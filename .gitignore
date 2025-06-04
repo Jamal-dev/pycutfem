@@ -192,3 +192,8 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# vscode local enviorment
+.vscode
+__pycache__
+**/__pycache__/
