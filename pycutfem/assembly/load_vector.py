@@ -4,20 +4,23 @@ from pycutfem.integration import volume
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem import transform
 
-def element_load(mesh, elem_id, f, order=None):
-    # Determine the polynomial order of the element from the mesh object
-    poly_ord = getattr(mesh, "element_order", 1)
-    # Get the reference element definition for the correct polynomial order
-    ref = get_reference(mesh.element_type, poly_ord)
-    n_loc = len(ref.shape(0, 0))
-    # n_loc = 3 if mesh.element_type=='tri' else 4
-    Fe = np.zeros(n_loc)
-    order = poly_ord + 3 if order is None else order
-    pts, wts = volume(mesh.element_type, order)
-    for xi_eta, w in zip(pts, wts):
-        N = np.asarray(ref.shape(*xi_eta)).ravel()
-        x = transform.x_mapping(mesh, elem_id, xi_eta)
-        J = transform.jacobian(mesh, elem_id, xi_eta)
-        detJ = np.linalg.det(J)
-        Fe += w*detJ * N * f(*x)
+__all__ = ["cg_element_load", "dg_element_load"]
+
+def cg_element_load(mesh, elem_id, rhs, *, poly_order, quad_order=None):
+    if quad_order is None:
+        quad_order = poly_order + 2
+    pts, wts = volume(mesh.element_type, quad_order)
+    ref = get_reference(mesh.element_type, poly_order)
+    Fe = np.zeros(len(ref.shape(0, 0)))
+    for (xi, eta), w in zip(pts, wts):
+        N = ref.shape(xi, eta)
+        detJ = abs(np.linalg.det(transform.jacobian(mesh, elem_id, (xi, eta))))
+        x = transform.x_mapping(mesh, elem_id, (xi, eta))
+        Fe += w * detJ * N * rhs(*x)
     return Fe
+
+def dg_element_load(mesh, elem_id, rhs, *, poly_order, quad_order=None):
+    # identical integral, just a separate helper
+    return cg_element_load(mesh, elem_id, rhs,
+                           poly_order=poly_order,
+                           quad_order=quad_order)

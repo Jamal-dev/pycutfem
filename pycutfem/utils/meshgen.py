@@ -199,20 +199,20 @@ def _structured_qn(Lx, Ly, nx, ny, order):
             
     return pts, quads
 
-def structured_quad(Lx, Ly, *, nx=4, ny=4, element_order=1):
+def structured_quad(Lx, Ly, *, nx=4, ny=4, poly_order=1):
     """
     Main function to generate a structured quadrilateral mesh.
     This function is now generalized for any order.
     """
-    if not isinstance(element_order, int) or element_order < 0:
+    if not isinstance(poly_order, int) or poly_order < 0:
         # Delegate detailed error checking to _structured_qn, but catch common cases.
         raise ValueError("Order must be a positive integer (e.g., 1 for Q1, 2 for Q2).")
     
-    pts, quads = _structured_qn(Lx, Ly, nx, ny, element_order)
+    pts, quads = _structured_qn(Lx, Ly, nx, ny, poly_order)
     
     return pts, quads
 
-def structured_triangles(Lx, Ly, *, nx_quads=4, ny_quads=4, order=1):
+def structured_triangles(Lx, Ly, *, nx_quads=4, ny_quads=4, poly_order=1):
     """
     Main function to generate a structured triangular mesh of Pk elements.
 
@@ -228,7 +228,7 @@ def structured_triangles(Lx, Ly, *, nx_quads=4, ny_quads=4, order=1):
         tuple: (pts, tris) as returned by _structured_pk.
     """
     # 'order' here means Pk order (k)
-    pts, tris = _structured_pk(Lx, Ly, nx_quads, ny_quads, order)
+    pts, tris = _structured_pk(Lx, Ly, nx_quads, ny_quads, poly_order)
     return pts, tris
 
 def visualize_test_structured_quad():
@@ -237,7 +237,7 @@ def visualize_test_structured_quad():
     # Test Case 1: Single Q1 element
     print("\n--- Test Case 1: Single Q1 Element (1x1 grid) ---")
     Lx1, Ly1, nx1, ny1, order1 = 1.0, 1.0, 1, 1, 1
-    pts1, quads1 = structured_quad(Lx1, Ly1, nx=nx1, ny=ny1, element_order=order1)
+    pts1, quads1 = structured_quad(Lx1, Ly1, nx=nx1, ny=ny1, poly_order=order1)
     print(f"Points shape: {pts1.shape}")
     print(f"First 5 points:\n{pts1[:5]}")
     print(f"Quads shape: {quads1.shape}")
@@ -247,7 +247,7 @@ def visualize_test_structured_quad():
     # Test Case 2: 2x1 Q1 elements
     print("\n--- Test Case 2: 2x1 Q1 Elements ---")
     Lx2, Ly2, nx2, ny2, order2 = 2.0, 1.0, 2, 1, 1
-    pts2, quads2 = structured_quad(Lx2, Ly2, nx=nx2, ny=ny2, element_order=order2)
+    pts2, quads2 = structured_quad(Lx2, Ly2, nx=nx2, ny=ny2, poly_order=order2)
     print(f"Points shape: {pts2.shape}")
     # print(f"Points:\n{pts2}") # Can be long
     print(f"Quads shape: {quads2.shape}")
@@ -257,7 +257,7 @@ def visualize_test_structured_quad():
     # Test Case 3: Single Q2 element
     print("\n--- Test Case 3: Single Q2 Element (1x1 grid) ---")
     Lx3, Ly3, nx3, ny3, order3 = 1.0, 1.0, 1, 1, 2
-    pts3, quads3 = structured_quad(Lx3, Ly3, nx=nx3, ny=ny3, element_order=order3)
+    pts3, quads3 = structured_quad(Lx3, Ly3, nx=nx3, ny=ny3, poly_order=order3)
     print(f"Points shape: {pts3.shape}")
     # print(f"Points:\n{pts3}")
     print(f"Quads shape: {quads3.shape}")
@@ -267,7 +267,7 @@ def visualize_test_structured_quad():
     # Test Case 4: 2x2 Q2 elements
     print("\n--- Test Case 4: 2x2 Q2 Elements ---")
     Lx4, Ly4, nx4, ny4, order4 = 2.0, 2.0, 2, 2, 2
-    pts4, quads4 = structured_quad(Lx4, Ly4, nx=nx4, ny=ny4, element_order=order4)
+    pts4, quads4 = structured_quad(Lx4, Ly4, nx=nx4, ny=ny4, poly_order=order4)
     print(f"Points shape: {pts4.shape}")
     print(f"Quads shape: {quads4.shape}")
     # print(f"Quads connectivity:\n{quads4}") # Can be long
@@ -276,7 +276,7 @@ def visualize_test_structured_quad():
     # Test Case 5: Single Q3 element (demonstrates generality)
     print("\n--- Test Case 5: Single Q3 Element (1x1 grid) ---")
     Lx5, Ly5, nx5, ny5, order5 = 1.0, 1.5, 1, 1, 3 # Using Ly=1.5 for non-square
-    pts5, quads5 = structured_quad(Lx5, Ly5, nx=nx5, ny=ny5, element_order=order5)
+    pts5, quads5 = structured_quad(Lx5, Ly5, nx=nx5, ny=ny5, poly_order=order5)
     print(f"Points shape: {pts5.shape}")
     print(f"Quads shape: {quads5.shape}")
     print(f"Quads connectivity (first element if many, or all if one):\n{quads5[0] if quads5.shape[0] > 0 else quads5}")
@@ -289,33 +289,33 @@ def visualize_test_structured_tri_and_quad():
 
     # === Quadrilateral Tests ===
     print("\n--- Test Case Q1: Single Q1 Element (1x1 grid) ---")
-    ptsQ1, quadsQ1 = structured_quad(1.0, 1.0, nx=1, ny=1, element_order=1)
+    ptsQ1, quadsQ1 = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
     visualize_mesh_node_order(ptsQ1, quadsQ1, 1, 'quad', title="Test Q1: Single Q1 Element")
 
     print("\n--- Test Case Q2: 2x1 Q2 Elements ---")
-    ptsQ2, quadsQ2 = structured_quad(2.0, 1.0, nx=2, ny=1, element_order=2)
+    ptsQ2, quadsQ2 = structured_quad(2.0, 1.0, nx=2, ny=1, poly_order=2)
     visualize_mesh_node_order(ptsQ2, quadsQ2, 2, 'quad', title="Test Q2: 2x1 Q2 Elements")
     
     print("\n--- Test Case Q0: 2x2 Q0 Elements ---") # Test order 0 for Quads
-    ptsQ0, quadsQ0 = structured_quad(2.0, 2.0, nx=2, ny=2, element_order=0)
+    ptsQ0, quadsQ0 = structured_quad(2.0, 2.0, nx=2, ny=2, poly_order=0)
     visualize_mesh_node_order(ptsQ0, quadsQ0, 0, 'quad', title="Test Q0: 2x2 Q0 (Point) Elements")
 
 
     # === Triangular Tests ===
     print("\n--- Test Case T1: 1x1 Base Quads, P1 Elements (2 triangles) ---")
-    ptsT1, trisT1 = structured_triangles(1.0, 1.0, nx_quads=1, ny_quads=1, order=1)
+    ptsT1, trisT1 = structured_triangles(1.0, 1.0, nx_quads=1, ny_quads=1, poly_order=1)
     visualize_mesh_node_order(ptsT1, trisT1, 1, 'triangle', title="Test T1: P1 Triangles (from 1x1 Quads)")
 
     print("\n--- Test Case T2: 1x1 Base Quads, P2 Elements (2 triangles) ---")
-    ptsT2, trisT2 = structured_triangles(1.0, 1.0, nx_quads=1, ny_quads=1, order=2)
+    ptsT2, trisT2 = structured_triangles(1.0, 1.0, nx_quads=1, ny_quads=1, poly_order=2)
     visualize_mesh_node_order(ptsT2, trisT2, 2, 'triangle', title="Test T2: P2 Triangles (from 1x1 Quads)")
 
     print("\n--- Test Case T3: 2x1 Base Quads, P1 Elements (4 triangles) ---")
-    ptsT3, trisT3 = structured_triangles(2.0, 1.0, nx_quads=2, ny_quads=1, order=1)
+    ptsT3, trisT3 = structured_triangles(2.0, 1.0, nx_quads=2, ny_quads=1, poly_order=1)
     visualize_mesh_node_order(ptsT3, trisT3, 1, 'triangle', title="Test T3: P1 Triangles (from 2x1 Quads)")
 
     print("\n--- Test Case T0: 2x2 Base Quads, P0 Elements (8 triangles) ---") # Test order 0 for Triangles
-    ptsT0, trisT0 = structured_triangles(2.0, 2.0, nx_quads=2, ny_quads=2, order=0)
+    ptsT0, trisT0 = structured_triangles(2.0, 2.0, nx_quads=2, ny_quads=2, poly_order=0)
     visualize_mesh_node_order(ptsT0, trisT0, 0, 'triangle', title="Test T0: P0 (Point) Elements on Triangles")
 
     print("\nAll test cases executed. Check the plots for visual verification.")

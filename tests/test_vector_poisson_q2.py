@@ -3,7 +3,7 @@ import scipy
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.core import Mesh
 from pycutfem.assembly import stiffness_matrix, assemble
-from pycutfem.assembly.load_vector import element_load
+from pycutfem.assembly.load_vector import cg_element_load
 from pycutfem.assembly.boundary_conditions import apply_dirichlet
 
 x, y = sp.symbols("x y")
@@ -17,15 +17,15 @@ fx  = sp.lambdify((x, y), ux_rhs, "numpy")
 fy  = sp.lambdify((x, y), uy_rhs, "numpy")
 
 def test_vector_poisson_q2():
-    nodes, elems = structured_quad(3, 2, nx=8, ny=5, element_order=2)
-    mesh = Mesh(nodes, elems, element_type="quad",element_order=2)
+    nodes, elems = structured_quad(3, 2, nx=8, ny=5, poly_order=2)
+    mesh = Mesh(nodes, elems, element_type="quad",poly_order=2)
     # Assemble block‑diagonal (2× scalar problems)
-    K = assemble(mesh, lambda eid: stiffness_matrix(mesh, eid, order=4))
+    K = assemble(mesh, lambda eid: stiffness_matrix(mesh, eid, quad_order=4))
     Kblock = scipy.sparse.block_diag((K, K))
     F = np.zeros(2 * len(nodes))
     for eid, elem in enumerate(mesh.elements):
-        Fe_x = element_load(mesh, eid, fx, order=4)
-        Fe_y = element_load(mesh, eid, fy, order=4)
+        Fe_x = cg_element_load(mesh, eid, fx, poly_order=mesh.poly_order, quad_order=4)
+        Fe_y = cg_element_load(mesh, eid, fy, poly_order=mesh.poly_order, quad_order=4)
         for a, A in enumerate(elem):
             F[A] += Fe_x[a]
             F[A + len(nodes)] += Fe_y[a]

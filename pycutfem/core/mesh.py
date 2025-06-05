@@ -21,11 +21,11 @@ class Mesh:
         'tri': ((0,1),(1,2),(2,0)),
         'quad':((0,1),(1,2),(2,3),(3,0)),
     }
-    def __init__(self, nodes: np.ndarray, elements: np.ndarray, element_type='tri', element_order: int = 1, **kwargs):
+    def __init__(self, nodes: np.ndarray, elements: np.ndarray, element_type='tri', poly_order: int = 1, **kwargs):
         self.nodes = np.ascontiguousarray(nodes, dtype=float)
         self.elements = np.ascontiguousarray(elements, dtype=int)
         self.element_type = element_type
-        self.element_order = element_order
+        self.poly_order = poly_order
         if self.nodes.ndim!=2 or self.nodes.shape[1]!=2:
             raise ValueError('nodes must be (N,2)')
         if self.elements.ndim!=2:
@@ -35,21 +35,21 @@ class Mesh:
         
         expected_nodes_per_elem = -1
         if self.element_type == 'tri':
-            if self.element_order >= 0: # Pk elements
-                expected_nodes_per_elem = (self.element_order + 1) * (self.element_order + 2) // 2
+            if self.poly_order >= 0: # Pk elements
+                expected_nodes_per_elem = (self.poly_order + 1) * (self.poly_order + 2) // 2
             else:
-                raise ValueError(f"Unsupported element_order {self.element_order} for triangle.")
+                raise ValueError(f"Unsupported element_order {self.poly_order} for triangle.")
         elif self.element_type == 'quad':
-            if self.element_order >= 0: # Qn elements
-                expected_nodes_per_elem = (self.element_order + 1)**2
+            if self.poly_order >= 0: # Qn elements
+                expected_nodes_per_elem = (self.poly_order + 1)**2
             else:
-                raise ValueError(f"Unsupported element_order {self.element_order} for quadrilateral.")
+                raise ValueError(f"Unsupported element_order {self.poly_order} for quadrilateral.")
         else:
             raise ValueError(f"Unknown element_type: {self.element_type}")
         
         if self.elements.shape[0] > 0 and self.elements.shape[1] != expected_nodes_per_elem:
             raise ValueError(
-                f"Mismatch for {self.element_type} order {self.element_order}: "
+                f"Mismatch for {self.element_type} order {self.poly_order}: "
                 f"elements array has {self.elements.shape[1]} nodes per element, "
                 f"but expected {expected_nodes_per_elem}."
             )
@@ -73,7 +73,7 @@ class Mesh:
         Assumes structured_quad/tri node ordering.
         """
         elem_all_nodes_gids = self.elements[element_idx]
-        order = self.element_order
+        order = self.poly_order
 
         if self.element_type == 'tri':
             if order == 0: # P0
@@ -131,7 +131,7 @@ class Mesh:
             return np.array([])
             
         element_areas = np.zeros(len(self.elements))
-        if self.element_order == 0: # Point elements have zero geometric area
+        if self.poly_order == 0: # Point elements have zero geometric area
             return element_areas
 
         for eid in range(len(self.elements)):
@@ -164,7 +164,7 @@ class Mesh:
         return self._neighbors
     # ------------------------
     def _build_edges(self):
-        if self.element_order == 0 or len(self.elements) == 0: # Point elements don't have edges here
+        if self.poly_order == 0 or len(self.elements) == 0: # Point elements don't have edges here
             self.edges = []
             self._edge_dict = {}
             self._neighbors = [[] for _ in range(len(self.elements))]

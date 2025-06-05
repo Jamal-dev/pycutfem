@@ -6,15 +6,13 @@ from pycutfem.integration import volume
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem import transform
 
-def stiffness_matrix(mesh, elem_id, *, order=None):
+def stiffness_matrix(mesh, elem_id, *, quad_order=None):
     # Choose quadrature automatically: order+2 Gauss (quad) or Dunavant
-    poly_ord = 1  # P1/Q1 default; will be overwritten below
-    if hasattr(mesh, "element_order"):
-        poly_ord = mesh.element_order
-    if order is None:
-        order = poly_ord + 2
+    poly_ord = mesh.poly_order  # P1/Q1 default; will be overwritten below
+    if quad_order is None:
+        quad_order = poly_ord + 2
 
-    pts, wts = volume(mesh.element_type, order)
+    pts, wts = volume(mesh.element_type, quad_order)
     ref = get_reference(mesh.element_type, poly_ord)
     n_loc = len(ref.shape(0, 0))
 

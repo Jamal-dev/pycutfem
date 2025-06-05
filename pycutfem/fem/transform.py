@@ -13,15 +13,15 @@ def _shape_and_grad(ref, xi_eta):
 
 def x_mapping(mesh, elem_id, xi_eta):
     nodes = mesh.nodes[mesh.elements[elem_id]]
-    order = getattr(mesh, "element_order", 1)
-    ref   = get_reference(mesh.element_type, order)
+    poly_order = mesh.poly_order
+    ref   = get_reference(mesh.element_type, poly_order)
     N,_ = _shape_and_grad(ref, xi_eta)
     return N @ nodes                  # (2,)
 
 def jacobian(mesh, elem_id, xi_eta):
     nodes = mesh.nodes[mesh.elements[elem_id]]
-    order = getattr(mesh, "element_order", 1)
-    ref   = get_reference(mesh.element_type, order)
+    poly_order = mesh.poly_order
+    ref   = get_reference(mesh.element_type, poly_order)
     _, dN = _shape_and_grad(ref, xi_eta)
     return dN.T @ nodes
 

@@ -4,7 +4,7 @@ import numpy as np, scipy.sparse.linalg as spla
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.core import Mesh
 from pycutfem.assembly import stiffness_matrix, assemble
-from pycutfem.assembly.load_vector import element_load
+from pycutfem.assembly.load_vector import cg_element_load
 from pycutfem.assembly.boundary_conditions import apply_dirichlet
 from pycutfem.io import plot_mesh
 
@@ -17,7 +17,7 @@ KeFe = lambda eid: stiffness_matrix(mesh, eid)
 K = assemble(mesh, lambda eid: stiffness_matrix(mesh, eid))
 F = np.zeros(len(nodes))
 for eid,elem in enumerate(mesh.elements):
-    Fe = element_load(mesh, eid, f_rhs)
+    Fe = cg_element_load(mesh, eid, f_rhs)
     for a,A in enumerate(elem): F[A]+=Fe[a]
 dbc={}
 for dof,(x,y) in enumerate(mesh.nodes):
