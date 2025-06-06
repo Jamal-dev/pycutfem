@@ -7,128 +7,116 @@ import numpy as np
 from pycutfem.integration import volume, edge
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem import transform
+from typing import Callable, Tuple
 
-# -------------------------------------------------------------------------
-# Element volume contribution — identical to CG (just uses local DOF ids)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Volume kernel (unchanged from CG, but loops over vector components if needed)
+# -----------------------------------------------------------------------------
 
-def volume_laplace(mesh, elem_id, *, poly_order, quad_order=None):
+def volume_laplace(mesh, elem_id: int, *, poly_order: int, quad_order: int | None = None,
+                   n_comp: int = 1) -> np.ndarray:
+    """Return local stiffness block of shape (n_loc*n_comp, n_loc*n_comp)."""
     if quad_order is None:
         quad_order = poly_order + 2
+
+    ref  = get_reference(mesh.element_type, poly_order)
     pts, wts = volume(mesh.element_type, quad_order)
-    ref = get_reference(mesh.element_type, poly_order)
     n_loc = len(ref.shape(0, 0))
-    Ke = np.zeros((n_loc, n_loc))
+    Ke    = np.zeros((n_loc * n_comp, n_loc * n_comp))
+
     for (xi, eta), w in zip(pts, wts):
-        dN = ref.grad(xi, eta)                    # (n_loc, 2)
-        J = transform.jacobian(mesh, elem_id, (xi, eta))
+        dN   = ref.grad(xi, eta)                 # (n_loc,2)
+        J    = transform.jacobian(mesh, elem_id, (xi, eta))
         invJT = np.linalg.inv(J).T
-        grad = dN @ invJT                        # (n_loc, 2)
-        detJ = np.abs(np.linalg.det(J))
-        Ke += w * detJ * grad @ grad.T
+        grad = dN @ invJT                       # (n_loc,2)
+        detJ = abs(np.linalg.det(J))
+        k_s  = w * detJ * grad @ grad.T         # (n_loc,n_loc)
+        for c in range(n_comp):                 # diagonal block per component
+            i0 = c * n_loc
+            Ke[i0:i0+n_loc, i0:i0+n_loc] += k_s
     return Ke
 
-# -------------------------------------------------------------------------
-# Face contribution  (SIPG): left/right element pair
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Face kernel: row‑matrix‑rowᵀ formulation (works for vector/scalar)
+# -----------------------------------------------------------------------------
 
-# assembly/dg_local.py
-# ----------------------------------------------------------------------
-def face_laplace(mesh, eL, eR, edge_id, *, poly_order,
-                 penalty, quad_order=None,
-                 dirichlet=lambda x, y: 0.0):
-    """
-    Return blocks  (K_LL, K_LR, K_RL, K_RR,  F_L, F_R)
-
-    K_LR … are None on a boundary face (eR is None);
-    F_R is None on a boundary face.
+def face_laplace(mesh, eL: int, eR: int | None, edge_id: int, *,
+                 poly_order: int, alpha: float = 10.0, symmetry: int = 1,
+                 quad_order: int | None = None, n_comp: int = 1,
+                 dirichlet: Callable[[float, float], float] | Callable[[float, float], np.ndarray] = lambda x, y: 0.0
+                 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (Ke_face, Fe_face) where
+         *Ke_face* is a dense block (n_face_dofs × n_face_dofs).
+         The calling assembler adds it to the global CSR.
     """
     if quad_order is None:
         quad_order = poly_order + 2
 
-    ref   = get_reference(mesh.element_type, poly_order)
+    ref  = get_reference(mesh.element_type, poly_order)
     n_loc = len(ref.shape(0, 0))
+    n_fld = n_loc * (1 + int(eR is not None))  # Scalar case: n_comp=1
 
-    # ---- edge geometry ------------------------------------------------
+    Ke = np.zeros((n_fld, n_fld))
+    Fe = np.zeros(n_fld)
+
+    # --- Geometry ------------------------------------------------------
     edge_obj = mesh.edge(edge_id)
-    normal   = edge_obj.normal
     idx_L    = _find_local_edge(mesh, eL, edge_obj.nodes)
-
-    # reference-edge quadrature (pts in element reference coords)
     pts_ref, w_ref = edge(mesh.element_type, idx_L, quad_order)
 
-    # physical edge length → 1-D Jacobian
-    p0 = mesh.nodes[edge_obj.nodes[0]]
-    p1 = mesh.nodes[edge_obj.nodes[1]]
-    jac_edge = np.linalg.norm(p1 - p0) / 2.0   # ref edge assumed length 2
+    def geom(xi, eta):
+        J = transform.jacobian(mesh, eL, (xi, eta))
+        if mesh.element_type == "quad":
+            n_ref = np.array([[0,-1],[1,0],[0,1],[-1,0]][idx_L])
+            dS_dxi = 1.0
+        else:  # tri edges in CCW order
+            n_ref = np.array([[0,-1],[1,1],[-1,0]][idx_L]) / np.sqrt(2)
+            dS_dxi = 1.0
+        v = np.linalg.det(J) * J.T @ n_ref
+        n_phys = v / np.linalg.norm(v)
+        jac_1d = np.linalg.norm(v) * dS_dxi
+        return n_phys, jac_1d
 
-    # ---- helpers ------------------------------------------------------
-    def grad_phys(elem_id, xi_eta):
-        dN = ref.grad(*xi_eta)
-        J  = transform.jacobian(mesh, elem_id, xi_eta)
-        return dN @ np.linalg.inv(J).T
-
-    # local matrices/vectors
-    K_LL = np.zeros((n_loc, n_loc))
-    K_LR = K_RL = K_RR = None
-    F_L  = np.zeros(n_loc)
-    F_R  = None
-
-    if eR is not None:
-        K_LR = np.zeros((n_loc, n_loc))
-        K_RL = np.zeros((n_loc, n_loc))
-        K_RR = np.zeros((n_loc, n_loc))
-        F_R  = np.zeros(n_loc)
-
-    # element size & penalty
     hL = element_char_length(mesh, eL)
     hR = element_char_length(mesh, eR) if eR is not None else hL
     h  = 0.5 * (hL + hR)
-    sigma = 10.0 * penalty * (poly_order + 1) * (poly_order + 2) / h
+    sigma = alpha * (poly_order + 1) * (poly_order + 2) / h
 
-    # ---- quadrature loop ---------------------------------------------
-    for (xiL, etaL), w in zip(pts_ref, w_ref):
-        w_phys = w * jac_edge                      # scale weight
+    B = np.array([[0, symmetry], [-1, sigma]])
 
-        xphys  = transform.x_mapping(mesh, eL, (xiL, etaL))
-        NL     = ref.shape(xiL, etaL)
-        gL     = grad_phys(eL, (xiL, etaL))
+    # --- Quadrature Loop -----------------------------------------------
+    for (xi, eta), w in zip(pts_ref, w_ref):
+        n, jac1d = geom(xi, eta)
+        lam = w * jac1d
 
-        if eR is not None:                         # interior face
-            xiR, etaR = _inverse_map(mesh, eR, xphys)
-            NR        = ref.shape(xiR, etaR)
-            gR        = grad_phys(eR, (xiR, etaR))
-            avg_g     = 0.5 * (gL + gR)
-            jump_L, jump_R = NL, -NR
-        else:                                      # boundary face
-            avg_g     = gL
-            jump_L    = NL
-            uD        = dirichlet(*xphys)
+        φL  = ref.shape(xi, eta)
+        gL  = ref.grad(xi, eta) @ transform.inv_jac_T(mesh, eL, (xi, eta))
+        dφnL = gL @ n
 
-        # volume-free blocks -------------------------------------------
-        
+        if eR is not None:  # Interior face
+            xr = transform.x_mapping(mesh, eL, (xi, eta))
+            xiR, etaR = _inverse_map(mesh, eR, xr)
+            φR  = ref.shape(xiR, etaR)
+            gR  = ref.grad(xiR, etaR) @ transform.inv_jac_T(mesh, eR, (xiR, etaR))
+            dφnR = gR @ n
+            # Concatenate left and right DOFs for jumps
+            row1 = np.concatenate((0.5 * dφnL, -0.5 * dφnR))  # [∂n φ] = ∂n φ_L - ∂n φ_R
+            row2 = np.concatenate((φL, -φR))                   # [φ] = φ_L - φ_R
+        else:  # Boundary face
+            uD_val = dirichlet(*transform.x_mapping(mesh, eL, (xi, eta)))
+            uD_val = np.atleast_1d(uD_val) if np.isscalar(uD_val) else uD_val
+            row1 = 0.5 * dφnL
+            row2 = φL
 
-        if eR is not None:                         # interior blocks
-            K_LL += w_phys * ( (avg_g @ normal)[:,None] * jump_L[None,:] +
-                           (avg_g @ normal)[None,:] * jump_L[:,None] +
-                           sigma * np.outer(jump_L, jump_L) )
-            K_LR += w_phys * ( (avg_g @ normal)[:,None] * jump_R[None,:] +
-                               sigma * np.outer(jump_L, jump_R) )
-            K_RL += w_phys * ( (avg_g @ normal)[:,None] * jump_L[None,:] +
-                               sigma * np.outer(jump_R, jump_L) )
-            K_RR += w_phys * ( (avg_g @ normal)[:,None] * jump_R[None,:] +
-                               (avg_g @ normal)[None,:] * jump_R[:,None] +
-                               sigma * np.outer(jump_R, jump_R) )
-        else:                                      # Dirichlet RHS
-            uD     = dirichlet(*xphys)
-            jump_L = NL                            # u_R ≡ u_D
+        R = np.vstack((row1, row2))  # (2, n_fld)
+        Ke += lam * R.T @ B @ R      # (n_fld, n_fld)
 
-            # only (∇u_L·n) v_L  +  σ(u_L v_L) stays in the matrix
-            K_LL += w_phys * ( (gL @ normal)[:,None] * jump_L[None,:] +
-                               sigma * np.outer(jump_L, jump_L) )
-            F_L += w_phys * ( -(gL @ normal) * uD - sigma * uD ) * NL
+        # Boundary RHS
+        if eR is None:
+            vL = symmetry * row1 + sigma * row2  # vL is (n_loc,)
+            Fe += lam * (-vL * uD_val[0])        # Scalar case: use first component
 
-    return K_LL, K_LR, K_RL, K_RR, F_L, F_R
+    return Ke, Fe
 
 
 # -------------------------------------------------------------------------

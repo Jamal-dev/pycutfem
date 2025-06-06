@@ -4,8 +4,12 @@ Mesh generators for quick tests.
 import numpy as np
 from scipy.spatial import Delaunay
 from pycutfem.io.visualization import visualize_mesh_node_order
+from pycutfem.core import Node
+from typing import List
 
 __all__ = ["delaunay_rectangle", "structured_quad", "structured_triangles"]
+
+
 
 def delaunay_rectangle(length: float, height: float, nx: int = 10, ny: int = 10):
     x = np.linspace(0.0, length, nx)
@@ -24,212 +28,180 @@ def delaunay_rectangle(length: float, height: float, nx: int = 10, ny: int = 10)
             t[1], t[2] = t[2], t[1]
     return pts, elems
 
-def _structured_pk(Lx, Ly, nx_base_quads, ny_base_quads, order_k):
-    if not isinstance(order_k, int) or order_k < 0: # Allow order 0 for point elements
-        raise ValueError("Order k must be a non-negative integer.")
+def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int):
+    """
+    Main wrapper for generating structured quadrilateral meshes.
+    Returns raw data: node objects, element connectivity, edge connectivity,
+    and corner node connectivity for each element.
+    """
+    return _structured_qn(Lx, Ly, nx, ny, poly_order)
 
-    num_fine_nodes_x = order_k * nx_base_quads + 1 if order_k > 0 else nx_base_quads + 1
-    num_fine_nodes_y = order_k * ny_base_quads + 1 if order_k > 0 else ny_base_quads + 1
+def _structured_qn(Lx: float, Ly: float, nx: int, ny: int, order: int):
+    """
+    Generates raw data for a structured quadrilateral mesh of Qn elements.
 
-    if nx_base_quads == 0 or ny_base_quads == 0: # Handle cases with no base quads
-        num_fine_nodes_x = nx_base_quads + 1
-        num_fine_nodes_y = ny_base_quads + 1
+    Returns:
+        tuple: (nodes, elements, edges, elements_corner_nodes)
+            nodes (List[Node]): A list of Node objects with tags.
+            elements (np.ndarray): Full element connectivity using Node IDs.
+            edges (np.ndarray): Edge connectivity (unique pairs of corner node IDs).
+            elements_corner_nodes (np.ndarray): Corner node connectivity for each element.
+    """
+    if not isinstance(order, int) or order < 1:
+        raise ValueError("Polynomial order must be a positive integer.")
+
+    # --- 1. Generate all Node objects with tags ---
+    nodes_per_edge_1d = order + 1
+    num_global_nodes_x = order * nx + 1
+    num_global_nodes_y = order * ny + 1
+    x_coords = np.linspace(0, Lx, num_global_nodes_x)
+    y_coords = np.linspace(0, Ly, num_global_nodes_y)
+
+    nodes: List[Node] = []
+    for j_glob in range(num_global_nodes_y):
+        for i_glob in range(num_global_nodes_x):
+            x, y = x_coords[i_glob], y_coords[j_glob]
+            tags = []
+            if np.isclose(x, 0): tags.append("boundary_left")
+            if np.isclose(x, Lx): tags.append("boundary_right")
+            if np.isclose(y, 0): tags.append("boundary_bottom")
+            if np.isclose(y, Ly): tags.append("boundary_top")
+            is_corner = (i_glob % order == 0) and (j_glob % order == 0)
+            is_edge_node = not is_corner and (i_glob % order == 0 or j_glob % order == 0)
+            if is_corner: tags.append("corner")
+            elif is_edge_node: tags.append("edge")
+            else: tags.append("interior")
+            nodes.append(Node(id=len(nodes), x=x, y=y, tag=",".join(tags)))
+
+    # --- 2. Generate Element, Edge, and Corner Connectivity ---
+    num_elements = nx * ny
+    elements = np.empty((num_elements, nodes_per_edge_1d**2), dtype=int)
+    elements_corner_nodes = np.empty((num_elements, 4), dtype=int)
+    unique_edges = set()
+    
+    get_node_id = lambda ix, iy: iy * num_global_nodes_x + ix
+
+    for el_j in range(ny):
+        for el_i in range(nx):
+            eid = el_j * nx + el_i
+            start_ix, start_iy = order * el_i, order * el_j
+            
+            # A. Build Full Element Connectivity
+            local_node_idx = 0
+            for local_ny in range(nodes_per_edge_1d):
+                for local_nx in range(nodes_per_edge_1d):
+                    gid = get_node_id(start_ix + local_nx, start_iy + local_ny)
+                    elements[eid, local_node_idx] = gid
+                    local_node_idx += 1
+            
+            # B. Identify Corners for this element
+            bl_gid = get_node_id(start_ix, start_iy)
+            br_gid = get_node_id(start_ix + order, start_iy)
+            tr_gid = get_node_id(start_ix + order, start_iy + order)
+            tl_gid = get_node_id(start_ix, start_iy + order)
+            
+            # C. Store the ordered list of corners for this element
+            # This order is canonical (CCW) and used for defining local edges.
+            corners = [bl_gid, br_gid, tr_gid, tl_gid]
+            elements_corner_nodes[eid] = corners
+            
+            # D. Add geometric edges to the unique set
+            unique_edges.add(tuple(sorted((corners[0], corners[1])))) # Bottom
+            unique_edges.add(tuple(sorted((corners[1], corners[2])))) # Right
+            unique_edges.add(tuple(sorted((corners[2], corners[3])))) # Top
+            unique_edges.add(tuple(sorted((corners[3], corners[0])))) # Left
+
+    edges = np.array(list(unique_edges), dtype=int)
+    return nodes, elements, edges, elements_corner_nodes
 
 
+def structured_triangles(Lx: float, Ly: float, *, nx_quads: int, ny_quads: int, poly_order: int):
+    """
+    Main wrapper for generating structured triangular meshes.
+    Returns raw data: node objects, element connectivity, edge connectivity,
+    and corner node connectivity.
+    """
+    return _structured_pk(Lx, Ly, nx_quads, ny_quads, poly_order)
+
+
+def _structured_pk(Lx: float, Ly: float, nx_base_quads: int, ny_base_quads: int, order_k: int):
+    """
+    Generates raw data for a structured triangular mesh of Pk elements.
+    """
+    if not isinstance(order_k, int) or order_k < 1:
+        raise ValueError("Polynomial order must be a positive integer.")
+
+    # --- 1. Generate all Node objects with tags ---
+    num_fine_nodes_x = order_k * nx_base_quads + 1
+    num_fine_nodes_y = order_k * ny_base_quads + 1
     x_fine = np.linspace(0, Lx, num_fine_nodes_x)
     y_fine = np.linspace(0, Ly, num_fine_nodes_y)
 
-    if num_fine_nodes_x == 0 or num_fine_nodes_y == 0:
-         pts = np.array([[0.0,0.0]]) if Lx==0 and Ly==0 and nx_base_quads==1 and ny_base_quads==1 and order_k==0 else np.empty((0,2))
-    else:
-        X_fine, Y_fine = np.meshgrid(x_fine, y_fine)
-        pts = np.column_stack([X_fine.ravel(), Y_fine.ravel()])
+    nodes: List[Node] = []
+    for j_fine in range(num_fine_nodes_y):
+        for i_fine in range(num_fine_nodes_x):
+            x, y = x_fine[i_fine], y_fine[j_fine]
+            tags = []
+            if np.isclose(x, 0): tags.append("boundary_left")
+            if np.isclose(x, Lx): tags.append("boundary_right")
+            if np.isclose(y, 0): tags.append("boundary_bottom")
+            if np.isclose(y, Ly): tags.append("boundary_top")
+            is_on_coarse_x = i_fine % order_k == 0
+            is_on_coarse_y = j_fine % order_k == 0
+            if is_on_coarse_x and is_on_coarse_y: tags.append("corner")
+            elif is_on_coarse_x or is_on_coarse_y: tags.append("edge")
+            else: tags.append("interior")
+            nodes.append(Node(id=len(nodes), x=x, y=y, tag=",".join(tags)))
 
-
-    if order_k == 0: # P0 element
-        num_nodes_per_pk_element = 1
-    else:
-        num_nodes_per_pk_element = (order_k + 1) * (order_k + 2) // 2
-    
-    num_pk_elements = 2 * nx_base_quads * ny_base_quads
-    if nx_base_quads == 0 or ny_base_quads == 0 : # If no base quads, no Pk elements.
-         num_pk_elements = 0
-    if order_k == 0 and nx_base_quads > 0 and ny_base_quads > 0: # P0 case, one node per base quad, but we make 2 "elements" for consistency
-        # This interpretation of P0 on a quad split is a bit unusual.
-        # Typically P0 implies one value per original cell. Let's assume each "triangle" gets a P0 node.
-        # The P0 node can be the centroid of the base triangle or just its first vertex.
-        # For simplicity, let's assign it to the first vertex of each conceptual base triangle.
-        pass
-
-
-    if num_pk_elements == 0:
-        return pts, np.empty((0, num_nodes_per_pk_element), dtype=int)
-        
-    pk_elements_connectivity = np.empty((num_pk_elements, num_nodes_per_pk_element), dtype=int)
+    # --- 2. Generate Element, Edge, and Corner Connectivity ---
+    num_nodes_per_elem = (order_k + 1) * (order_k + 2) // 2
+    num_elems = 2 * nx_base_quads * ny_base_quads
+    elements = np.empty((num_elems, num_nodes_per_elem), dtype=int)
+    elements_corner_nodes = np.empty((num_elems, 3), dtype=int)
+    unique_edges = set()
     elem_idx_counter = 0
 
-    def get_global_fine_node_id(ix_fine, iy_fine):
-        if not (np.isclose(ix_fine, round(ix_fine)) and np.isclose(iy_fine, round(iy_fine))):
-             raise ValueError(f"Pk: Computed fine grid indices ({ix_fine}, {iy_fine}) are not close to integers.")
-        ix_fine_int, iy_fine_int = int(round(ix_fine)), int(round(iy_fine))
-        if not (0 <= ix_fine_int < num_fine_nodes_x and 0 <= iy_fine_int < num_fine_nodes_y):
-            raise ValueError(f"Pk: Fine grid indices ({ix_fine_int}, {iy_fine_int}) out of bounds ({num_fine_nodes_x}, {num_fine_nodes_y}). Original: ({ix_fine}, {iy_fine})")
-        return iy_fine_int * num_fine_nodes_x + ix_fine_int
+    get_node_id = lambda ix, iy: iy * num_fine_nodes_x + ix
 
-    for e_iy_base in range(ny_base_quads):
-        for e_ix_base in range(nx_base_quads):
-            v00_fgidx_raw_x = order_k * e_ix_base if order_k > 0 else e_ix_base
-            v00_fgidx_raw_y = order_k * e_iy_base if order_k > 0 else e_iy_base
+    for e_iy in range(ny_base_quads):
+        for e_ix in range(nx_base_quads):
+            v00_idx = (order_k * e_ix, order_k * e_iy)
+            v10_idx = (order_k * (e_ix + 1), order_k * e_iy)
+            v01_idx = (order_k * e_ix, order_k * (e_iy + 1))
+            v11_idx = (order_k * (e_ix + 1), order_k * (e_iy + 1))
             
-            v10_fgidx_raw_x = order_k * (e_ix_base + 1) if order_k > 0 else (e_ix_base + 1)
-            v10_fgidx_raw_y = order_k * e_iy_base if order_k > 0 else e_iy_base
-            
-            v01_fgidx_raw_x = order_k * e_ix_base if order_k > 0 else e_ix_base
-            v01_fgidx_raw_y = order_k * (e_iy_base + 1) if order_k > 0 else (e_iy_base + 1)
-
-            v11_fgidx_raw_x = order_k * (e_ix_base + 1) if order_k > 0 else (e_ix_base + 1)
-            v11_fgidx_raw_y = order_k * (e_iy_base + 1) if order_k > 0 else (e_iy_base + 1)
-
-            v00_fgidx = (v00_fgidx_raw_x, v00_fgidx_raw_y)
-            v10_fgidx = (v10_fgidx_raw_x, v10_fgidx_raw_y)
-            v01_fgidx = (v01_fgidx_raw_x, v01_fgidx_raw_y)
-            v11_fgidx = (v11_fgidx_raw_x, v11_fgidx_raw_y)
-            
-            base_triangles_vertices_fine_indices = [
-                (v00_fgidx, v10_fgidx, v11_fgidx),
-                (v00_fgidx, v11_fgidx, v01_fgidx)
+            base_tri_vertex_indices = [
+                (v00_idx, v10_idx, v11_idx),
+                (v00_idx, v11_idx, v01_idx)
             ]
 
-            for V0, V1, V2 in base_triangles_vertices_fine_indices:
-                if order_k == 0: # P0 element, one node (e.g., first vertex of base triangle)
-                    pk_elements_connectivity[elem_idx_counter, 0] = get_global_fine_node_id(V0[0], V0[1])
-                else:
-                    current_pk_node_indices = []
-                    for j_level in range(order_k + 1): 
-                        for i_level in range(order_k + 1 - j_level):
-                            node_fine_ix = V0[0] + i_level * ((V1[0] - V0[0]) // order_k) + j_level * ((V2[0] - V0[0]) // order_k)
-                            node_fine_iy = V0[1] + i_level * ((V1[1] - V0[1]) // order_k) + j_level * ((V2[1] - V0[1]) // order_k)
-                            current_pk_node_indices.append(get_global_fine_node_id(node_fine_ix, node_fine_iy))
-                    if len(current_pk_node_indices) != num_nodes_per_pk_element:
-                         raise RuntimeError(f"Internal error: Pk node count mismatch.")
-                    pk_elements_connectivity[elem_idx_counter] = current_pk_node_indices
+            for V0_idx, V1_idx, V2_idx in base_tri_vertex_indices:
+                # A. Build Full Element Connectivity
+                local_node_idx = 0
+                elem_nodes = np.empty(num_nodes_per_elem, dtype=int)
+                for j_level in range(order_k + 1): 
+                    for i_level in range(order_k + 1 - j_level):
+                        node_ix = V0_idx[0] + i_level * ((V1_idx[0] - V0_idx[0]) // order_k) + j_level * ((V2_idx[0] - V0_idx[0]) // order_k)
+                        node_iy = V0_idx[1] + i_level * ((V1_idx[1] - V0_idx[1]) // order_k) + j_level * ((V2_idx[1] - V0_idx[1]) // order_k)
+                        elem_nodes[local_node_idx] = get_node_id(node_ix, node_iy)
+                        local_node_idx += 1
+                elements[elem_idx_counter] = elem_nodes
+                
+                # B. Identify Corners and store them
+                v0_gid = get_node_id(*V0_idx)
+                v1_gid = get_node_id(*V1_idx)
+                v2_gid = get_node_id(*V2_idx)
+                elements_corner_nodes[elem_idx_counter] = [v0_gid, v1_gid, v2_gid]
+                
+                # C. Add geometric edges to the unique set
+                unique_edges.add(tuple(sorted((v0_gid, v1_gid))))
+                unique_edges.add(tuple(sorted((v1_gid, v2_gid))))
+                unique_edges.add(tuple(sorted((v2_gid, v0_gid))))
+
                 elem_idx_counter += 1
                 
-    return pts, pk_elements_connectivity
-
-
-
-
-def _structured_qn(Lx, Ly, nx, ny, order):
-    """
-    Generates a structured quadrilateral mesh for Qn elements.
-
-    Args:
-        Lx (float): Length of the domain in the x-direction.
-        Ly (float): Length of the domain in the y-direction.
-        nx (int): Number of elements in the x-direction.
-        ny (int): Number of elements in the y-direction.
-        order (int): Order of the Lagrange polynomial (e.g., 1 for Q1, 2 for Q2).
-                     This 'order' corresponds to 'n' in Qn.
-
-    Returns:
-        tuple: (pts, quads)
-            pts (np.ndarray): Array of node coordinates, shape (num_total_nodes, 2).
-            quads (np.ndarray): Array of element connectivities.
-                                Shape is (num_elements, (order+1)**2).
-                                Nodes are ordered lexicographically within each element,
-                                consistent with tensor-product shape functions (like those
-                                generated by the user's `quad_qn` function).
-    """
-    if not isinstance(order, int) or order < 0:
-        raise ValueError("Order must be a positive integer.")
-
-    # Number of nodes along one edge of a Qn element (e.g., order=1 -> 2 nodes)
-    nodes_per_edge_1d = order + 1
-    nodes_per_element = nodes_per_edge_1d * nodes_per_edge_1d
-
-    # Total number of unique node lines in the global grid
-    num_global_nodes_x = order * nx + 1
-    num_global_nodes_y = order * ny + 1
-
-    # Generate global node coordinates
-    x_coords = np.linspace(0, Lx, num_global_nodes_x)
-    y_coords = np.linspace(0, Ly, num_global_nodes_y)
-    X_glob, Y_glob = np.meshgrid(x_coords, y_coords)
-    # Node points are ordered such that Y changes slowest, then X.
-    # (x0,y0), (x1,y0), ..., (x_N,y0), (x0,y1), (x1,y1), ...
-    pts = np.column_stack([X_glob.ravel(), Y_glob.ravel()])
-
-    num_elements = nx * ny
-    # Pre-allocate quads array for efficiency
-    quads = np.empty((num_elements, nodes_per_element), dtype=int)
-    
-    current_element_idx = 0
-
-    # Helper function to get global node ID from global grid indices (ix_glob, iy_glob)
-    # ix_glob ranges from 0 to num_global_nodes_x - 1
-    # iy_glob ranges from 0 to num_global_nodes_y - 1
-    def get_global_node_id(ix_glob, iy_glob):
-        return iy_glob * num_global_nodes_x + ix_glob
-
-    # Iterate over each element cell (identified by its bottom-left corner's element indices)
-    for el_j in range(ny):  # Element index in y-direction
-        for el_i in range(nx):  # Element index in x-direction
-            # Determine the starting global grid indices for this element's
-            # bottom-left-most node (the node with local indices (0,0) within the element).
-            start_ix_global_grid = order * el_i
-            start_iy_global_grid = order * el_j
-            
-            current_node_in_element_idx = 0
-            # Iterate over the local nodes within the current element.
-            # The order (local_ny first, then local_nx) ensures lexicographical ordering
-            # (0,0), (1,0), ..., (order,0), (0,1), ..., (order,1), ...
-            # which matches the typical tensor-product shape function ordering from `quad_qn`.
-            for local_ny in range(nodes_per_edge_1d): # Corresponds to increasing eta node index
-                for local_nx in range(nodes_per_edge_1d): # Corresponds to increasing xi node index
-                    # Calculate global grid indices for the current local node
-                    global_ix_grid = start_ix_global_grid + local_nx
-                    global_iy_grid = start_iy_global_grid + local_ny
-                    
-                    node_id = get_global_node_id(global_ix_grid, global_iy_grid)
-                    quads[current_element_idx, current_node_in_element_idx] = node_id
-                    current_node_in_element_idx += 1
-            
-            current_element_idx += 1
-            
-    return pts, quads
-
-def structured_quad(Lx, Ly, *, nx=4, ny=4, poly_order=1):
-    """
-    Main function to generate a structured quadrilateral mesh.
-    This function is now generalized for any order.
-    """
-    if not isinstance(poly_order, int) or poly_order < 0:
-        # Delegate detailed error checking to _structured_qn, but catch common cases.
-        raise ValueError("Order must be a positive integer (e.g., 1 for Q1, 2 for Q2).")
-    
-    pts, quads = _structured_qn(Lx, Ly, nx, ny, poly_order)
-    
-    return pts, quads
-
-def structured_triangles(Lx, Ly, *, nx_quads=4, ny_quads=4, poly_order=1):
-    """
-    Main function to generate a structured triangular mesh of Pk elements.
-
-    Args:
-        Lx (float): Length of the domain in x.
-        Ly (float): Length of the domain in y.
-        nx_quads (int): Number of coarse quadrilaterals in x to be split.
-                        Results in 2*nx_quads triangles in x-bands.
-        ny_quads (int): Number of coarse quadrilaterals in y to be split.
-        order (int): Polynomial order k of the Pk elements (e.g., 1 for P1).
-
-    Returns:
-        tuple: (pts, tris) as returned by _structured_pk.
-    """
-    # 'order' here means Pk order (k)
-    pts, tris = _structured_pk(Lx, Ly, nx_quads, ny_quads, poly_order)
-    return pts, tris
+    edges = np.array(list(unique_edges), dtype=int)
+    return nodes, elements, edges, elements_corner_nodes
 
 def visualize_test_structured_quad():
     print("Running Mesh Generation Test Cases...")

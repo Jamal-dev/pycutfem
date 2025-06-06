@@ -4,55 +4,175 @@ from matplotlib.collections import LineCollection, PolyCollection
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
+# --- Helper Color/Style Definitions (from your original code) ---
 _ELEM_FILL = {
-    "inside": (0.4,0.6,1.0,0.25),   # light blue
-    "cut":    (1.0,0.55,0.0,0.45),  # orange
+    "inside": (0.4, 0.6, 1.0, 0.25),  # light blue
+    "cut": (1.0, 0.55, 0.0, 0.45),   # orange
+    "default": (0.9, 0.9, 0.9, 0.5)  # A default light grey fill
 }
-_EDGE_COLOR = {"interface":"red", "ghost":"blue"}
+_EDGE_COLOR = {"interface": "red", "ghost": "blue"}
 
-def _edge_col(tag): return _EDGE_COLOR.get(tag, 'black')
-def _elem_fill(tag): return _ELEM_FILL.get(tag, 'none')
+def _edge_col(tag):
+    return _EDGE_COLOR.get(tag, 'black')
 
-def plot_mesh(mesh, *, level_set=None, edge_colors=True,
+def _elem_fill(tag):
+    # If tag is not in _ELEM_FILL, use the default color.
+    # If tag is None or empty string, no fill will be used.
+    if not tag:
+        return 'none'
+    return _ELEM_FILL.get(tag, _ELEM_FILL["default"])
+
+# --- Refactored and Generalized plot_mesh Function ---
+def plot_mesh(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True, 
+              plot_edges=True, elem_tags=True, edge_colors=True, 
               show=True, ax=None, resolution=200):
+    """
+    Plots a 2D mesh of triangular or quadrilateral elements of any order.
+
+    Args:
+        mesh (Mesh): The mesh object to plot. It is expected to have the
+                     `_get_element_corner_global_indices` method.
+        solution_on_nodes (np.ndarray, optional): A solution vector of nodal values
+                                                  to display as a contour plot.
+        level_set (object, optional): A level-set object with a callable `evaluate_on_nodes`
+                                      or direct callable interface `level_set(points)`
+                                      to plot the zero contour line.
+        plot_nodes (bool, optional): If True, plots all nodes as points. Defaults to True.
+        plot_edges (bool, optional): If True, plots the geometric edges. Defaults to True.
+        elem_tags (bool, optional): If True, fills elements based on `mesh.elem_tag`.
+                                    Defaults to True.
+        edge_colors (bool, optional): If True, colors edges based on `mesh.edge_tag`.
+                                      This maps to the `edge_tags` parameter internally.
+        show (bool, optional): If True, calls plt.show() at the end. Defaults to True.
+        ax (matplotlib.axes.Axes, optional): An existing axes object to plot on.
+        resolution (int, optional): Grid resolution for plotting the level-set contour.
+    Returns:
+        matplotlib.axes.Axes: The axes object containing the plot.
+    """
     if ax is None:
-        fig, ax = plt.subplots()
+        fig, ax = plt.subplots(figsize=(10, 8))
 
-    # fill elems
-    polys_by_color = {}
-    if getattr(mesh, "elem_tag", None) is not None:
+    # --- Plot Filled Element Polygons (using CORNER nodes) ---
+    if elem_tags and hasattr(mesh, "elem_tag"):
+        polys_by_color = {}
         for eid, tag in enumerate(mesh.elem_tag):
-            face = _elem_fill(tag)
-            if face == 'none':
+            face_color = _elem_fill(tag)
+            if face_color == 'none':
+                # Draw a light outline for elements without a fill tag
+                polys_by_color.setdefault('outline', []).append(
+                    mesh.nodes[mesh._get_element_corner_global_indices(eid)]
+                )
                 continue
-            polys_by_color.setdefault(face, []).append(mesh.nodes[mesh.elements[eid]])
-    for col, polys in polys_by_color.items():
-        pc = PolyCollection(polys, facecolors=col, edgecolors='none', zorder=1)
-        ax.add_collection(pc)
+            
+            corner_gids = mesh._get_element_corner_global_indices(eid)
+            corner_coords = mesh.nodes[corner_gids]
+            polys_by_color.setdefault(face_color, []).append(corner_coords)
 
-    # edges
-    segs = [mesh.nodes[list(e.nodes)] for e in mesh.edges]
-    cols = [_edge_col(mesh.edge_tag[e.id]) if edge_colors else 'black' for e in mesh.edges]
-    lc = LineCollection(segs, colors=cols, linewidths=0.7, zorder=2)
-    ax.add_collection(lc)
+        for color, polys_list in polys_by_color.items():
+            if color == 'outline':
+                poly_collection = PolyCollection(polys_list, facecolors='none', 
+                                                 edgecolors=(0.1, 0.1, 0.1, 0.2), 
+                                                 linewidths=0.5, zorder=1)
+            else:
+                poly_collection = PolyCollection(polys_list, facecolors=color, 
+                                                 edgecolors='none', zorder=1, alpha=0.7)
+            ax.add_collection(poly_collection)
 
-    # level-set contour
+    # --- Plot Edges ---
+    if plot_edges and hasattr(mesh, 'edges'):
+        edge_segments = [mesh.nodes[list(edge.nodes)] for edge in mesh.edges]
+        edge_colors_list = []
+        for edge in mesh.edges:
+            color = 'black'  # Default for internal, untagged edges
+            # Check for boundary edges first
+            if edge.right is None:
+                color = 'dimgray' # Specific color for boundary edges
+            # Tagged edges override other colors
+            if edge_colors and hasattr(mesh, 'edge_tag') and mesh.edge_tag[edge.id]:
+                color = _EDGE_COLOR.get(mesh.edge_tag[edge.id], color)
+            edge_colors_list.append(color)
+        
+        line_collection = LineCollection(edge_segments, colors=edge_colors_list, 
+                                         linewidths=0.9, zorder=2)
+        ax.add_collection(line_collection)
+
+    # --- Plot Nodes (all of them, differentiating corners) ---
+    if plot_nodes:
+        # Identify all unique corner node global indices
+        corner_node_gids = set()
+        if hasattr(mesh, '_get_element_corner_global_indices'):
+            for eid in range(len(mesh.elements)):
+                corners = mesh._get_element_corner_global_indices(eid)
+                for gid in corners:
+                    corner_node_gids.add(gid)
+        
+        all_node_gids = set(range(len(mesh.nodes)))
+        ho_node_gids = list(all_node_gids - corner_node_gids)
+        corner_node_gids_list = list(corner_node_gids)
+
+        # Plot higher-order nodes (e.g., edge midpoints) first, smaller and lighter
+        if ho_node_gids:
+            ax.plot(mesh.nodes[ho_node_gids, 0], mesh.nodes[ho_node_gids, 1], 'o', 
+                    color='deepskyblue', markersize=2, zorder=3, label="Higher-Order Nodes", linestyle='None')
+
+        # Plot corner nodes on top, more prominently
+        if corner_node_gids_list:
+            ax.plot(mesh.nodes[corner_node_gids_list, 0], mesh.nodes[corner_node_gids_list, 1], 'o',
+                    color='navy', markersize=4, zorder=4, label="Corner Nodes", linestyle='None')
+        
+        # Add a legend if both types of nodes were plotted
+        if ho_node_gids and corner_node_gids_list:
+            ax.legend()
+
+
+    # --- Plot Level-Set Zero Contour ---
     if level_set is not None:
-        xmin,ymin = mesh.nodes.min(axis=0)
-        xmax,ymax = mesh.nodes.max(axis=0)
-        gx,gy = np.meshgrid(np.linspace(xmin,xmax,resolution),
-                            np.linspace(ymin,ymax,resolution))
-        phi = np.apply_along_axis(level_set,1,np.column_stack([gx.ravel(),gy.ravel()]))
-        phi = phi.reshape(gx.shape)
-        ax.contour(gx,gy,phi,levels=[0.0],colors='green',linewidths=1.0,zorder=3)
+        xmin, ymin = mesh.nodes.min(axis=0)
+        xmax, ymax = mesh.nodes.max(axis=0)
+        padding = (xmax - xmin) * 0.05
+        
+        gx, gy = np.meshgrid(np.linspace(xmin - padding, xmax + padding, resolution),
+                            np.linspace(ymin - padding, ymax + padding, resolution))
+        
+        points_to_eval = np.column_stack([gx.ravel(), gy.ravel()])
+        
+        if hasattr(level_set, 'evaluate') and callable(level_set.evaluate):
+            phi_vals = level_set.evaluate(points_to_eval)
+        elif callable(level_set):
+            phi_vals = np.apply_along_axis(level_set, 1, points_to_eval)
+        else:
+            raise TypeError("level_set must be a callable or have an 'evaluate' method.")
 
-    ax.set_aspect('equal','box')
-    ax.set_xlim(mesh.nodes[:,0].min(), mesh.nodes[:,0].max())
-    ax.set_ylim(mesh.nodes[:,1].min(), mesh.nodes[:,1].max())
+        phi_vals = phi_vals.reshape(gx.shape)
+        ax.contour(gx, gy, phi_vals, levels=[0.0], colors='green', linewidths=1.5, zorder=5)
+
+    # --- Plot Solution Contour ---
+    if solution_on_nodes is not None:
+        if len(solution_on_nodes) != len(mesh.nodes):
+            raise ValueError("Length of solution_on_nodes must match the number of mesh nodes.")
+        
+        contour = ax.tricontourf(mesh.nodes[:, 0], mesh.nodes[:, 1], solution_on_nodes,
+                                 levels=14, cmap='viridis', zorder=0, alpha=0.8)
+        plt.colorbar(contour, ax=ax, label="Solution Value")
+
+    # --- Finalize Plot ---
+    ax.set_aspect('equal', 'box')
+    xmin, ymin = mesh.nodes.min(axis=0)
+    xmax, ymax = mesh.nodes.max(axis=0)
+    xpad = (xmax - xmin) * 0.05
+    ypad = (ymax - ymin) * 0.05
+    if xpad == 0: xpad = 0.1
+    if ypad == 0: ypad = 0.1
+    ax.set_xlim(xmin - xpad, xmax + xpad)
+    ax.set_ylim(ymin - ypad, ymax + ypad)
+    ax.set_title("Mesh Visualization")
+    ax.set_xlabel("X-coordinate")
+    ax.set_ylabel("Y-coordinate")
+
     if show:
         plt.show()
+        
     return ax
-
 
 
 def visualize_mesh_node_order(pts, element_connectivity, order, element_shape, title="Mesh with Node Order"):

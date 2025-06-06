@@ -16,7 +16,7 @@ mesh = Mesh(nodes, elems, 'quad')
 KeFe = lambda eid: stiffness_matrix(mesh, eid)
 K = assemble(mesh, lambda eid: stiffness_matrix(mesh, eid))
 F = np.zeros(len(nodes))
-for eid,elem in enumerate(mesh.elements):
+for eid,elem in enumerate(mesh.elements_list):
     Fe = cg_element_load(mesh, eid, f_rhs)
     for a,A in enumerate(elem): F[A]+=Fe[a]
 dbc={}

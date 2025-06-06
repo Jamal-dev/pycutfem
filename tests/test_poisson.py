@@ -35,13 +35,13 @@ def l2_error(mesh, uh):
     return np.sqrt(np.mean((uh - u_exact(mesh.nodes[:,0], mesh.nodes[:,1]))**2))
 
 def test_poisson_quad():
-    nodes, elems = structured_quad(3,2, nx=20, ny=15, poly_order=1)
-    mesh = Mesh(nodes, elems, element_type='quad', poly_order=1)
+    nodes, elems, edge_connectvity, elem_connectivity_corner_nodes = structured_quad(3,2, nx=20, ny=15, poly_order=1)
+    mesh = Mesh(nodes, elems, edge_connectvity, elem_connectivity_corner_nodes, element_type='quad', poly_order=1)
     uh = solve(mesh)
     assert l2_error(mesh, uh) < 2e-2
 
 def test_poisson_tri():
-    nodes, elems = delaunay_rectangle(3,2, nx=20, ny=15)
-    mesh = Mesh(nodes, elems, element_type='tri', poly_order=1)
+    nodes, elems, edge_connectvity, elem_connectivity_corner_nodes = delaunay_rectangle(3,2, nx=20, ny=15)
+    mesh = Mesh(nodes, elems, edge_connectvity, elem_connectivity_corner_nodes, element_type='tri', poly_order=1)
     uh = solve(mesh)
     assert l2_error(mesh, uh) < 2e-2

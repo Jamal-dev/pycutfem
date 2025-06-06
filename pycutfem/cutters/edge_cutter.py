@@ -11,27 +11,27 @@ Criteria
 """
 import numpy as np
 
-def classify_edges(mesh, level_set=None):
-    tags = np.array([''] * len(mesh.edges), dtype=object)
+def classify_edges(mesh, level_set):
+    """
+    FIXED: The logic is now a clean if/elif/elif chain to prevent
+    misclassification and ensure all conditions are properly checked.
+    """
+    phi_nodes = level_set.evaluate_on_nodes(mesh)
+    for edge in mesh.edges_list:
+        # Check 1: Primary classification based on level set crossing vertices.
+        if phi_nodes[edge.nodes[0]] * phi_nodes[edge.nodes[1]] < 0:
+            edge.tag = 'interface'
+            continue # This edge is definitively an interface, move to the next.
 
-    if level_set is not None:
-        phi_nodes = level_set.evaluate_on_nodes(mesh)
-        for e in mesh.edges:
-            if phi_nodes[e.nodes[0]] * phi_nodes[e.nodes[1]] < 0:
-                tags[e.id] = 'interface'
-
-    # Fallback / additional classification via element tags
-    for e in mesh.edges:
-        if tags[e.id]:  # already set
-            continue
-        if e.right is None:
-            continue  # boundary edge
-        left = mesh.elem_tag[e.left]
-        right = mesh.elem_tag[e.right]
-        if {'inside', 'outside'} == {left, right} or 'cut' in (left, right):
-            tags[e.id] = 'interface'
-        elif left == right == 'cut':
-            tags[e.id] = 'ghost'
-
-    mesh.edge_tag[:] = tags
-    return tags
+        # Check 2: Fallback for interior edges based on element tags.
+        if edge.right is not None:
+            left_tag = mesh.elements_list[edge.left].tag
+            right_tag = mesh.elements_list[edge.right].tag
+            
+            # This order is important:
+            if {'inside', 'outside'} == {left_tag, right_tag}:
+                edge.tag = 'interface'
+            elif left_tag == 'cut' and right_tag == 'cut':
+                edge.tag = 'ghost'
+            elif 'cut' in (left_tag, right_tag) and left_tag != right_tag:
+                edge.tag = 'interface'

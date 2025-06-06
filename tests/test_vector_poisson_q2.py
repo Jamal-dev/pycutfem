@@ -17,13 +17,13 @@ fx  = sp.lambdify((x, y), ux_rhs, "numpy")
 fy  = sp.lambdify((x, y), uy_rhs, "numpy")
 
 def test_vector_poisson_q2():
-    nodes, elems = structured_quad(3, 2, nx=8, ny=5, poly_order=2)
-    mesh = Mesh(nodes, elems, element_type="quad",poly_order=2)
+    nodes, elem_connectivity, edge_connectvity, elem_connectivity_corner_nodes = structured_quad(3, 2, nx=8, ny=5, poly_order=2)
+    mesh = Mesh(nodes, elem_connectivity, edge_connectvity,elem_connectivity_corner_nodes, element_type="quad",poly_order=2)
     # Assemble block‑diagonal (2× scalar problems)
     K = assemble(mesh, lambda eid: stiffness_matrix(mesh, eid, quad_order=4))
     Kblock = scipy.sparse.block_diag((K, K))
     F = np.zeros(2 * len(nodes))
-    for eid, elem in enumerate(mesh.elements):
+    for eid, elem in enumerate(mesh.elements_list):
         Fe_x = cg_element_load(mesh, eid, fx, poly_order=mesh.poly_order, quad_order=4)
         Fe_y = cg_element_load(mesh, eid, fy, poly_order=mesh.poly_order, quad_order=4)
         for a, A in enumerate(elem):

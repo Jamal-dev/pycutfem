@@ -13,7 +13,13 @@ fe = sp.lambdify((x, y), f_sym, "numpy")
 def test_sipg_q1():
     nodes, elems = structured_quad(1, 1, nx=8, ny=8, poly_order=1)
     mesh = Mesh(nodes, elems, element_type="quad",poly_order=1)
-    K, F = assemble_dg(mesh, poly_order=1, penalty=100.0,dirichlet=lambda x, y: ue(x, y))
+    K,F = assemble_dg(mesh,
+                  poly_order=1,
+                  n_comp=1,
+                  alpha=10.0,
+                  symmetry=1,
+                  dirichlet=lambda x,y: ue(x,y))
+
     # Source term (volume only) — quick loop
     from pycutfem.integration import volume
     from pycutfem.fem.reference import get_reference
@@ -21,7 +27,7 @@ def test_sipg_q1():
     ref = get_reference("quad", 1)
     pts, wts = volume("quad", 3)
     n_loc = 4
-    for eid, elem in enumerate(mesh.elements):
+    for eid, elem in enumerate(mesh.elements_list):
         dofs = np.arange(n_loc) + eid * n_loc
         Fe = np.zeros(n_loc)
         for (xi, eta), w in zip(pts, wts):
@@ -34,7 +40,7 @@ def test_sipg_q1():
     uh = spla.spsolve(K, F)
     # Compute RMS nodal error (average of element nodal values)
     nodal_u = np.zeros(len(nodes)); counts = np.zeros(len(nodes))
-    for eid, elem in enumerate(mesh.elements):
+    for eid, elem in enumerate(mesh.elements_list):
         dofs = np.arange(n_loc) + eid * n_loc
         nodal_u[elem] += uh[dofs]
         counts[elem] += 1

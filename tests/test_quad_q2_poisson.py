@@ -14,11 +14,11 @@ fe = sp.lambdify((x, y), f_sym, "numpy")
 
 def solve(poly_order=2):
     quad_order = poly_order + 3
-    nodes, elems = structured_quad(3, 2, nx=10, ny=6, poly_order=poly_order)
-    mesh = Mesh(nodes, elems, element_type="quad",poly_order=poly_order)
+    nodes, elems, edge_connectvity, elem_connectivity_corner_nodes = structured_quad(3, 2, nx=10, ny=6, poly_order=poly_order)
+    mesh = Mesh(nodes, elems, edge_connectvity, elem_connectivity_corner_nodes, element_type="quad",poly_order=poly_order)
     K = assemble(mesh, lambda eid: stiffness_matrix(mesh, eid, quad_order=quad_order))
     F = np.zeros(len(nodes))
-    for eid, elem in enumerate(mesh.elements):
+    for eid, elem in enumerate(mesh.elements_list):
         Fe = cg_element_load(mesh, eid, fe,poly_order=mesh.poly_order, quad_order=quad_order)
         for a, A in enumerate(elem):
             F[A] += Fe[a]
