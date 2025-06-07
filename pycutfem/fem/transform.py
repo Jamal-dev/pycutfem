@@ -54,3 +54,20 @@ def inverse_mapping(mesh, elem_id, x, tol=1e-10, maxiter=50):
     else:
         raise ValueError(f"Inverse mapping did not converge after {maxiter} iterations for elem {elem_id}, x={x}, residual={np.linalg.norm(x - X)}")
     return xi
+
+@staticmethod
+def jacobian_1d(mesh, elem_id: int, ref_coords: tuple, local_edge_idx: int) -> float:
+    """
+    Computes the 1D Jacobian for a line integral (ratio of physical edge
+    length to reference edge length).
+    """
+    J = jacobian(mesh, elem_id, ref_coords)
+
+    if mesh.element_type == 'quad':
+        # Tangent vectors on the reference quad edges [-1,1]x[-1,1]
+        t_ref = np.array([[1, 0], [0, 1], [1, 0], [0, 1]], dtype=float)[local_edge_idx]
+    else: # tri
+        # Tangent vectors on the reference triangle edges
+        t_ref = np.array([[1, 0], [-1, 1], [0, -1]], dtype=float)[local_edge_idx]
+
+    return np.linalg.norm(J @ t_ref)

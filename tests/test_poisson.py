@@ -3,7 +3,7 @@ import numpy as np
 import scipy.sparse.linalg as spla
 import sympy as sp
 
-from pycutfem.utils.meshgen import structured_quad, delaunay_rectangle
+from pycutfem.utils.meshgen import structured_quad, delaunay_rectangle, structured_triangles
 from pycutfem.core import Mesh
 from pycutfem.assembly import stiffness_matrix, assemble
 from pycutfem.assembly.load_vector import cg_element_load
@@ -19,7 +19,7 @@ f_rhs   = sp.lambdify((x, y), f_sym, 'numpy')
 def solve(mesh):
     K = assemble(mesh, lambda eid: stiffness_matrix(mesh, eid,quad_order=5))
     F = np.zeros(len(mesh.nodes))
-    for eid, elem in enumerate(mesh.elements):
+    for eid, elem in enumerate(mesh.elements_connectivity):
         Fe = cg_element_load(mesh, eid, f_rhs, poly_order = mesh.poly_order)
         for a,A in enumerate(elem): F[A] += Fe[a]
 
@@ -41,7 +41,7 @@ def test_poisson_quad():
     assert l2_error(mesh, uh) < 2e-2
 
 def test_poisson_tri():
-    nodes, elems, edge_connectvity, elem_connectivity_corner_nodes = delaunay_rectangle(3,2, nx=20, ny=15)
+    nodes, elems, edge_connectvity, elem_connectivity_corner_nodes = structured_triangles(3,2, nx_quads=20, ny_quads=15,poly_order=1)
     mesh = Mesh(nodes, elems, edge_connectvity, elem_connectivity_corner_nodes, element_type='tri', poly_order=1)
     uh = solve(mesh)
     assert l2_error(mesh, uh) < 2e-2

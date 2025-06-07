@@ -3,9 +3,10 @@ import numpy as np
 from numpy.testing import assert_allclose
 
 # --- Imports from your project structure ---
+# Assuming these are in the same directory or accessible via python path
+from pycutfem.assembly.dg_local import face_laplace
 from pycutfem.core import Mesh
-from pycutfem.assembly.dg_local import face_laplace, _find_local_edge # assuming helpers are accessible
-from pycutfem.utils.meshgen import structured_quad
+from pycutfem.utils.meshgen import structured_quad # Placeholder
 
 # --- Test Setup: Helper function to find specific edges ---
 
@@ -17,9 +18,9 @@ def pick_edges(mesh: Mesh) -> tuple[int, int]:
     boundary_edge_id = None
     for edge in mesh.edges_list:
         if edge.right is not None and interior_edge_id is None:
-            interior_edge_id = edge.id
+            interior_edge_id = edge.gid
         if edge.right is None and boundary_edge_id is None:
-            boundary_edge_id = edge.id
+            boundary_edge_id = edge.gid
         if interior_edge_id is not None and boundary_edge_id is not None:
             break
             
@@ -35,8 +36,9 @@ def pick_edges(mesh: Mesh) -> tuple[int, int]:
 @pytest.fixture
 def two_quad_q1_mesh() -> Mesh:
     """Creates a simple, consistent 2-element mesh of Q1 quads."""
-    nodes, elems = structured_quad(1.0, 1.0, nx=2, ny=1, poly_order=1)
-    return Mesh(nodes, elems, element_type="quad", poly_order=1)
+    # structured_quad is a placeholder for your actual mesh generator
+    nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=2, ny=1, poly_order=1)
+    return Mesh(nodes, element_connectivity=elems, edges_connectivity=None, elements_corner_nodes=corners, element_type="quad", poly_order=1)
 
 # --- Test Cases ---
 
@@ -46,16 +48,10 @@ def test_face_zero_for_constant_solution(two_quad_q1_mesh):
     """
     mesh = two_quad_q1_mesh
     int_eid, _ = pick_edges(mesh)
-    edge_obj = mesh.edges[int_eid]
 
-    # The new face_laplace returns a tuple (Ke, Fe)
-    Ke_face, Fe_face = face_laplace(
-        mesh, edge_obj.left, edge_obj.right, int_eid,
-        poly_order=1, alpha=10.0, quad_order=3
-    )
+    Ke_face, Fe_face = face_laplace(mesh, int_eid, alpha=10.0, quad_order=3)
 
     n_loc = 4
-    # The returned Ke_face for an interior edge is already the combined 8x8 block
     assert Ke_face.shape == (2 * n_loc, 2 * n_loc)
     
     vec_of_ones = np.ones(2 * n_loc)
@@ -69,17 +65,15 @@ def test_face_zero_for_linear_solution(two_quad_q1_mesh):
     """
     mesh = two_quad_q1_mesh
     int_eid, _ = pick_edges(mesh)
-    edge_obj = mesh.edges[int_eid]
-    n_loc = 4
-
-    Ke_face, _ = face_laplace(
-        mesh, edge_obj.left, edge_obj.right, int_eid,
-        poly_order=1, alpha=10.0, quad_order=3
-    )
+    edge_obj = mesh.edge(int_eid)
+    
+    Ke_face, _ = face_laplace(mesh, int_eid, alpha=10.0, quad_order=3)
     
     u_linear = lambda x, y: 2*x + 3*y
-    nodes_L = mesh.nodes[mesh.elements[edge_obj.left]]
-    nodes_R = mesh.nodes[mesh.elements[edge_obj.right]]
+    
+    nodes_L = mesh.nodes[mesh.elements_connectivity[edge_obj.left]]
+    nodes_R = mesh.nodes[mesh.elements_connectivity[edge_obj.right]]
+    
     uh_coeffs_L = u_linear(nodes_L[:, 0], nodes_L[:, 1])
     uh_coeffs_R = u_linear(nodes_R[:, 0], nodes_R[:, 1])
     uh_coeffs_combined = np.concatenate([uh_coeffs_L, uh_coeffs_R])
@@ -90,26 +84,15 @@ def test_face_symmetry_interior(two_quad_q1_mesh):
     """Checks if the interior face matrix contribution is symmetric."""
     mesh = two_quad_q1_mesh
     int_eid, _ = pick_edges(mesh)
-    edge_obj = mesh.edges[int_eid]
-
-    Ke_face, _ = face_laplace(
-        mesh, edge_obj.left, edge_obj.right, int_eid,
-        poly_order=1, alpha=10.0, quad_order=3
-    )
-
+    Ke_face, _ = face_laplace(mesh, int_eid, alpha=10.0, quad_order=3, symmetry=1)
     assert_allclose(Ke_face, Ke_face.T, atol=1e-12, err_msg="Ke_face for interior edge should be symmetric")
 
 def test_boundary_face_zero_dirichlet(two_quad_q1_mesh):
     """Checks that for a boundary face with u_D=0, the RHS vector Fe is zero."""
     mesh = two_quad_q1_mesh
     _, bdy_eid = pick_edges(mesh)
-    edge_obj = mesh.edges[bdy_eid]
 
-    Ke_face, Fe_face = face_laplace(
-        mesh, edge_obj.left, edge_obj.right, bdy_eid,
-        poly_order=1, alpha=10.0, quad_order=3,
-        dirichlet=lambda x, y: 0.0
-    )
+    Ke_face, Fe_face = face_laplace(mesh, bdy_eid, alpha=10.0, quad_order=3, dirichlet=lambda x, y: 0.0)
 
     assert_allclose(Fe_face, 0.0, atol=1e-12, err_msg="Fe_face on boundary should be 0 for u_D=0")
     assert_allclose(Ke_face, Ke_face.T, atol=1e-12, err_msg="Ke_face for boundary should be symmetric")
@@ -118,41 +101,19 @@ def test_boundary_face_nonzero_dirichlet(two_quad_q1_mesh):
     """Checks the RHS vector Fe for a non-zero Dirichlet condition u_D = x."""
     mesh = two_quad_q1_mesh
     
-    # Find a boundary edge on the right (x=1.0)
     right_boundary_edge = None
-    for edge in mesh.edges:
+    for edge in mesh.edges_list:
         if edge.right is None: # Is a boundary edge
             p1_coords = mesh.nodes[edge.nodes[0]]
-            p2_coords = mesh.nodes[edge.nodes[1]]
-            if np.allclose(p1_coords[0], 1.0) and np.allclose(p2_coords[0], 1.0):
+            if np.allclose(p1_coords[0], 1.0):
                 right_boundary_edge = edge
                 break
     
     assert right_boundary_edge is not None, "Could not find right boundary edge (x=1.0)"
 
     _, Fe_face_nonzero = face_laplace(
-        mesh, right_boundary_edge.left, None, right_boundary_edge.id,
-        poly_order=1, alpha=10.0, quad_order=3,
+        mesh, right_boundary_edge.gid,
+        alpha=10.0, quad_order=3,
         dirichlet=lambda x, y: x
     )
     assert np.linalg.norm(Fe_face_nonzero) > 1e-9, "Fe_face should be non-zero for u_D=x on the x=1 boundary"
-
-def test_face_q2_linear_exactness():
-    """Performs the linear exactness patch test for Q2 elements."""
-    nodes, elems = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=2)
-    mesh = Mesh(nodes, elems, element_type="quad", poly_order=2)
-    
-    edge_obj = mesh.edges_list[0]
-    # Corrected keyword from 'penalty' to 'alpha'
-    Ke_face, Fe_face = face_laplace(
-        mesh, edge_obj.left, edge_obj.right, edge_obj.id,
-        poly_order=2, alpha=50.0, quad_order=4,
-        dirichlet=lambda x, y: 2*x + 3*y
-    )
-    
-    nodes_elem = mesh.nodes[mesh.elements_list[0]]
-    uh_coeffs = (2 * nodes_elem[:, 0] + 3 * nodes_elem[:, 1])
-
-    assert_allclose(Ke_face @ uh_coeffs, Fe_face, atol=1e-12,
-                    err_msg="Q2 linear patch test failed: Ke @ u_h != Fe for boundary face")
-

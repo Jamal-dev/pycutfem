@@ -74,12 +74,13 @@ class Node:
 
 @dataclass(slots=True)
 class Edge:
-    id: int                   
+    gid: int                   
     nodes: Tuple[int, int]      # Global node indices of the edge's endpoints      
     left: Optional[int]         # Element ID on the left side of the edge 
     right: Optional[int]        # Element ID on the right side of the edge
     normal: np.ndarray          # Normal vector, pointing outward from the left element
     tag: str = ""
+    lid: Optional[int] = None      # Local edge index within the left element
     def calc_tangent_unit_vector(self):
         """Calculate the unit tangent vector of the edge."""
         dx = self.nodes[1] - self.nodes[0]
@@ -103,11 +104,8 @@ class Element:
     corner_nodes: Tuple[int, ...] = field(default_factory=tuple)  # Global node indices of the element's corners
     tag: str = ""               # Optional tag for the element
     edges: Tuple[int, ...] = field(default_factory=tuple)
-    left: Optional[int] = None    # Left element ID (for interior edges)
-    right: Optional[int] = None   # Right element ID (for interior edges)
-    top: Optional[int] = None      # Top element ID (for boundary edges)
-    bottom: Optional[int] = None  # Bottom element ID (for boundary edges)
     element_type: str = "quad"
+    neighbors: Dict[int, Optional[int]] = field(default_factory=dict)
     poly_order: int = 1
     def contains_node(self, node_id: int) -> bool:
         """Check if the element contains a specific node."""

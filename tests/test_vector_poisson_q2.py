@@ -26,13 +26,13 @@ def test_vector_poisson_q2():
     for eid, elem in enumerate(mesh.elements_list):
         Fe_x = cg_element_load(mesh, eid, fx, poly_order=mesh.poly_order, quad_order=4)
         Fe_y = cg_element_load(mesh, eid, fy, poly_order=mesh.poly_order, quad_order=4)
-        for a, A in enumerate(elem):
+        for a, A in enumerate(elem.nodes):
             F[A] += Fe_x[a]
             F[A + len(nodes)] += Fe_y[a]
 
     # Dirichlet on both components
     dbc = {}
-    for dof, (xp, yp) in enumerate(nodes):
+    for dof, (xp, yp) in enumerate(mesh.nodes):
         if np.isclose(xp, 0) | np.isclose(xp, 3) | np.isclose(yp, 0) | np.isclose(yp, 2):
             dbc[dof]                 = uex(xp, yp)
             dbc[dof + len(nodes)] = uey(xp, yp)
@@ -41,6 +41,6 @@ def test_vector_poisson_q2():
     uh = spla.spsolve(Kbc, Fbc)
     ux_h = uh[:len(nodes)]
     uy_h = uh[len(nodes):]
-    err = np.sqrt(np.mean((ux_h - uex(nodes[:, 0], nodes[:, 1]))**2 +
-                         (uy_h - uey(nodes[:, 0], nodes[:, 1]))**2))
+    err = np.sqrt(np.mean((ux_h - uex(mesh.nodes[:, 0], mesh.nodes[:, 1]))**2 +
+                         (uy_h - uey(mesh.nodes[:, 0], mesh.nodes[:, 1]))**2))
     assert err < 1e-2

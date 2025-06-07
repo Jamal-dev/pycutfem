@@ -20,14 +20,14 @@ def solve(poly_order=2):
     F = np.zeros(len(nodes))
     for eid, elem in enumerate(mesh.elements_list):
         Fe = cg_element_load(mesh, eid, fe,poly_order=mesh.poly_order, quad_order=quad_order)
-        for a, A in enumerate(elem):
+        for a, A in enumerate(elem.nodes):
             F[A] += Fe[a]
 
-    dbc = {dof: ue(xp, yp) for dof, (xp, yp) in enumerate(nodes)
+    dbc = {dof: ue(xp, yp) for dof, (xp, yp) in enumerate(mesh.nodes)
            if np.isclose(xp, 0) | np.isclose(xp, 3) | np.isclose(yp, 0) | np.isclose(yp, 2)}
     K, F = apply_dirichlet(K, F, dbc)
     uh = spla.spsolve(K, F)
-    err = np.sqrt(np.mean((uh - ue(nodes[:, 0], nodes[:, 1]))**2))
+    err = np.sqrt(np.mean((uh - ue(mesh.nodes[:, 0], mesh.nodes[:, 1]))**2))
     return err
 
 def test_poisson_q2():
