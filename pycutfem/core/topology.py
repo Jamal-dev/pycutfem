@@ -69,6 +69,13 @@ class Node:
 
     def __hash__(self):
         return hash((self.x, self.y))
+    def __getitem__(self, idx):
+        if   idx == 0: return self.x
+        elif idx == 1: return self.y
+        raise IndexError("Node supports indices 0 (x) and 1 (y)")
+    def __iter__(self):
+        yield self.x
+        yield self.y
 
 
 

@@ -25,8 +25,8 @@ class Mesh:
     def __init__(self,
                  nodes: List['Node'],
                  element_connectivity: np.ndarray,
-                 edges_connectivity: np.ndarray,
-                 elements_corner_nodes: np.ndarray,
+                 edges_connectivity: np.ndarray = None,
+                 elements_corner_nodes: np.ndarray = None,
                  *,
                  element_type: str = 'tri',
                  poly_order: int = 1):
@@ -37,7 +37,8 @@ class Mesh:
         self.element_type = element_type
         self.poly_order = poly_order
         self.nodes_list: List['Node'] = nodes
-        self.nodes = np.array([[n.x, n.y] for n in self.nodes_list], dtype=float)
+        self.nodes_x_y_pos = np.array([[n.x, n.y] for n in self.nodes_list], dtype=float)
+        self.nodes = np.array([n.id for n in self.nodes_list])
         self.elements_connectivity: np.ndarray = element_connectivity
         self.corner_connectivity: np.ndarray = elements_corner_nodes
         self.elements_list: List['Element'] = []
@@ -101,7 +102,7 @@ class Mesh:
 
     def _compute_normal(self, directed_edge_nodes: Tuple[int, int]) -> np.ndarray:
         """Computes an outward-pointing unit normal for a directed edge."""
-        v_start, v_end = self.nodes[directed_edge_nodes[0]], self.nodes[directed_edge_nodes[1]]
+        v_start, v_end = self.nodes_x_y_pos[directed_edge_nodes[0]], self.nodes_x_y_pos[directed_edge_nodes[1]]
         directed_vec = v_end - v_start
         raw_normal = np.array([directed_vec[1], -directed_vec[0]], dtype=float)
         length = np.linalg.norm(raw_normal)
@@ -111,7 +112,7 @@ class Mesh:
 
     def _get_node_coords(self) -> np.ndarray:
         """Helper to get node coordinates as a NumPy array."""
-        return self.nodes
+        return self.nodes_x_y_pos
         
     def _phi_on_centroids(self, level_set) -> np.ndarray:
         """Compute φ at each element’s centroid."""
@@ -207,7 +208,7 @@ class Mesh:
         """Applies tags to boundary edges based on their midpoint location."""
         for edge in self.edges_list:
             if edge.right is None:
-                midpoint = self.nodes[list(edge.nodes)].mean(axis=0)
+                midpoint = self.nodes_x_y_pos[list(edge.nodes)].mean(axis=0)
                 for tag_name, func in tag_functions.items():
                     if func(midpoint[0], midpoint[1]):
                         edge.tag = tag_name
@@ -217,7 +218,7 @@ class Mesh:
         """Calculates the geometric area of each element."""
         element_areas = np.zeros(len(self.elements_list))
         for elem in self.elements_list:
-            corner_coords = self.nodes[list(elem.corner_nodes)]
+            corner_coords = self.nodes_x_y_pos[list(elem.corner_nodes)]
             if self.element_type == 'tri':
                 v0, v1, v2 = corner_coords[0], corner_coords[1], corner_coords[2]
                 element_areas[elem.id] = 0.5 * np.abs(np.cross(v1 - v0, v2 - v0))
