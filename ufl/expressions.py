@@ -36,9 +36,29 @@ class Expression:
     def restrict(self, domain_tag): return Restriction(self, domain_tag)
     def side(self, s: str):            # ‘+’ or ‘-’
         return Side(self, s)
+    def find_first(self, criteria):
+        """Recursively search for the first node in the expression tree that meets a criteria."""
+        if criteria(self):
+            return self
+
+        # Recurse through operands
+        if hasattr(self, 'a') and hasattr(self, 'b'):
+            found = self.a.find_first(criteria)
+            if found: return found
+            found = self.b.find_first(criteria)
+            if found: return found
+        elif hasattr(self, 'operand'):
+            return self.operand.find_first(criteria)
+        elif hasattr(self, 'v'): # For Avg, Jump
+            return self.v.find_first(criteria)
+        elif hasattr(self, 'f'): # For Restriction, Side
+            return self.f.find_first(criteria)
+        
+        return None
 
 class Function(Expression):
-    def __init__(self, fs, name=""): self.function_space = fs; self.name = name
+    def __init__(self, field_name, name=""): 
+        self.field_name = field_name; self.name = name
 
 class TrialFunction(Function): pass
 class TestFunction(Function): pass
@@ -55,7 +75,18 @@ class Prod(Expression):
 class Div(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
 class Grad(Expression):
-    def __init__(self, operand): self.operand = operand
+    def __init__(self, operand):
+        self.operand = operand
+    def __getitem__(self, index):
+        # This allows syntax like grad(u)[0] for the x-component
+        return Derivative(self.operand, index)
+
+class Derivative(Expression):
+    """Represents the derivative of a function with respect to a specific coordinate."""
+    def __init__(self, f, component_index):
+        self.f = f
+        self.component_index = component_index
+
 class DivOperation(Expression): # Renamed to avoid conflict with Div expression
     def __init__(self, operand): self.operand = operand
 class Inner(Expression):
@@ -83,7 +114,12 @@ class Integral(Expression):
 
 # --- Helper functions to create operator instances ---
 def grad(v): return Grad(v)
-def div(v): return DivOperation(v)
+def div(v):
+    """Computes the divergence of a vector field represented by a tuple of functions."""
+    if isinstance(v, (list, tuple)) and len(v) == 2:
+        # div(u) -> du_x/dx + du_y/dy
+        return Derivative(v[0], 0) + Derivative(v[1], 1)
+    raise TypeError("div() is only implemented for 2D vector fields (list/tuple of two functions).")
 def inner(a, b): return Inner(a, b)
 def dot(a, b): return Inner(a, b)
 def outer(a, b): return Outer(a, b)

@@ -3,19 +3,26 @@ import numpy as np
 import scipy.sparse.linalg as spla
 import sympy as sp
 
-# --- Imports from your project structure ---
-from pycutfem.core import Mesh, Node
-from pycutfem.utils.meshgen import structured_quad
-from ufl.functionspace import FunctionSpace
+# --- Core imports from the refactored library ---
+from pycutfem.core.mesh import Mesh
+from pycutfem.core.dofhandler import DofHandler
+
+# --- UFL-like imports ---
 from ufl.expressions import TrialFunction, TestFunction, grad, inner, dot, Constant
 from ufl.measures import dx
-from ufl.forms import assemble_form, BoundaryCondition
+from ufl.forms import BoundaryCondition, assemble_form
 from ufl.analytic import Analytic, x, y
+
+# --- Utility imports ---
+from pycutfem.utils.meshgen import structured_quad
+
 
 def test_advection_diffusion_solve():
     """
     Tests the symbolic solver for a steady-state advection-diffusion problem.
     -∇⋅(ε∇u) + β⋅∇u = f
+    
+    This test is updated to use the DofHandler-centric framework.
     """
     # 1. Define Analytical Solution and Parameters
     beta_vec = np.array([1.0, 1.0])
@@ -25,50 +32,66 @@ def test_advection_diffusion_solve():
     f_sym = -epsilon*sp.diff(u_exact_sym, x, 2) - epsilon*sp.diff(u_exact_sym, y, 2) + \
             beta_vec[0]*sp.diff(u_exact_sym, x) + beta_vec[1]*sp.diff(u_exact_sym, y)
 
-    u_exact = Analytic(u_exact_sym)
+    # The 'value' for a BC must be a callable function (lambda x, y: ...),
+    # so we use sympy.lambdify to create it from the symbolic expression.
+    u_exact_func = sp.lambdify((x, y), u_exact_sym, 'numpy')
+    
+    # The source term `f` can remain an Analytic object for the compiler.
     f = Analytic(f_sym)
 
-    # 2. Setup Mesh and Function Space
-    nodes_coords, elems, _, corners = structured_quad(1, 1, nx=8, ny=8, poly_order=2)
-    nodes_list = [Node(id=i, x=c[0], y=c[1]) for i,c in enumerate(nodes_coords)]
-    mesh = Mesh(nodes=nodes_list, element_connectivity=elems, 
-                elements_corner_nodes=corners, element_type="quad", poly_order=2)
+    # 2. Setup Mesh and DofHandler (which replaces FunctionSpace)
+    poly_order = 1
+    nodes, elems, _, corners = structured_quad(1, 1, nx=8, ny=8, poly_order=poly_order)
+    mesh = Mesh(nodes=nodes, element_connectivity=elems, 
+                elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
 
-    V = FunctionSpace(mesh, p=2, dim=1) # Scalar problem
+    # Define the field and create the DofHandler. This is the modern way
+    # to define the problem's function space.
+    fe_map = {'u': mesh}
+    dof_handler = DofHandler(fe_map, method='cg')
 
     # 3. Define the Weak Form
-    u, v = TrialFunction(V), TestFunction(V)
+    # Trial/Test functions are now identified by their field name (string).
+    u = TrialFunction('u')
+    v = TestFunction('u')
     beta = Constant(beta_vec)
 
-    # Weak form: ∫(ε∇v⋅∇u + (β⋅∇u)v)dx = ∫fv dx
+    # The weak form definition remains syntactically the same.
     a = (epsilon * inner(grad(u), grad(v)) + dot(beta, grad(u)) * v) * dx()
     L = f * v * dx()
-    
     equation = (a == L)
 
     # 4. Define Boundary Conditions
-    # We strongly impose Dirichlet BCs on the whole boundary for this test
-    mesh.tag_boundary_edges({'boundary': lambda x,y: True})
-    bcs = [BoundaryCondition(V, 'dirichlet', 'boundary', u_exact)]
+    # The BoundaryCondition class now takes the field name as a string.
+    mesh.tag_boundary_edges({'boundary': lambda x, y: True})
+    bcs = [
+        BoundaryCondition(
+            field='u', 
+            method='dirichlet', 
+            domain_tag='boundary', 
+            value=u_exact_func
+        )
+    ]
 
     # 5. Assemble and Solve
-    K, F = assemble_form(equation, function_space=V,mesh=mesh, bcs=bcs, quad_order=4)
-    uh = spla.spsolve(K, F)
+    # The assemble_form function now takes the DofHandler as the main argument
+    # for managing the function space and mesh.
+    K, F = assemble_form(equation, dof_handler=dof_handler, bcs=bcs, quad_order=4)
+    uh_vec = spla.spsolve(K, F)
 
     # 6. Verify Solution
-    # We approximate the L2 error by checking the error at the nodes
-    nodal_uh = np.zeros(len(mesh.nodes_list))
-    counts = np.zeros(len(mesh.nodes_list))
-    n_loc = V.num_local_dofs()
-
-    for eid, elem in enumerate(mesh.elements_list):
-        dofs = np.arange(n_loc) + eid * n_loc
-        nodal_uh[list(elem.nodes)] += uh[dofs]
-        counts[list(elem.nodes)] += 1
-    nodal_uh /= counts
+    # For a CG simulation, the resulting solution vector `uh_vec` directly
+    # corresponds to the values at the nodes of the mesh.
     
-    exact_vals_at_nodes = u_exact.eval(mesh.nodes_x_y_pos)
-    l2_error = np.sqrt(np.mean((nodal_uh - exact_vals_at_nodes)**2))
+    # Get the coordinates of all DOFs from the mesh's node list.
+    node_coords = mesh.nodes_x_y_pos
+    
+    # Evaluate the exact solution at every node for comparison.
+    exact_vals_at_nodes = u_exact_func(node_coords[:, 0], node_coords[:, 1])
+    
+    # The L2 error can be computed directly between the solution vector
+    # and the exact values at the nodes.
+    l2_error = np.sqrt(np.mean((uh_vec - exact_vals_at_nodes)**2))
     
     print(f"\nL2 Error for Advection-Diffusion problem: {l2_error:.4e}")
     assert l2_error < 0.05, "Solution error is too high."

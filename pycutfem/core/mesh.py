@@ -213,6 +213,61 @@ class Mesh:
                     if func(midpoint[0], midpoint[1]):
                         edge.tag = tag_name
                         break
+    
+    def tag_edges(self, tag_functions: Dict[str, Callable[[float, float], bool]], overwrite=True):
+        """
+        Applies tags to ANY edge (boundary or interior) based on its midpoint location.
+
+        Args:
+            tag_functions: Dictionary mapping tag names to boolean functions.
+            overwrite (bool): If True, it will overwrite any existing tags on the edges.
+        """
+        for edge in self.edges_list:
+            # Skip if the edge already has a tag and we are not overwriting
+            if edge.tag and not overwrite:
+                continue
+
+            midpoint = self.nodes_x_y_pos[list(edge.nodes)].mean(axis=0)
+            for tag_name, func in tag_functions.items():
+                if func(midpoint[0], midpoint[1]):
+                    edge.tag = tag_name
+                    break # Stop after the first matching tag is found
+
+    # ==================================================================
+    # NEW FUNCTION 2: Collect DOFs from tagged edges
+    # ==================================================================
+    def get_dofs_from_tags(self, dof_map: Dict[str, List[str]]) -> Dict[str, List[int]]:
+        """
+        Collects unique node IDs (DOFs) from edges based on their tags.
+
+        Args:
+            dof_map: A dictionary where keys are DOF set names (e.g., 'dirichlet')
+                     and values are lists of edge tags to be included in that set.
+                     Example: {'dirichlet': ['left', 'wall'], 'neumann': ['inlet']}
+
+        Returns:
+            A dictionary where keys are the DOF set names and values are sorted
+            lists of unique node IDs.
+        """
+        # Use sets to automatically handle duplicate node IDs
+        dof_sets = {name: set() for name in dof_map.keys()}
+
+        # Create a reverse map (tag -> dof_name) for efficient lookup
+        tag_to_dof_name = {}
+        for dof_name, tags in dof_map.items():
+            for tag in tags:
+                tag_to_dof_name[tag] = dof_name
+
+        # Iterate through all edges and collect the nodes
+        for edge in self.edges_list:
+            if edge.tag in tag_to_dof_name:
+                dof_name = tag_to_dof_name[edge.tag]
+                # .update() adds all items from the tuple (n1, n2) to the set
+                dof_sets[dof_name].update(edge.nodes)
+
+        # Return a dictionary with sorted lists of unique node IDs
+        return {name: sorted(list(nodes)) for name, nodes in dof_sets.items()}
+
 
     def areas(self) -> np.ndarray:
         """Calculates the geometric area of each element."""

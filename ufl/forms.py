@@ -1,4 +1,5 @@
 from ufl.expressions import Expression, Integral, Sum, Sub, Prod, Constant
+from typing import Callable
 # from .compilers import FormCompiler
 
 class Form(Expression):
@@ -36,15 +37,39 @@ class Equation:
 
 
 class BoundaryCondition:
-    """type: 'dirichlet' | 'neumann' · tag: mesh facet label · value: Expression"""
-    def __init__(self, V, type_, tag, value):
-        self.V = V
-        t = type_.lower()
-        if t not in ("dirichlet", "neumann"):
-            raise ValueError("BC type must be Dirichlet or Neumann")
-        self.type, self.tag, self.value = t, tag, value
+    """
+    Defines a boundary condition for a specific field.
 
-def assemble_form(equation, function_space, mesh,bcs=[], quad_order=None):
+    Attributes:
+        field (str): The name of the field this BC applies to (e.g., 'velocity_x').
+        method (str): The type of BC, e.g., 'dirichlet'.
+        domain_tag (str): The tag on the mesh boundary where this BC is applied.
+        value (Callable): A function `lambda x, y: value` that gives the BC value.
+    """
+    def __init__(self, field: str, method: str, domain_tag: str, value: Callable):
+        self.field = field
+        m = method.lower()
+        if m not in ("dirichlet", "neumann"):
+            raise ValueError("BC method must be 'dirichlet' or 'neumann'")
+        self.method = m
+        self.domain_tag = domain_tag
+        self.value = value
+
+def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None):
+    """
+    High-level function to assemble a weak form into a matrix and vector.
+
+    Args:
+        equation (Equation): The equation (a == L) to assemble.
+        dof_handler (DofHandler): The degree-of-freedom manager for the problem.
+        bcs (list): A list of BoundaryCondition objects.
+        quad_order (int, optional): The quadrature order. Defaults to p+2.
+
+    Returns:
+        (scipy.sparse.csr_matrix, numpy.ndarray): The assembled stiffness matrix K
+                                                  and load vector F.
+    """
+    # Local import to avoid circular dependencies
     from ufl.compilers import FormCompiler
-    compiler = FormCompiler(mesh,function_space, quad_order)
+    compiler = FormCompiler(dof_handler, quad_order)
     return compiler.assemble(equation, bcs)
