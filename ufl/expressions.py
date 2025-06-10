@@ -38,10 +38,7 @@ class Expression:
         return Side(self, s)
     def find_first(self, criteria):
         """Recursively search for the first node in the expression tree that meets a criteria."""
-        if criteria(self):
-            return self
-
-        # Recurse through operands
+        if criteria(self): return self
         if hasattr(self, 'a') and hasattr(self, 'b'):
             found = self.a.find_first(criteria)
             if found: return found
@@ -49,11 +46,13 @@ class Expression:
             if found: return found
         elif hasattr(self, 'operand'):
             return self.operand.find_first(criteria)
-        elif hasattr(self, 'v'): # For Avg, Jump
-            return self.v.find_first(criteria)
-        elif hasattr(self, 'f'): # For Restriction, Side
+        elif hasattr(self, 'f'):
             return self.f.find_first(criteria)
-        
+        elif hasattr(self, 'u_pos'): # For Jump
+            found = self.u_pos.find_first(criteria)
+            if found: return found
+            found = self.u_neg.find_first(criteria)
+            if found: return found
         return None
 
 class Function(Expression):
@@ -64,6 +63,11 @@ class TrialFunction(Function): pass
 class TestFunction(Function): pass
 class Constant(Expression):
     def __init__(self, value): self.value = np.asarray(value)
+
+class ElementWiseConstant(Expression):
+    """Represents a constant value that varies from element to element (e.g., kappa)."""
+    def __init__(self, values: np.ndarray):
+        self.values = values
 
 class FacetNormal(Expression): pass
 class Sum(Expression):
@@ -94,7 +98,10 @@ class Inner(Expression):
 class Outer(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
 class Jump(Expression):
-    def __init__(self, v, n=None): self.v, self.n = v, n
+    """Represents the jump of a field across an interface: u_on_pos - u_on_neg"""
+    def __init__(self, u_on_pos, u_on_neg):
+        self.u_pos = u_on_pos
+        self.u_neg = u_on_neg
 class Avg(Expression):
     def __init__(self, v): self.v = v
 class Restriction(Expression):

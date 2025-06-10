@@ -48,7 +48,7 @@ def tri_rule(order: int,dunavant_deg: int = None):
     return np.array(pts), np.array(wts)
 
 # -------------------------------------------------------------------------
-# Edge / facet rules (reference domain)
+# Edge / facet rules (reference domain) pycutfem/integration/quadrature.py
 # -------------------------------------------------------------------------
 def edge(element_type: str, edge_index: int, order: int = 2):
     xi, wi = gauss_legendre(order)

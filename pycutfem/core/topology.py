@@ -114,9 +114,16 @@ class Element:
     element_type: str = "quad"
     neighbors: Dict[int, Optional[int]] = field(default_factory=dict)
     poly_order: int = 1
+    centroid_x: float = None
+    centroid_y: float = None
     def contains_node(self, node_id: int) -> bool:
         """Check if the element contains a specific node."""
         return node_id in self.nodes
     def contains_edge(self, edge_id: int) -> bool:
         """Check if the element contains a specific edge."""
         return edge_id in self.edges
+    def centroid(self) -> Tuple[float, float]:
+        """Calculate the centroid of the element."""
+        if self.centroid_x is None or self.centroid_y is None:
+            raise ValueError("Centroid coordinates are not set. Please calculate the centroid first.")
+        return self.centroid_x, self.centroid_y

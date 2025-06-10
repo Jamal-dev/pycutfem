@@ -55,12 +55,17 @@ class Mesh:
 
         # Step 1: Create basic Element objects
         for eid, elem_nodes in enumerate(self.elements_connectivity):
+            centroid_x = np.mean([self.nodes_x_y_pos[nid,0] for nid in self.corner_connectivity[eid]])
+            centroid_y = np.mean([self.nodes_x_y_pos[nid,1] for nid in self.corner_connectivity[eid]])
+
             self.elements_list.append(Element(
                 id=eid,
                 element_type=self.element_type,
                 poly_order=self.poly_order,
                 nodes=tuple(elem_nodes),
                 corner_nodes=tuple(self.corner_connectivity[eid]),
+                centroid_x=centroid_x,
+                centroid_y=centroid_y,
             ))
 
         # Step 2: Build map from each edge to the elements that share it
