@@ -18,6 +18,7 @@ from ufl.forms import BoundaryCondition, assemble_form
 # --- Level Set and Cut Ratio imports ---
 from pycutfem.core.levelset import CircleLevelSet
 from pycutfem.utils.geometry import hansbo_cut_ratio
+from pycutfem.io.visualization import plot_mesh_2
 
 
 def test_cutfem_poisson_interface():
@@ -28,10 +29,11 @@ def test_cutfem_poisson_interface():
     """
     # 1. Setup Mesh and Level Set
     poly_order = 1
-    nodes, elems, _, corners = structured_quad(2, 2, nx=10, ny=10, poly_order=poly_order)
+    L,H = 2.0, 2.0
+    nodes, elems, _, corners = structured_quad(L,H, nx=10, ny=10, poly_order=poly_order)
     mesh = Mesh(nodes, element_connectivity=elems, elements_corner_nodes=corners, poly_order=poly_order, element_type='quad')
     
-    level_set = CircleLevelSet(center=(0.0, 0.0), radius=0.7)
+    level_set = CircleLevelSet(center=(L/2,H/2), radius=0.5)
 
     # Classify mesh elements and edges against the level set
     mesh.classify_elements(level_set)
@@ -41,6 +43,11 @@ def test_cutfem_poisson_interface():
     neg_elements = get_domain_bitset(mesh, 'element', 'outside')
     pos_elements = get_domain_bitset(mesh, 'element', 'inside')
     cut_elements = get_domain_bitset(mesh, 'element', 'cut')
+    has_pos_elements = pos_elements | cut_elements
+    has_neg_elements = neg_elements | cut_elements
+    print(f"Negative elements: {neg_elements}, Positive elements: {pos_elements}, Cut elements: {cut_elements}")
+    print(f"Has positive elements: {has_pos_elements}, Has negative elements: {has_neg_elements}")
+    plot_mesh_2(mesh,level_set=level_set)
     
     # Interface edges for the `ds` integral
     if_edges = get_domain_bitset(mesh, 'edge', 'interface')

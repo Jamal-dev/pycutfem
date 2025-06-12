@@ -76,6 +76,24 @@ class Mesh:
                 key = tuple(sorted((c1, c2)))
                 edge_incidences.setdefault(key, []).append(eid)
 
+        def _locate_all_nodes_in_edge(vA: int, vB: int) -> Tuple[int, int]:
+            x0, y0 = self.nodes_x_y_pos[vA]
+            x1, y1 = self.nodes_x_y_pos[vB]
+            dx, dy = x1 - x0, y1 - y0
+            L2 = dx*dx + dy*dy
+            tol = 1e-12 * np.sqrt(L2)
+
+            ids = []
+            for nd in self.nodes_list:
+                cross = abs((nd.x - x0)*dy - (nd.y - y0)*dx)
+                if cross > tol:
+                    continue
+                dot = (nd.x - x0)*dx + (nd.y - y0)*dy
+                if -tol <= dot <= L2 + tol:
+                    ids.append(nd.id)
+            # sort along the edge for reproducibility
+            ids.sort(key=lambda nid: (self.nodes_x_y_pos[nid,0]-x0)*dx + (self.nodes_x_y_pos[nid,1]-y0)*dy)
+            return tuple(ids)
         # Step 3: Create unique Edge objects
         for edge_gid, ((n_min, n_max), shared_eids) in enumerate(edge_incidences.items()):
             left_eid = shared_eids[0]
@@ -87,7 +105,8 @@ class Mesh:
                     break
             right_eid = shared_eids[1] if len(shared_eids) > 1 else None
             normal_vec = self._compute_normal((vA, vB))
-            edge_obj = Edge(gid=edge_gid, nodes=(vA, vB), left=left_eid, right=right_eid, normal=normal_vec)
+            all_edge_nodes = _locate_all_nodes_in_edge(vA, vB)
+            edge_obj = Edge(gid=edge_gid, nodes=(vA, vB), left=left_eid, right=right_eid, normal=normal_vec,all_nodes=all_edge_nodes)
             self.edges_list.append(edge_obj)
             self._edge_dict[(n_min, n_max)] = edge_obj
             if right_eid is not None:

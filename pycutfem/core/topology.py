@@ -88,6 +88,7 @@ class Edge:
     normal: np.ndarray          # Normal vector, pointing outward from the left element
     tag: str = ""
     lid: Optional[int] = None      # Local edge index within the left element
+    all_nodes: Tuple[int, ...] = ()
     def calc_tangent_unit_vector(self):
         """Calculate the unit tangent vector of the edge."""
         dx = self.nodes[1] - self.nodes[0]

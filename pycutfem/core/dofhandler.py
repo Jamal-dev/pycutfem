@@ -1,7 +1,8 @@
 # pycutfem/core/dofhandler.py
 
 import numpy as np
-from typing import Dict, List, Set, Callable, Tuple
+from typing import Dict, List, Set, Tuple, Callable, Mapping, Iterable, Union, Any
+
 
 # We assume the Mesh class and its components are in a sibling file.
 from pycutfem.core.mesh import Mesh
@@ -12,114 +13,196 @@ from ufl.forms import BoundaryCondition
 
 
 
+BcLike = Union[BoundaryCondition, Mapping[str, Any]]
+
+# -----------------------------------------------------------------------------
+#  Main class
+# -----------------------------------------------------------------------------
 class DofHandler:
-    """
-    Manages degrees of freedom (DOFs) for multi-field finite element problems.
-    """
+    """Centralised DOF numbering and boundary‑condition helpers."""
 
-    def __init__(self, fe_map: Dict[str, Mesh], method: str = 'cg'):
-        """
-        Initializes the DofHandler.
-        """
-        if method not in ['cg', 'dg']:
-            raise ValueError("Method must be either 'cg' or 'dg'")
-
-        self.fe_map = fe_map
-        self.method = method
-        self.field_names = list(fe_map.keys())
+    # .........................................................................
+    def __init__(self, fe_map: Dict[str, Mesh], method: str = "cg"):
+        if method not in {"cg", "dg"}:
+            raise ValueError("method must be 'cg' or 'dg'")
+        self.fe_map: Dict[str, Mesh] = fe_map
+        self.method: str = method
+        self.field_names: List[str] = list(fe_map.keys())
         self.field_offsets: Dict[str, int] = {}
         self.field_num_dofs: Dict[str, int] = {}
-        self.element_maps: Dict[str, List[List[int]]] = {name: [] for name in self.field_names}
-        self.dof_map: Dict[str, Dict] = {name: {} for name in self.field_names}
+        self.element_maps: Dict[str, List[List[int]]] = {f: [] for f in self.field_names}
+        self.dof_map: Dict[str, Dict] = {f: {} for f in self.field_names}
         self.total_dofs = 0
+        (self._build_maps_cg if method == "cg" else self._build_maps_dg)()
 
-        if self.method == 'cg':
-            self._build_maps_cg()
-        else:
-            self._build_maps_dg()
+    # ------------------------------------------------------------------
+    #  DOF numbering builders
+    # ------------------------------------------------------------------
+    def _build_maps_cg(self) -> None:
+        offset = 0
+        for fld, mesh in self.fe_map.items():
+            self.field_offsets[fld] = offset
+            self.field_num_dofs[fld] = len(mesh.nodes_list)
+            self.dof_map[fld] = {nd.id: offset + i for i, nd in enumerate(mesh.nodes_list)}
+            self.element_maps[fld] = [[self.dof_map[fld][nid] for nid in el.nodes]
+                                       for el in mesh.elements_list]
+            offset += len(mesh.nodes_list)
+        self.total_dofs = offset
 
-    def _build_maps_cg(self):
-        """Builds DOF maps for a Continuous Galerkin formulation."""
-        print("Building Continuous Galerkin (CG) DOF maps...")
-        current_offset = 0
-        for field in self.field_names:
-            mesh = self.fe_map[field]
-            num_nodes_in_field = len(mesh.nodes_list)
-            self.field_offsets[field] = current_offset
-            self.field_num_dofs[field] = num_nodes_in_field
-            self.dof_map[field] = {node_obj.id: current_offset + i for i, node_obj in enumerate(mesh.nodes_list)}
-            self.element_maps[field] = [[self.dof_map[field][node_id] for node_id in element.nodes] for element in mesh.elements_list]
-            current_offset += num_nodes_in_field
-        self.total_dofs = current_offset
-        print(f"Total CG DOFs in the system: {self.total_dofs}")
+    def _build_maps_dg(self) -> None:
+        offset = 0
+        for fld, mesh in self.fe_map.items():
+            self.field_offsets[fld] = offset
+            per_node: Dict[int, Dict[int, int]] = {nd.id: {} for nd in mesh.nodes_list}
+            field_dofs = 0
+            for el in mesh.elements_list:
+                dofs = list(range(offset, offset + len(el.nodes)))
+                self.element_maps[fld].append(dofs)
+                for loc, nid in enumerate(el.nodes):
+                    per_node[nid][el.id] = dofs[loc]
+                offset += len(el.nodes)
+                field_dofs += len(el.nodes)
+            self.dof_map[fld] = per_node
+            self.field_num_dofs[fld] = field_dofs
+        self.total_dofs = offset
 
-    def _build_maps_dg(self):
-        """Builds DOF maps for a Discontinuous Galerkin formulation."""
-        # This implementation remains for future use with DG methods.
-        print("Building Discontinuous Galerkin (DG) DOF maps...")
-        current_offset = 0
-        for field in self.field_names:
-            mesh = self.fe_map[field]
-            self.field_offsets[field] = current_offset
-            self.dof_map[field] = {node_obj.id: {} for node_obj in mesh.nodes_list}
-            field_dof_count = 0
-            for element in mesh.elements_list:
-                num_nodes_in_elem = len(element.nodes)
-                element_dofs = list(range(current_offset, current_offset + num_nodes_in_elem))
-                self.element_maps[field].append(element_dofs)
-                for i, node_id in enumerate(element.nodes):
-                    self.dof_map[field][node_id][element.id] = element_dofs[i]
-                current_offset += num_nodes_in_elem
-                field_dof_count += num_nodes_in_elem
-            self.field_num_dofs[field] = field_dof_count
-        self.total_dofs = current_offset
-        print(f"Total DG DOFs in the system: {self.total_dofs}")
-
-    def get_dirichlet_data(self, bcs: List[BoundaryCondition]) -> Dict[int, float]:
-        """
-        Generates a dictionary mapping Dirichlet DOFs to their specified values.
-        This method now correctly processes a list of BoundaryCondition objects
-        by looking for both edge tags and node tags.
-        """
-        dirichlet_data: Dict[int, float] = {}
-
-        for bc in bcs:
-            if bc.method != 'dirichlet':
+    # ------------------------------------------------------------------
+    #  Dirichlet helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _nodes_on_segment(mesh: Mesh, n0: int, n1: int, tol_rel: float = 1e-12) -> Tuple[int, ...]:
+        """Return *all* node‑ids that lie on the straight segment *(n0,n1)*."""
+        x0, y0 = mesh.nodes_x_y_pos[n0]
+        x1, y1 = mesh.nodes_x_y_pos[n1]
+        dx, dy = x1 - x0, y1 - y0
+        L2 = dx * dx + dy * dy
+        tol = tol_rel * np.sqrt(L2) if L2 else 0.0
+        idx: List[int] = []
+        for nd in mesh.nodes_list:
+            cross = abs((nd.x - x0) * dy - (nd.y - y0) * dx)
+            if cross > tol:
                 continue
+            dot = (nd.x - x0) * dx + (nd.y - y0) * dy
+            if -tol <= dot <= L2 + tol:
+                idx.append(nd.id)
+        if L2:
+            idx.sort(key=lambda nid: (mesh.nodes_x_y_pos[nid, 0] - x0) * dx +
+                                     (mesh.nodes_x_y_pos[nid, 1] - y0) * dy)
+        return tuple(idx)
 
-            field = bc.field
-            tag = bc.domain_tag
-            value_func = bc.value
+    # .................................................................
+    def _collect_nodes_by_tag_or_locator(
+        self,
+        mesh: Mesh,
+        tag: str | None,
+        locator: Callable[[float, float], bool] | None,
+    ) -> Set[int]:
+        """Gather node IDs that belong to *tag* or satisfy *locator*."""
+        found: Set[int] = set()
 
-            if self.method != 'cg':
-                raise NotImplementedError("get_dirichlet_data for DG is not implemented.")
-
-            mesh = self.fe_map[field]
-            nodes_with_tag = set()
-
-            # Robustly check for both edge tags AND node tags that match the bc.domain_tag
-            
-            # 1. Check edge tags for standard boundary conditions
+        # 1) Edge tags – fast path via `all_nodes` if present
+        if tag is not None:
             for edge in mesh.edges_list:
-                if edge.tag == tag:
-                    nodes_with_tag.update(edge.nodes)
+                if edge.tag != tag:
+                    continue
+                if getattr(edge, "all_nodes", None):
+                    found.update(edge.all_nodes)
+                else:
+                    # lazy compute + cache for legacy meshes
+                    edge.all_nodes = self._nodes_on_segment(mesh, *edge.nodes)  # type: ignore[attr-defined]
+                    found.update(edge.all_nodes)
 
-            # 2. Check node tags for single-point constraints (e.g., pressure pinning)
-            for node in mesh.nodes_list:
-                # The node must have a 'tag' attribute and it must match
-                if hasattr(node, 'tag') and node.tag == tag:
-                    nodes_with_tag.add(node.id)
+        # 2) Node tags (single‑point constraints)
+            for nd in mesh.nodes_list:
+                if getattr(nd, "tag", None) == tag:
+                    found.add(nd.id)
 
-            # 3. Get DOFs and values for all unique nodes found
-            for node_id in nodes_with_tag:
-                dof = self.dof_map[field].get(node_id)
-                if dof is None: continue
-                
-                x, y = mesh.nodes_x_y_pos[node_id]
-                bc_value = value_func(x, y)
-                dirichlet_data[dof] = bc_value
-                
-        return dirichlet_data
+        # 3) Explicit locator
+        if locator is not None:
+            for nd in mesh.nodes_list:
+                if locator(nd.x, nd.y):
+                    found.add(nd.id)
+        return found
+
+    # .................................................................
+    def _expand_bc_specs(self, bcs: Union[BcLike, Iterable[BcLike]]) -> Iterable[Tuple[str, str | None, Callable[[float, float], bool] | None, Callable[[float, float], float]]]:
+        """Normalise whatever the caller passes into a flat iterable of
+        *(field, tag, locator, value_function)* tuples.
+        """
+        if bcs is None:
+            return []
+        if isinstance(bcs, (list, tuple, set)):
+            iterable: Iterable[BcLike] = bcs  # type: ignore[assignment]
+        elif isinstance(bcs, Mapping):
+            iterable = bcs.values()
+        else:
+            iterable = [bcs]
+
+        for bc in iterable:
+            # --------------------------------------------------  UFL object
+            if isinstance(bc, BoundaryCondition):
+                if getattr(bc, "method", "dirichlet") != "dirichlet":
+                    continue
+                yield bc.field, getattr(bc, "domain_tag", None), getattr(bc, "locator", None), bc.value
+            # --------------------------------------------------  dict spec
+            elif isinstance(bc, Mapping):
+                if bc.get("type", "dirichlet") != "dirichlet":
+                    continue
+                fields = bc.get("fields", [])
+                tags = bc.get("tags", [])
+                locator = bc.get("locator", None)
+                value = bc["value"]
+                for field in fields:
+                    for tag in tags:
+                        yield field, tag, locator, value
+            else:
+                raise TypeError(f"Unsupported BC spec: {type(bc)}")
+
+    # .................................................................
+    def get_dirichlet_data(self, bcs: Union[BcLike, Iterable[BcLike], Mapping[str, Any]]) -> Dict[int, float]:
+        """Return map *global_dof → prescribed value* for all Dirichlet specs."""
+        data: Dict[int, float] = {}
+        for field, tag, locator, value_fun in self._expand_bc_specs(bcs):
+            mesh = self.fe_map[field]
+            nodes = self._collect_nodes_by_tag_or_locator(mesh, tag, locator)
+            if not nodes:
+                continue
+            if self.method == "cg":
+                nd2dof = self.dof_map[field]
+                for nid in nodes:
+                    dof = nd2dof.get(nid)
+                    if dof is None:
+                        continue
+                    x, y = mesh.nodes_x_y_pos[nid]
+                    data[dof] = value_fun(x, y)
+            else:
+                nd2dof: Dict[int, Dict[int, int]] = self.dof_map[field]  # type: ignore[assignment]
+                for nid in nodes:
+                    for dof in nd2dof.get(nid, {}).values():
+                        x, y = mesh.nodes_x_y_pos[nid]
+                        data[dof] = value_fun(x, y)
+        return data
+
+    # ------------------------------------------------------------------
+    #  DG helper (unchanged)
+    # ------------------------------------------------------------------
+    def get_dof_pairs_for_edge(self, field: str, edge_gid: int) -> Tuple[List[int], List[int]]:
+        if self.method != "dg":
+            raise RuntimeError("Edge DOF pairs only relevant for DG spaces")
+        mesh = self.fe_map[field]
+        edge = mesh.edges_list[edge_gid]
+        if edge.left is None or edge.right is None:
+            raise ValueError("Edge is on boundary – no right element")
+        return (self.element_maps[field][edge.left], self.element_maps[field][edge.right])
+
+    # ------------------------------------------------------------------
+    #  Debug convenience
+    # ------------------------------------------------------------------
+    def info(self) -> None:
+        print(f"=== DofHandler ({self.method.upper()}) ===")
+        for fld in self.field_names:
+            print(f"  {fld:>8}: {self.field_num_dofs[fld]} DOFs @ offset {self.field_offsets[fld]}")
+        print("  total :", self.total_dofs)
 
 
 
@@ -133,7 +216,7 @@ if __name__ == '__main__':
     # These imports assume the user has pycutfem installed or in their PYTHONPATH
     from pycutfem.utils.meshgen import structured_quad
     from pycutfem.core.topology import Node # Mesh needs this
-    
+
     # 1. Generate mesh data using a library utility
     print("Generating a 2x1 P1 mesh...")
     nodes, elems, _, corners = structured_quad(1, 0.5, nx=2, ny=1, poly_order=1)
@@ -147,11 +230,11 @@ if __name__ == '__main__':
 
     # 3. Define and apply boundary tags
     bc_dict = {'left': lambda x,y: x==0,
-               'bottom': lambda x,y:y==0,
-               'top': lambda x,y: y==0.5, 
-               'right':lambda x,y:x==1}
+                'bottom': lambda x,y:y==0,
+                'top': lambda x,y: y==0.5, 
+                'right':lambda x,y:x==1}
     mesh.tag_boundary_edges(bc_dict)
-    
+
     # 4. Define the FE space and create the DofHandlers
     fe_map = {'scalar_field': mesh}
 
@@ -182,6 +265,31 @@ if __name__ == '__main__':
         print(f"  Global DOF {dof}: {val:.1f}")
 
     print("\n\n" + "="*70)
+
+    # -------------------------------------------------------------------
+    # DEMONSTRATION: Q2 (9-node) elements, CG
+    # -------------------------------------------------------------------
+    print("\n" + "="*70)
+    print("DEMONSTRATION: CONTINUOUS GALERKIN (CG) – Q2")
+    print("="*70)
+    nodes_q2, elems_q2, _, corners_q2 = structured_quad(1, 0.5, nx=2, ny=1, poly_order=2)
+    mesh_q2 = Mesh(nodes=nodes_q2,
+                element_connectivity=elems_q2,
+                elements_corner_nodes=corners_q2,
+                element_type="quad",
+                poly_order=2)
+    mesh_q2.tag_boundary_edges(bc_dict)
+
+    dof_q2 = DofHandler({'scalar_field': mesh_q2}, method='cg')
+    print("Total nodes (Q2 mesh):", len(nodes_q2))
+    print("Total DOFs (Q2 CG):   ", dof_q2.total_dofs)
+    print("\nElement-to-DOF Maps (CG):")
+    for i, elem_map in enumerate(dof_q2.element_maps['scalar_field']):
+        print(f"  Element {i}: {elem_map}")
+    print("--> Note: DOFs on the shared edge are the same in both lists.")
+
+    dirichlet_q2 = dof_q2.get_dirichlet_data(dirichlet_def)
+    print(f"Dirichlet DOFs on 'left' boundary (expect 3 nodes * ny=1 = 3):\n  {sorted(dirichlet_q2)}")
     print("DEMONSTRATION: DISCONTINUOUS GALERKIN (DG)")
     print("="*70)
     dof_handler_dg = DofHandler(fe_map, method='dg')
