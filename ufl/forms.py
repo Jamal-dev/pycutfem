@@ -55,7 +55,7 @@ class BoundaryCondition:
         self.domain_tag = domain_tag
         self.value = value
 
-def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None):
+def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None, assembler_hooks=None):
     """
     High-level function to assemble a weak form into a matrix and vector.
 
@@ -71,5 +71,5 @@ def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None):
     """
     # Local import to avoid circular dependencies
     from ufl.compilers import FormCompiler
-    compiler = FormCompiler(dof_handler, quad_order)
+    compiler = FormCompiler(dof_handler, quad_order, assembler_hooks=assembler_hooks)
     return compiler.assemble(equation, bcs)

@@ -13,7 +13,7 @@ _ELEM_FILL = {
     "cut": (1.0, 0.55, 0.0, 0.7),
     "default": (0.9, 0.9, 0.9, 0.5)
 }
-_EDGE_COLOR = {"interface": "red", "ghost": "blue", "boundary": "dimgray"}
+_EDGE_COLOR = {"interface": "red", "ghost": "blue", "boundary": "black", "interior": "gray", "default": "darkgray"}
 
 def _edge_col(tag):
     return _EDGE_COLOR.get(tag, 'black')
@@ -179,7 +179,7 @@ def plot_mesh(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True,
 
 def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True, 
               plot_edges=True, elem_tags=True, edge_colors=True, 
-              show=True, ax=None, resolution=200):
+              show=True, ax=None, resolution=200, plot_interface=True):
     """
     Plots a 2D mesh, correctly using the nodes_x_y_pos attribute for coordinates
     and adding a descriptive legend for tags.
@@ -236,6 +236,28 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
         # Check if any contours were actually drawn before adding to legend
         if len(contour.allsegs[0]) > 0:
             legend_handles.append(plt.Line2D([0], [0], color='green', lw=2, label='Level Set (φ=0)'))
+    
+    if plot_interface:
+        all_pts = []
+        segments = []
+        for elem in mesh.elements_list:
+            if hasattr(elem, 'interface_pts') and elem.interface_pts:
+                all_pts.extend(elem.interface_pts)
+                if len(elem.interface_pts) == 2:
+                    segments.append(elem.interface_pts)
+        
+        if segments:
+            lc = LineCollection(segments, colors='magenta', linewidths=3.5, zorder=6, label='Interface Segment')
+            ax.add_collection(lc)
+            legend_handles.append(lc)
+
+        if all_pts:
+            all_pts_np = np.array(all_pts)
+            ax.plot(all_pts_np[:, 0], all_pts_np[:, 1], 'o', color='cyan', markersize=9, 
+                    markeredgecolor='black', zorder=7)
+            legend_handles.append(plt.Line2D([0], [0], marker='o', color='w', 
+                                             markerfacecolor='cyan', markeredgecolor='black',
+                                             markersize=9, linestyle='None', label='Interface Point'))
 
     ax.set_aspect('equal', 'box')
     ax.set_title("Mesh Visualization with Domain Tags")

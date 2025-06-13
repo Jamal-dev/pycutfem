@@ -45,6 +45,7 @@ class Expression:
             found = self.b.find_first(criteria)
             if found: return found
         elif hasattr(self, 'operand'):
+            if self.operand is None: return None
             return self.operand.find_first(criteria)
         elif hasattr(self, 'f'):
             return self.f.find_first(criteria)
@@ -56,16 +57,22 @@ class Expression:
         return None
 
 class Function(Expression):
-    def __init__(self, field_name, name=""):
+    def __init__(self, field_name, name="",nodal_values = None):
         self.field_name = field_name; self.name = name
+        self.nodal_values = nodal_values
     def __repr__(self):
         return f"{self.__class__.__name__}(field='{self.field_name}')"
+
+class NodalFunction(Expression):
+    def __init__(self, field_name: str):
+        self.field_name = field_name    # key in mesh.node_data
+    def __repr__(self): return f"NodalFunction({self.field_name!r})"
 
 class TrialFunction(Function): pass
 class TestFunction(Function): pass
 
 class Constant(Expression):
-    def __init__(self, value): self.value = np.asarray(value)
+    def __init__(self, value, dim=0): self.value = value; self.dim = dim
     def __repr__(self):
         return f"Constant({self.value})"
 
@@ -131,10 +138,27 @@ class Outer(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
     def __repr__(self): return f"Outer({self.a!r}, {self.b!r})"
 
+class Pos(Expression):
+    def __init__(self, operand): self.operand = operand
+    def __repr__(self): return f"Pos({self.operand!r})"
+    
+class Neg(Expression):
+    def __init__(self, operand): self.operand = operand
+    def __repr__(self): return f"Neg({self.operand!r})"
+
 class Jump(Expression):
-    def __init__(self, u_on_pos, u_on_neg):
+    """
+    Jump( expr_pos, expr_neg )
+    If expr_neg is omitted → Jump(expr) expands to  Pos(expr) – Neg(expr).
+    """
+    def __init__(self, u_on_pos, u_on_neg=None):
+        if u_on_neg is None:
+            # Automatic expansion: jump(u)  :=  pos(u) – neg(u)
+            u_on_pos, u_on_neg = Pos(u_on_pos), Neg(u_on_pos)
         self.u_pos, self.u_neg = u_on_pos, u_on_neg
-    def __repr__(self): return f"Jump({self.u_pos!r}, {self.u_neg!r})"
+
+    def __repr__(self):
+        return f"Jump({self.u_pos!r}, {self.u_neg!r})"
 
 class Avg(Expression):
     def __init__(self, v): self.v = v
@@ -163,13 +187,7 @@ class Dot(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
     def __repr__(self): return f"Dot({self.a!r}, {self.b!r})"
 
-class Pos(Expression):
-    def __init__(self, operand): self.operand = operand
-    def __repr__(self): return f"Pos({self.operand!r})"
-    
-class Neg(Expression):
-    def __init__(self, operand): self.operand = operand
-    def __repr__(self): return f"Neg({self.operand!r})"
+
 
 # --- Helper functions to create operator instances ---
 def grad(v): return Grad(v)

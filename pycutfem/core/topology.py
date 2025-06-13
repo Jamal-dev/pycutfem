@@ -89,6 +89,7 @@ class Edge:
     tag: str = ""
     lid: Optional[int] = None      # Local edge index within the left element
     all_nodes: Tuple[int, ...] = ()
+    tangent: np.ndarray = field(init=False, default=None)  # Tangent vector of the edge
     def calc_tangent_unit_vector(self):
         """Calculate the unit tangent vector of the edge."""
         dx = self.nodes[1] - self.nodes[0]
@@ -117,6 +118,7 @@ class Element:
     poly_order: int = 1
     centroid_x: float = None
     centroid_y: float = None
+    interface_pts: List[Tuple[float, float]] = field(default_factory=list)
     def contains_node(self, node_id: int) -> bool:
         """Check if the element contains a specific node."""
         return node_id in self.nodes

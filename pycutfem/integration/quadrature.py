@@ -90,3 +90,17 @@ def volume(element_type: str, order: int = 2):
     if element_type == 'quad':
         return quad_rule(order)
     raise KeyError(element_type)
+
+
+def line_quadrature(p0: np.ndarray, p1: np.ndarray, order: int = 2):
+    """
+    Gauss–Legendre rule mapped from [-1,1] onto the straight segment p0→p1.
+    Returns (x_i, w_i) with weights in **physical** space.
+    """
+    ξ, w_ref = gauss_legendre(order)             # reference rule
+    mid  = 0.5*(p0 + p1)
+    half = 0.5*(p1 - p0)                         # derivative dx/dξ
+    pts  = mid[None, :] + np.outer(ξ, half)      # shape (n_qp,2)
+    J    = np.linalg.norm(half)                  # |p1-p0| / 2
+    wts  = w_ref * J                             # physical weights
+    return pts, wts

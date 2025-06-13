@@ -214,6 +214,69 @@ class Mesh:
                 edge.tag = 'interface'
 
 
+    def build_interface_segments(self, level_set, tol=1e-12, qorder=2):
+        """
+        Populate element.interface_pts for every 'cut' element.
+        Each entry is a list of interface points, typically [p0, p1].
+        """
+        phi_nodes = level_set.evaluate_on_nodes(self)      # φ at every mesh node
+
+        for elem in self.elements_list:
+            if elem.tag != 'cut':
+                elem.interface_pts = []
+                continue
+
+            pts = []
+            for gid in elem.edges:                         # loop over its 4 edges
+                e = self.edge(gid)
+                n0, n1 = e.nodes
+                phi0, phi1 = phi_nodes[n0], phi_nodes[n1]
+
+                # Skip edges that are clearly on one side of the interface.
+                if (phi0 * phi1 > 0.0) and (abs(phi0) > tol and abs(phi1) > tol):
+                    continue
+                
+                # --- ROBUST INTERPOLATION ---
+                if abs(phi0 - phi1) < tol:
+                    if abs(phi0) < tol:
+                        # The whole edge is on the interface.
+                        pts.append(self.nodes_x_y_pos[n0])
+                        pts.append(self.nodes_x_y_pos[n1])
+                    continue
+                else:
+                    # Standard linear interpolation
+                    t = phi0 / (phi0 - phi1)
+                    # Clamp t to the valid range [0, 1] to prevent extrapolation.
+                    t = max(0.0, min(1.0, t))
+                    
+                    p = self.nodes_x_y_pos[n0] + t * (self.nodes_x_y_pos[n1] -
+                                                    self.nodes_x_y_pos[n0])
+                    pts.append(p)
+
+            # Remove duplicate points that can occur if the interface
+            # passes exactly through a mesh node.
+            unique_pts = []
+            for p in pts:
+                is_duplicate = False
+                for up in unique_pts:
+                    if np.linalg.norm(p - up) < tol:
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    unique_pts.append(p)
+            
+            # --- FIX: A valid interface segment requires exactly two points ---
+            # After calculating all intersections and removing duplicates, only
+            # proceed if we have exactly two points. Otherwise, it's a
+            # degenerate case (grazing a node, etc.), which we filter out.
+            if len(unique_pts) == 2:
+                # Sort points for reproducibility and assign them.
+                unique_pts.sort(key=lambda P: (P[0], P[1]))
+                elem.interface_pts = unique_pts
+            else:
+                # If we don't have exactly two points, treat this element as
+                # not having a valid cut segment.
+                elem.interface_pts = []
     # --- Public API ---
     def element_char_length(self, elem_id):
         if elem_id is None:

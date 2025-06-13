@@ -1,109 +1,159 @@
-import pytest
-import numpy as np
-
-# --- Core imports ---
-from pycutfem.core.mesh import Mesh
+import numpy as np, pytest
+from pycutfem.utils.meshgen   import structured_quad
+from pycutfem.core.mesh       import Mesh
+from pycutfem.core.levelset   import CircleLevelSet
+from ufl.measures    import dInterface
+from ufl.expressions import Constant, Pos, Neg, Jump, FacetNormal,grad, Function, dot, inner
+from ufl.forms           import assemble_form
 from pycutfem.core.dofhandler import DofHandler
-from pycutfem.utils.meshgen import structured_quad
-from pycutfem.core.levelset import CircleLevelSet
-from pycutfem.utils.bitset import BitSet
 
-# --- UFL-like imports ---
-from ufl.expressions import Constant, jump, Pos, Neg
-from ufl.measures import ds
-from ufl.forms import assemble_form
+L     = 2.0
+R     = 0.7
+center= (L/2, L/2)
 
-def test_perimeter_calculation():
+@pytest.fixture
+def mesh():
+    nodes, elems, _, corners = structured_quad(L, L, nx=40, ny=40, poly_order=1)
+    return Mesh(nodes=nodes, element_connectivity=elems,elements_corner_nodes= corners,element_type= 'quad', poly_order=1)
+
+def make_levelset():
+    return CircleLevelSet(center, radius=R)
+
+def add_scalar_field(func: Function, mesh: Mesh, phi, u_pos=None, u_neg=None):
     """
-    Tests _assemble_face_integral by computing the perimeter of a circle.
-    This validates the core loop over cut edges and geometric terms.
+    Populates the nodal values of a Function object based on the sign of a level set.
     """
-    # 1. Setup a mesh and a level set
-    mesh_size = 2.0
-    nx = 20 # Use a reasonably fine mesh
-    nodes, elems, _, corners = structured_quad(mesh_size, mesh_size, nx=nx, ny=nx, poly_order=1)
-    mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=1)
+    # Assign to the 'nodal_values' array within the Function object
+    for node in mesh.nodes_list:
+        is_positive = phi((node.x, node.y)) >= 0
+        value = u_pos(node.x, node.y) if is_positive else u_neg(node.x, node.y)
+        func.nodal_values[node.id] = value
+    return func
 
-    radius = 0.7
-    level_set = CircleLevelSet(center=(0.0, 0.0), radius=radius)
-    
-    # 2. Use the robust mesh classification methods
-    mesh.classify_elements(level_set)
-    mesh.classify_edges(level_set)
+def add_vector_field(mesh:Mesh, phi:CircleLevelSet):
+    vals = np.zeros((len(mesh.nodes_list), 2))
+    for node in mesh.nodes_list:
+        if phi((node.x,node.y))>=0:
+            vals[node.id] = [node.y, 3*node.y]
+        else:
+            vals[node.id] = [2*node.y,4*node.y]
+    mesh.node_data_vec = {'v': vals}
+    return
 
-    # Create a BitSet of interface edges for the ds() measure
-    is_interface_edge = [edge.tag == 'interface' for edge in mesh.edges_list]
-    interface_edges = BitSet(is_interface_edge)
-    assert interface_edges.cardinality() > 0, "No interface edges were found by mesh.classify_edges."
+# ------------------------------------------------ value jump scalar
+def test_jump_scalar(mesh:Mesh):
+    phi = make_levelset()
+    mesh.classify_elements(phi); mesh.classify_edges(phi); 
+    mesh.build_interface_segments(phi)
+    # add_scalar_field(mesh, phi)
+    u_pos = Constant(lambda x,y: x)       # outside  (φ ≥ 0)
+    u_neg = Constant(lambda x,y: 2*x)     # inside   (φ < 0)
+    jump = Jump(u_pos , u_neg)           # jump expression
 
-    # 3. Define the form for the perimeter
-    form = Constant(1.0) * ds(defined_on=interface_edges, level_set=level_set)
-    dummy_equation = form == Constant(0.0)
-    
-    # 4. Assemble, using a hook to capture the scalar result
-    dof_handler = DofHandler({'phi': mesh}) # Dummy handler
-    hooks = { Constant: {'name': 'perimeter'} }
-    
-    results = assemble_form(dummy_equation, dof_handler=dof_handler, bcs=[])
-    
-    # 5. Verify the result
-    computed_perimeter = results['perimeter']
-    exact_perimeter = 2 * np.pi * radius
-    
-    print(f"\nExact Perimeter: {exact_perimeter:.6f}")
-    print(f"Computed Perimeter: {computed_perimeter:.6f}")
-    
-    assert np.isclose(computed_perimeter, exact_perimeter, rtol=1e-2), \
-        "Computed perimeter is not close to the exact value."
+    # u_out = x     ;  u_in = 2x
+    # u_pos = Pos(Constant(lambda x,y: x))   # evaluate via lambda inside visitor
+    # u_neg = Neg(Constant(lambda x,y: 2*x))
+    form = jump * dInterface(level_set=phi)
+    eq    = form == Constant(0.0)
 
-    print("Perimeter calculation test passed.")
+    res = assemble_form(eq, DofHandler({'u':mesh}), bcs=[],
+                        assembler_hooks={type(form.integrand):{'name':'jmp'}})
+    J = res['jmp']
+    print(f"Jump scalar value: {J}")
+    exact = - 2 * np.pi * phi.radius * center[0]  # integral of jump over interface
+    assert np.isclose(J, exact, atol=1e-2)
 
-def test_jump_of_constant():
-    """
-    Tests the jump of a discontinuous constant field.
-    The form is Integral(jump(u) * ds), where u is conceptually { C1 if phi>0, C2 if phi<0 }.
-    This validates the Pos(u) and Neg(u) visitors.
-    """
-    # 1. Setup mesh and level set, same as perimeter test
-    mesh_size = 2.0; nx = 20
-    nodes, elems, _, corners = structured_quad(mesh_size, mesh_size, nx=nx, ny=nx, poly_order=1)
-    mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=1)
-    radius = 0.7
-    level_set = CircleLevelSet(center=(0.0, 0.0), radius=radius)
-    mesh.classify_elements(level_set)
-    mesh.classify_edges(level_set)
-    is_interface_edge = [edge.tag == 'interface' for edge in mesh.edges_list]
-    interface_edges = BitSet(is_interface_edge)
+def test_jump_grad_scalar_manual(mesh:Mesh):
+    phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
+    mesh.build_interface_segments(phi); 
+    u_pos = lambda x,y: x**2       # outside  (φ ≥ 0)
+    u_neg = lambda x,y: x**2-1     # inside   (φ < 0)
+    grad_u_pos_x = lambda x,y: 2*x       # grad outside
+    grad_u_neg_x = lambda x,y: 2*x       # grad inside
+    grad_u_pos_y = lambda x,y: 0         # grad outside
+    grad_u_neg_y = lambda x,y: 0         # grad inside
+    jump_grad_u = Jump(Constant( [grad_u_pos_x, grad_u_pos_y],dim=1),
+                        Constant([grad_u_neg_x, grad_u_neg_y],dim=1))  # jump in vector
+    n   = FacetNormal()                    # unit normal from ctx
+    form = dot(jump_grad_u,n) * dInterface(level_set=phi) 
+    
+    eq   = form == Constant(0.0)
+    hook = {type(form.integrand):{'name':'gj'}}
+    res  = assemble_form(eq, DofHandler({'u':mesh}), bcs=[],assembler_hooks=hook)
+    print(res)
+    assert np.isclose(res['gj'], 0.0, atol=1e-2)
 
-    # 2. Define the form using Pos() and Neg() to create the jump
-    # Let u = 5.0 on the '+' side (outside circle) and u = 2.0 on the '-' side (inside)
-    # The jump is u('+') - u('-') = 5.0 - 2.0 = 3.0
-    C_pos = Constant(5.0)
-    C_neg = Constant(2.0)
-    
-    # We define the jump manually for this test to be explicit
-    integrand = Pos(C_pos) - Neg(C_neg)
-    form = integrand * ds(defined_on=interface_edges, level_set=level_set)
-    dummy_equation = form == Constant(0.0)
 
-    # 3. Assemble with a hook
-    dof_handler = DofHandler({'phi': mesh})
-    # The hook needs to be on the top-level expression type, which is Sub
-    from ufl.expressions import Sub as SubExpr
-    hooks = { SubExpr: {'name': 'jump_integral'} }
-    results = assemble_form(dummy_equation, dof_handler=dof_handler, bcs=[])
-    
-    # 4. Verify
-    computed_integral = results['jump_integral']
-    exact_integral = (5.0 - 2.0) * (2 * np.pi * radius) # jump_value * perimeter
-    
-    print(f"\nExact Integral of Jump: {exact_integral:.6f}")
-    print(f"Computed Integral of Jump: {computed_integral:.6f}")
-    
-    assert np.isclose(computed_integral, exact_integral, rtol=1e-2)
-    print("Constant jump test passed.")
+def test_jump_grad_scalar_two_fields(mesh: Mesh):
+    phi = make_levelset()
+    # ... setup mesh ...
 
+    # --- Create TWO separate, smooth Function objects ---
+    u_pos = lambda x, y: x**2
+    u_neg = lambda x, y: x**2 - 1
+
+    # Create the positive-side function
+    u_pos_func = Function(field_name='u', name='u_pos',
+                          nodal_values=np.zeros(len(mesh.nodes_list)))
+    for node in mesh.nodes_list:
+        u_pos_func.nodal_values[node.id] = u_pos(node.x, node.y)
+
+    # Create the negative-side function
+    u_neg_func = Function(field_name='u', name='u_neg',
+                          nodal_values=np.zeros(len(mesh.nodes_list)))
+    for node in mesh.nodes_list:
+        u_neg_func.nodal_values[node.id] = u_neg(node.x, node.y)
+
+
+    # --- Define the form using the two functions ---
+    n = FacetNormal()
+    
+    # The form now correctly represents the jump between two distinct fields
+    form = dot(grad(u_pos_func) - grad(u_neg_func), n) * dInterface(level_set=phi)
+
+    # --- Assembly and Assertion ---
+    eq = form == Constant(0.0)
+    hook = {type(form.integrand): {'name': 'gj'}}
+    res = assemble_form(eq, DofHandler({'u': mesh}), bcs=[], assembler_hooks=hook)
+    
+    print(res)
+    # This will now pass, as g_pos - g_neg will correctly evaluate to zero.
+    assert np.isclose(res['gj'], 0.0, atol=1e-2)
+
+# ------------------------------------------------ gradient jump scalar
+def test_jump_grad_scalar(mesh:Mesh):
+    phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
+    mesh.build_interface_segments(phi); 
+    u_pos = lambda x,y: x**2       # outside  (φ ≥ 0)
+    u_neg = lambda x,y: x**2-1     # inside   (φ < 0)
+    u_scalar = Function(field_name='u', name='u_scalar',
+                        nodal_values=np.zeros(len(mesh.nodes_list)))
+    u_scalar = add_scalar_field(u_scalar,mesh, phi, u_pos, u_neg)
+    print(u_scalar.nodal_values)
+
+    n   = FacetNormal()                    # unit normal from ctx
+    grad_jump = Jump(grad(u_scalar))        # placeholder: visit_Jump will supply 1
+    form = dot(grad_jump , n) * dInterface(level_set=phi)
+    eq   = form == Constant(0.0)
+    hook = {type(form.integrand):{'name':'gj'}}
+    res  = assemble_form(eq, DofHandler({'u':mesh}), bcs=[],assembler_hooks=hook)
+    print(res)
+    assert np.isclose(res['gj'], 0.0, atol=1e-2)
+
+# ------------------------------------------------ vector value jump (norm)
+# def test_jump_vector_norm(mesh:Mesh):
+#     phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
+#     mesh.build_interface_segments(phi); add_vector_field(mesh, phi)
+
+#     v_pos = Pos(Constant(lambda x,y: np.array([y,3*y])))
+#     v_neg = Neg(Constant(lambda x,y: np.array([2*y,4*y])))
+#     jump_norm = np.sqrt((v_pos - v_neg)[0]**2 + (v_pos - v_neg)[1]**2)
+#     form = jump_norm * dInterface(level_set=phi)
+#     eq   = form == Constant(0.0)
+#     res  = assemble_form(eq, DofHandler({'v':mesh}), bcs=[],
+#                          assembler_hooks={type(form.integrand):{'name':'jv'}})
+#     exact = 4*R*np.sqrt(2)
+#     assert np.isclose(res['jv'], exact, rtol=1e-2)
 
 if __name__ == "__main__":
-    test_perimeter_calculation()
-    test_jump_of_constant()
+    pytest.main([__file__, '-v', '--tb=short'])

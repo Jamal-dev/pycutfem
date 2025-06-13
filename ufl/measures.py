@@ -25,3 +25,7 @@ def ds(defined_on: Optional[BitSet] = None, level_set: Optional[Callable] = None
 def dS(defined_on: Optional[BitSet] = None, level_set: Optional[Callable] = None): 
     """Creates a measure for integration over exterior facets (edges)."""
     return Measure("exterior_facet", defined_on=defined_on, level_set=level_set)
+
+def dInterface(defined_on: Optional[BitSet] = None, level_set: Optional[Callable] = None): 
+    """Creates a measure for integration over interface (edges)."""
+    return Measure("interface", defined_on=defined_on, level_set=level_set)
