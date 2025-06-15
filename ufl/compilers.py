@@ -90,6 +90,8 @@ class _ShapeVisitor:
     def visit_Jump(self,n):  return self.visit(n.u_pos)
     def visit_FacetNormal(self,n): return _Shape(1,'none')
     def visit_Function(self, n):    return _Shape(0, 'none')    # scalar FE function
+    def visit_ElementWiseConstant(self, n):
+        return _Shape(0, 'none')
 
 # ---------------------------------------------------------------------------
 #  Helper utilities
@@ -166,6 +168,13 @@ class FormCompiler:
     def visit(self, node):
         return getattr(self, f"visit_{type(node).__name__}")(node)
 
+    def visit_ElementWiseConstant(self, node):
+        side = self.ctx.get("side", "")
+        if side:
+            elem_id = self.ctx["e_pos"] if side == "+" else self.ctx["e_neg"]
+        else:
+            elem_id = self.ctx["elem_id"]
+        return node.values[elem_id]
     # scalars
     def visit_Constant(self,n): 
         v = n.value
@@ -266,7 +275,7 @@ class FormCompiler:
     # differential ops ---------------------------------------------------
     def visit_Grad(self,n):
         # Handle the special case of the gradient of a scalar FE Function
-        if isinstance(n.operand, Function):
+        if isinstance(n.operand, Function) and not isinstance(n.operand, (TrialFunction, TestFunction)):
             func = n.operand
             # Get the DoF indices for the current element
             dofs = self._elm_dofs(func, self.ctx['elem_id'])
@@ -288,6 +297,8 @@ class FormCompiler:
     def visit_DivOperation(self,n):
         grads = self.visit(Grad(n.operand))  # list of rows
         return np.hstack([g[:,i] for i,g in enumerate(grads)])
+    
+    def visit_Analytic(self, node): return node.eval(self.ctx['x_phys'])
 
     # algebra -----------------------------------------------------------
     def visit_Prod(self,n):
@@ -314,6 +325,12 @@ class FormCompiler:
             for i,(ra,rb) in enumerate(zip(a,b)):
                 mat[rows[i]:rows[i+1], cols[i]:cols[i+1]] = ra @ rb.T
             return mat
+        # ADDED: This new path correctly handles grad(scalar).grad(scalar) for Poisson.
+        if sa.dim == 1 and sb.dim == 1:
+            # `a` and `b` are matrices of basis gradients, shape (n_basis, n_dim).
+            # We compute G_v @ G_u.T to get the (n_basis, n_basis) matrix.
+            # `b` is from the test function (rows), `a` is from the trial function (cols).
+            return b @ a.T
         # scalar inner
         if sa.kind=='test':
             return np.outer(a,b)
@@ -378,6 +395,11 @@ class FormCompiler:
 
         # Other cases for assembling vectors or matrices
         sa, sb = self.shape.visit(n.a), self.shape.visit(n.b)
+        # ADDED: This new condition handles dot(Constant, grad(TrialFunction))
+        if sa.kind == 'none' and sb.kind == 'trial':
+            # This is Constant `a` dotted with each basis grad in `b`.
+            # Operation is matrix @ vector: (4, 2) @ (2,) -> (4,)
+            return b @ a
         if sa.kind == 'none' and sb.kind == 'test': return b @ a
         if sa.kind == 'test' and sb.kind == 'none': return a @ b.T
         if sa.kind == 'test' and sb.kind == 'trial': return np.outer(a, b)
@@ -464,6 +486,8 @@ class FormCompiler:
         qpts,qwts = volume(mesh.element_type,q)
         terms = _split_terms(intg.integrand)
         for eid,elem in enumerate(mesh.elements_list):
+            
+            self.ctx['elem_id'] = elem.id
             # precompute basis at qpts
             bv=defaultdict(lambda:{'val':[],'grad':[]})
             for fld in _all_fields(intg.integrand):
@@ -485,6 +509,9 @@ class FormCompiler:
                     col = self._elm_dofs(trial,eid)
                     local = np.zeros((len(row),len(col)))
                 for k,(xi_eta, w) in enumerate(zip(qpts,qwts)):
+                    self.ctx['x_phys'] = transform.x_mapping(mesh, elem.id, (xi, eta))
+                    self.ctx["side"] = ""  # volume integrals have no side notion
+                    self.ctx['x'] = self.ctx['x_phys']
                     self.ctx['basis_values']={f:{'val':bv[f]['val'][k],'grad':bv[f]['grad'][k]} for f in bv}
                     J = transform.jacobian(mesh,eid,xi_eta)
                     val = self.visit(term)
@@ -493,22 +520,14 @@ class FormCompiler:
                     matvec[row]+=local
                 else:
                     matvec[np.ix_(row,col)]+=local
+        # Context cleanup
+        for key in ('phi_val', 'normal', 'basis_values', 'x', 'nodal_vals','elem_id','x_phys','side'):
+            self.ctx.pop(key, None)
     
     # ------------------------------------------------------------------
     #  Interface integrals (CutFEM) – one-sided, no extra DOFs
     # ------------------------------------------------------------------
-    def _set_ctx(self, qk, x, elem, basis_cache, level_set, fields):
-        self.ctx['x']         = x
-        self.ctx['phi_val']   = level_set(x)
-        self.ctx['normal']    = level_set.gradient(x)
-        self.ctx['basis']     = {f: {'val':  basis_cache[f]['val'][qk],
-                                    'grad': basis_cache[f]['grad'][qk]}
-                                for f in fields}
-        self.ctx['nodal_vals'] = {
-            f: elem.mesh.node_data[f][elem.nodes]
-            for f in getattr(elem.mesh, 'node_data', {})
-            if f in fields
-        }
+
 
     def _assemble_interface(self, intg, matvec):
         rhs = self.ctx['is_rhs']

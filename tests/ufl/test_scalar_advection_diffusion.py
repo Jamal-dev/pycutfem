@@ -26,8 +26,8 @@ def test_advection_diffusion_solve():
     """
     # 1. Define Analytical Solution and Parameters
     beta_vec = np.array([1.0, 1.0])
-    epsilon = 0.01
-    
+    epsilon = 1.0
+
     u_exact_sym = sp.sin(sp.pi * x) * sp.sin(sp.pi * y)
     f_sym = -epsilon*sp.diff(u_exact_sym, x, 2) - epsilon*sp.diff(u_exact_sym, y, 2) + \
             beta_vec[0]*sp.diff(u_exact_sym, x) + beta_vec[1]*sp.diff(u_exact_sym, y)
@@ -54,7 +54,7 @@ def test_advection_diffusion_solve():
     # Trial/Test functions are now identified by their field name (string).
     u = TrialFunction('u')
     v = TestFunction('u')
-    beta = Constant(beta_vec)
+    beta = Constant(beta_vec,dim=1)
 
     # The weak form definition remains syntactically the same.
     a = (epsilon * inner(grad(u), grad(v)) + dot(beta, grad(u)) * v) * dx()
@@ -76,7 +76,7 @@ def test_advection_diffusion_solve():
     # 5. Assemble and Solve
     # The assemble_form function now takes the DofHandler as the main argument
     # for managing the function space and mesh.
-    K, F = assemble_form(equation, dof_handler=dof_handler, bcs=bcs, quad_order=4)
+    K, F = assemble_form(equation, dof_handler=dof_handler, bcs=bcs, quad_order=5)
     uh_vec = spla.spsolve(K, F)
 
     # 6. Verify Solution

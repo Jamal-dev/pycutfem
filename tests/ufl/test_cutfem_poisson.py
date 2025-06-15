@@ -12,7 +12,7 @@ from pycutfem.utils.domain_manager import get_domain_bitset
 # --- UFL-like imports ---
 from ufl.expressions import (TrialFunction, TestFunction, grad, inner, jump,dot,
                              ElementWiseConstant, Constant)
-from ufl.measures import dx, ds
+from ufl.measures import dx, ds, dInterface
 from ufl.forms import BoundaryCondition, assemble_form
 
 # --- Level Set and Cut Ratio imports ---
@@ -47,7 +47,7 @@ def test_cutfem_poisson_interface():
     has_neg_elements = neg_elements | cut_elements
     print(f"Negative elements: {neg_elements}, Positive elements: {pos_elements}, Cut elements: {cut_elements}")
     print(f"Has positive elements: {has_pos_elements}, Has negative elements: {has_neg_elements}")
-    plot_mesh_2(mesh,level_set=level_set)
+    # plot_mesh_2(mesh,level_set=level_set)
     
     # Interface edges for the `ds` integral
     if_edges = get_domain_bitset(mesh, 'edge', 'interface')
@@ -85,7 +85,7 @@ def test_cutfem_poisson_interface():
     a += inner(alpha * grad(u_pos), grad(v_pos)) * dx(defined_on=pos_elements | cut_elements)
     
     # Interface terms use the ds measure, which now requires the level_set for orientation
-    a += ( dot(avg_flux_u, jump_v) + dot(avg_flux_v, jump_u) + stab * jump_u * jump_v ) * ds(defined_on=if_edges, level_set=level_set)
+    a += ( dot(avg_flux_u, jump_v) + dot(avg_flux_v, jump_u) + stab * jump_u * jump_v ) * dInterface( level_set=level_set)
 
     # Right-hand side
     f = Constant(1.0) * v_neg * dx(defined_on=neg_elements | cut_elements)
@@ -101,7 +101,7 @@ def test_cutfem_poisson_interface():
     ]
     
     # 8. Assemble and Solve
-    system = [equation]
+    system = equation
     K, F = assemble_form(system, dof_handler=dof_handler, bcs=bcs, quad_order=poly_order + 2)
 
     # Check the rank to ensure the system is solvable
@@ -115,14 +115,14 @@ def test_cutfem_poisson_interface():
     assert np.linalg.norm(solution_vec) > 1e-8, "Solution is trivial (zero)."
     
     center_node_id = -1
-    for i, node_data in enumerate(mesh.nodes):
-        if np.isclose(node_data['x'], 0) and np.isclose(node_data['y'], 0):
+    for i, node_data in enumerate(mesh.nodes_list):
+        if np.isclose(node_data.x, L/2) and np.isclose(node_data.y, H/2):
             center_node_id = i
             break
             
+    assert center_node_id != -1, "Could not find the center node of the mesh."
+
     u_pos_dof = dof_handler.dof_map['u_inside'][center_node_id]
     center_val = solution_vec[u_pos_dof]
     print(f"Solution at center (inside domain): {center_val:.4f}")
     assert center_val > 0, "Expected a positive solution at the center."
-    
-    print("\nCutFEM Poisson test completed successfully!")

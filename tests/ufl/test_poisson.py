@@ -7,9 +7,11 @@ from numpy.testing import assert_allclose
 from pycutfem.core import Mesh
 from pycutfem.utils.meshgen import structured_quad
 # Imports from the new UFL-like library
-from ufl.expressions import TrialFunction, TestFunction, Constant, grad, inner
+from ufl.expressions import TrialFunction,dot, TestFunction, Constant, grad, inner
 from ufl.measures import dx
-from ufl.forms import assemble_form
+from ufl.forms import assemble_form, BoundaryCondition
+from pycutfem.core.dofhandler import DofHandler
+from ufl.functionspace import FunctionSpace
 
 def test_poisson_symbolic_q1():
     """
@@ -20,10 +22,13 @@ def test_poisson_symbolic_q1():
     mesh = Mesh(nodes, element_connectivity=elems, edges_connectivity=None, 
                 elements_corner_nodes=corners, element_type="quad", poly_order=1)
 
-    # 2. Define the weak form using the symbolic API
-    u = TrialFunction(None) # Placeholder for FunctionSpace
-    v = TestFunction(None)  # Placeholder for FunctionSpace
-    
+    # fe map
+    fe_map = {'u': mesh}  # Single field for Poisson problem
+    dof_handler = DofHandler(fe_map, method='cg')
+    u_space = FunctionSpace("disp",['u'],dim=0)    # 2. Define the weak form using the symbolic API
+    u = TrialFunction(u_space.field_names[0])
+    v = TestFunction(u_space.field_names[0])
+
     # Define source term f = 1.0
     f = Constant(1.0)
     
@@ -33,13 +38,26 @@ def test_poisson_symbolic_q1():
 
     # The '==' creates an Equation object
     equation = (a == L)
-    
-    # 3. Assemble the system
-    K, F = assemble_form(equation, mesh, quad_order=3)
 
+    # 2. Define boundary conditions (Dirichlet)
+    bc_tags = {
+        'left': lambda x, y: np.isclose(x, 0),
+        'right': lambda x, y: np.isclose(x, 1),
+        'bottom': lambda x, y: np.isclose(y, 0),
+        'top': lambda x, y: np.isclose(y, 1)
+    }
+    mesh.tag_boundary_edges(bc_tags)
+    bcs = [BoundaryCondition('u', 'dirichlet', 'left', lambda x, y: 0.0),
+           BoundaryCondition('u', 'dirichlet', 'right', lambda x, y: 0.0),
+           BoundaryCondition('u', 'dirichlet', 'bottom', lambda x, y: 0.0),
+           BoundaryCondition('u', 'dirichlet', 'top', lambda x, y: 0.0)]
+
+    K, F = assemble_form(equation, dof_handler= dof_handler, bcs=bcs, quad_order=5)
     # 4. Assertions
     n_elems = len(mesh.elements_list)
-    n_dofs = 4 * n_elems 
+    dofs_x = np.sqrt(n_elems) + 1  # Q1 has (n+1)x(n+1) nodes for n elements
+    n_dofs = dofs_x * dofs_x  # Total number of DOFs for a square mesh 
+    assert n_dofs == dof_handler.total_dofs, "Mismatch in total DOFs."
     assert K.shape == (n_dofs, n_dofs), "Stiffness matrix has incorrect shape."
     assert F.shape == (n_dofs,), "Force vector has incorrect shape."
     assert K.nnz > 0, "Stiffness matrix should not be empty."
