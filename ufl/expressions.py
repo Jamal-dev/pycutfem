@@ -63,6 +63,40 @@ class Function(Expression):
     def __repr__(self):
         return f"{self.__class__.__name__}(field='{self.field_name}')"
 
+# In your ufl/expressions.py file
+
+class VectorFunction(Expression):
+    """
+    Represents a known, data-carrying vector-valued finite element function.
+    """
+    def __init__(self, name: str, field_names: list[str], nodal_values=None):
+        """
+        Args:
+            name (str): A name for the vector function space, e.g., "velocity".
+            field_names (list[str]): A list of the component field names, e.g., ['ux', 'uy'].
+            nodal_values (np.ndarray, optional): The array of nodal data, with a
+                shape like (n_total_dofs, n_components).
+        """
+        self.name = name
+        self.field_names = field_names
+        self.nodal_values = nodal_values
+        
+        # Create a list of scalar Function objects for polymorphism.
+        # These components are primarily for structural compatibility and do not
+        # hold data themselves; the data is in self.nodal_values.
+        self.components = [Function(fn) for fn in self.field_names]
+
+    def __repr__(self):
+        return f"VectorFunction(name='{self.name}', fields={self.field_names})"
+
+    def __getitem__(self, i):
+        """Allows accessing components like my_vec_func[0]."""
+        return self.components[i]
+
+    def __iter__(self):
+        """Allows iterating over components."""
+        return iter(self.components)
+
 class NodalFunction(Expression):
     def __init__(self, field_name: str):
         self.field_name = field_name    # key in mesh.node_data
@@ -146,6 +180,7 @@ class Neg(Expression):
     def __init__(self, operand): self.operand = operand
     def __repr__(self): return f"Neg({self.operand!r})"
 
+from copy import deepcopy
 class Jump(Expression):
     """
     Jump( expr_pos, expr_neg )
@@ -154,7 +189,7 @@ class Jump(Expression):
     def __init__(self, u_on_pos, u_on_neg=None):
         if u_on_neg is None:
             # Automatic expansion: jump(u)  :=  pos(u) – neg(u)
-            u_on_pos, u_on_neg = Pos(u_on_pos), Neg(u_on_pos)
+            u_on_pos, u_on_neg = Pos(u_on_pos), Neg(deepcopy(u_on_pos))
         self.u_pos, self.u_neg = u_on_pos, u_on_neg
 
     def __repr__(self):

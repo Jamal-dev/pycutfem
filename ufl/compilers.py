@@ -27,13 +27,14 @@ import numpy as np
 import scipy.sparse as sp
 from collections import defaultdict
 from typing import Dict, List, Tuple, Iterable, Mapping, Any, Union
+import logging
 
 # UFL‑like helpers ----------------------------------------------------------
 from ufl.expressions import (
     Constant, TrialFunction, TestFunction,
     VectorTrialFunction, VectorTestFunction,
     Grad, DivOperation, Inner, Dot, Sum, Sub, Prod,
-    Jump, FacetNormal, Pos, Neg, Function
+    Jump, FacetNormal, Pos, Neg, Function, VectorFunction
 )
 from ufl.forms import Equation
 
@@ -46,6 +47,87 @@ from pycutfem.integration.quadrature import  line_quadrature
 from pycutfem.integration.quadrature import edge as edge_quadrature_element
 
 _INTERFACE_TOL = 1.0e-12
+
+
+# ---------------------------------------------------------------------------
+# Sympy to UFL-like expressions
+# ---------------------------------------------------------------------------
+class SymPyToUFLVisitor:
+    """
+    Translates a SymPy expression tree into a UFL expression tree.
+    """
+    def __init__(self, symbol_map: dict):
+        """
+        Initializes the visitor with a map from SymPy Functions to UFL Functions.
+        Example: {sympy.Function('u_trial_x'): ufl.TrialFunction('ux')}
+        """
+        self.symbol_map = symbol_map
+
+    def visit(self, node):
+        """Public visit method for dispatching."""
+        # The method name is matched to the SymPy class name
+        method = f'visit_{type(node).__name__}'
+        visitor = getattr(self, method, self.generic_visit)
+        return visitor(node)
+
+    def generic_visit(self, node):
+        raise TypeError(f"No UFL translation rule for SymPy object: {type(node)}")
+
+    # --- Translation Rules for SymPy Object Types ---
+
+    def visit_Add(self, node):
+        """Translates a SymPy Add into a tree of UFL Sum objects."""
+        # Recursively visit the arguments of the sum and combine with ufl.Sum
+        terms = [self.visit(arg) for arg in node.args]
+        return functools.reduce(lambda a, b: Sum(a, b), terms)
+
+    def visit_Mul(self, node):
+        """Translates a SymPy Mul into a tree of UFL Prod objects."""
+        # Recursively visit the arguments of the product and combine with ufl.Prod
+        terms = [self.visit(arg) for arg in node.args]
+        return functools.reduce(lambda a, b: Prod(a, b), terms)
+
+    def visit_Pow(self, node):
+        """Translates a SymPy Pow, e.g., x**2."""
+        # We need a ufl.Pow class for this. If it doesn't exist, this will fail.
+        # Assuming we can add `class Pow(Expression): ...` to expressions.py
+        base = self.visit(node.base)
+        exp = self.visit(node.exp)
+        return Pow(base, exp) # You may need to create a ufl.Pow class
+
+    def visit_Integer(self, node):
+        """Translates a SymPy Integer to a UFL Constant."""
+        return Constant(int(node))
+
+    def visit_Float(self, node):
+        """Translates a SymPy Float to a UFL Constant."""
+        return Constant(float(node))
+        
+    def visit_Rational(self, node):
+        """Translates a SymPy Rational to a UFL Constant."""
+        return Constant(float(node))
+
+    def visit_Symbol(self, node):
+        """Translates a SymPy Symbol (like 'dt') to a UFL Constant."""
+        return Constant(node)
+
+    def visit_Function(self, node):
+        """Translates a symbolic function using the provided symbol map."""
+        # This is the key lookup step
+        if node in self.symbol_map:
+            return self.symbol_map[node]
+        raise ValueError(f"Unknown SymPy function '{node}' not found in symbol map.")
+
+    def visit_Derivative(self, node):
+        """Translates a SymPy derivative into a UFL Grad component."""
+        # e.g., Derivative(u_x(x,y), y) -> Grad(TrialFunction('ux'))[1]
+        field_to_diff = self.visit(node.expr)
+        
+        # Determine if differentiating w.r.t 'x' (0) or 'y' (1)
+        # Note: assumes x,y are the first two symbols defined in your sympy_fem library
+        coord_index = node.variables[0].__str__() == 'y' 
+        
+        return Grad(field_to_diff)[coord_index]
 
 # ---------------------------------------------------------------------------
 #  Light shape‑meta visitor (helps flip test/trial in ∇· terms)
@@ -90,6 +172,7 @@ class _ShapeVisitor:
     def visit_Jump(self,n):  return self.visit(n.u_pos)
     def visit_FacetNormal(self,n): return _Shape(1,'none')
     def visit_Function(self, n):    return _Shape(0, 'none')    # scalar FE function
+    def visit_VectorFunction(self, n): return _Shape(1, 'none')  # vector FE function
     def visit_ElementWiseConstant(self, n):
         return _Shape(0, 'none')
 
@@ -113,10 +196,14 @@ def _all_fields(expr):
             fields.add(n.field_name)
         if hasattr(n,'space'):
             fields.update(n.space.field_names)
-        for attr in ('operand','a','b','u_pos','u_neg'):
-            if hasattr(n,attr):
-                m=getattr(n,attr)
-                if isinstance(m, (list,tuple)):
+        if isinstance(n, VectorFunction):
+            fields.update(n.field_names)
+
+        # Recurse through the expression tree
+        for attr in ('operand', 'a', 'b', 'u_pos', 'u_neg', 'components'):
+            if hasattr(n, attr):
+                m = getattr(n, attr)
+                if isinstance(m, (list, tuple)):
                     for x in m: walk(x)
                 elif m is not None:
                     walk(m)
@@ -203,6 +290,7 @@ class FormCompiler:
         Evaluates the operand if on the positive side (phi>=0), otherwise returns
         a zero of the same shape as the operand.
         """
+        print("visit Pos zeroing: ctx=", self.ctx)
         # We use a clear convention: '+' side includes the boundary (phi >= 0)
         if ('phi_val' in self.ctx and self.ctx['phi_val'] >= _INTERFACE_TOL) or \
            ('active_side' in self.ctx and self.ctx['active_side'] != '+'):
@@ -221,6 +309,7 @@ class FormCompiler:
         Evaluates the operand if on the negative side (phi<0), otherwise returns
         a zero of the same shape as the operand.
         """
+        print("visit Neg zeroing: ctx=", self.ctx)
         # The '-' side is strictly phi < 0
         if ('phi_val' in self.ctx and self.ctx['phi_val'] < _INTERFACE_TOL) or \
            ('active_side' in self.ctx and self.ctx['active_side'] != '-'):
@@ -270,28 +359,84 @@ class FormCompiler:
         # Return the interpolated value: N · u_local
         return N @ nodal_loc
     
+    def visit_VectorFunction(self, n): # vector FE function
+        """
+        Evaluates a VectorFunction at a quadrature point by interpolating each
+        component and returns the result as a single NumPy vector.
+        """
+        # Get the local DoFs for all fields. Assumes all fields share the same map.
+        # Note: _elm_dofs for a VectorFunction-like object might need to handle this.
+        # For now, we'll get dofs for the first component as a representative.
+        dofs = self._elm_dofs(n.components[0], self.ctx['elem_id'])
+        
+        # Nodal values for this element, shape (n_loc_dofs, n_components)
+        nodal_loc = n.nodal_values[dofs, :]
+        
+        # Interpolate each component and gather the results
+        field_values = []
+        for i, field_name in enumerate(n.field_names):
+            # Get basis function values `N` for this component's field
+            N = self._basis_val(field_name, role='test')
+            # Interpolate: N · u_local_component
+            field_values.append(N @ nodal_loc[:, i])
+            
+        # Return a single NumPy vector, e.g., array([value_x, value_y])
+        return np.array(field_values)
+    
 
 
     # differential ops ---------------------------------------------------
-    def visit_Grad(self,n):
-        # Handle the special case of the gradient of a scalar FE Function
-        if isinstance(n.operand, Function) and not isinstance(n.operand, (TrialFunction, TestFunction)):
+    def visit_Grad(self, n):
+        # Case 1: A data-carrying VectorFunction
+        if isinstance(n.operand, VectorFunction):
             func = n.operand
-            # Get the DoF indices for the current element
-            dofs = self._elm_dofs(func, self.ctx['elem_id'])
-            # Get the corresponding local slice of the global nodal vector
-            nodal_loc = func.nodal_values[dofs]
+            
+            # --- THIS IS THE CORRECTED LOGIC ---
+            # 1. Get the mesh associated with the function's fields.
+            #    All components must share the same mesh.
+            mesh = self.dh.fe_map[func.field_names[0]]
+            
+            # 2. Get the element object using the elem_id from the context.
+            elem = mesh.elements_list[self.ctx['elem_id']]
+            
+            # 3. Get the element's NODE indices.
+            node_indices = elem.nodes
+            
+            # 4. Use the NODE indices to slice the nodal_values array.
+            #    This correctly fetches the (n_basis, n_components) data block.
+            nodal_loc = func.nodal_values[node_indices, :]
 
-            # Get the basis function gradients (G) at the current quadrature point
-            G = self._basis_grad(func.field_name, role='test') # Role is irrelevant
-            # Return the interpolated gradient: G^T · u_local
+            # --- The rest of the logic can now work with the correct data ---
+            grad_rows = []
+            for i, field_name in enumerate(func.field_names):
+                # Get basis gradients `G` (shape (n_basis, 2))
+                G = self._basis_grad(field_name, role='test')
+                
+                # Get the nodal values for this specific component
+                nodal_comp_i = nodal_loc[:, i] # Shape (n_basis,)
+                
+                # Interpolate the gradient: G.T @ nodal_comp
+                grad_rows.append(G.T @ nodal_comp_i) # (2, n_basis) @ (n_basis,) -> (2,)
+
+            # Per your successful experiment, we return the TRANSPOSE of the standard
+            # Jacobian to match the convention expected by visit_Dot.
+            return np.vstack(grad_rows)
+
+        # Case 2: A data-carrying scalar Function
+        elif isinstance(n.operand, Function) and not isinstance(n.operand, (TrialFunction, TestFunction)):
+            func = n.operand
+            dofs = self._elm_dofs(func, self.ctx['elem_id'])
+            nodal_loc = func.nodal_values[dofs]
+            G = self._basis_grad(func.field_name, role='test')
             return G.T @ nodal_loc
 
+        # Case 3: Symbolic Trial/Test functions
         sh = self.shape.visit(n.operand)
-        if sh.dim==0:  # grad(scalar) -> vector
+        if sh.dim == 0:  # grad(scalar) -> vector of basis grads
             return self._basis_grad(n.operand.field_name, sh.kind)
-        if sh.dim==1:  # grad(vector) -> list[tensor row]
+        if sh.dim == 1:  # grad(vector) -> list of gradient rows
             return [self._basis_grad(f, sh.kind) for f in n.operand.space.field_names]
+            
         raise NotImplementedError('grad of tensor not needed')
 
     def visit_DivOperation(self,n):
@@ -336,15 +481,7 @@ class FormCompiler:
             return np.outer(a,b)
         return np.outer(b,a)
 
-    # def visit_Dot(self,n): # it was passing the Stokes test
-    #     const, vec = (self.visit(n.a), self.visit(n.b)) if isinstance(n.a, Constant) else (self.visit(n.b), self.visit(n.a))
-    #     ncomp = len(const)
-    #     dofs_per = len(vec)//ncomp
-    #     out = np.zeros_like(vec)
-    #     vec = vec.reshape((ncomp,dofs_per))
-    #     for i in range(ncomp):
-    #         out[i*dofs_per:(i+1)*dofs_per]=const[i]*vec[i]
-    #     return out
+
     
     def visit_Dot(self, n):
         # --- Dispatcher: Correctly identify the expression pattern ---
@@ -392,6 +529,14 @@ class FormCompiler:
         # Case for scalar * vector/matrix
         if a.ndim == 0: return a * b
         if b.ndim == 0: return b * a
+
+        # ADDED: Case for dot(tensor, vector) -> vector (Matrix-vector product)
+        if a.ndim == 2 and b.ndim == 1:
+            return a @ b
+            
+        # # Failing the advection diffusion test: Case for dot(vector, tensor) -> vector
+        # if a.ndim == 1 and b.ndim == 2:
+        #     return a @ b
 
         # Other cases for assembling vectors or matrices
         sa, sb = self.shape.visit(n.a), self.shape.visit(n.b)
@@ -527,121 +672,129 @@ class FormCompiler:
     # ------------------------------------------------------------------
     #  Interface integrals (CutFEM) – one-sided, no extra DOFs
     # ------------------------------------------------------------------
-
+    # In class FormCompiler:
 
     def _assemble_interface(self, intg, matvec):
+        """
+        Assembles integrals over non-conforming interfaces defined by a level set.
+
+        This robust implementation evaluates the entire integrand at once, correctly
+        handling scalar and vector-valued expressions for bilinear forms, linear
+        forms, and hooked functionals without relying on term-splitting.
+        """
+        # Use a logger for clear, hierarchical debugging output.
+        # (Assumes you have `import logging` at the top of the file)
+        log = logging.getLogger(__name__)
+        log.debug(f"Assembling interface integral: {intg}")
+
+        # --- 1. Initial Setup ---
         rhs = self.ctx['is_rhs']
         level_set = intg.measure.level_set
-        mesh = next(iter(self.dh.fe_map.values()))        # any mesh
-
-        qdeg   = self.qorder or mesh.poly_order+2
-        terms = _split_terms(intg.integrand)
-        fields = _all_fields(intg.integrand)
-
-        # optional scalar hook (perimeter, jump, …)
-        hook = None
-        for cls,cfg in self.ctx['hooks'].items():
-            if isinstance(intg.integrand, cls):
-                hook = cfg
-                if hook and hook['name'] not in self.ctx['scalar_results']:
-                    self.ctx['scalar_results'][hook['name']] = 0.0
-                break
-
-        # ---------------------------------------------------------- loop cut elems
-        for elem in mesh.elements_list:
-            if elem.tag != 'cut' or len(elem.interface_pts) != 2:
-                continue
-            self.ctx['elem_id'] = elem.id
-            p0, p1 = elem.interface_pts
-            # print(f"{elem}")
-            # print(f"p0={p0}, p1={p1}")
-
-            qp, qw = line_quadrature(p0, p1, qdeg)        # physical pts + weights
-            # print(f"qp={qp}, qw={qw}")
-
-            # -------- pre-tabulate basis at all quad-pts for every field ----
-            basis_cache = {f:{'val':[], 'grad':[]} for f in fields}
-            if fields:
-                for x in qp:
-                    for fld in fields:
-                        fm  = self.dh.fe_map[fld]
-                        
-                        ref = get_reference(fm.element_type, fm.poly_order)
-                        xi,eta = transform.inverse_mapping(fm, elem.id, x)
-                        JinvT  = np.linalg.inv(transform.jacobian(fm, elem.id, (xi,eta))).T
-                        basis_cache[fld]['val' ].append(ref.shape(xi,eta))
-                        basis_cache[fld]['grad'].append(ref.grad (xi,eta) @ JinvT)
-            # print(f"After line integration: basis_cache={basis_cache}")
-            # if fields:
-            #     print(f"basis_cache[fld]['val' ].shape={np.asarray(basis_cache[fields[0]]['val']).shape}")
-            #     print(f"basis_cache[fld]['grad'].shape={np.asarray(basis_cache[fields[0]]['grad']).shape}")
-            # ------------------------------------------------------ term loop
+        if level_set is None:
+            raise ValueError("dInterface measure requires a level_set.")
             
-             # --- Assemble for each term in the integrand ---
-            for sgn, term in terms:
-                trial, test = _trial_test(term)
-                # DEBUGGING BLOCK =======================================================
-                # print("\n--- DEBUG: Checking term ---")
-                # print(f"Term: {term}")
-                # print(f"Is RHS? {rhs}")
-                # print(f"Trial function: {trial}")
-                # print(f"Test function: {test}")
-                # print(f"Hook available? {hook is not None}")
-                # if hook:
-                #     print(f"Hook config: {hook}")
-                #     print(f"Hook keys: {tuple(self.ctx['hooks'].keys())}")
-                #     print(f"Is term instance of hooked type? {isinstance(term, tuple(self.ctx['hooks'].keys()))}")
-                # =======================================================================
+        mesh = next(iter(self.dh.fe_map.values())) # Any mesh known to the DoF handler
+        qdeg = self.qorder or mesh.poly_order + 2
+        fields = _all_fields(intg.integrand)
+        
+        # Check for a user-defined hook for functionals.
+        hook = self.ctx['hooks'].get(type(intg.integrand))
+        if hook and hook.get('name') not in self.ctx.get('scalar_results', {}):
+            # Initialize the result bucket; it might hold a scalar or a vector.
+            self.ctx.setdefault('scalar_results', {})[hook['name']] = 0.0
 
+        try:
+            # --- 2. Loop Over All Cut Elements in the Mesh ---
+            for elem in mesh.elements_list:
+                if elem.tag != 'cut' or len(elem.interface_pts) != 2:
+                    continue
+                
+                self.ctx['elem_id'] = elem.id
+                log.debug(f"  Processing cut element: {elem.id}")
 
-                # Case 1: Bilinear form (LHS) -> contributes to the matrix `K`
-                if not rhs and trial is not None and test is not None:
+                # --- 3. Quadrature Rule on the Physical Interface Segment ---
+                p0, p1 = elem.interface_pts
+                qp, qw = line_quadrature(p0, p1, qdeg)
+
+                # --- 4. Pre-compute Basis Functions for this Element ---
+                # This is a key optimization. We evaluate all basis functions for all
+                # quadrature points on this element's interface segment at once.
+                basis_cache = {}
+                if fields:
+                    for fld in fields:
+                        fm = self.dh.fe_map[fld]
+                        ref = get_reference(fm.element_type, fm.poly_order)
+                        vals, grads = [], []
+                        for x_q in qp:
+                            xi, eta = transform.inverse_mapping(fm, elem.id, x_q)
+                            J = transform.jacobian(fm, elem.id, (xi, eta))
+                            # The mathematically correct transformation for row-vector gradients
+                            Jinv = np.linalg.inv(J)
+                            vals.append(ref.shape(xi, eta))
+                            grads.append(ref.grad(xi, eta) @ Jinv)
+                        # Store as efficient NumPy arrays
+                        basis_cache[fld] = {'val': np.asarray(vals), 'grad': np.asarray(grads)}
+                
+                # --- 5. Determine Assembly Path (Bilinear, Linear, or Functional) ---
+                trial, test = _trial_test(intg.integrand)
+
+                # --- PATH A: Bilinear Form (e.g., a(u,v), contributes to the matrix) ---
+                if not rhs and trial and test:
                     row_dofs = self._elm_dofs(test, elem.id)
                     col_dofs = self._elm_dofs(trial, elem.id)
                     loc = np.zeros((len(row_dofs), len(col_dofs)))
+                    
                     for k, (x, w) in enumerate(zip(qp, qw)):
-                        self.ctx['x'] = x
-                        self.ctx['phi_val'] = level_set(x)
-                        self.ctx['normal'] = level_set.gradient(x)
-                        self.ctx['basis_values'] = {f: {'val': basis_cache[f]['val'][k], 'grad': basis_cache[f]['grad'][k]} for f in fields}
-                        # self.ctx['nodal_vals'] = {f: mesh.node_data[f][elem.nodes] for f in getattr(mesh, 'node_data', {}) if f in fields}
-                        loc += sgn * w * self.visit(term)
-                    matvec[np.ix_(row_dofs, col_dofs)] += loc
-
-                # Case 2: Linear form (RHS) -> contributes to the vector `F`
-                elif rhs and test is not None:
-                    row_dofs = self._elm_dofs(test, elem.id)
-                    loc = np.zeros(len(row_dofs))
-                    for k, (x, w) in enumerate(zip(qp, qw)):
-                        self.ctx['x'] = x
-                        self.ctx['phi_val'] = level_set(x)
-                        self.ctx['normal'] = level_set.gradient(x)
-                        self.ctx['basis_values'] = {f: {'val': basis_cache[f]['val'][k], 'grad': basis_cache[f]['grad'][k]} for f in fields}
-                        # self.ctx['nodal_vals'] = {f: mesh.node_data[f][elem.nodes] for f in getattr(mesh, 'node_data', {}) if f in fields}
-                        loc += sgn * w * self.visit(term)
-                    matvec[row_dofs] += loc
-                
-                # Case 3: Scalar functional -> contributes to `scalar_results` via a hook
-                elif hook and trial is None and test is None and isinstance(term, tuple(self.ctx['hooks'].keys())):
-                    acc = 0.0
-                    for k, (x, w) in enumerate(zip(qp, qw)):
-                        self.ctx['x'] = x
-                        self.ctx['phi_val'] = level_set(x)
+                        # Set context for the current quadrature point
+                        self.ctx['x'], self.ctx['phi_val'] = x, level_set(x)
                         self.ctx['normal'] = level_set.gradient(x)
                         if fields:
-                           self.ctx['basis_values'] = {f: {'val': basis_cache[f]['val'][k], 'grad': basis_cache[f]['grad'][k]} for f in fields}
-                        #    print(f"self.ctx['basis_values'][f]['val'][k]={self.ctx['basis_values'][fields[0]]['val'][k]}")
-                        #    print(f"self.ctx['basis_values'][f]['grad'][k]={self.ctx['basis_values'][fields[0]]['grad'][k]}")
-                        #    self.ctx['nodal_vals'] = {f: mesh.node_data[f][elem.nodes] for f in getattr(mesh, 'node_data', {}) if f in fields}
-                        # print(f" term = {term}")
-                        # print(f"self.visit(term) = {self.visit(term)}")
+                            self.ctx['basis_values'] = {f: {'val': basis_cache[f]['val'][k], 'grad': basis_cache[f]['grad'][k]} for f in fields}
                         
-                        acc += sgn * w * self.visit(term)
-                    self.ctx['scalar_results'][hook['name']] += acc
+                        # Evaluate the ENTIRE integrand at once
+                        integrand_val = self.visit(intg.integrand)
+                        loc += w * integrand_val
+                    
+                    matvec[np.ix_(row_dofs, col_dofs)] += loc
+                    log.debug(f"    Assembled {loc.shape} local matrix for element {elem.id}")
 
-        # Context cleanup
-        for key in ('phi_val', 'normal', 'basis_values', 'x', 'nodal_vals','elem_id'):
-            self.ctx.pop(key, None)
+                # --- PATH B: Linear Form (e.g., L(v)) or Functional (e.g., dot(jump,n)) ---
+                else:
+                    # Initialize accumulator correctly based on the result shape
+                    acc = None
+                    
+                    # Main Quadrature Loop
+                    for k, (x, w) in enumerate(zip(qp, qw)):
+                        self.ctx['x'], self.ctx['phi_val'] = x, level_set(x)
+                        self.ctx['normal'] = level_set.gradient(x)
+                        if fields:
+                            self.ctx['basis_values'] = {f: {'val': basis_cache[f]['val'][k], 'grad': basis_cache[f]['grad'][k]} for f in fields}
+                        
+                        integrand_val = self.visit(intg.integrand)
+                        
+                        # Initialize accumulator on the first pass
+                        if acc is None:
+                            acc = w * np.asarray(integrand_val)
+                        else:
+                            acc += w * integrand_val
+
+                    # Add the accumulated result to the correct global object
+                    if acc is not None:
+                        if rhs: # It's a linear form (RHS)
+                            row_dofs = self._elm_dofs(test, elem.id)
+                            matvec[row_dofs] += acc
+                            log.debug(f"    Assembled {acc.shape} local vector for element {elem.id}")
+                        elif hook: # It's a hooked functional
+                            self.ctx['scalar_results'][hook['name']] += acc
+                            log.debug(f"    Accumulated functional '{hook['name']}' for element {elem.id}")
+
+        finally:
+            # --- 6. Final Context Cleanup ---
+            # Use a `finally` block to guarantee cleanup happens even if an error occurs.
+            for key in ('phi_val', 'normal', 'basis_values', 'x', 'elem_id'):
+                self.ctx.pop(key, None)
+            log.debug("Interface assembly finished. Context cleaned.")
+
 
 
 
