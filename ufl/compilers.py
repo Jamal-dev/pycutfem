@@ -27,14 +27,14 @@ import numpy as np
 import scipy.sparse as sp
 from collections import defaultdict
 from typing import Dict, List, Tuple, Iterable, Mapping, Any, Union
-import logging
+import logging,functools
 
 # UFL‑like helpers ----------------------------------------------------------
 from ufl.expressions import (
     Constant, TrialFunction, TestFunction,
     VectorTrialFunction, VectorTestFunction,
     Grad, DivOperation, Inner, Dot, Sum, Sub, Prod,
-    Jump, FacetNormal, Pos, Neg, Function, VectorFunction
+    Jump, FacetNormal, Pos, Neg, Function, VectorFunction, Div
 )
 from ufl.forms import Equation
 
@@ -45,89 +45,11 @@ from pycutfem.fem import transform
 from pycutfem.integration import volume
 from pycutfem.integration.quadrature import  line_quadrature
 from pycutfem.integration.quadrature import edge as edge_quadrature_element
+import sympy
 
 _INTERFACE_TOL = 1.0e-12
 
 
-# ---------------------------------------------------------------------------
-# Sympy to UFL-like expressions
-# ---------------------------------------------------------------------------
-class SymPyToUFLVisitor:
-    """
-    Translates a SymPy expression tree into a UFL expression tree.
-    """
-    def __init__(self, symbol_map: dict):
-        """
-        Initializes the visitor with a map from SymPy Functions to UFL Functions.
-        Example: {sympy.Function('u_trial_x'): ufl.TrialFunction('ux')}
-        """
-        self.symbol_map = symbol_map
-
-    def visit(self, node):
-        """Public visit method for dispatching."""
-        # The method name is matched to the SymPy class name
-        method = f'visit_{type(node).__name__}'
-        visitor = getattr(self, method, self.generic_visit)
-        return visitor(node)
-
-    def generic_visit(self, node):
-        raise TypeError(f"No UFL translation rule for SymPy object: {type(node)}")
-
-    # --- Translation Rules for SymPy Object Types ---
-
-    def visit_Add(self, node):
-        """Translates a SymPy Add into a tree of UFL Sum objects."""
-        # Recursively visit the arguments of the sum and combine with ufl.Sum
-        terms = [self.visit(arg) for arg in node.args]
-        return functools.reduce(lambda a, b: Sum(a, b), terms)
-
-    def visit_Mul(self, node):
-        """Translates a SymPy Mul into a tree of UFL Prod objects."""
-        # Recursively visit the arguments of the product and combine with ufl.Prod
-        terms = [self.visit(arg) for arg in node.args]
-        return functools.reduce(lambda a, b: Prod(a, b), terms)
-
-    def visit_Pow(self, node):
-        """Translates a SymPy Pow, e.g., x**2."""
-        # We need a ufl.Pow class for this. If it doesn't exist, this will fail.
-        # Assuming we can add `class Pow(Expression): ...` to expressions.py
-        base = self.visit(node.base)
-        exp = self.visit(node.exp)
-        return Pow(base, exp) # You may need to create a ufl.Pow class
-
-    def visit_Integer(self, node):
-        """Translates a SymPy Integer to a UFL Constant."""
-        return Constant(int(node))
-
-    def visit_Float(self, node):
-        """Translates a SymPy Float to a UFL Constant."""
-        return Constant(float(node))
-        
-    def visit_Rational(self, node):
-        """Translates a SymPy Rational to a UFL Constant."""
-        return Constant(float(node))
-
-    def visit_Symbol(self, node):
-        """Translates a SymPy Symbol (like 'dt') to a UFL Constant."""
-        return Constant(node)
-
-    def visit_Function(self, node):
-        """Translates a symbolic function using the provided symbol map."""
-        # This is the key lookup step
-        if node in self.symbol_map:
-            return self.symbol_map[node]
-        raise ValueError(f"Unknown SymPy function '{node}' not found in symbol map.")
-
-    def visit_Derivative(self, node):
-        """Translates a SymPy derivative into a UFL Grad component."""
-        # e.g., Derivative(u_x(x,y), y) -> Grad(TrialFunction('ux'))[1]
-        field_to_diff = self.visit(node.expr)
-        
-        # Determine if differentiating w.r.t 'x' (0) or 'y' (1)
-        # Note: assumes x,y are the first two symbols defined in your sympy_fem library
-        coord_index = node.variables[0].__str__() == 'y' 
-        
-        return Grad(field_to_diff)[coord_index]
 
 # ---------------------------------------------------------------------------
 #  Light shape‑meta visitor (helps flip test/trial in ∇· terms)
@@ -138,41 +60,77 @@ class _Shape:
         self.dim = dim      # tensor order (scalar:0, vector:1, grad:2,…)
         self.kind = kind    # 'test' | 'trial' | 'none'
 
+
+
+# In ufl/compilers.py
+
 class _ShapeVisitor:
     def __init__(self):
         self._memo = {}
     def visit(self, n):
-        if n in self._memo:
-            return self._memo[n]
-        meth = getattr(self, f"visit_{type(n).__name__}", self.generic)
+        if n in self._memo: return self._memo[n]
+        
+        # This dispatch needs to be specific
+        meth_name = f"visit_{type(n).__name__}"
+        meth = getattr(self, meth_name, self.generic_visit)
+        
         res = meth(n)
         self._memo[n] = res
         return res
-    def generic(self, n):
+
+    def generic_visit(self, n):
+        # Fallback for base classes if a specific visitor doesn't exist
+        if isinstance(n, TestFunction): return self.visit_TestFunction(n)
+        if isinstance(n, TrialFunction): return self.visit_TrialFunction(n)
+        if isinstance(n, Function): return self.visit_Function(n)
         raise TypeError(f"No shape rule for {type(n)}")
 
-    # terminals
-    def visit_Constant(self, n):          return _Shape(0, 'none')
+    # --- Corrected Visitors for all types ---
+    def visit_Constant(self, n):      return _Shape(n.dim, 'none')
+    def visit_Analytic(self, n):      return _Shape(0, 'none')
+    
+    # --- Specific handlers for each type ---
     def visit_TestFunction(self, n):      return _Shape(0, 'test')
     def visit_TrialFunction(self, n):     return _Shape(0, 'trial')
-    def visit_VectorTestFunction(self,n): return _Shape(1, 'test')
-    def visit_VectorTrialFunction(self,n):return _Shape(1, 'trial')
-    # composite
+    def visit_Function(self, n):          return _Shape(0, 'none')
+    
+    def visit_VectorTestFunction(self, n):  return _Shape(1, 'test')
+    def visit_VectorTrialFunction(self, n): return _Shape(1, 'trial')
+    def visit_VectorFunction(self, n):      return _Shape(1, 'none')
+
+    # --- Visitors for Operators ---
     def visit_Sum(self, n):  return self.visit(n.a)
     def visit_Sub(self, n):  return self.visit(n.a)
-    def visit_Prod(self,n):  # first non‑none wins
+    def visit_Prod(self,n):
         sa, sb = self.visit(n.a), self.visit(n.b)
-        return sa if sa.kind != 'none' else sb
-    def visit_Grad(self, n): s=self.visit(n.operand); return _Shape(s.dim+1, s.kind)
-    def visit_DivOperation(self,n):       return _Shape(0, self.visit(n.operand).kind)
-    def visit_Inner(self,n): sa=self.visit(n.a); sb=self.visit(n.b); return _Shape(0, sa.kind if sa.kind!='none' else sb.kind)
-    def visit_Dot(self,n):   return _Shape(0, self.visit(n.a).kind)
+        dim = sa.dim + sb.dim
+        kind = sa.kind if sa.kind != 'none' else sb.kind
+        return _Shape(dim, kind)
+
+    def visit_Grad(self, n): 
+        s = self.visit(n.operand)
+        return _Shape(s.dim + 1, s.kind)
+
+    def visit_DivOperation(self,n):
+        return _Shape(0, self.visit(n.operand).kind)
+
+    def visit_Inner(self,n): 
+        sa = self.visit(n.a); sb = self.visit(n.b)
+        kind = sa.kind if sa.kind != 'none' else sb.kind
+        return _Shape(max(0, sa.dim - 1), kind)
+    
+    def visit_Dot(self,n):
+        sa = self.visit(n.a); sb = self.visit(n.b)
+        kind = sa.kind if sa.kind != 'none' else sb.kind
+        # Dot product reduces total tensor rank by 2, or dimension by 1 for vectors
+        dim = max(0, sa.dim + sb.dim - 2) if (sa.dim > 0 and sb.dim > 0) else sa.dim + sb.dim
+        return _Shape(dim, kind)
+
+    def visit_Div(self, n): return self.visit(n.a)
     def visit_Pos(self,n):   return self.visit(n.operand)
     def visit_Neg(self,n):   return self.visit(n.operand)
     def visit_Jump(self,n):  return self.visit(n.u_pos)
     def visit_FacetNormal(self,n): return _Shape(1,'none')
-    def visit_Function(self, n):    return _Shape(0, 'none')    # scalar FE function
-    def visit_VectorFunction(self, n): return _Shape(1, 'none')  # vector FE function
     def visit_ElementWiseConstant(self, n):
         return _Shape(0, 'none')
 
@@ -200,7 +158,7 @@ def _all_fields(expr):
             fields.update(n.field_names)
 
         # Recurse through the expression tree
-        for attr in ('operand', 'a', 'b', 'u_pos', 'u_neg', 'components'):
+        for attr in ('operand', 'a', 'b', 'u_pos', 'u_neg', 'components','f'):
             if hasattr(n, attr):
                 m = getattr(n, attr)
                 if isinstance(m, (list, tuple)):
@@ -262,6 +220,41 @@ class FormCompiler:
         else:
             elem_id = self.ctx["elem_id"]
         return node.values[elem_id]
+        
+    # ---------------- Derivative single ------------------------------------------
+    def visit_Derivative(self, node):
+        """
+        Evaluates a single component of a gradient.
+        e.g., Derivative(f, 0) corresponds to ∂f/∂x.
+
+        This method is robust enough to handle both 2D arrays of basis
+        gradients (from Trial/TestFunctions) and 1D arrays of interpolated
+        gradient values (from data-carrying Functions).
+        """
+        # First, evaluate the full gradient of the function.
+        full_grad = self.visit(Grad(node.f))
+        component_idx = node.component_index
+
+        # --- NEW: Check the dimensionality of the result ---
+
+        if full_grad.ndim == 2:
+            # This is the case for Trial/TestFunctions, where full_grad is an
+            # array of basis gradients with shape (n_basis, n_dim).
+            # We need to select the correct column.
+            return full_grad[:, component_idx]
+        
+        elif full_grad.ndim == 1:
+            # This is the case for a data-carrying Function, where full_grad
+            # is the final interpolated gradient vector with shape (n_dim,).
+            # We just need to select the correct component.
+            return full_grad[component_idx]
+        
+        else:
+            # Handle scalars or other unexpected shapes
+            if full_grad.ndim == 0 and component_idx == 0:
+                return full_grad
+            raise ValueError(f"Unsupported shape {full_grad.shape} in visit_Derivative")
+
     # scalars
     def visit_Constant(self,n): 
         v = n.value
@@ -290,7 +283,7 @@ class FormCompiler:
         Evaluates the operand if on the positive side (phi>=0), otherwise returns
         a zero of the same shape as the operand.
         """
-        print("visit Pos zeroing: ctx=", self.ctx)
+        # print("visit Pos zeroing: ctx=", self.ctx)
         # We use a clear convention: '+' side includes the boundary (phi >= 0)
         if ('phi_val' in self.ctx and self.ctx['phi_val'] >= _INTERFACE_TOL) or \
            ('active_side' in self.ctx and self.ctx['active_side'] != '+'):
@@ -309,7 +302,7 @@ class FormCompiler:
         Evaluates the operand if on the negative side (phi<0), otherwise returns
         a zero of the same shape as the operand.
         """
-        print("visit Neg zeroing: ctx=", self.ctx)
+        # print("visit Neg zeroing: ctx=", self.ctx)
         # The '-' side is strictly phi < 0
         if ('phi_val' in self.ctx and self.ctx['phi_val'] < _INTERFACE_TOL) or \
            ('active_side' in self.ctx and self.ctx['active_side'] != '-'):
@@ -347,96 +340,122 @@ class FormCompiler:
     def visit_VectorTestFunction(self,n):  return np.hstack([self._basis_val(f,'test')  for f in n.space.field_names])
     def visit_VectorTrialFunction(self,n): return np.hstack([self._basis_val(f,'trial') for f in n.space.field_names])
 
-    def visit_Function(self, n): # scalar FE function
-        """Evaluates a Function at a quadrature point."""
-        # Get the DoF indices for the current element
-        dofs = self._elm_dofs(n, self.ctx['elem_id'])
-        # Get the corresponding local slice of the global nodal vector
-        nodal_loc = n.nodal_values[dofs]
-
-        # Get the basis function values (N) at the current quadrature point
-        N = self._basis_val(n.field_name, role='test')  # Role ('test'/'trial') is irrelevant here
-        # Return the interpolated value: N · u_local
+    def visit_Function(self, n):
+        """
+        UNIFIED: Evaluates a scalar Function.
+        - If 'solution_vector' is in the context, uses it (Solver Mode).
+        - Otherwise, uses the data on the Function object itself (Direct Eval Mode).
+        """
+        if 'solution_vector' in self.ctx:
+            # --- SOLVER MODE ---
+            solution_vectors = self.ctx['solution_vector']
+            # Use the function's name ('u_k', 'p_k', etc.) to get the right vector
+            vector_to_use = solution_vectors.get(n.name)
+            if vector_to_use is None:
+                raise KeyError(f"Function '{n.name}' not found in the provided solution_vectors dictionary.")
+            
+            dofs = self._elm_dofs(n, self.ctx['elem_id'])
+            nodal_loc = vector_to_use[dofs]
+        else:
+            # --- DIRECT EVALUATION MODE (for tests) ---
+            dofs = self._elm_dofs(n, self.ctx['elem_id'])
+            nodal_loc = n.nodal_values[dofs]
+            
+        N = self._basis_val(n.field_name, role='test')
         return N @ nodal_loc
     
-    def visit_VectorFunction(self, n): # vector FE function
+    def visit_VectorFunction(self, n):
         """
-        Evaluates a VectorFunction at a quadrature point by interpolating each
-        component and returns the result as a single NumPy vector.
+        UNIFIED: Evaluates a VectorFunction.
+        - If 'solution_vector' is in the context, uses it (Solver Mode).
+        - Otherwise, uses the data on the Function object itself (Direct Eval Mode).
         """
-        # Get the local DoFs for all fields. Assumes all fields share the same map.
-        # Note: _elm_dofs for a VectorFunction-like object might need to handle this.
-        # For now, we'll get dofs for the first component as a representative.
-        dofs = self._elm_dofs(n.components[0], self.ctx['elem_id'])
-        
-        # Nodal values for this element, shape (n_loc_dofs, n_components)
-        nodal_loc = n.nodal_values[dofs, :]
-        
-        # Interpolate each component and gather the results
         field_values = []
-        for i, field_name in enumerate(n.field_names):
-            # Get basis function values `N` for this component's field
-            N = self._basis_val(field_name, role='test')
-            # Interpolate: N · u_local_component
-            field_values.append(N @ nodal_loc[:, i])
-            
-        # Return a single NumPy vector, e.g., array([value_x, value_y])
-        return np.array(field_values)
-    
+        if 'solution_vector' in self.ctx:
+            # --- SOLVER MODE ---
+            solution_vectors = self.ctx['solution_vector']
+            vector_to_use = solution_vectors.get(n.name)
+            if vector_to_use is None:
+                raise KeyError(f"VectorFunction '{n.name}' not found in the provided solution_vectors dictionary.")
+                
+            for field_name in n.field_names:
+                dofs = self.dh.element_maps[field_name][self.ctx['elem_id']]
+                nodal_loc_comp = vector_to_use[dofs]
+                N = self._basis_val(field_name, role='test')
+                field_values.append(N @ nodal_loc_comp)
+        else:
+            # --- DIRECT EVALUATION MODE (for tests) ---
+            # This logic matches your original implementation.
+            for i, field_name in enumerate(n.field_names):
+                # Get the correct DoFs for the CURRENT component
+                dofs = self._elm_dofs(n.components[i], self.ctx['elem_id'])
+                
+                # Slice the component's data from the full nodal array
+                # n.nodal_values has shape (num_total_nodes, num_components)
+                nodal_loc_comp = n.nodal_values[dofs, i]
 
+                # Get basis function values `N`
+                N = self._basis_val(field_name, role='test')
+
+                # Interpolate: N · u_local_component
+                field_values.append(N @ nodal_loc_comp)
+                
+        return np.array(field_values)
 
     # differential ops ---------------------------------------------------
     def visit_Grad(self, n):
-        # Case 1: A data-carrying VectorFunction
-        if isinstance(n.operand, VectorFunction):
+        """ UNIFIED visit_Grad method """
+        # This branch handles known data functions (u_k, u_n, etc.)
+        if isinstance(n.operand, (Function, VectorFunction)) and not isinstance(n.operand, (TrialFunction, TestFunction)):
             func = n.operand
             
-            # --- THIS IS THE CORRECTED LOGIC ---
-            # 1. Get the mesh associated with the function's fields.
-            #    All components must share the same mesh.
-            mesh = self.dh.fe_map[func.field_names[0]]
+            # --- SOLVER MODE ---
+            if 'solution_vector' in self.ctx:
+                solution_vectors = self.ctx['solution_vector']
+                vector_to_use = solution_vectors.get(func.name)
+                if vector_to_use is None:
+                    raise KeyError(f"Function '{func.name}' not found in the provided solution_vectors dictionary.")
+
+                if isinstance(func, Function): # Scalar
+                    dofs = self._elm_dofs(func, self.ctx['elem_id'])
+                    nodal_loc = vector_to_use[dofs]
+                    G = self._basis_grad(func.field_name, role='test')
+                    return G.T @ nodal_loc
+                else: # Vector
+                    grad_rows = []
+                    for field_name in func.field_names:
+                        dofs = self.dh.element_maps[field_name][self.ctx['elem_id']]
+                        nodal_loc_comp = vector_to_use[dofs]
+                        G = self._basis_grad(field_name, role='test')
+                        grad_rows.append(G.T @ nodal_loc_comp)
+                    return np.vstack(grad_rows)
             
-            # 2. Get the element object using the elem_id from the context.
-            elem = mesh.elements_list[self.ctx['elem_id']]
-            
-            # 3. Get the element's NODE indices.
-            node_indices = elem.nodes
-            
-            # 4. Use the NODE indices to slice the nodal_values array.
-            #    This correctly fetches the (n_basis, n_components) data block.
-            nodal_loc = func.nodal_values[node_indices, :]
+            # --- DIRECT EVALUATION MODE ---
+            else:
+                # This is your original, working logic from the file you provided.
+                if isinstance(func, VectorFunction):
+                    mesh = self.dh.fe_map[func.field_names[0]]
+                    elem = mesh.elements_list[self.ctx['elem_id']]
+                    node_indices = elem.nodes
+                    nodal_loc = func.nodal_values[node_indices, :]
+                    grad_rows = []
+                    for i, field_name in enumerate(func.field_names):
+                        G = self._basis_grad(field_name, role='test')
+                        nodal_comp_i = nodal_loc[:, i]
+                        grad_rows.append(G.T @ nodal_comp_i)
+                    return np.vstack(grad_rows)
+                else: # Scalar Function
+                    dofs = self._elm_dofs(func, self.ctx['elem_id'])
+                    nodal_loc = func.nodal_values[dofs]
+                    G = self._basis_grad(func.field_name, role='test')
+                    return G.T @ nodal_loc
 
-            # --- The rest of the logic can now work with the correct data ---
-            grad_rows = []
-            for i, field_name in enumerate(func.field_names):
-                # Get basis gradients `G` (shape (n_basis, 2))
-                G = self._basis_grad(field_name, role='test')
-                
-                # Get the nodal values for this specific component
-                nodal_comp_i = nodal_loc[:, i] # Shape (n_basis,)
-                
-                # Interpolate the gradient: G.T @ nodal_comp
-                grad_rows.append(G.T @ nodal_comp_i) # (2, n_basis) @ (n_basis,) -> (2,)
-
-            # Per your successful experiment, we return the TRANSPOSE of the standard
-            # Jacobian to match the convention expected by visit_Dot.
-            return np.vstack(grad_rows)
-
-        # Case 2: A data-carrying scalar Function
-        elif isinstance(n.operand, Function) and not isinstance(n.operand, (TrialFunction, TestFunction)):
-            func = n.operand
-            dofs = self._elm_dofs(func, self.ctx['elem_id'])
-            nodal_loc = func.nodal_values[dofs]
-            G = self._basis_grad(func.field_name, role='test')
-            return G.T @ nodal_loc
-
-        # Case 3: Symbolic Trial/Test functions
+        # This branch for symbolic functions remains unchanged
         sh = self.shape.visit(n.operand)
-        if sh.dim == 0:  # grad(scalar) -> vector of basis grads
+        if sh.dim == 0:
             return self._basis_grad(n.operand.field_name, sh.kind)
-        if sh.dim == 1:  # grad(vector) -> list of gradient rows
+        if sh.dim == 1:
             return [self._basis_grad(f, sh.kind) for f in n.operand.space.field_names]
-            
         raise NotImplementedError('grad of tensor not needed')
 
     def visit_DivOperation(self,n):
@@ -458,7 +477,20 @@ class FormCompiler:
             return np.outer(a,b)
         if sb.kind=='test' and sa.kind=='trial':
             return np.outer(b,a)
-        raise TypeError('Unsupported Prod for assembly')
+        if sa.kind == 'none' and sb.kind == 'none':
+            return a * b
+        # Handle convection: e.g., dot(du, grad(u_k)) * v
+        if sa.kind == 'none' and sb.kind == 'test':  # dot(du, grad(u_k)) * v
+            return np.outer(b, a)  # v as rows, dot result as cols (needs du basis)
+        raise TypeError(f"Unsupported Prod: sa={sa.kind}, sb={sb.kind}")
+    
+    def visit_Div(self, n):
+        """Handles scalar, vector, or tensor division by a scalar."""
+        numerator = self.visit(n.a)
+        denominator = self.visit(n.b)
+
+        # NumPy correctly handles element-wise division of an array by a scalar.
+        return numerator / denominator
 
     def visit_Inner(self,n):
         a=self.visit(n.a); b=self.visit(n.b)
@@ -482,75 +514,183 @@ class FormCompiler:
         return np.outer(b,a)
 
 
-    
+    # dot product ---------------------------------------------------
+    #----------------------------------------------------------------------------------------------------------
+
     def visit_Dot(self, n):
-        # --- Dispatcher: Correctly identify the expression pattern ---
+        """
+        Compute the dot product between two operands in a finite element context.
+        Handles Stokes load vectors, advection terms, numerical arrays, and other FEM cases.
+        """
+        # Visit operands unless they are symbolic expressions to be handled directly
+        a = self.visit(n.a) if not isinstance(n.a, (Constant, Grad, Jump, FacetNormal, TrialFunction, VectorTrialFunction, VectorFunction)) else n.a
+        b = self.visit(n.b) if not isinstance(n.b, (Constant, Grad, Jump, FacetNormal, TestFunction, VectorTestFunction, VectorFunction)) else n.b
 
-        # Use `isinstance` to check the UFL types directly
-        is_a_const = isinstance(n.a, Constant)
-        is_b_const = isinstance(n.b, Constant)
-        is_a_test = isinstance(n.a, (TestFunction, VectorTestFunction))
-        is_b_test = isinstance(n.b, (TestFunction, VectorTestFunction))
+        # Case 1: Numerical arrays (e.g., after evaluation)
+        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+            if a.ndim == 1 and b.ndim == 1:
+                return np.dot(a, b)  # Vector dot product
+            elif a.ndim == 2 and b.ndim == 1:
+                return a @ b  # Matrix-vector product
+            elif a.ndim == 0 or b.ndim == 0:
+                return a * b  # Scalar multiplication
+            else:
+                raise TypeError(f"Unsupported shapes in dot: {a.shape}, {b.shape}")
 
-        # If the pattern is `dot(Constant, TestFunction)`, use the special Stokes logic
-        if (is_a_const and is_b_test) or (is_b_const and is_a_test):
-            const_eval, vec_eval = (self.visit(n.a), self.visit(n.b)) if is_a_const else (self.visit(n.b), self.visit(n.a))
+        # Case 2: Stokes load vector - dot(Constant, VectorTestFunction) or vice versa
+        if (isinstance(n.a, Constant) and isinstance(n.b, VectorTestFunction)) or \
+        (isinstance(n.b, Constant) and isinstance(n.a, VectorTestFunction)):
+            const = n.a if isinstance(n.a, Constant) else n.b
+            test = n.b if isinstance(n.b, VectorTestFunction) else n.a
+            const_val = const.value  # Constant vector, e.g., [fx, fy]
+            test_val = self.visit(test)  # DOFs of vector test function, shape (n_dofs_total,)
 
-            ncomp = len(const_eval)
-            if len(vec_eval) == 0:
-                return vec_eval  # Return empty if no DoFs on element
-
-            # Ensure component division is valid
-            if len(vec_eval) % ncomp != 0:
-                raise ValueError(
-                    f"In dot(Constant, TestFunction), cannot divide basis vector of "
-                    f"length {len(vec_eval)} into {ncomp} components."
-                )
+            ncomp = len(test.space.field_names)  # Number of components (e.g., 2 for 2D)
+            if len(const_val) != ncomp:
+                raise ValueError("Constant vector dimension must match test function components")
+            if len(test_val) % ncomp != 0:
+                raise ValueError("Test function DOFs must be divisible by number of components")
             
-            dofs_per = len(vec_eval) // ncomp
-            out = np.zeros_like(vec_eval)
-            vec_reshaped = vec_eval.reshape((ncomp, dofs_per))
+            dofs_per_comp = len(test_val) // ncomp
+            out = np.zeros_like(test_val)
             for i in range(ncomp):
-                out[i * dofs_per:(i + 1) * dofs_per] = const_eval[i] * vec_reshaped[i]
+                start = i * dofs_per_comp
+                end = (i + 1) * dofs_per_comp
+                out[start:end] = const_val[i] * test_val[start:end]  # Scale each component
             return out
 
-        # --- General Logic Path ---
-        # If the Stokes pattern doesn't match, proceed with general-purpose logic.
-        a = self.visit(n.a)
-        b = self.visit(n.b)
+        # Case 3: Advection term - dot(Constant, Grad(TrialFunction))
+        if isinstance(n.a, Constant) and isinstance(n.b, Grad) and isinstance(n.b.operand, TrialFunction):
+            const_val = n.a.value  # Constant vector, e.g., beta = [1, 1]
+            grad_trial = self.visit(n.b)  # Gradient matrix, shape (n_basis, n_dim)
+            if not isinstance(grad_trial, np.ndarray):
+                return Dot(n.a, n.b)  # Defer if symbolic
+            if len(const_val) != grad_trial.shape[1]:
+                raise ValueError("Dimension mismatch in dot(Constant, Grad)")
+            return np.dot(grad_trial, const_val)  # Resulting shape: (n_basis,)
 
-        a = np.asarray(a)
-        b = np.asarray(b)
+        # Case 4: Boundary/flux term - dot(Grad(...), FacetNormal())
+        if isinstance(n.a, Grad) and isinstance(n.b, FacetNormal):
+            grad_val = self.visit(n.a)  # Gradient, e.g., (n_basis, n_dim)
+            normal = self.visit(n.b)  # Normal vector, e.g., (n_dim,)
+            if isinstance(grad_val, np.ndarray) and isinstance(normal, np.ndarray):
+                if grad_val.ndim == 2:
+                    return np.dot(grad_val, normal)  # (n_basis,)
+                elif grad_val.ndim == 1:
+                    return np.dot(grad_val, normal)  # Scalar
+            return Dot(n.a, n.b)  # Defer symbolic case
 
-        # Case for dot(vector, vector) -> scalar (fixes the jump test)
-        if a.ndim == 1 and b.ndim == 1:
-            return np.dot(a, b)
+        # Case 5: DG term - dot(Jump(...), FacetNormal())
+        if isinstance(n.a, Jump) and isinstance(n.b, FacetNormal):
+            jump_val = self.visit(n.a)  # Jump across facets
+            normal = self.visit(n.b)  # Normal vector
+            if isinstance(jump_val, np.ndarray) and isinstance(normal, np.ndarray):
+                return np.dot(jump_val, normal)
+            return Dot(n.a, n.b)  # Defer symbolic case
+
+        # Case 6: Scalar test function - dot(Constant, TestFunction) or vice versa
+        if (isinstance(n.a, Constant) and isinstance(n.b, TestFunction)) or \
+        (isinstance(n.b, Constant) and isinstance(n.a, TestFunction)):
+            const = n.a if isinstance(n.a, Constant) else n.b
+            test = n.b if isinstance(n.b, TestFunction) else n.a
+            const_val = const.value
+            test_val = self.visit(test)
+            if not isinstance(const_val, (int, float)):
+                raise ValueError("Constant must be scalar for scalar TestFunction")
+            return const_val * test_val
+        
+        # Handles terms like dot(u_k, grad(du_i)) from the advection term.
+        if isinstance(n.a, VectorFunction) and isinstance(n.b, Grad) and isinstance(n.b.operand, TrialFunction):
+            vec_func_val = self.visit(n.a)    # Evaluated vector, e.g., u_k at a point -> shape(2,)
+            grad_trial = self.visit(n.b)      # Basis gradients for du_i -> shape(n_basis, 2)
             
-        # Case for scalar * vector/matrix
-        if a.ndim == 0: return a * b
-        if b.ndim == 0: return b * a
+            # This is the operation u_k ⋅ ∇(du_i), which results in a vector of
+            # coefficients for each basis function in the trial space.
+            return grad_trial @ vec_func_val  # (n_basis, 2) @ (2,) -> (n_basis,)
 
-        # ADDED: Case for dot(tensor, vector) -> vector (Matrix-vector product)
-        if a.ndim == 2 and b.ndim == 1:
-            return a @ b
-            
-        # # Failing the advection diffusion test: Case for dot(vector, tensor) -> vector
-        # if a.ndim == 1 and b.ndim == 2:
-        #     return a @ b
+        # Case 7: Trial and test functions (bilinear forms)
+        a_is_trial = isinstance(n.a, (TrialFunction, VectorTrialFunction))
+        b_is_test = isinstance(n.b, (TestFunction, VectorTestFunction))
+        if a_is_trial and b_is_test:
+            if isinstance(n.a, VectorTrialFunction) and isinstance(n.b, VectorTestFunction):
+                # Vector case: sum over components
+                return sum(self.visit_Prod(Prod(n.a[i], n.b[i])) for i in range(len(n.a.space.field_names)))
+            return self.visit_Prod(Prod(n.a, n.b))  # Scalar case
 
-        # Other cases for assembling vectors or matrices
-        sa, sb = self.shape.visit(n.a), self.shape.visit(n.b)
-        # ADDED: This new condition handles dot(Constant, grad(TrialFunction))
-        if sa.kind == 'none' and sb.kind == 'trial':
-            # This is Constant `a` dotted with each basis grad in `b`.
-            # Operation is matrix @ vector: (4, 2) @ (2,) -> (4,)
-            return b @ a
-        if sa.kind == 'none' and sb.kind == 'test': return b @ a
-        if sa.kind == 'test' and sb.kind == 'none': return a @ b.T
-        if sa.kind == 'test' and sb.kind == 'trial': return np.outer(a, b)
-        if sb.kind == 'test' and sa.kind == 'trial': return np.outer(b, a)
+        # If no case matches, raise an error
+        print(n.a.dim, n.b.shape)
+        raise NotImplementedError(f"Dot between {type(n.a)} and {type(n.b)} not supported")
+
+    # def visit_Dot(self, n): # this logic is passihng the Stokes test
+    #     # --- Dispatcher: Correctly identify the expression pattern ---
+
+    #     # Use `isinstance` to check the UFL types directly
+    #     is_a_const = isinstance(n.a, Constant)
+    #     is_b_const = isinstance(n.b, Constant)
+    #     is_a_test = isinstance(n.a, (TestFunction, VectorTestFunction))
+    #     is_b_test = isinstance(n.b, (TestFunction, VectorTestFunction))
+
+    #     # If the pattern is `dot(Constant, TestFunction)`, use the special Stokes logic
+    #     if (is_a_const and is_b_test) or (is_b_const and is_a_test):
+    #         const_eval, vec_eval = (self.visit(n.a), self.visit(n.b)) if is_a_const else (self.visit(n.b), self.visit(n.a))
+
+    #         ncomp = len(const_eval)
+    #         if len(vec_eval) == 0:
+    #             return vec_eval  # Return empty if no DoFs on element
+
+    #         # Ensure component division is valid
+    #         if len(vec_eval) % ncomp != 0:
+    #             raise ValueError(
+    #                 f"In dot(Constant, TestFunction), cannot divide basis vector of "
+    #                 f"length {len(vec_eval)} into {ncomp} components."
+    #             )
             
-        raise TypeError(f"Unsupported Dot operation between shapes {a.shape} and {b.shape}")
+    #         dofs_per = len(vec_eval) // ncomp
+    #         out = np.zeros_like(vec_eval)
+    #         vec_reshaped = vec_eval.reshape((ncomp, dofs_per))
+    #         for i in range(ncomp):
+    #             out[i * dofs_per:(i + 1) * dofs_per] = const_eval[i] * vec_reshaped[i]
+    #         return out
+
+    #     # --- General Logic Path ---
+    #     # If the Stokes pattern doesn't match, proceed with general-purpose logic.
+    #     a = self.visit(n.a)
+    #     b = self.visit(n.b)
+
+    #     a = np.asarray(a)
+    #     b = np.asarray(b)
+
+    #     # Case for dot(vector, vector) -> scalar (fixes the jump test)
+    #     if a.ndim == 1 and b.ndim == 1:
+    #         return np.dot(a, b)
+            
+    #     # Case for scalar * vector/matrix
+    #     if a.ndim == 0: return a * b
+    #     if b.ndim == 0: return b * a
+
+    #     # ADDED: Case for dot(tensor, vector) -> vector (Matrix-vector product)
+    #     if a.ndim == 2 and b.ndim == 1:
+    #         return a @ b
+            
+    #     # # Failing the advection diffusion test: Case for dot(vector, tensor) -> vector
+    #     # if a.ndim == 1 and b.ndim == 2:
+    #     #     return a @ b
+
+    #     # Other cases for assembling vectors or matrices
+    #     sa, sb = self.shape.visit(n.a), self.shape.visit(n.b)
+    #     # ADDED: This new condition handles dot(Constant, grad(TrialFunction))
+    #     if sa.kind == 'none' and sb.kind == 'trial':
+    #         # This is Constant `a` dotted with each basis grad in `b`.
+    #         # Operation is matrix @ vector: (4, 2) @ (2,) -> (4,)
+    #         return b @ a
+    #     if sa.kind == 'none' and sb.kind == 'test': return b @ a
+    #     if sa.kind == 'test' and sb.kind == 'none': return a @ b.T
+    #     if sa.kind == 'test' and sb.kind == 'trial': return np.outer(a, b)
+    #     if sb.kind == 'test' and sa.kind == 'trial': return np.outer(b, a)
+            
+    #     raise TypeError(f"Unsupported Dot operation between shapes {a.shape} and {b.shape}")
+
+    #---------------------------------------------------------------------------------------------------------
 
     # def visit_Jump(self,n):
     #     side = self.ctx['active_side']
@@ -624,50 +764,119 @@ class FormCompiler:
                 self._assemble_interface(integral,matvec)
 
     # volume ------------------------------------------------------------
-    def _assemble_volume(self,intg,matvec):
+    # In ufl/compilers.py
+
+    def _assemble_volume(self, intg, matvec):
         rhs = self.ctx['is_rhs']
+        # Use the first field to determine the mesh for geometry, assuming they are all on the same one.
         mesh = self.dh.fe_map[_all_fields(intg.integrand)[0]]
-        q = self.qorder or mesh.poly_order+2
-        qpts,qwts = volume(mesh.element_type,q)
+        q = self.qorder or mesh.poly_order + 2
+        qpts, qwts = volume(mesh.element_type, q)
         terms = _split_terms(intg.integrand)
-        for eid,elem in enumerate(mesh.elements_list):
-            
+        
+        # Get all unique fields in the integrand to get their reference elements
+        all_q_fields = _all_fields(intg.integrand)
+        ref_elements = {fld: get_reference(self.dh.fe_map[fld].element_type, self.dh.fe_map[fld].poly_order)
+                        for fld in all_q_fields}
+
+        for eid, elem in enumerate(mesh.elements_list):
             self.ctx['elem_id'] = elem.id
-            # precompute basis at qpts
-            bv=defaultdict(lambda:{'val':[],'grad':[]})
-            for fld in _all_fields(intg.integrand):
-                fm = self.dh.fe_map[fld]
-                ref = get_reference(fm.element_type,fm.poly_order)
-                for xi,eta in qpts:
-                    J = transform.jacobian(fm,eid,(xi,eta))
-                    JinvT = np.linalg.inv(J).T
-                    bv[fld]['val'].append(ref.shape(xi,eta))
-                    bv[fld]['grad'].append(ref.grad(xi,eta) @ JinvT)
-            for sgn,term in terms:
-                trial,test=_trial_test(term)
+
+            for sgn, term in terms:
+                trial, test = _trial_test(term)
                 if rhs and test is None: continue
                 if not rhs and (trial is None or test is None): continue
-                row = self._elm_dofs(test,eid)
+                
+                row = self._elm_dofs(test, eid)
                 if rhs:
                     local = np.zeros(len(row))
                 else:
-                    col = self._elm_dofs(trial,eid)
-                    local = np.zeros((len(row),len(col)))
-                for k,(xi_eta, w) in enumerate(zip(qpts,qwts)):
-                    self.ctx['x_phys'] = transform.x_mapping(mesh, elem.id, (xi, eta))
-                    self.ctx["side"] = ""  # volume integrals have no side notion
+                    col = self._elm_dofs(trial, eid)
+                    local = np.zeros((len(row), len(col)))
+
+                # Main Quadrature Loop
+                for xi_eta, w in zip(qpts, qwts):
+                    # --- All calculations are now correctly scoped inside this loop ---
+
+                    # 1. Compute geometric transformations for the CURRENT quadrature point
+                    J = transform.jacobian(mesh, eid, xi_eta)
+                    detJ = abs(np.linalg.det(J))
+                    JinvT = np.linalg.inv(J).T
+                    
+                    # 2. Set the context for the visit methods
+                    self.ctx['x_phys'] = transform.x_mapping(mesh, elem.id, xi_eta)
                     self.ctx['x'] = self.ctx['x_phys']
-                    self.ctx['basis_values']={f:{'val':bv[f]['val'][k],'grad':bv[f]['grad'][k]} for f in bv}
-                    J = transform.jacobian(mesh,eid,xi_eta)
+                    self.ctx["side"] = ""
+
+                    # 3. Compute and cache basis function values for the CURRENT quadrature point
+                    basis_values_at_qp = {}
+                    for fld in _all_fields(term): # Only need fields for the specific term
+                        ref = ref_elements[fld]
+                        basis_values_at_qp[fld] = {
+                            'val': ref.shape(*xi_eta),
+                            'grad': ref.grad(*xi_eta) @ JinvT
+                        }
+                    self.ctx['basis_values'] = basis_values_at_qp
+
+                    # 4. Evaluate the integrand
                     val = self.visit(term)
-                    local += sgn * w * abs(np.linalg.det(J)) * val
+                    
+                    # 5. Accumulate into the local matrix/vector
+                    local += sgn * w * detJ * val
+
+                # Scatter the local contribution into the global matrix/vector
                 if rhs:
-                    matvec[row]+=local
+                    matvec[row] += local
                 else:
-                    matvec[np.ix_(row,col)]+=local
-        # Context cleanup
-        for key in ('phi_val', 'normal', 'basis_values', 'x', 'nodal_vals','elem_id','x_phys','side'):
+                    matvec[np.ix_(row, col)] += local
+                    
+        # Context cleanup (good practice)
+        for key in ('phi_val', 'normal', 'basis_values', 'x', 'nodal_vals', 'elem_id', 'x_phys', 'side'):
             self.ctx.pop(key, None)
+    # def _assemble_volume(self,intg,matvec):
+    #     rhs = self.ctx['is_rhs']
+    #     mesh = self.dh.fe_map[_all_fields(intg.integrand)[0]]
+    #     q = self.qorder or mesh.poly_order+2
+    #     qpts,qwts = volume(mesh.element_type,q)
+    #     terms = _split_terms(intg.integrand)
+    #     for eid,elem in enumerate(mesh.elements_list):
+            
+    #         self.ctx['elem_id'] = elem.id
+    #         # precompute basis at qpts
+    #         bv=defaultdict(lambda:{'val':[],'grad':[]})
+    #         for fld in _all_fields(intg.integrand):
+    #             fm = self.dh.fe_map[fld]
+    #             ref = get_reference(fm.element_type,fm.poly_order)
+    #             for xi,eta in qpts:
+    #                 J = transform.jacobian(fm,eid,(xi,eta))
+    #                 JinvT = np.linalg.inv(J).T
+    #                 bv[fld]['val'].append(ref.shape(xi,eta))
+    #                 bv[fld]['grad'].append(ref.grad(xi,eta) @ JinvT)
+    #         for sgn,term in terms:
+    #             trial,test=_trial_test(term)
+    #             if rhs and test is None: continue
+    #             if not rhs and (trial is None or test is None): continue
+    #             row = self._elm_dofs(test,eid)
+    #             if rhs:
+    #                 local = np.zeros(len(row))
+    #             else:
+    #                 col = self._elm_dofs(trial,eid)
+    #                 local = np.zeros((len(row),len(col)))
+    #             for k,(xi_eta, w) in enumerate(zip(qpts,qwts)):
+    #                 self.ctx['x_phys'] = transform.x_mapping(mesh, elem.id, (xi, eta))
+    #                 self.ctx["side"] = ""  # volume integrals have no side notion
+    #                 self.ctx['x'] = self.ctx['x_phys']
+    #                 self.ctx['basis_values']={f:{'val':bv[f]['val'][k],'grad':bv[f]['grad'][k]} for f in bv}
+    #                 J = transform.jacobian(mesh,eid,xi_eta)
+    #                 val = self.visit(term)
+    #                 local += sgn * w * abs(np.linalg.det(J)) * val
+    #             if rhs:
+    #                 matvec[row]+=local
+    #             else:
+    #                 matvec[np.ix_(row,col)]+=local
+    #     # Context cleanup
+    #     for key in ('phi_val', 'normal', 'basis_values', 'x', 'nodal_vals','elem_id','x_phys','side'):
+    #         self.ctx.pop(key, None)
     
     # ------------------------------------------------------------------
     #  Interface integrals (CutFEM) – one-sided, no extra DOFs

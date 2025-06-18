@@ -194,6 +194,13 @@ class DofHandler:
         if edge.left is None or edge.right is None:
             raise ValueError("Edge is on boundary – no right element")
         return (self.element_maps[field][edge.left], self.element_maps[field][edge.right])
+    
+    def get_field_slice(self, field: str) -> List[int]:
+        """Return the global DOF indices for the given field."""
+        if field not in self.field_names:
+            raise ValueError(f"Field '{field}' not found in DofHandler")
+        
+        return list(self.dof_map[field].values())
 
     # ------------------------------------------------------------------
     #  Debug convenience

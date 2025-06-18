@@ -57,11 +57,42 @@ class Expression:
         return None
 
 class Function(Expression):
-    def __init__(self, field_name, name="",nodal_values = None):
-        self.field_name = field_name; self.name = name
-        self.nodal_values = nodal_values
+    def __init__(self, field_name, name="", nodal_values=None, parent_vector=None, component_index=None):
+        self.field_name = field_name
+        self.name = name
+        
+        # --- NEW ---
+        # If this is a standalone function, it stores its own data.
+        self._nodal_values = nodal_values 
+        # If it's a component of a vector, it holds a reference to the parent.
+        self.parent_vector = parent_vector
+        self.component_index = component_index
+        self.dim = 0
+
+    @property
+    def nodal_values(self):
+        """
+        If this is a component of a vector, return the corresponding slice 
+        from the parent's data. Otherwise, return its own data.
+        """
+        if self.parent_vector is not None:
+            return self.parent_vector.nodal_values[:, self.component_index]
+        return self._nodal_values
+
+    @nodal_values.setter
+    def nodal_values(self, value):
+        """
+        If this is a component of a vector, modify the parent's data
+        IN-PLACE. Otherwise, set its own data.
+        """
+        if self.parent_vector is not None:
+            # This modifies the data in the parent array directly.
+            self.parent_vector.nodal_values[:, self.component_index] = value
+        else:
+            self._nodal_values = value
+
     def __repr__(self):
-        return f"{self.__class__.__name__}(field='{self.field_name}')"
+        return f"{self.__class__.__name__}(name='{self.name}', field='{self.field_name}')"
 
 # In your ufl/expressions.py file
 
@@ -80,11 +111,19 @@ class VectorFunction(Expression):
         self.name = name
         self.field_names = field_names
         self.nodal_values = nodal_values
+        self.dim = 1
         
         # Create a list of scalar Function objects for polymorphism.
         # These components are primarily for structural compatibility and do not
         # hold data themselves; the data is in self.nodal_values.
-        self.components = [Function(fn) for fn in self.field_names]
+        self.components = [
+            Function(
+                fn, 
+                name=f"{self.name}_{fn}", 
+                parent_vector=self,              # Pass reference to parent
+                component_index=i                # Pass the component index
+            ) for i, fn in enumerate(self.field_names)
+        ]
 
     def __repr__(self):
         return f"VectorFunction(name='{self.name}', fields={self.field_names})"
@@ -149,6 +188,11 @@ class Prod(Expression):
 class Div(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
     def __repr__(self): return f"({self.a!r} / {self.b!r})"
+
+class Derivative(Expression):
+    def __init__(self, f, component_index):
+        self.f, self.component_index = f, component_index
+    def __repr__(self): return f"Derivative({self.f!r}, {self.component_index})"
 
 class Grad(Expression):
     def __init__(self, operand): self.operand = operand

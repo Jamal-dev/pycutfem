@@ -9,7 +9,10 @@ Add more degrees as needed.
 import numpy as np
 import json
 from pathlib import Path
-with open(Path("pycutfem/integration/dunavant_degree_1_to_20.json"), "r") as f:
+import os
+
+
+with open(Path(os.path.dirname(__file__))/Path("dunavant_degree_1_to_20.json"), "r") as f:
     dunavant_data = json.load(f)
 
 def get_dunavant_weights(degree):

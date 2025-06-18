@@ -55,21 +55,21 @@ class BoundaryCondition:
         self.domain_tag = domain_tag
         self.value = value
 
-def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None, assembler_hooks=None):
+def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None, 
+                  assembler_hooks=None, solution_vector=None):
     """
     High-level function to assemble a weak form into a matrix and vector.
-
-    Args:
-        equation (Equation): The equation (a == L) to assemble.
-        dof_handler (DofHandler): The degree-of-freedom manager for the problem.
-        bcs (list): A list of BoundaryCondition objects.
-        quad_order (int, optional): The quadrature order. Defaults to p+2.
-
-    Returns:
-        (scipy.sparse.csr_matrix, numpy.ndarray): The assembled stiffness matrix K
-                                                  and load vector F.
     """
     # Local import to avoid circular dependencies
     from ufl.compilers import FormCompiler
+    
+    # Create the compiler instance
     compiler = FormCompiler(dof_handler, quad_order, assembler_hooks=assembler_hooks)
+    
+    # --- NEW: Set the solution_vector context if it's provided ---
+    # This context will be available to all visitor methods.
+    if solution_vector is not None:
+        compiler.ctx['solution_vector'] = solution_vector
+        
+    # The compiler is now configured and ready to assemble.
     return compiler.assemble(equation, bcs)
