@@ -368,85 +368,51 @@ def test_white_box_vector_advection():
 def test_vector_advection_diffusion():
     """
     Tests the assembly for a vector advection-diffusion problem using
-    the method of manufactured solutions.
-    
-    We solve for a correction `du` at the exact solution `u_exact`.
-    The correction `du` should be zero.
-    
-    Equation: -εΔu + (u ⋅ ∇)u = f
-    Linearized system for correction du: -εΔ(du) + ((u_k ⋅ ∇)du) + ((du ⋅ ∇)u_k) = -R(u_k)
-    For our test, we set u_k = u_exact, so the residual R(u_k) = 0.
-    We solve: [-εΔ(du) + ((u_exact ⋅ ∇)du)] = -((du ⋅ ∇)u_exact)
-    This is too complex. Let's simplify and test one term at a time.
-    
-    Let's test the form: ε inner(grad(u),grad(v)) + dot(dot(beta, grad(u)), v) = dot(f, v)
-    where beta is a known vector function.
+    the final, robust Function and VectorFunction classes.
     """
     print("\n" + "="*70)
     print("Testing Vector Advection-Diffusion with Manufactured Solution")
     print("="*70)
 
     # 1. Define Analytical Solution and Parameters using SymPy
-    epsilon = 10.0
-    # Define a known vector field for the advection velocity, beta(x,y)
-    # beta_sym = sp.Matrix([sp.sin(sp.pi * y), sp.cos(sp.pi * x)])
+    epsilon = 0.1
     beta_sym = sp.Matrix([1.0, 1.0])
-    # beta_sym =  np.array([1.0, 1.0])
 
-    
-    # Define the exact solution we want to recover
     u_exact_sym_x = sp.sin(2 * sp.pi * x) * sp.cos(sp.pi * y)
     u_exact_sym_y = sp.cos(sp.pi * x) * sp.sin(2 * sp.pi * y)
     
-    # Calculate the source term f = -εΔu_exact + (β ⋅ ∇)u_exact
     f_sym_x = -epsilon * (sp.diff(u_exact_sym_x, x, 2) + sp.diff(u_exact_sym_x, y, 2)) + \
               (beta_sym[0] * sp.diff(u_exact_sym_x, x) + beta_sym[1] * sp.diff(u_exact_sym_x, y))
-              
     f_sym_y = -epsilon * (sp.diff(u_exact_sym_y, x, 2) + sp.diff(u_exact_sym_y, y, 2)) + \
               (beta_sym[0] * sp.diff(u_exact_sym_y, x) + beta_sym[1] * sp.diff(u_exact_sym_y, y))
 
-    # Lambdify expressions to create callable functions for BCs and evaluation
     u_exact_func_x = sp.lambdify((x, y), u_exact_sym_x, 'numpy')
     u_exact_func_y = sp.lambdify((x, y), u_exact_sym_y, 'numpy')
-    
-    # The source `f` and advection velocity `beta` can be passed as Analytic objects
-    f = (Analytic(f_sym_x), Analytic(f_sym_y))
+    f_x = Analytic(f_sym_x)
+    f_y = Analytic(f_sym_y)
+    beta_analytic_func = sp.lambdify((x, y), beta_sym, 'numpy')
 
     # 2. Setup Mesh and DofHandler
-    poly_order = 1
+    poly_order = 2  # Test with Q2 elements where the error occurred
     nodes, elems, _, corners = structured_quad(1, 1, nx=8, ny=8, poly_order=poly_order)
     mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
-
-    beta = VectorFunction(name="beta", field_names=['ux', 'uy']) # Placeholder
-    # beta = Constant(beta_sym, dim =1)  # Use a constant vector for simplicity
-    beta_vals = np.zeros((len(nodes), 2))
-    for i, node in enumerate(nodes):
-        beta_vals[node.id,:] = [beta_sym[0].evalf(subs={x:node.x,y:node.y}), beta_sym[1].evalf(subs={x:node.x,y:node.y})]
-    beta.nodal_values = beta_vals
-
     fe_map = {'ux': mesh, 'uy': mesh}
     dof_handler = DofHandler(fe_map, method='cg')
 
-    # 3. Define the Weak Form using a component-wise advection term for robustness
+    # 3. Define the Weak Form
+    # --- UPDATED FUNCTION INITIALIZATION ---
     u = VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy']))
     v = VectorTestFunction(FunctionSpace("velocity", ['ux', 'uy']))
     
-    # Diffusion Term
-    diffusion = epsilon * inner(grad(u), grad(v))
-    
-    # Advection Term: ∑ᵢ (β ⋅ ∇uᵢ)vᵢ
-    # This formulation is cleaner and less prone to parsing errors by the compiler
-    # advection = dot(dot(beta, grad(u)) , v)
-    advection = (
-        dot(beta, grad(u[0])) * v[0] + 
-        dot(beta, grad(u[1])) * v[1]
-    )
-    
-    a_form = (diffusion + advection) * dx()
-    
-    # Forcing term
-    L_form = (f[0] * v[0] + f[1] * v[1]) * dx()
+    # Create beta and populate it using the new, clean API
+    beta = VectorFunction(name="beta", field_names=['ux', 'uy'], dof_handler=dof_handler)
+    beta.set_values_from_function(beta_analytic_func)
 
+    # --- Weak form definition remains the same ---
+    diffusion = epsilon * inner(grad(u), grad(v))
+    advection = (dot(beta, grad(u[0])) * v[0] + dot(beta, grad(u[1])) * v[1])
+    a_form = (diffusion + advection) * dx()
+    L_form = (f_x * v[0] + f_y * v[1]) * dx()
     equation = (a_form == L_form)
 
     # 4. Define Boundary Conditions
@@ -457,7 +423,8 @@ def test_vector_advection_diffusion():
     ]
 
     # 5. Assemble and Solve
-    # We are in "Direct Evaluation Mode", no solution_vector needed
+    # We are in "Direct Evaluation Mode", no solution_vector needed.
+    # The compiler will use the data stored inside the `beta` object.
     A, b = assemble_form(equation, dof_handler=dof_handler, bcs=bcs, quad_order=5)
     u_vec = spla.spsolve(A, b)
 
@@ -465,12 +432,13 @@ def test_vector_advection_diffusion():
     ux_dofs = dof_handler.get_field_slice('ux')
     uy_dofs = dof_handler.get_field_slice('uy')
     
+    node_coords = mesh.nodes_x_y_pos
     exact_sol_vec = np.zeros_like(u_vec)
-    exact_sol_vec[ux_dofs] = u_exact_func_x(mesh.nodes_x_y_pos[:, 0], mesh.nodes_x_y_pos[:, 1])
-    exact_sol_vec[uy_dofs] = u_exact_func_y(mesh.nodes_x_y_pos[:, 0], mesh.nodes_x_y_pos[:, 1])
+    exact_sol_vec[ux_dofs] = u_exact_func_x(node_coords[:, 0], node_coords[:, 1])
+    exact_sol_vec[uy_dofs] = u_exact_func_y(node_coords[:, 0], node_coords[:, 1])
     
     l2_error = np.linalg.norm(u_vec - exact_sol_vec) / np.linalg.norm(exact_sol_vec)
     
-    print(f"\nRelative L2 Error for Vector Advection-Diffusion: {l2_error:.4e}")
+    print(f"\nRelative L2 Error for Q{poly_order} Vector Advection-Diffusion: {l2_error:.4e}")
     assert l2_error < 0.01, "Solution error is too high."
     print("Vector advection-diffusion test passed successfully!")

@@ -340,115 +340,70 @@ class FormCompiler:
     def visit_VectorTestFunction(self,n):  return np.hstack([self._basis_val(f,'test')  for f in n.space.field_names])
     def visit_VectorTrialFunction(self,n): return np.hstack([self._basis_val(f,'trial') for f in n.space.field_names])
 
-    def visit_Function(self, n):
+    #----------------------------------------------------------
+    def _get_data_vector_and_dofs(self, func_object):
         """
-        UNIFIED: Evaluates a scalar Function.
-        - If 'solution_vector' is in the context, uses it (Solver Mode).
-        - Otherwise, uses the data on the Function object itself (Direct Eval Mode).
+        Unified helper to get the correct data vector and element DoFs.
+        It checks for a solver context and falls back to the object's own data.
         """
+        elem_dofs = self._elm_dofs(func_object, self.ctx['elem_id'])
+        
         if 'solution_vector' in self.ctx:
             # --- SOLVER MODE ---
             solution_vectors = self.ctx['solution_vector']
-            # Use the function's name ('u_k', 'p_k', etc.) to get the right vector
-            vector_to_use = solution_vectors.get(n.name)
-            if vector_to_use is None:
-                raise KeyError(f"Function '{n.name}' not found in the provided solution_vectors dictionary.")
             
-            dofs = self._elm_dofs(n, self.ctx['elem_id'])
-            nodal_loc = vector_to_use[dofs]
+            # In solver mode, a VectorFunction's components might not be in the context dict.
+            # We use the base name (e.g., 'u_k' from 'u_k_ux') if it exists.
+            name_to_lookup = getattr(func_object, '_parent_vector', func_object).name
+            
+            data_vector = solution_vectors.get(name_to_lookup)
+            if data_vector is None:
+                raise KeyError(f"Function '{name_to_lookup}' not found in solution_vectors context.")
+            
+            # In solver mode, we slice the GLOBAL vector directly with GLOBAL dofs.
+            nodal_loc = data_vector[elem_dofs]
+            
         else:
-            # --- DIRECT EVALUATION MODE (for tests) ---
-            dofs = self._elm_dofs(n, self.ctx['elem_id'])
-            nodal_loc = n.nodal_values[dofs]
+            # --- DIRECT EVALUATION MODE ---
+            # Call the object's own getter method, which handles the mapping
+            # from global element DoFs to its internal local data array.
+            nodal_loc = func_object.get_nodal_values(elem_dofs)
             
+        return nodal_loc
+
+    def visit_Function(self, n):
+        elem_dofs = self._elm_dofs(n, self.ctx['elem_id'])
+        nodal_loc = n.get_nodal_values(elem_dofs)
         N = self._basis_val(n.field_name, role='test')
         return N @ nodal_loc
     
     def visit_VectorFunction(self, n):
-        """
-        UNIFIED: Evaluates a VectorFunction.
-        - If 'solution_vector' is in the context, uses it (Solver Mode).
-        - Otherwise, uses the data on the Function object itself (Direct Eval Mode).
-        """
+        # This method is for when a VectorFunction is evaluated directly, e.g. dot(beta, ...).
+        # Its logic is more complex as it combines multiple fields.
         field_values = []
-        if 'solution_vector' in self.ctx:
-            # --- SOLVER MODE ---
-            solution_vectors = self.ctx['solution_vector']
-            vector_to_use = solution_vectors.get(n.name)
-            if vector_to_use is None:
-                raise KeyError(f"VectorFunction '{n.name}' not found in the provided solution_vectors dictionary.")
-                
-            for field_name in n.field_names:
-                dofs = self.dh.element_maps[field_name][self.ctx['elem_id']]
-                nodal_loc_comp = vector_to_use[dofs]
-                N = self._basis_val(field_name, role='test')
-                field_values.append(N @ nodal_loc_comp)
-        else:
-            # --- DIRECT EVALUATION MODE (for tests) ---
-            # This logic matches your original implementation.
-            for i, field_name in enumerate(n.field_names):
-                # Get the correct DoFs for the CURRENT component
-                dofs = self._elm_dofs(n.components[i], self.ctx['elem_id'])
-                
-                # Slice the component's data from the full nodal array
-                # n.nodal_values has shape (num_total_nodes, num_components)
-                nodal_loc_comp = n.nodal_values[dofs, i]
-
-                # Get basis function values `N`
-                N = self._basis_val(field_name, role='test')
-
-                # Interpolate: N · u_local_component
-                field_values.append(N @ nodal_loc_comp)
-                
+        for component in n.components:
+            # We can just visit each component as a regular Function
+            field_values.append(self.visit(component))
         return np.array(field_values)
 
     # differential ops ---------------------------------------------------
     def visit_Grad(self, n):
-        """ UNIFIED visit_Grad method """
-        # This branch handles known data functions (u_k, u_n, etc.)
+        # This branch handles known data functions.
         if isinstance(n.operand, (Function, VectorFunction)) and not isinstance(n.operand, (TrialFunction, TestFunction)):
             func = n.operand
-            
-            # --- SOLVER MODE ---
-            if 'solution_vector' in self.ctx:
-                solution_vectors = self.ctx['solution_vector']
-                vector_to_use = solution_vectors.get(func.name)
-                if vector_to_use is None:
-                    raise KeyError(f"Function '{func.name}' not found in the provided solution_vectors dictionary.")
-
-                if isinstance(func, Function): # Scalar
-                    dofs = self._elm_dofs(func, self.ctx['elem_id'])
-                    nodal_loc = vector_to_use[dofs]
-                    G = self._basis_grad(func.field_name, role='test')
-                    return G.T @ nodal_loc
-                else: # Vector
-                    grad_rows = []
-                    for field_name in func.field_names:
-                        dofs = self.dh.element_maps[field_name][self.ctx['elem_id']]
-                        nodal_loc_comp = vector_to_use[dofs]
-                        G = self._basis_grad(field_name, role='test')
-                        grad_rows.append(G.T @ nodal_loc_comp)
-                    return np.vstack(grad_rows)
-            
-            # --- DIRECT EVALUATION MODE ---
-            else:
-                # This is your original, working logic from the file you provided.
-                if isinstance(func, VectorFunction):
-                    mesh = self.dh.fe_map[func.field_names[0]]
-                    elem = mesh.elements_list[self.ctx['elem_id']]
-                    node_indices = elem.nodes
-                    nodal_loc = func.nodal_values[node_indices, :]
-                    grad_rows = []
-                    for i, field_name in enumerate(func.field_names):
-                        G = self._basis_grad(field_name, role='test')
-                        nodal_comp_i = nodal_loc[:, i]
-                        grad_rows.append(G.T @ nodal_comp_i)
-                    return np.vstack(grad_rows)
-                else: # Scalar Function
-                    dofs = self._elm_dofs(func, self.ctx['elem_id'])
-                    nodal_loc = func.nodal_values[dofs]
-                    G = self._basis_grad(func.field_name, role='test')
-                    return G.T @ nodal_loc
+            if isinstance(func, Function): # Scalar case
+                elem_dofs = self._elm_dofs(func, self.ctx['elem_id'])
+                nodal_loc = func.get_nodal_values(elem_dofs)
+                G = self._basis_grad(func.field_name, role='test')
+                return G.T @ nodal_loc
+            else: # Vector case
+                grad_rows = []
+                for component in func.components:
+                    elem_dofs = self._elm_dofs(component, self.ctx['elem_id'])
+                    nodal_loc_comp = component.get_nodal_values(elem_dofs)
+                    G = self._basis_grad(component.field_name, role='test')
+                    grad_rows.append(G.T @ nodal_loc_comp)
+                return np.vstack(grad_rows)
 
         # This branch for symbolic functions remains unchanged
         sh = self.shape.visit(n.operand)

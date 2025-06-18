@@ -201,6 +201,39 @@ class DofHandler:
             raise ValueError(f"Field '{field}' not found in DofHandler")
         
         return list(self.dof_map[field].values())
+    
+    def get_field_dofs_on_nodes(self, field: str) -> np.ndarray:
+        """
+        Returns a sorted array of all global DOF indices for a given field.
+        """
+        if field not in self.field_names:
+            raise ValueError(f"Field '{field}' not found in DofHandler")
+        # The values of the dof_map are the global DOF indices for that field
+        return np.array(sorted(self.dof_map[field].values()))
+
+    def get_dof_coords(self, field: str) -> np.ndarray:
+        """
+        Returns an array of (x,y) coordinates for each DOF in a given field,
+        sorted in the same order as get_field_dofs_on_nodes.
+        """
+        if field not in self.field_names:
+            raise ValueError(f"Field '{field}' not found in DofHandler")
+            
+        mesh = self.fe_map[field]
+        dof_map = self.dof_map[field] # Dict of {node_id: global_dof}
+
+        # Create a list of (global_dof, coordinate_tuple) pairs
+        dof_coord_pairs = [
+            (global_dof, tuple(mesh.nodes_x_y_pos[node_id]))
+            for node_id, global_dof in dof_map.items()
+        ]
+        # Sort the list based on the global_dof to ensure order is consistent
+        dof_coord_pairs.sort(key=lambda pair: pair[0])
+        
+        # Unzip the sorted list into just the coordinates
+        coords_list = [pair[1] for pair in dof_coord_pairs]
+        
+        return np.array(coords_list)
 
     # ------------------------------------------------------------------
     #  Debug convenience

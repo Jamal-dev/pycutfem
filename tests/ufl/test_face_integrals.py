@@ -69,6 +69,7 @@ def test_jump_scalar(mesh:Mesh):
 def test_jump_grad_scalar_manual(mesh:Mesh):
     phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
     mesh.build_interface_segments(phi); 
+    dof_handler = DofHandler({'u':mesh})  # Create a DofHandler for the mesh
     u_pos = lambda x,y: x**2       # outside  (φ ≥ 0)
     u_neg = lambda x,y: x**2-1     # inside   (φ < 0)
     grad_u_pos_x = lambda x,y: 2*x       # grad outside
@@ -95,17 +96,17 @@ def test_jump_grad_scalar_two_fields(mesh: Mesh):
     u_pos = lambda x, y: x**2
     u_neg = lambda x, y: x**2 - 1
 
+    dof_handler = DofHandler({'u': mesh})  # Create a DofHandler for the mesh
     # Create the positive-side function
     u_pos_func = Function(field_name='u', name='u_pos',
-                          nodal_values=np.zeros(len(mesh.nodes_list)))
-    for node in mesh.nodes_list:
-        u_pos_func.nodal_values[node.id] = u_pos(node.x, node.y)
+                          dof_handler=dof_handler)
+    u_pos_func.set_values_from_function(u_pos)
+
 
     # Create the negative-side function
     u_neg_func = Function(field_name='u', name='u_neg',
-                          nodal_values=np.zeros(len(mesh.nodes_list)))
-    for node in mesh.nodes_list:
-        u_neg_func.nodal_values[node.id] = u_neg(node.x, node.y)
+                          dof_handler=dof_handler)
+    u_neg_func.set_values_from_function(u_neg)
 
 
     # --- Define the form using the two functions ---
@@ -117,7 +118,7 @@ def test_jump_grad_scalar_two_fields(mesh: Mesh):
     # --- Assembly and Assertion ---
     eq = form == Constant(0.0)
     hook = {type(form.integrand): {'name': 'gj'}}
-    res = assemble_form(eq, DofHandler({'u': mesh}), bcs=[], assembler_hooks=hook)
+    res = assemble_form(eq, dof_handler=dof_handler, bcs=[], assembler_hooks=hook)
     
     print(res)
     # This will now pass, as g_pos - g_neg will correctly evaluate to zero.
@@ -129,8 +130,9 @@ def test_jump_grad_scalar(mesh:Mesh):
     mesh.build_interface_segments(phi); 
     u_pos = lambda x,y: x**2       # outside  (φ ≥ 0)
     u_neg = lambda x,y: x**2-1     # inside   (φ < 0)
+    dof_handler = DofHandler({'u':mesh})  # Create a DofHandler for the mesh
     u_scalar = Function(field_name='u', name='u_scalar',
-                        nodal_values=np.zeros(len(mesh.nodes_list)))
+                        dof_handler=dof_handler)
     u_scalar = add_scalar_field(u_scalar,mesh, phi, u_pos, u_neg)
 
     n   = FacetNormal()                    # unit normal from ctx
@@ -138,7 +140,7 @@ def test_jump_grad_scalar(mesh:Mesh):
     form = dot(grad_jump , n) * dInterface(level_set=phi)
     eq   = form == Constant(0.0)
     hook = {type(form.integrand):{'name':'gj'}}
-    res  = assemble_form(eq, DofHandler({'u':mesh}), bcs=[],assembler_hooks=hook)
+    res  = assemble_form(eq, dof_handler=dof_handler, bcs=[],assembler_hooks=hook)
     print(res)
     assert np.isclose(res['gj'], 0.0, atol=1e-2)
 
@@ -146,14 +148,14 @@ def test_jump_grad_scalar(mesh:Mesh):
 def test_jump_vector_norm(mesh:Mesh):
     fe_map = {'vx': mesh, 'vy':mesh}  # Define a vector field
     dof_handler = DofHandler(fe_map, method='cg')
-    velocity_space_pos = VectorFunction("velocity_pos", ['vx', 'vy'], nodal_values=np.zeros((len(mesh.nodes_list), 2)))
-    velocity_space_neg = VectorFunction("velocity_neg", ['vx', 'vy'], nodal_values=np.zeros((len(mesh.nodes_list), 2)))
+    velocity_space_pos = VectorFunction("velocity_pos", ['vx', 'vy'], dof_handler=dof_handler)
+    velocity_space_neg = VectorFunction("velocity_neg", ['vx', 'vy'], dof_handler=dof_handler)
     phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
     mesh.build_interface_segments(phi); 
     v_pos = lambda x,y: np.array([y,3*y])
     v_neg = lambda x,y: np.array([2*y,4*y])
-    velocity_space_pos=add_vector_field(velocity_space_pos,mesh, phi, v_pos, v_pos)
-    velocity_space_neg=add_vector_field(velocity_space_neg,mesh, phi, v_neg, v_neg)
+    velocity_space_pos.set_values_from_function(v_pos)
+    velocity_space_neg.set_values_from_function(v_neg)
     n = FacetNormal()  # unit normal from ctx
     jump_v = Jump(velocity_space_pos,velocity_space_neg)  # jump in vector
 
@@ -189,14 +191,14 @@ def reference_solution_vector(L=L, R=R, center=center):
 def test_jump_grad_vector(mesh:Mesh):
     fe_map = {'vx': mesh, 'vy':mesh}  # Define a vector field
     dof_handler = DofHandler(fe_map, method='cg')
-    velocity_space_pos = VectorFunction("velocity_pos", ['vx', 'vy'], nodal_values=np.zeros((len(mesh.nodes_list), 2)))
-    velocity_space_neg = VectorFunction("velocity_neg", ['vx', 'vy'], nodal_values=np.zeros((len(mesh.nodes_list), 2)))
+    velocity_space_pos = VectorFunction("velocity_pos", ['vx', 'vy'], dof_handler=dof_handler)
+    velocity_space_neg = VectorFunction("velocity_neg", ['vx', 'vy'], dof_handler=dof_handler)
     phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
     mesh.build_interface_segments(phi); 
     v_pos = lambda x,y: np.array([2 * x * y, 3 * x**2 * y-y**2])
     v_neg = lambda x,y: np.array([3 * y**2 * x + x**3, 10 * x +y])
-    velocity_space_pos=add_vector_field(velocity_space_pos,mesh, phi, v_pos, v_pos)
-    velocity_space_neg=add_vector_field(velocity_space_neg,mesh, phi, v_neg, v_neg)
+    velocity_space_pos.set_values_from_function(v_pos)
+    velocity_space_neg.set_values_from_function(v_neg)
     n = FacetNormal()  # unit normal from ctx
     jump_grad_v = Jump(grad(velocity_space_pos),grad(velocity_space_neg))  # jump in vector
     grad_v_pos_n = dot(grad(velocity_space_pos),n)  
@@ -205,7 +207,7 @@ def test_jump_grad_vector(mesh:Mesh):
     # form = dot(jump_grad_v,n) * dInterface(level_set=phi)
     form = Jump(grad_v_pos_n,grad_v_neg_n) * dInterface(level_set=phi)
     eq   = form == Constant(0.0)
-    res  = assemble_form(eq, dof_handler, bcs=[],
+    res  = assemble_form(eq, dof_handler=dof_handler, bcs=[],
                          assembler_hooks={type(form.integrand):{'name':'jv'}})
     exact = reference_solution_vector()
     print(f"Exact vector jump: {exact}")

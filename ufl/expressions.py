@@ -1,4 +1,6 @@
 import numpy as np
+from typing import Callable
+
 
 class Expression:
     """Base class for any object in a symbolic FEM expression."""
@@ -57,39 +59,74 @@ class Expression:
         return None
 
 class Function(Expression):
-    def __init__(self, field_name, name="", nodal_values=None, parent_vector=None, component_index=None):
-        self.field_name = field_name
+    """
+    Represents a single-field function. Can be a standalone data-carrier
+    or a component that provides a view into a parent VectorFunction.
+    """
+    def __init__(self, name: str, field_name: str, dof_handler: 'DofHandler' = None,
+                 parent_vector: 'VectorFunction' = None, component_index: int = None):
         self.name = name
-        
-        # --- NEW ---
-        # If this is a standalone function, it stores its own data.
-        self._nodal_values = nodal_values 
-        # If it's a component of a vector, it holds a reference to the parent.
-        self.parent_vector = parent_vector
-        self.component_index = component_index
-        self.dim = 0
+        self.field_name = field_name
+        self._dof_handler = dof_handler
+        self._parent_vector = parent_vector
+        self._component_index = component_index
+
+        # A Function ONLY manages data if it is a STANDALONE function.
+        if self._parent_vector is None and self._dof_handler is not None:
+            # This is a data-carrying standalone function (e.g., 'beta' in a test)
+            self._my_global_dofs = self._dof_handler.get_field_slice(self.field_name)
+            self._global_dof_to_local_idx = {dof: i for i, dof in enumerate(self._my_global_dofs)}
+            self._nodal_values = np.zeros(len(self._my_global_dofs))
+        else:
+            # This is a symbolic function (Trial/Test) OR a component of a VectorFunction.
+            # It does not need to store its own data arrays.
+            self._my_global_dofs = []
+            self._global_dof_to_local_idx = {}
+            self._nodal_values = None
 
     @property
     def nodal_values(self):
         """
-        If this is a component of a vector, return the corresponding slice 
-        from the parent's data. Otherwise, return its own data.
+        Smart property: Delegates to the parent vector if this is a component,
+        otherwise returns its own data.
         """
-        if self.parent_vector is not None:
-            return self.parent_vector.nodal_values[:, self.component_index]
+        if self._parent_vector is not None:
+            # Get all global dofs for this component's field
+            dofs = self._parent_vector._get_dofs_for_component(self._component_index)
+            return self._parent_vector.get_nodal_values(dofs)
         return self._nodal_values
 
     @nodal_values.setter
-    def nodal_values(self, value):
-        """
-        If this is a component of a vector, modify the parent's data
-        IN-PLACE. Otherwise, set its own data.
-        """
-        if self.parent_vector is not None:
-            # This modifies the data in the parent array directly.
-            self.parent_vector.nodal_values[:, self.component_index] = value
+    def nodal_values(self, values):
+        if self._parent_vector is not None:
+            dofs = self._parent_vector._get_dofs_for_component(self._component_index)
+            self._parent_vector.set_nodal_values(dofs, values)
         else:
-            self._nodal_values = value
+            self._nodal_values[:] = values
+
+    def set_values_from_function(self, func: Callable[[float, float], float]):
+        """Populates nodal values by evaluating a function at each DoF's coordinate."""
+        global_dofs = self._dof_handler.get_field_dofs_on_nodes(self.field_name)
+        coords = self._dof_handler.get_dof_coords(self.field_name)
+        values = np.apply_along_axis(lambda c: func(c[0], c[1]), 1, coords).ravel()
+        self.set_nodal_values(global_dofs, values)
+
+    def get_nodal_values(self, global_dofs: np.ndarray) -> np.ndarray:
+        """Gets values for a specific list of global DOFs from this function's data."""
+        if self._parent_vector is not None:
+            return self._parent_vector.get_nodal_values(global_dofs)
+        
+        local_indices = np.array([self._global_dof_to_local_idx[gd] for gd in global_dofs])
+        return self._nodal_values[local_indices]
+
+    def set_nodal_values(self, global_dofs: np.ndarray, values: np.ndarray):
+        """Sets values for a specific list of global DOFs in this function's data."""
+        if self._parent_vector is not None:
+            self._parent_vector.set_nodal_values(global_dofs, values)
+            return
+            
+        local_indices = np.array([self._global_dof_to_local_idx[gd] for gd in global_dofs])
+        self._nodal_values[local_indices] = values
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name='{self.name}', field='{self.field_name}')"
@@ -97,33 +134,38 @@ class Function(Expression):
 # In your ufl/expressions.py file
 
 class VectorFunction(Expression):
-    """
-    Represents a known, data-carrying vector-valued finite element function.
-    """
-    def __init__(self, name: str, field_names: list[str], nodal_values=None):
-        """
-        Args:
-            name (str): A name for the vector function space, e.g., "velocity".
-            field_names (list[str]): A list of the component field names, e.g., ['ux', 'uy'].
-            nodal_values (np.ndarray, optional): The array of nodal data, with a
-                shape like (n_total_dofs, n_components).
-        """
+    def __init__(self, name: str, field_names: list[str], dof_handler: 'DofHandler'=None):
         self.name = name
         self.field_names = field_names
-        self.nodal_values = nodal_values
-        self.dim = 1
+        self._dof_handler = dof_handler
         
-        # Create a list of scalar Function objects for polymorphism.
-        # These components are primarily for structural compatibility and do not
-        # hold data themselves; the data is in self.nodal_values.
+        self._my_global_dofs = np.concatenate([dof_handler.get_field_slice(fn) for fn in field_names])
+        self._global_dof_to_local_idx = {dof: i for i, dof in enumerate(self._my_global_dofs)}
+        
+        self.nodal_values = np.zeros(len(self._my_global_dofs))
         self.components = [
-            Function(
-                fn, 
-                name=f"{self.name}_{fn}", 
-                parent_vector=self,              # Pass reference to parent
-                component_index=i                # Pass the component index
-            ) for i, fn in enumerate(self.field_names)
+            Function(f"{name}_{fn}", fn, dof_handler, parent_vector=self, component_index=i)
+            for i, fn in enumerate(self.field_names)
         ]
+
+    def _get_dofs_for_component(self, component_index: int) -> np.ndarray:
+        field_name = self.field_names[component_index]
+        return self._dof_handler.get_field_dofs_on_nodes(field_name)
+
+    def set_values_from_function(self, func: Callable[[float, float], np.ndarray]):
+        for i, field_name in enumerate(self.field_names):
+            global_dofs = self._dof_handler.get_field_dofs_on_nodes(field_name)
+            coords = self._dof_handler.get_dof_coords(field_name)
+            values = np.apply_along_axis(lambda c: func(c[0], c[1])[i], 1, coords).ravel()
+            self.set_nodal_values(global_dofs, values)
+
+    def get_nodal_values(self, global_dofs: np.ndarray) -> np.ndarray:
+        local_indices = np.array([self._global_dof_to_local_idx[gd] for gd in global_dofs])
+        return self.nodal_values[local_indices]
+
+    def set_nodal_values(self, global_dofs: np.ndarray, values: np.ndarray):
+        local_indices = np.array([self._global_dof_to_local_idx[gd] for gd in global_dofs])
+        self.nodal_values[local_indices] = values
 
     def __repr__(self):
         return f"VectorFunction(name='{self.name}', fields={self.field_names})"
@@ -141,8 +183,16 @@ class NodalFunction(Expression):
         self.field_name = field_name    # key in mesh.node_data
     def __repr__(self): return f"NodalFunction({self.field_name!r})"
 
-class TrialFunction(Function): pass
-class TestFunction(Function): pass
+class TrialFunction(Function):
+    def __init__(self, field_name: str):
+        # A TrialFunction is purely symbolic. It has no dof_handler or data.
+        # Its name and field_name are the same.
+        super().__init__(name=field_name, field_name=field_name)
+
+class TestFunction(Function):
+    def __init__(self, field_name: str):
+        # A TestFunction is purely symbolic.
+        super().__init__(name=field_name, field_name=field_name)
 
 class Constant(Expression):
     def __init__(self, value, dim=0): self.value = value; self.dim = dim
