@@ -70,6 +70,7 @@ class Function(Expression):
         self._dof_handler = dof_handler
         self._parent_vector = parent_vector
         self._component_index = component_index
+        self.dim = 0 # always assuming scalar functions for now
 
         # A Function ONLY manages data if it is a STANDALONE function.
         if self._parent_vector is None and self._dof_handler is not None:
@@ -130,6 +131,9 @@ class Function(Expression):
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name='{self.name}', field='{self.field_name}')"
+    def is_vector_component_basis(self):
+        """Componenet of a Vector is also scalar"""
+        return False
 
 # In your ufl/expressions.py file
 
@@ -138,6 +142,7 @@ class VectorFunction(Expression):
         self.name = name
         self.field_names = field_names
         self._dof_handler = dof_handler
+        self.dim = 1 # always a vector function, this dim is a tensor dimension not the spatial dimension
         
         self._my_global_dofs = np.concatenate([dof_handler.get_field_slice(fn) for fn in field_names])
         self._global_dof_to_local_idx = {dof: i for i, dof in enumerate(self._my_global_dofs)}
@@ -177,6 +182,9 @@ class VectorFunction(Expression):
     def __iter__(self):
         """Allows iterating over components."""
         return iter(self.components)
+    def is_vector_component_basis(self):
+        """Returns True if this VectorFunction is a component of a vector function."""
+        return True
 
 class NodalFunction(Expression):
     def __init__(self, field_name: str):
@@ -188,11 +196,19 @@ class TrialFunction(Function):
         # A TrialFunction is purely symbolic. It has no dof_handler or data.
         # Its name and field_name are the same.
         super().__init__(name=field_name, field_name=field_name)
+        self.dim = 0
+    def is_vector_component_basis(self):
+        """Returns True if this TrialFunction is a component of a vector function."""
+        return False
 
 class TestFunction(Function):
     def __init__(self, field_name: str):
         # A TestFunction is purely symbolic.
         super().__init__(name=field_name, field_name=field_name)
+        self.dim = 0  # Assuming scalar test functions for now
+    def is_vector_component_basis(self):
+        """Returns True if this TestFunction is a component of a vector function."""
+        return False
 
 class Constant(Expression):
     def __init__(self, value, dim=0): self.value = value; self.dim = dim
@@ -203,19 +219,27 @@ class VectorTrialFunction(Expression):
     def __init__(self, space): # space: FunctionSpace
         self.space = space
         self.components = [TrialFunction(fn) for fn in space.field_names]
+        self.dim = 1
     def __repr__(self):
         return f"VectorTrialFunction(space='{self.space.name}')"
     def __getitem__(self, i): return self.components[i]
     def __iter__(self): return iter(self.components)
+    def is_vector_component_basis(self):
+        """Returns True if this VectorTrialFunction is a component of a vector function."""
+        return True
 
 class VectorTestFunction(Expression):
     def __init__(self, space): # space: FunctionSpace
         self.space = space
         self.components = [TestFunction(fn) for fn in space.field_names]
+        self.dim = 1 
     def __repr__(self):
         return f"VectorTestFunction(space='{self.space.name}')"
     def __getitem__(self, i): return self.components[i]
     def __iter__(self): return iter(self.components)
+    def is_vector_component_basis(self):
+        """Returns True if this VectorTestFunction is a component of a vector function."""
+        return True
 
 class ElementWiseConstant(Expression):
     def __init__(self, values: np.ndarray): self.values = values

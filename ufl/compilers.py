@@ -388,30 +388,44 @@ class FormCompiler:
 
     # differential ops ---------------------------------------------------
     def visit_Grad(self, n):
-        # This branch handles known data functions.
+        """ FINAL, ROBUST visit_Grad method """
+        # This branch handles known data functions (u_k, u_n, etc.)
         if isinstance(n.operand, (Function, VectorFunction)) and not isinstance(n.operand, (TrialFunction, TestFunction)):
+            # This unified logic from our previous work is correct.
             func = n.operand
+            nodal_loc = self._get_data_vector_and_dofs(func) # Use the helper
+            
             if isinstance(func, Function): # Scalar case
-                elem_dofs = self._elm_dofs(func, self.ctx['elem_id'])
-                nodal_loc = func.get_nodal_values(elem_dofs)
                 G = self._basis_grad(func.field_name, role='test')
                 return G.T @ nodal_loc
             else: # Vector case
                 grad_rows = []
-                for component in func.components:
+                for i, component in enumerate(func.components):
+                    # We need to get the DoFs for each component to slice nodal_loc
                     elem_dofs = self._elm_dofs(component, self.ctx['elem_id'])
-                    nodal_loc_comp = component.get_nodal_values(elem_dofs)
+                    # Map global dofs from the element to local dofs in the function's data
+                    local_indices = [func._global_dof_to_local_idx[gd] for gd in elem_dofs]
+                    nodal_loc_comp = func.nodal_values[local_indices]
+                    
                     G = self._basis_grad(component.field_name, role='test')
                     grad_rows.append(G.T @ nodal_loc_comp)
                 return np.vstack(grad_rows)
 
-        # This branch for symbolic functions remains unchanged
+        # --- This branch for symbolic functions is where the KEY CHANGE is ---
         sh = self.shape.visit(n.operand)
-        if sh.dim == 0:
+        
+        if sh.dim == 0:  # grad(scalar)
             return self._basis_grad(n.operand.field_name, sh.kind)
-        if sh.dim == 1:
-            return [self._basis_grad(f, sh.kind) for f in n.operand.space.field_names]
+            
+        if sh.dim == 1:  # grad(vector)
+            # Instead of returning a list, stack the arrays into a 3D numpy array
+            # Shape will be (n_components, n_basis_funcs, n_spatial_dims) e.g. (2, 9, 2)
+            return np.stack([self._basis_grad(f, sh.kind) 
+                            for f in n.operand.space.field_names])
+            
         raise NotImplementedError('grad of tensor not needed')
+
+
 
     def visit_DivOperation(self,n):
         grads = self.visit(Grad(n.operand))  # list of rows
@@ -420,24 +434,7 @@ class FormCompiler:
     def visit_Analytic(self, node): return node.eval(self.ctx['x_phys'])
 
     # algebra -----------------------------------------------------------
-    def visit_Prod(self,n):
-        a = self.visit(n.a); b=self.visit(n.b)
-        if self.ctx['is_rhs']:
-            return a*b
-        sa,sb = self.shape.visit(n.a), self.shape.visit(n.b)
-        if sa.kind=='none' or sb.kind=='none':
-            return a*b
-        # orient outer‑product row=test, col=trial
-        if sa.kind=='test' and sb.kind=='trial':
-            return np.outer(a,b)
-        if sb.kind=='test' and sa.kind=='trial':
-            return np.outer(b,a)
-        if sa.kind == 'none' and sb.kind == 'none':
-            return a * b
-        # Handle convection: e.g., dot(du, grad(u_k)) * v
-        if sa.kind == 'none' and sb.kind == 'test':  # dot(du, grad(u_k)) * v
-            return np.outer(b, a)  # v as rows, dot result as cols (needs du basis)
-        raise TypeError(f"Unsupported Prod: sa={sa.kind}, sb={sb.kind}")
+    
     
     def visit_Div(self, n):
         """Handles scalar, vector, or tensor division by a scalar."""
@@ -447,205 +444,243 @@ class FormCompiler:
         # NumPy correctly handles element-wise division of an array by a scalar.
         return numerator / denominator
 
-    def visit_Inner(self,n):
-        a=self.visit(n.a); b=self.visit(n.b)
-        sa,sb = self.shape.visit(n.a), self.shape.visit(n.b)
-        if sa.dim==2 and sb.dim==2:  # grad(u):grad(v)
-            rows = np.cumsum([0]+[c.shape[0] for c in a])
-            cols = np.cumsum([0]+[c.shape[0] for c in b])
-            mat = np.zeros((rows[-1], cols[-1]))
-            for i,(ra,rb) in enumerate(zip(a,b)):
-                mat[rows[i]:rows[i+1], cols[i]:cols[i+1]] = ra @ rb.T
-            return mat
-        # ADDED: This new path correctly handles grad(scalar).grad(scalar) for Poisson.
-        if sa.dim == 1 and sb.dim == 1:
-            # `a` and `b` are matrices of basis gradients, shape (n_basis, n_dim).
-            # We compute G_v @ G_u.T to get the (n_basis, n_basis) matrix.
-            # `b` is from the test function (rows), `a` is from the trial function (cols).
-            return b @ a.T
-        # scalar inner
-        if sa.kind=='test':
-            return np.outer(a,b)
-        return np.outer(b,a)
+    def visit_Inner(self, n):
+        """ FINAL, ROBUST visit_Inner method """
+        a_node, b_node = n.a, n.b
+        
+        if self.ctx['is_rhs']:
+            # --- RHS: Assemble a vector from inner(func, test) ---
+            grad_func_val = self.visit(a_node)   # Evaluated tensor, shape (2,2)
+            grad_test_basis = self.visit(b_node) # STACKED basis grads, shape (2, 9, 2)
+
+            n_comp = grad_test_basis.shape[0]
+            n_basis_scalar = grad_test_basis.shape[1]
+            out = np.zeros(n_basis_scalar * n_comp)
+            
+            for i in range(n_comp):
+                start, end = i * n_basis_scalar, (i + 1) * n_basis_scalar
+                # grad_test_basis[i] is (9,2). grad_func_val[i] is (2,). Result is (9,).
+                out[start:end] = grad_test_basis[i] @ grad_func_val[i]
+            return out
+            
+        else:
+            # --- LHS: Assemble a matrix from inner(trial, test) ---
+            G_a = self.visit(a_node)
+            G_b = self.visit(b_node)
+            sa = self.shape.visit(a_node)
+            
+            # Reorder to ensure G_test is from the test function (row)
+            G_test = G_b if sa.kind == 'trial' else G_a
+            G_trial = G_a if sa.kind == 'trial' else G_b
+            
+            if sa.dim == 2: # inner(grad(vector), grad(vector))
+                n_comp = G_test.shape[0]
+                n_basis_scalar = G_test.shape[1]
+                local_matrix = np.zeros((n_basis_scalar*n_comp, n_basis_scalar*n_comp))
+                for i in range(n_comp):
+                    block = G_test[i] @ G_trial[i].T # (9,2) @ (2,9) -> (9,9)
+                    start, end = i * n_basis_scalar, (i + 1) * n_basis_scalar
+                    local_matrix[start:end, start:end] = block
+                return local_matrix
+            else: # inner(grad(scalar), grad(scalar))
+                return G_test @ G_trial.T
+                
+    raise NotImplementedError("Inner product form not supported for these shapes/kinds.")
 
 
     # dot product ---------------------------------------------------
     #----------------------------------------------------------------------------------------------------------
+    def visit_Prod(self, n):
+        """
+        Calculates the product of two expressions.
+        For bilinear forms (LHS), if the product involves a 'trial' kind expression
+        and a 'test' kind expression, it performs an outer product to form a local
+        element matrix. Otherwise, it's a simple scalar/vector multiplication.
+        """
+        a_val = self.visit(n.a)
+        b_val = self.visit(n.b)
+        
+        if self.ctx['is_rhs']:
+            # RHS: Simple scalar/vector multiplication for load vector contributions
+            return a_val * b_val
+        
+        # LHS: This is where we form the stiffness/mass matrix contributions
+        sa, sb = self.shape.visit(n.a), self.shape.visit(n.b)
+
+        # Identify which operand is 'test' and which is 'trial' based on shape kind.
+        # This handles:
+        # - (TestFunction * TrialFunction) directly
+        # - (ComplexTrialExpression * TestFunction) or (TestFunction * ComplexTrialExpression)
+        #   where ComplexTrialExpression is, for example, dot(beta, grad(u[0])) which has shape.kind='trial'
+        
+        test_expr_val = None
+        trial_expr_val = None
+
+        if sa.kind == 'test':
+            test_expr_val = a_val
+        elif sb.kind == 'test':
+            test_expr_val = b_val
+        
+        if sa.kind == 'trial':
+            trial_expr_val = a_val
+        elif sb.kind == 'trial':
+            trial_expr_val = b_val
+        
+        # If we have both a 'test' component and a 'trial' component, form an outer product.
+        if test_expr_val is not None and trial_expr_val is not None:
+            # Ensure both are 1D arrays suitable for np.outer.
+            # This is crucial for results like dot(beta, grad(u[0])) which is 1D.
+            if not isinstance(test_expr_val, np.ndarray) or test_expr_val.ndim != 1 or \
+               not isinstance(trial_expr_val, np.ndarray) or trial_expr_val.ndim != 1:
+                raise ValueError(
+                    f"Prod expects 1D arrays for outer product between 'test' ({test_expr_val.shape}) "
+                    f"and 'trial' ({trial_expr_val.shape}) kinds. "
+                    f"Nodes: {type(n.a).__name__} ({sa.kind}), {type(n.b).__name__} ({sb.kind})"
+                )
+            return np.outer(test_expr_val, trial_expr_val)
+        
+        # If not forming an outer product (e.g., Constant * Constant, Function * Function, etc.)
+        # or if only one of them is a test/trial function, perform direct multiplication.
+        # This covers Constant * TestFunction (for RHS when `is_rhs` is false, but typically RHS)
+        # and other cases where we don't form a matrix block.
+        # This is essentially the "none" kind fallback.
+        return a_val * b_val
+   
 
     def visit_Dot(self, n):
-        """
-        Compute the dot product between two operands in a finite element context.
-        Handles Stokes load vectors, advection terms, numerical arrays, and other FEM cases.
-        """
-        # Visit operands unless they are symbolic expressions to be handled directly
-        a = self.visit(n.a) if not isinstance(n.a, (Constant, Grad, Jump, FacetNormal, TrialFunction, VectorTrialFunction, VectorFunction)) else n.a
-        b = self.visit(n.b) if not isinstance(n.b, (Constant, Grad, Jump, FacetNormal, TestFunction, VectorTestFunction, VectorFunction)) else n.b
+        a_node, b_node = n.a, n.b
 
-        # Case 1: Numerical arrays (e.g., after evaluation)
-        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
-            if a.ndim == 1 and b.ndim == 1:
-                return np.dot(a, b)  # Vector dot product
-            elif a.ndim == 2 and b.ndim == 1:
-                return a @ b  # Matrix-vector product
-            elif a.ndim == 0 or b.ndim == 0:
-                return a * b  # Scalar multiplication
+        # Determine if nodes are vector basis functions using YOUR methods
+        is_a_vector_trial = isinstance(a_node, VectorTrialFunction)
+        is_a_vector_test = isinstance(a_node, VectorTestFunction)
+        is_b_vector_trial = isinstance(b_node, VectorTrialFunction)
+        is_b_vector_test = isinstance(b_node, VectorTestFunction)
+
+        # Check if the overall dot product is between two *vector* basis functions
+        # e.g., dot(VectorTrialFunction, VectorTestFunction) for mass matrix
+        if (is_a_vector_trial and is_b_vector_test) or \
+           (is_a_vector_test and is_b_vector_trial):
+            
+            # Identify which is trial and which is test for consistent access
+            trial_vec_node = a_node if is_a_vector_trial else b_node
+            test_vec_node = b_node if is_b_vector_test else a_node
+
+            # Number of components (e.g., 2 for 'ux', 'uy')
+            n_components = len(trial_vec_node.space.field_names)
+
+            # Get the full, concatenated basis values for the vector functions.
+            # `self.visit(test_vec_node)` returns a hstacked array of all component basis functions.
+            full_test_basis_vals = self.visit(test_vec_node)
+            full_trial_basis_vals = self.visit(trial_vec_node)
+            
+            if full_test_basis_vals.size == 0 or full_trial_basis_vals.size == 0:
+                # This can happen if an element has no DoFs for a component,
+                # or if the basis evaluation returns empty.
+                return np.array([]) # Or np.zeros((0,0)) for consistency
+
+            # Determine the number of basis functions per scalar component.
+            # Assumes all scalar components in the vector space have the same number of basis functions.
+            n_basis_scalar = len(full_test_basis_vals) // n_components
+            
+            # Safety check for consistent dimensions
+            if len(full_trial_basis_vals) != n_components * n_basis_scalar:
+                raise ValueError("Mismatched dimensions for vector basis functions in dot product evaluation.")
+
+            total_dofs_vec = n_components * n_basis_scalar
+            local_matrix = np.zeros((total_dofs_vec, total_dofs_vec), dtype=float)
+
+            # Iterate over each component pair (ux with vx, uy with vy, etc.)
+            for i in range(n_components):
+                # Extract the basis values for the current scalar component
+                test_comp_basis = full_test_basis_vals[i * n_basis_scalar : (i + 1) * n_basis_scalar]
+                trial_comp_basis = full_trial_basis_vals[i * n_basis_scalar : (i + 1) * n_basis_scalar]
+
+                # Here, we perform the outer product for the scalar components.
+                # This forms the individual block of the mass matrix.
+                component_block = np.outer(test_comp_basis, trial_comp_basis)
+
+                # Place this block into the correct diagonal position
+                start_idx = i * n_basis_scalar
+                local_matrix[start_idx : start_idx + n_basis_scalar,
+                             start_idx : start_idx + n_basis_scalar] = component_block
+            
+            return local_matrix
+
+        # --- Remaining cases from your original visit_Dot logic ---
+
+        # Case: Dot product between a scalar Trial/Test function
+        # (e.g., dot(scalar_trial, scalar_test) or dot(scalar_test, scalar_trial))
+        # This occurs if the expression is (u*v) for scalar u,v, then it directly falls into Prod.
+        # This will now correctly be handled by Prod if the nodes are scalar Trial/TestFunction instances.
+        if (isinstance(a_node, TrialFunction) and isinstance(b_node, TestFunction)) or \
+           (isinstance(a_node, TestFunction) and isinstance(b_node, TrialFunction)):
+            return self.visit_Prod(Prod(a_node, b_node))
+
+        # Case: Dot product involving a Function/Constant and a TestFunction (for RHS)
+        # This part of your original logic seems largely correct for handling load vectors.
+        # It's essentially f_i * v_i for each component i, then stacked.
+        is_func_a = isinstance(a_node, (Function, VectorFunction, Constant))
+        is_func_b = isinstance(b_node, (Function, VectorFunction, Constant))
+        is_test_node_a = isinstance(a_node, (TestFunction, VectorTestFunction))
+        is_test_node_b = isinstance(b_node, (TestFunction, VectorTestFunction))
+
+        if (is_func_a and is_test_node_b) or (is_func_b and is_test_node_a):
+            func_node = a_node if is_func_a else b_node
+            test_func_node = b_node if is_test_node_b else a_node
+            
+            func_val = self.visit(func_node)
+            test_basis = self.visit(test_func_node)
+
+            if isinstance(test_func_node, VectorTestFunction):
+                # If the func_val is a scalar constant and being dotted with a VectorTestFunction,
+                # we need to replicate the scalar value for each component.
+                if isinstance(func_node, Constant) and func_node.dim == 0:
+                    func_val = np.full(len(test_func_node.space.field_names), func_val)
+                elif not isinstance(func_val, np.ndarray) or func_val.ndim != 1 or \
+                     len(func_val) != len(test_func_node.space.field_names):
+                    raise TypeError(f"Mismatch: VectorTestFunction needs vector 'func_val', got {type(func_val)} with shape {getattr(func_val, 'shape', 'N/A')}")
+
+                n_comp = len(test_func_node.space.field_names)
+                if len(test_basis) == 0: return np.array([])
+                n_basis_scalar = len(test_basis) // n_comp
+                out = np.zeros_like(test_basis, dtype=float)
+                for i in range(n_comp):
+                    start, end = i * n_basis_scalar, (i + 1) * n_basis_scalar
+                    out[start:end] = func_val[i] * test_basis[start:end]
+                return out
             else:
-                raise TypeError(f"Unsupported shapes in dot: {a.shape}, {b.shape}")
-
-        # Case 2: Stokes load vector - dot(Constant, VectorTestFunction) or vice versa
-        if (isinstance(n.a, Constant) and isinstance(n.b, VectorTestFunction)) or \
-        (isinstance(n.b, Constant) and isinstance(n.a, VectorTestFunction)):
-            const = n.a if isinstance(n.a, Constant) else n.b
-            test = n.b if isinstance(n.b, VectorTestFunction) else n.a
-            const_val = const.value  # Constant vector, e.g., [fx, fy]
-            test_val = self.visit(test)  # DOFs of vector test function, shape (n_dofs_total,)
-
-            ncomp = len(test.space.field_names)  # Number of components (e.g., 2 for 2D)
-            if len(const_val) != ncomp:
-                raise ValueError("Constant vector dimension must match test function components")
-            if len(test_val) % ncomp != 0:
-                raise ValueError("Test function DOFs must be divisible by number of components")
-            
-            dofs_per_comp = len(test_val) // ncomp
-            out = np.zeros_like(test_val)
-            for i in range(ncomp):
-                start = i * dofs_per_comp
-                end = (i + 1) * dofs_per_comp
-                out[start:end] = const_val[i] * test_val[start:end]  # Scale each component
-            return out
-
-        # Case 3: Advection term - dot(Constant, Grad(TrialFunction))
-        if isinstance(n.a, Constant) and isinstance(n.b, Grad) and isinstance(n.b.operand, TrialFunction):
-            const_val = n.a.value  # Constant vector, e.g., beta = [1, 1]
-            grad_trial = self.visit(n.b)  # Gradient matrix, shape (n_basis, n_dim)
-            if not isinstance(grad_trial, np.ndarray):
-                return Dot(n.a, n.b)  # Defer if symbolic
-            if len(const_val) != grad_trial.shape[1]:
-                raise ValueError("Dimension mismatch in dot(Constant, Grad)")
-            return np.dot(grad_trial, const_val)  # Resulting shape: (n_basis,)
-
-        # Case 4: Boundary/flux term - dot(Grad(...), FacetNormal())
-        if isinstance(n.a, Grad) and isinstance(n.b, FacetNormal):
-            grad_val = self.visit(n.a)  # Gradient, e.g., (n_basis, n_dim)
-            normal = self.visit(n.b)  # Normal vector, e.g., (n_dim,)
-            if isinstance(grad_val, np.ndarray) and isinstance(normal, np.ndarray):
-                if grad_val.ndim == 2:
-                    return np.dot(grad_val, normal)  # (n_basis,)
-                elif grad_val.ndim == 1:
-                    return np.dot(grad_val, normal)  # Scalar
-            return Dot(n.a, n.b)  # Defer symbolic case
-
-        # Case 5: DG term - dot(Jump(...), FacetNormal())
-        if isinstance(n.a, Jump) and isinstance(n.b, FacetNormal):
-            jump_val = self.visit(n.a)  # Jump across facets
-            normal = self.visit(n.b)  # Normal vector
-            if isinstance(jump_val, np.ndarray) and isinstance(normal, np.ndarray):
-                return np.dot(jump_val, normal)
-            return Dot(n.a, n.b)  # Defer symbolic case
-
-        # Case 6: Scalar test function - dot(Constant, TestFunction) or vice versa
-        if (isinstance(n.a, Constant) and isinstance(n.b, TestFunction)) or \
-        (isinstance(n.b, Constant) and isinstance(n.a, TestFunction)):
-            const = n.a if isinstance(n.a, Constant) else n.b
-            test = n.b if isinstance(n.b, TestFunction) else n.a
-            const_val = const.value
-            test_val = self.visit(test)
-            if not isinstance(const_val, (int, float)):
-                raise ValueError("Constant must be scalar for scalar TestFunction")
-            return const_val * test_val
+                # Scalar function dotted with scalar test function
+                return func_val * test_basis
         
-        # Handles terms like dot(u_k, grad(du_i)) from the advection term.
-        if isinstance(n.a, VectorFunction) and isinstance(n.b, Grad) and isinstance(n.b.operand, TrialFunction):
-            vec_func_val = self.visit(n.a)    # Evaluated vector, e.g., u_k at a point -> shape(2,)
-            grad_trial = self.visit(n.b)      # Basis gradients for du_i -> shape(n_basis, 2)
+        # Case: Dot product involving Grad (e.g., Constant . Grad(TrialFunction))
+        if isinstance(a_node, (VectorFunction, Constant)) and isinstance(b_node, Grad):
+            vec_val = self.visit(a_node)
+            grad_op = self.visit(b_node) 
             
-            # This is the operation u_k ⋅ ∇(du_i), which results in a vector of
-            # coefficients for each basis function in the trial space.
-            return grad_trial @ vec_func_val  # (n_basis, 2) @ (2,) -> (n_basis,)
-
-        # Case 7: Trial and test functions (bilinear forms)
-        a_is_trial = isinstance(n.a, (TrialFunction, VectorTrialFunction))
-        b_is_test = isinstance(n.b, (TestFunction, VectorTestFunction))
-        if a_is_trial and b_is_test:
-            if isinstance(n.a, VectorTrialFunction) and isinstance(n.b, VectorTestFunction):
-                # Vector case: sum over components
-                return sum(self.visit_Prod(Prod(n.a[i], n.b[i])) for i in range(len(n.a.space.field_names)))
-            return self.visit_Prod(Prod(n.a, n.b))  # Scalar case
-
-        # If no case matches, raise an error
-        print(n.a.dim, n.b.shape)
-        raise NotImplementedError(f"Dot between {type(n.a)} and {type(n.b)} not supported")
-
-    # def visit_Dot(self, n): # this logic is passihng the Stokes test
-    #     # --- Dispatcher: Correctly identify the expression pattern ---
-
-    #     # Use `isinstance` to check the UFL types directly
-    #     is_a_const = isinstance(n.a, Constant)
-    #     is_b_const = isinstance(n.b, Constant)
-    #     is_a_test = isinstance(n.a, (TestFunction, VectorTestFunction))
-    #     is_b_test = isinstance(n.b, (TestFunction, VectorTestFunction))
-
-    #     # If the pattern is `dot(Constant, TestFunction)`, use the special Stokes logic
-    #     if (is_a_const and is_b_test) or (is_b_const and is_a_test):
-    #         const_eval, vec_eval = (self.visit(n.a), self.visit(n.b)) if is_a_const else (self.visit(n.b), self.visit(n.a))
-
-    #         ncomp = len(const_eval)
-    #         if len(vec_eval) == 0:
-    #             return vec_eval  # Return empty if no DoFs on element
-
-    #         # Ensure component division is valid
-    #         if len(vec_eval) % ncomp != 0:
-    #             raise ValueError(
-    #                 f"In dot(Constant, TestFunction), cannot divide basis vector of "
-    #                 f"length {len(vec_eval)} into {ncomp} components."
-    #             )
+            # This logic remains as you had it, assuming it's for cases like:
+            # (vector constant) . (grad(scalar test function))
+            # Where grad_op is (n_basis, n_dim) and vec_val is (n_dim,)
+            if grad_op.ndim == 2 and vec_val.ndim == 1 and grad_op.shape[1] == vec_val.shape[0]:
+                return grad_op @ vec_val
+            # More complex cases for grad(VectorFunction) would typically be handled
+            # within Inner or other specialized visitors if needed for coupling.
             
-    #         dofs_per = len(vec_eval) // ncomp
-    #         out = np.zeros_like(vec_eval)
-    #         vec_reshaped = vec_eval.reshape((ncomp, dofs_per))
-    #         for i in range(ncomp):
-    #             out[i * dofs_per:(i + 1) * dofs_per] = const_eval[i] * vec_reshaped[i]
-    #         return out
-
-    #     # --- General Logic Path ---
-    #     # If the Stokes pattern doesn't match, proceed with general-purpose logic.
-    #     a = self.visit(n.a)
-    #     b = self.visit(n.b)
-
-    #     a = np.asarray(a)
-    #     b = np.asarray(b)
-
-    #     # Case for dot(vector, vector) -> scalar (fixes the jump test)
-    #     if a.ndim == 1 and b.ndim == 1:
-    #         return np.dot(a, b)
+            raise NotImplementedError(f"Dot with Grad: unsupported combination {type(a_node).__name__} (val_shape={getattr(vec_val, 'shape', 'N/A')}) and {type(b_node).__name__} (op_shape={getattr(grad_op, 'shape', 'N/A')}).")
             
-    #     # Case for scalar * vector/matrix
-    #     if a.ndim == 0: return a * b
-    #     if b.ndim == 0: return b * a
-
-    #     # ADDED: Case for dot(tensor, vector) -> vector (Matrix-vector product)
-    #     if a.ndim == 2 and b.ndim == 1:
-    #         return a @ b
+        # Case: General Dot product between NumPy arrays (e.g., dot(vector_func_val, vector_func_val))
+        a_val, b_val = self.visit(a_node), self.visit(b_node)
+        if isinstance(a_val, np.ndarray) and isinstance(b_val, np.ndarray):
+            if a_val.ndim == 1 and b_val.ndim == 1 and a_val.shape == b_val.shape:
+                return np.dot(a_val, b_val)
+            if a_val.ndim == 2 and b_val.ndim == 1 and a_val.shape[1] == b_val.shape[0]:
+                return a_val @ b_val
+            if a_val.ndim == 1 and b_val.ndim == 2 and a_val.shape[0] == b_val.shape[0]:
+                 return a_val @ b_val 
             
-    #     # # Failing the advection diffusion test: Case for dot(vector, tensor) -> vector
-    #     # if a.ndim == 1 and b.ndim == 2:
-    #     #     return a @ b
+        raise NotImplementedError(f"Dot between {type(a_node).__name__} and {type(b_node).__name__} not supported.")    
 
-    #     # Other cases for assembling vectors or matrices
-    #     sa, sb = self.shape.visit(n.a), self.shape.visit(n.b)
-    #     # ADDED: This new condition handles dot(Constant, grad(TrialFunction))
-    #     if sa.kind == 'none' and sb.kind == 'trial':
-    #         # This is Constant `a` dotted with each basis grad in `b`.
-    #         # Operation is matrix @ vector: (4, 2) @ (2,) -> (4,)
-    #         return b @ a
-    #     if sa.kind == 'none' and sb.kind == 'test': return b @ a
-    #     if sa.kind == 'test' and sb.kind == 'none': return a @ b.T
-    #     if sa.kind == 'test' and sb.kind == 'trial': return np.outer(a, b)
-    #     if sb.kind == 'test' and sa.kind == 'trial': return np.outer(b, a)
-            
-    #     raise TypeError(f"Unsupported Dot operation between shapes {a.shape} and {b.shape}")
 
-    #---------------------------------------------------------------------------------------------------------
+    
 
     # def visit_Jump(self,n):
     #     side = self.ctx['active_side']
@@ -1047,7 +1082,21 @@ class FormCompiler:
                 self.ctx.pop('trial_side',None)
 
     # dof helpers --------------------------------------------------------
-    def _elm_dofs(self,func,eid):
-        if isinstance(func,(VectorTrialFunction,VectorTestFunction)):
-            return [d for f in func.space.field_names for d in self.dh.element_maps[f][eid]]
-        return self.dh.element_maps[func.field_name][eid]
+    def _elm_dofs(self, func, eid):
+        """Final, robust method to get all global element DOFs for any function type."""
+        if func is None:
+            return []
+        
+        # Check for any class with a `.space` attribute (VectorTrial/TestFunction)
+        if hasattr(func, 'space'):
+            return np.concatenate([self.dh.element_maps[f][eid] for f in func.space.field_names])
+
+        # Check for any class with a `.field_names` attribute (VectorFunction)
+        if hasattr(func, 'field_names'):
+            return np.concatenate([self.dh.element_maps[f][eid] for f in func.field_names])
+
+        # Fallback for scalar types (Function, TrialFunction, TestFunction)
+        if hasattr(func, 'field_name'):
+            return self.dh.element_maps[func.field_name][eid]
+            
+        raise TypeError(f"Cannot get element DOFs for object of type {type(func)}")

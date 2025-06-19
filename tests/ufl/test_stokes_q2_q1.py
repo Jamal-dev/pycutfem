@@ -48,7 +48,7 @@ def test_stokes_lid_driven_cavity():
     # 3. Define the Weak Form in vector notation
     # ∫ (∇u : ∇v - p(∇⋅v) + q(∇⋅u)) dx = ∫ f⋅v dx
     a_form = (inner(grad(u), grad(v)) - p * div(v) + q * div(u)) * dx()
-    f = Constant((0.0, 0.0))
+    f = Constant([0.0, 0.0],dim=1)
     L_form = dot(f, v) * dx()
     
     equation = a_form == L_form
@@ -124,7 +124,7 @@ def test_stokes_couette_flow_vector_form():
     # 3. Define the Weak Form in vector notation
     # ∫ (∇u : ∇v - p(∇⋅v) + q(∇⋅u)) dx = ∫ f⋅v dx
     a = (inner(grad(u), grad(v)) - p * div(v) + q * div(u)) * dx()
-    f = Constant((0.0, 0.0))
+    f = Constant([0.0, 0.0],dim=1)
     L = dot(f, v) * dx()
     equation = (a == L)
 

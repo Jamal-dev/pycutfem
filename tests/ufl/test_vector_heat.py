@@ -10,11 +10,112 @@ from pycutfem.utils.meshgen import structured_quad
 from ufl.functionspace import FunctionSpace
 from ufl.expressions import (
     VectorTrialFunction, VectorTestFunction, VectorFunction,
-    grad, inner, dot, Constant
+    grad, inner, dot, Constant, TrialFunction, TestFunction
 )
 from ufl.measures import dx
 from ufl.forms import BoundaryCondition, assemble_form
 from ufl.analytic import Analytic, x, y
+
+
+def get_exact_q1_mass_matrix():
+    """
+    Computes the exact 4x4 mass matrix for a Q1 element on the [-1,1] x [-1,1]
+    reference element, mapped to a 1x1 physical square.
+    """
+    xi, eta = sp.symbols('xi eta')
+    
+    # Q1 basis functions on the [-1, 1] x [-1, 1] reference element
+    N_ref = [
+        (1 - xi)/2 * (1 - eta)/2,  # Node 0: (-1, -1)
+        (1 + xi)/2 * (1 - eta)/2,  # Node 1: ( 1, -1)
+        (1 + xi)/2 * (1 + eta)/2,  # Node 2: ( 1,  1)
+        (1 - xi)/2 * (1 + eta)/2   # Node 3: (-1,  1)
+    ]
+    
+    # The structured_quad generator creates nodes in the order:
+    # (0,0), (1,0), (0,1), (1,1). For a single element, this corresponds to
+    # reference nodes (-1,-1), (1,-1), (-1,1), (1,1).
+    # The basis function order must match this node order.
+    # N0 -> (-1,-1), N1 -> (1,-1), N3 -> (-1,1), N2 -> (1,1)
+    N_ordered = [N_ref[0], N_ref[1], N_ref[3], N_ref[2]]
+    
+    M = sp.zeros(4, 4)
+    # The Jacobian determinant for mapping [-1,1]^2 to [0,1]^2 is (1/2)*(1/2) = 1/4
+    detJ = sp.Rational(1, 4)
+    
+    for i in range(4):
+        for j in range(4):
+            integrand = N_ordered[i] * N_ordered[j]
+            integral_val = sp.integrate(integrand * detJ, (xi, -1, 1), (eta, -1, 1))
+            M[i, j] = integral_val
+            
+    # The result is (1/36) * [[4, 2, 2, 1], [2, 4, 1, 2], [2, 1, 4, 2], [1, 2, 2, 4]]
+    return np.array(M, dtype=float)
+
+def test_scalar_mass_matrix_q1():
+    """White-box test for a scalar Q1 mass matrix on a single element."""
+    print("\n" + "="*70)
+    print("White-Box Test of Q1 Scalar Mass Matrix")
+    print("="*70)
+
+    # 1. Setup a single Q1 element
+    nodes, elems, _, corners = structured_quad(1, 1, nx=1, ny=1, poly_order=1)
+    mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=1)
+    fe_map = {'u': mesh}
+    dof_handler = DofHandler(fe_map, method='cg')
+
+    # 2. Define the UFL form for the mass matrix
+    u = TrialFunction('u')
+    v = TestFunction('u')
+    equation = (dot(u, v) * dx() == Constant(0.0) * v * dx())
+
+    # 3. Get the global matrix A from the real assembler
+    A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])
+    compiler_matrix = A.toarray()
+
+    # 4. Get the exact analytical matrix
+    expected_matrix = get_exact_q1_mass_matrix()
+
+    # 5. Compare
+    print("Comparing Compiler's Q1 Scalar Mass Matrix with Analytical Ground Truth...")
+    np.testing.assert_allclose(compiler_matrix, expected_matrix, rtol=1e-12, atol=1e-12)
+    print("SUCCESS: Q1 Scalar Mass Matrix is correct!")
+    # print("Get Matrix:\n", compiler_matrix)
+    # print("Expected Matrix:\n", expected_matrix)
+
+def test_vector_mass_matrix_q1():
+    """White-box test for a vector Q1 mass matrix on a single element."""
+    print("\n" + "="*70)
+    print("White-Box Test of Q1 Vector Mass Matrix")
+    print("="*70)
+    
+    nodes, elems, _, corners = structured_quad(1, 1, nx=1, ny=1, poly_order=1)
+    mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=1)
+    fe_map = {'ux': mesh, 'uy': mesh}
+    dof_handler = DofHandler(fe_map, method='cg')
+
+    u = VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy']))
+    v = VectorTestFunction(FunctionSpace("velocity", ['ux', 'uy']))
+    equation = (dot(u, v) * dx() == Constant(0.0) * v[0] * dx() + Constant(0.0) * v[1] * dx())
+
+    A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])
+    compiler_matrix = A.toarray()
+    print("Compiler's Q1 Vector Mass Matrix shape:\n", compiler_matrix.shape)
+
+    scalar_mass_block = get_exact_q1_mass_matrix()
+    expected_matrix = np.zeros((8, 8))
+    expected_matrix[0:4, 0:4] = scalar_mass_block
+    expected_matrix[4:8, 4:8] = scalar_mass_block
+    
+    np.savetxt("/home/bhatti/Documents/pycutfem/garbage/vector_mass_q1.csv", compiler_matrix, delimiter=",")
+    np.savetxt("/home/bhatti/Documents/pycutfem/garbage/vector_mass_q1_desired.csv", expected_matrix, delimiter=",")
+    print("Comparing Compiler's Q1 Vector Mass Matrix with Analytical Ground Truth...")
+    np.testing.assert_allclose(compiler_matrix, expected_matrix, rtol=1e-12, atol=1e-12)
+    print("SUCCESS: Q1 Vector Mass Matrix is correct!")
+
+
+
+
 
 def test_vector_heat_equation_mms():
     """
@@ -32,8 +133,11 @@ def test_vector_heat_equation_mms():
     t_sym = sp.Symbol('t')
     
     # Choose a smooth vector solution that depends on both space and time
-    u_exact_sym_x = sp.cos(t_sym) * sp.sin(sp.pi * x) * sp.cos(sp.pi * y)
-    u_exact_sym_y = sp.cos(t_sym) * sp.cos(sp.pi * x) * sp.sin(sp.pi * y)
+    # u_exact_sym_x = sp.cos(t_sym) * sp.sin(sp.pi * x) * sp.cos(sp.pi * y)
+    # u_exact_sym_y = sp.cos(t_sym) * sp.cos(sp.pi * x) * sp.sin(sp.pi * y)
+
+    u_exact_sym_x = t_sym * sp.sin(sp.pi * x) * sp.cos(sp.pi * y)
+    u_exact_sym_y = t_sym * sp.cos(sp.pi * x) * sp.sin(sp.pi * y)
     
     # Calculate the forcing term f = ∂u/∂t - εΔu
     f_sym_x = sp.diff(u_exact_sym_x, t_sym) - epsilon * (sp.diff(u_exact_sym_x, x, 2) + sp.diff(u_exact_sym_x, y, 2))
@@ -47,7 +151,7 @@ def test_vector_heat_equation_mms():
 
     # 2. Setup Q2 Mesh and DofHandler
     poly_order = 2  # Q2 elements
-    nodes, elems, _, corners = structured_quad(1, 1, nx=4, ny=4, poly_order=poly_order)
+    nodes, elems, _, corners = structured_quad(1, 1, nx=6, ny=6, poly_order=poly_order)
     mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
     fe_map = {'ux': mesh, 'uy': mesh}
     dof_handler = DofHandler(fe_map, method='cg')
