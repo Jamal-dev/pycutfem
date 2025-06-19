@@ -26,6 +26,12 @@ class Form(Expression):
         if isinstance(other, Form):
             return Form(self.integrals + [_negate(i) for i in other.integrals])
         raise TypeError("Can only subtract an Integral or Form from a Form.")
+    def __neg__(self):
+        from ufl.expressions import Constant, Prod
+        new = []
+        for I in self.integrals:
+            new.append(Integral(Prod(Constant(-1.0), I.integrand), I.measure))
+        return Form(new)
 
 
     def __eq__(self, other): return Equation(self, other)

@@ -107,8 +107,8 @@ def test_vector_mass_matrix_q1():
     expected_matrix[0:4, 0:4] = scalar_mass_block
     expected_matrix[4:8, 4:8] = scalar_mass_block
     
-    np.savetxt("/home/bhatti/Documents/pycutfem/garbage/vector_mass_q1.csv", compiler_matrix, delimiter=",")
-    np.savetxt("/home/bhatti/Documents/pycutfem/garbage/vector_mass_q1_desired.csv", expected_matrix, delimiter=",")
+    # np.savetxt("/home/bhatti/Documents/pycutfem/garbage/vector_mass_q1.csv", compiler_matrix, delimiter=",")
+    # np.savetxt("/home/bhatti/Documents/pycutfem/garbage/vector_mass_q1_desired.csv", expected_matrix, delimiter=",")
     print("Comparing Compiler's Q1 Vector Mass Matrix with Analytical Ground Truth...")
     np.testing.assert_allclose(compiler_matrix, expected_matrix, rtol=1e-12, atol=1e-12)
     print("SUCCESS: Q1 Vector Mass Matrix is correct!")

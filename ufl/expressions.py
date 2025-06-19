@@ -7,10 +7,25 @@ class Expression:
     def __repr__(self):
         return f"{self.__class__.__name__}()"
 
-    def __add__(self, other): return Sum(self, other)
-    def __radd__(self, other): return Sum(other, self)
-    def __sub__(self, other): return Sub(self, other)
-    def __rsub__(self, other): return Sub(other, self)
+    def __add__(self, other):
+        if not isinstance(other, Expression):
+            other = Constant(other)
+        return Sum(self, other)
+
+    def __radd__(self, other):
+        if not isinstance(other, Expression):
+            other = Constant(other)
+        return Sum(other, self)
+
+    def __sub__(self, other):
+        if not isinstance(other, Expression):
+            other = Constant(other)
+        return Sub(self, other)
+
+    def __rsub__(self, other):
+        if not isinstance(other, Expression):
+            other = Constant(other)
+        return Sub(other, self)
 
     def __mul__(self, other):
         """Left multiplication. If *other* is a Measure (dx, ds, …), create an Integral."""
@@ -332,6 +347,9 @@ class Integral(Expression):
     def __add__(self, other):
         from .forms import Form
         return Form([self, other])
+    def __neg__(self):
+        from ufl.expressions import Constant, Prod
+        return Integral(Prod(Constant(-1.0), self.integrand), self.measure)
     def __eq__(self, other):
         from .forms import Form, Equation
         return Equation(Form([self]), other)
