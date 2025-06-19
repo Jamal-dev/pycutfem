@@ -234,6 +234,64 @@ class DofHandler:
         coords_list = [pair[1] for pair in dof_coord_pairs]
         
         return np.array(coords_list)
+    
+    def apply_bcs_to_vector(self, vector: np.ndarray, bcs: Union[BcLike, Iterable[BcLike]]):
+        """
+        Modifies a vector in-place by applying Dirichlet boundary conditions.
+        """
+        dirichlet_data = self.get_dirichlet_data(bcs)
+        for dof, value in dirichlet_data.items():
+            if dof < len(vector):
+                vector[dof] = value
+
+    def add_to_functions(self, global_delta_vector: np.ndarray, functions: List[Union["Function", "VectorFunction"]]):
+        """
+        Distributes a global correction vector to the nodal_values of a list
+        of Function/VectorFunction objects.
+        """
+        from ufl.expressions import Function, VectorFunction
+        # Create a mapping from each field name to the Function object that contains it.
+        field_to_func_map = {}
+        for func in functions:
+            if isinstance(func, VectorFunction):
+                for field_name in func.field_names:
+                    field_to_func_map[field_name] = func
+            elif isinstance(func, Function):
+                field_to_func_map[func.field_name] = func
+
+        # Keep track of functions that have been updated to avoid redundant additions
+        # for components of the same VectorFunction.
+        updated_funcs = set()
+
+        for field in self.field_names:
+            if field not in field_to_func_map:
+                continue
+            
+            target_func = field_to_func_map[field]
+            
+            # If the target is a scalar Function, update it directly.
+            if isinstance(target_func, Function) and not isinstance(target_func, VectorFunction):
+                if id(target_func) not in updated_funcs:
+                    field_dofs = self.get_field_dofs_on_nodes(field)
+                    corrections = global_delta_vector[field_dofs]
+                    # Directly add to the function's internal data array
+                    target_func.nodal_values[:] += corrections
+                    updated_funcs.add(id(target_func))
+
+            # If the target is a VectorFunction, perform one update for all its components.
+            elif isinstance(target_func, VectorFunction):
+                if id(target_func) not in updated_funcs:
+                    # Get all global dofs for this entire vector function
+                    func_global_dofs = np.concatenate(
+                        [self.get_field_dofs_on_nodes(fn) for fn in target_func.field_names]
+                    )
+                    # Get the corresponding correction values from the global vector
+                    corrections = global_delta_vector[func_global_dofs]
+                    
+                    # The internal order of nodal_values in VectorFunction matches the
+                    # concatenated order of fields from the DofHandler, so we can add directly.
+                    target_func.nodal_values[:] += corrections
+                    updated_funcs.add(id(target_func))
 
     # ------------------------------------------------------------------
     #  Debug convenience

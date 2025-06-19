@@ -686,7 +686,7 @@ class FormCompiler:
         # anything else is still unsupported ------------------------------
         # -----------------------------------------------------------------
         raise NotImplementedError(
-            f"Dot between {type(a_node).__name__} and {type(b_node).__name__} "
+            f"Dot between {a_node} and {b_node} "
             "is not implemented."
         )
     
