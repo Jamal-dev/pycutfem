@@ -406,48 +406,57 @@ class FormCompiler:
 
     # differential ops ---------------------------------------------------
     def visit_Grad(self, n):
-        """ FINAL, ROBUST visit_Grad method """
-        # This branch handles known data functions (u_k, u_n, etc.)
-        if isinstance(n.operand, (Function, VectorFunction)) and not isinstance(n.operand, (TrialFunction, TestFunction)):
-            # This unified logic from our previous work is correct.
-            func = n.operand
-            nodal_loc = self._get_data_vector_and_dofs(func) # Use the helper
-            
-            if isinstance(func, Function): # Scalar case
-                G = self._basis_grad(func.field_name, role='test')
-                return G.T @ nodal_loc
-            else: # Vector case
-                grad_rows = []
-                for i, component in enumerate(func.components):
-                    # We need to get the DoFs for each component to slice nodal_loc
-                    elem_dofs = self._elm_dofs(component, self.ctx['elem_id'])
-                    # Map global dofs from the element to local dofs in the function's data
-                    local_indices = [func._global_dof_to_local_idx[gd] for gd in elem_dofs]
-                    nodal_loc_comp = func.nodal_values[local_indices]
-                    
-                    G = self._basis_grad(component.field_name, role='test')
-                    grad_rows.append(G.T @ nodal_loc_comp)
-                return np.vstack(grad_rows)
+        """
+        Correct evaluation of gradients for both scalar‐ and vector-valued
+        data functions and for symbolic (test / trial) functions.
+        """
 
-        # --- This branch for symbolic functions is where the KEY CHANGE is ---
+        # ------------------------------------------------------------------ #
+        # 1. Concrete FE functions (u_k, u_n, beta, …) ---------------------- #
+        # ------------------------------------------------------------------ #
+        if isinstance(n.operand, (Function, VectorFunction)) \
+        and not isinstance(n.operand, (TrialFunction, TestFunction)):
+
+            func       = n.operand
+            nodal_loc  = self._get_data_vector_and_dofs(func)   # (dofs_elem,)
+
+            # ---------- scalar ------------------------------------------------
+            if isinstance(func, Function):
+                G = self._basis_grad(func.field_name, role='test')   # (n_b, n_dim)
+                return G.T @ nodal_loc                               # (n_dim,)
+
+            # ---------- vector ------------------------------------------------
+            n_comp = len(func.components)
+            n_bs   = nodal_loc.size // n_comp                        # scalar bases
+            grad_rows = []
+            for i, comp in enumerate(func.components):
+                comp_nodal = nodal_loc[i*n_bs : (i+1)*n_bs]          # slice once
+                G          = self._basis_grad(comp.field_name, 'test')
+                grad_rows.append(G.T @ comp_nodal)                   # (n_dim,)
+            return np.vstack(grad_rows)                              # (n_comp,n_dim)
+
+        # ------------------------------------------------------------------ #
+        # 2. Symbolic (trial / test) functions ------------------------------ #
+        # ------------------------------------------------------------------ #
         sh = self.shape.visit(n.operand)
-        
-        if sh.dim == 0:  # grad(scalar)
-            return self._basis_grad(n.operand.field_name, sh.kind)
-            
-        if sh.dim == 1:  # grad(vector)
-            # Instead of returning a list, stack the arrays into a 3D numpy array
-            # Shape will be (n_components, n_basis_funcs, n_spatial_dims) e.g. (2, 9, 2)
-            return np.stack([self._basis_grad(f, sh.kind) 
-                            for f in n.operand.space.field_names])
-            
-        raise NotImplementedError('grad of tensor not needed')
 
+        if sh.dim == 0:                    # grad(scalar ϕ) → (n_b,n_dim)
+            return self._basis_grad(n.operand.field_name, sh.kind)
+
+        if sh.dim == 1:                    # grad(vector ϕ) → (n_comp,n_b,n_dim)
+            return np.stack([self._basis_grad(f, sh.kind)
+                            for f in n.operand.space.field_names])
+
+        raise TypeError(f"Unsupported operand to Grad(): {type(n.operand)}")
 
 
     def visit_DivOperation(self,n):
-        grads = self.visit(Grad(n.operand))  # list of rows
-        return np.hstack([g[:,i] for i,g in enumerate(grads)])
+        grads = self.visit(Grad(n.operand))
+        if isinstance(grads, np.ndarray) and grads.ndim == 3: # Symbolic
+            return np.hstack([grads[i, :, i] for i in range(grads.shape[0])])
+        elif isinstance(grads, np.ndarray) and grads.ndim == 2: # Data
+            return np.trace(grads)
+        raise TypeError(f"Unsupported type for DivOperation: {type(grads)}")
     
     def visit_Analytic(self, node): return node.eval(self.ctx['x_phys'])
 
