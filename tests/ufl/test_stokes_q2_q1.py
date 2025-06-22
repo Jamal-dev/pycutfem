@@ -8,13 +8,13 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
 
 # --- UFL-like imports ---
-from ufl.functionspace import FunctionSpace
-from ufl.expressions import (
+from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     grad, inner, dot, div, Constant
 )
-from ufl.measures import dx
-from ufl.forms import BoundaryCondition, assemble_form
+from pycutfem.ufl.measures import dx
+from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 
 def test_stokes_lid_driven_cavity():
     """

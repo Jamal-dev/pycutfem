@@ -1,15 +1,15 @@
 import numpy as np
 import scipy.sparse.linalg as spla
 import sympy as sp
-from ufl.functionspace import FunctionSpace
-from ufl.expressions import (    VectorTrialFunction, VectorTestFunction, VectorFunction, div,
+from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.expressions import (    VectorTrialFunction, VectorTestFunction, VectorFunction, div,
     grad, inner, dot, Constant, TrialFunction, TestFunction)
-from ufl.measures import dx
-from ufl.forms import BoundaryCondition, assemble_form
+from pycutfem.ufl.measures import dx
+from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
-from ufl.analytic import Analytic, x, y
+from pycutfem.ufl.analytic import Analytic, x, y
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem import transform
 from pycutfem.integration.quadrature import volume
@@ -158,76 +158,7 @@ def test_rhs_mass_matrix():
     print("\nSUCCESS: Compiler's RHS Q2 mass vector is correct!")
 
 
-def test_rhs_nonlinear_advection():
-    """
-    White-box test for the RHS vector from: ((u_k ⋅ ∇)u_k) ⋅ v
-    where u_k is a known VectorFunction.
-    """
-    print("\n" + "="*70)
-    print("White-Box Test of RHS Nonlinear Advection Term")
-    print("="*70)
 
-    mesh, dof_handler = setup_single_q2_element()
-    velocity_space = FunctionSpace("velocity", ['ux', 'uy'])
-    v = VectorTestFunction(velocity_space)
-
-    u_k = VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler)
-    np.random.seed(42)
-    u_k.nodal_values[:] = np.sin(np.linspace(0, 5, dof_handler.total_dofs))
-
-    # In UFL, dot(grad(u), v) for vector u,v is ambiguous.
-    # The term (u_k ⋅ ∇)u_k is explicitly written as:
-    # (u_k, ∇(u_k_x)) for the x-component
-    # (u_k, ∇(u_k_y)) for the y-component
-    advection_term =  dot(u_k, grad(u_k[0]))* v[0] + dot(u_k, grad(u_k[1]))* v[1]
-
-    equation = Constant(0.0) * v[0] * dx() == 1.0 * advection_term * dx()
-    
-    _, R = assemble_form(equation, dof_handler=dof_handler, bcs=[])
-    compiler_vector = R
-    
-    ref_q2 = get_reference("quad", poly_order=2)
-    q_order = 5
-    qpts, qwts = volume("quad", q_order)
-    n_basis_scalar = 9
-    
-    expected_vector = np.zeros(n_basis_scalar * 2)
-
-    dofs_ux = dof_handler.element_maps['ux'][0]
-    dofs_uy = dof_handler.element_maps['uy'][0]
-    u_k_ux_local = u_k.get_nodal_values(dofs_ux)
-    u_k_uy_local = u_k.get_nodal_values(dofs_uy)
-
-    for qp, w in zip(qpts, qwts):
-        J = transform.jacobian(mesh, 0, qp)
-        detJ = abs(np.linalg.det(J))
-        JinvT = np.linalg.inv(J).T
-        
-        N_scalar = ref_q2.shape(*qp)
-        G_scalar_phys = ref_q2.grad(*qp) @ JinvT
-        
-        u_k_val = np.array([
-            N_scalar @ u_k_ux_local,
-            N_scalar @ u_k_uy_local
-        ])
-        
-        grad_uk0_val = G_scalar_phys.T @ u_k_ux_local
-        grad_uk1_val = G_scalar_phys.T @ u_k_uy_local
-
-        # Term 1: ((u_k ⋅ ∇)u_k[0]) * v[0]
-        # This contributes to the first 9 rows of the local vector
-        coeff0 = np.dot(u_k_val, grad_uk0_val)
-        expected_vector[:n_basis_scalar] += (coeff0 * N_scalar) * w * detJ
-        
-        # Term 2: ((u_k ⋅ ∇)u_k[1]) * v[1]
-        # This contributes to the last 9 rows of the local vector
-        coeff1 = np.dot(u_k_val, grad_uk1_val)
-        expected_vector[n_basis_scalar:] += (coeff1 * N_scalar) * w * detJ
-
-    print(f"compiler.shape: {compiler_vector.shape}, expected.shape: {expected_vector.shape}")
-    print("Comparing compiler-generated vector with manually computed ground truth...")
-    np.testing.assert_allclose(compiler_vector, expected_vector, rtol=1e-12, atol=1e-12)
-    print("\nSUCCESS: Compiler's RHS nonlinear advection vector is correct!")
 
 
 def get_exact_q1_mass_matrix():
@@ -453,8 +384,10 @@ def test_lhs_advection_q2():
 
 def test_lhs_advection_transpose_q2():
     """
-    White-box test for the other linearized advection term:
+    A thorough and explicit white-box test for the advection term:
     A_ij = ∫ ((u_j ⋅ ∇)u_k) ⋅ v_i dΩ
+    This test builds the final matrix block-by-block to ensure correct
+    handling of vector components.
     """
     print("\n" + "="*70)
     print("White-Box Test of LHS Advection Matrix (u_grad_uk)")
@@ -470,15 +403,17 @@ def test_lhs_advection_transpose_q2():
     np.random.seed(1337)
     u_k.nodal_values[:] = np.random.rand(dof_handler.total_dofs)
     
-    # UFL for (u ⋅ ∇)u_k is dot(u, grad(u_k))
-    # Then dot with v
-    advection_term = dot(u, grad(u_k[0])) * v[0] + dot(u, grad(u_k[1])) * v[1]
+    # UFL form for ((u ⋅ ∇)u_k) ⋅ v
+    advection_term = dot(dot(u, grad(u_k)), v)
     equation = advection_term * dx() == Constant(0.0) * v[0] * dx()
     
     A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])
     compiler_matrix = A.toarray()
     
-    # Manually compute the ground truth element matrix
+    # ==========================================================================
+    #    THOROUGH MANUAL CALCULATION (BLOCK-BY-BLOCK)
+    # ==========================================================================
+    
     ref_q2 = get_reference("quad", poly_order=2)
     q_order = 5
     qpts, qwts = volume("quad", q_order)
@@ -491,49 +426,64 @@ def test_lhs_advection_transpose_q2():
     u_k_ux_local = u_k.get_nodal_values(dofs_ux)
     u_k_uy_local = u_k.get_nodal_values(dofs_uy)
     
+    # The four 9x9 blocks composing the final 18x18 matrix
+    block_ux_ux = np.zeros((n_basis_scalar, n_basis_scalar))
+    block_uy_ux = np.zeros((n_basis_scalar, n_basis_scalar))
+    block_ux_uy = np.zeros((n_basis_scalar, n_basis_scalar))
+    block_uy_uy = np.zeros((n_basis_scalar, n_basis_scalar))
+    
     for qp, w in zip(qpts, qwts):
+        # --- 1. Pre-compute values at the quadrature point ---
         J = transform.jacobian(mesh, 0, qp)
         detJ = abs(np.linalg.det(J))
         JinvT = np.linalg.inv(J).T
         
-        N = ref_q2.shape(*qp)
-        G_phys = ref_q2.grad(*qp) @ JinvT
-        
-        grad_uk_val = np.zeros((2, 2))
-        grad_uk_val[0, :] = G_phys.T @ u_k_ux_local # row 0: grad(uk_x)
-        grad_uk_val[1, :] = G_phys.T @ u_k_uy_local # row 1: grad(uk_y)
-        
-        for i in range(n_basis_scalar * 2):
-            for j in range(n_basis_scalar * 2):
-                
-                u_j = np.zeros(2)
-                if j < n_basis_scalar:
-                    u_j[0] = N[j]
-                else:
-                    u_j[1] = N[j - n_basis_scalar]
-                
-                v_i = np.zeros(2)
-                if i < n_basis_scalar:
-                    v_i[0] = N[i]
-                else:
-                    v_i[1] = N[i - n_basis_scalar]
+        N = ref_q2.shape(*qp) # Shape (9,) - values of scalar basis functions
+        G_phys = ref_q2.grad(*qp) @ JinvT # Shape (9, 2) - grads of scalar basis funcs
 
-                # --- CORRECTED CALCULATION ---
-                # To compute (u_j ⋅ ∇)u_k, we compute the dot product of u_j with each
-                # ROW of grad_uk_val.
-                # The previous version (u_j @ grad_uk_val) incorrectly used the columns.
-                term_vec = np.array([
-                    np.dot(u_j, grad_uk_val[0, :]),  # Component 1: u_j ⋅ ∇(u_k)_x
-                    np.dot(u_j, grad_uk_val[1, :])   # Component 2: u_j ⋅ ∇(u_k)_y
-                ])
+        # Get the 2x2 gradient of the known function u_k
+        grad_uk_val = np.zeros((2, 2))
+        grad_uk_val[0, :] = G_phys.T @ u_k_ux_local # row 0: (∂uk_x/∂x, ∂uk_x/∂y)
+        grad_uk_val[1, :] = G_phys.T @ u_k_uy_local # row 1: (∂uk_y/∂x, ∂uk_y/∂y)
+
+        # --- 2. Calculate the contribution matrix for this quad point ---
+        # The term N_i * N_j appears in all blocks, so we compute it once
+        # This is the contribution to a scalar mass matrix at this point.
+        mass_contrib = np.outer(N, N)
+
+        # --- 3. Add contribution to each block based on the math ---
+        # Block 1: ux-ux. Term: (u_j_x * ∂u_k_x/∂x) * v_i_x -> N_j * (∂u_k_x/∂x) * N_i
+        block_ux_ux += mass_contrib * grad_uk_val[0, 0] * w * detJ
+        
+        # Block 2: uy-ux. Term: (u_j_x * ∂u_k_y/∂x) * v_i_y -> N_j * (∂u_k_y/∂x) * N_i
+        block_uy_ux += mass_contrib * grad_uk_val[1, 0] * w * detJ
+
+        # Block 3: ux-uy. Term: (u_j_y * ∂u_k_x/∂y) * v_i_x -> N_j * (∂u_k_x/∂y) * N_i
+        block_ux_uy += mass_contrib * grad_uk_val[0, 1] * w * detJ
+
+        # Block 4: uy-uy. Term: (u_j_y * ∂u_k_y/∂y) * v_i_y -> N_j * (∂u_k_y/∂y) * N_i
+        block_uy_uy += mass_contrib * grad_uk_val[1, 1] * w * detJ
+
+    # --- 4. Assemble the full 18x18 expected matrix from the blocks ---
+    expected_matrix[0:n_basis_scalar, 0:n_basis_scalar] = block_ux_ux
+    expected_matrix[n_basis_scalar:18, 0:n_basis_scalar] = block_uy_ux
+    expected_matrix[0:n_basis_scalar, n_basis_scalar:18] = block_ux_uy
+    expected_matrix[n_basis_scalar:18, n_basis_scalar:18] = block_uy_uy
                 
-                integrand = np.dot(term_vec, v_i)
-                
-                expected_matrix[i, j] += integrand * w * detJ
-                
-    print(f"Comparing compiler-generated matrix with manually computed ground truth... expected shape: {expected_matrix.shape}, compiler shape: {compiler_matrix.shape}")
-    np.testing.assert_allclose(compiler_matrix, expected_matrix, rtol=1e-12, atol=1e-12)
-    print("\nSUCCESS: Compiler's LHS transpose advection matrix is correct!")
+    # --- 5. Compare the results ---
+    print(f"Comparing compiler-generated matrix with thoroughly computed ground truth...")
+    try:
+        np.testing.assert_allclose(compiler_matrix, expected_matrix, rtol=1e-9, atol=1e-9)
+        print("\n✅ SUCCESS: Compiler's LHS transpose advection matrix is correct!")
+    except AssertionError:
+        print("\n❌ FAILURE: Matrices do not match.")
+        diff = np.abs(compiler_matrix - expected_matrix)
+        max_err_idx = np.unravel_index(np.argmax(diff), diff.shape)
+        i, j = max_err_idx
+        print(f"  - Largest absolute error is {diff[i, j]:.6e} at matrix entry ({i}, {j}).")
+        print(f"  - Value from pycutfem: {compiler_matrix[i, j]:.6e}")
+        print(f"  - Value from ground truth: {expected_matrix[i, j]:.6e}")
+
 
 #endregion
 

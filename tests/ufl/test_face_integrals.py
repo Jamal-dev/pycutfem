@@ -2,11 +2,11 @@ import numpy as np, pytest
 from pycutfem.utils.meshgen   import structured_quad
 from pycutfem.core.mesh       import Mesh
 from pycutfem.core.levelset   import CircleLevelSet
-from ufl.measures    import dInterface
-from ufl.expressions import Constant, Pos, Neg, Jump, FacetNormal,grad, Function, dot, inner, VectorFunction
-from ufl.forms           import assemble_form
+from pycutfem.ufl.measures    import dInterface
+from pycutfem.ufl.expressions import Constant, Pos, Neg, Jump, FacetNormal,grad, Function, dot, inner, VectorFunction
+from pycutfem.ufl.forms           import assemble_form
 from pycutfem.core.dofhandler import DofHandler
-from ufl.functionspace import FunctionSpace
+from pycutfem.ufl.functionspace import FunctionSpace
 from numpy.testing import assert_allclose # Add this import at the top
 
 

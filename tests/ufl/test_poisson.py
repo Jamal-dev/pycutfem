@@ -7,11 +7,11 @@ from numpy.testing import assert_allclose
 from pycutfem.core import Mesh
 from pycutfem.utils.meshgen import structured_quad
 # Imports from the new UFL-like library
-from ufl.expressions import TrialFunction,dot, TestFunction, Constant, grad, inner
-from ufl.measures import dx
-from ufl.forms import assemble_form, BoundaryCondition
+from pycutfem.ufl.expressions import TrialFunction,dot, TestFunction, Constant, grad, inner
+from pycutfem.ufl.measures import dx
+from pycutfem.ufl.forms import assemble_form, BoundaryCondition
 from pycutfem.core.dofhandler import DofHandler
-from ufl.functionspace import FunctionSpace
+from pycutfem.ufl.functionspace import FunctionSpace
 
 def test_poisson_symbolic_q1():
     """

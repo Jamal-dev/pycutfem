@@ -7,20 +7,20 @@ import sympy as sp
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
-from ufl.functionspace import FunctionSpace
-from ufl.expressions import (
+from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.expressions import (
     VectorTrialFunction, VectorTestFunction, VectorFunction,
     grad, inner, dot, Constant
 )
-from ufl.measures import dx
-from ufl.forms import BoundaryCondition, assemble_form
-from ufl.analytic import Analytic, x, y
+from pycutfem.ufl.measures import dx
+from pycutfem.ufl.forms import BoundaryCondition, assemble_form
+from pycutfem.ufl.analytic import Analytic, x, y
 from pycutfem.fem.reference import get_reference
 from itertools import product
 
 from pycutfem.fem import transform
 from pycutfem.integration import volume
-from ufl.compilers import _split_terms
+from pycutfem.ufl.compilers import _split_terms
 
 
 def test_vector_diffusion_mms():
@@ -235,7 +235,7 @@ def get_matrix_from_compiler(dof_handler, equation):
     matvec = K_global
 
     # Temporarily instantiate a compiler to use its methods
-    from ufl.compilers import FormCompiler, _trial_test, _all_fields
+    from pycutfem.ufl.compilers import FormCompiler, _trial_test, _all_fields
     compiler = FormCompiler(dof_handler, quad_order=5)
     compiler.ctx['is_rhs'] = False
 

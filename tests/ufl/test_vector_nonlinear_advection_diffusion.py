@@ -1,15 +1,15 @@
 import numpy as np
 import scipy.sparse.linalg as spla
 import sympy as sp
-from ufl.functionspace import FunctionSpace
-from ufl.expressions import (    VectorTrialFunction, VectorTestFunction, VectorFunction,
+from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.expressions import (    VectorTrialFunction, VectorTestFunction, VectorFunction,
     grad, inner, dot, Constant, TrialFunction, TestFunction)
-from ufl.measures import dx
-from ufl.forms import BoundaryCondition, assemble_form
+from pycutfem.ufl.measures import dx
+from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
-from ufl.analytic import Analytic, x, y
+from pycutfem.ufl.analytic import Analytic, x, y
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem import transform
 from pycutfem.integration.quadrature import volume

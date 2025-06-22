@@ -8,10 +8,10 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 
 # --- UFL-like imports ---
-from ufl.expressions import TrialFunction, TestFunction, grad, inner, dot, Constant
-from ufl.measures import dx
-from ufl.forms import BoundaryCondition, assemble_form
-from ufl.analytic import Analytic, x, y
+from pycutfem.ufl.expressions import TrialFunction, TestFunction, grad, inner, dot, Constant
+from pycutfem.ufl.measures import dx
+from pycutfem.ufl.forms import BoundaryCondition, assemble_form
+from pycutfem.ufl.analytic import Analytic, x, y
 
 # --- Utility imports ---
 from pycutfem.utils.meshgen import structured_quad

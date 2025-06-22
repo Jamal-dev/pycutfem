@@ -10,10 +10,10 @@ from pycutfem.utils.bitset import BitSet
 from pycutfem.utils.domain_manager import get_domain_bitset
 
 # --- UFL-like imports ---
-from ufl.expressions import (TrialFunction, TestFunction, grad, inner, jump,dot,
+from pycutfem.ufl.expressions import (TrialFunction, TestFunction, grad, inner, jump,dot,
                              ElementWiseConstant, Constant)
-from ufl.measures import dx, ds, dInterface
-from ufl.forms import BoundaryCondition, assemble_form
+from pycutfem.ufl.measures import dx, ds, dInterface
+from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 
 # --- Level Set and Cut Ratio imports ---
 from pycutfem.core.levelset import CircleLevelSet

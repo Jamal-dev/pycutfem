@@ -7,7 +7,7 @@ from typing import Dict, List, Set, Tuple, Callable, Mapping, Iterable, Union, A
 # We assume the Mesh class and its components are in a sibling file.
 from pycutfem.core.mesh import Mesh
 
-from ufl.forms import BoundaryCondition
+from pycutfem.ufl.forms import BoundaryCondition
 
 
 
@@ -249,7 +249,7 @@ class DofHandler:
         Distributes a global correction vector to the nodal_values of a list
         of Function/VectorFunction objects.
         """
-        from ufl.expressions import Function, VectorFunction
+        from pycutfem.ufl.expressions import Function, VectorFunction
         # Create a mapping from each field name to the Function object that contains it.
         field_to_func_map = {}
         for func in functions:

@@ -7,7 +7,7 @@
 
 
 import sympy
-from ufl.symops import SymbolicOps as so
+from pycutfem.ufl.symops import SymbolicOps as so
 
 # 1. Define symbolic constants
 rho_sympy, dt_sympy, theta_sympy, mu_sympy = sympy.symbols('rho Delta_t theta mu')
@@ -99,13 +99,13 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
 
 # --- UFL-like imports ---
-from ufl.functionspace import FunctionSpace
-from ufl.expressions import (
+from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfemufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     grad, inner, dot, div, Constant, Function, VectorFunction
 )
-from ufl.measures import dx
-from ufl.forms import BoundaryCondition, assemble_form
+from pycutfem.ufl.measures import dx
+from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 import numpy as np
 # 1. Setup Meshes and DofHandler for Q2-Q1 elements
 L, H = 1.0, 1.0  # Domain size
@@ -209,8 +209,8 @@ symbol_map = {
 # In[6]:
 
 
-from ufl.compilers import SymPyToUFLVisitor
-from ufl.expressions import Prod, Sum, Grad, DivOperation, Div
+from pycutfem.ufl.compilers import SymPyToUFLVisitor
+from pycutfem.ufl.expressions import Prod, Sum, Grad, DivOperation, Div
 import functools
 
 
