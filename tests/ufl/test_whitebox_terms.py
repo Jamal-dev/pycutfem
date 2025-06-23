@@ -404,7 +404,7 @@ def test_lhs_advection_transpose_q2():
     u_k.nodal_values[:] = np.random.rand(dof_handler.total_dofs)
     
     # UFL form for ((u ⋅ ∇)u_k) ⋅ v
-    advection_term = dot(dot(u, grad(u_k)), v)
+    advection_term = dot(dot(grad(u_k), u), v)
     equation = advection_term * dx() == Constant(0.0) * v[0] * dx()
     
     A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])

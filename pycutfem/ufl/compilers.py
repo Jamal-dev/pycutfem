@@ -50,6 +50,9 @@ from pycutfem.integration.quadrature import  line_quadrature
 from pycutfem.integration.quadrature import edge as edge_quadrature_element
 import sympy
 
+logger = logging.getLogger(__name__)
+
+
 _INTERFACE_TOL = 1.0e-12
 
 
@@ -706,210 +709,138 @@ class FormCompiler:
     def visit_Dot(self, n):
         a_node, b_node = n.a, n.b
         a_val,  b_val  = self.visit(a_node), self.visit(b_node)
-        # print(f"a_node:{a_node}, a_val.shape: {a_val.shape};    b_node:{b_node}, b_val.shape:{b_val.shape}")
+        logger.debug("visit_Dot  a:%s  b:%s  a_val.shape:%s  b_val.shape:%s",
+                 type(a_node).__name__, type(b_node).__name__,
+                 getattr(a_val, 'shape', None), getattr(b_val, 'shape', None))
 
-        if (
-            isinstance(a_node, VectorFunction) and isinstance(b_node, Grad)
-            and isinstance(b_val, np.ndarray) and b_val.ndim == 3     # (n_comp,n_bs,gdim)
-        ):
-            # Tensordot over the component axis
-            #   Σ_c u_k[c] * ∂_x u_c   → shape (n_bs , gdim)
-            # correct contraction: over spatial dim (= last axis of grad)
-            print('adv 2 '*50)
-            print(f"Inside (u_k @ grad(u))(expected shape:(n_comp,n_bs,gdim) @ (n_comp,n_bs,gdim) → (n_bs,gdim)): a_node: {a_node}, a_val.shape: {a_val.shape}; , b_node: {b_node}, b_val.shape: {b_val.shape}")
-            tmp = np.tensordot(a_val, b_val, axes=([0], [2])) # (n_comp , n_bs)
-            # print(f"tmp.shape: {tmp.shape}")
-            vec = tmp.T
-            print(f"vec.shape: {vec.shape}")
-            return vec # (n_bs , n_comp)
+        # Short aliases for readability ------------------------------------------------
+        VF  = VectorFunction  # data vector (coefficient)
+        VTf = VectorTrialFunction
+        VTe = VectorTestFunction
+        TF  = TrialFunction
+        TeF = TestFunction
+        GR  = Grad
+        CST = Constant
+        DOT = Dot
+        def _is_component_diagonal(node: Any) -> bool:
+            """Return *True* iff *node* == Dot(data‑vector, Grad(trial/test‑vector))."""
+            return (
+                isinstance(node, Dot) and
+                isinstance(node.a, Grad) and
+                isinstance(node.b, (VectorFunction, Constant, VectorTrialFunction)) 
+            )
         
-        if (
-            isinstance(b_node, VectorFunction) and isinstance(a_node, Grad)
-            and isinstance(a_val, np.ndarray) and a_val.ndim == 3
-        ):
-            print('adv'*50)
-            print(f"a_val.shape: {a_val.shape}, b_val.shape: {b_val.shape}")
-            tmp  = np.tensordot(b_val, a_val, axes=([0], [2])) # (n_comp , n_bs)
-            return (tmp).T
+        # ---------------------------------------------------------------------
+        # 0.  data‑vector · Grad(trial/test‑vector)  →  (n_bs , n_comp)
+        # ---------------------------------------------------------------------
+        if isinstance(a_node, VF) and isinstance(b_node, GR) and b_val.ndim == 3:
+            # (gdim,)  ·  (n_comp , n_bs , gdim)  →  (n_comp , n_bs)
+            res = np.tensordot(a_val, b_val, axes=([0], [2])).T  # (n_bs , n_comp)
+            logger.debug("β·∇u  →  %s", res.shape)
+            return res
+
+        # Mirror permutation:  Grad(vec) · data‑vector
+        if isinstance(b_node, VF) and isinstance(a_node, GR) and a_val.ndim == 3:
+            res = np.tensordot(b_val, a_val, axes=([0], [2])).T  # (n_bs , n_comp) in Q2 (9,2) or Q1 (4,2)
+            logger.debug("∇u·β  →  %s", res.shape)
+            return res
         
-        if (
-            isinstance(b_node, Constant) and isinstance(a_node, Grad)
-            and isinstance(a_val, np.ndarray) and a_val.ndim == 3 and b_node.dim == 1
-        ):
-            print('adv const'*50)
-            print(f"a_val.shape: {a_val.shape}, b_val.shape: {b_val.shape}")
-            tmp  = np.tensordot(b_val, a_val, axes=([0], [2])) # (n_comp , n_bs)
-            return (tmp).T
+        # Same as above but with a *Constant* on the left ------------------------------------------------
+        if isinstance(b_node, CST) and isinstance(a_node, GR) and a_val.ndim == 3 and b_node.dim == 1:
+            # only works for Constant Vector not with scalar
+            res = np.tensordot(b_val, a_val, axes=([0], [2])).T  # (n_bs , n_comp)
+            logger.debug("c·∇u  →  %s", res.shape)
+            return res
+        # ---------------------------------------------------------------------
+        # 1.  scalar‑basis outer products (mass‑matrix‑like)  ------------------
+        # ---------------------------------------------------------------------
+        if (isinstance(a_node, (VTf, VTe)) and isinstance(b_node, (VTf, VTe))):
+            trial_vec = a_val if isinstance(a_node, VTf) else b_val
+            test_vec  = b_val if isinstance(a_node, VTf) else a_val
+            n_comp = len((a_node if isinstance(a_node, VTf) else b_node).space.field_names)
+            res = self._diag_outer(test_vec, trial_vec, n_comp)
+            logger.debug("vector‑basis · vector‑basis  →  diag block  %s", res.shape)
+            return res
+        
+        # ---------------------------------------------------------------------
+        # 2.  vector‑basis · numeric‑vector   OR   numeric‑vector · vector‑basis
+        # ---------------------------------------------------------------------
+        if isinstance(a_node, (VTf, VTe)) and (isinstance(b_val, np.ndarray) and b_val.ndim == 1):
+            res = self._weight_vector_basis(a_val, b_val) # distributing a on b
+            logger.debug("vector‑basis · num‑vec  →  %s", res.shape)
+            return res
 
-
-        if (isinstance(a_node, TrialFunction) and isinstance(b_node, TestFunction)) or \
-        (isinstance(a_node, TestFunction) and isinstance(b_node, TrialFunction)):
-
-            print(f'&'*50)
-            # Make sure we know which one is the row (test) and which is the column (trial)
-            test_basis  = self.visit(b_node if isinstance(b_node, TestFunction)  else a_node)  # 1-D (n_test,)
-            trial_basis = self.visit(a_node if isinstance(a_node, TrialFunction) else b_node)  # 1-D (n_trial,)
-
-            if self.ctx['is_rhs']:
-                # Shouldn’t happen for dot(u,v) in a RHS, but keep it safe.
-                return test_basis * trial_basis
-            else:
-                # Correct n_test × n_trial outer product for the local element matrix
-                return np.outer(test_basis, trial_basis)
-
-        # -----------------------------------------------------------------
-        # 1. vector-basis  ⋅  vector-basis  (mass matrix blocks)
-        # -----------------------------------------------------------------
-        if isinstance(a_node, (VectorTrialFunction, VectorTestFunction)) \
-        and isinstance(b_node, (VectorTrialFunction, VectorTestFunction)):
-            print(f'mass matrix'*50)
-            trial_vec = a_val if isinstance(a_node, VectorTrialFunction) else b_val
-            test_vec  = b_val if isinstance(a_node, VectorTrialFunction) else a_val
-            ncomp = len((a_node if isinstance(a_node, VectorTrialFunction)
-                                    else b_node).space.field_names)
-            return self._diag_outer(test_vec, trial_vec, ncomp)
-
-        # -----------------------------------------------------------------
-        # 2. vector-basis  ⋅  numeric-vector   or   numeric-vector ⋅ vector-basis
-        #    (e.g. dot(ũ, ∇u_k[0]))
-        # -----------------------------------------------------------------
-        if isinstance(a_node, (VectorTrialFunction, VectorTestFunction)) \
-        and (isinstance(b_val, np.ndarray) and b_val.ndim == 1):
-            print(f'@'*50)
-            return self._weight_vector_basis(a_val, b_val)
-
-        def _is_component_diagonal(node):
-            return (isinstance(node, Dot)
-                    and isinstance(node.a, ( Constant))
-                    and isinstance(node.b, Grad))
-
-        # -----------------------------------------------------------------
-        # 3. Constant / VectorFunction  ⋅  Grad(scalar basis)  (already ok)
-        # -----------------------------------------------------------------
-        if isinstance(a_node, (VectorFunction, Constant)) and isinstance(b_node, Grad):
-            vec_val = a_val                      # (2,)
-            grad_op = b_val                      # (n_basis, 2) *or* (2,)
-            if grad_op.ndim == 2:                # (n_basis,2) @ (2,)  → (n_basis,)
-                print(f"Inside (grad_op @ vec_val)(expected shape:(n_basis,2) @ (2,)  → (n_basis,)): a_node: {a_node}, a_val.shape: {a_val.shape}; , b_node: {b_node}, b_val.shape: {b_val.shape}")
-                return grad_op @ vec_val
-            if grad_op.ndim == 1:                # (2,)·(2,) → scalar
-                print(f"@"*50)
+        if isinstance(b_node, (VTf, VTe)) and (isinstance(a_val, np.ndarray) and a_val.ndim == 1):
+            res = self._weight_vector_basis(b_val, a_val)
+            logger.debug("num‑vec · vector‑basis  →  %s", res.shape)
+            return res
+        
+        # ---------------------------------------------------------------------
+        # 3. Constant / VectorFunction  ·  Grad(scalar basis)  -----------------
+        # ---------------------------------------------------------------------
+        if isinstance(a_node, (VF, CST)) and isinstance(b_node, GR):
+            vec_val = a_val  # (gdim,)
+            grad_op = b_val  # (n_bs, gdim)  *or*  (gdim,)
+            if grad_op.ndim == 2:                           # (n_bs, gdim)·(gdim,) → (n_bs,)
+                res = grad_op @ vec_val
+                logger.debug("β·∇φ  →  %s", res.shape)
+                return res
+            if grad_op.ndim == 1:                           # point‑wise dot → scalar
                 return float(np.dot(grad_op, vec_val))
-            if grad_op.ndim == 3:                # (n_comp, n_bs, gdim) @ (gdim,) → (n_comp, n_bs)
-                print(f"my branch"*50)
-                n_comp = grad_op.shape[0]  # 2 in 2D
-                n_bs   = grad_op.shape[1]        # 9 for Q2
-                if len(vec_val) == 2 and vec_val.ndim == 1:
-                    temp = []
-                    for i in range(n_comp):
-                        temp.append(grad_op[i,:,0] * vec_val[0]+ grad_op[i,:,1] * vec_val[1])
-                    return (np.array(temp)).T  # (n_bs * n_comp,) 9, 2
-                    block = np.outer(temp[0], temp[1])  # (9, 9)
-
-        if   _is_component_diagonal(a_node):
-            print("Inside _is_component_diagonal(a_node)")
-            print(f"a_val.shape: {a_val.shape}, b_val.shape: {b_val.shape}")
-            n_comp = a_val.shape[1]  # 2 in 2-D, 3 in 3-D
+        
+        # ---------------------------------------------------------------------
+        # 4. (n_bs , n_comp) · stacked‑vector‑basis  ---------------------------
+        # ---------------------------------------------------------------------
+        if a_val.ndim == 2 and isinstance(b_node, (VTf, VTe)):
+            n_comp = len(b_node.components)
             n_bs   = a_val.shape[0]
-            test_by_comp = self._split_stacked(b_val, n_comp)   # (2,9)
-            # a_val is 9 x2 first col 1: \partial_x u1 + \partial_y u1
-            temp_a = a_val[:,0]
-            temp_b = test_by_comp[0,:]
-            block1 = np.outer(temp_a, temp_b)  # (9, 9)
-            block2 = np.outer(test_by_comp[1,:], a_val[:, 1])  # (9, 9)
-            mat = np.zeros((n_comp*n_bs,  n_comp * n_bs))
-            for i in range(n_comp):
-                r = slice(i*n_bs, (i+1)*n_bs)
-                c = slice(i*n_bs, (i+1)*n_bs)
-                if i == 0:
-                    mat[r, c] = block1
-                else:
-                    mat[r, c] = block2
-            return mat
+            test_by_comp = self._split_stacked(b_val, n_comp)  # (n_comp , n_bs)
 
-        # --------------------------------------------------------------------
-        # NEW:  (n_bs , n_comp)  ·  stacked-vector-basis  →  (n_bs,)
-        #       e.g. dot( dot(u_k, grad(u)) , v )
-        # --------------------------------------------------------------------
-        if (
-            a_val.ndim == 2                                    # (n_bs , n_comp)
-            and isinstance(b_node, (VectorTestFunction, VectorTrialFunction))
-        ):
-            print(f"#"*50)
-            print(f"a_node: {a_node}, a_val.shape: {a_val.shape}; , b_node: {b_node}, b_val.shape: {b_val.shape}")
-            
-            n_comp = len(b_node.components)                    # 2 in 2-D, 3 in 3-D
-            n_bs   = a_val.shape[0]                            # 9 for Q2
-            print(f"Before splitting: test_by_comp.shape: {a_val.shape}, n_comp: {n_comp}, n_bs: {n_bs}")
-            test_by_comp = self._split_stacked(b_val, n_comp)       # (n_comp , n_bs)
-            print(f"After splitting: expected(2,9) test_by_comp.shape: {test_by_comp.shape}, a_val.shape: {a_val.shape}")
             if a_val.shape[0] == 2 and a_val.shape[1] == 2:
                 # a_val is 2 x 2, test_by_comp is 2 x 9 case when we do grad(u_k) \cdot u_trial
+                logger.debug(f"grad(u_k) \cdot u_trial  →  (a.shape:{a_val.shape}, b.shape: {test_by_comp.shape})" )
                 n_bs = test_by_comp.shape[1]  # 9 for Q2
                 res = a_val @ test_by_comp # 2 x 9
                 return res.reshape(-1)  # (18,)
-            # branch when we have grad(u_trial) \cdot u_k
-            mat = np.zeros((n_comp*n_bs, n_comp*n_bs))
-            for i in range(n_comp):
-                block = np.outer(test_by_comp[i,:], a_val[:, i])   # (9,9)
-                r = slice(i*n_bs, (i+1)*n_bs)
-                mat[r, r] = block                                # ← diagonal
+
+            if _is_component_diagonal(a_node):
+                # Only diagonal (i,i) blocks are present.
+                mat = np.zeros((n_comp*n_bs, n_comp*n_bs))
+                for i in range(n_comp):
+                    blk = np.outer(test_by_comp[i], a_val[:, i])
+                    r = slice(i*n_bs, (i+1)*n_bs)
+                    mat[r, r] = blk
+                logger.debug("component‑diag block  →  %s", mat.shape)
+                return mat
+
+            # Full component coupling.
+            blocks = np.einsum('in,km->iknm', test_by_comp, a_val.T)  # (i,k,n,m)
+            mat = blocks.reshape(n_comp*n_bs, n_comp*n_bs)
+            logger.debug("full block matrix  →  %s", mat.shape)
             return mat
-            
-            # for i in range(n_comp):                  # test-component index
-            #     for k in range(n_comp):              # trial-component index
-            #         block = np.outer(test_by_comp[i], a_val[:, k])   # (9, 9)
-            #         r = slice(i*n_bs, (i+1)*n_bs)    # rows of comp i
-            #         c = slice(k*n_bs, (k+1)*n_bs)    # cols of comp k
-            #         mat[r, c] = block
-            # print(f'#'*50)
-            # return mat  
-        if (
-            isinstance(a_node, (VectorTrialFunction, VectorTestFunction))
-            and isinstance(b_node, Grad)
-            and isinstance(b_val, np.ndarray) and b_val.ndim == 2
-        ):
-            print(f"a_node: {a_node}, a_val.shape: {a_val.shape}; , b_node: {b_node}, b_val.shape: {b_val.shape}")
-            n_comp = len(a_node.components)
-            basis_by_comp = self._split_stacked(a_val, n_comp)        # (n_comp , n_bs)
-            # transpose so rows = basis functions
-            print(f"basis_by_comp.shape:{basis_by_comp.shape}, b_val.shape: {b_val.shape}")
-            # res = (b_val.T @ basis_by_comp ).T  
-            #                       # (n_bs , gdim)
-            dd = np.outer(basis_by_comp, b_val)
-            print(dd.shape)
-            res = np.einsum('jn,kj->nk', basis_by_comp, b_val)
-            return res.reshape(-1)                                           # (18 , 18)
         
-        if (
-            isinstance(b_node, (VectorTrialFunction, VectorTestFunction))
-            and isinstance(a_node, Grad)
-            and isinstance(a_val, np.ndarray) and a_val.ndim == 2
-        ):
-            print('*'*50)
-            n_comp = len(b_node.components)
-            basis_by_comp = self._split_stacked(b_val, n_comp)        # (n_comp , n_bs)
-            res = np.einsum('jn,kj->nk', basis_by_comp, a_val)        # (n_bs , n_comp)
-            return res
+        # ---------------------------------------------------------------------
+        # 5. Scalar basis × scalar basis (simple outer product) ----------------
+        # ---------------------------------------------------------------------
+        if (isinstance(a_node, TF) and isinstance(b_node, TeF)) or \
+        (isinstance(a_node, TeF) and isinstance(b_node, TF)):
+            test_basis  = b_val if isinstance(b_node, TeF) else a_val
+            trial_basis = a_val if isinstance(a_node, TF)  else b_val
+            if self.ctx['is_rhs']:
+                return test_basis * trial_basis
+            return np.outer(test_basis, trial_basis)
         
-        
-        if isinstance(b_node, (VectorTrialFunction, VectorTestFunction)) \
-        and (isinstance(a_val, np.ndarray) and a_val.ndim == 1):
-            print(f'x'*50)
-            print(f"Inside (self._weight_vector_basis(b_val, a_val)): a_node: {a_node}, a_val.shape: {a_val.shape}; , b_node: {b_node}, b_val.shape: {b_val.shape}")
-            return self._weight_vector_basis(b_val, a_val)
-        # -----------------------------------------------------------------
-        # 4. purely numerical dot products (data-data) ---------------------
-        # -----------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # 6. purely numerical dot product -------------------------------------
+        # ---------------------------------------------------------------------
         if isinstance(a_val, np.ndarray) and isinstance(b_val, np.ndarray):
-            print('*'*50)
             if a_val.ndim == 1 and b_val.ndim == 1 and a_val.shape == b_val.shape:
-                return np.dot(a_val, b_val)
+                return float(np.dot(a_val, b_val))
             if a_val.ndim == 2 and b_val.ndim == 1 and a_val.shape[1] == b_val.shape[0]:
                 return a_val @ b_val
             if a_val.ndim == 1 and b_val.ndim == 2 and a_val.shape[0] == b_val.shape[0]:
                 return a_val @ b_val
-        
+                
         # -----------------------------------------------------------------
         # anything else is still unsupported ------------------------------
         # -----------------------------------------------------------------

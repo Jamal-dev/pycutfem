@@ -1,5 +1,7 @@
 import numpy as np
 from typing import Callable
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
 
 
 class Expression:
@@ -146,9 +148,70 @@ class Function(Expression):
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name='{self.name}', field='{self.field_name}')"
-    def is_vector_component_basis(self):
-        """Componenet of a Vector is also scalar"""
-        return False
+    def plot(self, **kwargs):
+        """ Function.plot(**kwargs) -> None
+        Creates a 2D filled contour plot of the scalar function.
+
+        Requires matplotlib to be installed.
+
+        Args:
+            **kwargs: Additional keyword arguments passed to tricontourf,
+                      e.g., cmap='viridis', levels=20.
+        """
+
+
+        if self._dof_handler is None:
+            raise RuntimeError("Cannot plot a function without an associated DofHandler.")
+
+        mesh = self._dof_handler.fe_map.get(self.field_name)
+        if mesh is None:
+            raise RuntimeError(f"Field '{self.field_name}' not found in DofHandler's fe_map.")
+
+        x = mesh.nodes_x_y_pos[:, 0]
+        y = mesh.nodes_x_y_pos[:, 1]
+        
+        # The nodal_values property correctly delegates to the parent if needed.
+        z = self.nodal_values
+
+        if len(z) != len(x):
+             raise ValueError(
+                 f"Mismatch between number of nodal values ({len(z)}) and coordinates ({len(x)}). "
+                 "Ensure the function's DoF handler corresponds to the correct mesh."
+             )
+
+        # Use element corner nodes for triangulation. This is suitable for visualizing
+        # both P1/Q1 and higher-order solutions at the DoF nodes.
+        if not hasattr(mesh, 'corner_connectivity'):
+            raise AttributeError("Mesh object must have 'corner_connectivity' for plotting.")
+            
+        conn = np.asarray(mesh.corner_connectivity)
+        if conn.shape[1] == 3: # Mesh is already triangles
+            triangles = conn
+        elif conn.shape[1] == 4: # Mesh is quadrilaterals, split into triangles
+            # For each quad [n0, n1, n2, n3], create two triangles:
+            # [n0, n1, n3] and [n1, n2, n3]
+            tri1 = conn[:, [0, 1, 3]]
+            tri2 = conn[:, [1, 2, 3]]
+            triangles = np.vstack((tri1, tri2))
+        else:
+            raise ValueError(f"Unsupported element connectivity shape for plotting: {conn.shape}")
+            
+        triangulation = tri.Triangulation(x, y, triangles=triangles)
+
+        # --- Plotting ---
+        fig, ax = plt.subplots()
+        title = kwargs.pop('title', f'Scalar Field: {self.name}')
+        plot_kwargs = {'cmap': 'viridis', 'levels': 15}
+        plot_kwargs.update(kwargs)
+        
+        contour = ax.tricontourf(triangulation, z, **plot_kwargs)
+        fig.colorbar(contour, ax=ax, label='Value')
+        ax.set_title(title)
+        ax.set_xlabel('X coordinate')
+        ax.set_ylabel('Y coordinate')
+        ax.set_aspect('equal', adjustable='box')
+        ax.tricontour(triangulation, z, colors='k', linewidths=0.5, levels=plot_kwargs['levels'])
+        plt.show()
 
 # In your ufl/expressions.py file
 
@@ -197,9 +260,110 @@ class VectorFunction(Expression):
     def __iter__(self):
         """Allows iterating over components."""
         return iter(self.components)
-    def is_vector_component_basis(self):
-        """Returns True if this VectorFunction is a component of a vector function."""
-        return True
+    def plot(self, field: str = None, kind: str = 'contour', **kwargs):
+        """
+        Visualizes the vector function.
+
+        Requires matplotlib to be installed.
+
+        Args:
+            field (str, optional): The name of a specific component to plot
+                (e.g., 'ux'). If None, the behavior is determined by 'kind'.
+                Defaults to None.
+            kind (str, optional): The type of plot. Can be 'contour' to show
+                scalar components or 'quiver' to show vector arrows.
+                This is ignored if 'field' is specified. Defaults to 'contour'.
+            **kwargs: Additional keyword arguments passed to the underlying
+                      matplotlib plot function (e.g., title='My Plot').
+        """
+        if field is not None:
+            found = False
+            for comp in self.components:
+                if comp.field_name == field:
+                    print(f"Plotting component: '{field}'")
+                    comp.plot(**kwargs)
+                    found = True
+                    break
+            if not found:
+                raise ValueError(f"Field '{field}' not found in VectorFunction components: {self.field_names}")
+            return
+
+        if kind == 'contour':
+            print(f"Plotting all components of '{self.name}' as separate contour plots...")
+            for i, comp in enumerate(self.components):
+                # Pass a default title for each component if none is provided
+                comp_title = kwargs.get('title', f'Component: {comp.name}')
+                # Create a copy of kwargs to avoid modifying it in the loop
+                comp_kwargs = kwargs.copy()
+                comp_kwargs['title'] = comp_title
+                comp.plot(**comp_kwargs)
+        elif kind == 'quiver':
+            self._plot_quiver(**kwargs)
+        else:
+            raise ValueError(f"Unsupported plot kind '{kind}'. Choose 'contour' or 'quiver'.")
+
+    def _plot_quiver(self, **kwargs):
+        """Helper method to generate a quiver plot of the vector field."""
+
+        if self._dof_handler is None:
+            raise RuntimeError("Cannot plot a function without an associated DofHandler.")
+        if len(self.field_names) != 2:
+            raise NotImplementedError("Quiver plot is currently only supported for 2D vectors.")
+
+        mesh_u = self._dof_handler.fe_map.get(self.field_names[0])
+        mesh_v = self._dof_handler.fe_map.get(self.field_names[1])
+
+        if mesh_u is not mesh_v:
+            # This is a complex case (e.g., staggered grids). For now, we don't support it.
+            raise NotImplementedError("Quiver plot for components on different meshes is not supported.")
+        
+        mesh = mesh_u
+        x = mesh.nodes_x_y_pos[:, 0]
+        y = mesh.nodes_x_y_pos[:, 1]
+        
+        # The .nodal_values property on the components correctly gets their data.
+        u_vals = self.components[0].nodal_values
+        v_vals = self.components[1].nodal_values
+        
+        if len(u_vals) != len(x) or len(v_vals) != len(x):
+            raise ValueError("Mismatch between number of nodal values and coordinates for quiver plot.")
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+
+        title = kwargs.pop('title', f'Vector Field: {self.name}')
+        
+        plot_kwargs = {'color': 'k', 'angles': 'xy', 'scale_units': 'xy', 'scale': None}
+        plot_kwargs.update(kwargs)
+        
+        magnitude = np.sqrt(u_vals**2 + v_vals**2)
+        
+        # Add a colored background showing the magnitude of the velocity
+        if hasattr(mesh, 'corner_connectivity'):
+            conn = np.asarray(mesh.corner_connectivity)
+            if conn.shape[1] == 3:
+                triangles = conn
+            elif conn.shape[1] == 4:
+                tri1 = conn[:, [0, 1, 3]]
+                tri2 = conn[:, [1, 2, 3]]
+                triangles = np.vstack((tri1, tri2))
+            else:
+                raise ValueError(f"Unsupported element connectivity shape for plotting: {conn.shape}")
+            
+            triangulation = tri.Triangulation(x, y, triangles=triangles)
+            ax.tricontourf(triangulation, magnitude, cmap='Blues', levels=15)
+
+        ax.quiver(x, y, u_vals, v_vals, **plot_kwargs)
+        
+        ax.set_title(title)
+        ax.set_xlabel('X coordinate')
+        ax.set_ylabel('Y coordinate')
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlim(x.min() - 0.1, x.max() + 0.1)
+        ax.set_ylim(y.min() - 0.1, y.max() + 0.1)
+        plt.show()
+
+    
+
 
 class NodalFunction(Expression):
     def __init__(self, field_name: str):

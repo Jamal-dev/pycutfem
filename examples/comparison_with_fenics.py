@@ -28,6 +28,11 @@ from pycutfem.fem.reference import get_reference
 # Imports for mapping and matrix conversion
 from scipy.optimize import linear_sum_assignment
 from scipy.sparse import csr_matrix
+import logging
+logging.basicConfig(
+    level=logging.INFO,  # show debug messages
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 # Helper functions for coordinates
 def get_pycutfem_dof_coords(dof_handler: DofHandler, field: str) -> np.ndarray:
@@ -134,6 +139,7 @@ def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
     # u_n_data_pc = 2*np.ones(18)  # Use ones for simplicity
     # u_k_p_k_data_pc = np.random.rand(dof_handler_pc.total_dofs)
     u_n_data_pc = np.random.rand(18)
+    # u_k_p_k_data_pc[18:] = 0.0  # Ensure pressure DoFs are zero
     
     dofs_ux_pc = dof_handler_pc.get_field_slice('ux')
     dofs_uy_pc = dof_handler_pc.get_field_slice('uy')
@@ -144,8 +150,8 @@ def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
     pc['c'] = Constant([0.5,-0.2],dim=1)
     # 
     fx_u_k_array = fenicsx['u_k'].x.array
-    print(f"fx_u_k_array shape: {fx_u_k_array.shape}")
-    print(f"fx_u_k_array:{fx_u_k_array}")
+    # print(f"fx_u_k_array shape: {fx_u_k_array.shape}")
+    # print(f"fx_u_k_array:{fx_u_k_array}")
     for pc_dof, fx_dof in enumerate(P_map):
     #    print(f"Mapping pc_dof {pc_dof} to fx_dof {fx_dof}")
        fx_u_k_array[fx_dof] = u_k_p_k_data_pc[pc_dof]
@@ -162,7 +168,7 @@ def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
         fx_local_dof_in_V = fx_global_to_local_V[fx_global_dof]
         fx_u_n_array[fx_local_dof_in_V] = u_n_data_pc[i]
     
-    print(f"before mapping, fx_u_k_array: {fx_u_k_array}")
+    # print(f"before mapping, fx_u_k_array: {fx_u_k_array}")
     V, V_map = fenicsx['W'].sub(0).collapse()
     fx_global_to_local_V = np.argsort(V_map)
     pc_all_dofs = np.concatenate([dofs_ux_pc, dofs_uy_pc])
@@ -242,14 +248,96 @@ if __name__ == '__main__':
     advection_1_pc = ( dot(dot(grad(pc['du']), pc['u_k']), pc['v'])) * dx()
     c_pc = pc['c']
     c_fx = fenicsx['c']
-    # advection_1_pc = (pc['theta'] * pc['rho'] * 
-    #                   (
-    #                       dot(pc['u_k'], grad(pc['du'][0]))* pc['v'][0] +
-    #                       dot(pc['u_k'], grad(pc['du'][1]))* pc['v'][1] +
-    #                     dot(pc['u_k'], grad(pc['du'][0]))* pc['v'][1] +
-    #                         dot(pc['u_k'], grad(pc['du'][1])) * pc['v'][0]
-                          
-    #                       )) * dx()
+    jacobian_pc = (
+        # Time derivative term
+        pc['rho'] * dot(pc['du'], pc['v']) / pc['dt'] +
+        
+        # Convection terms (linearization of u ⋅ ∇u)
+        pc['theta'] * pc['rho'] * dot(dot(grad(pc['u_k']), pc['du']), pc['v']) +
+        pc['theta'] * pc['rho'] * dot(dot(grad(pc['du']), pc['u_k']), pc['v']) +
+
+        # Diffusion term
+        pc['theta'] * pc['mu'] * inner(grad(pc['du']), grad(pc['v'])) -
+        
+        # Pressure term (linearization of -p∇⋅v)
+        pc['dp'] * div(pc['v']) +
+        
+        # Continuity term
+        pc['q'] * div(pc['du'])
+    ) * dx()
+    residual_pc = (
+        # Time derivative
+        pc['rho'] * dot(pc['u_k'] - pc['u_n'], pc['v']) / pc['dt'] +
+
+        # Convection terms (implicit and explicit parts)
+        pc['theta'] * pc['rho'] * dot(dot(grad(pc['u_k']), pc['u_k']), pc['v']) +
+        (1.0 - pc['theta']) * pc['rho'] * dot(dot(grad(pc['u_n']), pc['u_n']), pc['v']) +
+
+        # Diffusion terms (implicit and explicit parts)
+        pc['theta'] * pc['mu'] * inner(grad(pc['u_k']), grad(pc['v'])) +
+        (1.0 - pc['theta']) * pc['mu'] * inner(grad(pc['u_n']), grad(pc['v'])) -
+        
+        # Pressure term
+        pc['p_k'] * div(pc['v']) -
+        
+        # Continuity term
+        pc['q'] * div(pc['u_k'])
+    ) * dx()
+
+
+    def create_fenics_ns_jacobian(deg):
+        """Creates the UFL form for the Navier-Stokes Jacobian using Trial/Test
+        functions from the mixed space W."""
+        # Define Trial and Test Functions on the *mixed space* W_fx
+        dup_fx, vq_fx = ufl.TrialFunction(W_fx), ufl.TestFunction(W_fx)
+        # Split them to get the velocity and pressure components
+        du_fx, dp_fx = ufl.split(dup_fx)
+        v_fx, q_fx = ufl.split(vq_fx)
+        
+        # Now, build the form using these correctly-defined components
+        return (
+            fenicsx['rho'] * ufl.dot(du_fx, v_fx) / fenicsx['dt'] +
+            fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(ufl.grad(u_k_fx), du_fx), v_fx) +
+            fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(ufl.grad(du_fx), u_k_fx), v_fx) +
+            fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du_fx), ufl.grad(v_fx)) -
+            dp_fx * ufl.div(v_fx) +
+            q_fx * ufl.div(du_fx)
+        ) * ufl.dx(metadata={'quadrature_degree': deg})
+
+    def create_fenics_ns_residual(deg):
+        """Creates the UFL form for the Navier-Stokes residual using a
+        TestFunction from the mixed space W."""
+        # Define a single TestFunction on the parent mixed space
+        vq_fx = ufl.TestFunction(W_fx)
+        
+        # Split it to get the velocity and pressure components
+        v_fx, q_fx = ufl.split(vq_fx)
+        
+        # Now, build the residual form using these correctly-defined test functions
+        # and the existing Function objects (u_k_fx, p_k_fx, u_n_fx)
+        return (
+            # Time derivative
+            fenicsx['rho'] * ufl.dot(u_k_fx - u_n_fx, v_fx) / fenicsx['dt'] +
+
+            # Convection terms (implicit and explicit parts)
+            fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(ufl.grad(u_k_fx), u_k_fx), v_fx) +
+            (1.0 - fenicsx['theta']) * fenicsx['rho'] * ufl.dot(ufl.dot(ufl.grad(u_n_fx), u_n_fx), v_fx) +
+
+            # Diffusion terms (implicit and explicit parts)
+            fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(u_k_fx), ufl.grad(v_fx)) +
+            (1.0 - fenicsx['theta']) * fenicsx['mu'] * ufl.inner(ufl.grad(u_n_fx), ufl.grad(v_fx)) -
+            
+            # Pressure term
+            p_k_fx * ufl.div(v_fx) -
+            
+            # Continuity term
+            q_fx * ufl.div(u_k_fx)
+        ) * ufl.dx(metadata={'quadrature_degree': deg})
+
+    vq_fx = ufl.TestFunction(W_fx)
+        
+    # Split it to get the velocity and pressure components
+    v_fx, q_fx = ufl.split(vq_fx)
     terms = {
         "LHS Mass":          {'pc': pc['rho'] * dot(pc['du'], pc['v']) / pc['dt'] * dx(),                                    'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(du, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
         "LHS Diffusion":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']), grad(pc['v'])) * dx(),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du), ufl.grad(v)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
@@ -260,7 +348,11 @@ if __name__ == '__main__':
         "RHS Time Derivative": {'pc': (pc['rho'] * dot(pc['u_k'] - pc['u_n'], pc['v']) / pc['dt']) * dx(),                       'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(u_k_fx - u_n_fx, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
         "RHS Advection":     {'pc': pc['theta'] * pc['rho'] * dot(dot(grad(pc['u_k']), pc['u_k']), pc['v']) * dx(),          'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(ufl.grad(u_k_fx),u_k_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
         "LHS Scalar Advection": {'pc': dot(grad(pc['dp']), pc['u_k']) * pc['q'] * dx(), 'f_lambda': lambda deg: ufl.dot(ufl.grad(dp), u_k_fx) * q * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
-        "LHS Vector Advection Constant": {'pc': dot(dot(grad(pc['du']), c_pc), pc['v']) * dx(), 'f_lambda': lambda deg: ufl.dot(ufl.dot(ufl.grad(du), c_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
+        "LHS Vector Advection Constant": {'pc': dot(dot(grad(pc['du']), c_pc), pc['v']) * dx(), 'f_lambda': lambda deg: ufl.dot(ufl.dot(ufl.grad(du), c_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
+        "Navier Stokes LHS": {'pc': jacobian_pc, 'f_lambda':  create_fenics_ns_jacobian, 'mat': True, 'deg': 5},
+        "Navier Stokes RHS": {'pc': residual_pc, 'f_lambda':  create_fenics_ns_residual, 'mat': False, 'deg': 5},
+        "RHS pressure term": {'pc': pc['p_k'] * div(pc['v']) * dx(), 'f_lambda': lambda deg: p_k_fx * ufl.div(v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
+        "RHS Continuity":    {'pc': pc['q'] * div(pc['u_k']) * dx(), 'f_lambda': lambda deg: q_fx * ufl.div(u_k_fx) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 6}
 
     }
 
