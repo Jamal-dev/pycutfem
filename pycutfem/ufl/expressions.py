@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Callable
+from typing import Callable, Dict, List, Optional, Union
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
 
@@ -89,38 +89,25 @@ class Function(Expression):
         self._component_index = component_index
         self.dim = 0 # always assuming scalar functions for now
 
-        # A Function ONLY manages data if it is a STANDALONE function.
         if self._parent_vector is None and self._dof_handler is not None:
-            # This is a data-carrying standalone function (e.g., 'beta' in a test)
-            self._my_global_dofs = self._dof_handler.get_field_slice(self.field_name)
-            self._global_dof_to_local_idx = {dof: i for i, dof in enumerate(self._my_global_dofs)}
-            self._nodal_values = np.zeros(len(self._my_global_dofs))
+            # --- stand‑alone data carrier -----------------------------------
+            self._g_dofs = np.asarray(self._dof_handler.get_field_slice(field_name), dtype=int)
+            self._g2l: Dict[int, int] = {gd: i for i, gd in enumerate(self._g_dofs)}
+            self._values = np.zeros_like(self._g_dofs, dtype=float)
         else:
-            # This is a symbolic function (Trial/Test) OR a component of a VectorFunction.
-            # It does not need to store its own data arrays.
-            self._my_global_dofs = []
-            self._global_dof_to_local_idx = {}
-            self._nodal_values = None
+            self._g_dofs = np.empty(0, dtype=int); self._values = None; self._g2l = {}
 
     @property
     def nodal_values(self):
-        """
-        Smart property: Delegates to the parent vector if this is a component,
-        otherwise returns its own data.
-        """
         if self._parent_vector is not None:
-            # Get all global dofs for this component's field
-            dofs = self._parent_vector._get_dofs_for_component(self._component_index)
-            return self._parent_vector.get_nodal_values(dofs)
-        return self._nodal_values
+            return self._parent_vector.nodal_values_component(self._component_index)
+        return self._values
 
     @nodal_values.setter
-    def nodal_values(self, values):
+    def nodal_values(self, v):
         if self._parent_vector is not None:
-            dofs = self._parent_vector._get_dofs_for_component(self._component_index)
-            self._parent_vector.set_nodal_values(dofs, values)
-        else:
-            self._nodal_values[:] = values
+            self._parent_vector.set_component_values(self._component_index, v); return
+        self._values[:] = v
 
     def set_values_from_function(self, func: Callable[[float, float], float]):
         """Populates nodal values by evaluating a function at each DoF's coordinate."""
@@ -130,21 +117,14 @@ class Function(Expression):
         self.set_nodal_values(global_dofs, values)
 
     def get_nodal_values(self, global_dofs: np.ndarray) -> np.ndarray:
-        """Gets values for a specific list of global DOFs from this function's data."""
         if self._parent_vector is not None:
             return self._parent_vector.get_nodal_values(global_dofs)
-        
-        local_indices = np.array([self._global_dof_to_local_idx[gd] for gd in global_dofs])
-        return self._nodal_values[local_indices]
+        return self._values[[self._g2l[d] for d in global_dofs]]
 
-    def set_nodal_values(self, global_dofs: np.ndarray, values: np.ndarray):
-        """Sets values for a specific list of global DOFs in this function's data."""
+    def set_nodal_values(self, global_dofs: np.ndarray, vals: np.ndarray):
         if self._parent_vector is not None:
-            self._parent_vector.set_nodal_values(global_dofs, values)
-            return
-            
-        local_indices = np.array([self._global_dof_to_local_idx[gd] for gd in global_dofs])
-        self._nodal_values[local_indices] = values
+            self._parent_vector.set_nodal_values(global_dofs, vals); return
+        self._values[[self._g2l[d] for d in global_dofs]] = vals
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name='{self.name}', field='{self.field_name}')"
@@ -217,38 +197,44 @@ class Function(Expression):
 
 class VectorFunction(Expression):
     def __init__(self, name: str, field_names: list[str], dof_handler: 'DofHandler'=None):
-        self.name = name
-        self.field_names = field_names
-        self._dof_handler = dof_handler
-        self.dim = 1 # always a vector function, this dim is a tensor dimension not the spatial dimension
-        
-        self._my_global_dofs = np.concatenate([dof_handler.get_field_slice(fn) for fn in field_names])
-        self._global_dof_to_local_idx = {dof: i for i, dof in enumerate(self._my_global_dofs)}
-        
-        self.nodal_values = np.zeros(len(self._my_global_dofs))
-        self.components = [
-            Function(f"{name}_{fn}", fn, dof_handler, parent_vector=self, component_index=i)
-            for i, fn in enumerate(self.field_names)
-        ]
+        super().__init__()
+        self.name = name; self.field_names = field_names; self._dh = dof_handler
+        self.dim = 1
+        self._g_dofs = np.concatenate([dof_handler.get_field_slice(f) for f in field_names])
+        self._g2l = {gd: i for i, gd in enumerate(self._g_dofs)}
+        self.nodal_values = np.zeros(len(self._g_dofs), dtype=float)
+        self.components = [Function(f"{name}_{f}", f, dof_handler,
+                                    parent_vector=self, component_index=i)
+                           for i, f in enumerate(field_names)]
 
-    def _get_dofs_for_component(self, component_index: int) -> np.ndarray:
-        field_name = self.field_names[component_index]
-        return self._dof_handler.get_field_dofs_on_nodes(field_name)
+    
+    def nodal_values_component(self, idx: int):
+        s = self._dh.get_field_slice(self.field_names[idx])
+        return self.nodal_values[[self._g2l[d] for d in s]]
+    def set_component_values(self, idx: int, vals):
+        s = self._dh.get_field_slice(self.field_names[idx])
+        self.nodal_values[[self._g2l[d] for d in s]] = vals
+
+    # ------------------------------------------------------------------
+    def _dofs_for_component(self, idx: int) -> np.ndarray:
+        return np.asarray(self._dh.get_field_slice(self.field_names[idx]), dtype=int)
+
+    def get_nodal_values(self, global_dofs: np.ndarray) -> np.ndarray:
+        return self.nodal_values[[self._g2l[d] for d in global_dofs]]
+
+    def set_nodal_values(self, global_dofs: np.ndarray, vals: np.ndarray):
+        self.nodal_values[[self._g2l[d] for d in global_dofs]] = vals
+
+    
+    
 
     def set_values_from_function(self, func: Callable[[float, float], np.ndarray]):
         for i, field_name in enumerate(self.field_names):
-            global_dofs = self._dof_handler.get_field_dofs_on_nodes(field_name)
-            coords = self._dof_handler.get_dof_coords(field_name)
+            global_dofs = self._dh.get_field_dofs_on_nodes(field_name)
+            coords = self._dh.get_dof_coords(field_name)
             values = np.apply_along_axis(lambda c: func(c[0], c[1])[i], 1, coords).ravel()
             self.set_nodal_values(global_dofs, values)
 
-    def get_nodal_values(self, global_dofs: np.ndarray) -> np.ndarray:
-        local_indices = np.array([self._global_dof_to_local_idx[gd] for gd in global_dofs])
-        return self.nodal_values[local_indices]
-
-    def set_nodal_values(self, global_dofs: np.ndarray, values: np.ndarray):
-        local_indices = np.array([self._global_dof_to_local_idx[gd] for gd in global_dofs])
-        self.nodal_values[local_indices] = values
 
     def __repr__(self):
         return f"VectorFunction(name='{self.name}', fields={self.field_names})"
@@ -413,6 +399,7 @@ class Constant(Expression):
 class VectorTrialFunction(Expression):
     def __init__(self, space, dof_handler: 'DofHandler'=None): # space: FunctionSpace
         self.space = space
+        self.field_names = space.field_names
         self.components = [
             TrialFunction(name=f"{space.name}_{fn}",field_name = fn, dof_handler=dof_handler, 
                           parent_vector=self, 
@@ -429,6 +416,7 @@ class VectorTrialFunction(Expression):
 class VectorTestFunction(Expression):
     def __init__(self, space, dof_handler=None): # space: FunctionSpace
         self.space = space
+        self.field_names = space.field_names
         self.components = [
             TestFunction(name=f"{space.name}_{fn}", 
                         field_name= fn,
