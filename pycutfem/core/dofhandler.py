@@ -34,7 +34,16 @@ class DofHandler:
         self.dof_map: Dict[str, Dict] = {f: {} for f in self.field_names}
         self.total_dofs = 0
         (self._build_maps_cg if method == "cg" else self._build_maps_dg)()
+        self.elem_permutation: dict[str, np.ndarray] = {}
+        self._build_permutations()
 
+    def get_n_local_basis_element(self, field: str) -> int:
+        """Return the number of local basis functions per element for the given field.
+           For Q2 element and if we put ux then we get 9 local basis functions."""
+        if field not in self.field_names:
+            raise ValueError(f"Field '{field}' not found in DofHandler")
+        mesh = self.fe_map[field]
+        return mesh.get_n_local_basis(mesh.elements_list[0].id)  # Assuming all elements have the same number of local basis functions
     # ------------------------------------------------------------------
     #  DOF numbering builders
     # ------------------------------------------------------------------
@@ -65,6 +74,32 @@ class DofHandler:
             self.dof_map[fld] = per_node
             self.field_num_dofs[fld] = field_dofs
         self.total_dofs = offset
+    
+    def _build_permutations(self) -> None:
+        """
+        For every field build a 1-D array `perm` such that
+            nodal_reference = nodal_mesh[perm]
+        holds on **all** elements of that field.
+        The rule is purely geometric → completely robust to global
+        numbering or DG/CG choices.
+        """
+        for fld, mesh in self.fe_map.items():
+            elem = mesh.elements_list[0]               # one element is enough
+            ids   = np.asarray(elem.nodes)
+            xy    = mesh.nodes_x_y_pos[ids]            # (n_loc,2)
+
+            if mesh.element_type == "quad":
+                # Row-major on (η, ξ):  first by y (bottom→top) then by x
+                perm = np.lexsort((xy[:, 0], xy[:, 1]))
+            elif mesh.element_type == "tri":
+                # Counter-clockwise angle around centroid (works for any Pₖ)
+                cx, cy = xy.mean(axis=0)
+                angles = np.arctan2(xy[:, 1] - cy, xy[:, 0] - cx)
+                perm = np.argsort(angles)
+            else:
+                raise ValueError(f"Unsupported element type '{mesh.element_type}'")
+
+            self.elem_permutation[fld] = perm.astype(int)
 
     # ------------------------------------------------------------------
     #  Dirichlet helpers

@@ -101,9 +101,11 @@ def create_true_dof_map(dof_handler_pc, W_fenicsx):
     pc_coords = {f: get_pycutfem_dof_coords(dof_handler_pc, f) for f in ['ux', 'uy', 'p']}
     pc_dofs = {f: dof_handler_pc.get_field_slice(f) for f in ['ux', 'uy', 'p']}
     P = np.zeros(dof_handler_pc.total_dofs, dtype=int)
-    coord_map_q2 = one_to_one_map_coords(pc_coords['ux'], fx_coords['ux'])
-    P[pc_dofs['ux']] = fx_dofs['ux'][coord_map_q2]
-    P[pc_dofs['uy']] = fx_dofs['uy'][coord_map_q2]
+    print(f"fx_dofs: {fx_dofs}")
+    coord_map_q2_ux = one_to_one_map_coords(pc_coords['ux'], fx_coords['ux'])
+    coord_map_q2_uy = one_to_one_map_coords(pc_coords['uy'], fx_coords['uy'])
+    P[pc_dofs['ux']] = fx_dofs['ux'][coord_map_q2_ux]
+    P[pc_dofs['uy']] = fx_dofs['uy'][coord_map_q2_uy]
     coord_map_q1 = one_to_one_map_coords(pc_coords['p'], fx_coords['p'])
     P[pc_dofs['p']] = fx_dofs['p'][coord_map_q1]
     print("True DoF map discovered successfully.")
@@ -116,30 +118,41 @@ def setup_problems():
     mesh_q1 = Mesh(nodes=nodes_q1, element_connectivity=elems_q1, elements_corner_nodes=corners_q1, element_type="quad", poly_order=1)
     fe_map_pc = {'ux': mesh_q2, 'uy': mesh_q2, 'p': mesh_q1}
     dof_handler_pc = DofHandler(fe_map_pc, method='cg')
-    pc = {'du': VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy'])), 'dp': TrialFunction(FunctionSpace("pressure", ['p'])), 'v': VectorTestFunction(FunctionSpace("velocity", ['ux', 'uy'])), 'q': TestFunction(FunctionSpace("pressure", ['p'])), 'u_k': VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler_pc), 'p_k': Function(name="p_k", field_name='p', dof_handler=dof_handler_pc), 'u_n': VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handler_pc), 'rho': Constant(1.0), 'dt': Constant(0.1), 'theta': Constant(0.5), 'mu': Constant(1.0e-2)}
+    pc = {'du': VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy'])), 'dp': TrialFunction(FunctionSpace("pressure", ['p'])), 'v': VectorTestFunction(FunctionSpace("velocity", ['ux', 'uy'])), 'q': TestFunction(FunctionSpace("pressure", ['p'])), 'u_k': VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler_pc), 
+          'p_k': Function(name="p_k", field_name='p', dof_handler=dof_handler_pc), 
+          'u_n': VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handler_pc),
+          'p_n': Function(name="p_n", field_name='p', dof_handler=dof_handler_pc), 
+            'rho': Constant(1.0), 
+            'dt': Constant(0.1), 
+            'theta': Constant(0.5), 
+            'mu': Constant(1.0e-2)}
     
     mesh_fx = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 1, 1, dolfinx.mesh.CellType.quadrilateral)
     gdim = mesh_fx.geometry.dim
     P2_el = basix.ufl.element("Lagrange", 'quadrilateral', 2, shape=(gdim,))
     P1_el = basix.ufl.element("Lagrange", 'quadrilateral', 1)
     W_el = mixed_element([P2_el, P1_el])
+    # W_el = mixed_element([P2_el,P2_el, P1_el]) # ux, uy, p
     W = dolfinx.fem.functionspace(mesh_fx, W_el)
     fenicsx = {'W': W, 'rho': dolfinx.fem.Constant(mesh_fx, 1.0), 'dt': dolfinx.fem.Constant(mesh_fx, 0.1), 'theta': dolfinx.fem.Constant(mesh_fx, 0.5), 'mu': dolfinx.fem.Constant(mesh_fx, 1.0e-2)}
-    V, _ = W.sub(0).collapse()
-    fenicsx['u_n'] = dolfinx.fem.Function(V, name="u_n")
-    fenicsx['u_k'] = dolfinx.fem.Function(W, name="u_k")
-    fenicsx['c'] = dolfinx.fem.Constant(mesh_fx, (0.5, -0.2))
+    # V, Vele = W.sub(0).collapse()
+    # Q, Qele = W.sub(1).collapse()
+    # print(f"Vele: {Vele}, Qele: {Qele}")
+
+    fenicsx['w_k'] = dolfinx.fem.Function(W, name="w_k")   # full mixed solution (velocity + pressure)
+    fenicsx['c']    = dolfinx.fem.Constant(mesh_fx, (0.5, -0.2))  # a constant vector field
+    fenicsx['w_n'] = dolfinx.fem.Function(W, name="w_n")   # previous mixed solution (velocity + pressure)
+
     
     return pc, dof_handler_pc, fenicsx
 
 def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
     print("Initializing and synchronizing function data...")
     np.random.seed(1234)
-    u_k_p_k_data_pc = np.ones(dof_handler_pc.total_dofs)  # Use ones for simplicity
-    # u_n_data_pc = 2*np.ones(18)  # Use ones for simplicity
-    # u_k_p_k_data_pc = np.random.rand(dof_handler_pc.total_dofs)
-    u_n_data_pc = np.random.rand(18)
-    # u_k_p_k_data_pc[18:] = 0.0  # Ensure pressure DoFs are zero
+    # u_k_p_k_data_pc = 100*np.ones(dof_handler_pc.total_dofs)  # Use ones for simplicity
+    # u_n_p_n_data_pc = np.ones(dof_handler_pc.total_dofs)  # Use ones for simplicity
+    u_k_p_k_data_pc = np.random.rand(dof_handler_pc.total_dofs)
+    u_n_p_n_data_pc = np.random.rand(dof_handler_pc.total_dofs)
     
     dofs_ux_pc = dof_handler_pc.get_field_slice('ux')
     dofs_uy_pc = dof_handler_pc.get_field_slice('uy')
@@ -147,36 +160,16 @@ def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
     pc['u_k'].nodal_values[dofs_ux_pc] = u_k_p_k_data_pc[dofs_ux_pc]
     pc['u_k'].nodal_values[dofs_uy_pc] = u_k_p_k_data_pc[dofs_uy_pc]
     pc['p_k'].nodal_values[:] = u_k_p_k_data_pc[dofs_p_pc]
+    pc['u_n'].nodal_values[dofs_ux_pc] = u_n_p_n_data_pc[dofs_ux_pc]
+    pc['u_n'].nodal_values[dofs_uy_pc] = u_n_p_n_data_pc[dofs_uy_pc]
+    pc['p_n'].nodal_values[:] = u_n_p_n_data_pc[dofs_p_pc]
     pc['c'] = Constant([0.5,-0.2],dim=1)
     # 
-    fx_u_k_array = fenicsx['u_k'].x.array
-    # print(f"fx_u_k_array shape: {fx_u_k_array.shape}")
-    # print(f"fx_u_k_array:{fx_u_k_array}")
-    for pc_dof, fx_dof in enumerate(P_map):
-    #    print(f"Mapping pc_dof {pc_dof} to fx_dof {fx_dof}")
-       fx_u_k_array[fx_dof] = u_k_p_k_data_pc[pc_dof]
-    
-    pc['u_n'].nodal_values[:] = u_n_data_pc
-    
-    fx_u_n_array = fenicsx['u_n'].x.array
+    fenicsx['w_k'].x.array[P_map] = u_k_p_k_data_pc
+    fenicsx['w_n'].x.array[P_map] = u_n_p_n_data_pc
 
-    V, V_map = fenicsx['W'].sub(0).collapse()
-    fx_global_to_local_V = np.argsort(V_map)
-    pc_vel_dofs = np.concatenate([dofs_ux_pc, dofs_uy_pc])
-    for i, pc_dof in enumerate(pc_vel_dofs):
-        fx_global_dof = P_map[pc_dof]
-        fx_local_dof_in_V = fx_global_to_local_V[fx_global_dof]
-        fx_u_n_array[fx_local_dof_in_V] = u_n_data_pc[i]
+
     
-    # print(f"before mapping, fx_u_k_array: {fx_u_k_array}")
-    V, V_map = fenicsx['W'].sub(0).collapse()
-    fx_global_to_local_V = np.argsort(V_map)
-    pc_all_dofs = np.concatenate([dofs_ux_pc, dofs_uy_pc])
-    for i, pc_dof in enumerate(pc_all_dofs):
-        fx_global_dof = P_map[pc_dof]
-        fx_local_dof_in_V = fx_global_to_local_V[fx_global_dof]
-        fx_u_k_array[fx_local_dof_in_V] = u_k_p_k_data_pc[i]
-    print(f"after mapping, fx_u_k_array: {fx_u_k_array}")
 
 def compare_term(term_name, J_pc, R_pc, J_fx, R_fx, P_map, dof_handler_pc, W_fenicsx):
     print("\n" + f"--- Comparing Term: {term_name} ---")
@@ -237,9 +230,9 @@ if __name__ == '__main__':
     initialize_functions(pc, fenicsx, dof_handler_pc, P_map)
 
     W_fx = fenicsx['W']
-    u_k_fx, p_k_fx = ufl.split(fenicsx['u_k']) 
-    u_n_fx = fenicsx['u_n']
-    
+    u_k_fx, p_k_fx = ufl.split(fenicsx['w_k']  )
+    u_n_fx, p_n_fx = ufl.split(fenicsx['w_n']  )
+
     V_subspace = W_fx.sub(0)
     Q_subspace = W_fx.sub(1)
     du, v = ufl.TrialFunction(V_subspace), ufl.TestFunction(V_subspace)
@@ -303,6 +296,25 @@ if __name__ == '__main__':
             dp_fx * ufl.div(v_fx) +
             q_fx * ufl.div(du_fx)
         ) * ufl.dx(metadata={'quadrature_degree': deg})
+    
+    residual_pc = (
+        # Time derivative
+        pc['rho'] * dot(pc['u_k'] - pc['u_n'], pc['v']) / pc['dt'] +
+
+        # Convection terms (implicit and explicit parts)
+        pc['theta'] * pc['rho'] * dot(dot(grad(pc['u_k']), pc['u_k']), pc['v']) +
+        (1.0 - pc['theta']) * pc['rho'] * dot(dot(grad(pc['u_n']), pc['u_n']), pc['v']) +
+
+        # Diffusion terms (implicit and explicit parts)
+        pc['theta'] * pc['mu'] * inner(grad(pc['u_k']), grad(pc['v'])) +
+        (1.0 - pc['theta']) * pc['mu'] * inner(grad(pc['u_n']), grad(pc['v'])) -
+        
+        # Pressure term
+        pc['p_k'] * div(pc['v']) -
+        
+        # Continuity term
+        pc['q'] * div(pc['u_k'])
+    ) * dx()
 
     def create_fenics_ns_residual(deg):
         """Creates the UFL form for the Navier-Stokes residual using a
@@ -351,6 +363,8 @@ if __name__ == '__main__':
         "LHS Vector Advection Constant": {'pc': dot(dot(grad(pc['du']), c_pc), pc['v']) * dx(), 'f_lambda': lambda deg: ufl.dot(ufl.dot(ufl.grad(du), c_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
         "Navier Stokes LHS": {'pc': jacobian_pc, 'f_lambda':  create_fenics_ns_jacobian, 'mat': True, 'deg': 5},
         "Navier Stokes RHS": {'pc': residual_pc, 'f_lambda':  create_fenics_ns_residual, 'mat': False, 'deg': 5},
+        "RHS Advection 2": {'pc': (1.0 - pc['theta']) * pc['rho'] * dot(dot(grad(pc['u_n']), pc['u_n']), pc['v']) * dx(), 'f_lambda': lambda deg: (1-fenicsx['theta']) * fenicsx['rho'] * ufl.dot(ufl.dot(ufl.grad(u_n_fx),u_n_fx),v_fx) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
+        "RHS mass matrix": {'pc': pc['rho'] * dot(pc['u_k'] - pc['u_n'], pc['v']) / pc['dt'] * dx(), 'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(u_k_fx-u_n_fx, v_fx) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
         "RHS pressure term": {'pc': pc['p_k'] * div(pc['v']) * dx(), 'f_lambda': lambda deg: p_k_fx * ufl.div(v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
         "RHS Continuity":    {'pc': pc['q'] * div(pc['u_k']) * dx(), 'f_lambda': lambda deg: q_fx * ufl.div(u_k_fx) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 6}
 

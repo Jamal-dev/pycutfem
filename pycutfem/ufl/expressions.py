@@ -103,6 +103,15 @@ class Function(Expression):
             self._nodal_values = None
 
     @property
+    def n_local_basis(self):
+        """
+        Returns the local number of basis. For Q2 element it would be 9, for Q1 it is 4.
+        It will not return local basis of a parent vector.
+        """
+        return self._dof_handler.get_n_local_basis_element(self.field_name) if self._dof_handler else None
+        
+    
+    @property
     def nodal_values(self):
         """
         Smart property: Delegates to the parent vector if this is a component,

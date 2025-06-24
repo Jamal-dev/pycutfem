@@ -47,6 +47,14 @@ class Mesh:
         self._neighbors: List[List[int]] = [[] for _ in range(len(self.elements_connectivity))]
         self._build_topology()
 
+    def get_n_local_basis(self,eid:int) -> int:
+        """
+        Returns the total number of basis functions for a given element ID.
+        """
+        if eid not in range(len(self.elements_list)):
+            raise IndexError(f"Element ID {eid} out of range.")
+        return len(self.elements_list[eid].nodes)
+    
     def _build_topology(self):
         """
         Builds the full mesh topology: Elements, Edges, and Neighbors.
@@ -76,6 +84,7 @@ class Mesh:
                 key = tuple(sorted((c1, c2)))
                 edge_incidences.setdefault(key, []).append(eid)
 
+    
         def _locate_all_nodes_in_edge(vA: int, vB: int) -> Tuple[int, int]:
             x0, y0 = self.nodes_x_y_pos[vA]
             x1, y1 = self.nodes_x_y_pos[vB]
