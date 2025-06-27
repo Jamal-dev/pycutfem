@@ -2,7 +2,10 @@ import numpy as np
 from typing import Callable, Dict, List, Optional, Union
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
+import numbers
+from matplotlib.colors import LinearSegmentedColormap
 
+custom_cmap = LinearSegmentedColormap.from_list('blue_red', ['blue', 'red'])
 
 class Expression:
     """Base class for any object in a symbolic FEM expression."""
@@ -117,40 +120,47 @@ class Function(Expression):
         self.set_nodal_values(global_dofs, values)
 
     def get_nodal_values(self, global_dofs: np.ndarray) -> np.ndarray:
+        """
+        For a given array of global DOF indices (e.g., from an element),
+        return a corresponding array of values. The returned array has the
+        same size as the input, with zeros for DOFs not owned by this Function.
+        """
         if self._parent_vector is not None:
+            # Delegate to the parent, which manages the full data vector.
             return self._parent_vector.get_nodal_values(global_dofs)
-        return self._values[[self._g2l[d] for d in global_dofs]]
+
+        # Standalone function: build the padded vector manually.
+        out = np.zeros(len(global_dofs), dtype=float)
+        for i, gdof in enumerate(global_dofs):
+            if gdof in self._g2l:
+                local_idx = self._g2l[gdof]
+                out[i] = self._values[local_idx]
+        return out
 
     def set_nodal_values(self, global_dofs: np.ndarray, vals: np.ndarray):
         if self._parent_vector is not None:
             self._parent_vector.set_nodal_values(global_dofs, vals); return
-        self._values[[self._g2l[d] for d in global_dofs]] = vals
+        
+        for gdof, val in zip(global_dofs, vals):
+            if gdof in self._g2l:
+                self._values[self._g2l[gdof]] = val
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name='{self.name}', field='{self.field_name}')"
+    
     def plot(self, **kwargs):
         """ Function.plot(**kwargs) -> None
         Creates a 2D filled contour plot of the scalar function.
-
-        Requires matplotlib to be installed.
-
-        Args:
-            **kwargs: Additional keyword arguments passed to tricontourf,
-                      e.g., cmap='viridis', levels=20.
         """
-
-
         if self._dof_handler is None:
             raise RuntimeError("Cannot plot a function without an associated DofHandler.")
-
         mesh = self._dof_handler.fe_map.get(self.field_name)
         if mesh is None:
             raise RuntimeError(f"Field '{self.field_name}' not found in DofHandler's fe_map.")
-
-        x = mesh.nodes_x_y_pos[:, 0]
-        y = mesh.nodes_x_y_pos[:, 1]
         
-        # The nodal_values property correctly delegates to the parent if needed.
+        coords = self._dof_handler.get_dof_coords(self.field_name)
+        x = coords[:, 0]
+        y = coords[:, 1]
         z = self.nodal_values
 
         if len(z) != len(x):
@@ -159,8 +169,6 @@ class Function(Expression):
                  "Ensure the function's DoF handler corresponds to the correct mesh."
              )
 
-        # Use element corner nodes for triangulation. This is suitable for visualizing
-        # both P1/Q1 and higher-order solutions at the DoF nodes.
         if not hasattr(mesh, 'corner_connectivity'):
             raise AttributeError("Mesh object must have 'corner_connectivity' for plotting.")
             
@@ -168,17 +176,12 @@ class Function(Expression):
         if conn.shape[1] == 3: # Mesh is already triangles
             triangles = conn
         elif conn.shape[1] == 4: # Mesh is quadrilaterals, split into triangles
-            # For each quad [n0, n1, n2, n3], create two triangles:
-            # [n0, n1, n3] and [n1, n2, n3]
-            tri1 = conn[:, [0, 1, 3]]
-            tri2 = conn[:, [1, 2, 3]]
+            tri1 = conn[:, [0, 1, 3]]; tri2 = conn[:, [1, 2, 3]]
             triangles = np.vstack((tri1, tri2))
         else:
             raise ValueError(f"Unsupported element connectivity shape for plotting: {conn.shape}")
             
         triangulation = tri.Triangulation(x, y, triangles=triangles)
-
-        # --- Plotting ---
         fig, ax = plt.subplots()
         title = kwargs.pop('title', f'Scalar Field: {self.name}')
         plot_kwargs = {'cmap': 'viridis', 'levels': 15}
@@ -187,8 +190,7 @@ class Function(Expression):
         contour = ax.tricontourf(triangulation, z, **plot_kwargs)
         fig.colorbar(contour, ax=ax, label='Value')
         ax.set_title(title)
-        ax.set_xlabel('X coordinate')
-        ax.set_ylabel('Y coordinate')
+        ax.set_xlabel('X coordinate'); ax.set_ylabel('Y coordinate')
         ax.set_aspect('equal', adjustable='box')
         ax.tricontour(triangulation, z, colors='k', linewidths=0.5, levels=plot_kwargs['levels'])
         plt.show()
@@ -200,40 +202,57 @@ class VectorFunction(Expression):
         super().__init__()
         self.name = name; self.field_names = field_names; self._dh = dof_handler
         self.dim = 1
-        self._g_dofs = np.concatenate([dof_handler.get_field_slice(f) for f in field_names])
+        
+        # This function holds the data for multiple fields.
+        g_dofs_list = [dof_handler.get_field_slice(f) for f in field_names]
+        self._g_dofs = np.concatenate(g_dofs_list)
         self._g2l = {gd: i for i, gd in enumerate(self._g_dofs)}
         self.nodal_values = np.zeros(len(self._g_dofs), dtype=float)
+        self._dof_handler = dof_handler
+        
         self.components = [Function(f"{name}_{f}", f, dof_handler,
                                     parent_vector=self, component_index=i)
                            for i, f in enumerate(field_names)]
+        
 
     
     def nodal_values_component(self, idx: int):
         s = self._dh.get_field_slice(self.field_names[idx])
-        return self.nodal_values[[self._g2l[d] for d in s]]
+        return self.nodal_values[[self._g2l[d] for d in s if d in self._g2l]]
+
     def set_component_values(self, idx: int, vals):
         s = self._dh.get_field_slice(self.field_names[idx])
-        self.nodal_values[[self._g2l[d] for d in s]] = vals
-
-    # ------------------------------------------------------------------
-    def _dofs_for_component(self, idx: int) -> np.ndarray:
-        return np.asarray(self._dh.get_field_slice(self.field_names[idx]), dtype=int)
+        for i, gdof in enumerate(s):
+            if gdof in self._g2l:
+                self.nodal_values[self._g2l[gdof]] = vals[i]
 
     def get_nodal_values(self, global_dofs: np.ndarray) -> np.ndarray:
-        return self.nodal_values[[self._g2l[d] for d in global_dofs]]
+        """
+        For a given array of global DOF indices (e.g., from an element),
+        return a corresponding array of values. The returned array has the
+        same size as the input, with zeros for DOFs not owned by this VectorFunction.
+        """
+        out = np.zeros(len(global_dofs), dtype=float)
+        for i, gdof in enumerate(global_dofs):
+            if gdof in self._g2l:
+                local_idx = self._g2l[gdof]
+                out[i] = self.nodal_values[local_idx]
+        return out
 
     def set_nodal_values(self, global_dofs: np.ndarray, vals: np.ndarray):
-        self.nodal_values[[self._g2l[d] for d in global_dofs]] = vals
-
-    
-    
+        for gdof, val in zip(global_dofs, vals):
+            if gdof in self._g2l:
+                self.nodal_values[self._g2l[gdof]] = val
 
     def set_values_from_function(self, func: Callable[[float, float], np.ndarray]):
         for i, field_name in enumerate(self.field_names):
-            global_dofs = self._dh.get_field_dofs_on_nodes(field_name)
+            # Get coords for this specific field
             coords = self._dh.get_dof_coords(field_name)
+            # Evaluate the ith component of the vector function at these coords
             values = np.apply_along_axis(lambda c: func(c[0], c[1])[i], 1, coords).ravel()
-            self.set_nodal_values(global_dofs, values)
+            # Get the global DOFs for this field to set the values
+            global_dofs_field = self._dh.get_field_dofs_on_nodes(field_name)
+            self.set_nodal_values(global_dofs_field, values)
 
 
     def __repr__(self):
@@ -296,7 +315,7 @@ class VectorFunction(Expression):
         if len(self.field_names) != 2:
             raise NotImplementedError("Quiver plot is currently only supported for 2D vectors.")
 
-        mesh_u = self._dof_handler.fe_map.get(self.field_names[0])
+        mesh_u = self._dof_handler.fe_map.get(self.field_names[0]) 
         mesh_v = self._dof_handler.fe_map.get(self.field_names[1])
 
         if mesh_u is not mesh_v:
@@ -336,7 +355,12 @@ class VectorFunction(Expression):
                 raise ValueError(f"Unsupported element connectivity shape for plotting: {conn.shape}")
             
             triangulation = tri.Triangulation(x, y, triangles=triangles)
-            ax.tricontourf(triangulation, magnitude, cmap='Blues', levels=15)
+            tcf = ax.tricontourf(triangulation, magnitude, cmap = custom_cmap, levels=15)
+            # Add colorbar to the right
+            cbar = fig.colorbar(tcf, ax=ax)
+            cbar.set_label("Magnitude")
+            cbar.set_ticks([magnitude.min(), magnitude.max()])
+            cbar.ax.set_yticklabels([f"{magnitude.min():.2f}", f"{magnitude.max():.2f}"])
 
         ax.quiver(x, y, u_vals, v_vals, **plot_kwargs)
         
@@ -391,10 +415,28 @@ class TestFunction(Function):
         self.dim = 0  # Assuming scalar test functions for now
  
 
-class Constant(Expression):
-    def __init__(self, value, dim=0): self.value = value; self.dim = dim
+class Constant(Expression, numbers.Number):
+    def __init__(self, value, dim: int = 0):
+        # Call the __init__ of the next class in the Method Resolution Order (MRO)
+        # This ensures all parent classes are properly initialized
+        super().__init__() 
+        
+        self.value = value
+        self.dim = dim
+        self.role = 'none'
+
     def __repr__(self):
+        # We override __repr__ to show the value, which is more informative
         return f"Constant({self.value})"
+
+    def __float__(self):
+        return float(self.value)
+
+    def __int__(self):
+        return int(self.value)
+
+    def __array__(self, dtype=None):
+        return np.asarray(self.value, dtype=dtype)
 
 class VectorTrialFunction(Expression):
     def __init__(self, space, dof_handler: 'DofHandler'=None): # space: FunctionSpace

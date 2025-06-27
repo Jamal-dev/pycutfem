@@ -17,7 +17,7 @@ Why rev‑2?
 """
 
 from functools import lru_cache
-from typing import Mapping, Sequence, Dict, Tuple
+from typing import Mapping, Sequence, Dict, Tuple, List
 
 import numpy as np
 
@@ -48,30 +48,32 @@ class MixedElement:
     def __init__(
         self,
         mesh: Mesh,
-        field_names: Sequence[str],
-        *,
-        field_orders: Mapping[str, int] | None = None,
+        field_specs: Mapping[str, int] | None = None,
     ) -> None:
+        if not isinstance(field_specs, dict):
+            field_specs = dict(field_specs)
         if not isinstance(mesh, Mesh):
             raise TypeError("'mesh' must be a pycutfem Mesh instance.")
-        if not field_names:
+        self.field_names: Tuple[str, ...] = tuple(field_specs.keys())
+        if not self.field_names:
             raise ValueError("'field_names' cannot be empty.")
 
         self.mesh: Mesh = mesh
-        self.field_names: Tuple[str, ...] = tuple(field_names)
         self._field_orders: Dict[str, int] = {
-            name: (field_orders[name] if field_orders and name in field_orders else mesh.poly_order)
+            name: (field_specs[name] if field_specs and name in field_specs else mesh.poly_order)
             for name in self.field_names
         }
 
         # Build per‑field reference elements and basis counts -----------------
         self._ref: Dict[str, object] = {}
         self._n_basis: Dict[str, int] = {}
+        self._n_basis: Dict[str,int] = {f: (p+1)**2 if mesh.element_type=='quad'
+                                          else (p+1)*(p+2)//2
+                                        for f,p in self._field_orders.items()}
         for name in self.field_names:
             ref = get_reference(mesh.element_type, self._field_orders[name])
             self._ref[name] = ref
-            # scalar basis fn count for *that* order
-            self._n_basis[name] = int(ref.shape(0.0, 0.0).size)
+
 
         # Build slices into the global local‑DOF vector -----------------------
         self.component_dof_slices: Dict[str, slice] = {}
@@ -85,31 +87,44 @@ class MixedElement:
         # Canonical reference‑node ordering for geometry ----------------------
         self.element_node_map: np.ndarray = self._reference_node_ordering()
 
+         # global (element‑local) index → owning field
+        self._field_of: List[str] = []
+        for f in self.field_names:                       #   |ux|  |uy|  |p|
+            self._field_of += [f]*self._n_basis[f]       # 0..8  9..17 18..21
+
+        self.n_dofs_per_elem = len(self._field_of)
+        # Debug
+        # print(f"MixedElement created with {self.n_dofs_per_elem} local DOFs "
+        #       f"({self.field_names}) for {mesh.element_type} elements of order "
+        #       f"{self.mesh.poly_order} (p) and field orders {self._field_orders}.")
+
     # ..................................................................
     #  Basis, gradient, Hessian
     # ..................................................................
+    def _eval_scalar_basis(self,field:str, xi: float, eta: float) -> np.ndarray:
+        return self._ref[field].shape(xi, eta)
+    def _eval_scalar_grad(self, field: str, xi: float, eta: float) -> np.ndarray:
+        """Return the gradient of the scalar basis functions for `field`."""
+        return self._ref[field].grad(xi, eta)
     def _cache_key(self, xi: float, eta: float) -> Tuple[float, float]:
         """Round coordinates so different IEEE‑754 spellings hit the same key."""
         return (round(xi, 14), round(eta, 14))
 
-    @lru_cache(maxsize=512)
-    def basis(self, xi: float, eta: float) -> np.ndarray:  # noqa: D401
-        """Return **zero‑padded** basis vector ϕ(xi,η) (shape ≡ (n_dofs_local,))."""
-        # Use a single contiguous array → cache‑friendly in assemblers
-        out = np.zeros(self.n_dofs_local, dtype=float)
-        for name in self.field_names:
-            s = self.component_dof_slices[name]
-            out[s] = self._ref[name].shape(xi, eta).ravel()
-        return out
+    def basis(self, field: str, xi: float, eta: float) -> np.ndarray:
+        """22‑vector with non‑zeros only at the DOFs of ``field``."""
+        phi = np.zeros(self.n_dofs_per_elem)
+        local = self._eval_scalar_basis(field, xi, eta)
+        idx = self.component_dof_slices[field]
+        phi[idx] = local
+        return phi
 
-    @lru_cache(maxsize=512)
-    def grad(self, xi: float, eta: float) -> np.ndarray:
-        """Return stacked gradient ∇ϕ (shape (n_dofs_local, 2))."""
-        out = np.zeros((self.n_dofs_local, 2), dtype=float)
-        for name in self.field_names:
-            s = self.component_dof_slices[name]
-            out[s, :] = self._ref[name].grad(xi, eta)
-        return out
+    def grad_basis(self, field: str, xi: float, eta: float) -> np.ndarray:
+        """Shape (22,2); rows belonging to other fields are zero."""
+        G = np.zeros((self.n_dofs_per_elem, 2))
+        locG = self._eval_scalar_grad(field, xi, eta)  # (n,2)
+        idx = self.component_dof_slices[field]
+        G[idx, :] = locG
+        return G
 
     @lru_cache(maxsize=256)
     def hess(self, xi: float, eta: float) -> np.ndarray:

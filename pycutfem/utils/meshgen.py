@@ -209,12 +209,14 @@ def visualize_test_structured_quad():
     # Test Case 1: Single Q1 element
     print("\n--- Test Case 1: Single Q1 Element (1x1 grid) ---")
     Lx1, Ly1, nx1, ny1, order1 = 1.0, 1.0, 1, 1, 1
-    pts1, quads1 = structured_quad(Lx1, Ly1, nx=nx1, ny=ny1, poly_order=order1)
-    print(f"Points shape: {pts1.shape}")
-    print(f"First 5 points:\n{pts1[:5]}")
-    print(f"Quads shape: {quads1.shape}")
-    print(f"Quads connectivity:\n{quads1}")
-    visualize_mesh_node_order(pts1, quads1, order1, title="Test Case 1: Single Q1 Element (1x1)")
+    nodes1, elements1, edges1, elements_corner_nodes1 = structured_quad(Lx1, Ly1, nx=nx1, ny=ny1, poly_order=order1)
+    nodes1 = np.array([[node.x, node.y] for node in nodes1])  # Convert Node objects to numpy array
+    print(f"Points shape: {nodes1.shape}")
+    print(f"First 5 points:\n{nodes1[:5]}")
+    print(f"Quads shape: {elements1.shape}")
+    print(f"Quads connectivity:\n{elements1}")
+    print(f"Corner connectivity:\n{elements_corner_nodes1}")
+    visualize_mesh_node_order(nodes1, elements1, order1, title="Test Case 1: Single Q1 Element (1x1)")
 
     # Test Case 2: 2x1 Q1 elements
     print("\n--- Test Case 2: 2x1 Q1 Elements ---")
@@ -261,34 +263,47 @@ def visualize_test_structured_tri_and_quad():
 
     # === Quadrilateral Tests ===
     print("\n--- Test Case Q1: Single Q1 Element (1x1 grid) ---")
-    ptsQ1, quadsQ1 = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
-    visualize_mesh_node_order(ptsQ1, quadsQ1, 1, 'quad', title="Test Q1: Single Q1 Element")
+    nodes, elements, edges, corner_connectivity = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
+    ptsQ1 = np.array([[node.x,node.y] for node in nodes])
+    visualize_mesh_node_order(ptsQ1, elements, 1, 'quad', title="Test Q1: Single Q1 Element")
 
     print("\n--- Test Case Q2: 2x1 Q2 Elements ---")
-    ptsQ2, quadsQ2 = structured_quad(2.0, 1.0, nx=2, ny=1, poly_order=2)
+    nodes, elements, edges, corner_connectivity = structured_quad(2.0, 1.0, nx=2, ny=1, poly_order=2)
+    ptsQ2 = np.array([[node.x,node.y] for node in nodes])
+    quadsQ2 = elements
     visualize_mesh_node_order(ptsQ2, quadsQ2, 2, 'quad', title="Test Q2: 2x1 Q2 Elements")
     
     print("\n--- Test Case Q0: 2x2 Q0 Elements ---") # Test order 0 for Quads
-    ptsQ0, quadsQ0 = structured_quad(2.0, 2.0, nx=2, ny=2, poly_order=0)
-    visualize_mesh_node_order(ptsQ0, quadsQ0, 0, 'quad', title="Test Q0: 2x2 Q0 (Point) Elements")
+    # nodes, elements, edges, corner_connectivity = structured_quad(2.0, 2.0, nx=2, ny=2, poly_order=0)
+    # ptsQ0 = np.array([[node.x,node.y] for node in nodes])
+    # quadsQ0 = elements
+    # visualize_mesh_node_order(ptsQ0, quadsQ0, 0, 'quad', title="Test Q0: 2x2 Q0 (Point) Elements")
 
 
     # === Triangular Tests ===
     print("\n--- Test Case T1: 1x1 Base Quads, P1 Elements (2 triangles) ---")
-    ptsT1, trisT1 = structured_triangles(1.0, 1.0, nx_quads=1, ny_quads=1, poly_order=1)
+    nodes, elements, edges, elements_corner_nodes = structured_triangles(1.0, 1.0, nx_quads=1, ny_quads=1, poly_order=1)
+    ptsT1 = np.array([[node.x, node.y] for node in nodes])
+    trisT1 = elements
     visualize_mesh_node_order(ptsT1, trisT1, 1, 'triangle', title="Test T1: P1 Triangles (from 1x1 Quads)")
 
     print("\n--- Test Case T2: 1x1 Base Quads, P2 Elements (2 triangles) ---")
-    ptsT2, trisT2 = structured_triangles(1.0, 1.0, nx_quads=1, ny_quads=1, poly_order=2)
+    nodes, elements, edges, elements_corner_nodes = structured_triangles(1.0, 1.0, nx_quads=1, ny_quads=1, poly_order=2)
+    ptsT2 = np.array([[node.x, node.y] for node in nodes])
+    trisT2 = elements
     visualize_mesh_node_order(ptsT2, trisT2, 2, 'triangle', title="Test T2: P2 Triangles (from 1x1 Quads)")
 
     print("\n--- Test Case T3: 2x1 Base Quads, P1 Elements (4 triangles) ---")
-    ptsT3, trisT3 = structured_triangles(2.0, 1.0, nx_quads=2, ny_quads=1, poly_order=1)
+    nodes, elements, edges, elements_corner_nodes = structured_triangles(2.0, 1.0, nx_quads=2, ny_quads=1, poly_order=1)
+    ptsT3 = np.array([[node.x, node.y] for node in nodes])
+    trisT3 = elements
     visualize_mesh_node_order(ptsT3, trisT3, 1, 'triangle', title="Test T3: P1 Triangles (from 2x1 Quads)")
 
-    print("\n--- Test Case T0: 2x2 Base Quads, P0 Elements (8 triangles) ---") # Test order 0 for Triangles
-    ptsT0, trisT0 = structured_triangles(2.0, 2.0, nx_quads=2, ny_quads=2, poly_order=0)
-    visualize_mesh_node_order(ptsT0, trisT0, 0, 'triangle', title="Test T0: P0 (Point) Elements on Triangles")
+    # print("\n--- Test Case T0: 2x2 Base Quads, P0 Elements (8 triangles) ---") # Test order 0 for Triangles
+    # nodes, elements, edges, elements_corner_nodes = structured_triangles(2.0, 2.0, nx_quads=2, ny_quads=2, poly_order=0)
+    # ptsT0 = np.array([[node.x, node.y] for node in nodes])
+    # trisT0 = elements
+    # visualize_mesh_node_order(ptsT0, trisT0, 0, 'triangle', title="Test T0: P0 (Point) Elements on Triangles")
 
     print("\nAll test cases executed. Check the plots for visual verification.")
 

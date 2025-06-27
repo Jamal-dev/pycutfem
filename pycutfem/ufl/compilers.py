@@ -1,176 +1,193 @@
-# pycutfem/fem/compilers.py
-"""Light‑yet‑robust *local* form compiler for the project’s test-suite.
-
-It supports exactly the expression types exercised by the Stokes examples
-(Q2/Q1 Taylor–Hood, vector formulation) **plus** a generic interior‑facet path
-so future ghost‑penalty terms won’t break again.  All duplicated definitions
-that crept into the file have been removed – this is the *only* `FormCompiler`
-exported.
-
-Key design points
------------------
-* **Side‑aware basis cache**  – visitors pick the right trace when the context
-  advertises an `active_side` (test) or `trial_side`.
-* **Volume and facet assembly paths share the same visitors**; only the way
-  `basis_values` is filled differs.
-* **No dependence on a `level_set`** for ordinary `interior_facet` measures; if
-  present, we use it to orient the normal consistently (+ side has φ ≥ 0).
-* **RHS assembly** is sign‑aware via `_split_terms`.
-
-The implementation aims for clarity over absolute speed, but all hot loops are
-NumPy‑vectorised and free of Python allocations.
+# pycutfem/ufl/compilers.py
 """
+A minimal‑yet‑robust volume‑form compiler geared towards the project’s
+current needs (Taylor–Hood Stokes, Poisson, linear elasticity, etc.).
 
+This version integrates the ``GradOpInfo`` and ``VecOpInfo`` bookkeeping and a
+shape- and role-aware algebraic layer. This distinguishes between symbolic
+basis functions (for unknowns) and evaluated numerical data (for knowns),
+enabling robust assembly of LHS matrices and RHS vectors.
+"""
 from __future__ import annotations
-
-
 
 import numpy as np
 import scipy.sparse as sp
-from collections import defaultdict
-from typing import Dict, List, Tuple, Iterable, Mapping, Any, Union
-import logging,functools
+from typing import Dict, List, Any, Tuple, Iterable, Mapping, Union
+import logging
+from dataclasses import dataclass
 
-# UFL‑like helpers ----------------------------------------------------------
-from pycutfem.fem.operators import grad
-from pycutfem.ufl.expressions import (
-    Constant, TrialFunction, TestFunction,
-    VectorTrialFunction, VectorTestFunction,
-    Grad, DivOperation, Inner, Dot, Sum, Sub, Prod,
-    Jump, FacetNormal, Pos, Neg, Function, VectorFunction, Div
-)
-from pycutfem.ufl.forms import Equation
-
-# Project helpers -----------------------------------------------------------
+# -------------------------------------------------------------------------
+#  Project imports – only the really needed bits
+# -------------------------------------------------------------------------
 from pycutfem.core.dofhandler import DofHandler
-from pycutfem.fem.reference import get_reference
+from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.fem import transform
 from pycutfem.integration import volume
-from pycutfem.integration.quadrature import  line_quadrature
-from pycutfem.integration.quadrature import edge as edge_quadrature_element
-import sympy
-from pycutfem.fem.mixedelement import MixedElement
+
+# Symbolic building blocks
+from pycutfem.ufl.expressions import (
+    Constant,    TestFunction,   TrialFunction,
+    VectorTestFunction, VectorTrialFunction,
+    Function,    VectorFunction,
+    Grad, DivOperation, Inner, Dot,
+    Sum, Sub, Prod, Pos, Neg,Div
+)
+from pycutfem.ufl.forms import Equation
+from pycutfem.ufl.measures import Integral
 
 logger = logging.getLogger(__name__)
 
+# ========================================================================
+#  Tensor Containers for Symbolic Basis Functions
+# ========================================================================
+@dataclass(slots=True, frozen=True)
+class VecOpInfo:
+    """Container for vector basis functions φ (phi). Shape: (k, n)."""
+    data: np.ndarray  # (num_components, n_loc_dofs)
+    role: str = "none"  # "test" or "trial"
 
-_INTERFACE_TOL = 1.0e-12
+    def inner(self, other: "VecOpInfo") -> np.ndarray:
+        """Computes inner product (u, v), returning an (n, n) matrix."""
+        if self.data.shape[0] != other.data.shape[0]:
+            raise ValueError("VecOpInfo component mismatch for inner product.")
+        # sum over components (k), outer product over basis functions (n,m)
+        return np.einsum("kn,km->nm", self.data, other.data, optimize=True)
+
+    def dot_const(self, const: np.ndarray) -> np.ndarray:
+        """Computes dot(v, c), returning an (n,) vector."""
+        logger.debug(f"VecOpInfo.dot_const: const={const}, data.shape={self.data.shape}")
+        const = np.asarray(const)
+        if const.ndim != 1 or const.size != self.data.shape[0]:
+            raise ValueError(f"Constant vector of size {const.size} is wrong length for VecOpInfo with {self.data.shape[0]} components.")
+        return np.einsum("kn,k->n", self.data, const, optimize=True)
+    # ========================================================================
+    # Shape, len, and ndim methods
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        """Returns the shape of the data array."""
+        return self.data.shape
+    @property
+    def ndim(self) -> int:
+        """Returns the number of dimensions of the data array."""
+        return self.data.ndim
+    def __len__(self) -> int:
+        """Returns the size of the first dimension (number of components)."""
+        return self.data.shape[0] if self.data.ndim > 0 else 1
+    def __mul__(self, other: Union[float, np.ndarray]) -> "VecOpInfo":
+        """Element-wise multiplication with a scalar or vector."""
+        if isinstance(other, (float, int)):
+            return VecOpInfo(self.data * other, role=self.role)
+        elif isinstance(other, np.ndarray):
+            if other.ndim == 1 and other.size == self.data.shape[0]:
+                return VecOpInfo(self.data * other[:, np.newaxis], role=self.role)
+            else:
+                raise ValueError(f"Cannot multiply VecOpInfo with array of shape {other.shape}.")
+        else:
+            raise TypeError(f"Unsupported multiplication type: {type(other)}")
+    def __rmul__(self, other: Union[float, np.ndarray]) -> "VecOpInfo":
+        return self.__mul__(other)
+    def __add__(self, other: "VecOpInfo") -> "VecOpInfo":
+        """Element-wise addition with another VecOpInfo."""
+        if not isinstance(other, VecOpInfo):
+            raise TypeError(f"Cannot add VecOpInfo to {type(other)}.")
+        if self.data.shape != other.data.shape:
+            raise ValueError("VecOpInfo shapes mismatch in addition.")
+        return VecOpInfo(self.data + other.data, role=self.role)
+    def __sub__(self, other: "VecOpInfo") -> "VecOpInfo":
+        """Element-wise subtraction with another VecOpInfo."""
+        if not isinstance(other, VecOpInfo):
+            raise TypeError(f"Cannot subtract {type(other)} from VecOpInfo.")
+        if self.data.shape != other.data.shape:
+            raise ValueError("VecOpInfo shapes mismatch in subtraction.")
+        return VecOpInfo(self.data - other.data, role=self.role)
+    def __neg__(self) -> "VecOpInfo":
+        """Element-wise negation of the VecOpInfo."""
+        return VecOpInfo(-self.data, role=self.role)
+    def info(self):
+        """Return the type of the data array."""
+        return f"VecOpInfo({self.data.dtype}, shape={self.data.shape}, role='{self.role}')"
 
 
+@dataclass(slots=True, frozen=True)
+class GradOpInfo:
+    """Container for gradient of basis functions ∇φ. Shape: (k, n, d)."""
+    data: np.ndarray  # (num_components, n_loc_dofs, spatial_dim)
+    role: str = "none"
 
-# ---------------------------------------------------------------------------
-#  Light shape‑meta visitor (helps flip test/trial in ∇· terms)
-# ---------------------------------------------------------------------------
-class _Shape:
-    __slots__ = ("dim", "kind")
-    def __init__(self, dim: int, kind: str):
-        self.dim = dim      # tensor order (scalar:0, vector:1, grad:2,…)
-        self.kind = kind    # 'test' | 'trial' | 'none'
+    def inner(self, other: GradOpInfo) -> np.ndarray:
+        """Computes inner(∇u, ∇v) = ∫(∇u)T(∇v), returning an (n, n) matrix."""
+        if not isinstance(other, GradOpInfo) or self.data.shape != other.data.shape:
+            raise ValueError("Operands must be GradOpInfo of the same shape for inner product.")
+        # sum over components (k) and spatial dims (d), outer product over basis funcs (n,m)
+        return np.einsum("knd,kmd->nm", self.data, other.data, optimize=True)
 
-
-
-# In ufl/compilers.py
-
-class _ShapeVisitor:
-    def __init__(self):
-        self._memo = {}
-    def visit(self, n):
-        if n in self._memo: return self._memo[n]
+    def dot_vec(self, vec: np.ndarray) -> VecOpInfo:
+        """
+        Computes the dot product with a constant vector over the SPATIAL dimension.
+        This operation reduces the dimension and returns a VecOpInfo object.
+        dot(∇v, c) -> ∇v ⋅ c
+        """
+        vec = np.asarray(vec)
+        if vec.ndim != 1 or vec.size != self.shape[-1]: # Must match spatial dim `d`
+            raise ValueError(f"Input vector of size {vec.size} cannot be dotted with spatial dimension of size {self.shape[-1]}.")
         
-        # This dispatch needs to be specific
-        meth_name = f"visit_{type(n).__name__}"
-        meth = getattr(self, meth_name, self.generic_visit)
+        # einsum("knd,d->kn", ...)
+        result_data = np.einsum("knd,d->kn", self.data, vec, optimize=True)
+        return VecOpInfo(result_data, role=self.role)
+
+    # ========================================================================
+    # Dunder methods for SCALING Operations
+    # ========================================================================
+
+    def __mul__(self, other: Union[float, int, np.ndarray]) -> GradOpInfo:
+        """
+        Performs SCALING and always returns a new GradOpInfo object.
+        This operator preserves the shape (k, n, d).
+        """
+        if isinstance(other, (float, int)):
+            # Case 1: Scaling by a single scalar
+            new_data = self.data * other
+            
+        elif isinstance(other, np.ndarray):
+            other = np.asarray(other)
+            if other.ndim == 0:
+                # Case 1b: Scaling by a 0-D array (e.g., np.array(2))
+                new_data = self.data * other
+            elif other.ndim == 1 and other.size == self.shape[0]:
+                # Case 2: Scaling by component (vector of size k)
+                # Reshape (k,) -> (k, 1, 1) to broadcast over (k, n, d)
+                new_data = self.data * other[:, np.newaxis, np.newaxis]
+            elif other.ndim == 1 and other.size == self.shape[1]:
+                # Case 3: Scaling by location (vector of size n, e.g. a density field rho)
+                # Reshape (n,) -> (1, n, 1) to broadcast over (k, n, d)
+                new_data = self.data * other[np.newaxis, :, np.newaxis]
+            else:
+                 raise ValueError(f"Cannot scale GradOpInfo(shape={self.shape}) with array of shape {other.shape}.")
+        else:
+            return NotImplemented
+
+        return GradOpInfo(new_data, role=self.role)
+
+    def __rmul__(self, other: Union[float, int, np.ndarray]) -> GradOpInfo:
+        return self.__mul__(other)
         
-        res = meth(n)
-        self._memo[n] = res
-        return res
+    def __neg__(self) -> GradOpInfo:
+        return GradOpInfo(-self.data, role=self.role)
 
-    def generic_visit(self, n):
-        # Fallback for base classes if a specific visitor doesn't exist
-        if isinstance(n, TestFunction): return self.visit_TestFunction(n)
-        if isinstance(n, TrialFunction): return self.visit_TrialFunction(n)
-        if isinstance(n, Function): return self.visit_Function(n)
-        raise TypeError(f"No shape rule for {type(n)}")
+    def __add__(self, other: GradOpInfo) -> GradOpInfo:
+        if not isinstance(other, GradOpInfo) or self.data.shape != other.data.shape:
+            raise ValueError("Operands must be GradOpInfo of the same shape for addition.")
+        return GradOpInfo(self.data + other.data, role=self.role)
 
-    # --- Corrected Visitors for all types ---
-    def visit_Constant(self, n):      return _Shape(n.dim, 'none')
-    def visit_Analytic(self, n):      return _Shape(0, 'none')
-    
-    # --- Specific handlers for each type ---
-    def visit_TestFunction(self, n):      return _Shape(0, 'test')
-    def visit_TrialFunction(self, n):     return _Shape(0, 'trial')
-    def visit_Function(self, n):          return _Shape(0, 'none')
-    
-    def visit_VectorTestFunction(self, n):  return _Shape(1, 'test')
-    def visit_VectorTrialFunction(self, n): return _Shape(1, 'trial')
-    def visit_VectorFunction(self, n):      return _Shape(1, 'none')
+    def __sub__(self, other: GradOpInfo) -> GradOpInfo:
+        return self.__add__(-other)
 
-    # --- Visitors for Operators ---
-    def visit_Sum(self, n):  return self.visit(n.a)
-    def visit_Sub(self, n):  return self.visit(n.a)
-    def visit_Prod(self,n):
-        sa, sb = self.visit(n.a), self.visit(n.b)
-        dim = sa.dim + sb.dim
-        kind = sa.kind if sa.kind != 'none' else sb.kind
-        return _Shape(dim, kind)
-
-    def visit_Grad(self, n): 
-        s = self.visit(n.operand)
-        return _Shape(s.dim + 1, s.kind)
-
-    def visit_DivOperation(self,n):
-        return _Shape(0, self.visit(n.operand).kind)
-
-    def visit_Inner(self,n): 
-        sa = self.visit(n.a); sb = self.visit(n.b)
-        kind = sa.kind if sa.kind != 'none' else sb.kind
-        return _Shape(max(0, sa.dim - 1), kind)
-    
-    def visit_Dot(self,n):
-        sa = self.visit(n.a); sb = self.visit(n.b)
-        kind = sa.kind if sa.kind != 'none' else sb.kind
-        # Dot product reduces total tensor rank by 2, or dimension by 1 for vectors
-        dim = max(0, sa.dim + sb.dim - 2) if (sa.dim > 0 and sb.dim > 0) else sa.dim + sb.dim
-        return _Shape(dim, kind)
-
-    def visit_Div(self, n): return self.visit(n.a)
-    def visit_Pos(self,n):   return self.visit(n.operand)
-    def visit_Neg(self,n):   return self.visit(n.operand)
-    def visit_Jump(self,n):  return self.visit(n.u_pos)
-    def visit_FacetNormal(self,n): return _Shape(1,'none')
-    def visit_ElementWiseConstant(self, n):
-        return _Shape(0, 'none')
-
-# ---------------------------------------------------------------------------
-#  Helper utilities
-# ---------------------------------------------------------------------------
-
-def _split_terms(expr, coef=1.0):
-    """
-    Flatten a ± tree **and** pull purely-scalar factors in front.
-    Returns a list  [(scalar, term), …]
-    where each *term* still contains the symbolic FE factors.
-    """
-    from pycutfem.ufl.expressions import Sum, Sub, Prod, Constant
-    # 1. walk through +/–
-    if isinstance(expr, Sum):
-        return _split_terms(expr.a, coef) + _split_terms(expr.b, coef)
-    if isinstance(expr, Sub):
-        return _split_terms(expr.a, coef) + _split_terms(expr.b, -coef)
-
-    # 2. pull scalar constants out of a product
-    if isinstance(expr, Prod):
-        # “Constant ⋅ something”  or  “something ⋅ Constant”
-        if isinstance(expr.a, Constant) and expr.a.dim == 0:
-            return _split_terms(expr.b, coef * expr.a.value)
-        if isinstance(expr.b, Constant) and expr.b.dim == 0:
-            return _split_terms(expr.a, coef * expr.b.value)
-
-    # 3. everything else stays as-is
-    return [(coef, expr)]
-
-
-
+    # --- Helper properties ---
+    @property
+    def shape(self) -> Tuple[int, ...]: return self.data.shape
+    @property
+    def ndim(self) -> int: return self.data.ndim
+    def __repr__(self): return f"GradOpInfo(shape={self.data.shape}, role='{self.role}')"
 
 def _all_fields(expr):
     fields=set()
@@ -193,626 +210,481 @@ def _all_fields(expr):
     walk(expr)
     return list(fields)
 
-
-def _trial_test(expr):
-    trial = expr.find_first(lambda n:isinstance(n,(TrialFunction,VectorTrialFunction)))
-    test  = expr.find_first(lambda n:isinstance(n,(TestFunction ,VectorTestFunction )))
-    return trial, test
-
-def _is_component(obj) -> bool:
-    """True if *obj* is a scalar component extracted from a vector."""
-    return getattr(obj, "_parent_vector", None) is not None
-
-def _n_components(obj) -> int:
-    """How many components in the vector that *obj* belongs to?"""
-    if _is_component(obj):
-        return len(obj._parent_vector.components)
-    if hasattr(obj, "components"):
-        return len(obj.components)
-    return 1                # scalar stand-alone
-
-
-def _mask(n_dofs: int, slc: slice) -> np.ndarray:
-    """Vector of length *n_dofs* with ones on *slc* and zeros elsewhere."""
-    m = np.zeros(n_dofs)
-    m[slc] = 1.0
-    return m
-
-# ---------------------------------------------------------------------------
-#  Actual compiler
-# ---------------------------------------------------------------------------
+# ========================================================================
+#  The Compiler
+# ========================================================================
 class FormCompiler:
-    def __init__(self, dofhandler: DofHandler, quad_order: int | None = None, assembler_hooks: dict | None = None):
-        self.dh = dofhandler
-        self.qorder = quad_order
-        self.shape = _ShapeVisitor()
-        self.ctx: Dict[str,Any] = {}
-        # assembler hooks are passed in via `ctx['hooks']`
-        self.ctx['hooks'] = assembler_hooks or {}
-        # bucket for diagnostics such as perimeter / jump integrals
-        self._scalar_results: dict[str, float] = {}
-        self.ctx['scalar_results'] = self._scalar_results
-        if self.dh.mixed_element is None:
-            raise RuntimeError("This compiler requires a MixedElement‑backed DofHandler.")
-        self.me: MixedElement = self.dh.mixed_element
+    """A single‑file *volume* compiler for mixed continuous Galerkin forms."""
 
-    # ---------- public --------------------------------------------------
-    def assemble(self, equation: Equation, bcs):
-        n = self.dh.total_dofs
-        K = sp.lil_matrix((n,n))
-        F = np.zeros(n)
+    def __init__(self, dh: DofHandler, quadrature_order: int | None = None, assembler_hooks: Dict[str, Any] = None):
+        if dh.mixed_element is None:
+            raise RuntimeError("A MixedElement‑backed DofHandler is required.")
+        self.dh, self.me = dh, dh.mixed_element
+        self.qorder = quadrature_order
+        self.ctx: Dict[str, Any] = {}
+        self._basis_cache: Dict[str, Dict[str, np.ndarray]] = {}
+        self._dispatch = {
+            Constant: self._visit_Constant, 
+            TestFunction: self._visit_TestFunction,
+            TrialFunction: self._visit_TrialFunction, 
+            VectorTestFunction: self._visit_VectorTestFunction,
+            VectorTrialFunction: self._visit_VectorTrialFunction, 
+            Function: self._visit_Function,
+            VectorFunction: self._visit_VectorFunction, Grad: self._visit_Grad,
+            DivOperation: self._visit_DivOperation, Sum: self._visit_Sum,
+            Sub: self._visit_Sub, Prod: self._visit_Prod, Dot: self._visit_Dot,
+            Inner: self._visit_Inner, Pos: self._visit_Pos, Neg: self._visit_Neg,
+            Div: self._visit_Div
+        }
 
-        # left‑hand side
-        self.ctx['is_rhs'] = False
-        self._assemble_form(equation.a, K)
-        # right‑hand side
-        self.ctx['is_rhs'] = True
-        self._assemble_form(equation.L, F)
-
-        self._apply_bcs(K,F,bcs)
-        # face-only forms (e.g. Constant()*ds) produce no matrix/vector
-        # – in this case hand back the accumulated scalars instead
-        if self._scalar_results:
-           return self._scalar_results
+    # ============================ PUBLIC API ===============================
+    def assemble(self, eq: Equation, bcs: Union[Mapping, Iterable, None] = None):
+        ndofs = self.dh.total_dofs
+        K = sp.lil_matrix((ndofs, ndofs))
+        F = np.zeros(ndofs)
+        logger.info("Assembling LHS matrix K...")
+        self.ctx["rhs"] = False
+        self._assemble_form(eq.a, K)
+        logger.info("Assembling RHS vector F...")
+        self.ctx["rhs"] = True
+        self._assemble_form(eq.L, F)
+        logger.info("Applying Dirichlet boundary conditions...")
+        self._apply_bcs(K, F, bcs)
+        logger.info("Assembly complete.")
         return K.tocsr(), F
 
+    # ===================== VISITORS: LEAF NODES =======================
+    def _b(self, fld): return self._basis_cache[fld]["val"]  # (n_loc,)
+    def _g(self, fld): return self._basis_cache[fld]["grad"] # (n_loc, d)
+    def _local_dofs(self): return self.dh.get_elemental_dofs(self.ctx["eid"])
 
-    
-    # ---------- visitors ------------------------------------------------
-    def visit(self, node):
-        return getattr(self, f"visit_{type(node).__name__}")(node)
+    # --- Knowns (evaluated to numerical values) ---
+    def _visit_Constant(self, n: Constant):
+        if n.dim ==0:
+            return float(n.value)
+        return np.asarray(n.value)
 
-    def visit_ElementWiseConstant(self, node):
-        side = self.ctx.get("side", "")
-        if side:
-            elem_id = self.ctx["e_pos"] if side == "+" else self.ctx["e_neg"]
-        else:
-            elem_id = self.ctx["elem_id"]
-        return node.values[elem_id]
-        
-    # ---------------- Derivative single ------------------------------------------
-    def visit_Derivative(self, n): # needs to be corrected
-        """
-        Evaluates a single component of a gradient.
-        e.g., Derivative(f, 0) corresponds to ∂f/∂x.
+    def _visit_Function(self, n: Function):
+        logger.debug(f"Visiting Function: {n.field_name}")
+        u_loc = n.get_nodal_values(self._local_dofs())      # (22,) padded
+        data = [u_loc * self._b(n.field_name)]                 # one block
+        return VecOpInfo(np.stack(data), role="function")
 
-        This method is robust enough to handle both 2D arrays of basis
-        gradients (from Trial/TestFunctions) and 1D arrays of interpolated
-        gradient values (from data-carrying Functions).
-        """
-        # First, evaluate the full gradient of the function.
+    def _visit_VectorFunction(self, n: VectorFunction):
+        """VectorFunction → VecOpInfo(k, n_loc) where n_loc = 22 for Q2–Q2–Q1."""
+        logger.debug(f"Visiting VectorFunction: {n.field_names}")
+        u_loc = n.get_nodal_values(self._local_dofs())      # (22,) padded
+        data = [u_loc * self._b(fld) for fld in n.field_names]
+        return VecOpInfo(np.stack(data), role="function")
 
-        base=self.visit(Grad(n.f)); ax=n.component_index
-        return base[ax] if base.ndim==1 else base[:,ax]
+    # --- Unknowns (represented by basis functions) ---
+    def _visit_TestFunction(self, n):
+        logger.debug(f"Visiting TestFunction: {n.field_name}")
+        return VecOpInfo(np.stack([self._b(n.field_name)]), role="test")
+    def _visit_TrialFunction(self, n):
+        logger.debug(f"Visiting TrialFunction: {n.field_name}")
+        return VecOpInfo(np.stack([self._b(n.field_name)]), role="trial")
 
-    # scalars
-    def visit_Constant(self, n):
-        """Return an array whose length matches the target expression.
-
-        * scalar → one full-length (n_dofs_local) vector of that value
-        * iterable of length == n_components → *concatenate* one padded
-        vector **per component**, mirroring VectorTest/Trial layout
-        """
-        if np.isscalar(n.value):
-            return np.full(self.me.n_dofs_local, float(n.value))
-
-        parts = []
-        for comp_val, fld in zip(n.value, self.me.field_names):
-            vec = np.zeros(self.me.n_dofs_local)
-            vec[self.me.slice(fld)] = comp_val
-            parts.append(vec)
-        return np.concatenate(parts)           # length = n_components · n_dofs_local
-    
-    def visit_Pos(self, n):
-        """
-        Evaluates the operand if on the positive side (phi>=0), otherwise returns
-        a zero of the same shape as the operand.
-        """
-        # print("visit Pos zeroing: ctx=", self.ctx)
-        # We use a clear convention: '+' side includes the boundary (phi >= 0)
-        if ('phi_val' in self.ctx and self.ctx['phi_val'] >= _INTERFACE_TOL) or \
-           ('active_side' in self.ctx and self.ctx['active_side'] != '+'):
-            
-            # Get operand shape and return a correctly-shaped zero
-            sh = self.shape.visit(n.operand)
-            if sh.dim == 0: return 0.0
-            if sh.dim == 1: return np.zeros(2) # Assumes 2D vectors
-            # Add other dimensions if needed
-            raise TypeError(f"Unsupported dimension {sh.dim} in Pos/Neg zeroing.")
-
-        return self.visit(n.operand)
-
-    def visit_Neg(self, n):
-        """
-        Evaluates the operand if on the negative side (phi<0), otherwise returns
-        a zero of the same shape as the operand.
-        """
-        # print("visit Neg zeroing: ctx=", self.ctx)
-        # The '-' side is strictly phi < 0
-        if ('phi_val' in self.ctx and self.ctx['phi_val'] < _INTERFACE_TOL) or \
-           ('active_side' in self.ctx and self.ctx['active_side'] != '-'):
-
-            # Get operand shape and return a correctly-shaped zero
-            sh = self.shape.visit(n.operand)
-            if sh.dim == 0: return 0.0
-            if sh.dim == 1: return np.zeros(2) # Assumes 2D vectors
-            raise TypeError(f"Unsupported dimension {sh.dim} in Pos/Neg zeroing.")
-            
-        return self.visit(n.operand)
-    def visit_Sum(self,n): return self.visit(n.a)+self.visit(n.b)
-    def visit_Sub(self,n): return self.visit(n.a)-self.visit(n.b)
-
-    # ------------------------------------------------------------------
-    #  Core basis cache (single side – volume) -------------------------
-    # ------------------------------------------------------------------
-    def _make_basis_cache(self, xi: float, eta: float, JinvT: np.ndarray):
-        """Full‑length (n_dofs_local) basis & grad for every field."""
-        φ_full = self.me.basis(xi, eta)            # (ndofs,)
-        g_full = self.me.grad(xi, eta) @ JinvT      # (ndofs,2)
-
-        cache: Dict[str, Dict[str, np.ndarray]] = {}
-        for fld in self.me.field_names:
-            sl = self.me.slice(fld)
-            val  = np.zeros_like(φ_full);  val[sl]  = φ_full[sl]
-            grad = np.zeros_like(g_full); grad[sl] = g_full[sl]
-            cache[fld] = { 'val': val, 'grad': grad }
-        return cache, g_full
-
-    # ------------------------------------------------------------------
-    #  Role‑aware helpers ----------------------------------------------
-    # ------------------------------------------------------------------
-    def _basis_val(self, field: str, role: str):
-        bv = self.ctx['basis_values']
-        if '+' in bv:  # interface dict  { '+': …, '-': … }
-            side = self.ctx['active_side'] if role == 'test' else self.ctx.get('trial_side', '+')
-            return bv[side][field]['val']
-        return bv[field]['val']
-
-    def _basis_grad(self, field: str, role: str):
-        bg = self.ctx['basis_values']
-        if '+' in bg:
-            side = self.ctx['active_side'] if role == 'test' else self.ctx.get('trial_side', '+')
-            return bg[side][field]['grad']
-        return bg[field]['grad']
-
-    # finite element functions ------------------------------------------
-
-    def visit_TestFunction(self, n):
-        return self._basis_val(n.field_name, 'test')
-
-    def visit_TrialFunction(self, n):
-        return self._basis_val(n.field_name, 'trial')
-
-    def visit_VectorTestFunction(self, n):
-        return np.concatenate([self._basis_val(f, 'test') for f in n.field_names])
-
-    def visit_VectorTrialFunction(self, n):
-        return np.concatenate([self._basis_val(f, 'trial') for f in n.field_names])
-
-
-    # ------------------------------------------------------------------
-    #  Data visitors ----------------------------------------------------
-    # ------------------------------------------------------------------
-    def _local_dofs(self): return self.dh.get_elemental_dofs(self.ctx['element_id'])
-    
-    def visit_Function(self, n):
-        u_loc = n.get_nodal_values(self._local_dofs())
-        ϕ = self._basis_val(n.field_name,'test')  # role irrelevant for value
-        return ϕ @ u_loc
-    
-    def visit_VectorFunction(self, n):
-        u_loc = n.get_nodal_values(self._local_dofs())
-        out=[]
-        for f in n.field_names:
-            ϕ=self._basis_val(f,'test'); out.append(ϕ @ u_loc[self.me.slice(f)])
-        return np.array(out)
-
-    # differential ops ---------------------------------------------------
-    def visit_Grad(self, n):
+    def _visit_VectorTestFunction(self, n):
+        logger.debug(f"Visiting VectorTestFunction: {n.field_names}")
+        return VecOpInfo(np.stack([self._b(f) for f in n.field_names]), role="test")
+    def _visit_VectorTrialFunction(self, n):
+        logger.debug(f"Visiting VectorTrialFunction: {n.field_names}")
+        return VecOpInfo(np.stack([self._b(f) for f in n.field_names]), role="trial")
+    # ================== VISITORS: OPERATORS ========================
+    def _visit_Grad(self, n: Grad):
+        """Return GradOpInfo with shape (k, n_dofs_local, d)."""
         op = n.operand
-        if isinstance(op, (TestFunction, TrialFunction)):
-            role = 'test' if isinstance(op, TestFunction) else 'trial'
-            return self._basis_grad(op.field_name, role)
-        if isinstance(op, (VectorTestFunction, VectorTrialFunction)):
-            return self.ctx['grad_full']  # 22×2 once, no duplication
-        if isinstance(op, Function):
-            gradϕ = self._basis_grad(op.field_name, 'data')
-            return gradϕ.T @ op.get_nodal_values(self._local_dofs())
-        if isinstance(op, VectorFunction):
-            G = np.zeros((len(op.field_names), 2))
-            u_loc = op.get_nodal_values(self._local_dofs())
-            for i, f in enumerate(op.field_names):
-                G[i, :] = self._basis_grad(f, 'test').T @ u_loc[self.me.slice(f)]
-            return G
-        raise NotImplementedError(type(op))
+        logger.debug(f"Entering _visit_Grad for operand type {type(op)}")
 
+        # ------------------------------------------------------------
+        # 1.  Determine role  (affects assembly later on)
+        # ------------------------------------------------------------
+        if isinstance(op, (TestFunction, VectorTestFunction)):
+            role = "test"
+        elif isinstance(op, (TrialFunction, VectorTrialFunction)):
+            role = "trial"
+        elif isinstance(op, (Function, VectorFunction)):
+            role = "function"
+        else:
+            raise NotImplementedError(f"grad() not implemented for {type(op)}")
 
+        # ------------------------------------------------------------
+        # 2.  Build one gradient block per component / field
+        # ------------------------------------------------------------
 
-    def visit_DivOperation(self,n):
-        grads = self.visit(Grad(n.operand))
-        return grads[:,0]+grads[:,1] if grads.ndim==2 else grads[0]+grads[1]
+        if hasattr(op, "field_names"):
+            fields = op.field_names
+        else:
+            fields = [op.field_name]
+
+        k_blocks = []
+        for fld in fields:
+            g = self._g(fld)                                    # (22,2)
+
+            if role == "function":                              # data → scale rows
+                coeffs = op.get_nodal_values(self._local_dofs()) # (22,)
+                g = coeffs[:, None] * g                         # (22,2)
+
+            # For test/trial the raw g is already correct
+            k_blocks.append(g)
+
+        return GradOpInfo(np.stack(k_blocks), role=role)
+
+    def _visit_DivOperation(self, n: DivOperation):
+        grad_op = self._visit(Grad(n.operand))           # (k, n_loc, d)
+        logger.debug(f"Visiting DivOperation for operand of type {type(n.operand)}, grad_op shape: {grad_op.data.shape}")
+
+        # ∇·v  =  Σ_i ∂v_i/∂x_i   → length n_loc (22) vector
+        div_vec = np.sum([grad_op.data[i, :, i]          # pick diagonal components
+                        for i in range(grad_op.data.shape[0])],
+                        axis=0)
+
+        # Decide which side of the bilinear form this lives on
+        op = n.operand
+        if isinstance(op, (TestFunction, VectorTestFunction)):
+            role = "test"
+        elif isinstance(op, (TrialFunction, VectorTrialFunction)):
+            role = "trial"
+        elif isinstance(op, (Function, VectorFunction)):
+            role = "function"
+        else:
+            role = "none"
+
+        # Wrap as VecOpInfo with a single component so that _visit_Prod
+        # can use the role information to orient the outer product.
+        return VecOpInfo(np.stack([div_vec]), role=role)
     
-    def visit_Analytic(self, node): return node.eval(self.ctx['x_phys'])
 
-    # algebra -----------------------------------------------------------
-    
-    
-    def visit_Div(self, n):
+
+    # ================= VISITORS: ALGEBRAIC ==========================
+    def _visit_Sum(self, n): return self._visit(n.a) + self._visit(n.b)
+    def _visit_Sub(self, n):
+        a = self._visit(n.a)
+        b = self._visit(n.b)
+        return a - b
+    def _visit_Neg(self, n): return -self._visit(n.operand)
+    def _visit_Pos(self, n): return self._visit(n.operand)
+    def _visit_Div(self, n):
         """Handles scalar, vector, or tensor division by a scalar."""
-        numerator = self.visit(n.a)
-        denominator = self.visit(n.b)
+        numerator = self._visit(n.a)
+        denominator = self._visit(n.b)
 
         # NumPy correctly handles element-wise division of an array by a scalar.
         return numerator / denominator
 
-    def _maybe_outer(self,a,b):
-        if not self.ctx['is_rhs'] and a.ndim==b.ndim==1 and a.size==self.me.n_dofs_local:
-            return np.outer(a,b)
-        return None
-    
-    def visit_Inner(self, n):
-        A=self.visit(n.a); B=self.visit(n.b)
-        if not self.ctx['is_rhs'] and A.ndim==B.ndim==2 and A.shape[0]==self.me.n_dofs_local:
-            return np.outer(A[:,0],B[:,0])+np.outer(A[:,1],B[:,1])
-        return np.sum(A*B)
+    def _visit_Prod(self, n: Prod):
+        a = self._visit(n.a)
+        b = self._visit(n.b)
+        a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo)) else a
+        b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
+        a_vec = np.squeeze(a_data) 
+        b_vec = np.squeeze(b_data)
+        role_a = getattr(a, 'role', None)
+        role_b = getattr(b, 'role', None)
+        # Use repr for detailed logging of symbolic expression parts
+        logger.debug(f"Entering _visit_Prod for  ('{n.a!r}' * '{n.b!r}') on {'RHS' if self.ctx['rhs'] else 'LHS'}, a.info={getattr(a, 'info', None)}, b.info={getattr(b, 'info', None)}")
+        logger.debug(f"  a: {type(a)} (role={role_a}), b: {type(b)} (role={role_b})")
 
 
-    # dot product ---------------------------------------------------
-    #----------------------------------------------------------------------------------------------------------
-    def visit_Prod(self, n):
-        a=self.visit(n.a); b=self.visit(n.b); out=self._maybe_outer(a,b); return out if out is not None else a*b
-    
+        # ------------------------------------------------------------------
+        # scalar × scalar  (Constant * Constant  or numeric literals)
+        # ------------------------------------------------------------------
+        if np.isscalar(a) and np.isscalar(b):
+            return a * b
+        
 
-   
-   
+        # ------------------------------------------------------------------
+        # scalar x vector multiplication
+        # ------------------------------------------------------------------
+        if np.isscalar(a) and isinstance(b, (VecOpInfo, GradOpInfo, np.ndarray)):
+            return a * b
+        if np.isscalar(b) and isinstance(a, (VecOpInfo, GradOpInfo, np.ndarray)):
+            return b * a
 
-    def visit_Dot(self, n):
-        a=self.visit(n.a); b=self.visit(n.b); out=self._maybe_outer(a,b)
-        return out if out is not None else a @ b
-           
+        # --- RHS: one operand MUST be a value, the other a Test function basis ---
+        if self.ctx["rhs"]:
+            # (known) VecOpInfo  *  (test) VecOpInfo  → length-n vector
+            if isinstance(a, VecOpInfo) and a.role == "function" and \
+            isinstance(b, VecOpInfo) and b.role == "test":
 
-    # def visit_Jump(self,n):
-    #     side = self.ctx['active_side']
-    #     if side=='+': return self.visit(n.u_pos)
-    #     return self.visit(n.u_neg)
+                # scalar field (k = 1)  .................  p_k · div(v)
+                if a.data.shape[0] == 1:
+                    f_val = np.sum(a.data)                 # p(x_q)
+                    return f_val * b.data[0]               # p · div(v)
 
-    # def visit_Jump(self, n):                         # u(+) – u(–)
-    #     return self.visit(n.u_pos) - self.visit(n.u_neg)
-    
-    def visit_Jump(self, n):
-        """
-        Correct evaluation on CutFEM interfaces:
-        we must obtain *both* traces, regardless of the current φ-sign.
-        """
-        phi_orig = self.ctx.get('phi_val', None)
+                # vector field (k = 2)  ..................  (u_k − u_n , v)
+                return np.einsum("kn,kn->n", a.data, b.data, optimize=True)
 
-        # ----- “+” trace -------------------------------------------------
-        # Temporarily force phi to be positive to ensure the Pos() visitor
-        # evaluates its operand.
-        if phi_orig is not None:
-            self.ctx['phi_val'] = +1.0
-        u_pos = self.visit(n.u_pos)
+            # symmetric orientation
+            if isinstance(b, VecOpInfo) and b.role == "function" and \
+            isinstance(a, VecOpInfo) and a.role == "test":
 
-        # ----- “–” trace -------------------------------------------------
-        # Temporarily force phi to be negative to ensure the Neg() visitor
-        # evaluates its operand.
-        if phi_orig is not None:
-            self.ctx['phi_val'] = -1.0
-        u_neg = self.visit(n.u_neg)
+                if b.data.shape[0] == 1:
+                    f_val = np.sum(b.data)
+                    return f_val * a.data[0]
+                return np.einsum("kn,kn->n", b.data, a.data, optimize=True)
 
-        # ----- restore context ------------------------------------------
-        # Restore the original phi_val to prevent side-effects.
-        if phi_orig is None:
-            self.ctx.pop('phi_val', None)
-        else:
-            self.ctx['phi_val'] = phi_orig
+            # scalar Constant or numpy value times test basis 
+            if np.isscalar(a) and isinstance(b, VecOpInfo) and b.role == "test":
+                return a * b.data[0]
+            if np.isscalar(b) and isinstance(a, VecOpInfo) and a.role == "test":
+                return b * a.data[0]
+            
 
-        return u_pos - u_neg
+        # --- LHS: matrix assembly ---
+        else: 
+            # # Case 1: One operand is a scalar value (from Constant or evaluated expression like inner/dot)
+            # if np.isscalar(a) or (isinstance(a, np.ndarray) and a.ndim == 0):
+            #     return a * b
+            # if np.isscalar(b) or (isinstance(b, np.ndarray) and b.ndim == 0):
+            #     return b * a
 
-    def visit_FacetNormal(self,n):
-        return self.ctx['normal']
+            # Case 2: Both operands represent fields. Unwrap their data for outer product.
+            # ✓  (test , trial)   →  rows = test, cols = trial
+            if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+                # v (test)  ·  w (trial / function)
+                if a.role == "test"  and b.role in {"trial", "function"}:
+                    # M_nm = Σ_k  a_k,n  *  b_k,m
+                    return np.einsum("kn,km->nm", a.data, b.data, optimize=True)
+                if b.role == "test"  and a.role in {"trial", "function"}:
+                    return np.einsum("kn,km->nm", b.data, a.data, optimize=True)
+            
+            # fallback (same-role or plain arrays)
+            # if a_vec.ndim == 1 and b_vec.ndim == 1:
+            #     return np.outer(a_vec, b_vec)
 
-    # ---------- core assembly helpers -----------------------------------
-    def _apply_bcs(self,K,F,bcs):
+        raise TypeError(f"Unsupported product 'type(a)={type(a)}, type(b)={type(b)}'{n.a} * {n.b}' for {'RHS' if self.ctx['rhs'] else 'LHS'}")
+
+
+        
+
+    def _visit_Dot(self, n: Dot):
+        a = self._visit(n.a)
+        b = self._visit(n.b)
+        a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo)) else a
+        b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
+        logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
+
+        def rhs():
+            # ------------------------------------------------------------------
+            # RHS  •  dot(  Function ,  Test  )   or   dot( Test , Function )
+            # ------------------------------------------------------------------
+            if  isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+                # if a.role == "function" and b.role == "test":
+                #     # f_k,n · v_k,n  →  Σ_k f_k,n v_k,n   (length-n vector for RHS)
+                #     return np.einsum("km,kn->n", a.data, b.data, optimize=True)
+                # if b.role == "function" and a.role == "test":
+                #     return np.einsum("km,kn->n", b.data, a.data, optimize=True)
+                 #  func · test
+                if a.role == "function" and b.role == "test":
+                    u_val = np.sum(a.data, axis=1)                 # <- 1-D (k,)
+                    return np.einsum("k,kn->n", u_val, b.data, optimize=True)
+
+                #  test · func
+                if b.role == "function" and a.role == "test":
+                    u_val = np.sum(b.data, axis=1)                 # <- 1-D (k,)
+                    return np.einsum("k,kn->n", u_val, a.data, optimize=True)
+
+            # ------------------------------------------------------------------
+            # Function · Function   (needed for  dot(grad(u_k), u_k)  on RHS)
+            # ------------------------------------------------------------------
+            if  isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo) \
+            and a.role == b.role == "function":
+                u_val   = np.sum(b.data, axis=1)                # (d,)
+                data_fk = np.einsum("knd,d->kn", a.data, u_val) # keep basis-index n
+                return VecOpInfo(data_fk, role="function")
+            # Constant (numpy 1-D) · test VecOpInfo  → length-n vector
+            if isinstance(a, np.ndarray) and a.ndim == 1 and \
+            isinstance(b, VecOpInfo) and b.role == "test":
+                return b.dot_const(a)
+
+            if isinstance(b, np.ndarray) and b.ndim == 1 and \
+            isinstance(a, VecOpInfo) and a.role == "test":
+                return a.dot_const(b)
+
+        if self.ctx["rhs"]:
+            result = rhs()
+            if result is not None:
+                return result
+            else:
+                raise TypeError(f"Unsupported dot product for RHS: '{n.a} . {n.b}'")
+        
+        # Dot product between a basis field and a numerical vector
+        if isinstance(a, (VecOpInfo, GradOpInfo)) and isinstance(b, np.ndarray): return a.dot_const(b) if a.ndim==2 else a.dot_vec(b)
+        if isinstance(b, (VecOpInfo, GradOpInfo)) and isinstance(a, np.ndarray): return b.dot_const(a) if b.ndim==2 else b.dot_vec(a)
+        
+
+        if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+            logger.debug(f"visit dot: Both operands are VecOpInfo: {a.role} . {b.role}")
+            if a.role == "test" and b.role in {"trial", "function"}:
+                return np.dot(a_data.T, b_data)  # test . trial
+            elif b.role == "test" and a.role in {"trial", "function"}:
+                return np.dot(b_data.T, a_data)  # tiral . test
+        
+        # case grad(u) . u_k
+        if isinstance(a, GradOpInfo) and ((isinstance(b, VecOpInfo) \
+            and (b.role == "function" )) 
+            ):
+
+            # velocity value at this quadrature point
+            u_val = np.sum(b.data, axis=1)                 # (d,)
+
+            # works for k = 1 (scalar) and k = 2 (vector) alike
+            data  = np.einsum("knd,d->kn", a.data, u_val, optimize=True)
+
+            return VecOpInfo(data, role=a.role)
+        
+        # ------------------------------------------------------------------
+        # Case:  VectorFunction · Grad(⋅)      u_k · ∇w
+        # ------------------------------------------------------------------
+        if isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo) \
+        and a.role == "function":
+
+            # 1. velocity value at the current quadrature point
+            u_val = np.sum(a.data, axis=1)                  # (d,)  —   u_d(ξ)
+
+            # 2. dot with each gradient row   w_{k,n} = Σ_d u_d ∂_d φ_{k,n}
+            #    Works for both scalar (k = 1) and vector (k = 2) targets.
+            data  = np.einsum("d,knd->kn", u_val, b.data, optimize=True)
+
+            # 3. The role is inherited from the Grad operand (trial / test / function)
+            return VecOpInfo(data, role=b.role)
+        
+        # ------------------------------------------------------------------
+        # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u
+        # ------------------------------------------------------------------
+        if isinstance(a, GradOpInfo) and a.role == "function" \
+        and isinstance(b, VecOpInfo)  and b.role == "trial":
+
+            # (1)  value of ∇u_k at this quad-point
+            grad_val = np.sum(a.data, axis=1)          # (k,d)
+
+            # (2)  w_i,n = Σ_d (∇u_k)_i,d  *  φ_{u,d,n}
+            data = np.einsum("kd,kn->kn", grad_val, b.data, optimize=True)
+
+            return VecOpInfo(data, role="trial")
+        
+        # ------------------------------------------------------------------
+        # Case:  Vec(Function) · Grad(Trial)      u_k · ∇u
+        # ------------------------------------------------------------------
+        if isinstance(a, VecOpInfo)  and a.role == "function" \
+        and isinstance(b, GradOpInfo) and b.role == "trial":
+
+            u_val = np.sum(a.data, axis=1)             # (d,)
+            data  = np.einsum("d,knd->kn", u_val, b.data, optimize=True)
+            return VecOpInfo(data, role="trial")
+        
+        # Both are numerical vectors (RHS)
+        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray): return np.dot(a,b)
+
+        raise TypeError(f"Unsupported dot product '{n.a} . {n.b}'")
+
+    def _visit_Inner(self, n: Inner):
+        a = self._visit(n.a)
+        b = self._visit(n.b)
+        logger.debug(f"Entering _visit_Inner for types {type(a)} : {type(b)}")
+
+        # ------------------------------------------------------------------
+        # RHS:  inner( Grad(Function) , Grad(Test) )   or   symmetric case
+        #        → length-n vector  F_n = Σ_{k,d}  (∑_m ∂_d u_k φ_m) · ∂_d v_k,n
+        # ------------------------------------------------------------------
+        if self.ctx.get("rhs"):
+            if isinstance(a, GradOpInfo) and isinstance(b, GradOpInfo):
+                # Function · Test  ............................................
+                if a.role == "function" and b.role == "test":
+                    grad_val = np.sum(a.data, axis=1)            # (k,d)  ∇u_k(x_q)
+                    return np.einsum("kd,knd->n", grad_val, b.data, optimize=True)
+
+                # Test · Function  (rare but symmetrical) .............
+                if b.role == "function" and a.role == "test":
+                    grad_val = np.sum(b.data, axis=1)            # (k,d)
+                    return np.einsum("kd,knd->n", grad_val, a.data, optimize=True)
+
+        # Both are Info objects of the same kind -> matrix assembly
+        if type(a) is type(b) and isinstance(a, (VecOpInfo, GradOpInfo)):
+            return a.inner(b)
+
+        # One is a basis, the other a numerical tensor value (RHS or complex LHS)
+        if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray): return a.contracted_with_tensor(b)
+        if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray): return b.contracted_with_tensor(a)
+        
+        # RHS: both are functions, result is scalar integral
+        if self.ctx['rhs'] and isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+             return np.sum(a.data * b.data)
+
+        raise TypeError(f"Unsupported inner product '{n.a} : {n.b}'")
+        
+    # Visitor dispatch
+    def _visit(self, node): return self._dispatch[type(node)](node)
+
+    # ======================= ASSEMBLY CORE ============================
+    def _assemble_form(self, form, target):
+        if form is None: return
+        integrals = form.integrals if hasattr(form, "integrals") else [form]
+        for ing in integrals:
+            if ing.measure.domain_type != "volume":
+                logger.error(f"Unsupported integral type: {ing.measure.domain_type}")
+                raise NotImplementedError
+            self._assemble_volume(ing, target)
+
+    def _assemble_volume(self, integral: Integral, matvec):
+        mesh = self.me.mesh
+        # Use a higher quadrature order for safety, esp. with mixed orders
+        q_order = self.qorder or self.me.mesh.poly_order + max(self.me._field_orders.values()) + 1
+        qp, qw = volume(mesh.element_type, q_order)
+        fields = _all_fields(integral.integrand)
+        rhs = self.ctx["rhs"]
+
+        for eid, element in enumerate(mesh.elements_list):
+            if rhs:
+                loc = np.zeros(self.me.n_dofs_local)
+            else:
+                loc = np.zeros((self.me.n_dofs_local, self.me.n_dofs_local))
+            
+            for (xi, eta), w in zip(qp, qw):
+                J = transform.jacobian(mesh, eid, (xi, eta))
+                detJ = abs(np.linalg.det(J))
+                JiT = np.linalg.inv(J).T
+                
+                # Cache basis values and gradients for this quadrature point
+                self._basis_cache.clear()
+                for f in fields:
+                    val = self.me.basis(f, xi, eta)
+                    g_ref = self.me.grad_basis(f, xi, eta)
+                    self._basis_cache[f] = {"val": val, "grad": g_ref @ JiT}
+                
+                self.ctx["eid"] = eid
+                integrand_val = self._visit(integral.integrand)
+                loc += w * detJ * integrand_val
+            
+            gdofs = self.dh.get_elemental_dofs(eid)
+            if rhs:
+                np.add.at(matvec, gdofs, loc)
+            else:
+                # Efficiently add local matrix to sparse global matrix
+                r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
+                matvec[r, c] += loc
+        
+        self.ctx.pop("eid", None)
+
+    # ====================== BC handling ===============================
+    def _apply_bcs(self, K, F, bcs):
+        # This method remains unchanged from your provided file
+        if not bcs: return
         data = self.dh.get_dirichlet_data(bcs)
         if not data: return
-        rows = np.fromiter(data.keys(),int)
-        vals = np.fromiter(data.values(),float)
-        u = np.zeros_like(F); u[rows]=vals
-        F -= K@u
+        rows = np.fromiter(data.keys(), dtype=int)
+        vals = np.fromiter(data.values(), dtype=float)
+        
+        # Apply to RHS vector F
+        F -= K @ np.bincount(rows, weights=vals, minlength=F.size)
+        
+        # Zero out rows and columns in the matrix
         K = K.tolil()
-        K[rows,:]=0; K[:,rows]=0; K[rows,rows]=1.0
-        F[rows]=vals
-
-    def _assemble_form(self, form, matvec):
-        """
-        Dispatch each integral in *form* to the proper low-level routine.
-        Works whether *form* is an Integral or a Form holding many integrals.
-        """
-        from pycutfem.ufl.measures import Integral
-
-        # 1. Normalise *form* → iterable of Integrals
-        if isinstance(form, Integral):
-            integrals = [form]
-        elif hasattr(form, "integrals"):
-            integrals = form.integrals
-        else:                           # e.g. Constant(0.0) on the dummy LHS
-            return
-
-        # 2. Route every integral to its dedicated assembler
-        for intg in integrals:
-            if not isinstance(intg, Integral):        # skip Stray constants, etc.
-                continue
-
-            kind = intg.measure.domain_type
-            if   kind == "volume":          self._assemble_volume(intg, matvec)
-            elif kind == "interior_facet":  self._assemble_facet(intg,  matvec)
-            elif kind == "interface":       self._assemble_interface(intg, matvec)
-
-      
-
-
-    # volume ------------------------------------------------------------
-    # In ufl/compilers.py
-
-    def _assemble_volume(self, integral, matvec):
-        mesh = self.me.mesh; q = self.qorder or mesh.poly_order + 2
-        q_pts, q_wts = volume(mesh.element_type, q)
-        for el in mesh.elements_list:
-            dofs = self.dh.get_elemental_dofs(el.id)
-            local = (np.zeros(self.me.n_dofs_local) if self.ctx['is_rhs']
-                     else np.zeros((self.me.n_dofs_local, self.me.n_dofs_local)))
-            for (xi, eta), w in zip(q_pts, q_wts):
-                J = transform.jacobian(mesh, el.id, (xi, eta))
-                detJ = abs(np.linalg.det(J)); JinvT = np.linalg.inv(J).T
-                cache, g_full = self._make_basis_cache(xi, eta, JinvT)
-                self.ctx.update({
-                    'element_id':   el.id,
-                    'basis_values': cache,
-                    'grad_full':    g_full,
-                    'x_phys': transform.x_mapping(mesh, el.id, (xi,eta)),
-                    'x':      transform.x_mapping(mesh, el.id, (xi,eta)),
-                    'side': ""
-                })
-                local += w * detJ * self.visit(integral.integrand)
-            if self.ctx['is_rhs']:
-                np.add.at(matvec, dofs, local)
-            else:
-                r, c = np.meshgrid(dofs, dofs, indexing='ij'); matvec[r, c] += local            
-        # Context cleanup (good practice)
-        for key in ('phi_val', 'normal', 'basis_values', 'x', 'nodal_vals', 'elem_id', 'x_phys', 'side'):
-            self.ctx.pop(key, None)
-    
-    
-    # ------------------------------------------------------------------
-    #  Interface integrals (CutFEM) – one-sided, no extra DOFs
-    # ------------------------------------------------------------------
-    # In class FormCompiler:
-
-    def _assemble_interface(self, intg, matvec):
-        """
-        Assembles integrals over non-conforming interfaces defined by a level set.
-
-        This robust implementation evaluates the entire integrand at once, correctly
-        handling scalar and vector-valued expressions for bilinear forms, linear
-        forms, and hooked functionals without relying on term-splitting.
-        """
-        # Use a logger for clear, hierarchical debugging output.
-        # (Assumes you have `import logging` at the top of the file)
-        log = logging.getLogger(__name__)
-        log.debug(f"Assembling interface integral: {intg}")
-
-        # --- 1. Initial Setup ---
-        rhs = self.ctx['is_rhs']
-        level_set = intg.measure.level_set
-        if level_set is None:
-            raise ValueError("dInterface measure requires a level_set.")
-            
-        mesh = next(iter(self.dh.fe_map.values())) # Any mesh known to the DoF handler
-        qdeg = self.qorder or mesh.poly_order + 2
-        fields = _all_fields(intg.integrand)
+        K[rows, :] = 0
+        K[:, rows] = 0
+        K[rows, rows] = 1.0
         
-        # Check for a user-defined hook for functionals.
-        hook = self.ctx['hooks'].get(type(intg.integrand))
-        if hook and hook.get('name') not in self.ctx.get('scalar_results', {}):
-            # Initialize the result bucket; it might hold a scalar or a vector.
-            self.ctx.setdefault('scalar_results', {})[hook['name']] = 0.0
-
-        try:
-            # --- 2. Loop Over All Cut Elements in the Mesh ---
-            for elem in mesh.elements_list:
-                if elem.tag != 'cut' or len(elem.interface_pts) != 2:
-                    continue
-                
-                self.ctx['elem_id'] = elem.id
-                log.debug(f"  Processing cut element: {elem.id}")
-
-                # --- 3. Quadrature Rule on the Physical Interface Segment ---
-                p0, p1 = elem.interface_pts
-                qp, qw = line_quadrature(p0, p1, qdeg)
-
-                # --- 4. Pre-compute Basis Functions for this Element ---
-                # This is a key optimization. We evaluate all basis functions for all
-                # quadrature points on this element's interface segment at once.
-                basis_cache = {}
-                if fields:
-                    for fld in fields:
-                        fm = self.dh.fe_map[fld]
-                        ref = get_reference(fm.element_type, fm.poly_order)
-                        vals, grads = [], []
-                        for x_q in qp:
-                            xi, eta = transform.inverse_mapping(fm, elem.id, x_q)
-                            J = transform.jacobian(fm, elem.id, (xi, eta))
-                            # The mathematically correct transformation for row-vector gradients
-                            Jinv = np.linalg.inv(J)
-                            vals.append(ref.shape(xi, eta))
-                            grads.append(ref.grad(xi, eta) @ Jinv)
-                        # Store as efficient NumPy arrays
-                        basis_cache[fld] = {'val': np.asarray(vals), 'grad': np.asarray(grads)}
-                
-                # --- 5. Determine Assembly Path (Bilinear, Linear, or Functional) ---
-                trial, test = _trial_test(intg.integrand)
-
-                # --- PATH A: Bilinear Form (e.g., a(u,v), contributes to the matrix) ---
-                if not rhs and trial and test:
-                    row_dofs = self._elm_dofs(test, elem.id)
-                    col_dofs = self._elm_dofs(trial, elem.id)
-                    loc = np.zeros((len(row_dofs), len(col_dofs)))
-                    
-                    for k, (x, w) in enumerate(zip(qp, qw)):
-                        # Set context for the current quadrature point
-                        self.ctx['x'], self.ctx['phi_val'] = x, level_set(x)
-                        self.ctx['normal'] = level_set.gradient(x)
-                        if fields:
-                            self.ctx['basis_values'] = {f: {'val': basis_cache[f]['val'][k], 'grad': basis_cache[f]['grad'][k]} for f in fields}
-                        
-                        # Evaluate the ENTIRE integrand at once
-                        integrand_val = self.visit(intg.integrand)
-                        loc += w * integrand_val
-                    
-                    matvec[np.ix_(row_dofs, col_dofs)] += loc
-                    log.debug(f"    Assembled {loc.shape} local matrix for element {elem.id}")
-
-                # --- PATH B: Linear Form (e.g., L(v)) or Functional (e.g., dot(jump,n)) ---
-                else:
-                    # Initialize accumulator correctly based on the result shape
-                    acc = None
-                    
-                    # Main Quadrature Loop
-                    for k, (x, w) in enumerate(zip(qp, qw)):
-                        self.ctx['x'], self.ctx['phi_val'] = x, level_set(x)
-                        self.ctx['normal'] = level_set.gradient(x)
-                        if fields:
-                            self.ctx['basis_values'] = {f: {'val': basis_cache[f]['val'][k], 'grad': basis_cache[f]['grad'][k]} for f in fields}
-                        
-                        integrand_val = self.visit(intg.integrand)
-                        
-                        # Initialize accumulator on the first pass
-                        if acc is None:
-                            acc = w * np.asarray(integrand_val)
-                        else:
-                            acc += w * integrand_val
-
-                    # Add the accumulated result to the correct global object
-                    if acc is not None:
-                        if rhs: # It's a linear form (RHS)
-                            row_dofs = self._elm_dofs(test, elem.id)
-                            matvec[row_dofs] += acc
-                            log.debug(f"    Assembled {acc.shape} local vector for element {elem.id}")
-                        elif hook: # It's a hooked functional
-                            self.ctx['scalar_results'][hook['name']] += acc
-                            log.debug(f"    Accumulated functional '{hook['name']}' for element {elem.id}")
-
-        finally:
-            # --- 6. Final Context Cleanup ---
-            # Use a `finally` block to guarantee cleanup happens even if an error occurs.
-            for key in ('phi_val', 'normal', 'basis_values', 'x', 'elem_id'):
-                self.ctx.pop(key, None)
-            log.debug("Interface assembly finished. Context cleaned.")
-
-
-
-
-    # facet -------------------------------------------------------------
-    def _assemble_facet(self,intg,matvec):
-        rhs = self.ctx['is_rhs']
-         # ----- pick *any* mesh the dof-handler knows if the integrand
-        #       contains no FE fields (e.g. Constant * ds)
-        fields = _all_fields(intg.integrand)
-        mesh   = self.dh.fe_map[fields[0]] if fields else next(iter(self.dh.fe_map.values()))
-
-        # optional user-defined hook, e.g. {Constant: {'name':'perimeter'}}
-        hooks = self.ctx.get('hooks', {})          # <-- hooks were stored here
-        scalar_hook = None
-        for cls, cfg in hooks.items():             # accept subclass matches
-            if isinstance(intg.integrand, cls):
-                scalar_hook = cfg
-                break
-
-        if scalar_hook and scalar_hook['name'] not in self.ctx['scalar_results']:
-            self.ctx['scalar_results'][scalar_hook['name']] = 0.0
-        q = self.qorder or mesh.poly_order+2
-        edge_ids = intg.measure.defined_on.to_indices()
-        terms = _split_terms(intg.integrand)
-        level_set = getattr(intg.measure,'level_set',None)
-        print(f"level_set={level_set}")
-
-        for eid_edge in edge_ids:
-            edge = mesh.edge(eid_edge)
-            left,right = edge.left, edge.right
-            if right is None:  # boundary facet – treat right as ghost copy of left
-                continue
-                left,right = (edge.left, edge.left)
-            # decide pos/neg orientation using level_set if available
-            if level_set is not None:
-                phi_left = level_set(mesh.elements_list[left].centroid())
-                pos,neg = (left,right) if phi_left>=0 else (right,left)
-            else:
-                pos,neg = left,right
-            # quadrature pts on reference edge of pos element
-            loc_idx = mesh.elements_list[pos].edges.index(eid_edge)
-            glob_edge_idx = mesh.elements_list[pos].edges[loc_idx]
-            # print(loc_idx,mesh.elements_list[pos].edges)
-            qpts_ref, qwts = edge_quadrature_element(mesh.element_type, loc_idx, q)
-            for qp, w in zip(qpts_ref,qwts):
-                xq = transform.x_mapping(mesh,pos,qp)
-                self.ctx['normal'] = mesh.edges_list[glob_edge_idx].calc_normal_unit_vector()#transform.edge_unit_normal(mesh,pos,loc_idx)  # project helper must exist
-                jac1d = transform.jacobian_1d(mesh,pos,qp,loc_idx)
-                # ----- Constant / jump integrals – no basis evaluation needed
-                if scalar_hook and not fields:
-                    val = self.visit(intg.integrand)
-                    self._scalar_results[scalar_hook['name']] += val * jac1d * w
-                    continue
-                # side‑aware basis cache
-                bv={'+' : defaultdict(dict), '-' : defaultdict(dict)}
-                for side,eid in (('+',pos),('-',neg)):
-                    for fld in _all_fields(intg.integrand):
-                        fm = self.dh.fe_map[fld]
-                        ref = get_reference(fm.element_type,fm.poly_order)
-                        xi,eta = transform.inverse_mapping(fm,eid,xq)
-                        J = transform.jacobian(fm,eid,(xi,eta))
-                        JinvT = np.linalg.inv(J).T
-                        bv[side][fld]['val']=ref.shape(xi,eta)
-                        bv[side][fld]['grad']=ref.grad(xi,eta) @ JinvT
-                self.ctx['basis_values']=bv
-
-                for sgn,term in terms:
-                    trial,test=_trial_test(term)
-                    if rhs and test is None: continue
-                    if not rhs and (trial is None or test is None): continue
-
-                    for row_side,row_eid in (('+',pos),('-',neg)):
-                        self.ctx['active_side']=row_side
-                        rows = self._elm_dofs(test,row_eid)
-                        if rhs:
-                            val = self.visit(term)
-                            matvec[rows]+= sgn*w*jac1d*val
-                        else:
-                            for col_side,col_eid in (('+',pos),('-',neg)):
-                                self.ctx['trial_side']=col_side
-                                cols = self._elm_dofs(trial,col_eid)
-                                val = self.visit(term)
-                                matvec[np.ix_(rows,cols)]+= sgn*w*jac1d*val
-
-                self.ctx.pop('active_side',None)
-                self.ctx.pop('trial_side',None)
-
-    # dof helpers --------------------------------------------------------
-    def _elm_dofs(self, func, eid):
-        """Final, robust method to get all global element DOFs for any function type."""
-        if func is None:
-            return []
-        
-        # Check for any class with a `.space` attribute (VectorTrial/TestFunction)
-        if hasattr(func, 'space'):
-            return np.concatenate([self.dh.element_maps[f][eid] for f in func.space.field_names])
-
-        # Check for any class with a `.field_names` attribute (VectorFunction)
-        if hasattr(func, 'field_names'):
-            return np.concatenate([self.dh.element_maps[f][eid] for f in func.field_names])
-
-        # Fallback for scalar types (Function, TrialFunction, TestFunction)
-        if hasattr(func, 'field_name'):
-            return self.dh.element_maps[func.field_name][eid]
-            
-        raise TypeError(f"Cannot get element DOFs for object of type {type(func)}")
+        # Set values in the RHS vector
+        F[rows] = vals

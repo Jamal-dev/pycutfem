@@ -24,6 +24,7 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.measures import dx
 from pycutfem.ufl.forms import assemble_form
 from pycutfem.fem.reference import get_reference
+from pycutfem.fem.mixedelement import MixedElement
 
 # Imports for mapping and matrix conversion
 from scipy.optimize import linear_sum_assignment
@@ -112,11 +113,24 @@ def create_true_dof_map(dof_handler_pc, W_fenicsx):
 def setup_problems():
     nodes_q2, elems_q2, _, corners_q2 = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=2)
     mesh_q2 = Mesh(nodes=nodes_q2, element_connectivity=elems_q2, elements_corner_nodes=corners_q2, element_type="quad", poly_order=2)
-    nodes_q1, elems_q1, _, corners_q1 = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
-    mesh_q1 = Mesh(nodes=nodes_q1, element_connectivity=elems_q1, elements_corner_nodes=corners_q1, element_type="quad", poly_order=1)
-    fe_map_pc = {'ux': mesh_q2, 'uy': mesh_q2, 'p': mesh_q1}
-    dof_handler_pc = DofHandler(fe_map_pc, method='cg')
-    pc = {'du': VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy'])), 'dp': TrialFunction(FunctionSpace("pressure", ['p'])), 'v': VectorTestFunction(FunctionSpace("velocity", ['ux', 'uy'])), 'q': TestFunction(FunctionSpace("pressure", ['p'])), 'u_k': VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler_pc), 'p_k': Function(name="p_k", field_name='p', dof_handler=dof_handler_pc), 'u_n': VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handler_pc), 'rho': Constant(1.0), 'dt': Constant(0.1), 'theta': Constant(0.5), 'mu': Constant(1.0e-2)}
+    # nodes_q1, elems_q1, _, corners_q1 = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
+    # mesh_q1 = Mesh(nodes=nodes_q1, element_connectivity=elems_q1, elements_corner_nodes=corners_q1, element_type="quad", poly_order=1)
+    # fe_map_pc = {'ux': mesh_q2, 'uy': mesh_q2, 'p': mesh_q1}
+    mixed_element_pc = MixedElement(mesh_q2, field_specs={'ux': 2, 'uy': 2, 'p': 1})
+    dof_handler_pc = DofHandler(mixed_element_pc, method='cg')
+    velocity_fs = FunctionSpace("velocity", ['ux', 'uy'], dim=1)
+    pressure_fs = FunctionSpace("pressure", ['p'], dim=0)
+    pc = {'du': VectorTrialFunction(velocity_fs, dof_handler=dof_handler_pc), 
+          'dp': TrialFunction(pressure_fs, dof_handler=dof_handler_pc), 
+          'v': VectorTestFunction(velocity_fs, dof_handler=dof_handler_pc), 
+          'q': TestFunction(pressure_fs, dof_handler=dof_handler_pc), 
+          'u_k': VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler_pc), 
+          'p_k': Function(name="p_k", field_name='p', dof_handler=dof_handler_pc), 
+          'u_n': VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handler_pc), 
+          'rho': Constant(1.0,dim=0), 
+          'dt': Constant(0.1,dim=0), 
+          'theta': Constant(0.5,dim=0), 
+          'mu': Constant(1.0e-2,dim=0)}
     
     mesh_fx = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, 1, 1, dolfinx.mesh.CellType.quadrilateral)
     gdim = mesh_fx.geometry.dim
@@ -144,9 +158,10 @@ def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
     dofs_ux_pc = dof_handler_pc.get_field_slice('ux')
     dofs_uy_pc = dof_handler_pc.get_field_slice('uy')
     dofs_p_pc = dof_handler_pc.get_field_slice('p')
-    pc['u_k'].nodal_values[dofs_ux_pc] = u_k_p_k_data_pc[dofs_ux_pc]
-    pc['u_k'].nodal_values[dofs_uy_pc] = u_k_p_k_data_pc[dofs_uy_pc]
-    pc['p_k'].nodal_values[:] = u_k_p_k_data_pc[dofs_p_pc]
+    pc['u_k'].set_nodal_values(dofs_ux_pc, u_k_p_k_data_pc[dofs_ux_pc])
+    pc['u_k'].set_nodal_values(dofs_uy_pc, u_k_p_k_data_pc[dofs_uy_pc])
+    pc['p_k'].set_nodal_values(dofs_p_pc, u_k_p_k_data_pc[dofs_p_pc])
+   
     pc['c'] = Constant([0.5,-0.2],dim=1)
     # 
     fx_u_k_array = fenicsx['u_k'].x.array
@@ -278,7 +293,7 @@ if __name__ == '__main__':
         (1.0 - pc['theta']) * pc['mu'] * inner(grad(pc['u_n']), grad(pc['v'])) -
         
         # Pressure term
-        pc['p_k'] * div(pc['v']) -
+        pc['p_k'] * div(pc['v']) +
         
         # Continuity term
         pc['q'] * div(pc['u_k'])
@@ -328,7 +343,7 @@ if __name__ == '__main__':
             (1.0 - fenicsx['theta']) * fenicsx['mu'] * ufl.inner(ufl.grad(u_n_fx), ufl.grad(v_fx)) -
             
             # Pressure term
-            p_k_fx * ufl.div(v_fx) -
+            p_k_fx * ufl.div(v_fx) +
             
             # Continuity term
             q_fx * ufl.div(u_k_fx)
@@ -345,17 +360,20 @@ if __name__ == '__main__':
         "LHS Advection 2":   {'pc': pc['theta'] * pc['rho'] * dot(dot(grad(pc['u_k']), pc['du']), pc['v']) * dx(),            'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(ufl.grad(u_k_fx),du), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
         "LHS Pressure":      {'pc': -pc['dp'] * div(pc['v']) * dx(),                                                         'f_lambda': lambda deg: -dp * ufl.div(v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
         "LHS Continuity":    {'pc': pc['q'] * div(pc['du']) * dx(),                                                          'f_lambda': lambda deg: q * ufl.div(du) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
-        "RHS Time Derivative": {'pc': (pc['rho'] * dot(pc['u_k'] - pc['u_n'], pc['v']) / pc['dt']) * dx(),                       'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(u_k_fx - u_n_fx, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "RHS Time Derivative": {'pc': (pc['rho'] * dot(pc['u_k'] - pc['u_n'], pc['v']) / pc['dt']) * dx(),                       'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(u_k_fx - u_n_fx, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
         "RHS Advection":     {'pc': pc['theta'] * pc['rho'] * dot(dot(grad(pc['u_k']), pc['u_k']), pc['v']) * dx(),          'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(ufl.grad(u_k_fx),u_k_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
         "LHS Scalar Advection": {'pc': dot(grad(pc['dp']), pc['u_k']) * pc['q'] * dx(), 'f_lambda': lambda deg: ufl.dot(ufl.grad(dp), u_k_fx) * q * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
+        "LHS Scalar Advection 2": {'pc': dot(pc['u_k'], grad(pc['dp'])) * pc['q'] * dx(), 'f_lambda': lambda deg: ufl.dot(u_k_fx, ufl.grad(dp)) * q * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
         "LHS Vector Advection Constant": {'pc': dot(dot(grad(pc['du']), c_pc), pc['v']) * dx(), 'f_lambda': lambda deg: ufl.dot(ufl.dot(ufl.grad(du), c_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
         "Navier Stokes LHS": {'pc': jacobian_pc, 'f_lambda':  create_fenics_ns_jacobian, 'mat': True, 'deg': 5},
-        "Navier Stokes RHS": {'pc': residual_pc, 'f_lambda':  create_fenics_ns_residual, 'mat': False, 'deg': 5},
+        "RHS diffusion": {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['u_k']), grad(pc['v'])) * dx(),'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(u_k_fx), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg':4},
+        "RHS diffusion 2": {'pc': (1.0 - pc['theta']) * pc['mu'] * inner(grad(pc['u_n']), grad(pc['v'])) * dx(),'f_lambda': lambda deg: (1.0 - fenicsx['theta']) * fenicsx['mu'] * ufl.inner(ufl.grad(u_n_fx), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat':False, 'deg':4},
+        "Navier Stokes RHS": {'pc': residual_pc, 'f_lambda':  create_fenics_ns_residual, 'mat': False, 'deg': 6},
         "RHS pressure term": {'pc': pc['p_k'] * div(pc['v']) * dx(), 'f_lambda': lambda deg: p_k_fx * ufl.div(v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
         "RHS Continuity":    {'pc': pc['q'] * div(pc['u_k']) * dx(), 'f_lambda': lambda deg: q_fx * ufl.div(u_k_fx) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 6}
 
     }
-
+    pc_dummy_side = dot(Constant([0.0,0.0],dim=1), pc['v']) * dx()
     for name, forms in terms.items():
         J_pc, R_pc, J_fx, R_fx = None, None, None, None
         
@@ -363,14 +381,14 @@ if __name__ == '__main__':
         form_fx_compiled = dolfinx.fem.form(form_fx_ufl)
 
         if forms['mat']:
-            J_pc, _ = assemble_form(forms['pc'] == Constant(0.0) * pc['v'][0] * dx(), dof_handler_pc, quad_degree=forms['deg'])
+            J_pc, _ = assemble_form(forms['pc'] == pc_dummy_side, dof_handler_pc, quad_degree=forms['deg'])
             A = dolfinx.fem.petsc.assemble_matrix(form_fx_compiled)
             A.assemble()
             indptr, indices, data = A.getValuesCSR()
             J_fx_sparse = csr_matrix((data, indices, indptr), shape=A.getSize())
             J_fx = J_fx_sparse.toarray()
         else:
-            _, R_pc = assemble_form( Constant(0.0) * pc['v'][0] * dx()==forms['pc'], dof_handler_pc, quad_degree=forms['deg'])
+            _, R_pc = assemble_form( pc_dummy_side==forms['pc'], dof_handler_pc, quad_degree=forms['deg'])
             vec = dolfinx.fem.petsc.assemble_vector(form_fx_compiled)
             # CORRECTED: ghostUpdate is not needed for serial runs.
             R_fx = vec.array
