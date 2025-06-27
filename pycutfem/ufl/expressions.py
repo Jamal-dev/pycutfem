@@ -561,12 +561,19 @@ class Integral(Expression):
     def __init__(self, integrand, measure):
         self.integrand, self.measure = integrand, measure
     def __repr__(self): return f"Integral({self.integrand!r}, {self.measure!r})"
+    
     def __add__(self, other):
         from .forms import Form
         return Form([self, other])
-    def __neg__(self):
-        from pycutfem.ufl.expressions import Constant, Prod
-        return Integral(Prod(Constant(-1.0), self.integrand), self.measure)
+
+    def __sub__(self, other): 
+        from .forms import Form 
+        # Create a negated version of the other term and add it. 
+        return Form([self, other.__neg__()]) 
+
+    def __neg__(self): 
+        return Integral(self.integrand.__neg__(), self.measure) 
+    
     def __eq__(self, other):
         from .forms import Form, Equation
         return Equation(Form([self]), other)
