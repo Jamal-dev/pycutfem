@@ -23,6 +23,7 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.fem import transform
 from pycutfem.integration import volume
+from pycutfem.integration.quadrature import line_quadrature
 
 # Symbolic building blocks
 from pycutfem.ufl.expressions import (
@@ -30,14 +31,16 @@ from pycutfem.ufl.expressions import (
     VectorTestFunction, VectorTrialFunction,
     Function,    VectorFunction,
     Grad, DivOperation, Inner, Dot,
-    Sum, Sub, Prod, Pos, Neg,Div
+    Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
 from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo
+from pycutfem.ufl.analytic import Analytic
 
 logger = logging.getLogger(__name__)
+_INTERFACE_TOL = 1.0e-12 # New
 
 
 def _all_fields(expr):
@@ -61,6 +64,13 @@ def _all_fields(expr):
     walk(expr)
     return list(fields)
 
+# New: Helper to identify trial and test functions in an expression
+def _trial_test(expr): # New
+    """Finds the first trial and test function in an expression tree.""" # New
+    trial = expr.find_first(lambda n: isinstance(n, (TrialFunction, VectorTrialFunction))) # New
+    test = expr.find_first(lambda n: isinstance(n, (TestFunction, VectorTestFunction))) # New
+    return trial, test # New
+
 # ========================================================================
 #  The Compiler
 # ========================================================================
@@ -72,7 +82,7 @@ class FormCompiler:
             raise RuntimeError("A MixedElement‑backed DofHandler is required.")
         self.dh, self.me = dh, dh.mixed_element
         self.qorder = quadrature_order
-        self.ctx: Dict[str, Any] = {}
+        self.ctx: Dict[str, Any] = {"hooks": assembler_hooks or {}}
         self._basis_cache: Dict[str, Dict[str, np.ndarray]] = {}
         self.degree_estimator = PolynomialDegreeEstimator(dh)
         self._dispatch = {
@@ -86,7 +96,10 @@ class FormCompiler:
             DivOperation: self._visit_DivOperation, Sum: self._visit_Sum,
             Sub: self._visit_Sub, Prod: self._visit_Prod, Dot: self._visit_Dot,
             Inner: self._visit_Inner, Pos: self._visit_Pos, Neg: self._visit_Neg,
-            Div: self._visit_Div
+            Div: self._visit_Div,
+            Analytic: self._visit_Analytic,
+            FacetNormal: self._visit_FacetNormal,
+            Jump: self._visit_Jump,
         }
 
     # ============================ PUBLIC API ===============================
@@ -115,7 +128,46 @@ class FormCompiler:
         if n.dim ==0:
             return float(n.value)
         return np.asarray(n.value)
+    
+    def _visit_FacetNormal(self, n: FacetNormal): # New
+        """Returns the normal vector from the context.""" # New
+        if 'normal' not in self.ctx: # New
+            raise RuntimeError("FacetNormal accessed outside of a facet or interface integral context.") # New
+        return self.ctx['normal'] # New
+    
+    
+    def _visit_Pos(self, n: Pos): # New
+        """Evaluates operand only if on the positive side of an interface.""" # New
+        # The '+' side is where phi >= 0 (a closed set)
+        if 'phi_val' in self.ctx and self.ctx['phi_val'] < -_INTERFACE_TOL: # New
+            # We are on the strictly negative side, so return zero.
+            op_val = self._visit(n.operand) # New
+            return op_val * 0.0 # Scales scalars, arrays, and Info objects to zero # New
+        return self._visit(n.operand) # New
 
+    def _visit_Neg(self, n: Neg): # New
+        """Evaluates operand only if on the negative side of an interface.""" # New
+        # The '-' side is where phi < 0 (an open set)
+        if 'phi_val' in self.ctx and self.ctx['phi_val'] >= _INTERFACE_TOL: # New
+             # We are on the positive or zero side, so return zero.
+            op_val = self._visit(n.operand) # New
+            return op_val * 0.0 # New
+        return self._visit(n.operand) # New
+
+    def _visit_Jump(self, n: Jump): # New
+        """Robustly evaluates jump(u) = u(+) - u(-) across an interface.""" # New
+        phi_orig = self.ctx.get('phi_val') # New
+        # --- Evaluate positive side trace u(+) ---
+        self.ctx['phi_val'] = 1.0 # Force context to be on the '+' side # New
+        u_pos = self._visit(n.u_pos) # This will call _visit_Pos # New
+        # --- Evaluate negative side trace u(-) ---
+        self.ctx['phi_val'] = -1.0 # Force context to be on the '-' side # New
+        u_neg = self._visit(n.u_neg) # This will call _visit_Neg # New
+        # --- Restore context and return difference ---
+        self.ctx['phi_val'] = phi_orig # New
+        return u_pos - u_neg # New
+###########################################################################################3
+########### --- Functions and VectorFunctions (evaluated to numerical values) ---
     def _visit_Function(self, n: Function):
         logger.debug(f"Visiting Function: {n.field_name}")
         u_loc = n.get_nodal_values(self._local_dofs())      # (22,) padded
@@ -215,8 +267,7 @@ class FormCompiler:
         a = self._visit(n.a)
         b = self._visit(n.b)
         return a - b
-    def _visit_Neg(self, n): return -self._visit(n.operand)
-    def _visit_Pos(self, n): return self._visit(n.operand)
+
     def _visit_Div(self, n):
         """Handles scalar, vector, or tensor division by a scalar."""
         numerator = self._visit(n.a)
@@ -294,7 +345,7 @@ class FormCompiler:
 
             # Case 2: Both operands represent fields. Unwrap their data for outer product.
             # ✓  (test , trial)   →  rows = test, cols = trial
-            if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+            if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo): # mass matrix
                 # v (test)  ·  w (trial / function)
                 if a.role == "test"  and b.role in {"trial", "function"}:
                     # M_nm = Σ_k  a_k,n  *  b_k,m
@@ -325,27 +376,22 @@ class FormCompiler:
             if  isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
                 if a.role == "function" and b.role == "test":
                     # f_k,n · v_k,n  →  Σ_k f_k,n v_k,n   (length-n vector for RHS)
-                    return np.einsum("km,kn->n", a.data, b.data, optimize=True)
+                    # return np.einsum("km,kn->n", a.data, b.data, optimize=True)
+                    return a.dot_vec(b)  # function . test
                 if b.role == "function" and a.role == "test":
-                    return np.einsum("km,kn->n", b.data, a.data, optimize=True)
-                 #  func · test
-                # if a.role == "function" and b.role == "test":
-                #     u_val = np.sum(a.data, axis=1)                 # <- 1-D (k,)
-                #     return np.einsum("k,kn->n", u_val, b.data, optimize=True)
+                    # return np.einsum("km,kn->n", b.data, a.data, optimize=True)
+                    return b.dot_vec(a)  # test . function
 
-                # #  test · func
-                # if b.role == "function" and a.role == "test":
-                #     u_val = np.sum(b.data, axis=1)                 # <- 1-D (k,)
-                #     return np.einsum("k,kn->n", u_val, a.data, optimize=True)
 
             # ------------------------------------------------------------------
             # Function · Function   (needed for  dot(grad(u_k), u_k)  on RHS)
             # ------------------------------------------------------------------
             if  isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo) \
             and a.role == b.role == "function":
-                u_val   = np.sum(b.data, axis=1)                # (d,)
-                data_fk = np.einsum("knd,d->kn", a.data, u_val) # keep basis-index n
-                return VecOpInfo(data_fk, role="function")
+                # u_val   = np.sum(b.data, axis=1)                # (d,)
+                # data_fk = np.einsum("knd,d->kn", a.data, u_val) # keep basis-index n
+                # return VecOpInfo(data_fk, role="function")
+                return a.dot_vec(b)  # grad(u_k) . u_k
             # Constant (numpy 1-D) · test VecOpInfo  → length-n vector
             if isinstance(a, np.ndarray) and a.ndim == 1 and \
             isinstance(b, VecOpInfo) and b.role == "test":
@@ -370,9 +416,11 @@ class FormCompiler:
         if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
             logger.debug(f"visit dot: Both operands are VecOpInfo: {a.role} . {b.role}")
             if a.role == "test" and b.role in {"trial", "function"}:
-                return np.dot(a_data.T, b_data)  # test . trial
+                # return np.dot(a_data.T, b_data)  # test . trial
+                return b.dot_vec(a)  # test . trial
             elif b.role == "test" and a.role in {"trial", "function"}:
-                return np.dot(b_data.T, a_data)  # tiral . test
+                # return np.dot(b_data.T, a_data)  # tiral . test
+                return a.dot_vec(b)  # trial . test
         
         # case grad(u) . u_k
         if isinstance(a, GradOpInfo) and ((isinstance(b, VecOpInfo) \
@@ -380,12 +428,13 @@ class FormCompiler:
             ):
 
             # velocity value at this quadrature point
-            u_val = np.sum(b.data, axis=1)                 # (d,)
+            # u_val = np.sum(b.data, axis=1)                 # (d,)
 
             # works for k = 1 (scalar) and k = 2 (vector) alike
-            data  = np.einsum("knd,d->kn", a.data, u_val, optimize=True)
+            # data  = np.einsum("knd,d->kn", a.data, u_val, optimize=True)
 
-            return VecOpInfo(data, role=a.role)
+            # return VecOpInfo(data, role=a.role)
+            return a.dot_vec(b)  # grad(u) . u_k
         
         # ------------------------------------------------------------------
         # Case:  VectorFunction · Grad(⋅)      u_k · ∇w
@@ -394,14 +443,15 @@ class FormCompiler:
         and a.role == "function":
 
             # 1. velocity value at the current quadrature point
-            u_val = np.sum(a.data, axis=1)                  # (d,)  —   u_d(ξ)
+            # u_val = np.sum(a.data, axis=1)                  # (d,)  —   u_d(ξ)
 
-            # 2. dot with each gradient row   w_{k,n} = Σ_d u_d ∂_d φ_{k,n}
-            #    Works for both scalar (k = 1) and vector (k = 2) targets.
-            data  = np.einsum("d,knd->kn", u_val, b.data, optimize=True)
+            # # 2. dot with each gradient row   w_{k,n} = Σ_d u_d ∂_d φ_{k,n}
+            # #    Works for both scalar (k = 1) and vector (k = 2) targets.
+            # data  = np.einsum("d,knd->kn", u_val, b.data, optimize=True)
 
             # 3. The role is inherited from the Grad operand (trial / test / function)
-            return VecOpInfo(data, role=b.role)
+            # return VecOpInfo(data, role=b.role)
+            return a.dot_grad(b)  # u_k · ∇w
         
         # ------------------------------------------------------------------
         # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u
@@ -410,12 +460,13 @@ class FormCompiler:
         and isinstance(b, VecOpInfo)  and b.role == "trial":
 
             # (1)  value of ∇u_k at this quad-point
-            grad_val = np.sum(a.data, axis=1)          # (k,d)
+            # grad_val = np.sum(a.data, axis=1)          # (k,d)
 
-            # (2)  w_i,n = Σ_d (∇u_k)_i,d  *  φ_{u,d,n}
-            data = np.einsum("kd,kn->kn", grad_val, b.data, optimize=True)
+            # # (2)  w_i,n = Σ_d (∇u_k)_i,d  *  φ_{u,d,n}
+            # data = np.einsum("kd,kn->kn", grad_val, b.data, optimize=True)
 
-            return VecOpInfo(data, role="trial")
+            # return VecOpInfo(data, role="trial")
+            return a.dot_func(b)
         
         # ------------------------------------------------------------------
         # Case:  Vec(Function) · Grad(Trial)      u_k · ∇u
@@ -423,9 +474,10 @@ class FormCompiler:
         if isinstance(a, VecOpInfo)  and a.role == "function" \
         and isinstance(b, GradOpInfo) and b.role == "trial":
 
-            u_val = np.sum(a.data, axis=1)             # (d,)
-            data  = np.einsum("d,knd->kn", u_val, b.data, optimize=True)
-            return VecOpInfo(data, role="trial")
+            # u_val = np.sum(a.data, axis=1)             # (d,)
+            # data  = np.einsum("d,knd->kn", u_val, b.data, optimize=True)
+            # return VecOpInfo(data, role="trial")
+            return a.dot_grad(b)  # u_k · ∇u
         
         # Both are numerical vectors (RHS)
         if isinstance(a, np.ndarray) and isinstance(b, np.ndarray): return np.dot(a,b)
@@ -470,6 +522,8 @@ class FormCompiler:
     # Visitor dispatch
     def _visit(self, node): return self._dispatch[type(node)](node)
 
+    def _visit_Analytic(self, node): return node.eval(self.ctx['x_phys'])
+
     # ======================= ASSEMBLY CORE ============================
     def _assemble_form(self, form, target): # NEW
         """Accept a Form object and iterate through its integrals.""" # NEW
@@ -484,7 +538,7 @@ class FormCompiler:
             self._assemble_volume(integral, target)
 
     def _find_q_order(self, integral: Integral) -> int:
-        q_order = integral.measure.metadata.get('quad_degree')
+        q_order = integral.measure.metadata.get('quad_degree') or integral.measure.metadata.get('q', None)
         
         # 2. If not overridden, estimate from the integrand's polynomial degree
         if q_order is None:
@@ -523,6 +577,7 @@ class FormCompiler:
                 J = transform.jacobian(mesh, eid, (xi, eta))
                 detJ = abs(np.linalg.det(J))
                 JiT = np.linalg.inv(J).T
+                self.ctx['x_phys'] = transform.x_mapping(mesh, eid, (xi, eta))
                 
                 # Cache basis values and gradients for this quadrature point
                 self._basis_cache.clear()
@@ -565,3 +620,109 @@ class FormCompiler:
         
         # Set values in the RHS vector
         F[rows] = vals
+    
+    def _assemble_interface(self, intg: Integral, matvec): # New
+        """ # New
+        Assembles integrals over non-conforming interfaces defined by a level set. # New
+        This implementation is adapted for the new MixedElement/DofHandler architecture. # New
+        """ # New
+        log = logging.getLogger(__name__) # New
+        log.debug(f"Assembling interface integral: {intg}") # New
+
+        # --- 1. Initial Setup --- # New
+        rhs = self.ctx['rhs'] # New
+        level_set = intg.measure.level_set # New
+        if level_set is None: # New
+            raise ValueError("dInterface measure requires a level_set.") # New
+            
+        mesh = self.me.mesh # New
+        qdeg = self.qorder or mesh.poly_order + 2 # New
+        fields = _all_fields(intg.integrand) # New
+        
+        hook = self.ctx['hooks'].get(type(intg.integrand)) # New
+        if hook: # New
+            self.ctx.setdefault('scalar_results', {})[hook['name']] = 0.0 # New
+
+        try: # New
+            # --- 2. Loop Over All Cut Elements in the Mesh --- # New
+            for elem in mesh.elements_list: # New
+                if elem.tag != 'cut' or len(elem.interface_pts) != 2: # New
+                    continue # New
+                
+                log.debug(f"  Processing cut element: {elem.id}") # New
+
+                # --- 3. Quadrature Rule on the Physical Interface Segment --- # New
+                p0, p1 = elem.interface_pts # New
+                qp, qw = line_quadrature(p0, p1, qdeg) # New
+                
+                # --- 4. Determine Assembly Path (Bilinear, Linear, or Functional) --- # New
+                trial, test = _trial_test(intg.integrand) # New
+
+                # --- PATH A: Bilinear Form (e.g., a(u,v), contributes to the matrix) --- # New
+                if not rhs and trial and test: # New
+                    loc = np.zeros((self.me.n_dofs_local, self.me.n_dofs_local)) # New
+                    
+                    for x_q, w in zip(qp, qw): # New
+                        # --- Set context for the current quadrature point --- # New
+                        xi, eta = transform.inverse_mapping(mesh, elem.id, x_q) # New
+                        J = transform.jacobian(mesh, elem.id, (xi, eta)) # New
+                        JiT = np.linalg.inv(J).T # New
+                        
+                        self._basis_cache.clear() # New
+                        for f in fields: # New
+                            val = self.me.basis(f, xi, eta) # New
+                            grad = self.me.grad_basis(f, xi, eta) @ JiT # New
+                            self._basis_cache[f] = {"val": val, "grad": grad} # New
+
+                        self.ctx['eid'] = elem.id # New
+                        self.ctx['normal'] = level_set.gradient(x_q) # New
+                        self.ctx['phi_val'] = level_set(x_q) # New
+                        
+                        # --- Evaluate the ENTIRE integrand at once --- # New
+                        integrand_val = self._visit(intg.integrand) # New
+                        loc += w * integrand_val # w contains the 1D jacobian # New
+                    
+                    gdofs = self.dh.get_elemental_dofs(elem.id) # New
+                    r, c = np.meshgrid(gdofs, gdofs, indexing="ij") # New
+                    matvec[r, c] += loc # New
+                    log.debug(f"    Assembled {loc.shape} local matrix for element {elem.id}") # New
+
+                # --- PATH B: Linear Form (e.g., L(v)) or Functional (e.g., jump(u)) --- # New
+                else: # New
+                    acc = None # New
+                    for x_q, w in zip(qp, qw): # New
+                        xi, eta = transform.inverse_mapping(mesh, elem.id, x_q) # New
+                        J = transform.jacobian(mesh, elem.id, (xi, eta)) # New
+                        JiT = np.linalg.inv(J).T # New
+
+                        self._basis_cache.clear() # New
+                        for f in fields: # New
+                            val = self.me.basis(f, xi, eta) # New
+                            grad = self.me.grad_basis(f, xi, eta) @ JiT # New
+                            self._basis_cache[f] = {"val": val, "grad": grad} # New
+                        
+                        self.ctx['eid'] = elem.id # New
+                        self.ctx['normal'] = level_set.gradient(x_q) # New
+                        self.ctx['phi_val'] = level_set(x_q) # New
+                        
+                        integrand_val = self._visit(intg.integrand) # New
+                        
+                        if acc is None: # New
+                            acc = w * np.asarray(integrand_val) # New
+                        else: # New
+                            acc += w * np.asarray(integrand_val) # New
+
+                    if acc is not None: # New
+                        if rhs and test: # It's a linear form # New
+                            gdofs = self.dh.get_elemental_dofs(elem.id) # New
+                            np.add.at(matvec, gdofs, acc) # New
+                            log.debug(f"    Assembled {acc.shape} local vector for element {elem.id}") # New
+                        elif hook: # It's a hooked functional # New
+                            self.ctx['scalar_results'][hook['name']] += acc # New
+                            log.debug(f"    Accumulated functional '{hook['name']}' for element {elem.id}") # New
+
+        finally: # New
+            # --- Final Context Cleanup --- # New
+            for key in ('phi_val', 'normal', 'eid'): # New
+                self.ctx.pop(key, None) # New
+            log.debug("Interface assembly finished. Context cleaned.") # New

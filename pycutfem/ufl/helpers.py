@@ -1,3 +1,4 @@
+import re
 import numpy as np
 from dataclasses import dataclass
 from typing import Union, Tuple
@@ -22,11 +23,57 @@ class VecOpInfo:
 
     def dot_const(self, const: np.ndarray) -> np.ndarray:
         """Computes dot(v, c), returning an (n,) vector."""
+        # case for Constant with dim = 1 and also normal vector
         logger.debug(f"VecOpInfo.dot_const: const={const}, data.shape={self.data.shape}")
         const = np.asarray(const)
         if const.ndim != 1 or const.size != self.data.shape[0]:
             raise ValueError(f"Constant vector of size {const.size} is wrong length for VecOpInfo with {self.data.shape[0]} components.")
         return np.einsum("kn,k->n", self.data, const, optimize=True)
+    def dot_grad(self, grad: "GradOpInfo") -> "VecOpInfo":
+        """
+        Computes dot(v, ∇u) for a vector basis function v and gradient ∇u.
+        Returns a new VecOpInfo with shape (k, n).
+        """
+        if not isinstance(grad, GradOpInfo):
+            raise TypeError(f"Expected GradOpInfo, got {type(grad)}.")
+        if self.data.shape[0] != grad.data.shape[-1]:
+            raise ValueError(f"VecOpInfo {self.shape} and GradOpInfo {grad.shape} must have the same number of components.")
+        
+        result_data = np.einsum("kl,ijk->ij", self.data, grad.data, optimize=True)
+        role = self.role
+        if grad.role == "trial":
+            role = grad.role
+        if role == "none" or None and grad.role == 'function':
+            role = grad.role
+        return VecOpInfo(result_data, role=role)
+    def dot_vec(self, vec: "VecOpInfo") -> "VecOpInfo":
+        """
+        Computes dot(u, v) for a vector basis function u and a other vector basis.
+        Returns a new VecOpInfo with shape (n,).
+        """
+        # print(f" a.shape = {self.data.shape}, b.shape = {vec.data.shape}")
+        if not isinstance(vec, VecOpInfo):
+            raise TypeError(f"Expected VecOpInfo, got {type(vec)}.")
+        if vec.shape[0] != self.data.shape[0]:
+            raise ValueError(f"Input vector of shape {vec.shape} cannot be dotted with VecOpInfo of shape {self.data.shape}.")
+        
+        if vec.role == "test" and self.role == "function": # rhs time derivative term
+            # print("VecOpInfo.dot_vec: rhs time derivative term")
+            result_data = np.einsum("km,kn->n", self.data, vec.data, optimize=True) #rhs time derivative term
+            return result_data  # Return as a 1D array if vec is a test function
+        if self.role == "trial" and vec.role == "test":
+            # lhs mass matrix term
+            # If self is trial and vec is test, we return a VecOpInfo with shape (m, n)
+            result_data = np.einsum("km,kn->nm", self.data, vec.data, optimize=True)
+            return result_data
+        if vec.role == "function":
+            # If vec is a function, we return a VecOpInfo with shape (m, n)
+            result_data = np.einsum("km,kn->nm", self.data, vec.data, optimize=True)
+        role = self.role
+        if vec.role == "trial":
+            role = vec.role
+        # adding a new axis to maintain VecOpInfo structure
+        return VecOpInfo(result_data, role=role)
     # ========================================================================
     # Shape, len, and ndim methods
     @property
@@ -87,6 +134,29 @@ class GradOpInfo:
             raise ValueError("Operands must be GradOpInfo of the same shape for inner product.")
         # sum over components (k) and spatial dims (d), outer product over basis funcs (n,m)
         return np.einsum("knd,kmd->nm", self.data, other.data, optimize=True)
+    
+    def dot_func(self, func: VecOpInfo) -> VecOpInfo:
+        """
+        Computes the dot product with a function over the SPATIAL dimension.
+        This operation reduces the dimension and returns a VecOpInfo object.
+        dot(∇u_k, v)
+        Special dot product of vector functions 
+        """
+        if self.role == "function" and func.role == "trial":
+            # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u
+            # (1)  value of ∇u_k at this quad-point
+            grad_val = np.sum(self.data, axis=1)          # (k,d) ∫ ∇u_k dx ) 
+            # (2)  w_i,n = Σ_d (∇u_k)_i,d  *  φ_{u,d,n}
+            data = np.einsum("kd,kn->kn", grad_val, func.data, optimize=True)
+            role = self.role
+            if func.role == "trial":
+                role = func.role
+            if self.role == "none" and func.role == 'function':
+                role = func.role
+
+            return VecOpInfo(data, role=role)
+        
+        
 
     def dot_vec(self, vec: np.ndarray) -> VecOpInfo:
         """
@@ -94,12 +164,18 @@ class GradOpInfo:
         This operation reduces the dimension and returns a VecOpInfo object.
         dot(∇v, c) -> ∇v ⋅ c
         """
-        vec = np.asarray(vec)
-        if vec.ndim != 1 or vec.size != self.shape[-1]: # Must match spatial dim `d`
-            raise ValueError(f"Input vector of size {vec.size} cannot be dotted with spatial dimension of size {self.shape[-1]}.")
         
-        # einsum("knd,d->kn", ...)
-        result_data = np.einsum("knd,d->kn", self.data, vec, optimize=True)
+        if isinstance(vec, (VecOpInfo)): # this part is until trial grad(u) dot u_k  ((∇u) · u_k)
+            role = self.role
+            if vec.role == "trial":
+                role = vec.role
+            if vec.data.shape[0] != self.data.shape[-1]:
+                raise ValueError(f"Cannot dot GradOpInfo {self.shape} with VecOpInfo of shape {vec.data.shape}.")
+            result_data = np.einsum("ijk,kl->ij", self.data, vec.data, optimize=True)
+            return VecOpInfo(result_data, role=role)
+        
+        if isinstance(vec, np.ndarray) and vec.ndim == 1:
+            result_data = np.einsum("knd,d->kn", self.data, vec, optimize=True)
         return VecOpInfo(result_data, role=self.role)
 
     # ========================================================================
