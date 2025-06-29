@@ -367,12 +367,15 @@ class FormCompiler:
         b = self._visit(n.b)
         a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo)) else a
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
+        role_a = getattr(a, 'role', None)
+        role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
 
         def rhs():
             # ------------------------------------------------------------------
             # RHS  •  dot(  Function ,  Test  )   or   dot( Test , Function )
             # ------------------------------------------------------------------
+            # Case 1: Function · Test  (VecOpInfo, VecOpInfo)
             if  isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
                 if a.role == "function" and b.role == "test":
                     # f_k,n · v_k,n  →  Σ_k f_k,n v_k,n   (length-n vector for RHS)
@@ -386,13 +389,17 @@ class FormCompiler:
             # ------------------------------------------------------------------
             # Function · Function   (needed for  dot(grad(u_k), u_k)  on RHS)
             # ------------------------------------------------------------------
+            # Case 2: Function · Function  (GradOpInfo, VecOpInfo)
             if  isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo) \
             and a.role == b.role == "function":
                 # u_val   = np.sum(b.data, axis=1)                # (d,)
                 # data_fk = np.einsum("knd,d->kn", a.data, u_val) # keep basis-index n
                 # return VecOpInfo(data_fk, role="function")
                 return a.dot_vec(b)  # grad(u_k) . u_k
+            
+            
             # Constant (numpy 1-D) · test VecOpInfo  → length-n vector
+            # Case 3: Constant(np.array([u1,u2])) · Test
             if isinstance(a, np.ndarray) and a.ndim == 1 and \
             isinstance(b, VecOpInfo) and b.role == "test":
                 return b.dot_const(a)
@@ -400,6 +407,16 @@ class FormCompiler:
             if isinstance(b, np.ndarray) and b.ndim == 1 and \
             isinstance(a, VecOpInfo) and a.role == "test":
                 return a.dot_const(b)
+            
+            # Case 4: Constant(np.array([u1,u2])) · Trial or Function, no test so output is VecOpInfo
+            if isinstance(a, np.ndarray) and a.ndim == 1 and \
+             isinstance(b, (VecOpInfo, GradOpInfo)) and b.role in {"trial", "function"}:
+                # return b.dot_const(a) if b.ndim==2 else b.dot_vec(a)
+                return b.dot_const_vec(a) if b.ndim==2 else b.dot_vec(a)
+            if isinstance(b, np.ndarray) and b.ndim == 1 and \
+             isinstance(a, (VecOpInfo, GradOpInfo)) and a.role in {"trial", "function"}:
+                # return a.dot_const(b) if a.ndim==2 else a.dot_vec(b)
+                return a.dot_const_vec(b) if a.ndim==2 else a.dot_vec(b)
 
         if self.ctx["rhs"]:
             result = rhs()
@@ -408,9 +425,17 @@ class FormCompiler:
             else:
                 raise TypeError(f"Unsupported dot product for RHS: '{n.a} . {n.b}'")
         
+        if role_a == None and role_b == "test":
+            # Special case like dot( Constat(np.array([u1,u2])), TestFunction('v') )
+            # This is a special case where we have a numerical vector on the LHS
+            # and a test function basis on the RHS.
+            if isinstance(a, np.ndarray) and isinstance(b, VecOpInfo) and b.role == "test":
+                return b.dot_const(a)
+            if isinstance(b, np.ndarray) and isinstance(a, VecOpInfo) and a.role == "test":
+                return a.dot_const(b)
         # Dot product between a basis field and a numerical vector
-        if isinstance(a, (VecOpInfo, GradOpInfo)) and isinstance(b, np.ndarray): return a.dot_const(b) if a.ndim==2 else a.dot_vec(b)
-        if isinstance(b, (VecOpInfo, GradOpInfo)) and isinstance(a, np.ndarray): return b.dot_const(a) if b.ndim==2 else b.dot_vec(a)
+        if isinstance(a, (VecOpInfo, GradOpInfo)) and isinstance(b, np.ndarray): return a.dot_const_vec(b) if a.ndim==2 else a.dot_vec(b)
+        if isinstance(b, (VecOpInfo, GradOpInfo)) and isinstance(a, np.ndarray): return b.dot_const_vec(a) if b.ndim==2 else b.dot_vec(a)
         
 
         if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
@@ -662,9 +687,9 @@ class FormCompiler:
                 if not rhs and trial and test: # New
                     loc = np.zeros((self.me.n_dofs_local, self.me.n_dofs_local)) # New
                     
-                    for x_q, w in zip(qp, qw): # New
+                    for x_phys, w in zip(qp, qw): # New
                         # --- Set context for the current quadrature point --- # New
-                        xi, eta = transform.inverse_mapping(mesh, elem.id, x_q) # New
+                        xi, eta = transform.inverse_mapping(mesh, elem.id, x_phys) # New
                         J = transform.jacobian(mesh, elem.id, (xi, eta)) # New
                         JiT = np.linalg.inv(J).T # New
                         
@@ -675,8 +700,9 @@ class FormCompiler:
                             self._basis_cache[f] = {"val": val, "grad": grad} # New
 
                         self.ctx['eid'] = elem.id # New
-                        self.ctx['normal'] = level_set.gradient(x_q) # New
-                        self.ctx['phi_val'] = level_set(x_q) # New
+                        self.ctx['normal'] = level_set.gradient(x_phys) # New
+                        self.ctx['phi_val'] = level_set(x_phys) # New
+                        self.ctx['x_phys'] = x_phys
                         
                         # --- Evaluate the ENTIRE integrand at once --- # New
                         integrand_val = self._visit(intg.integrand) # New
@@ -690,8 +716,8 @@ class FormCompiler:
                 # --- PATH B: Linear Form (e.g., L(v)) or Functional (e.g., jump(u)) --- # New
                 else: # New
                     acc = None # New
-                    for x_q, w in zip(qp, qw): # New
-                        xi, eta = transform.inverse_mapping(mesh, elem.id, x_q) # New
+                    for x_phys, w in zip(qp, qw): # New
+                        xi, eta = transform.inverse_mapping(mesh, elem.id, x_phys) # New
                         J = transform.jacobian(mesh, elem.id, (xi, eta)) # New
                         JiT = np.linalg.inv(J).T # New
 
@@ -702,8 +728,9 @@ class FormCompiler:
                             self._basis_cache[f] = {"val": val, "grad": grad} # New
                         
                         self.ctx['eid'] = elem.id # New
-                        self.ctx['normal'] = level_set.gradient(x_q) # New
-                        self.ctx['phi_val'] = level_set(x_q) # New
+                        self.ctx['normal'] = level_set.gradient(x_phys) # New
+                        self.ctx['phi_val'] = level_set(x_phys) # New
+                        self.ctx['x_phys'] = x_phys
                         
                         integrand_val = self._visit(intg.integrand) # New
                         
@@ -723,6 +750,6 @@ class FormCompiler:
 
         finally: # New
             # --- Final Context Cleanup --- # New
-            for key in ('phi_val', 'normal', 'eid'): # New
+            for key in ('phi_val', 'normal', 'eid', 'x_phys'): # New
                 self.ctx.pop(key, None) # New
             log.debug("Interface assembly finished. Context cleaned.") # New

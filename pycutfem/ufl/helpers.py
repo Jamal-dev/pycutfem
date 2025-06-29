@@ -29,6 +29,16 @@ class VecOpInfo:
         if const.ndim != 1 or const.size != self.data.shape[0]:
             raise ValueError(f"Constant vector of size {const.size} is wrong length for VecOpInfo with {self.data.shape[0]} components.")
         return np.einsum("kn,k->n", self.data, const, optimize=True)
+    def dot_const_vec(self, const: np.ndarray) -> "VecOpInfo":
+        """Computes dot(v, c), returning an (n,) vector."""
+        # case for Constant with dim = 1 and also normal vector
+        logger.debug(f"VecOpInfo.dot_const: const={const}, data.shape={self.data.shape}")
+        const = np.asarray(const)
+        if const.ndim != 1 or const.size != self.data.shape[0]:
+            raise ValueError(f"Constant vector of size {const.size} is wrong length for VecOpInfo with {self.data.shape[0]} components.")
+        #data =  np.einsum("kn,k->n", self.data, const, optimize=True)
+        data = self.data.T @ const  # fast BLAS-2
+        return VecOpInfo(data[np.newaxis,:], role=self.role)
     def dot_grad(self, grad: "GradOpInfo") -> "VecOpInfo":
         """
         Computes dot(v, ∇u) for a vector basis function v and gradient ∇u.
@@ -174,7 +184,7 @@ class GradOpInfo:
             result_data = np.einsum("ijk,kl->ij", self.data, vec.data, optimize=True)
             return VecOpInfo(result_data, role=role)
         
-        if isinstance(vec, np.ndarray) and vec.ndim == 1:
+        if isinstance(vec, np.ndarray) and vec.ndim == 1: # dot product with a constant vector
             result_data = np.einsum("knd,d->kn", self.data, vec, optimize=True)
         return VecOpInfo(result_data, role=self.role)
 

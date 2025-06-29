@@ -21,7 +21,7 @@ from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner, dot, div
 )
-from pycutfem.ufl.measures import dx
+from pycutfem.ufl.measures import dx, dInterface
 from pycutfem.ufl.forms import assemble_form
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem.mixedelement import MixedElement
@@ -381,6 +381,7 @@ if __name__ == '__main__':
         
         form_fx_ufl = forms['f_lambda'](forms['deg'])
         form_fx_compiled = dolfinx.fem.form(form_fx_ufl)
+        print(f"Compiling form for '{name}' with degree {forms['deg']}...")
 
         if forms['mat']:
             J_pc, _ = assemble_form(forms['pc'] == pc_dummy_side, dof_handler_pc, quad_degree=forms['deg'])

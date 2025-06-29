@@ -21,7 +21,7 @@ class CircleLevelSet(LevelSetFunction):
     def __call__(self, x):
         return np.linalg.norm(x-self.center)-self.radius
     def gradient(self, x):
-        d=x-self.center
+        d=np.asarray(x-self.center)
         nrm=np.linalg.norm(d)
         return d/nrm if nrm else np.zeros_like(d)
 
