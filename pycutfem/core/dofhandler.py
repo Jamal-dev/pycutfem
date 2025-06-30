@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 import numpy as np
-from typing import Dict, List, Set, Tuple, Callable, Mapping, Iterable, Union, Any
+from typing import Dict, List, Set, Tuple, Callable, Mapping, Iterable, Union, Any, Sequence
+import math
 
 # Assume these are available in the project structure
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.topology import Node, Edge, Element
 from pycutfem.ufl.forms import BoundaryCondition
+from pycutfem.fem import transform
+from pycutfem.integration.quadrature import volume
 
 BcLike = Union[BoundaryCondition, Mapping[str, Any]]
 
@@ -446,6 +449,67 @@ class DofHandler:
                 domain = getattr(bc, "domain", None) or getattr(bc, "domain_tag", None) or getattr(bc, "tag", None)
                 out.append((bc.field, domain, bc.value))
         return out
+    
+    def l2_error(self,
+                u_vec: np.ndarray,
+                exact: Mapping[str, Callable[[float, float], Sequence[float]]],
+                quad_order: int | None = None,
+                relative: bool = True) -> float:
+        """
+        Compute the global L2-error of *u_vec* against analytical *exact* functions.
+
+        Parameters
+        ----------
+        u_vec       : global solution vector.
+        exact       : mapping  field-name -> callable (x,y) → value or tuple of
+                    component values.  Provide one entry for every field you
+                    want in the error norm.
+        quad_order  : if ``None`` we use 2*mesh.poly_order (safe).
+        relative    : return ‖u_h-u‖ / ‖u‖ if *True*, else absolute error.
+
+        Returns
+        -------
+        float
+        """
+        mesh  = self.mixed_element.mesh
+        me    = self.mixed_element
+        qdeg  = quad_order or 2*mesh.poly_order
+        qp, qw = volume(mesh.element_type, qdeg)            # ← existing helper
+        err2 = exact2 = 0.0
+
+        # loop over physical elements
+        for eid, elem in enumerate(mesh.elements_list):
+            gdofs = self.get_elemental_dofs(eid)
+            u_loc = u_vec[gdofs]                             # element DoFs view
+
+            for (xi, eta), w in zip(qp, qw):
+                # mapping & Jacobian
+                J      = transform.jacobian(mesh, eid, (xi, eta))
+                detJ   = abs(np.linalg.det(J))
+                x, y   = transform.x_mapping(mesh, eid, (xi, eta))
+
+                # assemble FE value per requested field/component --------------
+                uh_fields = {}
+                for fld in exact.keys():
+                    phi = me.basis(fld, xi, eta)             # shape (n_loc,)
+                    uh_fields[fld] = float(u_loc @ phi)      # scalar value
+                                                            # (vector fields are
+                                                            # stored component-wise)
+
+                # accumulate error and exact norms -----------------------------
+                for fld, u_ex in exact.items():
+                    u_exact_val = u_ex(x, y)
+                    # accept scalar or sequence – always treat as 1-D np.array
+                    u_exact_val = np.atleast_1d(u_exact_val).astype(float)
+
+                    uh_val = np.atleast_1d(uh_fields[fld])
+                    diff2 = np.sum((uh_val - u_exact_val)**2)
+                    base2 = np.sum(u_exact_val**2)
+
+                    err2   += w*detJ*diff2
+                    exact2 += w*detJ*base2
+
+        return math.sqrt(err2 / exact2) if relative else math.sqrt(err2)
 
     def info(self) -> None:
         print(f"=== DofHandler ({self.method.upper()}) ===")

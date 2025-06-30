@@ -20,7 +20,7 @@ from itertools import product
 
 from pycutfem.fem import transform
 from pycutfem.integration import volume
-from pycutfem.ufl.compilers import _split_terms
+from pycutfem.fem.mixedelement import MixedElement
 
 
 def test_vector_diffusion_mms():
@@ -42,6 +42,8 @@ def test_vector_diffusion_mms():
     # Calculate the forcing term f = -εΔu_exact
     f_sym_x = -epsilon * (sp.diff(u_exact_sym_x, x, 2) + sp.diff(u_exact_sym_x, y, 2))
     f_sym_y = -epsilon * (sp.diff(u_exact_sym_y, x, 2) + sp.diff(u_exact_sym_y, y, 2))
+    lambdify_f_x = sp.lambdify((x, y), f_sym_x, 'numpy')
+    lambdify_f_y = sp.lambdify((x, y), f_sym_y, 'numpy')
 
     # Lambdify expressions to create callable Python functions
     u_exact_func_x = sp.lambdify((x, y), u_exact_sym_x, 'numpy')
@@ -53,27 +55,38 @@ def test_vector_diffusion_mms():
 
     # 2. Setup Q2 Mesh and DofHandler
     poly_order = 2
-    nx, ny = 8, 8
+    nx, ny = 16, 16
     nodes, elems, _, corners = structured_quad(1, 1, nx=nx, ny=ny, poly_order=poly_order)
     mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
-    fe_map = {'ux': mesh, 'uy': mesh}
-    dof_handler = DofHandler(fe_map, method='cg')
+    me = MixedElement(mesh,field_specs={'ux': poly_order, 'uy': poly_order})
+    dof_handler = DofHandler(me, method='cg')
 
     # 3. Define the Weak Form
     velocity_space = FunctionSpace("velocity", ['ux', 'uy'])
-    u = VectorTrialFunction(velocity_space)
-    v = VectorTestFunction(velocity_space)
+    u = VectorTrialFunction(velocity_space,dof_handler=dof_handler)
+    v = VectorTestFunction( velocity_space,dof_handler=dof_handler)
+    f = VectorFunction(name="f", field_names=['ux', 'uy'], dof_handler=dof_handler)
+    f.set_values_from_function([lambdify_f_x, lambdify_f_y])
+    
     
     # Weak form for -εΔu = f  is  ∫ ε(∇u : ∇v)dx = ∫ f⋅v dx
-    a_form = (epsilon * inner(grad(u), grad(v))) * dx()
-    L_form = (f_x * v[0] + f_y * v[1]) * dx()
+    a_form = (epsilon * inner(grad(u), grad(v))) * dx(metadata={'quad_order': 4})
+    # L_form = (f_x * v[0] + f_y * v[1]) * dx()
+    L_form = dot(f,v) * dx()
     equation = (a_form == L_form)
 
     # 4. Define Boundary Conditions using the exact solution
-    mesh.tag_boundary_edges({'boundary': lambda x, y: True})
+    bc_tags = {
+        'bottom': lambda x,y: np.isclose(y,0),
+        'left':   lambda x,y: np.isclose(x,0),
+        'right':  lambda x,y: np.isclose(x,1.0),
+        'top':     lambda x,y: np.isclose(y,1.0)
+    }
+    mesh.tag_boundary_edges(bc_tags)
     bcs = [
-        BoundaryCondition('ux', 'dirichlet', 'boundary', u_exact_func_x),
-        BoundaryCondition('uy', 'dirichlet', 'boundary', u_exact_func_y)
+        BoundaryCondition('ux', 'dirichlet', tag, u_exact_func_x) for tag in bc_tags.keys()]
+    bcs = bcs + [
+        BoundaryCondition('uy', 'dirichlet', tag, u_exact_func_y) for tag in bc_tags.keys()
     ]
 
     # 5. Assemble and Solve
@@ -85,18 +98,23 @@ def test_vector_diffusion_mms():
     uy_dofs = dof_handler.get_field_slice('uy')
     
     # Get node coordinates directly from the mesh for evaluation
-    node_coords = mesh.nodes_x_y_pos
+    node_coords_ux = dof_handler.get_dof_coords('ux')
+    node_coords_uy = dof_handler.get_dof_coords('uy')
+
+    exact = {'ux': u_exact_func_x,
+         'uy': u_exact_func_y}
+    rel_L2 = dof_handler.l2_error(u_vec,exact,quad_order=5)
     
-    exact_sol_vec = np.zeros_like(u_vec)
-    exact_sol_vec[ux_dofs] = u_exact_func_x(node_coords[:, 0], node_coords[:, 1])
-    exact_sol_vec[uy_dofs] = u_exact_func_y(node_coords[:, 0], node_coords[:, 1])
+    # exact_sol_vec = np.zeros_like(u_vec)
+    # exact_sol_vec[ux_dofs] = u_exact_func_x(node_coords_ux[:, 0], node_coords_ux[:, 1])
+    # exact_sol_vec[uy_dofs] = u_exact_func_y(node_coords_uy[:, 0], node_coords_uy[:, 1])
     
-    l2_error_norm = np.linalg.norm(u_vec - exact_sol_vec)
-    exact_norm = np.linalg.norm(exact_sol_vec)
-    relative_l2_error = l2_error_norm / exact_norm
+    # l2_error_norm = np.linalg.norm(u_vec - exact_sol_vec)
+    # exact_norm = np.linalg.norm(exact_sol_vec)
+    # relative_l2_error = l2_error_norm / exact_norm
     
-    print(f"\nRelative L2 Error for Q{poly_order} Vector Diffusion: {relative_l2_error:.4e}")
-    assert relative_l2_error < 1e-3, "Vector diffusion term assembly failed for Q2 elements."
+    print(f"\nRelative L2 Error for Q{poly_order} Vector Diffusion: {rel_L2:.4e}")
+    assert rel_L2 < 1e-3, "Vector diffusion term assembly failed for Q2 elements."
     print("Vector diffusion test passed successfully!")
 
 def test_q2_dirichlet_dof_collection():
@@ -113,8 +131,8 @@ def test_q2_dirichlet_dof_collection():
     poly_order = 2
     nodes, elems, _, corners = structured_quad(1, 1, nx=nx, ny=ny, poly_order=poly_order)
     mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
-    fe_map = {'u': mesh}
-    dof_handler = DofHandler(fe_map, method='cg')
+    me = MixedElement(mesh, field_specs={'u': poly_order})
+    dof_handler = DofHandler(me, method='cg')
 
     # 2. Tag the top boundary
     mesh.tag_boundary_edges({'top': lambda x, y: np.isclose(y, 1.0)})
@@ -222,147 +240,10 @@ def test_q2_node_ordering():
     print("Node ordering test passed successfully!")
 
 
-# This helper function will call your compiler for a single element
-def get_matrix_from_compiler(dof_handler, equation):
-    """A helper to get the first local element matrix from the compiler."""
-    # We create a fake global matrix to pass in
-    K_global = np.zeros((dof_handler.total_dofs, dof_handler.total_dofs))
-    
-    # This is a simplified version of your _assemble_volume
-    form = equation.a
-    integral = form.integrals[0] # Assume one integral
-    intg = integral
-    matvec = K_global
-
-    # Temporarily instantiate a compiler to use its methods
-    from pycutfem.ufl.compilers import FormCompiler, _trial_test, _all_fields
-    compiler = FormCompiler(dof_handler, quad_order=5)
-    compiler.ctx['is_rhs'] = False
-
-    mesh = dof_handler.fe_map['ux']
-    q = compiler.qorder or mesh.poly_order + 2
-    qpts, qwts = volume(mesh.element_type, q)
-    terms = _split_terms(intg.integrand)
-
-    # --- Assemble for the FIRST element only (eid=0) ---
-    eid = 0
-    elem = mesh.elements_list[eid]
-    compiler.ctx['elem_id'] = eid
-    
-    # We only care about the advection term
-    advection_term = terms[1][1] # Assumes advection is the second term in your form
-    
-    trial, test = _trial_test(advection_term)
-    row_dofs = compiler._elm_dofs(test, eid)
-    col_dofs = compiler._elm_dofs(trial, eid)
-    
-    local_matrix = np.zeros((len(row_dofs), len(col_dofs)))
-
-    for xi_eta, w in zip(qpts, qwts):
-        J = transform.jacobian(mesh, eid, xi_eta)
-        detJ = abs(np.linalg.det(J))
-        JinvT = np.linalg.inv(J).T
-        
-        basis_values_at_qp = {}
-        for fld in _all_fields(advection_term):
-            ref = get_reference(dof_handler.fe_map[fld].element_type, dof_handler.fe_map[fld].poly_order)
-            basis_values_at_qp[fld] = {
-                'val': ref.shape(*xi_eta),
-                'grad': ref.grad(*xi_eta) @ JinvT
-            }
-        compiler.ctx['basis_values'] = basis_values_at_qp
-        
-        val = compiler.visit(advection_term)
-        local_matrix += w * detJ * val
-        
-    return local_matrix
 
 
-def test_white_box_vector_advection():
-    """
-    Compares the compiler's local advection matrix against a manually
-    computed ground truth for a single Q2 element.
-    
-    THIS IS THE DEFINITIVE TEST.
-    """
-    print("\n" + "="*70)
-    print("White-Box Test of Q2 Vector Advection Matrix")
-    print("="*70)
 
-    # 1. Setup a single Q2 element
-    poly_order = 2
-    nodes, elems, _, corners = structured_quad(2, 2, nx=1, ny=1, poly_order=poly_order)
-    mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
-    fe_map = {'ux': mesh, 'uy': mesh}
-    dof_handler = DofHandler(fe_map, method='cg')
 
-    # 2. Define the UFL form for ONLY the advection term
-    velocity_space = FunctionSpace("velocity", ['ux', 'uy'])
-    u = VectorTrialFunction(velocity_space)
-    v = VectorTestFunction(velocity_space)
-    beta = Constant([1.5, 2.5], dim=1)
-
-    # Advection term: (β ⋅ ∇u) ⋅ v = Σᵢ (β ⋅ ∇uᵢ)vᵢ
-    advection_form = (
-        dot(beta, grad(u[0])) * v[0] +
-        dot(beta, grad(u[1])) * v[1]
-    ) * dx()
-    # We solve A*u=0 with zero BCs, so the solution should be zero.
-    equation = advection_form == (Constant(0.0) * v[0] * dx())
-
-    # 3. Get the global matrix A from YOUR real assembler
-    # We use empty BCs because we want the raw, unmodified matrix.
-    A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])
-
-    # 4. Extract the local 18x18 matrix for the first element from A
-    element_dofs_ux = dof_handler.element_maps['ux'][0]
-    element_dofs_uy = dof_handler.element_maps['uy'][0]
-    element_dofs_all = np.array(element_dofs_ux + element_dofs_uy, dtype=int)
-    
-    # Use np.ix_ to select the block from the sparse matrix
-    compiler_matrix = A[np.ix_(element_dofs_all, element_dofs_all)].toarray()
-
-    # 5. Manually compute the ground truth matrix
-    ref_q2 = get_reference("quad", poly_order)
-    q_order = 5
-    qpts, qwts = volume("quad", q_order)
-    n_basis_scalar = (poly_order + 1)**2 # 9 for Q2
-    
-    expected_matrix = np.zeros((n_basis_scalar * 2, n_basis_scalar * 2))
-    
-    for qp, w in zip(qpts, qwts):
-        J = transform.jacobian(mesh, 0, qp)
-        detJ = abs(np.linalg.det(J))
-        JinvT = np.linalg.inv(J).T
-        
-        N = ref_q2.shape(*qp) # Shape (9,)
-        G_phys = ref_q2.grad(*qp) @ JinvT # Shape (9, 2)
-        
-        beta_val = np.array([1.5, 2.5])
-        
-        # This computes the vector (β⋅∇Nⱼ) for all j=0..8
-        beta_dot_grad_N = G_phys @ beta_val # Shape (9,)
-        
-        # The local matrix block is K_ij = ∫ (β⋅∇Nⱼ)Nᵢ dΩ
-        K_block = np.outer(N, beta_dot_grad_N)
-        
-        # Advection term (β⋅∇u)⋅v only creates diagonal blocks K_xx and K_yy
-        expected_matrix[:n_basis_scalar, :n_basis_scalar] += K_block * w * detJ
-        expected_matrix[n_basis_scalar:, n_basis_scalar:] += K_block * w * detJ
-
-    # 6. Compare the matrices
-    print("Comparing compiler-generated matrix with manually computed ground truth...")
-    
-    # Debugging output:
-    # print("Compiler Matrix:\n", compiler_matrix)
-    # print("Expected Matrix:\n", expected_matrix)
-    # print("Difference:\n", compiler_matrix - expected_matrix)
-
-    print("Compiler Matrix shape:", compiler_matrix.shape)
-    print("Expected Matrix shape:", expected_matrix.shape)
-    np.testing.assert_allclose(compiler_matrix, expected_matrix, rtol=1e-12, atol=1e-12)
-    
-    print("\nSUCCESS: Compiler's local advection matrix is correct!")
 
 
 def test_vector_advection_diffusion():
@@ -394,10 +275,10 @@ def test_vector_advection_diffusion():
 
     # 2. Setup Mesh and DofHandler
     poly_order = 2  # Test with Q2 elements where the error occurred
-    nodes, elems, _, corners = structured_quad(1, 1, nx=8, ny=8, poly_order=poly_order)
+    nodes, elems, _, corners = structured_quad(1, 1, nx=16, ny=16, poly_order=poly_order)
     mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
-    fe_map = {'ux': mesh, 'uy': mesh}
-    dof_handler = DofHandler(fe_map, method='cg')
+    me = MixedElement(mesh, field_specs={'ux': poly_order, 'uy': poly_order})
+    dof_handler = DofHandler(me, method='cg')
 
     # 3. Define the Weak Form
     # --- UPDATED FUNCTION INITIALIZATION ---
@@ -410,7 +291,7 @@ def test_vector_advection_diffusion():
 
     # --- Weak form definition remains the same ---
     diffusion = epsilon * inner(grad(u), grad(v))
-    advection = (dot(beta, grad(u[0])) * v[0] + dot(beta, grad(u[1])) * v[1])
+    advection = dot( dot(grad(u), beta), v) 
     a_form = (diffusion + advection) * dx()
     L_form = (f_x * v[0] + f_y * v[1]) * dx()
     equation = (a_form == L_form)

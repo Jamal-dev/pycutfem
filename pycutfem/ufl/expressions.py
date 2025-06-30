@@ -247,12 +247,15 @@ class VectorFunction(Expression):
     def set_values_from_function(self, func: Callable[[float, float], np.ndarray]):
         for i, field_name in enumerate(self.field_names):
             # Get coords for this specific field
+            g_slice = self._dh.get_field_slice(field_name)        # full slice
             coords = self._dh.get_dof_coords(field_name)
-            # Evaluate the ith component of the vector function at these coords
-            values = np.apply_along_axis(lambda c: func(c[0], c[1])[i], 1, coords).ravel()
-            # Get the global DOFs for this field to set the values
-            global_dofs_field = self._dh.get_field_dofs_on_nodes(field_name)
-            self.set_nodal_values(global_dofs_field, values)
+            if isinstance(func, list):
+                component_func = func[i]
+                vals = np.array([component_func(*xy) for xy in coords])
+            else:
+                vals = np.array([func(*xy)[i] for xy in coords])
+
+            self.set_nodal_values(g_slice, vals)                  # store all
 
 
     def __repr__(self):
@@ -474,8 +477,25 @@ class VectorTestFunction(Expression):
  
 
 class ElementWiseConstant(Expression):
-    def __init__(self, values: np.ndarray): self.values = values
-    def __repr__(self): return f"ElementWiseConstant(...)"
+    """
+    Per-element constant value that can be scalar **or** an arbitrary
+    tensor.  Internally we store an `(n_elem, …)` NumPy array whose *first*
+    axis enumerates the mesh elements and whose remaining axes are the
+    tensor shape (empty for scalars).
+    """
+    def __init__(self, values: np.ndarray):
+        self.values = np.asarray(values)
+        if self.values.ndim == 0:
+            raise ValueError("Provide one value **per element**, not a single scalar.")
+        self.tensor_shape = self.values.shape[1:]   # () for scalars
+
+    # Handy helper – compiler calls this through the visitor method below
+    def value_on_element(self, eid: int):
+        return self.values[eid]
+
+    def __repr__(self):
+        shape = "scalar" if self.tensor_shape == () else f"tensor{self.tensor_shape}"
+        return f"ElementWiseConstant({shape})"
 
 class FacetNormal(Expression): pass
 

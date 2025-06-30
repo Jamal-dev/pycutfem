@@ -31,7 +31,8 @@ from pycutfem.ufl.expressions import (
     VectorTestFunction, VectorTrialFunction,
     Function,    VectorFunction,
     Grad, DivOperation, Inner, Dot,
-    Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal
+    Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
+    ElementWiseConstant
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -99,6 +100,7 @@ class FormCompiler:
             Div: self._visit_Div,
             Analytic: self._visit_Analytic,
             FacetNormal: self._visit_FacetNormal,
+            ElementWiseConstant: self._visit_EWC,
             Jump: self._visit_Jump,
         }
 
@@ -134,6 +136,13 @@ class FormCompiler:
         if 'normal' not in self.ctx: # New
             raise RuntimeError("FacetNormal accessed outside of a facet or interface integral context.") # New
         return self.ctx['normal'] # New
+    
+    # -- Element-wise constants ----------------------------------------
+    def _visit_EWC(self, n:ElementWiseConstant):
+        eid = self.ctx.get("eid")
+        if eid is None:
+            raise RuntimeError("ElementWiseConstant evaluated outside an element loop.")
+        return n.value_on_element(eid)
     
     
     def _visit_Pos(self, n: Pos): # New
@@ -285,80 +294,51 @@ class FormCompiler:
         b_vec = np.squeeze(b_data)
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
-        # Use repr for detailed logging of symbolic expression parts
-        logger.debug(f"Entering _visit_Prod for  ('{n.a!r}' * '{n.b!r}') on {'RHS' if self.ctx['rhs'] else 'LHS'}, a.info={getattr(a, 'info', None)}, b.info={getattr(b, 'info', None)}")
-        logger.debug(f"  a: {type(a)} (role={role_a}), b: {type(b)} (role={role_b})")
+        logger.debug(f"Entering _visit_Prod for  ('{n.a!r}' * '{n.b!r}') on {'RHS' if self.ctx['rhs'] else 'LHS'}") #, a.info={getattr(a, 'info', None)}, b.info={getattr(b, 'info', None)}
+        # logger.debug(f"  a: {type(a)} (role={role_a}), b: {type(b)} (role={role_b})")
 
-
-        # ------------------------------------------------------------------
-        # scalar × scalar  (Constant * Constant  or numeric literals)
-        # ------------------------------------------------------------------
+        # scalar * scalar multiplication
         if np.isscalar(a) and np.isscalar(b):
             return a * b
-        
+        # First, handle context-specific RHS assembly.
+        if self.ctx["rhs"]:
+            # Case 1: (known Function) * (Test Function) -> results in a vector
+            if isinstance(a, VecOpInfo) and a.role == "function" and isinstance(b, VecOpInfo) and b.role == "test":
+                if a.data.shape[0] == 1: # Scalar field * test function
+                    return np.sum(a.data) * b.data[0]
+                return np.einsum("kn,kn->n", a.data, b.data, optimize=True) # Vector field
 
-        # ------------------------------------------------------------------
-        # scalar x vector multiplication
-        # ------------------------------------------------------------------
+            # Symmetric orientation
+            if isinstance(b, VecOpInfo) and b.role == "function" and isinstance(a, VecOpInfo) and a.role == "test":
+                if b.data.shape[0] == 1: # Scalar field * test function
+                    return np.sum(b.data) * a.data[0]
+                return np.einsum("kn,kn->n", b.data, a.data, optimize=True) # Vector field
+
+            # Case 2: (scalar Constant) * (Test Function) -> results in a vector
+            # This now takes precedence over the general scalar multiplication.
+            if np.isscalar(a) and isinstance(b, VecOpInfo) and b.role == "test":
+                # This correctly returns a numeric array, not a VecOpInfo object.
+                return a * b.data[0]
+            if np.isscalar(b) and isinstance(a, VecOpInfo) and a.role == "test":
+                return b * a.data[0]
+        
+        # --- General Purpose Logic (used mostly for LHS) ---
+
+        # General scalar multiplication (if not a special RHS case)
         if np.isscalar(a) and isinstance(b, (VecOpInfo, GradOpInfo, np.ndarray)):
             return a * b
         if np.isscalar(b) and isinstance(a, (VecOpInfo, GradOpInfo, np.ndarray)):
             return b * a
-
-        # --- RHS: one operand MUST be a value, the other a Test function basis ---
-        if self.ctx["rhs"]:
-            # (known) VecOpInfo  *  (test) VecOpInfo  → length-n vector
-            if isinstance(a, VecOpInfo) and a.role == "function" and \
-            isinstance(b, VecOpInfo) and b.role == "test":
-
-                # scalar field (k = 1)  .................  p_k · div(v)
-                if a.data.shape[0] == 1:
-                    f_val = np.sum(a.data)                 # p(x_q)
-                    return f_val * b.data[0]               # p · div(v)
-
-                # vector field (k = 2)  ..................  (u_k − u_n , v)
-                return np.einsum("kn,kn->n", a.data, b.data, optimize=True)
-
-            # symmetric orientation
-            if isinstance(b, VecOpInfo) and b.role == "function" and \
-            isinstance(a, VecOpInfo) and a.role == "test":
-
-                if b.data.shape[0] == 1:
-                    f_val = np.sum(b.data)
-                    return f_val * a.data[0]
-                return np.einsum("kn,kn->n", b.data, a.data, optimize=True)
-
-            # scalar Constant or numpy value times test basis 
-            if np.isscalar(a) and isinstance(b, VecOpInfo) and b.role == "test":
-                return a * b.data[0]
-            if np.isscalar(b) and isinstance(a, VecOpInfo) and a.role == "test":
-                return b * a.data[0]
             
-
-        # --- LHS: matrix assembly ---
-        else: 
-            # # Case 1: One operand is a scalar value (from Constant or evaluated expression like inner/dot)
-            # if np.isscalar(a) or (isinstance(a, np.ndarray) and a.ndim == 0):
-            #     return a * b
-            # if np.isscalar(b) or (isinstance(b, np.ndarray) and b.ndim == 0):
-            #     return b * a
-
-            # Case 2: Both operands represent fields. Unwrap their data for outer product.
-            # ✓  (test , trial)   →  rows = test, cols = trial
-            if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo): # mass matrix
-                # v (test)  ·  w (trial / function)
-                if a.role == "test"  and b.role in {"trial", "function"}:
-                    # M_nm = Σ_k  a_k,n  *  b_k,m
+        # LHS Matrix Assembly: (Test * Trial)
+        if not self.ctx["rhs"]:
+            if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+                if a.role == "test" and b.role in {"trial", "function"}:
                     return np.einsum("kn,km->nm", a.data, b.data, optimize=True)
-                if b.role == "test"  and a.role in {"trial", "function"}:
+                if b.role == "test" and a.role in {"trial", "function"}:
                     return np.einsum("kn,km->nm", b.data, a.data, optimize=True)
-            
-            # fallback (same-role or plain arrays)
-            # if a_vec.ndim == 1 and b_vec.ndim == 1:
-            #     return np.outer(a_vec, b_vec)
-
+        
         raise TypeError(f"Unsupported product 'type(a)={type(a)}, type(b)={type(b)}'{n.a} * {n.b}' for {'RHS' if self.ctx['rhs'] else 'LHS'}")
-
 
         
 
@@ -532,14 +512,20 @@ class FormCompiler:
 
         # Both are Info objects of the same kind -> matrix assembly
         if type(a) is type(b) and isinstance(a, (VecOpInfo, GradOpInfo)):
+            # print(f"k"*32)
             return a.inner(b)
 
         # One is a basis, the other a numerical tensor value (RHS or complex LHS)
-        if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray): return a.contracted_with_tensor(b)
-        if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray): return b.contracted_with_tensor(a)
+        if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray): 
+            # print(f"*"*32)
+            return a.contracted_with_tensor(b)
+        if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray): 
+            # print(f"@"*32)
+            return b.contracted_with_tensor(a)
         
         # RHS: both are functions, result is scalar integral
         if self.ctx['rhs'] and isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+            #  print(f"&"*32)
              return np.sum(a.data * b.data)
 
         raise TypeError(f"Unsupported inner product '{n.a} : {n.b}'")
@@ -557,32 +543,64 @@ class FormCompiler:
 
         for integral in form.integrals: # NEW
             if not isinstance(integral, Integral): continue # NEW
-            if integral.measure.domain_type != "volume":
+            if integral.measure.domain_type == "interface":
+                # Handle interface integrals with a level set
+                logger.info(f"Assembling interface integral: {integral}")
+                self._assemble_interface(integral, target)
+                continue
+            if integral.measure.domain_type == "volume":
+                # Handle volume integrals
+                logger.info(f"Assembling volume integral: {integral}")
+                self._assemble_volume(integral, target)
+                continue
+            if integral.measure.domain_type not in ["volume", "interface"]:
                 logger.warning(f"Skipping unsupported integral type: {integral.measure.domain_type}")
                 raise NotImplementedError(f"Unsupported integral type: {integral.measure.domain_type}")
-            self._assemble_volume(integral, target)
 
     def _find_q_order(self, integral: Integral) -> int:
-        q_order = integral.measure.metadata.get('quad_degree') or integral.measure.metadata.get('q', None)
-        
-        # 2. If not overridden, estimate from the integrand's polynomial degree
-        if q_order is None:
+        # --- 1. explicit override in the dx metadata -------------------------
+        q_order = (integral.measure.metadata.get('quad_degree')     #   Fenics
+                or integral.measure.metadata.get('quad_order')   # ← new alias
+                or integral.measure.metadata.get('q'))           #   VTK / misc.
+
+        # --- 2. global ‘assemble_form(…, quad_order=…)’ fallback -------------
+        if q_order is None and self.qorder is not None:
+            q_order = self.qorder
+
+        # --- 3. last resort: automatic estimation ----------------------------
+        if q_order is None:                       # only if nothing fixed it yet
             try:
-                poly_deg = self.degree_estimator.estimate_degree(integral.integrand)
-                # A quadrature rule of order `k` integrates polynomials of degree `2k-1` exactly.
-                # To be safe, we choose an order that can integrate the polynomial exactly.
-                # Here, we simply set the quadrature order to the polynomial degree,
-                # assuming the `volume` function selects an appropriate rule.
-                q_order = poly_deg
-                logger.debug(f"Auto-detected quad_order={q_order} for integral.")
+                p = self.degree_estimator.estimate_degree(integral.integrand)
+                q_order = max(1, math.ceil((p + 1) / 2))            # k ≥ (p+1)/2
+                logger.debug(f'Auto-detected quad_order={q_order} for integral.')
             except Exception as e:
-                logger.warning(f"Could not estimate polynomial degree: {e}. Falling back to global default.")
-        
-        # 3. Fallback to the global default if estimation fails or is not provided
-        if q_order is None:
-            q_order = self.qorder or self.me.mesh.poly_order * 2
-            logger.debug(f"Using global default quad_order={q_order}.")
+                logger.warning(f'Could not estimate polynomial degree: {e}.')
+                q_order = max(1, self.me.mesh.poly_order * 2)
+
         return q_order
+    
+    # ====================== BC handling ===============================
+    def _apply_bcs(self, K, F, bcs):
+        # This method remains unchanged from your provided file
+        if not bcs: return
+        data = self.dh.get_dirichlet_data(bcs)
+        if not data: return
+        rows = np.fromiter(data.keys(), dtype=int)
+        vals = np.fromiter(data.values(), dtype=float)
+        
+        # Apply to RHS vector F
+        F -= K @ np.bincount(rows, weights=vals, minlength=F.size)
+        
+        # Zero out rows and columns in the matrix
+        K_lil = K.tolil()
+        K_lil[rows, :] = 0
+        K_lil[:, rows] = 0
+        K_lil[rows, rows] = 1.0
+        # copy the edited data back
+        K[:] = K_lil  # Convert back to CSR format
+        
+        # Set values in the RHS vector
+        F[rows] = vals
     
     def _assemble_volume(self, integral: Integral, matvec):
         mesh = self.me.mesh
@@ -623,28 +641,9 @@ class FormCompiler:
                 r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
                 matvec[r, c] += loc
         
-        self.ctx.pop("eid", None)
+        self.ctx.pop("eid", None); self.ctx.pop("x_phys", None)  # Clean up context
 
-    # ====================== BC handling ===============================
-    def _apply_bcs(self, K, F, bcs):
-        # This method remains unchanged from your provided file
-        if not bcs: return
-        data = self.dh.get_dirichlet_data(bcs)
-        if not data: return
-        rows = np.fromiter(data.keys(), dtype=int)
-        vals = np.fromiter(data.values(), dtype=float)
-        
-        # Apply to RHS vector F
-        F -= K @ np.bincount(rows, weights=vals, minlength=F.size)
-        
-        # Zero out rows and columns in the matrix
-        K = K.tolil()
-        K[rows, :] = 0
-        K[:, rows] = 0
-        K[rows, rows] = 1.0
-        
-        # Set values in the RHS vector
-        F[rows] = vals
+    
     
     def _assemble_interface(self, intg: Integral, matvec): # New
         """ # New
@@ -661,7 +660,8 @@ class FormCompiler:
             raise ValueError("dInterface measure requires a level_set.") # New
             
         mesh = self.me.mesh # New
-        qdeg = self.qorder or mesh.poly_order + 2 # New
+        qdeg = self._find_q_order(intg) 
+        logger.debug(f"Assemble Interface: Using quadrature degree: {qdeg}") 
         fields = _all_fields(intg.integrand) # New
         
         hook = self.ctx['hooks'].get(type(intg.integrand)) # New
@@ -744,8 +744,10 @@ class FormCompiler:
                             gdofs = self.dh.get_elemental_dofs(elem.id) # New
                             np.add.at(matvec, gdofs, acc) # New
                             log.debug(f"    Assembled {acc.shape} local vector for element {elem.id}") # New
-                        elif hook: # It's a hooked functional # New
-                            self.ctx['scalar_results'][hook['name']] += acc # New
+                        elif hook: # It's a hooked functional 
+                            if isinstance(acc,VecOpInfo): # New
+                                acc = np.sum(acc.data, axis=1)
+                            self.ctx['scalar_results'][hook['name']] += acc
                             log.debug(f"    Accumulated functional '{hook['name']}' for element {elem.id}") # New
 
         finally: # New

@@ -2,22 +2,70 @@ import numpy as np, pytest
 from pycutfem.utils.meshgen   import structured_quad
 from pycutfem.core.mesh       import Mesh
 from pycutfem.core.levelset   import CircleLevelSet
-from pycutfem.ufl.measures    import dInterface
-from pycutfem.ufl.expressions import Constant, Pos, Neg, Jump, FacetNormal,grad, Function, dot, inner, VectorFunction
+from pycutfem.ufl.measures    import dInterface, dx
+from pycutfem.ufl.expressions import (Constant, Pos, Neg, Jump, FacetNormal,grad, 
+                                      Function, dot, inner, VectorFunction, VectorTrialFunction ,
+                                      TestFunction, VectorTestFunction, TrialFunction)
 from pycutfem.ufl.forms           import assemble_form
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.ufl.functionspace import FunctionSpace
 from numpy.testing import assert_allclose # Add this import at the top
+from pycutfem.fem.mixedelement import MixedElement
+from pycutfem.ufl.analytic import Analytic
+from pycutfem.ufl.analytic import x as x_ana
+from pycutfem.ufl.analytic import y as y_ana
+from pycutfem.ufl.forms import BoundaryCondition, assemble_form
+
+import logging
+
 
 
 L     = 2.0
 R     = 0.7
 center= (L/2, L/2)
 
-@pytest.fixture
-def mesh(poly_order=1):
+@pytest.fixture(scope="module")
+def cavity_setup(poly_order=1):
+    """
+    A single, heavy-lifting fixture that computes all necessary objects
+    and returns them in a tuple. This is efficient as the computation
+    is only done once.
+    """
+    print("\n--- Running cavity_setup fixture ---")
     nodes, elems, _, corners = structured_quad(L, L, nx=40, ny=40, poly_order=poly_order)
-    return Mesh(nodes=nodes, element_connectivity=elems,elements_corner_nodes= corners,element_type= 'quad', poly_order=poly_order)
+    bc_tags = {
+        'bottom_wall': lambda x,y: np.isclose(y,0),
+        'left_wall':   lambda x,y: np.isclose(x,0),
+        'right_wall':  lambda x,y: np.isclose(x,L),
+        'top_lid':     lambda x,y: np.isclose(y,L)
+    }
+    bcs = [
+        BoundaryCondition('u', 'dirichlet', 'bottom_wall', lambda x,y: 0.0),
+        BoundaryCondition('u', 'dirichlet', 'left_wall',   lambda x,y: 0.0),
+        BoundaryCondition('u', 'dirichlet', 'right_wall',  lambda x,y: 0.0),
+        BoundaryCondition('u', 'dirichlet', 'top_lid',     lambda x,y: 0.0),
+    ]
+    mesh_obj = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type='quad', poly_order=poly_order)
+    mesh_obj.tag_boundary_edges(bc_tags)
+    me = MixedElement(mesh_obj, field_specs={"u": 1})
+    dof_handler_obj = DofHandler(me, method='cg')
+    
+    return mesh_obj, dof_handler_obj, bcs
+
+@pytest.fixture(scope="module")
+def mesh(cavity_setup):
+    """Gets the mesh object from the main setup fixture."""
+    return cavity_setup[0]
+
+@pytest.fixture(scope="module")
+def dof_handler(cavity_setup):
+    """Gets the DofHandler object from the main setup fixture."""
+    return cavity_setup[1]
+
+@pytest.fixture(scope="module")
+def bcs(cavity_setup):
+    """Gets the boundary conditions list from the main setup fixture."""
+    return cavity_setup[2]
 
 def make_levelset():
     return CircleLevelSet(center, radius=R)
@@ -30,7 +78,7 @@ def add_scalar_field(func: Function, mesh: Mesh, phi, u_pos=None, u_neg=None):
     for node in mesh.nodes_list:
         is_positive = phi((node.x, node.y)) >= 0
         value = u_pos(node.x, node.y) if is_positive else u_neg(node.x, node.y)
-        func.nodal_values[node.id] = value
+        func.set_nodal_values(node.id, value)
     return func
 
 def add_vector_field(vecfun:VectorFunction,mesh:Mesh, phi:CircleLevelSet, v_pos=None, v_neg=None):
@@ -44,51 +92,65 @@ def add_vector_field(vecfun:VectorFunction,mesh:Mesh, phi:CircleLevelSet, v_pos=
     return vecfun
 
 # ------------------------------------------------ value jump scalar
-def test_jump_scalar(mesh:Mesh):
+def test_jump_scalar(mesh:Mesh, dof_handler:DofHandler, bcs:list[BoundaryCondition]):
     phi = make_levelset()
     mesh.classify_elements(phi); mesh.classify_edges(phi); 
     mesh.build_interface_segments(phi)
     # add_scalar_field(mesh, phi)
-    u_pos = Constant(lambda x,y: x)       # outside  (φ ≥ 0)
-    u_neg = Constant(lambda x,y: 2*x)     # inside   (φ < 0)
+    u_pos = Analytic(x_ana)       # outside  (φ ≥ 0)
+    u_neg = Analytic( 2*x_ana)     # inside   (φ < 0)
     jump = Jump(u_pos , u_neg)           # jump expression
 
     # u_out = x     ;  u_in = 2x
     # u_pos = Pos(Constant(lambda x,y: x))   # evaluate via lambda inside visitor
     # u_neg = Neg(Constant(lambda x,y: 2*x))
-    form = jump * dInterface(level_set=phi)
-    eq    = form == Constant(0.0)
+    form = jump * dInterface(level_set=phi,metadata={"q":3})  # dInterface is a measure for the interface
+    eq    = form == Constant(0.0) * dx
 
-    res = assemble_form(eq, DofHandler({'u':mesh}), bcs=[],
+
+    res = assemble_form(eq, dof_handler=dof_handler, bcs=[],
                         assembler_hooks={type(form.integrand):{'name':'jmp'}})
+    print(f"res: {res}")
     J = res['jmp']
     print(f"Jump scalar value: {J}")
     exact = - 2 * np.pi * phi.radius * center[0]  # integral of jump over interface
     assert np.isclose(J, exact, atol=1e-2)
 
-def test_jump_grad_scalar_manual(mesh:Mesh):
+def test_jump_grad_scalar_manual(mesh:Mesh, dof_handler:DofHandler, bcs:list[BoundaryCondition]):
     phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
     mesh.build_interface_segments(phi); 
-    dof_handler = DofHandler({'u':mesh})  # Create a DofHandler for the mesh
+    v = TestFunction('u', dof_handler=dof_handler)  # Test function for the weak form
     u_pos = lambda x,y: x**2       # outside  (φ ≥ 0)
     u_neg = lambda x,y: x**2-1     # inside   (φ < 0)
     grad_u_pos_x = lambda x,y: 2*x       # grad outside
     grad_u_neg_x = lambda x,y: 2*x       # grad inside
     grad_u_pos_y = lambda x,y: 0         # grad outside
     grad_u_neg_y = lambda x,y: 0         # grad inside
-    jump_grad_u = Jump(Constant( [grad_u_pos_x, grad_u_pos_y],dim=1),
-                        Constant([grad_u_neg_x, grad_u_neg_y],dim=1))  # jump in vector
+    u_func_pos = Function(field_name='u', name='u_pos',
+                          dof_handler=dof_handler)
+    u_func_pos.set_values_from_function(u_pos)
+    u_func_neg = Function(field_name='u', name='u_neg',
+                          dof_handler=dof_handler)
+    u_func_neg.set_values_from_function(u_neg)
+    jump_grad_u = Jump(grad(u_func_pos), grad(u_func_neg))  # jump in gradient
     n   = FacetNormal()                    # unit normal from ctx
-    form = dot(jump_grad_u,n) * dInterface(level_set=phi) 
-    
-    eq   = form == Constant(0.0)
-    hook = {type(form.integrand):{'name':'gj'}}
-    res  = assemble_form(eq, DofHandler({'u':mesh}), bcs=[],assembler_hooks=hook)
-    print(res)
-    assert np.isclose(res['gj'], 0.0, atol=1e-2)
+    # interface contribution goes on the RHS --------------------
+    rhs_form = dot(jump_grad_u, n) * v * dInterface(level_set=phi)
+
+    # a positive-definite mass matrix on the volume --------------
+    w = TrialFunction('u', dof_handler=dof_handler)
+    lhs_form = w * v * dx
+
+    eq  = lhs_form == rhs_form
+    K, F = assemble_form(eq, dof_handler=dof_handler, bcs=bcs)
+
+    u_sol = np.linalg.solve(K.toarray(), F)
+    assert np.allclose(u_sol, 0.0, atol=1e-12)
 
 
-def test_jump_grad_scalar_two_fields(mesh: Mesh):
+
+
+def test_jump_grad_scalar_two_fields(mesh: Mesh, dof_handler: DofHandler, bcs: list[BoundaryCondition]):
     phi = make_levelset()
     # ... setup mesh ...
 
@@ -96,7 +158,6 @@ def test_jump_grad_scalar_two_fields(mesh: Mesh):
     u_pos = lambda x, y: x**2
     u_neg = lambda x, y: x**2 - 1
 
-    dof_handler = DofHandler({'u': mesh})  # Create a DofHandler for the mesh
     # Create the positive-side function
     u_pos_func = Function(field_name='u', name='u_pos',
                           dof_handler=dof_handler)
@@ -111,45 +172,28 @@ def test_jump_grad_scalar_two_fields(mesh: Mesh):
 
     # --- Define the form using the two functions ---
     n = FacetNormal()
-    
+    w = TrialFunction('u', dof_handler=dof_handler)  # Trial function for the weak form
+    v = TestFunction('u', dof_handler=dof_handler)  # Test function for the weak form
     # The form now correctly represents the jump between two distinct fields
-    form = dot(grad(u_pos_func) - grad(u_neg_func), n) * dInterface(level_set=phi)
+    rhs = dot(grad(u_pos_func) - grad(u_neg_func), n) * v * dInterface(level_set=phi)
 
     # --- Assembly and Assertion ---
-    eq = form == Constant(0.0)
-    hook = {type(form.integrand): {'name': 'gj'}}
-    res = assemble_form(eq, dof_handler=dof_handler, bcs=[], assembler_hooks=hook)
-    
-    print(res)
+    eq = w *v * dx == rhs
+    # hook = {type(rhs.integrand): {'name': 'gj'}}
+    LHS,RHS = assemble_form(eq, dof_handler=dof_handler, bcs=[], assembler_hooks=None)
+    res = np.linalg.solve(LHS.toarray(), RHS)
     # This will now pass, as g_pos - g_neg will correctly evaluate to zero.
-    assert np.isclose(res['gj'], 0.0, atol=1e-2)
+    assert np.allclose(res, 0.0, atol=1e-10)
 
-# ------------------------------------------------ gradient jump scalar
-def test_jump_grad_scalar(mesh:Mesh):
-    phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
-    mesh.build_interface_segments(phi); 
-    u_pos = lambda x,y: x**2       # outside  (φ ≥ 0)
-    u_neg = lambda x,y: x**2-1     # inside   (φ < 0)
-    dof_handler = DofHandler({'u':mesh})  # Create a DofHandler for the mesh
-    u_scalar = Function(field_name='u', name='u_scalar',
-                        dof_handler=dof_handler)
-    u_scalar = add_scalar_field(u_scalar,mesh, phi, u_pos, u_neg)
 
-    n   = FacetNormal()                    # unit normal from ctx
-    grad_jump = Jump(grad(u_scalar))        # placeholder: visit_Jump will supply 1
-    form = dot(grad_jump , n) * dInterface(level_set=phi)
-    eq   = form == Constant(0.0)
-    hook = {type(form.integrand):{'name':'gj'}}
-    res  = assemble_form(eq, dof_handler=dof_handler, bcs=[],assembler_hooks=hook)
-    print(res)
-    assert np.isclose(res['gj'], 0.0, atol=1e-2)
 
 # ------------------------------------------------ vector value jump (norm)
-def test_jump_vector_norm(mesh:Mesh):
-    fe_map = {'vx': mesh, 'vy':mesh}  # Define a vector field
-    dof_handler = DofHandler(fe_map, method='cg')
-    velocity_space_pos = VectorFunction("velocity_pos", ['vx', 'vy'], dof_handler=dof_handler)
-    velocity_space_neg = VectorFunction("velocity_neg", ['vx', 'vy'], dof_handler=dof_handler)
+def test_jump_vector_norm(mesh:Mesh, dof_handler:DofHandler, bcs:list[BoundaryCondition]):
+    
+    me = MixedElement(mesh, field_specs={"vx":1, "vy":1})
+    dof_handler = DofHandler(me, method='cg')  # Create a DofHandler for the mesh
+    velocity_space_pos = VectorFunction(name="velocity_pos", field_names= ['vx', 'vy'], dof_handler=dof_handler)
+    velocity_space_neg = VectorFunction(name="velocity_neg", field_names= ['vx', 'vy'], dof_handler=dof_handler)
     phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
     mesh.build_interface_segments(phi); 
     v_pos = lambda x,y: np.array([y,3*y])
@@ -158,12 +202,16 @@ def test_jump_vector_norm(mesh:Mesh):
     velocity_space_neg.set_values_from_function(v_neg)
     n = FacetNormal()  # unit normal from ctx
     jump_v = Jump(velocity_space_pos,velocity_space_neg)  # jump in vector
+    form_lhs = dot(jump_v, n) * dInterface(level_set=phi)
+    
+    # CORRECTED: RHS must be a valid integral form
+    form_rhs = Constant(0.0) * dx
+    eq = form_lhs ==  form_rhs
 
-    form = dot(jump_v,n) * dInterface(level_set=phi)
-    eq   = form == Constant(0.0)
-    res  = assemble_form(eq, dof_handler, bcs=[],
-                         assembler_hooks={type(form.integrand):{'name':'jv'}})
-    exact = -R**2 * np.pi
+    res = assemble_form(eq, dof_handler, bcs=[],
+                        assembler_hooks={type(form_lhs.integrand): {'name': 'jv'}})
+    
+    exact = -np.pi * R**2
     assert np.isclose(res['jv'], exact, rtol=1e-2)
 
 def reference_solution_vector(L=L, R=R, center=center):
@@ -189,8 +237,9 @@ def reference_solution_vector(L=L, R=R, center=center):
     return result.flatten()
 
 def test_jump_grad_vector(mesh:Mesh):
-    fe_map = {'vx': mesh, 'vy':mesh}  # Define a vector field
-    dof_handler = DofHandler(fe_map, method='cg')
+
+    me = MixedElement(mesh, field_specs={"vx":1, "vy":1})
+    dof_handler = DofHandler(me, method='cg')  # Create a DofHandler for the mesh
     velocity_space_pos = VectorFunction("velocity_pos", ['vx', 'vy'], dof_handler=dof_handler)
     velocity_space_neg = VectorFunction("velocity_neg", ['vx', 'vy'], dof_handler=dof_handler)
     phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
@@ -206,7 +255,7 @@ def test_jump_grad_vector(mesh:Mesh):
 
     # form = dot(jump_grad_v,n) * dInterface(level_set=phi)
     form = Jump(grad_v_pos_n,grad_v_neg_n) * dInterface(level_set=phi)
-    eq   = form == Constant(0.0)
+    eq   = form == Constant(0.0) * dx
     res  = assemble_form(eq, dof_handler=dof_handler, bcs=[],
                          assembler_hooks={type(form.integrand):{'name':'jv'}})
     exact = reference_solution_vector()

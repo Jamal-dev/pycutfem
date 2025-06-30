@@ -35,13 +35,9 @@ class MixedElement:
     ----------
     mesh
         The common :class:`pycutfem.core.mesh.Mesh` instance.
-    field_names
-        Ordered iterable of field identifiers (e.g. ("ux", "uy", "p")).
-    field_orders
-        Optional mapping *field_name → polynomial order*.  Fields not listed
-        inherit ``mesh.poly_order``.  Example::
-
-            MixedElement(mesh, ("ux","uy","p"), field_orders={"p": 1})
+    field_specs
+        A mapping of field names to their polynomial orders, e.g. `{'ux': 2, 'uy': 2, 'p': 1}`.
+        
     """
 
     # ..................................................................

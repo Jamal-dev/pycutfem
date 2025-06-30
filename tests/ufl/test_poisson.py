@@ -12,6 +12,7 @@ from pycutfem.ufl.measures import dx
 from pycutfem.ufl.forms import assemble_form, BoundaryCondition
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.fem.mixedelement import MixedElement
 
 def test_poisson_symbolic_q1():
     """
@@ -22,12 +23,12 @@ def test_poisson_symbolic_q1():
     mesh = Mesh(nodes, element_connectivity=elems, edges_connectivity=None, 
                 elements_corner_nodes=corners, element_type="quad", poly_order=1)
 
-    # fe map
-    fe_map = {'u': mesh}  # Single field for Poisson problem
-    dof_handler = DofHandler(fe_map, method='cg')
+    me = MixedElement(mesh, field_specs={'u': 1})  # Single field for Poisson problem
+    
+    dof_handler = DofHandler(me, method='cg')
     u_space = FunctionSpace("disp",['u'],dim=0)    # 2. Define the weak form using the symbolic API
-    u = TrialFunction(u_space.field_names[0])
-    v = TestFunction(u_space.field_names[0])
+    u = TrialFunction(u_space,dof_handler=dof_handler)
+    v = TestFunction( u_space,dof_handler=dof_handler)
 
     # Define source term f = 1.0
     f = Constant(1.0)

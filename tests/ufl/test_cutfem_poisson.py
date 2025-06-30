@@ -19,6 +19,7 @@ from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 from pycutfem.core.levelset import CircleLevelSet
 from pycutfem.utils.geometry import hansbo_cut_ratio
 from pycutfem.io.visualization import plot_mesh_2
+from pycutfem.fem.mixedelement import MixedElement
 
 
 def test_cutfem_poisson_interface():
@@ -54,12 +55,13 @@ def test_cutfem_poisson_interface():
 
     # 3. Define the DofHandler for the two-field problem
     # The field names are now just labels; their meaning is defined by their use in the weak form.
-    fe_map = {'u_outside': mesh, 'u_inside': mesh}
-    dof_handler = DofHandler(fe_map, method='cg')
+    me = MixedElement(mesh, field_specs={'u_outside' : poly_order, 'u_inside': poly_order})
+    # fe_map = {'u_outside': mesh, 'u_inside': mesh}
+    dof_handler = DofHandler(me, method='cg')
 
     # 4. Define Trial and Test Functions
-    u_neg, v_neg = TrialFunction('u_outside'), TestFunction('u_outside')
-    u_pos, v_pos = TrialFunction('u_inside'), TestFunction('u_inside')
+    u_neg, v_neg = TrialFunction('u_outside',dof_handler=dof_handler), TestFunction('u_outside',dof_handler=dof_handler)
+    u_pos, v_pos = TrialFunction('u_inside',dof_handler=dof_handler), TestFunction('u_inside',dof_handler=dof_handler)
 
     # 5. Define Coefficients and Expressions
     alpha_vals = np.zeros(len(mesh.elements_list))

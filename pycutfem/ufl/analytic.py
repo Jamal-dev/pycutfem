@@ -13,13 +13,21 @@ class Analytic(Expression):
     _coords = _coord_syms
     _space_dimensions = 2
 
-    def __init__(self, sympy_expr, dim=0): # dim is a tensor dimension, not a space dimension
+    def __init__(self, sympy_expr, dim=0, degree:int | None = None): # dim is a tensor dimension, not a space dimension
         self.sympy_expr = sympy_expr
         self.dim = dim
-        self._func = sp.lambdify(self._coords[:], sympy_expr, "numpy")
+        self._degree = degree
+        if callable(sympy_expr):
+            # If sympy_expr is a callable, we assume it takes (x, y) as arguments
+            self._func = sympy_expr
+        else:
+            self._func = sp.lambdify(self._coords[:], sympy_expr, "numpy")
 
     def grad(self): from pycutfem.ufl.expressions import Grad; return Grad(self)
     # nothing extra is needed for UFL algebra – we inherit +,*,grad,…
+    @property
+    def degree(self):   # used by the estimator
+        return self._degree
     def eval(self, X):
         """X : (..., dim) array → numpy array of the same leading shape"""
         X = np.asarray(X)

@@ -59,4 +59,15 @@ def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None,
     # The compiler will handle the list of integrals directly.
     compiler = FormCompiler(dof_handler, quad_order, assembler_hooks=assembler_hooks)
     
-    return compiler.assemble(equation, bcs)
+    # This runs the full assembly process. K and F are created, and if hooks
+    # are present, compiler.ctx['scalar_results'] is populated.
+    K, F = compiler.assemble(equation, bcs)
+
+    # --- FIXED RETURN LOGIC ---
+    # After assembly, check the compiler's context for scalar results.
+    # If the user provided hooks and those hooks produced results, return them.
+    if assembler_hooks and 'scalar_results' in compiler.ctx:
+        return compiler.ctx['scalar_results']
+    
+    # Otherwise, return the standard system matrix and vector.
+    return K, F

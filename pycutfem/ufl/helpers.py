@@ -130,6 +130,9 @@ class VecOpInfo:
     def info(self):
         """Return the type of the data array."""
         return f"VecOpInfo({self.data.dtype}, shape={self.data.shape}, role='{self.role}')"
+    def __repr__(self) -> str:
+        """String representation of the VecOpInfo."""
+        return f"VecOpInfo(shape={self.data.shape}, role='{self.role}')"
 
 
 @dataclass(slots=True, frozen=True)
@@ -241,3 +244,6 @@ class GradOpInfo:
     @property
     def ndim(self) -> int: return self.data.ndim
     def __repr__(self): return f"GradOpInfo(shape={self.data.shape}, role='{self.role}')"
+    def info(self):
+        """Return the type of the data array."""
+        return f"GradOpInfo({self.data.dtype}, shape={self.data.shape}, role='{self.role}')"

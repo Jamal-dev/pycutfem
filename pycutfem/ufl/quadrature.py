@@ -4,10 +4,11 @@ import logging
 from typing import TYPE_CHECKING, Dict
 
 # Symbolic building blocks
+from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import (
     Expression, Constant, TestFunction, TrialFunction, VectorTestFunction,
     VectorTrialFunction, Function, VectorFunction, Grad, DivOperation, Inner,
-    Dot, Sum, Sub, Prod, Pos, Neg, Div
+    Dot, Sum, Sub, Prod, Pos, Neg, Div, FacetNormal, ElementWiseConstant, Jump
 )
 
 if TYPE_CHECKING:
@@ -27,6 +28,7 @@ class PolynomialDegreeEstimator:
             raise ValueError("PolynomialDegreeEstimator requires a MixedElement-backed DofHandler.")
         self.dh = dh
         self.me = dh.mixed_element
+        self._geom_deg = max(0, self.me.mesh.poly_order - 1)
         
         # Memoization cache to avoid re-computing degrees for the same sub-expression
         self._cache: Dict[int, int] = {}
@@ -58,17 +60,36 @@ class PolynomialDegreeEstimator:
 
         # --- Recursive Cases: Operators ---
         elif isinstance(expr, Grad):
-            # NEW: Clamp the degree to be non-negative immediately.
-            result = max(0, self._get_degree(expr.operand) - 1)
+            # ∇u :  (deg(u)-1)  on the reference cell  +  J^{-T}  of degree geom-1
+            result = max(0, self._get_degree(expr.operand) - 1) + self._geom_deg
         elif isinstance(expr, DivOperation):
             # NEW: Clamp the degree to be non-negative immediately.
-            result = max(0, self._get_degree(expr.operand) - 1)
+            result = max(0, self._get_degree(expr.operand) - 1) + self._geom_deg
         elif isinstance(expr, (Sum, Sub)):
             result = max(self._get_degree(expr.a), self._get_degree(expr.b))
         elif isinstance(expr, (Prod, Dot, Inner)):
             result = self._get_degree(expr.a) + self._get_degree(expr.b)
         elif isinstance(expr, (Pos, Neg)):
             result = self._get_degree(expr.operand)
+        elif isinstance(expr, FacetNormal):
+            result = self._geom_deg
+        elif isinstance(expr, ElementWiseConstant):
+            # ElementWiseConstant is a special case that should not be confused with Constant.
+            # It represents a constant value that is element-wise, so its degree is 0.
+            result = 0
+        elif isinstance(expr, Jump):
+            result = self._get_degree(expr.operand)
+        
+        elif isinstance(expr, Analytic):                 # NEW ✱
+            # 1. Honour an explicit hint  (Analytic(..., degree=k))
+            if expr.degree is not None:
+                result = expr.degree
+            else:
+                # 2. Fallback: be conservative – twice the mesh order
+                result = max(2, self.me.mesh.poly_order * 2)
+                logger.warning(
+                    "Analytic expression without degree hint – "
+                    "assuming polynomial degree %d", result)
         elif isinstance(expr, Div):
              deg_a = self._get_degree(expr.a)
              deg_b = self._get_degree(expr.b)

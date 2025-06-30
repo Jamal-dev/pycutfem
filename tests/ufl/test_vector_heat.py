@@ -15,6 +15,7 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.measures import dx
 from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 from pycutfem.ufl.analytic import Analytic, x, y
+from pycutfem.fem.mixedelement import MixedElement
 
 
 
@@ -59,8 +60,8 @@ def test_vector_heat_equation_mms():
     poly_order = 2  # Q2 elements
     nodes, elems, _, corners = structured_quad(1, 1, nx=6, ny=6, poly_order=poly_order)
     mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
-    fe_map = {'ux': mesh, 'uy': mesh}
-    dof_handler = DofHandler(fe_map, method='cg')
+    me = MixedElement(mesh, field_specs={'ux': poly_order, 'uy': poly_order})
+    dof_handler = DofHandler(me, method='cg')
 
     # 3. Time-Stepping Loop
     T_end = 0.5
@@ -75,8 +76,8 @@ def test_vector_heat_equation_mms():
     u_n.set_values_from_function(u_n_initial_func)
     
     # UFL Trial/Test functions and constants for the weak form
-    u = VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy']))
-    v = VectorTestFunction(FunctionSpace("velocity", ['ux', 'uy']))
+    u = VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy']),dof_handler=dof_handler)
+    v = VectorTestFunction( FunctionSpace("velocity", ['ux', 'uy']),dof_handler=dof_handler)
     dt = Constant(dt_val)
     eps = Constant(epsilon)
     
