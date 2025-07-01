@@ -36,8 +36,10 @@ def test_vector_heat_equation_mms():
     print("="*70)
 
     # 1. Define Analytical Solution and Parameters using SymPy
-    epsilon = 0.1
+    epsilon = 0.5
     t_sym = sp.Symbol('t')
+    nx,ny = 10, 10  # Number of elements in x and y directions
+    poly_order = 2  # Q2 elements
     
     # Choose a smooth vector solution that depends on both space and time
     # u_exact_sym_x = sp.cos(t_sym) * sp.sin(sp.pi * x) * sp.cos(sp.pi * y)
@@ -57,8 +59,7 @@ def test_vector_heat_equation_mms():
     f_analytic_func = sp.lambdify((x, y, t_sym), [f_sym_x, f_sym_y], 'numpy')
 
     # 2. Setup Q2 Mesh and DofHandler
-    poly_order = 2  # Q2 elements
-    nodes, elems, _, corners = structured_quad(1, 1, nx=6, ny=6, poly_order=poly_order)
+    nodes, elems, _, corners = structured_quad(1, 1, nx=nx, ny=ny, poly_order=poly_order)
     mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
     me = MixedElement(mesh, field_specs={'ux': poly_order, 'uy': poly_order})
     dof_handler = DofHandler(me, method='cg')
@@ -84,14 +85,19 @@ def test_vector_heat_equation_mms():
     # These will hold the forcing term at times t_n and t_{n+1}
     f_n = VectorFunction(name="f_n", field_names=['ux', 'uy'], dof_handler=dof_handler)
     f_np1 = VectorFunction(name="f_np1", field_names=['ux', 'uy'], dof_handler=dof_handler)
+    bc_tags = {
+        'boundary': lambda x, y: (np.isclose(x, 0.0) or np.isclose(x, 1.0) or
+                                    np.isclose(y, 0.0) or np.isclose(y, 1.0))
+    }
+    mesh.tag_boundary_edges(bc_tags)
 
+    theta = 1.0 # Use Backward Euler for stability
     for n in range(num_steps):
         t_n = n * dt_val
         t_np1 = (n + 1) * dt_val
         print(f"\n--- Solving Time Step {n+1}/{num_steps} | t = {t_np1:.2f}s ---")
 
         # 4. Define Weak Form using the Theta-method
-        theta = 1.0 # Use Backward Euler for stability
         
         # LHS of the system for the unknown u_k (aliased as u)
         a_form = (
@@ -110,31 +116,34 @@ def test_vector_heat_equation_mms():
         equation = a_form == L_form
 
         # 5. Populate time-dependent functions and define BCs for t_{n+1}
-        f_n.set_values_from_function(lambda x, y: f_analytic_func(x, y, t_n))
+        f_n.set_values_from_function(  lambda x, y: f_analytic_func(x, y, t_n))
         f_np1.set_values_from_function(lambda x, y: f_analytic_func(x, y, t_np1))
         
         bcs = [
             BoundaryCondition('ux', 'dirichlet', 'boundary', lambda x, y: u_exact_func_x(x, y, t_np1)),
             BoundaryCondition('uy', 'dirichlet', 'boundary', lambda x, y: u_exact_func_y(x, y, t_np1))
         ]
-        mesh.tag_boundary_edges({'boundary': lambda x, y: True})
+        
 
         # 6. Assemble and Solve the linear system
         A, b = assemble_form(equation, dof_handler, bcs=bcs, quad_order=5)
         u_k_vec = spla.spsolve(A, b)
 
         # 7. Verify Solution for the current time step
-        node_coords = mesh.nodes_x_y_pos
-        exact_sol_vec = np.zeros_like(u_k_vec)
-        exact_sol_vec[dof_handler.get_field_slice('ux')] = u_exact_func_x(node_coords[:, 0], node_coords[:, 1], t_np1)
-        exact_sol_vec[dof_handler.get_field_slice('uy')] = u_exact_func_y(node_coords[:, 0], node_coords[:, 1], t_np1)
+
+        exact = {'ux': lambda x,y: u_exact_func_x(x,y,t_np1),
+                 'uy': lambda x,y: u_exact_func_y(x,y,t_np1)}
+        l2_error = dof_handler.l2_error(u_k_vec,exact,quad_order=5)
+
+
         
-        l2_error = np.linalg.norm(u_k_vec - exact_sol_vec) / np.linalg.norm(exact_sol_vec)
+        # l2_error = np.linalg.norm(u_k_vec - exact_sol_vec) / np.linalg.norm(exact_sol_vec)
         print(f"  > Relative L2 Error at t={t_np1:.2f}: {l2_error:.4e}")
         assert l2_error < 1e-3
 
         # 8. Update for next step
-        u_n.nodal_values[:] = u_k_vec
+        u_n.nodal_values.fill(0.0)
+        dof_handler.add_to_functions(u_k_vec, [u_n])
         
     print("\nVector heat equation test passed successfully!")
 

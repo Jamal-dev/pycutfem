@@ -49,13 +49,21 @@ class VecOpInfo:
         if self.data.shape[0] != grad.data.shape[-1]:
             raise ValueError(f"VecOpInfo {self.shape} and GradOpInfo {grad.shape} must have the same number of components.")
         
-        result_data = np.einsum("kl,ijk->ij", self.data, grad.data, optimize=True)
-        role = self.role
-        if grad.role == "trial":
-            role = grad.role
-        if role == "none" or None and grad.role == 'function':
-            role = grad.role
-        return VecOpInfo(result_data, role=role)
+        # result_data = np.einsum("kl,ijk->ij", self.data, grad.data, optimize=True)
+        # role = self.role
+        # if grad.role == "trial":
+        #     role = grad.role
+        # if role == "none" or None and grad.role == 'function':
+        #     role = grad.role
+        # return VecOpInfo(result_data, role=role)
+        # 1. value of each velocity component at the current Q-point
+        u_val = np.sum(self.data, axis=1)          # shape (d,)
+
+        # 2. contract over the spatial index d
+        data = np.einsum("d,knd->kn", u_val, grad.data, optimize=True)
+
+        return VecOpInfo(data, role=grad.role)
+    
     def dot_vec(self, vec: "VecOpInfo") -> "VecOpInfo":
         """
         Computes dot(u, v) for a vector basis function u and a other vector basis.
@@ -69,8 +77,19 @@ class VecOpInfo:
         
         if vec.role == "test" and self.role == "function": # rhs time derivative term
             # print("VecOpInfo.dot_vec: rhs time derivative term")
-            result_data = np.einsum("km,kn->n", self.data, vec.data, optimize=True) #rhs time derivative term
-            return result_data  # Return as a 1D array if vec is a test function
+            # result_data = np.einsum("km,kn->n", self.data, vec.data, optimize=True) #rhs time derivative term
+            # return result_data  # Return as a 1D array if vec is a test function
+            
+            # self.data contains [u_loc*basis_x, u_loc*basis_y, ...].
+            # First, correctly evaluate the scalar value of each component of the function 'self'
+            # at the current quadrature point by summing over the basis functions.
+            func_values_at_qp = np.sum(self.data, axis=1)  # Shape (k,)
+
+            # Now, multiply these scalar component values by the corresponding test basis vectors
+            # and sum the results: value_x*v_x + value_y*v_y + ...
+            # The einsum "k,kn->n" performs this operation correctly.
+            return np.einsum("k,kn->n", func_values_at_qp, vec.data, optimize=True)
+            
         if self.role == "trial" and vec.role == "test":
             # lhs mass matrix term
             # If self is trial and vec is test, we return a VecOpInfo with shape (m, n)

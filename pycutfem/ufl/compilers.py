@@ -349,6 +349,7 @@ class FormCompiler:
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
+        # print(f"visit dot: role_a={role_a}, role_b={role_b}, a={a}, b={b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}")
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
 
         def rhs():
@@ -376,6 +377,12 @@ class FormCompiler:
                 # data_fk = np.einsum("knd,d->kn", a.data, u_val) # keep basis-index n
                 # return VecOpInfo(data_fk, role="function")
                 return a.dot_vec(b)  # grad(u_k) . u_k
+            if  isinstance(b, GradOpInfo) and isinstance(a, VecOpInfo) \
+            and b.role == a.role == "function":
+                # u_val   = np.sum(a.data, axis=1)                # (d,)
+                # data_fk = np.einsum("knd,d->kn", b.data, u_val) # keep basis-index n
+                # return VecOpInfo(data_fk, role="function")
+                return b.dot_vec(a)
             
             
             # Constant (numpy 1-D) · test VecOpInfo  → length-n vector
@@ -418,6 +425,7 @@ class FormCompiler:
         if isinstance(b, (VecOpInfo, GradOpInfo)) and isinstance(a, np.ndarray): return b.dot_const_vec(a) if b.ndim==2 else b.dot_vec(a)
         
 
+        # mass matrix case: VecOpInfo . VecOpInfo
         if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
             logger.debug(f"visit dot: Both operands are VecOpInfo: {a.role} . {b.role}")
             if a.role == "test" and b.role in {"trial", "function"}:
@@ -427,9 +435,11 @@ class FormCompiler:
                 # return np.dot(b_data.T, a_data)  # tiral . test
                 return a.dot_vec(b)  # trial . test
         
-        # case grad(u) . u_k
+        
+        # ------------------------------------------------------------------
+        # case grad(u_trial) . u_k
         if isinstance(a, GradOpInfo) and ((isinstance(b, VecOpInfo) \
-            and (b.role == "function" )) 
+            and (b.role == "function" )) and a.role == "trial" 
             ):
 
             # velocity value at this quadrature point
@@ -442,10 +452,10 @@ class FormCompiler:
             return a.dot_vec(b)  # grad(u) . u_k
         
         # ------------------------------------------------------------------
-        # Case:  VectorFunction · Grad(⋅)      u_k · ∇w
+        # Case:  VectorFunction · Grad(⋅)      u_k · ∇w_test
         # ------------------------------------------------------------------
         if isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo) \
-        and a.role == "function":
+        and a.role == "function" and b.role == "test":
 
             # 1. velocity value at the current quadrature point
             # u_val = np.sum(a.data, axis=1)                  # (d,)  —   u_d(ξ)
@@ -474,15 +484,36 @@ class FormCompiler:
             return a.dot_func(b)
         
         # ------------------------------------------------------------------
-        # Case:  Vec(Function) · Grad(Trial)      u_k · ∇u
+        # Case:  Vec(Function) · Grad(Trial)      u_k · ∇u_trial
         # ------------------------------------------------------------------
         if isinstance(a, VecOpInfo)  and a.role == "function" \
         and isinstance(b, GradOpInfo) and b.role == "trial":
 
-            # u_val = np.sum(a.data, axis=1)             # (d,)
-            # data  = np.einsum("d,knd->kn", u_val, b.data, optimize=True)
-            # return VecOpInfo(data, role="trial")
-            return a.dot_grad(b)  # u_k · ∇u
+            return a.dot_grad(b)  # u_k · ∇u_trial
+            # # print(f"problem " * 4)
+            # # return a.dot_grad(b)  # u_k · ∇u
+            # # trying new things here
+            # fun_vals = np.sum(a.data, axis=1) 
+            # fun_vals_x = sum(a.data[0,:])
+            # fun_vals_y = sum(a.data[1,:])
+            # # print(f"func_vals_x: {fun_vals_x}, sum(fun_vals_x): {np.sum(fun_vals_x)}") 
+            # # print(f"func_vals_y: {fun_vals_y}, sum(fun_vals_y): {np.sum(fun_vals_y)}")
+            # if b.data.shape[0] == 2: # vector gradient
+            #     a11 = b.data[0,:,0] # ∂_x u_trial_1
+            #     a12 = b.data[0,:,1] # ∂_y u_trial_1
+            #     a21 = b.data[1,:,0] # ∂_x u_trial_2
+            #     a22 = b.data[1,:,1] # ∂_y u_trial_2
+            #     c11 =  fun_vals_x * a11 +  fun_vals_y * a21 # ∂_x u_trial
+            #     c12 =  fun_vals_x * a12 +  fun_vals_y * a22 #
+            #     # print(f"shapes = c11.shape:{c11.shape}, c12.shape:{c12.shape}, {fun_vals_x.shape}, fun_vals_y.shape:{fun_vals_y.shape}, a11.shape:{a11.shape}, a12.shape:{a12.shape}, a21.shape:{a21.shape}, a22.shape:{a22.shape}")
+            #     c = np.stack([c11, c12], axis=0) # (2, n_loc)
+            # else: # scalar gradient
+            #     a1 = b.data[0,:,0] # ∂_x u_trial
+            #     a2 = b.data[0,:,1] # ∂_y u_trial
+            #     c1 = fun_vals_x *  a1 + fun_vals_y *  a2 # ∂_x u_trial
+            #     c = np.stack([c1], axis=0)
+            # # data = np.einsum("km,imk->im", a.data, b.data, optimize=True)
+            # return VecOpInfo(c, role="trial")  # u_k · ∇u_trial
         
         # Both are numerical vectors (RHS)
         if isinstance(a, np.ndarray) and isinstance(b, np.ndarray): return np.dot(a,b)

@@ -113,7 +113,7 @@ class DofHandler:
         #    assigns a unique DOF to each pair when first encountered, and builds
         #    the element-to-DOF map for each field.
         for elem in mesh.elements_list:
-            loc2phys = {loc: nid for loc, nid in enumerate(elem.nodes)}
+            # loc2phys = {loc: nid for loc, nid in enumerate(elem.nodes)}
             
             for fld in self.field_names:
                 p_f = self.mixed_element._field_orders[fld]
@@ -122,7 +122,7 @@ class DofHandler:
                 
                 gids = []
                 for loc in needed_loc_idx:
-                    phys_nid = loc2phys[loc]
+                    phys_nid = elem.nodes[loc]
                     key = (fld, phys_nid)
                     if key not in node_dof_map:
                         node_dof_map[key] = offset
@@ -256,12 +256,7 @@ class DofHandler:
             raise ValueError(f"Unknown field '{field}'.")
         return np.asarray(sorted(self.dof_map[field].values()), dtype=int)
 
-    def get_dof_coords(self, field: str) -> np.ndarray:
-        self._require_cg("get_dof_coords")
-        mesh = self.fe_map[field]
-        coords = [(mesh.nodes_x_y_pos[nid][0], mesh.nodes_x_y_pos[nid][1])
-                  for nid in sorted(self.dof_map[field].keys())]
-        return np.asarray(coords, dtype=float)
+
         
     # ------------------------------------------------------------------
     #  Tagging and Dirichlet handling (CG‑only)
@@ -293,8 +288,8 @@ class DofHandler:
             print(f"Warning: DofHandler.tag_dof_by_locator did not find any node for field '{field}' with the given locator.")
 
     def get_dirichlet_data(self,
-                           bcs: Union[BcLike, Iterable[BcLike]],
-                           locators: Dict[str, Callable[[float, float], bool]] = None) -> Dict[int, float]:
+                        bcs: Union[BcLike, Iterable[BcLike]],
+                        locators: Dict[str, Callable[[float, float], bool]] = None) -> Dict[int, float]:
         """Calculates Dirichlet DOF values from a list of BoundaryCondition objects."""
         self._require_cg("Dirichlet BC evaluation")
         data: Dict[int, float] = {}
@@ -306,42 +301,52 @@ class DofHandler:
                 continue
 
             field = getattr(bc, "field", None)
-            if field is None: continue
+            if field is None: raise ValueError("BoundaryCondition must have a 'field' attribute.")
+            # For MixedElement, all fields share the same mesh, so this is fine.
             mesh = self.fe_map.get(field)
             if mesh is None: continue
 
             domain_tag = getattr(bc, "domain_tag", None) or getattr(bc, "tag", None)
             if domain_tag is None: continue
 
+            # --- START FIX ---
+            # The logic to find nodes must be self-contained within the loop for each BC.
+            
+            nodes_on_domain: Set[int] = set()
+
+            # Path 1: The domain is a pre-tagged set of DOFs (e.g., 'pressure_pin')
             if domain_tag in self.dof_tags:
                 val_is_callable = callable(bc.value)
                 for dof in self.dof_tags[domain_tag]:
                     dof_field, node_id = self._dof_to_node_map[dof]
-                    if dof_field == field:
+                    if dof_field == field: # Apply only if the field matches
                         x, y = mesh.nodes_x_y_pos[node_id]
                         value = bc.value(x, y) if val_is_callable else bc.value
                         data[dof] = value
-                continue
+                continue # Go to the next BC
 
-            nodes_on_domain: Set[int] = set()
+            # Path 2: The domain is found by a locator function
             if domain_tag in locators:
                 locator_func = locators[domain_tag]
                 for node in mesh.nodes_list:
                     if locator_func(node.x, node.y):
                         nodes_on_domain.add(node.id)
+            # Path 3: The domain is found by tags on geometric entities (edges/nodes)
             else:
                 found_on_edges = False
                 for edge in mesh.edges_list:
                     if getattr(edge, 'tag', None) == domain_tag:
-                        nodes_to_add = getattr(edge, 'all_nodes', edge.nodes)
-                        if nodes_to_add:
-                            nodes_on_domain.update(nodes_to_add)
-                            found_on_edges = True
+                        nodes_to_add = getattr(edge, 'all_nodes', None)
+                        if nodes_to_add is None: raise ValueError(f"Edge {edge.id} does not have 'all_nodes' attribute.")
+                        nodes_on_domain.update(nodes_to_add)
+                        found_on_edges = True
                 if not found_on_edges:
                     for node in mesh.nodes_list:
                         if getattr(node, 'tag', None) == domain_tag:
                             nodes_on_domain.add(node.id)
 
+            # Now, apply the value for the CURRENT boundary condition `bc`
+            # to the nodes found for its specific domain.
             val_is_callable = callable(bc.value)
             for nid in nodes_on_domain:
                 dof = self.dof_map.get(field, {}).get(nid)
@@ -349,6 +354,8 @@ class DofHandler:
                     x, y = mesh.nodes_x_y_pos[nid]
                     value = bc.value(x, y) if val_is_callable else bc.value
                     data[dof] = value
+            # --- END FIX ---
+            
         return data
 
     # ------------------------------------------------------------------
@@ -371,8 +378,18 @@ class DofHandler:
         # Import here to avoid circular dependency at the top level
         from pycutfem.ufl.expressions import Function, VectorFunction
 
-        if delta.shape[0] != self.total_dofs:
-            raise ValueError(f"Shape of delta vector ({delta.shape[0]}) does not match "
+        delta_vec = None
+        if isinstance(delta, np.ndarray):
+            delta_vec = delta
+        elif isinstance(delta, (Function, VectorFunction)):
+            # If the user passes a Function object, use its internal data array.
+            # This makes the function more robust to common usage errors.
+            delta_vec = delta.nodal_values
+        else:
+            raise TypeError(f"Argument 'delta' must be a NumPy array or a Function object, not {type(delta)}")
+
+        if delta_vec.shape[0] != self.total_dofs:
+            raise ValueError(f"Shape of delta vector ({delta_vec.shape[0]}) does not match "
                              f"total DOFs in handler ({self.total_dofs}).")
 
         for func in functions:
@@ -389,8 +406,8 @@ class DofHandler:
             
             if target_array is not None and g2l_map is not None:
                 for gdof, lidx in g2l_map.items():
-                    if gdof < len(delta):
-                        target_array[lidx] += delta[gdof]
+                    if gdof < len(delta_vec):
+                        target_array[lidx] += delta_vec[gdof]
 
     def apply_bcs(self, bcs: Union[BcLike, Iterable[BcLike]], *functions: Any):
         """
@@ -450,65 +467,75 @@ class DofHandler:
                 out.append((bc.field, domain, bc.value))
         return out
     
+    def get_dof_coords(self, field: str) -> np.ndarray:
+        """Coordinates of the field’s DOFs in the *same* order as get_field_slice."""
+        self._require_cg("get_dof_coords")
+        if field not in self.field_names:
+            raise ValueError(f"Unknown field '{field}'.")
+        gdofs  = self.get_field_slice(field)           # canonical order
+        mesh   = self.fe_map[field]
+        coords = [ mesh.nodes_x_y_pos[self._dof_to_node_map[d][1]] for d in gdofs ]
+        return np.asarray(coords, dtype=float)
+
+
+    
+
+
     def l2_error(self,
-                u_vec: np.ndarray,
-                exact: Mapping[str, Callable[[float, float], Sequence[float]]],
-                quad_order: int | None = None,
-                relative: bool = True) -> float:
+                 u_vec: Union[np.ndarray, 'Function', 'VectorFunction'], # Accept multiple types
+                 exact: Mapping[str, Callable[[float, float], float]],
+                 quad_order: int | None = None,
+                 relative: bool = True) -> float:
         """
-        Compute the global L2-error of *u_vec* against analytical *exact* functions.
-
-        Parameters
-        ----------
-        u_vec       : global solution vector.
-        exact       : mapping  field-name -> callable (x,y) → value or tuple of
-                    component values.  Provide one entry for every field you
-                    want in the error norm.
-        quad_order  : if ``None`` we use 2*mesh.poly_order (safe).
-        relative    : return ‖u_h-u‖ / ‖u‖ if *True*, else absolute error.
-
-        Returns
-        -------
-        float
+        Element-wise L2-norm  ‖u_h − u‖, handling NumPy arrays or Function objects.
         """
+        
+        # Import here to avoid circular dependencies
+        from pycutfem.ufl.expressions import Function, VectorFunction
+        
+        
         mesh  = self.mixed_element.mesh
         me    = self.mixed_element
-        qdeg  = quad_order or 2*mesh.poly_order
-        qp, qw = volume(mesh.element_type, qdeg)            # ← existing helper
+        qdeg  = quad_order or 2 * mesh.poly_order
+        qp, qw = volume(mesh.element_type, qdeg)
+
         err2 = exact2 = 0.0
 
-        # loop over physical elements
-        for eid, elem in enumerate(mesh.elements_list):
-            gdofs = self.get_elemental_dofs(eid)
-            u_loc = u_vec[gdofs]                             # element DoFs view
+        for eid in range(len(mesh.elements_list)):
+            gdofs  = self.get_elemental_dofs(eid)
+            
+            
+            # Polymorphic handling of the input solution u_vec
+            if isinstance(u_vec, np.ndarray):
+                # Case 1: Input is a raw NumPy vector from a solver.
+                # The original logic is correct for this case.
+                u_loc = u_vec[gdofs]
+            elif isinstance(u_vec, (Function, VectorFunction)):
+                # Case 2: Input is a Function or VectorFunction object.
+                # Use the object's dedicated method to get the nodal values.
+                u_loc = u_vec.get_nodal_values(gdofs)
+            else:
+                raise TypeError(f"Unsupported solution type for L2 error calculation: {type(u_vec)}")
+            
 
             for (xi, eta), w in zip(qp, qw):
-                # mapping & Jacobian
-                J      = transform.jacobian(mesh, eid, (xi, eta))
-                detJ   = abs(np.linalg.det(J))
-                x, y   = transform.x_mapping(mesh, eid, (xi, eta))
+                J    = transform.jacobian(mesh, eid, (xi, eta))
+                detJ = abs(np.linalg.det(J))
+                x, y = transform.x_mapping(mesh, eid, (xi, eta))
 
-                # assemble FE value per requested field/component --------------
-                uh_fields = {}
-                for fld in exact.keys():
-                    phi = me.basis(fld, xi, eta)             # shape (n_loc,)
-                    uh_fields[fld] = float(u_loc @ phi)      # scalar value
-                                                            # (vector fields are
-                                                            # stored component-wise)
+                for fld, u_exact_func in exact.items():
+                    phi = me.basis(fld, xi, eta)
+                    uh  = float(u_loc @ phi)
+                    u_exact_val = u_exact_func(x, y)
+                    diff2  = (uh - u_exact_val)**2
+                    base2  = u_exact_val**2
+                    err2  += w * detJ * diff2
+                    exact2 += w * detJ * base2
 
-                # accumulate error and exact norms -----------------------------
-                for fld, u_ex in exact.items():
-                    u_exact_val = u_ex(x, y)
-                    # accept scalar or sequence – always treat as 1-D np.array
-                    u_exact_val = np.atleast_1d(u_exact_val).astype(float)
-
-                    uh_val = np.atleast_1d(uh_fields[fld])
-                    diff2 = np.sum((uh_val - u_exact_val)**2)
-                    base2 = np.sum(u_exact_val**2)
-
-                    err2   += w*detJ*diff2
-                    exact2 += w*detJ*base2
-
+        # Avoid division by zero if the exact solution is zero
+        if exact2 < 1e-14:
+            return math.sqrt(err2)
+            
         return math.sqrt(err2 / exact2) if relative else math.sqrt(err2)
 
     def info(self) -> None:

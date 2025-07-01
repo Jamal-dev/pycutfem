@@ -49,9 +49,7 @@ def test_vector_diffusion_mms():
     u_exact_func_x = sp.lambdify((x, y), u_exact_sym_x, 'numpy')
     u_exact_func_y = sp.lambdify((x, y), u_exact_sym_y, 'numpy')
     
-    # Pass the forcing term `f` as UFL Analytic objects
-    f_x = Analytic(f_sym_x)
-    f_y = Analytic(f_sym_y)
+
 
     # 2. Setup Q2 Mesh and DofHandler
     poly_order = 2
@@ -70,7 +68,7 @@ def test_vector_diffusion_mms():
     
     
     # Weak form for -εΔu = f  is  ∫ ε(∇u : ∇v)dx = ∫ f⋅v dx
-    a_form = (epsilon * inner(grad(u), grad(v))) * dx(metadata={'quad_order': 4})
+    a_form = (epsilon * inner(grad(u), grad(v))) * dx(metadata={'quad_order': 5})
     # L_form = (f_x * v[0] + f_y * v[1]) * dx()
     L_form = dot(f,v) * dx()
     equation = (a_form == L_form)
@@ -93,13 +91,7 @@ def test_vector_diffusion_mms():
     A, b = assemble_form(equation, dof_handler=dof_handler, bcs=bcs, quad_order=5)
     u_vec = spla.spsolve(A, b)
 
-    # 6. Verify Solution against the exact solution
-    ux_dofs = dof_handler.get_field_slice('ux')
-    uy_dofs = dof_handler.get_field_slice('uy')
-    
-    # Get node coordinates directly from the mesh for evaluation
-    node_coords_ux = dof_handler.get_dof_coords('ux')
-    node_coords_uy = dof_handler.get_dof_coords('uy')
+
 
     exact = {'ux': u_exact_func_x,
          'uy': u_exact_func_y}
@@ -267,10 +259,12 @@ def test_vector_advection_diffusion():
     f_sym_y = -epsilon * (sp.diff(u_exact_sym_y, x, 2) + sp.diff(u_exact_sym_y, y, 2)) + \
               (beta_sym[0] * sp.diff(u_exact_sym_y, x) + beta_sym[1] * sp.diff(u_exact_sym_y, y))
 
+    lambdify_f_x = sp.lambdify((x, y), f_sym_x, 'numpy')
+    lambdify_f_y = sp.lambdify((x, y), f_sym_y, 'numpy')
+    
     u_exact_func_x = sp.lambdify((x, y), u_exact_sym_x, 'numpy')
     u_exact_func_y = sp.lambdify((x, y), u_exact_sym_y, 'numpy')
-    f_x = Analytic(f_sym_x)
-    f_y = Analytic(f_sym_y)
+
     beta_analytic_func = sp.lambdify((x, y), beta_sym, 'numpy')
 
     # 2. Setup Mesh and DofHandler
@@ -282,8 +276,11 @@ def test_vector_advection_diffusion():
 
     # 3. Define the Weak Form
     # --- UPDATED FUNCTION INITIALIZATION ---
-    u = VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy']))
-    v = VectorTestFunction(FunctionSpace("velocity", ['ux', 'uy']))
+    u = VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy']),dof_handler=dof_handler)
+    v = VectorTestFunction( FunctionSpace("velocity", ['ux', 'uy']),dof_handler=dof_handler)
+    f = VectorFunction(name="f", field_names=['ux', 'uy'], dof_handler=dof_handler)
+    f.set_values_from_function([lambdify_f_x, lambdify_f_y])
+    
     
     # Create beta and populate it using the new, clean API
     beta = VectorFunction(name="beta", field_names=['ux', 'uy'], dof_handler=dof_handler)
@@ -293,14 +290,21 @@ def test_vector_advection_diffusion():
     diffusion = epsilon * inner(grad(u), grad(v))
     advection = dot( dot(grad(u), beta), v) 
     a_form = (diffusion + advection) * dx()
-    L_form = (f_x * v[0] + f_y * v[1]) * dx()
+    L_form = dot(f,v) * dx()
     equation = (a_form == L_form)
 
-    # 4. Define Boundary Conditions
-    mesh.tag_boundary_edges({'boundary': lambda x, y: True})
+    # 4. Define Boundary Conditions using the exact solution
+    bc_tags = {
+        'bottom': lambda x,y: np.isclose(y,0),
+        'left':   lambda x,y: np.isclose(x,0),
+        'right':  lambda x,y: np.isclose(x,1.0),
+        'top':     lambda x,y: np.isclose(y,1.0)
+    }
+    mesh.tag_boundary_edges(bc_tags)
     bcs = [
-        BoundaryCondition('ux', 'dirichlet', 'boundary', u_exact_func_x),
-        BoundaryCondition('uy', 'dirichlet', 'boundary', u_exact_func_y)
+        BoundaryCondition('ux', 'dirichlet', tag, u_exact_func_x) for tag in bc_tags.keys()]
+    bcs = bcs + [
+        BoundaryCondition('uy', 'dirichlet', tag, u_exact_func_y) for tag in bc_tags.keys()
     ]
 
     # 5. Assemble and Solve
@@ -310,16 +314,9 @@ def test_vector_advection_diffusion():
     u_vec = spla.spsolve(A, b)
 
     # 6. Verify Solution
-    ux_dofs = dof_handler.get_field_slice('ux')
-    uy_dofs = dof_handler.get_field_slice('uy')
-    
-    node_coords = mesh.nodes_x_y_pos
-    exact_sol_vec = np.zeros_like(u_vec)
-    exact_sol_vec[ux_dofs] = u_exact_func_x(node_coords[:, 0], node_coords[:, 1])
-    exact_sol_vec[uy_dofs] = u_exact_func_y(node_coords[:, 0], node_coords[:, 1])
-    
-    l2_error = np.linalg.norm(u_vec - exact_sol_vec) / np.linalg.norm(exact_sol_vec)
-    
-    print(f"\nRelative L2 Error for Q{poly_order} Vector Advection-Diffusion: {l2_error:.4e}")
-    assert l2_error < 0.01, "Solution error is too high."
+    exact = {'ux': u_exact_func_x,
+         'uy': u_exact_func_y}
+    rel_L2 = dof_handler.l2_error(u_vec,exact,quad_order=5)
+    print(f"\nRelative L2 Error for Q{poly_order} Vector Advection-Diffusion: {rel_L2:.4e}")
+    assert rel_L2 < 0.01, "Solution error is too high."
     print("Vector advection-diffusion test passed successfully!")

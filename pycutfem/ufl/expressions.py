@@ -216,6 +216,12 @@ class VectorFunction(Expression):
         
 
     
+    @property
+    def shape(self):
+        """Returns the shape of the vector function"""
+        return self.nodal_values.shape
+    
+
     def nodal_values_component(self, idx: int):
         s = self._dh.get_field_slice(self.field_names[idx])
         return self.nodal_values[[self._g2l[d] for d in s if d in self._g2l]]
