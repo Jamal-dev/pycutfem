@@ -1,6 +1,6 @@
 import re
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Union, Tuple
 import logging
 # Setup logging
@@ -57,12 +57,21 @@ class VecOpInfo:
         #     role = grad.role
         # return VecOpInfo(result_data, role=role)
         # 1. value of each velocity component at the current Q-point
-        u_val = np.sum(self.data, axis=1)          # shape (d,)
-
-        # 2. contract over the spatial index d
-        data = np.einsum("d,knd->kn", u_val, grad.data, optimize=True)
-
-        return VecOpInfo(data, role=grad.role)
+        if self.role == "function" and grad.role == "trial":
+            # Case:  Function · Grad(Trial)      u_k · ∇u_trial
+            # (1)  value of u_k at this quad-point
+            u_val = np.sum(self.data, axis=1)          # shape (k,)  —   u_k(ξ)
+            # (2)  w_i,n = Σ_d u_d ∂_d φ_{k,n}
+            data = np.einsum("d,kld->kl", u_val, grad.data, optimize=True)
+            return VecOpInfo(data, role=grad.role)
+        if self.role == "trial" and grad.role == "function":
+            # Case:  Trial · Grad(Function)      u_trial · ∇u_k
+            # (1)  value of u_trial at this quad-point
+            grad_vals = np.sum(grad.data, axis=1)          # shape (k,d)  —   u_k(ξ)
+            # (2)  w_i,n = Σ_d ∂_d φ_{k,n} u_d
+            data = np.einsum("dl,kd->kl", self.data, grad_vals, optimize=True)
+            return VecOpInfo(data, role=self.role)
+        raise NotImplementedError(f"VecOpInfo.dot_grad not implemented for role {self.role} and GradOpInfo role {grad.role}.")
     
     def dot_vec(self, vec: "VecOpInfo") -> "VecOpInfo":
         """
@@ -93,8 +102,10 @@ class VecOpInfo:
         if self.role == "trial" and vec.role == "test":
             # lhs mass matrix term
             # If self is trial and vec is test, we return a VecOpInfo with shape (m, n)
-            result_data = np.einsum("km,kn->nm", self.data, vec.data, optimize=True)
-            return result_data
+            return np.einsum("km,kn->mn", vec.data , self.data, optimize=True)
+        elif self.role == "test" and vec.role == "trial":
+            return np.einsum("km,kn->mn", self.data, vec.data, optimize=True)
+        
         if vec.role == "function":
             # If vec is a function, we return a VecOpInfo with shape (m, n)
             result_data = np.einsum("km,kn->nm", self.data, vec.data, optimize=True)
@@ -159,6 +170,7 @@ class GradOpInfo:
     """Container for gradient of basis functions ∇φ. Shape: (k, n, d)."""
     data: np.ndarray  # (num_components, n_loc_dofs, spatial_dim)
     role: str = "none"
+    coeffs: np.ndarray = field(default=None)
 
     def inner(self, other: "GradOpInfo") -> np.ndarray:
         """Computes inner(∇u, ∇v) = ∫(∇u)T(∇v), returning an (n, n) matrix."""
@@ -192,23 +204,53 @@ class GradOpInfo:
 
     def dot_vec(self, vec: np.ndarray) -> VecOpInfo:
         """
-        Computes the dot product with a constant vector over the SPATIAL dimension.
+        Computes the dot product with a constant vector or VecOpInfo over the SPATIAL dimension.
         This operation reduces the dimension and returns a VecOpInfo object.
         dot(∇v, c) -> ∇v ⋅ c
         """
         
         if isinstance(vec, (VecOpInfo)): # this part is until trial grad(u) dot u_k  ((∇u) · u_k)
-            role = self.role
-            if vec.role == "trial":
-                role = vec.role
-            if vec.data.shape[0] != self.data.shape[-1]:
-                raise ValueError(f"Cannot dot GradOpInfo {self.shape} with VecOpInfo of shape {vec.data.shape}.")
-            result_data = np.einsum("ijk,kl->ij", self.data, vec.data, optimize=True)
-            return VecOpInfo(result_data, role=role)
+            # role = self.role
+            # if vec.role == "trial":
+            #     role = vec.role
+            # if vec.data.shape[0] != self.data.shape[-1]:
+            #     raise ValueError(f"Cannot dot GradOpInfo {self.shape} with VecOpInfo of shape {vec.data.shape}.")
+            # result_data = np.einsum("ijk,kl->ij", self.data, vec.data, optimize=True)
+            # return VecOpInfo(result_data, role=role)
+            if self.role == "function" and vec.role == "trial": # introducing a new branch
+                # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u
+                # (k, d)   =  Σ_i  u_{k,i}  ∂_d φ_i   – true ∇u_k at this quad-point
+                grad_val = np.einsum("kn,knd->kd", self.coeffs, self.data, optimize=True)
+
+                # (k, n)   =  Σ_d  (∇u_k)_d  φ_{u,d,n}     – (∇u_k)·δu  for every trial dof n
+                # data = grad_val @ vec.data                  # BLAS-2, same as einsum("kd,dn->kn")
+                data = grad_val @ vec.data
+                
+                return VecOpInfo(data, role=vec.role)
+            
+            if self.role == "trial" and vec.role == "function": # introducing a new branch
+                # Case:  Grad(Trial) · Vec(Function)      (∇u_trial) · u_k
+                u_val = np.sum(vec.data, axis=1)          # (k,d) ∫ u_k dx ) 
+                data = np.einsum("kld,d->kl", self.data, u_val, optimize=True)
+                return VecOpInfo(data, role=self.role)
+            if self.role == "function" and vec.role == "function":
+                # Case:  Grad(Function) · Vec(Function)      (∇u_k) · u_k
+                # (1)  value of ∇u_k at this quad-point
+                grad_val = np.sum(self.data, axis=1)
+                u_val = np.sum(vec.data, axis=1)
+                w_val = np.einsum("kd,d->k", grad_val, u_val, optimize=True)
+                # broadcast over *one* basis index so shape matches (k, n_test)
+                # (use the same 'n' as the test function will have a moment later)
+                n_loc = self.data.shape[1]
+                data  = np.tile(w_val[:, None], (1, n_loc))  # (k, n_loc)
+
+                return VecOpInfo(data, role="function")
+            
         
         if isinstance(vec, np.ndarray) and vec.ndim == 1: # dot product with a constant vector
             result_data = np.einsum("knd,d->kn", self.data, vec, optimize=True)
-        return VecOpInfo(result_data, role=self.role)
+            return VecOpInfo(result_data, role=self.role)
+        raise NotImplementedError(f"dot_vec of GradOpInfo not implemented for role {self.role}, GradOpInfo  and type {type(vec)} with role: {vec.role}.")
 
     # ========================================================================
     # Dunder methods for SCALING Operations

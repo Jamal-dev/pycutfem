@@ -144,6 +144,16 @@ class Function(Expression):
         for gdof, val in zip(global_dofs, vals):
             if gdof in self._g2l:
                 self._values[self._g2l[gdof]] = val
+    
+    def padded_values(self, global_dofs: np.ndarray) -> np.ndarray:
+        """Component-only, zero-padded to element size."""
+        if self._parent_vector is None:
+            return self.get_nodal_values(global_dofs)          # stand-alone scalar
+        # component view into VectorFunction
+        parent_vals = self._parent_vector.get_nodal_values(global_dofs)
+        fld_dofs = set(self._dof_handler.get_field_slice(self.field_name))
+        mask = np.isin(global_dofs, list(fld_dofs))
+        return parent_vals * mask
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name='{self.name}', field='{self.field_name}')"

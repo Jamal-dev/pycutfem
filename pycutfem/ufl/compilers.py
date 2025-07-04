@@ -15,6 +15,7 @@ import scipy.sparse as sp
 from typing import Dict, List, Any, Tuple, Iterable, Mapping, Union
 import logging
 from dataclasses import dataclass
+import math
 
 # -------------------------------------------------------------------------
 #  Project imports – only the really needed bits
@@ -93,7 +94,8 @@ class FormCompiler:
             VectorTestFunction: self._visit_VectorTestFunction,
             VectorTrialFunction: self._visit_VectorTrialFunction, 
             Function: self._visit_Function,
-            VectorFunction: self._visit_VectorFunction, Grad: self._visit_Grad,
+            VectorFunction: self._visit_VectorFunction, 
+            Grad: self._visit_Grad,
             DivOperation: self._visit_DivOperation, Sum: self._visit_Sum,
             Sub: self._visit_Sub, Prod: self._visit_Prod, Dot: self._visit_Dot,
             Inner: self._visit_Inner, Pos: self._visit_Pos, Neg: self._visit_Neg,
@@ -186,8 +188,11 @@ class FormCompiler:
     def _visit_VectorFunction(self, n: VectorFunction):
         """VectorFunction → VecOpInfo(k, n_loc) where n_loc = 22 for Q2–Q2–Q1."""
         logger.debug(f"Visiting VectorFunction: {n.field_names}")
-        u_loc = n.get_nodal_values(self._local_dofs())      # (22,) padded
-        data = [u_loc * self._b(fld) for fld in n.field_names]
+        data = []
+        for i, fld in enumerate(n.field_names):
+            coeffs = n.components[i].padded_values(self._local_dofs())
+            b      = self._b(fld)                     # basis (n_loc,)
+            data.append(coeffs * b)                   # ← component-clean
         return VecOpInfo(np.stack(data), role="function")
 
     # --- Unknowns (represented by basis functions) ---
@@ -232,17 +237,33 @@ class FormCompiler:
             fields = [op.field_name]
 
         k_blocks = []
-        for fld in fields:
+        coeffs_list = []
+        for i,fld in enumerate(fields):
+            
             g = self._g(fld)                                    # (22,2)
 
             if role == "function":                              # data → scale rows
-                coeffs = op.get_nodal_values(self._local_dofs()) # (22,)
-                g = coeffs[:, None] * g                         # (22,2)
+                # coeffs = op.get_nodal_values(self._local_dofs()) # (22,)
+                if hasattr(op, "components"):
+                    # VectorFunction case: each component has its own values
+                    coeffs = op.components[i].padded_values(self._local_dofs()) 
+                    # print(f"field {i}: coeffs({coeffs.shape}) : , {coeffs}")
+                else:
+                    # Function case: single component
+                    coeffs = op.padded_values(self._local_dofs()) # (22,)
+                # g = coeffs[:, None] * g                         # (22,2)
+                coeffs_list.append(coeffs)  # Store coeffs for later use
+                # print(f"field {i}: g({g.shape}) : , {g}")
 
             # For test/trial the raw g is already correct
             k_blocks.append(g)
 
-        return GradOpInfo(np.stack(k_blocks), role=role)
+        if role == "function":
+            # Pass the un-scaled gradients and the coefficients separately
+            return GradOpInfo(np.stack(k_blocks), role=role, coeffs=np.stack(coeffs_list))
+        else:
+            # Trial/Test functions have no coeffs, this is unchanged
+            return GradOpInfo(np.stack(k_blocks), role=role)
 
     def _visit_DivOperation(self, n: DivOperation):
         grad_op = self._visit(Grad(n.operand))           # (k, n_loc, d)
@@ -435,6 +456,13 @@ class FormCompiler:
                 # return np.dot(b_data.T, a_data)  # tiral . test
                 return a.dot_vec(b)  # trial . test
         
+        # ------------------------------------------------------------------
+        # Case:  VectorFunction · Grad(⋅)      u_k · ∇w_test
+        # ------------------------------------------------------------------
+        if isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo) \
+        and a.role == "function" and b.role == "test":
+
+            return a.dot_grad(b)  # u_k · ∇w
         
         # ------------------------------------------------------------------
         # case grad(u_trial) . u_k
@@ -442,31 +470,17 @@ class FormCompiler:
             and (b.role == "function" )) and a.role == "trial" 
             ):
 
-            # velocity value at this quadrature point
-            # u_val = np.sum(b.data, axis=1)                 # (d,)
+            return a.dot_vec(b)  # ∇u_trial · u_k
+        # ------------------------------------------------------------------
+        # case u_trial . grad(u_k)
+        if isinstance(b, GradOpInfo) and ((isinstance(a, VecOpInfo) \
+            and (a.role == "trial" )) and b.role == "function"
+            ):
 
-            # works for k = 1 (scalar) and k = 2 (vector) alike
-            # data  = np.einsum("knd,d->kn", a.data, u_val, optimize=True)
-
-            # return VecOpInfo(data, role=a.role)
-            return a.dot_vec(b)  # grad(u) . u_k
+            return a.dot_grad(b)  # u_trial · ∇u_k
         
-        # ------------------------------------------------------------------
-        # Case:  VectorFunction · Grad(⋅)      u_k · ∇w_test
-        # ------------------------------------------------------------------
-        if isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo) \
-        and a.role == "function" and b.role == "test":
-
-            # 1. velocity value at the current quadrature point
-            # u_val = np.sum(a.data, axis=1)                  # (d,)  —   u_d(ξ)
-
-            # # 2. dot with each gradient row   w_{k,n} = Σ_d u_d ∂_d φ_{k,n}
-            # #    Works for both scalar (k = 1) and vector (k = 2) targets.
-            # data  = np.einsum("d,knd->kn", u_val, b.data, optimize=True)
-
-            # 3. The role is inherited from the Grad operand (trial / test / function)
-            # return VecOpInfo(data, role=b.role)
-            return a.dot_grad(b)  # u_k · ∇w
+ 
+        
         
         # ------------------------------------------------------------------
         # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u
@@ -474,14 +488,7 @@ class FormCompiler:
         if isinstance(a, GradOpInfo) and a.role == "function" \
         and isinstance(b, VecOpInfo)  and b.role == "trial":
 
-            # (1)  value of ∇u_k at this quad-point
-            # grad_val = np.sum(a.data, axis=1)          # (k,d)
-
-            # # (2)  w_i,n = Σ_d (∇u_k)_i,d  *  φ_{u,d,n}
-            # data = np.einsum("kd,kn->kn", grad_val, b.data, optimize=True)
-
-            # return VecOpInfo(data, role="trial")
-            return a.dot_func(b)
+            return a.dot_vec(b)  # ∇u_k · u_trial
         
         # ------------------------------------------------------------------
         # Case:  Vec(Function) · Grad(Trial)      u_k · ∇u_trial
@@ -490,36 +497,15 @@ class FormCompiler:
         and isinstance(b, GradOpInfo) and b.role == "trial":
 
             return a.dot_grad(b)  # u_k · ∇u_trial
-            # # print(f"problem " * 4)
-            # # return a.dot_grad(b)  # u_k · ∇u
-            # # trying new things here
-            # fun_vals = np.sum(a.data, axis=1) 
-            # fun_vals_x = sum(a.data[0,:])
-            # fun_vals_y = sum(a.data[1,:])
-            # # print(f"func_vals_x: {fun_vals_x}, sum(fun_vals_x): {np.sum(fun_vals_x)}") 
-            # # print(f"func_vals_y: {fun_vals_y}, sum(fun_vals_y): {np.sum(fun_vals_y)}")
-            # if b.data.shape[0] == 2: # vector gradient
-            #     a11 = b.data[0,:,0] # ∂_x u_trial_1
-            #     a12 = b.data[0,:,1] # ∂_y u_trial_1
-            #     a21 = b.data[1,:,0] # ∂_x u_trial_2
-            #     a22 = b.data[1,:,1] # ∂_y u_trial_2
-            #     c11 =  fun_vals_x * a11 +  fun_vals_y * a21 # ∂_x u_trial
-            #     c12 =  fun_vals_x * a12 +  fun_vals_y * a22 #
-            #     # print(f"shapes = c11.shape:{c11.shape}, c12.shape:{c12.shape}, {fun_vals_x.shape}, fun_vals_y.shape:{fun_vals_y.shape}, a11.shape:{a11.shape}, a12.shape:{a12.shape}, a21.shape:{a21.shape}, a22.shape:{a22.shape}")
-            #     c = np.stack([c11, c12], axis=0) # (2, n_loc)
-            # else: # scalar gradient
-            #     a1 = b.data[0,:,0] # ∂_x u_trial
-            #     a2 = b.data[0,:,1] # ∂_y u_trial
-            #     c1 = fun_vals_x *  a1 + fun_vals_y *  a2 # ∂_x u_trial
-            #     c = np.stack([c1], axis=0)
-            # # data = np.einsum("km,imk->im", a.data, b.data, optimize=True)
-            # return VecOpInfo(c, role="trial")  # u_k · ∇u_trial
+            
         
         # Both are numerical vectors (RHS)
         if isinstance(a, np.ndarray) and isinstance(b, np.ndarray): return np.dot(a,b)
 
         raise TypeError(f"Unsupported dot product '{n.a} . {n.b}'")
 
+    
+    # ================ VISITORS: INNER PRODUCTS =========================
     def _visit_Inner(self, n: Inner):
         a = self._visit(n.a)
         b = self._visit(n.b)
@@ -533,7 +519,12 @@ class FormCompiler:
             if isinstance(a, GradOpInfo) and isinstance(b, GradOpInfo):
                 # Function · Test  ............................................
                 if a.role == "function" and b.role == "test":
+                    # print(f"mei hu na" * 6)
+                    # print(f"a.data before summition: {a.data}")
+
                     grad_val = np.sum(a.data, axis=1)            # (k,d)  ∇u_k(x_q)
+                    # print(f"grad_val: {grad_val}")
+                    # print(f"b.data: {b.data}")
                     return np.einsum("kd,knd->n", grad_val, b.data, optimize=True)
 
                 # Test · Function  (rare but symmetrical) .............
@@ -614,6 +605,7 @@ class FormCompiler:
     def _apply_bcs(self, K, F, bcs):
         # This method remains unchanged from your provided file
         if not bcs: return
+        print(f"hellloww " * 89)
         data = self.dh.get_dirichlet_data(bcs)
         if not data: return
         rows = np.fromiter(data.keys(), dtype=int)
@@ -658,6 +650,7 @@ class FormCompiler:
                 for f in fields:
                     val = self.me.basis(f, xi, eta)
                     g_ref = self.me.grad_basis(f, xi, eta)
+                    # print(f"field: {f}, gref.shape: {g_ref.shape}, JiT.shape: {JiT.shape}")
                     self._basis_cache[f] = {"val": val, "grad": g_ref @ JiT}
                 
                 self.ctx["eid"] = eid
