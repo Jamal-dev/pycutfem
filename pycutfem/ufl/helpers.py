@@ -49,13 +49,7 @@ class VecOpInfo:
         if self.data.shape[0] != grad.data.shape[-1]:
             raise ValueError(f"VecOpInfo {self.shape} and GradOpInfo {grad.shape} must have the same number of components.")
         
-        # result_data = np.einsum("kl,ijk->ij", self.data, grad.data, optimize=True)
-        # role = self.role
-        # if grad.role == "trial":
-        #     role = grad.role
-        # if role == "none" or None and grad.role == 'function':
-        #     role = grad.role
-        # return VecOpInfo(result_data, role=role)
+        # Case 1: Function · Grad(Trial) or Trial · Grad(Function)
         # 1. value of each velocity component at the current Q-point
         if self.role == "function" and grad.role == "trial":
             # Case:  Function · Grad(Trial)      u_k · ∇u_trial
@@ -64,10 +58,10 @@ class VecOpInfo:
             # (2)  w_i,n = Σ_d u_d ∂_d φ_{k,n}
             data = np.einsum("d,kld->kl", u_val, grad.data, optimize=True)
             return VecOpInfo(data, role=grad.role)
-        if self.role == "trial" and grad.role == "function":
+        elif self.role == "trial" and grad.role == "function":
             # Case:  Trial · Grad(Function)      u_trial · ∇u_k
             # (1)  value of u_trial at this quad-point
-            grad_val = np.einsum("knd,kn->kd", grad.data, grad.coeffs, optimize=True)
+            grad_val = np.einsum("knd,kn->kd", grad.data, grad.coeffs, optimize=True) # (k, d)  —   ∇u_k(ξ) (2,2)
             # (2)  w_i,n = Σ_d ∂_d φ_{k,n} u_d
             data = np.einsum("dl,kd->kl", self.data, grad_val, optimize=True)
             return VecOpInfo(data, role=self.role)
@@ -84,21 +78,12 @@ class VecOpInfo:
         if vec.shape[0] != self.data.shape[0]:
             raise ValueError(f"Input vector of shape {vec.shape} cannot be dotted with VecOpInfo of shape {self.data.shape}.")
         
+        # case 1 function dot test
         if vec.role == "test" and self.role == "function": # rhs time derivative term
-            # print("VecOpInfo.dot_vec: rhs time derivative term")
-            # result_data = np.einsum("km,kn->n", self.data, vec.data, optimize=True) #rhs time derivative term
-            # return result_data  # Return as a 1D array if vec is a test function
-            
-            # self.data contains [u_loc*basis_x, u_loc*basis_y, ...].
-            # First, correctly evaluate the scalar value of each component of the function 'self'
-            # at the current quadrature point by summing over the basis functions.
             func_values_at_qp = np.sum(self.data, axis=1)  # Shape (k,)
-
-            # Now, multiply these scalar component values by the corresponding test basis vectors
-            # and sum the results: value_x*v_x + value_y*v_y + ...
-            # The einsum "k,kn->n" performs this operation correctly.
             return np.einsum("k,kn->n", func_values_at_qp, vec.data, optimize=True)
             
+        # case 2 trial dot test and test dot trial
         if self.role == "trial" and vec.role == "test":
             # lhs mass matrix term
             # If self is trial and vec is test, we return a VecOpInfo with shape (m, n)
@@ -106,14 +91,22 @@ class VecOpInfo:
         elif self.role == "test" and vec.role == "trial":
             return np.einsum("km,kn->mn", self.data, vec.data, optimize=True)
         
-        if vec.role == "function":
-            # If vec is a function, we return a VecOpInfo with shape (m, n)
-            result_data = np.einsum("km,kn->nm", self.data, vec.data, optimize=True)
-        role = self.role
-        if vec.role == "trial":
-            role = vec.role
-        # adding a new axis to maintain VecOpInfo structure
-        return VecOpInfo(result_data, role=role)
+        # case 3 trial and function
+        if self.role == "trial" and vec.role == "function":
+            u_values = np.sum(vec.data, axis=1)  # Shape (k,)
+            data = np.einsum("kn,k->n", self.data, u_values, optimize=True)
+            return VecOpInfo(data, role=self.role)
+        elif self.role == "function" and vec.role == "trial":
+            # If self is function and vec is trial, we return a VecOpInfo with shape (m, n)
+            u_values = np.sum(self.data, axis=1)
+            data = np.einsum("k,kn->n", u_values, vec.data, optimize=True)
+            return VecOpInfo(data, role=vec.role)
+        # case 4 function and function
+        if self.role == "function" and vec.role == "function":
+            u_values = np.sum(self.data, axis=1)  # Shape (k,)
+            v_values = np.sum(vec.data, axis=1)  # Shape (k,)
+            return np.dot(u_values, v_values)  # scalar result for rhs
+        raise NotImplementedError(f"VecOpInfo.dot_vec not implemented for roles {self.role} and {vec.role}.")
     # ========================================================================
     # Shape, len, and ndim methods
     @property
@@ -220,12 +213,8 @@ class GradOpInfo:
                 grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
                 u_val = np.sum(vec.data, axis=1)
                 w_val = np.einsum("kd,d->k", grad_val, u_val, optimize=True)
-                # broadcast over *one* basis index so shape matches (k, n_test)
-                # (use the same 'n' as the test function will have a moment later)
-                n_loc = self.data.shape[1]
-                data  = np.tile(w_val[:, None], (1, n_loc))  # (k, n_loc)
+                return w_val # rhs, so return a 1D array
 
-                return VecOpInfo(data, role="function")
             
         
         if isinstance(vec, np.ndarray) and vec.ndim == 1: # dot product with a constant vector

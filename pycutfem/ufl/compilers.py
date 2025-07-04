@@ -272,7 +272,7 @@ class FormCompiler:
         if grad_op.role == "function":
             # scaled the gradient
             grad_val = np.einsum("knd,kn->kd", grad_op.data, grad_op.coeffs, optimize=True) # (k,d) (2,2)
-            div_vec = np.sum([grad_val[i, :] for i in range(grad_val.shape[0])], axis=0)  # sum over k
+            div_vec = np.sum([grad_val[i, i] for i in range(grad_val.shape[0])], axis=0)  # sum over k
         else:
             # ∇·v  =  Σ_i ∂v_i/∂x_i   → length n_loc (22) vector
             div_vec = np.sum([grad_op.data[i, :, i]          # pick diagonal components
@@ -603,7 +603,6 @@ class FormCompiler:
     def _apply_bcs(self, K, F, bcs):
         # This method remains unchanged from your provided file
         if not bcs: return
-        print(f"hellloww " * 89)
         data = self.dh.get_dirichlet_data(bcs)
         if not data: return
         rows = np.fromiter(data.keys(), dtype=int)
