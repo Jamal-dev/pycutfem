@@ -269,10 +269,15 @@ class FormCompiler:
         grad_op = self._visit(Grad(n.operand))           # (k, n_loc, d)
         logger.debug(f"Visiting DivOperation for operand of type {type(n.operand)}, grad_op shape: {grad_op.data.shape}")
 
-        # ∇·v  =  Σ_i ∂v_i/∂x_i   → length n_loc (22) vector
-        div_vec = np.sum([grad_op.data[i, :, i]          # pick diagonal components
-                        for i in range(grad_op.data.shape[0])],
-                        axis=0)
+        if grad_op.role == "function":
+            # scaled the gradient
+            grad_val = np.einsum("knd,kn->kd", grad_op.data, grad_op.coeffs, optimize=True) # (k,d) (2,2)
+            div_vec = np.sum([grad_val[i, :] for i in range(grad_val.shape[0])], axis=0)  # sum over k
+        else:
+            # ∇·v  =  Σ_i ∂v_i/∂x_i   → length n_loc (22) vector
+            div_vec = np.sum([grad_op.data[i, :, i]          # pick diagonal components
+                            for i in range(grad_op.data.shape[0])],
+                            axis=0)
 
         # Decide which side of the bilinear form this lives on
         op = n.operand
@@ -380,11 +385,10 @@ class FormCompiler:
             # Case 1: Function · Test  (VecOpInfo, VecOpInfo)
             if  isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
                 if a.role == "function" and b.role == "test":
-                    # f_k,n · v_k,n  →  Σ_k f_k,n v_k,n   (length-n vector for RHS)
-                    # return np.einsum("km,kn->n", a.data, b.data, optimize=True)
+
                     return a.dot_vec(b)  # function . test
                 if b.role == "function" and a.role == "test":
-                    # return np.einsum("km,kn->n", b.data, a.data, optimize=True)
+                    
                     return b.dot_vec(a)  # test . function
 
 
@@ -394,15 +398,9 @@ class FormCompiler:
             # Case 2: Function · Function  (GradOpInfo, VecOpInfo)
             if  isinstance(a, GradOpInfo) and isinstance(b, VecOpInfo) \
             and a.role == b.role == "function":
-                # u_val   = np.sum(b.data, axis=1)                # (d,)
-                # data_fk = np.einsum("knd,d->kn", a.data, u_val) # keep basis-index n
-                # return VecOpInfo(data_fk, role="function")
                 return a.dot_vec(b)  # grad(u_k) . u_k
             if  isinstance(b, GradOpInfo) and isinstance(a, VecOpInfo) \
             and b.role == a.role == "function":
-                # u_val   = np.sum(a.data, axis=1)                # (d,)
-                # data_fk = np.einsum("knd,d->kn", b.data, u_val) # keep basis-index n
-                # return VecOpInfo(data_fk, role="function")
                 return b.dot_vec(a)
             
             
@@ -522,14 +520,14 @@ class FormCompiler:
                     # print(f"mei hu na" * 6)
                     # print(f"a.data before summition: {a.data}")
 
-                    grad_val = np.sum(a.data, axis=1)            # (k,d)  ∇u_k(x_q)
+                    grad_val = np.einsum("knd,kn->kd", a.data, a.coeffs, optimize=True)
                     # print(f"grad_val: {grad_val}")
                     # print(f"b.data: {b.data}")
                     return np.einsum("kd,knd->n", grad_val, b.data, optimize=True)
 
                 # Test · Function  (rare but symmetrical) .............
                 if b.role == "function" and a.role == "test":
-                    grad_val = np.sum(b.data, axis=1)            # (k,d)
+                    grad_val = np.einsum("knd,kn->kd", b.data, b.coeffs, optimize=True)
                     return np.einsum("kd,knd->n", grad_val, a.data, optimize=True)
 
         # Both are Info objects of the same kind -> matrix assembly
