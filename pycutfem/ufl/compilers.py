@@ -33,13 +33,15 @@ from pycutfem.ufl.expressions import (
     Function,    VectorFunction,
     Grad, DivOperation, Inner, Dot,
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
-    ElementWiseConstant
+    ElementWiseConstant, Derivative
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
-from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo
+from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices
+from pycutfem.fem.transform import map_deriv
 from pycutfem.ufl.analytic import Analytic
+from pycutfem.utils.domain_manager import get_domain_bitset
 
 logger = logging.getLogger(__name__)
 _INTERFACE_TOL = 1.0e-12 # New
@@ -104,6 +106,7 @@ class FormCompiler:
             FacetNormal: self._visit_FacetNormal,
             ElementWiseConstant: self._visit_EWC,
             Jump: self._visit_Jump,
+            Derivative        : self._visit_Derivative
         }
 
     # ============================ PUBLIC API ===============================
@@ -123,10 +126,108 @@ class FormCompiler:
         return K.tocsr(), F
 
     # ===================== VISITORS: LEAF NODES =======================
-    def _b(self, fld): return self._basis_cache[fld]["val"]  # (n_loc,)
-    def _g(self, fld): return self._basis_cache[fld]["grad"] # (n_loc, d)
-    def _local_dofs(self): return self.dh.get_elemental_dofs(self.ctx["eid"])
+    def _b(self, fld): 
+        # ➊ standard volume/interface path
+        if fld in self._basis_cache:
+            return self._basis_cache[fld]["val"]
 
+        # ➋ ghost-edge fallback: pull from the side-aware cache
+        bv = self.ctx.get("basis_values")
+        if bv is not None:
+            side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
+            if fld in bv[side] and (0, 0) in bv[side][fld]:
+                return bv[side][fld][(0, 0)]
+        raise KeyError(f"Basis for field '{fld}' not found.")
+    def _g(self, fld):
+        if fld in self._basis_cache:
+            return self._basis_cache[fld]["grad"]
+
+        bv = self.ctx.get("basis_values")
+        if bv is not None:
+            side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
+            gx = bv[side][fld].get((1, 0))
+            gy = bv[side][fld].get((0, 1))
+            if gx is not None and gy is not None:
+                return np.stack([gx, gy], axis=1)
+        raise KeyError(f"Gradient for field '{fld}' not found.")
+    def _lookup_basis(self, field: str, alpha: tuple[int, int]) -> np.ndarray:
+        """
+        Return the trace of ∂^{alpha}φ_i (i = 1..n_loc) at the current
+        quadrature point.
+
+        * If we are on a ghost edge   →  use the side–aware cache.
+        * Otherwise (volume / interior face) fall back to the element cache
+        exposed via _b / _g.
+        """
+        # ---- ghost-edge path ------------------------------------------
+        if "basis_values" in self.ctx:
+            side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
+            return self.ctx["basis_values"][side][field][alpha]
+
+        # ---- standard element path ------------------------------------
+        if alpha == (0, 0):
+            return self._b(field)                                             # (n_loc,)
+        if alpha == (1, 0):
+            return self._g(field)[:, 0]                                       # (n_loc,)
+        if alpha == (0, 1):
+            return self._g(field)[:, 1]                                       # (n_loc,)
+
+        # Higher derivatives outside ghost-edge assembly are not (yet) required
+        raise KeyError(f"Basis for derivative {alpha} of field '{field}' not found.")
+    def _local_dofs(self): 
+        if 'eid' in self.ctx:           # matrix/vector path
+            return self.dh.get_elemental_dofs(self.ctx["eid"])
+        return self.ctx['global_dofs']   # functional path
+
+    def _visit_Derivative(self, op: Derivative):
+        # --------------------------------------------------------------
+        # 1) Operand is a Jump  →  Jump of derivatives
+        # --------------------------------------------------------------
+        if isinstance(op.f, Jump):
+            # Build two new Derivative nodes with the same multi-index
+            dpos = Derivative(op.f.u_pos, *op.order)
+            dneg = Derivative(op.f.u_neg, *op.order)
+
+            phi_old = self.ctx.get('phi_val', 0.0)
+            eid_old = self.ctx.get('eid')
+
+            # + side
+            self.ctx['phi_val'] = 1.0
+            if 'pos_eid' in self.ctx:
+                self.ctx['eid'] = self.ctx['pos_eid']
+            v_pos = self._visit(dpos)
+
+            # – side
+            self.ctx['phi_val'] = -1.0
+            if 'neg_eid' in self.ctx:
+                self.ctx['eid'] = self.ctx['neg_eid']
+            v_neg = self._visit(dneg)
+
+            # restore
+            self.ctx['phi_val'] = phi_old
+            if eid_old is None:
+                self.ctx.pop('eid', None)
+            else:
+                self.ctx['eid'] = eid_old
+
+            return v_pos - v_neg
+
+        # --------------------------------------------------------------
+        # 2) Operand is *not* a Jump (previous logic, unchanged)
+        # --------------------------------------------------------------
+        fld, alpha = op.f.field_name, op.order
+        row = self._lookup_basis(fld, alpha)[np.newaxis, :]      # (1,n)
+
+        if op.f.is_function:
+            coeffs = op.f.get_nodal_values(self._local_dofs())[np.newaxis, :]
+            data, role = coeffs * row, "function"
+        elif op.f.is_trial:
+            data, role = row, "trial"
+        else:
+            data, role = row, "test"
+
+        return VecOpInfo(data, role=role)
+   
     # --- Knowns (evaluated to numerical values) ---
     def _visit_Constant(self, n: Constant):
         if n.dim ==0:
@@ -147,68 +248,102 @@ class FormCompiler:
         return n.value_on_element(eid)
     
     
-    def _visit_Pos(self, n: Pos): # New
-        """Evaluates operand only if on the positive side of an interface.""" # New
+    def _visit_Pos(self, n: Pos): 
+        """Evaluates operand only if on the positive side of an interface.""" 
         # The '+' side is where phi >= 0 (a closed set)
-        if 'phi_val' in self.ctx and self.ctx['phi_val'] < -_INTERFACE_TOL: # New
+        if 'phi_val' in self.ctx and self.ctx['phi_val'] < -_INTERFACE_TOL: 
             # We are on the strictly negative side, so return zero.
-            op_val = self._visit(n.operand) # New
-            return op_val * 0.0 # Scales scalars, arrays, and Info objects to zero # New
-        return self._visit(n.operand) # New
+            op_val = self._visit(n.operand) 
+            return op_val * 0.0 # Scales scalars, arrays, and Info objects to zero 
+        return self._visit(n.operand) 
 
-    def _visit_Neg(self, n: Neg): # New
-        """Evaluates operand only if on the negative side of an interface.""" # New
+    def _visit_Neg(self, n: Neg): 
+        """Evaluates operand only if on the negative side of an interface.""" 
         # The '-' side is where phi < 0 (an open set)
-        if 'phi_val' in self.ctx and self.ctx['phi_val'] >= _INTERFACE_TOL: # New
+        if 'phi_val' in self.ctx and self.ctx['phi_val'] >= _INTERFACE_TOL: 
              # We are on the positive or zero side, so return zero.
-            op_val = self._visit(n.operand) # New
-            return op_val * 0.0 # New
-        return self._visit(n.operand) # New
+            op_val = self._visit(n.operand) 
+            return op_val * 0.0 
+        return self._visit(n.operand) 
 
-    def _visit_Jump(self, n: Jump): # New
-        """Robustly evaluates jump(u) = u(+) - u(-) across an interface.""" # New
-        phi_orig = self.ctx.get('phi_val') # New
+    def _visit_Jump(self, n: Jump): 
+        """Robustly evaluates jump(u) = u(+) - u(-) across an interface.""" 
+        phi_orig = self.ctx.get('phi_val') 
+        eid_orig  = self.ctx.get('eid')
         # --- Evaluate positive side trace u(+) ---
-        self.ctx['phi_val'] = 1.0 # Force context to be on the '+' side # New
-        u_pos = self._visit(n.u_pos) # This will call _visit_Pos # New
+        self.ctx['eid']     = self.ctx.get('pos_eid')
+        self.ctx['phi_val'] = 1.0 # Force context to be on the '+' side 
+        u_pos = self._visit(n.u_pos) # This will call _visit_Pos 
         # --- Evaluate negative side trace u(-) ---
-        self.ctx['phi_val'] = -1.0 # Force context to be on the '-' side # New
-        u_neg = self._visit(n.u_neg) # This will call _visit_Neg # New
+        self.ctx['eid']     = self.ctx.get('neg_eid')
+        self.ctx['phi_val'] = -1.0 # Force context to be on the '-' side 
+        u_neg = self._visit(n.u_neg) # This will call _visit_Neg 
         # --- Restore context and return difference ---
-        self.ctx['phi_val'] = phi_orig # New
-        return u_pos - u_neg # New
+        self.ctx['phi_val'] = phi_orig 
+        if eid_orig is not None:
+            self.ctx['eid'] = eid_orig
+        else:
+            self.ctx.pop('eid', None)
+        return u_pos - u_neg 
 ###########################################################################################3
 ########### --- Functions and VectorFunctions (evaluated to numerical values) ---
     def _visit_Function(self, n: Function):
         logger.debug(f"Visiting Function: {n.field_name}")
-        u_loc = n.get_nodal_values(self._local_dofs())      # (22,) padded
-        data = [u_loc * self._b(n.field_name)]                 # one block
+        u_loc = n.get_nodal_values(self._local_dofs())      # element-local coeffs
+        phi   = self._b(n.field_name)                       # trace on current side
+
+        # ghost-edge: enlarge coeff vector to |global_dofs|
+        if phi.shape[0] != u_loc.shape[0] and "global_dofs" in self.ctx:
+            padded = np.zeros_like(phi)
+            side   = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
+            amap   = self.ctx["pos_map"] if side == '+' else self.ctx["neg_map"]
+            padded[amap] = u_loc
+            u_loc = padded
+
+        data = [u_loc * phi]
         return VecOpInfo(np.stack(data), role="function")
 
     def _visit_VectorFunction(self, n: VectorFunction):
-        """VectorFunction → VecOpInfo(k, n_loc) where n_loc = 22 for Q2–Q2–Q1."""
+        """
+        Return VecOpInfo(k, n_loc) with k = len(field_names).
+        Handles both volume and ghost-edge assembly: coefficients are padded
+        exactly as in _visit_Function when we are on a ghost edge.
+        """
         logger.debug(f"Visiting VectorFunction: {n.field_names}")
         data = []
+        local_dofs = self._local_dofs()                          # element or union
         for i, fld in enumerate(n.field_names):
-            coeffs = n.components[i].padded_values(self._local_dofs())
-            b      = self._b(fld)                     # basis (n_loc,)
-            data.append(coeffs * b)                   # ← component-clean
+            coeffs = n.components[i].get_nodal_values(local_dofs)  # (n_loc,)
+            phi    = self._b(fld)                                   # (n_loc,) – padded on ghost edge
+
+            # --- pad coefficients on ghost edges --------------------
+            if phi.shape[0] != coeffs.shape[0] and 'global_dofs' in self.ctx:
+                padded = np.zeros_like(phi)
+                side   = '+' if self.ctx.get('phi_val', 0.0) >= 0 else '-'
+                amap   = self.ctx['pos_map'] if side == '+' else self.ctx['neg_map']
+                padded[amap] = coeffs
+                coeffs = padded
+
+            data.append(coeffs * phi)                              # component-wise
         return VecOpInfo(np.stack(data), role="function")
+
 
     # --- Unknowns (represented by basis functions) ---
     def _visit_TestFunction(self, n):
         logger.debug(f"Visiting TestFunction: {n.field_name}")
-        return VecOpInfo(np.stack([self._b(n.field_name)]), role="test")
+        row = self._lookup_basis(n.field_name, (0, 0))[np.newaxis, :]
+        return VecOpInfo(row, role="test")
     def _visit_TrialFunction(self, n):
         logger.debug(f"Visiting TrialFunction: {n.field_name}")
-        return VecOpInfo(np.stack([self._b(n.field_name)]), role="trial")
+        row = self._lookup_basis(n.field_name, (0, 0))[np.newaxis, :]
+        return VecOpInfo(row, role="trial")
 
     def _visit_VectorTestFunction(self, n):
         logger.debug(f"Visiting VectorTestFunction: {n.field_names}")
-        return VecOpInfo(np.stack([self._b(f) for f in n.field_names]), role="test")
+        return VecOpInfo(np.stack([self._lookup_basis(f, (0, 0)) for f in n.field_names]), role="test")
     def _visit_VectorTrialFunction(self, n):
         logger.debug(f"Visiting VectorTrialFunction: {n.field_names}")
-        return VecOpInfo(np.stack([self._b(f) for f in n.field_names]), role="trial")
+        return VecOpInfo(np.stack([self._lookup_basis(f, (0, 0)) for f in n.field_names]), role="trial")
     # ================== VISITORS: OPERATORS ========================
     def _visit_Grad(self, n: Grad):
         """Return GradOpInfo with shape (k, n_dofs_local, d)."""
@@ -316,16 +451,20 @@ class FormCompiler:
         b = self._visit(n.b)
         a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo)) else a
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
-        a_vec = np.squeeze(a_data) 
-        b_vec = np.squeeze(b_data)
-        role_a = getattr(a, 'role', None)
-        role_b = getattr(b, 'role', None)
+        # a_vec = np.squeeze(a_data) 
+        # b_vec = np.squeeze(b_data)
+        # role_a = getattr(a, 'role', None)
+        # role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Prod for  ('{n.a!r}' * '{n.b!r}') on {'RHS' if self.ctx['rhs'] else 'LHS'}") #, a.info={getattr(a, 'info', None)}, b.info={getattr(b, 'info', None)}
         # logger.debug(f"  a: {type(a)} (role={role_a}), b: {type(b)} (role={role_b})")
 
         # scalar * scalar multiplication
         if np.isscalar(a) and np.isscalar(b):
             return a * b
+        # RHS: (Function) * (Function)  → scalar
+        if (isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo)
+            and a.role == b.role == "function"):
+            return a * b          # delegates to VecOpInfo.__mul_
         # First, handle context-specific RHS assembly.
         if self.ctx["rhs"]:
             # Case 1: (known Function) * (Test Function) -> results in a vector
@@ -339,6 +478,7 @@ class FormCompiler:
                 if b.data.shape[0] == 1: # Scalar field * test function
                     return np.sum(b.data) * a.data[0]
                 return np.einsum("kn,kn->n", b.data, a.data, optimize=True) # Vector field
+            
 
             # Case 2: (scalar Constant) * (Test Function) -> results in a vector
             # This now takes precedence over the general scalar multiplication.
@@ -359,10 +499,7 @@ class FormCompiler:
         # LHS Matrix Assembly: (Test * Trial)
         if not self.ctx["rhs"]:
             if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
-                if a.role == "test" and b.role in {"trial", "function"}:
-                    return np.einsum("kn,km->nm", a.data, b.data, optimize=True)
-                if b.role == "test" and a.role in {"trial", "function"}:
-                    return np.einsum("kn,km->nm", b.data, a.data, optimize=True)
+                return a * b
         
         raise TypeError(f"Unsupported product 'type(a)={type(a)}, type(b)={type(b)}'{n.a} * {n.b}' for {'RHS' if self.ctx['rhs'] else 'LHS'}")
 
@@ -573,6 +710,10 @@ class FormCompiler:
                 logger.info(f"Assembling volume integral: {integral}")
                 self._assemble_volume(integral, target)
                 continue
+            if integral.measure.domain_type == "ghost_edge":
+                logger.info(f"Assembling ghost edge integral: {integral}")
+                self._assemble_ghost_edge(integral, target)
+                continue
             if integral.measure.domain_type not in ["volume", "interface"]:
                 logger.warning(f"Skipping unsupported integral type: {integral.measure.domain_type}")
                 raise NotImplementedError(f"Unsupported integral type: {integral.measure.domain_type}")
@@ -705,6 +846,7 @@ class FormCompiler:
                 trial, test = _trial_test(intg.integrand) # New
 
                 # --- PATH A: Bilinear Form (e.g., a(u,v), contributes to the matrix) --- # New
+                self.ctx.pop('global_dofs', None)
                 if not rhs and trial and test: # New
                     loc = np.zeros((self.me.n_dofs_local, self.me.n_dofs_local)) # New
                     
@@ -724,6 +866,8 @@ class FormCompiler:
                         self.ctx['normal'] = level_set.gradient(x_phys) # New
                         self.ctx['phi_val'] = level_set(x_phys) # New
                         self.ctx['x_phys'] = x_phys
+                        self.ctx['pos_eid'] = elem.id # New
+                        self.ctx['neg_eid'] = elem.id # New
                         
                         # --- Evaluate the ENTIRE integrand at once --- # New
                         integrand_val = self._visit(intg.integrand) # New
@@ -752,6 +896,8 @@ class FormCompiler:
                         self.ctx['normal'] = level_set.gradient(x_phys) # New
                         self.ctx['phi_val'] = level_set(x_phys) # New
                         self.ctx['x_phys'] = x_phys
+                        self.ctx['pos_eid'] = elem.id
+                        self.ctx['neg_eid'] = elem.id 
                         
                         integrand_val = self._visit(intg.integrand) # New
                         
@@ -768,11 +914,168 @@ class FormCompiler:
                         elif hook: # It's a hooked functional 
                             if isinstance(acc,VecOpInfo): # New
                                 acc = np.sum(acc.data, axis=1)
+                            self.ctx['global_dofs'] = self.dh.get_elemental_dofs(elem.id)
                             self.ctx['scalar_results'][hook['name']] += acc
                             log.debug(f"    Accumulated functional '{hook['name']}' for element {elem.id}") # New
 
         finally: # New
             # --- Final Context Cleanup --- # New
-            for key in ('phi_val', 'normal', 'eid', 'x_phys'): # New
+            for key in ('phi_val', 'normal', 'eid', 'x_phys', 'pos_eid', 'neg_eid', 'global_dofs'): # New
                 self.ctx.pop(key, None) # New
             log.debug("Interface assembly finished. Context cleaned.") # New
+    
+    def _assemble_ghost_edge(self, intg: "Integral", matvec):
+        """
+        Assembles integrals over ghost facets using a side-aware cache.
+
+        This routine correctly computes and caches basis function derivatives from
+        both sides ('+' and '-') of each ghost edge. The UFL visitors for Jump,
+        Avg, etc., are responsible for interpreting this side-aware cache to
+        construct the final integrand, which couples the degrees of freedom
+        from the adjacent elements. It also supports assembler hooks for assembling
+        scalar-valued functionals.
+        """
+
+        rhs = self.ctx.get('rhs', False)
+        mesh = self.me.mesh
+
+        # 1. Determine derivative orders needed.
+        derivs: set | None = intg.measure.metadata.get('derivs')
+        if derivs is None:
+            derivs = required_multi_indices(intg.integrand)
+        if (0, 0) not in derivs:
+            derivs = set(derivs) | {(0, 0)}
+
+        # 2. Get edge set and level set.
+        defined = intg.measure.defined_on
+        if defined is None:                       # ← fallback: all ghost edges
+            edge_ids = get_domain_bitset(mesh, 'edge', 'ghost')
+        else:
+            edge_ids = defined.to_indices()
+        level_set = getattr(intg.measure, 'level_set', None)
+        if level_set is None:
+            raise ValueError("dGhost measure requires a 'level_set' callable.")
+
+        qdeg = self._find_q_order(intg)
+        fields = _all_fields(intg.integrand)
+        
+        # New: Check for assembler hooks to handle scalar functionals.
+        trial, test = _trial_test(intg.integrand) # New
+        hook = self.ctx['hooks'].get(type(intg.integrand)) if intg.integrand else self.ctx['hooks'].get(Function) # New
+        is_functional = (hook is not None and trial is None and test is None) # New
+        if is_functional: # New
+            self.ctx.setdefault('scalar_results', {})[hook['name']] = 0.0 # New
+
+
+        # 3. Main Loop over all candidate edges.
+        for eid_edge in edge_ids:
+            edge = mesh.edge(eid_edge)
+            if edge.right is None:
+                continue
+            
+            # edge_left = mesh.edges_list[edge.left]
+            # edge_left_nodes = edge_left.nodes
+
+            # edge_right = mesh.edges_list[edge.right]
+            # edge_right_nodes = edge_right.nodes
+            # pL00,pL01,pL10,pL11 = mesh.nodes_x_y_pos[list(edge_left_nodes)]
+            # pR00,pR01,pR10,pR11 = mesh.nodes_x_y_pos[list(edge_right_nodes)]
+
+            phi_left  = level_set(np.asarray(mesh.elements_list[edge.left].centroid()))
+            phi_right = level_set(np.asarray(mesh.elements_list[edge.right].centroid()))
+           
+            if (phi_left < 0) == (phi_right < 0):
+                continue
+
+     
+            pos_eid, neg_eid = (edge.left, edge.right) if phi_left >= 0 else (edge.right, edge.left)
+
+            # 4. Setup for Quadrature and Local Assembly
+            p0, p1 = mesh.nodes_x_y_pos[list(edge.nodes)]
+            qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
+            normal_vec = edge.normal
+            if np.dot(normal_vec, mesh.elements_list[pos_eid].centroid() - qpts_phys[0]) < 0:
+                normal_vec *= -1.0
+
+            loc_accumulator = 0.0 if is_functional else None # New
+            
+            # New: Only set up DOF mapping if we are not assembling a functional.
+            if not is_functional: # New
+                pos_dofs = self.dh.get_elemental_dofs(pos_eid)
+                neg_dofs = self.dh.get_elemental_dofs(neg_eid)
+                global_dofs = np.unique(np.concatenate((pos_dofs, neg_dofs)))
+                pos_map = np.searchsorted(global_dofs, pos_dofs)   # e.g. [0,1,2,3,4,  8,9,10,11]
+                neg_map = np.searchsorted(global_dofs, neg_dofs)   # e.g. [5,6,7,     12,13,14]
+
+                if rhs:
+                    loc_accumulator = np.zeros(len(global_dofs))
+                else:
+                    loc_accumulator = np.zeros((len(global_dofs), len(global_dofs)))
+
+            # 5. Main Quadrature Loop
+            
+            for qp_phys, w in zip(qpts_phys, qwts):
+                bv: dict[str, dict] = {'+': {}, '-': {}}
+                for side, eid in (('+', pos_eid), ('-', neg_eid)):
+                    xi, eta = transform.inverse_mapping(mesh, eid, qp_phys)
+                    J = transform.jacobian(mesh, eid, (xi, eta))
+                    J_inv = np.linalg.inv(J)
+                    for fld in fields:
+                        bv[side].setdefault(fld, {})
+                        # ref = self.me._ref[fld]
+                        # for alpha in derivs:
+                        #     ref_val = ref.derivative(xi, eta, *alpha)
+                        #     push = transform.map_deriv(alpha, J, J_inv)
+                        #     phys_val = push(ref_val)
+                        #     bv[side][fld][alpha] = phys_val
+                        for alpha in derivs:
+                            ox, oy = alpha
+                            #------ref deriv zero padded
+                            ref_val = self.me.deriv_ref(fld, xi, eta, ox, oy)
+                            # -------- push-forward (axis-aligned map) ------------
+                            # for curved elements we need to change this
+                            sx = J_inv[0, 0] 
+                            sy = J_inv[1, 1]
+                            phys_val = ref_val * (sx ** ox) * (sy ** oy)   # (n_dofs,)
+                            if is_functional:
+                                # No union padding needed
+                                bv[side][fld][alpha] = phys_val
+                            else:
+                                full_val = np.zeros(len(global_dofs))
+                                if side == '+':
+                                    full_val[pos_map] = phys_val
+                                else:
+                                    full_val[neg_map] = phys_val
+                                # -------- cache for visitors -------------------------
+                                bv[side][fld][alpha] = full_val
+
+                eid_qp  = pos_eid if side == '+' else neg_eid
+                ctx_data = {'basis_values': bv, 'normal': normal_vec,
+                            'phi_val': level_set(qp_phys),
+                            'eid': eid_qp,
+                            'x_phys': qp_phys}
+                ctx_data.update({'pos_eid': pos_eid, 'neg_eid': neg_eid})
+                if not is_functional:
+                    ctx_data.update({'global_dofs': global_dofs,
+                                     'pos_map': pos_map,
+                                     'neg_map': neg_map})
+                self.ctx.update(ctx_data)
+                integrand_val = self._visit(intg.integrand)
+                loc_accumulator += w * integrand_val
+
+            # 6. Scatter contributions.
+            if is_functional: # New
+                # If it's a functional, add the accumulated scalar to the results dictionary.
+                self.ctx['scalar_results'][hook['name']] += loc_accumulator # New
+                continue
+            else: # New
+                # Otherwise, scatter the local matrix/vector to the global system.
+                if not rhs:
+                    r, c = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                    matvec[r, c] += loc_accumulator
+                else:
+                    np.add.at(matvec, global_dofs, loc_accumulator)
+
+        # 7. Final Context Cleanup
+        for k in ('basis_values', 'normal', 'phi_val', 'eid', 'x_phys', 'global_dofs', 'pos_map', 'neg_map'):
+            self.ctx.pop(k, None)

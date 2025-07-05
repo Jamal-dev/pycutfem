@@ -9,6 +9,9 @@ custom_cmap = LinearSegmentedColormap.from_list('blue_red', ['blue', 'red'])
 
 class Expression:
     """Base class for any object in a symbolic FEM expression."""
+    is_function = False
+    is_trial    = False
+    is_test     = False
     def __repr__(self):
         return f"{self.__class__.__name__}()"
 
@@ -83,6 +86,9 @@ class Function(Expression):
     Represents a single-field function. Can be a standalone data-carrier
     or a component that provides a view into a parent VectorFunction.
     """
+    is_function = True
+    is_trial = False
+    is_test = False
     def __init__(self, name: str, field_name: str, dof_handler: 'DofHandler' = None,
                  parent_vector: 'VectorFunction' = None, component_index: int = None):
         self.name = name
@@ -208,6 +214,9 @@ class Function(Expression):
 # In your ufl/expressions.py file
 
 class VectorFunction(Expression):
+    is_function = True
+    is_trial = False
+    is_test = False
     def __init__(self, name: str, field_names: list[str], dof_handler: 'DofHandler'=None):
         super().__init__()
         self.name = name; self.field_names = field_names; self._dh = dof_handler
@@ -400,6 +409,9 @@ class NodalFunction(Expression):
     def __repr__(self): return f"NodalFunction({self.field_name!r})"
 
 class TrialFunction(Function):
+    is_trial = True
+    is_test = False
+    is_function = False
     def __init__(self, field_name: str,dof_handler: 'DofHandler' = None,
                  parent_vector: 'VectorFunction' = None, component_index: int = None, name: str = None):
         # A TrialFunction is purely symbolic. It has no dof_handler or data.
@@ -418,6 +430,9 @@ class TrialFunction(Function):
 
 
 class TestFunction(Function):
+    is_test = True
+    is_trial = False
+    is_function = False
     def __init__(self, field_name: str,dof_handler: 'DofHandler' = None,
                  parent_vector: 'VectorFunction' = None, component_index: int = None, name: str = None):
         # A TestFunction is purely symbolic.
@@ -458,6 +473,9 @@ class Constant(Expression, numbers.Number):
         return np.asarray(self.value, dtype=dtype)
 
 class VectorTrialFunction(Expression):
+    is_trial = True
+    is_function = False
+    is_test = False
     def __init__(self, space, dof_handler: 'DofHandler'=None): # space: FunctionSpace
         self.space = space
         self.field_names = space.field_names
@@ -475,6 +493,9 @@ class VectorTrialFunction(Expression):
 
 
 class VectorTestFunction(Expression):
+    is_test = True
+    is_function = False
+    is_trial = False
     def __init__(self, space, dof_handler=None): # space: FunctionSpace
         self.space = space
         self.field_names = space.field_names
@@ -532,19 +553,60 @@ class Div(Expression):
     def __repr__(self): return f"({self.a!r} / {self.b!r})"
 
 class Derivative(Expression):
-    def __init__(self, f, component_index):
-        self.f, self.component_index = f, component_index
-    def __repr__(self): return f"Derivative({self.f!r}, {self.component_index})"
+    def __init__(self, f, *args):
+        # ------------------------------------------------------------
+        # Accept both   Derivative(f, dir)          (old form)
+        #           and Derivative(f, ox, oy)       (new form)
+        # ------------------------------------------------------------
+        if len(args) == 1:                # old API
+            dir = args[0]
+            ox, oy = (1, 0) if dir == 0 else (0, 1)
+        elif len(args) == 2:              # new API
+            ox, oy = args
+        else:
+            raise TypeError("Derivative expects 2 or 3 arguments")
+
+        self.f     = f
+        self.order = (ox, oy)
+
+        # -------- retro-compat field for helper functions ------------
+        if ox + oy == 1:                  # first-order only
+            self.component_index = 0 if ox == 1 else 1
+        # higher-order: leave attribute undefined (walker never asks)
+
+        # role flags (unchanged)
+        self.is_function = getattr(f, "is_function", False)
+        self.is_trial    = getattr(f, "is_trial",    False)
+        self.is_test     = getattr(f, "is_test",     False)
+
+
+    def __repr__(self):
+        return f"Derivative({self.f!r}, {self.order[0]}, {self.order[1]})"
+
 
 class Grad(Expression):
-    def __init__(self, operand): self.operand = operand
-    def __repr__(self): return f"Grad({self.operand!r})"
-    def __getitem__(self, index): return Derivative(self.operand, index)
+    """Gradient of a scalar expression in 2-D (returns a length-2 vector)."""
 
-class Derivative(Expression):
-    def __init__(self, f, component_index):
-        self.f, self.component_index = f, component_index
-    def __repr__(self): return f"Derivative({self.f!r}, {self.component_index})"
+    def __init__(self, operand):
+        self.operand = operand          # scalar Expression
+
+    def __repr__(self):
+        return f"Grad({self.operand!r})"
+
+    # ------------------------------------------------------------------
+    # component access:
+    #
+    #   Grad(u)[0]   → ∂u/∂x   = Derivative(u, 1, 0)
+    #   Grad(u)[1]   → ∂u/∂y   = Derivative(u, 0, 1)
+    # ------------------------------------------------------------------
+    def __getitem__(self, index):
+        if index == 0:
+            return Derivative(self.operand, 1, 0)
+        elif index == 1:
+            return Derivative(self.operand, 0, 1)
+        raise IndexError("Grad supports indices 0 (x) or 1 (y)")
+
+
 
 class DivOperation(Expression):
     def __init__(self, operand): self.operand = operand
@@ -559,11 +621,31 @@ class Outer(Expression):
     def __repr__(self): return f"Outer({self.a!r}, {self.b!r})"
 
 class Pos(Expression):
-    def __init__(self, operand): self.operand = operand
+    def __init__(self, operand): 
+        self.operand = operand
+    @property
+    def is_function(self): return getattr(self.operand, "is_function", False)
+    @property
+    def is_trial(self):    return getattr(self.operand, "is_trial",    False)
+    @property
+    def is_test(self):     return getattr(self.operand, "is_test",     False)
+
+    def __getattr__(self, name):
+        return getattr(self.operand, name)
     def __repr__(self): return f"Pos({self.operand!r})"
     
 class Neg(Expression):
-    def __init__(self, operand): self.operand = operand
+    def __init__(self, operand): 
+        self.operand = operand
+    @property
+    def is_function(self): return getattr(self.operand, "is_function", False)
+    @property
+    def is_trial(self):    return getattr(self.operand, "is_trial",    False)
+    @property
+    def is_test(self):     return getattr(self.operand, "is_test",     False)
+
+    def __getattr__(self, name):
+        return getattr(self.operand, name)
     def __repr__(self): return f"Neg({self.operand!r})"
 
 from copy import deepcopy
@@ -572,11 +654,16 @@ class Jump(Expression):
     Jump( expr_pos, expr_neg )
     If expr_neg is omitted → Jump(expr) expands to  Pos(expr) – Neg(expr).
     """
-    def __init__(self, u_on_pos, u_on_neg=None):
+    def __init__(self, u_on_pos:Union[TrialFunction,TestFunction,VectorFunction,VectorTestFunction,VectorTrialFunction]
+                 , u_on_neg=None):
         if u_on_neg is None:
             # Automatic expansion: jump(u)  :=  pos(u) – neg(u)
             u_on_pos, u_on_neg = Pos(u_on_pos), Neg(deepcopy(u_on_pos))
         self.u_pos, self.u_neg = u_on_pos, u_on_neg
+        self.is_function = getattr(u_on_pos, "is_function", False)
+        self.is_trial    = getattr(u_on_pos, "is_trial",    False)
+        self.is_test     = getattr(u_on_pos, "is_test",     False)
+  
 
     def __repr__(self):
         return f"Jump({self.u_pos!r}, {self.u_neg!r})"

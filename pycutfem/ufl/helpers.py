@@ -1,7 +1,9 @@
 import re
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Union, Tuple
+from typing import Union, Tuple, Set
+from pycutfem.ufl.expressions import Expression, Derivative
+
 import logging
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -129,6 +131,33 @@ class VecOpInfo:
                 return VecOpInfo(self.data * other[:, np.newaxis], role=self.role)
             else:
                 raise ValueError(f"Cannot multiply VecOpInfo with array of shape {other.shape}.")
+        elif isinstance(other, VecOpInfo):
+            if self.data.shape != other.data.shape:
+                raise ValueError("VecOpInfo shapes mismatch in multiplication.")
+            if self.role == "trial" and other.role == "test":
+                # Case: Trial * Test , outer product case
+                return np.einsum("km,kn->mn", other.data , self.data, optimize=True)
+            elif self.role == "test" and other.role == "trial":
+                # Case: Test * Trial , outer product case
+                return np.einsum("km,kn->mn", self.data, other.data, optimize=True)
+            elif self.role == "function" and other.role == "function":
+                # Case: Function * Function , inner product case
+                u_vals = np.sum(self.data, axis=1)  # Shape (k,)
+                v_vals = np.sum(other.data, axis=1)  # Shape (k,)
+                return np.dot(u_vals, v_vals)  # scalar result for rhs
+            elif self.role == "trial" and other.role == "function":
+                # Case: Trial * Function , dot product case
+                u_vals = np.sum(other.data, axis=1)
+                data = np.einsum("kn,k->n", self.data, u_vals, optimize=True)
+                return VecOpInfo(data, role=self.role)
+            elif self.role == "function" and other.role == "trial":
+                # Case: Function * Trial , dot product case
+                u_vals = np.sum(self.data, axis=1)
+                data = np.einsum("k,kn->n", u_vals, other.data, optimize=True)
+                return VecOpInfo(data, role=other.role)
+            else:
+                raise NotImplementedError(f"VecOpInfo multiplication not implemented for roles {self.role} and {other.role}.")
+                
         else:
             raise TypeError(f"Unsupported multiplication type: {type(other)}")
     def __rmul__(self, other: Union[float, np.ndarray]) -> "VecOpInfo":
@@ -218,6 +247,13 @@ class GradOpInfo:
             
         
         if isinstance(vec, np.ndarray) and vec.ndim == 1: # dot product with a constant vector
+            if self.role == "function" and self.coeffs is not None:
+                # Case:  Grad(Function) · Const      (∇u_k) · c
+                # (1)  value of ∇u_k at this quad-point
+                grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+                # (2)  w_i,n = Σ_d (∇u_k)_d c_d φ_{k,n}
+                result_data = np.einsum("kd,d->k", grad_val, vec, optimize=True)
+                return result_data # returns a 1D array
             result_data = np.einsum("knd,d->kn", self.data, vec, optimize=True)
             return VecOpInfo(result_data, role=self.role)
         raise NotImplementedError(f"dot_vec of GradOpInfo not implemented for role {self.role}, GradOpInfo  and type {type(vec)} with role: {vec.role}.")
@@ -278,3 +314,52 @@ class GradOpInfo:
     def info(self):
         """Return the type of the data array."""
         return f"GradOpInfo({self.data.dtype}, shape={self.data.shape}, role='{self.role}')"
+
+# ----------------------------------------------------------------------
+# New definition (helpers.py)
+# ----------------------------------------------------------------------
+MultiIndex = Tuple[int, int]  # (α_x, α_y)
+
+def required_multi_indices(expr: "Expression") -> Set[MultiIndex]:
+    """
+    Collect every distinct multi-index (ox, oy) that occurs anywhere in *expr*.
+    Works with:
+        • new Derivative(f, ox, oy)
+        • old nested Derivative(f, dir) chains
+    """
+    out: Set[MultiIndex] = set()
+
+    def _walk(node: "Expression", acc_x: int = 0, acc_y: int = 0):
+        # ---------- Derivative node ----------------------------------
+        if isinstance(node, Derivative):
+            # --- new API --------------------------------------------
+            if hasattr(node, "order"):
+                ox, oy = node.order
+                _walk(node.f, acc_x + ox, acc_y + oy)
+                return
+            # --- old API (single direction) --------------------------
+            dir = getattr(node, "component_index", None)
+            if dir == 0:
+                _walk(node.f, acc_x + 1, acc_y)
+            elif dir == 1:
+                _walk(node.f, acc_x, acc_y + 1)
+            else:  # fallback: treat as unknown expr
+                _walk(node.f, acc_x, acc_y)
+            return
+
+        # ---------- leaf reached: record accumulated orders ----------
+        if acc_x or acc_y:
+            out.add((acc_x, acc_y))
+            acc_x = acc_y = 0
+
+        # ---------- recurse over children ---------------------------
+        for child in node.__dict__.values():
+            if isinstance(child, Expression):
+                _walk(child, acc_x, acc_y)
+            elif isinstance(child, (list, tuple)):
+                for c in child:
+                    if isinstance(c, Expression):
+                        _walk(c, acc_x, acc_y)
+
+    _walk(expr)
+    return out

@@ -102,6 +102,12 @@ class MixedElement:
     def _eval_scalar_grad(self, field: str, xi: float, eta: float) -> np.ndarray:
         """Return the gradient of the scalar basis functions for `field`."""
         return self._ref[field].grad(xi, eta)
+    def _eval_scalar_deriv(self, field: str, xi: float, eta: float,order_x:int, order_y:int ):
+        """Return the derivative of the scalar basis functions for `field`.
+           order_x =1, order_y=1 would be ∂^2φ/∂eta∂xi
+           order_x = 2, order_y=0 would be ∂^2φ/∂xi^2
+        """
+        return self._ref[field].derivative(xi, eta, order_x, order_y)
     def _cache_key(self, xi: float, eta: float) -> Tuple[float, float]:
         """Round coordinates so different IEEE‑754 spellings hit the same key."""
         return (round(xi, 14), round(eta, 14))
@@ -121,6 +127,18 @@ class MixedElement:
         idx = self.component_dof_slices[field]
         G[idx, :] = locG
         return G
+    def deriv_ref(self, field: str, xi, eta, order_x, order_y) -> np.ndarray:
+        """
+        Reference derivative for any order.
+
+        Output shape is (n_dofs,)
+        """
+        phi = np.zeros(self.n_dofs_per_elem)
+        loc_phi = self._eval_scalar_deriv(field, xi, eta, order_x, order_y)
+        idx = self.component_dof_slices[field]
+        phi[idx] = loc_phi  # n_dofs_local
+        return phi
+
 
     @lru_cache(maxsize=256)
     def hess(self, xi: float, eta: float) -> np.ndarray:

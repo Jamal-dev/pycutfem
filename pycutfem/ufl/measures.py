@@ -85,3 +85,6 @@ dS = Measure("exterior_facet")
 
 #: Measure for integration over a level-set-defined interface.
 dInterface = Measure("interface")
+
+# New: Measure for integration over ghost edges for CutFEM stabilization.
+dGhost = Measure("ghost_edge")

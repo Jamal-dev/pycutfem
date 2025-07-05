@@ -3,6 +3,7 @@ Reference → physical mapping for linear elements.
 """
 import numpy as np
 from pycutfem.fem.reference import get_reference
+from functools import lru_cache
 
 def _shape_and_grad(ref, xi_eta):
     xi,eta=xi_eta
@@ -73,3 +74,35 @@ def jacobian_1d(mesh, elem_id: int, ref_coords: tuple, local_edge_idx: int) -> f
         t_ref = np.array([[1, 0], [-1, 1], [0, -1]], dtype=float)[local_edge_idx]
 
     return np.linalg.norm(J @ t_ref)
+
+
+def map_deriv(alpha: tuple[int,int], J: np.ndarray, J_inv: np.ndarray):
+    """Return a callable that maps reference ∂^{α}φ to physical coords.
+
+    Args:
+        alpha: multi‑index (α_xi, α_eta)
+        J, J_inv: Jacobian and its inverse at the quadrature point.
+
+    Note:  We assume the mapping is *affine on the element* so higher
+    derivatives of the mapping vanish.  For bilinear Q1 quads this is exact
+    because J is constant in ξ, η.  For isoparametric Q2 and above, ghost‑edge
+    penalties usually still use this approximation (see Burman 2010, Sec. 4).
+    """
+    order = sum(alpha)
+    if order == 0:
+        return lambda ref_vals: ref_vals  # shape (n_basis,)
+
+    J_inv_T = J_inv.T  # (2×2)
+
+    def _push_forward(ref_tensor):
+        # ref_tensor shape = (n_basis, 2, 2, ... [order times] ...)
+        phys = ref_tensor
+        for _ in range(order):
+            phys = np.tensordot(phys, J_inv_T, axes=([-1], [0]))
+            # tensordot contracts last axis of phys with first axis of J_inv_T
+            # Result keeps last axis = 2 (physical dim)
+        return phys  # same rank, but expressed in x‑space
+
+    return _push_forward
+
+
