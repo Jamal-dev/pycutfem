@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as tri
 import numbers
 from matplotlib.colors import LinearSegmentedColormap
+from pycutfem.plotting.triangulate import triangulate_field
+
 
 custom_cmap = LinearSegmentedColormap.from_list('blue_red', ['blue', 'red'])
 
@@ -174,30 +176,11 @@ class Function(Expression):
         if mesh is None:
             raise RuntimeError(f"Field '{self.field_name}' not found in DofHandler's fe_map.")
         
-        coords = self._dof_handler.get_dof_coords(self.field_name)
-        x = coords[:, 0]
-        y = coords[:, 1]
+       
         z = self.nodal_values
 
-        if len(z) != len(x):
-             raise ValueError(
-                 f"Mismatch between number of nodal values ({len(z)}) and coordinates ({len(x)}). "
-                 "Ensure the function's DoF handler corresponds to the correct mesh."
-             )
-
-        if not hasattr(mesh, 'corner_connectivity'):
-            raise AttributeError("Mesh object must have 'corner_connectivity' for plotting.")
             
-        conn = np.asarray(mesh.corner_connectivity)
-        if conn.shape[1] == 3: # Mesh is already triangles
-            triangles = conn
-        elif conn.shape[1] == 4: # Mesh is quadrilaterals, split into triangles
-            tri1 = conn[:, [0, 1, 3]]; tri2 = conn[:, [1, 2, 3]]
-            triangles = np.vstack((tri1, tri2))
-        else:
-            raise ValueError(f"Unsupported element connectivity shape for plotting: {conn.shape}")
-            
-        triangulation = tri.Triangulation(x, y, triangles=triangles)
+        triangulation = triangulate_field(mesh, self._dof_handler, self.field_name)
         fig, ax = plt.subplots()
         title = kwargs.pop('title', f'Scalar Field: {self.name}')
         plot_kwargs = {'cmap': 'viridis', 'levels': 15}
@@ -335,69 +318,77 @@ class VectorFunction(Expression):
         else:
             raise ValueError(f"Unsupported plot kind '{kind}'. Choose 'contour' or 'quiver'.")
 
-    def _plot_quiver(self, **kwargs):
-        """Helper method to generate a quiver plot of the vector field."""
+    def _plot_quiver(self, *,          # <-- keep the same public signature
+                 stride: int = 1,   # decimate arrows to avoid clutter
+                 background: bool | str = "magnitude",
+                 **kwargs):
+        """
+        Quiver plot that **always** matches the field’s DOF layout.
 
+        Parameters
+        ----------
+        stride : int, optional
+            Use every *stride*-th DOF for the arrows. 1 → all nodes (default 1).
+        background : bool | str, optional
+            ``False`` – no colour wash behind arrows.
+            ``True``  – filled contour of |u|.
+            ``"ux"``/``"uy"``/``"p"`` … any scalar component name → plot that
+            component instead of the magnitude.  (Default ``"magnitude"`` which is
+            equivalent to ``True``.)
+        **kwargs :
+            Passed straight to ``ax.quiver`` (e.g. `color='k'`, `scale=50` …).
+        """
         if self._dof_handler is None:
-            raise RuntimeError("Cannot plot a function without an associated DofHandler.")
+            raise RuntimeError("VectorFunction needs an attached DofHandler.")
         if len(self.field_names) != 2:
-            raise NotImplementedError("Quiver plot is currently only supported for 2D vectors.")
+            raise NotImplementedError("Quiver is implemented only for 2-D vectors.")
 
-        mesh_u = self._dof_handler.fe_map.get(self.field_names[0]) 
-        mesh_v = self._dof_handler.fe_map.get(self.field_names[1])
+        fld_u, fld_v = self.field_names
+        dh   = self._dof_handler
+        mesh = dh.fe_map[fld_u]
 
-        if mesh_u is not mesh_v:
-            # This is a complex case (e.g., staggered grids). For now, we don't support it.
-            raise NotImplementedError("Quiver plot for components on different meshes is not supported.")
-        
-        mesh = mesh_u
-        x = mesh.nodes_x_y_pos[:, 0]
-        y = mesh.nodes_x_y_pos[:, 1]
-        
-        # The .nodal_values property on the components correctly gets their data.
+        # --- coordinates + values (1-to-1 with DOFs) ---------------------
+        coords = dh.get_dof_coords(fld_u)                                
+        x, y   = coords[:, 0], coords[:, 1]
         u_vals = self.components[0].nodal_values
         v_vals = self.components[1].nodal_values
-        
-        if len(u_vals) != len(x) or len(v_vals) != len(x):
-            raise ValueError("Mismatch between number of nodal values and coordinates for quiver plot.")
+        if len(u_vals) != len(x):
+            raise ValueError("Mismatch between nodal values and coordinate length.")
 
+        # optional arrow decimation
+        sl = slice(None, None, stride)
+        x_q, y_q, u_q, v_q = x[sl], y[sl], u_vals[sl], v_vals[sl]
+
+        # --- background colour-wash --------------------------------------
+        tri_obj = triangulate_field(mesh, dh, fld_u)
         fig, ax = plt.subplots(figsize=(8, 8))
 
-        title = kwargs.pop('title', f'Vector Field: {self.name}')
-        
-        plot_kwargs = {'color': 'k', 'angles': 'xy', 'scale_units': 'xy', 'scale': None}
-        plot_kwargs.update(kwargs)
-        
-        magnitude = np.sqrt(u_vals**2 + v_vals**2)
-        
-        # Add a colored background showing the magnitude of the velocity
-        if hasattr(mesh, 'corner_connectivity'):
-            conn = np.asarray(mesh.corner_connectivity)
-            if conn.shape[1] == 3:
-                triangles = conn
-            elif conn.shape[1] == 4:
-                tri1 = conn[:, [0, 1, 3]]
-                tri2 = conn[:, [1, 2, 3]]
-                triangles = np.vstack((tri1, tri2))
-            else:
-                raise ValueError(f"Unsupported element connectivity shape for plotting: {conn.shape}")
-            
-            triangulation = tri.Triangulation(x, y, triangles=triangles)
-            tcf = ax.tricontourf(triangulation, magnitude, cmap = custom_cmap, levels=15)
-            # Add colorbar to the right
-            cbar = fig.colorbar(tcf, ax=ax)
-            cbar.set_label("Magnitude")
-            cbar.set_ticks([magnitude.min(), magnitude.max()])
-            cbar.ax.set_yticklabels([f"{magnitude.min():.2f}", f"{magnitude.max():.2f}"])
+        if background:
+            if background is True or background == "magnitude":
+                scalar, label = np.hypot(u_vals, v_vals), "|u|"
+            else:  # any scalar component name
+                comp = next((c for c in self.components if c.field_name == background), None)
+                if comp is None:
+                    raise ValueError(f"background='{background}' not a component.")
+                scalar, label = comp.nodal_values, background
+            levels = kwargs.pop("levels", 15)
+            cmap   = kwargs.pop("cmap",   "viridis")
+            tcf = ax.tricontourf(tri_obj, scalar, levels=levels, cmap=cmap)
+            fig.colorbar(tcf, ax=ax, label=label)
 
-        ax.quiver(x, y, u_vals, v_vals, **plot_kwargs)
-        
+        # --- arrows -------------------------------------------------------
+        q_defaults = dict(angles="xy", scale_units="xy", scale=None, color="k")
+        title = kwargs.pop('title', f"Vector field: {self.name}")
+        q_defaults.update(kwargs)
+        ax.quiver(x_q, y_q, u_q, v_q, **q_defaults)
+
         ax.set_title(title)
-        ax.set_xlabel('X coordinate')
-        ax.set_ylabel('Y coordinate')
-        ax.set_aspect('equal', adjustable='box')
-        ax.set_xlim(x.min() - 0.1, x.max() + 0.1)
-        ax.set_ylim(y.min() - 0.1, y.max() + 0.1)
+        ax.set_xlabel("x"); ax.set_ylabel("y")
+        ax.set_aspect("equal", adjustable="box")
+        dx = np.ptp(x)    # instead of x.ptp()
+        dy = np.ptp(y)    # instead of y.ptp()
+        ax.set_xlim(x.min() - 0.05 * dx, x.max() + 0.05 * dx)
+        ax.set_ylim(y.min() - 0.05 * dy, y.max() + 0.05 * dy)
         plt.show()
 
     
