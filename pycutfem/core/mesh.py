@@ -46,6 +46,8 @@ class Mesh:
         self._edge_dict: Dict[Tuple[int, int], 'Edge'] = {}
         self._neighbors: List[List[int]] = [[] for _ in range(len(self.elements_connectivity))]
         self._build_topology()
+        self.n_elements = len(self.elements_connectivity)
+        self.spatial_dim = 2  # Assuming 2D mesh by default
 
     def _build_topology(self):
         """

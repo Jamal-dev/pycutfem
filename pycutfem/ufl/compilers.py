@@ -42,6 +42,9 @@ from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices
 from pycutfem.fem.transform import map_deriv
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.utils.domain_manager import get_domain_bitset
+from pycutfem.ufl.helpers_jit import _precompute_physical_quadrature, _build_jit_kernel_args
+
+
 
 logger = logging.getLogger(__name__)
 _INTERFACE_TOL = 1.0e-12 # New
@@ -68,6 +71,21 @@ def _all_fields(expr):
     walk(expr)
     return list(fields)
 
+def _find_all(expr, cls):
+    out = []
+    def walk(n):
+        if isinstance(n, cls):
+            out.append(n)
+        for attr in ('operand','a','b','u_pos','u_neg','components','f'):
+            m = getattr(n, attr, None)
+            if m is None: continue
+            if isinstance(m, (list, tuple)):
+                for x in m: walk(x)
+            else:
+                walk(m)
+    walk(expr)
+    return out
+
 # New: Helper to identify trial and test functions in an expression
 def _trial_test(expr): # New
     """Finds the first trial and test function in an expression tree.""" # New
@@ -81,7 +99,9 @@ def _trial_test(expr): # New
 class FormCompiler:
     """A single‑file *volume* compiler for mixed continuous Galerkin forms."""
 
-    def __init__(self, dh: DofHandler, quadrature_order: int | None = None, assembler_hooks: Dict[str, Any] = None):
+    def __init__(self, dh: DofHandler, quadrature_order: int | None = None, 
+                 assembler_hooks: Dict[str, Any] = None,
+                 backend: str = "jit"):
         if dh.mixed_element is None:
             raise RuntimeError("A MixedElement‑backed DofHandler is required.")
         self.dh, self.me = dh, dh.mixed_element
@@ -89,6 +109,10 @@ class FormCompiler:
         self.ctx: Dict[str, Any] = {"hooks": assembler_hooks or {}}
         self._basis_cache: Dict[str, Dict[str, np.ndarray]] = {}
         self.degree_estimator = PolynomialDegreeEstimator(dh)
+        self.backend = backend
+        if self.backend == "jit":
+            from pycutfem.jit import compile_backend
+            self._compile_backend = compile_backend
         self._dispatch = {
             Constant: self._visit_Constant, 
             TestFunction: self._visit_TestFunction,
@@ -764,6 +788,85 @@ class FormCompiler:
         F[rows] = vals
     
     def _assemble_volume(self, integral: Integral, matvec):
+        if self.backend == "python":
+            logger.info(f"Assembling volume integral with python backend: {integral}")
+            self._assemble_volume_python(integral, matvec)
+        elif self.backend == "jit":
+            logger.info(f"Assembling volume integral with jit backend: {integral}")
+            self._assemble_volume_jit(integral, matvec)
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+    
+    # ----------------------------------------------------------------------
+    def _assemble_volume_jit(self, integral: Integral, matvec):
+        # 1. JIT kernel ---------------------------------------------------
+        (kernel, param_order), ir = self._compile_backend(integral.integrand, mixed_element=self.me)
+
+        # 2. Geometry + quadrature ---------------------------------------
+        mesh     = self.me.mesh
+        q_order  = self._find_q_order(integral)
+        qp_phys, qw_phys, detJ, J_inv = _precompute_physical_quadrature(mesh, q_order)
+
+        
+        # Basis/gradient arrays that the kernel actually asks for --------
+        basis_args = _build_jit_kernel_args(ir, integral.integrand, self.me, q_order,
+                                            dof_handler = self.dh,
+                                            param_order=param_order)
+
+        # 3. Element-to-global DOF map and geometry ----------------------
+        gdofs_map     = np.vstack([self.dh.get_elemental_dofs(eid)
+                                for eid in range(mesh.n_elements)]).astype(np.int32)
+        node_coords   = mesh.nodes_x_y_pos.astype(float)
+        element_nodes = self.me.element_node_map.astype(np.int32)     # ← no mesh.elements
+
+        # 4. Assemble POSITIONAL argument list in the exact order --------
+        arg_dict = {
+            "gdofs_map": gdofs_map,
+            "node_coords": node_coords,
+            "element_nodes": element_nodes,
+            "qp_phys": qp_phys,
+            "qw": qw_phys,
+            "detJ": detJ,
+            "J_inv": J_inv,
+            "normals": None,
+            "phis": None,
+            **basis_args
+        }
+        args = [arg_dict[name] for name in param_order]               # ordered!
+
+        K_values, F_values  = kernel(*args)
+        n_elements = mesh.n_elements
+
+        # 5. Scatter to global matrix / vector ---------------------------
+        if self.ctx["rhs"]:
+            for e in range(n_elements):
+                gdofs = self.dh.get_elemental_dofs(e)
+                np.add.at(matvec, gdofs, F_values[e])
+        else:
+            # More efficient sparse matrix assembly
+            n_dofs_local = self.me.n_dofs_local
+            data = np.zeros(n_elements * n_dofs_local * n_dofs_local)
+            rows = np.zeros_like(data, dtype=np.int32)
+            cols = np.zeros_like(data, dtype=np.int32)
+            
+            for e in range(n_elements):
+                gdofs = self.dh.get_elemental_dofs(e)
+                r, c = np.meshgrid(gdofs, gdofs, indexing='ij')
+                
+                start = e * n_dofs_local * n_dofs_local
+                end = start + n_dofs_local * n_dofs_local
+                
+                rows[start:end] = r.ravel()
+                cols[start:end] = c.ravel()
+                data[start:end] = K_values[e].ravel()
+
+            # Create the sparse matrix from the COO triplets
+            K_coo = sp.coo_matrix((data, (rows, cols)),
+                                shape=(self.dh.total_dofs, self.dh.total_dofs))
+            matvec += K_coo.tocsr()
+
+
+    def _assemble_volume_python(self, integral: Integral, matvec):
         mesh = self.me.mesh
         # Use a higher quadrature order for safety, esp. with mixed orders
         q_order = self._find_q_order(integral)
