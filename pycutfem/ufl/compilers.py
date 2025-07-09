@@ -16,6 +16,7 @@ from typing import Dict, List, Any, Tuple, Iterable, Mapping, Union
 import logging
 from dataclasses import dataclass
 import math
+import os
 
 # -------------------------------------------------------------------------
 #  Project imports – only the really needed bits
@@ -42,7 +43,7 @@ from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices
 from pycutfem.fem.transform import map_deriv
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.utils.domain_manager import get_domain_bitset
-from pycutfem.ufl.helpers_jit import _precompute_physical_quadrature, _build_jit_kernel_args
+from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args
 
 
 
@@ -799,70 +800,97 @@ class FormCompiler:
     
     # ----------------------------------------------------------------------
     def _assemble_volume_jit(self, integral: Integral, matvec):
-        # 1. JIT kernel ---------------------------------------------------
-        (kernel, param_order), ir = self._compile_backend(integral.integrand, mixed_element=self.me)
+        dbg = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
 
-        # 2. Geometry + quadrature ---------------------------------------
-        mesh     = self.me.mesh
-        q_order  = self._find_q_order(integral)
-        qp_phys, qw_phys, detJ, J_inv = _precompute_physical_quadrature(mesh, q_order)
+        # ------------------------------------------------------------------
+        # 1. Get – or create – the JIT kernel runner
+        # ------------------------------------------------------------------
+        runner, ir = self._compile_backend(
+            integral.integrand,          # the expression (no Form wrapper)
+            self.dh, self.me
+        )
 
-        
-        # Basis/gradient arrays that the kernel actually asks for --------
-        basis_args = _build_jit_kernel_args(ir, integral.integrand, self.me, q_order,
-                                            dof_handler = self.dh,
-                                            param_order=param_order)
+        # ------------------------------------------------------------------
+        # 2. Build (or reuse) the STATIC argument dictionary
+        # ------------------------------------------------------------------
+        q_order = self._find_q_order(integral)
 
-        # 3. Element-to-global DOF map and geometry ----------------------
-        gdofs_map     = np.vstack([self.dh.get_elemental_dofs(eid)
-                                for eid in range(mesh.n_elements)]).astype(np.int32)
-        node_coords   = mesh.nodes_x_y_pos.astype(float)
-        element_nodes = self.me.element_node_map.astype(np.int32)     # ← no mesh.elements
+        cache_key = (q_order, runner.param_order)   # hashable & unique enough
+        if not hasattr(self, "_jit_static_cache"):
+            self._jit_static_cache = {}
+        if cache_key not in self._jit_static_cache:
+            # (A) geometric factors      -------------------------------
+            geo_args = self.dh.precompute_geometric_factors(q_order)
 
-        # 4. Assemble POSITIONAL argument list in the exact order --------
-        arg_dict = {
-            "gdofs_map": gdofs_map,
-            "node_coords": node_coords,
-            "element_nodes": element_nodes,
-            "qp_phys": qp_phys,
-            "qw": qw_phys,
-            "detJ": detJ,
-            "J_inv": J_inv,
-            "normals": None,
-            "phis": None,
-            **basis_args
-        }
-        args = [arg_dict[name] for name in param_order]               # ordered!
+            # (B) element → global DOF map  &  node coordinates         ------
+            mesh = self.me.mesh
+            gdofs_map = np.vstack([
+                self.dh.get_elemental_dofs(e) for e in range(mesh.n_elements)
+            ]).astype(np.int32)
+            node_coords = self.dh.get_all_dof_coords()
 
-        K_values, F_values  = kernel(*args)
-        n_elements = mesh.n_elements
+            # (C) basis / gradient / derivative tables (only what kernel needs)
+            basis_args = _build_jit_kernel_args(
+                ir, integral.integrand, self.me, q_order,
+                dof_handler=self.dh,
+                param_order=runner.param_order
+            )
 
-        # 5. Scatter to global matrix / vector ---------------------------
-        if self.ctx["rhs"]:
-            for e in range(n_elements):
-                gdofs = self.dh.get_elemental_dofs(e)
-                np.add.at(matvec, gdofs, F_values[e])
+            static_args = {
+                "gdofs_map":  gdofs_map,
+                "node_coords": node_coords,
+                **geo_args,
+                **basis_args,
+            }
+            self._jit_static_cache[cache_key] = static_args
         else:
-            # More efficient sparse matrix assembly
-            n_dofs_local = self.me.n_dofs_local
-            data = np.zeros(n_elements * n_dofs_local * n_dofs_local)
-            rows = np.zeros_like(data, dtype=np.int32)
-            cols = np.zeros_like(data, dtype=np.int32)
-            
-            for e in range(n_elements):
-                gdofs = self.dh.get_elemental_dofs(e)
+            static_args = self._jit_static_cache[cache_key]
+
+        # ------------------------------------------------------------------
+        # 3. Collect the up-to-date coefficient Functions
+        # ------------------------------------------------------------------
+        current_funcs = {
+            f.name: f
+            for f in _find_all(integral.integrand, (Function, VectorFunction))
+        }
+
+        # ------------------------------------------------------------------
+        # 4. Execute the kernel via the runner
+        # ------------------------------------------------------------------
+        K_loc, F_loc = runner(current_funcs, static_args)
+        if dbg:
+            print(f"[Assembler] kernel returned  K_loc {K_loc.shape}  "
+                  f"F_loc {F_loc.shape}")
+
+        # ------------------------------------------------------------------
+        # 5. Scatter element contributions to the global system
+        # ------------------------------------------------------------------
+        mesh         = self.me.mesh
+        gdofs_map    = static_args["gdofs_map"]
+        n_dofs_local = self.me.n_dofs_local
+
+        if self.ctx["rhs"]:                               # assembling a vector
+            for e in range(mesh.n_elements):
+                np.add.at(matvec, gdofs_map[e], F_loc[e])
+        else:                                             # assembling a matrix
+            data = np.empty(mesh.n_elements * n_dofs_local * n_dofs_local)
+            rows = np.empty_like(data, dtype=np.int32)
+            cols = np.empty_like(data, dtype=np.int32)
+
+            for e in range(mesh.n_elements):
+                gdofs = gdofs_map[e]
                 r, c = np.meshgrid(gdofs, gdofs, indexing='ij')
-                
                 start = e * n_dofs_local * n_dofs_local
-                end = start + n_dofs_local * n_dofs_local
-                
+                end   = start + n_dofs_local * n_dofs_local
+
                 rows[start:end] = r.ravel()
                 cols[start:end] = c.ravel()
-                data[start:end] = K_values[e].ravel()
+                data[start:end] = K_loc[e].ravel()
 
-            # Create the sparse matrix from the COO triplets
-            K_coo = sp.coo_matrix((data, (rows, cols)),
-                                shape=(self.dh.total_dofs, self.dh.total_dofs))
+            K_coo = sp.coo_matrix(
+                (data, (rows, cols)),
+                shape=(self.dh.total_dofs, self.dh.total_dofs)
+            )
             matvec += K_coo.tocsr()
 
 

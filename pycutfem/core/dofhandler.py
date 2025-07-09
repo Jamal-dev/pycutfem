@@ -537,6 +537,101 @@ class DofHandler:
             return math.sqrt(err2)
             
         return math.sqrt(err2 / exact2) if relative else math.sqrt(err2)
+    
+    # ==================================================================
+    # NEW: Precompute Geometric Factors for JIT Kernels
+    # ==================================================================
+    def get_all_dof_coords(self) -> np.ndarray:
+        """
+        Builds and returns a coordinate array for every DOF in the system.
+
+        The returned array has shape (total_dofs, 2), where the first index
+        corresponds directly to the global DOF index. This is the correct
+        coordinate array to pass to JIT kernels.
+
+        Returns:
+            np.ndarray: The (total_dofs, 2) array of DOF coordinates.
+        """
+        if self._dg_mode:
+            raise NotImplementedError("get_all_dof_coords is not yet implemented for DG methods.")
+
+        # Initialize an array to hold coordinates for every single DOF.
+        all_coords = np.zeros((self.total_dofs, 2))
+
+        # Use the internal map that links a global DOF to its original node.
+        for dof_idx, (field, node_idx) in self._dof_to_node_map.items():
+            # Get the coordinates of the original node.
+            coords = self.fe_map[field].nodes_x_y_pos[node_idx]
+            # Place these coordinates at the correct index in our new array.
+            all_coords[dof_idx] = coords
+
+        return all_coords
+    def precompute_geometric_factors(self, quad_order: int, level_set: Callable = None) -> Dict[str, np.ndarray]:
+        """
+        Calculates all geometric data needed by JIT kernels ahead of time.
+
+        This is the single, authoritative method for preparing geometric
+        quadrature data. It computes physical coordinates, scaled quadrature
+        weights, inverse Jacobians, and optional level-set values.
+
+        Args:
+            quad_order (int): The polynomial degree of the quadrature rule.
+            level_set (Callable, optional): A level-set function to evaluate `phi`
+                                            at quadrature points. Defaults to None.
+
+        Returns:
+            Dict[str, np.ndarray]: A dictionary of pre-computed arrays.
+        """
+        if self.mixed_element is None:
+            raise RuntimeError("This method requires a MixedElement-backed DofHandler.")
+
+        mesh = self.mixed_element.mesh
+        num_elements = len(mesh.elements_list)
+        spatial_dim = mesh.spatial_dim
+
+        # 1. Get reference quadrature rule
+        qp_ref, qw_ref = volume(mesh.element_type, quad_order)
+        num_quad_points = len(qw_ref)
+
+        # 2. Initialize output arrays
+        qp_phys = np.zeros((num_elements, num_quad_points, spatial_dim))
+        qw_scaled = np.zeros((num_elements, num_quad_points))
+        detJ = np.zeros((num_elements, num_quad_points))
+        J_inv = np.zeros((num_elements, num_quad_points, spatial_dim, spatial_dim))
+        phis = np.zeros((num_elements, num_quad_points)) if level_set else None
+        normals = np.zeros((num_elements, num_quad_points, spatial_dim)) # Placeholder
+
+        # 3. Loop over all elements and quadrature points
+        for e_idx in range(num_elements):
+            for q_idx, (qp, qw) in enumerate(zip(qp_ref, qw_ref)):
+                xi_tuple = tuple(qp)
+
+                J_matrix = transform.jacobian(mesh, e_idx, xi_tuple)
+                det_J_val = np.linalg.det(J_matrix)
+                if det_J_val <= 1e-12:
+                    raise ValueError(f"Jacobian determinant is non-positive ({det_J_val}) for element {e_idx}.")
+
+                J_inv[e_idx, q_idx] = np.linalg.inv(J_matrix)
+                detJ[e_idx, q_idx] = det_J_val
+                
+                x_phys, y_phys = transform.x_mapping(mesh, e_idx, xi_tuple)
+                qp_phys[e_idx, q_idx, 0] = x_phys
+                qp_phys[e_idx, q_idx, 1] = y_phys
+                
+                qw_scaled[e_idx, q_idx] = qw * det_J_val
+
+                if level_set:
+                    phis[e_idx, q_idx] = level_set(x_phys, y_phys)
+
+        # 4. Return results in a dictionary for easy use
+        return {
+            "qp_phys": qp_phys,
+            "qw": qw_scaled,
+            "detJ": detJ,
+            "J_inv": J_inv,
+            "normals": normals,
+            "phis": phis,
+        }
 
     def info(self) -> None:
         print(f"=== DofHandler ({self.method.upper()}) ===")

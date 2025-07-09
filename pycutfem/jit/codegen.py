@@ -471,7 +471,7 @@ class NumbaCodeGen:
                         f"    {res_var}[n] = local_sum",
                     ]
                     stack.append(StackItem(var_name=res_var, role='value',
-                                        shape=(b.shape[1],), is_vector=False)
+                                        shape=(b.shape[1],), is_vector=False))
                 
                 # ---------------------------------------------------------------------
                 # dot( u_k ,  u_test )          ← load-vector term -> (n,)
@@ -728,20 +728,24 @@ class NumbaCodeGen:
         """
         Build complete kernel source code with parallel assembly.
         """
-        # Add coefficients for all function fields to the required arguments
+        # New Newton: Change parameter names to reflect they are pre-gathered.
         for name in solution_func_names:
-            required_args.add(f"u_{name}_coeffs")
+            # We will pass u_{name}_loc directly, not the global coeffs.
+            required_args.add(f"u_{name}_loc")
 
+        # New Newton: Remove gdofs_map from parameters, it's used before the kernel call.
         param_order = [
-            "gdofs_map", "node_coords", "element_nodes",
+            "gdofs_map",
+            "node_coords",
             "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
             *sorted(list(required_args))
         ]
         param_order_literal = ", ".join(f"'{arg}'" for arg in param_order)
 
-        # Create the unpacking block for the solution coefficients
+        # New Newton: The unpacking block is now much simpler.
+        # We just select the data for the current element `e`.
         coeffs_unpack_block = "\n".join(
-            f"        u_{name}_loc = u_{name}_coeffs[gdofs_e]"
+            f"        u_{name}_loc_e = u_{name}_loc[e]"
             for name in sorted(list(solution_func_names))
         )
         
@@ -752,12 +756,13 @@ class NumbaCodeGen:
         )
 
         body_code_block = "\n".join(
-            f"            {line}" for line in body_lines if line.strip()
+            f"            {line.replace('_loc', '_loc_e')}" for line in body_lines if line.strip()
         )
 
         decorator = ""
         if not DEBUG:
             decorator = "@numba.njit(parallel=True, fastmath=True)"
+        # New Newton: The kernel signature and loop structure are updated.
         final_kernel_src = f"""
 import numba
 import numpy as np
@@ -766,18 +771,15 @@ PARAM_ORDER = [{param_order_literal}]
 def {kernel_name}(
         {", ".join(param_order)}
     ):
-    num_elements        = gdofs_map.shape[0]
-    n_dofs_per_element  = gdofs_map.shape[1]
+    num_elements        = qp_phys.shape[0]
+    n_dofs_per_element  = {self.n_dofs_local}
     
-    # Allocate storage for the dense local matrices and vectors
     K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
     F_values = np.zeros((num_elements, n_dofs_per_element), dtype=np.float64)
 
     for e in numba.prange(num_elements):
-        # These are now local to the thread for this element
         Ke = np.zeros((n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
         Fe = np.zeros(n_dofs_per_element, dtype=np.float64)
-        gdofs_e = gdofs_map[e]
 
 {coeffs_unpack_block}
 
@@ -788,7 +790,6 @@ def {kernel_name}(
 {basis_unpack_block}
 {body_code_block}
 
-        # Store the final computed local matrix/vector for this element
         K_values[e] = Ke
         F_values[e] = Fe
                 

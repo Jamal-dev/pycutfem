@@ -2,6 +2,9 @@ import numpy as np
 from typing import Mapping, Tuple, Dict, Any
 from pycutfem.integration import volume
 from pycutfem.fem import transform
+import logging # Added for logging warnings
+
+logger = logging.getLogger(__name__)
 
 def _pad_coeffs(coeffs, phi, ctx):
     """Return coeffs padded to the length of `phi` on ghost edges."""
@@ -14,49 +17,7 @@ def _pad_coeffs(coeffs, phi, ctx):
     padded[amap] = coeffs
     return padded
 
-def _precompute_physical_quadrature(mesh, q_order):
-    """
-    Return
-        qp_phys : (nel, n_qp, dim)
-        qw_phys : (nel, n_qp)                        *already* includes |detJ|
-        detJ    : (nel, n_qp)
-        J_inv   : (nel, n_qp, dim, dim)
 
-    Geometry is gathered once per element, once per quadrature point,
-    so the JIT kernel never touches the mesh object.
-    """
-    dim         = mesh.spatial_dim
-    n_elements  = mesh.n_elements
-    qp_ref, qw_ref = volume(mesh.element_type, q_order)     # reference rule
-    n_qp        = len(qp_ref)
-
-    # --- allocate output ------------------------------------------------
-    qp_phys = np.empty((n_elements, n_qp, dim),  dtype=np.float64)
-    detJ    = np.empty((n_elements, n_qp),       dtype=np.float64)
-    J_inv   = np.empty((n_elements, n_qp, dim, dim), dtype=np.float64)
-
-    # physical weights = w_q * |detJ|
-    qw_phys = np.empty((n_elements, n_qp),       dtype=np.float64)
-
-    
-    # --- loop over elements & quad points ------------------------------
-    # (vectorising across *all* elements costs memory, so a double loop
-    #  is usually faster / leaner at this stage.)
-    for eid in range(n_elements):
-        for q, (xi, *rest) in enumerate(qp_ref):   # rest = eta,(zeta)
-            # transform.jacobian() must accept both 2-D and 3-D ξ
-            xi_tuple = (xi, *rest)
-
-            J_q   = transform.jacobian(mesh, eid, xi_tuple)
-            det   = np.linalg.det(J_q)
-            invJ  = np.linalg.inv(J_q)
-
-            detJ[eid, q]   = det
-            J_inv[eid, q]  = invJ
-            qp_phys[eid, q] = transform.x_mapping(mesh, eid, xi_tuple)
-            qw_phys[eid, q] = qw_ref[q] * det          # already physical
-
-    return qp_phys, qw_phys, detJ, J_inv
 
 def _build_jit_kernel_args(       # ← NEW signature
         ir,                       # linear IR produced by the visitor
@@ -68,8 +29,7 @@ def _build_jit_kernel_args(       # ← NEW signature
     ) -> Dict[str, Any]:
     """
     Allocate reference-space basis / gradient / derivative arrays **and**
-    zero-padded coefficient vectors for exactly the symbols that the JIT
-    kernel requests.
+    coefficient vectors for exactly the symbols that the JIT kernel requests.
     """
     # -- late imports to avoid circular dependencies -------------------
     from pycutfem.ufl.expressions import (
@@ -85,43 +45,31 @@ def _build_jit_kernel_args(       # ← NEW signature
     }
     args: Dict[str, Any] = {}
 
-    # -----------------------------------------------------------------
     # 1. reference-element quadrature (ξ-space)
-    # -----------------------------------------------------------------
     qp_ref, _ = volume(mixed_element.mesh.element_type, q_order)
 
-    # -----------------------------------------------------------------
     # 2. find all Functions / VectorFunctions appearing in *expression*
-    # -----------------------------------------------------------------
     func_map: Dict[str, Any] = {}
     for f in _find_all(expression, Function):
-        func_map[f.name] = f                     # p_k
-        func_map.setdefault(f.field_name, f)     # p
-    
-    # VectorFunction → add alias for every component’s field
-    for vf in _find_all(expression, VectorFunction):
-        func_map[vf.name] = vf                   # u_k
-        for comp, fld in zip(vf.components, vf.field_names):
-            func_map.setdefault(fld, vf)         # ux, uy
+        func_map[f.name] = f
+        func_map.setdefault(f.field_name, f)
 
-    # constant tensors that need a NumPy array
+    for vf in _find_all(expression, VectorFunction):
+        func_map[vf.name] = vf
+        for comp, fld in zip(vf.components, vf.field_names):
+            func_map.setdefault(fld, vf)
+
     const_arrays = {
         f"const_arr_{id(c)}": c
         for c in _find_all(expression, UflConst) if c.dim != 0
     }
 
-    # -----------------------------------------------------------------
     # 3. collect the kernel’s required argument *names*
-    # -----------------------------------------------------------------
-    # -----------------------------------------------------------------
-    # 0.  Which symbols does the generated kernel require?
-    # -----------------------------------------------------------------
     if param_order is not None:
-        required_args = set(param_order)           # ← exactly as used later
+        required_args = set(param_order)
     else:
         required_args = set()
 
-    # 3.a – scan the IR for basis / derivative symbols and coeffs
     for op in ir:
         if isinstance(op, LoadVariable):
             field_names = (
@@ -135,38 +83,33 @@ def _build_jit_kernel_args(       # ← NEW signature
                     required_args.add(f"d{d0}{d1}_{f}")
 
             if op.role == "function":
-                required_args.add(f"u_{op.name}_coeffs")
+                # CHANGE: Default to requesting the new high-performance `_loc` arrays.
+                required_args.add(f"u_{op.name}_loc")
 
         elif isinstance(op, LoadConstantArray):
             required_args.add(op.name)
 
-    # 3.b – gradients referenced directly in the expression tree
     for g in _find_all(expression, Grad):
         op = g.operand
-        if hasattr(op, "field_names"):             # vector
+        if hasattr(op, "field_names"):
             required_args.update(f"g_{f}" for f in op.field_names)
-        else:                                      # scalar
+        else:
             required_args.add(f"g_{op.field_name}")
 
-    # -----------------------------------------------------------------
     # 4. build the *numeric* arrays
-    # -----------------------------------------------------------------
     for name in sorted(required_args):
         if name in prebuilt: continue
 
-        # ---- basis --------------------------------------------------
         if name.startswith("b_"):
             fld = name[2:]
             vals = [mixed_element.basis(fld, *xi_eta) for xi_eta in qp_ref]
-            args[name] = np.asarray(vals, dtype=np.float64)            # (n_qp,n_loc)
+            args[name] = np.asarray(vals, dtype=np.float64)
 
-        # ---- gradient ----------------------------------------------
         elif name.startswith("g_"):
             fld = name[2:]
             grads = [mixed_element.grad_basis(fld, *xi_eta) for xi_eta in qp_ref]
-            args[name] = np.asarray(grads, dtype=np.float64)           # (n_qp,n_loc,dim)
+            args[name] = np.asarray(grads, dtype=np.float64)
 
-        # ---- higher-order partials d<ax><ay>_field ------------------
         elif name.startswith("d"):
             dtag, fld = name.split("_", 1)
             ax, ay = int(dtag[1]), int(dtag[2])
@@ -174,12 +117,17 @@ def _build_jit_kernel_args(       # ← NEW signature
                 mixed_element.deriv_ref(fld, *xi_eta, ax, ay)
                 for xi_eta in qp_ref
             ]
-            args[name] = np.asarray(deriv, dtype=np.float64)           # (n_qp,n_loc)
+            args[name] = np.asarray(deriv, dtype=np.float64)
 
-        # ---- zero-padded coefficient arrays ------------------------
-        elif name.startswith("u_") and name.endswith("_coeffs"):
-            # strip 'u_' prefix and '_coeffs' suffix
-            func_name = name[2:-7]
+        # CHANGE: This block now handles both _loc (new) and _coeffs (old) conventions.
+        elif name.startswith("u_") and (name.endswith("_loc") or name.endswith("_coeffs")):
+            is_local_request = name.endswith("_loc")
+
+            if is_local_request:
+                func_name = name[2:-4]  # e.g., 'u_u_k_loc' -> 'u_k'
+            else:
+                func_name = name[2:-7]  # e.g., 'u_u_k_coeffs' -> 'u_k'
+
             f = func_map.get(func_name)
             if f is None:
                 raise NameError(
@@ -187,26 +135,26 @@ def _build_jit_kernel_args(       # ← NEW signature
                     f"or VectorFunction '{func_name}'."
                 )
 
-            coeffs = np.zeros(dof_handler.total_dofs, dtype=np.float64)
+            # NEW LOGIC: Always build the full global vector first.
+            full_coeffs_vec = np.zeros(dof_handler.total_dofs, dtype=np.float64)
+            for gdof, lidx in f._g2l.items():
+                full_coeffs_vec[gdof] = f.nodal_values[lidx]
 
-            def _fill_slice(field_name, src_vals):
-                sl = dof_handler.get_field_slice(field_name)
-                coeffs[sl] = src_vals
-
-            # scalar Function ----------------------------------------------
-            if not hasattr(f, "field_names"):
-                _fill_slice(f.field_name, f.nodal_values)
-
-            # VectorFunction -----------------------------------------------
+            if is_local_request:
+                # If the kernel wants a local array, gather it now.
+                gdofs_map = np.vstack([
+                    dof_handler.get_elemental_dofs(eid)
+                    for eid in range(mixed_element.mesh.n_elements)
+                ]).astype(np.int32)
+                args[name] = full_coeffs_vec[gdofs_map]
             else:
-                for idx, fld in enumerate(f.field_names):
-                    comp_vals = f.components[idx].nodal_values
-                    _fill_slice(fld, comp_vals)
+                # Otherwise, provide the full global vector for backward compatibility.
+                args[name] = full_coeffs_vec
 
-            args[name] = coeffs
-
-        # ---- constant tensors --------------------------------------
-        else:  # LoadConstantArray
-            args[name] = const_arrays[name].value
+        else:
+            if name in const_arrays:
+                args[name] = const_arrays[name].value
+            else:
+                logger.warning(f"Argument builder skipped unrecognized kernel parameter: '{name}'")
 
     return args
