@@ -449,7 +449,16 @@ class Constant(Expression, numbers.Number):
         self.value = value
         self.dim = dim
         self.role = 'none'
-
+    @property
+    def shape(self):
+        """Returns the shape of the constant value."""
+        if isinstance(self.value, np.ndarray):
+            return self.value.shape
+        elif isinstance(self.value, (list, tuple)):
+            return (len(self.value),)
+        else:
+            return ()
+    
     def __repr__(self):
         # We override __repr__ to show the value, which is more informative
         return f"Constant({self.value})"

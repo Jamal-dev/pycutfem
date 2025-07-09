@@ -97,7 +97,7 @@ class IRGenerator:
                 # For array constants, we treat them as runtime arguments
                 # identified by their object ID to ensure uniqueness.
                 name = f"const_arr_{id(node)}"
-                self.ir_sequence.append(LoadConstantArray(name=name))
+                self.ir_sequence.append(LoadConstantArray(name=name, shape=node.shape))
             return
 
         if isinstance(node, FacetNormal):

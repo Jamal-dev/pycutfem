@@ -81,3 +81,4 @@ class Store:
 class LoadConstantArray:
     """Instruction to load a constant array passed as a kernel argument."""
     name: str # A unique identifier for the constant array
+    shape: Tuple[int, ...] # Shape of the constant array

@@ -3,5 +3,4 @@ scipy
 sympy
 matplotlib
 legacy-quadpy
-xarray
 numba

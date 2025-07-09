@@ -3,7 +3,6 @@ import textwrap
 from dataclasses import dataclass, field
 
 from matplotlib.pylab import f
-from xarray import as_variable
 from .ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
@@ -121,7 +120,7 @@ class NumbaCodeGen:
                 # NumPy array inside the kernel for Numba compatibility.
                 np_array_var = new_var("const_np_arr")
                 body_lines.append(f"{np_array_var} = np.array({op.name}, dtype=np.float64)")
-                stack.append(StackItem(var_name=np_array_var, role='value', shape=(-1,), is_vector=True, field_names=[]))
+                stack.append(StackItem(var_name=np_array_var, role='value', shape=op.shape, is_vector=True, field_names=[]))
 
 
             # --- UNARY OPERATORS ---
@@ -189,8 +188,8 @@ class NumbaCodeGen:
                     body_lines.append("# Div(basis) → scalar basis (1,n_loc)")
 
                     body_lines += [
-                        f"n_loc  = {a.var_name}.shape[1]",
-                        f"n_vec  = {a.var_name}.shape[0]",     # components k
+                        f"n_loc  = {a.shape[1]}",  # number of local basis functions
+                        f"n_vec  = {a.shape[0]}",     # components k
                         f"{div_var} = np.zeros((1, n_loc), dtype=np.float64)",
                         f"for j in range(n_loc):",            # local basis index
                         f"    tmp = 0.0",
@@ -215,42 +214,27 @@ class NumbaCodeGen:
                 #     a.var_name shape: (k , d)
                 # ---------------------------------------------------------------
                 elif a.role == "value":
-                    body_lines.append("# Div(value)  – vector → scalar   or   tensor → vector")
+                    k_comp, n_dim = a.shape        # (k , d)   both known at code-gen time
 
-                    body_lines += [
-                        f"n_comp = {a.var_name}.shape[0]",    # number of components  (k)
-                        f"n_dim  = {a.var_name}.shape[1]",    # spatial dimension     (d)",
-
-                        # ---------------- vector field: k == d  → scalar
-                        f"if n_comp == n_dim:",
-                        f"    {div_var} = 0.0",
-                        f"    for k in range(n_dim):",
-                        f"        {div_var} += {a.var_name}[k, k]",
-
-                        # ---------------- tensor field: k != d  → vector (k,)
-                        f"else:",
-                        f"    {div_var} = np.zeros((n_comp,), dtype=np.float64)",
-                        f"    for k in range(n_comp):",
-                        f"        tmp = 0.0",
-                        f"        for d in range(n_dim):",
-                        f"            tmp += {a.var_name}[k, d]",
-                        f"        {div_var}[k] = tmp",
-                    ]
-
-                    # meta-data for the StackItem
-                    body_lines.append(f"_is_vec = n_comp != n_dim")
-                    body_lines.append(f"_shape  = () if not _is_vec else (n_comp,)")
-
-                    stack.append(
-                        StackItem(
-                            var_name    = div_var,
-                            role        = "value",
-                            shape       = () if a.shape[0] == a.shape[1] else (a.shape[1],),
-                            is_vector   = a.shape[1] != a.shape[0],
-                            is_gradient = False,
-                            field_names = a.field_names,
-                        )
-                    )
+                    if k_comp == n_dim:            # vector field → scalar
+                        body_lines.append("# Div(vector value) → scalar")
+                        body_lines.append(f"{div_var} = 0.0")
+                        for k in range(k_comp):
+                            body_lines.append(f"{div_var} += {a.var_name}[{k}, {k}]")
+                        stack.append(StackItem(var_name=div_var, role='value',
+                                            shape=(), is_vector=False, is_gradient=False,
+                                            field_names=a.field_names))
+                    else:                          # tensor field → vector (k,)
+                        body_lines.append("# Div(tensor value) → vector")
+                        body_lines.append(f"{div_var} = np.zeros(({k_comp},), dtype=np.float64)")
+                        for k in range(k_comp):
+                            body_lines.append(f"tmp = 0.0")
+                            for d in range(n_dim):
+                                body_lines.append(f"tmp += {a.var_name}[{k}, {d}]")
+                            body_lines.append(f"{div_var}[{k}] = tmp")
+                        stack.append(StackItem(var_name=div_var, role='value',
+                                            shape=(k_comp,), is_vector=True, is_gradient=False,
+                                            field_names=a.field_names))
 
                 # ---------------------------------------------------------------
                 # 3)  Anything else is not defined
@@ -283,9 +267,7 @@ class NumbaCodeGen:
                         body_lines.append(f'{res_var} = np.zeros(({a.shape[1]}, {b.shape[1]}))')
                         body_lines.append(f'for k in range({a.shape[0]}):')
                         # Use .copy() to ensure contiguous arrays and avoid performance warnings
-                        body_lines.append(f'    a_k = {a.var_name}[k].copy()')
-                        body_lines.append(f'    b_k = {b.var_name}[k].copy()')
-                        body_lines.append(f'    {res_var} += a_k @ b_k.T')
+                        body_lines.append(f'    {res_var} += {a.var_name}[k] @ {b.var_name}[k].T')
                     else:
                         body_lines.append(f'# Inner(Vec, Vec): mass matrix')
                         body_lines.append(f'{res_var} = {a.var_name}.T @ {b.var_name}')
@@ -302,14 +284,19 @@ class NumbaCodeGen:
                             f'for n in range(n_locs):',
                             f"    {res_var}[n] = np.sum({a.var_name} * {b.var_name}[:,n,:])"
                         ]
-                    elif a.is_vector and  b.is_vector:
+                    elif a.is_vector and b.is_vector:
                         body_lines.append(f'# RHS: Inner(Function, Test)')
                         # a is (k), b is (k,n) -> (n,)
+                        # New Newton: Optimized manual dot product loop
                         body_lines += [
-                            f'n_locs = {b.shape[1]}; n_vec_comps = {b.shape[0]};',
-                            f'{res_var} = np.zeros((n_locs))',
+                            f'n_locs = {b.shape[1]}',
+                            f'n_vec_comps = {b.shape[0]}',
+                            f'{res_var} = np.zeros(n_locs, dtype=np.float64)',
                             f'for n in range(n_locs):',
-                            f'    {res_var}[n] = np.dot({a.var_name}, {b.var_name}[:,n])'
+                            f'    local_sum = 0.0',
+                            f'    for k in range(n_vec_comps):',
+                            f'        local_sum += {a.var_name}[k] * {b.var_name}[k, n]',
+                            f'    {res_var}[n] = local_sum',
                         ]
                     else:
                         raise NotImplementedError(f"Inner not implemented for roles {a.role}/{b.role}")
@@ -342,7 +329,7 @@ class NumbaCodeGen:
                     body_lines.append(f"# Advection: dot(grad(Trial), Function)")
                     # body_lines.append(f"{res_var} = np.einsum('knd,d->kn', {a.var_name}, {b.var_name})")
                     body_lines += [
-                        f"n_vec_comps = {a.var_name}.shape[0];n_locs = {a.var_name}.shape[1];n_spatial_dim = {a.var_name}.shape[2];",
+                        f"n_vec_comps = {a.shape[0]};n_locs = {a.shape[1]};n_spatial_dim = {a.shape[2]};",
                         f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
                         f"for k in range(n_vec_comps):",
                         f"    {res_var}[k] = {b.var_name} @ {a.var_name}[k].T ",
@@ -355,7 +342,7 @@ class NumbaCodeGen:
                      body_lines.append(f"# Mass: dot(Trial, Test)")
                     #  body_lines.append(f"assert ({a.var_name}.shape == (2,22) and {b.var_name}.shape == (2,22)), 'Trial and Test to have the same shape'")
                      body_lines.append(f"{res_var} = {b.var_name}.T @ {a.var_name}")
-                     stack.append(StackItem(var_name=res_var, role='value', shape=(), is_vector=False, field_names=[]))
+                     stack.append(StackItem(var_name=res_var, role='value', shape=(b.shape[1],a.shape[1]), is_vector=False, field_names=[]))
                 
                 # ---------------------------------------------------------------------
                 # dot( grad(u_k) ,  u_trial )  ← convection term (Function gradient · Trial)
@@ -399,8 +386,8 @@ class NumbaCodeGen:
                 elif a.role == 'value' and a.is_vector and b.role == 'trial' and b.is_gradient:
                     body_lines.append("# dot(Function, grad(Trial))")
                     body_lines += [
-                        f"n_vec_comps = {b.var_name}.shape[0];",
-                        f"n_locs      = {b.var_name}.shape[1];",
+                        f"n_vec_comps = {b.shape[0]};",
+                        f"n_locs      = {b.shape[1]};",
                         f"{res_var}   = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
                         # einsum: f"{res_var} = np.einsum('d,kld->kl', {a.var_name}, {b.var_name})",
                         f"for k in range(n_vec_comps):",
@@ -418,7 +405,7 @@ class NumbaCodeGen:
                     body_lines.append("# Mass: dot(Test, Trial)")
                     body_lines.append(f"{res_var} = {a.var_name}.T @ {b.var_name}")
                     stack.append(StackItem(var_name=res_var, role='value',
-                                        shape=(), is_vector=False))
+                                        shape=(a.shape[1],b.shape[1]), is_vector=False))
 
                 
                 # ---------------------------------------------------------------------
@@ -456,7 +443,7 @@ class NumbaCodeGen:
                                         shape=( a.shape[0],), is_vector=True,
                                         is_gradient=False, field_names=[]))
                 # ---------------------------------------------------------------------
-                # dot( grad(u_k) ,  u_k )     ← e.g. rhs advection term
+                # dot( grad(u_k) ,  u_k )     ← e.g. rhs advection term  -> (k,d).(k) -> k
                 # ---------------------------------------------------------------------
                 elif a.role == 'value' and a.is_gradient and b.role == 'value' and b.is_vector:
                     body_lines.append("# RHS: dot(grad(Function), Function) (k,d).(k) -> k")
@@ -467,29 +454,34 @@ class NumbaCodeGen:
                                         shape=(a.shape[0], ), is_vector=True,
                                         is_gradient=False, field_names=[]))
                 # ---------------------------------------------------------------------
-                # dot( np.array ,  u_test )     ← e.g. body-force · test
+                # dot( np.array ,  u_test )     ← e.g. body-force · test -> (n,)
                 # ---------------------------------------------------------------------
                 elif a.role == 'const' and a.is_vector and b.role == 'test' and b.is_vector:
                     # a (k) and b (k,n)
                     body_lines.append("# Constant body-force: dot(const-vec, Test)")
+                    # New Newton: Optimized manual dot product loop
                     body_lines += [
-                        f"n_locs = {b.shape[1]}; n_vec_comps = {a.shape[0]};",
-                        f"{res_var} = np.zeros((n_locs), dtype=np.float64)",
+                        f"n_locs = {b.shape[1]}",
+                        f"n_vec_comps = {a.shape[0]}",
+                        f"{res_var} = np.zeros(n_locs, dtype=np.float64)",
                         f"for n in range(n_locs):",
-                        f"    {res_var}[n] = np.dot({a.var_name}, {b.var_name}[:,n])"
+                        f"    local_sum = 0.0",
+                        f"    for k in range(n_vec_comps):",
+                        f"        local_sum += {a.var_name}[k] * {b.var_name}[k, n]",
+                        f"    {res_var}[n] = local_sum",
                     ]
                     stack.append(StackItem(var_name=res_var, role='value',
-                                        shape=(), is_vector=False))
+                                        shape=(b.shape[1],), is_vector=False)
                 
                 # ---------------------------------------------------------------------
-                # dot( u_k ,  u_test )          ← load-vector term
+                # dot( u_k ,  u_test )          ← load-vector term -> (n,)
                 # ---------------------------------------------------------------------
                 elif a.role == 'value' and a.is_vector and b.role == 'test' and b.is_vector:
                     body_lines.append("# RHS: dot(Function, Test)")
                     # body_lines.append(f"print(f'a.shape: {{{a.var_name}.shape}}, b.shape: {{{b.var_name}.shape}}')")
                     body_lines.append(f"{res_var} = {b.var_name}.T @ {a.var_name}")
                     stack.append(StackItem(var_name=res_var, role='value',
-                                        shape=(), is_vector=False,is_gradient=False))
+                                        shape=(b.shape[1],), is_vector=False,is_gradient=False))
                 
                 else:
                     raise NotImplementedError(f"Dot not implemented for roles {a.role}/{b.role} with shapes {a.shape}/{b.shape} with vectoors {a.is_vector}/{b.is_vector} and gradients {a.is_gradient}/{b.is_gradient}")
@@ -510,18 +502,23 @@ class NumbaCodeGen:
                         and not a.is_vector and not b.is_vector 
                             and not a.is_gradient and not b.is_gradient):
                         body_lines.append("# Product: scalar * scalar/np.ndarry → scalar/np.ndarray")
-                        body_lines += [
-                            f"if np.isscalar({a.var_name}) and (np.isscalar({b.var_name}) or isinstance({b.var_name},np.ndarray)):",
-                            f"    {res_var} = {a.var_name} * {b.var_name}",
-                            f"elif np.isscalar({b.var_name}) and (np.isscalar({a.var_name}) or isinstance({a.var_name},np.ndarray)):",
-                            f"    {res_var} = {b.var_name} * {a.var_name}",
-                            f"else:",
-                            f"    raise ValueError(f'Both operands must be scalars for this operation. "
-                            f"Received: {a.var_name} ({{type({a.var_name})}}), {b.var_name} ({{type({b.var_name})}}) "
-                            f"and shapes {{getattr({a.var_name}, \"shape\", None)}}/{{getattr({b.var_name}, \"shape\", None)}}')"
+                        if a.shape == () and b.shape == ():
+                            # both are scalars
+                            body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}")
+                            shape = ()
+                        elif a.shape == () and b.shape != ():
+                            # a is scalar, b is vector/tensor
+                            body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}")
+                            shape = b.shape
+                        elif b.shape == () and a.shape != ():
+                            # b is scalar, a is vector/tensor
+                            body_lines.append(f"{res_var} = {b.var_name} * {a.var_name}")
+                            shape = a.shape
+                        else:
+                            # both are vectors/tensors, but not scalars
+                            raise ValueError(f"Cannot multiply two non-scalar values: {a.var_name} (shape: {a.shape}) and {b.var_name} (shape: {b.shape})")
 
-                        ]
-                        stack.append(StackItem(var_name=res_var, role='const', shape=(), is_vector=False, field_names=[]))
+                        stack.append(StackItem(var_name=res_var, role='const', shape=shape, is_vector=False, field_names=[]))
                         
                     # -----------------------------------------------------------------
                     # 01. Vector, Tensor:   scalar   *  Vector/Tensor    →  Vector/Tensor 
@@ -531,15 +528,15 @@ class NumbaCodeGen:
                           (not a.is_vector and not a.is_gradient)) :
                         body_lines.append("# Product: scalar * Vector/Tensor → Vector/Tensor")
                         # a is scalar, b is vector/tensor
-                        body_lines += [
-                            # f"print(f'a.shape: {{{a.var_name}.shape}}, b.shape: {{{b.var_name}.shape}}')",
-                            # f"print(f'a.role: {a.role}, b.role: {b.role}')",
-                            # f"print(f'a: {{{a.var_name}}}')",
-                            f"if np.isscalar({a.var_name}):",
-                            f"    {res_var} = {a.var_name} * {b.var_name}[0]" if b.role == 'test' else f"    {res_var} = {a.var_name} * {b.var_name}",
-                            f"else:",
-                            f"    raise ValueError('First operand must be a scalar for this operation.')",
-                        ]
+                        if a.shape == ():
+                            body_lines.append("# a is scalar, b is vector/tensor")
+                            if b.role == 'test':
+                                body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}[0]")  # b is vector/tensor, a is scalar
+                            else:
+                                body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}")
+                        else:
+                            raise ValueError(f"First operand must be a scalar for this operation, got {a.var_name} with shape {a.shape}.")
+                        
                         stack.append(StackItem(var_name=res_var, role=b.role,
                                             shape=b.shape, is_vector=b.is_vector,
                                             is_gradient=b.is_gradient,
@@ -551,15 +548,15 @@ class NumbaCodeGen:
                         (not b.is_vector and not b.is_gradient)):
                         body_lines.append("# Product: Vector/Tensor * scalar → Vector/Tensor")
                         # b is scalar, a is vector/tensor
-                        body_lines += [
-                            # f"print(f'a.shape: {{{a.var_name}.shape}}, b.shape: {{{b.var_name}.shape}}')",
-                            # f"print(f'a.role: {a.role}, b.role: {b.role}')",
-                            # f"print(f'b: {{{b.var_name}}}')",
-                            f"if np.isscalar({b.var_name}):",      
-                            f"    {res_var} = {b.var_name} * {a.var_name}[0]" if a.role == 'test' else f"    {res_var} = {b.var_name} * {a.var_name}",
-                            f"else:",
-                            f"    raise ValueError('Second operand must be a scalar for this operation.')",
-                        ]
+                        if b.shape == ():
+                            body_lines.append("# b is scalar, a is vector/tensor")
+                            if a.role == 'test':
+                                body_lines.append(f"{res_var} = {b.var_name} * {a.var_name}[0]")  # a is vector/tensor, b is scalar
+                            else:
+                                body_lines.append(f"{res_var} = {b.var_name} * {a.var_name}")
+                        else:   
+                            raise ValueError(f"Second operand must be a scalar for this operation, got {b.var_name} with shape {b.shape}.")
+                        
                         stack.append(StackItem(var_name=res_var, role=a.role,
                                             shape=a.shape, is_vector=a.is_vector,
                                             is_gradient=a.is_gradient,
@@ -584,7 +581,7 @@ class NumbaCodeGen:
                             f"{res_var} = {test_var.var_name}.T @ {trial_var.var_name}",  # (n_loc, n_loc)
                         ]
                         stack.append(StackItem(var_name=res_var, role='value',
-                                            shape=(), is_vector=False))
+                                            shape=(test_var.shape[1],trial_var.shape[0]), is_vector=False))
                     # -----------------------------------------------------------------
                     # 2. RHS load:   scalar / vector Function  *  scalar Test
                     #                (u_k or c)                ·  φ_v
@@ -596,7 +593,7 @@ class NumbaCodeGen:
 
                         body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}")   # (n_loc,)
                         stack.append(StackItem(var_name=res_var, role='value',
-                                            shape=(), is_vector=False))
+                                            shape=(b.shape[1],), is_vector=False))
 
                     # symmetric orientation
                     elif (a.role == "test" and not a.is_vector
@@ -605,7 +602,7 @@ class NumbaCodeGen:
 
                         body_lines.append(f"{res_var} = {b.var_name} * {a.var_name}")   # (n_loc,)
                         stack.append(StackItem(var_name=res_var, role='value',
-                                            shape=(), is_vector=False))
+                                            shape=(a.shape[1],), is_vector=False))
                     # -----------------------------------------------------------------
                     # 4. Anything else is ***not implemented yet*** – fail fast
                     # -----------------------------------------------------------------
@@ -620,33 +617,28 @@ class NumbaCodeGen:
                  # -------------  ADDITION / SUBTRACTION  (+  -)  ------------------
                  # -----------------------------------------------------------------
                  elif op.op_symbol in ('+', '-'):
-                    sym = op.op_symbol                    # '+' or '-'
+                    sym = op.op_symbol
                     body_lines.append(f"# {'Addition' if sym=='+' else 'Subtraction'}")
 
-                    # ---------- helper to choose the resulting role ----------------
-                    def _merge_role(ra: str, rb: str) -> str:
+                    def _merge_role(ra, rb):
                         if 'trial' in (ra, rb):  return 'trial'
                         if 'test'  in (ra, rb):  return 'test'
                         if 'value' in (ra, rb):  return 'value'
                         return 'const'
 
                     # ----------------------------------------------------------------
-                    # CASE A – broadcast with a *scalar* const/value on one side
+                    # CASE A – one operand is a true scalar () ➜ broadcast
                     # ----------------------------------------------------------------
                     scalar_left  = (a.shape == () and not a.is_vector and not a.is_gradient)
                     scalar_right = (b.shape == () and not b.is_vector and not b.is_gradient)
 
                     if scalar_left ^ scalar_right:
-                        # orient:  non_scalar  ±  scalar
-                        non_scal, scal   = (b, a) if scalar_left else (a, b)
-                        op_left,  op_rgt = (scal, non_scal) if scalar_left else (non_scal, scal)
-
-                        body_lines.append("# broadcast scalar with non-scalar")
-                        body_lines.append(f"{res_var} = {op_left.var_name} {sym} {op_rgt.var_name}")
-
+                        non_scal, scal = (b, a) if scalar_left else (a, b)
+                        body_lines.append("# scalar broadcast with non-scalar")
+                        body_lines.append(f"{res_var} = {non_scal.var_name} {sym} {scal.var_name}")
                         stack.append(StackItem(
                             var_name    = res_var,
-                            role        = non_scal.role,          # keep the structural role
+                            role        = non_scal.role,
                             shape       = non_scal.shape,
                             is_vector   = non_scal.is_vector,
                             is_gradient = non_scal.is_gradient,
@@ -654,26 +646,27 @@ class NumbaCodeGen:
                         ))
 
                     # ----------------------------------------------------------------
-                    # CASE B – identical shapes & flags  (original rule)
+                    # CASE B – both operands have the same vec/grad flags and the
+                    #          shapes are broadcast-compatible
                     # ----------------------------------------------------------------
-                    elif a.shape == b.shape and a.is_vector == b.is_vector and a.is_gradient == b.is_gradient:
-                        same_shape = a.shape == b.shape
-                        same_vec   = a.is_vector   == b.is_vector
-                        same_grad  = a.is_gradient == b.is_gradient
+                    elif a.is_vector == b.is_vector and a.is_gradient == b.is_gradient:
+                        try:
+                            new_shape = np.broadcast_shapes(a.shape, b.shape)
+                        except ValueError:
+                            raise NotImplementedError(
+                                f"'{sym}' cannot broadcast shapes {a.shape} and {b.shape}"
+                            )
 
-                        if same_shape and same_vec and same_grad:
-                            res_role = _merge_role(a.role, b.role)
-                            body_lines.append(f"{res_var} = {a.var_name} {sym} {b.var_name}")
-
-                            stack.append(StackItem(
-                                var_name    = res_var,
-                                role        = res_role,
-                                shape       = a.shape,
-                                is_vector   = a.is_vector,
-                                is_gradient = a.is_gradient,
-                                field_names = a.field_names if a.role in ('trial', 'test')
-                                                        else b.field_names
-                            ))
+                        body_lines.append("# element-wise op with NumPy broadcasting")
+                        body_lines.append(f"{res_var} = {a.var_name} {sym} {b.var_name}")
+                        stack.append(StackItem(
+                            var_name    = res_var,
+                            role        = _merge_role(a.role, b.role),
+                            shape       = new_shape,
+                            is_vector   = a.is_vector,
+                            is_gradient = a.is_gradient,
+                            field_names = a.field_names if a.role in ('trial','test') else b.field_names
+                        ))
                     else:
                         raise NotImplementedError(
                             f"'{sym}' not implemented for roles {a.role}/{b.role} "
@@ -681,6 +674,7 @@ class NumbaCodeGen:
                             f"or mismatched vector / gradient flags "
                             f"({a.is_vector},{b.is_vector}) – "
                             f"({a.is_gradient},{b.is_gradient})"
+                            f"names: {a.var_name}/{b.var_name}"
                         )
                  # -----------------------------------------------------------------
                  # ------------------  DIVISION  ( /  )  ---------------------------
@@ -688,13 +682,13 @@ class NumbaCodeGen:
                  elif op.op_symbol == '/':
                     body_lines.append("# Division")
                     # divide *anything* by a scalar constant (const in denominator)
-                    if (b.role == 'const' or b.role == 'value') and not b.is_vector and np.isscalar(b.shape):
+                    if (b.role == 'const' or b.role == 'value') and not b.is_vector and b.shape == ():
                         body_lines.append(f"{res_var} = {a.var_name} / float({b.var_name})")
                         stack.append(StackItem(var_name=res_var, role=a.role,
                                             shape=a.shape, is_vector=a.is_vector,
                                             is_gradient=a.is_gradient, field_names=a.field_names,
                                             parent_name=a.parent_name))
-                    elif (a.role == 'const' or a.role == 'value') and not a.is_vector and np.isscalar(a.shape):
+                    elif (a.role == 'const' or a.role == 'value') and not a.is_vector and a.shape == ():
                         body_lines.append(f"{res_var} = float({a.var_name}) / {b.var_name}")
                         stack.append(StackItem(var_name=res_var, role=b.role,
                                             shape=b.shape, is_vector=b.is_vector,
