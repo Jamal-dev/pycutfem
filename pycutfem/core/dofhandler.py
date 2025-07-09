@@ -358,9 +358,6 @@ class DofHandler:
             
         return data
 
-    # ------------------------------------------------------------------
-    #  NEW: Solver loop integration
-    # ------------------------------------------------------------------
     def add_to_functions(self, delta: np.ndarray, functions: List[Any]):
         """
         Distributes and adds a global delta vector to the nodal values of

@@ -22,6 +22,8 @@ from pycutfem.fem.mixedelement import MixedElement
 
 # --- NEW: High-performance backend imports ---
 from pycutfem.jit import compile_backend
+import scipy.sparse as sp
+
 
 # ============================================================================
 #    NEW: High-Performance Assembly Helper
@@ -53,7 +55,8 @@ def assemble_system_from_local(K_loc, F_loc, dof_handler, bcs):
         data[start:end] = K_loc[e].ravel()
         np.add.at(F, gdofs, F_loc[e])
 
-    K = sp_la.coo_matrix((data, (rows, cols)), shape=(n_total_dofs, n_total_dofs)).tocsr()
+    K = sp.coo_matrix((data, (rows, cols)), 
+                      shape=(n_total_dofs, n_total_dofs)).tocsr()
     
     # Apply Dirichlet boundary conditions
     if bcs:
@@ -132,21 +135,31 @@ def create_verification_plot(dof_handler, u_solution, reference_data):
 #    SETUP
 # ===============================================================================
 L, H = 1.0, 1.0
-NX, NY = 32, 32
+NX, NY = 64, 64
 nodes_q2, elems_q2, _, corners_q2 = structured_quad(L, H, nx=NX, ny=NY, poly_order=2)
 mesh_q2 = Mesh(nodes=nodes_q2, element_connectivity=elems_q2, elements_corner_nodes=corners_q2, element_type="quad", poly_order=2)
 mixed_element = MixedElement(mesh_q2, field_specs={'ux': 2, 'uy': 2, 'p': 1})
 dof_handler = DofHandler(mixed_element, method='cg')
 
-bc_tags = {'bottom_wall': lambda x,y: np.isclose(y,0), 'left_wall': lambda x,y: np.isclose(x,0), 'right_wall': lambda x,y: np.isclose(x,L), 'top_lid': lambda x,y: np.isclose(y,H)}
+bc_tags = {'bottom_wall': lambda x,y: np.isclose(y,0), 
+           'left_wall': lambda x,y: np.isclose(x,0), 
+           'right_wall': lambda x,y: np.isclose(x,L), 
+           'top_lid': lambda x,y: np.isclose(y,H)}
 mesh_q2.tag_boundary_edges(bc_tags)
 dof_handler.tag_dof_by_locator(tag='pressure_pin_point', field='p', locator=lambda x, y: np.isclose(x, 0.0) and np.isclose(y, 0.0), find_first=True)
 
 bcs = [
-    BoundaryCondition('ux', 'dirichlet', 'bottom_wall', lambda x,y: 0.0), BoundaryCondition('uy', 'dirichlet', 'bottom_wall', lambda x,y: 0.0),
-    BoundaryCondition('ux', 'dirichlet', 'left_wall',   lambda x,y: 0.0), BoundaryCondition('uy', 'dirichlet', 'left_wall',   lambda x,y: 0.0),
-    BoundaryCondition('ux', 'dirichlet', 'right_wall',  lambda x,y: 0.0), BoundaryCondition('uy', 'dirichlet', 'right_wall',  lambda x,y: 0.0),
-    BoundaryCondition('ux', 'dirichlet', 'top_lid',     lambda x,y: 1.0), BoundaryCondition('uy', 'dirichlet', 'top_lid',     lambda x,y: 0.0),
+    # No-slip on bottom, left, and right walls
+    BoundaryCondition('ux', 'dirichlet', 'bottom_wall', lambda x,y: 0.0),
+    BoundaryCondition('uy', 'dirichlet', 'bottom_wall', lambda x,y: 0.0),
+    BoundaryCondition('ux', 'dirichlet', 'left_wall',   lambda x,y: 0.0),
+    BoundaryCondition('uy', 'dirichlet', 'left_wall',   lambda x,y: 0.0),
+    BoundaryCondition('ux', 'dirichlet', 'right_wall',  lambda x,y: 0.0),
+    BoundaryCondition('uy', 'dirichlet', 'right_wall',  lambda x,y: 0.0),
+    # Moving lid on the top wall (ux=1, uy=0)
+    BoundaryCondition('ux', 'dirichlet', 'top_lid',     lambda x,y: 1.0),
+    BoundaryCondition('uy', 'dirichlet', 'top_lid',     lambda x,y: 0.0),
+    # Pin pressure at one point to ensure a unique solution
     BoundaryCondition('p', 'dirichlet', 'pressure_pin_point',lambda x,y: 0.0)
 ]
 bcs_homog = [BoundaryCondition(bc.field, bc.method, bc.domain_tag, lambda x,y: 0.0) for bc in bcs]
@@ -175,26 +188,64 @@ dof_handler.apply_bcs(bcs, u_n, p_n)
 # --- NEW: JIT Compile Forms ONCE Before the Loop ---
 print("\nJIT compiling Jacobian and Residual forms...")
 jacobian_form = (
-    rho * dot(du, v) / dt + theta * rho * dot(dot(grad(u_k), du), v) +
-    theta * rho * dot(dot(grad(du), u_k), v) + theta * mu * inner(grad(du), grad(v)) -
-    dp * div(v) + q * div(du)
+    rho * dot(du, v) / dt + 
+    theta * rho * dot(dot(grad(u_k), du), v) +
+    theta * rho * dot(dot(grad(du), u_k), v) + 
+    theta * mu * inner(grad(du), grad(v)) 
+    -dp * div(v) + q * div(du)
 ) * dx()
 
-residual_form = -(
-    rho * dot(u_k - u_n, v) / dt + theta * dot(rho * dot(grad(u_k), u_k), v) +
-    (1.0 - theta) * dot(rho * dot(grad(u_n), u_n), v) +
+residual_form = (
+    rho * dot(u_k - u_n, v) / dt 
+    + theta *rho * dot( dot(grad(u_k), u_k), v) +
+    (1.0 - theta) * rho * dot( dot(grad(u_n), u_n), v) +
     theta * mu * inner(grad(u_k), grad(v)) +
-    (1.0 - theta) * mu * inner(grad(u_n), grad(v)) -
-    p_k * div(v) + q * div(u_k)
+    (1.0 - theta) * mu * inner(grad(u_n), grad(v)) 
+    -p_k * div(v) + q * div(u_k)
 ) * dx()
 
 # The compile step returns high-performance runner objects
-jacobian_runner, jacobian_ir = compile_backend(jacobian_form, dof_handler, mixed_element)
-residual_runner, residual_ir = compile_backend(residual_form, dof_handler, mixed_element)
+jacobian_runner, jacobian_ir = compile_backend(jacobian_form, dof_handler=dof_handler, mixed_element= mixed_element)
+residual_runner, residual_ir = compile_backend(residual_form, dof_handler=dof_handler, mixed_element= mixed_element)
 
 # --- NEW: Precompute Geometric Factors ONCE ---
 print("Precomputing geometric factors...")
-static_kernel_args = dof_handler.precompute_geometric_factors(quad_order=6)
+quad_order = 6                                   # keep this consistent
+
+# A) geometry (what you already had)
+static_kernel_args = dof_handler.precompute_geometric_factors(quad_order)
+
+# B) mesh / DOF information
+mesh = mixed_element.mesh
+static_kernel_args["gdofs_map"] = np.vstack(
+    [dof_handler.get_elemental_dofs(e) for e in range(mesh.n_elements)]
+).astype(np.int32)
+static_kernel_args["node_coords"] = dof_handler.get_all_dof_coords()
+
+# C) basis / gradient tables – once for each kernel, then take the union
+from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
+
+basis_jac = _build_jit_kernel_args(
+    jacobian_ir,               # returned by compile_backend
+    jacobian_form.integrand,   # UFL integrand
+    mixed_element,
+    quad_order,
+    dof_handler,
+    param_order=jacobian_runner.param_order,
+)
+basis_res = _build_jit_kernel_args(
+    residual_ir,
+    residual_form.integrand,
+    mixed_element,
+    quad_order,
+    dof_handler,
+    param_order=residual_runner.param_order,
+)
+
+static_kernel_args.update(basis_jac)
+static_kernel_args.update(basis_res)   # union – safe, no duplicates
+static_kernel_args = {k: v for k, v in static_kernel_args.items()
+                      if not (k.startswith("u_") and k.endswith("_loc"))}
 
 # --- Main Time-Stepping Loop (to reach steady state) ---
 for n in range(max_timesteps):
@@ -228,7 +279,7 @@ for n in range(max_timesteps):
             print(f"    Newton solver time: {newton_end_time - newton_start_time:.4f} seconds.")
             break
         
-        delta_U = sp_la.spsolve(A, R_vec)
+        delta_U = sp_la.spsolve(A, -R_vec)
         dof_handler.add_to_functions(delta_U, [u_k, p_k])
         dof_handler.apply_bcs(bcs, u_k, p_k)
     else:
@@ -265,6 +316,14 @@ plt.close()
 
 u_n.plot(field='uy', title='V-Velocity (uy) at Steady State (Re=100)', levels=20, cmap='viridis')
 plt.savefig(os.path.join(output_dir, "steady_state_velocity_uy.png"), dpi=300)
+plt.close()
+
+u_n.plot(kind="streamline",
+         density=2.0,
+         linewidth=0.8,
+         cmap="plasma",
+         title="Lid-driven cavity – stream-lines",background = True)
+plt.savefig(os.path.join(output_dir, "steady_state_streamlines.png"), dpi=300)
 plt.close()
 
 p_n.plot(title='Pressure (p) at Steady State (Re=100)', levels=20, cmap='viridis')

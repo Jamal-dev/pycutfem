@@ -77,14 +77,21 @@ class IRGenerator:
         if isinstance(node, (Function)):
             is_vec = False
             role = 'function'
-            name = node.space.name if hasattr(node, 'space') else node.field_name
+            name = node.space.name if hasattr(node, 'space') else node.name
             # Pass the component field names into the IR node
             self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=[node.field_name]))
             return
-
-        if isinstance(node, (VectorTestFunction, VectorTrialFunction, VectorFunction)):
+        if isinstance(node, (VectorFunction)):
             is_vec = True
-            role = 'test' if node.is_test else 'trial' if node.is_trial else 'function'
+            role = 'function'
+            name = node.space.name if hasattr(node, 'space') else node.name
+            # Pass the component field names into the IR node
+            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=node.field_names))
+            return
+
+        if isinstance(node, (VectorTestFunction, VectorTrialFunction)):
+            is_vec = True
+            role = 'test' if node.is_test else 'trial' 
             name = node.space.name if hasattr(node, 'space') else node.name
             # Pass the component field names into the IR node
             self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=node.field_names))

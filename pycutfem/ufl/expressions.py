@@ -315,6 +315,8 @@ class VectorFunction(Expression):
                 comp.plot(**comp_kwargs)
         elif kind == 'quiver':
             self._plot_quiver(**kwargs)
+        elif kind == 'streamlines' or kind == 'streamline':
+            self._plot_streamlines(**kwargs)
         else:
             raise ValueError(f"Unsupported plot kind '{kind}'. Choose 'contour' or 'quiver'.")
 
@@ -389,6 +391,100 @@ class VectorFunction(Expression):
         dy = np.ptp(y)    # instead of y.ptp()
         ax.set_xlim(x.min() - 0.05 * dx, x.max() + 0.05 * dx)
         ax.set_ylim(y.min() - 0.05 * dy, y.max() + 0.05 * dy)
+        plt.show()
+    
+    # ------------------------------------------------------------------
+    # NEW: stream-line plot
+    # ------------------------------------------------------------------
+    def _plot_streamlines(
+            self, *,
+            grid: int = 200,           # samples per axis for interpolation grid
+            density: float = 1.3,      # passed straight to plt.streamplot
+            linewidth: float = 1.0,
+            cmap: str = "turbo",
+            background: bool | str = "magnitude",
+            **kwargs):
+        """
+        Draw stream-lines of the 2-D vector field.
+
+        Parameters
+        ----------
+        grid        : int
+            Resolution of the regular (x,y) grid to which the nodal values are
+            interpolated (default 200×200).
+        density     : float
+            Stream-line density parameter as in ``plt.streamplot``.
+        linewidth   : float
+            Line width for the stream-lines.
+        cmap        : str
+            Colour map for line colouring by |u|.
+        background  : see ``_plot_quiver`` – allows a filled contour behind
+            the stream-lines; use ``False`` for none.
+        **kwargs    :
+            Extra keyword args go to ``ax.streamplot`` (e.g. arrowsize=1.5).
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.tri import LinearTriInterpolator
+
+        if self._dof_handler is None or len(self.field_names) != 2:
+            raise RuntimeError("Stream-line plot needs a 2-D VectorFunction attached to a DofHandler.")
+
+        fld_u, fld_v = self.field_names
+        dh   = self._dof_handler
+        mesh = dh.fe_map[fld_u]
+
+        # 1. nodal coordinates and values (exactly as in quiver)
+        coords = dh.get_dof_coords(fld_u)
+        x, y   = coords[:, 0], coords[:, 1]
+        u_vals = self.components[0].nodal_values
+        v_vals = self.components[1].nodal_values
+
+        # 2. interpolate to a regular grid so that streamplot can integrate
+        tri      = triangulate_field(mesh, dh, fld_u)            # existing helper
+        interp_u = LinearTriInterpolator(tri, u_vals)
+        interp_v = LinearTriInterpolator(tri, v_vals)
+
+        xi = np.linspace(x.min(), x.max(), grid)
+        yi = np.linspace(y.min(), y.max(), grid)
+        X, Y = np.meshgrid(xi, yi)
+        U = interp_u(X, Y)
+        V = interp_v(X, Y)
+
+        # mask out triangles lying outside the domain (Finite-Element holes)
+        mask = np.isnan(U) | np.isnan(V)
+        U[mask] = 0.0; V[mask] = 0.0
+
+        # 3. plotting ---------------------------------------------------
+        fig, ax = plt.subplots(figsize=(8, 8))
+        title     = kwargs.pop("title", f"Stream-lines: {self.name}") 
+        # optional background colour wash
+        if background:
+            if background is True or background == "magnitude":
+                scalar, label = np.hypot(u_vals, v_vals), "|u|"
+            else:
+                comp = next((c for c in self.components if c.field_name == background), None)
+                if comp is None:
+                    raise ValueError(f"background='{background}' not a component.")
+                scalar, label = comp.nodal_values, background
+            tri_obj = triangulate_field(mesh, dh, fld_u)
+            tcf = ax.tricontourf(tri_obj, scalar, levels=20, cmap=cmap, alpha=0.8)
+            fig.colorbar(tcf, ax=ax, label=label)
+
+        # stream-lines coloured by speed
+        speed = np.hypot(U, V)
+        strm = ax.streamplot(
+            X, Y, U, V,
+            density=density,
+            linewidth=linewidth,
+            color=speed,
+            cmap=cmap,
+            **kwargs
+        )
+        fig.colorbar(strm.lines, ax=ax, label="|u|")
+
+        ax.set_title(title)
+        ax.set_xlabel("x"); ax.set_ylabel("y")
+        ax.set_aspect("equal", adjustable="box")
         plt.show()
 
     

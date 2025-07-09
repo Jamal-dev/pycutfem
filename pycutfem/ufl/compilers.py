@@ -815,7 +815,7 @@ class FormCompiler:
         # ------------------------------------------------------------------
         q_order = self._find_q_order(integral)
 
-        cache_key = (q_order, runner.param_order)   # hashable & unique enough
+        cache_key = (q_order, tuple(runner.param_order))   # hashable & unique enough
         if not hasattr(self, "_jit_static_cache"):
             self._jit_static_cache = {}
         if cache_key not in self._jit_static_cache:

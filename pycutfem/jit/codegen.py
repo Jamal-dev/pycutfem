@@ -9,6 +9,8 @@ from .ir import (
     BinaryOp, Inner, Dot, Store
 )
 import numpy as np
+def dotc(a, b):
+    return np.ascontiguousarray(a) @ np.ascontiguousarray(b)
 
 # Numba is imported inside the generated kernel string
 # import numba
@@ -86,7 +88,7 @@ class NumbaCodeGen:
                 if operand.role in ('test', 'trial'):
                     if not operand.is_vector:
                         var_name = new_var("basis_reshaped")
-                        body_lines.append(f"{var_name} = {basis_vars[0]}[np.newaxis, :]")
+                        body_lines.append(f"{var_name} = {basis_vars[0]}[np.newaxis, :].copy()")
                         shape = (1, self.n_dofs_local)
                     else:
                         var_name = new_var("basis_stack")
@@ -267,10 +269,10 @@ class NumbaCodeGen:
                         body_lines.append(f'{res_var} = np.zeros(({a.shape[1]}, {b.shape[1]}))')
                         body_lines.append(f'for k in range({a.shape[0]}):')
                         # Use .copy() to ensure contiguous arrays and avoid performance warnings
-                        body_lines.append(f'    {res_var} += {a.var_name}[k] @ {b.var_name}[k].T')
+                        body_lines.append(f'    {res_var} += {a.var_name}[k] @ {b.var_name}[k].T.copy()')
                     else:
                         body_lines.append(f'# Inner(Vec, Vec): mass matrix')
-                        body_lines.append(f'{res_var} = {a.var_name}.T @ {b.var_name}')
+                        body_lines.append(f'{res_var} = {a.var_name}.T.copy() @ {b.var_name}')
                 elif a.role == 'value' and b.role == 'test': # RHS
                     body_lines.append(f'# RHS: Inner(Function, Test)')
                     # a is (k,d) , b is (k,n,d), 
@@ -310,7 +312,7 @@ class NumbaCodeGen:
                         body_lines += [
                             f'# Inner(Grad(Value), Grad(Value)): stiffness matrix',
                             f'# (k,d) @ (k,d) -> (k,k)',
-                            f'{res_var} = {a.var_name} @ {b.var_name}.T',]
+                            f'{res_var} = {a.var_name} @ {b.var_name}.T.copy()',]
                 
                 else:
                     raise NotImplementedError(f"JIT Inner not implemented for roles {a.role}/{b.role}")
@@ -332,7 +334,7 @@ class NumbaCodeGen:
                         f"n_vec_comps = {a.shape[0]};n_locs = {a.shape[1]};n_spatial_dim = {a.shape[2]};",
                         f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
                         f"for k in range(n_vec_comps):",
-                        f"    {res_var}[k] = {b.var_name} @ {a.var_name}[k].T ",
+                        f"    {res_var}[k] = {b.var_name} @ {a.var_name}[k].T.copy() ",
                         # f"assert {res_var}.shape == (2, 22), f'result shape mismatch {res_var}.shape with {{(n_vec_comps, n_locs)}}'"
                     ]
                     stack.append(StackItem(var_name=res_var, role='trial', shape=(a.shape[0], a.shape[1]), is_vector=True, is_gradient=False, field_names=a.field_names, parent_name=a.parent_name))
@@ -341,7 +343,7 @@ class NumbaCodeGen:
                 elif a.role == 'trial' and a.is_vector and b.role == 'test' and b.is_vector:
                      body_lines.append(f"# Mass: dot(Trial, Test)")
                     #  body_lines.append(f"assert ({a.var_name}.shape == (2,22) and {b.var_name}.shape == (2,22)), 'Trial and Test to have the same shape'")
-                     body_lines.append(f"{res_var} = {b.var_name}.T @ {a.var_name}")
+                     body_lines.append(f"{res_var} = {b.var_name}.T.copy() @ {a.var_name}")
                      stack.append(StackItem(var_name=res_var, role='value', shape=(b.shape[1],a.shape[1]), is_vector=False, field_names=[]))
                 
                 # ---------------------------------------------------------------------
@@ -391,7 +393,7 @@ class NumbaCodeGen:
                         f"{res_var}   = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
                         # einsum: f"{res_var} = np.einsum('d,kld->kl', {a.var_name}, {b.var_name})",
                         f"for k in range(n_vec_comps):",
-                        f"    {res_var}[k] = {a.var_name} @ {b.var_name}[k].T",
+                        f"    {res_var}[k] = {a.var_name} @ {b.var_name}[k].T.copy()",
                     ]
                     stack.append(StackItem(var_name=res_var, role='trial',
                                         shape=(b.shape[0], b.shape[1]), is_vector=True,
@@ -403,7 +405,7 @@ class NumbaCodeGen:
                 # ---------------------------------------------------------------------
                 elif a.role == 'test' and a.is_vector and b.role == 'trial' and b.is_vector:
                     body_lines.append("# Mass: dot(Test, Trial)")
-                    body_lines.append(f"{res_var} = {a.var_name}.T @ {b.var_name}")
+                    body_lines.append(f"{res_var} = {a.var_name}.T.copy() @ {b.var_name}")
                     stack.append(StackItem(var_name=res_var, role='value',
                                         shape=(a.shape[1],b.shape[1]), is_vector=False))
 
@@ -479,7 +481,7 @@ class NumbaCodeGen:
                 elif a.role == 'value' and a.is_vector and b.role == 'test' and b.is_vector:
                     body_lines.append("# RHS: dot(Function, Test)")
                     # body_lines.append(f"print(f'a.shape: {{{a.var_name}.shape}}, b.shape: {{{b.var_name}.shape}}')")
-                    body_lines.append(f"{res_var} = {b.var_name}.T @ {a.var_name}")
+                    body_lines.append(f"{res_var} = {b.var_name}.T.copy() @ {a.var_name}")
                     stack.append(StackItem(var_name=res_var, role='value',
                                         shape=(b.shape[1],), is_vector=False,is_gradient=False))
                 
@@ -578,7 +580,7 @@ class NumbaCodeGen:
                         trial_var = b if a.role == "test"  else a
 
                         body_lines += [
-                            f"{res_var} = {test_var.var_name}.T @ {trial_var.var_name}",  # (n_loc, n_loc)
+                            f"{res_var} = {test_var.var_name}.T.copy() @ {trial_var.var_name}",  # (n_loc, n_loc)
                         ]
                         stack.append(StackItem(var_name=res_var, role='value',
                                             shape=(test_var.shape[1],trial_var.shape[0]), is_vector=False))
