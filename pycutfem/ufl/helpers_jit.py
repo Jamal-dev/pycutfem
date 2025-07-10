@@ -48,9 +48,10 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
 
     from pycutfem.integration import volume
     from pycutfem.ufl.expressions import (
-        Function, VectorFunction, Constant as UflConst, Grad
+        Function, VectorFunction, Constant as UflConst, Grad, ElementWiseConstant
     )
-    from pycutfem.jit.ir import LoadVariable, LoadConstantArray
+    from pycutfem.jit.ir import LoadVariable, LoadConstantArray, LoadElementWiseConstant
+    from pycutfem.ufl.analytic import Analytic
     from pycutfem.ufl.compilers import _find_all
 
     logger = logging.getLogger(__name__)
@@ -195,6 +196,32 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         # ---- constant arrays ---------------------------------------------
         elif name in const_arrays:
             args[name] = const_arrays[name].value
+        
+        # ---- element-wise constants ---------------------------------------------
+        elif name.startswith("ewc_"):
+            obj_id = int(name.split("_", 1)[1])
+            ewc = next(c for c in _find_all(expression, ElementWiseConstant)
+                    if id(c) == obj_id)
+            args[name] = np.asarray(ewc.values, dtype=np.float64)
+        
+        # ---- analytic expressions ------------------------------------------------
+        elif name.startswith("ana_"):
+            func_id = int(name.split("_", 1)[1])
+            ana = next(a for a in _find_all(expression, Analytic)
+                    if id(a) == func_id)
+
+            # physical quadrature coordinates have already been built a few lines
+            # earlier and live in args["qp_phys"]  (shape = n_elem × n_qp × 2)
+            qp_phys = args["qp_phys"]
+            n_elem, n_qp, _ = qp_phys.shape
+            ana_vals = np.empty((n_elem, n_qp), dtype=np.float64)
+
+            # tabulate once, in pure NumPy
+            x = qp_phys[..., 0]
+            y = qp_phys[..., 1]
+            ana_vals[:] = ana.eval(np.stack((x, y), axis=-1))   # vectorised call
+
+            args[name] = ana_vals
 
         else:
             logger.warning(

@@ -111,16 +111,14 @@ class IRGenerator:
             self.ir_sequence.append(LoadFacetNormal())
             return
         
-        if isinstance(node, ElementWiseConstant):
-            # We need a way to uniquely identify this constant array.
-            # Using its object ID is a robust way to do this.
+        elif isinstance(node, ElementWiseConstant):
             name = f"ewc_{id(node)}"
-            self.ir_sequence.append(LoadElementWiseConstant(name=name))
+            self.ir_sequence.append(
+                LoadElementWiseConstant(name=name,
+                                        tensor_shape=node.tensor_shape)   # NEW
+            )
             return
 
-        if isinstance(node, Analytic):
-            self.ir_sequence.append(LoadAnalytic(func_id=id(node.func), func_ref=node.func))
-            return
 
         # --- Unary Operators ---
         if isinstance(node, UflGrad):
@@ -188,6 +186,10 @@ class IRGenerator:
             self._visit(node.u_pos)
             self._visit(node.u_neg)
             self.ir_sequence.append(BinaryOp(op_symbol='-'))
+            return
+        elif isinstance(node, Analytic):
+            uid = f"ana_{id(node)}"
+            self.ir_sequence.append(LoadAnalytic(func_id=id(node), func_ref=node.eval))
             return
 
         raise TypeError(f"UFL expression node '{type(node).__name__}' is not supported by the JIT compiler.")

@@ -22,6 +22,7 @@ class LoadConstant:
 class LoadElementWiseConstant:
     """Instruction to load a value from a per-element data array."""
     name: str          # An identifier for the data array
+    tensor_shape: tuple[int, ...] = field(default=())
 
 @dataclass(frozen=True, slots=True)
 class LoadAnalytic:

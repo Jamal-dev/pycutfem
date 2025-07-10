@@ -67,8 +67,31 @@ class NumbaCodeGen:
 
         # --- Main IR processing loop ---
         for op in ir_sequence:
+
+            if isinstance(op, LoadElementWiseConstant):
+                # the full (n_elem, …) array is passed as a kernel argument
+                required_args.add(op.name)                 # kernel argument
+                var_name = new_var("ewc")
+                body_lines.append(f"{var_name} = {op.name}[e]")
+
+                is_vec = len(op.tensor_shape) == 1
+                stack.append(
+                    StackItem(var_name=var_name,
+                            role='value',
+                            shape=op.tensor_shape,       # real shape, not ()
+                            is_vector=is_vec)
+                )
+            # --- analytic (pre-tabulated) ---------------------------------------------
+            elif isinstance(op, LoadAnalytic):
+                param = f"ana_{op.func_id}"                # unique name in PARAM_ORDER
+                required_args.add(param)
+                var_name = new_var("ana")
+                body_lines.append(f"{var_name} = {param}[e, q]")
+                stack.append(StackItem(var_name=var_name,
+                                    role='const',
+                                    shape=(), is_vector=False))
             # --- LOAD OPERATIONS ---
-            if isinstance(op, LoadVariable):
+            elif isinstance(op, LoadVariable):
                 # This handles both simple variables and UFL Derivatives,
                 # which the visitor translates to a LoadVariable with a deriv_order.
                 operand = op
@@ -725,7 +748,7 @@ class NumbaCodeGen:
             body_lines: list,
             required_args: set,
             solution_func_names: set
-            , DEBUG: bool = False
+            , DEBUG: bool = True
         ):
         """
         Build complete kernel source code with parallel assembly.

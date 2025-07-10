@@ -622,6 +622,11 @@ class ElementWiseConstant(Expression):
             raise ValueError("Provide one value **per element**, not a single scalar.")
         self.tensor_shape = self.values.shape[1:]   # () for scalars
 
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Return the tensor shape (empty tuple for scalars)."""
+        return self.tensor_shape
+
     # Handy helper – compiler calls this through the visitor method below
     def value_on_element(self, eid: int):
         return self.values[eid]

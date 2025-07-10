@@ -6,7 +6,6 @@
 #
 # PyTest discovers this file automatically.
 
-from networkx import edge_connectivity
 import numpy as np
 import pytest
 
