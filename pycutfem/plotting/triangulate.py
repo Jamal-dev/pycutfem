@@ -56,3 +56,46 @@ def triangulate_field(mesh, dof_handler, field: str, *, strict: bool = False) ->
         return mtri.Triangulation(x, y)
 
     return mtri.Triangulation(x, y, np.asarray(tris, dtype=int))
+
+
+def _extract_profile_1d(field_name: str,
+                        dof_handler,
+                        values: np.ndarray,
+                        *,
+                        line_axis: str,
+                        line_pos: float,
+                        atol: float = 1e-10):
+    """
+    Collect <values> of a scalar field along either
+        - the vertical   line x = line_pos   (line_axis='x'),  or
+        - the horizontal line y = line_pos   (line_axis='y').
+
+    Repeated coordinates (may happen with high-order elements) are
+    grouped and averaged so the returned arrays contain unique, sorted
+    locations and one value per location.
+    """
+    # 1. coordinates of *all* DOFs of this field
+    coords = dof_handler.get_dof_coords(field_name)        # shape (n_dofs,2)
+
+    if line_axis.lower() == "x":         # vertical centre-line
+        mask = np.isclose(coords[:, 0], line_pos, atol=atol)
+        line_coord = coords[mask, 1]     # y-coordinates
+    elif line_axis.lower() == "y":       # horizontal centre-line
+        mask = np.isclose(coords[:, 1], line_pos, atol=atol)
+        line_coord = coords[mask, 0]     # x-coordinates
+    else:
+        raise ValueError("line_axis must be 'x' or 'y'.")
+
+    vals_on_line = values[mask]
+
+    # 2. group (coord,value) pairs that are numerically identical
+    #    → one representative per coordinate
+    unique_map = {}          # coord -> list of values
+    for c, v in zip(line_coord, vals_on_line):
+        key = float(f"{c:.12f}")         # round to 1e-12 for stability
+        unique_map.setdefault(key, []).append(v)
+
+    sorted_items = sorted(unique_map.items())      # sort by coord
+    coords_out = np.array([k for k, _ in sorted_items])
+    vals_out   = np.array([np.mean(vs) for _, vs in sorted_items])
+    return coords_out, vals_out

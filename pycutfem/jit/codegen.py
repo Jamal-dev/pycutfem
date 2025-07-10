@@ -139,12 +139,12 @@ class NumbaCodeGen:
                     phys_grad_vars = []
                     for i, fname in enumerate(a.field_names):
                         phys_grad_var = new_var(f"phys_grad_{fname}")
-                        body_lines.append(f"{phys_grad_var} = {grad_basis_vars[i]} @ J_inv_q.transpose()")
+                        body_lines.append(f"{phys_grad_var} = {grad_basis_vars[i]} @ J_inv_q.transpose().copy()")
                         phys_grad_vars.append(phys_grad_var)
                     
                     if not a.is_vector:
                         var_name = new_var("grad_reshaped")
-                        body_lines.append(f"{var_name} = {phys_grad_vars[0]}[np.newaxis, :, :]")
+                        body_lines.append(f"{var_name} = {phys_grad_vars[0]}[np.newaxis, :, :].copy()")
                         shape = (1, self.n_dofs_local, self.spatial_dim)
                     else:
                         var_name = new_var("grad_stack")
@@ -157,10 +157,10 @@ class NumbaCodeGen:
                     grad_val_comps = []
                     for i, fname in enumerate(a.field_names):
                         phys_grad_basis = new_var(f"phys_grad_basis_{fname}")
-                        body_lines.append(f"{phys_grad_basis} = {grad_basis_vars[i]} @ J_inv_q.transpose()")
+                        body_lines.append(f"{phys_grad_basis} = {grad_basis_vars[i]} @ J_inv_q.transpose().copy()")
                         grad_val_comp = new_var(f"grad_val_{fname}")
                         # Use the parent name to get the correct coefficient array
-                        body_lines.append(f"{grad_val_comp} = {phys_grad_basis}.T @ u_{a.parent_name}_loc")
+                        body_lines.append(f"{grad_val_comp} = {phys_grad_basis}.T.copy() @ u_{a.parent_name}_loc")
                         grad_val_comps.append(grad_val_comp)
                     
                     if not a.is_vector:
@@ -284,7 +284,7 @@ class NumbaCodeGen:
                             # f'print(f"a.shape: {{{a.var_name}.shape}}, b.shape: {{{b.var_name}.shape}}")',
                             f'{res_var} = np.zeros((n_locs))',
                             f'for n in range(n_locs):',
-                            f"    {res_var}[n] = np.sum({a.var_name} * {b.var_name}[:,n,:])"
+                            f"    {res_var}[n] = np.sum({a.var_name} * {b.var_name}[:,n,:].copy())"
                         ]
                     elif a.is_vector and b.is_vector:
                         body_lines.append(f'# RHS: Inner(Function, Test)')
