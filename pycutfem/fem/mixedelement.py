@@ -66,6 +66,7 @@ class MixedElement:
         self._n_basis: Dict[str,int] = {f: (p+1)**2 if mesh.element_type=='quad'
                                           else (p+1)*(p+2)//2
                                         for f,p in self._field_orders.items()}
+        # print(f"number of basis functions per field: {self._n_basis}")
         for name in self.field_names:
             ref = get_reference(mesh.element_type, self._field_orders[name])
             self._ref[name] = ref
@@ -89,6 +90,7 @@ class MixedElement:
             self._field_of += [f]*self._n_basis[f]       # 0..8  9..17 18..21
 
         self.n_dofs_per_elem = len(self._field_of)
+        # print(f"Dofs per element: {self.n_dofs_per_elem} (fields: {self.field_names})")
         # Debug
         # print(f"MixedElement created with {self.n_dofs_per_elem} local DOFs "
         #       f"({self.field_names}) for {mesh.element_type} elements of order "
@@ -178,6 +180,18 @@ class MixedElement:
             raise KeyError(f"Unsupported element_type '{self.mesh.element_type}'")
         return np.arange(len(coords), dtype=int)
 
+    def signature(self) -> tuple:
+        """
+        A hashable identifier that changes as soon as *anything* relevant for the
+        element-local layout changes (geometry type, mesh order, per-field order,
+        or the resulting local DOF count).  Safe to use as part of a JIT cache key.
+        """
+        field_info = tuple(sorted(self._field_orders.items()))    # (('p',1),('ux',2),('uy',2))
+        return (self.mesh.element_type,            # 'quad' / 'tri'
+                self.mesh.poly_order,              # geometry order
+                field_info,                        # heterogeneous field orders
+                self.n_dofs_local)                 # 22, 18, 8, ...
+    
     # ..................................................................
     def __repr__(self) -> str:  # pragma: no cover – debug aide
         orders = ", ".join(f"{k}:p{self._field_orders[k]}" for k in self.field_names)

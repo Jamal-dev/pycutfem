@@ -75,8 +75,8 @@ class Dot:
 @dataclass(frozen=True, slots =True)
 class Store:
     """Instruction to store the final result to an accumulator."""
-    dest_name: str     # Name of the destination ('Ke' for matrix, 'Fe' for vector)
-    store_type: str    # 'vector', 'matrix'
+    dest_name: str     # Name of the destination ('Ke' for matrix, 'Fe' for vector) or **'Je'**
+    store_type: str    # 'vector', 'matrix' or 'functional'
 
 @dataclass(frozen=True, slots =True)
 class LoadConstantArray:

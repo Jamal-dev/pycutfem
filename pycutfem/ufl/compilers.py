@@ -833,7 +833,8 @@ class FormCompiler:
             basis_args = _build_jit_kernel_args(
                 ir, integral.integrand, self.me, q_order,
                 dof_handler=self.dh,
-                param_order=runner.param_order
+                param_order=runner.param_order,
+                pre_built= geo_args
             )
 
             static_args = {
@@ -857,10 +858,22 @@ class FormCompiler:
         # ------------------------------------------------------------------
         # 4. Execute the kernel via the runner
         # ------------------------------------------------------------------
-        K_loc, F_loc = runner(current_funcs, static_args)
+        K_loc, F_loc, J_loc = runner(current_funcs, static_args)
         if dbg:
             print(f"[Assembler] kernel returned  K_loc {K_loc.shape}  "
                   f"F_loc {F_loc.shape}")
+
+        # ------------------------------------------------------------------
+        # 5.  Pure scalar functional  → never touches the global system
+        # ------------------------------------------------------------------
+        trial, test = _trial_test(integral.integrand)
+        hook        = self.ctx["hooks"].get(type(integral.integrand))
+        if trial is None and test is None:           # functional (hooked or not)
+            if hook:                                 # accumulate if requested
+                name = hook["name"]
+                self.ctx.setdefault("scalar_results", {})[name] = 0.0
+                self.ctx["scalar_results"][name] += J_loc.sum()
+            return  
 
         # ------------------------------------------------------------------
         # 5. Scatter element contributions to the global system
@@ -892,6 +905,7 @@ class FormCompiler:
                 shape=(self.dh.total_dofs, self.dh.total_dofs)
             )
             matvec += K_coo.tocsr()
+
 
 
     def _assemble_volume_python(self, integral: Integral, matvec):

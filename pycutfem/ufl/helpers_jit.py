@@ -25,7 +25,8 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         mixed_element,            # MixedElement instance
         q_order: int,             # quadrature order
         dof_handler,              # DofHandler – *needed* for padding
-        param_order=None          # order of parameters in the JIT kernel
+        param_order=None,          # order of parameters in the JIT kernel
+        pre_built: dict | None = None
     ):
     """
     Return a **dict { name -> ndarray }** with *all* reference-space tables
@@ -137,11 +138,15 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     # ------------------------------------------------------------------
     # 4. Build each requested array (skip ones already delivered elsewhere)
     # ------------------------------------------------------------------
-    pre_built = {
-        "gdofs_map", "node_coords", "element_nodes",
-        "qp_phys", "qw", "detJ", "J_inv", "normals", "phis"
-    }
-    args: Dict[str, Any] = {}
+    if pre_built is None:
+        pre_built = {}
+    predeclared = {
+         "gdofs_map", "node_coords", "element_nodes",
+         "qp_phys", "qw", "detJ", "J_inv", "normals", "phis"
+    }   
+    pre_built = {**{k: v for k, v in pre_built.items()
+                    if k in predeclared}, **pre_built}
+    args: Dict[str, Any] = dict(pre_built)
 
     const_arrays = {
         f"const_arr_{id(c)}": c
@@ -157,7 +162,7 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     total_dofs = dof_handler.total_dofs
 
     for name in sorted(required):
-        if name in pre_built:
+        if name in args:
             continue
 
         # ---- basis tables ------------------------------------------------

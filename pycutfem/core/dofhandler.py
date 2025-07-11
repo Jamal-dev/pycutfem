@@ -12,8 +12,17 @@ from pycutfem.core.topology import Node, Edge, Element
 from pycutfem.ufl.forms import BoundaryCondition
 from pycutfem.fem import transform
 from pycutfem.integration.quadrature import volume
+from collections.abc import Sequence
+from hashlib import blake2b
+from pycutfem.integration.quadrature import line_quadrature
 
 BcLike = Union[BoundaryCondition, Mapping[str, Any]]
+
+def _hash_subset(ids: Sequence[int]) -> int:
+    """Stable 64-bit hash for a list / BitSet of indices."""
+    h = blake2b(digest_size=8)
+    h.update(np.asarray(sorted(ids), dtype=np.int32).tobytes())
+    return int.from_bytes(h.digest(), "little")
 
 # -----------------------------------------------------------------------------
 #  Main class
@@ -629,6 +638,66 @@ class DofHandler:
             "normals": normals,
             "phis": phis,
         }
+    
+    # ------------------------------------------------------------------
+    # edge-geometry cache keyed by (hash(ids), qdeg, id(level_set))
+    # ------------------------------------------------------------------
+    _edge_geom_cache: dict[tuple[int,int,int], dict] = {}
+    
+    def precompute_edge_factors(
+        self,
+        edge_ids: "BitSet | Sequence[int]",
+        qdeg: int,
+        level_set=None,
+        *,
+        reuse: bool = True,
+    ) -> dict:
+        """
+        Returns a dict with the arrays
+           qp_phys   (n_e , n_q , 2)
+           qw        (n_e , n_q)
+           normals   (n_e , n_q , 2)
+           phis      (n_e , n_q)    – empty if level_set is None
+
+        *Only* the edges given by *edge_ids* are tabulated.
+        """
+        mesh  = self.mixed_element.mesh
+        ids   = edge_ids.to_indices() if hasattr(edge_ids, "to_indices") else edge_ids
+        key   = (_hash_subset(ids), qdeg, id(level_set))
+
+        if reuse and key in self._edge_geom_cache:
+            return self._edge_geom_cache[key]
+
+        n_e   = len(ids)
+        q_ref, w_ref = line_quadrature((0, 0), (1, 0), qdeg)
+
+        qp_phys = np.empty((n_e, len(w_ref), 2))
+        qw      = np.empty((n_e, len(w_ref)))
+        normals = np.empty((n_e, len(w_ref), 2))
+        phis    = (np.empty((n_e, len(w_ref))) if level_set else None)
+
+        for i, eid in enumerate(ids):
+            edge    = mesh.edge(eid)
+            p0, p1  = mesh.nodes_x_y_pos[list(edge.nodes)]
+            tang    = p1 - p0
+            L       = np.hypot(*tang)
+            n       = np.array([ tang[1], -tang[0] ]) / L
+
+            for q,(ξ,), w in zip(range(len(w_ref)), q_ref, w_ref):
+                x_q = p0 + ξ * tang
+                qp_phys[i,q] = x_q
+                qw[i,q]      = w * L
+                normals[i,q] = n
+                if phis is not None:
+                    phis[i,q] = level_set(x_q)
+
+        data = {"qp_phys": qp_phys,
+                "qw":      qw,
+                "normals": normals,
+                "phis":    phis if phis is not None else np.empty(0)}
+
+        self._edge_geom_cache[key] = data
+        return data
 
     def info(self) -> None:
         print(f"=== DofHandler ({self.method.upper()}) ===")

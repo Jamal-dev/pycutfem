@@ -132,7 +132,7 @@ def compile_backend(integral_expression, dof_handler,mixed_element ): # New Newt
 
     ir_sequence = ir_generator.generate(integral_expression)
     
-    kernel, param_order = cache.get_kernel(ir_sequence, codegen)
+    kernel, param_order = cache.get_kernel(ir_sequence, codegen,mixed_element.signature())
     
     if hasattr(kernel, "py_func"):
         kernel.python = kernel.py_func

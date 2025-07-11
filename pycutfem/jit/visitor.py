@@ -47,8 +47,11 @@ class IRGenerator:
         self.ir_sequence.clear()
         form_type = _find_form_type(node)
         
-        if form_type == 'functional':
-            raise NotImplementedError("JIT for scalar functionals is not yet implemented.")
+        if form_type == 'functional':        # same walk, different STORE
+            self._visit(node)
+            self.ir_sequence.append(         # ➊ new op-code
+                Store(dest_name="Je", store_type="functional"))
+            return self.ir_sequence
 
         self._visit(node)
 
@@ -65,13 +68,13 @@ class IRGenerator:
         # --- Leaf Nodes & Special Variables ---
         if isinstance(node, (TestFunction)):
             is_vec = False
-            name = node.space.name if hasattr(node, 'space') else node.field_name
+            name = node.space.name if hasattr(node, 'space') else node.name
             self.ir_sequence.append(LoadVariable(name=name, role='test', is_vector=is_vec, field_names=[node.field_name]))
             return
             
         if isinstance(node, (TrialFunction)):
             is_vec = False
-            name = node.space.name if hasattr(node, 'space') else node.field_name
+            name = node.space.name if hasattr(node, 'space') else node.name
             self.ir_sequence.append(LoadVariable(name=name, role='trial', is_vector=is_vec, field_names= [node.field_name]))
             return
         if isinstance(node, (Function)):

@@ -7,6 +7,7 @@ from typing import Tuple, Dict, List, Any
 
 import numpy as np  # numba kernels rely on it
 
+from pycutfem.core import mesh
 from pycutfem.jit.ir import LoadAnalytic
 
 class KernelCache:
@@ -25,13 +26,13 @@ class KernelCache:
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
-    def get_kernel(self, ir_sequence: list, codegen):
+    def get_kernel(self, ir_sequence: list, codegen, mesh_sig=None):
         """
         Build (or load) a kernel for the given IR sequence and return
         (kernel_fn, param_order_list).  The codegen object must expose
         `generate_source(ir, "kernel")  -> (source_str, analytic_map, param_order)`.
         """
-        ir_hash = self._hash_ir(ir_sequence)
+        ir_hash = self._hash_ir(ir_sequence,mesh_sig)
 
         # fast path: session cache
         if ir_hash in self.in_memory_cache:
@@ -68,14 +69,16 @@ class KernelCache:
     # --- helpers -------------------------------------------------------
     # ------------------------------------------------------------------
     @staticmethod
-    def _hash_ir(ir_sequence) -> str:
+    def _hash_ir(ir_sequence,mesh_sig=None) -> str:
         """Hash IR after stripping non-picklable objects."""
         def _hashable(op):
             if isinstance(op, LoadAnalytic):
                 return ("analytic", op.func_id)        # ignore func_ref
             return op
-        return hashlib.sha256(pickle.dumps([_hashable(o) for o in ir_sequence])
-                              ).hexdigest()
+        payload = [_hashable(o) for o in ir_sequence]
+        if mesh_sig is not None:
+            payload.append(("mesh", mesh_sig))
+        return hashlib.sha256(pickle.dumps(payload)).hexdigest()
 
     # ..................................................................
     # locking helpers (prevent two procs writing same file concurrently)

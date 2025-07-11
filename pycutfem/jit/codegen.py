@@ -9,8 +9,7 @@ from .ir import (
     BinaryOp, Inner, Dot, Store
 )
 import numpy as np
-def dotc(a, b):
-    return np.ascontiguousarray(a) @ np.ascontiguousarray(b)
+
 
 # Numba is imported inside the generated kernel string
 # import numba
@@ -137,15 +136,16 @@ class NumbaCodeGen:
                     raise TypeError(f"Unknown role '{operand.role}' for LoadVariable/Derivative")
 
             elif isinstance(op, LoadConstant):
-                stack.append(StackItem(var_name=str(op.value), role='value', shape=(), is_vector=False, field_names=[]))
+                stack.append(StackItem(var_name=str(op.value), role='const', shape=(), is_vector=False, field_names=[]))
             
             elif isinstance(op, LoadConstantArray):
                 required_args.add(op.name)
                 # The constant array is passed in as a list. Convert it to a
                 # NumPy array inside the kernel for Numba compatibility.
                 np_array_var = new_var("const_np_arr")
+                is_vec = len(op.shape) == 1
                 body_lines.append(f"{np_array_var} = np.array({op.name}, dtype=np.float64)")
-                stack.append(StackItem(var_name=np_array_var, role='value', shape=op.shape, is_vector=True, field_names=[]))
+                stack.append(StackItem(var_name=np_array_var, role='const', shape=op.shape, is_vector=is_vec, field_names=[]))
 
 
             # --- UNARY OPERATORS ---
@@ -349,6 +349,8 @@ class NumbaCodeGen:
                 a = stack.pop()
                 res_var = new_var("dot")
 
+                # print(f"Dot operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}")
+
                 # Advection term: dot(grad(u_trial), u_k)
                 if a.role == 'trial' and a.is_gradient and b.role == 'value' and b.is_vector:
                     body_lines.append(f"# Advection: dot(grad(Trial), Function)")
@@ -363,11 +365,59 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=res_var, role='trial', shape=(a.shape[0], a.shape[1]), is_vector=True, is_gradient=False, field_names=a.field_names, parent_name=a.parent_name))
                
                 # Final advection term: dot(advection_vector_trial, v_test)
-                elif a.role == 'trial' and a.is_vector and b.role == 'test' and b.is_vector:
+                elif (a.role == 'trial' and (not a.is_gradient) and b.role == 'test' and (not b.is_gradient)):
                      body_lines.append(f"# Mass: dot(Trial, Test)")
                     #  body_lines.append(f"assert ({a.var_name}.shape == (2,22) and {b.var_name}.shape == (2,22)), 'Trial and Test to have the same shape'")
                      body_lines.append(f"{res_var} = {b.var_name}.T.copy() @ {a.var_name}")
-                     stack.append(StackItem(var_name=res_var, role='value', shape=(b.shape[1],a.shape[1]), is_vector=False, field_names=[]))
+                     stack.append(StackItem(var_name=res_var, 
+                                            role='value', 
+                                            shape=(b.shape[1],a.shape[1]), 
+                                            is_vector=False, field_names=[]))
+                elif (a.role == 'test' and (not a.is_gradient) and b.role == 'trial' and (not b.is_gradient)):
+                    body_lines.append(f"# Mass: dot(Test, Trial)")
+                    # body_lines.append(f"assert ({a.var_name}.shape == (2,22) and {b.var_name}.shape == (2,22)), 'Trial and Test to have the same shape'")
+                    body_lines.append(f"{res_var} = {a.var_name}.T.copy() @ {b.var_name}")
+                    stack.append(StackItem(var_name=res_var, 
+                                            role='value', 
+                                            shape=(a.shape[1],b.shape[1]), 
+                                            is_vector=False, field_names=[]))
+                
+                # ---------------------------------------------------------------------
+                # dot( grad(u_trial) ,  beta )  ← convection term (Function gradient · Trial)
+                # ---------------------------------------------------------------------
+                elif a.role == 'trial' and a.is_gradient and b.role == 'const' and b.is_vector:
+                    if b.shape[0] == a.shape[2]:
+                        body_lines.append("# Advection: dot(grad(Trial), constant beta vector)")
+                        body_lines += [
+                            f"n_vec_comps = {a.shape[0]}; n_locs = {a.shape[1]};n_spatial_dim = {a.shape[2]};",
+                            f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
+                            f"for k in range(n_vec_comps):",
+                            f"    temp_sum = 0.0",
+                            f"    for d in range(n_spatial_dim):",
+                            f"        temp_sum += {a.var_name}[k, :, d] * {b.var_name}[d]",
+                            f"    {res_var}[k] = temp_sum",
+                        ]
+                        stack.append(StackItem(var_name=res_var, role='trial',
+                                            shape=(a.shape[0], a.shape[1]), is_vector=True,
+                                            is_gradient=False, field_names=a.field_names,
+                                            parent_name=a.parent_name))
+                elif b.role == 'trial' and b.is_gradient and a.role == 'const' and a.is_vector:
+                    if a.shape[0] == b.shape[2]:
+                        body_lines.append("# Advection: dot(constant beta vector, grad(Trial))")
+                        body_lines += [
+                            f"n_vec_comps = {b.shape[0]}; n_locs = {b.shape[1]};n_spatial_dim = {b.shape[2]};",
+                            f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
+                            f"for k in range(n_vec_comps):",
+                            f"    temp_sum = 0.0",
+                            f"    for d in range(n_spatial_dim):",
+                            f"        temp_sum += {b.var_name}[k, :, d] * {a.var_name}[d]",
+                            f"    {res_var}[k] = temp_sum",
+                        ]
+                        stack.append(StackItem(var_name=res_var, role='trial',
+                                            shape=(b.shape[0], b.shape[1]), is_vector=True,
+                                            is_gradient=False, field_names=b.field_names,
+                                            parent_name=b.parent_name))
+                
                 
                 # ---------------------------------------------------------------------
                 # dot( grad(u_k) ,  u_trial )  ← convection term (Function gradient · Trial)
@@ -731,8 +781,12 @@ class NumbaCodeGen:
                 integrand = stack.pop()
                 if op.store_type == 'matrix':
                     body_lines.append(f"Ke += {integrand.var_name} * w_q")
-                else:
+                elif op.store_type == 'vector':
                     body_lines.append(f"Fe += {integrand.var_name} * w_q")
+                elif op.store_type == 'functional':
+                    body_lines.append(f"J += {integrand.var_name} * w_q")
+                else:
+                    raise NotImplementedError(f"Store type '{op.store_type}' not implemented.")
             
             else:
                 raise NotImplementedError(f"Opcode {type(op).__name__} not handled in JIT codegen.")
@@ -801,10 +855,12 @@ def {kernel_name}(
     
     K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
     F_values = np.zeros((num_elements, n_dofs_per_element), dtype=np.float64)
+    J_values = np.zeros(num_elements, dtype=np.float64)  # For functional forms
 
     for e in numba.prange(num_elements):
         Ke = np.zeros((n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
         Fe = np.zeros(n_dofs_per_element, dtype=np.float64)
+        J = 0.0
 
 {coeffs_unpack_block}
 
@@ -817,8 +873,9 @@ def {kernel_name}(
 
         K_values[e] = Ke
         F_values[e] = Fe
+        J_values[e] = J
                 
-    return K_values, F_values
+    return K_values, F_values, J_values
 """.lstrip()
 
         return final_kernel_src, param_order

@@ -403,20 +403,3 @@ def test_mixed_velocity_divergence_operator():
     print("\nSUCCESS: Compiler's mixed-space divergence matrix is correct!")
 
 
-if __name__ == '__main__':
-    # Validated Existing Tests
-    test_rhs_vector_diffusion()
-    test_rhs_mass_matrix()
-    test_vector_mass_matrix_q1()
-    test_vector_mass_matrix_q2()
-    
-    print("\n\n" + "#"*70)
-    print("### RUNNING EXTENDED & CORRECTED TEST SUITE ###")
-    print("#"*70)
-    
-    # Corrected Advection and Mixed-Element Tests
-    test_lhs_advection_q2()
-    test_lhs_advection_transpose_q2()
-    test_mixed_pressure_grad_operator()
-    test_mixed_velocity_divergence_operator()
-    test_rhs_mixed_divergence()
