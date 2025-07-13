@@ -12,6 +12,16 @@ from pycutfem.core.topology import Node, Edge, Element
 from pycutfem.ufl.forms import BoundaryCondition
 from pycutfem.fem import transform
 from pycutfem.integration.quadrature import volume
+<<<<<<< Updated upstream
+=======
+from collections.abc import Sequence
+from hashlib import blake2b
+from pycutfem.integration.quadrature import line_quadrature
+from functools import lru_cache
+
+
+_edge_geom_cache: dict[tuple, dict] = {}     # ← NEW — module-level cache
+>>>>>>> Stashed changes
 
 BcLike = Union[BoundaryCondition, Mapping[str, Any]]
 
@@ -537,7 +547,408 @@ class DofHandler:
             return math.sqrt(err2)
             
         return math.sqrt(err2 / exact2) if relative else math.sqrt(err2)
+<<<<<<< Updated upstream
+=======
+    
+    # ==================================================================
+    # NEW: Precompute Geometric Factors for JIT Kernels
+    # ==================================================================
+    def get_all_dof_coords(self) -> np.ndarray:
+        """
+        Builds and returns a coordinate array for every DOF in the system.
 
+        The returned array has shape (total_dofs, 2), where the first index
+        corresponds directly to the global DOF index. This is the correct
+        coordinate array to pass to JIT kernels.
+
+        Returns:
+            np.ndarray: The (total_dofs, 2) array of DOF coordinates.
+        """
+        if self._dg_mode:
+            raise NotImplementedError("get_all_dof_coords is not yet implemented for DG methods.")
+
+        # Initialize an array to hold coordinates for every single DOF.
+        all_coords = np.zeros((self.total_dofs, 2))
+
+        # Use the internal map that links a global DOF to its original node.
+        for dof_idx, (field, node_idx) in self._dof_to_node_map.items():
+            # Get the coordinates of the original node.
+            coords = self.fe_map[field].nodes_x_y_pos[node_idx]
+            # Place these coordinates at the correct index in our new array.
+            all_coords[dof_idx] = coords
+
+        return all_coords
+    def precompute_geometric_factors(self, quad_order: int, level_set: Callable = None) -> Dict[str, np.ndarray]:
+        """
+        Calculates all geometric data needed by JIT kernels ahead of time.
+
+        This is the single, authoritative method for preparing geometric
+        quadrature data. It computes physical coordinates, scaled quadrature
+        weights, inverse Jacobians, and optional level-set values.
+
+        Args:
+            quad_order (int): The polynomial degree of the quadrature rule.
+            level_set (Callable, optional): A level-set function to evaluate `phi`
+                                            at quadrature points. Defaults to None.
+
+        Returns:
+            Dict[str, np.ndarray]: A dictionary of pre-computed arrays.
+        """
+        if self.mixed_element is None:
+            raise RuntimeError("This method requires a MixedElement-backed DofHandler.")
+
+        mesh = self.mixed_element.mesh
+        num_elements = len(mesh.elements_list)
+        spatial_dim = mesh.spatial_dim
+
+        # 1. Get reference quadrature rule
+        qp_ref, qw_ref = volume(mesh.element_type, quad_order)
+        num_quad_points = len(qw_ref)
+
+        # 2. Initialize output arrays
+        qp_phys = np.zeros((num_elements, num_quad_points, spatial_dim))
+        qw_scaled = np.zeros((num_elements, num_quad_points))
+        detJ = np.zeros((num_elements, num_quad_points))
+        J_inv = np.zeros((num_elements, num_quad_points, spatial_dim, spatial_dim))
+        phis = np.zeros((num_elements, num_quad_points)) if level_set else None
+        normals = np.zeros((num_elements, num_quad_points, spatial_dim)) # Placeholder
+
+        # 3. Loop over all elements and quadrature points
+        for e_idx in range(num_elements):
+            for q_idx, (qp, qw) in enumerate(zip(qp_ref, qw_ref)):
+                xi_tuple = tuple(qp)
+
+                J_matrix = transform.jacobian(mesh, e_idx, xi_tuple)
+                det_J_val = np.linalg.det(J_matrix)
+                if det_J_val <= 1e-12:
+                    raise ValueError(f"Jacobian determinant is non-positive ({det_J_val}) for element {e_idx}.")
+
+                J_inv[e_idx, q_idx] = np.linalg.inv(J_matrix)
+                detJ[e_idx, q_idx] = det_J_val
+                
+                x_phys, y_phys = transform.x_mapping(mesh, e_idx, xi_tuple)
+                qp_phys[e_idx, q_idx, 0] = x_phys
+                qp_phys[e_idx, q_idx, 1] = y_phys
+                
+                qw_scaled[e_idx, q_idx] = qw * det_J_val
+
+                if level_set:
+                    phis[e_idx, q_idx] = level_set(x_phys, y_phys)
+
+        # 4. Return results in a dictionary for easy use
+        return {
+            "qp_phys": qp_phys,
+            "qw": qw_scaled,
+            "detJ": detJ,
+            "J_inv": J_inv,
+            "normals": normals,
+            "phis": phis,
+        }
+    
+    # ------------------------------------------------------------------
+    # edge-geometry cache keyed by (hash(ids), qdeg, id(level_set))
+    # ------------------------------------------------------------------
+    _edge_geom_cache: dict[tuple[int,int,int], dict] = {}
+
+    def _hash_subset(idx: Sequence[int]) -> int:
+        """Fast 64-bit signature for any list / BitSet of indices."""
+        return hash(bytes(sorted(idx)))
+    
+    
+
+    # -------------------------------------------------------------------------
+    #  DofHandler.precompute_interface_factors
+    # -------------------------------------------------------------------------
+    def precompute_interface_factors(
+        self,
+        cut_element_ids: "BitSet | Sequence[int]",
+        qdeg: int,
+        level_set,
+        reuse: bool = True,
+    ) -> dict:
+        """
+        Pre-computes all geometric data for interface integrals on a given
+        set of CUT elements.
+
+        This is the authoritative method for preparing data for dInterface JIT kernels.
+        It iterates directly over cut elements, not edges, ensuring all geometric
+        data (Jacobians, etc.) is sourced from the correct parent element.
+
+        Parameters
+        ----------
+        cut_element_ids : BitSet | Sequence[int]
+            The element IDs of the 'cut' elements to process.
+        qdeg : int
+            1-D quadrature order along the interface segment.
+        level_set : callable
+            The level-set function, required for calculating normals.
+
+        Returns
+        -------
+        dict
+            A dictionary of pre-computed arrays, with the first dimension
+            corresponding to the order of `cut_element_ids`. Keys include:
+            'eids', 'qp_phys', 'qw', 'normals', 'phis', 'detJ', 'J_inv'.
+        """
+        from pycutfem.integration.quadrature import line_quadrature
+        from pycutfem.fem import transform
+
+        mesh = self.mixed_element.mesh
+        ids = cut_element_ids.to_indices() if hasattr(cut_element_ids, "to_indices") else list(cut_element_ids)
+
+        # Filter for elements that are actually 'cut' and have a valid segment
+        valid_cut_eids = [
+            eid for eid in ids
+            if mesh.elements_list[eid].tag == 'cut' and len(mesh.elements_list[eid].interface_pts) == 2
+        ]
+        
+        if not valid_cut_eids:
+            # Return empty arrays with correct shapes if no valid cut elements
+            return {
+                'eids': np.array([], dtype=int),
+                'qp_phys': np.empty((0, 0, 2)), 'qw': np.empty((0, 0)),
+                'normals': np.empty((0, 0, 2)), 'phis': np.empty((0, 0)),
+                'detJ': np.empty((0, 0)), 'J_inv': np.empty((0, 0, 2, 2)),
+            }
+
+        # --- Use a cache if requested ---
+        cache_key = (_hash_subset(valid_cut_eids), qdeg, id(level_set))
+        if reuse and cache_key in _edge_geom_cache:
+            return _edge_geom_cache[cache_key]
+
+        # --- Allocation ---
+        # n_elems = len(valid_cut_eids)
+        n_elems = mesh.n_elements
+        # We need a representative segment to determine n_q
+        p0_rep, p1_rep = mesh.elements_list[valid_cut_eids[0]].interface_pts
+        q_xi_rep, q_w_rep = line_quadrature(p0_rep, p1_rep, qdeg)
+        n_q = len(q_w_rep)
+
+        qp_phys = np.zeros((n_elems, n_q, 2))
+        qw = np.zeros((n_elems, n_q))
+        normals = np.zeros((n_elems, n_q, 2))
+        phis = np.zeros((n_elems, n_q))
+        detJ_arr = np.zeros((n_elems, n_q))
+        Jinv_arr = np.zeros((n_elems, n_q, 2, 2))
+        # ---------- NEW: basis / grad-basis tables on the interface ----------
+        me      = self.mixed_element
+        fields  = me.field_names            # ['vx', 'vy', …]
+        b_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local))         for f in fields}
+        g_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local, 2))      for f in fields}
+
+
+        # --- Loop over valid cut elements ---
+        for k, eid in enumerate(valid_cut_eids):
+            elem = mesh.elements_list[eid]
+            p0, p1 = elem.interface_pts
+
+            # --- Quadrature rule on the physical interface segment ---
+            q_xi, q_w = line_quadrature(p0, p1, qdeg)
+
+            for q, (xq, wq) in enumerate(zip(q_xi, q_w)):
+                qp_phys[eid, q] = xq
+                qw[eid, q] = wq
+
+                # Normal and phi value from the level set
+                g = level_set.gradient(xq)
+                # norm_g = np.linalg.norm(g)
+                normals[eid, q] = g #/ (norm_g + 1e-30)
+                phis[eid, q] = level_set(xq)
+
+                # Jacobian of the parent element at the quadrature point
+                xi_ref, eta_ref = transform.inverse_mapping(mesh, eid, xq)
+                J = transform.jacobian(mesh, eid, (xi_ref, eta_ref))
+                detJ_arr[eid, q] = np.linalg.det(J)
+                Jinv_arr[eid, q] = np.linalg.inv(J)
+                for fld in fields:
+                    b_tabs[fld][eid, q] = me.basis      (fld, xi_ref, eta_ref)
+                    g_tabs[fld][eid, q] = me.grad_basis (fld, xi_ref, eta_ref)
+
+        # --- Gather results and cache ---
+        out = {
+            'eids': np.array(valid_cut_eids, dtype=int),
+            # 'eids': np.arange(mesh.n_elements, dtype=int),  # All elements, not just cut
+            'qp_phys': qp_phys, 'qw': qw, 'normals': normals, 'phis': phis,
+            'detJ': detJ_arr, 'J_inv': Jinv_arr,
+        }
+        for fld in fields:
+            out[f"b_{fld}"] = b_tabs[fld]
+            out[f"g_{fld}"] = g_tabs[fld]
+
+        if reuse:
+            _edge_geom_cache[cache_key] = out
+        
+        return out
+    
+    # ---------------------------------------------------------------------
+    #  DofHandler.precompute_edge_factors 
+    # ---------------------------------------------------------------------
+    def precompute_edge_factors(
+            self,
+            edge_ids: "BitSet | Sequence[int]",
+            qdeg: int,
+            level_set=None,
+            *,
+            with_maps: bool = False,
+            reuse: bool = True,
+        ) -> dict:
+        """
+        Pre-compute (and cache) every geometric quantity that a facet-based
+        JIT kernel may need.  Works for **regular**, **interface** *and*
+        **ghost** edges.
+
+        Returns
+        -------
+        dict
+            Keys common to all facets
+                qp_phys     (n_e,n_q,2)
+                qw          (n_e,n_q)
+                normals     (n_e,n_q,2)
+                phis        (n_e,n_q)
+            +  per-side data for ghost facets
+                detJ_pos / detJ_neg      (n_e,n_q)
+                J_inv_pos / J_inv_neg    (n_e,n_q,2,2)
+            +  optional mapping helpers (only if with_maps=True)
+                global_dofs : list[np.ndarray]
+                pos_map     : list[np.ndarray]
+                neg_map     : list[np.ndarray]
+        """
+        from pycutfem.integration.quadrature import line_quadrature
+        from pycutfem.fem import transform
+
+        mesh   = self.mixed_element.mesh
+        ids    = edge_ids.to_indices() if hasattr(edge_ids, "to_indices") else list(edge_ids)
+
+        # ------------------------------------------------------------------ cache
+        cache_key = (_hash_subset(ids), qdeg, id(level_set), with_maps)
+        if reuse and cache_key in _edge_geom_cache:
+            return _edge_geom_cache[cache_key]
+
+        # ------------------------------------------------------------------ allocation
+        n_e          = len(ids)
+        q_ref, w_ref = line_quadrature((0., 0.), (1., 0.), qdeg)
+        n_q          = len(w_ref)
+
+        qp_phys   = np.zeros((n_e, n_q, 2))
+        qw        = np.zeros((n_e, n_q))
+        normals   = np.zeros((n_e, n_q, 2))
+        phis      = np.zeros((n_e, n_q)) if level_set else np.empty(0)
+
+        detJ_pos  = np.zeros((n_e, n_q))
+        detJ_neg  = np.zeros((n_e, n_q))
+        Jinv_pos  = np.zeros((n_e, n_q, 2, 2))
+        Jinv_neg  = np.zeros((n_e, n_q, 2, 2))
+        Jinv_mean  = np.zeros((n_e, n_q, 2, 2))
+        detJ_mean  = np.zeros((n_e, n_q))
+
+        # (+/–) bookkeeping (needed only for ghost / interface kernels)
+        gd_lists, pmaps, nmaps = [], [], []
+        pos_eid_arr = np.empty(n_e, dtype=int)
+        neg_eid_arr = np.empty(n_e, dtype=int)
+
+        # ------------------------------------------------------------------ loop over facets
+        for k, eid_edge in enumerate(ids):
+            edge         = mesh.edge(eid_edge)
+            p0, p1       = mesh.nodes_x_y_pos[list(edge.nodes)]
+            p0, p1       = map(np.asarray, (p0, p1))            # <<< guarant. ndarray
+            tang         = p1 - p0
+            L_edge       = np.hypot(*tang)
+
+            # ---------------------------------------------------------- classify facet
+            tag      = getattr(edge, "tag", "")
+            is_iface = tag == "interface"
+            is_ghost = tag == "ghost"
+
+            if level_set is None:
+                # pure Neumann / Robin edge – outward normal from geometry
+                n_vec = np.array([ tang[1], -tang[0] ]) / L_edge
+            else:
+                # level-set normal (pointing to φ>0)
+                mid   = np.asarray(0.5 * (p0 + p1))
+                g     = level_set.gradient(mid)
+                n_vec = g / (np.linalg.norm(g) + 1e-30)
+
+            # ---------------------------------------------------------- pick integration segment
+            if is_iface:
+                # interface edges are integrated **once per cut element**;
+                # the caller already deduplicated edges → use stored pts
+                cut_elem = mesh.elements_list[edge.left] \
+                        if mesh.elements_list[edge.left].tag == "cut" \
+                        else mesh.elements_list[edge.right]
+                seg_p0, seg_p1 = [np.asarray(pt) for pt in cut_elem.interface_pts]
+                pos_eid = neg_eid = cut_elem.id
+            else:
+                # regular or ghost edge – full edge
+                seg_p0, seg_p1 = p0, p1
+                # determine ± elements from level-set *sign*
+                if level_set is None or edge.right is None:
+                    pos_eid = edge.left
+                    neg_eid = edge.right if edge.right is not None else edge.left
+                else:
+                    φL = level_set(np.asarray(mesh.elements_list[edge.left ].centroid()))
+                    φR = level_set(np.asarray(mesh.elements_list[edge.right].centroid()))
+                    pos_eid, neg_eid = (edge.left, edge.right) if φL >= φR else (edge.right, edge.left)
+
+            pos_eid_arr[k] = pos_eid
+            neg_eid_arr[k] = neg_eid
+
+            # ---------------------------------------------------------- quadrature
+            qpts_phys, qwts = line_quadrature(seg_p0, seg_p1, qdeg)
+            for q, (xq, wq) in enumerate(zip(qpts_phys, qwts)):
+                xq = np.asarray(xq)                   # ensure ndarray
+                qp_phys[k, q] = xq
+                qw[k, q]      = wq
+                normals[k, q] = n_vec                 # same for both sides
+                if level_set is not None:
+                    phis[k, q] = level_set(xq)
+
+                # ---- (+) side ---------------------------------------------------
+                xi, eta   = transform.inverse_mapping(mesh, pos_eid, xq)
+                J_pos     = transform.jacobian(mesh, pos_eid, (xi, eta))
+                detJ_pos[k, q] = np.linalg.det(J_pos)
+                Jinv_pos[k, q] = np.linalg.inv(J_pos)
+
+                # ---- (–) side ---------------------------------------------------
+                xi, eta   = transform.inverse_mapping(mesh, neg_eid, xq)
+                J_neg     = transform.jacobian(mesh, neg_eid, (xi, eta))
+                detJ_neg[k, q] = np.linalg.det(J_neg)
+                Jinv_neg[k, q] = np.linalg.inv(J_neg)
+                # ---- mean Jacobian ----------------------------------------------
+                Jinv_mean[k, q] = 0.5 * (Jinv_pos[k, q] + Jinv_neg[k, q])
+                detJ_mean[k, q] = 0.5 * (detJ_pos[k, q] + detJ_neg[k, q])
+
+            # ---------------------------------------------------------- DOF-maps (ghost / iface)
+            if with_maps and (is_ghost or is_iface):
+                pos_dofs = self.get_elemental_dofs(pos_eid)
+                neg_dofs = self.get_elemental_dofs(neg_eid)
+                g_dofs   = np.unique(np.concatenate((pos_dofs, neg_dofs)))
+                pmaps.append(np.searchsorted(g_dofs, pos_dofs))
+                nmaps.append(np.searchsorted(g_dofs, neg_dofs))
+                gd_lists.append(g_dofs)
+
+        # ------------------------------------------------------------------ gather + cache
+        out = dict(
+            qp_phys = qp_phys,   qw = qw,
+            normals = normals,   phis = phis,
+            detJ_pos = detJ_pos, detJ_neg = detJ_neg,
+            J_inv_pos = Jinv_pos, J_inv_neg = Jinv_neg,
+            pos_eid = pos_eid_arr, neg_eid = neg_eid_arr,
+            detJ = detJ_mean, J_inv = Jinv_mean
+        )
+        if with_maps:
+            from pycutfem.ufl.helpers_jit import _stack_ragged
+            out.update(dict(global_dofs = _stack_ragged(gd_lists), 
+                            pos_map = _stack_ragged(pmaps), 
+                            neg_map = _stack_ragged(nmaps)
+                            ))
+
+        _edge_geom_cache[cache_key] = out
+        return out
+>>>>>>> Stashed changes
+
+
+
+    
     def info(self) -> None:
         print(f"=== DofHandler ({self.method.upper()}) ===")
         for fld in self.field_names:

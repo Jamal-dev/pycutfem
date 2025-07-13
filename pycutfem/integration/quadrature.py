@@ -97,6 +97,8 @@ def line_quadrature(p0: np.ndarray, p1: np.ndarray, order: int = 2):
     Gauss–Legendre rule mapped from [-1,1] onto the straight segment p0→p1.
     Returns (x_i, w_i) with weights in **physical** space.
     """
+    p0 = np.asarray(p0, dtype=np.float64)       #  ← NEW
+    p1 = np.asarray(p1, dtype=np.float64)       #  ← NEW
     ξ, w_ref = gauss_legendre(order)             # reference rule
     mid  = 0.5*(p0 + p1)
     half = 0.5*(p1 - p0)                         # derivative dx/dξ

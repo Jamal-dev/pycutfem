@@ -67,7 +67,7 @@ def bcs(cavity_setup):
     """Gets the boundary conditions list from the main setup fixture."""
     return cavity_setup[2]
 
-def make_levelset():
+def make_levelset(center=center, R=R):
     return CircleLevelSet(center, radius=R)
 
 def add_scalar_field(func: Function, mesh: Mesh, phi, u_pos=None, u_neg=None):
@@ -242,7 +242,8 @@ def test_jump_grad_vector(mesh:Mesh):
     dof_handler = DofHandler(me, method='cg')  # Create a DofHandler for the mesh
     velocity_space_pos = VectorFunction("velocity_pos", ['vx', 'vy'], dof_handler=dof_handler)
     velocity_space_neg = VectorFunction("velocity_neg", ['vx', 'vy'], dof_handler=dof_handler)
-    phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)
+    phi = make_levelset(); mesh.classify_elements(phi); 
+    mesh.classify_edges(phi)
     mesh.build_interface_segments(phi); 
     v_pos = lambda x,y: np.array([2 * x * y, 3 * x**2 * y-y**2])
     v_neg = lambda x,y: np.array([3 * y**2 * x + x**3, 10 * x +y])
@@ -254,7 +255,7 @@ def test_jump_grad_vector(mesh:Mesh):
     grad_v_neg_n = dot(grad(velocity_space_neg),n)
 
     # form = dot(jump_grad_v,n) * dInterface(level_set=phi)
-    form = Jump(grad_v_pos_n,grad_v_neg_n) * dInterface(level_set=phi)
+    form = Jump(grad_v_pos_n,grad_v_neg_n) * dInterface(level_set=phi, metadata={'q':4})
     eq   = form == Constant(0.0) * dx
     res  = assemble_form(eq, dof_handler=dof_handler, bcs=[],
                          assembler_hooks={type(form.integrand):{'name':'jv'}})
@@ -262,6 +263,28 @@ def test_jump_grad_vector(mesh:Mesh):
     print(f"Exact vector jump: {exact}")
     print(f"Computed vector jump: {res['jv']}")
     assert_allclose(res['jv'], exact.flatten(), rtol=1e-2)
+
+def test_jump_grad_vector_zero(mesh):
+    me  = MixedElement(mesh, field_specs={"vx": 1, "vy": 1})
+    dh  = DofHandler(me, method="cg")
+
+    v_fun = lambda x, y: np.array([x + 2*y, -3*x + y**2])
+    v_pos = VectorFunction("v_pos", ['vx', 'vy'], dof_handler=dh)
+    v_neg = VectorFunction("v_neg", ['vx', 'vy'], dof_handler=dh)
+    v_pos.set_values_from_function(v_fun)
+    v_neg.set_values_from_function(v_fun)          # identical field
+
+    n = FacetNormal()
+    form = Jump(dot(grad(v_pos), n),
+                dot(grad(v_neg), n)) * dInterface(level_set=make_levelset())
+    eq   = form == Constant(0.0) * dx
+
+    res  = assemble_form(eq, dof_handler=dh, bcs=[],
+                         assembler_hooks={type(form.integrand): {'name': 'zero'}})
+    assert_allclose(res['zero'], np.zeros(2), atol=1e-12)
+
+
+
 
 if __name__ == "__main__":
     pytest.main([__file__, '-v', '--tb=short'])

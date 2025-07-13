@@ -40,6 +40,13 @@ from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
 from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo
 from pycutfem.ufl.analytic import Analytic
+<<<<<<< Updated upstream
+=======
+from pycutfem.utils.domain_manager import get_domain_bitset
+from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_edge_contribs, _scatter_ghost_edge_contribs, _stack_ragged,_scatter_element_contribs
+
+
+>>>>>>> Stashed changes
 
 logger = logging.getLogger(__name__)
 _INTERFACE_TOL = 1.0e-12 # New
@@ -623,6 +630,130 @@ class FormCompiler:
         F[rows] = vals
     
     def _assemble_volume(self, integral: Integral, matvec):
+<<<<<<< Updated upstream
+=======
+        if self.backend == "python":
+            logger.info(f"Assembling volume integral with python backend: {integral}")
+            self._assemble_volume_python(integral, matvec)
+        elif self.backend == "jit":
+            logger.info(f"Assembling volume integral with jit backend: {integral}")
+            self._assemble_volume_jit(integral, matvec)
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+    
+    # ----------------------------------------------------------------------
+    def _assemble_volume_jit(self, integral: Integral, matvec):
+        dbg = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
+
+        # ------------------------------------------------------------------
+        # 1. Get – or create – the JIT kernel runner
+        # ------------------------------------------------------------------
+        runner, ir = self._compile_backend(
+            integral.integrand,          # the expression (no Form wrapper)
+            self.dh, self.me
+        )
+
+        # ------------------------------------------------------------------
+        # 2. Build (or reuse) the STATIC argument dictionary
+        # ------------------------------------------------------------------
+        q_order = self._find_q_order(integral)
+
+        cache_key = (q_order, tuple(runner.param_order))   # hashable & unique enough
+        if not hasattr(self, "_jit_static_cache"):
+            self._jit_static_cache = {}
+        if cache_key not in self._jit_static_cache:
+            # (A) geometric factors      -------------------------------
+            geo_args = self.dh.precompute_geometric_factors(q_order)
+
+            # (B) element → global DOF map  &  node coordinates         ------
+            mesh = self.me.mesh
+            gdofs_map = np.vstack([
+                self.dh.get_elemental_dofs(e) for e in range(mesh.n_elements)
+            ]).astype(np.int32)
+            node_coords = self.dh.get_all_dof_coords()
+
+            # (C) basis / gradient / derivative tables (only what kernel needs)
+            basis_args = _build_jit_kernel_args(
+                ir, integral.integrand, self.me, q_order,
+                dof_handler=self.dh,
+                gdofs_map=gdofs_map,
+                param_order=runner.param_order,
+                pre_built= geo_args
+            )
+
+            static_args = {
+                "gdofs_map":  gdofs_map,
+                "node_coords": node_coords,
+                **geo_args,
+                **basis_args,
+            }
+            self._jit_static_cache[cache_key] = static_args
+        else:
+            static_args = self._jit_static_cache[cache_key]
+
+        # ------------------------------------------------------------------
+        # 3. Collect the up-to-date coefficient Functions
+        # ------------------------------------------------------------------
+        current_funcs = {
+            f.name: f
+            for f in _find_all(integral.integrand, (Function, VectorFunction))
+        }
+
+        # ------------------------------------------------------------------
+        # 4. Execute the kernel via the runner
+        # ------------------------------------------------------------------
+        K_loc, F_loc, J_loc = runner(current_funcs, static_args)
+        if dbg:
+            print(f"[Assembler] kernel returned  K_loc {K_loc.shape}  "
+                  f"F_loc {F_loc.shape}")
+
+        # ------------------------------------------------------------------
+        # 5.  Pure scalar functional  → never touches the global system
+        # ------------------------------------------------------------------
+        trial, test = _trial_test(integral.integrand)
+        hook        = self.ctx["hooks"].get(type(integral.integrand))
+        if trial is None and test is None:           # functional (hooked or not)
+            if hook:                                 # accumulate if requested
+                name = hook["name"]
+                self.ctx.setdefault("scalar_results", {})[name] = 0.0
+                self.ctx["scalar_results"][name] += J_loc.sum()
+            return  
+
+        # ------------------------------------------------------------------
+        # 5. Scatter element contributions to the global system
+        # ------------------------------------------------------------------
+        mesh         = self.me.mesh
+        gdofs_map    = static_args["gdofs_map"]
+        n_dofs_local = self.me.n_dofs_local
+
+        if self.ctx["rhs"]:                               # assembling a vector
+            for e in range(mesh.n_elements):
+                np.add.at(matvec, gdofs_map[e], F_loc[e])
+        else:                                             # assembling a matrix
+            data = np.empty(mesh.n_elements * n_dofs_local * n_dofs_local)
+            rows = np.empty_like(data, dtype=np.int32)
+            cols = np.empty_like(data, dtype=np.int32)
+
+            for e in range(mesh.n_elements):
+                gdofs = gdofs_map[e]
+                r, c = np.meshgrid(gdofs, gdofs, indexing='ij')
+                start = e * n_dofs_local * n_dofs_local
+                end   = start + n_dofs_local * n_dofs_local
+
+                rows[start:end] = r.ravel()
+                cols[start:end] = c.ravel()
+                data[start:end] = K_loc[e].ravel()
+
+            K_coo = sp.coo_matrix(
+                (data, (rows, cols)),
+                shape=(self.dh.total_dofs, self.dh.total_dofs)
+            )
+            matvec += K_coo.tocsr()
+
+
+
+    def _assemble_volume_python(self, integral: Integral, matvec):
+>>>>>>> Stashed changes
         mesh = self.me.mesh
         # Use a higher quadrature order for safety, esp. with mixed orders
         q_order = self._find_q_order(integral)
@@ -666,7 +797,197 @@ class FormCompiler:
 
     
     
-    def _assemble_interface(self, intg: Integral, matvec): # New
+    def _assemble_interface_jit(self, intg, matvec):
+        """
+        Assemble ∫_Γ ⋯ using the JIT backend.
+        All kernel tables are sized (n_elems_total, …) so the kernel may
+        iterate over *all* elements; non-cut rows are zero and contribute
+        nothing.
+        """
+
+        dh, me = self.dh, self.me
+        mesh   = me.mesh
+
+        # 1.  BitSet of cut elements ------------------------------------------------
+        cut_eids = (intg.measure.defined_on
+                    if intg.measure.defined_on is not None
+                    else mesh.element_bitset("cut"))
+
+        if cut_eids.cardinality() == 0:            # nothing to do
+            return
+
+        # 2.  Geometric pre-compute --------------------------------------------------
+        qdeg      = self._find_q_order(intg)
+        level_set = intg.measure.level_set
+        if level_set is None:
+            raise ValueError("dInterface measure requires a level_set.")
+
+        geo = dh.precompute_interface_factors(cut_eids, qdeg, level_set)
+
+        # 3.  Full element-to-DOF map  (shape = n_elems_total × n_loc) --------------
+        gdofs_map = np.vstack(
+            [dh.get_elemental_dofs(eid) for eid in range(mesh.n_elements)]
+        ).astype(np.int32)
+
+        # 4.  Compile kernel & build argument dict ----------------------------------
+        runner, ir = self._compile_backend(intg.integrand, dh, me)
+
+        basis_args = _build_jit_kernel_args(
+            ir, intg.integrand, me, qdeg,
+            dof_handler = dh,
+            gdofs_map   = gdofs_map,
+            param_order = runner.param_order,
+            pre_built   = geo           # already sized n_elems_total
+        )
+
+        static_args = {k: v for k, v in geo.items() if k != 'eids'}
+        static_args.update(basis_args)
+
+        # 5.  Execute the kernel -----------------------------------------------------
+        K, F, J = runner({}, static_args)
+
+        # 6. scatter ONLY the cut rows --------------------------------------
+        cut_eids = geo["eids"]                 # 1-D array of global ids
+        K_cut = K[cut_eids]
+        F_cut = F[cut_eids]
+        J_cut = J[cut_eids] if J is not None else None
+
+        gdofs_cut = gdofs_map[cut_eids]        # rows aligned with K_cut
+
+        _scatter_element_contribs(
+            K_cut, F_cut, J_cut,
+            cut_eids, gdofs_cut,
+            matvec, self.ctx, intg.integrand
+        )
+
+    # ---------------------------------------------------------------------------
+    # JIT assembly on CUT ghost edges
+    # ---------------------------------------------------------------------------
+    def _assemble_ghost_jit(self, intg, matvec):
+        """
+        Assemble element matrices/vectors for ghost edges with the Numba JIT
+        backend.  The routine mirrors the pure-Python ghost implementation but
+        buckets edges by equal local-union size so every kernel can run on a
+        rectangular (n_edges, union) work-set.
+
+        Parameters
+        ----------
+        intg : Integrand
+            The integrand whose Hessian / gradient / residual we assemble.
+        matvec : MatVecBuilder
+            Object that accumulates the global K, F, J triplet.
+        """
+        from pycutfem.ufl.helpers_jit import _stack_ragged
+
+        dh, me   = self.dh, self.me
+        mesh     = me.mesh
+
+        # ------------------------------------------------------------------
+        # 1.  bookkeeping on the integrand (derivatives, quadrature degree)
+        # ------------------------------------------------------------------
+        derivs = intg.measure.metadata.get("derivs")
+        if derivs is None:
+            derivs = required_multi_indices(intg.integrand)
+            derivs |= {(0, 0)}                    # always need basis itself
+            intg.measure.metadata["derivs"] = derivs
+        qdeg = self._find_q_order(intg)
+
+        # which edges are *ghost* for this measure?
+        subset   = intg.measure.defined_on
+        edge_ids = subset.to_indices() if subset is not None else \
+                get_domain_bitset(mesh, "edge", "ghost")
+
+        # ------------------------------------------------------------------
+        # 2.  geometry & mapping pre-computation (done once)
+        # ------------------------------------------------------------------
+        geo = dh.precompute_edge_factors(
+            edge_ids,
+            qdeg,
+            level_set=intg.measure.level_set,
+            with_maps=True,          # gives global_dofs / pos_map / neg_map
+        )
+        n_edges_total = len(edge_ids)
+
+        # ------------------------------------------------------------------
+        # 3.  bucket edges by identical union size
+        # ------------------------------------------------------------------
+        buckets: Dict[int, Dict[str, Any]] = {}
+        for e, g in enumerate(geo["global_dofs"]):
+            buckets.setdefault(len(g), {"edges": []})["edges"].append(e)
+
+        # 4.  gather coefficient Functions once ----------------------------
+        current_funcs = {
+            f.name: f
+            for f in _find_all(intg.integrand, (Function, VectorFunction))
+        }
+        # also map parent VectorFunction names when we see a scalar component
+        for f in list(current_funcs.values()):
+            pv = getattr(f, "_parent_vector", None)
+            if pv is not None:
+                current_funcs.setdefault(pv.name, pv)
+        # ------------------------------------------------------------------
+        # 5.  loop over buckets, run JIT kernel, scatter
+        # ------------------------------------------------------------------
+        for n_loc, info in buckets.items():
+            e_sel = info["edges"]
+
+            # (a) build per-bucket geometry tables --------------------------------
+            gdofs_map = _stack_ragged([geo["global_dofs"][e] for e in e_sel])
+            pos_map = geo["pos_map"][e_sel]      # correct rows for this bucket
+            neg_map = geo["neg_map"][e_sel]
+            # slice everything that is stored “per edge” (first axis == n_edges_total)
+            geo_slice = {}
+            for k, v in geo.items():
+                if isinstance(v, list):
+                    v = np.asarray(v)
+                if isinstance(v, np.ndarray) and v.shape[0] == n_edges_total:
+                    geo_slice[k] = v[e_sel]
+
+            static = {
+                "gdofs_map":  gdofs_map,
+                "node_coords": dh.get_all_dof_coords(),
+                "pos_map":    pos_map,                 # local DOFs on positive side
+                "neg_map":    neg_map,                 # local DOFs on negative side
+                **geo_slice,                     # pos_map / neg_map arrive here too
+            }
+
+            # (b) compile or reuse the kernel --------------------------------------
+            runner, ir = info.get("runner", (None, None))
+            if runner is None:
+                runner, ir = self._compile_backend(intg.integrand, dh, me)
+                info["runner"] = runner
+                info["ir"]     = ir
+
+            # augment kernel args that are independent of edge selection
+            static.update(
+                _build_jit_kernel_args(
+                    ir,
+                    intg.integrand,
+                    me,
+                    qdeg,
+                    dof_handler   = dh,
+                    param_order   = runner.param_order,
+                    pre_built     = static,
+                )
+            )
+
+            # (c) execute & scatter ------------------------------------------------
+            K, F, J = runner(current_funcs, static)
+            _scatter_ghost_edge_contribs(
+                K, F, J, static, matvec, self.ctx, intg.integrand
+            )
+
+
+    def _assemble_interface(self, intg: Integral, matvec):
+        """Assemble integrals over non-conforming interfaces defined by a level set."""
+        if self.backend == "python":
+            self._assemble_interface_python(intg, matvec)
+        elif self.backend == "jit":
+            self._assemble_interface_jit(intg, matvec)
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+    
+    def _assemble_interface_python(self, intg: Integral, matvec): 
         """ # New
         Assembles integrals over non-conforming interfaces defined by a level set. # New
         This implementation is adapted for the new MixedElement/DofHandler architecture. # New
@@ -775,4 +1096,176 @@ class FormCompiler:
             # --- Final Context Cleanup --- # New
             for key in ('phi_val', 'normal', 'eid', 'x_phys'): # New
                 self.ctx.pop(key, None) # New
+<<<<<<< Updated upstream
             log.debug("Interface assembly finished. Context cleaned.") # New
+=======
+            log.debug("Interface assembly finished. Context cleaned.") # New
+    
+    def _assemble_ghost_edge(self, intg: "Integral", matvec):
+        """
+        Assembles integrals over ghost edges using a side-aware cache.
+        This method supports both JIT and Python backends.
+        """
+        if self.backend == "python":
+            self._assemble_ghost_edge_python(intg, matvec)
+        elif self.backend == "jit":
+            self._assemble_ghost_jit(intg, matvec)
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+
+    def _assemble_ghost_edge_python(self, intg: "Integral", matvec):
+        """
+        Assembles integrals over ghost facets using a side-aware cache.
+
+        This routine correctly computes and caches basis function derivatives from
+        both sides ('+' and '-') of each ghost edge. The UFL visitors for Jump,
+        Avg, etc., are responsible for interpreting this side-aware cache to
+        construct the final integrand, which couples the degrees of freedom
+        from the adjacent elements. It also supports assembler hooks for assembling
+        scalar-valued functionals.
+        """
+
+        rhs = self.ctx.get('rhs', False)
+        mesh = self.me.mesh
+
+        # 1. Determine derivative orders needed.
+        derivs: set | None = intg.measure.metadata.get('derivs')
+        if derivs is None:
+            derivs = required_multi_indices(intg.integrand)
+        if (0, 0) not in derivs:
+            derivs = set(derivs) | {(0, 0)}
+
+        # 2. Get edge set and level set.
+        defined = intg.measure.defined_on
+        if defined is None:                       # ← fallback: all ghost edges
+            edge_ids = get_domain_bitset(mesh, 'edge', 'ghost')
+        else:
+            edge_ids = defined.to_indices()
+        level_set = getattr(intg.measure, 'level_set', None)
+        if level_set is None:
+            raise ValueError("dGhost measure requires a 'level_set' callable.")
+
+        qdeg = self._find_q_order(intg)
+        fields = _all_fields(intg.integrand)
+        
+        # New: Check for assembler hooks to handle scalar functionals.
+        trial, test = _trial_test(intg.integrand) # New
+        hook = self.ctx['hooks'].get(type(intg.integrand)) if intg.integrand else self.ctx['hooks'].get(Function) # New
+        is_functional = (hook is not None and trial is None and test is None) # New
+        if is_functional: # New
+            self.ctx.setdefault('scalar_results', {})[hook['name']] = 0.0 # New
+
+
+        # 3. Main Loop over all candidate edges.
+        for eid_edge in edge_ids:
+            edge = mesh.edge(eid_edge)
+            if edge.right is None:
+                continue
+            
+            # edge_left = mesh.edges_list[edge.left]
+            # edge_left_nodes = edge_left.nodes
+
+            # edge_right = mesh.edges_list[edge.right]
+            # edge_right_nodes = edge_right.nodes
+            # pL00,pL01,pL10,pL11 = mesh.nodes_x_y_pos[list(edge_left_nodes)]
+            # pR00,pR01,pR10,pR11 = mesh.nodes_x_y_pos[list(edge_right_nodes)]
+
+            phi_left  = level_set(np.asarray(mesh.elements_list[edge.left].centroid()))
+            phi_right = level_set(np.asarray(mesh.elements_list[edge.right].centroid()))
+           
+            if (phi_left < 0) == (phi_right < 0):
+                continue
+
+     
+            pos_eid, neg_eid = (edge.left, edge.right) if phi_left >= 0 else (edge.right, edge.left)
+
+            # 4. Setup for Quadrature and Local Assembly
+            p0, p1 = mesh.nodes_x_y_pos[list(edge.nodes)]
+            qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
+            normal_vec = edge.normal
+            if np.dot(normal_vec, mesh.elements_list[pos_eid].centroid() - qpts_phys[0]) < 0:
+                normal_vec *= -1.0
+
+            loc_accumulator = 0.0 if is_functional else None # New
+            
+            # New: Only set up DOF mapping if we are not assembling a functional.
+            if not is_functional: # New
+                pos_dofs = self.dh.get_elemental_dofs(pos_eid)
+                neg_dofs = self.dh.get_elemental_dofs(neg_eid)
+                global_dofs = np.unique(np.concatenate((pos_dofs, neg_dofs)))
+                pos_map = np.searchsorted(global_dofs, pos_dofs)   # e.g. [0,1,2,3,4,  8,9,10,11]
+                neg_map = np.searchsorted(global_dofs, neg_dofs)   # e.g. [5,6,7,     12,13,14]
+
+                if rhs:
+                    loc_accumulator = np.zeros(len(global_dofs))
+                else:
+                    loc_accumulator = np.zeros((len(global_dofs), len(global_dofs)))
+
+            # 5. Main Quadrature Loop
+            
+            for qp_phys, w in zip(qpts_phys, qwts):
+                bv: dict[str, dict] = {'+': {}, '-': {}}
+                for side, eid in (('+', pos_eid), ('-', neg_eid)):
+                    xi, eta = transform.inverse_mapping(mesh, eid, qp_phys)
+                    J = transform.jacobian(mesh, eid, (xi, eta))
+                    J_inv = np.linalg.inv(J)
+                    for fld in fields:
+                        bv[side].setdefault(fld, {})
+                        # ref = self.me._ref[fld]
+                        # for alpha in derivs:
+                        #     ref_val = ref.derivative(xi, eta, *alpha)
+                        #     push = transform.map_deriv(alpha, J, J_inv)
+                        #     phys_val = push(ref_val)
+                        #     bv[side][fld][alpha] = phys_val
+                        for alpha in derivs:
+                            ox, oy = alpha
+                            #------ref deriv zero padded
+                            ref_val = self.me.deriv_ref(fld, xi, eta, ox, oy)
+                            # -------- push-forward (axis-aligned map) ------------
+                            # for curved elements we need to change this
+                            sx = J_inv[0, 0] 
+                            sy = J_inv[1, 1]
+                            phys_val = ref_val * (sx ** ox) * (sy ** oy)   # (n_dofs,)
+                            if is_functional:
+                                # No union padding needed
+                                bv[side][fld][alpha] = phys_val
+                            else:
+                                full_val = np.zeros(len(global_dofs))
+                                if side == '+':
+                                    full_val[pos_map] = phys_val
+                                else:
+                                    full_val[neg_map] = phys_val
+                                # -------- cache for visitors -------------------------
+                                bv[side][fld][alpha] = full_val
+
+                eid_qp  = pos_eid if side == '+' else neg_eid
+                ctx_data = {'basis_values': bv, 'normal': normal_vec,
+                            'phi_val': level_set(qp_phys),
+                            'eid': eid_qp,
+                            'x_phys': qp_phys}
+                ctx_data.update({'pos_eid': pos_eid, 'neg_eid': neg_eid})
+                if not is_functional:
+                    ctx_data.update({'global_dofs': global_dofs,
+                                     'pos_map': pos_map,
+                                     'neg_map': neg_map})
+                self.ctx.update(ctx_data)
+                integrand_val = self._visit(intg.integrand)
+                loc_accumulator += w * integrand_val
+
+            # 6. Scatter contributions.
+            if is_functional: # New
+                # If it's a functional, add the accumulated scalar to the results dictionary.
+                self.ctx['scalar_results'][hook['name']] += loc_accumulator # New
+                continue
+            else: # New
+                # Otherwise, scatter the local matrix/vector to the global system.
+                if not rhs:
+                    r, c = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                    matvec[r, c] += loc_accumulator
+                else:
+                    np.add.at(matvec, global_dofs, loc_accumulator)
+
+        # 7. Final Context Cleanup
+        for k in ('basis_values', 'normal', 'phi_val', 'eid', 'x_phys', 'global_dofs', 'pos_map', 'neg_map'):
+            self.ctx.pop(k, None)
+>>>>>>> Stashed changes

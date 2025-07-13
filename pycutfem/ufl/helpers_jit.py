@@ -1,0 +1,456 @@
+import numpy as np
+from typing import Mapping, Tuple, Dict, Any, Sequence
+from pycutfem.integration import volume
+import logging # Added for logging warnings
+import os
+import re
+
+logger = logging.getLogger(__name__)
+
+def _pad_coeffs(coeffs, phi, ctx):
+    """Return coeffs padded to the length of `phi` on ghost edges."""
+    if phi.shape[0] == coeffs.shape[0] or "global_dofs" not in ctx:
+        return coeffs                       # interior element – nothing to do
+
+    padded = np.zeros_like(phi)
+    side   = '+' if ctx.get("phi_val", 0.0) >= 0 else '-'
+    amap   = ctx["pos_map"] if side == '+' else ctx["neg_map"]
+    padded[amap] = coeffs
+    return padded
+
+
+def _build_jit_kernel_args(       # ← NEW signature (unchanged)
+        ir,                       # linear IR produced by the visitor
+        expression,               # the UFL integrand
+        mixed_element,            # MixedElement instance
+        q_order: int,             # quadrature order
+        dof_handler,              # DofHandler – *needed* for padding
+        gdofs_map: np.ndarray=None, 
+        param_order=None,          # order of parameters in the JIT kernel
+        pre_built: dict | None = None
+    ):
+    """
+    Return a **dict { name -> ndarray }** with *all* reference-space tables
+    and coefficient arrays the kernel lists in `param_order`
+    (or – if `param_order` is None – in the IR).
+
+    Guarantees that names such as ``b_p``, ``g_ux``, ``d20_uy`` *always*
+    appear when requested.
+
+    Notes
+    -----
+    * The *mixed-space* element → global DOF map **(`gdofs_map`)** and
+      `node_coords` are **NOT** created here because the surrounding
+      assembler already provides them (and they do not depend on the IR).
+    * Set ``PYCUTFEM_JIT_DEBUG=1`` to get a short print-out of every array
+      built (name, shape, dtype) – useful for verification.
+    """
+
+    import logging
+
+    from pycutfem.integration import volume
+    from pycutfem.ufl.expressions import (
+        Function, VectorFunction, Constant as UflConst, Grad, ElementWiseConstant
+    )
+    from pycutfem.jit.ir import LoadVariable, LoadConstantArray, LoadElementWiseConstant
+    from pycutfem.ufl.analytic import Analytic
+    from pycutfem.ufl.compilers import _find_all
+
+    logger = logging.getLogger(__name__)
+    dbg    = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
+
+    # ------------------------------------------------------------------
+    # 0. Helpers
+    # ------------------------------------------------------------------
+    n_elem = mixed_element.mesh.n_elements
+
+    def _expand_per_element(ref_tab: np.ndarray) -> np.ndarray:
+        """
+        Replicate a reference-space table so that shape[0] == n_elem.
+
+        We keep memory overhead low with ``np.broadcast_to``; the
+        result is read-only, which is fine because kernels never write
+        into these tables.
+        """
+        return np.broadcast_to(ref_tab, (n_elem, *ref_tab.shape)).copy()
+
+    
+    def _basis_table(field: str):
+        ref = np.asarray([mixed_element.basis(field, *xi_eta)
+                          for xi_eta in qp_ref], dtype=np.float64)      # (n_q , n_loc)
+        return _expand_per_element(ref)                                 # (n_elem , n_q , n_loc)
+
+    def _grad_table(field: str):
+        ref = np.asarray([mixed_element.grad_basis(field, *xi_eta)
+                          for xi_eta in qp_ref], dtype=np.float64)      # (n_q , n_loc , 2)
+        return _expand_per_element(ref)  
+
+    def _deriv_table(field: str, ax: int, ay: int):
+        """∂^{ax+ay} φ_i / ∂ξ^{ax} ∂η^{ay}"""
+        ref = np.asarray(
+            [mixed_element.deriv_ref(field, *xi_eta, ax, ay)
+             for xi_eta in qp_ref],
+            dtype=np.float64
+            )
+        return _expand_per_element(ref)                                 # (n_elem, n_q, n_loc)
+
+    # ------------------------------------------------------------------
+    # 1. Reference-element quadrature (ξ-space)
+    # ------------------------------------------------------------------
+    qp_ref, _ = volume(mixed_element.mesh.element_type, q_order)
+
+    # ------------------------------------------------------------------
+    # 2. Map Function / VectorFunction names  →  objects
+    # ------------------------------------------------------------------
+    func_map: Dict[str, Any] = {}
+
+    for f in _find_all(expression, Function):
+        func_map[f.name] = f
+        func_map.setdefault(f.field_name, f)
+
+    for vf in _find_all(expression, VectorFunction):
+        func_map[vf.name] = vf
+        for comp, fld in zip(vf.components, vf.field_names):
+            func_map.setdefault(fld, vf)
+
+    # ------------------------------------------------------------------
+    # 3. Collect EVERY parameter the kernel will expect
+    # ------------------------------------------------------------------
+    required: set[str] = set(param_order) if param_order is not None else set()
+
+    # If `param_order` was not given collect names from the IR too
+    if param_order is None:
+        for op in ir:
+            if isinstance(op, LoadVariable):
+                fnames = (
+                    op.field_names if op.is_vector and op.field_names
+                    else [op.name]
+                )
+                for fld in fnames:
+                    if op.deriv_order == (0, 0):
+                        required.add(f"b_{fld}")
+                    else:
+                        d0, d1 = op.deriv_order
+                        required.add(f"d{d0}{d1}_{fld}")
+
+                    if op.role == "function":
+                        required.add(f"u_{op.name}_loc")
+
+            elif isinstance(op, LoadConstantArray):
+                required.add(op.name)
+
+        for g in _find_all(expression, Grad):
+            op = g.operand
+            if hasattr(op, "field_names"):
+                required.update(f"g_{f}" for f in op.field_names)
+            else:
+                required.add(f"g_{op.field_name}")
+
+    # ------------------------------------------------------------------
+    # 4. Build each requested array (skip ones already delivered elsewhere)
+    # ------------------------------------------------------------------
+    if pre_built is None:
+        pre_built = {}
+    predeclared = {
+         "gdofs_map", "node_coords", "element_nodes",
+         "qp_phys", "qw", "detJ", "J_inv", "normals", "phis"
+    }   
+    pre_built = {**{k: v for k, v in pre_built.items()
+                    if k in predeclared}, **pre_built}
+    args: Dict[str, Any] = dict(pre_built)
+
+    const_arrays = {
+        f"const_arr_{id(c)}": c
+        for c in _find_all(expression, UflConst) if c.dim != 0
+    }
+
+    # cache gdofs_map for coefficient gathering
+    if gdofs_map is None:
+        gdofs_map = np.vstack([
+            dof_handler.get_elemental_dofs(eid)
+            for eid in range(mixed_element.mesh.n_elements)
+        ]).astype(np.int32)
+
+    total_dofs = dof_handler.total_dofs
+
+    for name in sorted(required):
+        if name in args:
+            continue
+
+        # ---- basis tables ------------------------------------------------
+        if name.startswith("b_"):
+            fld = name[2:]
+            args[name] = _basis_table(fld)
+
+        # ---- gradient tables ---------------------------------------------
+        elif name.startswith("g_"):
+            fld = name[2:]
+            args[name] = _grad_table(fld)
+
+        # ---- higher-order ξ-derivatives ----------------------------------
+        elif re.match(r"d\d\d_", name):
+            tag, fld = name.split("_", 1)
+            ax, ay = int(tag[1]), int(tag[2])
+            args[name] = _deriv_table(fld, ax, ay)
+
+        
+
+        # ---- constant arrays ---------------------------------------------
+        elif name in const_arrays:
+            args[name] = const_arrays[name].value
+        
+        # ---- element-wise constants ---------------------------------------------
+        elif name.startswith("ewc_"):
+            obj_id = int(name.split("_", 1)[1])
+            ewc = next(c for c in _find_all(expression, ElementWiseConstant)
+                    if id(c) == obj_id)
+            args[name] = np.asarray(ewc.values, dtype=np.float64)
+        
+        # ---- analytic expressions ------------------------------------------------
+        elif name.startswith("ana_"):
+            func_id = int(name.split("_", 1)[1])
+            ana = next(a for a in _find_all(expression, Analytic)
+                    if id(a) == func_id)
+
+            # physical quadrature coordinates have already been built a few lines
+            # earlier and live in args["qp_phys"]  (shape = n_elem × n_qp × 2)
+            qp_phys = args["qp_phys"]
+            n_elem, n_qp, _ = qp_phys.shape
+            ana_vals = np.empty((n_elem, n_qp), dtype=np.float64)
+
+            # tabulate once, in pure NumPy
+            x = qp_phys[..., 0]
+            y = qp_phys[..., 1]
+            ana_vals[:] = ana.eval(np.stack((x, y), axis=-1))   # vectorised call
+
+            args[name] = ana_vals
+        # -------------------------------------------------------------------------
+        # (+) / (–)  side coefficient tables for ghost facets
+        # -------------------------------------------------------------------------
+        elif re.match(r"u_.*_(pos|neg)_loc$", name):
+            # requested symbol is e.g.  u_u_pos_loc  or  u_v_neg_loc
+            func_name, side = name[2:-4].rsplit("_", 1)   # "u", "pos" | "neg"
+            f = func_map[func_name]
+
+            # ---- 1. global vector of the Function --------------------------------
+            full = np.zeros(total_dofs, dtype=np.float64)
+            full[list(f._g2l.keys())] = f.nodal_values
+
+            # ---- 2. gather block-by-block along the bucket -----------------------
+            n_edges, union = gdofs_map.shape
+
+            # Convert ragged object-arrays into a proper 2-D table
+            amap = np.asarray(pre_built[f"{side}_map"])
+            if amap.ndim == 1:           # object array → rows of different length
+                from pycutfem.ufl.helpers_jit import _stack_ragged
+                amap = _stack_ragged(amap)          # pad with -1 to full rectangle
+
+            # Keep both maps in lock-step – work with the smaller row count
+            if amap.shape[0] != n_edges:
+                max_edges = min(amap.shape[0], n_edges)
+                amap      = amap[:max_edges]
+                gdofs_map = gdofs_map[:max_edges]
+                n_edges   = max_edges
+
+            coeff = np.zeros((n_edges, union), dtype=np.float64)
+
+            for e in range(n_edges):
+                sel_all = amap[e]
+                # keep only valid positions *inside this union*
+                sel = sel_all[(sel_all >= 0) & (sel_all < union)]
+                if sel.size:
+                    coeff[e, sel] = full[gdofs_map[e, sel]]
+
+            args[name] = coeff
+            continue   # <- do NOT let the generic "u_*_loc" branch see this name
+
+        # ---- coefficient vectors / element-local blocks ------------------
+        elif name.startswith("u_") and name.endswith("_loc"):
+            func_name = name[2:-4]          # strip 'u_'   and '_loc'
+            f = func_map.get(func_name)
+            if f is None:
+                raise NameError(
+                    f"Kernel requests coefficient array for unknown Function "
+                    f"or VectorFunction '{func_name}'."
+                )
+
+            # build once – padding to GLOBAL length ensures safe gather
+            full_vec = np.zeros(total_dofs, dtype=np.float64)
+            for gdof, lidx in f._g2l.items():
+                full_vec[gdof] = f.nodal_values[lidx]
+
+            args[name] = full_vec[gdofs_map]
+
+        else:
+            logger.warning(
+                f"[build_jit_kernel_args] unrecognised kernel parameter '{name}' "
+                "– skipped."
+            )
+
+    # ------------------------------------------------------------------
+    # 5. Optional debug print
+    # ------------------------------------------------------------------
+    if dbg:
+        print("[build_jit_kernel_args] built:")
+        for k, v in args.items():
+            if isinstance(v, np.ndarray):
+                print(f"    {k:<20} shape={v.shape} dtype={v.dtype}")
+            else:
+                print(f"    {k:<20} type={type(v).__name__}")
+
+    qp_phys = args["qp_phys"]
+    n_elem, n_qp, _ = qp_phys.shape
+ 
+    # ------------------------------------------------------ default facet data
+    # A volume kernel still carries the *name* "normals" because the generated
+    # code contains the line
+    #       normal_q = normals[e, q] if normals is not None else np.zeros(2)
+    # Give it a harmless zero array so the symbol is always defined.
+    # if "normals" in param_order and "normals" not in args:
+    #     args["normals"] = np.zeros((n_elem, n_qp, 2), dtype=np.float64)
+    # if "phis" in param_order and "phis" not in args:
+    #     args["phis"]    = np.zeros((n_elem, n_qp),     dtype=np.float64)
+    # ------------------------------------------------------------------
+    # 6.  Dummy defaults for detJ / J_inv (ghost edges don’t need them
+    #     but the generated signature still lists them)
+    # ------------------------------------------------------------------
+    if "detJ" in required and "detJ" not in args:
+        n_el, n_qp, _ = args["qp_phys"].shape
+        args["detJ"] = np.ones((n_el, n_qp), dtype=np.float64)
+
+    if "J_inv" in required and "J_inv" not in args:
+        n_el, n_qp, _ = args["qp_phys"].shape
+        eye = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+        args["J_inv"] = np.broadcast_to(eye, (n_el, n_qp, 2, 2)).copy()
+    return args
+
+
+def _scatter_element_contribs(
+    K_elem: np.ndarray | None,
+    F_elem: np.ndarray | None,
+    J_elem: np.ndarray | None,
+    element_ids: np.ndarray,
+    gdofs_map: np.ndarray,
+    matvec: np.ndarray,
+    ctx: dict,
+    integrand,
+):
+    """
+    Generic scatter for element-based JIT kernels (e.g., dInterface).
+    """
+    rhs = ctx.get("rhs", False)
+    hook = ctx.get("hooks", {}).get(type(integrand))
+
+    # --- Matrix contributions ---
+    if not rhs and K_elem is not None and K_elem.ndim == 3:
+        for i, eid in enumerate(element_ids):
+            gdofs = gdofs_map[i]
+            r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
+            matvec[r, c] += K_elem[i]
+
+    # --- Vector contributions ---
+    if rhs and F_elem is not None:
+        for i, eid in enumerate(element_ids):
+            gdofs = gdofs_map[i]
+            np.add.at(matvec, gdofs, F_elem[i])
+
+    # --- Functional contributions ---
+    if hook and J_elem is not None:
+        # print(f"J_elem.shape: {J_elem.shape}---J_elem: {J_elem}")
+        total = J_elem.sum(axis=0) if J_elem.ndim > 1 else J_elem.sum()
+        # This accumulator logic is correct.
+        acc = ctx.setdefault("scalar_results", {}).setdefault(
+            hook["name"], np.zeros_like(total)
+        )
+        acc += total
+
+# -------------------------------------------------------------------------# helper – ghost edge scatter
+# -------------------------------------------------------------------------
+def _scatter_ghost_edge_contribs(K, F, J, geo, matvec, ctx, integrand):
+    rhs  = ctx["rhs"]
+    hook = ctx["hooks"].get(type(integrand))
+
+    # ------------------------------------------------------------------
+    #  Matrix block K[e] is *pos-side* 9×9.  Scatter it only to those
+    #  nine global DOFs (g[pm]) so the shapes agree (9 ↔ 9).
+    # ------------------------------------------------------------------
+    if (not rhs) and K is not None and K.ndim == 3:
+        for e, (g, pm, nm) in enumerate(
+                zip(geo["global_dofs"], geo["pos_map"], geo["neg_map"])):
+            edge_dofs = g[pm]                                   # len = 9
+            r, c = np.meshgrid(edge_dofs, edge_dofs, indexing="ij")
+            matvec[r, c] += K[e]
+
+    # ------------------------------------------------------------------
+    #  RHS blocks are likewise 9-long (pos side).  Map by pm.
+    # ------------------------------------------------------------------
+    if rhs and F is not None:
+        for e, (g, pm, nm) in enumerate(
+                zip(geo["global_dofs"], geo["pos_map"], geo["neg_map"])):
+            np.add.at(matvec, g[pm], F[e])
+
+    # --- Scalar (hooked) functional -----------------------------------
+    if hook and J is not None:
+        total = J.sum(axis=0) if J.ndim > 1 else J.sum()
+        acc = ctx.setdefault("scalar_results", {}).setdefault(
+                   hook["name"], np.zeros_like(total))
+        acc += total            # in-place update → dictionary entry change
+
+# -------------------------------------------------------------------------
+# helper – edge / interface block scatter
+# -------------------------------------------------------------------------
+def _stack_ragged(chunks: Sequence[np.ndarray]) -> np.ndarray:
+    """Stack 1‑D integer arrays of variable length → 2‑D, padded with ‑1."""
+    n = len(chunks)
+    m = max(len(c) for c in chunks)
+    out = -np.ones((n, m), dtype=np.int32)
+    for i, c in enumerate(chunks):
+        out[i, : len(c)] = c
+    return out
+def _scatter_edge_contribs(
+    K_edge: np.ndarray | None,
+    F_edge: np.ndarray | None,
+    J_edge: np.ndarray | None,
+    edge_ids: Sequence[int],
+    matvec: np.ndarray,
+    ctx: dict,
+    dh: "DofHandler",
+    integrand,
+):
+    """
+    Generic scatter for edge-based JIT kernels.
+
+    # Only scatter into the (n_dofs × n_dofs) matrix of a *bilinear* form.
+    if (not rhs) and matvec.ndim == 2 and K_edge is not None and K_edge.ndim == 3:
+    """
+    rhs  = ctx["rhs"]
+    hook = ctx["hooks"].get(type(integrand))
+
+    mesh = dh.mixed_element.mesh
+    print(f"K_edge shape: {K_edge.shape if K_edge is not None else 'None'}")
+    print(f"F_edge shape: {F_edge.shape if F_edge is not None else 'None'}")
+
+    # ------------------------------------------------------------------ matrix
+    if (not rhs) and K_edge is not None and K_edge.ndim == 3:
+        n_loc = K_edge.shape[1]
+        for e, eid in enumerate(edge_ids):
+            # For interface edges we only need ONE element (choose .left)
+            gdofs = dh.get_elemental_dofs(mesh.edge(eid).left)
+            # (n_loc, n_loc) should already match gdofs length:
+            r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
+            matvec[r, c] += K_edge[e]
+
+    # ------------------------------------------------------------------ vector
+    if rhs and F_edge is not None:
+        n_loc = F_edge.shape[1]
+        for e, eid in enumerate(edge_ids):
+            gdofs = dh.get_elemental_dofs(mesh.edge(eid).left)
+            np.add.at(matvec, gdofs, F_edge[e])
+
+    # ---------------------------------------------------------------- functional
+    if hook and J_edge is not None:
+        total = J_edge.sum(axis=0) if J_edge.ndim > 1 else J_edge.sum()
+        acc   = ctx.setdefault("scalar_results", {}).setdefault(
+                    hook["name"], np.zeros_like(total))
+        acc += total
+

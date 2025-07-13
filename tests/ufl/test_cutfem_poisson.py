@@ -6,13 +6,13 @@ import scipy.sparse.linalg as spla
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
-from pycutfem.utils.bitset import BitSet
+# from pycutfem.utils.bitset import BitSet
 from pycutfem.utils.domain_manager import get_domain_bitset
 
 # --- UFL-like imports ---
 from pycutfem.ufl.expressions import (TrialFunction, TestFunction, grad, inner, jump,dot,
-                             ElementWiseConstant, Constant)
-from pycutfem.ufl.measures import dx, ds, dInterface
+                             ElementWiseConstant, Constant, FacetNormal)
+from pycutfem.ufl.measures import dx, dInterface
 from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 
 # --- Level Set and Cut Ratio imports ---
@@ -39,6 +39,7 @@ def test_cutfem_poisson_interface():
     # Classify mesh elements and edges against the level set
     mesh.classify_elements(level_set)
     mesh.classify_edges(level_set)
+    n = FacetNormal()  # unit normal from ctx
 
     # 2. Create BitSets for the integration domains
     neg_elements = get_domain_bitset(mesh, 'element', 'outside')
@@ -87,7 +88,9 @@ def test_cutfem_poisson_interface():
     a += inner(alpha * grad(u_pos), grad(v_pos)) * dx(defined_on=pos_elements | cut_elements)
     
     # Interface terms use the ds measure, which now requires the level_set for orientation
-    a += ( dot(avg_flux_u, jump_v) + dot(avg_flux_v, jump_u) + stab * jump_u * jump_v ) * dInterface( level_set=level_set)
+    a += ( dot(dot(avg_flux_u,n), jump_v) 
+          + dot(dot(avg_flux_v,n), jump_u) 
+          + stab * jump_u * jump_v ) * dInterface( level_set=level_set)
 
     # Right-hand side
     f = Constant(1.0) * v_neg * dx(defined_on=neg_elements | cut_elements)
