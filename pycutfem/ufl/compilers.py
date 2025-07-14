@@ -1335,6 +1335,8 @@ class FormCompiler:
         # 3. Compile kernel
         runner, ir = self._compile_backend(intg.integrand, dh, me)
 
+        
+
         # 4. Build kernel arguments
         # The precomputed factors are now the "basis tables"
         # We must also provide the DOF maps for coefficient padding
@@ -1358,7 +1360,15 @@ class FormCompiler:
         )
 
         # 5. Get current functions and execute kernel
-        current_funcs = {f.name: f for f in _find_all(intg.integrand, (Function, VectorFunction))}
+        current_funcs = {
+            f.name: f
+            for f in _find_all(intg.integrand, (Function, VectorFunction))
+        }
+        # also map parent VectorFunction names when we see a scalar component
+        for f in list(current_funcs.values()):
+            pv = getattr(f, "_parent_vector", None)
+            if pv is not None:
+                current_funcs.setdefault(pv.name, pv)
         
         # The runner now gets per-edge arguments
         K_edge, F_edge, J_edge = runner(current_funcs, args)

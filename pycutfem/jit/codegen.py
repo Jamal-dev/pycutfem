@@ -34,6 +34,7 @@ class StackItem:
     field_names: list = field(default_factory=list)
     # Stores the name of the parent Function/VectorFunction
     parent_name: str = ""
+    side: str = ""  # Side for ghost integrals, e.g., "+", "-", or ""
     # tiny shim so we can write  item = item._replace(var_name="tmp")
     def _replace(self, **changes) -> "StackItem":
         
@@ -58,6 +59,7 @@ class NumbaCodeGen:
         self.me = mixed_element
         self.n_dofs_local = self.me.n_dofs_local
         self.spatial_dim = self.me.mesh.spatial_dim
+        self.last_side_for_store = "" # Track side for detJ
 
     def generate_source(self, ir_sequence: list, kernel_name: str):
         body_lines = []
@@ -108,141 +110,181 @@ class NumbaCodeGen:
                                     role='const',
                                     shape=(), is_vector=False))
             # --- LOAD OPERATIONS ---
+            # ---------------------------------------------------------------------------
+            # LOADVARIABLE –– basis tables and coefficient look-ups
+            # ---------------------------------------------------------------------------
             elif isinstance(op, LoadVariable):
-                # This block handles loading all variables: test/trial functions and coefficient functions,
-                # for both standard volume/interface integrals and side-aware ghost edge integrals.
-                # It correctly generates code to access different data arrays based on the `op.side`
-                # attribute, which can be "", "+", or "-".
-
                 # ------------------------------------------------------------------
-                # 1. Setup: Determine names, sides, and derivatives from the IR
+                # 1. Common set-up --------------------------------------------------
                 # ------------------------------------------------------------------
-
-                # A helper to create the correct argument name for basis/derivative tables.
-                # e.g., get_arg_name("u", (1,1), "_pos") -> "d11_u_pos"
-                def get_arg_name(field_name, deriv, side_suffix):
-                    """Constructs the canonical name for a basis/derivative table argument."""
-                    # Use 'b' for basis functions (zeroth derivative), 'd' for others.
-                    d_str = f"d{deriv[0]}{deriv[1]}" if deriv != (0, 0) else "b"
-                    return f"{d_str}_{field_name}{side_suffix}"
-
                 deriv_order = op.deriv_order
                 field_names = op.field_names
-                # The side_suffix is the key to handling different integral types.
-                # It will be "_pos", "_neg", or "" (for standard volume/interface).
-                side_suffix = f"_{op.side}" if op.side else ""
 
-                # ------------------------------------------------------------------
-                # 2. Jacobian Selection for Derivative Push-forward
-                # ------------------------------------------------------------------
-                # The kernel will be passed the correct inverse Jacobian(s). We just
-                # need to generate code that uses the right one based on the side.
-                if op.side == "+":
-                    jinv_sym = "J_inv_pos_q"
-                    required_args.add("J_inv_pos")
-                elif op.side == "-":
-                    jinv_sym = "J_inv_neg_q"
-                    required_args.add("J_inv_neg")
-                else: # Standard volume or interface integral
-                    jinv_sym = "J_inv_q"
-                    # 'J_inv' is a default argument for volume/interface kernels.
+                # *Reference* tables are side-agnostic (no suffix)        # NEW
+                side_suffix_basis = ""                                   # NEW
 
-                # ------------------------------------------------------------------
-                # 3. Generate code to load basis/derivative tables
-                # ------------------------------------------------------------------
-                # Get the names of the required pre-computed tables (e.g., ['d10_u_pos', 'd10_v_pos'])
-                basis_arg_names = [get_arg_name(fname, deriv_order, side_suffix) for fname in field_names]
+                # helper: "dxy_" or "b_" + field name
+                def get_basis_arg_name(field_name, deriv):
+                    d_str = f"d{deriv[0]}{deriv[1]}" if deriv != (0, 0) else "b"
+                    return f"{d_str}_{field_name}{side_suffix_basis}"
 
-                # Ensure these tables are requested as kernel parameters
+                basis_arg_names = [get_basis_arg_name(fname, deriv_order) for fname in field_names]
                 for arg_name in basis_arg_names:
                     required_args.add(arg_name)
 
-                # In the kernel, these tables have shape (n_entities, n_q, ...).
-                # We generate code to select the data for the current entity `e` and quadrature point `q`.
-                # The loop variable 'e' represents an element index for volume integrals
-                # and an edge index for ghost integrals. The generated code is agnostic to this.
+                # Which J⁻¹ to use for push-forward / derivatives
+                if op.side == "+":
+                    jinv_sym = "J_inv_pos_q"; required_args.add("J_inv_pos")
+                elif op.side == "-":
+                    jinv_sym = "J_inv_neg_q"; required_args.add("J_inv_neg")
+                else:
+                    jinv_sym = "J_inv_q";      required_args.add("J_inv")
+
+                # reference value(s) at current quadrature point
                 basis_vars_at_q = [f"{arg_name}[e, q]" for arg_name in basis_arg_names]
 
                 # ------------------------------------------------------------------
-                # 4. Handle based on role: Test/Trial vs. Function
+                # 2. Test / Trial functions  ---------------------------------------
                 # ------------------------------------------------------------------
-
-                # --- A. Test / Trial Functions (Symbolic Basis Functions) ---
                 if op.role in ("test", "trial"):
-                    # For vector functions, we stack the basis functions for each component.
-                    # For scalar functions, we reshape to have a leading dimension of 1 for consistent shapes.
+
+                    if op.side:                                              # ghost edge: pad to DOF-union
+                        local_basis_var  = new_var("local_basis")
+                        body_lines.append(f"{local_basis_var} = {basis_vars_at_q[0]}")
+
+                        map_array = "pos_map_e" if op.side == "+" else "neg_map_e"
+                        required_args.add("pos_map" if op.side == "+" else "neg_map")    # NEW
+
+                        padded_basis_var = new_var("padded_basis")
+                        body_lines += [
+                            f"{map_array} = {'pos_map' if op.side == '+' else 'neg_map'}[e]",  # NEW
+                            f"print(f'gdofs_map[e].shape: {{gdofs_map[e].shape}}')",  # NEW
+                            f"n_union = gdofs_map[e].shape[0]",    
+                            f"{map_array}.shape: {{{map_array}.shape}}",                              # NEW
+                            f"{padded_basis_var} = np.zeros(n_union, dtype=np.float64)",  
+                            f"{padded_basis_var}.shape: {{{padded_basis_var}.shape}}",      # NEW
+                            f"for j in range({local_basis_var}.shape[0]):",                     # NEW
+                            f"    idx = {map_array}[j]",                                        # NEW
+                            f"    if idx >= 0:",                                                # NEW
+                            f"        {padded_basis_var}[idx] = {local_basis_var}[j]",          # NEW
+                        ]
+                        final_basis_var = padded_basis_var
+                        n_dofs          = -1                                                    # run-time  # NEW
+                    else:                                                     # volume / interface
+                        final_basis_var = basis_vars_at_q[0]
+                        n_dofs          = self.me.n_dofs_local
+
+                    # reshape or stack
                     if not op.is_vector:
                         var_name = new_var("basis_reshaped")
-                        body_lines.append(f"{var_name} = {basis_vars_at_q[0]}[np.newaxis, :].copy()")
-                        # The runtime shape will be (1, n_dofs_local) for volume integrals or
-                        # (1, n_dofs_union) for ghost integrals.
-                        shape = (1, -1) # -1 indicates the size is determined at runtime.
+                        body_lines.append(f"{var_name} = {final_basis_var}[np.newaxis, :].copy()")
+                        shape = (1, n_dofs)
                     else:
                         var_name = new_var("basis_stack")
                         body_lines.append(f"{var_name} = np.stack(({', '.join(basis_vars_at_q)}))")
-                        # Runtime shape will be (k, n_dofs_local) or (k, n_dofs_union).
-                        shape = (len(field_names), -1)
+                        shape = (len(field_names), n_dofs)
 
-                    # Apply push-forward for derivatives using the correct side's Jacobian.
-                    # This simplified scaling is for axis-aligned mappings. The full tensor
-                    # transformation g_phys = g_ref @ J_inv.T is handled by the Grad visitor.
+                    # push-forward for ∂-ordered bases
                     if deriv_order != (0, 0):
                         dx, dy = deriv_order
-                        scale = f"({jinv_sym}[0,0]**{dx}) * ({jinv_sym}[1,1]**{dy})"
+                        scale  = f"({jinv_sym}[0,0]**{dx}) * ({jinv_sym}[1,1]**{dy})"
                         body_lines.append(f"{var_name} *= {scale}")
 
                     stack.append(
                         StackItem(
-                            var_name=var_name,
-                            role=op.role,
-                            shape=shape,
-                            is_vector=op.is_vector,
-                            field_names=field_names,
-                            parent_name=op.name,
+                            var_name   = var_name,
+                            role       = op.role,
+                            shape      = shape,
+                            is_vector  = op.is_vector,
+                            field_names= field_names,
+                            parent_name= op.name
                         )
                     )
 
-                # --- B. Coefficient Functions (Evaluated Numerical Values) ---
+                # ------------------------------------------------------------------
+                # 3. Coefficient / Function values ---------------------------------
+                # ------------------------------------------------------------------
                 elif op.role == "function":
-                    # Construct the side-aware coefficient variable name, e.g., "u_myfunc_pos_loc"
-                    coeff_sym = f"u_{op.name}{side_suffix}_loc"
-                    # Tell the argument builder that this kernel needs this coefficient array.
-                    required_args.add(coeff_sym)
+                    # side suffix only for *coefficients*  ( __pos / __neg )  # NEW
+                    from pycutfem.jit.symbols import POS_SUFFIX, NEG_SUFFIX   # NEW
+                    coeff_side = POS_SUFFIX if op.side == "+" else NEG_SUFFIX if op.side == "-" else ""  # NEW
 
-                    # The kernel's outer loop unpacks the per-entity coefficients into `coeff_sym_e`.
-                    # We generate code to perform the dot product: Σ (coeffs_i * basis_i)
+                    if op.name.startswith("u_") and op.name.endswith("_loc"):
+                        coeff_sym = op.name[:-4] + f"{coeff_side}_loc"        # NEW
+                    else:
+                        coeff_sym = f"u_{op.name}{coeff_side}_loc"            # NEW
+
+                    required_args.add(coeff_sym)
+                    solution_func_names.add(coeff_sym)
+
+                    # NEW – pad reference basis to the DOF-union on ghost edges
+                    if op.side:                                         # "+" or "-"
+                        map_array = "pos_map_e" if op.side == "+" else "neg_map_e"
+                        required_args.add("pos_map" if op.side == "+" else "neg_map")
+                        body_lines.append(f"{map_array} = "
+                                        f"{'pos_map' if op.side == '+' else 'neg_map'}[e]")
+                        body_lines.append(f"n_union = gdofs_map[e].shape[0]")
+                        padded = []
+                        for i, b_var in enumerate(basis_vars_at_q):
+                            local = new_var(f"local_basis{i}")
+                            pad   = new_var(f"padded_basis{i}")
+                            body_lines += [
+                                f"{local} = {b_var}",
+                                f"{pad}   = np.zeros(n_union, dtype=np.float64)",
+                                f"for j in range({local}.shape[0]):",
+                                f"    idx = {map_array}[j]",
+                                f"    if idx >= 0:",
+                                f"        {pad}[idx] = {local}[j]",
+                            ]
+                            padded.append(pad)
+                        final_basis_var = padded
+                        basis_vars_at_q = padded
+                    else:
+                        final_basis_var = basis_vars_at_q[0]
+
                     val_var = new_var(f"{op.name}_val")
 
+                    # dot product(s) with the coefficient vector
                     if op.is_vector:
-                        # For each component, dot its basis functions with the full coefficient vector.
-                        comps = [f"np.dot({b_var}, {coeff_sym}_e)" for b_var in basis_vars_at_q]
+                        comps = []
+                        for b_var in basis_vars_at_q:             # handle each component
+                            if op.side:
+                                tmp_l = new_var("tmp_basis")
+                                tmp_p = new_var("tmp_pad")
+                                body_lines += [
+                                    f"{tmp_l} = {b_var}",
+                                    f"{tmp_p} = np.zeros(n_union, dtype=np.float64)",
+                                    f"for j in range({tmp_l}.shape[0]):",
+                                    f"    idx = {map_array}[j]",
+                                    f"    if idx >= 0:",
+                                    f"        {tmp_p}[idx] = {tmp_l}[j]",
+                                ]
+                                comps.append(f"np.dot({tmp_p}, {coeff_sym})")
+                            else:
+                                comps.append(f"np.dot({b_var}, {coeff_sym})")
                         body_lines.append(f"{val_var} = np.array([{', '.join(comps)}])")
                         shape = (len(field_names),)
                     else:
-                        body_lines.append(f"{val_var} = np.dot({basis_vars_at_q[0]}, {coeff_sym}_e)")
+                        body_lines.append(f"{val_var} = np.dot({basis_vars_at_q[0]}, {coeff_sym})")
                         shape = ()
 
-                    # Apply push-forward for derivatives, same as for test/trial.
                     if deriv_order != (0, 0):
                         dx, dy = deriv_order
-                        scale = f"({jinv_sym}[0,0]**{dx}) * ({jinv_sym}[1,1]**{dy})"
+                        scale  = f"({jinv_sym}[0,0]**{dx}) * ({jinv_sym}[1,1]**{dy})"
                         body_lines.append(f"{val_var} *= {scale}")
 
                     stack.append(
                         StackItem(
-                            var_name=val_var,
-                            role="value",
-                            shape=shape,
-                            is_vector=op.is_vector,
-                            field_names=field_names,
-                            parent_name=coeff_sym, # Store the canonical coefficient name for later reference
+                            var_name   = val_var,
+                            role       = "value",
+                            shape      = shape,
+                            is_vector  = op.is_vector,
+                            field_names= field_names,
+                            parent_name= coeff_sym
                         )
                     )
-
-
-                    
                 else:
-                    raise TypeError(f"Unknown role '{operand.role}' for LoadVariable/Derivative")
+                    raise TypeError(f"Unknown role '{op.role}' for LoadVariable IR node.")
 
             elif isinstance(op, LoadConstant):
                 stack.append(StackItem(var_name=str(op.value), role='const', shape=(), is_vector=False, field_names=[]))
@@ -258,60 +300,84 @@ class NumbaCodeGen:
 
 
             # --- UNARY OPERATORS ---
+            # ---------------------------------------------------------------------------
+            # GRAD -- push forward reference-space gradients to physical space
+            # ---------------------------------------------------------------------------
             elif isinstance(op, Grad):
-                a = stack.pop()
+                a        = stack.pop()
                 grad_var = new_var("grad")
-                
-                def get_grad_arg_name(field_name): return f"g_{field_name}"
-                
-                grad_basis_vars = [f"{get_grad_arg_name(fname)}_q" for fname in a.field_names]
-                for fname in a.field_names: required_args.add(get_grad_arg_name(fname))
 
-                if a.role in ('test', 'trial'):
+                # --- choose the inverse-Jacobian for the requested side ----------------
+                if a.side == "+":
+                    jinv_sym = "J_inv_pos_q"; required_args.add("J_inv_pos")
+                elif a.side == "-":
+                    jinv_sym = "J_inv_neg_q"; required_args.add("J_inv_neg")
+                else:
+                    jinv_sym = "J_inv_q";      required_args.add("J_inv")
+
+                # --- reference-gradient tables carry *no* side suffix # NEW ------------
+                def get_grad_arg_name(field_name):           # NEW
+                    return f"g_{field_name}_q"               # NEW
+
+                grad_basis_vars_at_q = [get_grad_arg_name(fname) for fname in a.field_names]  # NEW
+                for fname in grad_basis_vars_at_q:
+                    required_args.add(fname)
+
+                # ----------------------------------------------------------------------
+                # (A) grad(Test/Trial)  –– symbolic gradient matrices
+                # ----------------------------------------------------------------------
+                if a.role in ("test", "trial"):
+
                     phys_grad_vars = []
                     for i, fname in enumerate(a.field_names):
                         phys_grad_var = new_var(f"phys_grad_{fname}")
-                        body_lines.append(f"{phys_grad_var} = {grad_basis_vars[i]} @ J_inv_q.transpose().copy()")
+                        body_lines.append(                                              # ∇φ_ref @ J⁻¹ᵀ
+                            f"{phys_grad_var} = {grad_basis_vars_at_q[i]} @ {jinv_sym}.transpose().copy()")
                         phys_grad_vars.append(phys_grad_var)
-                    
-                    if not a.is_vector:
+
+                    n_dofs = self.n_dofs_local if not a.side else -1                    # −1 ⇒ run-time size  # NEW
+
+                    if not a.is_vector:                                                 # scalar space
                         var_name = new_var("grad_reshaped")
                         body_lines.append(f"{var_name} = {phys_grad_vars[0]}[np.newaxis, :, :].copy()")
-                        shape = (1, self.n_dofs_local, self.spatial_dim)
-                    else:
+                        shape = (1, n_dofs, self.spatial_dim)
+                    else:                                                               # vector space
                         var_name = new_var("grad_stack")
                         body_lines.append(f"{var_name} = np.stack(({', '.join(phys_grad_vars)}))")
-                        shape = (len(a.field_names), self.n_dofs_local, self.spatial_dim)
-                    stack.append(StackItem(var_name=var_name, role=a.role, shape=shape, is_gradient=True, is_vector=False, field_names=a.field_names, parent_name=a.parent_name))
+                        shape = (len(a.field_names), n_dofs, self.spatial_dim)
 
-                elif a.role == "value":                                 # grad(Function)
-                    # ∇f(x_q) = Σ_i u_i ∇φ_i(x_q)
-                    grad_val_comps = []
-                    # coeff_name = encode(a.parent_name, None)
-                    print(f"DEBUG grad(fun): a.parent_name: {a.parent_name}")
+                    stack.append(a._replace(var_name = var_name,
+                                            shape    = shape,
+                                            is_gradient = True))
+
+                # ----------------------------------------------------------------------
+                # (B) grad(Function) –– numerical gradient of a coefficient
+                # ----------------------------------------------------------------------
+                elif a.role == "value":
+                    # canonical coefficient name (without side suffix)
                     if a.parent_name.startswith("u_") and a.parent_name.endswith("_loc"):
                         coeff_name = a.parent_name
                     else:
                         coeff_name = f"u_{a.parent_name}_loc"
+
+                    grad_val_comps = []
                     for i, fname in enumerate(a.field_names):
                         phys_grad_basis = new_var(f"phys_grad_basis_{fname}")
                         body_lines.append(
-                            f"{phys_grad_basis} = {grad_basis_vars[i]} @ J_inv_q.transpose().copy()"
-                        )
+                            f"{phys_grad_basis} = {grad_basis_vars_at_q[i]} @ {jinv_sym}.transpose().copy()")
 
                         grad_val_comp = new_var(f"grad_val_{fname}")
                         body_lines.append(
-                            f"{grad_val_comp} = {phys_grad_basis}.T.copy() @ {coeff_name}"
-                        )
+                            f"{grad_val_comp} = {phys_grad_basis}.T.copy() @ {coeff_name}")
                         grad_val_comps.append(grad_val_comp)
 
                     if not a.is_vector:
                         var_name = grad_val_comps[0]
-                        shape = (self.spatial_dim,)
+                        shape    = (self.spatial_dim,)
                     else:
                         var_name = new_var("grad_val_stack")
                         body_lines.append(f"{var_name} = np.stack(({', '.join(grad_val_comps)}))")
-                        shape = (len(a.field_names), self.spatial_dim)
+                        shape    = (len(a.field_names), self.spatial_dim)
 
                     stack.append(
                         StackItem(
@@ -321,11 +387,12 @@ class NumbaCodeGen:
                             is_gradient = True,
                             is_vector   = False,
                             field_names = a.field_names,
-                            parent_name = coeff_name    # keep the canon. form
+                            parent_name = coeff_name
                         )
                     )
                 else:
                     raise NotImplementedError(f"Grad not implemented for role {a.role}")
+
             
             elif isinstance(op, Div):
                 a = stack.pop()
@@ -878,26 +945,63 @@ class NumbaCodeGen:
                             f"and gradient flags {a.is_gradient}/{b.is_gradient}."
                             f" Shapes: {a.shape}/{b.shape}"
                         )
-                 # -----------------------------------------------------------------
-                 # -------------  ADDITION / SUBTRACTION  (+  -)  ------------------
-                 # -----------------------------------------------------------------
+                 # ---------------------------------------------------------------------------
+                 # Binary “+ / −” (element-wise) --------------------------------------------
+                 # ---------------------------------------------------------------------------
                  elif op.op_symbol in ('+', '-'):
                     sym = op.op_symbol
-                    body_lines.append(f"# {'Addition' if sym=='+' else 'Subtraction'}")
+                    body_lines.append(f"# {'Addition' if sym == '+' else 'Subtraction'}")
 
+                    # --- utilities ---------------------------------------------------------
                     def _merge_role(ra, rb):
                         if 'trial' in (ra, rb):  return 'trial'
                         if 'test'  in (ra, rb):  return 'test'
                         if 'value' in (ra, rb):  return 'value'
                         return 'const'
 
-                    # ----------------------------------------------------------------
-                    # CASE A – one operand is a true scalar () ➜ broadcast
-                    # ----------------------------------------------------------------
+                    def _broadcast_shape_with_minus1(sa, sb):
+                        """
+                        Like numpy.broadcast_shapes but treats -1 as a wildcard
+                        (run-time size).  Compatible with NumPy’s rules otherwise.
+                        """
+                        from itertools import zip_longest
+                        la, lb      = len(sa), len(sb)
+                        max_len     = max(la, lb)
+                        ra          = (1,)*(max_len-la) + sa
+                        rb          = (1,)*(max_len-lb) + sb
+                        out         = []
+                        for da, db in zip_longest(ra, rb):
+                            if da == db:               out.append(da)
+                            elif da == 1:              out.append(db)
+                            elif db == 1:              out.append(da)
+                            elif da == -1 or db == -1: out.append(-1)      # NEW rule
+                            else:
+                                raise NotImplementedError(
+                                    f"'{sym}' cannot broadcast shapes {sa} and {sb}"
+                                )
+                        # drop leading unit dims if NumPy would do so
+                        while len(out) > 0 and out[0] == 1:
+                            out.pop(0)
+                        return tuple(out)
+
+                    # ----------------------------------------------------------------------
+                    # CASE A – broadcast with true scalar on exactly one side
+                    # ----------------------------------------------------------------------
                     scalar_left  = (a.shape == () and not a.is_vector and not a.is_gradient)
                     scalar_right = (b.shape == () and not b.is_vector and not b.is_gradient)
 
-                    if scalar_left ^ scalar_right:
+                    # Special-case: subtracting two ghost-edge bases (both have -1 shape)
+                    if (a.role in ('test', 'trial') and b.role in ('test', 'trial')
+                        and -1 in a.shape and -1 in b.shape):
+                        body_lines.append("# Addition / subtraction of two ghost-edge bases")
+                        body_lines.append(f"{res_var} = {a.var_name} {sym} {b.var_name}")
+                        stack.append(a._replace(
+                            var_name = res_var,
+                            role     = _merge_role(a.role, b.role)
+                        ))
+
+                    elif scalar_left ^ scalar_right:
+                        # exactly one side is a scalar -> NumPy will broadcast
                         non_scal, scal = (b, a) if scalar_left else (a, b)
                         body_lines.append("# scalar broadcast with non-scalar")
                         body_lines.append(f"{res_var} = {non_scal.var_name} {sym} {scal.var_name}")
@@ -910,17 +1014,18 @@ class NumbaCodeGen:
                             field_names = non_scal.field_names
                         ))
 
-                    # ----------------------------------------------------------------
-                    # CASE B – both operands have the same vec/grad flags and the
-                    #          shapes are broadcast-compatible
-                    # ----------------------------------------------------------------
+                    # ----------------------------------------------------------------------
+                    # CASE B – both operands non-scalar; same vec/grad flags; broadcastable
+                    # ----------------------------------------------------------------------
                     elif a.is_vector == b.is_vector and a.is_gradient == b.is_gradient:
                         try:
                             new_shape = np.broadcast_shapes(a.shape, b.shape)
                         except ValueError:
-                            raise NotImplementedError(
-                                f"'{sym}' cannot broadcast shapes {a.shape} and {b.shape}"
-                            )
+                            # NEW – allow “−1” wildcard broadcasting
+                            if -1 in a.shape or -1 in b.shape:
+                                new_shape = _broadcast_shape_with_minus1(a.shape, b.shape)
+                            else:
+                                raise
 
                         body_lines.append("# element-wise op with NumPy broadcasting")
                         body_lines.append(f"{res_var} = {a.var_name} {sym} {b.var_name}")
@@ -930,17 +1035,23 @@ class NumbaCodeGen:
                             shape       = new_shape,
                             is_vector   = a.is_vector,
                             is_gradient = a.is_gradient,
-                            field_names = a.field_names if a.role in ('trial','test') else b.field_names
+                            field_names = (a.field_names if a.role in ('trial', 'test')
+                                        else b.field_names)
                         ))
+
+                    # ----------------------------------------------------------------------
+                    # CASE C – anything else is unsupported
+                    # ----------------------------------------------------------------------
                     else:
                         raise NotImplementedError(
                             f"'{sym}' not implemented for roles {a.role}/{b.role} "
                             f"with shapes {a.shape}/{b.shape} "
                             f"or mismatched vector / gradient flags "
                             f"({a.is_vector},{b.is_vector}) – "
-                            f"({a.is_gradient},{b.is_gradient})"
+                            f"({a.is_gradient},{b.is_gradient}) "
                             f"names: {a.var_name}/{b.var_name}"
                         )
+
                  # -----------------------------------------------------------------
                  # ------------------  DIVISION  ( /  )  ---------------------------
                  # -----------------------------------------------------------------
@@ -969,6 +1080,8 @@ class NumbaCodeGen:
             # --- STORE ---
             elif isinstance(op, Store):
                 integrand = stack.pop()
+                side = self.last_side_for_store
+
                 if op.store_type == 'matrix':
                     body_lines.append(f"Ke += {integrand.var_name} * w_q")
                 elif op.store_type == 'vector':
@@ -983,6 +1096,7 @@ class NumbaCodeGen:
             else:
                 raise NotImplementedError(f"Opcode {type(op).__name__} not handled in JIT codegen.")
 
+        print(f"DEBUG L:998: solution_func_names: {solution_func_names}")
         source, param_order = self._build_kernel_string(
             kernel_name, body_lines, required_args, solution_func_names, functional_shape
         )
@@ -1001,6 +1115,7 @@ class NumbaCodeGen:
         Build complete kernel source code with parallel assembly.
         """
         # New Newton: Change parameter names to reflect they are pre-gathered.
+        # print(f"DEBUG L:1016: solution_func_names: {list(solution_func_names)}")
         for name in solution_func_names:
             # We will pass u_{name}_loc directly, not the global coeffs.
             if name.startswith("u_") and name.endswith("_loc"):
@@ -1009,6 +1124,7 @@ class NumbaCodeGen:
                 required_args.add(f"u_{name}_loc")
 
         # New Newton: Remove gdofs_map from parameters, it's used before the kernel call.
+        print(f"DEBUG L:1025: required_args: {sorted(list(required_args))}")
         param_order = [
             "gdofs_map",
             "node_coords",
@@ -1020,6 +1136,7 @@ class NumbaCodeGen:
 
         # New Newton: The unpacking block is now much simpler.
         # We just select the data for the current element `e`.
+        # print(f"DEBUG L:1035: solution_func_names: {list(solution_func_names)}")
         coeffs_unpack_block = "\n".join(
             f"        {name}_e = {name}[e]" if name.startswith("u_") and name.endswith("_loc")
             else f"        u_{name}_e = u_{name}_loc[e]"
@@ -1049,7 +1166,9 @@ def {kernel_name}(
         {", ".join(param_order)}
     ):
     num_elements        = qp_phys.shape[0]
-    n_dofs_per_element  = {self.n_dofs_local}
+    # n_dofs_per_element  = {self.n_dofs_local}
+    n_dofs_per_element  = gdofs_map.shape[1]            # 9 for volume, 15 on ghost edge
+    print(f"n_dofs_per_element: {{n_dofs_per_element}}")
     
     K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
     F_values = np.zeros((num_elements, n_dofs_per_element), dtype=np.float64)

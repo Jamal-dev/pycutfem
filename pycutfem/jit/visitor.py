@@ -8,21 +8,18 @@ from pycutfem.ufl.expressions import (
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
-    LoadVariable, LoadConstant, LoadElementWiseConstant, LoadAnalytic,
-    LoadFacetNormal, Grad, Div, PosOp, NegOp, BinaryOp, Inner, Dot, Store,
-    LoadConstantArray
+    LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
+    LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store
 )
 from dataclasses import replace
-
 import logging
+
 logger = logging.getLogger(__name__)
-
-
 
 def _find_form_type(node: Expression) -> str:
     """
-    Analyzes the expression to determine if it's for a matrix (LHS) or
-    a vector (RHS).
+    Analyzes the expression to determine if it's for a matrix (LHS),
+    a vector (RHS), or a scalar functional.
     """
     has_trial = node.find_first(lambda n: getattr(n, 'is_trial', False))
     has_test = node.find_first(lambda n: getattr(n, 'is_test', False))
@@ -48,65 +45,116 @@ class IRGenerator:
         self.ir_sequence.clear()
         form_type = _find_form_type(node)
         
-        if form_type == 'functional':        # same walk, different STORE
-            self._visit(node)
-            self.ir_sequence.append(         # ➊ new op-code
-                Store(dest_name="Je", store_type="functional"))
-            return self.ir_sequence
+        self._visit(node) # Initial call with default side=""
 
-        self._visit(node)
-
-        dest_name = "Ke" if form_type == 'matrix' else "Fe"
-        self.ir_sequence.append(Store(dest_name=dest_name, store_type=form_type))
+        if form_type == 'functional':
+            self.ir_sequence.append(Store(dest_name="Je", store_type="functional"))
+        else:
+            dest_name = "Ke" if form_type == 'matrix' else "Fe"
+            self.ir_sequence.append(Store(dest_name=dest_name, store_type=form_type))
 
         return self.ir_sequence
 
-    def _visit(self, node: Expression):
+    def _visit(self, node: Expression, side: str = ""):
         """
-        Recursive post-order traversal to generate IR.
-        This function dispatches to the correct visitor based on node type.
+        Recursive post-order traversal to generate IR. The `side` parameter
+        is crucial for correctly handling Jump/Pos/Neg expressions.
+        This version is reordered to handle operators before leaf nodes.
         """
-        # --- Leaf Nodes & Special Variables ---
-        if isinstance(node, (TestFunction)):
-            is_vec = False
-            name = node.space.name if hasattr(node, 'space') else node.name
-            self.ir_sequence.append(LoadVariable(name=name, role='test', is_vector=is_vec, field_names=[node.field_name]))
-            return
-            
-        if isinstance(node, (TrialFunction)):
-            is_vec = False
-            name = node.space.name if hasattr(node, 'space') else node.name
-            self.ir_sequence.append(LoadVariable(name=name, role='trial', is_vector=is_vec, field_names= [node.field_name]))
-            return
-        if isinstance(node, (Function)):
-            is_vec = False
-            role = 'function'
-            name = node.space.name if hasattr(node, 'space') else node.name
-            # Pass the component field names into the IR node
-            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=[node.field_name]))
-            return
-        if isinstance(node, (VectorFunction)):
-            is_vec = True
-            role = 'function'
-            name = node.space.name if hasattr(node, 'space') else node.name
-            # Pass the component field names into the IR node
-            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=node.field_names))
+        # --- 1. Unary Operators that change context ---
+        if isinstance(node, Pos):
+            self._visit(node.operand, side="+")
             return
 
-        if isinstance(node, (VectorTestFunction, VectorTrialFunction)):
-            is_vec = True
-            role = 'test' if node.is_test else 'trial' 
-            name = node.space.name if hasattr(node, 'space') else node.name
-            # Pass the component field names into the IR node
-            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=node.field_names))
+        if isinstance(node, Neg):
+            self._visit(node.operand, side="-")
+            return
+
+        # --- 2. Binary Operators ---
+        if isinstance(node, Jump):
+            # A Jump(u) is defined as u(+) - u(-).
+            # This correctly dispatches to the Pos and Neg visitors.
+            self._visit(node.u_pos)
+            self._visit(node.u_neg)
+            self.ir_sequence.append(BinaryOp(op_symbol='-'))
+            return
+
+        if isinstance(node, (Sum, Sub, Prod, UflDiv)):
+            self._visit(node.a, side=side)
+            if isinstance(node, UflDiv):
+                if not isinstance(node.b, Constant):
+                    raise NotImplementedError("JIT compilation for division by non-constants is not supported.")
+                self._visit(Constant(1.0 / node.b.value), side=side)
+                op_symbol = '*'
+            else:
+                self._visit(node.b, side=side)
+                op_symbol = {Sum: '+', Sub: '-', Prod: '*'}.get(type(node), '/')
+            self.ir_sequence.append(BinaryOp(op_symbol=op_symbol))
+            return
+            
+        if isinstance(node, (UflInner, UflDot)):
+            self._visit(node.a, side=side)
+            self._visit(node.b, side=side)
+            self.ir_sequence.append(Inner() if isinstance(node, UflInner) else Dot())
+            return
+
+        # --- 3. Unary Operators that modify their operand ---
+        if isinstance(node, UflGrad):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(Grad())
+            return
+            
+        if isinstance(node, DivOperation):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(Grad()) 
+            self.ir_sequence.append(Div())
+            return
+        
+        if isinstance(node, Derivative):
+            operand = node.f
+            deriv_order = node.order
+
+            # --- SPECIAL CASE: Derivative of a Jump ---
+            # This is the key to handling [[D(u)]] = D(u_pos) - D(u_neg).
+            if isinstance(operand, Jump):
+                # We create two new temporary UFL nodes and visit them.
+                # This correctly dispatches to this Derivative visitor again,
+                # but with Pos(u) and Neg(u) as the new operands.
+                self._visit(Derivative(operand.u_pos, *deriv_order),side='+')
+                self._visit(Derivative(operand.u_neg, *deriv_order),side='-')
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                return
+
+            # --- GENERIC CASE: Derivative of a standard field ---
+            # At this point, the operand MUST be a leaf-like node (Function, etc.)
+            # because all operators that could wrap it have been handled above.
+            is_vec = isinstance(operand, (VectorTestFunction, VectorTrialFunction, VectorFunction))
+            role = 'test' if getattr(operand, 'is_test', False) else 'trial' if getattr(operand, 'is_trial', False) else 'function'
+            # Safely get field_names or field_name
+            field_names = getattr(operand, 'field_names', None) or [getattr(operand, 'field_name')]
+            name = getattr(getattr(operand, 'space', operand), 'name', 'anon')
+
+
+            self.ir_sequence.append(
+                LoadVariable(name=name, role=role, is_vector=is_vec,
+                             deriv_order=deriv_order, field_names=field_names,
+                             side=side)
+            )
+            return
+
+        # --- 4. Leaf Nodes ---
+        if isinstance(node, (TestFunction, TrialFunction, Function, VectorTestFunction, VectorTrialFunction, VectorFunction)):
+            is_vec = isinstance(node, (VectorTestFunction, VectorTrialFunction, VectorFunction))
+            role = 'test' if getattr(node, 'is_test', False) else 'trial' if getattr(node, 'is_trial', False) else 'function'
+            field_names = getattr(node, 'field_names', None) or [getattr(node, 'field_name')]
+            name = getattr(getattr(node, 'space', node), 'name', 'anon')
+            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=field_names, side=side))
             return
             
         if isinstance(node, Constant):
             if node.dim == 0:
                 self.ir_sequence.append(LoadConstant(value=float(node.value)))
             else:
-                # For array constants, we treat them as runtime arguments
-                # identified by their object ID to ensure uniqueness.
                 name = f"const_arr_{id(node)}"
                 self.ir_sequence.append(LoadConstantArray(name=name, shape=node.shape))
             return
@@ -115,132 +163,16 @@ class IRGenerator:
             self.ir_sequence.append(LoadFacetNormal())
             return
         
-        elif isinstance(node, ElementWiseConstant):
+        if isinstance(node, ElementWiseConstant):
             name = f"ewc_{id(node)}"
-            self.ir_sequence.append(
-                LoadElementWiseConstant(name=name,
-                                        tensor_shape=node.tensor_shape)   # NEW
-            )
+            # This was a bug, creating a UFL node instead of an IR node
+            self.ir_sequence.append(LoadEWC_IR(name=name, tensor_shape=node.tensor_shape))
             return
 
-
-        # --- Unary Operators ---
-        if isinstance(node, UflGrad):
-            self._visit(node.operand)
-            self.ir_sequence.append(Grad())
-            return
-            
-        if isinstance(node, DivOperation):
-            self._visit(node.operand)
-            self.ir_sequence.append(Grad()) 
-            self.ir_sequence.append(Div())
-            return
-        
-        if isinstance(node, Pos):
-            self._visit(node.operand)
-            self.ir_sequence.append(PosOp())
-            return
-
-        if isinstance(node, Neg):
-            self._visit(node.operand)
-            self.ir_sequence.append(NegOp())
-            return
-        
-         # ------------------------------------------------------------------
-        #  Derivative …
-        #  ───────────
-        #  ▸ ordinary fields   → single LoadVariable, as before
-        #  ▸ jump(expr)        → jump of the *derivative*, i.e.
-        #                         Derivative(Jump(u), αx, αy)
-        #                       becomes
-        #                         Jump( Derivative(u_pos, αx, αy),
-        #                               Derivative(u_neg, αx, αy) )
-        #                       which expands to “pos − neg” IR nodes
-        # ------------------------------------------------------------------
-        if isinstance(node, Derivative):
-            operand     = node.f
-            deriv_order = node.order
-
-            # -------- special case: derivative of a jump ------------------
-            if isinstance(operand, Jump):
-                self._visit(Derivative(operand.u_pos, *deriv_order))
-                self.ir_sequence[-1] = replace(self.ir_sequence[-1], side="+")
-                self._visit(Derivative(operand.u_neg, *deriv_order))
-                self.ir_sequence[-1] = replace(self.ir_sequence[-1], side="-")
-                self.ir_sequence.append(BinaryOp(op_symbol='-'))   # pos − neg
-                return
-
-            # -------- ordinary scalar / vector field ----------------------
-            is_vec = isinstance(
-                operand,
-                (VectorTestFunction, VectorTrialFunction, VectorFunction)
-            )
-            role = (
-                'test'   if operand.is_test  else
-                'trial'  if operand.is_trial else
-                'function'
-            )
-            field_names = (
-                list(operand.field_names)           # vectors
-                if hasattr(operand, 'field_names')
-                else [operand.field_name]           # scalars → wrap in list
-            )
-            # some UFL leaves (e.g. Constant) have neither .space nor .name
-            if hasattr(operand, 'space'):
-                name = operand.space.name
-            elif hasattr(operand, 'name'):
-                name = operand.name
-            else:                                    # fall-back – never fails
-                name = f"anon_{id(operand):x}"
-
-            self.ir_sequence.append(
-                LoadVariable(name=name,
-                             role=role,
-                             is_vector=is_vec,
-                             deriv_order=deriv_order,
-                             field_names=field_names)
-            )
-            return
-
-        # --- Binary Operators ---
-        if isinstance(node, (Sum, Sub, Prod, UflDiv)):
-            self._visit(node.a)
-            if isinstance(node, UflDiv):
-                # We handle division by multiplying by the reciprocal.
-                # This requires visiting a new Prod(Constant(1.0), node.b) tree.
-                # For simplicity, we assume b is a Constant for now.
-                if not isinstance(node.b, Constant):
-                    raise NotImplementedError("JIT compilation for division by non-constants is not supported.")
-                self._visit(Constant(1.0 / node.b.value))
-                op_symbol = '*'
-            else:
-                self._visit(node.b)
-                op_symbol = '+' if isinstance(node, Sum) else '-' if isinstance(node, Sub) else '*'
-            self.ir_sequence.append(BinaryOp(op_symbol=op_symbol))
-            return
-            
-        if isinstance(node, UflInner):
-            self._visit(node.a)
-            self._visit(node.b)
-            self.ir_sequence.append(Inner())
-            return
-            
-        if isinstance(node, UflDot):
-            self._visit(node.a)
-            self._visit(node.b)
-            self.ir_sequence.append(Dot())
-            return
-
-        if isinstance(node, Jump):
-            self._visit(node.u_pos)
-            self.ir_sequence[-1] = replace(self.ir_sequence[-1], side="+")
-            self._visit(node.u_neg)
-            self.ir_sequence[-1] = replace(self.ir_sequence[-1], side="-")
-            self.ir_sequence.append(BinaryOp(op_symbol='-'))
-            return
-        elif isinstance(node, Analytic):
+        if isinstance(node, Analytic):
             uid = f"ana_{id(node)}"
             self.ir_sequence.append(LoadAnalytic(func_id=id(node), func_ref=node.eval))
             return
 
+        # If we reach here, the node type is not supported.
         raise TypeError(f"UFL expression node '{type(node).__name__}' is not supported by the JIT compiler.")

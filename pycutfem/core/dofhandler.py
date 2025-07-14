@@ -821,6 +821,11 @@ class DofHandler:
         qp_phys_arr = np.zeros((n_edges, n_q, 2))
         qw_arr = np.zeros((n_edges, n_q))
         normals_arr = np.zeros((n_edges, n_q, 2))
+        phis_arr = np.zeros((n_edges, n_q))
+        J_inv_pos_arr = np.zeros((n_edges, n_q, 2, 2))
+        J_inv_neg_arr = np.zeros((n_edges, n_q, 2, 2))
+        detJ_pos_arr = np.zeros((n_edges, n_q))
+        detJ_neg_arr = np.zeros((n_edges, n_q))
         
         # DOF mapping for the union space
         global_dofs_list = []
@@ -833,7 +838,7 @@ class DofHandler:
             for side in ["pos", "neg"]:
                 for d_ord in derivs:
                     key = f"d{d_ord[0]}{d_ord[1]}_{fld}_{side}"
-                    basis_tables[key] = np.zeros((n_edges, n_q, me.n_dofs_per_field(fld)))
+                    basis_tables[key] = np.zeros((n_edges, n_q, me._n_basis[fld]))
 
         # --- Loop over valid ghost edges ---
         for i, edge in enumerate(valid_ghost_edges):
@@ -871,6 +876,12 @@ class DofHandler:
                     xi, eta = transform.inverse_mapping(mesh, eid_side, xq)
                     J = transform.jacobian(mesh, eid_side, (xi, eta))
                     J_inv = np.linalg.inv(J)
+                    if side == "pos":
+                        J_inv_pos_arr[i, q] = J_inv
+                        detJ_pos_arr[i, q] = np.linalg.det(J)
+                    else:
+                        J_inv_neg_arr[i, q] = J_inv
+                        detJ_neg_arr[i, q] = np.linalg.det(J)
                     
                     for fld in fields:
                         for d_ord in derivs:
@@ -891,6 +902,13 @@ class DofHandler:
             'global_dofs': global_dofs_list, # Ragged list
             'pos_map': pos_maps_list,         # Ragged list
             'neg_map': neg_maps_list,         # Ragged list
+            'phis': phis_arr,
+            'J_inv_pos': J_inv_pos_arr,
+            'J_inv_neg': J_inv_neg_arr,
+            'detJ_pos': detJ_pos_arr,
+            'detJ_neg': detJ_neg_arr,
+            'detJ': (detJ_pos_arr + detJ_neg_arr) * 0.5,  # Combined for convenience
+            'J_inv': (J_inv_pos_arr + J_inv_neg_arr)*0.5,  # Combined for convenience
         }
         out.update(basis_tables)
         return out
