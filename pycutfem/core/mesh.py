@@ -52,6 +52,9 @@ class Mesh:
         self.spatial_dim = 2  # Assuming 2D mesh by default
         self._elem_bitsets: Dict[str, BitSet] = {}
         self._edge_bitsets: Dict[str, BitSet] = {}
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 
     def _build_topology(self):

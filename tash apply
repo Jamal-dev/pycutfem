@@ -1,0 +1,1735 @@
+[1mdiff --git a/cavity_verification_plot.png b/cavity_verification_plot.png[m
+[1mdeleted file mode 100644[m
+[1mindex 59d258d..0000000[m
+Binary files a/cavity_verification_plot.png and /dev/null differ
+[1mdiff --git a/pycutfem/core/dofhandler.py b/pycutfem/core/dofhandler.py[m
+[1mindex 42414b5..6d0820b 100644[m
+[1m--- a/pycutfem/core/dofhandler.py[m
+[1m+++ b/pycutfem/core/dofhandler.py[m
+[36m@@ -15,6 +15,10 @@[m [mfrom pycutfem.integration.quadrature import volume[m
+ from collections.abc import Sequence[m
+ from hashlib import blake2b[m
+ from pycutfem.integration.quadrature import line_quadrature[m
+[32m+[m[32mfrom functools import lru_cache[m
+[32m+[m
+[32m+[m
+[32m+[m[32m_edge_geom_cache: dict[tuple, dict] = {}     # ← NEW — module-level cache[m
+ [m
+ BcLike = Union[BoundaryCondition, Mapping[str, Any]][m
+ [m
+[36m@@ -643,62 +647,305 @@[m [mclass DofHandler:[m
+     # edge-geometry cache keyed by (hash(ids), qdeg, id(level_set))[m
+     # ------------------------------------------------------------------[m
+     _edge_geom_cache: dict[tuple[int,int,int], dict] = {}[m
+[32m+[m
+[32m+[m[32m    def _hash_subset(idx: Sequence[int]) -> int:[m
+[32m+[m[32m        """Fast 64-bit signature for any list / BitSet of indices."""[m
+[32m+[m[32m        return hash(bytes(sorted(idx)))[m
+     [m
+[31m-    def precompute_edge_factors([m
+[32m+[m[41m    [m
+[32m+[m
+[32m+[m[32m    # -------------------------------------------------------------------------[m
+[32m+[m[32m    #  DofHandler.precompute_interface_factors[m
+[32m+[m[32m    # -------------------------------------------------------------------------[m
+[32m+[m[32m    def precompute_interface_factors([m
+         self,[m
+[31m-        edge_ids: "BitSet | Sequence[int]",[m
+[32m+[m[32m        cut_element_ids: "BitSet | Sequence[int]",[m
+         qdeg: int,[m
+[31m-        level_set=None,[m
+[31m-        *,[m
+[32m+[m[32m        level_set,[m
+         reuse: bool = True,[m
+     ) -> dict:[m
+         """[m
+[31m-        Returns a dict with the arrays[m
+[31m-           qp_phys   (n_e , n_q , 2)[m
+[31m-           qw        (n_e , n_q)[m
+[31m-           normals   (n_e , n_q , 2)[m
+[31m-           phis      (n_e , n_q)    – empty if level_set is None[m
+[32m+[m[32m        Pre-computes all geometric data for interface integrals on a given[m
+[32m+[m[32m        set of CUT elements.[m
+[32m+[m
+[32m+[m[32m        This is the authoritative method for preparing data for dInterface JIT kernels.[m
+[32m+[m[32m        It iterates directly over cut elements, not edges, ensuring all geometric[m
+[32m+[m[32m        data (Jacobians, etc.) is sourced from the correct parent element.[m
+[32m+[m
+[32m+[m[32m        Parameters[m
+[32m+[m[32m        ----------[m
+[32m+[m[32m        cut_element_ids : BitSet | Sequence[int][m
+[32m+[m[32m            The element IDs of the 'cut' elements to process.[m
+[32m+[m[32m        qdeg : int[m
+[32m+[m[32m            1-D quadrature order along the interface segment.[m
+[32m+[m[32m        level_set : callable[m
+[32m+[m[32m            The level-set function, required for calculating normals.[m
+[32m+[m
+[32m+[m[32m        Returns[m
+[32m+[m[32m        -------[m
+[32m+[m[32m        dict[m
+[32m+[m[32m            A dictionary of pre-computed arrays, with the first dimension[m
+[32m+[m[32m            corresponding to the order of `cut_element_ids`. Keys include:[m
+[32m+[m[32m            'eids', 'qp_phys', 'qw', 'normals', 'phis', 'detJ', 'J_inv'.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        from pycutfem.integration.quadrature import line_quadrature[m
+[32m+[m[32m        from pycutfem.fem import transform[m
+ [m
+[31m-        *Only* the edges given by *edge_ids* are tabulated.[m
+[32m+[m[32m        mesh = self.mixed_element.mesh[m
+[32m+[m[32m        ids = cut_element_ids.to_indices() if hasattr(cut_element_ids, "to_indices") else list(cut_element_ids)[m
+[32m+[m
+[32m+[m[32m        # Filter for elements that are actually 'cut' and have a valid segment[m
+[32m+[m[32m        valid_cut_eids = [[m
+[32m+[m[32m            eid for eid in ids[m
+[32m+[m[32m            if mesh.elements_list[eid].tag == 'cut' and len(mesh.elements_list[eid].interface_pts) == 2[m
+[32m+[m[32m        ][m
+[32m+[m[41m        [m
+[32m+[m[32m        if not valid_cut_eids:[m
+[32m+[m[32m            # Return empty arrays with correct shapes if no valid cut elements[m
+[32m+[m[32m            return {[m
+[32m+[m[32m                'eids': np.array([], dtype=int),[m
+[32m+[m[32m                'qp_phys': np.empty((0, 0, 2)), 'qw': np.empty((0, 0)),[m
+[32m+[m[32m                'normals': np.empty((0, 0, 2)), 'phis': np.empty((0, 0)),[m
+[32m+[m[32m                'detJ': np.empty((0, 0)), 'J_inv': np.empty((0, 0, 2, 2)),[m
+[32m+[m[32m            }[m
+[32m+[m
+[32m+[m[32m        # --- Use a cache if requested ---[m
+[32m+[m[32m        cache_key = (_hash_subset(valid_cut_eids), qdeg, id(level_set))[m
+[32m+[m[32m        if reuse and cache_key in _edge_geom_cache:[m
+[32m+[m[32m            return _edge_geom_cache[cache_key][m
+[32m+[m
+[32m+[m[32m        # --- Allocation ---[m
+[32m+[m[32m        # n_elems = len(valid_cut_eids)[m
+[32m+[m[32m        n_elems = mesh.n_elements[m
+[32m+[m[32m        # We need a representative segment to determine n_q[m
+[32m+[m[32m        p0_rep, p1_rep = mesh.elements_list[valid_cut_eids[0]].interface_pts[m
+[32m+[m[32m        q_xi_rep, q_w_rep = line_quadrature(p0_rep, p1_rep, qdeg)[m
+[32m+[m[32m        n_q = len(q_w_rep)[m
+[32m+[m
+[32m+[m[32m        qp_phys = np.zeros((n_elems, n_q, 2))[m
+[32m+[m[32m        qw = np.zeros((n_elems, n_q))[m
+[32m+[m[32m        normals = np.zeros((n_elems, n_q, 2))[m
+[32m+[m[32m        phis = np.zeros((n_elems, n_q))[m
+[32m+[m[32m        detJ_arr = np.zeros((n_elems, n_q))[m
+[32m+[m[32m        Jinv_arr = np.zeros((n_elems, n_q, 2, 2))[m
+[32m+[m[32m        # ---------- NEW: basis / grad-basis tables on the interface ----------[m
+[32m+[m[32m        me      = self.mixed_element[m
+[32m+[m[32m        fields  = me.field_names            # ['vx', 'vy', …][m
+[32m+[m[32m        b_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local))         for f in fields}[m
+[32m+[m[32m        g_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local, 2))      for f in fields}[m
+[32m+[m
+[32m+[m
+[32m+[m[32m        # --- Loop over valid cut elements ---[m
+[32m+[m[32m        for k, eid in enumerate(valid_cut_eids):[m
+[32m+[m[32m            elem = mesh.elements_list[eid][m
+[32m+[m[32m            p0, p1 = elem.interface_pts[m
+[32m+[m
+[32m+[m[32m            # --- Quadrature rule on the physical interface segment ---[m
+[32m+[m[32m            q_xi, q_w = line_quadrature(p0, p1, qdeg)[m
+[32m+[m
+[32m+[m[32m            for q, (xq, wq) in enumerate(zip(q_xi, q_w)):[m
+[32m+[m[32m                qp_phys[eid, q] = xq[m
+[32m+[m[32m                qw[eid, q] = wq[m
+[32m+[m
+[32m+[m[32m                # Normal and phi value from the level set[m
+[32m+[m[32m                g = level_set.gradient(xq)[m
+[32m+[m[32m                # norm_g = np.linalg.norm(g)[m
+[32m+[m[32m                normals[eid, q] = g #/ (norm_g + 1e-30)[m
+[32m+[m[32m                phis[eid, q] = level_set(xq)[m
+[32m+[m
+[32m+[m[32m                # Jacobian of the parent element at the quadrature point[m
+[32m+[m[32m                xi_ref, eta_ref = transform.inverse_mapping(mesh, eid, xq)[m
+[32m+[m[32m                J = transform.jacobian(mesh, eid, (xi_ref, eta_ref))[m
+[32m+[m[32m                detJ_arr[eid, q] = np.linalg.det(J)[m
+[32m+[m[32m                Jinv_arr[eid, q] = np.linalg.inv(J)[m
+[32m+[m[32m                for fld in fields:[m
+[32m+[m[32m                    b_tabs[fld][eid, q] = me.basis      (fld, xi_ref, eta_ref)[m
+[32m+[m[32m                    g_tabs[fld][eid, q] = me.grad_basis (fld, xi_ref, eta_ref)[m
+[32m+[m
+[32m+[m[32m        # --- Gather results and cache ---[m
+[32m+[m[32m        out = {[m
+[32m+[m[32m            'eids': np.array(valid_cut_eids, dtype=int),[m
+[32m+[m[32m            # 'eids': np.arange(mesh.n_elements, dtype=int),  # All elements, not just cut[m
+[32m+[m[32m            'qp_phys': qp_phys, 'qw': qw, 'normals': normals, 'phis': phis,[m
+[32m+[m[32m            'detJ': detJ_arr, 'J_inv': Jinv_arr,[m
+[32m+[m[32m        }[m
+[32m+[m[32m        for fld in fields:[m
+[32m+[m[32m            out[f"b_{fld}"] = b_tabs[fld][m
+[32m+[m[32m            out[f"g_{fld}"] = g_tabs[fld][m
+[32m+[m
+[32m+[m[32m        if reuse:[m
+[32m+[m[32m            _edge_geom_cache[cache_key] = out[m
+[32m+[m[41m        [m
+[32m+[m[32m        return out[m
+[32m+[m[41m    [m
+[32m+[m[32m    # ---------------------------------------------------------------------[m
+[32m+[m[32m    #  DofHandler.precompute_edge_factors[m[41m [m
+[32m+[m[32m    # ---------------------------------------------------------------------[m
+[32m+[m[32m    def precompute_edge_factors([m
+[32m+[m[32m            self,[m
+[32m+[m[32m            edge_ids: "BitSet | Sequence[int]",[m
+[32m+[m[32m            qdeg: int,[m
+[32m+[m[32m            level_set=None,[m
+[32m+[m[32m            *,[m
+[32m+[m[32m            with_maps: bool = False,[m
+[32m+[m[32m            reuse: bool = True,[m
+[32m+[m[32m        ) -> dict:[m
+         """[m
+[31m-        mesh  = self.mixed_element.mesh[m
+[31m-        ids   = edge_ids.to_indices() if hasattr(edge_ids, "to_indices") else edge_ids[m
+[31m-        key   = (_hash_subset(ids), qdeg, id(level_set))[m
+[31m-[m
+[31m-        if reuse and key in self._edge_geom_cache:[m
+[31m-            return self._edge_geom_cache[key][m
+[31m-[m
+[31m-        n_e   = len(ids)[m
+[31m-        q_ref, w_ref = line_quadrature((0, 0), (1, 0), qdeg)[m
+[31m-[m
+[31m-        qp_phys = np.empty((n_e, len(w_ref), 2))[m
+[31m-        qw      = np.empty((n_e, len(w_ref)))[m
+[31m-        normals = np.empty((n_e, len(w_ref), 2))[m
+[31m-        phis    = (np.empty((n_e, len(w_ref))) if level_set else None)[m
+[31m-[m
+[31m-        for i, eid in enumerate(ids):[m
+[31m-            edge    = mesh.edge(eid)[m
+[31m-            p0, p1  = mesh.nodes_x_y_pos[list(edge.nodes)][m
+[31m-            tang    = p1 - p0[m
+[31m-            L       = np.hypot(*tang)[m
+[31m-            n       = np.array([ tang[1], -tang[0] ]) / L[m
+[31m-[m
+[31m-            for q,(ξ,), w in zip(range(len(w_ref)), q_ref, w_ref):[m
+[31m-                x_q = p0 + ξ * tang[m
+[31m-                qp_phys[i,q] = x_q[m
+[31m-                qw[i,q]      = w * L[m
+[31m-                normals[i,q] = n[m
+[31m-                if phis is not None:[m
+[31m-                    phis[i,q] = level_set(x_q)[m
+[31m-[m
+[31m-        data = {"qp_phys": qp_phys,[m
+[31m-                "qw":      qw,[m
+[31m-                "normals": normals,[m
+[31m-                "phis":    phis if phis is not None else np.empty(0)}[m
+[31m-[m
+[31m-        self._edge_geom_cache[key] = data[m
+[31m-        return data[m
+[32m+[m[32m        Pre-compute (and cache) every geometric quantity that a facet-based[m
+[32m+[m[32m        JIT kernel may need.  Works for **regular**, **interface** *and*[m
+[32m+[m[32m        **ghost** edges.[m
+[32m+[m
+[32m+[m[32m        Returns[m
+[32m+[m[32m        -------[m
+[32m+[m[32m        dict[m
+[32m+[m[32m            Keys common to all facets[m
+[32m+[m[32m                qp_phys     (n_e,n_q,2)[m
+[32m+[m[32m                qw          (n_e,n_q)[m
+[32m+[m[32m                normals     (n_e,n_q,2)[m
+[32m+[m[32m                phis        (n_e,n_q)[m
+[32m+[m[32m            +  per-side data for ghost facets[m
+[32m+[m[32m                detJ_pos / detJ_neg      (n_e,n_q)[m
+[32m+[m[32m                J_inv_pos / J_inv_neg    (n_e,n_q,2,2)[m
+[32m+[m[32m            +  optional mapping helpers (only if with_maps=True)[m
+[32m+[m[32m                global_dofs : list[np.ndarray][m
+[32m+[m[32m                pos_map     : list[np.ndarray][m
+[32m+[m[32m                neg_map     : list[np.ndarray][m
+[32m+[m[32m        """[m
+[32m+[m[32m        from pycutfem.integration.quadrature import line_quadrature[m
+[32m+[m[32m        from pycutfem.fem import transform[m
+[32m+[m
+[32m+[m[32m        mesh   = self.mixed_element.mesh[m
+[32m+[m[32m        ids    = edge_ids.to_indices() if hasattr(edge_ids, "to_indices") else list(edge_ids)[m
+[32m+[m
+[32m+[m[32m        # ------------------------------------------------------------------ cache[m
+[32m+[m[32m        cache_key = (_hash_subset(ids), qdeg, id(level_set), with_maps)[m
+[32m+[m[32m        if reuse and cache_key in _edge_geom_cache:[m
+[32m+[m[32m            return _edge_geom_cache[cache_key][m
+[32m+[m
+[32m+[m[32m        # ------------------------------------------------------------------ allocation[m
+[32m+[m[32m        n_e          = len(ids)[m
+[32m+[m[32m        q_ref, w_ref = line_quadrature((0., 0.), (1., 0.), qdeg)[m
+[32m+[m[32m        n_q          = len(w_ref)[m
+[32m+[m
+[32m+[m[32m        qp_phys   = np.zeros((n_e, n_q, 2))[m
+[32m+[m[32m        qw        = np.zeros((n_e, n_q))[m
+[32m+[m[32m        normals   = np.zeros((n_e, n_q, 2))[m
+[32m+[m[32m        phis      = np.zeros((n_e, n_q)) if level_set else np.empty(0)[m
+[32m+[m
+[32m+[m[32m        detJ_pos  = np.zeros((n_e, n_q))[m
+[32m+[m[32m        detJ_neg  = np.zeros((n_e, n_q))[m
+[32m+[m[32m        Jinv_pos  = np.zeros((n_e, n_q, 2, 2))[m
+[32m+[m[32m        Jinv_neg  = np.zeros((n_e, n_q, 2, 2))[m
+[32m+[m[32m        Jinv_mean  = np.zeros((n_e, n_q, 2, 2))[m
+[32m+[m[32m        detJ_mean  = np.zeros((n_e, n_q))[m
+[32m+[m
+[32m+[m[32m        # (+/–) bookkeeping (needed only for ghost / interface kernels)[m
+[32m+[m[32m        gd_lists, pmaps, nmaps = [], [], [][m
+[32m+[m[32m        pos_eid_arr = np.empty(n_e, dtype=int)[m
+[32m+[m[32m        neg_eid_arr = np.empty(n_e, dtype=int)[m
+[32m+[m
+[32m+[m[32m        # ------------------------------------------------------------------ loop over facets[m
+[32m+[m[32m        for k, eid_edge in enumerate(ids):[m
+[32m+[m[32m            edge         = mesh.edge(eid_edge)[m
+[32m+[m[32m            p0, p1       = mesh.nodes_x_y_pos[list(edge.nodes)][m
+[32m+[m[32m            p0, p1       = map(np.asarray, (p0, p1))            # <<< guarant. ndarray[m
+[32m+[m[32m            tang         = p1 - p0[m
+[32m+[m[32m            L_edge       = np.hypot(*tang)[m
+[32m+[m
+[32m+[m[32m            # ---------------------------------------------------------- classify facet[m
+[32m+[m[32m            tag      = getattr(edge, "tag", "")[m
+[32m+[m[32m            is_iface = tag == "interface"[m
+[32m+[m[32m            is_ghost = tag == "ghost"[m
+[32m+[m
+[32m+[m[32m            if level_set is None:[m
+[32m+[m[32m                # pure Neumann / Robin edge – outward normal from geometry[m
+[32m+[m[32m                n_vec = np.array([ tang[1], -tang[0] ]) / L_edge[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                # level-set normal (pointing to φ>0)[m
+[32m+[m[32m                mid   = np.asarray(0.5 * (p0 + p1))[m
+[32m+[m[32m                g     = level_set.gradient(mid)[m
+[32m+[m[32m                n_vec = g / (np.linalg.norm(g) + 1e-30)[m
+[32m+[m
+[32m+[m[32m            # ---------------------------------------------------------- pick integration segment[m
+[32m+[m[32m            if is_iface:[m
+[32m+[m[32m                # interface edges are integrated **once per cut element**;[m
+[32m+[m[32m                # the caller already deduplicated edges → use stored pts[m
+[32m+[m[32m                cut_elem = mesh.elements_list[edge.left] \[m
+[32m+[m[32m                        if mesh.elements_list[edge.left].tag == "cut" \[m
+[32m+[m[32m                        else mesh.elements_list[edge.right][m
+[32m+[m[32m                seg_p0, seg_p1 = [np.asarray(pt) for pt in cut_elem.interface_pts][m
+[32m+[m[32m                pos_eid = neg_eid = cut_elem.id[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                # regular or ghost edge – full edge[m
+[32m+[m[32m                seg_p0, seg_p1 = p0, p1[m
+[32m+[m[32m                # determine ± elements from level-set *sign*[m
+[32m+[m[32m                if level_set is None or edge.right is None:[m
+[32m+[m[32m                    pos_eid = edge.left[m
+[32m+[m[32m                    neg_eid = edge.right if edge.right is not None else edge.left[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    φL = level_set(np.asarray(mesh.elements_list[edge.left ].centroid()))[m
+[32m+[m[32m                    φR = level_set(np.asarray(mesh.elements_list[edge.right].centroid()))[m
+[32m+[m[32m                    pos_eid, neg_eid = (edge.left, edge.right) if φL >= φR else (edge.right, edge.left)[m
+[32m+[m
+[32m+[m[32m            pos_eid_arr[k] = pos_eid[m
+[32m+[m[32m            neg_eid_arr[k] = neg_eid[m
+[32m+[m
+[32m+[m[32m            # ---------------------------------------------------------- quadrature[m
+[32m+[m[32m            qpts_phys, qwts = line_quadrature(seg_p0, seg_p1, qdeg)[m
+[32m+[m[32m            for q, (xq, wq) in enumerate(zip(qpts_phys, qwts)):[m
+[32m+[m[32m                xq = np.asarray(xq)                   # ensure ndarray[m
+[32m+[m[32m                qp_phys[k, q] = xq[m
+[32m+[m[32m                qw[k, q]      = wq[m
+[32m+[m[32m                normals[k, q] = n_vec                 # same for both sides[m
+[32m+[m[32m                if level_set is not None:[m
+[32m+[m[32m                    phis[k, q] = level_set(xq)[m
+[32m+[m
+[32m+[m[32m                # ---- (+) side ---------------------------------------------------[m
+[32m+[m[32m                xi, eta   = transform.inverse_mapping(mesh, pos_eid, xq)[m
+[32m+[m[32m                J_pos     = transform.jacobian(mesh, pos_eid, (xi, eta))[m
+[32m+[m[32m                detJ_pos[k, q] = np.linalg.det(J_pos)[m
+[32m+[m[32m                Jinv_pos[k, q] = np.linalg.inv(J_pos)[m
+[32m+[m
+[32m+[m[32m                # ---- (–) side ---------------------------------------------------[m
+[32m+[m[32m                xi, eta   = transform.inverse_mapping(mesh, neg_eid, xq)[m
+[32m+[m[32m                J_neg     = transform.jacobian(mesh, neg_eid, (xi, eta))[m
+[32m+[m[32m                detJ_neg[k, q] = np.linalg.det(J_neg)[m
+[32m+[m[32m                Jinv_neg[k, q] = np.linalg.inv(J_neg)[m
+[32m+[m[32m                # ---- mean Jacobian ----------------------------------------------[m
+[32m+[m[32m                Jinv_mean[k, q] = 0.5 * (Jinv_pos[k, q] + Jinv_neg[k, q])[m
+[32m+[m[32m                detJ_mean[k, q] = 0.5 * (detJ_pos[k, q] + detJ_neg[k, q])[m
+[32m+[m
+[32m+[m[32m            # ---------------------------------------------------------- DOF-maps (ghost / iface)[m
+[32m+[m[32m            if with_maps and (is_ghost or is_iface):[m
+[32m+[m[32m                pos_dofs = self.get_elemental_dofs(pos_eid)[m
+[32m+[m[32m                neg_dofs = self.get_elemental_dofs(neg_eid)[m
+[32m+[m[32m                g_dofs   = np.unique(np.concatenate((pos_dofs, neg_dofs)))[m
+[32m+[m[32m                pmaps.append(np.searchsorted(g_dofs, pos_dofs))[m
+[32m+[m[32m                nmaps.append(np.searchsorted(g_dofs, neg_dofs))[m
+[32m+[m[32m                gd_lists.append(g_dofs)[m
+[32m+[m
+[32m+[m[32m        # ------------------------------------------------------------------ gather + cache[m
+[32m+[m[32m        out = dict([m
+[32m+[m[32m            qp_phys = qp_phys,   qw = qw,[m
+[32m+[m[32m            normals = normals,   phis = phis,[m
+[32m+[m[32m            detJ_pos = detJ_pos, detJ_neg = detJ_neg,[m
+[32m+[m[32m            J_inv_pos = Jinv_pos, J_inv_neg = Jinv_neg,[m
+[32m+[m[32m            pos_eid = pos_eid_arr, neg_eid = neg_eid_arr,[m
+[32m+[m[32m            detJ = detJ_mean, J_inv = Jinv_mean[m
+[32m+[m[32m        )[m
+[32m+[m[32m        if with_maps:[m
+[32m+[m[32m            from pycutfem.ufl.helpers_jit import _stack_ragged[m
+[32m+[m[32m            out.update(dict(global_dofs = _stack_ragged(gd_lists),[m[41m [m
+[32m+[m[32m                            pos_map = _stack_ragged(pmaps),[m[41m [m
+[32m+[m[32m                            neg_map = _stack_ragged(nmaps)[m
+[32m+[m[32m                            ))[m
+[32m+[m
+[32m+[m[32m        _edge_geom_cache[cache_key] = out[m
+[32m+[m[32m        return out[m
+ [m
+[32m+[m
+[32m+[m
+[32m+[m[41m    [m
+     def info(self) -> None:[m
+         print(f"=== DofHandler ({self.method.upper()}) ===")[m
+         for fld in self.field_names:[m
+[1mdiff --git a/pycutfem/core/levelset.py b/pycutfem/core/levelset.py[m
+[1mindex 51e7052..ead3c0a 100644[m
+[1m--- a/pycutfem/core/levelset.py[m
+[1m+++ b/pycutfem/core/levelset.py[m
+[36m@@ -20,7 +20,7 @@[m [mclass CircleLevelSet(LevelSetFunction):[m
+         self.radius=float(radius)[m
+     def __call__(self, x):[m
+         return np.linalg.norm(x-self.center)-self.radius[m
+[31m-    def gradient(self, x):[m
+[32m+[m[32m    def gradient(self, x): # unit normal vector[m
+         d=np.asarray(x-self.center)[m
+         nrm=np.linalg.norm(d)[m
+         return d/nrm if nrm else np.zeros_like(d)[m
+[1mdiff --git a/pycutfem/core/mesh.py b/pycutfem/core/mesh.py[m
+[1mindex d9ebb3f..7ace0a6 100644[m
+[1m--- a/pycutfem/core/mesh.py[m
+[1m+++ b/pycutfem/core/mesh.py[m
+[36m@@ -4,7 +4,7 @@[m [mfrom typing import Tuple, List, Dict, Optional, Callable[m
+ [m
+ [m
+ from pycutfem.core.topology import Edge, Node, Element[m
+[31m-[m
+[32m+[m[32mfrom pycutfem.utils.bitset import BitSet[m
+ [m
+ class Mesh:[m
+     """[m
+[36m@@ -48,6 +48,8 @@[m [mclass Mesh:[m
+         self._build_topology()[m
+         self.n_elements = len(self.elements_connectivity)[m
+         self.spatial_dim = 2  # Assuming 2D mesh by default[m
+[32m+[m[32m        self._elem_bitsets: Dict[str, BitSet] = {}[m
+[32m+[m[32m        self._edge_bitsets: Dict[str, BitSet] = {}[m
+ [m
+     def _build_topology(self):[m
+         """[m
+[36m@@ -177,6 +179,8 @@[m [mclass Mesh:[m
+         for eid in inside_inds: self.elements_list[eid].tag = 'inside'[m
+         for eid in outside_inds: self.elements_list[eid].tag = 'outside'[m
+         for eid in cut_inds: self.elements_list[eid].tag = 'cut'[m
+[32m+[m[32m        tags_el = np.array([e.tag for e in self.elements_list])[m
+[32m+[m[32m        self._elem_bitsets = {t: BitSet(tags_el == t) for t in np.unique(tags_el)}[m
+         [m
+         return inside_inds, outside_inds, cut_inds[m
+ [m
+[36m@@ -214,6 +218,12 @@[m [mclass Mesh:[m
+             # CRITICAL FIX: This must NOT override a 'ghost' tag.[m
+             if edge.tag != 'ghost' and phi_nodes[edge.nodes[0]] * phi_nodes[edge.nodes[1]] < 0:[m
+                 edge.tag = 'interface'[m
+[32m+[m[32m            # Build and cache BitSets *once* – O(n_edges) total[m
+[32m+[m[32m            tags = np.array([e.tag for e in self.edges_list])[m
+[32m+[m[32m            self._edge_bitsets = {[m
+[32m+[m[32m                t: BitSet(tags == t)               # tiny (n_edges) boolean mask[m
+[32m+[m[32m                for t in np.unique(tags) if t      # skip '' untagged edges[m
+[32m+[m[32m            }[m
+ [m
+ [m
+     def build_interface_segments(self, level_set, tol=1e-12, qorder=2):[m
+[36m@@ -279,6 +289,50 @@[m [mclass Mesh:[m
+                 # If we don't have exactly two points, treat this element as[m
+                 # not having a valid cut segment.[m
+                 elem.interface_pts = [][m
+[32m+[m[32m    def edge_bitset(self, tag: str) -> BitSet:[m
+[32m+[m[32m        """Return cached BitSet of edges with the given tag."""[m
+[32m+[m[32m        return self._edge_bitsets.get(tag, BitSet(np.zeros(len(self.edges_list), bool)))[m
+[32m+[m
+[32m+[m[32m    def element_bitset(self, tag: str) -> BitSet:[m
+[32m+[m[32m        return self._elem_bitsets.get(tag, BitSet(np.zeros(len(self.elements_list), bool)))[m
+[32m+[m
+[32m+[m[32m    def get_domain_bitset(self, tag: str, *, entity: str = "edge") -> BitSet:     # noqa: N802[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Return a **BitSet** that marks all mesh entities carrying *tag*.[m
+[32m+[m
+[32m+[m[32m        Parameters[m
+[32m+[m[32m        ----------[m
+[32m+[m[32m        tag     : str[m
+[32m+[m[32m            Mesh or BC tag (e.g. ``'interface'``, ``'ghost'``, ``'left_wall'`` …).[m
+[32m+[m[32m        entity  : {'edge', 'elem', 'element'}[m
+[32m+[m[32m            Select whether the BitSet refers to edges or elements.[m
+[32m+[m
+[32m+[m[32m        Notes[m
+[32m+[m[32m        -----[m
+[32m+[m[32m        *   For edges and elements the classification routines fill the[m
+[32m+[m[32m            private caches ``_edge_bitsets`` and ``_elem_bitsets`` exactly once[m
+[32m+[m[32m            (O(*n*)).  From then on every call is an O(1) dictionary lookup.[m
+[32m+[m[32m        *   If a cache does *not* exist yet we compute the mask on the fly – this[m
+[32m+[m[32m            costs at most O(*n*) and does **not** pollute the cache (avoids[m
+[32m+[m[32m            hidden state changes).[m
+[32m+[m[32m        """[m
+[32m+[m[32m        entity = entity.lower()[m
+[32m+[m[32m        if entity in {"edge", "edges"}:[m
+[32m+[m[32m            cache = getattr(self, "_edge_bitsets", None)[m
+[32m+[m[32m            if cache is not None and tag in cache:                     # fast path[m
+[32m+[m[32m                return cache[tag][m
+[32m+[m[32m            mask = np.fromiter((e.tag == tag for e in self.edges_list), bool)  # O(n)[m
+[32m+[m[32m            return BitSet(mask)[m
+[32m+[m
+[32m+[m[32m        if entity in {"elem", "element", "elements"}:[m
+[32m+[m[32m            cache = getattr(self, "_elem_bitsets", None)[m
+[32m+[m[32m            if cache is not None and tag in cache:[m
+[32m+[m[32m                return cache[tag][m
+[32m+[m[32m            mask = np.fromiter((el.tag == tag for el in self.elements_list), bool)[m
+[32m+[m[32m            return BitSet(mask)[m
+[32m+[m
+[32m+[m[32m        raise ValueError(f"Unsupported entity type '{entity}'.")[m
+[32m+[m[41m    [m
+     # --- Public API ---[m
+     def element_char_length(self, elem_id):[m
+         if elem_id is None:[m
+[1mdiff --git a/pycutfem/integration/quadrature.py b/pycutfem/integration/quadrature.py[m
+[1mindex 2c6eded..4fd7c8c 100644[m
+[1m--- a/pycutfem/integration/quadrature.py[m
+[1m+++ b/pycutfem/integration/quadrature.py[m
+[36m@@ -97,6 +97,8 @@[m [mdef line_quadrature(p0: np.ndarray, p1: np.ndarray, order: int = 2):[m
+     Gauss–Legendre rule mapped from [-1,1] onto the straight segment p0→p1.[m
+     Returns (x_i, w_i) with weights in **physical** space.[m
+     """[m
+[32m+[m[32m    p0 = np.asarray(p0, dtype=np.float64)       #  ← NEW[m
+[32m+[m[32m    p1 = np.asarray(p1, dtype=np.float64)       #  ← NEW[m
+     ξ, w_ref = gauss_legendre(order)             # reference rule[m
+     mid  = 0.5*(p0 + p1)[m
+     half = 0.5*(p1 - p0)                         # derivative dx/dξ[m
+[1mdiff --git a/pycutfem/jit/codegen.py b/pycutfem/jit/codegen.py[m
+[1mindex be72e27..48f1e47 100644[m
+[1m--- a/pycutfem/jit/codegen.py[m
+[1m+++ b/pycutfem/jit/codegen.py[m
+[36m@@ -9,7 +9,7 @@[m [mfrom .ir import ([m
+     BinaryOp, Inner, Dot, Store[m
+ )[m
+ import numpy as np[m
+[31m-[m
+[32m+[m[32mfrom dataclasses import replace[m
+ [m
+ # Numba is imported inside the generated kernel string[m
+ # import numba[m
+[36m@@ -30,6 +30,10 @@[m [mclass StackItem:[m
+     field_names: list = field(default_factory=list)[m
+     # Stores the name of the parent Function/VectorFunction[m
+     parent_name: str = ""[m
+[32m+[m[32m    # tiny shim so we can write  item = item._replace(var_name="tmp")[m
+[32m+[m[32m    def _replace(self, **changes) -> "StackItem":[m
+[32m+[m[41m        [m
+[32m+[m[32m        return replace(self, **changes)[m
+ [m
+ [m
+ class NumbaCodeGen:[m
+[36m@@ -56,6 +60,7 @@[m [mclass NumbaCodeGen:[m
+         stack = [][m
+         var_counter = 0[m
+         required_args = set()[m
+[32m+[m[32m        functional_shape = None        # () for scalar, (k,) for vector[m
+         # Track names of Function/VectorFunction objects that provide coefficients[m
+         solution_func_names = set()[m
+ [m
+[36m@@ -67,7 +72,16 @@[m [mclass NumbaCodeGen:[m
+         # --- Main IR processing loop ---[m
+         for op in ir_sequence:[m
+ [m
+[31m-            if isinstance(op, LoadElementWiseConstant):[m
+[32m+[m[32m            if isinstance(op, LoadFacetNormal):[m
+[32m+[m[32m                required_args.add("normals")[m
+[32m+[m[32m                var_name = new_var("nrm")[m
+[32m+[m[32m                body_lines.append(f"{var_name} = normals[e, q]")[m
+[32m+[m[32m                stack.append(StackItem(var_name=var_name,[m
+[32m+[m[32m                                        role='const',[m
+[32m+[m[32m                                        shape=(self.spatial_dim,),[m
+[32m+[m[32m                                        is_vector=True))[m
+[32m+[m
+[32m+[m[32m            elif isinstance(op, LoadElementWiseConstant):[m
+                 # the full (n_elem, …) array is passed as a kernel argument[m
+                 required_args.add(op.name)                 # kernel argument[m
+                 var_name = new_var("ewc")[m
+[36m@@ -91,47 +105,103 @@[m [mclass NumbaCodeGen:[m
+                                     shape=(), is_vector=False))[m
+             # --- LOAD OPERATIONS ---[m
+             elif isinstance(op, LoadVariable):[m
+[31m-                # This handles both simple variables and UFL Derivatives,[m
+[31m-                # which the visitor translates to a LoadVariable with a deriv_order.[m
+[31m-                operand = op[m
+[31m-                deriv_order = op.deriv_order[m
+[31m-                # This now correctly gets the field names from the IR[m
+[32m+[m[32m                # ----------------------------------------------------------- metadata[m
+[32m+[m[32m                operand     = op[m
+[32m+[m[32m                deriv_order = op.deriv_order           # (dx, dy)[m
+                 field_names = operand.field_names[m
+ [m
+[31m-                # Determine the name of the basis/derivative array needed[m
+[31m-                def get_arg_name(field_name):[m
+[31m-                    if deriv_order == (0, 0): return f"b_{field_name}"[m
+[31m-                    return f"d{deriv_order[0]}{deriv_order[1]}_{field_name}"[m
+[32m+[m[32m                # Which Jacobian should we use?[m
+[32m+[m[32m                jinv_sym = "J_inv"          # default → +-side[m
+[32m+[m[32m                if operand.side == "-":[m
+[32m+[m[32m                    jinv_sym = "J_inv_neg"[m
+[32m+[m[32m                    required_args.add("J_inv_neg")     # make sure it is a kernel param[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    jinv_sym = "J_inv"[m
+[32m+[m
+[32m+[m[32m                # ------------------------------------------------------ basis / tables[m
+[32m+[m[32m                def get_arg_name(fname):[m
+[32m+[m[32m                    if deriv_order == (0, 0):[m
+[32m+[m[32m                        return f"b_{fname}"[m
+[32m+[m[32m                    return f"d{deriv_order[0]}{deriv_order[1]}_{fname}"[m
+ [m
+                 basis_vars = [f"{get_arg_name(fname)}_q" for fname in field_names][m
+                 for fname in field_names:[m
+                     required_args.add(get_arg_name(fname))[m
+ [m
+[31m-                if operand.role in ('test', 'trial'):[m
+[32m+[m[32m                # ------------------------------------------------------------------ A[m
+[32m+[m[32m                # Test / trial functions  → basis tables[m
+[32m+[m[32m                # ------------------------------------------------------------------[m
+[32m+[m[32m                if operand.role in ("test", "trial"):[m
+                     if not operand.is_vector:[m
+                         var_name = new_var("basis_reshaped")[m
+[31m-                        body_lines.append(f"{var_name} = {basis_vars[0]}[np.newaxis, :].copy()")[m
+[32m+[m[32m                        body_lines.append([m
+[32m+[m[32m                            f"{var_name} = {basis_vars[0]}[np.newaxis, :].copy()"[m
+[32m+[m[32m                        )[m
+                         shape = (1, self.n_dofs_local)[m
+                     else:[m
+                         var_name = new_var("basis_stack")[m
+[31m-                        body_lines.append(f"{var_name} = np.stack(({', '.join(basis_vars)}))")[m
+[32m+[m[32m                        body_lines.append([m
+[32m+[m[32m                            f"{var_name} = np.stack(({', '.join(basis_vars)}))"[m
+[32m+[m[32m                        )[m
+                         shape = (len(field_names), self.n_dofs_local)[m
+[31m-                    stack.append(StackItem(var_name=var_name, role=operand.role, shape=shape, is_vector=operand.is_vector, field_names=field_names, parent_name=operand.name))[m
+ [m
+[31m-                elif operand.role == 'function':[m
+[31m-                    # For functions, the coefficients are associated with the main function name[m
+[31m-                    solution_func_names.add(operand.name)[m
+[32m+[m[32m                    # push-forward ξ-derivatives[m
+[32m+[m[32m                    dx, dy = deriv_order[m
+[32m+[m[32m                    if (dx, dy) != (0, 0):[m
+[32m+[m[32m                        scale = f"({jinv_sym}[0,0]**{dx})*({jinv_sym}[1,1]**{dy})"[m
+[32m+[m[32m                        body_lines.append(f"{var_name} *= {scale}")[m
+[32m+[m
+[32m+[m[32m                    stack.append([m
+[32m+[m[32m                        StackItem([m
+[32m+[m[32m                            var_name    = var_name,[m
+[32m+[m[32m                            role        = operand.role,[m
+[32m+[m[32m                            shape       = shape,[m
+[32m+[m[32m                            is_vector   = operand.is_vector,[m
+[32m+[m[32m                            field_names = field_names,[m
+[32m+[m[32m                            parent_name = operand.name,[m
+[32m+[m[32m                        )[m
+[32m+[m[32m                    )[m
+[32m+[m
+[32m+[m[32m                # ------------------------------------------------------------------ B[m
+[32m+[m[32m                # Coefficient functions  → dot(basis, coeff_loc)[m
+[32m+[m[32m                # ------------------------------------------------------------------[m
+[32m+[m[32m                elif operand.role == "function":[m
+[32m+[m[32m                    base = f"u_{operand.name}"[m
+[32m+[m[32m                    coeff_sym = ([m
+[32m+[m[32m                        f"{base}_pos_loc" if operand.side == "+"[m
+[32m+[m[32m                        else f"{base}_neg_loc" if operand.side == "-"[m
+[32m+[m[32m                        else f"{base}_loc"[m
+[32m+[m[32m                    )[m
+[32m+[m[32m                    solution_func_names.add(coeff_sym)[m
+[32m+[m
+                     val_var = new_var(f"{operand.name}_val")[m
+[31m-                    [m
+                     if operand.is_vector:[m
+[31m-                        # val_at_q = [dot(basis_ux, coeffs_u_k), dot(basis_uy, coeffs_u_k), ...][m
+[31m-                        comp_vals = [f"np.dot({bvar}, u_{operand.name}_loc)" for bvar in basis_vars][m
+[31m-                        body_lines.append(f"{val_var} = np.array([{', '.join(comp_vals)}])")[m
+[32m+[m[32m                        comps = [f"np.dot({b}, {coeff_sym})" for b in basis_vars][m
+[32m+[m[32m                        body_lines.append(f"{val_var} = np.array([{', '.join(comps)}])")[m
+                         shape = (len(field_names),)[m
+[31m-                    else: # scalar[m
+[31m-                        body_lines.append(f"{val_var} = np.dot({basis_vars[0]}, u_{operand.name}_loc)")[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        body_lines.append(f"{val_var} = np.dot({basis_vars[0]}, {coeff_sym})")[m
+                         shape = ()[m
+[31m-                    stack.append(StackItem(var_name=val_var, role='value', shape=shape, is_vector=operand.is_vector, field_names=field_names, parent_name=operand.name))[m
+[32m+[m
+[32m+[m[32m                    # push-forward ξ-derivatives[m
+[32m+[m[32m                    dx, dy = deriv_order[m
+[32m+[m[32m                    if (dx, dy) != (0, 0):[m
+[32m+[m[32m                        scale = f"({jinv_sym}[0,0]**{dx})*({jinv_sym}[1,1]**{dy})"[m
+[32m+[m[32m                        body_lines.append(f"{val_var} *= {scale}")[m
+[32m+[m
+[32m+[m[32m                    stack.append([m
+[32m+[m[32m                        StackItem([m
+[32m+[m[32m                            var_name    = val_var,[m
+[32m+[m[32m                            role        = "value",[m
+[32m+[m[32m                            shape       = shape,[m
+[32m+[m[32m                            is_vector   = operand.is_vector,[m
+[32m+[m[32m                            field_names = field_names,[m
+[32m+[m[32m                            parent_name = operand.name,[m
+[32m+[m[32m                        )[m
+[32m+[m[32m                    )[m
+[32m+[m
+[32m+[m
+[32m+[m[41m                    [m
+                 else:[m
+                     raise TypeError(f"Unknown role '{operand.role}' for LoadVariable/Derivative")[m
+ [m
+[36m@@ -184,6 +254,7 @@[m [mclass NumbaCodeGen:[m
+                         grad_val_comp = new_var(f"grad_val_{fname}")[m
+                         # Use the parent name to get the correct coefficient array[m
+                         body_lines.append(f"{grad_val_comp} = {phys_grad_basis}.T.copy() @ u_{a.parent_name}_loc")[m
+[32m+[m[32m                        # body_lines.append(f"{grad_val_comp} = {phys_grad_basis}.T.copy() @ u_{fname}_loc")[m
+                         grad_val_comps.append(grad_val_comp)[m
+                     [m
+                     if not a.is_vector:[m
+[36m@@ -349,7 +420,7 @@[m [mclass NumbaCodeGen:[m
+                 a = stack.pop()[m
+                 res_var = new_var("dot")[m
+ [m
+[31m-                # print(f"Dot operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}")[m
+[32m+[m[32m                print(f"Dot operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}")[m
+ [m
+                 # Advection term: dot(grad(u_trial), u_k)[m
+                 if a.role == 'trial' and a.is_gradient and b.role == 'value' and b.is_vector:[m
+[36m@@ -382,6 +453,26 @@[m [mclass NumbaCodeGen:[m
+                                             shape=(a.shape[1],b.shape[1]), [m
+                                             is_vector=False, field_names=[]))[m
+                 [m
+[32m+[m[32m                # ---------------------------------------------------------------------[m
+[32m+[m[32m                # dot( grad(u_test) ,  const_vec )  ← symmetric term -> Test vec[m
+[32m+[m[32m                # ---------------------------------------------------------------------[m
+[32m+[m[32m                elif a.role == 'test' and a.is_gradient and b.role == 'const' and b.is_vector:[m
+[32m+[m[32m                    if a.shape[2] == b.shape[0]:[m
+[32m+[m[32m                        body_lines.append("# Symmetric term: dot(grad(Test), constant vector)")[m
+[32m+[m[32m                        body_lines += [[m
+[32m+[m[32m                            f"n_vec_comps = {a.shape[0]}; n_locs = {a.shape[1]};n_spatial_dim = {a.shape[2]};",[m
+[32m+[m[32m                            f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",[m
+[32m+[m[32m                            f"for k in range(n_vec_comps):",[m
+[32m+[m[32m                            f"    temp_sum = 0.0",[m
+[32m+[m[32m                            f"    for d in range(n_spatial_dim):",[m
+[32m+[m[32m                            f"        temp_sum += {a.var_name}[k, :, d] * {b.var_name}[d]",[m
+[32m+[m[32m                            f"    {res_var}[k] = temp_sum",[m
+[32m+[m[32m                        ][m
+[32m+[m[32m                        stack.append(StackItem(var_name=res_var, role='test',[m
+[32m+[m[32m                                            shape=(a.shape[0], a.shape[1]), is_vector=True,[m
+[32m+[m[32m                                            is_gradient=False, field_names=a.field_names,[m
+[32m+[m[32m                                            parent_name=a.parent_name))[m
+[32m+[m[41m                [m
+                 # ---------------------------------------------------------------------[m
+                 # dot( grad(u_trial) ,  beta )  ← convection term (Function gradient · Trial)[m
+                 # ---------------------------------------------------------------------[m
+[36m@@ -557,6 +648,46 @@[m [mclass NumbaCodeGen:[m
+                     body_lines.append(f"{res_var} = {b.var_name}.T.copy() @ {a.var_name}")[m
+                     stack.append(StackItem(var_name=res_var, role='value',[m
+                                         shape=(b.shape[1],), is_vector=False,is_gradient=False))[m
+[32m+[m[32m                # ---------------------------------------------------------------------[m
+[32m+[m[32m                # dot( value/const ,  value/const )          ← load-vector term -> (n,)[m
+[32m+[m[32m                # ---------------------------------------------------------------------[m
+[32m+[m[32m                elif (a.role in ('const', 'value') and[m[41m   [m
+[32m+[m[32m                     b.role in ('const', 'value') ):[m
+[32m+[m[32m                    if a.is_gradient and b.is_vector:[m
+[32m+[m[32m                        body_lines.append("# Dot: grad(scalar) * const vector → const vector")[m
+[32m+[m[32m                        # print(f" a.shape: {a.shape}, b.shape: {b.shape}, a.is_vector: {a.is_vector}, b.is_vector: {b.is_vector}, a.is_gradient: {a.is_gradient}, b.is_gradient: {b.is_gradient}")[m
+[32m+[m[32m                        if a.shape == b.shape:[m
+[32m+[m[32m                            body_lines.append(f"{res_var} = np.dot({a.var_name} , {b.var_name})")[m
+[32m+[m[32m                            shape = ()[m
+[32m+[m[32m                            is_vector = False; is_grad = False[m
+[32m+[m[32m                        else:[m
+[32m+[m[32m                            body_lines.append(f"{res_var} = {a.var_name} @ {b.var_name}")[m
+[32m+[m[32m                            shape = (a.shape[0],)[m
+[32m+[m[32m                            is_vector = True; is_grad = False[m
+[32m+[m[32m                    elif a.is_vector and b.is_gradient:[m
+[32m+[m[32m                        body_lines.append("# Dot: const vector * grad(scalar) → const vector")[m
+[32m+[m[32m                        if a.shape == b.shape:[m
+[32m+[m[32m                            body_lines.append(f"{res_var} = np.dot({a.var_name} , {b.var_name})")[m
+[32m+[m[32m                            shape = ()[m
+[32m+[m[32m                            is_vector = False; is_grad = False[m
+[32m+[m[32m                        else:[m
+[32m+[m[32m                            body_lines.append(f"{res_var} = {a.var_name} @ {b.var_name}")[m
+[32m+[m[32m                            shape = (b.shape[0],)[m
+[32m+[m[32m                            is_vector = True; is_grad = False[m
+[32m+[m[32m                    elif a.is_vector and b.is_vector:[m
+[32m+[m[32m                        body_lines.append("# Dot: vector * vector → scalar")[m
+[32m+[m[32m                        body_lines.append(f"{res_var} = np.dot({a.var_name}, {b.var_name})")[m
+[32m+[m[32m                        shape = ()[m
+[32m+[m[32m                        is_vector = False; is_grad = False[m
+[32m+[m[32m                    elif a.is_gradient and  b.is_grdient:[m
+[32m+[m[32m                        body_lines.append("# Dot: grad(scalar) * grad(scalar) → scalar")[m
+[32m+[m[32m                        body_lines.append(f"{res_var} = np.dot({a.var_name}, {b.var_name})")[m
+[32m+[m[32m                        shape = ()[m
+[32m+[m[32m                        is_vector = False; is_grad = False[m
+[32m+[m[32m                    stack.append(StackItem(var_name=res_var, role='const',[m
+[32m+[m[32m                                        shape=shape, is_vector=is_vector,[m[41m [m
+[32m+[m[32m                                        is_gradient=is_grad,[m
+[32m+[m[32m                                        field_names=[]))[m
+                 [m
+                 else:[m
+                     raise NotImplementedError(f"Dot not implemented for roles {a.role}/{b.role} with shapes {a.shape}/{b.shape} with vectoors {a.is_vector}/{b.is_vector} and gradients {a.is_gradient}/{b.is_gradient}")[m
+[36m@@ -568,6 +699,7 @@[m [mclass NumbaCodeGen:[m
+                  # -------------------------------------[m
+                  # ------------ PRODUCT ---------------[m
+                  # -------------------------------------[m
+[32m+[m[32m                #  print(f"BinaryOp: {op.op_symbol} with a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}")[m
+                  if op.op_symbol == '*':[m
+                     body_lines.append(f"# Product: {a.role} * {b.role}")[m
+                     # -----------------------------------------------------------------[m
+[36m@@ -785,6 +917,8 @@[m [mclass NumbaCodeGen:[m
+                     body_lines.append(f"Fe += {integrand.var_name} * w_q")[m
+                 elif op.store_type == 'functional':[m
+                     body_lines.append(f"J += {integrand.var_name} * w_q")[m
+[32m+[m[32m                    if functional_shape is None:[m
+[32m+[m[32m                        functional_shape = integrand.shape[m
+                 else:[m
+                     raise NotImplementedError(f"Store type '{op.store_type}' not implemented.")[m
+             [m
+[36m@@ -792,7 +926,7 @@[m [mclass NumbaCodeGen:[m
+                 raise NotImplementedError(f"Opcode {type(op).__name__} not handled in JIT codegen.")[m
+ [m
+         source, param_order = self._build_kernel_string([m
+[31m-            kernel_name, body_lines, required_args, solution_func_names[m
+[32m+[m[32m            kernel_name, body_lines, required_args, solution_func_names, functional_shape[m
+         )[m
+         return source, {}, param_order[m
+ [m
+[36m@@ -801,39 +935,65 @@[m [mclass NumbaCodeGen:[m
+             self, kernel_name: str,[m
+             body_lines: list,[m
+             required_args: set,[m
+[31m-            solution_func_names: set[m
+[31m-            , DEBUG: bool = True[m
+[32m+[m[32m            solution_func_names: set,[m
+[32m+[m[32m            functional_shape: tuple = None,[m
+[32m+[m[32m            DEBUG: bool = True[m
+         ):[m
+         """[m
+         Build complete kernel source code with parallel assembly.[m
+         """[m
+[31m-        # New Newton: Change parameter names to reflect they are pre-gathered.[m
+[32m+[m[32m        # Each entry in solution_func_names already *is* the correct symbol[m
+[32m+[m[32m        # (e.g.  u_u_loc, u_u_pos_loc, …).  Pass it through verbatim.[m
+         for name in solution_func_names:[m
+[31m-            # We will pass u_{name}_loc directly, not the global coeffs.[m
+[31m-            required_args.add(f"u_{name}_loc")[m
+[32m+[m[32m            required_args.add(name)[m
+ [m
+         # New Newton: Remove gdofs_map from parameters, it's used before the kernel call.[m
+[32m+[m[32m        # param_order = [[m
+[32m+[m[32m        #     "gdofs_map",[m
+[32m+[m[32m        #     "node_coords",[m
+[32m+[m[32m        #     "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",[m
+[32m+[m[32m        #     *sorted(list(required_args))[m
+[32m+[m[32m        # ][m
+         param_order = [[m
+[31m-            "gdofs_map",[m
+[31m-            "node_coords",[m
+[31m-            "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",[m
+[31m-            *sorted(list(required_args))[m
+[31m-        ][m
+[32m+[m[32m            #  "gdofs_map", "node_coords",[m
+[32m+[m[32m             "qp_phys", "qw", "detJ", "J_inv",[m
+[32m+[m[32m             "normals", "phis",[m
+[32m+[m[32m             *sorted(required_args)[m
+[32m+[m[32m         ][m
+[32m+[m
+[32m+[m[32m        seen = set();  uniq = [][m
+[32m+[m[32m        for p in param_order:[m
+[32m+[m[32m            if p not in seen:[m
+[32m+[m[32m                uniq.append(p);  seen.add(p)[m
+[32m+[m[32m        param_order = uniq[m
+[32m+[m[32m        # param_order = list(dict.fromkeys(param_order))  # Remove duplicates while preserving order[m
+[32m+[m[41m   [m
+         param_order_literal = ", ".join(f"'{arg}'" for arg in param_order)[m
+ [m
+[31m-        # New Newton: The unpacking block is now much simpler.[m
+[31m-        # We just select the data for the current element `e`.[m
+[32m+[m[32m        # Slice the per-element block once per coefficient array[m
+         coeffs_unpack_block = "\n".join([m
+[31m-            f"        u_{name}_loc_e = u_{name}_loc[e]"[m
+[31m-            for name in sorted(list(solution_func_names))[m
+[32m+[m[32m            f"        {name}_e = {name}[e]"[m
+[32m+[m[32m            for name in sorted(solution_func_names)[m
+         )[m
+         [m
+[32m+[m[32m        # basis_unpack_block = "\n".join([m
+[32m+[m[32m        #     f"            {arg}_q = {arg}[q]"[m
+[32m+[m[32m        #     for arg in sorted(list(required_args))[m
+[32m+[m[32m        #     if arg.startswith(("b_", "d_", "g_"))[m
+[32m+[m[32m        # )[m
+[32m+[m[32m        # basis_unpack_block = "\n".join([m
+[32m+[m[32m        #     f"""            # pick value at this quadrature point[m
+[32m+[m[32m        #             {arg}_q = {arg}[e, q] if {arg}.shape[0] == num_elements else {arg}[q]"""[m
+[32m+[m[32m        #     for arg in sorted(list(required_args))[m
+[32m+[m[32m        #     if arg.startswith(('b_', 'd_', 'g_'))[m
+[32m+[m[32m        # )[m
+         basis_unpack_block = "\n".join([m
+[31m-            f"            {arg}_q = {arg}[q]"[m
+[32m+[m[32m            f"            {arg}_q = {arg}[e, q]"[m
+             for arg in sorted(list(required_args))[m
+[31m-            if arg.startswith(("b_", "d_", "g_"))[m
+[32m+[m[32m            if arg.startswith(('b_', 'd', 'g_'))[m
+         )[m
+ [m
+[32m+[m
+         body_code_block = "\n".join([m
+             f"            {line.replace('_loc', '_loc_e')}" for line in body_lines if line.strip()[m
+         )[m
+[36m@@ -855,12 +1015,17 @@[m [mdef {kernel_name}([m
+     [m
+     K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype=np.float64)[m
+     F_values = np.zeros((num_elements, n_dofs_per_element), dtype=np.float64)[m
+[31m-    J_values = np.zeros(num_elements, dtype=np.float64)  # For functional forms[m
+[32m+[m[32m    # Shape of the integrand that lands in “J”.[m
+[32m+[m[32m    # -------- functional accumulator ------------------------------------[m
+[32m+[m[32m    k = {functional_shape[0] if functional_shape else 0}[m
+[32m+[m[32m    J_init = {'0.0' if not functional_shape else f'np.zeros((k,), dtype=np.float64)'}[m
+[32m+[m[32m    J     = J_init[m
+[32m+[m[32m    J_values = np.zeros(({ 'num_elements' if not functional_shape else f'(num_elements, k)' }), dtype=np.float64)[m
+ [m
+     for e in numba.prange(num_elements):[m
+         Ke = np.zeros((n_dofs_per_element, n_dofs_per_element), dtype=np.float64)[m
+         Fe = np.zeros(n_dofs_per_element, dtype=np.float64)[m
+[31m-        J = 0.0[m
+[32m+[m[32m        J  = J_init.copy() if {bool(functional_shape)} else J_init[m
+ [m
+ {coeffs_unpack_block}[m
+ [m
+[36m@@ -878,4 +1043,8 @@[m [mdef {kernel_name}([m
+     return K_values, F_values, J_values[m
+ """.lstrip()[m
+ [m
+[32m+[m[32m        # print('*'*50)[m
+[32m+[m[32m        # print(f"Generate kernel: {final_kernel_src}")[m
+[32m+[m[32m        # print('*'*50)[m
+[32m+[m
+         return final_kernel_src, param_order[m
+\ No newline at end of file[m
+[1mdiff --git a/pycutfem/jit/ir.py b/pycutfem/jit/ir.py[m
+[1mindex b8d91ca..cbd71b1 100644[m
+[1m--- a/pycutfem/jit/ir.py[m
+[1m+++ b/pycutfem/jit/ir.py[m
+[36m@@ -12,6 +12,7 @@[m [mclass LoadVariable:[m
+     is_vector: bool    # Flag for vector-valued functions[m
+     deriv_order: Tuple[int, int] = field(default=(0, 0)) # (dx, dy) order of derivative[m
+     field_names: list = field(default_factory=list) [m
+[32m+[m[32m    side: str = ""           # "", "+", or "-"   ← NEW[m
+ [m
+ @dataclass(frozen=True, slots=True)[m
+ class LoadConstant:[m
+[1mdiff --git a/pycutfem/jit/visitor.py b/pycutfem/jit/visitor.py[m
+[1mindex eeaf911..086b883 100644[m
+[1m--- a/pycutfem/jit/visitor.py[m
+[1m+++ b/pycutfem/jit/visitor.py[m
+[36m@@ -12,6 +12,7 @@[m [mfrom pycutfem.jit.ir import ([m
+     LoadFacetNormal, Grad, Div, PosOp, NegOp, BinaryOp, Inner, Dot, Store,[m
+     LoadConstantArray[m
+ )[m
+[32m+[m[32mfrom dataclasses import replace[m
+ [m
+ import logging[m
+ logger = logging.getLogger(__name__)[m
+[36m@@ -145,15 +146,60 @@[m [mclass IRGenerator:[m
+             self.ir_sequence.append(NegOp())[m
+             return[m
+         [m
+[32m+[m[32m         # ------------------------------------------------------------------[m
+[32m+[m[32m        #  Derivative …[m
+[32m+[m[32m        #  ───────────[m
+[32m+[m[32m        #  ▸ ordinary fields   → single LoadVariable, as before[m
+[32m+[m[32m        #  ▸ jump(expr)        → jump of the *derivative*, i.e.[m
+[32m+[m[32m        #                         Derivative(Jump(u), αx, αy)[m
+[32m+[m[32m        #                       becomes[m
+[32m+[m[32m        #                         Jump( Derivative(u_pos, αx, αy),[m
+[32m+[m[32m        #                               Derivative(u_neg, αx, αy) )[m
+[32m+[m[32m        #                       which expands to “pos − neg” IR nodes[m
+[32m+[m[32m        # ------------------------------------------------------------------[m
+         if isinstance(node, Derivative):[m
+[31m-            operand = node.f[m
+[32m+[m[32m            operand     = node.f[m
+             deriv_order = node.order[m
+[31m-            [m
+[31m-            is_vec = isinstance(operand, (VectorTestFunction, VectorTrialFunction, VectorFunction))[m
+[31m-            role = 'test' if operand.is_test else 'trial' if operand.is_trial else 'function'[m
+[31m-            name = operand.space.name if hasattr(operand, 'space') else operand.name if hasattr(operand, 'name') else operand.field_name[m
+[31m-            [m
+[31m-            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, deriv_order=deriv_order))[m
+[32m+[m
+[32m+[m[32m            # -------- special case: derivative of a jump ------------------[m
+[32m+[m[32m            if isinstance(operand, Jump):[m
+[32m+[m[32m                self._visit(Derivative(operand.u_pos, *deriv_order))[m
+[32m+[m[32m                self.ir_sequence[-1] = replace(self.ir_sequence[-1], side="+")[m
+[32m+[m[32m                self._visit(Derivative(operand.u_neg, *deriv_order))[m
+[32m+[m[32m                self.ir_sequence[-1] = replace(self.ir_sequence[-1], side="-")[m
+[32m+[m[32m                self.ir_sequence.append(BinaryOp(op_symbol='-'))   # pos − neg[m
+[32m+[m[32m                return[m
+[32m+[m
+[32m+[m[32m            # -------- ordinary scalar / vector field ----------------------[m
+[32m+[m[32m            is_vec = isinstance([m
+[32m+[m[32m                operand,[m
+[32m+[m[32m                (VectorTestFunction, VectorTrialFunction, VectorFunction)[m
+[32m+[m[32m            )[m
+[32m+[m[32m            role = ([m
+[32m+[m[32m                'test'   if operand.is_test  else[m
+[32m+[m[32m                'trial'  if operand.is_trial else[m
+[32m+[m[32m                'function'[m
+[32m+[m[32m            )[m
+[32m+[m[32m            field_names = ([m
+[32m+[m[32m                list(operand.field_names)           # vectors[m
+[32m+[m[32m                if hasattr(operand, 'field_names')[m
+[32m+[m[32m                else [operand.field_name]           # scalars → wrap in list[m
+[32m+[m[32m            )[m
+[32m+[m[32m            # some UFL leaves (e.g. Constant) have neither .space nor .name[m
+[32m+[m[32m            if hasattr(operand, 'space'):[m
+[32m+[m[32m                name = operand.space.name[m
+[32m+[m[32m            elif hasattr(operand, 'name'):[m
+[32m+[m[32m                name = operand.name[m
+[32m+[m[32m            else:                                    # fall-back – never fails[m
+[32m+[m[32m                name = f"anon_{id(operand):x}"[m
+[32m+[m
+[32m+[m[32m            self.ir_sequence.append([m
+[32m+[m[32m                LoadVariable(name=name,[m
+[32m+[m[32m                             role=role,[m
+[32m+[m[32m                             is_vector=is_vec,[m
+[32m+[m[32m                             deriv_order=deriv_order,[m
+[32m+[m[32m                             field_names=field_names)[m
+[32m+[m[32m            )[m
+             return[m
+ [m
+         # --- Binary Operators ---[m
+[1mdiff --git a/pycutfem/ufl/compilers.py b/pycutfem/ufl/compilers.py[m
+[1mindex 60316d3..9018e0a 100644[m
+[1m--- a/pycutfem/ufl/compilers.py[m
+[1m+++ b/pycutfem/ufl/compilers.py[m
+[36m@@ -43,7 +43,7 @@[m [mfrom pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices[m
+ from pycutfem.fem.transform import map_deriv[m
+ from pycutfem.ufl.analytic import Analytic[m
+ from pycutfem.utils.domain_manager import get_domain_bitset[m
+[31m-from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args[m
+[32m+[m[32mfrom pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_edge_contribs, _scatter_ghost_edge_contribs, _stack_ragged,_scatter_element_contribs[m
+ [m
+ [m
+ [m
+[36m@@ -833,6 +833,7 @@[m [mclass FormCompiler:[m
+             basis_args = _build_jit_kernel_args([m
+                 ir, integral.integrand, self.me, q_order,[m
+                 dof_handler=self.dh,[m
+[32m+[m[32m                gdofs_map=gdofs_map,[m
+                 param_order=runner.param_order,[m
+                 pre_built= geo_args[m
+             )[m
+[36m@@ -952,7 +953,197 @@[m [mclass FormCompiler:[m
+ [m
+     [m
+     [m
+[31m-    def _assemble_interface(self, intg: Integral, matvec): # New[m
+[32m+[m[32m    def _assemble_interface_jit(self, intg, matvec):[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Assemble ∫_Γ ⋯ using the JIT backend.[m
+[32m+[m[32m        All kernel tables are sized (n_elems_total, …) so the kernel may[m
+[32m+[m[32m        iterate over *all* elements; non-cut rows are zero and contribute[m
+[32m+[m[32m        nothing.[m
+[32m+[m[32m        """[m
+[32m+[m
+[32m+[m[32m        dh, me = self.dh, self.me[m
+[32m+[m[32m        mesh   = me.mesh[m
+[32m+[m
+[32m+[m[32m        # 1.  BitSet of cut elements ------------------------------------------------[m
+[32m+[m[32m        cut_eids = (intg.measure.defined_on[m
+[32m+[m[32m                    if intg.measure.defined_on is not None[m
+[32m+[m[32m                    else mesh.element_bitset("cut"))[m
+[32m+[m
+[32m+[m[32m        if cut_eids.cardinality() == 0:            # nothing to do[m
+[32m+[m[32m            return[m
+[32m+[m
+[32m+[m[32m        # 2.  Geometric pre-compute --------------------------------------------------[m
+[32m+[m[32m        qdeg      = self._find_q_order(intg)[m
+[32m+[m[32m        level_set = intg.measure.level_set[m
+[32m+[m[32m        if level_set is None:[m
+[32m+[m[32m            raise ValueError("dInterface measure requires a level_set.")[m
+[32m+[m
+[32m+[m[32m        geo = dh.precompute_interface_factors(cut_eids, qdeg, level_set)[m
+[32m+[m
+[32m+[m[32m        # 3.  Full element-to-DOF map  (shape = n_elems_total × n_loc) --------------[m
+[32m+[m[32m        gdofs_map = np.vstack([m
+[32m+[m[32m            [dh.get_elemental_dofs(eid) for eid in range(mesh.n_elements)][m
+[32m+[m[32m        ).astype(np.int32)[m
+[32m+[m
+[32m+[m[32m        # 4.  Compile kernel & build argument dict ----------------------------------[m
+[32m+[m[32m        runner, ir = self._compile_backend(intg.integrand, dh, me)[m
+[32m+[m
+[32m+[m[32m        basis_args = _build_jit_kernel_args([m
+[32m+[m[32m            ir, intg.integrand, me, qdeg,[m
+[32m+[m[32m            dof_handler = dh,[m
+[32m+[m[32m            gdofs_map   = gdofs_map,[m
+[32m+[m[32m            param_order = runner.param_order,[m
+[32m+[m[32m            pre_built   = geo           # already sized n_elems_total[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m        static_args = {k: v for k, v in geo.items() if k != 'eids'}[m
+[32m+[m[32m        static_args.update(basis_args)[m
+[32m+[m
+[32m+[m[32m        # 5.  Execute the kernel -----------------------------------------------------[m
+[32m+[m[32m        K, F, J = runner({}, static_args)[m
+[32m+[m
+[32m+[m[32m        # 6. scatter ONLY the cut rows --------------------------------------[m
+[32m+[m[32m        cut_eids = geo["eids"]                 # 1-D array of global ids[m
+[32m+[m[32m        K_cut = K[cut_eids][m
+[32m+[m[32m        F_cut = F[cut_eids][m
+[32m+[m[32m        J_cut = J[cut_eids] if J is not None else None[m
+[32m+[m
+[32m+[m[32m        gdofs_cut = gdofs_map[cut_eids]        # rows aligned with K_cut[m
+[32m+[m
+[32m+[m[32m        _scatter_element_contribs([m
+[32m+[m[32m            K_cut, F_cut, J_cut,[m
+[32m+[m[32m            cut_eids, gdofs_cut,[m
+[32m+[m[32m            matvec, self.ctx, intg.integrand[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    # ---------------------------------------------------------------------------[m
+[32m+[m[32m    # JIT assembly on CUT ghost edges[m
+[32m+[m[32m    # ---------------------------------------------------------------------------[m
+[32m+[m[32m    def _assemble_ghost_jit(self, intg, matvec):[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Assemble element matrices/vectors for ghost edges with the Numba JIT[m
+[32m+[m[32m        backend.  The routine mirrors the pure-Python ghost implementation but[m
+[32m+[m[32m        buckets edges by equal local-union size so every kernel can run on a[m
+[32m+[m[32m        rectangular (n_edges, union) work-set.[m
+[32m+[m
+[32m+[m[32m        Parameters[m
+[32m+[m[32m        ----------[m
+[32m+[m[32m        intg : Integrand[m
+[32m+[m[32m            The integrand whose Hessian / gradient / residual we assemble.[m
+[32m+[m[32m        matvec : MatVecBuilder[m
+[32m+[m[32m            Object that accumulates the global K, F, J triplet.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        from pycutfem.ufl.helpers_jit import _stack_ragged[m
+[32m+[m
+[32m+[m[32m        dh, me   = self.dh, self.me[m
+[32m+[m[32m        mesh     = me.mesh[m
+[32m+[m
+[32m+[m[32m        # ------------------------------------------------------------------[m
+[32m+[m[32m        # 1.  bookkeeping on the integrand (derivatives, quadrature degree)[m
+[32m+[m[32m        # ------------------------------------------------------------------[m
+[32m+[m[32m        derivs = intg.measure.metadata.get("derivs")[m
+[32m+[m[32m        if derivs is None:[m
+[32m+[m[32m            derivs = required_multi_indices(intg.integrand)[m
+[32m+[m[32m            derivs |= {(0, 0)}                    # always need basis itself[m
+[32m+[m[32m            intg.measure.metadata["derivs"] = derivs[m
+[32m+[m[32m        qdeg = self._find_q_order(intg)[m
+[32m+[m
+[32m+[m[32m        # which edges are *ghost* for this measure?[m
+[32m+[m[32m        subset   = intg.measure.defined_on[m
+[32m+[m[32m        edge_ids = subset.to_indices() if subset is not None else \[m
+[32m+[m[32m                get_domain_bitset(mesh, "edge", "ghost")[m
+[32m+[m
+[32m+[m[32m        # ------------------------------------------------------------------[m
+[32m+[m[32m        # 2.  geometry & mapping pre-computation (done once)[m
+[32m+[m[32m        # ------------------------------------------------------------------[m
+[32m+[m[32m        geo = dh.precompute_edge_factors([m
+[32m+[m[32m            edge_ids,[m
+[32m+[m[32m            qdeg,[m
+[32m+[m[32m            level_set=intg.measure.level_set,[m
+[32m+[m[32m            with_maps=True,          # gives global_dofs / pos_map / neg_map[m
+[32m+[m[32m        )[m
+[32m+[m[32m        n_edges_total = len(edge_ids)[m
+[32m+[m
+[32m+[m[32m        # ------------------------------------------------------------------[m
+[32m+[m[32m        # 3.  bucket edges by identical union size[m
+[32m+[m[32m        # ------------------------------------------------------------------[m
+[32m+[m[32m        buckets: Dict[int, Dict[str, Any]] = {}[m
+[32m+[m[32m        for e, g in enumerate(geo["global_dofs"]):[m
+[32m+[m[32m            buckets.setdefault(len(g), {"edges": []})["edges"].append(e)[m
+[32m+[m
+[32m+[m[32m        # 4.  gather coefficient Functions once ----------------------------[m
+[32m+[m[32m        current_funcs = {[m
+[32m+[m[32m            f.name: f[m
+[32m+[m[32m            for f in _find_all(intg.integrand, (Function, VectorFunction))[m
+[32m+[m[32m        }[m
+[32m+[m[32m        # also map parent VectorFunction names when we see a scalar component[m
+[32m+[m[32m        for f in list(current_funcs.values()):[m
+[32m+[m[32m            pv = getattr(f, "_parent_vector", None)[m
+[32m+[m[32m            if pv is not None:[m
+[32m+[m[32m                current_funcs.setdefault(pv.name, pv)[m
+[32m+[m[32m        # ------------------------------------------------------------------[m
+[32m+[m[32m        # 5.  loop over buckets, run JIT kernel, scatter[m
+[32m+[m[32m        # ------------------------------------------------------------------[m
+[32m+[m[32m        for n_loc, info in buckets.items():[m
+[32m+[m[32m            e_sel = info["edges"][m
+[32m+[m
+[32m+[m[32m            # (a) build per-bucket geometry tables --------------------------------[m
+[32m+[m[32m            gdofs_map = _stack_ragged([geo["global_dofs"][e] for e in e_sel])[m
+[32m+[m[32m            pos_map = geo["pos_map"][e_sel]      # correct rows for this bucket[m
+[32m+[m[32m            neg_map = geo["neg_map"][e_sel][m
+[32m+[m[32m            # slice everything that is stored “per edge” (first axis == n_edges_total)[m
+[32m+[m[32m            geo_slice = {}[m
+[32m+[m[32m            for k, v in geo.items():[m
+[32m+[m[32m                if isinstance(v, list):[m
+[32m+[m[32m                    v = np.asarray(v)[m
+[32m+[m[32m                if isinstance(v, np.ndarray) and v.shape[0] == n_edges_total:[m
+[32m+[m[32m                    geo_slice[k] = v[e_sel][m
+[32m+[m
+[32m+[m[32m            static = {[m
+[32m+[m[32m                "gdofs_map":  gdofs_map,[m
+[32m+[m[32m                "node_coords": dh.get_all_dof_coords(),[m
+[32m+[m[32m                "pos_map":    pos_map,                 # local DOFs on positive side[m
+[32m+[m[32m                "neg_map":    neg_map,                 # local DOFs on negative side[m
+[32m+[m[32m                **geo_slice,                     # pos_map / neg_map arrive here too[m
+[32m+[m[32m            }[m
+[32m+[m
+[32m+[m[32m            # (b) compile or reuse the kernel --------------------------------------[m
+[32m+[m[32m            runner, ir = info.get("runner", (None, None))[m
+[32m+[m[32m            if runner is None:[m
+[32m+[m[32m                runner, ir = self._compile_backend(intg.integrand, dh, me)[m
+[32m+[m[32m                info["runner"] = runner[m
+[32m+[m[32m                info["ir"]     = ir[m
+[32m+[m
+[32m+[m[32m            # augment kernel args that are independent of edge selection[m
+[32m+[m[32m            static.update([m
+[32m+[m[32m                _build_jit_kernel_args([m
+[32m+[m[32m                    ir,[m
+[32m+[m[32m                    intg.integrand,[m
+[32m+[m[32m                    me,[m
+[32m+[m[32m                    qdeg,[m
+[32m+[m[32m                    dof_handler   = dh,[m
+[32m+[m[32m                    param_order   = runner.param_order,[m
+[32m+[m[32m                    pre_built     = static,[m
+[32m+[m[32m                )[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            # (c) execute & scatter ------------------------------------------------[m
+[32m+[m[32m            K, F, J = runner(current_funcs, static)[m
+[32m+[m[32m            _scatter_ghost_edge_contribs([m
+[32m+[m[32m                K, F, J, static, matvec, self.ctx, intg.integrand[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m
+[32m+[m[32m    def _assemble_interface(self, intg: Integral, matvec):[m
+[32m+[m[32m        """Assemble integrals over non-conforming interfaces defined by a level set."""[m
+[32m+[m[32m        if self.backend == "python":[m
+[32m+[m[32m            self._assemble_interface_python(intg, matvec)[m
+[32m+[m[32m        elif self.backend == "jit":[m
+[32m+[m[32m            self._assemble_interface_jit(intg, matvec)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")[m
+[32m+[m[41m    [m
+[32m+[m[32m    def _assemble_interface_python(self, intg: Integral, matvec):[m[41m [m
+         """ # New[m
+         Assembles integrals over non-conforming interfaces defined by a level set. # New[m
+         This implementation is adapted for the new MixedElement/DofHandler architecture. # New[m
+[36m@@ -1070,6 +1261,18 @@[m [mclass FormCompiler:[m
+             log.debug("Interface assembly finished. Context cleaned.") # New[m
+     [m
+     def _assemble_ghost_edge(self, intg: "Integral", matvec):[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Assembles integrals over ghost edges using a side-aware cache.[m
+[32m+[m[32m        This method supports both JIT and Python backends.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        if self.backend == "python":[m
+[32m+[m[32m            self._assemble_ghost_edge_python(intg, matvec)[m
+[32m+[m[32m        elif self.backend == "jit":[m
+[32m+[m[32m            self._assemble_ghost_jit(intg, matvec)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")[m
+[32m+[m
+[32m+[m[32m    def _assemble_ghost_edge_python(self, intg: "Integral", matvec):[m
+         """[m
+         Assembles integrals over ghost facets using a side-aware cache.[m
+ [m
+[1mdiff --git a/pycutfem/ufl/helpers_jit.py b/pycutfem/ufl/helpers_jit.py[m
+[1mindex d5c24da..9773b4d 100644[m
+[1m--- a/pycutfem/ufl/helpers_jit.py[m
+[1m+++ b/pycutfem/ufl/helpers_jit.py[m
+[36m@@ -1,5 +1,5 @@[m
+ import numpy as np[m
+[31m-from typing import Mapping, Tuple, Dict, Any[m
+[32m+[m[32mfrom typing import Mapping, Tuple, Dict, Any, Sequence[m
+ from pycutfem.integration import volume[m
+ import logging # Added for logging warnings[m
+ import os[m
+[36m@@ -25,6 +25,7 @@[m [mdef _build_jit_kernel_args(       # ← NEW signature (unchanged)[m
+         mixed_element,            # MixedElement instance[m
+         q_order: int,             # quadrature order[m
+         dof_handler,              # DofHandler – *needed* for padding[m
+[32m+[m[32m        gdofs_map: np.ndarray=None,[m[41m [m
+         param_order=None,          # order of parameters in the JIT kernel[m
+         pre_built: dict | None = None[m
+     ):[m
+[36m@@ -61,27 +62,37 @@[m [mdef _build_jit_kernel_args(       # ← NEW signature (unchanged)[m
+     # ------------------------------------------------------------------[m
+     # 0. Helpers[m
+     # ------------------------------------------------------------------[m
+[32m+[m[32m    n_elem = mixed_element.mesh.n_elements[m
+[32m+[m
+[32m+[m[32m    def _expand_per_element(ref_tab: np.ndarray) -> np.ndarray:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Replicate a reference-space table so that shape[0] == n_elem.[m
+[32m+[m
+[32m+[m[32m        We keep memory overhead low with ``np.broadcast_to``; the[m
+[32m+[m[32m        result is read-only, which is fine because kernels never write[m
+[32m+[m[32m        into these tables.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        return np.broadcast_to(ref_tab, (n_elem, *ref_tab.shape)).copy()[m
+[32m+[m
+[32m+[m[41m    [m
+     def _basis_table(field: str):[m
+[31m-        """φ_i(ξ,η) for every quadrature point"""[m
+[31m-        return np.asarray([m
+[31m-            [mixed_element.basis(field, *xi_eta) for xi_eta in qp_ref],[m
+[31m-            dtype=np.float64[m
+[31m-        )[m
+[32m+[m[32m        ref = np.asarray([mixed_element.basis(field, *xi_eta)[m
+[32m+[m[32m                          for xi_eta in qp_ref], dtype=np.float64)      # (n_q , n_loc)[m
+[32m+[m[32m        return _expand_per_element(ref)                                 # (n_elem , n_q , n_loc)[m
+ [m
+     def _grad_table(field: str):[m
+[31m-        """∇φ_i(ξ,η) in reference coords"""[m
+[31m-        return np.asarray([m
+[31m-            [mixed_element.grad_basis(field, *xi_eta) for xi_eta in qp_ref],[m
+[31m-            dtype=np.float64[m
+[31m-        )[m
+[32m+[m[32m        ref = np.asarray([mixed_element.grad_basis(field, *xi_eta)[m
+[32m+[m[32m                          for xi_eta in qp_ref], dtype=np.float64)      # (n_q , n_loc , 2)[m
+[32m+[m[32m        return _expand_per_element(ref)[m[41m  [m
+ [m
+     def _deriv_table(field: str, ax: int, ay: int):[m
+         """∂^{ax+ay} φ_i / ∂ξ^{ax} ∂η^{ay}"""[m
+[31m-        return np.asarray([m
+[32m+[m[32m        ref = np.asarray([m
+             [mixed_element.deriv_ref(field, *xi_eta, ax, ay)[m
+              for xi_eta in qp_ref],[m
+             dtype=np.float64[m
+[31m-        )[m
+[32m+[m[32m            )[m
+[32m+[m[32m        return _expand_per_element(ref)                                 # (n_elem, n_q, n_loc)[m
+ [m
+     # ------------------------------------------------------------------[m
+     # 1. Reference-element quadrature (ξ-space)[m
+[36m@@ -154,10 +165,11 @@[m [mdef _build_jit_kernel_args(       # ← NEW signature (unchanged)[m
+     }[m
+ [m
+     # cache gdofs_map for coefficient gathering[m
+[31m-    gdofs_map = np.vstack([[m
+[31m-        dof_handler.get_elemental_dofs(eid)[m
+[31m-        for eid in range(mixed_element.mesh.n_elements)[m
+[31m-    ]).astype(np.int32)[m
+[32m+[m[32m    if gdofs_map is None:[m
+[32m+[m[32m        gdofs_map = np.vstack([[m
+[32m+[m[32m            dof_handler.get_elemental_dofs(eid)[m
+[32m+[m[32m            for eid in range(mixed_element.mesh.n_elements)[m
+[32m+[m[32m        ]).astype(np.int32)[m
+ [m
+     total_dofs = dof_handler.total_dofs[m
+ [m
+[36m@@ -181,22 +193,7 @@[m [mdef _build_jit_kernel_args(       # ← NEW signature (unchanged)[m
+             ax, ay = int(tag[1]), int(tag[2])[m
+             args[name] = _deriv_table(fld, ax, ay)[m
+ [m
+[31m-        # ---- coefficient vectors / element-local blocks ------------------[m
+[31m-        elif name.startswith("u_") and name.endswith("_loc"):[m
+[31m-            func_name = name[2:-4]          # strip 'u_'   and '_loc'[m
+[31m-            f = func_map.get(func_name)[m
+[31m-            if f is None:[m
+[31m-                raise NameError([m
+[31m-                    f"Kernel requests coefficient array for unknown Function "[m
+[31m-                    f"or VectorFunction '{func_name}'."[m
+[31m-                )[m
+[31m-[m
+[31m-            # build once – padding to GLOBAL length ensures safe gather[m
+[31m-            full_vec = np.zeros(total_dofs, dtype=np.float64)[m
+[31m-            for gdof, lidx in f._g2l.items():[m
+[31m-                full_vec[gdof] = f.nodal_values[lidx][m
+[31m-[m
+[31m-            args[name] = full_vec[gdofs_map][m
+[32m+[m[41m        [m
+ [m
+         # ---- constant arrays ---------------------------------------------[m
+         elif name in const_arrays:[m
+[36m@@ -227,6 +224,62 @@[m [mdef _build_jit_kernel_args(       # ← NEW signature (unchanged)[m
+             ana_vals[:] = ana.eval(np.stack((x, y), axis=-1))   # vectorised call[m
+ [m
+             args[name] = ana_vals[m
+[32m+[m[32m        # -------------------------------------------------------------------------[m
+[32m+[m[32m        # (+) / (–)  side coefficient tables for ghost facets[m
+[32m+[m[32m        # -------------------------------------------------------------------------[m
+[32m+[m[32m        elif re.match(r"u_.*_(pos|neg)_loc$", name):[m
+[32m+[m[32m            # requested symbol is e.g.  u_u_pos_loc  or  u_v_neg_loc[m
+[32m+[m[32m            func_name, side = name[2:-4].rsplit("_", 1)   # "u", "pos" | "neg"[m
+[32m+[m[32m            f = func_map[func_name][m
+[32m+[m
+[32m+[m[32m            # ---- 1. global vector of the Function --------------------------------[m
+[32m+[m[32m            full = np.zeros(total_dofs, dtype=np.float64)[m
+[32m+[m[32m            full[list(f._g2l.keys())] = f.nodal_values[m
+[32m+[m
+[32m+[m[32m            # ---- 2. gather block-by-block along the bucket -----------------------[m
+[32m+[m[32m            n_edges, union = gdofs_map.shape[m
+[32m+[m
+[32m+[m[32m            # Convert ragged object-arrays into a proper 2-D table[m
+[32m+[m[32m            amap = np.asarray(pre_built[f"{side}_map"])[m
+[32m+[m[32m            if amap.ndim == 1:           # object array → rows of different length[m
+[32m+[m[32m                from pycutfem.ufl.helpers_jit import _stack_ragged[m
+[32m+[m[32m                amap = _stack_ragged(amap)          # pad with -1 to full rectangle[m
+[32m+[m
+[32m+[m[32m            # Keep both maps in lock-step – work with the smaller row count[m
+[32m+[m[32m            if amap.shape[0] != n_edges:[m
+[32m+[m[32m                max_edges = min(amap.shape[0], n_edges)[m
+[32m+[m[32m                amap      = amap[:max_edges][m
+[32m+[m[32m                gdofs_map = gdofs_map[:max_edges][m
+[32m+[m[32m                n_edges   = max_edges[m
+[32m+[m
+[32m+[m[32m            coeff = np.zeros((n_edges, union), dtype=np.float64)[m
+[32m+[m
+[32m+[m[32m            for e in range(n_edges):[m
+[32m+[m[32m                sel_all = amap[e][m
+[32m+[m[32m                # keep only valid positions *inside this union*[m
+[32m+[m[32m                sel = sel_all[(sel_all >= 0) & (sel_all < union)][m
+[32m+[m[32m                if sel.size:[m
+[32m+[m[32m                    coeff[e, sel] = full[gdofs_map[e, sel]][m
+[32m+[m
+[32m+[m[32m            args[name] = coeff[m
+[32m+[m[32m            continue   # <- do NOT let the generic "u_*_loc" branch see this name[m
+[32m+[m
+[32m+[m[32m        # ---- coefficient vectors / element-local blocks ------------------[m
+[32m+[m[32m        elif name.startswith("u_") and name.endswith("_loc"):[m
+[32m+[m[32m            func_name = name[2:-4]          # strip 'u_'   and '_loc'[m
+[32m+[m[32m            f = func_map.get(func_name)[m
+[32m+[m[32m            if f is None:[m
+[32m+[m[32m                raise NameError([m
+[32m+[m[32m                    f"Kernel requests coefficient array for unknown Function "[m
+[32m+[m[32m                    f"or VectorFunction '{func_name}'."[m
+[32m+[m[32m                )[m
+[32m+[m
+[32m+[m[32m            # build once – padding to GLOBAL length ensures safe gather[m
+[32m+[m[32m            full_vec = np.zeros(total_dofs, dtype=np.float64)[m
+[32m+[m[32m            for gdof, lidx in f._g2l.items():[m
+[32m+[m[32m                full_vec[gdof] = f.nodal_values[lidx][m
+[32m+[m
+[32m+[m[32m            args[name] = full_vec[gdofs_map][m
+ [m
+         else:[m
+             logger.warning([m
+[36m@@ -245,6 +298,159 @@[m [mdef _build_jit_kernel_args(       # ← NEW signature (unchanged)[m
+             else:[m
+                 print(f"    {k:<20} type={type(v).__name__}")[m
+ [m
+[32m+[m[32m    qp_phys = args["qp_phys"][m
+[32m+[m[32m    n_elem, n_qp, _ = qp_phys.shape[m
+[32m+[m[41m [m
+[32m+[m[32m    # ------------------------------------------------------ default facet data[m
+[32m+[m[32m    # A volume kernel still carries the *name* "normals" because the generated[m
+[32m+[m[32m    # code contains the line[m
+[32m+[m[32m    #       normal_q = normals[e, q] if normals is not None else np.zeros(2)[m
+[32m+[m[32m    # Give it a harmless zero array so the symbol is always defined.[m
+[32m+[m[32m    # if "normals" in param_order and "normals" not in args:[m
+[32m+[m[32m    #     args["normals"] = np.zeros((n_elem, n_qp, 2), dtype=np.float64)[m
+[32m+[m[32m    # if "phis" in param_order and "phis" not in args:[m
+[32m+[m[32m    #     args["phis"]    = np.zeros((n_elem, n_qp),     dtype=np.float64)[m
+[32m+[m[32m    # ------------------------------------------------------------------[m
+[32m+[m[32m    # 6.  Dummy defaults for detJ / J_inv (ghost edges don’t need them[m
+[32m+[m[32m    #     but the generated signature still lists them)[m
+[32m+[m[32m    # ------------------------------------------------------------------[m
+[32m+[m[32m    if "detJ" in required and "detJ" not in args:[m
+[32m+[m[32m        n_el, n_qp, _ = args["qp_phys"].shape[m
+[32m+[m[32m        args["detJ"] = np.ones((n_el, n_qp), dtype=np.float64)[m
+[32m+[m
+[32m+[m[32m    if "J_inv" in required and "J_inv" not in args:[m
+[32m+[m[32m        n_el, n_qp, _ = args["qp_phys"].shape[m
+[32m+[m[32m        eye = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float64)[m
+[32m+[m[32m        args["J_inv"] = np.broadcast_to(eye, (n_el, n_qp, 2, 2)).copy()[m
+     return args[m
+ [m
+ [m
+[32m+[m[32mdef _scatter_element_contribs([m
+[32m+[m[32m    K_elem: np.ndarray | None,[m
+[32m+[m[32m    F_elem: np.ndarray | None,[m
+[32m+[m[32m    J_elem: np.ndarray | None,[m
+[32m+[m[32m    element_ids: np.ndarray,[m
+[32m+[m[32m    gdofs_map: np.ndarray,[m
+[32m+[m[32m    matvec: np.ndarray,[m
+[32m+[m[32m    ctx: dict,[m
+[32m+[m[32m    integrand,[m
+[32m+[m[32m):[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Generic scatter for element-based JIT kernels (e.g., dInterface).[m
+[32m+[m[32m    """[m
+[32m+[m[32m    rhs = ctx.get("rhs", False)[m
+[32m+[m[32m    hook = ctx.get("hooks", {}).get(type(integrand))[m
+[32m+[m
+[32m+[m[32m    # --- Matrix contributions ---[m
+[32m+[m[32m    if not rhs and K_elem is not None and K_elem.ndim == 3:[m
+[32m+[m[32m        for i, eid in enumerate(element_ids):[m
+[32m+[m[32m            gdofs = gdofs_map[i][m
+[32m+[m[32m            r, c = np.meshgrid(gdofs, gdofs, indexing="ij")[m
+[32m+[m[32m            matvec[r, c] += K_elem[i][m
+[32m+[m
+[32m+[m[32m    # --- Vector contributions ---[m
+[32m+[m[32m    if rhs and F_elem is not None:[m
+[32m+[m[32m        for i, eid in enumerate(element_ids):[m
+[32m+[m[32m            gdofs = gdofs_map[i][m
+[32m+[m[32m            np.add.at(matvec, gdofs, F_elem[i])[m
+[32m+[m
+[32m+[m[32m    # --- Functional contributions ---[m
+[32m+[m[32m    if hook and J_elem is not None:[m
+[32m+[m[32m        # print(f"J_elem.shape: {J_elem.shape}---J_elem: {J_elem}")[m
+[32m+[m[32m        total = J_elem.sum(axis=0) if J_elem.ndim > 1 else J_elem.sum()[m
+[32m+[m[32m        # This accumulator logic is correct.[m
+[32m+[m[32m        acc = ctx.setdefault("scalar_results", {}).setdefault([m
+[32m+[m[32m            hook["name"], np.zeros_like(total)[m
+[32m+[m[32m        )[m
+[32m+[m[32m        acc += total[m
+[32m+[m
+[32m+[m[32m# -------------------------------------------------------------------------# helper – ghost edge scatter[m
+[32m+[m[32m# -------------------------------------------------------------------------[m
+[32m+[m[32mdef _scatter_ghost_edge_contribs(K, F, J, geo, matvec, ctx, integrand):[m
+[32m+[m[32m    rhs  = ctx["rhs"][m
+[32m+[m[32m    hook = ctx["hooks"].get(type(integrand))[m
+[32m+[m
+[32m+[m[32m    # ------------------------------------------------------------------[m
+[32m+[m[32m    #  Matrix block K[e] is *pos-side* 9×9.  Scatter it only to those[m
+[32m+[m[32m    #  nine global DOFs (g[pm]) so the shapes agree (9 ↔ 9).[m
+[32m+[m[32m    # ------------------------------------------------------------------[m
+[32m+[m[32m    if (not rhs) and K is not None and K.ndim == 3:[m
+[32m+[m[32m        for e, (g, pm, nm) in enumerate([m
+[32m+[m[32m                zip(geo["global_dofs"], geo["pos_map"], geo["neg_map"])):[m
+[32m+[m[32m            edge_dofs = g[pm]                                   # len = 9[m
+[32m+[m[32m            r, c = np.meshgrid(edge_dofs, edge_dofs, indexing="ij")[m
+[32m+[m[32m            matvec[r, c] += K[e][m
+[32m+[m
+[32m+[m[32m    # ------------------------------------------------------------------[m
+[32m+[m[32m    #  RHS blocks are likewise 9-long (pos side).  Map by pm.[m
+[32m+[m[32m    # ------------------------------------------------------------------[m
+[32m+[m[32m    if rhs and F is not None:[m
+[32m+[m[32m        for e, (g, pm, nm) in enumerate([m
+[32m+[m[32m                zip(geo["global_dofs"], geo["pos_map"], geo["neg_map"])):[m
+[32m+[m[32m            np.add.at(matvec, g[pm], F[e])[m
+[32m+[m
+[32m+[m[32m    # --- Scalar (hooked) functional -----------------------------------[m
+[32m+[m[32m    if hook and J is not None:[m
+[32m+[m[32m        total = J.sum(axis=0) if J.ndim > 1 else J.sum()[m
+[32m+[m[32m        acc = ctx.setdefault("scalar_results", {}).setdefault([m
+[32m+[m[32m                   hook["name"], np.zeros_like(total))[m
+[32m+[m[32m        acc += total            # in-place update → dictionary entry change[m
+[32m+[m
+[32m+[m[32m# -------------------------------------------------------------------------[m
+[32m+[m[32m# helper – edge / interface block scatter[m
+[32m+[m[32m# -------------------------------------------------------------------------[m
+[32m+[m[32mdef _stack_ragged(chunks: Sequence[np.ndarray]) -> np.ndarray:[m
+[32m+[m[32m    """Stack 1‑D integer arrays of variable length → 2‑D, padded with ‑1."""[m
+[32m+[m[32m    n = len(chunks)[m
+[32m+[m[32m    m = max(len(c) for c in chunks)[m
+[32m+[m[32m    out = -np.ones((n, m), dtype=np.int32)[m
+[32m+[m[32m    for i, c in enumerate(chunks):[m
+[32m+[m[32m        out[i, : len(c)] = c[m
+[32m+[m[32m    return out[m
+[32m+[m[32mdef _scatter_edge_contribs([m
+[32m+[m[32m    K_edge: np.ndarray | None,[m
+[32m+[m[32m    F_edge: np.ndarray | None,[m
+[32m+[m[32m    J_edge: np.ndarray | None,[m
+[32m+[m[32m    edge_ids: Sequence[int],[m
+[32m+[m[32m    matvec: np.ndarray,[m
+[32m+[m[32m    ctx: dict,[m
+[32m+[m[32m    dh: "DofHandler",[m
+[32m+[m[32m    integrand,[m
+[32m+[m[32m):[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Generic scatter for edge-based JIT kernels.[m
+[32m+[m
+[32m+[m[32m    # Only scatter into the (n_dofs × n_dofs) matrix of a *bilinear* form.[m
+[32m+[m[32m    if (not rhs) and matvec.ndim == 2 and K_edge is not None and K_edge.ndim == 3:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    rhs  = ctx["rhs"][m
+[32m+[m[32m    hook = ctx["hooks"].get(type(integrand))[m
+[32m+[m
+[32m+[m[32m    mesh = dh.mixed_element.mesh[m
+[32m+[m[32m    print(f"K_edge shape: {K_edge.shape if K_edge is not None else 'None'}")[m
+[32m+[m[32m    print(f"F_edge shape: {F_edge.shape if F_edge is not None else 'None'}")[m
+[32m+[m
+[32m+[m[32m    # ------------------------------------------------------------------ matrix[m
+[32m+[m[32m    if (not rhs) and K_edge is not None and K_edge.ndim == 3:[m
+[32m+[m[32m        n_loc = K_edge.shape[1][m
+[32m+[m[32m        for e, eid in enumerate(edge_ids):[m
+[32m+[m[32m            # For interface edges we only need ONE element (choose .left)[m
+[32m+[m[32m            gdofs = dh.get_elemental_dofs(mesh.edge(eid).left)[m
+[32m+[m[32m            # (n_loc, n_loc) should already match gdofs length:[m
+[32m+[m[32m            r, c = np.meshgrid(gdofs, gdofs, indexing="ij")[m
+[32m+[m[32m            matvec[r, c] += K_edge[e][m
+[32m+[m
+[32m+[m[32m    # ------------------------------------------------------------------ vector[m
+[32m+[m[32m    if rhs and F_edge is not None:[m
+[32m+[m[32m        n_loc = F_edge.shape[1][m
+[32m+[m[32m        for e, eid in enumerate(edge_ids):[m
+[32m+[m[32m            gdofs = dh.get_elemental_dofs(mesh.edge(eid).left)[m
+[32m+[m[32m            np.add.at(matvec, gdofs, F_edge[e])[m
+[32m+[m
+[32m+[m[32m    # ---------------------------------------------------------------- functional[m
+[32m+[m[32m    if hook and J_edge is not None:[m
+[32m+[m[32m        total = J_edge.sum(axis=0) if J_edge.ndim > 1 else J_edge.sum()[m
+[32m+[m[32m        acc   = ctx.setdefault("scalar_results", {}).setdefault([m
+[32m+[m[32m                    hook["name"], np.zeros_like(total))[m
+[32m+[m[32m        acc += total[m
+[32m+[m
+[1mdiff --git a/pycutfem/utils/domain_manager.py b/pycutfem/utils/domain_manager.py[m
+[1mindex 759a5f3..f753783 100644[m
+[1m--- a/pycutfem/utils/domain_manager.py[m
+[1m+++ b/pycutfem/utils/domain_manager.py[m
+[36m@@ -1,26 +1,34 @@[m
+ import numpy as np[m
+[31m-from pycutfem.core.mesh import Mesh[m
+[32m+[m
+ from pycutfem.utils.bitset import BitSet[m
+ [m
+[31m-def get_domain_bitset(mesh: Mesh, entity_type: str, tag: str) -> BitSet:[m
+[32m+[m[32mdef get_domain_bitset(mesh: "Mesh", entity_type: str, tag: str) -> BitSet:[m
+     """[m
+[31m-    Creates a BitSet for a domain based on a tag applied to mesh entities.[m
+[31m-[m
+[31m-    Args:[m
+[31m-        mesh (Mesh): The mesh object, which must have been classified first.[m
+[31m-        entity_type (str): The type of mesh entity ('element' or 'edge').[m
+[31m-        tag (str): The tag to search for (e.g., 'NEG', 'POS', 'interface').[m
+[31m-[m
+[31m-    Returns:[m
+[31m-        BitSet: A bitmask representing the domain.[m
+[32m+[m[32m    Return a BitSet that selects all *entity_type* (‘element’ or ‘edge’) whose[m
+[32m+[m[32m    `.tag` equals *tag*.  For interface/ghost problems the routine first tries[m
+[32m+[m[32m    the BitSet caches filled during `mesh.classify_elements/edges`, falling[m
+[32m+[m[32m    back to an explicit O(n) scan only when necessary.[m
+     """[m
+[31m-    if entity_type == 'element':[m
+[31m-        entity_list = mesh.elements_list[m
+[31m-        mask = np.array([e.tag == tag for e in entity_list], dtype=bool)[m
+[31m-    elif entity_type == 'edge':[m
+[31m-        entity_list = mesh.edges_list[m
+[31m-        mask = np.array([e.tag == tag for e in entity_list], dtype=bool)[m
+[32m+[m[32m    if entity_type == "edge":[m
+[32m+[m[32m        # Fast path – use cache built once in classify_edges(..)[m
+[32m+[m[32m        if tag in getattr(mesh, "_edge_bitsets", {}):[m
+[32m+[m[32m            return mesh.edge_bitset(tag)                     # O(1)[m
+[32m+[m[32m        # ------------------------------------------------------------------[m
+[32m+[m[32m        entities = mesh.edges_list[m
+[32m+[m[32m    elif entity_type == "element":[m
+[32m+[m[32m        if tag in getattr(mesh, "_elem_bitsets", {}):[m
+[32m+[m[32m            return mesh.element_bitset(tag)[m
+[32m+[m[32m        entities = mesh.elements_list[m
+     else:[m
+         raise ValueError("entity_type must be 'element' or 'edge'")[m
+[31m-        [m
+[31m-    return BitSet(mask)[m
+\ No newline at end of file[m
+[32m+[m
+[32m+[m[32m    # Slow fall-back – happens only if the mesh has not been classified yet[m
+[32m+[m[32m    mask = np.fromiter((getattr(e, "tag", "") == tag for e in entities),[m
+[32m+[m[32m                       dtype=bool, count=len(entities))[m
+[32m+[m[32m    bs = BitSet(mask)[m
+[32m+[m[32m    # Fill the cache so subsequent calls are cheap[m
+[32m+[m[32m    if entity_type == "edge":[m
+[32m+[m[32m        mesh._edge_bitsets[tag] = bs[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        mesh._elem_bitsets[tag] = bs[m
+[32m+[m[32m    return bs[m
+[1mdiff --git a/pycutfem/utils/meshgen.py b/pycutfem/utils/meshgen.py[m
+[1mindex 7363240..fcb8d74 100644[m
+[1m--- a/pycutfem/utils/meshgen.py[m
+[1m+++ b/pycutfem/utils/meshgen.py[m
+[36m@@ -4,7 +4,7 @@[m [mMesh generators for quick tests.[m
+ import numpy as np[m
+ from scipy.spatial import Delaunay[m
+ from pycutfem.io.visualization import visualize_mesh_node_order[m
+[31m-from pycutfem.core import Node[m
+[32m+[m[32mfrom pycutfem.core.topology import Node[m
+ from typing import List[m
+ [m
+ __all__ = ["delaunay_rectangle", "structured_quad", "structured_triangles"][m
+[1mdiff --git a/tests/ufl/test_cutfem_poisson.py b/tests/ufl/test_cutfem_poisson.py[m
+[1mindex 89d847b..72dab43 100644[m
+[1m--- a/tests/ufl/test_cutfem_poisson.py[m
+[1m+++ b/tests/ufl/test_cutfem_poisson.py[m
+[36m@@ -6,13 +6,13 @@[m [mimport scipy.sparse.linalg as spla[m
+ from pycutfem.core.mesh import Mesh[m
+ from pycutfem.core.dofhandler import DofHandler[m
+ from pycutfem.utils.meshgen import structured_quad[m
+[31m-from pycutfem.utils.bitset import BitSet[m
+[32m+[m[32m# from pycutfem.utils.bitset import BitSet[m
+ from pycutfem.utils.domain_manager import get_domain_bitset[m
+ [m
+ # --- UFL-like imports ---[m
+ from pycutfem.ufl.expressions import (TrialFunction, TestFunction, grad, inner, jump,dot,[m
+[31m-                             ElementWiseConstant, Constant)[m
+[31m-from pycutfem.ufl.measures import dx, ds, dInterface[m
+[32m+[m[32m                             ElementWiseConstant, Constant, FacetNormal)[m
+[32m+[m[32mfrom pycutfem.ufl.measures import dx, dInterface[m
+ from pycutfem.ufl.forms import BoundaryCondition, assemble_form[m
+ [m
+ # --- Level Set and Cut Ratio imports ---[m
+[36m@@ -39,6 +39,7 @@[m [mdef test_cutfem_poisson_interface():[m
+     # Classify mesh elements and edges against the level set[m
+     mesh.classify_elements(level_set)[m
+     mesh.classify_edges(level_set)[m
+[32m+[m[32m    n = FacetNormal()  # unit normal from ctx[m
+ [m
+     # 2. Create BitSets for the integration domains[m
+     neg_elements = get_domain_bitset(mesh, 'element', 'outside')[m
+[36m@@ -87,7 +88,9 @@[m [mdef test_cutfem_poisson_interface():[m
+     a += inner(alpha * grad(u_pos), grad(v_pos)) * dx(defined_on=pos_elements | cut_elements)[m
+     [m
+     # Interface terms use the ds measure, which now requires the level_set for orientation[m
+[31m-    a += ( dot(avg_flux_u, jump_v) + dot(avg_flux_v, jump_u) + stab * jump_u * jump_v ) * dInterface( level_set=level_set)[m
+[32m+[m[32m    a += ( dot(dot(avg_flux_u,n), jump_v)[m[41m [m
+[32m+[m[32m          + dot(dot(avg_flux_v,n), jump_u)[m[41m [m
+[32m+[m[32m          + stab * jump_u * jump_v ) * dInterface( level_set=level_set)[m
+ [m
+     # Right-hand side[m
+     f = Constant(1.0) * v_neg * dx(defined_on=neg_elements | cut_elements)[m
+[1mdiff --git a/tests/ufl/test_face_integrals.py b/tests/ufl/test_face_integrals.py[m
+[1mindex 22669e7..016473f 100644[m
+[1m--- a/tests/ufl/test_face_integrals.py[m
+[1m+++ b/tests/ufl/test_face_integrals.py[m
+[36m@@ -67,7 +67,7 @@[m [mdef bcs(cavity_setup):[m
+     """Gets the boundary conditions list from the main setup fixture."""[m
+     return cavity_setup[2][m
+ [m
+[31m-def make_levelset():[m
+[32m+[m[32mdef make_levelset(center=center, R=R):[m
+     return CircleLevelSet(center, radius=R)[m
+ [m
+ def add_scalar_field(func: Function, mesh: Mesh, phi, u_pos=None, u_neg=None):[m
+[36m@@ -242,7 +242,8 @@[m [mdef test_jump_grad_vector(mesh:Mesh):[m
+     dof_handler = DofHandler(me, method='cg')  # Create a DofHandler for the mesh[m
+     velocity_space_pos = VectorFunction("velocity_pos", ['vx', 'vy'], dof_handler=dof_handler)[m
+     velocity_space_neg = VectorFunction("velocity_neg", ['vx', 'vy'], dof_handler=dof_handler)[m
+[31m-    phi = make_levelset(); mesh.classify_elements(phi); mesh.classify_edges(phi)[m
+[32m+[m[32m    phi = make_levelset(); mesh.classify_elements(phi);[m[41m [m
+[32m+[m[32m    mesh.classify_edges(phi)[m
+     mesh.build_interface_segments(phi); [m
+     v_pos = lambda x,y: np.array([2 * x * y, 3 * x**2 * y-y**2])[m
+     v_neg = lambda x,y: np.array([3 * y**2 * x + x**3, 10 * x +y])[m
+[36m@@ -254,7 +255,7 @@[m [mdef test_jump_grad_vector(mesh:Mesh):[m
+     grad_v_neg_n = dot(grad(velocity_space_neg),n)[m
+ [m
+     # form = dot(jump_grad_v,n) * dInterface(level_set=phi)[m
+[31m-    form = Jump(grad_v_pos_n,grad_v_neg_n) * dInterface(level_set=phi)[m
+[32m+[m[32m    form = Jump(grad_v_pos_n,grad_v_neg_n) * dInterface(level_set=phi, metadata={'q':4})[m
+     eq   = form == Constant(0.0) * dx[m
+     res  = assemble_form(eq, dof_handler=dof_handler, bcs=[],[m
+                          assembler_hooks={type(form.integrand):{'name':'jv'}})[m
+[36m@@ -263,5 +264,27 @@[m [mdef test_jump_grad_vector(mesh:Mesh):[m
+     print(f"Computed vector jump: {res['jv']}")[m
+     assert_allclose(res['jv'], exact.flatten(), rtol=1e-2)[m
+ [m
+[32m+[m[32mdef test_jump_grad_vector_zero(mesh):[m
+[32m+[m[32m    me  = MixedElement(mesh, field_specs={"vx": 1, "vy": 1})[m
+[32m+[m[32m    dh  = DofHandler(me, method="cg")[m
+[32m+[m
+[32m+[m[32m    v_fun = lambda x, y: np.array([x + 2*y, -3*x + y**2])[m
+[32m+[m[32m    v_pos = VectorFunction("v_pos", ['vx', 'vy'], dof_handler=dh)[m
+[32m+[m[32m    v_neg = VectorFunction("v_neg", ['vx', 'vy'], dof_handler=dh)[m
+[32m+[m[32m    v_pos.set_values_from_function(v_fun)[m
+[32m+[m[32m    v_neg.set_values_from_function(v_fun)          # identical field[m
+[32m+[m
+[32m+[m[32m    n = FacetNormal()[m
+[32m+[m[32m    form = Jump(dot(grad(v_pos), n),[m
+[32m+[m[32m                dot(grad(v_neg), n)) * dInterface(level_set=make_levelset())[m
+[32m+[m[32m    eq   = form == Constant(0.0) * dx[m
+[32m+[m
+[32m+[m[32m    res  = assemble_form(eq, dof_handler=dh, bcs=[],[m
+[32m+[m[32m                         assembler_hooks={type(form.integrand): {'name': 'zero'}})[m
+[32m+[m[32m    assert_allclose(res['zero'], np.zeros(2), atol=1e-12)[m
+[32m+[m
+[32m+[m
+[32m+[m
+[32m+[m
+ if __name__ == "__main__":[m
+     pytest.main([__file__, '-v', '--tb=short'])[m
+\ No newline at end of file[m

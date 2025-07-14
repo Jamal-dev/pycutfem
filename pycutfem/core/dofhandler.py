@@ -18,6 +18,12 @@ from collections.abc import Sequence
 from hashlib import blake2b
 from pycutfem.integration.quadrature import line_quadrature
 from functools import lru_cache
+<<<<<<< Updated upstream
+=======
+
+
+_edge_geom_cache: dict[tuple, dict] = {}     # ← NEW — module-level cache
+>>>>>>> Stashed changes
 
 
 _edge_geom_cache: dict[tuple, dict] = {}     # ← NEW — module-level cache
@@ -692,6 +698,7 @@ class DofHandler:
         """
         from pycutfem.integration.quadrature import line_quadrature
         from pycutfem.fem import transform
+<<<<<<< Updated upstream
 
         mesh = self.mixed_element.mesh
         ids = cut_element_ids.to_indices() if hasattr(cut_element_ids, "to_indices") else list(cut_element_ids)
@@ -775,6 +782,91 @@ class DofHandler:
             out[f"b_{fld}"] = b_tabs[fld]
             out[f"g_{fld}"] = g_tabs[fld]
 
+=======
+
+        mesh = self.mixed_element.mesh
+        ids = cut_element_ids.to_indices() if hasattr(cut_element_ids, "to_indices") else list(cut_element_ids)
+
+        # Filter for elements that are actually 'cut' and have a valid segment
+        valid_cut_eids = [
+            eid for eid in ids
+            if mesh.elements_list[eid].tag == 'cut' and len(mesh.elements_list[eid].interface_pts) == 2
+        ]
+        
+        if not valid_cut_eids:
+            # Return empty arrays with correct shapes if no valid cut elements
+            return {
+                'eids': np.array([], dtype=int),
+                'qp_phys': np.empty((0, 0, 2)), 'qw': np.empty((0, 0)),
+                'normals': np.empty((0, 0, 2)), 'phis': np.empty((0, 0)),
+                'detJ': np.empty((0, 0)), 'J_inv': np.empty((0, 0, 2, 2)),
+            }
+
+        # --- Use a cache if requested ---
+        cache_key = (_hash_subset(valid_cut_eids), qdeg, id(level_set))
+        if reuse and cache_key in _edge_geom_cache:
+            return _edge_geom_cache[cache_key]
+
+        # --- Allocation ---
+        # n_elems = len(valid_cut_eids)
+        n_elems = mesh.n_elements
+        # We need a representative segment to determine n_q
+        p0_rep, p1_rep = mesh.elements_list[valid_cut_eids[0]].interface_pts
+        q_xi_rep, q_w_rep = line_quadrature(p0_rep, p1_rep, qdeg)
+        n_q = len(q_w_rep)
+
+        qp_phys = np.zeros((n_elems, n_q, 2))
+        qw = np.zeros((n_elems, n_q))
+        normals = np.zeros((n_elems, n_q, 2))
+        phis = np.zeros((n_elems, n_q))
+        detJ_arr = np.zeros((n_elems, n_q))
+        Jinv_arr = np.zeros((n_elems, n_q, 2, 2))
+        # ---------- NEW: basis / grad-basis tables on the interface ----------
+        me      = self.mixed_element
+        fields  = me.field_names            # ['vx', 'vy', …]
+        b_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local))         for f in fields}
+        g_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local, 2))      for f in fields}
+
+
+        # --- Loop over valid cut elements ---
+        for k, eid in enumerate(valid_cut_eids):
+            elem = mesh.elements_list[eid]
+            p0, p1 = elem.interface_pts
+
+            # --- Quadrature rule on the physical interface segment ---
+            q_xi, q_w = line_quadrature(p0, p1, qdeg)
+
+            for q, (xq, wq) in enumerate(zip(q_xi, q_w)):
+                qp_phys[eid, q] = xq
+                qw[eid, q] = wq
+
+                # Normal and phi value from the level set
+                g = level_set.gradient(xq)
+                # norm_g = np.linalg.norm(g)
+                normals[eid, q] = g #/ (norm_g + 1e-30)
+                phis[eid, q] = level_set(xq)
+
+                # Jacobian of the parent element at the quadrature point
+                xi_ref, eta_ref = transform.inverse_mapping(mesh, eid, xq)
+                J = transform.jacobian(mesh, eid, (xi_ref, eta_ref))
+                detJ_arr[eid, q] = np.linalg.det(J)
+                Jinv_arr[eid, q] = np.linalg.inv(J)
+                for fld in fields:
+                    b_tabs[fld][eid, q] = me.basis      (fld, xi_ref, eta_ref)
+                    g_tabs[fld][eid, q] = me.grad_basis (fld, xi_ref, eta_ref)
+
+        # --- Gather results and cache ---
+        out = {
+            'eids': np.array(valid_cut_eids, dtype=int),
+            # 'eids': np.arange(mesh.n_elements, dtype=int),  # All elements, not just cut
+            'qp_phys': qp_phys, 'qw': qw, 'normals': normals, 'phis': phis,
+            'detJ': detJ_arr, 'J_inv': Jinv_arr,
+        }
+        for fld in fields:
+            out[f"b_{fld}"] = b_tabs[fld]
+            out[f"g_{fld}"] = g_tabs[fld]
+
+>>>>>>> Stashed changes
         if reuse:
             _edge_geom_cache[cache_key] = out
         
@@ -944,6 +1036,9 @@ class DofHandler:
 
         _edge_geom_cache[cache_key] = out
         return out
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 
 
