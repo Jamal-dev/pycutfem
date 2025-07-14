@@ -12,6 +12,7 @@ class LoadVariable:
     is_vector: bool    # Flag for vector-valued functions
     deriv_order: Tuple[int, int] = field(default=(0, 0)) # (dx, dy) order of derivative
     field_names: list = field(default_factory=list) 
+    side: str = ""           # "", "+", or "-"   ← NEW
 
 @dataclass(frozen=True, slots=True)
 class LoadConstant:

@@ -5,6 +5,8 @@ from typing import Tuple, List, Dict, Optional, Callable
 
 from pycutfem.core.topology import Edge, Node, Element
 
+from pycutfem.utils.bitset import BitSet
+
 
 class Mesh:
     """
@@ -48,6 +50,8 @@ class Mesh:
         self._build_topology()
         self.n_elements = len(self.elements_connectivity)
         self.spatial_dim = 2  # Assuming 2D mesh by default
+        self._elem_bitsets: Dict[str, BitSet] = {}
+        self._edge_bitsets: Dict[str, BitSet] = {}
 
     def _build_topology(self):
         """
@@ -177,6 +181,9 @@ class Mesh:
         for eid in inside_inds: self.elements_list[eid].tag = 'inside'
         for eid in outside_inds: self.elements_list[eid].tag = 'outside'
         for eid in cut_inds: self.elements_list[eid].tag = 'cut'
+        tags_el = np.array([e.tag for e in self.elements_list])
+
+        self._elem_bitsets = {t: BitSet(tags_el == t) for t in np.unique(tags_el)}
         
         return inside_inds, outside_inds, cut_inds
 
@@ -214,6 +221,17 @@ class Mesh:
             # CRITICAL FIX: This must NOT override a 'ghost' tag.
             if edge.tag != 'ghost' and phi_nodes[edge.nodes[0]] * phi_nodes[edge.nodes[1]] < 0:
                 edge.tag = 'interface'
+            # Build and cache BitSets *once* – O(n_edges) total
+
+            tags = np.array([e.tag for e in self.edges_list])
+
+            self._edge_bitsets = {
+
+                t: BitSet(tags == t)               # tiny (n_edges) boolean mask
+
+                for t in np.unique(tags) if t      # skip '' untagged edges
+
+            }
 
 
     def build_interface_segments(self, level_set, tol=1e-12, qorder=2):
@@ -279,6 +297,49 @@ class Mesh:
                 # If we don't have exactly two points, treat this element as
                 # not having a valid cut segment.
                 elem.interface_pts = []
+
+    def edge_bitset(self, tag: str) -> BitSet:
+        """Return cached BitSet of edges with the given tag."""
+        return self._edge_bitsets.get(tag, BitSet(np.zeros(len(self.edges_list), bool)))
+
+    def element_bitset(self, tag: str) -> BitSet:
+        return self._elem_bitsets.get(tag, BitSet(np.zeros(len(self.elements_list), bool)))
+
+    def get_domain_bitset(self, tag: str, *, entity: str = "edge") -> BitSet:     # noqa: N802
+        """
+        Return a **BitSet** that marks all mesh entities carrying *tag*.
+        Parameters
+        ----------
+        tag     : str
+
+            Mesh or BC tag (e.g. ``'interface'``, ``'ghost'``, ``'left_wall'`` …).
+
+        entity  : {'edge', 'elem', 'element'}
+
+            Select whether the BitSet refers to edges or elements.
+        Notes
+        -----
+        *   For edges and elements the classification routines fill the
+            private caches ``_edge_bitsets`` and ``_elem_bitsets`` exactly once
+            (O(*n*)).  From then on every call is an O(1) dictionary lookup.
+        *   If a cache does *not* exist yet we compute the mask on the fly – this
+            costs at most O(*n*) and does **not** pollute the cache (avoids
+            hidden state changes).
+        """
+        entity = entity.lower()
+        if entity in {"edge", "edges"}:
+            cache = getattr(self, "_edge_bitsets", None)
+            if cache is not None and tag in cache:                     # fast path
+                return cache[tag]
+            mask = np.fromiter((e.tag == tag for e in self.edges_list), bool)  # O(n)
+            return BitSet(mask)
+        if entity in {"elem", "element", "elements"}:
+            cache = getattr(self, "_elem_bitsets", None)
+            if cache is not None and tag in cache:
+                return cache[tag]
+            mask = np.fromiter((el.tag == tag for el in self.elements_list), bool)
+            return BitSet(mask)
+        raise ValueError(f"Unsupported entity type '{entity}'.")
     # --- Public API ---
     def element_char_length(self, elem_id):
         if elem_id is None:

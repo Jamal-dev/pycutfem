@@ -43,7 +43,7 @@ from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices
 from pycutfem.fem.transform import map_deriv
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.utils.domain_manager import get_domain_bitset
-from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args
+from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs
 
 
 
@@ -833,6 +833,7 @@ class FormCompiler:
             basis_args = _build_jit_kernel_args(
                 ir, integral.integrand, self.me, q_order,
                 dof_handler=self.dh,
+                gdofs_map=gdofs_map,
                 param_order=runner.param_order,
                 pre_built= geo_args
             )
@@ -952,7 +953,7 @@ class FormCompiler:
 
     
     
-    def _assemble_interface(self, intg: Integral, matvec): # New
+    def _assemble_interface_python(self, intg: Integral, matvec): # New
         """ # New
         Assembles integrals over non-conforming interfaces defined by a level set. # New
         This implementation is adapted for the new MixedElement/DofHandler architecture. # New
@@ -1224,3 +1225,86 @@ class FormCompiler:
         # 7. Final Context Cleanup
         for k in ('basis_values', 'normal', 'phi_val', 'eid', 'x_phys', 'global_dofs', 'pos_map', 'neg_map'):
             self.ctx.pop(k, None)
+    
+    def _assemble_interface_jit(self, intg, matvec):
+        """
+        Assemble ∫_Γ ⋯ using the JIT backend.
+        All kernel tables are sized (n_elems_total, …) so the kernel may
+        iterate over *all* elements; non-cut rows are zero and contribute
+        nothing.
+        """
+
+        dh, me = self.dh, self.me
+        mesh   = me.mesh
+
+        # 1.  BitSet of cut elements ------------------------------------------------
+        cut_eids = (intg.measure.defined_on
+                    if intg.measure.defined_on is not None
+                    else mesh.element_bitset("cut"))
+
+        if cut_eids.cardinality() == 0:            # nothing to do
+            return
+
+        # 2.  Geometric pre-compute --------------------------------------------------
+        qdeg      = self._find_q_order(intg)
+        level_set = intg.measure.level_set
+        if level_set is None:
+            raise ValueError("dInterface measure requires a level_set.")
+
+        geo = dh.precompute_interface_factors(cut_eids, qdeg, level_set)
+
+        # 3.  Full element-to-DOF map  (shape = n_elems_total × n_loc) --------------
+        gdofs_map = np.vstack(
+            [dh.get_elemental_dofs(eid) for eid in range(mesh.n_elements)]
+        ).astype(np.int32)
+
+        # 4.  gather coefficient Functions once ----------------------------
+        current_funcs = {
+            f.name: f
+            for f in _find_all(intg.integrand, (Function, VectorFunction))
+        }
+        # also map parent VectorFunction names when we see a scalar component
+        for f in list(current_funcs.values()):
+            pv = getattr(f, "_parent_vector", None)
+            if pv is not None:
+                current_funcs.setdefault(pv.name, pv)
+
+        # 5.  Compile kernel & build argument dict ----------------------------------
+        runner, ir = self._compile_backend(intg.integrand, dh, me)
+
+        basis_args = _build_jit_kernel_args(
+            ir, intg.integrand, me, qdeg,
+            dof_handler = dh,
+            gdofs_map   = gdofs_map,
+            param_order = runner.param_order,
+            pre_built   = geo           # already sized n_elems_total
+        )
+
+        static_args = {k: v for k, v in geo.items() if k != 'eids'}
+        static_args.update(basis_args)
+
+        # 5.  Execute the kernel -----------------------------------------------------
+        K, F, J = runner(current_funcs, static_args)
+
+        # 6. scatter ONLY the cut rows --------------------------------------
+        cut_eids = geo["eids"]                 # 1-D array of global ids
+        K_cut = K[cut_eids]
+        F_cut = F[cut_eids]
+        J_cut = J[cut_eids] if J is not None else None
+
+        gdofs_cut = gdofs_map[cut_eids]        # rows aligned with K_cut
+
+        _scatter_element_contribs(
+            K_cut, F_cut, J_cut,
+            cut_eids, gdofs_cut,
+            matvec, self.ctx, intg.integrand
+        )
+
+    def _assemble_interface(self, intg: Integral, matvec):
+        """Assemble integrals over non-conforming interfaces defined by a level set."""
+        if self.backend == "python":
+            self._assemble_interface_python(intg, matvec)
+        elif self.backend == "jit":
+            self._assemble_interface_jit(intg, matvec)
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")

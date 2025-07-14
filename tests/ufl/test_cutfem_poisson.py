@@ -11,7 +11,7 @@ from pycutfem.utils.domain_manager import get_domain_bitset
 
 # --- UFL-like imports ---
 from pycutfem.ufl.expressions import (TrialFunction, TestFunction, grad, inner, jump,dot,
-                             ElementWiseConstant, Constant)
+                             ElementWiseConstant, Constant, FacetNormal)
 from pycutfem.ufl.measures import dx, ds, dInterface
 from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 
@@ -77,9 +77,10 @@ def test_cutfem_poisson_interface():
     jump_u = jump(u_pos, u_neg)
     jump_v = jump(v_pos, v_neg)
     
+    normal = FacetNormal()
     # We define the average flux using the functions themselves
-    avg_flux_u = - (alpha * grad(u_neg) + alpha * grad(u_pos)) * 0.5
-    avg_flux_v = - (alpha * grad(v_neg) + alpha * grad(v_pos)) * 0.5
+    avg_flux_u = - (alpha * dot(grad(u_neg),normal) + alpha * dot(grad(u_pos),normal)) * 0.5
+    avg_flux_v = - (alpha * dot(grad(v_neg),normal) + alpha * dot(grad(v_pos),normal)) * 0.5
     
     # 6. Define the Weak Form
     # Volume terms are integrated over their respective domains (including cut elements)

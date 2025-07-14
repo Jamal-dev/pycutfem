@@ -17,6 +17,10 @@ from hashlib import blake2b
 from pycutfem.integration.quadrature import line_quadrature
 
 BcLike = Union[BoundaryCondition, Mapping[str, Any]]
+# ------------------------------------------------------------------
+# edge-geometry cache keyed by (hash(ids), qdeg, id(level_set))
+# ------------------------------------------------------------------
+_edge_geom_cache: dict[tuple[int,int,int], dict] = {}
 
 def _hash_subset(ids: Sequence[int]) -> int:
     """Stable 64-bit hash for a list / BitSet of indices."""
@@ -639,65 +643,129 @@ class DofHandler:
             "phis": phis,
         }
     
-    # ------------------------------------------------------------------
-    # edge-geometry cache keyed by (hash(ids), qdeg, id(level_set))
-    # ------------------------------------------------------------------
-    _edge_geom_cache: dict[tuple[int,int,int], dict] = {}
     
-    def precompute_edge_factors(
+    # -------------------------------------------------------------------------
+    #  DofHandler.precompute_interface_factors
+    # -------------------------------------------------------------------------
+     
+    def precompute_interface_factors(
         self,
-        edge_ids: "BitSet | Sequence[int]",
+        cut_element_ids: "BitSet | Sequence[int]",
         qdeg: int,
-        level_set=None,
-        *,
+        level_set,
         reuse: bool = True,
     ) -> dict:
         """
-        Returns a dict with the arrays
-           qp_phys   (n_e , n_q , 2)
-           qw        (n_e , n_q)
-           normals   (n_e , n_q , 2)
-           phis      (n_e , n_q)    – empty if level_set is None
+        Pre-computes all geometric data for interface integrals on a given
+        set of CUT elements.
 
-        *Only* the edges given by *edge_ids* are tabulated.
+        This is the authoritative method for preparing data for dInterface JIT kernels.
+        It iterates directly over cut elements, not edges, ensuring all geometric
+        data (Jacobians, etc.) is sourced from the correct parent element.
+
+        Parameters
+        ----------
+        cut_element_ids : BitSet | Sequence[int]
+            The element IDs of the 'cut' elements to process.
+        qdeg : int
+            1-D quadrature order along the interface segment.
+        level_set : callable
+            The level-set function, required for calculating normals.
+
+        Returns
+        -------
+        dict
+            A dictionary of pre-computed arrays, with the first dimension
+            corresponding to the order of `cut_element_ids`. Keys include:
+            'eids', 'qp_phys', 'qw', 'normals', 'phis', 'detJ', 'J_inv'.
         """
-        mesh  = self.mixed_element.mesh
-        ids   = edge_ids.to_indices() if hasattr(edge_ids, "to_indices") else edge_ids
-        key   = (_hash_subset(ids), qdeg, id(level_set))
 
-        if reuse and key in self._edge_geom_cache:
-            return self._edge_geom_cache[key]
+        mesh = self.mixed_element.mesh
+        ids = cut_element_ids.to_indices() if hasattr(cut_element_ids, "to_indices") else list(cut_element_ids)
 
-        n_e   = len(ids)
-        q_ref, w_ref = line_quadrature((0, 0), (1, 0), qdeg)
+        # Filter for elements that are actually 'cut' and have a valid segment
+        valid_cut_eids = [
+            eid for eid in ids
+            if mesh.elements_list[eid].tag == 'cut' and len(mesh.elements_list[eid].interface_pts) == 2
+        ]
+        
+        if not valid_cut_eids:
+            # Return empty arrays with correct shapes if no valid cut elements
+            return {
+                'eids': np.array([], dtype=int),
+                'qp_phys': np.empty((0, 0, 2)), 'qw': np.empty((0, 0)),
+                'normals': np.empty((0, 0, 2)), 'phis': np.empty((0, 0)),
+                'detJ': np.empty((0, 0)), 'J_inv': np.empty((0, 0, 2, 2)),
+            }
 
-        qp_phys = np.empty((n_e, len(w_ref), 2))
-        qw      = np.empty((n_e, len(w_ref)))
-        normals = np.empty((n_e, len(w_ref), 2))
-        phis    = (np.empty((n_e, len(w_ref))) if level_set else None)
+        # --- Use a cache if requested ---
+        cache_key = (_hash_subset(valid_cut_eids), qdeg, id(level_set))
+        if reuse and cache_key in _edge_geom_cache:
+            return _edge_geom_cache[cache_key]
 
-        for i, eid in enumerate(ids):
-            edge    = mesh.edge(eid)
-            p0, p1  = mesh.nodes_x_y_pos[list(edge.nodes)]
-            tang    = p1 - p0
-            L       = np.hypot(*tang)
-            n       = np.array([ tang[1], -tang[0] ]) / L
+        # --- Allocation ---
+        # n_elems = len(valid_cut_eids)
+        n_elems = mesh.n_elements
+        # We need a representative segment to determine n_q
+        p0_rep, p1_rep = mesh.elements_list[valid_cut_eids[0]].interface_pts
+        q_xi_rep, q_w_rep = line_quadrature(p0_rep, p1_rep, qdeg)
+        n_q = len(q_w_rep)
 
-            for q,(ξ,), w in zip(range(len(w_ref)), q_ref, w_ref):
-                x_q = p0 + ξ * tang
-                qp_phys[i,q] = x_q
-                qw[i,q]      = w * L
-                normals[i,q] = n
-                if phis is not None:
-                    phis[i,q] = level_set(x_q)
+        qp_phys = np.zeros((n_elems, n_q, 2))
+        qw = np.zeros((n_elems, n_q))
+        normals = np.zeros((n_elems, n_q, 2))
+        phis = np.zeros((n_elems, n_q))
+        detJ_arr = np.zeros((n_elems, n_q))
+        Jinv_arr = np.zeros((n_elems, n_q, 2, 2))
+        # ---------- NEW: basis / grad-basis tables on the interface ----------
+        me      = self.mixed_element
+        fields  = me.field_names            # ['vx', 'vy', …]
+        b_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local))         for f in fields}
+        g_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local, 2))      for f in fields}
 
-        data = {"qp_phys": qp_phys,
-                "qw":      qw,
-                "normals": normals,
-                "phis":    phis if phis is not None else np.empty(0)}
 
-        self._edge_geom_cache[key] = data
-        return data
+        # --- Loop over valid cut elements ---
+        for k, eid in enumerate(valid_cut_eids):
+            elem = mesh.elements_list[eid]
+            p0, p1 = elem.interface_pts
+
+            # --- Quadrature rule on the physical interface segment ---
+            q_xi, q_w = line_quadrature(p0, p1, qdeg)
+
+            for q, (xq, wq) in enumerate(zip(q_xi, q_w)):
+                qp_phys[eid, q] = xq
+                qw[eid, q] = wq
+
+                # Normal and phi value from the level set
+                g = level_set.gradient(xq)
+                # norm_g = np.linalg.norm(g)
+                normals[eid, q] = g #/ (norm_g + 1e-30)
+                phis[eid, q] = level_set(xq)
+
+                # Jacobian of the parent element at the quadrature point
+                xi_ref, eta_ref = transform.inverse_mapping(mesh, eid, xq)
+                J = transform.jacobian(mesh, eid, (xi_ref, eta_ref))
+                detJ_arr[eid, q] = np.linalg.det(J)
+                Jinv_arr[eid, q] = np.linalg.inv(J)
+                for fld in fields:
+                    b_tabs[fld][eid, q] = me.basis      (fld, xi_ref, eta_ref)
+                    g_tabs[fld][eid, q] = me.grad_basis (fld, xi_ref, eta_ref)
+
+        # --- Gather results and cache ---
+        out = {
+            'eids': np.array(valid_cut_eids, dtype=int),
+            # 'eids': np.arange(mesh.n_elements, dtype=int),  # All elements, not just cut
+            'qp_phys': qp_phys, 'qw': qw, 'normals': normals, 'phis': phis,
+            'detJ': detJ_arr, 'J_inv': Jinv_arr,
+        }
+        for fld in fields:
+            out[f"b_{fld}"] = b_tabs[fld]
+            out[f"g_{fld}"] = g_tabs[fld]
+
+        if reuse:
+            _edge_geom_cache[cache_key] = out
+        
+        return out
 
     def info(self) -> None:
         print(f"=== DofHandler ({self.method.upper()}) ===")

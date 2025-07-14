@@ -1,6 +1,6 @@
 # pycutfem/jit/codegen.py
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from matplotlib.pylab import f
 from .ir import (
@@ -8,11 +8,15 @@ from .ir import (
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
     BinaryOp, Inner, Dot, Store
 )
+from pycutfem.jit.symbols import encode
 import numpy as np
+import re
 
 
 # Numba is imported inside the generated kernel string
 # import numba
+
+
 
 @dataclass(frozen=True, slots=True)
 class StackItem:
@@ -30,6 +34,10 @@ class StackItem:
     field_names: list = field(default_factory=list)
     # Stores the name of the parent Function/VectorFunction
     parent_name: str = ""
+    # tiny shim so we can write  item = item._replace(var_name="tmp")
+    def _replace(self, **changes) -> "StackItem":
+        
+        return replace(self, **changes)
 
 
 class NumbaCodeGen:
@@ -56,6 +64,7 @@ class NumbaCodeGen:
         stack = []
         var_counter = 0
         required_args = set()
+        functional_shape = None # () for scalar, (k,) for vector, 
         # Track names of Function/VectorFunction objects that provide coefficients
         solution_func_names = set()
 
@@ -67,7 +76,16 @@ class NumbaCodeGen:
         # --- Main IR processing loop ---
         for op in ir_sequence:
 
-            if isinstance(op, LoadElementWiseConstant):
+            if isinstance(op, LoadFacetNormal):
+                required_args.add("normals")
+                var_name = new_var("nrm")
+                body_lines.append(f"{var_name} = normals[e, q]")
+                stack.append(StackItem(var_name=var_name,
+                                        role='const',
+                                        shape=(self.spatial_dim,),
+                                        is_vector=True))
+            
+            elif isinstance(op, LoadElementWiseConstant):
                 # the full (n_elem, …) array is passed as a kernel argument
                 required_args.add(op.name)                 # kernel argument
                 var_name = new_var("ewc")
@@ -91,47 +109,104 @@ class NumbaCodeGen:
                                     shape=(), is_vector=False))
             # --- LOAD OPERATIONS ---
             elif isinstance(op, LoadVariable):
-                # This handles both simple variables and UFL Derivatives,
-                # which the visitor translates to a LoadVariable with a deriv_order.
-                operand = op
-                deriv_order = op.deriv_order
-                # This now correctly gets the field names from the IR
+                # ----------------------------------------------------------- metadata
+                operand     = op
+                deriv_order = op.deriv_order           # (dx, dy)
                 field_names = operand.field_names
 
-                # Determine the name of the basis/derivative array needed
-                def get_arg_name(field_name):
-                    if deriv_order == (0, 0): return f"b_{field_name}"
-                    return f"d{deriv_order[0]}{deriv_order[1]}_{field_name}"
+                # Which Jacobian should we use?
+                jinv_sym = "J_inv"          # default → +-side
+                if operand.side == "-":
+                    jinv_sym = "J_inv_neg"
+                    required_args.add("J_inv_neg")     # make sure it is a kernel param
+                else:
+                    jinv_sym = "J_inv"
+
+                # ------------------------------------------------------ basis / tables
+                def get_arg_name(fname):
+                    if deriv_order == (0, 0):
+                        return f"b_{fname}"
+                    return f"d{deriv_order[0]}{deriv_order[1]}_{fname}"
 
                 basis_vars = [f"{get_arg_name(fname)}_q" for fname in field_names]
                 for fname in field_names:
                     required_args.add(get_arg_name(fname))
 
-                if operand.role in ('test', 'trial'):
+                # ------------------------------------------------------------------ A
+                # Test / trial functions  → basis tables
+                # ------------------------------------------------------------------
+                if operand.role in ("test", "trial"):
                     if not operand.is_vector:
                         var_name = new_var("basis_reshaped")
-                        body_lines.append(f"{var_name} = {basis_vars[0]}[np.newaxis, :].copy()")
+                        body_lines.append(
+                            f"{var_name} = {basis_vars[0]}[np.newaxis, :].copy()"
+                        )
                         shape = (1, self.n_dofs_local)
                     else:
                         var_name = new_var("basis_stack")
-                        body_lines.append(f"{var_name} = np.stack(({', '.join(basis_vars)}))")
+                        body_lines.append(
+                            f"{var_name} = np.stack(({', '.join(basis_vars)}))"
+                        )
                         shape = (len(field_names), self.n_dofs_local)
-                    stack.append(StackItem(var_name=var_name, role=operand.role, shape=shape, is_vector=operand.is_vector, field_names=field_names, parent_name=operand.name))
 
-                elif operand.role == 'function':
-                    # For functions, the coefficients are associated with the main function name
-                    solution_func_names.add(operand.name)
-                    val_var = new_var(f"{operand.name}_val")
+                    # push-forward ξ-derivatives
+                    dx, dy = deriv_order
+                    if (dx, dy) != (0, 0):
+                        scale = f"({jinv_sym}[0,0]**{dx})*({jinv_sym}[1,1]**{dy})"
+                        body_lines.append(f"{var_name} *= {scale}")
+
+                    stack.append(
+                        StackItem(
+                            var_name    = var_name,
+                            role        = operand.role,
+                            shape       = shape,
+                            is_vector   = operand.is_vector,
+                            field_names = field_names,
+                            parent_name = operand.name,
+                        )
+                    )
+
+                # ------------------------------------------------------------------ B
+                # Coefficient functions  → dot(basis, coeff_loc)
+                # ------------------------------------------------------------------
+                elif operand.role == "function":
+                    # coeff_sym = encode(operand.name, operand.side)
+                    if operand.name.startswith("u_") and operand.name.endswith("_loc"):
+                        coeff_sym = operand.name
+                    else:
+                        coeff_sym = f"u_{operand.name}_loc"
                     
+                    solution_func_names.add(coeff_sym)
+
+                    val_var = new_var(f"{operand.name}_val")
                     if operand.is_vector:
-                        # val_at_q = [dot(basis_ux, coeffs_u_k), dot(basis_uy, coeffs_u_k), ...]
-                        comp_vals = [f"np.dot({bvar}, u_{operand.name}_loc)" for bvar in basis_vars]
-                        body_lines.append(f"{val_var} = np.array([{', '.join(comp_vals)}])")
+                        comps = [f"np.dot({b}, {coeff_sym})" for b in basis_vars]
+                        body_lines.append(f"{val_var} = np.array([{', '.join(comps)}])")
                         shape = (len(field_names),)
-                    else: # scalar
-                        body_lines.append(f"{val_var} = np.dot({basis_vars[0]}, u_{operand.name}_loc)")
+                    else:
+                        body_lines.append(f"{val_var} = np.dot({basis_vars[0]}, {coeff_sym})")
                         shape = ()
-                    stack.append(StackItem(var_name=val_var, role='value', shape=shape, is_vector=operand.is_vector, field_names=field_names, parent_name=operand.name))
+
+                    # push-forward ξ-derivatives
+                    dx, dy = deriv_order
+                    if (dx, dy) != (0, 0):
+                        scale = f"({jinv_sym}[0,0]**{dx})*({jinv_sym}[1,1]**{dy})"
+                        body_lines.append(f"{val_var} *= {scale}")
+
+
+                    stack.append(
+                        StackItem(
+                            var_name    = val_var,
+                            role        = "value",
+                            shape       = shape,
+                            is_vector   = operand.is_vector,
+                            field_names = field_names,
+                            parent_name = coeff_sym,
+                        )
+                    )
+
+
+                    
                 else:
                     raise TypeError(f"Unknown role '{operand.role}' for LoadVariable/Derivative")
 
@@ -175,17 +250,27 @@ class NumbaCodeGen:
                         shape = (len(a.field_names), self.n_dofs_local, self.spatial_dim)
                     stack.append(StackItem(var_name=var_name, role=a.role, shape=shape, is_gradient=True, is_vector=False, field_names=a.field_names, parent_name=a.parent_name))
 
-                elif a.role == 'value': # grad(function)
-                    # grad(f)(x_q) = sum_i u_i * grad(phi_i)(x_q)
+                elif a.role == "value":                                 # grad(Function)
+                    # ∇f(x_q) = Σ_i u_i ∇φ_i(x_q)
                     grad_val_comps = []
+                    # coeff_name = encode(a.parent_name, None)
+                    print(f"DEBUG grad(fun): a.parent_name: {a.parent_name}")
+                    if a.parent_name.startswith("u_") and a.parent_name.endswith("_loc"):
+                        coeff_name = a.parent_name
+                    else:
+                        coeff_name = f"u_{a.parent_name}_loc"
                     for i, fname in enumerate(a.field_names):
                         phys_grad_basis = new_var(f"phys_grad_basis_{fname}")
-                        body_lines.append(f"{phys_grad_basis} = {grad_basis_vars[i]} @ J_inv_q.transpose().copy()")
+                        body_lines.append(
+                            f"{phys_grad_basis} = {grad_basis_vars[i]} @ J_inv_q.transpose().copy()"
+                        )
+
                         grad_val_comp = new_var(f"grad_val_{fname}")
-                        # Use the parent name to get the correct coefficient array
-                        body_lines.append(f"{grad_val_comp} = {phys_grad_basis}.T.copy() @ u_{a.parent_name}_loc")
+                        body_lines.append(
+                            f"{grad_val_comp} = {phys_grad_basis}.T.copy() @ {coeff_name}"
+                        )
                         grad_val_comps.append(grad_val_comp)
-                    
+
                     if not a.is_vector:
                         var_name = grad_val_comps[0]
                         shape = (self.spatial_dim,)
@@ -193,7 +278,18 @@ class NumbaCodeGen:
                         var_name = new_var("grad_val_stack")
                         body_lines.append(f"{var_name} = np.stack(({', '.join(grad_val_comps)}))")
                         shape = (len(a.field_names), self.spatial_dim)
-                    stack.append(StackItem(var_name=var_name, role='value', shape=shape, is_gradient=True, is_vector=False, field_names=a.field_names, parent_name=a.parent_name))
+
+                    stack.append(
+                        StackItem(
+                            var_name    = var_name,
+                            role        = "value",
+                            shape       = shape,
+                            is_gradient = True,
+                            is_vector   = False,
+                            field_names = a.field_names,
+                            parent_name = coeff_name    # keep the canon. form
+                        )
+                    )
                 else:
                     raise NotImplementedError(f"Grad not implemented for role {a.role}")
             
@@ -383,6 +479,26 @@ class NumbaCodeGen:
                                             is_vector=False, field_names=[]))
                 
                 # ---------------------------------------------------------------------
+                # dot( grad(u_test) ,  const_vec )  ← symmetric term -> Test vec
+                # ---------------------------------------------------------------------
+                elif a.role == 'test' and a.is_gradient and b.role == 'const' and b.is_vector:
+                    if a.shape[2] == b.shape[0]:
+                        body_lines.append("# Symmetric term: dot(grad(Test), constant vector)")
+                        body_lines += [
+                            f"n_vec_comps = {a.shape[0]}; n_locs = {a.shape[1]};n_spatial_dim = {a.shape[2]};",
+                            f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
+                            f"for k in range(n_vec_comps):",
+                            f"    temp_sum = 0.0",
+                            f"    for d in range(n_spatial_dim):",
+                            f"        temp_sum += {a.var_name}[k, :, d] * {b.var_name}[d]",
+                            f"    {res_var}[k] = temp_sum",
+                        ]
+                        stack.append(StackItem(var_name=res_var, role='test',
+                                            shape=(a.shape[0], a.shape[1]), is_vector=True,
+                                            is_gradient=False, field_names=a.field_names,
+                                            parent_name=a.parent_name))
+
+                # ---------------------------------------------------------------------
                 # dot( grad(u_trial) ,  beta )  ← convection term (Function gradient · Trial)
                 # ---------------------------------------------------------------------
                 elif a.role == 'trial' and a.is_gradient and b.role == 'const' and b.is_vector:
@@ -557,6 +673,46 @@ class NumbaCodeGen:
                     body_lines.append(f"{res_var} = {b.var_name}.T.copy() @ {a.var_name}")
                     stack.append(StackItem(var_name=res_var, role='value',
                                         shape=(b.shape[1],), is_vector=False,is_gradient=False))
+                # ---------------------------------------------------------------------
+                # dot( value/const ,  value/const )          ← load-vector term -> (n,)
+                # ---------------------------------------------------------------------
+                elif (a.role in ('const', 'value') and   
+                     b.role in ('const', 'value') ):
+                    if a.is_gradient and b.is_vector:
+                        body_lines.append("# Dot: grad(scalar) * const vector → const vector")
+                        # print(f" a.shape: {a.shape}, b.shape: {b.shape}, a.is_vector: {a.is_vector}, b.is_vector: {b.is_vector}, a.is_gradient: {a.is_gradient}, b.is_gradient: {b.is_gradient}")
+                        if a.shape == b.shape:
+                            body_lines.append(f"{res_var} = np.dot({a.var_name} , {b.var_name})")
+                            shape = ()
+                            is_vector = False; is_grad = False
+                        else:
+                            body_lines.append(f"{res_var} = {a.var_name} @ {b.var_name}")
+                            shape = (a.shape[0],)
+                            is_vector = True; is_grad = False
+                    elif a.is_vector and b.is_gradient:
+                        body_lines.append("# Dot: const vector * grad(scalar) → const vector")
+                        if a.shape == b.shape:
+                            body_lines.append(f"{res_var} = np.dot({a.var_name} , {b.var_name})")
+                            shape = ()
+                            is_vector = False; is_grad = False
+                        else:
+                            body_lines.append(f"{res_var} = {a.var_name} @ {b.var_name}")
+                            shape = (b.shape[0],)
+                            is_vector = True; is_grad = False
+                    elif a.is_vector and b.is_vector:
+                        body_lines.append("# Dot: vector * vector → scalar")
+                        body_lines.append(f"{res_var} = np.dot({a.var_name}, {b.var_name})")
+                        shape = ()
+                        is_vector = False; is_grad = False
+                    elif a.is_gradient and  b.is_grdient:
+                        body_lines.append("# Dot: grad(scalar) * grad(scalar) → scalar")
+                        body_lines.append(f"{res_var} = np.dot({a.var_name}, {b.var_name})")
+                        shape = ()
+                        is_vector = False; is_grad = False
+                    stack.append(StackItem(var_name=res_var, role='const',
+                                        shape=shape, is_vector=is_vector, 
+                                        is_gradient=is_grad,
+                                        field_names=[]))
                 
                 else:
                     raise NotImplementedError(f"Dot not implemented for roles {a.role}/{b.role} with shapes {a.shape}/{b.shape} with vectoors {a.is_vector}/{b.is_vector} and gradients {a.is_gradient}/{b.is_gradient}")
@@ -785,6 +941,8 @@ class NumbaCodeGen:
                     body_lines.append(f"Fe += {integrand.var_name} * w_q")
                 elif op.store_type == 'functional':
                     body_lines.append(f"J += {integrand.var_name} * w_q")
+                    if functional_shape is None:
+                        functional_shape = integrand.shape
                 else:
                     raise NotImplementedError(f"Store type '{op.store_type}' not implemented.")
             
@@ -792,7 +950,7 @@ class NumbaCodeGen:
                 raise NotImplementedError(f"Opcode {type(op).__name__} not handled in JIT codegen.")
 
         source, param_order = self._build_kernel_string(
-            kernel_name, body_lines, required_args, solution_func_names
+            kernel_name, body_lines, required_args, solution_func_names, functional_shape
         )
         return source, {}, param_order
 
@@ -801,8 +959,9 @@ class NumbaCodeGen:
             self, kernel_name: str,
             body_lines: list,
             required_args: set,
-            solution_func_names: set
-            , DEBUG: bool = True
+            solution_func_names: set,
+            functional_shape: tuple = None,
+            DEBUG: bool = True
         ):
         """
         Build complete kernel source code with parallel assembly.
@@ -810,7 +969,10 @@ class NumbaCodeGen:
         # New Newton: Change parameter names to reflect they are pre-gathered.
         for name in solution_func_names:
             # We will pass u_{name}_loc directly, not the global coeffs.
-            required_args.add(f"u_{name}_loc")
+            if name.startswith("u_") and name.endswith("_loc"):
+                required_args.add(name)
+            else:
+                required_args.add(f"u_{name}_loc")
 
         # New Newton: Remove gdofs_map from parameters, it's used before the kernel call.
         param_order = [
@@ -819,19 +981,21 @@ class NumbaCodeGen:
             "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
             *sorted(list(required_args))
         ]
+        param_order = list(dict.fromkeys(param_order))  # Remove duplicates while preserving order
         param_order_literal = ", ".join(f"'{arg}'" for arg in param_order)
 
         # New Newton: The unpacking block is now much simpler.
         # We just select the data for the current element `e`.
         coeffs_unpack_block = "\n".join(
-            f"        u_{name}_loc_e = u_{name}_loc[e]"
+            f"        {name}_e = {name}[e]" if name.startswith("u_") and name.endswith("_loc")
+            else f"        u_{name}_e = u_{name}_loc[e]"
             for name in sorted(list(solution_func_names))
         )
         
         basis_unpack_block = "\n".join(
-            f"            {arg}_q = {arg}[q]"
+            f"            {arg}_q = {arg}[e,q]"
             for arg in sorted(list(required_args))
-            if arg.startswith(("b_", "d_", "g_"))
+            if arg.startswith(("b_", "d", "g_"))
         )
 
         body_code_block = "\n".join(
@@ -855,12 +1019,17 @@ def {kernel_name}(
     
     K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
     F_values = np.zeros((num_elements, n_dofs_per_element), dtype=np.float64)
-    J_values = np.zeros(num_elements, dtype=np.float64)  # For functional forms
+    # Shape of the integrand that lands in “J”.
+    # -------- functional accumulator ------------------------------------
+    k = {functional_shape[0] if functional_shape else 0}
+    J_init = {'0.0' if not functional_shape else f'np.zeros((k,), dtype=np.float64)'}
+    J     = J_init
+    J_values = np.zeros(({ 'num_elements' if not functional_shape else f'(num_elements, k)' }), dtype=np.float64)
 
     for e in numba.prange(num_elements):
         Ke = np.zeros((n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
         Fe = np.zeros(n_dofs_per_element, dtype=np.float64)
-        J = 0.0
+        J  = J_init.copy() if {bool(functional_shape)} else J_init
 
 {coeffs_unpack_block}
 

@@ -12,6 +12,7 @@ from pycutfem.jit.ir import (
     LoadFacetNormal, Grad, Div, PosOp, NegOp, BinaryOp, Inner, Dot, Store,
     LoadConstantArray
 )
+from dataclasses import replace
 
 import logging
 logger = logging.getLogger(__name__)
@@ -145,15 +146,60 @@ class IRGenerator:
             self.ir_sequence.append(NegOp())
             return
         
+         # ------------------------------------------------------------------
+        #  Derivative …
+        #  ───────────
+        #  ▸ ordinary fields   → single LoadVariable, as before
+        #  ▸ jump(expr)        → jump of the *derivative*, i.e.
+        #                         Derivative(Jump(u), αx, αy)
+        #                       becomes
+        #                         Jump( Derivative(u_pos, αx, αy),
+        #                               Derivative(u_neg, αx, αy) )
+        #                       which expands to “pos − neg” IR nodes
+        # ------------------------------------------------------------------
         if isinstance(node, Derivative):
-            operand = node.f
+            operand     = node.f
             deriv_order = node.order
-            
-            is_vec = isinstance(operand, (VectorTestFunction, VectorTrialFunction, VectorFunction))
-            role = 'test' if operand.is_test else 'trial' if operand.is_trial else 'function'
-            name = operand.space.name if hasattr(operand, 'space') else operand.name if hasattr(operand, 'name') else operand.field_name
-            
-            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, deriv_order=deriv_order))
+
+            # -------- special case: derivative of a jump ------------------
+            if isinstance(operand, Jump):
+                self._visit(Derivative(operand.u_pos, *deriv_order))
+                self.ir_sequence[-1] = replace(self.ir_sequence[-1], side="+")
+                self._visit(Derivative(operand.u_neg, *deriv_order))
+                self.ir_sequence[-1] = replace(self.ir_sequence[-1], side="-")
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))   # pos − neg
+                return
+
+            # -------- ordinary scalar / vector field ----------------------
+            is_vec = isinstance(
+                operand,
+                (VectorTestFunction, VectorTrialFunction, VectorFunction)
+            )
+            role = (
+                'test'   if operand.is_test  else
+                'trial'  if operand.is_trial else
+                'function'
+            )
+            field_names = (
+                list(operand.field_names)           # vectors
+                if hasattr(operand, 'field_names')
+                else [operand.field_name]           # scalars → wrap in list
+            )
+            # some UFL leaves (e.g. Constant) have neither .space nor .name
+            if hasattr(operand, 'space'):
+                name = operand.space.name
+            elif hasattr(operand, 'name'):
+                name = operand.name
+            else:                                    # fall-back – never fails
+                name = f"anon_{id(operand):x}"
+
+            self.ir_sequence.append(
+                LoadVariable(name=name,
+                             role=role,
+                             is_vector=is_vec,
+                             deriv_order=deriv_order,
+                             field_names=field_names)
+            )
             return
 
         # --- Binary Operators ---

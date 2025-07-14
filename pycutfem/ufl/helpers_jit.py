@@ -4,6 +4,7 @@ from pycutfem.integration import volume
 import logging # Added for logging warnings
 import os
 import re
+import pycutfem.jit.symbols as symbols
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         mixed_element,            # MixedElement instance
         q_order: int,             # quadrature order
         dof_handler,              # DofHandler – *needed* for padding
+        gdofs_map: np.ndarray=None,  # global DOF map (mixed-space)
         param_order=None,          # order of parameters in the JIT kernel
         pre_built: dict | None = None
     ):
@@ -47,13 +49,13 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
 
     import logging
 
-    from pycutfem.integration import volume
     from pycutfem.ufl.expressions import (
         Function, VectorFunction, Constant as UflConst, Grad, ElementWiseConstant
     )
     from pycutfem.jit.ir import LoadVariable, LoadConstantArray, LoadElementWiseConstant
     from pycutfem.ufl.analytic import Analytic
     from pycutfem.ufl.compilers import _find_all
+    
 
     logger = logging.getLogger(__name__)
     dbg    = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
@@ -61,27 +63,37 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     # ------------------------------------------------------------------
     # 0. Helpers
     # ------------------------------------------------------------------
+    n_elem = mixed_element.mesh.n_elements
+
+    def _expand_per_element(ref_tab: np.ndarray) -> np.ndarray:
+        """
+        Replicate a reference-space table so that shape[0] == n_elem.
+
+        We keep memory overhead low with ``np.broadcast_to``; the
+        result is read-only, which is fine because kernels never write
+        into these tables.
+        """
+        return np.broadcast_to(ref_tab, (n_elem, *ref_tab.shape)).copy()
+
+    
     def _basis_table(field: str):
-        """φ_i(ξ,η) for every quadrature point"""
-        return np.asarray(
-            [mixed_element.basis(field, *xi_eta) for xi_eta in qp_ref],
-            dtype=np.float64
-        )
+        ref = np.asarray([mixed_element.basis(field, *xi_eta)
+                          for xi_eta in qp_ref], dtype=np.float64)      # (n_q , n_loc)
+        return _expand_per_element(ref)                                 # (n_elem , n_q , n_loc)
 
     def _grad_table(field: str):
-        """∇φ_i(ξ,η) in reference coords"""
-        return np.asarray(
-            [mixed_element.grad_basis(field, *xi_eta) for xi_eta in qp_ref],
-            dtype=np.float64
-        )
+        ref = np.asarray([mixed_element.grad_basis(field, *xi_eta)
+                          for xi_eta in qp_ref], dtype=np.float64)      # (n_q , n_loc , 2)
+        return _expand_per_element(ref)  
 
     def _deriv_table(field: str, ax: int, ay: int):
         """∂^{ax+ay} φ_i / ∂ξ^{ax} ∂η^{ay}"""
-        return np.asarray(
+        ref = np.asarray(
             [mixed_element.deriv_ref(field, *xi_eta, ax, ay)
              for xi_eta in qp_ref],
             dtype=np.float64
-        )
+            )
+        return _expand_per_element(ref)                                 # (n_elem, n_q, n_loc)
 
     # ------------------------------------------------------------------
     # 1. Reference-element quadrature (ξ-space)
@@ -154,10 +166,11 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     }
 
     # cache gdofs_map for coefficient gathering
-    gdofs_map = np.vstack([
-        dof_handler.get_elemental_dofs(eid)
-        for eid in range(mixed_element.mesh.n_elements)
-    ]).astype(np.int32)
+    if gdofs_map is None:
+        gdofs_map = np.vstack([
+            dof_handler.get_elemental_dofs(eid)
+            for eid in range(mixed_element.mesh.n_elements)
+        ]).astype(np.int32)
 
     total_dofs = dof_handler.total_dofs
 
@@ -181,22 +194,7 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
             ax, ay = int(tag[1]), int(tag[2])
             args[name] = _deriv_table(fld, ax, ay)
 
-        # ---- coefficient vectors / element-local blocks ------------------
-        elif name.startswith("u_") and name.endswith("_loc"):
-            func_name = name[2:-4]          # strip 'u_'   and '_loc'
-            f = func_map.get(func_name)
-            if f is None:
-                raise NameError(
-                    f"Kernel requests coefficient array for unknown Function "
-                    f"or VectorFunction '{func_name}'."
-                )
-
-            # build once – padding to GLOBAL length ensures safe gather
-            full_vec = np.zeros(total_dofs, dtype=np.float64)
-            for gdof, lidx in f._g2l.items():
-                full_vec[gdof] = f.nodal_values[lidx]
-
-            args[name] = full_vec[gdofs_map]
+        
 
         # ---- constant arrays ---------------------------------------------
         elif name in const_arrays:
@@ -227,12 +225,54 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
             ana_vals[:] = ana.eval(np.stack((x, y), axis=-1))   # vectorised call
 
             args[name] = ana_vals
+        
+        # -------------------------------------------------------------------------
+        #  Handle coefficient-vector kernel parameters
+        #  •  u_<field>_loc                 – element-volume  (side=None)
+        #  •  u_<field>_(pos|neg)_loc       – interior facet (side="pos"/"neg")
+        #  •  u_u_…  /  u_<side>_loc / u_loc – special cases when the field itself
+        #                                      is literally called “u”
+        # -------------------------------------------------------------------------
+        elif (name.startswith("u_") and name.endswith("_loc")) :
+           
 
-        else:
-            logger.warning(
-                f"[build_jit_kernel_args] unrecognised kernel parameter '{name}' "
-                "– skipped."
-            )
+            # ---- 1. who is it? ------------------------------------------------
+            field, side = symbols.decode_coeff(name)         # ("u", "neg"), ("velocity", None), …
+
+            f = func_map.get(field)
+            if f is None:
+                raise NameError(
+                    "Kernel requests coefficient array for unknown Function "
+                    f"or VectorFunction '{field}'."
+                    f" input name: {name}"
+                    f" side: {side}"
+                )
+
+            # ---- 2. build the GLOBAL vector once ------------------------------
+            full = np.zeros(total_dofs, dtype=np.float64)
+            full[list(f._g2l.keys())] = f.nodal_values
+
+            # ---- 3. gather what the kernel needs ------------------------------
+            if side in ("pos", "neg"):                      # interior facets
+                amap = np.asarray(pre_built[f"{side}_map"])
+                if amap.ndim == 1:                          # ragged → dense
+                    from pycutfem.ufl.helpers_jit import _stack_ragged
+                    amap = _stack_ragged(amap)
+
+                n_edges, union = gdofs_map.shape
+                coeff = np.zeros((n_edges, union), dtype=np.float64)
+                for e in range(min(n_edges, amap.shape[0])):
+                    sel = amap[e]
+                    sel = sel[(sel >= 0) & (sel < union)]
+                    if sel.size:
+                        coeff[e, sel] = full[gdofs_map[e, sel]]
+
+                args[name] = coeff
+                continue                                    # done – next param
+
+            # ---- volume tables -----------------------------------------------
+            args[name] = full[gdofs_map]
+            continue
 
     # ------------------------------------------------------------------
     # 5. Optional debug print
@@ -246,5 +286,48 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
                 print(f"    {k:<20} type={type(v).__name__}")
 
     return args
+
+
+#----------------------------------------------------------------------
+# Generic scatter for element-based JIT kernels (e.g., dInterface)
+#----------------------------------------------------------------------
+def _scatter_element_contribs(
+    K_elem: np.ndarray | None,
+    F_elem: np.ndarray | None,
+    J_elem: np.ndarray | None,
+    element_ids: np.ndarray,
+    gdofs_map: np.ndarray,
+    matvec: np.ndarray,
+    ctx: dict,
+    integrand,
+):
+    """
+    Generic scatter for element-based JIT kernels (e.g., dInterface).
+    """
+    rhs = ctx.get("rhs", False)
+    hook = ctx.get("hooks", {}).get(type(integrand))
+
+    # --- Matrix contributions ---
+    if not rhs and K_elem is not None and K_elem.ndim == 3:
+        for i, eid in enumerate(element_ids):
+            gdofs = gdofs_map[i]
+            r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
+            matvec[r, c] += K_elem[i]
+
+    # --- Vector contributions ---
+    if rhs and F_elem is not None:
+        for i, eid in enumerate(element_ids):
+            gdofs = gdofs_map[i]
+            np.add.at(matvec, gdofs, F_elem[i])
+
+    # --- Functional contributions ---
+    if hook and J_elem is not None:
+        # print(f"J_elem.shape: {J_elem.shape}---J_elem: {J_elem}")
+        total = J_elem.sum(axis=0) if J_elem.ndim > 1 else J_elem.sum()
+        # This accumulator logic is correct.
+        acc = ctx.setdefault("scalar_results", {}).setdefault(
+            hook["name"], np.zeros_like(total)
+        )
+        acc += total
 
 
