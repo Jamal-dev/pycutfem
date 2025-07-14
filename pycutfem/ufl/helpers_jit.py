@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Mapping, Tuple, Dict, Any
+from typing import Mapping, Tuple, Dict, Any, Sequence
 from pycutfem.integration import volume
 import logging # Added for logging warnings
 import os
@@ -331,3 +331,11 @@ def _scatter_element_contribs(
         acc += total
 
 
+def _stack_ragged(chunks: Sequence[np.ndarray]) -> np.ndarray:
+    """Stack 1‑D integer arrays of variable length → 2‑D, padded with ‑1."""
+    n = len(chunks)
+    m = max(len(c) for c in chunks)
+    out = -np.ones((n, m), dtype=np.int32)
+    for i, c in enumerate(chunks):
+        out[i, : len(c)] = c
+    return out

@@ -233,7 +233,9 @@ class IRGenerator:
 
         if isinstance(node, Jump):
             self._visit(node.u_pos)
+            self.ir_sequence[-1] = replace(self.ir_sequence[-1], side="+")
             self._visit(node.u_neg)
+            self.ir_sequence[-1] = replace(self.ir_sequence[-1], side="-")
             self.ir_sequence.append(BinaryOp(op_symbol='-'))
             return
         elif isinstance(node, Analytic):

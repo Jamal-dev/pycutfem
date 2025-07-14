@@ -43,7 +43,7 @@ from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices
 from pycutfem.fem.transform import map_deriv
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.utils.domain_manager import get_domain_bitset
-from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs
+from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 
 
 
@@ -1070,7 +1070,7 @@ class FormCompiler:
                 self.ctx.pop(key, None) # New
             log.debug("Interface assembly finished. Context cleaned.") # New
     
-    def _assemble_ghost_edge(self, intg: "Integral", matvec):
+    def _assemble_ghost_edge_python(self, intg: "Integral", matvec):
         """
         Assembles integrals over ghost facets using a side-aware cache.
 
@@ -1306,5 +1306,76 @@ class FormCompiler:
             self._assemble_interface_python(intg, matvec)
         elif self.backend == "jit":
             self._assemble_interface_jit(intg, matvec)
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+        
+    def _assemble_ghost_edge_jit(self, intg: "Integral", matvec):
+        """Assembles ghost-edge integrals using the JIT backend."""
+        mesh = self.me.mesh
+        dh, me = self.dh, self.me
+
+        # 1. Get required derivatives, edge set, and level set
+        derivs = required_multi_indices(intg.integrand)
+        edge_ids = get_domain_bitset(mesh, 'edge', 'ghost')
+        level_set = getattr(intg.measure, 'level_set', None)
+        if level_set is None:
+            raise ValueError("dGhost measure requires a 'level_set' callable.")
+        qdeg = self._find_q_order(intg)
+
+        if edge_ids.cardinality() == 0:
+            return
+
+        # 2. Precompute all side-aware geometric and basis factors
+        geo_factors = self.dh.precompute_ghost_factors(edge_ids, qdeg, level_set, derivs)
+        
+        valid_eids = geo_factors.get('eids')
+        if valid_eids is None or len(valid_eids) == 0:
+            return
+
+        # 3. Compile kernel
+        runner, ir = self._compile_backend(intg.integrand, dh, me)
+
+        # 4. Build kernel arguments
+        # The precomputed factors are now the "basis tables"
+        # We must also provide the DOF maps for coefficient padding
+        pre_built_args = geo_factors.copy()
+        
+        # The ragged lists of dofs/maps need to be converted to something the
+        # JIT helpers can use. A dense array is simplest.
+        pre_built_args["global_dofs"] = _stack_ragged(geo_factors["global_dofs"])
+        pre_built_args["pos_map"] = _stack_ragged(geo_factors["pos_map"])
+        pre_built_args["neg_map"] = _stack_ragged(geo_factors["neg_map"])
+        
+        # The kernel needs a single, dense gdofs_map for the coefficient gathering logic
+        gdofs_map = pre_built_args["global_dofs"]
+
+        args = _build_jit_kernel_args(
+            ir, intg.integrand, me, qdeg,
+            dof_handler=dh,
+            gdofs_map=gdofs_map, # This is now per-edge union of DOFs
+            param_order=runner.param_order,
+            pre_built=pre_built_args
+        )
+
+        # 5. Get current functions and execute kernel
+        current_funcs = {f.name: f for f in _find_all(intg.integrand, (Function, VectorFunction))}
+        
+        # The runner now gets per-edge arguments
+        K_edge, F_edge, J_edge = runner(current_funcs, args)
+        
+        # 6. Scatter contributions
+        _scatter_element_contribs(
+            K_edge, F_edge, J_edge,
+            valid_eids,       # The edge IDs
+            gdofs_map,        # The per-edge union of DOFs
+            matvec, self.ctx, intg.integrand
+        )
+    
+    def _assemble_ghost_edge(self, intg: "Integral", matvec):
+        """Assemble ghost edge integrals."""
+        if self.backend == "python":
+            self._assemble_ghost_edge_python(intg, matvec)
+        elif self.backend == "jit":
+            self._assemble_ghost_edge_jit(intg, matvec)
         else:
             raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")

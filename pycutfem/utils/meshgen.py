@@ -4,7 +4,7 @@ Mesh generators for quick tests.
 import numpy as np
 from scipy.spatial import Delaunay
 from pycutfem.io.visualization import visualize_mesh_node_order
-from pycutfem.core import Node
+from pycutfem.core.topology import Node
 from typing import List
 
 __all__ = ["delaunay_rectangle", "structured_quad", "structured_triangles"]

@@ -109,99 +109,133 @@ class NumbaCodeGen:
                                     shape=(), is_vector=False))
             # --- LOAD OPERATIONS ---
             elif isinstance(op, LoadVariable):
-                # ----------------------------------------------------------- metadata
-                operand     = op
-                deriv_order = op.deriv_order           # (dx, dy)
-                field_names = operand.field_names
+                # This block handles loading all variables: test/trial functions and coefficient functions,
+                # for both standard volume/interface integrals and side-aware ghost edge integrals.
+                # It correctly generates code to access different data arrays based on the `op.side`
+                # attribute, which can be "", "+", or "-".
 
-                # Which Jacobian should we use?
-                jinv_sym = "J_inv"          # default → +-side
-                if operand.side == "-":
-                    jinv_sym = "J_inv_neg"
-                    required_args.add("J_inv_neg")     # make sure it is a kernel param
-                else:
-                    jinv_sym = "J_inv"
-
-                # ------------------------------------------------------ basis / tables
-                def get_arg_name(fname):
-                    if deriv_order == (0, 0):
-                        return f"b_{fname}"
-                    return f"d{deriv_order[0]}{deriv_order[1]}_{fname}"
-
-                basis_vars = [f"{get_arg_name(fname)}_q" for fname in field_names]
-                for fname in field_names:
-                    required_args.add(get_arg_name(fname))
-
-                # ------------------------------------------------------------------ A
-                # Test / trial functions  → basis tables
                 # ------------------------------------------------------------------
-                if operand.role in ("test", "trial"):
-                    if not operand.is_vector:
+                # 1. Setup: Determine names, sides, and derivatives from the IR
+                # ------------------------------------------------------------------
+
+                # A helper to create the correct argument name for basis/derivative tables.
+                # e.g., get_arg_name("u", (1,1), "_pos") -> "d11_u_pos"
+                def get_arg_name(field_name, deriv, side_suffix):
+                    """Constructs the canonical name for a basis/derivative table argument."""
+                    # Use 'b' for basis functions (zeroth derivative), 'd' for others.
+                    d_str = f"d{deriv[0]}{deriv[1]}" if deriv != (0, 0) else "b"
+                    return f"{d_str}_{field_name}{side_suffix}"
+
+                deriv_order = op.deriv_order
+                field_names = op.field_names
+                # The side_suffix is the key to handling different integral types.
+                # It will be "_pos", "_neg", or "" (for standard volume/interface).
+                side_suffix = f"_{op.side}" if op.side else ""
+
+                # ------------------------------------------------------------------
+                # 2. Jacobian Selection for Derivative Push-forward
+                # ------------------------------------------------------------------
+                # The kernel will be passed the correct inverse Jacobian(s). We just
+                # need to generate code that uses the right one based on the side.
+                if op.side == "+":
+                    jinv_sym = "J_inv_pos_q"
+                    required_args.add("J_inv_pos")
+                elif op.side == "-":
+                    jinv_sym = "J_inv_neg_q"
+                    required_args.add("J_inv_neg")
+                else: # Standard volume or interface integral
+                    jinv_sym = "J_inv_q"
+                    # 'J_inv' is a default argument for volume/interface kernels.
+
+                # ------------------------------------------------------------------
+                # 3. Generate code to load basis/derivative tables
+                # ------------------------------------------------------------------
+                # Get the names of the required pre-computed tables (e.g., ['d10_u_pos', 'd10_v_pos'])
+                basis_arg_names = [get_arg_name(fname, deriv_order, side_suffix) for fname in field_names]
+
+                # Ensure these tables are requested as kernel parameters
+                for arg_name in basis_arg_names:
+                    required_args.add(arg_name)
+
+                # In the kernel, these tables have shape (n_entities, n_q, ...).
+                # We generate code to select the data for the current entity `e` and quadrature point `q`.
+                # The loop variable 'e' represents an element index for volume integrals
+                # and an edge index for ghost integrals. The generated code is agnostic to this.
+                basis_vars_at_q = [f"{arg_name}[e, q]" for arg_name in basis_arg_names]
+
+                # ------------------------------------------------------------------
+                # 4. Handle based on role: Test/Trial vs. Function
+                # ------------------------------------------------------------------
+
+                # --- A. Test / Trial Functions (Symbolic Basis Functions) ---
+                if op.role in ("test", "trial"):
+                    # For vector functions, we stack the basis functions for each component.
+                    # For scalar functions, we reshape to have a leading dimension of 1 for consistent shapes.
+                    if not op.is_vector:
                         var_name = new_var("basis_reshaped")
-                        body_lines.append(
-                            f"{var_name} = {basis_vars[0]}[np.newaxis, :].copy()"
-                        )
-                        shape = (1, self.n_dofs_local)
+                        body_lines.append(f"{var_name} = {basis_vars_at_q[0]}[np.newaxis, :].copy()")
+                        # The runtime shape will be (1, n_dofs_local) for volume integrals or
+                        # (1, n_dofs_union) for ghost integrals.
+                        shape = (1, -1) # -1 indicates the size is determined at runtime.
                     else:
                         var_name = new_var("basis_stack")
-                        body_lines.append(
-                            f"{var_name} = np.stack(({', '.join(basis_vars)}))"
-                        )
-                        shape = (len(field_names), self.n_dofs_local)
+                        body_lines.append(f"{var_name} = np.stack(({', '.join(basis_vars_at_q)}))")
+                        # Runtime shape will be (k, n_dofs_local) or (k, n_dofs_union).
+                        shape = (len(field_names), -1)
 
-                    # push-forward ξ-derivatives
-                    dx, dy = deriv_order
-                    if (dx, dy) != (0, 0):
-                        scale = f"({jinv_sym}[0,0]**{dx})*({jinv_sym}[1,1]**{dy})"
+                    # Apply push-forward for derivatives using the correct side's Jacobian.
+                    # This simplified scaling is for axis-aligned mappings. The full tensor
+                    # transformation g_phys = g_ref @ J_inv.T is handled by the Grad visitor.
+                    if deriv_order != (0, 0):
+                        dx, dy = deriv_order
+                        scale = f"({jinv_sym}[0,0]**{dx}) * ({jinv_sym}[1,1]**{dy})"
                         body_lines.append(f"{var_name} *= {scale}")
 
                     stack.append(
                         StackItem(
-                            var_name    = var_name,
-                            role        = operand.role,
-                            shape       = shape,
-                            is_vector   = operand.is_vector,
-                            field_names = field_names,
-                            parent_name = operand.name,
+                            var_name=var_name,
+                            role=op.role,
+                            shape=shape,
+                            is_vector=op.is_vector,
+                            field_names=field_names,
+                            parent_name=op.name,
                         )
                     )
 
-                # ------------------------------------------------------------------ B
-                # Coefficient functions  → dot(basis, coeff_loc)
-                # ------------------------------------------------------------------
-                elif operand.role == "function":
-                    # coeff_sym = encode(operand.name, operand.side)
-                    if operand.name.startswith("u_") and operand.name.endswith("_loc"):
-                        coeff_sym = operand.name
-                    else:
-                        coeff_sym = f"u_{operand.name}_loc"
-                    
-                    solution_func_names.add(coeff_sym)
+                # --- B. Coefficient Functions (Evaluated Numerical Values) ---
+                elif op.role == "function":
+                    # Construct the side-aware coefficient variable name, e.g., "u_myfunc_pos_loc"
+                    coeff_sym = f"u_{op.name}{side_suffix}_loc"
+                    # Tell the argument builder that this kernel needs this coefficient array.
+                    required_args.add(coeff_sym)
 
-                    val_var = new_var(f"{operand.name}_val")
-                    if operand.is_vector:
-                        comps = [f"np.dot({b}, {coeff_sym})" for b in basis_vars]
+                    # The kernel's outer loop unpacks the per-entity coefficients into `coeff_sym_e`.
+                    # We generate code to perform the dot product: Σ (coeffs_i * basis_i)
+                    val_var = new_var(f"{op.name}_val")
+
+                    if op.is_vector:
+                        # For each component, dot its basis functions with the full coefficient vector.
+                        comps = [f"np.dot({b_var}, {coeff_sym}_e)" for b_var in basis_vars_at_q]
                         body_lines.append(f"{val_var} = np.array([{', '.join(comps)}])")
                         shape = (len(field_names),)
                     else:
-                        body_lines.append(f"{val_var} = np.dot({basis_vars[0]}, {coeff_sym})")
+                        body_lines.append(f"{val_var} = np.dot({basis_vars_at_q[0]}, {coeff_sym}_e)")
                         shape = ()
 
-                    # push-forward ξ-derivatives
-                    dx, dy = deriv_order
-                    if (dx, dy) != (0, 0):
-                        scale = f"({jinv_sym}[0,0]**{dx})*({jinv_sym}[1,1]**{dy})"
+                    # Apply push-forward for derivatives, same as for test/trial.
+                    if deriv_order != (0, 0):
+                        dx, dy = deriv_order
+                        scale = f"({jinv_sym}[0,0]**{dx}) * ({jinv_sym}[1,1]**{dy})"
                         body_lines.append(f"{val_var} *= {scale}")
-
 
                     stack.append(
                         StackItem(
-                            var_name    = val_var,
-                            role        = "value",
-                            shape       = shape,
-                            is_vector   = operand.is_vector,
-                            field_names = field_names,
-                            parent_name = coeff_sym,
+                            var_name=val_var,
+                            role="value",
+                            shape=shape,
+                            is_vector=op.is_vector,
+                            field_names=field_names,
+                            parent_name=coeff_sym, # Store the canonical coefficient name for later reference
                         )
                     )
 
