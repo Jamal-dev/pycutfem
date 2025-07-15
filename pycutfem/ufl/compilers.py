@@ -1344,12 +1344,11 @@ class FormCompiler:
         
         # The ragged lists of dofs/maps need to be converted to something the
         # JIT helpers can use. A dense array is simplest.
-        pre_built_args["global_dofs"] = _stack_ragged(geo_factors["global_dofs"])
-        pre_built_args["pos_map"] = _stack_ragged(geo_factors["pos_map"])
-        pre_built_args["neg_map"] = _stack_ragged(geo_factors["neg_map"])
+        pre_built_args["gdofs_map"] = geo_factors["gdofs_map"]
+        pre_built_args["pos_map"] =     geo_factors["pos_map"]
+        pre_built_args["neg_map"] =     geo_factors["neg_map"]
+        gdofs_map = pre_built_args["gdofs_map"]
         
-        # The kernel needs a single, dense gdofs_map for the coefficient gathering logic
-        gdofs_map = pre_built_args["global_dofs"]
 
         args = _build_jit_kernel_args(
             ir, intg.integrand, me, qdeg,

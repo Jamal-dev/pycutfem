@@ -134,11 +134,11 @@ class NumbaCodeGen:
 
                 # Which J⁻¹ to use for push-forward / derivatives
                 if op.side == "+":
-                    jinv_sym = "J_inv_pos_q"; required_args.add("J_inv_pos")
+                    jinv_sym = "J_inv_pos"; required_args.add("J_inv_pos")
                 elif op.side == "-":
-                    jinv_sym = "J_inv_neg_q"; required_args.add("J_inv_neg")
+                    jinv_sym = "J_inv_neg"; required_args.add("J_inv_neg")
                 else:
-                    jinv_sym = "J_inv_q";      required_args.add("J_inv")
+                    jinv_sym = "J_inv";      required_args.add("J_inv")
 
                 # reference value(s) at current quadrature point
                 basis_vars_at_q = [f"{arg_name}[e, q]" for arg_name in basis_arg_names]
@@ -148,28 +148,34 @@ class NumbaCodeGen:
                 # ------------------------------------------------------------------
                 if op.role in ("test", "trial"):
 
-                    if op.side:                                              # ghost edge: pad to DOF-union
-                        local_basis_var  = new_var("local_basis")
+                    # ─── inside _visit_LoadVariable, just after   if op.side:  ──────────
+                    if op.side:                                              # facet  (+ / -)
+                        local_basis_var = new_var("local_basis")
                         body_lines.append(f"{local_basis_var} = {basis_vars_at_q[0]}")
 
-                        map_array = "pos_map_e" if op.side == "+" else "neg_map_e"
-                        required_args.add("pos_map" if op.side == "+" else "neg_map")    # NEW
+                        map_array_name = "pos_map" if op.side == "+" else "neg_map"
+                        required_args.add(map_array_name)
 
                         padded_basis_var = new_var("padded_basis")
+                        map_e            = new_var(f"{map_array_name}_e")
+
                         body_lines += [
-                            f"{map_array} = {'pos_map' if op.side == '+' else 'neg_map'}[e]",  # NEW
-                            f"print(f'gdofs_map[e].shape: {{gdofs_map[e].shape}}')",  # NEW
-                            f"n_union = gdofs_map[e].shape[0]",    
-                            f"{map_array}.shape: {{{map_array}.shape}}",                              # NEW
-                            f"{padded_basis_var} = np.zeros(n_union, dtype=np.float64)",  
-                            f"{padded_basis_var}.shape: {{{padded_basis_var}.shape}}",      # NEW
-                            f"for j in range({local_basis_var}.shape[0]):",                     # NEW
-                            f"    idx = {map_array}[j]",                                        # NEW
-                            f"    if idx >= 0:",                                                # NEW
-                            f"        {padded_basis_var}[idx] = {local_basis_var}[j]",          # NEW
+                            f"{map_e} = {map_array_name}[e]",
+                            f"n_union = gdofs_map[e].shape[0]",
+                            # ── fast path: union already == element length ───────────────
+                            f"if n_union == {local_basis_var}.shape[0]:",
+                            f"    {padded_basis_var} = {local_basis_var}.copy()",
+                            f"else:",                                                     # ghost facet
+                            f"    {padded_basis_var} = np.zeros(n_union, dtype=np.float64)",
+                            f"    for j in range({local_basis_var}.shape[0]):",
+                            f"        idx = {map_e}[j]",
+                            f"        if 0 <= idx < n_union:",
+                            f"            {padded_basis_var}[idx] = {local_basis_var}[j]",
                         ]
+
                         final_basis_var = padded_basis_var
-                        n_dofs          = -1                                                    # run-time  # NEW
+                        n_dofs          = -1                                              # run‑time
+
                     else:                                                     # volume / interface
                         final_basis_var = basis_vars_at_q[0]
                         n_dofs          = self.me.n_dofs_local
@@ -187,7 +193,8 @@ class NumbaCodeGen:
                     # push-forward for ∂-ordered bases
                     if deriv_order != (0, 0):
                         dx, dy = deriv_order
-                        scale  = f"({jinv_sym}[0,0]**{dx}) * ({jinv_sym}[1,1]**{dy})"
+                        jinv_q = f"{jinv_sym}_q"                #  J_inv_pos_q, J_inv_neg_q, J_inv_q
+                        scale  = f"({jinv_q}[0,0]**{dx}) * ({jinv_q}[1,1]**{dy})"
                         body_lines.append(f"{var_name} *= {scale}")
 
                     stack.append(
@@ -217,28 +224,38 @@ class NumbaCodeGen:
                     required_args.add(coeff_sym)
                     solution_func_names.add(coeff_sym)
 
-                    # NEW – pad reference basis to the DOF-union on ghost edges
+                    # NEW – pad reference basis to the DOF‑union on ghost edges
                     if op.side:                                         # "+" or "-"
-                        map_array = "pos_map_e" if op.side == "+" else "neg_map_e"
-                        required_args.add("pos_map" if op.side == "+" else "neg_map")
-                        body_lines.append(f"{map_array} = "
-                                        f"{'pos_map' if op.side == '+' else 'neg_map'}[e]")
-                        body_lines.append(f"n_union = gdofs_map[e].shape[0]")
+                        map_array_name = "pos_map" if op.side == "+" else "neg_map"
+                        required_args.add(map_array_name)
+
+                        map_e = new_var(f"{map_array_name}_e")
+                        body_lines += [
+                            f"{map_e} = {map_array_name}[e]",
+                            f"n_union = gdofs_map[e].shape[0]",
+                        ]
+
                         padded = []
                         for i, b_var in enumerate(basis_vars_at_q):
                             local = new_var(f"local_basis{i}")
                             pad   = new_var(f"padded_basis{i}")
                             body_lines += [
                                 f"{local} = {b_var}",
-                                f"{pad}   = np.zeros(n_union, dtype=np.float64)",
-                                f"for j in range({local}.shape[0]):",
-                                f"    idx = {map_array}[j]",
-                                f"    if idx >= 0:",
-                                f"        {pad}[idx] = {local}[j]",
+                                # fast path
+                                f"if n_union == {local}.shape[0]:",
+                                f"    {pad} = {local}.copy()",
+                                f"else:",
+                                f"    {pad} = np.zeros(n_union, dtype=np.float64)",
+                                f"    for j in range({local}.shape[0]):",
+                                f"        idx = {map_e}[j]",
+                                f"        if 0 <= idx < n_union:",
+                                f"            {pad}[idx] = {local}[j]",
                             ]
                             padded.append(pad)
+
                         final_basis_var = padded
-                        basis_vars_at_q = padded
+                        basis_vars_at_q = padded           # hand the padded list forward
+
                     else:
                         final_basis_var = basis_vars_at_q[0]
 
@@ -246,32 +263,21 @@ class NumbaCodeGen:
 
                     # dot product(s) with the coefficient vector
                     if op.is_vector:
-                        comps = []
-                        for b_var in basis_vars_at_q:             # handle each component
-                            if op.side:
-                                tmp_l = new_var("tmp_basis")
-                                tmp_p = new_var("tmp_pad")
-                                body_lines += [
-                                    f"{tmp_l} = {b_var}",
-                                    f"{tmp_p} = np.zeros(n_union, dtype=np.float64)",
-                                    f"for j in range({tmp_l}.shape[0]):",
-                                    f"    idx = {map_array}[j]",
-                                    f"    if idx >= 0:",
-                                    f"        {tmp_p}[idx] = {tmp_l}[j]",
-                                ]
-                                comps.append(f"np.dot({tmp_p}, {coeff_sym})")
-                            else:
-                                comps.append(f"np.dot({b_var}, {coeff_sym})")
+                        # one dot‑product per component;  basis_vars_at_q is already
+                        # padded (or not) by the code above
+                        comps = [f"np.dot({b_var}, {coeff_sym})" for b_var in basis_vars_at_q]
                         body_lines.append(f"{val_var} = np.array([{', '.join(comps)}])")
                         shape = (len(field_names),)
                     else:
                         body_lines.append(f"{val_var} = np.dot({basis_vars_at_q[0]}, {coeff_sym})")
                         shape = ()
 
+
+                    # optional ξ‑derivative rescaling
                     if deriv_order != (0, 0):
                         dx, dy = deriv_order
-                        scale  = f"({jinv_sym}[0,0]**{dx}) * ({jinv_sym}[1,1]**{dy})"
-                        body_lines.append(f"{val_var} *= {scale}")
+                        jinv_q = f"{jinv_sym}_q"
+                        body_lines.append(f"{val_var} *= ({jinv_q}[0,0]**{dx}) * ({jinv_q}[1,1]**{dy})")
 
                     stack.append(
                         StackItem(
@@ -300,95 +306,96 @@ class NumbaCodeGen:
 
 
             # --- UNARY OPERATORS ---
-            # ---------------------------------------------------------------------------
-            # GRAD -- push forward reference-space gradients to physical space
-            # ---------------------------------------------------------------------------
+            # ----------------------------------------------------------------------
+            # ∇(·) operator
+            # ----------------------------------------------------------------------
             elif isinstance(op, Grad):
-                a        = stack.pop()
-                grad_var = new_var("grad")
+                a = stack.pop()
 
-                # --- choose the inverse-Jacobian for the requested side ----------------
-                if a.side == "+":
-                    jinv_sym = "J_inv_pos_q"; required_args.add("J_inv_pos")
-                elif a.side == "-":
-                    jinv_sym = "J_inv_neg_q"; required_args.add("J_inv_neg")
-                else:
-                    jinv_sym = "J_inv_q";      required_args.add("J_inv")
+                # --- which J⁻¹ array to use -------------------------------------------
+                if   a.side == "+":  jinv_sym = "J_inv_pos"; required_args.add("J_inv_pos")
+                elif a.side == "-":  jinv_sym = "J_inv_neg"; required_args.add("J_inv_neg")
+                else:                jinv_sym = "J_inv";     required_args.add("J_inv")
 
-                # --- reference-gradient tables carry *no* side suffix # NEW ------------
-                def get_grad_arg_name(field_name):           # NEW
-                    return f"g_{field_name}_q"               # NEW
+                jinv_q = f"{jinv_sym}_q"          # ← element‑, qp‑local  (2×2)
 
-                grad_basis_vars_at_q = [get_grad_arg_name(fname) for fname in a.field_names]  # NEW
-                for fname in grad_basis_vars_at_q:
-                    required_args.add(fname)
+                # --- reference‑gradient tables (no side suffix) -----------------------
+                grad_q = [f"g_{f}" for f in a.field_names]
+                for name in grad_q: required_args.add(name)
 
-                # ----------------------------------------------------------------------
-                # (A) grad(Test/Trial)  –– symbolic gradient matrices
-                # ----------------------------------------------------------------------
+                # ======================================================================
+                # (A)  grad(Test/Trial)           → (k , n_loc , 2)
+                # ======================================================================
                 if a.role in ("test", "trial"):
+                    phys = []
+                    for i in range(len(a.field_names)):
+                        pg_loc = new_var("grad_loc")
+                        body_lines.append(f"{pg_loc} = {grad_q[i]}[e, q] @ {jinv_q}.T.copy()")
 
-                    phys_grad_vars = []
-                    for i, fname in enumerate(a.field_names):
-                        phys_grad_var = new_var(f"phys_grad_{fname}")
-                        body_lines.append(                                              # ∇φ_ref @ J⁻¹ᵀ
-                            f"{phys_grad_var} = {grad_basis_vars_at_q[i]} @ {jinv_sym}.transpose().copy()")
-                        phys_grad_vars.append(phys_grad_var)
+                        if a.side:        # ---------- NEW ----------
+                            map_arr = "pos_map" if a.side == "+" else "neg_map"
+                            required_args.add(map_arr)
+                            map_e   = new_var(f"{map_arr}_e")
+                            pg_pad  = new_var("grad_pad")
+                            body_lines += [
+                                f"{map_e} = {map_arr}[e]",
+                                f"n_union = gdofs_map[e].shape[0]",
+                                f"{pg_pad} = np.zeros((n_union, {self.spatial_dim}))",
+                                f"for j in range({pg_loc}.shape[0]):",
+                                f"    idx = {map_e}[j]",
+                                f"    if 0 <= idx < n_union:",
+                                f"        {pg_pad}[idx] = {pg_loc}[j]",
+                            ]
+                            phys.append(pg_pad)
+                        else:
+                            phys.append(pg_loc)
 
-                    n_dofs = self.n_dofs_local if not a.side else -1                    # −1 ⇒ run-time size  # NEW
-
-                    if not a.is_vector:                                                 # scalar space
-                        var_name = new_var("grad_reshaped")
-                        body_lines.append(f"{var_name} = {phys_grad_vars[0]}[np.newaxis, :, :].copy()")
+                    n_dofs = self.n_dofs_local if not a.side else -1
+                    if not a.is_vector:                                # scalar space
+                        var = new_var("grad_scalar")
+                        body_lines.append(f"{var} = {phys[0]}[None, :, :].copy()")
                         shape = (1, n_dofs, self.spatial_dim)
-                    else:                                                               # vector space
-                        var_name = new_var("grad_stack")
-                        body_lines.append(f"{var_name} = np.stack(({', '.join(phys_grad_vars)}))")
+                    else:                                              # vector space
+                        var = new_var("grad_stack")
+                        body_lines.append(f"{var} = np.stack(({', '.join(phys)}))")
                         shape = (len(a.field_names), n_dofs, self.spatial_dim)
 
-                    stack.append(a._replace(var_name = var_name,
-                                            shape    = shape,
-                                            is_gradient = True))
+                    stack.append(a._replace(var_name=var,
+                                            shape=shape,
+                                            is_gradient=True))
 
-                # ----------------------------------------------------------------------
-                # (B) grad(Function) –– numerical gradient of a coefficient
-                # ----------------------------------------------------------------------
+                # ======================================================================
+                # (B)  grad(Function/VectorFunction)  → (2,)  or  (k , 2)
+                # ======================================================================
                 elif a.role == "value":
-                    # canonical coefficient name (without side suffix)
-                    if a.parent_name.startswith("u_") and a.parent_name.endswith("_loc"):
-                        coeff_name = a.parent_name
-                    else:
-                        coeff_name = f"u_{a.parent_name}_loc"
+                    coeff = (a.parent_name if a.parent_name.startswith("u_")
+                            else f"u_{a.parent_name}_loc")
 
-                    grad_val_comps = []
-                    for i, fname in enumerate(a.field_names):
-                        phys_grad_basis = new_var(f"phys_grad_basis_{fname}")
-                        body_lines.append(
-                            f"{phys_grad_basis} = {grad_basis_vars_at_q[i]} @ {jinv_sym}.transpose().copy()")
+                    comps = []
+                    for i in range(len(a.field_names)):
+                        pg  = new_var("phys_grad_basis")
+                        val = new_var("grad_val")
+                        body_lines += [
+                            f"{pg}  = {grad_q[i]}[e, q] @ {jinv_q}.T.copy()",   # (n_loc,2)
+                            f"{val} = {pg}.T.copy() @ {coeff}",           # (2,)
+                        ]
+                        comps.append(val)
 
-                        grad_val_comp = new_var(f"grad_val_{fname}")
-                        body_lines.append(
-                            f"{grad_val_comp} = {phys_grad_basis}.T.copy() @ {coeff_name}")
-                        grad_val_comps.append(grad_val_comp)
-
-                    if not a.is_vector:
-                        var_name = grad_val_comps[0]
-                        shape    = (self.spatial_dim,)
-                    else:
-                        var_name = new_var("grad_val_stack")
-                        body_lines.append(f"{var_name} = np.stack(({', '.join(grad_val_comps)}))")
-                        shape    = (len(a.field_names), self.spatial_dim)
+                    if not a.is_vector:               # scalar coefficient
+                        var, shape = comps[0], (self.spatial_dim,)
+                    else:                             # k‑vector coefficient
+                        var = new_var("grad_val_stack")
+                        body_lines.append(f"{var} = np.stack(({', '.join(comps)}))")
+                        shape = (len(a.field_names), self.spatial_dim)
 
                     stack.append(
-                        StackItem(
-                            var_name    = var_name,
-                            role        = "value",
-                            shape       = shape,
-                            is_gradient = True,
-                            is_vector   = False,
-                            field_names = a.field_names,
-                            parent_name = coeff_name
-                        )
+                        StackItem(var_name   = var,
+                                role       = "value",
+                                shape      = shape,
+                                is_gradient= True,
+                                is_vector  = False,
+                                field_names= a.field_names,
+                                parent_name= coeff)
                     )
                 else:
                     raise NotImplementedError(f"Grad not implemented for role {a.role}")
@@ -1131,6 +1138,8 @@ class NumbaCodeGen:
             "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
             *sorted(list(required_args))
         ]
+        if 'global_dofs' in param_order:
+            param_order.append('union_sizes')
         param_order = list(dict.fromkeys(param_order))  # Remove duplicates while preserving order
         param_order_literal = ", ".join(f"'{arg}'" for arg in param_order)
 
@@ -1145,9 +1154,14 @@ class NumbaCodeGen:
         
         basis_unpack_block = "\n".join(
             f"            {arg}_q = {arg}[e,q]"
-            for arg in sorted(list(required_args))
-            if arg.startswith(("b_", "d", "g_"))
+            for arg in sorted(required_args)
+            if (
+                arg.startswith(("b_", "d", "g_"))       # reference tables
+                or arg in {"J_inv", "J_inv_pos", "J_inv_neg",
+                        "detJ", "detJ_pos", "detJ_neg"}
+            )
         )
+
 
         body_code_block = "\n".join(
             f"            {line.replace('_loc', '_loc_e')}" for line in body_lines if line.strip()

@@ -28,6 +28,12 @@ from pycutfem.fem.reference import get_reference
 #  MixedElement
 # -----------------------------------------------------------------------------
 
+# How many nodes live on ONE geometric edge for a given Lagrange order?
+def _edge_nodes(p: int, element_type: str) -> int:
+    # quads and triangles both have p+1 equally‑spaced nodes on an edge
+    return p + 1
+
+
 class MixedElement:
     """Mixed finite element on a single mesh with *per‑field* polynomial orders.
 
@@ -95,7 +101,20 @@ class MixedElement:
         # print(f"MixedElement created with {self.n_dofs_per_elem} local DOFs "
         #       f"({self.field_names}) for {mesh.element_type} elements of order "
         #       f"{self.mesh.poly_order} (p) and field orders {self._field_orders}.")
+        # ------------------------------------------------------------------
+        #  Per‑field edge node counts  (shared DOFs on one edge)
+        self._n_edge: Dict[str, int] = {
+            f: _edge_nodes(p, mesh.element_type) for f, p in self._field_orders.items()
+        }
+        #  Size of the union of two neighbouring elements on an interior edge
+        #  =  2·(local DOFs)  –  (shared edge DOFs)   summed over all fields
+        self.n_union_cg = sum(2*self._n_basis[f] - self._n_edge[f] for f in self.field_names)
+        self.n_union_dg = sum(2*self._n_basis[f]                      for f in self.field_names)
 
+    
+    def union_dofs(self, method: str = "cg") -> int:
+        """Return the ghost‑edge union size for 'cg' or 'dg' numbering."""
+        return self.n_union_cg if method == "cg" else self.n_union_dg
     # ..................................................................
     #  Basis, gradient, Hessian
     # ..................................................................

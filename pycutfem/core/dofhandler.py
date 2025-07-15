@@ -225,6 +225,14 @@ class DofHandler:
     # ------------------------------------------------------------------
     #  Public helpers
     # ------------------------------------------------------------------
+    @property
+    def union_dofs(self) -> int:
+        """Number of distinct global DOFs on one ghost edge (all fields)."""
+        if self.mixed_element is None:
+            raise RuntimeError("union_dofs requires a MixedElement‑backed DofHandler.")
+        if self.method == "cg":
+            return self.mixed_element.union_dofs("cg")
+        return self.mixed_element.union_dofs("dg")
     def get_elemental_dofs(self, element_id: int) -> np.ndarray:
         """Return *stacked* global DOFs for element *element_id*."""
         if self.mixed_element is None:
@@ -767,6 +775,9 @@ class DofHandler:
         
         return out
     
+    # --------------------------------------------------------------------
+    #  DofHandler.precompute_ghost_factors  (new implementation)
+    # --------------------------------------------------------------------
     def precompute_ghost_factors(
         self,
         ghost_edge_ids: "BitSet | Sequence[int]",
@@ -775,140 +786,135 @@ class DofHandler:
         derivs: set[tuple[int, int]],
     ) -> dict:
         """
-        Pre-computes all geometric data for ghost edge integrals.
+        Pre‑compute all geometric and algebraic data needed by dGhost JIT kernels.
 
-        This is the authoritative method for preparing data for dGhost JIT kernels.
-        It prepares side-aware basis/derivative tables and DOF mappings.
-
-        Args:
-            ghost_edge_ids: The global IDs of the ghost edges to process.
-            qdeg: 1D quadrature order along the edge.
-            level_set: The level-set function for determining '+' and '-' sides.
-            derivs: A set of (dx, dy) derivative orders required by the integrand.
-
-        Returns:
-            A dictionary of pre-computed arrays, with the first dimension
-            corresponding to the order of `ghost_edge_ids`.
+        The routine now uses the MixedElement‑supplied union size so the output
+        is valid for *both* CG and DG discretisations, regardless of how many
+        fields or blocks you mix.
         """
-        mesh = self.mixed_element.mesh
-        me = self.mixed_element
-        fields = me.field_names
-        edge_ids = ghost_edge_ids.to_indices() if hasattr(ghost_edge_ids, "to_indices") else list(ghost_edge_ids)
+        mesh        = self.mixed_element.mesh
+        me          = self.mixed_element
+        fields      = me.field_names
+        n_union     = self.union_dofs              # <- CG: 36, DG: 44, …
+        n_loc       = me.n_dofs_per_elem
 
-        # Filter for valid interior ghost edges
-        valid_ghost_edges = []
+        # ---------------------------------- collect valid interior ghost edges
+        edge_ids = (ghost_edge_ids.to_indices() if
+                    hasattr(ghost_edge_ids, "to_indices") else list(ghost_edge_ids))
+        valid_edges = []
         for eid in edge_ids:
-            edge = mesh.edge(eid)
-            if edge.right is None: continue
-            
-            phi_left = level_set(np.asarray(mesh.elements_list[edge.left].centroid()))
-            phi_right = level_set(np.asarray(mesh.elements_list[edge.right].centroid()))
-            
-            # Keep only edges that actually cross the interface
-            if (phi_left < 0) == (phi_right < 0): continue
-            valid_ghost_edges.append(edge)
+            e = mesh.edge(eid)
+            if e.right is None:               # boundary → not a ghost edge
+                continue
 
-        if not valid_ghost_edges:
-            return {'eids': np.array([], dtype=int)} # Return empty if nothing to do
+            phi_l = level_set(np.asanyarray(mesh.elements_list[e.left ].centroid()))
+            phi_r = level_set(np.asanyarray(mesh.elements_list[e.right].centroid()))
+            if (phi_l < 0) == (phi_r < 0):    # interface does not cut the edge
+                continue
+            valid_edges.append(e)
 
-        n_edges = len(valid_ghost_edges)
-        p0_rep, p1_rep = mesh.nodes_x_y_pos[list(valid_ghost_edges[0].nodes)]
+        if not valid_edges:
+            return {"eids": np.array([], dtype=int)}    # early‑out
+
+        # ---------------------------------- allocate dense workspaces
+        n_edges = len(valid_edges)
+        p0_rep, p1_rep = mesh.nodes_x_y_pos[list(valid_edges[0].nodes)]
         q_xi_rep, q_w_rep = line_quadrature(p0_rep, p1_rep, qdeg)
         n_q = len(q_w_rep)
 
-        # --- Allocation ---
-        # Geometry
-        qp_phys_arr = np.zeros((n_edges, n_q, 2))
-        qw_arr = np.zeros((n_edges, n_q))
-        normals_arr = np.zeros((n_edges, n_q, 2))
-        phis_arr = np.zeros((n_edges, n_q))
-        J_inv_pos_arr = np.zeros((n_edges, n_q, 2, 2))
-        J_inv_neg_arr = np.zeros((n_edges, n_q, 2, 2))
-        detJ_pos_arr = np.zeros((n_edges, n_q))
-        detJ_neg_arr = np.zeros((n_edges, n_q))
-        
-        # DOF mapping for the union space
-        global_dofs_list = []
-        pos_maps_list = []
-        neg_maps_list = []
-        
-        # Side-aware basis & derivative tables
+        # geometry
+        qp_phys   = np.zeros((n_edges, n_q, 2))
+        qw        = np.zeros((n_edges, n_q))
+        normals   = np.zeros((n_edges, n_q, 2))
+        J_inv_pos = np.zeros((n_edges, n_q, 2, 2))
+        J_inv_neg = np.zeros((n_edges, n_q, 2, 2))
+        detJ_pos  = np.zeros((n_edges, n_q))
+        detJ_neg  = np.zeros((n_edges, n_q))
+        phi_arr = np.zeros((n_edges, n_q)) if level_set else None
+
+        # DOF data (dense)
+        gdofs_map = -np.ones((n_edges, n_union), dtype=np.int64)
+        pos_map   = -np.ones((n_edges, n_loc),  dtype=np.int32)
+        neg_map   = -np.ones((n_edges, n_loc),  dtype=np.int32)
+
+        # basis / derivative tables
         basis_tables = {}
         for fld in fields:
-            for side in ["pos", "neg"]:
-                for d_ord in derivs:
-                    key = f"d{d_ord[0]}{d_ord[1]}_{fld}_{side}"
+            for side in ("pos", "neg"):
+                for dx, dy in derivs:
+                    key = f"d{dx}{dy}_{fld}_{side}"
                     basis_tables[key] = np.zeros((n_edges, n_q, me._n_basis[fld]))
 
-        # --- Loop over valid ghost edges ---
-        for i, edge in enumerate(valid_ghost_edges):
-            # 1. Determine sides and union of DOFs
+        # ---------------------------------- main loop over valid edges
+        for i, edge in enumerate(valid_edges):
+            # 1. (+) and (‑) element ids
             phi_left = level_set(np.asarray(mesh.elements_list[edge.left].centroid()))
             pos_eid, neg_eid = (edge.left, edge.right) if phi_left >= 0 else (edge.right, edge.left)
 
+            # 2. union of global DOFs
             pos_dofs = self.get_elemental_dofs(pos_eid)
             neg_dofs = self.get_elemental_dofs(neg_eid)
             global_dofs = np.unique(np.concatenate((pos_dofs, neg_dofs)))
-            
-            pos_map = np.searchsorted(global_dofs, pos_dofs)
-            neg_map = np.searchsorted(global_dofs, neg_dofs)
-            
-            global_dofs_list.append(global_dofs)
-            pos_maps_list.append(pos_map)
-            neg_maps_list.append(neg_map)
-            
-            # 2. Quadrature rule and normal vector
+
+            assert len(global_dofs) == n_union, (
+                f"union size mismatch on edge {edge.gid}: "
+                f"{len(global_dofs)}  vs  expected {n_union}"
+            )
+
+            gdofs_map[i, :n_union] = global_dofs
+            pos_map[i] = np.searchsorted(global_dofs, pos_dofs)
+            neg_map[i] = np.searchsorted(global_dofs, neg_dofs)
+
+            # 3. quadrature rule & outward normal
             p0, p1 = mesh.nodes_x_y_pos[list(edge.nodes)]
-            qp_phys, qw = line_quadrature(p0, p1, qdeg)
-            
-            normal_vec = edge.normal
-            # Ensure normal points from (-) to (+) side
-            if np.dot(normal_vec, mesh.elements_list[pos_eid].centroid() - qp_phys[0]) < 0:
-                normal_vec *= -1.0
-            
-            qw_arr[i, :] = qw
-            qp_phys_arr[i, :] = qp_phys
-            normals_arr[i, :] = normal_vec # Broadcast normal to all q points
+            qp_e, qw_e = line_quadrature(p0, p1, qdeg)
+            normal = edge.normal
+            if np.dot(normal, np.asarray(mesh.elements_list[pos_eid].centroid()) - qp_e[0]) < 0:
+                normal *= -1.0   # ensure normal points from (‑) to (+)
 
-            # 3. Compute basis/derivative values from each side
-            for q, xq in enumerate(qp_phys):
-                for side, eid_side in [("pos", pos_eid), ("neg", neg_eid)]:
-                    xi, eta = transform.inverse_mapping(mesh, eid_side, xq)
-                    J = transform.jacobian(mesh, eid_side, (xi, eta))
-                    J_inv = np.linalg.inv(J)
+            qp_phys[i] = qp_e
+            qw[i]      = qw_e
+            normals[i] = normal
+
+            # 4. push‑forward reference bases (both sides)
+            for q, xq in enumerate(qp_e):
+                phi_arr[i, q] = level_set(xq) if level_set else 0.0
+                for side, eid in (("pos", pos_eid), ("neg", neg_eid)):
+                    xi, eta = transform.inverse_mapping(mesh, eid, xq)
+                    J       = transform.jacobian(mesh, eid, (xi, eta))
+                    J_inv   = np.linalg.inv(J)
+
                     if side == "pos":
-                        J_inv_pos_arr[i, q] = J_inv
-                        detJ_pos_arr[i, q] = np.linalg.det(J)
+                        J_inv_pos[i, q] = J_inv
+                        detJ_pos[i, q]  = np.linalg.det(J)
                     else:
-                        J_inv_neg_arr[i, q] = J_inv
-                        detJ_neg_arr[i, q] = np.linalg.det(J)
-                    
-                    for fld in fields:
-                        for d_ord in derivs:
-                            ref_val = me.deriv_ref(fld, xi, eta, *d_ord)
-                            # Push-forward using axis-aligned assumption (OK for structured_quad)
-                            sx, sy = J_inv[0, 0], J_inv[1, 1]
-                            phys_val = ref_val * (sx ** d_ord[0]) * (sy ** d_ord[1])
-                            
-                            key = f"d{d_ord[0]}{d_ord[1]}_{fld}_{side}"
-                            basis_tables[key][i, q, :] = phys_val
+                        J_inv_neg[i, q] = J_inv
+                        detJ_neg[i, q]  = np.linalg.det(J)
 
-        # --- Gather results and return ---
+                    sx, sy = J_inv[0, 0], J_inv[1, 1]   # structured quad assumption
+                    for fld in fields:
+                        for dx, dy in derivs:
+                            ref = me.deriv_ref(fld, xi, eta, dx, dy)
+                            phys = ref * (sx ** dx) * (sy ** dy)
+                            key = f"d{dx}{dy}_{fld}_{side}"
+                            basis_tables[key][i, q, :] = phys
+
+        # ---------------------------------- pack & return
         out = {
-            'eids': np.array([e.gid for e in valid_ghost_edges], dtype=int),
-            'qp_phys': qp_phys_arr,
-            'qw': qw_arr,
-            'normals': normals_arr,
-            'global_dofs': global_dofs_list, # Ragged list
-            'pos_map': pos_maps_list,         # Ragged list
-            'neg_map': neg_maps_list,         # Ragged list
-            'phis': phis_arr,
-            'J_inv_pos': J_inv_pos_arr,
-            'J_inv_neg': J_inv_neg_arr,
-            'detJ_pos': detJ_pos_arr,
-            'detJ_neg': detJ_neg_arr,
-            'detJ': (detJ_pos_arr + detJ_neg_arr) * 0.5,  # Combined for convenience
-            'J_inv': (J_inv_pos_arr + J_inv_neg_arr)*0.5,  # Combined for convenience
+            "eids":        np.fromiter((e.gid for e in valid_edges), dtype=np.int32),
+            "qp_phys":     qp_phys,
+            "qw":          qw,
+            "normals":     normals,
+            "gdofs_map":   gdofs_map,   # dense (‑1 padded) union map
+            "pos_map":     pos_map,
+            "neg_map":     neg_map,
+            "J_inv_pos":   J_inv_pos,
+            "J_inv_neg":   J_inv_neg,
+            "detJ_pos":    detJ_pos,
+            "detJ_neg":    detJ_neg,
+            "detJ":        0.5 * (detJ_pos + detJ_neg),
+            "J_inv":       0.5 * (J_inv_pos + J_inv_neg),
+            "phis":        phi_arr,
         }
         out.update(basis_tables)
         return out
