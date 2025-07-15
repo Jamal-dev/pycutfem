@@ -41,11 +41,38 @@ class StackItem:
         return replace(self, **changes)
 
 
+# ── scalar * Vector/Tensor  (or Vector/Tensor * scalar) ────────────
+def _mul_scalar_vector(self,first_is_scalar,res_var,a, b, body_lines, stack):
+    scalar = a if first_is_scalar else b
+    vect   = b if first_is_scalar else a
+
+    if scalar.shape != ():
+        raise ValueError("Scalar operand must truly be scalar")
+
+    res_shape = vect.shape
+    # Collapse (1,n) only for rank-1 or rank-0 forms
+    collapse = (self.form_rank < 2 and
+                len(vect.shape) == 2 and vect.shape[0] == 1)
+    lhs = f"{scalar.var_name}"
+    rhs = f"{vect.var_name}[0]" if collapse else f"{vect.var_name}"
+    body_lines.append(f"{res_var} = {lhs} * {rhs}")
+
+    if collapse:
+        res_shape = (vect.shape[1],)            # (n,)
+
+    stack.append(StackItem(var_name   = res_var,
+                           role       = vect.role,
+                           shape      = res_shape,
+                           is_vector  = vect.is_vector,
+                           is_gradient= vect.is_gradient,
+                           field_names= vect.field_names,
+                           parent_name= vect.parent_name))
+
 class NumbaCodeGen:
     """
     Translates a linear IR sequence into a Numba-Python kernel source string.
     """
-    def __init__(self, nopython: bool = True, mixed_element=None):
+    def __init__(self, nopython: bool = True, mixed_element=None,form_rank=0):
         """
         Initializes the code generator.
         
@@ -54,6 +81,7 @@ class NumbaCodeGen:
             mixed_element: An INSTANCE of the MixedElement class, not the class type.
         """
         self.nopython = nopython
+        self.form_rank = form_rank # rank of the form (0 for scalar, 1 for linearform, 2 for bilinear form etc.)
         if mixed_element is None:
             raise ValueError("NumbaCodeGen requires an instance of a MixedElement.")
         self.me = mixed_element
@@ -61,6 +89,8 @@ class NumbaCodeGen:
         self.spatial_dim = self.me.mesh.spatial_dim
         self.last_side_for_store = "" # Track side for detJ
 
+    
+    
     def generate_source(self, ir_sequence: list, kernel_name: str):
         body_lines = []
         stack = []
@@ -301,7 +331,8 @@ class NumbaCodeGen:
                 # NumPy array inside the kernel for Numba compatibility.
                 np_array_var = new_var("const_np_arr")
                 is_vec = len(op.shape) == 1
-                body_lines.append(f"{np_array_var} = np.array({op.name}, dtype=np.float64)")
+                # body_lines.append(f"{np_array_var} = np.array({op.name}, dtype=np.float64)")
+                body_lines.append(f"{np_array_var} = {op.name}")
                 stack.append(StackItem(var_name=np_array_var, role='const', shape=op.shape, is_vector=is_vec, field_names=[]))
 
 
@@ -596,10 +627,8 @@ class NumbaCodeGen:
                             f"n_vec_comps = {a.shape[0]}; n_locs = {a.shape[1]};n_spatial_dim = {a.shape[2]};",
                             f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
                             f"for k in range(n_vec_comps):",
-                            f"    temp_sum = 0.0",
                             f"    for d in range(n_spatial_dim):",
-                            f"        temp_sum += {a.var_name}[k, :, d] * {b.var_name}[d]",
-                            f"    {res_var}[k] = temp_sum",
+                            f"        {res_var}[k] += {a.var_name}[k, :, d] * {b.var_name}[d]",
                         ]
                         stack.append(StackItem(var_name=res_var, role='test',
                                             shape=(a.shape[0], a.shape[1]), is_vector=True,
@@ -616,10 +645,8 @@ class NumbaCodeGen:
                             f"n_vec_comps = {a.shape[0]}; n_locs = {a.shape[1]};n_spatial_dim = {a.shape[2]};",
                             f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
                             f"for k in range(n_vec_comps):",
-                            f"    temp_sum = 0.0",
                             f"    for d in range(n_spatial_dim):",
-                            f"        temp_sum += {a.var_name}[k, :, d] * {b.var_name}[d]",
-                            f"    {res_var}[k] = temp_sum",
+                            f"        {res_var}[k] += {a.var_name}[k, :, d] * {b.var_name}[d]",
                         ]
                         stack.append(StackItem(var_name=res_var, role='trial',
                                             shape=(a.shape[0], a.shape[1]), is_vector=True,
@@ -632,10 +659,8 @@ class NumbaCodeGen:
                             f"n_vec_comps = {b.shape[0]}; n_locs = {b.shape[1]};n_spatial_dim = {b.shape[2]};",
                             f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
                             f"for k in range(n_vec_comps):",
-                            f"    temp_sum = 0.0",
                             f"    for d in range(n_spatial_dim):",
-                            f"        temp_sum += {b.var_name}[k, :, d] * {a.var_name}[d]",
-                            f"    {res_var}[k] = temp_sum",
+                            f"        {res_var}[k] += {b.var_name}[k, :, d] * {a.var_name}[d]",
                         ]
                         stack.append(StackItem(var_name=res_var, role='trial',
                                             shape=(b.shape[0], b.shape[1]), is_vector=True,
@@ -862,45 +887,29 @@ class NumbaCodeGen:
                     # -----------------------------------------------------------------
                     # 01. Vector, Tensor:   scalar   *  Vector/Tensor    →  Vector/Tensor 
                     # -----------------------------------------------------------------
+                    
                     elif ((a.role == 'const' or a.role=='value')  
                          and 
                           (not a.is_vector and not a.is_gradient)) :
                         body_lines.append("# Product: scalar * Vector/Tensor → Vector/Tensor")
                         # a is scalar, b is vector/tensor
-                        if a.shape == ():
-                            body_lines.append("# a is scalar, b is vector/tensor")
-                            if b.role == 'test':
-                                body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}[0]")  # b is vector/tensor, a is scalar
-                            else:
-                                body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}")
-                        else:
-                            raise ValueError(f"First operand must be a scalar for this operation, got {a.var_name} with shape {a.shape}.")
+                        # if a.shape == ():
+                        #     body_lines.append("# a is scalar, b is vector/tensor")
+                        #     if b.role == 'test' and len(b.shape) == 2 and b.shape[0] == 1:
+                        #         body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}[0]")  # b is vector/tensor, a is scalar
+                        #         shape = (b.shape[1],) # not true shape needs fix
+                        #     else:
+                        #         body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}")
+                        #         shape = b.shape
+                        _mul_scalar_vector(self,first_is_scalar=True, a=a, b=b, res_var=res_var, body_lines=body_lines,stack=stack)
                         
-                        stack.append(StackItem(var_name=res_var, role=b.role,
-                                            shape=b.shape, is_vector=b.is_vector,
-                                            is_gradient=b.is_gradient,
-                                            field_names=b.field_names,
-                                            parent_name=b.parent_name))
                         
                     elif ((b.role == 'const' or b.role=='value')
                           and 
                         (not b.is_vector and not b.is_gradient)):
                         body_lines.append("# Product: Vector/Tensor * scalar → Vector/Tensor")
                         # b is scalar, a is vector/tensor
-                        if b.shape == ():
-                            body_lines.append("# b is scalar, a is vector/tensor")
-                            if a.role == 'test':
-                                body_lines.append(f"{res_var} = {b.var_name} * {a.var_name}[0]")  # a is vector/tensor, b is scalar
-                            else:
-                                body_lines.append(f"{res_var} = {b.var_name} * {a.var_name}")
-                        else:   
-                            raise ValueError(f"Second operand must be a scalar for this operation, got {b.var_name} with shape {b.shape}.")
-                        
-                        stack.append(StackItem(var_name=res_var, role=a.role,
-                                            shape=a.shape, is_vector=a.is_vector,
-                                            is_gradient=a.is_gradient,
-                                            field_names=a.field_names,
-                                            parent_name=a.parent_name))
+                        _mul_scalar_vector(self,first_is_scalar=False, a=a, b=b, res_var=res_var, body_lines=body_lines,stack=stack)
                         
                     
                     # -----------------------------------------------------------------
@@ -1103,7 +1112,6 @@ class NumbaCodeGen:
             else:
                 raise NotImplementedError(f"Opcode {type(op).__name__} not handled in JIT codegen.")
 
-        print(f"DEBUG L:998: solution_func_names: {solution_func_names}")
         source, param_order = self._build_kernel_string(
             kernel_name, body_lines, required_args, solution_func_names, functional_shape
         )
@@ -1116,7 +1124,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = True
+            DEBUG: bool = False
         ):
         """
         Build complete kernel source code with parallel assembly.
@@ -1131,7 +1139,7 @@ class NumbaCodeGen:
                 required_args.add(f"u_{name}_loc")
 
         # New Newton: Remove gdofs_map from parameters, it's used before the kernel call.
-        print(f"DEBUG L:1025: required_args: {sorted(list(required_args))}")
+        # print(f"DEBUG L:1025: required_args: {sorted(list(required_args))}")
         param_order = [
             "gdofs_map",
             "node_coords",
@@ -1182,7 +1190,6 @@ def {kernel_name}(
     num_elements        = qp_phys.shape[0]
     # n_dofs_per_element  = {self.n_dofs_local}
     n_dofs_per_element  = gdofs_map.shape[1]            # 9 for volume, 15 on ghost edge
-    print(f"n_dofs_per_element: {{n_dofs_per_element}}")
     
     K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
     F_values = np.zeros((num_elements, n_dofs_per_element), dtype=np.float64)

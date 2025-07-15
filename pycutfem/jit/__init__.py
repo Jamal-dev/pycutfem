@@ -6,6 +6,22 @@ from pycutfem.fem.mixedelement import MixedElement
 import numpy as np
 import os
 
+#  pycutfem/jit/__init__.py      (anywhere near the top-level)
+
+def _form_rank(expr):
+    """Return 0 (functional), 1 (linear) or 2 (bilinear)."""
+    from pycutfem.ufl.expressions import Function, VectorFunction
+    from pycutfem.ufl.expressions import TrialFunction, VectorTrialFunction
+    from pycutfem.ufl.expressions import TestFunction,  VectorTestFunction
+
+    has_trial = expr.find_first(lambda n: isinstance(
+        n, (TrialFunction, VectorTrialFunction))) is not None
+    has_test  = expr.find_first(lambda n: isinstance(
+        n, (TestFunction,  VectorTestFunction)))  is not None
+
+    return 2 if (has_trial and has_test) else 1 if (has_test) else 0
+
+
 # New Newton: Create a class to handle data preparation and execution.
 class KernelRunner:
     def __init__(self, kernel, param_order, ir_sequence, dof_handler):
@@ -127,7 +143,8 @@ def compile_backend(integral_expression, dof_handler,mixed_element ): # New Newt
     elif isinstance(integral_expression, _Integral):         # single Integral
         integral_expression = integral_expression.integrand
     ir_generator = IRGenerator()
-    codegen = NumbaCodeGen(mixed_element=mixed_element) 
+    rank    = _form_rank(integral_expression)
+    codegen = NumbaCodeGen(mixed_element=mixed_element,form_rank=rank) 
     cache = KernelCache()
 
     ir_sequence = ir_generator.generate(integral_expression)

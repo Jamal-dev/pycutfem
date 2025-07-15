@@ -208,8 +208,10 @@ class NewtonSolver:
             if aux_funcs:
                 current.update(aux_funcs)
 
-            K_loc, _ = self._jac_runner(current, self.static_args)
-            _, F_loc = self._res_runner(current, self.static_args)
+            # K_loc, _ = self._jac_runner(current, self.static_args)
+            K_loc = self._jac_runner(current, self.static_args)[0] 
+            # _, F_loc = self._res_runner(current, self.static_args)
+            F_loc = self._res_runner(current, self.static_args)[1]
             A, R = self._assemble_system(K_loc, F_loc)
 
             norm_R = np.linalg.norm(R, ord=np.inf)
@@ -346,7 +348,8 @@ class NewtonSolver:
             dh.apply_bcs(bcs_now, *funcs)
 
             # residual ---------------------------------
-            _, F_loc_trial = self._res_runner(coeffs, self.static_args)
+            # _, F_loc_trial = self._res_runner(coeffs, self.static_args)
+            F_loc_trial = self._res_runner(coeffs, self.static_args)[1]
             _, R_trial = self._assemble_system(np.zeros_like(F_loc_trial), F_loc_trial)
 
             if np.linalg.norm(R_trial, ord=np.inf) <= (1.0 - self.np.ls_c1 * alpha) * R0:

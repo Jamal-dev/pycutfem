@@ -739,7 +739,7 @@ class FormCompiler:
                 logger.info(f"Assembling ghost edge integral: {integral}")
                 self._assemble_ghost_edge(integral, target)
                 continue
-            if integral.measure.domain_type not in ["volume", "interface"]:
+            if integral.measure.domain_type not in ["volume", "interface","ghost_edge"]:
                 logger.warning(f"Skipping unsupported integral type: {integral.measure.domain_type}")
                 raise NotImplementedError(f"Unsupported integral type: {integral.measure.domain_type}")
 
