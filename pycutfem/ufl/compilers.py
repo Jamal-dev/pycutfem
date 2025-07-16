@@ -1446,8 +1446,8 @@ class FormCompiler:
 
             # outward normal of the *element*:
             n = edge.normal.copy()
-            if np.dot(n, np.asarray(mesh.elements_list[eid].centroid()) - qp[0]) < 0:
-                n *= -1.0
+            # if np.dot(n, np.asarray(mesh.elements_list[eid].centroid()) - qp[0]) < 0:
+            #     n *= -1.0
             self.ctx["normal"] = n                  # constant along that edge
 
             # precompute element dofs once
@@ -1481,8 +1481,8 @@ class FormCompiler:
                 r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
                 matvec[r, c] += loc
             elif is_functional:               # hooked scalar functional
-                print('-'*50)
-                print(f"loc.shape: {loc.shape}, type: {type(loc)}")
+                # print('-'*50)
+                # print(f"loc.shape: {loc.shape}, type: {type(loc)}")
                 if isinstance(loc, VecOpInfo):    # collapse (k,n) → scalar
                     loc = np.sum(loc.data, axis=1)
                 self.ctx["global_dofs"] = gdofs
@@ -1538,7 +1538,21 @@ class FormCompiler:
 
 
         hook = self._hook_for(intg.integrand)
-     
+        trial, test = _trial_test(intg.integrand)
+        is_functional = (trial is None and test is None)
+
+        if is_functional:
+            # J_loc is (n_edges,) or scalar; collapse to plain float
+            if J_loc is not None:
+                if J_loc.ndim > 1:
+                    total = J_loc.sum(axis=1)
+                if J_loc.ndim == 1:
+                    total = J_loc.sum()
+            name  = hook["name"]               # retrieved earlier via _hook_for
+            scal  = self.ctx.setdefault("scalar_results", {})
+            scal[name] = scal.get(name, 0.0) + total
+            return                             # 🔑  skip the scatter stage
+            
         _scatter_element_contribs(
             K_loc, F_loc, J_loc,
             element_ids=geo["eids"],                 # rows ≡ edge ids
