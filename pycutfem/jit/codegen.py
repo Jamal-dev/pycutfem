@@ -6,7 +6,7 @@ from matplotlib.pylab import f
 from .ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
-    BinaryOp, Inner, Dot, Store
+    BinaryOp, Inner, Dot, Store, Transpose
 )
 from pycutfem.jit.symbols import encode
 import numpy as np
@@ -386,14 +386,18 @@ class NumbaCodeGen:
                         var = new_var("grad_scalar")
                         body_lines.append(f"{var} = {phys[0]}[None, :, :].copy()")
                         shape = (1, n_dofs, self.spatial_dim)
+                        is_vector = True
+                        is_gradient = False
                     else:                                              # vector space
                         var = new_var("grad_stack")
                         body_lines.append(f"{var} = np.stack(({', '.join(phys)}))")
                         shape = (len(a.field_names), n_dofs, self.spatial_dim)
+                        is_vector = False
+                        is_gradient = True
 
                     stack.append(a._replace(var_name=var,
                                             shape=shape,
-                                            is_gradient=True))
+                                            is_gradient=is_gradient,is_vector = is_vector))
 
                 # ======================================================================
                 # (B)  grad(Function/VectorFunction)  → (2,)  or  (k , 2)
@@ -414,17 +418,21 @@ class NumbaCodeGen:
 
                     if not a.is_vector:               # scalar coefficient
                         var, shape = comps[0], (self.spatial_dim,)
+                        is_vector = True
+                        is_gradient = False
                     else:                             # k‑vector coefficient
                         var = new_var("grad_val_stack")
                         body_lines.append(f"{var} = np.stack(({', '.join(comps)}))")
                         shape = (len(a.field_names), self.spatial_dim)
+                        is_vector = False
+                        is_gradient = True
 
                     stack.append(
                         StackItem(var_name   = var,
                                 role       = "value",
                                 shape      = shape,
-                                is_gradient= True,
-                                is_vector  = False,
+                                is_gradient= is_gradient,
+                                is_vector  = is_vector,
                                 field_names= a.field_names,
                                 parent_name= coeff)
                     )
@@ -444,7 +452,9 @@ class NumbaCodeGen:
                 # 1)  Divergence of basis gradients (Test / Trial)  →  scalar (1,n)
                 #     a.var_name shape: (k , n_loc , d)
                 # ---------------------------------------------------------------
-                if a.role in ("test", "trial") and a.shape[0] ==2:
+                print(f"Div: a.shape={a.shape}, a.role={a.role},a.is_vector={a.is_vector}, a.is_gradient={a.is_gradient}")
+                if a.role in ("test", "trial") and a.shape[0] ==2 and a.is_gradient:
+                    print("hello "*10)
                     body_lines.append("# Div(basis) → scalar basis (1,n_loc)")
 
                     body_lines += [
@@ -466,6 +476,7 @@ class NumbaCodeGen:
                             is_vector=False,
                             field_names=a.field_names,
                             parent_name=a.parent_name,
+                            is_gradient=False
                         )
                     )
 
@@ -531,6 +542,9 @@ class NumbaCodeGen:
                     else:
                         body_lines.append(f'# Inner(Vec, Vec): mass matrix')
                         body_lines.append(f'{res_var} = {a.var_name}.T.copy() @ {b.var_name}')
+                # elif a.role == 'const' and b.role == 'const' and a.shape == b.shape:
+                #     body_lines.append(f'# Inner(Const, Const): element-wise product')
+                #     body_lines.append(f'{res_var} = {a.var_name} * {b.var_name}')
                 elif a.role == 'value' and b.role == 'test': # RHS
                     body_lines.append(f'# RHS: Inner(Function, Test)')
                     # a is (k,d) , b is (k,n,d), 
@@ -559,7 +573,7 @@ class NumbaCodeGen:
                             f'    {res_var}[n] = local_sum',
                         ]
                     else:
-                        raise NotImplementedError(f"Inner not implemented for roles {a.role}/{b.role}")
+                        raise NotImplementedError(f"Inner not implemented for roles {a.role}/{b.role}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}, is_gradient: {b.is_gradient},shapes: {a.shape}/{b.shape}")
                         
                     
                 elif a.role == 'value' and b.role == 'value':
@@ -573,7 +587,7 @@ class NumbaCodeGen:
                             f'{res_var} = {a.var_name} @ {b.var_name}.T.copy()',]
                 
                 else:
-                    raise NotImplementedError(f"JIT Inner not implemented for roles {a.role}/{b.role}")
+                    raise NotImplementedError(f"JIT Inner not implemented for roles {a.role}/{b.role}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}, is_gradient: {b.is_gradient}, shapes: {a.shape}/{b.shape}")
                 stack.append(StackItem(var_name=res_var, role='value', shape=(), is_vector=False, field_names=[]))
 
             # ------------------------------------------------------------------
@@ -849,6 +863,48 @@ class NumbaCodeGen:
                 
                 else:
                     raise NotImplementedError(f"Dot not implemented for roles {a.role}/{b.role} with shapes {a.shape}/{b.shape} with vectoors {a.is_vector}/{b.is_vector} and gradients {a.is_gradient}/{b.is_gradient}")
+
+            elif isinstance(op, Transpose):
+                a = stack.pop()                   # operand descriptor
+                res = new_var("trp")
+
+                # ---------------------------------------------------------------
+                # 0) scalar  →  transpose is a no-op
+                # ---------------------------------------------------------------
+                if a.shape == ():
+                    body_lines.append(f"{res} = {a.var_name}")     # just copy
+                    res_shape = ()
+                # -------- scalar grad: (1,n_qp,2)  -> (2,n_qp,1) ----------------
+                elif a.is_gradient and a.shape == (1, a.shape[1], 2):
+                    k, n, d = a.shape
+                    body_lines.append(
+                        f"{res} = {a.var_name}.swapaxes(0,2).copy()"   # (2,n,1)
+                    )
+                    res_shape = (2, n, 1)
+
+                # -------- vector grad: (2,n_qp,2)  swap off-diagonals ------------
+                elif a.is_gradient and a.shape[0] == a.shape[2] == 2:
+                    n = a.shape[1]
+                    body_lines.extend([
+                        f"{res} = {a.var_name}.copy();",
+                        f"{res}[0,:,{1}] = {a.var_name}[1,:,{0}];",
+                        f"{res}[1,:,{0}] = {a.var_name}[0,:,{1}];"
+                    ])
+                    res_shape = a.shape  # still (2,n,2)
+
+                # -------- plain 2×2 matrix --------------------------------------
+                elif len(a.shape) == 2 and a.shape[0] == a.shape[1] == 2:
+                    body_lines.append(f"{res} = {a.var_name}.T.copy()")
+                    res_shape = a.shape[::-1]
+
+                else:
+                    raise NotImplementedError("Transpose not supported for shape "
+                                            f"{a.shape}")
+
+                stack.append(a._replace(var_name=res,
+                                        shape=res_shape,
+                                        is_vector=a.is_vector,
+                                        is_gradient=a.is_gradient))
 
             
             elif isinstance(op, BinaryOp):

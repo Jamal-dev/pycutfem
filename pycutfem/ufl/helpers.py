@@ -194,6 +194,23 @@ class GradOpInfo:
     role: str = "none"
     coeffs: np.ndarray = field(default=None)
 
+    def transpose(self) -> "GradOpInfo":
+        if self.data.ndim == 2:
+            # If data is 2D, we can just transpose it
+            return GradOpInfo(self.data.T, role=self.role, coeffs=self.coeffs)
+        elif self.data.ndim == 3 and self.shape[0] == 2 and self.shape[2] == 2:
+            temp = self.data.copy()
+            temp[0,:,1] = self.data[1,:,0]
+            temp[1,:,0] = self.data[0,:,1]
+            return GradOpInfo(temp, role=self.role, coeffs=self.coeffs)
+        elif self.data.ndim == 3 and self.shape[0] == 1 and self.shape[2] == 2:
+            # For sclar gradients (1 component, 2 spatial dimensions)
+            # we swap the two spatial dimensions
+            return GradOpInfo(self.data.swapaxes(0, 2),
+                              role=self.role, coeffs=self.coeffs)
+        else:
+            raise ValueError(f"Cannot transpose GradOpInfo with data of shape {self.data.shape}. Expected 2D or 3D array.")
+
     def inner(self, other: "GradOpInfo") -> np.ndarray:
         """Computes inner(∇u, ∇v) = ∫(∇u)T(∇v), returning an (n, n) matrix."""
         if not isinstance(other, GradOpInfo) or self.data.shape != other.data.shape:

@@ -34,7 +34,7 @@ from pycutfem.ufl.expressions import (
     Function,    VectorFunction,
     Grad, DivOperation, Inner, Dot,
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
-    ElementWiseConstant, Derivative
+    ElementWiseConstant, Derivative, Transpose
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -131,7 +131,8 @@ class FormCompiler:
             FacetNormal: self._visit_FacetNormal,
             ElementWiseConstant: self._visit_EWC,
             Jump: self._visit_Jump,
-            Derivative        : self._visit_Derivative
+            Derivative        : self._visit_Derivative,
+            Transpose: self._visit_Transpose,
         }
 
     # ============================ PUBLIC API ===============================
@@ -462,6 +463,17 @@ class FormCompiler:
         a = self._visit(n.a)
         b = self._visit(n.b)
         return a - b
+    def _visit_Transpose(self, node:Transpose):
+        mat = self._visit(node.A)               # recurse
+        # NumPy ndarray  → just use .T
+        if isinstance(mat, np.ndarray):
+            return mat.T
+        if isinstance(mat, GradOpInfo):
+            return mat.transpose()            
+        # VecOpInfo (our own small tensor wrapper)
+        if isinstance(mat, VecOpInfo):
+            return mat.transpose()              # implement below
+        raise TypeError(f"Cannot transpose object of type {type(mat)}")
 
     def _visit_Div(self, n):
         """Handles scalar, vector, or tensor division by a scalar."""
@@ -865,10 +877,7 @@ class FormCompiler:
         # ------------------------------------------------------------------
         # 3. Collect the up-to-date coefficient Functions
         # ------------------------------------------------------------------
-        current_funcs = {
-            f.name: f
-            for f in _find_all(integral.integrand, (Function, VectorFunction))
-        }
+        current_funcs = self._get_data_functions_objs(integral)
 
         # ------------------------------------------------------------------
         # 4. Execute the kernel via the runner
@@ -1273,15 +1282,7 @@ class FormCompiler:
         ).astype(np.int32)
 
         # 4.  gather coefficient Functions once ----------------------------
-        current_funcs = {
-            f.name: f
-            for f in _find_all(intg.integrand, (Function, VectorFunction))
-        }
-        # also map parent VectorFunction names when we see a scalar component
-        for f in list(current_funcs.values()):
-            pv = getattr(f, "_parent_vector", None)
-            if pv is not None:
-                current_funcs.setdefault(pv.name, pv)
+        current_funcs = self._get_data_functions_objs(intg)
 
         # 5.  Compile kernel & build argument dict ----------------------------------
         runner, ir = self._compile_backend(intg.integrand, dh, me)
@@ -1375,15 +1376,7 @@ class FormCompiler:
         )
 
         # 5. Get current functions and execute kernel
-        current_funcs = {
-            f.name: f
-            for f in _find_all(intg.integrand, (Function, VectorFunction))
-        }
-        # also map parent VectorFunction names when we see a scalar component
-        for f in list(current_funcs.values()):
-            pv = getattr(f, "_parent_vector", None)
-            if pv is not None:
-                current_funcs.setdefault(pv.name, pv)
+        current_funcs = self._get_data_functions_objs(intg)
         
         # The runner now gets per-edge arguments
         K_edge, F_edge, J_edge = runner(current_funcs, args)
@@ -1491,6 +1484,25 @@ class FormCompiler:
         # tidy
         for k in ("eid", "x_phys", "normal", "global_dofs"):
             self.ctx.pop(k, None)
+    def _get_data_functions_objs(self, intg: Integral):
+        """
+        Extracts all Function and VectorFunction objects from the integrand.
+        This is used to gather the current state of coefficient functions
+        before executing the JIT kernel.
+        """
+        coeffs = (Function, VectorFunction)
+        current = {f.name: f
+                   for f in _find_all(intg.integrand, coeffs)
+                   if not getattr(f, "is_test", False)
+                   and not getattr(f, "is_trial", False)}
+        
+        # Add parent vectors if they look like real coefficient vectors
+        for f in list(current.values()):
+            pv = getattr(f, "_parent_vector", None)
+            if pv is not None and hasattr(pv, "name"):
+                current.setdefault(pv.name, pv)
+
+        return current
     
     def _assemble_boundary_edge_jit(self, intg: Integral, matvec):
         mesh, dh, me = self.me.mesh, self.dh, self.me
@@ -1526,12 +1538,9 @@ class FormCompiler:
         )
 
         # 4. up-to-date coefficient Functions -------------------------
-        current = {f.name: f
-                   for f in _find_all(intg.integrand, (Function, VectorFunction))}
-        for f in list(current.values()):
-            pv = getattr(f, "_parent_vector", None)
-            if pv is not None:
-                current.setdefault(pv.name, pv)
+        #    • ignore test/trial symbols
+        #    • add parent vectors only if they look like real coefficient vectors
+        current = self._get_data_functions_objs(intg)
 
         # 5. execute and scatter --------------------------------------
         K_loc, F_loc, J_loc = runner(current, args)

@@ -4,12 +4,12 @@ from pycutfem.ufl.expressions import (
     VectorTestFunction, VectorTrialFunction, VectorFunction,
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, 
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
-    ElementWiseConstant
+    ElementWiseConstant, Transpose as UFLTranspose
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
-    LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store
+    LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose
 )
 from dataclasses import replace
 import logging
@@ -157,6 +157,11 @@ class IRGenerator:
             else:
                 name = f"const_arr_{id(node)}"
                 self.ir_sequence.append(LoadConstantArray(name=name, shape=node.shape))
+            return
+        if isinstance(node, UFLTranspose):
+            # Transpose is a no-op in IR, just push the top-of-stack tensor.
+            self._visit(node.A, side=side)
+            self.ir_sequence.append(Transpose())
             return
 
         if isinstance(node, FacetNormal):

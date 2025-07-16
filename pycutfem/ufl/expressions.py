@@ -5,15 +5,22 @@ import matplotlib.tri as tri
 import numbers
 from matplotlib.colors import LinearSegmentedColormap
 from pycutfem.plotting.triangulate import triangulate_field
+from matplotlib.animation import FuncAnimation
 
 
 custom_cmap = LinearSegmentedColormap.from_list('blue_red', ['blue', 'red'])
+
+
 
 class Expression:
     """Base class for any object in a symbolic FEM expression."""
     is_function = False
     is_trial    = False
     is_test     = False
+    @property
+    def T(self):
+        """Shorthand to build a transposed view of a tensor expression."""
+        return Transpose(self)
     def __repr__(self):
         return f"{self.__class__.__name__}()"
 
@@ -89,6 +96,11 @@ class Expression:
             if found: return found
         return None
 
+class Transpose(Expression):
+    """Symbolic transpose (for 2-D tensors)."""
+    def __init__(self, A: Expression):
+        super().__init__()
+        self.A = A
 class Function(Expression):
     """
     Represents a single-field function. Can be a standalone data-carrier
@@ -199,6 +211,55 @@ class Function(Expression):
         ax.set_aspect('equal', adjustable='box')
         ax.tricontour(triangulation, z, colors='k', linewidths=0.5, levels=plot_kwargs['levels'])
         plt.show()
+
+    def plot_deformed(self,
+                    displacement: 'VectorFunction',
+                    exaggeration: float = 1.0,
+                    **kwargs):
+        """
+        Filled-contour plot of this scalar function on the *deformed*
+        geometry.
+
+        Parameters
+        ----------
+        displacement : VectorFunction
+            FE solution that carries ['ux','uy'] (or any 2-D pair).
+        exaggeration : float
+            Multiply the physical displacement by this factor.
+        **kwargs     :
+            Passed straight to `tricontourf` (cmap, levels, …).
+        """
+        if self._dof_handler is None:
+            raise RuntimeError("Function needs an attached DofHandler.")
+        mesh = self._dof_handler.fe_map[self.field_name]
+
+        # --- original triangulation & coords --------------------------------
+        tri_orig = triangulate_field(mesh, self._dof_handler, self.field_name)
+        node_ids = [self._dof_handler._dof_to_node_map[d][1]
+                    for d in self._dof_handler.get_field_slice(self.field_name)]
+        coords   = mesh.nodes_x_y_pos[node_ids]
+
+        # --- look up displacement at those nodes ----------------------------
+        fx, fy = displacement.field_names[:2]          # first two components
+        disp_x = np.array([displacement.get_value_at_node(nid, fx) for nid in node_ids])
+        disp_y = np.array([displacement.get_value_at_node(nid, fy) for nid in node_ids])
+        coords_def = coords + exaggeration*np.column_stack((disp_x, disp_y))
+
+        tri_def = tri.Triangulation(coords_def[:, 0], coords_def[:, 1],
+                                    tri_orig.triangles)
+
+        z = self.nodal_values
+        fig, ax = plt.subplots()
+        title = kwargs.pop('title', f"{self.name} (deformed)")
+        plot_kw = {'cmap': 'viridis', 'levels': 15} | kwargs
+
+        cf = ax.tricontourf(tri_def, z, **plot_kw)
+        fig.colorbar(cf, ax=ax, label='Value')
+        ax.tricontour(tri_def, z, levels=plot_kw['levels'],
+                    colors='k', linewidths=0.4)
+        ax.set(title=title, xlabel='x', ylabel='y', aspect='equal')
+        plt.show()
+
 
 # In your ufl/expressions.py file
 
@@ -492,6 +553,149 @@ class VectorFunction(Expression):
         ax.set_xlabel("x"); ax.set_ylabel("y")
         ax.set_aspect("equal", adjustable="box")
         plt.show()
+    
+    def plot_deformed(self,
+                    displacement: 'VectorFunction',
+                    exaggeration: float = 1.0,
+                    kind: str = 'quiver',
+                    background: bool | str = "magnitude",
+                    stride: int = 1,
+                    **kwargs):
+        """
+        Visualise the vector field on the *deformed* mesh.
+
+        Parameters
+        ----------
+        displacement : VectorFunction
+            Same-mesh solution holding the geometry change.
+        exaggeration : float
+            Scale factor for the displayed deformation.
+        kind : {'quiver', 'streamlines'}
+            Choose arrow or streamline style.
+        background, stride, **kwargs
+            Passed through to the underlying _plot_quiver/_plot_streamlines.
+        """
+        if self._dof_handler is None:
+            raise RuntimeError("VectorFunction needs an attached DofHandler.")
+        dh   = self._dof_handler
+        mesh = dh.fe_map[self.field_names[0]]
+
+        # -----------------------------------------------------------------------
+        # One consistent list of node-ids (pick them from the *first* component)
+        # -----------------------------------------------------------------------
+        fld_x, fld_y = self.field_names[:2]           # e.g. 'ux', 'uy'
+        g_dofs_x     = dh.get_field_slice(fld_x)      # global DOFs for ux
+        node_ids     = [dh._dof_to_node_map[gd][1] for gd in g_dofs_x]
+
+        coords       = mesh.nodes_x_y_pos[node_ids]   # (n, 2)
+
+        # -----------------------------------------------------------------------
+        # Displacement field — value per node, fetched via global-DOF indexing
+        # -----------------------------------------------------------------------
+        gx = np.array([dh.dof_map[fld_x][nid] for nid in node_ids])
+        gy = np.array([dh.dof_map[fld_y][nid] for nid in node_ids])
+
+        disp_x = displacement.get_nodal_values(gx)
+        disp_y = displacement.get_nodal_values(gy)
+
+        coords_def = coords + exaggeration * np.column_stack((disp_x, disp_y))
+        x_d, y_d   = coords_def[:, 0], coords_def[:, 1]
+
+        # -----------------------------------------------------------------------
+        # Vector values to draw (this VectorFunction, not necessarily displacement)
+        # -----------------------------------------------------------------------
+        u_vals = self.get_nodal_values(gx)
+        v_vals = self.get_nodal_values(gy)
+
+        # --- branch according to kind ---------------------------------------
+        if kind == 'quiver':
+            # u_vals = self.components[0].nodal_values
+            # v_vals = self.components[1].nodal_values
+            sl = slice(None, None, stride)
+            fig, ax = plt.subplots(figsize=(8, 8))
+
+            # optional colour wash
+            if background:
+                tri_def = tri.Triangulation(x_d, y_d,
+                            triangulate_field(mesh, dh, self.field_names[0]).triangles)
+                if background is True or background == "magnitude":
+                    scalar, label = np.hypot(u_vals, v_vals), "|u|"
+                else:
+                    comp = next((c for c in self.components
+                                if c.field_name == background), None)
+                    scalar, label = comp.nodal_values, background
+                tcf = ax.tricontourf(tri_def, scalar, levels=15,
+                                    cmap=kwargs.pop('cmap', 'viridis'))
+                fig.colorbar(tcf, ax=ax, label=label)
+
+            # pick up an explicit 'scale' if the caller gave one – otherwise let
+            # Matplotlib use its default.  Everything else comes from **kwargs.
+            scale_kw = kwargs.pop('scale', None)
+            q_kwargs = dict(angles='xy', scale_units='xy',
+                            color=kwargs.pop('color', 'k'))
+            if scale_kw is not None:
+                q_kwargs['scale'] = scale_kw
+            q_kwargs.update(kwargs)
+
+            ax.quiver(x_d[sl], y_d[sl], u_vals[sl], v_vals[sl], **q_kwargs)
+            ax.set(title=kwargs.pop('title', f"{self.name} (deformed quiver)"),
+                xlabel='x', ylabel='y', aspect='equal')
+            plt.show()
+
+        elif kind in {'streamlines', 'streamline'}:
+            # temporarily swap mesh.nodes_x_y_pos for the deformed coords,
+            # call existing _plot_streamlines, then restore
+            original = mesh.nodes_x_y_pos.copy()
+            mesh.nodes_x_y_pos[:] = coords_def
+            try:
+                self._plot_streamlines(background=background, **kwargs)
+            finally:
+                mesh.nodes_x_y_pos[:] = original
+        else:
+            raise ValueError("kind must be 'quiver' or 'streamlines'")
+    
+
+    def animate_deformation(self,
+                            displacement: 'VectorFunction',
+                            frames: int = 30,
+                            exaggeration: float = 1.0,
+                            interval: int = 100,
+                            **kwargs):
+        """
+        Create a simple Matplotlib animation that morphs the mesh from the
+        undeformed state (t=0) to the fully deformed one (t=1).
+
+        Returns
+        -------
+        anim : matplotlib.animation.FuncAnimation
+            You can save it with anim.save('beam.gif', writer='imagemagick').
+        """
+        dh   = self._dof_handler
+        coords = dh.get_dof_coords(self.field_names[0])
+        disp_x = displacement.components[0].nodal_values
+        disp_y = displacement.components[1].nodal_values
+        u_vals = self.components[0].nodal_values
+        v_vals = self.components[1].nodal_values
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        q = ax.quiver(coords[:, 0], coords[:, 1],
+                    u_vals, v_vals, angles='xy',
+                    scale_units='xy', scale=None, color='k', **kwargs)
+        ax.set_aspect('equal')
+        ax.set_title('Deformation animation')
+
+        def update(frame):
+            f = frame / (frames - 1)
+            x_def = coords[:, 0] + f*exaggeration*disp_x
+            y_def = coords[:, 1] + f*exaggeration*disp_y
+            q.set_offsets(np.c_[x_def, y_def])
+            return q,
+
+        anim = FuncAnimation(fig, update, frames=frames,
+                            blit=True, interval=interval)
+        plt.show()
+        return anim
+
 
     
 
