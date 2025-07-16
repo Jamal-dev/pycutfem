@@ -300,12 +300,13 @@ def _scatter_element_contribs(
     matvec: np.ndarray,
     ctx: dict,
     integrand,
+    hook,
 ):
     """
     Generic scatter for element-based JIT kernels (e.g., dInterface).
     """
     rhs = ctx.get("rhs", False)
-    hook = ctx.get("hooks", {}).get(type(integrand))
+    # hook = ctx.get("hooks", {}).get(type(integrand))
 
     # --- Matrix contributions ---
     if not rhs and K_elem is not None and K_elem.ndim == 3:
@@ -322,7 +323,7 @@ def _scatter_element_contribs(
 
     # --- Functional contributions ---
     if hook and J_elem is not None:
-        # print(f"J_elem.shape: {J_elem.shape}---J_elem: {J_elem}")
+        print(f"J_elem.shape: {J_elem.shape}---J_elem: {J_elem}")
         total = J_elem.sum(axis=0) if J_elem.ndim > 1 else J_elem.sum()
         # This accumulator logic is correct.
         acc = ctx.setdefault("scalar_results", {}).setdefault(

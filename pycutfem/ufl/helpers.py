@@ -322,37 +322,50 @@ MultiIndex = Tuple[int, int]  # (α_x, α_y)
 
 def required_multi_indices(expr: "Expression") -> Set[MultiIndex]:
     """
-    Collect every distinct multi-index (ox, oy) that occurs anywhere in *expr*.
-    Works with:
-        • new Derivative(f, ox, oy)
-        • old nested Derivative(f, dir) chains
+    Collect each distinct derivative order (α_x, α_y) that occurs anywhere
+    in *expr*.
+
+    Works with
+        • Derivative(f, order=(αx, αy))      – new API
+        • nested Derivative(f, dir) chains   – old API
+
+    A node can appear more than once in the graph (e.g. a VectorFunction
+    points to its two scalar components).  We keep a *seen* set so the
+    walk terminates even on graphs with back-references.
     """
-    out: Set[MultiIndex] = set()
+    out:  Set[MultiIndex] = set()   # final result
+    seen: Set[int]        = set()   # id(node) → already visited
 
     def _walk(node: "Expression", acc_x: int = 0, acc_y: int = 0):
-        # ---------- Derivative node ----------------------------------
+        # ---- NEW: break potential cycles --------------------------------
+        nid = id(node)
+        if nid in seen:
+            return
+        seen.add(nid)
+
+        # ---- Derivative node --------------------------------------------
         if isinstance(node, Derivative):
-            # --- new API --------------------------------------------
+            # -- new API ---------------------------------------------------
             if hasattr(node, "order"):
                 ox, oy = node.order
                 _walk(node.f, acc_x + ox, acc_y + oy)
                 return
-            # --- old API (single direction) --------------------------
-            dir = getattr(node, "component_index", None)
-            if dir == 0:
+            # -- old API (single direction) --------------------------------
+            dir_ = getattr(node, "component_index", None)
+            if dir_ == 0:
                 _walk(node.f, acc_x + 1, acc_y)
-            elif dir == 1:
+            elif dir_ == 1:
                 _walk(node.f, acc_x, acc_y + 1)
-            else:  # fallback: treat as unknown expr
+            else:                       # unrecognised → just recurse
                 _walk(node.f, acc_x, acc_y)
             return
 
-        # ---------- leaf reached: record accumulated orders ----------
+        # ---- leaf: record accumulated orders ----------------------------
         if acc_x or acc_y:
             out.add((acc_x, acc_y))
             acc_x = acc_y = 0
 
-        # ---------- recurse over children ---------------------------
+        # ---- recurse over children --------------------------------------
         for child in node.__dict__.values():
             if isinstance(child, Expression):
                 _walk(child, acc_x, acc_y)

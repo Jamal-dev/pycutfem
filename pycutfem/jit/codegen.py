@@ -1124,7 +1124,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = False
+            DEBUG: bool = True
         ):
         """
         Build complete kernel source code with parallel assembly.
@@ -1190,6 +1190,7 @@ def {kernel_name}(
     num_elements        = qp_phys.shape[0]
     # n_dofs_per_element  = {self.n_dofs_local}
     n_dofs_per_element  = gdofs_map.shape[1]            # 9 for volume, 15 on ghost edge
+    print(f"num_elements: {{num_elements}},n_dofs_per_element: {{n_dofs_per_element}}")
     
     K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
     F_values = np.zeros((num_elements, n_dofs_per_element), dtype=np.float64)

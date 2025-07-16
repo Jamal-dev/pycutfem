@@ -918,6 +918,99 @@ class DofHandler:
         }
         out.update(basis_tables)
         return out
+    
+    # --------------------------------------------------------------------
+    #  DofHandler.precompute_boundary_factors   (∫ ⋯ dS backend)
+    # --------------------------------------------------------------------
+    def precompute_boundary_factors(
+            self,
+            edge_ids: "BitSet | Sequence[int]",
+            qdeg: int,
+            derivs: set[tuple[int, int]],
+            reuse: bool = True,
+    ) -> dict:
+        """
+        Pre-compute all geometry / basis tables that a JIT kernel needs for
+        ∫_Γ f dS on *boundary* edges Γ.  Very similar to
+        `precompute_ghost_factors` :contentReference[oaicite:0]{index=0} but with only **one**
+        element (the left owner) and no ‘neg/pos’ bookkeeping.
+        """
+        mesh   = self.mixed_element.mesh
+        me     = self.mixed_element
+        fields = me.field_names
+
+        # ----------- normalise input ------------------------------------
+        if hasattr(edge_ids, "to_indices"):
+            edge_ids = edge_ids.to_indices()
+        edge_ids = [eid for eid in edge_ids if mesh.edge(eid).right is None]
+        if not edge_ids:                      # nothing to do
+            raise ValueError("No valid boundary edges found in the provided edge IDs.") 
+            return {"eids": np.empty(0, dtype=int)}
+
+        cache_key = (_hash_subset(edge_ids), qdeg, tuple(sorted(derivs)))
+        if reuse and cache_key in _edge_geom_cache:
+            return _edge_geom_cache[cache_key]
+
+        # ----------- representative rule / array sizes ------------------
+        p0, p1 = mesh.nodes_x_y_pos[list(mesh.edge(edge_ids[0]).nodes)]
+        qp_rep, qw_rep = line_quadrature(p0, p1, qdeg)
+        n_q   = len(qw_rep)
+        n_loc = me.n_dofs_local
+
+        # ----------- bulk workspaces ------------------------------------
+        qp_phys  = np.zeros((len(edge_ids), n_q, 2))
+        qw       = np.zeros((len(edge_ids), n_q))
+        normals  = np.zeros((len(edge_ids), n_q, 2))
+        detJ_arr = np.zeros((len(edge_ids), n_q))
+        phi_arr = np.zeros((len(edge_ids), n_q)) 
+        Jinv_arr = np.zeros((len(edge_ids), n_q, 2, 2))
+        gdofs_map = np.zeros((len(edge_ids), n_loc), dtype=np.int32)
+
+        # basis / derivative tables
+        basis_tabs = {f"d{dx}{dy}_{fld}": np.zeros((len(edge_ids), n_q, n_loc))
+                      for fld in fields for (dx, dy) in derivs}
+
+        # ----------- main loop over edges --------------------------------
+        for row, eid_edge in enumerate(edge_ids):
+            edge = mesh.edge(eid_edge)
+            owner = edge.left          # guaranteed not None
+            gdofs_map[row] = self.get_elemental_dofs(owner)
+
+            p0, p1 = mesh.nodes_x_y_pos[list(edge.nodes)]
+            qpts, qwts = line_quadrature(p0, p1, qdeg)
+            n_vec = edge.normal
+
+            qp_phys[row] = qpts
+            qw[row]      = qwts
+            normals[row] = n_vec        # constant per edge – replicate
+
+            for q, (xq, wq) in enumerate(zip(qpts, qwts)):
+                xi, eta = transform.inverse_mapping(mesh, owner, xq)
+                J       = transform.jacobian(mesh, owner, (xi, eta))
+                J_inv   = np.linalg.inv(J)
+
+                detJ_arr[row, q] = np.linalg.det(J)
+                Jinv_arr[row, q] = J_inv
+
+                sx, sy = J_inv[0, 0], J_inv[1, 1]   # axis-aligned quad
+                for fld in fields:
+                    for dx, dy in derivs:
+                        ref   = me.deriv_ref(fld, xi, eta, dx, dy)
+                        basis_tabs[f"d{dx}{dy}_{fld}"][row, q] = \
+                            ref * (sx**dx) * (sy**dy)
+
+        out = {"eids": np.asarray(edge_ids, dtype=np.int32),
+               "qp_phys": qp_phys, "qw": qw, "normals": normals,
+               "detJ": detJ_arr, "J_inv": Jinv_arr,
+               "gdofs_map": gdofs_map,
+               "phis": phi_arr # phi is just a placeholder here with 0 values 
+               }
+        out.update(basis_tabs)
+
+        if reuse:
+            _edge_geom_cache[cache_key] = out
+        return out
+
 
     def info(self) -> None:
         print(f"=== DofHandler ({self.method.upper()}) ===")

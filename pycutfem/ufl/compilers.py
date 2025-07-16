@@ -770,6 +770,15 @@ class FormCompiler:
 
         return q_order
     
+    def _hook_for(self, expr):
+        hooks = self.ctx.get("hooks", {})
+        # print(f"expr={expr}, hooks={hooks}")
+        if expr is None:
+            return hooks.get(Function)           # default
+        if expr in hooks:                        # ← object hash & equality!
+            return hooks[expr]
+        return hooks.get(type(expr))             # fallback by type
+    
     # ====================== BC handling ===============================
     def _apply_bcs(self, K, F, bcs):
         # This method remains unchanged from your provided file
@@ -873,7 +882,7 @@ class FormCompiler:
         # 5.  Pure scalar functional  → never touches the global system
         # ------------------------------------------------------------------
         trial, test = _trial_test(integral.integrand)
-        hook        = self.ctx["hooks"].get(type(integral.integrand))
+        hook        = self._hook_for(integral.integrand)
         if trial is None and test is None:           # functional (hooked or not)
             if hook:                                 # accumulate if requested
                 name = hook["name"]
@@ -977,7 +986,7 @@ class FormCompiler:
         logger.debug(f"Assemble Interface: Using quadrature degree: {qdeg}") 
         fields = _all_fields(intg.integrand) # New
         
-        hook = self.ctx['hooks'].get(type(intg.integrand)) # New
+        hook = self._hook_for(intg.integrand)
         if hook: # New
             self.ctx.setdefault('scalar_results', {})[hook['name']] = 0.0 # New
 
@@ -1112,7 +1121,7 @@ class FormCompiler:
         
         # New: Check for assembler hooks to handle scalar functionals.
         trial, test = _trial_test(intg.integrand) # New
-        hook = self.ctx['hooks'].get(type(intg.integrand)) if intg.integrand else self.ctx['hooks'].get(Function) # New
+        hook = self._hook_for(intg.integrand)
         is_functional = (hook is not None and trial is None and test is None) # New
         if is_functional: # New
             self.ctx.setdefault('scalar_results', {})[hook['name']] = 0.0 # New
@@ -1298,11 +1307,13 @@ class FormCompiler:
         J_cut = J[cut_eids] if J is not None else None
 
         gdofs_cut = gdofs_map[cut_eids]        # rows aligned with K_cut
+        hook = self._hook_for(intg.integrand)
 
         _scatter_element_contribs(
             K_cut, F_cut, J_cut,
             cut_eids, gdofs_cut,
-            matvec, self.ctx, intg.integrand
+            matvec, self.ctx, intg.integrand,
+            hook=hook,  # Pass the hook for scalar functionals
         )
 
     def _assemble_interface(self, intg: Integral, matvec):
@@ -1376,13 +1387,15 @@ class FormCompiler:
         
         # The runner now gets per-edge arguments
         K_edge, F_edge, J_edge = runner(current_funcs, args)
+        hook = self._hook_for(intg.integrand)
         
         # 6. Scatter contributions
         _scatter_element_contribs(
             K_edge, F_edge, J_edge,
             valid_eids,       # The edge IDs
             gdofs_map,        # The per-edge union of DOFs
-            matvec, self.ctx, intg.integrand
+            matvec, self.ctx, intg.integrand,
+            hook = hook,  # Pass the hook for scalar functionals
         )
     
     def _assemble_ghost_edge(self, intg: "Integral", matvec):
@@ -1396,7 +1409,7 @@ class FormCompiler:
 
 
     # inside FormCompiler -------------------------------------------------
-    def _assemble_boundary_edge(self, intg: Integral, matvec):
+    def _assemble_boundary_edge_python(self, intg: Integral, matvec):
         """
         Assemble ∫_Γ  f  dS   over a *set* of boundary edges  Γ  (Neumann BC,
         surface traction in elasticity, etc.).  Works for bilinear, linear
@@ -1409,7 +1422,7 @@ class FormCompiler:
         rhs   = self.ctx.get("rhs", False)
         mesh  = self.me.mesh
         qdeg  = self._find_q_order(intg)
-        hook  = self.ctx["hooks"].get(type(intg.integrand))
+        hook  = self._hook_for(intg.integrand)
         trial, test = _trial_test(intg.integrand)
         is_functional = hook and trial is None and test is None
         if is_functional:
@@ -1422,6 +1435,9 @@ class FormCompiler:
 
         fields = _all_fields(intg.integrand)
 
+        if edge_ids.size == 0: raise ValueError(
+            f"Integral {intg} has no defined edges. "
+            "Check the measure or the mesh.")
         for gid in edge_ids:
             edge   = mesh.edge(gid)
             eid    = edge.left                      # the unique owner element
@@ -1465,6 +1481,8 @@ class FormCompiler:
                 r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
                 matvec[r, c] += loc
             elif is_functional:               # hooked scalar functional
+                print('-'*50)
+                print(f"loc.shape: {loc.shape}, type: {type(loc)}")
                 if isinstance(loc, VecOpInfo):    # collapse (k,n) → scalar
                     loc = np.sum(loc.data, axis=1)
                 self.ctx["global_dofs"] = gdofs
@@ -1473,3 +1491,68 @@ class FormCompiler:
         # tidy
         for k in ("eid", "x_phys", "normal", "global_dofs"):
             self.ctx.pop(k, None)
+    
+    def _assemble_boundary_edge_jit(self, intg: Integral, matvec):
+        mesh, dh, me = self.me.mesh, self.dh, self.me
+
+        # 1. pick edges -----------------------------------------------
+        edge_set = (intg.measure.defined_on
+                    if intg.measure.defined_on is not None
+                    else mesh.get_domain_bitset(intg.measure.tag, entity="edge"))
+        if edge_set.cardinality() == 0:
+            return
+
+        # 2. geometry tables ------------------------------------------
+        derivs = required_multi_indices(intg.integrand)
+        if (0, 0) not in derivs:
+            derivs |= {(0, 0)}
+        qdeg = self._find_q_order(intg)
+        print(f"[Assembler: boundary edge JIT] Using quadrature degree: {qdeg}")
+        geo  = dh.precompute_boundary_factors(edge_set, qdeg, derivs)
+
+        valid = geo["eids"]
+        if valid.size == 0:
+            return
+
+        # 3. kernel compilation ---------------------------------------
+        runner, ir = self._compile_backend(intg.integrand, dh, me)
+
+        args = _build_jit_kernel_args(
+            ir, intg.integrand, me, qdeg,
+            dof_handler = dh,
+            gdofs_map   = geo["gdofs_map"],
+            param_order = runner.param_order,
+            pre_built   = geo
+        )
+
+        # 4. up-to-date coefficient Functions -------------------------
+        current = {f.name: f
+                   for f in _find_all(intg.integrand, (Function, VectorFunction))}
+        for f in list(current.values()):
+            pv = getattr(f, "_parent_vector", None)
+            if pv is not None:
+                current.setdefault(pv.name, pv)
+
+        # 5. execute and scatter --------------------------------------
+        K_loc, F_loc, J_loc = runner(current, args)
+
+
+        hook = self._hook_for(intg.integrand)
+     
+        _scatter_element_contribs(
+            K_loc, F_loc, J_loc,
+            element_ids=geo["eids"],                 # rows ≡ edge ids
+            gdofs_map=geo["gdofs_map"],
+            matvec=matvec, 
+            ctx=self.ctx, 
+            integrand=intg.integrand,
+            hook=hook,
+        )
+    def _assemble_boundary_edge(self, intg: Integral, matvec):
+        """Assemble integrals over boundary edges."""
+        if self.backend == "python":
+            self._assemble_boundary_edge_python(intg, matvec)
+        elif self.backend == "jit":
+            self._assemble_boundary_edge_jit(intg, matvec)
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")

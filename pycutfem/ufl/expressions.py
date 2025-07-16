@@ -60,6 +60,12 @@ class Expression:
         return Div(self, other)
 
     def __neg__(self): return Prod(Constant(-1.0), self)
+    def __hash__(self):
+        return id(self)
+    def __deepcopy__(self, memo):
+        return self
+    def __copy__(self):
+        return self                  # shallow copy ➜ same object
     def restrict(self, domain_tag): return Restriction(self, domain_tag)
     def side(self, s: str): return Side(self, s)
 
@@ -577,6 +583,12 @@ class Constant(Expression, numbers.Number):
 
     def __array__(self, dtype=None):
         return np.asarray(self.value, dtype=dtype)
+    def __hash__(self):
+        # Scalars:   hash(1.0)        → constant regardless of identity
+        # Vectors :  hash(bytes(value)) so different arrays are distinct
+        if np.ndim(self.value) == 0:
+            return hash(float(self.value))
+        return hash(self.value.tobytes())
 
 class VectorTrialFunction(Expression):
     is_trial = True
