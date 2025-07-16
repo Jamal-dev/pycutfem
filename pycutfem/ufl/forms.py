@@ -47,7 +47,7 @@ class BoundaryCondition:
         self.value = value
 
 def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None, 
-                  assembler_hooks=None, **kwargs):
+                  assembler_hooks=None,backend='jit', **kwargs):
     """
     High-level function to assemble a weak form into a matrix and vector.
     """
@@ -57,7 +57,7 @@ def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None,
     
     # We no longer need to preprocess the form.
     # The compiler will handle the list of integrals directly.
-    compiler = FormCompiler(dof_handler, quad_order, assembler_hooks=assembler_hooks)
+    compiler = FormCompiler(dof_handler, quad_order, assembler_hooks=assembler_hooks, backend=backend)
     
     # This runs the full assembly process. K and F are created, and if hooks
     # are present, compiler.ctx['scalar_results'] is populated.

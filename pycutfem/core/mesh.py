@@ -355,14 +355,28 @@ class Mesh:
         return self.edges_list[edge_id]
 
     def tag_boundary_edges(self, tag_functions: Dict[str, Callable[[float, float], bool]]):
-        """Applies tags to boundary edges based on their midpoint location."""
-        for edge in self.edges_list:
-            if edge.right is None:
-                midpoint = self.nodes_x_y_pos[list(edge.nodes)].mean(axis=0)
-                for tag_name, func in tag_functions.items():
-                    if func(midpoint[0], midpoint[1]):
-                        edge.tag = tag_name
-                        break
+        """
+        Tag every *boundary* edge ( `edge.right is None` ) and – **new** –
+        build / refresh the private `_edge_bitsets` cache so that
+
+            >>> mesh.edge_bitset('right_wall')
+
+        is an **O(1)** dictionary lookup instead of a fresh scan.
+        """
+        n_edges          = len(self.edges_list)
+        tag_masks        = {t: np.zeros(n_edges, bool) for t in tag_functions}
+        for e in self.edges_list:
+            if e.right is not None:                  # interior → skip
+                continue
+            mpx, mpy   = self.nodes_x_y_pos[list(e.nodes)].mean(axis=0)
+            for tag, locator in tag_functions.items():
+                if locator(mpx, mpy):
+                    e.tag            = tag
+                    tag_masks[tag][e.gid] = True
+                    break
+
+        # refresh / create the cache ---------------------------------
+        self._edge_bitsets = {tag: BitSet(mask) for tag, mask in tag_masks.items()}
     
     def tag_edges(self, tag_functions: Dict[str, Callable[[float, float], bool]], overwrite=True):
         """

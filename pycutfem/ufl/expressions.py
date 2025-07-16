@@ -537,13 +537,23 @@ class TestFunction(Function):
  
 
 class Constant(Expression, numbers.Number):
-    def __init__(self, value, dim: int = 0):
+    def __init__(self, value, dim: int = None):
         # Call the __init__ of the next class in the Method Resolution Order (MRO)
         # This ensures all parent classes are properly initialized
         super().__init__() 
         
         self.value = value
-        self.dim = dim
+        temp_value = np.asarray(value)
+        if dim is None:
+            if temp_value.ndim == 0:
+                self.dim = 0
+                self.value = float(value)  # Convert scalar to float
+            else:
+                self.dim = temp_value.ndim
+                self.value = np.asarray(value, dtype=float)
+        else:
+            self.dim = dim
+            if dim >0: self.value = np.asarray(value, dtype=float)
         self.role = 'none'
     @property
     def shape(self):

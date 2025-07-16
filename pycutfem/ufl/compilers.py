@@ -739,6 +739,11 @@ class FormCompiler:
                 logger.info(f"Assembling ghost edge integral: {integral}")
                 self._assemble_ghost_edge(integral, target)
                 continue
+            if integral.measure.domain_type == "exterior_facet":
+                logger.info(f"Assembling exterior-facet integral: {integral}")
+                self._assemble_boundary_edge(integral, target)
+                continue
+
             if integral.measure.domain_type not in ["volume", "interface","ghost_edge"]:
                 logger.warning(f"Skipping unsupported integral type: {integral.measure.domain_type}")
                 raise NotImplementedError(f"Unsupported integral type: {integral.measure.domain_type}")
@@ -1388,3 +1393,83 @@ class FormCompiler:
             self._assemble_ghost_edge_jit(intg, matvec)
         else:
             raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+
+
+    # inside FormCompiler -------------------------------------------------
+    def _assemble_boundary_edge(self, intg: Integral, matvec):
+        """
+        Assemble ∫_Γ  f  dS   over a *set* of boundary edges  Γ  (Neumann BC,
+        surface traction in elasticity, etc.).  Works for bilinear, linear
+        and scalar functional forms – scalar forms can be captured with the
+        same “assembler_hooks” mechanism used for interfaces / ghost edges.
+        """
+        if self.backend == "jit":
+            raise NotImplementedError("dS + JIT not wired yet")
+
+        rhs   = self.ctx.get("rhs", False)
+        mesh  = self.me.mesh
+        qdeg  = self._find_q_order(intg)
+        hook  = self.ctx["hooks"].get(type(intg.integrand))
+        trial, test = _trial_test(intg.integrand)
+        is_functional = hook and trial is None and test is None
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {})[hook["name"]] = 0.0
+
+        # decide which edges we visit -------------------------------------
+        defined = intg.measure.defined_on
+        edge_ids = (defined.to_indices() if defined is not None
+                    else np.fromiter((e.right is None for e in mesh.edges_list), bool).nonzero()[0])
+
+        fields = _all_fields(intg.integrand)
+
+        for gid in edge_ids:
+            edge   = mesh.edge(gid)
+            eid    = edge.left                      # the unique owner element
+            p0, p1 = mesh.nodes_x_y_pos[list(edge.nodes)]
+            qp, qw = line_quadrature(p0, p1, qdeg)  # *weights already in phys. space*
+
+            # outward normal of the *element*:
+            n = edge.normal.copy()
+            if np.dot(n, np.asarray(mesh.elements_list[eid].centroid()) - qp[0]) < 0:
+                n *= -1.0
+            self.ctx["normal"] = n                  # constant along that edge
+
+            # precompute element dofs once
+            gdofs = self.dh.get_elemental_dofs(eid)
+
+            # ------------------------------------------------------------------
+            loc = None
+            for x_phys, w in zip(qp, qw):
+                xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
+                JiT     = np.linalg.inv(transform.jacobian(mesh, eid, (xi, eta))).T
+
+                # basis cache ---------------------------------------------------
+                self._basis_cache.clear()
+                for f in fields:
+                    self._basis_cache[f] = {
+                        "val" : self.me.basis      (f, xi, eta),
+                        "grad": self.me.grad_basis (f, xi, eta) @ JiT
+                    }
+
+                # context for visitors
+                self.ctx.update({"eid": eid, "x_phys": x_phys})
+
+                val = self._visit(intg.integrand)    # scalar, vec, or matrix
+                loc = (w * np.asarray(val)           # **NO detJ re-multiplication!**
+                    if loc is None else loc + w * np.asarray(val))
+
+            # ---------------- scatter -----------------------------------------
+            if rhs and test:                   # linear form  (vector assemble)
+                np.add.at(matvec, gdofs, loc)
+            elif not rhs and trial and test:   # bilinear form (matrix assemble)
+                r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
+                matvec[r, c] += loc
+            elif is_functional:               # hooked scalar functional
+                if isinstance(loc, VecOpInfo):    # collapse (k,n) → scalar
+                    loc = np.sum(loc.data, axis=1)
+                self.ctx["global_dofs"] = gdofs
+                self.ctx["scalar_results"][hook["name"]] += loc
+
+        # tidy
+        for k in ("eid", "x_phys", "normal", "global_dofs"):
+            self.ctx.pop(k, None)

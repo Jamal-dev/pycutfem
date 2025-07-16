@@ -1,6 +1,7 @@
 """pycutfem.integration.quadrature
 Unified quadrature provider for 1‑D, triangles, and quads (any Gauss order ≥1).
 """
+# pycutfem.integration.quadrature
 import numpy as np
 from functools import lru_cache
 from numpy.polynomial.legendre import leggauss
