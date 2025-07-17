@@ -5,8 +5,14 @@ from __future__ import annotations
 import numpy as np
 import matplotlib.tri as mtri
 from typing import List
+from itertools import chain
 
-def triangulate_field(mesh, dof_handler, field: str, *, strict: bool = False) -> mtri.Triangulation:
+
+
+# triangulate.py  – robust per‑field connectivity
+
+
+def triangulate_field(mesh, dof_handler, field: str, *, strict=False):
     """
     Build a Matplotlib Triangulation that matches the DOFs of ``field``.
 
@@ -21,41 +27,42 @@ def triangulate_field(mesh, dof_handler, field: str, *, strict: bool = False) ->
     field       : str        – field name (e.g. 'ux', 'p')
     strict      : bool       – raise instead of skipping incomplete elements
     """
-    # 1.  Global DOFs and their coordinates in *field order*
-    gdofs   = dof_handler.get_field_slice(field)                     # list[int]  :contentReference[oaicite:0]{index=0}
-    node_ids: List[int] = [dof_handler._dof_to_node_map[d][1] for d in gdofs]  # mapping stored during build :contentReference[oaicite:1]{index=1}
-    coords  = mesh.nodes_x_y_pos[node_ids]                           # shape (n,2)
-    x, y    = coords[:, 0], coords[:, 1]
+    # ------------------------------------------------------------------
+    # 1.  Coordinates of *all* DOFs that belong to <field>
+    # ------------------------------------------------------------------
+    gdofs   = dof_handler.get_field_slice(field)
+    node_ids = [dof_handler._dof_to_node_map[d][1] for d in gdofs]
+    coords   = mesh.nodes_x_y_pos[node_ids]
+    x, y     = coords[:,0], coords[:,1]
 
-    # helper: map physical node-id → local index (0…n-1)
     id2local = {nid: i for i, nid in enumerate(node_ids)}
+    tris     = []
 
-    # 2.  Element-wise connectivity (remapped to local indices)
-    tris = []
-    if mesh.element_type == "tri":
-        for tri in mesh.corner_connectivity:
-            try:
-                tris.append([id2local[tri[0]], id2local[tri[1]], id2local[tri[2]]])
-            except KeyError:
-                if strict: raise ValueError("Field missing a triangle corner node.")
-                continue
-    elif mesh.element_type == "quad":
-        for quad in mesh.corner_connectivity:
-            try:
-                # split into two triangles (0-1-3, 1-2-3)
-                tris.append([id2local[quad[0]], id2local[quad[1]], id2local[quad[3]]])
-                tris.append([id2local[quad[1]], id2local[quad[2]], id2local[quad[3]]])
-            except KeyError:
-                if strict: raise ValueError("Field missing a quadrilateral corner node.")
-                continue
-    else:
-        raise KeyError(f"Unsupported element_type '{mesh.element_type}'")
+    # ------------------------------------------------------------------
+    # 2.  Element‑wise triangulation that respects field DOFs
+    # ------------------------------------------------------------------
+    elem_maps = dof_handler.element_maps[field]
+    for eid, edofs in enumerate(elem_maps):
+        if len(edofs) < 3:
+            if strict: raise ValueError(f"Element {eid} has <3 DOFs for '{field}'.")
+            continue
 
-    # 3.  Fallback: if *many* elements were skipped, rely on Delaunay
-    if len(tris) < max(1, len(coords) // 5):        # heuristic – tweak if desired
-        return mtri.Triangulation(x, y)
+        local_ids   = [id2local[dof_handler._dof_to_node_map[d][1]] for d in edofs]
+        sub_coords  = coords[local_ids]
 
-    return mtri.Triangulation(x, y, np.asarray(tris, dtype=int))
+        # local Delaunay (matplotlib already has a C implementation)
+        sub_tri = mtri.Triangulation(sub_coords[:,0], sub_coords[:,1])
+        tris.extend([[local_ids[i] for i in tri]            # lift to global
+                     for tri in sub_tri.triangles])
+
+    # ------------------------------------------------------------------
+    # 3.  Deduplicate and hand off to Matplotlib
+    # ------------------------------------------------------------------
+    if not tris:
+        raise RuntimeError(f"Could not build connectivity for field '{field}'.")
+    tris_arr = np.unique(np.sort(np.asarray(tris, dtype=int), axis=1), axis=0)
+    return mtri.Triangulation(x, y, tris_arr)
+
 
 
 def _extract_profile_1d(field_name: str,

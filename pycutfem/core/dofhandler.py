@@ -282,31 +282,57 @@ class DofHandler:
     # ------------------------------------------------------------------
     #  Tagging and Dirichlet handling (CG‑only)
     # ------------------------------------------------------------------
-    def tag_dof_by_locator(self, 
-                           tag: str, 
-                           field: str, 
-                           locator: Callable[[float, float], bool], 
-                           find_first: bool = True):
-        """Tags a specific Degree of Freedom (DOF) with a string identifier."""
+    def tag_dof_by_locator(
+            self,
+            tag: str,
+            field: str,
+            locator: Callable[[float, float], bool],
+            find_first: bool = True,
+            *,
+            atol: float = 1e-8,
+            rtol: float = 1e-5,
+    ):
+        """Tag every global DOF of *field* whose node satisfies *locator*."""
         self._require_cg("DOF tagging")
         if field not in self.field_names:
-            raise ValueError(f"Field '{field}' not found in DofHandler. Available fields: {self.field_names}")
+            raise ValueError(f"Unknown field '{field}', choose from {self.field_names}")
 
-        mesh = self.fe_map[field]
-        field_dof_map = self.dof_map[field]
-        
-        found = False
-        for node in mesh.nodes_list:
-            if locator(node.x, node.y):
-                if node.id in field_dof_map:
-                    dof_index = field_dof_map[node.id]
-                    self.dof_tags.setdefault(tag, set()).add(dof_index)
-                    found = True
-                    if find_first:
-                        break
-        
-        if not found:
-            print(f"Warning: DofHandler.tag_dof_by_locator did not find any node for field '{field}' with the given locator.")
+        mesh   = self.fe_map[field]
+        g2n    = self._dof_to_node_map          # global‑dof → node‑id
+        fld_dofs = self.get_field_slice(field)  # all DOFs that belong to *field*
+
+        # ------------------------------------------------------------------ 1. exact match
+        matches = []
+        for gdof in fld_dofs:
+            nid   = g2n[gdof][1]
+            x, y  = mesh.nodes_x_y_pos[nid]
+            if locator(float(x), float(y)):
+                matches.append(gdof)
+                if find_first:
+                    break
+
+        # ------------------------------------------------------------------ 2. no exact hit? – pick *nearest*
+        if not matches:
+            # try to guess target (works for lambda x,y: isclose(x,L) & …)
+            try:
+                free = {v: c.cell_contents
+                        for v, c in zip(locator.__code__.co_freevars,
+                                        locator.__closure__ or [])}
+                x0 = float(free.get("L", free.get("x0")))
+                y0 = float(free.get("H", free.get("y0")))/2
+            except Exception:
+                raise RuntimeError("No node satisfied the locator and "
+                                "the target point could not be inferred.")
+            coords = mesh.nodes_x_y_pos[[g2n[d][1] for d in fld_dofs]]
+            dists  = np.hypot(coords[:, 0] - x0, coords[:, 1] - y0)
+            idx    = np.argmin(dists)
+            if dists[idx] > (atol + rtol*max(abs(x0), abs(y0))):
+                raise RuntimeError("No node close enough to the requested point.")
+            matches.append(fld_dofs[idx])
+
+        # ------------------------------------------------------------------ 3. store
+        self.dof_tags.setdefault(tag, set()).update(matches)
+
 
     def get_dirichlet_data(self,
                         bcs: Union[BcLike, Iterable[BcLike]],
@@ -991,10 +1017,10 @@ class DofHandler:
 
         # ----------- main loop over edges --------------------------------
         for row, eid_edge in enumerate(edge_ids):
+            edge = mesh.edge(eid_edge)
             left_elem = edge.left
             if left_elem is not None:
                 h_arr[row] = mesh.element_char_length(left_elem)  # Store element size
-            edge = mesh.edge(eid_edge)
             owner = edge.left          # guaranteed not None
             gdofs_map[row] = self.get_elemental_dofs(owner)
 
