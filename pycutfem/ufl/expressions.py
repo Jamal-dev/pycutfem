@@ -1033,6 +1033,14 @@ class Dot(Expression):
     def __repr__(self): return f"Dot({self.a!r}, {self.b!r})"
 
 
+class CellDiameter(Expression):
+    """Return element‑wise √area — identical to mesh.element_char_length(eid)."""
+    def __init__(self):
+        super().__init__()
+        self.role = "none"
+
+
+
 
 # --- Helper functions to create operator instances ---
 def grad(v): return Grad(v)

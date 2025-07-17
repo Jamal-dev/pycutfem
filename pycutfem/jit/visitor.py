@@ -4,12 +4,13 @@ from pycutfem.ufl.expressions import (
     VectorTestFunction, VectorTrialFunction, VectorFunction,
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, 
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
-    ElementWiseConstant, Transpose as UFLTranspose
+    ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
-    LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose
+    LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
+    CellDiameter
 )
 from dataclasses import replace
 import logging
@@ -81,17 +82,18 @@ class IRGenerator:
 
         if isinstance(node, (Sum, Sub, Prod, UflDiv)):
             self._visit(node.a, side=side)
+            self._visit(node.b, side=side)
             if isinstance(node, UflDiv):
-                if not isinstance(node.b, Constant):
-                    raise NotImplementedError("JIT compilation for division by non-constants is not supported.")
-                self._visit(Constant(1.0 / node.b.value), side=side)
-                op_symbol = '*'
+                op_symbol = '/'
             else:
-                self._visit(node.b, side=side)
+                # op_symbol = {Sum: '+', Sub: '-', Prod: '*'}.get(type(node), '/')
                 op_symbol = {Sum: '+', Sub: '-', Prod: '*'}.get(type(node), '/')
             self.ir_sequence.append(BinaryOp(op_symbol=op_symbol))
             return
             
+        if isinstance(node, UFLCellDiameter):           # ==> your Expression
+            self.ir_sequence.append(CellDiameter())     # push scalar at runtime
+            return
         if isinstance(node, (UflInner, UflDot)):
             self._visit(node.a, side=side)
             self._visit(node.b, side=side)

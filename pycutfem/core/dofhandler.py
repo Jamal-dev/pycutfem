@@ -618,9 +618,11 @@ class DofHandler:
         J_inv = np.zeros((num_elements, num_quad_points, spatial_dim, spatial_dim))
         phis = np.zeros((num_elements, num_quad_points)) if level_set else None
         normals = np.zeros((num_elements, num_quad_points, spatial_dim)) # Placeholder
+        h_arr = np.zeros((num_elements,))  # Placeholder for h-array
 
         # 3. Loop over all elements and quadrature points
         for e_idx in range(num_elements):
+            h_arr[e_idx] = mesh.element_char_length(e_idx)  # Store element size
             for q_idx, (qp, qw) in enumerate(zip(qp_ref, qw_ref)):
                 xi_tuple = tuple(qp)
 
@@ -649,6 +651,7 @@ class DofHandler:
             "J_inv": J_inv,
             "normals": normals,
             "phis": phis,
+            "h_arr": h_arr,
         }
     
     
@@ -730,10 +733,11 @@ class DofHandler:
         fields  = me.field_names            # ['vx', 'vy', …]
         b_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local))         for f in fields}
         g_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local, 2))      for f in fields}
-
+        h_arr = np.zeros((n_elems,))  # Placeholder for element sizes
 
         # --- Loop over valid cut elements ---
         for k, eid in enumerate(valid_cut_eids):
+            h_arr[eid] = mesh.element_char_length(eid)  # Store element size
             elem = mesh.elements_list[eid]
             p0, p1 = elem.interface_pts
 
@@ -764,7 +768,7 @@ class DofHandler:
             'eids': np.array(valid_cut_eids, dtype=int),
             # 'eids': np.arange(mesh.n_elements, dtype=int),  # All elements, not just cut
             'qp_phys': qp_phys, 'qw': qw, 'normals': normals, 'phis': phis,
-            'detJ': detJ_arr, 'J_inv': Jinv_arr,
+            'detJ': detJ_arr, 'J_inv': Jinv_arr, 'h_arr': h_arr,
         }
         for fld in fields:
             out[f"b_{fld}"] = b_tabs[fld]
@@ -845,8 +849,20 @@ class DofHandler:
                     key = f"d{dx}{dy}_{fld}_{side}"
                     basis_tables[key] = np.zeros((n_edges, n_q, me._n_basis[fld]))
 
+        h_arr = np.zeros((n_edges,))  # Placeholder for element sizes
         # ---------------------------------- main loop over valid edges
         for i, edge in enumerate(valid_edges):
+            left_elem = mesh.edge(edge.left)
+            right_elem = mesh.edge(edge.right)
+            if left_elem is not None:
+                h_left = mesh.element_char_length(left_elem)
+            else:
+                h_left = 0.0
+            if right_elem is not None:
+                h_right = mesh.element_char_length(right_elem)
+            else:
+                h_right = 0.0
+            h_arr[i] = max(h_left, h_right)  # Store element size
             # 1. (+) and (‑) element ids
             phi_left = level_set(np.asarray(mesh.elements_list[edge.left].centroid()))
             pos_eid, neg_eid = (edge.left, edge.right) if phi_left >= 0 else (edge.right, edge.left)
@@ -915,6 +931,7 @@ class DofHandler:
             "detJ":        0.5 * (detJ_pos + detJ_neg),
             "J_inv":       0.5 * (J_inv_pos + J_inv_neg),
             "phis":        phi_arr,
+            "h_arr":      h_arr,
         }
         out.update(basis_tables)
         return out
@@ -956,22 +973,27 @@ class DofHandler:
         qp_rep, qw_rep = line_quadrature(p0, p1, qdeg)
         n_q   = len(qw_rep)
         n_loc = me.n_dofs_local
+        n_edges = len(edge_ids)
 
         # ----------- bulk workspaces ------------------------------------
-        qp_phys  = np.zeros((len(edge_ids), n_q, 2))
-        qw       = np.zeros((len(edge_ids), n_q))
-        normals  = np.zeros((len(edge_ids), n_q, 2))
-        detJ_arr = np.zeros((len(edge_ids), n_q))
-        phi_arr = np.zeros((len(edge_ids), n_q)) 
-        Jinv_arr = np.zeros((len(edge_ids), n_q, 2, 2))
-        gdofs_map = np.zeros((len(edge_ids), n_loc), dtype=np.int32)
+        qp_phys  =  np.zeros((n_edges, n_q, 2))
+        qw       =  np.zeros((n_edges, n_q))
+        normals  =  np.zeros((n_edges, n_q, 2))
+        detJ_arr =  np.zeros((n_edges, n_q))
+        phi_arr =   np.zeros((n_edges, n_q))
+        Jinv_arr =  np.zeros((n_edges, n_q, 2, 2))
+        gdofs_map = np.zeros((n_edges, n_loc), dtype=np.int32)
+        h_arr = np.zeros((n_edges,))  # Placeholder for element sizes
 
         # basis / derivative tables
-        basis_tabs = {f"d{dx}{dy}_{fld}": np.zeros((len(edge_ids), n_q, n_loc))
+        basis_tabs = {f"d{dx}{dy}_{fld}": np.zeros((n_edges, n_q, n_loc))
                       for fld in fields for (dx, dy) in derivs}
 
         # ----------- main loop over edges --------------------------------
         for row, eid_edge in enumerate(edge_ids):
+            left_elem = edge.left
+            if left_elem is not None:
+                h_arr[row] = mesh.element_char_length(left_elem)  # Store element size
             edge = mesh.edge(eid_edge)
             owner = edge.left          # guaranteed not None
             gdofs_map[row] = self.get_elemental_dofs(owner)
@@ -1003,7 +1025,7 @@ class DofHandler:
                "qp_phys": qp_phys, "qw": qw, "normals": normals,
                "detJ": detJ_arr, "J_inv": Jinv_arr,
                "gdofs_map": gdofs_map,
-               "phis": phi_arr # phi is just a placeholder here with 0 values 
+               "phis": phi_arr, "h_arr": h_arr
                }
         out.update(basis_tabs)
 

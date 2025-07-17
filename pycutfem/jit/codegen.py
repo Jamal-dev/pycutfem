@@ -6,7 +6,7 @@ from matplotlib.pylab import f
 from .ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
-    BinaryOp, Inner, Dot, Store, Transpose
+    BinaryOp, Inner, Dot, Store, Transpose, CellDiameter
 )
 from pycutfem.jit.symbols import encode
 import numpy as np
@@ -47,7 +47,11 @@ def _mul_scalar_vector(self,first_is_scalar,res_var,a, b, body_lines, stack):
     vect   = b if first_is_scalar else a
 
     if scalar.shape != ():
-        raise ValueError("Scalar operand must truly be scalar")
+        raise ValueError(f"Scalar operand must truly be scalar shapes: {getattr(scalar, 'shape', None)} / {getattr(vect, 'shape', None)},"
+                         f" role: {getattr(scalar, 'role', None)}, {getattr(vect, 'role', None)}"
+                         f", is_vector: {getattr(scalar, 'is_vector', None)}, {getattr(vect, 'is_vector', None)}"
+                         f", is_gradient: {getattr(scalar, 'is_gradient', None)}, {getattr(vect, 'is_gradient', None)}"
+                         f", Bilinear form" if self.form_rank == 2 else ", Linear form")
 
     res_shape = vect.shape
     # Collapse (1,n) only for rank-1 or rank-0 forms
@@ -334,6 +338,18 @@ class NumbaCodeGen:
                 # body_lines.append(f"{np_array_var} = np.array({op.name}, dtype=np.float64)")
                 body_lines.append(f"{np_array_var} = {op.name}")
                 stack.append(StackItem(var_name=np_array_var, role='const', shape=op.shape, is_vector=is_vec, field_names=[]))
+            
+            elif isinstance(op, CellDiameter):
+                res = new_var("h")
+                body_lines.append(f"{res} = h_arr[eid]")    # h_arr provided by pre‑compute
+                stack.append(StackItem(var_name=res,
+                                    shape=(),
+                                    is_vector=False,
+                                    role='const',
+                                    is_gradient=False))
+                if "h_arr" not in required_args:
+                    required_args.add("h_arr")
+
 
 
             # --- UNARY OPERATORS ---
@@ -454,7 +470,7 @@ class NumbaCodeGen:
                 # ---------------------------------------------------------------
                 print(f"Div: a.shape={a.shape}, a.role={a.role},a.is_vector={a.is_vector}, a.is_gradient={a.is_gradient}")
                 if a.role in ("test", "trial") and a.shape[0] ==2 and a.is_gradient:
-                    print("hello "*10)
+                    # print("hello "*10)
                     body_lines.append("# Div(basis) → scalar basis (1,n_loc)")
 
                     body_lines += [
@@ -815,11 +831,73 @@ class NumbaCodeGen:
                 # dot( u_k ,  u_test )          ← load-vector term -> (n,)
                 # ---------------------------------------------------------------------
                 elif a.role == 'value' and a.is_vector and b.role == 'test' and b.is_vector:
-                    body_lines.append("# RHS: dot(Function, Test)")
-                    # body_lines.append(f"print(f'a.shape: {{{a.var_name}.shape}}, b.shape: {{{b.var_name}.shape}}')")
-                    body_lines.append(f"{res_var} = {b.var_name}.T.copy() @ {a.var_name}")
-                    stack.append(StackItem(var_name=res_var, role='value',
-                                        shape=(b.shape[1],), is_vector=False,is_gradient=False))
+                    if self.form_rank == 2:
+                        body_lines.append("# LHS: dot(Function, Test) (k,n)·(k) -> (1,n)")
+                        shape = (1, b.shape[1])
+                        role = 'test'
+                        body_lines += [f"{res_var} = np.zeros((1,{b.shape[1]}), dtype=np.float64)",
+                                        f"for n in range({b.shape[1]}):",
+                                        f"    {res_var}[0, n] = np.sum({a.var_name}[:, n] * {b.var_name})"]
+                    elif self.form_rank == 1:
+                        body_lines.append("# RHS: dot(Function, Test)")
+                        body_lines.append(f"{res_var} = {a.var_name}.T.copy() @ {b.var_name}")
+                        shape = (b.shape[1],)
+                        role = 'value'
+                    stack.append(StackItem(var_name=res_var, role=role,
+                                        shape=shape, is_vector=False,is_gradient=False))
+
+                # ---------------------------------------------------------------------
+                # dot( u_test ,  u_k )          ← load-vector term -> (n,)
+                # ---------------------------------------------------------------------
+                elif a.role == 'test' and a.is_vector and b.role == 'value' and b.is_vector:
+                    if self.form_rank == 2:
+                        body_lines.append("# LHS: dot(Test, Function) (k,n)·(k) -> (1,n)")
+                        shape = (1, a.shape[1])
+                        role = 'test'
+                        body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype=np.float64)",
+                                        f"for n in range({a.shape[1]}):",
+                                        f"    {res_var}[0, n] = np.sum({a.var_name}[:, n] * {b.var_name})"]
+                    elif self.form_rank == 1:
+                        body_lines.append("# RHS: dot(Test, Function)")
+                        body_lines.append(f"{res_var} = {b.var_name}.T.copy() @ {a.var_name}")
+                        shape = (a.shape[1],)
+                        role = 'value'
+                    stack.append(StackItem(var_name=res_var, role=role,
+                                        shape=shape, is_vector=False,is_gradient=False))
+                # ---------------------------------------------------------------------
+                # dot( u_test ,  const_vec )          ← load-vector term -> (n,)
+                # ---------------------------------------------------------------------
+                elif a.role == 'test' and a.is_vector and b.role == 'const' and b.is_vector:
+                    if self.form_rank == 2:
+                        body_lines.append("# LHS: dot(Test, Const) (k,n)·(k) -> (1,n)")
+                        shape = (1, a.shape[1])
+                        role = 'test'
+                        body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype=np.float64)",
+                                        f"for n in range({a.shape[1]}):",
+                                        f"    {res_var}[0, n] = np.sum({a.var_name}[:, n] * {b.var_name})"]
+                        stack.append(StackItem(var_name=res_var, role=role,
+                                            shape=shape, is_vector=False,is_gradient=False))
+                    elif self.form_rank == 1:
+                        body_lines.append("# RHS: dot(Test, Const)")
+                        body_lines.append(f"{res_var} = {a.var_name}.T.copy() @ {b.var_name}")
+                        shape = (a.shape[1],)
+                        role = 'value'
+                        stack.append(StackItem(var_name=res_var, role=role,
+                                            shape=shape, is_vector=False,is_gradient=False))
+                # ---------------------------------------------------------------------
+                # dot( u_trial ,  const_vec )          ← load-vector term -> (1,n)
+                # ---------------------------------------------------------------------
+                elif a.role == 'trial' and a.is_vector and b.role == 'const' and b.is_vector:
+                   body_lines.append("# LHS: dot(Trial, Const) (k,n)·(k) -> (1,n)")
+                   shape = (1, a.shape[1])
+                   role = 'trial'
+                   body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype=np.float64)",
+                                   f"for n in range({a.shape[1]}):",
+                                   f"    {res_var}[0, n] = np.sum({a.var_name}[:, n] * {b.var_name})"]
+                   stack.append(StackItem(var_name=res_var, role=role,
+                                        shape=shape, is_vector=False,is_gradient=False))
+   
+
                 # ---------------------------------------------------------------------
                 # dot( value/const ,  value/const )          ← load-vector term -> (n,)
                 # ---------------------------------------------------------------------
@@ -862,7 +940,10 @@ class NumbaCodeGen:
                                         field_names=[]))
                 
                 else:
-                    raise NotImplementedError(f"Dot not implemented for roles {a.role}/{b.role} with shapes {a.shape}/{b.shape} with vectoors {a.is_vector}/{b.is_vector} and gradients {a.is_gradient}/{b.is_gradient}")
+                    raise NotImplementedError(f"Dot not implemented for roles {a.role}/{b.role} with shapes {a.shape}/{b.shape}"
+                                              f" with vectoors {a.is_vector}/{b.is_vector}"
+                                              f" and gradients {a.is_gradient}/{b.is_gradient}"
+                                              f", BilinearForm" if self.form_rank == 2 else ", LinearForm")
 
             elif isinstance(op, Transpose):
                 a = stack.pop()                   # operand descriptor
@@ -883,7 +964,7 @@ class NumbaCodeGen:
                     res_shape = (2, n, 1)
 
                 # -------- vector grad: (2,n_qp,2)  swap off-diagonals ------------
-                elif a.is_gradient and a.shape[0] == a.shape[2] == 2:
+                elif a.is_gradient and len(a.shape) == 3:
                     n = a.shape[1]
                     body_lines.extend([
                         f"{res} = {a.var_name}.copy();",
@@ -893,7 +974,7 @@ class NumbaCodeGen:
                     res_shape = a.shape  # still (2,n,2)
 
                 # -------- plain 2×2 matrix --------------------------------------
-                elif len(a.shape) == 2 and a.shape[0] == a.shape[1] == 2:
+                elif len(a.shape) == 2 :
                     body_lines.append(f"{res} = {a.var_name}.T.copy()")
                     res_shape = a.shape[::-1]
 

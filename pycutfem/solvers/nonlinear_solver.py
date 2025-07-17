@@ -25,6 +25,8 @@ import scipy.sparse as sp
 
 from pycutfem.jit import compile_backend
 from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
+from pycutfem.jit import compile_multi        # NEW import
+
 
 # ----------------------------------------------------------------------------
 #  Parameter dataclasses
@@ -110,10 +112,10 @@ class NewtonSolver:
         self._jacobian_form = jacobian_form
 
         # 1) compile kernels ------------------------------------------------
-        self._res_runner, self._res_ir = compile_backend(
+        self._res_runner, self._res_ir = compile_multi(
             residual_form, dof_handler=self.dh, mixed_element=self.me
         )
-        self._jac_runner, self._jac_ir = compile_backend(
+        self._jac_runner, self._jac_ir = compile_multi(
             jacobian_form, dof_handler=self.dh, mixed_element=self.me
         )
 
@@ -251,17 +253,23 @@ class NewtonSolver:
         static_args["node_coords"] = dh.get_all_dof_coords()
 
         # Basis / gradient lookup tables -------------------------------
+        jac_integrand = (self._jacobian_form.integrals[0].integrand
+                  if hasattr(self._jacobian_form, "integrals")
+                  else self._jacobian_form.integrand)
         basis_jac = _build_jit_kernel_args(
             self._jac_ir,
-            self._jacobian_form.integrand,
+            jac_integrand,
             me,
             quad_order,
             dh,
             param_order=self._jac_runner.param_order,
         )
+        res_integrand = (self._residual_form.integrals[0].integrand
+                  if hasattr(self._residual_form, "integrals")
+                  else self._residual_form.integrand)
         basis_res = _build_jit_kernel_args(
             self._res_ir,
-            self._residual_form.integrand,
+            res_integrand,
             me,
             quad_order,
             dh,

@@ -157,3 +157,40 @@ def compile_backend(integral_expression, dof_handler,mixed_element ): # New Newt
     # New Newton: Return the runner, not the raw kernel
     runner = KernelRunner(kernel, param_order, ir_sequence, dof_handler)
     return runner, ir_sequence
+
+
+# ----------------------------------------------------------------------
+#  Convenience: accept a Form with N>1 integrals
+# ----------------------------------------------------------------------
+def compile_multi(integral_form, *, dof_handler, mixed_element):
+    """
+    Accepts a Form with any number of integrals, compiles a kernel for
+    each, and returns a *single* KernelRunner that adds their element
+    contributions.
+
+    The returned (runner, ir_list) mimics compile_backend().
+    """
+    if not hasattr(integral_form, "integrals") or len(integral_form.integrals) == 1:
+        # nothing special – fallback to the old routine
+        return compile_backend(integral_form, dof_handler, mixed_element)
+
+    sub_runners = []
+    ir_list     = []
+    for I in integral_form.integrals:
+        r, ir = compile_backend(I.integrand, dof_handler, mixed_element)
+        sub_runners.append(r);  ir_list.append(ir)
+
+    # -------- combined runner ----------------------------------------
+    def combined_runner(coeffs: dict, static_args: dict):
+        K_sum = F_sum = J_sum = None
+        for sub in sub_runners:
+            K, F, J = sub(coeffs, static_args)
+            if K_sum is None:
+                K_sum, F_sum, J_sum = K, F, J
+            else:
+                K_sum += K;  F_sum += F;  J_sum += J
+        return K_sum, F_sum, J_sum
+
+    # We re‑use the PARAM_ORDER of the first kernel; they all match.
+    combined_runner.param_order = sub_runners[0].param_order
+    return combined_runner, ir_list[0]           # ir only needed for basis tables

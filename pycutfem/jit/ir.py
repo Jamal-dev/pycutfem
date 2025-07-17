@@ -89,3 +89,7 @@ class LoadConstantArray:
 class Transpose:
     """IR instruction: transpose top-of-stack tensor."""
     pass
+
+@dataclass(frozen=True, slots=True)
+class CellDiameter:
+    pass

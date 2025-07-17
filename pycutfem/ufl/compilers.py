@@ -34,7 +34,8 @@ from pycutfem.ufl.expressions import (
     Function,    VectorFunction,
     Grad, DivOperation, Inner, Dot,
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
-    ElementWiseConstant, Derivative, Transpose
+    ElementWiseConstant, Derivative, Transpose,
+    CellDiameter
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -133,6 +134,7 @@ class FormCompiler:
             Jump: self._visit_Jump,
             Derivative        : self._visit_Derivative,
             Transpose: self._visit_Transpose,
+            CellDiameter: self._visit_CellDiameter
         }
 
     # ============================ PUBLIC API ===============================
@@ -456,13 +458,18 @@ class FormCompiler:
         return VecOpInfo(np.stack([div_vec]), role=role)
     
 
+    def _visit_CellDiameter(self, node):
+        eid = self.ctx["eid"]          # set by every volume / interface loop
+        return self.me.mesh.element_char_length(eid)
 
+    
     # ================= VISITORS: ALGEBRAIC ==========================
     def _visit_Sum(self, n): return self._visit(n.a) + self._visit(n.b)
     def _visit_Sub(self, n):
         a = self._visit(n.a)
         b = self._visit(n.b)
         return a - b
+    
     def _visit_Transpose(self, node:Transpose):
         mat = self._visit(node.A)               # recurse
         # NumPy ndarray  → just use .T
