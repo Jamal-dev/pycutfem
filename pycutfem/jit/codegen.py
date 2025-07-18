@@ -341,7 +341,7 @@ class NumbaCodeGen:
             
             elif isinstance(op, CellDiameter):
                 res = new_var("h")
-                body_lines.append(f"{res} = h_arr[e]")    # h_arr provided by pre‑compute
+                body_lines.append(f"{res} = h_arr[eid]")    # h_arr provided by pre‑compute
                 stack.append(StackItem(var_name=res,
                                     shape=(),
                                     is_vector=False,
@@ -557,7 +557,14 @@ class NumbaCodeGen:
                         body_lines.append(f'    {res_var} += {a.var_name}[k] @ {b.var_name}[k].T.copy()')
                     else:
                         body_lines.append(f'# Inner(Vec, Vec): mass matrix')
-                        body_lines.append(f'{res_var} = {a.var_name}.T.copy() @ {b.var_name}')
+                        if (len(a.shape) == 3 and a.shape[0] == 1
+                            and len(b.shape) == 3 and b.shape[0] == 1):
+                            # Gradients of scalar fields: collapse leading dim
+                            body_lines.append(
+                                f'{res_var} = {a.var_name}[0] @ {b.var_name}[0].T.copy()')
+                        else:
+                            body_lines.append(
+                                f'{res_var} = {a.var_name}.T.copy() @ {b.var_name}')
                 # elif a.role == 'const' and b.role == 'const' and a.shape == b.shape:
                 #     body_lines.append(f'# Inner(Const, Const): element-wise product')
                 #     body_lines.append(f'{res_var} = {a.var_name} * {b.var_name}')
@@ -749,6 +756,17 @@ class NumbaCodeGen:
                     ]
                     stack.append(StackItem(var_name=res_var, role='trial',
                                         shape=(b.shape[0], b.shape[1]), is_vector=True,
+                                        is_gradient=False, field_names=b.field_names,
+                                        parent_name=b.parent_name))
+                elif a.role == 'value' and a.is_vector and b.role == 'trial' \
+                        and len(b.shape) == 3 and b.shape[0] == 1:
+                    body_lines.append("# dot(Function, grad(Trial scalar))")
+                    body_lines += [
+                        f"{res_var} = np.zeros((1, {b.shape[1]}), dtype=np.float64)",
+                        f"{res_var}[0] = {a.var_name} @ {b.var_name}[0].T.copy()",
+                    ]
+                    stack.append(StackItem(var_name=res_var, role='trial',
+                                        shape=(1, b.shape[1]), is_vector=False,
                                         is_gradient=False, field_names=b.field_names,
                                         parent_name=b.parent_name))
 
