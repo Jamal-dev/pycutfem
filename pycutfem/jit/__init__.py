@@ -163,34 +163,50 @@ def compile_backend(integral_expression, dof_handler,mixed_element ): # New Newt
 #  Convenience: accept a Form with N>1 integrals
 # ----------------------------------------------------------------------
 def compile_multi(integral_form, *, dof_handler, mixed_element):
-    """
-    Accepts a Form with any number of integrals, compiles a kernel for
-    each, and returns a *single* KernelRunner that adds their element
-    contributions.
+    """Compile all integrals of ``integral_form`` separately.
 
-    The returned (runner, ir_list) mimics compile_backend().
+    The returned object behaves like a normal :func:`compile_backend`
+    runner but additionally exposes the list of sub‑runners via the
+    ``runners`` attribute.  This is useful for solvers that want to
+    drive the assembly integral by integral.
     """
+
     if not hasattr(integral_form, "integrals") or len(integral_form.integrals) == 1:
-        # nothing special – fallback to the old routine
-        return compile_backend(integral_form, dof_handler, mixed_element)
+        runner, ir = compile_backend(integral_form, dof_handler, mixed_element)
+        runner.runners = [runner]
+        return runner, [ir]
 
     sub_runners = []
     ir_list     = []
     for I in integral_form.integrals:
         r, ir = compile_backend(I.integrand, dof_handler, mixed_element)
-        sub_runners.append(r);  ir_list.append(ir)
+        sub_runners.append(r)
+        ir_list.append(ir)
 
-    # -------- combined runner ----------------------------------------
-    def combined_runner(coeffs: dict, static_args: dict):
-        K_sum = F_sum = J_sum = None
-        for sub in sub_runners:
-            K, F, J = sub(coeffs, static_args)
-            if K_sum is None:
-                K_sum, F_sum, J_sum = K, F, J
-            else:
-                K_sum += K;  F_sum += F;  J_sum += J
-        return K_sum, F_sum, J_sum
+    class CombinedRunner:
+        def __init__(self, runners):
+            self.runners = runners
+            self.param_order = runners[0].param_order
 
-    # We re‑use the PARAM_ORDER of the first kernel; they all match.
-    combined_runner.param_order = sub_runners[0].param_order
-    return combined_runner, ir_list[0]           # ir only needed for basis tables
+        def __call__(self, coeffs: dict, static_args_list: list[dict]):
+            K_sum = F_sum = J_sum = None
+            for r, sa in zip(self.runners, static_args_list):
+                K, F, J = r(coeffs, sa)
+                if K_sum is None:
+                    K_sum, F_sum, J_sum = K, F, J
+                else:
+                    K_sum += K
+                    F_sum += F
+                    J_sum += J
+            return K_sum, F_sum, J_sum
+
+    return CombinedRunner(sub_runners), ir_list
+
+
+def runner_shapes(static_args: dict):
+    """Return (K_shape, F_shape) deduced from ``gdofs_map``."""
+    gmap = static_args.get("gdofs_map")
+    if gmap is None:
+        raise KeyError("static_args must contain 'gdofs_map' to derive shapes")
+    n_rows, n_union = gmap.shape
+    return (n_rows, n_union, n_union), (n_rows, n_union)

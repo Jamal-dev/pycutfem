@@ -119,8 +119,12 @@ class NewtonSolver:
             jacobian_form, dof_handler=self.dh, mixed_element=self.me
         )
 
+        # Normalise to lists for easier iteration later
+        self._res_runners = getattr(self._res_runner, "runners", [self._res_runner])
+        self._jac_runners = getattr(self._jac_runner, "runners", [self._jac_runner])
+
         # 2) pre‑compute static arguments (geometry, basis tables, …) -------
-        self.static_args = self._precompute_static_args(quad_order)
+        self._precompute_static_args(quad_order)
 
     # ------------------------------------------------------------------
     #  Public interface
@@ -210,11 +214,22 @@ class NewtonSolver:
             if aux_funcs:
                 current.update(aux_funcs)
 
-            # K_loc, _ = self._jac_runner(current, self.static_args)
-            K_loc = self._jac_runner(current, self.static_args)[0] 
-            # _, F_loc = self._res_runner(current, self.static_args)
-            F_loc = self._res_runner(current, self.static_args)[1]
-            A, R = self._assemble_system(K_loc, F_loc)
+            import scipy.sparse as sp
+            n_glob = dh.total_dofs
+            A = sp.csr_matrix((n_glob, n_glob))
+            R = np.zeros(n_glob)
+
+            # --- Jacobian contributions ---
+            for runner, sa in zip(self._jac_runners, self.static_args_jac):
+                K_loc = runner(current, sa)[0]
+                A_part, _ = self._assemble_system(K_loc, np.zeros((K_loc.shape[0], K_loc.shape[1])), sa["gdofs_map"])
+                A = A + A_part
+
+            # --- Residual contributions ---
+            for runner, sa in zip(self._res_runners, self.static_args_res):
+                F_loc = runner(current, sa)[1]
+                _, R_part = self._assemble_system(np.zeros((F_loc.shape[0], F_loc.shape[1])), F_loc, sa["gdofs_map"])
+                R += R_part
 
             norm_R = np.linalg.norm(R, ord=np.inf)
             print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}")
@@ -243,30 +258,30 @@ class NewtonSolver:
     # ------------------------------------------------------------------
     #  Static kernel arguments (geometry + basis tables, *not* coeffs)
     # ------------------------------------------------------------------
-    def _precompute_static_args(self, quad_order: int) -> Dict[str, np.ndarray]:
+    def _precompute_static_args(self, quad_order: int):
         """
-        Robust variant that                                                  
-            • works with dx, dΓ *and* dGhost                                  
-            • survives meshes without any ghost edges (place‑holders sent)    
-            • guarantees helpers_jit never sees a missing pos/neg map.        
+        Build and return static kernel arguments **per integral**.
         """
         import numpy as np
-        from typing import Dict, Optional
+        from typing import Optional
         from pycutfem.ufl.helpers import required_multi_indices
 
-        dh, me  = self.dh, self.me
-        self.union_dofs = dh.union_dofs  # e.g. 36 for P2-P2-P1
-        mesh    = me.mesh
+        dh, me = self.dh, self.me
+        self.union_dofs = dh.union_dofs
+        mesh = me.mesh
         ghost_ls: Optional[callable] = None
-        ghost_derivs: set            = set()
+        ghost_derivs: set = set()
+        interface_ls: Optional[callable] = None
 
         # ------------------------------------------------------ 1) scan integrals
         def _scan(ints):
-            nonlocal ghost_ls, ghost_derivs
+            nonlocal ghost_ls, ghost_derivs, interface_ls
             for I in ints:
                 if I.measure.domain_type == "ghost_edge":
                     ghost_ls      = I.measure.level_set
                     ghost_derivs |= required_multi_indices(I.integrand)
+                if I.measure.domain_type == "interface":
+                    interface_ls = I.measure.level_set
 
         _scan(self._jacobian_form.integrals
             if hasattr(self._jacobian_form, "integrals") else
@@ -277,92 +292,65 @@ class NewtonSolver:
 
         # ------------------------------------------------------ 2) place‑holders
         _empty_J = np.empty((0, 0, 2, 2))      # re‑usable singleton
-        pre_built = {                     # always at least the dummies
-            
-        }
-
-        # ------------------------------------------------------ 3) real ghost data
-        edge_ids = mesh.edge_bitset("ghost")
-        if ghost_ls is not None and edge_ids.cardinality():
-            ghost_geo = dh.precompute_ghost_factors(edge_ids,
-                                                    quad_order,
-                                                    ghost_ls,
-                                                    ghost_derivs)
-            pre_built.update(ghost_geo)       # overwrites the dummies
-
-        # ------------------------------------------------------ 4) cell‑wise geom
-        static_args: Dict[str, np.ndarray] = dh.precompute_geometric_factors(
-            quad_order
-        )
-        static_args["gdofs_map"] = np.vstack(
+        vol_geo = dh.precompute_geometric_factors(quad_order)
+        vol_geo["gdofs_map"] = np.vstack(
             [dh.get_elemental_dofs(e) for e in range(mesh.n_elements)]
         ).astype(np.int32)
-        static_args["node_coords"] = dh.get_all_dof_coords()
+        vol_geo["node_coords"] = dh.get_all_dof_coords()
 
-        # non‑mapping ghost quantities (J_inv_pos, detJ_neg, normals, …)
-        for k, v in pre_built.items():
-            if k not in {"pos_map", "neg_map", "gdofs_map"}:
-                static_args[k] = v
+        ghost_geo = {}
+        edge_ids = mesh.edge_bitset("ghost")
+        if ghost_ls is not None and edge_ids.cardinality():
+            ghost_geo = dh.precompute_ghost_factors(edge_ids, quad_order, ghost_ls, ghost_derivs)
 
-        # ------------------------------------------------------ 5) helper
-        def _add_tables(target, ir, integrand, param_order):
-            try:
-                target.update(
-                    _build_jit_kernel_args(ir, integrand,
-                                        me, quad_order, dh,
-                                        param_order=param_order,
-                                        pre_built=pre_built)   # <-- here!
-                )
-            except NameError as err:
-                # swallow ONLY “unknown Function …” – everything else re‑raise
-                if "unknown Function or VectorFunction" in str(err):
-                    return
-                raise
+        interface_geo = {}
+        if interface_ls is not None:
+            cut_eids = mesh.element_bitset("cut")
+            if cut_eids.cardinality():
+                interface_geo = dh.precompute_interface_factors(cut_eids, quad_order, interface_ls)
+                interface_geo["gdofs_map"] = vol_geo["gdofs_map"]
 
-        # ---------------- Jacobian -------------------------------------
-        basis_jac = {}
-        for I in (self._jacobian_form.integrals
-                if hasattr(self._jacobian_form, "integrals")
-                else [self._jacobian_form]):
-            _add_tables(basis_jac, self._jac_ir, I.integrand,
-                        self._jac_runner.param_order)
+        def _build(ir, integrand, runner, base):
+            args = dict(base)
+            args.update(
+                _build_jit_kernel_args(ir, integrand, me, quad_order, dh,
+                                       param_order=runner.param_order,
+                                       pre_built=base)
+            )
+            # pad tables to union size
+            n_union = self.union_dofs
+            for k, v in list(args.items()):
+                if not isinstance(v, np.ndarray) or v.ndim < 3:
+                    continue
+                if v.shape[-1] < n_union and v.shape[-2] != 2:
+                    pad = np.zeros(v.shape[:-1] + (n_union,), dtype=v.dtype)
+                    pad[..., :v.shape[-1]] = v
+                    args[k] = pad
+                elif v.shape[-2] < n_union and v.shape[-1] == 2:
+                    pad = np.zeros(v.shape[:-2] + (n_union, 2), dtype=v.dtype)
+                    pad[..., :v.shape[-2], :] = v
+                    args[k] = pad
+            return {k: v for k, v in args.items() if not k.endswith("_loc")}
 
-        # ---------------- Residual -------------------------------------
-        basis_res = {}
-        for I in (self._residual_form.integrals
-                if hasattr(self._residual_form, "integrals")
-                else [self._residual_form]):
-            _add_tables(basis_res, self._res_ir, I.integrand,
-                        self._res_runner.param_order)
+        self.static_args_jac = []
+        for ir, I, r in zip(self._jac_ir, self._jacobian_form.integrals, self._jac_runners):
+            base = vol_geo
+            if I.measure.domain_type == "ghost_edge":
+                base = ghost_geo
+            elif I.measure.domain_type == "interface":
+                base = interface_geo
+            self.static_args_jac.append(_build(ir, I.integrand, r, base))
 
-        # ------------------------------------------------------ 6) merge & strip
-        static_args.update(basis_jac)
-        static_args.update(basis_res)
+        self.static_args_res = []
+        for ir, I, r in zip(self._res_ir, self._residual_form.integrals, self._res_runners):
+            base = vol_geo
+            if I.measure.domain_type == "ghost_edge":
+                base = ghost_geo
+            elif I.measure.domain_type == "interface":
+                base = interface_geo
+            self.static_args_res.append(_build(ir, I.integrand, r, base))
 
-        # do *not* keep the run‑time coefficient vectors (…_loc)
-
-        # ------------------------------------------------------------------
-        # PAD every basis / gradient table to n_union columns
-        # ------------------------------------------------------------------
-        n_union = self.union_dofs
-        for k, v in list(static_args.items()):
-            if v.ndim < 3:           # geometry, maps, scalars – skip
-                continue
-
-            # Case A: scalar/vector bases  …, n_basis
-            if v.shape[-1] < n_union and v.shape[-2] != 2:
-                pad = np.zeros(v.shape[:-1] + (n_union,), dtype=v.dtype)
-                pad[..., : v.shape[-1]] = v
-                static_args[k] = pad
-                continue
-
-            # Case B: gradient bases      …, n_basis, 2
-            if v.shape[-2] < n_union and v.shape[-1] == 2:
-                pad = np.zeros(v.shape[:-2] + (n_union, 2), dtype=v.dtype)
-                pad[..., : v.shape[-2], :] = v
-                static_args[k] = pad
-        return {k: v for k, v in static_args.items()
-                if not k.endswith("_loc")}
+        return
 
 
 
@@ -373,7 +361,7 @@ class NewtonSolver:
     #  Linear system & BC handling
     #  Assemble global matrix & residual from local JIT blocks
     # ----------------------------------------------------------------------
-    def _assemble_system(self, K_loc: np.ndarray, F_loc: np.ndarray):
+    def _assemble_system(self, K_loc: np.ndarray, F_loc: np.ndarray, gdofs_map: np.ndarray):
         """
         Scatter JIT‑returned (K_loc, F_loc) into a CSR matrix A and vector R.
 
@@ -388,7 +376,6 @@ class NewtonSolver:
 
         dh          = self.dh
         n_glob      = dh.total_dofs
-        gdofs_map   = self.static_args["gdofs_map"]   # (n_rows, n_union)
 
         # ---------------- residual ----------------------------------------
         R = np.zeros(n_glob)
@@ -455,9 +442,12 @@ class NewtonSolver:
             dh.apply_bcs(bcs_now, *funcs)
 
             # residual ---------------------------------
-            # _, F_loc_trial = self._res_runner(coeffs, self.static_args)
-            F_loc_trial = self._res_runner(coeffs, self.static_args)[1]
-            _, R_trial = self._assemble_system(np.zeros_like(F_loc_trial), F_loc_trial)
+            n_glob = dh.total_dofs
+            R_trial = np.zeros(n_glob)
+            for runner, sa in zip(self._res_runners, self.static_args_res):
+                F_loc_trial = runner(coeffs, sa)[1]
+                _, part = self._assemble_system(np.zeros((F_loc_trial.shape[0], F_loc_trial.shape[1])), F_loc_trial, sa["gdofs_map"])
+                R_trial += part
 
             if np.linalg.norm(R_trial, ord=np.inf) <= (1.0 - self.np.ls_c1 * alpha) * R0:
                 return alpha * dU  # accept

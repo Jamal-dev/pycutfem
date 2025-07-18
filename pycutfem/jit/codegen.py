@@ -1,8 +1,6 @@
 # pycutfem/jit/codegen.py
 import textwrap
 from dataclasses import dataclass, field, replace
-
-from matplotlib.pylab import f
 from .ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
