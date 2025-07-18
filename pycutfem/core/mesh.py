@@ -52,6 +52,8 @@ class Mesh:
         self.spatial_dim = 2  # Assuming 2D mesh by default
         self._elem_bitsets: Dict[str, BitSet] = {}
         self._edge_bitsets: Dict[str, BitSet] = {}
+        self.areas_list: Optional[np.ndarray] = self.areas()  # Precompute areas for elements
+        
 
     def _build_topology(self):
         """
@@ -300,7 +302,13 @@ class Mesh:
 
     def edge_bitset(self, tag: str) -> BitSet:
         """Return cached BitSet of edges with the given tag."""
-        return self._edge_bitsets.get(tag, BitSet(np.zeros(len(self.edges_list), bool)))
+        cache = getattr(self, "_edge_bitsets", None)
+        if cache is not None and tag in cache:          # fast path
+            return cache[tag]
+
+        # --- recompute on the fly (O(n_edges)) ---------------------------
+        mask = np.fromiter((e.tag == tag for e in self.edges_list), bool)
+        return BitSet(mask)
 
     def element_bitset(self, tag: str) -> BitSet:
         return self._elem_bitsets.get(tag, BitSet(np.zeros(len(self.elements_list), bool)))
@@ -342,9 +350,10 @@ class Mesh:
         raise ValueError(f"Unsupported entity type '{entity}'.")
     # --- Public API ---
     def element_char_length(self, elem_id):
+        # print(f"[Mesh] element_char_length: elem_id={elem_id}")
         if elem_id is None:
             return 0.0
-        return np.sqrt(self.areas()[elem_id])
+        return np.sqrt(self.areas_list[elem_id])
     def neighbors(self) -> List[int]:
         return self._neighbors
 

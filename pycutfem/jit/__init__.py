@@ -81,7 +81,16 @@ class KernelRunner:
         gdofs_map = kernel_args["gdofs_map"]          # ndarray, safe to use
 
         # ---------------------------------------------------------------
-        # C)  inject element-local coefficient blocks for every Function
+        # C 0‑bis)  replace sentinel ‑1 values by zeros (safe for gather)
+        # ---------------------------------------------------------------
+        if "gdofs_map" in kernel_args:
+            gmap = kernel_args["gdofs_map"]
+            if (gmap < 0).any():
+                gmap = gmap.copy()
+                gmap[gmap < 0] = 0
+                kernel_args["gdofs_map"] = gmap
+        # ---------------------------------------------------------------
+        # C)  inject element‑local coefficient blocks for every Function
         # ---------------------------------------------------------------
         for name in self.func_names:                  # e.g. 'u_k', 'p_n'
             key = f"u_{name}_loc"
@@ -90,14 +99,43 @@ class KernelRunner:
 
             f = functions[name]                       # Function / VectorFunction
 
-            # 1) pad up to the *global* mixed vector length (cheap)
+            # 1) pad to the *global* mixed length (cheap, once per Newton step)
             full_vec = np.zeros(self.dof_handler.total_dofs,
                                 dtype=f.nodal_values.dtype)
             for gdof, lidx in f._g2l.items():         # _g2l: global → local
                 full_vec[gdof] = f.nodal_values[lidx]
 
-            # 2) gather element-local blocks once for all elements
-            kernel_args[key] = full_vec[gdofs_map]
+            # 2) gather union blocks for every element / edge
+            gmap = kernel_args["gdofs_map"]
+            union_blocks = full_vec[gmap]             # shape (n_edge, n_union)
+            kernel_args[key] = union_blocks           # original behaviour
+            # kernel_args[key] = union_blocks[:, :self.dof_handler.mixed_element.n_dofs_per_elem]
+
+
+            # -----------------------------------------------------------
+            # C‑extra)  build (+) and (‑) blocks for interior‑facet kernels
+            # -----------------------------------------------------------
+            if "pos_map" in kernel_args and "neg_map" in kernel_args:
+                pmap = kernel_args["pos_map"]   # (n_edge, n_loc)
+                nmap = kernel_args["neg_map"]   # (n_edge, n_loc)
+                n_edge, n_union = union_blocks.shape
+                n_loc           = pmap.shape[1]
+
+                # helper to scatter one side --------------------------------------
+                def _scatter(side_map):
+                    side_vals = np.zeros_like(union_blocks)       # (n_edge, n_union)
+                    rows      = np.arange(n_edge)[:, None]        # column broadcast
+                    cols      = side_map.clip(min=0)              # -1 → 0, harmless
+                    valid     = side_map >= 0
+                    # write only the DOFs that belong to this element -------------
+                    side_vals[rows, cols] = union_blocks[rows, cols] * valid
+                    return side_vals
+
+                kernel_args.setdefault(f"u_{name}__pos_loc", _scatter(pmap))
+                kernel_args.setdefault(f"u_{name}__neg_loc", _scatter(nmap))
+
+        
+
 
         # ---------------------------------------------------------------
         # D)  final sanity check – everything the kernel listed?
@@ -176,10 +214,15 @@ def compile_multi(integral_form, *, dof_handler, mixed_element):
 
     sub_runners = []
     ir_list     = []
+    global_param_order = []        # <- NEW
     for I in integral_form.integrals:
         r, ir = compile_backend(I.integrand, dof_handler, mixed_element)
         sub_runners.append(r);  ir_list.append(ir)
 
+        # extend the global list preserving order
+        for p in r.param_order:
+            if p not in global_param_order:
+                global_param_order.append(p)
     # -------- combined runner ----------------------------------------
     def combined_runner(coeffs: dict, static_args: dict):
         K_sum = F_sum = J_sum = None
@@ -192,5 +235,5 @@ def compile_multi(integral_form, *, dof_handler, mixed_element):
         return K_sum, F_sum, J_sum
 
     # We re‑use the PARAM_ORDER of the first kernel; they all match.
-    combined_runner.param_order = sub_runners[0].param_order
+    combined_runner.param_order = global_param_order
     return combined_runner, ir_list[0]           # ir only needed for basis tables

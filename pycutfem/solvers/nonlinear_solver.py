@@ -239,102 +239,201 @@ class NewtonSolver:
 
         raise RuntimeError("Newton did not converge – adjust Δt or verify Jacobian.")
 
+    
     # ------------------------------------------------------------------
     #  Static kernel arguments (geometry + basis tables, *not* coeffs)
     # ------------------------------------------------------------------
     def _precompute_static_args(self, quad_order: int) -> Dict[str, np.ndarray]:
-        dh = self.dh
-        me = self.me
+        """
+        Robust variant that                                                  
+            • works with dx, dΓ *and* dGhost                                  
+            • survives meshes without any ghost edges (place‑holders sent)    
+            • guarantees helpers_jit never sees a missing pos/neg map.        
+        """
+        import numpy as np
+        from typing import Dict, Optional
+        from pycutfem.ufl.helpers import required_multi_indices
 
-        static_args: Dict[str, np.ndarray] = dh.precompute_geometric_factors(quad_order)
-        static_args["gdofs_map"] = np.vstack([
-            dh.get_elemental_dofs(e) for e in range(me.mesh.n_elements)
-        ]).astype(np.int32)
+        dh, me  = self.dh, self.me
+        self.union_dofs = dh.union_dofs  # e.g. 36 for P2-P2-P1
+        mesh    = me.mesh
+        ghost_ls: Optional[callable] = None
+        ghost_derivs: set            = set()
+
+        # ------------------------------------------------------ 1) scan integrals
+        def _scan(ints):
+            nonlocal ghost_ls, ghost_derivs
+            for I in ints:
+                if I.measure.domain_type == "ghost_edge":
+                    ghost_ls      = I.measure.level_set
+                    ghost_derivs |= required_multi_indices(I.integrand)
+
+        _scan(self._jacobian_form.integrals
+            if hasattr(self._jacobian_form, "integrals") else
+            [self._jacobian_form])
+        _scan(self._residual_form.integrals
+            if hasattr(self._residual_form, "integrals") else
+            [self._residual_form])
+
+        # ------------------------------------------------------ 2) place‑holders
+        _empty_J = np.empty((0, 0, 2, 2))      # re‑usable singleton
+        pre_built = {                     # always at least the dummies
+            
+        }
+
+        # ------------------------------------------------------ 3) real ghost data
+        edge_ids = mesh.edge_bitset("ghost")
+        if ghost_ls is not None and edge_ids.cardinality():
+            ghost_geo = dh.precompute_ghost_factors(edge_ids,
+                                                    quad_order,
+                                                    ghost_ls,
+                                                    ghost_derivs)
+            pre_built.update(ghost_geo)       # overwrites the dummies
+
+        # ------------------------------------------------------ 4) cell‑wise geom
+        static_args: Dict[str, np.ndarray] = dh.precompute_geometric_factors(
+            quad_order
+        )
+        static_args["gdofs_map"] = np.vstack(
+            [dh.get_elemental_dofs(e) for e in range(mesh.n_elements)]
+        ).astype(np.int32)
         static_args["node_coords"] = dh.get_all_dof_coords()
 
-        # Basis / gradient lookup tables -------------------------------
-        jac_integrand = (self._jacobian_form.integrals[0].integrand
-                  if hasattr(self._jacobian_form, "integrals")
-                  else self._jacobian_form.integrand)
-        basis_jac = _build_jit_kernel_args(
-            self._jac_ir,
-            jac_integrand,
-            me,
-            quad_order,
-            dh,
-            param_order=self._jac_runner.param_order,
-        )
-        res_integrand = (self._residual_form.integrals[0].integrand
-                  if hasattr(self._residual_form, "integrals")
-                  else self._residual_form.integrand)
-        basis_res = _build_jit_kernel_args(
-            self._res_ir,
-            res_integrand,
-            me,
-            quad_order,
-            dh,
-            param_order=self._res_runner.param_order,
-        )
+        # non‑mapping ghost quantities (J_inv_pos, detJ_neg, normals, …)
+        for k, v in pre_built.items():
+            if k not in {"pos_map", "neg_map", "gdofs_map"}:
+                static_args[k] = v
+
+        # ------------------------------------------------------ 5) helper
+        def _add_tables(target, ir, integrand, param_order):
+            try:
+                target.update(
+                    _build_jit_kernel_args(ir, integrand,
+                                        me, quad_order, dh,
+                                        param_order=param_order,
+                                        pre_built=pre_built)   # <-- here!
+                )
+            except NameError as err:
+                # swallow ONLY “unknown Function …” – everything else re‑raise
+                if "unknown Function or VectorFunction" in str(err):
+                    return
+                raise
+
+        # ---------------- Jacobian -------------------------------------
+        basis_jac = {}
+        for I in (self._jacobian_form.integrals
+                if hasattr(self._jacobian_form, "integrals")
+                else [self._jacobian_form]):
+            _add_tables(basis_jac, self._jac_ir, I.integrand,
+                        self._jac_runner.param_order)
+
+        # ---------------- Residual -------------------------------------
+        basis_res = {}
+        for I in (self._residual_form.integrals
+                if hasattr(self._residual_form, "integrals")
+                else [self._residual_form]):
+            _add_tables(basis_res, self._res_ir, I.integrand,
+                        self._res_runner.param_order)
+
+        # ------------------------------------------------------ 6) merge & strip
         static_args.update(basis_jac)
         static_args.update(basis_res)
 
-        # strip really dynamic blocks (u_k_loc, p_k_loc, …) ------------
-        static_args = {k: v for k, v in static_args.items() if not k.endswith("_loc")}
-        return static_args
+        # do *not* keep the run‑time coefficient vectors (…_loc)
+
+        # ------------------------------------------------------------------
+        # PAD every basis / gradient table to n_union columns
+        # ------------------------------------------------------------------
+        n_union = self.union_dofs
+        for k, v in list(static_args.items()):
+            if v.ndim < 3:           # geometry, maps, scalars – skip
+                continue
+
+            # Case A: scalar/vector bases  …, n_basis
+            if v.shape[-1] < n_union and v.shape[-2] != 2:
+                pad = np.zeros(v.shape[:-1] + (n_union,), dtype=v.dtype)
+                pad[..., : v.shape[-1]] = v
+                static_args[k] = pad
+                continue
+
+            # Case B: gradient bases      …, n_basis, 2
+            if v.shape[-2] < n_union and v.shape[-1] == 2:
+                pad = np.zeros(v.shape[:-2] + (n_union, 2), dtype=v.dtype)
+                pad[..., : v.shape[-2], :] = v
+                static_args[k] = pad
+        return {k: v for k, v in static_args.items()
+                if not k.endswith("_loc")}
+
+
+
+
+
 
     # ------------------------------------------------------------------
     #  Linear system & BC handling
-    # ------------------------------------------------------------------
-    def _assemble_system(self, K_loc, F_loc):
-        r"""Assemble global matrix **A** and residual vector **R**.
-
-        If *K_loc* has shape *(n_elem, n_loc, n_loc)* it is interpreted as the
-        per‑element stiffness/Jacobian contribution.  If it has shape
-        *(n_elem, n_loc)* (i.e. rank‑2), this signals that the caller is only
-        interested in the **residual**.  In that case we **skip** the sparse
-        matrix construction entirely – a huge speed‑up for the line‑search,
-        which only needs \|R\|.
+    #  Assemble global matrix & residual from local JIT blocks
+    # ----------------------------------------------------------------------
+    def _assemble_system(self, K_loc: np.ndarray, F_loc: np.ndarray):
         """
-        dh = self.dh
-        n_total = dh.total_dofs
+        Scatter JIT‑returned (K_loc, F_loc) into a CSR matrix A and vector R.
 
-        # ---------------------------- assemble residual vector R --------
-        R = np.zeros(n_total)
-        for e, Fe in enumerate(F_loc):
-            gdofs = dh.get_elemental_dofs(e)
-            np.add.at(R, gdofs, Fe)
+        *  Each row corresponds to either an **element** or an **edge**.
+        *  The mapping from that row to global DOFs is the same
+        ``static_args['gdofs_map'][row]`` that was used in the kernel.
+        *  Rows may contain −1 padding; those columns are skipped.
+        """
+        import numpy as np
+        import scipy.sparse as sp
+        from scipy.sparse import lil_matrix
 
-        # ---------------------------- fast path: residual only ----------
+        dh          = self.dh
+        n_glob      = dh.total_dofs
+        gdofs_map   = self.static_args["gdofs_map"]   # (n_rows, n_union)
+
+        # ---------------- residual ----------------------------------------
+        R = np.zeros(n_glob)
+        for row, Fe in enumerate(F_loc):
+            gmap  = gdofs_map[row]
+            valid = gmap >= 0
+            np.add.at(R, gmap[valid], Fe[valid])
+
+        # ---------------- fast path: residual only ------------------------
         if K_loc.ndim == 2:
-            # Caller does not need the matrix (line‑search, diagnostics …)
-            A = sp.csr_matrix((n_total, n_total))  # empty / zero
+            A = sp.csr_matrix((n_glob, n_glob))   # empty shell
         else:
-            # Full matrix assembly -------------------------------------
-            n_elem, n_loc, _ = K_loc.shape
-            data = np.zeros(n_elem * n_loc * n_loc)
-            rows = np.zeros_like(data, dtype=np.int32)
-            cols = np.zeros_like(data, dtype=np.int32)
+            # sparse accumulate -------------------------------------------
+            A = lil_matrix((n_glob, n_glob))
+            for row, Ke in enumerate(K_loc):
+                gmap  = gdofs_map[row]
+                valid = gmap >= 0
+                rows  = gmap[valid]
+                cols  = gmap[valid]
+                A[np.ix_(rows, cols)] += Ke[np.ix_(valid, valid)]
+            A = A.tocsr()
 
-            for e in range(n_elem):
-                gdofs = dh.get_elemental_dofs(e)
-                r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
-                offset = e * n_loc * n_loc
-                rows[offset:offset + n_loc * n_loc] = r.ravel()
-                cols[offset:offset + n_loc * n_loc] = c.ravel()
-                data[offset:offset + n_loc * n_loc] = K_loc[e].ravel()
-
-            A = sp.coo_matrix((data, (rows, cols)), shape=(n_total, n_total)).tocsr()
-
-            # --- Dirichlet BCs ----------------------------------------
+            # ------------- homogeneous Dirichlet BCs ----------------------
             if self.bcs_homog:
                 bc_data = dh.get_dirichlet_data(self.bcs_homog)
                 if bc_data:
                     bc_dofs = np.fromiter(bc_data.keys(), dtype=int)
                     bc_vals = np.fromiter(bc_data.values(), dtype=float)
-                    R -= A @ np.bincount(bc_dofs, weights=bc_vals, minlength=n_total)
-                    A = _zero_rows_cols(A, bc_dofs)
+
+                    # subtract known values from RHS
+                    R -= A @ np.bincount(bc_dofs, weights=bc_vals,
+                                        minlength=n_glob)
+
+                    # zero rows & columns, put 1 on diag
+                    A_lil = A.tolil()
+                    A_lil[bc_dofs, :] = 0
+                    A_lil[:, bc_dofs] = 0
+                    A_lil[bc_dofs, bc_dofs] = 1.0
+                    A = A_lil.tocsr()
+
+                    # enforce values in RHS
                     R[bc_dofs] = bc_vals
+
         return A, R
+
 
     def _solve_linear_system(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
         if self.lp.backend == "scipy":

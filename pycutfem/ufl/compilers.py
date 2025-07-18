@@ -1354,6 +1354,10 @@ class FormCompiler:
         
         valid_eids = geo_factors.get('eids')
         if valid_eids is None or len(valid_eids) == 0:
+            raise ValueError(
+                "No valid ghost edges found for the integral. "
+                "Check the measure or the mesh."
+            )
             return
 
         # 3. Compile kernel

@@ -46,6 +46,23 @@ def _hess_comp(a, b):
             2*Derivative(a,1,1)*Derivative(b,1,1) +
             Derivative(a,0,2)*Derivative(b,0,2))
 
+def _grad_comp(a, b):
+    return (Derivative(a,1,0) * Derivative(b, 1,0) + Derivative(a, 0, 1) * Derivative(b, 0, 1))
+
+def grad_inner(u, v):
+    if getattr(u, "num_components", 1) == 1:  # scalar case
+        return _grad_comp(u, v)
+
+    # vector case: sum component-wise
+    if u.numcomponents == v.num_components == 2:
+        return (
+            Derivative(u[0], 1, 0) * Derivative(v[0], 1, 0)+
+            Derivative(u[0], 0, 1) * Derivative(v[0], 0, 1) +
+            Derivative(u[1], 1, 0) * Derivative(v[1], 1, 0) +
+            Derivative(u[1], 0, 1) * Derivative(v[1], 0, 1)
+        )
+    else : raise ValueError("Unsupported number of components for gradient inner product.")
+
 class VerticalLineLevelSet(LevelSetFunction):
     """ φ(x,y) = x - c   (vertical line x = c) """
     def __init__(self, c: float = 1.0):
@@ -90,6 +107,8 @@ class AffineLevelSet(LevelSetFunction):
 
     # ---- value ------------------------------------------------------
     def __call__(self, x: np.ndarray) -> np.ndarray:
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)  # Ensure x is a numpy array
         # Works with shape (2,) or (..., 2)
         return self.a * x[..., 0] + self.b * x[..., 1] + self.c
 
@@ -124,8 +143,8 @@ def setup_quad2():
 
     ghost = get_domain_bitset(mesh, "edge", "ghost")
     fig, ax = plt.subplots(figsize=(10, 8))
-    plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True, 
-              plot_nodes=False, elem_tags=True, edge_colors=True)
+    # plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True, 
+    #           plot_nodes=False, elem_tags=True, edge_colors=True)
     assert ghost.cardinality() > 0, "Mesh should contain ghost edges for the test."
     # This call now works because of the fixes in visualization.py
     
@@ -141,13 +160,14 @@ def setup_quad2():
 # 1. Structural check – SPD + symmetry
 # ---------------------------------------------------------------------------
 
-def test_hessian_penalty_spd(setup_quad2):
+@pytest.mark.parametrize("backend", ["python", "jit"])
+def test_hessian_penalty_spd(setup_quad2,backend):
     _mesh, ls, ghost, dh, comp = setup_quad2
     u = TrialFunction(field_name="u",name="u_trial",dof_handler=dh) 
     v = TestFunction( field_name="u",name="v_test",dof_handler=dh)
 
     a = hessian_inner(Jump(u), Jump(v)) * dGhost(defined_on=ghost, level_set=ls, metadata={"derivs": {(2,0),(1,1),(0,2)}})
-    A, _ = comp.assemble(a == Constant(0) * dx)
+    A, _ = assemble_form(a == Constant(0) * dx, dof_handler=dh, bcs=[],backend=backend)
     K = A.toarray()
 
     # symmetric
@@ -269,9 +289,9 @@ def test_hessian_penalty_quantitative_value(setup_quad2):
 # E. Vector jump of gradients
 # ---------------------------
 
-# def test_grad_jump_energy_vanishes_for_linear(base_setup):
+# def test_grad_jump_energy_vanishes_for_linear(setup_quad2):
 #     """For linear **vector** field, grad jump is constant ⇒ penalty non‑zero; but linear *continuous* field should give zero."""
-#     mesh, level_set, ghost_domain, dh, compiler = base_setup
+#     mesh, level_set, ghost_domain, dh, compiler = setup_quad2
 
 #     # Build vector function space: two components, each Q2
 #     vme = MixedElement(mesh, {'U': 2, 'V': 2})

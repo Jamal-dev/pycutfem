@@ -341,7 +341,7 @@ class NumbaCodeGen:
             
             elif isinstance(op, CellDiameter):
                 res = new_var("h")
-                body_lines.append(f"{res} = h_arr[eid]")    # h_arr provided by pre‑compute
+                body_lines.append(f"{res} = h_arr[e]")    # h_arr provided by pre‑compute
                 stack.append(StackItem(var_name=res,
                                     shape=(),
                                     is_vector=False,
