@@ -877,7 +877,7 @@ class DofHandler:
             for side in ("pos", "neg"):
                 for dx, dy in derivs:
                     key = f"d{dx}{dy}_{fld}_{side}"
-                    basis_tables[key] = np.zeros((n_edges, n_q, me._n_basis[fld]))
+                    basis_tables[key] = np.zeros((n_edges, n_q, n_loc))  # me._n_basis[fld]))
 
         h_arr = np.zeros((n_edges,))  # Placeholder for element sizes
         # ---------------------------------- main loop over valid edges
