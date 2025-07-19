@@ -83,24 +83,45 @@ class KernelRunner:
 
         gdofs_map = kernel_args["gdofs_map"]          # ndarray, safe to use
 
-        # ---------------------------------------------------------------
-        # C)  inject element-local coefficient blocks for every Function
-        # ---------------------------------------------------------------
-        for name in self.func_names:                  # e.g. 'u_k', 'p_n'
-            key = f"u_{name}_loc"
-            if key in kernel_args:                    # caller already supplied it
-                continue
+        # ------------------------------------------------------------------
+        # C)  inject *fresh* coefficient blocks for every Function
+        #      – volume ( ..._loc )
+        #      – ghost  ( ..._pos_loc, ..._neg_loc )
+        # ------------------------------------------------------------------
+        pos_map = kernel_args.get("pos_map")
+        neg_map = kernel_args.get("neg_map")
 
+        # helper ------------------------------------------------------------
+        def _gather(side_map):
+            """Return dense coeff array matching *side_map* (‑1 → 0)."""
+            if side_map is None:
+                return None
+            # side_map might be ragged (dtype=object); stack if needed
+            if side_map.dtype == object:
+                from pycutfem.ufl.helpers_jit import _stack_ragged
+                side_map = _stack_ragged(side_map)
+            coeff = np.zeros_like(side_map, dtype=full_vec.dtype)
+            mask  = side_map >= 0
+            coeff[mask] = full_vec[side_map[mask]]
+            return coeff
+
+        for name in self.func_names:                  # 'u_k', 'p'
             f = functions[name]                       # Function / VectorFunction
 
-            # 1) pad up to the *global* mixed vector length (cheap)
+            # 1) global vector with current nodal values --------------------
             full_vec = np.zeros(self.dof_handler.total_dofs,
                                 dtype=f.nodal_values.dtype)
-            for gdof, lidx in f._g2l.items():         # _g2l: global → local
+            for gdof, lidx in f._g2l.items():
                 full_vec[gdof] = f.nodal_values[lidx]
 
-            # 2) gather element-local blocks once for all elements
-            kernel_args[key] = full_vec[gdofs_map]
+            # 2a) volume coefficients  u_<name>_loc -------------------------
+            kernel_args[f"u_{name}_loc"] = full_vec[gdofs_map]
+
+            # 2b) ghost/interface  u_<name>_pos_loc / _neg_loc --------------
+            if pos_map is not None:
+                kernel_args[f"u_{name}_pos_loc"] = _gather(pos_map)
+            if neg_map is not None:
+                kernel_args[f"u_{name}_neg_loc"] = _gather(neg_map)
 
         # ---------------------------------------------------------------
         # D)  final sanity check – everything the kernel listed?
