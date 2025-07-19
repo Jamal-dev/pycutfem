@@ -238,14 +238,10 @@ def test_lhs_advection_q2():
     np.random.seed(1337)
     u_k.nodal_values[:] = np.random.rand(dof_handler.total_dofs)
     
-    # CORRECTED UFL FORM: This now correctly represents ((u_k ⋅ ∇)u) ⋅ v
-    # We define the term component-wise for clarity.
-    uk_grad_ux = dot(u_k, grad(u[0]))
-    uk_grad_uy = dot(u_k, grad(u[1]))
-    advection_term = uk_grad_ux * v[0] + uk_grad_uy * v[1]
+
     
     # The RHS can be a simple zero vector for this LHS test.
-    equation = advection_term * dx() == dot(Constant([0.0,0.0],dim=1), v) * dx()
+    equation = dot(dot(u_k,grad(u)),v) * dx() == dot(Constant([0.0,0.0],dim=1), v) * dx()
     
     A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])
     compiler_matrix = A.toarray()

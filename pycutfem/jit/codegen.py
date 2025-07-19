@@ -402,8 +402,8 @@ class NumbaCodeGen:
                         var = new_var("grad_scalar")
                         body_lines.append(f"{var} = {phys[0]}[None, :, :].copy()")
                         shape = (1, n_dofs, self.spatial_dim)
-                        is_vector = True
-                        is_gradient = False
+                        is_vector = False
+                        is_gradient = True
                     else:                                              # vector space
                         var = new_var("grad_stack")
                         body_lines.append(f"{var} = np.stack(({', '.join(phys)}))")
@@ -547,6 +547,7 @@ class NumbaCodeGen:
             elif isinstance(op, Inner):
                 b = stack.pop(); a = stack.pop()
                 res_var = new_var("inner")
+                print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}")
                 if a.role in ('test', 'trial') and b.role in ('test', 'trial'): # LHS
                     if a.is_gradient and b.is_gradient:
                         body_lines.append(f'# Inner(Grad, Grad): stiffness matrix')
@@ -557,6 +558,7 @@ class NumbaCodeGen:
                         body_lines.append(f'    {res_var} += {a.var_name}[k] @ {b.var_name}[k].T.copy()')
                     else:
                         body_lines.append(f'# Inner(Vec, Vec): mass matrix')
+                        # body_lines.append(f'print(f"a.shape: {{{a.var_name}.shape}}, b.shape: {{{b.var_name}.shape}}")')
                         body_lines.append(f'{res_var} = {a.var_name}.T.copy() @ {b.var_name}')
                 # elif a.role == 'const' and b.role == 'const' and a.shape == b.shape:
                 #     body_lines.append(f'# Inner(Const, Const): element-wise product')

@@ -878,8 +878,8 @@ class DofHandler:
         h_arr = np.zeros((n_edges,))  # Placeholder for element sizes
         # ---------------------------------- main loop over valid edges
         for i, edge in enumerate(valid_edges):
-            left_elem = mesh.edge(edge.left)
-            right_elem = mesh.edge(edge.right)
+            left_elem = edge.left
+            right_elem = edge.right
             if left_elem is not None:
                 h_left = mesh.element_char_length(left_elem)
             else:
