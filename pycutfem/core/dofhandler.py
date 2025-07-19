@@ -760,10 +760,13 @@ class DofHandler:
         b_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local))         for f in fields}
         g_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local, 2))      for f in fields}
         h_arr = np.zeros((n_elems,))  # Placeholder for element sizes
+        for eid in range(n_elems):
+            h_arr[eid] = mesh.element_char_length(eid)
 
         # --- Loop over valid cut elements ---
         for k, eid in enumerate(valid_cut_eids):
-            h_arr[eid] = mesh.element_char_length(eid)  # Store element size
+            # h_arr[eid] = mesh.element_char_length(eid)  # Store element size
+            # print(f"eid: {eid}, h_arr[eid]: {h_arr[eid]}")  # Debug output
             elem = mesh.elements_list[eid]
             p0, p1 = elem.interface_pts
 
@@ -822,6 +825,7 @@ class DofHandler:
         is valid for *both* CG and DG discretisations, regardless of how many
         fields or blocks you mix.
         """
+        derivs = derivs | {(0, 0)}
         mesh        = self.mixed_element.mesh
         me          = self.mixed_element
         fields      = me.field_names
