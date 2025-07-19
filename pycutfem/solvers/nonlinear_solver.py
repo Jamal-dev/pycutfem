@@ -22,8 +22,7 @@ import inspect
 import numpy as np
 import scipy.sparse.linalg as spla
 import scipy.sparse as sp
-
-from pycutfem.jit import compile_backend
+from pycutfem.ufl.helpers_jit import _scatter_element_contribs
 from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
 from pycutfem.jit import compile_multi        # NEW import
 
@@ -97,6 +96,7 @@ class NewtonSolver:
         quad_order: int = 6,
         preproc_cb: Optional[Callable[[List], None]] = None,
         postproc_cb: Optional[Callable[[List], None]] = None,
+        backend: str = "jit",
     ) -> None:
         self.dh = dof_handler
         self.me = mixed_element
@@ -111,17 +111,23 @@ class NewtonSolver:
         self._residual_form = residual_form
         self._jacobian_form = jacobian_form
 
-        # 1) compile kernels ------------------------------------------------
-        self._res_runner, self._res_ir = compile_multi(
-            residual_form, dof_handler=self.dh, mixed_element=self.me
-        )
-        self._jac_runner, self._jac_ir = compile_multi(
-            jacobian_form, dof_handler=self.dh, mixed_element=self.me
+        # --- compile one kernel list for K, one for F ----------------------
+        self.kernels_K = compile_multi(        # Jacobian
+                jacobian_form,
+                dof_handler   = self.dh,
+                mixed_element = self.me,
+                backend       = backend,
         )
 
-        # 2) pre‑compute static arguments (geometry, basis tables, …) -------
-        self.static_args = self._precompute_static_args(quad_order)
+        self.kernels_F = compile_multi(        # Residual
+                residual_form,
+                dof_handler   = self.dh,
+                mixed_element = self.me,
+                backend       = backend,
+        )
 
+
+        
     # ------------------------------------------------------------------
     #  Public interface
     # ------------------------------------------------------------------
@@ -210,11 +216,7 @@ class NewtonSolver:
             if aux_funcs:
                 current.update(aux_funcs)
 
-            # K_loc, _ = self._jac_runner(current, self.static_args)
-            K_loc = self._jac_runner(current, self.static_args)[0] 
-            # _, F_loc = self._res_runner(current, self.static_args)
-            F_loc = self._res_runner(current, self.static_args)[1]
-            A, R = self._assemble_system(K_loc, F_loc)
+            A, R = self._assemble_system(current)
 
             norm_R = np.linalg.norm(R, ord=np.inf)
             print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}")
@@ -239,102 +241,58 @@ class NewtonSolver:
 
         raise RuntimeError("Newton did not converge – adjust Δt or verify Jacobian.")
 
-    # ------------------------------------------------------------------
-    #  Static kernel arguments (geometry + basis tables, *not* coeffs)
-    # ------------------------------------------------------------------
-    def _precompute_static_args(self, quad_order: int) -> Dict[str, np.ndarray]:
-        dh = self.dh
-        me = self.me
-
-        static_args: Dict[str, np.ndarray] = dh.precompute_geometric_factors(quad_order)
-        static_args["gdofs_map"] = np.vstack([
-            dh.get_elemental_dofs(e) for e in range(me.mesh.n_elements)
-        ]).astype(np.int32)
-        static_args["node_coords"] = dh.get_all_dof_coords()
-
-        # Basis / gradient lookup tables -------------------------------
-        jac_integrand = (self._jacobian_form.integrals[0].integrand
-                  if hasattr(self._jacobian_form, "integrals")
-                  else self._jacobian_form.integrand)
-        basis_jac = _build_jit_kernel_args(
-            self._jac_ir,
-            jac_integrand,
-            me,
-            quad_order,
-            dh,
-            param_order=self._jac_runner.param_order,
-        )
-        res_integrand = (self._residual_form.integrals[0].integrand
-                  if hasattr(self._residual_form, "integrals")
-                  else self._residual_form.integrand)
-        basis_res = _build_jit_kernel_args(
-            self._res_ir,
-            res_integrand,
-            me,
-            quad_order,
-            dh,
-            param_order=self._res_runner.param_order,
-        )
-        static_args.update(basis_jac)
-        static_args.update(basis_res)
-
-        # strip really dynamic blocks (u_k_loc, p_k_loc, …) ------------
-        static_args = {k: v for k, v in static_args.items() if not k.endswith("_loc")}
-        return static_args
+   
 
     # ------------------------------------------------------------------
     #  Linear system & BC handling
     # ------------------------------------------------------------------
-    def _assemble_system(self, K_loc, F_loc):
-        r"""Assemble global matrix **A** and residual vector **R**.
+    def _assemble_system(self, coeffs, *, need_matrix=True):
+        dh   = self.dh
+        ndof = dh.total_dofs
+        A    = sp.lil_matrix((ndof, ndof)) if need_matrix else None
+        R    = np.zeros(ndof)
 
-        If *K_loc* has shape *(n_elem, n_loc, n_loc)* it is interpreted as the
-        per‑element stiffness/Jacobian contribution.  If it has shape
-        *(n_elem, n_loc)* (i.e. rank‑2), this signals that the caller is only
-        interested in the **residual**.  In that case we **skip** the sparse
-        matrix construction entirely – a huge speed‑up for the line‑search,
-        which only needs \|R\|.
-        """
-        dh = self.dh
-        n_total = dh.total_dofs
+        # ------------ Jacobian (matrix) --------------------------------
+        if need_matrix:
+            for ker in self.kernels_K:
+                Kloc, _, _ = ker.exec(coeffs)           # Floc is None
+                _scatter_element_contribs(
+                    Kloc, None, None,
+                    ker.static_args["eids"],
+                    ker.static_args["gdofs_map"],
+                    A, {"rhs": False},
+                    ker, hook=None
+                )
 
-        # ---------------------------- assemble residual vector R --------
-        R = np.zeros(n_total)
-        for e, Fe in enumerate(F_loc):
-            gdofs = dh.get_elemental_dofs(e)
-            np.add.at(R, gdofs, Fe)
+        # ------------ Residual (vector) -------------------------------
+        for ker in self.kernels_F:
+            _, Floc, _ = ker.exec(coeffs)
+            _scatter_element_contribs(
+                None, Floc, None,
+                ker.static_args["eids"],
+                ker.static_args["gdofs_map"],
+                R, {"rhs": True},
+                ker, hook = None
+            )
 
-        # ---------------------------- fast path: residual only ----------
-        if K_loc.ndim == 2:
-            # Caller does not need the matrix (line‑search, diagnostics …)
-            A = sp.csr_matrix((n_total, n_total))  # empty / zero
-        else:
-            # Full matrix assembly -------------------------------------
-            n_elem, n_loc, _ = K_loc.shape
-            data = np.zeros(n_elem * n_loc * n_loc)
-            rows = np.zeros_like(data, dtype=np.int32)
-            cols = np.zeros_like(data, dtype=np.int32)
+        # ------------ enforce homogeneous Dirichlet rows --------------
+        if need_matrix and self.bcs_homog:
+            bc_data = dh.get_dirichlet_data(self.bcs_homog)   # existing helper
+            if bc_data:
+                rows = np.fromiter(bc_data.keys(),  dtype=int)
+                vals = np.fromiter(bc_data.values(), dtype=float)
 
-            for e in range(n_elem):
-                gdofs = dh.get_elemental_dofs(e)
-                r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
-                offset = e * n_loc * n_loc
-                rows[offset:offset + n_loc * n_loc] = r.ravel()
-                cols[offset:offset + n_loc * n_loc] = c.ravel()
-                data[offset:offset + n_loc * n_loc] = K_loc[e].ravel()
+                # build a dense vector with the prescribed values
+                bc_vec = np.zeros(ndof)
+                bc_vec[rows] = vals
 
-            A = sp.coo_matrix((data, (rows, cols)), shape=(n_total, n_total)).tocsr()
+                # enforce u = g on those rows/cols
+                R -= A @ bc_vec
+                A  = _zero_rows_cols(A, rows)
+                R[rows] = vals
 
-            # --- Dirichlet BCs ----------------------------------------
-            if self.bcs_homog:
-                bc_data = dh.get_dirichlet_data(self.bcs_homog)
-                if bc_data:
-                    bc_dofs = np.fromiter(bc_data.keys(), dtype=int)
-                    bc_vals = np.fromiter(bc_data.values(), dtype=float)
-                    R -= A @ np.bincount(bc_dofs, weights=bc_vals, minlength=n_total)
-                    A = _zero_rows_cols(A, bc_dofs)
-                    R[bc_dofs] = bc_vals
-        return A, R
+        return A.tocsr() if need_matrix else None, R
+
 
     def _solve_linear_system(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
         if self.lp.backend == "scipy":
@@ -347,27 +305,26 @@ class NewtonSolver:
     #  Armijo back‑tracking line‑search
     # ------------------------------------------------------------------
     def _line_search(self, funcs, dU, coeffs, R0, bcs_now):
-        dh = self.dh
+        dh    = self.dh
         alpha = 1.0
 
-        for ls_it in range(self.np.ls_max_iter):
-            # trial update ------------------------------
+        for _ in range(self.np.ls_max_iter):
+            # 1) trial update ------------------------------------------------
             dh.add_to_functions(alpha * dU, funcs)
             dh.apply_bcs(bcs_now, *funcs)
 
-            # residual ---------------------------------
-            # _, F_loc_trial = self._res_runner(coeffs, self.static_args)
-            F_loc_trial = self._res_runner(coeffs, self.static_args)[1]
-            _, R_trial = self._assemble_system(np.zeros_like(F_loc_trial), F_loc_trial)
+            # 2) residual with *matrix‑free* assembly ------------------------
+            _, R_trial = self._assemble_system(coeffs, need_matrix=False)
 
-            if np.linalg.norm(R_trial, ord=np.inf) <= (1.0 - self.np.ls_c1 * alpha) * R0:
-                return alpha * dU  # accept
+            # 3) Armijo test -------------------------------------------------
+            if np.linalg.norm(R_trial, np.inf) <= (1.0 - self.np.ls_c1 * alpha) * R0:
+                return alpha * dU          # accept step
 
-            # reject: rollback --------------------------
+            # 4) reject → rollback & shrink ---------------------------------
             dh.add_to_functions(-alpha * dU, funcs)
             alpha *= self.np.ls_reduction
 
-        print("        Line search failed – proceeding with full step anyway.")
+        print("        Line search failed – taking full Newton step.")
         return dU
     # ------------------------------------------------------------------
     #  Boundary‑condition helper

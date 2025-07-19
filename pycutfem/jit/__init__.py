@@ -1,12 +1,15 @@
 # pycutfem/jit/__init__.py
+from pycutfem.ufl.helpers import required_multi_indices
 from .visitor import IRGenerator
 from .codegen import NumbaCodeGen
 from .cache import KernelCache
 from pycutfem.fem.mixedelement import MixedElement
 import numpy as np
 import os
+from dataclasses import dataclass
+from typing import Callable, Any
 
-#  pycutfem/jit/__init__.py      (anywhere near the top-level)
+#  pycutfem/jit/__init__.py      
 
 def _form_rank(expr):
     """Return 0 (functional), 1 (linear) or 2 (bilinear)."""
@@ -162,35 +165,95 @@ def compile_backend(integral_expression, dof_handler,mixed_element ): # New Newt
 # ----------------------------------------------------------------------
 #  Convenience: accept a Form with N>1 integrals
 # ----------------------------------------------------------------------
-def compile_multi(integral_form, *, dof_handler, mixed_element):
+@dataclass
+class _IntegralKernel:
+    """Everything needed to evaluate one integral during Newton."""
+    runner:        Callable              # compiled Numba function
+    static_args:   dict[str, Any]        # geometry, basis tables, maps …
+    domain:        str                   # "volume" | "interface" | "ghost"
+
+    def exec(self, current_funcs):
+        """Execute the kernel and *return* (Kloc, Floc, Jloc)."""
+        return self.runner(current_funcs, self.static_args)
+
+def compile_multi(form, *, dof_handler, mixed_element,
+                  quad_order: int | None = None, backend: str = "jit"):
     """
-    Accepts a Form with any number of integrals, compiles a kernel for
-    each, and returns a *single* KernelRunner that adds their element
-    contributions.
+    Compile **every** integral contained in *form* once and return a list of
+    _IntegralKernel objects.
 
-    The returned (runner, ir_list) mimics compile_backend().
+    Nothing else in pycutfem is modified, so the legacy “one integral at a
+    time” path keeps working untouched.
     """
-    if not hasattr(integral_form, "integrals") or len(integral_form.integrals) == 1:
-        # nothing special – fallback to the old routine
-        return compile_backend(integral_form, dof_handler, mixed_element)
+    from pycutfem.ufl.measures import Integral
+    from pycutfem.ufl.forms    import Equation
+    from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
+    from pycutfem.utils.domain_manager import get_domain_bitset
+    from pycutfem.core.dofhandler import DofHandler
+    from pycutfem.ufl.compilers import FormCompiler
 
-    sub_runners = []
-    ir_list     = []
-    for I in integral_form.integrals:
-        r, ir = compile_backend(I.integrand, dof_handler, mixed_element)
-        sub_runners.append(r);  ir_list.append(ir)
+    kernels : list[_IntegralKernel] = []
+    fc = FormCompiler(dof_handler, quadrature_order=quad_order, backend=backend)
 
-    # -------- combined runner ----------------------------------------
-    def combined_runner(coeffs: dict, static_args: dict):
-        K_sum = F_sum = J_sum = None
-        for sub in sub_runners:
-            K, F, J = sub(coeffs, static_args)
-            if K_sum is None:
-                K_sum, F_sum, J_sum = K, F, J
-            else:
-                K_sum += K;  F_sum += F;  J_sum += J
-        return K_sum, F_sum, J_sum
+    # 0) normalise ----------------------------------------------------------
+    if isinstance(form, Equation):   # we normally pass jac == -res
+        integrals = form.a.integrals + form.L.integrals
+    elif isinstance(form, Integral):
+        integrals = [form]
+    else:                            # Form
+        integrals = form.integrals
 
-    # We re‑use the PARAM_ORDER of the first kernel; they all match.
-    combined_runner.param_order = sub_runners[0].param_order
-    return combined_runner, ir_list[0]           # ir only needed for basis tables
+    # 1) walk every integral exactly once ----------------------------------
+    for intg in integrals:
+        dom = intg.measure.domain_type        # "volume", "interface", …
+
+        # ------------------------------ pre‑compute geometry & basis tables
+        if dom == "volume":
+            qdeg = fc._find_q_order(intg)
+            geom = dof_handler.precompute_geometric_factors(qdeg)
+            gdofs_map = np.vstack(
+                [dof_handler.get_elemental_dofs(e)
+                 for e in range(mixed_element.mesh.n_elements)]
+            ).astype(np.int32)
+
+        elif dom == "interface":
+            qdeg = fc._find_q_order(intg)
+            level_set = intg.measure.level_set
+            cut_eids  = (intg.measure.defined_on
+                         or mixed_element.mesh.element_bitset("cut"))
+            geom = dof_handler.precompute_interface_factors(cut_eids,
+                                                            qdeg, level_set)
+            gdofs_map = np.vstack(
+                [dof_handler.get_elemental_dofs(e)
+                 for e in range(mixed_element.mesh.n_elements)]
+            ).astype(np.int32)
+
+        elif dom == "ghost_edge":
+            qdeg = fc._find_q_order(intg)
+            level_set = intg.measure.level_set
+            edges = get_domain_bitset(mixed_element.mesh, "edge", "ghost")
+            derivs = required_multi_indices(intg.integrand)
+            geom = dof_handler.precompute_ghost_factors(edges, qdeg,
+                                                        level_set, derivs)
+            gdofs_map = geom["gdofs_map"]      # already the *union* map
+
+        else:
+            raise NotImplementedError(f"d{dom} + JIT not wired yet")
+
+        # ------------------------------ compile kernel itself -------------
+        runner, ir = fc._compile_backend(intg.integrand,
+                                         dof_handler, mixed_element)
+
+        static = {"gdofs_map": gdofs_map, **geom}
+        # add only the *basis* tables this kernel really touches
+        static.update(_build_jit_kernel_args(
+            ir, intg.integrand, mixed_element, qdeg,
+            dof_handler=dof_handler,
+            gdofs_map   = gdofs_map,
+            param_order = runner.param_order,
+            pre_built   = geom,
+        ))
+
+        kernels.append(_IntegralKernel(runner, static, dom))
+
+    return kernels

@@ -645,10 +645,12 @@ class DofHandler:
         phis = np.zeros((num_elements, num_quad_points)) if level_set else None
         normals = np.zeros((num_elements, num_quad_points, spatial_dim)) # Placeholder
         h_arr = np.zeros((num_elements,))  # Placeholder for h-array
+        ele_ids = np.zeros((num_elements,), dtype=int)  # Element IDs
 
         # 3. Loop over all elements and quadrature points
         for e_idx in range(num_elements):
             h_arr[e_idx] = mesh.element_char_length(e_idx)  # Store element size
+            ele_ids[e_idx] = e_idx  # Store element ID
             for q_idx, (qp, qw) in enumerate(zip(qp_ref, qw_ref)):
                 xi_tuple = tuple(qp)
 
@@ -678,6 +680,7 @@ class DofHandler:
             "normals": normals,
             "phis": phis,
             "h_arr": h_arr,
+            "eids": ele_ids,
         }
     
     
@@ -1062,6 +1065,7 @@ class DofHandler:
         if reuse:
             _edge_geom_cache[cache_key] = out
         return out
+    
 
 
     def info(self) -> None:
