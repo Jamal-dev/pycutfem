@@ -177,10 +177,10 @@ class NumbaCodeGen:
                 # ------------------------------------------------------------------
                 # 2. Test / Trial functions  ---------------------------------------
                 # ------------------------------------------------------------------
-                print(f"Visiting LoadVariable: {op.name}, role={op.role}, side={op.side}, "
-                    f"deriv_order={deriv_order}, field_names={field_names}, "
-                    f"is_vector={getattr(op, 'is_vector', None)}, "
-                    f"is_gradient={getattr(op, 'is_gradient', None)}")
+                # print(f"Visiting LoadVariable: {op.name}, role={op.role}, side={op.side}, "
+                #     f"deriv_order={deriv_order}, field_names={field_names}, "
+                #     f"is_vector={getattr(op, 'is_vector', None)}, "
+                #     f"is_gradient={getattr(op, 'is_gradient', None)}")
 
                 if op.role in ("test", "trial"):
 
@@ -251,29 +251,27 @@ class NumbaCodeGen:
                     )
 
                 # ------------------------------------------------------------------
-                # 3. Coefficient look‑ups (role == "function") stay unchanged
-                #     ↓ leave the existing code that follows here as‑is ↓
-                # ------------------------------------------------------------------
-
-
-                # ------------------------------------------------------------------
-                # 3. Coefficient / Function values ---------------------------------
+                # 3. Coefficient / Function values  –– scalar **and** vector
                 # ------------------------------------------------------------------
                 elif op.role == "function":
-                    # side suffix only for *coefficients*  ( __pos / __neg )  # NEW
-                    from pycutfem.jit.symbols import POS_SUFFIX, NEG_SUFFIX   # NEW
-                    coeff_side = POS_SUFFIX if op.side == "+" else NEG_SUFFIX if op.side == "-" else ""  # NEW
+                    # --------------------------------------------------------------
+                    # 3‑A  Which coefficient array do we need?  (single array)
+                    # --------------------------------------------------------------
+                    from pycutfem.jit.symbols import POS_SUFFIX, NEG_SUFFIX
+                    coeff_side = POS_SUFFIX if op.side == "+" else NEG_SUFFIX if op.side == "-" else ""
 
                     if op.name.startswith("u_") and op.name.endswith("_loc"):
-                        coeff_sym = op.name[:-4] + f"{coeff_side}_loc"        # NEW
+                        coeff_sym = op.name[:-4] + f"{coeff_side}_loc"
                     else:
-                        coeff_sym = f"u_{op.name}{coeff_side}_loc"            # NEW
+                        coeff_sym = f"u_{op.name}{coeff_side}_loc"
 
                     required_args.add(coeff_sym)
                     solution_func_names.add(coeff_sym)
 
-                    # NEW – pad reference basis to the DOF‑union on ghost edges
-                    if op.side:                                         # "+" or "-"
+                    # --------------------------------------------------------------
+                    # 3‑B  Pad reference bases to the DOF‑union on ghost facets
+                    # --------------------------------------------------------------
+                    if op.side:                                            # "+" or "-"
                         map_array_name = "pos_map" if op.side == "+" else "neg_map"
                         required_args.add(map_array_name)
 
@@ -289,10 +287,10 @@ class NumbaCodeGen:
                             pad   = new_var(f"padded_basis{i}")
                             body_lines += [
                                 f"{local} = {b_var}",
-                                # fast path
+                                # fast path: interior facet (no ghosts)
                                 f"if n_union == {local}.shape[0]:",
                                 f"    {pad} = {local}.copy()",
-                                f"else:",
+                                f"else:",                                     # genuine ghost facet
                                 f"    {pad} = np.zeros(n_union, dtype=np.float64)",
                                 f"    for j in range({local}.shape[0]):",
                                 f"        idx = {map_e}[j]",
@@ -301,42 +299,47 @@ class NumbaCodeGen:
                             ]
                             padded.append(pad)
 
-                        final_basis_var = padded
-                        basis_vars_at_q = padded           # hand the padded list forward
+                        basis_vars_at_q = padded             # hand padded list forward
+                    # volume / interface: basis_vars_at_q already fine
 
-                    else:
-                        final_basis_var = basis_vars_at_q[0]
-
+                    # --------------------------------------------------------------
+                    # 3‑C  Evaluate u_h(x_q)  (scalar or vector)
+                    # --------------------------------------------------------------
                     val_var = new_var(f"{op.name}_val")
 
-                    # dot product(s) with the coefficient vector
                     if op.is_vector:
-                        # one dot‑product per component;  basis_vars_at_q is already
-                        # padded (or not) by the code above
+                        # one dot product per component, same coefficient array
                         comps = [f"np.dot({b_var}, {coeff_sym})" for b_var in basis_vars_at_q]
                         body_lines.append(f"{val_var} = np.array([{', '.join(comps)}])")
-                        shape = (len(field_names),)
+                        shape = (len(field_names),)           # e.g. (2,)
                     else:
                         body_lines.append(f"{val_var} = np.dot({basis_vars_at_q[0]}, {coeff_sym})")
                         shape = ()
 
-
-                    # optional ξ‑derivative rescaling
+                    # --------------------------------------------------------------
+                    # 3‑D  Optional ξ‑derivative rescaling
+                    # --------------------------------------------------------------
                     if deriv_order != (0, 0):
                         dx, dy = deriv_order
                         jinv_q = f"{jinv_sym}_q"
-                        body_lines.append(f"{val_var} *= ({jinv_q}[0,0]**{dx}) * ({jinv_q}[1,1]**{dy})")
+                        body_lines.append(
+                            f"{val_var} *= ({jinv_q}[0,0]**{dx}) * ({jinv_q}[1,1]**{dy})"
+                        )
 
+                    # --------------------------------------------------------------
+                    # 3‑E  Push onto stack
+                    # --------------------------------------------------------------
                     stack.append(
                         StackItem(
-                            var_name   = val_var,
-                            role       = "value",
-                            shape      = shape,
-                            is_vector  = op.is_vector,
-                            field_names= field_names,
-                            parent_name= coeff_sym
+                            var_name    = val_var,
+                            role        = "value",
+                            shape       = shape,
+                            is_vector   = op.is_vector,
+                            field_names = field_names,
+                            parent_name = coeff_sym
                         )
                     )
+
                 else:
                     raise TypeError(f"Unknown role '{op.role}' for LoadVariable IR node.")
 
