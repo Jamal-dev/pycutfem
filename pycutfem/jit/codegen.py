@@ -149,13 +149,13 @@ class NumbaCodeGen:
             # ---------------------------------------------------------------------------
             elif isinstance(op, LoadVariable):
                 # ------------------------------------------------------------------
-                # 1. Common set-up --------------------------------------------------
+                # 1. Common set‑up --------------------------------------------------
                 # ------------------------------------------------------------------
                 deriv_order = op.deriv_order
                 field_names = op.field_names
 
-                # *Reference* tables are side-agnostic (no suffix)        # NEW
-                side_suffix_basis = ""                                   # NEW
+                # *Reference* tables are side‑agnostic (no suffix)
+                side_suffix_basis = ""
 
                 # helper: "dxy_" or "b_" + field name
                 def get_basis_arg_name(field_name, deriv):
@@ -166,13 +166,10 @@ class NumbaCodeGen:
                 for arg_name in basis_arg_names:
                     required_args.add(arg_name)
 
-                # Which J⁻¹ to use for push-forward / derivatives
-                if op.side == "+":
-                    jinv_sym = "J_inv_pos"; required_args.add("J_inv_pos")
-                elif op.side == "-":
-                    jinv_sym = "J_inv_neg"; required_args.add("J_inv_neg")
-                else:
-                    jinv_sym = "J_inv";      required_args.add("J_inv")
+                # Which J⁻¹ to use for push‑forward / derivatives
+                if   op.side == "+":  jinv_sym = "J_inv_pos"; required_args.add("J_inv_pos")
+                elif op.side == "-":  jinv_sym = "J_inv_neg"; required_args.add("J_inv_neg")
+                else:                 jinv_sym = "J_inv";      required_args.add("J_inv")
 
                 # reference value(s) at current quadrature point
                 basis_vars_at_q = [f"{arg_name}[e, q]" for arg_name in basis_arg_names]
@@ -180,67 +177,84 @@ class NumbaCodeGen:
                 # ------------------------------------------------------------------
                 # 2. Test / Trial functions  ---------------------------------------
                 # ------------------------------------------------------------------
+                print(f"Visiting LoadVariable: {op.name}, role={op.role}, side={op.side}, "
+                    f"deriv_order={deriv_order}, field_names={field_names}, "
+                    f"is_vector={getattr(op, 'is_vector', None)}, "
+                    f"is_gradient={getattr(op, 'is_gradient', None)}")
+
                 if op.role in ("test", "trial"):
 
-                    # ─── inside _visit_LoadVariable, just after   if op.side:  ──────────
-                    if op.side:                                              # facet  (+ / -)
-                        local_basis_var = new_var("local_basis")
-                        body_lines.append(f"{local_basis_var} = {basis_vars_at_q[0]}")
-
+                    # ---------- facet integrals (+ / -) : pad to union DOFs ----------
+                    if op.side:                                              # "+" or "-"
                         map_array_name = "pos_map" if op.side == "+" else "neg_map"
                         required_args.add(map_array_name)
 
-                        padded_basis_var = new_var("padded_basis")
-                        map_e            = new_var(f"{map_array_name}_e")
-
+                        map_e = new_var(f"{map_array_name}_e")
                         body_lines += [
                             f"{map_e} = {map_array_name}[e]",
-                            f"n_union = gdofs_map[e].shape[0]",
-                            # ── fast path: union already == element length ───────────────
-                            f"if n_union == {local_basis_var}.shape[0]:",
-                            f"    {padded_basis_var} = {local_basis_var}.copy()",
-                            f"else:",                                                     # ghost facet
-                            f"    {padded_basis_var} = np.zeros(n_union, dtype=np.float64)",
-                            f"    for j in range({local_basis_var}.shape[0]):",
-                            f"        idx = {map_e}[j]",
-                            f"        if 0 <= idx < n_union:",
-                            f"            {padded_basis_var}[idx] = {local_basis_var}[j]",
+                            f"n_union = gdofs_map[e].shape[0]",              # e.g. 36 for Stokes
                         ]
 
-                        final_basis_var = padded_basis_var
-                        n_dofs          = -1                                              # run‑time
+                        padded_vars = []                                     # one per component
+                        for i, bq in enumerate(basis_vars_at_q):
+                            loc = new_var(f"local_basis{i}")
+                            pad = new_var(f"padded_basis{i}")
+                            body_lines += [
+                                f"{loc} = {bq}",
+                                f"if n_union == {loc}.shape[0]:",          # fast path (interior facet)
+                                f"    {pad} = {loc}.copy()",
+                                f"else:",                                  # true ghost facet
+                                f"    {pad} = np.zeros(n_union, dtype=np.float64)",
+                                f"    for j in range({loc}.shape[0]):",
+                                f"        idx = {map_e}[j]",
+                                f"        if 0 <= idx < n_union:",
+                                f"            {pad}[idx] = {loc}[j]",
+                            ]
+                            padded_vars.append(pad)
 
-                    else:                                                     # volume / interface
+                        basis_vars_at_q = padded_vars        # hand off the padded list
+                        final_basis_var = padded_vars[0]     # for scalar reshape path
+                        n_dofs = -1                          # run‑time on ghost facets
+
+                    # ---------- volume / interface -----------------------------------
+                    else:
                         final_basis_var = basis_vars_at_q[0]
-                        n_dofs          = self.me.n_dofs_local
+                        n_dofs = self.me.n_dofs_local
 
-                    # reshape or stack
-                    if not op.is_vector:
+                    # ---------- reshape (scalar) or stack (vector) -------------------
+                    if not op.is_vector:                               # scalar basis
                         var_name = new_var("basis_reshaped")
                         body_lines.append(f"{var_name} = {final_basis_var}[np.newaxis, :].copy()")
                         shape = (1, n_dofs)
-                    else:
+                    else:                                              # vector basis
                         var_name = new_var("basis_stack")
                         body_lines.append(f"{var_name} = np.stack(({', '.join(basis_vars_at_q)}))")
                         shape = (len(field_names), n_dofs)
 
-                    # push-forward for ∂-ordered bases
+                    # ---------- push‑forward for ∂‑ordered bases ---------------------
                     if deriv_order != (0, 0):
                         dx, dy = deriv_order
-                        jinv_q = f"{jinv_sym}_q"                #  J_inv_pos_q, J_inv_neg_q, J_inv_q
+                        jinv_q = f"{jinv_sym}_q"                       # J_inv_pos_q, …
                         scale  = f"({jinv_q}[0,0]**{dx}) * ({jinv_q}[1,1]**{dy})"
                         body_lines.append(f"{var_name} *= {scale}")
 
+                    # ---------- push onto stack --------------------------------------
                     stack.append(
                         StackItem(
-                            var_name   = var_name,
-                            role       = op.role,
-                            shape      = shape,
-                            is_vector  = op.is_vector,
-                            field_names= field_names,
-                            parent_name= op.name
+                            var_name    = var_name,
+                            role        = op.role,
+                            shape       = shape,
+                            is_vector   = op.is_vector,
+                            field_names = field_names,
+                            parent_name = op.name
                         )
                     )
+
+                # ------------------------------------------------------------------
+                # 3. Coefficient look‑ups (role == "function") stay unchanged
+                #     ↓ leave the existing code that follows here as‑is ↓
+                # ------------------------------------------------------------------
+
 
                 # ------------------------------------------------------------------
                 # 3. Coefficient / Function values ---------------------------------
