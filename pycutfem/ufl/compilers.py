@@ -1256,42 +1256,62 @@ class FormCompiler:
         for k in ('basis_values', 'normal', 'phi_val', 'eid', 'x_phys', 'global_dofs', 'pos_map', 'neg_map'):
             self.ctx.pop(k, None)
     
+
     def _assemble_interface_jit(self, intg, matvec):
         """
-        Assemble ∫_Γ ⋯ using the JIT backend.
-        All kernel tables are sized (n_elems_total, …) so the kernel may
-        iterate over *all* elements; non-cut rows are zero and contribute
-        nothing.
+        Assemble interface terms (∫_Γ …) with the JIT back‑end **using
+        cut‑only tables**.
+
+        All geometry/basis tables coming from
+        `DofHandler.precompute_interface_factors` are sized
+        ``n_cut_elems × …`` and contain *only* the rows that correspond to
+        the global element ids listed in ``geo["eids"]``.  We therefore:
+
+        1. build a DOF‑map of the same length,
+        2. feed those aligned arrays to the kernel, and
+        3. scatter the kernel output with the matching global‑id list.
         """
+        dh, me  = self.dh, self.me
+        mesh    = me.mesh
 
-        dh, me = self.dh, self.me
-        mesh   = me.mesh
+        # ------------------------------------------------------------------
+        # 1. Which elements carry an interface?  (BitSet → array of ids)
+        # ------------------------------------------------------------------
+        cut_bs = (intg.measure.defined_on
+                if intg.measure.defined_on is not None
+                else mesh.element_bitset("cut"))
 
-        # 1.  BitSet of cut elements ------------------------------------------------
-        cut_eids = (intg.measure.defined_on
-                    if intg.measure.defined_on is not None
-                    else mesh.element_bitset("cut"))
-
-        if cut_eids.cardinality() == 0:            # nothing to do
+        if cut_bs.cardinality() == 0:          # nothing to do
             return
 
-        # 2.  Geometric pre-compute --------------------------------------------------
+        # ------------------------------------------------------------------
+        # 2. Pre‑compute geometry for the interface elements only
+        # ------------------------------------------------------------------
         qdeg      = self._find_q_order(intg)
         level_set = intg.measure.level_set
         if level_set is None:
             raise ValueError("dInterface measure requires a level_set.")
 
-        geo = dh.precompute_interface_factors(cut_eids, qdeg, level_set)
+        geo = dh.precompute_interface_factors(cut_bs, qdeg, level_set)
+        cut_eids = geo["eids"].astype(np.int32)      # 1‑D array, len = n_cut
 
-        # 3.  Full element-to-DOF map  (shape = n_elems_total × n_loc) --------------
+        # ------------------------------------------------------------------
+        # 3. Element‑to‑DOF map  (shape = n_cut × n_loc)
+        # ------------------------------------------------------------------
         gdofs_map = np.vstack(
-            [dh.get_elemental_dofs(eid) for eid in range(mesh.n_elements)]
+            [dh.get_elemental_dofs(eid) for eid in cut_eids]
         ).astype(np.int32)
+        geo["gdofs_map"] = gdofs_map
 
-        # 4.  gather coefficient Functions once ----------------------------
+        # ------------------------------------------------------------------
+        # 4. Gather coefficient Functions once
+        # ------------------------------------------------------------------
         current_funcs = self._get_data_functions_objs(intg)
 
-        # 5.  Compile kernel & build argument dict ----------------------------------
+        # ------------------------------------------------------------------
+        # 5. Compile kernel & build static argument dict
+        # ------------------------------------------------------------------
+
         runner, ir = self._compile_backend(intg.integrand, dh, me)
 
         basis_args = _build_jit_kernel_args(
@@ -1299,30 +1319,29 @@ class FormCompiler:
             dof_handler = dh,
             gdofs_map   = gdofs_map,
             param_order = runner.param_order,
-            pre_built   = geo           # already sized n_elems_total
+            pre_built   = geo
         )
 
-        static_args = {k: v for k, v in geo.items() if k != 'eids'}
+        static_args = {k: v for k, v in geo.items() if k != "eids"}
         static_args.update(basis_args)
 
-        # 5.  Execute the kernel -----------------------------------------------------
-        K, F, J = runner(current_funcs, static_args)
+        # ------------------------------------------------------------------
+        # 6. Execute kernel  → element buffers K/F/J
+        # ------------------------------------------------------------------
+        K_cut, F_cut, J_cut = runner(current_funcs, static_args)
 
-        # 6. scatter ONLY the cut rows --------------------------------------
-        cut_eids = geo["eids"]                 # 1-D array of global ids
-        K_cut = K[cut_eids]
-        F_cut = F[cut_eids]
-        J_cut = J[cut_eids] if J is not None else None
-
-        gdofs_cut = gdofs_map[cut_eids]        # rows aligned with K_cut
+        # ------------------------------------------------------------------
+        # 7. Scatter the contributions from the cut elements
+        # ------------------------------------------------------------------
         hook = self._hook_for(intg.integrand)
 
         _scatter_element_contribs(
             K_cut, F_cut, J_cut,
-            cut_eids, gdofs_cut,
+            cut_eids, gdofs_map,
             matvec, self.ctx, intg.integrand,
-            hook=hook,  # Pass the hook for scalar functionals
+            hook = hook,          # scalar‑functional hook, if any
         )
+
 
     def _assemble_interface(self, intg: Integral, matvec):
         """Assemble integrals over non-conforming interfaces defined by a level set."""

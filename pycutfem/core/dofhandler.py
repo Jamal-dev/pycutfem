@@ -744,8 +744,8 @@ class DofHandler:
             return _edge_geom_cache[cache_key]
 
         # --- Allocation ---
-        # n_elems = len(valid_cut_eids)
-        n_elems = mesh.n_elements
+        n_elems = len(valid_cut_eids)
+        # n_elems = mesh.n_elements
         # We need a representative segment to determine n_q
         p0_rep, p1_rep = mesh.elements_list[valid_cut_eids[0]].interface_pts
         q_xi_rep, q_w_rep = line_quadrature(p0_rep, p1_rep, qdeg)
@@ -763,8 +763,7 @@ class DofHandler:
         b_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local))         for f in fields}
         g_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local, 2))      for f in fields}
         h_arr = np.zeros((n_elems,))  # Placeholder for element sizes
-        for eid in range(n_elems):
-            h_arr[eid] = mesh.element_char_length(eid)
+        
 
         # --- Loop over valid cut elements ---
         for k, eid in enumerate(valid_cut_eids):
@@ -772,33 +771,34 @@ class DofHandler:
             # print(f"eid: {eid}, h_arr[eid]: {h_arr[eid]}")  # Debug output
             elem = mesh.elements_list[eid]
             p0, p1 = elem.interface_pts
+            h_arr[k] = mesh.element_char_length(eid)
 
             # --- Quadrature rule on the physical interface segment ---
             q_xi, q_w = line_quadrature(p0, p1, qdeg)
 
             for q, (xq, wq) in enumerate(zip(q_xi, q_w)):
-                qp_phys[eid, q] = xq
-                qw[eid, q] = wq
+                qp_phys[k, q] = xq
+                qw[k, q] = wq
 
                 # Normal and phi value from the level set
                 g = level_set.gradient(xq)
-                # norm_g = np.linalg.norm(g)
-                normals[eid, q] = g #/ (norm_g + 1e-30)
-                phis[eid, q] = level_set(xq)
+                norm_g = np.linalg.norm(g)
+                normals[k, q] = g / (norm_g + 1e-30)
+                phis[k, q] = level_set(xq)
 
                 # Jacobian of the parent element at the quadrature point
                 xi_ref, eta_ref = transform.inverse_mapping(mesh, eid, xq)
                 J = transform.jacobian(mesh, eid, (xi_ref, eta_ref))
-                detJ_arr[eid, q] = np.linalg.det(J)
-                Jinv_arr[eid, q] = np.linalg.inv(J)
+                detJ_arr[k, q] = np.linalg.det(J)
+                Jinv_arr[k, q] = np.linalg.inv(J)
                 for fld in fields:
-                    b_tabs[fld][eid, q] = me.basis      (fld, xi_ref, eta_ref)
-                    g_tabs[fld][eid, q] = me.grad_basis (fld, xi_ref, eta_ref)
+                    b_tabs[fld][k, q] = me.basis      (fld, xi_ref, eta_ref)
+                    g_tabs[fld][k, q] = me.grad_basis (fld, xi_ref, eta_ref)
 
         # --- Gather results and cache ---
         out = {
-            'eids': np.array(valid_cut_eids, dtype=int),
-            # 'eids': np.arange(mesh.n_elements, dtype=int),  # All elements, not just cut
+            'eids': np.asarray(valid_cut_eids, dtype=int),
+            # 'eids': np.arange(n_elems, dtype=int),  
             'qp_phys': qp_phys, 'qw': qw, 'normals': normals, 'phis': phis,
             'detJ': detJ_arr, 'J_inv': Jinv_arr, 'h_arr': h_arr,
         }
