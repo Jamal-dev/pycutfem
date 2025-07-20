@@ -468,7 +468,7 @@ class NumbaCodeGen:
                 # 1)  Divergence of basis gradients (Test / Trial)  →  scalar (1,n)
                 #     a.var_name shape: (k , n_loc , d)
                 # ---------------------------------------------------------------
-                print(f"Div: a.shape={a.shape}, a.role={a.role},a.is_vector={a.is_vector}, a.is_gradient={a.is_gradient}")
+                # print(f"Div: a.shape={a.shape}, a.role={a.role},a.is_vector={a.is_vector}, a.is_gradient={a.is_gradient}")
                 if a.role in ("test", "trial") and a.shape[0] ==2 and a.is_gradient:
                     # print("hello "*10)
                     body_lines.append("# Div(basis) → scalar basis (1,n_loc)")
@@ -547,7 +547,7 @@ class NumbaCodeGen:
             elif isinstance(op, Inner):
                 b = stack.pop(); a = stack.pop()
                 res_var = new_var("inner")
-                print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}")
+                # print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}")
                 if a.role in ('test', 'trial') and b.role in ('test', 'trial'): # LHS
                     if a.is_gradient and b.is_gradient:
                         body_lines.append(f'# Inner(Grad, Grad): stiffness matrix')
@@ -1329,7 +1329,7 @@ def {kernel_name}(
     num_elements        = qp_phys.shape[0]
     # n_dofs_per_element  = {self.n_dofs_local}
     n_dofs_per_element  = gdofs_map.shape[1]            # 9 for volume, 15 on ghost edge
-    print(f"num_elements: {{num_elements}},n_dofs_per_element: {{n_dofs_per_element}}")
+    # print(f"num_elements: {{num_elements}},n_dofs_per_element: {{n_dofs_per_element}}")
     
     K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
     F_values = np.zeros((num_elements, n_dofs_per_element), dtype=np.float64)

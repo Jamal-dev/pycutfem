@@ -22,10 +22,79 @@ import inspect
 import numpy as np
 import scipy.sparse.linalg as spla
 import scipy.sparse as sp
-from pycutfem.ufl.helpers_jit import _scatter_element_contribs
+# from pycutfem.ufl.helpers_jit import _scatter_element_contribs
 from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
 from pycutfem.jit import compile_multi        # NEW import
 
+def _scatter_element_contribs(
+    *,
+    K_elem: np.ndarray | None,
+    F_elem: np.ndarray | None,
+    J_elem: np.ndarray | None,
+    element_ids: np.ndarray,
+    gdofs_map: np.ndarray,
+    target: np.ndarray,            # lil_matrix for Jacobian, 1‑D array for RHS
+    ctx: dict,
+    integrand,
+    hook,
+):
+    """
+    Add local element (or facet) contributions into the global matrix / vector.
+
+    Behaviour is controlled via *ctx*:
+        ctx["rhs"]  : True  → F_elem is assembled (vector mode)
+                      False → K_elem is assembled (matrix mode)
+        ctx["add"]  : True  → contributions are *added* to *target*
+                      False → target[...] is overwritten
+    """
+    rhs    = ctx.get("rhs", False)
+    do_add = ctx.get("add", True)
+
+    # ------------------------------------------------------------------ #
+    # Matrix contributions                                               #
+    # ------------------------------------------------------------------ #
+    if not rhs and K_elem is not None and K_elem.ndim == 3:
+        for i in range(len(element_ids)):
+            gdofs = gdofs_map[i]
+            valid = gdofs >= 0                      # ignore padding (‑1)
+
+            if not np.any(valid):
+                continue
+
+            rows = gdofs[valid]
+            Ke   = K_elem[i][np.ix_(valid, valid)]
+
+            r, c = np.meshgrid(rows, rows, indexing="ij")
+            if do_add:
+                target[r, c] += Ke
+            else:
+                target[r, c]  = Ke
+
+    # ------------------------------------------------------------------ #
+    # Vector contributions                                               #
+    # ------------------------------------------------------------------ #
+    if rhs and F_elem is not None:
+        for i in range(len(element_ids)):
+            gdofs = gdofs_map[i]
+            valid = gdofs >= 0
+
+            if not np.any(valid):
+                continue
+
+            if do_add:
+                np.add.at(target, gdofs[valid], F_elem[i][valid])
+            else:
+                target[gdofs[valid]] = F_elem[i][valid]
+
+    # ------------------------------------------------------------------ #
+    # Functional contributions (unchanged)                               #
+    # ------------------------------------------------------------------ #
+    if hook and J_elem is not None:
+        total = J_elem.sum(axis=0) if J_elem.ndim > 1 else J_elem.sum()
+        acc = ctx.setdefault("scalar_results", {}).setdefault(
+            hook["name"], np.zeros_like(total)
+        )
+        acc += total
 
 # ----------------------------------------------------------------------------
 #  Parameter dataclasses
@@ -183,6 +252,7 @@ class NewtonSolver:
 
             # Newton loop -----------------------------------------
             delta_U = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
+            print(f"    Time step {step+1}: ΔU = {np.linalg.norm(delta_U, ord=np.inf):.2e}")
 
             # Steady‑state test -----------------------------------
             if (
@@ -246,52 +316,80 @@ class NewtonSolver:
     # ------------------------------------------------------------------
     #  Linear system & BC handling
     # ------------------------------------------------------------------
-    def _assemble_system(self, coeffs, *, need_matrix=True):
+    def _assemble_system(self, coeffs, *, need_matrix: bool = True):
+        """
+        Assemble global Jacobian A (optional) and residual R.
+
+        The key difference from the old version is that we *accumulate* every
+        kernel’s contribution into one global matrix / vector instead of overwriting
+        them on each loop iteration.
+        """
         dh   = self.dh
         ndof = dh.total_dofs
-        A    = sp.lil_matrix((ndof, ndof)) if need_matrix else None
-        R    = np.zeros(ndof)
 
-        # ------------ Jacobian (matrix) --------------------------------
+        A_glob = sp.lil_matrix((ndof, ndof)) if need_matrix else None
+        R_glob = np.zeros(ndof)
+
+        # ------------------------------------------------------------------ #
+        # 1) Jacobian                                                        #
+        # ------------------------------------------------------------------ #
         if need_matrix:
             for ker in self.kernels_K:
-                Kloc, _, _ = ker.exec(coeffs)           # Floc is None
+                Kloc, _, _ = ker.exec(coeffs)
+
                 _scatter_element_contribs(
-                    Kloc, None, None,
-                    ker.static_args["eids"],
-                    ker.static_args["gdofs_map"],
-                    A, {"rhs": False},
-                    ker, hook=None
+                    K_elem      = Kloc,
+                    F_elem      = None,
+                    J_elem      = None,
+                    element_ids = ker.static_args["eids"],
+                    gdofs_map   = ker.static_args["gdofs_map"],
+                    target      = A_glob,               # accumulate into A_glob
+                    ctx         = {"rhs": False, "add": True},
+                    integrand   = ker,
+                    hook        = None,
                 )
 
-        # ------------ Residual (vector) -------------------------------
+        # ------------------------------------------------------------------ #
+        # 2) Residual                                                        #
+        # ------------------------------------------------------------------ #
         for ker in self.kernels_F:
             _, Floc, _ = ker.exec(coeffs)
+
+            R_inc = np.zeros_like(R_glob)                # per‑kernel buffer
             _scatter_element_contribs(
-                None, Floc, None,
-                ker.static_args["eids"],
-                ker.static_args["gdofs_map"],
-                R, {"rhs": True},
-                ker, hook = None
+                K_elem      = None,
+                F_elem      = Floc,
+                J_elem      = None,
+                element_ids = ker.static_args["eids"],
+                gdofs_map   = ker.static_args["gdofs_map"],
+                target      = R_inc,                     # write into buffer
+                ctx         = {"rhs": True, "add": True},
+                integrand   = ker,
+                hook        = None,
             )
 
-        # ------------ enforce homogeneous Dirichlet rows --------------
+            # print individual contribution (handy for debugging)
+            print(f"{ker.domain:9}: |R|_∞ = {np.linalg.norm(R_inc, np.inf):.3e}")
+
+            R_glob += R_inc                              # accumulate
+
+        # ------------------------------------------------------------------ #
+        # 3) Homogeneous Dirichlet rows                                       #
+        # ------------------------------------------------------------------ #
         if need_matrix and self.bcs_homog:
-            bc_data = dh.get_dirichlet_data(self.bcs_homog)   # existing helper
+            bc_data = dh.get_dirichlet_data(self.bcs_homog)
             if bc_data:
                 rows = np.fromiter(bc_data.keys(),  dtype=int)
                 vals = np.fromiter(bc_data.values(), dtype=float)
 
-                # build a dense vector with the prescribed values
                 bc_vec = np.zeros(ndof)
                 bc_vec[rows] = vals
 
-                # enforce u = g on those rows/cols
-                R -= A @ bc_vec
-                A  = _zero_rows_cols(A, rows)
-                R[rows] = vals
+                R_glob -= A_glob @ bc_vec          # move prescribed values to RHS
+                A_glob  = _zero_rows_cols(A_glob, rows)
+                R_glob[rows] = vals               # enforce value in residual
 
-        return A.tocsr() if need_matrix else None, R
+        return (A_glob.tocsr() if need_matrix else None), R_glob
 
 
     def _solve_linear_system(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:

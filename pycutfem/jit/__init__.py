@@ -92,18 +92,20 @@ class KernelRunner:
         neg_map = kernel_args.get("neg_map")
 
         # helper ------------------------------------------------------------
-        def _gather(side_map):
-            """Return dense coeff array matching *side_map* (‑1 → 0)."""
+        n_union = gdofs_map.shape[1]
+        # print(f"KernelRunner: gdofs_map.shape={gdofs_map.shape}, n_union={n_union}")
+        def _gather(side_map, tag):
             if side_map is None:
-                return None
-            # side_map might be ragged (dtype=object); stack if needed
-            if side_map.dtype == object:
-                from pycutfem.ufl.helpers_jit import _stack_ragged
-                side_map = _stack_ragged(side_map)
-            coeff = np.zeros_like(side_map, dtype=full_vec.dtype)
-            mask  = side_map >= 0
-            coeff[mask] = full_vec[side_map[mask]]
-            return coeff
+                return
+            # print(f"KernelRunner: side_map.shape={side_map.shape}, tag={tag}")
+            # side_map is (n_elem, n_side) with union indices (‑1 = padding)
+            coeff = np.zeros((side_map.shape[0], n_union), dtype=full_vec.dtype)
+            for e in range(side_map.shape[0]):
+                idx = side_map[e]
+                m   = idx >= 0                         # ignore padding
+                coeff[e, idx[m]] = full_vec[gdofs_map[e, idx[m]]]
+            kernel_args[f"u_{name}__{tag}_loc"] = coeff   #  **double “__”**
+
 
         for name in self.func_names:                  # 'u_k', 'p'
             f = functions[name]                       # Function / VectorFunction
@@ -118,11 +120,8 @@ class KernelRunner:
             kernel_args[f"u_{name}_loc"] = full_vec[gdofs_map]
 
             # 2b) ghost/interface  u_<name>_pos_loc / _neg_loc --------------
-            if pos_map is not None:
-                kernel_args[f"u_{name}_pos_loc"] = _gather(pos_map)
-            if neg_map is not None:
-                kernel_args[f"u_{name}_neg_loc"] = _gather(neg_map)
-
+            _gather(pos_map, "pos")
+            _gather(neg_map, "neg")
         # ---------------------------------------------------------------
         # D)  final sanity check – everything the kernel listed?
         # ---------------------------------------------------------------
