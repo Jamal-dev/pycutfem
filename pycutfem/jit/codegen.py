@@ -6,7 +6,7 @@ from matplotlib.pylab import f
 from .ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
-    BinaryOp, Inner, Dot, Store, Transpose, CellDiameter
+    BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent
 )
 from pycutfem.jit.symbols import encode
 import numpy as np
@@ -120,6 +120,14 @@ class NumbaCodeGen:
                                         role='const',
                                         shape=(self.spatial_dim,),
                                         is_vector=True))
+            elif isinstance(op, LoadFacetNormalComponent):
+                required_args.add("normals")
+                var_name = new_var("nrm_c")
+                body_lines.append(f"{var_name} = normals[e, q, {op.idx}]")
+                stack.append(StackItem(var_name=var_name,
+                                       role='const',
+                                       shape=(),          # scalar
+                                       is_vector=False))
             
             elif isinstance(op, LoadElementWiseConstant):
                 # the full (n_elem, …) array is passed as a kernel argument

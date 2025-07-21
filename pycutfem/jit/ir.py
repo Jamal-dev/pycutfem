@@ -93,3 +93,8 @@ class Transpose:
 @dataclass(frozen=True, slots=True)
 class CellDiameter:
     pass
+
+@dataclass(frozen=True, slots=True)
+class LoadFacetNormalComponent:
+    """Load n[idx] (scalar component of the facet normal)."""
+    idx: int

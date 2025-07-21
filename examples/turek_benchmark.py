@@ -66,8 +66,8 @@ print(f"Reynolds number (Re): {Re:.2f}")
 
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-NX, NY = 10, 10
-# NX, NY = 40, 40
+# NX, NY = 18, 18
+NX, NY = 50, 60
 poly_order = 2
 nodes, elems, _, corners = structured_quad(L, H, nx=NX, ny=NY, poly_order=poly_order)
 mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
@@ -82,7 +82,7 @@ bc_tags = {
     'outlet': lambda x, y: np.isclose(x, L),
     'walls':  lambda x, y: np.isclose(y, 0) | np.isclose(y, H),
 }
-mesh.tag_boundary_edges(bc_tags)
+
 
 # --- Define Parabolic Inflow Profile ---
 def parabolic_inflow(x, y):
@@ -103,14 +103,17 @@ bcs_homog = [BoundaryCondition(bc.field, bc.method, bc.domain_tag, lambda x, y: 
 
 
 
-# In[4]:
+# In[ ]:
 
 
 # --- Level Set for the Cylinder Obstacle ---
-level_set = CircleLevelSet(center=(c_x, c_y), radius=D / 2.0)
+
+
+level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
 mesh.classify_elements(level_set)
 mesh.classify_edges(level_set)
 mesh.build_interface_segments(level_set=level_set)
+mesh.tag_boundary_edges(bc_tags)
 
 # --- Define Domains with BitSets ---
 fluid_domain = get_domain_bitset(mesh, "element", "outside")
@@ -126,6 +129,11 @@ dof_handler.info()
 
 print(f"Number of interface edges: {mesh.edge_bitset('interface').cardinality()}")
 print(f"Number of ghost edges: {ghost_edges.cardinality()}")
+print(f"Number of cut elements: {cut_domain.cardinality()}")
+from pycutfem.io.visualization import plot_mesh_2
+fig, ax = plt.subplots(figsize=(10, 8))
+plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True, 
+              plot_nodes=False, elem_tags=True, edge_colors=True)
 
 
 # In[ ]:
@@ -134,7 +142,7 @@ print(f"Number of ghost edges: {ghost_edges.cardinality()}")
 
 
 
-# In[5]:
+# In[ ]:
 
 
 # ============================================================================
@@ -164,8 +172,24 @@ theta = Constant(0.5) # Crank-Nicolson
 mu_const = Constant(mu)
 rho_const = Constant(rho)
 
+u_k.nodal_values.fill(0.0); p_k.nodal_values.fill(0.0)
+u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
+dof_handler.apply_bcs(bcs, u_n, p_n)
 
-# In[6]:
+
+# In[ ]:
+
+
+u_n.plot()
+
+
+# In[ ]:
+
+
+print(len(dof_handler.get_dirichlet_data(bcs)))
+
+
+# In[ ]:
 
 
 from pycutfem.ufl.expressions import Derivative
@@ -187,9 +211,9 @@ def grad_inner(u, v):
 def _grad_comp(a, b):
     return (Derivative(a,1,0) * Derivative(b, 1,0) + Derivative(a, 0, 1) * Derivative(b, 0, 1))
 
-dx_phys  = dx(physical_domain)               # volume
-dΓ        = dInterface(level_set=level_set)   # interior surface
-dG       = dGhost(defined_on=mesh.edge_bitset("ghost"), level_set=level_set)
+dx_phys  = dx(defined_on=physical_domain,metadata={q:6})               # volume
+dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={q:4})   # interior surface
+dG       = dGhost(defined_on=mesh.edge_bitset("ghost"), level_set=level_set,metadata={q:4})  # ghost surface
 
 n       = FacetNormal()                       # (nx , ny)
 cell_h  = CellDiameter() # length‑scale per element
@@ -229,8 +253,7 @@ def sigma_dot_n_v(u_vec, p_scal,v_test):
 J_int = (
     - sigma_dot_n_v(du, dp, v)           # consistency
     - sigma_dot_n_v(v, q, du)           # symmetry
-    # + beta_N * mu / cell_h * dot(du, v)     # penalty
-    + beta_N * mu / Constant(0.1) * dot(du, v)     # penalty
+    + beta_N * mu / cell_h * dot(du, v)     # penalty
 ) * dΓ
 
 # --- Residual contribution on Γsolid --------------------------------
@@ -245,40 +268,56 @@ a_vol = ( rho*dot(du,v)/dt
           + theta*rho*dot(dot(grad(u_k), du), v)
           + theta*rho*dot(dot(grad(du), u_k), v)
           + theta*mu*inner(grad(du), grad(v))
-          - dp*div(v) + q*div(du) ) * dx_phys
+          - dp*div(v) + q*div(du) ) * dx(defined_on=physical_domain,metadata={q:6}) 
 
 r_vol = ( rho*dot(u_k-u_n, v)/dt
           + theta*rho*dot(dot(grad(u_k), u_k), v)
           + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
           + theta*mu*inner(grad(u_k), grad(v))
           + (1-theta)*mu*inner(grad(u_n), grad(v))
-          - p_k*div(v) + q*div(u_k) ) * dx_phys
+          - p_k*div(v) + q*div(u_k) ) * dx(defined_on=physical_domain,metadata={q:6}) 
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
-gamma_0 = Constant(10.0) # Penalty parameter for jump in value
-gamma_1 = Constant(0.1)  # Penalty parameter for jump in gradient
-stab = gamma_0 * cell_h * grad_inner(jump(u_k), jump(v)) * dGhost(defined_on=mesh.edge_bitset("ghost"), level_set=level_set)         # u_k, v
-stab_lin = gamma_1 * cell_h * grad_inner(jump(du), jump(v)) * dGhost(defined_on=mesh.edge_bitset("ghost"), level_set=level_set)      # du, v
+gamma_val = Constant(10.0 * poly_order**2)
+gamma_grad= Constant(0.1  * poly_order**2)
 
+stab      = ( gamma_val  * cell_h   * dot(jump(u_k), jump(v))
+            + gamma_grad / cell_h   * grad_inner(jump(u_k), jump(v)) ) * dG
+
+stab_lin  = ( gamma_val  * cell_h   * dot(jump(du),  jump(v))
+            + gamma_grad / cell_h   * grad_inner(jump(du),  jump(v)) ) * dG
 # complete Jacobian and residual -----------------------------------
 jacobian_form  = a_vol + J_int + stab_lin
 residual_form  = r_vol + R_int + stab
-# jacobian_form  = a_vol
-# residual_form  = r_vol
-
-u_k.nodal_values.fill(0.0); p_k.nodal_values.fill(0.0)
-u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
-dof_handler.apply_bcs(bcs, u_n, p_n)
+# residual_form  = dot(  Constant(np.array([0.0, 0.0]),dim=1), v) * dx
+# jacobian_form  = J_int
+# residual_form  = R_int
 
 
 
-# In[7]:
+
+
+# In[ ]:
+
+
+get_ipython().system('rm ~/.cache/pycutfem_jit/*')
+
+
+# In[ ]:
+
+
+# from pycutfem.ufl.forms import assemble_form
+# K,F=assemble_form(jacobian_form==-residual_form, dof_handler=dof_handler, bcs=bcs_homog)
+# print(np.linalg.norm(F, ord=np.inf))
+
+
+# In[ ]:
 
 
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
-time_params = TimeStepperParameters(dt=0.1, stop_on_steady=True, steady_tol=1e-6, theta= 0.49)
+time_params = TimeStepperParameters(dt=dt.value,max_steps=36 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
 
 solver = NewtonSolver(
     residual_form, jacobian_form,
@@ -292,7 +331,8 @@ solver = NewtonSolver(
 functions      = [u_k, p_k]
 prev_functions = [u_n, p_n]
 
-solver.solve_time_interval(functions=functions,prev_functions= prev_functions,
+solver.solve_time_interval(functions=functions,
+                           prev_functions= prev_functions,
                            time_params=time_params,)
 
 

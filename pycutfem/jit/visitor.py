@@ -4,13 +4,14 @@ from pycutfem.ufl.expressions import (
     VectorTestFunction, VectorTrialFunction, VectorFunction,
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, 
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
-    ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter
+    ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter,
+    NormalComponent
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
     LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
-    CellDiameter
+    CellDiameter,LoadFacetNormalComponent
 )
 from dataclasses import replace
 import logging
@@ -169,7 +170,10 @@ class IRGenerator:
         if isinstance(node, FacetNormal):
             self.ir_sequence.append(LoadFacetNormal())
             return
-        
+        if isinstance(node, NormalComponent):
+            self.ir_sequence.append(LoadFacetNormalComponent(idx=node.idx))
+            return
+
         if isinstance(node, ElementWiseConstant):
             name = f"ewc_{id(node)}"
             # This was a bug, creating a UFL node instead of an IR node

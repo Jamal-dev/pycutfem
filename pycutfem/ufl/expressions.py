@@ -861,7 +861,20 @@ class ElementWiseConstant(Expression):
         shape = "scalar" if self.tensor_shape == () else f"tensor{self.tensor_shape}"
         return f"ElementWiseConstant({shape})"
 
-class FacetNormal(Expression): pass
+class NormalComponent(Expression):
+    """Scalar component of the interface normal vector."""
+    def __init__(self, parent: "FacetNormal", idx: int):
+        super().__init__()
+        self.parent = parent      # the FacetNormal instance
+        self.idx    = idx         # 0 → n_x , 1 → n_y
+
+    def __repr__(self):
+        return f"NormalComponent({self.idx})"
+class FacetNormal(Expression): 
+    def __getitem__(self, idx: int):
+        if idx not in (0, 1):
+            raise IndexError("FacetNormal has two components (0, 1).")
+        return NormalComponent(self, idx)
 
 class Sum(Expression):
     def __init__(self, a, b): self.a, self.b = a, b

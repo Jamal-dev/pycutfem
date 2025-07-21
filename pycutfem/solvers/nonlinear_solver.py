@@ -111,7 +111,7 @@ class NewtonParameters:
     line_search: bool = True
     ls_max_iter: int = 8
     ls_reduction: float = 0.5           # α ← β·α after reject
-    ls_c1: float = 1.0e-4               # sufficient‑decrease parameter
+    ls_c1: float = 0.1#1.0e-4               # sufficient‑decrease parameter
 
 
 @dataclass
@@ -301,7 +301,7 @@ class NewtonSolver:
             dU = self._solve_linear_system(A, -R)
 
             if self.np.line_search:
-                dU = self._line_search(funcs, dU, current, norm_R, bcs_now)
+                dU = self._line_search(funcs, dU, current, R, bcs_now)
 
             dh.add_to_functions(dU, funcs)
             dh.apply_bcs(bcs_now, *funcs)
@@ -348,6 +348,7 @@ class NewtonSolver:
                     integrand   = ker,
                     hook        = None,
                 )
+            self._last_jacobian = A_glob 
 
         # ------------------------------------------------------------------ #
         # 2) Residual                                                        #
@@ -399,31 +400,69 @@ class NewtonSolver:
             raise ValueError(f"Unknown linear solver backend '{self.lp.backend}'.")
 
 
-    # ------------------------------------------------------------------
-    #  Armijo back‑tracking line‑search
-    # ------------------------------------------------------------------
-    def _line_search(self, funcs, dU, coeffs, R0, bcs_now):
-        dh    = self.dh
-        alpha = 1.0
+    def _phi(self, vec):                 # ½‖·‖² helper
+        return 0.5 * np.dot(vec, vec)
 
-        for _ in range(self.np.ls_max_iter):
-            # 1) trial update ------------------------------------------------
+    # ------------------------------------------------------------------
+    #  Armijo back‑tracking line‑search (NewtonSolver only)
+    # ------------------------------------------------------------------
+    def _line_search(self, funcs, dU, coeffs, R0_vec, bcs_now):
+        """
+        Classic Armijo back‑tracking that *recomputes* Φ₀ from the actual
+        current iterate to avoid inconsistencies.
+
+        Returns a descent step (may be zero).  Never applies the full
+        Newton step after a failure.
+        """
+        dh  = self.dh
+        np_ = self.np
+
+        # --- deep copy nodal values so we can always roll back ----------
+        snap = [f.nodal_values.copy() for f in funcs]
+
+        # --- recompute Φ₀ from the PRESENT state ------------------------
+        _, R_cur = self._assemble_system(coeffs, need_matrix=False)
+        phi0 = 0.5 * np.dot(R_cur, R_cur)
+
+        alpha        = 1.0
+        best_phi     = phi0
+        best_alpha   = 0.0
+        best_reached = False
+
+        for _ in range(np_.ls_max_iter):
+            # trial update ------------------------------------------------
             dh.add_to_functions(alpha * dU, funcs)
             dh.apply_bcs(bcs_now, *funcs)
 
-            # 2) residual with *matrix‑free* assembly ------------------------
             _, R_trial = self._assemble_system(coeffs, need_matrix=False)
+            phi = 0.5 * np.dot(R_trial, R_trial)
 
-            # 3) Armijo test -------------------------------------------------
-            if np.linalg.norm(R_trial, np.inf) <= (1.0 - self.np.ls_c1 * alpha) * R0:
-                return alpha * dU          # accept step
+            if phi < best_phi:
+                best_phi     = phi
+                best_alpha   = alpha
+                best_reached = True
 
-            # 4) reject → rollback & shrink ---------------------------------
-            dh.add_to_functions(-alpha * dU, funcs)
-            alpha *= self.np.ls_reduction
+            # Armijo: fixed 10 % reduction irrespective of α -------------
+            if phi <= 0.9 * phi0:
+                break    # accept current alpha
+            # rollback & shrink ------------------------------------------
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf            # restore
+            alpha *= 0.5
 
-        print("        Line search failed – taking full Newton step.")
-        return dU
+        else:
+            # loop exhausted – choose the best Φ seen
+            if best_reached:
+                alpha = best_alpha
+                dh.add_to_functions(alpha * dU, funcs)
+                dh.apply_bcs(bcs_now, *funcs)
+            else:
+                alpha = 0.0                       # keep iterate
+
+        # leave funcs in the accepted state, but return ΔU = α dU
+        return alpha * dU
+
+
     # ------------------------------------------------------------------
     #  Boundary‑condition helper
     # ------------------------------------------------------------------
@@ -451,3 +490,136 @@ def _zero_rows_cols(A: sp.csr_matrix, rows: np.ndarray) -> sp.csr_matrix:
     A[:, rows] = 0.0
     A[rows, rows] = 1.0
     return A.tocsr()
+
+
+#------------------------------------------------------------------------------
+# nonlinear_solver.py  ---------------------------------------------------
+# --------------------------------------------------------------------------
+#  Hybrid Newton–Adam solver
+# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+#  AdaGrad‑Preconditioned Newton with Trust‑Region Switch
+# --------------------------------------------------------------------------
+class AdamNewtonSolver(NewtonSolver):
+    """
+    Newton search direction pre‑conditioned by AdaGrad/Adam, with a
+    trust‑region fallback to a pure (scaled) gradient step.
+
+    * Keeps quadratic convergence near the solution (when dU_H is small).
+    * Never takes an uphill step thanks to the best‑α fallback.
+    * Call signature identical to NewtonSolver – no driver changes.
+    """
+
+    # --- hyper‑parameters ---------------------------------------------
+    beta1 = 0.9
+    beta2 = 0.999
+    eps   = 1e-8
+    eta   = 2.0          # trust‑region radius  (||dU_H|| > η||dU_A||)
+    ls_c1 = 1e-4         # Armijo parameter
+    ls_min_alpha = 1e-6  # abort search below this
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.m = None
+        self.v = None
+        self.t = 0
+
+    # ------------------------------------------------------------------
+    #  Newton loop (same signature as parent)
+    # ------------------------------------------------------------------
+    def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
+        dh     = self.dh
+        np_    = self.np
+
+        # allocate Adam buffers lazily
+        ndof = sum(f.nodal_values.size for f in funcs)
+        if self.m is None or self.m.size != ndof:
+            self.m = np.zeros(ndof)
+            self.v = np.zeros(ndof)
+            self.t = 0
+
+        for it in range(1, np_.max_newton_iter + 1):
+
+            # 1) assemble J, R -----------------------------------------
+            coeffs = {f.name: f for f in funcs}
+            coeffs.update({f.name: f for f in prev_funcs})
+            if aux_funcs:
+                coeffs.update(aux_funcs)
+
+            K, R = self._assemble_system(coeffs, need_matrix=True)
+            self._last_jacobian = K          # for fallback gradient step
+            norm_R = np.linalg.norm(R, np.inf)
+            print(f"        Newton {it}: |R|_∞ = {norm_R:.2e}")
+            if norm_R < np_.newton_tol:
+                delta = np.hstack([f.nodal_values - fp.nodal_values
+                                   for f, fp in zip(funcs, prev_funcs)])
+                return delta
+
+            # 2) gradient & AdaGrad preconditioner ---------------------
+            g = K.T @ R                      # true gradient of ½‖R‖²
+            self.t += 1
+            self.m = self.beta1 * self.m + (1-self.beta1) * g
+            self.v = self.beta2 * self.v + (1-self.beta2) * (g*g)
+            m_hat  = self.m / (1 - self.beta1**self.t)
+            v_hat  = self.v / (1 - self.beta2**self.t)
+            P_diag = 1.0 / (np.sqrt(v_hat) + self.eps)
+
+            # 3) three candidate directions ----------------------------
+            dU_N = self._solve_linear_system(K, -R)   # Newton
+            dU_A = -P_diag * m_hat                   # AdaGrad / Adam
+            dU_H =  P_diag * dU_N                    # hybrid (scaled Newton)
+
+            # trust‑region switch
+            if np.linalg.norm(dU_H) > self.eta * np.linalg.norm(dU_A):
+                S = dU_A         # fall back to safe first‑order step
+            else:
+                S = dU_H
+
+            # 4) Armijo back‑tracking (with gᵀS) -----------------------
+            ΔU = self._armijo_search(S, g, coeffs, bcs_now, funcs)
+            if ΔU.size == 0:                      # gave up – cut Δt outside
+                raise RuntimeError("Line search failed – try smaller Δt")
+            dh.add_to_functions(ΔU, funcs)
+            dh.apply_bcs(bcs_now, *funcs)
+
+        raise RuntimeError("Newton max_iter reached without convergence")
+
+    # ------------------------------------------------------------------
+    # Armijo search on a single direction S
+    # ------------------------------------------------------------------
+    def _armijo_search(self, S, g, coeffs, bcs_now, funcs):
+        dh     = self.dh
+        alpha  = 1.0
+        _, R0  = self._assemble_system(coeffs, need_matrix=False)
+        phi0   = 0.5 * np.dot(R0, R0)
+        gTS    = np.dot(g, S)           # <0 by construction (AdaGrad & switch)
+
+        best_alpha = 0.0
+        best_phi   = phi0
+
+        while alpha >= self.ls_min_alpha:
+            dh.add_to_functions(alpha * S, funcs)
+            dh.apply_bcs(bcs_now, *funcs)
+
+            _, R_trial = self._assemble_system(coeffs, need_matrix=False)
+            phi = 0.5 * np.dot(R_trial, R_trial)
+
+            if phi < best_phi:
+                best_phi   = phi
+                best_alpha = alpha
+
+            # Armijo condition with gᵀS
+            if phi <= phi0 + self.ls_c1 * alpha * gTS:
+                dh.add_to_functions(-alpha * S, funcs)   # rollback probe
+                return alpha * S
+
+            dh.add_to_functions(-alpha * S, funcs)
+            alpha *= 0.5
+
+        if best_alpha > 0.0:
+            print(f"        Search failed – using best α = {best_alpha:.3e}")
+            return best_alpha * S
+        print("        Line search failed – no descent direction.")
+        return np.zeros_like(S)          # signal failure to caller
+
+

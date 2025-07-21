@@ -35,7 +35,7 @@ from pycutfem.ufl.expressions import (
     Grad, DivOperation, Inner, Dot,
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
     ElementWiseConstant, Derivative, Transpose,
-    CellDiameter
+    CellDiameter, NormalComponent
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -134,7 +134,8 @@ class FormCompiler:
             Jump: self._visit_Jump,
             Derivative        : self._visit_Derivative,
             Transpose: self._visit_Transpose,
-            CellDiameter: self._visit_CellDiameter
+            CellDiameter: self._visit_CellDiameter,
+            NormalComponent: self._visit_NormalComponent
         }
 
     # ============================ PUBLIC API ===============================
@@ -206,6 +207,10 @@ class FormCompiler:
         if 'eid' in self.ctx:           # matrix/vector path
             return self.dh.get_elemental_dofs(self.ctx["eid"])
         return self.ctx['global_dofs']   # functional path
+    
+    def _visit_NormalComponent(self, n:NormalComponent):
+        return self._visit_FacetNormal(FacetNormal())[n.idx]
+
 
     def _visit_Derivative(self, op: Derivative):
         # --------------------------------------------------------------
