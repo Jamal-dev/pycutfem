@@ -5,7 +5,7 @@ import numpy as np
 from scipy.spatial import Delaunay
 from pycutfem.io.visualization import visualize_mesh_node_order
 from pycutfem.core.topology import Node
-from typing import List
+from typing import List, Tuple, Dict, Callable, Optional
 
 __all__ = ["delaunay_rectangle", "structured_quad", "structured_triangles"]
 
@@ -202,6 +202,11 @@ def _structured_pk(Lx: float, Ly: float, nx_base_quads: int, ny_base_quads: int,
                 
     edges = np.array(list(unique_edges), dtype=int)
     return nodes, elements, edges, elements_corner_nodes
+
+
+
+
+
 
 def visualize_test_structured_quad():
     print("Running Mesh Generation Test Cases...")

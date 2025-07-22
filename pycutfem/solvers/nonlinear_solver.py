@@ -563,6 +563,7 @@ class AdamNewtonSolver(NewtonSolver):
             m_hat  = self.m / (1 - self.beta1**self.t)
             v_hat  = self.v / (1 - self.beta2**self.t)
             P_diag = 1.0 / (np.sqrt(v_hat) + self.eps)
+            P_diag = np.clip(P_diag, 1/20.0, 20.0)       # bounded scaling
 
             # 3) three candidate directions ----------------------------
             dU_N = self._solve_linear_system(K, -R)   # Newton
@@ -570,10 +571,13 @@ class AdamNewtonSolver(NewtonSolver):
             dU_H =  P_diag * dU_N                    # hybrid (scaled Newton)
 
             # trust‑region switch
-            if np.linalg.norm(dU_H) > self.eta * np.linalg.norm(dU_A):
-                S = dU_A         # fall back to safe first‑order step
-            else:
-                S = dU_H
+            gTS = lambda v: np.dot(g, v)
+            candidates = {"hybrid": dU_H, "adam": dU_A, "newton": dU_N,
+                          "steepest": -g}
+            name, S = min(candidates.items(), key=lambda kv: gTS(kv[1]))
+
+            if gTS(S) >= 0.0:
+                raise RuntimeError("No descent direction – try smaller Δt")
 
             # 4) Armijo back‑tracking (with gᵀS) -----------------------
             ΔU = self._armijo_search(S, g, coeffs, bcs_now, funcs)

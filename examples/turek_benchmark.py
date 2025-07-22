@@ -103,7 +103,7 @@ bcs_homog = [BoundaryCondition(bc.field, bc.method, bc.domain_tag, lambda x, y: 
 
 
 
-# In[ ]:
+# In[4]:
 
 
 # --- Level Set for the Cylinder Obstacle ---
@@ -130,19 +130,18 @@ dof_handler.info()
 print(f"Number of interface edges: {mesh.edge_bitset('interface').cardinality()}")
 print(f"Number of ghost edges: {ghost_edges.cardinality()}")
 print(f"Number of cut elements: {cut_domain.cardinality()}")
+
+
+# In[5]:
+
+
 from pycutfem.io.visualization import plot_mesh_2
-fig, ax = plt.subplots(figsize=(10, 8))
+fig, ax = plt.subplots(figsize=(15, 30))
 plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True, 
-              plot_nodes=False, elem_tags=True, edge_colors=True)
+              plot_nodes=False, elem_tags=False, edge_colors=True, plot_interface=False,resolution=300)
 
 
-# In[ ]:
-
-
-
-
-
-# In[ ]:
+# In[6]:
 
 
 # ============================================================================
@@ -177,45 +176,43 @@ u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
 dof_handler.apply_bcs(bcs, u_n, p_n)
 
 
-# In[ ]:
+# In[7]:
 
 
 u_n.plot()
 
 
-# In[ ]:
+# In[8]:
 
 
 print(len(dof_handler.get_dirichlet_data(bcs)))
 
 
-# In[ ]:
+# In[9]:
 
 
-from pycutfem.ufl.expressions import Derivative
+from pycutfem.ufl.expressions import Derivative, FacetNormal
+n = FacetNormal()                    # vector expression (n_x, n_y)
+
+def _dn(expr):
+    """Normal derivative  n·∇expr  on an (interior) edge."""
+    return n[0] * Derivative(expr, 1, 0) + n[1] * Derivative(expr, 0, 1)
+    # return dot(grad(expr), n)
+
 def grad_inner(u, v):
-    if getattr(u, "num_components", 1) == 1:  # scalar case
-        return _grad_comp(u, v)
+    """⟨∂ₙu, ∂ₙv⟩  (scalar or 2‑D vector)."""
+    if getattr(u, "num_components", 1) == 1:      # scalar
+        return _dn(u) * _dn(v)
 
-    # vector case: sum component-wise
-    if u.numcomponents == v.num_components == 2:
-        return (
-            Derivative(u[0], 1, 0) * Derivative(v[0], 1, 0)+
-            Derivative(u[0], 0, 1) * Derivative(v[0], 0, 1) +
-            Derivative(u[1], 1, 0) * Derivative(v[1], 1, 0) +
-            Derivative(u[1], 0, 1) * Derivative(v[1], 0, 1)
-        )
-    else : raise ValueError("Unsupported number of components for gradient inner product.")
+    if u.num_components == v.num_components == 2: # vector
+        return _dn(u[0]) * _dn(v[0]) + _dn(u[1]) * _dn(v[1])
 
+    raise ValueError("grad_inner supports only scalars or 2‑D vectors.")
 
-def _grad_comp(a, b):
-    return (Derivative(a,1,0) * Derivative(b, 1,0) + Derivative(a, 0, 1) * Derivative(b, 0, 1))
+dx_phys  = dx(defined_on=physical_domain,metadata={"q":6})               # volume
+dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":4})   # interior surface
+dG       = dGhost(defined_on=mesh.edge_bitset("ghost"), level_set=level_set,metadata={"q":4})  # ghost surface
 
-dx_phys  = dx(defined_on=physical_domain,metadata={q:6})               # volume
-dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={q:4})   # interior surface
-dG       = dGhost(defined_on=mesh.edge_bitset("ghost"), level_set=level_set,metadata={q:4})  # ghost surface
-
-n       = FacetNormal()                       # (nx , ny)
 cell_h  = CellDiameter() # length‑scale per element
 beta_N  = Constant(10.0 * poly_order**2)      # Nitsche penalty (tweak)
 
@@ -281,29 +278,29 @@ r_vol = ( rho*dot(u_k-u_n, v)/dt
 gamma_val = Constant(10.0 * poly_order**2)
 gamma_grad= Constant(0.1  * poly_order**2)
 
-stab      = ( gamma_val  * cell_h   * dot(jump(u_k), jump(v))
-            + gamma_grad / cell_h   * grad_inner(jump(u_k), jump(v)) ) * dG
+stab      = ( gamma_val  / cell_h   * dot(jump(u_k), jump(v))
+            + gamma_grad * cell_h   * grad_inner(jump(u_k), jump(v))) * dG
 
-stab_lin  = ( gamma_val  * cell_h   * dot(jump(du),  jump(v))
-            + gamma_grad / cell_h   * grad_inner(jump(du),  jump(v)) ) * dG
+stab_lin  = ( gamma_val  / cell_h   * dot(jump(du),  jump(v))
+            + gamma_grad * cell_h   * grad_inner(jump(du),  jump(v))) * dG
 # complete Jacobian and residual -----------------------------------
 jacobian_form  = a_vol + J_int + stab_lin
 residual_form  = r_vol + R_int + stab
 # residual_form  = dot(  Constant(np.array([0.0, 0.0]),dim=1), v) * dx
-# jacobian_form  = J_int
-# residual_form  = R_int
+# jacobian_form  = stab_lin
+# residual_form  = stab
 
 
 
 
 
-# In[ ]:
+# In[10]:
 
 
 get_ipython().system('rm ~/.cache/pycutfem_jit/*')
 
 
-# In[ ]:
+# In[11]:
 
 
 # from pycutfem.ufl.forms import assemble_form
@@ -314,22 +311,30 @@ get_ipython().system('rm ~/.cache/pycutfem_jit/*')
 # In[ ]:
 
 
-from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters
+from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
 time_params = TimeStepperParameters(dt=dt.value,max_steps=36 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
 
-solver = NewtonSolver(
+# solver = NewtonSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler,
+#     mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6),
+# )
+# primary unknowns
+functions      = [u_k, p_k]
+prev_functions = [u_n, p_n]
+solver = AdamNewtonSolver(
     residual_form, jacobian_form,
     dof_handler=dof_handler,
     mixed_element=mixed_element,
     bcs=bcs, bcs_homog=bcs_homog,
-    newton_params=NewtonParameters(newton_tol=1e-6),
+    newton_params=NewtonParameters(newton_tol=1e-6)
 )
 
-# primary unknowns
-functions      = [u_k, p_k]
-prev_functions = [u_n, p_n]
+
 
 solver.solve_time_interval(functions=functions,
                            prev_functions= prev_functions,

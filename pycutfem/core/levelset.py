@@ -19,7 +19,11 @@ class CircleLevelSet(LevelSetFunction):
         self.center=np.asarray(center,dtype=float)
         self.radius=float(radius)
     def __call__(self, x):
-        return np.linalg.norm(x-self.center)-self.radius
+        """Signed distance; works for shape (..., 2) or plain (2,)."""
+        x = np.asarray(x, dtype=float)
+        rel = x - self.center
+        # norm along the last axis keeps the leading shape intact
+        return np.linalg.norm(rel, axis=-1) - self.radius
     def gradient(self, x):
         d=np.asarray(x-self.center)
         nrm=np.linalg.norm(d)
