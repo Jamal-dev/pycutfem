@@ -287,6 +287,7 @@ class NewtonSolver:
                 current.update(aux_funcs)
 
             A, R = self._assemble_system(current)
+            self._last_jacobian = A
 
             norm_R = np.linalg.norm(R, ord=np.inf)
             print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}")
@@ -316,13 +317,16 @@ class NewtonSolver:
     # ------------------------------------------------------------------
     #  Linear system & BC handling
     # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+    #  Linear system & BC handling        (REF‑ACTORED)
+    # ------------------------------------------------------------------
     def _assemble_system(self, coeffs, *, need_matrix: bool = True):
         """
         Assemble global Jacobian A (optional) and residual R.
 
-        The key difference from the old version is that we *accumulate* every
-        kernel’s contribution into one global matrix / vector instead of overwriting
-        them on each loop iteration.
+        * When ``need_matrix=False`` it returns (None, R) but **still**
+          enforces homogeneous Dirichlet rows in *R* so that line‑search
+          evaluations are meaningful.
         """
         dh   = self.dh
         ndof = dh.total_dofs
@@ -330,9 +334,7 @@ class NewtonSolver:
         A_glob = sp.lil_matrix((ndof, ndof)) if need_matrix else None
         R_glob = np.zeros(ndof)
 
-        # ------------------------------------------------------------------ #
-        # 1) Jacobian                                                        #
-        # ------------------------------------------------------------------ #
+        # 1) Jacobian ---------------------------------------------------
         if need_matrix:
             for ker in self.kernels_K:
                 Kloc, _, _ = ker.exec(coeffs)
@@ -343,54 +345,51 @@ class NewtonSolver:
                     J_elem      = None,
                     element_ids = ker.static_args["eids"],
                     gdofs_map   = ker.static_args["gdofs_map"],
-                    target      = A_glob,               # accumulate into A_glob
+                    target      = A_glob,
                     ctx         = {"rhs": False, "add": True},
                     integrand   = ker,
                     hook        = None,
                 )
-            self._last_jacobian = A_glob 
+            self._last_jacobian = A_glob          # keep for line‑search
 
-        # ------------------------------------------------------------------ #
-        # 2) Residual                                                        #
-        # ------------------------------------------------------------------ #
+        # 2) Residual ---------------------------------------------------
         for ker in self.kernels_F:
             _, Floc, _ = ker.exec(coeffs)
 
-            R_inc = np.zeros_like(R_glob)                # per‑kernel buffer
+            R_inc = np.zeros_like(R_glob)
             _scatter_element_contribs(
                 K_elem      = None,
                 F_elem      = Floc,
                 J_elem      = None,
                 element_ids = ker.static_args["eids"],
                 gdofs_map   = ker.static_args["gdofs_map"],
-                target      = R_inc,                     # write into buffer
+                target      = R_inc,
                 ctx         = {"rhs": True, "add": True},
                 integrand   = ker,
                 hook        = None,
             )
-
-            # print individual contribution (handy for debugging)
             print(f"{ker.domain:9}: |R|_∞ = {np.linalg.norm(R_inc, np.inf):.3e}")
+            R_glob += R_inc
 
-            R_glob += R_inc                              # accumulate
-
-        # ------------------------------------------------------------------ #
-        # 3) Homogeneous Dirichlet rows                                       #
-        # ------------------------------------------------------------------ #
-        if need_matrix and self.bcs_homog:
+        # 3) Homogeneous Dirichlet rows  (always) -----------------------
+        #    OLD: executed only when `need_matrix` was True
+        if self.bcs_homog:
             bc_data = dh.get_dirichlet_data(self.bcs_homog)
             if bc_data:
                 rows = np.fromiter(bc_data.keys(),  dtype=int)
                 vals = np.fromiter(bc_data.values(), dtype=float)
 
-                bc_vec = np.zeros(ndof)
-                bc_vec[rows] = vals
+                if need_matrix:
+                    # Move prescribed values to RHS and zero the rows/cols
+                    bc_vec = np.zeros(ndof);  bc_vec[rows] = vals
+                    R_glob -= A_glob @ bc_vec
+                    A_glob  = _zero_rows_cols(A_glob, rows)   # ← moved
 
-                R_glob -= A_glob @ bc_vec          # move prescribed values to RHS
-                A_glob  = _zero_rows_cols(A_glob, rows)
-                R_glob[rows] = vals               # enforce value in residual
+                # Always override residual entries so ‖R‖ ignores BC rows
+                R_glob[rows] = vals                        # NEW
 
         return (A_glob.tocsr() if need_matrix else None), R_glob
+
 
 
     def _solve_linear_system(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
@@ -403,64 +402,73 @@ class NewtonSolver:
     def _phi(self, vec):                 # ½‖·‖² helper
         return 0.5 * np.dot(vec, vec)
 
-    # ------------------------------------------------------------------
-    #  Armijo back‑tracking line‑search (NewtonSolver only)
-    # ------------------------------------------------------------------
     def _line_search(self, funcs, dU, coeffs, R0_vec, bcs_now):
         """
-        Classic Armijo back‑tracking that *recomputes* Φ₀ from the actual
-        current iterate to avoid inconsistencies.
-
-        Returns a descent step (may be zero).  Never applies the full
-        Newton step after a failure.
+        A robust "best-effort" backtracking line search. It finds a step
+        that satisfies the Armijo condition. If it fails, it returns the
+        step that produced the largest observed residual reduction.
         """
-        dh  = self.dh
+        dh = self.dh
         np_ = self.np
+        c1 = 1e-4
 
-        # --- deep copy nodal values so we can always roll back ----------
         snap = [f.nodal_values.copy() for f in funcs]
+        phi0 = 0.5 * np.dot(R0_vec, R0_vec)
 
-        # --- recompute Φ₀ from the PRESENT state ------------------------
-        _, R_cur = self._assemble_system(coeffs, need_matrix=False)
-        phi0 = 0.5 * np.dot(R_cur, R_cur)
+        # Initialize "best-effort" tracking variables
+        best_alpha = 1.0
+        best_phi = phi0
+        # print(f"initial φ = {phi0:.2e}, starting Armijo search...")
 
-        alpha        = 1.0
-        best_phi     = phi0
-        best_alpha   = 0.0
-        best_reached = False
+        # This will now work correctly because of the change in _newton_loop
+        J = self._last_jacobian
+        if J is None:
+             print("        Warning: Jacobian not found, cannot perform Armijo search.")
+             return dU # Fallback to full step
 
-        for _ in range(np_.ls_max_iter):
-            # trial update ------------------------------------------------
+        g = J.T @ R0_vec
+        gTd = np.dot(g, dU)
+        if gTd >= 0:
+            print("        Warning: Not a descent direction.")
+            return np.zeros_like(dU)
+
+        alpha = 1.0
+        for i in range(np_.ls_max_iter):
+            # Restore state and apply new trial step
+            for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
             dh.add_to_functions(alpha * dU, funcs)
             dh.apply_bcs(bcs_now, *funcs)
 
             _, R_trial = self._assemble_system(coeffs, need_matrix=False)
-            phi = 0.5 * np.dot(R_trial, R_trial)
+            # print(f"R_trial_norm_inf : {np.linalg.norm(R_trial, ord=np.inf):.2e}")
+            phi_trial = 0.5 * np.dot(R_trial, R_trial)
+            # print(f"  Armijo search α = {alpha:.2e}: φ = {phi_trial:.2e} (Δφ = {phi_trial - phi0:.2e})")
 
-            if phi < best_phi:
-                best_phi     = phi
-                best_alpha   = alpha
-                best_reached = True
+            # Keep track of the best result found so far
+            if phi_trial < best_phi and alpha > 0:
+                best_phi = phi_trial
+                # print(f" Current best α = {alpha:.2e}")
+                best_alpha = alpha
 
-            # Armijo: fixed 10 % reduction irrespective of α -------------
-            if phi <= 0.9 * phi0:
-                break    # accept current alpha
-            # rollback & shrink ------------------------------------------
-            for f, buf in zip(funcs, snap):
-                f.nodal_values[:] = buf            # restore
-            alpha *= 0.5
+            # Check the strict Armijo condition
+            if phi_trial <= phi0 + c1 * alpha * gTd:
+                # Restore state before returning the scaled step
+                for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
+                print(f"        Armijo search accepted α = {alpha:.2e}")
+                return alpha * dU
 
+            alpha *= np_.ls_reduction
+        
+        # Restore state before returning
+        for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
+
+        # If the loop finishes, fall back to the best step we found, if any.
+        if best_alpha > 0:
+            print(f"        Armijo failed, using best-effort α = {best_alpha:.2e} instead.")
+            return best_alpha * dU
         else:
-            # loop exhausted – choose the best Φ seen
-            if best_reached:
-                alpha = best_alpha
-                dh.add_to_functions(alpha * dU, funcs)
-                dh.apply_bcs(bcs_now, *funcs)
-            else:
-                alpha = 0.0                       # keep iterate
-
-        # leave funcs in the accepted state, but return ΔU = α dU
-        return alpha * dU
+            print(f"        Line search failed catastrophically. No descent found.")
+            return np.zeros_like(dU)
 
 
     # ------------------------------------------------------------------
@@ -490,6 +498,22 @@ def _zero_rows_cols(A: sp.csr_matrix, rows: np.ndarray) -> sp.csr_matrix:
     A[:, rows] = 0.0
     A[rows, rows] = 1.0
     return A.tocsr()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 #------------------------------------------------------------------------------
