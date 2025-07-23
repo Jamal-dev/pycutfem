@@ -72,12 +72,12 @@ class AAINHBSolver(NewtonSolver):
     """Anderson‑accelerated, Hessian‑bounded Inexact Newton solver."""
 
     # -------- hyper‑parameters (can be tuned per instance) ----------------
-    gamma: float = 30.0           # Hessian‑bound γ (clip P to [γ⁻¹,γ])
+    gamma: float = 20.0           # Hessian‑bound γ (clip P to [γ⁻¹,γ])
     m_AA: int = 4                 # Anderson depth m
-    eta_CG: float = 5e-2          # relative Krylov tolerance η₍CG₎
+    eta_CG: float = 1e-2          # relative Krylov tolerance η₍CG₎
     eps: float = 1e-8             # AdaGrad epsilon
     alpha_0: float = 1.0          # initial step length
-    c1: float = 1e-4              # Armijo slope reduction
+    c1: float = 1e-6              # New Armijo slope reduction (smaller to accept larger steps)
     alpha_min: float = 1e-6       # minimum step length
 
     # ------------------------------------------------------------------
@@ -88,6 +88,7 @@ class AAINHBSolver(NewtonSolver):
         self.Uhist: deque[np.ndarray] = deque(maxlen=self.m_AA)
         self.Fhist: deque[np.ndarray] = deque(maxlen=self.m_AA)
         self.v: Optional[np.ndarray] = None   # running RMS for AdaGrad
+        self.last_alpha: float = 1.0  # for adaptive initial line search alpha
 
     # ------------------------------------------------------------------
     #  Internal Krylov solve (GMRES with loose tol)
@@ -119,6 +120,9 @@ class AAINHBSolver(NewtonSolver):
         dh = self.dh
         np_ = self.np
 
+        self.Uhist.clear()  # New (reset histories for each nonlinear solve)
+        self.Fhist.clear()  # New
+
         # allocate running‑RMS buffer lazily -----------------------------
         ndof = dh.total_dofs
         if self.v is None or self.v.size != ndof:
@@ -145,14 +149,17 @@ class AAINHBSolver(NewtonSolver):
                 return delta
 
             # Newton direction (inexact) ---------------------------------
-            tol_krylov = self.eta_CG * np.linalg.norm(R)
-            if k == 1: tol_krylov = 1e-2   # first step is looser
-            dU_N = self._solve_krylov(J, -R, reltol=tol_krylov)
+            tol_krylov = self.eta_CG  # New
+            if k == 1: tol_krylov = 5e-2  # New (slightly looser for first step)
+            dU_N = self._solve_krylov(J, -R, reltol=tol_krylov)  # New (passed corrected reltol)
 
             # Hessian‑bounded diagonal scaling ---------------------------
             g = J.T @ R                              # true gradient
             # running RMS (AdaGrad style)
-            self.v = 0.9 * self.v + 0.1 * (g * g)
+            if k == 1:
+                self.v = g * g + 1e-6  # New (initialize v based on first gradient to avoid zero)
+            else:
+                self.v = 0.9 * self.v + 0.1 * (g * g)  # New (faster adaptation)
             P = 1.0 / (np.sqrt(self.v) + self.eps)
             P = np.clip(P, 1.0 / self.gamma, self.gamma)
             dU_H = P * dU_N
@@ -175,8 +182,18 @@ class AAINHBSolver(NewtonSolver):
             if len(self.Uhist) > 0:
                 ΔF = np.column_stack([F_bar - f for f in self.Fhist])
                 ΔU = np.column_stack([U_bar - u for u in self.Uhist])
-                # least squares: argmin ‖ΔF θ – F_bar‖₂
-                theta, *_ = np.linalg.lstsq(ΔF, F_bar, rcond=None)
+                # least squares: argmin ‖ΔF θ – F_bar‖₂ s.t. sum θ = 1
+                Q = ΔF.T @ ΔF
+                s = ΔF.T @ F_bar
+                theta_un, *_ = np.linalg.lstsq(Q, s, rcond=1e-8)  # New (use lstsq for robustness)
+                ones_vec = np.ones(len(self.Uhist))
+                z, *_ = np.linalg.lstsq(Q, ones_vec, rcond=1e-8)  # New
+                sum_z = np.sum(z)
+                if abs(sum_z) > 1e-10:
+                    lambda_ = (1 - np.sum(theta_un)) / sum_z
+                else:
+                    lambda_ = 0
+                theta = theta_un + lambda_ * z
                 U_AA = U_bar - ΔU @ theta            # extrapolated point
                 dU_AA = U_AA - U_vec
                 # keep only if it is a *better* descent direction
@@ -187,7 +204,7 @@ class AAINHBSolver(NewtonSolver):
             # ------------------------------------------------------ 4)
             # Monotone Armijo back‑tracking line search
             # ----------------------------------------------------------
-            alpha = self.alpha_0
+            alpha = self.last_alpha  # New (start with previous accepted alpha)
             phi0 = 0.5 * np.dot(R, R)
             gTd = np.dot(g, dU_cand)
             assert gTd < 0.0, "Candidate is not a descent direction!"
@@ -200,8 +217,10 @@ class AAINHBSolver(NewtonSolver):
                 _, R_try = self._assemble_system(coeffs, need_matrix=False)
                 phi_try = 0.5 * np.dot(R_try, R_try)
 
-                if phi_try <= phi0 - self.c1 * alpha * gTd:
+                # Armijo:  φ(trial) ≤ φ0 + c1 α gᵀd   (gᵀd < 0 ⇒ RHS < φ0)
+                if phi_try <= phi0 + self.c1 * alpha * gTd:
                     accepted = True
+                    print(f"        Armijo accepted α = {alpha:.2e}")  # New (added for debugging)
                     break    # accept this alpha
                 # rollback and halve alpha
                 dh.add_to_functions(-alpha * dU_cand, funcs)
@@ -209,6 +228,8 @@ class AAINHBSolver(NewtonSolver):
 
             if not accepted:
                 raise RuntimeError("Armijo search failed – suggest to cut Δt")
+
+            self.last_alpha = min(1.0, alpha * 4.0)  # New (more aggressive growth *4)
 
             # ------------------------------------------------------ 5)
             # Accept step, update histories, go to next Newton iter

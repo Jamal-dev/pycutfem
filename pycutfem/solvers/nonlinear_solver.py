@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Callable, Optional, Tuple
 import inspect
 
+from ufl import p
+
 import numpy as np
 import scipy.sparse.linalg as spla
 import scipy.sparse as sp
@@ -613,41 +615,58 @@ class AdamNewtonSolver(NewtonSolver):
         raise RuntimeError("Newton max_iter reached without convergence")
 
     # ------------------------------------------------------------------
-    # Armijo search on a single direction S
+    # Armijo search on a single direction S (Corrected Version)
     # ------------------------------------------------------------------
     def _armijo_search(self, S, g, coeffs, bcs_now, funcs):
-        dh     = self.dh
-        alpha  = 1.0
-        _, R0  = self._assemble_system(coeffs, need_matrix=False)
-        phi0   = 0.5 * np.dot(R0, R0)
-        gTS    = np.dot(g, S)           # <0 by construction (AdaGrad & switch)
+        dh = self.dh
+        alpha = 1.0
+        _, R0 = self._assemble_system(coeffs, need_matrix=False)
+        phi0 = 0.5 * np.dot(R0, R0)
+        gTS = np.dot(g, S)
 
+        # 1. Save the pristine state at the beginning of the search.
+        snap = [f.nodal_values.copy() for f in funcs]
+
+        # 2. Initialize best_alpha to 0.0 for clean failure signaling.
         best_alpha = 0.0
-        best_phi   = phi0
+        best_phi = phi0
 
         while alpha >= self.ls_min_alpha:
+            # 3. Always apply the trial step from the clean snapshot.
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
             dh.add_to_functions(alpha * S, funcs)
             dh.apply_bcs(bcs_now, *funcs)
 
             _, R_trial = self._assemble_system(coeffs, need_matrix=False)
             phi = 0.5 * np.dot(R_trial, R_trial)
 
+            # Update the best-effort trackers
             if phi < best_phi:
-                best_phi   = phi
+                best_phi = phi
                 best_alpha = alpha
 
-            # Armijo condition with gᵀS
+            # Armijo condition for sufficient decrease
             if phi <= phi0 + self.ls_c1 * alpha * gTS:
-                dh.add_to_functions(-alpha * S, funcs)   # rollback probe
+                # Success! Restore state and return the scaled step.
+                print(f"        Armijo search accepted α = {alpha:.2e} (φ = {phi:.2e})")
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
                 return alpha * S
 
-            dh.add_to_functions(-alpha * S, funcs)
+            # No need for an explicit rollback here, as the top of the
+            # loop will restore from the snapshot anyway.
             alpha *= 0.5
+
+        # If the loop finishes, the strict condition failed. Use the best-effort result.
+        for f, buf in zip(funcs, snap):
+            f.nodal_values[:] = buf # Ensure state is restored before exiting.
 
         if best_alpha > 0.0:
             print(f"        Search failed – using best α = {best_alpha:.3e}")
             return best_alpha * S
+
         print("        Line search failed – no descent direction.")
-        return np.zeros_like(S)          # signal failure to caller
+        return np.zeros_like(S)  # Signal failure to the caller
 
 
