@@ -5,13 +5,13 @@ from pycutfem.ufl.expressions import (
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, 
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
     ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter,
-    NormalComponent
+    NormalComponent,Restriction
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
     LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
-    CellDiameter,LoadFacetNormalComponent
+    CellDiameter,LoadFacetNormalComponent, CheckDomain
 )
 from dataclasses import replace
 import logging
@@ -81,6 +81,14 @@ class IRGenerator:
             self.ir_sequence.append(BinaryOp(op_symbol='-'))
             return
 
+        if isinstance(node, Restriction):
+            # Visit the operand first (post-order traversal)
+            self._visit(node.operand, side=side)
+            # Then, add the instruction to check the domain tag.
+            # The code generator will use this to conditionally zero the result.
+            self.ir_sequence.append(CheckDomain(bitset_id=id(node.domain)))
+            return
+        
         if isinstance(node, (Sum, Sub, Prod, UflDiv)):
             self._visit(node.a, side=side)
             self._visit(node.b, side=side)

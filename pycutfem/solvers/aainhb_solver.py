@@ -137,8 +137,8 @@ class AAINHBSolver(NewtonSolver):
             if aux_funcs:
                 coeffs.update(aux_funcs)
 
-            J, R = self._assemble_system(coeffs, need_matrix=True)
-            norm_R_inf = np.linalg.norm(R, ord=np.inf)
+            A_full, R_full = self._assemble_system(coeffs, need_matrix=True)
+            norm_R_inf = np.linalg.norm(R_full, ord=np.inf)
             print(f"        AA‑INHB {k}: |R|_∞ = {norm_R_inf:.2e}")
             if norm_R_inf < np_.newton_tol:
                 # time‑step increment to report
@@ -148,13 +148,16 @@ class AAINHBSolver(NewtonSolver):
                 ])
                 return delta
 
+            K_red, R_red = self.restrictor.reduce_system(A_full, R_full,
+                                                 self.dh, bcs_now)
             # Newton direction (inexact) ---------------------------------
             tol_krylov = self.eta_CG  # New
             if k == 1: tol_krylov = 5e-2  # New (slightly looser for first step)
-            dU_N = self._solve_krylov(J, -R, reltol=tol_krylov)  # New (passed corrected reltol)
+            dU_N_red = self._solve_krylov(K_red, -R_red, reltol=tol_krylov)  # New (passed corrected reltol)
+            dU_N = self.restrictor.expand_vec(dU_N_red)
 
             # Hessian‑bounded diagonal scaling ---------------------------
-            g = J.T @ R                              # true gradient
+            g = A_full.T @ R_full                              # true gradient
             # running RMS (AdaGrad style)
             if k == 1:
                 self.v = g * g + 1e-6  # New (initialize v based on first gradient to avoid zero)
@@ -205,7 +208,7 @@ class AAINHBSolver(NewtonSolver):
             # Monotone Armijo back‑tracking line search
             # ----------------------------------------------------------
             alpha = self.last_alpha  # New (start with previous accepted alpha)
-            phi0 = 0.5 * np.dot(R, R)
+            phi0 = 0.5 * np.dot(R_full, R_full)
             gTd = np.dot(g, dU_cand)
             assert gTd < 0.0, "Candidate is not a descent direction!"
 

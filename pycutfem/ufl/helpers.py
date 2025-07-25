@@ -3,6 +3,13 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Union, Tuple, Set
 from pycutfem.ufl.expressions import Expression, Derivative
+from pycutfem.ufl.expressions import (
+    VectorFunction, TrialFunction, VectorTrialFunction,
+    TestFunction, VectorTestFunction, Restriction
+)
+from pycutfem.ufl.forms import Form, Equation
+from pycutfem.core.dofhandler import DofHandler
+from pycutfem.fem.mixedelement import MixedElement
 
 import logging
 # Setup logging
@@ -393,3 +400,111 @@ def required_multi_indices(expr: "Expression") -> Set[MultiIndex]:
 
     _walk(expr)
     return out
+
+
+#-----------------------------------------------------------
+
+def _all_fields(expr):
+    fields=set()
+    def walk(n):
+        if hasattr(n,'field_name'):
+            fields.add(n.field_name)
+        if hasattr(n,'space'):
+            fields.update(n.space.field_names)
+        if isinstance(n, VectorFunction):
+            fields.update(n.field_names)
+
+        # Recurse through the expression tree
+        for attr in ('operand', 'a', 'b', 'u_pos', 'u_neg', 'components','f'):
+            if hasattr(n, attr):
+                m = getattr(n, attr)
+                if isinstance(m, (list, tuple)):
+                    for x in m: walk(x)
+                elif m is not None:
+                    walk(m)
+    walk(expr)
+    return list(fields)
+
+def _find_all(expr, cls):
+    out = []
+    def walk(n):
+        if isinstance(n, cls):
+            out.append(n)
+        for attr in ('operand','a','b','u_pos','u_neg','components','f'):
+            m = getattr(n, attr, None)
+            if m is None: continue
+            if isinstance(m, (list, tuple)):
+                for x in m: walk(x)
+            else:
+                walk(m)
+    walk(expr)
+    return out
+
+# New: Helper to identify trial and test functions in an expression
+def _trial_test(expr): 
+    """Finds the first trial and test function in an expression tree.""" 
+    trial = expr.find_first(lambda n: isinstance(n, (TrialFunction, VectorTrialFunction))) 
+    test = expr.find_first(lambda n: isinstance(n, (TestFunction, VectorTestFunction))) 
+    return trial, test
+
+#----------------------------------------------------------------------------------
+#               Restriction dofs
+def _find_all_restrictions(form: Form) -> list[Restriction]:
+    """Helper to walk a Form and find all Restriction nodes."""
+    restrictions = []
+    
+    def walk(expr):
+        if isinstance(expr, Restriction):
+            restrictions.append(expr)
+
+        # ----- recurse -----
+        for attr in ('operand', 'a', 'b', 'u_pos', 'u_neg',
+                    'integrand',   # Integral
+                    'integrals'):  # ➊ NEW – list of Integrals in a Form
+            child = getattr(expr, attr, None)
+            if child is None:
+                continue
+            if isinstance(child, (list, tuple)):
+                for item in child:
+                    walk(item)
+            else:
+                walk(child)
+
+
+    walk(form)
+    return restrictions 
+
+
+def analyze_active_dofs(equation: Equation, dh: DofHandler, me: MixedElement, bcs: list) -> np.ndarray:
+    """
+    Analyzes a UFL equation to determine the set of active DOFs.
+    If no Restriction operators are found, all DOFs are considered active.
+    """
+    active_dof_set = set()
+    all_forms = equation.a.integrals + equation.L.integrals
+    all_restrictions = _find_all_restrictions(Form(all_forms))
+
+    # --- Case 1: The form uses Restriction operators ---
+    if all_restrictions:
+        print("Restriction operators found. Analyzing active domains...")
+        for r in all_restrictions:
+            fields_in_operand = _all_fields(r.operand)
+            active_element_ids = r.domain.to_indices()
+
+            for eid in active_element_ids:
+                elemental_dofs_vector = dh.get_elemental_dofs(eid)
+                for field_name in fields_in_operand:
+                    field_slice_local = me.component_dof_slices[field_name]
+                    field_specific_global_dofs = elemental_dofs_vector[field_slice_local]
+                    active_dof_set.update(field_specific_global_dofs)
+    # --- Case 2: The form has no restrictions ---
+    else:
+        print("No Restriction operators found. All DOFs are considered active.")
+        active_dof_set.update(range(dh.total_dofs))
+
+    # Always include Dirichlet DOFs
+    if bcs:
+        dirichlet_dofs = dh.get_dirichlet_data(bcs).keys()
+        active_dof_set.update(dirichlet_dofs)
+
+    return np.array(sorted(list(active_dof_set)), dtype=int)

@@ -6,6 +6,7 @@ import numbers
 from matplotlib.colors import LinearSegmentedColormap
 from pycutfem.plotting.triangulate import triangulate_field
 from matplotlib.animation import FuncAnimation
+from pycutfem.utils.bitset import BitSet
 
 
 custom_cmap = LinearSegmentedColormap.from_list('blue_red', ['blue', 'red'])
@@ -1053,7 +1054,25 @@ class CellDiameter(Expression):
         self.role = "none"
 
 
+class Restriction(Expression):
+    """
+    Restricts an expression to be active only on elements with a specific
+    domain tag.
+    """
+    def __init__(self, operand: Expression, domain: BitSet):
+        super().__init__()
+        if not isinstance(operand, Expression) or not isinstance(domain, BitSet):
+            raise TypeError("Restriction takes an Expression and a domain BitSet.")
+        self.operand = operand
+        self.domain = domain
+        
+        # Inherit properties from the operand for type checking
+        self.is_function = getattr(operand, "is_function", False)
+        self.is_trial    = getattr(operand, "is_trial",    False)
+        self.is_test     = getattr(operand, "is_test",     False)
 
+    def __repr__(self):
+        return f"Restriction({self.operand!r}, '{self.domain}')"
 
 # --- Helper functions to create operator instances ---
 def grad(v): return Grad(v)
@@ -1065,3 +1084,5 @@ def outer(a, b): return Outer(a, b)
 def jump(v, n=None): return Jump(v, n)
 def avg(v): return Avg(v)
 def dot(a, b): return Dot(a, b)
+def restrict(expression, domain_tag):
+    return Restriction(expression, domain_tag)

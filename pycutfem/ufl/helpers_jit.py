@@ -6,8 +6,12 @@ import logging # Added for logging warnings
 import os
 import re
 import pycutfem.jit.symbols as symbols
+from pycutfem.utils.bitset import BitSet
+from pycutfem.ufl.expressions import Restriction
+
 
 logger = logging.getLogger(__name__)
+
 
 def _pad_coeffs(coeffs, phi, ctx):
     """Return coeffs padded to the length of `phi` on ghost edges."""
@@ -19,6 +23,25 @@ def _pad_coeffs(coeffs, phi, ctx):
     amap   = ctx["pos_map"] if side == '+' else ctx["neg_map"]
     padded[amap] = coeffs
     return padded
+
+def _find_all_bitsets(expression):
+    """Walks the expression tree and collects all unique BitSet objects."""
+    bitsets = set()
+    
+    def walk(expr):
+        if isinstance(expr, Restriction):
+            bitsets.add(expr.domain)
+        
+        for attr in ('operand', 'a', 'b', 'u_pos', 'u_neg', 'integrand'):
+            if hasattr(expr, attr):
+                child = getattr(expr, attr)
+                if isinstance(child, list):
+                    for item in child: walk(item)
+                elif child:
+                    walk(child)
+
+    walk(expression)
+    return list(bitsets)
 
 
 def _build_jit_kernel_args(       # ← NEW signature (unchanged)
@@ -55,7 +78,7 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     )
     from pycutfem.jit.ir import LoadVariable, LoadConstantArray, LoadElementWiseConstant
     from pycutfem.ufl.analytic import Analytic
-    from pycutfem.ufl.compilers import _find_all
+    from pycutfem.ufl.helpers import _find_all
     
 
     logger = logging.getLogger(__name__)
@@ -160,6 +183,13 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     pre_built = {**{k: v for k, v in pre_built.items()
                     if k in predeclared}, **pre_built}
     args: Dict[str, Any] = dict(pre_built)
+    # --- NEW: Find and add all domain BitSets used in the expression ---
+    all_bitsets_in_form = _find_all_bitsets(expression)
+    for bs in all_bitsets_in_form:
+        # Create a unique, valid parameter name for each bitset
+        param_name = f"domain_bs_{id(bs)}"
+        # Add the bitset's underlying boolean array to the kernel arguments
+        args[param_name] = bs.array
 
     const_arrays = {
         f"const_arr_{id(c)}": c
@@ -196,7 +226,13 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
             args[name] = _deriv_table(fld, ax, ay)
 
         
-
+        # ----- Restriction to a domain tag --------------------------------
+        if name == "element_tags":
+            tags = [DOMAIN_TAG_MAP.get(e.tag, -1) for e in mixed_element.mesh.elements_list]
+            args[name] = np.array(tags, dtype=np.int32)
+            continue
+        
+        
         # ---- constant arrays ---------------------------------------------
         elif name in const_arrays:
             args[name] = const_arrays[name].value

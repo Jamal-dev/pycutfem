@@ -98,3 +98,8 @@ class CellDiameter:
 class LoadFacetNormalComponent:
     """Load n[idx] (scalar component of the facet normal)."""
     idx: int
+
+@dataclass(frozen=True, slots=True)
+class CheckDomain:
+    """Instruction to check if the current element is in a domain BitSet."""
+    bitset_id: int

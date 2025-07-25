@@ -64,12 +64,23 @@ print(f"Reynolds number (Re): {Re:.2f}")
 # In[3]:
 
 
+from pycutfem.utils.adaptive_mesh import structured_quad_levelset_adaptive
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-# NX, NY = 18, 18
-NX, NY = 50, 60
+NX, NY = 18, 18
+# NX, NY = 50, 60
 poly_order = 2
-nodes, elems, _, corners = structured_quad(L, H, nx=NX, ny=NY, poly_order=poly_order)
+level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
+h  = 0.5*(L/NX + H/NY)
+# box = (c_x-3*h, c_y-3*h, c_x+3*h, c_y+3*h)
+window = (c_x-D*1.5, c_y-D*1.5, c_x+D*1.5, c_y+D*1.5)  # grid-aligned selection window
+
+# nodes, elems, _, corners = structured_quad(L, H, nx=NX, ny=NY, poly_order=poly_order)
+
+nodes, elems, edges, corners = structured_quad_levelset_adaptive(
+        Lx=L, Ly=H, nx=NX, ny=NY, poly_order=poly_order,
+        level_set=CircleLevelSet(center=(c_x, c_y), radius=(D/2.0+0.1*D/2.0) ),
+        max_refine_level=1)          # add a single halo, nothing else
 mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
 
 # ============================================================================
@@ -109,7 +120,6 @@ bcs_homog = [BoundaryCondition(bc.field, bc.method, bc.domain_tag, lambda x, y: 
 # --- Level Set for the Cylinder Obstacle ---
 
 
-level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
 mesh.classify_elements(level_set)
 mesh.classify_edges(level_set)
 mesh.build_interface_segments(level_set=level_set)
@@ -167,7 +177,7 @@ p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler)
 
 # --- Parameters ---
 dt = Constant(0.02)
-theta = Constant(0.5) # Crank-Nicolson
+theta = Constant(1.0) # Crank-Nicolson
 mu_const = Constant(mu)
 rho_const = Constant(rho)
 
@@ -191,7 +201,7 @@ print(len(dof_handler.get_dirichlet_data(bcs)))
 # In[9]:
 
 
-from pycutfem.ufl.expressions import Derivative, FacetNormal
+from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict
 n = FacetNormal()                    # vector expression (n_x, n_y)
 
 def _dn(expr):
@@ -261,31 +271,37 @@ R_int = (
 ) * dΓ
 
 # volume ------------------------------------------------------------
-a_vol = ( rho*dot(du,v)/dt
+a_vol = restrict(( rho*dot(du,v)/dt
           + theta*rho*dot(dot(grad(u_k), du), v)
           + theta*rho*dot(dot(grad(du), u_k), v)
           + theta*mu*inner(grad(du), grad(v))
-          - dp*div(v) + q*div(du) ) * dx(defined_on=physical_domain,metadata={q:6}) 
+          - dp*div(v) + q*div(du) ),physical_domain) * dx_phys
 
-r_vol = ( rho*dot(u_k-u_n, v)/dt
+r_vol = restrict(( rho*dot(u_k-u_n, v)/dt
           + theta*rho*dot(dot(grad(u_k), u_k), v)
           + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
           + theta*mu*inner(grad(u_k), grad(v))
           + (1-theta)*mu*inner(grad(u_n), grad(v))
-          - p_k*div(v) + q*div(u_k) ) * dx(defined_on=physical_domain,metadata={q:6}) 
+          - p_k*div(v) + q*div(u_k) ),physical_domain) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
-gamma_val = Constant(10.0 * poly_order**2)
-gamma_grad= Constant(0.1  * poly_order**2)
+penalty_val = 10
+penalty_grad = 0.1
+gamma_v = Constant(penalty_val * poly_order**2)
+gamma_v_grad= Constant(penalty_grad * poly_order**2)
+gamma_p  = Constant(penalty_val * poly_order**1)
+gama_p_grad = Constant(penalty_grad * poly_order**1)
 
-stab      = ( gamma_val  / cell_h   * dot(jump(u_k), jump(v))
-            + gamma_grad * cell_h   * grad_inner(jump(u_k), jump(v))) * dG
+# stab      = ( gamma_v  / cell_h   * dot(jump(u_k), jump(v))
+#             + gamma_v_grad * cell_h   * grad_inner(jump(u_k), jump(v))) * dG
 
-stab_lin  = ( gamma_val  / cell_h   * dot(jump(du),  jump(v))
-            + gamma_grad * cell_h   * grad_inner(jump(du),  jump(v))) * dG
+stab_lin  = ( gamma_v  / cell_h   * dot(jump(du),  jump(v)) +
+             gamma_v_grad * cell_h   * grad_inner(jump(du),  jump(v))) * dG
+stab_lin += ( gamma_p  / cell_h   * dot(jump(dp),  jump(q))
+            + gama_p_grad * cell_h   * grad_inner(jump(dp),  jump(q))) * dG
 # complete Jacobian and residual -----------------------------------
 jacobian_form  = a_vol + J_int + stab_lin
-residual_form  = r_vol + R_int + stab
+residual_form  = r_vol + R_int 
 # residual_form  = dot(  Constant(np.array([0.0, 0.0]),dim=1), v) * dx
 # jacobian_form  = stab_lin
 # residual_form  = stab
@@ -308,31 +324,40 @@ get_ipython().system('rm ~/.cache/pycutfem_jit/*')
 # print(np.linalg.norm(F, ord=np.inf))
 
 
-# In[ ]:
+# In[12]:
 
 
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver
+from pycutfem.solvers.aainhb_solver import AAINHBSolver           # or get_solver("aainhb")
+
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
 time_params = TimeStepperParameters(dt=dt.value,max_steps=36 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
 
-# solver = NewtonSolver(
+solver = NewtonSolver(
+    residual_form, jacobian_form,
+    dof_handler=dof_handler,
+    mixed_element=mixed_element,
+    bcs=bcs, bcs_homog=bcs_homog,
+    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+)
+# primary unknowns
+functions      = [u_k, p_k]
+prev_functions = [u_n, p_n]
+# solver = AdamNewtonSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler,
+#     mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6)
+# )
+# solver = AAINHBSolver(
 #     residual_form, jacobian_form,
 #     dof_handler=dof_handler,
 #     mixed_element=mixed_element,
 #     bcs=bcs, bcs_homog=bcs_homog,
 #     newton_params=NewtonParameters(newton_tol=1e-6),
 # )
-# primary unknowns
-functions      = [u_k, p_k]
-prev_functions = [u_n, p_n]
-solver = AdamNewtonSolver(
-    residual_form, jacobian_form,
-    dof_handler=dof_handler,
-    mixed_element=mixed_element,
-    bcs=bcs, bcs_homog=bcs_homog,
-    newton_params=NewtonParameters(newton_tol=1e-6)
-)
 
 
 

@@ -35,12 +35,13 @@ from pycutfem.ufl.expressions import (
     Grad, DivOperation, Inner, Dot,
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
     ElementWiseConstant, Derivative, Transpose,
-    CellDiameter, NormalComponent
+    CellDiameter, NormalComponent,
+    Restriction
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
-from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices
+from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices,_all_fields,_find_all,_trial_test
 from pycutfem.fem.transform import map_deriv
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.utils.domain_manager import get_domain_bitset
@@ -52,48 +53,7 @@ logger = logging.getLogger(__name__)
 _INTERFACE_TOL = 1.0e-12 # New
 
 
-def _all_fields(expr):
-    fields=set()
-    def walk(n):
-        if hasattr(n,'field_name'):
-            fields.add(n.field_name)
-        if hasattr(n,'space'):
-            fields.update(n.space.field_names)
-        if isinstance(n, VectorFunction):
-            fields.update(n.field_names)
 
-        # Recurse through the expression tree
-        for attr in ('operand', 'a', 'b', 'u_pos', 'u_neg', 'components','f'):
-            if hasattr(n, attr):
-                m = getattr(n, attr)
-                if isinstance(m, (list, tuple)):
-                    for x in m: walk(x)
-                elif m is not None:
-                    walk(m)
-    walk(expr)
-    return list(fields)
-
-def _find_all(expr, cls):
-    out = []
-    def walk(n):
-        if isinstance(n, cls):
-            out.append(n)
-        for attr in ('operand','a','b','u_pos','u_neg','components','f'):
-            m = getattr(n, attr, None)
-            if m is None: continue
-            if isinstance(m, (list, tuple)):
-                for x in m: walk(x)
-            else:
-                walk(m)
-    walk(expr)
-    return out
-
-# New: Helper to identify trial and test functions in an expression
-def _trial_test(expr): # New
-    """Finds the first trial and test function in an expression tree.""" # New
-    trial = expr.find_first(lambda n: isinstance(n, (TrialFunction, VectorTrialFunction))) # New
-    test = expr.find_first(lambda n: isinstance(n, (TestFunction, VectorTestFunction))) # New
-    return trial, test # New
 
 # ========================================================================
 #  The Compiler
@@ -135,7 +95,8 @@ class FormCompiler:
             Derivative        : self._visit_Derivative,
             Transpose: self._visit_Transpose,
             CellDiameter: self._visit_CellDiameter,
-            NormalComponent: self._visit_NormalComponent
+            NormalComponent: self._visit_NormalComponent,
+            Restriction: self._visit_Restriction,
         }
 
     # ============================ PUBLIC API ===============================
@@ -207,6 +168,42 @@ class FormCompiler:
         if 'eid' in self.ctx:           # matrix/vector path
             return self.dh.get_elemental_dofs(self.ctx["eid"])
         return self.ctx['global_dofs']   # functional path
+    
+    def _visit_Restriction(self, n: Restriction):
+        """
+        Evaluates the operand only if the current element's tag matches the
+        restriction tag. Otherwise, returns a zero-like value.
+        """
+        # 1. Get the current element's tag.
+        #    The element ID is reliably in the context during volume/interface assembly.
+        eid = self.ctx.get("eid")
+        if eid is None:
+            # This can happen in contexts where 'eid' is not defined.
+            # We proceed, but the check might fail gracefully later.
+            elem_tag = None
+        else:
+            in_domain = n.domain[eid] if hasattr(n.domain, "__getitem__") else eid in n.domain
+
+        # 2. Check if the element is in the active domain.
+        if in_domain:
+            # If it matches, proceed as if the Restriction node wasn't there.
+            return self._visit(n.operand)
+        else:
+            # If it does not match, return a "zero" value that has the same
+            # structure (shape, role) as the real result would have.
+            # This is crucial for subsequent operations like dot, inner, etc.
+            
+            # We can achieve this by visiting the operand and then nullifying it.
+            result = self._visit(n.operand)
+            
+            if isinstance(result, (VecOpInfo, GradOpInfo)):
+                # Use the overloaded multiplication to create a zeroed-out copy.
+                return result * 0.0
+            elif isinstance(result, np.ndarray):
+                # For raw numpy arrays, just return a zero-filled array of the same shape.
+                return np.zeros_like(result)
+            else: # for scalars
+                return 0.0
     
     def _visit_NormalComponent(self, n:NormalComponent):
         return self._visit_FacetNormal(FacetNormal())[n.idx]

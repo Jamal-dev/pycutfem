@@ -14,6 +14,7 @@ control logic.
 
 from __future__ import annotations
 
+from re import A
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Callable, Optional, Tuple
@@ -26,7 +27,9 @@ import scipy.sparse.linalg as spla
 import scipy.sparse as sp
 # from pycutfem.ufl.helpers_jit import _scatter_element_contribs
 from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
-from pycutfem.jit import compile_multi        # NEW import
+from pycutfem.jit import compile_multi        
+from pycutfem.ufl.forms import Equation
+from pycutfem.ufl.helpers import analyze_active_dofs
 
 def _scatter_element_contribs(
     *,
@@ -136,6 +139,60 @@ class LinearSolverParameters:
     tol: float = 1e-12
     maxit: int = 10_000
 
+# ----------------------------------------------------------------------------
+#  Restriction helper
+# ----------------------------------------------------------------------------
+# put this in nonlinear_solver.py (top-level) -------------------------
+class _ActiveReducer:
+    def __init__(self, dh, active_dofs):
+        self.dh = dh
+        self.active = np.asarray(active_dofs, dtype=int)
+        self.full2red = {i: j for j, i in enumerate(self.active)}
+
+    # vectors ----------------------------------------------------------
+    def restrict_vec(self, v_full):
+        return v_full[self.active]
+
+    def expand_vec(self, v_red):
+        v_full = np.zeros(self.dh.total_dofs, dtype=v_red.dtype)
+        v_full[self.active] = v_red
+        return v_full
+
+    # matrices ---------------------------------------------------------
+    def restrict_mat(self, A_full):
+        aid = self.active
+        return A_full.tocsr()[np.ix_(aid, aid)]
+
+    # systems (full → reduced with BCs already handled in the full space)
+    def reduce_system(self, A_full, R_full, dh, bcs):
+        K_red = self.restrict_mat(A_full)
+        F_red = self.restrict_vec(R_full)
+
+        # Dirichlet on the reduced system (identical to your current code)
+        bc_data = dh.get_dirichlet_data(bcs)
+        if bc_data:
+            rows_full = np.fromiter(bc_data.keys(), dtype=int)
+            vals_full = np.fromiter(bc_data.values(), dtype=float)
+
+            # keep only rows that are active
+            mask = np.isin(rows_full, self.active)
+            rows_full = rows_full[mask]
+            vals_full = vals_full[mask]
+            if rows_full.size:
+                rows_red = np.array([self.full2red[i] for i in rows_full])
+
+                F_red -= K_red @ np.bincount(rows_red, weights=vals_full,
+                                             minlength=self.active.size)
+
+                K_red = K_red.tolil()
+                K_red[rows_red, :] = 0
+                K_red[:, rows_red] = 0
+                K_red[rows_red, rows_red] = 1.0
+                K_red = K_red.tocsr()
+
+                F_red[rows_red] = vals_full
+        return K_red, F_red
+
 
 # ----------------------------------------------------------------------------
 #  NewtonSolver class
@@ -196,6 +253,17 @@ class NewtonSolver:
                 mixed_element = self.me,
                 backend       = backend,
         )
+        # --- NEW: A PRIORI DOF ANALYSIS ---
+        # Analyze the forms once to get the definitive set of active DOFs.
+        equation = Equation(jacobian_form, residual_form)
+        self.active_dofs = analyze_active_dofs(equation, self.dh,self.me ,self.bcs + self.bcs_homog)
+        if len(self.active_dofs) < self.dh.total_dofs:
+             print(f"NewtonSolver: System will be reduced to {len(self.active_dofs)} active DOFs.")
+        else:
+             print("NewtonSolver: Operating on the full, unrestricted system.")
+        self.restrictor = _ActiveReducer(self.dh, self.active_dofs)
+
+
 
 
         
@@ -288,10 +356,15 @@ class NewtonSolver:
             if aux_funcs:
                 current.update(aux_funcs)
 
-            A, R = self._assemble_system(current)
-            self._last_jacobian = A
+            # 1. Assemble the full, potentially singular system
+            A_full, R_full = self._assemble_system(current)
+            # 2. Reduce the system using the pre-computed active_dofs
+            #    If no restrictions were used, this step is effectively a copy.
+            A_red, R_red, full_to_red_map = self._create_reduced_system(A_full, R_full, bcs_now)
 
-            norm_R = np.linalg.norm(R, ord=np.inf)
+            self._last_jacobian = A_full
+
+            norm_R = np.linalg.norm(R_full, ord=np.inf)
             print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}")
             if norm_R < self.np.newton_tol:
                 # Return *time‑step* increment --------------------
@@ -301,12 +374,15 @@ class NewtonSolver:
                 ])
                 return delta
 
-            dU = self._solve_linear_system(A, -R)
+            dU_red = self._solve_linear_system(A_red, -R_red)
+            # 4. Expand the solution vector back to the full size
+            dU_full = np.zeros(dh.total_dofs)
+            dU_full[self.active_dofs] = dU_red
 
             if self.np.line_search:
-                dU = self._line_search(funcs, dU, current, R, bcs_now)
+                dU = self._line_search(funcs, dU_full, current, R_full, bcs_now)
 
-            dh.add_to_functions(dU, funcs)
+            dh.add_to_functions(dU_full, funcs)
             dh.apply_bcs(bcs_now, *funcs)
 
             if self.post_cb is not None:
@@ -471,6 +547,47 @@ class NewtonSolver:
         else:
             print(f"        Line search failed catastrophically. No descent found.")
             return np.zeros_like(dU)
+    
+    def _create_reduced_system(self, K_full, F_full, bcs):
+        """
+        Reduces the linear system using the pre-computed self.active_dofs.
+        This method is now simpler and more robust.
+        """
+        # We already have self.active_dofs, computed once at the start.
+        active_dofs = self.active_dofs
+        
+        # The rest of the logic is very similar, but no longer needs to find active DOFs.
+        full_to_red_map = {old_dof: new_dof for new_dof, old_dof in enumerate(active_dofs)}
+
+        K_red = K_full.tocsr()[np.ix_(active_dofs, active_dofs)]
+        F_red = F_full[active_dofs]
+
+        # Apply BCs to the reduced system
+        # Get all dirichlet data again to apply to the reduced system
+        bc_data = self.dh.get_dirichlet_data(bcs)
+        
+        # Filter for BCs that are part of the active system
+        active_bc_data = {dof: val for dof, val in bc_data.items() if dof in active_dofs}
+        
+        if active_bc_data:
+            # Map full DOF indices to reduced indices
+            reduced_rows = np.array([full_to_red_map[dof] for dof in active_bc_data.keys()], dtype=int)
+            reduced_vals = np.array(list(active_bc_data.values()), dtype=float)
+            
+            # Apply to RHS vector F_red
+            F_red -= K_red @ np.bincount(reduced_rows, weights=reduced_vals, minlength=len(active_dofs))
+
+            # Zero out rows and columns in the reduced matrix
+            K_red_lil = K_red.tolil()
+            K_red_lil[reduced_rows, :] = 0
+            K_red_lil[:, reduced_rows] = 0
+            K_red_lil[reduced_rows, reduced_rows] = 1.0
+            K_red = K_red_lil.tocsr()
+
+            # Set values in the RHS vector
+            F_red[reduced_rows] = reduced_vals
+        
+        return K_red, F_red, full_to_red_map
 
 
     # ------------------------------------------------------------------
@@ -572,9 +689,9 @@ class AdamNewtonSolver(NewtonSolver):
             if aux_funcs:
                 coeffs.update(aux_funcs)
 
-            K, R = self._assemble_system(coeffs, need_matrix=True)
-            self._last_jacobian = K          # for fallback gradient step
-            norm_R = np.linalg.norm(R, np.inf)
+            A_full, R_full = self._assemble_system(coeffs, need_matrix=True)
+            self._last_jacobian = A_full          # for fallback gradient step
+            norm_R = np.linalg.norm(R_full, np.inf)
             print(f"        Newton {it}: |R|_∞ = {norm_R:.2e}")
             if norm_R < np_.newton_tol:
                 delta = np.hstack([f.nodal_values - fp.nodal_values
@@ -582,7 +699,9 @@ class AdamNewtonSolver(NewtonSolver):
                 return delta
 
             # 2) gradient & AdaGrad preconditioner ---------------------
-            g = K.T @ R                      # true gradient of ½‖R‖²
+            K_red, R_red   = self.restrictor.reduce_system(A_full, R_full,
+                                                 self.dh, bcs_now)
+            g = A_full.T @ R_full                      # true gradient of ½‖R‖²
             self.t += 1
             self.m = self.beta1 * self.m + (1-self.beta1) * g
             self.v = self.beta2 * self.v + (1-self.beta2) * (g*g)
@@ -592,7 +711,8 @@ class AdamNewtonSolver(NewtonSolver):
             P_diag = np.clip(P_diag, 1/20.0, 20.0)       # bounded scaling
 
             # 3) three candidate directions ----------------------------
-            dU_N = self._solve_linear_system(K, -R)   # Newton
+            dU_N_red = self._solve_linear_system(K_red, -R_red)   # Newton
+            dU_N = self.restrictor.expand_vec(dU_N_red)
             dU_A = -P_diag * m_hat                   # AdaGrad / Adam
             dU_H =  P_diag * dU_N                    # hybrid (scaled Newton)
 

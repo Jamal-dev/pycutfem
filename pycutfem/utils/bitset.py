@@ -15,3 +15,14 @@ class BitSet:
     def to_indices(self): return np.flatnonzero(self.mask)
     def __len__(self): return len(self.mask)
     def __repr__(self): return f'<BitSet {self.cardinality()}/{len(self)}>'
+    @property
+    def array(self):          # <-- NEW
+        """Boolean NumPy array used directly inside JIT kernels."""
+        return self.mask
+
+    # small conveniences that other code paths already assume
+    def __getitem__(self, idx):      # BitSet[i] → bool
+        return self.mask[idx]
+
+    def __contains__(self, idx):     # idx in BitSet
+        return bool(self.mask[idx])

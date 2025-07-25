@@ -3,10 +3,10 @@ import textwrap
 from dataclasses import dataclass, field, replace
 
 from matplotlib.pylab import f
-from .ir import (
+from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
-    BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent
+    BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain
 )
 from pycutfem.jit.symbols import encode
 import numpy as np
@@ -128,6 +128,26 @@ class NumbaCodeGen:
                                        role='const',
                                        shape=(),          # scalar
                                        is_vector=False))
+            
+            elif isinstance(op, CheckDomain):
+                # Get the operand from the stack
+                a = stack.pop()
+                res_var = new_var("restricted")
+                
+                # Construct the parameter name for the BitSet's boolean array
+                domain_bs_name = f"domain_bs_{op.bitset_id}"
+                # Ensure this parameter will be included in the kernel signature
+                required_args.add(domain_bs_name)
+                
+                # Generate the conditional code
+                body_lines.append(f"# Restriction to domain defined by {domain_bs_name}")
+                body_lines.append(f"if {domain_bs_name}[e]:")
+                body_lines.append(f"    {res_var} = {a.var_name}")
+                body_lines.append(f"else:")
+                body_lines.append(f"    {res_var} = np.zeros_like({a.var_name})")
+
+                # Push the result back onto the stack
+                stack.append(a._replace(var_name=res_var))
             
             elif isinstance(op, LoadElementWiseConstant):
                 # the full (n_elem, …) array is passed as a kernel argument
@@ -1328,7 +1348,9 @@ class NumbaCodeGen:
             f"            {arg}_q = {arg}[e,q]"
             for arg in sorted(required_args)
             if (
-                arg.startswith(("b_", "d", "g_"))       # reference tables
+                arg.startswith(("b_", "g_"))       # reference tables
+                or re.match(r"d\d\d?_.*", arg)     # d00_vx, d12_p,
+                and not arg.startswith("domain_bs_")  # exclude bitsets
                 or arg in {"J_inv", "J_inv_pos", "J_inv_neg",
                         "detJ", "detJ_pos", "detJ_neg"}
             )
