@@ -225,6 +225,7 @@ class NewtonSolver:
         preproc_cb: Optional[Callable[[List], None]] = None,
         postproc_cb: Optional[Callable[[List], None]] = None,
         backend: str = "jit",
+        postproc_timeloop_cb: Optional[Callable[[List], None]] = None,
     ) -> None:
         self.dh = dof_handler
         self.me = mixed_element
@@ -234,6 +235,7 @@ class NewtonSolver:
         self.lp = lin_params
         self.pre_cb = preproc_cb
         self.post_cb = postproc_cb
+        self.post_timeloop_cb = postproc_timeloop_cb
 
         # Keep original forms handy (their .integrand is needed later)
         self._residual_form = residual_form
@@ -335,6 +337,9 @@ class NewtonSolver:
             # Accept: promote current → previous ------------------
             for f_prev, f in zip(prev_functions, functions):
                 f_prev.nodal_values[:] = f.nodal_values[:]
+            # Post time-loop callback
+            if self.post_timeloop_cb is not None:
+                self.post_timeloop_cb(functions)
             if t_n + dt >= time_params.final_time:
                 break
 

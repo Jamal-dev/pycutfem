@@ -46,6 +46,9 @@ from pycutfem.fem.transform import map_deriv
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.utils.domain_manager import get_domain_bitset
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
+from pycutfem.ufl.helpers_geom import (
+    phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
+)
 
 
 
@@ -824,14 +827,22 @@ class FormCompiler:
         F[rows] = vals
     
     def _assemble_volume(self, integral: Integral, matvec):
+        # if a level-set was attached to dx → do cut-cell assembly in Python path
+        if getattr(integral.measure, "level_set", None) is not None:
+            # CUT-VOLUME integral
+            if self.backend == "jit":
+                self._assemble_volume_cut_jit(integral, matvec)
+            else:
+                # existing pure-Python path (already working from earlier work)
+                self._assemble_volume_cut_python(integral, matvec)
+            return
+        # … otherwise the existing back-end selection …
         if self.backend == "python":
-            logger.info(f"Assembling volume integral with python backend: {integral}")
             self._assemble_volume_python(integral, matvec)
         elif self.backend == "jit":
-            logger.info(f"Assembling volume integral with jit backend: {integral}")
             self._assemble_volume_jit(integral, matvec)
         else:
-            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+            raise ValueError("Unsupported backend.")
     
     # ----------------------------------------------------------------------
     def _assemble_volume_jit(self, integral: Integral, matvec):
@@ -1607,3 +1618,221 @@ class FormCompiler:
             self._assemble_boundary_edge_jit(intg, matvec)
         else:
             raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+    # --- CUT-CELL helpers -------------------------------------------------
+
+    def _physical_tri_quadrature(self, tri_coords, q_order):
+        """
+        Map the reference-triangle quadrature to the physical triangle with vertices tri_coords.
+        Returns (qpoints_phys, qweights_phys). Weights are *physical* areas.
+        """
+        v0, v1, v2 = map(np.asarray, tri_coords)
+        qp_ref, qw_ref = volume('tri', q_order)     # reference rule (r,s) on Δ(0,0)-(1,0)-(0,1)
+        J = np.column_stack((v1 - v0, v2 - v0))     # 2x2 affine map
+        detJ = abs(np.linalg.det(J))
+        qp_phys = (qp_ref @ J.T) + v0               # (nq,2)
+        qw_phys = qw_ref * detJ                     # area scaling → physical weights
+        return qp_phys, qw_phys
+    
+    def _integrate_on_cut_element(self, eid: int, integral, level_set, q_order: int, side: str):
+        """
+        Integrate over the physical part of element `eid` by clipping each geometric
+        corner-triangle against phi=0, then sub-triangulating and integrating each piece.
+        Returns the local element vector/matrix (shape matches self.ctx['rhs']).
+        """
+        mesh   = self.me.mesh
+        fields = _all_fields(integral.integrand)
+        rhs    = self.ctx.get('rhs', False)
+
+        # local accumulator
+        loc = (np.zeros(self.me.n_dofs_local) if rhs
+            else np.zeros((self.me.n_dofs_local, self.me.n_dofs_local)))
+
+        # 1) split geometry into corner triangles (tri stays as-is; quad → two tris)
+        elem = mesh.elements_list[eid]
+        tri_local, corner_ids = corner_tris(mesh, elem)
+
+        # 2) reference rule on the unit triangle
+        qp_ref, qw_ref = volume("tri", q_order)
+
+        # 3) process each geometric triangle
+        for loc_tri in tri_local:
+            v_ids   = [corner_ids[i] for i in loc_tri]
+            v_coords = mesh.nodes_x_y_pos[v_ids]  # (3,2)
+            v_phi    = np.array([phi_eval(level_set, xy) for xy in v_coords], dtype=float)
+
+            # clip to requested side and fan-triangulate each polygon
+            polygons = clip_triangle_to_side(v_coords, v_phi, side=side)
+            for poly in polygons:
+                for A, B, C in fan_triangulate(poly):
+                    qp_phys, qw_phys = map_ref_tri_to_phys(A, B, C, qp_ref, qw_ref)
+
+                    # 4) quadrature loop in *physical* space (weights are physical)
+                    for x_phys, w in zip(qp_phys, qw_phys):
+                        # reference point of the *parent element* that owns x_phys
+                        xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
+                        J       = transform.jacobian(mesh, eid, (xi, eta))
+                        JiT     = np.linalg.inv(J).T
+
+                        # cache bases at this point (zero-padded across mixed fields)
+                        self._basis_cache.clear()
+                        for f in fields:
+                            self._basis_cache[f] = {
+                                "val" : self.me.basis(f, xi, eta),
+                                "grad": self.me.grad_basis(f, xi, eta) @ JiT
+                            }
+
+                        # context for UFL visitors
+                        self.ctx["eid"]     = eid
+                        self.ctx["x_phys"]  = x_phys
+                        self.ctx["phi_val"] = phi_eval(level_set, x_phys)
+
+                        integrand_val = self._visit(integral.integrand)
+                        # IMPORTANT: 'w' already includes the area Jacobian of the sub-triangle.
+                        loc += w * integrand_val
+
+        return loc
+
+    def _assemble_volume_cut_python(self, integral, matvec):
+        """
+        Assemble a volume integral restricted by the 'side' of a level set:
+            dx(level_set=phi, metadata={'side': '+/-'})
+        - full elements on the selected side: standard reference rule
+        - cut elements: clipped sub-triangle physical quadrature
+        """
+        mesh      = self.me.mesh
+        level_set = integral.measure.level_set
+        if level_set is None:
+            raise ValueError("Cut-cell volume assembly requires measure.level_set")
+
+        side    = integral.measure.metadata.get('side', '+')  # '+' → phi>0, '-' → phi<0
+        q_order = self._find_q_order(integral)
+        rhs     = self.ctx.get("rhs", False)
+        fields  = _all_fields(integral.integrand)
+
+        # --- 1) classify (fills tags & caches)
+        inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
+
+        # Reference rule & scatter util
+        qp_ref, qw_ref = volume(mesh.element_type, q_order)
+
+        def _scatter(eid, loc):
+            gdofs = self.dh.get_elemental_dofs(eid)
+            if rhs:
+                np.add.at(matvec, gdofs, loc)
+            else:
+                r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
+                matvec[r, c] += loc
+
+        # --- 2) full elements on the selected side → standard reference rule
+        full_eids = outside_ids if side == '+' else inside_ids
+        for eid in full_eids:
+            loc = (np.zeros(self.me.n_dofs_local) if rhs
+                else np.zeros((self.me.n_dofs_local, self.me.n_dofs_local)))
+
+            for (xi, eta), w in zip(qp_ref, qw_ref):
+                J    = transform.jacobian(mesh, eid, (xi, eta))
+                detJ = abs(np.linalg.det(J))
+                JiT  = np.linalg.inv(J).T
+
+                self._basis_cache.clear()
+                for f in fields:
+                    self._basis_cache[f] = {
+                        "val" : self.me.basis(f, xi, eta),
+                        "grad": self.me.grad_basis(f, xi, eta) @ JiT
+                    }
+                self.ctx["eid"]    = eid
+                self.ctx["x_phys"] = transform.x_mapping(mesh, eid, (xi, eta))
+                integrand_val      = self._visit(integral.integrand)
+                loc += w * detJ * integrand_val
+
+            _scatter(eid, loc)
+
+        # --- 3) cut elements → clipped sub-triangles
+        for eid in cut_ids:
+            loc = self._integrate_on_cut_element(eid, integral, level_set, q_order, side=side)
+            _scatter(eid, loc)
+
+        # cleanup
+        for key in ("eid", "x_phys", "phi_val"):
+            self.ctx.pop(key, None)
+
+    
+    def _assemble_volume_cut_jit(self, intg, matvec):
+        """
+        Assemble ∫_{Ω∩{φ▹0}} (...) dx with the JIT back-end.
+
+        Strategy:
+        1) classify elements w.r.t. φ
+        2) assemble full elements on the selected side with the *standard* JIT volume
+        3) assemble cut elements with element-specific (clipped) quadrature
+        """
+        mesh, dh, me = self.me.mesh, self.dh, self.me
+        qdeg   = self._find_q_order(intg)
+        level_set = intg.measure.level_set
+        side   = intg.measure.metadata.get('side', '+')   # '+' → φ>0, '-' → φ<0
+
+        # --- 1) classification (must be called; sets element tags & caches)
+        inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
+
+        # --- compile kernel once
+        runner, ir = self._compile_backend(intg.integrand, dh, me)
+
+        # helper to run kernel on a subset of elements with prebuilt geo
+        def _run_subset(eids: np.ndarray, prebuilt: dict):
+            if eids.size == 0:
+                return
+            gdofs_map = np.vstack([dh.get_elemental_dofs(e) for e in eids]).astype(np.int32)
+            # kernel wants node_coords in the signature, provide it once
+            prebuilt = dict(prebuilt)
+            prebuilt["gdofs_map"]  = gdofs_map
+            prebuilt["node_coords"] = dh.get_all_dof_coords()  # required in param_order
+
+            static_args = _build_jit_kernel_args(
+                ir, intg.integrand, me, qdeg,
+                dof_handler=dh,
+                gdofs_map=gdofs_map,
+                param_order=runner.param_order,
+                pre_built=prebuilt
+            )
+            current_funcs = self._get_data_functions_objs(intg)
+            K_loc, F_loc, J_loc = runner(current_funcs, static_args)
+
+            hook = self._hook_for(intg.integrand)
+            _scatter_element_contribs(
+                K_loc, F_loc, J_loc, eids, gdofs_map,
+                matvec, self.ctx, intg.integrand, hook=hook
+            )
+
+        # --- 2) full elements on the selected side → standard volume tables sliced
+        full_ids = np.asarray(outside_ids if side == '+' else inside_ids, dtype=np.int32)
+        if full_ids.size:
+            geo_all = dh.precompute_geometric_factors(qdeg)  # (n_elem, n_q, …)
+            # slice only needed keys to reduce memory traffic
+            prebuilt_full = {k: geo_all[k][full_ids]
+                            for k in ("qp_phys", "qw", "detJ", "J_inv")}
+            _run_subset(full_ids, prebuilt_full)
+
+        # --- 3) cut elements → clipped triangles (physical weights); detJ := 1
+        if len(cut_ids):
+            from pycutfem.ufl.helpers import required_multi_indices
+            derivs = required_multi_indices(intg.integrand) | {(0, 0)}
+
+            # precomputed, element-specific qp / qw / J_inv  (+ basis tables b_* / dxy_*)
+            geo_cut = dh.precompute_cut_volume_factors(
+                mesh.element_bitset("cut"), qdeg, derivs, level_set, side=side
+            )
+            cut_eids = np.asarray(geo_cut.get("eids", []), dtype=np.int32)
+            if cut_eids.size:
+                # ensure detJ is present and neutral (if your helper has not added it)
+                if "detJ" not in geo_cut:
+                    geo_cut["detJ"] = np.ones_like(geo_cut["qw"])
+                _run_subset(cut_eids, geo_cut)
+
+        # cleanup context (if you stored any debug keys)
+        for k in ("eid", "x_phys", "phi_val"):
+            self.ctx.pop(k, None)
+
+
+
+
+

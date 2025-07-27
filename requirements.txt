@@ -4,3 +4,4 @@ sympy
 matplotlib
 legacy-quadpy
 numba
+meshio

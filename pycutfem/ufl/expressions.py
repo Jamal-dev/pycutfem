@@ -2,6 +2,7 @@ import numpy as np
 from typing import Callable, Dict, List, Optional, Union
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
+from matplotlib.tri import LinearTriInterpolator
 import numbers
 from matplotlib.colors import LinearSegmentedColormap
 from pycutfem.plotting.triangulate import triangulate_field
@@ -102,6 +103,61 @@ class Transpose(Expression):
     def __init__(self, A: Expression):
         super().__init__()
         self.A = A
+
+# ----------------------------------------------------------
+# Small utility to build a per-DOF mask for a given field
+# ----------------------------------------------------------
+def _node_keep_mask_for_field(dh, field_name, mask):
+    """
+    Return a boolean array of length len(dh.get_field_slice(field_name))
+    with True where the field's DOF is *kept* for plotting.
+    mask can be: BitSet (elements), boolean array per node, or callable (x,y)->bool.
+    """
+    fld_slice = dh.get_field_slice(field_name)
+    n = len(fld_slice)
+    keep = np.ones(n, dtype=bool) if mask is None else None
+
+    if keep is not None:
+        return keep
+
+    if callable(mask):
+        xy = dh.get_dof_coords(field_name)
+        keep = np.asarray(mask(xy[:, 0], xy[:, 1]), dtype=bool)
+        if keep.shape != (n,):
+            raise ValueError("callable mask must return shape (n_dofs_field,)")
+        return keep
+
+    if isinstance(mask, np.ndarray):
+        keep = np.asarray(mask, dtype=bool)
+        if keep.shape != (n,):
+            raise ValueError("mask boolean array must match the field's DOF count")
+        return keep
+
+    if isinstance(mask, BitSet):
+        # Mark all DOFs belonging to any *kept* element.
+        keep = np.zeros(n, dtype=bool)
+        gdofs = dh.get_field_slice(field_name)
+        gd2l = {gd: i for i, gd in enumerate(gdofs)}
+        # element_maps[field_name][eid] -> list of global dofs for that element/field
+        for eid in mask.to_indices():
+            for gd in dh.element_maps[field_name][eid]:
+                li = gd2l.get(gd)
+                if li is not None:
+                    keep[li] = True
+        return keep
+
+    raise TypeError("Unsupported mask type for plotting. Use BitSet, bool array, or callable.")
+
+def _apply_tri_mask(tri_obj, keep_nodes_bool):
+    """
+    Given a Triangulation and a per-node boolean 'keep' mask,
+    mask out every triangle that touches a 'False' node.
+    """
+    tris = tri_obj.triangles
+    tri_mask = np.any(~keep_nodes_bool[tris], axis=1)
+    tri_obj.set_mask(tri_mask)
+    return tri_mask
+
 class Function(Expression):
     """
     Represents a single-field function. Can be a standalone data-carrier
@@ -186,31 +242,41 @@ class Function(Expression):
         return f"{self.__class__.__name__}(name='{self.name}', field='{self.field_name}')"
     
     def plot(self, **kwargs):
-        """ Function.plot(**kwargs) -> None
-        Creates a 2D filled contour plot of the scalar function.
+        """
+        Plot a scalar Function. New keyword:
+            mask : BitSet | ndarray[bool] | callable(x,y)->bool, optional
+                Only plot within this region. Implemented by masking triangles.
         """
         if self._dof_handler is None:
             raise RuntimeError("Cannot plot a function without an associated DofHandler.")
-        mesh = self._dof_handler.fe_map.get(self.field_name)
+        mask_arg = kwargs.pop('mask', None)
+
+        dh   = self._dof_handler
+        mesh = dh.fe_map.get(self.field_name)
         if mesh is None:
             raise RuntimeError(f"Field '{self.field_name}' not found in DofHandler's fe_map.")
-        
-       
-        z = self.nodal_values
 
-            
-        triangulation = triangulate_field(mesh, self._dof_handler, self.field_name)
+        z = self.nodal_values
+        tri = triangulate_field(mesh, dh, self.field_name)
+
+        if mask_arg is not None:
+            keep = _node_keep_mask_for_field(dh, self.field_name, mask_arg)
+            tri_mask = _apply_tri_mask(tri, keep)
+            if np.all(tri_mask):
+                raise ValueError("Mask excludes all triangles — nothing to plot.")
+
         fig, ax = plt.subplots()
         title = kwargs.pop('title', f'Scalar Field: {self.name}')
+        x_label = kwargs.pop('xlabel', 'X-Axis')
+        y_label = kwargs.pop('ylabel', 'Y-Axis')
         plot_kwargs = {'cmap': 'viridis', 'levels': 15}
         plot_kwargs.update(kwargs)
-        
-        contour = ax.tricontourf(triangulation, z, **plot_kwargs)
-        fig.colorbar(contour, ax=ax, label='Value')
-        ax.set_title(title)
-        ax.set_xlabel('X coordinate'); ax.set_ylabel('Y coordinate')
-        ax.set_aspect('equal', adjustable='box')
-        ax.tricontour(triangulation, z, colors='k', linewidths=0.5, levels=plot_kwargs['levels'])
+
+        tcf = ax.tricontourf(tri, z, **plot_kwargs)
+        fig.colorbar(tcf, ax=ax, label='Value')
+        ax.set_title(title); ax.set_xlabel(x_label); ax.set_ylabel(y_label)
+        ax.set_aspect('equal', 'box')
+        # ax.tricontour(tri, z, colors='k', linewidths=0.5, levels=plot_kwargs['levels'])
         plt.show()
 
     def plot_deformed(self,
@@ -388,144 +454,101 @@ class VectorFunction(Expression):
         else:
             raise ValueError(f"Unsupported plot kind '{kind}'. Choose 'contour' or 'quiver'.")
 
-    def _plot_quiver(self, *,          # <-- keep the same public signature
-                 stride: int = 1,   # decimate arrows to avoid clutter
-                 background: bool | str = "magnitude",
-                 **kwargs):
-        """
-        Quiver plot that **always** matches the field’s DOF layout.
-
-        Parameters
-        ----------
-        stride : int, optional
-            Use every *stride*-th DOF for the arrows. 1 → all nodes (default 1).
-        background : bool | str, optional
-            ``False`` – no colour wash behind arrows.
-            ``True``  – filled contour of |u|.
-            ``"ux"``/``"uy"``/``"p"`` … any scalar component name → plot that
-            component instead of the magnitude.  (Default ``"magnitude"`` which is
-            equivalent to ``True``.)
-        **kwargs :
-            Passed straight to ``ax.quiver`` (e.g. `color='k'`, `scale=50` …).
-        """
-        if self._dof_handler is None:
-            raise RuntimeError("VectorFunction needs an attached DofHandler.")
-        if len(self.field_names) != 2:
-            raise NotImplementedError("Quiver is implemented only for 2-D vectors.")
-
-        fld_u, fld_v = self.field_names
-        dh   = self._dof_handler
-        mesh = dh.fe_map[fld_u]
-
-        # --- coordinates + values (1-to-1 with DOFs) ---------------------
-        coords = dh.get_dof_coords(fld_u)                                
-        x, y   = coords[:, 0], coords[:, 1]
-        u_vals = self.components[0].nodal_values
-        v_vals = self.components[1].nodal_values
-        if len(u_vals) != len(x):
-            raise ValueError("Mismatch between nodal values and coordinate length.")
-
-        # optional arrow decimation
-        sl = slice(None, None, stride)
-        x_q, y_q, u_q, v_q = x[sl], y[sl], u_vals[sl], v_vals[sl]
-
-        # --- background colour-wash --------------------------------------
-        tri_obj = triangulate_field(mesh, dh, fld_u)
-        fig, ax = plt.subplots(figsize=(8, 8))
-
-        if background:
-            if background is True or background == "magnitude":
-                scalar, label = np.hypot(u_vals, v_vals), "|u|"
-            else:  # any scalar component name
-                comp = next((c for c in self.components if c.field_name == background), None)
-                if comp is None:
-                    raise ValueError(f"background='{background}' not a component.")
-                scalar, label = comp.nodal_values, background
-            levels = kwargs.pop("levels", 15)
-            cmap   = kwargs.pop("cmap",   "viridis")
-            tcf = ax.tricontourf(tri_obj, scalar, levels=levels, cmap=cmap)
-            fig.colorbar(tcf, ax=ax, label=label)
-
-        # --- arrows -------------------------------------------------------
-        q_defaults = dict(angles="xy", scale_units="xy", scale=None, color="k")
-        title = kwargs.pop('title', f"Vector field: {self.name}")
-        q_defaults.update(kwargs)
-        ax.quiver(x_q, y_q, u_q, v_q, **q_defaults)
-
-        ax.set_title(title)
-        ax.set_xlabel("x"); ax.set_ylabel("y")
-        ax.set_aspect("equal", adjustable="box")
-        dx = np.ptp(x)    # instead of x.ptp()
-        dy = np.ptp(y)    # instead of y.ptp()
-        ax.set_xlim(x.min() - 0.05 * dx, x.max() + 0.05 * dx)
-        ax.set_ylim(y.min() - 0.05 * dy, y.max() + 0.05 * dy)
-        plt.show()
-    
-    # ------------------------------------------------------------------
-    # NEW: stream-line plot
-    # ------------------------------------------------------------------
-    def _plot_streamlines(
-            self, *,
-            grid: int = 200,           # samples per axis for interpolation grid
-            density: float = 1.3,      # passed straight to plt.streamplot
-            linewidth: float = 1.0,
-            cmap: str = "turbo",
-            background: bool | str = "magnitude",
-            **kwargs):
-        """
-        Draw stream-lines of the 2-D vector field.
-
-        Parameters
-        ----------
-        grid        : int
-            Resolution of the regular (x,y) grid to which the nodal values are
-            interpolated (default 200×200).
-        density     : float
-            Stream-line density parameter as in ``plt.streamplot``.
-        linewidth   : float
-            Line width for the stream-lines.
-        cmap        : str
-            Colour map for line colouring by |u|.
-        background  : see ``_plot_quiver`` – allows a filled contour behind
-            the stream-lines; use ``False`` for none.
-        **kwargs    :
-            Extra keyword args go to ``ax.streamplot`` (e.g. arrowsize=1.5).
-        """
-        import matplotlib.pyplot as plt
-        from matplotlib.tri import LinearTriInterpolator
-
+    def _plot_quiver(self, *,
+                    stride: int = 1,
+                    background: bool | str = "magnitude",
+                    mask=None,
+                    **kwargs):
         if self._dof_handler is None or len(self.field_names) != 2:
-            raise RuntimeError("Stream-line plot needs a 2-D VectorFunction attached to a DofHandler.")
-
+            raise RuntimeError("Quiver requires a 2-D VectorFunction with a DofHandler.")
         fld_u, fld_v = self.field_names
         dh   = self._dof_handler
         mesh = dh.fe_map[fld_u]
 
-        # 1. nodal coordinates and values (exactly as in quiver)
         coords = dh.get_dof_coords(fld_u)
         x, y   = coords[:, 0], coords[:, 1]
         u_vals = self.components[0].nodal_values
         v_vals = self.components[1].nodal_values
 
-        # 2. interpolate to a regular grid so that streamplot can integrate
-        tri      = triangulate_field(mesh, dh, fld_u)            # existing helper
+        # Node-level keep mask
+        keep = _node_keep_mask_for_field(dh, fld_u, mask)
+        pick = np.flatnonzero(keep)[::max(1, int(stride))]
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+
+        # Optional background respecting the same tri-mask
+        if background:
+            tri = triangulate_field(mesh, dh, fld_u)
+            _apply_tri_mask(tri, keep)
+            if background is True or background == "magnitude":
+                scalar, label = np.hypot(u_vals, v_vals), "|u|"
+            else:
+                comp = next((c for c in self.components if c.field_name == background), None)
+                if comp is None:
+                    raise ValueError(f"background='{background}' not a component.")
+                scalar, label = comp.nodal_values, background
+            tcf = ax.tricontourf(tri, scalar, levels=15, cmap=kwargs.get('cmap', 'viridis'))
+            fig.colorbar(tcf, ax=ax, label=label)
+
+        q = ax.quiver(x[pick], y[pick], u_vals[pick], v_vals[pick],
+                    angles='xy', scale_units='xy',
+                    color=kwargs.pop('color', 'k'),
+                    **kwargs)
+        ax.set(title=kwargs.pop('title', f"{self.name}"), xlabel='x', ylabel='y', aspect='equal')
+        plt.show()
+    
+    # ------------------------------------------------------------------
+    # NEW: stream-line plot
+    # ------------------------------------------------------------------
+    def _plot_streamlines(self, *,
+                        grid: int = 200,
+                        density: float = 1.3,
+                        linewidth: float = 1.0,
+                        cmap: str = "turbo",
+                        background: bool | str = "magnitude",
+                        mask=None,
+                        **kwargs):
+        from matplotlib.tri import LinearTriInterpolator
+
+        if self._dof_handler is None or len(self.field_names) != 2:
+            raise RuntimeError("Stream-lines need a 2-D VectorFunction with a DofHandler.")
+        fld_u, fld_v = self.field_names
+        dh   = self._dof_handler
+        mesh = dh.fe_map[fld_u]
+
+        u_vals = self.components[0].nodal_values
+        v_vals = self.components[1].nodal_values
+
+        # Triangulation + mask
+        tri = triangulate_field(mesh, dh, fld_u)
+        keep = _node_keep_mask_for_field(dh, fld_u, mask)
+        tri_mask = _apply_tri_mask(tri, keep)
+        if np.all(tri_mask):
+            raise ValueError("Mask excludes all triangles — no streamlines to draw.")
+
         interp_u = LinearTriInterpolator(tri, u_vals)
         interp_v = LinearTriInterpolator(tri, v_vals)
 
-        xi = np.linspace(x.min(), x.max(), grid)
-        yi = np.linspace(y.min(), y.max(), grid)
+        # Grid covering the (unmasked) triangulation
+        x_min, x_max = tri.x.min(), tri.x.max()
+        y_min, y_max = tri.y.min(), tri.y.max()
+        xi = np.linspace(x_min, x_max, grid)
+        yi = np.linspace(y_min, y_max, grid)
         X, Y = np.meshgrid(xi, yi)
-        U = interp_u(X, Y)
-        V = interp_v(X, Y)
 
-        # mask out triangles lying outside the domain (Finite-Element holes)
-        mask = np.isnan(U) | np.isnan(V)
-        U[mask] = 0.0; V[mask] = 0.0
+        # Mask grid cells that fall outside the (masked) triangulation
+        trifinder = tri.get_trifinder()
+        grid_outside = (trifinder(X, Y) < 0)
 
-        # 3. plotting ---------------------------------------------------
+        U = np.asarray(interp_u(X, Y))
+        V = np.asarray(interp_v(X, Y))
+        U = np.ma.array(U, mask=grid_outside)
+        V = np.ma.array(V, mask=grid_outside)
+
         fig, ax = plt.subplots(figsize=(8, 8))
-        title     = kwargs.pop("title", f"Stream-lines: {self.name}") 
-        # optional background colour wash
+        title = kwargs.pop("title", f"Stream-lines: {self.name}")
+
+        # Optional background respecting tri-mask
         if background:
             if background is True or background == "magnitude":
                 scalar, label = np.hypot(u_vals, v_vals), "|u|"
@@ -534,26 +557,20 @@ class VectorFunction(Expression):
                 if comp is None:
                     raise ValueError(f"background='{background}' not a component.")
                 scalar, label = comp.nodal_values, background
-            tri_obj = triangulate_field(mesh, dh, fld_u)
-            tcf = ax.tricontourf(tri_obj, scalar, levels=20, cmap=cmap, alpha=0.8)
+            tcf = ax.tricontourf(tri, scalar, levels=20, cmap=cmap, alpha=0.85)
             fig.colorbar(tcf, ax=ax, label=label)
 
-        # stream-lines coloured by speed
-        speed = np.hypot(U, V)
-        strm = ax.streamplot(
-            X, Y, U, V,
-            density=density,
-            linewidth=linewidth,
-            color=speed,
-            cmap=cmap,
-            **kwargs
-        )
+        strm = ax.streamplot(X, Y, U, V,
+                            density=density,
+                            linewidth=linewidth,
+                            color=np.hypot(U, V),
+                            cmap=cmap,
+                            **kwargs)
         fig.colorbar(strm.lines, ax=ax, label="|u|")
-
-        ax.set_title(title)
-        ax.set_xlabel("x"); ax.set_ylabel("y")
-        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(title); ax.set_xlabel("x"); ax.set_ylabel("y")
+        ax.set_aspect("equal", "box")
         plt.show()
+
     
     def plot_deformed(self,
                     displacement: 'VectorFunction',

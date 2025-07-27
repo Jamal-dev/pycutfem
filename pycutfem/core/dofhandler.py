@@ -15,6 +15,10 @@ from pycutfem.integration.quadrature import volume
 from collections.abc import Sequence
 from hashlib import blake2b
 from pycutfem.integration.quadrature import line_quadrature
+from pycutfem.ufl.helpers_geom import (
+    phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
+)
+
 
 BcLike = Union[BoundaryCondition, Mapping[str, Any]]
 # ------------------------------------------------------------------
@@ -1067,7 +1071,182 @@ class DofHandler:
         return out
     
 
+    # --- cut volume --------------------------------------
 
+    def precompute_cut_volume_factors(
+            self,
+            element_bitset,
+            qdeg: int,
+            derivs: set[tuple[int, int]],
+            level_set,
+            side: str = "+",
+    ) -> dict:
+        """
+        Pre-compute geometry/basis for ∫_{Ω ∩ {φ ▷ 0}} (…) dx on CUT elements only,
+        using element-specific clipped triangle quadrature in *physical* space.
+
+        Returns padded arrays shaped (n_cut, max_q, …), aligned with 'eids' order.
+        Provides 'qp_phys', 'qw', 'J_inv', 'detJ' (ones), 'normals' (zeros), 'phis',
+        and basis tables 'b_<field>', 'g_<field>' (+ 'd{dx}{dy}_{field}' if requested).
+        """
+        import numpy as np
+        from pycutfem.integration.quadrature import volume as tri_volume_rule
+        from pycutfem.fem import transform
+        # helpers shared across Python & JIT paths
+        from pycutfem.ufl.helpers_geom import (
+            phi_eval, clip_triangle_to_side, fan_triangulate,
+            map_ref_tri_to_phys, corner_tris
+        )
+
+        mesh = self.mixed_element.mesh
+        me   = self.mixed_element
+        fields = list(me.field_names)
+
+        # --- collect candidate (cut) element ids ---------------------------------
+        eids_all = element_bitset.to_indices() if hasattr(element_bitset, "to_indices") else list(element_bitset)
+        eids_all = [eid for eid in eids_all if 0 <= eid < mesh.n_elements]
+        if not eids_all:
+            return {
+                "eids": np.array([], dtype=np.int32),
+                "qp_phys": np.empty((0,0,2)), "qw": np.empty((0,0)),
+                "J_inv": np.empty((0,0,2,2)), "detJ": np.empty((0,0)),
+                "normals": np.empty((0,0,2)), "phis": np.empty((0,0)),
+            }
+
+        # reference triangle rule (0,0)-(1,0)-(0,1)
+        qp_ref_tri, qw_ref_tri = tri_volume_rule("tri", qdeg)
+
+        # ragged accumulators
+        valid_eids   = []
+        qp_chunks    = []
+        qw_chunks    = []
+        Jinv_chunks  = []
+        phi_chunks   = []
+        basis_lists: dict[str, list[np.ndarray]] = {}
+
+        for eid in eids_all:
+            elem = mesh.elements_list[eid]
+
+            # geometric corner-triangle tiling and corner ids
+            tri_local, cn = corner_tris(mesh, elem)
+
+            xq_elem, wq_elem, Jinv_elem, phi_elem = [], [], [], []
+            per_elem_basis: dict[str, list[np.ndarray]] = {}
+
+            for loc_tri in tri_local:
+                v_ids = [cn[i] for i in loc_tri]                # corner ids
+                V     = mesh.nodes_x_y_pos[v_ids]              # (3,2) physical vertices
+                v_phi = [phi_eval(level_set, xy) for xy in V]  # φ at vertices
+
+                # polygons on requested side ('+' keeps φ>=0, '-' keeps φ<=0)
+                polys = clip_triangle_to_side(V, v_phi, side=side)
+                if not polys:
+                    continue
+
+                for poly in polys:
+                    # fan triangulate polygon and integrate each sub-triangle
+                    for A, B, C in fan_triangulate(poly):
+                        x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_ref_tri, qw_ref_tri)
+
+                        for x, w in zip(x_phys, w_phys):
+                            # map quadrature point back to parent (ξ,η)
+                            xi, eta = transform.inverse_mapping(mesh, eid, x)
+                            J       = transform.jacobian(mesh, eid, (xi, eta))
+                            Jinv    = np.linalg.inv(J)
+
+                            xq_elem.append(x)
+                            wq_elem.append(w)
+                            Jinv_elem.append(Jinv)
+                            phi_elem.append(phi_eval(level_set, x))
+
+                            # basis & reference grads
+                            for fld in fields:
+                                kb = f"b_{fld}"
+                                kg = f"g_{fld}"
+                                per_elem_basis.setdefault(kb, []).append(me.basis(fld, xi, eta))
+                                per_elem_basis.setdefault(kg, []).append(me.grad_basis(fld, xi, eta))
+                                for (dx, dy) in derivs:
+                                    if (dx, dy) == (0, 0):
+                                        continue
+                                    kd = f"d{dx}{dy}_{fld}"
+                                    per_elem_basis.setdefault(kd, []).append(me.deriv_ref(fld, xi, eta, dx, dy))
+
+            if not wq_elem:
+                continue
+
+            valid_eids.append(eid)
+            qp_chunks.append(np.asarray(xq_elem, dtype=float))       # (n_q,2)
+            qw_chunks.append(np.asarray(wq_elem, dtype=float))       # (n_q,)
+            Jinv_chunks.append(np.asarray(Jinv_elem, dtype=float))   # (n_q,2,2)
+            phi_chunks.append(np.asarray(phi_elem, dtype=float))     # (n_q,)
+
+            # finalize per-element basis arrays → (n_q, n_loc)
+            for key, rows in per_elem_basis.items():
+                basis_lists.setdefault(key, []).append(np.vstack(rows).astype(float))
+
+        if not valid_eids:
+            return {
+                "eids": np.array([], dtype=np.int32),
+                "qp_phys": np.empty((0,0,2)), "qw": np.empty((0,0)),
+                "J_inv": np.empty((0,0,2,2)), "detJ": np.empty((0,0)),
+                "normals": np.empty((0,0,2)), "phis": np.empty((0,0)),
+            }
+
+        # --- pad ragged → dense (n_cut, max_q, …) -------------------------------
+        def _pad2(list_of_2d, fill=0.0):
+            n = len(list_of_2d)
+            m = max(a.shape[0] for a in list_of_2d)
+            d = list_of_2d[0].shape[1]
+            out = np.full((n, m, d), fill, dtype=float)
+            for i, a in enumerate(list_of_2d):
+                out[i, :a.shape[0], :a.shape[1]] = a
+            return out
+
+        def _pad1(list_of_1d, fill=0.0):
+            n = len(list_of_1d)
+            m = max(a.shape[0] for a in list_of_1d)
+            out = np.full((n, m), fill, dtype=float)
+            for i, a in enumerate(list_of_1d):
+                out[i, :a.shape[0]] = a
+            return out
+
+        def _pad22(list_of_3d, fill=0.0):
+            n = len(list_of_3d)
+            m = max(a.shape[0] for a in list_of_3d)
+            out = np.full((n, m, 2, 2), fill, dtype=float)
+            for i, a in enumerate(list_of_3d):
+                out[i, :a.shape[0], :, :] = a
+            return out
+
+        qp_phys = _pad2(qp_chunks, 0.0)
+        qw      = _pad1(qw_chunks,  0.0)
+        J_inv   = _pad22(Jinv_chunks, 0.0)
+        phis    = _pad1(phi_chunks,  0.0)
+
+        # volume-only arrays required by kernel
+        normals = np.zeros((qp_phys.shape[0], qp_phys.shape[1], 2), dtype=float)
+        detJ    = np.ones_like(qw, dtype=float)   # weights already physical
+
+        out = {
+            "eids":    np.asarray(valid_eids, dtype=np.int32),
+            "qp_phys": qp_phys,
+            "qw":      qw,
+            "J_inv":   J_inv,
+            "detJ":    detJ,
+            "normals": normals,
+            "phis":    phis,
+            "h_arr":   np.asarray([mesh.element_char_length(e) for e in valid_eids], dtype=float),
+        }
+        # stitch basis tables (key → (n_cut, max_q, n_loc))
+        for key, seq in basis_lists.items():
+            out[key] = _pad2(seq, 0.0)
+
+        return out
+
+
+
+
+    
     def info(self) -> None:
         print(f"=== DofHandler ({self.method.upper()}) ===")
         for fld in self.field_names:

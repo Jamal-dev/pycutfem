@@ -56,7 +56,7 @@ D = 0.1   # Cylinder diameter
 c_x, c_y = 0.2, 0.2  # Cylinder center
 rho = 1.0  # Density
 mu = 1e-3  # Viscosity
-U_mean = 1.0 # Mean inflow velocity
+U_mean = 1.5 # Mean inflow velocity
 Re = rho * U_mean * D / mu
 print(f"Reynolds number (Re): {Re:.2f}")
 
@@ -67,19 +67,18 @@ print(f"Reynolds number (Re): {Re:.2f}")
 from pycutfem.utils.adaptive_mesh import structured_quad_levelset_adaptive
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-NX, NY = 18, 18
+NX, NY = 45, 20
 # NX, NY = 50, 60
 poly_order = 2
 level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
 h  = 0.5*(L/NX + H/NY)
-# box = (c_x-3*h, c_y-3*h, c_x+3*h, c_y+3*h)
-window = (c_x-D*1.5, c_y-D*1.5, c_x+D*1.5, c_y+D*1.5)  # grid-aligned selection window
+
 
 # nodes, elems, _, corners = structured_quad(L, H, nx=NX, ny=NY, poly_order=poly_order)
 
 nodes, elems, edges, corners = structured_quad_levelset_adaptive(
         Lx=L, Ly=H, nx=NX, ny=NY, poly_order=poly_order,
-        level_set=CircleLevelSet(center=(c_x, c_y), radius=(D/2.0+0.1*D/2.0) ),
+        level_set=CircleLevelSet(center=(c_x, c_y), radius=(D/2.0+0.2*D/2.0) ),
         max_refine_level=1)          # add a single halo, nothing else
 mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
 
@@ -127,6 +126,7 @@ mesh.tag_boundary_edges(bc_tags)
 
 # --- Define Domains with BitSets ---
 fluid_domain = get_domain_bitset(mesh, "element", "outside")
+rigid_domain = get_domain_bitset(mesh, "element", "inside")
 cut_domain = get_domain_bitset(mesh, "element", "cut")
 ghost_edges = get_domain_bitset(mesh, "edge", "ghost")
 physical_domain = fluid_domain | cut_domain
@@ -176,8 +176,8 @@ u_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handl
 p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler)
 
 # --- Parameters ---
-dt = Constant(0.02)
-theta = Constant(1.0) # Crank-Nicolson
+dt = Constant(0.5)
+theta = Constant(0.5) # Crank-Nicolson
 mu_const = Constant(mu)
 rho_const = Constant(rho)
 
@@ -224,7 +224,7 @@ dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_s
 dG       = dGhost(defined_on=mesh.edge_bitset("ghost"), level_set=level_set,metadata={"q":4})  # ghost surface
 
 cell_h  = CellDiameter() # length‑scale per element
-beta_N  = Constant(10.0 * poly_order**2)      # Nitsche penalty (tweak)
+beta_N  = Constant(20.0 * poly_order**2)      # Nitsche penalty (tweak)
 
 def epsilon(u):
     "Symmetric gradient."
@@ -283,25 +283,39 @@ r_vol = restrict(( rho*dot(u_k-u_n, v)/dt
           + theta*mu*inner(grad(u_k), grad(v))
           + (1-theta)*mu*inner(grad(u_n), grad(v))
           - p_k*div(v) + q*div(u_k) ),physical_domain) * dx_phys
+# a_vol = ( rho*dot(du,v)/dt
+#           + theta*rho*dot(dot(grad(u_k), du), v)
+#           + theta*rho*dot(dot(grad(du), u_k), v)
+#           + theta*mu*inner(grad(du), grad(v))
+#           - dp*div(v) + q*div(du) ) * dx_phys
+
+# r_vol = ( rho*dot(u_k-u_n, v)/dt
+#           + theta*rho*dot(dot(grad(u_k), u_k), v)
+#           + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
+#           + theta*mu*inner(grad(u_k), grad(v))
+#           + (1-theta)*mu*inner(grad(u_n), grad(v))
+#           - p_k*div(v) + q*div(u_k) ) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
-penalty_val = 10
+penalty_val = 20
 penalty_grad = 0.1
 gamma_v = Constant(penalty_val * poly_order**2)
 gamma_v_grad= Constant(penalty_grad * poly_order**2)
 gamma_p  = Constant(penalty_val * poly_order**1)
-gama_p_grad = Constant(penalty_grad * poly_order**1)
+gamma_p_grad = Constant(penalty_grad * poly_order**1)
 
-# stab      = ( gamma_v  / cell_h   * dot(jump(u_k), jump(v))
-#             + gamma_v_grad * cell_h   * grad_inner(jump(u_k), jump(v))) * dG
+stab = ( gamma_v  / cell_h   * dot(jump(u_k), jump(v))
+       + gamma_v_grad * cell_h   * grad_inner(jump(u_k), jump(v))
+       + gamma_p  / cell_h   * jump(p_k) * jump(q)  # Note: use * for scalars, see issue 2
+       + gamma_p_grad * cell_h   * grad_inner(jump(p_k), jump(q)) ) * dG
 
 stab_lin  = ( gamma_v  / cell_h   * dot(jump(du),  jump(v)) +
              gamma_v_grad * cell_h   * grad_inner(jump(du),  jump(v))) * dG
-stab_lin += ( gamma_p  / cell_h   * dot(jump(dp),  jump(q))
-            + gama_p_grad * cell_h   * grad_inner(jump(dp),  jump(q))) * dG
+stab_lin += ( gamma_p  / cell_h   * jump(dp) *  jump(q)
+            + gamma_p_grad * cell_h   * grad_inner(jump(dp),  jump(q))) * dG
 # complete Jacobian and residual -----------------------------------
 jacobian_form  = a_vol + J_int + stab_lin
-residual_form  = r_vol + R_int 
+residual_form  = r_vol + R_int + stab
 # residual_form  = dot(  Constant(np.array([0.0, 0.0]),dim=1), v) * dx
 # jacobian_form  = stab_lin
 # residual_form  = stab
@@ -313,7 +327,7 @@ residual_form  = r_vol + R_int
 # In[10]:
 
 
-get_ipython().system('rm ~/.cache/pycutfem_jit/*')
+# !rm ~/.cache/pycutfem_jit/*
 
 
 # In[11]:
@@ -327,12 +341,44 @@ get_ipython().system('rm ~/.cache/pycutfem_jit/*')
 # In[12]:
 
 
+from pycutfem.io.vtk import export_vtk
+output_dir = "turek_results"
+os.makedirs(output_dir, exist_ok=True)
+step_counter = 0
+
+def save_solution(funcs):
+    """A callback function to export the solution to VTK."""
+    global step_counter
+
+    # We are interested in the primary unknowns, u_k and p_k
+    u_k_func = funcs[0]
+    p_k_func = funcs[1]
+
+    filename = os.path.join(output_dir, f"solution_{step_counter:04d}.vtu")
+    export_vtk(
+        filename=filename,
+        mesh=mesh,
+        dof_handler=dof_handler,
+        functions={"velocity": u_k_func, "pressure": p_k_func}
+    )
+    if step_counter % 5 == 0:
+        u_k_func.plot(field = 'ux',
+                      title=f"Velocity Ux at step {step_counter}",
+                      xlabel='X-Axis', ylabel='Y-Axis',
+                      levels=100, cmap='jet',
+                      mask = physical_domain,)
+    step_counter += 1
+
+
+# In[ ]:
+
+
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver
 from pycutfem.solvers.aainhb_solver import AAINHBSolver           # or get_solver("aainhb")
 
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
-time_params = TimeStepperParameters(dt=dt.value,max_steps=36 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
+time_params = TimeStepperParameters(dt=dt.value,max_steps=50 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
 
 solver = NewtonSolver(
     residual_form, jacobian_form,
@@ -340,6 +386,7 @@ solver = NewtonSolver(
     mixed_element=mixed_element,
     bcs=bcs, bcs_homog=bcs_homog,
     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+    postproc_timeloop_cb=save_solution
 )
 # primary unknowns
 functions      = [u_k, p_k]
@@ -373,5 +420,18 @@ u_n.plot(kind="streamline",
          density=4.0,
          linewidth=0.8,
          cmap="plasma",
-         title="Turek-Schafer",background = False)
+         title="Turek-Schafer",background = False,mask=physical_domain)
+
+
+# In[ ]:
+
+
+u_n.plot(kind="contour",mask =physical_domain)
+
+
+# In[ ]:
+
+
+p_n.plot(
+         title="Pressure",mask =physical_domain)
 
