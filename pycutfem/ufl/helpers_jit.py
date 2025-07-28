@@ -360,9 +360,9 @@ def _scatter_element_contribs(
 
     # --- Functional contributions ---
     if hook and J_elem is not None:
-        print(f"J_elem.shape: {J_elem.shape}---J_elem: {J_elem}")
+        # print(f"J_elem.shape: {J_elem.shape}---J_elem: {J_elem}")
         total = J_elem.sum(axis=0) if J_elem.ndim > 1 else J_elem.sum()
-        print(f"total.shape: {total.shape}---total: {total}")
+        # print(f"total.shape: {total.shape}---total: {total}")
         # This accumulator logic is correct.
         acc = ctx.setdefault("scalar_results", {}).setdefault(
             hook["name"], np.zeros_like(total)

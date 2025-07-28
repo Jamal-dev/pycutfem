@@ -3,6 +3,7 @@ import numpy as np
 from matplotlib.collections import LineCollection, PolyCollection
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from typing import Union, List
 
 
 
@@ -13,7 +14,16 @@ _ELEM_FILL = {
     "cut": (1.0, 0.55, 0.0, 0.7),
     "default": (0.9, 0.9, 0.9, 0.5)
 }
-_EDGE_COLOR = {"interface": "red", "ghost": "blue", "boundary": "black", "interior": "gray", "default": "darkgray"}
+_EDGE_COLOR = {
+    "boundary": "black",
+    "ghost": "blue",
+    "ghost_pos": "cyan",
+    "ghost_neg": "darkviolet",
+    "ghost_both": "red",
+    "interface": "green",
+    "cut_boundary": "red",
+    "default": "black",
+}
 
 def _edge_col(tag):
     return _EDGE_COLOR.get(tag, 'black')
@@ -177,9 +187,10 @@ def plot_mesh(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True,
         
     return ax
 
-def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True, 
-              plot_edges=True, elem_tags=True, edge_colors=True, 
-              show=True, ax=None, resolution=200, plot_interface=True):
+def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True,
+              plot_edges=True, elem_tags=True, edge_colors=True,
+              show=True, ax=None, resolution=200, plot_interface=True,
+              edge_filter: Union[str, List[str]] = None):
     """
     Plots a 2D mesh, correctly using the nodes_x_y_pos attribute for coordinates
     and adding a descriptive legend for tags.
@@ -193,69 +204,84 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
     if elem_tags:
         polys_by_color = {}
         unique_elem_tags = set(elem.tag for elem in mesh.elements_list if elem.tag)
-        
+
         for elem in mesh.elements_list:
-            face_color = _ELEM_FILL.get(elem.tag, _ELEM_FILL["default"])
+            # Use default color if tag is missing to ensure it's drawn
+            tag = elem.tag or "default"
+            face_color = _ELEM_FILL.get(tag, _ELEM_FILL["default"])
             corner_coords = node_coords[list(elem.corner_nodes)]
             polys_by_color.setdefault(face_color, []).append(corner_coords)
 
         for color, polys_list in polys_by_color.items():
-            poly_collection = PolyCollection(polys_list, facecolors=color, 
+            poly_collection = PolyCollection(polys_list, facecolors=color,
                                              edgecolors='black', lw=0.5, zorder=1)
             ax.add_collection(poly_collection)
-        
+
         for tag in sorted(list(unique_elem_tags)):
             if tag in _ELEM_FILL:
                 legend_handles.append(patches.Patch(color=_ELEM_FILL[tag], label=f'Element: {tag}'))
 
+    # --- MODIFIED SECTION ---
     if plot_edges:
-        edge_segments = [node_coords[list(edge.nodes)] for edge in mesh.edges_list]
-        colors = [_EDGE_COLOR.get(edge.tag, 'black') if edge.right is not None else _EDGE_COLOR.get('boundary', 'black') for edge in mesh.edges_list]
+        # 1. Determine which edges to draw
+        edges_to_draw = mesh.edges_list  # Default to all edges
+
+        if edge_filter:
+            tags_to_show = [edge_filter] if isinstance(edge_filter, str) else edge_filter
+            combined_mask = np.zeros(len(mesh.edges_list), dtype=bool)
+            for tag in tags_to_show:
+                try:
+                    combined_mask |= mesh.edge_bitset(tag).mask
+                except Exception:
+                    print(f"Warning: Could not find or use BitSet for edge tag '{tag}'.")
+            indices = np.flatnonzero(combined_mask)
+            edges_to_draw = [mesh.edges_list[i] for i in indices]
+
+        # 2. Build segments and colors using the (potentially filtered) list
+        edge_segments = [node_coords[list(edge.nodes)] for edge in edges_to_draw]
+        colors = [_EDGE_COLOR.get(edge.tag, 'black') if edge.right is not None else _EDGE_COLOR.get('boundary', 'black') for edge in edges_to_draw]
         line_collection = LineCollection(edge_segments, colors=colors, linewidths=1.2, zorder=2)
         ax.add_collection(line_collection)
-        
-        unique_edge_tags = set(edge.tag for edge in mesh.edges_list if edge.tag)
-        if any(e.right is None for e in mesh.edges_list):
+
+        # 3. Build legend using only the tags from the drawn edges
+        unique_edge_tags = set(edge.tag for edge in edges_to_draw if edge.tag)
+        if any(e.right is None for e in edges_to_draw):
             unique_edge_tags.add('boundary')
 
         for tag in sorted(list(unique_edge_tags)):
              if tag in _EDGE_COLOR:
                 legend_handles.append(plt.Line2D([0], [0], color=_EDGE_COLOR[tag], lw=2, label=f'Edge: {tag}'))
+    # --- END MODIFIED SECTION ---
 
     if level_set is not None:
         xmin, ymin = node_coords.min(axis=0); xmax, ymax = node_coords.max(axis=0)
-        padding = (xmax - xmin) * 0.1
-        gx, gy = np.meshgrid(np.linspace(xmin - padding, xmax + padding, resolution),
-                             np.linspace(ymin - padding, ymax + padding, resolution))
-        
+        padding = (xmax-xmin)*0.1 if xmax > xmin else 0.1
+        gx, gy = np.meshgrid(np.linspace(xmin-padding, xmax+padding, resolution),
+                             np.linspace(ymin-padding, ymax+padding, resolution))
+
         points_to_eval = np.c_[gx.ravel(), gy.ravel()]
-        # FIX: Use apply_along_axis for robustness with non-vectorized level sets
         phi_vals = np.apply_along_axis(level_set.__call__, 1, points_to_eval).reshape(gx.shape)
 
         contour = ax.contour(gx, gy, phi_vals, levels=[0.0], colors='green', linewidths=2.5, zorder=5)
-        # Check if any contours were actually drawn before adding to legend
         if len(contour.allsegs[0]) > 0:
             legend_handles.append(plt.Line2D([0], [0], color='green', lw=2, label='Level Set (φ=0)'))
-    
+
     if plot_interface:
-        all_pts = []
-        segments = []
+        all_pts, segments = [], []
         for elem in mesh.elements_list:
             if hasattr(elem, 'interface_pts') and elem.interface_pts:
                 all_pts.extend(elem.interface_pts)
                 if len(elem.interface_pts) == 2:
                     segments.append(elem.interface_pts)
-        
         if segments:
             lc = LineCollection(segments, colors='magenta', linewidths=3.5, zorder=6, label='Interface Segment')
             ax.add_collection(lc)
             legend_handles.append(lc)
-
         if all_pts:
             all_pts_np = np.array(all_pts)
-            ax.plot(all_pts_np[:, 0], all_pts_np[:, 1], 'o', color='cyan', markersize=9, 
+            ax.plot(all_pts_np[:, 0], all_pts_np[:, 1], 'o', color='cyan', markersize=9,
                     markeredgecolor='black', zorder=7)
-            legend_handles.append(plt.Line2D([0], [0], marker='o', color='w', 
+            legend_handles.append(plt.Line2D([0], [0], marker='o', color='w',
                                              markerfacecolor='cyan', markeredgecolor='black',
                                              markersize=9, linestyle='None', label='Interface Point'))
 

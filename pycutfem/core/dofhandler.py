@@ -845,16 +845,18 @@ class DofHandler:
         valid_edges = []
         for eid in edge_ids:
             e = mesh.edge(eid)
-            if e.right is None:               # boundary → not a ghost edge
-                continue
+            if e.right is None:
+                continue  # ghost edges are interior
 
-            phi_l = level_set(np.asanyarray(mesh.elements_list[e.left ].centroid()))
-            phi_r = level_set(np.asanyarray(mesh.elements_list[e.right].centroid()))
-            if (phi_l < 0) == (phi_r < 0):    # interface does not cut the edge
-                continue
-            valid_edges.append(e)
+            # Trust the mesh classification / or require at least one CUT neighbor
+            left_tag  = mesh.elements_list[e.left].tag
+            right_tag = mesh.elements_list[e.right].tag
+            if ('cut' in (left_tag, right_tag)) or getattr(e, "tag", "")[:5] == "ghost":
+                valid_edges.append(e)
 
         if not valid_edges:
+            raise ValueError("No valid ghost edges found. "
+                             "Check that the mesh has been properly cut and tagged.")
             return {"eids": np.array([], dtype=int)}    # early‑out
 
         # ---------------------------------- allocate dense workspaces

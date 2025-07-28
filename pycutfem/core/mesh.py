@@ -1,6 +1,6 @@
 import numpy as np
 from dataclasses import dataclass
-from typing import Tuple, List, Dict, Optional, Callable
+from typing import Tuple, List, Dict, Optional, Callable, Union
 
 
 from pycutfem.core.topology import Edge, Node, Element
@@ -191,7 +191,7 @@ class Mesh:
     def classify_elements_multi(self, level_sets, tol=1e-12):
         """Classifies elements against multiple level sets."""
         return {idx: self.classify_elements(ls, tol) for idx, ls in enumerate(level_sets)}
-
+    
     def classify_edges(self, level_set):
         """
         Classify edges as 'interface' or 'ghost' based on element tags.
@@ -201,38 +201,42 @@ class Mesh:
             # Reset tag to avoid state from previous classifications
             edge.tag = ''
 
-            # --- Primary classification for INTERIOR edges based on element tags ---
+            # --- Classification for INTERIOR edges based on element tags ---
             if edge.right is not None:
                 left_tag = self.elements_list[edge.left].tag
                 right_tag = self.elements_list[edge.right].tag
                 tags = {left_tag, right_tag}
 
-                # An edge between two 'cut' elements is a 'ghost' edge.
-                if tags == {'cut'}:
-                    edge.tag = 'ghost'
-                # An edge between a 'cut' element and a non-cut one is an 'interface'.
-                elif 'cut' in tags and len(tags) > 1:
+                # Prioritize 'interface' if crossed (level set lies on edge)
+                if phi_nodes[edge.nodes[0]] * phi_nodes[edge.nodes[1]] < 0:
                     edge.tag = 'interface'
-                # An edge between an 'inside' and 'outside' element is an 'interface'.
-                elif tags == {'inside', 'outside'}:
-                    edge.tag = 'interface'
-            
-            # --- Secondary check for any edge whose nodes cross the level set ---
-            # The nodal crossing is the strongest indicator of the interface.
-            # CRITICAL FIX: This must NOT override a 'ghost' tag.
-            if edge.tag != 'ghost' and phi_nodes[edge.nodes[0]] * phi_nodes[edge.nodes[1]] < 0:
-                edge.tag = 'interface'
-            # Build and cache BitSets *once* – O(n_edges) total
+                elif 'cut' in tags:
+                    # This logic might be flawed if both elements are 'cut'.
+                    # Assuming one is 'cut' and the other is not.
+                    non_cut_tags = [t for t in tags if t != 'cut']
+                    if non_cut_tags:
+                        non_cut = non_cut_tags[0]
+                        if non_cut == 'outside':
+                            edge.tag = 'ghost_pos'  # Cut and positive side
+                        elif non_cut == 'inside':
+                            edge.tag = 'ghost_neg'  # Cut and negative side
+                    else: # This happens if both tags are 'cut'
+                        edge.tag = 'ghost_both'
 
-            tags = np.array([e.tag for e in self.edges_list])
 
-            self._edge_bitsets = {
+        # Build and cache BitSets *once* – O(n_edges) total
+        tags = np.array([e.tag for e in self.edges_list])
+        #Convert np.unique result to a standard Python list
+        unique_tags = np.unique(tags).tolist()
+        self._edge_bitsets = {t: BitSet(tags == t) for t in unique_tags if t}
 
-                t: BitSet(tags == t)               # tiny (n_edges) boolean mask
+        # New: Union bitset for 'ghost' (all ghost_*)
+        ghost_pos_bs = self._edge_bitsets.get('ghost_pos', BitSet(np.zeros(len(tags), bool)))
+        ghost_neg_bs = self._edge_bitsets.get('ghost_neg', BitSet(np.zeros(len(tags), bool)))
+        ghost_both_bs = self._edge_bitsets.get('ghost_both', BitSet(np.zeros(len(tags), bool)))
+        self._edge_bitsets['ghost'] = ghost_pos_bs | ghost_neg_bs | ghost_both_bs
 
-                for t in np.unique(tags) if t      # skip '' untagged edges
-
-            }
+    
 
 
     def build_interface_segments(self, level_set, tol=1e-12, qorder=2):
@@ -386,8 +390,9 @@ class Mesh:
                     tag_masks[tag][e.gid] = True
                     break
 
-        # refresh / create the cache ---------------------------------
-        self._edge_bitsets = {tag: BitSet(mask) for tag, mask in tag_masks.items()}
+        if not hasattr(self, "_edge_bitsets"):
+            self._edge_bitsets = {}
+        self._edge_bitsets.update({tag: BitSet(mask) for tag, mask in tag_masks.items()})
     
     def tag_edges(self, tag_functions: Dict[str, Callable[[float, float], bool]], overwrite=True):
         """

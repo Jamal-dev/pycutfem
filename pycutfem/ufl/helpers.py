@@ -136,8 +136,15 @@ class VecOpInfo:
         elif isinstance(other, np.ndarray):
             if other.ndim == 1 and other.size == self.data.shape[0]:
                 return VecOpInfo(self.data * other[:, np.newaxis], role=self.role)
+            elif other.ndim == 1 and self.data.shape[0] == 1:
+                # New Case: Scalar multiplication with a vector
+                if self.role == "function":
+                    vals = np.sum(self.data, axis=1)  # Shape (k,)
+                    return vals * other  # returns a 1D array
+                return VecOpInfo([self.data[0,:] * comp for comp in other], role=self.role)
             else:
-                raise ValueError(f"Cannot multiply VecOpInfo with array of shape {other.shape}.")
+                raise ValueError(f"Cannot multiply VecOpInfo {self.data.shape} with array of shape {other.shape}."
+                                 f" Roles: {self.role}, other={getattr(other, 'role', None)}.")
         elif isinstance(other, VecOpInfo):
             if self.data.shape != other.data.shape:
                 raise ValueError("VecOpInfo shapes mismatch in multiplication.")

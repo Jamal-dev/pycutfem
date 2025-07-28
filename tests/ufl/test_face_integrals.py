@@ -1,8 +1,9 @@
+from matplotlib.pylab import f
 import numpy as np, pytest
 from pycutfem.utils.meshgen   import structured_quad
 from pycutfem.core.mesh       import Mesh
 from pycutfem.core.levelset   import CircleLevelSet
-from pycutfem.ufl.measures    import dInterface, dx
+from pycutfem.ufl.measures    import dInterface, dx, dGhost
 from pycutfem.ufl.expressions import (Constant, Pos, Neg, Jump, FacetNormal,grad, 
                                       Function, dot, inner, VectorFunction, VectorTrialFunction ,
                                       TestFunction, VectorTestFunction, TrialFunction)
@@ -15,6 +16,9 @@ from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.analytic import x as x_ana
 from pycutfem.ufl.analytic import y as y_ana
 from pycutfem.ufl.forms import BoundaryCondition, assemble_form
+from pycutfem.core.levelset import AffineLevelSet
+from pycutfem.io.visualization import plot_mesh_2
+import matplotlib.pyplot as plt
 
 import logging
 
@@ -262,6 +266,101 @@ def test_jump_grad_vector(mesh:Mesh):
     print(f"Exact vector jump: {exact}")
     print(f"Computed vector jump: {res['jv']}")
     assert_allclose(res['jv'], exact.flatten(), rtol=1e-2)
+
+def assemble_scalar(form, dof_handler):
+    """Assemble a scalar functional from a form."""
+    # This is a placeholder for the actual assembly logic
+    # In practice, this would involve creating an assembler and calling its methods
+    hook = {type(form.integrand): {'name': 'scalar'}}
+    res = assemble_form(Constant(0.0)*dx==form, dof_handler=dof_handler, bcs=[], backend="jit", assembler_hooks=hook)
+    return res["scalar"]
+
+
+def test_interface_normal_sign_vertical_nonaligned():
+    # Mesh: [0,2]x[0,1]
+    nodes, elems, _, corners = structured_quad(2, 1, nx=40, ny=20, poly_order=1)
+    mesh = Mesh(nodes=nodes, element_connectivity=elems,
+                elements_corner_nodes=corners, element_type='quad', poly_order=1)
+
+    # Level set: φ = x - (1 + ε), with ε small so the line cuts element interiors
+    eps = 0.007
+    ls  = AffineLevelSet(1.0, 0.0, -(1.0 + eps))
+    mesh.classify_elements(ls)
+    mesh.classify_edges(ls)
+    mesh.build_interface_segments(ls)
+
+    me  = MixedElement(mesh, field_specs={"vx": 1, "vy": 1})
+    dh  = DofHandler(me, method='cg')
+    n   = FacetNormal()
+
+    I = n[0] * dInterface(defined_on=mesh.element_bitset('cut'), level_set=ls)
+    val = assemble_scalar(I, dof_handler=dh)
+
+    # The interface is still a vertical segment of height 1, so the integral should be +1
+    assert np.isclose(val, 1.0, atol=1e-3)
+
+def test_interface_normal_matches_gradphi_unit():
+    nodes, elems, _, corners = structured_quad(2, 1, nx=39, ny=20, poly_order=1)  # nx odd => no face alignment
+    mesh = Mesh(nodes=nodes, element_connectivity=elems,
+                elements_corner_nodes=corners, element_type='quad', poly_order=1)
+
+    # φ = x - 1 (now x=1 is *not* on a grid line with nx=39)
+    ls  = AffineLevelSet(1.0, 0.0, -1.0)
+    mesh.classify_elements(ls); mesh.classify_edges(ls); mesh.build_interface_segments(ls)
+
+    me  = MixedElement(mesh, field_specs={"vx":1, "vy":1})
+    dh  = DofHandler(me, method='cg')
+    n   = FacetNormal()
+
+    # Since ∇φ = (1,0), the unit gradient is just (1,0)
+    Ix = n[0] * dInterface(defined_on=mesh.element_bitset('cut'), level_set=ls)
+    len_int = dot(n,n) * dInterface(defined_on=mesh.element_bitset('cut'), level_set=ls)
+    length = assemble_scalar(len_int, dh)
+
+    val = assemble_scalar(Ix, dh)
+    # If your JIT normal is +gradphi/|gradphi|, val == length
+    # If it's the outward-fluid normal, val == -length
+    print(f"Computed integral value: {val}, expected length: {length}")
+    assert np.isclose(abs(val), length, rtol=1e-3)
+    # Optional: assert on the *sign* you expect:
+    assert val > 0.0     # for the current neg→pos convention
+
+def total_ghost_length(mesh):
+    L = 0.0
+    for gid in mesh.edge_bitset('ghost').to_indices():
+        e = mesh.edge(gid)
+        (i, j) = e.nodes
+        x0, y0 = mesh.nodes_x_y_pos[i]
+        x1, y1 = mesh.nodes_x_y_pos[j]
+        L += float(np.hypot(x1-x0, y1-y0))
+    return L
+
+def test_ghost_normal_sign_with_gradphi():
+    nodes, elems, _, corners = structured_quad(2, 1, nx=39, ny=20, poly_order=1)
+    mesh = Mesh(nodes=nodes, element_connectivity=elems,
+                elements_corner_nodes=corners, element_type='quad', poly_order=1)
+    ls  = AffineLevelSet(1.0, 0.0, -1.0)
+    mesh.classify_elements(ls); mesh.classify_edges(ls); mesh.build_interface_segments(ls)
+    print(f"Ghost edges: {mesh.edge_bitset('ghost').cardinality()}")
+    fig, ax = plt.subplots(figsize=(10, 8))
+    plot_mesh_2(mesh, ax=ax, level_set=ls, show=True, 
+              plot_nodes=False, elem_tags=True, edge_colors=True)
+
+    me  = MixedElement(mesh, field_specs={"vx":1, "vy":1})
+    dh  = DofHandler(me, method='cg')
+
+    n   = FacetNormal()
+    dG  = dGhost(defined_on=mesh.edge_bitset('ghost'), level_set=ls)
+
+    val = assemble_scalar( n[0] * dG, dh)        # = ∫_G n_G·(1,0) dG
+    Lup = total_ghost_length(mesh)               # upper bound using mesh geometry
+
+    assert val > 0.0
+    assert val <= Lup * (1.0 + 1e-3)
+
+
+
+
 
 if __name__ == "__main__":
     pytest.main([__file__, '-v', '--tb=short'])

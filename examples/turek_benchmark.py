@@ -56,7 +56,7 @@ D = 0.1   # Cylinder diameter
 c_x, c_y = 0.2, 0.2  # Cylinder center
 rho = 1.0  # Density
 mu = 1e-3  # Viscosity
-U_mean = 1.5 # Mean inflow velocity
+U_mean = 1.0  # Mean inflow velocity
 Re = rho * U_mean * D / mu
 print(f"Reynolds number (Re): {Re:.2f}")
 
@@ -87,6 +87,7 @@ mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corne
 # ============================================================================
 
 # --- Tag Boundaries ---
+
 bc_tags = {
     'inlet':  lambda x, y: np.isclose(x, 0),
     'outlet': lambda x, y: np.isclose(x, L),
@@ -117,8 +118,6 @@ bcs_homog = [BoundaryCondition(bc.field, bc.method, bc.domain_tag, lambda x, y: 
 
 
 # --- Level Set for the Cylinder Obstacle ---
-
-
 mesh.classify_elements(level_set)
 mesh.classify_edges(level_set)
 mesh.build_interface_segments(level_set=level_set)
@@ -128,7 +127,7 @@ mesh.tag_boundary_edges(bc_tags)
 fluid_domain = get_domain_bitset(mesh, "element", "outside")
 rigid_domain = get_domain_bitset(mesh, "element", "inside")
 cut_domain = get_domain_bitset(mesh, "element", "cut")
-ghost_edges = get_domain_bitset(mesh, "edge", "ghost")
+ghost_edges = mesh.edge_bitset('ghost')
 physical_domain = fluid_domain | cut_domain
 
 # --- Finite Element Space and DofHandler ---
@@ -138,11 +137,36 @@ dof_handler = DofHandler(mixed_element, method='cg')
 dof_handler.info()
 
 print(f"Number of interface edges: {mesh.edge_bitset('interface').cardinality()}")
-print(f"Number of ghost edges: {ghost_edges.cardinality()}")
+print(f"Number of ghost edges: {mesh.edge_bitset('ghost').cardinality()}")
 print(f"Number of cut elements: {cut_domain.cardinality()}")
+print(f"Number of pos ghost edges: {mesh.edge_bitset('ghost_pos').cardinality()}")
+print(f"Number of neg ghost edges: {mesh.edge_bitset('ghost_neg').cardinality()}")
+print(f"Number of ghost edges (both): {mesh.edge_bitset('ghost_both').cardinality()}")
+
+
+# In[6]:
+
+
+get_domain_bitset(mesh, "edge", "ghost_pos")
 
 
 # In[5]:
+
+
+dof_handler.tag_dof_by_locator('p_pin', 'p',
+    locator=lambda x,y: np.isclose(x, 0) and np.isclose(y, 0),
+    find_first=True)
+bcs.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
+bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
+
+
+# In[6]:
+
+
+mesh._edge_bitsets.keys()
+
+
+# In[7]:
 
 
 from pycutfem.io.visualization import plot_mesh_2
@@ -151,7 +175,7 @@ plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True,
               plot_nodes=False, elem_tags=False, edge_colors=True, plot_interface=False,resolution=300)
 
 
-# In[6]:
+# In[8]:
 
 
 # ============================================================================
@@ -176,7 +200,7 @@ u_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handl
 p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler)
 
 # --- Parameters ---
-dt = Constant(0.5)
+dt = Constant(0.25)
 theta = Constant(0.5) # Crank-Nicolson
 mu_const = Constant(mu)
 rho_const = Constant(rho)
@@ -186,23 +210,27 @@ u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
 dof_handler.apply_bcs(bcs, u_n, p_n)
 
 
-# In[7]:
+# In[9]:
 
 
-u_n.plot()
+# u_n.plot()
 
 
-# In[8]:
+# In[10]:
 
 
 print(len(dof_handler.get_dirichlet_data(bcs)))
 
 
-# In[9]:
+# In[11]:
 
 
 from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict
+from pycutfem.core.geometry import hansbo_cut_ratio
+from pycutfem.ufl.expressions import ElementWiseConstant
+
 n = FacetNormal()                    # vector expression (n_x, n_y)
+n_f = FacetNormal()                  # vector expression (n_x, n_y) on the fluid side
 
 def _dn(expr):
     """Normal derivative  n·∇expr  on an (interior) edge."""
@@ -219,31 +247,48 @@ def grad_inner(u, v):
 
     raise ValueError("grad_inner supports only scalars or 2‑D vectors.")
 
-dx_phys  = dx(defined_on=physical_domain,metadata={"q":6})               # volume
-dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":4})   # interior surface
-dG       = dGhost(defined_on=mesh.edge_bitset("ghost"), level_set=level_set,metadata={"q":4})  # ghost surface
+dx_phys  = dx(defined_on=physical_domain, 
+              level_set=level_set,            # the cylinder level set
+              metadata   = {"q": 7, "side": "+"} # integrate only φ>0 (positive side)
+    )
+dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":11})   # interior surface
+dG       = dGhost(defined_on=mesh.edge_bitset("ghost_pos"), level_set=level_set,metadata={"q":6})  # ghost surface
 
 cell_h  = CellDiameter() # length‑scale per element
 beta_N  = Constant(20.0 * poly_order**2)      # Nitsche penalty (tweak)
+# 1) Hansbo factor — this is a *numpy array*, one value per element
+beta0_val  = 20.0 * poly_order**2
+theta_min  = 1.0e-3
+hansbo_plus = hansbo_cut_ratio(mesh, level_set, side='+')    # -> np.ndarray, shape (n_elem,)
+beta_hansbo_arr = beta0_val / np.clip(hansbo_plus, theta_min, 1.0)
+
+# Wrap only the array part in ElementWiseConstant
+β_h = ElementWiseConstant(beta_hansbo_arr)  # OK: per-element scalar
+
+# 2) Symbolic augmentation factor (stays symbolic because of CellDiameter())
+augment = mu_const / cell_h + rho_const * cell_h / dt   # scalar expression
+
+# 3) Final penalty (symbolic EWC × expression)
+β = β_h * augment
 
 def epsilon(u):
     "Symmetric gradient."
     return 0.5 * (grad(u) + grad(u).T)
 
-def sigma_dot_n(u_vec, p_scal):
-    """
-    Expanded form of (σ(u, p) · n) without using the '@' operator.
+# def sigma_dot_n(u_vec, p_scal):
+#     """
+#     Expanded form of (σ(u, p) · n) without using the '@' operator.
 
-        σ(u, p)·n = μ (∇u + ∇uᵀ)·n  −  p n
-    """
-    # first term: μ (∇u)·n
-    a = dot(grad(u_vec), n)
-    # second term: μ (∇uᵀ)·n
-    b = dot(grad(u_vec).T, n)
-    # combine and subtract pressure part
-    return mu * (a + b) - p_scal * n         # vector of size 2
+#         σ(u, p)·n = μ (∇u + ∇uᵀ)·n  −  p n
+#     """
+#     # first term: μ (∇u)·n
+#     a = dot(grad(u_vec), n)
+#     # second term: μ (∇uᵀ)·n
+#     b = dot(grad(u_vec).T, n)
+#     # combine and subtract pressure part
+#     return mu * (a + b) - p_scal * n         # vector of size 2
 
-def sigma_dot_n_v(u_vec, p_scal,v_test):
+def sigma_dot_n_v(u_vec, p_scal,v_test,n):
     """
     Expanded form of (σ(u, p) · n) without using the '@' operator.
 
@@ -258,16 +303,18 @@ def sigma_dot_n_v(u_vec, p_scal,v_test):
 
 # --- Jacobian contribution on Γsolid --------------------------------
 J_int = (
-    - sigma_dot_n_v(du, dp, v)           # consistency
-    - sigma_dot_n_v(v, q, du)           # symmetry
-    + beta_N * mu / cell_h * dot(du, v)     # penalty
+    - sigma_dot_n_v(du, dp, v,n_f)           # consistency
+    - sigma_dot_n_v(v, q, du,n_f)           # symmetry
+    # + beta_N * mu / cell_h * dot(du, v)     # penalty
+    + β  * dot(du, v)     # penalty
 ) * dΓ
 
 # --- Residual contribution on Γsolid --------------------------------
 R_int = (
-    - sigma_dot_n_v(u_k, p_k, v)
-    - sigma_dot_n_v(v, q, u_k)
-    + beta_N * mu / cell_h * dot(u_k, v)
+    - sigma_dot_n_v(u_k, p_k, v,n_f)
+    - sigma_dot_n_v(v, q, u_k,n_f)
+    # + beta_N * mu / cell_h * dot(u_k, v)
+    + β  * dot(u_k, v)  
 ) * dΓ
 
 # volume ------------------------------------------------------------
@@ -324,13 +371,13 @@ residual_form  = r_vol + R_int + stab
 
 
 
-# In[10]:
+# In[12]:
 
 
 # !rm ~/.cache/pycutfem_jit/*
 
 
-# In[11]:
+# In[13]:
 
 
 # from pycutfem.ufl.forms import assemble_form
@@ -338,22 +385,41 @@ residual_form  = r_vol + R_int + stab
 # print(np.linalg.norm(F, ord=np.inf))
 
 
-# In[12]:
+# In[14]:
+
+
+mesh.edge_bitset('ghost').cardinality()
+
+
+# In[15]:
 
 
 from pycutfem.io.vtk import export_vtk
+from pycutfem.ufl.compilers import FormCompiler
+from pycutfem.ufl.forms import Equation, assemble_form
+from pycutfem.fem import transform
 output_dir = "turek_results"
 os.makedirs(output_dir, exist_ok=True)
 step_counter = 0
+histories = {}  # Store histories for CD, CL, Δp
+# --- Traction helper on Γ: (σ(u,p)·n)·v_dir  -------------------------------
+# Uses the same σ as in your Nitsche terms: μ(∇u + ∇uᵀ) - p I
+def traction_dot_dir(u_vec, p_scal, v_dir):
+    # n is provided by the interface/boundary assembler via FacetNormal()
+    a = dot(grad(u_vec),   n)      # (∇u)·n
+    b = dot(grad(u_vec).T, n)      # (∇uᵀ)·n
+    t = mu*(a + b) - p_scal*n      # σ(u,p)·n   (vector in ℝ²)
+    return dot(t, v_dir)           # scalar: (σ·n)·e_x or (σ·n)·e_y
+
 
 def save_solution(funcs):
-    """A callback function to export the solution to VTK."""
+    """Export + compute CD, CL, Δp (Turek)."""
     global step_counter
 
-    # We are interested in the primary unknowns, u_k and p_k
     u_k_func = funcs[0]
     p_k_func = funcs[1]
 
+    # ------------------ VTK output (as you already have) --------------------
     filename = os.path.join(output_dir, f"solution_{step_counter:04d}.vtu")
     export_vtk(
         filename=filename,
@@ -361,16 +427,117 @@ def save_solution(funcs):
         dof_handler=dof_handler,
         functions={"velocity": u_k_func, "pressure": p_k_func}
     )
-    if step_counter % 5 == 0:
+
+    # ------------------ Interface integrals for Drag & Lift -----------------
+    # High-order quadrature helps here (Q2 velocity): use q≈11–13
+    dΓ = dInterface(defined_on=cut_domain, level_set=level_set, metadata={"q": 11})
+
+    e_x = Constant(np.array([1.0, 0.0]), dim =1)
+    e_y = Constant(np.array([0.0, 1.0]), dim =1)
+
+    # traction on the *fluid* side, then flip the sign to get the force on the cylinder
+    integrand_drag = -traction_dot_dir(u_k_func, p_k_func, e_x)   # scalar
+    integrand_lift = -traction_dot_dir(u_k_func, p_k_func, e_y)   # scalar
+
+    I_drag = integrand_drag * dΓ
+    I_lift = integrand_lift * dΓ
+
+    # Assemble the two scalar functionals using the compiler “hooks”
+    hooks = {
+        I_drag.integrand: {"name": "FD"},
+        I_lift.integrand: {"name": "FL"},
+    }
+    drag_hook = {I_drag.integrand: {"name": "FD"}}
+    lift_hook = {I_lift.integrand: {"name": "FL"}}
+
+    res_Fd = assemble_form(I_drag == Constant(0.0) * dx, 
+                           dof_handler=dof_handler, bcs=[],
+                           assembler_hooks=drag_hook, backend="python")
+    res_Fl = assemble_form(I_lift == Constant(0.0) * dx, 
+                           dof_handler=dof_handler, bcs=[],
+                           assembler_hooks=lift_hook, backend="python")
+
+    F_D = float(res_Fd["FD"])
+    F_L = float(res_Fl["FL"])
+
+    # Dimensionless coefficients (DFG definition)
+    coeff = 2.0 / (rho * (U_mean**2) * D)
+    C_D = coeff * F_D
+    C_L = coeff * F_L
+
+    # ------------------ Pressure difference Δp = p(A) - p(B) ----------------
+    # ------------------ Pressure difference Δp = p(A) - p(B) ----------------
+    def eval_scalar_at_point(f_scalar, x, y):
+        """
+        Robustly evaluates a scalar field at a point (x,y),
+        ensuring the point is in the physical domain.
+        """
+        xy = np.array([x, y])
+
+        # 1. First, check if the point is in the physical domain.
+        if level_set(xy) < 0:
+            # print(f"Warning: Point ({x},{y}) is in the fictitious domain (phi < 0). Returning NaN.")
+            return np.nan
+
+        # 2. Find the element that contains the point.
+        eid_found = None
+        for e in mesh.elements_list:
+            # Skip elements that are fully inside the cylinder
+            if getattr(e, "tag", None) == "inside":
+                continue
+
+            # Check if the point is geometrically within the element's bounding box first for efficiency
+            v_coords = mesh.nodes_x_y_pos[list(e.corner_nodes)]
+            if not (v_coords[:, 0].min() <= x <= v_coords[:, 0].max() and \
+                    v_coords[:, 1].min() <= y <= v_coords[:, 1].max()):
+                continue
+
+            # Perform precise inverse mapping
+            try:
+                xi, eta = transform.inverse_mapping(mesh, e.id, xy)
+                if -1e-9 <= xi <= 1 + 1e-9 and -1e-9 <= eta <= 1 + 1e-9:
+                    eid_found = e.id
+                    break
+            except (np.linalg.LinAlgError, ValueError):
+                continue # Point is outside this element.
+
+        if eid_found is None:
+            # print(f"Warning: Point ({x},{y}) could not be located in any physical element. Returning NaN.")
+            return np.nan
+
+        # 3. Evaluate the field using basis functions at the found reference coords.
+        phi = mixed_element.basis(f_scalar.field_name, xi, eta)
+        gdofs = dof_handler.get_elemental_dofs(eid_found)
+        vals = f_scalar.get_nodal_values(gdofs)
+        return float(phi @ vals)
+
+    # Evaluate pressure slightly away from the cylinder boundary for stability.
+    # Cylinder is at (0.2, 0.2) with radius 0.05.
+    pA = eval_scalar_at_point(p_k_func, c_x - D/2 - 0.01, c_y) # Front point
+    pB = eval_scalar_at_point(p_k_func, c_x + D/2 + 0.01, c_y) # Rear point
+    dp = pA - pB
+
+    # ------------------ Log / store ----------------------------------------
+    print(f"[step {step_counter:4d}]  FD={F_D:.6e}  FL={F_L:.6e}  "
+          f"CD={C_D:.6f}  CL={C_L:.6f}  Δp={dp:.6f}")
+    if step_counter % 2 == 0:
         u_k_func.plot(field = 'ux',
                       title=f"Velocity Ux at step {step_counter}",
                       xlabel='X-Axis', ylabel='Y-Axis',
                       levels=100, cmap='jet',
                       mask = physical_domain,)
+
+    # (Optional) append to global histories for later plotting
+    histories.setdefault("cd", []).append(C_D)
+    histories.setdefault("cl", []).append(C_L)
+    histories.setdefault("dp", []).append(dp)
+
+
     step_counter += 1
 
 
-# In[ ]:
+
+# In[16]:
 
 
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver
@@ -417,10 +584,23 @@ solver.solve_time_interval(functions=functions,
 
 
 u_n.plot(kind="streamline",
-         density=4.0,
+         density=2.0,
          linewidth=0.8,
          cmap="plasma",
-         title="Turek-Schafer",background = False,mask=physical_domain)
+         title="Turek-Schafer",background = False)
+
+
+# In[ ]:
+
+
+plt.plot(histories["cd"], label="C_D", marker='o')
+plt.ylabel('C_D')
+plt.figure()
+plt.plot(histories["cl"], label="C_L", marker='o')
+plt.ylabel('C_L')
+plt.figure()
+plt.plot(histories["dp"], label="Δp", marker='o')
+plt.ylabel('Δp')
 
 
 # In[ ]:

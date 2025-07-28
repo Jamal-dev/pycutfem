@@ -10,6 +10,8 @@ enabling robust assembly of LHS matrices and RHS vectors.
 """
 from __future__ import annotations
 
+from matplotlib.pylab import f
+
 import numpy as np
 import scipy.sparse as sp
 from typing import Dict, List, Any, Tuple, Iterable, Mapping, Union
@@ -44,7 +46,6 @@ from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
 from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices,_all_fields,_find_all,_trial_test
 from pycutfem.fem.transform import map_deriv
 from pycutfem.ufl.analytic import Analytic
-from pycutfem.utils.domain_manager import get_domain_bitset
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 from pycutfem.ufl.helpers_geom import (
     phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
@@ -154,7 +155,9 @@ class FormCompiler:
         """
         # ---- ghost-edge path ------------------------------------------
         if "basis_values" in self.ctx:
-            side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
+            side = self.ctx.get("side")
+            if side not in ('+', '-'):
+                side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
             return self.ctx["basis_values"][side][field][alpha]
 
         # ---- standard element path ------------------------------------
@@ -223,15 +226,18 @@ class FormCompiler:
 
             phi_old = self.ctx.get('phi_val', 0.0)
             eid_old = self.ctx.get('eid')
+            old_side  = self.ctx.get("side", None)
 
             # + side
             self.ctx['phi_val'] = 1.0
+            self.ctx["side"]    = '+' 
             if 'pos_eid' in self.ctx:
                 self.ctx['eid'] = self.ctx['pos_eid']
             v_pos = self._visit(dpos)
 
             # – side
             self.ctx['phi_val'] = -1.0
+            self.ctx["side"]    = '-'
             if 'neg_eid' in self.ctx:
                 self.ctx['eid'] = self.ctx['neg_eid']
             v_neg = self._visit(dneg)
@@ -242,6 +248,10 @@ class FormCompiler:
                 self.ctx.pop('eid', None)
             else:
                 self.ctx['eid'] = eid_old
+            if old_side is None:
+                self.ctx.pop('side', None)
+            else:
+                self.ctx['side'] = old_side
 
             return v_pos - v_neg
 
@@ -549,8 +559,13 @@ class FormCompiler:
         if not self.ctx["rhs"]:
             if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
                 return a * b
+            elif isinstance(b, np.ndarray) and isinstance(a, VecOpInfo):
+                return a * b
+            elif isinstance(a, np.ndarray) and isinstance(b, VecOpInfo):
+                return b * a
         
-        raise TypeError(f"Unsupported product 'type(a)={type(a)}, type(b)={type(b)}'{n.a} * {n.b}' for {'RHS' if self.ctx['rhs'] else 'LHS'}")
+        raise TypeError(f"Unsupported product 'type(a)={type(a)}, type(b)={type(b)}'{n.a} * {n.b}' for {'RHS' if self.ctx['rhs'] else 'LHS'}"
+                        f" for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
 
         
 
@@ -626,8 +641,16 @@ class FormCompiler:
             if isinstance(b, np.ndarray) and isinstance(a, VecOpInfo) and a.role == "test":
                 return a.dot_const(b)
         # Dot product between a basis field and a numerical vector
-        if isinstance(a, (VecOpInfo, GradOpInfo)) and isinstance(b, np.ndarray): return a.dot_const_vec(b) if a.ndim==2 else a.dot_vec(b)
-        if isinstance(b, (VecOpInfo, GradOpInfo)) and isinstance(a, np.ndarray): return b.dot_const_vec(a) if b.ndim==2 else b.dot_vec(a)
+        if isinstance(a, (VecOpInfo)) and isinstance(b, np.ndarray): 
+            return a.dot_const_vec(b)
+        elif isinstance(b, (VecOpInfo)) and isinstance(a, np.ndarray): 
+            return b.dot_const_vec(a)
+        elif isinstance(a, (GradOpInfo)) and isinstance(b, np.ndarray):
+            result = a.dot_vec(b)
+            # print(f"visit dot: GradOpInfo . result: {result}, result shape: {result.shape}, role: {getattr(result, 'role', None)}")
+            return result
+        elif isinstance(b, (GradOpInfo)) and isinstance(a, np.ndarray):
+            return b.dot_vec(a)
         
 
         # mass matrix case: VecOpInfo . VecOpInfo
@@ -1115,159 +1138,164 @@ class FormCompiler:
     
     def _assemble_ghost_edge_python(self, intg: "Integral", matvec):
         """
-        Assembles integrals over ghost facets using a side-aware cache.
+        Assemble integrals over ghost facets (pure Python path).
 
-        This routine correctly computes and caches basis function derivatives from
-        both sides ('+' and '-') of each ghost edge. The UFL visitors for Jump,
-        Avg, etc., are responsible for interpreting this side-aware cache to
-        construct the final integrand, which couples the degrees of freedom
-        from the adjacent elements. It also supports assembler hooks for assembling
-        scalar-valued functionals.
+        This version:
+        * trusts the provided ghost edge ids except for minimal validity checks;
+        * populates a side-aware basis cache for both (+) and (–);
+        * guarantees all derivative multi-indices needed by the form are present;
+        * orients the facet normal from (–) to (+);
+        * supports scalar-valued functionals via assembler hooks.
         """
-
-        rhs = self.ctx.get('rhs', False)
+        # --------------------------------------------------------- basics
+        rhs  = self.ctx.get("rhs", False)
         mesh = self.me.mesh
 
-        # 1. Determine derivative orders needed.
-        derivs: set | None = intg.measure.metadata.get('derivs')
-        if derivs is None:
-            derivs = required_multi_indices(intg.integrand)
-        if (0, 0) not in derivs:
-            derivs = set(derivs) | {(0, 0)}
+        # ---- derivative orders we need (robust) -------------------------
+        md = intg.measure.metadata or {}
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0)}  # always include values
 
-        # 2. Get edge set and level set.
+        # Close the set up to the maximum total order present.
+        # This prevents KeyError for cross terms like (1,1) in Hessian energies.
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        for p in range(max_total + 1):
+            for ox in range(p + 1):
+                derivs.add((ox, p - ox))
+
+        # ---- which edges -------------------------------------------------
         defined = intg.measure.defined_on
-        if defined is None:                       # ← fallback: all ghost edges
-            edge_ids = get_domain_bitset(mesh, 'edge', 'ghost')
+        if defined is None:
+            edge_set = mesh.edge_bitset("ghost")
+            edge_ids = (edge_set.to_indices() if hasattr(edge_set, "to_indices")
+                        else list(edge_set))
         else:
             edge_ids = defined.to_indices()
-        level_set = getattr(intg.measure, 'level_set', None)
+
+        level_set = getattr(intg.measure, "level_set", None)
         if level_set is None:
             raise ValueError("dGhost measure requires a 'level_set' callable.")
 
-        qdeg = self._find_q_order(intg)
+        qdeg   = self._find_q_order(intg)
         fields = _all_fields(intg.integrand)
-        
-        # New: Check for assembler hooks to handle scalar functionals.
-        trial, test = _trial_test(intg.integrand) # New
+
+        # ---- hook / functional support ----------------------------------
+        trial, test = _trial_test(intg.integrand)
         hook = self._hook_for(intg.integrand)
-        is_functional = (hook is not None and trial is None and test is None) # New
-        if is_functional: # New
-            self.ctx.setdefault('scalar_results', {})[hook['name']] = 0.0 # New
+        is_functional = (hook is not None and trial is None and test is None)
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {})[hook["name"]] = 0.0
 
-
-        # 3. Main Loop over all candidate edges.
+        # -------------------------------------------------------- main loop
         for eid_edge in edge_ids:
-            edge = mesh.edge(eid_edge)
-            if edge.right is None:
-                continue
-            
-            # edge_left = mesh.edges_list[edge.left]
-            # edge_left_nodes = edge_left.nodes
-
-            # edge_right = mesh.edges_list[edge.right]
-            # edge_right_nodes = edge_right.nodes
-            # pL00,pL01,pL10,pL11 = mesh.nodes_x_y_pos[list(edge_left_nodes)]
-            # pR00,pR01,pR10,pR11 = mesh.nodes_x_y_pos[list(edge_right_nodes)]
-
-            phi_left  = level_set(np.asarray(mesh.elements_list[edge.left].centroid()))
-            phi_right = level_set(np.asarray(mesh.elements_list[edge.right].centroid()))
-           
-            if (phi_left < 0) == (phi_right < 0):
+            e = mesh.edge(eid_edge)
+            # ghost facets must be interior (two neighbors)
+            if e.right is None:
                 continue
 
-     
-            pos_eid, neg_eid = (edge.left, edge.right) if phi_left >= 0 else (edge.right, edge.left)
+            # Keep edges in the narrow band (at least one CUT neighbor),
+            # or edges already tagged as ghost_* by the mesh.
+            lt = mesh.elements_list[e.left].tag
+            rt = mesh.elements_list[e.right].tag
+            etag = str(getattr(e, "tag", ""))
+            if not (("cut" in (lt, rt)) or etag.startswith("ghost")):
+                continue
 
-            # 4. Setup for Quadrature and Local Assembly
-            p0, p1 = mesh.nodes_x_y_pos[list(edge.nodes)]
+            # (+) and (–) sides: decide by the left-element φ sign
+            phiL = level_set(np.asarray(mesh.elements_list[e.left].centroid()))
+            pos_eid, neg_eid = (e.left, e.right) if phiL >= 0 else (e.right, e.left)
+
+            # Quadrature and oriented normal
+            p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
             qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
-            normal_vec = edge.normal
-            if np.dot(normal_vec, mesh.elements_list[pos_eid].centroid() - qpts_phys[0]) < 0:
-                normal_vec *= -1.0
 
-            loc_accumulator = 0.0 if is_functional else None # New
-            
-            # New: Only set up DOF mapping if we are not assembling a functional.
-            if not is_functional: # New
+            normal_vec = e.normal
+            if np.dot(normal_vec, mesh.elements_list[pos_eid].centroid() - qpts_phys[0]) < 0:
+                normal_vec = -normal_vec  # from (–) to (+)
+
+            # Local accumulator & maps
+            if is_functional:
+                loc_accumulator = 0.0
+                global_dofs = pos_map = neg_map = None
+            else:
                 pos_dofs = self.dh.get_elemental_dofs(pos_eid)
                 neg_dofs = self.dh.get_elemental_dofs(neg_eid)
                 global_dofs = np.unique(np.concatenate((pos_dofs, neg_dofs)))
-                pos_map = np.searchsorted(global_dofs, pos_dofs)   # e.g. [0,1,2,3,4,  8,9,10,11]
-                neg_map = np.searchsorted(global_dofs, neg_dofs)   # e.g. [5,6,7,     12,13,14]
-
+                pos_map = np.searchsorted(global_dofs, pos_dofs)
+                neg_map = np.searchsorted(global_dofs, neg_dofs)
                 if rhs:
                     loc_accumulator = np.zeros(len(global_dofs))
                 else:
                     loc_accumulator = np.zeros((len(global_dofs), len(global_dofs)))
 
-            # 5. Main Quadrature Loop
-            
-            for qp_phys, w in zip(qpts_phys, qwts):
-                bv: dict[str, dict] = {'+': {}, '-': {}}
-                for side, eid in (('+', pos_eid), ('-', neg_eid)):
-                    xi, eta = transform.inverse_mapping(mesh, eid, qp_phys)
-                    J = transform.jacobian(mesh, eid, (xi, eta))
-                    J_inv = np.linalg.inv(J)
-                    for fld in fields:
-                        bv[side].setdefault(fld, {})
-                        # ref = self.me._ref[fld]
-                        # for alpha in derivs:
-                        #     ref_val = ref.derivative(xi, eta, *alpha)
-                        #     push = transform.map_deriv(alpha, J, J_inv)
-                        #     phys_val = push(ref_val)
-                        #     bv[side][fld][alpha] = phys_val
-                        for alpha in derivs:
-                            ox, oy = alpha
-                            #------ref deriv zero padded
-                            ref_val = self.me.deriv_ref(fld, xi, eta, ox, oy)
-                            # -------- push-forward (axis-aligned map) ------------
-                            # for curved elements we need to change this
-                            sx = J_inv[0, 0] 
-                            sy = J_inv[1, 1]
-                            phys_val = ref_val * (sx ** ox) * (sy ** oy)   # (n_dofs,)
-                            if is_functional:
-                                # No union padding needed
-                                bv[side][fld][alpha] = phys_val
-                            else:
-                                full_val = np.zeros(len(global_dofs))
-                                if side == '+':
-                                    full_val[pos_map] = phys_val
-                                else:
-                                    full_val[neg_map] = phys_val
-                                # -------- cache for visitors -------------------------
-                                bv[side][fld][alpha] = full_val
+            # ------------------------------------------------- quadrature loop
+            for xq, w in zip(qpts_phys, qwts):
+                # Build the side-aware cache for this qp
+                bv = {"+": {}, "-": {}}
 
-                eid_qp  = pos_eid if side == '+' else neg_eid
-                ctx_data = {'basis_values': bv, 'normal': normal_vec,
-                            'phi_val': level_set(qp_phys),
-                            'eid': eid_qp,
-                            'x_phys': qp_phys}
-                ctx_data.update({'pos_eid': pos_eid, 'neg_eid': neg_eid})
+                for side, eid in (("+", pos_eid), ("-", neg_eid)):
+                    xi, eta = transform.inverse_mapping(mesh, eid, xq)
+                    J      = transform.jacobian(mesh, eid, (xi, eta))
+                    J_inv  = np.linalg.inv(J)
+
+                    # axis-aligned / structured assumption
+                    sx, sy = J_inv[0, 0], J_inv[1, 1]
+
+                    for fld in fields:
+                        fld_cache = {}
+                        for ox, oy in derivs:
+                            ref_val  = self.me.deriv_ref(fld, xi, eta, ox, oy)  # (n_loc,)
+                            phys_val = ref_val * (sx ** ox) * (sy ** oy)
+
+                            if is_functional:
+                                # (n_loc,) is fine for functionals
+                                fld_cache[(ox, oy)] = phys_val
+                            else:
+                                # pad to union with zeros on the other side
+                                full = np.zeros(len(global_dofs))
+                                if side == "+":
+                                    full[pos_map] = phys_val
+                                else:
+                                    full[neg_map] = phys_val
+                                fld_cache[(ox, oy)] = full
+
+                        bv[side][fld] = fld_cache
+
+                # Context for visitors
+                self.ctx.update({
+                    "basis_values": bv,
+                    "normal": normal_vec,
+                    "phi_val": level_set(xq),
+                    "x_phys": xq,
+                    "pos_eid": pos_eid,
+                    "neg_eid": neg_eid,
+                })
                 if not is_functional:
-                    ctx_data.update({'global_dofs': global_dofs,
-                                     'pos_map': pos_map,
-                                     'neg_map': neg_map})
-                self.ctx.update(ctx_data)
+                    self.ctx.update({
+                        "global_dofs": global_dofs,
+                        "pos_map": pos_map,
+                        "neg_map": neg_map,
+                    })
+
+                # Evaluate integrand and accumulate
                 integrand_val = self._visit(intg.integrand)
                 loc_accumulator += w * integrand_val
 
-            # 6. Scatter contributions.
-            if is_functional: # New
-                # If it's a functional, add the accumulated scalar to the results dictionary.
-                self.ctx['scalar_results'][hook['name']] += loc_accumulator # New
-                continue
-            else: # New
-                # Otherwise, scatter the local matrix/vector to the global system.
+            # ----------------------------------------------- scatter / finalize
+            if is_functional:
+                self.ctx["scalar_results"][hook["name"]] += loc_accumulator
+            else:
                 if not rhs:
                     r, c = np.meshgrid(global_dofs, global_dofs, indexing="ij")
                     matvec[r, c] += loc_accumulator
                 else:
                     np.add.at(matvec, global_dofs, loc_accumulator)
 
-        # 7. Final Context Cleanup
-        for k in ('basis_values', 'normal', 'phi_val', 'eid', 'x_phys', 'global_dofs', 'pos_map', 'neg_map'):
+        # ----------------------------------------------- cleanup context keys
+        for k in ("basis_values", "normal", "phi_val", "x_phys",
+                "global_dofs", "pos_map", "neg_map", "pos_eid", "neg_eid"):
             self.ctx.pop(k, None)
+
     
 
     def _assemble_interface_jit(self, intg, matvec):
@@ -1347,6 +1375,7 @@ class FormCompiler:
         # 7. Scatter the contributions from the cut elements
         # ------------------------------------------------------------------
         hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_cut, hook): return
 
         _scatter_element_contribs(
             K_cut, F_cut, J_cut,
@@ -1372,7 +1401,9 @@ class FormCompiler:
 
         # 1. Get required derivatives, edge set, and level set
         derivs = required_multi_indices(intg.integrand)
-        edge_ids = get_domain_bitset(mesh, 'edge', 'ghost')
+        edge_ids = (intg.measure.defined_on
+                if intg.measure.defined_on is not None
+                else mesh.edge_bitset('ghost'))
         level_set = getattr(intg.measure, 'level_set', None)
         if level_set is None:
             raise ValueError("dGhost measure requires a 'level_set' callable.")
@@ -1385,6 +1416,7 @@ class FormCompiler:
         geo_factors = self.dh.precompute_ghost_factors(edge_ids, qdeg, level_set, derivs)
         
         valid_eids = geo_factors.get('eids')
+        print(f"len(valid_eids)={len(valid_eids)}")
         if valid_eids is None or len(valid_eids) == 0:
             return
 
@@ -1420,7 +1452,8 @@ class FormCompiler:
         # The runner now gets per-edge arguments
         K_edge, F_edge, J_edge = runner(current_funcs, args)
         hook = self._hook_for(intg.integrand)
-        
+        if self._functional_calculate(intg, J_edge, hook): return
+
         # 6. Scatter contributions
         _scatter_element_contribs(
             K_edge, F_edge, J_edge,
@@ -1543,6 +1576,24 @@ class FormCompiler:
 
         return current
     
+    def _functional_calculate(self, intg: Integral, J_loc, hook):
+        trial, test = _trial_test(intg.integrand)
+        is_functional = (trial is None and test is None)
+        flag = False
+        print(f"[Assembler] Functional calculation: {is_functional}, hook: {hook}")
+        if is_functional:
+            # J_loc is (n_edges,) or scalar; collapse to plain float
+            if J_loc is not None:
+                if J_loc.ndim > 1:
+                    total = J_loc.sum(axis=1)
+                if J_loc.ndim == 1:
+                    total = J_loc.sum()
+            name  = hook["name"]               # retrieved earlier via _hook_for
+            scal  = self.ctx.setdefault("scalar_results", {})
+            scal[name] = scal.get(name, 0.0) + total
+            flag = True
+        return flag                            # 🔑  skip the scatter stage
+
     def _assemble_boundary_edge_jit(self, intg: Integral, matvec):
         mesh, dh, me = self.me.mesh, self.dh, self.me
 
@@ -1586,20 +1637,7 @@ class FormCompiler:
 
 
         hook = self._hook_for(intg.integrand)
-        trial, test = _trial_test(intg.integrand)
-        is_functional = (trial is None and test is None)
-
-        if is_functional:
-            # J_loc is (n_edges,) or scalar; collapse to plain float
-            if J_loc is not None:
-                if J_loc.ndim > 1:
-                    total = J_loc.sum(axis=1)
-                if J_loc.ndim == 1:
-                    total = J_loc.sum()
-            name  = hook["name"]               # retrieved earlier via _hook_for
-            scal  = self.ctx.setdefault("scalar_results", {})
-            scal[name] = scal.get(name, 0.0) + total
-            return                             # 🔑  skip the scatter stage
+        if self._functional_calculate(intg, J_loc, hook): return
             
         _scatter_element_contribs(
             K_loc, F_loc, J_loc,

@@ -251,7 +251,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
         elif dom == "ghost_edge":
             qdeg = fc._find_q_order(intg)
             level_set = intg.measure.level_set
-            edges = get_domain_bitset(mixed_element.mesh, "edge", "ghost")
+            edges     = intg.measure.defined_on \
+                or mixed_element.mesh.edge_bitset("ghost")
             derivs = required_multi_indices(intg.integrand)
             geom = dof_handler.precompute_ghost_factors(edges, qdeg,
                                                         level_set, derivs)
