@@ -61,7 +61,7 @@ Re = rho * U_mean * D / mu
 print(f"Reynolds number (Re): {Re:.2f}")
 
 
-# In[3]:
+# In[ ]:
 
 
 from pycutfem.utils.adaptive_mesh import structured_quad_levelset_adaptive
@@ -71,7 +71,7 @@ NX, NY = 45, 20
 # NX, NY = 50, 60
 poly_order = 2
 level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
-h  = 0.5*(L/NX + H/NY)
+# h  = 0.5*(L/NX + H/NY)
 
 
 # nodes, elems, _, corners = structured_quad(L, H, nx=NX, ny=NY, poly_order=poly_order)
@@ -93,6 +93,7 @@ bc_tags = {
     'outlet': lambda x, y: np.isclose(x, L),
     'walls':  lambda x, y: np.isclose(y, 0) | np.isclose(y, H),
 }
+
 
 
 # --- Define Parabolic Inflow Profile ---
@@ -144,12 +145,6 @@ print(f"Number of neg ghost edges: {mesh.edge_bitset('ghost_neg').cardinality()}
 print(f"Number of ghost edges (both): {mesh.edge_bitset('ghost_both').cardinality()}")
 
 
-# In[6]:
-
-
-get_domain_bitset(mesh, "edge", "ghost_pos")
-
-
 # In[5]:
 
 
@@ -159,11 +154,27 @@ dof_handler.tag_dof_by_locator('p_pin', 'p',
 bcs.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
 bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
 
+# Tag velocity DOFs inside the cylinder (same tag name for both fields is OK)
+dof_handler.tag_dofs_from_element_bitset("inactive", "ux", "inside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "uy", "inside", strict=True)
+
+bcs.append(BoundaryCondition('ux', 'dirichlet', 'inactive', lambda x, y: 0.0))
+bcs.append(BoundaryCondition('uy', 'dirichlet', 'inactive', lambda x, y: 0.0))
+bcs_homog.append(BoundaryCondition('ux', 'dirichlet', 'inactive', lambda x, y: 0.0))
+bcs_homog.append(BoundaryCondition('uy', 'dirichlet', 'inactive', lambda x, y: 0.0))
+
 
 # In[6]:
 
 
-mesh._edge_bitsets.keys()
+for name, bitset in mesh._edge_bitsets.items():
+    print(f"Edge bitset '{name}': {bitset.cardinality()}")
+
+
+# In[ ]:
+
+
+
 
 
 # In[7]:
@@ -225,6 +236,12 @@ print(len(dof_handler.get_dirichlet_data(bcs)))
 # In[11]:
 
 
+len(dof_handler.get_dirichlet_data(bcs))
+
+
+# In[12]:
+
+
 from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict
 from pycutfem.core.geometry import hansbo_cut_ratio
 from pycutfem.ufl.expressions import ElementWiseConstant
@@ -246,13 +263,13 @@ def grad_inner(u, v):
         return _dn(u[0]) * _dn(v[0]) + _dn(u[1]) * _dn(v[1])
 
     raise ValueError("grad_inner supports only scalars or 2‑D vectors.")
-
+ghost_edges_used = mesh.edge_bitset('ghost_pos') | mesh.edge_bitset('interface')
 dx_phys  = dx(defined_on=physical_domain, 
               level_set=level_set,            # the cylinder level set
               metadata   = {"q": 7, "side": "+"} # integrate only φ>0 (positive side)
     )
-dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":11})   # interior surface
-dG       = dGhost(defined_on=mesh.edge_bitset("ghost_pos"), level_set=level_set,metadata={"q":6})  # ghost surface
+dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":9})   # interior surface
+dG       = dGhost(defined_on=ghost_edges_used, level_set=level_set,metadata={"q":6})  # ghost surface
 
 cell_h  = CellDiameter() # length‑scale per element
 beta_N  = Constant(20.0 * poly_order**2)      # Nitsche penalty (tweak)
@@ -318,30 +335,30 @@ R_int = (
 ) * dΓ
 
 # volume ------------------------------------------------------------
-a_vol = restrict(( rho*dot(du,v)/dt
-          + theta*rho*dot(dot(grad(u_k), du), v)
-          + theta*rho*dot(dot(grad(du), u_k), v)
-          + theta*mu*inner(grad(du), grad(v))
-          - dp*div(v) + q*div(du) ),physical_domain) * dx_phys
-
-r_vol = restrict(( rho*dot(u_k-u_n, v)/dt
-          + theta*rho*dot(dot(grad(u_k), u_k), v)
-          + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
-          + theta*mu*inner(grad(u_k), grad(v))
-          + (1-theta)*mu*inner(grad(u_n), grad(v))
-          - p_k*div(v) + q*div(u_k) ),physical_domain) * dx_phys
-# a_vol = ( rho*dot(du,v)/dt
+# a_vol = restrict(( rho*dot(du,v)/dt
 #           + theta*rho*dot(dot(grad(u_k), du), v)
 #           + theta*rho*dot(dot(grad(du), u_k), v)
 #           + theta*mu*inner(grad(du), grad(v))
-#           - dp*div(v) + q*div(du) ) * dx_phys
+#           - dp*div(v) + q*div(du) ),physical_domain) * dx_phys
 
-# r_vol = ( rho*dot(u_k-u_n, v)/dt
+# r_vol = restrict(( rho*dot(u_k-u_n, v)/dt
 #           + theta*rho*dot(dot(grad(u_k), u_k), v)
 #           + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
 #           + theta*mu*inner(grad(u_k), grad(v))
 #           + (1-theta)*mu*inner(grad(u_n), grad(v))
-#           - p_k*div(v) + q*div(u_k) ) * dx_phys
+#           - p_k*div(v) + q*div(u_k) ),physical_domain) * dx_phys
+a_vol = ( rho*dot(du,v)/dt
+          + theta*rho*dot(dot(grad(u_k), du), v)
+          + theta*rho*dot(dot(grad(du), u_k), v)
+          + theta*mu*inner(grad(du), grad(v))
+          - dp*div(v) + q*div(du) ) * dx_phys
+
+r_vol = ( rho*dot(u_k-u_n, v)/dt
+          + theta*rho*dot(dot(grad(u_k), u_k), v)
+          + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
+          + theta*mu*inner(grad(u_k), grad(v))
+          + (1-theta)*mu*inner(grad(u_n), grad(v))
+          - p_k*div(v) + q*div(u_k) ) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
 penalty_val = 20
@@ -371,13 +388,13 @@ residual_form  = r_vol + R_int + stab
 
 
 
-# In[12]:
+# In[13]:
 
 
 # !rm ~/.cache/pycutfem_jit/*
 
 
-# In[13]:
+# In[14]:
 
 
 # from pycutfem.ufl.forms import assemble_form
@@ -385,13 +402,13 @@ residual_form  = r_vol + R_int + stab
 # print(np.linalg.norm(F, ord=np.inf))
 
 
-# In[14]:
+# In[15]:
 
 
 mesh.edge_bitset('ghost').cardinality()
 
 
-# In[15]:
+# In[16]:
 
 
 from pycutfem.io.vtk import export_vtk
@@ -537,7 +554,7 @@ def save_solution(funcs):
 
 
 
-# In[16]:
+# In[17]:
 
 
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver
