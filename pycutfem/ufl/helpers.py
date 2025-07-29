@@ -482,36 +482,27 @@ def _find_all_restrictions(form: Form) -> list[Restriction]:
     return restrictions 
 
 
-def analyze_active_dofs(equation: Equation, dh: DofHandler, me: MixedElement, bcs: list) -> np.ndarray:
+def analyze_active_dofs(equation: Equation, dh: DofHandler, me: MixedElement, bcs: list):
     """
-    Analyzes a UFL equation to determine the set of active DOFs.
-    If no Restriction operators are found, all DOFs are considered active.
+    Return (active_dofs, has_restriction).
+    - active_dofs: indices touched by Restricted domains if any, otherwise all DOFs.
+    - has_restriction: True iff Restriction operators are present in the forms.
     """
     active_dof_set = set()
     all_forms = equation.a.integrals + equation.L.integrals
     all_restrictions = _find_all_restrictions(Form(all_forms))
 
-    # --- Case 1: The form uses Restriction operators ---
     if all_restrictions:
         print("Restriction operators found. Analyzing active domains...")
         for r in all_restrictions:
             fields_in_operand = _all_fields(r.operand)
             active_element_ids = r.domain.to_indices()
-
             for eid in active_element_ids:
                 elemental_dofs_vector = dh.get_elemental_dofs(eid)
                 for field_name in fields_in_operand:
-                    field_slice_local = me.component_dof_slices[field_name]
-                    field_specific_global_dofs = elemental_dofs_vector[field_slice_local]
-                    active_dof_set.update(field_specific_global_dofs)
-    # --- Case 2: The form has no restrictions ---
+                    sl = me.component_dof_slices[field_name]
+                    active_dof_set.update(elemental_dofs_vector[sl])
+        return np.array(sorted(active_dof_set), dtype=int), True
     else:
         print("No Restriction operators found. All DOFs are considered active.")
-        active_dof_set.update(range(dh.total_dofs))
-
-    # Always include Dirichlet DOFs
-    if bcs:
-        dirichlet_dofs = dh.get_dirichlet_data(bcs).keys()
-        active_dof_set.update(dirichlet_dofs)
-
-    return np.array(sorted(list(active_dof_set)), dtype=int)
+        return np.arange(dh.total_dofs, dtype=int), False

@@ -1,8 +1,25 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# # Navier Stokes Equatoin
+
+# In[1]:
+
+
 import numpy as np
 import time
-import os
 import scipy.sparse.linalg as sp_la
 import matplotlib.pyplot as plt
+import numba
+import os
+
+# Get the number of available CPU cores
+num_cores = os.cpu_count()
+print(f"This machine has {num_cores} cores.")
+
+# Set Numba to use all of them
+numba.set_num_threads(num_cores)
+print(f"Numba is set to use {numba.get_num_threads()} threads.")
 
 # --- Core imports ---
 from pycutfem.core.mesh import Mesh
@@ -20,134 +37,59 @@ from pycutfem.ufl.forms import BoundaryCondition, assemble_form
 from pycutfem.fem.mixedelement import MixedElement
 
 
-# --- NEW: High-performance backend imports ---
-from pycutfem.jit import compile_backend
-import scipy.sparse as sp
+
+
+
+
+# In[2]:
 
 
 # ============================================================================
-#    NEW: High-Performance Assembly Helper
+#    NEW: Verification Data and Plotting Function
 # ============================================================================
-def assemble_system_from_local(K_loc, F_loc, dof_handler, bcs):
-    """
-    Assembles global sparse matrix and vector from local contributions
-    and applies boundary conditions.
-    """
-    n_total_dofs = dof_handler.total_dofs
-    n_elements, n_dofs_local, _ = K_loc.shape
-    
-    # Pre-allocate COO data
-    data = np.zeros(n_elements * n_dofs_local * n_dofs_local)
-    rows = np.zeros_like(data, dtype=np.int32)
-    cols = np.zeros_like(data, dtype=np.int32)
-    F = np.zeros(n_total_dofs, dtype=np.float64)
 
-    # Build COO triplets and global vector F
-    for e in range(n_elements):
-        gdofs = dof_handler.get_elemental_dofs(e)
-        r, c = np.meshgrid(gdofs, gdofs, indexing='ij')
-        
-        start = e * n_dofs_local * n_dofs_local
-        end = start + n_dofs_local * n_dofs_local
-        
-        rows[start:end] = r.ravel()
-        cols[start:end] = c.ravel()
-        data[start:end] = K_loc[e].ravel()
-        np.add.at(F, gdofs, F_loc[e])
-
-    K = sp.coo_matrix((data, (rows, cols)), 
-                      shape=(n_total_dofs, n_total_dofs)).tocsr()
-    
-    # Apply Dirichlet boundary conditions
-    if bcs:
-        bc_data = dof_handler.get_dirichlet_data(bcs)
-        if bc_data:
-            bc_dofs = np.fromiter(bc_data.keys(), dtype=int)
-            bc_vals = np.fromiter(bc_data.values(), dtype=float)
-            
-            F -= K @ np.bincount(bc_dofs, weights=bc_vals, minlength=n_total_dofs)
-            
-            K_lil = K.tolil()
-            K_lil[bc_dofs, :] = 0
-            K_lil[:, bc_dofs] = 0
-            K_lil[bc_dofs, bc_dofs] = 1.0
-            K = K_lil.tocsr()
-            
-            F[bc_dofs] = bc_vals
-            
-    return K, F
-
-# ============================================================================
-#    Verification Data and Plotting Function
-# ============================================================================
+# Digitized data from Ghia, Ghia, and Shin (1982), Table 1 for Re=100
 ghia_data_re100 = {
-    'y_locations': np.array([0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0]),
-    'u_velocity_on_vertical_centerline': np.array([0.0, -0.0722, -0.1364, -0.2282, -0.2928, -0.3239, -0.3273, -0.3017, -0.2452, -0.1553, -0.0524, 0.0033, 1.0]),
-    'x_locations': np.array([0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0]),
-    'v_velocity_on_horizontal_centerline': np.array([0.0, 0.0886, 0.1608, 0.2804, 0.3556, 0.3789, 0.3547, 0.2971, 0.2223, 0.1463, 0.0712, 0.0396, 0.0])
+    'y_locations': np.array([0.0, 0.0547, 0.0625, 0.0703, 0.1016, 0.1719, 0.2813, 0.4531, 0.5, 0.6172, 0.7344, 0.8516, 0.9531,0.9609,0.9688,0.9766,1.0]),
+    'u_velocity_on_vertical_centerline': np.array([0.0, -0.03717, -0.04192, -0.04775, -0.06434, -0.10150, -0.15662, -0.21090, -0.20581, -0.13641, 0.00332, 0.23151,0.68717,0.73722,0.78871,0.84123,1.0]),
+    'x_locations': np.array([0.0, 0.0625, 0.0703, 0.0781, 0.0938, 0.1563, 0.2266, 0.2344, 0.5, 0.8047, 0.8594, 0.9063, 0.9453, 0.9531, 0.9609, 0.9688, 1.0]),
+    'v_velocity_on_horizontal_centerline': np.array([0.0, 0.09233, 0.10091, 0.10890, 0.12317, 0.16077, 0.17507,0.17527,0.05454,-.24533,-.22445,-.16914,-.10313,-.08864,-.07391,-.05906,0.0])
 }
 
-def create_verification_plot(dof_handler, u_solution, reference_data):
-    """
-    Extracts velocity profiles, plots them against Ghia et al. reference data,
-    and saves the plot to a file.
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle("Verification Against Ghia, Ghia & Shin (1982) for Re=100", fontsize=16)
 
-    # --- 1. u-velocity on vertical centerline (x=0.5) ---
-    ux_dof_coords = dof_handler.get_dof_coords('ux')
-    centerline_mask = np.isclose(ux_dof_coords[:, 0], 0.5)
-    y_coords = ux_dof_coords[centerline_mask, 1]
-    u_centerline = u_solution[0].nodal_values[centerline_mask]
-    sort_indices = np.argsort(y_coords)
-    ax = axes[0]
-    ax.plot(u_centerline[sort_indices], y_coords[sort_indices], 'b-', label='FEM Solution', lw=2)
-    ax.plot(reference_data['u_velocity_on_vertical_centerline'], reference_data['y_locations'], 'ro', label='Ghia et al. (1982)', mfc='none')
-    ax.set_title('u-velocity along Vertical Centerline (x=0.5)')
-    ax.set_xlabel('u-velocity')
-    ax.set_ylabel('Y-coordinate')
-    ax.grid(True, linestyle=':')
-    ax.legend()
 
-    # --- 2. v-velocity on horizontal centerline (y=0.5) ---
-    uy_dof_coords = dof_handler.get_dof_coords('uy')
-    centerline_mask = np.isclose(uy_dof_coords[:, 1], 0.5)
-    x_coords = uy_dof_coords[centerline_mask, 0]
-    v_centerline = u_solution[1].nodal_values[centerline_mask]
-    sort_indices = np.argsort(x_coords)
-    ax = axes[1]
-    ax.plot(x_coords[sort_indices], v_centerline[sort_indices], 'b-', label='FEM Solution', lw=2)
-    ax.plot(reference_data['x_locations'], reference_data['v_velocity_on_horizontal_centerline'], 'ro', label='Ghia et al. (1982)', mfc='none')
-    ax.set_title('v-velocity along Horizontal Centerline (y=0.5)')
-    ax.set_xlabel('X-coordinate')
-    ax.set_ylabel('v-velocity')
-    ax.grid(True, linestyle=':')
-    ax.legend()
+# In[3]:
 
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    # NEW: Save the plot to a file
-    plt.savefig("cavity_verification_plot.png", dpi=300)
-    print("Saved verification plot to cavity_verification_plot.png")
-    plt.close(fig)
 
 # 1. ============================================================================
-#    SETUP
+#    SETUP (Meshes, DofHandler, BCs)
 # ===============================================================================
 L, H = 1.0, 1.0
-NX, NY = 64, 64
+# MODIFIED: Increased resolution for better accuracy
+NX, NY = 30, 30
 nodes_q2, elems_q2, _, corners_q2 = structured_quad(L, H, nx=NX, ny=NY, poly_order=2)
 mesh_q2 = Mesh(nodes=nodes_q2, element_connectivity=elems_q2, elements_corner_nodes=corners_q2, element_type="quad", poly_order=2)
 mixed_element = MixedElement(mesh_q2, field_specs={'ux': 2, 'uy': 2, 'p': 1})
+
 dof_handler = DofHandler(mixed_element, method='cg')
 
-bc_tags = {'bottom_wall': lambda x,y: np.isclose(y,0), 
-           'left_wall': lambda x,y: np.isclose(x,0), 
-           'right_wall': lambda x,y: np.isclose(x,L), 
-           'top_lid': lambda x,y: np.isclose(y,H)}
+# Tag boundaries for applying BCs
+bc_tags = {
+    'bottom_wall': lambda x,y: np.isclose(y,0),
+    'left_wall':   lambda x,y: np.isclose(x,0),
+    'right_wall':  lambda x,y: np.isclose(x,L),
+    'top_lid':     lambda x,y: np.isclose(y,H)
+}
 mesh_q2.tag_boundary_edges(bc_tags)
-dof_handler.tag_dof_by_locator(tag='pressure_pin_point', field='p', locator=lambda x, y: np.isclose(x, 0.0) and np.isclose(y, 0.0), find_first=True)
 
+# Tag a single node for pressure pinning
+dof_handler.tag_dof_by_locator(
+    tag='pressure_pin_point', field='p',
+    locator=lambda x, y: np.isclose(x, 0.0) and np.isclose(y, 0.0),
+    find_first=True
+)
+
+# MODIFIED: Boundary conditions for the classic lid-driven cavity problem
 bcs = [
     # No-slip on bottom, left, and right walls
     BoundaryCondition('ux', 'dirichlet', 'bottom_wall', lambda x,y: 0.0),
@@ -162,24 +104,46 @@ bcs = [
     # Pin pressure at one point to ensure a unique solution
     BoundaryCondition('p', 'dirichlet', 'pressure_pin_point',lambda x,y: 0.0)
 ]
+
 bcs_homog = [BoundaryCondition(bc.field, bc.method, bc.domain_tag, lambda x,y: 0.0) for bc in bcs]
-dof_handler.info()
+print(f"DofHandler info: {dof_handler.info()}")
+
+
+# In[ ]:
+
+
+
+
+
+# In[4]:
+
 
 # 2. ============================================================================
 #    UFL FORMULATION
 # ===============================================================================
-rho, dt, theta, mu = Constant(1.0), Constant(0.1), Constant(1.0), Constant(0.01)
-velocity_space, pressure_space = FunctionSpace("velocity", ['ux', 'uy']), FunctionSpace("pressure", ['p'])
-du, dp = VectorTrialFunction(velocity_space), TrialFunction(pressure_space)
-v, q = VectorTestFunction(velocity_space), TestFunction(pressure_space)
-u_k, p_k = VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler), Function(name="p_k", field_name='p', dof_handler=dof_handler)
-u_n, p_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handler), Function(name="p_n", field_name='p', dof_handler=dof_handler)
+rho = Constant(1.0)
+dt = Constant(0.1)
+theta = Constant(1.0) # Use Backward Euler for stability (theta=1.0)
+# MODIFIED: Set viscosity for Re=100
+mu = Constant(0.01) # Re = (1.0 * 1.0 * 1.0) / 0.01 = 100
 
-# 3. ============================================================================
-#    NEW: HIGH-PERFORMANCE SOLVER LOOP
-# ===============================================================================
-steady_state_tol, max_timesteps = 1e-5, 200
-newton_tol, max_newton_iter = 1e-6, 15
+velocity_space = FunctionSpace("velocity", ['ux', 'uy'])
+pressure_space = FunctionSpace("pressure", ['p'])
+
+du = VectorTrialFunction(velocity_space, dof_handler=dof_handler)
+dp = TrialFunction(pressure_space, dof_handler=dof_handler)
+v = VectorTestFunction(velocity_space, dof_handler=dof_handler)
+q = TestFunction(pressure_space, dof_handler=dof_handler)
+
+u_k = VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler)
+p_k = Function(name="p_k", field_name='p', dof_handler=dof_handler)
+u_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handler)
+# p_n is not needed for the steady state formulation if theta=1.0, but we keep it for consistency
+p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler)
+
+
+# In[5]:
+
 
 u_k.nodal_values.fill(0.0); p_k.nodal_values.fill(0.0)
 u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
@@ -204,133 +168,127 @@ residual_form = (
     -p_k * div(v) + q * div(u_k)
 ) * dx()
 
-# The compile step returns high-performance runner objects
-jacobian_runner, jacobian_ir = compile_backend(jacobian_form, dof_handler=dof_handler, mixed_element= mixed_element)
-residual_runner, residual_ir = compile_backend(residual_form, dof_handler=dof_handler, mixed_element= mixed_element)
 
-# --- NEW: Precompute Geometric Factors ONCE ---
-print("Precomputing geometric factors...")
-quad_order = 6                                   # keep this consistent
+# In[6]:
 
-# A) geometry (what you already had)
-static_kernel_args = dof_handler.precompute_geometric_factors(quad_order)
 
-# B) mesh / DOF information
-mesh = mixed_element.mesh
-static_kernel_args["gdofs_map"] = np.vstack(
-    [dof_handler.get_elemental_dofs(e) for e in range(mesh.n_elements)]
-).astype(np.int32)
-static_kernel_args["node_coords"] = dof_handler.get_all_dof_coords()
+from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver
+from pycutfem.solvers.aainhb_solver import AAINHBSolver
 
-# C) basis / gradient tables – once for each kernel, then take the union
-from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
+# build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
+time_params = TimeStepperParameters(dt=0.1, stop_on_steady=True, steady_tol=1e-6, theta= 0.49)
 
-basis_jac = _build_jit_kernel_args(
-    jacobian_ir,               # returned by compile_backend
-    jacobian_form.integrand,   # UFL integrand
-    mixed_element,
-    quad_order,
-    dof_handler,
-    param_order=jacobian_runner.param_order,
+solver = NewtonSolver(
+    residual_form, jacobian_form,
+    dof_handler=dof_handler,
+    mixed_element=mixed_element,
+    bcs=bcs, bcs_homog=bcs_homog,
+    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
 )
-basis_res = _build_jit_kernel_args(
-    residual_ir,
-    residual_form.integrand,
-    mixed_element,
-    quad_order,
-    dof_handler,
-    param_order=residual_runner.param_order,
-)
+# solver = AdamNewtonSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler,
+#     mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6)
+# )
+# solver = AAINHBSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler,
+#     mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6),
+# )
 
-static_kernel_args.update(basis_jac)
-static_kernel_args.update(basis_res)   # union – safe, no duplicates
-static_kernel_args = {k: v for k, v in static_kernel_args.items()
-                      if not (k.startswith("u_") and k.endswith("_loc"))}
 
-# --- Main Time-Stepping Loop (to reach steady state) ---
-for n in range(max_timesteps):
-    t = (n + 1) * dt.value
-    print(f"\n--- Solving Time Step {n+1} | t = {t:.2f}s ---")
+# primary unknowns
+functions      = [u_k, p_k]
+prev_functions = [u_n, p_n]
 
-    u_k.nodal_values[:] = u_n.nodal_values[:]
-    p_k.nodal_values[:] = p_n.nodal_values[:]
-    dof_handler.apply_bcs(bcs, u_k, p_k)
+solver.solve_time_interval(functions=functions,prev_functions= prev_functions,
+                           time_params=time_params,)
 
-    # --- NEW: Timing the Newton Loop ---
-    newton_start_time = time.perf_counter()
-    
-    for k in range(max_newton_iter):
-        # Define the functions with their current data for this iteration
-        current_funcs = {'u_k': u_k, 'p_k': p_k, 'u_n': u_n, 'p_n': p_n}
-        
-        # Execute the pre-compiled runners
-        K_loc, _ = jacobian_runner(current_funcs, static_kernel_args)
-        _, F_loc = residual_runner(current_funcs, static_kernel_args)
-        
-        # Assemble the global system from local contributions
-        A, R_vec = assemble_system_from_local(K_loc, F_loc, dof_handler, bcs=bcs_homog)
 
-        norm_res = np.linalg.norm(R_vec)
-        print(f"  Newton iteration {k+1} | Residual Norm: {norm_res:.3e}")
+# In[ ]:
 
-        if norm_res < newton_tol:
-            newton_end_time = time.perf_counter()
-            print(f"    Newton converged in {k+1} iterations.")
-            print(f"    Newton solver time: {newton_end_time - newton_start_time:.4f} seconds.")
-            break
-        
-        delta_U = sp_la.spsolve(A, -R_vec)
-        dof_handler.add_to_functions(delta_U, [u_k, p_k])
-        dof_handler.apply_bcs(bcs, u_k, p_k)
-    else:
-        newton_end_time = time.perf_counter()
-        print(f"    Newton solver time: {newton_end_time - newton_start_time:.4f} seconds.")
-        raise RuntimeError(f"Newton's method did not converge after {max_newton_iter} iterations.")
-
-    # --- Check for steady-state convergence ---
-    solution_change = np.linalg.norm(u_k.nodal_values - u_n.nodal_values)
-    print(f"  Change in solution (L2 norm): {solution_change:.3e}")
-    if solution_change < steady_state_tol and n > 0:
-        print(f"\n--- Steady state reached at t={t:.2f}s ---")
-        u_n.nodal_values[:] = u_k.nodal_values[:]
-        p_n.nodal_values[:] = p_k.nodal_values[:]
-        break
-
-    u_n.nodal_values[:], p_n.nodal_values[:] = u_k.nodal_values[:], p_k.nodal_values[:]
-else:
-    print(f"\n--- Max timesteps ({max_timesteps}) reached. Solution may not be fully steady. ---")
-
-# 4. ============================================================================
-#    POST-PROCESSING AND VERIFICATION
-# ===============================================================================
-print("\nSimulation finished. Generating and saving plots...")
-
-# NEW: Create a directory for the plots if it doesn't exist
-output_dir = "cavity_results"
-os.makedirs(output_dir, exist_ok=True)
-
-# --- Plot Final Solution Contours and Save them ---
-u_n.plot(field='ux', title='U-Velocity (ux) at Steady State (Re=100)', levels=20, cmap='viridis')
-plt.savefig(os.path.join(output_dir, "steady_state_velocity_ux.png"), dpi=300)
-plt.close()
-
-u_n.plot(field='uy', title='V-Velocity (uy) at Steady State (Re=100)', levels=20, cmap='viridis')
-plt.savefig(os.path.join(output_dir, "steady_state_velocity_uy.png"), dpi=300)
-plt.close()
 
 u_n.plot(kind="streamline",
-         density=2.0,
+         density=4.0,
          linewidth=0.8,
          cmap="plasma",
-         title="Lid-driven cavity – stream-lines",background = True)
-plt.savefig(os.path.join(output_dir, "steady_state_streamlines.png"), dpi=300)
-plt.close()
+         title="Lid-driven cavity – stream-lines",background = False)
 
-p_n.plot(title='Pressure (p) at Steady State (Re=100)', levels=20, cmap='viridis')
-plt.savefig(os.path.join(output_dir, "steady_state_pressure.png"), dpi=300)
-plt.close()
 
-# --- Generate and Save Quantitative Verification Plot ---
+# In[ ]:
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from pycutfem.plotting import _extract_profile_1d
+
+
+# ---------------------------------------------------------------------------
+
+
+def create_verification_plot(dh, u_vec, reference_data, *,
+                             x_center=0.5, y_center=0.5):
+    """
+    Compare the FEM velocity field *u_vec* (VectorFunction) against the
+    Ghia et al. (1982) reference data for Re=100.
+
+    Parameters
+    ----------
+    dh : DofHandler
+        The handler that owns *u_vec*.
+    u_vec : VectorFunction
+        Solution with components ['ux', 'uy'].
+    reference_data : dict
+        Dict with keys 'x_locations', 'y_locations',
+        'u_velocity_on_vertical_centerline',
+        'v_velocity_on_horizontal_centerline'.
+    x_center, y_center : float, optional
+        Position of the vertical / horizontal centre-lines.
+    """
+    # ------------------------------------------------------------------
+    # 1. Extract smooth centre-line profiles from the solution
+    # ------------------------------------------------------------------
+    ux_vals = u_vec.components[0].nodal_values   # or u_vec[0].nodal_values
+    uy_vals = u_vec.components[1].nodal_values
+
+    y_sol, u_sol = _extract_profile_1d('ux', dh, ux_vals,
+                                       line_axis='x', line_pos=x_center)
+    x_sol, v_sol = _extract_profile_1d('uy', dh, uy_vals,
+                                       line_axis='y', line_pos=y_center)
+
+    # ------------------------------------------------------------------
+    # 2. Plot comparison
+    # ------------------------------------------------------------------
+    fig, (ax_u, ax_v) = plt.subplots(1, 2, figsize=(14, 6), sharey=False)
+    fig.suptitle("Lid-driven cavity – comparison with Ghia et al. (Re = 100)",
+                 fontsize=16)
+
+    # u-velocity along vertical centre-line
+    ax_u.plot(u_sol, y_sol, 'b-', lw=2, label='FEM')
+    ax_u.plot(reference_data['u_velocity_on_vertical_centerline'],
+              reference_data['y_locations'],
+              'ro',  mfc='none', label='Ghia et al. (1982)')
+    ax_u.set_xlabel(r'$u$');  ax_u.set_ylabel(r'$y$')
+    ax_u.set_title(r'$u(x=0.5,\;y)$')
+    ax_u.grid(ls=':')
+    ax_u.legend()
+
+    # v-velocity along horizontal centre-line
+    ax_v.plot(x_sol, v_sol, 'b-', lw=2, label='FEM')
+    ax_v.plot(reference_data['x_locations'],
+              reference_data['v_velocity_on_horizontal_centerline'],
+              'ro',  mfc='none', label='Ghia et al. (1982)')
+    ax_v.set_xlabel(r'$x$');  ax_v.set_ylabel(r'$v$')
+    ax_v.set_title(r'$v(x,\;y=0.5)$')
+    ax_v.grid(ls=':')
+    ax_v.legend()
+
+    plt.tight_layout()
+    plt.show()
+
 create_verification_plot(dof_handler, u_n, ghia_data_re100)
 
-print(f"\nAll plots saved to the '{output_dir}' directory.")

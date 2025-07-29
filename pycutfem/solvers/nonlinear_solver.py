@@ -101,6 +101,63 @@ def _scatter_element_contribs(
         )
         acc += total
 
+def _scatter_element_contribs_reduced(
+    *,
+    K_elem: np.ndarray | None,
+    F_elem: np.ndarray | None,
+    J_elem: np.ndarray | None,
+    element_ids: np.ndarray,
+    gdofs_map: np.ndarray,
+    A_red,                 # csr/lil for matrix or None
+    R_red,                 # 1-D array for rhs or None
+    full_to_red: np.ndarray,  # length = ndof, maps full→reduced (−1 if dropped)
+    hook=None,
+):
+    """
+    Scatter element contributions directly into a reduced system.
+    Rows/cols with full_to_red == -1 (Dirichlet / inactive) are ignored.
+    """
+
+    nloc_ok = lambda arr: (arr is not None) and (arr.ndim >= 2)
+
+    # --- Matrix block: keep only (free, free) -------------------------
+    if A_red is not None and K_elem is not None and K_elem.ndim == 3:
+        for i in range(len(element_ids)):
+            gdofs = gdofs_map[i]
+            rmap  = full_to_red[gdofs]
+            rmask = rmap >= 0
+            if not np.any(rmask):
+                continue
+            rows = rmap[rmask]
+
+            # columns use the same element gdofs (bilinear form)
+            cmap  = full_to_red[gdofs]
+            cmask = cmap >= 0
+            if not np.any(cmask):
+                continue
+            cols = cmap[cmask]
+
+            Ke = K_elem[i][np.ix_(rmask, cmask)]
+            A_red[np.ix_(rows, cols)] += Ke
+
+    # --- Vector block: keep only free rows ----------------------------
+    if R_red is not None and F_elem is not None:
+        for i in range(len(element_ids)):
+            gdofs = gdofs_map[i]
+            rmap  = full_to_red[gdofs]
+            rmask = rmap >= 0
+            if not np.any(rmask):
+                continue
+            rows = rmap[rmask]
+            R_red[rows] += F_elem[i][rmask]
+
+    # --- Scalar functionals unchanged (optional) ----------------------
+    if hook is not None and J_elem is not None:
+        total = J_elem.sum(axis=0) if J_elem.ndim > 1 else J_elem.sum()
+        acc = hook.setdefault("acc", 0.0)
+        hook["acc"] = acc + total
+
+
 # ----------------------------------------------------------------------------
 #  Parameter dataclasses
 # ----------------------------------------------------------------------------
@@ -257,12 +314,40 @@ class NewtonSolver:
         )
         # --- NEW: A PRIORI DOF ANALYSIS ---
         # Analyze the forms once to get the definitive set of active DOFs.
-        equation = Equation(jacobian_form, residual_form)
-        self.active_dofs = analyze_active_dofs(equation, self.dh,self.me ,self.bcs + self.bcs_homog)
-        if len(self.active_dofs) < self.dh.total_dofs:
-             print(f"NewtonSolver: System will be reduced to {len(self.active_dofs)} active DOFs.")
+        self.equation = Equation(jacobian_form, residual_form)
+        # Which BC list marks the fixed rows? Prefer homogeneous set.
+        bcs_for_active = self.bcs_homog if getattr(self, "bcs_homog", None) else self.bcs
+        # 1) What DOFs are “touched” by Restriction (if any)?
+        active_by_restr, has_restriction = analyze_active_dofs(
+            self.equation, self.dh, self.me, bcs_for_active
+        )
+        ndof = self.dh.total_dofs
+        bc_dofs = set(self.dh.get_dirichlet_data(bcs_for_active).keys())
+        # 2) Free DOFs = (Restriction-active DOFs) \ (Dirichlet DOFs),
+        #    or (All DOFs) \ (Dirichlet DOFs) when no Restriction.
+        if has_restriction:
+            free = sorted(set(active_by_restr) - bc_dofs)
         else:
-             print("NewtonSolver: Operating on the full, unrestricted system.")
+            free = sorted(set(range(ndof)) - bc_dofs)
+
+        self.active_dofs = np.asarray(free, dtype=int)
+        nfree = self.active_dofs.size
+
+        # 3) Maps full ↔ reduced
+        self.full_to_red = -np.ones(ndof, dtype=int)
+        self.full_to_red[self.active_dofs] = np.arange(nfree, dtype=int)
+        self.red_to_full = self.active_dofs
+
+        # 4) Always run the reduced path when there are any fixed DOFs
+        self.use_reduced = (nfree < ndof)
+        if not self.use_reduced:
+            print("NewtonSolver: Operating on the full, unrestricted system.")
+        else:
+            print(f"NewtonSolver: Reduced system with {nfree}/{ndof} DOFs.")
+
+        # Optional sanity log:
+        print(f"  Dirichlet DOFs detected: {len(bc_dofs)}; Free DOFs: {nfree}")
+
         self.restrictor = _ActiveReducer(self.dh, self.active_dofs)
 
 
@@ -350,57 +435,167 @@ class NewtonSolver:
     #  Newton iteration (internal)
     # ------------------------------------------------------------------
     def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
+        """
+        Newton iterations that ALWAYS operate in the reduced space (ff block).
+        - Dirichlet DOFs are excluded via self.active_dofs.
+        - Inhomogeneous Dirichlet values are NOT re-applied inside the iteration,
+        only after an accepted step (BCs were already set before entering the loop).
+        """
         dh = self.dh
+        ndof = dh.total_dofs
+
+        # Quick safety: make sure we actually have a reduced set
+        # (This is only for logging; we still run the reduced pipeline.)
+        nfree = len(self.active_dofs)
+        if nfree == ndof:
+            print("        [warn] active_dofs == total_dofs — reduced path = full size."
+                " Check that bcs_homog correctly marks Dirichlet nodes.")
 
         for it in range(self.np.max_newton_iter):
             if self.pre_cb is not None:
                 self.pre_cb(funcs)
 
+            # Build the coefficients dict expected by kernels
             current: Dict[str, "Function"] = {f.name: f for f in funcs}
             current.update({f.name: f for f in prev_funcs})
             if aux_funcs:
                 current.update(aux_funcs)
 
-            # 1. Assemble the full, potentially singular system
-            A_full, R_full = self._assemble_system(current)
-            # 2. Reduce the system using the pre-computed active_dofs
-            #    If no restrictions were used, this step is effectively a copy.
-            A_red, R_red, full_to_red_map = self._create_reduced_system(A_full, R_full, bcs_now)
+            # 1) Assemble reduced system: A_ff δU_f = -R_f
+            A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
 
-            self._last_jacobian = A_full
-
+            # Log residual with a full-size view (zeros on fixed DOFs) for readability
+            R_full = np.zeros(ndof)
+            R_full[self.active_dofs] = R_red
             norm_R = np.linalg.norm(R_full, ord=np.inf)
             print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}")
             if norm_R < self.np.newton_tol:
-                # Return *time‑step* increment --------------------
+                # Converged — return *time-step* increment for all fields
                 delta = np.hstack([
                     f.nodal_values - f_prev.nodal_values
                     for f, f_prev in zip(funcs, prev_funcs)
                 ])
                 return delta
 
+            # 2) Compute reduced Newton direction
             dU_red = self._solve_linear_system(A_red, -R_red)
-            # 4. Expand the solution vector back to the full size
-            dU_full = np.zeros(dh.total_dofs)
+
+            # 3) Optional Armijo backtracking in reduced space (no BC re-application inside)
+            if getattr(self.np, "line_search", False):
+                dU_red = self._line_search_reduced(A_red, R_red, dU_red, funcs, current, bcs_now)
+
+            # 4) Apply accepted step: expand reduced → full, update fields, then re-impose BCs
+            dU_full = np.zeros(ndof)
             dU_full[self.active_dofs] = dU_red
-
-            if self.np.line_search:
-                dU = self._line_search(funcs, dU_full, current, R_full, bcs_now)
-
             dh.add_to_functions(dU_full, funcs)
+
+            # Re-impose the (possibly inhomogeneous) Dirichlet values AFTER the update
             dh.apply_bcs(bcs_now, *funcs)
 
             if self.post_cb is not None:
                 self.post_cb(funcs)
 
+        # If we get here, Newton did not converge within the iteration budget
         raise RuntimeError("Newton did not converge – adjust Δt or verify Jacobian.")
 
+
    
+    def _line_search_reduced(self, A_red, R_red, S_red, funcs, coeffs, bcs_now):
+        """
+        Backtracking Armijo search performed entirely in the reduced space.
+        - A_red, R_red: current reduced Jacobian and residual
+        - S_red: proposed search direction in reduced space
+        """
+        dh   = self.dh
+        np_  = self.np
+        c1   = getattr(np_, "ls_c1", 1.0e-4)
+
+        # Gradient g_f = J_ff^T R_f  (reduced variables only)
+        g = A_red.T @ R_red
+        gTS = float(g @ S_red)
+        if gTS >= 0.0:
+            # Not a descent direction – reject and take zero step
+            print("        Warning: Not a descent direction in reduced space.")
+            return np.zeros_like(S_red)
+
+        phi0 = 0.5 * float(R_red @ R_red)
+        alpha = 1.0
+        best_alpha, best_phi = 0.0, phi0
+
+        # Snapshot the *full* iterate
+        snap = [f.nodal_values.copy() for f in funcs]
+
+        for _ in range(np_.ls_max_iter):
+            # Trial update: expand to full, apply, and re-impose BCs
+            for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
+            dU_full = np.zeros(dh.total_dofs)
+            dU_full[self.active_dofs] = alpha * S_red
+            dh.add_to_functions(dU_full, funcs)
+            # dh.apply_bcs(bcs_now, *funcs)
+
+            # Evaluate residual in reduced space (matrix not needed)
+            _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
+            phi = 0.5 * float(R_try @ R_try)
+
+            # Track best effort
+            if phi < best_phi:
+                best_phi, best_alpha = phi, alpha
+
+            # Armijo condition with reduced quantities
+            if phi <= phi0 + c1 * alpha * gTS:
+                for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
+                print(f"        Armijo search accepted α = {alpha:.2e}")
+                return alpha * S_red
+
+            alpha *= np_.ls_reduction
+
+        # Fallback (best effort seen)
+        for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
+        if best_alpha > 0.0:
+            print(f"        Armijo failed, using best-effort α = {best_alpha:.2e}.")
+            return best_alpha * S_red
+        print("        Line search failed – no descent.")
+        return np.zeros_like(S_red)
 
     # ------------------------------------------------------------------
-    #  Linear system & BC handling
+    #  Reduced Linear system & BC handling
     # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
+    def _assemble_system_reduced(self, coeffs, *, need_matrix: bool = True):
+        """
+        Assemble Jacobian and residual directly on the reduced unknown set
+        (non‑Dirichlet, restriction‑aware). Returns (A_red | None, R_red).
+        """
+
+        nred = len(self.active_dofs)
+        A_red = sp.lil_matrix((nred, nred)) if need_matrix else None
+        R_red = np.zeros(nred)
+
+        # 1) Jacobian (reduced rows/cols only)
+        if need_matrix:
+            for ker in self.kernels_K:
+                Kloc, _, _ = ker.exec(coeffs)
+                _scatter_element_contribs_reduced(
+                    K_elem=Kloc, F_elem=None, J_elem=None,
+                    element_ids=ker.static_args["eids"],
+                    gdofs_map =ker.static_args["gdofs_map"],
+                    A_red=A_red, R_red=None,
+                    full_to_red=self.full_to_red,
+                )
+
+        # 2) Residual (reduced rows only)
+        for ker in self.kernels_F:
+            _, Floc, _ = ker.exec(coeffs)
+            _scatter_element_contribs_reduced(
+                K_elem=None, F_elem=Floc, J_elem=None,
+                element_ids=ker.static_args["eids"],
+                gdofs_map =ker.static_args["gdofs_map"],
+                A_red=None, R_red=R_red,
+                full_to_red=self.full_to_red,
+            )
+
+        return (A_red.tocsr() if need_matrix else None), R_red
+
+    # ------------------------------------------------------------------
     #  Linear system & BC handling        (REF‑ACTORED)
     # ------------------------------------------------------------------
     def _assemble_system(self, coeffs, *, need_matrix: bool = True):
