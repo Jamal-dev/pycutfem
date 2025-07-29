@@ -1323,7 +1323,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = False
+            DEBUG: bool = True
         ):
         """
         Build complete kernel source code with parallel assembly.

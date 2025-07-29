@@ -259,8 +259,29 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
             # ---- Cut volume (level set present) --------------------------
             inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
-            full_ids = np.asarray(outside_ids if side == "+" else inside_ids,
-                                  dtype=np.int32)
+            # By convention in this codebase:
+            #   inside_ids  ↔ elements with  φ < 0
+            #   outside_ids ↔ elements with  φ > 0
+            if side not in ("+", "-"):
+                raise ValueError(f"volume(side=...) must be '+' or '-', got {side!r}")
+            side_full = inside_ids if side == "-" else outside_ids
+
+            # Start from full elements on the requested side
+            full_ids = np.asarray(side_full, dtype=np.int32)
+
+            # Respect 'defined_on' for the full-element subset too, if provided.
+            # (The cut subset already uses defined_on via 'cut_bs' below.)
+            bs = intg.measure.defined_on
+            if bs is not None:
+                # Try the common BitSet APIs first.
+                try:
+                    allowed = np.asarray(bs.to_indices(), dtype=np.int32)
+                except AttributeError:
+                    arr = np.asarray(bs)
+                    allowed = (np.nonzero(arr)[0].astype(np.int32)
+                               if arr.dtype == bool else arr.astype(np.int32))
+                # Intersect: full elements from the requested side ∩ defined_on
+                full_ids = np.intersect1d(full_ids, allowed, assume_unique=False)
 
             # 1) FULL elements on the requested side
             if full_ids.size:
@@ -293,7 +314,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
             # 2) CUT elements (clipped physical quadrature & per-element basis)
             if len(cut_ids):
                 derivs = required_multi_indices(intg.integrand) | {(0, 0)}
-                cut_bs = intg.measure.defined_on or mesh.element_bitset("cut")
+                cut_mask = mesh.element_bitset("cut")
+                cut_bs = (bs & cut_mask) if bs is not None else cut_mask
 
                 geom_cut = dof_handler.precompute_cut_volume_factors(
                     cut_bs, qdeg, derivs, level_set, side=side
@@ -328,7 +350,9 @@ def compile_multi(form, *, dof_handler, mixed_element,
         # ------------------------------------------------------------------
         if dom == "interface":
             level_set = intg.measure.level_set
-            cut_eids  = intg.measure.defined_on or mixed_element.mesh.element_bitset("cut")
+            bs_cut = mixed_element.mesh.element_bitset("cut")
+            bs_def = intg.measure.defined_on
+            cut_eids = (bs_def & bs_cut) if bs_def is not None else bs_cut
             geom = dof_handler.precompute_interface_factors(cut_eids, qdeg, level_set)
 
             # interface assembly still uses element-local maps; safe to use all
@@ -353,10 +377,12 @@ def compile_multi(form, *, dof_handler, mixed_element,
         # ------------------------------------------------------------------
         if dom == "ghost_edge":
             level_set = intg.measure.level_set
-            edges     = intg.measure.defined_on or mixed_element.mesh.edge_bitset("ghost")
             derivs    = required_multi_indices(intg.integrand)
-
+            bs_ghost = mixed_element.mesh.edge_bitset("ghost")
+            bs_def   = intg.measure.defined_on
+            edges = (bs_def & bs_ghost) if bs_def is not None else bs_ghost
             geom = dof_handler.precompute_ghost_factors(edges, qdeg, level_set, derivs)
+
             # ghost precompute returns the union dof map for each edge
             gdofs_map = geom["gdofs_map"]
 

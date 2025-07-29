@@ -180,7 +180,7 @@ for name, bitset in mesh._edge_bitsets.items():
 
 
 
-# In[ ]:
+# In[7]:
 
 
 from pycutfem.io.visualization import plot_mesh_2
@@ -189,7 +189,7 @@ plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True,
               plot_nodes=False, elem_tags=False, edge_colors=True, plot_interface=False,resolution=300)
 
 
-# In[ ]:
+# In[8]:
 
 
 # ============================================================================
@@ -224,25 +224,25 @@ u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
 dof_handler.apply_bcs(bcs, u_n, p_n)
 
 
-# In[ ]:
+# In[9]:
 
 
 # u_n.plot()
 
 
-# In[ ]:
+# In[10]:
 
 
 print(len(dof_handler.get_dirichlet_data(bcs)))
 
 
-# In[ ]:
+# In[11]:
 
 
 len(dof_handler.get_dirichlet_data(bcs))
 
 
-# In[ ]:
+# In[12]:
 
 
 from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict
@@ -338,30 +338,30 @@ R_int = (
 ) * dΓ
 
 # volume ------------------------------------------------------------
-a_vol = restrict(( rho*dot(du,v)/dt
-          + theta*rho*dot(dot(grad(u_k), du), v)
-          + theta*rho*dot(dot(grad(du), u_k), v)
-          + theta*mu*inner(grad(du), grad(v))
-          - dp*div(v) + q*div(du) ),physical_domain) * dx_phys
-
-r_vol = restrict(( rho*dot(u_k-u_n, v)/dt
-          + theta*rho*dot(dot(grad(u_k), u_k), v)
-          + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
-          + theta*mu*inner(grad(u_k), grad(v))
-          + (1-theta)*mu*inner(grad(u_n), grad(v))
-          - p_k*div(v) + q*div(u_k) ),physical_domain) * dx_phys
-# a_vol = ( rho*dot(du,v)/dt
+# a_vol = restrict(( rho*dot(du,v)/dt
 #           + theta*rho*dot(dot(grad(u_k), du), v)
 #           + theta*rho*dot(dot(grad(du), u_k), v)
 #           + theta*mu*inner(grad(du), grad(v))
-#           - dp*div(v) + q*div(du) ) * dx_phys
+#           - dp*div(v) + q*div(du) ),physical_domain) * dx_phys
 
-# r_vol = ( rho*dot(u_k-u_n, v)/dt
+# r_vol = restrict(( rho*dot(u_k-u_n, v)/dt
 #           + theta*rho*dot(dot(grad(u_k), u_k), v)
 #           + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
 #           + theta*mu*inner(grad(u_k), grad(v))
 #           + (1-theta)*mu*inner(grad(u_n), grad(v))
-#           - p_k*div(v) + q*div(u_k) ) * dx_phys
+#           - p_k*div(v) + q*div(u_k) ),physical_domain) * dx_phys
+a_vol = ( rho*dot(du,v)/dt
+          + theta*rho*dot(dot(grad(u_k), du), v)
+          + theta*rho*dot(dot(grad(du), u_k), v)
+          + theta*mu*inner(grad(du), grad(v))
+          - dp*div(v) + q*div(du) ) * dx_phys
+
+r_vol = ( rho*dot(u_k-u_n, v)/dt
+          + theta*rho*dot(dot(grad(u_k), u_k), v)
+          + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
+          + theta*mu*inner(grad(u_k), grad(v))
+          + (1-theta)*mu*inner(grad(u_n), grad(v))
+          - p_k*div(v) + q*div(u_k) ) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
 penalty_val = 20
@@ -391,13 +391,13 @@ residual_form  = r_vol + R_int + stab
 
 
 
-# In[ ]:
+# In[13]:
 
 
 # !rm ~/.cache/pycutfem_jit/*
 
 
-# In[ ]:
+# In[14]:
 
 
 # from pycutfem.ufl.forms import assemble_form
@@ -405,13 +405,13 @@ residual_form  = r_vol + R_int + stab
 # print(np.linalg.norm(F, ord=np.inf))
 
 
-# In[ ]:
+# In[15]:
 
 
 mesh.edge_bitset('ghost').cardinality()
 
 
-# In[ ]:
+# In[16]:
 
 
 from pycutfem.io.vtk import export_vtk
