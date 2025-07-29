@@ -61,7 +61,7 @@ Re = rho * U_mean * D / mu
 print(f"Reynolds number (Re): {Re:.2f}")
 
 
-# In[ ]:
+# In[3]:
 
 
 from pycutfem.utils.adaptive_mesh import structured_quad_levelset_adaptive
@@ -157,11 +157,14 @@ bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
 # Tag velocity DOFs inside the cylinder (same tag name for both fields is OK)
 dof_handler.tag_dofs_from_element_bitset("inactive", "ux", "inside", strict=True)
 dof_handler.tag_dofs_from_element_bitset("inactive", "uy", "inside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "p", "inside", strict=True)
 
 bcs.append(BoundaryCondition('ux', 'dirichlet', 'inactive', lambda x, y: 0.0))
 bcs.append(BoundaryCondition('uy', 'dirichlet', 'inactive', lambda x, y: 0.0))
+bcs.append(BoundaryCondition('p', 'dirichlet', 'inactive', lambda x, y: 0.0))
 bcs_homog.append(BoundaryCondition('ux', 'dirichlet', 'inactive', lambda x, y: 0.0))
 bcs_homog.append(BoundaryCondition('uy', 'dirichlet', 'inactive', lambda x, y: 0.0))
+bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'inactive', lambda x, y: 0.0))
 
 
 # In[6]:
@@ -177,7 +180,7 @@ for name, bitset in mesh._edge_bitsets.items():
 
 
 
-# In[7]:
+# In[ ]:
 
 
 from pycutfem.io.visualization import plot_mesh_2
@@ -186,7 +189,7 @@ plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True,
               plot_nodes=False, elem_tags=False, edge_colors=True, plot_interface=False,resolution=300)
 
 
-# In[8]:
+# In[ ]:
 
 
 # ============================================================================
@@ -221,25 +224,25 @@ u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
 dof_handler.apply_bcs(bcs, u_n, p_n)
 
 
-# In[9]:
+# In[ ]:
 
 
 # u_n.plot()
 
 
-# In[10]:
+# In[ ]:
 
 
 print(len(dof_handler.get_dirichlet_data(bcs)))
 
 
-# In[11]:
+# In[ ]:
 
 
 len(dof_handler.get_dirichlet_data(bcs))
 
 
-# In[12]:
+# In[ ]:
 
 
 from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict
@@ -335,30 +338,30 @@ R_int = (
 ) * dΓ
 
 # volume ------------------------------------------------------------
-# a_vol = restrict(( rho*dot(du,v)/dt
-#           + theta*rho*dot(dot(grad(u_k), du), v)
-#           + theta*rho*dot(dot(grad(du), u_k), v)
-#           + theta*mu*inner(grad(du), grad(v))
-#           - dp*div(v) + q*div(du) ),physical_domain) * dx_phys
-
-# r_vol = restrict(( rho*dot(u_k-u_n, v)/dt
-#           + theta*rho*dot(dot(grad(u_k), u_k), v)
-#           + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
-#           + theta*mu*inner(grad(u_k), grad(v))
-#           + (1-theta)*mu*inner(grad(u_n), grad(v))
-#           - p_k*div(v) + q*div(u_k) ),physical_domain) * dx_phys
-a_vol = ( rho*dot(du,v)/dt
+a_vol = restrict(( rho*dot(du,v)/dt
           + theta*rho*dot(dot(grad(u_k), du), v)
           + theta*rho*dot(dot(grad(du), u_k), v)
           + theta*mu*inner(grad(du), grad(v))
-          - dp*div(v) + q*div(du) ) * dx_phys
+          - dp*div(v) + q*div(du) ),physical_domain) * dx_phys
 
-r_vol = ( rho*dot(u_k-u_n, v)/dt
+r_vol = restrict(( rho*dot(u_k-u_n, v)/dt
           + theta*rho*dot(dot(grad(u_k), u_k), v)
           + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
           + theta*mu*inner(grad(u_k), grad(v))
           + (1-theta)*mu*inner(grad(u_n), grad(v))
-          - p_k*div(v) + q*div(u_k) ) * dx_phys
+          - p_k*div(v) + q*div(u_k) ),physical_domain) * dx_phys
+# a_vol = ( rho*dot(du,v)/dt
+#           + theta*rho*dot(dot(grad(u_k), du), v)
+#           + theta*rho*dot(dot(grad(du), u_k), v)
+#           + theta*mu*inner(grad(du), grad(v))
+#           - dp*div(v) + q*div(du) ) * dx_phys
+
+# r_vol = ( rho*dot(u_k-u_n, v)/dt
+#           + theta*rho*dot(dot(grad(u_k), u_k), v)
+#           + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
+#           + theta*mu*inner(grad(u_k), grad(v))
+#           + (1-theta)*mu*inner(grad(u_n), grad(v))
+#           - p_k*div(v) + q*div(u_k) ) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
 penalty_val = 20
@@ -388,13 +391,13 @@ residual_form  = r_vol + R_int + stab
 
 
 
-# In[13]:
+# In[ ]:
 
 
 # !rm ~/.cache/pycutfem_jit/*
 
 
-# In[14]:
+# In[ ]:
 
 
 # from pycutfem.ufl.forms import assemble_form
@@ -402,13 +405,13 @@ residual_form  = r_vol + R_int + stab
 # print(np.linalg.norm(F, ord=np.inf))
 
 
-# In[15]:
+# In[ ]:
 
 
 mesh.edge_bitset('ghost').cardinality()
 
 
-# In[16]:
+# In[ ]:
 
 
 from pycutfem.io.vtk import export_vtk
@@ -554,7 +557,7 @@ def save_solution(funcs):
 
 
 
-# In[17]:
+# In[ ]:
 
 
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver

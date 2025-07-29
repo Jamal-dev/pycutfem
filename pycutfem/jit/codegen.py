@@ -635,6 +635,15 @@ class NumbaCodeGen:
                             f'        local_sum += {a.var_name}[k] * {b.var_name}[k, n]',
                             f'    {res_var}[n] = local_sum',
                         ]
+                    elif a.is_vector and b.is_gradient:
+                        # Case: grad(scalarFunction)->(k,), grad(Test)->(k,n,d) --> (n,)
+                        body_lines.append(f'# RHS: Inner(grad(scalarFunction), grad(Test)')
+                        body_lines += [
+                            f'n_locs = {b.shape[1]}; n_vec_comps = {a.shape[0]};',
+                            f'{res_var} = np.zeros((n_locs))',
+                            f'for n in range(n_locs):',
+                            f"    {res_var}[n] = np.sum({a.var_name} * {b.var_name}[:,n,:].copy())"
+                        ]
                     else:
                         raise NotImplementedError(f"Inner not implemented for roles {a.role}/{b.role}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}, is_gradient: {b.is_gradient},shapes: {a.shape}/{b.shape}")
                         
@@ -701,11 +710,15 @@ class NumbaCodeGen:
                     if a.shape[2] == b.shape[0]:
                         body_lines.append("# Symmetric term: dot(grad(Test), constant vector)")
                         body_lines += [
-                            f"n_vec_comps = {a.shape[0]}; n_locs = {a.shape[1]};n_spatial_dim = {a.shape[2]};",
-                            f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
-                            f"for k in range(n_vec_comps):",
-                            f"    for d in range(n_spatial_dim):",
-                            f"        {res_var}[k] += {a.var_name}[k, :, d] * {b.var_name}[d]",
+                                        # robust on ghost facets (pos/neg padding)
+                                        f"n_vec_comps   = {a.var_name}.shape[0];",
+                                        f"n_locs        = {a.var_name}.shape[1];",
+                                        f"n_spatial_dim = {a.var_name}.shape[2];",
+                                        f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
+                                        f"for k in range(n_vec_comps):",
+                                        f"    for d in range(n_spatial_dim):",
+                                        f"        {res_var}[k] += {a.var_name}[k, :, d] * {b.var_name}[d]",
+
                         ]
                         stack.append(StackItem(var_name=res_var, role='test',
                                             shape=(a.shape[0], a.shape[1]), is_vector=True,
@@ -719,7 +732,9 @@ class NumbaCodeGen:
                     if b.shape[0] == a.shape[2]:
                         body_lines.append("# Advection: dot(grad(Trial), constant beta vector)")
                         body_lines += [
-                            f"n_vec_comps = {a.shape[0]}; n_locs = {a.shape[1]};n_spatial_dim = {a.shape[2]};",
+                            f"n_vec_comps   = {a.var_name}.shape[0];",
+                            f"n_locs        = {a.var_name}.shape[1];",
+                            f"n_spatial_dim = {a.var_name}.shape[2];",
                             f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
                             f"for k in range(n_vec_comps):",
                             f"    for d in range(n_spatial_dim):",

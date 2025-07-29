@@ -199,82 +199,178 @@ class _IntegralKernel:
 def compile_multi(form, *, dof_handler, mixed_element,
                   quad_order: int | None = None, backend: str = "jit"):
     """
-    Compile **every** integral contained in *form* once and return a list of
-    _IntegralKernel objects.
-
-    Nothing else in pycutfem is modified, so the legacy “one integral at a
-    time” path keeps working untouched.
+    Compile every integral contained in *form* and return a list of
+    _IntegralKernel objects. Supports plain volume, cut volume (level set
+    with side), interface, and ghost-edge integrals.
     """
     from pycutfem.ufl.measures import Integral
     from pycutfem.ufl.forms    import Equation
     from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
-    from pycutfem.utils.domain_manager import get_domain_bitset
-    from pycutfem.core.dofhandler import DofHandler
     from pycutfem.ufl.compilers import FormCompiler
 
     kernels : list[_IntegralKernel] = []
     fc = FormCompiler(dof_handler, quadrature_order=quad_order, backend=backend)
 
-    # 0) normalise ----------------------------------------------------------
-    if isinstance(form, Equation):   # we normally pass jac == -res
+    # Normalize to a list of Integrals
+    if isinstance(form, Equation):   # (a, L)
         integrals = form.a.integrals + form.L.integrals
     elif isinstance(form, Integral):
         integrals = [form]
-    else:                            # Form
+    else:
         integrals = form.integrals
 
-    # 1) walk every integral exactly once ----------------------------------
     for intg in integrals:
-        dom = intg.measure.domain_type        # "volume", "interface", …
+        dom = intg.measure.domain_type           # "volume", "interface", "ghost_edge", ...
+        qdeg = fc._find_q_order(intg)
 
-        # ------------------------------ pre‑compute geometry & basis tables
+        # Compile the backend once; reuse for all subsets of this integral
+        runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element)
+
+        # ------------------------------------------------------------------
+        # VOLUME (plain or cut)
+        # ------------------------------------------------------------------
         if dom == "volume":
-            qdeg = fc._find_q_order(intg)
-            geom = dof_handler.precompute_geometric_factors(qdeg)
-            gdofs_map = np.vstack(
-                [dof_handler.get_elemental_dofs(e)
-                 for e in range(mixed_element.mesh.n_elements)]
-            ).astype(np.int32)
-
-        elif dom == "interface":
-            qdeg = fc._find_q_order(intg)
             level_set = intg.measure.level_set
-            cut_eids  = (intg.measure.defined_on
-                         or mixed_element.mesh.element_bitset("cut"))
-            geom = dof_handler.precompute_interface_factors(cut_eids,
-                                                            qdeg, level_set)
-            gdofs_map = np.vstack(
-                [dof_handler.get_elemental_dofs(e)
-                 for e in range(mixed_element.mesh.n_elements)]
-            ).astype(np.int32)
+            side      = intg.measure.metadata.get("side", "+")
+            mesh      = mixed_element.mesh
 
-        elif dom == "ghost_edge":
-            qdeg = fc._find_q_order(intg)
+            # ---- Plain volume (no level set) -----------------------------
+            if level_set is None:
+                geom = dof_handler.precompute_geometric_factors(qdeg)
+                gdofs_map = np.vstack([
+                    dof_handler.get_elemental_dofs(e)
+                    for e in range(mesh.n_elements)
+                ]).astype(np.int32)
+
+                static = {"gdofs_map": gdofs_map, **geom}
+                # Safety: ensure 'eids' exists (older helpers might omit it)
+                if "eids" not in static:
+                    static["eids"] = np.arange(mesh.n_elements, dtype=np.int32)
+
+                static.update(_build_jit_kernel_args(
+                    ir, intg.integrand, mixed_element, qdeg,
+                    dof_handler=dof_handler,
+                    gdofs_map   = gdofs_map,
+                    param_order = runner.param_order,
+                    pre_built   = geom,
+                ))
+                kernels.append(_IntegralKernel(runner, static, "volume"))
+                continue  # done with this integral
+
+            # ---- Cut volume (level set present) --------------------------
+            inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
+            full_ids = np.asarray(outside_ids if side == "+" else inside_ids,
+                                  dtype=np.int32)
+
+            # 1) FULL elements on the requested side
+            if full_ids.size:
+                # include level_set so 'phis' is present (may still be None)
+                geom_all = dof_handler.precompute_geometric_factors(qdeg, level_set)
+                geom_full = {
+                    "qp_phys": geom_all["qp_phys"][full_ids],
+                    "qw":      geom_all["qw"][full_ids],
+                    "detJ":    geom_all["detJ"][full_ids],
+                    "J_inv":   geom_all["J_inv"][full_ids],
+                    "normals": geom_all["normals"][full_ids],
+                    "phis":    None if geom_all["phis"] is None else geom_all["phis"][full_ids],
+                }
+                gdofs_map_full = np.vstack([
+                    dof_handler.get_elemental_dofs(e) for e in full_ids
+                ]).astype(np.int32)
+
+                static_full = {"gdofs_map": gdofs_map_full, **geom_full}
+                # IMPORTANT: provide 'eids' for the scatter step
+                static_full = {"gdofs_map": gdofs_map_full, "eids": full_ids, **geom_full}
+                static_full.update(_build_jit_kernel_args(
+                    ir, intg.integrand, mixed_element, qdeg,
+                    dof_handler=dof_handler,
+                    gdofs_map   = gdofs_map_full,
+                    param_order = runner.param_order,
+                    pre_built   = geom_full,
+                ))
+                kernels.append(_IntegralKernel(runner, static_full, "volume"))
+
+            # 2) CUT elements (clipped physical quadrature & per-element basis)
+            if len(cut_ids):
+                derivs = required_multi_indices(intg.integrand) | {(0, 0)}
+                cut_bs = intg.measure.defined_on or mesh.element_bitset("cut")
+
+                geom_cut = dof_handler.precompute_cut_volume_factors(
+                    cut_bs, qdeg, derivs, level_set, side=side
+                )
+                cut_eids = np.asarray(geom_cut.get("eids", []), dtype=np.int32)
+                if cut_eids.size:
+                    # ensure detJ exists (weights already physical)
+                    if "detJ" not in geom_cut:
+                        geom_cut["detJ"] = np.ones_like(geom_cut["qw"])
+
+                    gdofs_map_cut = np.vstack([
+                        dof_handler.get_elemental_dofs(e) for e in cut_eids
+                    ]).astype(np.int32)
+
+                    # geom_cut already carries 'eids'; keep it and pass through
+                    static_cut = {"gdofs_map": gdofs_map_cut, **geom_cut}
+                    # _build_jit_kernel_args won't overwrite per-element basis we provide
+                    static_cut.update(_build_jit_kernel_args(
+                        ir, intg.integrand, mixed_element, qdeg,
+                        dof_handler=dof_handler,
+                        gdofs_map   = gdofs_map_cut,
+                        param_order = runner.param_order,
+                        pre_built   = geom_cut,
+                    ))
+                    kernels.append(_IntegralKernel(runner, static_cut, "volume"))
+
+            # finished handling this integral (even if one subset was empty)
+            continue
+
+        # ------------------------------------------------------------------
+        # INTERFACE (cut edges/faces)
+        # ------------------------------------------------------------------
+        if dom == "interface":
             level_set = intg.measure.level_set
-            edges     = intg.measure.defined_on \
-                or mixed_element.mesh.edge_bitset("ghost")
-            derivs = required_multi_indices(intg.integrand)
-            geom = dof_handler.precompute_ghost_factors(edges, qdeg,
-                                                        level_set, derivs)
-            gdofs_map = geom["gdofs_map"]      # already the *union* map
+            cut_eids  = intg.measure.defined_on or mixed_element.mesh.element_bitset("cut")
+            geom = dof_handler.precompute_interface_factors(cut_eids, qdeg, level_set)
 
-        else:
-            raise NotImplementedError(f"d{dom} + JIT not wired yet")
+            # interface assembly still uses element-local maps; safe to use all
+            gdofs_map = np.vstack([
+                dof_handler.get_elemental_dofs(e)
+                for e in range(mixed_element.mesh.n_elements)
+            ]).astype(np.int32)
 
-        # ------------------------------ compile kernel itself -------------
-        runner, ir = fc._compile_backend(intg.integrand,
-                                         dof_handler, mixed_element)
+            static = {"gdofs_map": gdofs_map, **geom}
+            static.update(_build_jit_kernel_args(
+                ir, intg.integrand, mixed_element, qdeg,
+                dof_handler=dof_handler,
+                gdofs_map   = gdofs_map,
+                param_order = runner.param_order,
+                pre_built   = geom,
+            ))
+            kernels.append(_IntegralKernel(runner, static, "interface"))
+            continue
 
-        static = {"gdofs_map": gdofs_map, **geom}
-        # add only the *basis* tables this kernel really touches
-        static.update(_build_jit_kernel_args(
-            ir, intg.integrand, mixed_element, qdeg,
-            dof_handler=dof_handler,
-            gdofs_map   = gdofs_map,
-            param_order = runner.param_order,
-            pre_built   = geom,
-        ))
+        # ------------------------------------------------------------------
+        # GHOST EDGE (stabilization across a cut)
+        # ------------------------------------------------------------------
+        if dom == "ghost_edge":
+            level_set = intg.measure.level_set
+            edges     = intg.measure.defined_on or mixed_element.mesh.edge_bitset("ghost")
+            derivs    = required_multi_indices(intg.integrand)
 
-        kernels.append(_IntegralKernel(runner, static, dom))
+            geom = dof_handler.precompute_ghost_factors(edges, qdeg, level_set, derivs)
+            # ghost precompute returns the union dof map for each edge
+            gdofs_map = geom["gdofs_map"]
+
+            static = {"gdofs_map": gdofs_map, **geom}
+            static.update(_build_jit_kernel_args(
+                ir, intg.integrand, mixed_element, qdeg,
+                dof_handler=dof_handler,
+                gdofs_map   = gdofs_map,
+                param_order = runner.param_order,
+                pre_built   = geom,
+            ))
+            kernels.append(_IntegralKernel(runner, static, "ghost_edge"))
+            continue
+
+        raise NotImplementedError(f"{dom!r} integrals are not supported by JIT.")
 
     return kernels

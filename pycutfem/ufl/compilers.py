@@ -1844,10 +1844,19 @@ class FormCompiler:
         # --- 2) full elements on the selected side → standard volume tables sliced
         full_ids = np.asarray(outside_ids if side == '+' else inside_ids, dtype=np.int32)
         if full_ids.size:
-            geo_all = dh.precompute_geometric_factors(qdeg)  # (n_elem, n_q, …)
-            # slice only needed keys to reduce memory traffic
-            prebuilt_full = {k: geo_all[k][full_ids]
-                            for k in ("qp_phys", "qw", "detJ", "J_inv")}
+            # include level_set so 'phis' is populated (still fine if None)
+            geo_all = dh.precompute_geometric_factors(qdeg, level_set)
+
+            # slice what the kernel signature expects
+            prebuilt_full = {
+                "qp_phys": geo_all["qp_phys"][full_ids],
+                "qw":      geo_all["qw"][full_ids],
+                "detJ":    geo_all["detJ"][full_ids],
+                "J_inv":   geo_all["J_inv"][full_ids],
+                "normals": geo_all["normals"][full_ids],
+                # 'phis' may be None if level_set was None; keep it as None in that case
+                "phis":    None if geo_all["phis"] is None else geo_all["phis"][full_ids],
+            }
             _run_subset(full_ids, prebuilt_full)
 
         # --- 3) cut elements → clipped triangles (physical weights); detJ := 1

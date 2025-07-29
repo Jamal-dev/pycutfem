@@ -13,6 +13,9 @@ from pycutfem.core.levelset import AffineLevelSet
 from pycutfem.ufl.expressions import TrialFunction, TestFunction, Constant
 from pycutfem.ufl.measures import dx
 from pycutfem.ufl.forms import assemble_form
+from pycutfem.ufl.expressions import Function, inner, grad
+from pycutfem.solvers.nonlinear_solver import NewtonSolver, TimeStepperParameters
+
 
 # ---------------------------
 # Helpers
@@ -112,3 +115,115 @@ def test_levelset_matches_fitted_when_interface_aligned(backend):
 
     assert np.isclose(area_ls, fitted_area, atol=5e-6, rtol=1e-6)
     assert np.isclose(area_ls, 0.5, atol=5e-6, rtol=1e-6)
+
+
+# ----------------------------------------------------------------------
+# Newton-solver tests for cut-volume assembly (JIT backend)
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("side", ['+', '-'])
+def test_newton_mass_projection_on_cut_domain(side):
+    """
+    Linear mass problem on a single cut cell:
+        Find u such that  ∫_{Ω_side} u v dx = ∫_{Ω_side} 1·v dx.
+    Exact solution in CG space is u ≡ 1, so Newton converges in one step.
+    This validates the cut-volume path in compile_multi used by Newton.
+    """
+    # Single element mesh on [0,1]x[0,1]
+    nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
+    mesh = Mesh(nodes, element_connectivity=elems, elements_corner_nodes=corners,
+                poly_order=1, element_type='quad')
+
+    # Linear cut: phi(x,y) = x - alpha (cuts the single quad)
+    alpha = 0.37
+    phi = AffineLevelSet(1.0, 0.0, -alpha)
+
+    me = MixedElement(mesh, field_specs={'u': 1})
+    dh = DofHandler(me, method='cg')
+
+    # Unknown and test/trial symbols
+    u_k  = Function(name= 'u_k', field_name='u', dof_handler=dh)
+    v  = TestFunction(field_name='u', dof_handler=dh)
+    u = TrialFunction(field_name='u', dof_handler=dh)
+
+    # Measure restricted to the chosen side of the cut
+    meas = dx(level_set=phi, metadata={'side': side})
+
+    # Residual and Jacobian forms (linear problem)
+    residual_form = (u_k * v - Constant(1.0) * v) * meas
+    jacobian_form = (u * v) * meas
+
+    # Newton driver (JIT backend; no BCs needed for pure mass on a single element)
+    solver = NewtonSolver(
+        residual_form, jacobian_form,
+        dof_handler=dh, mixed_element=me,
+        bcs=[], bcs_homog=[],
+        backend='jit',
+    )
+
+    # Initial/previous states
+    u_prev = Function(name='u_n', field_name='u', dof_handler=dh)
+    u_prev.nodal_values[:] = 0.0
+    u_k.nodal_values[:] = 0.0
+
+    # One pseudo-time step is enough for a linear system
+    delta, nsteps, _elapsed = solver.solve_time_interval(
+        functions=[u_k], prev_functions=[u_prev],
+        time_params=TimeStepperParameters(dt=1.0, max_steps=1, stop_on_steady=True),
+    )
+
+    # Expect the nodal solution to be (close to) 1.0 everywhere
+    assert np.allclose(u_k.nodal_values, 1.0, atol=1e-10, rtol=0.0)
+
+    # Residual at the solution should be ~ 0
+    # (assemble residual only, no need for the Jacobian here)
+    R_only = solver._assemble_system({'u_k': u_k, 'u_n': u_prev}, need_matrix=False)[1]
+    assert np.linalg.norm(R_only, np.inf) < 1e-11
+
+
+@pytest.mark.parametrize("side", ['+', '-'])
+def test_newton_helmholtz_on_cut_domain(side):
+    """
+    Helmholtz-type linear problem on a cut cell:
+        ∫_{Ω_side} (∇u·∇v + u v) dx = ∫_{Ω_side} 1·v dx.
+    This touches the gradient tables in the cut-volume precompute.
+    We assert that Newton drives the residual below a tight tolerance.
+    """
+    # Mesh & cut as above
+    nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=1, ny=1, poly_order=1)
+    mesh = Mesh(nodes, element_connectivity=elems, elements_corner_nodes=corners,
+                poly_order=1, element_type='quad')
+    phi = AffineLevelSet(1.0, 0.0, -0.41)
+
+    me = MixedElement(mesh, field_specs={'u': 1})
+    dh = DofHandler(me, method='cg')
+
+    u_k  = Function(name='u_k',field_name='u', dof_handler=dh)
+    v  = TestFunction(field_name='u', dof_handler=dh)
+    u = TrialFunction(field_name='u', dof_handler=dh)
+
+    meas = dx(level_set=phi, metadata={'side': side})
+
+    # Residual/Jacobian
+    residual_form = (inner(grad(u_k), grad(v)) + u_k * v - Constant(1.0) * v) * meas
+    jacobian_form = (inner(grad(u), grad(v)) + u * v) * meas
+
+    solver = NewtonSolver(
+        residual_form, jacobian_form,
+        dof_handler=dh, mixed_element=me,
+        bcs=[], bcs_homog=[],
+        backend='jit',
+    )
+
+    # Start from zero; a few Newton iterations suffice (linear system)
+    u_prev = Function(name='u_n', field_name='u', dof_handler=dh)
+    u_prev.nodal_values[:] = 0.0
+    u_k.nodal_values[:] = 0.0
+
+    delta, nsteps, _elapsed = solver.solve_time_interval(
+        functions=[u_k], prev_functions=[u_prev],
+        time_params=TimeStepperParameters(dt=1.0, max_steps=1, stop_on_steady=True),
+    )
+
+    # Check the assembled residual at the solution
+    _, R = solver._assemble_system({'u_k': u_k, 'u_n': u_prev}, need_matrix=False)
+    assert np.linalg.norm(R, np.inf) < 1e-9

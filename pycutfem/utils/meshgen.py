@@ -28,15 +28,31 @@ def delaunay_rectangle(length: float, height: float, nx: int = 10, ny: int = 10)
             t[1], t[2] = t[2], t[1]
     return pts, elems
 
-def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int):
+def _translate_nodes(nodes: List[Node], offset: Tuple[float, float]):
+    """Translates all nodes by a given offset vector."""
+    tx, ty = offset
+    if not nodes:
+        return
+    # It's more efficient to modify a numpy array of coordinates
+    # and then update the node objects.
+    coords = np.array([[node.x, node.y] for node in nodes])
+    coords[:, 0] += tx
+    coords[:, 1] += ty
+    for i, node in enumerate(nodes):
+        node.x = coords[i, 0]
+        node.y = coords[i, 1]
+
+def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int, 
+                    offset: Optional[Tuple[float, float]] = None):
     """
     Main wrapper for generating structured quadrilateral meshes.
     Returns raw data: node objects, element connectivity, edge connectivity,
     and corner node connectivity for each element.
     """
-    return _structured_qn(Lx, Ly, nx, ny, poly_order)
+    return _structured_qn(Lx, Ly, nx, ny, poly_order, offset)
 
-def _structured_qn(Lx: float, Ly: float, nx: int, ny: int, order: int):
+def _structured_qn(Lx: float, Ly: float, nx: int, ny: int, order: int, 
+                   offset: Optional[Tuple[float, float]] = None) -> Tuple[List[Node], np.ndarray, np.ndarray, np.ndarray]:
     """
     Generates raw data for a structured quadrilateral mesh of Qn elements.
 
@@ -112,19 +128,21 @@ def _structured_qn(Lx: float, Ly: float, nx: int, ny: int, order: int):
             unique_edges.add(tuple(sorted((corners[3], corners[0])))) # Left
 
     edges = np.array(list(unique_edges), dtype=int)
+    if offset is not None:
+        _translate_nodes(nodes, offset)
     return nodes, elements, edges, elements_corner_nodes
 
 
-def structured_triangles(Lx: float, Ly: float, *, nx_quads: int, ny_quads: int, poly_order: int):
+def structured_triangles(Lx: float, Ly: float, *, nx_quads: int, ny_quads: int, poly_order: int, offset: Optional[Tuple[float, float]] = None):
     """
     Main wrapper for generating structured triangular meshes.
     Returns raw data: node objects, element connectivity, edge connectivity,
     and corner node connectivity.
     """
-    return _structured_pk(Lx, Ly, nx_quads, ny_quads, poly_order)
+    return _structured_pk(Lx, Ly, nx_quads, ny_quads, poly_order, offset=offset)
 
 
-def _structured_pk(Lx: float, Ly: float, nx_base_quads: int, ny_base_quads: int, order_k: int):
+def _structured_pk(Lx: float, Ly: float, nx_base_quads: int, ny_base_quads: int, order_k: int, offset: Optional[Tuple[float, float]] = None):
     """
     Generates raw data for a structured triangular mesh of Pk elements.
     """
@@ -201,6 +219,8 @@ def _structured_pk(Lx: float, Ly: float, nx_base_quads: int, ny_base_quads: int,
                 elem_idx_counter += 1
                 
     edges = np.array(list(unique_edges), dtype=int)
+    if offset is not None:
+        _translate_nodes(nodes, offset)
     return nodes, elements, edges, elements_corner_nodes
 
 

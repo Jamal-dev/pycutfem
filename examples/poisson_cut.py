@@ -29,7 +29,7 @@ from pycutfem.core.levelset import CircleLevelSet
 # --- UFL-like imports ---
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction,
-    Function, Constant, grad, inner, dot, jump, FacetNormal, CellDiameter
+    Function, Constant, grad, inner, dot, jump, FacetNormal, CellDiameter, Derivative
 )
 from pycutfem.ufl.measures import dx, dGhost, dInterface
 from pycutfem.ufl.forms import Equation, assemble_form, BoundaryCondition
@@ -70,7 +70,7 @@ def run_step85():
     # ========================================================================
     #    2. CONVERGENCE LOOP
     # ========================================================================
-    n_refinements = 2
+    n_refinements = 4
     convergence_data = []
 
     for cycle in range(n_refinements):
@@ -148,6 +148,20 @@ def run_step85():
         g = Constant(bc_val)
         n = FacetNormal()
         h = CellDiameter()
+        n = FacetNormal()                    # vector expression (n_x, n_y)
+
+        def _dn(expr):
+            """Normal derivative  n·∇expr  on an (interior) edge."""
+            return n[0] * Derivative(expr, 1, 0) + n[1] * Derivative(expr, 0, 1)
+            # return dot(grad(expr), n)
+
+        def grad_inner(u, v):
+            """⟨∂ₙu, ∂ₙv⟩  (scalar or 2‑D vector)."""
+            if getattr(u, "num_components", 1) == 1:      # scalar
+                return _dn(u) * _dn(v)
+
+            if u.num_components == v.num_components == 2: # vector
+                return _dn(u[0]) * _dn(v[0]) + _dn(u[1]) * _dn(v[1])
         gamma_N = Constant(nitsche_parameter)
         gamma_G = Constant(ghost_parameter)
 
@@ -165,8 +179,7 @@ def run_step85():
         # --- Ghost penalty stabilization term ---
         # This term corresponds to: 0.5 * γ_G * h * jump(n·∇u) * jump(n·∇v)
         a_stabilization = (0.5 * gamma_G * h *
-                           jump(dot(grad(u), n)) *
-                           jump(dot(grad(v), n)) * dGhost_stab)
+                           grad_inner(jump(u),jump(v))* dGhost_stab)
         a += a_stabilization
 
         # --- Linear form L(v) ---
@@ -246,7 +259,7 @@ def run_step85():
             for loc_tri in tri_local:
                 v_ids = [corner_ids[i] for i in loc_tri]
                 v_coords = mesh.nodes_x_y_pos[v_ids]
-                v_phi = np.array([level_set(xy[0], xy[1]) for xy in v_coords])
+                v_phi = np.array([level_set(np.asarray(xy)) for xy in v_coords])
 
                 # Integrate on the physical side (phi < 0)
                 polygons = clip_triangle_to_side(v_coords, v_phi, side='-')

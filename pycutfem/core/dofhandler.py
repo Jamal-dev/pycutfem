@@ -1,6 +1,8 @@
 # dofhandler.py
 
 from __future__ import annotations
+
+from matplotlib.pylab import f
 import numpy as np
 from typing import Dict, List, Set, Tuple, Callable, Mapping, Iterable, Union, Any, Sequence
 import math
@@ -18,6 +20,8 @@ from pycutfem.integration.quadrature import line_quadrature
 from pycutfem.ufl.helpers_geom import (
     phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
 )
+from pycutfem.utils.bitset import BitSet
+
 
 
 BcLike = Union[BoundaryCondition, Mapping[str, Any]]
@@ -31,6 +35,40 @@ def _hash_subset(ids: Sequence[int]) -> int:
     h = blake2b(digest_size=8)
     h.update(np.asarray(sorted(ids), dtype=np.int32).tobytes())
     return int.from_bytes(h.digest(), "little")
+def _resolve_elem_selection(elem_sel, mesh) -> set[int]:
+    """
+    Normalize various 'element selection' inputs into a set[int] of element ids.
+
+    Accepts:
+      - BitSet:           returns indices where mask is True
+      - str (tag name):   looks up mesh element bitset by tag (e.g., 'inside')
+      - np.ndarray[bool]: uses truthy positions
+      - Iterable[int]:    coerces to ints
+    """
+    # 1) Direct BitSet
+    if isinstance(elem_sel, BitSet):
+        return set(map(int, elem_sel.to_indices()))      # BitSet → indices
+
+    # 2) Named tag on this mesh (e.g., 'inside', 'outside', 'cut', or your custom)
+    if isinstance(elem_sel, str):
+        bs = mesh.element_bitset(elem_sel)               # O(1) if cached
+        return set(map(int, bs.to_indices()))            # BitSet → indices
+
+    # 3) Boolean numpy mask
+    if hasattr(elem_sel, "__array__"):
+        arr = np.asarray(elem_sel)
+        if arr.dtype == bool:
+            return set(np.flatnonzero(arr))
+        # fall through: treat non-bool arrays as list of ids
+
+    # 4) Generic iterable of ids
+    try:
+        return set(map(int, elem_sel))
+    except TypeError as exc:
+        raise TypeError(
+            "elem_sel must be BitSet, str tag, boolean mask, or iterable of ints"
+        ) from exc
+
 
 # -----------------------------------------------------------------------------
 #  Main class
@@ -630,6 +668,9 @@ class DofHandler:
         Returns:
             Dict[str, np.ndarray]: A dictionary of pre-computed arrays.
         """
+        print("-" * 80)
+        print(f"Precomputing geometric factors with quad_order={quad_order}...")
+        print("-" * 80)
         if self.mixed_element is None:
             raise RuntimeError("This method requires a MixedElement-backed DofHandler.")
 
@@ -673,7 +714,7 @@ class DofHandler:
                 qw_scaled[e_idx, q_idx] = qw * det_J_val
 
                 if level_set:
-                    phis[e_idx, q_idx] = level_set(x_phys, y_phys)
+                    phis[e_idx, q_idx] = level_set(np.asarray([x_phys, y_phys]))
 
         # 4. Return results in a dictionary for easy use
         return {
@@ -723,6 +764,9 @@ class DofHandler:
             corresponding to the order of `cut_element_ids`. Keys include:
             'eids', 'qp_phys', 'qw', 'normals', 'phis', 'detJ', 'J_inv'.
         """
+        print("-" * 80)
+        print(f"Precomputing interface factors for {len(cut_element_ids)} cut elements with qdeg={qdeg}...")
+        print("-" * 80)
 
         mesh = self.mixed_element.mesh
         ids = cut_element_ids.to_indices() if hasattr(cut_element_ids, "to_indices") else list(cut_element_ids)
@@ -832,6 +876,9 @@ class DofHandler:
         is valid for *both* CG and DG discretisations, regardless of how many
         fields or blocks you mix.
         """
+        print("-" * 80)
+        print(f"Precomputing ghost factors for {len(ghost_edge_ids)} edges with qdeg={qdeg} and derivs={derivs}")
+        print("-" * 80)
         derivs = derivs | {(0, 0)}
         mesh        = self.mixed_element.mesh
         me          = self.mixed_element
@@ -991,6 +1038,9 @@ class DofHandler:
         `precompute_ghost_factors` :contentReference[oaicite:0]{index=0} but with only **one**
         element (the left owner) and no ‘neg/pos’ bookkeeping.
         """
+        print("-" * 80)
+        print(f"Precomputing boundary factors for {len(edge_ids)} edges with qdeg={qdeg} and derivs={derivs}")
+        print("-" * 80)
         mesh   = self.mixed_element.mesh
         me     = self.mixed_element
         fields = me.field_names
@@ -1091,6 +1141,9 @@ class DofHandler:
         Provides 'qp_phys', 'qw', 'J_inv', 'detJ' (ones), 'normals' (zeros), 'phis',
         and basis tables 'b_<field>', 'g_<field>' (+ 'd{dx}{dy}_{field}' if requested).
         """
+        print("-" * 80)
+        print(f"Precomputing cut volume factors for {len(element_bitset)} elements with qdeg={qdeg} and side='{side}'")
+        print("-" * 80)
         import numpy as np
         from pycutfem.integration.quadrature import volume as tri_volume_rule
         from pycutfem.fem import transform
@@ -1183,16 +1236,27 @@ class DofHandler:
             phi_chunks.append(np.asarray(phi_elem, dtype=float))     # (n_q,)
 
             # finalize per-element basis arrays → (n_q, n_loc)
+            # finalize per-element basis arrays
             for key, rows in per_elem_basis.items():
-                basis_lists.setdefault(key, []).append(np.vstack(rows).astype(float))
+                arr0 = rows[0]
+                if arr0.ndim == 1:                # b_<field>, d{dx}{dy}_<field> → (n_q, n_loc)
+                    arr = np.vstack(rows).astype(float)
+                elif arr0.ndim == 2:              # g_<field> rows are (n_loc, 2) → stack to (n_q, n_loc, 2)
+                    arr = np.stack(rows, axis=0).astype(float)
+                else:
+                    raise ValueError(f"Unexpected rank for {key}: {arr0.shape}")
+                basis_lists.setdefault(key, []).append(arr)
+
 
         if not valid_eids:
+            raise ValueError("No valid cut elements found in the provided element IDs.")
             return {
                 "eids": np.array([], dtype=np.int32),
                 "qp_phys": np.empty((0,0,2)), "qw": np.empty((0,0)),
                 "J_inv": np.empty((0,0,2,2)), "detJ": np.empty((0,0)),
                 "normals": np.empty((0,0,2)), "phis": np.empty((0,0)),
             }
+        else: print(f"Found {len(valid_eids)} valid cut elements for cut volume.")
 
         # --- pad ragged → dense (n_cut, max_q, …) -------------------------------
         def _pad2(list_of_2d, fill=0.0):
@@ -1219,6 +1283,16 @@ class DofHandler:
             for i, a in enumerate(list_of_3d):
                 out[i, :a.shape[0], :, :] = a
             return out
+        def _pad3(list_of_3d, fill=0.0):
+            n = len(list_of_3d)
+            m = max(a.shape[0] for a in list_of_3d)   # max_q
+            p = list_of_3d[0].shape[1]                # n_loc
+            d = list_of_3d[0].shape[2]                # dim (2 in 2D)
+            out = np.full((n, m, p, d), fill, dtype=float)
+            for i, a in enumerate(list_of_3d):
+                out[i, :a.shape[0], :a.shape[1], :a.shape[2]] = a
+            return out
+
 
         qp_phys = _pad2(qp_chunks, 0.0)
         qw      = _pad1(qw_chunks,  0.0)
@@ -1241,10 +1315,76 @@ class DofHandler:
         }
         # stitch basis tables (key → (n_cut, max_q, n_loc))
         for key, seq in basis_lists.items():
-            out[key] = _pad2(seq, 0.0)
+            if not seq:
+                continue
+            arr0 = seq[0]
+            if arr0.ndim == 3:           # g_<field>: (n_q, n_loc, 2)
+                out[key] = _pad3(seq, 0.0)
+            elif arr0.ndim == 2:         # b_<field>, d{dx}{dy}_<field>: (n_q, n_loc)
+                out[key] = _pad2(seq, 0.0)
+            elif arr0.ndim == 1:         # (unlikely here, but safe)
+                out[key] = _pad1(seq, 0.0)
+            else:
+                raise ValueError(f"Unexpected rank for {key}: {arr0.shape}")
+
 
         return out
 
+    def tag_dofs_from_element_bitset(
+        self,
+        tag: str,
+        field: str,
+        elem_sel,                 # ← BitSet | str | bool mask | Iterable[int]
+        *,
+        strict: bool = True,
+    ) -> set[int]:
+        if field not in self.field_names:
+            raise ValueError(f"Unknown field '{field}', choose from {self.field_names}")
+
+        mesh = self.fe_map[field]
+
+        # --- clean resolution of element ids
+        inside_eids = _resolve_elem_selection(elem_sel, mesh)
+
+        # --- DG: tag all DOFs from those elements directly
+        if getattr(self, "_dg_mode", False):
+            elem_maps = self.element_maps[field]
+            nE = len(elem_maps)
+            dofs = set()
+            for eid in inside_eids:
+                if 0 <= eid < nE:
+                    dofs.update(elem_maps[eid])
+            self.dof_tags.setdefault(tag, set()).update(dofs)
+            return dofs
+
+        # --- CG: candidate nodes = union of nodes from the selected elements
+        candidate_nodes: set[int] = set()
+        for eid in inside_eids:
+            el = mesh.elements_list[eid]
+            candidate_nodes.update(el.nodes)
+
+        if strict:
+            # Build node → {adjacent eids} once, then keep only nodes whose
+            # adjacent elements are all in 'inside_eids'
+            node_to_elems: dict[int, set[int]] = {}
+            for el in mesh.elements_list:
+                for nid in el.nodes:
+                    node_to_elems.setdefault(nid, set()).add(el.id)
+
+            inside_eids_set = set(inside_eids)
+            nodes = {
+                nid for nid in candidate_nodes
+                if node_to_elems.get(nid, set()).issubset(inside_eids_set)
+            }
+        else:
+            nodes = candidate_nodes
+
+        # Map nodes → DOFs for this field
+        node_to_dof = self.dof_map[field]
+        dofs = {node_to_dof[nid] for nid in nodes if nid in node_to_dof}
+
+        self.dof_tags.setdefault(tag, set()).update(dofs)
+        return dofs
 
 
 
