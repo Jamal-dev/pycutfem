@@ -69,7 +69,7 @@ def run_step85_newton():
     # ========================================================================
     #    2. CONVERGENCE LOOP
     # ========================================================================
-    n_refinements = 3
+    n_refinements = 4
     convergence_data = []
 
     for cycle in range(n_refinements):
@@ -139,8 +139,8 @@ def run_step85_newton():
         
         # --- NEW: Define solution Function and Trial/Test Functions ---
         u_k = Function(name="u_k", field_name="u", dof_handler=dof_handler) # Current Newton iterate
-        du  = TrialFunction('u', dof_handler=dof_handler)                  # Newton update direction
-        v   = TestFunction('u', dof_handler=dof_handler)                   # Test function
+        du  = TrialFunction(name="du", field_name='u', dof_handler=dof_handler)                  # Newton update direction
+        v   = TestFunction(name="v", field_name='u', dof_handler=dof_handler)                   # Test function
 
         # --- Symbolic constants and helpers ---
         f = Constant(rhs_val)
@@ -165,16 +165,16 @@ def run_step85_newton():
         gamma_G = Constant(ghost_parameter)
 
         # --- Define integration measures ---
-        dx_phys = dx(defined_on=physical_domain, level_set=level_set, metadata={'side': '-'})
-        dGamma = dInterface(defined_on=cut_domain, level_set=level_set, metadata={"q": fe_degree + 2})
-        dGhost_stab = dGhost(defined_on=ghost_domain, level_set=level_set, metadata={"q": fe_degree + 2})
+        dx_phys = dx(defined_on=physical_domain, level_set=level_set, metadata={'side': '-',"q": fe_degree + 2})
+        dGamma = dInterface(defined_on=cut_domain, level_set=level_set, metadata={"q": fe_degree + 3})
+        dGhost_stab = dGhost(defined_on=ghost_domain, level_set=level_set, metadata={"q": fe_degree + 3})
 
         # --- NEW: Define Residual Form R(u_k, v) ---
         # This is equivalent to a(u_k, v) - L(v) = 0
         residual = (
             # Volume terms
             inner(grad(u_k), grad(v)) * dx_phys
-            - f * v * dx_phys
+            -f * v * dx_phys
             # Nitsche terms for BC
             - dot(grad(u_k), n) * v * dGamma
             - dot(grad(v), n) * (u_k - g) * dGamma
@@ -219,9 +219,11 @@ def run_step85_newton():
         time_params = TimeStepperParameters(dt=dt.value ,
                                             stop_on_steady=False, 
                                             max_steps = 1)
+        u_k_prev = Function(name="u_k_prev", field_name="u", dof_handler=dof_handler)
+        u_k_prev.nodal_values[:] = 0.0
         solver.solve_time_interval(
             functions=[u_k],
-            prev_functions=[u_k], # For steady state, prev_functions is not used but required
+            prev_functions=[u_k_prev], # For steady state, prev_functions is not used but required
             time_params=time_params
         )
 
@@ -252,7 +254,7 @@ def run_step85_newton():
         qp_ref, qw_ref = volume(mesh.element_type, q_order_err)
         for eid in mesh.element_bitset("inside").to_indices():
             gdofs = dof_handler.get_elemental_dofs(eid)
-            u_loc = solution_vec[gdofs]
+            u_loc = u_k.get_nodal_values(gdofs)
             for (xi, eta), w in zip(qp_ref, qw_ref):
                 J = transform.jacobian(mesh, eid, (xi, eta))
                 detJ = abs(np.linalg.det(J))
@@ -267,7 +269,7 @@ def run_step85_newton():
             elem = mesh.elements_list[eid]
             tri_local, corner_ids = corner_tris(mesh, elem)
             gdofs = dof_handler.get_elemental_dofs(eid)
-            u_loc = solution_vec[gdofs]
+            u_loc = u_k.get_nodal_values(gdofs)
 
             for loc_tri in tri_local:
                 v_ids = [corner_ids[i] for i in loc_tri]

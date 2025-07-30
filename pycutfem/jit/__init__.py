@@ -358,7 +358,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
             # interface assembly still uses element-local maps; safe to use all
             gdofs_map = np.vstack([
                 dof_handler.get_elemental_dofs(e)
-                for e in range(mixed_element.mesh.n_elements)
+                for e in geom["eids"]
             ]).astype(np.int32)
 
             static = {"gdofs_map": gdofs_map, **geom}
