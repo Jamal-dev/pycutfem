@@ -77,11 +77,11 @@ class DofHandler:
     """Centralised DOF numbering and boundary‑condition helpers."""
 
     # .........................................................................
-    def __init__(self, fe_space: Union[Dict[str, Mesh], 'MixedElement'], method: str = "cg"):
+    def __init__(self, fe_space: Union[Dict[str, Mesh], 'MixedElement'], method: str = "cg",DEBUG = False):
         if method not in {"cg", "dg"}:
             raise ValueError("method must be 'cg' or 'dg'")
         self.method: str = method
-        
+        self.DEBUG: bool = DEBUG
         # This will store tags for specific DOFs, e.g., {'pressure_pin': {123}}
         self.dof_tags: Dict[str, Set[int]] = {}
         # This will map a global DOF index back to its (field, node_id) origin
@@ -668,9 +668,10 @@ class DofHandler:
         Returns:
             Dict[str, np.ndarray]: A dictionary of pre-computed arrays.
         """
-        print("-" * 80)
-        print(f"Precomputing geometric factors with quad_order={quad_order}...")
-        print("-" * 80)
+        if self.DEBUG:
+            print("-" * 80)
+            print(f"Precomputing geometric factors with quad_order={quad_order}...")
+            print("-" * 80)
         if self.mixed_element is None:
             raise RuntimeError("This method requires a MixedElement-backed DofHandler.")
 
@@ -764,9 +765,10 @@ class DofHandler:
             corresponding to the order of `cut_element_ids`. Keys include:
             'eids', 'qp_phys', 'qw', 'normals', 'phis', 'detJ', 'J_inv'.
         """
-        print("-" * 80)
-        print(f"Precomputing interface factors for {len(cut_element_ids)} cut elements with qdeg={qdeg}...")
-        print("-" * 80)
+        if self.DEBUG:
+            print("-" * 80)
+            print(f"Precomputing interface factors for {len(cut_element_ids)} cut elements with qdeg={qdeg}...")
+            print("-" * 80)
 
         mesh = self.mixed_element.mesh
         ids = cut_element_ids.to_indices() if hasattr(cut_element_ids, "to_indices") else list(cut_element_ids)
@@ -876,9 +878,10 @@ class DofHandler:
         is valid for *both* CG and DG discretisations, regardless of how many
         fields or blocks you mix.
         """
-        print("-" * 80)
-        print(f"Precomputing ghost factors for {len(ghost_edge_ids)} edges with qdeg={qdeg} and derivs={derivs}")
-        print("-" * 80)
+        if self.DEBUG:
+            print("-" * 80)
+            print(f"Precomputing ghost factors for {len(ghost_edge_ids)} edges with qdeg={qdeg} and derivs={derivs}")
+            print("-" * 80)
         derivs = derivs | {(0, 0)}
         mesh        = self.mixed_element.mesh
         me          = self.mixed_element
@@ -1038,9 +1041,10 @@ class DofHandler:
         `precompute_ghost_factors` :contentReference[oaicite:0]{index=0} but with only **one**
         element (the left owner) and no ‘neg/pos’ bookkeeping.
         """
-        print("-" * 80)
-        print(f"Precomputing boundary factors for {len(edge_ids)} edges with qdeg={qdeg} and derivs={derivs}")
-        print("-" * 80)
+        if self.DEBUG:
+            print("-" * 80)
+            print(f"Precomputing boundary factors for {len(edge_ids)} edges with qdeg={qdeg} and derivs={derivs}")
+            print("-" * 80)
         mesh   = self.mixed_element.mesh
         me     = self.mixed_element
         fields = me.field_names
@@ -1141,9 +1145,10 @@ class DofHandler:
         Provides 'qp_phys', 'qw', 'J_inv', 'detJ' (ones), 'normals' (zeros), 'phis',
         and basis tables 'b_<field>', 'g_<field>' (+ 'd{dx}{dy}_{field}' if requested).
         """
-        print("-" * 80)
-        print(f"Precomputing cut volume factors for {len(element_bitset)} elements with qdeg={qdeg} and side='{side}'")
-        print("-" * 80)
+        if self.DEBUG:
+            print("-" * 80)
+            print(f"Precomputing cut volume factors for {len(element_bitset)} elements with qdeg={qdeg} and side='{side}'")
+            print("-" * 80)
         import numpy as np
         from pycutfem.integration.quadrature import volume as tri_volume_rule
         from pycutfem.fem import transform
@@ -1386,6 +1391,129 @@ class DofHandler:
         self.dof_tags.setdefault(tag, set()).update(dofs)
         return dofs
 
+
+    def l2_error_on_side(
+        self,
+        functions,                      # VectorFunction, Function, or dict[str, Function]
+        exact: dict[str, callable],     # e.g. {'ux': u_ex_x, 'uy': u_ex_y, 'p': p_ex}
+        level_set,                      # φ(x,y) callable
+        side: str = '-',                # '-' → φ<0  (inside),  '+' → φ>0 (outside)
+        quad_order: int | None = None,
+        fields: list[str] | None = None,
+        relative: bool = False,
+    ) -> float:
+        """
+        L2-norm of specified fields over Ω_side := Ω ∩ { φ ▷ 0 }, with ▷='<' if side='-', or '>' if side='+'.
+
+        * Fast pure-Python path:
+        - full elements: standard reference quadrature + detJ
+        - cut elements : clip corner-triangles and integrate physical sub-tris (weights already physical)
+        * 'functions' can be a VectorFunction, a single Function, or a dict {'ux': Fun, 'uy': Fun, ...}.
+        * 'exact' supplies exact scalar callables per field to compare against.
+        """
+        import numpy as np
+        from pycutfem.fem import transform
+        from pycutfem.integration.quadrature import volume as vol_rule
+        from pycutfem.ufl.helpers_geom import (
+            corner_tris, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, phi_eval
+        )
+
+        mesh = self.mixed_element.mesh
+        me   = self.mixed_element
+        qdeg = quad_order or (2 * mesh.poly_order + 2)
+
+        # --------------- normalize 'functions' → dict[field]->Function -------------
+        from pycutfem.ufl.expressions import Function, VectorFunction
+        field_funcs: dict[str, Function] = {}
+
+        if isinstance(functions, dict):
+            field_funcs = functions
+        elif isinstance(functions, VectorFunction):
+            for name, comp in zip(functions.field_names, functions.components):
+                field_funcs[name] = comp
+        elif isinstance(functions, (list, tuple)) and functions and isinstance(functions[0], VectorFunction):
+            vf = functions[0]
+            for name, comp in zip(vf.field_names, vf.components):
+                field_funcs[name] = comp
+            for extra in functions[1:]:
+                if isinstance(extra, Function):
+                    field_funcs[extra.field_name] = extra
+        elif isinstance(functions, Function):
+            field_funcs[functions.field_name] = functions
+        else:
+            raise TypeError("'functions' must be a Function, VectorFunction, or dict[str, Function]")
+
+        # which fields to include in the error
+        if fields is None:
+            fields = [f for f in me.field_names if f in exact]
+
+        # accumulators
+        err2, base2 = 0.0, 0.0
+
+        # ---------------------------- classify elements ----------------------------
+        inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)  # fills element tags too
+        full_eids = outside_ids if side == '+' else inside_ids
+
+        # -------------------------- (A) full elements on side ----------------------
+        qp_ref, qw_ref = vol_rule(mesh.element_type, qdeg)
+        for eid in full_eids:
+            # per‑field local dofs for this element (avoids mixing fields)
+            gdofs_f = {fld: self.element_maps[fld][eid] for fld in fields}
+            for (xi, eta), w in zip(qp_ref, qw_ref):
+                J    = transform.jacobian(mesh, eid, (xi, eta))
+                detJ = abs(np.linalg.det(J))
+                x, y = transform.x_mapping(mesh, eid, (xi, eta))
+
+                for fld in fields:
+                    # MixedElement.basis returns a zero‑padded vector → slice to the field’s block
+                    # slice to the field block → local basis of size n_loc(fld) (e.g., 9)
+                    phi_f = me.basis(fld, xi, eta)[me.slice(fld)]
+                    uh    = float(field_funcs[fld].get_nodal_values(gdofs_f[fld]) @ phi_f)
+                    ue    = float(exact[fld](x, y))
+                    d2    = (uh - ue) ** 2
+                    b2    = ue ** 2
+                    err2  += w * detJ * d2
+                    base2 += w * detJ * b2
+
+        # -------------------------- (B) cut elements on side -----------------------
+        # reference rule on the unit triangle
+        qp_tri, qw_tri = vol_rule("tri", qdeg)
+
+        for eid in cut_ids:
+            elem = mesh.elements_list[eid]
+            tri_local, corner_ids = corner_tris(mesh, elem)
+
+            # per‑field local dofs for this element (avoids mixing fields)
+            gd_f = {fld: self.element_maps[fld][eid] for fld in fields}
+
+            for loc_tri in tri_local:
+                v_ids   = [corner_ids[i] for i in loc_tri]
+                V       = mesh.nodes_x_y_pos[v_ids]                     # (3,2)
+                v_phi   = np.array([phi_eval(level_set, xy) for xy in V], dtype=float)
+
+                # clip this geometric triangle to requested side -------------------
+                polys = clip_triangle_to_side(V, v_phi, side=side)      # list of polygons
+                if not polys:
+                    continue
+
+                for poly in polys:
+                    for A, B, C in fan_triangulate(poly):
+                        x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)  # physical weights
+                        for (x, y), w in zip(x_phys, w_phys):
+                            # map back to (xi,eta) of the *parent* element -----------
+                            xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+
+                            for fld in fields:
+                                # slice to the field block → local basis of size n_loc(fld) (e.g., 9)
+                                phi_f = me.basis(fld, xi, eta)[me.slice(fld)]   # local (len n_loc(fld))
+                                uh    = float(field_funcs[fld].get_nodal_values(gd_f[fld]) @ phi_f)
+                                ue    = float(exact[fld](x, y))
+                                d2    = (uh - ue) ** 2
+                                b2    = ue ** 2
+                                err2  += w * d2         # w already physical (no detJ)
+                                base2 += w * b2
+
+        return (err2 / base2) ** 0.5 if (relative and base2 > 1e-28) else err2 ** 0.5
 
 
     

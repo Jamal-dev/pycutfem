@@ -145,14 +145,14 @@ print(f"Number of neg ghost edges: {mesh.edge_bitset('ghost_neg').cardinality()}
 print(f"Number of ghost edges (both): {mesh.edge_bitset('ghost_both').cardinality()}")
 
 
-# In[5]:
+# In[ ]:
 
 
-dof_handler.tag_dof_by_locator('p_pin', 'p',
-    locator=lambda x,y: np.isclose(x, 0) and np.isclose(y, 0),
-    find_first=True)
-bcs.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
-bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
+# dof_handler.tag_dof_by_locator('p_pin', 'p',
+#     locator=lambda x,y: np.isclose(x, 0) and np.isclose(y, 0),
+#     find_first=True)
+# bcs.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
+# bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
 
 # Tag velocity DOFs inside the cylinder (same tag name for both fields is OK)
 dof_handler.tag_dofs_from_element_bitset("inactive", "ux", "inside", strict=True)
@@ -227,7 +227,7 @@ dof_handler.apply_bcs(bcs, u_n, p_n)
 # In[9]:
 
 
-# u_n.plot()
+u_n.plot()
 
 
 # In[10]:
@@ -266,7 +266,7 @@ def grad_inner(u, v):
         return _dn(u[0]) * _dn(v[0]) + _dn(u[1]) * _dn(v[1])
 
     raise ValueError("grad_inner supports only scalars or 2‑D vectors.")
-ghost_edges_used = mesh.edge_bitset('ghost_pos') | mesh.edge_bitset('interface')
+ghost_edges_used = mesh.edge_bitset('ghost_pos') | mesh.edge_bitset('ghost_both') | mesh.edge_bitset('interface')
 dx_phys  = dx(defined_on=physical_domain, 
               level_set=level_set,            # the cylinder level set
               metadata   = {"q": 7, "side": "+"} # integrate only φ>0 (positive side)
@@ -275,21 +275,21 @@ dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_s
 dG       = dGhost(defined_on=ghost_edges_used, level_set=level_set,metadata={"q":6})  # ghost surface
 
 cell_h  = CellDiameter() # length‑scale per element
-beta_N  = Constant(20.0 * poly_order**2)      # Nitsche penalty (tweak)
+beta_N  = Constant(100.0 * poly_order**2)      # Nitsche penalty (tweak)
 # 1) Hansbo factor — this is a *numpy array*, one value per element
-beta0_val  = 20.0 * poly_order**2
-theta_min  = 1.0e-3
-hansbo_plus = hansbo_cut_ratio(mesh, level_set, side='+')    # -> np.ndarray, shape (n_elem,)
-beta_hansbo_arr = beta0_val / np.clip(hansbo_plus, theta_min, 1.0)
+# beta0_val  = 10.0 * poly_order**2
+# theta_min  = 1.0e-3
+# hansbo_plus = hansbo_cut_ratio(mesh, level_set, side='+')    # -> np.ndarray, shape (n_elem,)
+# beta_hansbo_arr = beta0_val / np.clip(hansbo_plus, theta_min, 1.0)
 
 # Wrap only the array part in ElementWiseConstant
-β_h = ElementWiseConstant(beta_hansbo_arr)  # OK: per-element scalar
+# β_h = ElementWiseConstant(beta_hansbo_arr)  # OK: per-element scalar
 
 # 2) Symbolic augmentation factor (stays symbolic because of CellDiameter())
-augment = mu_const / cell_h + rho_const * cell_h / dt   # scalar expression
+# augment = mu_const / cell_h + rho_const * cell_h / dt   # scalar expression
 
 # 3) Final penalty (symbolic EWC × expression)
-β = β_h * augment
+# β = β_h * augment
 
 def epsilon(u):
     "Symmetric gradient."
@@ -319,22 +319,26 @@ def sigma_dot_n_v(u_vec, p_scal,v_test,n):
     # second term: μ (∇uᵀ)·n
     b = dot(grad(u_vec).T, n)
     # combine and subtract pressure part
-    return mu * dot((a + b),v_test) - p_scal * dot(v_test,n)         # vector of size 2
+    return  mu * dot((a + b),v_test) #- p_scal * dot(v_test,n)         # vector of size 2
 
 # --- Jacobian contribution on Γsolid --------------------------------
 J_int = (
     - sigma_dot_n_v(du, dp, v,n_f)           # consistency
     - sigma_dot_n_v(v, q, du,n_f)           # symmetry
-    # + beta_N * mu / cell_h * dot(du, v)     # penalty
-    + β  * dot(du, v)     # penalty
+    + beta_N  / cell_h * dot(du, v)     # penalty
+    - dot(du,n) * q
+    + beta_N/ cell_h * dot(du,n) * dot(v,n)     # penalty
+    # + β  * dot(du, v)     # penalty
 ) * dΓ
 
 # --- Residual contribution on Γsolid --------------------------------
 R_int = (
     - sigma_dot_n_v(u_k, p_k, v,n_f)
     - sigma_dot_n_v(v, q, u_k,n_f)
-    # + beta_N * mu / cell_h * dot(u_k, v)
-    + β  * dot(u_k, v)  
+    + beta_N  / cell_h * dot(u_k, v)
+    - dot(u_k,n) * q
+    + beta_N/ cell_h * dot(u_k,n) * dot(v,n)
+    # + β  * dot(u_k, v)  
 ) * dΓ
 
 # volume ------------------------------------------------------------
@@ -353,18 +357,18 @@ R_int = (
 a_vol = ( rho*dot(du,v)/dt
           + theta*rho*dot(dot(grad(u_k), du), v)
           + theta*rho*dot(dot(grad(du), u_k), v)
-          + theta*mu*inner(grad(du), grad(v))
+          + 2 * theta*mu*inner(epsilon(du), epsilon(v))
           - dp*div(v) + q*div(du) ) * dx_phys
 
 r_vol = ( rho*dot(u_k-u_n, v)/dt
           + theta*rho*dot(dot(grad(u_k), u_k), v)
           + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
-          + theta*mu*inner(grad(u_k), grad(v))
-          + (1-theta)*mu*inner(grad(u_n), grad(v))
+          + 2 * theta*mu*inner(epsilon(u_k), epsilon(v))
+          + 2 * (1-theta)*mu*inner(epsilon(u_n), epsilon(v))
           - p_k*div(v) + q*div(u_k) ) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
-penalty_val = 20
+penalty_val = 10
 penalty_grad = 0.1
 gamma_v = Constant(penalty_val * poly_order**2)
 gamma_v_grad= Constant(penalty_grad * poly_order**2)
@@ -376,10 +380,10 @@ stab = ( gamma_v  / cell_h   * dot(jump(u_k), jump(v))
        + gamma_p  / cell_h   * jump(p_k) * jump(q)  # Note: use * for scalars, see issue 2
        + gamma_p_grad * cell_h   * grad_inner(jump(p_k), jump(q)) ) * dG
 
-stab_lin  = ( gamma_v  / cell_h   * dot(jump(du),  jump(v)) +
-             gamma_v_grad * cell_h   * grad_inner(jump(du),  jump(v))) * dG
-stab_lin += ( gamma_p  / cell_h   * jump(dp) *  jump(q)
-            + gamma_p_grad * cell_h   * grad_inner(jump(dp),  jump(q))) * dG
+stab_lin  = (( gamma_v  / cell_h   * dot(jump(du),  jump(v)) +
+             gamma_v_grad * cell_h   * grad_inner(jump(du),  jump(v))) 
+           + ( gamma_p  / cell_h   * jump(dp) *  jump(q)
+            + gamma_p_grad * cell_h   * grad_inner(jump(dp),  jump(q)))  ) * dG
 # complete Jacobian and residual -----------------------------------
 jacobian_form  = a_vol + J_int + stab_lin
 residual_form  = r_vol + R_int + stab
@@ -406,12 +410,6 @@ residual_form  = r_vol + R_int + stab
 
 
 # In[15]:
-
-
-mesh.edge_bitset('ghost').cardinality()
-
-
-# In[16]:
 
 
 from pycutfem.io.vtk import export_vtk
@@ -545,7 +543,7 @@ def save_solution(funcs):
                       title=f"Velocity Ux at step {step_counter}",
                       xlabel='X-Axis', ylabel='Y-Axis',
                       levels=100, cmap='jet',
-                      mask = physical_domain,)
+                      mask = fluid_domain,)
 
     # (Optional) append to global histories for later plotting
     histories.setdefault("cd", []).append(C_D)
@@ -557,7 +555,7 @@ def save_solution(funcs):
 
 
 
-# In[ ]:
+# In[16]:
 
 
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver
@@ -600,17 +598,7 @@ solver.solve_time_interval(functions=functions,
                            time_params=time_params,)
 
 
-# In[ ]:
-
-
-u_n.plot(kind="streamline",
-         density=2.0,
-         linewidth=0.8,
-         cmap="plasma",
-         title="Turek-Schafer",background = False)
-
-
-# In[ ]:
+# In[17]:
 
 
 plt.plot(histories["cd"], label="C_D", marker='o')
@@ -623,15 +611,18 @@ plt.plot(histories["dp"], label="Δp", marker='o')
 plt.ylabel('Δp')
 
 
-# In[ ]:
+# In[18]:
 
 
-u_n.plot(kind="contour",mask =physical_domain)
+u_n.plot(kind="contour",mask =fluid_domain,
+         title="Turek-Schafer",
+         xlabel='X-Axis', ylabel='Y-Axis',
+         levels=100, cmap='jet')
 
 
-# In[ ]:
+# In[19]:
 
 
 p_n.plot(
-         title="Pressure",mask =physical_domain)
+         title="Pressure",mask =fluid_domain)
 
