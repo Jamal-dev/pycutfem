@@ -727,6 +727,7 @@ class DofHandler:
             "phis": phis,
             "h_arr": h_arr,
             "eids": ele_ids,
+            "entity_kind": "element"
         }
     
     
@@ -851,6 +852,7 @@ class DofHandler:
             # 'eids': np.arange(n_elems, dtype=int),  
             'qp_phys': qp_phys, 'qw': qw, 'normals': normals, 'phis': phis,
             'detJ': detJ_arr, 'J_inv': Jinv_arr, 'h_arr': h_arr,
+            "entity_kind": "element"
         }
         for fld in fields:
             out[f"b_{fld}"] = b_tabs[fld]
@@ -1021,6 +1023,7 @@ class DofHandler:
             "J_inv":       0.5 * (J_inv_pos + J_inv_neg),
             "phis":        phi_arr,
             "h_arr":      h_arr,
+            "entity_kind": "edge"
         }
         out.update(basis_tables)
         return out
@@ -1118,7 +1121,8 @@ class DofHandler:
                "qp_phys": qp_phys, "qw": qw, "normals": normals,
                "detJ": detJ_arr, "J_inv": Jinv_arr,
                "gdofs_map": gdofs_map,
-               "phis": phi_arr, "h_arr": h_arr
+               "phis": phi_arr, "h_arr": h_arr,
+               "entity_kind": "edge"
                }
         out.update(basis_tabs)
 
@@ -1317,6 +1321,7 @@ class DofHandler:
             "normals": normals,
             "phis":    phis,
             "h_arr":   np.asarray([mesh.element_char_length(e) for e in valid_eids], dtype=float),
+            "entity_kind": "element"
         }
         # stitch basis tables (key → (n_cut, max_q, n_loc))
         for key, seq in basis_lists.items():

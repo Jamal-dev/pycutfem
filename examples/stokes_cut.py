@@ -43,15 +43,12 @@ from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner, dot, div,
-    jump, FacetNormal, CellDiameter, Derivative
+    jump, FacetNormal, CellDiameter, Derivative, ElementWiseConstant
 )
 from pycutfem.ufl.measures import dx, dInterface, dGhost
 from pycutfem.ufl.forms import BoundaryCondition
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters
-from pycutfem.fem import transform
-from pycutfem.integration.quadrature import volume
-from pycutfem.ufl.helpers_geom import clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
-from tests.ufl.test_face_integrals import bcs, dof_handler, mesh
+from pycutfem.core.geometry import hansbo_cut_ratio
 import matplotlib.pyplot as plt
 
 # --- SymPy symbols for MMS ---
@@ -96,10 +93,12 @@ def run_stokes_mms_cut_internal():
     nx = ny = 20
     poly_order_vel = 2
     poly_order_p = 1
-    mesh_bounds = (-1.2, 1.2)
+    mesh_bounds = (-1.21, 1.21)
 
     n_refinements = 2  # No mesh refinement for simplicity
     convergence_data = []
+
+    
     
     for cycle in range(n_refinements):
         nx = ny = 10 * (2**cycle)
@@ -187,6 +186,21 @@ def run_stokes_mms_cut_internal():
         h = CellDiameter()
         mu = Constant(mu_val)
         beta_N = Constant(20.0 * poly_order_vel**2) # Nitsche penalty
+        def scaled_penalty_interface(penalty,poly_order =poly_order_vel,
+                             side='+'):
+            # 1) Hansbo factor — this is a *numpy array*, one value per element
+            beta0_val  = penalty * poly_order**2
+            theta_min  = 1.0e-3
+            hansbo_plus = hansbo_cut_ratio(mesh, level_set, side=side)    # -> np.ndarray, shape (n_elem,)
+            hansbo_plus = np.clip(hansbo_plus, theta_min, 1.0)
+            alpha = 0.5
+            beta_hansbo_arr = np.minimum(beta0_val * hansbo_plus**(-alpha), 50.0)
+            β_visc = ElementWiseConstant(beta_hansbo_arr) * (mu / h)
+            β_iner = beta0_val * ( h )        # no θ-scaling here
+
+            # 3) Final penalty (symbolic EWC × expression)
+            return β_visc + β_iner
+        β = scaled_penalty_interface(20.0, side='-')  # Nitsche penalty
         penalty_val = 0.0
         penalty_grad = 0.05
         gamma_v = Constant(penalty_val * poly_order_vel**2)
@@ -247,12 +261,14 @@ def run_stokes_mms_cut_internal():
         residual_nitsche = (
             - sigma_dot_n_v(u_k, p_k, v, n)
             - sigma_dot_n_v(v, q, u_k-u_exact, n)
-            + (beta_N / h) * dot(u_k - u_exact, v) 
+            + β * dot(u_k - u_exact, v) 
+            # + (beta_N / h) * dot(u_k - u_exact, v) 
         ) * dGamma
         jacobian_nitsche = (
             - sigma_dot_n_v(du,dp,v,n)
-            - sigma_dot_n_v(v,q,du,n) 
-            + (beta_N / h) * dot(du, v) 
+            - sigma_dot_n_v(v,q,du,n)
+            + β * dot(du, v) 
+            # + (beta_N / h) * dot(du, v) 
         ) * dGamma
         
         # --- Ghost Penalty Stabilization Terms ---

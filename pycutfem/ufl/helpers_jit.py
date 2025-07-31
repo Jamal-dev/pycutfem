@@ -178,7 +178,8 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         pre_built = {}
     predeclared = {
          "gdofs_map", "node_coords", "element_nodes",
-         "qp_phys", "qw", "detJ", "J_inv", "normals", "phis"
+         "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
+         "eids"
     }   
     pre_built = {**{k: v for k, v in pre_built.items()
                     if k in predeclared}, **pre_built}
@@ -195,6 +196,29 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         f"const_arr_{id(c)}": c
         for c in _find_all(expression, UflConst) if c.dim != 0
     }
+    entity_kind = pre_built.get("entity_kind", "element")  # default: element
+    # helper: align any per‑element array to the subset order if needed
+    def _subset_align(arr: np.ndarray) -> np.ndarray:
+        qp = args.get("qp_phys", None)
+        if qp is None:
+            return arr
+        n_sub = qp.shape[0]
+        # Only attempt an alignment when the incoming array is per-element
+        # and the kernel is iterating over a subset of ELEMENTS.
+        if (arr.ndim >= 1 
+            and arr.shape[0] == mixed_element.mesh.n_elements
+            and n_sub != arr.shape[0]):
+            if entity_kind != "element":
+                # Do NOT try to reindex per-element arrays by edge ids.
+                raise RuntimeError(
+                    "Attempted to align a per-element array in a non-element (e.g., edge) kernel. "
+                    "Pass a per-edge array instead."
+                )
+            eids = pre_built.get("eids", None)
+            if eids is None:
+                raise RuntimeError("Subset kernel without 'eids' – cannot align ElementWiseConstant.")
+            return np.asarray(arr, dtype=np.float64)[np.asarray(eids, dtype=np.int32)]
+        return arr
 
     # cache gdofs_map for coefficient gathering
     if gdofs_map is None:
@@ -226,23 +250,20 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
             args[name] = _deriv_table(fld, ax, ay)
 
         
-        # ----- Restriction to a domain tag --------------------------------
-        if name == "element_tags":
-            tags = [DOMAIN_TAG_MAP.get(e.tag, -1) for e in mixed_element.mesh.elements_list]
-            args[name] = np.array(tags, dtype=np.int32)
-            continue
+        
         
         
         # ---- constant arrays ---------------------------------------------
         elif name in const_arrays:
-            args[name] = const_arrays[name].value
-        
+            vals = const_arrays[name].value
+            args[name] = _subset_align(np.asarray(vals, dtype=np.float64))
+
         # ---- element-wise constants ---------------------------------------------
         elif name.startswith("ewc_"):
             obj_id = int(name.split("_", 1)[1])
             ewc = next(c for c in _find_all(expression, ElementWiseConstant)
                     if id(c) == obj_id)
-            args[name] = np.asarray(ewc.values, dtype=np.float64)
+            args[name] = _subset_align(np.asarray(ewc.values, dtype=np.float64))
         
         # ---- analytic expressions ------------------------------------------------
         elif name.startswith("ana_"):
