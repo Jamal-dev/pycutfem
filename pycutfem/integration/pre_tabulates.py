@@ -3,6 +3,7 @@ try:
     _HAVE_NUMBA = True
 except Exception:
     _HAVE_NUMBA = False
+import numpy as np
 
 if _HAVE_NUMBA:
     @_nb.njit(cache=True, fastmath=True, parallel=True)
@@ -108,3 +109,134 @@ def _tabulate_q2(xi, eta, N, dN):
             # Node 8: (1, 1)
             N[e, q, 8] = 0.25 * s * t * s_p1 * t_p1
             dN[e, q, 8, 0] = 0.25 * t * t_p1 * (2*s + 1.0); dN[e, q, 8, 1] = 0.25 * s * s_p1 * (2*t + 1.0)
+        
+
+
+
+
+# ----------------------- JIT searchsorted (positions of items) ----------------
+if _HAVE_NUMBA:
+    @_nb.njit(cache=True)
+    def _searchsorted_positions(sorted_unique: np.ndarray, items: np.ndarray) -> np.ndarray:
+        n = sorted_unique.shape[0]
+        m = items.shape[0]
+        out = np.empty(m, dtype=np.int32)
+        for j in range(m):
+            x = items[j]
+            lo = 0
+            hi = n
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if sorted_unique[mid] < x:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            # assume present (union = unique(pos ∪ neg))
+            out[j] = lo if (lo < n and sorted_unique[lo] == x) else -1
+        return out
+else:
+    def _searchsorted_positions(sorted_unique: np.ndarray, items: np.ndarray) -> np.ndarray:
+        # Python fallback
+        idx = np.searchsorted(sorted_unique, items)
+        mask = (idx < sorted_unique.size) & (sorted_unique[idx] == items)
+        out = np.where(mask, idx, -1).astype(np.int32)
+        return out
+
+# ----------------------- Q1 (quad, p=1) derivatives up to order 2 --------------
+# nodes in row-major: (xi,eta) = (-1,-1),(+1,-1),(+1,+1),(-1,+1)
+if _HAVE_NUMBA:
+    @_nb.njit(cache=True)
+    def _eval_deriv_q1(xi: float, eta: float, dx: int, dy: int) -> np.ndarray:
+        # 1D shapes
+        L0 = 0.5*(1.0 - xi); L1 = 0.5*(1.0 + xi)
+        M0 = 0.5*(1.0 - eta); M1 = 0.5*(1.0 + eta)
+        dL0 = -0.5; dL1 = 0.5
+        dM0 = -0.5; dM1 = 0.5
+        # second derivs are zero for Q1
+        if dx == 0 and dy == 0:
+            return np.array([L0*M0, L1*M0, L1*M1, L0*M1])
+        if dx == 1 and dy == 0:
+            return np.array([dL0*M0, dL1*M0, dL1*M1, dL0*M1])
+        if dx == 0 and dy == 1:
+            return np.array([L0*dM0, L1*dM0, L1*dM1, L0*dM1])
+        # all second-order derivatives are zero for Q1
+        return np.zeros(4)
+
+    @_nb.njit(cache=True, parallel=True, fastmath=True)
+    def _tabulate_deriv_q1(xi_tab, eta_tab, dx: int, dy: int, out):
+        nE, nQ = xi_tab.shape
+        for e in _nb.prange(nE):
+            for q in range(nQ):
+                out[e, q, :] = _eval_deriv_q1(xi_tab[e, q], eta_tab[e, q], dx, dy)
+
+# ----------------------- Q2 (quad, p=2) derivatives up to order 2 --------------
+# 1D nodes s∈{-1,0,1}:  L0=0.5*s*(s-1), L1=1-s*s, L2=0.5*s*(s+1)
+if _HAVE_NUMBA:
+    @_nb.njit(cache=True)
+    def _L(s):
+        L0 = 0.5*s*(s - 1.0)
+        L1 = 1.0 - s*s
+        L2 = 0.5*s*(s + 1.0)
+        dL0 = s - 0.5
+        dL1 = -2.0*s
+        dL2 = s + 0.5
+        ddL0 = 1.0
+        ddL1 = -2.0
+        ddL2 = 1.0
+        return (L0, L1, L2, dL0, dL1, dL2, ddL0, ddL1, ddL2)
+
+    @_nb.njit(cache=True)
+    def _eval_deriv_q2(xi: float, eta: float, dx: int, dy: int) -> np.ndarray:
+        L0,L1,L2,dL0,dL1,dL2,ddL0,ddL1,ddL2 = _L(xi)
+        M0,M1,M2,dM0,dM1,dM2,ddM0,ddM1,ddM2 = _L(eta)
+        # tensor product, row-major (eta bottom->top, xi left->right)
+        out = np.empty(9)
+        if dx == 0 and dy == 0:
+            Li = (L0, L1, L2); Mj = (M0, M1, M2)
+        elif dx == 1 and dy == 0:
+            Li = (dL0, dL1, dL2); Mj = (M0, M1, M2)
+        elif dx == 0 and dy == 1:
+            Li = (L0, L1, L2); Mj = (dM0, dM1, dM2)
+        elif dx == 2 and dy == 0:
+            Li = (ddL0, ddL1, ddL2); Mj = (M0, M1, M2)
+        elif dx == 0 and dy == 2:
+            Li = (L0, L1, L2); Mj = (ddM0, ddM1, ddM2)
+        elif dx == 1 and dy == 1:
+            # product rule: (d/dxi Li)*(d/deta Mj)
+            Li = (dL0, dL1, dL2); Mj = (dM0, dM1, dM2)
+        else:
+            return np.zeros(9)
+        k = 0
+        for j in range(3):
+            for i in range(3):
+                out[k] = Li[i] * Mj[j]
+                k += 1
+        return out
+
+    @_nb.njit(cache=True, parallel=True, fastmath=True)
+    def _tabulate_deriv_q2(xi_tab, eta_tab, dx: int, dy: int, out):
+        nE, nQ = xi_tab.shape
+        for e in _nb.prange(nE):
+            for q in range(nQ):
+                out[e, q, :] = _eval_deriv_q2(xi_tab[e, q], eta_tab[e, q], dx, dy)
+
+# ----------------------- P1 (tri, p=1) derivatives up to order 2 ---------------
+if _HAVE_NUMBA:
+    @_nb.njit(cache=True)
+    def _eval_deriv_p1(xi: float, eta: float, dx: int, dy: int) -> np.ndarray:
+        # N1=1-xi-eta, N2=xi, N3=eta
+        if dx == 0 and dy == 0:
+            return np.array([1.0 - xi - eta, xi, eta])
+        if dx == 1 and dy == 0:
+            return np.array([-1.0, 1.0, 0.0])
+        if dx == 0 and dy == 1:
+            return np.array([-1.0, 0.0, 1.0])
+        # second derivatives are zero for P1
+        return np.zeros(3)
+
+    @_nb.njit(cache=True, parallel=True, fastmath=True)
+    def _tabulate_deriv_p1(xi_tab, eta_tab, dx: int, dy: int, out):
+        nE, nQ = xi_tab.shape
+        for e in _nb.prange(nE):
+            for q in range(nQ):
+                out[e, q, :] = _eval_deriv_p1(xi_tab[e, q], eta_tab[e, q], dx, dy)

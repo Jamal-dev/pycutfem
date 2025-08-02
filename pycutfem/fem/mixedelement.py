@@ -148,17 +148,33 @@ class MixedElement:
         idx = self.component_dof_slices[field]
         G[idx, :] = locG
         return G
-    def deriv_ref(self, field: str, xi, eta, order_x, order_y) -> np.ndarray:
+    def deriv_ref(self, field: str, xi, eta, order_x: int, order_y: int) -> np.ndarray:
         """
-        Reference derivative for any order.
-
-        Output shape is (n_dofs,)
+        Reference derivative for any order (union-sized vector).
+        Fast path for quads P1/P2 and tris P1 when order_x+order_y <= 2.
         """
+        import numpy as np
+        from pycutfem.integration.pre_tabulates import (
+            _eval_deriv_q1, _eval_deriv_q2, _eval_deriv_p1
+        )
         phi = np.zeros(self.n_dofs_per_elem)
-        loc_phi = self._eval_scalar_deriv(field, xi, eta, order_x, order_y)
-        idx = self.component_dof_slices[field]
-        phi[idx] = loc_phi  # n_dofs_local
+        sl = self.component_dof_slices[field]
+        p  = self._field_orders[field]
+        if (order_x + order_y) <= 2:
+            if self.mesh.element_type == "quad" and p == 1:
+                phi[sl] = _eval_deriv_q1(float(xi), float(eta), int(order_x), int(order_y))
+                return phi
+            if self.mesh.element_type == "quad" and p == 2:
+                phi[sl] = _eval_deriv_q2(float(xi), float(eta), int(order_x), int(order_y))
+                return phi
+            if self.mesh.element_type == "tri" and p == 1:
+                phi[sl] = _eval_deriv_p1(float(xi), float(eta), int(order_x), int(order_y))
+                return phi
+        # fallback: per-field reference object
+        loc = self._eval_scalar_deriv(field, float(xi), float(eta), int(order_x), int(order_y))
+        phi[sl] = loc
         return phi
+
 
 
     @lru_cache(maxsize=256)

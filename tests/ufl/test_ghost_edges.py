@@ -91,7 +91,7 @@ def test_hessian_penalty_spd(setup_quad2, backend):
     v = TestFunction( field_name="u",name="v_test",dof_handler=dh)
 
     a = hessian_inner(Jump(u), Jump(v)) * dGhost(defined_on=ghost, level_set=ls, metadata={"derivs": {(2,0),(1,1),(0,2)}})
-    A,_ = assemble_form(a == Constant(0) * dx, dof_handler=dh, bcs=[], backend=backend)
+    A,_ = assemble_form(a == None, dof_handler=dh, bcs=[], backend=backend)
     K = A.toarray()
 
     # symmetric
@@ -112,7 +112,7 @@ def test_hessian_energy_zero_for_quadratic(setup_quad2, backend):
     uh.set_values_from_function(lambda x, y: x**2 + y**2)  # constant Hessian
     jump_u = Jump(uh)
     energy_form = hessian_inner(jump_u, jump_u) * dGhost(defined_on=ghost, level_set=ls, metadata={"q":4})
-    F = Constant(0) * dx  # dummy lhs; we need scalar assembly path
+    F = None  # dummy lhs; we need scalar assembly path
     assembler_hooks={type(energy_form.integrand):{'name':'E'}}
     res = assemble_form(F == energy_form,  dof_handler=dh, bcs=[], assembler_hooks=assembler_hooks, backend=backend)
     assert abs(res["E"]) < 1e-12
@@ -132,7 +132,7 @@ def test_hessian_energy_known_value(setup_quad2, backend):
 
     energy_form = hessian_inner(Jump(uh), Jump(uh)) * dGhost(defined_on=ghost, level_set=ls, metadata={"q":4})
     assembler_hooks={type(energy_form.integrand):{'name':'E'}}
-    F = Constant(0) * dx
+    F = None
     res = assemble_form(F == energy_form,  dof_handler=dh, bcs=[], assembler_hooks=assembler_hooks, backend=backend)
 
     assembled = res["E"]
@@ -149,7 +149,7 @@ def test_scalar_jump_penalty_spd(setup_quad2, backend):
     v = TestFunction( field_name="u",name="v",dof_handler=dh)
     a = Jump(u) * Jump(v) * dGhost(defined_on=ghost_domain, level_set=level_set, metadata={"q":4})
 
-    K,_ = assemble_form(a == Constant(0.0) * dx, dof_handler=dh, bcs=[], backend=backend)
+    K,_ = assemble_form(a == None, dof_handler=dh, bcs=[], backend=backend)
     Kd = K.toarray()
     assert np.allclose(Kd, Kd.T), 'K not symmetric'
     eig = np.linalg.eigvalsh(Kd)
@@ -171,7 +171,7 @@ def test_hessian_penalty_exactness_for_quadratics(setup_quad2, backend):
     
     # Assemble the scalar functional
     assembler_hooks={type(penalty_form.integrand):{'name':'penalty_energy'}}
-    F = Constant(0) * dx
+    F = None
     res = assemble_form(F == penalty_form,  
                         dof_handler=dh, bcs=[], 
                         assembler_hooks=assembler_hooks, 
@@ -211,7 +211,7 @@ def test_hessian_penalty_quantitative_value(setup_quad2, backend):
 
     # Assemble the scalar functional
     assembler_hooks={type(penalty_form.integrand):{'name':'penalty_energy'}}
-    F = Constant(0) * dx
+    F = None
     res = assemble_form(F == penalty_form,  dof_handler=dh, bcs=[], assembler_hooks=assembler_hooks, backend=backend)
     assembled_energy = res['penalty_energy']
     assert np.isclose(assembled_energy, expected_energy, rtol=1e-2), \

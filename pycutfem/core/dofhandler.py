@@ -1146,265 +1146,497 @@ class DofHandler:
         self,
         ghost_edge_ids: "BitSet | Sequence[int]",
         qdeg: int,
-        level_set: Callable,
+        level_set,
         derivs: set[tuple[int, int]],
     ) -> dict:
-        """
-        Pre‑compute all geometric and algebraic data needed by dGhost JIT kernels.
+        from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
+        from pycutfem.integration.quadrature import line_quadrature
+        from pycutfem.fem import transform
+        from pycutfem.fem.reference import get_reference
+        from pycutfem.integration.pre_tabulates import (
+            _searchsorted_positions,
+            _tabulate_deriv_q1, _tabulate_deriv_q2, _tabulate_deriv_p1,
+        )
 
-        The routine now uses the MixedElement‑supplied union size so the output
-        is valid for *both* CG and DG discretisations, regardless of how many
-        fields or blocks you mix.
-        """
-        if self.DEBUG:
-            print("-" * 80)
-            print(f"Precomputing ghost factors for {len(ghost_edge_ids)} edges with qdeg={qdeg} and derivs={derivs}")
-            print("-" * 80)
-        derivs = derivs | {(0, 0)}
-        mesh        = self.mixed_element.mesh
-        me          = self.mixed_element
-        fields      = me.field_names
-        n_union     = self.union_dofs              # <- CG: 36, DG: 44, …
-        n_loc       = me.n_dofs_per_elem
+        try:
+            import numba as _nb
+            _HAVE_NUMBA = True
+        except Exception:
+            _HAVE_NUMBA = False
 
-        # ---------------------------------- collect valid interior ghost edges
-        edge_ids = (ghost_edge_ids.to_indices() if
-                    hasattr(ghost_edge_ids, "to_indices") else list(ghost_edge_ids))
-        valid_edges = []
-        for eid in edge_ids:
-            e = mesh.edge(eid)
+        # ---- J from dN and coords (Numba kernel) -------------------------------
+        if _HAVE_NUMBA:
+            @_nb.njit(cache=True, fastmath=True, parallel=True)
+            def _geom_from_dN(coords, dN_tab):
+                nE, nLoc = coords.shape[0], coords.shape[1]
+                nQ = dN_tab.shape[1]
+                detJ = np.zeros((nE, nQ))
+                Jinv = np.zeros((nE, nQ, 2, 2))
+                for e in _nb.prange(nE):
+                    for q in range(nQ):
+                        a00 = 0.0; a01 = 0.0; a10 = 0.0; a11 = 0.0
+                        for i in range(nLoc):
+                            gx = dN_tab[e, q, i, 0]
+                            gy = dN_tab[e, q, i, 1]
+                            x = coords[e, i, 0]; y = coords[e, i, 1]
+                            a00 += gx * x; a01 += gx * y
+                            a10 += gy * x; a11 += gy * y
+                        det = a00 * a11 - a01 * a10
+                        detJ[e, q] = det
+                        inv_det = 1.0 / det
+                        Jinv[e, q, 0, 0] =  a11 * inv_det
+                        Jinv[e, q, 0, 1] = -a01 * inv_det
+                        Jinv[e, q, 1, 0] = -a10 * inv_det
+                        Jinv[e, q, 1, 1] =  a00 * inv_det
+                return detJ, Jinv
+
+        mesh = self.mixed_element.mesh
+        me   = self.mixed_element
+        fields = me.field_names
+        n_union = self.union_dofs
+        n_loc   = me.n_dofs_per_elem
+
+        # 0) normalise/collect interior ghost edges ------------------------------
+        ids = (ghost_edge_ids.to_indices()
+            if hasattr(ghost_edge_ids, "to_indices")
+            else list(ghost_edge_ids))
+        edges = []
+        for gid in ids:
+            e = mesh.edge(gid)
             if e.right is None:
-                continue  # ghost edges are interior
+                continue
+            # keep edges if at least one CUT neighbour or already tagged as ghost
+            lt = mesh.elements_list[e.left].tag
+            rt = mesh.elements_list[e.right].tag
+            et = str(getattr(e, "tag", ""))
+            if (("cut" in (lt, rt)) or et.startswith("ghost")):
+                edges.append(e)
+        if not edges:
+            raise ValueError("No valid ghost edges found.")
 
-            # Trust the mesh classification / or require at least one CUT neighbor
-            left_tag  = mesh.elements_list[e.left].tag
-            right_tag = mesh.elements_list[e.right].tag
-            if ('cut' in (left_tag, right_tag)) or getattr(e, "tag", "")[:5] == "ghost":
-                valid_edges.append(e)
+        # 1) batched line rule on each segment ----------------------------------
+        nE = len(edges)
+        P0 = np.empty((nE, 2), dtype=float)
+        P1 = np.empty((nE, 2), dtype=float)
+        for i, e in enumerate(edges):
+            p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+            P0[i] = p0; P1[i] = p1
 
-        if not valid_edges:
-            raise ValueError("No valid ghost edges found. "
-                             "Check that the mesh has been properly cut and tagged.")
-            return {"eids": np.array([], dtype=int)}    # early‑out
+        xi1, w_ref = gauss_legendre(qdeg)
+        xi1 = np.asarray(xi1, float); w_ref = np.asarray(w_ref, float)
+        nQ = xi1.size
+        qp_phys = np.empty((nE, nQ, 2), dtype=float)
+        qw      = np.empty((nE, nQ),    dtype=float)
+        if _HAVE_NUMBA:
+            _batched(P0, P1, xi1, w_ref, qp_phys, qw)
+        else:
+            for i in range(nE):
+                pts, wts = line_quadrature(P0[i], P1[i], qdeg)
+                qp_phys[i, :, :] = pts; qw[i, :] = wts
 
-        # ---------------------------------- allocate dense workspaces
-        n_edges = len(valid_edges)
-        p0_rep, p1_rep = mesh.nodes_x_y_pos[list(valid_edges[0].nodes)]
-        q_xi_rep, q_w_rep = line_quadrature(p0_rep, p1_rep, qdeg)
-        n_q = len(q_w_rep)
+        # 2) oriented normals & phi ---------------------------------------------
+        normals = np.empty((nE, nQ, 2), dtype=float)
+        phi_arr = np.zeros((nE, nQ), dtype=float)
+        for i, e in enumerate(edges):
+            # orient from (–) to (+) using the centroid test (compiler path)
+            phiL = level_set(np.asarray(mesh.elements_list[e.left].centroid()))
+            pos_eid, neg_eid = (e.left, e.right) if phiL >= 0 else (e.right, e.left)
+            nvec = e.normal
+            if np.dot(nvec, mesh.elements_list[pos_eid].centroid() - qp_phys[i, 0]) < 0:
+                nvec = -nvec
+            for q in range(nQ):
+                normals[i, q] = nvec
+                phi_arr[i, q] = level_set(qp_phys[i, q])
 
-        # geometry
-        qp_phys   = np.zeros((n_edges, n_q, 2))
-        qw        = np.zeros((n_edges, n_q))
-        normals   = np.zeros((n_edges, n_q, 2))
-        J_inv_pos = np.zeros((n_edges, n_q, 2, 2))
-        J_inv_neg = np.zeros((n_edges, n_q, 2, 2))
-        detJ_pos  = np.zeros((n_edges, n_q))
-        detJ_neg  = np.zeros((n_edges, n_q))
-        phi_arr = np.zeros((n_edges, n_q)) if level_set else None
+        # 3) union GDofs and maps (JIT searchsorted) -----------------------------
+        gdofs_map = -np.ones((nE, n_union), dtype=np.int64)
+        pos_map   = -np.ones((nE, n_loc),   dtype=np.int32)
+        neg_map   = -np.ones((nE, n_loc),   dtype=np.int32)
 
-        # DOF data (dense)
-        gdofs_map = -np.ones((n_edges, n_union), dtype=np.int64)
-        pos_map   = -np.ones((n_edges, n_loc),  dtype=np.int32)
-        neg_map   = -np.ones((n_edges, n_loc),  dtype=np.int32)
-
-        # basis / derivative tables
-        basis_tables = {}
-        for fld in fields:
-            for side in ("pos", "neg"):
-                for dx, dy in derivs:
-                    key = f"d{dx}{dy}_{fld}_{side}"
-                    basis_tables[key] = np.zeros((n_edges, n_q, n_loc))  # me._n_basis[fld]))
-
-        h_arr = np.zeros((n_edges,))  # Placeholder for element sizes
-        # ---------------------------------- main loop over valid edges
-        for i, edge in enumerate(valid_edges):
-            left_elem = edge.left
-            right_elem = edge.right
-            if left_elem is not None:
-                h_left = mesh.element_char_length(left_elem)
-            else:
-                h_left = 0.0
-            if right_elem is not None:
-                h_right = mesh.element_char_length(right_elem)
-            else:
-                h_right = 0.0
-            h_arr[i] = max(h_left, h_right)  # Store element size
-            # 1. (+) and (‑) element ids
-            phi_left = level_set(np.asarray(mesh.elements_list[edge.left].centroid()))
-            pos_eid, neg_eid = (edge.left, edge.right) if phi_left >= 0 else (edge.right, edge.left)
-
-            # 2. union of global DOFs
+        for i, e in enumerate(edges):
+            phiL = level_set(np.asarray(mesh.elements_list[e.left].centroid()))
+            pos_eid, neg_eid = (e.left, e.right) if phiL >= 0 else (e.right, e.left)
             pos_dofs = self.get_elemental_dofs(pos_eid)
             neg_dofs = self.get_elemental_dofs(neg_eid)
             global_dofs = np.unique(np.concatenate((pos_dofs, neg_dofs)))
-
-            assert len(global_dofs) == n_union, (
-                f"union size mismatch on edge {edge.gid}: "
-                f"{len(global_dofs)}  vs  expected {n_union}"
-            )
-
+            if global_dofs.size != n_union:
+                raise ValueError(f"union size mismatch on edge {e.gid}: {global_dofs.size} vs {n_union}")
             gdofs_map[i, :n_union] = global_dofs
-            pos_map[i] = np.searchsorted(global_dofs, pos_dofs)
-            neg_map[i] = np.searchsorted(global_dofs, neg_dofs)
+            pos_map[i] = _searchsorted_positions(global_dofs, pos_dofs)
+            neg_map[i] = _searchsorted_positions(global_dofs, neg_dofs)
 
-            # 3. quadrature rule & outward normal
-            p0, p1 = mesh.nodes_x_y_pos[list(edge.nodes)]
-            qp_e, qw_e = line_quadrature(p0, p1, qdeg)
-            normal = edge.normal
-            if np.dot(normal, np.asarray(mesh.elements_list[pos_eid].centroid()) - qp_e[0]) < 0:
-                normal *= -1.0   # ensure normal points from (‑) to (+)
+        # 4) (ξ,η) on both sides; build dN (for geometry order) ------------------
+        #    and compute J, detJ, J_inv from (coords, dN)
+        xi_pos = np.empty((nE, nQ)); eta_pos = np.empty((nE, nQ))
+        xi_neg = np.empty((nE, nQ)); eta_neg = np.empty((nE, nQ))
+        pos_ids = np.empty(nE, dtype=np.int32)
+        neg_ids = np.empty(nE, dtype=np.int32)
 
-            qp_phys[i] = qp_e
-            qw[i]      = qw_e
-            normals[i] = normal
+        for i, e in enumerate(edges):
+            phiL = level_set(np.asarray(mesh.elements_list[e.left].centroid()))
+            pos_eid, neg_eid = (e.left, e.right) if phiL >= 0 else (e.right, e.left)
+            pos_ids[i] = pos_eid; neg_ids[i] = neg_eid
+            for q in range(nQ):
+                s, t = transform.inverse_mapping(mesh, pos_eid, qp_phys[i, q])
+                xi_pos[i, q]  = float(s); eta_pos[i, q] = float(t)
+                s, t = transform.inverse_mapping(mesh, neg_eid, qp_phys[i, q])
+                xi_neg[i, q]  = float(s); eta_neg[i, q] = float(t)
 
-            # 4. push‑forward reference bases (both sides)
-            for q, xq in enumerate(qp_e):
-                phi_arr[i, q] = level_set(xq) if level_set else 0.0
-                for side, eid in (("pos", pos_eid), ("neg", neg_eid)):
-                    xi, eta = transform.inverse_mapping(mesh, eid, xq)
-                    J       = transform.jacobian(mesh, eid, (xi, eta))
-                    J_inv   = np.linalg.inv(J)
+        # coordinates of parent elements
+        node_ids_all = mesh.nodes[mesh.elements_connectivity]
+        coords_all   = mesh.nodes_x_y_pos[node_ids_all].astype(float)
+        coords_pos   = coords_all[pos_ids]
+        coords_neg   = coords_all[neg_ids]
+        nLocGeom     = coords_pos.shape[1]
 
-                    if side == "pos":
-                        J_inv_pos[i, q] = J_inv
-                        detJ_pos[i, q]  = np.linalg.det(J)
+        # reference geometry dN tables
+        from pycutfem.integration.pre_tabulates import _tabulate_q1 as _tab_q1
+        from pycutfem.integration.pre_tabulates import _tabulate_q2 as _tab_q2
+        from pycutfem.integration.pre_tabulates import _tabulate_p1 as _tab_p1
+
+        dN_pos = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
+        dN_neg = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
+
+        if mesh.element_type == "quad" and mesh.poly_order == 1:
+            _tab_q1(xi_pos, eta_pos, np.empty((nE, nQ, 4)), dN_pos)
+            _tab_q1(xi_neg, eta_neg, np.empty((nE, nQ, 4)), dN_neg)
+        elif mesh.element_type == "quad" and mesh.poly_order == 2:
+            _tab_q2(xi_pos, eta_pos, np.empty((nE, nQ, 9)), dN_pos)
+            _tab_q2(xi_neg, eta_neg, np.empty((nE, nQ, 9)), dN_neg)
+        elif mesh.element_type == "tri"  and mesh.poly_order == 1:
+            _tab_p1(xi_pos, eta_pos, np.empty((nE, nQ, 3)), dN_pos)
+            _tab_p1(xi_neg, eta_neg, np.empty((nE, nQ, 3)), dN_neg)
+        else:
+            # generic Python fallback for geometry dN
+            ref = get_reference(mesh.element_type, mesh.poly_order)
+            for i in range(nE):
+                for q in range(nQ):
+                    dN_pos[i, q] = np.asarray(ref.grad(xi_pos[i, q], eta_pos[i, q]))
+                    dN_neg[i, q] = np.asarray(ref.grad(xi_neg[i, q], eta_neg[i, q]))
+
+        # build J, detJ, J_inv
+        if _HAVE_NUMBA:
+            detJ_pos, J_inv_pos = _geom_from_dN(coords_pos, dN_pos)
+            detJ_neg, J_inv_neg = _geom_from_dN(coords_neg, dN_neg)
+        else:
+            detJ_pos = np.empty((nE, nQ)); J_inv_pos = np.empty((nE, nQ, 2, 2))
+            detJ_neg = np.empty((nE, nQ)); J_inv_neg = np.empty((nE, nQ, 2, 2))
+            for side, coords, dN, detJ, J_inv in (
+                ("pos", coords_pos, dN_pos, detJ_pos, J_inv_pos),
+                ("neg", coords_neg, dN_neg, detJ_neg, J_inv_neg),
+            ):
+                for e in range(nE):
+                    Xe = coords[e]
+                    for q in range(nQ):
+                        a00 = a01 = a10 = a11 = 0.0
+                        for i in range(nLocGeom):
+                            gx, gy = dN[e, q, i, 0], dN[e, q, i, 1]
+                            x, y = Xe[i, 0], Xe[i, 1]
+                            a00 += gx * x; a01 += gx * y
+                            a10 += gy * x; a11 += gy * y
+                        det = a00 * a11 - a01 * a10
+                        detJ[e, q] = det
+                        invd = 1.0 / det
+                        J_inv[e, q, 0, 0] =  a11 * invd
+                        J_inv[e, q, 0, 1] = -a01 * invd
+                        J_inv[e, q, 1, 0] = -a10 * invd
+                        J_inv[e, q, 1, 1] =  a00 * invd
+
+        # sanity: non-degenerate
+        bad = np.where((detJ_pos <= 1e-12) | (detJ_neg <= 1e-12))
+        if bad[0].size:
+            e_bad, q_bad = int(bad[0][0]), int(bad[1][0])
+            raise ValueError(f"Non-positive detJ at edge {edges[e_bad].gid}, qp {q_bad}")
+
+        # 5) tabulate reference derivatives (per field) and push-forward ----------
+        derivs = set(derivs) | {(0, 0)}  # ensure φ itself
+        basis_tables = {}
+        for fld in fields:
+            p_f = me._field_orders[fld]
+            sl  = me.component_dof_slices[fld]  # slice into union-local
+            n_f = sl.stop - sl.start
+
+            # choose tabulator for this field
+            kind = (mesh.element_type, p_f)
+            def _fill(side, xi_tab, eta_tab, J_inv):
+                # sx, sy from J_inv (diagonal assumption consistent with earlier code)
+                sx = J_inv[..., 0, 0]; sy = J_inv[..., 1, 1]
+                for (dx, dy) in derivs:
+                    key = f"d{dx}{dy}_{fld}_{side}"
+                    arr = np.zeros((nE, nQ, me.n_dofs_per_elem))
+                    # local field block (n_f,)
+                    loc = np.empty((nE, nQ, n_f))
+                    if _HAVE_NUMBA and kind == ("quad", 1):
+                        _tabulate_deriv_q1(xi_tab, eta_tab, dx, dy, loc)
+                    elif _HAVE_NUMBA and kind == ("quad", 2):
+                        _tabulate_deriv_q2(xi_tab, eta_tab, dx, dy, loc)
+                    elif _HAVE_NUMBA and kind == ("tri", 1):
+                        _tabulate_deriv_p1(xi_tab, eta_tab, dx, dy, loc)
                     else:
-                        J_inv_neg[i, q] = J_inv
-                        detJ_neg[i, q]  = np.linalg.det(J)
+                        # generic fallback with per-point MixedElement call
+                        for e in range(nE):
+                            for q in range(nQ):
+                                loc[e, q, :] = me._eval_scalar_deriv(fld, xi_tab[e, q], eta_tab[e, q], dx, dy)
 
-                    sx, sy = J_inv[0, 0], J_inv[1, 1]   # structured quad assumption
-                    for fld in fields:
-                        for dx, dy in derivs:
-                            ref = me.deriv_ref(fld, xi, eta, dx, dy)
-                            phys = ref * (sx ** dx) * (sy ** dy)
-                            key = f"d{dx}{dy}_{fld}_{side}"
-                            basis_tables[key][i, q, :] = phys
+                    # map to physical (structured scaling used in your ghost path)
+                    phys = loc * (sx ** dx)[:, :, None] * (sy ** dy)[:, :, None]
+                    arr[:, :, sl] = phys
+                    basis_tables[key] = arr
 
-        # ---------------------------------- pack & return
+            _fill("pos", xi_pos, eta_pos, J_inv_pos)
+            _fill("neg", xi_neg, eta_neg, J_inv_neg)
+
+        # 6) element sizes and pack
+        h_arr = np.empty((nE,), dtype=float)
+        for i, e in enumerate(edges):
+            hL = mesh.element_char_length(e.left)
+            hR = mesh.element_char_length(e.right)
+            h_arr[i] = max(hL, hR)
+
         out = {
-            "eids":        np.fromiter((e.gid for e in valid_edges), dtype=np.int32),
+            "eids":        np.fromiter((e.gid for e in edges), dtype=np.int32),
             "qp_phys":     qp_phys,
             "qw":          qw,
             "normals":     normals,
-            "gdofs_map":   gdofs_map,   # dense (‑1 padded) union map
+            "gdofs_map":   gdofs_map,
             "pos_map":     pos_map,
             "neg_map":     neg_map,
             "J_inv_pos":   J_inv_pos,
             "J_inv_neg":   J_inv_neg,
             "detJ_pos":    detJ_pos,
             "detJ_neg":    detJ_neg,
-            "detJ":        0.5 * (detJ_pos + detJ_neg),
-            "J_inv":       0.5 * (J_inv_pos + J_inv_neg),
+            "detJ":        0.5*(detJ_pos + detJ_neg),
+            "J_inv":       0.5*(J_inv_pos + J_inv_neg),
             "phis":        phi_arr,
-            "h_arr":      h_arr,
-            "entity_kind": "edge"
+            "h_arr":       h_arr,
+            "entity_kind": "edge",
         }
         out.update(basis_tables)
         return out
+
     
     # --------------------------------------------------------------------
     #  DofHandler.precompute_boundary_factors   (∫ ⋯ dS backend)
     # --------------------------------------------------------------------
     def precompute_boundary_factors(
-            self,
-            edge_ids: "BitSet | Sequence[int]",
-            qdeg: int,
-            derivs: set[tuple[int, int]],
-            reuse: bool = True,
+        self,
+        edge_ids: "BitSet | Sequence[int]",
+        qdeg: int,
+        derivs: set[tuple[int, int]],
+        reuse: bool = True,
     ) -> dict:
         """
-        Pre-compute all geometry / basis tables that a JIT kernel needs for
-        ∫_Γ f dS on *boundary* edges Γ.  Very similar to
-        `precompute_ghost_factors` :contentReference[oaicite:0]{index=0} but with only **one**
-        element (the left owner) and no ‘neg/pos’ bookkeeping.
+        Pre-compute geometry & basis tables for ∫_Γ ⋯ dS on *boundary* edges.
+        Returns per-edge arrays sized to the given subset and ready for JIT.
         """
-        if self.DEBUG:
-            print("-" * 80)
-            print(f"Precomputing boundary factors for {len(edge_ids)} edges with qdeg={qdeg} and derivs={derivs}")
-            print("-" * 80)
-        mesh   = self.mixed_element.mesh
-        me     = self.mixed_element
+        from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
+        from pycutfem.integration.quadrature import line_quadrature
+        from pycutfem.fem import transform
+        from pycutfem.fem.reference import get_reference
+        from pycutfem.integration.pre_tabulates import (
+            _tabulate_q1, _tabulate_q2, _tabulate_p1,
+            _tabulate_deriv_q1, _tabulate_deriv_q2, _tabulate_deriv_p1,
+        )
+
+        try:
+            import numba as _nb
+            _HAVE_NUMBA = True
+        except Exception:
+            _HAVE_NUMBA = False
+
+        # --- J from dN and coords (Numba kernel) ---------------------------------
+        if _HAVE_NUMBA:
+            @_nb.njit(cache=True, fastmath=True, parallel=True)
+            def _geom_from_dN(coords, dN_tab):
+                nE, nLoc = coords.shape[0], coords.shape[1]
+                nQ = dN_tab.shape[1]
+                detJ = np.zeros((nE, nQ))
+                Jinv = np.zeros((nE, nQ, 2, 2))
+                for e in _nb.prange(nE):
+                    for q in range(nQ):
+                        a00 = 0.0; a01 = 0.0; a10 = 0.0; a11 = 0.0
+                        for i in range(nLoc):
+                            gx = dN_tab[e, q, i, 0]
+                            gy = dN_tab[e, q, i, 1]
+                            x = coords[e, i, 0]; y = coords[e, i, 1]
+                            a00 += gx * x; a01 += gx * y
+                            a10 += gy * x; a11 += gy * y
+                        det = a00 * a11 - a01 * a10
+                        detJ[e, q] = det
+                        inv_det = 1.0 / det
+                        Jinv[e, q, 0, 0] =  a11 * inv_det
+                        Jinv[e, q, 0, 1] = -a01 * inv_det
+                        Jinv[e, q, 1, 0] = -a10 * inv_det
+                        Jinv[e, q, 1, 1] =  a00 * inv_det
+                return detJ, Jinv
+
+        mesh = self.mixed_element.mesh
+        me   = self.mixed_element
         fields = me.field_names
 
-        # ----------- normalise input ------------------------------------
+        # ---- normalise / filter to boundary edges (right is None) ---------------
         if hasattr(edge_ids, "to_indices"):
             edge_ids = edge_ids.to_indices()
-        edge_ids = [eid for eid in edge_ids if mesh.edge(eid).right is None]
-        if not edge_ids:                      # nothing to do
-            raise ValueError("No valid boundary edges found in the provided edge IDs.") 
-            return {"eids": np.empty(0, dtype=int)}
+        edge_ids = [int(e) for e in edge_ids if mesh.edge(e).right is None]
+        if not edge_ids:
+            return {"eids": np.empty(0, dtype=int)}  # nothing to do
 
-        cache_key = (_hash_subset(edge_ids), qdeg, tuple(sorted(derivs)))
+        # ---- reuse cache if possible --------------------------------------------
+        global _edge_geom_cache
+        try:
+            _edge_geom_cache
+        except NameError:
+            _edge_geom_cache = {}
+        cache_key = (_hash_subset(edge_ids), int(qdeg), tuple(sorted(derivs)))
         if reuse and cache_key in _edge_geom_cache:
             return _edge_geom_cache[cache_key]
 
-        # ----------- representative rule / array sizes ------------------
-        p0, p1 = mesh.nodes_x_y_pos[list(mesh.edge(edge_ids[0]).nodes)]
-        qp_rep, qw_rep = line_quadrature(p0, p1, qdeg)
-        n_q   = len(qw_rep)
-        n_loc = me.n_dofs_local
+        # ---- sizes ---------------------------------------------------------------
         n_edges = len(edge_ids)
+        # representative to size arrays
+        p0r, p1r = mesh.nodes_x_y_pos[list(mesh.edge(edge_ids[0]).nodes)]
+        qpr, qwr = line_quadrature(p0r, p1r, qdeg)
+        n_q    = len(qwr)
+        n_loc  = me.n_dofs_local
 
-        # ----------- bulk workspaces ------------------------------------
-        qp_phys  =  np.zeros((n_edges, n_q, 2))
-        qw       =  np.zeros((n_edges, n_q))
-        normals  =  np.zeros((n_edges, n_q, 2))
-        detJ_arr =  np.zeros((n_edges, n_q))
-        phi_arr =   np.zeros((n_edges, n_q))
-        Jinv_arr =  np.zeros((n_edges, n_q, 2, 2))
+        # ---- work arrays ---------------------------------------------------------
+        qp_phys  = np.zeros((n_edges, n_q, 2))
+        qw       = np.zeros((n_edges, n_q))
+        normals  = np.zeros((n_edges, n_q, 2))
+        detJ     = np.zeros((n_edges, n_q))
+        J_inv    = np.zeros((n_edges, n_q, 2, 2))
+        phis     = None  # boundary dS: no level-set needed
         gdofs_map = np.zeros((n_edges, n_loc), dtype=np.int32)
-        h_arr = np.zeros((n_edges,))  # Placeholder for element sizes
-
-        # basis / derivative tables
+        h_arr     = np.zeros((n_edges,))
+        # derivative tables (union-sized)
         basis_tabs = {f"d{dx}{dy}_{fld}": np.zeros((n_edges, n_q, n_loc))
-                      for fld in fields for (dx, dy) in derivs}
+                    for fld in fields for (dx, dy) in derivs}
 
-        # ----------- main loop over edges --------------------------------
-        for row, eid_edge in enumerate(edge_ids):
-            edge = mesh.edge(eid_edge)
-            left_elem = edge.left
-            if left_elem is not None:
-                h_arr[row] = mesh.element_char_length(left_elem)  # Store element size
-            owner = edge.left          # guaranteed not None
-            gdofs_map[row] = self.get_elemental_dofs(owner)
+        # ---- batched edge mapping ------------------------------------------------
+        xi1, w_ref = gauss_legendre(qdeg)
+        xi1 = np.asarray(xi1, float); w_ref = np.asarray(w_ref, float)
+        P0 = np.empty((n_edges, 2)); P1 = np.empty((n_edges, 2))
+        for i, gid in enumerate(edge_ids):
+            n0, n1 = mesh.edge(gid).nodes
+            P0[i], P1[i] = mesh.nodes_x_y_pos[n0], mesh.nodes_x_y_pos[n1]
+        if _HAVE_NUMBA:
+            _batched(P0, P1, xi1, w_ref, qp_phys, qw)
+        else:
+            for i in range(n_edges):
+                pts, wts = line_quadrature(P0[i], P1[i], qdeg)
+                qp_phys[i], qw[i] = pts, wts
 
-            p0, p1 = mesh.nodes_x_y_pos[list(edge.nodes)]
-            qpts, qwts = line_quadrature(p0, p1, qdeg)
-            n_vec = edge.normal
+        # ---- normals & dof maps (owner is 'left') -------------------------------
+        for i, gid in enumerate(edge_ids):
+            e = mesh.edge(gid)
+            eid = e.left
+            normals[i, :, :] = e.normal  # constant along edge; outward for owner
+            gdofs_map[i, :]  = self.get_elemental_dofs(eid)
+            h_arr[i]         = mesh.element_char_length(eid)
 
-            qp_phys[row] = qpts
-            qw[row]      = qwts
-            normals[row] = n_vec        # constant per edge – replicate
+        # ---- (ξ,η) tables on the owner element ---------------------------------
+        xi_tab  = np.empty((n_edges, n_q))
+        eta_tab = np.empty((n_edges, n_q))
+        eids_arr = np.empty((n_edges,), dtype=np.int32)
+        for i, gid in enumerate(edge_ids):
+            eid = mesh.edge(gid).left
+            eids_arr[i] = eid
+            for q in range(n_q):
+                s, t = transform.inverse_mapping(mesh, eid, qp_phys[i, q])
+                xi_tab[i, q]  = float(s)
+                eta_tab[i, q] = float(t)
 
-            for q, (xq, wq) in enumerate(zip(qpts, qwts)):
-                xi, eta = transform.inverse_mapping(mesh, owner, xq)
-                J       = transform.jacobian(mesh, owner, (xi, eta))
-                J_inv   = np.linalg.inv(J)
+        # ---- reference dN for geometry order; build J, detJ, J⁻¹ ----------------
+        node_ids_all = mesh.nodes[mesh.elements_connectivity]
+        coords_all   = mesh.nodes_x_y_pos[node_ids_all].astype(float)
+        coords_sel   = coords_all[eids_arr]
+        nLocGeom     = coords_sel.shape[1]
+        dN_tab = np.empty((n_edges, n_q, nLocGeom, 2))
+        if mesh.element_type == "quad" and mesh.poly_order == 1:
+            _tabulate_q1(xi_tab, eta_tab, np.empty((n_edges, n_q, 4)), dN_tab)
+        elif mesh.element_type == "quad" and mesh.poly_order == 2:
+            _tabulate_q2(xi_tab, eta_tab, np.empty((n_edges, n_q, 9)), dN_tab)
+        elif mesh.element_type == "tri" and mesh.poly_order == 1:
+            _tabulate_p1(xi_tab, eta_tab, np.empty((n_edges, n_q, 3)), dN_tab)
+        else:
+            ref = get_reference(mesh.element_type, mesh.poly_order)
+            for i in range(n_edges):
+                for q in range(n_q):
+                    dN_tab[i, q] = np.asarray(ref.grad(xi_tab[i, q], eta_tab[i, q]), dtype=float)
 
-                detJ_arr[row, q] = np.linalg.det(J)
-                Jinv_arr[row, q] = J_inv
+        if _HAVE_NUMBA:
+            detJ[:], J_inv[:] = _geom_from_dN(coords_sel, dN_tab)
+        else:
+            for e in range(n_edges):
+                Xe = coords_sel[e]
+                for q in range(n_q):
+                    a00 = a01 = a10 = a11 = 0.0
+                    for iL in range(nLocGeom):
+                        gx, gy = dN_tab[e, q, iL, 0], dN_tab[e, q, iL, 1]
+                        x, y = Xe[iL, 0], Xe[iL, 1]
+                        a00 += gx * x; a01 += gx * y
+                        a10 += gy * x; a11 += gy * y
+                    d = a00 * a11 - a01 * a10
+                    detJ[e, q] = d
+                    invd = 1.0 / d
+                    J_inv[e, q, 0, 0] =  a11 * invd
+                    J_inv[e, q, 0, 1] = -a01 * invd
+                    J_inv[e, q, 1, 0] = -a10 * invd
+                    J_inv[e, q, 1, 1] =  a00 * invd
 
-                sx, sy = J_inv[0, 0], J_inv[1, 1]   # axis-aligned quad
-                for fld in fields:
-                    for dx, dy in derivs:
-                        ref   = me.deriv_ref(fld, xi, eta, dx, dy)
-                        basis_tabs[f"d{dx}{dy}_{fld}"][row, q] = \
-                            ref * (sx**dx) * (sy**dy)
+        # ---- tabulate derivatives per field and push-forward --------------------
+        derivs = set(derivs)  # ensure (0,0) is included if needed by the kernel build
+        for fld in fields:
+            sl  = me.component_dof_slices[fld]
+            p_f = me._field_orders[fld]
+            # choose tabulator for field
+            if mesh.element_type == "quad" and p_f == 1:
+                tab = _tabulate_deriv_q1
+                n_f = 4
+            elif mesh.element_type == "quad" and p_f == 2:
+                tab = _tabulate_deriv_q2
+                n_f = 9
+            elif mesh.element_type == "tri" and p_f == 1:
+                tab = _tabulate_deriv_p1
+                n_f = 3
+            else:
+                tab = None
+                n_f = sl.stop - sl.start
 
-        out = {"eids": np.asarray(edge_ids, dtype=np.int32),
-               "qp_phys": qp_phys, "qw": qw, "normals": normals,
-               "detJ": detJ_arr, "J_inv": Jinv_arr,
-               "gdofs_map": gdofs_map,
-               "phis": phi_arr, "h_arr": h_arr,
-               "entity_kind": "edge"
-               }
+            for (dx, dy) in derivs:
+                key = f"d{dx}{dy}_{fld}"
+                loc = np.empty((n_edges, n_q, n_f))
+                if tab is not None:
+                    tab(xi_tab, eta_tab, int(dx), int(dy), loc)
+                else:
+                    # generic fallback via MixedElement (reference)
+                    for e in range(n_edges):
+                        for q in range(n_q):
+                            loc[e, q, :] = me._eval_scalar_deriv(fld, xi_tab[e, q], eta_tab[e, q], dx, dy)
+
+                # diagonal push-forward used elsewhere in boundary/ghost paths
+                sx = J_inv[:, :, 0, 0]; sy = J_inv[:, :, 1, 1]
+                phys = loc * (sx ** dx)[:, :, None] * (sy ** dy)[:, :, None]
+                basis_tabs[key][:, :, sl] = phys  # scatter into union block
+
+        out = {
+            "eids":      np.asarray(edge_ids, dtype=np.int32),
+            "qp_phys":   qp_phys,
+            "qw":        qw,
+            "normals":   normals,
+            "detJ":      detJ,          # neutral for dS in kernels that don’t use it
+            "J_inv":     J_inv,
+            "phis":      phis,          # not used for exterior_facet
+            "gdofs_map": gdofs_map,
+            "h_arr":     h_arr,
+            "entity_kind": "edge",
+        }
         out.update(basis_tabs)
 
         if reuse:
             _edge_geom_cache[cache_key] = out
         return out
+
     
 
     # --- cut volume --------------------------------------
