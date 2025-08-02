@@ -240,3 +240,57 @@ if _HAVE_NUMBA:
         for e in _nb.prange(nE):
             for q in range(nQ):
                 out[e, q, :] = _eval_deriv_p1(xi_tab[e, q], eta_tab[e, q], dx, dy)
+
+    @_nb.njit(cache=True, fastmath=True)
+    def _q1_shape_grad(xi, eta):
+        # NOTE: This uses a counter-clockwise order, not lexicographical
+        N = np.empty(4); dN = np.empty((4, 2))
+        N[0] = 0.25 * (1 - xi) * (1 - eta)
+        N[1] = 0.25 * (1 + xi) * (1 - eta)
+        N[2] = 0.25 * (1 + xi) * (1 + eta)
+        N[3] = 0.25 * (1 - xi) * (1 + eta)
+        dN[0, 0] = -0.25 * (1 - eta); dN[0, 1] = -0.25 * (1 - xi)
+        dN[1, 0] =  0.25 * (1 - eta); dN[1, 1] = -0.25 * (1 + xi)
+        dN[2, 0] =  0.25 * (1 + eta); dN[2, 1] =  0.25 * (1 + xi)
+        dN[3, 0] = -0.25 * (1 + eta); dN[3, 1] =  0.25 * (1 - xi)
+        return N, dN
+    
+    @_nb.njit(cache=True, fastmath=True)
+    def _q2_shape_grad(xi, eta):
+        """
+        Computes Q2 shape functions and gradients in LEXICOGRAPHICAL order.
+        """
+        N = np.empty(9); dN = np.empty((9, 2))
+        s = xi; t = eta
+        s_m1 = s - 1.0; s_p1 = s + 1.0
+        t_m1 = t - 1.0; t_p1 = t + 1.0
+        s2 = s * s; t2 = t * t
+        s2_m1 = 1.0 - s2; t2_m1 = 1.0 - t2
+        # Node 0: (-1, -1)
+        N[0] = 0.25 * s * t * s_m1 * t_m1
+        dN[0, 0] = 0.25 * t * t_m1 * (2*s - 1.0); dN[0, 1] = 0.25 * s * s_m1 * (2*t - 1.0)
+        # Node 1: (0, -1)
+        N[1] = 0.5 * t * t_m1 * s2_m1
+        dN[1, 0] = -s * t * t_m1; dN[1, 1] = 0.5 * s2_m1 * (2*t - 1.0)
+        # Node 2: (1, -1)
+        N[2] = 0.25 * s * t * s_p1 * t_m1
+        dN[2, 0] = 0.25 * t * t_m1 * (2*s + 1.0); dN[2, 1] = 0.25 * s * s_p1 * (2*t - 1.0)
+        # Node 3: (-1, 0)
+        N[3] = 0.5 * s * s_m1 * t2_m1
+        dN[3, 0] = 0.5 * (2*s - 1.0) * t2_m1; dN[3, 1] = -t * s * s_m1
+        # Node 4: (0, 0)
+        N[4] = s2_m1 * t2_m1
+        dN[4, 0] = -2.0 * s * t2_m1; dN[4, 1] = -2.0 * t * s2_m1
+        # Node 5: (1, 0)
+        N[5] = 0.5 * s * s_p1 * t2_m1
+        dN[5, 0] = 0.5 * (2*s + 1.0) * t2_m1; dN[5, 1] = -t * s * s_p1
+        # Node 6: (-1, 1)
+        N[6] = 0.25 * s * t * s_m1 * t_p1
+        dN[6, 0] = 0.25 * t * t_p1 * (2*s - 1.0); dN[6, 1] = 0.25 * s * s_m1 * (2*t + 1.0)
+        # Node 7: (0, 1)
+        N[7] = 0.5 * t * t_p1 * s2_m1
+        dN[7, 0] = -s * t * t_p1; dN[7, 1] = 0.5 * s2_m1 * (2*t + 1.0)
+        # Node 8: (1, 1)
+        N[8] = 0.25 * s * t * s_p1 * t_p1
+        dN[8, 0] = 0.25 * t * t_p1 * (2*s + 1.0); dN[8, 1] = 0.25 * s * s_p1 * (2*t + 1.0)
+        return N, dN
