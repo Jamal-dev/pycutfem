@@ -6,6 +6,8 @@ from scipy.spatial import Delaunay
 from pycutfem.io.visualization import visualize_mesh_node_order
 from pycutfem.core.topology import Node
 from typing import List, Tuple, Dict, Callable, Optional
+import numba
+
 
 __all__ = ["delaunay_rectangle", "structured_quad", "structured_triangles"]
 
@@ -42,14 +44,112 @@ def _translate_nodes(nodes: List[Node], offset: Tuple[float, float]):
         node.x = coords[i, 0]
         node.y = coords[i, 1]
 
+@numba.jit(nopython=True, cache=True)
+def _translate_coords(coords: np.ndarray, offset: np.ndarray):
+    """Translates all node coordinates by a given offset vector."""
+    coords[:, 0] += offset[0]
+    coords[:, 1] += offset[1]
+    return coords
+
 def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int, 
-                    offset: Optional[Tuple[float, float]] = None):
+                    offset: Optional[Tuple[float, float]] = None,numba_path=True, parallel: bool = True):
     """
     Main wrapper for generating structured quadrilateral meshes.
     Returns raw data: node objects, element connectivity, edge connectivity,
     and corner node connectivity for each element.
     """
-    return _structured_qn(Lx, Ly, nx, ny, poly_order, offset)
+    if not numba_path:
+        return _structured_qn(Lx, Ly, nx, ny, poly_order, offset)
+    else:
+        # 1. Call the fast Numba core to get raw NumPy arrays
+        nodes_coords, elements, edges, elements_corner_nodes = _structured_qn_numba(
+            Lx, Ly, nx, ny, poly_order, parallel
+        )
+        if offset is not None:
+            nodes_coords = _translate_coords(nodes_coords, np.array(offset, dtype=np.float64))
+
+        # 2. Convert the raw coordinate array back to a list of Node objects
+        # This loop is fast and runs in standard Python.
+        node_objects = [
+            Node(id=i, x=coord[0], y=coord[1])
+            for i, coord in enumerate(nodes_coords)
+        ]
+
+        # 3. Return the Node objects and other connectivity data
+        return node_objects, elements, edges, elements_corner_nodes
+
+@numba.jit(nopython=True, parallel=True, cache=True)
+def _structured_qn_numba(Lx: float, Ly: float, nx: int, ny: int, order: int, parallel: bool):
+    """
+    Generates raw data for a structured Qn quadrilateral mesh using Numba.
+    """
+    if order < 1:
+        # Numba doesn't support raising ValueError with strings, so error is minimal.
+        raise ValueError("Polynomial order must be a positive integer.")
+
+    # --- 1. Generate Node Coordinates ---
+    num_global_nodes_x = order * nx + 1
+    num_global_nodes_y = order * ny + 1
+    num_total_nodes = num_global_nodes_x * num_global_nodes_y
+    nodes_coords = np.zeros((num_total_nodes, 2), dtype=np.float64)
+    
+    x_coords = np.linspace(0, Lx, num_global_nodes_x)
+    y_coords = np.linspace(0, Ly, num_global_nodes_y)
+
+    # Numba can parallelize this loop efficiently
+    for j_glob in numba.prange(num_global_nodes_y) if parallel else range(num_global_nodes_y):
+        for i_glob in range(num_global_nodes_x):
+            node_id = j_glob * num_global_nodes_x + i_glob
+            nodes_coords[node_id, 0] = x_coords[i_glob]
+            nodes_coords[node_id, 1] = y_coords[j_glob]
+
+    # --- 2. Generate Element and Edge Connectivity ---
+    num_elements = nx * ny
+    nodes_per_edge_1d = order + 1
+    elements = np.empty((num_elements, nodes_per_edge_1d**2), dtype=np.int64)
+    elements_corner_nodes = np.empty((num_elements, 4), dtype=np.int64)
+    # A set() is not supported in nopython mode, so we collect all edges
+    # and find the unique ones later using numpy.
+    all_edges = np.empty((num_elements * 4, 2), dtype=np.int64)
+
+    # This loop is also safe to parallelize
+    for el_idx in numba.prange(num_elements) if parallel else range(num_elements):
+        el_j = el_idx // nx
+        el_i = el_idx % nx
+        
+        start_ix, start_iy = order * el_i, order * el_j
+        
+        # A. Build Full Element Connectivity
+        local_node_idx = 0
+        for local_ny in range(nodes_per_edge_1d):
+            for local_nx in range(nodes_per_edge_1d):
+                gid = (start_iy + local_ny) * num_global_nodes_x + (start_ix + local_nx)
+                elements[el_idx, local_node_idx] = gid
+                local_node_idx += 1
+        
+        # B. Identify and store corners for this element (CCW order)
+        bl_gid = start_iy * num_global_nodes_x + start_ix
+        br_gid = start_iy * num_global_nodes_x + (start_ix + order)
+        tl_gid = (start_iy + order) * num_global_nodes_x + start_ix
+        tr_gid = (start_iy + order) * num_global_nodes_x + (start_ix + order)
+        corners = np.array([bl_gid, br_gid, tr_gid, tl_gid])
+        elements_corner_nodes[el_idx, :] = corners
+        
+        # C. Store all geometric edges for later unique filtering
+        edge_offset = el_idx * 4
+        all_edges[edge_offset, :] = np.sort(np.array([corners[0], corners[1]]))
+        all_edges[edge_offset + 1, :] = np.sort(np.array([corners[1], corners[2]]))
+        all_edges[edge_offset + 2, :] = np.sort(np.array([corners[2], corners[3]]))
+        all_edges[edge_offset + 3, :] = np.sort(np.array([corners[3], corners[0]]))
+
+    # --- 3. Filter for Unique Edges (serial operation) ---
+    # This is a standard method to find unique rows in a NumPy array.
+    if num_elements > 0:
+        edges = np.unique(all_edges, axis=0)
+    else:
+        edges = np.empty((0, 2), dtype=np.int64)
+
+    return nodes_coords, elements, edges, elements_corner_nodes
 
 def _structured_qn(Lx: float, Ly: float, nx: int, ny: int, order: int, 
                    offset: Optional[Tuple[float, float]] = None) -> Tuple[List[Node], np.ndarray, np.ndarray, np.ndarray]:
