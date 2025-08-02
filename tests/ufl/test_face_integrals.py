@@ -259,7 +259,7 @@ def test_jump_grad_vector(mesh:Mesh):
 
     # form = dot(jump_grad_v,n) * dInterface(level_set=phi)
     form = Jump(grad_v_pos_n,grad_v_neg_n) * dInterface(level_set=phi)
-    eq   = form == Constant(0.0) * dx
+    eq   = form == None
     res  = assemble_form(eq, dof_handler=dof_handler, bcs=[],
                          assembler_hooks={type(form.integrand):{'name':'jv'}})
     exact = reference_solution_vector()

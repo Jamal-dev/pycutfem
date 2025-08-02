@@ -32,9 +32,9 @@ class Form(Expression):
 
 class Equation:
     def __init__(self, a, L):
-        # Ensure both sides of the equation are Form objects
-        self.a = a if isinstance(a, Form) else Form([a])
-        self.L = L if isinstance(L, Form) else Form([L])
+        # Allow a side to be None, otherwise ensure it's a Form object.
+        self.a = a if isinstance(a, Form) or a is None else Form([a])
+        self.L = L if isinstance(L, Form) or L is None else Form([L])
 
 class BoundaryCondition:
     def __init__(self, field: str, method: str, domain_tag: str, value: Callable):
@@ -63,7 +63,6 @@ def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None,
     # are present, compiler.ctx['scalar_results'] is populated.
     K, F = compiler.assemble(equation, bcs)
 
-    # --- FIXED RETURN LOGIC ---
     # After assembly, check the compiler's context for scalar results.
     # If the user provided hooks and those hooks produced results, return them.
     if assembler_hooks and 'scalar_results' in compiler.ctx:

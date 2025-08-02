@@ -70,3 +70,37 @@ class CompositeLevelSet(LevelSetFunction):
         return np.stack([ls.gradient(x) for ls in self.levelsets])
     def evaluate_on_nodes(self, mesh):
         return np.vstack([ls.evaluate_on_nodes(mesh) for ls in self.levelsets])
+
+# --- Numba helpers for common level sets -----------------------------------
+try:
+    import numba as _nb  # type: ignore
+    _HAVE_NUMBA = True
+except Exception:
+    _HAVE_NUMBA = False
+
+if _HAVE_NUMBA:
+    @_nb.njit(cache=True, fastmath=True)
+    def _circle_value(x, cx, cy, r):
+        dx = x[0] - cx; dy = x[1] - cy
+        return (dx*dx + dy*dy) ** 0.5 - r
+
+    @_nb.njit(cache=True, fastmath=True)
+    def _circle_grad(x, cx, cy):
+        dx = x[0] - cx; dy = x[1] - cy
+        n = (dx*dx + dy*dy) ** 0.5
+        g = np.zeros(2)
+        if n > 0.0:
+            g[0] = dx / n; g[1] = dy / n
+        return g
+
+    @_nb.njit(cache=True, fastmath=True)
+    def _affine_value(x, a, b, c):
+        return a * x[0] + b * x[1] + c
+
+    @_nb.njit(cache=True, fastmath=True)
+    def _affine_unit_grad(a, b):
+        n = (a*a + b*b) ** 0.5
+        g = np.zeros(2)
+        if n > 0.0:
+            g[0] = a / n; g[1] = b / n
+        return g

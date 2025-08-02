@@ -850,123 +850,283 @@ class DofHandler:
     # -------------------------------------------------------------------------
      
     def precompute_interface_factors(
-        self,
-        cut_element_ids: "BitSet | Sequence[int]",
-        qdeg: int,
-        level_set,
-        reuse: bool = True,
+        self, cut_element_ids, qdeg: int, level_set, reuse: bool = True
     ) -> dict:
-        """
-        Pre-computes all geometric data for interface integrals on a given
-        set of CUT elements.
+        from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
+        from pycutfem.core.levelset import CircleLevelSet, AffineLevelSet
+        from pycutfem.core.levelset import _circle_value, _circle_grad, _affine_value, _affine_unit_grad  # type: ignore
+        from pycutfem.fem import transform
+        from pycutfem.fem.reference import get_reference
+        from pycutfem.integration.pre_tabulates import _tabulate_p1, _tabulate_q2, _tabulate_q1
 
-        This is the authoritative method for preparing data for dInterface JIT kernels.
-        It iterates directly over cut elements, not edges, ensuring all geometric
-        data (Jacobians, etc.) is sourced from the correct parent element.
+        # ---- numba availability -------------------------------------------------
+        try:
+            import numba as _nb  # noqa: F401
+            _HAVE_NUMBA = True
+        except Exception:
+            _HAVE_NUMBA = False
 
-        Parameters
-        ----------
-        cut_element_ids : BitSet | Sequence[int]
-            The element IDs of the 'cut' elements to process.
-        qdeg : int
-            1-D quadrature order along the interface segment.
-        level_set : callable
-            The level-set function, required for calculating normals.
-
-        Returns
-        -------
-        dict
-            A dictionary of pre-computed arrays, with the first dimension
-            corresponding to the order of `cut_element_ids`. Keys include:
-            'eids', 'qp_phys', 'qw', 'normals', 'phis', 'detJ', 'J_inv'.
-        """
-        if self.DEBUG:
-            print("-" * 80)
-            print(f"Precomputing interface factors for {len(cut_element_ids)} cut elements with qdeg={qdeg}...")
-            print("-" * 80)
+        # ---- J from dN and coords (Numba kernel) --------------------------------
+        if _HAVE_NUMBA:
+            @_nb.njit(cache=True, fastmath=True, parallel=True)
+            def _geom_from_dN(coords, dN_tab):
+                # coords: (nE, nLoc, 2), dN_tab: (nE, nQ, nLoc, 2)
+                nE, nLoc = coords.shape[0], coords.shape[1]
+                nQ = dN_tab.shape[1]
+                detJ = np.zeros((nE, nQ))
+                Jinv = np.zeros((nE, nQ, 2, 2))
+                for e in _nb.prange(nE):
+                    for q in range(nQ):
+                        a00 = 0.0; a01 = 0.0; a10 = 0.0; a11 = 0.0
+                        for i in range(nLoc):
+                            gx = dN_tab[e, q, i, 0]
+                            gy = dN_tab[e, q, i, 1]
+                            x = coords[e, i, 0]; y = coords[e, i, 1]
+                            a00 += gx * x; a01 += gx * y
+                            a10 += gy * x; a11 += gy * y
+                        det = a00 * a11 - a01 * a10
+                        detJ[e, q] = det
+                        inv_det = 1.0 / det
+                        Jinv[e, q, 0, 0] =  a11 * inv_det
+                        Jinv[e, q, 0, 1] = -a01 * inv_det
+                        Jinv[e, q, 1, 0] = -a10 * inv_det
+                        Jinv[e, q, 1, 1] =  a00 * inv_det
+                return detJ, Jinv
 
         mesh = self.mixed_element.mesh
-        ids = cut_element_ids.to_indices() if hasattr(cut_element_ids, "to_indices") else list(cut_element_ids)
+        me   = self.mixed_element
 
-        # Filter for elements that are actually 'cut' and have a valid segment
+        # --- normalize ids → valid cuts with 2 interface points -----------------
+        ids = (cut_element_ids.to_indices()
+            if hasattr(cut_element_ids, "to_indices")
+            else list(cut_element_ids))
         valid_cut_eids = [
-            eid for eid in ids
-            if mesh.elements_list[eid].tag == 'cut' and len(mesh.elements_list[eid].interface_pts) == 2
+            int(eid) for eid in ids
+            if (mesh.elements_list[eid].tag == "cut"
+                and len(mesh.elements_list[eid].interface_pts) == 2)
         ]
-        
         if not valid_cut_eids:
-            # Return empty arrays with correct shapes if no valid cut elements
-            return {
-                'eids': np.array([], dtype=int),
-                'qp_phys': np.empty((0, 0, 2)), 'qw': np.empty((0, 0)),
-                'normals': np.empty((0, 0, 2)), 'phis': np.empty((0, 0)),
-                'detJ': np.empty((0, 0)), 'J_inv': np.empty((0, 0, 2, 2)),
-            }
+            z2 = np.empty((0, 0, 2)); z1 = np.empty((0, 0))
+            out = {"eids": np.array([], dtype=int), "qp_phys": z2, "qw": z1,
+                "normals": z2, "phis": z1, "detJ": z1, "J_inv": np.empty((0, 0, 2, 2)),
+                "h_arr": np.empty((0,)), "entity_kind": "element"}
+            for fld in me.field_names:
+                out[f"b_{fld}"] = z1.reshape(0, 0)
+                out[f"g_{fld}"] = np.empty((0, 0, me.n_dofs_local, 2))
+            return out
 
-        # --- Use a cache if requested ---
-        cache_key = (_hash_subset(valid_cut_eids), qdeg, id(level_set))
+        # --- cache key and lookup ----------------------------------------------
+        cache_key = (_hash_subset(valid_cut_eids), int(qdeg), id(level_set))
         if reuse and cache_key in _edge_geom_cache:
             return _edge_geom_cache[cache_key]
 
-        # --- Allocation ---
-        n_elems = len(valid_cut_eids)
-        # n_elems = mesh.n_elements
-        # We need a representative segment to determine n_q
-        p0_rep, p1_rep = mesh.elements_list[valid_cut_eids[0]].interface_pts
-        q_xi_rep, q_w_rep = line_quadrature(p0_rep, p1_rep, qdeg)
-        n_q = len(q_w_rep)
-
-        qp_phys = np.zeros((n_elems, n_q, 2))
-        qw = np.zeros((n_elems, n_q))
-        normals = np.zeros((n_elems, n_q, 2))
-        phis = np.zeros((n_elems, n_q))
-        detJ_arr = np.zeros((n_elems, n_q))
-        Jinv_arr = np.zeros((n_elems, n_q, 2, 2))
-        # ---------- NEW: basis / grad-basis tables on the interface ----------
-        me      = self.mixed_element
-        fields  = me.field_names            # ['vx', 'vy', …]
-        b_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local))         for f in fields}
-        g_tabs  = {f: np.zeros((n_elems, n_q, me.n_dofs_local, 2))      for f in fields}
-        h_arr = np.zeros((n_elems,))  # Placeholder for element sizes
-        
-
-        # --- Loop over valid cut elements ---
+        # --- Prepare segments for batched mapping -------------------------------
+        nE = len(valid_cut_eids)
+        P0 = np.empty((nE, 2), dtype=float)
+        P1 = np.empty((nE, 2), dtype=float)
+        h_arr = np.empty((nE,), dtype=float)
         for k, eid in enumerate(valid_cut_eids):
-            # h_arr[eid] = mesh.element_char_length(eid)  # Store element size
-            # print(f"eid: {eid}, h_arr[eid]: {h_arr[eid]}")  # Debug output
-            elem = mesh.elements_list[eid]
-            p0, p1 = elem.interface_pts
+            p0, p1 = mesh.elements_list[eid].interface_pts
+            P0[k] = p0; P1[k] = p1
             h_arr[k] = mesh.element_char_length(eid)
 
-            # --- Quadrature rule on the physical interface segment ---
-            q_xi, q_w = line_quadrature(p0, p1, qdeg)
+        xi_1d, w_ref = gauss_legendre(qdeg)
+        xi_1d = np.asarray(xi_1d, float); w_ref = np.asarray(w_ref, float)
+        nQ = xi_1d.size
 
-            for q, (xq, wq) in enumerate(zip(q_xi, q_w)):
-                qp_phys[k, q] = xq
-                qw[k, q] = wq
+        qp_phys = np.empty((nE, nQ, 2), dtype=float)
+        qw      = np.empty((nE, nQ),    dtype=float)
 
-                # Normal and phi value from the level set
-                g = level_set.gradient(xq)
-                norm_g = np.linalg.norm(g)
-                normals[k, q] = g / (norm_g + 1e-30)
-                phis[k, q] = level_set(xq)
+        if _HAVE_NUMBA:
+            _batched(P0, P1, xi_1d, w_ref, qp_phys, qw)
+        else:
+            from pycutfem.integration.quadrature import line_quadrature
+            for k in range(nE):
+                pts, wts = line_quadrature(P0[k], P1[k], qdeg)
+                qp_phys[k, :, :] = pts; qw[k, :] = wts
 
-                # Jacobian of the parent element at the quadrature point
-                xi_ref, eta_ref = transform.inverse_mapping(mesh, eid, xq)
-                J = transform.jacobian(mesh, eid, (xi_ref, eta_ref))
-                detJ_arr[k, q] = np.linalg.det(J)
-                Jinv_arr[k, q] = np.linalg.inv(J)
-                for fld in fields:
-                    b_tabs[fld][k, q] = me.basis      (fld, xi_ref, eta_ref)
-                    g_tabs[fld][k, q] = me.grad_basis (fld, xi_ref, eta_ref)
+        # --- φ and normals (JIT for common LS) ---------------------------------
+        phis    = np.empty((nE, nQ), dtype=float)
+        normals = np.empty((nE, nQ, 2), dtype=float)
 
-        # --- Gather results and cache ---
+        if _HAVE_NUMBA and isinstance(level_set, CircleLevelSet):
+            cx, cy = float(level_set.center[0]), float(level_set.center[1])
+            r = float(level_set.radius)
+            for e in range(nE):
+                for q in range(nQ):
+                    xq = qp_phys[e, q]
+                    phis[e, q] = _circle_value(xq, cx, cy, r)
+                    normals[e, q] = _circle_grad(xq, cx, cy)
+        elif _HAVE_NUMBA and isinstance(level_set, AffineLevelSet):
+            a, b, c = level_set.a, level_set.b, level_set.c
+            g_unit = _affine_unit_grad(a, b)
+            for e in range(nE):
+                for q in range(nQ):
+                    phis[e, q] = _affine_value(qp_phys[e, q], a, b, c)
+                    normals[e, q] = g_unit
+        else:
+            for e in range(nE):
+                for q in range(nQ):
+                    xq = qp_phys[e, q]
+                    phis[e, q] = level_set(xq)
+                    g = level_set.gradient(xq)
+                    ng = np.linalg.norm(g)
+                    normals[e, q] = g / (ng + 1e-30)
+
+        # --- (ξ,η) at each interface quadrature point --------------------------
+        xi_tab  = np.empty((nE, nQ), dtype=float)
+        eta_tab = np.empty((nE, nQ), dtype=float)
+        for k, eid in enumerate(valid_cut_eids):
+            for q in range(nQ):
+                xi_eta = transform.inverse_mapping(mesh, eid, qp_phys[k, q])  # fast path if p==1
+                xi_tab[k, q]  = float(xi_eta[0])
+                eta_tab[k, q] = float(xi_eta[1])
+
+        # --- Reference basis/grad (P1, Q1, Q2 JIT; else generic) ---------------
+        elem_type = mesh.element_type
+        p_geom    = mesh.poly_order  # geometry/order on the mesh
+
+        # parent element coordinates for geometry/J
+        node_ids_all = mesh.nodes[mesh.elements_connectivity]
+        coords_all   = mesh.nodes_x_y_pos[node_ids_all].astype(float)
+        coords_sel   = coords_all[valid_cut_eids]  # (nE, nLocGeom, 2)
+        nLocGeom     = coords_sel.shape[1]
+        # Invariant: local-node ordering is row-major (eta rows bottom→top, xi left→right) on quads,
+        # and the standard Pk ordering from tri_pn on triangles. Mesh connectivity is built that way
+        # (structured_quad/_structured_qn_numba), and tabulators (_tabulate_q1/_tabulate_q2/_tabulate_p1)
+        # must emit in exactly the same order. With that, J = dN^T @ X uses consistent indices.
+
+
+        # Build dN_tab (nE, nQ, nLocGeom, 2) and also N_tab if we can (for basis fill)
+        have_jit_ref = False
+        if _HAVE_NUMBA and elem_type == "tri" and p_geom == 1:
+            # P1 triangle
+            N_tab  = np.empty((nE, nQ, 3), dtype=float)
+            dN_tab = np.empty((nE, nQ, 3, 2), dtype=float)
+            _tabulate_p1(xi_tab, eta_tab, N_tab, dN_tab)
+            have_jit_ref = True
+        elif _HAVE_NUMBA and elem_type == "quad" and p_geom == 1:
+            # Q1 quad
+            N_tab  = np.empty((nE, nQ, 4), dtype=float)
+            dN_tab = np.empty((nE, nQ, 4, 2), dtype=float)
+            _tabulate_q1(xi_tab, eta_tab, N_tab, dN_tab)
+            have_jit_ref = True
+        elif _HAVE_NUMBA and elem_type == "quad" and p_geom == 2:
+            # Q2 quad
+            N_tab  = np.empty((nE, nQ, 9), dtype=float)
+            dN_tab = np.empty((nE, nQ, 9, 2), dtype=float)
+            _tabulate_q2(xi_tab, eta_tab, N_tab, dN_tab)
+            have_jit_ref = True
+        else:
+            # Generic reference (Python) — use Ref object
+            ref = get_reference(elem_type, p_geom)
+            dN_tab = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
+            # N_tab is only needed for basis fallback; allocate lazily below if needed
+            for k in range(nE):
+                for q in range(nQ):
+                    dN_tab[k, q] = np.asarray(ref.grad(xi_tab[k, q], eta_tab[k, q]), dtype=float)
+
+        # --- J, detJ, J_inv from (coords, dN_tab) -------------------------------
+        if _HAVE_NUMBA and have_jit_ref:
+            detJ, J_inv = _geom_from_dN(coords_sel, dN_tab)
+        else:
+            detJ = np.empty((nE, nQ), dtype=float)
+            J_inv = np.empty((nE, nQ, 2, 2), dtype=float)
+            for e in range(nE):
+                Xe = coords_sel[e]
+                for q in range(nQ):
+                    a00 = a01 = a10 = a11 = 0.0
+                    for i in range(nLocGeom):
+                        gx, gy = dN_tab[e, q, i, 0], dN_tab[e, q, i, 1]
+                        x, y = Xe[i, 0], Xe[i, 1]
+                        a00 += gx * x; a01 += gx * y
+                        a10 += gy * x; a11 += gy * y
+                    det = a00 * a11 - a01 * a10
+                    detJ[e, q] = det
+                    invd = 1.0 / det
+                    J_inv[e, q, 0, 0] =  a11 * invd
+                    J_inv[e, q, 0, 1] = -a01 * invd
+                    J_inv[e, q, 1, 0] = -a10 * invd
+                    J_inv[e, q, 1, 1] =  a00 * invd
+
+        # Optional: when debugging local-node order, verify one point
+        if getattr(self, "DEBUG", False):
+            e0, q0 = 0, 0
+            xi_eta0 = (xi_tab[e0, q0], eta_tab[e0, q0])
+            J_py = transform.jacobian(mesh, valid_cut_eids[e0], xi_eta0)
+            if abs(np.linalg.det(J_py) - detJ[e0, q0]) > 1e-12:
+                raise RuntimeError("Local-node ordering mismatch: detJ(py) != detJ(jit).")
+        # Basic sanity: non-degenerate mapping
+        bad = np.where(detJ <= 1e-12)
+        if bad[0].size:
+            e_bad, q_bad = int(bad[0][0]), int(bad[1][0])
+            raise ValueError(
+                f"Jacobian determinant is non-positive ({detJ[e_bad, q_bad]}) "
+                f"for element idx {e_bad} at qp {q_bad}."
+            )
+
+        # --- Basis & grad-basis on REFERENCE for each field ---------------------
+        fields = me.field_names
+        b_tabs = {f: np.zeros((nE, nQ, me.n_dofs_local), dtype=float) for f in fields}
+        g_tabs = {f: np.zeros((nE, nQ, me.n_dofs_local, 2), dtype=float) for f in fields}
+
+        # We can reuse N_tab for P1/Q1/Q2; otherwise allocate a temp and use MixedElement
+        for fld in fields:
+            sl = me.component_dof_slices[fld]    # where this field lives in the union vector
+            order_f = me._field_orders[fld]      # field polynomial order
+
+            if _HAVE_NUMBA and elem_type == "tri" and order_f == 1 and p_geom == 1 and N_tab.shape[2] == 3:
+                b_tabs[fld][:, :, sl]    = N_tab
+                g_tabs[fld][:, :, sl, :] = dN_tab
+                continue
+
+            if _HAVE_NUMBA and elem_type == "quad" and order_f == 1 and p_geom in (1, 2) and (N_tab.shape[2] == 4):
+                # geometry could be Q1 or Q2; field is Q1 (4 local basis)
+                # (we already built Q1 N_tab/dN_tab above when p_geom==1; if p_geom==2 and field is Q1,
+                #  we still need Q1 reference tables at (xi,eta) – compute them quickly here)
+                if p_geom == 2 and N_tab.shape[2] != 4:
+                    # make local Q1 tables at the same (xi,eta)
+                    Nq1  = np.empty((nE, nQ, 4), dtype=float)
+                    dNq1 = np.empty((nE, nQ, 4, 2), dtype=float)
+                    _tabulate_q1(xi_tab, eta_tab, Nq1, dNq1)
+                    b_tabs[fld][:, :, sl]    = Nq1
+                    g_tabs[fld][:, :, sl, :] = dNq1
+                else:
+                    b_tabs[fld][:, :, sl]    = N_tab
+                    g_tabs[fld][:, :, sl, :] = dN_tab
+                continue
+
+            if _HAVE_NUMBA and elem_type == "quad" and order_f == 2:
+                # ensure we have Q2 ref tables
+                if not (have_jit_ref and N_tab.shape[2] == 9):
+                    Nq2  = np.empty((nE, nQ, 9), dtype=float)
+                    dNq2 = np.empty((nE, nQ, 9, 2), dtype=float)
+                    _tabulate_q2(xi_tab, eta_tab, Nq2, dNq2)
+                    b_tabs[fld][:, :, sl]    = Nq2
+                    g_tabs[fld][:, :, sl, :] = dNq2
+                else:
+                    b_tabs[fld][:, :, sl]    = N_tab
+                    g_tabs[fld][:, :, sl, :] = dN_tab
+                continue
+
+            # ---- Generic fallback using MixedElement (reference values) --------
+            # If we reach here, use me._eval_scalar_basis/_eval_scalar_grad per point
+            for k, eid in enumerate(valid_cut_eids):
+                for q in range(nQ):
+                    s, t = xi_tab[k, q], eta_tab[k, q]
+                    b_tabs[fld][k, q, sl]    = me._eval_scalar_basis(fld, s, t)
+                    g_tabs[fld][k, q, sl, :] = me._eval_scalar_grad (fld, s, t)
+
         out = {
-            'eids': np.asarray(valid_cut_eids, dtype=int),
-            # 'eids': np.arange(n_elems, dtype=int),  
-            'qp_phys': qp_phys, 'qw': qw, 'normals': normals, 'phis': phis,
-            'detJ': detJ_arr, 'J_inv': Jinv_arr, 'h_arr': h_arr,
-            "entity_kind": "element"
+            "eids": np.asarray(valid_cut_eids, dtype=int),
+            "qp_phys": qp_phys,
+            "qw": qw,
+            "normals": normals,
+            "phis": phis,
+            "detJ": detJ,
+            "J_inv": J_inv,
+            "h_arr": h_arr,
+            "entity_kind": "element",
         }
         for fld in fields:
             out[f"b_{fld}"] = b_tabs[fld]
@@ -974,8 +1134,10 @@ class DofHandler:
 
         if reuse:
             _edge_geom_cache[cache_key] = out
-        
         return out
+
+
+
     
     # --------------------------------------------------------------------
     #  DofHandler.precompute_ghost_factors  (new implementation)

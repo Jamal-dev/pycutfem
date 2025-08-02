@@ -6,6 +6,12 @@ import numpy as np
 from functools import lru_cache
 from numpy.polynomial.legendre import leggauss
 from .dunavant_data import DUNAVANT
+try:
+    import numba as _nb  # type: ignore
+    _HAVE_NUMBA = True
+except Exception:
+    _HAVE_NUMBA = False
+
 
 
 # -------------------------------------------------------------------------
@@ -93,15 +99,42 @@ def volume(element_type: str, order: int = 2):
     raise KeyError(element_type)
 
 
+if _HAVE_NUMBA:
+    @_nb.njit(cache=True, fastmath=True)
+    def _map_line_rule(p0, p1, xi, w_ref):
+        mid0 = 0.5*(p0[0] + p1[0]); mid1 = 0.5*(p0[1] + p1[1])
+        half0 = 0.5*(p1[0] - p0[0]); half1 = 0.5*(p1[1] - p0[1])
+        nQ = xi.shape[0]
+        pts = np.empty((nQ, 2))
+        for q in range(nQ):
+            pts[q, 0] = mid0 + xi[q] * half0
+            pts[q, 1] = mid1 + xi[q] * half1
+        J = (half0*half0 + half1*half1) ** 0.5
+        wts = w_ref * J
+        return pts, wts
+
+    @_nb.njit(cache=True, fastmath=True, parallel=True)
+    def _map_line_rule_batched(P0, P1, xi, w_ref, out_pts, out_wts):
+        nE = P0.shape[0]; nQ = xi.shape[0]
+        for e in _nb.prange(nE):
+            mid0 = 0.5*(P0[e, 0] + P1[e, 0]); mid1 = 0.5*(P0[e, 1] + P1[e, 1])
+            half0 = 0.5*(P1[e, 0] - P0[e, 0]); half1 = 0.5*(P1[e, 1] - P0[e, 1])
+            J = (half0*half0 + half1*half1) ** 0.5
+            for q in range(nQ):
+                out_pts[e, q, 0] = mid0 + xi[q] * half0
+                out_pts[e, q, 1] = mid1 + xi[q] * half1
+                out_wts[e, q] = w_ref[q] * J
+
+
 def line_quadrature(p0: np.ndarray, p1: np.ndarray, order: int = 2):
-    """
-    Gauss–Legendre rule mapped from [-1,1] onto the straight segment p0→p1.
-    Returns (x_i, w_i) with weights in **physical** space.
-    """
-    ξ, w_ref = gauss_legendre(order)             # reference rule
+    ξ, w_ref = gauss_legendre(order)
+    if _HAVE_NUMBA:
+        return _map_line_rule(np.asarray(p0, float), np.asarray(p1, float),
+                              np.asarray(ξ, float), np.asarray(w_ref, float))
+    # fallback (unchanged)
     mid  = 0.5*(p0 + p1)
-    half = 0.5*(p1 - p0)                         # derivative dx/dξ
-    pts  = mid[None, :] + np.outer(ξ, half)      # shape (n_qp,2)
-    J    = np.linalg.norm(half)                  # |p1-p0| / 2
-    wts  = w_ref * J                             # physical weights
+    half = 0.5*(p1 - p0)
+    pts  = mid[None, :] + np.outer(ξ, half)
+    J    = np.linalg.norm(half)
+    wts  = w_ref * J
     return pts, wts

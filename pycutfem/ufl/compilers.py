@@ -108,14 +108,21 @@ class FormCompiler:
         ndofs = self.dh.total_dofs
         K = sp.lil_matrix((ndofs, ndofs))
         F = np.zeros(ndofs)
-        logger.info("Assembling LHS matrix K...")
-        self.ctx["rhs"] = False
-        self._assemble_form(eq.a, K)
-        logger.info("Assembling RHS vector F...")
-        self.ctx["rhs"] = True
-        self._assemble_form(eq.L, F)
-        logger.info("Applying Dirichlet boundary conditions...")
-        self._apply_bcs(K, F, bcs)
+
+        # Assemble LHS if it is provided.
+        if eq.a is not None:
+            logger.info("Assembling LHS...")
+            self.ctx["rhs"] = False
+            self._assemble_form(eq.a, K)
+
+        # Assemble RHS and apply BCs if a RHS form is provided.
+        if eq.L is not None:
+            logger.info("Assembling RHS vector F...")
+            self.ctx["rhs"] = True
+            self._assemble_form(eq.L, F)
+            logger.info("Applying Dirichlet boundary conditions...")
+            self._apply_bcs(K, F, bcs)
+
         logger.info("Assembly complete.")
         return K.tocsr(), F
 
@@ -1574,17 +1581,16 @@ class FormCompiler:
         trial, test = _trial_test(intg.integrand)
         is_functional = (trial is None and test is None)
         flag = False
-        print(f"[Assembler] Functional calculation: {is_functional}, hook: {hook}")
         if is_functional:
             # J_loc is (n_edges,) or scalar; collapse to plain float
             if J_loc is not None:
                 if J_loc.ndim > 1:
-                    total = J_loc.sum(axis=1)
+                    total = np.sum(J_loc, axis=0)  # (n_edges,) → scalar
                 if J_loc.ndim == 1:
                     total = J_loc.sum()
             name  = hook["name"]               # retrieved earlier via _hook_for
             scal  = self.ctx.setdefault("scalar_results", {})
-            scal[name] = scal.get(name, 0.0) + total
+            scal[name] =  total
             flag = True
         return flag                            # 🔑  skip the scatter stage
 
