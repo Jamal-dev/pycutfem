@@ -240,38 +240,115 @@ def structured_quad_levelset_adaptive(
     node_objects = [Node(id=i, x=coord[0], y=coord[1]) for i, coord in enumerate(nodes_coords)]
     return node_objects, elements, edges, corners
 
-@jit_compile(nopython=True, cache=True)
+@jit_compile(nopython=True, parallel=True, cache=True)
 def _subdivide_cells(cells, parent_indices, split_types):
-    num_new_cells = 0
-    for stype in split_types:
-        if stype == 1 or stype == 2: num_new_cells += 2
-        else: num_new_cells += 4
-            
-    new_cells_arr = np.empty(num_new_cells, dtype=cell_dtype)
-    current_new_idx = 0; next_cell_id = len(cells)
+    num_parents = len(parent_indices)
+    if num_parents == 0:
+        return cells
     
-    for idx in parent_indices: cells[idx]['active'] = False
-
-    for i, parent_idx in enumerate(parent_indices):
+    num_children = np.empty(num_parents, dtype=np.int32)
+    for i in prange(num_parents):
+        stype = split_types[i]
+        if stype == 1 or stype == 2:
+            num_children[i] = 2
+        else:
+            num_children[i] = 4
+    
+    offsets = np.cumsum(num_children)
+    offsets = np.concatenate((np.array([0]), offsets[:-1]))
+    
+    num_new_cells = offsets[-1] + num_children[-1]
+    new_cells_arr = np.empty(num_new_cells, dtype=cell_dtype)
+    next_cell_id = len(cells)
+    
+    for i in prange(num_parents):
+        cells[parent_indices[i]]['active'] = False
+    
+    for i in prange(num_parents):
+        parent_idx = parent_indices[i]
         parent = cells[parent_idx]
         x0, y0, dx, dy = parent['x0'], parent['y0'], parent['dx'], parent['dy']
-        hx, hy = 0.5 * dx, 0.5 * dy; new_level = parent['level'] + 1
-        stype = split_types[i]; p_idx_32 = np.int32(parent_idx); n_lvl_32 = np.int32(new_level)
-
-        if stype & 1 and not (stype & 2): # Horizontal
-            new_cells_arr[current_new_idx]['id'] = np.int32(next_cell_id); new_cells_arr[current_new_idx]['x0'] = x0; new_cells_arr[current_new_idx]['y0'] = y0; new_cells_arr[current_new_idx]['dx'] = dx; new_cells_arr[current_new_idx]['dy'] = hy; new_cells_arr[current_new_idx]['level'] = n_lvl_32; new_cells_arr[current_new_idx]['parent_id'] = p_idx_32; new_cells_arr[current_new_idx]['active'] = True
-            new_cells_arr[current_new_idx+1]['id'] = np.int32(next_cell_id + 1); new_cells_arr[current_new_idx+1]['x0'] = x0; new_cells_arr[current_new_idx+1]['y0'] = y0 + hy; new_cells_arr[current_new_idx+1]['dx'] = dx; new_cells_arr[current_new_idx+1]['dy'] = hy; new_cells_arr[current_new_idx+1]['level'] = n_lvl_32; new_cells_arr[current_new_idx+1]['parent_id'] = p_idx_32; new_cells_arr[current_new_idx+1]['active'] = True
-            current_new_idx += 2; next_cell_id += 2
-        elif stype & 2 and not (stype & 1): # Vertical
-            new_cells_arr[current_new_idx]['id'] = np.int32(next_cell_id); new_cells_arr[current_new_idx]['x0'] = x0; new_cells_arr[current_new_idx]['y0'] = y0; new_cells_arr[current_new_idx]['dx'] = hx; new_cells_arr[current_new_idx]['dy'] = dy; new_cells_arr[current_new_idx]['level'] = n_lvl_32; new_cells_arr[current_new_idx]['parent_id'] = p_idx_32; new_cells_arr[current_new_idx]['active'] = True
-            new_cells_arr[current_new_idx+1]['id'] = np.int32(next_cell_id + 1); new_cells_arr[current_new_idx+1]['x0'] = x0 + hx; new_cells_arr[current_new_idx+1]['y0'] = y0; new_cells_arr[current_new_idx+1]['dx'] = hx; new_cells_arr[current_new_idx+1]['dy'] = dy; new_cells_arr[current_new_idx+1]['level'] = n_lvl_32; new_cells_arr[current_new_idx+1]['parent_id'] = p_idx_32; new_cells_arr[current_new_idx+1]['active'] = True
-            current_new_idx += 2; next_cell_id += 2
-        else: # Symmetric
-            new_cells_arr[current_new_idx]['id'] = np.int32(next_cell_id); new_cells_arr[current_new_idx]['x0'] = x0; new_cells_arr[current_new_idx]['y0'] = y0; new_cells_arr[current_new_idx]['dx'] = hx; new_cells_arr[current_new_idx]['dy'] = hy; new_cells_arr[current_new_idx]['level'] = n_lvl_32; new_cells_arr[current_new_idx]['parent_id'] = p_idx_32; new_cells_arr[current_new_idx]['active'] = True
-            new_cells_arr[current_new_idx+1]['id'] = np.int32(next_cell_id + 1); new_cells_arr[current_new_idx+1]['x0'] = x0 + hx; new_cells_arr[current_new_idx+1]['y0'] = y0; new_cells_arr[current_new_idx+1]['dx'] = hx; new_cells_arr[current_new_idx+1]['dy'] = hy; new_cells_arr[current_new_idx+1]['level'] = n_lvl_32; new_cells_arr[current_new_idx+1]['parent_id'] = p_idx_32; new_cells_arr[current_new_idx+1]['active'] = True
-            new_cells_arr[current_new_idx+2]['id'] = np.int32(next_cell_id + 2); new_cells_arr[current_new_idx+2]['x0'] = x0 + hx; new_cells_arr[current_new_idx+2]['y0'] = y0 + hy; new_cells_arr[current_new_idx+2]['dx'] = hx; new_cells_arr[current_new_idx+2]['dy'] = hy; new_cells_arr[current_new_idx+2]['level'] = n_lvl_32; new_cells_arr[current_new_idx+2]['parent_id'] = p_idx_32; new_cells_arr[current_new_idx+2]['active'] = True
-            new_cells_arr[current_new_idx+3]['id'] = np.int32(next_cell_id + 3); new_cells_arr[current_new_idx+3]['x0'] = x0; new_cells_arr[current_new_idx+3]['y0'] = y0 + hy; new_cells_arr[current_new_idx+3]['dx'] = hx; new_cells_arr[current_new_idx+3]['dy'] = hy; new_cells_arr[current_new_idx+3]['level'] = n_lvl_32; new_cells_arr[current_new_idx+3]['parent_id'] = p_idx_32; new_cells_arr[current_new_idx+3]['active'] = True
-            current_new_idx += 4; next_cell_id += 4
+        hx, hy = 0.5 * dx, 0.5 * dy
+        new_level = parent['level'] + 1
+        stype = split_types[i]
+        p_idx_32 = np.int32(parent_idx)
+        n_lvl_32 = np.int32(new_level)
+        start_idx = offsets[i]
+        child_id_start = np.int32(next_cell_id + start_idx)
+        
+        if stype & 1 and not (stype & 2):  # Horizontal
+            new_cells_arr[start_idx]['id'] = child_id_start
+            new_cells_arr[start_idx]['x0'] = x0
+            new_cells_arr[start_idx]['y0'] = y0
+            new_cells_arr[start_idx]['dx'] = dx
+            new_cells_arr[start_idx]['dy'] = hy
+            new_cells_arr[start_idx]['level'] = n_lvl_32
+            new_cells_arr[start_idx]['parent_id'] = p_idx_32
+            new_cells_arr[start_idx]['active'] = True
+            
+            new_cells_arr[start_idx+1]['id'] = child_id_start + 1
+            new_cells_arr[start_idx+1]['x0'] = x0
+            new_cells_arr[start_idx+1]['y0'] = y0 + hy
+            new_cells_arr[start_idx+1]['dx'] = dx
+            new_cells_arr[start_idx+1]['dy'] = hy
+            new_cells_arr[start_idx+1]['level'] = n_lvl_32
+            new_cells_arr[start_idx+1]['parent_id'] = p_idx_32
+            new_cells_arr[start_idx+1]['active'] = True
+        elif stype & 2 and not (stype & 1):  # Vertical
+            new_cells_arr[start_idx]['id'] = child_id_start
+            new_cells_arr[start_idx]['x0'] = x0
+            new_cells_arr[start_idx]['y0'] = y0
+            new_cells_arr[start_idx]['dx'] = hx
+            new_cells_arr[start_idx]['dy'] = dy
+            new_cells_arr[start_idx]['level'] = n_lvl_32
+            new_cells_arr[start_idx]['parent_id'] = p_idx_32
+            new_cells_arr[start_idx]['active'] = True
+            
+            new_cells_arr[start_idx+1]['id'] = child_id_start + 1
+            new_cells_arr[start_idx+1]['x0'] = x0 + hx
+            new_cells_arr[start_idx+1]['y0'] = y0
+            new_cells_arr[start_idx+1]['dx'] = hx
+            new_cells_arr[start_idx+1]['dy'] = dy
+            new_cells_arr[start_idx+1]['level'] = n_lvl_32
+            new_cells_arr[start_idx+1]['parent_id'] = p_idx_32
+            new_cells_arr[start_idx+1]['active'] = True
+        else:  # Symmetric
+            new_cells_arr[start_idx]['id'] = child_id_start
+            new_cells_arr[start_idx]['x0'] = x0
+            new_cells_arr[start_idx]['y0'] = y0
+            new_cells_arr[start_idx]['dx'] = hx
+            new_cells_arr[start_idx]['dy'] = hy
+            new_cells_arr[start_idx]['level'] = n_lvl_32
+            new_cells_arr[start_idx]['parent_id'] = p_idx_32
+            new_cells_arr[start_idx]['active'] = True
+            
+            new_cells_arr[start_idx+1]['id'] = child_id_start + 1
+            new_cells_arr[start_idx+1]['x0'] = x0 + hx
+            new_cells_arr[start_idx+1]['y0'] = y0
+            new_cells_arr[start_idx+1]['dx'] = hx
+            new_cells_arr[start_idx+1]['dy'] = hy
+            new_cells_arr[start_idx+1]['level'] = n_lvl_32
+            new_cells_arr[start_idx+1]['parent_id'] = p_idx_32
+            new_cells_arr[start_idx+1]['active'] = True
+            
+            new_cells_arr[start_idx+2]['id'] = child_id_start + 2
+            new_cells_arr[start_idx+2]['x0'] = x0 + hx
+            new_cells_arr[start_idx+2]['y0'] = y0 + hy
+            new_cells_arr[start_idx+2]['dx'] = hx
+            new_cells_arr[start_idx+2]['dy'] = hy
+            new_cells_arr[start_idx+2]['level'] = n_lvl_32
+            new_cells_arr[start_idx+2]['parent_id'] = p_idx_32
+            new_cells_arr[start_idx+2]['active'] = True
+            
+            new_cells_arr[start_idx+3]['id'] = child_id_start + 3
+            new_cells_arr[start_idx+3]['x0'] = x0
+            new_cells_arr[start_idx+3]['y0'] = y0 + hy
+            new_cells_arr[start_idx+3]['dx'] = hx
+            new_cells_arr[start_idx+3]['dy'] = hy
+            new_cells_arr[start_idx+3]['level'] = n_lvl_32
+            new_cells_arr[start_idx+3]['parent_id'] = p_idx_32
+            new_cells_arr[start_idx+3]['active'] = True
+    
     return np.concatenate((cells, new_cells_arr))
 
 @jit_compile(nopython=True, parallel=True, cache=True)
@@ -336,7 +413,7 @@ if __name__ == '__main__':
         print("Skipping example: pycutfem, levelset_numba, or matplotlib not found.")
     else:
         max_refine_level = 1; H, L, D = 0.41, 2.2, 0.1
-        c_x, c_y = 0.4, 0.2; NX, NY = 50, 40; poly_order = 1
+        c_x, c_y = 0.4, 0.2; NX, NY = 70, 60; poly_order = 1
         circle_ls = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 + 0.1*D/2.0)
         print(f"--- Running Numba Adaptive Mesh (DEBUG={DEBUG}) ---")
         start_time = time.time()

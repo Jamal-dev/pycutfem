@@ -5,12 +5,12 @@ import numpy as np
 from scipy.spatial import Delaunay
 from pycutfem.io.visualization import visualize_mesh_node_order
 from pycutfem.core.topology import Node
-from typing import List, Tuple, Dict, Callable, Optional
+from typing import List, Tuple, Dict, Optional
 import numba
-
+from numba.core import types
+from numba.typed import Dict
 
 __all__ = ["delaunay_rectangle", "structured_quad", "structured_triangles"]
-
 
 
 def delaunay_rectangle(length: float, height: float, nx: int = 10, ny: int = 10):
@@ -51,6 +51,47 @@ def _translate_coords(coords: np.ndarray, offset: np.ndarray):
     coords[:, 1] += offset[1]
     return coords
 
+# Python implementations for fallback
+def py_unique_rows(a):
+    """
+    Finds unique rows in a 2D array using pure Python.
+    """
+    seen = set()
+    unique_list = []
+    for i in range(a.shape[0]):
+        row_tuple = tuple(a[i])
+        if row_tuple not in seen:
+            seen.add(row_tuple)
+            unique_list.append(a[i])
+    return np.array(unique_list, dtype=a.dtype)
+
+unituple_int64_2 = types.UniTuple(types.int64, 2)
+
+@numba.jit(nopython=True, cache=True)
+def unique_rows_int64_impl(a):
+    if a.shape[0] == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    
+    seen_dict = Dict.empty(
+        key_type=unituple_int64_2,
+        value_type=types.boolean
+    )
+    
+    unique_list = []
+    for i in range(a.shape[0]):
+        row_tuple = (a[i, 0], a[i, 1])
+        if row_tuple not in seen_dict:
+            seen_dict[row_tuple] = True
+            unique_list.append(row_tuple)
+            
+    res = np.empty((len(unique_list), 2), dtype=np.int64)
+    for i in range(len(unique_list)):
+        res[i, 0] = unique_list[i][0]
+        res[i, 1] = unique_list[i][1]
+    return res
+
+unique_rows_int64 = unique_rows_int64_impl
+
 def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int, 
                     offset: Optional[Tuple[float, float]] = None,numba_path=True, parallel: bool = True):
     """
@@ -79,7 +120,9 @@ def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int,
         return node_objects, elements, edges, elements_corner_nodes
 
 @numba.jit(nopython=True, parallel=True, cache=True)
-def _structured_qn_numba(Lx: float, Ly: float, nx: int, ny: int, order: int, parallel: bool):
+def _structured_qn_numba(
+    Lx: float, Ly: float, nx: int, ny: int, order: int, parallel: bool
+):
     """
     Generates raw data for a structured Qn quadrilateral mesh using Numba.
     """
@@ -145,7 +188,7 @@ def _structured_qn_numba(Lx: float, Ly: float, nx: int, ny: int, order: int, par
     # --- 3. Filter for Unique Edges (serial operation) ---
     # This is a standard method to find unique rows in a NumPy array.
     if num_elements > 0:
-        edges = np.unique(all_edges, axis=0)
+        edges = unique_rows_int64(all_edges)
     else:
         edges = np.empty((0, 2), dtype=np.int64)
 

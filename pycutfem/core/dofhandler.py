@@ -29,6 +29,8 @@ BcLike = Union[BoundaryCondition, Mapping[str, Any]]
 # edge-geometry cache keyed by (hash(ids), qdeg, id(level_set))
 # ------------------------------------------------------------------
 _edge_geom_cache: dict[tuple[int,int,int], dict] = {}
+# geometric volume-cache keyed by (MixedElement.signature(), qdeg, id(level_set) or 0)
+_volume_geom_cache: dict[tuple, dict] = {}
 
 def _hash_subset(ids: Sequence[int]) -> int:
     """Stable 64-bit hash for a list / BitSet of indices."""
@@ -652,83 +654,195 @@ class DofHandler:
             all_coords[dof_idx] = coords
 
         return all_coords
-    def precompute_geometric_factors(self, quad_order: int, level_set: Callable = None) -> Dict[str, np.ndarray]:
+    def precompute_geometric_factors(
+        self,
+        quad_order: int,
+        level_set: Callable = None,
+        reuse: bool = True,
+    ) -> Dict[str, np.ndarray]:
         """
-        Calculates all geometric data needed by JIT kernels ahead of time.
-
-        This is the single, authoritative method for preparing geometric
-        quadrature data. It computes physical coordinates, scaled quadrature
-        weights, inverse Jacobians, and optional level-set values.
-
-        Args:
-            quad_order (int): The polynomial degree of the quadrature rule.
-            level_set (Callable, optional): A level-set function to evaluate `phi`
-                                            at quadrature points. Defaults to None.
-
-        Returns:
-            Dict[str, np.ndarray]: A dictionary of pre-computed arrays.
+        Precompute physical quadrature data (geometry, weights, optional level-set).
+        - Caches geometry per (mesh-id, n_elements, element_type, p, quad_order).
+        - Uses a Numba kernel for the per-element/per-qp loops when available.
+        - Returns:
+            qp_phys (nE,nQ,2), qw (nE,nQ), detJ (nE,nQ), J_inv (nE,nQ,2,2),
+            normals (nE,nQ,2), phis (nE,nQ or None), h_arr (nE,), eids (nE,),
+            entity_kind="element".
         """
-        if self.DEBUG:
-            print("-" * 80)
-            print(f"Precomputing geometric factors with quad_order={quad_order}...")
-            print("-" * 80)
+        from pycutfem.fem.reference import get_reference  # Ref API (shape, grad)  # noqa: F401
+        # volume quadrature, transform are already imported at file top
+        # from pycutfem.integration.quadrature import volume
+        # from pycutfem.fem import transform
+
+        # Optional numba path -----------------------------------------------------
+        try:
+            import numba as _nb  # type: ignore
+            _HAVE_NUMBA = True
+        except Exception:
+            _HAVE_NUMBA = False
+
         if self.mixed_element is None:
             raise RuntimeError("This method requires a MixedElement-backed DofHandler.")
 
         mesh = self.mixed_element.mesh
-        num_elements = len(mesh.elements_list)
-        spatial_dim = mesh.spatial_dim
+        n_el = getattr(mesh, "n_elements", len(mesh.elements_list))
+        dim  = mesh.spatial_dim
+        if dim != 2:
+            raise NotImplementedError("This implementation currently supports 2D only.")
 
-        # 1. Get reference quadrature rule
-        qp_ref, qw_ref = volume(mesh.element_type, quad_order)
-        num_quad_points = len(qw_ref)
+        # ---------------------- cache key (geometry-only) ------------------------
+        geom_key = (id(mesh), n_el, mesh.element_type, mesh.poly_order, int(quad_order))
+        global _volume_geom_cache
+        try:
+            _volume_geom_cache
+        except NameError:
+            _volume_geom_cache = {}
 
-        # 2. Initialize output arrays
-        qp_phys = np.zeros((num_elements, num_quad_points, spatial_dim))
-        qw_scaled = np.zeros((num_elements, num_quad_points))
-        detJ = np.zeros((num_elements, num_quad_points))
-        J_inv = np.zeros((num_elements, num_quad_points, spatial_dim, spatial_dim))
-        phis = np.zeros((num_elements, num_quad_points)) if level_set else None
-        normals = np.zeros((num_elements, num_quad_points, spatial_dim)) # Placeholder
-        h_arr = np.zeros((num_elements,))  # Placeholder for h-array
-        ele_ids = np.zeros((num_elements,), dtype=int)  # Element IDs
+        if reuse and geom_key in _volume_geom_cache:
+            geo = _volume_geom_cache[geom_key]
+            # On-demand φ(xq) evaluation (cheap vs. geometry)
+            phis = None
+            if level_set is not None:
+                qp = geo["qp_phys"]
+                phis = np.empty((qp.shape[0], qp.shape[1]), dtype=np.float64)
+                for e in range(qp.shape[0]):
+                    for q in range(qp.shape[1]):
+                        phis[e, q] = level_set(qp[e, q])
+            return {**geo, "phis": phis}
 
-        # 3. Loop over all elements and quadrature points
-        for e_idx in range(num_elements):
-            h_arr[e_idx] = mesh.element_char_length(e_idx)  # Store element size
-            ele_ids[e_idx] = e_idx  # Store element ID
-            for q_idx, (qp, qw) in enumerate(zip(qp_ref, qw_ref)):
-                xi_tuple = tuple(qp)
+        print(f"Precomputing geometric factors for {mesh.element_type} elements "
+              f"with quad_order={quad_order} and p={mesh.poly_order}...")
+        # ---------------------- reference quadrature -----------------------------
+        qp_ref, qw_ref = volume(mesh.element_type, quad_order)  # (nQ,2), (nQ,)
+        qp_ref = np.asarray(qp_ref, dtype=np.float64)
+        qw_ref = np.asarray(qw_ref, dtype=np.float64)
+        n_q    = qw_ref.shape[0]
 
-                J_matrix = transform.jacobian(mesh, e_idx, xi_tuple)
-                det_J_val = np.linalg.det(J_matrix)
-                if det_J_val <= 1e-12:
-                    raise ValueError(f"Jacobian determinant is non-positive ({det_J_val}) for element {e_idx}.")
+        # ---------------------- reference shape/grad tables ----------------------
+        ref = get_reference(mesh.element_type, mesh.poly_order)  # Ref provides shape(), grad()  :contentReference[oaicite:9]{index=9}
+        # infer n_loc from a single evaluation (Ref has no n_functions)
+        n_loc = int(np.asarray(ref.shape(qp_ref[0, 0], qp_ref[0, 1])).size)
+        Ntab  = np.empty((n_q, n_loc), dtype=np.float64)        # (nQ, n_loc)
+        dNtab = np.empty((n_q, n_loc, 2), dtype=np.float64)     # (nQ, n_loc, 2)
+        for q, (xi, eta) in enumerate(qp_ref):
+            Ntab[q, :]     = np.asarray(ref.shape(xi, eta), dtype=np.float64).ravel()
+            dNtab[q, :, :] = np.asarray(ref.grad(xi, eta),   dtype=np.float64)  # (n_loc,2)  :contentReference[oaicite:10]{index=10}
 
-                J_inv[e_idx, q_idx] = np.linalg.inv(J_matrix)
-                detJ[e_idx, q_idx] = det_J_val
-                
-                x_phys, y_phys = transform.x_mapping(mesh, e_idx, xi_tuple)
-                qp_phys[e_idx, q_idx, 0] = x_phys
-                qp_phys[e_idx, q_idx, 1] = y_phys
-                
-                qw_scaled[e_idx, q_idx] = qw * det_J_val
+        # ---------------------- element → node coords (vectorized) ---------------
+        # transform.py uses: nodes = mesh.nodes[mesh.elements_connectivity[eid]]
+        #                    nodes_x_y_pos[nodes]  → (n_loc,2)                    :contentReference[oaicite:11]{index=11}
+        node_ids   = mesh.nodes[mesh.elements_connectivity]            # (nE, n_loc)
+        elem_coord = mesh.nodes_x_y_pos[node_ids].astype(np.float64)   # (nE, n_loc, 2)
 
-                if level_set:
-                    phis[e_idx, q_idx] = level_set(np.asarray([x_phys, y_phys]))
+        # ---------------------- allocate outputs ---------------------------------
+        qp_phys = np.zeros((n_el, n_q, 2), dtype=np.float64)
+        qw_sc   = np.zeros((n_el, n_q),    dtype=np.float64)
+        detJ    = np.zeros((n_el, n_q),    dtype=np.float64)
+        J_inv   = np.zeros((n_el, n_q, 2, 2), dtype=np.float64)
 
-        # 4. Return results in a dictionary for easy use
-        return {
-            "qp_phys": qp_phys,
-            "qw": qw_scaled,
-            "detJ": detJ,
-            "J_inv": J_inv,
-            "normals": normals,
-            "phis": phis,
-            "h_arr": h_arr,
-            "eids": ele_ids,
-            "entity_kind": "element"
+        # ---------------------- fast path: Numba ---------------------------------
+        if _HAVE_NUMBA:
+            @_nb.njit(parallel=True, fastmath=True, cache=True)
+            def _geom_kernel(coords, Ntab, dNtab, qwref):
+                nE, nLoc, _ = coords.shape
+                nQ = qwref.shape[0]
+                qp_phys = np.zeros((nE, nQ, 2))
+                qw_sc   = np.zeros((nE, nQ))
+                detJ    = np.zeros((nE, nQ))
+                J_inv   = np.zeros((nE, nQ, 2, 2))
+                for e in _nb.prange(nE):
+                    for q in range(nQ):
+                        # x = Σ_i N_i * X_i
+                        x0 = 0.0; x1 = 0.0
+                        for i in range(nLoc):
+                            Ni = Ntab[q, i]
+                            x0 += Ni * coords[e, i, 0]
+                            x1 += Ni * coords[e, i, 1]
+                        qp_phys[e, q, 0] = x0
+                        qp_phys[e, q, 1] = x1
+                        # J = dN^T @ X
+                        a00 = 0.0; a01 = 0.0; a10 = 0.0; a11 = 0.0
+                        for i in range(nLoc):
+                            dNix = dNtab[q, i, 0]
+                            dNiy = dNtab[q, i, 1]
+                            Xix  = coords[e, i, 0]
+                            Xiy  = coords[e, i, 1]
+                            a00 += dNix * Xix; a01 += dNix * Xiy
+                            a10 += dNiy * Xix; a11 += dNiy * Xiy
+                        det = a00 * a11 - a01 * a10
+                        detJ[e, q] = det
+                        inv_det = 1.0 / det
+                        J_inv[e, q, 0, 0] =  a11 * inv_det
+                        J_inv[e, q, 0, 1] = -a01 * inv_det
+                        J_inv[e, q, 1, 0] = -a10 * inv_det
+                        J_inv[e, q, 1, 1] =  a00 * inv_det
+                        qw_sc[e, q] = qwref[q] * det
+                return qp_phys, qw_sc, detJ, J_inv
+
+            qp_phys, qw_sc, detJ, J_inv = _geom_kernel(elem_coord, Ntab, dNtab, qw_ref)
+
+        else:
+            # ------------------ safe Python fallback (original logic) ------------
+            normals = np.zeros((n_el, n_q, dim), dtype=np.float64)
+            phis    = np.zeros((n_el, n_q), dtype=np.float64) if level_set else None
+            h_arr   = np.zeros((n_el,), dtype=np.float64)
+            eids    = np.arange(n_el, dtype=int)
+
+            for e in range(n_el):
+                h_arr[e] = mesh.element_char_length(e)
+                for q_idx, (xi_eta, qw) in enumerate(zip(qp_ref, qw_ref)):
+                    xi_eta_t = (float(xi_eta[0]), float(xi_eta[1]))
+                    J = transform.jacobian(mesh, e, xi_eta_t)
+                    det = float(np.linalg.det(J))
+                    if det <= 1e-12:
+                        raise ValueError(f"Jacobian determinant is non-positive ({det}) for element {e}.")
+                    detJ[e, q_idx]  = det
+                    J_inv[e, q_idx] = np.linalg.inv(J)
+                    qp_phys[e, q_idx] = transform.x_mapping(mesh, e, xi_eta_t)
+                    qw_sc[e, q_idx]   = qw * det
+                    if phis is not None:
+                        phis[e, q_idx] = level_set(qp_phys[e, q_idx])
+
+            geo = {
+                "qp_phys": qp_phys, "qw": qw_sc, "detJ": detJ, "J_inv": J_inv,
+                "normals": normals, "phis": phis, "h_arr": h_arr, "eids": eids,
+                "entity_kind": "element",
+            }
+            if reuse:
+                _volume_geom_cache[geom_key] = {**geo, "phis": None}  # cache geometry only
+            return geo
+
+        # ---------------------- post-process & cache -----------------------------
+        bad = np.where(detJ <= 1e-12)
+        if bad[0].size:
+            e_bad, q_bad = int(bad[0][0]), int(bad[1][0])
+            raise ValueError(f"Jacobian determinant is non-positive "
+                            f"({detJ[e_bad, q_bad]}) for element {e_bad} at qp {q_bad}.")
+
+        normals = np.zeros((n_el, n_q, dim), dtype=np.float64)
+        h_arr   = np.empty((n_el,), dtype=np.float64)
+        for e in range(n_el):
+            h_arr[e] = mesh.element_char_length(e)
+        eids = np.arange(n_el, dtype=int)
+
+        geo = {
+            "qp_phys": qp_phys, "qw": qw_sc, "detJ": detJ, "J_inv": J_inv,
+            "normals": normals, "h_arr": h_arr, "eids": eids,
+            "entity_kind": "element",
         }
+        if reuse:
+            _volume_geom_cache[geom_key] = geo  # cache geometry (no phis)
+
+        phis = None
+        if level_set is not None:
+            phis = np.empty((n_el, n_q), dtype=np.float64)
+            for e in range(n_el):
+                for q in range(n_q):
+                    phis[e, q] = level_set(qp_phys[e, q])
+
+        return {**geo, "phis": phis}
+
+
     
     
     # -------------------------------------------------------------------------
