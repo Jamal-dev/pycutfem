@@ -30,6 +30,9 @@ from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
 from pycutfem.jit import compile_multi        
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.helpers import analyze_active_dofs
+from pycutfem.solvers.giant import giant_solver
+from petsc4py import PETSc
+import sys
 
 def _scatter_element_contribs(
     *,
@@ -348,6 +351,9 @@ class NewtonSolver:
         # Optional sanity log:
         print(f"  Dirichlet DOFs detected: {len(bc_dofs)}; Free DOFs: {nfree}")
 
+        # Build once: CSR structure & per-element scatter plan for reduced system
+        self._build_reduced_pattern()
+
         self.restrictor = _ActiveReducer(self.dh, self.active_dofs)
 
 
@@ -411,6 +417,16 @@ class NewtonSolver:
             delta_U = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
             print(f"    Time step {step+1}: ΔU = {np.linalg.norm(delta_U, ord=np.inf):.2e}")
 
+            if step > 0:
+                # Reject and retry with smaller Δt if the update blows up
+                if np.linalg.norm(delta_U, np.inf) > 5.0 * (np.linalg.norm(self.delta_U_prev, np.inf) if step else 1.0):
+                    # restore current to previous and cut dt
+                    for f, fp in zip(functions, prev_functions):
+                        f.nodal_values[:] = fp.nodal_values[:]
+                    time_params.dt *= 0.5
+                    print(f"    Rejecting step {step+1}; reducing Δt → {time_params.dt:.3e} and retrying.")
+                    continue
+            self.delta_U_prev = delta_U.copy()
             # Steady‑state test -----------------------------------
             if (
                 time_params.stop_on_steady
@@ -531,7 +547,7 @@ class NewtonSolver:
             dU_full = np.zeros(dh.total_dofs)
             dU_full[self.active_dofs] = alpha * S_red
             dh.add_to_functions(dU_full, funcs)
-            # dh.apply_bcs(bcs_now, *funcs)
+            dh.apply_bcs(bcs_now, *funcs)
 
             # Evaluate residual in reduced space (matrix not needed)
             _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
@@ -561,39 +577,23 @@ class NewtonSolver:
     #  Reduced Linear system & BC handling
     # ------------------------------------------------------------------
     def _assemble_system_reduced(self, coeffs, *, need_matrix: bool = True):
-        """
-        Assemble Jacobian and residual directly on the reduced unknown set
-        (non‑Dirichlet, restriction‑aware). Returns (A_red | None, R_red).
-        """
-
         nred = len(self.active_dofs)
-        A_red = sp.lil_matrix((nred, nred)) if need_matrix else None
-        R_red = np.zeros(nred)
-
-        # 1) Jacobian (reduced rows/cols only)
         if need_matrix:
-            for ker in self.kernels_K:
-                Kloc, _, _ = ker.exec(coeffs)
-                _scatter_element_contribs_reduced(
-                    K_elem=Kloc, F_elem=None, J_elem=None,
-                    element_ids=ker.static_args["eids"],
-                    gdofs_map =ker.static_args["gdofs_map"],
-                    A_red=A_red, R_red=None,
-                    full_to_red=self.full_to_red,
-                )
+            A_red, R_red = self._assemble_system_reduced_fast(coeffs)
+            return A_red, R_red
+        else:
+            # residual only: keep a light path that avoids fancy indexing
+            R_red = np.zeros(nred)
+            for ker in self.kernels_F:
+                _, Floc, _ = ker.exec(coeffs)
+                eids = ker.static_args["eids"]; gdofs = ker.static_args["gdofs_map"]
+                for e in range(len(eids)):
+                    rmap = self.full_to_red[gdofs[e]]
+                    m = rmap >= 0
+                    if np.any(m):
+                        np.add.at(R_red, rmap[m], Floc[e][m])
+            return None, R_red
 
-        # 2) Residual (reduced rows only)
-        for ker in self.kernels_F:
-            _, Floc, _ = ker.exec(coeffs)
-            _scatter_element_contribs_reduced(
-                K_elem=None, F_elem=Floc, J_elem=None,
-                element_ids=ker.static_args["eids"],
-                gdofs_map =ker.static_args["gdofs_map"],
-                A_red=None, R_red=R_red,
-                full_to_red=self.full_to_red,
-            )
-
-        return (A_red.tocsr() if need_matrix else None), R_red
 
     # ------------------------------------------------------------------
     #  Linear system & BC handling        (REF‑ACTORED)
@@ -789,7 +789,128 @@ class NewtonSolver:
         
         return K_red, F_red, full_to_red_map
 
+    # ------------------------------------------------------------------
+    #  Fast assembly Path
+    # ------------------------------------------------------------------
+    def _build_reduced_pattern(self):
+        """
+        Build (once) the CSR sparsity of the reduced system and a per-element
+        scatter plan that works even when the number of active local DOFs varies
+        across elements (due to BCs/cuts). Stores:
+        - self._csr_indptr, self._csr_indices
+        - self._elem_pos  : per-kernel list of [ per-element 1D position arrays ]
+        - self._elem_lidx : per-kernel list of [ per-element local active idx ]
+        """
 
+        n = len(self.active_dofs)
+        if n == 0:
+            # degenerate case; keep minimal structures
+            self._csr_indptr = np.zeros(1, dtype=np.int32)
+            self._csr_indices = np.zeros(0, dtype=np.int32)
+            self._elem_pos = [[] for _ in self.kernels_K]
+            self._elem_lidx = [[] for _ in self.kernels_K]
+            return
+
+        # 1) Collect column sets per reduced row
+        rows_cols = [set() for _ in range(n)]
+        for ker in self.kernels_K:
+            gdofs = ker.static_args["gdofs_map"]
+            for e in range(gdofs.shape[0]):
+                rmap = self.full_to_red[gdofs[e]]
+                rows = rmap[rmap >= 0]
+                if rows.size == 0:
+                    continue
+                cols_set = set(rows.tolist())
+                for r in rows:
+                    rows_cols[r].update(cols_set)
+
+        # 2) Build CSR (row-wise sorted for determinism)
+        indptr = np.zeros(n + 1, dtype=np.int32)
+        for i in range(n):
+            indptr[i + 1] = indptr[i] + len(rows_cols[i])
+        indices = np.empty(indptr[-1], dtype=np.int32)
+        for i in range(n):
+            cols = sorted(rows_cols[i])
+            indices[indptr[i] : indptr[i + 1]] = cols
+        self._csr_indptr, self._csr_indices = indptr, indices
+
+        # 3) Map (row, col) → absolute position in CSR "data"
+        pos = {}
+        for i in range(n):
+            s, t = indptr[i], indptr[i + 1]
+            for k, c in enumerate(indices[s:t]):
+                pos[(i, c)] = s + k
+
+        # 4) Ragged per-element scatter plans (store 1-D position arrays + local idx)
+        self._elem_pos = []   # per-kernel: list of 1-D arrays (len = n_act^2)
+        self._elem_lidx = []  # per-kernel: list of local indices kept (len = n_act)
+        for ker in self.kernels_K:
+            gdofs = ker.static_args["gdofs_map"]
+            pos_list = []
+            lidx_list = []
+            for e in range(gdofs.shape[0]):
+                full = gdofs[e]
+                rmap = self.full_to_red[full]
+                mask = rmap >= 0
+                rows = rmap[mask]
+                if rows.size == 0:
+                    pos_list.append(np.empty(0, dtype=np.int32))
+                    lidx_list.append(np.empty(0, dtype=np.int32))
+                    continue
+                # flattened positions, row-major order matching Ke[np.ix_(lidx,lidx)].ravel()
+                nact = rows.size
+                pflat = np.empty(nact * nact, dtype=np.int32)
+                t = 0
+                for a in range(nact):
+                    ra = rows[a]
+                    for b in range(nact):
+                        cb = rows[b]
+                        pflat[t] = pos[(ra, cb)]
+                        t += 1
+                pos_list.append(pflat)
+                lidx_list.append(np.nonzero(mask)[0].astype(np.int32))
+            self._elem_pos.append(pos_list)
+            self._elem_lidx.append(lidx_list)
+
+
+    def _assemble_system_reduced_fast(self, coeffs):
+        """
+        Assemble reduced (A, R) using the prebuilt CSR pattern and ragged
+        per-element scatter plans from _build_reduced_pattern().
+        Returns: (A_csr, R)
+        """
+
+        indptr, indices = self._csr_indptr, self._csr_indices
+        n = indptr.size - 1
+        data = np.zeros(indices.size, dtype=float)
+        R = np.zeros(n, dtype=float)
+
+        # Matrix (Jacobian) blocks
+        for ker, pos_list, lidx_list in zip(self.kernels_K, self._elem_pos, self._elem_lidx):
+            Kloc, _, _ = ker.exec(coeffs)  # shape [nel, nloc, nloc]
+            for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
+                if pflat.size == 0:
+                    continue
+                Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
+                data[pflat] += Kel
+
+        # Residual blocks
+        for ker in self.kernels_F:
+            _, Floc, _ = ker.exec(coeffs)  # [nel, nloc]
+            gdofs = ker.static_args["gdofs_map"]
+            for e in range(gdofs.shape[0]):
+                rmap = self.full_to_red[gdofs[e]]
+                mask = rmap >= 0
+                if not np.any(mask):
+                    continue
+                rows = rmap[mask]
+                np.add.at(R, rows, Floc[e][mask])
+
+        A = sp.csr_matrix((data, indices, indptr), shape=(n, n))
+        return A, R
+
+
+    
     # ------------------------------------------------------------------
     #  Boundary‑condition helper
     # ------------------------------------------------------------------
@@ -822,12 +943,515 @@ def _zero_rows_cols(A: sp.csr_matrix, rows: np.ndarray) -> sp.csr_matrix:
 
 
 
+#-----------------------------------------------------------------------------
+# petsc-like solvers ---------------------------------------------------------
+#-----------------------------------------------------------------------------
+# ============================================================================
+#  PETSc/SNES Inexact Newton-Krylov Solver
+# ============================================================================
+
+
+
+class PetscSnesNewtonSolver(NewtonSolver):
+    """
+    PETSc-backed Newton solver that mirrors the Python Newton:
+      - Direct linear solve by default (preonly+lu)
+      - Backtracking line search (newtonls + bt)
+      - Absolute nonlinear tolerance (SNES atol)
+      - Reuses SNES/KSP/Mats/Vectors across time steps
+      - Assembles reduced residual/Jacobian; gives SNES the true R(u)
+    """
+
+    def __init__(self, *args, petsc_options: Optional[Dict] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.petsc_options = dict(petsc_options or {})
+        self._petsc_ctx: Dict = {}
+
+        # persistent PETSc objects
+        self._snes: Optional[PETSc.SNES] = None
+        self._x_red: Optional[PETSc.Vec] = None
+        self._r_red: Optional[PETSc.Vec] = None
+        self._J: Optional[PETSc.Mat] = None
+        self._P: Optional[PETSc.Mat] = None
+        self._box_lower_full = None   # full-size np.array (total_dofs) or None
+        self._box_upper_full = None
+        self._XL = None               # PETSc Vec (reduced) for lower bounds
+        self._XU = None               # PETSc Vec (reduced) for upper bounds
+
+
+        # Sensible defaults; user options may override via setFromOptions()
+        self.petsc_options.setdefault("snes_type", "newtonls")
+        self.petsc_options.setdefault("snes_linesearch_type", "bt")
+        self.petsc_options.setdefault("snes_linesearch_damping", 1.0)
+
+        # Robust baseline linear solve: exact Newton like the Python path
+        self.petsc_options.setdefault("ksp_type", "preonly")
+        self.petsc_options.setdefault("pc_type", "lu")
+        self.petsc_options.setdefault("pc_factor_mat_solver_type", "mumps")  # or superlu_dist/superlu
+
+    # ------------------------------------------------------------------ #
+    # Utilities
+    # ------------------------------------------------------------------ #
+    def _apply_petsc_options(self) -> None:
+        """Load self.petsc_options into PETSc.Options so setFromOptions() sees them."""
+        opts = PETSc.Options()
+        for k, v in self.petsc_options.items():
+            key = k if k.startswith("-") else k
+            opts[key] = "" if v is None else str(v)
+    
+    def set_box_bounds(self, lower=None, upper=None, by_field: dict | None=None):
+        """
+        Define box bounds on DOFs. Accepts:
+        - lower/upper: scalar or full-size numpy arrays (total_dofs)
+        - by_field: dict like {'ux': (lo, hi), 'uy': (lo, hi), 'p': (None, None)}
+        Any missing bound → ±inf.
+        Call BEFORE solve_time_interval().
+        """
+        n = self.dh.total_dofs
+        lo_full = np.full(n, -np.inf, dtype=float)
+        hi_full = np.full(n,  np.inf, dtype=float)
+
+        if isinstance(lower, (int, float)): lo_full[:] = lower
+        elif isinstance(lower, np.ndarray): lo_full[:] = lower
+        if isinstance(upper, (int, float)): hi_full[:] = upper
+        elif isinstance(upper, np.ndarray): hi_full[:] = upper
+
+        if by_field:
+            for name, (lo, hi) in by_field.items():
+                sl = self.dh.get_field_slice(name)
+                if lo is not None: lo_full[sl] = lo
+                if hi is not None: hi_full[sl] = hi
+
+        # store; we’ll map to reduced each step/size
+        self._box_lower_full = lo_full
+        self._box_upper_full = hi_full
+
+
+    def _ensure_snes(self, n_free: int, comm) -> None:
+        """Create/resize SNES and persistent objects if needed; set defaults then apply options."""
+        if self._snes is not None and self._x_red.getSize() == n_free:
+            return
+
+        # --- Vectors (reduced) ---
+        self._x_red = PETSc.Vec().create(comm=comm)
+        self._x_red.setSizes(n_free)
+        self._x_red.setFromOptions()
+
+        self._r_red = PETSc.Vec().create(comm=comm)
+        self._r_red.setSizes(n_free)
+        self._r_red.setFromOptions()
+
+        # --- Matrices (reduced) ---
+        self._J = PETSc.Mat().createAIJ(size=(n_free, n_free), comm=comm)
+        self._P = PETSc.Mat().createAIJ(size=(n_free, n_free), comm=comm)
+
+        # Optional preallocation from reduced CSR pattern
+        if hasattr(self, "_csr_indptr") and hasattr(self, "_csr_indices"):
+            try:
+                ia = np.asarray(self._csr_indptr, dtype=PETSc.IntType)
+                ja = np.asarray(self._csr_indices, dtype=PETSc.IntType)
+                self._J.setPreallocationCSR((ia, ja))
+                self._P.setPreallocationCSR((ia, ja))
+            except Exception:
+                pass
+
+        # --- SNES and callbacks ---
+        self._snes = PETSc.SNES().create(comm=comm)
+        self._snes.setFunction(self._eval_residual_reduced, self._r_red)
+        self._snes.setJacobian(self._eval_jacobian_reduced, self._J, self._P)
+
+        # --- Optional VI bounds (reduced) ---
+        if (getattr(self, "_box_lower_full", None) is not None) and (getattr(self, "_box_upper_full", None) is not None):
+            lo_red = self._box_lower_full[self.active_dofs].astype(float, copy=True)
+            hi_red = self._box_upper_full[self.active_dofs].astype(float, copy=True)
+
+            self._XL = PETSc.Vec().create(comm=comm)
+            self._XL.setSizes(n_free)
+            self._XL.setFromOptions()
+            self._XU = PETSc.Vec().create(comm=comm)
+            self._XU.setSizes(n_free)
+            self._XU.setFromOptions()
+
+            idx = np.arange(n_free, dtype=PETSc.IntType)
+            self._XL.setValues(idx, lo_red, addv=PETSc.InsertMode.INSERT_VALUES)
+            self._XU.setValues(idx, hi_red, addv=PETSc.InsertMode.INSERT_VALUES)
+            self._XL.assemblyBegin(); self._XL.assemblyEnd()
+            self._XU.assemblyBegin(); self._XU.assemblyEnd()
+
+            # Default to VI Newton unless the user chose something else
+            self.petsc_options.setdefault("snes_type", "vinewtonrsls")
+            # Attach bounds to SNES (now that SNES exists)
+            self._snes.setVariableBounds(self._XL, self._XU)
+
+        # --- Programmatic defaults (robust baseline; options may override) ---
+        # Use absolute tolerance to mimic your Python Newton's stopping rule
+        self._snes.setTolerances(rtol=0.0, atol=self.np.newton_tol, max_it=self.np.max_newton_iter)
+        try:
+            self._snes.getLineSearch().setType("bt")
+        except Exception:
+            pass
+
+        ksp = self._snes.getKSP()
+        ksp.setType("preonly")
+        pc = ksp.getPC()
+        pc.setType("lu")
+        try:
+            pc.setFactorSolverType("mumps")  # or "superlu_dist"/"superlu"
+        except Exception:
+            pass
+
+        # If you configured a Schur fieldsplit elsewhere, install it now (optional)
+        if getattr(self, "_schur_split_cfg", None) is not None:
+            self._apply_schur_fieldsplit(ksp)
+
+        # --- Apply user options last so they override all defaults ---
+        self._apply_petsc_options()
+        self._snes.setFromOptions()
+
+
+    # ------------------------------------------------------------------ #
+    # Newton loop
+    # ------------------------------------------------------------------ #
+    def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
+        dh = self.dh
+        comm = PETSc.COMM_WORLD
+
+        # Ensure we have the reduced pattern/active dofs
+        if not hasattr(self, "_csr_indptr"):
+            self._build_reduced_pattern()
+
+        # Apply BCs to the current iterate and form the reduced initial guess
+        dh.apply_bcs(bcs_now, *funcs)
+        x0_full = np.hstack([f.nodal_values for f in funcs]).copy()
+        x0_red = x0_full[self.active_dofs].copy()
+
+        # Context for callbacks
+        self._petsc_ctx = dict(
+            funcs=funcs, prev_funcs=prev_funcs, aux_funcs=aux_funcs,
+            bcs_now=bcs_now, x0_full=x0_full
+        )
+
+        # Create/reuse SNES stack for this reduced size
+        self._ensure_snes(len(self.active_dofs), comm)
+
+        # Load initial guess into PETSc vector
+        idx = np.arange(x0_red.size, dtype=PETSc.IntType)
+        self._x_red.setValues(idx, x0_red, addv=PETSc.InsertMode.INSERT_VALUES)
+        self._x_red.assemblyBegin(); self._x_red.assemblyEnd()
+
+        # Solve the nonlinear system on the reduced space
+        self._snes.solve(None, self._x_red)
+
+        # Write back the absolute solution (not an increment)
+        x_fin = self._x_red.getArray(readonly=True)
+        new_full = x0_full.copy()
+        new_full[self.active_dofs] = x_fin
+        for f in funcs:
+            g = f._g_dofs
+            f.set_nodal_values(g, new_full[g])
+        dh.apply_bcs(bcs_now, *funcs)
+
+        prev_vals = np.hstack([f.nodal_values for f in prev_funcs])
+        return np.hstack([f.nodal_values for f in funcs]) - prev_vals
+
+    # ------------------------------------------------------------------ #
+    # SNES callbacks: residual and Jacobian on the reduced space
+    # ------------------------------------------------------------------ #
+    def _eval_residual_reduced(self, snes, x_red: PETSc.Vec, r_red: PETSc.Vec):
+        ctx = self._petsc_ctx
+
+        # Lift reduced iterate to full space on a fresh copy, then apply BCs
+        x_full = ctx["x0_full"].copy()
+        x_full[self.active_dofs] = x_red.getArray(readonly=True)
+
+        res_funcs = [f.copy() for f in ctx["funcs"]]
+        for f in res_funcs:
+            g = f._g_dofs
+            f.set_nodal_values(g, x_full[g])
+        self.dh.apply_bcs(ctx["bcs_now"], *res_funcs)
+
+        coeffs = {f.name: f for f in res_funcs}
+        coeffs.update({f.name: f for f in ctx["prev_funcs"]})
+        if ctx["aux_funcs"]:
+            coeffs.update(ctx["aux_funcs"])
+
+        # Assemble residual R(u) on the reduced space (SNES expects +R)
+        _, R_red = self._assemble_system_reduced(coeffs, need_matrix=False)
+
+        r_red.set(0.0)
+        idx = np.arange(R_red.size, dtype=PETSc.IntType)
+        r_red.setValues(idx, R_red, addv=PETSc.InsertMode.INSERT_VALUES)
+        r_red.assemblyBegin(); r_red.assemblyEnd()
+        return 0
+
+    def _eval_jacobian_reduced(self, snes, x_red: PETSc.Vec, J: PETSc.Mat, P: PETSc.Mat):
+        ctx = self._petsc_ctx
+
+        x_full = ctx["x0_full"].copy()
+        x_full[self.active_dofs] = x_red.getArray(readonly=True)
+
+        jac_funcs = [f.copy() for f in ctx["funcs"]]
+        for f in jac_funcs:
+            g = f._g_dofs
+            f.set_nodal_values(g, x_full[g])
+        self.dh.apply_bcs(ctx["bcs_now"], *jac_funcs)
+
+        coeffs = {f.name: f for f in jac_funcs}
+        coeffs.update({f.name: f for f in ctx["prev_funcs"]})
+        if ctx["aux_funcs"]:
+            coeffs.update(ctx["aux_funcs"])
+
+        # Assemble reduced Jacobian
+        A_red, _ = self._assemble_system_reduced(coeffs, need_matrix=True)
+
+        # Load into PETSc AIJ(s)
+        ia = A_red.indptr.astype(PETSc.IntType, copy=False)
+        ja = A_red.indices.astype(PETSc.IntType, copy=False)
+        a = A_red.data
+        try:
+            J.setValuesCSR((ia, ja), a)
+        except TypeError:
+            J.setValuesCSR(ia, ja, a)
+        J.assemblyBegin(); J.assemblyEnd()
+
+        if P.handle != J.handle:
+            try:
+                P.setValuesCSR((ia, ja), a)
+            except TypeError:
+                P.setValuesCSR(ia, ja, a)
+            P.assemblyBegin(); P.assemblyEnd()
+
+        return J, P, PETSc.Mat.Structure.SAME_NONZERO_PATTERN
+
+    # ------------------------------------------------------------------ #
+    # Optional: Schur field-split wiring (only if you call set_schur_fieldsplit)
+    # ------------------------------------------------------------------ #
+    def set_schur_fieldsplit(
+        self,
+        split_map: dict,
+        *,
+        schur_fact: str = "full",      # "full", "upper", "lower", "diag"
+        schur_pre:  str = "selfp",     # "selfp", "a11", "user"
+        sub_pc: dict | None = None,    # e.g. {"u":"hypre", "p":"jacobi"}
+    ) -> None:
+        self._schur_split_cfg = {
+            "split_map": dict(split_map),
+            "schur_fact": schur_fact.lower(),
+            "schur_pre":  schur_pre.lower(),
+            "sub_pc": sub_pc or {},
+        }
+
+    def _apply_schur_fieldsplit(self, ksp) -> None:
+        pc = ksp.getPC()
+        pc.setType("fieldsplit")
+        pc.setFieldSplitType(PETSc.PC.CompositeType.SCHUR)
+
+        cfg = getattr(self, "_schur_split_cfg", None)
+        if cfg is None:
+            return
+
+        opts = PETSc.Options()
+        opts["pc_fieldsplit_schur_fact_type"]    = cfg["schur_fact"]
+        opts["pc_fieldsplit_schur_precondition"] = cfg["schur_pre"]
+
+        blocks = []
+        for name, fields in cfg["split_map"].items():
+            full_idx = []
+            for fld in fields:
+                full_idx.extend(self.dh.get_field_slice(fld))
+            full_idx = np.array(sorted(full_idx), dtype=int)
+            red_idx = self.full_to_red[full_idx]
+            red_idx = red_idx[red_idx >= 0]
+            iset = PETSc.IS().createGeneral(red_idx.astype(PETSc.IntType))
+            blocks.append((name, iset))
+
+        pc.setFieldSplitIS(*blocks)
+        for name, _ in blocks:
+            if f"fieldsplit_{name}_ksp_type" not in self.petsc_options:
+                opts[f"fieldsplit_{name}_ksp_type"] = "preonly"
+            if f"fieldsplit_{name}_pc_type" not in self.petsc_options:
+                opts[f"fieldsplit_{name}_pc_type"] = cfg["sub_pc"].get(name, "jacobi")
 
 
 
 
 
 
+
+
+# --- Helper functions for scattering into global NumPy arrays for PETSc ---
+# These can be added to the bottom of nonlinear_solver.py
+
+def _scatter_element_contribs_petsc(F_elem, element_ids, gdofs_map, target_vec):
+    """Scatters local vectors into a global NumPy vector."""
+    for i in range(len(element_ids)):
+        gdofs = gdofs_map[i]
+        valid = gdofs >= 0
+        if not np.any(valid):
+            continue
+        np.add.at(target_vec, gdofs[valid], F_elem[i][valid])
+
+def _scatter_mat_vec_petsc(K_elem, vec_loc_vals, element_ids, gdofs_map, target_vec):
+    """Computes local mat-vec products and scatters them into a global vector."""
+    for i in range(len(element_ids)):
+        gdofs = gdofs_map[i]
+        valid = gdofs >= 0
+        if not np.any(valid):
+            continue
+        
+        # Get local part of the input vector
+        v_loc = vec_loc_vals[gdofs[valid]]
+        
+        # Local mat-vec product
+        res_loc = K_elem[i][np.ix_(valid, valid)] @ v_loc
+        
+        # Add to global result vector
+        np.add.at(target_vec, gdofs[valid], res_loc)
+
+
+
+
+
+#-----------------------------------------------------------------------------
+# Inexact Newton solver (not working)
+#------------------------------------------------------------------------------
+
+
+class GiantInexactNewtonSolver(NewtonSolver):
+    """
+    Uses the GIANT Fortran package (matrix-free inexact/semi-smooth Newton)
+    as the outer nonlinear solver. Residual/Jacobian-vector products are
+    still assembled/evaluated by your fast Numba kernels.
+    """
+    def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
+
+        dh      = self.dh
+        n_total = dh.total_dofs
+        active  = self.active_dofs         # free dofs (length n_free)
+        n_free  = active.size
+
+        # 1) pack the CURRENT iterate into a reduced vector x_red
+        def _pack_reduced():
+            x_full = np.hstack([f.nodal_values for f in funcs])
+            return x_full[active].copy()
+
+        def _unpack_into_funcs(x_red):
+            # expand reduced → full, add to fields, re-apply BCs
+            dU_full = np.zeros(n_total)
+            dU_full[active] = x_red - _pack_reduced()  # delta on free dofs
+            dh.add_to_functions(dU_full, funcs)
+            dh.apply_bcs(bcs_now, *funcs)
+
+        # 2) Build a shared "coeffs" dict each evaluation uses
+        def _current_coeffs():
+            coeffs = {f.name: f for f in funcs}
+            coeffs.update({f.name: f for f in prev_funcs})
+            if aux_funcs:
+                coeffs.update(aux_funcs)
+            return coeffs
+
+        # 3) GIANT callbacks ------------------------------------------------
+        # IMPORTANT: GIANT calls these many times, so avoid needless allocs.
+        # Residual: fcn(n, x, f, ierr, ...)
+        # Reuse your local helpers: active, dh, _current_coeffs(), etc.
+
+        def fcn(x_in, n_opt=None, *unused):
+            # Snapshot the current fields
+            snap = [f.nodal_values.copy() for f in funcs]
+            try:
+                # Write reduced iterate into the live functions
+                x_full = np.hstack([buf for buf in snap])
+                x_full[active] = x_in
+                off = 0
+                for f, buf in zip(funcs, snap):
+                    nloc = f.nodal_values.size
+                    f.nodal_values[:] = x_full[off:off+nloc]; off += nloc
+                dh.apply_bcs(bcs_now, *funcs)
+
+                # Assemble reduced residual
+                _, R_red = self._assemble_system_reduced(_current_coeffs(), need_matrix=False)
+                return np.asarray(R_red, dtype=np.float64), 0
+            except Exception:
+                return np.zeros_like(x_in, dtype=np.float64), 1
+            finally:
+                # Restore snapshots
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+
+        # Optional tiny cache so we don’t rebuild A_red multiple times at same x
+        _jac_cache = {"x_id": None, "x_copy": None, "A": None}
+        _last_x = None
+        _last_A = None
+
+        def muljac(x_in, v_in, n_opt=None, *unused):
+            snap = [f.nodal_values.copy() for f in funcs]
+            try:
+                # If x_in hasn't changed, reuse cached A_red
+                use_cache = (_jac_cache["x_copy"] is not None
+                                and _jac_cache["x_copy"].shape == x_in.shape
+                                and np.array_equal(_jac_cache["x_copy"], x_in))
+
+
+                if not use_cache or _jac_cache["A"] is None:
+                    x_full = np.hstack([buf for buf in snap])
+                    x_full[active] = x_in
+                    off = 0
+                    for f, buf in zip(funcs, snap):
+                        nloc = f.nodal_values.size
+                        f.nodal_values[:] = x_full[off:off+nloc]; off += nloc
+                    dh.apply_bcs(bcs_now, *funcs)
+
+                    A_red, _ = self._assemble_system_reduced(_current_coeffs(), need_matrix=True)
+                    _jac_cache["A"] = A_red
+                    _jac_cache["x_copy"] = x_in.copy()
+
+                jv = _jac_cache["A"] @ v_in
+                return np.asarray(jv, dtype=np.float64), 0
+            except Exception:
+                return np.zeros_like(v_in, dtype=np.float64), 1
+            finally:
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+
+
+        # 4) Run GIANT on the reduced vector (GIANT updates x0 in place)
+        # Make sure dtypes are correct
+        x0 = _pack_reduced()
+        xscal = np.maximum(1.0, np.abs(x0))
+        rtol  = self.np.newton_tol
+        iopt  = np.zeros(50, dtype=np.int32)
+        ierr  = np.int32(0)
+        x0    = np.asarray(x0,    dtype=np.float64)
+        xscal = np.asarray(xscal, dtype=np.float64)
+        iopt  = np.asarray(iopt,  dtype=np.int32)
+        iopt[30] = 1   # print Newton iteration header
+        iopt[31] = 1   # print inner GMRES info
+
+
+        ierr = giant_solver.giant_wrapper_mod.giant_shim(
+            x0,                         # x : in/out, length n_free
+            xscal,                      # xscal : length n_free
+            float(rtol),                # rtol : scalar
+            iopt,                       # iopt : int32[50], in/out
+            fcn,                        # fcn   : callback (function, not tuple)
+            muljac,                     # muljac: callback (function, not tuple)
+            n_free,                     # optional; may omit since len(x0) is used
+            (),                         # fcn_extra_args
+            ()                          # muljac_extra_args
+        )
+        if int(ierr) != 0:
+            raise RuntimeError(f"GIANT failed with ierr={int(ierr)}")
+
+        # 5) Accept GIANT’s iterate: write it back once
+        # (delta = x* - x_old on active dofs)
+        dU_full = np.zeros(n_total)
+        dU_full[active] = x0 - _pack_reduced()
+        dh.add_to_functions(dU_full, funcs)
+        dh.apply_bcs(bcs_now, *funcs)
+
+        # return the *time-step* increment like your base class
+        delta = np.hstack([f.nodal_values - fp.nodal_values for f, fp in zip(funcs, prev_funcs)])
+        return delta
 
 
 

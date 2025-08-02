@@ -1522,6 +1522,9 @@ class DofHandler:
 
 
     
+
+
+    
     def info(self) -> None:
         print(f"=== DofHandler ({self.method.upper()}) ===")
         for fld in self.field_names:

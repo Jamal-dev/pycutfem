@@ -41,6 +41,7 @@ from pycutfem.fem.mixedelement import MixedElement
 
 
 
+
 # In[2]:
 
 
@@ -172,19 +173,30 @@ residual_form = (
 # In[6]:
 
 
-from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver
+len(dof_handler.get_dirichlet_data(bcs))
+
+
+# In[ ]:
+
+
+from pycutfem.solvers.nonlinear_solver import (NewtonSolver, 
+                                               NewtonParameters, 
+                                               TimeStepperParameters, 
+                                               AdamNewtonSolver, 
+                                               GiantInexactNewtonSolver,
+                                               PetscSnesNewtonSolver)
 from pycutfem.solvers.aainhb_solver import AAINHBSolver
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
 time_params = TimeStepperParameters(dt=0.1, stop_on_steady=True, steady_tol=1e-6, theta= 0.49)
 
-solver = NewtonSolver(
-    residual_form, jacobian_form,
-    dof_handler=dof_handler,
-    mixed_element=mixed_element,
-    bcs=bcs, bcs_homog=bcs_homog,
-    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
-)
+# solver = NewtonSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler,
+#     mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+# )
 # solver = AdamNewtonSolver(
 #     residual_form, jacobian_form,
 #     dof_handler=dof_handler,
@@ -199,7 +211,39 @@ solver = NewtonSolver(
 #     bcs=bcs, bcs_homog=bcs_homog,
 #     newton_params=NewtonParameters(newton_tol=1e-6),
 # )
+# solver = GiantInexactNewtonSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler,
+#     mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6, line_search=False),
+# )
+solver = PetscSnesNewtonSolver(
+    residual_form, jacobian_form,
+    dof_handler=dof_handler,
+    mixed_element=mixed_element,
+    bcs=bcs, bcs_homog=bcs_homog,
+    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+    petsc_options={
+        "mat_type": "aij",
+        "ksp_type": "gmres",
+        "ksp_rtol": 1e-8,
+        "pc_type": "fieldsplit",
+        "pc_fieldsplit_type": "schur",
+        "pc_fieldsplit_schur_fact_type": "full",   # FULL Schur factorization
+        "pc_fieldsplit_schur_precondition": "selfp",
+        # (optional) monitoring
+        "snes_monitor": None, 
+        # "ksp_monitor": None,
+    },
+)
 
+solver.set_schur_fieldsplit(
+    {"u": ["ux", "uy"], "p": ["p"]},
+    schur_fact="full",
+    schur_pre="selfp",
+    sub_pc={"u": "hypre", "p": "jacobi"},   # defaults; tune as needed
+)
 
 # primary unknowns
 functions      = [u_k, p_k]

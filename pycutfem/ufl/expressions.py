@@ -182,7 +182,23 @@ class Function(Expression):
             self._values = np.zeros_like(self._g_dofs, dtype=float)
         else:
             self._g_dofs = np.empty(0, dtype=int); self._values = None; self._g2l = {}
+    
+    def copy(self):
+        """Creates a new Function with a copy of the nodal values."""
+        if self._parent_vector:
+            # The parent VectorFunction is responsible for copying its components.
+            # This logic will be handled by the parent's copy method.
+            # We create a placeholder, the parent will populate it.
+            return Function(self.name, self.field_name, self._dof_handler,
+                            parent_vector=self._parent_vector,
+                            component_index=self._component_index)
 
+        # For a standalone function
+        new_f = Function(self.name, self.field_name, self._dof_handler)
+        if self.nodal_values is not None:
+            new_f.nodal_values[:] = self.nodal_values.copy()
+        return new_f
+    
     @property
     def nodal_values(self):
         if self._parent_vector is not None:
@@ -351,6 +367,14 @@ class VectorFunction(Expression):
                            for i, f in enumerate(field_names)]
         
 
+    def copy(self):
+        """Creates a new VectorFunction with a copy of the nodal values."""
+        # Create a new VectorFunction with the same metadata
+        new_vf = VectorFunction(self.name, self.field_names, self._dof_handler)
+        # Deep copy the numerical data
+        if self.nodal_values is not None:
+            new_vf.nodal_values[:] = self.nodal_values.copy()
+        return new_vf
     
     @property
     def shape(self):

@@ -1,0 +1,118 @@
+  domain:
+ -3.  3.
+ -3.  3.
+  grid:
+ -3. -2.8 -2.6 -2.4 -2.2 -2. -1.8 -1.6 -1.4 -1.2 -1. -0.8 -0.6 -0.4 -0.2
+  1.66533454E-16  0.2  0.4  0.6  0.8  1.  1.2  1.4  1.6  1.8  2.  2.2  2.4  2.6
+  2.8  3.
+ -3. -2.8 -2.6 -2.4 -2.2 -2. -1.8 -1.6 -1.4 -1.2 -1. -0.8 -0.6 -0.4 -0.2
+  1.66533454E-16  0.2  0.4  0.6  0.8  1.  1.2  1.4  1.6  1.8  2.  2.2  2.4  2.6
+  2.8  3.
+
+ ============= Parameter settings ============= 
+
+ sig= 0.1E-04
+ mprmon=3  mprlin=   1
+ kmax=  9  rhoord= 0.4E+01  rhosim= 0.4E+01
+ nonlin=3  rtol= 0.1E-04  itmax=  50
+
+ ============================================== 
+
+
+   G I A N T *****  V e r s i o n  2 . 3 ***
+
+ Generalized Newton-Methods for the solution of nonlinear systems
+
+
+ Real    Workspace declared as     19315 is used up to     19315 (100.0 percent)
+
+ Integer Workspace declared as        50 is used up to        50 (100.0 percent)
+
+
+
+ N =    961
+
+ Prescribed relative precision  0.10E-04
+
+ The selected linear solver is :
+ Good Broyden - ZIB CODELIB
+ Problem is specified as being highly nonlinear
+ Bounded damping strategy is off
+ Maximum permitted number of iteration steps :     50
+
+
+ Internal parameters:
+
+ Starting value for damping factor FCSTART =  0.10E-01
+ Minimum allowed damping factor FCMIN =  0.10E-03
+
+
+
+  ******************************************************************
+
+        It       Normf           Normx         Damp.Fct.
+          LinSol:   Iter:     6  EstPrec:   0.19E+00  TermCrit: 2
+           Cont.:   Iter:    11  EstPrec:   0.63E-01  TermCrit: 1
+         0      0.630E+00       0.184E+00
+          LinSol:   Iter:     4  EstPrec:   0.10E-01  TermCrit: 1
+         1      0.623E+00    *  0.182E+00      0.01000
+          LinSol:   Iter:     4  EstPrec:   0.12E-01  TermCrit: 1
+           Cont.:   Iter:     6  EstPrec:   0.13E-01  TermCrit: 1
+         1      0.623E+00       0.183E+00
+          LinSol:   Iter:     4  EstPrec:   0.91E-01  TermCrit: 1
+         2      0.234E+00    *  0.705E-01      0.59412
+          LinSol:   Iter:     6  EstPrec:   0.36E-01  TermCrit: 1
+           Cont.:   Iter:    18  EstPrec:   0.68E-02  TermCrit: 1
+         2      0.234E+00       0.553E-01
+          LinSol:   Iter:    13  EstPrec:   0.12E+00  TermCrit: 1
+         3      0.135E-01    *  0.352E-02      1.00000
+          LinSol:   Iter:     4  EstPrec:   0.34E-01  TermCrit: 1
+           Cont.:   Iter:    20  EstPrec:   0.37E-03  TermCrit: 1
+         3      0.135E-01       0.343E-02
+          LinSol:   Iter:    15  EstPrec:   0.67E-01  TermCrit: 1
+         4      0.423E-04    *  0.946E-05      1.00000
+
+
+
+ Solution of nonlinear system of equations obtained
+ GIANT required  4 Iteration steps with   5 Function evaluations
+
+ Achieved relative accuracy 0.946E-05
+
+
+
+
+ #############################################################################
+ #                                                                           #
+ #                                                                           #
+ #     Results from time monitor program for:   GIANT                        #
+ #                                                                           #
+ #   Total time:      0.000     Sum of parts:      0.000                     #
+ #                                                                           #
+ #     Name              Calls       Time    Av-time    % Total      % Sum   #
+ #   GIANT                   1      0.000     0.0000       0.00              #
+ #   FCN                     5      0.000     0.0000       0.00       0.00   #
+ #   Jacobi                  4      0.000     0.0000       0.00       0.00   #
+ #   Precon                110      0.000     0.0000       0.00       0.00   #
+ #   It-lin-sol             12      0.000     0.0000       0.00       0.00   #
+ #   Muljac                110      0.000     0.0000       0.00       0.00   #
+ #   Output                  9      0.000     0.0000       0.00       0.00   #
+ #                                                                           #
+ #############################################################################
+
+
+
+
+
+   ******  Statistics * GIANT    **********
+   ***  Newton iterations :          4  ***
+   ***  Corrector steps   :          0  ***
+   ***  JAC calls         :          4  ***
+   ***  FCN calls         :          5  ***
+   ***  Lin. Solv. (ord.) :         55  ***
+   ***  Lin. Solv. (sim.) :         36  ***
+   ***  Lin. Solv. (tot.) :         91  ***
+   ***  Lin. accur. fails :          0  ***
+   ****************************************
+
+ returned from call    1 of GIANT

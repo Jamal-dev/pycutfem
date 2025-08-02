@@ -949,29 +949,23 @@ class FormCompiler:
         gdofs_map    = static_args["gdofs_map"]
         n_dofs_local = self.me.n_dofs_local
 
-        if self.ctx["rhs"]:                               # assembling a vector
+        if self.ctx["rhs"]:
             for e in range(mesh.n_elements):
                 np.add.at(matvec, gdofs_map[e], F_loc[e])
-        else:                                             # assembling a matrix
-            data = np.empty(mesh.n_elements * n_dofs_local * n_dofs_local)
+        else:
+            nloc = self.me.n_dofs_local
+            data = np.empty(mesh.n_elements * nloc * nloc)
             rows = np.empty_like(data, dtype=np.int32)
             cols = np.empty_like(data, dtype=np.int32)
-
             for e in range(mesh.n_elements):
                 gdofs = gdofs_map[e]
                 r, c = np.meshgrid(gdofs, gdofs, indexing='ij')
-                start = e * n_dofs_local * n_dofs_local
-                end   = start + n_dofs_local * n_dofs_local
+                s = e * nloc * nloc; t = s + nloc * nloc
+                rows[s:t] = r.ravel(); cols[s:t] = c.ravel(); data[s:t] = K_loc[e].ravel()
+            matvec += sp.coo_matrix((data, (rows, cols)),
+                                    shape=(self.dh.total_dofs, self.dh.total_dofs)).tocsr()
 
-                rows[start:end] = r.ravel()
-                cols[start:end] = c.ravel()
-                data[start:end] = K_loc[e].ravel()
-
-            K_coo = sp.coo_matrix(
-                (data, (rows, cols)),
-                shape=(self.dh.total_dofs, self.dh.total_dofs)
-            )
-            matvec += K_coo.tocsr()
+        
 
 
 
