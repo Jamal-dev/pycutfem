@@ -67,8 +67,8 @@ print(f"Reynolds number (Re): {Re:.2f}")
 from pycutfem.utils.adaptive_mesh import structured_quad_levelset_adaptive
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-NX, NY = 45, 20
-# NX, NY = 50, 60
+# NX, NY = 20, 20
+NX, NY = 50, 60
 poly_order = 2
 level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
 # h  = 0.5*(L/NX + H/NY)
@@ -145,15 +145,16 @@ print(f"Number of neg ghost edges: {mesh.edge_bitset('ghost_neg').cardinality()}
 print(f"Number of ghost edges (both): {mesh.edge_bitset('ghost_both').cardinality()}")
 
 
-# In[ ]:
+# In[5]:
 
 
-# dof_handler.tag_dof_by_locator('p_pin', 'p',
-#     locator=lambda x,y: np.isclose(x, 0) and np.isclose(y, 0),
-#     find_first=True)
-# bcs.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
-# bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x,y: 0.0))
-
+dof_handler.tag_dof_by_locator(
+    'p_pin', 'p',
+    locator=lambda x, y: (x < 0.05 * L) and np.isclose(y, 0.5 * H),
+    find_first=True
+)
+bcs.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x, y: 0.0))
+bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x, y: 0.0))
 # Tag velocity DOFs inside the cylinder (same tag name for both fields is OK)
 dof_handler.tag_dofs_from_element_bitset("inactive", "ux", "inside", strict=True)
 dof_handler.tag_dofs_from_element_bitset("inactive", "uy", "inside", strict=True)
@@ -245,6 +246,167 @@ len(dof_handler.get_dirichlet_data(bcs))
 # In[12]:
 
 
+import numpy as np
+
+def make_peak_filter_cb(
+    dh,
+    level_set,
+    *,
+    fields=('ux', 'uy'),
+    side='+',                 # '+' → φ>=0 (outside), '-' → φ<=0 (inside)
+    band_width=1.0,           # keep nodes with |φ| <= band_width * h_dof
+    tau=3.5,                  # MAD threshold
+    skip_dofs=None            # set[int] of global DOFs to skip (e.g. active Dirichlet)
+):
+    """
+    Robust outlier clamp for velocity components near the interface, operating in
+    DOF space using only the DofHandler's numbering and maps.
+
+    Usage:
+        skip_active = set(dh.get_dirichlet_data(bcs).keys()) \
+                      - set(dh.dof_tags.get('inactive', set()))
+        cb = make_peak_filter_cb(dh, level_set, side='+', band_width=1.0,
+                                 tau=3.5, skip_dofs=skip_active)
+        solver = NewtonSolver(..., post_cb=cb)
+    """
+    if skip_dofs is None:
+        skip_dofs = set()
+
+    mesh = dh.mixed_element.mesh
+
+    # -----------------------------------------------------------
+    # 1) Build 1-ring DOF adjacency per field from element maps
+    # -----------------------------------------------------------
+    def _build_dof_adjacency(field):
+        adj = {}  # gdof -> set(neighbour gdofs)
+        elem_maps = dh.element_maps[field]            # per-element global DOFs (field)
+        for gdofs in elem_maps:                       # list[int] for that element/field
+            g = list(gdofs)
+            for i in range(len(g)):
+                ai = g[i]
+                s = adj.setdefault(ai, set())
+                for j in range(len(g)):
+                    if i == j: continue
+                    s.add(g[j])
+        return adj
+
+    adj_by_field = {f: _build_dof_adjacency(f) for f in fields}
+
+    # -----------------------------------------------------------
+    # 2) Coordinates and φ at DOFs (handler-driven, not mesh ids)
+    # -----------------------------------------------------------
+    # all DOF coords aligned with global DOF index
+    all_coords = dh.get_all_dof_coords()             # shape (total_dofs, 2)  :contentReference[oaicite:11]{index=11}
+    # φ evaluated vectorised (CircleLevelSet etc. support array input)
+    phi_all = level_set(all_coords)
+
+    # -----------------------------------------------------------
+    # 3) Per-DOF h: mean element char length over adjacent elems
+    # -----------------------------------------------------------
+    # Build node -> {adjacent element ids} once (geometry graph),
+    # then map gdof -> node id -> elems -> average h
+    node_to_elems = {}
+    for el in mesh.elements_list:
+        for nid in el.nodes:
+            node_to_elems.setdefault(nid, set()).add(el.id)
+
+    g2n = dh._dof_to_node_map  # global dof -> (field, node_id)  :contentReference[oaicite:12]{index=12}
+
+    def _h_for_gdof(gd):
+        nid = g2n[gd][1]
+        eids = node_to_elems.get(nid, ())
+        if not eids:
+            return mesh.element_char_length(0)
+        return np.mean([mesh.element_char_length(e) for e in eids])
+
+    # cache per-DOF h in a dict (sparse – only what we touch)
+    h_cache = {}
+
+    # -----------------------------------------------------------
+    # 4) Band masks per field (by DOF), with side selection
+    # -----------------------------------------------------------
+    def _band_mask_for_field(field):
+        gdofs = dh.get_field_slice(field)            # ascending global DOFs  :contentReference[oaicite:13]{index=13}
+        phi_f = phi_all[gdofs]
+        if side == '+':
+            side_ok = (phi_f >= 0.0)
+        elif side == '-':
+            side_ok = (phi_f <= 0.0)
+        else:
+            raise ValueError("side must be '+' or '-'")
+        # build h per gdof lazily
+        h_f = np.empty_like(phi_f)
+        for i, gd in enumerate(gdofs):
+            if gd not in h_cache:
+                h_cache[gd] = _h_for_gdof(gd)
+            h_f[i] = h_cache[gd]
+        band = (np.abs(phi_f) <= band_width * h_f) & side_ok
+        return gdofs, band
+
+    band_by_field = {f: _band_mask_for_field(f) for f in fields}
+
+    # -----------------------------------------------------------
+    # 5) The actual filter that edits a VectorFunction in-place
+    # -----------------------------------------------------------
+    from pycutfem.ufl.expressions import VectorFunction
+
+    def _filter_on_vector(vf, field):
+        gdofs, band = band_by_field[field]
+        g2l = vf._g2l        # global→local map in that VectorFunction  :contentReference[oaicite:14]{index=14}
+        vals = vf.nodal_values
+
+        adj = adj_by_field[field]
+        changed = 0
+
+        # iterate only DOFs present in vf and within the band and not in skip list
+        for gd, keep in zip(gdofs, band):
+            if not keep:               # not in |φ|<=band_width*h or wrong side
+                continue
+            if gd in skip_dofs:        # e.g. active Dirichlet at walls/inlet/outlet
+                continue
+            li = g2l.get(gd, None)
+            if li is None:             # vf may not carry this DOF (shouldn't happen)
+                continue
+
+            neigh = [n for n in adj.get(gd, ()) if n in g2l]
+            if len(neigh) < 3:
+                continue
+
+            nvals = np.array([vals[g2l[n]] for n in neigh], float)
+            med   = np.median(nvals)
+            mad   = np.median(np.abs(nvals - med)) + 1e-14
+            if abs(vals[li] - med) > tau * mad:
+                vals[li] = med
+                changed += 1
+                dh._tmp_clamped_gdofs.add(gd)   # << NEW, remember this clamped gdof
+                dh._tmp_clamped_vals[gd] = med         # NEW
+        return changed
+
+    # -----------------------------------------------------------
+    # 6) The callback the Newton solver will call each iteration
+    # -----------------------------------------------------------
+    def _cb(funcs):
+        # Reset a per-call scratch set the solver can read afterwards
+        dh._tmp_clamped_gdofs = set()     # << NEW
+        dh._tmp_clamped_vals = {}
+        # Expect a VectorFunction (velocity) and a scalar Function (pressure) in funcs.
+        from pycutfem.ufl.expressions import VectorFunction
+        vf = next((f for f in funcs if isinstance(f, VectorFunction)), None)
+        if vf is None:
+            return
+        total = 0
+        for f in fields:
+            total += _filter_on_vector(vf, f)
+        if total:
+            print(f"        [peak-filter] clamped {total} DOFs in |φ|≤{band_width}h on side '{side}'")
+
+    return _cb
+
+
+# In[13]:
+
+
+from matplotlib import scale
 from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict
 from pycutfem.core.geometry import hansbo_cut_ratio
 from pycutfem.ufl.expressions import ElementWiseConstant
@@ -254,8 +416,10 @@ n_f = FacetNormal()                  # vector expression (n_x, n_y) on the fluid
 
 def _dn(expr):
     """Normal derivative  n·∇expr  on an (interior) edge."""
-    return n[0] * Derivative(expr, 1, 0) + n[1] * Derivative(expr, 0, 1)
-    # return dot(grad(expr), n)
+    Dx = Derivative(expr, 1, 0)
+    Dy = Derivative(expr, 0, 1)
+    _ = Dx + Dy
+    return n[0]*Dx + n[1]*Dy
 
 def grad_inner(u, v):
     """⟨∂ₙu, ∂ₙv⟩  (scalar or 2‑D vector)."""
@@ -272,24 +436,25 @@ dx_phys  = dx(defined_on=physical_domain,
               metadata   = {"q": 7, "side": "+"} # integrate only φ>0 (positive side)
     )
 dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":9})   # interior surface
-dG       = dGhost(defined_on=ghost_edges_used, level_set=level_set,metadata={"q":6})  # ghost surface
+dG       = dGhost(defined_on=ghost_edges_used, level_set=level_set,metadata={"q":6,'derivs': {(0,1),(1,0)}})  # ghost surface
 
 cell_h  = CellDiameter() # length‑scale per element
-beta_N  = Constant(100.0 * poly_order**2)      # Nitsche penalty (tweak)
-# 1) Hansbo factor — this is a *numpy array*, one value per element
-# beta0_val  = 10.0 * poly_order**2
-# theta_min  = 1.0e-3
-# hansbo_plus = hansbo_cut_ratio(mesh, level_set, side='+')    # -> np.ndarray, shape (n_elem,)
-# beta_hansbo_arr = beta0_val / np.clip(hansbo_plus, theta_min, 1.0)
+beta_N  = Constant(20.0 * poly_order**2)      # Nitsche penalty (tweak)
+def scaled_penalty_interface(penalty,poly_order =poly_order,
+                             side='+'):
+    # 1) Hansbo factor — this is a *numpy array*, one value per element
+    beta0_val  = penalty * poly_order**2
+    theta_min  = 1.0e-3
+    hansbo_plus = hansbo_cut_ratio(mesh, level_set, side=side)    # -> np.ndarray, shape (n_elem,)
+    hansbo_plus = np.clip(hansbo_plus, theta_min, 1.0)
+    alpha = 0.5
+    beta_hansbo_arr = beta0_val * hansbo_plus**(-alpha)
+    β_visc = ElementWiseConstant(beta_hansbo_arr) * (mu_const / cell_h)
+    β_iner = beta0_val * (rho_const * cell_h / dt)        # no θ-scaling here
 
-# Wrap only the array part in ElementWiseConstant
-# β_h = ElementWiseConstant(beta_hansbo_arr)  # OK: per-element scalar
-
-# 2) Symbolic augmentation factor (stays symbolic because of CellDiameter())
-# augment = mu_const / cell_h + rho_const * cell_h / dt   # scalar expression
-
-# 3) Final penalty (symbolic EWC × expression)
-# β = β_h * augment
+    # 3) Final penalty (symbolic EWC × expression)
+    return β_visc + β_iner
+β = scaled_penalty_interface(30.0, side='+')  # Nitsche penalty
 
 def epsilon(u):
     "Symmetric gradient."
@@ -319,26 +484,26 @@ def sigma_dot_n_v(u_vec, p_scal,v_test,n):
     # second term: μ (∇uᵀ)·n
     b = dot(grad(u_vec).T, n)
     # combine and subtract pressure part
-    return  mu * dot((a + b),v_test) #- p_scal * dot(v_test,n)         # vector of size 2
+    return  mu * dot((a + b),v_test) - p_scal * dot(v_test,n)         # vector of size 2
 
 # --- Jacobian contribution on Γsolid --------------------------------
 J_int = (
     - sigma_dot_n_v(du, dp, v,n_f)           # consistency
     - sigma_dot_n_v(v, q, du,n_f)           # symmetry
-    + beta_N  / cell_h * dot(du, v)     # penalty
-    - dot(du,n) * q
-    + beta_N/ cell_h * dot(du,n) * dot(v,n)     # penalty
-    # + β  * dot(du, v)     # penalty
+    # + beta_N  / cell_h * dot(du, v)     # penalty
+    # - dot(du,n) * q
+    # + beta_N/ cell_h * dot(du,n) * dot(v,n)     # penalty
+    + β  * dot(du, v)     # penalty
 ) * dΓ
 
 # --- Residual contribution on Γsolid --------------------------------
 R_int = (
     - sigma_dot_n_v(u_k, p_k, v,n_f)
     - sigma_dot_n_v(v, q, u_k,n_f)
-    + beta_N  / cell_h * dot(u_k, v)
-    - dot(u_k,n) * q
-    + beta_N/ cell_h * dot(u_k,n) * dot(v,n)
-    # + β  * dot(u_k, v)  
+    # + beta_N  / cell_h * dot(u_k, v)
+    # - dot(u_k,n) * q
+    # + beta_N/ cell_h * dot(u_k,n) * dot(v,n)
+    + β  * dot(u_k, v)  
 ) * dΓ
 
 # volume ------------------------------------------------------------
@@ -368,7 +533,7 @@ r_vol = ( rho*dot(u_k-u_n, v)/dt
           - p_k*div(v) + q*div(u_k) ) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
-penalty_val = 10
+penalty_val = 0.1
 penalty_grad = 0.1
 gamma_v = Constant(penalty_val * poly_order**2)
 gamma_v_grad= Constant(penalty_grad * poly_order**2)
@@ -393,12 +558,6 @@ residual_form  = r_vol + R_int + stab
 
 
 
-
-
-# In[13]:
-
-
-# !rm ~/.cache/pycutfem_jit/*
 
 
 # In[14]:
@@ -494,7 +653,7 @@ def save_solution(funcs):
 
         # 1. First, check if the point is in the physical domain.
         if level_set(xy) < 0:
-            # print(f"Warning: Point ({x},{y}) is in the fictitious domain (phi < 0). Returning NaN.")
+            print(f"Warning: Point ({x},{y}) is in the fictitious domain (phi < 0). Returning NaN.")
             return np.nan
 
         # 2. Find the element that contains the point.
@@ -538,7 +697,7 @@ def save_solution(funcs):
     # ------------------ Log / store ----------------------------------------
     print(f"[step {step_counter:4d}]  FD={F_D:.6e}  FL={F_L:.6e}  "
           f"CD={C_D:.6f}  CL={C_L:.6f}  Δp={dp:.6f}")
-    if step_counter % 2 == 0:
+    if step_counter % 5 == 0:
         u_k_func.plot(field = 'ux',
                       title=f"Velocity Ux at step {step_counter}",
                       xlabel='X-Axis', ylabel='Y-Axis',
@@ -558,21 +717,57 @@ def save_solution(funcs):
 # In[16]:
 
 
-from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver
+from pycutfem.solvers.nonlinear_solver import (NewtonSolver, 
+                                               NewtonParameters, 
+                                               TimeStepperParameters, 
+                                               AdamNewtonSolver,
+                                               PetscSnesNewtonSolver)
 from pycutfem.solvers.aainhb_solver import AAINHBSolver           # or get_solver("aainhb")
 
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
 time_params = TimeStepperParameters(dt=dt.value,max_steps=50 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
+dirichlet_dofs = set(dof_handler.get_dirichlet_data(bcs).keys())  # bcs = your Dirichlet BCs
+post_cb = make_peak_filter_cb(
+    dof_handler, level_set,
+    fields=("ux","uy"),      # or ("ux","uy","p") if you want to smooth pressure too
+    side='+',                 # use '+' if Ω = {φ>0}, '-' if Ω = {φ<0}
+    band_width=0.5,           # in units of h
+    tau=5.0,
+    skip_dofs=dirichlet_dofs
+)
 
-solver = NewtonSolver(
+# solver = NewtonSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler,
+#     mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+#     postproc_timeloop_cb=save_solution,
+#     # preproc_cb=post_cb,  # Optional: peak filter callback
+# )
+solver = PetscSnesNewtonSolver(
     residual_form, jacobian_form,
     dof_handler=dof_handler,
     mixed_element=mixed_element,
     bcs=bcs, bcs_homog=bcs_homog,
-    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
-    postproc_timeloop_cb=save_solution
-)
+    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True,
+                                   max_newton_iter=500),
+    postproc_timeloop_cb=save_solution,
+    petsc_options={
+        "snes_type": "vinewtonrsls",     # VI Newton (Reduced-Space)
+        "snes_vi_monitor": None,         # optional: see active set info
+        "snes_linesearch_type": "bt",    # OK with VI
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+        "snes_converged_reason": None,
+    },)
+solver.set_box_bounds(by_field={
+    "ux": (-2.0, 2.0),
+    "uy": (-2.0, 2.0),
+    "p":  (None,  None),   # p ≥ 0
+})
 # primary unknowns
 functions      = [u_k, p_k]
 prev_functions = [u_n, p_n]

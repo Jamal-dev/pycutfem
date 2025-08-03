@@ -370,6 +370,7 @@ class NewtonSolver:
         prev_functions: List,               # previous‑step snapshot Uⁿ⁻¹
         time_params: TimeStepperParameters = TimeStepperParameters(),
         aux_functions: Optional[Dict[str, "Function"]] = None,
+        post_step_refiner=None
     ) -> Tuple[np.ndarray, int, float]:
         r"""Advance the problem in *pseudo*‑time until steady‑state.
 
@@ -386,6 +387,8 @@ class NewtonSolver:
         aux_functions : dict[str, Function], optional
             Additional coefficient fields (material properties, body forces,
             etc.) that appear in the forms but are *not* unknowns.
+        post_step_refiner : Callable, optional
+            It can be another newton method that refines the solution
 
         Returns
         -------
@@ -416,6 +419,14 @@ class NewtonSolver:
             # Newton loop -----------------------------------------
             delta_U = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
             print(f"    Time step {step+1}: ΔU = {np.linalg.norm(delta_U, ord=np.inf):.2e}")
+            
+            # Post-step refiner (VI clip) **before** promotion so prev matches clipped state
+            if post_step_refiner is not None:
+                post_step_refiner(step, bcs_now, functions, prev_functions)
+            
+             # Accept: promote current → previous
+            for f_prev, f in zip(prev_functions, functions):
+                f_prev.nodal_values[:] = f.nodal_values[:]
 
             if step > 0:
                 # Reject and retry with smaller Δt if the update blows up
@@ -1136,8 +1147,16 @@ class PetscSnesNewtonSolver(NewtonSolver):
 
         # Load initial guess into PETSc vector
         idx = np.arange(x0_red.size, dtype=PETSc.IntType)
+
+        # --- PROJECT x0 INTO [XL, XU] if VI is active ---
+        if getattr(self, "_XL", None) is not None and getattr(self, "_XU", None) is not None:
+            lo = self._XL.getArray(readonly=True)
+            hi = self._XU.getArray(readonly=True)
+            x0_red = np.minimum(np.maximum(x0_red, lo), hi)
+
         self._x_red.setValues(idx, x0_red, addv=PETSc.InsertMode.INSERT_VALUES)
         self._x_red.assemblyBegin(); self._x_red.assemblyEnd()
+
 
         # Solve the nonlinear system on the reduced space
         self._snes.solve(None, self._x_red)
@@ -1271,6 +1290,75 @@ class PetscSnesNewtonSolver(NewtonSolver):
                 opts[f"fieldsplit_{name}_ksp_type"] = "preonly"
             if f"fieldsplit_{name}_pc_type" not in self.petsc_options:
                 opts[f"fieldsplit_{name}_pc_type"] = cfg["sub_pc"].get(name, "jacobi")
+    # ------------------------------------------------------------------ #
+    # -------------------- Additional methods ---------------------------
+    # ------------------------------------------------------------------ #
+    def set_vi_on_interface_band(
+        self,
+        level_set,
+        *,
+        fields=("ux", "uy"),      # constrain only velocity by default
+        side="+",                 # '+' => φ>=0 (fluid), '-' => φ<=0 (solid)
+        band_width=1.0,           # thickness ~ band_width * h_interface
+        bounds_by_field=None,     # e.g. {"ux": (-Ucap, Ucap), "uy": (-Ucap, Ucap)}
+        Ucap=None,                # if given, symmetric cap (-Ucap, +Ucap) for listed fields
+        eps=None                  # absolute band half-width (override if you prefer |φ|<=eps)
+    ):
+        """
+        Build VI bounds only for DOFs in an interface band and only for the requested
+        fields; all other DOFs remain unbounded (±inf). Call BEFORE solve_time_interval().
+        """
+        dh   = self.dh
+        mesh = dh.mixed_element.mesh
+
+        # 1) Coordinates and level-set at DOFs
+        X = dh.get_all_dof_coords()                  # shape (total_dofs, 2)  :contentReference[oaicite:3]{index=3}
+        phi = level_set(X)
+
+        # 2) Choose band half-width in physical units
+        if eps is None:
+            # representative h near the interface (use cut elements if available)
+            try:
+                cut_ids = mesh.element_bitset("cut").to_indices()
+                if len(cut_ids) > 0:
+                    h0 = float(np.mean([mesh.element_char_length(int(e)) for e in cut_ids]))
+                else:
+                    h0 = float(np.mean([mesh.element_char_length(e) for e in range(len(mesh.elements_list))]))
+            except Exception:
+                h0 = float(np.mean([mesh.element_char_length(e) for e in range(len(mesh.elements_list))]))
+            eps = band_width * h0
+
+        # 3) Start with ±inf everywhere
+        n = dh.total_dofs
+        lo_full = np.full(n, -np.inf, dtype=float)
+        hi_full = np.full(n,  np.inf, dtype=float)
+
+        # 4) Field-wise mask inside the band on the requested side
+        def _side_ok(arr):
+            if side == "+":  return arr >= 0.0
+            if side == "-":  return arr <= 0.0
+            raise ValueError("side must be '+' or '-'")
+
+        # bounds to apply
+        if bounds_by_field is None:
+            if Ucap is None:
+                raise ValueError("Provide either bounds_by_field or Ucap.")
+            bounds_by_field = {f: (-float(Ucap), float(Ucap)) for f in fields}
+
+        for f in fields:
+            gdofs = np.asarray(dh.get_field_slice(f), dtype=int)
+            band  = (np.abs(phi[gdofs]) <= eps) & _side_ok(phi[gdofs])
+            if not np.any(band):
+                continue
+            lo, hi = bounds_by_field.get(f, (None, None))
+            if lo is not None:
+                lo_full[gdofs[band]] = float(lo)
+            if hi is not None:
+                hi_full[gdofs[band]] = float(hi)
+
+        # Leave pressure (or other fields) unbounded by simply not touching them.
+        # Store for SNES setup; they’ll be reduced to the active/free DOFs later.
+        self.set_box_bounds(lower=lo_full, upper=hi_full)     # uses existing API  :contentReference[oaicite:4]{index=4}
 
 
 
