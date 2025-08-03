@@ -5,7 +5,7 @@ from pycutfem.ufl.expressions import (
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, 
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
     ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter,
-    NormalComponent,Restriction
+    NormalComponent, Restriction, Power as UFLPower
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
@@ -89,14 +89,14 @@ class IRGenerator:
             self.ir_sequence.append(CheckDomain(bitset_id=id(node.domain)))
             return
         
-        if isinstance(node, (Sum, Sub, Prod, UflDiv)):
+        if isinstance(node, (Sum, Sub, Prod, UflDiv, UFLPower)):
             self._visit(node.a, side=side)
             self._visit(node.b, side=side)
             if isinstance(node, UflDiv):
                 op_symbol = '/'
             else:
                 # op_symbol = {Sum: '+', Sub: '-', Prod: '*'}.get(type(node), '/')
-                op_symbol = {Sum: '+', Sub: '-', Prod: '*'}.get(type(node), '/')
+                op_symbol = {Sum: '+', Sub: '-', Prod: '*', UFLPower: '**'}.get(type(node), '/')
             self.ir_sequence.append(BinaryOp(op_symbol=op_symbol))
             return
             

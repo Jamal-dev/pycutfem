@@ -1291,6 +1291,28 @@ class NumbaCodeGen:
                         raise NotImplementedError(
                             f"Division not implemented for roles {a.role}/{b.role} "
                             f"with shapes {a.shape}/{b.shape}")
+                # -----------------------------------------------------------------
+                # ------------------  POWER  ( **  )  --------------------------------
+                # -----------------------------------------------------------------
+                 elif op.op_symbol == '**':
+                    body_lines.append("# Power")
+                    # power *anything* by a scalar constant (const in exponent)
+                    if (b.role == 'const' or b.role == 'value') and not b.is_vector and b.shape == ():
+                        body_lines.append(f"{res_var} = {a.var_name} ** float({b.var_name})")
+                        stack.append(StackItem(var_name=res_var, role=a.role,
+                                            shape=a.shape, is_vector=a.is_vector,
+                                            is_gradient=a.is_gradient, field_names=a.field_names,
+                                            parent_name=a.parent_name))
+                    elif (a.role == 'const' or a.role == 'value') and not a.is_vector and a.shape == ():
+                        body_lines.append(f"{res_var} = float({a.var_name}) ** {b.var_name}")
+                        stack.append(StackItem(var_name=res_var, role=b.role,
+                                            shape=b.shape, is_vector=b.is_vector,
+                                            is_gradient=b.is_gradient, field_names=b.field_names,
+                                            parent_name=b.parent_name))
+                    else:
+                        raise NotImplementedError(
+                            f"Power not implemented for roles {a.role}/{b.role} "
+                            f"with shapes {a.shape}/{b.shape}")
 
                     
 

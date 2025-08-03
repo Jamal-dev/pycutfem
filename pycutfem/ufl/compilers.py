@@ -38,7 +38,7 @@ from pycutfem.ufl.expressions import (
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
     ElementWiseConstant, Derivative, Transpose,
     CellDiameter, NormalComponent,
-    Restriction
+    Restriction, Power
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -101,6 +101,7 @@ class FormCompiler:
             CellDiameter: self._visit_CellDiameter,
             NormalComponent: self._visit_NormalComponent,
             Restriction: self._visit_Restriction,
+            Power: self._visit_Power
         }
 
     # ============================ PUBLIC API ===============================
@@ -220,6 +221,29 @@ class FormCompiler:
     
     def _visit_NormalComponent(self, n:NormalComponent):
         return self._visit_FacetNormal(FacetNormal())[n.idx]
+    
+    def _visit_Power(self, n: Power):
+        """
+        Handles the power operation, which is not a standard UFL operation.
+        It can be used to raise a field to a constant power.
+        """
+        # Visit the base and exponent separately.
+        base = self._visit(n.a)
+        exponent = self._visit(n.b)
+
+        # Handle custom VecOpInfo and GradOpInfo types explicitly
+        if isinstance(base, (VecOpInfo, GradOpInfo)):
+            new_data = base.data ** exponent
+            # Return a new instance of the same class with the new data
+            # This uses getattr for robustness, as VecOpInfo lacks 'coeffs'
+            return type(base)(data=new_data, role=base.role, coeffs=getattr(base, 'coeffs', None))
+
+        # Ensure the exponent is a scalar (constant).
+        if not np.isscalar(exponent):
+            raise ValueError("Exponent must be a scalar constant.")
+
+        # Raise the base to the power of the exponent.
+        return base ** exponent
 
 
     def _visit_Derivative(self, op: Derivative):
@@ -1401,7 +1425,7 @@ class FormCompiler:
         dh, me = self.dh, self.me
 
         # 1. Get required derivatives, edge set, and level set
-        derivs = required_multi_indices(intg.integrand)
+        derivs = required_multi_indices(intg.integrand) | {(0, 0)}
         edge_ids = (intg.measure.defined_on
                 if intg.measure.defined_on is not None
                 else mesh.edge_bitset('ghost'))
@@ -1605,7 +1629,7 @@ class FormCompiler:
             return
 
         # 2. geometry tables ------------------------------------------
-        derivs = required_multi_indices(intg.integrand)
+        derivs = required_multi_indices(intg.integrand) | {(0, 0)}  # always include values
         if (0, 0) not in derivs:
             derivs |= {(0, 0)}
         qdeg = self._find_q_order(intg)

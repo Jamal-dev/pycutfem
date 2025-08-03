@@ -78,6 +78,18 @@ class Expression:
     def restrict(self, domain_tag): return Restriction(self, domain_tag)
     def side(self, s: str): return Side(self, s)
 
+    def __pow__(self, other):
+        """Creates a symbolic Power expression."""
+        if not isinstance(other, Expression):
+            other = Constant(other)
+        return Power(self, other)
+
+    def __rpow__(self, other):
+        """Handles cases like `2.0 ** expr`."""
+        if not isinstance(other, Expression):
+            other = Constant(other)
+        return Power(other, self)
+
     def find_first(self, criteria):
         """Recursively search for the first node in the expression tree that meets a criteria."""
         if criteria(self): return self
@@ -103,7 +115,9 @@ class Transpose(Expression):
     def __init__(self, A: Expression):
         super().__init__()
         self.A = A
-
+class Power(Expression):
+    def __init__(self, a, b): self.a, self.b = a, b
+    def __repr__(self): return f"({self.a!r} ** {self.b!r})"
 # ----------------------------------------------------------
 # Small utility to build a per-DOF mask for a given field
 # ----------------------------------------------------------

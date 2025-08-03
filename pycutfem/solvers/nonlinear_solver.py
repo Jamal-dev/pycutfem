@@ -447,6 +447,7 @@ class NewtonSolver:
                 break
 
             # Accept: promote current → previous ------------------
+            dh.apply_bcs(bcs_now, *functions)
             for f_prev, f in zip(prev_functions, functions):
                 f_prev.nodal_values[:] = f.nodal_values[:]
             # Post time-loop callback
