@@ -1129,6 +1129,18 @@ class Restriction(Expression):
     def __repr__(self):
         return f"Restriction({self.operand!r}, '{self.domain}')"
 
+class Trace(Expression):
+    """Symbolic trace of a tensor expression."""
+    def __init__(self, A: Expression):
+        super().__init__()
+        self.A = A
+    def __repr__(self):
+        return f"Trace({self.A!r})"
+
+def trace(A):
+    """Helper function to create a Trace expression."""
+    return Trace(A)
+
 # --- Helper functions to create operator instances ---
 def grad(v): return Grad(v)
 def div(v):

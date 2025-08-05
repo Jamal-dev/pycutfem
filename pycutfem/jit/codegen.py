@@ -6,7 +6,8 @@ from matplotlib.pylab import f
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
-    BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain
+    BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
+    Trace
 )
 from pycutfem.jit.symbols import encode
 import numpy as np
@@ -396,7 +397,60 @@ class NumbaCodeGen:
                     required_args.add("h_arr")
 
 
+            # ------------------------------------------------------------------
+            # Trace operator --------
+            # ------------------------------------------------------------------
+            elif isinstance(op, Trace):
+                a = stack.pop()
+                res_var = new_var("trace_res")
 
+                # --- Case 1: Trace of a computed value/constant (e.g., shape (2, 2)) ---
+                if len(a.shape) == 2:
+                    # First, validate that the matrix is square.
+                    if a.shape[0] != a.shape[1]:
+                        raise ValueError(f"Trace requires a square matrix, but got shape {a.shape}")
+                    
+                    # If valid, generate the execution code.
+                    body_lines.append(f"# Trace of a computed matrix -> scalar value")
+                    body_lines.append(f"{res_var} = np.trace({a.var_name})")
+                    stack.append(StackItem(var_name=res_var,
+                                            role='value',
+                                            shape=(), # Result is a scalar
+                                            is_vector=False,
+                                            is_gradient=False,
+                                            field_names=[]))
+
+                # --- Case 2: Trace of a Test/Trial function tensor (e.g., shape (2, n, 2)) ---
+                elif len(a.shape) == 3:
+                    # First, validate that the tensor is square over its first and last dimensions.
+                    if a.shape[0] != a.shape[2]:
+                        raise ValueError(f"Trace requires a square tensor (k=d), but got shape {a.shape}")
+
+                    # If valid, generate the execution code.
+                    body_lines.append(f"# Trace of a symbolic tensor -> scalar basis of shape (1, n)")
+                    k, n, _ = a.shape
+                    body_lines += [
+                        f"n_locs = {n}",
+                        f"n_comps = {k}",
+                        f"{res_var} = np.zeros((1, n_locs), dtype=np.float64)",
+                        f"for j in range(n_locs):",
+                        f"    local_sum = 0.0",
+                        f"    for i in range(n_comps):",
+                        f"        local_sum += {a.var_name}[i, j, i]",
+                        f"    {res_var}[0, j] = local_sum"
+                    ]
+                    stack.append(StackItem(var_name=res_var,
+                                            role=a.role,
+                                            shape=(1, n),
+                                            is_vector=False,
+                                            is_gradient=False,
+                                            field_names=a.field_names,
+                                            parent_name=a.parent_name))
+                
+                # --- Else: The shape is not a 2D or 3D tensor, so it's invalid. ---
+                else:
+                    raise TypeError(f"Cannot take trace of an operand with shape {a.shape}. Must be a 2D or 3D tensor.")
+            
             # --- UNARY OPERATORS ---
             # ----------------------------------------------------------------------
             # ∇(·) operator
@@ -822,8 +876,67 @@ class NumbaCodeGen:
                     body_lines.append(f"{res_var} = {a.var_name}.T.copy() @ {b.var_name}")
                     stack.append(StackItem(var_name=res_var, role='value',
                                         shape=(a.shape[1],b.shape[1]), is_vector=False))
+                    
 
-                
+                # ---------------------new block--------------------------------
+
+                # ---------------------------------------------------------------------
+                # dot( grad(u_trial) ,  grad(u_k) )   -> (k,n,d) . (k,d) => (k,n,k)
+                # ---------------------------------------------------------------------
+                elif (a.role == 'trial' and a.is_gradient and b.role == 'value' 
+                    and b.is_gradient 
+                    and a.shape[0] == b.shape[0] and a.shape[2] == b.shape[1]): 
+                    body_lines.append("# Dot: grad(Trial) @ grad(Function).T")
+                    # Operation for each n: (k, d) @ (d, k) -> (k, k)
+                    body_lines += [
+                        f"n_vec_comps = {a.shape[0]}; n_locs = {a.shape[1]};",
+                        # The result has shape (k, n, k)
+                        f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
+                        f"b_T = {b.var_name}.T.copy()", # Transpose and copy once outside the loop
+                        f"for n in range(n_locs):",
+                        f"    a_slice = {a.var_name}[:, n, :]",
+                        f"    {res_var}[:, n, :] = a_slice @ b_T",
+                    ]
+                    # The result shape changes, so we must update it for the stack.
+                    res_shape = (a.shape[0], a.shape[1], a.shape[0])
+                    stack.append(StackItem(var_name=res_var, role='trial',
+                                        shape=res_shape, is_vector=False, is_gradient=True,
+                                        field_names=a.field_names, parent_name=a.parent_name))
+
+                # ---------------------------------------------------------------------
+                # dot( grad(u_k) ,  grad(u_trial) )   -> (k,d) . (k,n,d) => (k,n,k)
+                # ---------------------------------------------------------------------
+                elif (a.role == 'value' and a.is_gradient and 
+                    b.role == 'trial' and b.is_gradient and 
+                    a.shape[0] == b.shape[0] and a.shape[1] == b.shape[2]):
+                    body_lines.append("# Dot: grad(Function) @ grad(Trial).T")
+                    # Operation for each n: (k, d) @ (d, k) -> (k, k)
+                    body_lines += [
+                        f"n_vec_comps = {b.shape[0]}; n_locs = {b.shape[1]};",
+                        f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
+                        f"for n in range(n_locs):",
+                        # Transpose and copy the slice of grad(trial)
+                        f"    b_slice_T = {b.var_name}[:, n, :].T.copy()",
+                        f"    {res_var}[:, n, :] = {a.var_name} @ b_slice_T",
+                    ]
+                    res_shape = (b.shape[0], b.shape[1], b.shape[0])
+                    stack.append(StackItem(var_name=res_var, role='trial',
+                                        shape=res_shape, is_vector=False, is_gradient=True,
+                                        field_names=b.field_names, parent_name=b.parent_name))
+
+                # ---------------------------------------------------------------------
+                # dot( grad(u_k) ,  grad(u_k) )   -> (k,d) . (k,d) => (k,k)
+                # ---------------------------------------------------------------------
+                elif a.role == 'value' and a.is_gradient and b.role == 'value' and b.is_gradient and a.shape == b.shape:
+                    body_lines.append("# Dot: grad(Function) @ grad(Function).T")
+                    # Operation: (k, d) @ (d, k) -> (k, k)
+                    body_lines.append(f"{res_var} = {a.var_name} @ {b.var_name}.T.copy()")
+                    res_shape = (a.shape[0], a.shape[0])
+                    stack.append(StackItem(var_name=res_var, role='value',
+                                        shape=res_shape, is_vector=False, is_gradient=True,
+                                        field_names=b.field_names, parent_name=b.parent_name))
+
+                # ---------------------new block--------------------------------
                 # ---------------------------------------------------------------------
                 # dot( scalar ,  u_trial;u_test;u_k )     ← e.g. scalar constant time function
                 # ---------------------------------------------------------------------

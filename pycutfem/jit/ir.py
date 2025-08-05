@@ -103,3 +103,8 @@ class LoadFacetNormalComponent:
 class CheckDomain:
     """Instruction to check if the current element is in a domain BitSet."""
     bitset_id: int
+
+@dataclass(frozen=True, slots=True)
+class Trace:
+    """Instruction to compute the trace of the tensor on top of the stack."""
+    pass

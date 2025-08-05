@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Callable, Optional, Tuple
 import inspect
 
-from ufl import p
 
 import numpy as np
 import scipy.sparse.linalg as spla
@@ -30,7 +29,12 @@ from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
 from pycutfem.jit import compile_multi        
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.helpers import analyze_active_dofs
-from pycutfem.solvers.giant import giant_solver
+try:
+    from pycutfem.solvers.giant import giant_solver
+    HAS_GIANT = True
+except ImportError:
+    giant_solver = None
+    HAS_GIANT = False
 from petsc4py import PETSc
 import sys
 
@@ -1405,83 +1409,50 @@ def _scatter_mat_vec_petsc(K_elem, vec_loc_vals, element_ids, gdofs_map, target_
 # Inexact Newton solver (not working)
 #------------------------------------------------------------------------------
 
+if HAS_GIANT:
+    class GiantInexactNewtonSolver(NewtonSolver):
+        """
+        Uses the GIANT Fortran package (matrix-free inexact/semi-smooth Newton)
+        as the outer nonlinear solver. Residual/Jacobian-vector products are
+        still assembled/evaluated by your fast Numba kernels.
+        """
+        def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
 
-class GiantInexactNewtonSolver(NewtonSolver):
-    """
-    Uses the GIANT Fortran package (matrix-free inexact/semi-smooth Newton)
-    as the outer nonlinear solver. Residual/Jacobian-vector products are
-    still assembled/evaluated by your fast Numba kernels.
-    """
-    def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
+            dh      = self.dh
+            n_total = dh.total_dofs
+            active  = self.active_dofs         # free dofs (length n_free)
+            n_free  = active.size
 
-        dh      = self.dh
-        n_total = dh.total_dofs
-        active  = self.active_dofs         # free dofs (length n_free)
-        n_free  = active.size
+            # 1) pack the CURRENT iterate into a reduced vector x_red
+            def _pack_reduced():
+                x_full = np.hstack([f.nodal_values for f in funcs])
+                return x_full[active].copy()
 
-        # 1) pack the CURRENT iterate into a reduced vector x_red
-        def _pack_reduced():
-            x_full = np.hstack([f.nodal_values for f in funcs])
-            return x_full[active].copy()
-
-        def _unpack_into_funcs(x_red):
-            # expand reduced → full, add to fields, re-apply BCs
-            dU_full = np.zeros(n_total)
-            dU_full[active] = x_red - _pack_reduced()  # delta on free dofs
-            dh.add_to_functions(dU_full, funcs)
-            dh.apply_bcs(bcs_now, *funcs)
-
-        # 2) Build a shared "coeffs" dict each evaluation uses
-        def _current_coeffs():
-            coeffs = {f.name: f for f in funcs}
-            coeffs.update({f.name: f for f in prev_funcs})
-            if aux_funcs:
-                coeffs.update(aux_funcs)
-            return coeffs
-
-        # 3) GIANT callbacks ------------------------------------------------
-        # IMPORTANT: GIANT calls these many times, so avoid needless allocs.
-        # Residual: fcn(n, x, f, ierr, ...)
-        # Reuse your local helpers: active, dh, _current_coeffs(), etc.
-
-        def fcn(x_in, n_opt=None, *unused):
-            # Snapshot the current fields
-            snap = [f.nodal_values.copy() for f in funcs]
-            try:
-                # Write reduced iterate into the live functions
-                x_full = np.hstack([buf for buf in snap])
-                x_full[active] = x_in
-                off = 0
-                for f, buf in zip(funcs, snap):
-                    nloc = f.nodal_values.size
-                    f.nodal_values[:] = x_full[off:off+nloc]; off += nloc
+            def _unpack_into_funcs(x_red):
+                # expand reduced → full, add to fields, re-apply BCs
+                dU_full = np.zeros(n_total)
+                dU_full[active] = x_red - _pack_reduced()  # delta on free dofs
+                dh.add_to_functions(dU_full, funcs)
                 dh.apply_bcs(bcs_now, *funcs)
 
-                # Assemble reduced residual
-                _, R_red = self._assemble_system_reduced(_current_coeffs(), need_matrix=False)
-                return np.asarray(R_red, dtype=np.float64), 0
-            except Exception:
-                return np.zeros_like(x_in, dtype=np.float64), 1
-            finally:
-                # Restore snapshots
-                for f, buf in zip(funcs, snap):
-                    f.nodal_values[:] = buf
+            # 2) Build a shared "coeffs" dict each evaluation uses
+            def _current_coeffs():
+                coeffs = {f.name: f for f in funcs}
+                coeffs.update({f.name: f for f in prev_funcs})
+                if aux_funcs:
+                    coeffs.update(aux_funcs)
+                return coeffs
 
-        # Optional tiny cache so we don’t rebuild A_red multiple times at same x
-        _jac_cache = {"x_id": None, "x_copy": None, "A": None}
-        _last_x = None
-        _last_A = None
+            # 3) GIANT callbacks ------------------------------------------------
+            # IMPORTANT: GIANT calls these many times, so avoid needless allocs.
+            # Residual: fcn(n, x, f, ierr, ...)
+            # Reuse your local helpers: active, dh, _current_coeffs(), etc.
 
-        def muljac(x_in, v_in, n_opt=None, *unused):
-            snap = [f.nodal_values.copy() for f in funcs]
-            try:
-                # If x_in hasn't changed, reuse cached A_red
-                use_cache = (_jac_cache["x_copy"] is not None
-                                and _jac_cache["x_copy"].shape == x_in.shape
-                                and np.array_equal(_jac_cache["x_copy"], x_in))
-
-
-                if not use_cache or _jac_cache["A"] is None:
+            def fcn(x_in, n_opt=None, *unused):
+                # Snapshot the current fields
+                snap = [f.nodal_values.copy() for f in funcs]
+                try:
+                    # Write reduced iterate into the live functions
                     x_full = np.hstack([buf for buf in snap])
                     x_full[active] = x_in
                     off = 0
@@ -1490,57 +1461,90 @@ class GiantInexactNewtonSolver(NewtonSolver):
                         f.nodal_values[:] = x_full[off:off+nloc]; off += nloc
                     dh.apply_bcs(bcs_now, *funcs)
 
-                    A_red, _ = self._assemble_system_reduced(_current_coeffs(), need_matrix=True)
-                    _jac_cache["A"] = A_red
-                    _jac_cache["x_copy"] = x_in.copy()
+                    # Assemble reduced residual
+                    _, R_red = self._assemble_system_reduced(_current_coeffs(), need_matrix=False)
+                    return np.asarray(R_red, dtype=np.float64), 0
+                except Exception:
+                    return np.zeros_like(x_in, dtype=np.float64), 1
+                finally:
+                    # Restore snapshots
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
 
-                jv = _jac_cache["A"] @ v_in
-                return np.asarray(jv, dtype=np.float64), 0
-            except Exception:
-                return np.zeros_like(v_in, dtype=np.float64), 1
-            finally:
-                for f, buf in zip(funcs, snap):
-                    f.nodal_values[:] = buf
+            # Optional tiny cache so we don’t rebuild A_red multiple times at same x
+            _jac_cache = {"x_id": None, "x_copy": None, "A": None}
+            _last_x = None
+            _last_A = None
 
-
-        # 4) Run GIANT on the reduced vector (GIANT updates x0 in place)
-        # Make sure dtypes are correct
-        x0 = _pack_reduced()
-        xscal = np.maximum(1.0, np.abs(x0))
-        rtol  = self.np.newton_tol
-        iopt  = np.zeros(50, dtype=np.int32)
-        ierr  = np.int32(0)
-        x0    = np.asarray(x0,    dtype=np.float64)
-        xscal = np.asarray(xscal, dtype=np.float64)
-        iopt  = np.asarray(iopt,  dtype=np.int32)
-        iopt[30] = 1   # print Newton iteration header
-        iopt[31] = 1   # print inner GMRES info
+            def muljac(x_in, v_in, n_opt=None, *unused):
+                snap = [f.nodal_values.copy() for f in funcs]
+                try:
+                    # If x_in hasn't changed, reuse cached A_red
+                    use_cache = (_jac_cache["x_copy"] is not None
+                                    and _jac_cache["x_copy"].shape == x_in.shape
+                                    and np.array_equal(_jac_cache["x_copy"], x_in))
 
 
-        ierr = giant_solver.giant_wrapper_mod.giant_shim(
-            x0,                         # x : in/out, length n_free
-            xscal,                      # xscal : length n_free
-            float(rtol),                # rtol : scalar
-            iopt,                       # iopt : int32[50], in/out
-            fcn,                        # fcn   : callback (function, not tuple)
-            muljac,                     # muljac: callback (function, not tuple)
-            n_free,                     # optional; may omit since len(x0) is used
-            (),                         # fcn_extra_args
-            ()                          # muljac_extra_args
-        )
-        if int(ierr) != 0:
-            raise RuntimeError(f"GIANT failed with ierr={int(ierr)}")
+                    if not use_cache or _jac_cache["A"] is None:
+                        x_full = np.hstack([buf for buf in snap])
+                        x_full[active] = x_in
+                        off = 0
+                        for f, buf in zip(funcs, snap):
+                            nloc = f.nodal_values.size
+                            f.nodal_values[:] = x_full[off:off+nloc]; off += nloc
+                        dh.apply_bcs(bcs_now, *funcs)
 
-        # 5) Accept GIANT’s iterate: write it back once
-        # (delta = x* - x_old on active dofs)
-        dU_full = np.zeros(n_total)
-        dU_full[active] = x0 - _pack_reduced()
-        dh.add_to_functions(dU_full, funcs)
-        dh.apply_bcs(bcs_now, *funcs)
+                        A_red, _ = self._assemble_system_reduced(_current_coeffs(), need_matrix=True)
+                        _jac_cache["A"] = A_red
+                        _jac_cache["x_copy"] = x_in.copy()
 
-        # return the *time-step* increment like your base class
-        delta = np.hstack([f.nodal_values - fp.nodal_values for f, fp in zip(funcs, prev_funcs)])
-        return delta
+                    jv = _jac_cache["A"] @ v_in
+                    return np.asarray(jv, dtype=np.float64), 0
+                except Exception:
+                    return np.zeros_like(v_in, dtype=np.float64), 1
+                finally:
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+
+
+            # 4) Run GIANT on the reduced vector (GIANT updates x0 in place)
+            # Make sure dtypes are correct
+            x0 = _pack_reduced()
+            xscal = np.maximum(1.0, np.abs(x0))
+            rtol  = self.np.newton_tol
+            iopt  = np.zeros(50, dtype=np.int32)
+            ierr  = np.int32(0)
+            x0    = np.asarray(x0,    dtype=np.float64)
+            xscal = np.asarray(xscal, dtype=np.float64)
+            iopt  = np.asarray(iopt,  dtype=np.int32)
+            iopt[30] = 1   # print Newton iteration header
+            iopt[31] = 1   # print inner GMRES info
+
+
+            ierr = giant_solver.giant_wrapper_mod.giant_shim(
+                x0,                         # x : in/out, length n_free
+                xscal,                      # xscal : length n_free
+                float(rtol),                # rtol : scalar
+                iopt,                       # iopt : int32[50], in/out
+                fcn,                        # fcn   : callback (function, not tuple)
+                muljac,                     # muljac: callback (function, not tuple)
+                n_free,                     # optional; may omit since len(x0) is used
+                (),                         # fcn_extra_args
+                ()                          # muljac_extra_args
+            )
+            if int(ierr) != 0:
+                raise RuntimeError(f"GIANT failed with ierr={int(ierr)}")
+
+            # 5) Accept GIANT’s iterate: write it back once
+            # (delta = x* - x_old on active dofs)
+            dU_full = np.zeros(n_total)
+            dU_full[active] = x0 - _pack_reduced()
+            dh.add_to_functions(dU_full, funcs)
+            dh.apply_bcs(bcs_now, *funcs)
+
+            # return the *time-step* increment like your base class
+            delta = np.hstack([f.nodal_values - fp.nodal_values for f, fp in zip(funcs, prev_funcs)])
+            return delta
 
 
 
