@@ -346,6 +346,18 @@ class GradOpInfo:
         """Return the type of the data array."""
         return f"GradOpInfo({self.data.dtype}, shape={self.data.shape}, role='{self.role}')"
 
+
+# ========================================================================
+# Generic walker
+def _iter_child_exprs(node):
+    for value in node.__dict__.values():
+        if isinstance(value, Expression):
+            yield value
+        elif isinstance(value, (list, tuple)):
+            for v in value:
+                if isinstance(v, Expression):
+                    yield v
+
 # ----------------------------------------------------------------------
 # New definition (helpers.py)
 # ----------------------------------------------------------------------
@@ -409,41 +421,52 @@ def required_multi_indices(expr: "Expression") -> Set[MultiIndex]:
     return out
 
 
-#-----------------------------------------------------------
-
+# ------------------------------------------------------------------
+#  all_fields -------------------------------------------------------
+# ------------------------------------------------------------------
 def _all_fields(expr):
-    fields=set()
+    fields   = set()
+    visited  = set()
+
     def walk(n):
-        if hasattr(n,'field_name'):
+        nid = id(n)
+        if nid in visited:
+            return
+        visited.add(nid)
+
+        # record
+        if getattr(n, "field_name", None):
             fields.add(n.field_name)
-        if hasattr(n,'space'):
+        if getattr(n, "space", None):
             fields.update(n.space.field_names)
         if isinstance(n, VectorFunction):
             fields.update(n.field_names)
 
-        # Recurse through the expression tree
-        for attr in ('operand', 'a', 'b', 'u_pos', 'u_neg', 'components','f'):
-            if hasattr(n, attr):
-                m = getattr(n, attr)
-                if isinstance(m, (list, tuple)):
-                    for x in m: walk(x)
-                elif m is not None:
-                    walk(m)
+        # recurse
+        for child in _iter_child_exprs(n):
+            walk(child)
+
     walk(expr)
     return list(fields)
 
+# ------------------------------------------------------------------
+#  find_all ---------------------------------------------------------
+# ------------------------------------------------------------------
 def _find_all(expr, cls):
-    out = []
+    out      = []
+    visited  = set()
+
     def walk(n):
+        nid = id(n)
+        if nid in visited:
+            return
+        visited.add(nid)
+
         if isinstance(n, cls):
             out.append(n)
-        for attr in ('operand','a','b','u_pos','u_neg','components','f'):
-            m = getattr(n, attr, None)
-            if m is None: continue
-            if isinstance(m, (list, tuple)):
-                for x in m: walk(x)
-            else:
-                walk(m)
+        for child in _iter_child_exprs(n):
+            walk(child)
+
     walk(expr)
     return out
 
@@ -454,32 +477,37 @@ def _trial_test(expr):
     test = expr.find_first(lambda n: isinstance(n, (TestFunction, VectorTestFunction))) 
     return trial, test
 
-#----------------------------------------------------------------------------------
-#               Restriction dofs
-def _find_all_restrictions(form: Form) -> list[Restriction]:
-    """Helper to walk a Form and find all Restriction nodes."""
+# ------------------------------------------------------------------
+#  find_all_restrictions -------------------------------------------
+# ------------------------------------------------------------------
+def _find_all_restrictions(form) -> list[Restriction]:
     restrictions = []
-    
-    def walk(expr):
-        if isinstance(expr, Restriction):
-            restrictions.append(expr)
+    visited      = set()
 
-        # ----- recurse -----
-        for attr in ('operand', 'a', 'b', 'u_pos', 'u_neg',
-                    'integrand',   # Integral
-                    'integrals'):  # ➊ NEW – list of Integrals in a Form
-            child = getattr(expr, attr, None)
-            if child is None:
-                continue
-            if isinstance(child, (list, tuple)):
-                for item in child:
-                    walk(item)
-            else:
-                walk(child)
+    def walk(obj):
+        oid = id(obj)
+        if oid in visited:
+            return
+        visited.add(oid)
 
+        if isinstance(obj, Restriction):
+            restrictions.append(obj)
+
+        if isinstance(obj, Expression):
+            iterable = _iter_child_exprs(obj)
+        else:  # Form / Integral containers
+            iterable = []
+            for v in getattr(obj, "__dict__", {}).values():
+                if isinstance(v, Expression):
+                    iterable.append(v)
+                elif isinstance(v, (list, tuple)):
+                    iterable.extend([c for c in v if isinstance(c, Expression)])
+
+        for child in iterable:
+            walk(child)
 
     walk(form)
-    return restrictions 
+    return restrictions
 
 
 def analyze_active_dofs(equation: Equation, dh: DofHandler, me: MixedElement, bcs: list):

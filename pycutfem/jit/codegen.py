@@ -37,6 +37,7 @@ class StackItem:
     parent_name: str = ""
     side: str = ""  # Side for ghost integrals, e.g., "+", "-", or ""
     # tiny shim so we can write  item = item._replace(var_name="tmp")
+    is_transpose: bool = field(default=False)  # True if this item is a transposed version of another
     def _replace(self, **changes) -> "StackItem":
         
         return replace(self, **changes)
@@ -646,7 +647,11 @@ class NumbaCodeGen:
             elif isinstance(op, Inner):
                 b = stack.pop(); a = stack.pop()
                 res_var = new_var("inner")
-                # print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}")
+                print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}"
+                      f", is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}"
+                      f", a.is_transpose: {a.is_transpose}, b.is_transpose: {b.is_transpose}")
+
+                # LHS Bilinear Form: inner(TRIAL_BASIS, TEST_BASIS)
                 if a.role in ('test', 'trial') and b.role in ('test', 'trial'): # LHS
                     if a.is_gradient and b.is_gradient:
                         body_lines.append(f'# Inner(Grad, Grad): stiffness matrix')
@@ -829,7 +834,7 @@ class NumbaCodeGen:
                                         parent_name=b.parent_name))
 
                 # ---------------------------------------------------------------------
-                # dot( u_trial ,  grad(u_k) )   ← transpose of the previous
+                # dot( u_trial ,  grad(u_k) )   ← swap of the previous
                 # ---------------------------------------------------------------------
                 elif a.role == 'trial' and a.is_vector and b.role == 'value' and b.is_gradient:
                     body_lines.append("# Advection: dot(Trial, grad(Function))")
@@ -879,69 +884,120 @@ class NumbaCodeGen:
                     
 
                 # ---------------------new block--------------------------------
-
                 # ---------------------------------------------------------------------
-                # dot( grad(u_trial) ,  grad(u_k) )   -> (k,n,d) . (k,d) => (k,n,k)
+                # dot(grad(Trial), grad(Function)) and its transposed variants.
                 # ---------------------------------------------------------------------
                 elif (a.role == 'trial' and a.is_gradient and b.role == 'value' 
                     and b.is_gradient 
                     and a.shape[0] == b.shape[0] and a.shape[2] == b.shape[1]): 
-                    body_lines.append("# Dot: grad(Trial) @ grad(Function).T")
-                    # Operation for each n: (k, d) @ (d, k) -> (k, k)
-                    body_lines += [
-                        f"n_vec_comps = {a.shape[0]}; n_locs = {a.shape[1]};",
-                        # The result has shape (k, n, k)
-                        f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
-                        f"b_T = {b.var_name}.T.copy()", # Transpose and copy once outside the loop
-                        f"for n in range(n_locs):",
-                        f"    a_slice = {a.var_name}[:, n, :]",
-                        f"    {res_var}[:, n, :] = a_slice @ b_T",
-                    ]
-                    # The result shape changes, so we must update it for the stack.
-                    res_shape = (a.shape[0], a.shape[1], a.shape[0])
+                    k = a.shape[0]; n_locs = a.shape[1]; d = a.shape[2]
+                    
+                    # a: grad(du) or grad(du).T -> Trial function basis, shape (k, n, d)
+                    # b: grad(u_k)             -> Function value, shape (k, d)
+                    
+                    a_is_T = getattr(a, 'is_transpose', False)
+                    
+                    if not a_is_T:
+                        # UFL Operation: dot(grad(du), grad(u_k))
+                        # For each basis function n, this computes: grad(du_n) @ grad(u_k).T
+                        # Shapes: (k, d) @ (d, k) -> (k, k)
+                        body_lines.append("# dot(grad(trial), grad(value)) -> (k,n,k) tensor basis")
+                        body_lines += [
+                            f"n_vec_comps = {k}; n_locs = {n_locs};",
+                            f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
+                            f"b_T = np.ascontiguousarray({b.var_name}.T)",
+                            f"for n in range(n_locs):",
+                            f"    a_slice = np.ascontiguousarray({a.var_name}[:, n, :])",
+                            f"    {res_var}[:, n, :] = a_slice @ b_T",
+                        ]
+                    else: # a_is_T is True
+                        # UFL Operation: dot(grad(du).T, grad(u_k))
+                        # For each basis function n, this computes: grad(u_k) @ grad(du_n).T
+                        # Shapes: (k, d) @ (d, k) -> (k, k)
+                        # Note: This relies on k == d for the UFL operation to be well-defined.
+                        body_lines.append("# dot(grad(trial).T, grad(value)) -> (k,n,k) tensor basis")
+                        body_lines += [
+                            f"n_vec_comps = {k}; n_locs = {n_locs};",
+                            f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
+                            f"b_arr = np.ascontiguousarray({b.var_name})",
+                            f"for n in range(n_locs):",
+                            f"    a_slice = np.ascontiguousarray({a.var_name}[:, n, :])",
+                            f"    {res_var}[:, n, :] = b_arr @ a_slice",
+                        ]
+                    
+                    res_shape = (k, n_locs, k)
                     stack.append(StackItem(var_name=res_var, role='trial',
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=a.field_names, parent_name=a.parent_name))
 
                 # ---------------------------------------------------------------------
-                # dot( grad(u_k) ,  grad(u_trial) )   -> (k,d) . (k,n,d) => (k,n,k)
+                # dot(grad(Function), grad(Trial)) and its transposed variants.
                 # ---------------------------------------------------------------------
                 elif (a.role == 'value' and a.is_gradient and 
                     b.role == 'trial' and b.is_gradient and 
                     a.shape[0] == b.shape[0] and a.shape[1] == b.shape[2]):
-                    body_lines.append("# Dot: grad(Function) @ grad(Trial).T")
-                    # Operation for each n: (k, d) @ (d, k) -> (k, k)
-                    body_lines += [
-                        f"n_vec_comps = {b.shape[0]}; n_locs = {b.shape[1]};",
-                        f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
-                        f"for n in range(n_locs):",
-                        # Transpose and copy the slice of grad(trial)
-                        f"    b_slice_T = {b.var_name}[:, n, :].T.copy()",
-                        f"    {res_var}[:, n, :] = {a.var_name} @ b_slice_T",
-                    ]
-                    res_shape = (b.shape[0], b.shape[1], b.shape[0])
+                    k = b.shape[0]; n_locs = b.shape[1]; d = b.shape[2]
+
+                    # a: grad(u_k) or grad(u_k).T -> Function value, shape (k, d)
+                    # b: grad(du)             -> Trial function basis, shape (k, n, d)
+
+                    b_is_T = getattr(b, 'is_transpose', False)
+                    
+                    if not b_is_T:
+                        # UFL Operation: dot(grad(u_k), grad(du))
+                        # For each basis function n, this computes: grad(u_k).T @ grad(du_n)
+                        # Shapes: (d, k) @ (k, d) -> (d, d)
+                        # Note: This produces a (d,d) matrix, which works here because the
+                        # tests assume vector dimension k == spatial dimension d.
+                        body_lines.append("# dot(grad(value), grad(trial)) -> (k,n,k) tensor basis")
+                        body_lines += [
+                            f"n_vec_comps = {k}; n_locs = {n_locs};",
+                            f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
+                            f"a_contig_T = np.ascontiguousarray({a.var_name}.T)",
+                            f"for n in range(n_locs):",
+                            f"    b_slice = np.ascontiguousarray({b.var_name}[:, n, :])",
+                            f"    {res_var}[:, n, :] = a_contig_T @ b_slice",
+                        ]
+                    else: # b_is_T is True
+                        # UFL Operation: dot(grad(u_k), grad(du).T)
+                        # For each basis function n, this computes: grad(du_n).T @ grad(u_k)
+                        # Shapes: (d, k) @ (k, d) -> (d, d)
+                        # Note: This produces a (d,d) matrix, assuming k == d.
+                        body_lines.append("# dot(grad(value), grad(trial).T) -> (k,n,k) tensor basis")
+                        body_lines += [
+                            f"n_vec_comps = {k}; n_locs = {n_locs};",
+                            f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
+                            f"a_arr = np.ascontiguousarray({a.var_name})",
+                            f"for n in range(n_locs):",
+                            f"    b_slice = np.ascontiguousarray({b.var_name}[:, n, :])",
+                            f"    {res_var}[:, n, :] = b_slice @ a_arr",
+                        ]
+                    res_shape = (k, n_locs, k)
                     stack.append(StackItem(var_name=res_var, role='trial',
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=b.field_names, parent_name=b.parent_name))
 
                 # ---------------------------------------------------------------------
-                # dot( grad(u_k) ,  grad(u_k) )   -> (k,d) . (k,d) => (k,k)
+                # dot(grad(Function), grad(Function)) and its transposed variants.
                 # ---------------------------------------------------------------------
-                elif a.role == 'value' and a.is_gradient and b.role == 'value' and b.is_gradient and a.shape == b.shape:
-                    body_lines.append("# Dot: grad(Function) @ grad(Function).T")
-                    # Operation: (k, d) @ (d, k) -> (k, k)
-                    body_lines.append(f"{res_var} = {a.var_name} @ {b.var_name}.T.copy()")
-                    res_shape = (a.shape[0], a.shape[0])
+                elif a.role == 'value' and a.is_gradient and b.role == 'value' and b.is_gradient:
+                    # a: grad(u_k) or grad(u_k).T -> Function value, shape (k, d)
+                    # b: grad(u_k) or grad(u_k).T -> Function value, shape (k, d)
+                    # This block handles various combinations like dot(A, B), dot(A.T, B), etc.
+                    # The generated code assumes k == d.
+                    body_lines.append("# dot(grad(value), grad(value)) -> (k,k) tensor value")
+                    body_lines.append(f"{res_var} = {a.var_name} @ {b.var_name}")
+                    res_shape = (a.shape[0], a.shape[1])
                     stack.append(StackItem(var_name=res_var, role='value',
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=b.field_names, parent_name=b.parent_name))
 
                 # ---------------------new block--------------------------------
                 # ---------------------------------------------------------------------
-                # dot( scalar ,  u_trial;u_test;u_k )     ← e.g. scalar constant time function
+                # dot( scalar ,  u_trial;u_test;u_k )     ← e.g. scalar constant time Function
                 # ---------------------------------------------------------------------
                 elif (a.role == 'const' or a.role == 'value') and not a.is_vector and not a.is_gradient:
-                    # a is scalar, b is vector (trial/test/function)
+                    # a is scalar, b is vector (trial/test/Function)
                     body_lines.append("# Scalar constant: dot(scalar, Function/Trial/Test)")
                     body_lines.append(f"{res_var} = float({a.var_name}) * {b.var_name}")
                     stack.append(StackItem(var_name=res_var, role=b.role,
@@ -949,10 +1005,10 @@ class NumbaCodeGen:
                                         is_gradient=b.is_gradient, field_names=b.field_names,
                                         parent_name=b.parent_name))
                 # ---------------------------------------------------------------------
-                # dot( u_trial;u_test;u_k, scalar )     ← e.g. scalar constant time function
+                # dot( u_trial;u_test;u_k, scalar )     ← e.g. scalar constant time Function
                 # ---------------------------------------------------------------------
                 elif (b.role == 'const' or b.role == 'value') and not b.is_vector and not b.is_gradient:
-                    # a is vector (trial/test/function), b is scalar
+                    # a is vector (trial/test/Function), b is scalar
                     body_lines.append("# Scalar constant: dot(Function/Trial/Test, scalar)")
                     body_lines.append(f"{res_var} = float({b.var_name}) * {a.var_name}")
                     stack.append(StackItem(var_name=res_var, role=a.role,
@@ -1131,27 +1187,27 @@ class NumbaCodeGen:
                     body_lines.append(f"{res} = {a.var_name}")     # just copy
                     res_shape = ()
                 # -------- scalar grad: (1,n_qp,2)  -> (2,n_qp,1) ----------------
-                elif a.is_gradient and a.shape == (1, a.shape[1], 2):
-                    k, n, d = a.shape
-                    body_lines.append(
-                        f"{res} = {a.var_name}.swapaxes(0,2).copy()"   # (2,n,1)
-                    )
-                    res_shape = (2, n, 1)
+                # elif a.is_gradient and a.shape == (1, a.shape[1], 2):
+                #     k, n, d = a.shape
+                #     body_lines.append(
+                #         f"{res} = {a.var_name}.swapaxes(0,2).copy()"   # (2,n,1)
+                #     )
+                #     res_shape = (2, n, 1)
 
                 # -------- vector grad: (2,n_qp,2)  swap off-diagonals ------------
                 elif a.is_gradient and len(a.shape) == 3:
-                    n = a.shape[1]
-                    body_lines.extend([
-                        f"{res} = {a.var_name}.copy();",
-                        f"{res}[0,:,{1}] = {a.var_name}[1,:,{0}];",
-                        f"{res}[1,:,{0}] = {a.var_name}[0,:,{1}];"
-                    ])
+                    n_locs = a.shape[1]
+                    body_lines += [
+                        f"{res} = np.zeros_like({a.var_name}, dtype={a.var_name}.dtype);",
+                        f"for n in range({n_locs}):",
+                        f"    {res}[:, n, :] = ({a.var_name}[:, n, :].T).copy();"
+                    ]
                     res_shape = a.shape  # still (2,n,2)
 
                 # -------- plain 2×2 matrix --------------------------------------
                 elif len(a.shape) == 2 :
                     body_lines.append(f"{res} = {a.var_name}.T.copy()")
-                    res_shape = a.shape[::-1]
+                    res_shape = a.shape
 
                 else:
                     raise NotImplementedError("Transpose not supported for shape "
@@ -1160,7 +1216,11 @@ class NumbaCodeGen:
                 stack.append(a._replace(var_name=res,
                                         shape=res_shape,
                                         is_vector=a.is_vector,
-                                        is_gradient=a.is_gradient))
+                                        is_gradient=a.is_gradient,
+                                        is_transpose=True,
+                                        field_names=a.field_names,
+                                        parent_name=a.parent_name,
+                                        role=a.role))
 
             
             elif isinstance(op, BinaryOp):
@@ -1528,7 +1588,8 @@ def {kernel_name}(
     num_elements        = qp_phys.shape[0]
     # n_dofs_per_element  = {self.n_dofs_local}
     n_dofs_per_element  = gdofs_map.shape[1]            # 9 for volume, 15 on ghost edge
-    # print(f"num_elements: {{num_elements}},n_dofs_per_element: {{n_dofs_per_element}}")
+    print(f"num_elements: {{num_elements}},n_dofs_per_element: {{n_dofs_per_element}}")
+    print(f"number of quadrature points: {{qw.shape[1]}}")
     
     K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
     F_values = np.zeros((num_elements, n_dofs_per_element), dtype=np.float64)

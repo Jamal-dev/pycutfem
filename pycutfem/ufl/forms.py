@@ -28,7 +28,19 @@ class Form(Expression):
         # Create a new Form where each integral's integrand is negated.
         return Form([integral.__neg__() for integral in self.integrals])
 
-    def __eq__(self, other): return Equation(self, other)
+    def __eq__(self, other):
+        """Handles cases like `my_form == None`."""
+        return Equation(self, other)
+
+    def __req__(self, other):
+        """
+        Handles reverse-equals for cases like `None == my_form`. [THE FIX]
+        
+        This method is called by Python when `other == self` is evaluated and
+        `other` does not have a specific `__eq__` method for a Form. Here,
+        `other` is the left-hand side (e.g., None) and `self` is the Form object.
+        """
+        return Equation(other, self)
 
 class Equation:
     def __init__(self, a, L):
@@ -51,6 +63,11 @@ def assemble_form(equation: Equation, dof_handler, bcs=[], quad_order=None,
     """
     High-level function to assemble a weak form into a matrix and vector.
     """
+    if not isinstance(equation, Equation):
+        raise Warning(
+            "assemble_form expects a pycutfem.ufl.forms.Equation; "
+            "did you accidentally write None == form? This will give just 0s"
+        )
     from pycutfem.ufl.compilers import FormCompiler
     if kwargs.get('quad_degree') is not None:
         quad_order = kwargs['quad_degree']

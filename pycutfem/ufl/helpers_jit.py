@@ -24,23 +24,38 @@ def _pad_coeffs(coeffs, phi, ctx):
     padded[amap] = coeffs
     return padded
 
-def _find_all_bitsets(expression):
-    """Walks the expression tree and collects all unique BitSet objects."""
-    bitsets = set()
-    
-    def walk(expr):
-        if isinstance(expr, Restriction):
-            bitsets.add(expr.domain)
-        
-        for attr in ('operand', 'a', 'b', 'u_pos', 'u_neg', 'integrand'):
-            if hasattr(expr, attr):
-                child = getattr(expr, attr)
-                if isinstance(child, list):
-                    for item in child: walk(item)
-                elif child:
-                    walk(child)
+def _find_all_bitsets(expr):
+    """
+    Collect *all* distinct BitSet objects that occur anywhere in the
+    expression graph – no matter how deeply nested.
 
-    walk(expression)
+    Uses a generic DFS over ``expr.__dict__`` instead of a fixed list of
+    attribute names, so it automatically follows any new node types
+    (Transpose, Derivative, Side, …) you might add in the future.
+    """
+    from pycutfem.ufl.expressions import Restriction, Expression
+    bitsets   = set()
+    seen      = set()          # guard against cycles
+    stack     = [expr]
+
+    while stack:
+        node = stack.pop()
+        nid  = id(node)
+        if nid in seen:
+            continue
+        seen.add(nid)
+
+        # Record BitSet carried by a Restriction node
+        if isinstance(node, Restriction):
+            bitsets.add(node.domain)
+
+        # ---- generic child traversal ----------------------------------
+        for child in node.__dict__.values():
+            if isinstance(child, (list, tuple)):
+                stack.extend(c for c in child if isinstance(c, Expression))
+            elif isinstance(child, Expression):
+                stack.append(child)
+
     return list(bitsets)
 
 
@@ -137,6 +152,14 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         func_map[vf.name] = vf
         for comp, fld in zip(vf.components, vf.field_names):
             func_map.setdefault(fld, vf)
+    
+    # ------------------------------------------------------------------
+    # make sure every component points back to its parent VectorFunction
+    # ------------------------------------------------------------------
+    for f in list(func_map.values()):
+        pv = getattr(f, "_parent_vector", None)
+        if pv is not None and hasattr(pv, "name"):
+            func_map.setdefault(pv.name, pv)
 
     # ------------------------------------------------------------------
     # 3. Collect EVERY parameter the kernel will expect

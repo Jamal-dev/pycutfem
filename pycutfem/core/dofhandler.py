@@ -1141,6 +1141,12 @@ class DofHandler:
             out[f"b_{fld}"] = b_tabs[fld]
             out[f"g_{fld}"] = g_tabs[fld]
 
+        out["J_inv_pos"] = out["J_inv"]      # shape (nE, nQ, 2, 2)
+        out["J_inv_neg"] = out["J_inv"]
+        n_union = me.n_dofs_local
+        out["pos_map"] = np.tile(np.arange(n_union, dtype=np.int32), (len(valid_cut_eids), 1))
+        out["neg_map"] = out["pos_map"].copy()
+
         if reuse:
             _edge_geom_cache[cache_key] = out
         return out

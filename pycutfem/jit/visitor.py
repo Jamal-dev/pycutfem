@@ -118,11 +118,26 @@ class IRGenerator:
 
         # --- 3. Unary Operators that modify their operand ---
         if isinstance(node, UflGrad):
-            self._visit(node.operand, side=side)
+            op = node.operand
+            if isinstance(op, Jump):
+                # grad(jump(u)) = grad(u(+)) - grad(u(-))
+                self._visit(UflGrad(op.u_pos), side='+')
+                self._visit(UflGrad(op.u_neg), side='-')
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                return
+            self._visit(op, side=side)
             self.ir_sequence.append(Grad())
             return
             
         if isinstance(node, DivOperation):
+            op = node.operand
+            if isinstance(op, Jump):
+                # Special case: Derivative of a Jump(u) is D(u(+)) - D(u(-)).
+                # This correctly dispatches to the Derivative visitor again.
+                self._visit(DivOperation(op.u_pos), side='+')
+                self._visit(DivOperation(op.u_neg), side='-')
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                return
             self._visit(node.operand, side=side)
             self.ir_sequence.append(Grad()) 
             self.ir_sequence.append(Div())

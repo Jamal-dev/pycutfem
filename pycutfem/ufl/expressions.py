@@ -91,24 +91,37 @@ class Expression:
         return Power(other, self)
 
     def find_first(self, criteria):
-        """Recursively search for the first node in the expression tree that meets a criteria."""
-        if criteria(self): return self
-        if hasattr(self, 'a') and hasattr(self, 'b'):
-            found = self.a.find_first(criteria)
-            if found: return found
-            found = self.b.find_first(criteria)
-            if found: return found
-        elif hasattr(self, 'operand'):
-            if self.operand is None: return None
-            return self.operand.find_first(criteria)
-        elif hasattr(self, 'f'):
-            return self.f.find_first(criteria)
-        elif hasattr(self, 'u_pos'): # For Jump
-            found = self.u_pos.find_first(criteria)
-            if found: return found
-            found = self.u_neg.find_first(criteria)
-            if found: return found
-        return None
+        """
+        Depth-first search that stops at the first sub-expression
+        satisfying *criteria*.  Guarded against cycles.
+        """
+        visited = set()
+
+        def dfs(node):
+            nid = id(node)
+            if nid in visited:
+                return None
+            visited.add(nid)
+
+            if criteria(node):
+                return node
+
+            for v in node.__dict__.values():
+                if isinstance(v, Expression):
+                    found = dfs(v)
+                    if found:
+                        return found
+                elif isinstance(v, (list, tuple)):
+                    for vv in v:
+                        if isinstance(vv, Expression):
+                            found = dfs(vv)
+                            if found:
+                                return found
+            return None
+
+        return dfs(self)
+
+
 
 class Transpose(Expression):
     """Symbolic transpose (for 2-D tensors)."""

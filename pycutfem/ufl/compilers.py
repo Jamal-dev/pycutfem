@@ -116,13 +116,17 @@ class FormCompiler:
             self.ctx["rhs"] = False
             self._assemble_form(eq.a, K)
 
-        # Assemble RHS and apply BCs if a RHS form is provided.
+        # Assemble RHS if it is provided.
         if eq.L is not None:
             logger.info("Assembling RHS vector F...")
             self.ctx["rhs"] = True
             self._assemble_form(eq.L, F)
-            logger.info("Applying Dirichlet boundary conditions...")
-            self._apply_bcs(K, F, bcs)
+        
+        # --- THE FIX ---
+        # Apply boundary conditions AFTER both LHS and RHS have been assembled.
+        # This block is now outside of the `if eq.L` check.
+        logger.info("Applying Dirichlet boundary conditions...")
+        self._apply_bcs(K, F, bcs)
 
         logger.info("Assembly complete.")
         return K.tocsr(), F
@@ -796,13 +800,20 @@ class FormCompiler:
     def _visit_Analytic(self, node): return node.eval(self.ctx['x_phys'])
 
     # ======================= ASSEMBLY CORE ============================
-    def _assemble_form(self, form, target): # NEW
-        """Accept a Form object and iterate through its integrals.""" # NEW
+    def _assemble_form(self, form, target):
+        """Accept a Form object and iterate through its integrals."""
         from pycutfem.ufl.forms import Form
-        if form is None or not isinstance(form, Form): return # NEW
+        # from pycutfem.ufl.measures import Integral
 
-        for integral in form.integrals: # NEW
-            if not isinstance(integral, Integral): continue # NEW
+        # This guard clause correctly handles one-sided equations (e.g., L=None or a=None)
+        if form is None or not isinstance(form, Form):
+            return
+
+        for integral in form.integrals:
+            if not isinstance(integral, Integral):
+                continue
+            
+            # --- The rest of the dispatching logic remains the same ---
             if integral.measure.domain_type == "interface":
                 # Handle interface integrals with a level set
                 logger.info(f"Assembling interface integral: {integral}")
@@ -822,9 +833,8 @@ class FormCompiler:
                 self._assemble_boundary_edge(integral, target)
                 continue
 
-            if integral.measure.domain_type not in ["volume", "interface","ghost_edge"]:
-                logger.warning(f"Skipping unsupported integral type: {integral.measure.domain_type}")
-                raise NotImplementedError(f"Unsupported integral type: {integral.measure.domain_type}")
+            logger.warning(f"Skipping unsupported integral type: {integral.measure.domain_type}")
+
 
     def _find_q_order(self, integral: Integral) -> int:
         # --- 1. explicit override in the dx metadata -------------------------
@@ -900,102 +910,91 @@ class FormCompiler:
     
     # ----------------------------------------------------------------------
     def _assemble_volume_jit(self, integral: Integral, matvec):
+        """
+        Assembles a volume integral using the JIT backend, correctly handling
+        element subsets and ensuring argument lists match the specific integral.
+        """
         dbg = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
+        mesh = self.me.mesh
 
-        # ------------------------------------------------------------------
-        # 1. Get – or create – the JIT kernel runner
-        # ------------------------------------------------------------------
+        # 1. Determine the exact subset of elements for this integral.
+        defined_on = integral.measure.defined_on
+        if defined_on is not None:
+            element_ids = np.asarray(defined_on.to_indices(), dtype=np.int32) if hasattr(defined_on, "to_indices") else np.flatnonzero(np.asarray(defined_on)).astype(np.int32)
+        else:
+            element_ids = np.arange(mesh.n_elements, dtype=np.int32)
+
+        if element_ids.size == 0:
+            return # Nothing to assemble.
+
+        # 2. Collect the up-to-date coefficient functions from the expression FIRST.
+        # This aligns with the calling sequence of other robust JIT assemblers.
+        current_funcs = self._get_data_functions_objs(integral)
+
+        # 3. Compile the backend for the CURRENT integral to get the specific runner and IR.
+        # This ensures we have the correct param_order for this exact expression.
         runner, ir = self._compile_backend(
-            integral.integrand,          # the expression (no Form wrapper)
+            integral.integrand,
             self.dh, self.me
         )
 
-        # ------------------------------------------------------------------
-        # 2. Build (or reuse) the STATIC argument dictionary
-        # ------------------------------------------------------------------
+        # 4. Build the static arguments required by this specific kernel.
+        # We build these fresh every time to avoid caching collisions.
         q_order = self._find_q_order(integral)
 
-        cache_key = (q_order, tuple(runner.param_order))   # hashable & unique enough
-        if not hasattr(self, "_jit_static_cache"):
-            self._jit_static_cache = {}
-        if cache_key not in self._jit_static_cache:
-            # (A) geometric factors      -------------------------------
-            geo_args = self.dh.precompute_geometric_factors(q_order)
+        # (A) Get full-mesh geometric factors and then SLICE them for the subset.
+        geo_args_all = self.dh.precompute_geometric_factors(q_order)
+        pre_built = {
+            "qp_phys": geo_args_all["qp_phys"][element_ids],
+            "qw":      geo_args_all["qw"][element_ids],
+            "detJ":    geo_args_all["detJ"][element_ids],
+            "J_inv":   geo_args_all["J_inv"][element_ids],
+            "normals": geo_args_all["normals"][element_ids],
+            "h_arr":   geo_args_all["h_arr"][element_ids],
+            "phis":    None if geo_args_all["phis"] is None else geo_args_all["phis"][element_ids],
+        }
 
-            # (B) element → global DOF map  &  node coordinates         ------
-            mesh = self.me.mesh
-            gdofs_map = np.vstack([
-                self.dh.get_elemental_dofs(e) for e in range(mesh.n_elements)
-            ]).astype(np.int32)
-            node_coords = self.dh.get_all_dof_coords()
+        # (B) Build the DOF map for the subset.
+        gdofs_map = np.vstack([
+            self.dh.get_elemental_dofs(e) for e in element_ids
+        ]).astype(np.int32)
 
-            # (C) basis / gradient / derivative tables (only what kernel needs)
-            basis_args = _build_jit_kernel_args(
-                ir, integral.integrand, self.me, q_order,
-                dof_handler=self.dh,
-                gdofs_map=gdofs_map,
-                param_order=runner.param_order,
-                pre_built= geo_args
-            )
+        # (C) Build all other required tables (basis, etc.) based on the correct param_order.
+        basis_args = _build_jit_kernel_args(
+            ir, integral.integrand, self.me, q_order,
+            dof_handler=self.dh,
+            gdofs_map=gdofs_map,
+            param_order=runner.param_order, # Use the param_order from the CURRENT runner
+            pre_built=pre_built
+        )
 
-            static_args = {
-                "gdofs_map":  gdofs_map,
-                "node_coords": node_coords,
-                **geo_args,
-                **basis_args,
-            }
-            self._jit_static_cache[cache_key] = static_args
-        else:
-            static_args = self._jit_static_cache[cache_key]
+        # (D) Finalize the dictionary of static arguments for the kernel runner.
+        static_args = {
+            "gdofs_map":  gdofs_map,
+            "node_coords": self.dh.get_all_dof_coords(),
+            **pre_built,
+            **basis_args,
+        }
 
-        # ------------------------------------------------------------------
-        # 3. Collect the up-to-date coefficient Functions
-        # ------------------------------------------------------------------
-        current_funcs = self._get_data_functions_objs(integral)
-
-        # ------------------------------------------------------------------
-        # 4. Execute the kernel via the runner
-        # ------------------------------------------------------------------
+        # 5. Execute the kernel via the runner.
         K_loc, F_loc, J_loc = runner(current_funcs, static_args)
         if dbg:
-            print(f"[Assembler] kernel returned  K_loc {K_loc.shape}  "
-                  f"F_loc {F_loc.shape}")
+            print(f"[Assembler] kernel returned K_loc {K_loc.shape}, F_loc {F_loc.shape}")
 
-        # ------------------------------------------------------------------
-        # 5.  Pure scalar functional  → never touches the global system
-        # ------------------------------------------------------------------
-        trial, test = _trial_test(integral.integrand)
-        hook        = self._hook_for(integral.integrand)
-        if trial is None and test is None:           # functional (hooked or not)
-            if hook:                                 # accumulate if requested
-                name = hook["name"]
-                self.ctx.setdefault("scalar_results", {})[name] = 0.0
-                self.ctx["scalar_results"][name] += J_loc.sum()
-            return  
+        # 6. Handle scalar functional result or scatter the element contributions.
+        hook = self._hook_for(integral.integrand)
+        if self._functional_calculate(integral, J_loc, hook):
+            return
 
-        # ------------------------------------------------------------------
-        # 5. Scatter element contributions to the global system
-        # ------------------------------------------------------------------
-        mesh         = self.me.mesh
-        gdofs_map    = static_args["gdofs_map"]
-        n_dofs_local = self.me.n_dofs_local
-
-        if self.ctx["rhs"]:
-            for e in range(mesh.n_elements):
-                np.add.at(matvec, gdofs_map[e], F_loc[e])
-        else:
-            nloc = self.me.n_dofs_local
-            data = np.empty(mesh.n_elements * nloc * nloc)
-            rows = np.empty_like(data, dtype=np.int32)
-            cols = np.empty_like(data, dtype=np.int32)
-            for e in range(mesh.n_elements):
-                gdofs = gdofs_map[e]
-                r, c = np.meshgrid(gdofs, gdofs, indexing='ij')
-                s = e * nloc * nloc; t = s + nloc * nloc
-                rows[s:t] = r.ravel(); cols[s:t] = c.ravel(); data[s:t] = K_loc[e].ravel()
-            matvec += sp.coo_matrix((data, (rows, cols)),
-                                    shape=(self.dh.total_dofs, self.dh.total_dofs)).tocsr()
-
+        _scatter_element_contribs(
+            K_loc, F_loc, J_loc,
+            element_ids=element_ids,
+            gdofs_map=gdofs_map,
+            matvec=matvec,
+            ctx=self.ctx,
+            integrand=integral.integrand,
+            hook=hook
+        )
         
 
 
