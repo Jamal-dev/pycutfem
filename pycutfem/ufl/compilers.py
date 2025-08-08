@@ -1016,7 +1016,7 @@ class FormCompiler:
             for (xi, eta), w in zip(qp, qw):
                 J = transform.jacobian(mesh, eid, (xi, eta))
                 detJ = abs(np.linalg.det(J))
-                JiT = np.linalg.inv(J).T
+                Ji = np.linalg.inv(J)
                 self.ctx['x_phys'] = transform.x_mapping(mesh, eid, (xi, eta))
                 
                 # Cache basis values and gradients for this quadrature point
@@ -1024,8 +1024,7 @@ class FormCompiler:
                 for f in fields:
                     val = self.me.basis(f, xi, eta)
                     g_ref = self.me.grad_basis(f, xi, eta)
-                    # print(f"field: {f}, gref.shape: {g_ref.shape}, JiT.shape: {JiT.shape}")
-                    self._basis_cache[f] = {"val": val, "grad": g_ref @ JiT}
+                    self._basis_cache[f] = {"val": val, "grad": g_ref @ Ji}
                 
                 self.ctx["eid"] = eid
                 integrand_val = self._visit(integral.integrand)
@@ -1090,13 +1089,13 @@ class FormCompiler:
                         # --- Set context for the current quadrature point --- # New
                         xi, eta = transform.inverse_mapping(mesh, elem.id, x_phys) # New
                         J = transform.jacobian(mesh, elem.id, (xi, eta)) # New
-                        JiT = np.linalg.inv(J).T # New
+                        Ji = np.linalg.inv(J)
                         
-                        self._basis_cache.clear() # New
-                        for f in fields: # New
-                            val = self.me.basis(f, xi, eta) # New
-                            grad = self.me.grad_basis(f, xi, eta) @ JiT # New
-                            self._basis_cache[f] = {"val": val, "grad": grad} # New
+                        self._basis_cache.clear() 
+                        for f in fields: 
+                            val = self.me.basis(f, xi, eta) 
+                            grad = self.me.grad_basis(f, xi, eta) @ Ji
+                            self._basis_cache[f] = {"val": val, "grad": grad} 
 
                         self.ctx['eid'] = elem.id # New
                         self.ctx['normal'] = level_set.gradient(x_phys) # New
@@ -1120,12 +1119,12 @@ class FormCompiler:
                     for x_phys, w in zip(qp, qw): # New
                         xi, eta = transform.inverse_mapping(mesh, elem.id, x_phys) # New
                         J = transform.jacobian(mesh, elem.id, (xi, eta)) # New
-                        JiT = np.linalg.inv(J).T # New
+                        Ji = np.linalg.inv(J)
 
                         self._basis_cache.clear() # New
                         for f in fields: # New
                             val = self.me.basis(f, xi, eta) # New
-                            grad = self.me.grad_basis(f, xi, eta) @ JiT # New
+                            grad = self.me.grad_basis(f, xi, eta) @ Ji # New
                             self._basis_cache[f] = {"val": val, "grad": grad} # New
                         
                         self.ctx['eid'] = elem.id # New
@@ -1546,14 +1545,14 @@ class FormCompiler:
             loc = None
             for x_phys, w in zip(qp, qw):
                 xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
-                JiT     = np.linalg.inv(transform.jacobian(mesh, eid, (xi, eta))).T
+                Ji    = np.linalg.inv(transform.jacobian(mesh, eid, (xi, eta)))
 
                 # basis cache ---------------------------------------------------
                 self._basis_cache.clear()
                 for f in fields:
                     self._basis_cache[f] = {
                         "val" : self.me.basis      (f, xi, eta),
-                        "grad": self.me.grad_basis (f, xi, eta) @ JiT
+                        "grad": self.me.grad_basis (f, xi, eta) @ Ji
                     }
 
                 # context for visitors
@@ -1732,14 +1731,14 @@ class FormCompiler:
                         # reference point of the *parent element* that owns x_phys
                         xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
                         J       = transform.jacobian(mesh, eid, (xi, eta))
-                        JiT     = np.linalg.inv(J).T
+                        Ji     = np.linalg.inv(J)
 
                         # cache bases at this point (zero-padded across mixed fields)
                         self._basis_cache.clear()
                         for f in fields:
                             self._basis_cache[f] = {
                                 "val" : self.me.basis(f, xi, eta),
-                                "grad": self.me.grad_basis(f, xi, eta) @ JiT
+                                "grad": self.me.grad_basis(f, xi, eta) @ Ji
                             }
 
                         # context for UFL visitors
@@ -1793,13 +1792,13 @@ class FormCompiler:
             for (xi, eta), w in zip(qp_ref, qw_ref):
                 J    = transform.jacobian(mesh, eid, (xi, eta))
                 detJ = abs(np.linalg.det(J))
-                JiT  = np.linalg.inv(J).T
+                Ji  = np.linalg.inv(J)
 
                 self._basis_cache.clear()
                 for f in fields:
                     self._basis_cache[f] = {
                         "val" : self.me.basis(f, xi, eta),
-                        "grad": self.me.grad_basis(f, xi, eta) @ JiT
+                        "grad": self.me.grad_basis(f, xi, eta) @ Ji
                     }
                 self.ctx["eid"]    = eid
                 self.ctx["x_phys"] = transform.x_mapping(mesh, eid, (xi, eta))

@@ -200,4 +200,5 @@ __pycache__
 garbage/
 project/
 examples/*_results/
+pycutfem/solvers/giant/*
 

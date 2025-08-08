@@ -477,7 +477,7 @@ class NumbaCodeGen:
                     phys = []
                     for i in range(len(a.field_names)):
                         pg_loc = new_var("grad_loc")
-                        body_lines.append(f"{pg_loc} = {grad_q[i]}[e, q] @ {jinv_q}.T.copy()")
+                        body_lines.append(f"{pg_loc} = {grad_q[i]}[e, q] @ {jinv_q}.copy()")
 
                         if a.side:        # ---------- NEW ----------
                             map_arr = "pos_map" if a.side == "+" else "neg_map"
@@ -527,7 +527,7 @@ class NumbaCodeGen:
                         pg  = new_var("phys_grad_basis")
                         val = new_var("grad_val")
                         body_lines += [
-                            f"{pg}  = {grad_q[i]}[e, q] @ {jinv_q}.T.copy()",   # (n_loc,2)
+                            f"{pg}  = {grad_q[i]}[e, q] @ {jinv_q}.copy()",   # (n_loc,2)
                             f"{val} = {pg}.T.copy() @ {coeff}",           # (2,)
                         ]
                         comps.append(val)
