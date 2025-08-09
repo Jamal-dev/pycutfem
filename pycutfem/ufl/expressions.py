@@ -128,6 +128,8 @@ class Transpose(Expression):
     def __init__(self, A: Expression):
         super().__init__()
         self.A = A
+    def __repr__(self):
+        return f"Transpose({self.A!r})"
 class Power(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
     def __repr__(self): return f"({self.a!r} ** {self.b!r})"

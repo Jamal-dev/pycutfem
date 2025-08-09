@@ -1,4 +1,5 @@
 import re
+from matplotlib.pylab import f
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Union, Tuple, Set
@@ -209,32 +210,114 @@ class GradOpInfo:
     coeffs: np.ndarray = field(default=None)
 
     def transpose(self) -> "GradOpInfo":
-        if self.data.ndim == 2:
-            # If data is 2D, we can just transpose it
+        """
+        Transpose over component and spatial axes.
+
+        (k, n, d) -> (d, n, k)     e.g. [[∂x u1, ∂y u1],
+                                        [∂x u2, ∂y u2]]^T
+                                    = [[∂x u1, ∂x u2],
+                                        [∂y u1, ∂y u2]]
+
+        (k, d)     -> (d, k)
+        """
+        if self.data.ndim == 3:        # (k, n, d)
+            if self.role == "function":
+                # Transpose for function gradients
+                # swap the coefficents to match the new shape
+                if self.coeffs is not None:
+                    grad_vals = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+                return GradOpInfo(grad_vals.T, role=self.role, coeffs=None)
+            else: # trial and test 
+                return GradOpInfo(self.data.transpose(2, 1, 0), role=self.role, coeffs=self.coeffs)
+        if self.data.ndim == 2:        # (k, d) or (n, d)
             return GradOpInfo(self.data.T, role=self.role, coeffs=self.coeffs)
-        elif self.data.ndim == 3 and self.shape[0] == 2 and self.shape[2] == 2:
-            temp = self.data.copy()
-            temp[0,:,1] = self.data[1,:,0]
-            temp[1,:,0] = self.data[0,:,1]
-            return GradOpInfo(temp, role=self.role, coeffs=self.coeffs)
-        elif self.data.ndim == 3 and self.shape[0] == 1 and self.shape[2] == 2:
-            # For sclar gradients (1 component, 2 spatial dimensions)
-            # we swap the two spatial dimensions
-            return GradOpInfo(self.data.swapaxes(0, 2),
-                              role=self.role, coeffs=self.coeffs)
-        else:
-            raise ValueError(f"Cannot transpose GradOpInfo with data of shape {self.data.shape}. Expected 2D or 3D array.")
+        raise ValueError(f"Cannot transpose GradOpInfo with data of shape {self.data.shape}.")
+
+    def _eval_function_to_2d(self) -> np.ndarray:
+        assert self.role == "function", "Only use on function gradients."
+        # If it's 3D, contract over n → (k,d)
+        if self.data.ndim == 3:
+            if self.coeffs is not None:
+                # (k, n, d) contracted with (k, n) → (k, d)
+                kd = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+                return kd
+            else:
+                raise ValueError("Function gradient is 3D but no coeffs provided.")
+
+        # Already 2D: try to use a stored hint, otherwise assume ('k','d')
+        if self.data.ndim == 2:
+            return self.data
+
+        raise ValueError(f"Unexpected function gradient shape: {self.data.shape}")
 
     def inner(self, other: "GradOpInfo") -> np.ndarray:
-        """Computes inner(∇u, ∇v) = ∫(∇u)T(∇v), returning an (n, n) matrix."""
         if not isinstance(other, GradOpInfo) or self.data.shape != other.data.shape:
-            raise ValueError("Operands must be GradOpInfo of the same shape for inner product.")
-        # sum over components (k) and spatial dims (d), outer product over basis funcs (n,m)
-        return np.einsum("knd,kmd->nm", self.data, other.data, optimize=True)
-    
+            raise ValueError(...)
 
+        if self.role == "test" and other.role == "trial":
+            # standard order: rows=test, cols=trial
+            return np.einsum("knd,kmd->nm", self.data, other.data, optimize=True)
+
+        elif self.role == "trial" and other.role == "test":
+            # reversed inputs: build rows=test, cols=trial anyway
+            return np.einsum("knd,kmd->mn", self.data, other.data, optimize=True)
+
+        elif self.role == "function" and other.role == "function":
+            # (RHS or unusual cases rarely hit here; keep the default if needed)
+            return np.einsum("knd,kmd->nm", self.data, other.data, optimize=True)
+        else:
+            raise NotImplementedError(f"GradOpInfo.inner not implemented for roles {self.role} and {other.role}."
+                                      f" Shapes: {self.data.shape} and {other.data.shape}."
+                                      f" Roles: {self.role} and {other.role}.")
+
+
+    def dot(self, other:"GradOpInfo") -> "GradOpInfo":
+        """
+        Computes dot(∇u, ∇v) for two GradOpInfo objects.
+        Returns a new GradOpInfo with shape (k, n, d).
+        """
+        if not isinstance(other, GradOpInfo):
+            raise TypeError(f"Expected GradOpInfo, got {type(other)}.")
+        if self.data.shape[-1] != other.data.shape[0]:
+            raise ValueError(f"GradOpInfo shapes mismatch: {self.data.shape} vs {other.data.shape}.")
         
-        
+        # Case 1: Function · Grad(Trial) or Trial · Grad(Function)
+        if self.role == "function" and other.role == "trial":
+            # Case:  Function · Grad(Trial)      ∇u_k · ∇u_trial
+            # (k, d)   =  Σ_i  u_{k,i}  ∂_d φ_i   – true ∇u_k at this quad-point
+            if self.coeffs is not None:
+                grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+            else: 
+                grad_val = self.data
+            # (2)  matrix multiplication
+            data = np.einsum("ks,snd->knd", grad_val, other.data, optimize=True)
+            return GradOpInfo(data, role=other.role)
+        elif self.role == "trial" and other.role == "function":
+            # Case:  Grad(Trial) · Grad(Function)      ∇u_trial · ∇u_k
+            # (1)  value of u_trial at this quad-point
+            if other.coeffs is not None:
+                grad_val = np.einsum("knd,kn->kd", other.data, other.coeffs, optimize=True)
+            else:
+                grad_val = other.data
+            data = np.einsum("kns,sd->knd", self.data, grad_val, optimize=True)
+            return GradOpInfo(data, role=self.role)
+        elif self.role == "function" and other.role == "function":
+            # Case:  Grad(Function) · Grad(Function)      ∇u_k · ∇u_k
+            # (1)  value of ∇u_k at this quad-point
+            if self.coeffs is not None:
+                grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+            else:
+                grad_val = self.data
+            if other.coeffs is not None:
+                other_grad_val = np.einsum("knd,kn->kd", other.data, other.coeffs, optimize=True)
+            else:
+                other_grad_val = other.data
+            # Matrix multiplication
+            data = np.einsum("kd,dn->kn", grad_val, other_grad_val, optimize=True)
+            return GradOpInfo(data, role=self.role)
+        else:
+            raise NotImplementedError(f"GradOpInfo.dot not implemented for roles {self.role} and {other.role}."
+                                      f" Shapes: {self.data.shape} and {other.data.shape}.")
 
     def dot_vec(self, vec: np.ndarray) -> VecOpInfo:
         """
@@ -329,9 +412,24 @@ class GradOpInfo:
         return GradOpInfo(-self.data, role=self.role)
 
     def __add__(self, other: "GradOpInfo") -> "GradOpInfo":
-        if not isinstance(other, GradOpInfo) or self.data.shape != other.data.shape:
-            raise ValueError("Operands must be GradOpInfo of the same shape for addition.")
-        return GradOpInfo(self.data + other.data, role=self.role)
+        if not isinstance(other, GradOpInfo) and self.role != other.role:
+            raise ValueError("Operands must be GradOpInfo of the same shape for addition."
+                             f" Shapes: {self.data.shape} and {other.data.shape}."
+                             f" Roles: {self.role} and {other.role}.")
+        if self.role in ["test", "trial"] and other.role in ["test", "trial"]:
+            # Case: both are test or trial gradients
+            if self.data.shape != other.data.shape:
+                raise ValueError(f"GradOpInfo shapes mismatch in addition: {self.data.shape} vs {other.data.shape}.")
+            return GradOpInfo(self.data + other.data, role=self.role)
+        elif self.role == "function" and other.role == "function":
+            a = self._eval_function_to_2d()  
+            b = other._eval_function_to_2d()
+            if a.shape != b.shape:
+                raise ValueError(f"Function gradient shapes mismatch in addition: {a.shape} vs {b.shape}.")
+            return GradOpInfo(a + b, role=self.role) # collapsed gradients (2,2)
+        else:
+            raise NotImplementedError(f"GradOpInfo addition not implemented for roles {self.role} and {other.role}."
+                                      f" Shapes: {self.data.shape} and {other.data.shape}.")
 
     def __sub__(self, other: "GradOpInfo") -> "GradOpInfo":
         return self.__add__(-other)

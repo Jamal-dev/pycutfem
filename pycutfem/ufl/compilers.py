@@ -38,7 +38,7 @@ from pycutfem.ufl.expressions import (
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
     ElementWiseConstant, Derivative, Transpose,
     CellDiameter, NormalComponent,
-    Restriction, Power
+    Restriction, Power, Trace
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -101,7 +101,8 @@ class FormCompiler:
             CellDiameter: self._visit_CellDiameter,
             NormalComponent: self._visit_NormalComponent,
             Restriction: self._visit_Restriction,
-            Power: self._visit_Power
+            Power: self._visit_Power,
+            Trace: self._visit_Trace
         }
 
     # ============================ PUBLIC API ===============================
@@ -225,6 +226,46 @@ class FormCompiler:
     
     def _visit_NormalComponent(self, n:NormalComponent):
         return self._visit_FacetNormal(FacetNormal())[n.idx]
+    
+    def _visit_Trace(self, node: Trace):
+        """trace(A): sum of diagonal on the *first* and *last* axes for GradOpInfo.
+        - For function gradients: returns a 1-component VecOpInfo with a scalar value.
+        - For test/trial gradients: returns a 1-component VecOpInfo of length n.
+        - For plain numpy arrays: returns np.trace(A)."""
+        A = self._visit(node.A)
+
+        # Numeric tensor: use NumPy
+        if isinstance(A, np.ndarray):
+            return np.trace(A)
+
+        # Gradient-like object
+        if isinstance(A, GradOpInfo):
+            # Function: evaluate to 2D (k,d) or (d,k) and take trace → scalar
+            if A.role == "function":
+                if A.data.ndim == 3 and A.coeffs is not None:
+                    # (k,n,d) ⨯ (k,n) → (k,d)
+                    M = np.einsum("knd,kn->kd", A.data, A.coeffs, optimize=True)
+                else:
+                    # already 2D from a previous Transpose
+                    M = A.data
+                tr_val = float(np.trace(M))
+                # Wrap as a 1-component VecOpInfo (shape (1,)) so RHS assembly paths work
+                return VecOpInfo(np.array([tr_val]), role="function")
+
+            # Test/Trial: sum diagonal across first/last axes → (n,)
+            if A.data.ndim != 3:
+                raise ValueError(f"Trace expects a rank-3 GradOpInfo for test/trial, got {A.data.shape}.")
+            k_dim, n_loc, d_dim = A.data.shape
+            m = min(k_dim, d_dim)
+            # sum_i A[i, :, i]  — works for either (k,n,d) or (d,n,k) because we always use axes (0,2)
+            tr_vec = np.zeros((n_loc,), dtype=A.data.dtype)
+            for i in range(m):
+                tr_vec += A.data[i, :, i]
+            # Return as a 1-component vector basis block: (1, n_loc)
+            return VecOpInfo(np.stack([tr_vec]), role=A.role)
+
+        # VecOpInfo or other types are not meaningful for trace
+        raise TypeError(f"Trace not implemented for {type(A)}")
     
     def _visit_Power(self, n: Power):
         """
@@ -520,17 +561,23 @@ class FormCompiler:
         b = self._visit(n.b)
         return a - b
     
-    def _visit_Transpose(self, node:Transpose):
-        mat = self._visit(node.A)               # recurse
-        # NumPy ndarray  → just use .T
-        if isinstance(mat, np.ndarray):
-            return mat.T
-        if isinstance(mat, GradOpInfo):
-            return mat.transpose()            
-        # VecOpInfo (our own small tensor wrapper)
-        if isinstance(mat, VecOpInfo):
-            return mat.transpose()              # implement below
-        raise TypeError(f"Cannot transpose object of type {type(mat)}")
+    def _visit_Transpose(self, node: Transpose):
+        A = self._visit(node.A)
+
+        # Plain numpy: use .T
+        if isinstance(A, np.ndarray):
+            return A.T
+
+        # Grad basis/operators
+        if isinstance(A, GradOpInfo):
+            return A.transpose()
+
+        # Vector basis/operators
+        if isinstance(A, VecOpInfo):
+            # VecOpInfo stores (k, n) -> transpose to (n, k)
+            return VecOpInfo(A.data.T, role=A.role)
+
+        raise TypeError(f"Transpose not implemented for {type(A)}")
 
     def _visit_Div(self, n):
         """Handles scalar, vector, or tensor division by a scalar."""
@@ -659,6 +706,12 @@ class FormCompiler:
              isinstance(a, (VecOpInfo, GradOpInfo)) and a.role in {"trial", "function"}:
                 # return a.dot_const(b) if a.ndim==2 else a.dot_vec(b)
                 return a.dot_const_vec(b) if a.ndim==2 else a.dot_vec(b)
+            # ------------------------------------------------------------------
+            # Case:  Grad(Trial) · Grad(Function)       ∇u_trial · ∇u_k 
+            # ------------------------------------------------------------------
+            if isinstance(a, GradOpInfo) and  (a.role == "function") \
+            and isinstance(b, GradOpInfo) and (b.role == "function"):
+                return a.dot(b)
 
         if self.ctx["rhs"]:
             result = rhs()
@@ -740,6 +793,12 @@ class FormCompiler:
 
             return a.dot_grad(b)  # u_k · ∇u_trial
             
+        # ------------------------------------------------------------------
+        # Case:  Grad(Trial) · Grad(Function)       ∇u_trial · ∇u_k 
+        # ------------------------------------------------------------------
+        if isinstance(a, GradOpInfo) and (a.role == "trial" or a.role == "function") \
+        and isinstance(b, GradOpInfo) and (b.role == "trial" or b.role == "function"):
+            return a.dot(b)
         
         # Both are numerical vectors (RHS)
         if isinstance(a, np.ndarray) and isinstance(b, np.ndarray): return np.dot(a,b)
@@ -764,7 +823,10 @@ class FormCompiler:
                     # print(f"mei hu na" * 6)
                     # print(f"a.data before summition: {a.data}")
 
-                    grad_val = np.einsum("knd,kn->kd", a.data, a.coeffs, optimize=True)
+                    if a.coeffs is not None:
+                        grad_val = np.einsum("knd,kn->kd", a.data, a.coeffs, optimize=True)
+                    else:
+                        grad_val = a.data
                     # print(f"grad_val: {grad_val}")
                     # print(f"b.data: {b.data}")
                     return np.einsum("kd,knd->n", grad_val, b.data, optimize=True)
