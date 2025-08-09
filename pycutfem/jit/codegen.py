@@ -651,19 +651,34 @@ class NumbaCodeGen:
                       f", is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}"
                       f", a.is_transpose: {a.is_transpose}, b.is_transpose: {b.is_transpose}")
 
-                # LHS Bilinear Form: inner(TRIAL_BASIS, TEST_BASIS)
-                if a.role in ('test', 'trial') and b.role in ('test', 'trial'): # LHS
+                # LHS Bilinear Form: always rows=test, cols=trial
+                if a.role in ('test', 'trial') and b.role in ('test', 'trial'):
+                    body_lines.append('# Inner(LHS): orient rows=test, cols=trial')
+
+                    # pick the operands by role, regardless of stack order
+                    test_var  = f"{a.var_name}" if a.role == "test"  else f"{b.var_name}"
+                    trial_var = f"{a.var_name}" if a.role == "trial" else f"{b.var_name}"
+                    n_test    = a.shape[1] if a.role == "test"  else b.shape[1]
+                    n_trial   = a.shape[1] if a.role == "trial" else b.shape[1]
+
+                    body_lines.append(f'{res_var} = np.zeros(({n_test}, {n_trial}), dtype=np.float64)')
+
                     if a.is_gradient and b.is_gradient:
-                        body_lines.append(f'# Inner(Grad, Grad): stiffness matrix')
-                        # This is equivalent to einsum("knd,kmd->nm", a, b)
-                        body_lines.append(f'{res_var} = np.zeros(({a.shape[1]}, {b.shape[1]}))')
-                        body_lines.append(f'for k in range({a.shape[0]}):')
-                        # Use .copy() to ensure contiguous arrays and avoid performance warnings
-                        body_lines.append(f'    {res_var} += {a.var_name}[k] @ {b.var_name}[k].T.copy()')
+                        # grad-grad: sum over vector components
+                        k_comps = a.shape[0]  # == b.shape[0]
+                        body_lines.append(f'for k in range({k_comps}):')
+                        # test[k] @ trial[k].T → (n_test, n_trial)
+                        body_lines.append(f'    {res_var} += {test_var}[k] @ {trial_var}[k].T.copy()')
                     else:
-                        body_lines.append(f'# Inner(Vec, Vec): mass matrix')
-                        # body_lines.append(f'print(f"a.shape: {{{a.var_name}.shape}}, b.shape: {{{b.var_name}.shape}}")')
-                        body_lines.append(f'{res_var} = {a.var_name}.T.copy() @ {b.var_name}')
+                        # vector bases (or scalar lifted to (1,n)): test.T @ trial
+                        body_lines.append(f'{res_var} = {test_var}.T.copy() @ {trial_var}')
+
+                    # push with correct matrix shape
+                    stack.append(StackItem(var_name=res_var, role="value",
+                                        shape=(n_test, n_trial), is_vector=False,
+                                        is_gradient=False))
+                    continue
+
                 # elif a.role == 'const' and b.role == 'const' and a.shape == b.shape:
                 #     body_lines.append(f'# Inner(Const, Const): element-wise product')
                 #     body_lines.append(f'{res_var} = {a.var_name} * {b.var_name}')
@@ -895,37 +910,18 @@ class NumbaCodeGen:
                     # a: grad(du) or grad(du).T -> Trial function basis, shape (k, n, d)
                     # b: grad(u_k)             -> Function value, shape (k, d)
                     
-                    a_is_T = getattr(a, 'is_transpose', False)
+
+                    body_lines.append("# dot(grad(trial), grad(value)) -> (k,n,k) tensor basis")
+                    body_lines += [
+                        f"n_vec_comps = {k}; n_locs = {n_locs};",
+                        f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
+                        f"b_mat = np.ascontiguousarray({b.var_name})",
+                        f"for n in range(n_locs):",
+                        f"    a_slice = np.ascontiguousarray({a.var_name}[:, n, :])",
+                        f"    {res_var}[:, n, :] = a_slice @ b_mat",
+                    ]
                     
-                    if not a_is_T:
-                        # UFL Operation: dot(grad(du), grad(u_k))
-                        # For each basis function n, this computes: grad(du_n) @ grad(u_k).T
-                        # Shapes: (k, d) @ (d, k) -> (k, k)
-                        body_lines.append("# dot(grad(trial), grad(value)) -> (k,n,k) tensor basis")
-                        body_lines += [
-                            f"n_vec_comps = {k}; n_locs = {n_locs};",
-                            f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
-                            f"b_T = np.ascontiguousarray({b.var_name}.T)",
-                            f"for n in range(n_locs):",
-                            f"    a_slice = np.ascontiguousarray({a.var_name}[:, n, :])",
-                            f"    {res_var}[:, n, :] = a_slice @ b_T",
-                        ]
-                    else: # a_is_T is True
-                        # UFL Operation: dot(grad(du).T, grad(u_k))
-                        # For each basis function n, this computes: grad(u_k) @ grad(du_n).T
-                        # Shapes: (k, d) @ (d, k) -> (k, k)
-                        # Note: This relies on k == d for the UFL operation to be well-defined.
-                        body_lines.append("# dot(grad(trial).T, grad(value)) -> (k,n,k) tensor basis")
-                        body_lines += [
-                            f"n_vec_comps = {k}; n_locs = {n_locs};",
-                            f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
-                            f"b_arr = np.ascontiguousarray({b.var_name})",
-                            f"for n in range(n_locs):",
-                            f"    a_slice = np.ascontiguousarray({a.var_name}[:, n, :])",
-                            f"    {res_var}[:, n, :] = b_arr @ a_slice",
-                        ]
-                    
-                    res_shape = (k, n_locs, k)
+                    res_shape = (k, n_locs, d)
                     stack.append(StackItem(var_name=res_var, role='trial',
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=a.field_names, parent_name=a.parent_name))
@@ -941,37 +937,16 @@ class NumbaCodeGen:
                     # a: grad(u_k) or grad(u_k).T -> Function value, shape (k, d)
                     # b: grad(du)             -> Trial function basis, shape (k, n, d)
 
-                    b_is_T = getattr(b, 'is_transpose', False)
+                    body_lines.append("# dot(grad(value), grad(trial)) -> (k,n,k) tensor basis")
+                    body_lines += [
+                        f"n_vec_comps = {k}; n_locs = {n_locs};",
+                        f"{res_var} = np.zeros((n_vec_comps, n_locs, {d}), dtype=np.float64)",
+                        f"a_contig = np.ascontiguousarray({a.var_name})",
+                        f"for n in range(n_locs):",
+                        f"    b_slice = np.ascontiguousarray({b.var_name}[:, n, :])",
+                        f"    {res_var}[:, n, :] = a_contig @ b_slice",
+                    ]
                     
-                    if not b_is_T:
-                        # UFL Operation: dot(grad(u_k), grad(du))
-                        # For each basis function n, this computes: grad(u_k).T @ grad(du_n)
-                        # Shapes: (d, k) @ (k, d) -> (d, d)
-                        # Note: This produces a (d,d) matrix, which works here because the
-                        # tests assume vector dimension k == spatial dimension d.
-                        body_lines.append("# dot(grad(value), grad(trial)) -> (k,n,k) tensor basis")
-                        body_lines += [
-                            f"n_vec_comps = {k}; n_locs = {n_locs};",
-                            f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
-                            f"a_contig_T = np.ascontiguousarray({a.var_name}.T)",
-                            f"for n in range(n_locs):",
-                            f"    b_slice = np.ascontiguousarray({b.var_name}[:, n, :])",
-                            f"    {res_var}[:, n, :] = a_contig_T @ b_slice",
-                        ]
-                    else: # b_is_T is True
-                        # UFL Operation: dot(grad(u_k), grad(du).T)
-                        # For each basis function n, this computes: grad(du_n).T @ grad(u_k)
-                        # Shapes: (d, k) @ (k, d) -> (d, d)
-                        # Note: This produces a (d,d) matrix, assuming k == d.
-                        body_lines.append("# dot(grad(value), grad(trial).T) -> (k,n,k) tensor basis")
-                        body_lines += [
-                            f"n_vec_comps = {k}; n_locs = {n_locs};",
-                            f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
-                            f"a_arr = np.ascontiguousarray({a.var_name})",
-                            f"for n in range(n_locs):",
-                            f"    b_slice = np.ascontiguousarray({b.var_name}[:, n, :])",
-                            f"    {res_var}[:, n, :] = b_slice @ a_arr",
-                        ]
                     res_shape = (k, n_locs, k)
                     stack.append(StackItem(var_name=res_var, role='trial',
                                         shape=res_shape, is_vector=False, is_gradient=True,
