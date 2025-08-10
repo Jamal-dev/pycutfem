@@ -337,7 +337,10 @@ class GradOpInfo:
             if self.role == "function" and vec.role == "trial": # introducing a new branch
                 # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u
                 # (k, d)   =  Σ_i  u_{k,i}  ∂_d φ_i   – true ∇u_k at this quad-point
-                grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+                if self.coeffs is not None:
+                    grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+                else:
+                    grad_val = self.data
 
                 # (k, n)   =  Σ_d  (∇u_k)_d  φ_{u,d,n}     – (∇u_k)·δu  for every trial dof n
                 # data = grad_val @ vec.data                  # BLAS-2, same as einsum("kd,dn->kn")
@@ -347,24 +350,33 @@ class GradOpInfo:
             
             if self.role == "trial" and vec.role == "function": # introducing a new branch
                 # Case:  Grad(Trial) · Vec(Function)      (∇u_trial) · u_k
-                u_val = np.sum(vec.data, axis=1)          # (k,d) ∫ u_k dx ) 
-                data = np.einsum("kld,d->kl", self.data, u_val, optimize=True)
+                v_val = np.sum(vec.data, axis=1)          # (k,d) ∫ u_k dx ) 
+                data = np.einsum("kld,d->kl", self.data, v_val, optimize=True)
                 return VecOpInfo(data, role=self.role)
             if self.role == "function" and vec.role == "function":
                 # Case:  Grad(Function) · Vec(Function)      (∇u_k) · u_k
                 # (1)  value of ∇u_k at this quad-point
-                grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
-                u_val = np.sum(vec.data, axis=1)
-                w_val = np.einsum("kd,d->k", grad_val, u_val, optimize=True)
+                if self.coeffs is not None:
+                    grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+                else:
+                    grad_val = self.data
+                v_val = np.sum(vec.data, axis=1)
+                w_val = np.einsum("kd,d->k", grad_val, v_val, optimize=True)
                 return w_val # rhs, so return a 1D array
 
             
         
         if isinstance(vec, np.ndarray) and vec.ndim == 1: # dot product with a constant vector
-            if self.role == "function" and self.coeffs is not None:
+            # print(f"GradOpInfo.dot_vec: vec={vec}, data.shape={self.data.shape}, role={self.role}"
+                #   f", vec.role={getattr(vec, 'role', None)}, vec.shape={getattr(vec, 'shape', None)}")
+            if self.role == "function":
                 # Case:  Grad(Function) · Const      (∇u_k) · c
                 # (1)  value of ∇u_k at this quad-point
-                grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+                if self.coeffs is not None and self.data.shape != (2,2):
+                    # (k, d)   =  Σ_i  u_{k,i}  ∂_d φ_i   – true ∇u_k at this quad-point
+                    grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+                else:
+                    grad_val = self.data
                 # (2)  w_i,n = Σ_d (∇u_k)_d c_d φ_{k,n}
                 result_data = np.einsum("kd,d->k", grad_val, vec, optimize=True)
                 return result_data # returns a 1D array

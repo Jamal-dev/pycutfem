@@ -290,7 +290,7 @@ uf_n.plot()
 # In[11]:
 
 
-from pycutfem.ufl.expressions import Derivative, FacetNormal, trace
+from pycutfem.ufl.expressions import Derivative, FacetNormal, trace, Jump
 n = FacetNormal()                    # vector expression (n_x, n_y)
 
 def _dn(expr):
@@ -371,16 +371,16 @@ def sigma_dot_n_v(u_vec, p_scal,v_test,n):
 
 # --- Jacobian contribution on Γsolid --------------------------------
 J_int = (
-    - sigma_dot_n_v(du_f, dp_f, test_vel_f - test_vel_s,n)           # consistency
-    - sigma_dot_n_v(test_vel_f, -test_q_f, du_f - du_s, n)           # symmetry
-    + beta_N * mu_f / cell_h * dot(du_f - du_s, test_vel_f - test_disp_s)     # penalty
+    - sigma_dot_n_v(du_f, dp_f, Jump(test_vel_f, test_vel_s),n)           # consistency
+    - sigma_dot_n_v(Jump(test_vel_f, test_vel_s), -test_q_f, Jump(du_f, du_s), n)           # symmetry
+    + beta_N * mu_f / cell_h * dot(Jump(du_f, du_s), Jump(test_vel_f, test_vel_s))     # penalty
 ) * dΓ
 
 # --- Residual contribution on Γsolid --------------------------------
 R_int = (
-    - sigma_dot_n_v(uf_k, pf_k, test_vel_f - test_vel_s,n)
-    - sigma_dot_n_v(test_vel_f, -test_q_f, uf_k - us_k,n)
-    + beta_N * mu_f / cell_h * dot(uf_k - us_k, test_vel_f - test_disp_s)
+    - sigma_dot_n_v(uf_k, pf_k, Jump(test_vel_f, test_vel_s),n)
+    - sigma_dot_n_v(Jump(test_vel_f, test_vel_s), -test_q_f, Jump(uf_k, us_k), n)
+    + beta_N * mu_f / cell_h * dot(Jump(uf_k,us_k), Jump(test_vel_f , test_vel_s))
 ) * dΓ
 
 # volume -------------------fluid--------------------------------
@@ -468,7 +468,7 @@ a_stab = (
     ) * dG_fluid + 
     (
     rho_s_const * g_v_s(gamma_v, du_s, test_vel_s)
-    + Constant(2.0) * mu_s * g_disp_s(gamma_v_grad, ddisp_s, test_vel_s)
+    + Constant(2.0) * mu_s * g_disp_s(gamma_v_grad, ddisp_s, test_disp_s)
     ) * dG_solid
 )
 r_stab = (
@@ -478,7 +478,7 @@ r_stab = (
     ) * dG_fluid + 
     (
     rho_s_const * g_v_s(gamma_v, us_k, test_vel_s)
-    + Constant(2.0) * mu_s * g_disp_s(gamma_v_grad, disp_k, test_vel_s)
+    + Constant(2.0) * mu_s * g_disp_s(gamma_v_grad, disp_k, test_disp_s)
     ) * dG_solid
 )
 # complete Jacobian and residual -----------------------------------
@@ -492,10 +492,10 @@ residual_form  = r_vol_f + R_int + r_vol_s + r_svc + r_stab
 
 
 
-# In[ ]:
+# In[12]:
 
 
-# !rm ~/.cache/pycutfem_jit/*
+get_ipython().system('rm ~/.cache/pycutfem_jit/*')
 
 
 # In[13]:

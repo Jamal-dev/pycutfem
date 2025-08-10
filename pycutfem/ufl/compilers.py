@@ -9,6 +9,7 @@ basis functions (for unknowns) and evaluated numerical data (for knowns),
 enabling robust assembly of LHS matrices and RHS vectors.
 """
 from __future__ import annotations
+import re
 
 from matplotlib.pylab import f
 
@@ -525,7 +526,10 @@ class FormCompiler:
 
         if grad_op.role == "function":
             # scaled the gradient
-            grad_val = np.einsum("knd,kn->kd", grad_op.data, grad_op.coeffs, optimize=True) # (k,d) (2,2)
+            if grad_op.coeffs is not None:
+                grad_val = np.einsum("knd,kn->kd", grad_op.data, grad_op.coeffs, optimize=True) # (k,d) (2,2)
+            else:
+                grad_val = grad_op.data
             div_vec = np.sum([grad_val[i, i] for i in range(grad_val.shape[0])], axis=0)  # sum over k
         else:
             # ∇·v  =  Σ_i ∂v_i/∂x_i   → length n_loc (22) vector
@@ -592,6 +596,8 @@ class FormCompiler:
         b = self._visit(n.b)
         a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo)) else a
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
+        shape_a = getattr(a_data,"shape", None)
+        shape_b = getattr(b_data,"shape", None)
         # a_vec = np.squeeze(a_data) 
         # b_vec = np.squeeze(b_data)
         # role_a = getattr(a, 'role', None)
@@ -628,6 +634,10 @@ class FormCompiler:
                 return a * b.data[0]
             if np.isscalar(b) and isinstance(a, VecOpInfo) and a.role == "test":
                 return b * a.data[0]
+            elif isinstance(b, np.ndarray) and isinstance(a, VecOpInfo):
+                return a * b # p * normal
+            elif isinstance(a, np.ndarray) and isinstance(b, VecOpInfo):
+                return b * a # normal * p
         
         # --- General Purpose Logic (used mostly for LHS) ---
 
@@ -647,7 +657,8 @@ class FormCompiler:
                 return b * a
         
         raise TypeError(f"Unsupported product 'type(a)={type(a)}, type(b)={type(b)}'{n.a} * {n.b}' for {'RHS' if self.ctx['rhs'] else 'LHS'}"
-                        f" for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
+                        f" for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}"
+                        f" and data shapes a={shape_a}, b={shape_b}"    )
 
         
 
@@ -699,19 +710,26 @@ class FormCompiler:
             
             # Case 4: Constant(np.array([u1,u2])) · Trial or Function, no test so output is VecOpInfo
             if isinstance(a, np.ndarray) and a.ndim == 1 and \
-             isinstance(b, (VecOpInfo, GradOpInfo)) and b.role in {"trial", "function"}:
+             isinstance(b, (VecOpInfo)) and b.role in {"trial", "function"}:
                 # return b.dot_const(a) if b.ndim==2 else b.dot_vec(a)
-                return b.dot_const_vec(a) if b.ndim==2 else b.dot_vec(a)
-            if isinstance(b, np.ndarray) and b.ndim == 1 and \
-             isinstance(a, (VecOpInfo, GradOpInfo)) and a.role in {"trial", "function"}:
+                return b.dot_const_vec(a) 
+            elif isinstance(b, np.ndarray) and b.ndim == 1 and \
+             isinstance(a, (VecOpInfo)) and a.role in {"trial", "function"}:
                 # return a.dot_const(b) if a.ndim==2 else a.dot_vec(b)
-                return a.dot_const_vec(b) if a.ndim==2 else a.dot_vec(b)
+                return a.dot_const_vec(b) 
+            elif isinstance(a, np.ndarray) and isinstance(b, GradOpInfo):
+                return b.dot_vec(a)  # ∇u_k · u_trial
+            elif isinstance(b, np.ndarray) and isinstance(a, GradOpInfo):
+                return a.dot_vec(b)
             # ------------------------------------------------------------------
             # Case:  Grad(Trial) · Grad(Function)       ∇u_trial · ∇u_k 
             # ------------------------------------------------------------------
             if isinstance(a, GradOpInfo) and  (a.role == "function") \
             and isinstance(b, GradOpInfo) and (b.role == "function"):
                 return a.dot(b)
+            if isinstance(b, np.ndarray) and  (role_b == None) \
+            and isinstance(a, np.ndarray) and (role_a == None):
+                return np.dot(a, b)  # plain numpy dot product
 
         if self.ctx["rhs"]:
             result = rhs()

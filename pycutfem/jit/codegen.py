@@ -94,6 +94,7 @@ class NumbaCodeGen:
         self.n_dofs_local = self.me.n_dofs_local
         self.spatial_dim = self.me.mesh.spatial_dim
         self.last_side_for_store = "" # Track side for detJ
+        self.dtype = "np.float64"  # Default data type for arrays
 
     
     
@@ -146,7 +147,7 @@ class NumbaCodeGen:
                 body_lines.append(f"if {domain_bs_name}[e]:")
                 body_lines.append(f"    {res_var} = {a.var_name}")
                 body_lines.append(f"else:")
-                body_lines.append(f"    {res_var} = np.zeros_like({a.var_name})")
+                body_lines.append(f"    {res_var} = np.zeros_like({a.var_name}, dtype={self.dtype})")
 
                 # Push the result back onto the stack
                 stack.append(a._replace(var_name=res_var))
@@ -234,7 +235,7 @@ class NumbaCodeGen:
                                 f"if n_union == {loc}.shape[0]:",          # fast path (interior facet)
                                 f"    {pad} = {loc}.copy()",
                                 f"else:",                                  # true ghost facet
-                                f"    {pad} = np.zeros(n_union, dtype=np.float64)",
+                                f"    {pad} = np.zeros(n_union, dtype={self.dtype})",
                                 f"    for j in range({loc}.shape[0]):",
                                 f"        idx = {map_e}[j]",
                                 f"        if 0 <= idx < n_union:",
@@ -321,7 +322,7 @@ class NumbaCodeGen:
                                 f"if n_union == {local}.shape[0]:",
                                 f"    {pad} = {local}.copy()",
                                 f"else:",                                     # genuine ghost facet
-                                f"    {pad} = np.zeros(n_union, dtype=np.float64)",
+                                f"    {pad} = np.zeros(n_union, dtype={self.dtype})",
                                 f"    for j in range({local}.shape[0]):",
                                 f"        idx = {map_e}[j]",
                                 f"        if 0 <= idx < n_union:",
@@ -433,7 +434,7 @@ class NumbaCodeGen:
                     body_lines += [
                         f"n_locs = {n}",
                         f"n_comps = {k}",
-                        f"{res_var} = np.zeros((1, n_locs), dtype=np.float64)",
+                        f"{res_var} = np.zeros((1, n_locs), dtype={self.dtype})",
                         f"for j in range(n_locs):",
                         f"    local_sum = 0.0",
                         f"    for i in range(n_comps):",
@@ -487,7 +488,7 @@ class NumbaCodeGen:
                             body_lines += [
                                 f"{map_e} = {map_arr}[e]",
                                 f"n_union = gdofs_map[e].shape[0]",
-                                f"{pg_pad} = np.zeros((n_union, {self.spatial_dim}))",
+                                f"{pg_pad} = np.zeros((n_union, {self.spatial_dim}), dtype={self.dtype})",
                                 f"for j in range({pg_loc}.shape[0]):",
                                 f"    idx = {map_e}[j]",
                                 f"    if 0 <= idx < n_union:",
@@ -576,7 +577,7 @@ class NumbaCodeGen:
                     body_lines += [
                         f"n_loc  = {a.shape[1]}",  # number of local basis functions
                         f"n_vec  = {a.shape[0]}",     # components k
-                        f"{div_var} = np.zeros((1, n_loc), dtype=np.float64)",
+                        f"{div_var} = np.zeros((1, n_loc), dtype={self.dtype})",
                         f"for j in range(n_loc):",            # local basis index
                         f"    tmp = 0.0",
                         f"    for k in range(n_vec):",        # component index
@@ -613,7 +614,7 @@ class NumbaCodeGen:
                                             field_names=a.field_names))
                     else:                          # tensor field → vector (k,)
                         body_lines.append("# Div(tensor value) → vector")
-                        body_lines.append(f"{div_var} = np.zeros(({k_comp},), dtype=np.float64)")
+                        body_lines.append(f"{div_var} = np.zeros(({k_comp},), dtype={self.dtype})")
                         for k in range(k_comp):
                             body_lines.append(f"tmp = 0.0")
                             for d in range(n_dim):
@@ -634,22 +635,22 @@ class NumbaCodeGen:
             elif isinstance(op, PosOp):
                 a = stack.pop()
                 res_var = new_var("pos")
-                body_lines.append(f"{res_var} = {a.var_name} if phi_q >= 0.0 else np.zeros_like({a.var_name})")
+                body_lines.append(f"{res_var} = {a.var_name} if phi_q >= 0.0 else np.zeros_like({a.var_name}, dtype={self.dtype})")
                 stack.append(a._replace(var_name=res_var))
 
             elif isinstance(op, NegOp):
                 a = stack.pop()
                 res_var = new_var("neg")
-                body_lines.append(f"{res_var} = {a.var_name} if phi_q < 0.0 else np.zeros_like({a.var_name})")
+                body_lines.append(f"{res_var} = {a.var_name} if phi_q < 0.0 else np.zeros_like({a.var_name}, dtype={self.dtype})")
                 stack.append(a._replace(var_name=res_var))
 
             # --- BINARY OPERATORS ---
             elif isinstance(op, Inner):
                 b = stack.pop(); a = stack.pop()
                 res_var = new_var("inner")
-                print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}"
-                      f", is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}"
-                      f", a.is_transpose: {a.is_transpose}, b.is_transpose: {b.is_transpose}")
+                # print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}"
+                #       f", is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}"
+                #       f", a.is_transpose: {a.is_transpose}, b.is_transpose: {b.is_transpose}")
 
                 # LHS Bilinear Form: always rows=test, cols=trial
                 if a.role in ('test', 'trial') and b.role in ('test', 'trial'):
@@ -661,7 +662,7 @@ class NumbaCodeGen:
                     n_test    = a.shape[1] if a.role == "test"  else b.shape[1]
                     n_trial   = a.shape[1] if a.role == "trial" else b.shape[1]
 
-                    body_lines.append(f'{res_var} = np.zeros(({n_test}, {n_trial}), dtype=np.float64)')
+                    body_lines.append(f'{res_var} = np.zeros(({n_test}, {n_trial}), dtype={self.dtype})')
 
                     if a.is_gradient and b.is_gradient:
                         # grad-grad: sum over vector components
@@ -691,7 +692,7 @@ class NumbaCodeGen:
                         body_lines += [
                             f'n_locs = {b.shape[1]}; n_vec_comps = {a.shape[0]};',
                             # f'print(f"a.shape: {{{a.var_name}.shape}}, b.shape: {{{b.var_name}.shape}}")',
-                            f'{res_var} = np.zeros((n_locs))',
+                            f'{res_var} = np.zeros((n_locs), dtype={self.dtype})',
                             f'for n in range(n_locs):',
                             f"    {res_var}[n] = np.sum({a.var_name} * {b.var_name}[:,n,:].copy())"
                         ]
@@ -702,7 +703,7 @@ class NumbaCodeGen:
                         body_lines += [
                             f'n_locs = {b.shape[1]}',
                             f'n_vec_comps = {b.shape[0]}',
-                            f'{res_var} = np.zeros(n_locs, dtype=np.float64)',
+                            f'{res_var} = np.zeros(n_locs, dtype={self.dtype})',
                             f'for n in range(n_locs):',
                             f'    local_sum = 0.0',
                             f'    for k in range(n_vec_comps):',
@@ -714,7 +715,7 @@ class NumbaCodeGen:
                         body_lines.append(f'# RHS: Inner(grad(scalarFunction), grad(Test)')
                         body_lines += [
                             f'n_locs = {b.shape[1]}; n_vec_comps = {a.shape[0]};',
-                            f'{res_var} = np.zeros((n_locs))',
+                            f'{res_var} = np.zeros((n_locs), dtype={self.dtype})',
                             f'for n in range(n_locs):',
                             f"    {res_var}[n] = np.sum({a.var_name} * {b.var_name}[:,n,:].copy())"
                         ]
@@ -752,7 +753,7 @@ class NumbaCodeGen:
                     # body_lines.append(f"{res_var} = np.einsum('knd,d->kn', {a.var_name}, {b.var_name})")
                     body_lines += [
                         f"n_vec_comps = {a.shape[0]};n_locs = {a.shape[1]};n_spatial_dim = {a.shape[2]};",
-                        f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
+                        f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype={self.dtype})",
                         f"for k in range(n_vec_comps):",
                         f"    {res_var}[k] = {b.var_name} @ {a.var_name}[k].T.copy() ",
                         # f"assert {res_var}.shape == (2, 22), f'result shape mismatch {res_var}.shape with {{(n_vec_comps, n_locs)}}'"
@@ -788,7 +789,7 @@ class NumbaCodeGen:
                                         f"n_vec_comps   = {a.var_name}.shape[0];",
                                         f"n_locs        = {a.var_name}.shape[1];",
                                         f"n_spatial_dim = {a.var_name}.shape[2];",
-                                        f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
+                                        f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype={self.dtype})",
                                         f"for k in range(n_vec_comps):",
                                         f"    for d in range(n_spatial_dim):",
                                         f"        {res_var}[k] += {a.var_name}[k, :, d] * {b.var_name}[d]",
@@ -809,7 +810,7 @@ class NumbaCodeGen:
                             f"n_vec_comps   = {a.var_name}.shape[0];",
                             f"n_locs        = {a.var_name}.shape[1];",
                             f"n_spatial_dim = {a.var_name}.shape[2];",
-                            f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
+                            f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype={self.dtype})",
                             f"for k in range(n_vec_comps):",
                             f"    for d in range(n_spatial_dim):",
                             f"        {res_var}[k] += {a.var_name}[k, :, d] * {b.var_name}[d]",
@@ -823,7 +824,7 @@ class NumbaCodeGen:
                         body_lines.append("# Advection: dot(constant beta vector, grad(Trial))")
                         body_lines += [
                             f"n_vec_comps = {b.shape[0]}; n_locs = {b.shape[1]};n_spatial_dim = {b.shape[2]};",
-                            f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
+                            f"{res_var} = np.zeros((n_vec_comps, n_locs), dtype={self.dtype})",
                             f"for k in range(n_vec_comps):",
                             f"    for d in range(n_spatial_dim):",
                             f"        {res_var}[k] += {b.var_name}[k, :, d] * {a.var_name}[d]",
@@ -878,7 +879,7 @@ class NumbaCodeGen:
                     body_lines += [
                         f"n_vec_comps = {b.shape[0]};",
                         f"n_locs      = {b.shape[1]};",
-                        f"{res_var}   = np.zeros((n_vec_comps, n_locs), dtype=np.float64)",
+                        f"{res_var}   = np.zeros((n_vec_comps, n_locs), dtype={self.dtype})",
                         # einsum: f"{res_var} = np.einsum('d,kld->kl', {a.var_name}, {b.var_name})",
                         f"for k in range(n_vec_comps):",
                         f"    {res_var}[k] = {a.var_name} @ {b.var_name}[k].T.copy()",
@@ -914,7 +915,7 @@ class NumbaCodeGen:
                     body_lines.append("# dot(grad(trial), grad(value)) -> (k,n,k) tensor basis")
                     body_lines += [
                         f"n_vec_comps = {k}; n_locs = {n_locs};",
-                        f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype=np.float64)",
+                        f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype={self.dtype})",
                         f"b_mat = np.ascontiguousarray({b.var_name})",
                         f"for n in range(n_locs):",
                         f"    a_slice = np.ascontiguousarray({a.var_name}[:, n, :])",
@@ -940,7 +941,7 @@ class NumbaCodeGen:
                     body_lines.append("# dot(grad(value), grad(trial)) -> (k,n,k) tensor basis")
                     body_lines += [
                         f"n_vec_comps = {k}; n_locs = {n_locs};",
-                        f"{res_var} = np.zeros((n_vec_comps, n_locs, {d}), dtype=np.float64)",
+                        f"{res_var} = np.zeros((n_vec_comps, n_locs, {d}), dtype={self.dtype})",
                         f"a_contig = np.ascontiguousarray({a.var_name})",
                         f"for n in range(n_locs):",
                         f"    b_slice = np.ascontiguousarray({b.var_name}[:, n, :])",
@@ -1023,7 +1024,7 @@ class NumbaCodeGen:
                     body_lines += [
                         f"n_locs = {b.shape[1]}",
                         f"n_vec_comps = {a.shape[0]}",
-                        f"{res_var} = np.zeros(n_locs, dtype=np.float64)",
+                        f"{res_var} = np.zeros(n_locs, dtype={self.dtype})",
                         f"for n in range(n_locs):",
                         f"    local_sum = 0.0",
                         f"    for k in range(n_vec_comps):",
@@ -1041,7 +1042,7 @@ class NumbaCodeGen:
                         body_lines.append("# LHS: dot(Function, Test) (k,n)·(k) -> (1,n)")
                         shape = (1, b.shape[1])
                         role = 'test'
-                        body_lines += [f"{res_var} = np.zeros((1,{b.shape[1]}), dtype=np.float64)",
+                        body_lines += [f"{res_var} = np.zeros((1,{b.shape[1]}), dtype={self.dtype})",
                                         f"for n in range({b.shape[1]}):",
                                         f"    {res_var}[0, n] = np.sum({a.var_name}[:, n] * {b.var_name})"]
                     elif self.form_rank == 1:
@@ -1060,7 +1061,7 @@ class NumbaCodeGen:
                         body_lines.append("# LHS: dot(Test, Function) (k,n)·(k) -> (1,n)")
                         shape = (1, a.shape[1])
                         role = 'test'
-                        body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype=np.float64)",
+                        body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype={self.dtype})",
                                         f"for n in range({a.shape[1]}):",
                                         f"    {res_var}[0, n] = np.sum({a.var_name}[:, n] * {b.var_name})"]
                     elif self.form_rank == 1:
@@ -1078,7 +1079,7 @@ class NumbaCodeGen:
                         body_lines.append("# LHS: dot(Test, Const) (k,n)·(k) -> (1,n)")
                         shape = (1, a.shape[1])
                         role = 'test'
-                        body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype=np.float64)",
+                        body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype={self.dtype})",
                                         f"for n in range({a.shape[1]}):",
                                         f"    {res_var}[0, n] = np.sum({a.var_name}[:, n] * {b.var_name})"]
                         stack.append(StackItem(var_name=res_var, role=role,
@@ -1097,7 +1098,7 @@ class NumbaCodeGen:
                    body_lines.append("# LHS: dot(Trial, Const) (k,n)·(k) -> (1,n)")
                    shape = (1, a.shape[1])
                    role = 'trial'
-                   body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype=np.float64)",
+                   body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype={self.dtype})",
                                    f"for n in range({a.shape[1]}):",
                                    f"    {res_var}[0, n] = np.sum({a.var_name}[:, n] * {b.var_name})"]
                    stack.append(StackItem(var_name=res_var, role=role,
@@ -1173,7 +1174,7 @@ class NumbaCodeGen:
                 elif a.is_gradient and len(a.shape) == 3:
                     n_locs = a.shape[1]
                     body_lines += [
-                        f"{res} = np.zeros_like({a.var_name}, dtype={a.var_name}.dtype);",
+                        f"{res} = np.zeros_like({a.var_name}, dtype={self.dtype});",
                         f"for n in range({n_locs}):",
                         f"    {res}[:, n, :] = ({a.var_name}[:, n, :].T).copy();"
                     ]
@@ -1495,7 +1496,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = True
+            DEBUG: bool = False
         ):
         """
         Build complete kernel source code with parallel assembly.
@@ -1563,28 +1564,28 @@ def {kernel_name}(
     num_elements        = qp_phys.shape[0]
     # n_dofs_per_element  = {self.n_dofs_local}
     n_dofs_per_element  = gdofs_map.shape[1]            # 9 for volume, 15 on ghost edge
-    print(f"num_elements: {{num_elements}},n_dofs_per_element: {{n_dofs_per_element}}")
-    print(f"number of quadrature points: {{qw.shape[1]}}")
-    
-    K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
-    F_values = np.zeros((num_elements, n_dofs_per_element), dtype=np.float64)
+    # print(f"num_elements: {{num_elements}},n_dofs_per_element: {{n_dofs_per_element}}")
+    # print(f"number of quadrature points: {{qw.shape[1]}}")
+
+    K_values = np.zeros((num_elements, n_dofs_per_element, n_dofs_per_element), dtype={self.dtype})
+    F_values = np.zeros((num_elements, n_dofs_per_element), dtype={self.dtype})
     # Shape of the integrand that lands in “J”.
     # -------- functional accumulator ------------------------------------
     k = {functional_shape[0] if functional_shape else 0}
-    J_init = {'0.0' if not functional_shape else f'np.zeros((k,), dtype=np.float64)'}
+    J_init = {'0.0' if not functional_shape else f'np.zeros((k,), dtype={self.dtype})'}
     J     = J_init
-    J_values = np.zeros(({ 'num_elements' if not functional_shape else f'(num_elements, k)' }), dtype=np.float64)
+    J_values = np.zeros(({ 'num_elements' if not functional_shape else f'(num_elements, k)' }), dtype={self.dtype})
 
     for e in numba.prange(num_elements):
-        Ke = np.zeros((n_dofs_per_element, n_dofs_per_element), dtype=np.float64)
-        Fe = np.zeros(n_dofs_per_element, dtype=np.float64)
+        Ke = np.zeros((n_dofs_per_element, n_dofs_per_element), dtype={self.dtype})
+        Fe = np.zeros(n_dofs_per_element, dtype={self.dtype})
         J  = J_init.copy() if {bool(functional_shape)} else J_init
 
 {coeffs_unpack_block}
 
         for q in range(qw.shape[1]):
             x_q, w_q, J_inv_q = qp_phys[e, q], qw[e, q], J_inv[e, q]
-            normal_q = normals[e, q] if normals is not None else np.zeros(2)
+            normal_q = normals[e, q] if normals is not None else np.zeros(2, dtype={self.dtype})
             phi_q    = phis[e, q] if phis is not None else 0.0
 {basis_unpack_block}
 {body_code_block}

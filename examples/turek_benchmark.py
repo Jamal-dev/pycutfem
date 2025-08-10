@@ -64,11 +64,12 @@ print(f"Reynolds number (Re): {Re:.2f}")
 # In[3]:
 
 
-from pycutfem.utils.adaptive_mesh import structured_quad_levelset_adaptive
+# from pycutfem.utils.adaptive_mesh import structured_quad_levelset_adaptive
+from pycutfem.utils.adaptive_mesh_ls_numba import structured_quad_levelset_adaptive
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-# NX, NY = 20, 20
-NX, NY = 50, 60
+NX, NY = 40, 40
+# NX, NY = 30, 40
 poly_order = 2
 level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
 # h  = 0.5*(L/NX + H/NY)
@@ -148,13 +149,36 @@ print(f"Number of ghost edges (both): {mesh.edge_bitset('ghost_both').cardinalit
 # In[5]:
 
 
-dof_handler.tag_dof_by_locator(
-    'p_pin', 'p',
-    locator=lambda x, y: (x < 0.05 * L) and np.isclose(y, 0.5 * H),
-    find_first=True
-)
-bcs.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x, y: 0.0))
-bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x, y: 0.0))
+# 1. Define the target point.
+target_point = np.array([1.5, 0.99 * H])
+
+# 2. Get all node IDs that have a pressure DOF associated with them.
+p_dofs = dof_handler.get_field_slice('p')
+p_node_ids = np.array([dof_handler._dof_to_node_map[dof][1] for dof in p_dofs])
+
+# 3. Get the coordinates of ONLY these pressure-carrying nodes.
+p_node_coords = mesh.nodes_x_y_pos[p_node_ids]
+
+# 4. Find the node closest to the target point WITHIN this restricted set.
+distances = np.linalg.norm(p_node_coords - target_point, axis=1)
+local_index = np.argmin(distances)
+
+# 5. Get the global ID and actual coordinates of that specific pressure node.
+closest_p_node_id = p_node_ids[local_index]
+actual_pin_coords = mesh.nodes_x_y_pos[closest_p_node_id]
+print(f"Pinning pressure at the node closest to {target_point}, found at {actual_pin_coords}")
+
+
+# In[6]:
+
+
+# dof_handler.tag_dof_by_locator(
+#     'p_pin', 'p',
+#     locator=lambda x, y: np.isclose(x, actual_pin_coords[0]) and np.isclose(y, actual_pin_coords[1]),
+#     find_first=True
+# )
+# bcs.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x, y: 0.0))
+# bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x, y: 0.0))
 # Tag velocity DOFs inside the cylinder (same tag name for both fields is OK)
 dof_handler.tag_dofs_from_element_bitset("inactive", "ux", "inside", strict=True)
 dof_handler.tag_dofs_from_element_bitset("inactive", "uy", "inside", strict=True)
@@ -168,7 +192,7 @@ bcs_homog.append(BoundaryCondition('uy', 'dirichlet', 'inactive', lambda x, y: 0
 bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'inactive', lambda x, y: 0.0))
 
 
-# In[6]:
+# In[7]:
 
 
 for name, bitset in mesh._edge_bitsets.items():
@@ -181,7 +205,7 @@ for name, bitset in mesh._edge_bitsets.items():
 
 
 
-# In[7]:
+# In[8]:
 
 
 from pycutfem.io.visualization import plot_mesh_2
@@ -190,7 +214,7 @@ plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True,
               plot_nodes=False, elem_tags=False, edge_colors=True, plot_interface=False,resolution=300)
 
 
-# In[8]:
+# In[9]:
 
 
 # ============================================================================
@@ -215,8 +239,8 @@ u_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handl
 p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler)
 
 # --- Parameters ---
-dt = Constant(0.25)
-theta = Constant(0.5) # Crank-Nicolson
+dt = Constant(0.02)
+theta = Constant(1.0) # Crank-Nicolson
 mu_const = Constant(mu)
 rho_const = Constant(rho)
 
@@ -225,22 +249,16 @@ u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
 dof_handler.apply_bcs(bcs, u_n, p_n)
 
 
-# In[9]:
+# In[10]:
 
 
 u_n.plot()
 
 
-# In[10]:
-
-
-print(len(dof_handler.get_dirichlet_data(bcs)))
-
-
 # In[11]:
 
 
-len(dof_handler.get_dirichlet_data(bcs))
+print(len(dof_handler.get_dirichlet_data(bcs)))
 
 
 # In[12]:
@@ -406,7 +424,6 @@ def make_peak_filter_cb(
 # In[13]:
 
 
-from matplotlib import scale
 from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict
 from pycutfem.core.geometry import hansbo_cut_ratio
 from pycutfem.ufl.expressions import ElementWiseConstant
@@ -430,13 +447,29 @@ def grad_inner(u, v):
         return _dn(u[0]) * _dn(v[0]) + _dn(u[1]) * _dn(v[1])
 
     raise ValueError("grad_inner supports only scalars or 2‑D vectors.")
+
+def hessian_inner(u, v):
+    if getattr(u, "num_components", 1) == 1:      # scalar
+        return _hess_comp(u, v)
+
+    # vector: sum component-wise
+    return sum(_hess_comp(u[i], v[i]) for i in range(u.num_components))
+
+
+def _hess_comp(a, b):
+    return (Derivative(a,2,0)*Derivative(b,2,0) +
+            2*Derivative(a,1,1)*Derivative(b,1,1) +
+            Derivative(a,0,2)*Derivative(b,0,2))
+
+
+
 ghost_edges_used = mesh.edge_bitset('ghost_pos') | mesh.edge_bitset('ghost_both') | mesh.edge_bitset('interface')
 dx_phys  = dx(defined_on=physical_domain, 
               level_set=level_set,            # the cylinder level set
-              metadata   = {"q": 7, "side": "+"} # integrate only φ>0 (positive side)
+              metadata   = {"q": 5, "side": "+"} # integrate only φ>0 (positive side)
     )
-dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":9})   # interior surface
-dG       = dGhost(defined_on=ghost_edges_used, level_set=level_set,metadata={"q":6,'derivs': {(0,1),(1,0)}})  # ghost surface
+dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":5})   # interior surface
+dG       = dGhost(defined_on=ghost_edges_used, level_set=level_set,metadata={"q":5,'derivs': {(0,0),(0,1),(1,0),(2,0),(0,2),(1,1)}})  # ghost surface
 
 cell_h  = CellDiameter() # length‑scale per element
 beta_N  = Constant(20.0 * poly_order**2)      # Nitsche penalty (tweak)
@@ -460,18 +493,7 @@ def epsilon(u):
     "Symmetric gradient."
     return 0.5 * (grad(u) + grad(u).T)
 
-# def sigma_dot_n(u_vec, p_scal):
-#     """
-#     Expanded form of (σ(u, p) · n) without using the '@' operator.
 
-#         σ(u, p)·n = μ (∇u + ∇uᵀ)·n  −  p n
-#     """
-#     # first term: μ (∇u)·n
-#     a = dot(grad(u_vec), n)
-#     # second term: μ (∇uᵀ)·n
-#     b = dot(grad(u_vec).T, n)
-#     # combine and subtract pressure part
-#     return mu * (a + b) - p_scal * n         # vector of size 2
 
 def sigma_dot_n_v(u_vec, p_scal,v_test,n):
     """
@@ -533,22 +555,26 @@ r_vol = ( rho*dot(u_k-u_n, v)/dt
           - p_k*div(v) + q*div(u_k) ) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
-penalty_val = 0.1
-penalty_grad = 0.1
+penalty_val = 1e-3
+penalty_grad = 1e-3
+penalty_hess = 1e-3
 gamma_v = Constant(penalty_val * poly_order**2)
 gamma_v_grad= Constant(penalty_grad * poly_order**2)
 gamma_p  = Constant(penalty_val * poly_order**1)
 gamma_p_grad = Constant(penalty_grad * poly_order**1)
+gamma_v_hess = Constant(penalty_hess * poly_order**2)
 
 stab = ( gamma_v  / cell_h   * dot(jump(u_k), jump(v))
        + gamma_v_grad * cell_h   * grad_inner(jump(u_k), jump(v))
-       + gamma_p  / cell_h   * jump(p_k) * jump(q)  # Note: use * for scalars, see issue 2
-       + gamma_p_grad * cell_h   * grad_inner(jump(p_k), jump(q)) ) * dG
+         + gamma_v_hess * cell_h**3.0/4.0   * hessian_inner(jump(u_k), jump(v))
+    #    + gamma_p  / cell_h   * jump(p_k) * jump(q)  # Note: use * for scalars, see issue 2
+       + gamma_p_grad * cell_h**3.0   * grad_inner(jump(p_k), jump(q)) ) * dG
 
-stab_lin  = (( gamma_v  / cell_h   * dot(jump(du),  jump(v)) +
-             gamma_v_grad * cell_h   * grad_inner(jump(du),  jump(v))) 
-           + ( gamma_p  / cell_h   * jump(dp) *  jump(q)
-            + gamma_p_grad * cell_h   * grad_inner(jump(dp),  jump(q)))  ) * dG
+stab_lin  = ( gamma_v  / cell_h   * dot(jump(du),  jump(v)) +
+             gamma_v_grad * cell_h   * grad_inner(jump(du),  jump(v)) 
+           + gamma_v_hess * cell_h**3.0/4.0   * hessian_inner(jump(du), jump(v))
+        #    +  gamma_p  / cell_h   * jump(dp) *  jump(q)
+            + gamma_p_grad * cell_h**3.0   * grad_inner(jump(dp),  jump(q)))   * dG
 # complete Jacobian and residual -----------------------------------
 jacobian_form  = a_vol + J_int + stab_lin
 residual_form  = r_vol + R_int + stab
@@ -569,6 +595,12 @@ residual_form  = r_vol + R_int + stab
 
 
 # In[15]:
+
+
+get_ipython().system('rm -rf ~/.cache/pycutfem_jit/*')
+
+
+# In[16]:
 
 
 from pycutfem.io.vtk import export_vtk
@@ -627,10 +659,10 @@ def save_solution(funcs):
     drag_hook = {I_drag.integrand: {"name": "FD"}}
     lift_hook = {I_lift.integrand: {"name": "FL"}}
 
-    res_Fd = assemble_form(I_drag == Constant(0.0) * dx, 
+    res_Fd = assemble_form(I_drag == None, 
                            dof_handler=dof_handler, bcs=[],
                            assembler_hooks=drag_hook, backend="python")
-    res_Fl = assemble_form(I_lift == Constant(0.0) * dx, 
+    res_Fl = assemble_form(I_lift == None, 
                            dof_handler=dof_handler, bcs=[],
                            assembler_hooks=lift_hook, backend="python")
 
@@ -643,61 +675,75 @@ def save_solution(funcs):
     C_L = coeff * F_L
 
     # ------------------ Pressure difference Δp = p(A) - p(B) ----------------
-    # ------------------ Pressure difference Δp = p(A) - p(B) ----------------
-    def eval_scalar_at_point(f_scalar, x, y):
+    def evaluate_field_at_point(
+        dof_handler,      # The DofHandler object
+        mesh,             # The Mesh object
+        f_scalar,         # The Function object to evaluate (e.g., p_k)
+        point             # The (x, y) coordinate tuple
+    ):
         """
-        Robustly evaluates a scalar field at a point (x,y),
-        ensuring the point is in the physical domain.
+        Robustly evaluates a scalar field at a point by finding the containing
+        element and performing a basis function summation.
+
+        This approach is adapted from the library's internal error calculation
+        methods and is more reliable than relying on inverse mapping alone.
         """
-        xy = np.array([x, y])
+        x, y = point
+        xy = np.asarray(point)
 
-        # 1. First, check if the point is in the physical domain.
-        if level_set(xy) < 0:
-            print(f"Warning: Point ({x},{y}) is in the fictitious domain (phi < 0). Returning NaN.")
-            return np.nan
-
-        # 2. Find the element that contains the point.
+        # 1. Find the element that contains the point.
         eid_found = None
         for e in mesh.elements_list:
-            # Skip elements that are fully inside the cylinder
-            if getattr(e, "tag", None) == "inside":
-                continue
-
-            # Check if the point is geometrically within the element's bounding box first for efficiency
-            v_coords = mesh.nodes_x_y_pos[list(e.corner_nodes)]
+            # Bounding box check using ALL nodes (correct for high-order elements)
+            all_node_ids = e.nodes
+            v_coords = mesh.nodes_x_y_pos[list(all_node_ids)]
             if not (v_coords[:, 0].min() <= x <= v_coords[:, 0].max() and \
                     v_coords[:, 1].min() <= y <= v_coords[:, 1].max()):
                 continue
 
-            # Perform precise inverse mapping
+            # Perform precise inverse mapping to confirm the point is inside
             try:
+                # This can still fail if the point is right on an edge, hence the loop
                 xi, eta = transform.inverse_mapping(mesh, e.id, xy)
-                if -1e-9 <= xi <= 1 + 1e-9 and -1e-9 <= eta <= 1 + 1e-9:
+                # Check if inside the reference element [-1, 1] x [-1, 1] with tolerance
+                if -1.00001 <= xi <= 1.00001 and -1.00001 <= eta <= 1.00001:
                     eid_found = e.id
                     break
             except (np.linalg.LinAlgError, ValueError):
-                continue # Point is outside this element.
+                continue # Inverse mapping failed, point is likely outside.
 
         if eid_found is None:
-            # print(f"Warning: Point ({x},{y}) could not be located in any physical element. Returning NaN.")
+            print(f"Warning: Point ({x},{y}) could not be located in any element.")
             return np.nan
 
-        # 3. Evaluate the field using basis functions at the found reference coords.
-        phi = mixed_element.basis(f_scalar.field_name, xi, eta)
-        gdofs = dof_handler.get_elemental_dofs(eid_found)
+        # 2. Perform the evaluation using the library's robust internal logic.
+        # This logic is adapted from the DofHandler.l2_error_on_side method.
+        me = dof_handler.mixed_element
+        field_name = f_scalar.field_name
+
+        # Get the local basis functions for the specific field (e.g., 'p' is Q1)
+        # The slice ensures we only get the relevant part of the mixed basis vector
+        phi = me.basis(field_name, xi, eta)[me.slice(field_name)]
+
+        # Get the element's specific DOFs for this field
+        gdofs = dof_handler.element_maps[field_name][eid_found]
+
+        # Get the corresponding nodal values (coefficients) from the function object
         vals = f_scalar.get_nodal_values(gdofs)
+
+        # Return the dot product, which is the interpolated value
         return float(phi @ vals)
 
     # Evaluate pressure slightly away from the cylinder boundary for stability.
     # Cylinder is at (0.2, 0.2) with radius 0.05.
-    pA = eval_scalar_at_point(p_k_func, c_x - D/2 - 0.01, c_y) # Front point
-    pB = eval_scalar_at_point(p_k_func, c_x + D/2 + 0.01, c_y) # Rear point
+    pA = evaluate_field_at_point(dof_handler, mesh, p_k_func, (c_x - D/2 - 0.01, c_y))
+    pB = evaluate_field_at_point(dof_handler, mesh, p_k_func, (c_x + D/2 + 0.01, c_y))
     dp = pA - pB
 
     # ------------------ Log / store ----------------------------------------
     print(f"[step {step_counter:4d}]  FD={F_D:.6e}  FL={F_L:.6e}  "
           f"CD={C_D:.6f}  CL={C_L:.6f}  Δp={dp:.6f}")
-    if step_counter % 5 == 0:
+    if step_counter % 2 == 0:
         u_k_func.plot(field = 'ux',
                       title=f"Velocity Ux at step {step_counter}",
                       xlabel='X-Axis', ylabel='Y-Axis',
@@ -714,7 +760,7 @@ def save_solution(funcs):
 
 
 
-# In[16]:
+# In[ ]:
 
 
 from pycutfem.solvers.nonlinear_solver import (NewtonSolver, 
@@ -737,37 +783,87 @@ post_cb = make_peak_filter_cb(
     skip_dofs=dirichlet_dofs
 )
 
-# solver = NewtonSolver(
-#     residual_form, jacobian_form,
-#     dof_handler=dof_handler,
-#     mixed_element=mixed_element,
-#     bcs=bcs, bcs_homog=bcs_homog,
-#     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
-#     postproc_timeloop_cb=save_solution,
-#     # preproc_cb=post_cb,  # Optional: peak filter callback
-# )
-solver = PetscSnesNewtonSolver(
+solver = NewtonSolver(
     residual_form, jacobian_form,
     dof_handler=dof_handler,
     mixed_element=mixed_element,
     bcs=bcs, bcs_homog=bcs_homog,
-    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True,
-                                   max_newton_iter=500),
+    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
     postproc_timeloop_cb=save_solution,
-    petsc_options={
-        "snes_type": "vinewtonrsls",     # VI Newton (Reduced-Space)
-        "snes_vi_monitor": None,         # optional: see active set info
-        "snes_linesearch_type": "bt",    # OK with VI
-        "ksp_type": "preonly",
-        "pc_type": "lu",
-        "pc_factor_mat_solver_type": "mumps",
-        "snes_converged_reason": None,
-    },)
-solver.set_box_bounds(by_field={
-    "ux": (-2.0, 2.0),
-    "uy": (-2.0, 2.0),
-    "p":  (None,  None),   # p ≥ 0
-})
+    # preproc_cb=post_cb,  # Optional: peak filter callback
+)
+# Unconstrained Newton (fast, robust)
+# solver = PetscSnesNewtonSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler,
+#     mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6, line_search=False, max_newton_iter=60), # Line search handled by PETSc
+#     postproc_timeloop_cb=save_solution,
+#     petsc_options={
+#         # --- SNES (Nonlinear Solver) Options ---
+#         "snes_type": "newtonls",
+#         "snes_linesearch_type": "bt",
+#         "snes_converged_reason": None,
+#         "snes_monitor": None,
+
+#         # --- KSP (Linear Solver) and PC (Preconditioner) Options ---
+#         "ksp_type": "gmres",  # A flexible iterative solver is best for fieldsplit
+#         "pc_type": "fieldsplit",
+#         "pc_fieldsplit_type": "schur",
+
+#         # Configure the Schur factorization
+#         # 'full' is most robust: S = C - B*inv(A)*B.T
+#         "pc_fieldsplit_schur_fact_type": "full",
+
+#         # --- Sub-solvers for the Velocity block (u) ---
+#         # We'll use a direct solver (MUMPS) for the momentum block inv(A)
+#         # This is often referred to as "ideal" Schur complement.
+#         "fieldsplit_u_ksp_type": "preonly",
+#         "fieldsplit_u_pc_type": "lu",
+#         "fieldsplit_u_pc_factor_mat_solver_type": "mumps",
+
+#         # --- Sub-solvers for the Pressure block (the Schur complement S) ---
+#         # The solve on S is often approximate. We use GMRES + a simple PC.
+#         "fieldsplit_p_ksp_type": "gmres",
+#         "fieldsplit_p_pc_type": "hypre",   # Use Hypre's BoomerAMG 
+#         "fieldsplit_p_ksp_rtol": 1e-5,
+#     },
+# )
+
+# 2. Define the field splitting for the Schur complement
+# This tells the solver how to partition the system.
+# solver.set_schur_fieldsplit(
+#     split_map={
+#         'u': ['ux', 'uy'],  # The 'A' block in the matrix
+#         'p': ['p'],         # The 'C' block (and where S operates)
+#     }
+# )
+
+# VI solver (semismooth; we’ll run it for only 1–2 iterations per step)
+# vi = PetscSnesNewtonSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler, mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+#     postproc_timeloop_cb=save_solution,
+#     petsc_options={
+#         "snes_type": "vinewtonssls",      # semismooth VI is robust near kinks
+#         "snes_linesearch_type": "bt",
+#         "snes_vi_monitor": None,          # optional: see active set
+#         "ksp_type": "preonly", "pc_type": "lu",
+#         "pc_factor_mat_solver_type": "mumps",
+#     },
+# )
+# # Cap |u| only in a narrow band around the interface on φ>=0 (fluid) side
+# Ucap = 4.0 * U_mean        # pick something physically reasonable
+# vi.set_vi_on_interface_band(
+#     level_set,
+#     fields=("ux", "uy"),
+#     side="+",
+#     band_width=0.5,               # ~ one h around interface
+#     bounds_by_field={"ux": (-Ucap, Ucap), "uy": (-Ucap, Ucap)},
+# )
 # primary unknowns
 functions      = [u_k, p_k]
 prev_functions = [u_n, p_n]
@@ -785,15 +881,47 @@ prev_functions = [u_n, p_n]
 #     bcs=bcs, bcs_homog=bcs_homog,
 #     newton_params=NewtonParameters(newton_tol=1e-6),
 # )
+from petsc4py import PETSc
+def vi_clip(step, bcs_now, funs, prev_funs):
+    if step < 1:
+        return
+
+    vi._ensure_snes(len(vi.active_dofs), PETSc.COMM_WORLD)
+
+    # ---- project current state into the box and write back to fields ----
+    # assemble the reduced current guess from the fields
+    x0_full = np.hstack([f.nodal_values for f in funs]).copy()
+    x0_red  = x0_full[vi.active_dofs].copy()
+
+    if getattr(vi, "_XL", None) is not None and getattr(vi, "_XU", None) is not None:
+        lo = vi._XL.getArray(readonly=True)
+        hi = vi._XU.getArray(readonly=True)
+        x0_red = np.minimum(np.maximum(x0_red, lo), hi)
+
+        # write the projected state back to the fields (absolute assign)
+        new_full = x0_full
+        new_full[vi.active_dofs] = x0_red
+        for f in funs:
+            g = f._g_dofs
+            f.set_nodal_values(g, new_full[g])
+        vi.dh.apply_bcs(bcs_now, *funs)
+
+    # ---- short VI solve (1–2 steps is usually enough) ----
+    old = vi._snes.getTolerances()
+    vi._snes.setTolerances(rtol=0.0, atol=vi.np.newton_tol, max_it=2)
+    _ = vi._newton_loop(funs, prev_funs, aux_funcs=None, bcs_now=bcs_now)
+    vi._snes.setTolerances(*old)
 
 
 
 solver.solve_time_interval(functions=functions,
                            prev_functions= prev_functions,
-                           time_params=time_params,)
+                           time_params=time_params,
+                           # post_step_refiner=vi_clip
+                           )
 
 
-# In[17]:
+# In[ ]:
 
 
 plt.plot(histories["cd"], label="C_D", marker='o')
@@ -806,7 +934,7 @@ plt.plot(histories["dp"], label="Δp", marker='o')
 plt.ylabel('Δp')
 
 
-# In[18]:
+# In[ ]:
 
 
 u_n.plot(kind="contour",mask =fluid_domain,
@@ -815,7 +943,7 @@ u_n.plot(kind="contour",mask =fluid_domain,
          levels=100, cmap='jet')
 
 
-# In[19]:
+# In[ ]:
 
 
 p_n.plot(
