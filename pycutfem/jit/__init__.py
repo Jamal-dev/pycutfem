@@ -294,6 +294,9 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     "J_inv":   geom_all["J_inv"][full_ids],
                     "normals": geom_all["normals"][full_ids],
                     "phis":    None if geom_all["phis"] is None else geom_all["phis"][full_ids],
+                    "h_arr":     geom_all["h_arr"][full_ids],
+                    "owner_id":  geom_all.get("owner_id", geom_all["eids"])[full_ids].astype(np.int32),
+                    "entity_kind": "element",
                 }
                 gdofs_map_full = np.vstack([
                     dof_handler.get_elemental_dofs(e) for e in full_ids

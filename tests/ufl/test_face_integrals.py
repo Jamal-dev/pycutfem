@@ -6,7 +6,7 @@ from pycutfem.ufl.measures    import dInterface, dx, dGhost
 from pycutfem.ufl.expressions import (Constant, Pos, Neg, Jump, FacetNormal,grad, 
                                       Function, dot, inner, VectorFunction, VectorTrialFunction ,
                                       TestFunction, VectorTestFunction, TrialFunction)
-from pycutfem.ufl.forms           import assemble_form
+from pycutfem.ufl.forms           import assemble_form, Equation
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.ufl.functionspace import FunctionSpace
 from numpy.testing import assert_allclose # Add this import at the top
@@ -108,7 +108,7 @@ def test_jump_scalar(mesh:Mesh, dof_handler:DofHandler, bcs:list[BoundaryConditi
     # u_pos = Pos(Constant(lambda x,y: x))   # evaluate via lambda inside visitor
     # u_neg = Neg(Constant(lambda x,y: 2*x))
     form = jump * dInterface(level_set=phi,metadata={"q":3})  # dInterface is a measure for the interface
-    eq    = form == Constant(0.0) * dx
+    eq    = Equation(form, None)  # No RHS, just the integral form
 
 
     res = assemble_form(eq, dof_handler=dof_handler, bcs=[],
@@ -144,7 +144,7 @@ def test_jump_grad_scalar_manual(mesh:Mesh, dof_handler:DofHandler, bcs:list[Bou
     w = TrialFunction('u', dof_handler=dof_handler)
     lhs_form = w * v * dx
 
-    eq  = lhs_form == rhs_form
+    eq  = Equation(lhs_form, rhs_form)
     K, F = assemble_form(eq, dof_handler=dof_handler, bcs=bcs)
 
     u_sol = np.linalg.solve(K.toarray(), F)
@@ -181,7 +181,8 @@ def test_jump_grad_scalar_two_fields(mesh: Mesh, dof_handler: DofHandler, bcs: l
     rhs = dot(grad(u_pos_func) - grad(u_neg_func), n) * v * dInterface(level_set=phi)
 
     # --- Assembly and Assertion ---
-    eq = w *v * dx == rhs
+    lhs = w *v * dx
+    eq = Equation(lhs, rhs)
     # hook = {type(rhs.integrand): {'name': 'gj'}}
     LHS,RHS = assemble_form(eq, dof_handler=dof_handler, bcs=[], assembler_hooks=None)
     res = np.linalg.solve(LHS.toarray(), RHS)
@@ -208,8 +209,8 @@ def test_jump_vector_norm(mesh:Mesh, dof_handler:DofHandler, bcs:list[BoundaryCo
     form_lhs = dot(jump_v, n) * dInterface(level_set=phi)
     
     # CORRECTED: RHS must be a valid integral form
-    form_rhs = Constant(0.0) * dx
-    eq = form_lhs ==  form_rhs
+    form_rhs = None
+    eq = Equation(form_lhs, form_rhs)  # No RHS, just the integral form
 
     res = assemble_form(eq, dof_handler, bcs=[],
                         assembler_hooks={type(form_lhs.integrand): {'name': 'jv'}})
@@ -258,7 +259,7 @@ def test_jump_grad_vector(mesh:Mesh):
 
     # form = dot(jump_grad_v,n) * dInterface(level_set=phi)
     form = Jump(grad_v_pos_n,grad_v_neg_n) * dInterface(level_set=phi)
-    eq   = form == None
+    eq   = Equation(form, None)
     res  = assemble_form(eq, dof_handler=dof_handler, bcs=[],
                          assembler_hooks={type(form.integrand):{'name':'jv'}})
     exact = reference_solution_vector()
@@ -271,7 +272,7 @@ def assemble_scalar(form, dof_handler):
     # This is a placeholder for the actual assembly logic
     # In practice, this would involve creating an assembler and calling its methods
     hook = {type(form.integrand): {'name': 'scalar'}}
-    res = assemble_form(Constant(0.0)*dx==form, dof_handler=dof_handler, bcs=[], backend="jit", assembler_hooks=hook)
+    res = assemble_form(Equation(None, form), dof_handler=dof_handler, bcs=[], backend="jit", assembler_hooks=hook)
     return res["scalar"]
 
 
@@ -341,9 +342,9 @@ def test_ghost_normal_sign_with_gradphi():
     ls  = AffineLevelSet(1.0, 0.0, -1.0)
     mesh.classify_elements(ls); mesh.classify_edges(ls); mesh.build_interface_segments(ls)
     print(f"Ghost edges: {mesh.edge_bitset('ghost').cardinality()}")
-    fig, ax = plt.subplots(figsize=(10, 8))
-    plot_mesh_2(mesh, ax=ax, level_set=ls, show=True, 
-              plot_nodes=False, elem_tags=True, edge_colors=True)
+    # fig, ax = plt.subplots(figsize=(10, 8))
+    # plot_mesh_2(mesh, ax=ax, level_set=ls, show=True, 
+    #           plot_nodes=False, elem_tags=True, edge_colors=True)
 
     me  = MixedElement(mesh, field_specs={"vx":1, "vy":1})
     dh  = DofHandler(me, method='cg')
@@ -354,6 +355,7 @@ def test_ghost_normal_sign_with_gradphi():
     val = assemble_scalar( n[0] * dG, dh)        # = ∫_G n_G·(1,0) dG
     Lup = total_ghost_length(mesh)               # upper bound using mesh geometry
 
+    print(f"Computed ghost integral value: {val}, expected length: {Lup}")
     assert val > 0.0
     assert val <= Lup * (1.0 + 1e-3)
 

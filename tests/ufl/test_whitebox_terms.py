@@ -7,7 +7,7 @@ from pycutfem.ufl.expressions import (
     grad, inner, dot, Constant, TrialFunction, TestFunction, Derivative
 )
 from pycutfem.ufl.measures import dx
-from pycutfem.ufl.forms import BoundaryCondition, assemble_form
+from pycutfem.ufl.forms import BoundaryCondition, assemble_form, Equation
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
@@ -46,9 +46,9 @@ def test_rhs_vector_diffusion():
     np.random.seed(0)
     u_k.nodal_values[:] = np.random.rand(dof_handler.total_dofs)
 
-    equation = dot(Constant([0.0,0.0],dim=1) , v) * dx() == inner(grad(u_k), grad(v)) * dx(metadata={'q': 4})
-    
-    _, R = assemble_form(equation, dof_handler=dof_handler, bcs=[])
+    rhs =  inner(grad(u_k), grad(v)) * dx(metadata={'q': 4})
+
+    _, R = assemble_form(Equation(None, rhs), dof_handler=dof_handler, bcs=[])
     compiler_vector = R
 
     ref_q2 = get_reference("quad", poly_order=2)
@@ -106,9 +106,9 @@ def test_rhs_mass_matrix():
     np.random.seed(123)
     u_k.nodal_values[:] = np.random.rand(dof_handler.total_dofs)
 
-    equation = dot(Constant([0.0,0.0],dim=1), v) * dx() == dot(u_k, v) * dx()
-    
-    _, R = assemble_form(equation, dof_handler=dof_handler, bcs=[])
+    rhs = dot(u_k, v) * dx()
+
+    _, R = assemble_form(Equation(None, rhs), dof_handler=dof_handler, bcs=[])
     compiler_vector = R
 
     ref_q2 = get_reference("quad", poly_order=2)
@@ -169,9 +169,9 @@ def test_vector_mass_matrix_q1():
 
     u = VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy']))
     v = VectorTestFunction(FunctionSpace("velocity", ['ux', 'uy']))
-    equation = (dot(u, v) * dx() == dot(Constant([0.0,0.0],dim=1) , v) * dx())
+    lhs = dot(u, v) * dx() 
 
-    A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])
+    A, _ = assemble_form(Equation(lhs,None), dof_handler=dof_handler, bcs=[])
     compiler_matrix = A.toarray()
 
     scalar_mass_block = get_exact_q1_mass_matrix()
@@ -208,8 +208,8 @@ def test_vector_mass_matrix_q2():
     mesh, dof_handler = setup_single_q2_element()
     u = VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy']))
     v = VectorTestFunction(FunctionSpace("velocity", ['ux', 'uy']))
-    equation = (dot(u, v) * dx() == dot(Constant([0.0,0.0],dim=1) , v) * dx())
-    A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])
+    lhs = dot(u, v) * dx() 
+    A, _ = assemble_form(Equation(lhs, None), dof_handler=dof_handler, bcs=[])
     compiler_matrix = A.toarray()
 
     scalar_mass_block = get_exact_q2_mass_matrix()
@@ -241,9 +241,9 @@ def test_lhs_advection_q2():
 
     
     # The RHS can be a simple zero vector for this LHS test.
-    equation = dot(dot(u_k,grad(u)),v) * dx() == dot(Constant([0.0,0.0],dim=1), v) * dx()
-    
-    A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])
+    lhs = dot(dot(u_k,grad(u)),v) * dx()
+
+    A, _ = assemble_form(Equation(lhs, None), dof_handler=dof_handler, bcs=[])
     compiler_matrix = A.toarray()
     
     # The manual calculation below is already correct for this term.
@@ -313,9 +313,9 @@ def test_mixed_pressure_grad_operator():
     p = TrialFunction('p')
 
     # CORRECTED UFL FORM: This is the standard pressure term in Stokes flow.
-    equation = (-p * div(v)) * dx() == Constant(0.0) * dx()
+    lhs = (-p * div(v)) * dx()
 
-    A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])
+    A, _ = assemble_form(Equation(lhs,None), dof_handler=dof_handler, bcs=[])
     compiler_matrix = A.toarray()
 
     ref_q2 = get_reference("quad", poly_order=2)
@@ -362,10 +362,10 @@ def test_mixed_velocity_divergence_operator():
     dof_handler, mesh = setup_mixed_q2_q1_element()
     u = VectorTrialFunction(FunctionSpace("velocity", ['ux', 'uy']))
     q = TestFunction('p')
-    
-    equation = -(div(u) * q) * dx() == Constant(0.0)  * dx()
-    
-    A, _ = assemble_form(equation, dof_handler=dof_handler, bcs=[])
+
+    lhs = -(div(u) * q) * dx()
+
+    A, _ = assemble_form(Equation(lhs, None), dof_handler=dof_handler, bcs=[])
     compiler_matrix = A.toarray()
     
     ref_q2 = get_reference("quad", poly_order=2)

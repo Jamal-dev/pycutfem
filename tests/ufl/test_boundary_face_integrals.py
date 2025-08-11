@@ -10,7 +10,7 @@ from pycutfem.ufl.expressions  import inner, FacetNormal, dot
 from pycutfem.ufl.analytic     import Analytic
 from pycutfem.ufl.analytic     import y as y_ana
 from pycutfem.ufl.functionspace import FunctionSpace
-from pycutfem.ufl.forms        import assemble_form, BoundaryCondition
+from pycutfem.ufl.forms        import assemble_form, BoundaryCondition,Equation
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.core.dofhandler  import DofHandler
 
@@ -59,7 +59,7 @@ def mesh_vec_and_dh():
 def test_y_moment_right_edge(mesh_and_dh,backend):
     mesh, dh = mesh_and_dh
     form = Analytic(y_ana) * dS(mesh.edge_bitset("right_wall"))
-    res  = assemble_form(form == Constant(0.0) * dx,
+    res  = assemble_form(Equation(form, None),
                          dof_handler=dh, assembler_hooks={type(form.integrand):{"name":"m"}}, backend=backend)
     assert_allclose(res["m"], 0.5*L**2, rtol=1e-13)
 
@@ -70,7 +70,7 @@ def test_len_right_edge_function(mesh_and_dh):
     u.set_values_from_function(lambda x,y: 2.0*y)
     form       = u * dS(mesh.edge_bitset("right_wall"))
     exact      = L**2        # ∫_0^L   2y dy  = L²
-    res        = assemble_form(form == Constant(0.0)*dx,
+    res        = assemble_form(Equation(form, None),
                                dof_handler=dh,
                                assembler_hooks={type(form.integrand): {'name':'len_f'}},
                                backend="jit")
@@ -88,7 +88,7 @@ def test_len_vectorfun(mesh_vec_and_dh,backend):
     dot_c = dot(v, n)
     form = dot_c * dS(mesh.edge_bitset("right_wall"),metadata={"q":3})
     # rhs = dot(Constant(np.asarray([0.0, 0.0]), dim=1) , v_test) * dx
-    res  = assemble_form(form == Constant(0.0) * dx, dh,
+    res  = assemble_form(Equation(form, None), dh,
             assembler_hooks={dot_c:{"name":"flux"}},
             backend=backend)
     assert_allclose(res["flux"], 0.5*L**2, rtol=1e-13)
@@ -98,8 +98,9 @@ def test_bilinear(mesh_and_dh, backend):
     mesh, dh   = mesh_and_dh
     u = TrialFunction("u", dof_handler=dh)
     v = TestFunction ("u", dof_handler=dh)
-    _   = assemble_form(inner(u, v) * dS(mesh.edge_bitset("right_wall"))
-                        == Constant(0.0)*dx,
+    form = inner(u, v) * dS(mesh.edge_bitset("right_wall"))
+    _   = assemble_form(
+                        Equation(form, None),
                         dh, backend=backend)  # just needs to run
     
 @pytest.mark.parametrize("backend", ["python","jit"])
@@ -108,6 +109,6 @@ def test_len_boundary_right_edge(mesh_and_dh,backend):
     c_1 = Constant(1.0)
     form = c_1 * dS(mesh.edge_bitset("right_wall"),metadata={"q":3})
     v = TestFunction ("u", dof_handler=dh)
-    res  = assemble_form(form == Constant(0.0) * dx,
+    res  = assemble_form(Equation(None, form),
                          dof_handler=dh, assembler_hooks={c_1:{"name":"len"}}, backend=backend)
     assert_allclose(res["len"], L, rtol=1e-13)

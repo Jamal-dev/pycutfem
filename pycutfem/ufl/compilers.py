@@ -13,6 +13,7 @@ import re
 
 
 
+from matplotlib.pylab import f
 import numpy as np
 import scipy.sparse as sp
 from typing import Dict, List, Any, Tuple, Iterable, Mapping, Union
@@ -917,26 +918,38 @@ class FormCompiler:
 
 
     def _find_q_order(self, integral: Integral) -> int:
-        # --- 1. explicit override in the dx metadata -------------------------
-        q_order = (integral.measure.metadata.get('quad_degree')     #   Fenics
-                or integral.measure.metadata.get('quad_order')   # ← new alias
-                or integral.measure.metadata.get('q'))           #   VTK / misc.
+        md = integral.measure.metadata or {}
 
-        # --- 2. global ‘assemble_form(…, quad_order=…)’ fallback -------------
-        if q_order is None and self.qorder is not None:
-            q_order = self.qorder
+        # 1) explicit override
+        for key in ('quad_degree', 'quad_order', 'q'):
+            if key in md:
+                return int(md[key])
 
-        # --- 3. last resort: automatic estimation ----------------------------
-        if q_order is None:                       # only if nothing fixed it yet
-            try:
-                p = self.degree_estimator.estimate_degree(integral.integrand)
-                q_order = max(1, math.ceil((p + 1) / 2))            # k ≥ (p+1)/2
-                logger.debug(f'Auto-detected quad_order={q_order} for integral.')
-            except Exception as e:
-                logger.warning(f'Could not estimate polynomial degree: {e}.')
-                q_order = max(1, self.me.mesh.poly_order * 2)
+        # 2) global fallback
+        if self.qorder is not None:
+            return int(self.qorder)
 
-        return q_order
+        # 3) auto + derivative-aware bump
+        try:
+            p = self.degree_estimator.estimate_degree(integral.integrand)
+        except Exception as e:
+            logger.warning(f'Could not estimate polynomial degree: {e}.')
+            p = max(1, self.me.mesh.poly_order)   # conservative but not huge
+
+        # highest total derivative order requested on this measure (if any)
+        r = 0
+        if 'derivs' in md and md['derivs']:
+            r = max(int(ox) + int(oy) for (ox, oy) in md['derivs'])
+
+        geom = max(0, self.me.mesh.poly_order - 1)
+
+        # Gauss–Legendre exactness guideline in 1D:
+        q_est   = max(1, math.ceil((p + 1) / 2))
+        # Small geometry/derivative floor that matches what your JIT needed (e.g. r=2, geom=1 → 6)
+        q_floor = max(1, 2*geom + 2*r)
+
+        return max(q_est, q_floor)
+
     
     def _hook_for(self, expr):
         hooks = self.ctx.get("hooks", {})
@@ -1261,6 +1274,7 @@ class FormCompiler:
         derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
         derivs |= {(0, 0)}  # always include values
 
+
         # Close the set up to the maximum total order present.
         # This prevents KeyError for cross terms like (1,1) in Hessian energies.
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
@@ -1281,7 +1295,8 @@ class FormCompiler:
         if level_set is None:
             raise ValueError("dGhost measure requires a 'level_set' callable.")
 
-        qdeg   = self._find_q_order(intg)
+        qdeg = max(self._find_q_order(intg), 2*max_total + 4)  # e.g., 2*2+4 = 8
+        print(f"Assemble Ghost Edge Python: Using quadrature degree: {qdeg}")
         fields = _all_fields(intg.integrand)
 
         # ---- hook / functional support ----------------------------------
@@ -1306,17 +1321,29 @@ class FormCompiler:
             if not (("cut" in (lt, rt)) or etag.startswith("ghost")):
                 continue
 
-            # (+) and (–) sides: decide by the left-element φ sign
-            phiL = level_set(np.asarray(mesh.elements_list[e.left].centroid()))
-            pos_eid, neg_eid = (e.left, e.right) if phiL >= 0 else (e.right, e.left)
-
+            
             # Quadrature and oriented normal
             p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
             qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
+            # (+) and (–) sides: decide by the left-element φ sign
+            phiL = float(level_set(np.asarray(mesh.elements_list[e.left ].centroid())))
+            phiR = float(level_set(np.asarray(mesh.elements_list[e.right].centroid())))
 
+            # pos = higher φ, neg = lower φ  ⇒ normal from (−) → (+)
+            if phiL >= phiR:
+                pos_eid, neg_eid = e.left, e.right
+            else:
+                pos_eid, neg_eid = e.right, e.left
+
+            # geometric normal, then flip if needed so it points from neg → pos
             normal_vec = e.normal
-            if np.dot(normal_vec, mesh.elements_list[pos_eid].centroid() - qpts_phys[0]) < 0:
-                normal_vec = -normal_vec  # from (–) to (+)
+            cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
+            cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
+            if np.dot(normal_vec, cpos - cneg) < 0.0:
+                normal_vec = -normal_vec
+
+            # if np.dot(normal_vec, mesh.elements_list[pos_eid].centroid() - qpts_phys[0]) < 0:
+            #     normal_vec = -normal_vec  # from (–) to (+)
 
             # Local accumulator & maps
             if is_functional:
@@ -1697,8 +1724,10 @@ class FormCompiler:
             if J_loc is not None:
                 if J_loc.ndim > 1:
                     total = np.sum(J_loc, axis=0)  # (n_edges,) → scalar
+                    # print(f"J_loc.shape={J_loc.shape}, total={total}")
                 if J_loc.ndim == 1:
                     total = J_loc.sum()
+                    # print(f"J_loc.shape={J_loc.shape}, total={total}")
             name  = hook["name"]               # retrieved earlier via _hook_for
             scal  = self.ctx.setdefault("scalar_results", {})
             scal[name] =  total
@@ -1967,6 +1996,7 @@ class FormCompiler:
                 "normals": geo_all["normals"][full_ids],
                 # 'phis' may be None if level_set was None; keep it as None in that case
                 "phis":    None if geo_all["phis"] is None else geo_all["phis"][full_ids],
+                "owner_id": geo_all.get("owner_id", geo_all["eids"])[full_ids].astype(np.int32),
             }
             _run_subset(full_ids, prebuilt_full)
 

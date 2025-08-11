@@ -1258,13 +1258,35 @@ class DofHandler:
         neg_ids = np.empty(nE, dtype=np.int32)
         for i, e in enumerate(edges):
             # orient from (–) to (+) using the centroid test (compiler path)
-            phiL = level_set(np.asarray(mesh.elements_list[e.left].centroid()))
-            pos_eid, neg_eid = (e.left, e.right) if phiL >= 0 else (e.right, e.left)
+            # phiL = level_set(np.asarray(mesh.elements_list[e.left].centroid()))
+            # pos_eid, neg_eid = (e.left, e.right) if phiL >= 0 else (e.right, e.left)
+            # pos_ids[i] = int(pos_eid)
+            # neg_ids[i] = int(neg_eid)
+            # nvec = e.normal
+            # if np.dot(nvec, mesh.elements_list[pos_eid].centroid() - qp_phys[i, 0]) < 0:
+            #     nvec = -nvec
+            # for q in range(nQ):
+            #     normals[i, q] = nvec
+            #     phi_arr[i, q] = level_set(qp_phys[i, q])
+            phiL = float(level_set(np.asarray(mesh.elements_list[e.left ].centroid())))
+            phiR = float(level_set(np.asarray(mesh.elements_list[e.right].centroid())))
+
+            # pos = higher φ, neg = lower φ  ⇒ normal from (−) → (+)
+            if phiL >= phiR:
+                pos_eid, neg_eid = e.left, e.right
+            else:
+                pos_eid, neg_eid = e.right, e.left
             pos_ids[i] = int(pos_eid)
             neg_ids[i] = int(neg_eid)
+
+            # geometric normal, then flip if needed so it points from neg → pos
             nvec = e.normal
-            if np.dot(nvec, mesh.elements_list[pos_eid].centroid() - qp_phys[i, 0]) < 0:
+            cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
+            cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
+            if np.dot(nvec, cpos - cneg) < 0.0:
                 nvec = -nvec
+
+
             for q in range(nQ):
                 normals[i, q] = nvec
                 phi_arr[i, q] = level_set(qp_phys[i, q])
@@ -1658,7 +1680,7 @@ class DofHandler:
             "entity_kind": "edge",
         }
         out.update(basis_tabs)
-        owner_id = np.asarray([self.mesh.edge(eid).left for eid in edge_ids], dtype=np.int32)
+        owner_id = np.asarray([mesh.edge(eid).left for eid in edge_ids], dtype=np.int32)
         out["owner_id"] = owner_id
 
         if reuse:

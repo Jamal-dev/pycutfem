@@ -9,7 +9,7 @@ from pycutfem.utils.meshgen import structured_quad
 # Imports from the new UFL-like library
 from pycutfem.ufl.expressions import TrialFunction,dot, TestFunction, Constant, grad, inner
 from pycutfem.ufl.measures import dx
-from pycutfem.ufl.forms import assemble_form, BoundaryCondition
+from pycutfem.ufl.forms import assemble_form, BoundaryCondition, Equation
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.fem.mixedelement import MixedElement
@@ -26,9 +26,8 @@ def test_poisson_symbolic_q1():
     me = MixedElement(mesh, field_specs={'u': 1})  # Single field for Poisson problem
     
     dof_handler = DofHandler(me, method='cg')
-    u_space = FunctionSpace("disp",['u'],dim=0)    # 2. Define the weak form using the symbolic API
-    u = TrialFunction(u_space,dof_handler=dof_handler)
-    v = TestFunction( u_space,dof_handler=dof_handler)
+    u = TrialFunction(name='u_trial',field_name='u',dof_handler=dof_handler)
+    v = TestFunction (name='v_test', field_name='u',dof_handler=dof_handler)
 
     # Define source term f = 1.0
     f = Constant(1.0)
@@ -38,7 +37,7 @@ def test_poisson_symbolic_q1():
     L = f * v * dx()
 
     # The '==' creates an Equation object
-    equation = (a == L)
+    equation = (Equation(a,L))
 
     # 2. Define boundary conditions (Dirichlet)
     bc_tags = {

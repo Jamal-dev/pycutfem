@@ -8,7 +8,8 @@ from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import (
     Expression, Constant, TestFunction, TrialFunction, VectorTestFunction,
     VectorTrialFunction, Function, VectorFunction, Grad, DivOperation, Inner,
-    Dot, Sum, Sub, Prod, Pos, Neg, Div, FacetNormal, ElementWiseConstant, Jump
+    Dot, Sum, Sub, Prod, Pos, Neg, Div, FacetNormal, ElementWiseConstant, Jump,
+    Derivative
 )
 
 if TYPE_CHECKING:
@@ -96,6 +97,14 @@ class PolynomialDegreeEstimator:
              if deg_b != 0:
                  logger.warning(f"Division by non-constant expression '{expr.b!r}' may result in a non-polynomial. Assuming degree of numerator.")
              result = deg_a
+        elif isinstance(expr, Derivative):
+            ox, oy = expr.order
+            r = ox + oy
+            # derivative lowers the field degree by r on the reference cell,
+            # mapping contributes r factors of J^{-1} of degree (poly_order-1)
+            result = max(0, self._get_degree(expr.f) - r) + r * self._geom_deg
+
+
         else:
             raise NotImplementedError(f"Polynomial degree estimation not implemented for type {type(expr)}")
 

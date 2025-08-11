@@ -316,32 +316,7 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         # Always supply global element-length h_arr for CellDiameter
         # ---- cell diameter (row-aligned) -------------------------------------
         if name == "h_arr":
-            ent = args.get("entity_kind", "element")
-
-            if ent == "element":
-                # Volume/interface: use per-row owner_ids if available; else full length
-                if _row_eids is not None:
-                    args["h_arr"] = _h_global[_row_eids]
-                elif _n_rows is not None and _n_rows == n_elem:
-                    args["h_arr"] = _h_global
-                else:
-                    # No row mapping available here. Provide global h; codegen can
-                    # switch to owner_id indexing when you add it there.
-                    args["h_arr"] = _h_global
-
-            else:
-                # Facet/ghost: compute face scale from **owners** (no 'eids' changes)
-                if (_pos_owner is not None) and (_neg_owner is not None):
-                    args["h_arr"] = 0.5 * (_h_global[_pos_owner] + _h_global[_neg_owner])
-                elif _pos_owner is not None:
-                    args["h_arr"] = _h_global[_pos_owner]
-                elif _neg_owner is not None:
-                    args["h_arr"] = _h_global[_neg_owner]
-                else:
-                    raise KeyError(
-                        "helpers_jit: cannot build facet h_arr – provide "
-                        "owner_pos_id/owner_neg_id or pos_eids/neg_eids in pre_built"
-                    )
+            args["h_arr"] = _h_global
             continue
 
         if name in args:
@@ -370,15 +345,9 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         # ---- constant arrays ---------------------------------------------
         elif name in const_arrays:
             vals = np.asarray(const_arrays[name].value, dtype=np.float64)
-            # Element-indexed array? Align rows via owner/eids when available.
-            if vals.ndim >= 1 and vals.shape[0] == n_elems and _row_eids is not None:
-                args[name] = vals[_row_eids]
-            elif vals.ndim >= 1 and _n_rows is not None and vals.shape[0] == _n_rows:
-                # Already row-aligned
-                args[name] = vals
-            else:
-                # Keep element-length (codegen can index by owner_id once you switch it)
-                args[name] = vals
+            # If it’s element-indexed (vals.shape[0] == n_elems), keep full length.
+            args[name] = vals
+
 
 
         # ---- element-wise constants ---------------------------------------------
@@ -386,13 +355,8 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
             obj_id = int(name.split("_", 1)[1])
             ewc = next(c for c in _find_all(expression, ElementWiseConstant) if id(c) == obj_id)
             arr = np.asarray(ewc.values, dtype=np.float64)  # shape (n_elems, ...)
-            if arr.ndim >= 1 and arr.shape[0] == n_elems and _row_eids is not None:
-                args[name] = arr[_row_eids]
-            elif arr.ndim >= 1 and _n_rows is not None and arr.shape[0] == _n_rows:
-                args[name] = arr
-            else:
-                args[name] = arr   # element-length; codegen can index via owner_id later
-
+            args[name] = arr
+            
 
 
         
