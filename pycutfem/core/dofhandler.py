@@ -1297,8 +1297,8 @@ class DofHandler:
         neg_map   = -np.ones((nE, n_loc),   dtype=np.int32)
 
         for i, e in enumerate(edges):
-            phiL = level_set(np.asarray(mesh.elements_list[e.left].centroid()))
-            pos_eid, neg_eid = (e.left, e.right) if phiL >= 0 else (e.right, e.left)
+            pos_eid = int(pos_ids[i])
+            neg_eid = int(neg_ids[i])
             pos_dofs = self.get_elemental_dofs(pos_eid)
             neg_dofs = self.get_elemental_dofs(neg_eid)
             global_dofs = np.unique(np.concatenate((pos_dofs, neg_dofs)))
@@ -1312,13 +1312,11 @@ class DofHandler:
         #    and compute J, detJ, J_inv from (coords, dN)
         xi_pos = np.empty((nE, nQ)); eta_pos = np.empty((nE, nQ))
         xi_neg = np.empty((nE, nQ)); eta_neg = np.empty((nE, nQ))
-        pos_ids = np.empty(nE, dtype=np.int32)
-        neg_ids = np.empty(nE, dtype=np.int32)
+  
 
         for i, e in enumerate(edges):
-            phiL = level_set(np.asarray(mesh.elements_list[e.left].centroid()))
-            pos_eid, neg_eid = (e.left, e.right) if phiL >= 0 else (e.right, e.left)
-            pos_ids[i] = pos_eid; neg_ids[i] = neg_eid
+            pos_eid = int(pos_ids[i])
+            neg_eid = int(neg_ids[i])
             for q in range(nQ):
                 s, t = transform.inverse_mapping(mesh, pos_eid, qp_phys[i, q])
                 xi_pos[i, q]  = float(s); eta_pos[i, q] = float(t)
