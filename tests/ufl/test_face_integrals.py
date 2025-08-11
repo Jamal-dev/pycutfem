@@ -1,4 +1,3 @@
-from matplotlib.pylab import f
 import numpy as np, pytest
 from pycutfem.utils.meshgen   import structured_quad
 from pycutfem.core.mesh       import Mesh

@@ -450,10 +450,10 @@ class NewtonSolver:
             ):
                 break
 
-            # Accept: promote current → previous ------------------
-            dh.apply_bcs(bcs_now, *functions)
-            for f_prev, f in zip(prev_functions, functions):
-                f_prev.nodal_values[:] = f.nodal_values[:]
+            # # Accept: promote current → previous ------------------
+            # dh.apply_bcs(bcs_now, *functions)
+            # for f_prev, f in zip(prev_functions, functions):
+            #     f_prev.nodal_values[:] = f.nodal_values[:]
             # Post time-loop callback
             if self.post_timeloop_cb is not None:
                 self.post_timeloop_cb(functions)
@@ -495,6 +495,22 @@ class NewtonSolver:
 
             # 1) Assemble reduced system: A_ff δU_f = -R_f
             A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
+
+            # 1a) PRUNE decoupled rows caused by Restriction (nnz==0)
+            row_nnz = np.diff(A_red.indptr)
+            inactive = np.where(row_nnz == 0)[0]
+            if inactive.size:
+                keep_mask = np.ones(len(self.active_dofs), dtype=bool)
+                keep_mask[inactive] = False
+                # rebuild maps
+                self.active_dofs = self.active_dofs[keep_mask]
+                self.full_to_red = -np.ones(ndof, dtype=int)
+                self.full_to_red[self.active_dofs] = np.arange(self.active_dofs.size, dtype=int)
+                self.red_to_full = self.active_dofs
+                # rebuild reduced CSR scatter pattern
+                self._build_reduced_pattern()
+                # re-assemble on the cleaned support
+                A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
 
             # Log residual with a full-size view (zeros on fixed DOFs) for readability
             R_full = np.zeros(ndof)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from matplotlib.pylab import f
+
 import numpy as np
 from typing import Dict, List, Set, Tuple, Callable, Mapping, Iterable, Union, Any, Sequence
 import math
@@ -839,6 +839,7 @@ class DofHandler:
             "normals": normals, "h_arr": h_arr, "eids": eids,
             "entity_kind": "element",
         }
+        geo["owner_id"] = geo["eids"].astype(np.int32)
         if reuse:
             _volume_geom_cache[geom_key] = geo  # cache geometry (no phis)
 
@@ -1137,6 +1138,7 @@ class DofHandler:
             "h_arr": h_arr,
             "entity_kind": "element",
         }
+        out["owner_id"] = out["eids"].astype(np.int32)
         for fld in fields:
             out[f"b_{fld}"] = b_tabs[fld]
             out[f"g_{fld}"] = g_tabs[fld]
@@ -1252,10 +1254,14 @@ class DofHandler:
         # 2) oriented normals & phi ---------------------------------------------
         normals = np.empty((nE, nQ, 2), dtype=float)
         phi_arr = np.zeros((nE, nQ), dtype=float)
+        pos_ids = np.empty(nE, dtype=np.int32)
+        neg_ids = np.empty(nE, dtype=np.int32)
         for i, e in enumerate(edges):
             # orient from (–) to (+) using the centroid test (compiler path)
             phiL = level_set(np.asarray(mesh.elements_list[e.left].centroid()))
             pos_eid, neg_eid = (e.left, e.right) if phiL >= 0 else (e.right, e.left)
+            pos_ids[i] = int(pos_eid)
+            neg_ids[i] = int(neg_eid)
             nvec = e.normal
             if np.dot(nvec, mesh.elements_list[pos_eid].centroid() - qp_phys[i, 0]) < 0:
                 nvec = -nvec
@@ -1425,6 +1431,11 @@ class DofHandler:
             "phis":        phi_arr,
             "h_arr":       h_arr,
             "entity_kind": "edge",
+            "owner_pos_id": pos_ids,
+            "owner_neg_id": neg_ids,
+            # convenience single-owner for simple indexing paths
+            "owner_id":     pos_ids,
+
         }
         out.update(basis_tables)
         return out
@@ -1647,6 +1658,8 @@ class DofHandler:
             "entity_kind": "edge",
         }
         out.update(basis_tabs)
+        owner_id = np.asarray([self.mesh.edge(eid).left for eid in edge_ids], dtype=np.int32)
+        out["owner_id"] = owner_id
 
         if reuse:
             _edge_geom_cache[cache_key] = out
@@ -1860,6 +1873,7 @@ class DofHandler:
             "phis":    phis,
             "entity_kind": "element",
         }
+        out["owner_id"] = out["eids"].astype(np.int32)
 
         # pad and attach per-field tables
         for fld in fields:

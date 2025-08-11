@@ -1083,9 +1083,7 @@ class Avg(Expression):
     def __init__(self, v): self.v = v
     def __repr__(self): return f"Avg({self.v!r})"
 
-class Restriction(Expression):
-    def __init__(self, f, domain_tag): self.f, self.domain_tag = f, domain_tag
-    def __repr__(self): return f"Restriction({self.f!r}, '{self.domain_tag}')"
+
 
 class Side(Expression):
     def __init__(self, f, side): self.f, self.side = f, side

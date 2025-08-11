@@ -2,7 +2,7 @@
 import textwrap
 from dataclasses import dataclass, field, replace
 
-from matplotlib.pylab import f
+
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
@@ -133,30 +133,30 @@ class NumbaCodeGen:
                                        is_vector=False))
             
             elif isinstance(op, CheckDomain):
-                # Get the operand from the stack
                 a = stack.pop()
-                res_var = new_var("restricted")
-                
-                # Construct the parameter name for the BitSet's boolean array
-                domain_bs_name = f"domain_bs_{op.bitset_id}"
-                # Ensure this parameter will be included in the kernel signature
-                required_args.add(domain_bs_name)
-                
-                # Generate the conditional code
-                body_lines.append(f"# Restriction to domain defined by {domain_bs_name}")
-                body_lines.append(f"if {domain_bs_name}[e]:")
-                body_lines.append(f"    {res_var} = {a.var_name}")
-                body_lines.append(f"else:")
-                body_lines.append(f"    {res_var} = np.zeros_like({a.var_name}, dtype={self.dtype})")
+                out = new_var("restricted")
 
-                # Push the result back onto the stack
-                stack.append(a._replace(var_name=res_var))
+                bs = f"domain_bs_{op.bitset_id}"
+                required_args.add(bs)
+                required_args.add("owner_id")          # <— NEW
+
+                body_lines.append(f"# Restriction via {bs}")
+                # Compute a safe global element id, no exceptions
+                body_lines.append("eid = owner_id[e]  # global element id OR owner-element id for facets")
+                body_lines.append(f"flag = (0 <= eid < {bs}.shape[0]) and {bs}[eid]")
+                body_lines.append(f"{out} = {a.var_name} if flag else np.zeros_like({a.var_name}, dtype={self.dtype})")
+
+                stack.append(a._replace(var_name=out))
+
+
+
             
             elif isinstance(op, LoadElementWiseConstant):
                 # the full (n_elem, …) array is passed as a kernel argument
-                required_args.add(op.name)                 # kernel argument
+                required_args.add(op.name)
+                required_args.add("owner_id")          # <— NEW
                 var_name = new_var("ewc")
-                body_lines.append(f"{var_name} = {op.name}[e]")
+                body_lines.append(f"{var_name} = {op.name}[owner_id[e]]")
 
                 is_vec = len(op.tensor_shape) == 1
                 stack.append(
@@ -388,8 +388,11 @@ class NumbaCodeGen:
                 stack.append(StackItem(var_name=np_array_var, role='const', shape=op.shape, is_vector=is_vec, field_names=[]))
             
             elif isinstance(op, CellDiameter):
+                required_args.add("owner_id")          # <— NEW
+                required_args.add("h_arr")             # ensures builder injects global element-length sizes
                 res = new_var("h")
-                body_lines.append(f"{res} = h_arr[e]")    # h_arr provided by pre‑compute
+                body_lines.append(f"{res} = h_arr[owner_id[e]]")
+
                 stack.append(StackItem(var_name=res,
                                     shape=(),
                                     is_vector=False,
@@ -644,7 +647,7 @@ class NumbaCodeGen:
                 body_lines.append(f"{res_var} = {a.var_name} if phi_q < 0.0 else np.zeros_like({a.var_name}, dtype={self.dtype})")
                 stack.append(a._replace(var_name=res_var))
 
-            # --- BINARY OPERATORS ---
+            # --- Inner OPERATORS ---
             elif isinstance(op, Inner):
                 b = stack.pop(); a = stack.pop()
                 res_var = new_var("inner")
@@ -1136,7 +1139,7 @@ class NumbaCodeGen:
                         body_lines.append(f"{res_var} = np.dot({a.var_name}, {b.var_name})")
                         shape = ()
                         is_vector = False; is_grad = False
-                    elif a.is_gradient and  b.is_grdient:
+                    elif a.is_gradient and  b.is_gradient:
                         body_lines.append("# Dot: grad(scalar) * grad(scalar) → scalar")
                         body_lines.append(f"{res_var} = np.dot({a.var_name}, {b.var_name})")
                         shape = ()
@@ -1266,7 +1269,7 @@ class NumbaCodeGen:
                     elif (not a.is_gradient and not b.is_gradient and
                         ((a.role, b.role) == ("test", "trial") or
                         (a.role, b.role) == ("trial", "test"))):
-
+                        n_locs = a.shape[1]
                         body_lines.append("# Product: scalar Test × scalar Trial → (n_loc,n_loc)")
 
                         # orient rows = test , columns = trial
@@ -1277,7 +1280,7 @@ class NumbaCodeGen:
                             f"{res_var} = {test_var.var_name}.T.copy() @ {trial_var.var_name}",  # (n_loc, n_loc)
                         ]
                         stack.append(StackItem(var_name=res_var, role='value',
-                                            shape=(test_var.shape[1],trial_var.shape[0]), is_vector=False))
+                                            shape=(n_locs,n_locs), is_vector=False))
                     # -----------------------------------------------------------------
                     # 2. RHS load:   scalar / vector Function  *  scalar Test
                     #                (u_k or c)                ·  φ_v

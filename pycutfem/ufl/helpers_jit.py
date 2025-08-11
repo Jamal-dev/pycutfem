@@ -1,4 +1,3 @@
-from matplotlib.pylab import f
 import numpy as np
 from typing import Mapping, Tuple, Dict, Any, Sequence
 from pycutfem.integration import volume
@@ -103,6 +102,12 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     # 0. Helpers
     # ------------------------------------------------------------------
     n_elem = mixed_element.mesh.n_elements
+    # full-length element size for CellDiameter() lookups via owner ids
+    _h_global = np.asarray(
+        [mixed_element.mesh.element_char_length(i) for i in range(n_elem)],
+        dtype=np.float64
+    )
+
 
     def _expand_per_element(ref_tab: np.ndarray) -> np.ndarray:
         """
@@ -152,7 +157,7 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         func_map[vf.name] = vf
         for comp, fld in zip(vf.components, vf.field_names):
             func_map.setdefault(fld, vf)
-    
+
     # ------------------------------------------------------------------
     # make sure every component points back to its parent VectorFunction
     # ------------------------------------------------------------------
@@ -170,10 +175,8 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     if param_order is None:
         for op in ir:
             if isinstance(op, LoadVariable):
-                fnames = (
-                    op.field_names if op.is_vector and op.field_names
-                    else [op.name]
-                )
+                fnames = (op.field_names if op.is_vector and op.field_names
+                        else [op.name])
                 for fld in fnames:
                     if op.deriv_order == (0, 0):
                         required.add(f"b_{fld}")
@@ -199,49 +202,103 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     # ------------------------------------------------------------------
     if pre_built is None:
         pre_built = {}
-    predeclared = {
-         "gdofs_map", "node_coords", "element_nodes",
-         "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
-         "eids"
-    }   
-    pre_built = {**{k: v for k, v in pre_built.items()
-                    if k in predeclared}, **pre_built}
+
+    # Allow base keys, plus exactly what this kernel says it needs in `param_order`.
+    base_allow = {
+        "gdofs_map", "node_coords", "element_nodes",
+        "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
+        "eids", "entity_kind",
+        "owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids",
+
+    }
+    needed = set(param_order) if param_order is not None else set()
+
+    # Side keys can appear under many names; keep only the ones actually present/needed.
+    side_keys_present = set(k for k in (pre_built or {}).keys() if k.startswith(("pos_", "neg_")))
+
+    pre_built = {
+        k: v for k, v in (pre_built or {}).items()
+        if (k in base_allow) or (k in needed) or (k in side_keys_present)
+    }
     args: Dict[str, Any] = dict(pre_built)
-    # --- NEW: Find and add all domain BitSets used in the expression ---
+
+    # --- derived row info --------------------------------------------------
+    # Number of rows the kernel will loop over
+    _n_rows = None
+    if gdofs_map is not None:
+        _n_rows = int(gdofs_map.shape[0])
+    elif "qp_phys" in args:
+        _n_rows = int(np.asarray(args["qp_phys"]).shape[0])
+    else:
+        for _k in ("pos_qp_phys", "neg_qp_phys"):
+            if _k in args:
+                _n_rows = int(np.asarray(args[_k]).shape[0]); break
+
+    # Row -> owner element ids if precompute provided them (never overwrite 'eids')
+    _row_eids = None
+    if "owner_id" in args:
+        _row_eids = np.asarray(args["owner_id"], dtype=np.int32)
+    elif "eids" in args and args.get("entity_kind", "element") == "element":
+        _row_eids = np.asarray(args["eids"], dtype=np.int32)
+
+    # Ghost/internal edges: prefer explicit owners when present
+    _pos_owner = args.get("owner_pos_id", args.get("pos_eids", None))
+    _neg_owner = args.get("owner_neg_id", args.get("neg_eids", None))
+    if _pos_owner is not None:
+        _pos_owner = np.asarray(_pos_owner, dtype=np.int32)
+    if _neg_owner is not None:
+        _neg_owner = np.asarray(_neg_owner, dtype=np.int32)
+
+
+    # --- helper: expand a subset-length per-element array to full length using eids ---
+    n_elems = mixed_element.mesh.n_elements
+    eids = None
+    if "eids" in args and args["eids"] is not None:
+        eids = np.asarray(args["eids"], dtype=np.int32)
+
+    def _expand_subset_to_full(arr: np.ndarray, what: str) -> np.ndarray:
+        """
+        Ensure per-element arrays (bitsets, EWC values, etc.) are FULL element-length.
+        If 'arr' has shape[0] == len(eids), expand it into a length-n_elems array.
+        Otherwise if shape[0] == n_elems, return as-is.
+        Otherwise, raise with a helpful message.
+        """
+        a = np.asarray(arr)
+        if a.ndim == 0:
+            return a  # scalar, nothing to do
+
+        # Already full-length?
+        if a.shape[0] == n_elems:
+            return a
+
+        # Subset → expand to full using eids
+        if eids is not None and a.shape[0] == eids.shape[0]:
+            out = np.zeros((n_elems,) + a.shape[1:], dtype=a.dtype)
+            out[eids] = a
+            return out
+
+        raise ValueError(
+            f"{what}: got length {a.shape[0]} but expected either n_elems={n_elems} "
+            f"or len(eids)={0 if eids is None else int(eids.shape[0])}."
+        )
+
+    # --- Add all domain BitSets used in the expression ---
     all_bitsets_in_form = _find_all_bitsets(expression)
     for bs in all_bitsets_in_form:
-        # Create a unique, valid parameter name for each bitset
-        param_name = f"domain_bs_{id(bs)}"
-        # Add the bitset's underlying boolean array to the kernel arguments
-        args[param_name] = bs.array
+        pname = f"domain_bs_{id(bs)}"
+        raw = getattr(bs, "array", bs)
+        mask_full = _expand_subset_to_full(
+            np.asarray(raw, dtype=np.bool_).ravel(), what=f"BitSet {pname}"
+        )
+        args[pname] = mask_full
 
+
+    # --- Constant nd-arrays (unchanged)
     const_arrays = {
         f"const_arr_{id(c)}": c
         for c in _find_all(expression, UflConst) if c.dim != 0
     }
-    entity_kind = pre_built.get("entity_kind", "element")  # default: element
-    # helper: align any per‑element array to the subset order if needed
-    def _subset_align(arr: np.ndarray) -> np.ndarray:
-        qp = args.get("qp_phys", None)
-        if qp is None:
-            return arr
-        n_sub = qp.shape[0]
-        # Only attempt an alignment when the incoming array is per-element
-        # and the kernel is iterating over a subset of ELEMENTS.
-        if (arr.ndim >= 1 
-            and arr.shape[0] == mixed_element.mesh.n_elements
-            and n_sub != arr.shape[0]):
-            if entity_kind != "element":
-                # Do NOT try to reindex per-element arrays by edge ids.
-                raise RuntimeError(
-                    "Attempted to align a per-element array in a non-element (e.g., edge) kernel. "
-                    "Pass a per-edge array instead."
-                )
-            eids = pre_built.get("eids", None)
-            if eids is None:
-                raise RuntimeError("Subset kernel without 'eids' – cannot align ElementWiseConstant.")
-            return np.asarray(arr, dtype=np.float64)[np.asarray(eids, dtype=np.int32)]
-        return arr
+    # args.update(const_arrays)
 
     # cache gdofs_map for coefficient gathering
     if gdofs_map is None:
@@ -252,7 +309,41 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
 
     total_dofs = dof_handler.total_dofs
 
+
+
     for name in sorted(required):
+        
+        # Always supply global element-length h_arr for CellDiameter
+        # ---- cell diameter (row-aligned) -------------------------------------
+        if name == "h_arr":
+            ent = args.get("entity_kind", "element")
+
+            if ent == "element":
+                # Volume/interface: use per-row owner_ids if available; else full length
+                if _row_eids is not None:
+                    args["h_arr"] = _h_global[_row_eids]
+                elif _n_rows is not None and _n_rows == n_elem:
+                    args["h_arr"] = _h_global
+                else:
+                    # No row mapping available here. Provide global h; codegen can
+                    # switch to owner_id indexing when you add it there.
+                    args["h_arr"] = _h_global
+
+            else:
+                # Facet/ghost: compute face scale from **owners** (no 'eids' changes)
+                if (_pos_owner is not None) and (_neg_owner is not None):
+                    args["h_arr"] = 0.5 * (_h_global[_pos_owner] + _h_global[_neg_owner])
+                elif _pos_owner is not None:
+                    args["h_arr"] = _h_global[_pos_owner]
+                elif _neg_owner is not None:
+                    args["h_arr"] = _h_global[_neg_owner]
+                else:
+                    raise KeyError(
+                        "helpers_jit: cannot build facet h_arr – provide "
+                        "owner_pos_id/owner_neg_id or pos_eids/neg_eids in pre_built"
+                    )
+            continue
+
         if name in args:
             continue
 
@@ -278,15 +369,32 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         
         # ---- constant arrays ---------------------------------------------
         elif name in const_arrays:
-            vals = const_arrays[name].value
-            args[name] = _subset_align(np.asarray(vals, dtype=np.float64))
+            vals = np.asarray(const_arrays[name].value, dtype=np.float64)
+            # Element-indexed array? Align rows via owner/eids when available.
+            if vals.ndim >= 1 and vals.shape[0] == n_elems and _row_eids is not None:
+                args[name] = vals[_row_eids]
+            elif vals.ndim >= 1 and _n_rows is not None and vals.shape[0] == _n_rows:
+                # Already row-aligned
+                args[name] = vals
+            else:
+                # Keep element-length (codegen can index by owner_id once you switch it)
+                args[name] = vals
+
 
         # ---- element-wise constants ---------------------------------------------
         elif name.startswith("ewc_"):
             obj_id = int(name.split("_", 1)[1])
-            ewc = next(c for c in _find_all(expression, ElementWiseConstant)
-                    if id(c) == obj_id)
-            args[name] = _subset_align(np.asarray(ewc.values, dtype=np.float64))
+            ewc = next(c for c in _find_all(expression, ElementWiseConstant) if id(c) == obj_id)
+            arr = np.asarray(ewc.values, dtype=np.float64)  # shape (n_elems, ...)
+            if arr.ndim >= 1 and arr.shape[0] == n_elems and _row_eids is not None:
+                args[name] = arr[_row_eids]
+            elif arr.ndim >= 1 and _n_rows is not None and arr.shape[0] == _n_rows:
+                args[name] = arr
+            else:
+                args[name] = arr   # element-length; codegen can index via owner_id later
+
+
+
         
         # ---- analytic expressions ------------------------------------------------
         elif name.startswith("ana_"):
@@ -334,21 +442,38 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
             full[list(f._g2l.keys())] = f.nodal_values
 
             # ---- 3. gather what the kernel needs ------------------------------
-            if side in ("pos", "neg"):                      # interior facets
-                amap = np.asarray(pre_built[f"{side}_map"])
-                if amap.ndim == 1:                          # ragged → dense
-                    from pycutfem.ufl.helpers_jit import _stack_ragged
-                    amap = _stack_ragged(amap)
+            # ---- facet / ghost-edge geometry (robust to missing side) ---------
+            facet_sides = [s for s in ("pos", "neg")
+                        if any(f"{s}_{suffix}" in pre_built
+                                for suffix in ("map", "qp_phys", "qw", "detJ", "J_inv", "normals", "phis", "eids"))]
 
-                n_edges, union = gdofs_map.shape
-                coeff = np.zeros((n_edges, union), dtype=np.float64)
-                for e in range(min(n_edges, amap.shape[0])):
-                    sel = amap[e]
-                    sel = sel[(sel >= 0) & (sel < union)]
-                    if sel.size:
-                        coeff[e, sel] = full[gdofs_map[e, sel]]
+            for side in facet_sides:
+                # Copy over whatever this side actually provides
+                for suffix in ("map", "qp_phys", "qw", "detJ", "J_inv", "normals", "phis", "eids"):
+                    key = f"{side}_{suffix}"
+                    if key not in pre_built:
+                        continue
+                    val = pre_built[key]
+                    if suffix == "map":
+                        # maps can be ragged (1D of objects) → densify
+                        arr = np.asarray(val)
+                        if arr.ndim == 1 and arr.dtype == object:
+                            # use your existing helper if present; otherwise simple stack
+                            try:
+                                val = _stack_ragged(arr)  # preferred helper if you have it
+                            except NameError:
+                                val = np.vstack([np.asarray(row, dtype=np.int32) for row in arr]).astype(np.int32)
+                    args[key] = val
 
-                args[name] = coeff
+            # For facet kernels, provide an owner-element eid mapping if available.
+            # This lets the Restriction check index the domain mask by element.
+            if args.get("entity_kind", None) != "element" and "eids" not in args:
+                if "pos_eids" in pre_built:
+                    args["eids"] = np.asarray(pre_built["pos_eids"], dtype=np.int32)
+                elif "neg_eids" in pre_built:
+                    args["eids"] = np.asarray(pre_built["neg_eids"], dtype=np.int32)
+                # else: leave absent; the kernel-side guard will handle it
+
                 continue                                    # done – next param
 
             # ---- volume tables -----------------------------------------------

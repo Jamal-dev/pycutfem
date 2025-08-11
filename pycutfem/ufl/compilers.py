@@ -11,7 +11,7 @@ enabling robust assembly of LHS matrices and RHS vectors.
 from __future__ import annotations
 import re
 
-from matplotlib.pylab import f
+
 
 import numpy as np
 import scipy.sparse as sp
@@ -198,11 +198,11 @@ class FormCompiler:
         #    The element ID is reliably in the context during volume/interface assembly.
         eid = self.ctx.get("eid")
         if eid is None:
-            # This can happen in contexts where 'eid' is not defined.
-            # We proceed, but the check might fail gracefully later.
-            elem_tag = None
+            # No element context (e.g., early scalar eval) → do nothing.
+            in_domain = True
         else:
-            in_domain = n.domain[eid] if hasattr(n.domain, "__getitem__") else eid in n.domain
+            in_domain = (n.domain[eid] if hasattr(n.domain, "__getitem__")
+                         else (eid in n.domain))
 
         # 2. Check if the element is in the active domain.
         if in_domain:
@@ -1032,6 +1032,8 @@ class FormCompiler:
             "normals": geo_args_all["normals"][element_ids],
             "h_arr":   geo_args_all["h_arr"][element_ids],
             "phis":    None if geo_args_all["phis"] is None else geo_args_all["phis"][element_ids],
+            "entity_kind": "element",
+            "owner_id": geo_args_all.get("owner_id", geo_args_all["eids"])[element_ids],
         }
 
         # (B) Build the DOF map for the subset.
@@ -1446,6 +1448,7 @@ class FormCompiler:
             [dh.get_elemental_dofs(eid) for eid in cut_eids]
         ).astype(np.int32)
         geo["gdofs_map"] = gdofs_map
+        geo["entity_kind"] = "element"
 
         # ------------------------------------------------------------------
         # 4. Gather coefficient Functions once
@@ -1538,6 +1541,12 @@ class FormCompiler:
         pre_built_args["gdofs_map"] = geo_factors["gdofs_map"]
         pre_built_args["pos_map"] =     geo_factors["pos_map"]
         pre_built_args["neg_map"] =     geo_factors["neg_map"]
+        pre_built_args["owner_pos_id"] = geo_factors["owner_pos_id"]
+        pre_built_args["owner_neg_id"] = geo_factors["owner_neg_id"]
+        # convenience single-owner (matches our codegen use of owner_id)
+        pre_built_args["owner_id"]     = geo_factors.get("owner_id", geo_factors["owner_pos_id"])
+        # explicit
+        pre_built_args["entity_kind"]  = "edge"
         gdofs_map = pre_built_args["gdofs_map"]
         
 
