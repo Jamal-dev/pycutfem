@@ -108,3 +108,9 @@ class CheckDomain:
 class Trace:
     """Instruction to compute the trace of the tensor on top of the stack."""
     pass
+
+@dataclass(frozen=True, slots=True)
+class Hessian:   pass
+
+@dataclass(frozen=True, slots=True)
+class Laplacian: pass

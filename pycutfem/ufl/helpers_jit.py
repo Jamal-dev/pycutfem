@@ -7,6 +7,8 @@ import re
 import pycutfem.jit.symbols as symbols
 from pycutfem.utils.bitset import BitSet
 from pycutfem.ufl.expressions import Restriction
+from pycutfem.fem.transform import element_Hxi   # new util
+
 
 
 logger = logging.getLogger(__name__)

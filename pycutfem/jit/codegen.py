@@ -7,7 +7,7 @@ from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
     BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
-    Trace
+    Trace, Hessian as IRHessian, Laplacian as IRLaplacian
 )
 from pycutfem.jit.symbols import encode
 import numpy as np
@@ -147,8 +147,145 @@ class NumbaCodeGen:
                 body_lines.append(f"{out} = {a.var_name} if flag else np.zeros_like({a.var_name}, dtype={self.dtype})")
 
                 stack.append(a._replace(var_name=out))
+            
+
+            elif isinstance(op, IRHessian):
+                a = stack.pop()  # carries .role, .field_names, .side
+                # choose per-side symbols
+                if   a.side == "+": jinv = "J_inv_pos"; H0 = "pos_Hxi0"; H1 = "pos_Hxi1"; suff = "_pos"
+                elif a.side == "-": jinv = "J_inv_neg"; H0 = "neg_Hxi0"; H1 = "neg_Hxi1"; suff = "_neg"
+                else:               jinv = "J_inv";     H0 = "Hxi0";     H1 = "Hxi1";     suff = ""
+
+                required_args.update({jinv, H0, H1})
+
+                # need reference derivative tables (volume: d.._; edge: r.._pos/neg)
+                d10, d01, d20, d11, d02 = [], [], [], [], []
+                for fn in a.field_names:
+                    name10 = (f"d10_{fn}" if suff=="" else f"r10_{fn}{suff}")
+                    name01 = (f"d01_{fn}" if suff=="" else f"r01_{fn}{suff}")
+                    name20 = (f"d20_{fn}" if suff=="" else f"r20_{fn}{suff}")
+                    name11 = (f"d11_{fn}" if suff=="" else f"r11_{fn}{suff}")
+                    name02 = (f"d02_{fn}" if suff=="" else f"r02_{fn}{suff}")
+                    for nm in (name10,name01,name20,name11,name02): required_args.add(nm)
+                    d10.append(name10); d01.append(name01); d20.append(name20); d11.append(name11); d02.append(name02)
+
+                out = new_var("Hess")
+                body_lines.append(f"{out} = []  # (k, n_union, 2, 2)")
+
+                # map/pad exactly like Grad: build (n_loc,2,2) then pad to union if side
+                for i, fn in enumerate(a.field_names):
+                    Hloc = new_var("Hloc")
+                    body_lines += [
+                        f"A  = {jinv}[e, q]",
+                        f"Hx = {H0}[e, q]",
+                        f"Hy = {H1}[e, q]",
+                        f"d10_q = {d10[i]}[e, q]",  # (n_loc,)
+                        f"d01_q = {d01[i]}[e, q]",
+                        f"d20_q = {d20[i]}[e, q]",
+                        f"d11_q = {d11[i]}[e, q]",
+                        f"d02_q = {d02[i]}[e, q]",
+                        f"nloc = d20_q.shape[0]",
+                        f"{Hloc} = np.empty((nloc, 2, 2), dtype=d20_q.dtype)",
+                        "for j in range(nloc):",
+                        "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
+                        "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
+                        "    core = A.T @ (Href @ A)",
+                        "    Hphys = core + gref[0]*Hx + gref[1]*Hy",
+                    ]
+                    if a.side:
+                        map_arr = "pos_map" if a.side == "+" else "neg_map"
+                        required_args.add(map_arr)
+                        Hpad = new_var("Hpad"); me = new_var("map_e")
+                        body_lines += [
+                            f"{me} = {map_arr}[e]",
+                            "n_union = gdofs_map[e].shape[0]",
+                            f"{Hpad} = np.zeros((n_union, 2, 2), dtype=d20_q.dtype)",
+                            f"for j in range(nloc):",
+                            f"    idx = {me}[j]",
+                            f"    if 0 <= idx < n_union:",
+                            f"        {Hpad}[idx] = Hphys",
+                            f"{out}.append({Hpad})",
+                        ]
+                    else:
+                        body_lines += [f"{Hloc}[j] = Hphys",
+                                    f"{out}.append({Hloc})"]
+
+                # stack components, final shape = (k, n_union, 2, 2)
+                body_lines.append(f"{out} = np.stack({out}, axis=0)")
+                stack.append(StackItem(var_name=out, role=a.role, shape=(-1,-1,2,2),
+                                    is_vector=False, field_names=a.field_names, side=a.side, is_hessian=True))
 
 
+
+
+            
+            elif isinstance(op, IRLaplacian):
+                a = stack.pop()
+                if   a.side == "+": jinv = "J_inv_pos"; H0 = "pos_Hxi0"; H1 = "pos_Hxi1"; suff = "_pos"
+                elif a.side == "-": jinv = "J_inv_neg"; H0 = "neg_Hxi0"; H1 = "neg_Hxi1"; suff = "_neg"
+                else:               jinv = "J_inv";     H0 = "Hxi0";     H1 = "Hxi1";     suff = ""
+                required_args.update({jinv, H0, H1})
+
+                # derivative tables
+                d10, d01, d20, d11, d02 = [], [], [], [], []
+                for fn in a.field_names:
+                    for nm in (f"d10_{fn}" if suff=="" else f"r10_{fn}{suff}",
+                            f"d01_{fn}" if suff=="" else f"r01_{fn}{suff}",
+                            f"d20_{fn}" if suff=="" else f"r20_{fn}{suff}",
+                            f"d11_{fn}" if suff=="" else f"r11_{fn}{suff}",
+                            f"d02_{fn}" if suff=="" else f"r02_{fn}{suff}"):
+                        required_args.add(nm)
+                    d10.append((f"d10_{fn}" if suff=="" else f"r10_{fn}{suff}"))
+                    d01.append((f"d01_{fn}" if suff=="" else f"r01_{fn}{suff}"))
+                    d20.append((f"d20_{fn}" if suff=="" else f"r20_{fn}{suff}"))
+                    d11.append((f"d11_{fn}" if suff=="" else f"r11_{fn}{suff}"))
+                    d02.append((f"d02_{fn}" if suff=="" else f"r02_{fn}{suff}"))
+
+                out = new_var("Lap")
+                body_lines.append(f"{out} = []  # (k, n_union)")
+                for i, fn in enumerate(a.field_names):
+                    laploc = new_var("laploc")
+                    body_lines += [
+                        f"A  = {jinv}[e, q]",
+                        f"Hx = {H0}[e, q]",
+                        f"Hy = {H1}[e, q]",
+                        f"d10_q = {d10[i]}[e, q]",
+                        f"d01_q = {d01[i]}[e, q]",
+                        f"d20_q = {d20[i]}[e, q]",
+                        f"d11_q = {d11[i]}[e, q]",
+                        f"d02_q = {d02[i]}[e, q]",
+                        f"nloc = d20_q.shape[0]",
+                        f"{laploc} = np.empty((nloc,), dtype=d20_q.dtype)",
+                        "for j in range(nloc):",
+                        "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
+                        "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
+                        "    core = A.T @ (Href @ A)",
+                        "    tr_core = core[0,0] + core[1,1]",
+                        "    lap_j = tr_core + gref[0]*(Hx[0,0]+Hx[1,1]) + gref[1]*(Hy[0,0]+Hy[1,1])",
+                    ]
+                    if a.side:
+                        map_arr = "pos_map" if a.side == "+" else "neg_map"
+                        required_args.add(map_arr)
+                        lap_pad = new_var("lap_pad"); me = new_var("map_e")
+                        body_lines += [
+                            f"{me} = {map_arr}[e]",
+                            "n_union = gdofs_map[e].shape[0]",
+                            f"{lap_pad} = np.zeros((n_union,), dtype=d20_q.dtype)",
+                            "for j in range(nloc):",
+                            "    idx = {me}[j]".format(me=me),
+                            "    if 0 <= idx < n_union:",
+                            "        {lp}[idx] = lap_j".format(lp=lap_pad),
+                            f"{out}.append({lap_pad})",
+                        ]
+                    else:
+                        body_lines += [
+                            f"{laploc}[j] = lap_j",
+                            f"{out}.append({laploc})",
+                        ]
+
+                body_lines.append(f"{out} = np.stack({out}, axis=0)")  # (k, n_union)
+                stack.append(StackItem(var_name=out, role=a.role, shape=(-1,-1), is_vector=True,
+                                    field_names=a.field_names, side=a.side))
 
             
             elif isinstance(op, LoadElementWiseConstant):

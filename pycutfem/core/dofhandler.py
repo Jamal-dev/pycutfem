@@ -668,6 +668,7 @@ class DofHandler:
         quad_order: int,
         level_set: Callable = None,
         reuse: bool = True,
+        need_hess: bool = False, 
     ) -> Dict[str, np.ndarray]:
         """
         Precompute physical quadrature data (geometry, weights, optional level-set).
@@ -817,6 +818,7 @@ class DofHandler:
                 "normals": normals, "phis": phis, "h_arr": h_arr, "eids": eids,
                 "entity_kind": "element",
             }
+            
             if reuse:
                 _volume_geom_cache[geom_key] = {**geo, "phis": None}  # cache geometry only
             return geo
@@ -840,6 +842,20 @@ class DofHandler:
             "entity_kind": "element",
         }
         geo["owner_id"] = geo["eids"].astype(np.int32)
+        if need_hess:
+            # Hξ tensors for the inverse map, exact up to geometry order 2
+            Hxi0 = np.zeros((n_el, n_q, 2, 2), dtype=np.float64)
+            Hxi1 = np.zeros_like(Hxi0)
+            # element ids (same ordering as other outputs)
+            eids = np.arange(self.mixed_element.mesh.n_elements, dtype=np.int32)
+            for e in range(n_el):
+                eid = int(eids[e])
+                for q, (xi, eta) in enumerate(qp_ref):
+                    _, _, H0, H1 = transform.element_Hxi(self.mixed_element.mesh, eid, (float(xi), float(eta)))
+                    Hxi0[e, q] = H0
+                    Hxi1[e, q] = H1
+            geo["Hxi0"] = Hxi0
+            geo["Hxi1"] = Hxi1
         if reuse:
             _volume_geom_cache[geom_key] = geo  # cache geometry (no phis)
 
@@ -860,7 +876,7 @@ class DofHandler:
     # -------------------------------------------------------------------------
      
     def precompute_interface_factors(
-        self, cut_element_ids, qdeg: int, level_set, reuse: bool = True
+        self, cut_element_ids, qdeg: int, level_set, reuse: bool = True, need_hess: bool = False
     ) -> dict:
         from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
         from pycutfem.core.levelset import CircleLevelSet, AffineLevelSet
@@ -1143,11 +1159,62 @@ class DofHandler:
             out[f"b_{fld}"] = b_tabs[fld]
             out[f"g_{fld}"] = g_tabs[fld]
 
+        
+
         out["J_inv_pos"] = out["J_inv"]      # shape (nE, nQ, 2, 2)
         out["J_inv_neg"] = out["J_inv"]
         n_union = me.n_dofs_local
         out["pos_map"] = np.tile(np.arange(n_union, dtype=np.int32), (len(valid_cut_eids), 1))
         out["neg_map"] = out["pos_map"].copy()
+        if need_hess:
+            nE = len(valid_cut_eids)
+            nQ = xi_tab.shape[1]
+            Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+            Hxi1 = np.zeros_like(Hxi0)
+            for i, eid in enumerate(valid_cut_eids):
+                eid = int(eid)
+                for q in range(nQ):
+                    _, _, H0, H1 = transform.element_Hxi(mesh, eid, (float(xi_tab[i, q]), float(eta_tab[i, q])))
+                    Hxi0[i, q] = H0
+                    Hxi1[i, q] = H1
+            out["Hxi0"] = Hxi0
+            out["Hxi1"] = Hxi1
+        if need_hess:
+            # We need 1st & 2nd REF derivatives for each field at (xi_tab, eta_tab)
+            from pycutfem.integration.pre_tabulates import (
+                _tabulate_deriv_q1, _tabulate_deriv_q2, _tabulate_deriv_p1,
+            )
+            fields = me.field_names
+            nE, nQ = xi_tab.shape
+            for fld in fields:
+                sl  = me.component_dof_slices[fld]
+                p_f = me._field_orders[fld]
+                # choose tabulator for the FIELD (not geometry)
+                if mesh.element_type == "quad" and p_f == 1:
+                    tab = _tabulate_deriv_q1; n_f = 4
+                elif mesh.element_type == "quad" and p_f == 2:
+                    tab = _tabulate_deriv_q2; n_f = 9
+                elif mesh.element_type == "tri"  and p_f == 1:
+                    tab = _tabulate_deriv_p1; n_f = 3
+                else:
+                    tab = None; n_f = sl.stop - sl.start
+
+                for dx, dy in ((1,0),(0,1),(2,0),(1,1),(0,2)):
+                    key_ref = f"r{dx}{dy}_{fld}"
+                    arr = np.zeros((nE, nQ, me.n_dofs_local), dtype=float)
+                    if tab is not None:
+                        loc = np.empty((nE, nQ, n_f), dtype=float)
+                        tab(xi_tab, eta_tab, int(dx), int(dy), loc)
+                    else:
+                        loc = np.empty((nE, nQ, n_f), dtype=float)
+                        for i, eid in enumerate(valid_cut_eids):
+                            for q in range(nQ):
+                                loc[i, q] = np.asarray(
+                                    me.deriv_ref(fld, float(xi_tab[i, q]), float(eta_tab[i, q]), int(dx), int(dy)),
+                                    dtype=float
+                                )
+                    arr[:, :, sl] = loc
+                    out[key_ref] = arr
 
         if reuse:
             _edge_geom_cache[cache_key] = out
@@ -1164,7 +1231,7 @@ class DofHandler:
         ghost_edge_ids: "BitSet | Sequence[int]",
         qdeg: int,
         level_set,
-        derivs: set[tuple[int, int]],
+        derivs: set[tuple[int, int]], need_hess: bool = False, reuse: bool = True
     ) -> dict:
         from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
         from pycutfem.integration.quadrature import line_quadrature
@@ -1418,7 +1485,13 @@ class DofHandler:
                         for e in range(nE):
                             for q in range(nQ):
                                 loc[e, q, :] = me._eval_scalar_deriv(fld, xi_tab[e, q], eta_tab[e, q], dx, dy)
+                    if need_hess:
+                        key_ref = f"r{dx}{dy}_{fld}_{side}"
+                        arr_ref = np.zeros((nE, nQ, me.n_dofs_per_elem), dtype=float)
+                        arr_ref[:, :, sl] = loc  # reference derivatives, no push-forward
+                        basis_tables[key_ref] = arr_ref
 
+                    
                     # map to physical (structured scaling used in your ghost path)
                     phys = loc * (sx ** dx)[:, :, None] * (sy ** dy)[:, :, None]
                     arr[:, :, sl] = phys
@@ -1458,6 +1531,25 @@ class DofHandler:
 
         }
         out.update(basis_tables)
+        if need_hess:
+            nE, nQ = xi_pos.shape
+            pos_Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+            pos_Hxi1 = np.zeros_like(pos_Hxi0)
+            neg_Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+            neg_Hxi1 = np.zeros_like(neg_Hxi0)
+            for i in range(nE):
+                pe = int(pos_ids[i]); ne = int(neg_ids[i])
+                for q in range(nQ):
+                    _, _, H0, H1 = transform.element_Hxi(mesh, pe, (float(xi_pos[i, q]), float(eta_pos[i, q])))
+                    pos_Hxi0[i, q] = H0; pos_Hxi1[i, q] = H1
+                    _, _, H0, H1 = transform.element_Hxi(mesh, ne, (float(xi_neg[i, q]), float(eta_neg[i, q])))
+                    neg_Hxi0[i, q] = H0; neg_Hxi1[i, q] = H1
+            out_extra = {
+                "pos_Hxi0": pos_Hxi0, "pos_Hxi1": pos_Hxi1,
+                "neg_Hxi0": neg_Hxi0, "neg_Hxi1": neg_Hxi1,
+            }
+        if need_hess:
+            out.update(out_extra)
         return out
 
     
@@ -1470,6 +1562,7 @@ class DofHandler:
         qdeg: int,
         derivs: set[tuple[int, int]],
         reuse: bool = True,
+        need_hess: bool = False,
     ) -> dict:
         """
         Pre-compute geometry & basis tables for ∫_Γ ⋯ dS on *boundary* edges.
@@ -1630,6 +1723,16 @@ class DofHandler:
                     J_inv[e, q, 1, 0] = -a10 * invd
                     J_inv[e, q, 1, 1] =  a00 * invd
 
+        if need_hess:
+            nE, nQ = xi_tab.shape
+            Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+            Hxi1 = np.zeros_like(Hxi0)
+            for i, eid in enumerate(eids_arr):
+                eid = int(eid)
+                for q in range(nQ):
+                    _, _, H0, H1 = transform.element_Hxi(mesh, eid, (float(xi_tab[i, q]), float(eta_tab[i, q])))
+                    Hxi0[i, q] = H0
+                    Hxi1[i, q] = H1
         # ---- tabulate derivatives per field and push-forward --------------------
         derivs = set(derivs)  # ensure (0,0) is included if needed by the kernel build
         for fld in fields:
@@ -1659,6 +1762,12 @@ class DofHandler:
                     for e in range(n_edges):
                         for q in range(n_q):
                             loc[e, q, :] = me._eval_scalar_deriv(fld, xi_tab[e, q], eta_tab[e, q], dx, dy)
+
+                if need_hess:
+                    key_ref = f"r{dx}{dy}_{fld}"
+                    arr_ref = np.zeros((n_edges, n_q, n_loc), dtype=float)
+                    arr_ref[:, :, sl] = loc   # reference derivatives, unscaled
+                    basis_tabs[key_ref] = arr_ref
 
                 # diagonal push-forward used elsewhere in boundary/ghost paths
                 sx = J_inv[:, :, 0, 0]; sy = J_inv[:, :, 1, 1]
@@ -1697,6 +1806,7 @@ class DofHandler:
         level_set,
         side: str = "+",
         reuse: bool = True,
+        need_hess: bool = False,
     ) -> dict:
         """
         Pre-compute geometry/basis for ∫_{Ω ∩ {φ ▷ 0}} (…) dx on CUT elements.
@@ -1776,6 +1886,10 @@ class DofHandler:
         Jinv_blocks = []
         phi_blocks  = []
         basis_lists: dict[str, list[np.ndarray]] = {}
+        if need_hess:
+            H0_blocks: list[np.ndarray] = []
+            H1_blocks: list[np.ndarray] = []
+
 
         sgn = +1 if side == "+" else -1
 
@@ -1810,6 +1924,13 @@ class DofHandler:
                         xi, eta = transform.inverse_mapping(mesh, eid, x)
                         J       = transform.jacobian(mesh, eid, (xi, eta))
                         Ji      = np.linalg.inv(J)
+
+                        if need_hess:
+                            _, _, H0, H1 = transform.element_Hxi(mesh, eid, (float(xi), float(eta)))
+                            # append per-qp; we’ll stack/pad later per element
+                            H0_blocks.append(np.asarray(H0))
+                            H1_blocks.append(np.asarray(H1))
+
 
                         xq_elem.append(x)
                         wq_elem.append(w)
@@ -1882,6 +2003,17 @@ class DofHandler:
             qw[i, :n]         = qw_blocks[i]
             J_inv[i, :n, :, :] = Jinv_blocks[i]
             phis[i, :n]       = phi_blocks[i]
+        if need_hess:
+            Hxi0 = np.zeros((nE, Qmax, 2, 2), dtype=float)
+            Hxi1 = np.zeros_like(Hxi0)
+            for i in range(nE):
+                n = len(Jinv_blocks[i])   # same n_q for that element’s cut-triangles
+                # assume you stored per-qp (2,2) arrays in lists H0_elem/H1_elem for element i
+                H0e = np.asarray(H0_blocks[i], dtype=float)   # shape (n,2,2)
+                H1e = np.asarray(H1_blocks[i], dtype=float)
+                Hxi0[i, :n, :, :] = H0e
+                Hxi1[i, :n, :, :] = H1e
+
 
         out = {
             "eids":   np.asarray(valid_eids, dtype=np.int32),
@@ -1921,6 +2053,9 @@ class DofHandler:
                 for i, arr in enumerate(blk_list):
                     d_pad[i, :arr.shape[0], :] = arr
                 out[key] = d_pad
+
+        out["Hxi0"] = Hxi0
+        out["Hxi1"] = Hxi1
 
         if reuse:
             _cut_volume_cache[key] = out

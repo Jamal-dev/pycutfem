@@ -46,7 +46,6 @@ from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
 from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices,_all_fields,_find_all,_trial_test
-from pycutfem.fem.transform import map_deriv
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 from pycutfem.ufl.helpers_geom import (

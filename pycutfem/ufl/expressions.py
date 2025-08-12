@@ -1023,6 +1023,16 @@ class DivOperation(Expression):
     def __init__(self, operand): self.operand = operand
     def __repr__(self): return f"Div({self.operand!r})"
 
+class Hessian(Expression):
+    """2×2 Hessian of a scalar expression."""
+    def __init__(self, operand): self.operand = operand
+    def __repr__(self): return f"Hessian({self.operand!r})"
+
+class Laplacian(Expression):
+    """Trace of the Hessian (Δu)."""
+    def __init__(self, operand): self.operand = operand
+    def __repr__(self): return f"Laplacian({self.operand!r})"
+
 class Inner(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
     def __repr__(self): return f"Inner({self.a!r}, {self.b!r})"

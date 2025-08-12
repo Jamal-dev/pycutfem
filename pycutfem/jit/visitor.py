@@ -5,13 +5,15 @@ from pycutfem.ufl.expressions import (
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, 
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
     ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter,
-    NormalComponent, Restriction, Power as UFLPower, Trace as UFLTrace
+    NormalComponent, Restriction, Power as UFLPower, Trace as UFLTrace,
+    Hessian as UFLHessian, Laplacian as UFLLaplacian
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
     LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
-    CellDiameter, LoadFacetNormalComponent, CheckDomain, Trace
+    CellDiameter, LoadFacetNormalComponent, CheckDomain, Trace,
+    Hessian as IRHessian, Laplacian as IRLaplacian
 )
 from dataclasses import replace
 import logging
@@ -127,6 +129,28 @@ class IRGenerator:
                 return
             self._visit(op, side=side)
             self.ir_sequence.append(Grad())
+            return
+        
+        if isinstance(node, UFLHessian):
+            op = node.operand
+            if isinstance(op, Jump):
+                self._visit(UFLHessian(op.u_pos), side="+")
+                self._visit(UFLHessian(op.u_neg), side="-")
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                return
+            self._visit(op, side=side)
+            self.ir_sequence.append(IRHessian())
+            return
+
+        if isinstance(node, UFLLaplacian):
+            op = node.operand
+            if isinstance(op, Jump):
+                self._visit(UFLLaplacian(op.u_pos), side="+")
+                self._visit(UFLLaplacian(op.u_neg), side="-")
+                self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                return
+            self._visit(op, side=side)
+            self.ir_sequence.append(IRLaplacian())
             return
             
         if isinstance(node, DivOperation):

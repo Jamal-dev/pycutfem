@@ -10,6 +10,8 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.forms import Form, Equation
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
+from pycutfem.ufl.expressions import Hessian as UFLHessian, Laplacian as UFLLaplacian
+
 
 import logging
 # Setup logging
@@ -455,6 +457,62 @@ class GradOpInfo:
         """Return the type of the data array."""
         return f"GradOpInfo({self.data.dtype}, shape={self.data.shape}, role='{self.role}')"
 
+def make_hessian_from_ref(d20, d11, d02, role: str) -> "HessOpInfo":
+    """
+    d20,d11,d02 already padded to union length and stacked per component:
+    each of shape (k, n). Return HessOpInfo (k,n,2,2).
+    """
+    k, n = d20.shape
+    H = np.empty((k, n, 2, 2), dtype=d20.dtype)
+    H[..., 0, 0] = d20
+    H[..., 0, 1] = d11
+    H[..., 1, 0] = d11
+    H[..., 1, 1] = d02
+    return HessOpInfo(H, role=role)
+
+def make_laplacian_from_ref(d20, d02, role: str) -> VecOpInfo:
+    return VecOpInfo(d20 + d02, role=role)   # (k, n)
+
+
+
+@dataclass(slots=True, frozen=True)
+class HessOpInfo:
+    """
+    Hessian of basis functions, per component:
+    data shape: (k, n, d, d) — k components, n (union) dofs, d=2 spatial.
+    role: "test", "trial", or "function"
+    """
+    data: np.ndarray
+    role: str = "none"
+    coeffs: np.ndarray = field(default=None)
+
+    # Frobenius inner product: sum over (k, a, b), keep dof axes
+    def inner(self, other: "HessOpInfo"):
+        A, B = self.data, other.data
+        if A.ndim != 4 or B.ndim != 4:
+            raise ValueError("HessOpInfo.inner expects (k,n,2,2) arrays.")
+        if A.shape[0] != B.shape[0] or A.shape[2:] != B.shape[2:]:
+            raise ValueError(f"HessOpInfo component/spatial mismatch: {A.shape} vs {B.shape}")
+        # (k,n,2,2) ⨂ (k,m,2,2) → (n,m)
+        return np.tensordot(A, B, axes=([0,2,3], [0,2,3]))
+
+    # Trace over last two axes → Laplacian per component → VecOpInfo(k, n)
+    def trace(self) -> "VecOpInfo":
+        tr = self.data[..., 0, 0] + self.data[..., 1, 1]      # (k, n)
+        return VecOpInfo(tr, role=self.role)
+
+    # n^T H n projection → VecOpInfo(k,n)
+    def proj_nn(self, nvec: np.ndarray) -> "VecOpInfo":
+        n = np.asarray(nvec).reshape(2)
+        # (k,n,2,2) : (2,) : (2,) → (k,n)
+        tmp = np.einsum("kndp,p->knd", self.data, n, optimize=True)  # H n, shape (k,n,2)
+        val = np.einsum("knd,d->kn", tmp, n, optimize=True)          # nᵀ(H n)
+        return VecOpInfo(val, role=self.role)
+
+    @property
+    def shape(self): return self.data.shape
+    @property
+    def ndim(self): return self.data.ndim
 
 # ========================================================================
 # Generic walker
@@ -511,6 +569,10 @@ def required_multi_indices(expr: "Expression") -> Set[MultiIndex]:
             else:                       # unrecognised → just recurse
                 _walk(node.f, acc_x, acc_y)
             return
+        if isinstance(node, UFLHessian):
+            out.update({(2,0),(1,1),(0,2)}); _walk(node.operand, acc_x, acc_y); return
+        if isinstance(node, UFLLaplacian):
+            out.update({(2,0),(0,2)}); _walk(node.operand, acc_x, acc_y); return
 
         # ---- leaf: record accumulated orders ----------------------------
         if acc_x or acc_y:

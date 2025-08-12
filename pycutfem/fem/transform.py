@@ -4,6 +4,7 @@ Reference → physical mapping for linear elements.
 import numpy as np
 from pycutfem.fem.reference import get_reference
 from functools import lru_cache
+import warnings
 
 def _shape_and_grad(ref, xi_eta):
     xi,eta=xi_eta
@@ -235,3 +236,58 @@ def inverse_mapping(mesh, elem_id, x, tol=1e-10, maxiter=50):
         if np.linalg.norm(delta) < tol:
             break
     return xi
+
+
+
+#----------------------------- Hessian and Laplacian -----------------------------
+# === NEW: exact Hessian mapping up to order-2 ================================
+
+
+_warned_high_order = False
+
+def _hess_inverse_from_Hx(J_inv: np.ndarray, Hx0: np.ndarray, Hx1: np.ndarray):
+    """
+    Given J_inv = ∂ξ/∂x and Hxβ = ∂² x_β / ∂ξ∂ξ (β=0,1), return Hξα = ∂² ξ_α / ∂x∂x.
+    Hξα(ν,γ) = - ∑_{μ,λ} ( ∑_β A_{αβ} Hxβ_{μλ} ) A_{λν} A_{μγ},   A ≡ J_inv.
+    """
+    A = J_inv
+    C0 = A[0,0]*Hx0 + A[0,1]*Hx1
+    C1 = A[1,0]*Hx0 + A[1,1]*Hx1
+    Hxi0 = -np.einsum("ml,ln,mg->ng", C0, A, A, optimize=True)
+    Hxi1 = -np.einsum("ml,ln,mg->ng", C1, A, A, optimize=True)
+    return Hxi0, Hxi1
+
+def element_Hxi(mesh, elem_id: int, xi_eta: tuple[float,float]):
+    """
+    Exact Hξ for geometry orders ≤ 2. For higher orders, warn once and return zeros.
+    """
+    xi, eta = xi_eta
+    ref = get_reference(mesh.element_type, mesh.poly_order)
+    J = jacobian(mesh, elem_id, (xi, eta))
+    A = np.linalg.inv(J)
+
+    # affine (P1 tri / Q1 bilinear) → exact, Hξ = 0
+    if mesh.poly_order <= 1:
+        Z = np.zeros((2,2), dtype=J.dtype)
+        return J, A, Z, Z
+
+    # quadratic (P2 / Q2) → compute geometry shape Hessians exactly
+    if mesh.poly_order == 2:
+        HN = np.asarray(ref.hess(xi, eta))          # (nLocGeom, 2, 2)
+        nodes = mesh.nodes[mesh.elements_connectivity[elem_id]]
+        X = mesh.nodes_x_y_pos[nodes].astype(float) # (nLocGeom, 2)
+        Hx0 = np.einsum("iij, i->ij", HN, X[:,0], optimize=True)  # (2,2)
+        Hx1 = np.einsum("iij, i->ij", HN, X[:,1], optimize=True)
+        Hxi0, Hxi1 = _hess_inverse_from_Hx(A, Hx0, Hx1)
+        return J, A, Hxi0, Hxi1
+
+    global _warned_high_order_hess
+    if not _warned_high_order_hess:
+        warnings.warn(
+            f"[transform] Exact Hessian map not implemented for element_type={mesh.element_type}, "
+            f"poly_order={mesh.poly_order}. Falling back to affine-like approximation (Hξ=0).",
+            RuntimeWarning
+        )
+        _warned_high_order_hess = True
+    Z = np.zeros((2,2), dtype=J.dtype)
+    return J, A, Z, Z
