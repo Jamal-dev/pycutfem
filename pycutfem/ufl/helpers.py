@@ -475,6 +475,7 @@ def make_laplacian_from_ref(d20, d02, role: str) -> VecOpInfo:
 
 
 
+
 @dataclass(slots=True, frozen=True)
 class HessOpInfo:
     """
@@ -486,20 +487,75 @@ class HessOpInfo:
     role: str = "none"
     coeffs: np.ndarray = field(default=None)
 
-    # Frobenius inner product: sum over (k, a, b), keep dof axes
-    def inner(self, other: "HessOpInfo"):
+    # ---------- linear algebra ops on the Hessian tensor -----------------
+
+    def transpose(self) -> "HessOpInfo":
+        """Swap the last two (spatial) axes i↔j; keep (k, n) intact."""
+        return HessOpInfo(self.data.swapaxes(-1, -2), role=self.role, coeffs=self.coeffs)
+
+    def __neg__(self) -> "HessOpInfo":
+        return HessOpInfo(-self.data, role=self.role, coeffs=self.coeffs)
+
+    def __mul__(self, other):
+        """Scalar multiplication (left or right)."""
+        if isinstance(other, (int, float, np.floating)):
+            return HessOpInfo(self.data * other, role=self.role, coeffs=self.coeffs)
+        if isinstance(other, np.ndarray) and other.ndim == 0:
+            return HessOpInfo(self.data * float(other), role=self.role, coeffs=self.coeffs)
+        raise TypeError(f"HessOpInfo can only be multiplied by scalars, not {type(other)}")
+    __rmul__ = __mul__
+
+    def __add__(self, other: "HessOpInfo") -> "HessOpInfo":
+        if not isinstance(other, HessOpInfo):
+            raise TypeError(f"Cannot add HessOpInfo to {type(other)}.")
+        if self.data.shape != other.data.shape:
+            raise ValueError(f"HessOpInfo shapes mismatch in addition: {self.data.shape} vs {other.data.shape}.")
+        if self.role != other.role:
+            raise ValueError(f"Cannot add HessOpInfo with different roles: {self.role} vs {other.role}.")
+        # prefer keeping coeffs only if both match, otherwise drop
+        coeffs = self.coeffs if (self.coeffs is other.coeffs) else None
+
+        return HessOpInfo(self.data + other.data, role=self.role, coeffs=coeffs)
+
+    def __sub__(self, other: "HessOpInfo") -> "HessOpInfo":
+        return self.__add__(-other)
+
+    # ---------- algebra used in assembly ---------------------------------
+    def trace(self) -> "VecOpInfo":
+        """
+        Trace over spatial axes → per‑component Laplacian table with shape (k, n).
+        Note: for role=='function' we purposely *do not* contract with coeffs here.
+        That contraction (if needed) is handled at the integrand level (e.g. in _visit_Inner).
+        """
+        tr = self.data[..., 0, 0] + self.data[..., 1, 1]      # (k, n)
+        return VecOpInfo(tr, role=self.role)
+
+
+
+    # n^T H n projection → VecOpInfo(k,n)
+
+    def proj_nn(self, nvec: np.ndarray) -> "VecOpInfo":
+
+        n = np.asarray(nvec).reshape(2)
+
+        tmp = np.einsum("kndp,p->knd", self.data, n, optimize=True)  # H n, shape (k,n,2)
+
+        val = np.einsum("knd,d->kn", tmp, n, optimize=True)          # nᵀ(H n)
+
+        return VecOpInfo(val, role=self.role)
+
+    def inner(self, other: "HessOpInfo") -> np.ndarray:
+        """
+        Frobenius inner product per DOF pair:
+
+          (n_test, n_trial) ← einsum("k n i j, k m i j -> n m", Htest, Htrial)
+        """
         A, B = self.data, other.data
         if A.ndim != 4 or B.ndim != 4:
             raise ValueError("HessOpInfo.inner expects (k,n,2,2) arrays.")
         if A.shape[0] != B.shape[0] or A.shape[2:] != B.shape[2:]:
             raise ValueError(f"HessOpInfo component/spatial mismatch: {A.shape} vs {B.shape}")
-        # (k,n,2,2) ⨂ (k,m,2,2) → (n,m)
-        return np.tensordot(A, B, axes=([0,2,3], [0,2,3]))
-
-    # Trace over last two axes → Laplacian per component → VecOpInfo(k, n)
-    def trace(self) -> "VecOpInfo":
-        tr = self.data[..., 0, 0] + self.data[..., 1, 1]      # (k, n)
-        return VecOpInfo(tr, role=self.role)
+        return np.einsum("knij,kmij->nm", A, B, optimize=True)
 
     # n^T H n projection → VecOpInfo(k,n)
     def proj_nn(self, nvec: np.ndarray) -> "VecOpInfo":
@@ -513,6 +569,11 @@ class HessOpInfo:
     def shape(self): return self.data.shape
     @property
     def ndim(self): return self.data.ndim
+    def __repr__(self): return f"HessOpInfo(shape={self.data.shape}, role='{self.role}')"
+
+    def info(self): return f"HessOpInfo({self.data.dtype}, shape={self.data.shape}, role='{self.role}')"
+
+
 
 # ========================================================================
 # Generic walker

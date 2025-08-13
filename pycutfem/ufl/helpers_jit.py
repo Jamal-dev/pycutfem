@@ -60,16 +60,16 @@ def _find_all_bitsets(expr):
     return list(bitsets)
 
 
-def _build_jit_kernel_args(       # ← NEW signature (unchanged)
-        ir,                       # linear IR produced by the visitor
-        expression,               # the UFL integrand
-        mixed_element,            # MixedElement instance
-        q_order: int,             # quadrature order
-        dof_handler,              # DofHandler – *needed* for padding
-        gdofs_map: np.ndarray=None,  # global DOF map (mixed-space)
-        param_order=None,          # order of parameters in the JIT kernel
-        pre_built: dict | None = None
-    ):
+def _build_jit_kernel_args(       # ← signature unchanged
+    ir,                           # linear IR produced by the visitor
+    expression,                   # the UFL integrand
+    mixed_element,                # MixedElement instance
+    q_order: int,                 # quadrature order
+    dof_handler,                  # DofHandler – *needed* for padding
+    gdofs_map: np.ndarray = None, # global DOF map (mixed-space)
+    param_order=None,             # order of parameters in the JIT kernel
+    pre_built: dict | None = None
+):
     """
     Return a **dict { name -> ndarray }** with *all* reference-space tables
     and coefficient arrays the kernel lists in `param_order`
@@ -86,18 +86,24 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     * Set ``PYCUTFEM_JIT_DEBUG=1`` to get a short print-out of every array
       built (name, shape, dtype) – useful for verification.
     """
-
-    import logging
-
+    import os, re, numpy as np
+    from typing import Dict, Any
+    from pycutfem.integration.quadrature import volume
     from pycutfem.ufl.expressions import (
         Function, VectorFunction, Constant as UflConst, Grad, ElementWiseConstant
     )
-    from pycutfem.jit.ir import LoadVariable, LoadConstantArray, LoadElementWiseConstant
+    from pycutfem.jit.ir import LoadVariable, LoadConstantArray
     from pycutfem.ufl.analytic import Analytic
     from pycutfem.ufl.helpers import _find_all
-    
 
-    logger = logging.getLogger(__name__)
+    # Optional: BitSet finder (fallback to no-op if not available)
+    try:
+        from pycutfem.ufl.helpers import _find_all_bitsets  # type: ignore
+    except Exception:
+        def _find_all_bitsets(_expr):  # noqa: N802
+            return []
+
+    logger = __import__("logging").getLogger(__name__)
     dbg    = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
 
     # ------------------------------------------------------------------
@@ -110,18 +116,15 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         dtype=np.float64
     )
 
-
     def _expand_per_element(ref_tab: np.ndarray) -> np.ndarray:
         """
         Replicate a reference-space table so that shape[0] == n_elem.
-
-        We keep memory overhead low with ``np.broadcast_to``; the
-        result is read-only, which is fine because kernels never write
-        into these tables.
         """
         return np.broadcast_to(ref_tab, (n_elem, *ref_tab.shape)).copy()
 
-    
+    # Reference-element quadrature (ξ-space) for table builders
+    qp_ref, _ = volume(mixed_element.mesh.element_type, q_order)
+
     def _basis_table(field: str):
         ref = np.asarray([mixed_element.basis(field, *xi_eta)
                           for xi_eta in qp_ref], dtype=np.float64)      # (n_q , n_loc)
@@ -130,7 +133,7 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
     def _grad_table(field: str):
         ref = np.asarray([mixed_element.grad_basis(field, *xi_eta)
                           for xi_eta in qp_ref], dtype=np.float64)      # (n_q , n_loc , 2)
-        return _expand_per_element(ref)  
+        return _expand_per_element(ref)                                 # (n_elem , n_q , n_loc , 2)
 
     def _deriv_table(field: str, ax: int, ay: int):
         """∂^{ax+ay} φ_i / ∂ξ^{ax} ∂η^{ay}"""
@@ -138,16 +141,21 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
             [mixed_element.deriv_ref(field, *xi_eta, ax, ay)
              for xi_eta in qp_ref],
             dtype=np.float64
-            )
+        )
         return _expand_per_element(ref)                                 # (n_elem, n_q, n_loc)
 
-    # ------------------------------------------------------------------
-    # 1. Reference-element quadrature (ξ-space)
-    # ------------------------------------------------------------------
-    qp_ref, _ = volume(mixed_element.mesh.element_type, q_order)
+    def _decode_coeff_name(name: str):
+        """Parse u_<field>_loc | u_<field>_pos_loc | u_<field>_neg_loc → (field, side)."""
+        assert name.startswith("u_") and name.endswith("_loc")
+        mid = name[2:-4]
+        if mid.endswith("_pos"):
+            return mid[:-4], "pos"
+        if mid.endswith("_neg"):
+            return mid[:-4], "neg"
+        return mid, None
 
     # ------------------------------------------------------------------
-    # 2. Map Function / VectorFunction names  →  objects
+    # 1. Map Function / VectorFunction names  →  objects
     # ------------------------------------------------------------------
     func_map: Dict[str, Any] = {}
 
@@ -160,16 +168,14 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         for comp, fld in zip(vf.components, vf.field_names):
             func_map.setdefault(fld, vf)
 
-    # ------------------------------------------------------------------
     # make sure every component points back to its parent VectorFunction
-    # ------------------------------------------------------------------
     for f in list(func_map.values()):
         pv = getattr(f, "_parent_vector", None)
         if pv is not None and hasattr(pv, "name"):
             func_map.setdefault(pv.name, pv)
 
     # ------------------------------------------------------------------
-    # 3. Collect EVERY parameter the kernel will expect
+    # 2. Collect EVERY parameter the kernel will expect
     # ------------------------------------------------------------------
     required: set[str] = set(param_order) if param_order is not None else set()
 
@@ -178,14 +184,13 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         for op in ir:
             if isinstance(op, LoadVariable):
                 fnames = (op.field_names if op.is_vector and op.field_names
-                        else [op.name])
+                          else [op.name])
                 for fld in fnames:
                     if op.deriv_order == (0, 0):
                         required.add(f"b_{fld}")
                     else:
                         d0, d1 = op.deriv_order
                         required.add(f"d{d0}{d1}_{fld}")
-
                     if op.role == "function":
                         required.add(f"u_{op.name}_loc")
 
@@ -200,59 +205,47 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
                 required.add(f"g_{op.field_name}")
 
     # ------------------------------------------------------------------
-    # 4. Build each requested array (skip ones already delivered elsewhere)
+    # 3. Start with pre_built arrays (geometry, facet maps, etc.)
     # ------------------------------------------------------------------
     if pre_built is None:
         pre_built = {}
 
     # Allow base keys, plus exactly what this kernel says it needs in `param_order`.
     base_allow = {
+        # geometry / meta (unsided)
         "gdofs_map", "node_coords", "element_nodes",
         "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
         "eids", "entity_kind",
         "owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids",
 
+        # Hessian-of-inverse-map tensors (volume / boundary / interface)
+        "Hxi0", "Hxi1",
+
+        # sided Hessian tensors for ghost facets (and similar)
+        "pos_Hxi0", "pos_Hxi1",
+        "neg_Hxi0", "neg_Hxi1",
     }
     needed = set(param_order) if param_order is not None else set()
 
     # Side keys can appear under many names; keep only the ones actually present/needed.
-    side_keys_present = set(k for k in (pre_built or {}).keys() if k.startswith(("pos_", "neg_")))
+    side_keys_present = {k for k in pre_built.keys() if k.startswith(("pos_", "neg_"))}
 
     pre_built = {
-        k: v for k, v in (pre_built or {}).items()
+        k: v for k, v in pre_built.items()
         if (k in base_allow) or (k in needed) or (k in side_keys_present)
     }
     args: Dict[str, Any] = dict(pre_built)
 
-    # --- derived row info --------------------------------------------------
-    # Number of rows the kernel will loop over
-    _n_rows = None
-    if gdofs_map is not None:
-        _n_rows = int(gdofs_map.shape[0])
-    elif "qp_phys" in args:
-        _n_rows = int(np.asarray(args["qp_phys"]).shape[0])
-    else:
-        for _k in ("pos_qp_phys", "neg_qp_phys"):
-            if _k in args:
-                _n_rows = int(np.asarray(args[_k]).shape[0]); break
+    # OPTIONAL alias: if a sided Hxi was requested but missing, fall back to unsided if available.
+    for _side in ("pos", "neg"):
+        for _t in ("Hxi0", "Hxi1"):
+            _k = f"{_side}_{_t}"
+            if (_k in needed) and (_k not in args) and (_t in pre_built):
+                args[_k] = pre_built[_t]
 
-    # Row -> owner element ids if precompute provided them (never overwrite 'eids')
-    _row_eids = None
-    if "owner_id" in args:
-        _row_eids = np.asarray(args["owner_id"], dtype=np.int32)
-    elif "eids" in args and args.get("entity_kind", "element") == "element":
-        _row_eids = np.asarray(args["eids"], dtype=np.int32)
-
-    # Ghost/internal edges: prefer explicit owners when present
-    _pos_owner = args.get("owner_pos_id", args.get("pos_eids", None))
-    _neg_owner = args.get("owner_neg_id", args.get("neg_eids", None))
-    if _pos_owner is not None:
-        _pos_owner = np.asarray(_pos_owner, dtype=np.int32)
-    if _neg_owner is not None:
-        _neg_owner = np.asarray(_neg_owner, dtype=np.int32)
-
-
-    # --- helper: expand a subset-length per-element array to full length using eids ---
+    # ------------------------------------------------------------------
+    # 4. BitSets present in the expression → full-length element masks
+    # ------------------------------------------------------------------
     n_elems = mixed_element.mesh.n_elements
     eids = None
     if "eids" in args and args["eids"] is not None:
@@ -267,24 +260,18 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         """
         a = np.asarray(arr)
         if a.ndim == 0:
-            return a  # scalar, nothing to do
-
-        # Already full-length?
+            return a  # scalar
         if a.shape[0] == n_elems:
             return a
-
-        # Subset → expand to full using eids
         if eids is not None and a.shape[0] == eids.shape[0]:
             out = np.zeros((n_elems,) + a.shape[1:], dtype=a.dtype)
             out[eids] = a
             return out
-
         raise ValueError(
             f"{what}: got length {a.shape[0]} but expected either n_elems={n_elems} "
             f"or len(eids)={0 if eids is None else int(eids.shape[0])}."
         )
 
-    # --- Add all domain BitSets used in the expression ---
     all_bitsets_in_form = _find_all_bitsets(expression)
     for bs in all_bitsets_in_form:
         pname = f"domain_bs_{id(bs)}"
@@ -294,13 +281,13 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
         )
         args[pname] = mask_full
 
-
-    # --- Constant nd-arrays (unchanged)
+    # ------------------------------------------------------------------
+    # 5. Constants / EWC / coefficient vectors / reference tables
+    # ------------------------------------------------------------------
     const_arrays = {
         f"const_arr_{id(c)}": c
         for c in _find_all(expression, UflConst) if c.dim != 0
     }
-    # args.update(const_arrays)
 
     # cache gdofs_map for coefficient gathering
     if gdofs_map is None:
@@ -311,12 +298,8 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
 
     total_dofs = dof_handler.total_dofs
 
-
-
     for name in sorted(required):
-        
         # Always supply global element-length h_arr for CellDiameter
-        # ---- cell diameter (row-aligned) -------------------------------------
         if name == "h_arr":
             args["h_arr"] = _h_global
             continue
@@ -340,114 +323,48 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
             ax, ay = int(tag[1]), int(tag[2])
             args[name] = _deriv_table(fld, ax, ay)
 
-        
-        
-        
-        
         # ---- constant arrays ---------------------------------------------
         elif name in const_arrays:
             vals = np.asarray(const_arrays[name].value, dtype=np.float64)
-            # If it’s element-indexed (vals.shape[0] == n_elems), keep full length.
             args[name] = vals
 
-
-
-        # ---- element-wise constants ---------------------------------------------
+        # ---- element-wise constants --------------------------------------
         elif name.startswith("ewc_"):
             obj_id = int(name.split("_", 1)[1])
+            # find the EWC by id
             ewc = next(c for c in _find_all(expression, ElementWiseConstant) if id(c) == obj_id)
             arr = np.asarray(ewc.values, dtype=np.float64)  # shape (n_elems, ...)
             args[name] = arr
-            
 
-
-        
-        # ---- analytic expressions ------------------------------------------------
+        # ---- analytic expressions ----------------------------------------
         elif name.startswith("ana_"):
             func_id = int(name.split("_", 1)[1])
-            ana = next(a for a in _find_all(expression, Analytic)
-                    if id(a) == func_id)
-
-            # physical quadrature coordinates have already been built a few lines
-            # earlier and live in args["qp_phys"]  (shape = n_elem × n_qp × 2)
-            qp_phys = args["qp_phys"]
-            n_elem, n_qp, _ = qp_phys.shape
-            ana_vals = np.empty((n_elem, n_qp), dtype=np.float64)
-
-            # tabulate once, in pure NumPy
+            ana = next(a for a in _find_all(expression, Analytic) if id(a) == func_id)
+            qp_phys = args["qp_phys"]                      # (n_elem, n_qp, 2)
+            n_elem_, n_qp, _ = qp_phys.shape
+            ana_vals = np.empty((n_elem_, n_qp), dtype=np.float64)
             x = qp_phys[..., 0]
             y = qp_phys[..., 1]
-            ana_vals[:] = ana.eval(np.stack((x, y), axis=-1))   # vectorised call
-
+            ana_vals[:] = ana.eval(np.stack((x, y), axis=-1))   # vectorised
             args[name] = ana_vals
-        
-        # -------------------------------------------------------------------------
-        #  Handle coefficient-vector kernel parameters
-        #  •  u_<field>_loc                 – element-volume  (side=None)
-        #  •  u_<field>_(pos|neg)_loc       – interior facet (side="pos"/"neg")
-        #  •  u_u_…  /  u_<side>_loc / u_loc – special cases when the field itself
-        #                                      is literally called “u”
-        # -------------------------------------------------------------------------
-        elif (name.startswith("u_") and name.endswith("_loc")) :
-           
 
-            # ---- 1. who is it? ------------------------------------------------
-            field, side = symbols.decode_coeff(name)         # ("u", "neg"), ("velocity", None), …
-
-            f = func_map.get(field)
-            if f is None:
+        # ---- coefficient vectors (gather) --------------------------------
+        elif (name.startswith("u_") and name.endswith("_loc")):
+            field, _side = _decode_coeff_name(name)
+            fobj = func_map.get(field)
+            if fobj is None:
                 raise NameError(
-                    "Kernel requests coefficient array for unknown Function "
-                    f"or VectorFunction '{field}'."
-                    f" input name: {name}"
-                    f" side: {side}"
+                    "Kernel requests coefficient array for unknown Function/VectorFunction "
+                    f"'{field}'. Input name: {name}"
                 )
-
-            # ---- 2. build the GLOBAL vector once ------------------------------
+            # Build the GLOBAL vector once
             full = np.zeros(total_dofs, dtype=np.float64)
-            full[list(f._g2l.keys())] = f.nodal_values
-
-            # ---- 3. gather what the kernel needs ------------------------------
-            # ---- facet / ghost-edge geometry (robust to missing side) ---------
-            facet_sides = [s for s in ("pos", "neg")
-                        if any(f"{s}_{suffix}" in pre_built
-                                for suffix in ("map", "qp_phys", "qw", "detJ", "J_inv", "normals", "phis", "eids"))]
-
-            for side in facet_sides:
-                # Copy over whatever this side actually provides
-                for suffix in ("map", "qp_phys", "qw", "detJ", "J_inv", "normals", "phis", "eids"):
-                    key = f"{side}_{suffix}"
-                    if key not in pre_built:
-                        continue
-                    val = pre_built[key]
-                    if suffix == "map":
-                        # maps can be ragged (1D of objects) → densify
-                        arr = np.asarray(val)
-                        if arr.ndim == 1 and arr.dtype == object:
-                            # use your existing helper if present; otherwise simple stack
-                            try:
-                                val = _stack_ragged(arr)  # preferred helper if you have it
-                            except NameError:
-                                val = np.vstack([np.asarray(row, dtype=np.int32) for row in arr]).astype(np.int32)
-                    args[key] = val
-
-            # For facet kernels, provide an owner-element eid mapping if available.
-            # This lets the Restriction check index the domain mask by element.
-            if args.get("entity_kind", None) != "element" and "eids" not in args:
-                if "pos_eids" in pre_built:
-                    args["eids"] = np.asarray(pre_built["pos_eids"], dtype=np.int32)
-                elif "neg_eids" in pre_built:
-                    args["eids"] = np.asarray(pre_built["neg_eids"], dtype=np.int32)
-                # else: leave absent; the kernel-side guard will handle it
-
-                continue                                    # done – next param
-
-            # ---- volume tables -----------------------------------------------
+            full[list(fobj._g2l.keys())] = fobj.nodal_values
+            # Gather per-element block (union-local ordering)
             args[name] = full[gdofs_map]
-            continue
 
     # ------------------------------------------------------------------
-    # 5. Optional debug print
+    # 6. Optional debug print
     # ------------------------------------------------------------------
     if dbg:
         print("[build_jit_kernel_args] built:")
@@ -458,6 +375,7 @@ def _build_jit_kernel_args(       # ← NEW signature (unchanged)
                 print(f"    {k:<20} type={type(v).__name__}")
 
     return args
+
 
 
 #----------------------------------------------------------------------

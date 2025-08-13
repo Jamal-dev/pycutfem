@@ -40,12 +40,12 @@ from pycutfem.ufl.expressions import (
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
     ElementWiseConstant, Derivative, Transpose,
     CellDiameter, NormalComponent,
-    Restriction, Power, Trace
+    Restriction, Power, Trace, Hessian, Laplacian
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
-from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, required_multi_indices,_all_fields,_find_all,_trial_test
+from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, HessOpInfo, required_multi_indices,_all_fields,_find_all,_trial_test
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 from pycutfem.ufl.helpers_geom import (
@@ -103,7 +103,9 @@ class FormCompiler:
             NormalComponent: self._visit_NormalComponent,
             Restriction: self._visit_Restriction,
             Power: self._visit_Power,
-            Trace: self._visit_Trace
+            Trace: self._visit_Trace,
+            Hessian: self._visit_Hessian,
+            Laplacian: self._visit_Laplacian
         }
 
     # ============================ PUBLIC API ===============================
@@ -264,6 +266,10 @@ class FormCompiler:
                 tr_vec += A.data[i, :, i]
             # Return as a 1-component vector basis block: (1, n_loc)
             return VecOpInfo(np.stack([tr_vec]), role=A.role)
+        
+        # Hessian-like object
+        if isinstance(A, HessOpInfo):
+            return A.trace()
 
         # VecOpInfo or other types are not meaningful for trace
         raise TypeError(f"Trace not implemented for {type(A)}")
@@ -872,7 +878,33 @@ class FormCompiler:
             #  print(f"&"*32)
              return np.sum(a.data * b.data)
 
+        # --- Hessian · Hessian cases -------------------------------------------------
+        if isinstance(a, HessOpInfo) and isinstance(b, HessOpInfo):
+            # RHS: Function vs Test/Trial
+            if self.ctx.get('rhs'):
+                if a.role == 'function' and b.role in ('test','trial'):
+                    if a.coeffs is None:
+                        raise ValueError('Hessian(Function) missing coeffs for RHS contraction.')
+                    kdij = np.einsum('knij,kn->kij', a.data, a.coeffs, optimize=True)
+                    # f_n = Σ_{k,i,j} kdij * Htest[k,n,i,j]
+                    f = np.einsum('kij,knij->n', kdij, b.data, optimize=True)
+                    return VecOpInfo(np.stack([f]), role=b.role)
+                if b.role == 'function' and a.role in ('test','trial'):
+                    if b.coeffs is None:
+                        raise ValueError('Hessian(Function) missing coeffs for RHS contraction.')
+                    kdij = np.einsum('knij,kn->kij', b.data, b.coeffs, optimize=True)
+                    f = np.einsum('kij,knij->n', kdij, a.data, optimize=True)
+                    return VecOpInfo(np.stack([f]), role=a.role)
+                raise NotImplementedError('Unsupported RHS Hessian inner-product configuration.')
+            # LHS: assemble (n_test, n_trial)
+            if a.role == 'test' and b.role == 'trial':
+                return a.inner(b)
+            if a.role == 'trial' and b.role == 'test':
+                return b.inner(a)
+            raise NotImplementedError(f'Hessian inner not implemented for roles {a.role} and {b.role}.')
+        
         raise TypeError(f"Unsupported inner product '{n.a} : {n.b}'")
+    
         
     # Visitor dispatch
     def _visit(self, node): return self._dispatch[type(node)](node)
