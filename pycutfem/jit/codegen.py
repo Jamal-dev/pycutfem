@@ -191,12 +191,15 @@ class NumbaCodeGen:
                             f"d10_q = {d10[i]}[e, q]", f"d01_q = {d01[i]}[e, q]",
                             f"d20_q = {d20[i]}[e, q]", f"d11_q = {d11[i]}[e, q]", f"d02_q = {d02[i]}[e, q]",
                             "nloc = d20_q.shape[0]",
-                            f"{Hloc} = np.empty((nloc, 2, 2), dtype=d20_q.dtype)",
+                            f"{Hloc} = np.zeros((nloc, 2, 2), dtype={self.dtype})",
+                            f"Href = np.zeros((2, 2), dtype={self.dtype})",
                             "for j in range(nloc):",
-                            "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
-                            "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
+                            f"    Href[0, 0] = d20_q[j]", 
+                            f"    Href[0, 1] = d11_q[j]",
+                            f"    Href[1, 0] = d11_q[j]",
+                            f"    Href[1, 1] = d02_q[j]",
                             "    core = A.T @ (Href @ A)",
-                            "    Hphys = core + gref[0]*Hx + gref[1]*Hy",
+                            "    Hphys = core + d10_q[j]*Hx + d01_q[j]*Hy",
                             f"    {Hloc}[j] = Hphys",
                         ]
                         if a.side:  # pad to union using map
@@ -205,7 +208,7 @@ class NumbaCodeGen:
                             Hpad, me = new_var("Hpad"), new_var("map_e")
                             body_lines += [
                                 f"{me} = {map_arr}[e]",
-                                f"{Hpad} = np.zeros((n_union, 2, 2), dtype=d20_q.dtype)",
+                                f"{Hpad} = np.zeros((n_union, 2, 2), dtype={self.dtype})",
                                 "for j in range(nloc):",
                                 f"    idx = {me}[j]",
                                 "    if 0 <= idx < n_union:",
@@ -228,7 +231,7 @@ class NumbaCodeGen:
                             else f"u_{a.parent_name}_loc")
                     required_args.add(coeff)
 
-                    body_lines += [f"{out} = np.empty(({k_comps}, 2, 2), dtype={self.dtype})"]
+                    body_lines += [f"{out} = np.zeros(({k_comps}, 2, 2), dtype={self.dtype})"]
                     for i, fn in enumerate(a.field_names):
                         Hloc = new_var("Hloc")
                         body_lines += [
@@ -237,12 +240,15 @@ class NumbaCodeGen:
                             f"d10_q = {d10[i]}[e, q]", f"d01_q = {d01[i]}[e, q]",
                             f"d20_q = {d20[i]}[e, q]", f"d11_q = {d11[i]}[e, q]", f"d02_q = {d02[i]}[e, q]",
                             "nloc = d20_q.shape[0]",
-                            f"{Hloc} = np.empty((nloc, 2, 2), dtype=d20_q.dtype)",
+                            f"{Hloc} = np.zeros((nloc, 2, 2), dtype={self.dtype})",
+                            f"Href = np.zeros((2, 2), dtype={self.dtype})",
                             "for j in range(nloc):",
-                            "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
-                            "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
+                            "    Href[0, 0] = d20_q[j]",
+                            "    Href[0, 1] = d11_q[j]",
+                            "    Href[1, 0] = d11_q[j]",
+                            "    Href[1, 1] = d02_q[j]",
                             "    core = A.T @ (Href @ A)",
-                            "    Hphys = core + gref[0]*Hx + gref[1]*Hy",
+                            "    Hphys = core + d10_q[j]*Hx + d01_q[j]*Hy",
                             f"    {Hloc}[j] = Hphys",
                         ]
                         if a.side:
@@ -252,21 +258,32 @@ class NumbaCodeGen:
                             body_lines += [
                                 f"{me} = {map_arr}[e]",
                                 "n_union = gdofs_map[e].shape[0]",
-                                f"{Hpad} = np.zeros((n_union, 2, 2), dtype=d20_q.dtype)",
+                                f"{Hpad} = np.zeros((n_union, 2, 2), dtype={self.dtype})",
                                 "for j in range(nloc):",
                                 f"    idx = {me}[j]",
                                 "    if 0 <= idx < n_union:",
                                 f"        {Hpad}[idx] = {Hloc}[j]",
-                                f"Hval = np.tensordot({coeff}, {Hpad}, axes=(0,0))",  # (2,2)
+                                # --- tensordot-free collapse: (n,2,2) -> (2,2)
+                                f"c = {coeff}.astype({self.dtype})",
+                                f"M = {Hpad}.reshape({Hpad}.shape[0], 4)",
+                                "hflat = M.T @ c",               # (4,)
+                                "Hval = hflat.reshape(2, 2)",    # (2,2)
                             ]
                         else:
-                            body_lines += [f"Hval = np.tensordot({coeff}, {Hloc}, axes=(0,0))"]  # (2,2)
+                            # --- tensordot-free collapse: (n,2,2) -> (2,2)
+                            body_lines += [
+                                f"c = {coeff}.astype({self.dtype})",
+                                f"M = {Hloc}.reshape({Hloc}.shape[0], 4)",
+                                "hflat = M.T @ c",               # (4,)
+                                "Hval = hflat.reshape(2, 2)",    # (2,2)
+                            ]
                         body_lines += [f"{out}[{i}] = Hval"]
 
                     stack.append(StackItem(var_name=out, role="value",
                                         shape=(k_comps, 2, 2),
                                         is_vector=False, is_hessian=True,
                                         field_names=a.field_names, side=a.side))
+
 
 
                 else:
@@ -316,15 +333,18 @@ class NumbaCodeGen:
                             f"d10_q = {d10[i]}[e, q]", f"d01_q = {d01[i]}[e, q]",
                             f"d20_q = {d20[i]}[e, q]", f"d11_q = {d11[i]}[e, q]", f"d02_q = {d02[i]}[e, q]",
                             "nloc = d20_q.shape[0]",
-                            f"{laploc} = np.empty((nloc,), dtype=d20_q.dtype)",
+                            f"{laploc} = np.zeros((nloc,), dtype= {self.dtype})",
                             "tHx = Hx[0,0] + Hx[1,1]",
                             "tHy = Hy[0,0] + Hy[1,1]",
+                            f"Href = np.zeros((2, 2), dtype={self.dtype})",
                             "for j in range(nloc):",
-                            "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
-                            "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
+                            f"    Href[0, 0] = d20_q[j]",
+                            f"    Href[0, 1] = d11_q[j]",
+                            f"    Href[1, 0] = d11_q[j]",
+                            f"    Href[1, 1] = d02_q[j]",
                             "    core = A.T @ (Href @ A)",
                             "    tr_core = core[0,0] + core[1,1]",
-                            "    lap_j = tr_core + gref[0]*tHx + gref[1]*tHy",
+                            "    lap_j = tr_core + d10_q[j]*tHx + d01_q[j]*tHy",
                             f"    {laploc}[j] = lap_j",
                         ]
                         if a.side:
@@ -333,7 +353,7 @@ class NumbaCodeGen:
                             lap_pad, me = new_var("lap_pad"), new_var("map_e")
                             body_lines += [
                                 f"{me} = {map_arr}[e]",
-                                f"{lap_pad} = np.zeros((n_union,), dtype=d20_q.dtype)",
+                                f"{lap_pad} = np.zeros((n_union,), dtype={self.dtype})",
                                 "for j in range(nloc):",
                                 f"    idx = {me}[j]",
                                 "    if 0 <= idx < n_union:",
@@ -354,7 +374,7 @@ class NumbaCodeGen:
                             else f"u_{a.parent_name}_loc")
                     required_args.add(coeff)
 
-                    vals = []  # one scalar laplacian per component
+                    body_lines += [f"{out} = np.zeros(({k_comps},), dtype={self.dtype})"]
                     for i, fn in enumerate(a.field_names):
                         laploc = new_var("laploc")
                         body_lines += [
@@ -363,15 +383,18 @@ class NumbaCodeGen:
                             f"d10_q = {d10[i]}[e, q]", f"d01_q = {d01[i]}[e, q]",
                             f"d20_q = {d20[i]}[e, q]", f"d11_q = {d11[i]}[e, q]", f"d02_q = {d02[i]}[e, q]",
                             "nloc = d20_q.shape[0]",
-                            f"{laploc} = np.empty((nloc,), dtype=d20_q.dtype)",
+                            f"{laploc} = np.zeros((nloc,), dtype={self.dtype})",
                             "tHx = Hx[0,0] + Hx[1,1]",
                             "tHy = Hy[0,0] + Hy[1,1]",
+                            f"Href = np.zeros((2, 2), dtype={self.dtype})",
                             "for j in range(nloc):",
-                            "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
-                            "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
+                            f"    Href[0, 0] = d20_q[j]",
+                            f"    Href[0, 1] = d11_q[j]",
+                            f"    Href[1, 0] = d11_q[j]",
+                            f"    Href[1, 1] = d02_q[j]",
                             "    core = A.T @ (Href @ A)",
                             "    tr_core = core[0,0] + core[1,1]",
-                            "    lap_j = tr_core + gref[0]*tHx + gref[1]*tHy",
+                            "    lap_j = tr_core + d10_q[j]*tHx + d01_q[j]*tHy",
                             f"    {laploc}[j] = lap_j",
                         ]
                         if a.side:
@@ -381,23 +404,18 @@ class NumbaCodeGen:
                             body_lines += [
                                 f"{me} = {map_arr}[e]",
                                 "n_union = gdofs_map[e].shape[0]",
-                                f"{lap_pad} = np.zeros((n_union,), dtype=d20_q.dtype)",
+                                f"{lap_pad} = np.zeros((n_union,), dtype={self.dtype})",
                                 "for j in range(nloc):",
                                 f"    idx = {me}[j]",
                                 "    if 0 <= idx < n_union:",
                                 f"        {lap_pad}[idx] = {laploc}[j]",
+                                f"{out}[{i}] = float(np.dot({coeff}, {lap_pad}))",
                             ]
-                            lap_src = lap_pad
                         else:
-                            lap_src = laploc
+                            body_lines += [f"{out}[{i}] = float(np.dot({coeff}, {laploc}))"]
 
-                        val = new_var("lap_val")
-                        body_lines += [
-                            f"{val} = float(np.dot({coeff}, {lap_src}))",  # collapse to scalar
-                        ]
-                        vals.append(val)
+        
 
-                    body_lines.append(f"{out} = np.array([{', '.join(vals)}], dtype={self.dtype})")  # (k,)
                     stack.append(StackItem(var_name=out, role="value", shape=(k_comps,),
                                         is_vector=True, field_names=a.field_names, side=a.side))
 
@@ -639,7 +657,6 @@ class NumbaCodeGen:
                 # NumPy array inside the kernel for Numba compatibility.
                 np_array_var = new_var("const_np_arr")
                 is_vec = len(op.shape) == 1
-                # body_lines.append(f"{np_array_var} = np.array({op.name}, dtype=np.float64)")
                 body_lines.append(f"{np_array_var} = {op.name}")
                 stack.append(StackItem(var_name=np_array_var, role='const', shape=op.shape, is_vector=is_vec, field_names=[]))
             
