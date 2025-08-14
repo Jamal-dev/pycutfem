@@ -19,9 +19,10 @@ from pycutfem.utils.meshgen import structured_quad
 from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
-    Function, VectorFunction, Constant, grad, inner, dot, div, trace, Hessian, Laplacian
+    Function, VectorFunction, Constant, grad, inner, 
+    dot, div, trace, Hessian, Laplacian, FacetNormal
 )
-from pycutfem.ufl.measures import dx, dInterface
+from pycutfem.ufl.measures import dx, dInterface, dS
 from pycutfem.ufl.forms import assemble_form
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem.mixedelement import MixedElement
@@ -136,6 +137,7 @@ def setup_problems():
     nx, ny = 1, 1  # Number of elements in x and y directions
     nodes_q2, elems_q2, _, corners_q2 = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
     mesh_q2 = Mesh(nodes=nodes_q2, element_connectivity=elems_q2, elements_corner_nodes=corners_q2, element_type="quad", poly_order=2)
+    mesh_q2.tag_boundary_edges({'all': lambda x,y: True})
     mixed_element_pc = MixedElement(mesh_q2, field_specs={'ux': 2, 'uy': 2, 'p': 1})
     dof_handler_pc = DofHandler(mixed_element_pc, method='cg')
     velocity_fs = FunctionSpace("velocity", ['ux', 'uy'], dim=1)
@@ -150,7 +152,8 @@ def setup_problems():
           'rho': Constant(1.0,dim=0), 
           'dt': Constant(0.1,dim=0), 
           'theta': Constant(0.5,dim=0), 
-          'mu': Constant(1.0e-2,dim=0)}
+          'mu': Constant(1.0e-2,dim=0),
+          'normal': FacetNormal()}
     
     mesh_fx = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, nx, ny, dolfinx.mesh.CellType.quadrilateral)
     gdim = mesh_fx.geometry.dim
@@ -163,6 +166,7 @@ def setup_problems():
     fenicsx['u_n'] = dolfinx.fem.Function(V, name="u_n")
     fenicsx['u_k_p_k'] = dolfinx.fem.Function(W, name="u_k_p_k")
     fenicsx['c'] = dolfinx.fem.Constant(mesh_fx, (0.5, -0.2))
+    fenicsx['normal'] = ufl.FacetNormal(mesh_fx) 
     
     return pc, dof_handler_pc, fenicsx
 
@@ -321,6 +325,10 @@ if __name__ == '__main__':
     advection_1_pc = ( dot(dot(grad(pc['du']), pc['u_k']), pc['v'])) * dx()
     c_pc = pc['c']
     c_fx = fenicsx['c']
+    # Facet normals
+    n_pc = pc['normal']                # PyCutFEM-side facet normal
+    n_fx = fenicsx['normal']           # FEniCSx-side facet normal
+
     jacobian_pc = (
         # Time derivative term
         pc['rho'] * dot(pc['du'], pc['v']) / pc['dt'] +
@@ -438,6 +446,17 @@ if __name__ == '__main__':
         strain = epsilon_s_linear_R(disp_k, grad, dot)
         return 2.0 * inner(strain, grad_v_test) + trace(strain) * trace(grad_v_test)
 
+    def Hdotn_fx(u, n):   # (H · n)
+        return ufl.dot(ufl.grad(ufl.grad(u)), n)
+
+    def ndotH_fx(u, n):   # (n · H)
+        return ufl.dot(n, ufl.grad(ufl.grad(u)))
+
+    def nHn_fx(u, n):     # (nᵀ H n)
+        return ufl.dot(n, ufl.dot(ufl.grad(ufl.grad(u)), n))
+
+
+    
     terms = {
         # "LHS Mass":          {'pc': pc['rho'] * dot(pc['du'], pc['v']) / pc['dt'] * dx(),                                    'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(du, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
         # "LHS Diffusion":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']), grad(pc['v'])) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du), ufl.grad(v)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
@@ -500,14 +519,172 @@ if __name__ == '__main__':
 
         # "Trace Operator RHS": {'pc': trace(grad(pc['u_k'])) * trace(grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.tr(ufl.grad(u_k_fx)) * ufl.tr(ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
         # "Linear Strain tensor LHS": {'pc': inner(epsilon_f(pc['du'], grad), epsilon_f(pc['v'],grad))  * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(epsilon_f(du, ufl.grad), epsilon_f(v_fx, ufl.grad)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        "Vector Hessian LHS": {'pc': inner(Hessian(pc['du']), Hessian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(du)), ufl.grad(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        "Vector Hessian RHS": {'pc': inner(Hessian(pc['u_k']), Hessian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(u_k_fx)), ufl.grad(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        "Vector Laplacian LHS": {'pc': inner(Laplacian(pc['du']), Laplacian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(du)), ufl.div(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        "Vector Laplacian RHS": {'pc': inner(Laplacian(pc['u_k']), Laplacian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(u_k_fx)), ufl.div(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        "Scalar Hessian LHS": {'pc': inner(Hessian(pc['dp']), Hessian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(dp)), ufl.grad(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        "Scalar Hessian RHS": {'pc': inner(Hessian(pc['p_k']), Hessian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(p_k_fx)), ufl.grad(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        "Scalar Laplacian LHS": {'pc': inner(Laplacian(pc['dp']), Laplacian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(dp)), ufl.div(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        "Scalar Laplacian RHS": {'pc': inner(Laplacian(pc['p_k']), Laplacian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(p_k_fx)), ufl.div(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        # "Vector Hessian LHS": {'pc': inner(Hessian(pc['du']), Hessian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(du)), ufl.grad(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        # "Vector Hessian RHS": {'pc': inner(Hessian(pc['u_k']), Hessian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(u_k_fx)), ufl.grad(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        # "Vector Laplacian LHS": {'pc': inner(Laplacian(pc['du']), Laplacian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(du)), ufl.div(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        # "Vector Laplacian RHS": {'pc': inner(Laplacian(pc['u_k']), Laplacian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(u_k_fx)), ufl.div(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        # "Scalar Hessian LHS": {'pc': inner(Hessian(pc['dp']), Hessian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(dp)), ufl.grad(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        # "Scalar Hessian RHS": {'pc': inner(Hessian(pc['p_k']), Hessian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(p_k_fx)), ufl.grad(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        # "Scalar Laplacian LHS": {'pc': inner(Laplacian(pc['dp']), Laplacian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(dp)), ufl.div(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        # "Scalar Laplacian RHS": {'pc': inner(Laplacian(pc['p_k']), Laplacian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(p_k_fx)), ufl.div(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        
+        
+        # ===========================
+        # Hessian contractions with facet normal (boundary tests, ds)
+        # ===========================
+        # ---------------- Hessian · c (right contraction) ----------------
+        "Vector Hdotc LHS": {
+            'pc': inner(dot(Hessian(pc['du']), c_pc), dot(Hessian(pc['v']), c_pc)) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(du, c_fx), Hdotn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector Hdotc RHS": {
+            'pc': inner(dot(Hessian(pc['u_k']), c_pc), dot(Hessian(pc['v']), c_pc)) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(u_k_fx, c_fx), Hdotn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # ---------------- c · Hessian (left contraction) ----------------
+        "Vector cdotH LHS": {
+            'pc': inner(dot(c_pc, Hessian(pc['du'])), dot(c_pc, Hessian(pc['v']))) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(du, c_fx), ndotH_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector cdotH RHS": {
+            'pc': inner(dot(c_pc, Hessian(pc['u_k'])), dot(c_pc, Hessian(pc['v']))) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(u_k_fx, c_fx), ndotH_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # ---------------- double contraction cᵀ H c ----------------
+        # Vector field: nHn(u) is a 2-vector; inner yields a scalar integrand
+        "Vector nHn LHS": {
+            'pc': inner( dot(c_pc, dot(Hessian(pc['du']), c_pc)),
+                        dot(c_pc, dot(Hessian(pc['v']),  c_pc)) ) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(du, c_fx), nHn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector nHn RHS": {
+            'pc': inner( dot(c_pc, dot(Hessian(pc['u_k']), c_pc)),
+                        dot(c_pc, dot(Hessian(pc['v']),   c_pc)) ) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(u_k_fx, c_fx), nHn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # ---------------- scalar versions ----------------
+        # For scalar p, H·c and c·H are d-vectors; inner gives a scalar integrand.
+        "Scalar Hdotc LHS": {
+            'pc': inner(dot(Hessian(pc['dp']), c_pc), dot(Hessian(pc['q']), c_pc)) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(dp, c_fx), Hdotn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar Hdotc RHS": {
+            'pc': inner(dot(Hessian(pc['p_k']), c_pc), dot(Hessian(pc['q']), c_pc)) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(p_k_fx, c_fx), Hdotn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        "Scalar cdotH LHS": {
+            'pc': inner(dot(c_pc, Hessian(pc['dp'])), dot(c_pc, Hessian(pc['q']))) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(dp, c_fx), ndotH_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar cdotH RHS": {
+            'pc': inner(dot(c_pc, Hessian(pc['p_k'])), dot(c_pc, Hessian(pc['q']))) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(p_k_fx, c_fx), ndotH_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # Scalar nHn: nHn(p) is scalar; inner(scalar, scalar) is fine
+        "Scalar nHn LHS": {
+            'pc': inner( dot(c_pc, dot(Hessian(pc['dp']), c_pc)),
+                        dot(c_pc, dot(Hessian(pc['q']),  c_pc)) ) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(dp, c_fx), nHn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar nHn RHS": {
+            'pc': inner( dot(c_pc, dot(Hessian(pc['p_k']), c_pc)),
+                        dot(c_pc, dot(Hessian(pc['q']),   c_pc)) ) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(p_k_fx, c_fx), nHn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Vector field: H · n ----------
+        "Vector Hdotn LHS (ds)": {
+            'pc': inner(dot(Hessian(pc['du']), n_pc), dot(Hessian(pc['v']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(du, n_fx), Hdotn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector Hdotn RHS (ds)": {
+            'pc': inner(dot(Hessian(pc['u_k']), n_pc), dot(Hessian(pc['v']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(u_k_fx, n_fx), Hdotn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Vector field: n · H ----------
+        "Vector ndotH LHS (ds)": {
+            'pc': inner(dot(n_pc, Hessian(pc['du'])), dot(n_pc, Hessian(pc['v']))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(du, n_fx), ndotH_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector ndotH RHS (ds)": {
+            'pc': inner(dot(n_pc, Hessian(pc['u_k'])), dot(n_pc, Hessian(pc['v']))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(u_k_fx, n_fx), ndotH_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Vector field: nᵀ H n ----------
+        "Vector nHn LHS (ds)": {
+            'pc': inner(dot(n_pc, dot(Hessian(pc['du']), n_pc)),
+                        dot(n_pc, dot(Hessian(pc['v']),  n_pc))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(du, n_fx), nHn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector nHn RHS (ds)": {    
+            'pc': inner(dot(n_pc, dot(Hessian(pc['u_k']), n_pc)),
+                        dot(n_pc, dot(Hessian(pc['v']),   n_pc))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(u_k_fx, n_fx), nHn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Scalar field: H · n ----------
+        "Scalar Hdotn LHS (ds)": {
+            'pc': inner(dot(Hessian(pc['dp']), n_pc), dot(Hessian(pc['q']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(dp, n_fx), Hdotn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar Hdotn RHS (ds)": {
+            'pc': inner(dot(Hessian(pc['p_k']), n_pc), dot(Hessian(pc['q']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(p_k_fx, n_fx), Hdotn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Scalar field: n · H ----------
+        "Scalar ndotH LHS (ds)": {
+            'pc': inner(dot(n_pc, Hessian(pc['dp'])), dot(n_pc, Hessian(pc['q']))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(dp, n_fx), ndotH_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar ndotH RHS (ds)": {
+            'pc': inner(dot(n_pc, Hessian(pc['p_k'])), dot(n_pc, Hessian(pc['q']))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(p_k_fx, n_fx), ndotH_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Scalar field: nᵀ H n ----------
+        "Scalar nHn LHS (ds)": {
+            'pc': inner(dot(n_pc, dot(Hessian(pc['dp']), n_pc)),
+                        dot(n_pc, dot(Hessian(pc['q']),  n_pc))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(dp, n_fx), nHn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar nHn RHS (ds)": {
+            'pc': inner(dot(n_pc, dot(Hessian(pc['p_k']), n_pc)),
+                        dot(n_pc, dot(Hessian(pc['q']),   n_pc))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(p_k_fx, n_fx), nHn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
 
         }
     pc_dummy_side = dot(Constant([0.0,0.0],dim=1), pc['v']) * dx()

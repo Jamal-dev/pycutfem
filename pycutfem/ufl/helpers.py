@@ -548,16 +548,59 @@ class HessOpInfo:
 
 
 
-    # n^T H n projection → VecOpInfo(k,n)
+    # ---------- vector contractions --------------------------------------
+    def dot_right(self, vec) -> "GradOpInfo":
+        """Right contraction H · n over the last spatial axis j.
+        Returns:
+          test/trial → GradOpInfo with data (k,n,d)
+          function   → GradOpInfo with data (k,d)
+        """
+        role_vec = vec.role if hasattr(vec, "role") else None
+        n = np.asarray(vec.data if hasattr(vec, "data") else vec).reshape(-1)
+        if role_vec == "function" and n.ndim == 2:
+            # collapse the axis
+            n = np.sum(vec.data, axis=1)  # Shape (k,)
+        
+        if self.data.ndim == 4:    # (k,n,d,d) · (d,) -> (k,n,d)
+            out = np.einsum("knij,j->kni", self.data, n, optimize=True)
+        elif self.data.ndim == 3:  # (k,d,d)   · (d,) -> (k,d)
+            out = np.einsum("kij,j->ki",   self.data, n, optimize=True)
+        else:
+            raise ValueError(f"HessOpInfo.dot_right: unexpected ndim={self.data.ndim}")
+        return GradOpInfo(out, role=self.role)
 
-    def proj_nn(self, nvec: np.ndarray) -> "VecOpInfo":
+    def dot_left(self, vec) -> "GradOpInfo":
+        """Left contraction n · H over the first spatial axis i."""
+        role_vec = vec.role if hasattr(vec, "role") else None
+        n = np.asarray(vec.data if hasattr(vec, "data") else vec).reshape(-1)
 
-        n = np.asarray(nvec).reshape(2)
+        if role_vec == "function" and n.ndim == 2:
+            # collapse the axis
+            n = np.sum(vec.data, axis=1)  # Shape (k,)
 
-        tmp = np.einsum("kndp,p->knd", self.data, n, optimize=True)  # H n, shape (k,n,2)
+        if self.data.ndim == 4:    # (d,) · (k,n,d,d) -> (k,n,d)
+            out = np.einsum("i,knij->knj", n, self.data, optimize=True)
+        elif self.data.ndim == 3:  # (d,) · (k,d,d)   -> (k,d)
+            out = np.einsum("i,kij->kj",   n, self.data, optimize=True)
+        else:
+            raise ValueError(f"HessOpInfo.dot_left: unexpected ndim={self.data.ndim}")
+        return GradOpInfo(out, role=self.role)
 
-        val = np.einsum("knd,d->kn", tmp, n, optimize=True)          # nᵀ(H n)
-
+    def proj_nn(self, nvec) -> "VecOpInfo":
+        """Double contraction nᵀ H n (second normal derivative).
+        Returns:
+          test/trial → VecOpInfo with data (k,n)
+          function   → VecOpInfo with data (k,)
+        """
+        n = np.asarray(nvec.data if hasattr(nvec, "data") else nvec).reshape(-1)
+        if self.data.ndim == 4:    # (d,) · (k,n,d,d) · (d,) -> (k,n)
+            tmp = np.einsum("i,knij->knj", n, self.data, optimize=True)
+            val = np.einsum("knj,j->kn",   tmp, n, optimize=True)
+        elif self.data.ndim == 3:  # (d,) · (k,d,d)   · (d,) -> (k,)
+            tmp = np.einsum("i,kij->kj",   n, self.data, optimize=True)
+            val = np.einsum("kj,j->k",     tmp, n, optimize=True)
+        else:
+            raise ValueError(f"HessOpInfo.proj_nn: unexpected ndim={self.data.ndim}")
         return VecOpInfo(val, role=self.role)
 
     def inner(self, other: "HessOpInfo") -> np.ndarray:

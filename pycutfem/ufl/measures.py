@@ -17,7 +17,8 @@ class Measure:
                  domain_type: str, 
                  defined_on: Optional[BitSet] = None, 
                  level_set: Optional[Callable] = None,
-                 metadata: Optional[Dict] = None):
+                 metadata: Optional[Dict] = None,
+                 tag: Optional[str] = None):
         """
         Initializes a Measure.
         
@@ -34,11 +35,13 @@ class Measure:
         self.defined_on = defined_on
         self.level_set = level_set
         self.metadata = metadata or {}
+        self.tag = tag
 
     def __call__(self, 
                  defined_on: Optional[BitSet] = None, 
                  level_set: Optional[Callable] = None,
-                 metadata: Optional[Dict] = None) -> 'Measure':
+                 metadata: Optional[Dict] = None,
+                 tag: Optional[str] = None) -> 'Measure':
         """
         Creates a new, configured Measure instance. This allows for an
         expressive syntax like `dx(defined_on=my_set, metadata={'q': 5})`.
@@ -51,9 +54,9 @@ class Measure:
         # Use new values if provided, otherwise stick with the defaults
         new_defined_on = defined_on if defined_on is not None else self.defined_on
         new_level_set = level_set if level_set is not None else self.level_set
-        
+        new_tag = tag if tag is not None else self.tag
         # Return a new Measure object with the specified configurations
-        return Measure(self.domain_type, new_defined_on, new_level_set, new_meta)
+        return Measure(self.domain_type, new_defined_on, new_level_set, new_meta, new_tag)
 
     def __rmul__(self, other: Expression) -> Integral:
         """
@@ -68,6 +71,7 @@ class Measure:
             parts.append(f"defined_on={self.defined_on!r}")
         if self.level_set:
             parts.append(f"level_set={self.level_set.__name__ if hasattr(self.level_set, '__name__') else '...'}")
+        if self.tag:        parts.append(f"tag='{self.tag}'") 
         if self.metadata:
             parts.append(f"metadata={self.metadata!r}")
         return f"Measure({', '.join(parts)})"

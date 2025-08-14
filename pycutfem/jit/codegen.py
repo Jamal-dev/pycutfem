@@ -1419,6 +1419,98 @@ class NumbaCodeGen:
    
 
                 # ---------------------------------------------------------------------
+                # dot( Hessian ,  value/const )          ← Grad object
+                # ---------------------------------------------------------------------
+                # --- Hessian · vector (right) and vector · Hessian (left) ---
+                # Contractions only with constant geometric vectors (e.g., facet normals)
+                elif a.is_hessian and b.role in {'const','value'} and b.is_vector:
+                    if a.role in ('test', 'trial'):
+                        # a: (k,n,d,d), b: (d,) → (k,n,d)
+                        body_lines.append("# Dot: Hessian(basis) · const vec -> Grad-like")
+                        body_lines += [
+                            f"n_vec_comps = {a.var_name}.shape[0]",
+                            f"n_locs      = {a.var_name}.shape[1]",
+                            f"d1          = {a.var_name}.shape[2]",
+                            f"d2          = {a.var_name}.shape[3]",
+                            f"{res_var}   = np.zeros((n_vec_comps, n_locs, d2), dtype={self.dtype})",
+                            f"for kk in range(n_vec_comps):",
+                            f"    for ii in range(d1):",
+                            f"        acc = np.zeros((n_locs,), dtype={self.dtype})",
+                            f"        for jj in range(d2):",
+                            f"            acc += {a.var_name}[kk, :, ii, jj] * {b.var_name}[jj]",
+                            f"        {res_var}[kk, :, ii] = acc",
+                        ]
+                        stack.append(StackItem(var_name=res_var, role=a.role,
+                                            shape=(-1, -1, -1),  # (k,n,d) at runtime
+                                            is_vector=False, is_gradient=True,
+                                            field_names=a.field_names, parent_name=a.parent_name,
+                                            side=a.side, is_hessian=False))
+                    else:
+                        # a: (k,d,d), b: (d,) → (k,d)
+                        body_lines.append("# Dot: Hessian(value) · const vec -> Grad-like")
+                        body_lines += [
+                            f"n_vec_comps = {a.var_name}.shape[0]",
+                            f"d1          = {a.var_name}.shape[1]",
+                            f"d2          = {a.var_name}.shape[2]",
+                            f"{res_var}   = np.zeros((n_vec_comps, d2), dtype={self.dtype})",
+                            f"for kk in range(n_vec_comps):",
+                            f"    for ii in range(d1):",
+                            f"        acc = 0.0",
+                            f"        for jj in range(d2):",
+                            f"            acc += {a.var_name}[kk, ii, jj] * {b.var_name}[jj]",
+                            f"        {res_var}[kk, ii] = acc",
+                        ]
+                        stack.append(StackItem(var_name=res_var, role=a.role,
+                                            shape=(-1, -1),  # (k,d) at runtime
+                                            is_vector=False, is_gradient=True,
+                                            field_names=a.field_names, parent_name=a.parent_name,
+                                            side=a.side, is_hessian=False))
+
+                elif b.is_hessian and a.role in {'const','value'} and a.is_vector:
+                    if b.role in ('test', 'trial'):
+                        # a: (d,), b: (k,n,d,d) → (k,n,d)
+                        body_lines.append("# Dot: const vec · Hessian(basis) -> Grad-like")
+                        body_lines += [
+                            f"n_vec_comps = {b.var_name}.shape[0]",
+                            f"n_locs      = {b.var_name}.shape[1]",
+                            f"d1          = {b.var_name}.shape[2]",
+                            f"d2          = {b.var_name}.shape[3]",
+                            f"{res_var}   = np.zeros((n_vec_comps, n_locs, d2), dtype={self.dtype})",
+                            f"for kk in range(n_vec_comps):",
+                            f"    for jj in range(d2):",
+                            f"        acc = np.zeros((n_locs,), dtype={self.dtype})",
+                            f"        for ii in range(d1):",
+                            f"            acc += {b.var_name}[kk, :, ii, jj] * {a.var_name}[ii]",
+                            f"        {res_var}[kk, :, jj] = acc",
+                        ]
+                        stack.append(StackItem(var_name=res_var, role=b.role,
+                                            shape=(-1, -1, -1),  # (k,n,d)
+                                            is_vector=False, is_gradient=True,
+                                            field_names=b.field_names, parent_name=b.parent_name,
+                                            side=b.side, is_hessian=False))
+                    else:
+                        # a: (d,), b: (k,d,d) → (k,d)
+                        body_lines.append("# Dot: const vec · Hessian(value) -> Grad-like")
+                        body_lines += [
+                            f"n_vec_comps = {b.var_name}.shape[0]",
+                            f"d1          = {b.var_name}.shape[1]",
+                            f"d2          = {b.var_name}.shape[2]",
+                            f"{res_var}   = np.zeros((n_vec_comps, d2), dtype={self.dtype})",
+                            f"for kk in range(n_vec_comps):",
+                            f"    for jj in range(d2):",
+                            f"        acc = 0.0",
+                            f"        for ii in range(d1):",
+                            f"            acc += {b.var_name}[kk, ii, jj] * {a.var_name}[ii]",
+                            f"        {res_var}[kk, jj] = acc",
+                        ]
+                        stack.append(StackItem(var_name=res_var, role=b.role,
+                                            shape=(-1, -1),  # (k,d)
+                                            is_vector=False, is_gradient=True,
+                                            field_names=b.field_names, parent_name=b.parent_name,
+                                            side=b.side, is_hessian=False))
+
+                
+                # ---------------------------------------------------------------------
                 # dot( value/const ,  value/const )          ← load-vector term -> (n,)
                 # ---------------------------------------------------------------------
                 elif (a.role in ('const', 'value') and   
@@ -1809,7 +1901,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = False
+            DEBUG: bool = True
         ):
         """
         Build complete kernel source code with parallel assembly.

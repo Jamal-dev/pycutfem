@@ -973,12 +973,25 @@ class FormCompiler:
         and isinstance(b, GradOpInfo) and (b.role == "trial" or b.role == "function"):
             return a.dot(b)
         
+        # --- Hessian · vector (right) and vector · Hessian (left) -------------
+        # Accept geometric constant vectors (facet normals) or plain numpy 1D vectors.
+        if isinstance(a, HessOpInfo) and (
+            isinstance(b, np.ndarray) or (isinstance(b, VecOpInfo) and role_b in {"function",None})
+        ):
+            return a.dot_right(b)
+
+        if isinstance(b, HessOpInfo) and (
+            isinstance(a, np.ndarray) or (isinstance(a, VecOpInfo) and role_a in {"function",None} )
+        ):
+            return b.dot_left(a)
+        
         # Both are numerical vectors (RHS)
         if isinstance(a, np.ndarray) and isinstance(b, np.ndarray): return np.dot(a,b)
 
-        raise TypeError(f"Unsupported dot product '{n.a} . {n.b}'")
+        raise TypeError(f"Unsupported dot product '{n.a} . {n.b}'"
+                        f" for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}"
+                        f" and data shapes a={getattr(a_data, 'shape', None)}, b={getattr(b_data, 'shape', None)}")
 
-    
     # ================ VISITORS: INNER PRODUCTS =========================
     def _visit_Inner(self, n: Inner):
         a = self._visit(n.a)
