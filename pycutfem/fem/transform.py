@@ -243,12 +243,11 @@ def inverse_mapping(mesh, elem_id, x, tol=1e-10, maxiter=50):
 # === NEW: exact Hessian mapping up to order-2 ================================
 
 
-_warned_high_order = False
 
 def _hess_inverse_from_Hx(J_inv: np.ndarray, Hx0: np.ndarray, Hx1: np.ndarray):
     """
-    Given J_inv = ∂ξ/∂x and Hxβ = ∂² x_β / ∂ξ∂ξ (β=0,1), return Hξα = ∂² ξ_α / ∂x∂x.
-    Hξα(ν,γ) = - ∑_{μ,λ} ( ∑_β A_{αβ} Hxβ_{μλ} ) A_{λν} A_{μγ},   A ≡ J_inv.
+    Given A=J^{-1} and Hxβ=∂²x_β/∂(ξ,η)², produce Hξα = ∂² ξ_α / ∂x².
+    Hξα(ν,γ) = - Σ_{μ,λ} ( Σ_{β} A_{αβ} Hxβ_{μλ} ) A_{λν} A_{μγ}.
     """
     A = J_inv
     C0 = A[0,0]*Hx0 + A[0,1]*Hx1
@@ -257,37 +256,41 @@ def _hess_inverse_from_Hx(J_inv: np.ndarray, Hx0: np.ndarray, Hx1: np.ndarray):
     Hxi1 = -np.einsum("ml,ln,mg->ng", C1, A, A, optimize=True)
     return Hxi0, Hxi1
 
+
 def element_Hxi(mesh, elem_id: int, xi_eta: tuple[float,float]):
     """
-    Exact Hξ for geometry orders ≤ 2. For higher orders, warn once and return zeros.
+    Exact inverse-map Hessians Hξ (two 2×2 matrices) for any geometry order.
+    Hxi0 = ∂²ξ/∂x∂x, Hxi1 = ∂²η/∂x∂x.
     """
     xi, eta = xi_eta
     ref = get_reference(mesh.element_type, mesh.poly_order)
-    J = jacobian(mesh, elem_id, (xi, eta))
-    A = np.linalg.inv(J)
 
-    # affine (P1 tri / Q1 bilinear) → exact, Hξ = 0
-    if mesh.poly_order <= 1:
-        Z = np.zeros((2,2), dtype=J.dtype)
-        return J, A, Z, Z
+    # Standard Jacobian and its inverse
+    J = jacobian(mesh, elem_id, (xi, eta))          # (2,2)
+    A = np.linalg.inv(J)                            # (2,2)
 
-    # quadratic (P2 / Q2) → compute geometry shape Hessians exactly
-    if mesh.poly_order == 2:
-        HN = np.asarray(ref.hess(xi, eta))          # (nLocGeom, 2, 2)
-        nodes = mesh.nodes[mesh.elements_connectivity[elem_id]]
-        X = mesh.nodes_x_y_pos[nodes].astype(float) # (nLocGeom, 2)
-        Hx0 = np.einsum("iij, i->ij", HN, X[:,0], optimize=True)  # (2,2)
-        Hx1 = np.einsum("iij, i->ij", HN, X[:,1], optimize=True)
-        Hxi0, Hxi1 = _hess_inverse_from_Hx(A, Hx0, Hx1)
-        return J, A, Hxi0, Hxi1
+    # Geometry second derivatives in reference coords:
+    # HN[i, a, b] = ∂² N_i / ∂ξ_a ∂ξ_b
+    HN = np.asarray(ref.hess(xi, eta))              # (nGeom, 2, 2)
 
-    global _warned_high_order_hess
-    if not _warned_high_order_hess:
-        warnings.warn(
-            f"[transform] Exact Hessian map not implemented for element_type={mesh.element_type}, "
-            f"poly_order={mesh.poly_order}. Falling back to affine-like approximation (Hξ=0).",
-            RuntimeWarning
-        )
-        _warned_high_order_hess = True
-    Z = np.zeros((2,2), dtype=J.dtype)
-    return J, A, Z, Z
+    # Element node coordinates
+    conn = mesh.elements_connectivity[elem_id]
+    gidx = mesh.nodes[conn]                              # (nGeom,)
+    X = mesh.nodes_x_y_pos[gidx].astype(float)           # (nGeom, 2)
+
+    # build Hx0, Hx1
+    Hx0 = np.empty((2, 2), float)
+    Hx1 = np.empty((2, 2), float)
+    d20 = HN[:, 0, 0]; d11 = HN[:, 0, 1]; d02 = HN[:, 1, 1]
+
+    # ∂² x_β / ∂(ξ,η)²  = Σ_i HN[i,:,:] * X[i,β]
+    # → two 2×2 matrices Hx0, Hx1
+    # einsum "iab,i->ab" : sum over node index i
+    X0 = X[:, 0]; X1 = X[:, 1]
+    Hx0[0, 0] = np.dot(d20, X0); Hx0[0, 1] = np.dot(d11, X0); Hx0[1, 0] = Hx0[0, 1]; Hx0[1, 1] = np.dot(d02, X0)
+    Hx1[0, 0] = np.dot(d20, X1); Hx1[0, 1] = np.dot(d11, X1); Hx1[1, 0] = Hx1[0, 1]; Hx1[1, 1] = np.dot(d02, X1)
+
+
+    # Convert to inverse-map Hessians via the standard formula
+    Hxi0, Hxi1 = _hess_inverse_from_Hx(A, Hx0, Hx1)
+    return J, A, Hxi0, Hxi1

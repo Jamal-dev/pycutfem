@@ -151,75 +151,126 @@ class NumbaCodeGen:
             
 
             elif isinstance(op, IRHessian):
-                a = stack.pop()  # carries .role, .field_names, .side
+                a = stack.pop()
 
-                # choose per-side symbols
+                # choose per-side names
                 if   a.side == "+": jinv = "J_inv_pos"; H0 = "pos_Hxi0"; H1 = "pos_Hxi1"; suff = "_pos"
                 elif a.side == "-": jinv = "J_inv_neg"; H0 = "neg_Hxi0"; H1 = "neg_Hxi1"; suff = "_neg"
                 else:               jinv = "J_inv";     H0 = "Hxi0";     H1 = "Hxi1";     suff = ""
 
-                required_args.update({jinv, H0, H1})
-                required_args.add("gdofs_map")  # needed for union width on facets
+                k_comps = len(a.field_names)  # 1 for scalar, >1 for vector fields
 
-                # need reference derivative tables (volume: d.._; facet: r.._pos/neg)
+                required_args.update({jinv, H0, H1})
+                required_args.add("gdofs_map")
+
+                # reference derivative tables (volume: d.._; facet: r.._pos/neg)
                 d10, d01, d20, d11, d02 = [], [], [], [], []
                 for fn in a.field_names:
-                    name10 = (f"d10_{fn}" if suff=="" else f"r10_{fn}{suff}")
-                    name01 = (f"d01_{fn}" if suff=="" else f"r01_{fn}{suff}")
-                    name20 = (f"d20_{fn}" if suff=="" else f"r20_{fn}{suff}")
-                    name11 = (f"d11_{fn}" if suff=="" else f"r11_{fn}{suff}")
-                    name02 = (f"d02_{fn}" if suff=="" else f"r02_{fn}{suff}")
-                    required_args.update({name10, name01, name20, name11, name02})
-                    d10.append(name10); d01.append(name01); d20.append(name20); d11.append(name11); d02.append(name02)
+                    n10 = (f"d10_{fn}" if suff=="" else f"r10_{fn}{suff}")
+                    n01 = (f"d01_{fn}" if suff=="" else f"r01_{fn}{suff}")
+                    n20 = (f"d20_{fn}" if suff=="" else f"r20_{fn}{suff}")
+                    n11 = (f"d11_{fn}" if suff=="" else f"r11_{fn}{suff}")
+                    n02 = (f"d02_{fn}" if suff=="" else f"r02_{fn}{suff}")
+                    required_args.update({n10, n01, n20, n11, n02})
+                    d10.append(n10); d01.append(n01); d20.append(n20); d11.append(n11); d02.append(n02)
 
                 out = new_var("Hess")
-                body_lines.append(f"{out} = []  # (k, n_union, 2, 2)")
 
-                # Build local Hessians per field, then (if needed) scatter to union layout
-                for i, fn in enumerate(a.field_names):
-                    Hloc = new_var("Hloc")
+                # ---------- TEST/TRIAL (keep basis tables, possibly padded) ----------
+                if a.role in ("test", "trial"):
+                    k_comps = len(a.field_names)
                     body_lines += [
-                        f"A  = {jinv}[e, q]",       # (2,2)
-                        f"Hx = {H0}[e, q]",         # (2,2) = H_{xi0}
-                        f"Hy = {H1}[e, q]",         # (2,2) = H_{xi1}"
-                        f"d10_q = {d10[i]}[e, q]",  # (n_loc,)
-                        f"d01_q = {d01[i]}[e, q]",
-                        f"d20_q = {d20[i]}[e, q]",
-                        f"d11_q = {d11[i]}[e, q]",
-                        f"d02_q = {d02[i]}[e, q]",
-                        "nloc = d20_q.shape[0]",
-                        f"{Hloc} = np.empty((nloc, 2, 2), dtype=d20_q.dtype)",
-                        "for j in range(nloc):",
-                        "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
-                        "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
-                        "    core = A.T @ (Href @ A)",
-                        "    Hphys = core + gref[0]*Hx + gref[1]*Hy",
-                        f"    {Hloc}[j] = Hphys",
+                        "n_union = gdofs_map[e].shape[0]",
+                        f"{out} = np.empty(({k_comps}, n_union, 2, 2), dtype={self.dtype})",
                     ]
-
-                    if a.side:
-                        map_arr = "pos_map" if a.side == "+" else "neg_map"
-                        required_args.add(map_arr)
-                        Hpad = new_var("Hpad"); me = new_var("map_e")
+                    for i, fn in enumerate(a.field_names):
+                        Hloc = new_var("Hloc")
                         body_lines += [
-                            f"{me} = {map_arr}[e]",                       # (n_loc,)
-                            "n_union = gdofs_map[e].shape[0]",
-                            f"{Hpad} = np.zeros((n_union, 2, 2), dtype=d20_q.dtype)",
+                            f"A  = {jinv}[e, q]",
+                            f"Hx = {H0}[e, q]", f"Hy = {H1}[e, q]",
+                            f"d10_q = {d10[i]}[e, q]", f"d01_q = {d01[i]}[e, q]",
+                            f"d20_q = {d20[i]}[e, q]", f"d11_q = {d11[i]}[e, q]", f"d02_q = {d02[i]}[e, q]",
+                            "nloc = d20_q.shape[0]",
+                            f"{Hloc} = np.empty((nloc, 2, 2), dtype=d20_q.dtype)",
                             "for j in range(nloc):",
-                            f"    idx = {me}[j]",
-                            "    if 0 <= idx < n_union:",
-                            f"        {Hpad}[idx] = {Hloc}[j]",
-                            f"{out}.append({Hpad})",
+                            "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
+                            "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
+                            "    core = A.T @ (Href @ A)",
+                            "    Hphys = core + gref[0]*Hx + gref[1]*Hy",
+                            f"    {Hloc}[j] = Hphys",
                         ]
-                    else:
-                        body_lines += [f"{out}.append({Hloc})"]
+                        if a.side:  # pad to union using map
+                            map_arr = "pos_map" if a.side == "+" else "neg_map"
+                            required_args.add(map_arr)
+                            Hpad, me = new_var("Hpad"), new_var("map_e")
+                            body_lines += [
+                                f"{me} = {map_arr}[e]",
+                                f"{Hpad} = np.zeros((n_union, 2, 2), dtype=d20_q.dtype)",
+                                "for j in range(nloc):",
+                                f"    idx = {me}[j]",
+                                "    if 0 <= idx < n_union:",
+                                f"        {Hpad}[idx] = {Hloc}[j]",
+                                f"{out}[{i}] = {Hpad}",
+                            ]
+                        else:
+                            # volume: typically nloc == n_union; assign directly
+                            body_lines += [f"{out}[{i}] = {Hloc}"]
+                    # push
+                    stack.append(StackItem(var_name=out, role=a.role,
+                                        shape=(k_comps, -1, 2, 2),
+                                        is_vector=False, is_hessian=True,
+                                        field_names=a.field_names, side=a.side))
 
-                # stack components, final shape = (k, n_union, 2, 2)
-                body_lines.append(f"{out} = np.stack({out}, axis=0)")
-                stack.append(StackItem(var_name={out}, role=a.role, shape=(-1, -1, 2, 2),
-                                    is_vector=False, field_names=a.field_names, side=a.side, is_hessian=True))
+
+                elif a.role == "value":
+                    k_comps = len(a.field_names)
+                    coeff = (a.parent_name if a.parent_name.startswith("u_")
+                            else f"u_{a.parent_name}_loc")
+                    required_args.add(coeff)
+
+                    body_lines += [f"{out} = np.empty(({k_comps}, 2, 2), dtype={self.dtype})"]
+                    for i, fn in enumerate(a.field_names):
+                        Hloc = new_var("Hloc")
+                        body_lines += [
+                            f"A  = {jinv}[e, q]",
+                            f"Hx = {H0}[e, q]", f"Hy = {H1}[e, q]",
+                            f"d10_q = {d10[i]}[e, q]", f"d01_q = {d01[i]}[e, q]",
+                            f"d20_q = {d20[i]}[e, q]", f"d11_q = {d11[i]}[e, q]", f"d02_q = {d02[i]}[e, q]",
+                            "nloc = d20_q.shape[0]",
+                            f"{Hloc} = np.empty((nloc, 2, 2), dtype=d20_q.dtype)",
+                            "for j in range(nloc):",
+                            "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
+                            "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
+                            "    core = A.T @ (Href @ A)",
+                            "    Hphys = core + gref[0]*Hx + gref[1]*Hy",
+                            f"    {Hloc}[j] = Hphys",
+                        ]
+                        if a.side:
+                            map_arr = "pos_map" if a.side == "+" else "neg_map"
+                            required_args.add(map_arr)
+                            Hpad, me = new_var("Hpad"), new_var("map_e")
+                            body_lines += [
+                                f"{me} = {map_arr}[e]",
+                                "n_union = gdofs_map[e].shape[0]",
+                                f"{Hpad} = np.zeros((n_union, 2, 2), dtype=d20_q.dtype)",
+                                "for j in range(nloc):",
+                                f"    idx = {me}[j]",
+                                "    if 0 <= idx < n_union:",
+                                f"        {Hpad}[idx] = {Hloc}[j]",
+                                f"Hval = np.tensordot({coeff}, {Hpad}, axes=(0,0))",  # (2,2)
+                            ]
+                        else:
+                            body_lines += [f"Hval = np.tensordot({coeff}, {Hloc}, axes=(0,0))"]  # (2,2)
+                        body_lines += [f"{out}[{i}] = Hval"]
+
+                    stack.append(StackItem(var_name=out, role="value",
+                                        shape=(k_comps, 2, 2),
+                                        is_vector=False, is_hessian=True,
+                                        field_names=a.field_names, side=a.side))
 
 
+                else:
+                    raise NotImplementedError(f"Hessian not implemented for role {a.role}")
 
 
 
@@ -227,9 +278,11 @@ class NumbaCodeGen:
             elif isinstance(op, IRLaplacian):
                 a = stack.pop()
 
+                # choose per-side arrays
                 if   a.side == "+": jinv = "J_inv_pos"; H0 = "pos_Hxi0"; H1 = "pos_Hxi1"; suff = "_pos"
-                elif a.side == "-": jinv = "J_inv_neg"; H0 = "neg_Hxi0"; H1 = "neg_Hxi1"; suff = "_neg"
+                elif a.side == "-": jinv = "J_inv_neg"; H0 = "neg_Hxi0"; H1 = "neg_Hxi1"; suff = ""
                 else:               jinv = "J_inv";     H0 = "Hxi0";     H1 = "Hxi1";     suff = ""
+
                 required_args.update({jinv, H0, H1})
                 required_args.add("gdofs_map")
 
@@ -245,54 +298,112 @@ class NumbaCodeGen:
                     d10.append(n10); d01.append(n01); d20.append(n20); d11.append(n11); d02.append(n02)
 
                 out = new_var("Lap")
-                body_lines.append(f"{out} = []  # (k, n_union)")
+                k_comps = len(a.field_names)
 
-                for i, fn in enumerate(a.field_names):
-                    laploc = new_var("laploc")
+
+                # ---------------- TEST/TRIAL: keep basis tables ----------------
+                if a.role in ("test", "trial"):
+                    k_comps = len(a.field_names)
                     body_lines += [
-                        f"A  = {jinv}[e, q]",
-                        f"Hx = {H0}[e, q]",
-                        f"Hy = {H1}[e, q]",
-                        f"d10_q = {d10[i]}[e, q]",
-                        f"d01_q = {d01[i]}[e, q]",
-                        f"d20_q = {d20[i]}[e, q]",
-                        f"d11_q = {d11[i]}[e, q]",
-                        f"d02_q = {d02[i]}[e, q]",
-                        "nloc = d20_q.shape[0]",
-                        f"{laploc} = np.empty((nloc,), dtype=d20_q.dtype)",
-                        "tHx = Hx[0,0] + Hx[1,1]",
-                        "tHy = Hy[0,0] + Hy[1,1]",
-                        "for j in range(nloc):",
-                        "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
-                        "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
-                        "    core = A.T @ (Href @ A)",
-                        "    tr_core = core[0,0] + core[1,1]",
-                        "    lap_j = tr_core + gref[0]*tHx + gref[1]*tHy",
-                        f"    {laploc}[j] = lap_j",
+                        "n_union = gdofs_map[e].shape[0]",
+                        f"{out} = np.empty(({k_comps}, n_union), dtype={self.dtype})",
                     ]
-
-                    if a.side:
-                        map_arr = "pos_map" if a.side == "+" else "neg_map"
-                        required_args.add(map_arr)
-                        lap_pad = new_var("lap_pad"); me = new_var("map_e")
+                    for i, fn in enumerate(a.field_names):
+                        laploc = new_var("laploc")
                         body_lines += [
-                            f"{me} = {map_arr}[e]",                      # (n_loc,)
-                            "n_union = gdofs_map[e].shape[0]",
-                            f"{lap_pad} = np.zeros((n_union,), dtype=d20_q.dtype)",
+                            f"A  = {jinv}[e, q]",
+                            f"Hx = {H0}[e, q]", f"Hy = {H1}[e, q]",
+                            f"d10_q = {d10[i]}[e, q]", f"d01_q = {d01[i]}[e, q]",
+                            f"d20_q = {d20[i]}[e, q]", f"d11_q = {d11[i]}[e, q]", f"d02_q = {d02[i]}[e, q]",
+                            "nloc = d20_q.shape[0]",
+                            f"{laploc} = np.empty((nloc,), dtype=d20_q.dtype)",
+                            "tHx = Hx[0,0] + Hx[1,1]",
+                            "tHy = Hy[0,0] + Hy[1,1]",
                             "for j in range(nloc):",
-                            f"    idx = {me}[j]",
-                            "    if 0 <= idx < n_union:",
-                            f"        {lap_pad}[idx] = {laploc}[j]",
-                            f"{out}.append({lap_pad})",
+                            "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
+                            "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
+                            "    core = A.T @ (Href @ A)",
+                            "    tr_core = core[0,0] + core[1,1]",
+                            "    lap_j = tr_core + gref[0]*tHx + gref[1]*tHy",
+                            f"    {laploc}[j] = lap_j",
                         ]
-                    else:
-                        body_lines += [
-                            f"{out}.append({laploc})",
-                        ]
+                        if a.side:
+                            map_arr = "pos_map" if a.side == "+" else "neg_map"
+                            required_args.add(map_arr)
+                            lap_pad, me = new_var("lap_pad"), new_var("map_e")
+                            body_lines += [
+                                f"{me} = {map_arr}[e]",
+                                f"{lap_pad} = np.zeros((n_union,), dtype=d20_q.dtype)",
+                                "for j in range(nloc):",
+                                f"    idx = {me}[j]",
+                                "    if 0 <= idx < n_union:",
+                                f"        {lap_pad}[idx] = {laploc}[j]",
+                                f"{out}[{i}] = {lap_pad}",
+                            ]
+                        else:
+                            body_lines += [f"{out}[{i}] = {laploc}"]
 
-                body_lines.append(f"{out} = np.stack({out}, axis=0)")  # (k, n_union)
-                stack.append(StackItem(var_name={out}, role=a.role, shape=(-1,-1), is_vector=True,
-                                    field_names=a.field_names, side=a.side))
+                    stack.append(StackItem(var_name=out, role=a.role,
+                                        shape=(k_comps, -1),
+                                        is_vector=True, field_names=a.field_names, side=a.side))
+
+
+                # ---------------- VALUE: collapse with coeffs → (k,) ----------------
+                elif a.role == "value":
+                    coeff = (a.parent_name if a.parent_name.startswith("u_")
+                            else f"u_{a.parent_name}_loc")
+                    required_args.add(coeff)
+
+                    vals = []  # one scalar laplacian per component
+                    for i, fn in enumerate(a.field_names):
+                        laploc = new_var("laploc")
+                        body_lines += [
+                            f"A  = {jinv}[e, q]",
+                            f"Hx = {H0}[e, q]", f"Hy = {H1}[e, q]",
+                            f"d10_q = {d10[i]}[e, q]", f"d01_q = {d01[i]}[e, q]",
+                            f"d20_q = {d20[i]}[e, q]", f"d11_q = {d11[i]}[e, q]", f"d02_q = {d02[i]}[e, q]",
+                            "nloc = d20_q.shape[0]",
+                            f"{laploc} = np.empty((nloc,), dtype=d20_q.dtype)",
+                            "tHx = Hx[0,0] + Hx[1,1]",
+                            "tHy = Hy[0,0] + Hy[1,1]",
+                            "for j in range(nloc):",
+                            "    Href = np.array([[d20_q[j], d11_q[j]],[d11_q[j], d02_q[j]]], dtype=d20_q.dtype)",
+                            "    gref = np.array([d10_q[j], d01_q[j]], dtype=d20_q.dtype)",
+                            "    core = A.T @ (Href @ A)",
+                            "    tr_core = core[0,0] + core[1,1]",
+                            "    lap_j = tr_core + gref[0]*tHx + gref[1]*tHy",
+                            f"    {laploc}[j] = lap_j",
+                        ]
+                        if a.side:
+                            map_arr = "pos_map" if a.side == "+" else "neg_map"
+                            required_args.add(map_arr)
+                            lap_pad = new_var("lap_pad"); me = new_var("map_e")
+                            body_lines += [
+                                f"{me} = {map_arr}[e]",
+                                "n_union = gdofs_map[e].shape[0]",
+                                f"{lap_pad} = np.zeros((n_union,), dtype=d20_q.dtype)",
+                                "for j in range(nloc):",
+                                f"    idx = {me}[j]",
+                                "    if 0 <= idx < n_union:",
+                                f"        {lap_pad}[idx] = {laploc}[j]",
+                            ]
+                            lap_src = lap_pad
+                        else:
+                            lap_src = laploc
+
+                        val = new_var("lap_val")
+                        body_lines += [
+                            f"{val} = float(np.dot({coeff}, {lap_src}))",  # collapse to scalar
+                        ]
+                        vals.append(val)
+
+                    body_lines.append(f"{out} = np.array([{', '.join(vals)}], dtype={self.dtype})")  # (k,)
+                    stack.append(StackItem(var_name=out, role="value", shape=(k_comps,),
+                                        is_vector=True, field_names=a.field_names, side=a.side))
+
+                else:
+                    raise NotImplementedError(f"Laplacian not implemented for role {a.role}")
+
 
 
             
@@ -804,85 +915,122 @@ class NumbaCodeGen:
                 if a.role in ('test', 'trial') and b.role in ('test', 'trial'):
                     body_lines.append('# Inner(LHS): orient rows=test, cols=trial')
 
-                    # pick the operands by role, regardless of stack order
+                    # pick operands by role (regardless of stack order)
                     test_var  = f"{a.var_name}" if a.role == "test"  else f"{b.var_name}"
                     trial_var = f"{a.var_name}" if a.role == "trial" else f"{b.var_name}"
-                    n_test    = a.shape[1] if a.role == "test"  else b.shape[1]
-                    n_trial   = a.shape[1] if a.role == "trial" else b.shape[1]
-
-                    body_lines.append(f'{res_var} = np.zeros(({n_test}, {n_trial}), dtype={self.dtype})')
 
                     if a.is_gradient and b.is_gradient:
-                        # grad-grad: sum over vector components
-                        k_comps = a.shape[0]  # == b.shape[0]
-                        body_lines.append(f'for k in range({k_comps}):')
-                        # test[k] @ trial[k].T → (n_test, n_trial)
-                        body_lines.append(f'    {res_var} += {test_var}[k] @ {trial_var}[k].T.copy()')
-                    else:
-                        # vector bases (or scalar lifted to (1,n)): test.T @ trial
-                        body_lines.append(f'{res_var} = {test_var}.T.copy() @ {trial_var}')
+                        # grad-grad: test/trial are lists over k, each item is (n, d)
+                        body_lines += [
+                            f"n_test  = {test_var}[0].shape[0]",
+                            f"n_trial = {trial_var}[0].shape[0]",
+                            f"{res_var} = np.zeros((n_test, n_trial), dtype={self.dtype})",
+                            f"k_comps = {test_var}.shape[0]",
+                            f"for k in range(k_comps):",
+                            f"    {res_var} += {test_var}[k] @ {trial_var}[k].T",
+                        ]
 
-                    # push with correct matrix shape
-                    stack.append(StackItem(var_name=res_var, role="value",
-                                        shape=(n_test, n_trial), is_vector=False,
-                                        is_gradient=False))
+                    elif a.is_hessian and b.is_hessian:
+                        # Hessian-Hessian: items are (n, 2, 2)
+                        body_lines += [
+                            f"n_test  = {test_var}[0].shape[0]",
+                            f"n_trial = {trial_var}[0].shape[0]",
+                            f"{res_var} = np.zeros((n_test, n_trial), dtype={self.dtype})",
+                            f"k_comps = {test_var}.shape[0]",
+                            f"for k in range(k_comps):",
+                            f"    T = {test_var}[k].reshape(n_test, 4)",
+                            f"    R = {trial_var}[k].reshape(n_trial, 4)",
+                            f"    {res_var} += T @ R.T",
+                        ]
+
+                    else:
+                        # vector bases: test.T @ trial
+                        body_lines.append(f"{res_var} = {test_var}.T @ {trial_var}")
+
+                    stack.append(StackItem(var_name=res_var, role='value',
+                                        shape=(), is_vector=False, is_gradient=False))
                     continue
+
 
                 # elif a.role == 'const' and b.role == 'const' and a.shape == b.shape:
                 #     body_lines.append(f'# Inner(Const, Const): element-wise product')
                 #     body_lines.append(f'{res_var} = {a.var_name} * {b.var_name}')
-                elif a.role == 'value' and b.role == 'test': # RHS
-                    body_lines.append(f'# RHS: Inner(Function, Test)')
-                    # a is (k,d) , b is (k,n,d), 
+                elif a.role == 'value' and b.role == 'test':  # RHS
+                    body_lines.append('# RHS: Inner(Function, Test)')
+
                     if a.is_gradient and b.is_gradient:
-                        # a is (k,d) and b is  (k,n,d)  --> (n)
-                        body_lines.append(f'# RHS: Inner(Grad(Function), Grad(Test))')
+                        # a: (k,d) collapsed grad(Function), b: (k,n,d)
                         body_lines += [
-                            f'n_locs = {b.shape[1]}; n_vec_comps = {a.shape[0]};',
-                            # f'print(f"a.shape: {{{a.var_name}.shape}}, b.shape: {{{b.var_name}.shape}}")',
-                            f'{res_var} = np.zeros((n_locs), dtype={self.dtype})',
-                            f'for n in range(n_locs):',
-                            f"    {res_var}[n] = np.sum({a.var_name} * {b.var_name}[:,n,:].copy())"
+                            "# RHS: Inner(Grad(Function), Grad(Test))",
+                            f"n_locs = {b.var_name}[0].shape[0]",                # (k,n,d) -> n
+                            f"{res_var} = np.zeros(n_locs, dtype={self.dtype})",
+                            f"k_comps = {b.var_name}.shape[0]",
+                            "for k in range(k_comps):",
+                            f"    # b[k]: (n,d), a[k]: (d,)  → (n,)",
+                            f"    {res_var} += {b.var_name}[k] @ {a.var_name}[k]",
                         ]
+
+                    elif a.is_hessian and b.is_hessian:
+                        # a: (k,2,2) collapsed Hess(Function), b: (k,n,2,2)
+                        body_lines += [
+                            "# RHS: Inner(Hessian(Function), Hessian(Test))",
+                            f"n_locs = {b.var_name}[0].shape[0]",                # (k,n,2,2) -> n
+                            f"{res_var} = np.zeros(n_locs, dtype={self.dtype})",
+                            f"k_comps = {a.var_name}.shape[0]",
+                            "for k in range(k_comps):",
+                            f"    v = {a.var_name}[k].reshape(4)",               # (4,)
+                            f"    B = {b.var_name}[k].reshape(n_locs, 4)",       # (n,4)
+                            f"    {res_var} += B @ v",                           # (n,)
+                        ]
+
                     elif a.is_vector and b.is_vector:
-                        body_lines.append(f'# RHS: Inner(Function, Test)')
-                        # a is (k), b is (k,n) -> (n,)
-                        # New Newton: Optimized manual dot product loop
+                        # a: (k,), b: (k,n)  → (n,)
                         body_lines += [
-                            f'n_locs = {b.shape[1]}',
-                            f'n_vec_comps = {b.shape[0]}',
-                            f'{res_var} = np.zeros(n_locs, dtype={self.dtype})',
-                            f'for n in range(n_locs):',
-                            f'    local_sum = 0.0',
-                            f'    for k in range(n_vec_comps):',
-                            f'        local_sum += {a.var_name}[k] * {b.var_name}[k, n]',
-                            f'    {res_var}[n] = local_sum',
+                            "# RHS: Inner(Value(Vector), Test(Vector))",
+                            f"n_locs = {b.var_name}.shape[1]",
+                            f"{res_var} = {b.var_name}.T @ {a.var_name}",        # (n,k) @ (k,) -> (n,)
                         ]
+
                     elif a.is_vector and b.is_gradient:
-                        # Case: grad(scalarFunction)->(k,), grad(Test)->(k,n,d) --> (n,)
-                        body_lines.append(f'# RHS: Inner(grad(scalarFunction), grad(Test)')
+                        # grad(scalarFunction): a: (d,), b: (1,n,d) → (n,)
                         body_lines += [
-                            f'n_locs = {b.shape[1]}; n_vec_comps = {a.shape[0]};',
-                            f'{res_var} = np.zeros((n_locs), dtype={self.dtype})',
-                            f'for n in range(n_locs):',
-                            f"    {res_var}[n] = np.sum({a.var_name} * {b.var_name}[:,n,:].copy())"
+                            "# RHS: Inner(grad(scalarFunction), grad(Test))",
+                            f"n_locs = {b.var_name}[0].shape[0]",
+                            f"{res_var} = {b.var_name}[0] @ {a.var_name}",       # (n,d) @ (d,) -> (n,)
                         ]
+
                     else:
-                        raise NotImplementedError(f"Inner not implemented for roles {a.role}/{b.role}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}, is_gradient: {b.is_gradient},shapes: {a.shape}/{b.shape}")
+                        raise NotImplementedError(
+                            f"Inner not implemented for roles {a.role}/{b.role}, "
+                            f"is_vector: {a.is_vector}/{b.is_vector}, "
+                            f"is_gradient: {a.is_gradient}/{b.is_gradient}, "
+                            f"shapes: {a.shape}/{b.shape}, is_hessian: {a.is_hessian}/{b.is_hessian}"
+                        )
+
                         
                     
                 elif a.role == 'value' and b.role == 'value':
                     if a.is_vector and b.is_vector:
                         body_lines.append(f'# Inner(Value, Value): dot product')
                         body_lines.append(f'{res_var} = np.dot({a.var_name}, {b.var_name})')
-                    if a.is_gradient and b.is_gradient:
+                    elif a.is_gradient and b.is_gradient:
                         body_lines += [
                             f'# Inner(Grad(Value), Grad(Value)): stiffness matrix',
                             f'# (k,d) @ (k,d) -> (k,k)',
                             f'{res_var} = {a.var_name} @ {b.var_name}.T.copy()',]
+                    elif a.is_hessian and b.is_hessian:
+                        body_lines += [
+                            f'# Inner(Hessian(Value), Hessian(Value)): stiffness matrix',
+                            f'# (k,2,2) @ (k,2,2) -> (k,k)',
+                            f'{res_var} = {a.var_name} @ {b.var_name}.T.copy()',
+                        ]
                 
                 else:
-                    raise NotImplementedError(f"JIT Inner not implemented for roles {a.role}/{b.role}, is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}, is_gradient: {b.is_gradient}, shapes: {a.shape}/{b.shape}")
+                    raise NotImplementedError(f"JIT Inner not implemented for roles {a.role}/{b.role}, "
+                                              f" is_vector: {a.is_vector}/{b.is_vector}, " 
+                                              f" is_gradient: {a.is_gradient}/{b.is_gradient}, " 
+                                              f" shapes: {a.shape}/{b.shape}"
+                                              f" is_hessian: {a.is_hessian}/{b.is_hessian}")
                 stack.append(StackItem(var_name=res_var, role='value', shape=(), is_vector=False, field_names=[]))
 
             # ------------------------------------------------------------------
@@ -1644,7 +1792,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = True
+            DEBUG: bool = False
         ):
         """
         Build complete kernel source code with parallel assembly.

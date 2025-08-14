@@ -53,6 +53,17 @@ class Ref:
     @lru_cache(maxsize=None)
     def laplacian(self, xi, eta):
         return self.hess_dxixi(xi, eta) + self.hess_detaeta(xi, eta)
+    @lru_cache(maxsize=None)
+    def hess(self, xi, eta):
+        d20 = self.hess_dxixi(xi, eta)
+        d11 = self.hess_dxieta(xi, eta)
+        d02 = self.hess_detaeta(xi, eta)
+        H = np.empty((d20.shape[0], 2, 2), dtype=float)
+        H[:, 0, 0] = d20
+        H[:, 0, 1] = d11
+        H[:, 1, 0] = d11
+        H[:, 1, 1] = d02
+        return H
 
 @lru_cache(maxsize=None)
 def get_reference(element_type: str, poly_order: int = 1, max_deriv_order: int = 2):

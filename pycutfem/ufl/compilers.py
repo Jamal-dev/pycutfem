@@ -1220,6 +1220,23 @@ class FormCompiler:
             raise ValueError("Unsupported backend.")
     
     # ----------------------------------------------------------------------
+    def _expr_requires_hess(self, node):
+        # generic DFS over expression tree
+        stack = [node]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, (Hessian, Laplacian)):
+                return True
+            # push children if any (covers unary/binary ops, inner, etc.)
+            for attr in ("operand","a","b","A"):
+                child = getattr(x, attr, None)
+                if child is not None:
+                    stack.append(child)
+            # lists/tuples of nodes
+            if hasattr(x, "__iter__") and not isinstance(x, (str, bytes)):
+                stack.extend([y for y in x if hasattr(y, "__dict__")])
+        return False
+
     def _assemble_volume_jit(self, integral: Integral, matvec):
         """
         Assembles a volume integral using the JIT backend, correctly handling
@@ -1248,24 +1265,24 @@ class FormCompiler:
             integral.integrand,
             self.dh, self.me
         )
+        need_hess = False
+        if hasattr(runner, "required_static"):
+            req = set(runner.required_static)
+            need_hess = bool(req & {"Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1"})
+        else:
+            need_hess = self._expr_requires_hess(integral.integrand)
+
 
         # 4. Build the static arguments required by this specific kernel.
         # We build these fresh every time to avoid caching collisions.
         q_order = self._find_q_order(integral)
 
         # (A) Get full-mesh geometric factors and then SLICE them for the subset.
-        geo_args_all = self.dh.precompute_geometric_factors(q_order)
-        pre_built = {
-            "qp_phys": geo_args_all["qp_phys"][element_ids],
-            "qw":      geo_args_all["qw"][element_ids],
-            "detJ":    geo_args_all["detJ"][element_ids],
-            "J_inv":   geo_args_all["J_inv"][element_ids],
-            "normals": geo_args_all["normals"][element_ids],
-            "h_arr":   geo_args_all["h_arr"][element_ids],
-            "phis":    None if geo_args_all["phis"] is None else geo_args_all["phis"][element_ids],
-            "entity_kind": "element",
-            "owner_id": geo_args_all.get("owner_id", geo_args_all["eids"])[element_ids],
-        }
+        geo_args_all = self.dh.precompute_geometric_factors(q_order, need_hess=need_hess)
+        pre_built = {k: (v[element_ids] if isinstance(v, np.ndarray) else v) for k, v in geo_args_all.items()}
+        pre_built["entity_kind"] = "element"
+        pre_built["owner_id"]    = geo_args_all.get("owner_id", geo_args_all.get("eids"))[element_ids]
+
 
         # (B) Build the DOF map for the subset.
         gdofs_map = np.vstack([
@@ -1683,7 +1700,15 @@ class FormCompiler:
         if level_set is None:
             raise ValueError("dInterface measure requires a level_set.")
 
-        geo = dh.precompute_interface_factors(cut_bs, qdeg, level_set)
+        
+        runner, ir = self._compile_backend(intg.integrand, dh, me)
+        need_hess = False
+        if hasattr(runner, "required_static"):
+            req = set(runner.required_static)
+            need_hess = bool(req & {"Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1"})
+        else:
+            need_hess = self._expr_requires_hess(intg.integrand)
+        geo = dh.precompute_interface_factors(cut_bs, qdeg, level_set, need_hess=need_hess)
         cut_eids = geo["eids"].astype(np.int32)      # 1‑D array, len = n_cut
 
         # ------------------------------------------------------------------
@@ -1704,7 +1729,7 @@ class FormCompiler:
         # 5. Compile kernel & build static argument dict
         # ------------------------------------------------------------------
 
-        runner, ir = self._compile_backend(intg.integrand, dh, me)
+        
 
         basis_args = _build_jit_kernel_args(
             ir, intg.integrand, me, qdeg,
@@ -1762,17 +1787,24 @@ class FormCompiler:
 
         if edge_ids.cardinality() == 0:
             return
-
-        # 2. Precompute all side-aware geometric and basis factors
-        geo_factors = self.dh.precompute_ghost_factors(edge_ids, qdeg, level_set, derivs)
         
+        # 3. Compile kernel
+        runner, ir = self._compile_backend(intg.integrand, dh, me)
+
+        need_hess = False
+        if hasattr(runner, "required_static"):
+            req = set(runner.required_static)
+            need_hess = bool(req & {"Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1"})
+        else:
+            need_hess = self._expr_requires_hess(intg.integrand)
+        # 2. Precompute all side-aware geometric and basis factors
+        geo_factors = self.dh.precompute_ghost_factors(edge_ids, qdeg, level_set, derivs, need_hess=need_hess)
+
         valid_eids = geo_factors.get('eids')
         print(f"len(valid_eids)={len(valid_eids)}")
         if valid_eids is None or len(valid_eids) == 0:
             return
 
-        # 3. Compile kernel
-        runner, ir = self._compile_backend(intg.integrand, dh, me)
 
         
 
@@ -1968,14 +2000,20 @@ class FormCompiler:
             derivs |= {(0, 0)}
         qdeg = self._find_q_order(intg)
         print(f"[Assembler: boundary edge JIT] Using quadrature degree: {qdeg}")
-        geo  = dh.precompute_boundary_factors(edge_set, qdeg, derivs)
+        # 3. kernel compilation ---------------------------------------
+        runner, ir = self._compile_backend(intg.integrand, dh, me)
+        need_hess = False
+        if hasattr(runner, "required_static"):
+            req = set(runner.required_static)
+            need_hess = bool(req & {"Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1"})
+        else:
+            need_hess = self._expr_requires_hess(intg.integrand)
+        geo  = dh.precompute_boundary_factors(edge_set, qdeg, derivs, need_hess=need_hess)
 
         valid = geo["eids"]
         if valid.size == 0:
             return
 
-        # 3. kernel compilation ---------------------------------------
-        runner, ir = self._compile_backend(intg.integrand, dh, me)
 
         args = _build_jit_kernel_args(
             ir, intg.integrand, me, qdeg,
@@ -2172,6 +2210,12 @@ class FormCompiler:
 
         # --- compile kernel once
         runner, ir = self._compile_backend(intg.integrand, dh, me)
+        need_hess = False
+        if hasattr(runner, "required_static"):
+            req = set(runner.required_static)
+            need_hess = bool(req & {"Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1"})
+        else:
+            need_hess = self._expr_requires_hess(intg.integrand)
 
         # helper to run kernel on a subset of elements with prebuilt geo
         def _run_subset(eids: np.ndarray, prebuilt: dict):
@@ -2203,7 +2247,7 @@ class FormCompiler:
         full_ids = np.asarray(outside_ids if side == '+' else inside_ids, dtype=np.int32)
         if full_ids.size:
             # include level_set so 'phis' is populated (still fine if None)
-            geo_all = dh.precompute_geometric_factors(qdeg, level_set)
+            geo_all = dh.precompute_geometric_factors(qdeg, level_set, need_hess=need_hess)
 
             # slice what the kernel signature expects
             prebuilt_full = {
@@ -2225,7 +2269,7 @@ class FormCompiler:
 
             # precomputed, element-specific qp / qw / J_inv  (+ basis tables b_* / dxy_*)
             geo_cut = dh.precompute_cut_volume_factors(
-                mesh.element_bitset("cut"), qdeg, derivs, level_set, side=side
+                mesh.element_bitset("cut"), qdeg, derivs, level_set, side=side, need_hess=need_hess
             )
             cut_eids = np.asarray(geo_cut.get("eids", []), dtype=np.int32)
             if cut_eids.size:
