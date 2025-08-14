@@ -144,6 +144,8 @@ else:
 
 # ----------------------- Q1 (quad, p=1) derivatives up to order 2 --------------
 # nodes in row-major: (xi,eta) = (-1,-1),(+1,-1),(+1,+1),(-1,+1)
+# nodes in LEXICOGRAPHICAL order to match _tabulate_q1:
+# (xi, eta) = [(-1,-1), ( +1,-1), ( -1,+1), ( +1,+1)]
 if _HAVE_NUMBA:
     @_nb.njit(cache=True)
     def _eval_deriv_q1(xi: float, eta: float, dx: int, dy: int) -> np.ndarray:
@@ -152,14 +154,23 @@ if _HAVE_NUMBA:
         M0 = 0.5*(1.0 - eta); M1 = 0.5*(1.0 + eta)
         dL0 = -0.5; dL1 = 0.5
         dM0 = -0.5; dM1 = 0.5
-        # second derivs are zero for Q1
+
         if dx == 0 and dy == 0:
-            return np.array([L0*M0, L1*M0, L1*M1, L0*M1])
+            # [(-1,-1), (+1,-1), (-1,+1), (+1,+1)]
+            return np.array([L0*M0, L1*M0, L0*M1, L1*M1])
+
         if dx == 1 and dy == 0:
-            return np.array([dL0*M0, dL1*M0, dL1*M1, dL0*M1])
+            return np.array([dL0*M0, dL1*M0, dL0*M1, dL1*M1])
+
         if dx == 0 and dy == 1:
-            return np.array([L0*dM0, L1*dM0, L1*dM1, L0*dM1])
-        # all second-order derivatives are zero for Q1
+            return np.array([L0*dM0, L1*dM0, L0*dM1, L1*dM1])
+
+        if dx == 1 and dy == 1:
+            # Mixed derivative is NONZERO for Q1: dL * dM (±0.25)
+            return np.array([dL0*dM0, dL1*dM0, dL0*dM1, dL1*dM1])
+
+        # pure second derivatives vanish for Q1
+        # (dx,dy) in {(2,0),(0,2)} → 0
         return np.zeros(4)
 
     @_nb.njit(cache=True, parallel=True, fastmath=True)

@@ -29,8 +29,21 @@ class VecOpInfo:
         """Computes inner product (u, v), returning an (n, n) matrix."""
         if self.data.shape[0] != other.data.shape[0]:
             raise ValueError("VecOpInfo component mismatch for inner product.")
-        # sum over components (k), outer product over basis functions (n,m)
-        return np.einsum("kn,km->nm", self.data, other.data, optimize=True)
+        A, B = self.data, other.data
+        if A.ndim == 2 and B.ndim == 2:
+            # LHS: (k,n) and (k,m) -> (n,m)
+            return np.einsum("kn,km->nm", A, B, optimize=True)
+        if A.ndim == 1 and B.ndim == 2:
+            # RHS: (k,) and (k,n) -> (n,)
+            return np.einsum("k,kn->n", A, B, optimize=True)
+        if A.ndim == 2 and B.ndim == 1:
+            # RHS: (k,n) and (k,) -> (n,)
+            return np.einsum("kn,k->n", A, B, optimize=True)
+        if A.ndim == 1 and B.ndim == 1:
+            # RHS: (k,) and (k,) -> scalar
+            return float(np.einsum("k,k->", A, B, optimize=True))
+        raise ValueError(f"Unsupported inner dims A{A.shape}, B{B.shape} for VecOpInfo.")
+    
 
     def dot_const(self, const: np.ndarray) -> np.ndarray:
         """Computes dot(v, c), returning an (n,) vector."""
@@ -72,7 +85,10 @@ class VecOpInfo:
         elif self.role == "trial" and grad.role == "function":
             # Case:  Trial · Grad(Function)      u_trial · ∇u_k
             # (1)  value of u_trial at this quad-point
-            grad_val = np.einsum("knd,kn->kd", grad.data, grad.coeffs, optimize=True) # (k, d)  —   ∇u_k(ξ) (2,2)
+            if grad.coeffs is not None:
+                grad_val = np.einsum("knd,kn->kd", grad.data, grad.coeffs, optimize=True)
+            else:
+                grad_val = grad.data
             # (2)  w_i,n = Σ_d ∂_d φ_{k,n} u_d
             data = np.einsum("dl,kd->kl", self.data, grad_val, optimize=True)
             return VecOpInfo(data, role=self.role)

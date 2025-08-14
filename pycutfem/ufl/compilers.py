@@ -74,6 +74,8 @@ class FormCompiler:
         self.dh, self.me = dh, dh.mixed_element
         self.qorder = quadrature_order
         self.ctx: Dict[str, Any] = {"hooks": assembler_hooks or {}}
+        self._coeff_cache: Dict[tuple, np.ndarray] = {}
+        self._collapsed_cache: Dict[tuple, np.ndarray] = {}
         self._basis_cache: Dict[str, Dict[str, np.ndarray]] = {}
         self.degree_estimator = PolynomialDegreeEstimator(dh)
         self.backend = backend
@@ -160,6 +162,69 @@ class FormCompiler:
             if gx is not None and gy is not None:
                 return np.stack([gx, gy], axis=1)
         raise KeyError(f"Gradient for field '{fld}' not found.")
+    def _hess(self, fld):
+        """
+        Return the physical 2x2 Hessian tensor table for the scalar field `fld`
+        at the current quadrature context. Shape: (n_loc, 2, 2).
+        Resolves from:
+          1) cached per-element tables (if available),
+          2) ghost-edge side-aware `basis_values` {(2,0),(1,1),(0,2)},
+          3) reference derivatives + affine mapping via Ji.
+        """
+        # ➊ per-element cache
+        if fld in self._basis_cache and "hess" in self._basis_cache[fld]:
+            return self._basis_cache[fld]["hess"]
+
+        # ➋ ghost-edge / side-aware cache
+        bv = self.ctx.get("basis_values")
+        if bv is not None:
+            side = self.ctx.get("side")
+            if side not in ("+", "-"):
+                side = "+" if self.ctx.get("phi_val", 0.0) >= 0 else "-"
+            fld_dict = bv.get(side, {}).get(fld, {})
+            d20 = fld_dict.get((2, 0))
+            d11 = fld_dict.get((1, 1))
+            d02 = fld_dict.get((0, 2))
+            if d20 is not None and d11 is not None and d02 is not None:
+                nloc = d20.shape[0]
+                H = np.empty((nloc, 2, 2), dtype=d20.dtype)
+                H[:, 0, 0] = d20
+                H[:, 0, 1] = d11
+                H[:, 1, 0] = d11
+                H[:, 1, 1] = d02
+                return H
+
+        # ➌ standard element path: compute from reference and map
+        eid    = self.ctx.get("eid")
+        x_phys = self.ctx.get("x_phys")
+        if eid is None or x_phys is None:
+            raise KeyError("Hessian requested outside of element context (missing 'eid'/'x_phys').")
+
+        mesh = self.me.mesh
+        xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
+        J       = transform.jacobian(mesh, eid, (xi, eta))
+        Ji      = np.linalg.inv(J)
+
+        d20 = self.me.deriv_ref(fld, xi, eta, 2, 0)  # (n_loc,)
+        d11 = self.me.deriv_ref(fld, xi, eta, 1, 1)
+        d02 = self.me.deriv_ref(fld, xi, eta, 0, 2)
+
+        nloc = d20.shape[0]
+        Href = np.empty((nloc, 2, 2), dtype=d20.dtype)
+        Href[:, 0, 0] = d20
+        Href[:, 0, 1] = d11
+        Href[:, 1, 0] = d11
+        Href[:, 1, 1] = d02
+
+        # affine mapping: H_phys = Ji.T @ Href @ Ji  (per basis function)
+        tmp = np.einsum("ab,nbc->nac", Ji.T, Href, optimize=True)
+        H   = np.einsum("nac,cb->nab", tmp, Ji, optimize=True)
+
+        # cache for this quadrature point
+        if fld not in self._basis_cache:
+            self._basis_cache[fld] = {}
+        self._basis_cache[fld]["hess"] = H
+        return H
     def _lookup_basis(self, field: str, alpha: tuple[int, int]) -> np.ndarray:
         """
         Return the trace of ∂^{alpha}φ_i (i = 1..n_loc) at the current
@@ -183,6 +248,13 @@ class FormCompiler:
             return self._g(field)[:, 0]                                       # (n_loc,)
         if alpha == (0, 1):
             return self._g(field)[:, 1]                                       # (n_loc,)
+        # second derivatives via Hessian helper
+        if alpha == (2, 0):
+            return self._hess(field)[:, 0, 0]
+        if alpha == (1, 1):
+            return self._hess(field)[:, 0, 1]
+        if alpha == (0, 2):
+            return self._hess(field)[:, 1, 1]
 
         # Higher derivatives outside ghost-edge assembly are not (yet) required
         raise KeyError(f"Basis for derivative {alpha} of field '{field}' not found.")
@@ -269,10 +341,23 @@ class FormCompiler:
         
         # Hessian-like object
         if isinstance(A, HessOpInfo):
-            return A.trace()
+            # Function: already collapsed to (k,2,2) or needs coeffs contraction
+            if A.role == "function":
+                if A.coeffs is not None and A.data.ndim == 4:
+                    Hval = np.einsum("knij,kn->kij", A.data, A.coeffs, optimize=True)
+                else:
+                    Hval = A.data  # (k,2,2)
+                # trace over spatial axes → (k,)
+                tr = Hval[..., 0, 0] + Hval[..., 1, 1]
+                return VecOpInfo(tr, role="function")
+            else:
+                # test/trial: return (k,n) table of Laplacians
+                tr = A.data[..., 0, 0] + A.data[..., 1, 1]
+                return VecOpInfo(tr, role=A.role)
 
         # VecOpInfo or other types are not meaningful for trace
-        raise TypeError(f"Trace not implemented for {type(A)}")
+        raise TypeError(f"Trace not implemented for {type(A)}"
+                        f" for role '{A.role}' with shape {A.data.shape}.")
     
     def _visit_Power(self, n: Power):
         """
@@ -472,13 +557,11 @@ class FormCompiler:
         return VecOpInfo(np.stack([self._lookup_basis(f, (0, 0)) for f in n.field_names]), role="trial")
     # ================== VISITORS: OPERATORS ========================
     def _visit_Grad(self, n: Grad):
-        """Return GradOpInfo with shape (k, n_dofs_local, d)."""
+        """Return GradOpInfo with shape (k, n_dofs_local, d) for test/trial, or (k,d) for function (collapsed)."""
         op = n.operand
         logger.debug(f"Entering _visit_Grad for operand type {type(op)}")
 
-        # ------------------------------------------------------------
-        # 1.  Determine role  (affects assembly later on)
-        # ------------------------------------------------------------
+        # 1) role
         if isinstance(op, (TestFunction, VectorTestFunction)):
             role = "test"
         elif isinstance(op, (TrialFunction, VectorTrialFunction)):
@@ -488,43 +571,106 @@ class FormCompiler:
         else:
             raise NotImplementedError(f"grad() not implemented for {type(op)}")
 
-        # ------------------------------------------------------------
-        # 2.  Build one gradient block per component / field
-        # ------------------------------------------------------------
-
-        if hasattr(op, "field_names"):
-            fields = op.field_names
-        else:
-            fields = [op.field_name]
+        # 2) fields
+        fields = op.field_names if hasattr(op, "field_names") else [op.field_name]
 
         k_blocks = []
-        coeffs_list = []
-        for i,fld in enumerate(fields):
-            
-            g = self._g(fld)                                    # (22,2)
-
-            if role == "function":                              # data → scale rows
-                # coeffs = op.get_nodal_values(self._local_dofs()) # (22,)
-                if hasattr(op, "components"):
-                    # VectorFunction case: each component has its own values
-                    coeffs = op.components[i].padded_values(self._local_dofs()) 
-                    # print(f"field {i}: coeffs({coeffs.shape}) : , {coeffs}")
-                else:
-                    # Function case: single component
-                    coeffs = op.padded_values(self._local_dofs()) # (22,)
-                # g = coeffs[:, None] * g                         # (22,2)
-                coeffs_list.append(coeffs)  # Store coeffs for later use
-                # print(f"field {i}: g({g.shape}) : , {g}")
-
-            # For test/trial the raw g is already correct
-            k_blocks.append(g)
-
         if role == "function":
-            # Pass the un-scaled gradients and the coefficients separately
-            return GradOpInfo(np.stack(k_blocks), role=role, coeffs=np.stack(coeffs_list))
-        else:
-            # Trial/Test functions have no coeffs, this is unchanged
+            # collapse once per component and cache
+            local_dofs = self._local_dofs()
+            for i, fld in enumerate(fields):
+                key_coll = (id(op), "grad", i, self.ctx.get("eid"), self.ctx.get("side"), self.ctx.get("phi_val"))
+                gval = self._collapsed_cache.get(key_coll)
+                if gval is None:
+                    g = self._g(fld)                                    # (n,2)
+                    # coefficients padded once per component
+                    key_c = (id(op), i, tuple(local_dofs))
+                    coeffs = self._coeff_cache.get(key_c)
+                    if coeffs is None:
+                        if hasattr(op, "components"):
+                            coeffs = op.components[i].padded_values(local_dofs)
+                        else:
+                            coeffs = op.padded_values(local_dofs)
+                        self._coeff_cache[key_c] = coeffs
+                    gval = np.einsum("nd,n->d", g, coeffs, optimize=True)  # (2,)
+                    self._collapsed_cache[key_coll] = gval
+                k_blocks.append(gval)
             return GradOpInfo(np.stack(k_blocks), role=role)
+        else:
+            for fld in fields:
+                g = self._g(fld)
+                k_blocks.append(g)
+            return GradOpInfo(np.stack(k_blocks), role=role)
+    
+    def _visit_Hessian(self, n: Hessian):
+        """
+        Build per-component Hessian tables.
+          • Test/Trial → data shape (k, n, 2, 2).
+          • Function   → collapsed per component, data shape (k, 2, 2).
+        """
+        op = n.operand
+
+        # Determine role
+        if isinstance(op, (TestFunction, VectorTestFunction)):
+            role = "test"
+        elif isinstance(op, (TrialFunction, VectorTrialFunction)):
+            role = "trial"
+        elif isinstance(op, (Function, VectorFunction)):
+            role = "function"
+        else:
+            raise NotImplementedError(f"Hessian not implemented for {type(op)}")
+
+        fields = getattr(op, "field_names", None)
+        if fields is None:
+            fields = [op.field_name]
+
+        local_dofs = self._local_dofs()
+
+        # helper to get padded coefficients once per component
+        def _get_coeff(i):
+            key = (id(op), i, tuple(local_dofs))
+            c = self._coeff_cache.get(key)
+            if c is None:
+                if hasattr(op, "components"):
+                    c = op.components[i].padded_values(local_dofs)
+                else:
+                    c = op.padded_values(local_dofs)
+                self._coeff_cache[key] = c
+            return c
+
+        k_blocks = []
+        if role == "function":
+            # collapse once per component and cache result per QP
+            for i, fld in enumerate(fields):
+                key_coll = (id(op), "hess", i, self.ctx.get("eid"), self.ctx.get("side"), self.ctx.get("phi_val"))
+                Hval = self._collapsed_cache.get(key_coll)
+                if Hval is None:
+                    Htbl = self._hess(fld)                    # (n,2,2)
+                    coeffs = _get_coeff(i)                    # (n,)
+                    Hval = np.einsum("nij,n->ij", Htbl, coeffs, optimize=True)  # (2,2)
+                    self._collapsed_cache[key_coll] = Hval
+                k_blocks.append(Hval)
+            data = np.stack(k_blocks)                          # (k,2,2)
+            return HessOpInfo(data, role=role)                 # coeffs=None → already collapsed
+        else:
+            # build basis tables per component
+            for fld in fields:
+                Htbl = self._hess(fld)                         # (n,2,2)
+                k_blocks.append(Htbl)
+            data = np.stack(k_blocks)                          # (k,n,2,2)
+            return HessOpInfo(data, role=role)
+
+    def _visit_Laplacian(self, n: Laplacian):
+        """
+        Laplacian(u) := trace(Hessian(u)).
+
+        For Function/VectorFunction operands, returns a VecOpInfo with role="function"
+        containing the collapsed per-component Laplacians (k,).
+        For Test/Trial operands, returns a VecOpInfo (k, n) of basis Laplacians.
+        """
+        H = self._visit_Hessian(Hessian(n.operand))
+        tr = H.trace()      # VecOpInfo with role preserved
+        return tr
 
     def _visit_DivOperation(self, n: DivOperation):
         grad_op = self._visit(Grad(n.operand))           # (k, n_loc, d)
@@ -580,6 +726,9 @@ class FormCompiler:
 
         # Grad basis/operators
         if isinstance(A, GradOpInfo):
+            return A.transpose()
+        # Hessian basis/operators
+        if isinstance(A, HessOpInfo):
             return A.transpose()
 
         # Vector basis/operators
@@ -836,74 +985,112 @@ class FormCompiler:
         b = self._visit(n.b)
         logger.debug(f"Entering _visit_Inner for types {type(a)} : {type(b)}")
 
-        # ------------------------------------------------------------------
-        # RHS:  inner( Grad(Function) , Grad(Test) )   or   symmetric case
-        #        → length-n vector  F_n = Σ_{k,d}  (∑_m ∂_d u_k φ_m) · ∂_d v_k,n
-        # ------------------------------------------------------------------
-        if self.ctx.get("rhs"):
-            if isinstance(a, GradOpInfo) and isinstance(b, GradOpInfo):
-                # Function · Test  ............................................
-                if a.role == "function" and b.role == "test":
-                    # print(f"mei hu na" * 6)
-                    # print(f"a.data before summition: {a.data}")
+        rhs = bool(self.ctx.get("rhs"))
 
-                    if a.coeffs is not None:
-                        grad_val = np.einsum("knd,kn->kd", a.data, a.coeffs, optimize=True)
+        # ============================= RHS =============================
+        if rhs:
+            # ---- Hessian(Function) · Hessian(Test/Trial)  → (n,) ----
+            if isinstance(a, HessOpInfo) and isinstance(b, HessOpInfo):
+                if a.role == 'function' and b.role in ('test', 'trial'):
+                    # a.data is either (k,2,2) collapsed or (k,n,2,2) + a.coeffs
+                    if a.coeffs is not None and a.data.ndim == 4:
+                        kdij = np.einsum('knij,kn->kij', a.data, a.coeffs, optimize=True)  # (k,2,2)
                     else:
-                        grad_val = a.data
-                    # print(f"grad_val: {grad_val}")
-                    # print(f"b.data: {b.data}")
-                    return np.einsum("kd,knd->n", grad_val, b.data, optimize=True)
-
-                # Test · Function  (rare but symmetrical) .............
-                if b.role == "function" and a.role == "test":
-                    grad_val = np.einsum("knd,kn->kd", b.data, b.coeffs, optimize=True)
-                    return np.einsum("kd,knd->n", grad_val, a.data, optimize=True)
-
-        # Both are Info objects of the same kind -> matrix assembly
-        if type(a) is type(b) and isinstance(a, (VecOpInfo, GradOpInfo)):
-            # print(f"k"*32)
-            return a.inner(b)
-
-        # One is a basis, the other a numerical tensor value (RHS or complex LHS)
-        if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray): 
-            # print(f"*"*32)
-            return a.contracted_with_tensor(b)
-        if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray): 
-            # print(f"@"*32)
-            return b.contracted_with_tensor(a)
-        
-        # RHS: both are functions, result is scalar integral
-        if self.ctx['rhs'] and isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
-            #  print(f"&"*32)
-             return np.sum(a.data * b.data)
-
-        # --- Hessian · Hessian cases -------------------------------------------------
-        if isinstance(a, HessOpInfo) and isinstance(b, HessOpInfo):
-            # RHS: Function vs Test/Trial
-            if self.ctx.get('rhs'):
-                if a.role == 'function' and b.role in ('test','trial'):
-                    if a.coeffs is None:
-                        raise ValueError('Hessian(Function) missing coeffs for RHS contraction.')
-                    kdij = np.einsum('knij,kn->kij', a.data, a.coeffs, optimize=True)
-                    # f_n = Σ_{k,i,j} kdij * Htest[k,n,i,j]
-                    f = np.einsum('kij,knij->n', kdij, b.data, optimize=True)
-                    return VecOpInfo(np.stack([f]), role=b.role)
-                if b.role == 'function' and a.role in ('test','trial'):
-                    if b.coeffs is None:
-                        raise ValueError('Hessian(Function) missing coeffs for RHS contraction.')
-                    kdij = np.einsum('knij,kn->kij', b.data, b.coeffs, optimize=True)
+                        kdij = a.data  # (k,2,2) already collapsed
+                    f = np.einsum('kij,knij->n', kdij, b.data, optimize=True)  # (n,)
+                    return f
+                if b.role == 'function' and a.role in ('test', 'trial'):
+                    if b.coeffs is not None and b.data.ndim == 4:
+                        kdij = np.einsum('knij,kn->kij', b.data, b.coeffs, optimize=True)
+                    else:
+                        kdij = b.data
                     f = np.einsum('kij,knij->n', kdij, a.data, optimize=True)
-                    return VecOpInfo(np.stack([f]), role=a.role)
-                raise NotImplementedError('Unsupported RHS Hessian inner-product configuration.')
-            # LHS: assemble (n_test, n_trial)
-            if a.role == 'test' and b.role == 'trial':
+                    return f
+                raise NotImplementedError(f"Unsupported RHS Hessian inner-product configuration: "
+                                        f"a.role={getattr(a,'role',None)}, b.role={getattr(b,'role',None)}")
+
+            # ---- Grad(Function) · Grad(Test/Trial)  → (n,) ----
+            if isinstance(a, GradOpInfo) and isinstance(b, GradOpInfo):
+                if a.role == "function" and b.role in ("test", "trial"):
+                    # a is (k,d) collapsed OR (k,n,d)+coeffs
+                    if a.coeffs is not None and a.data.ndim == 3:
+                        grad_val = np.einsum("knd,kn->kd", a.data, a.coeffs, optimize=True)  # (k,d)
+                    else:
+                        grad_val = a.data  # (k,d)
+                    return np.einsum("kd,knd->n", grad_val, b.data, optimize=True)
+                if b.role == "function" and a.role in ("test", "trial"):
+                    if b.coeffs is not None and b.data.ndim == 3:
+                        grad_val = np.einsum("knd,kn->kd", b.data, b.coeffs, optimize=True)
+                    else:
+                        grad_val = b.data
+                    return np.einsum("kd,knd->n", grad_val, a.data, optimize=True)
+                # (test,trial) or (trial,test) would be LHS; fall through to LHS block below.
+            
+            # ---- Vec(Function) · Vec(Test/Trial)  (e.g., Laplacian) → (n,) ----
+            if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+                # We rely on visitors to collapse Function operands to (k,)
+                if a.role == "function" and b.role in ("test", "trial"):
+                    return a.inner(b)  # handles (k,) ⨯ (k,n) → (n,)
+                if b.role == "function" and a.role in ("test", "trial"):
+                    return b.inner(a)  # handles (k,n) ⨯ (k,) → (n,)
+                if a.role == "function" and b.role == "function":
+                    # both collapsed to (k,) → scalar
+                    A, B = a.data, b.data
+                    if A.ndim == B.ndim == 1:
+                        return float(np.einsum("k,k->", A, B, optimize=True))
+                    raise ValueError(f"RHS inner(Function,Function) expects 1D data; got {A.shape}, {B.shape}")
+
+            # ---- Numeric tensor with Grad basis on RHS ----
+            if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray):
+                return a.contracted_with_tensor(b)
+            if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray):
+                return b.contracted_with_tensor(a)
+
+            raise TypeError(f"Unsupported RHS inner '{n.a} : {n.b}' "
+                            f"a={type(a)}, b={type(b)}, roles=({getattr(a,'role',None)},{getattr(b,'role',None)})")
+
+        # ============================= LHS =============================
+        # Orientation: rows = test space, cols = trial space
+
+        # ---- Hessian LHS ----
+        if isinstance(a, HessOpInfo) and isinstance(b, HessOpInfo):
+            if a.role == "test" and b.role == "trial":
+                return a.inner(b)  # (n_test, n_trial)
+            if a.role == "trial" and b.role == "test":
+                return b.inner(a)  # (n_test, n_trial)
+            raise ValueError(f"Hessian LHS expects test vs trial; got {a.role} vs {b.role}.")
+
+        # ---- Grad LHS ----
+        if isinstance(a, GradOpInfo) and isinstance(b, GradOpInfo):
+            if a.role == "test" and b.role == "trial":
                 return a.inner(b)
-            if a.role == 'trial' and b.role == 'test':
+            if a.role == "trial" and b.role == "test":
                 return b.inner(a)
-            raise NotImplementedError(f'Hessian inner not implemented for roles {a.role} and {b.role}.')
-        
-        raise TypeError(f"Unsupported inner product '{n.a} : {n.b}'")
+            raise ValueError(f"Grad LHS expects test vs trial; got {a.role} vs {b.role}.")
+
+        # ---- Vec LHS (e.g., Laplacian(LHS) yields VecOpInfo) ----
+        if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
+            if a.role == "test" and b.role == "trial":
+                return a.inner(b)
+            if a.role == "trial" and b.role == "test":
+                return b.inner(a)
+            raise ValueError(f"Vec LHS expects test vs trial; got {a.role} vs {b.role}.")
+
+        # ---- Numerical fallbacks ----
+        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+            # generic numeric inner (use tensordot if needed)
+            return float(np.einsum("..., ...->", a, b, optimize=True)) if a.ndim == b.ndim == 1 else np.tensordot(a, b, axes=([0], [0]))
+
+        # Grad with numeric (complex LHS) supported above if needed; otherwise:
+        if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray):
+            return a.contracted_with_tensor(b)
+        if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray):
+            return b.contracted_with_tensor(a)
+
+        raise TypeError(f"Unsupported inner product '{n.a} : {n.b}' "
+                        f"for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)} "
+                        f"and data shapes a={getattr(a, 'data', None)}, b={getattr(b, 'data', None)}")
+
     
         
     # Visitor dispatch
@@ -1146,7 +1333,7 @@ class FormCompiler:
                 self.ctx['x_phys'] = transform.x_mapping(mesh, eid, (xi, eta))
                 
                 # Cache basis values and gradients for this quadrature point
-                self._basis_cache.clear()
+                self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
                 for f in fields:
                     val = self.me.basis(f, xi, eta)
                     g_ref = self.me.grad_basis(f, xi, eta)
@@ -1217,7 +1404,7 @@ class FormCompiler:
                         J = transform.jacobian(mesh, elem.id, (xi, eta)) # New
                         Ji = np.linalg.inv(J)
                         
-                        self._basis_cache.clear() 
+                        self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
                         for f in fields: 
                             val = self.me.basis(f, xi, eta) 
                             grad = self.me.grad_basis(f, xi, eta) @ Ji
@@ -1247,7 +1434,7 @@ class FormCompiler:
                         J = transform.jacobian(mesh, elem.id, (xi, eta)) # New
                         Ji = np.linalg.inv(J)
 
-                        self._basis_cache.clear() # New
+                        self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
                         for f in fields: # New
                             val = self.me.basis(f, xi, eta) # New
                             grad = self.me.grad_basis(f, xi, eta) @ Ji # New
@@ -1695,7 +1882,7 @@ class FormCompiler:
                 Ji    = np.linalg.inv(transform.jacobian(mesh, eid, (xi, eta)))
 
                 # basis cache ---------------------------------------------------
-                self._basis_cache.clear()
+                self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
                 for f in fields:
                     self._basis_cache[f] = {
                         "val" : self.me.basis      (f, xi, eta),
@@ -1883,7 +2070,7 @@ class FormCompiler:
                         Ji     = np.linalg.inv(J)
 
                         # cache bases at this point (zero-padded across mixed fields)
-                        self._basis_cache.clear()
+                        self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
                         for f in fields:
                             self._basis_cache[f] = {
                                 "val" : self.me.basis(f, xi, eta),
@@ -1943,7 +2130,7 @@ class FormCompiler:
                 detJ = abs(np.linalg.det(J))
                 Ji  = np.linalg.inv(J)
 
-                self._basis_cache.clear()
+                self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
                 for f in fields:
                     self._basis_cache[f] = {
                         "val" : self.me.basis(f, xi, eta),
