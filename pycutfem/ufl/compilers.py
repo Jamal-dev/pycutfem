@@ -610,6 +610,16 @@ class FormCompiler:
         """
         op = n.operand
 
+        # Jump(u_pos,u_neg): evaluate sided Hessians via _visit_Jump
+        if isinstance(op, Jump):
+            return self._visit(Jump(Hessian(op.u_pos), Hessian(op.u_neg)))
+
+        # Pos/Neg: gate the Hessian result on the active side
+        if isinstance(op, Pos):
+            return self._visit(Pos(Hessian(op.operand)))
+        if isinstance(op, Neg):
+            return self._visit(Neg(Hessian(op.operand)))
+
         # Determine role
         if isinstance(op, (TestFunction, VectorTestFunction)):
             role = "test"
@@ -620,8 +630,10 @@ class FormCompiler:
         else:
             raise NotImplementedError(f"Hessian not implemented for {type(op)}")
 
-        fields = getattr(op, "field_names", None)
-        if fields is None:
+        # Determine component list
+        if isinstance(op, (VectorFunction, VectorTestFunction, VectorTrialFunction)):
+            fields = list(op.field_names)  # e.g. ["ux","uy"]
+        else:
             fields = [op.field_name]
 
         local_dofs = self._local_dofs()
@@ -824,8 +836,8 @@ class FormCompiler:
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
-        print(f"visit dot: role_a={role_a}, role_b={role_b}, a={a}, b={b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-              f" type_a={type(a)}, type_b={type(b)}")
+        # print(f"visit dot: role_a={role_a}, role_b={role_b}, a={a}, b={b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+        #       f" type_a={type(a)}, type_b={type(b)}")
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
 
         def rhs():
@@ -1008,8 +1020,8 @@ class FormCompiler:
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Inner for types {type(a)} : {type(b)}")
-        print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-              f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
+        # print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+        #       f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
 
         rhs = bool(self.ctx.get("rhs"))
 
@@ -1032,6 +1044,19 @@ class FormCompiler:
                         kdij = b.data
                     f = np.einsum('kij,knij->n', kdij, a.data, optimize=True)
                     return f
+                if a.role == 'function' and b.role == 'function':
+                    def _collapse(g: HessOpInfo):
+                        if g.data.ndim == 4:               # (k,n,2) with coeffs
+                            if g.coeffs is None:
+                                raise ValueError("HessOpInfo(function) with 4D data requires coeffs to collapse.")
+                            return np.einsum("knij,kn->kij", g.data, g.coeffs, optimize=True)  # (k,2)
+                        return g.data                      # already (k,2)
+                    A = _collapse(a)
+                    B = _collapse(b)
+                    if A.ndim == B.ndim == 3:
+                        return float(np.einsum("kij,kij->", A, B, optimize=True))
+                    raise ValueError(f"RHS inner(Hess,Hess) expects 3D data; got {A.shape}, {B.shape}")
+
                 raise NotImplementedError(f"Unsupported RHS Hessian inner-product configuration: "
                                         f"a.role={getattr(a,'role',None)}, b.role={getattr(b,'role',None)}")
 
@@ -1050,6 +1075,19 @@ class FormCompiler:
                     else:
                         grad_val = b.data
                     return np.einsum("kd,knd->n", grad_val, a.data, optimize=True)
+                if a.role == "function" and b.role == "function":
+                    # collapse to (k,2) if needed
+                    def _collapse(g: GradOpInfo):
+                        if g.data.ndim == 3:               # (k,n,2) with coeffs
+                            if g.coeffs is None:
+                                raise ValueError("GradOpInfo(function) with 3D data requires coeffs to collapse.")
+                            return np.einsum("knd,kn->kd", g.data, g.coeffs, optimize=True)  # (k,2)
+                        return g.data                      # already (k,2)
+                    A = _collapse(a)
+                    B = _collapse(b)
+                    if A.ndim == B.ndim == 2:
+                        return float(np.einsum("kd,kd->", A, B, optimize=True))
+                    raise ValueError(f"RHS inner(Grad,Grad) expects 2D data; got {A.shape}, {B.shape}")
                 # (test,trial) or (trial,test) would be LHS; fall through to LHS block below.
             
             # ---- Vec(Function) · Vec(Test/Trial)  (e.g., Laplacian) → (n,) ----
@@ -1835,7 +1873,7 @@ class FormCompiler:
         geo_factors = self.dh.precompute_ghost_factors(edge_ids, qdeg, level_set, derivs, need_hess=need_hess)
 
         valid_eids = geo_factors.get('eids')
-        print(f"len(valid_eids)={len(valid_eids)}")
+        # print(f"len(valid_eids)={len(valid_eids)}")
         if valid_eids is None or len(valid_eids) == 0:
             return
 

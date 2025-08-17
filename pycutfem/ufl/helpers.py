@@ -59,8 +59,8 @@ class VecOpInfo:
         # case for Constant with dim = 1 and also normal vector
         logger.debug(f"VecOpInfo.dot_const: const={const}, data.shape={self.data.shape}")
         const = np.asarray(const)
-        if const.ndim != 1 or const.size != self.data.shape[0] or self.data.shape[0] != 1:
-            raise ValueError(f"Constant vector of size {const.size} is wrong length for VecOpInfo with {self.data.shape[0]} components.")
+        if const.ndim != 1 or const.size != self.data.shape[0]:
+            raise ValueError(f"Constant vector of size {const.size} is wrong length for VecOpInfo with {self.data.shape} components.")
         #data =  np.einsum("kn,k->n", self.data, const, optimize=True)
         data = self.data.T @ const  # fast BLAS-2
         return VecOpInfo(data[np.newaxis,:], role=self.role)

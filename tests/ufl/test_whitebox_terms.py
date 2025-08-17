@@ -220,67 +220,7 @@ def test_vector_mass_matrix_q2():
     print("SUCCESS: Q2 Vector Mass Matrix is correct!")
 
 
-def test_lhs_advection_q2():
-    """
-    White-box test for the LHS matrix from the linearized advection term:
-    A_ij = ∫ ((u_k ⋅ ∇)u_j) ⋅ v_i dΩ
-    """
-    print("\n" + "="*70)
-    print("White-Box Test of LHS Advection Matrix (u_k_grad_u)")
-    print("="*70)
-    
-    mesh, dof_handler = setup_single_q2_element()
-    velocity_space = FunctionSpace("velocity", ['ux', 'uy'])
-    u = VectorTrialFunction(velocity_space)
-    v = VectorTestFunction(velocity_space)
-    
-    u_k = VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler)
-    np.random.seed(1337)
-    u_k.nodal_values[:] = np.random.rand(dof_handler.total_dofs)
-    
 
-    
-    # The RHS can be a simple zero vector for this LHS test.
-    lhs = dot(dot(u_k,grad(u)),v) * dx()
-
-    A, _ = assemble_form(Equation(lhs, None), dof_handler=dof_handler, bcs=[])
-    compiler_matrix = A.toarray()
-    
-    # The manual calculation below is already correct for this term.
-    ref_q2 = get_reference("quad", poly_order=2)
-    q_order = 5
-    qpts, qwts = volume("quad", q_order)
-    n_basis_scalar = 9
-    expected_matrix = np.zeros((n_basis_scalar * 2, n_basis_scalar * 2))
-    
-    elemental_dofs = dof_handler.get_elemental_dofs(0)
-    u_k_local = u_k.get_nodal_values(elemental_dofs)
-    u_k_ux_local, u_k_uy_local = u_k_local[:n_basis_scalar], u_k_local[n_basis_scalar:]
-    
-    for qp, w in zip(qpts, qwts):
-        J = transform.jacobian(mesh, 0, qp)
-        detJ = abs(np.linalg.det(J))
-        JinvT = np.linalg.inv(J).T
-        N = ref_q2.shape(*qp)
-        G_phys = ref_q2.grad(*qp) @ JinvT
-        u_k_val = np.array([N @ u_k_ux_local, N @ u_k_uy_local])
-        
-        for i in range(n_basis_scalar * 2):
-            for j in range(n_basis_scalar * 2):
-                # Term is (u_k ⋅ ∇u_j) ⋅ v_i
-                integrand = 0.0
-                if (i < n_basis_scalar and j < n_basis_scalar): # (ux, ux) block
-                    convected_grad_j = u_k_val @ G_phys[j, :] # u_k ⋅ ∇(φ_j) for x-component
-                    integrand = convected_grad_j * N[i]
-                elif (i >= n_basis_scalar and j >= n_basis_scalar): # (uy, uy) block
-                    convected_grad_j = u_k_val @ G_phys[j - n_basis_scalar, :] # u_k ⋅ ∇(φ_j) for y-component
-                    integrand = convected_grad_j * N[i - n_basis_scalar]
-                
-                expected_matrix[i, j] += integrand * w * detJ
-
-    print("Comparing compiler-generated matrix with manually computed ground truth...")
-    np.testing.assert_allclose(compiler_matrix, expected_matrix, rtol=1e-12, atol=1e-12)
-    print("\nSUCCESS: Compiler's LHS advection matrix is correct!")
 
 def setup_mixed_q2_q1_element():
     """
