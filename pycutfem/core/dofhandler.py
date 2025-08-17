@@ -1674,6 +1674,7 @@ class DofHandler:
             _tabulate_deriv_q2,
             _tabulate_deriv_p1,
         )
+        
 
         try:
             import numba as _nb
@@ -1713,10 +1714,14 @@ class DofHandler:
         n_loc = me.n_dofs_per_elem  # union-local width
 
         # ---- normalize & filter to boundary edges (right is None) ------------------
-        if hasattr(edge_ids, "to_indices"):
-            edge_ids = edge_ids.to_indices()
-        edge_ids = tuple(int(e) for e in edge_ids if mesh.edge(e).right is None)
-        if not edge_ids:
+        if hasattr(edge_ids, "to_indices"):                  # BitSet
+            edge_ids = list(int(i) for i in edge_ids.to_indices())
+        else:
+            edge_ids = list(int(i) for i in edge_ids)        # already a sequence
+
+        edge_ids = np.asarray(edge_ids, dtype=np.int32)
+        n_edges  = int(edge_ids.shape[0])
+        if n_edges == 0:
             return {"eids": np.empty(0, dtype=np.int32)}  # nothing to do
 
         # ---- reuse cache if possible -----------------------------------------------
@@ -1726,12 +1731,13 @@ class DofHandler:
         except NameError:
             _edge_geom_cache = {}
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
-        cache_key = (edge_ids, int(qdeg), me.signature(), derivs_key, self.method, bool(need_hess))
+        cache_key  = (tuple(edge_ids.tolist()), int(qdeg),
+                    me.signature(), derivs_key, self.method, bool(need_hess))
         if reuse and cache_key in _edge_geom_cache:
             return _edge_geom_cache[cache_key]
 
         # ---- sizes -----------------------------------------------------------------
-        n_edges = len(edge_ids)
+        # n_edges = len(edge_ids)
         # representative to size arrays
         p0r, p1r = mesh.nodes_x_y_pos[list(mesh.edge(edge_ids[0]).nodes)]
         qpr, qwr = line_quadrature(p0r, p1r, qdeg)

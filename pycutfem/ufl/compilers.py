@@ -2005,7 +2005,11 @@ class FormCompiler:
                     if intg.measure.defined_on is not None
                     else mesh.get_domain_bitset(intg.measure.tag, entity="edge"))
         if edge_set.cardinality() == 0:
-            return
+            raise ValueError(f"[Assembler: boundary edge JIT] No edges defined for {intg.measure.tag}.")
+        else:
+            print(f"Found boundary edges: {edge_set.cardinality()}")
+
+            
 
         # 2. geometry tables ------------------------------------------
         derivs = required_multi_indices(intg.integrand) | {(0, 0)}  # always include values
@@ -2035,6 +2039,23 @@ class FormCompiler:
             param_order = runner.param_order,
             pre_built   = geo
         )
+
+        # if anything is not aligned to edges
+        n_edges = geo["qp_phys"].shape[0]
+        owner   = geo.get("owner_id")                # per-edge owner element id
+        n_elems = self.me.mesh.n_elements
+
+        for name in runner.param_order:
+            arr = args.get(name)
+            if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] != n_edges:
+                if arr.shape[0] == n_elems and owner is not None:
+                    # Gather per-edge rows from per-element array
+                    args[name] = arr[owner]
+                else:
+                    raise ValueError(
+                        f"Static array '{name}' has shape[0]={arr.shape[0]} "
+                        f"but boundary kernel expects {n_edges} edges."
+                    )
 
         # 4. up-to-date coefficient Functions -------------------------
         #    • ignore test/trial symbols

@@ -72,6 +72,7 @@ def _mul_scalar_vector(self,first_is_scalar,res_var,a, b, body_lines, stack):
                            shape      = res_shape,
                            is_vector  = vect.is_vector,
                            is_gradient= vect.is_gradient,
+                           is_hessian = vect.is_hessian,
                            field_names= vect.field_names,
                            parent_name= vect.parent_name))
 
@@ -114,7 +115,10 @@ class NumbaCodeGen:
             return f"{prefix}_{var_counter}"
 
         # --- Main IR processing loop ---
-        for op in ir_sequence:
+        for idx, op in enumerate(ir_sequence):
+            next_op = ir_sequence[idx + 1] if (idx + 1) < len(ir_sequence) else None
+            def _next_is_deriv():
+                return isinstance(next_op, (Grad, IRHessian, IRLaplacian))
 
             if isinstance(op, LoadFacetNormal):
                 required_args.add("normals")
@@ -283,6 +287,7 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=out, role="value",
                                         shape=(k_comps, 2, 2),
                                         is_vector=False, is_hessian=True,
+                                        is_gradient=False,
                                         field_names=a.field_names, side=a.side))
 
 
@@ -455,7 +460,31 @@ class NumbaCodeGen:
             # ---------------------------------------------------------------------------
             elif isinstance(op, LoadVariable):
                 # ------------------------------------------------------------------
-                # 1. Common set‑up --------------------------------------------------
+                # 0. Peek ahead: if a differential operator will consume this
+                #    test/trial next, don't materialize φ here.
+                # ------------------------------------------------------------------
+                next_op = ir_sequence[idx + 1] if idx + 1 < len(ir_sequence) else None
+                followed_by_diff = isinstance(next_op, (Grad, IRHessian, IRLaplacian))
+
+                # Fast path: symbolic hand-off to Grad/Hessian/Laplacian
+                if (op.role in ("test", "trial")
+                    and op.deriv_order == (0, 0)
+                    and followed_by_diff):
+                    stack.append(
+                        StackItem(
+                            var_name="__basis__",
+                            role=op.role,
+                            shape=(len(op.field_names), -1),
+                            is_vector=op.is_vector,
+                            field_names=op.field_names,
+                            parent_name=op.name,
+                            side=op.side,
+                        )
+                    )
+                    continue
+
+                # ------------------------------------------------------------------
+                # 1. Common set-up --------------------------------------------------
                 # ------------------------------------------------------------------
                 deriv_order = op.deriv_order
                 field_names = op.field_names
@@ -469,15 +498,20 @@ class NumbaCodeGen:
                     return f"{d_str}_{field_name}{side_suffix_basis}"
 
                 basis_arg_names = [get_basis_arg_name(fname, deriv_order) for fname in field_names]
-                for arg_name in basis_arg_names:
-                    required_args.add(arg_name)
+                # Only request b_* / d** tables *here* when they are actually needed
+                # (Function followed immediately by derivative ops will assemble their
+                # own derivative tables later; no b_* needed there).
+                add_basis_now = not (op.role == "function" and _next_is_deriv())
+                if add_basis_now:
+                    for arg_name in basis_arg_names:
+                        required_args.add(arg_name)
 
                 # Which J⁻¹ to use for push‑forward / derivatives
                 if   op.side == "+":  jinv_sym = "J_inv_pos"; required_args.add("J_inv_pos")
                 elif op.side == "-":  jinv_sym = "J_inv_neg"; required_args.add("J_inv_neg")
                 else:                 jinv_sym = "J_inv";      required_args.add("J_inv")
 
-                # reference value(s) at current quadrature point
+                # reference value(s) at current quadrature point (only if used below)
                 basis_vars_at_q = [f"{arg_name}[e, q]" for arg_name in basis_arg_names]
 
                 # ------------------------------------------------------------------
@@ -563,16 +597,36 @@ class NumbaCodeGen:
                     # --------------------------------------------------------------
                     # 3‑A  Which coefficient array do we need?  (single array)
                     # --------------------------------------------------------------
+                    # If the very next op is a derivative, don't build u(x_q) via b_*
+                    # Just pass through the coefficient; derivative op will collapse
+                    # r**/d** with it.  This avoids needing b_* on facets.
                     from pycutfem.jit.symbols import POS_SUFFIX, NEG_SUFFIX
                     coeff_side = POS_SUFFIX if op.side == "+" else NEG_SUFFIX if op.side == "-" else ""
-
                     if op.name.startswith("u_") and op.name.endswith("_loc"):
                         coeff_sym = op.name[:-4] + f"{coeff_side}_loc"
                     else:
                         coeff_sym = f"u_{op.name}{coeff_side}_loc"
-
                     required_args.add(coeff_sym)
                     solution_func_names.add(coeff_sym)
+
+                    if _next_is_deriv():
+                        # Push a lightweight placeholder – IRGrad/IRHessian/IRLaplacian
+                        # will materialize the correct quantity using derivative tables.
+                        stack.append(
+                            StackItem(
+                                var_name    = "coeff_placeholder",
+                                role        = "value",
+                                shape       = (len(field_names),),
+                                is_vector   = op.is_vector,
+                                field_names = field_names,
+                                parent_name = coeff_sym,
+                                side        = op.side
+                            )
+                        )
+                        continue
+
+                    # --- Otherwise: we truly need the value u(x_q) via b_* ---
+
 
                     # --------------------------------------------------------------
                     # 3‑B  Pad reference bases to the DOF‑union on ghost facets
@@ -736,6 +790,7 @@ class NumbaCodeGen:
             # ----------------------------------------------------------------------
             elif isinstance(op, Grad):
                 a = stack.pop()
+
 
                 # --- which J⁻¹ array to use -------------------------------------------
                 if   a.side == "+":  jinv_sym = "J_inv_pos"; required_args.add("J_inv_pos")
@@ -1012,13 +1067,13 @@ class NumbaCodeGen:
                             f"n_locs = {b.var_name}.shape[1]",
                             f"{res_var} = {b.var_name}.T @ {a.var_name}",        # (n,k) @ (k,) -> (n,)
                         ]
-                    elif not a.is_vector and b.is_vector and b.shape[0] == 1 and len(b.shape) == 2:
-                        # a: (), b: (n,)  → (n,)
-                        body_lines += [
-                            "# RHS: Inner(Value(Scalar), Test(Vector))",
-                            f"n_locs = {b.var_name}.shape[1]",
-                            f"{res_var} = {b.var_name}[0] * {a.var_name}",        # (n,) * () -> (n,)
-                        ]
+                    # elif not a.is_vector and b.is_vector and b.shape[0] == 1 and len(b.shape) == 2:
+                    #     # a: (), b: (n,)  → (n,)
+                    #     body_lines += [
+                    #         "# RHS: Inner(Value(Scalar), Test(Vector))",
+                    #         f"n_locs = {b.var_name}.shape[1]",
+                    #         f"{res_var} = {b.var_name}[0] * {a.var_name}",        # (n,) * () -> (n,)
+                    #     ]
 
                     elif a.is_vector and b.is_gradient:
                         # grad(scalarFunction): a: (d,), b: (1,n,d) → (n,)
@@ -1026,6 +1081,13 @@ class NumbaCodeGen:
                             "# RHS: Inner(grad(scalarFunction), grad(Test))",
                             f"n_locs = {b.var_name}[0].shape[0]",
                             f"{res_var} = {b.var_name}[0] @ {a.var_name}",       # (n,d) @ (d,) -> (n,)
+                        ]
+                    elif not a.is_vector and not b.is_vector and b.shape[0] == 1 and len(b.shape) == 2:
+                        # a: (), b: (n,)  → (n,)
+                        body_lines += [
+                            "# RHS: Inner(Value(Scalar), Test(Scalar))",
+                            f"n_locs = {b.var_name}.shape[1]",
+                            f"{res_var} = {b.var_name}[0] * {a.var_name}",        # (n,) * () -> (n,)
                         ]
 
                     else:
@@ -1043,16 +1105,27 @@ class NumbaCodeGen:
                         body_lines.append(f'# Inner(Value, Value): dot product')
                         body_lines.append(f'{res_var} = np.dot({a.var_name}, {b.var_name})')
                     elif a.is_gradient and b.is_gradient:
-                        body_lines += [
-                            f'# Inner(Grad(Value), Grad(Value)): stiffness matrix',
-                            f'# (k,d) @ (k,d) -> (k,k)',
-                            f'{res_var} = {a.var_name} @ {b.var_name}.T.copy()',]
+                        if self.form_rank == 0:
+                            body_lines += [f"{res_var} = float(np.sum({a.var_name} * {b.var_name}))"]
+                        else:
+                            body_lines += [
+                                f'# Inner(Grad(Value), Grad(Value)): stiffness matrix',
+                                f'# (k,d) @ (k,d) -> (k,k)',
+                                f'{res_var} = {a.var_name} @ {b.var_name}.T.copy()',]
                     elif a.is_hessian and b.is_hessian:
-                        body_lines += [
-                            f'# Inner(Hessian(Value), Hessian(Value)): stiffness matrix',
-                            f'# (k,2,2) @ (k,2,2) -> (k,k)',
-                            f'{res_var} = {a.var_name} @ {b.var_name}.T.copy()',
-                        ]
+                        if self.form_rank == 0:
+                            body_lines += [
+                                f'# Inner(Hessian(Value), Hessian(Value)): scalarvalue',
+                                f'# (k,2,2) * (k,2,2) -> scalar',
+                                f'{res_var} = float(np.sum({a.var_name} * {b.var_name}))',
+                            ]
+                        else:
+                            body_lines += [
+                                f'# Inner(Hessian(Value), Hessian(Value)): stiffness matrix',
+                                f'# (k,2,2) @ (k,2,2) -> (k,k)',
+                                f'{res_var} = {a.var_name} @ {b.var_name}.T.copy()',
+                            ]
+                        
                 
                 else:
                     raise NotImplementedError(f"JIT Inner not implemented for roles {a.role}/{b.role}, "
@@ -1078,6 +1151,8 @@ class NumbaCodeGen:
 
                 # Advection term: dot(grad(u_trial), u_k)
                 if a.role == 'trial' and a.is_gradient and b.role == 'value' and b.is_vector:
+                    # grad(u_trial) is a second order tensor when u i vector, the dot product results into a vector
+                    # when u_trial is scalar then grad(u_trial) is a vector and u_k is scalar the result again should be a vector
                     body_lines.append(f"# Advection: dot(grad(Trial), Function)")
                     # body_lines.append(f"{res_var} = np.einsum('knd,d->kn', {a.var_name}, {b.var_name})")
                     body_lines += [
@@ -1087,10 +1162,11 @@ class NumbaCodeGen:
                         f"    {res_var}[k] = {b.var_name} @ {a.var_name}[k].T.copy() ",
                         # f"assert {res_var}.shape == (2, 22), f'result shape mismatch {res_var}.shape with {{(n_vec_comps, n_locs)}}'"
                     ]
-                    stack.append(StackItem(var_name=res_var, role='trial', shape=(a.shape[0], a.shape[1]), is_vector=True, is_gradient=False, field_names=a.field_names, parent_name=a.parent_name))
+                    stack.append(StackItem(var_name=res_var, role='trial', shape=(a.shape[0], a.shape[1]), 
+                                           is_vector=True, is_gradient=False, field_names=a.field_names, parent_name=a.parent_name))
                
                 # Final advection term: dot(advection_vector_trial, v_test)
-                elif (a.role == 'trial' and (not a.is_gradient) and b.role == 'test' and (not b.is_gradient) and a.is_vector and b.is_vector):
+                elif (a.role == 'trial' and (not a.is_gradient and not a.is_hessian) and b.role == 'test' and (not b.is_gradient and not b.is_hessian) ):
                     body_lines.append(f"# Mass: dot(Trial, Test)")
                     #  body_lines.append(f"assert ({a.var_name}.shape == (2,22) and {b.var_name}.shape == (2,22)), 'Trial and Test to have the same shape'")
                     body_lines.append(f"{res_var} = {b.var_name}.T.copy() @ {a.var_name}")
@@ -1099,7 +1175,7 @@ class NumbaCodeGen:
                                             role='value', 
                                             shape=(b.shape[1],a.shape[1]), 
                                             is_vector=False, field_names=[]))
-                elif (a.role == 'test' and (not a.is_gradient) and b.role == 'trial' and (not b.is_gradient) and a.is_vector and b.is_vector):
+                elif (a.role == 'test' and (not a.is_gradient and not a.is_hessian) and b.role == 'trial' and (not b.is_gradient and not b.is_hessian) ):
                     body_lines.append(f"# Mass: dot(Test, Trial)")
                     # body_lines.append(f"assert ({a.var_name}.shape == (2,22) and {b.var_name}.shape == (2,22)), 'Trial and Test to have the same shape'")
                     body_lines.append(f"{res_var} = {a.var_name}.T.copy() @ {b.var_name}")
@@ -1112,6 +1188,9 @@ class NumbaCodeGen:
                 # dot( grad(u_test) ,  const_vec )  ← symmetric term -> Test vec
                 # ---------------------------------------------------------------------
                 elif a.role == 'test' and a.is_gradient and b.role == 'const' and b.is_vector:
+                    k_comps = a.shape[0]; n_locs = a.shape[1]; d = a.shape[2]
+                    if k_comps > 1: is_vector = True
+                    else: is_vector = False
                     if a.shape[2] == b.shape[0]:
                         body_lines.append("# Symmetric term: dot(grad(Test), constant vector)")
                         body_lines += [
@@ -1126,7 +1205,7 @@ class NumbaCodeGen:
 
                         ]
                         stack.append(StackItem(var_name=res_var, role='test',
-                                            shape=(a.shape[0], a.shape[1]), is_vector=True,
+                                            shape=(a.shape[0], a.shape[1]), is_vector=is_vector,
                                             is_gradient=False, field_names=a.field_names,
                                             parent_name=a.parent_name))
 
@@ -1134,6 +1213,9 @@ class NumbaCodeGen:
                 # dot( grad(u_trial) ,  beta )  ← convection term (Function gradient · Trial)
                 # ---------------------------------------------------------------------
                 elif a.role == 'trial' and a.is_gradient and b.role in {'const','value'} and b.is_vector:
+                    k_comps = a.shape[0]; n_locs = a.shape[1]; d = a.shape[2]
+                    if k_comps > 1: is_vector = True
+                    else: is_vector = False 
                     if b.shape[0] == a.shape[2]:
                         body_lines.append("# Advection: dot(grad(Trial), constant beta vector)")
                         body_lines += [
@@ -1146,7 +1228,7 @@ class NumbaCodeGen:
                             f"        {res_var}[k] += {a.var_name}[k, :, d] * {b.var_name}[d]",
                         ]
                         stack.append(StackItem(var_name=res_var, role='trial',
-                                            shape=(a.shape[0], a.shape[1]), is_vector=True,
+                                            shape=(a.shape[0], a.shape[1]), is_vector=is_vector,
                                             is_gradient=False, field_names=a.field_names,
                                             parent_name=a.parent_name))
                 # ---------------------------------------------------------------------
@@ -1154,6 +1236,8 @@ class NumbaCodeGen:
                 # ---------------------------------------------------------------------
                 elif b.role == 'trial' and b.is_gradient and a.role in {'const','value'} and a.is_vector:
                     k_comps = b.shape[0]; n_locs = b.shape[1]; d = b.shape[2]
+                    if k_comps > 1: is_vector = True
+                    else: is_vector = False
                     beta_comps = a.shape[0]
                     if k_comps == 1: # scalar field u
                         body_lines.append("# Advection: dot(constant beta vector, grad(scalar_Trial))")
@@ -1165,7 +1249,7 @@ class NumbaCodeGen:
                             f"    {res_var}[:] += {a.var_name}[d] * grad_u[:, :, d]",
                         ]
                         stack.append(StackItem(var_name=res_var, role='trial',
-                                            shape=(k_comps, n_locs), is_vector=True,
+                                            shape=(k_comps, n_locs), is_vector=False,
                                             is_gradient=False, field_names=b.field_names,
                                             parent_name=b.parent_name))
                     else:
@@ -1229,8 +1313,10 @@ class NumbaCodeGen:
                     role_b = "trial" if b.role == "trial" else "test"
                     if k_comps >1:
                         b_slice = f"b_slice_T = np.ascontiguousarray({b.var_name}[:, n, :]).T.copy()"
+                        is_vector = True
                     elif k_comps == 1:
-                        b_slice = f"b_slice_T = np.ascontiguousarray({b.var_name}[:, n, :]).copy()" 
+                        b_slice = f"b_slice_T = np.ascontiguousarray({b.var_name}[:, n, :]).copy()"
+                        is_vector = False
                     body_lines.append(f"# dot(Function, grad({role_b.capitalize()}))")
                     body_lines += [
                         f"n_vec_comps = {b.var_name}.shape[0];",
@@ -1243,7 +1329,7 @@ class NumbaCodeGen:
                         f"    {res_var}[:, n] = b_slice_T @ {a.var_name}",
                     ]
                     stack.append(StackItem(var_name=res_var, role=role_b,
-                                        shape=(k_comps, n_locs), is_vector=True,
+                                        shape=(k_comps, n_locs), is_vector=is_vector,
                                         is_gradient=False, field_names=b.field_names,
                                         parent_name=b.parent_name))
 
@@ -1336,7 +1422,9 @@ class NumbaCodeGen:
                     body_lines.append(f"{res_var} = float({a.var_name}) * {b.var_name}")
                     stack.append(StackItem(var_name=res_var, role=b.role,
                                         shape=b.shape, is_vector=b.is_vector,
-                                        is_gradient=b.is_gradient, field_names=b.field_names,
+                                        is_gradient=b.is_gradient, 
+                                        is_hessian=b.is_hessian, 
+                                        field_names=b.field_names,
                                         parent_name=b.parent_name))
                 # ---------------------------------------------------------------------
                 # dot( u_trial;u_test;u_k, scalar )     ← e.g. scalar constant time Function
@@ -1347,7 +1435,9 @@ class NumbaCodeGen:
                     body_lines.append(f"{res_var} = float({b.var_name}) * {a.var_name}")
                     stack.append(StackItem(var_name=res_var, role=a.role,
                                         shape=a.shape, is_vector=a.is_vector,
-                                        is_gradient=a.is_gradient, field_names=a.field_names,
+                                        is_gradient=a.is_gradient, 
+                                        is_hessian=a.is_hessian, 
+                                        field_names=a.field_names,
                                         parent_name=a.parent_name))
                 
                 # ---------------------------------------------------------------------
@@ -1845,8 +1935,8 @@ class NumbaCodeGen:
                     # ----------------------------------------------------------------------
                     # CASE A – broadcast with true scalar on exactly one side
                     # ----------------------------------------------------------------------
-                    scalar_left  = (a.shape == () and not a.is_vector and not a.is_gradient)
-                    scalar_right = (b.shape == () and not b.is_vector and not b.is_gradient)
+                    scalar_left  = (a.shape == () and not a.is_vector and not a.is_gradient and not a.is_hessian)
+                    scalar_right = (b.shape == () and not b.is_vector and not b.is_gradient and not b.is_hessian)
 
                     # Special-case: subtracting two ghost-edge bases (both have -1 shape)
                     if (a.role in ('test', 'trial') and b.role in ('test', 'trial')
@@ -1869,6 +1959,8 @@ class NumbaCodeGen:
                             shape       = non_scal.shape,
                             is_vector   = non_scal.is_vector,
                             is_gradient = non_scal.is_gradient,
+                            is_hessian  = non_scal.is_hessian,
+                            parent_name = non_scal.parent_name,
                             field_names = non_scal.field_names
                         ))
 
@@ -1893,6 +1985,8 @@ class NumbaCodeGen:
                             shape       = new_shape,
                             is_vector   = a.is_vector,
                             is_gradient = a.is_gradient,
+                            is_hessian  = a.is_hessian,
+                            parent_name = a.parent_name,
                             field_names = (a.field_names if a.role in ('trial', 'test')
                                         else b.field_names)
                         ))
@@ -1922,13 +2016,15 @@ class NumbaCodeGen:
                         body_lines.append(f"{res_var} = {a.var_name} / float({b.var_name})")
                         stack.append(StackItem(var_name=res_var, role=a.role,
                                             shape=a.shape, is_vector=a.is_vector,
-                                            is_gradient=a.is_gradient, field_names=a.field_names,
+                                            is_gradient=a.is_gradient, is_hessian=a.is_hessian,
+                                            field_names=a.field_names,
                                             parent_name=a.parent_name))
                     elif (a.role == 'const' or a.role == 'value') and not a.is_vector and a.shape == ():
                         body_lines.append(f"{res_var} = float({a.var_name}) / {b.var_name}")
                         stack.append(StackItem(var_name=res_var, role=b.role,
                                             shape=b.shape, is_vector=b.is_vector,
-                                            is_gradient=b.is_gradient, field_names=b.field_names,
+                                            is_gradient=b.is_gradient, is_hessian=b.is_hessian,
+                                            field_names=b.field_names,
                                             parent_name=b.parent_name))
                     else:
                         raise NotImplementedError(
@@ -1944,13 +2040,15 @@ class NumbaCodeGen:
                         body_lines.append(f"{res_var} = {a.var_name} ** float({b.var_name})")
                         stack.append(StackItem(var_name=res_var, role=a.role,
                                             shape=a.shape, is_vector=a.is_vector,
-                                            is_gradient=a.is_gradient, field_names=a.field_names,
+                                            is_gradient=a.is_gradient, is_hessian=a.is_hessian,
+                                            field_names=a.field_names,
                                             parent_name=a.parent_name))
                     elif (a.role == 'const' or a.role == 'value') and not a.is_vector and a.shape == ():
                         body_lines.append(f"{res_var} = float({a.var_name}) ** {b.var_name}")
                         stack.append(StackItem(var_name=res_var, role=b.role,
                                             shape=b.shape, is_vector=b.is_vector,
-                                            is_gradient=b.is_gradient, field_names=b.field_names,
+                                            is_gradient=b.is_gradient, is_hessian=b.is_hessian,
+                                            field_names=b.field_names,
                                             parent_name=b.parent_name))
                     else:
                         raise NotImplementedError(

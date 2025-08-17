@@ -145,14 +145,37 @@ def _build_jit_kernel_args(       # ← signature unchanged
         return _expand_per_element(ref)                                 # (n_elem, n_q, n_loc)
 
     def _decode_coeff_name(name: str):
-        """Parse u_<field>_loc | u_<field>_pos_loc | u_<field>_neg_loc → (field, side)."""
+        """
+        Resolve u_<mid>_loc into (field_key, side).
+
+        Prefer exact function name matches in func_map (e.g., 'velocity_neg').
+        Only if no exact match exists, treat a trailing _pos/_neg or __pos/__neg
+        as a side suffix and strip it, returning ('velocity', 'pos'|'neg').
+        """
         assert name.startswith("u_") and name.endswith("_loc")
-        mid = name[2:-4]
-        if mid.endswith("_pos"):
-            return mid[:-4], "pos"
-        if mid.endswith("_neg"):
-            return mid[:-4], "neg"
+        mid = name[2:-4]  # strip leading 'u_' and trailing '_loc'
+
+        # 1) Exact match first: supports distinct objects named 'velocity_pos'/'velocity_neg'
+        if mid in func_map:
+            return mid, None
+
+        # 2) Recognize both single-underscore and symbols-based suffixes
+        pos_suf = getattr(symbols, "POS_SUFFIX", "__pos")
+        neg_suf = getattr(symbols, "NEG_SUFFIX", "__neg")
+
+        for suf, side in ((pos_suf, "pos"), (neg_suf, "neg"), ("_pos", "pos"), ("_neg", "neg")):
+            if mid.endswith(suf):
+                base = mid[:-len(suf)]
+                # prefer a real function/object if it exists
+                if base in func_map:
+                    return base, side
+                # fallback: report stripped base even if not present (caller will error)
+                return base, side
+
+        # 3) No side suffix at all
         return mid, None
+
+
 
     # ------------------------------------------------------------------
     # 1. Map Function / VectorFunction names  →  objects

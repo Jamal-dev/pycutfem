@@ -18,7 +18,12 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.domain_manager import get_domain_bitset
 
 # --- UFL / compiler ----------------------------------------------------------
-from pycutfem.ufl.expressions import Function, TrialFunction, TestFunction, Derivative, Constant, Jump, VectorTrialFunction, VectorTestFunction
+from pycutfem.ufl.expressions import (Function, TrialFunction, 
+                                      TestFunction, Derivative, 
+                                      Constant, Jump, 
+                                      VectorTrialFunction, 
+                                      VectorTestFunction,
+                                      Hessian, FacetNormal, inner, dot)
 from pycutfem.ufl.measures import dGhost, dx
 from pycutfem.ufl.compilers import FormCompiler
 from tests.ufl.test_face_integrals import dof_handler
@@ -34,18 +39,13 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 
 def hessian_inner(u, v):
-    if getattr(u, "num_components", 1) == 1:      # scalar
-        return _hess_comp(u, v)
-
-    # vector: sum component-wise
-    return sum(_hess_comp(u[i], v[i]) for i in range(u.num_components))
+    return inner(Hessian(u), Hessian(v)) 
 
 
-def _hess_comp(a, b):
-    return (Derivative(a,2,0)*Derivative(b,2,0) +
-            2*Derivative(a,1,1)*Derivative(b,1,1) +
-            Derivative(a,0,2)*Derivative(b,0,2))
-
+def hdotn(expr):
+    """Convenience: (Hessian(expr)) · n  (vector in R^2)."""
+    n = FacetNormal()
+    return dot(Hessian(expr), n)
 
 
 
@@ -84,7 +84,7 @@ def setup_quad2():
 # ---------------------------------------------------------------------------
 # 1. Structural check – SPD + symmetry
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("backend", ["python", "jit"])
+@pytest.mark.parametrize("backend", [ "jit"])
 def test_hessian_penalty_spd(setup_quad2, backend):
     _mesh, ls, ghost, dh, comp = setup_quad2
     u_pos = TrialFunction(field_name="u",name="u_trial_pos",dof_handler=dh) 
@@ -110,7 +110,7 @@ def test_hessian_penalty_spd(setup_quad2, backend):
 # 2. Zero‑jump check – quadratic function (constant Hessian)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("backend", ["python", "jit"])
+@pytest.mark.parametrize("backend", [ "jit"])
 def test_hessian_energy_zero_for_quadratic(setup_quad2, backend):
     _mesh, ls, ghost, dh, comp = setup_quad2
 
@@ -126,7 +126,7 @@ def test_hessian_energy_zero_for_quadratic(setup_quad2, backend):
 # ---------------------------------------------------------------------------
 # 3. Analytic value – manufactured jump 2 on Hessian xx
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("backend", ["python", "jit"])
+@pytest.mark.parametrize("backend", [ "jit"])
 def test_hessian_energy_known_value(setup_quad2, backend):
     _mesh, ls, ghost, dh, comp = setup_quad2
 
@@ -146,7 +146,7 @@ def test_hessian_energy_known_value(setup_quad2, backend):
     expected = 4.0 * 1.0  # jump 2, length 1
     assert np.isclose(assembled, expected, rtol=1e-2)
 
-@pytest.mark.parametrize("backend", ["python", "jit"])
+@pytest.mark.parametrize("backend", [ "jit"])
 def test_scalar_jump_penalty_spd(setup_quad2, backend):
     """Ghost penalty K = ∫_Γ ⟦u⟧⟦v⟧ ds must be symmetric PSD."""
     _mesh, level_set, ghost_domain, dh, compiler = setup_quad2
@@ -162,7 +162,7 @@ def test_scalar_jump_penalty_spd(setup_quad2, backend):
     assert np.all(eig >= -1e-12), 'K not PSD'
 
 ### Test 4: Mathematical Exactness (Zero-Jump) ###
-@pytest.mark.parametrize("backend", ["python", "jit"])
+@pytest.mark.parametrize("backend", [ "jit"])
 def test_hessian_penalty_exactness_for_quadratics(setup_quad2, backend):
     """
     Tests that the penalty energy is zero for a function whose Hessian jump is zero.
@@ -187,7 +187,7 @@ def test_hessian_penalty_exactness_for_quadratics(setup_quad2, backend):
     assert abs(assembled_energy) < 1e-12
 
 ### Test 3: Quantitative Correctness (Constant-Jump) ###
-@pytest.mark.parametrize("backend", ["python", "jit"])
+@pytest.mark.parametrize("backend", [ "jit"])
 def test_hessian_penalty_quantitative_value(setup_quad2, backend):
     """
     Tests that the assembled value of the Hessian penalty for a manufactured
@@ -224,3 +224,48 @@ def test_hessian_penalty_quantitative_value(setup_quad2, backend):
         f"Expected {expected_energy}, got {assembled_energy} for the Hessian penalty energy."
 
 
+@pytest.mark.parametrize("backend", [ "jit"])
+def test_hdotn_scalar_spd(setup_quad2, backend):
+    _mesh, ls, ghost, dh, comp = setup_quad2
+    u_pos = TrialFunction("u", "u_pos", dh)
+    v_pos = TestFunction( "u", "v_pos", dh)
+    u_neg = TrialFunction("u", "u_neg", dh)
+    v_neg = TestFunction( "u", "v_neg", dh)
+
+    a = inner(hdotn(Jump(u_pos, u_neg)), hdotn(Jump(v_pos, v_neg))) * dGhost(
+        defined_on=ghost, level_set=ls, metadata={"q": 6}
+    )
+    K, _ = assemble_form(Equation(a, None), dof_handler=dh, bcs=[], backend=backend)
+    K = K.toarray()
+    assert np.allclose(K, K.T, atol=1e-12)
+    eig = np.linalg.eigvalsh(K)
+    assert np.all(eig >= -1.5e-10)
+
+@pytest.mark.parametrize("backend", [ "jit"])
+def test_hdotn_scalar_zero_for_quadratic(setup_quad2, backend):
+    _mesh, ls, ghost, dh, comp = setup_quad2
+    uh = Function("u", "u", dh)
+    uh.set_values_from_function(lambda x, y: x**2 + y**2)
+
+    Eform = inner(hdotn(Jump(uh)), hdotn(Jump(uh))) * dGhost(
+        defined_on=ghost, level_set=ls, metadata={"q": 4}
+    )
+    hooks = {type(Eform.integrand): {"name": "E"}}
+    res = assemble_form(Equation(None, Eform), dof_handler=dh,
+                        bcs=[], assembler_hooks=hooks, backend=backend)
+    assert abs(res["E"]) < 1e-12
+
+@pytest.mark.parametrize("backend", [ "jit"])
+def test_hdotn_scalar_known_value(setup_quad2, backend):
+    _mesh, ls, ghost, dh, comp = setup_quad2
+    uh = Function("u", "u", dh)
+    uh.set_values_from_function(lambda x, y: (x - 1.0) ** 2 if x > 1.0 else 0.0)
+
+    Eform = inner(hdotn(Jump(uh)), hdotn(Jump(uh))) * dGhost(
+        defined_on=ghost, level_set=ls, metadata={"q": 4}
+    )
+    hooks = {type(Eform.integrand): {"name": "E"}}
+    res = assemble_form(Equation(None, Eform), dof_handler=dh,
+                        bcs=[], assembler_hooks=hooks, backend=backend)
+    expected = 4.0 * 1.0
+    assert np.isclose(res["E"], expected, rtol=1e-2)

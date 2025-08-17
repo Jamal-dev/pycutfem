@@ -139,6 +139,8 @@ def test_cutfem_poisson_interface():
 
     # Interface terms use the ds measure, which now requires the level_set for orientation
     a += ( dot(avg_flux_u, jump_v) + dot(avg_flux_v, jump_u) + stab * jump_u * jump_v ) * dGamma
+    # a += ( avg_flux_u * jump_v + avg_flux_v * jump_u + stab * jump_u * jump_v ) * dGamma
+
 
     # Right-hand side
     f =  Constant(1.0) * v_pos * dx_pos

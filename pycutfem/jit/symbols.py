@@ -26,7 +26,7 @@ def decode_coeff(sym: str) -> tuple[str, str | None]:
 
     Returns: (field_name, side) with side ∈ {None, "pos", "neg"}.
     """
-
+    # print(f"Decoding symbol: {sym}")
     # ---- 1. remove *one* leading 'u_' wrapper ---------------------------
     if sym.startswith("u_"):
         sym = sym[2:]
