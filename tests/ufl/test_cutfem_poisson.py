@@ -113,8 +113,8 @@ def test_cutfem_poisson_interface():
     stab = Constant(20 * (20.0 + 1.0)) / h
 
     # The jump operator is now the explicit source of truth for +/- sides.
-    jump_u = jump(u_neg, u_pos)
-    jump_v = jump(v_neg, v_pos)
+    jump_u = Jump(u_pos, u_neg)
+    jump_v = Jump(v_pos, v_neg)
     
     normal = FacetNormal()
     alpha_pos = Pos(alpha)   # α(+)
@@ -127,8 +127,8 @@ def test_cutfem_poisson_interface():
                         - alpha_neg * dot(grad(v_neg), normal) )
     # 6. Define the Weak Form
     # Volume terms are integrated over their respective domains (including cut elements)
-    dx_pos = dx(defined_on=has_pos_elements, level_set=level_set,  metadata={'side': '+'})
-    dx_neg = dx(defined_on=has_neg_elements, level_set=level_set,  metadata={'side': '-'})
+    dx_pos = dx(defined_on=has_pos_elements, level_set=level_set,  metadata={'side': '+',"q": poly_order + 2})
+    dx_neg = dx(defined_on=has_neg_elements, level_set=level_set,  metadata={'side': '-',"q": poly_order + 2})
     dGamma = dInterface(defined_on=cut_domain, level_set=level_set, metadata={"q": poly_order + 2})
     dGhost_stab = dGhost(defined_on=ghost_domain, level_set=level_set, metadata={"q": poly_order + 2})
     a_stabilization = (0.5 * gamma_G * h *
@@ -138,8 +138,8 @@ def test_cutfem_poisson_interface():
     a += a_stabilization
 
     # Interface terms use the ds measure, which now requires the level_set for orientation
-    a += ( dot(avg_flux_u, jump_v) + dot(avg_flux_v, jump_u) + stab * jump_u * jump_v ) * dGamma
-    # a += ( avg_flux_u * jump_v + avg_flux_v * jump_u + stab * jump_u * jump_v ) * dGamma
+    # a += ( dot(avg_flux_u, jump_v) + dot(avg_flux_v, jump_u) + stab * jump_u * jump_v ) * dGamma
+    a += ( avg_flux_u * jump_v + avg_flux_v * jump_u + stab * jump_u * jump_v ) * dGamma
 
 
     # Right-hand side

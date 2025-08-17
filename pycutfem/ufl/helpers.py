@@ -1,4 +1,5 @@
 import re
+from matplotlib.pylab import f
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Union, Tuple, Set
@@ -58,7 +59,7 @@ class VecOpInfo:
         # case for Constant with dim = 1 and also normal vector
         logger.debug(f"VecOpInfo.dot_const: const={const}, data.shape={self.data.shape}")
         const = np.asarray(const)
-        if const.ndim != 1 or const.size != self.data.shape[0]:
+        if const.ndim != 1 or const.size != self.data.shape[0] or self.data.shape[0] != 1:
             raise ValueError(f"Constant vector of size {const.size} is wrong length for VecOpInfo with {self.data.shape[0]} components.")
         #data =  np.einsum("kn,k->n", self.data, const, optimize=True)
         data = self.data.T @ const  # fast BLAS-2
@@ -68,9 +69,11 @@ class VecOpInfo:
         Computes dot(v, ∇u) for a vector basis function v and gradient ∇u.
         Returns a new VecOpInfo with shape (k, n).
         """
+        # print(f"VecOpInfo.dot_grad: {self.role} and {grad.role}"
+        #           f" with shapes {self.data.shape} and {grad.data.shape}")
         if not isinstance(grad, GradOpInfo):
             raise TypeError(f"Expected GradOpInfo, got {type(grad)}.")
-        if self.data.shape[0] != grad.data.shape[-1]:
+        if self.data.shape[0] != grad.data.shape[0]:
             raise ValueError(f"VecOpInfo {self.shape} and GradOpInfo {grad.shape} must have the same number of components.")
         
         # Case 1: Function · Grad(Trial) or Trial · Grad(Function)
@@ -80,7 +83,11 @@ class VecOpInfo:
             # (1)  value of u_k at this quad-point
             u_val = np.sum(self.data, axis=1)          # shape (k,)  —   u_k(ξ)
             # (2)  w_i,n = Σ_d u_d ∂_d φ_{k,n}
-            data = np.einsum("d,kld->kl", u_val, grad.data, optimize=True)
+            if grad.shape[0] == 1:
+                # Special case: single component gradient
+                data = np.einsum("d,kld->kl", u_val, grad.data, optimize=True)
+            else:
+                data = np.einsum("s,sld->dl", u_val, grad.data, optimize=True)
             return VecOpInfo(data, role=grad.role)
         elif self.role == "trial" and grad.role == "function":
             # Case:  Trial · Grad(Function)      u_trial · ∇u_k
@@ -90,8 +97,18 @@ class VecOpInfo:
             else:
                 grad_val = grad.data
             # (2)  w_i,n = Σ_d ∂_d φ_{k,n} u_d
-            data = np.einsum("dl,kd->kl", self.data, grad_val, optimize=True)
+            data = np.einsum("sl,sd->dl", self.data, grad_val, optimize=True)
             return VecOpInfo(data, role=self.role)
+        elif self.role == "function" and grad.role == "function":
+            # Case:  Function · Grad(Function)      u_k · ∇u_k
+            # (1)  value of u_k at this quad-point
+            u_val = np.sum(self.data, axis=1)          # shape (k,)  —   u_k(ξ)
+            if grad.coeffs is not None:
+                grad_val = np.einsum("knd,kn->kd", grad.data, grad.coeffs, optimize=True)
+            else:
+                grad_val = grad.data
+            data = np.einsum("s,sd->d", u_val, grad_val, optimize=True)
+            return data
         raise NotImplementedError(f"VecOpInfo.dot_grad not implemented for role {self.role} and GradOpInfo role {grad.role}.")
     
     def dot_vec(self, vec: "VecOpInfo") -> "VecOpInfo":
@@ -336,6 +353,56 @@ class GradOpInfo:
             raise NotImplementedError(f"GradOpInfo.dot not implemented for roles {self.role} and {other.role}."
                                       f" Shapes: {self.data.shape} and {other.data.shape}.")
 
+    def left_dot(self, vec:np.ndarray) -> VecOpInfo:
+        """
+        Computes the left dot product with a constant vector or VecOpInfo over the SPATIAL dimension.
+        This operation reduces the dimension and returns a VecOpInfo object.
+        dot(c, ∇v) -> c ⋅ ∇v
+        """
+        if isinstance(vec, (VecOpInfo)):
+            # Case:  Const · Grad(Function)      c · ∇u_k
+            if self.role == "function":
+                # (1)  value of ∇u_k at this quad-point
+                if self.coeffs is not None:
+                    grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+                else:
+                    grad_val = self.data
+                # (2)  dot product
+                if vec.role in {"trial", "test"}:
+                    data = np.einsum("kn,kd->dn", vec.data, grad_val, optimize=True)
+                    return VecOpInfo(data, role=vec.role)
+                elif vec.role == "function":
+                    u_vals = np.sum(vec.data, axis=1)  # Shape (k,)
+                    return np.dot(u_vals, grad_val)  # scalar result for rhs
+            elif self.role in {"trial", "test"}:
+                if vec.role == "function":
+                    u_vals = np.sum(vec.data, axis=1)  # Shape (k,)
+                    if self.data.shape[0] == 1:
+                        # Special case: single component gradient
+                        data = np.einsum("d,kld->kl", u_vals, self.data, optimize=True)
+                    else:
+                        data = np.einsum("s,snd->dn", u_vals, self.data, optimize=True)
+                    return VecOpInfo(data, role=self.role)
+
+        if isinstance(vec, np.ndarray) and vec.ndim == 1:
+            if self.role == "function":
+                # Case:  Const · Grad(Function)      c · ∇u_k
+                if self.coeffs is not None:
+                    grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
+                else:
+                    grad_val = self.data
+                data = np.einsum("k,kd->d", vec, grad_val, optimize=True)
+                return VecOpInfo(data, role=self.role)
+            elif self.role in {"trial", "test"}:
+                if self.data.shape[0] == 1:
+                    # Special case: single component gradient
+                    data = np.einsum("d,kld->kl", vec, self.data, optimize=True)
+                else:
+                    data = np.einsum("s,snd->dn", vec, self.data, optimize=True)
+                return VecOpInfo(data, role=self.role)
+
+        raise ValueError(f"Cannot left_dot with vector of shape {vec.shape}.")
+
     def dot_vec(self, vec: np.ndarray) -> VecOpInfo:
         """
         Computes the dot product with a constant vector or VecOpInfo over the SPATIAL dimension.
@@ -556,13 +623,17 @@ class HessOpInfo:
           function   → GradOpInfo with data (k,d)
         """
         role_vec = vec.role if hasattr(vec, "role") else None
-        n = np.asarray(vec.data if hasattr(vec, "data") else vec).reshape(-1)
+        n = np.asarray(vec.data if hasattr(vec, "data") else vec)
         if role_vec == "function" and n.ndim == 2:
             # collapse the axis
             n = np.sum(vec.data, axis=1)  # Shape (k,)
         
         if self.data.ndim == 4:    # (k,n,d,d) · (d,) -> (k,n,d)
-            out = np.einsum("knij,j->kni", self.data, n, optimize=True)
+            if self.data.shape[0] == 1:
+                # special case for scalar
+                out = np.einsum("knij,j->kni", self.data, n, optimize=True)
+            else:
+                out = np.einsum("knij,j->kni", self.data, n, optimize=True)
         elif self.data.ndim == 3:  # (k,d,d)   · (d,) -> (k,d)
             out = np.einsum("kij,j->ki",   self.data, n, optimize=True)
         else:
@@ -572,16 +643,19 @@ class HessOpInfo:
     def dot_left(self, vec) -> "GradOpInfo":
         """Left contraction n · H over the first spatial axis i."""
         role_vec = vec.role if hasattr(vec, "role") else None
-        n = np.asarray(vec.data if hasattr(vec, "data") else vec).reshape(-1)
+        n = np.asarray(vec.data if hasattr(vec, "data") else vec)
 
         if role_vec == "function" and n.ndim == 2:
             # collapse the axis
             n = np.sum(vec.data, axis=1)  # Shape (k,)
 
         if self.data.ndim == 4:    # (d,) · (k,n,d,d) -> (k,n,d)
-            out = np.einsum("i,knij->knj", n, self.data, optimize=True)
+            if self.data.shape[0] == 1:
+                out = np.einsum("s,knsj->knj", n, self.data, optimize=True)
+            else:
+                out = np.einsum("s,snij->inj", n, self.data, optimize=True)
         elif self.data.ndim == 3:  # (d,) · (k,d,d)   -> (k,d)
-            out = np.einsum("i,kij->kj",   n, self.data, optimize=True)
+            out = np.einsum("s,sij->ij",   n, self.data, optimize=True)
         else:
             raise ValueError(f"HessOpInfo.dot_left: unexpected ndim={self.data.ndim}")
         return GradOpInfo(out, role=self.role)
@@ -594,10 +668,10 @@ class HessOpInfo:
         """
         n = np.asarray(nvec.data if hasattr(nvec, "data") else nvec).reshape(-1)
         if self.data.ndim == 4:    # (d,) · (k,n,d,d) · (d,) -> (k,n)
-            tmp = np.einsum("i,knij->knj", n, self.data, optimize=True)
+            tmp = np.einsum("s,snij->inj", n, self.data, optimize=True)
             val = np.einsum("knj,j->kn",   tmp, n, optimize=True)
         elif self.data.ndim == 3:  # (d,) · (k,d,d)   · (d,) -> (k,)
-            tmp = np.einsum("i,kij->kj",   n, self.data, optimize=True)
+            tmp = np.einsum("s,sij->ij",   n, self.data, optimize=True)
             val = np.einsum("kj,j->k",     tmp, n, optimize=True)
         else:
             raise ValueError(f"HessOpInfo.proj_nn: unexpected ndim={self.data.ndim}")
@@ -616,13 +690,7 @@ class HessOpInfo:
             raise ValueError(f"HessOpInfo component/spatial mismatch: {A.shape} vs {B.shape}")
         return np.einsum("knij,kmij->nm", A, B, optimize=True)
 
-    # n^T H n projection → VecOpInfo(k,n)
-    def proj_nn(self, nvec: np.ndarray) -> "VecOpInfo":
-        n = np.asarray(nvec).reshape(2)
-        # (k,n,2,2) : (2,) : (2,) → (k,n)
-        tmp = np.einsum("kndp,p->knd", self.data, n, optimize=True)  # H n, shape (k,n,2)
-        val = np.einsum("knd,d->kn", tmp, n, optimize=True)          # nᵀ(H n)
-        return VecOpInfo(val, role=self.role)
+
 
     @property
     def shape(self): return self.data.shape

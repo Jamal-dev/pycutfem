@@ -824,7 +824,8 @@ class FormCompiler:
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
-        # print(f"visit dot: role_a={role_a}, role_b={role_b}, a={a}, b={b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}")
+        print(f"visit dot: role_a={role_a}, role_b={role_b}, a={a}, b={b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+              f" type_a={type(a)}, type_b={type(b)}")
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
 
         def rhs():
@@ -850,7 +851,7 @@ class FormCompiler:
                 return a.dot_vec(b)  # grad(u_k) . u_k
             if  isinstance(b, GradOpInfo) and isinstance(a, VecOpInfo) \
             and b.role == a.role == "function":
-                return b.dot_vec(a)
+                return a.dot_grad(b)
             
             
             # Constant (numpy 1-D) · test VecOpInfo  → length-n vector
@@ -873,7 +874,7 @@ class FormCompiler:
                 # return a.dot_const(b) if a.ndim==2 else a.dot_vec(b)
                 return a.dot_const_vec(b) 
             elif isinstance(a, np.ndarray) and isinstance(b, GradOpInfo):
-                return b.dot_vec(a)  # ∇u_k · u_trial
+                return (b.transpose()).dot_vec(a)  # np.ndarry · ∇u
             elif isinstance(b, np.ndarray) and isinstance(a, GradOpInfo):
                 return a.dot_vec(b)
             # ------------------------------------------------------------------
@@ -885,6 +886,17 @@ class FormCompiler:
             if isinstance(b, np.ndarray) and  (role_b == None) \
             and isinstance(a, np.ndarray) and (role_a == None):
                 return np.dot(a, b)  # plain numpy dot product
+            # --- Hessian · vector (right) and vector · Hessian (left) -------------
+            # Accept geometric constant vectors (facet normals) or plain numpy 1D vectors.
+            if isinstance(a, HessOpInfo) and (
+                isinstance(b, np.ndarray) or (isinstance(b, VecOpInfo) and role_b in {"function",None})
+            ):
+                return a.dot_right(b)
+
+            if isinstance(b, HessOpInfo) and (
+                isinstance(a, np.ndarray) or (isinstance(a, VecOpInfo) and role_a in {"function",None} )
+            ):
+                return b.dot_left(a)
 
         if self.ctx["rhs"]:
             result = rhs()
@@ -911,7 +923,7 @@ class FormCompiler:
             # print(f"visit dot: GradOpInfo . result: {result}, result shape: {result.shape}, role: {getattr(result, 'role', None)}")
             return result
         elif isinstance(b, (GradOpInfo)) and isinstance(a, np.ndarray):
-            return b.dot_vec(a)
+            return b.left_dot(a)
         
 
         # mass matrix case: VecOpInfo . VecOpInfo
@@ -929,8 +941,7 @@ class FormCompiler:
         # ------------------------------------------------------------------
         if isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo) \
         and a.role == "function" and b.role == "test":
-
-            return a.dot_grad(b)  # u_k · ∇w
+            return b.left_dot(a)  # u_k · ∇w
         
         # ------------------------------------------------------------------
         # case grad(u_trial) . u_k
@@ -944,8 +955,7 @@ class FormCompiler:
         if isinstance(b, GradOpInfo) and ((isinstance(a, VecOpInfo) \
             and (a.role == "trial" )) and b.role == "function"
             ):
-
-            return a.dot_grad(b)  # u_trial · ∇u_k
+            return b.left_dot(a)  # u_trial · ∇u_k
         
  
         
@@ -963,8 +973,7 @@ class FormCompiler:
         # ------------------------------------------------------------------
         if isinstance(a, VecOpInfo)  and a.role == "function" \
         and isinstance(b, GradOpInfo) and b.role == "trial":
-
-            return a.dot_grad(b)  # u_k · ∇u_trial
+            return b.left_dot(a)  # u_k · ∇u_trial
             
         # ------------------------------------------------------------------
         # Case:  Grad(Trial) · Grad(Function)       ∇u_trial · ∇u_k 
@@ -996,7 +1005,11 @@ class FormCompiler:
     def _visit_Inner(self, n: Inner):
         a = self._visit(n.a)
         b = self._visit(n.b)
+        role_a = getattr(a, 'role', None)
+        role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Inner for types {type(a)} : {type(b)}")
+        print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+              f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
 
         rhs = bool(self.ctx.get("rhs"))
 
@@ -1054,13 +1067,21 @@ class FormCompiler:
                     raise ValueError(f"RHS inner(Function,Function) expects 1D data; got {A.shape}, {B.shape}")
 
             # ---- Numeric tensor with Grad basis on RHS ----
-            if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray):
-                return a.contracted_with_tensor(b)
-            if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray):
-                return b.contracted_with_tensor(a)
+            if isinstance(a, np.ndarray) and isinstance(b, VecOpInfo) and a.ndim == 1:
+                if b.role == "function":
+                    u_vals = np.sum(b.data, axis=1)
+                    return np.dot(a, u_vals)
+                return np.einsum("k,kn->n", a, b.data, optimize=True)
+            if isinstance(b, np.ndarray) and isinstance(a, VecOpInfo) and b.ndim == 1:
+                if a.role == "function":
+                    u_vals = np.sum(a.data, axis=1)
+                    return np.dot(b, u_vals)
+                return np.einsum("k,kn->n", b, a.data, optimize=True)
+                
 
             raise TypeError(f"Unsupported RHS inner '{n.a} : {n.b}' "
-                            f"a={type(a)}, b={type(b)}, roles=({getattr(a,'role',None)},{getattr(b,'role',None)})")
+                            f"a={type(a)}, b={type(b)}, roles=({getattr(a,'role',None)},{getattr(b,'role',None)})"
+                            f" and data shapes a={getattr(getattr(a, 'data', a), 'shape', None)}, b={getattr(getattr(b, 'data', b), 'shape', None)}")
 
         # ============================= LHS =============================
         # Orientation: rows = test space, cols = trial space

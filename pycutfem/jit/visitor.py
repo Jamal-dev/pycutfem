@@ -76,10 +76,16 @@ class IRGenerator:
 
         # --- 2. Binary Operators ---
         if isinstance(node, Jump):
-            # A Jump(u) is defined as u(+) - u(-).
-            # This correctly dispatches to the Pos and Neg visitors.
-            self._visit(node.u_pos)
-            self._visit(node.u_neg)
+            # Force side on both operands. If they’re already Pos/Neg wrappers,
+            # just visit them; otherwise visit with explicit side.
+            def _visit_with_side(expr, sgn):
+                from pycutfem.ufl.expressions import Pos, Neg
+                if isinstance(expr, (Pos, Neg)):
+                    self._visit(expr)
+                else:
+                    self._visit(expr, side=sgn)
+            _visit_with_side(node.u_pos, "+")   # u(+)
+            _visit_with_side(node.u_neg, "-")   # u(-)
             self.ir_sequence.append(BinaryOp(op_symbol='-'))
             return
 
