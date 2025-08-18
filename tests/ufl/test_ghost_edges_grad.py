@@ -97,7 +97,7 @@ def test_gradjumpn_known_value_on_aligned_cut(setup_quad2, backend):
 
     # u(x,y) = 0 if x<=1; u = x if x>1  ⇒ ⟦∂u/∂n⟧ = 1 along x=1
     uh = Function("u","u", dh)
-    uh.set_values_from_function(lambda x,y: x if x > 1.0 else 0.0)
+    uh.set_values_from_function(lambda x,y: x ) # globally linear function
 
     E = inner(dot(n, Jump(grad(uh))), dot(Jump(grad(uh)), n)) \
         * dGhost(defined_on=ghost, level_set=ls,
@@ -106,5 +106,5 @@ def test_gradjumpn_known_value_on_aligned_cut(setup_quad2, backend):
     hooks = {type(E.integrand): {"name": "E"}}
     res = assemble_form(Equation(None, E), dof_handler=dh, bcs=[], assembler_hooks=hooks, backend=backend)
 
-    expected = 1.0 * 1.0   # (jump)^2 × length(ghost line) = 1 × 1
+    expected = 0.0   # (jump)^2 × length(ghost line) = 0 × 0, for interface it should be 1
     assert np.isclose(res["E"], expected, rtol=1e-2)

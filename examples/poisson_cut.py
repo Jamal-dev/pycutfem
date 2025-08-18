@@ -13,7 +13,6 @@ Problem setup:
 - Analytical Solution: u(x,y) = 2 - (x² + y²)
 """
 
-from ufl import p
 import numpy as np
 import scipy.sparse
 import scipy.sparse.linalg as sp_la

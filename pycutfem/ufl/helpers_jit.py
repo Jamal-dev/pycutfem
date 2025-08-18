@@ -240,6 +240,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
         "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
         "eids", "entity_kind",
         "owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids",
+        "pos_map", "neg_map",
 
         # Hessian-of-inverse-map tensors (volume / boundary / interface)
         "Hxi0", "Hxi1",
@@ -330,6 +331,28 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if name in args:
             continue
 
+        # --- NEW: sided reference derivative tables (ghost) with interface fallback ---
+        m_r = re.match(r"^r(\d)(\d)_(\w+?)_(pos|neg)$", name)
+        if m_r:
+            d0, d1, fld, _side = m_r.groups()
+            # Provided by ghost/interface precompute?
+            if pre_built is not None and name in pre_built:
+                args[name] = pre_built[name]
+                continue
+            # Interface fallback: use dXY_<fld> if we're on elements
+            if (pre_built is not None
+                and pre_built.get("entity_kind") == "element"
+                and f"d{d0}{d1}_{fld}" in pre_built):
+                args[name] = pre_built[f"d{d0}{d1}_{fld}"]
+                continue
+            raise KeyError(
+                f"_build_jit_kernel_args: kernel requests '{name}', "
+                "but it wasn't provided. Ensure you call "
+                "DofHandler.precompute_ghost_factors(...) for ghost, or "
+                "let interface fallback map rXY->dXY when entity_kind=='element'."
+                f" args.keys()={list(args.keys())};"
+                f" pre_built.keys()={list(pre_built.keys())}"
+            )
         # ---- basis tables ------------------------------------------------
         if name.startswith("b_"):
             fld = name[2:]

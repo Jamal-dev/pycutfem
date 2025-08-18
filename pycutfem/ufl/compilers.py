@@ -718,8 +718,13 @@ class FormCompiler:
     
 
     def _visit_CellDiameter(self, node):
-        eid = self.ctx["eid"]          # set by every volume / interface loop
-        return self.me.mesh.element_char_length(eid)
+        eid = self.ctx.get("eid")
+        if eid is None:
+            eid = self.ctx.get("pos_eid", self.ctx.get("neg_eid"))
+        if eid is None:
+            raise KeyError("CellDiameter() requires 'eid' in context; set it in the element loop.")
+        return self.me.mesh.element_char_length(int(eid))
+
 
     
     # ================= VISITORS: ALGEBRAIC ==========================
@@ -836,8 +841,8 @@ class FormCompiler:
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
-        print(f"visit dot: role_a={role_a}, role_b={role_b}, a={a}, b={b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-              f" type_a={type(a)}, type_b={type(b)}")
+        # print(f"visit dot: role_a={role_a}, role_b={role_b}, a={a}, b={b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+        #       f" type_a={type(a)}, type_b={type(b)}")
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
 
         def rhs():
@@ -1020,8 +1025,8 @@ class FormCompiler:
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Inner for types {type(a)} : {type(b)}")
-        print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-              f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
+        # print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+        #       f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
 
         rhs = bool(self.ctx.get("rhs"))
 
@@ -1477,6 +1482,9 @@ class FormCompiler:
                     continue # New
                 
                 log.debug(f"  Processing cut element: {elem.id}") # New
+                self.ctx['eid'] = elem.id 
+                self.ctx['pos_eid'] = elem.id 
+                self.ctx['neg_eid'] = elem.id 
 
                 # --- 3. Quadrature Rule on the Physical Interface Segment --- # New
                 p0, p1 = elem.interface_pts # New
@@ -1502,12 +1510,11 @@ class FormCompiler:
                             grad = self.me.grad_basis(f, xi, eta) @ Ji
                             self._basis_cache[f] = {"val": val, "grad": grad} 
 
-                        self.ctx['eid'] = elem.id # New
+                        
                         self.ctx['normal'] = level_set.gradient(x_phys) # New
                         self.ctx['phi_val'] = level_set(x_phys) # New
                         self.ctx['x_phys'] = x_phys
-                        self.ctx['pos_eid'] = elem.id # New
-                        self.ctx['neg_eid'] = elem.id # New
+
                         
                         # --- Evaluate the ENTIRE integrand at once --- # New
                         integrand_val = self._visit(intg.integrand) # New
@@ -1532,12 +1539,11 @@ class FormCompiler:
                             grad = self.me.grad_basis(f, xi, eta) @ Ji # New
                             self._basis_cache[f] = {"val": val, "grad": grad} # New
                         
-                        self.ctx['eid'] = elem.id # New
+                        
                         self.ctx['normal'] = level_set.gradient(x_phys) # New
                         self.ctx['phi_val'] = level_set(x_phys) # New
                         self.ctx['x_phys'] = x_phys
-                        self.ctx['pos_eid'] = elem.id
-                        self.ctx['neg_eid'] = elem.id 
+
                         
                         integrand_val = self._visit(intg.integrand) # New
                         
@@ -1786,6 +1792,22 @@ class FormCompiler:
         geo = dh.precompute_interface_factors(cut_bs, qdeg, level_set, need_hess=need_hess)
         cut_eids = geo["eids"].astype(np.int32)      # 1‑D array, len = n_cut
 
+        # 2a) ALIAS: for interface, both sides are the same element.
+        #    Provide r**_*_{pos|neg} by aliasing to existing d**_* tables.
+        fields = dh.mixed_element.field_names
+        for fld in fields:
+            gkey = f"g_{fld}"
+            if gkey not in geo:
+                continue
+            g = geo[gkey]                         # (nE, nQ, n_union, 2) = [d/dξ, d/dη]
+            r10 = np.ascontiguousarray(g[..., 0]) # (nE, nQ, n_union)
+            r01 = np.ascontiguousarray(g[..., 1]) # (nE, nQ, n_union)
+            # Only set if absent
+            geo.setdefault(f"r10_{fld}_pos", r10)
+            geo.setdefault(f"r01_{fld}_pos", r01)
+            geo.setdefault(f"r10_{fld}_neg", r10)
+            geo.setdefault(f"r01_{fld}_neg", r01)
+
         # ------------------------------------------------------------------
         # 3. Element‑to‑DOF map  (shape = n_cut × n_loc)
         # ------------------------------------------------------------------
@@ -1851,14 +1873,21 @@ class FormCompiler:
         dh, me = self.dh, self.me
 
         # 1. Get required derivatives, edge set, and level set
-        derivs = required_multi_indices(intg.integrand) | {(0, 0)}
+        md = intg.measure.metadata or {}
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0)}  # always include values
+        # Close up to the maximum total order present (robust for Hessian/cross terms)
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        for p in range(max_total + 1):
+            for ox in range(p + 1):
+                derivs.add((ox, p - ox))
         edge_ids = (intg.measure.defined_on
                 if intg.measure.defined_on is not None
                 else mesh.edge_bitset('ghost'))
         level_set = getattr(intg.measure, 'level_set', None)
         if level_set is None:
             raise ValueError("dGhost measure requires a 'level_set' callable.")
-        qdeg = self._find_q_order(intg)
+        qdeg = max(self._find_q_order(intg), 2*max_total + 4)
 
         if edge_ids.cardinality() == 0:
             return

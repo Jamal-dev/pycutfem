@@ -442,16 +442,18 @@ class DofHandler:
             
             nodes_on_domain: Set[int] = set()
 
-            # Path 1: The domain is a pre-tagged set of DOFs (e.g., 'pressure_pin')
+            # Path 1: pre-tagged DOFs (field-scoped by construction)
             if domain_tag in self.dof_tags:
                 val_is_callable = callable(bc.value)
                 for dof in self.dof_tags[domain_tag]:
-                    dof_field, node_id = self._dof_to_node_map[dof]
-                    if dof_field == field: # Apply only if the field matches
+                    # Optional: still try to evaluate at the node if available
+                    node_id = self._dof_to_node_map.get(dof, (field, None))[1]
+                    if node_id is not None and val_is_callable:
                         x, y = mesh.nodes_x_y_pos[node_id]
-                        value = bc.value(x, y) if val_is_callable else bc.value
-                        data[dof] = value
-                continue # Go to the next BC
+                        data[dof] = bc.value(x, y)
+                    else:
+                        data[dof] = float(bc.value)  # constants (your case) are fine
+                continue
 
             # Path 2: The domain is found by a locator function
             if domain_tag in locators:

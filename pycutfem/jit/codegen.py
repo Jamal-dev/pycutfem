@@ -788,35 +788,37 @@ class NumbaCodeGen:
             # ----------------------------------------------------------------------
             # ∇(·) operator
             # ----------------------------------------------------------------------
+            # --- UNARY OPERATORS ----------------------------------------------------------
+            # ∇(·)
+            # ------------------------------------------------------------------------------
             elif isinstance(op, Grad):
                 a = stack.pop()
 
-
-                # --- which J⁻¹ array to use -------------------------------------------
+                # Which J^{-1} to use
                 if   a.side == "+":  jinv_sym = "J_inv_pos"; required_args.add("J_inv_pos")
                 elif a.side == "-":  jinv_sym = "J_inv_neg"; required_args.add("J_inv_neg")
                 else:                jinv_sym = "J_inv";     required_args.add("J_inv")
-
-                jinv_q = f"{jinv_sym}_q"          # ← element‑, qp‑local  (2×2)
-
-                # --- reference‑gradient tables (no side suffix) -----------------------
-                grad_q = [f"g_{f}" for f in a.field_names]
-                for name in grad_q: required_args.add(name)
+                jinv_q = f"{jinv_sym}_q"    # 2×2 at (e,q)
 
                 # ======================================================================
-                # (A)  grad(Test/Trial)           → (k , n_loc , 2)
+                # (A) grad(Test/Trial) → (k , n_loc_or_union , 2)
                 # ======================================================================
                 if a.role in ("test", "trial"):
+                    # Keep old behavior for volume/interface (g_* tables),
+                    # but allow ghost facets to be padded to the union.
+                    grad_tab_names = [f"g_{f}" for f in a.field_names]
+                    for nm in grad_tab_names: required_args.add(nm)
+
                     phys = []
                     for i in range(len(a.field_names)):
-                        pg_loc = new_var("grad_loc")
-                        body_lines.append(f"{pg_loc} = {grad_q[i]}[e, q] @ {jinv_q}.copy()")
+                        pg_loc = new_var("grad_loc")           # (n_loc,2) in element coords
+                        body_lines.append(f"{pg_loc} = {grad_tab_names[i]}[e, q] @ {jinv_q}.copy()")
 
-                        if a.side:        # ---------- NEW ----------
+                        if a.side:  # ghost facet → pad to (n_union,2)
                             map_arr = "pos_map" if a.side == "+" else "neg_map"
                             required_args.add(map_arr)
-                            map_e   = new_var(f"{map_arr}_e")
-                            pg_pad  = new_var("grad_pad")
+                            map_e  = new_var(f"{map_arr}_e")
+                            pg_pad = new_var("grad_pad")
                             body_lines += [
                                 f"{map_e} = {map_arr}[e]",
                                 f"n_union = gdofs_map[e].shape[0]",
@@ -831,89 +833,92 @@ class NumbaCodeGen:
                             phys.append(pg_loc)
 
                     n_dofs = self.n_dofs_local if not a.side else -1
-                    if not a.is_vector:                                # scalar space
-                        var = new_var("grad_scalar")
-                        body_lines.append(f"{var} = {phys[0]}[None, :, :].copy()")
-                        shape = (1, n_dofs, self.spatial_dim)
-                        is_vector = False
-                        is_gradient = True
-                    else:                                              # vector space
-                        var = new_var("grad_stack")
-                        body_lines.append(f"{var} = np.stack(({', '.join(phys)}))")
-                        shape = (len(a.field_names), n_dofs, self.spatial_dim)
-                        is_vector = False
-                        is_gradient = True
+                    if not a.is_vector:
+                        var = new_var("grad_scalar"); body_lines.append(f"{var} = {phys[0]}[None, :, :].copy()")
+                        shape, is_vector, is_gradient = (1, n_dofs, self.spatial_dim), False, True
+                    else:
+                        var = new_var("grad_stack"); body_lines.append(f"{var} = np.stack(({', '.join(phys)}))")
+                        shape, is_vector, is_gradient = (len(a.field_names), n_dofs, self.spatial_dim), False, True
 
-                    stack.append(a._replace(var_name=var,
-                                            shape=shape,
-                                            is_gradient=is_gradient,is_vector = is_vector))
+                    stack.append(a._replace(var_name=var, shape=shape,
+                                            is_gradient=is_gradient, is_vector=is_vector))
+                    continue
 
                 # ======================================================================
-                # (B)  grad(Function/VectorFunction)  → (2,)  or  (k , 2)
+                # (B) grad(Function/VectorFunction)
                 # ======================================================================
-                elif a.role == "value":
-                    # Base coefficient name (e.g. "u_u__pos_loc" / "u_u__neg_loc" / "u_u_loc")
+                if a.role == "value":
+                    # Base coefficient name (may already be an alias like "..._e" created earlier)
                     coeff = (a.parent_name if a.parent_name.startswith("u_")
                             else f"u_{a.parent_name}_loc")
                     required_args.add(coeff)
 
-                    # Decide side map (ghost faces only) and pick the per-edge coeff alias.
-                    # NOTE: Earlier in the kernel you already have:
-                    #   u_u__pos_loc_e = u_u__pos_loc[e]
-                    #   u_u__neg_loc_e = u_u__neg_loc[e]
-                    # We use those aliases directly to avoid double indexing.
-                    if a.side == "+":
-                        map_sym   = "pos_map"
-                        coeff_e   = f"{coeff}"      # -> u_u__pos_loc_e
-                        required_args.add(map_sym)
-                    elif a.side == "-":
-                        map_sym   = "neg_map"
-                        coeff_e   = f"{coeff}"      # -> u_u__neg_loc_e
-                        required_args.add(map_sym)
-                    else:
-                        map_sym   = None
-                        coeff_e   = f"{coeff}[e]"     # volume case: per-element slice
-
                     comps = []
-                    for i in range(len(a.field_names)):
-                        pg  = new_var("phys_grad_basis")   # (n_loc or n_union, 2)
-                        val = new_var("grad_val")          # (2,)
+                    for i, fld in enumerate(a.field_names):
+                        val = new_var("grad_val")
 
-                        # Use the per-edge gradient table row; map to physical via the right J^{-1}
-                        body_lines += [f"{pg} = {grad_q[i]}[e, q] @ {jinv_q}.copy()"]
+                        if a.side in {"+", "-"}:
+                            # -------- GHOST FACET (side-restricted) -----------------------
+                            # per-edge, per-side reference derivative tables (length = n_loc)
+                            suff = "pos" if a.side == "+" else "neg"
+                            d10 = f"r10_{fld}_{suff}"
+                            d01 = f"r01_{fld}_{suff}"
+                            required_args.update({d10, d01})
 
-                        if map_sym:
-                            # Ghost face: slice union-length coeff down to local side DOFs
-                            u_loc = new_var("u_loc")
+                            # side map: union → this side's local dofs (length n_loc)
+                            map_sym = "pos_map" if a.side == "+" else "neg_map"
+                            required_args.add(map_sym)
+
+                            # per-edge coeff alias: if alias already exists, use it; else slice once
+                            coeff_e = coeff if coeff.endswith("_e") else f"{coeff}"
+
+                            g2   = new_var("g_ref2")   # (n_loc, 2) in (ξ,η)
+                            phys = new_var("g_phys2")  # (n_loc, 2) in (x,y)
+                            u_sl = new_var("u_side")   # (n_loc,)
+
                             body_lines += [
-                                f"{u_loc} = {coeff_e}[{map_sym}[e]]",
-                                f"{val} = {pg}.T.copy() @ {u_loc}",
+                                f"d10_q = {d10}[e, q]",                      # (n_loc,)
+                                f"d01_q = {d01}[e, q]",                      # (n_loc,)
+                                f"{g2}  = np.stack((d10_q, d01_q), axis=1)", # (n_loc,2)
+                                f"{phys}= {g2} @ {jinv_q}.copy()",           # J^{-1} on the correct side
+                                f"{u_sl} = {coeff_e}[{map_sym}[e]]",         # slice union coeff -> local (n_loc,)
+                                f"{val} = {phys}.T.copy() @ {u_sl}",         # (2,)
                             ]
+
                         else:
-                            # Volume: coeff_e is already the per-element vector
-                            body_lines += [f"{val} = {pg}.T.copy() @ {coeff_e}"]
+                            # -------- VOLUME / INTERFACE (no side) ------------------------
+                            gnm = f"g_{fld}"
+                            required_args.add(gnm)
+
+                            # SAFE per-element coeff alias: never double-index
+                            coeff_e = coeff if coeff.endswith("_e") else f"{coeff}"
+
+                            pg = new_var("phys_grad_basis")  # (n_loc, 2)
+                            body_lines += [
+                                f"{pg}  = {gnm}[e, q] @ {jinv_q}.copy()",   # (n_loc,2)
+                                f"{val} = {pg}.T.copy() @ {coeff_e}",       # (2,)  ✅ NO extra [e]
+                            ]
 
                         comps.append(val)
 
                     if not a.is_vector:
-                        var, shape = comps[0], (self.spatial_dim,)
-                        is_vector, is_gradient = True, False
+                        var, shape, is_vector, is_gradient = comps[0], (self.spatial_dim,), True, False
                     else:
                         var = new_var("grad_val_stack")
                         body_lines.append(f"{var} = np.stack(({', '.join(comps)}))")
-                        shape = (len(a.field_names), self.spatial_dim)
-                        is_vector, is_gradient = False, True
+                        shape, is_vector, is_gradient = (len(a.field_names), self.spatial_dim), False, True
 
                     stack.append(
                         StackItem(var_name=var, role="value", shape=shape,
                                 is_gradient=is_gradient, is_vector=is_vector,
                                 field_names=a.field_names, parent_name=coeff)
                     )
+                    continue
+
+                raise NotImplementedError(f"Grad not implemented for role {a.role}")
 
 
 
-                else:
-                    raise NotImplementedError(f"Grad not implemented for role {a.role}")
 
             
             elif isinstance(op, Div):

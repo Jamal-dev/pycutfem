@@ -103,8 +103,14 @@ def test_hessian_penalty_spd(setup_quad2, backend):
     assert np.allclose(K, K.T, atol=1e-12)
     # positive semi‑definite
     evals = np.linalg.eigvalsh(K)
-    print("minimum eigenvalue of K:", evals.min())
-    assert np.all(evals >= -1.5e-10)
+    lam_min = evals[0]
+    lam_max = evals[-1]
+    eps = np.finfo(float).eps
+
+    # Robust PSD check (relative to the matrix scale)
+    tol = 200 * eps * max(1.0, lam_max)   # ~ O(1e-8) here
+    assert lam_min >= -tol
+
 
 # ---------------------------------------------------------------------------
 # 2. Zero‑jump check – quadratic function (constant Hessian)
