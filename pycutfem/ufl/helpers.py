@@ -391,8 +391,13 @@ class GradOpInfo:
                     grad_val = np.einsum("knd,kn->kd", self.data, self.coeffs, optimize=True)
                 else:
                     grad_val = self.data
-                data = np.einsum("k,kd->d", vec, grad_val, optimize=True)
-                return VecOpInfo(data, role=self.role)
+                if grad_val.shape[0] == 1:
+                    # Special case: single component gradient
+                    data = np.einsum("d,kd->k", vec, grad_val, optimize=True)
+                    return data # returns a 1D array
+                else:
+                    data = np.einsum("k,kd->d", vec, grad_val, optimize=True)
+                return data
             elif self.role in {"trial", "test"}:
                 if self.data.shape[0] == 1:
                     # Special case: single component gradient

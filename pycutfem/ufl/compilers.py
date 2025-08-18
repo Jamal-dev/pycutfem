@@ -836,8 +836,8 @@ class FormCompiler:
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
-        # print(f"visit dot: role_a={role_a}, role_b={role_b}, a={a}, b={b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-        #       f" type_a={type(a)}, type_b={type(b)}")
+        print(f"visit dot: role_a={role_a}, role_b={role_b}, a={a}, b={b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+              f" type_a={type(a)}, type_b={type(b)}")
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
 
         def rhs():
@@ -886,7 +886,7 @@ class FormCompiler:
                 # return a.dot_const(b) if a.ndim==2 else a.dot_vec(b)
                 return a.dot_const_vec(b) 
             elif isinstance(a, np.ndarray) and isinstance(b, GradOpInfo):
-                return (b.transpose()).dot_vec(a)  # np.ndarry · ∇u
+                return b.left_dot(a)  # np.ndarray · ∇u
             elif isinstance(b, np.ndarray) and isinstance(a, GradOpInfo):
                 return a.dot_vec(b)
             # ------------------------------------------------------------------
@@ -1020,8 +1020,8 @@ class FormCompiler:
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Inner for types {type(a)} : {type(b)}")
-        # print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-        #       f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
+        print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+              f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
 
         rhs = bool(self.ctx.get("rhs"))
 
@@ -1115,7 +1115,10 @@ class FormCompiler:
                     u_vals = np.sum(a.data, axis=1)
                     return np.dot(b, u_vals)
                 return np.einsum("k,kn->n", b, a.data, optimize=True)
-                
+            if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+                if a.ndim == 1 and b.ndim == 1:
+                    return float(np.einsum("k,k->", a, b, optimize=True))
+                return np.tensordot(a, b, axes=([0], [0]))
 
             raise TypeError(f"Unsupported RHS inner '{n.a} : {n.b}' "
                             f"a={type(a)}, b={type(b)}, roles=({getattr(a,'role',None)},{getattr(b,'role',None)})"

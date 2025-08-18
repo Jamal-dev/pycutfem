@@ -852,39 +852,66 @@ class NumbaCodeGen:
                 # (B)  grad(Function/VectorFunction)  → (2,)  or  (k , 2)
                 # ======================================================================
                 elif a.role == "value":
+                    # Base coefficient name (e.g. "u_u__pos_loc" / "u_u__neg_loc" / "u_u_loc")
                     coeff = (a.parent_name if a.parent_name.startswith("u_")
                             else f"u_{a.parent_name}_loc")
+                    required_args.add(coeff)
+
+                    # Decide side map (ghost faces only) and pick the per-edge coeff alias.
+                    # NOTE: Earlier in the kernel you already have:
+                    #   u_u__pos_loc_e = u_u__pos_loc[e]
+                    #   u_u__neg_loc_e = u_u__neg_loc[e]
+                    # We use those aliases directly to avoid double indexing.
+                    if a.side == "+":
+                        map_sym   = "pos_map"
+                        coeff_e   = f"{coeff}"      # -> u_u__pos_loc_e
+                        required_args.add(map_sym)
+                    elif a.side == "-":
+                        map_sym   = "neg_map"
+                        coeff_e   = f"{coeff}"      # -> u_u__neg_loc_e
+                        required_args.add(map_sym)
+                    else:
+                        map_sym   = None
+                        coeff_e   = f"{coeff}[e]"     # volume case: per-element slice
 
                     comps = []
                     for i in range(len(a.field_names)):
-                        pg  = new_var("phys_grad_basis")
-                        val = new_var("grad_val")
-                        body_lines += [
-                            f"{pg}  = {grad_q[i]}[e, q] @ {jinv_q}.copy()",   # (n_loc,2)
-                            f"{val} = {pg}.T.copy() @ {coeff}",           # (2,)
-                        ]
+                        pg  = new_var("phys_grad_basis")   # (n_loc or n_union, 2)
+                        val = new_var("grad_val")          # (2,)
+
+                        # Use the per-edge gradient table row; map to physical via the right J^{-1}
+                        body_lines += [f"{pg} = {grad_q[i]}[e, q] @ {jinv_q}.copy()"]
+
+                        if map_sym:
+                            # Ghost face: slice union-length coeff down to local side DOFs
+                            u_loc = new_var("u_loc")
+                            body_lines += [
+                                f"{u_loc} = {coeff_e}[{map_sym}[e]]",
+                                f"{val} = {pg}.T.copy() @ {u_loc}",
+                            ]
+                        else:
+                            # Volume: coeff_e is already the per-element vector
+                            body_lines += [f"{val} = {pg}.T.copy() @ {coeff_e}"]
+
                         comps.append(val)
 
-                    if not a.is_vector:               # scalar coefficient
+                    if not a.is_vector:
                         var, shape = comps[0], (self.spatial_dim,)
-                        is_vector = True
-                        is_gradient = False
-                    else:                             # k‑vector coefficient
+                        is_vector, is_gradient = True, False
+                    else:
                         var = new_var("grad_val_stack")
                         body_lines.append(f"{var} = np.stack(({', '.join(comps)}))")
                         shape = (len(a.field_names), self.spatial_dim)
-                        is_vector = False
-                        is_gradient = True
+                        is_vector, is_gradient = False, True
 
                     stack.append(
-                        StackItem(var_name   = var,
-                                role       = "value",
-                                shape      = shape,
-                                is_gradient= is_gradient,
-                                is_vector  = is_vector,
-                                field_names= a.field_names,
-                                parent_name= coeff)
+                        StackItem(var_name=var, role="value", shape=shape,
+                                is_gradient=is_gradient, is_vector=is_vector,
+                                field_names=a.field_names, parent_name=coeff)
                     )
+
+
+
                 else:
                     raise NotImplementedError(f"Grad not implemented for role {a.role}")
 
@@ -980,10 +1007,10 @@ class NumbaCodeGen:
             elif isinstance(op, Inner):
                 b = stack.pop(); a = stack.pop()
                 res_var = new_var("inner")
-                print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}"
-                      f", is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}"
-                      f", a.is_transpose: {a.is_transpose}, b.is_transpose: {b.is_transpose}"
-                      f", a.is_hessian: {a.is_hessian}, b.is_hessian: {b.is_hessian}")
+                # print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}"
+                #       f", is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}"
+                #       f", a.is_transpose: {a.is_transpose}, b.is_transpose: {b.is_transpose}"
+                #       f", a.is_hessian: {a.is_hessian}, b.is_hessian: {b.is_hessian}")
 
                 # LHS Bilinear Form: always rows=test, cols=trial
                 if a.role in ('test', 'trial') and b.role in ('test', 'trial'):
@@ -1100,7 +1127,9 @@ class NumbaCodeGen:
 
                         
                     
-                elif a.role == 'value' and b.role == 'value':
+                elif a.role in {'value','const'} and b.role in {'value','const'}:
+                    # body_lines.append(f"print(f'RHS Functional inner: a.shape: {{{a.var_name}.shape}}, "
+                    #                   f"b.shape: {{{b.var_name}.shape}}, ')")
                     if a.is_vector and b.is_vector:
                         body_lines.append(f'# Inner(Value, Value): dot product')
                         body_lines.append(f'{res_var} = np.dot({a.var_name}, {b.var_name})')
@@ -1125,6 +1154,10 @@ class NumbaCodeGen:
                                 f'# (k,2,2) @ (k,2,2) -> (k,k)',
                                 f'{res_var} = {a.var_name} @ {b.var_name}.T.copy()',
                             ]
+                    elif not ((a.is_vector and a.is_gradient and a.is_hessian) and (b.is_vector and b.is_gradient and b.is_hessian)) \
+                         and a.shape == b.shape:
+                        body_lines.append(f'# Inner(Scalar, Scalar): element-wise product')
+                        body_lines.append(f'{res_var} = {a.var_name} * {b.var_name}')
                         
                 
                 else:
@@ -1569,10 +1602,12 @@ class NumbaCodeGen:
                             f"d1          = {a.var_name}.shape[2]",
                             f"d2          = {a.var_name}.shape[3]",
                             f"{res_var}   = np.zeros((n_vec_comps, n_locs, d1), dtype={self.dtype})",
+                            f"b_var = np.ascontiguousarray({b.var_name})",
                             f"for kk in range(n_vec_comps):",
                             f"    for n in range(n_locs):",
                             f"        # (d1,d2)·(d2,) -> (d1,)",
-                            f"        {res_var}[kk, n, :] = {a.var_name}[kk, n, :, :].dot({b.var_name})",
+                            f"        a_slice = np.ascontiguousarray({a.var_name}[kk, n, :, :])",
+                            f"        {res_var}[kk, n, :] = np.dot(a_slice, b_var)",
                         ]
                         stack.append(StackItem(var_name=res_var, role=a.role,
                                             shape=(k_comps, -1, a.shape[2]),  # (k, n, d1)
@@ -1585,8 +1620,10 @@ class NumbaCodeGen:
                             f"d1          = {a.var_name}.shape[1]",
                             f"d2          = {a.var_name}.shape[2]",
                             f"{res_var}   = np.zeros((n_vec_comps, d1), dtype={self.dtype})",
+                            f"b_var = np.ascontiguousarray({b.var_name})",
                             f"for kk in range(n_vec_comps):",
-                            f"    {res_var}[kk, :] = {a.var_name}[kk, :, :].dot({b.var_name})",
+                            f"    a_slice = np.ascontiguousarray({a.var_name}[kk, :, :])",
+                            f"    {res_var}[kk, :] = np.dot(a_slice, b_var)",
                         ]
                         stack.append(StackItem(var_name=res_var, role=a.role,
                                             shape=(k_comps, a.shape[1]),      # (k, d1)
@@ -1611,10 +1648,12 @@ class NumbaCodeGen:
                             body_lines += [
                                 f"n_locs = {b.var_name}.shape[1]; d1 = {b.var_name}.shape[2]; d2 = {b.var_name}.shape[3]",
                                 f"{res_var} = np.zeros((d1, n_locs, d2), dtype={self.dtype})",
+                                f"a_var = np.ascontiguousarray({a.var_name})",
                                 f"for n in range(n_locs):",
                                 f"    for j in range(d1):",
                                 f"        # (k,) · (k, d2) -> (d2,)",
-                                f"        {res_var}[j, n, :] = np.dot({a.var_name}, {b.var_name}[:, n, j, :])",
+                                f"        b_slice = np.ascontiguousarray({b.var_name}[:, j, :])",
+                                f"        {res_var}[j, n, :] = np.dot(a_var, b_slice)",
                             ]
                             stack.append(StackItem(var_name=res_var, role=b.role,
                                                 shape=(d1, -1, d2),
@@ -1626,9 +1665,11 @@ class NumbaCodeGen:
                             body_lines += [
                                 f"n_locs = {b.var_name}.shape[1]; d2 = {b.var_name}.shape[3]; k_comps = {b.var_name}.shape[0]",
                                 f"{res_var} = np.zeros((k_comps, n_locs, d2), dtype={self.dtype})",
+                                f"a_var = np.ascontiguousarray({a.var_name})",
                                 f"for n in range(n_locs):",
                                 f"    # (d1,) · (d1, d2) -> (d2,)",
-                                f"    {res_var}[0, n, :] = np.dot({a.var_name}, {b.var_name}[0, n, :, :])",
+                                f"    b_slice = np.ascontiguousarray({b.var_name}[0, n, :, :])",
+                                f"    {res_var}[0, n, :] = np.dot(a_var, b_slice)",
                             ]
                             stack.append(StackItem(var_name=res_var, role=b.role,
                                                 shape=(1, -1, d2),
@@ -1652,8 +1693,10 @@ class NumbaCodeGen:
                             body_lines += [
                                 f"d1 = {b.var_name}.shape[1]; d2 = {b.var_name}.shape[2]", 
                                 f"{res_var} = np.zeros((d1, d2), dtype={self.dtype})",
+                                f"a_var = np.ascontiguousarray({a.var_name})",
                                 f"for j in range(d1):",
-                                f"    {res_var}[j, :] = np.dot({a.var_name}, {b.var_name}[:, j, :])",
+                                f"    b_slice = np.ascontiguousarray({b.var_name}[:, j, :])",
+                                f"    {res_var}[j, :] = np.dot(a_var, b_slice)",
                             ]
                             stack.append(StackItem(var_name=res_var, role=b.role,
                                                 shape=(d1, d2),
@@ -1667,7 +1710,9 @@ class NumbaCodeGen:
                                 f"{res_var} = np.zeros((1, d2), dtype={self.dtype})",
                                 f"# (d1,) · (d1, d2) -> (1, d2)",
                                 f"{res_var} = np.zeros((1, d2), dtype={self.dtype})",
-                                f"{res_var}[0, :] = np.dot({a.var_name}, {b.var_name}[0, :, :])",
+                                f"a_var = np.ascontiguousarray({a.var_name})",
+                                f"b_slice = np.ascontiguousarray({b.var_name}[0, :, :])",
+                                f"{res_var}[0, :] = np.dot(a_var, b_slice)",
                             ]
                             stack.append(StackItem(var_name=res_var, role=b.role,
                                                 shape=(1, d2),
