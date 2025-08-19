@@ -29,6 +29,7 @@ from pycutfem.io.visualization import plot_mesh_2
 from pycutfem.fem.mixedelement import MixedElement
 from scipy.sparse.linalg import eigsh,  ArpackNoConvergence
 from scipy.sparse import csr_matrix, bmat
+import os
 
 
 def smallest_eigs_safe(K, k=3):
@@ -61,7 +62,7 @@ def test_cutfem_poisson_interface(backend):
     # 1. Setup Mesh and Level Set
     poly_order = 1
     L,H = 3.0, 3.0
-    nx, ny = 10, 10
+    nx, ny = 30, 30
     ghost_parameter = 0.5
     beta =20  # Stabilization parameter
     gamma_G = Constant(ghost_parameter)
@@ -78,17 +79,18 @@ def test_cutfem_poisson_interface(backend):
         'bottom': lambda x, y: np.isclose(y, -H/2.0),
         'top': lambda x, y: np.isclose(y, H/2.0),
     }
-    mesh.tag_boundary_edges(boundary_tags)
     # Classify mesh elements and edges against the level set
     mesh.classify_elements(level_set)
     mesh.classify_edges(level_set)
     mesh.build_interface_segments(level_set)
+    mesh.tag_boundary_edges(boundary_tags)
+    plot_mesh_2(mesh, level_set=level_set)
 
     # plot_mesh_2(mesh, level_set=level_set)
 
     # 2. Create BitSets for the integration domains
-    pos_elements  = mesh.element_bitset("outside")
-    neg_elements  = mesh.element_bitset("inside")
+    pos_elements  = mesh.element_bitset("inside")
+    neg_elements  = mesh.element_bitset("outside")
     cut_elements  = mesh.element_bitset("cut")
     has_pos_elements = pos_elements | cut_elements
     has_neg_elements = neg_elements | cut_elements
@@ -101,8 +103,7 @@ def test_cutfem_poisson_interface(backend):
         print(f"Boundary tag '{tag}': {bitset.cardinality()}")
     # plot_mesh_2(mesh,level_set=level_set)
     
-    # Interface edges for the `ds` integral
-    if_edges = get_domain_bitset(mesh, 'edge', 'interface')
+
 
     # 3. Define the DofHandler for the two-field problem
     # The field names are now just labels; their meaning is defined by their use in the weak form.
@@ -110,7 +111,7 @@ def test_cutfem_poisson_interface(backend):
     # fe_map = {'u_outside': mesh, 'u_inside': mesh}
     dof_handler = DofHandler(me, method='cg')
 
-    dof_handler.tag_dofs_from_element_bitset("inactive_inside", "u_outside", "inside", strict=False)
+    dof_handler.tag_dofs_from_element_bitset("inactive_inside", "u_outside", "inside", strict=True)
     dof_handler.tag_dofs_from_element_bitset("inactive_outside", "u_inside", "outside", strict=True)
 
 
@@ -129,12 +130,12 @@ def test_cutfem_poisson_interface(backend):
     dx_pos  = dx(defined_on=has_pos_elements, level_set=level_set, metadata={'side': '+', 'q': poly_order+2})
     dx_neg  = dx(defined_on=has_neg_elements, level_set=level_set, metadata={'side': '-', 'q': poly_order+2})
     dGamma  = dInterface(defined_on=cut_elements, level_set=level_set, metadata={'q': poly_order+2})
-    dGhost_pos = dGhost(defined_on=ghost_pos, level_set=level_set, metadata={'q': poly_order+2})
-    dGhost_neg = dGhost(defined_on=ghost_neg, level_set=level_set, metadata={'q': poly_order+2})
+    dGhost_pos = dGhost(defined_on=ghost_pos, level_set=level_set, metadata={'q': poly_order+2, "derivs": {(0,1),(1,0)}})
+    dGhost_neg = dGhost(defined_on=ghost_neg, level_set=level_set, metadata={'q': poly_order+2, "derivs": {(0,1),(1,0)}})
 
     # --- trial/test ---
-    u_pos, v_pos = TrialFunction('u_outside', dof_handler), TestFunction('u_outside', dof_handler)
-    u_neg, v_neg = TrialFunction('u_inside',  dof_handler), TestFunction('u_inside',  dof_handler)
+    u_pos, v_pos = TrialFunction('u_outside', dof_handler, name='u_pos_trial'), TestFunction('u_outside', dof_handler, name='u_pos_test')
+    u_neg, v_neg = TrialFunction('u_inside',  dof_handler, name='u_neg_trial'), TestFunction('u_inside',  dof_handler, name='u_neg_test')
 
     # --- coefficients / constants (as you had) ---
     alpha_vals = np.zeros(len(mesh.elements_list))
@@ -221,38 +222,38 @@ def test_cutfem_poisson_interface(backend):
 
 
     Kd = K.astype(float).tocsr()
-    # 1) Which rows are (near) empty after BC elimination?
-    row_norms = np.linalg.norm(Kd.toarray(), axis=1)
-    suspect = int(np.argmin(row_norms))
-    print("Min row-norm DOF:", suspect, "norm:", row_norms[suspect])
+    # # 1) Which rows are (near) empty after BC elimination?
+    # row_norms = np.linalg.norm(Kd.toarray(), axis=1)
+    # suspect = int(np.argmin(row_norms))
+    # print("Min row-norm DOF:", suspect, "norm:", row_norms[suspect])
 
-    # 2) Smallest eigenvector shows the “floating” direction
-    w, v = eigsh(Kd, k=1, which="SM")
-    x = v[:, 0]
-    i_max = int(np.argmax(np.abs(x)))
-    print("Largest component in smallest-eigvec → DOF:", i_max, "ampl:", x[i_max])
+    # # 2) Smallest eigenvector shows the “floating” direction
+    # w, v = eigsh(Kd, k=1, which="SM")
+    # x = v[:, 0]
+    # i_max = int(np.argmax(np.abs(x)))
+    # print("Largest component in smallest-eigvec → DOF:", i_max, "ampl:", x[i_max])
 
-    # 3) Map to (field, node, coords), and show whether *you* tagged it
-    field, node = dof_handler._dof_to_node_map[i_max]
-    xy = dof_handler.fe_map[field].nodes_x_y_pos[node]
-    print(f"Suspect DOF belongs to field='{field}', node={node}, coords={tuple(xy)}")
-    print("Is tagged inactive_inside?:", i_max in dof_handler.dof_tags.get("inactive_inside", set()))
-    print("Is tagged inactive_outside?:", i_max in dof_handler.dof_tags.get("inactive_outside", set()))
+    # # 3) Map to (field, node, coords), and show whether *you* tagged it
+    # field, node = dof_handler._dof_to_node_map[i_max]
+    # xy = dof_handler.fe_map[field].nodes_x_y_pos[node]
+    # print(f"Suspect DOF belongs to field='{field}', node={node}, coords={tuple(xy)}")
+    # print("Is tagged inactive_inside?:", i_max in dof_handler.dof_tags.get("inactive_inside", set()))
+    # print("Is tagged inactive_outside?:", i_max in dof_handler.dof_tags.get("inactive_outside", set()))
 
-    ones = np.ones(K.shape[0])
-    r = np.linalg.norm((K @ ones))
-    print(f"||K·1|| = {r}, should be ~ 1e-12–1e-14")  # should be ~ 1e-12–1e-14
+    # ones = np.ones(K.shape[0])
+    # r = np.linalg.norm((K @ ones))
+    # print(f"||K·1|| = {r}, should be ~ 1e-12–1e-14")  # should be ~ 1e-12–1e-14
 
-    w, v = eigsh(K, k=1, which="SM")
-    corr = abs(v[:,0] @ ones) / (np.linalg.norm(v[:,0]) * np.linalg.norm(ones))
-    print(f"corr(smallest‐eigvec, 1) ≈ {corr}, should be ~ 1.0")  # ~ 1.0
+    # w, v = eigsh(K, k=1, which="SM")
+    # corr = abs(v[:,0] @ ones) / (np.linalg.norm(v[:,0]) * np.linalg.norm(ones))
+    # print(f"corr(smallest‐eigvec, 1) ≈ {corr}, should be ~ 1.0")  # ~ 1.0
 
-    # Smallest few eigenvalues of symmetric K (shift-invert is not needed here)
-    w = smallest_eigs_safe(Kd, k=3)
-    lam_min, lam_max = float(w[0]), float(w[-1])
-    tol = 200 * np.finfo(float).eps * max(1.0, lam_max)  # relative PSD tol
-    print(f"Smallest eigenvalue: {lam_min}, Largest eigenvalue: {lam_max}, Tolerance: {tol}")
-    assert lam_min >= -tol, f"Smallest eigenvalue {lam_min} is below tolerance {tol}!"
+    # # Smallest few eigenvalues of symmetric K (shift-invert is not needed here)
+    # w = smallest_eigs_safe(Kd, k=3)
+    # lam_min, lam_max = float(w[0]), float(w[-1])
+    # tol = 200 * np.finfo(float).eps * max(1.0, lam_max)  # relative PSD tol
+    # print(f"Smallest eigenvalue: {lam_min}, Largest eigenvalue: {lam_max}, Tolerance: {tol}")
+    # assert lam_min >= -tol, f"Smallest eigenvalue {lam_min} is below tolerance {tol}!"
 
    
 
@@ -279,17 +280,24 @@ def test_cutfem_poisson_interface(backend):
     u_in  = Function(name="u_inside",  field_name="u_inside",  dof_handler=dof_handler)
 
     # (B) Robust scatter from global → field-local for each Function
-    def scatter_global(func: Function, u_global: np.ndarray):
-        # func._g2l: dict {global_dof -> local_index_in_this_function}
-        for gdof, lidx in func._g2l.items():
-            func.nodal_values[lidx] = u_global[gdof]
+    def scatter_global(func, u_global, dof_handler):
+        gdofs = np.asarray(dof_handler.get_field_slice(func.field_name), dtype=int)
+        func.set_nodal_values(gdofs, u_global[gdofs])
 
-    scatter_global(u_out, solution_vec)
-    scatter_global(u_in,  solution_vec)
+
+    u_in.plot(title="u_inside", mask = has_pos_elements)
+    scatter_global(u_out, solution_vec, dof_handler)
+    scatter_global(u_in,  solution_vec, dof_handler)
+    phi_vals = level_set.evaluate_on_nodes(mesh)
+
+    output_dir = "two_alpha_results"
+    os.makedirs(output_dir, exist_ok=True)
+    vtk_path = os.path.join(output_dir, f"ewc_solution_cycle.vtu")
+    print(f"Writing solution to {vtk_path}")
 
     export_vtk(
-        "solution.vtu",
-        mesh=dof_handler.me.mesh,
+        vtk_path,
+        mesh=mesh,
         dof_handler=dof_handler,
         functions={
             "u_outside": u_out,

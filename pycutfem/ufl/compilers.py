@@ -477,25 +477,34 @@ class FormCompiler:
             return op_val * 0.0 
         return self._visit(n.operand) 
 
-    def _visit_Jump(self, n: Jump): 
-        """Robustly evaluates jump(u) = u(+) - u(-) across an interface.""" 
-        phi_orig = self.ctx.get('phi_val') 
-        eid_orig  = self.ctx.get('eid')
-        # --- Evaluate positive side trace u(+) ---
-        self.ctx['eid']     = self.ctx.get('pos_eid')
-        self.ctx['phi_val'] = 1.0 # Force context to be on the '+' side 
-        u_pos = self._visit(n.u_pos) # This will call _visit_Pos 
-        # --- Evaluate negative side trace u(-) ---
-        self.ctx['eid']     = self.ctx.get('neg_eid')
-        self.ctx['phi_val'] = -1.0 # Force context to be on the '-' side 
-        u_neg = self._visit(n.u_neg) # This will call _visit_Neg 
-        # --- Restore context and return difference ---
-        self.ctx['phi_val'] = phi_orig 
-        if eid_orig is not None:
-            self.ctx['eid'] = eid_orig
-        else:
-            self.ctx.pop('eid', None)
-        return u_pos - u_neg 
+    def _visit_Jump(self, n: Jump):
+        phi_old  = self.ctx.get('phi_val', 0.0)
+        eid_old  = self.ctx.get('eid')
+        side_old = self.ctx.get('side')
+
+        # u(+)  on the + side / pos_eid
+        self.ctx['phi_val'] =  1.0
+        self.ctx['side']    = '+'
+        if 'pos_eid' in self.ctx:
+            self.ctx['eid'] = self.ctx['pos_eid']
+        u_pos = self._visit(n.u_pos)
+
+        # u(-)  on the – side / neg_eid
+        self.ctx['phi_val'] = -1.0
+        self.ctx['side']    = '-'
+        if 'neg_eid' in self.ctx:
+            self.ctx['eid'] = self.ctx['neg_eid']
+        u_neg = self._visit(n.u_neg)
+
+        # restore
+        self.ctx['phi_val'] = phi_old
+        if eid_old is None: self.ctx.pop('eid', None)
+        else:               self.ctx['eid'] = eid_old
+        if side_old is None: self.ctx.pop('side', None)
+        else:                self.ctx['side'] = side_old
+
+        return u_pos - u_neg
+
 ###########################################################################################3
 ########### --- Functions and VectorFunctions (evaluated to numerical values) ---
     def _visit_Function(self, n: Function):

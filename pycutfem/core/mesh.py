@@ -198,8 +198,16 @@ class Mesh:
         """
         phi_nodes = level_set.evaluate_on_nodes(self)
         for edge in self.edges_list:
-            # Reset tag to avoid state from previous classifications
+            if edge.right is None:
+                # Boundary edge: KEEP whatever tag the mesh generator gave
+                # (e.g., 'left', 'right', 'top', 'bottom' or 'boundary').
+                # If you also want to auto-fill when missing, you can set a
+                # default like: edge.tag = edge.tag or 'boundary'
+                continue
+
+            # Interior edge -> safe to reset and classify
             edge.tag = ''
+            
 
             # --- Classification for INTERIOR edges based on element tags ---
             if edge.right is not None:
@@ -294,13 +302,18 @@ class Mesh:
             # After calculating all intersections and removing duplicates, only
             # proceed if we have exactly two points. Otherwise, it's a
             # degenerate case (grazing a node, etc.), which we filter out.
-            if len(unique_pts) == 2:
-                # Sort points for reproducibility and assign them.
-                unique_pts.sort(key=lambda P: (P[0], P[1]))
-                elem.interface_pts = unique_pts
+            if len(unique_pts) >= 2:
+                # Pick the longest chord across the collected points.
+                # This handles {2,3,4}-point degeneracies (grazing a node / lying on an edge).
+                P = np.asarray(unique_pts, float)
+                # pairwise distances
+                d2 = ((P[:,None,:]-P[None,:,:])**2).sum(axis=2)
+                i, j = divmod(int(d2.argmax()), d2.shape[1])
+                pts = [tuple(P[i]), tuple(P[j])]
+                # Sort for reproducibility and assign
+                pts.sort(key=lambda Q: (Q[0], Q[1]))
+                elem.interface_pts = pts
             else:
-                # If we don't have exactly two points, treat this element as
-                # not having a valid cut segment.
                 elem.interface_pts = []
 
     def edge_bitset(self, tag: str) -> BitSet:
