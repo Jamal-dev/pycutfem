@@ -89,8 +89,8 @@ def test_cutfem_poisson_interface(backend):
     # plot_mesh_2(mesh, level_set=level_set)
 
     # 2. Create BitSets for the integration domains
-    pos_elements  = mesh.element_bitset("inside")
-    neg_elements  = mesh.element_bitset("outside")
+    neg_elements  = mesh.element_bitset("inside")
+    pos_elements  = mesh.element_bitset("outside")
     cut_elements  = mesh.element_bitset("cut")
     has_pos_elements = pos_elements | cut_elements
     has_neg_elements = neg_elements | cut_elements
@@ -169,8 +169,8 @@ def test_cutfem_poisson_interface(backend):
 
     # --- CORRECT ghost stabilization: interior jump on each side separately ---
     #     i.e., [∇u_pos]·[∇v_pos] on ghost faces of the + side, and similarly for - side
-    a += gamma_G * h * inner(Jump(grad(u_pos)), Jump(grad(v_pos))) * dGhost_pos
-    a += gamma_G * h * inner(Jump(grad(u_neg)), Jump(grad(v_neg))) * dGhost_neg
+    a += gamma_G * h * inner(Jump(grad(u_pos), grad(u_neg)), Jump(grad(v_pos), grad(v_neg))) * dGhost_pos
+    a += gamma_G * h * inner(Jump(grad(u_pos), grad(u_neg)), Jump(grad(v_pos), grad(v_neg))) * dGhost_neg
 
     # --- Interface Nitsche terms (unchanged algebra) ---
     jump_u = Jump(u_pos, u_neg)

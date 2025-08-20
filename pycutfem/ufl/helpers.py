@@ -898,3 +898,181 @@ def analyze_active_dofs(equation: Equation, dh: DofHandler, me: MixedElement, bc
     else:
         print("No Restriction operators found. All DOFs are considered active.")
         return np.arange(dh.total_dofs, dtype=int), False
+
+from pycutfem.fem.transform import jacobian, element_forward_F2_F3, _hess_inverse_from_Hx, inverse_A3_material
+from pycutfem.fem import transform
+
+def phys_scalar_third_row(me, fld: str, xi: float, eta: float, i: int, j: int, k: int, mesh, elem_id: int) -> np.ndarray:
+    """
+    Build the (n_loc,) row for the 3rd-order physical derivative ∂^3/∂x^i ∂x^j ∂x^k of scalar field 'fld'
+    at the reference point (xi,eta) in element elem_id.
+
+      f_{ijk} = g_{IJK} A^I_i A^J_j A^K_k
+              + g_{IJ} ( A^I_{ij} A^J_k + A^I_{ik} A^J_j + A^I_{jk} A^J_i )
+              + g_I A^I_{ijk}
+
+    where g_* are *reference* derivatives of the basis functions.
+    """
+    # Geometry
+    J = jacobian(mesh, elem_id, (xi, eta))
+    A = np.linalg.inv(J)
+
+    # Forward-map tensors and inverse jets
+    F2, F3 = element_forward_F2_F3(mesh, elem_id, (xi, eta))
+    Hxi0, Hxi1 = _hess_inverse_from_Hx(A, F2[0], F2[1])  # A2[I,:,:]
+    A2 = np.stack([Hxi0, Hxi1], axis=0)
+    A3 = inverse_A3_material(A, F2, F3)
+
+    # Reference derivatives (vectors length = n_loc)
+    g1_xi  = me.deriv_ref(fld, xi, eta, 1, 0)
+    g1_eta = me.deriv_ref(fld, xi, eta, 0, 1)
+
+    g2_xx  = me.deriv_ref(fld, xi, eta, 2, 0)
+    g2_xy  = me.deriv_ref(fld, xi, eta, 1, 1)
+    g2_yy  = me.deriv_ref(fld, xi, eta, 0, 2)
+
+    # 3rd-order by counts
+    g3_300 = me.deriv_ref(fld, xi, eta, 3, 0)
+    g3_210 = me.deriv_ref(fld, xi, eta, 2, 1)
+    g3_120 = me.deriv_ref(fld, xi, eta, 1, 2)
+    g3_030 = me.deriv_ref(fld, xi, eta, 0, 3)
+
+    # helpers to index tensors by (I,J,K)
+    def g3(I, J, K):
+        s = I + J + K          # with ξ→0, η→1
+        if s == 0:   return g3_300
+        if s == 3:   return g3_030
+        if s == 1:   return g3_210   # two ξ, one η
+        return g3_120                 # one ξ, two η
+
+    g1 = [g1_xi, g1_eta]
+    g2 = [[g2_xx, g2_xy],
+          [g2_xy, g2_yy]]
+
+    nloc = g1_xi.shape[0]
+    row  = np.zeros(nloc, dtype=float)
+
+    # Top term: g_{IJK} A^I_i A^J_j A^K_k
+    for I in (0, 1):
+        for J2 in (0, 1):
+            for K2 in (0, 1):
+                row += g3(I, J2, K2) * A[I, i] * A[J2, j] * A[K2, k]
+
+    # Middle term: g_{IJ} ( A^I_{ij} A^J_k + A^I_{ik} A^J_j + A^I_{jk} A^J_i )
+    for I in (0, 1):
+        for J2 in (0, 1):
+            row += g2[I][J2] * ( A2[I, i, j] * A[J2, k]
+                                + A2[I, i, k] * A[J2, j]
+                                + A2[I, j, k] * A[J2, i] )
+
+    # Last term: g_I A^I_{ijk}
+    for I in (0, 1):
+        row += g1[I] * A3[I, i, j, k]
+
+    return row
+
+
+
+def phys_scalar_fourth_row(me, fld: str, xi: float, eta: float,
+                           i: int, j: int, k: int, l: int,
+                           mesh, elem_id: int) -> np.ndarray:
+    """
+    Row (length n_loc) for  ∂^4/∂x^i ∂x^j ∂x^k ∂x^l  of scalar field 'fld' at (xi,eta), element elem_id.
+
+    f_{ijkl} = g_{IJKL} A^I_i A^J_j A^K_k A^L_l
+             + g_{IJK}  sum_{2+1+1} (...)
+             + g_{IJ}   ( A^I_{ij}A^J_{kl} + A^I_{ik}A^J_{jl} + A^I_{il}A^J_{jk}
+                         + A^I_{ijk}A^J_l + A^I_{ijl}A^J_k + A^I_{ikl}A^J_j + A^I_{jkl}A^J_i )
+             + g_I      A^I_{ijkl}.
+    """
+    # Geometry
+    J = jacobian(mesh, elem_id, (xi, eta))
+    A = np.linalg.inv(J)
+
+    # Forward-map tensors
+    F2, F3 = transform.element_forward_F2_F3(mesh, elem_id, (xi, eta))
+    F4     = transform.element_forward_F4(mesh, elem_id, (xi, eta))
+
+    # Inverse jets
+    A2 = transform.hess_inverse_from_forward(A, F2[0], F2[1])  # (2,2,2)
+    A3 = transform.inverse_A3_material(A, F2, F3)              # (2,2,2,2)
+    A4 = transform.inverse_A4_material(A, A2, F2, F3, F4)      # (2,2,2,2,2)
+
+    # Reference derivatives (length = n_loc)
+    g1_xi  = me.deriv_ref(fld, xi, eta, 1, 0)
+    g1_eta = me.deriv_ref(fld, xi, eta, 0, 1)
+
+    g2_xx  = me.deriv_ref(fld, xi, eta, 2, 0)
+    g2_xy  = me.deriv_ref(fld, xi, eta, 1, 1)
+    g2_yy  = me.deriv_ref(fld, xi, eta, 0, 2)
+
+    g3_300 = me.deriv_ref(fld, xi, eta, 3, 0)
+    g3_210 = me.deriv_ref(fld, xi, eta, 2, 1)
+    g3_120 = me.deriv_ref(fld, xi, eta, 1, 2)
+    g3_030 = me.deriv_ref(fld, xi, eta, 0, 3)
+
+    g4_400 = me.deriv_ref(fld, xi, eta, 4, 0)
+    g4_310 = me.deriv_ref(fld, xi, eta, 3, 1)
+    g4_220 = me.deriv_ref(fld, xi, eta, 2, 2)
+    g4_130 = me.deriv_ref(fld, xi, eta, 1, 3)
+    g4_040 = me.deriv_ref(fld, xi, eta, 0, 4)
+
+    # small helpers to select the right reference tensor by index counts
+    def g3(I, J, K):
+        s = I + J + K
+        if   s == 0: return g3_300
+        elif s == 1: return g3_210
+        elif s == 2: return g3_120
+        else:        return g3_030
+
+    def g4(I, J, K, L):
+        s = I + J + K + L
+        if   s == 0: return g4_400
+        elif s == 1: return g4_310
+        elif s == 2: return g4_220
+        elif s == 3: return g4_130
+        else:        return g4_040
+
+    g1 = [g1_xi, g1_eta]
+    g2 = [[g2_xx, g2_xy],
+          [g2_xy, g2_yy]]
+
+    nloc = g1_xi.shape[0]
+    row  = np.zeros(nloc, dtype=float)
+
+    # 1) g_{IJKL} A^I_i A^J_j A^K_k A^L_l
+    for I0 in (0, 1):
+        for J0 in (0, 1):
+            for K0 in (0, 1):
+                for L0 in (0, 1):
+                    row += g4(I0, J0, K0, L0) * A[I0, i] * A[J0, j] * A[K0, k] * A[L0, l]
+
+    # 2) g_{IJK} (six 2+1+1 terms)
+    for I0 in (0, 1):
+        for J0 in (0, 1):
+            for K0 in (0, 1):
+                G3 = g3(I0, J0, K0)
+                row += G3 * ( A2[I0, i, j] * A[J0, k] * A[K0, l]
+                            + A2[I0, i, k] * A[J0, j] * A[K0, l]
+                            + A2[I0, i, l] * A[J0, j] * A[K0, k]
+                            + A2[I0, j, k] * A[J0, i] * A[K0, l]
+                            + A2[I0, j, l] * A[J0, i] * A[K0, k]
+                            + A2[I0, k, l] * A[J0, i] * A[K0, j] )
+
+    # 3) g_{IJ} (pair+pair and 3+1 terms)
+    for I0 in (0, 1):
+        for J0 in (0, 1):
+            G2 = g2[I0][J0]
+            row += G2 * ( A2[I0, i, j] * A2[J0, k, l]
+                        + A2[I0, i, k] * A2[J0, j, l]
+                        + A2[I0, i, l] * A2[J0, j, k] )
+            row += G2 * ( A3[I0, i, j, k] * A[J0, l]
+                        + A3[I0, i, j, l] * A[J0, k]
+                        + A3[I0, i, k, l] * A[J0, j]
+                        + A3[I0, j, k, l] * A[J0, i] )
+
+    # 4) g_I A^I_{ijkl}
+    for I0 in (0, 1):
+        row += g1[I0] * A4[I0, i, j, k, l]
+
+    return row

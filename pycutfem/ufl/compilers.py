@@ -20,6 +20,7 @@ from typing import Dict, List, Any, Tuple, Iterable, Mapping, Union
 import logging
 from dataclasses import dataclass
 import math
+from math import comb
 import os
 
 # -------------------------------------------------------------------------
@@ -45,7 +46,7 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
-from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, HessOpInfo, required_multi_indices,_all_fields,_find_all,_trial_test
+from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, HessOpInfo, required_multi_indices,_all_fields,_find_all,_trial_test, phys_scalar_third_row, phys_scalar_fourth_row
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 from pycutfem.ufl.helpers_geom import (
@@ -150,18 +151,38 @@ class FormCompiler:
             if fld in bv[side] and (0, 0) in bv[side][fld]:
                 return bv[side][fld][(0, 0)]
         raise KeyError(f"Basis for field '{fld}' not found.")
-    def _g(self, fld):
-        if fld in self._basis_cache:
-            return self._basis_cache[fld]["grad"]
-
+    def _v(self, fld):
+        # 1) Prefer per-QP, side-aware cache
         bv = self.ctx.get("basis_values")
         if bv is not None:
-            side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
+            side = self.ctx.get("side")
+            if side is None:
+                side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
+            val = bv[side][fld].get((0, 0))
+            if val is not None:
+                return val
+        # 2) Fallback to global cache
+        if fld in self._basis_cache:
+            return self._basis_cache[fld]["val"]
+        # 3) Last resort: compute fresh (element-local)
+        return self._basis_from_element_context(fld, kind="val")
+
+    def _g(self, fld):
+        # 1) Prefer per-QP, side-aware cache
+        bv = self.ctx.get("basis_values")
+        if bv is not None:
+            side = self.ctx.get("side")
+            if side is None:
+                side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
             gx = bv[side][fld].get((1, 0))
             gy = bv[side][fld].get((0, 1))
             if gx is not None and gy is not None:
-                return np.stack([gx, gy], axis=1)
-        raise KeyError(f"Gradient for field '{fld}' not found.")
+                return np.stack([gx, gy], axis=1)  # (nloc, 2)
+        # 2) Fallback to global cache
+        if fld in self._basis_cache:
+            return self._basis_cache[fld]["grad"]
+        # 3) Last resort: compute fresh (element-local)
+        return self._basis_from_element_context(fld, kind="grad")
     def _hess(self, fld):
         """
         Return the physical 2x2 Hessian tensor table for the scalar field `fld`
@@ -1579,179 +1600,266 @@ class FormCompiler:
                 self.ctx.pop(key, None) # New
             log.debug("Interface assembly finished. Context cleaned.") # New
     
+    def _phys_scalar_deriv_row(self, fld: str, xi: float, eta: float,
+                           ox: int, oy: int, eid: int) -> np.ndarray:
+        """
+        Return a length-(nloc_elem) row for D^{(ox,oy)} of scalar field 'fld' in physical coords.
+        Exact for orders 0,1 and exact for order 2 (includes inverse-map curvature).
+        """
+        me = self.me
+        # Values/first derivatives fast path
+        if ox == 0 and oy == 0:
+            return me.deriv_ref(fld, xi, eta, 0, 0)
+
+        # Geometry at qp (J, A, inverse-map Hessians)
+        J, A, Hxi, Heta = transform.element_inverse_hessians(self.me.mesh, eid, (xi, eta))  # :contentReference[oaicite:9]{index=9}
+
+        if ox + oy == 1:
+            # grad_ref (ξ,η) → (x,y): ∇_ref @ A, then pick x or y
+            dN_dxi  = me.deriv_ref(fld, xi, eta, 1, 0)
+            dN_deta = me.deriv_ref(fld, xi, eta, 0, 1)
+            if (ox, oy) == (1, 0):  # ∂/∂x
+                return dN_dxi * A[0, 0] + dN_deta * A[1, 0]
+            else:                   # (0,1): ∂/∂y
+                return dN_dxi * A[0, 1] + dN_deta * A[1, 1]
+
+        if ox + oy == 2:
+            # Build the exact order-2 terms
+            dN_xi    = me.deriv_ref(fld, xi, eta, 1, 0)
+            dN_eta   = me.deriv_ref(fld, xi, eta, 0, 1)
+            dN_xixi  = me.deriv_ref(fld, xi, eta, 2, 0)
+            dN_xieta = me.deriv_ref(fld, xi, eta, 1, 1)
+            dN_etaeta= me.deriv_ref(fld, xi, eta, 0, 2)
+
+            def second(i, j):
+                # First (Hessian × A × A) contraction
+                Axi_i,  Aeta_i = A[0, i], A[1, i]
+                Axi_j,  Aeta_j = A[0, j], A[1, j]
+                term1 = (dN_xixi   * (Axi_i*Axi_j)
+                    + dN_xieta  * (Axi_i*Aeta_j + Aeta_i*Axi_j)
+                    + dN_etaeta * (Aeta_i*Aeta_j))
+                # Curvature (gradient ⋅ A_{,ij})
+                Aij = Hxi if j == 0 else Heta      # choose ∂²ξ/∂x_i∂x_j OR ∂²η/∂x_i∂x_j container by column j
+                curv = dN_xi * Aij[0, i] + dN_eta * Aij[1, i]
+                return term1 + curv
+
+            if (ox, oy) == (2, 0):  # ∂²/∂x²
+                return second(0, 0)
+            if (ox, oy) == (1, 1):  # ∂²/∂x∂y
+                return second(0, 1)
+            if (ox, oy) == (0, 2):  # ∂²/∂y²
+                return second(1, 1)
+        if ox + oy == 3:
+            # map (ox,oy) -> ordered (i,j,k) = (x,y) component indices you want
+            # e.g. (3,0) => (0,0,0), (2,1) => (0,0,1), etc.
+            # Then:
+            return phys_scalar_third_row(self.me, fld, xi, eta, i, j, k, self.me.mesh, eid)
+        if ox + oy == 4:
+            # map (ox,oy) to an ordered (i,j,k,l) in {0,1}^4 you want (e.g. (4,0) → (0,0,0,0); (3,1) → (0,0,0,1); etc.)
+            # Example mapping by counts: use i=j=k=0,l=1 for (3,1), etc.
+            return phys_scalar_fourth_row(self.me, fld, xi, eta, i, j, k, l, self.me.mesh, eid)
+
+
+        # Fallback (orders ≥3): binomial chain rule without ∂A terms.
+        k = ox + oy
+        out = np.zeros(me.n_dofs_local, dtype=float)
+        A11, A12, A21, A22 = A[0, 0], A[0, 1], A[1, 0], A[1, 1]
+        for i in range(ox + 1):
+            cx = comb(ox, i) * (A11 ** i) * (A21 ** (ox - i))
+            for j in range(oy + 1):
+                cy = comb(oy, j) * (A12 ** j) * (A22 ** (oy - j))
+                orx = i + j
+                ory = k - orx
+                try:
+                    out += (cx * cy) * me.deriv_ref(fld, xi, eta, orx, ory)
+                except Exception:
+                    # If higher derivatives are not tabulated (default max order = 2), keep the available part.
+                    pass
+        return out
+    
     def _assemble_ghost_edge_python(self, intg: "Integral", matvec):
         """
         Assemble integrals over ghost facets (pure Python path).
 
-        This version:
-        * trusts the provided ghost edge ids except for minimal validity checks;
-        * populates a side-aware basis cache for both (+) and (–);
-        * guarantees all derivative multi-indices needed by the form are present;
-        * orients the facet normal from (–) to (+);
-        * supports scalar-valued functionals via assembler hooks.
+        Key points:
+        • Pads (+) and (–) traces into the union DOF set of the two owner elements.
+        • Guarantees value + first-derivative entries in the basis cache.
+        • Orients the facet normal from (–) to (+).
+        • Supports scalar-valued functionals via assembler hooks.
         """
-        # --------------------------------------------------------- basics
-        rhs  = self.ctx.get("rhs", False)
-        mesh = self.me.mesh
+
+        rhs   = self.ctx.get("rhs", False)
+        mesh  = self.me.mesh
 
         # ---- derivative orders we need (robust) -------------------------
-        md = intg.measure.metadata or {}
-        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
-        derivs |= {(0, 0)}  # always include values
+        md      = intg.measure.metadata or {}
+        derivs  = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0), (1, 0), (0, 1)}  # always have value and ∂x, ∂y
 
-
-        # Close the set up to the maximum total order present.
-        # This prevents KeyError for cross terms like (1,1) in Hessian energies.
+        # Close up to max total order (covers Hessian cross-terms etc.)
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
         for p in range(max_total + 1):
             for ox in range(p + 1):
                 derivs.add((ox, p - ox))
 
-        # ---- which edges -------------------------------------------------
+        # ---- which ghost edges ------------------------------------------
         defined = intg.measure.defined_on
         if defined is None:
             edge_set = mesh.edge_bitset("ghost")
-            edge_ids = (edge_set.to_indices() if hasattr(edge_set, "to_indices")
-                        else list(edge_set))
+            edge_ids = edge_set.to_indices() if hasattr(edge_set, "to_indices") else list(edge_set)
         else:
             edge_ids = defined.to_indices()
 
+        # level set required to choose (+)/(–)
         level_set = getattr(intg.measure, "level_set", None)
         if level_set is None:
             raise ValueError("dGhost measure requires a 'level_set' callable.")
 
-        qdeg = max(self._find_q_order(intg), 2*max_total + 4)  # e.g., 2*2+4 = 8
-        print(f"Assemble Ghost Edge Python: Using quadrature degree: {qdeg}")
-        fields = _all_fields(intg.integrand)
+        # Quadrature degree: safe upper bound
+        qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
 
-        # ---- hook / functional support ----------------------------------
+        # Fields needed (fallbacks if tree-walk misses some due to Jump/Pos/Neg)
+        fields = set(_all_fields(intg.integrand))
         trial, test = _trial_test(intg.integrand)
+        # Add from trial/test if missed
+        for tt in (trial, test):
+            if tt is None:
+                continue
+            if hasattr(tt, "field_names"): fields.update(tt.field_names)
+            elif hasattr(tt, "field_name"): fields.add(tt.field_name)
+        if not fields:
+            # last ditch: include all handler fields
+            fields = set(getattr(self.dh, "field_names", []))
+        fields = sorted(fields)
+
+        # Functional hook support (scalar accumulation)
         hook = self._hook_for(intg.integrand)
         is_functional = (hook is not None and trial is None and test is None)
         if is_functional:
-            self.ctx.setdefault("scalar_results", {})[hook["name"]] = 0.0
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], 0.0)
 
-        # -------------------------------------------------------- main loop
-        for eid_edge in edge_ids:
-            e = mesh.edge(eid_edge)
-            # ghost facets must be interior (two neighbors)
-            if e.right is None:
-                continue
+        # ------------------------ main loop over ghost edges ------------------------
+        try:
+            for eid_edge in map(int, edge_ids):
+                e = mesh.edge(eid_edge)
+                # Ghost facets must be interior (two neighbors)
+                if e.right is None:
+                    continue
 
-            # Keep edges in the narrow band (at least one CUT neighbor),
-            # or edges already tagged as ghost_* by the mesh.
-            lt = mesh.elements_list[e.left].tag
-            rt = mesh.elements_list[e.right].tag
-            etag = str(getattr(e, "tag", ""))
-            if not (("cut" in (lt, rt)) or etag.startswith("ghost")):
-                continue
+                # Narrow band or explicitly tagged as ghost
+                lt = mesh.elements_list[e.left].tag
+                rt = mesh.elements_list[e.right].tag
+                etag = str(getattr(e, "tag", ""))
+                if not (("cut" in (lt, rt)) or etag.startswith("ghost")):
+                    continue
 
-            
-            # Quadrature and oriented normal
-            p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
-            qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
-            # (+) and (–) sides: decide by the left-element φ sign
-            phiL = float(level_set(np.asarray(mesh.elements_list[e.left ].centroid())))
-            phiR = float(level_set(np.asarray(mesh.elements_list[e.right].centroid())))
+                # Choose (+)/(–) by phi at centroids: pos = higher φ, neg = lower φ
+                phiL = float(level_set(np.asarray(mesh.elements_list[e.left ].centroid())))
+                phiR = float(level_set(np.asarray(mesh.elements_list[e.right].centroid())))
+                pos_eid, neg_eid = (e.left, e.right) if phiL >= phiR else (e.right, e.left)
 
-            # pos = higher φ, neg = lower φ  ⇒ normal from (−) → (+)
-            if phiL >= phiR:
-                pos_eid, neg_eid = e.left, e.right
-            else:
-                pos_eid, neg_eid = e.right, e.left
+                # Edge quadrature (physical) and oriented normal (– → +)
+                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+                qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
 
-            # geometric normal, then flip if needed so it points from neg → pos
-            normal_vec = e.normal
-            cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
-            cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
-            if np.dot(normal_vec, cpos - cneg) < 0.0:
-                normal_vec = -normal_vec
+                normal_vec = e.normal.copy()
+                cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
+                cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
+                if np.dot(normal_vec, cpos - cneg) < 0.0:
+                    normal_vec = -normal_vec
 
-            # if np.dot(normal_vec, mesh.elements_list[pos_eid].centroid() - qpts_phys[0]) < 0:
-            #     normal_vec = -normal_vec  # from (–) to (+)
-
-            # Local accumulator & maps
-            if is_functional:
-                loc_accumulator = 0.0
-                global_dofs = pos_map = neg_map = None
-            else:
-                pos_dofs = self.dh.get_elemental_dofs(pos_eid)
-                neg_dofs = self.dh.get_elemental_dofs(neg_eid)
-                global_dofs = np.unique(np.concatenate((pos_dofs, neg_dofs)))
-                pos_map = np.searchsorted(global_dofs, pos_dofs)
-                neg_map = np.searchsorted(global_dofs, neg_dofs)
-                if rhs:
-                    loc_accumulator = np.zeros(len(global_dofs))
+                # Local union DOFs / accumulator
+                if is_functional:
+                    loc_acc = 0.0
+                    global_dofs = pos_map = neg_map = None
                 else:
-                    loc_accumulator = np.zeros((len(global_dofs), len(global_dofs)))
+                    pos_dofs = self.dh.get_elemental_dofs(pos_eid)
+                    neg_dofs = self.dh.get_elemental_dofs(neg_eid)
+                    global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+                    pos_map = np.searchsorted(global_dofs, pos_dofs)
+                    neg_map = np.searchsorted(global_dofs, neg_dofs)
+                    loc_acc = (np.zeros(len(global_dofs))
+                            if rhs else np.zeros((len(global_dofs), len(global_dofs))))
 
-            # ------------------------------------------------- quadrature loop
-            for xq, w in zip(qpts_phys, qwts):
-                # Build the side-aware cache for this qp
-                bv = {"+": {}, "-": {}}
+                # ---------------- QP loop ----------------
+                for xq, w in zip(qpts_phys, qwts):
+                    bv = {"+": {}, "-": {}}  # side-aware, padded to union if not functional
 
-                for side, eid in (("+", pos_eid), ("-", neg_eid)):
-                    xi, eta = transform.inverse_mapping(mesh, eid, xq)
-                    J      = transform.jacobian(mesh, eid, (xi, eta))
-                    J_inv  = np.linalg.inv(J)
+                    for side, eid, amap in (("+", pos_eid, None if is_functional else pos_map),
+                                            ("-", neg_eid, None if is_functional else neg_map)):
+                        xi, eta = transform.inverse_mapping(mesh, eid, xq)
+                        J  = transform.jacobian(mesh, eid, (xi, eta))
+                        Ji = np.linalg.inv(J)
 
-                    # axis-aligned / structured assumption
-                    sx, sy = J_inv[0, 0], J_inv[1, 1]
+                        # NOTE: proper push-forward for grads/tensors will come in step (2).
+                        # For now, basis/grad cache matches other python paths (grad = ref @ Ji).
+                        for fld in fields:
+                            # (n_loc_elem,) and (n_loc_elem,2)
+                            val  = self.me.basis(fld, xi, eta)
+                            grad = self.me.grad_basis(fld, xi, eta) @ Ji
 
-                    for fld in fields:
-                        fld_cache = {}
-                        for ox, oy in derivs:
-                            ref_val  = self.me.deriv_ref(fld, xi, eta, ox, oy)  # (n_loc,)
-                            phys_val = ref_val * (sx ** ox) * (sy ** oy)
-
-                            if is_functional:
-                                # (n_loc,) is fine for functionals
-                                fld_cache[(ox, oy)] = phys_val
-                            else:
-                                # pad to union with zeros on the other side
-                                full = np.zeros(len(global_dofs))
-                                if side == "+":
-                                    full[pos_map] = phys_val
+                            # Populate required multi-indices
+                            fcache = {}
+                            for (ox, oy) in derivs:
+                                if   ox == 0 and oy == 0: ref = val
+                                elif ox == 1 and oy == 0: ref = grad[:, 0]
+                                elif ox == 0 and oy == 1: ref = grad[:, 1]
                                 else:
-                                    full[neg_map] = phys_val
-                                fld_cache[(ox, oy)] = full
+                                    # Higher orders not on ghost path yet; fall back to zeros
+                                    ref = np.zeros_like(val)
 
-                        bv[side][fld] = fld_cache
+                                if is_functional:
+                                    fcache[(ox, oy)] = ref  # per-element length
+                                else:
+                                    full = np.zeros(len(global_dofs))
+                                    full[amap] = ref
+                                    fcache[(ox, oy)] = full
 
-                # Context for visitors
-                self.ctx.update({
-                    "basis_values": bv,
-                    "normal": normal_vec,
-                    "phi_val": level_set(xq),
-                    "x_phys": xq,
-                    "pos_eid": pos_eid,
-                    "neg_eid": neg_eid,
-                })
-                if not is_functional:
+                            bv[side][fld] = fcache
+
+                    # Context for visitors
                     self.ctx.update({
-                        "global_dofs": global_dofs,
-                        "pos_map": pos_map,
-                        "neg_map": neg_map,
+                        "basis_values": bv,
+                        "normal": normal_vec,
+                        "phi_val": level_set(xq),
+                        "x_phys": xq,
+                        "pos_eid": pos_eid, "neg_eid": neg_eid,
                     })
+                    if not is_functional:
+                        self.ctx.update({
+                            "global_dofs": global_dofs,
+                            "pos_map": pos_map, "neg_map": neg_map,
+                        })
 
-                # Evaluate integrand and accumulate
-                integrand_val = self._visit(intg.integrand)
-                loc_accumulator += w * integrand_val
+                    # Evaluate integrand and accumulate
+                    val = self._visit(intg.integrand)
+                    if is_functional:
+                        # Reduce to scalar robustly
+                        if isinstance(val, VecOpInfo):
+                            v = float(np.sum(val.data))
+                        else:
+                            arr = np.asarray(val)
+                            v = float(arr if arr.ndim == 0 else arr.sum())
+                        loc_acc += w * v
+                    else:
+                        loc_acc += w * np.asarray(val)
 
-            # ----------------------------------------------- scatter / finalize
-            if is_functional:
-                self.ctx["scalar_results"][hook["name"]] += loc_accumulator
-            else:
-                if not rhs:
-                    r, c = np.meshgrid(global_dofs, global_dofs, indexing="ij")
-                    matvec[r, c] += loc_accumulator
+                # Scatter
+                if is_functional:
+                    self.ctx["scalar_results"][hook["name"]] += loc_acc
                 else:
-                    np.add.at(matvec, global_dofs, loc_accumulator)
+                    if rhs:
+                        np.add.at(matvec, global_dofs, loc_acc)
+                    else:
+                        r, c = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                        matvec[r, c] += loc_acc
 
-        # ----------------------------------------------- cleanup context keys
-        for k in ("basis_values", "normal", "phi_val", "x_phys",
-                "global_dofs", "pos_map", "neg_map", "pos_eid", "neg_eid"):
-            self.ctx.pop(k, None)
+        finally:
+            # Clean context keys we may have set
+            for k in ("basis_values", "normal", "phi_val", "x_phys",
+                    "global_dofs", "pos_map", "neg_map", "pos_eid", "neg_eid"):
+                self.ctx.pop(k, None)
+
 
     
 
