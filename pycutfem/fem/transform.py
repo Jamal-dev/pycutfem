@@ -5,6 +5,17 @@ import numpy as np
 from pycutfem.fem.reference import get_reference
 from functools import lru_cache
 import warnings
+from typing import Tuple, Dict, Any
+
+# ---------- small utilities ----------
+
+def _q(x: float, ndp: int = 14) -> float:
+    """Quantize a float for cache keys (robust to tiny FP noise)."""
+    return float(round(x, ndp))
+
+def _key(mesh, elem_id: int, xi: float, eta: float) -> tuple:
+    """Cache key per element & reference point."""
+    return (id(mesh), elem_id, _q(xi), _q(eta), getattr(mesh, "poly_order", None))
 
 def _shape_and_grad(ref, xi_eta):
     xi,eta=xi_eta
@@ -263,7 +274,7 @@ def element_Hxi(mesh, elem_id: int, xi_eta: tuple[float,float]):
     Hxi0 = ∂²ξ/∂x∂x, Hxi1 = ∂²η/∂x∂x.
     """
     xi, eta = xi_eta
-    ref = get_reference(mesh.element_type, mesh.poly_order)
+    ref = get_reference(mesh.element_type, mesh.poly_order, max_deriv_order=2)
 
     # Standard Jacobian and its inverse
     J = jacobian(mesh, elem_id, (xi, eta))          # (2,2)
@@ -325,7 +336,7 @@ def element_inverse_hessians(mesh, elem_id: int, xi_eta: tuple[float, float]):
     Returns: (J, A, Hxi, Heta), each H·· is a 2x2 array of ∂²(ξ or η)/∂x².
     """
     xi, eta = xi_eta
-    ref = get_reference(mesh.element_type, mesh.poly_order)  
+    ref = get_reference(mesh.element_type, mesh.poly_order, max_deriv_order=2)  
 
     J = jacobian(mesh, elem_id, (xi, eta))                   # (2,2)  
     A = np.linalg.inv(J)
@@ -351,19 +362,22 @@ def element_inverse_hessians(mesh, elem_id: int, xi_eta: tuple[float, float]):
     Hxi, Heta = _inverse_hessian_from_forward(A, Hx0, Hx1)
     return J, A, Hxi, Heta
 
-# ---------- Forward-map material derivatives up to 3rd (as before) ----------
-def element_forward_F2_F3(mesh, elem_id: int, xi_eta: Tuple[float, float]) -> tuple[np.ndarray, np.ndarray]:
+# ---------- forward-map (material) derivatives up to order 4 ----------
+
+def element_forward_F2_F3(mesh, elem_id: int, xi_eta: Tuple[float, float]
+                          ) -> tuple[np.ndarray, np.ndarray]:
+    """F2[β,L,M], F3[β,L,M,N] at (xi,eta)."""
     xi, eta = xi_eta
     ref = get_reference(mesh.element_type, mesh.poly_order, max_deriv_order=3)
 
     conn = mesh.elements_connectivity[elem_id]
     gidx = mesh.nodes[conn]
     X = mesh.nodes_x_y_pos[gidx].astype(float)   # (nGeom, 2)
+    X0, X1 = X[:, 0], X[:, 1]
 
-    # 2nd derivatives via Hessians
+    # 2nd derivatives via Hessian
     HN = np.asarray(ref.hess(xi, eta))           # (nGeom, 2, 2)
     d20 = HN[:, 0, 0]; d11 = HN[:, 0, 1]; d02 = HN[:, 1, 1]
-    X0, X1 = X[:, 0], X[:, 1]
 
     Hx0 = np.array([[np.dot(d20, X0), np.dot(d11, X0)],
                     [np.dot(d11, X0), np.dot(d02, X0)]], dtype=float)
@@ -374,18 +388,18 @@ def element_forward_F2_F3(mesh, elem_id: int, xi_eta: Tuple[float, float]) -> tu
     F2[0] = Hx0
     F2[1] = Hx1
 
-    # 3rd derivatives (fill by multi-index counts)
+    # 3rd derivatives (fill by counts)
     d30 = np.asarray(ref.derivative(xi, eta, 3, 0))
     d21 = np.asarray(ref.derivative(xi, eta, 2, 1))
     d12 = np.asarray(ref.derivative(xi, eta, 1, 2))
     d03 = np.asarray(ref.derivative(xi, eta, 0, 3))
 
-    def F3_for_beta(coords_1d: np.ndarray) -> np.ndarray:
+    def F3_for(coords_1d: np.ndarray) -> np.ndarray:
         v30 = float(np.dot(d30, coords_1d))
         v21 = float(np.dot(d21, coords_1d))
         v12 = float(np.dot(d12, coords_1d))
         v03 = float(np.dot(d03, coords_1d))
-        T = np.empty((2, 2, 2), dtype=float)
+        T = np.empty((2, 2, 2), float)
         T[0,0,0] = v30
         T[0,0,1] = T[0,1,0] = T[1,0,0] = v21
         T[0,1,1] = T[1,0,1] = T[1,1,0] = v12
@@ -393,79 +407,73 @@ def element_forward_F2_F3(mesh, elem_id: int, xi_eta: Tuple[float, float]) -> tu
         return T
 
     F3 = np.empty((2, 2, 2, 2), float)
-    F3[0] = F3_for_beta(X0)
-    F3[1] = F3_for_beta(X1)
-
+    F3[0] = F3_for(X0)
+    F3[1] = F3_for(X1)
     return F2, F3
 
 
-# ---------- 4th-order forward-map material derivatives ----------
 def element_forward_F4(mesh, elem_id: int, xi_eta: Tuple[float, float]) -> np.ndarray:
-    """
-    F4[beta, L, M, N, P] = ∂^4 x_beta / ∂X^L ∂X^M ∂X^N ∂X^P   (symmetric in L,M,N,P).
-    """
+    """F4[β,L,M,N,P] at (xi,eta). Zeros automatically for Q2 beyond supported counts."""
     xi, eta = xi_eta
     ref = get_reference(mesh.element_type, mesh.poly_order, max_deriv_order=4)
 
     conn = mesh.elements_connectivity[elem_id]
     gidx = mesh.nodes[conn]
     X = mesh.nodes_x_y_pos[gidx].astype(float)   # (nGeom, 2)
+    X0, X1 = X[:, 0], X[:, 1]
 
-    # 4th derivatives of shape functions (per-axis degrees)
     d40 = np.asarray(ref.derivative(xi, eta, 4, 0))
     d31 = np.asarray(ref.derivative(xi, eta, 3, 1))
     d22 = np.asarray(ref.derivative(xi, eta, 2, 2))
     d13 = np.asarray(ref.derivative(xi, eta, 1, 3))
     d04 = np.asarray(ref.derivative(xi, eta, 0, 4))
 
-    def F4_for_beta(coords_1d: np.ndarray) -> np.ndarray:
+    def F4_for(coords_1d: np.ndarray) -> np.ndarray:
         v40 = float(np.dot(d40, coords_1d))
         v31 = float(np.dot(d31, coords_1d))
         v22 = float(np.dot(d22, coords_1d))
         v13 = float(np.dot(d13, coords_1d))
         v04 = float(np.dot(d04, coords_1d))
-        T = np.empty((2, 2, 2, 2), dtype=float)
-        # Fill by counts of 0/1 among (L,M,N,P)
+        T = np.empty((2, 2, 2, 2), float)
         for L in (0, 1):
             for M in (0, 1):
                 for N in (0, 1):
                     for P in (0, 1):
-                        cnt1 = L + M + N + P   # number of 'eta' indices
-                        cnt0 = 4 - cnt1        # number of 'xi' indices
+                        cnt0 = 4 - (L + M + N + P)
                         if   cnt0 == 4: val = v40
                         elif cnt0 == 3: val = v31
                         elif cnt0 == 2: val = v22
                         elif cnt0 == 1: val = v13
-                        else:           val = v04
+                        else:            val = v04
                         T[L, M, N, P] = val
         return T
 
     F4 = np.empty((2, 2, 2, 2, 2), float)
-    F4[0] = F4_for_beta(X[:, 0])
-    F4[1] = F4_for_beta(X[:, 1])
+    F4[0] = F4_for(X0)
+    F4[1] = F4_for(X1)
     return F4
 
+# ---------- exact inverse Hessians (order 2) ----------
 
-# ---------- Exact inverse-map Hessians (order 2) ----------
-def hess_inverse_from_forward(A: np.ndarray, Hx0: np.ndarray, Hx1: np.ndarray):
+def hess_inverse_from_forward(A: np.ndarray, Hx0: np.ndarray, Hx1: np.ndarray) -> np.ndarray:
     """
-    A2[I,i,j] = ∂^2 X^I / ∂x^i ∂x^j  from forward-map Hessians Hxβ.
-    Identity: A^I_{ij} = -∑_β A^I_β (a_i^T Hxβ a_j),  a_i = A[:,i].
+    Return A2[I,i,j] where A2[I] is the 2x2 Hessian of X^I wrt x.
+    Identity: A^I_{ij} = -∑_β A^I_β (a_i^T Hxβ a_j), with a_i = A[:,i].
     """
     a0 = A[:, 0]; a1 = A[:, 1]
     T0 = np.array([[a0 @ Hx0 @ a0, a0 @ Hx0 @ a1],
-                   [a1 @ Hx0 @ a0, a1 @ Hx0 @ a1]], dtype=float)
+                   [a1 @ Hx0 @ a0, a1 @ Hx0 @ a1]], float)
     T1 = np.array([[a0 @ Hx1 @ a0, a0 @ Hx1 @ a1],
-                   [a1 @ Hx1 @ a0, a1 @ Hx1 @ a1]], dtype=float)
+                   [a1 @ Hx1 @ a0, a1 @ Hx1 @ a1]], float)
     Hxi  = - (A[0, 0] * T0 + A[0, 1] * T1)
     Heta = - (A[1, 0] * T0 + A[1, 1] * T1)
-    A2 = np.stack([Hxi, Heta], axis=0)  # (2,2,2)
-    return A2
+    return np.stack([Hxi, Heta], axis=0)
 
+# ---------- inverse jets A3, A4 (material identities; loops only) ----------
 
-# ---------- 3rd-order inverse jet (material identity; loops only) ----------
 def inverse_A3_material(A: np.ndarray, F2: np.ndarray, F3: np.ndarray) -> np.ndarray:
-    A3 = np.zeros((2, 2, 2, 2), dtype=float)
+    """A3[I,i,j,k] via the 4-term material identity (loops only)."""
+    A3 = np.zeros((2, 2, 2, 2), float)
     for I in (0, 1):
         for i in (0, 1):
             for j in (0, 1):
@@ -476,148 +484,177 @@ def inverse_A3_material(A: np.ndarray, F2: np.ndarray, F3: np.ndarray) -> np.nda
                         for R in (0, 1):
                             for S in (0, 1):
                                 for p in (0, 1):
-                                    for J in (0, 1):
+                                    for J0 in (0, 1):
                                         for L in (0, 1):
                                             acc += (A[I, q] * F2[q, R, S] * A[S, k] *
-                                                    A[R, p] * F2[p, J, L] * A[L, j] * A[J, i])
+                                                    A[R, p] * F2[p, J0, L] * A[L, j] * A[J0, i])
                     # Term 2
                     for p in (0, 1):
-                        for J in (0, 1):
+                        for J0 in (0, 1):
                             for L in (0, 1):
                                 for M in (0, 1):
-                                    acc += (- A[I, p] * F3[p, J, L, M] *
-                                            A[M, k] * A[L, j] * A[J, i])
+                                    acc += (- A[I, p] * F3[p, J0, L, M] *
+                                            A[M, k] * A[L, j] * A[J0, i])
                     # Term 3
                     for p in (0, 1):
-                        for J in (0, 1):
+                        for J0 in (0, 1):
                             for L in (0, 1):
                                 for q in (0, 1):
                                     for R in (0, 1):
                                         for S in (0, 1):
-                                            acc += (A[I, p] * F2[p, J, L] * A[L, q] *
-                                                    F2[q, R, S] * A[S, k] * A[R, j] * A[J, i])
+                                            acc += (A[I, p] * F2[p, J0, L] * A[L, q] *
+                                                    F2[q, R, S] * A[S, k] * A[R, j] * A[J0, i])
                     # Term 4
                     for p in (0, 1):
-                        for J in (0, 1):
+                        for J0 in (0, 1):
                             for L in (0, 1):
                                 for q in (0, 1):
                                     for R in (0, 1):
                                         for S in (0, 1):
-                                            acc += (A[I, p] * F2[p, J, L] * A[L, j] *
-                                                    A[J, q] * F2[q, R, S] * A[S, k] * A[R, i])
+                                            acc += (A[I, p] * F2[p, J0, L] * A[L, j] *
+                                                    A[J0, q] * F2[q, R, S] * A[S, k] * A[R, i])
                     A3[I, i, j, k] = acc
     return A3
 
 
-# ---------- 4th-order inverse jet A4 via d/dx_l of A3 (loops only) ----------
 def inverse_A4_material(A: np.ndarray, A2: np.ndarray,
                         F2: np.ndarray, F3: np.ndarray, F4: np.ndarray) -> np.ndarray:
-    """
-    A4[I,i,j,k,l] = ∂^4 X^I / ∂x^i ∂x^j ∂x^k ∂x^l
-    by differentiating the A3 material identity once and using:
-      ∂_l A^I_q = A2[I,q,l],
-      ∂_l A^S_k = A2[S,k,l], etc.,
-      ∂_l F2[q,R,S] = F3[q,R,S,T] A[T,l],
-      ∂_l F3[p,J,L,M] = F4[p,J,L,M,N] A[N,l].
-    """
-    A4 = np.zeros((2, 2, 2, 2, 2), dtype=float)
+    """A4[I,i,j,k,l] by differentiating the A3 material identity once (loops only)."""
+    A4 = np.zeros((2, 2, 2, 2, 2), float)
     for I in (0, 1):
         for i in (0, 1):
             for j in (0, 1):
                 for k in (0, 1):
                     for l in (0, 1):
                         acc = 0.0
-                        # ----- d/dx_l of Term 1 -----
+                        # d/dx_l of Term 1
                         for q in (0, 1):
                             for R in (0, 1):
                                 for S in (0, 1):
                                     for p in (0, 1):
-                                        for J in (0, 1):
+                                        for J0 in (0, 1):
                                             for L in (0, 1):
-                                                base = F2[q, R, S] * A[S, k] * A[R, p] * F2[p, J, L] * A[L, j] * A[J, i]
-                                                # ∂A[I,q]
+                                                base = F2[q, R, S] * A[S, k] * A[R, p] * F2[p, J0, L] * A[L, j] * A[J0, i]
                                                 acc += A2[I, q, l] * base
-                                                # ∂F2[q,R,S]
                                                 for T in (0, 1):
-                                                    acc += A[I, q] * F3[q, R, S, T] * A[T, l] * A[S, k] * A[R, p] * F2[p, J, L] * A[L, j] * A[J, i]
-                                                # ∂A[S,k]
-                                                acc += A[I, q] * F2[q, R, S] * A2[S, k, l] * A[R, p] * F2[p, J, L] * A[L, j] * A[J, i]
-                                                # ∂A[R,p]
-                                                acc += A[I, q] * F2[q, R, S] * A[S, k] * A2[R, p, l] * F2[p, J, L] * A[L, j] * A[J, i]
-                                                # ∂F2[p,J,L]
+                                                    acc += A[I, q] * F3[q, R, S, T] * A[T, l] * A[S, k] * A[R, p] * F2[p, J0, L] * A[L, j] * A[J0, i]
+                                                acc += A[I, q] * F2[q, R, S] * A2[S, k, l] * A[R, p] * F2[p, J0, L] * A[L, j] * A[J0, i]
+                                                acc += A[I, q] * F2[q, R, S] * A[S, k] * A2[R, p, l] * F2[p, J0, L] * A[L, j] * A[J0, i]
                                                 for T in (0, 1):
-                                                    acc += A[I, q] * F2[q, R, S] * A[S, k] * A[R, p] * F3[p, J, L, T] * A[T, l] * A[L, j] * A[J, i]
-                                                # ∂A[L,j]
-                                                acc += A[I, q] * F2[q, R, S] * A[S, k] * A[R, p] * F2[p, J, L] * A2[L, j, l] * A[J, i]
-                                                # ∂A[J,i]
-                                                acc += A[I, q] * F2[q, R, S] * A[S, k] * A[R, p] * F2[p, J, L] * A[L, j] * A2[J, i, l]
-                        # ----- d/dx_l of Term 2 -----
+                                                    acc += A[I, q] * F2[q, R, S] * A[S, k] * A[R, p] * F3[p, J0, L, T] * A[T, l] * A[L, j] * A[J0, i]
+                                                acc += A[I, q] * F2[q, R, S] * A[S, k] * A[R, p] * F2[p, J0, L] * A2[L, j, l] * A[J0, i]
+                                                acc += A[I, q] * F2[q, R, S] * A[S, k] * A[R, p] * F2[p, J0, L] * A[L, j] * A2[J0, i, l]
+                        # d/dx_l of Term 2
                         for p in (0, 1):
-                            for J in (0, 1):
+                            for J0 in (0, 1):
                                 for L in (0, 1):
                                     for M in (0, 1):
-                                        base = F3[p, J, L, M] * A[M, k] * A[L, j] * A[J, i]
-                                        # ∂A[I,p]
+                                        base = F3[p, J0, L, M] * A[M, k] * A[L, j] * A[J0, i]
                                         acc += - A2[I, p, l] * base
-                                        # ∂F3[p,J,L,M]
                                         for N in (0, 1):
-                                            acc += - A[I, p] * F4[p, J, L, M, N] * A[N, l] * A[M, k] * A[L, j] * A[J, i]
-                                        # ∂A[M,k]
-                                        acc += - A[I, p] * F3[p, J, L, M] * A2[M, k, l] * A[L, j] * A[J, i]
-                                        # ∂A[L,j]
-                                        acc += - A[I, p] * F3[p, J, L, M] * A[M, k] * A2[L, j, l] * A[J, i]
-                                        # ∂A[J,i]
-                                        acc += - A[I, p] * F3[p, J, L, M] * A[M, k] * A[L, j] * A2[J, i, l]
-                        # ----- d/dx_l of Term 3 -----
+                                            acc += - A[I, p] * F4[p, J0, L, M, N] * A[N, l] * A[M, k] * A[L, j] * A[J0, i]
+                                        acc += - A[I, p] * F3[p, J0, L, M] * A2[M, k, l] * A[L, j] * A[J0, i]
+                                        acc += - A[I, p] * F3[p, J0, L, M] * A[M, k] * A2[L, j, l] * A[J0, i]
+                                        acc += - A[I, p] * F3[p, J0, L, M] * A[M, k] * A[L, j] * A2[J0, i, l]
+                        # d/dx_l of Term 3
                         for p in (0, 1):
-                            for J in (0, 1):
+                            for J0 in (0, 1):
                                 for L in (0, 1):
                                     for q in (0, 1):
                                         for R in (0, 1):
                                             for S in (0, 1):
-                                                base_left  = F2[p, J, L] * A[L, q]
-                                                base_right = F2[q, R, S] * A[S, k] * A[R, j] * A[J, i]
-                                                # ∂A[I,p]
-                                                acc += A2[I, p, l] * base_left * base_right
-                                                # ∂F2[p,J,L]
+                                                left  = F2[p, J0, L] * A[L, q]
+                                                right = F2[q, R, S] * A[S, k] * A[R, j] * A[J0, i]
+                                                acc += A2[I, p, l] * left * right
                                                 for T in (0, 1):
-                                                    acc += A[I, p] * F3[p, J, L, T] * A[T, l] * A[L, q] * base_right
-                                                # ∂A[L,q]
-                                                acc += A[I, p] * F2[p, J, L] * A2[L, q, l] * base_right
-                                                # ∂F2[q,R,S]
+                                                    acc += A[I, p] * F3[p, J0, L, T] * A[T, l] * A[L, q] * right
+                                                acc += A[I, p] * F2[p, J0, L] * A2[L, q, l] * right
                                                 for T in (0, 1):
-                                                    acc += A[I, p] * F2[p, J, L] * A[L, q] * F3[q, R, S, T] * A[T, l] * A[S, k] * A[R, j] * A[J, i]
-                                                # ∂A[S,k]
-                                                acc += A[I, p] * F2[p, J, L] * A[L, q] * F2[q, R, S] * A2[S, k, l] * A[R, j] * A[J, i]
-                                                # ∂A[R,j]
-                                                acc += A[I, p] * F2[p, J, L] * A[L, q] * F2[q, R, S] * A[S, k] * A2[R, j, l] * A[J, i]
-                                                # ∂A[J,i]
-                                                acc += A[I, p] * F2[p, J, L] * A[L, q] * F2[q, R, S] * A[S, k] * A[R, j] * A2[J, i, l]
-                        # ----- d/dx_l of Term 4 -----
+                                                    acc += A[I, p] * F2[p, J0, L] * A[L, q] * F3[q, R, S, T] * A[T, l] * A[S, k] * A[R, j] * A[J0, i]
+                                                acc += A[I, p] * F2[p, J0, L] * A[L, q] * F2[q, R, S] * A2[S, k, l] * A[R, j] * A[J0, i]
+                                                acc += A[I, p] * F2[p, J0, L] * A[L, q] * F2[q, R, S] * A[S, k] * A2[R, j, l] * A[J0, i]
+                                                acc += A[I, p] * F2[p, J0, L] * A[L, q] * F2[q, R, S] * A[S, k] * A[R, j] * A2[J0, i, l]
+                        # d/dx_l of Term 4
                         for p in (0, 1):
-                            for J in (0, 1):
+                            for J0 in (0, 1):
                                 for L in (0, 1):
                                     for q in (0, 1):
                                         for R in (0, 1):
                                             for S in (0, 1):
-                                                base_left  = F2[p, J, L] * A[L, j] * A[J, q]
-                                                base_right = F2[q, R, S] * A[S, k] * A[R, i]
-                                                # ∂A[I,p]
-                                                acc += A2[I, p, l] * base_left * base_right
-                                                # ∂F2[p,J,L]
+                                                left  = F2[p, J0, L] * A[L, j] * A[J0, q]
+                                                right = F2[q, R, S] * A[S, k] * A[R, i]
+                                                acc += A2[I, p, l] * left * right
                                                 for T in (0, 1):
-                                                    acc += A[I, p] * F3[p, J, L, T] * A[T, l] * A[L, j] * A[J, q] * base_right
-                                                # ∂A[L,j]
-                                                acc += A[I, p] * F2[p, J, L] * A2[L, j, l] * A[J, q] * base_right
-                                                # ∂A[J,q]
-                                                acc += A[I, p] * F2[p, J, L] * A[L, j] * A2[J, q, l] * base_right
-                                                # ∂F2[q,R,S]
+                                                    acc += A[I, p] * F3[p, J0, L, T] * A[T, l] * A[L, j] * A[J0, q] * right
+                                                acc += A[I, p] * F2[p, J0, L] * A2[L, j, l] * A[J0, q] * right
+                                                acc += A[I, p] * F2[p, J0, L] * A[L, j] * A2[J0, q, l] * right
                                                 for T in (0, 1):
-                                                    acc += A[I, p] * F2[p, J, L] * A[L, j] * A[J, q] * F3[q, R, S, T] * A[T, l] * A[S, k] * A[R, i]
-                                                # ∂A[S,k]
-                                                acc += A[I, p] * F2[p, J, L] * A[L, j] * A[J, q] * F2[q, R, S] * A2[S, k, l] * A[R, i]
-                                                # ∂A[R,i]
-                                                acc += A[I, p] * F2[p, J, L] * A[L, j] * A[J, q] * F2[q, R, S] * A[S, k] * A2[R, i, l]
+                                                    acc += A[I, p] * F2[p, J0, L] * A[L, j] * A[J0, q] * F3[q, R, S, T] * A[T, l] * A[S, k] * A[R, i]
+                                                acc += A[I, p] * F2[p, J0, L] * A[L, j] * A[J0, q] * F2[q, R, S] * A2[S, k, l] * A[R, i]
+                                                acc += A[I, p] * F2[p, J0, L] * A[L, j] * A[J0, q] * F2[q, R, S] * A[S, k] * A2[R, i, l]
 
                         A4[I, i, j, k, l] = acc
     return A4
+
+# ---------- geometry jet cache ----------
+
+class InverseJetCache:
+    """Cache geometry jets per (mesh, elem_id, xi, eta)."""
+    def __init__(self):
+        self.store: Dict[tuple, Dict[str, Any]] = {}
+
+    def get(self, mesh, elem_id: int, xi: float, eta: float, upto: int = 4) -> Dict[str, Any]:
+        k = _key(mesh, elem_id, xi, eta)
+        rec = self.store.get(k)
+        if rec is None:
+            rec = {}
+            self.store[k] = rec
+
+        # J, A
+        if "J" not in rec or "A" not in rec:
+            J = jacobian(mesh, elem_id, (xi, eta))
+            rec["J"] = J
+            rec["A"] = np.linalg.inv(J)
+
+        A = rec["A"]
+
+        # Forward tensors
+        if upto >= 2 and ("F2" not in rec or "F3" not in rec):
+            F2, F3 = element_forward_F2_F3(mesh, elem_id, (xi, eta))
+            rec["F2"], rec["F3"] = F2, F3
+
+        if upto >= 4 and "F4" not in rec:
+            rec["F4"] = element_forward_F4(mesh, elem_id, (xi, eta))
+
+        # Inverse jets
+        if upto >= 2 and "A2" not in rec:
+            F2 = rec["F2"]
+            rec["A2"] = hess_inverse_from_forward(A, F2[0], F2[1])
+
+        if upto >= 3 and "A3" not in rec:
+            rec["A3"] = inverse_A3_material(A, rec["F2"], rec["F3"])
+
+        if upto >= 4 and "A4" not in rec:
+            rec["A4"] = inverse_A4_material(A, rec["A2"], rec["F2"], rec["F3"], rec["F4"])
+
+        return rec
+
+# a convenient global cache you can reuse during an assembly sweep
+JET_CACHE = InverseJetCache()
+
+class RefDerivCache:
+    """
+    Cache for reference basis derivatives per (field, xi, eta, ox, oy).
+    Assumes 'me.deriv_ref(field, xi, eta, ox, oy)' depends only on (field, xi, eta, ox, oy).
+    """
+    def __init__(self, me):
+        self.me = me
+        self.store: Dict[tuple, np.ndarray] = {}
+
+    def get(self, fld: str, xi: float, eta: float, ox: int, oy: int) -> np.ndarray:
+        k = (fld, _q(xi), _q(eta), ox, oy)
+        arr = self.store.get(k)
+        if arr is None:
+            arr = self.me.deriv_ref(fld, xi, eta, ox, oy)
+            self.store[k] = arr
+        return arr

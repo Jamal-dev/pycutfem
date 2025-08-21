@@ -47,9 +47,9 @@ def test_unfitted_domain_visualization():
 
     # 4. Visualize
     print("\nGenerating visualization...")
-    fig, ax = plt.subplots(figsize=(10, 8))
+    # fig, ax = plt.subplots(figsize=(10, 8))
     # This call now works because of the fixes in visualization.py
-    plot_mesh_2(mesh, ax=ax, level_set=levelset, show=True, 
+    plot_mesh_2(mesh, level_set=levelset, show=True, 
               plot_nodes=False, elem_tags=True, edge_colors=True)
               
     print("Test passed: Classification and visualization completed.")

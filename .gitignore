@@ -201,4 +201,4 @@ garbage/
 project/
 examples/*_results/
 pycutfem/solvers/giant/*
-
+*_results/

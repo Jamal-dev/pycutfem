@@ -17,6 +17,7 @@ from matplotlib.pylab import f
 import numpy as np
 import scipy.sparse as sp
 from typing import Dict, List, Any, Tuple, Iterable, Mapping, Union
+from collections import defaultdict
 import logging
 from dataclasses import dataclass
 import math
@@ -46,7 +47,13 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
-from pycutfem.ufl.helpers import VecOpInfo, GradOpInfo, HessOpInfo, required_multi_indices,_all_fields,_find_all,_trial_test, phys_scalar_third_row, phys_scalar_fourth_row
+from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, 
+                                  required_multi_indices,
+                                  _all_fields,_find_all,
+                                  _trial_test, 
+                                  phys_scalar_third_row, 
+                                  phys_scalar_fourth_row,
+                                  _as_indices)
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 from pycutfem.ufl.helpers_geom import (
@@ -139,18 +146,100 @@ class FormCompiler:
         return K.tocsr(), F
 
     # ===================== VISITORS: LEAF NODES =======================
-    def _b(self, fld): 
-        # ➊ standard volume/interface path
-        if fld in self._basis_cache:
-            return self._basis_cache[fld]["val"]
+    # --------------------------------------------------------------
+    # Unified, side-aware, cached basis/derivative retrieval
+    # --------------------------------------------------------------
+    def _basis_row(self, field: str, alpha: tuple[int, int]) -> np.ndarray:
+        """
+        Return a row vector for D^{alpha} φ_field at the *current QP context*.
+        - If ctx["basis_values"] is present → side-aware cache (ghost/interface).
+          * Pads to union size iff ctx["global_dofs"] is not None.
+        - Else → per-element cache self._basis_cache[field] (no padding).
+        Computes missing entries with exact curvature-aware mapping up to order 4.
+        """
+        ox, oy = map(int, alpha)
+        total  = ox + oy
 
-        # ➋ ghost-edge fallback: pull from the side-aware cache
+        # ---------- Ghost/side-aware path (also works for interface with side) ----------
         bv = self.ctx.get("basis_values")
         if bv is not None:
-            side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
-            if fld in bv[side] and (0, 0) in bv[side][fld]:
-                return bv[side][fld][(0, 0)]
-        raise KeyError(f"Basis for field '{fld}' not found.")
+            # Determine side
+            side = self.ctx.get("side")
+            if side not in ('+','-'):
+                side = '+' if self.ctx.get("phi_val", 0.0) >= 0.0 else '-'
+            # Get per-side dicts
+            if side not in bv:
+                bv[side] = {}
+            if field not in bv[side]:
+                bv[side][field] = {}
+            # Served from per-QP, per-side cache?
+            if alpha in bv[side][field]:
+                return bv[side][field][alpha]
+
+            # Compute (un-padded) union-sized row for the *side's owner element*
+            x_phys = self.ctx.get("x_phys")
+            if x_phys is None:
+                raise KeyError("x_phys missing in context for derivative evaluation.")
+            eid = self.ctx["pos_eid"] if side == '+' else self.ctx["neg_eid"]
+            xi, eta = transform.inverse_mapping(self.me.mesh, int(eid), np.asarray(x_phys))
+            row = self._phys_scalar_deriv_row(field, float(xi), float(eta), ox, oy, int(eid))
+
+            # Pad to the union DOF set only if we're assembling a matrix/vector
+            g = self.ctx.get("global_dofs")
+            if g is not None:
+                amap = self.ctx["pos_map"] if side == '+' else self.ctx["neg_map"]
+                full = np.zeros(len(g), dtype=row.dtype)
+                full[amap] = row
+                row = full
+
+            # Cache & return
+            bv[side][field][alpha] = row
+            return row
+
+        # ---------- Standard element-local path (volume, boundary, cut-volume element subcells) ----------
+        cache = self._basis_cache.setdefault(field, {})
+        # (0,0), (1,0), (0,1) – possibly already cached
+        if alpha == (0,0):
+            if "val" in cache:
+                return cache["val"]
+        if alpha in ((1,0),(0,1)):
+            if "grad" in cache:
+                gx, gy = cache["grad"][:,0], cache["grad"][:,1]
+                return gx if alpha==(1,0) else gy
+        if alpha in ((2,0),(1,1),(0,2)) and "hess" in cache:
+            H = cache["hess"]
+            return H[:,0,0] if alpha==(2,0) else (H[:,0,1] if alpha==(1,1) else H[:,1,1])
+        # generic high-order per-element derivatives cache
+        dcache = cache.setdefault("derivs", {})
+        if alpha in dcache:
+            return dcache[alpha]
+
+        # Compute using exact mapping (needs eid & x_phys in ctx)
+        eid    = self.ctx.get("eid")
+        x_phys = self.ctx.get("x_phys")
+        if eid is None or x_phys is None:
+            raise KeyError("Derivative requested outside of element context (missing 'eid'/'x_phys').")
+        xi, eta = transform.inverse_mapping(self.me.mesh, int(eid), np.asarray(x_phys))
+        row = self._phys_scalar_deriv_row(field, float(xi), float(eta), ox, oy, int(eid))
+
+        # Optional convenience: if a full Hessian wasn’t cached yet and we just computed one of its entries,
+        # compute the rest and store it (saves two calls later).
+        if alpha in ((2,0),(1,1),(0,2)) and "hess" not in cache:
+            d20 = row if alpha==(2,0) else self._phys_scalar_deriv_row(field, float(xi), float(eta), 2, 0, int(eid))
+            d11 = row if alpha==(1,1) else self._phys_scalar_deriv_row(field, float(xi), float(eta), 1, 1, int(eid))
+            d02 = row if alpha==(0,2) else self._phys_scalar_deriv_row(field, float(xi), float(eta), 0, 2, int(eid))
+            H = np.empty((self.me.n_dofs_local, 2, 2), dtype=row.dtype)
+            H[:,0,0] = d20; H[:,0,1] = d11; H[:,1,0] = d11; H[:,1,1] = d02
+            cache["hess"] = H
+            # also stash each entry into derivs
+            dcache[(2,0)] = d20; dcache[(1,1)] = d11; dcache[(0,2)] = d02
+            return row
+
+        # Cache and return
+        dcache[alpha] = row
+        return row
+    def _b(self, fld): 
+        return self._basis_row(fld, (0,0))
     def _v(self, fld):
         # 1) Prefer per-QP, side-aware cache
         bv = self.ctx.get("basis_values")
@@ -168,117 +257,22 @@ class FormCompiler:
         return self._basis_from_element_context(fld, kind="val")
 
     def _g(self, fld):
-        # 1) Prefer per-QP, side-aware cache
-        bv = self.ctx.get("basis_values")
-        if bv is not None:
-            side = self.ctx.get("side")
-            if side is None:
-                side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
-            gx = bv[side][fld].get((1, 0))
-            gy = bv[side][fld].get((0, 1))
-            if gx is not None and gy is not None:
-                return np.stack([gx, gy], axis=1)  # (nloc, 2)
-        # 2) Fallback to global cache
-        if fld in self._basis_cache:
-            return self._basis_cache[fld]["grad"]
-        # 3) Last resort: compute fresh (element-local)
-        return self._basis_from_element_context(fld, kind="grad")
+        gx = self._basis_row(fld, (1,0))
+        gy = self._basis_row(fld, (0,1))
+        return np.stack([gx, gy], axis=1)  # (nloc, 2)
+
     def _hess(self, fld):
-        """
-        Return the physical 2x2 Hessian tensor table for the scalar field `fld`
-        at the current quadrature context. Shape: (n_loc, 2, 2).
-        Resolves from:
-          1) cached per-element tables (if available),
-          2) ghost-edge side-aware `basis_values` {(2,0),(1,1),(0,2)},
-          3) reference derivatives + affine mapping via Ji.
-        """
-        # ➊ per-element cache
-        if fld in self._basis_cache and "hess" in self._basis_cache[fld]:
-            return self._basis_cache[fld]["hess"]
-
-        # ➋ ghost-edge / side-aware cache
-        bv = self.ctx.get("basis_values")
-        if bv is not None:
-            side = self.ctx.get("side")
-            if side not in ("+", "-"):
-                side = "+" if self.ctx.get("phi_val", 0.0) >= 0 else "-"
-            fld_dict = bv.get(side, {}).get(fld, {})
-            d20 = fld_dict.get((2, 0))
-            d11 = fld_dict.get((1, 1))
-            d02 = fld_dict.get((0, 2))
-            if d20 is not None and d11 is not None and d02 is not None:
-                nloc = d20.shape[0]
-                H = np.empty((nloc, 2, 2), dtype=d20.dtype)
-                H[:, 0, 0] = d20
-                H[:, 0, 1] = d11
-                H[:, 1, 0] = d11
-                H[:, 1, 1] = d02
-                return H
-
-        # ➌ standard element path: compute from reference and map
-        eid    = self.ctx.get("eid")
-        x_phys = self.ctx.get("x_phys")
-        if eid is None or x_phys is None:
-            raise KeyError("Hessian requested outside of element context (missing 'eid'/'x_phys').")
-
-        mesh = self.me.mesh
-        xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
-        J       = transform.jacobian(mesh, eid, (xi, eta))
-        Ji      = np.linalg.inv(J)
-
-        d20 = self.me.deriv_ref(fld, xi, eta, 2, 0)  # (n_loc,)
-        d11 = self.me.deriv_ref(fld, xi, eta, 1, 1)
-        d02 = self.me.deriv_ref(fld, xi, eta, 0, 2)
-
-        nloc = d20.shape[0]
-        Href = np.empty((nloc, 2, 2), dtype=d20.dtype)
-        Href[:, 0, 0] = d20
-        Href[:, 0, 1] = d11
-        Href[:, 1, 0] = d11
-        Href[:, 1, 1] = d02
-
-        # affine mapping: H_phys = Ji.T @ Href @ Ji  (per basis function)
-        tmp = np.einsum("ab,nbc->nac", Ji.T, Href, optimize=True)
-        H   = np.einsum("nac,cb->nab", tmp, Ji, optimize=True)
-
-        # cache for this quadrature point
-        if fld not in self._basis_cache:
-            self._basis_cache[fld] = {}
-        self._basis_cache[fld]["hess"] = H
+        d20 = self._basis_row(fld, (2,0))
+        d11 = self._basis_row(fld, (1,1))
+        d02 = self._basis_row(fld, (0,2))
+        H = np.empty((len(d20), 2, 2), dtype=d20.dtype)
+        H[:,0,0] = d20; H[:,0,1] = d11
+        H[:,1,0] = d11; H[:,1,1] = d02
         return H
     def _lookup_basis(self, field: str, alpha: tuple[int, int]) -> np.ndarray:
-        """
-        Return the trace of ∂^{alpha}φ_i (i = 1..n_loc) at the current
-        quadrature point.
-
-        * If we are on a ghost edge   →  use the side–aware cache.
-        * Otherwise (volume / interior face) fall back to the element cache
-        exposed via _b / _g.
-        """
-        # ---- ghost-edge path ------------------------------------------
-        if "basis_values" in self.ctx:
-            side = self.ctx.get("side")
-            if side not in ('+', '-'):
-                side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
-            return self.ctx["basis_values"][side][field][alpha]
-
-        # ---- standard element path ------------------------------------
-        if alpha == (0, 0):
-            return self._b(field)                                             # (n_loc,)
-        if alpha == (1, 0):
-            return self._g(field)[:, 0]                                       # (n_loc,)
-        if alpha == (0, 1):
-            return self._g(field)[:, 1]                                       # (n_loc,)
-        # second derivatives via Hessian helper
-        if alpha == (2, 0):
-            return self._hess(field)[:, 0, 0]
-        if alpha == (1, 1):
-            return self._hess(field)[:, 0, 1]
-        if alpha == (0, 2):
-            return self._hess(field)[:, 1, 1]
-
-        # Higher derivatives outside ghost-edge assembly are not (yet) required
-        raise KeyError(f"Basis for derivative {alpha} of field '{field}' not found.")
+        """Unified entry point for any ∂^{alpha}φ_field (0 ≤ |alpha| ≤ 4)."""
+        return self._basis_row(field, alpha)
+    
     def _local_dofs(self): 
         if 'eid' in self.ctx:           # matrix/vector path
             return self.dh.get_elemental_dofs(self.ctx["eid"])
@@ -1604,76 +1598,86 @@ class FormCompiler:
                            ox: int, oy: int, eid: int) -> np.ndarray:
         """
         Return a length-(nloc_elem) row for D^{(ox,oy)} of scalar field 'fld' in physical coords.
-        Exact for orders 0,1 and exact for order 2 (includes inverse-map curvature).
+        Exact for orders 0, 1, 2 (includes inverse-map curvature). Uses cached exact formulas for
+        orders 3 and 4 (f_{ijk}, f_{ijkl}). Falls back to binomial (no curvature) for higher orders.
         """
         me = self.me
-        # Values/first derivatives fast path
+
+        # --- ensure we have per-object caches we can reuse across calls
+        if not hasattr(self, "_ref_cache"):
+            self._ref_cache = transform.RefDerivCache(me)
+        ref_cache = self._ref_cache
+
+
+        # order 0: just values in reference
         if ox == 0 and oy == 0:
-            return me.deriv_ref(fld, xi, eta, 0, 0)
+            return ref_cache.get(fld, xi, eta, 0, 0)
 
-        # Geometry at qp (J, A, inverse-map Hessians)
-        J, A, Hxi, Heta = transform.element_inverse_hessians(self.me.mesh, eid, (xi, eta))  # :contentReference[oaicite:9]{index=9}
+        # pick how far we need geometry jets
+        total = ox + oy
+        upto = 2 if total <= 2 else (3 if total == 3 else (4 if total == 4 else 2))
+        rec = transform.JET_CACHE.get(me.mesh, eid, xi, eta, upto=upto)
+        A = rec["A"]  # (2,2)
 
-        if ox + oy == 1:
-            # grad_ref (ξ,η) → (x,y): ∇_ref @ A, then pick x or y
-            dN_dxi  = me.deriv_ref(fld, xi, eta, 1, 0)
-            dN_deta = me.deriv_ref(fld, xi, eta, 0, 1)
+        # order 1: ∇_x = ∇_X A
+        if total == 1:
+            dN_dxi  = ref_cache.get(fld, xi, eta, 1, 0)
+            dN_deta = ref_cache.get(fld, xi, eta, 0, 1)
             if (ox, oy) == (1, 0):  # ∂/∂x
                 return dN_dxi * A[0, 0] + dN_deta * A[1, 0]
-            else:                   # (0,1): ∂/∂y
+            else:                   # (0,1) ∂/∂y
                 return dN_dxi * A[0, 1] + dN_deta * A[1, 1]
 
-        if ox + oy == 2:
-            # Build the exact order-2 terms
-            dN_xi    = me.deriv_ref(fld, xi, eta, 1, 0)
-            dN_eta   = me.deriv_ref(fld, xi, eta, 0, 1)
-            dN_xixi  = me.deriv_ref(fld, xi, eta, 2, 0)
-            dN_xieta = me.deriv_ref(fld, xi, eta, 1, 1)
-            dN_etaeta= me.deriv_ref(fld, xi, eta, 0, 2)
+        # order 2: exact with curvature  (uses A2 = ∂^2 X / ∂x^2)
+        if total == 2:
+            A2 = rec["A2"]  # shape (2,2,2) with A2[I,i,j] = A^I_{ij}
+            # reference derivatives
+            dN_xi     = ref_cache.get(fld, xi, eta, 1, 0)
+            dN_eta    = ref_cache.get(fld, xi, eta, 0, 1)
+            dN_xixi   = ref_cache.get(fld, xi, eta, 2, 0)
+            dN_xieta  = ref_cache.get(fld, xi, eta, 1, 1)
+            dN_etaeta = ref_cache.get(fld, xi, eta, 0, 2)
 
-            def second(i, j):
-                # First (Hessian × A × A) contraction
-                Axi_i,  Aeta_i = A[0, i], A[1, i]
-                Axi_j,  Aeta_j = A[0, j], A[1, j]
-                term1 = (dN_xixi   * (Axi_i*Axi_j)
-                    + dN_xieta  * (Axi_i*Aeta_j + Aeta_i*Axi_j)
-                    + dN_etaeta * (Aeta_i*Aeta_j))
-                # Curvature (gradient ⋅ A_{,ij})
-                Aij = Hxi if j == 0 else Heta      # choose ∂²ξ/∂x_i∂x_j OR ∂²η/∂x_i∂x_j container by column j
-                curv = dN_xi * Aij[0, i] + dN_eta * Aij[1, i]
-                return term1 + curv
+            def second(i: int, j: int):
+                # (H_X(w) pulled back) + curvature term (grad_X w ⋅ A_{,ij})
+                Axi_i, Aeta_i = A[0, i], A[1, i]
+                Axi_j, Aeta_j = A[0, j], A[1, j]
+                hess_pull = (dN_xixi   * (Axi_i * Axi_j)
+                        + dN_xieta  * (Axi_i * Aeta_j + Aeta_i * Axi_j)
+                        + dN_etaeta * (Aeta_i * Aeta_j))
+                curv = dN_xi * A2[0, i, j] + dN_eta * A2[1, i, j]
+                return hess_pull + curv
 
-            if (ox, oy) == (2, 0):  # ∂²/∂x²
+            if   (ox, oy) == (2, 0):  # ∂²/∂x²
                 return second(0, 0)
-            if (ox, oy) == (1, 1):  # ∂²/∂x∂y
+            elif (ox, oy) == (1, 1):  # ∂²/∂x∂y
                 return second(0, 1)
-            if (ox, oy) == (0, 2):  # ∂²/∂y²
+            else:                     # (0,2): ∂²/∂y²
                 return second(1, 1)
-        if ox + oy == 3:
-            # map (ox,oy) -> ordered (i,j,k) = (x,y) component indices you want
-            # e.g. (3,0) => (0,0,0), (2,1) => (0,0,1), etc.
-            # Then:
-            return phys_scalar_third_row(self.me, fld, xi, eta, i, j, k, self.me.mesh, eid)
-        if ox + oy == 4:
-            # map (ox,oy) to an ordered (i,j,k,l) in {0,1}^4 you want (e.g. (4,0) → (0,0,0,0); (3,1) → (0,0,0,1); etc.)
-            # Example mapping by counts: use i=j=k=0,l=1 for (3,1), etc.
-            return phys_scalar_fourth_row(self.me, fld, xi, eta, i, j, k, l, self.me.mesh, eid)
 
+        # order 3: exact (cached) f_{ijk}
+        if total == 3:
+            i, j, k = _as_indices(ox, oy)
+            return phys_scalar_third_row(me, fld, xi, eta, i, j, k, me.mesh, eid, ref_cache)
 
-        # Fallback (orders ≥3): binomial chain rule without ∂A terms.
-        k = ox + oy
+        # order 4: exact (cached) f_{ijkl}
+        if total == 4:
+            i, j, k, l = _as_indices(ox, oy)
+            return phys_scalar_fourth_row(me, fld, xi, eta, i, j, k, l, me.mesh, eid, ref_cache)
+
+        # fallback (>=5): pure binomial chain rule (no A-derivative curvature terms)
         out = np.zeros(me.n_dofs_local, dtype=float)
         A11, A12, A21, A22 = A[0, 0], A[0, 1], A[1, 0], A[1, 1]
+        ktot = total
         for i in range(ox + 1):
             cx = comb(ox, i) * (A11 ** i) * (A21 ** (ox - i))
             for j in range(oy + 1):
                 cy = comb(oy, j) * (A12 ** j) * (A22 ** (oy - j))
                 orx = i + j
-                ory = k - orx
+                ory = ktot - orx
                 try:
-                    out += (cx * cy) * me.deriv_ref(fld, xi, eta, orx, ory)
+                    out += (cx * cy) * ref_cache.get(fld, xi, eta, orx, ory)
                 except Exception:
-                    # If higher derivatives are not tabulated (default max order = 2), keep the available part.
                     pass
         return out
     
@@ -1783,47 +1787,20 @@ class FormCompiler:
 
                 # ---------------- QP loop ----------------
                 for xq, w in zip(qpts_phys, qwts):
-                    bv = {"+": {}, "-": {}}  # side-aware, padded to union if not functional
+                    # Side-aware store that _basis_row() will lazily populate:
+                    bv = {"+": defaultdict(dict), "-": defaultdict(dict)}
 
-                    for side, eid, amap in (("+", pos_eid, None if is_functional else pos_map),
-                                            ("-", neg_eid, None if is_functional else neg_map)):
-                        xi, eta = transform.inverse_mapping(mesh, eid, xq)
-                        J  = transform.jacobian(mesh, eid, (xi, eta))
-                        Ji = np.linalg.inv(J)
-
-                        # NOTE: proper push-forward for grads/tensors will come in step (2).
-                        # For now, basis/grad cache matches other python paths (grad = ref @ Ji).
-                        for fld in fields:
-                            # (n_loc_elem,) and (n_loc_elem,2)
-                            val  = self.me.basis(fld, xi, eta)
-                            grad = self.me.grad_basis(fld, xi, eta) @ Ji
-
-                            # Populate required multi-indices
-                            fcache = {}
-                            for (ox, oy) in derivs:
-                                if   ox == 0 and oy == 0: ref = val
-                                elif ox == 1 and oy == 0: ref = grad[:, 0]
-                                elif ox == 0 and oy == 1: ref = grad[:, 1]
-                                else:
-                                    # Higher orders not on ghost path yet; fall back to zeros
-                                    ref = np.zeros_like(val)
-
-                                if is_functional:
-                                    fcache[(ox, oy)] = ref  # per-element length
-                                else:
-                                    full = np.zeros(len(global_dofs))
-                                    full[amap] = ref
-                                    fcache[(ox, oy)] = full
-
-                            bv[side][fld] = fcache
-
-                    # Context for visitors
+                    # Context for visitors (enough info for _basis_row to compute & pad)
                     self.ctx.update({
-                        "basis_values": bv,
+                        "basis_values": bv,          # per-QP, side-aware derivative cache
                         "normal": normal_vec,
-                        "phi_val": level_set(xq),
+                        "phi_val": level_set(xq),    # used if 'side' isn't set explicitly
                         "x_phys": xq,
-                        "pos_eid": pos_eid, "neg_eid": neg_eid,
+                        "global_dofs": (global_dofs if not is_functional else None),
+                        "pos_map": (pos_map if not is_functional else None),
+                        "neg_map": (neg_map if not is_functional else None),
+                        "pos_eid": pos_eid,
+                        "neg_eid": neg_eid
                     })
                     if not is_functional:
                         self.ctx.update({
