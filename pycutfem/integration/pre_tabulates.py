@@ -169,8 +169,8 @@ if _HAVE_NUMBA:
             # Mixed derivative is NONZERO for Q1: dL * dM (±0.25)
             return np.array([dL0*dM0, dL1*dM0, dL0*dM1, dL1*dM1])
 
-        # pure second derivatives vanish for Q1
-        # (dx,dy) in {(2,0),(0,2)} → 0
+        # Any higher order in either variable vanishes for bilinear Q1
+        # (dx>1) or (dy>1) → 0 (covers (2,0),(0,2),(2,1),(1,2),(2,2), … up to API order 4)
         return np.zeros(4)
 
     @_nb.njit(cache=True, parallel=True, fastmath=True)

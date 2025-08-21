@@ -67,6 +67,15 @@ class Ref:
 
 @lru_cache(maxsize=None)
 def get_reference(element_type: str, poly_order: int = 1, max_deriv_order: int = 2):
+    """
+    Factory function to get a reference element based on type and polynomial order.
+    Args:
+        element_type (str): Type of the element ('quad', 'tri', etc.).
+        poly_order (int): Polynomial order of the reference element.
+        max_deriv_order (int): Maximum derivative order to compute.
+    Returns:
+        Ref: An instance of the Ref class containing shape and derivative functions.
+    """    
     if element_type == "quad":
         shape_l, deriv_lambdas  = import_module("pycutfem.fem.reference.quad_qn").quad_qn(poly_order, max_deriv_order)
     elif element_type == "tri":

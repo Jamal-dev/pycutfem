@@ -523,7 +523,6 @@ class NumbaCodeGen:
                 #     f"is_gradient={getattr(op, 'is_gradient', None)}")
 
                 if op.role in ("test", "trial"):
-
                     # ---------- facet integrals (+ / -) : pad to union DOFs ----------
                     if op.side:                                              # "+" or "-"
                         map_array_name = "pos_map" if op.side == "+" else "neg_map"
@@ -532,7 +531,7 @@ class NumbaCodeGen:
                         map_e = new_var(f"{map_array_name}_e")
                         body_lines += [
                             f"{map_e} = {map_array_name}[e]",
-                            f"n_union = gdofs_map[e].shape[0]",              # e.g. 36 for Stokes
+                            f"n_union = gdofs_map[e].shape[0]",              # e.g. 36 for Stokes
                         ]
 
                         padded_vars = []                                     # one per component
@@ -554,48 +553,244 @@ class NumbaCodeGen:
 
                         basis_vars_at_q = padded_vars        # hand off the padded list
                         final_basis_var = padded_vars[0]     # for scalar reshape path
-                        n_dofs = -1                          # run‑time on ghost facets
+                        n_dofs = -1                          # run-time on ghost facets
 
                     # ---------- volume / interface -----------------------------------
                     else:
                         final_basis_var = basis_vars_at_q[0]
                         n_dofs = self.me.n_dofs_local
 
-                    # ---------- reshape (scalar) or stack (vector) -------------------
-                    if not op.is_vector:                               # scalar basis
-                        var_name = new_var("basis_reshaped")
-                        body_lines.append(f"{var_name} = {final_basis_var}[np.newaxis, :].copy()")
-                        shape = (1, n_dofs)
-                    else:                                              # vector basis
-                        var_name = new_var("basis_stack")
-                        body_lines.append(f"{var_name} = np.stack(({', '.join(basis_vars_at_q)}))")
-                        shape = (len(field_names), n_dofs)
+                    ox, oy = deriv_order
+                    tot = ox + oy
 
-                    # ---------- push‑forward for ∂‑ordered bases ---------------------
-                    if deriv_order != (0, 0):
-                        dx, dy = deriv_order
-                        jinv_q = f"{jinv_sym}_q"                       # J_inv_pos_q, …
-                        scale  = f"({jinv_q}[0,0]**{dx}) * ({jinv_q}[1,1]**{dy})"
-                        body_lines.append(f"{var_name} *= {scale}")
+                    # ---------- (A) 0th order: keep your fast path -------------------
+                    if tot == 0:
+                        if not op.is_vector:
+                            var_name = new_var("basis_reshaped")
+                            body_lines.append(f"{var_name} = {final_basis_var}[np.newaxis, :].copy()")
+                            shape = (1, n_dofs)
+                        else:
+                            var_name = new_var("basis_stack")
+                            body_lines.append(f"{var_name} = np.stack(({', '.join(basis_vars_at_q)}))")
+                            shape = (len(field_names), n_dofs)
+                        stack.append(StackItem(var_name=var_name, role=op.role, shape=shape,
+                                            is_vector=op.is_vector, field_names=field_names, parent_name=op.name))
+                        continue
 
-                    # ---------- push onto stack --------------------------------------
-                    stack.append(
-                        StackItem(
-                            var_name    = var_name,
-                            role        = op.role,
-                            shape       = shape,
-                            is_vector   = op.is_vector,
-                            field_names = field_names,
-                            parent_name = op.name
-                        )
-                    )
+                    # Decide which J^{-1} to use and bind a local for use below
+                    if op.side == "+":
+                        jinv_sym = "J_inv_pos"
+                    elif op.side == "-":
+                        jinv_sym = "J_inv_neg"
+                    else:
+                        jinv_sym = "J_inv"
+                    required_args.add(jinv_sym)
+
+                    # ---------- (B) order == 1: use grad tables @ J_inv --------------
+                    if tot == 1:
+                        comp = 0 if ox == 1 else 1
+                        rows = []
+                        # bind J_inv[e,q] once
+                        Aq = new_var("Aq")
+                        body_lines.append(f"{Aq} = {jinv_sym}[e, q]")
+                        for fn in field_names:
+                            nm = f"g_{fn}"
+                            required_args.add(nm)
+                            gloc = new_var("g_loc"); prow = new_var("prow")
+                            body_lines += [
+                                f"{gloc} = {nm}[e, q] @ {Aq}",
+                                f"{prow} = {gloc}[:, {comp}]",
+                            ]
+                            if op.side:
+                                map_arr = "pos_map" if op.side == "+" else "neg_map"
+                                required_args.add(map_arr)
+                                pad = new_var("pad"); me = new_var("me")
+                                body_lines += [
+                                    f"{me} = {map_arr}[e]",
+                                    f"n_union = gdofs_map[e].shape[0]",
+                                    f"{pad} = np.zeros(n_union, dtype={self.dtype})",
+                                    "for j in range({}.shape[0]):".format(prow),
+                                    f"    idx = {me}[j]",
+                                    "    if 0 <= idx < n_union:",
+                                    f"        {pad}[idx] = {prow}[j]",
+                                ]
+                                rows.append(pad)
+                            else:
+                                rows.append(prow)
+                        var_name = new_var("d1_stack")
+                        if not op.is_vector:
+                            body_lines.append(f"{var_name} = {rows[0]}[None, :].copy()")
+                            shape = (1, -1 if op.side else self.n_dofs_local)
+                        else:
+                            body_lines.append(f"{var_name} = np.stack(({', '.join(rows)}))")
+                            shape = (len(field_names), -1 if op.side else self.n_dofs_local)
+                        stack.append(StackItem(var_name=var_name, role=op.role, shape=shape,
+                                            is_vector=op.is_vector, field_names=field_names, parent_name=op.name))
+                        continue
+
+                    # ---------- (C) order >= 2: exact chain-rule up to 4 -------------
+                    # choose per-side jet names
+                    if   op.side == "+": A_ = "J_inv_pos"; H0 = "pos_Hxi0"; H1 = "pos_Hxi1"; T0 = "pos_Txi0"; T1 = "pos_Txi1"; Q0 = "pos_Qxi0"; Q1 = "pos_Qxi1"
+                    elif op.side == "-": A_ = "J_inv_neg"; H0 = "neg_Hxi0"; H1 = "neg_Hxi1"; T0 = "neg_Txi0"; T1 = "neg_Txi1"; Q0 = "neg_Qxi0"; Q1 = "neg_Qxi1"
+                    else:                A_ = "J_inv";     H0 = "Hxi0";     H1 = "Hxi1";     T0 = "Txi0";     T1 = "Txi1";     Q0 = "Qxi0";     Q1 = "Qxi1"
+                    required_args.update({A_})
+                    if tot >= 2: required_args.update({H0, H1})
+                    if tot >= 3: required_args.update({T0, T1})
+                    if tot >= 4: required_args.update({Q0, Q1})
+
+                    # bind A locally for use inside loops
+                    A_loc = new_var("Aj")
+                    body_lines.append(f"{A_loc} = {A_}[e, q]")
+
+                    # derivative tables (volume: d.._; facet: r.._pos/neg)
+                    def _tab(name, suff):
+                        return (f"d{name}_{fn}" if not op.side else f"r{name}_{fn}_{'pos' if op.side=='+' else 'neg'}")
+                    need = { "10":"d10", "01":"d01", "20":"d20","11":"d11","02":"d02",
+                            "30":"d30","21":"d21","12":"d12","03":"d03",
+                            "40":"d40","31":"d31","22":"d22","13":"d13","04":"d04" }
+
+                    out_rows = []
+                    for fn in field_names:
+                        names = {}
+                        for key, tag in need.items():
+                            if (tot >= int(key[0])+int(key[1])):     # only what we need
+                                nm = (f"{tag}_{fn}" if not op.side else f"r{key}_{fn}_{'pos' if op.side=='+' else 'neg'}")
+                                required_args.add(nm); names[tag] = nm
+
+                        row = new_var("drow")
+                        # pull all ref-deriv arrays for this field at (e,q)
+                        for tag, nm in names.items():
+                            body_lines.append(f"{tag}_q = {nm}[e, q]")
+                        body_lines += [
+                            "nloc = {}_q.shape[0]".format("d20" if tot>=2 else "d10"),
+                            f"{row} = np.zeros((nloc,), dtype={self.dtype})",
+                        ]
+
+                        # prepare axes list (e.g. [0,0,1] for (2,1))
+                        body_lines.append(f"axes = np.array([{', '.join(map(str, [0]*ox + [1]*oy))}], dtype=np.int32)")
+
+                        # 2nd-order contribution (and extraction of xx/xy/yy)
+                        if tot == 2:
+                            body_lines += [
+                                f"Hx = {H0}[e, q]; Hy = {H1}[e, q]",
+                                f"Href = np.zeros((2,2), dtype={self.dtype})",
+                                "for j in range(nloc):",
+                                "    Href[0,0] = d20_q[j]; Href[0,1] = d11_q[j]; Href[1,0] = d11_q[j]; Href[1,1] = d02_q[j]",
+                                f"    core = {A_loc}.T @ (Href @ {A_loc})",
+                                "    Hphys = core + d10_q[j]*Hx + d01_q[j]*Hy",
+                                "    if   axes[0]==0 and axes[1]==0:  val = Hphys[0,0]",
+                                "    elif axes[0]==1 and axes[1]==1:  val = Hphys[1,1]",
+                                "    else:                              val = Hphys[0,1]",
+                                f"    {row}[j] = val",
+                            ]
+                        elif tot == 3:
+                            body_lines += [
+                                f"Hx = {H0}[e, q]; Hy = {H1}[e, q]; Tx0={T0}[e,q]; Tx1={T1}[e,q]",
+                                "for j in range(nloc):",
+                                "    s = 0.0",
+                                "    # g3 term",
+                                "    for a in (0,1):",
+                                "      for b in (0,1):",
+                                "        for c in (0,1):",
+                                "          ones = (a==1)+(b==1)+(c==1)",
+                                "          g3 = d30_q[j] if ones==0 else (d21_q[j] if ones==1 else (d12_q[j] if ones==2 else d03_q[j]))",
+                                f"          s += g3 * {A_loc}[a, axes[0]] * {A_loc}[b, axes[1]] * {A_loc}[c, axes[2]]",
+                                "    # g2 · A2 term (3 permutations)",
+                                "    for a in (0,1):",
+                                "      for b in (0,1):",
+                                "        g2 = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])",
+                                "        Hb = Hx if b==0 else Hy",
+                                f"        s += g2 * ( {A_loc}[a,axes[0]]*Hb[axes[1],axes[2]] + {A_loc}[a,axes[1]]*Hb[axes[0],axes[2]] + {A_loc}[a,axes[2]]*Hb[axes[0],axes[1]] )",
+                                "    # g1 · A3 term",
+                                "    s += d10_q[j] * Tx0[axes[0],axes[1],axes[2]] + d01_q[j] * Tx1[axes[0],axes[1],axes[2]]",
+                                f"    {row}[j] = s",
+                            ]
+                        else:  # tot == 4
+                            body_lines += [
+                                f"Hx = {H0}[e, q]; Hy = {H1}[e, q]; Tx0={T0}[e,q]; Tx1={T1}[e,q]; Qx0={Q0}[e,q]; Qx1={Q1}[e,q]",
+                                "for j in range(nloc):",
+                                "    s = 0.0",
+                                "    # g4 term",
+                                "    for a in (0,1):",
+                                "      for b in (0,1):",
+                                "        for c in (0,1):",
+                                "          for d in (0,1):",
+                                "            ones = (a==1)+(b==1)+(c==1)+(d==1)",
+                                "            g4 = d40_q[j] if ones==0 else (d31_q[j] if ones==1 else (d22_q[j] if ones==2 else (d13_q[j] if ones==3 else d04_q[j])))",
+                                f"            s += g4 * {A_loc}[a,axes[0]]*{A_loc}[b,axes[1]]*{A_loc}[c,axes[2]]*{A_loc}[d,axes[3]]",
+                                "    # g3 · A2 term (choose the A2 holder, choose a pair)",
+                                "    for a in (0,1):",
+                                "      for b in (0,1):",
+                                "        for c in (0,1):",
+                                "          g3v = d30_q[j] if (a+b+c)==0 else (d21_q[j] if (a+b+c)==1 else (d12_q[j] if (a+b+c)==2 else d03_q[j]))",
+                                "          for holder in (0,1,2):",
+                                "            hb = [a,b,c][holder]",
+                                "            Hb = Hx if hb==0 else Hy",
+                                "            others = [a,b,c][:holder]+[a,b,c][holder+1:]",
+                                "            for p in range(4):",
+                                "              for q in range(p+1,4):",
+                                "                r = [0,1,2,3]",
+                                "                r.remove(p); r.remove(q)",
+                                f"                s += g3v * Hb[axes[p],axes[q]] * {A_loc}[others[0],axes[r[0]]] * {A_loc}[others[1],axes[r[1]]]",
+                                "    # g2 · (A2·A2) term",
+                                "    for a in (0,1):",
+                                "      for b in (0,1):",
+                                "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])",
+                                "        Ha = Hx if a==0 else Hy; Hb = Hx if b==0 else Hy",
+                                "        s += g2v * ( Ha[axes[0],axes[1]]*Hb[axes[2],axes[3]] + Ha[axes[0],axes[2]]*Hb[axes[1],axes[3]] + Ha[axes[0],axes[3]]*Hb[axes[1],axes[2]] )",
+                                "    # g2 · A3 term (pick the single-A index)",
+                                "    for a in (0,1):",
+                                "      for b in (0,1):",
+                                "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])",
+                                "        Tb = Tx0 if b==0 else Tx1; Ta = Tx0 if a==0 else Tx1",
+                                "        for p in range(4):",
+                                "            rest = [axes[i] for i in range(4) if i != p]",
+                                f"            s += g2v * ( {A_loc}[a,axes[p]] * Tb[rest[0],rest[1],rest[2]] + {A_loc}[b,axes[p]] * Ta[rest[0],rest[1],rest[2]] )",
+                                "    # g1 · A4 term",
+                                "    s += d10_q[j] * Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_q[j] * Qx1[axes[0],axes[1],axes[2],axes[3]]",
+                                f"    {row}[j] = s",
+                            ]
+
+                        # Pad to union if side-restricted
+                        if op.side:
+                            map_arr = "pos_map" if op.side == "+" else "neg_map"
+                            required_args.add(map_arr)
+                            pad = new_var("pad"); me = new_var("me")
+                            body_lines += [
+                                f"{me} = {map_arr}[e]",
+                                "n_union = gdofs_map[e].shape[0]",
+                                f"{pad} = np.zeros(n_union, dtype={self.dtype})",
+                                "for j in range(nloc):",
+                                f"    idx = {me}[j]",
+                                "    if 0 <= idx < n_union:",
+                                f"        {pad}[idx] = {row}[j]",
+                            ]
+                            out_rows.append(pad)
+                        else:
+                            out_rows.append(row)
+
+                    # stack per-component rows
+                    var_name = new_var("d_stack")
+                    if not op.is_vector:
+                        body_lines.append(f"{var_name} = {out_rows[0]}[None, :].copy()")
+                        shape = (1, -1 if op.side else self.n_dofs_local)
+                    else:
+                        body_lines.append(f"{var_name} = np.stack(({', '.join(out_rows)}))")
+                        shape = (len(field_names), -1 if op.side else self.n_dofs_local)
+
+                    stack.append(StackItem(var_name=var_name, role=op.role, shape=shape,
+                                        is_vector=op.is_vector, field_names=field_names, parent_name=op.name))
+                    continue
+
+
+                
 
                 # ------------------------------------------------------------------
                 # 3. Coefficient / Function values  –– scalar **and** vector
                 # ------------------------------------------------------------------
                 elif op.role == "function":
                     # --------------------------------------------------------------
-                    # 3‑A  Which coefficient array do we need?  (single array)
+                    # 3-A  Which coefficient array do we need?  (single array)
                     # --------------------------------------------------------------
                     # If the very next op is a derivative, don't build u(x_q) via b_*
                     # Just pass through the coefficient; derivative op will collapse
@@ -625,11 +820,19 @@ class NumbaCodeGen:
                         )
                         continue
 
-                    # --- Otherwise: we truly need the value u(x_q) via b_* ---
-
+                    # --- Otherwise: we truly need either u(x_q) or D^{(ox,oy)}u(x_q) ---
+                    # Pick side-specific J^{-1} symbol for mapping (used below)
+                    if op.side == "+":
+                        jinv_sym = "J_inv_pos"
+                    elif op.side == "-":
+                        jinv_sym = "J_inv_neg"
+                    else:
+                        jinv_sym = "J_inv"
+                    required_args.add(jinv_sym)
 
                     # --------------------------------------------------------------
-                    # 3‑B  Pad reference bases to the DOF‑union on ghost facets
+                    # 3-B  Pad reference bases to the DOF-union on ghost facets
+                    #      (only used for tot==0 path that uses b_* tables)
                     # --------------------------------------------------------------
                     if op.side:                                            # "+" or "-"
                         map_array_name = "pos_map" if op.side == "+" else "neg_map"
@@ -660,34 +863,214 @@ class NumbaCodeGen:
                             padded.append(pad)
 
                         basis_vars_at_q = padded             # hand padded list forward
-                    # volume / interface: basis_vars_at_q already fine
+                    # volume/interface: basis_vars_at_q already fine
 
                     # --------------------------------------------------------------
-                    # 3‑C  Evaluate u_h(x_q)  (scalar or vector)
+                    # 3-C  Evaluate u_h or its derivative at x_q (scalar or vector)
                     # --------------------------------------------------------------
                     val_var = new_var(f"{op.name}_val")
+                    ox, oy = deriv_order
+                    tot = ox + oy
 
-                    if op.is_vector:
-                        # one dot product per component, same coefficient array
-                        comps = [f"np.dot({b_var}, {coeff_sym})" for b_var in basis_vars_at_q]
-                        body_lines.append(f"{val_var} = np.array([{', '.join(comps)}])")
-                        shape = (len(field_names),)           # e.g. (2,)
+                    # --- Case 0: value u(x_q) via b_* --------------------------------
+                    if tot == 0:
+                        if op.is_vector:
+                            comps = [f"np.dot({b_var}, {coeff_sym})" for b_var in basis_vars_at_q]
+                            body_lines.append(f"{val_var} = np.array([{', '.join(comps)}])")
+                            shape = (len(field_names),)
+                        else:
+                            body_lines.append(f"{val_var} = np.dot({basis_vars_at_q[0]}, {coeff_sym})")
+                            shape = ()
                     else:
-                        body_lines.append(f"{val_var} = np.dot({basis_vars_at_q[0]}, {coeff_sym})")
-                        shape = ()
+                        # We need D^{(ox,oy)}u_h. Build per-component derivative rows,
+                        # (pad to union if sided), then dot with the coefficient vector.
+
+                        # Utility: reference derivative table name (sided vs unsided)
+                        def tab_name(fn: str, tag: str) -> str:
+                            if op.side == "+":
+                                return f"r{tag}_{fn}_pos"
+                            elif op.side == "-":
+                                return f"r{tag}_{fn}_neg"
+                            else:
+                                return f"d{tag}_{fn}"
+
+                        rows_vec = []
+
+                        if tot == 1:
+                            # First order: grad_phys[:,comp] = [d10, d01] @ J_inv[:,comp]
+                            comp = 0 if ox == 1 else 1
+                            for fn in field_names:
+                                d10n = tab_name(fn, "10")
+                                d01n = tab_name(fn, "01")
+                                required_args.update({d10n, d01n})
+
+                                # fetch reference first-derivative rows at (e,q)
+                                d10q = new_var("d10_q"); d01q = new_var("d01_q"); row = new_var("row")
+                                body_lines += [
+                                    f"{d10q} = {d10n}[e,q]",
+                                    f"{d01q} = {d01n}[e,q]",
+                                    f"{row} = {d10q} * {jinv_sym}[e,q][0,{comp}] + {d01q} * {jinv_sym}[e,q][1,{comp}]",
+                                ]
+
+                                # pad to union if sided
+                                rv = new_var("rv")
+                                if op.side:
+                                    map_arr = "pos_map" if op.side == "+" else "neg_map"
+                                    required_args.add(map_arr)
+                                    pad = new_var("pad"); mep = new_var("mapp")
+                                    body_lines += [
+                                        f"{mep} = {map_arr}[e]",
+                                        "n_union = gdofs_map[e].shape[0]",
+                                        f"{pad} = np.zeros(n_union, dtype={self.dtype})",
+                                        f"for j in range({row}.shape[0]):",
+                                        f"    idx = {mep}[j]",
+                                        "    if 0 <= idx < n_union:",
+                                        f"        {pad}[idx] = {row}[j]",
+                                        f"{rv} = float(np.dot({coeff_sym}, {pad}))",
+                                    ]
+                                else:
+                                    body_lines.append(f"{rv} = float(np.dot({coeff_sym}, {row}))")
+                                rows_vec.append(rv)
+
+                        else:
+                            # Orders 2..4: exact chain rule with inverse-map jets (side-aware).
+                            if   op.side == "+": A_="J_inv_pos"; H0="pos_Hxi0"; H1="pos_Hxi1"; T0="pos_Txi0"; T1="pos_Txi1"; Q0="pos_Qxi0"; Q1="pos_Qxi1"
+                            elif op.side == "-": A_="J_inv_neg"; H0="neg_Hxi0"; H1="neg_Hxi1"; T0="neg_Txi0"; T1="neg_Txi1"; Q0="neg_Qxi0"; Q1="neg_Qxi1"
+                            else:                A_="J_inv";     H0="Hxi0";     H1="Hxi1";     T0="Txi0";     T1="Txi1";     Q0="Qxi0";     Q1="Qxi1"
+                            required_args.add(A_)
+                            if tot >= 2: required_args.update({H0, H1})
+                            if tot >= 3: required_args.update({T0, T1})
+                            if tot >= 4: required_args.update({Q0, Q1})
+
+                            # bind A locally in the generated kernel
+                            A_loc = new_var("Aj")
+                            body_lines.append(f"{A_loc} = {A_}[e,q]")
+
+                            # which reference derivative tables we need
+                            need_tags = ["10","01","20","11","02"]
+                            if tot >= 3: need_tags += ["30","21","12","03"]
+                            if tot >= 4: need_tags += ["40","31","22","13","04"]
+
+                            for fn in field_names:
+                                # bring in reference tables for this component at (e,q)
+                                for tg in need_tags:
+                                    nm = tab_name(fn, tg)
+                                    required_args.add(nm)
+                                    body_lines.append(f"d{tg}_q = {nm}[e,q]")
+
+                                body_lines.append("nloc = d20_q.shape[0]")
+                                row = new_var("row")
+                                body_lines.append(f"{row} = np.zeros((nloc,), dtype={self.dtype})")
+
+                                # axes list (e.g. [0,0] for (2,0); [0,1] for (1,1); ...)
+                                axes_lit = ",".join(["0"]*ox + ["1"]*oy)
+                                body_lines.append(f"axes = np.array([{axes_lit}], dtype=np.int32)")
+
+                                if tot == 2:
+                                    body_lines += [
+                                        f"Hx = {H0}[e,q]; Hy = {H1}[e,q]",
+                                        "Href = np.zeros((2,2), dtype={})".format(self.dtype),
+                                        "for j in range(nloc):",
+                                        "    Href[0,0]=d20_q[j]; Href[0,1]=d11_q[j]; Href[1,0]=d11_q[j]; Href[1,1]=d02_q[j]",
+                                        f"    core = {A_loc}.T @ (Href @ {A_loc})",
+                                        "    Hphys = core + d10_q[j]*Hx + d01_q[j]*Hy",
+                                        "    if   axes[0]==0 and axes[1]==0:  val = Hphys[0,0]",
+                                        "    elif axes[0]==1 and axes[1]==1:  val = Hphys[1,1]",
+                                        "    else:                              val = Hphys[0,1]",
+                                        f"    {row}[j] = val",
+                                    ]
+                                elif tot == 3:
+                                    body_lines += [
+                                        f"Hx = {H0}[e,q]; Hy = {H1}[e,q]; Tx0={T0}[e,q]; Tx1={T1}[e,q]",
+                                        "for j in range(nloc):",
+                                        "    s = 0.0",
+                                        "    # g3 term",
+                                        "    for a in (0,1):",
+                                        "      for b in (0,1):",
+                                        "        for c in (0,1):",
+                                        "          ones = (a==1)+(b==1)+(c==1)",
+                                        "          g3 = d30_q[j] if ones==0 else (d21_q[j] if ones==1 else (d12_q[j] if ones==2 else d03_q[j]))",
+                                        f"          s += g3 * {A_loc}[a,axes[0]]*{A_loc}[b,axes[1]]*{A_loc}[c,axes[2]]",
+                                        "    # g2 · A2 (3 permutations)",
+                                        "    for a in (0,1):",
+                                        "      for b in (0,1):",
+                                        "        g2 = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])",
+                                        "        Hb = Hx if b==0 else Hy",
+                                        f"        s += g2 * ( {A_loc}[a,axes[0]]*Hb[axes[1],axes[2]] + {A_loc}[a,axes[1]]*Hb[axes[0],axes[2]] + {A_loc}[a,axes[2]]*Hb[axes[0],axes[1]] )",
+                                        "    # g1 · A3",
+                                        "    s += d10_q[j]*Tx0[axes[0],axes[1],axes[2]] + d01_q[j]*Tx1[axes[0],axes[1],axes[2]]",
+                                        f"    {row}[j] = s",
+                                    ]
+                                else:  # tot == 4
+                                    body_lines += [
+                                        f"Hx = {H0}[e,q]; Hy = {H1}[e,q]; Tx0={T0}[e,q]; Tx1={T1}[e,q]; Qx0={Q0}[e,q]; Qx1={Q1}[e,q]",
+                                        "for j in range(nloc):",
+                                        "    s = 0.0",
+                                        "    # g4 term",
+                                        "    for a in (0,1):",
+                                        "      for b in (0,1):",
+                                        "        for c in (0,1):",
+                                        "          for d in (0,1):",
+                                        "            ones = (a==1)+(b==1)+(c==1)+(d==1)",
+                                        "            g4 = d40_q[j] if ones==0 else (d31_q[j] if ones==1 else (d22_q[j] if ones==2 else (d13_q[j] if ones==3 else d04_q[j])))",
+                                        f"            s += g4 * {A_loc}[a,axes[0]]*{A_loc}[b,axes[1]]*{A_loc}[c,axes[2]]*{A_loc}[d,axes[3]]",
+                                        "    # g3 · A2 (place A2 in one slot, A in the others)",
+                                        "    for a in (0,1):",
+                                        "      for b in (0,1):",
+                                        "        g3v = d30_q[j] if (a+b)==0 else (d21_q[j] if (a+b)==1 else (d12_q[j] if (a+b)==2 else d03_q[j]))",
+                                        "        for holder in (0,1,2):",
+                                        "            hb = [a,b,0][holder]  # dummy pick; indices only drive ones count",
+                                        "            Hb = Hx if hb==0 else Hy",
+                                        "            for p in range(4):",
+                                        "              for q2 in range(p+1,4):",
+                                        "                r = [0,1,2,3]",
+                                        "                r.remove(p); r.remove(q2)",
+                                        f"                s += g3v * Hb[axes[p],axes[q2]] * {A_loc}[a,axes[r[0]]] * {A_loc}[b,axes[r[1]]]",
+                                        "    # g2 · (A2·A2) + g2 · A3",
+                                        "    for a in (0,1):",
+                                        "      for b in (0,1):",
+                                        "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])",
+                                        "        Ha = Hx if a==0 else Hy; Hb = Hx if b==0 else Hy",
+                                        "        s += g2v * ( Ha[axes[0],axes[1]]*Hb[axes[2],axes[3]] + Ha[axes[0],axes[2]]*Hb[axes[1],axes[3]] + Ha[axes[0],axes[3]]*Hb[axes[1],axes[2]] )",
+                                        "        Tb = Tx0 if b==0 else Tx1; Ta = Tx0 if a==0 else Tx1",
+                                        "        for p in range(4):",
+                                        "            rest = [axes[i] for i in range(4) if i != p]",
+                                        f"            s += g2v * ( {A_loc}[a,axes[p]] * Tb[rest[0],rest[1],rest[2]] + {A_loc}[b,axes[p]] * Ta[rest[0],rest[1],rest[2]] )",
+                                        "    # g1 · A4",
+                                        "    s += d10_q[j]*Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_q[j]*Qx1[axes[0],axes[1],axes[2],axes[3]]",
+                                        f"    {row}[j] = s",
+                                    ]
+
+                                # collapse with coefficients; pad to union if sided
+                                rv = new_var("rv")
+                                if op.side:
+                                    map_arr = "pos_map" if op.side == "+" else "neg_map"
+                                    required_args.add(map_arr)
+                                    pad = new_var("pad"); mep = new_var("mapp")
+                                    body_lines += [
+                                        f"{mep} = {map_arr}[e]",
+                                        "n_union = gdofs_map[e].shape[0]",
+                                        f"{pad} = np.zeros(n_union, dtype={self.dtype})",
+                                        "for j in range(nloc):",
+                                        f"    idx = {mep}[j]",
+                                        "    if 0 <= idx < n_union:",
+                                        f"        {pad}[idx] = {row}[j]",
+                                        f"{rv} = float(np.dot({coeff_sym}, {pad}))",
+                                    ]
+                                else:
+                                    body_lines.append(f"{rv} = float(np.dot({coeff_sym}, {row}))")
+                                rows_vec.append(rv)
+
+                        # Final value (scalar or vector)
+                        if op.is_vector:
+                            body_lines.append(f"{val_var} = np.array([{', '.join(rows_vec)}], dtype={self.dtype})")
+                            shape = (len(field_names),)
+                        else:
+                            body_lines.append(f"{val_var} = float({rows_vec[0]})")
+                            shape = ()
 
                     # --------------------------------------------------------------
-                    # 3‑D  Optional ξ‑derivative rescaling
-                    # --------------------------------------------------------------
-                    if deriv_order != (0, 0):
-                        dx, dy = deriv_order
-                        jinv_q = f"{jinv_sym}_q"
-                        body_lines.append(
-                            f"{val_var} *= ({jinv_q}[0,0]**{dx}) * ({jinv_q}[1,1]**{dy})"
-                        )
-
-                    # --------------------------------------------------------------
-                    # 3‑E  Push onto stack
+                    # 3-E  Push onto stack
                     # --------------------------------------------------------------
                     stack.append(
                         StackItem(
@@ -699,6 +1082,8 @@ class NumbaCodeGen:
                             parent_name = coeff_sym
                         )
                     )
+
+
 
                 else:
                     raise TypeError(f"Unknown role '{op.role}' for LoadVariable IR node.")
@@ -2138,7 +2523,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = False
+            DEBUG: bool = True
         ):
         """
         Build complete kernel source code with parallel assembly.

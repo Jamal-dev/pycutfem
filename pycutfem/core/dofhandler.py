@@ -13,6 +13,7 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.core.topology import Node, Edge, Element
 from pycutfem.ufl.forms import BoundaryCondition
 from pycutfem.fem import transform
+from pycutfem.fem.reference import get_reference
 from pycutfem.integration.quadrature import volume
 from collections.abc import Sequence
 from hashlib import blake2b
@@ -21,6 +22,8 @@ from pycutfem.ufl.helpers_geom import (
     phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
 )
 from pycutfem.utils.bitset import BitSet
+from pycutfem.fem import transform
+_JET = transform.InverseJetCache()  # module-scope 
 
 
 
@@ -700,6 +703,8 @@ class DofHandler:
         level_set: Callable = None,
         reuse: bool = True,
         need_hess: bool = False,
+        need_o3: bool = False,
+        need_o4: bool = False
     ) -> Dict[str, np.ndarray]:
         """
         Precompute physical quadrature data (geometry, weights, optional level-set).
@@ -710,10 +715,11 @@ class DofHandler:
         normals (nE,nQ,2), phis (nE,nQ or None), h_arr (nE,), eids (nE,),
         owner_id (nE,), entity_kind="element".
         If need_hess=True, also Hxi0/Hxi1 (nE,nQ,2,2) are returned.
+        If need_o3=True   → also Txi0/Txi1 (nE,nQ,2,2,2).
+        If need_o4=True   → also Qxi0/Qxi1 (nE,nQ,2,2,2,2).
         """
         import numpy as np
         from typing import Dict, Callable
-        from pycutfem.fem.reference import get_reference
         from pycutfem.fem import transform
         from pycutfem.integration.quadrature import volume as _volume_rule
 
@@ -755,21 +761,45 @@ class DofHandler:
                     for q in range(nQ):
                         phis[e, q] = level_set(qp[e, q])
 
-            # On-demand Hξ if requested (not cached)
-            if need_hess:
-                Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=np.float64)
-                Hxi1 = np.zeros_like(Hxi0)
-                # Reconstruct reference (ξ,η) by inverse map at cached qp_phys
+            # On-demand inverse-map jets if requested (not cached; use qp_ref to avoid inverse mapping)
+            if need_hess or need_o3 or need_o4:
+                qp_ref = geo.get("qp_ref", None)
+                if qp_ref is None:
+                    from pycutfem.integration.quadrature import volume as _volume_rule
+                    qp_ref, _ = _volume_rule(mesh.element_type, quad_order)
+                    qp_ref = np.asarray(qp_ref, dtype=np.float64)
+                kmax = 4 if need_o4 else (3 if need_o3 else 2)
+                # allocate only what’s requested
+                out = {}
+                if need_hess:
+                    out["Hxi0"] = np.zeros((nE, nQ, 2, 2), dtype=np.float64)
+                    out["Hxi1"] = np.zeros((nE, nQ, 2, 2), dtype=np.float64)
+                if need_o3:
+                    out["Txi0"] = np.zeros((nE, nQ, 2, 2, 2), dtype=np.float64)
+                    out["Txi1"] = np.zeros((nE, nQ, 2, 2, 2), dtype=np.float64)
+                if need_o4:
+                    out["Qxi0"] = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=np.float64)
+                    out["Qxi1"] = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=np.float64)
+                # fill from inverse-jet cache
+                eids = geo["eids"]
                 for e in range(nE):
-                    eid = int(geo["eids"][e])
+                    eid = int(eids[e])
                     for q in range(nQ):
-                        xi, eta = transform.inverse_mapping(mesh, eid, qp[e, q])
-                        _, _, H0, H1 = transform.element_Hxi(mesh, eid, (float(xi), float(eta)))
-                        Hxi0[e, q] = H0
-                        Hxi1[e, q] = H1
-                return {**geo, "phis": phis, "Hxi0": Hxi0, "Hxi1": Hxi1}
-
-            return {**geo, "phis": phis}
+                        xi, eta = float(qp_ref[q, 0]), float(qp_ref[q, 1])
+                        rec = _JET.get(mesh, eid, xi, eta, upto=kmax)
+                        if need_hess:
+                            A2 = rec["A2"]  # (2,2,2)
+                            out["Hxi0"][e, q] = A2[0]
+                            out["Hxi1"][e, q] = A2[1]
+                        if need_o3:
+                            A3 = rec["A3"]  # (2,2,2,2)
+                            out["Txi0"][e, q] = A3[0]
+                            out["Txi1"][e, q] = A3[1]
+                        if need_o4:
+                            A4 = rec["A4"]  # (2,2,2,2,2)
+                            out["Qxi0"][e, q] = A4[0]
+                            out["Qxi1"][e, q] = A4[1]
+                return {**geo, "phis": phis, **out}
 
         # ---------------------- reference quadrature -----------------------------
         qp_ref, qw_ref = _volume_rule(mesh.element_type, quad_order)  # (nQ,2), (nQ,)
@@ -778,7 +808,8 @@ class DofHandler:
         n_q    = int(qw_ref.shape[0])
 
         # ---------------------- reference shape/grad tables ----------------------
-        ref = get_reference(mesh.element_type, mesh.poly_order)
+        kmax = 4 if need_o4 else (3 if need_o3 else 2)
+        ref = get_reference(mesh.element_type, mesh.poly_order, max_deriv_order=kmax)
         # infer n_loc from a single evaluation (Ref has no n_functions accessor)
         n_loc = int(np.asarray(ref.shape(qp_ref[0, 0], qp_ref[0, 1])).size)
         Ntab  = np.empty((n_q, n_loc), dtype=np.float64)        # (nQ, n_loc)
@@ -883,24 +914,47 @@ class DofHandler:
             "eids":    eids,
             "owner_id": eids.copy(),
             "entity_kind": "element",
+            # store qp_ref in cache so jets never need inverse-mapping on reuse
+            # "qp_ref":  qp_ref,
         }
 
-        # Compute Hξ tensors if requested (and include in cached geometry)
-        if need_hess:
-            Hxi0 = np.zeros((n_el, n_q, 2, 2), dtype=np.float64)
-            Hxi1 = np.zeros_like(Hxi0)
+        # Compute inverse-map jets if requested (not cached with geometry)
+        if need_hess or need_o3 or need_o4:
+            
+            if need_hess:
+                Hxi0 = np.zeros((n_el, n_q, 2, 2), dtype=np.float64)
+                Hxi1 = np.zeros_like(Hxi0)
+            if need_o3:
+                Txi0 = np.zeros((n_el, n_q, 2, 2, 2), dtype=np.float64)
+                Txi1 = np.zeros_like(Txi0)
+            if need_o4:
+                Qxi0 = np.zeros((n_el, n_q, 2, 2, 2, 2), dtype=np.float64)
+                Qxi1 = np.zeros_like(Qxi0)
             for e in range(n_el):
                 eid = int(eids[e])
-                for q, (xi, eta) in enumerate(qp_ref):
-                    _, _, H0, H1 = transform.element_Hxi(mesh, eid, (float(xi), float(eta)))
-                    Hxi0[e, q] = H0
-                    Hxi1[e, q] = H1
-            geo["Hxi0"] = Hxi0
-            geo["Hxi1"] = Hxi1
+                for q in range(n_q):
+                    xi, eta = float(qp_ref[q, 0]), float(qp_ref[q, 1])
+                    rec = _JET.get(mesh, eid, xi, eta, upto=kmax)
+                    if need_hess:
+                        A2 = rec["A2"]
+                        Hxi0[e, q] = A2[0]; Hxi1[e, q] = A2[1]
+                    if need_o3:
+                        A3 = rec["A3"]
+                        Txi0[e, q] = A3[0]; Txi1[e, q] = A3[1]
+                    if need_o4:
+                        A4 = rec["A4"]
+                        Qxi0[e, q] = A4[0]; Qxi1[e, q] = A4[1]
+            if need_hess:
+                geo["Hxi0"] = Hxi0; geo["Hxi1"] = Hxi1
+            if need_o3:
+                geo["Txi0"] = Txi0; geo["Txi1"] = Txi1
+            if need_o4:
+                geo["Qxi0"] = Qxi0; geo["Qxi1"] = Qxi1
 
         # Cache *geometry only* (no phis)
         if reuse:
-            _volume_geom_cache[geom_key] = {k: v for k, v in geo.items() if k not in ("Hxi0", "Hxi1")}
+            _volume_geom_cache[geom_key] = {k: v for k, v in geo.items()
+                                            if k not in ("Hxi0","Hxi1","Txi0","Txi1","Qxi0","Qxi1","phis")}
 
         # On-demand φ(xq) evaluation (cheap vs. geometry)
         phis = None
@@ -910,7 +964,7 @@ class DofHandler:
                 for q in range(n_q):
                     phis[e, q] = level_set(qp_phys[e, q])
 
-        # If we computed Hξ above, return them; otherwise return geometry+phis.
+        # Return geometry + phis + any requested jets (if present in geo)
         ret = {**geo, "phis": phis}
         return ret
 
@@ -929,6 +983,8 @@ class DofHandler:
         level_set,
         reuse: bool = True,
         need_hess: bool = False,
+        need_o3: bool = False,
+        need_o4: bool = False
     ) -> dict:
         """
         Pre-compute geometry & basis tables for ∫_{interface∩element} ⋯ dS on *cut* elements.
@@ -940,7 +996,6 @@ class DofHandler:
         from pycutfem.core.levelset import CircleLevelSet, AffineLevelSet
         from pycutfem.core.levelset import _circle_value, _circle_grad, _affine_value, _affine_unit_grad  # type: ignore
         from pycutfem.fem import transform
-        from pycutfem.fem.reference import get_reference
         from pycutfem.integration.pre_tabulates import (
             _tabulate_p1, _tabulate_q2, _tabulate_q1,
             _tabulate_deriv_q1, _tabulate_deriv_q2, _tabulate_deriv_p1,
@@ -1000,7 +1055,7 @@ class DofHandler:
             _interface_cache
         except NameError:
             _interface_cache = {}
-        cache_key = (_hash_subset(valid_cut_eids), int(qdeg), me.signature(), self.method, bool(need_hess), id(level_set))
+        cache_key = (_hash_subset(valid_cut_eids), int(qdeg), me.signature(), self.method, bool(need_hess), bool(need_o3), bool(need_o4), id(level_set))
         if reuse and cache_key in _interface_cache:
             return _interface_cache[cache_key]
 
@@ -1030,9 +1085,27 @@ class DofHandler:
                     out[f"d20_{fld}"] = np.empty((0, 0, n_union), dtype=float)
                     out[f"d11_{fld}"] = np.empty((0, 0, n_union), dtype=float)
                     out[f"d02_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+                if need_o3:
+                    out[f"d30_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+                    out[f"d21_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+                    out[f"d12_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+                    out[f"d03_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+                if need_o4:
+                    out[f"d40_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+                    out[f"d31_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+                    out[f"d22_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+                    out[f"d13_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+                    out[f"d04_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+            
             if need_hess:
                 out["Hxi0"] = np.empty((0, 0, 2, 2), dtype=float)
                 out["Hxi1"] = np.empty((0, 0, 2, 2), dtype=float)
+            if need_o3:
+                out["Txi0"] = np.empty((0, 0, 2, 2, 2), dtype=float)
+                out["Txi1"] = np.empty((0, 0, 2, 2, 2), dtype=float)
+            if need_o4:
+                out["Qxi0"] = np.empty((0, 0, 2, 2, 2, 2), dtype=float)
+                out["Qxi1"] = np.empty((0, 0, 2, 2, 2, 2), dtype=float)
             if reuse:
                 _interface_cache[cache_key] = out
             return out
@@ -1109,6 +1182,7 @@ class DofHandler:
         nLocGeom     = coords_sel.shape[1]
 
         have_jit_ref = False
+        kmax = 4 if need_o4 else (3 if need_o3 else 2)
         # Build dN_tab (nE, nQ, nLocGeom, 2) and, if available, N_tab (for basis fill)
         if _HAVE_NUMBA and elem_type == "tri" and p_geom == 1:
             N_tab  = np.empty((nE, nQ, 3), dtype=float)
@@ -1126,7 +1200,7 @@ class DofHandler:
             _tabulate_q2(xi_tab, eta_tab, N_tab, dN_tab)
             have_jit_ref = True
         else:
-            ref = get_reference(elem_type, p_geom)
+            ref = get_reference(elem_type, p_geom, max_deriv_order=kmax)
             dN_tab = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
             for k in range(nE):
                 for q in range(nQ):
@@ -1214,10 +1288,14 @@ class DofHandler:
                     g_tabs[fld][k, q, sl, :] = me._eval_scalar_grad (fld, s, t)
 
         # --- Reference derivative tables d.._{field} for codegen (no push-forward) --
-        # Always provide d10/d01 when requested; when need_hess, also d20/d11/d02.
-        base_derivs = set()
+        # Up to the requested max: 1st (always), 2nd (need_hess), 3rd (need_o3), 4th (need_o4)
+        base_derivs = {(1,0), (0,1)}
         if need_hess:
-            base_derivs.update({(1,0),(0,1),(2,0),(1,1),(0,2)})
+            base_derivs.update({(2,0), (1,1), (0,2)})
+        if need_o3:
+            base_derivs.update({(3,0), (2,1), (1,2), (0,3)})
+        if need_o4:
+            base_derivs.update({(4,0), (3,1), (2,2), (1,3), (0,4)})
         # If caller also asked for specific derivs, include them (superset)
         base_derivs |= set(getattr(self, "_last_requested_interface_derivs", set()))  # optional reuse
         # In case function parameter 'derivs' exists in your signature elsewhere:
@@ -1254,15 +1332,38 @@ class DofHandler:
                 arr[:, :, sl] = loc
                 d_tabs[f"d{dx}{dy}_{fld}"] = arr
 
-        # --- Hξ tensors for chain rule (if Hessian is needed) ----------------------
-        if need_hess:
-            Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
-            Hxi1 = np.zeros_like(Hxi0)
+        # --- Inverse-map jets for chain rule (Hxi: 2nd, Txi: 3rd, Qxi: 4th) -------
+        if need_hess or need_o3 or need_o4:
+            kmax = 4 if need_o4 else (3 if need_o3 else 2)
+            if need_hess:
+                Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+                Hxi1 = np.zeros_like(Hxi0)
+            if need_o3:
+                Txi0 = np.zeros((nE, nQ, 2, 2, 2), dtype=float)
+                Txi1 = np.zeros_like(Txi0)
+            if need_o4:
+                Qxi0 = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=float)
+                Qxi1 = np.zeros_like(Qxi0)
+
+            # Use module-level inverse-jet cache; (xi_tab, eta_tab) already computed
             for i, eid in enumerate(valid_cut_eids):
+                eidi = int(eid)
                 for q in range(nQ):
-                    _, _, H0, H1 = transform.element_Hxi(mesh, int(eid), (float(xi_tab[i, q]), float(eta_tab[i, q])))
-                    Hxi0[i, q] = H0
-                    Hxi1[i, q] = H1
+                    xi = float(xi_tab[i, q]); eta = float(eta_tab[i, q])
+                    rec = _JET.get(mesh, eidi, xi, eta, upto=kmax)
+                    if need_hess:
+                        A2 = rec["A2"]            # (2,2,2)
+                        Hxi0[i, q] = A2[0]
+                        Hxi1[i, q] = A2[1]
+                    if need_o3:
+                        A3 = rec["A3"]            # (2,2,2,2)
+                        Txi0[i, q] = A3[0]
+                        Txi1[i, q] = A3[1]
+                    if need_o4:
+                        A4 = rec["A4"]            # (2,2,2,2,2)
+                        Qxi0[i, q] = A4[0]
+                        Qxi1[i, q] = A4[1]
+
 
         # --- Pack outputs -----------------------------------------------------------
         out = {
@@ -1293,8 +1394,11 @@ class DofHandler:
             out[f"g_{fld}"] = g_tabs[fld]
         out.update(d_tabs)
         if need_hess:
-            out["Hxi0"] = Hxi0
-            out["Hxi1"] = Hxi1
+            out["Hxi0"] = Hxi0; out["Hxi1"] = Hxi1
+        if need_o3:
+            out["Txi0"] = Txi0; out["Txi1"] = Txi1
+        if need_o4:
+            out["Qxi0"] = Qxi0; out["Qxi1"] = Qxi1
 
         if reuse:
             _interface_cache[cache_key] = out
@@ -1313,14 +1417,15 @@ class DofHandler:
         qdeg: int,
         level_set,
         derivs: set[tuple[int, int]],
-        need_hess: bool = False,
         reuse: bool = True,
+        need_hess: bool = False,
+        need_o3: bool = False,
+        need_o4: bool = False
     ) -> dict:
         import numpy as np
         from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
         from pycutfem.integration.quadrature import line_quadrature
         from pycutfem.fem import transform
-        from pycutfem.fem.reference import get_reference
         from pycutfem.integration.pre_tabulates import (
             _searchsorted_positions,
             _tabulate_deriv_q1, _tabulate_deriv_q2, _tabulate_deriv_p1,
@@ -1374,7 +1479,12 @@ class DofHandler:
 
         # Cache key: use the subset tuple directly (stable & hashable)
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
-        cache_key  = (ghost_ids, int(qdeg), me.signature(), derivs_key, bool(need_hess), self.method)
+        cache_key  = (ghost_ids, int(qdeg), me.signature(), derivs_key, bool(need_hess), bool(need_o3), bool(need_o4), self.method)
+        global _ghost_cache
+        try:
+            _ghost_cache
+        except NameError:
+            _ghost_cache = {}
         if reuse and cache_key in _ghost_cache:
             return _ghost_cache[cache_key]
 
@@ -1475,6 +1585,7 @@ class DofHandler:
         # reference geometry dN on each side
         dN_pos = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
         dN_neg = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
+        kmax = 4 if need_o4 else (3 if need_o3 else 2)
         if mesh.element_type == "quad" and mesh.poly_order == 1:
             _tab_q1(xi_pos, xi_neg*0 + eta_pos, np.empty((nE, nQ, 4)), dN_pos)
             _tab_q1(xi_neg, xi_neg*0 + eta_neg, np.empty((nE, nQ, 4)), dN_neg)
@@ -1485,7 +1596,7 @@ class DofHandler:
             _tab_p1(xi_pos, xi_neg*0 + eta_pos, np.empty((nE, nQ, 3)), dN_pos)
             _tab_p1(xi_neg, xi_neg*0 + eta_neg, np.empty((nE, nQ, 3)), dN_neg)
         else:
-            ref = get_reference(mesh.element_type, mesh.poly_order)
+            ref = get_reference(mesh.element_type, mesh.poly_order, max_deriv_order = kmax)
             for i in range(nE):
                 for q in range(nQ):
                     dN_pos[i, q] = np.asarray(ref.grad(xi_pos[i, q], eta_pos[i, q]))
@@ -1553,6 +1664,8 @@ class DofHandler:
 
             need_grad = any(dx + dy == 1 for dx, dy in derivs) or need_hess
             need_h2   = any(dx + dy == 2 for dx, dy in derivs) or need_hess
+            need_o3rq   = any(dx + dy == 3 for dx, dy in derivs) or need_o3
+            need_o4rq   = any(dx + dy == 4 for dx, dy in derivs) or need_o4
 
             # POS side reference tables
             if need_grad:
@@ -1567,6 +1680,26 @@ class DofHandler:
                 basis_tables[f"r11_{fld}_pos"] = _scatter_union(arr, sl, final_w)
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 2, xi_pos, eta_pos, arr)
                 basis_tables[f"r02_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_o3rq:
+                arr = np.empty((nE, nQ, n_f)); _tab(3, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r30_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(2, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r21_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 2, xi_pos, eta_pos, arr)
+                basis_tables[f"r12_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 3, xi_pos, eta_pos, arr)
+                basis_tables[f"r03_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_o4rq:
+                arr = np.empty((nE, nQ, n_f)); _tab(4, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r40_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(3, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r31_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(2, 2, xi_pos, eta_pos, arr)
+                basis_tables[f"r22_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 3, xi_pos, eta_pos, arr)
+                basis_tables[f"r13_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 4, xi_pos, eta_pos, arr)
+                basis_tables[f"r04_{fld}_pos"] = _scatter_union(arr, sl, final_w)
 
             # NEG side reference tables
             if need_grad:
@@ -1581,21 +1714,66 @@ class DofHandler:
                 basis_tables[f"r11_{fld}_neg"] = _scatter_union(arr, sl, final_w)
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 2, xi_neg, eta_neg, arr)
                 basis_tables[f"r02_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_o3rq:
+                arr = np.empty((nE, nQ, n_f)); _tab(3, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r30_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(2, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r21_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 2, xi_neg, eta_neg, arr)
+                basis_tables[f"r12_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 3, xi_neg, eta_neg, arr)
+                basis_tables[f"r03_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_o4rq:
+                arr = np.empty((nE, nQ, n_f)); _tab(4, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r40_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(3, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r31_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(2, 2, xi_neg, eta_neg, arr)
+                basis_tables[f"r22_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 3, xi_neg, eta_neg, arr)
+                basis_tables[f"r13_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 4, xi_neg, eta_neg, arr)
+                basis_tables[f"r04_{fld}_neg"] = _scatter_union(arr, sl, final_w)
 
-        # 6) Inverse-map Hessians Hξ for chain rule (codegen consumes these) --------
+        # 6) Inverse-map jets for chain rule (sided; up to order 4) -----------------
         pos_Hxi0 = pos_Hxi1 = neg_Hxi0 = neg_Hxi1 = None
-        if need_hess:
-            pos_Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
-            pos_Hxi1 = np.zeros_like(pos_Hxi0)
-            neg_Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
-            neg_Hxi1 = np.zeros_like(neg_Hxi0)
+        if need_hess or need_o3 or need_o4:
+            if need_hess:
+                pos_Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+                pos_Hxi1 = np.zeros_like(pos_Hxi0)
+                neg_Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+                neg_Hxi1 = np.zeros_like(neg_Hxi0)
+            if need_o3:
+                pos_Txi0 = np.zeros((nE, nQ, 2, 2, 2), dtype=float)
+                pos_Txi1 = np.zeros_like(pos_Txi0)
+                neg_Txi0 = np.zeros((nE, nQ, 2, 2, 2), dtype=float)
+                neg_Txi1 = np.zeros_like(neg_Txi0)
+            if need_o4:
+                pos_Qxi0 = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=float)
+                pos_Qxi1 = np.zeros_like(pos_Qxi0)
+                neg_Qxi0 = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=float)
+                neg_Qxi1 = np.zeros_like(neg_Qxi0)
             for i in range(nE):
                 pe = int(pos_ids[i]); ne = int(neg_ids[i])
                 for q in range(nQ):
-                    _, _, H0, H1 = transform.element_Hxi(mesh, pe, (float(xi_pos[i, q]), float(eta_pos[i, q])))
-                    pos_Hxi0[i, q] = H0; pos_Hxi1[i, q] = H1
-                    _, _, H0, H1 = transform.element_Hxi(mesh, ne, (float(xi_neg[i, q]), float(eta_neg[i, q])))
-                    neg_Hxi0[i, q] = H0; neg_Hxi1[i, q] = H1
+                    # POS side
+                    rec = _JET.get(mesh, pe, float(xi_pos[i, q]), float(eta_pos[i, q]),
+                                   upto = 4 if need_o4 else (3 if need_o3 else 2))
+                    if need_hess:
+                        A2 = rec["A2"]; pos_Hxi0[i, q] = A2[0]; pos_Hxi1[i, q] = A2[1]
+                    if need_o3:
+                        A3 = rec["A3"]; pos_Txi0[i, q] = A3[0]; pos_Txi1[i, q] = A3[1]
+                    if need_o4:
+                        A4 = rec["A4"]; pos_Qxi0[i, q] = A4[0]; pos_Qxi1[i, q] = A4[1]
+                    # NEG side
+                    rec = _JET.get(mesh, ne, float(xi_neg[i, q]), float(eta_neg[i, q]),
+                                   upto = 4 if need_o4 else (3 if need_o3 else 2))
+                    if need_hess:
+                        A2 = rec["A2"]; neg_Hxi0[i, q] = A2[0]; neg_Hxi1[i, q] = A2[1]
+                    if need_o3:
+                        A3 = rec["A3"]; neg_Txi0[i, q] = A3[0]; neg_Txi1[i, q] = A3[1]
+                    if need_o4:
+                        A4 = rec["A4"]; neg_Qxi0[i, q] = A4[0]; neg_Qxi1[i, q] = A4[1]
 
         # 7) Edge size h (robust for interior faces) --------------------------------
         h_arr = np.empty((nE,), dtype=float)
@@ -1639,6 +1817,16 @@ class DofHandler:
                 "pos_Hxi0": pos_Hxi0, "pos_Hxi1": pos_Hxi1,
                 "neg_Hxi0": neg_Hxi0, "neg_Hxi1": neg_Hxi1,
             })
+        if need_o3:
+            out.update({
+                "pos_Txi0": pos_Txi0, "pos_Txi1": pos_Txi1,
+                "neg_Txi0": neg_Txi0, "neg_Txi1": neg_Txi1,
+            })
+        if need_o4:
+            out.update({
+                "pos_Qxi0": pos_Qxi0, "pos_Qxi1": pos_Qxi1,
+                "neg_Qxi0": neg_Qxi0, "neg_Qxi1": neg_Qxi1,
+            })
 
         if reuse:
             _ghost_cache[cache_key] = out
@@ -1657,6 +1845,8 @@ class DofHandler:
         derivs: set[tuple[int, int]],
         reuse: bool = True,
         need_hess: bool = False,
+        need_o3: bool = False,
+        need_o4: bool = False,
     ) -> dict:
         """
         Pre-compute geometry & basis tables for ∫_Γ ⋯ dS on *boundary* edges.
@@ -1667,7 +1857,6 @@ class DofHandler:
         from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
         from pycutfem.integration.quadrature import line_quadrature
         from pycutfem.fem import transform
-        from pycutfem.fem.reference import get_reference
         from pycutfem.integration.pre_tabulates import (
             _tabulate_q1 as _tab_q1,
             _tabulate_q2 as _tab_q2,
@@ -1734,7 +1923,7 @@ class DofHandler:
             _edge_geom_cache = {}
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
         cache_key  = (tuple(edge_ids.tolist()), int(qdeg),
-                    me.signature(), derivs_key, self.method, bool(need_hess))
+                    me.signature(), derivs_key, self.method, bool(need_hess), bool(need_o3), bool(need_o4))
         if reuse and cache_key in _edge_geom_cache:
             return _edge_geom_cache[cache_key]
 
@@ -1804,6 +1993,7 @@ class DofHandler:
         coords_sel   = coords_all[eids_arr]
         nLocGeom     = coords_sel.shape[1]
         dN_tab = np.empty((n_edges, n_q, nLocGeom, 2), dtype=float)
+        
 
         if mesh.element_type == "quad" and mesh.poly_order == 1:
             _tab_q1(xi_tab, eta_tab, np.empty((n_edges, n_q, 4)), dN_tab)
@@ -1812,7 +2002,7 @@ class DofHandler:
         elif mesh.element_type == "tri" and mesh.poly_order == 1:
             _tab_p1(xi_tab, eta_tab, np.empty((n_edges, n_q, 3)), dN_tab)
         else:
-            ref = get_reference(mesh.element_type, mesh.poly_order)
+            ref = get_reference(mesh.element_type, mesh.poly_order, max_deriv_order = 4 if need_o4 else (3 if need_o3 else 2))
             for i in range(n_edges):
                 for q in range(n_q):
                     dN_tab[i, q] = np.asarray(ref.grad(xi_tab[i, q], eta_tab[i, q]), dtype=float)
@@ -1837,18 +2027,44 @@ class DofHandler:
                     J_inv[e, q, 1, 0] = -a10 * invd
                     J_inv[e, q, 1, 1] =  a00 * invd
 
-        # ---- Hξ tensors for chain rule (if Hessian is needed) ---------------------
-        if need_hess:
-            Hxi0 = np.zeros((n_edges, n_q, 2, 2), dtype=float)
-            Hxi1 = np.zeros_like(Hxi0)
+        # ---- Inverse-map jets for chain rule (Hxi: 2nd, Txi: 3rd, Qxi: 4th) -------
+        if need_hess or need_o3 or need_o4:
+            kmax = 4 if need_o4 else (3 if need_o3 else 2)
+            if need_hess:
+                Hxi0 = np.zeros((n_edges, n_q, 2, 2), dtype=float)
+                Hxi1 = np.zeros_like(Hxi0)
+            if need_o3:
+                Txi0 = np.zeros((n_edges, n_q, 2, 2, 2), dtype=float)
+                Txi1 = np.zeros_like(Txi0)
+            if need_o4:
+                Qxi0 = np.zeros((n_edges, n_q, 2, 2, 2, 2), dtype=float)
+                Qxi1 = np.zeros_like(Qxi0)
             for i, eid in enumerate(eids_arr):
+                eidi = int(eid)
                 for q in range(n_q):
-                    _, _, H0, H1 = transform.element_Hxi(mesh, int(eid), (float(xi_tab[i, q]), float(eta_tab[i, q])))
-                    Hxi0[i, q] = H0
-                    Hxi1[i, q] = H1
+                    rec = _JET.get(mesh, eidi, float(xi_tab[i, q]), float(eta_tab[i, q]), upto=kmax)
+                    if need_hess:
+                        A2 = rec["A2"]; Hxi0[i, q] = A2[0]; Hxi1[i, q] = A2[1]
+                    if need_o3:
+                        A3 = rec["A3"]; Txi0[i, q] = A3[0]; Txi1[i, q] = A3[1]
+                    if need_o4:
+                        A4 = rec["A4"]; Qxi0[i, q] = A4[0]; Qxi1[i, q] = A4[1]
 
         # ---- tabulate REFERENCE derivatives per field (no push-forward here) -------
+        # Ensure closure: chain rule for orders 2/3/4 needs all lower orders too.
         derivs = set(derivs)
+        max_req = 0
+        if derivs:
+            max_req = max(dx + dy for dx, dy in derivs)
+        if need_o4: max_req = max(max_req, 4)
+        elif need_o3: max_req = max(max_req, 3)
+        elif need_hess: max_req = max(max_req, 2)
+        base = set()
+        if max_req >= 1: base |= {(1,0), (0,1)}
+        if max_req >= 2: base |= {(2,0), (1,1), (0,2)}
+        if max_req >= 3: base |= {(3,0), (2,1), (1,2), (0,3)}
+        if max_req >= 4: base |= {(4,0), (3,1), (2,2), (1,3), (0,4)}
+        derivs |= base
         for fld in fields:
             sl  = self.mixed_element.component_dof_slices[fld]
             p_f = self.mixed_element._field_orders[fld]
@@ -1892,8 +2108,11 @@ class DofHandler:
         }
         out.update(basis_tabs)
         if need_hess:
-            out["Hxi0"] = Hxi0
-            out["Hxi1"] = Hxi1
+            out["Hxi0"] = Hxi0; out["Hxi1"] = Hxi1
+        if need_o3:
+            out["Txi0"] = Txi0; out["Txi1"] = Txi1
+        if need_o4:
+            out["Qxi0"] = Qxi0; out["Qxi1"] = Qxi1
 
         if reuse:
             _edge_geom_cache[cache_key] = out
@@ -1913,6 +2132,8 @@ class DofHandler:
         side: str = "+",
         reuse: bool = True,
         need_hess: bool = False,
+        need_o3: bool = False,
+        need_o4: bool = False,
     ) -> dict:
         """
         Pre-compute geometry/basis for ∫_{Ω ∩ {φ ▷ 0}} (…) dx on CUT elements.
@@ -1951,6 +2172,21 @@ class DofHandler:
         me   = self.mixed_element
         fields = list(me.field_names)
         n_union = me.n_dofs_per_elem
+
+        # -------- which reference derivatives do we need? (ensure closure) --------
+        derivs = set(derivs)
+        max_req = max([0] + [dx + dy for (dx, dy) in derivs])
+        if need_o4:   max_req = max(max_req, 4)
+        elif need_o3: max_req = max(max_req, 3)
+        elif need_hess: max_req = max(max_req, 2)
+        derivs_eff = set(derivs)
+        if max_req >= 1: derivs_eff |= {(1, 0), (0, 1)}
+        if max_req >= 2: derivs_eff |= {(2, 0), (1, 1), (0, 2)}
+        if max_req >= 3: derivs_eff |= {(3, 0), (2, 1), (1, 2), (0, 3)}
+        if max_req >= 4: derivs_eff |= {(4, 0), (3, 1), (2, 2), (1, 3), (0, 4)}
+
+        # inverse-jet order needed just for geometry mapping (A, A2, A3, A4)
+        kmax_jets = 4 if need_o4 else (3 if need_o3 else (2 if need_hess else 1))
 
         # ---------------- collect CUT elements -------------------------------------
         if hasattr(element_bitset, "to_indices"):
@@ -1992,7 +2228,7 @@ class DofHandler:
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
         cache_key = (
             "cutvol", id(mesh), me.signature(), subset_hash,
-            int(qdeg), str(side), derivs_key, self.method, bool(need_hess), ls_token
+            int(qdeg), str(side), derivs_key, self.method, bool(need_hess), bool(need_o3), bool(need_o4), ls_token
         )
         if reuse and cache_key in _cut_volume_cache:
             return _cut_volume_cache[cache_key]
@@ -2013,6 +2249,10 @@ class DofHandler:
         h_list:      list[float] = []
         H0_blocks:   list[np.ndarray] = []        # each (n_q_elem, 2, 2) if need_hess
         H1_blocks:   list[np.ndarray] = []
+        T0_blocks:   list[np.ndarray] = []        # each (n_q_elem, 2, 2, 2) if need_o3
+        T1_blocks:   list[np.ndarray] = []
+        Q0_blocks:   list[np.ndarray] = []        # each (n_q_elem, 2, 2, 2, 2) if need_o4
+        Q1_blocks:   list[np.ndarray] = []
 
         # per-field ragged basis/deriv lists
         basis_lists: dict[str, list[np.ndarray]] = {}  # keys: "b_f", "g_f", "dXY_f"
@@ -2032,6 +2272,12 @@ class DofHandler:
             if need_hess:
                 H0_elem: list[np.ndarray] = []
                 H1_elem: list[np.ndarray] = []
+            if need_o3:
+                T0_elem: list[np.ndarray] = []
+                T1_elem: list[np.ndarray] = []
+            if need_o4:
+                Q0_elem: list[np.ndarray] = []
+                Q1_elem: list[np.ndarray] = []
 
             # global DOFs map and element size
             gdofs_map.append(self.get_elemental_dofs(int(eid)))
@@ -2074,10 +2320,10 @@ class DofHandler:
 
                     for q in range(nQ_ref):
                         x = x_phys[q]; w = float(w_phys[q])
-                        # parent reference coords and parent J^{-1}
+                        # parent reference coords and inverse-geometry jets
                         s, t  = transform.inverse_mapping(mesh, int(eid), x)
-                        J     = transform.jacobian(mesh, int(eid), (float(s), float(t)))
-                        Ji    = np.linalg.inv(J)
+                        rec   = _JET.get(mesh, int(eid), float(s), float(t), upto=kmax_jets)
+                        Ji    = rec["A"]  # (2,2)
 
                         # store per-qp geometry
                         xq_elem.append(np.asarray(x, dtype=float))
@@ -2085,11 +2331,19 @@ class DofHandler:
                         Jinv_elem.append(Ji)
                         phi_elem.append(float(phi_eval(level_set, x)))
 
-                        # Hessian of inverse map pieces if needed
+                        # inverse-map jets (chain rule) if requested
                         if need_hess:
-                            _, _, H0, H1 = transform.element_Hxi(mesh, int(eid), (float(s), float(t)))
-                            H0_elem.append(np.asarray(H0, dtype=float))
-                            H1_elem.append(np.asarray(H1, dtype=float))
+                            A2 = rec["A2"]  # (2,2,2)
+                            H0_elem.append(np.asarray(A2[0], dtype=float))
+                            H1_elem.append(np.asarray(A2[1], dtype=float))
+                        if need_o3:
+                            A3 = rec["A3"]  # (2,2,2,2)
+                            T0_elem.append(np.asarray(A3[0], dtype=float))
+                            T1_elem.append(np.asarray(A3[1], dtype=float))
+                        if need_o4:
+                            A4 = rec["A4"]  # (2,2,2,2,2)
+                            Q0_elem.append(np.asarray(A4[0], dtype=float))
+                            Q1_elem.append(np.asarray(A4[1], dtype=float))
 
                         # Reference basis/derivatives per field at (s,t)
                         for fld in fields:
@@ -2101,8 +2355,8 @@ class DofHandler:
                             basis_lists.setdefault(kg, []).append(
                                 np.asarray(me._eval_scalar_grad (fld, float(s), float(t)), dtype=float)
                             )
-                            # requested derivatives (reference)
-                            for (dx, dy) in derivs:
+                            # requested derivatives (reference), with closure (derivs_eff)
+                            for (dx, dy) in derivs_eff:
                                 if (dx, dy) == (0, 0):
                                     continue
                                 kd = f"d{dx}{dy}_{fld}"
@@ -2124,6 +2378,12 @@ class DofHandler:
             if need_hess:
                 H0_blocks.append(np.stack(H0_elem, axis=0))      # (n_q,2,2)
                 H1_blocks.append(np.stack(H1_elem, axis=0))      # (n_q,2,2))
+            if need_o3:
+                T0_blocks.append(np.stack(T0_elem, axis=0))      # (n_q,2,2,2)
+                T1_blocks.append(np.stack(T1_elem, axis=0))      # (n_q,2,2,2)
+            if need_o4:
+                Q0_blocks.append(np.stack(Q0_elem, axis=0))      # (n_q,2,2,2,2)
+                Q1_blocks.append(np.stack(Q1_elem, axis=0))      # (n_q,2,2,2,2)
 
         # ---------------- nothing valid? -------------------------------------------
         if not valid_eids:
@@ -2156,6 +2416,12 @@ class DofHandler:
         if need_hess:
             Hxi0 = np.zeros((nE, Qmax, 2, 2), dtype=float)
             Hxi1 = np.zeros_like(Hxi0)
+        if need_o3:
+            Txi0 = np.zeros((nE, Qmax, 2, 2, 2), dtype=float)
+            Txi1 = np.zeros_like(Txi0)
+        if need_o4:
+            Qxi0 = np.zeros((nE, Qmax, 2, 2, 2, 2), dtype=float)
+            Qxi1 = np.zeros_like(Qxi0)
 
         for i in range(nE):
             n = sizes[i]
@@ -2166,6 +2432,12 @@ class DofHandler:
             if need_hess:
                 Hxi0[i, :n, :, :] = H0_blocks[i]
                 Hxi1[i, :n, :, :] = H1_blocks[i]
+            if need_o3:
+                Txi0[i, :n, :, :, :] = T0_blocks[i]
+                Txi1[i, :n, :, :, :] = T1_blocks[i]
+            if need_o4:
+                Qxi0[i, :n, :, :, :, :] = Q0_blocks[i]
+                Qxi1[i, :n, :, :, :, :] = Q1_blocks[i]
 
         # ---------------- per-field: pad & scatter into union slices ---------------
         out = {
@@ -2236,10 +2508,7 @@ class DofHandler:
             out[f"b_{fld}"] = b_pad
             out[f"g_{fld}"] = g_pad
 
-        # d{dx}{dy}_* (include 2nd order if need_hess)
-        derivs_eff = set(derivs)
-        if need_hess:
-            derivs_eff |= {(1,0),(0,1),(2,0),(1,1),(0,2)}
+        # d{dx}{dy}_* already collected for derivs_eff; pad & scatter
 
         for fld in fields:
             sl = me.component_dof_slices[fld]
@@ -2259,6 +2528,12 @@ class DofHandler:
         if need_hess:
             out["Hxi0"] = Hxi0
             out["Hxi1"] = Hxi1
+        if need_o3:
+            out["Txi0"] = Txi0
+            out["Txi1"] = Txi1
+        if need_o4:
+            out["Qxi0"] = Qxi0
+            out["Qxi1"] = Qxi1
 
         if reuse:
             _cut_volume_cache[cache_key] = out
@@ -2266,6 +2541,7 @@ class DofHandler:
 
 
 
+    # --- tag DOFs from element selection ----------------------------------------
     def tag_dofs_from_element_bitset(
         self,
         tag: str,

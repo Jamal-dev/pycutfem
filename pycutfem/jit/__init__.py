@@ -226,7 +226,21 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
         # Compile the backend once; reuse for all subsets of this integral
         runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element)
-        need_hess = any(type(op).__name__ in ("Hessian","Laplacian") for op in ir)
+
+        # Max derivative order we need in the geometry *inverse* jets (A, A2, A3, A4)
+        def _max_required_order(ir_seq):
+            from pycutfem.jit.ir import Hessian as IRHessian, Laplacian as IRLaplacian, LoadVariable
+            k = 0
+            for op in ir_seq:
+                if isinstance(op, (IRHessian, IRLaplacian)):
+                    k = max(k, 2)
+                elif hasattr(op, "deriv_order"):
+                    k = max(k, sum(getattr(op, "deriv_order", (0,0))))
+            return k
+        _kmax = _max_required_order(ir)
+        need_hess = (_kmax >= 2)
+        need_o3   = (_kmax >= 3)
+        need_o4   = (_kmax >= 4)
 
 
         # ------------------------------------------------------------------
@@ -239,7 +253,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
             # ---- Plain volume (no level set) -----------------------------
             if level_set is None:
-                geom = dof_handler.precompute_geometric_factors(qdeg, need_hess=need_hess)
+                geom = dof_handler.precompute_geometric_factors(qdeg, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
                 gdofs_map = np.vstack([
                     dof_handler.get_elemental_dofs(e)
                     for e in range(mesh.n_elements)
@@ -289,7 +303,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
             # 1) FULL elements on the requested side
             if full_ids.size:
                 # include level_set so 'phis' is present (may still be None)
-                geom_all = dof_handler.precompute_geometric_factors(qdeg, level_set, need_hess=need_hess)
+                geom_all = dof_handler.precompute_geometric_factors(qdeg, level_set, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
                 geom_full = {
                     "qp_phys": geom_all["qp_phys"][full_ids],
                     "qw":      geom_all["qw"][full_ids],
@@ -324,7 +338,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 cut_bs = (bs & cut_mask) if bs is not None else cut_mask
 
                 geom_cut = dof_handler.precompute_cut_volume_factors(
-                    cut_bs, qdeg, derivs, level_set, side=side, need_hess=need_hess
+                    cut_bs, qdeg, derivs, level_set, side=side, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4
                 )
                 cut_eids = np.asarray(geom_cut.get("eids", []), dtype=np.int32)
                 if cut_eids.size:
@@ -359,7 +373,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
             bs_cut = mixed_element.mesh.element_bitset("cut")
             bs_def = intg.measure.defined_on
             cut_eids = (bs_def & bs_cut) if bs_def is not None else bs_cut
-            geom = dof_handler.precompute_interface_factors(cut_eids, qdeg, level_set, need_hess=need_hess)
+            geom = dof_handler.precompute_interface_factors(cut_eids, qdeg, level_set, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
 
             # interface assembly still uses element-local maps; safe to use all
             gdofs_map = np.vstack([
@@ -387,7 +401,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
             bs_ghost = mixed_element.mesh.edge_bitset("ghost")
             bs_def   = intg.measure.defined_on
             edges = (bs_def & bs_ghost) if bs_def is not None else bs_ghost
-            geom = dof_handler.precompute_ghost_factors(edges, qdeg, level_set, derivs, need_hess=need_hess)
+            geom = dof_handler.precompute_ghost_factors(edges, qdeg, level_set, derivs, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
 
             # ghost precompute returns the union dof map for each edge
             gdofs_map = geom["gdofs_map"]

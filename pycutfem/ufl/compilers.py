@@ -1963,92 +1963,139 @@ class FormCompiler:
         
     def _assemble_ghost_edge_jit(self, intg: "Integral", matvec):
         """Assembles ghost-edge integrals using the JIT backend."""
+
+
         mesh = self.me.mesh
         dh, me = self.dh, self.me
 
-        # 1. Get required derivatives, edge set, and level set
+        # 1) Collect derivative multi-indices & quadrature order
         md = intg.measure.metadata or {}
         derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
-        derivs |= {(0, 0)}  # always include values
-        # Close up to the maximum total order present (robust for Hessian/cross terms)
+        derivs |= {(0, 0)}
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
         for p in range(max_total + 1):
             for ox in range(p + 1):
                 derivs.add((ox, p - ox))
+
         edge_ids = (intg.measure.defined_on
-                if intg.measure.defined_on is not None
-                else mesh.edge_bitset('ghost'))
+                    if intg.measure.defined_on is not None
+                    else mesh.edge_bitset('ghost'))
         level_set = getattr(intg.measure, 'level_set', None)
         if level_set is None:
             raise ValueError("dGhost measure requires a 'level_set' callable.")
+
         qdeg = max(self._find_q_order(intg), 2*max_total + 4)
-
         if edge_ids.cardinality() == 0:
-            return
-        
-        # 3. Compile kernel
+            raise ValueError("No ghost edges found for the integral.")
+
+        # 2) Compile kernel FIRST (to know exact static params it will require)
         runner, ir = self._compile_backend(intg.integrand, dh, me)
+        req_list = list(getattr(runner, "param_order", []))
+        req = set(req_list)
 
-        need_hess = False
-        if hasattr(runner, "required_static"):
-            req = set(runner.required_static)
-            need_hess = bool(req & {"Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1"})
-        else:
-            need_hess = self._expr_requires_hess(intg.integrand)
-        # 2. Precompute all side-aware geometric and basis factors
-        geo_factors = self.dh.precompute_ghost_factors(edge_ids, qdeg, level_set, derivs, need_hess=need_hess)
+        # Which jets are actually required?
+        need_hess = any(k in req for k in
+                        ("Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1")) \
+                    or self._expr_requires_hess(intg.integrand)
+        need_o3   = any(k in req for k in
+                        ("Txi0","Txi1","pos_Txi0","pos_Txi1","neg_Txi0","neg_Txi1"))
+        need_o4   = any(k in req for k in
+                        ("Qxi0","Qxi1","pos_Qxi0","pos_Qxi1","neg_Qxi0","neg_Qxi1"))
 
-        valid_eids = geo_factors.get('eids')
-        # print(f"len(valid_eids)={len(valid_eids)}")
+        # Ensure deriv tables include everything the chain rule can touch
+        if need_hess:
+            derivs |= {(1,0),(0,1),(2,0),(1,1),(0,2)}
+        if need_o3:
+            derivs |= {(3,0),(2,1),(1,2),(0,3)}
+        if need_o4:
+            derivs |= {(4,0),(3,1),(2,2),(1,3),(0,4)}
+
+        # 3) Precompute sided ghost factors with the exact flags
+        geo = self.dh.precompute_ghost_factors(
+            ghost_edge_ids=edge_ids,
+            qdeg=qdeg,
+            level_set=level_set,
+            derivs=derivs,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            reuse=True,
+        )
+
+        valid_eids = geo.get("eids")
         if valid_eids is None or len(valid_eids) == 0:
             return
 
-
-        
-
-        # 4. Build kernel arguments
-        # The precomputed factors are now the "basis tables"
-        # We must also provide the DOF maps for coefficient padding
-        pre_built_args = geo_factors.copy()
-        
-        # The ragged lists of dofs/maps need to be converted to something the
-        # JIT helpers can use. A dense array is simplest.
-        pre_built_args["gdofs_map"] = geo_factors["gdofs_map"]
-        pre_built_args["pos_map"] =     geo_factors["pos_map"]
-        pre_built_args["neg_map"] =     geo_factors["neg_map"]
-        pre_built_args["owner_pos_id"] = geo_factors["owner_pos_id"]
-        pre_built_args["owner_neg_id"] = geo_factors["owner_neg_id"]
-        # convenience single-owner (matches our codegen use of owner_id)
-        pre_built_args["owner_id"]     = geo_factors.get("owner_id", geo_factors["owner_pos_id"])
-        # explicit
-        pre_built_args["entity_kind"]  = "edge"
-        gdofs_map = pre_built_args["gdofs_map"]
-        
-
-        args = _build_jit_kernel_args(
-            ir, intg.integrand, me, qdeg,
+        # 4) Build static kernel args from what we precomputed
+        kernel_args = _build_jit_kernel_args(
+            ir=ir,
+            expression=intg.integrand,
+            mixed_element=me,
+            q_order=qdeg,
             dof_handler=dh,
-            gdofs_map=gdofs_map, # This is now per-edge union of DOFs
+            gdofs_map=geo["gdofs_map"],
             param_order=runner.param_order,
-            pre_built=pre_built_args
+            pre_built=geo,
         )
 
-        # 5. Get current functions and execute kernel
-        current_funcs = self._get_data_functions_objs(intg)
-        
-        # The runner now gets per-edge arguments
-        K_edge, F_edge, J_edge = runner(current_funcs, args)
-        hook = self._hook_for(intg.integrand)
-        if self._functional_calculate(intg, J_edge, hook): return
+        # ---- baseline statics some kernels always expect ----
+        if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+            kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+        if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+            kernel_args["element_nodes"] = np.asarray(mesh.elements_connectivity, dtype=np.int64)
 
-        # 6. Scatter contributions
+        # 4b) Patch unsided dXY_<fld> if requested but missing: average of sided rXY
+        missing_now = [p for p in runner.param_order if p not in kernel_args]
+        if missing_now:
+            for name in list(missing_now):
+                m = re.match(r"^d(\d)(\d)_([A-Za-z0-9_]+)$", name)
+                if not m:
+                    continue
+                dx, dy, fld = int(m.group(1)), int(m.group(2)), m.group(3)
+                kpos = f"r{dx}{dy}_{fld}_pos"
+                kneg = f"r{dx}{dy}_{fld}_neg"
+                if (kpos in kernel_args) and (kneg in kernel_args):
+                    kernel_args[name] = 0.5*(kernel_args[kpos] + kernel_args[kneg])
+                elif kpos in kernel_args:
+                    kernel_args[name] = kernel_args[kpos]
+                elif kneg in kernel_args:
+                    kernel_args[name] = kernel_args[kneg]
+
+        # 4c) Alias sided jets from unsided if necessary (belt-and-suspenders)
+        for side in ("pos","neg"):
+            for t in ("Hxi0","Hxi1","Txi0","Txi1","Qxi0","Qxi1"):
+                need_key = f"{side}_{t}"
+                if (need_key in req) and (need_key not in kernel_args) and (t in geo):
+                    kernel_args[need_key] = geo[t]
+
+        # Final sanity: everything the kernel listed must be present now
+        still_missing = [p for p in runner.param_order if p not in kernel_args]
+        if still_missing:
+            raise KeyError(
+                "KernelRunner: the following static arrays are still missing after automatic completion: "
+                f"{still_missing}. Check that precompute_ghost_factors(...) produced them; "
+                "if not, ensure need_hess/need_o3/need_o4 and derivs were computed from runner.param_order."
+            )
+
+        # 5) Gather current coefficient Functions and run the kernel
+        current_funcs = self._get_data_functions_objs(intg)
+        K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
+
+        hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_edge, hook):
+            return
+
+        # 6) Scatter contributions (per-edge union DOFs)
         _scatter_element_contribs(
             K_edge, F_edge, J_edge,
-            valid_eids,       # The edge IDs
-            gdofs_map,        # The per-edge union of DOFs
+            valid_eids,
+            geo["gdofs_map"],
             matvec, self.ctx, intg.integrand,
-            hook = hook,  # Pass the hook for scalar functionals
+            hook=hook,
         )
+
+
+
     
     def _assemble_ghost_edge(self, intg: "Integral", matvec):
         """Assemble ghost edge integrals."""

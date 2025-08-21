@@ -244,10 +244,14 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
         # Hessian-of-inverse-map tensors (volume / boundary / interface)
         "Hxi0", "Hxi1",
+        "Txi0", "Txi1",           # 3rd order
+        "Qxi0", "Qxi1",           # 4th order
 
         # sided Hessian tensors for ghost facets (and similar)
         "pos_Hxi0", "pos_Hxi1",
         "neg_Hxi0", "neg_Hxi1",
+        "pos_Txi0", "pos_Txi1",  "neg_Txi0", "neg_Txi1",
+        "pos_Qxi0", "pos_Qxi1",  "neg_Qxi0", "neg_Qxi1",
     }
     needed = set(param_order) if param_order is not None else set()
 
@@ -262,7 +266,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
     # OPTIONAL alias: if a sided Hxi was requested but missing, fall back to unsided if available.
     for _side in ("pos", "neg"):
-        for _t in ("Hxi0", "Hxi1"):
+        for _t in ("Hxi0", "Hxi1", "Txi0", "Txi1", "Qxi0", "Qxi1"):
             _k = f"{_side}_{_t}"
             if (_k in needed) and (_k not in args) and (_t in pre_built):
                 args[_k] = pre_built[_t]
