@@ -2721,9 +2721,153 @@ class DofHandler:
                                 base2 += w * b2
 
         return (err2 / base2) ** 0.5 if (relative and base2 > 1e-28) else err2 ** 0.5
-
-
     
+    # --------------------------------------------------------------------------
+    # H1 seminorm (energy) of a VectorFunction on a *side* (φ<0 or φ>0)
+    # --------------------------------------------------------------------------
+    def _h1_seminorm_on_side(self,
+                            vector_function,                 # VectorFunction (e.g., ('ux','uy'))
+                            level_set,                       # φ(x,y) callable
+                            side: str = '-',                 # '-' for inside (φ<0), '+' for outside (φ>0)
+                            quad_order: int | None = None,
+                            fields: list[str] | None = None) -> float:
+        """
+        Returns ||∇(vector_function)||_{L2(Ω_side)} for the specified components.
+        This integrates ∑_k ∫_{Ω_side} ∇w_k : ∇w_k dx, where w_k are scalar components.
+
+        No finite differences. Uses FE gradients (basis grads @ J^{-1}) and your cut triangulation.
+        """
+        import numpy as np
+        from pycutfem.fem import transform
+        from pycutfem.integration.quadrature import volume as vol_rule
+        from pycutfem.ufl.helpers_geom import (
+            corner_tris, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, phi_eval
+        )
+        from pycutfem.ufl.expressions import VectorFunction as _VF
+
+        if not isinstance(vector_function, _VF):
+            raise TypeError("_h1_seminorm_on_side expects a VectorFunction.")
+
+        mesh = self.mixed_element.mesh
+        me   = self.mixed_element
+        qdeg = quad_order or (2*mesh.poly_order + 2)
+
+        if fields is None:
+            fields = list(vector_function.field_names)
+
+        # classify elements once (also sets tags)
+        inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
+        full_eids = outside_ids if side == '+' else inside_ids
+
+        acc = 0.0
+
+        # (A) full elements
+        qp_ref, qw_ref = vol_rule(mesh.element_type, qdeg)
+        for eid in full_eids:
+            # pick per-field dofs once
+            gdofs_f = {fld: self.element_maps[fld][eid] for fld in fields}
+            for (xi, eta), w_ref in zip(qp_ref, qw_ref):
+                # mapping & inverse
+                J  = transform.jacobian(mesh, eid, (xi, eta))
+                Ji = np.linalg.inv(J)
+                detJ = abs(np.linalg.det(J))
+
+                # accumulate ∑ |grad(component)|^2
+                for fld in fields:
+                    gref = me.grad_basis(fld, xi, eta)[me.slice(fld), :]     # (nloc_f, 2)
+                    gphy = gref @ Ji                                         # (nloc_f, 2)
+                    wh_g = vector_function.get_nodal_values(gdofs_f[fld]) @ gphy  # (2,)
+                    acc += w_ref * detJ * (wh_g[0]**2 + wh_g[1]**2)
+
+        # (B) cut elements: triangulate subdomain Ω_side and integrate w.r.t. physical weights
+        qp_tri, qw_tri = vol_rule("tri", qdeg)
+        for eid in cut_ids:
+            elem = mesh.elements_list[eid]
+            tri_local, corner_ids = corner_tris(mesh, elem)
+            gd_f = {fld: self.element_maps[fld][eid] for fld in fields}
+
+            for loc_tri in tri_local:
+                v_ids = [corner_ids[i] for i in loc_tri]
+                V     = mesh.nodes_x_y_pos[v_ids]
+                v_phi = np.array([phi_eval(level_set, xy) for xy in V], dtype=float)
+                polys = clip_triangle_to_side(V, v_phi, side=side)
+                if not polys: 
+                    continue
+                for poly in polys:
+                    for A, B, C in fan_triangulate(poly):
+                        x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)
+                        for (x, y), w in zip(x_phys, w_phys):
+                            xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+                            J  = transform.jacobian(mesh, eid, (xi, eta))
+                            Ji = np.linalg.inv(J)
+                            for fld in fields:
+                                gref = me.grad_basis(fld, xi, eta)[me.slice(fld), :]
+                                gphy = gref @ Ji
+                                wh_g = vector_function.get_nodal_values(gd_f[fld]) @ gphy
+                                acc += w * (wh_g[0]**2 + wh_g[1]**2)  # w is physical already
+        return float(acc)**0.5
+
+
+    # --------------------------------------------------------------------------
+    # Build w := u_h - I_h(u_exact) *at the nodes* (piecewise by φ sign)
+    # --------------------------------------------------------------------------
+    def _build_vector_diff_from_exact(self,
+                                    u_h,                            # VectorFunction ('ux','uy')
+                                    exact_neg: dict[str, callable], # {'ux': f(x,y), 'uy': g(x,y)} for φ<0
+                                    exact_pos: dict[str, callable], # same for φ>0
+                                    level_set) -> 'VectorFunction':
+        """
+        Returns a new VectorFunction w with nodal values w = u_h - u_exact_interp,
+        where u_exact_interp is the FE nodal interpolation of piecewise exact values:
+        node in φ<0 → use exact_neg; node in φ>0 → use exact_pos.
+        """
+        from pycutfem.ufl.expressions import VectorFunction as _VF, Function as _SF
+
+        if not hasattr(u_h, "field_names"):
+            raise TypeError("_build_vector_diff_from_exact expects a VectorFunction.")
+
+        w = u_h.copy()     # same dof layout; we'll overwrite nodal_values
+
+        # For each scalar component, evaluate piecewise exact at that field's DOF coords
+        for i, fld in enumerate(u_h.field_names):
+            g_slice = self.get_field_slice(fld)
+            coords  = self.get_dof_coords(fld)         # (n_field_dofs, 2)
+            values  = np.empty(coords.shape[0], dtype=float)
+            for k, (x, y) in enumerate(coords):
+                if level_set([x, y]) < 0.0:
+                    values[k] = exact_neg[fld](x, y)
+                else:
+                    values[k] = exact_pos[fld](x, y)
+
+            # subtract into copy: w = u_h - I_h(u_exact)
+            # write component-wise using vector function's global dofs
+            w.set_nodal_values(g_slice, u_h.get_nodal_values(g_slice) - values)
+
+        return w
+
+
+    # --------------------------------------------------------------------------
+    # Public: H1 error (piecewise) via FE interpolation of exact data
+    # --------------------------------------------------------------------------
+    def h1_error_vector_piecewise(self,
+                                u_h,                               # VectorFunction ('ux','uy')
+                                exact_neg: dict[str, callable],
+                                exact_pos: dict[str, callable],
+                                level_set,
+                                quad_order: int | None = None,
+                                fields: list[str] | None = None) -> float:
+        """
+        Returns the FE H1-seminorm error ||∇(u_h - I_h u_exact)|| over Ω^- ∪ Ω^+,
+        computed as ( ||∇w||_{Ω^-}^2 + ||∇w||_{Ω^+}^2 )^{1/2} with w := u_h - I_h u_exact.
+
+        No finite differences. No exact gradients required.
+        """
+        w = self._build_vector_diff_from_exact(u_h, exact_neg, exact_pos, level_set)
+        e_m = self._h1_seminorm_on_side(w, level_set, side='-', quad_order=quad_order, fields=fields)
+        e_p = self._h1_seminorm_on_side(w, level_set, side='+', quad_order=quad_order, fields=fields)
+        return (e_m**2 + e_p**2)**0.5
+
+
 
 
     

@@ -84,21 +84,21 @@ def test_cutfem_poisson_interface(backend):
     mesh.classify_edges(level_set)
     mesh.build_interface_segments(level_set)
     mesh.tag_boundary_edges(boundary_tags)
-    plot_mesh_2(mesh, level_set=level_set)
+    # plot_mesh_2(mesh, level_set=level_set)
 
     # plot_mesh_2(mesh, level_set=level_set)
 
     # 2. Create BitSets for the integration domains
-    neg_elements  = mesh.element_bitset("inside")
-    pos_elements  = mesh.element_bitset("outside")
+    inside_elements  = mesh.element_bitset("inside")
+    outside_elements  = mesh.element_bitset("outside")
     cut_elements  = mesh.element_bitset("cut")
-    has_pos_elements = pos_elements | cut_elements
-    has_neg_elements = neg_elements | cut_elements
+    has_outside_elements = outside_elements | cut_elements
+    has_inside_elements = inside_elements | cut_elements
     cut_domain = mesh.element_bitset("cut")
     # Ghost penalty is applied on faces between cut cells and interior cells
     ghost_domain = mesh.edge_bitset("ghost_neg") | mesh.edge_bitset("ghost_both") 
-    print(f"Negative elements: {neg_elements}, Positive elements: {pos_elements}, Cut elements: {cut_elements}")
-    print(f"Has positive elements: {has_pos_elements}, Has negative elements: {has_neg_elements}")
+    print(f"Negative elements: {inside_elements}, Positive elements: {outside_elements}, Cut elements: {cut_elements}")
+    print(f"Has positive elements: {has_outside_elements}, Has negative elements: {has_inside_elements}")
     for tag, bitset in mesh._edge_bitsets.items():
         print(f"Boundary tag '{tag}': {bitset.cardinality()}")
     # plot_mesh_2(mesh,level_set=level_set)
@@ -127,8 +127,8 @@ def test_cutfem_poisson_interface(backend):
     ghost_neg = g_neg | g_both | g_interface
 
     # --- measures ---
-    dx_pos  = dx(defined_on=has_pos_elements, level_set=level_set, metadata={'side': '+', 'q': poly_order+2})
-    dx_neg  = dx(defined_on=has_neg_elements, level_set=level_set, metadata={'side': '-', 'q': poly_order+2})
+    dx_pos  = dx(defined_on=has_outside_elements, level_set=level_set, metadata={'side': '+', 'q': poly_order+2})
+    dx_neg  = dx(defined_on=has_inside_elements, level_set=level_set, metadata={'side': '-', 'q': poly_order+2})
     dGamma  = dInterface(defined_on=cut_elements, level_set=level_set, metadata={'q': poly_order+2})
     dGhost_pos = dGhost(defined_on=ghost_pos, level_set=level_set, metadata={'q': poly_order+2, "derivs": {(0,1),(1,0)}})
     dGhost_neg = dGhost(defined_on=ghost_neg, level_set=level_set, metadata={'q': poly_order+2, "derivs": {(0,1),(1,0)}})
@@ -139,8 +139,8 @@ def test_cutfem_poisson_interface(backend):
 
     # --- coefficients / constants (as you had) ---
     alpha_vals = np.zeros(len(mesh.elements_list))
-    alpha_vals[pos_elements.to_indices()] = 1.0
-    alpha_vals[neg_elements.to_indices()] = 20.0
+    alpha_vals[outside_elements.to_indices()] = 1.0
+    alpha_vals[inside_elements.to_indices()] = 20.0
     alpha_vals[cut_elements.to_indices()] = 1.0  # convention
     alpha = ElementWiseConstant(alpha_vals)
 
@@ -285,9 +285,9 @@ def test_cutfem_poisson_interface(backend):
         func.set_nodal_values(gdofs, u_global[gdofs])
 
 
-    u_in.plot(title="u_inside", mask = has_pos_elements)
     scatter_global(u_out, solution_vec, dof_handler)
     scatter_global(u_in,  solution_vec, dof_handler)
+    u_in.plot(title="u_inside", mask = inside_elements)
     phi_vals = level_set.evaluate_on_nodes(mesh)
 
     output_dir = "two_alpha_results"

@@ -1320,7 +1320,6 @@ class NumbaCodeGen:
                 # ---------------------------------------------------------------
                 # print(f"Div: a.shape={a.shape}, a.role={a.role},a.is_vector={a.is_vector}, a.is_gradient={a.is_gradient}")
                 if a.role in ("test", "trial") and a.shape[0] ==2 and a.is_gradient:
-                    # print("hello "*10)
                     body_lines.append("# Div(basis) → scalar basis (1,n_loc)")
 
                     body_lines += [
@@ -1566,11 +1565,11 @@ class NumbaCodeGen:
                 a = stack.pop()
                 res_var = new_var("dot")
 
-                print(f"Dot operation: a.role={a.role}, b.role={b.role}, "
-                      f"a.shape={a.shape}, b.shape={b.shape}, "
-                      f"is_vector: {a.is_vector}/{b.is_vector}, "
-                      f"is_gradient: {a.is_gradient}/{b.is_gradient}, "
-                      f"is_hessian: {a.is_hessian}/{b.is_hessian}")
+                # print(f"Dot operation: a.role={a.role}, b.role={b.role}, "
+                #       f"a.shape={a.shape}, b.shape={b.shape}, "
+                #       f"is_vector: {a.is_vector}/{b.is_vector}, "
+                #       f"is_gradient: {a.is_gradient}/{b.is_gradient}, "
+                #       f"is_hessian: {a.is_hessian}/{b.is_hessian}")
 
                 # Advection term: dot(grad(u_trial), u_k)
                 if a.role == 'trial' and a.is_gradient and b.role == 'value' and b.is_vector:
@@ -2257,7 +2256,7 @@ class NumbaCodeGen:
                     
                     elif ((a.role == 'const' or a.role=='value')  
                          and 
-                          (not a.is_vector and not a.is_gradient)) :
+                          (not a.is_vector and not a.is_gradient and not a.is_hessian)) :
                         body_lines.append("# Product: scalar * Vector/Tensor → Vector/Tensor")
                         # a is scalar, b is vector/tensor
                         # if a.shape == ():
@@ -2273,7 +2272,7 @@ class NumbaCodeGen:
                         
                     elif ((b.role == 'const' or b.role=='value')
                           and 
-                        (not b.is_vector and not b.is_gradient)):
+                        (not b.is_vector and not b.is_gradient and not b.is_hessian)):
                         body_lines.append("# Product: Vector/Tensor * scalar → Vector/Tensor")
                         # b is scalar, a is vector/tensor
                         _mul_scalar_vector(self,first_is_scalar=False, a=a, b=b, res_var=res_var, body_lines=body_lines,stack=stack)
@@ -2283,6 +2282,7 @@ class NumbaCodeGen:
                     # 1. LHS block:   scalar test  *  scalar trial   →  outer product
                     # -----------------------------------------------------------------
                     elif (not a.is_gradient and not b.is_gradient and
+                          not a.is_hessian and not b.is_hessian and
                         ((a.role, b.role) == ("test", "trial") or
                         (a.role, b.role) == ("trial", "test"))):
                         n_locs = a.shape[1]
@@ -2298,12 +2298,41 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=res_var, role='value',
                                             shape=(n_locs,n_locs), is_vector=False))
                     # -----------------------------------------------------------------
-                    # 2. RHS load:   scalar / vector Function  *  scalar Test
+                    # 2. LHS block:   scalar trial/test  *  vector   →  vector trial
+                    # -----------------------------------------------------------------
+                    elif (a.role in {"trial", "test"} and not a.is_vector and not a.is_gradient and not a.is_hessian
+                          and b.role in {"value", "const"} and b.is_vector):
+                        role = 'trial' if a.role == 'trial' else 'test'
+                        body_lines.append("# Product: scalar Trial/Test × vector → vector Trial/Test")
+                        body_lines +=[
+                            f"{res_var} = np.zeros(({b.var_name}.shape[0], {a.var_name}.shape[1]), dtype={self.dtype})",
+                            f"for k in range({b.var_name}.shape[0]):",
+                            f"    {res_var}[k] = {a.var_name}[0, :] * {b.var_name}[k]",
+                        ]
+
+                        stack.append(StackItem(var_name=res_var, role=role,
+                                            shape=(b.shape[0],a.shape[1]), is_vector=True))
+                    elif (b.role in {"trial", "test"} and not b.is_vector and not b.is_gradient and not b.is_hessian
+                          and a.role in {"value", "const"} and a.is_vector):
+                        role = 'trial' if b.role == 'trial' else 'test'
+                        body_lines.append("# Product: vector × scalar Trial/Test → vector Trial/Test")
+                        body_lines +=[
+                            f"{res_var} = np.zeros(({b.var_name}.shape[0], {a.var_name}.shape[1]), dtype={self.dtype})",
+                            f"for k in range({b.var_name}.shape[0]):",
+                            f"    {res_var}[k] = {a.var_name}[k] * {b.var_name}[0, :]",
+                        ]
+                        stack.append(StackItem(var_name=res_var, role=role,
+                                            shape=(a.shape[0],b.shape[1]), is_vector=True))
+
+                    # -----------------------------------------------------------------
+                    # 1. RHS load:   scalar / vector Function  *  scalar Test
                     #                (u_k or c)                ·  φ_v
                     # -----------------------------------------------------------------
                     elif (b.role == "test" and not b.is_vector
                         and a.role == "value" and not a.is_vector
-                        and not a.is_gradient and not b.is_gradient):
+                        and not a.is_gradient and not b.is_gradient
+                        and not a.is_hessian and not b.is_hessian
+                        ):
                         body_lines.append("# Load: scalar Function × scalar Test → (n_loc,)")
 
                         body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}")   # (n_loc,)
@@ -2326,6 +2355,7 @@ class NumbaCodeGen:
                             f"Product not implemented for roles {a.role}/{b.role} "
                             f"with vector flags {a.is_vector}/{b.is_vector} "
                             f"and gradient flags {a.is_gradient}/{b.is_gradient}."
+                            f"and hessian flags {a.is_hessian}/{b.is_hessian}."
                             f" Shapes: {a.shape}/{b.shape}"
                         )
                  # ---------------------------------------------------------------------------

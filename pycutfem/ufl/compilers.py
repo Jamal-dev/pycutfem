@@ -1325,20 +1325,50 @@ class FormCompiler:
     
     # ----------------------------------------------------------------------
     def _expr_requires_hess(self, node):
-        # generic DFS over expression tree
+        """
+        Return True iff the expression tree contains a Hessian or Laplacian node.
+
+        Robust DFS that:
+        - visits each node once (cycle-safe),
+        - follows common child attributes ('operand', 'a', 'b', 'A', 'args', 'children'),
+        - only iterates over true containers (list/tuple/set),
+        - never tries to iterate arbitrary objects like Pos/Neg.
+        """
+
         stack = [node]
+        seen  = set()
+
         while stack:
             x = stack.pop()
+            if x is None:
+                continue
+            xid = id(x)
+            if xid in seen:
+                continue
+            seen.add(xid)
+
             if isinstance(x, (Hessian, Laplacian)):
                 return True
-            # push children if any (covers unary/binary ops, inner, etc.)
-            for attr in ("operand","a","b","A"):
+
+            # Follow standard single-child attributes (covers Pos/Neg, unary ops, etc.)
+            for attr in ("operand", "a", "b", "A", "args", "children"):
                 child = getattr(x, attr, None)
-                if child is not None:
+                if child is None:
+                    continue
+                # If the attribute is a container, push each element; else push the single child
+                if isinstance(child, (list, tuple, set)):
+                    for y in child:
+                        if y is not None:
+                            stack.append(y)
+                else:
                     stack.append(child)
-            # lists/tuples of nodes
-            if hasattr(x, "__iter__") and not isinstance(x, (str, bytes)):
-                stack.extend([y for y in x if hasattr(y, "__dict__")])
+
+            # If the node itself is a container, visit its items
+            if isinstance(x, (list, tuple, set)):
+                for y in x:
+                    if y is not None:
+                        stack.append(y)
+
         return False
 
     def _assemble_volume_jit(self, integral: Integral, matvec):
