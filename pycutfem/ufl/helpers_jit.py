@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Mapping, Tuple, Dict, Any, Sequence
+from typing import Mapping, Tuple, Dict, Any, Sequence, Set
 from pycutfem.integration import volume
 import logging # Added for logging warnings
 import os
@@ -12,6 +12,7 @@ from pycutfem.fem.transform import element_Hxi   # new util
 
 
 logger = logging.getLogger(__name__)
+
 
 
 def _pad_coeffs(coeffs, phi, ctx):

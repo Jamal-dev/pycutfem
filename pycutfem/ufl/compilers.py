@@ -1369,12 +1369,7 @@ class FormCompiler:
             integral.integrand,
             self.dh, self.me
         )
-        need_hess = False
-        if hasattr(runner, "required_static"):
-            req = set(runner.required_static)
-            need_hess = bool(req & {"Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1"})
-        else:
-            need_hess = self._expr_requires_hess(integral.integrand)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(integral, runner)
 
 
         # 4. Build the static arguments required by this specific kernel.
@@ -1382,7 +1377,8 @@ class FormCompiler:
         q_order = self._find_q_order(integral)
 
         # (A) Get full-mesh geometric factors and then SLICE them for the subset.
-        geo_args_all = self.dh.precompute_geometric_factors(q_order, need_hess=need_hess)
+        geo_args_all = self.dh.precompute_geometric_factors(q_order, 
+                                                            need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
         pre_built = {k: (v[element_ids] if isinstance(v, np.ndarray) else v) for k, v in geo_args_all.items()}
         pre_built["entity_kind"] = "element"
         pre_built["owner_id"]    = geo_args_all.get("owner_id", geo_args_all.get("eids"))[element_ids]
@@ -1877,13 +1873,9 @@ class FormCompiler:
 
         
         runner, ir = self._compile_backend(intg.integrand, dh, me)
-        need_hess = False
-        if hasattr(runner, "required_static"):
-            req = set(runner.required_static)
-            need_hess = bool(req & {"Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1"})
-        else:
-            need_hess = self._expr_requires_hess(intg.integrand)
-        geo = dh.precompute_interface_factors(cut_bs, qdeg, level_set, need_hess=need_hess)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+        geo = dh.precompute_interface_factors(cut_bs, qdeg, level_set, 
+                                              need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
         cut_eids = geo["eids"].astype(np.int32)      # 1‑D array, len = n_cut
 
         # 2a) ALIAS: for interface, both sides are the same element.
@@ -1960,15 +1952,9 @@ class FormCompiler:
             self._assemble_interface_jit(intg, matvec)
         else:
             raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
-        
-    def _assemble_ghost_edge_jit(self, intg: "Integral", matvec):
-        """Assembles ghost-edge integrals using the JIT backend."""
 
-
-        mesh = self.me.mesh
-        dh, me = self.dh, self.me
-
-        # 1) Collect derivative multi-indices & quadrature order
+    def _find_req_derivs(self, intg: "Integral", runner):
+        """Find all required derivative multi-indices for the given integral."""
         md = intg.measure.metadata or {}
         derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
         derivs |= {(0, 0)}
@@ -1976,20 +1962,6 @@ class FormCompiler:
         for p in range(max_total + 1):
             for ox in range(p + 1):
                 derivs.add((ox, p - ox))
-
-        edge_ids = (intg.measure.defined_on
-                    if intg.measure.defined_on is not None
-                    else mesh.edge_bitset('ghost'))
-        level_set = getattr(intg.measure, 'level_set', None)
-        if level_set is None:
-            raise ValueError("dGhost measure requires a 'level_set' callable.")
-
-        qdeg = max(self._find_q_order(intg), 2*max_total + 4)
-        if edge_ids.cardinality() == 0:
-            raise ValueError("No ghost edges found for the integral.")
-
-        # 2) Compile kernel FIRST (to know exact static params it will require)
-        runner, ir = self._compile_backend(intg.integrand, dh, me)
         req_list = list(getattr(runner, "param_order", []))
         req = set(req_list)
 
@@ -2009,6 +1981,33 @@ class FormCompiler:
             derivs |= {(3,0),(2,1),(1,2),(0,3)}
         if need_o4:
             derivs |= {(4,0),(3,1),(2,2),(1,3),(0,4)}
+
+        return derivs, need_hess, need_o3, need_o4
+
+    def _assemble_ghost_edge_jit(self, intg: "Integral", matvec):
+        """Assembles ghost-edge integrals using the JIT backend."""
+
+
+        mesh = self.me.mesh
+        dh, me = self.dh, self.me
+
+
+        edge_ids = (intg.measure.defined_on
+                    if intg.measure.defined_on is not None
+                    else mesh.edge_bitset('ghost'))
+        level_set = getattr(intg.measure, 'level_set', None)
+        if level_set is None:
+            raise ValueError("dGhost measure requires a 'level_set' callable.")
+
+        if edge_ids.cardinality() == 0:
+            raise ValueError("No ghost edges found for the integral.")
+
+        # 2) Compile kernel FIRST (to know exact static params it will require)
+        runner, ir = self._compile_backend(intg.integrand, dh, me)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = max(self._find_q_order(intg), 2*max_total + 4)
 
         # 3) Precompute sided ghost factors with the exact flags
         geo = self.dh.precompute_ghost_factors(
@@ -2062,6 +2061,8 @@ class FormCompiler:
                     kernel_args[name] = kernel_args[kneg]
 
         # 4c) Alias sided jets from unsided if necessary (belt-and-suspenders)
+        req_list = list(getattr(runner, "param_order", []))
+        req = set(req_list)
         for side in ("pos","neg"):
             for t in ("Hxi0","Hxi1","Txi0","Txi1","Qxi0","Qxi1"):
                 need_key = f"{side}_{t}"
@@ -2244,20 +2245,13 @@ class FormCompiler:
             
 
         # 2. geometry tables ------------------------------------------
-        derivs = required_multi_indices(intg.integrand) | {(0, 0)}  # always include values
-        if (0, 0) not in derivs:
-            derivs |= {(0, 0)}
         qdeg = self._find_q_order(intg)
         print(f"[Assembler: boundary edge JIT] Using quadrature degree: {qdeg}")
         # 3. kernel compilation ---------------------------------------
         runner, ir = self._compile_backend(intg.integrand, dh, me)
-        need_hess = False
-        if hasattr(runner, "required_static"):
-            req = set(runner.required_static)
-            need_hess = bool(req & {"Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1"})
-        else:
-            need_hess = self._expr_requires_hess(intg.integrand)
-        geo  = dh.precompute_boundary_factors(edge_set, qdeg, derivs, need_hess=need_hess)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+        geo  = dh.precompute_boundary_factors(edge_set, qdeg, derivs, 
+                                              need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
 
         valid = geo["eids"]
         if valid.size == 0:
@@ -2476,12 +2470,7 @@ class FormCompiler:
 
         # --- compile kernel once
         runner, ir = self._compile_backend(intg.integrand, dh, me)
-        need_hess = False
-        if hasattr(runner, "required_static"):
-            req = set(runner.required_static)
-            need_hess = bool(req & {"Hxi0","Hxi1","pos_Hxi0","pos_Hxi1","neg_Hxi0","neg_Hxi1"})
-        else:
-            need_hess = self._expr_requires_hess(intg.integrand)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
 
         # helper to run kernel on a subset of elements with prebuilt geo
         def _run_subset(eids: np.ndarray, prebuilt: dict):
@@ -2513,7 +2502,8 @@ class FormCompiler:
         full_ids = np.asarray(outside_ids if side == '+' else inside_ids, dtype=np.int32)
         if full_ids.size:
             # include level_set so 'phis' is populated (still fine if None)
-            geo_all = dh.precompute_geometric_factors(qdeg, level_set, need_hess=need_hess)
+            geo_all = dh.precompute_geometric_factors(qdeg, level_set, 
+                                                      need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
 
             # slice what the kernel signature expects
             prebuilt_full = {
