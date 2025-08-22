@@ -148,13 +148,13 @@ def test_cutfem_poisson_interface(backend):
     stab = Constant(20.0 * (20.0 + 1.0)) / h  # you can keep this
 
     # OPTIONAL: Hansbo scaling for the interface penalty (helps slivers)
-    # from pycutfem.core.geometry import hansbo_cut_ratio
-    # theta_min = 1.0e-3
-    # alpha_hansbo = 0.5
-    # theta_plus  = np.clip(hansbo_cut_ratio(mesh, level_set, side='+'), theta_min, 1.0)
-    # theta_minus = np.clip(hansbo_cut_ratio(mesh, level_set, side='-'), theta_min, 1.0)
-    # beta_scale = 0.5*(theta_plus**(-alpha_hansbo) + theta_minus**(-alpha_hansbo))
-    # stab = Constant(20.0 * (20.0 + 1.0)) * ElementWiseConstant(beta_scale) / h
+    from pycutfem.core.geometry import hansbo_cut_ratio
+    theta_min = 1.0e-3
+    alpha_hansbo = 0.5
+    theta_plus  = np.clip(hansbo_cut_ratio(mesh, level_set, side='+'), theta_min, 1.0)
+    theta_minus = np.clip(hansbo_cut_ratio(mesh, level_set, side='-'), theta_min, 1.0)
+    beta_scale = 0.5*(theta_plus**(-alpha_hansbo) + theta_minus**(-alpha_hansbo))
+    stab = Constant(20.0 * (20.0 + 1.0)) * ElementWiseConstant(beta_scale) / h
 
     # --- average fluxes (as you had) ---
     n = FacetNormal()
@@ -164,8 +164,8 @@ def test_cutfem_poisson_interface(backend):
     avg_flux_v = -0.5 * ( alpha_pos * dot(grad(v_pos), n) - alpha_neg * dot(grad(v_neg), n) )
 
     # --- core bilinear ---
-    a  = inner(alpha * grad(u_pos), grad(v_pos)) * dx_pos
-    a += inner(alpha * grad(u_neg), grad(v_neg)) * dx_neg
+    a  = inner(alpha_pos * grad(u_pos), grad(v_pos)) * dx_pos
+    a += inner(alpha_neg * grad(u_neg), grad(v_neg)) * dx_neg
 
     # --- CORRECT ghost stabilization: interior jump on each side separately ---
     #     i.e., [∇u_pos]·[∇v_pos] on ghost faces of the + side, and similarly for - side
