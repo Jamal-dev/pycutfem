@@ -36,8 +36,12 @@ def clip_triangle_to_side(v_coords, v_phi, side='+', eps=0.0):
     phi = sgn * np.asarray(v_phi, dtype=float)
     V   = [np.asarray(v, dtype=float) for v in v_coords]
 
-    keep = [i for i in range(3) if phi[i] >= -eps]
-    drop = [i for i in range(3) if phi[i] <  -eps]
+    if side == '+':
+        keep = [i for i in range(3) if (+1.0)*v_phi[i] >= -eps]  # φ >= -eps
+        drop = [i for i in range(3) if (+1.0)*v_phi[i] <  -eps]
+    else:  # side == '-'
+        keep = [i for i in range(3) if (-1.0)*v_phi[i] >  eps]   # φ < -eps  (strict)
+        drop = [i for i in range(3) if (-1.0)*v_phi[i] <= eps]
 
     if len(keep) == 3:
         return [V]
@@ -67,8 +71,12 @@ if _HAVE_NUMBA:
         Returns (poly_pts(4,2), n_pts:int). For triangle result n_pts=3; quad → 4; empty → 0.
         """
         p = _nb.types.float64
-        phi0 = sgn * phi[0]; phi1 = sgn * phi[1]; phi2 = sgn * phi[2]
-        keep0 = phi0 >= -eps; keep1 = phi1 >= -eps; keep2 = phi2 >= -eps
+        # phi here is the raw v_phi; we compute phiX = sgn * v_phi[X]
+        phi0 = sgn*phi[0]; phi1 = sgn*phi[1]; phi2 = sgn*phi[2]
+        if sgn == 1.0:           # '+' side: keep φ >= -eps
+            keep0 = (phi0 >= -eps); keep1 = (phi1 >= -eps); keep2 = (phi2 >= -eps)
+        else:                    # '−' side: keep φ < -eps  (strict)
+            keep0 = (phi0 >  eps); keep1 = (phi1 >  eps); keep2 = (phi2 >  eps)
         n_keep = (1 if keep0 else 0) + (1 if keep1 else 0) + (1 if keep2 else 0)
         out = np.empty((4, 2), dtype=np.float64)
         if n_keep == 3:

@@ -477,7 +477,7 @@ class FormCompiler:
     def _visit_Pos(self, n: Pos): 
         """Evaluates operand only if on the positive side of an interface.""" 
         # The '+' side is where phi >= 0 (a closed set)
-        if 'phi_val' in self.ctx and self.ctx['phi_val'] < -_INTERFACE_TOL: 
+        if 'phi_val' in self.ctx and self.ctx['phi_val'] < 0.0: 
             # We are on the strictly negative side, so return zero.
             op_val = self._visit(n.operand) 
             return op_val * 0.0 # Scales scalars, arrays, and Info objects to zero 
@@ -486,7 +486,7 @@ class FormCompiler:
     def _visit_Neg(self, n: Neg): 
         """Evaluates operand only if on the negative side of an interface.""" 
         # The '-' side is where phi < 0 (an open set)
-        if 'phi_val' in self.ctx and self.ctx['phi_val'] >= _INTERFACE_TOL: 
+        if 'phi_val' in self.ctx and self.ctx['phi_val'] >= 0.0: 
              # We are on the positive or zero side, so return zero.
             op_val = self._visit(n.operand) 
             return op_val * 0.0 

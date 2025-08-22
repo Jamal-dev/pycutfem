@@ -10,7 +10,7 @@ def _triangle_area(A, B, C):
 
 def hansbo_cut_ratio(mesh, level_set, side: str = "+") -> np.ndarray:
     """
-    theta_e(side) = |K_e ∩ {phi ▷ 0}| / |K_e|  with ▷ = '>' for side='+', '<' for side='-'.
+    theta_e(side) = |K_e ∩ {phi ▷ 0}| / |K_e|  with ▷ = '>=' for side='+', '<' for side='-'.
     Returns theta ∈ [0,1] for every element e.
     """
     nE = len(mesh.elements_list)

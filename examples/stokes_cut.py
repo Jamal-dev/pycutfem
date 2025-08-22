@@ -14,7 +14,7 @@ from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner, dot, div, jump, Pos, Neg,
-    FacetNormal, CellDiameter, ElementWiseConstant
+    FacetNormal, CellDiameter, ElementWiseConstant, Jump
 )
 from pycutfem.ufl.measures import dx, dInterface, dGhost
 from pycutfem.ufl.forms import BoundaryCondition, assemble_form, Equation
@@ -27,82 +27,7 @@ from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.analytic import x as x_ana
 from pycutfem.ufl.analytic import y as y_ana
 
-
-def test_stokes_interface_corrected():
-    """
-    Unfitted Stokes interface (NGSolve-style): Hansbo averaging, Nitsche coupling,
-    ghost penalties, SymPy-manufactured RHS, and piecewise L2/H1 errors.
-    This version is corrected to use the existing pycutfem API.
-    """
-    # ---------------- 1) Mesh, order, level set ----------------
-    poly_order = 2
-    maxh = 0.125
-    mesh_size = int(2.0 / maxh)
-
-    nodes, elems, _, corners = structured_quad(
-        2.0, 2.0, nx=mesh_size, ny=mesh_size,
-        poly_order=poly_order, offset=[-1.0, -1.0]
-    )
-    mesh = Mesh(nodes, element_connectivity=elems,
-                elements_corner_nodes=corners,
-                poly_order=poly_order, element_type='quad')
-
-    mu = [Constant(1.0), Constant(10.0)]        # μ_in, μ_out
-    R = 2.0/3.0
-    gammaf = 0.5            # surface tension = pressure jump
-    level_set = CircleLevelSet(center=(0.0, 0.0), radius=R)
-
-    # Classify & interface
-    mesh.classify_elements(level_set)
-    mesh.classify_edges(level_set)
-    mesh.build_interface_segments(level_set)
-
-    # Boundary tags (square boundary)
-    boundary_tags = {
-        'boundary': lambda x, y: np.isclose(x, -1.0) | np.isclose(x, 1.0) |
-                                  np.isclose(y, -1.0) | np.isclose(y, 1.0)
-    }
-    mesh.tag_boundary_edges(boundary_tags)
-
-    # BitSets
-    inside_e  = mesh.element_bitset("inside")
-    outside_e = mesh.element_bitset("outside")
-    cut_e     = mesh.element_bitset("cut")
-    ghost_e   = mesh.edge_bitset("ghost")
-
-    has_inside  = inside_e  | cut_e
-    has_outside = outside_e | cut_e
-
-    # ---------------- 2) Mixed FE space & dofs ----------------
-    me = MixedElement(mesh, field_specs={'ux': poly_order, 'uy': poly_order, 'p': poly_order-1})
-    dh = DofHandler(me, method='cg')
-
-    Vspace    = FunctionSpace("vel", ['ux', 'uy'])
-    vel_trial = VectorTrialFunction(space=Vspace, dof_handler=dh)
-    vel_test  = VectorTestFunction(space=Vspace,  dof_handler=dh)
-    p_trial   = TrialFunction('p', dh)
-    p_test    = TestFunction('p', dh)
-
-    # Measures & parameters
-    qvol   = 2*poly_order + 2
-    dx_pos = dx(defined_on=has_outside, level_set=level_set, metadata={'side': '+', 'q': qvol})
-    dx_neg = dx(defined_on=has_inside,  level_set=level_set, metadata={'side': '-', 'q': qvol})
-    dGamma = dInterface(defined_on=cut_e,  level_set=level_set, metadata={'q': qvol})
-    dG = dGhost(defined_on=ghost_e,    level_set=level_set, metadata={'q': qvol})
-
-    h = CellDiameter()
-    n = FacetNormal()
-
-    # Hansbo weights θ^+, θ^- (per element); element-wise constants
-    theta_pos_vals = hansbo_cut_ratio(mesh, level_set, side='+')
-    theta_neg_vals = 1.0 - theta_pos_vals
-    kappa_pos = ElementWiseConstant(theta_pos_vals)
-    kappa_neg = ElementWiseConstant(theta_neg_vals)
-
-    lambda_nitsche = Constant(0.5 * (mu[0].value + mu[1].value) * 20 * poly_order**2)
-    gamma_stab_v   = Constant(0.05)
-    gamma_stab_p   = Constant(0.05)
-
+def exact_solution(mu, R, gammaf):
     # ---------------- 3) Exact fields & manufactured RHS via SymPy ----------------
     sx, sy = sp.symbols('x y', real=True)
     r2 = sx*sx + sy*sy
@@ -206,11 +131,109 @@ def test_stokes_interface_corrected():
     # Manufactured body force (vector) — vectorized:
     g_neg_xy = vec2_callable(g_neg_x_fun, g_neg_y_fun)
     g_pos_xy = vec2_callable(g_pos_x_fun, g_pos_y_fun)
+    return (vel_exact_neg_xy, vel_exact_pos_xy,
+            g_neg_xy, g_pos_xy,
+            grad_vel_neg_xy, grad_vel_pos_xy,
+            p_exact_neg_xy, p_exact_pos_xy)
 
+
+def test_stokes_interface_corrected():
+    """
+    Unfitted Stokes interface (NGSolve-style): Hansbo averaging, Nitsche coupling,
+    ghost penalties, SymPy-manufactured RHS, and piecewise L2/H1 errors.
+    This version is corrected to use the existing pycutfem API.
+    """
+    # ---------------- 1) Mesh, order, level set ----------------
+    poly_order = 2
+    maxh = 0.125/2.0
+    mesh_size = int(2.0 / maxh)
+    L,H = 2.0, 2.0
+
+    nodes, elems, _, corners = structured_quad(
+        L, H, nx=mesh_size, ny=mesh_size,
+        poly_order=poly_order, offset=[-1.0, -1.0]
+    )
+    mesh = Mesh(nodes, element_connectivity=elems,
+                elements_corner_nodes=corners,
+                poly_order=poly_order, element_type='quad')
+
+    mu = [Constant(1.0), Constant(10.0)]        # μ_in, μ_out
+    R = 2.0/3.0
+    gammaf = 0.5            # surface tension = pressure jump
+    level_set = CircleLevelSet(center=(0.0, 0.0), radius=R)
+
+    # Classify & interface
+    mesh.classify_elements(level_set)
+    mesh.classify_edges(level_set)
+    mesh.build_interface_segments(level_set)
+
+    # Boundary tags (square boundary)
+    boundary_tags = {
+        'boundary': lambda x, y: np.isclose(x, -L/2.0) | np.isclose(x, L/2.0) |
+                                  np.isclose(y, -H/2.0) | np.isclose(y, H/2.0)
+    }
+    mesh.tag_boundary_edges(boundary_tags)
+
+    # BitSets
+    inside_e  = mesh.element_bitset("inside")
+    outside_e = mesh.element_bitset("outside")
+    cut_e     = mesh.element_bitset("cut")
+    ghost_pos = mesh.edge_bitset("ghost_pos")
+    ghost_neg = mesh.edge_bitset("ghost_neg")
+    ghost_both = mesh.edge_bitset("ghost_both")
+    ghost_interface = mesh.edge_bitset("interface")
+    ghost_pos   = ghost_pos | ghost_interface | ghost_both
+    ghost_neg   = ghost_neg | ghost_interface | ghost_both
+
+    has_inside  = inside_e  | cut_e
+    has_outside = outside_e | cut_e
+
+    # ---------------- 2) Mixed FE space & dofs ----------------
+    me = MixedElement(mesh, field_specs={'u_pos_x': poly_order, 'u_pos_y': poly_order, 'p_pos_': poly_order-1,
+                                         'u_neg_x': poly_order, 'u_neg_y': poly_order, 'p_neg_': poly_order-1})
+    dh = DofHandler(me, method='cg')
+
+    Vspace_pos    = FunctionSpace("vel_positive", ['u_pos_x', 'u_pos_y'])
+    Vspace_neg    = FunctionSpace("vel_negative", ['u_neg_x', 'u_neg_y'])
+    vel_trial_pos = VectorTrialFunction(space=Vspace_pos, dof_handler=dh)
+    vel_test_pos  = VectorTestFunction(space=Vspace_pos,  dof_handler=dh)
+    vel_trial_neg = VectorTrialFunction(space=Vspace_neg, dof_handler=dh)
+    vel_test_neg  = VectorTestFunction(space=Vspace_neg,  dof_handler=dh)
+    p_trial_pos   = TrialFunction('p_pos_', dh,name='pressure_pos_trial')
+    q_test_pos    = TestFunction ('p_pos_', dh,name='pressure_pos_test')
+    p_trial_neg   = TrialFunction('p_neg_', dh,name='pressure_neg_trial')
+    q_test_neg    = TestFunction ('p_neg_', dh,name='pressure_neg_test')
+
+    # Measures & parameters
+    qvol   = 2*poly_order + 2
+    dx_pos = dx(defined_on=has_outside, level_set=level_set, metadata={'side': '+', 'q': qvol})
+    dx_neg = dx(defined_on=has_inside,  level_set=level_set, metadata={'side': '-', 'q': qvol})
+    dGamma = dInterface(defined_on=cut_e,  level_set=level_set, metadata={'q': qvol})
+    dG_pos = dGhost(defined_on=ghost_pos,    level_set=level_set, metadata={'q': qvol+2, 'derivs': {(1,0),(0,1)}})
+    dG_neg = dGhost(defined_on=ghost_neg,    level_set=level_set, metadata={'q': qvol+2, 'derivs': {(1,0),(0,1)}})
+
+    h = CellDiameter()
+    n = FacetNormal()
+
+    # Hansbo weights θ^+, θ^- (per element); element-wise constants
+    theta_pos_vals = hansbo_cut_ratio(mesh, level_set, side='+')
+    theta_neg_vals = 1.0 - theta_pos_vals
+    kappa_pos = ElementWiseConstant(theta_pos_vals)
+    kappa_neg = ElementWiseConstant(theta_neg_vals)
+
+    lambda_nitsche = Constant(0.5 * (mu[0].value + mu[1].value) * 20 * poly_order**2)
+    gamma_stab_v   = Constant(0.05)
+    gamma_stab_p   = Constant(0.05)
+
+    
+    (vel_exact_neg_xy, vel_exact_pos_xy,
+            g_neg_xy, g_pos_xy,
+            grad_vel_neg_xy, grad_vel_pos_xy,
+            p_exact_neg_xy, p_exact_pos_xy)=exact_solution(mu, R, gammaf)
     # g_neg = Analytic(g_neg_xy)
     # g_pos = Analytic(g_pos_xy)
-    g_neg = VectorFunction(name="g_neg", field_names=['ux', 'uy'], dof_handler=dh)
-    g_pos = VectorFunction(name="g_pos", field_names=['ux', 'uy'], dof_handler=dh)
+    g_neg = VectorFunction(name="g_neg", field_names=['u_neg_x', 'u_neg_y'], dof_handler=dh)
+    g_pos = VectorFunction(name="g_pos", field_names=['u_pos_x', 'u_pos_y'], dof_handler=dh)
     g_neg.set_values_from_function(g_neg_xy)
     g_pos.set_values_from_function(g_pos_xy)
 
@@ -222,43 +245,66 @@ def test_stokes_interface_corrected():
         return -2*mu_val * dot(epsilon(u_vec), normal) + p_scal * normal
 
     # volume terms
-    a = (2*mu[1]*inner(epsilon(vel_trial), epsilon(vel_test)) - div(vel_trial)*p_test - div(vel_test)*p_trial) * dx_pos
-    a += (2*mu[0]*inner(epsilon(vel_trial), epsilon(vel_test)) - div(vel_trial)*p_test - div(vel_test)*p_trial) * dx_neg
+    a =  (2*mu[1]*inner(epsilon(vel_trial_pos), epsilon(vel_test_pos)) - div(vel_trial_pos)*q_test_pos - div(vel_test_pos)*p_trial_pos) * dx_pos
+    a += (2*mu[0]*inner(epsilon(vel_trial_neg), epsilon(vel_test_neg)) - div(vel_trial_neg)*q_test_neg - div(vel_test_neg)*p_trial_neg) * dx_neg
 
-    sig_pos_n_trial = traction(mu[1], Pos(vel_trial), Pos(p_trial), n)
-    sig_neg_n_trial = traction(mu[0], Neg(vel_trial), Neg(p_trial), n)
-    avg_flux_trial  = kappa_neg * sig_pos_n_trial + kappa_pos * sig_neg_n_trial
+    sig_pos_n_trial = traction(mu[1], Pos(vel_trial_pos), Pos(p_trial_pos), n)
+    sig_neg_n_trial = traction(mu[0], Neg(vel_trial_neg), Neg(p_trial_neg), n)
+    avg_flux_trial  = kappa_pos * sig_pos_n_trial + kappa_neg * sig_neg_n_trial
 
-    sig_pos_n_test = traction(mu[1], Pos(vel_test), Pos(p_test), n)
-    sig_neg_n_test = traction(mu[0], Neg(vel_test), Neg(p_test), n)
-    avg_flux_test  = kappa_neg * sig_pos_n_test + kappa_pos * sig_neg_n_test
+    sig_pos_n_test = traction(mu[1], Pos(vel_test_pos), Pos(q_test_pos), n)
+    sig_neg_n_test = traction(mu[0], Neg(vel_test_neg), Neg(q_test_neg), n)
+    avg_flux_test  = kappa_pos * sig_pos_n_test + kappa_neg * sig_neg_n_test
 
+    jump_vel_trial = Jump(vel_trial_pos, vel_trial_neg)
+    jump_vel_test  = Jump(vel_test_pos,  vel_test_neg)
+    jump_p_trial = Jump(p_trial_pos, p_trial_neg)
+    jump_q_test  = Jump(q_test_pos,  q_test_neg)
     # Interface terms
-    a += ( dot(avg_flux_trial, jump(vel_test))
-          + dot(avg_flux_test,  jump(vel_trial))
-          + (lambda_nitsche / h) * dot(jump(vel_trial), jump(vel_test)) ) * dGamma
+    a += ( dot(avg_flux_trial, jump_vel_test)
+          + dot(avg_flux_test,  jump_vel_trial)
+          + (lambda_nitsche / h) * dot(jump_vel_trial, jump_vel_test) ) * dGamma
 
     # Ghost penalty terms
-    a += (gamma_stab_v / h**2) * dot(jump(vel_trial), jump(vel_test)) * dG
-    a -= (gamma_stab_p * h**2) * jump(p_trial) * jump(p_test) * dG
+    a += (gamma_stab_v / h**2) * dot(jump_vel_trial, jump_vel_test) * dG_pos
+    a -= (gamma_stab_p ) * jump_p_trial * jump_q_test * dG_pos
+    a += (gamma_stab_v / h**2) * dot(jump_vel_trial, jump_vel_test) * dG_neg
+    a -= (gamma_stab_p ) * jump_p_trial * jump_q_test * dG_neg
 
-    avg_inv_test = kappa_neg * Pos(vel_test) + kappa_pos * Neg(vel_test)
-    f = dot(g_pos, vel_test) * dx_pos \
-      + dot(g_neg, vel_test) * dx_neg \
+    avg_inv_test = kappa_neg * Pos(vel_test_pos) + kappa_pos * Neg(vel_test_neg)
+    f = dot(g_pos, vel_test_pos) * dx_pos \
+      + dot(g_neg, vel_test_neg) * dx_neg \
       - gammaf * dot(avg_inv_test, n) * dGamma
 
     equation = Equation(a, f)
 
     # ---------------- 5) Velocity Dirichlet on outer boundary ----------------
+    dh.tag_dofs_from_element_bitset("inactive_inside_ux", "u_pos_x", "inside", strict=True)
+    dh.tag_dofs_from_element_bitset("inactive_inside_uy", "u_pos_y", "inside", strict=True)
+    dh.tag_dofs_from_element_bitset("inactive_outside_ux", "u_neg_x", "outside", strict=True)
+    dh.tag_dofs_from_element_bitset("inactive_outside_uy", "u_neg_y", "outside", strict=True)
+    dh.tag_dofs_from_element_bitset("inactive_inside_p", "p_pos_", "inside", strict=True)
+    dh.tag_dofs_from_element_bitset("inactive_outside_p", "p_neg_", "outside", strict=True)
     bcs = [
-        BoundaryCondition('ux', 'dirichlet', 'boundary', lambda x, y: vel_exact_pos_xy(x, y)[0]),
-        BoundaryCondition('uy', 'dirichlet', 'boundary', lambda x, y: vel_exact_pos_xy(x, y)[1]),
+        BoundaryCondition('u_pos_x', 'dirichlet', 'boundary', lambda x, y: vel_exact_pos_xy(x, y)[0]),
+        BoundaryCondition('u_pos_y', 'dirichlet', 'boundary', lambda x, y: vel_exact_pos_xy(x, y)[1]),
+        BoundaryCondition('p_pos_', 'dirichlet', 'boundary', lambda x, y: p_exact_pos_xy(x, y)),
+        BoundaryCondition('u_neg_x', 'dirichlet', 'boundary', lambda x, y: vel_exact_neg_xy(x, y)[0]),
+        BoundaryCondition('u_neg_y', 'dirichlet', 'boundary', lambda x, y: vel_exact_neg_xy(x, y)[1]),
+        BoundaryCondition('p_neg_', 'dirichlet', 'boundary', lambda x, y: p_exact_neg_xy(x, y)),
+        BoundaryCondition('u_pos_x', 'dirichlet', 'inactive_inside_ux', lambda x, y: vel_exact_pos_xy(x, y)[0]),
+        BoundaryCondition('u_pos_y', 'dirichlet', 'inactive_inside_uy', lambda x, y: vel_exact_pos_xy(x, y)[1]),
+        BoundaryCondition('u_neg_x', 'dirichlet', 'inactive_outside_ux', lambda x, y: vel_exact_neg_xy(x, y)[0]),
+        BoundaryCondition('u_neg_y', 'dirichlet', 'inactive_outside_uy', lambda x, y: vel_exact_neg_xy(x, y)[1]),
+        BoundaryCondition('p_pos_', 'dirichlet', 'inactive_inside_p', lambda x, y: p_exact_pos_xy(x, y)),
+        BoundaryCondition('p_neg_', 'dirichlet', 'inactive_outside_p', lambda x, y: p_exact_neg_xy(x, y)),
     ]
+
 
     # ---------------- 6) Assemble & solve ----------------
     K, F = assemble_form(equation, dof_handler=dh, bcs=bcs, quad_order=qvol)
 
-    p0 = dh.get_field_slice('p')[0]
+    p0 = dh.get_field_slice('p_pos_')[0]
     K = K.tolil(); F = F.copy()
     K[p0, :] = 0.0; K[:, p0] = 0.0
     K[p0, p0] = 1.0
@@ -270,25 +316,27 @@ def test_stokes_interface_corrected():
         sol = spla.lsqr(K.tocsc(), F)[0]
 
     # ---------------- 7) Wrap solution & calculate errors ----------------
-    U = VectorFunction(name="velocity", field_names=['ux','uy'], dof_handler=dh)
-    P = Function(name="pressure", field_name='p', dof_handler=dh)
-    dh.add_to_functions(sol, [U, P])
+    U_pos = VectorFunction(name="velocity_pos", field_names=['u_pos_x','u_pos_y'], dof_handler=dh)
+    P_pos = Function(name="pressure_pos", field_name='p_pos_', dof_handler=dh)
+    U_neg = VectorFunction(name="velocity_neg", field_names=['u_neg_x','u_neg_y'], dof_handler=dh)
+    P_neg = Function(name="pressure_neg", field_name='p_neg_', dof_handler=dh)
+    dh.add_to_functions(sol, [U_pos, P_pos, U_neg, P_neg])
 
-    exact_neg = {'ux': lambda x,y: vel_exact_neg_xy(x,y)[0], 'uy': lambda x,y: vel_exact_neg_xy(x,y)[1], 'p': p_exact_neg_xy}
-    exact_pos = {'ux': lambda x,y: vel_exact_pos_xy(x,y)[0], 'uy': lambda x,y: vel_exact_pos_xy(x,y)[1], 'p': p_exact_pos_xy}
+    exact_neg = {'u_neg_x': lambda x,y: vel_exact_neg_xy(x,y)[0], 'u_neg_y': lambda x,y: vel_exact_neg_xy(x,y)[1], 'p_neg_': p_exact_neg_xy}
+    exact_pos = {'u_pos_x': lambda x,y: vel_exact_pos_xy(x,y)[0], 'u_pos_y': lambda x,y: vel_exact_pos_xy(x,y)[1], 'p_pos_': p_exact_pos_xy}
 
-    err_vel_L2_neg = dh.l2_error_on_side(U, exact_neg, level_set, side='-', fields=['ux', 'uy'], relative=False)
-    err_vel_L2_pos = dh.l2_error_on_side(U, exact_pos, level_set, side='+', fields=['ux', 'uy'], relative=False)
+    err_vel_L2_neg = dh.l2_error_on_side(U_neg, exact_neg, level_set, side='-', fields=['u_neg_x', 'u_neg_y'], relative=False)
+    err_vel_L2_pos = dh.l2_error_on_side(U_pos, exact_pos, level_set, side='+', fields=['u_pos_x', 'u_pos_y'], relative=False)
     vel_L2 = np.sqrt(err_vel_L2_neg**2 + err_vel_L2_pos**2)
 
-    err_p_L2_neg = dh.l2_error_on_side(P, exact_neg, level_set, side='-', fields=['p'], relative=False)
-    err_p_L2_pos = dh.l2_error_on_side(P, exact_pos, level_set, side='+', fields=['p'], relative=False)
+    err_p_L2_neg = dh.l2_error_on_side(P_neg, exact_neg, level_set, side='-', fields=['p_neg_'], relative=False)
+    err_p_L2_pos = dh.l2_error_on_side(P_pos, exact_pos, level_set, side='+', fields=['p_pos_'], relative=False)
     p_L2 = np.sqrt(err_p_L2_neg**2 + err_p_L2_pos**2)
 
-    vel_H1 = dh.h1_error_vector_piecewise(U, exact_neg, exact_pos, level_set)
+    # vel_H1 = dh.h1_error_vector_piecewise(U_pos, exact_neg, exact_pos, level_set)
 
     print(f"L2 Error (velocity): {vel_L2:10.8e}")
-    print(f"H1 Error (velocity): {vel_H1:10.8e}")
+    # print(f"H1 Error (velocity): {vel_H1:10.8e}")
     print(f"L2 Error (pressure): {p_L2:10.8e}")
 
     # ---------------- 8) Export ----------------
@@ -297,7 +345,7 @@ def test_stokes_interface_corrected():
     vtk_path = os.path.join(outdir, "solution.vtu")
     phi_vals = level_set.evaluate_on_nodes(mesh)
     export_vtk(vtk_path, mesh=mesh, dof_handler=dh,
-               functions={"velocity": U, "pressure": P, "phi": phi_vals})
+               functions={"velocity_pos": U_pos, "pressure_pos": P_pos, "velocity_neg": U_neg, "pressure_neg": P_neg, "phi": phi_vals})
     print(f"Solution exported to {vtk_path}")
 
 if __name__ == "__main__":

@@ -60,9 +60,10 @@ def test_cutfem_poisson_interface(backend):
     This version uses the final, robust, BitSet-driven framework.
     """
     # 1. Setup Mesh and Level Set
-    poly_order = 1
+    poly_order = 2
     L,H = 3.0, 3.0
-    nx, ny = 30, 30
+    total_area = L * H
+    nx, ny = 10, 10
     ghost_parameter = 0.5
     beta =20  # Stabilization parameter
     gamma_G = Constant(ghost_parameter)
@@ -71,6 +72,8 @@ def test_cutfem_poisson_interface(backend):
     c_x, c_y = 0.0, 0.0
     radius = 1.0
     level_set = CircleLevelSet(center=(c_x, c_y), radius=radius)
+    A_pos_expected = total_area - np.pi * radius**2
+    A_neg_expected = np.pi * radius**2
 
     # 2. Apply general boundary tags FIRST
     boundary_tags = {
@@ -137,31 +140,36 @@ def test_cutfem_poisson_interface(backend):
     u_pos, v_pos = TrialFunction('u_outside', dof_handler, name='u_pos_trial'), TestFunction('u_outside', dof_handler, name='u_pos_test')
     u_neg, v_neg = TrialFunction('u_inside',  dof_handler, name='u_neg_trial'), TestFunction('u_inside',  dof_handler, name='u_neg_test')
 
+    one = Constant(1.0)
+    Apos = assemble_form(Equation(None, one * v_pos * dx_pos), dof_handler=dof_handler)[1].sum()
+    Aneg = assemble_form(Equation(None, one * v_neg * dx_neg), dof_handler=dof_handler)[1].sum()
+    print("A+ + A- =", Apos + Aneg, " vs |Ω| =", mesh.areas_list.sum())
+    print(f"A+: {Apos}, expected: {A_pos_expected:.4f}, difference: {abs(Apos - A_pos_expected):.4f}")
+    print(f"A-: {Aneg}, expected: {A_neg_expected:.4f}, difference: {abs(Apos - A_pos_expected):.4f}")
+
     # --- coefficients / constants (as you had) ---
-    alpha_vals = np.zeros(len(mesh.elements_list))
-    alpha_vals[outside_elements.to_indices()] = 1.0
-    alpha_vals[inside_elements.to_indices()] = 20.0
-    alpha_vals[cut_elements.to_indices()] = 1.0  # convention
-    alpha = ElementWiseConstant(alpha_vals)
+    alpha_pos = Constant(1.0)  # α₊
+    alpha_neg = Constant(20.0)  # α₋
 
     h    = CellDiameter()
-    stab = Constant(20.0 * (20.0 + 1.0)) / h  # you can keep this
+    stab = Constant(20.0 * (20.0 + 1.0)) / h  
 
     # OPTIONAL: Hansbo scaling for the interface penalty (helps slivers)
     from pycutfem.core.geometry import hansbo_cut_ratio
     theta_min = 1.0e-3
     alpha_hansbo = 0.5
-    theta_plus  = np.clip(hansbo_cut_ratio(mesh, level_set, side='+'), theta_min, 1.0)
-    theta_minus = np.clip(hansbo_cut_ratio(mesh, level_set, side='-'), theta_min, 1.0)
-    beta_scale = 0.5*(theta_plus**(-alpha_hansbo) + theta_minus**(-alpha_hansbo))
-    stab = Constant(20.0 * (20.0 + 1.0)) * ElementWiseConstant(beta_scale) / h
+    kappa_plus  = np.clip(hansbo_cut_ratio(mesh, level_set, side='+'), theta_min, 1.0)
+    kappa_minus = np.clip(hansbo_cut_ratio(mesh, level_set, side='-'), theta_min, 1.0)
+    kappa_p = Pos(ElementWiseConstant(kappa_plus))
+    kappa_m = Neg(ElementWiseConstant(kappa_minus))
+    stab = Constant(20.0 * (20.0 + 1.0)) / h
 
     # --- average fluxes (as you had) ---
     n = FacetNormal()
-    alpha_pos = Pos(alpha)
-    alpha_neg = Neg(alpha)
-    avg_flux_u = -0.5 * ( alpha_pos * dot(grad(u_pos), n) - alpha_neg * dot(grad(u_neg), n) )
-    avg_flux_v = -0.5 * ( alpha_pos * dot(grad(v_pos), n) - alpha_neg * dot(grad(v_neg), n) )
+    avg_flux_u = ( - kappa_p * alpha_pos * dot(grad(u_pos), n)
+               - kappa_m * alpha_neg * dot(grad(u_neg), n) )
+    avg_flux_v = ( - kappa_p * alpha_pos * dot(grad(v_pos), n)
+                - kappa_m * alpha_neg * dot(grad(v_neg), n) )
 
     # --- core bilinear ---
     a  = inner(alpha_pos * grad(u_pos), grad(v_pos)) * dx_pos
@@ -169,8 +177,8 @@ def test_cutfem_poisson_interface(backend):
 
     # --- CORRECT ghost stabilization: interior jump on each side separately ---
     #     i.e., [∇u_pos]·[∇v_pos] on ghost faces of the + side, and similarly for - side
-    a += gamma_G * h * inner(Jump(grad(u_pos), grad(u_neg)), Jump(grad(v_pos), grad(v_neg))) * dGhost_pos
-    a += gamma_G * h * inner(Jump(grad(u_pos), grad(u_neg)), Jump(grad(v_pos), grad(v_neg))) * dGhost_neg
+    # a += gamma_G * h * inner(Jump(grad(u_pos), grad(u_neg)), Jump(grad(v_pos), grad(v_neg))) * dGhost_pos
+    # a += gamma_G * h * inner(Jump(grad(u_pos), grad(u_neg)), Jump(grad(v_pos), grad(v_neg))) * dGhost_neg
 
     # --- Interface Nitsche terms (unchanged algebra) ---
     jump_u = Jump(u_pos, u_neg)
@@ -180,7 +188,7 @@ def test_cutfem_poisson_interface(backend):
     # --- RHS
     # to match the NGSolve notebook: f = [1, 0]
     f  = Constant(1.0) * v_neg * dx_neg
-    # f += Constant(1.0) * v_pos * dx_pos    # <- keep it commented if you want the exact NGSolve case
+    # f += Constant(0.0) * v_pos * dx_pos  
 
     equation = Equation(a, f)
 

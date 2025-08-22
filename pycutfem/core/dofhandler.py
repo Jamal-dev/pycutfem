@@ -2610,7 +2610,7 @@ class DofHandler:
         relative: bool = False,
     ) -> float:
         """
-        L2-norm of specified fields over Ω_side := Ω ∩ { φ ▷ 0 }, with ▷='<' if side='-', or '>' if side='+'.
+        L2-norm of specified fields over Ω_side := Ω ∩ { φ ▷ 0 }, with ▷='<' if side='-', or '>=' if side='+'.
 
         * Fast pure-Python path:
         - full elements: standard reference quadrature + detJ
@@ -2866,6 +2866,49 @@ class DofHandler:
         e_m = self._h1_seminorm_on_side(w, level_set, side='-', quad_order=quad_order, fields=fields)
         e_p = self._h1_seminorm_on_side(w, level_set, side='+', quad_order=quad_order, fields=fields)
         return (e_m**2 + e_p**2)**0.5
+    
+    def h1_error_scalar_on_side(self, uh, exact_grad, level_set, side, field=None, relative=False, quad_increase=0):
+        """
+        H1-seminorm error on a side: ||∇u_h - ∇u_exact||_{L2(Ω_side)} for a scalar Function.
+        - uh:        Function
+        - exact_grad: callable (x, y) -> array_like(..., 2)  giving [du/dx, du/dy]
+        - level_set: LevelSet
+        - side:      '+' or '-'
+        - field:     override field name; defaults to uh.field_name
+        - relative:  if True, divides by ||∇u_exact||_{L2(Ω_side)}
+        """
+        fld = field or uh.field_name
+        err2, ref2 = self._h1_seminorm_on_side(
+            function=uh, field=fld, exact_grad=exact_grad,
+            level_set=level_set, side=side, quad_increase=quad_increase
+        )
+        return (err2**0.5) if not relative else ((err2 / max(ref2, 1e-30))**0.5)
+
+    def h1_error_vector_on_side(self, Uh, exact_grad_vec, level_set, side, fields=None, relative=False, quad_increase=0):
+        """
+        H1-seminorm error for a 2D vector field on a side:
+        ||∇Uh - ∇U_exact||_{L2(Ω_side)} where ∇Uh and ∇U_exact are 2×2.
+        - Uh: VectorFunction
+        - exact_grad_vec: callable (x,y)-> array_like(..., 2,2)
+                        rows = component, cols = derivative (du_i/dx, du_i/dy)
+        - fields: order must match Uh.field_names if provided.
+        """
+        flds = fields or Uh.field_names
+        err2_tot = 0.0
+        ref2_tot = 0.0
+        # compute per-component gradients and sum
+        for ic, fld in enumerate(flds):
+            def exact_grad_comp(x, y, ic=ic):
+                G = exact_grad_vec(x, y)         # (..., 2, 2)
+                # return [d u_ic / dx, d u_ic / dy]
+                return G[..., ic, :]             # (..., 2)
+            err2, ref2 = self._h1_seminorm_on_side(
+                function=Uh, field=fld, exact_grad=exact_grad_comp,
+                level_set=level_set, side=side, quad_increase=quad_increase
+            )
+            err2_tot += err2; ref2_tot += ref2
+        return (err2_tot**0.5) if not relative else ((err2_tot / max(ref2_tot, 1e-30))**0.5)
+
 
 
 
