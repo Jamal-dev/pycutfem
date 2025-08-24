@@ -26,6 +26,11 @@ from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.analytic import x as x_ana
 from pycutfem.ufl.analytic import y as y_ana
+from pycutfem.io.visualization import plot_mesh_2
+
+
+
+
 
 def exact_solution(mu, R, gammaf):
     # ---------------- 3) Exact fields & manufactured RHS via SymPy ----------------
@@ -144,7 +149,7 @@ def test_stokes_interface_corrected():
     This version is corrected to use the existing pycutfem API.
     """
     # ---------------- 1) Mesh, order, level set ----------------
-    poly_order = 2
+    poly_order = 3
     maxh = 0.125/2.0
     mesh_size = int(2.0 / maxh)
     L,H = 2.0, 2.0
@@ -172,7 +177,7 @@ def test_stokes_interface_corrected():
         'boundary': lambda x, y: np.isclose(x, -L/2.0) | np.isclose(x, L/2.0) |
                                   np.isclose(y, -H/2.0) | np.isclose(y, H/2.0)
     }
-    mesh.tag_boundary_edges(boundary_tags)
+    # mesh.tag_boundary_edges(boundary_tags)
 
     # BitSets
     inside_e  = mesh.element_bitset("inside")
@@ -192,6 +197,8 @@ def test_stokes_interface_corrected():
     me = MixedElement(mesh, field_specs={'u_pos_x': poly_order, 'u_pos_y': poly_order, 'p_pos_': poly_order-1,
                                          'u_neg_x': poly_order, 'u_neg_y': poly_order, 'p_neg_': poly_order-1})
     dh = DofHandler(me, method='cg')
+    dh.tag_dofs_by_locator_map(boundary_tags, 
+                               fields=['u_pos_x','u_pos_y','u_neg_x','u_neg_y']) 
 
     Vspace_pos    = FunctionSpace("vel_positive", ['u_pos_x', 'u_pos_y'])
     Vspace_neg    = FunctionSpace("vel_negative", ['u_neg_x', 'u_neg_y'])
@@ -248,33 +255,84 @@ def test_stokes_interface_corrected():
     a =  (2*mu[1]*inner(epsilon(vel_trial_pos), epsilon(vel_test_pos)) - div(vel_trial_pos)*q_test_pos - div(vel_test_pos)*p_trial_pos) * dx_pos
     a += (2*mu[0]*inner(epsilon(vel_trial_neg), epsilon(vel_test_neg)) - div(vel_trial_neg)*q_test_neg - div(vel_test_neg)*p_trial_neg) * dx_neg
 
-    sig_pos_n_trial = traction(mu[1], Pos(vel_trial_pos), Pos(p_trial_pos), n)
-    sig_neg_n_trial = traction(mu[0], Neg(vel_trial_neg), Neg(p_trial_neg), n)
-    avg_flux_trial  = kappa_pos * sig_pos_n_trial + kappa_neg * sig_neg_n_trial
+    # sig_pos_n_trial = traction(mu[1], Pos(vel_trial_pos), Pos(p_trial_pos), n)
+    # sig_neg_n_trial = traction(mu[0], Neg(vel_trial_neg), Neg(p_trial_neg), n)
+    # avg_flux_trial  = kappa_pos * sig_pos_n_trial + kappa_neg * sig_neg_n_trial
 
-    sig_pos_n_test = traction(mu[1], Pos(vel_test_pos), Pos(q_test_pos), n)
-    sig_neg_n_test = traction(mu[0], Neg(vel_test_neg), Neg(q_test_neg), n)
-    avg_flux_test  = kappa_pos * sig_pos_n_test + kappa_neg * sig_neg_n_test
+    # sig_pos_n_test = traction(mu[1], Pos(vel_test_pos), Pos(q_test_pos), n)
+    # sig_neg_n_test = traction(mu[0], Neg(vel_test_neg), Neg(q_test_neg), n)
+    # avg_flux_test  = kappa_pos * sig_pos_n_test + kappa_neg * sig_neg_n_test
+
+    # jump_vel_trial = Jump(vel_trial_pos, vel_trial_neg)
+    # jump_vel_test  = Jump(vel_test_pos,  vel_test_neg)
+    # jump_p_trial = Jump(p_trial_pos, p_trial_neg)
+    # jump_q_test  = Jump(q_test_pos,  q_test_neg)
+    # # Interface terms
+    # a += ( dot(avg_flux_trial, jump_vel_test)
+    #       + dot(avg_flux_test,  jump_vel_trial)
+    #       + (lambda_nitsche / h) * dot(jump_vel_trial, jump_vel_test) ) * dGamma
+
+    def two_sided(expr_pos, expr_neg):
+        # zero with correct “shape/role”, so algebra still type-checks:
+        zpos = 0.0 * expr_pos
+        zneg = 0.0 * expr_neg
+        return Jump(expr_pos, zneg) - Jump(zpos, expr_neg)
+    
+    sig_pos_n_trial = traction(mu[1], vel_trial_pos, p_trial_pos, n)
+    sig_neg_n_trial = traction(mu[0], vel_trial_neg, p_trial_neg, n)
+    avg_flux_trial  = two_sided(kappa_pos * sig_pos_n_trial,
+                                kappa_neg * sig_neg_n_trial)
+
+    sig_pos_n_test = traction(mu[1], vel_test_pos, q_test_pos, n)
+    sig_neg_n_test = traction(mu[0], vel_test_neg, q_test_neg, n)
+    avg_flux_test  = two_sided(kappa_pos * sig_pos_n_test,
+                            kappa_neg * sig_neg_n_test)
 
     jump_vel_trial = Jump(vel_trial_pos, vel_trial_neg)
     jump_vel_test  = Jump(vel_test_pos,  vel_test_neg)
-    jump_p_trial = Jump(p_trial_pos, p_trial_neg)
-    jump_q_test  = Jump(q_test_pos,  q_test_neg)
-    # Interface terms
+
     a += ( dot(avg_flux_trial, jump_vel_test)
-          + dot(avg_flux_test,  jump_vel_trial)
-          + (lambda_nitsche / h) * dot(jump_vel_trial, jump_vel_test) ) * dGamma
+        + dot(avg_flux_test,  jump_vel_trial)
+        + (lambda_nitsche / h) * dot(jump_vel_trial, jump_vel_test) ) * dGamma
 
+    # Surface-tension RHS: also two-sided!
+    avg_inv_test = two_sided(kappa_neg * vel_test_pos,   # note the 1−i weight as in NGSolve
+                            kappa_pos * vel_test_neg)
+    # f = dot(g_pos, vel_test_pos) * dx_pos \
+    #   + dot(g_neg, vel_test_neg) * dx_neg 
+    # f += - gammaf * dot(avg_inv_test, n) * dGamma
+
+    g_neg = Analytic(g_neg_xy)   # returns [...,2]
+    g_pos = Analytic(g_pos_xy)
+
+    # keep your RHS as:
+    f = dot(g_pos, vel_test_pos) * dx_pos + dot(g_neg, vel_test_neg) * dx_neg \
+        - gammaf * dot(avg_inv_test, n) * dGamma
+
+    
+    
     # Ghost penalty terms
-    a += (gamma_stab_v / h**2) * dot(jump_vel_trial, jump_vel_test) * dG_pos
-    a -= (gamma_stab_p ) * jump_p_trial * jump_q_test * dG_pos
-    a += (gamma_stab_v / h**2) * dot(jump_vel_trial, jump_vel_test) * dG_neg
-    a -= (gamma_stab_p ) * jump_p_trial * jump_q_test * dG_neg
+    # POS ghost patch
+    jp_pos_tr = Jump(vel_trial_pos, vel_trial_pos)
+    jp_pos_te = Jump(vel_test_pos,  vel_test_pos)
+    jp_p_pos_tr = Jump(p_trial_pos, p_trial_pos)
+    jp_p_pos_te = Jump(q_test_pos,   q_test_pos)
+    a += (gamma_stab_v / h**2) * dot(jp_pos_tr, jp_pos_te) * dG_pos
+    a += -(gamma_stab_p)        *       jp_p_pos_tr * jp_p_pos_te * dG_pos
 
-    avg_inv_test = kappa_neg * Pos(vel_test_pos) + kappa_pos * Neg(vel_test_neg)
-    f = dot(g_pos, vel_test_pos) * dx_pos \
-      + dot(g_neg, vel_test_neg) * dx_neg \
-      - gammaf * dot(avg_inv_test, n) * dGamma
+    # NEG ghost patch
+    jp_neg_tr = Jump(vel_trial_neg, vel_trial_neg)
+    jp_neg_te = Jump(vel_test_neg,  vel_test_neg)
+    jp_p_neg_tr = Jump(p_trial_neg, p_trial_neg)
+    jp_p_neg_te = Jump(q_test_neg,   q_test_neg)
+    a += (gamma_stab_v / h**2) * dot(jp_neg_tr, jp_neg_te) * dG_neg
+    a += -(gamma_stab_p)        *       jp_p_neg_tr * jp_p_neg_te * dG_neg
+
+
+    # avg_inv_test = kappa_neg * Pos(vel_test_pos) + kappa_pos * Neg(vel_test_neg)
+    # f = dot(g_pos, vel_test_pos) * dx_pos \
+    #   + dot(g_neg, vel_test_neg) * dx_neg \
+    #   - gammaf * dot(avg_inv_test, n) * dGamma
 
     equation = Equation(a, f)
 
@@ -288,39 +346,50 @@ def test_stokes_interface_corrected():
     bcs = [
         BoundaryCondition('u_pos_x', 'dirichlet', 'boundary', lambda x, y: vel_exact_pos_xy(x, y)[0]),
         BoundaryCondition('u_pos_y', 'dirichlet', 'boundary', lambda x, y: vel_exact_pos_xy(x, y)[1]),
-        BoundaryCondition('p_pos_', 'dirichlet', 'boundary', lambda x, y: p_exact_pos_xy(x, y)),
+        # BoundaryCondition('p_pos_', 'dirichlet', 'boundary', lambda x, y: p_exact_pos_xy(x, y)),
         BoundaryCondition('u_neg_x', 'dirichlet', 'boundary', lambda x, y: vel_exact_neg_xy(x, y)[0]),
         BoundaryCondition('u_neg_y', 'dirichlet', 'boundary', lambda x, y: vel_exact_neg_xy(x, y)[1]),
-        BoundaryCondition('p_neg_', 'dirichlet', 'boundary', lambda x, y: p_exact_neg_xy(x, y)),
-        BoundaryCondition('u_pos_x', 'dirichlet', 'inactive_inside_ux', lambda x, y: vel_exact_pos_xy(x, y)[0]),
-        BoundaryCondition('u_pos_y', 'dirichlet', 'inactive_inside_uy', lambda x, y: vel_exact_pos_xy(x, y)[1]),
-        BoundaryCondition('u_neg_x', 'dirichlet', 'inactive_outside_ux', lambda x, y: vel_exact_neg_xy(x, y)[0]),
-        BoundaryCondition('u_neg_y', 'dirichlet', 'inactive_outside_uy', lambda x, y: vel_exact_neg_xy(x, y)[1]),
-        BoundaryCondition('p_pos_', 'dirichlet', 'inactive_inside_p', lambda x, y: p_exact_pos_xy(x, y)),
-        BoundaryCondition('p_neg_', 'dirichlet', 'inactive_outside_p', lambda x, y: p_exact_neg_xy(x, y)),
+        # BoundaryCondition('p_neg_', 'dirichlet', 'boundary', lambda x, y: p_exact_neg_xy(x, y)),
+        BoundaryCondition('u_pos_x', 'dirichlet', 'inactive_inside_ux', lambda x, y: 0.0),
+        BoundaryCondition('u_pos_y', 'dirichlet', 'inactive_inside_uy', lambda x, y: 0.0),
+        BoundaryCondition('u_neg_x', 'dirichlet', 'inactive_outside_ux', lambda x, y: 0.0),
+        BoundaryCondition('u_neg_y', 'dirichlet', 'inactive_outside_uy', lambda x, y: 0.0),
+        BoundaryCondition('p_pos_', 'dirichlet', 'inactive_inside_p', lambda x, y: 0.0),
+        BoundaryCondition('p_neg_', 'dirichlet', 'inactive_outside_p', lambda x, y: 0.0),
     ]
 
 
     # ---------------- 6) Assemble & solve ----------------
     K, F = assemble_form(equation, dof_handler=dh, bcs=bcs, quad_order=qvol)
 
-    p0 = dh.get_field_slice('p_pos_')[0]
-    K = K.tolil(); F = F.copy()
-    K[p0, :] = 0.0; K[:, p0] = 0.0
-    K[p0, p0] = 1.0
-    F[p0] = 0.0
+    r_full = dh.assemble_pressure_mean_vector(level_set, quad_order=qvol)  # or your compiler route
+    r_full[dh.get_field_slice('p_pos_')] = 0.0
+    Kf, Ff, free, dir_idx, u_dir, f2r = dh.reduce_linear_system(K, F, bcs=bcs, return_dirichlet=True)
 
-    try:
-        sol = spla.spsolve(K.tocsc(), F)
-    except Exception:
-        sol = spla.lsqr(K.tocsc(), F)[0]
+    rf   = r_full[free]
+    rhs2 = - float(r_full[dir_idx] @ u_dir[dir_idx])   # = 0 if no pressure Dirichlet
 
+    from scipy.sparse import csc_matrix, bmat
+    rf_col = csc_matrix(rf.reshape(-1,1))
+    rf_row = csc_matrix(rf.reshape(1,-1))
+    K_aug  = bmat([[Kf.tocsc(), rf_col],
+                [rf_row,     None  ]], format='csc')
+    F_aug  = np.concatenate([Ff, [rhs2]])
+
+    u_aug  = spla.spsolve(K_aug, F_aug)
+    u_free = u_aug[:-1]
+
+    sol = np.zeros(dh.total_dofs)
+    sol[free] = u_free
+    sol[dir_idx] = u_dir[dir_idx]
     # ---------------- 7) Wrap solution & calculate errors ----------------
     U_pos = VectorFunction(name="velocity_pos", field_names=['u_pos_x','u_pos_y'], dof_handler=dh)
     P_pos = Function(name="pressure_pos", field_name='p_pos_', dof_handler=dh)
     U_neg = VectorFunction(name="velocity_neg", field_names=['u_neg_x','u_neg_y'], dof_handler=dh)
     P_neg = Function(name="pressure_neg", field_name='p_neg_', dof_handler=dh)
     dh.add_to_functions(sol, [U_pos, P_pos, U_neg, P_neg])
+
+
 
     exact_neg = {'u_neg_x': lambda x,y: vel_exact_neg_xy(x,y)[0], 'u_neg_y': lambda x,y: vel_exact_neg_xy(x,y)[1], 'p_neg_': p_exact_neg_xy}
     exact_pos = {'u_pos_x': lambda x,y: vel_exact_pos_xy(x,y)[0], 'u_pos_y': lambda x,y: vel_exact_pos_xy(x,y)[1], 'p_pos_': p_exact_pos_xy}
@@ -333,11 +402,21 @@ def test_stokes_interface_corrected():
     err_p_L2_pos = dh.l2_error_on_side(P_pos, exact_pos, level_set, side='+', fields=['p_pos_'], relative=False)
     p_L2 = np.sqrt(err_p_L2_neg**2 + err_p_L2_pos**2)
 
-    # vel_H1 = dh.h1_error_vector_piecewise(U_pos, exact_neg, exact_pos, level_set)
 
     print(f"L2 Error (velocity): {vel_L2:10.8e}")
     # print(f"H1 Error (velocity): {vel_H1:10.8e}")
     print(f"L2 Error (pressure): {p_L2:10.8e}")
+    # vel_H1 = dh.h1_error_vector_piecewise(U_pos, exact_neg, exact_pos, level_set)
+    # H1-seminorm of velocity on each side
+    vel_H1m_neg = dh.h1_error_vector_on_side(U_neg, grad_vel_neg_xy, level_set, side='-', fields=['u_neg_x', 'u_neg_y'])
+    vel_H1m_pos = dh.h1_error_vector_on_side(U_pos, grad_vel_pos_xy, level_set, side='+', fields=['u_pos_x', 'u_pos_y'])
+    vel_H1m = np.sqrt(vel_H1m_neg**2 + vel_H1m_pos**2)   # piecewise |·|_{H1}
+
+    # If you want the *full* H1 norm (seminorm + L2)
+    vel_H1 = np.sqrt(vel_L2**2 + vel_H1m**2)
+
+    print(f"H1-seminorm (velocity): {vel_H1m:10.8e}")
+    print(f"H1 norm      (velocity): {vel_H1:10.8e}")
 
     # ---------------- 8) Export ----------------
     outdir = "stokes_interface_results"

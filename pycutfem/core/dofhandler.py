@@ -112,6 +112,30 @@ def _scatter_union(loc_arr: np.ndarray, sl: slice, final_width: int) -> np.ndarr
         raise ValueError(f"_scatter_union expects rank-3/4 arrays, got {loc_arr.shape}")
 
 
+def _ls_fingerprint(level_set):
+    """
+    Stable identity for a level set. Avoids CPython id() reuse bugs.
+    Known types → tuple of parameters; else falls back to id().
+    """
+    if level_set is None:
+        return ("none",)
+    # Prefer an explicit token if the class provides one
+    tok = getattr(level_set, "cache_token", None)
+    if tok is not None:
+        return ("token", tok)
+
+    # Affine and Circle are common; capture parameters
+    # (works even if you use a subclass that sets these attrs)
+    if all(hasattr(level_set, a) for a in ("a", "b", "c")):
+        return ("affine", float(level_set.a), float(level_set.b), float(level_set.c))
+    if hasattr(level_set, "center") and hasattr(level_set, "radius"):
+        cx, cy = map(float, level_set.center)
+        return ("circle", cx, cy, float(level_set.radius))
+
+    # Last resort: object identity
+    return ("objid", int(id(level_set)))
+
+
 # -----------------------------------------------------------------------------
 #  Main class
 # -----------------------------------------------------------------------------
@@ -123,6 +147,7 @@ class DofHandler:
         if method not in {"cg", "dg"}:
             raise ValueError("method must be 'cg' or 'dg'")
         self.method: str = method
+        self._dg_mode: bool = (method == "dg")
         self.DEBUG: bool = DEBUG
         # This will store tags for specific DOFs, e.g., {'pressure_pin': {123}}
         self.dof_tags: Dict[str, Set[int]] = {}
@@ -199,56 +224,87 @@ class DofHandler:
             raise KeyError(f"Unsupported element_type '{elem_type}'")
 
     def _build_maps_cg_mixed(self) -> None:
-        """Continuous-Galerkin DOF numbering for MixedElement spaces."""
-        mesh = self.mixed_element.mesh
-        p_mesh = mesh.poly_order
-        node_dof_map: Dict[Tuple[str, int], int] = {}
-        offset = 0
+        """
+        CG numbering for MixedElement with geometry-independent DOFs
+        (Q3–Q2, etc.) while preserving legacy APIs:
+        • self.dof_map[field][node_id] -> global_dof  (when a field DOF coincides with a mesh node)
+        • self._dof_to_node_map[global_dof] -> (field, node_id|None)
+        • self.get_field_slice(field) returns *all* field DOFs (even those not tied to a node).
+        """
 
-        # 1. Allocate a global DOF for every *used* mesh node per field.
-        #    This loop iterates through elements, discovers all (field, node) pairs,
-        #    assigns a unique DOF to each pair when first encountered, and builds
-        #    the element-to-DOF map for each field.
-        for elem in mesh.elements_list:
-            # loc2phys = {loc: nid for loc, nid in enumerate(elem.nodes)}
-            
-            for fld in self.field_names:
-                p_f = self.mixed_element._field_orders[fld]
-                # Use the robust class method to get needed local node indices
-                needed_loc_idx = self._local_node_indices_for_field(p_mesh, p_f, mesh.element_type, fld)
-                
-                gids = []
-                for loc in needed_loc_idx:
-                    phys_nid = elem.nodes[loc]
-                    key = (fld, phys_nid)
-                    if key not in node_dof_map:
-                        node_dof_map[key] = offset
-                        offset += 1
-                    gids.append(node_dof_map[key])
-                
-                self.element_maps[fld].append(gids)
 
-        # 2. Finalize handler state based on the created map.
-        self.total_dofs = offset
-        
-        # Create a temporary reverse map for convenience in BCs/legacy methods
-        for (fld, nid), dof in node_dof_map.items():
-            if fld not in self.dof_map:
-                self.dof_map[fld] = {}
-            self.dof_map[fld][nid] = dof
+        mesh   = self.mixed_element.mesh
+        fields = self.field_names
 
-        # Calculate the number of DOFs and offsets for each field
-        for fld in self.field_names:
-            # For CG-mixed with interleaved numbering, the "offset" is not a
-            # contiguous block start, but we can define it as the first DOF index
-            # encountered for that field, which is useful for info purposes.
-            field_dof_indices = self.dof_map[fld].values()
-            if field_dof_indices:
-                self.field_offsets[fld] = min(field_dof_indices)
-                self.field_num_dofs[fld] = len(field_dof_indices)
-            else:
-                self.field_offsets[fld] = 0
-                self.field_num_dofs[fld] = 0
+        def _ref_lattice_quad(p: int):
+            vals = np.linspace(-1.0, 1.0, p + 1)
+            # (eta outer, xi inner) to match quad_qn basis ordering
+            return [(float(xi), float(eta)) for eta in vals for xi in vals]
+
+        def _q(x: float, ndp: int = 12) -> float:
+            return float(round(x, ndp))
+
+        # Per-field: hashed coord -> global dof
+        key2dof = {f: {} for f in fields}
+        # Per-field: element-local -> global dofs
+        self.element_maps = {f: [] for f in fields}
+        # Global coordinates (by global dof id)
+        dof_coords: list[list[float]] = []
+
+        next_gid = 0
+        for eid, _ in enumerate(mesh.elements_list):
+            for f in fields:
+                p_f = self.mixed_element._field_orders[f]
+                if mesh.element_type != "quad":
+                    raise NotImplementedError("Only quads implemented here; extend for tris if needed.")
+                lattice = _ref_lattice_quad(p_f)
+
+                local_gids: list[int] = []
+                for (xi, eta) in lattice:
+                    X = transform.x_mapping(mesh, eid, (xi, eta))     # uses mesh.poly_order
+                    k = (_q(X[0]), _q(X[1]))
+                    dmap = key2dof[f]
+                    if k not in dmap:
+                        dmap[k] = next_gid
+                        dof_coords.append([float(X[0]), float(X[1])])
+                        next_gid += 1
+                    local_gids.append(dmap[k])
+                self.element_maps[f].append(local_gids)
+
+        self.total_dofs = next_gid
+        self._dof_coords = np.asarray(dof_coords, dtype=float)
+
+        # ----------------------------
+        # Legacy maps: node_id <-> dof
+        # ----------------------------
+        self.dof_map = {f: {} for f in fields}            # node_id -> gdof
+        self._dof_to_node_map = {}                        # gdof -> (field, node_id|None)
+
+        nodes_xy = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+        for f in fields:
+            kd = key2dof[f]                                # (qx,qy) -> gdof
+            # fill node_id -> dof when coords match
+            for nid, (x, y) in enumerate(nodes_xy):
+                key = (_q(float(x)), _q(float(y)))
+                gd  = kd.get(key)
+                if gd is not None:
+                    self.dof_map[f][nid] = gd
+                    self._dof_to_node_map[gd] = (f, nid)
+
+        # For any gdof that didn’t coincide with a node, at least record (field, None)
+        field_gdof_sets = {f: set() for f in fields}
+        for f in fields:
+            for cell in self.element_maps[f]:
+                field_gdof_sets[f].update(cell)
+        for f in fields:
+            for g in field_gdof_sets[f]:
+                if g not in self._dof_to_node_map:
+                    self._dof_to_node_map[g] = (f, None)
+
+        # Cache full per-field DOF lists (independent of node ids)
+        self._field_slices = {f: np.array(sorted(field_gdof_sets[f]), dtype=int) for f in fields}
+
+
 
     def _build_maps_dg_mixed(self) -> None:
         """Discontinuous‑Galerkin numbering – element‑local uniqueness."""
@@ -348,12 +404,15 @@ class DofHandler:
         if self._dg_mode:
             raise NotImplementedError(f"{name} not available for DG spaces – every element owns its DOFs.")
 
-    def get_field_slice(self, field: str) -> List[int]:
-        """Get all global DOF indices for a given field, sorted ascending."""
+    def get_field_slice(self, field: str):
         self._require_cg("get_field_slice")
-        if field not in self.field_names:
-            raise ValueError(f"Unknown field '{field}'.")
-        return sorted(list(self.dof_map[field].values()))
+        if hasattr(self, "_field_slices") and field in self._field_slices:
+            return self._field_slices[field].tolist()
+        # fallback (older paths)
+        if field in self.dof_map:
+            return sorted(self.dof_map[field].values())
+        raise KeyError(f"Unknown field '{field}'")
+
 
     def get_field_dofs_on_nodes(self, field: str) -> np.ndarray:
         self._require_cg("get_field_dofs_on_nodes")
@@ -389,7 +448,14 @@ class DofHandler:
         matches = []
         for gdof in fld_dofs:
             nid   = g2n[gdof][1]
-            x, y  = mesh.nodes_x_y_pos[nid]
+            if hasattr(self, "_dof_coords"):
+                x, y = self._dof_coords[gdof]
+            else:
+                # fallback (legacy, only when mapped to mesh nodes)
+                node_id = self._dof_to_node_map.get(gdof, (field, None))[1]
+                if node_id is None:
+                    continue
+                x, y = mesh.nodes_x_y_pos[node_id]
             if locator(float(x), float(y)):
                 matches.append(gdof)
                 if find_first:
@@ -418,78 +484,134 @@ class DofHandler:
         self.dof_tags.setdefault(tag, set()).update(matches)
 
 
-    def get_dirichlet_data(self,
-                        bcs: Union[BcLike, Iterable[BcLike]],
-                        locators: Dict[str, Callable[[float, float], bool]] = None) -> Dict[int, float]:
-        """Calculates Dirichlet DOF values from a list of BoundaryCondition objects."""
+    def get_dirichlet_data(
+        self,
+        bcs: Union[BcLike, Iterable[BcLike]],
+        locators: Dict[str, Callable[[float, float], bool]] = None
+    ) -> Dict[int, float]:
+        """
+        Build {global_dof -> value} for Dirichlet BCs.
+
+        Robust for both node-anchored DOFs and geometry-independent DOFs:
+        - If self._dof_coords exists, DOF positions come from there.
+        - Otherwise we fall back to mesh.nodes_x_y_pos via _dof_to_node_map.
+        - Boundary selection is coordinate-driven (edge segments), so Q2/Q3 mixing is fine.
+        """
+        import numpy as np
+
         self._require_cg("Dirichlet BC evaluation")
         data: Dict[int, float] = {}
         bcs_list = bcs if isinstance(bcs, (list, tuple, set)) else [bcs]
         locators = locators or {}
+
+        def _coord_of_dof(gdof: int, fld: str) -> tuple[float, float]:
+            # Prefer geometry-independent coordinates if present
+            if hasattr(self, "_dof_coords"):
+                x, y = self._dof_coords[int(gdof)]
+                return float(x), float(y)
+            # Legacy: map back to the owning mesh node
+            field_name, node_id = self._dof_to_node_map.get(int(gdof), (fld, None))
+            if node_id is None:
+                raise KeyError(f"No coordinate source for DOF {gdof} in field '{fld}'.")
+            x, y = self.fe_map[field_name].nodes_x_y_pos[node_id]
+            return float(x), float(y)
+
+        def _edge_segments_with_tag(mesh, tag: str):
+            segs = []
+            for e in getattr(mesh, "edges_list", []):
+                if getattr(e, "tag", None) == tag:
+                    n0, n1 = list(e.nodes)
+                    p0 = mesh.nodes_x_y_pos[n0]
+                    p1 = mesh.nodes_x_y_pos[n1]
+                    segs.append((p0, p1))
+            return segs
+
+        def _on_segment(P, A, B, tol=None):
+            # Distance of point P to segment AB with scale-aware tolerance.
+            v = B - A
+            w = P - A
+            L = float(np.linalg.norm(v))
+            L2 = L * L
+            if L2 <= 1e-30:
+                return float(np.linalg.norm(w)) <= (1e-12)
+            t = max(0.0, min(1.0, float((w @ v) / L2)))
+            proj = A + t * v
+            # scale-aware tol: 1e-9 of edge length + tiny absolute term
+            tol_eff = (1e-9 * L) + 1e-14 if tol is None else tol
+            return float(np.linalg.norm(P - proj)) <= tol_eff
+
 
         for bc in bcs_list:
             if not isinstance(bc, BoundaryCondition):
                 continue
 
             field = getattr(bc, "field", None)
-            if field is None: raise ValueError("BoundaryCondition must have a 'field' attribute.")
-            # For MixedElement, all fields share the same mesh, so this is fine.
+            if field is None:
+                raise ValueError("BoundaryCondition must have a 'field' attribute.")
             mesh = self.fe_map.get(field)
-            if mesh is None: continue
-
-            domain_tag = getattr(bc, "domain_tag", None) or getattr(bc, "tag", None)
-            if domain_tag is None: continue
-
-            # --- START FIX ---
-            # The logic to find nodes must be self-contained within the loop for each BC.
-            
-            nodes_on_domain: Set[int] = set()
-
-            # Path 1: pre-tagged DOFs (field-scoped by construction)
-            if domain_tag in self.dof_tags:
-                val_is_callable = callable(bc.value)
-                for dof in self.dof_tags[domain_tag]:
-                    # Optional: still try to evaluate at the node if available
-                    node_id = self._dof_to_node_map.get(dof, (field, None))[1]
-                    if node_id is not None and val_is_callable:
-                        x, y = mesh.nodes_x_y_pos[node_id]
-                        data[dof] = bc.value(x, y)
-                    else:
-                        data[dof] = float(bc.value)  # constants (your case) are fine
+            if mesh is None:
                 continue
 
-            # Path 2: The domain is found by a locator function
-            if domain_tag in locators:
-                locator_func = locators[domain_tag]
-                for node in mesh.nodes_list:
-                    if locator_func(node.x, node.y):
-                        nodes_on_domain.add(node.id)
-            # Path 3: The domain is found by tags on geometric entities (edges/nodes)
-            else:
-                found_on_edges = False
-                for edge in mesh.edges_list:
-                    if getattr(edge, 'tag', None) == domain_tag:
-                        nodes_to_add = getattr(edge, 'all_nodes', None)
-                        if nodes_to_add is None: raise ValueError(f"Edge {edge.id} does not have 'all_nodes' attribute.")
-                        nodes_on_domain.update(nodes_to_add)
-                        found_on_edges = True
-                if not found_on_edges:
-                    for node in mesh.nodes_list:
-                        if getattr(node, 'tag', None) == domain_tag:
-                            nodes_on_domain.add(node.id)
+            # Accept any common attribute name for the tagged domain
+            domain_tag = getattr(bc, "domain", None) \
+                    or getattr(bc, "domain_tag", None) \
+                    or getattr(bc, "tag", None)
+            if domain_tag is None:
+                continue
 
-            # Now, apply the value for the CURRENT boundary condition `bc`
-            # to the nodes found for its specific domain.
-            val_is_callable = callable(bc.value)
-            for nid in nodes_on_domain:
-                dof = self.dof_map.get(field, {}).get(nid)
-                if dof is not None:
-                    x, y = mesh.nodes_x_y_pos[nid]
-                    value = bc.value(x, y) if val_is_callable else bc.value
-                    data[dof] = value
-            # --- END FIX ---
-            
+            selected: set[int] = set()
+
+            # (0) Pre-tagged DOFs → restrict to *this field* only
+            if domain_tag in self.dof_tags:
+                tagged = set(self.dof_tags[domain_tag])
+                field_dofs = set(self.get_field_slice(field))
+                selected |= (tagged & field_dofs)
+
+            # (1) Locator override (if provided by caller)
+            locator = locators.get(domain_tag)
+            if locator is not None:
+                for gd in self.get_field_slice(field):
+                    x, y = _coord_of_dof(gd, field)
+                    try:
+                        if locator(x, y):
+                            selected.add(int(gd))
+                    except Exception:
+                        pass  # be forgiving with user-supplied callables
+
+            # (2) Edge-tag route: pick all DOFs whose coords lie on any tagged edge
+            segs = _edge_segments_with_tag(mesh, domain_tag)
+            if segs:
+                ABl = [(np.asarray(a, float), np.asarray(b, float)) for (a, b) in segs]
+                for gd in self.get_field_slice(field):
+                    P = np.asarray(_coord_of_dof(gd, field), float)
+                    if any(_on_segment(P, A, B) for (A, B) in ABl):
+                        selected.add(int(gd))
+
+            # (3) Legacy node-tag fallback (rare)
+            if not selected:
+                node_to_dof = self.dof_map.get(field, {})
+                for node in getattr(mesh, "nodes_list", []):
+                    if getattr(node, "tag", None) == domain_tag:
+                        d = node_to_dof.get(node.id)
+                        if isinstance(d, dict):  # tolerate historical nested maps
+                            d = next(iter(d.values()))
+                        if d is not None:
+                            selected.add(int(d))
+
+            # Assign values for this BC
+            is_fun = callable(bc.value)
+            if is_fun:
+                for gd in selected:
+                    x, y = _coord_of_dof(gd, field)
+                    data[gd] = float(bc.value(x, y))
+            else:
+                val = float(bc.value)
+                for gd in selected:
+                    data[gd] = val
+
         return data
+
+
 
     def add_to_functions(self, delta: np.ndarray, functions: List[Any]):
         """
@@ -598,14 +720,10 @@ class DofHandler:
         return out
     
     def get_dof_coords(self, field: str) -> np.ndarray:
-        """Coordinates of the field’s DOFs in the *same* order as get_field_slice."""
+        """Coordinates of a field’s DOFs (in the order of get_field_slice(field))."""
         self._require_cg("get_dof_coords")
-        if field not in self.field_names:
-            raise ValueError(f"Unknown field '{field}'.")
-        gdofs  = self.get_field_slice(field)           # canonical order
-        mesh   = self.fe_map[field]
-        coords = [ mesh.nodes_x_y_pos[self._dof_to_node_map[d][1]] for d in gdofs ]
-        return np.asarray(coords, dtype=float)
+        gdofs = self.get_field_slice(field)
+        return self._dof_coords[np.asarray(gdofs, dtype=int)]
 
 
     
@@ -672,30 +790,12 @@ class DofHandler:
     # NEW: Precompute Geometric Factors for JIT Kernels
     # ==================================================================
     def get_all_dof_coords(self) -> np.ndarray:
-        """
-        Builds and returns a coordinate array for every DOF in the system.
-
-        The returned array has shape (total_dofs, 2), where the first index
-        corresponds directly to the global DOF index. This is the correct
-        coordinate array to pass to JIT kernels.
-
-        Returns:
-            np.ndarray: The (total_dofs, 2) array of DOF coordinates.
-        """
-        if self._dg_mode:
-            raise NotImplementedError("get_all_dof_coords is not yet implemented for DG methods.")
-
-        # Initialize an array to hold coordinates for every single DOF.
-        all_coords = np.zeros((self.total_dofs, 2))
-
-        # Use the internal map that links a global DOF to its original node.
-        for dof_idx, (field, node_idx) in self._dof_to_node_map.items():
-            # Get the coordinates of the original node.
-            coords = self.fe_map[field].nodes_x_y_pos[node_idx]
-            # Place these coordinates at the correct index in our new array.
-            all_coords[dof_idx] = coords
-
-        return all_coords
+        """Coordinates for every global DOF (total_dofs, 2)."""
+        if getattr(self, "_dg_mode", False):
+            raise NotImplementedError("get_all_dof_coords not yet implemented for DG.")
+        if not hasattr(self, "_dof_coords"):
+            raise RuntimeError("Geometry-independent coords not initialized.")
+        return self._dof_coords.copy()
     
     def precompute_geometric_factors(
         self,
@@ -2224,7 +2324,7 @@ class DofHandler:
             subset_hash = _hash_subset(eids_all)
         except NameError:
             subset_hash = tuple(eids_all)
-        ls_token = getattr(level_set, "cache_token", None) or id(level_set)
+        ls_token = _ls_fingerprint(level_set)
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
         cache_key = (
             "cutvol", id(mesh), me.signature(), subset_hash,
@@ -2543,60 +2643,64 @@ class DofHandler:
 
     # --- tag DOFs from element selection ----------------------------------------
     def tag_dofs_from_element_bitset(
-        self,
-        tag: str,
-        field: str,
-        elem_sel,                 # ← BitSet | str | bool mask | Iterable[int]
-        *,
-        strict: bool = True,
-    ) -> set[int]:
+            self,
+            tag: str,
+            field: str,
+            elem_sel,                 # BitSet | str | bool mask | Iterable[int]
+            *,
+            strict: bool = True,
+        ) -> set[int]:
+        """
+        Tag DOFs that lie in (or strictly belong to) a set of elements.
+
+        • DG: unchanged — tags all DOFs from the selected elements.
+        • CG (geometry-independent): build a DOF↔elements adjacency and:
+            - strict=True  → tag DOFs whose *entire* support (all adjacent elements)
+                            is contained in the selected set.
+            - strict=False → tag DOFs that touch the selected set (any adjacency).
+        """
         if field not in self.field_names:
             raise ValueError(f"Unknown field '{field}', choose from {self.field_names}")
 
         mesh = self.fe_map[field]
-
-        # --- clean resolution of element ids
         inside_eids = _resolve_elem_selection(elem_sel, mesh)
+        inside_set = set(inside_eids)
 
-        # --- DG: tag all DOFs from those elements directly
+        # --- DG path: keep as-is
         if getattr(self, "_dg_mode", False):
             elem_maps = self.element_maps[field]
-            nE = len(elem_maps)
             dofs = set()
             for eid in inside_eids:
-                if 0 <= eid < nE:
+                if 0 <= eid < len(elem_maps):
                     dofs.update(elem_maps[eid])
             self.dof_tags.setdefault(tag, set()).update(dofs)
             return dofs
 
-        # --- CG: candidate nodes = union of nodes from the selected elements
-        candidate_nodes: set[int] = set()
-        for eid in inside_eids:
-            el = mesh.elements_list[eid]
-            candidate_nodes.update(el.nodes)
+        # --- CG path: geometry-independent (DOF adjacency), not node-based
+        # Build (and cache) dof -> set(adjacent element ids)
+        cache_name = "_dof_adj_elems"
+        if not hasattr(self, cache_name):
+            setattr(self, cache_name, {})
+        dof_adj_cache = getattr(self, cache_name)
+
+        dof_to_elems = dof_adj_cache.get(field)
+        if dof_to_elems is None:
+            dof_to_elems = {}
+            for eid, gds in enumerate(self.element_maps[field]):
+                for g in gds:
+                    dof_to_elems.setdefault(int(g), set()).add(int(eid))
+            dof_adj_cache[field] = dof_to_elems
 
         if strict:
-            # Build node → {adjacent eids} once, then keep only nodes whose
-            # adjacent elements are all in 'inside_eids'
-            node_to_elems: dict[int, set[int]] = {}
-            for el in mesh.elements_list:
-                for nid in el.nodes:
-                    node_to_elems.setdefault(nid, set()).add(el.id)
-
-            inside_eids_set = set(inside_eids)
-            nodes = {
-                nid for nid in candidate_nodes
-                if node_to_elems.get(nid, set()).issubset(inside_eids_set)
-            }
+            # Only DOFs whose *all* adjacent elements lie in inside_set
+            selected = {gd for gd, adj in dof_to_elems.items() if adj.issubset(inside_set)}
         else:
-            nodes = candidate_nodes
+            # Any DOF that has at least one adjacent element in inside_set
+            selected = {gd for gd, adj in dof_to_elems.items() if adj & inside_set}
 
-        # Map nodes → DOFs for this field
-        node_to_dof = self.dof_map[field]
-        dofs = {node_to_dof[nid] for nid in nodes if nid in node_to_dof}
+        self.dof_tags.setdefault(tag, set()).update(selected)
+        return selected
 
-        self.dof_tags.setdefault(tag, set()).update(dofs)
-        return dofs
 
 
     def l2_error_on_side(
@@ -2722,90 +2826,159 @@ class DofHandler:
 
         return (err2 / base2) ** 0.5 if (relative and base2 > 1e-28) else err2 ** 0.5
     
+    def l2_error_piecewise(self, functions, exact_neg, exact_pos, level_set, fields=None, quad_order=None, relative=False):
+        e_m = self.l2_error_on_side(functions, exact_neg, level_set, side='-', fields=fields, quad_order=quad_order, relative=relative)
+        e_p = self.l2_error_on_side(functions, exact_pos, level_set, side='+', fields=fields, quad_order=quad_order, relative=relative)
+        return (e_m**2 + e_p**2)**0.5
+
+    
     # --------------------------------------------------------------------------
     # H1 seminorm (energy) of a VectorFunction on a *side* (φ<0 or φ>0)
     # --------------------------------------------------------------------------
     def _h1_seminorm_on_side(self,
-                            vector_function,                 # VectorFunction (e.g., ('ux','uy'))
-                            level_set,                       # φ(x,y) callable
-                            side: str = '-',                 # '-' for inside (φ<0), '+' for outside (φ>0)
+                            vector_function=None,                 # VectorFunction for seminorm mode
+                            level_set=None,                       # φ(x,y)
+                            side: str = '-',                      # '-' or '+'
                             quad_order: int | None = None,
-                            fields: list[str] | None = None) -> float:
+                            fields: list[str] | None = None,
+                            *,
+                            function=None,                        # Scalar Function or VectorFunction (error mode)
+                            field: str | None = None,
+                            exact_grad=None,                      # callable (x,y)-> [du/dx, du/dy]
+                            quad_increase: int = 0):
         """
-        Returns ||∇(vector_function)||_{L2(Ω_side)} for the specified components.
-        This integrates ∑_k ∫_{Ω_side} ∇w_k : ∇w_k dx, where w_k are scalar components.
+        Dual-mode helper:
+        (A) Seminorm mode (when `function is None` and `exact_grad is None`):
+            Returns ||∇(vector_function)||_{L2(Ω_side)}.
 
-        No finite differences. Uses FE gradients (basis grads @ J^{-1}) and your cut triangulation.
+        (B) Error mode (when `function` AND `field` AND `exact_grad` are given):
+            Returns (err2, ref2) with
+                err2 = ||∇u_h - ∇u_exact||_{L2(Ω_side)}^2,
+                ref2 = ||∇u_exact||_{L2(Ω_side)}^2.
         """
         import numpy as np
-        from pycutfem.fem import transform
         from pycutfem.integration.quadrature import volume as vol_rule
         from pycutfem.ufl.helpers_geom import (
             corner_tris, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, phi_eval
         )
-        from pycutfem.ufl.expressions import VectorFunction as _VF
-
-        if not isinstance(vector_function, _VF):
-            raise TypeError("_h1_seminorm_on_side expects a VectorFunction.")
+        from pycutfem.ufl.expressions import VectorFunction as _VF, Function as _SF
 
         mesh = self.mixed_element.mesh
         me   = self.mixed_element
-        qdeg = quad_order or (2*mesh.poly_order + 2)
+        qdeg = (quad_order or (2 * mesh.poly_order + 2)) + int(quad_increase)
 
-        if fields is None:
-            fields = list(vector_function.field_names)
-
-        # classify elements once (also sets tags)
+        # classify once
         inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
         full_eids = outside_ids if side == '+' else inside_ids
 
-        acc = 0.0
+        # local gradient (physical) at (xi,eta) for a scalar field `fld`
+        def _grad_at(eid, xi, eta, fld, values):
+            # reference gradients of *this field* only
+            G_ref_full = me.grad_basis(fld, xi, eta)                    # (n_loc_total, 2)
+            loc = me.component_dof_slices[fld]                          # slice for this field
+            G_ref = G_ref_full[loc, :]                                  # (n_f, 2)
+            # physical mapping: ∇_x φ = J^{-T} ∇̂φ  (row-by-row)
+            J = transform.jacobian(mesh, eid, (xi, eta))               # (2,2)
+            Jinv = np.linalg.inv(J)           # (2,2) = J
+            G_phy = G_ref @ Jinv                                       # (n_f, 2)
+            return values @ G_phy                                       # (2,)
+
+        # -------- seminorm mode --------
+        if function is None and exact_grad is None:
+            if vector_function is None:
+                raise ValueError("seminorm mode requires 'vector_function'.")
+            if fields is None:
+                fields = list(vector_function.field_names)
+
+            acc = 0.0
+            # (A) full elements
+            qp_ref, qw_ref = vol_rule(mesh.element_type, qdeg)
+            for eid in full_eids:
+                gd_f = {fld: self.element_maps[fld][eid] for fld in fields}
+                for (xi, eta), w_ref in zip(qp_ref, qw_ref):
+                    J = transform.jacobian(mesh, eid, (xi, eta))
+                    w = float(w_ref * abs(np.linalg.det(J)))
+                    for fld in fields:
+                        vals = vector_function.get_nodal_values(gd_f[fld])
+                        gu = _grad_at(eid, xi, eta, fld, vals)
+                        acc += w * (gu[0]**2 + gu[1]**2)
+
+            # (B) cut elements
+            if len(cut_ids):
+                # one-point ref rule on unit triangle; mapped by fan-triangulation
+                qp_tri = np.array([[1.0/3.0, 1.0/3.0]])
+                qw_tri = np.array([0.5])
+                for eid in cut_ids:
+                    elem = mesh.elements_list[eid]
+                    tri_list, cn = corner_tris(mesh, elem)              # ([(i,j,k)], corner node ids)
+                    gd_f = {fld: self.element_maps[fld][eid] for fld in fields}
+                    for (i, j, k) in tri_list:
+                        tri_xy = mesh.nodes_x_y_pos[[cn[i], cn[j], cn[k]]]   # (3,2)
+                        v_phi  = [phi_eval(level_set, tri_xy[r]) for r in range(3)]
+                        for poly in clip_triangle_to_side(tri_xy, v_phi, side=side):
+                            for A, B, C in fan_triangulate(poly):
+                                x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)
+                                for (x, y), w in zip(x_phys, w_phys):
+                                    xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+                                    for fld in fields:
+                                        vals = vector_function.get_nodal_values(gd_f[fld])
+                                        gu = _grad_at(eid, xi, eta, fld, vals)
+                                        acc += w * (gu[0]**2 + gu[1]**2)
+            return float(acc) ** 0.5
+
+        # -------- error mode --------
+        if function is None or field is None or exact_grad is None:
+            raise ValueError("error mode requires 'function', 'field', and 'exact_grad'.")
+
+        # Both Function and VectorFunction expose .get_nodal_values(gd)
+        if not isinstance(function, (_VF, _SF)):
+            raise TypeError("Unsupported 'function' type for H1 error.")
+        get_vals = function.get_nodal_values
+
+        err2 = 0.0
+        ref2 = 0.0
 
         # (A) full elements
         qp_ref, qw_ref = vol_rule(mesh.element_type, qdeg)
         for eid in full_eids:
-            # pick per-field dofs once
-            gdofs_f = {fld: self.element_maps[fld][eid] for fld in fields}
+            gd = self.element_maps[field][eid]
             for (xi, eta), w_ref in zip(qp_ref, qw_ref):
-                # mapping & inverse
-                J  = transform.jacobian(mesh, eid, (xi, eta))
-                Ji = np.linalg.inv(J)
-                detJ = abs(np.linalg.det(J))
+                J = transform.jacobian(mesh, eid, (xi, eta))
+                w = float(w_ref * abs(np.linalg.det(J)))
+                vals = get_vals(gd)
+                gu = _grad_at(eid, xi, eta, field, vals)
+                x, y = transform.x_mapping(mesh, eid, (xi, eta))
+                ge = np.asarray(exact_grad(x, y), dtype=float)
+                de = gu - ge
+                err2 += w * float(de @ de)
+                ref2 += w * float(ge @ ge)
 
-                # accumulate ∑ |grad(component)|^2
-                for fld in fields:
-                    gref = me.grad_basis(fld, xi, eta)[me.slice(fld), :]     # (nloc_f, 2)
-                    gphy = gref @ Ji                                         # (nloc_f, 2)
-                    wh_g = vector_function.get_nodal_values(gdofs_f[fld]) @ gphy  # (2,)
-                    acc += w_ref * detJ * (wh_g[0]**2 + wh_g[1]**2)
+        # (B) cut elements
+        if len(cut_ids):
+            qp_tri = np.array([[1.0/3.0, 1.0/3.0]])
+            qw_tri = np.array([0.5])
+            for eid in cut_ids:
+                elem = mesh.elements_list[eid]
+                tri_list, cn = corner_tris(mesh, elem)
+                gd = self.element_maps[field][eid]
+                for (i, j, k) in tri_list:
+                    tri_xy = mesh.nodes_x_y_pos[[cn[i], cn[j], cn[k]]]   # (3,2)
+                    v_phi  = [phi_eval(level_set, tri_xy[r]) for r in range(3)]
+                    for poly in clip_triangle_to_side(tri_xy, v_phi, side=side):
+                        for A, B, C in fan_triangulate(poly):
+                            x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)
+                            for (x, y), w in zip(x_phys, w_phys):
+                                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+                                vals = get_vals(gd)
+                                gu = _grad_at(eid, xi, eta, field, vals)
+                                ge = np.asarray(exact_grad(x, y), dtype=float)
+                                de = gu - ge
+                                err2 += w * float(de @ de)
+                                ref2 += w * float(ge @ ge)
 
-        # (B) cut elements: triangulate subdomain Ω_side and integrate w.r.t. physical weights
-        qp_tri, qw_tri = vol_rule("tri", qdeg)
-        for eid in cut_ids:
-            elem = mesh.elements_list[eid]
-            tri_local, corner_ids = corner_tris(mesh, elem)
-            gd_f = {fld: self.element_maps[fld][eid] for fld in fields}
+        return float(err2), float(ref2)
 
-            for loc_tri in tri_local:
-                v_ids = [corner_ids[i] for i in loc_tri]
-                V     = mesh.nodes_x_y_pos[v_ids]
-                v_phi = np.array([phi_eval(level_set, xy) for xy in V], dtype=float)
-                polys = clip_triangle_to_side(V, v_phi, side=side)
-                if not polys: 
-                    continue
-                for poly in polys:
-                    for A, B, C in fan_triangulate(poly):
-                        x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)
-                        for (x, y), w in zip(x_phys, w_phys):
-                            xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
-                            J  = transform.jacobian(mesh, eid, (xi, eta))
-                            Ji = np.linalg.inv(J)
-                            for fld in fields:
-                                gref = me.grad_basis(fld, xi, eta)[me.slice(fld), :]
-                                gphy = gref @ Ji
-                                wh_g = vector_function.get_nodal_values(gd_f[fld]) @ gphy
-                                acc += w * (wh_g[0]**2 + wh_g[1]**2)  # w is physical already
-        return float(acc)**0.5
+
 
 
     # --------------------------------------------------------------------------
@@ -2908,6 +3081,141 @@ class DofHandler:
             )
             err2_tot += err2; ref2_tot += ref2
         return (err2_tot**0.5) if not relative else ((err2_tot / max(ref2_tot, 1e-30))**0.5)
+    def reduce_linear_system(self, A_full, R_full, *, bcs=None, return_dirichlet=False):
+        """
+        Reduce (K, F) to the free-DOF block with proper lifting:
+            [K_ff K_fd][u_f] = [F_f]  ->  K_ff u_f = (F_f - K_fd u_D)
+            [K_df K_dd][u_D]   [F_D]
+
+        Args
+        ----
+        A_full : (n x n) sparse matrix (scipy)
+        R_full : (n,) dense rhs
+        bcs    : Dirichlet BC list you pass to assemble_form (or None)
+        return_dirichlet : if True, also returns (dir_idx, u_dirichlet)
+
+        Returns
+        -------
+        K_ff : sparse
+        F_f  : ndarray  (lifted RHS = F_f - K_fd u_D)
+        free : (nf,) free dof ids
+        full_to_red : (n,) map full index -> reduced index, -1 for Dirichlet
+        [dir_idx, u_dir] : (optional) Dirichlet ids and values (length ndof array)
+        """
+        import numpy as np
+        from scipy.sparse import csr_matrix
+
+        if A_full.shape[0] != A_full.shape[1]:
+            raise ValueError("A_full must be square.")
+        if R_full.shape[0] != A_full.shape[0]:
+            raise ValueError("R_full length must match K size.")
+
+        ndof = self.total_dofs
+        A = A_full.tocsr()
+        F = np.asarray(R_full, dtype=float)
+
+        # 1) Collect Dirichlet data and build u_D
+        bc_map = self.get_dirichlet_data(bcs or [])
+        dir_idx = np.array(sorted(bc_map.keys()), dtype=int)
+        u_dir = np.zeros(ndof, dtype=float)
+        if dir_idx.size:
+            u_dir[dir_idx] = np.array([bc_map[i] for i in dir_idx], dtype=float)
+
+        # 2) Free set
+        all_idx = np.arange(ndof, dtype=int)
+        free = np.setdiff1d(all_idx, dir_idx, assume_unique=True)
+
+        # 3) Build reduced matrices and apply lifting on RHS
+        K_ff = A[np.ix_(free, free)].copy()
+        F_f  = F[free].copy()
+        if dir_idx.size:
+            K_fd = A[np.ix_(free, dir_idx)]
+            F_f -= K_fd @ u_dir[dir_idx]      # <--- lifting
+
+        # 4) Map full -> reduced
+        full_to_red = -np.ones(ndof, dtype=int)
+        full_to_red[free] = np.arange(free.size, dtype=int)
+
+        if return_dirichlet:
+            return K_ff, F_f, free, dir_idx, u_dir, full_to_red
+        return K_ff, F_f, free, full_to_red
+    
+    def tag_dofs_by_locator_map(
+        self,
+        tag_map: dict[str, "Callable[[float,float], bool]"],
+        fields: list[str] | None = None,
+    ) -> dict[str, set[int]]:
+        """
+        Tag DOFs using coordinate predicates (geometry-independent).
+        Example:
+            dh.tag_dofs_by_locator_map({
+                "boundary": lambda x,y: np.isclose(x, -L/2) | np.isclose(x, L/2)
+                                    | np.isclose(y, -H/2) | np.isclose(y, H/2)
+            }, fields=["u_pos_x","u_pos_y","u_neg_x","u_neg_y","p_pos_","p_neg_"])
+        """
+
+        if fields is None:
+            fields = list(self.field_names)
+
+        # coords[gdof] -> (x,y) for every global DOF (works with geometry-independent numbering)
+        coords = self.get_all_dof_coords()
+        out: dict[str, set[int]] = {}
+        for tag, locator in tag_map.items():
+            sel: set[int] = set()
+            for f in fields:
+                for gd in self.get_field_slice(f):
+                    x, y = coords[int(gd)]
+                    try:
+                        if locator(float(x), float(y)):
+                            sel.add(int(gd))
+                    except Exception:
+                        # be forgiving with user predicates
+                        pass
+            self.dof_tags.setdefault(tag, set()).update(sel)
+            out[tag] = sel
+        return out
+
+    
+    def assemble_pressure_mean_vector(self, level_set, quad_order=None,
+                                  p_pos_field='p_pos_', p_neg_field='p_neg_'):
+        """
+        Build r in R^{ndof} with:
+        r_j = ∫_{Ω+} φ_j dx  for p_pos_ dofs,
+        r_j = ∫_{Ω-} φ_j dx  for p_neg_ dofs,
+        r_j = 0 otherwise.
+
+        Uses the normal assembler (TestFunction on dx-side-restricted domains),
+        so it’s robust on cut cells and mixed orders.
+        """
+        from pycutfem.ufl.expressions import TestFunction, Constant
+        from pycutfem.ufl.measures import dx
+        from pycutfem.ufl.forms import Equation, assemble_form
+
+        mesh = self.mixed_element.mesh
+        # Ensure element tags are current
+        mesh.classify_elements(level_set)
+
+        has_inside  = mesh.element_bitset("inside")  | mesh.element_bitset("cut")
+        has_outside = mesh.element_bitset("outside") | mesh.element_bitset("cut")
+        qdeg = quad_order or (2 * mesh.poly_order + 2)
+
+        # Measures for each side (your compiler already uses these for cut volume)
+        dx_pos = dx(defined_on=has_outside, level_set=level_set, metadata={'side': '+', 'q': qdeg})
+        dx_neg = dx(defined_on=has_inside,  level_set=level_set, metadata={'side': '-', 'q': qdeg})
+
+        L = None
+        if p_pos_field in self.field_names:
+            q_pos = TestFunction(p_pos_field, self)
+            L = (Constant(1.0) * q_pos) * dx_pos
+        if p_neg_field in self.field_names:
+            q_neg = TestFunction(p_neg_field, self)
+            if L is not None: L += (Constant(1.0) * q_neg) * dx_neg
+            else: L = (Constant(1.0) * q_neg) * dx_neg
+
+        # No Dirichlet here – this is a pure geometric vector
+        K, r = assemble_form(Equation(a=None, L=L), dof_handler=self, bcs=None, quad_order=qdeg)
+        return r
+
 
 
 

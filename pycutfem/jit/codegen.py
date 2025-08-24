@@ -515,13 +515,17 @@ class NumbaCodeGen:
                 )
             # --- analytic (pre-tabulated) ---------------------------------------------
             elif isinstance(op, LoadAnalytic):
-                param = f"ana_{op.func_id}"                # unique name in PARAM_ORDER
+                param = f"ana_{op.func_id}"                  # unique name in PARAM_ORDER
                 required_args.add(param)
                 var_name = new_var("ana")
                 body_lines.append(f"{var_name} = {param}[e, q]")
+                tshape = tuple(getattr(op, "tensor_shape", ()))
+                is_vec = (len(tshape) == 1)
+                role = 'const' if not is_vec else 'value'
                 stack.append(StackItem(var_name=var_name,
-                                    role='const',
-                                    shape=(), is_vector=False))
+                                    role=role,
+                                    shape=tshape if tshape else (),
+                                    is_vector=is_vec))
             # --- LOAD OPERATIONS ---
             # ---------------------------------------------------------------------------
             # LOADVARIABLE –– basis tables and coefficient look-ups
@@ -1464,13 +1468,24 @@ class NumbaCodeGen:
             elif isinstance(op, PosOp):
                 a = stack.pop()
                 res_var = new_var("pos")
-                body_lines.append(f"{res_var} = {a.var_name} if phi_q >= 0.0 else np.zeros_like({a.var_name}, dtype={self.dtype})")
+                # On the interface, keep both sides; otherwise gate by phi_q
+                required_args.add("is_interface")
+                body_lines.append(
+                    f"# Pos Op"
+                    f"{res_var} = {a.var_name} if (is_interface or (phi_q >= 0.0)) "
+                    f"else np.zeros_like({a.var_name}, dtype={self.dtype})"
+                )
                 stack.append(a._replace(var_name=res_var))
 
             elif isinstance(op, NegOp):
                 a = stack.pop()
                 res_var = new_var("neg")
-                body_lines.append(f"{res_var} = {a.var_name} if phi_q < 0.0 else np.zeros_like({a.var_name}, dtype={self.dtype})")
+                required_args.add("is_interface")
+                body_lines.append(
+                    f"# Neg Op"
+                    f"{res_var} = {a.var_name} if (is_interface or (phi_q <  0.0)) "
+                    f"else np.zeros_like({a.var_name}, dtype={self.dtype})"
+                )
                 stack.append(a._replace(var_name=res_var))
 
             # --- Inner OPERATORS ---
@@ -2340,10 +2355,10 @@ class NumbaCodeGen:
 
                 # -------- vector grad: (2,n_qp,2)  swap off-diagonals ------------
                 elif a.is_gradient and len(a.shape) == 3:
-                    n_locs = a.shape[1]
                     body_lines += [
                         f"{res} = np.zeros_like({a.var_name}, dtype={self.dtype});",
-                        f"for n in range({n_locs}):",
+                        f"n_locs = {a.var_name}.shape[1]",
+                        f"for n in range(n_locs):",
                         f"    {res}[:, n, :] = ({a.var_name}[:, n, :].T).copy();"
                     ]
                     res_shape = a.shape  # still (2,n,2)
@@ -2789,6 +2804,7 @@ class NumbaCodeGen:
             "gdofs_map",
             "node_coords",
             "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
+            "is_interface",
             *sorted(list(required_args))
         ]
         if 'global_dofs' in param_order:

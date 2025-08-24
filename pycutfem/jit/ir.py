@@ -32,6 +32,7 @@ class LoadAnalytic:
     # We store its unique ID and will pass the actual function at runtime.
     func_id: int = field(compare=False)
     func_ref: Callable[[Any], Any] = field(repr=False, compare=False)
+    tensor_shape: tuple[int, ...] = field(default=()) 
 
 @dataclass(frozen=True, slots=True)
 class LoadFacetNormal:

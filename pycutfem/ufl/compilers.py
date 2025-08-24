@@ -476,6 +476,8 @@ class FormCompiler:
     
     def _visit_Pos(self, n: Pos): 
         """Evaluates operand only if on the positive side of an interface.""" 
+        if self.ctx.get('on_interface', False):
+            return self._visit(n.operand)
         # The '+' side is where phi >= 0 (a closed set)
         if 'phi_val' in self.ctx and self.ctx['phi_val'] < 0.0: 
             # We are on the strictly negative side, so return zero.
@@ -485,6 +487,8 @@ class FormCompiler:
 
     def _visit_Neg(self, n: Neg): 
         """Evaluates operand only if on the negative side of an interface.""" 
+        if self.ctx.get('on_interface', False):
+            return self._visit(n.operand)
         # The '-' side is where phi < 0 (an open set)
         if 'phi_val' in self.ctx and self.ctx['phi_val'] >= 0.0: 
              # We are on the positive or zero side, so return zero.
@@ -1411,6 +1415,7 @@ class FormCompiler:
                                                             need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
         pre_built = {k: (v[element_ids] if isinstance(v, np.ndarray) else v) for k, v in geo_args_all.items()}
         pre_built["entity_kind"] = "element"
+        pre_built["is_interface"] = False
         pre_built["owner_id"]    = geo_args_all.get("owner_id", geo_args_all.get("eids"))[element_ids]
 
 
@@ -1516,6 +1521,7 @@ class FormCompiler:
         if level_set is None: # New
             raise ValueError("dInterface measure requires a level_set.") # New
             
+        self.ctx['on_interface'] = True
         mesh = self.me.mesh # New
         qdeg = self._find_q_order(intg) 
         logger.debug(f"Assemble Interface: Using quadrature degree: {qdeg}") 
@@ -1616,7 +1622,7 @@ class FormCompiler:
 
         finally: # New
             # --- Final Context Cleanup --- # New
-            for key in ('phi_val', 'normal', 'eid', 'x_phys', 'pos_eid', 'neg_eid', 'global_dofs'): # New
+            for key in ('phi_val', 'normal', 'eid', 'x_phys', 'pos_eid', 'neg_eid', 'global_dofs', 'on_interface'): # New
                 self.ctx.pop(key, None) # New
             log.debug("Interface assembly finished. Context cleaned.") # New
     
@@ -1906,6 +1912,7 @@ class FormCompiler:
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
         geo = dh.precompute_interface_factors(cut_bs, qdeg, level_set, 
                                               need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
+        geo["is_interface"] = True
         cut_eids = geo["eids"].astype(np.int32)      # 1‑D array, len = n_cut
 
         # 2a) ALIAS: for interface, both sides are the same element.
@@ -2050,6 +2057,7 @@ class FormCompiler:
             need_o4=need_o4,
             reuse=True,
         )
+        geo["is_interface"] = False
 
         valid_eids = geo.get("eids")
         if valid_eids is None or len(valid_eids) == 0:
@@ -2283,6 +2291,7 @@ class FormCompiler:
         geo  = dh.precompute_boundary_factors(edge_set, qdeg, derivs, 
                                               need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
 
+        geo["is_interface"] = False
         valid = geo["eids"]
         if valid.size == 0:
             return
@@ -2545,6 +2554,8 @@ class FormCompiler:
                 # 'phis' may be None if level_set was None; keep it as None in that case
                 "phis":    None if geo_all["phis"] is None else geo_all["phis"][full_ids],
                 "owner_id": geo_all.get("owner_id", geo_all["eids"])[full_ids].astype(np.int32),
+                "entity_kind": "element",
+                "is_interface": False
             }
             _run_subset(full_ids, prebuilt_full)
 
@@ -2557,6 +2568,7 @@ class FormCompiler:
             geo_cut = dh.precompute_cut_volume_factors(
                 mesh.element_bitset("cut"), qdeg, derivs, level_set, side=side, need_hess=need_hess
             )
+            geo_cut["is_interface"] = False
             cut_eids = np.asarray(geo_cut.get("eids", []), dtype=np.int32)
             if cut_eids.size:
                 # ensure detJ is present and neutral (if your helper has not added it)

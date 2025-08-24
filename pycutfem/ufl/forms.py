@@ -43,7 +43,7 @@ class Form(Expression):
         return Equation(other, self)
 
 class Equation:
-    def __init__(self, a, L):
+    def __init__(self, a:Form, L:Form):
         # Allow a side to be None, otherwise ensure it's a Form object.
         self.a = a if isinstance(a, Form) or a is None else Form([a])
         self.L = L if isinstance(L, Form) or L is None else Form([L])

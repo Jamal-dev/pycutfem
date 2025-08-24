@@ -241,8 +241,8 @@ class IRGenerator:
             return
 
         if isinstance(node, Analytic):
-            uid = f"ana_{id(node)}"
-            self.ir_sequence.append(LoadAnalytic(func_id=id(node), func_ref=node.eval))
+            self.ir_sequence.append(LoadAnalytic(func_id=id(node), func_ref=node.eval,
+                                                 tensor_shape=getattr(node, "tensor_shape", ())))
             return
 
         # If we reach here, the node type is not supported.

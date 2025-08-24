@@ -391,12 +391,17 @@ def _build_jit_kernel_args(       # ← signature unchanged
         elif name.startswith("ana_"):
             func_id = int(name.split("_", 1)[1])
             ana = next(a for a in _find_all(expression, Analytic) if id(a) == func_id)
-            qp_phys = args["qp_phys"]                      # (n_elem, n_qp, 2)
+
+            qp_phys = args["qp_phys"]                 # (n_elem, n_qp, 2)
             n_elem_, n_qp, _ = qp_phys.shape
-            ana_vals = np.empty((n_elem_, n_qp), dtype=np.float64)
-            x = qp_phys[..., 0]
-            y = qp_phys[..., 1]
-            ana_vals[:] = ana.eval(np.stack((x, y), axis=-1))   # vectorised
+            tshape = getattr(ana, "tensor_shape", ())
+
+            if tshape == () or tshape is None:
+                ana_vals = np.empty((n_elem_, n_qp), dtype=np.float64)
+            else:
+                ana_vals = np.empty((n_elem_, n_qp) + tuple(tshape), dtype=np.float64)
+
+            ana_vals[...] = ana.eval(qp_phys)         # vectorised over (e,q)
             args[name] = ana_vals
 
         # ---- coefficient vectors (gather) --------------------------------
