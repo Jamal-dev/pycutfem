@@ -781,7 +781,8 @@ class TrialFunction(Function):
     is_test = False
     is_function = False
     def __init__(self, field_name: str,dof_handler: 'DofHandler' = None,
-                 parent_vector: 'VectorFunction' = None, component_index: int = None, name: str = None):
+                 parent_vector: 'VectorFunction' = None, 
+                 component_index: int = None, name: str = None, side: str = ""):
         # A TrialFunction is purely symbolic. It has no dof_handler or data.
         # Its name and field_name are the same.
         from pycutfem.ufl.functionspace import FunctionSpace
@@ -795,6 +796,12 @@ class TrialFunction(Function):
         super().__init__(name=name, field_name=field_name, dof_handler=dof_handler,
                          parent_vector=parent_vector, component_index=component_index)
         self.dim = 0
+        self.side = side
+        if side in ("+","-"):
+            s = "pos" if side == "+" else "neg"
+            self.field_sides = [s] 
+        else:
+            self.field_sides = None
 
 
 class TestFunction(Function):
@@ -802,7 +809,9 @@ class TestFunction(Function):
     is_trial = False
     is_function = False
     def __init__(self, field_name: str,dof_handler: 'DofHandler' = None,
-                 parent_vector: 'VectorFunction' = None, component_index: int = None, name: str = None):
+                 parent_vector: 'VectorFunction' = None, 
+                 component_index: int = None, name: str = None,
+                 side: str = ""):
         # A TestFunction is purely symbolic.
         from pycutfem.ufl.functionspace import FunctionSpace
         if isinstance(field_name, FunctionSpace):
@@ -815,6 +824,12 @@ class TestFunction(Function):
         super().__init__(name=name, field_name=field_name, dof_handler=dof_handler,
                          parent_vector=parent_vector, component_index=component_index)
         self.dim = 0  # Assuming scalar test functions for now
+        self.side = side
+        if side in ("+","-"):
+            s = "pos" if side == "+" else "neg"
+            self.field_sides = [s] 
+        else:
+            self.field_sides = None
  
 
 class Constant(Expression, numbers.Number):
@@ -869,7 +884,7 @@ class VectorTrialFunction(Expression):
     is_trial = True
     is_function = False
     is_test = False
-    def __init__(self, space, dof_handler: 'DofHandler'=None): # space: FunctionSpace
+    def __init__(self, space, dof_handler: 'DofHandler'=None, side: str = ""): # space: FunctionSpace
         self.space = space
         self.field_names = space.field_names
         self.components = [
@@ -879,6 +894,12 @@ class VectorTrialFunction(Expression):
             for i, fn in enumerate(space.field_names)
         ]
         self.dim = 1
+        self.side = side
+        if side in ("+","-"):
+            s = "pos" if side == "+" else "neg"
+            self.field_sides = [s] * len(self.field_names)
+        else:
+            self.field_sides = None
     def __repr__(self):
         return f"VectorTrialFunction(space='{self.space.name}')"
     def __getitem__(self, i): return self.components[i]
@@ -889,7 +910,7 @@ class VectorTestFunction(Expression):
     is_test = True
     is_function = False
     is_trial = False
-    def __init__(self, space, dof_handler=None): # space: FunctionSpace
+    def __init__(self, space, dof_handler=None, side: str = ""): # space: FunctionSpace
         self.space = space
         self.field_names = space.field_names
         self.components = [
@@ -899,7 +920,13 @@ class VectorTestFunction(Expression):
                          parent_vector=self, component_index=i)
             for i, fn in enumerate(space.field_names)
         ]
-        self.dim = 1 
+        self.dim = 1
+        self.side = side
+        if side in ("+","-"):
+            s = "pos" if side == "+" else "neg"
+            self.field_sides = [s] * len(self.field_names)
+        else:
+            self.field_sides = None 
     def __repr__(self):
         return f"VectorTestFunction(space='{self.space.name}')"
     def __getitem__(self, i): return self.components[i]

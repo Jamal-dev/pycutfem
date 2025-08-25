@@ -33,6 +33,7 @@ class StackItem:
     is_vector: bool = field(default=False)
     # Stores the field name(s) to look up basis functions or coefficients
     field_names: list = field(default_factory=list)
+    field_sides: list = field(default_factory=list)   # NEW: 'pos'/'neg' per component (optional)
     # Stores the name of the parent Function/VectorFunction
     parent_name: str = ""
     side: str = ""  # Side for ghost integrals, e.g., "+", "-", or ""
@@ -50,6 +51,8 @@ class StackItem:
             return bool(item.parent_name)
         if attr_name == "side":
             return bool(item.side)
+        if attr_name == "field_sides":
+            return bool(item.field_sides)
         return False
 
     @staticmethod
@@ -99,12 +102,13 @@ class StackItem:
             return default_for(attr)
 
         resolved = {}
-        for attr in ("field_names","parent_name","side"):
+        for attr in ("field_names","parent_name","side", "field_sides"):
             aval, bval = getattr(a, attr), getattr(b, attr)
             ahas, bhas = StackItem._has_value(a, attr), StackItem._has_value(b, attr)
             resolved[attr] = pick(attr, aval, bval, ahas, bhas)
 
-        return resolved["field_names"], resolved["parent_name"], resolved["side"]
+        return resolved["field_names"], resolved["parent_name"], resolved["side"], resolved["field_sides"]
+    
 
 
 # ── scalar * Vector/Tensor  (or Vector/Tensor * scalar) ────────────
@@ -138,7 +142,8 @@ def _mul_scalar_vector(self,first_is_scalar,res_var,a, b, body_lines, stack):
                            is_hessian = vect.is_hessian,
                            field_names= vect.field_names,
                            parent_name= vect.parent_name,
-                           side       = vect.side))
+                           side       = vect.side,
+                           field_sides=vect.field_sides or [],))
 
 class NumbaCodeGen:
     """
@@ -161,6 +166,38 @@ class NumbaCodeGen:
         self.spatial_dim = self.me.mesh.spatial_dim
         self.last_side_for_store = "" # Track side for detJ
         self.dtype = "np.float64"  # Default data type for arrays
+    
+    # ------------------------------------------------------------------
+    # Helpers for robust per-component side resolution / mapping
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _infer_side_from_name(field_name: str) -> str | None:
+        """
+        Try to infer 'pos' / 'neg' from a component field name like 'u_pos_x' / 'p_neg'.
+        Looks for whole-word '_pos_' / '_neg_' (also at start/end).
+        """
+        if re.search(r'(^|_)pos(_|$)', field_name):
+            return "pos"
+        if re.search(r'(^|_)neg(_|$)', field_name):
+            return "neg"
+        return None
+
+    @classmethod
+    def _component_side_tag(cls, default_side: str, field_sides: List[str] | None,
+                            field_name: str, idx: int) -> str | None:
+        """
+        Resolve the effective side for a single component:
+          1) explicit field_sides[idx] if present ('pos'/'neg')
+          2) infer from name ('*_pos_*' / '*_neg_*')
+          3) fall back to the enclosing op/stack side ('+'/'-')
+        Returns 'pos'/'neg' or None if nothing can be determined.
+        """
+        if field_sides and 0 <= idx < len(field_sides) and field_sides[idx] in ("pos","neg"):
+            return field_sides[idx]
+        hint = cls._infer_side_from_name(field_name)
+        if hint: return hint
+        if default_side in ("+","-"): return "pos" if default_side == "+" else "neg"
+        return None
 
     
     
@@ -253,6 +290,7 @@ class NumbaCodeGen:
                         f"{out} = np.empty(({k_comps}, n_union, 2, 2), dtype={self.dtype})",
                     ]
                     for i, fn in enumerate(a.field_names):
+                        s0 = self.me.component_dof_slices[fn].start; s1 = self.me.component_dof_slices[fn].stop
                         Hloc = new_var("Hloc")
                         body_lines += [
                             f"A  = {jinv}[e, q]",
@@ -272,16 +310,20 @@ class NumbaCodeGen:
                             f"    {Hloc}[j] = Hphys",
                         ]
                         if a.side:  # pad to union using map
-                            map_arr = "pos_map" if a.side == "+" else "neg_map"
+                            side_tag = self._component_side_tag(a.side, a.field_sides, fn, i)
+                            map_arr = f"{side_tag}_map_{fn}"
                             required_args.add(map_arr)
                             Hpad, me = new_var("Hpad"), new_var("map_e")
+                            Hsub = new_var("Hsub")
                             body_lines += [
                                 f"{me} = {map_arr}[e]",
+                                # slice down to this field first
+                                f"{Hsub} = {Hloc}[{s0}:{s1}, :, :]",
                                 f"{Hpad} = np.zeros((n_union, 2, 2), dtype={self.dtype})",
-                                "for j in range(nloc):",
+                                "for j in range({}.shape[0]):".format(Hsub),
                                 f"    idx = {me}[j]",
                                 "    if 0 <= idx < n_union:",
-                                f"        {Hpad}[idx] = {Hloc}[j]",
+                                f"        {Hpad}[idx] = {Hsub}[j]",
                                 f"{out}[{i}] = {Hpad}",
                             ]
                         else:
@@ -292,7 +334,8 @@ class NumbaCodeGen:
                                         shape=(k_comps, -1, 2, 2),
                                         is_vector=False, is_hessian=True,
                                         field_names=a.field_names, 
-                                        parent_name=a.parent_name, side=a.side))
+                                        parent_name=a.parent_name, side=a.side,
+                                        field_sides=a.field_sides or []))
 
 
                 elif a.role == "value":
@@ -303,6 +346,7 @@ class NumbaCodeGen:
 
                     body_lines += [f"{out} = np.zeros(({k_comps}, 2, 2), dtype={self.dtype})"]
                     for i, fn in enumerate(a.field_names):
+                        s0 = self.me.component_dof_slices[fn].start; s1 = self.me.component_dof_slices[fn].stop
                         Hloc = new_var("Hloc")
                         body_lines += [
                             f"A  = {jinv}[e, q]",
@@ -322,17 +366,20 @@ class NumbaCodeGen:
                             f"    {Hloc}[j] = Hphys",
                         ]
                         if a.side:
-                            map_arr = "pos_map" if a.side == "+" else "neg_map"
+                            side_tag = self._component_side_tag(a.side, a.field_sides, fn, i)
+                            map_arr = f"{side_tag}_map_{fn}"
                             required_args.add(map_arr)
                             Hpad, me = new_var("Hpad"), new_var("map_e")
+                            Hsub = new_var("Hsub")
                             body_lines += [
                                 f"{me} = {map_arr}[e]",
                                 "n_union = gdofs_map[e].shape[0]",
+                                f"{Hsub} = {Hloc}[{s0}:{s1}, :, :]",
                                 f"{Hpad} = np.zeros((n_union, 2, 2), dtype={self.dtype})",
-                                "for j in range(nloc):",
+                                "for j in range({}.shape[0]):".format(Hsub),
                                 f"    idx = {me}[j]",
                                 "    if 0 <= idx < n_union:",
-                                f"        {Hpad}[idx] = {Hloc}[j]",
+                                f"        {Hpad}[idx] = {Hsub}[j]",
                                 # --- tensordot-free collapse: (n,2,2) -> (2,2)
                                 f"c = {coeff}.astype({self.dtype})",
                                 f"M = {Hpad}.reshape({Hpad}.shape[0], 4)",
@@ -354,7 +401,8 @@ class NumbaCodeGen:
                                         is_vector=False, is_hessian=True,
                                         is_gradient=False,
                                         field_names=a.field_names, 
-                                        parent_name=a.parent_name, side=a.side))
+                                        parent_name=a.parent_name, side=a.side,
+                                        field_sides=a.field_sides or []))
 
 
 
@@ -398,6 +446,7 @@ class NumbaCodeGen:
                         f"{out} = np.empty(({k_comps}, n_union), dtype={self.dtype})",
                     ]
                     for i, fn in enumerate(a.field_names):
+                        s0 = self.me.component_dof_slices[fn].start; s1 = self.me.component_dof_slices[fn].stop
                         laploc = new_var("laploc")
                         body_lines += [
                             f"A  = {jinv}[e, q]",
@@ -420,16 +469,19 @@ class NumbaCodeGen:
                             f"    {laploc}[j] = lap_j",
                         ]
                         if a.side:
-                            map_arr = "pos_map" if a.side == "+" else "neg_map"
+                            side_tag = self._component_side_tag(a.side, a.field_sides, fn, i)
+                            map_arr = f"{side_tag}_map_{fn}"
                             required_args.add(map_arr)
                             lap_pad, me = new_var("lap_pad"), new_var("map_e")
+                            lap_sub = new_var("lap_sub")
                             body_lines += [
                                 f"{me} = {map_arr}[e]",
                                 f"{lap_pad} = np.zeros((n_union,), dtype={self.dtype})",
+                                f"{lap_sub} = {laploc}[{s0}:{s1}]",
                                 "for j in range(nloc):",
                                 f"    idx = {me}[j]",
                                 "    if 0 <= idx < n_union:",
-                                f"        {lap_pad}[idx] = {laploc}[j]",
+                                f"        {lap_pad}[idx] = {lap_sub}[j]",
                                 f"{out}[{i}] = {lap_pad}",
                             ]
                         else:
@@ -438,7 +490,8 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=out, role=a.role,
                                         shape=(k_comps, -1),
                                         is_vector=True, field_names=a.field_names, 
-                                        parent_name=a.parent_name, side=a.side))
+                                        parent_name=a.parent_name, side=a.side,
+                                        field_sides=a.field_sides or []))
 
 
                 # ---------------- VALUE: collapse with coeffs → (k,) ----------------
@@ -449,6 +502,7 @@ class NumbaCodeGen:
 
                     body_lines += [f"{out} = np.zeros(({k_comps},), dtype={self.dtype})"]
                     for i, fn in enumerate(a.field_names):
+                        s0 = self.me.component_dof_slices[fn].start; s1 = self.me.component_dof_slices[fn].stop
                         laploc = new_var("laploc")
                         body_lines += [
                             f"A  = {jinv}[e, q]",
@@ -471,17 +525,19 @@ class NumbaCodeGen:
                             f"    {laploc}[j] = lap_j",
                         ]
                         if a.side:
-                            map_arr = "pos_map" if a.side == "+" else "neg_map"
+                            side_tag = self._component_side_tag(a.side, a.field_sides, fn, i)
+                            map_arr = f"{side_tag}_map_{fn}"
                             required_args.add(map_arr)
-                            lap_pad = new_var("lap_pad"); me = new_var("map_e")
+                            lap_pad = new_var("lap_pad"); me = new_var("map_e"); lap_sub = new_var("lap_sub")
                             body_lines += [
                                 f"{me} = {map_arr}[e]",
                                 "n_union = gdofs_map[e].shape[0]",
                                 f"{lap_pad} = np.zeros((n_union,), dtype={self.dtype})",
+                                f"{lap_sub} = {laploc}[{s0}:{s1}]",
                                 "for j in range(nloc):",
                                 f"    idx = {me}[j]",
                                 "    if 0 <= idx < n_union:",
-                                f"        {lap_pad}[idx] = {laploc}[j]",
+                                f"        {lap_pad}[idx] = {lap_sub}[j]",
                                 f"{out}[{i}] = float(np.dot({coeff}, {lap_pad}))",
                             ]
                         else:
@@ -491,7 +547,8 @@ class NumbaCodeGen:
 
                     stack.append(StackItem(var_name=out, role="value", shape=(k_comps,),
                                         is_vector=True, field_names=a.field_names, 
-                                        parent_name=a.parent_name, side=a.side))
+                                        parent_name=a.parent_name, side=a.side,
+                                        field_sides=a.field_sides or []))
 
                 else:
                     raise NotImplementedError(f"Laplacian not implemented for role {a.role}")
@@ -551,6 +608,7 @@ class NumbaCodeGen:
                             field_names=op.field_names,
                             parent_name=op.name,
                             side=op.side,
+                            field_sides=op.field_sides or []
                         )
                     )
                     continue
@@ -582,6 +640,7 @@ class NumbaCodeGen:
                 if   op.side == "+":  jinv_sym = "J_inv_pos"; required_args.add("J_inv_pos")
                 elif op.side == "-":  jinv_sym = "J_inv_neg"; required_args.add("J_inv_neg")
                 else:                 jinv_sym = "J_inv";      required_args.add("J_inv")
+ 
 
                 # reference value(s) at current quadrature point (only if used below)
                 basis_vars_at_q = [f"{arg_name}[e, q]" for arg_name in basis_arg_names]
@@ -597,24 +656,28 @@ class NumbaCodeGen:
                 if op.role in ("test", "trial"):
                     # ---------- facet integrals (+ / -) : pad to union DOFs ----------
                     if op.side:                                              # "+" or "-"
-                        map_array_name = "pos_map" if op.side == "+" else "neg_map"
-                        required_args.add(map_array_name)
-
-                        map_e = new_var(f"{map_array_name}_e")
                         body_lines += [
-                            f"{map_e} = {map_array_name}[e]",
-                            f"n_union = gdofs_map[e].shape[0]",              # e.g. 36 for Stokes
+                            "n_union = gdofs_map[e].shape[0]",               # e.g. 36 for Stokes
                         ]
-
                         padded_vars = []                                     # one per component
                         for i, bq in enumerate(basis_vars_at_q):
+                            fld_i = field_names[i]
+                            # field slice in the element-union vector
+                            s0 = self.me.component_dof_slices[fld_i].start
+                            s1 = self.me.component_dof_slices[fld_i].stop
+                            side_tag = self._component_side_tag(op.side, op.field_sides, fld_i, i)
+                            map_array_name = f"{side_tag}_map_{fld_i}"
+                            required_args.add(map_array_name)
+                            map_e = new_var(f"{map_array_name}_e")
                             loc = new_var(f"local_basis{i}")
                             pad = new_var(f"padded_basis{i}")
                             body_lines += [
-                                f"{loc} = {bq}",
-                                f"if n_union == {loc}.shape[0]:",          # fast path (interior facet)
+                                f"{map_e} = {map_array_name}[e]",
+                                # slice the union-length reference vector down to this field
+                                f"{loc} = {bq}[{s0}:{s1}]",
+                                f"if n_union == {loc}.shape[0]:",            # fast path (interior facet)
                                 f"    {pad} = {loc}.copy()",
-                                f"else:",                                  # true ghost facet
+                                f"else:",                                    # true ghost facet
                                 f"    {pad} = np.zeros(n_union, dtype={self.dtype})",
                                 f"    for j in range({loc}.shape[0]):",
                                 f"        idx = {map_e}[j]",
@@ -647,7 +710,8 @@ class NumbaCodeGen:
                             shape = (len(field_names), n_dofs)
                         stack.append(StackItem(var_name=var_name, role=op.role, shape=shape,
                                             is_vector=op.is_vector, field_names=field_names, 
-                                            parent_name=op.name, side=op.side))
+                                            parent_name=op.name, side=op.side,
+                                            field_sides=op.field_sides or []))
                         continue
 
                     # Decide which J^{-1} to use and bind a local for use below
@@ -666,26 +730,30 @@ class NumbaCodeGen:
                         # bind J_inv[e,q] once
                         Aq = new_var("Aq")
                         body_lines.append(f"{Aq} = {jinv_sym}[e, q]")
-                        for fn in field_names:
+                        for i, fn in enumerate(field_names):
                             nm = f"g_{fn}"
                             required_args.add(nm)
-                            gloc = new_var("g_loc"); prow = new_var("prow")
+                            gloc = new_var("g_loc"); prow = new_var("prow"); 
                             body_lines += [
                                 f"{gloc} = {nm}[e, q] @ {Aq}",
                                 f"{prow} = {gloc}[:, {comp}]",
                             ]
                             if op.side:
-                                map_arr = "pos_map" if op.side == "+" else "neg_map"
+                                s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
+                                prow_s = new_var("prow_s")
+                                body_lines.append(f"{prow_s} = {prow}[{s0}:{s1}]")
+                                side_tag = self._component_side_tag(op.side, op.field_sides, fn, i)
+                                map_arr = f"{side_tag}_map_{fn}"
                                 required_args.add(map_arr)
                                 pad = new_var("pad"); me = new_var("me")
                                 body_lines += [
                                     f"{me} = {map_arr}[e]",
                                     f"n_union = gdofs_map[e].shape[0]",
                                     f"{pad} = np.zeros(n_union, dtype={self.dtype})",
-                                    "for j in range({}.shape[0]):".format(prow),
+                                    f"for j in range({prow_s}.shape[0]):",
                                     f"    idx = {me}[j]",
                                     "    if 0 <= idx < n_union:",
-                                    f"        {pad}[idx] = {prow}[j]",
+                                    f"        {pad}[idx] = {prow_s}[j]",
                                 ]
                                 rows.append(pad)
                             else:
@@ -699,7 +767,8 @@ class NumbaCodeGen:
                             shape = (len(field_names), -1 if op.side else self.n_dofs_local)
                         stack.append(StackItem(var_name=var_name, role=op.role, shape=shape,
                                             is_vector=op.is_vector, field_names=field_names, 
-                                            parent_name=op.name, side=op.side))
+                                            parent_name=op.name, side=op.side,
+                                            field_sides=op.field_sides or []))
                         continue
 
                     # ---------- (C) order >= 2: exact chain-rule up to 4 -------------
@@ -732,13 +801,23 @@ class NumbaCodeGen:
                                 required_args.add(nm); names[tag] = nm
 
                         row = new_var("drow")
-                        # pull all ref-deriv arrays for this field at (e,q)
-                        for tag, nm in names.items():
-                            body_lines.append(f"{tag}_q = {nm}[e, q]")
-                        body_lines += [
-                            "nloc = {}_q.shape[0]".format("d20" if tot>=2 else "d10"),
-                            f"{row} = np.zeros((nloc,), dtype={self.dtype})",
-                        ]
+                        # pull derivative arrays; slice ONLY on sided paths
+                        if op.side:
+                            s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
+                            for tag, nm in names.items():
+                                body_lines += [f"{tag}_q = {nm}[e, q]",
+                                               f"{tag}_s = {tag}_q[{s0}:{s1}]"]
+                            body_lines += [
+                                "nloc = {}_s.shape[0]".format("d20" if tot>=2 else "d10"),
+                                f"{row} = np.zeros((nloc,), dtype={self.dtype})",
+                            ]
+                        else:
+                            for tag, nm in names.items():
+                                body_lines.append(f"{tag}_q = {nm}[e, q]")
+                            body_lines += [
+                                "nloc = {}_q.shape[0]".format("d20" if tot>=2 else "d10"),
+                                f"{row} = np.zeros((nloc,), dtype={self.dtype})",
+                            ]
 
                         # prepare axes list (e.g. [0,0,1] for (2,1))
                         body_lines.append(f"axes = np.array([{', '.join(map(str, [0]*ox + [1]*oy))}], dtype=np.int32)")
@@ -749,9 +828,14 @@ class NumbaCodeGen:
                                 f"Hx = {H0}[e, q]; Hy = {H1}[e, q]",
                                 f"Href = np.zeros((2,2), dtype={self.dtype})",
                                 "for j in range(nloc):",
-                                "    Href[0,0] = d20_q[j]; Href[0,1] = d11_q[j]; Href[1,0] = d11_q[j]; Href[1,1] = d02_q[j]",
+                                ("    Href[0,0] = d20_s[j]; Href[0,1] = d11_s[j]; Href[1,0] = d11_s[j]; Href[1,1] = d02_s[j]"
+                                 if op.side else
+                                 "    Href[0,0] = d20_q[j]; Href[0,1] = d11_q[j]; Href[1,0] = d11_q[j]; Href[1,1] = d02_q[j]"),
+                                 
                                 f"    core = {A_loc}.T @ (Href @ {A_loc})",
-                                "    Hphys = core + d10_q[j]*Hx + d01_q[j]*Hy",
+                                ("    Hphys = core + d10_s[j]*Hx + d01_s[j]*Hy"
+                                 if op.side else
+                                 "    Hphys = core + d10_q[j]*Hx + d01_q[j]*Hy"),
                                 "    if   axes[0]==0 and axes[1]==0:  val = Hphys[0,0]",
                                 "    elif axes[0]==1 and axes[1]==1:  val = Hphys[1,1]",
                                 "    else:                              val = Hphys[0,1]",
@@ -767,16 +851,23 @@ class NumbaCodeGen:
                                 "      for b in (0,1):",
                                 "        for c in (0,1):",
                                 "          ones = (a==1)+(b==1)+(c==1)",
-                                "          g3 = d30_q[j] if ones==0 else (d21_q[j] if ones==1 else (d12_q[j] if ones==2 else d03_q[j]))",
+                                ("          g3 = d30_s[j] if ones==0 else (d21_s[j] if ones==1 else (d12_s[j] if ones==2 else d03_s[j]))"
+                                 if op.side else
+                                 "          g3 = d30_q[j] if ones==0 else (d21_q[j] if ones==1 else (d12_q[j] if ones==2 else d03_q[j]) )"),
                                 f"          s += g3 * {A_loc}[a, axes[0]] * {A_loc}[b, axes[1]] * {A_loc}[c, axes[2]]",
                                 "    # g2 · A2 term (3 permutations)",
                                 "    for a in (0,1):",
                                 "      for b in (0,1):",
-                                "        g2 = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])",
+                                ("        g2 = d20_s[j] if (a==0 and b==0) else (d11_s[j] if a!=b else d02_s[j])"
+                                 if op.side else
+                                 "        g2 = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])"),
                                 "        Hb = Hx if b==0 else Hy",
                                 f"        s += g2 * ( {A_loc}[a,axes[0]]*Hb[axes[1],axes[2]] + {A_loc}[a,axes[1]]*Hb[axes[0],axes[2]] + {A_loc}[a,axes[2]]*Hb[axes[0],axes[1]] )",
                                 "    # g1 · A3 term",
-                                "    s += d10_q[j] * Tx0[axes[0],axes[1],axes[2]] + d01_q[j] * Tx1[axes[0],axes[1],axes[2]]",
+                                ("    s += d10_s[j] * Tx0[axes[0],axes[1],axes[2]] + d01_s[j] * Tx1[axes[0],axes[1],axes[2]]"
+                                 if op.side else
+                                 "    s += d10_q[j] * Tx0[axes[0],axes[1],axes[2]] + d01_q[j] * Tx1[axes[0],axes[1],axes[2]]"),
+
                                 f"    {row}[j] = s",
                             ]
                         else:  # tot == 4
@@ -790,13 +881,19 @@ class NumbaCodeGen:
                                 "        for c in (0,1):",
                                 "          for d in (0,1):",
                                 "            ones = (a==1)+(b==1)+(c==1)+(d==1)",
-                                "            g4 = d40_q[j] if ones==0 else (d31_q[j] if ones==1 else (d22_q[j] if ones==2 else (d13_q[j] if ones==3 else d04_q[j])))",
+                                ("            g4 = d40_s[j] if ones==0 else (d31_s[j] if ones==1 else (d22_s[j] if ones==2 else (d13_s[j] if ones==3 else d04_s[j])))"
+                                 if op.side else
+                                 "            g4 = d40_q[j] if ones==0 else (d31_q[j] if ones==1 else (d22_q[j] if ones==2 else (d13_q[j] if ones==3 else d04_q[j])))"),
+
                                 f"            s += g4 * {A_loc}[a,axes[0]]*{A_loc}[b,axes[1]]*{A_loc}[c,axes[2]]*{A_loc}[d,axes[3]]",
                                 "    # g3 · A2 term (choose the A2 holder, choose a pair)",
                                 "    for a in (0,1):",
                                 "      for b in (0,1):",
                                 "        for c in (0,1):",
-                                "          g3v = d30_q[j] if (a+b+c)==0 else (d21_q[j] if (a+b+c)==1 else (d12_q[j] if (a+b+c)==2 else d03_q[j]))",
+                                ("        g3v = d30_s[j] if (a+b+c)==0 else (d21_s[j] if (a+b+c)==1 else (d12_s[j] if (a+b+c)==2 else d03_s[j]))"
+                                 if op.side else
+                                 "        g3v = d30_q[j] if (a+b+c)==0 else (d21_q[j] if (a+b+c)==1 else (d12_q[j] if (a+b+c)==2 else d03_q[j]))"),
+
                                 "          for holder in (0,1,2):",
                                 "            hb = [a,b,c][holder]",
                                 "            Hb = Hx if hb==0 else Hy",
@@ -809,25 +906,32 @@ class NumbaCodeGen:
                                 "    # g2 · (A2·A2) term",
                                 "    for a in (0,1):",
                                 "      for b in (0,1):",
-                                "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])",
+                                ("        g2v = d20_s[j] if (a==0 and b==0) else (d11_s[j] if a!=b else d02_s[j])"
+                                 if op.side else
+                                 "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])"),
                                 "        Ha = Hx if a==0 else Hy; Hb = Hx if b==0 else Hy",
                                 "        s += g2v * ( Ha[axes[0],axes[1]]*Hb[axes[2],axes[3]] + Ha[axes[0],axes[2]]*Hb[axes[1],axes[3]] + Ha[axes[0],axes[3]]*Hb[axes[1],axes[2]] )",
                                 "    # g2 · A3 term (pick the single-A index)",
                                 "    for a in (0,1):",
                                 "      for b in (0,1):",
-                                "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])",
+                                ("        g2v = d20_s[j] if (a==0 and b==0) else (d11_s[j] if a!=b else d02_s[j])"
+                                 if op.side else
+                                 "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])"),
                                 "        Tb = Tx0 if b==0 else Tx1; Ta = Tx0 if a==0 else Tx1",
                                 "        for p in range(4):",
                                 "            rest = [axes[i] for i in range(4) if i != p]",
                                 f"            s += g2v * ( {A_loc}[a,axes[p]] * Tb[rest[0],rest[1],rest[2]] + {A_loc}[b,axes[p]] * Ta[rest[0],rest[1],rest[2]] )",
                                 "    # g1 · A4 term",
-                                "    s += d10_q[j] * Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_q[j] * Qx1[axes[0],axes[1],axes[2],axes[3]]",
+                                ("    s += d10_s[j] * Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_s[j] * Qx1[axes[0],axes[1],axes[2],axes[3]]"
+                                 if op.side else
+                                 "    s += d10_q[j] * Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_q[j] * Qx1[axes[0],axes[1],axes[2],axes[3]]"),
                                 f"    {row}[j] = s",
                             ]
 
                         # Pad to union if side-restricted
                         if op.side:
-                            map_arr = "pos_map" if op.side == "+" else "neg_map"
+                            side_tag = self._component_side_tag(op.side, op.field_sides, fn, 0)
+                            map_arr = f"{side_tag}_map_{fn}"
                             required_args.add(map_arr)
                             pad = new_var("pad"); me = new_var("me")
                             body_lines += [
@@ -854,7 +958,8 @@ class NumbaCodeGen:
 
                     stack.append(StackItem(var_name=var_name, role=op.role, shape=shape,
                                         is_vector=op.is_vector, field_names=field_names, 
-                                        parent_name=op.name, side=op.side))
+                                        parent_name=op.name, side=op.side,
+                                        field_sides=op.field_sides or []))
                     continue
 
 
@@ -890,7 +995,8 @@ class NumbaCodeGen:
                                 is_vector   = op.is_vector,
                                 field_names = field_names,
                                 parent_name = coeff_sym,
-                                side        = op.side
+                                side        = op.side,
+                                field_sides = op.field_sides or []
                             )
                         )
                         continue
@@ -910,20 +1016,21 @@ class NumbaCodeGen:
                     #      (only used for tot==0 path that uses b_* tables)
                     # --------------------------------------------------------------
                     if op.side:                                            # "+" or "-"
-                        map_array_name = "pos_map" if op.side == "+" else "neg_map"
-                        required_args.add(map_array_name)
-
-                        map_e = new_var(f"{map_array_name}_e")
                         body_lines += [
-                            f"{map_e} = {map_array_name}[e]",
                             f"n_union = gdofs_map[e].shape[0]",
                         ]
 
                         padded = []
                         for i, b_var in enumerate(basis_vars_at_q):
+                            fld_i = field_names[i]
+                            side_tag = self._component_side_tag(op.side, op.field_sides, fld_i, i)
+                            map_array_name = f"{side_tag}_map_{fld_i}"
+                            required_args.add(map_array_name)
+                            map_e = new_var(f"{map_array_name}_e")
                             local = new_var(f"local_basis{i}")
                             pad   = new_var(f"padded_basis{i}")
                             body_lines += [
+                                f"{map_e} = {map_array_name}[e]",
                                 f"{local} = {b_var}",
                                 # fast path: interior facet (no ghosts)
                                 f"if n_union == {local}.shape[0]:",
@@ -990,17 +1097,21 @@ class NumbaCodeGen:
                                 # pad to union if sided
                                 rv = new_var("rv")
                                 if op.side:
-                                    map_arr = "pos_map" if op.side == "+" else "neg_map"
+                                    s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
+                                    row_s = new_var("row_s")
+                                    body_lines.append(f"{row_s} = {row}[{s0}:{s1}]")
+                                    side_tag = self._component_side_tag(op.side, op.field_sides, fn, 0)
+                                    map_arr = f"{side_tag}_map_{fn}"
                                     required_args.add(map_arr)
                                     pad = new_var("pad"); mep = new_var("mapp")
                                     body_lines += [
                                         f"{mep} = {map_arr}[e]",
                                         "n_union = gdofs_map[e].shape[0]",
                                         f"{pad} = np.zeros(n_union, dtype={self.dtype})",
-                                        f"for j in range({row}.shape[0]):",
+                                        f"for j in range({row_s}.shape[0]):",
                                         f"    idx = {mep}[j]",
                                         "    if 0 <= idx < n_union:",
-                                        f"        {pad}[idx] = {row}[j]",
+                                        f"        {pad}[idx] = {row_s}[j]",
                                         f"{rv} = float(np.dot({coeff_sym}, {pad}))",
                                     ]
                                 else:
@@ -1033,9 +1144,16 @@ class NumbaCodeGen:
                                     required_args.add(nm)
                                     body_lines.append(f"d{tg}_q = {nm}[e,q]")
 
-                                body_lines.append("nloc = d20_q.shape[0]")
+                                if op.side:
+                                    s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
+                                    for tg in need_tags:
+                                        body_lines.append(f"d{tg}_s = d{tg}_q[{s0}:{s1}]")
+                                    body_lines.append("nloc = d20_s.shape[0]")
+                                else:
+                                    body_lines.append("nloc = d20_q.shape[0]")
                                 row = new_var("row")
                                 body_lines.append(f"{row} = np.zeros((nloc,), dtype={self.dtype})")
+
 
                                 # axes list (e.g. [0,0] for (2,0); [0,1] for (1,1); ...)
                                 axes_lit = ",".join(["0"]*ox + ["1"]*oy)
@@ -1046,9 +1164,13 @@ class NumbaCodeGen:
                                         f"Hx = {H0}[e,q]; Hy = {H1}[e,q]",
                                         "Href = np.zeros((2,2), dtype={})".format(self.dtype),
                                         "for j in range(nloc):",
-                                        "    Href[0,0]=d20_q[j]; Href[0,1]=d11_q[j]; Href[1,0]=d11_q[j]; Href[1,1]=d02_q[j]",
+                                        ("    Href[0,0]=d20_s[j]; Href[0,1]=d11_s[j]; Href[1,0]=d11_s[j]; Href[1,1]=d02_s[j]"
+                                         if op.side else
+                                         "    Href[0,0]=d20_q[j]; Href[0,1]=d11_q[j]; Href[1,0]=d11_q[j]; Href[1,1]=d02_q[j]"),
                                         f"    core = {A_loc}.T @ (Href @ {A_loc})",
-                                        "    Hphys = core + d10_q[j]*Hx + d01_q[j]*Hy",
+                                        ("    Hphys = core + d10_s[j]*Hx + d01_s[j]*Hy"
+                                         if op.side else
+                                         "    Hphys = core + d10_q[j]*Hx + d01_q[j]*Hy"),
                                         "    if   axes[0]==0 and axes[1]==0:  val = Hphys[0,0]",
                                         "    elif axes[0]==1 and axes[1]==1:  val = Hphys[1,1]",
                                         "    else:                              val = Hphys[0,1]",
@@ -1064,16 +1186,25 @@ class NumbaCodeGen:
                                         "      for b in (0,1):",
                                         "        for c in (0,1):",
                                         "          ones = (a==1)+(b==1)+(c==1)",
-                                        "          g3 = d30_q[j] if ones==0 else (d21_q[j] if ones==1 else (d12_q[j] if ones==2 else d03_q[j]))",
+                                        ("          g3 = d30_s[j] if ones==0 else (d21_s[j] if ones==1 else (d12_s[j] if ones==2 else d03_s[j]))"
+                                         if op.side else
+                                         "          g3 = d30_q[j] if ones==0 else (d21_q[j] if ones==1 else (d12_q[j] if ones==2 else d03_q[j]))"),
+
                                         f"          s += g3 * {A_loc}[a,axes[0]]*{A_loc}[b,axes[1]]*{A_loc}[c,axes[2]]",
                                         "    # g2 · A2 (3 permutations)",
                                         "    for a in (0,1):",
                                         "      for b in (0,1):",
-                                        "        g2 = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])",
+                                        ("        g2 = d20_s[j] if (a==0 and b==0) else (d11_s[j] if a!=b else d02_s[j])"
+                                         if op.side else
+                                         "        g2 = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])"),
+
                                         "        Hb = Hx if b==0 else Hy",
                                         f"        s += g2 * ( {A_loc}[a,axes[0]]*Hb[axes[1],axes[2]] + {A_loc}[a,axes[1]]*Hb[axes[0],axes[2]] + {A_loc}[a,axes[2]]*Hb[axes[0],axes[1]] )",
                                         "    # g1 · A3",
-                                        "    s += d10_q[j]*Tx0[axes[0],axes[1],axes[2]] + d01_q[j]*Tx1[axes[0],axes[1],axes[2]]",
+                                        ("    s += d10_s[j]*Tx0[axes[0],axes[1],axes[2]] + d01_s[j]*Tx1[axes[0],axes[1],axes[2]]"
+                                     if op.side else
+                                     "    s += d10_q[j]*Tx0[axes[0],axes[1],axes[2]] + d01_q[j]*Tx1[axes[0],axes[1],axes[2]]"),
+
                                         f"    {row}[j] = s",
                                     ]
                                 else:  # tot == 4
@@ -1087,12 +1218,16 @@ class NumbaCodeGen:
                                         "        for c in (0,1):",
                                         "          for d in (0,1):",
                                         "            ones = (a==1)+(b==1)+(c==1)+(d==1)",
-                                        "            g4 = d40_q[j] if ones==0 else (d31_q[j] if ones==1 else (d22_q[j] if ones==2 else (d13_q[j] if ones==3 else d04_q[j])))",
+                                        ("            g4 = d40_s[j] if ones==0 else (d31_s[j] if ones==1 else (d22_s[j] if ones==2 else (d13_s[j] if ones==3 else d04_s[j]))"
+                                         if op.side else
+                                         "            g4 = d40_q[j] if ones==0 else (d31_q[j] if ones==1 else (d22_q[j] if ones==2 else (d13_q[j] if ones==3 else d04_q[j]))"),
                                         f"            s += g4 * {A_loc}[a,axes[0]]*{A_loc}[b,axes[1]]*{A_loc}[c,axes[2]]*{A_loc}[d,axes[3]]",
                                         "    # g3 · A2 (place A2 in one slot, A in the others)",
                                         "    for a in (0,1):",
                                         "      for b in (0,1):",
-                                        "        g3v = d30_q[j] if (a+b)==0 else (d21_q[j] if (a+b)==1 else (d12_q[j] if (a+b)==2 else d03_q[j]))",
+                                        ("        g3v = d30_s[j] if (a+b)==0 else (d21_s[j] if (a+b)==1 else (d12_s[j] if (a+b)==2 else d03_s[j]))"
+                                         if op.side else 
+                                         "        g3v = d30_q[j] if (a+b)==0 else (d21_q[j] if (a+b)==1 else (d12_q[j] if (a+b)==2 else d03_q[j]))"),
                                         "        for holder in (0,1,2):",
                                         "            hb = [a,b,0][holder]  # dummy pick; indices only drive ones count",
                                         "            Hb = Hx if hb==0 else Hy",
@@ -1104,7 +1239,9 @@ class NumbaCodeGen:
                                         "    # g2 · (A2·A2) + g2 · A3",
                                         "    for a in (0,1):",
                                         "      for b in (0,1):",
-                                        "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])",
+                                        ("        g2v = d20_s[j] if (a==0 and b==0) else (d11_s[j] if a!=b else d02_s[j])"
+                                         if op.side else
+                                         "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])"),
                                         "        Ha = Hx if a==0 else Hy; Hb = Hx if b==0 else Hy",
                                         "        s += g2v * ( Ha[axes[0],axes[1]]*Hb[axes[2],axes[3]] + Ha[axes[0],axes[2]]*Hb[axes[1],axes[3]] + Ha[axes[0],axes[3]]*Hb[axes[1],axes[2]] )",
                                         "        Tb = Tx0 if b==0 else Tx1; Ta = Tx0 if a==0 else Tx1",
@@ -1112,14 +1249,17 @@ class NumbaCodeGen:
                                         "            rest = [axes[i] for i in range(4) if i != p]",
                                         f"            s += g2v * ( {A_loc}[a,axes[p]] * Tb[rest[0],rest[1],rest[2]] + {A_loc}[b,axes[p]] * Ta[rest[0],rest[1],rest[2]] )",
                                         "    # g1 · A4",
-                                        "    s += d10_q[j]*Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_q[j]*Qx1[axes[0],axes[1],axes[2],axes[3]]",
+                                        ("    s += d10_s[j]*Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_s[j]*Qx1[axes[0],axes[1],axes[2],axes[3]]"
+                                         if op.side else
+                                         "    s += d10_q[j]*Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_q[j]*Qx1[axes[0],axes[1],axes[2],axes[3]]"),
                                         f"    {row}[j] = s",
                                     ]
 
                                 # collapse with coefficients; pad to union if sided
                                 rv = new_var("rv")
                                 if op.side:
-                                    map_arr = "pos_map" if op.side == "+" else "neg_map"
+                                    side_tag = self._component_side_tag(op.side, op.field_sides, fn, 0)
+                                    map_arr = f"{side_tag}_map_{fn}"
                                     required_args.add(map_arr)
                                     pad = new_var("pad"); mep = new_var("mapp")
                                     body_lines += [
@@ -1155,7 +1295,8 @@ class NumbaCodeGen:
                             is_vector   = op.is_vector,
                             field_names = field_names,
                             parent_name = coeff_sym,
-                            side        = op.side
+                            side        = op.side,
+                            field_sides = op.field_sides or []
                         )
                     )
 
@@ -1217,7 +1358,8 @@ class NumbaCodeGen:
                                             is_gradient=False,
                                             field_names=[],
                                             parent_name=a.parent_name,
-                                            side=a.side))
+                                            side=a.side,
+                                            field_sides=a.field_sides or []))
 
                 # --- Case 2: Trace of a Test/Trial function tensor (e.g., shape (2, n, 2)) ---
                 elif len(a.shape) == 3:
@@ -1245,8 +1387,9 @@ class NumbaCodeGen:
                                             is_gradient=False,
                                             field_names=a.field_names,
                                             parent_name=a.parent_name,
-                                            side=a.side))
-                
+                                            side=a.side,
+                                            field_sides=a.field_sides or []))
+
                 # --- Else: The shape is not a 2D or 3D tensor, so it's invalid. ---
                 else:
                     raise TypeError(f"Cannot take trace of an operand with shape {a.shape}. Must be a 2D or 3D tensor.")
@@ -1278,11 +1421,15 @@ class NumbaCodeGen:
 
                     phys = []
                     for i in range(len(a.field_names)):
-                        pg_loc = new_var("grad_loc")           # (n_loc,2) in element coords
+                        pg_loc = new_var("grad_loc")
                         body_lines.append(f"{pg_loc} = {grad_tab_names[i]}[e, q] @ {jinv_q}.copy()")
-
-                        if a.side:  # ghost facet → pad to (n_union,2)
-                            map_arr = "pos_map" if a.side == "+" else "neg_map"
+                        if a.side:
+                            s0 = self.me.slice(a.field_names[i]).start; s1 = self.me.slice(a.field_names[i]).stop
+                            pg_loc_s = new_var("grad_loc_s")
+                            body_lines.append(f"{pg_loc_s} = {pg_loc}[{s0}:{s1}, :]")
+                             
+                            fld_i = a.field_names[i]
+                            map_arr = f"{'pos' if a.side == '+' else 'neg'}_map_{a.field_names[i]}"
                             required_args.add(map_arr)
                             map_e  = new_var(f"{map_arr}_e")
                             pg_pad = new_var("grad_pad")
@@ -1290,10 +1437,10 @@ class NumbaCodeGen:
                                 f"{map_e} = {map_arr}[e]",
                                 f"n_union = gdofs_map[e].shape[0]",
                                 f"{pg_pad} = np.zeros((n_union, {self.spatial_dim}), dtype={self.dtype})",
-                                f"for j in range({pg_loc}.shape[0]):",
+                                f"for j in range({pg_loc_s}.shape[0]):",
                                 f"    idx = {map_e}[j]",
                                 f"    if 0 <= idx < n_union:",
-                                f"        {pg_pad}[idx] = {pg_loc}[j]",
+                                f"        {pg_pad}[idx] = {pg_loc_s}[j]",
                             ]
                             phys.append(pg_pad)
                         else:
@@ -1322,9 +1469,11 @@ class NumbaCodeGen:
 
                     comps = []
                     for i, fld in enumerate(a.field_names):
+                        
                         val = new_var("grad_val")
 
                         if a.side in {"+", "-"}:
+                            s0 = self.me.component_dof_slices[fld].start; s1 = self.me.component_dof_slices[fld].stop
                             # -------- GHOST FACET (side-restricted) -----------------------
                             # per-edge, per-side reference derivative tables (length = n_loc)
                             suff = "pos" if a.side == "+" else "neg"
@@ -1333,7 +1482,7 @@ class NumbaCodeGen:
                             required_args.update({d10, d01})
 
                             # side map: union → this side's local dofs (length n_loc)
-                            map_sym = "pos_map" if a.side == "+" else "neg_map"
+                            map_sym = f"{'pos' if a.side == '+' else 'neg'}_map_{fld}"
                             required_args.add(map_sym)
 
                             # per-edge coeff alias: if alias already exists, use it; else slice once
@@ -1341,6 +1490,7 @@ class NumbaCodeGen:
 
                             g2   = new_var("g_ref2")   # (n_loc, 2) in (ξ,η)
                             phys = new_var("g_phys2")  # (n_loc, 2) in (x,y)
+                            phys_s = new_var("g_phys2_s")
                             u_sl = new_var("u_side")   # (n_loc,)
 
                             body_lines += [
@@ -1348,8 +1498,12 @@ class NumbaCodeGen:
                                 f"d01_q = {d01}[e, q]",                      # (n_loc,)
                                 f"{g2}  = np.stack((d10_q, d01_q), axis=1)", # (n_loc,2)
                                 f"{phys}= {g2} @ {jinv_q}.copy()",           # J^{-1} on the correct side
-                                f"{u_sl} = {coeff_e}[{map_sym}[e]]",         # slice union coeff -> local (n_loc,)
-                                f"{val} = {phys}.T.copy() @ {u_sl}",         # (2,)
+                                # slice to field rows
+                                f"{phys_s} = {phys}[{s0}:{s1}, :]",
+                                # slice union coeff -> local (n_loc,) using per-component side map
+                                f"side_tag = '{self._component_side_tag(a.side, a.field_sides, fld, i)}'",
+                                f"{u_sl} = {coeff_e}[{map_sym.replace(('pos' if a.side=='+' else 'neg'), self._component_side_tag(a.side, a.field_sides, fld, i))}[e]]",        
+                                f"{val} = {phys_s}.T.copy() @ {u_sl}",         # (2,)
                             ]
 
                         else:
@@ -1359,11 +1513,11 @@ class NumbaCodeGen:
 
                             # SAFE per-element coeff alias: never double-index
                             coeff_e = coeff if coeff.endswith("_e") else f"{coeff}"
+                            pg = new_var("phys_grad_basis")
 
-                            pg = new_var("phys_grad_basis")  # (n_loc, 2)
                             body_lines += [
-                                f"{pg}  = {gnm}[e, q] @ {jinv_q}.copy()",   # (n_loc,2)
-                                f"{val} = {pg}.T.copy() @ {coeff_e}",       # (2,)  ✅ NO extra [e]
+                                f"{pg}  = {gnm}[e, q] @ {jinv_q}.copy()",
+                                f"{val} = {pg}.T.copy() @ {coeff_e}",
                             ]
 
                         comps.append(val)
@@ -1378,7 +1532,8 @@ class NumbaCodeGen:
                     stack.append(
                         StackItem(var_name=var, role="value", shape=shape,
                                 is_gradient=is_gradient, is_vector=is_vector,
-                                field_names=a.field_names, parent_name=coeff, side=a.side)
+                                field_names=a.field_names, parent_name=coeff, side=a.side,
+                                field_sides=a.field_sides or [])
                     )
                     continue
 
@@ -1424,7 +1579,8 @@ class NumbaCodeGen:
                             field_names=a.field_names,
                             parent_name=a.parent_name,
                             side=a.side,
-                            is_gradient=False
+                            is_gradient=False,
+                            field_sides=a.field_sides or []
                         )
                     )
 
@@ -1443,7 +1599,7 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=div_var, role='value',
                                             shape=(), is_vector=False, is_gradient=False,
                                             field_names=a.field_names, parent_name=a.parent_name,
-                                            side=a.side))
+                                            side=a.side, field_sides=a.field_sides or []))
                     else:                          # tensor field → vector (k,)
                         body_lines.append("# Div(tensor value) → vector")
                         body_lines.append(f"{div_var} = np.zeros(({k_comp},), dtype={self.dtype})")
@@ -1455,7 +1611,7 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=div_var, role='value',
                                             shape=(k_comp,), is_vector=True, is_gradient=False,
                                             field_names=a.field_names, parent_name=a.parent_name,
-                                            side=a.side))
+                                            side=a.side, field_sides=a.field_sides or []))
 
                 # ---------------------------------------------------------------
                 # 3)  Anything else is not defined
@@ -1536,11 +1692,12 @@ class NumbaCodeGen:
                         body_lines.append(f"# Inner(Vector, Vector): dot product, LHS mass matrix")
                         body_lines.append(f"{res_var} = {test_var}.T @ {trial_var}")
 
-                    field_names,parent_name ,side = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
+                    field_names,parent_name ,side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
                     shape = (test_item.shape[1], trial_item.shape[1])  # (n_test, n_trial)
                     stack.append(StackItem(var_name=res_var, role='value',
                                         shape=shape, is_vector=False, is_gradient=False,
-                                        field_names=field_names, parent_name=parent_name, side=side))
+                                        field_names=field_names, parent_name=parent_name, side=side,
+                                        field_sides=field_sides or []))
                     continue
 
 
@@ -1615,10 +1772,11 @@ class NumbaCodeGen:
                             f"shapes: {a.shape}/{b.shape}, is_hessian: {a.is_hessian}/{b.is_hessian}"
                         )
                     # Push RHS vector (n,) with resolved metadata (prefer test’s side)
-                    field_names, parent_name, side = StackItem.resolve_metadata(a, b, prefer=b, strict=False)
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=b, strict=False)
                     stack.append(StackItem(var_name=res_var, role='value',
                                            shape=(b.shape[1],), is_vector=False, is_gradient=False,
-                                           field_names=field_names, parent_name=parent_name, side=side))
+                                           field_names=field_names, parent_name=parent_name, side=side,
+                                           field_sides=field_sides))
                     continue
 
                         
@@ -1667,10 +1825,11 @@ class NumbaCodeGen:
                             f"b(v/g/h)={b.is_vector}/{b.is_gradient}/{b.is_hessian}"
                         )
 
-                    field_names, parent_name, side = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
                     stack.append(StackItem(var_name=res_var, role='value',
                                            shape=shape, is_vector=False, is_gradient=False,
-                                           field_names=field_names, parent_name=parent_name, side=side))
+                                           field_names=field_names, parent_name=parent_name, side=side,
+                                           field_sides=field_sides))
                     continue
                         
                 
@@ -1711,7 +1870,8 @@ class NumbaCodeGen:
                         # f"assert {res_var}.shape == (2, 22), f'result shape mismatch {res_var}.shape with {{(n_vec_comps, n_locs)}}'"
                     ]
                     stack.append(StackItem(var_name=res_var, role='trial', shape=(a.shape[0], a.shape[1]), 
-                                           is_vector=True, is_gradient=False, field_names=a.field_names, parent_name=a.parent_name, side =a.side))
+                                           is_vector=True, is_gradient=False, field_names=a.field_names, parent_name=a.parent_name, side =a.side,
+                                           field_sides=a.field_sides or []))
                
                 # Final advection term: dot(advection_vector_trial, v_test)
                 elif (a.role == 'trial' and (not a.is_gradient and not a.is_hessian) and b.role == 'test' and (not b.is_gradient and not b.is_hessian) ):
@@ -1719,23 +1879,23 @@ class NumbaCodeGen:
                     #  body_lines.append(f"assert ({a.var_name}.shape == (2,22) and {b.var_name}.shape == (2,22)), 'Trial and Test to have the same shape'")
                     body_lines.append(f"{res_var} = {b.var_name}.T.copy() @ {a.var_name}")
                     # collapsing all
-                    field_names, parent_name, side = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
                     stack.append(StackItem(var_name=res_var, 
                                             role='value', 
                                             shape=(b.shape[1],a.shape[1]), 
                                             is_vector=False, field_names=field_names, 
-                                            parent_name=parent_name, side=side))
+                                            parent_name=parent_name, side=side, field_sides=field_sides))
                 elif (a.role == 'test' and (not a.is_gradient and not a.is_hessian) and b.role == 'trial' and (not b.is_gradient and not b.is_hessian) ):
                     body_lines.append(f"# Mass: dot(Test, Trial)")
                     # body_lines.append(f"assert ({a.var_name}.shape == (2,22) and {b.var_name}.shape == (2,22)), 'Trial and Test to have the same shape'")
                     body_lines.append(f"{res_var} = {a.var_name}.T.copy() @ {b.var_name}")
                     # Collapsing all
-                    field_names, parent_name, side = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
                     stack.append(StackItem(var_name=res_var, 
                                             role='value', 
                                             shape=(a.shape[1],b.shape[1]), 
                                             is_vector=False, field_names=field_names, 
-                                            parent_name=parent_name, side=side))
+                                            parent_name=parent_name, side=side, field_sides=field_sides))
 
                 # ---------------------------------------------------------------------
                 # dot( grad(u_test) ,  const_vec )  ← symmetric term -> Test vec
@@ -1761,7 +1921,7 @@ class NumbaCodeGen:
                                             shape=(a.shape[0], a.shape[1]), is_vector=is_vector,
                                             is_gradient=False, field_names=a.field_names,
                                             parent_name=a.parent_name,
-                                            side=a.side))
+                                            side=a.side, field_sides=a.field_sides))
 
                 # ---------------------------------------------------------------------
                 # dot( grad(u_trial) ,  beta )  ← convection term (Function gradient · Trial)
@@ -1785,7 +1945,7 @@ class NumbaCodeGen:
                                             shape=(a.shape[0], a.shape[1]), is_vector=is_vector,
                                             is_gradient=False, field_names=a.field_names,
                                             parent_name=a.parent_name,
-                                            side=a.side))
+                                            side=a.side, field_sides=a.field_sides))
                 # ---------------------------------------------------------------------
                 # dot( beta, grad(u_trial)  )  ← beta_i * B_{inj} → 
                 # ---------------------------------------------------------------------
@@ -1806,7 +1966,8 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=res_var, role='trial',
                                             shape=(k_comps, n_locs), is_vector=False,
                                             is_gradient=False, field_names=b.field_names,
-                                            parent_name=b.parent_name, side=b.side))
+                                            parent_name=b.parent_name, side=b.side,
+                                            field_sides=b.field_sides))
                     else:
                         body_lines.append("# Advection: dot(constant beta vector, grad(Trial))")
                         body_lines += [
@@ -1822,9 +1983,9 @@ class NumbaCodeGen:
                                             shape=(k_comps, n_locs), is_vector=True,
                                             is_gradient=False, field_names=b.field_names,
                                             parent_name=b.parent_name,
-                                            side=b.side))
-                
-                
+                                            side=b.side, field_sides=b.field_sides))
+
+
                 # ---------------------------------------------------------------------
                 # dot( grad(u_k) ,  u_trial )  ← convection term (Function gradient · Trial)
                 # ---------------------------------------------------------------------
@@ -1838,7 +1999,7 @@ class NumbaCodeGen:
                                         shape=(b.shape[0], b.shape[1]), is_vector=True,
                                         is_gradient=False, field_names=b.field_names,
                                         parent_name=b.parent_name,
-                                        side=b.side))
+                                        side=b.side, field_sides=b.field_sides))
 
                 # ---------------------------------------------------------------------
                 # dot( u_trial ,  grad(u_k) )   ← swap of the previous
@@ -1852,7 +2013,7 @@ class NumbaCodeGen:
                                         shape=(b.shape[1], a.shape[1]), is_vector=True,
                                         is_gradient=False, field_names=a.field_names,
                                         parent_name=a.parent_name,
-                                        side=a.side))
+                                        side=a.side, field_sides=a.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot( u_k ,  u_k )             ← |u_k|², scalar
@@ -1863,7 +2024,7 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=res_var, role='value',
                                         shape=(), is_vector=False, side = a.side,
                                         is_gradient=False, field_names=a.field_names,
-                                        parent_name=a.parent_name))
+                                        parent_name=a.parent_name, field_sides=a.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot( u_k ,  grad(u_trial) )   ← usually zero for skew-symm forms
@@ -1891,7 +2052,8 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=res_var, role=role_b,
                                         shape=(k_comps, n_locs), is_vector=is_vector,
                                         is_gradient=False, field_names=b.field_names,
-                                        parent_name=b.parent_name, side=b.side))
+                                        parent_name=b.parent_name, side=b.side,
+                                        field_sides=b.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot( u_test ,  u_trial )      ← mass-matrix block
@@ -1900,10 +2062,11 @@ class NumbaCodeGen:
                     body_lines.append("# Mass: dot(Test, Trial)")
                     body_lines.append(f"{res_var} = {a.var_name}.T.copy() @ {b.var_name}")
                     # collapsing all
-                    field_names, parent_name, side = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
                     stack.append(StackItem(var_name=res_var, role='value',
                                         shape=(a.shape[1],b.shape[1]), is_vector=False,
-                                        field_names=field_names, parent_name=parent_name, side=side))
+                                        field_names=field_names, parent_name=parent_name, side=side,
+                                        field_sides=field_sides or []))
 
                 # ---------------------new block--------------------------------
                 # ---------------------------------------------------------------------
@@ -1932,7 +2095,7 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=res_var, role='trial',
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=a.field_names, parent_name=a.parent_name,
-                                        side=a.side))
+                                        side=a.side, field_sides=field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot(grad(Function), grad(Trial)) and its transposed variants.
@@ -1959,7 +2122,7 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=res_var, role='trial',
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=b.field_names, parent_name=b.parent_name,
-                                        side=b.side))
+                                        side=b.side, field_sides=b.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot(grad(Function), grad(Function)) and its transposed variants.
@@ -1975,7 +2138,7 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=res_var, role='value',
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=b.field_names, parent_name=b.parent_name,
-                                        side=b.side))
+                                        side=b.side, field_sides=b.field_sides or []))
 
                 # ---------------------new block--------------------------------
                 # ---------------------------------------------------------------------
@@ -1991,7 +2154,7 @@ class NumbaCodeGen:
                                         is_hessian=b.is_hessian, 
                                         field_names=b.field_names,
                                         parent_name=b.parent_name,
-                                        side=b.side))
+                                        side=b.side, field_sides=b.field_sides or []))
                 # ---------------------------------------------------------------------
                 # dot( u_trial;u_test;u_k, scalar )     ← e.g. scalar constant time Function
                 # ---------------------------------------------------------------------
@@ -2005,8 +2168,8 @@ class NumbaCodeGen:
                                         is_hessian=a.is_hessian, 
                                         field_names=a.field_names,
                                         parent_name=a.parent_name,
-                                        side=a.side))
-                
+                                        side=a.side, field_sides=a.field_sides or []))
+
                 # ---------------------------------------------------------------------
                 # dot( u_k ,  grad(u_k) )     ← e.g. rhs advection term
                 # ---------------------------------------------------------------------
@@ -2019,7 +2182,7 @@ class NumbaCodeGen:
                                         shape=( b.shape[1],), is_vector=True,
                                         is_gradient=False, field_names=b.field_names,
                                         parent_name=b.parent_name,
-                                        side=b.side))
+                                        side=b.side, field_sides=b.field_sides or []))
                 # ---------------------------------------------------------------------
                 # dot( grad(u_k) ,  u_k )     ← e.g. rhs advection term  -> (k,d).(k) -> k
                 # ---------------------------------------------------------------------
@@ -2032,7 +2195,7 @@ class NumbaCodeGen:
                                         shape=(a.shape[0], ), is_vector=True,
                                         is_gradient=False, field_names=a.field_names,
                                         parent_name=a.parent_name,
-                                        side=a.side))
+                                        side=a.side, field_sides=a.field_sides or []))
                 # ---------------------------------------------------------------------
                 # dot( np.array ,  u_test )     ← e.g. body-force · test -> (n,)
                 # ---------------------------------------------------------------------
@@ -2054,7 +2217,7 @@ class NumbaCodeGen:
                                         shape=(b.shape[1],), is_vector=False,
                                         is_gradient=False, field_names=b.field_names,
                                         parent_name=b.parent_name,
-                                        side=b.side))
+                                        side=b.side, field_sides=b.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot( u_k ,  u_test )          ← load-vector term -> (n,)
@@ -2075,7 +2238,7 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=res_var, role=role,
                                         shape=shape, is_vector=False,is_gradient=False,
                                         field_names=b.field_names, parent_name=b.parent_name,
-                                        side=b.side))
+                                        side=b.side, field_sides=b.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot( u_test ,  u_k )          ← load-vector term -> (n,)
@@ -2096,7 +2259,7 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=res_var, role=role,
                                         shape=shape, is_vector=False,is_gradient=False,
                                         field_names=a.field_names, parent_name=a.parent_name,
-                                        side=a.side))
+                                        side=a.side, field_sides=a.field_sides or []))
                 # ---------------------------------------------------------------------
                 # dot( u_test ,  const_vec )          ← load-vector term -> (n,)
                 # ---------------------------------------------------------------------
@@ -2111,7 +2274,7 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=shape, is_vector=False,is_gradient=False,
                                             field_names=a.field_names, parent_name=a.parent_name,
-                                            side=a.side))
+                                            side=a.side, field_sides=a.field_sides or []))
                     elif self.form_rank == 1:
                         body_lines.append("# RHS: dot(Test, Const)")
                         body_lines.append(f"{res_var} = {a.var_name}.T.copy() @ {b.var_name}")
@@ -2120,7 +2283,7 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=shape, is_vector=False,is_gradient=False,
                                             field_names=a.field_names, parent_name=a.parent_name,
-                                            side=a.side))
+                                            side=a.side, field_sides=a.field_sides or []))
                 # ---------------------------------------------------------------------
                 # dot( u_trial ,  const_vec )          ← load-vector term -> (1,n)
                 # ---------------------------------------------------------------------
@@ -2134,7 +2297,7 @@ class NumbaCodeGen:
                    stack.append(StackItem(var_name=res_var, role=role,
                                         shape=shape, is_vector=False,is_gradient=False,
                                         field_names=a.field_names, parent_name=a.parent_name,
-                                        side=a.side))
+                                        side=a.side, field_sides=a.field_sides or []))
 
 
                 # ---------------------------------------------------------------------
@@ -2162,7 +2325,7 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=res_var, role=a.role,
                                             shape=(k_comps, -1, a.shape[2]),  # (k, n, d1)
                                             is_vector=False, is_gradient=True, is_hessian=False,
-                                            field_names=a.field_names, parent_name=a.parent_name, side=a.side))
+                                            field_names=a.field_names, parent_name=a.parent_name, side=a.side, field_sides=a.field_sides or []))
                     else:
                         body_lines.append("# Dot: Hessian(value) · const spatial vec -> (k, d1)")
                         body_lines += [
@@ -2178,7 +2341,7 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=res_var, role=a.role,
                                             shape=(k_comps, a.shape[1]),      # (k, d1)
                                             is_vector=False, is_gradient=True, is_hessian=False,
-                                            field_names=a.field_names, parent_name=a.parent_name, side=a.side))
+                                            field_names=a.field_names, parent_name=a.parent_name, side=a.side, field_sides=a.field_sides or []))
 
 
                 elif b.is_hessian and a.role in {'const','value'} and a.is_vector:
@@ -2208,7 +2371,8 @@ class NumbaCodeGen:
                             stack.append(StackItem(var_name=res_var, role=b.role,
                                                 shape=(d1, -1, d2),
                                                 is_vector=False, is_gradient=True, is_hessian=False,
-                                                field_names=b.field_names, parent_name=b.parent_name, side=b.side))
+                                                field_names=b.field_names, parent_name=b.parent_name, side=b.side,
+                                                field_sides=b.field_sides or []))
                         elif vlen == d1 and k_comps == 1:
                             # spatial-vector · Hessian(basis) for scalar field -> (k, n, d2) == (1, n, d2)
                             body_lines.append("# Dot: spatial vec · Hessian(basis, k=1)  (contract over d1) -> (1, n, d2)")
@@ -2224,12 +2388,14 @@ class NumbaCodeGen:
                             stack.append(StackItem(var_name=res_var, role=b.role,
                                                 shape=(1, -1, d2),
                                                 is_vector=False, is_gradient=True, is_hessian=False,
-                                                field_names=b.field_names, parent_name=b.parent_name, side=b.side))
+                                                field_names=b.field_names, parent_name=b.parent_name, side=b.side,
+                                                field_sides=b.field_sides or []))
                         else:
                             body_lines.append(f"raise ValueError('vector·Hessian: ambiguous left vector length: vlen={{ {a.var_name}.shape[0] }}; expected {k_comps} (component) or {d1} (spatial with k=1)')")
                             stack.append(StackItem(var_name="__invalid__", role=b.role,
                                                 shape=(0,), is_vector=False, is_gradient=False,
-                                                field_names=[], parent_name=b.parent_name, side=b.side))
+                                                field_names=[], parent_name=b.parent_name, side=b.side,
+                                                field_sides=b.field_sides or []))
                     else:
                         # value case: b -> (k, d1, d2)
                         k_comps = b.shape[0]
@@ -2251,7 +2417,8 @@ class NumbaCodeGen:
                             stack.append(StackItem(var_name=res_var, role=b.role,
                                                 shape=(d1, d2),
                                                 is_vector=False, is_gradient=True, is_hessian=False,
-                                                field_names=b.field_names, parent_name=b.parent_name, side=b.side))
+                                                field_names=b.field_names, parent_name=b.parent_name, side=b.side,
+                                                field_sides=b.field_sides or []))
                         elif vlen == d1 and k_comps == 1:
                             # spatial-vector · Hessian(value, k=1) -> (1, d2)
                             body_lines.append("# Dot: spatial vec · Hessian(value, k=1) (contract over d1) -> (1, d2)")
@@ -2267,12 +2434,14 @@ class NumbaCodeGen:
                             stack.append(StackItem(var_name=res_var, role=b.role,
                                                 shape=(1, d2),
                                                 is_vector=False, is_gradient=True, is_hessian=False,
-                                                field_names=b.field_names, parent_name=b.parent_name, side=b.side))
+                                                field_names=b.field_names, parent_name=b.parent_name, side=b.side,
+                                                field_sides=b.field_sides or []))
                         else:
                             body_lines.append(f"raise ValueError('vector·Hessian(value): ambiguous left vector length')")
                             stack.append(StackItem(var_name="__invalid__", role=b.role,
                                                 shape=(0,), is_vector=False, is_gradient=False,
-                                                field_names=b.field_names, parent_name=b.parent_name, side=b.side))
+                                                field_names=b.field_names, parent_name=b.parent_name, side=b.side,
+                                                field_sides=b.field_sides or []))
 
 
                 
@@ -2319,15 +2488,13 @@ class NumbaCodeGen:
                         body_lines.append(f"{res_var} = np.dot({a.var_name}, {b.var_name})")
                         shape = ()
                         is_vector = False; is_grad = False
-                    parent_name = a.parent_name if a.parent_name else b.parent_name
-                    field_names = a.field_names if a.field_names else b.field_names
-                    side = a.side if a.side else b.side
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
                     stack.append(StackItem(var_name=res_var, role='const',
                                         shape=shape, is_vector=is_vector, 
                                         is_gradient=is_grad,
                                         field_names=field_names,
-                                        parent_name=parent_name, side=side))
-                
+                                        parent_name=parent_name, side=side,
+                                        field_sides=field_sides))
                 else:
                     raise NotImplementedError(f"Dot not implemented for roles {a.role}/{b.role} with shapes {a.shape}/{b.shape}"
                                               f" with vectoors {a.is_vector}/{b.is_vector}"
@@ -2426,11 +2593,10 @@ class NumbaCodeGen:
                             # both are vectors/tensors, but not scalars
                             raise ValueError(f"Cannot multiply two non-scalar values: {a.var_name} (shape: {a.shape}) and {b.var_name} (shape: {b.shape})")
 
-                        field_names = a.field_names if a.field_names else b.field_names
-                        parent_name = a.parent_name if a.parent_name else b.parent_name
-                        side = a.side if a.side else b.side
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer="a", strict=False)
                         stack.append(StackItem(var_name=res_var, role='const', shape=shape, is_vector=False, 
-                                               field_names=field_names, parent_name=parent_name, side=side))
+                                               field_names=field_names, parent_name=parent_name, side=side,
+                                               field_sides=field_sides))
 
                     # -----------------------------------------------------------------
                     # 01. Vector, Tensor:   scalar   *  Vector/Tensor    →  Vector/Tensor 
@@ -2478,10 +2644,11 @@ class NumbaCodeGen:
                             f"{res_var} = {test_var.var_name}.T.copy() @ {trial_var.var_name}",  # (n_loc, n_loc)
                         ]
                         # collapse all
-                        field_names, parent_name, side = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
                         stack.append(StackItem(var_name=res_var, role='value',
                                             shape=(n_locs,n_locs), is_vector=False,
-                                            field_names=field_names, parent_name=parent_name, side=side))
+                                            field_names=field_names, parent_name=parent_name, side=side,
+                                            field_sides=field_sides))
                     # -----------------------------------------------------------------
                     # 2. LHS block:   scalar trial/test  *  vector   →  vector trial/test
                     # -----------------------------------------------------------------
@@ -2497,7 +2664,7 @@ class NumbaCodeGen:
 
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=(b.shape[0],a.shape[1]), is_vector=True, field_names=a.field_names,
-                                            parent_name=a.parent_name, side=a.side))
+                                            parent_name=a.parent_name, side=a.side, field_sides=a.field_sides))
                     elif (b.role in {"trial", "test"} and not b.is_vector and not b.is_gradient and not b.is_hessian and b.shape[0] == 1
                           and a.role in {"value", "const"} and a.is_vector):
                         role = 'trial' if b.role == 'trial' else 'test'
@@ -2509,7 +2676,7 @@ class NumbaCodeGen:
                         ]
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=(a.shape[0],b.shape[1]), is_vector=True, field_names=b.field_names,
-                                            parent_name=b.parent_name, side=b.side))
+                                            parent_name=b.parent_name, side=b.side, field_sides=b.field_sides))
                     # -----------------------------------------------------------------
                     # 3. LHS block:   scalar trial/test  *  Identity   →  grad structure trial/test ex p * Id
                     # -----------------------------------------------------------------
@@ -2526,7 +2693,7 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=(b.shape[0], a.shape[1], b.shape[2]), is_vector=False,
                                             is_gradient=True, is_hessian=False, field_names=a.field_names,
-                                            parent_name=a.parent_name, side=a.side))
+                                            parent_name=a.parent_name, side=a.side, field_sides=a.field_sides))
                     elif (b.role in {"trial", "test"} and not b.is_vector and not b.is_gradient and not b.is_hessian and b.shape[0] == 1
                           and a.role == "const" and a.is_gradient):
                         role = 'trial' if b.role == 'trial' else 'test'
@@ -2540,7 +2707,7 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=(a.shape[0], b.shape[1], a.shape[2]), is_vector=False,
                                             is_gradient=True, is_hessian=False, field_names=b.field_names,
-                                            parent_name=b.parent_name, side=b.side))
+                                            parent_name=b.parent_name, side=b.side, field_sides=b.field_sides))
 
                     # -----------------------------------------------------------------
                     # 1. RHS load:   scalar / vector Function  *  scalar Test
@@ -2554,10 +2721,11 @@ class NumbaCodeGen:
                         body_lines.append("# Load: scalar Function × scalar Test → (n_loc,)")
 
                         body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}")   # (n_loc,)
-                        field_names, parent_name, side = StackItem.resolve_metadata(a, b, prefer=b, strict=False)
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=b, strict=False)
                         stack.append(StackItem(var_name=res_var, role='value',
                                             shape=(b.shape[1],), is_vector=False,
-                                            field_names=field_names, parent_name=parent_name, side=side))
+                                            field_names=field_names, parent_name=parent_name, side=side,
+                                            field_sides=field_sides))
 
                     # symmetric orientation
                     elif (a.role == "test" and not a.is_vector
@@ -2565,10 +2733,11 @@ class NumbaCodeGen:
                         body_lines.append("# Load: scalar Test × scalar Function → (n_loc,)")
 
                         body_lines.append(f"{res_var} = {b.var_name} * {a.var_name}")   # (n_loc,)
-                        field_names, parent_name, side = StackItem.resolve_metadata(a, b, prefer=a, strict=False)
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=a, strict=False)
                         stack.append(StackItem(var_name=res_var, role='value',
                                             shape=(a.shape[1],), is_vector=False,
-                                            field_names=field_names, parent_name=parent_name, side=side))
+                                            field_names=field_names, parent_name=parent_name, side=side,
+                                            field_sides=field_sides))
                     # -----------------------------------------------------------------
                     # 4. Anything else is ***not implemented yet*** – fail fast
                     # -----------------------------------------------------------------
@@ -2649,7 +2818,8 @@ class NumbaCodeGen:
                             is_hessian  = non_scal.is_hessian,
                             parent_name = non_scal.parent_name,
                             field_names = non_scal.field_names,
-                            side = non_scal.side
+                            side = non_scal.side,
+                            field_sides = non_scal.field_sides
                         ))
 
                     # ----------------------------------------------------------------------
@@ -2678,7 +2848,9 @@ class NumbaCodeGen:
                             field_names = (a.field_names if a.role in ('trial', 'test')
                                         else b.field_names),
                             side = (a.side if a.role in ('trial', 'test')
-                                    else b.side)
+                                    else b.side),
+                            field_sides = (a.field_sides if a.role in ('trial', 'test')
+                                    else b.field_sides)
                         ))
 
 
@@ -2709,7 +2881,8 @@ class NumbaCodeGen:
                                             is_gradient=a.is_gradient, is_hessian=a.is_hessian,
                                             field_names=a.field_names,
                                             parent_name=a.parent_name,
-                                            side=a.side))
+                                            side=a.side,
+                                            field_sides=a.field_sides or []))
                     elif (a.role == 'const' or a.role == 'value') and not a.is_vector and a.shape == ():
                         body_lines.append(f"{res_var} = float({a.var_name}) / {b.var_name}")
                         stack.append(StackItem(var_name=res_var, role=b.role,
@@ -2717,7 +2890,8 @@ class NumbaCodeGen:
                                             is_gradient=b.is_gradient, is_hessian=b.is_hessian,
                                             field_names=b.field_names,
                                             parent_name=b.parent_name,
-                                            side=b.side))
+                                            side=b.side,
+                                            field_sides=b.field_sides or []))
                     else:
                         raise NotImplementedError(
                             f"Division not implemented for roles {a.role}/{b.role} "
@@ -2735,7 +2909,8 @@ class NumbaCodeGen:
                                             is_gradient=a.is_gradient, is_hessian=a.is_hessian,
                                             field_names=a.field_names,
                                             parent_name=a.parent_name,
-                                            side=a.side)
+                                            side=a.side,
+                                            field_sides=a.field_sides or [])
                     )
                     elif (a.role == 'const' or a.role == 'value') and not a.is_vector and a.shape == ():
                         body_lines.append(f"{res_var} = float({a.var_name}) ** {b.var_name}")
@@ -2744,7 +2919,8 @@ class NumbaCodeGen:
                                             is_gradient=b.is_gradient, is_hessian=b.is_hessian,
                                             field_names=b.field_names,
                                             parent_name=b.parent_name,
-                                            side=b.side)
+                                            side=b.side,
+                                            field_sides=b.field_sides or [])
                     )
                     else:
                         raise NotImplementedError(

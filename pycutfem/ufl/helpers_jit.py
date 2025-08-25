@@ -60,6 +60,13 @@ def _find_all_bitsets(expr):
 
     return list(bitsets)
 
+# Helper: select the first present (non-None) value by key, without triggering
+def _first_present(d: dict, *keys):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
 
 def _build_jit_kernel_args(       # ← signature unchanged
     ir,                           # linear IR produced by the visitor
@@ -271,6 +278,73 @@ def _build_jit_kernel_args(       # ← signature unchanged
             _k = f"{_side}_{_t}"
             if (_k in needed) and (_k not in args) and (_t in pre_built):
                 args[_k] = pre_built[_t]
+    
+    # ------------------------------------------------------------------
+    # 3b. Build per-field side maps *exactly* as requested by the kernel.
+    #     Requested names are of the form:  (pos|neg)_map_<fld>
+    #     where <fld> MUST be in dof_handler.field_names.
+    # ------------------------------------------------------------------
+    if needed:
+        _re_side_map = re.compile(r"^(pos|neg)_map_(.+)$")
+        # Which fields were requested?
+        requested_fields: Dict[str, set[str]] = {"pos": set(), "neg": set()}
+        for name in needed:
+            m = _re_side_map.match(name)
+            if not m:
+                continue
+            side, fld = m.group(1), m.group(2)
+            # Already available? skip
+            if name in args:
+                continue
+            requested_fields[side].add(fld)
+
+        # If none requested, nothing to do.
+        if requested_fields["pos"] or requested_fields["neg"]:
+            # Select gdofs_map explicitly: prefer function arg, else from args
+            gmap = gdofs_map if gdofs_map is not None else args.get("gdofs_map")
+            if gmap is None:
+                raise KeyError("_build_jit_kernel_args: gdofs_map is required to synthesize per-field side maps.")
+            gdofs = np.asarray(gmap)
+
+            # Resolve side -> element ids (interface: owner_*_id; ghost: *_eids; fallbacks)
+            pos_ids = _first_present(args, "owner_pos_id", "pos_eids", "owner_id", "eids")
+            neg_ids = _first_present(args, "owner_neg_id", "neg_eids", "owner_id", "eids")
+             
+            # Validate requested field names strictly against DofHandler
+            valid_fields = set(dof_handler.field_names)
+            for side, fld_set in requested_fields.items():
+                if not fld_set:
+                    continue
+                missing = sorted([f for f in fld_set if f not in valid_fields])
+                if missing:
+                    raise KeyError(
+                        "_build_jit_kernel_args: kernel requested side maps for unknown fields: "
+                        f"{missing}. Available fields: {sorted(valid_fields)}"
+                    )
+                side_ids = pos_ids if side == "pos" else neg_ids
+                if side_ids is None:
+                    raise KeyError(
+                        f"_build_jit_kernel_args: cannot build '{side}_map_<fld>' — "
+                        f"no side element-ids found (looked for owner_{side}_id / {side}_eids / owner_id / eids)."
+                    )
+                side_ids = np.asarray(side_ids, dtype=np.int32)
+                nE, n_union = gdofs.shape[0], gdofs.shape[1]
+
+                # Build each requested map for this side
+                for fld in sorted(fld_set):
+                    # element-local gdofs for this field on each owner element of the side
+                    loc_lists = dof_handler.element_maps[fld]
+                    # all elements share same nloc for that field
+                    nloc_f = len(loc_lists[int(side_ids[0])])
+                    m_arr = np.empty((nE, nloc_f), dtype=np.int32)
+                    for i in range(nE):
+                        eid = int(side_ids[i])
+                        union_row = gdofs[i, :n_union]
+                        # map: global dof id -> union column
+                        col_of = {int(d): j for j, d in enumerate(union_row)}
+                        local_gdofs_f = loc_lists[eid]
+                        m_arr[i, :] = [col_of[int(d)] for d in local_gdofs_f]
+                    args[f"{side}_map_{fld}"] = m_arr
 
     # ------------------------------------------------------------------
     # 4. BitSets present in the expression → full-length element masks

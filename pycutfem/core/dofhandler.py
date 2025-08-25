@@ -1138,6 +1138,7 @@ class DofHandler:
         me   = self.mixed_element
         fields  = me.field_names
         n_union = me.n_dofs_local   # union-local width per element
+        out = {}
 
         # --- normalize ids → valid cuts with exactly 2 interface points -------------
         ids = (cut_element_ids.to_indices()
@@ -1431,6 +1432,19 @@ class DofHandler:
                 arr = np.zeros((nE, nQ, n_union), dtype=float)
                 arr[:, :, sl] = loc
                 d_tabs[f"d{dx}{dy}_{fld}"] = arr
+        
+        #--- union map for each field
+        for fld in fields:
+            # number of local dofs for this field on one element
+            nloc_f = len(self.element_maps[fld][valid_cut_eids[0]])
+            m = np.empty((nE, nloc_f), dtype=np.int32)
+            for i, eid in enumerate(valid_cut_eids):
+                union = gdofs_map[i, :n_union]        # union layout for this element
+                col_of = {int(d): j for j, d in enumerate(union)}
+                local_gdofs_f = self.element_maps[fld][eid]
+                m[i, :] = [col_of[int(d)] for d in local_gdofs_f]
+            out[f"pos_map_{fld}"] = m
+            out[f"neg_map_{fld}"] = m  # same element both "sides" on interface
 
         # --- Inverse-map jets for chain rule (Hxi: 2nd, Txi: 3rd, Qxi: 4th) -------
         if need_hess or need_o3 or need_o4:
@@ -1570,6 +1584,7 @@ class DofHandler:
         fields  = me.field_names
         n_union = self.union_dofs
         n_loc   = me.n_dofs_per_elem
+        out = {}
 
         # 0) normalize ghost edge ids and set up cache key --------------------------
         if hasattr(ghost_edge_ids, "to_indices"):
@@ -1663,6 +1678,25 @@ class DofHandler:
             gdofs_map[i, :n_union] = global_dofs
             pos_map[i] = _searchsorted_positions(global_dofs, pos_dofs)
             neg_map[i] = _searchsorted_positions(global_dofs, neg_dofs)
+        
+        # 3b --- per-field, side-local -> union maps (ghost)
+        for fld in fields:
+            nloc_f = len(self.element_maps[fld][pos_ids[0]])
+            pm = np.empty((nE, nloc_f), dtype=np.int32)
+            nm = np.empty((nE, nloc_f), dtype=np.int32)
+            for i in range(nE):
+                pos_eid = int(pos_ids[i]); neg_eid = int(neg_ids[i])
+                # union for this edge
+                union = gdofs_map[i, :n_union]
+                col_of = {int(d): j for j, d in enumerate(union)}
+                # side-local gdofs for this field
+                pos_loc = self.element_maps[fld][pos_eid]
+                neg_loc = self.element_maps[fld][neg_eid]
+                pm[i, :] = [col_of[int(d)] for d in pos_loc]
+                nm[i, :] = [col_of[int(d)] for d in neg_loc]
+            out[f"pos_map_{fld}"] = pm
+            out[f"neg_map_{fld}"] = nm
+
 
         # 4) Reference coords on both sides; geometry dN; build J, detJ, J_inv -------
         xi_pos = np.empty((nE, nQ)); eta_pos = np.empty((nE, nQ))
@@ -2308,6 +2342,7 @@ class DofHandler:
                 "gdofs_map": np.empty((0, n_union), dtype=np.int64),
                 "h_arr":     np.empty((0,), dtype=float),
                 "entity_kind": "element",
+                "is_interface": False,
             }
             for f in fields:
                 out[f"b_{f}"] = np.empty((0, 0, n_union), dtype=float)
@@ -2498,6 +2533,7 @@ class DofHandler:
                 "gdofs_map": np.empty((0, n_union), dtype=np.int64),
                 "h_arr":     np.empty((0,), dtype=float),
                 "entity_kind": "element",
+                "is_interface": False,
             }
             for f in fields:
                 out[f"b_{f}"] = np.empty((0, 0, n_union), dtype=float)
@@ -2552,6 +2588,7 @@ class DofHandler:
             "h_arr":     np.asarray(h_list, dtype=float),
             "entity_kind": "element",
             "owner_id":   np.asarray(valid_eids, dtype=np.int32),
+            "is_interface": False,
         }
 
         # organize ragged per-field lists into per-element arrays

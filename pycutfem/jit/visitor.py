@@ -201,7 +201,8 @@ class IRGenerator:
             self.ir_sequence.append(
                 LoadVariable(name=name, role=role, is_vector=is_vec,
                              deriv_order=deriv_order, field_names=field_names,
-                             side=side)
+                             side=side,
+                             field_sides=getattr(operand, "field_sides", None))
             )
             return
 
@@ -211,7 +212,8 @@ class IRGenerator:
             role = 'test' if getattr(node, 'is_test', False) else 'trial' if getattr(node, 'is_trial', False) else 'function'
             field_names = getattr(node, 'field_names', None) or [getattr(node, 'field_name')]
             name = getattr(getattr(node, 'space', node), 'name', 'anon')
-            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=field_names, side=side))
+            field_sides = getattr(node, "field_sides", None)
+            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=field_names, side=side, field_sides=field_sides))
             return
             
         if isinstance(node, Constant):

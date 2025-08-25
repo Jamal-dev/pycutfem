@@ -149,7 +149,7 @@ def test_stokes_interface_corrected():
     This version is corrected to use the existing pycutfem API.
     """
     # ---------------- 1) Mesh, order, level set ----------------
-    poly_order = 3
+    poly_order = 2
     maxh = 0.125/2.0
     mesh_size = int(2.0 / maxh)
     L,H = 2.0, 2.0
@@ -255,59 +255,60 @@ def test_stokes_interface_corrected():
     a =  (2*mu[1]*inner(epsilon(vel_trial_pos), epsilon(vel_test_pos)) - div(vel_trial_pos)*q_test_pos - div(vel_test_pos)*p_trial_pos) * dx_pos
     a += (2*mu[0]*inner(epsilon(vel_trial_neg), epsilon(vel_test_neg)) - div(vel_trial_neg)*q_test_neg - div(vel_test_neg)*p_trial_neg) * dx_neg
 
-    # sig_pos_n_trial = traction(mu[1], Pos(vel_trial_pos), Pos(p_trial_pos), n)
-    # sig_neg_n_trial = traction(mu[0], Neg(vel_trial_neg), Neg(p_trial_neg), n)
-    # avg_flux_trial  = kappa_pos * sig_pos_n_trial + kappa_neg * sig_neg_n_trial
+    sig_pos_n_trial = traction(mu[1], Pos(vel_trial_pos), Pos(p_trial_pos), n)
+    sig_neg_n_trial = traction(mu[0], Neg(vel_trial_neg), Neg(p_trial_neg), n)
+    avg_flux_trial  = kappa_pos * sig_pos_n_trial + kappa_neg * sig_neg_n_trial
 
-    # sig_pos_n_test = traction(mu[1], Pos(vel_test_pos), Pos(q_test_pos), n)
-    # sig_neg_n_test = traction(mu[0], Neg(vel_test_neg), Neg(q_test_neg), n)
-    # avg_flux_test  = kappa_pos * sig_pos_n_test + kappa_neg * sig_neg_n_test
-
-    # jump_vel_trial = Jump(vel_trial_pos, vel_trial_neg)
-    # jump_vel_test  = Jump(vel_test_pos,  vel_test_neg)
-    # jump_p_trial = Jump(p_trial_pos, p_trial_neg)
-    # jump_q_test  = Jump(q_test_pos,  q_test_neg)
-    # # Interface terms
-    # a += ( dot(avg_flux_trial, jump_vel_test)
-    #       + dot(avg_flux_test,  jump_vel_trial)
-    #       + (lambda_nitsche / h) * dot(jump_vel_trial, jump_vel_test) ) * dGamma
-
-    def two_sided(expr_pos, expr_neg):
-        # zero with correct “shape/role”, so algebra still type-checks:
-        zpos = 0.0 * expr_pos
-        zneg = 0.0 * expr_neg
-        return Jump(expr_pos, zneg) - Jump(zpos, expr_neg)
-    
-    sig_pos_n_trial = traction(mu[1], vel_trial_pos, p_trial_pos, n)
-    sig_neg_n_trial = traction(mu[0], vel_trial_neg, p_trial_neg, n)
-    avg_flux_trial  = two_sided(kappa_pos * sig_pos_n_trial,
-                                kappa_neg * sig_neg_n_trial)
-
-    sig_pos_n_test = traction(mu[1], vel_test_pos, q_test_pos, n)
-    sig_neg_n_test = traction(mu[0], vel_test_neg, q_test_neg, n)
-    avg_flux_test  = two_sided(kappa_pos * sig_pos_n_test,
-                            kappa_neg * sig_neg_n_test)
+    sig_pos_n_test = traction(mu[1], Pos(vel_test_pos), Pos(q_test_pos), n)
+    sig_neg_n_test = traction(mu[0], Neg(vel_test_neg), Neg(q_test_neg), n)
+    avg_flux_test  = kappa_pos * sig_pos_n_test + kappa_neg * sig_neg_n_test
 
     jump_vel_trial = Jump(vel_trial_pos, vel_trial_neg)
     jump_vel_test  = Jump(vel_test_pos,  vel_test_neg)
-
+    jump_p_trial = Jump(p_trial_pos, p_trial_neg)
+    jump_q_test  = Jump(q_test_pos,  q_test_neg)
+    # Interface terms
     a += ( dot(avg_flux_trial, jump_vel_test)
-        + dot(avg_flux_test,  jump_vel_trial)
-        + (lambda_nitsche / h) * dot(jump_vel_trial, jump_vel_test) ) * dGamma
+          + dot(avg_flux_test,  jump_vel_trial)
+          + (lambda_nitsche / h) * dot(jump_vel_trial, jump_vel_test) ) * dGamma
+
+    # def two_sided(expr_pos, expr_neg):
+    #     # zero with correct “shape/role”, so algebra still type-checks:
+    #     zpos = 0.0 * expr_pos
+    #     zneg = 0.0 * expr_neg
+    #     return Jump(expr_pos, zneg) - Jump(zpos, expr_neg)
+    
+    # sig_pos_n_trial = traction(mu[1], vel_trial_pos, p_trial_pos, n)
+    # sig_neg_n_trial = traction(mu[0], vel_trial_neg, p_trial_neg, n)
+    # avg_flux_trial  = two_sided(kappa_pos * sig_pos_n_trial,
+    #                             kappa_neg * sig_neg_n_trial)
+
+    # sig_pos_n_test = traction(mu[1], vel_test_pos, q_test_pos, n)
+    # sig_neg_n_test = traction(mu[0], vel_test_neg, q_test_neg, n)
+    # avg_flux_test  = two_sided(kappa_pos * sig_pos_n_test,
+    #                         kappa_neg * sig_neg_n_test)
+
+    # jump_vel_trial = Jump(vel_trial_pos, vel_trial_neg)
+    # jump_vel_test  = Jump(vel_test_pos,  vel_test_neg)
+
+    # a += ( dot(avg_flux_trial, jump_vel_test)
+    #     + dot(avg_flux_test,  jump_vel_trial)
+    #     + (lambda_nitsche / h) * dot(jump_vel_trial, jump_vel_test) ) * dGamma
 
     # Surface-tension RHS: also two-sided!
-    avg_inv_test = two_sided(kappa_neg * vel_test_pos,   # note the 1−i weight as in NGSolve
-                            kappa_pos * vel_test_neg)
-    # f = dot(g_pos, vel_test_pos) * dx_pos \
-    #   + dot(g_neg, vel_test_neg) * dx_neg 
-    # f += - gammaf * dot(avg_inv_test, n) * dGamma
-
+    # avg_inv_test = two_sided(kappa_neg * vel_test_pos,   # note the 1−i weight as in NGSolve
+    #                         kappa_pos * vel_test_neg)
     g_neg = Analytic(g_neg_xy)   # returns [...,2]
     g_pos = Analytic(g_pos_xy)
+    avg_inv_test = kappa_neg * Pos(vel_test_pos) + kappa_pos * Neg(vel_test_neg)
+    f = dot(g_pos, vel_test_pos) * dx_pos \
+      + dot(g_neg, vel_test_neg) * dx_neg 
+    f += - gammaf * dot(avg_inv_test, n) * dGamma
+
 
     # keep your RHS as:
-    f = dot(g_pos, vel_test_pos) * dx_pos + dot(g_neg, vel_test_neg) * dx_neg \
-        - gammaf * dot(avg_inv_test, n) * dGamma
+    # f = dot(g_pos, vel_test_pos) * dx_pos + dot(g_neg, vel_test_neg) * dx_neg \
+    #     - gammaf * dot(avg_inv_test, n) * dGamma
 
     
     

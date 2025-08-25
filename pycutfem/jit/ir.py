@@ -1,6 +1,6 @@
 # pycutfem/jit/ir.py
 from dataclasses import dataclass, field
-from typing import Union, Tuple, Callable, Any
+from typing import Union, Tuple, Callable, Any, Optional, List
 
 # --- IR Node Definitions ---
 
@@ -13,6 +13,7 @@ class LoadVariable:
     deriv_order: Tuple[int, int] = field(default=(0, 0)) # (dx, dy) order of derivative
     field_names: list = field(default_factory=list) 
     side: str = ""           # "", "+", or "-"   ← NEW
+    field_sides: Optional[List[str]] = None
 
 @dataclass(frozen=True, slots=True)
 class LoadConstant:
