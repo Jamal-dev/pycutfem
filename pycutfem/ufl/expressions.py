@@ -206,6 +206,7 @@ class Function(Expression):
         self.dim = 0 # always assuming scalar functions for now
          # --- Side metadata (inherit from parent unless explicitly set) ---
         self.side = getattr(parent_vector, "side", "") if parent_vector is not None else ""
+        self.parent_name = getattr(parent_vector, "name", "") if parent_vector else ""
         if side:
             self.side = side
         # Per-component side tag for codegen
@@ -400,6 +401,7 @@ class VectorFunction(Expression):
         super().__init__()
         self.name = name; self.field_names = field_names; self._dh = dof_handler
         self.dim = 1
+        self.parent_name = ""
         # --- Side metadata for vector-valued functions ---
         self.side = side
         if side in ("+","-"):
@@ -829,6 +831,7 @@ class TrialFunction(Function):
         super().__init__(name=name, field_name=field_name, dof_handler=dof_handler,
                          parent_vector=parent_vector, component_index=component_index)
         self.dim = 0
+        self.parent_name = getattr(parent_vector, "name", "") if parent_vector else ""
         self.side = side
         if side in ("+","-"):
             s = "pos" if side == "+" else "neg"
@@ -858,6 +861,7 @@ class TestFunction(Function):
                          parent_vector=parent_vector, component_index=component_index)
         self.dim = 0  # Assuming scalar test functions for now
         self.side = side
+        self.parent_name = getattr(parent_vector, "name", "") if parent_vector else ""
         if side in ("+","-"):
             s = "pos" if side == "+" else "neg"
             self.field_sides = [s] 
@@ -917,6 +921,7 @@ class VectorTrialFunction(Expression):
     is_trial = True
     is_function = False
     is_test = False
+    parent_name = ""
     def __init__(self, space, dof_handler: 'DofHandler'=None, side: str = ""): # space: FunctionSpace
         self.space = space
         self.field_names = space.field_names
@@ -943,6 +948,7 @@ class VectorTestFunction(Expression):
     is_test = True
     is_function = False
     is_trial = False
+    parent_name = ""
     def __init__(self, space, dof_handler=None, side: str = ""): # space: FunctionSpace
         self.space = space
         self.field_names = space.field_names
