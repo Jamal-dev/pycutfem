@@ -3214,7 +3214,7 @@ class DofHandler:
 
     
     def assemble_pressure_mean_vector(self, level_set, quad_order=None,
-                                  p_pos_field='p_pos_', p_neg_field='p_neg_'):
+                                  p_pos_field='p_pos_', p_neg_field='p_neg_', backend= 'python'):
         """
         Build r in R^{ndof} with:
         r_j = ∫_{Ω+} φ_j dx  for p_pos_ dofs,
@@ -3250,7 +3250,7 @@ class DofHandler:
             else: L = (Constant(1.0) * q_neg) * dx_neg
 
         # No Dirichlet here – this is a pure geometric vector
-        K, r = assemble_form(Equation(a=None, L=L), dof_handler=self, bcs=None, quad_order=qdeg)
+        K, r = assemble_form(Equation(a=None, L=L), dof_handler=self, bcs=None, quad_order=qdeg, backend=backend)
         return r
 
 

@@ -196,13 +196,29 @@ class Function(Expression):
     is_trial = False
     is_test = False
     def __init__(self, name: str, field_name: str, dof_handler: 'DofHandler' = None,
-                 parent_vector: 'VectorFunction' = None, component_index: int = None):
+                 parent_vector: 'VectorFunction' = None, 
+                 component_index: int = None, side: str = ""):
         self.name = name
         self.field_name = field_name
         self._dof_handler = dof_handler
         self._parent_vector = parent_vector
         self._component_index = component_index
         self.dim = 0 # always assuming scalar functions for now
+         # --- Side metadata (inherit from parent unless explicitly set) ---
+        self.side = getattr(parent_vector, "side", "") if parent_vector is not None else ""
+        if side:
+            self.side = side
+        # Per-component side tag for codegen
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
+            self.field_sides = [s]
+        elif parent_vector is not None and getattr(parent_vector, "field_sides", None) is not None and component_index is not None:
+            try:
+                self.field_sides = [parent_vector.field_sides[component_index]]
+            except Exception:
+                self.field_sides = None
+        else:
+            self.field_sides = None
 
         if self._parent_vector is None and self._dof_handler is not None:
             # --- stand‑alone data carrier -----------------------------------
@@ -379,10 +395,27 @@ class VectorFunction(Expression):
     is_function = True
     is_trial = False
     is_test = False
-    def __init__(self, name: str, field_names: list[str], dof_handler: 'DofHandler'=None):
+    def __init__(self, name: str, field_names: list[str], 
+                 dof_handler: 'DofHandler'=None, side: str = ""):
         super().__init__()
         self.name = name; self.field_names = field_names; self._dh = dof_handler
         self.dim = 1
+        # --- Side metadata for vector-valued functions ---
+        self.side = side
+        if side in ("+","-"):
+            s = "pos" if side == "+" else "neg"
+            self.field_sides = [s] * len(self.field_names)
+        else:
+            # Infer from component names if present
+            inferred = []
+            for fn in self.field_names:
+                if "_pos_" in fn or fn.endswith("_pos") or fn.startswith("pos_"):
+                    inferred.append("pos")
+                elif "_neg_" in fn or fn.endswith("_neg") or fn.startswith("neg_"):
+                    inferred.append("neg")
+                else:
+                    inferred.append(None)
+            self.field_sides = inferred if any(x is not None for x in inferred) else None
         
         # This function holds the data for multiple fields.
         g_dofs_list = [dof_handler.get_field_slice(f) for f in field_names]

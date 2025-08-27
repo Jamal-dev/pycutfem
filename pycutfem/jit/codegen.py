@@ -188,15 +188,19 @@ class NumbaCodeGen:
         """
         Resolve the effective side for a single component:
           1) explicit field_sides[idx] if present ('pos'/'neg')
-          2) infer from name ('*_pos_*' / '*_neg_*')
-          3) fall back to the enclosing op/stack side ('+'/'-')
+          2) explicit side from Jump/Pos/Neg ('+' → 'pos', '-' → 'neg')
+          3) infer from name ('*_pos_*' / '*_neg_*')
         Returns 'pos'/'neg' or None if nothing can be determined.
         """
         if field_sides and 0 <= idx < len(field_sides) and field_sides[idx] in ("pos","neg"):
             return field_sides[idx]
+        # Prefer the explicit +/- from the IR (ghost/interface need this to distinguish owner/neighbor)
+        if default_side in ("+","-"):
+            return "pos" if default_side == "+" else "neg"
+        # Only as a final hint, glean from the component name
         hint = cls._infer_side_from_name(field_name)
-        if hint: return hint
-        if default_side in ("+","-"): return "pos" if default_side == "+" else "neg"
+        if hint:
+            return hint
         return None
 
     
@@ -270,12 +274,13 @@ class NumbaCodeGen:
 
                 # reference derivative tables (volume: d.._; facet: r.._pos/neg)
                 d10, d01, d20, d11, d02 = [], [], [], [], []
-                for fn in a.field_names:
-                    n10 = (f"d10_{fn}" if suff=="" else f"r10_{fn}{suff}")
-                    n01 = (f"d01_{fn}" if suff=="" else f"r01_{fn}{suff}")
-                    n20 = (f"d20_{fn}" if suff=="" else f"r20_{fn}{suff}")
-                    n11 = (f"d11_{fn}" if suff=="" else f"r11_{fn}{suff}")
-                    n02 = (f"d02_{fn}" if suff=="" else f"r02_{fn}{suff}")
+                for i, fn in enumerate(a.field_names):
+                    if suff=="":
+                        n10 = f"d10_{fn}"; n01 = f"d01_{fn}"; n20 = f"d20_{fn}"; n11 = f"d11_{fn}"; n02 = f"d02_{fn}"
+                    else:
+                        side_tag = self._component_side_tag(a.side, getattr(a, 'field_sides', None), fn, i)
+                        n10 = f"r10_{fn}_{side_tag}"; n01 = f"r01_{fn}_{side_tag}"; n20 = f"r20_{fn}_{side_tag}"; n11 = f"r11_{fn}_{side_tag}"; n02 = f"r02_{fn}_{side_tag}"
+                     
                     required_args.update({n10, n01, n20, n11, n02})
                     d10.append(n10); d01.append(n01); d20.append(n20); d11.append(n11); d02.append(n02)
 
@@ -425,12 +430,13 @@ class NumbaCodeGen:
 
                 # derivative tables (volume: d.._; facet: r.._pos/neg)
                 d10, d01, d20, d11, d02 = [], [], [], [], []
-                for fn in a.field_names:
-                    n10 = (f"d10_{fn}" if suff=="" else f"r10_{fn}{suff}")
-                    n01 = (f"d01_{fn}" if suff=="" else f"r01_{fn}{suff}")
-                    n20 = (f"d20_{fn}" if suff=="" else f"r20_{fn}{suff}")
-                    n11 = (f"d11_{fn}" if suff=="" else f"r11_{fn}{suff}")
-                    n02 = (f"d02_{fn}" if suff=="" else f"r02_{fn}{suff}")
+                for i, fn in enumerate(a.field_names):
+                    if suff=="":
+                        n10 = f"d10_{fn}"; n01 = f"d01_{fn}"; n20 = f"d20_{fn}"; n11 = f"d11_{fn}"; n02 = f"d02_{fn}"
+                    else:
+                        side_tag = self._component_side_tag(a.side, getattr(a, 'field_sides', None), fn, i)
+                        n10 = f"r10_{fn}_{side_tag}"; n01 = f"r01_{fn}_{side_tag}"; n20 = f"r20_{fn}_{side_tag}"; n11 = f"r11_{fn}_{side_tag}"; n02 = f"r02_{fn}_{side_tag}"
+                     
                     required_args.update({n10, n01, n20, n11, n02})
                     d10.append(n10); d01.append(n01); d20.append(n20); d11.append(n11); d02.append(n02)
 
@@ -793,11 +799,15 @@ class NumbaCodeGen:
                             "40":"d40","31":"d31","22":"d22","13":"d13","04":"d04" }
 
                     out_rows = []
-                    for fn in field_names:
+                    for i, fn in enumerate(field_names):
                         names = {}
                         for key, tag in need.items():
                             if (tot >= int(key[0])+int(key[1])):     # only what we need
-                                nm = (f"{tag}_{fn}" if not op.side else f"r{key}_{fn}_{'pos' if op.side=='+' else 'neg'}")
+                                if not op.side:
+                                    nm = f"{tag}_{fn}"
+                                else:
+                                    side_tag = self._component_side_tag(op.side, getattr(op, 'field_sides', None), fn, i)
+                                    nm = f"r{key}_{fn}_{side_tag}"
                                 required_args.add(nm); names[tag] = nm
 
                         row = new_var("drow")
@@ -930,7 +940,7 @@ class NumbaCodeGen:
 
                         # Pad to union if side-restricted
                         if op.side:
-                            side_tag = self._component_side_tag(op.side, op.field_sides, fn, 0)
+                            side_tag = self._component_side_tag(op.side, op.field_sides, fn, i)
                             map_arr = f"{side_tag}_map_{fn}"
                             required_args.add(map_arr)
                             pad = new_var("pad"); me = new_var("me")
@@ -1068,11 +1078,10 @@ class NumbaCodeGen:
                         # (pad to union if sided), then dot with the coefficient vector.
 
                         # Utility: reference derivative table name (sided vs unsided)
-                        def tab_name(fn: str, tag: str) -> str:
-                            if op.side == "+":
-                                return f"r{tag}_{fn}_pos"
-                            elif op.side == "-":
-                                return f"r{tag}_{fn}_neg"
+                        def tab_name(fn: str, tag: str, idx: int) -> str:
+                            if op.side in ('+','-'):
+                                side_tag = self._component_side_tag(op.side, getattr(op, 'field_sides', None), fn, idx)
+                                return f"r{tag}_{fn}_{side_tag}"
                             else:
                                 return f"d{tag}_{fn}"
 
@@ -1081,9 +1090,9 @@ class NumbaCodeGen:
                         if tot == 1:
                             # First order: grad_phys[:,comp] = [d10, d01] @ J_inv[:,comp]
                             comp = 0 if ox == 1 else 1
-                            for fn in field_names:
-                                d10n = tab_name(fn, "10")
-                                d01n = tab_name(fn, "01")
+                            for i, fn in enumerate(field_names):
+                                d10n = tab_name(fn, "10", i)
+                                d01n = tab_name(fn, "01", i)
                                 required_args.update({d10n, d01n})
 
                                 # fetch reference first-derivative rows at (e,q)
@@ -1100,7 +1109,7 @@ class NumbaCodeGen:
                                     s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
                                     row_s = new_var("row_s")
                                     body_lines.append(f"{row_s} = {row}[{s0}:{s1}]")
-                                    side_tag = self._component_side_tag(op.side, op.field_sides, fn, 0)
+                                    side_tag = self._component_side_tag(op.side, op.field_sides, fn, i)
                                     map_arr = f"{side_tag}_map_{fn}"
                                     required_args.add(map_arr)
                                     pad = new_var("pad"); mep = new_var("mapp")
@@ -1137,10 +1146,10 @@ class NumbaCodeGen:
                             if tot >= 3: need_tags += ["30","21","12","03"]
                             if tot >= 4: need_tags += ["40","31","22","13","04"]
 
-                            for fn in field_names:
+                            for i, fn in enumerate(field_names):
                                 # bring in reference tables for this component at (e,q)
                                 for tg in need_tags:
-                                    nm = tab_name(fn, tg)
+                                    nm = tab_name(fn, tg, i)
                                     required_args.add(nm)
                                     body_lines.append(f"d{tg}_q = {nm}[e,q]")
 
@@ -1424,12 +1433,14 @@ class NumbaCodeGen:
                         pg_loc = new_var("grad_loc")
                         body_lines.append(f"{pg_loc} = {grad_tab_names[i]}[e, q] @ {jinv_q}.copy()")
                         if a.side:
-                            s0 = self.me.slice(a.field_names[i]).start; s1 = self.me.slice(a.field_names[i]).stop
+                            fld_i = a.field_names[i]
+                            s0 = self.me.component_dof_slices[fld_i].start; s1 = self.me.component_dof_slices[fld_i].stop
                             pg_loc_s = new_var("grad_loc_s")
                             body_lines.append(f"{pg_loc_s} = {pg_loc}[{s0}:{s1}, :]")
                              
-                            fld_i = a.field_names[i]
-                            map_arr = f"{'pos' if a.side == '+' else 'neg'}_map_{a.field_names[i]}"
+                            # per-component side map (pos/neg decided per field, not by enclosing side)
+                            side_tag = self._component_side_tag(a.side, a.field_sides, fld_i, i)
+                            map_arr = f"{side_tag}_map_{fld_i}"
                             required_args.add(map_arr)
                             map_e  = new_var(f"{map_arr}_e")
                             pg_pad = new_var("grad_pad")
@@ -1476,13 +1487,13 @@ class NumbaCodeGen:
                             s0 = self.me.component_dof_slices[fld].start; s1 = self.me.component_dof_slices[fld].stop
                             # -------- GHOST FACET (side-restricted) -----------------------
                             # per-edge, per-side reference derivative tables (length = n_loc)
-                            suff = "pos" if a.side == "+" else "neg"
-                            d10 = f"r10_{fld}_{suff}"
-                            d01 = f"r01_{fld}_{suff}"
+                            side_tag = self._component_side_tag(a.side, getattr(a, 'field_sides', None), fld, i)
+                            d10 = f"r10_{fld}_{side_tag}"
+                            d01 = f"r01_{fld}_{side_tag}"
                             required_args.update({d10, d01})
 
                             # side map: union → this side's local dofs (length n_loc)
-                            map_sym = f"{'pos' if a.side == '+' else 'neg'}_map_{fld}"
+                            map_sym = f"{side_tag}_map_{fld}"
                             required_args.add(map_sym)
 
                             # per-edge coeff alias: if alias already exists, use it; else slice once
@@ -1501,8 +1512,7 @@ class NumbaCodeGen:
                                 # slice to field rows
                                 f"{phys_s} = {phys}[{s0}:{s1}, :]",
                                 # slice union coeff -> local (n_loc,) using per-component side map
-                                f"side_tag = '{self._component_side_tag(a.side, a.field_sides, fld, i)}'",
-                                f"{u_sl} = {coeff_e}[{map_sym.replace(('pos' if a.side=='+' else 'neg'), self._component_side_tag(a.side, a.field_sides, fld, i))}[e]]",        
+                                f"{u_sl} = {coeff_e}[{map_sym}[e]]",
                                 f"{val} = {phys_s}.T.copy() @ {u_sl}",         # (2,)
                             ]
 

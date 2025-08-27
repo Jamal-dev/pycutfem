@@ -27,10 +27,10 @@ from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.analytic import x as x_ana
 from pycutfem.ufl.analytic import y as y_ana
 from pycutfem.io.visualization import plot_mesh_2
-
-
-
-
+import logging
+# logger = logging.getLogger(__name__)
+# if not logger.hasHandlers():
+#     logging.basicConfig(level=logging.INFO)
 
 def exact_solution(mu, R, gammaf):
     # ---------------- 3) Exact fields & manufactured RHS via SymPy ----------------
@@ -149,14 +149,15 @@ def test_stokes_interface_corrected():
     This version is corrected to use the existing pycutfem API.
     """
     # ---------------- 1) Mesh, order, level set ----------------
+    backend = 'jit'
     poly_order = 2
-    maxh = 0.125/2.0
-    mesh_size = int(2.0 / maxh)
+    maxh = 0.125
     L,H = 2.0, 2.0
+    mesh_size = int(L / maxh)
 
     nodes, elems, _, corners = structured_quad(
         L, H, nx=mesh_size, ny=mesh_size,
-        poly_order=poly_order, offset=[-1.0, -1.0]
+        poly_order=poly_order, offset=[-L/2.0, -H/2.0]
     )
     mesh = Mesh(nodes, element_connectivity=elems,
                 elements_corner_nodes=corners,
@@ -171,6 +172,8 @@ def test_stokes_interface_corrected():
     mesh.classify_elements(level_set)
     mesh.classify_edges(level_set)
     mesh.build_interface_segments(level_set)
+
+    # plot_mesh_2(mesh, level_set=level_set)
 
     # Boundary tags (square boundary)
     boundary_tags = {
@@ -202,14 +205,14 @@ def test_stokes_interface_corrected():
 
     Vspace_pos    = FunctionSpace("vel_positive", ['u_pos_x', 'u_pos_y'])
     Vspace_neg    = FunctionSpace("vel_negative", ['u_neg_x', 'u_neg_y'])
-    vel_trial_pos = VectorTrialFunction(space=Vspace_pos, dof_handler=dh)
-    vel_test_pos  = VectorTestFunction(space=Vspace_pos,  dof_handler=dh)
-    vel_trial_neg = VectorTrialFunction(space=Vspace_neg, dof_handler=dh)
-    vel_test_neg  = VectorTestFunction(space=Vspace_neg,  dof_handler=dh)
-    p_trial_pos   = TrialFunction('p_pos_', dh,name='pressure_pos_trial')
-    q_test_pos    = TestFunction ('p_pos_', dh,name='pressure_pos_test')
-    p_trial_neg   = TrialFunction('p_neg_', dh,name='pressure_neg_trial')
-    q_test_neg    = TestFunction ('p_neg_', dh,name='pressure_neg_test')
+    vel_trial_pos = VectorTrialFunction(space=Vspace_pos, dof_handler=dh, side='+')
+    vel_test_pos  = VectorTestFunction(space=Vspace_pos,  dof_handler=dh, side='+')
+    vel_trial_neg = VectorTrialFunction(space=Vspace_neg, dof_handler=dh, side='-')
+    vel_test_neg  = VectorTestFunction(space=Vspace_neg,  dof_handler=dh, side='-')
+    p_trial_pos   = TrialFunction('p_pos_', dh,name='pressure_pos_trial', side='+')
+    q_test_pos    = TestFunction ('p_pos_', dh,name='pressure_pos_test', side='+')
+    p_trial_neg   = TrialFunction('p_neg_', dh,name='pressure_neg_trial', side='-')
+    q_test_neg    = TestFunction ('p_neg_', dh,name='pressure_neg_test', side='-')
 
     # Measures & parameters
     qvol   = 2*poly_order + 2
@@ -237,12 +240,12 @@ def test_stokes_interface_corrected():
             g_neg_xy, g_pos_xy,
             grad_vel_neg_xy, grad_vel_pos_xy,
             p_exact_neg_xy, p_exact_pos_xy)=exact_solution(mu, R, gammaf)
-    # g_neg = Analytic(g_neg_xy)
-    # g_pos = Analytic(g_pos_xy)
-    g_neg = VectorFunction(name="g_neg", field_names=['u_neg_x', 'u_neg_y'], dof_handler=dh)
-    g_pos = VectorFunction(name="g_pos", field_names=['u_pos_x', 'u_pos_y'], dof_handler=dh)
-    g_neg.set_values_from_function(g_neg_xy)
-    g_pos.set_values_from_function(g_pos_xy)
+    g_neg = Analytic(g_neg_xy)
+    g_pos = Analytic(g_pos_xy)
+    # g_neg = VectorFunction(name="g_neg", field_names=['u_neg_x', 'u_neg_y'], dof_handler=dh)
+    # g_pos = VectorFunction(name="g_pos", field_names=['u_pos_x', 'u_pos_y'], dof_handler=dh)
+    # g_neg.set_values_from_function(g_neg_xy)
+    # g_pos.set_values_from_function(g_pos_xy)
 
     # ---------------- 4) Variational forms (NGSolve-style) ----------------
     def epsilon(u):
@@ -314,18 +317,26 @@ def test_stokes_interface_corrected():
     
     # Ghost penalty terms
     # POS ghost patch
-    jp_pos_tr = Jump(vel_trial_pos, vel_trial_pos)
-    jp_pos_te = Jump(vel_test_pos,  vel_test_pos)
-    jp_p_pos_tr = Jump(p_trial_pos, p_trial_pos)
-    jp_p_pos_te = Jump(q_test_pos,   q_test_pos)
+    # jp_pos_tr = Jump(vel_trial_pos, vel_trial_pos)
+    # jp_pos_te = Jump(vel_test_pos,  vel_test_pos)
+    # jp_p_pos_tr = Jump(p_trial_pos, p_trial_pos)
+    # jp_p_pos_te = Jump(q_test_pos,   q_test_pos)
+    jp_pos_tr   = Jump(vel_trial_pos)
+    jp_pos_te   = Jump(vel_test_pos)
+    jp_p_pos_tr = Jump(p_trial_pos)
+    jp_p_pos_te = Jump(q_test_pos)
     a += (gamma_stab_v / h**2) * dot(jp_pos_tr, jp_pos_te) * dG_pos
-    a += -(gamma_stab_p)        *       jp_p_pos_tr * jp_p_pos_te * dG_pos
+    a += -(gamma_stab_p)       *       jp_p_pos_tr * jp_p_pos_te * dG_pos
 
     # NEG ghost patch
-    jp_neg_tr = Jump(vel_trial_neg, vel_trial_neg)
-    jp_neg_te = Jump(vel_test_neg,  vel_test_neg)
-    jp_p_neg_tr = Jump(p_trial_neg, p_trial_neg)
-    jp_p_neg_te = Jump(q_test_neg,   q_test_neg)
+    # jp_neg_tr = Jump(vel_trial_neg, vel_trial_neg)
+    # jp_neg_te = Jump(vel_test_neg,  vel_test_neg)
+    # jp_p_neg_tr = Jump(p_trial_neg, p_trial_neg)
+    # jp_p_neg_te = Jump(q_test_neg,   q_test_neg)
+    jp_neg_tr   = Jump(vel_trial_neg)
+    jp_neg_te   = Jump(vel_test_neg)
+    jp_p_neg_tr = Jump(p_trial_neg)
+    jp_p_neg_te = Jump(q_test_neg)
     a += (gamma_stab_v / h**2) * dot(jp_neg_tr, jp_neg_te) * dG_neg
     a += -(gamma_stab_p)        *       jp_p_neg_tr * jp_p_neg_te * dG_neg
 
@@ -361,9 +372,9 @@ def test_stokes_interface_corrected():
 
 
     # ---------------- 6) Assemble & solve ----------------
-    K, F = assemble_form(equation, dof_handler=dh, bcs=bcs, quad_order=qvol)
+    K, F = assemble_form(equation, dof_handler=dh, bcs=bcs, quad_order=qvol, backend= backend)
 
-    r_full = dh.assemble_pressure_mean_vector(level_set, quad_order=qvol)  # or your compiler route
+    r_full = dh.assemble_pressure_mean_vector(level_set, quad_order=qvol, backend=backend)  # or your compiler route
     r_full[dh.get_field_slice('p_pos_')] = 0.0
     Kf, Ff, free, dir_idx, u_dir, f2r = dh.reduce_linear_system(K, F, bcs=bcs, return_dirichlet=True)
 
@@ -384,10 +395,10 @@ def test_stokes_interface_corrected():
     sol[free] = u_free
     sol[dir_idx] = u_dir[dir_idx]
     # ---------------- 7) Wrap solution & calculate errors ----------------
-    U_pos = VectorFunction(name="velocity_pos", field_names=['u_pos_x','u_pos_y'], dof_handler=dh)
-    P_pos = Function(name="pressure_pos", field_name='p_pos_', dof_handler=dh)
-    U_neg = VectorFunction(name="velocity_neg", field_names=['u_neg_x','u_neg_y'], dof_handler=dh)
-    P_neg = Function(name="pressure_neg", field_name='p_neg_', dof_handler=dh)
+    U_pos = VectorFunction(name="velocity_pos", field_names=['u_pos_x','u_pos_y'], dof_handler=dh, side='+')
+    P_pos = Function(name="pressure_pos", field_name='p_pos_', dof_handler=dh, side='+')
+    U_neg = VectorFunction(name="velocity_neg", field_names=['u_neg_x','u_neg_y'], dof_handler=dh, side='-')
+    P_neg = Function(name="pressure_neg", field_name='p_neg_', dof_handler=dh, side='-')
     dh.add_to_functions(sol, [U_pos, P_pos, U_neg, P_neg])
 
 
