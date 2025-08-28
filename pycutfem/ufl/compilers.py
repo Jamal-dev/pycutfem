@@ -122,39 +122,31 @@ class FormCompiler:
     # --------------------- OpInfo meta helpers ---------------------
     def _op_meta_from_ctx(self, node, field_names):
         """Build consistent metadata for VecOpInfo/GradOpInfo from ctx + node."""
-        # Side: prefer ctx (set during Pos/Neg/Jump), then node-declared, else ""
-        side_ctx  = self.ctx.get("side", None)
-        try:
-            side_node = _hfa._side_from_node(self, node)
-        except Exception:
-            side_node = None
-        side = side_ctx if side_ctx in ("+","-") else (side_node if side_node in ("+","-") else "")
+        # Side: prefer context (Pos/Neg/Jump set this), then node; else ""
+        side = self.ctx.get("side")
+        if side not in ("+","-"):
+            try:
+                side = _hfa._side_from_node(self, node)
+            except Exception:
+                side = None
+        side = side if side in ("+","-") else ""
 
         # Parent/container name
-        parent_name = ""
+        parent_name = getattr(node, "parent_name", "")
 
-        if hasattr(node, "parent_name"):
-            parent_name = node.parent_name
-     
-        # Field-sides list (keep node-provided if consistent; else infer per field)
+        # DO NOT infer per-field sides from names — leave empty unless node declares them
         fs = getattr(node, "field_sides", None)
-        if isinstance(fs, list) and fs:
-            field_sides = fs if len(fs) == len(field_names) else [
-                _hfa.infer_side_from_field_name(f) for f in field_names
-            ]
-        else:
-            field_sides = [_hfa.infer_side_from_field_name(f) for f in field_names]
-            if not any(x is not None for x in field_sides):
-                field_sides = []
+        field_sides = fs if (isinstance(fs, list) and len(fs) == len(field_names)) else []
 
-        is_rhs = bool(self.ctx.get("rhs", True))  # RHS mode influences axis semantics
+        is_rhs = bool(self.ctx.get("rhs", True))
         return {
             "field_names": list(field_names),
             "parent_name": parent_name,
             "side": side,
-            "field_sides": list(field_sides) if field_sides else [],
+            "field_sides": list(field_sides),
             "is_rhs": is_rhs,
         }
+
 
     def _vecinfo(self, data: np.ndarray, role: str, node, field_names):
         meta = self._op_meta_from_ctx(node, field_names)
@@ -200,123 +192,123 @@ class FormCompiler:
         """
         Row for D^{alpha} φ_field at the current QP.
 
-        • Ghost/interface path:
-            - Per-QP, per-side cache in ctx["basis_values"][side][field][alpha]
-            - Evaluates on (pos_eid|neg_eid) using physical mapping
-            - Optionally applies per-field side masks (pos/neg)
-            - Collapses element-union → field-local when padding via field map
-            - Pads to ctx["global_dofs"] iff present
-        • Standard element-local path:
-            - Uses self._basis_cache[field] with entries:
-            "val", "grad", "hess", and "derivs" (generic high-order)
+        Ghost/interface path:
+        • Per-QP, per-side cache in ctx["basis_values"][side][field][alpha]
+        • Evaluates on (pos_eid|neg_eid) using physical mapping
+        • ALWAYS slices element row → field-local row before any padding
+        • Applies optional per-field side masks (pos/neg)
+        • Pads to ctx["global_dofs"] (union) iff present
+
+        Standard path:
+        • Uses self._basis_cache[field] for val/grad/hess/derivs
         """
+
         ox, oy = map(int, alpha)
 
-        # ---------- Ghost/interface: side-aware path ----------
+        # ---------- Ghost / Interface: side-aware path ----------
         bv = self.ctx.get("basis_values")
         if isinstance(bv, dict):
-            # Determine side
+            # Determine active side
             side = self.ctx.get("side")
             if side not in ('+', '-'):
                 side = '+' if float(self.ctx.get("phi_val", 0.0)) >= 0.0 else '-'
 
-            # Per-side / per-field cache
+            # Side/field cache
             per_field = bv.setdefault(side, {}).setdefault(field, {})
             if alpha in per_field:
                 return per_field[alpha]
 
-            # Coordinates (physical) and owner element for this side
+            # Coordinates and owner element on this side
             x_phys = self.ctx.get("x_phys")
             if x_phys is None:
                 raise KeyError("x_phys missing in context for derivative evaluation.")
             eid = int(self.ctx["pos_eid"] if side == '+' else self.ctx["neg_eid"])
 
-            # Compute derivative row on the element (length = n_dofs_local; zero-padded across fields)
+            # Map to reference and evaluate derivative row on the element
             xi, eta = transform.inverse_mapping(self.me.mesh, eid, np.asarray(x_phys))
             row = self._phys_scalar_deriv_row(field, float(xi), float(eta), ox, oy, eid)
+            # row is length n_dofs_local and (in our library) zero-padded across fields.
 
-            # Target union layout (if assembling mat/vec) and mapping
-            g = self.ctx.get("global_dofs")  # None for pure functionals
-            amap = _hfa.get_field_map(self.ctx, side, field)
+            # Target "union" layout (present when assembling a matrix/vector)
+            g = self.ctx.get("global_dofs")  # None for functionals
+            # Prefer per-field map; then fall back to side-wide map-by-field; finally generic side map.
+            amap = None
+            try:
+                amap = _hfa.get_field_map(self.ctx, side, field)
+            except Exception:
+                amap = None
             if amap is None:
-                amap = self.ctx.get("pos_map") if side == '+' else self.ctx.get("neg_map")
+                maps_by_field = self.ctx.get("pos_map_by_field" if side == '+' else "neg_map_by_field")
+                if isinstance(maps_by_field, dict):
+                    amap = maps_by_field.get(field)
+            if amap is None:
+                side_map = self.ctx.get("pos_map") if side == '+' else self.ctx.get("neg_map")
+                # 'side_map' is usually the identity over the union; only used if row is already union-sized.
 
-            # Collapse element-union → field-local when we’re about to use a field map
+            # ALWAYS collapse element-union → field-local when we can
             field_slice = None
             try:
                 field_slice = self.me.component_dof_slices[field]
             except Exception:
                 field_slice = None
-            if g is not None and amap is not None:
-                if len(row) not in (len(g), len(amap)):
-                    if (
-                        field_slice is not None
-                        and len(row) == self.me.n_dofs_local
-                        and (field_slice.stop - field_slice.start) == len(amap)
-                    ):
-                        row = row[field_slice]  # now field-local
+            if field_slice is not None and len(row) == self.me.n_dofs_local:
+                row = row[field_slice]  # make it field-local unconditionally
 
-            # Optional per-field side mask
+            # Optional per-field side mask (field-local)
             mask_dict = self.ctx.get("pos_mask_by_field") if side == '+' else self.ctx.get("neg_mask_by_field")
             if isinstance(mask_dict, dict):
                 m_local = mask_dict.get(field)
-                if m_local is not None:
-                    if g is not None and amap is not None and len(row) == len(g):
-                        # row already union-padded → expand mask to union and apply
-                        m_full = np.zeros(len(g), dtype=row.dtype)
-                        m_full[np.asarray(amap, dtype=int)] = m_local
-                        row = row * m_full
-                    elif g is not None and amap is not None and len(row) == len(amap):
-                        # field-local before padding
-                        row = row * m_local
-                    elif field_slice is not None and len(row) == self.me.n_dofs_local:
-                        # element-union → apply mask on the field slice
-                        if (field_slice.stop - field_slice.start) == len(m_local):
-                            tmp = row.copy()
-                            tmp[field_slice] *= m_local
-                            row = tmp
-                    elif len(row) == len(m_local):
-                        # field-local without padding
-                        row = row * m_local
-                    # otherwise: silently skip (safer than crashing)
+                if m_local is not None and len(row) == len(m_local):
+                    row = row * m_local  # apply while still field-local
 
-            # Pad to union layout only if assembling a matrix/vector
+            # Pad to union layout only if assembling a mat/vec
             if g is not None:
-                if amap is None:
-                    # Assume already in target union layout
-                    if len(row) != len(g):
-                        raise ValueError(
-                            f"Cannot pad basis row for '{field}': no map and "
-                            f"len(row)={len(row)} != len(global_dofs)={len(g)}"
-                        )
-                else:
-                    if len(row) == len(g):
-                        pass  # already union-sized
-                    elif len(row) == len(amap):
+                if amap is not None:
+                    if len(row) == len(amap):
                         full = np.zeros(len(g), dtype=row.dtype)
                         full[np.asarray(amap, dtype=int)] = row
                         row = full
-                    else:
+                    elif len(row) != len(g):
                         raise ValueError(
                             f"Shape mismatch padding basis row for '{field}': "
                             f"len(row)={len(row)}, len(amap)={len(amap)}, len(global_dofs)={len(g)}"
                         )
+                    # else len(row) == len(g): already union-sized (rare here)
+                else:
+                    # No per-field map; row must already be union-sized
+                    if len(row) != len(g):
+                        # As a last resort, allow a side-wide identity map
+                        side_map = self.ctx.get("pos_map") if side == '+' else self.ctx.get("neg_map")
+                        if side_map is not None and len(side_map) == len(g) and len(row) == len(side_map):
+                            # already union-sized w.r.t. the side map; nothing to do
+                            pass
+                        else:
+                            raise ValueError(
+                                f"Cannot pad basis row for '{field}': no field map and "
+                                f"len(row)={len(row)} != len(global_dofs)={len(g)}"
+                            )
 
-            # Cache final row for this QP/side/field/alpha and return
+                # If we padded to union after masking (field-local), we may need to lift the mask too.
+                if isinstance(mask_dict, dict):
+                    m_local = mask_dict.get(field)
+                    if m_local is not None and amap is not None and len(row) == len(g) and len(m_local) != len(row):
+                        m_full = np.zeros(len(g), dtype=row.dtype)
+                        m_full[np.asarray(amap, dtype=int)] = m_local
+                        row = row * m_full
+
+            # Cache final form (per-side/field/alpha) and return
             per_field[alpha] = row
             return row
 
-        # ---------- Standard element-local path (volume/boundary/subcells) ----------
+        # ---------- Standard element-local path (volume/boundary) ----------
         cache = self._basis_cache.setdefault(field, {})
 
-        # Fast paths if value/grad/Hessian already present
-        if alpha == (0, 0):
-            if "val" in cache:
-                return cache["val"]
-        if alpha in ((1, 0), (0, 1)):
-            if "grad" in cache:
-                gx, gy = cache["grad"][:, 0], cache["grad"][:, 1]
-                return gx if alpha == (1, 0) else gy
+        # Fast paths
+        if alpha == (0, 0) and "val" in cache:
+            return cache["val"]
+        if alpha in ((1, 0), (0, 1)) and "grad" in cache:
+            gx, gy = cache["grad"][:, 0], cache["grad"][:, 1]
+            return gx if alpha == (1, 0) else gy
         if alpha in ((2, 0), (1, 1), (0, 2)) and "hess" in cache:
             H = cache["hess"]
             return H[:, 0, 0] if alpha == (2, 0) else (H[:, 0, 1] if alpha == (1, 1) else H[:, 1, 1])
@@ -343,13 +335,13 @@ class FormCompiler:
             H[:, 0, 0] = d20; H[:, 0, 1] = d11
             H[:, 1, 0] = d11; H[:, 1, 1] = d02
             cache["hess"] = H
-            # also stash each entry into derivs for direct hits next time
+            # also stash each entry into derivs
             dcache[(2, 0)] = d20; dcache[(1, 1)] = d11; dcache[(0, 2)] = d02
             return row
 
-        # Cache and return
         dcache[alpha] = row
         return row
+
 
 
 
@@ -578,11 +570,11 @@ class FormCompiler:
             return float(n.value)
         return np.asarray(n.value)
     
-    def _visit_FacetNormal(self, n: FacetNormal): # New
-        """Returns the normal vector from the context.""" # New
-        if 'normal' not in self.ctx: # New
-            raise RuntimeError("FacetNormal accessed outside of a facet or interface integral context.") # New
-        return self.ctx['normal'] # New
+    def _visit_FacetNormal(self, n: FacetNormal): 
+        """Returns the normal vector from the context.""" 
+        if 'normal' not in self.ctx: 
+            raise RuntimeError("FacetNormal accessed outside of a facet or interface integral context.") 
+        return self.ctx['normal'] 
     
     # -- Element-wise constants ----------------------------------------
     def _visit_EWC(self, n:ElementWiseConstant):
@@ -596,60 +588,47 @@ class FormCompiler:
         return n.value_on_element(int(eid))
     
     
-    def _visit_Pos(self, n: Pos):
-        """Restrict operand to the '+' side. On Γ, set ctx['side'] and eid accordingly."""
-        if self.ctx.get('on_interface', False):
-            phi_old  = self.ctx.get('phi_val', None)
-            side_old = self.ctx.get('side', None)
-            eid_old  = self.ctx.get('eid', None)
-            try:
-                self.ctx['phi_val'] =  1.0
-                self.ctx['side']    = '+'
-                if 'pos_eid' in self.ctx:
-                    self.ctx['eid'] = self.ctx['pos_eid']
-                return self._visit(n.operand)
-            finally:
-                if phi_old is None: self.ctx.pop('phi_val', None)
-                else:               self.ctx['phi_val'] = phi_old
-                if side_old is None: self.ctx.pop('side', None)
-                else:                self.ctx['side'] = side_old
-                if eid_old is None:  self.ctx.pop('eid', None)
-                else:                self.ctx['eid'] = eid_old
-        # The '+' side is where phi >= 0 (a closed set)
-        if 'phi_val' in self.ctx and self.ctx['phi_val'] < 0.0: 
-            # We are on the strictly negative side, so return zero.
-            op_val = self._visit(n.operand)
-            return op_val * 0.0
-        return self._visit(n.operand)
+    def _on_sided_path(self) -> bool:
+        # We’re on a “sided” integral if either:
+        #  - interface loop marked it, or
+        #  - ghost/interface loops created a per-QP basis cache.
+        return bool(self.ctx.get('is_interface', False) or isinstance(self.ctx.get('basis_values'), dict))
 
-    def _visit_Neg(self, n: Neg):
-        """Restrict operand to the '−' side. On Γ, set ctx['side'] and eid accordingly."""
-        if self.ctx.get('on_interface', False):
-            phi_old  = self.ctx.get('phi_val', None)
-            side_old = self.ctx.get('side', None)
-            eid_old  = self.ctx.get('eid', None)
-            try:
-                self.ctx['phi_val'] = -1.0
-                self.ctx['side']    = '-'
-                if 'neg_eid' in self.ctx:
-                    self.ctx['eid'] = self.ctx['neg_eid']
-                return self._visit(n.operand)
-            finally:
-                if phi_old is None: self.ctx.pop('phi_val', None)
-                else:               self.ctx['phi_val'] = phi_old
-                if side_old is None: self.ctx.pop('side', None)
-                else:                self.ctx['side'] = side_old
-                if eid_old is None:  self.ctx.pop('eid', None)
-                else:                self.ctx['eid'] = eid_old
-        # The '-' side is where phi < 0 (an open set)
-        if 'phi_val' in self.ctx and self.ctx['phi_val'] >= 0.0: 
-            # We are on the positive or zero side, so return zero.
-            op_val = self._visit(n.operand)
-            return op_val * 0.0
-        return self._visit(n.operand) 
+    def _with_side(self, side: str, eid_key: str, operand):
+        phi_old  = self.ctx.get('phi_val', None)
+        side_old = self.ctx.get('side', None)
+        eid_old  = self.ctx.get('eid', None)
+        try:
+            self.ctx['phi_val'] = +1.0 if side == '+' else -1.0
+            self.ctx['side']    = side
+            if eid_key in self.ctx:
+                self.ctx['eid'] = int(self.ctx[eid_key])
+            return self._visit(operand)
+        finally:
+            if phi_old  is None: self.ctx.pop('phi_val', None)
+            else:                self.ctx['phi_val'] = phi_old
+            if side_old is None: self.ctx.pop('side',    None)
+            else:                self.ctx['side']    = side_old
+            if eid_old  is None: self.ctx.pop('eid',     None)
+            else:                self.ctx['eid']     = eid_old
+    def _visit_Pos(self, n):
+        # SIDED path (interface or ghost): set side/eid and RETURN — no φ-gating.
+        if self._on_sided_path():
+            return self._with_side('+', 'pos_eid', n.operand)
+
+        # VOLUME path: φ-gate
+        val = self._with_side('+', 'pos_eid', n.operand)
+        return val if float(self.ctx.get('phi_val', 0.0)) >= 0.0 else (val * 0.0)
+
+    def _visit_Neg(self, n):
+        if self._on_sided_path():
+            return self._with_side('-', 'neg_eid', n.operand)
+
+        val = self._with_side('-', 'neg_eid', n.operand)
+        return (val * 0.0) if float(self.ctx.get('phi_val', 0.0)) >= 0.0 else val 
 
     def _visit_Jump(self, n: Jump):
-        phi_old  = self.ctx.get('phi_val', 0.0)
+        phi_old  = self.ctx.get('phi_val', None)
         eid_old  = self.ctx.get('eid')
         side_old = self.ctx.get('side')
 
@@ -668,18 +647,30 @@ class FormCompiler:
         u_neg = self._visit(n.u_neg)
 
         # restore
-        self.ctx['phi_val'] = phi_old
+        if phi_old is None: self.ctx.pop('phi_val', None)
+        else:               self.ctx['phi_val'] = phi_old
         if eid_old is None: self.ctx.pop('eid', None)
         else:               self.ctx['eid'] = eid_old
         if side_old is None: self.ctx.pop('side', None)
         else:                self.ctx['side'] = side_old
-        print(f'Jump: type(u_pos):{type(u_pos)}, type(u_neg):{type(u_neg)}'
-              f';role_a: {getattr(u_pos, "role", None)}, role_b: {getattr(u_neg, "role", None)}')
+        # print(f'Jump: type(u_pos):{type(u_pos)}, type(u_neg):{type(u_neg)}'
+        #       f';role_a: {getattr(u_pos, "role", None)}, role_b: {getattr(u_neg, "role", None)}')
 
         return u_pos - u_neg
 
 ###########################################################################################3
 ########### --- Functions and VectorFunctions (evaluated to numerical values) ---
+###########################################################################################
+    def _get_side(self):
+        side = self.ctx.get('side')
+        if side not in ('+','-'):
+            side = '+' if self.ctx.get('phi_val', 0.0) >= 0 else '-'
+        return side
+    def _zero_width(self):
+        g = self.ctx.get("global_dofs")
+        return len(g) if g is not None else len(self._local_dofs())
+
+
     def _visit_Function(self, n: Function):
         logger.debug(f"Visiting Function: {n.field_name}")
         u_loc = n.get_nodal_values(self._local_dofs())      # element-local coeffs
@@ -688,7 +679,7 @@ class FormCompiler:
         # ghost-edge: enlarge coeff vector to |global_dofs|
         if phi.shape[0] != u_loc.shape[0] and "global_dofs" in self.ctx:
             padded = np.zeros_like(phi)
-            side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
+            side = self._get_side()
             amap = _hfa.get_field_map(self.ctx, side, n.field_name)
             if amap is None:
                 # Fallback for safety if per-field map is missing
@@ -710,8 +701,8 @@ class FormCompiler:
             coeffs = comp_by_name[fld].get_nodal_values(local_dofs)  # (n_loc,)
             phi    = self._b(fld)                                    # (n_loc,)
             if phi.shape[0] != coeffs.shape[0] and 'global_dofs' in self.ctx:
-                side = '+' if self.ctx.get('phi_val', 0.0) >= 0 else '-'
-                amap = _hfa.get_field_map(self.ctx, side, fld)
+                side = self._get_side()
+                amap = _hfa.get_field_map(self.ctx, side, fld) 
                 if amap is None:
                     amap = self.ctx.get('pos_map') if side == '+' else self.ctx.get('neg_map')
                 padded = np.zeros_like(phi)
@@ -740,14 +731,14 @@ class FormCompiler:
         logger.debug(f"Visiting VectorTestFunction: {n.field_names}")
         names = _hfa._filter_fields_for_side(self, n, list(n.field_names))
         rows = [self._lookup_basis(f, (0, 0)) for f in names]
-        data = np.stack(rows) if rows else np.zeros((0, len(self._local_dofs())))
+        data  = np.stack(rows) if rows else np.zeros((len(n.field_names), self._zero_width()))
         return self._vecinfo(data, role="test", node=n, field_names=names)
 
     def _visit_VectorTrialFunction(self, n):
         logger.debug(f"Visiting VectorTrialFunction: {n.field_names}")
         names = _hfa._filter_fields_for_side(self, n, list(n.field_names))
         rows = [self._lookup_basis(f, (0, 0)) for f in names]
-        data = np.stack(rows) if rows else np.zeros((0, len(self._local_dofs())))
+        data  = np.stack(rows) if rows else np.zeros((len(n.field_names), self._zero_width()))
         return self._vecinfo(data, role="trial", node=n, field_names=names)
 
     # ================== VISITORS: OPERATORS ========================
@@ -981,13 +972,13 @@ class FormCompiler:
         # role_a = getattr(a, 'role', None)
         # role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Prod for  ('{n.a!r}' * '{n.b!r}') on {'RHS' if self.ctx['rhs'] else 'LHS'}") #, a.info={getattr(a, 'info', None)}, b.info={getattr(b, 'info', None)}
-        print(f" Product: a type={type(a)}, shape={shape_a}, b type={type(b)}, shape={shape_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-              f" roles: a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
+        # print(f" Product: a type={type(a)}, shape={shape_a}, b type={type(b)}, shape={shape_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+        #       f" roles: a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
 
         result = a * b
-        print(f" Product result: {getattr(result, 'shape', None)}"
-              f" roles: result={getattr(result, 'role', None)}"
-              f" types: result={type(result)}")
+        # print(f" Product result: {getattr(result, 'shape', None)}"
+        #       f" roles: result={getattr(result, 'role', None)}"
+        #       f" types: result={type(result)}")
         return result
         # scalar * scalar multiplication
         if np.isscalar(a) and np.isscalar(b):
@@ -1057,9 +1048,9 @@ class FormCompiler:
         role_b = getattr(b, 'role', None)
         shape_a = getattr(a_data,"shape", None)
         shape_b = getattr(b_data,"shape", None)
-        print(f"visit dot: role_a={role_a}, role_b={role_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-              f" type_a={type(a)}, type_b={type(b)}"
-              f" shape_a={shape_a}, shape_b={shape_b}")
+        # print(f"visit dot: role_a={role_a}, role_b={role_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+        #       f" type_a={type(a)}, type_b={type(b)}"
+        #       f" shape_a={shape_a}, shape_b={shape_b}")
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
 
         def rhs():
@@ -1248,8 +1239,8 @@ class FormCompiler:
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Inner for types {type(a)} : {type(b)}")
-        print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-              f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
+        # print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+        #       f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
 
         rhs = bool(self.ctx.get("rhs"))
 
@@ -1665,6 +1656,8 @@ class FormCompiler:
         qp, qw = volume(mesh.element_type, q_order)
         fields = _all_fields(integral.integrand)
         rhs = self.ctx["rhs"]
+        self.ctx['is_interface'] = False
+        logger.info(f"Assembling volume integral: {integral}")
 
         for eid, element in enumerate(mesh.elements_list):
             if rhs:
@@ -1698,8 +1691,8 @@ class FormCompiler:
                 # Efficiently add local matrix to sparse global matrix
                 r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
                 matvec[r, c] += loc
-        
-        self.ctx.pop("eid", None); self.ctx.pop("x_phys", None)  # Clean up context
+
+        self.ctx.pop("eid", None); self.ctx.pop("x_phys", None); self.ctx.pop("is_interface", None);  # Clean up context
 
     
     
@@ -1729,7 +1722,7 @@ class FormCompiler:
             raise ValueError("dInterface measure requires a level_set.")
 
         # Mark that we are on Γ so Pos/Neg visitors set ctx['side'] & select (pos|neg)_eid
-        self.ctx['on_interface'] = True
+        self.ctx['is_interface'] = True
 
         mesh = self.me.mesh
         qdeg = self._find_q_order(intg)
@@ -1740,14 +1733,13 @@ class FormCompiler:
         is_functional = (hook is not None) and not (trial or test)
         if is_functional:
             self.ctx.setdefault('scalar_results', {}).setdefault(hook['name'], 0.0)
+        def _is_valid_element(elem):
+            return getattr(elem, 'tag', None) == 'cut'  and len(getattr(elem, 'interface_pts', None)) == 2
 
         try:
             for elem in mesh.elements_list:
                 # Only elements that are actually cut and have a valid interface segment
-                if getattr(elem, 'tag', None) != 'cut':
-                    continue
-                seg = getattr(elem, 'interface_pts', None)
-                if not (isinstance(seg, (list, tuple)) and len(seg) == 2):
+                if not _is_valid_element(elem):
                     continue
 
                 eid = int(elem.id)
@@ -1834,7 +1826,7 @@ class FormCompiler:
                 "pos_map_by_field", "neg_map_by_field",
                 "pos_mask_by_field", "neg_mask_by_field",
                 "eid", "pos_eid", "neg_eid",
-                "on_interface", "x_phys", "phi_val", "normal"
+                "is_interface", "x_phys", "phi_val", "normal"
             ):
                 self.ctx.pop(k, None)
 
@@ -1939,11 +1931,13 @@ class FormCompiler:
 
         rhs   = self.ctx.get("rhs", False)
         mesh  = self.me.mesh
+        logger.info(f"Assembling ghost edge integral: {intg}")
 
         # ---- derivative orders we need (robust) -------------------------
         md      = intg.measure.metadata or {}
         derivs  = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
         derivs |= {(0, 0), (1, 0), (0, 1)}  # always have value and ∂x, ∂y
+        self.ctx['is_interface'] = False
 
         # Close up to max total order (covers Hessian cross-terms etc.)
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
@@ -2088,7 +2082,7 @@ class FormCompiler:
             # Clean context keys we may have set
             for k in ("basis_values", "normal", "phi_val", "x_phys",
                     "global_dofs", "pos_map", "neg_map", "pos_eid", "neg_eid",
-                    "pos_map_by_field", "neg_map_by_field", "on_interface"):
+                    "pos_map_by_field", "neg_map_by_field", "is_interface"):
                 self.ctx.pop(k, None)
 
 
@@ -2663,6 +2657,7 @@ class FormCompiler:
         q_order = self._find_q_order(integral)
         rhs     = self.ctx.get("rhs", False)
         fields  = _all_fields(integral.integrand)
+        self.ctx["is_interface"] = False
 
         # --- 1) classify (fills tags & caches)
         inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)

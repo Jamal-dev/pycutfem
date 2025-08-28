@@ -1145,7 +1145,11 @@ class Jump(Expression):
                  , u_on_neg=None):
         if u_on_neg is None:
             # Automatic expansion: jump(u)  :=  pos(u) – neg(u)
-            u_on_pos, u_on_neg = Pos(u_on_pos), Neg(deepcopy(u_on_pos))
+            u_on_neg = deepcopy(u_on_pos)
+            # remove pos from name
+            # setattr(u_on_neg, "side", "-")
+            # setattr(u_on_pos, "side", "+")
+            u_on_pos, u_on_neg = Pos(u_on_pos), Neg(u_on_neg)
         self.u_pos, self.u_neg = u_on_pos, u_on_neg
         self.is_function = getattr(u_on_pos, "is_function", False)
         self.is_trial    = getattr(u_on_pos, "is_trial",    False)

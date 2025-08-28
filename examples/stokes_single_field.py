@@ -197,22 +197,21 @@ def test_stokes_interface_corrected():
     has_outside = outside_e | cut_e
 
     # ---------------- 2) Mixed FE space & dofs ----------------
-    me = MixedElement(mesh, field_specs={'u_pos_x': poly_order, 'u_pos_y': poly_order, 'p_pos_': poly_order-1,
-                                         'u_neg_x': poly_order, 'u_neg_y': poly_order, 'p_neg_': poly_order-1})
+    me = MixedElement(mesh, field_specs={'u_x': poly_order, 'u_y': poly_order, 'p': poly_order-1})
     dh = DofHandler(me, method='cg')
     dh.tag_dofs_by_locator_map(boundary_tags, 
-                               fields=['u_pos_x','u_pos_y','u_neg_x','u_neg_y']) 
+                               fields=['u_x','u_y']) 
 
-    Vspace_pos    = FunctionSpace("vel_positive", ['u_pos_x', 'u_pos_y'])
-    Vspace_neg    = FunctionSpace("vel_negative", ['u_neg_x', 'u_neg_y'])
+    Vspace_pos    = FunctionSpace("vel_positive", ['u_x', 'u_y'])
+    Vspace_neg    = FunctionSpace("vel_negative", ['u_x', 'u_y'])
     vel_trial_pos = VectorTrialFunction(space=Vspace_pos, dof_handler=dh, side='+')
     vel_test_pos  = VectorTestFunction(space=Vspace_pos,  dof_handler=dh, side='+')
     vel_trial_neg = VectorTrialFunction(space=Vspace_neg, dof_handler=dh, side='-')
     vel_test_neg  = VectorTestFunction(space=Vspace_neg,  dof_handler=dh, side='-')
-    p_trial_pos   = TrialFunction('p_pos_', dh,name='pressure_pos_trial', side='+')
-    q_test_pos    = TestFunction ('p_pos_', dh,name='pressure_pos_test', side='+')
-    p_trial_neg   = TrialFunction('p_neg_', dh,name='pressure_neg_trial', side='-')
-    q_test_neg    = TestFunction ('p_neg_', dh,name='pressure_neg_test', side='-')
+    p_trial_pos   = TrialFunction('p', dh,name='pressure_pos_trial', side='+')
+    q_test_pos    = TestFunction ('p', dh,name='pressure_pos_test', side='+')
+    p_trial_neg   = TrialFunction('p', dh,name='pressure_neg_trial', side='-')
+    q_test_neg    = TestFunction ('p', dh,name='pressure_neg_test', side='-')
 
     # Measures & parameters
     qvol   = 2*poly_order + 2
@@ -242,8 +241,8 @@ def test_stokes_interface_corrected():
             p_exact_neg_xy, p_exact_pos_xy)=exact_solution(mu, R, gammaf)
     # g_neg = Analytic(g_neg_xy)
     # g_pos = Analytic(g_pos_xy)
-    g_neg = VectorFunction(name="g_neg", field_names=['u_neg_x', 'u_neg_y'], dof_handler=dh, side='-')
-    g_pos = VectorFunction(name="g_pos", field_names=['u_pos_x', 'u_pos_y'], dof_handler=dh, side='+')
+    g_neg = VectorFunction(name="g_neg", field_names=['u_x', 'u_y'], dof_handler=dh, side = "-")
+    g_pos = VectorFunction(name="g_pos", field_names=['u_x', 'u_y'], dof_handler=dh, side = "+")
     g_neg.set_values_from_function(g_neg_xy)
     g_pos.set_values_from_function(g_pos_xy)
 
@@ -318,17 +317,16 @@ def test_stokes_interface_corrected():
     jp_pos_te   = Jump(vel_test_pos, vel_test_pos)
     jp_p_pos_tr = Jump(p_trial_pos, p_trial_pos)
     jp_p_pos_te = Jump(q_test_pos, q_test_pos)
-    a += ((gamma_stab_v / h**2) * dot(jp_pos_tr, jp_pos_te)
-          -(gamma_stab_p)       *       jp_p_pos_tr * jp_p_pos_te) * dG_pos
-    
+    a += (gamma_stab_v / h**2) * dot(jp_pos_tr, jp_pos_te) * dG_pos
+    a += -(gamma_stab_p)       *       jp_p_pos_tr * jp_p_pos_te * dG_pos
 
     # NEG ghost patch
     jp_neg_tr   = Jump(vel_trial_neg, vel_trial_neg)
     jp_neg_te   = Jump(vel_test_neg, vel_test_neg)
     jp_p_neg_tr = Jump(p_trial_neg, p_trial_neg)
     jp_p_neg_te = Jump(q_test_neg, q_test_neg)
-    a += ((gamma_stab_v / h**2) * dot(jp_neg_tr, jp_neg_te)
-          -(gamma_stab_p)        *       jp_p_neg_tr * jp_p_neg_te) * dG_neg
+    a += (gamma_stab_v / h**2) * dot(jp_neg_tr, jp_neg_te) * dG_neg
+    a += -(gamma_stab_p)        *       jp_p_neg_tr * jp_p_neg_te * dG_neg
 
 
 
@@ -336,25 +334,10 @@ def test_stokes_interface_corrected():
     equation = Equation(a, f)
 
     # ---------------- 5) Velocity Dirichlet on outer boundary ----------------
-    dh.tag_dofs_from_element_bitset("inactive_inside_ux", "u_pos_x", "inside", strict=True)
-    dh.tag_dofs_from_element_bitset("inactive_inside_uy", "u_pos_y", "inside", strict=True)
-    dh.tag_dofs_from_element_bitset("inactive_outside_ux", "u_neg_x", "outside", strict=True)
-    dh.tag_dofs_from_element_bitset("inactive_outside_uy", "u_neg_y", "outside", strict=True)
-    dh.tag_dofs_from_element_bitset("inactive_inside_p", "p_pos_", "inside", strict=True)
-    dh.tag_dofs_from_element_bitset("inactive_outside_p", "p_neg_", "outside", strict=True)
+
     bcs = [
-        BoundaryCondition('u_pos_x', 'dirichlet', 'boundary', lambda x, y: vel_exact_pos_xy(x, y)[0]),
-        BoundaryCondition('u_pos_y', 'dirichlet', 'boundary', lambda x, y: vel_exact_pos_xy(x, y)[1]),
-        # BoundaryCondition('p_pos_', 'dirichlet', 'boundary', lambda x, y: p_exact_pos_xy(x, y)),
-        BoundaryCondition('u_neg_x', 'dirichlet', 'boundary', lambda x, y: vel_exact_neg_xy(x, y)[0]),
-        BoundaryCondition('u_neg_y', 'dirichlet', 'boundary', lambda x, y: vel_exact_neg_xy(x, y)[1]),
-        # BoundaryCondition('p_neg_', 'dirichlet', 'boundary', lambda x, y: p_exact_neg_xy(x, y)),
-        BoundaryCondition('u_pos_x', 'dirichlet', 'inactive_inside_ux', lambda x, y: 0.0),
-        BoundaryCondition('u_pos_y', 'dirichlet', 'inactive_inside_uy', lambda x, y: 0.0),
-        BoundaryCondition('u_neg_x', 'dirichlet', 'inactive_outside_ux', lambda x, y: 0.0),
-        BoundaryCondition('u_neg_y', 'dirichlet', 'inactive_outside_uy', lambda x, y: 0.0),
-        BoundaryCondition('p_pos_', 'dirichlet', 'inactive_inside_p', lambda x, y: 0.0),
-        BoundaryCondition('p_neg_', 'dirichlet', 'inactive_outside_p', lambda x, y: 0.0),
+        BoundaryCondition('u_x', 'dirichlet', 'boundary', lambda x, y: vel_exact_pos_xy(x, y)[0]),
+        BoundaryCondition('u_y', 'dirichlet', 'boundary', lambda x, y: vel_exact_pos_xy(x, y)[1]),
     ]
 
 
@@ -362,7 +345,7 @@ def test_stokes_interface_corrected():
     K, F = assemble_form(equation, dof_handler=dh, bcs=bcs, quad_order=qvol, backend= backend)
 
     r_full = dh.assemble_pressure_mean_vector(level_set, quad_order=qvol, backend=backend)  # or your compiler route
-    r_full[dh.get_field_slice('p_pos_')] = 0.0
+    r_full[dh.get_field_slice('p')] = 0.0
     Kf, Ff, free, dir_idx, u_dir, f2r = dh.reduce_linear_system(K, F, bcs=bcs, return_dirichlet=True)
 
     rf   = r_full[free]
@@ -382,23 +365,21 @@ def test_stokes_interface_corrected():
     sol[free] = u_free
     sol[dir_idx] = u_dir[dir_idx]
     # ---------------- 7) Wrap solution & calculate errors ----------------
-    U_pos = VectorFunction(name="velocity_pos", field_names=['u_pos_x','u_pos_y'], dof_handler=dh, side='+')
-    P_pos = Function(name="pressure_pos", field_name='p_pos_', dof_handler=dh, side='+')
-    U_neg = VectorFunction(name="velocity_neg", field_names=['u_neg_x','u_neg_y'], dof_handler=dh, side='-')
-    P_neg = Function(name="pressure_neg", field_name='p_neg_', dof_handler=dh, side='-')
-    dh.add_to_functions(sol, [U_pos, P_pos, U_neg, P_neg])
+    U = VectorFunction(name="velocity_pos", field_names=['u_x','u_y'], dof_handler=dh)
+    P = Function(name="pressure_pos", field_name='p', dof_handler=dh)
+    dh.add_to_functions(sol, [U, P])
 
 
 
-    exact_neg = {'u_neg_x': lambda x,y: vel_exact_neg_xy(x,y)[0], 'u_neg_y': lambda x,y: vel_exact_neg_xy(x,y)[1], 'p_neg_': p_exact_neg_xy}
-    exact_pos = {'u_pos_x': lambda x,y: vel_exact_pos_xy(x,y)[0], 'u_pos_y': lambda x,y: vel_exact_pos_xy(x,y)[1], 'p_pos_': p_exact_pos_xy}
+    exact_neg = {'u_x': lambda x,y: vel_exact_neg_xy(x,y)[0], 'u_y': lambda x,y: vel_exact_neg_xy(x,y)[1], 'p': p_exact_neg_xy}
+    exact_pos = {'u_x': lambda x,y: vel_exact_pos_xy(x,y)[0], 'u_y': lambda x,y: vel_exact_pos_xy(x,y)[1], 'p': p_exact_pos_xy}
 
-    err_vel_L2_neg = dh.l2_error_on_side(U_neg, exact_neg, level_set, side='-', fields=['u_neg_x', 'u_neg_y'], relative=False)
-    err_vel_L2_pos = dh.l2_error_on_side(U_pos, exact_pos, level_set, side='+', fields=['u_pos_x', 'u_pos_y'], relative=False)
+    err_vel_L2_neg = dh.l2_error_on_side(U, exact_neg, level_set, side='-', fields=['u_x', 'u_y'], relative=False)
+    err_vel_L2_pos = dh.l2_error_on_side(U, exact_pos, level_set, side='+', fields=['u_x', 'u_y'], relative=False)
     vel_L2 = np.sqrt(err_vel_L2_neg**2 + err_vel_L2_pos**2)
 
-    err_p_L2_neg = dh.l2_error_on_side(P_neg, exact_neg, level_set, side='-', fields=['p_neg_'], relative=False)
-    err_p_L2_pos = dh.l2_error_on_side(P_pos, exact_pos, level_set, side='+', fields=['p_pos_'], relative=False)
+    err_p_L2_neg = dh.l2_error_on_side(P, exact_neg, level_set, side='-', fields=['p'], relative=False)
+    err_p_L2_pos = dh.l2_error_on_side(P, exact_pos, level_set, side='+', fields=['p'], relative=False)
     p_L2 = np.sqrt(err_p_L2_neg**2 + err_p_L2_pos**2)
 
 
@@ -407,8 +388,8 @@ def test_stokes_interface_corrected():
     print(f"L2 Error (pressure): {p_L2:10.8e}")
     # vel_H1 = dh.h1_error_vector_piecewise(U_pos, exact_neg, exact_pos, level_set)
     # H1-seminorm of velocity on each side
-    vel_H1m_neg = dh.h1_error_vector_on_side(U_neg, grad_vel_neg_xy, level_set, side='-', fields=['u_neg_x', 'u_neg_y'])
-    vel_H1m_pos = dh.h1_error_vector_on_side(U_pos, grad_vel_pos_xy, level_set, side='+', fields=['u_pos_x', 'u_pos_y'])
+    vel_H1m_neg = dh.h1_error_vector_on_side(U, grad_vel_neg_xy, level_set, side='-', fields=['u_x', 'u_y'])
+    vel_H1m_pos = dh.h1_error_vector_on_side(U, grad_vel_pos_xy, level_set, side='+', fields=['u_x', 'u_y'])
     vel_H1m = np.sqrt(vel_H1m_neg**2 + vel_H1m_pos**2)   # piecewise |·|_{H1}
 
     # If you want the *full* H1 norm (seminorm + L2)
@@ -423,7 +404,7 @@ def test_stokes_interface_corrected():
     vtk_path = os.path.join(outdir, "solution.vtu")
     phi_vals = level_set.evaluate_on_nodes(mesh)
     export_vtk(vtk_path, mesh=mesh, dof_handler=dh,
-               functions={"velocity_pos": U_pos, "pressure_pos": P_pos, "velocity_neg": U_neg, "pressure_neg": P_neg, "phi": phi_vals})
+               functions={"velocity": U, "pressure": P,  "phi": phi_vals})
     print(f"Solution exported to {vtk_path}")
 
 if __name__ == "__main__":

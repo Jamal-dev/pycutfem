@@ -550,7 +550,9 @@ class VecOpInfo(BaseOpInfo):
             raise TypeError(f"Cannot add VecOpInfo to {type(other)}."
                             f" with shapes {self.data.shape} and {other_data.shape}")
         if self.data.shape != other_data.shape:
-            raise ValueError("VecOpInfo shapes mismatch in addition.")
+            raise ValueError(f"VecOpInfo shapes mismatch in addition: {self.data.shape} vs {other_data.shape}"
+                             f" Roles: {self.role}, other={getattr(other, 'role', None)}."
+                             f" Types: {type(self)} vs {type(other)}")
         if type(self) == type(other):
             meta = _resolve_meta(self.meta(), other_meta, strict=False)
         elif type(other) == np.ndarray:
@@ -1634,17 +1636,22 @@ class HelpersFieldAware:
             if tags == {"neg"}: return "-"
         return None                   # 3) unknown
     @staticmethod
-    def _filter_fields_for_side(self:"FormCompiler", n, fields):
-        side = HelpersFieldAware._side_from_node(self,n)
-        if side in ("+","-"):
-            keep = "pos" if side == "+" else "neg"
-            return [f for f in fields
-                    if (HelpersFieldAware.infer_side_from_field_name(f) in (None, keep))]
-        # fallback: infer from names (only if consistent)
-        tags = {HelpersFieldAware.infer_side_from_field_name(f) for f in fields}
-        tags.discard(None)
-        if len(tags) == 1:
-            keep = next(iter(tags))
-            return [f for f in fields
-                    if (HelpersFieldAware.infer_side_from_field_name(f) in (None, keep))]
+    def _filter_fields_for_side(self: "FormCompiler", n, fields):
+        """
+        New rule: never guess from names. If a side is active in the context,
+        we keep components and let _basis_row apply the correct side via
+        (pos/neg) eid + per-field maps/masks. This prevents empty (0, n)
+        blocks in Pos/Neg branches of Jump on ghost edges.
+        """
+        side_ctx = getattr(self, "ctx", {}).get("side", None)
+        if side_ctx in ("+", "-"):
+            return fields  # do not drop rows – padding/masks handle the side
+
+        # If the node explicitly declares a single side for *all* components,
+        # it’s still safe to keep them (evaluation will respect eid/side).
+        side_node = getattr(n, "side", None)
+        if side_node in ("+", "-"):
+            return fields
+
+        # Default: no filtering
         return fields
