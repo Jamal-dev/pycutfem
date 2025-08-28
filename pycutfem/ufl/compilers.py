@@ -1248,8 +1248,8 @@ class FormCompiler:
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Inner for types {type(a)} : {type(b)}")
-        # print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-        #       f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
+        print(f"Inner: {a} . {b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+              f" role_a={role_a}, role_b={role_b}, a.shape={getattr(a, 'shape', None)}, b.shape={getattr(b, 'shape', None)}")
 
         rhs = bool(self.ctx.get("rhs"))
 
@@ -1329,8 +1329,10 @@ class FormCompiler:
                     # both collapsed to (k,) → scalar
                     A, B = a.data, b.data
                     if A.ndim == B.ndim == 1:
-                        return float(np.einsum("k,k->", A, B, optimize=True))
+                        return np.dot(A,B)
                     raise ValueError(f"RHS inner(Function,Function) expects 1D data; got {A.shape}, {B.shape}")
+                if a.role == "vector" and b.role == "vector":
+                    return np.dot(a.data, b.data)  # both (d,) → scalar
 
             # ---- Numeric tensor with Grad basis on RHS ----
             def is_vector(a):

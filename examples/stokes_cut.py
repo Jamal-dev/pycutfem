@@ -252,8 +252,7 @@ def test_stokes_interface_corrected():
         return 0.5 * (grad(u) + grad(u).T)
 
     def traction(mu_val, u_vec, p_scal, normal):
-        # return -2*mu_val * dot(epsilon(u_vec), normal) + p_scal * normal
-        return  dot(epsilon(u_vec), normal) + p_scal * normal
+        return -2*mu_val * dot(epsilon(u_vec), normal) + p_scal * normal
 
     # volume terms
     a =  (2*mu[1]*inner(epsilon(vel_trial_pos), epsilon(vel_test_pos)) - div(vel_trial_pos)*q_test_pos - div(vel_test_pos)*p_trial_pos) * dx_pos

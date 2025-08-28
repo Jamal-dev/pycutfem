@@ -164,20 +164,66 @@ class BaseOpInfo:
         """Returns the number of dimensions of the data array."""
         return self.data.ndim
     # ---------- NumPy interop ----------
-    def __array__(self, dtype=None):
-        """
-        Expose numeric view for NumPy ufuncs:
-        """
-        arr = self.data
-        return np.asarray(arr, dtype=dtype) if dtype is not None else np.asarray(arr)
+    # Make NumPy prefer our ufunc handler over eager coercion to ndarray
+    __array_priority__ = 10_000
 
-    def __radd__(self, other):
+    def __array__(self, dtype=None):
+        """Expose data as ndarray (used only when we *choose* to coerce)."""
+        return np.asarray(self.data, dtype=dtype) if dtype is not None else np.asarray(self.data)
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         """
-        Enable `ndarray + VecOpInfo` in non-ufunc paths.
-        NumPy ufuncs will typically call __array__, but this is a harmless convenience.
+        Preserve metadata for mul/div; allow numeric add/sub with ndarray
+        accumulators during assembly without leaking types elsewhere.
         """
-        if isinstance(other, np.ndarray):
-            return other + np.asarray(self)
+        if method != "__call__":
+            return NotImplemented
+
+        def _num(x):
+            # numeric view for accumulation; squeeze (1,n)->(n,) for vectors
+            if isinstance(x, BaseOpInfo):
+                if isinstance(x, VecOpInfo):
+                    arr = x.data
+                    if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] == 1:
+                        return arr[0]
+                    return arr
+                return x.data
+            return x
+
+        # Allow numeric accumulation with ndarray on either side
+        if ufunc in (np.add, np.subtract):
+            if any(isinstance(i, np.ndarray) for i in inputs):
+                args = tuple(_num(i) for i in inputs)
+                return ufunc(*args, **kwargs)
+            # let VecOpInfo/GradOpInfo/HessOpInfo.__add__/__sub__ handle typed sums
+            return NotImplemented
+
+        # Preserve types & metadata for multiply
+        if ufunc is np.multiply:
+            a, *rest = inputs
+            b = rest[0] if rest else None
+            if isinstance(a, BaseOpInfo) and isinstance(b, BaseOpInfo):
+                return a.__mul__(b)
+            if isinstance(a, BaseOpInfo):
+                return a.__mul__(b)
+            if isinstance(b, BaseOpInfo):
+                return b.__rmul__(a)
+            return NotImplemented
+
+        # Preserve types & metadata for true divide
+        if ufunc in (np.true_divide, np.divide):
+            a, *rest = inputs
+            b = rest[0] if rest else None
+            if isinstance(a, BaseOpInfo) and not isinstance(b, BaseOpInfo):
+                return a.__truediv__(b)
+            if isinstance(b, BaseOpInfo) and not isinstance(a, BaseOpInfo):
+                return b.__rtruediv__(a)
+            return NotImplemented
+
+        # Negation
+        if ufunc is np.negative and len(inputs) == 1 and inputs[0] is self:
+            return -self
+
         return NotImplemented
     def _error_msg(self, other, opname: str) -> str:
         """Auto-formats a helpful error; no need to override in subclasses."""
