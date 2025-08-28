@@ -673,6 +673,8 @@ class FormCompiler:
         else:               self.ctx['eid'] = eid_old
         if side_old is None: self.ctx.pop('side', None)
         else:                self.ctx['side'] = side_old
+        print(f'Jump: type(u_pos):{type(u_pos)}, type(u_neg):{type(u_neg)}'
+              f';role_a: {getattr(u_pos, "role", None)}, role_b: {getattr(u_neg, "role", None)}')
 
         return u_pos - u_neg
 
@@ -970,8 +972,8 @@ class FormCompiler:
     def _visit_Prod(self, n: Prod):
         a = self._visit(n.a)
         b = self._visit(n.b)
-        a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo)) else a
-        b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo)) else b
+        a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo, HessOpInfo)) else a
+        b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo, HessOpInfo)) else b
         shape_a = getattr(a_data,"shape", None)
         shape_b = getattr(b_data,"shape", None)
         # a_vec = np.squeeze(a_data) 
@@ -979,9 +981,14 @@ class FormCompiler:
         # role_a = getattr(a, 'role', None)
         # role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Prod for  ('{n.a!r}' * '{n.b!r}') on {'RHS' if self.ctx['rhs'] else 'LHS'}") #, a.info={getattr(a, 'info', None)}, b.info={getattr(b, 'info', None)}
-        # print(f" Product: a type={type(a)}, shape={shape_a}, b type={type(b)}, shape={shape_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-        #       f" roles: a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
+        print(f" Product: a type={type(a)}, shape={shape_a}, b type={type(b)}, shape={shape_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+              f" roles: a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
 
+        result = a * b
+        print(f" Product result: {getattr(result, 'shape', None)}"
+              f" roles: result={getattr(result, 'role', None)}"
+              f" types: result={type(result)}")
+        return result
         # scalar * scalar multiplication
         if np.isscalar(a) and np.isscalar(b):
             return a * b
@@ -1021,7 +1028,7 @@ class FormCompiler:
         # --- General Purpose Logic (used mostly for LHS) ---
 
         # General scalar multiplication (if not a special RHS case)
-        if np.isscalar(a) and isinstance(b, (VecOpInfo, GradOpInfo, np.ndarray)):
+        if np.isscalar(a) and isinstance(b, (VecOpInfo, GradOpInfo, np.ndarray, HessOpInfo)):
             return a * b
         if np.isscalar(b) and isinstance(a, (VecOpInfo, GradOpInfo, np.ndarray)):
             return b * a
@@ -1048,8 +1055,11 @@ class FormCompiler:
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo,HessOpInfo)) else b
         role_a = getattr(a, 'role', None)
         role_b = getattr(b, 'role', None)
-        print(f"visit dot: role_a={role_a}, role_b={role_b}, a={a}, b={b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-              f" type_a={type(a)}, type_b={type(b)}")
+        shape_a = getattr(a_data,"shape", None)
+        shape_b = getattr(b_data,"shape", None)
+        print(f"visit dot: role_a={role_a}, role_b={role_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+              f" type_a={type(a)}, type_b={type(b)}"
+              f" shape_a={shape_a}, shape_b={shape_b}")
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
 
         def rhs():
@@ -1139,20 +1149,20 @@ class FormCompiler:
             # Special case like dot( Constat(np.array([u1,u2])), TestFunction('v') )
             # This is a special case where we have a numerical vector on the LHS
             # and a test function basis on the RHS.
-            if isinstance(a, np.ndarray) and isinstance(b, VecOpInfo) and b.role == "test":
+            if (isinstance(a, np.ndarray) and a.ndim == 1) and isinstance(b, VecOpInfo) and b.role == "test":
                 return b.dot_const(a)
-            if isinstance(b, np.ndarray) and isinstance(a, VecOpInfo) and a.role == "test":
+            if (isinstance(b, np.ndarray) and b.ndim == 1) and isinstance(a, VecOpInfo) and a.role == "test":
                 return a.dot_const(b)
         # Dot product between a basis field and a numerical vector
-        if isinstance(a, (VecOpInfo)) and isinstance(b, np.ndarray): 
-            return a.dot_const_vec(b)
-        elif isinstance(b, (VecOpInfo)) and isinstance(a, np.ndarray): 
-            return b.dot_const_vec(a)
-        elif isinstance(a, (GradOpInfo)) and isinstance(b, np.ndarray):
+        if isinstance(a, (VecOpInfo)) and (isinstance(b, np.ndarray) and b.ndim == 1): 
+            return a.dot_const(b)
+        elif isinstance(b, (VecOpInfo)) and (isinstance(a, np.ndarray) and a.ndim == 1): 
+            return b.dot_const(a)
+        elif isinstance(a, (GradOpInfo)) and (isinstance(b, np.ndarray) and b.ndim == 1):
             result = a.dot_vec(b)
             # print(f"visit dot: GradOpInfo . result: {result}, result shape: {result.shape}, role: {getattr(result, 'role', None)}")
             return result
-        elif isinstance(b, (GradOpInfo)) and isinstance(a, np.ndarray):
+        elif isinstance(b, (GradOpInfo)) and (isinstance(a, np.ndarray) and a.ndim == 1):
             return b.left_dot(a)
         
 

@@ -115,7 +115,7 @@ class KernelCache:
             compile(full_src, f"<{target.name}>", "exec")
         except SyntaxError as e:
             # dump the faulty code for inspection
-            fail = Path(tempfile.gettempdir()) / f"{target.stem}_FAILED.py"
+            fail = Path(tempfile.gettempdir()) / Path(f"{target.stem}_FAILED.py")
             fail.write_text(full_src)
             raise SyntaxError(
                 f"Generated kernel has syntax error (saved to {fail})\n"
@@ -124,7 +124,7 @@ class KernelCache:
 
         # write with lock
         with self._file_lock(target):
-            target.write_text(full_src)
+            target.write_text(full_src, encoding="utf-8")
 
     # ..................................................................
     def _import_with_fallback(self, modname: str, path: Path,

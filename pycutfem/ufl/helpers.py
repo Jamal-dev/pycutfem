@@ -122,6 +122,11 @@ def _is_scalar_field(a) -> bool:
         #     return False
         else:
             raise NotImplementedError(f"Unsupported GradOpInfo role: {a.role}")
+    if isinstance(a, HessOpInfo):
+        if a.role in {'trial', 'test', 'function'}:
+            return a.data.shape[0] == 1
+        else:
+            raise NotImplementedError(f"Unsupported HessOpInfo role: {a.role}")
     raise NotImplementedError(f"Unsupported type: {type(a)}")
 
 @dataclass(frozen=True, slots=True)
@@ -1004,10 +1009,25 @@ class HessOpInfo(BaseOpInfo):
           function   → GradOpInfo with data (k,d) if (k,d,d) else (k,n,d)
         """
         n = self._as_dir_vec(vec)  # (d,)
+        is_vec = _is_1d_vector(n)
+        is_scalar_field = _is_scalar_field(self)
+        is_d_k = n.shape[0] == self.data.shape[0]
+        is_d_d = n.shape[0] == self.data.shape[1] if self.data.ndim == 3 else n.shape[0] == self.data.shape[2]
+        # is_d_dd = n.shape[0] == self.data.shape[2] if self.data.ndim == 3 else n.shape[0] == self.data.shape[3]
+
         if self.data.ndim == 4:    # (d,) · (k,n,d,d) -> (k,n,d)
-            out = np.einsum("i,knij->knj", n, self.data, optimize=True)
+            if is_vec and is_scalar_field and is_d_d:
+                out = np.einsum("s,knsj->knj", n, self.data, optimize=True)
+            elif is_vec and is_d_k:
+                out = np.einsum("s,snij->inj", n, self.data, optimize=True)
+            else: raise NotImplementedError(f"HessOpInfo.dot_left: cannot contract with vector of shape {n.shape} and Hess shape {self.data.shape}.")
         elif self.data.ndim == 3:  # (d,) · (k,d,d)   -> (k,d)
-            out = np.einsum("i,kij->kj",   n, self.data, optimize=True)
+            if is_vec and is_scalar_field and is_d_d:
+                out = np.einsum("s,ksj->kj",   n, self.data, optimize=True)
+            elif is_vec and is_d_k:
+                out = np.einsum("s,sij->ij", n, self.data, optimize=True)
+            else:
+                raise NotImplementedError(f"HessOpInfo.dot_left: cannot contract with vector of shape {n.shape} and Hess shape {self.data.shape}.")
         else:
             raise ValueError(f"HessOpInfo.dot_left: unexpected ndim={self.data.ndim}")
         meta = _resolve_meta(self.meta(), getattr(vec, "meta", lambda: {})(), prefer='a')

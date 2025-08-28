@@ -149,7 +149,7 @@ def test_stokes_interface_corrected():
     This version is corrected to use the existing pycutfem API.
     """
     # ---------------- 1) Mesh, order, level set ----------------
-    backend = 'jit'
+    backend = 'python'
     poly_order = 2
     maxh = 0.125
     L,H = 2.0, 2.0
@@ -240,19 +240,20 @@ def test_stokes_interface_corrected():
             g_neg_xy, g_pos_xy,
             grad_vel_neg_xy, grad_vel_pos_xy,
             p_exact_neg_xy, p_exact_pos_xy)=exact_solution(mu, R, gammaf)
-    g_neg = Analytic(g_neg_xy)
-    g_pos = Analytic(g_pos_xy)
-    # g_neg = VectorFunction(name="g_neg", field_names=['u_neg_x', 'u_neg_y'], dof_handler=dh)
-    # g_pos = VectorFunction(name="g_pos", field_names=['u_pos_x', 'u_pos_y'], dof_handler=dh)
-    # g_neg.set_values_from_function(g_neg_xy)
-    # g_pos.set_values_from_function(g_pos_xy)
+    # g_neg = Analytic(g_neg_xy)
+    # g_pos = Analytic(g_pos_xy)
+    g_neg = VectorFunction(name="g_neg", field_names=['u_neg_x', 'u_neg_y'], dof_handler=dh)
+    g_pos = VectorFunction(name="g_pos", field_names=['u_pos_x', 'u_pos_y'], dof_handler=dh)
+    g_neg.set_values_from_function(g_neg_xy)
+    g_pos.set_values_from_function(g_pos_xy)
 
     # ---------------- 4) Variational forms (NGSolve-style) ----------------
     def epsilon(u):
         return 0.5 * (grad(u) + grad(u).T)
 
     def traction(mu_val, u_vec, p_scal, normal):
-        return -2*mu_val * dot(epsilon(u_vec), normal) + p_scal * normal
+        # return -2*mu_val * dot(epsilon(u_vec), normal) + p_scal * normal
+        return  dot(epsilon(u_vec), normal) + p_scal * normal
 
     # volume terms
     a =  (2*mu[1]*inner(epsilon(vel_trial_pos), epsilon(vel_test_pos)) - div(vel_trial_pos)*q_test_pos - div(vel_test_pos)*p_trial_pos) * dx_pos
@@ -301,26 +302,19 @@ def test_stokes_interface_corrected():
     # Surface-tension RHS: also two-sided!
     # avg_inv_test = two_sided(kappa_neg * vel_test_pos,   # note the 1−i weight as in NGSolve
     #                         kappa_pos * vel_test_neg)
-    g_neg = Analytic(g_neg_xy)   # returns [...,2]
-    g_pos = Analytic(g_pos_xy)
+
     avg_inv_test = kappa_neg * Pos(vel_test_pos) + kappa_pos * Neg(vel_test_neg)
     f = dot(g_pos, vel_test_pos) * dx_pos \
       + dot(g_neg, vel_test_neg) * dx_neg 
     f += - gammaf * dot(avg_inv_test, n) * dGamma
 
 
-    # keep your RHS as:
-    # f = dot(g_pos, vel_test_pos) * dx_pos + dot(g_neg, vel_test_neg) * dx_neg \
-    #     - gammaf * dot(avg_inv_test, n) * dGamma
+   
 
     
     
     # Ghost penalty terms
     # POS ghost patch
-    # jp_pos_tr = Jump(vel_trial_pos, vel_trial_pos)
-    # jp_pos_te = Jump(vel_test_pos,  vel_test_pos)
-    # jp_p_pos_tr = Jump(p_trial_pos, p_trial_pos)
-    # jp_p_pos_te = Jump(q_test_pos,   q_test_pos)
     jp_pos_tr   = Jump(vel_trial_pos)
     jp_pos_te   = Jump(vel_test_pos)
     jp_p_pos_tr = Jump(p_trial_pos)
@@ -329,10 +323,6 @@ def test_stokes_interface_corrected():
     a += -(gamma_stab_p)       *       jp_p_pos_tr * jp_p_pos_te * dG_pos
 
     # NEG ghost patch
-    # jp_neg_tr = Jump(vel_trial_neg, vel_trial_neg)
-    # jp_neg_te = Jump(vel_test_neg,  vel_test_neg)
-    # jp_p_neg_tr = Jump(p_trial_neg, p_trial_neg)
-    # jp_p_neg_te = Jump(q_test_neg,   q_test_neg)
     jp_neg_tr   = Jump(vel_trial_neg)
     jp_neg_te   = Jump(vel_test_neg)
     jp_p_neg_tr = Jump(p_trial_neg)
@@ -341,10 +331,7 @@ def test_stokes_interface_corrected():
     a += -(gamma_stab_p)        *       jp_p_neg_tr * jp_p_neg_te * dG_neg
 
 
-    # avg_inv_test = kappa_neg * Pos(vel_test_pos) + kappa_pos * Neg(vel_test_neg)
-    # f = dot(g_pos, vel_test_pos) * dx_pos \
-    #   + dot(g_neg, vel_test_neg) * dx_neg \
-    #   - gammaf * dot(avg_inv_test, n) * dGamma
+
 
     equation = Equation(a, f)
 
