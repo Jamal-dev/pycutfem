@@ -74,6 +74,21 @@ def _collapsed_grad(g: Union["GradOpInfo", np.ndarray]) -> np.ndarray:
     G = np.asarray(g)
     if G.ndim == 2: return G
     raise ValueError(f"_collapsed_grad: unexpected ndarray shape {G.shape}")
+def _collapsed_hess(h: Union["HessOpInfo", np.ndarray]) -> np.ndarray:
+    """(k,n,d,d)+coeffs -> (k,d,d); pass-through (k,d,d)."""
+    if isinstance(h, HessOpInfo):
+        H = np.asarray(h.data)
+        if H.ndim == 4:
+            if h.coeffs is None:
+                raise ValueError("_collapsed_hess: coeffs required for (k,n,d,d).")
+            # (k,n,d1,d2) x (k,n) -> (k,d1,d2)
+            return np.einsum("knij,kn->kij", H, h.coeffs, optimize=True)
+        if H.ndim == 3:
+            return H
+        raise ValueError(f"_collapsed_hess: unexpected hess data shape {H.shape}")
+    H = np.asarray(h)
+    if H.ndim == 3: return H
+    raise ValueError(f"_collapsed_hess: unexpected ndarray shape {H.shape}")
 
 def _is_1d_vector(vec) -> bool:
     """Check if the given vector is 1D."""
@@ -280,24 +295,53 @@ class VecOpInfo(BaseOpInfo):
             return VecOpInfo(data[np.newaxis,:], role=role, **self.update_meta(meta)) # (1,n)
     
 
-    def inner(self, other: "VecOpInfo") -> np.ndarray:
+    def inner(self, other: Optional[Union["VecOpInfo", np.ndarray]]) -> np.ndarray:
         """Computes inner product (u, v), returning an (n, n) matrix."""
         if self.data.shape[0] != other.data.shape[0]:
             raise ValueError("VecOpInfo component mismatch for inner product.")
-        A, B = self.data, other.data
-        if A.ndim == 2 and B.ndim == 2:
-            # LHS: (k,n) and (k,m) -> (n,m)
-            return np.einsum("kn,km->nm", A, B, optimize=True)
-        if A.ndim == 1 and B.ndim == 2:
-            # RHS: (k,) and (k,n) -> (n,)
-            return np.einsum("k,kn->n", A, B, optimize=True)
-        if A.ndim == 2 and B.ndim == 1:
-            # RHS: (k,n) and (k,) -> (n,)
-            return np.einsum("kn,k->n", A, B, optimize=True)
-        if A.ndim == 1 and B.ndim == 1:
-            # RHS: (k,) and (k,) -> scalar
-            return float(np.einsum("k,k->", A, B, optimize=True))
-        raise ValueError(f"Unsupported inner dims A{A.shape}, B{B.shape} for VecOpInfo.")
+        A, B = self.data, getattr(other, 'data', other)
+        role_a = self.role
+        role_b = getattr(other, 'role', None)
+        if self.is_rhs:
+            if role_a in {"trial","test"} and role_b in {"function"}:
+                fun = _collapsed_function(other) # (k,)
+                return np.einsum("kn,k->n", A, fun, optimize=True) # (n,)
+            elif role_a in {"function"} and role_b in {"trial","test"}:
+                fun = _collapsed_function(self) # (k,)
+                return np.einsum("kn,k->n", B, fun, optimize=True) # (n,)
+            elif role_a in {"function"} and role_b in {"function"}:
+                fun_a = _collapsed_function(self) # (k,)
+                fun_b = _collapsed_function(other) # (k,)
+                return np.einsum("k,k->", fun_a, fun_b, optimize=True) # ()
+            elif role_a in {"vector"} and role_b in {"vector"}:
+                return np.dot(A, B)
+            elif role_a in {"vector"} and role_b in {"function"}:
+                fun = _collapsed_function(other)
+                return np.dot(A, fun)
+            elif role_a in {"function"} and role_b in {"vector"}:
+                fun = _collapsed_function(self)
+                return np.dot(B, fun)
+            elif role_a == None and A.ndim == 1:
+                if role_b in {"function"}:
+                    fun = _collapsed_function(other)
+                    return np.dot(A, fun)
+                elif role_b in {"vector"}:
+                    return np.dot(A, B)
+                elif role_b in {"trial","test"}:
+                    return np.einsum("k,kn->n", A, B, optimize=True)
+                elif role_b == None:
+                    return float(np.einsum("..., ...->", A, B, optimize=True)) if A.ndim == B.ndim == 1 else np.tensordot(A, B, axes=([0], [0]))
+                else:
+                    raise ValueError(self._error_msg(other, "VecOpInfo.inner"))
+
+        else:
+            if role_a in {"trial","test"} and role_b in {"trial","test"}:
+                test_var = self if role_a == "test" else other
+                trial_var = other if role_a == "test" else self
+                return test_var.data.T @ trial_var.data # (n,n)
+
+        raise ValueError(f"Unsupported inner dims A{A.shape}, B{B.shape} for VecOpInfo."
+                         f" Roles: A={role_a}, B={role_b}.")
     
 
     def dot_const(self, const: np.ndarray):
@@ -640,6 +684,28 @@ class GradOpInfo(BaseOpInfo):
     def inner(self, other: "GradOpInfo") -> np.ndarray:
         if not isinstance(other, GradOpInfo) or self.data.shape != other.data.shape:
             raise ValueError(...)
+        if self.is_rhs:
+            if self.role in {"function"} and other.role in {"trial", "test"}:
+                # Case: Function · Grad(Trial) or Grad(Test)  -> (n,)
+                kd = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+                if kd.shape[0] == other.shape[0]:
+                    return  np.einsum("kd,knd->n", kd, other.data, optimize=True)
+                else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
+            elif self.role in {"trial", "test"} and other.role in {"function"}:
+                # Case: Grad(Trial) or Grad(Test) · Function  -> (n,)
+                kd = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+                if kd.shape[0] == self.shape[0]:
+                    return np.einsum("knd,kd->n", self.data, kd, optimize=True)
+                else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
+            elif self.role == "function" and other.role == "function":
+                # Case: Function · Function  -> ()
+                kd_self = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+                kd_other = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+                if kd_self.shape[0] == kd_other.shape[0]:
+                    return np.einsum("kd,kd->", kd_self, kd_other, optimize=True)
+                else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
+            else:
+                raise NotImplementedError(self._error_msg(other, "inner between gradients"))
 
         if self.role == "test" and other.role == "trial":
             # standard order: rows=test, cols=trial
@@ -1107,6 +1173,28 @@ class HessOpInfo(BaseOpInfo):
         """
         if not isinstance(other, HessOpInfo):
             raise TypeError(f"Cannot take HessOpInfo.inner with {type(other)}.")
+        if self.is_rhs:
+            if self.role in {"function"} and other.role in { "trial", "test"}:
+                kdij = _collapsed_hess(self)  # (k,d,d)
+                if kdij.shape[0] != other.shape[0]:
+                    raise NotImplementedError(self._error_msg(other, "inner with function Hessian"))
+                A, B = kdij, other.data
+                return np.einsum("kij,knij->n", A, B, optimize=True)
+            elif self.role in {"trial", "test"} and other.role in {"function"}:
+                kdij = _collapsed_hess(other)  # (k,d,d)
+                if kdij.shape[0] != self.shape[0]:
+                    raise NotImplementedError(self._error_msg(other, "inner with function Hessian"))
+                A, B = self.data, kdij
+                return np.einsum("knij,kij->n", A, B, optimize=True)
+            elif self.role in {"function"} and other.role in {"function"}:
+                kdij = _collapsed_hess(self)  # (k,d,d)
+                mdij = _collapsed_hess(other)  # (k,d,d)
+                if kdij.shape[0] != mdij.shape[0]:
+                    raise NotImplementedError(self._error_msg(other, "inner with function Hessian"))
+                A, B = kdij, mdij
+                return np.einsum("kij,kij->", A, B, optimize=True)
+            else: raise NotImplementedError(self._error_msg(other, "inner with function Hessian"))
+
         A, B = self.data, other.data
         if A.ndim != 4 or B.ndim != 4:
             raise ValueError("HessOpInfo.inner expects (k,n,d,d) arrays.")
@@ -1655,3 +1743,147 @@ class HelpersFieldAware:
 
         # Default: no filtering
         return fields
+
+class HelpersAlignCoefficents:
+    @staticmethod
+    def _target_len_from_ctx(ctx):
+        gd = ctx.get("global_dofs", None)
+        return len(gd) if gd is not None else None
+    @staticmethod
+    def _field_map(ctx, side, field_name):
+        # Per-field map: local(field) -> global
+        return (ctx.get("pos_map_by_field", {}) if side == '+' else ctx.get("neg_map_by_field", {})).get(field_name, None)
+
+    @staticmethod
+    def _side_map(ctx, side):
+        # Side-wide map: element-union(side) -> global
+        return ctx.get("pos_map") if side == '+' else ctx.get("neg_map")
+
+    @staticmethod
+    def _pad_basis_to_global(ctx, side, field_name, phi):
+        """
+        Ensure basis 'phi' for 'field_name' is padded to the global layout when on
+        ghost/interface paths (i.e., ctx has 'global_dofs').
+
+        Supports 1D (ndofs,) and 2D (ncomp, ndofs) arrays.
+        """
+        tgt = HelpersAlignCoefficents._target_len_from_ctx(ctx)
+        if tgt is None:
+            return phi  # nothing to do
+
+        # Already global-sized?
+        if phi.ndim == 1 and phi.shape[0] == tgt:
+            return phi
+        if phi.ndim == 2 and phi.shape[1] == tgt:
+            return phi
+
+        fmap = HelpersAlignCoefficents._field_map(ctx, side, field_name)
+        if fmap is None:
+            raise ValueError(f"Missing per-field map for basis padding: field='{field_name}', side={side}")
+
+        fmap = np.asarray(fmap, dtype=np.intp)
+
+        if phi.ndim == 1:
+            if len(fmap) != phi.shape[0]:
+                raise ValueError(f"Basis length mismatch for field '{field_name}': len(map)={len(fmap)} vs len(phi)={phi.shape[0]}")
+            padded = np.zeros(tgt, dtype=phi.dtype)
+            padded[fmap] = phi
+            return padded
+
+        elif phi.ndim == 2:
+            if len(fmap) != phi.shape[1]:
+                raise ValueError(f"Basis (2D) width mismatch for field '{field_name}': len(map)={len(fmap)} vs phi.shape[1]={phi.shape[1]}")
+            padded = np.zeros((phi.shape[0], tgt), dtype=phi.dtype)
+            padded[:, fmap] = phi
+            return padded
+
+        else:
+            raise ValueError(f"Unsupported basis ndim={phi.ndim} for field '{field_name}'")
+
+
+    @staticmethod
+    def _pad_coeffs_to_global(ctx, side, field_name, u_loc):
+        """
+        Ensure the coefficient vector(s) 'u_loc' are padded into the global layout.
+
+        Prefers the side-wide map (pos/neg_map) since u_loc is element-union sized.
+        Falls back to per-field map only when lengths match.
+
+        Supports 1D (ndofs,) and 2D (ncomp, ndofs).
+        """
+        tgt = HelpersAlignCoefficents._target_len_from_ctx(ctx)
+        if tgt is None:
+            return u_loc  # nothing to do
+
+        # Already global-sized?
+        if u_loc.ndim == 1 and u_loc.shape[0] == tgt:
+            return u_loc
+        if u_loc.ndim == 2 and u_loc.shape[1] == tgt:
+            return u_loc
+
+        # Choose an indexer whose length matches u_loc's width
+        smap = HelpersAlignCoefficents._side_map(ctx, side)
+        fmap = HelpersAlignCoefficents._field_map(ctx, side, field_name)
+
+        # Normalize to numpy int arrays if present
+        smap = None if smap is None else np.asarray(smap, dtype=np.intp)
+        fmap = None if fmap is None else np.asarray(fmap, dtype=np.intp)
+
+        def _pad_1d(idx, vec):
+            padded = np.zeros(tgt, dtype=vec.dtype)
+            padded[idx] = vec
+            return padded
+
+        def _pad_2d(idx, mat):
+            padded = np.zeros((mat.shape[0], tgt), dtype=mat.dtype)
+            padded[:, idx] = mat
+            return padded
+
+        if u_loc.ndim == 1:
+            if smap is not None and smap.shape[0] == u_loc.shape[0]:
+                return _pad_1d(smap, u_loc)
+            if fmap is not None and fmap.shape[0] == u_loc.shape[0]:
+                return _pad_1d(fmap, u_loc)
+            raise ValueError(
+                f"Cannot pad coeffs (1D) for '{field_name}' on side {side}: "
+                f"len(u_loc)={u_loc.shape[0]}, len(side_map)={None if smap is None else smap.shape[0]}, "
+                f"len(field_map)={None if fmap is None else fmap.shape[0]}, target={tgt}"
+            )
+
+        elif u_loc.ndim == 2:
+            if smap is not None and smap.shape[0] == u_loc.shape[1]:
+                return _pad_2d(smap, u_loc)
+            if fmap is not None and fmap.shape[0] == u_loc.shape[1]:
+                return _pad_2d(fmap, u_loc)
+            raise ValueError(
+                f"Cannot pad coeffs (2D) for '{field_name}' on side {side}: "
+                f"u_loc.shape[1]={'None' if u_loc.ndim < 2 else u_loc.shape[1]}, "
+                f"len(side_map)={None if smap is None else smap.shape[0]}, "
+                f"len(field_map)={None if fmap is None else fmap.shape[0]}, target={tgt}"
+            )
+
+        else:
+            raise ValueError(f"Unsupported coeffs ndim={u_loc.ndim} for field '{field_name}'")
+
+
+    @staticmethod
+    def _align_phi_and_coeffs_to_global(ctx, side, field_name, phi, u_loc):
+        """
+        Convenience: returns (phi_aligned, u_aligned), both in the same global layout
+        if ctx['global_dofs'] is present; otherwise returns inputs unchanged.
+        """
+        tgt = HelpersAlignCoefficents._target_len_from_ctx(ctx)
+        if tgt is None:
+            return phi, u_loc
+        phi_g = HelpersAlignCoefficents._pad_basis_to_global(ctx, side, field_name, phi)
+        u_g   = HelpersAlignCoefficents._pad_coeffs_to_global(ctx, side, field_name, u_loc)
+        # Final sanity: shapes must match along the dof axis
+        if phi_g.ndim == 1 and u_g.ndim == 1:
+            assert phi_g.shape[0] == u_g.shape[0], "Basis/coeff size mismatch after padding"
+        elif phi_g.ndim == 2 and u_g.ndim == 2:
+            assert phi_g.shape[1] == u_g.shape[1], "Basis/coeff width mismatch after padding"
+        elif phi_g.ndim == 2 and u_g.ndim == 1:
+            assert phi_g.shape[1] == u_g.shape[0], "Basis width vs coeff length mismatch after padding"
+        elif phi_g.ndim == 1 and u_g.ndim == 2:
+            assert phi_g.shape[0] == u_g.shape[1], "Basis length vs coeff width mismatch after padding"
+        return phi_g, u_g

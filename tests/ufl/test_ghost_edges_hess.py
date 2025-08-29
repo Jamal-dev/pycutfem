@@ -67,7 +67,7 @@ def setup_quad2():
     mesh.classify_edges(level_set)
 
     ghost = mesh.edge_bitset('ghost')
-    fig, ax = plt.subplots(figsize=(10, 8))
+    # fig, ax = plt.subplots(figsize=(10, 8))
     # plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True, 
     #           plot_nodes=False, elem_tags=True, edge_colors=True)
     assert ghost.cardinality() > 0, "Mesh should contain ghost edges for the test."

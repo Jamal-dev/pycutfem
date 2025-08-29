@@ -54,7 +54,8 @@ from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo,
                                   phys_scalar_third_row, 
                                   phys_scalar_fourth_row,
                                   _as_indices,
-                                  HelpersFieldAware as _hfa)
+                                  HelpersFieldAware as _hfa,
+                                  HelpersAlignCoefficents as _hac)
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 from pycutfem.ufl.helpers_geom import (
@@ -155,6 +156,10 @@ class FormCompiler:
     def _gradinfo(self, data: np.ndarray, role: str, node, field_names, coeffs=None):
         meta = self._op_meta_from_ctx(node, field_names)
         return GradOpInfo(np.asarray(data), role=role, coeffs=coeffs, **meta)
+    def _hessinfo(self, data: np.ndarray, role: str, node, field_names, coeffs=None):
+        meta = self._op_meta_from_ctx(node, field_names)
+        return HessOpInfo(np.asarray(data), role=role, coeffs=coeffs, **meta)
+
 
 
     # ============================ PUBLIC API ===============================
@@ -673,45 +678,52 @@ class FormCompiler:
 
     def _visit_Function(self, n: Function):
         logger.debug(f"Visiting Function: {n.field_name}")
-        u_loc = n.get_nodal_values(self._local_dofs())      # element-local coeffs
-        phi   = self._b(n.field_name)                       # trace on current side
 
-        # ghost-edge: enlarge coeff vector to |global_dofs|
-        if phi.shape[0] != u_loc.shape[0] and "global_dofs" in self.ctx:
-            padded = np.zeros_like(phi)
-            side = self._get_side()
-            amap = _hfa.get_field_map(self.ctx, side, n.field_name)
-            if amap is None:
-                # Fallback for safety if per-field map is missing
-                amap = self.ctx["pos_map"] if side == '+' else self.ctx["neg_map"]
-            padded[amap] = u_loc
-            u_loc = padded
+        # element-union coeffs for the *current side* and the side-trace basis row
+        local_dofs = self._local_dofs()
+        u_loc = n.get_nodal_values(local_dofs)   # (n_loc,)
+        phi   = self._b(n.field_name)            # (n_loc,) or already padded
 
+        # On ghost/interface paths, align BOTH basis and coeffs to the same global layout
+        gd = self.ctx.get("global_dofs", None)
+        if gd is not None:
+            side = self._get_side()  # '+' or '-'
+            phi, u_loc = _hac._align_phi_and_coeffs_to_global(self.ctx, side, n.field_name, phi, u_loc)
+
+        # Elementwise product: returns a single block (keep legacy shape: list of 1 vector)
         data = [u_loc * phi]
         return self._vecinfo(data, role="function", node=n, field_names=[n.field_name])
 
     def _visit_VectorFunction(self, n: VectorFunction):
         logger.debug(f"Visiting VectorFunction: {n.field_names}")
-        # Keep only components matching an explicit side (if any)
+        # Keep only components matching an explicit side (if any filter is in effect)
         names = _hfa._filter_fields_for_side(self, n, list(n.field_names))
         comp_by_name = {fn: comp for fn, comp in zip(n.field_names, n.components)}
+
         local_dofs = self._local_dofs()
         blocks = []
         for fld in names:
-            coeffs = comp_by_name[fld].get_nodal_values(local_dofs)  # (n_loc,)
-            phi    = self._b(fld)                                    # (n_loc,)
-            if phi.shape[0] != coeffs.shape[0] and 'global_dofs' in self.ctx:
+            coeffs = comp_by_name[fld].get_nodal_values(local_dofs)  # (n_loc,) or (ncomp, n_loc)
+            phi    = self._b(fld)                                    # (n_loc,) or (ncomp, n_loc)
+
+            gd = self.ctx.get("global_dofs", None)
+            if gd is not None:
                 side = self._get_side()
-                amap = _hfa.get_field_map(self.ctx, side, fld) 
-                if amap is None:
-                    amap = self.ctx.get('pos_map') if side == '+' else self.ctx.get('neg_map')
-                padded = np.zeros_like(phi)
-                if amap is not None:
-                    padded[np.asarray(amap, dtype=int)] = coeffs
-                    coeffs = padded
+                phi, coeffs = _hac._align_phi_and_coeffs_to_global(self.ctx, side, fld, phi, coeffs)
+
+            # Elementwise product per component
             blocks.append(coeffs * phi)
-        data = np.stack(blocks) if blocks else np.zeros((0, len(local_dofs)))
+
+        if blocks:
+            # stack along component axis; resulting shape: (ncomp_total, ndofs_global_or_local)
+            data = np.stack(blocks)
+        else:
+            # produce an empty (0, width) block with the correct width for downstream code
+            width = len(self.ctx["global_dofs"]) if self.ctx.get("global_dofs") is not None else len(local_dofs)
+            data = np.zeros((0, width))
+
         return self._vecinfo(data, role="function", node=n, field_names=names)
+
 
 
 
@@ -802,22 +814,20 @@ class FormCompiler:
     def _visit_Hessian(self, n: Hessian):
         """
         Build per-component Hessian tables.
-          • Test/Trial → data shape (k, n, 2, 2).
-          • Function   → collapsed per component, data shape (k, 2, 2).
+        • Test/Trial → (k, n, 2, 2) per-component per-DOF Hessian tables.
+        • Function   → (k, 2, 2) per-component collapsed Hessians at the QP.
         """
         op = n.operand
 
-        # Jump(u_pos,u_neg): evaluate sided Hessians via _visit_Jump
+        # Distribute over sided/jump operators so side selection happens upstream.
         if isinstance(op, Jump):
             return self._visit(Jump(Hessian(op.u_pos), Hessian(op.u_neg)))
-
-        # Pos/Neg: gate the Hessian result on the active side
         if isinstance(op, Pos):
             return self._visit(Pos(Hessian(op.operand)))
         if isinstance(op, Neg):
             return self._visit(Neg(Hessian(op.operand)))
 
-        # Determine role
+        # Role + component names
         if isinstance(op, (TestFunction, VectorTestFunction)):
             role = "test"
         elif isinstance(op, (TrialFunction, VectorTrialFunction)):
@@ -825,49 +835,48 @@ class FormCompiler:
         elif isinstance(op, (Function, VectorFunction)):
             role = "function"
         else:
-            raise NotImplementedError(f"Hessian not implemented for {type(op)}")
+            role = "none"
 
-        # Determine component list
-        if isinstance(op, (VectorFunction, VectorTestFunction, VectorTrialFunction)):
-            fields = list(op.field_names)  # e.g. ["ux","uy"]
-        else:
-            fields = [op.field_name]
+        fields = op.field_names if hasattr(op, "field_names") else [op.field_name]
 
-        local_dofs = self._local_dofs()
-
-        # helper to get padded coefficients once per component
-        def _get_coeff(i):
-            key = (id(op), i, tuple(local_dofs))
-            c = self._coeff_cache.get(key)
-            if c is None:
-                if hasattr(op, "components"):
-                    c = op.components[i].padded_values(local_dofs)
-                else:
-                    c = op.padded_values(local_dofs)
-                self._coeff_cache[key] = c
-            return c
-
-        k_blocks = []
+        # -- Function: collapse per component: H_ij(xq) = Σ_n H_ij(n) * u_n
         if role == "function":
-            # collapse once per component and cache result per QP
+            local_dofs = self._local_dofs()
+
+            def _get_coeff(comp_idx: int) -> np.ndarray:
+                key = (id(op), "coef", comp_idx, tuple(local_dofs))
+                c = self._coeff_cache.get(key)
+                if c is None:
+                    if hasattr(op, "components"):
+                        c = op.components[comp_idx].padded_values(local_dofs)
+                    else:
+                        c = op.padded_values(local_dofs)
+                    self._coeff_cache[key] = c
+                return c
+
+            k_blocks = []
             for i, fld in enumerate(fields):
-                key_coll = (id(op), "hess", i, self.ctx.get("eid"), self.ctx.get("side"), self.ctx.get("phi_val"))
+                key_coll = (id(op), "Hcoll", i, tuple(local_dofs))
                 Hval = self._collapsed_cache.get(key_coll)
                 if Hval is None:
-                    Htbl = self._hess(fld)                    # (n,2,2)
-                    coeffs = _get_coeff(i)                    # (n,)
-                    Hval = np.einsum("nij,n->ij", Htbl, coeffs, optimize=True)  # (2,2)
+                    Htbl   = self._hess(fld)             # (n, 2, 2); padded to union if on ghost/interface
+                    coeffs = _get_coeff(i)               # (n,)
+                    Hval   = np.einsum("nij,n->ij", Htbl, coeffs, optimize=True)  # (2, 2)
                     self._collapsed_cache[key_coll] = Hval
                 k_blocks.append(Hval)
-            data = np.stack(k_blocks)                          # (k,2,2)
-            return HessOpInfo(data, role=role)                 # coeffs=None → already collapsed
-        else:
-            # build basis tables per component
-            for fld in fields:
-                Htbl = self._hess(fld)                         # (n,2,2)
-                k_blocks.append(Htbl)
-            data = np.stack(k_blocks)                          # (k,n,2,2)
-            return HessOpInfo(data, role=role)
+
+            data = np.stack(k_blocks)                    # (k, 2, 2)
+            return self._hessinfo(data, role=role, node=op, field_names=fields)
+
+        # -- Test/Trial: return the per-DOF Hessian tables
+        k_blocks = []
+        for fld in fields:
+            Htbl = self._hess(fld)                       # (n, 2, 2); padded to union if on ghost/interface
+            k_blocks.append(Htbl)
+
+        data = np.stack(k_blocks)                        # (k, n, 2, 2)
+        return self._hessinfo(data, role=role, node=op, field_names=fields)
+
 
     def _visit_Laplacian(self, n: Laplacian):
         """
@@ -980,62 +989,7 @@ class FormCompiler:
         #       f" roles: result={getattr(result, 'role', None)}"
         #       f" types: result={type(result)}")
         return result
-        # scalar * scalar multiplication
-        if np.isscalar(a) and np.isscalar(b):
-            return a * b
-        # RHS: (Function) * (Function)  → scalar
-        if (isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo)
-            and a.role == b.role == "function"):
-            return a * b          # delegates to VecOpInfo.__mul_
-        # First, handle context-specific RHS assembly.
-        if self.ctx["rhs"]:
-            # Case 1: (known Function) * (Test Function) -> results in a vector
-            if isinstance(a, VecOpInfo) and a.role == "function" and isinstance(b, VecOpInfo) and b.role == "test":
-                return a * b
-
-            # Symmetric orientation
-            if isinstance(b, VecOpInfo) and b.role == "function" and isinstance(a, VecOpInfo) and a.role == "test":
-                return a * b
-            
-
-            # Case 2: (scalar Constant) * (Test Function) -> results in a vector
-            # This now takes precedence over the general scalar multiplication.
-            if np.isscalar(a) and isinstance(b, VecOpInfo) and b.role == "test":
-                # if b.data.shape[0] == 1: # special scalar case
-                #     # This correctly returns a numeric array, not a VecOpInfo object.
-                #     return a * b.data[0]
-                # return VecOpInfo(a * b.data, role="test")
-                return a * b
-            if np.isscalar(b) and isinstance(a, VecOpInfo) and a.role == "test":
-                # if a.data.shape[0] == 1:
-                #     return b * a.data[0]
-                # return VecOpInfo(b * a.data, role="test")
-                return b * a
-            elif isinstance(b, np.ndarray) and isinstance(a, VecOpInfo):
-                return a * b # p * normal
-            elif isinstance(a, np.ndarray) and isinstance(b, VecOpInfo):
-                return b * a # normal * p
         
-        # --- General Purpose Logic (used mostly for LHS) ---
-
-        # General scalar multiplication (if not a special RHS case)
-        if np.isscalar(a) and isinstance(b, (VecOpInfo, GradOpInfo, np.ndarray, HessOpInfo)):
-            return a * b
-        if np.isscalar(b) and isinstance(a, (VecOpInfo, GradOpInfo, np.ndarray)):
-            return b * a
-            
-        # LHS Matrix Assembly: (Test * Trial)
-        if not self.ctx["rhs"]:
-            if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
-                return a * b
-            elif isinstance(b, np.ndarray) and isinstance(a, VecOpInfo):
-                return a * b
-            elif isinstance(a, np.ndarray) and isinstance(b, VecOpInfo):
-                return b * a
-        
-        raise TypeError(f"Unsupported product 'type(a)={type(a)}, type(b)={type(b)}'{n.a} * {n.b}' for {'RHS' if self.ctx['rhs'] else 'LHS'}"
-                        f" for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}"
-                        f" and data shapes a={shape_a}, b={shape_b}"    )
 
         
 
@@ -1060,10 +1014,8 @@ class FormCompiler:
             # Case 1: Function · Test  (VecOpInfo, VecOpInfo)
             if  isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
                 if a.role == "function" and b.role == "test":
-
                     return a.dot_vec(b)  # function . test
                 if b.role == "function" and a.role == "test":
-                    
                     return b.dot_vec(a)  # test . function
 
 
@@ -1216,12 +1168,12 @@ class FormCompiler:
         # --- Hessian · vector (right) and vector · Hessian (left) -------------
         # Accept geometric constant vectors (facet normals) or plain numpy 1D vectors.
         if isinstance(a, HessOpInfo) and (
-            isinstance(b, np.ndarray) or (isinstance(b, VecOpInfo) and role_b in {"function",None})
+            (isinstance(b, np.ndarray) and b.ndim == 1) or (isinstance(b, VecOpInfo) and role_b in {"function",None,"vector"})
         ):
             return a.dot_right(b)
 
         if isinstance(b, HessOpInfo) and (
-            isinstance(a, np.ndarray) or (isinstance(a, VecOpInfo) and role_a in {"function",None} )
+            (isinstance(a, np.ndarray) and a.ndim == 1) or (isinstance(a, VecOpInfo) and role_a in {"function",None,"vector"})
         ):
             return b.dot_left(a)
         
@@ -1247,97 +1199,13 @@ class FormCompiler:
         # ============================= RHS =============================
         if rhs:
             # ---- Hessian(Function) · Hessian(Test/Trial)  → (n,) ----
-            if isinstance(a, HessOpInfo) and isinstance(b, HessOpInfo):
-                if a.role == 'function' and b.role in ('test', 'trial'):
-                    # a.data is either (k,2,2) collapsed or (k,n,2,2) + a.coeffs
-                    if a.coeffs is not None and a.data.ndim == 4:
-                        kdij = np.einsum('knij,kn->kij', a.data, a.coeffs, optimize=True)  # (k,2,2)
-                    else:
-                        kdij = a.data  # (k,2,2) already collapsed
-                    f = np.einsum('kij,knij->n', kdij, b.data, optimize=True)  # (n,)
-                    return f
-                if b.role == 'function' and a.role in ('test', 'trial'):
-                    if b.coeffs is not None and b.data.ndim == 4:
-                        kdij = np.einsum('knij,kn->kij', b.data, b.coeffs, optimize=True)
-                    else:
-                        kdij = b.data
-                    f = np.einsum('kij,knij->n', kdij, a.data, optimize=True)
-                    return f
-                if a.role == 'function' and b.role == 'function':
-                    def _collapse(g: HessOpInfo):
-                        if g.data.ndim == 4:               # (k,n,2) with coeffs
-                            if g.coeffs is None:
-                                raise ValueError("HessOpInfo(function) with 4D data requires coeffs to collapse.")
-                            return np.einsum("knij,kn->kij", g.data, g.coeffs, optimize=True)  # (k,2)
-                        return g.data                      # already (k,2)
-                    A = _collapse(a)
-                    B = _collapse(b)
-                    if A.ndim == B.ndim == 3:
-                        return float(np.einsum("kij,kij->", A, B, optimize=True))
-                    raise ValueError(f"RHS inner(Hess,Hess) expects 3D data; got {A.shape}, {B.shape}")
-
-                raise NotImplementedError(f"Unsupported RHS Hessian inner-product configuration: "
-                                        f"a.role={getattr(a,'role',None)}, b.role={getattr(b,'role',None)}")
-
-            # ---- Grad(Function) · Grad(Test/Trial)  → (n,) ----
-            if isinstance(a, GradOpInfo) and isinstance(b, GradOpInfo):
-                if a.role == "function" and b.role in ("test", "trial"):
-                    # a is (k,d) collapsed OR (k,n,d)+coeffs
-                    if a.coeffs is not None and a.data.ndim == 3:
-                        grad_val = np.einsum("knd,kn->kd", a.data, a.coeffs, optimize=True)  # (k,d)
-                    else:
-                        grad_val = a.data  # (k,d)
-                    return np.einsum("kd,knd->n", grad_val, b.data, optimize=True)
-                if b.role == "function" and a.role in ("test", "trial"):
-                    if b.coeffs is not None and b.data.ndim == 3:
-                        grad_val = np.einsum("knd,kn->kd", b.data, b.coeffs, optimize=True)
-                    else:
-                        grad_val = b.data
-                    return np.einsum("kd,knd->n", grad_val, a.data, optimize=True)
-                if a.role == "function" and b.role == "function":
-                    # collapse to (k,2) if needed
-                    def _collapse(g: GradOpInfo):
-                        if g.data.ndim == 3:               # (k,n,2) with coeffs
-                            if g.coeffs is None:
-                                raise ValueError("GradOpInfo(function) with 3D data requires coeffs to collapse.")
-                            return np.einsum("knd,kn->kd", g.data, g.coeffs, optimize=True)  # (k,2)
-                        return g.data                      # already (k,2)
-                    A = _collapse(a)
-                    B = _collapse(b)
-                    if A.ndim == B.ndim == 2:
-                        return float(np.einsum("kd,kd->", A, B, optimize=True))
-                    raise ValueError(f"RHS inner(Grad,Grad) expects 2D data; got {A.shape}, {B.shape}")
-                # (test,trial) or (trial,test) would be LHS; fall through to LHS block below.
-            
-            # ---- Vec(Function) · Vec(Test/Trial)  (e.g., Laplacian) → (n,) ----
-            if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
-                # We rely on visitors to collapse Function operands to (k,)
-                if a.role == "function" and b.role in ("test", "trial"):
-                    return a.inner(b)  # handles (k,) ⨯ (k,n) → (n,)
-                if b.role == "function" and a.role in ("test", "trial"):
-                    return b.inner(a)  # handles (k,n) ⨯ (k,) → (n,)
-                if a.role == "function" and b.role == "function":
-                    # both collapsed to (k,) → scalar
-                    A, B = a.data, b.data
-                    if A.ndim == B.ndim == 1:
-                        return np.dot(A,B)
-                    raise ValueError(f"RHS inner(Function,Function) expects 1D data; got {A.shape}, {B.shape}")
-                if a.role == "vector" and b.role == "vector":
-                    return np.dot(a.data, b.data)  # both (d,) → scalar
-
+            if isinstance(a, (HessOpInfo, VecOpInfo, GradOpInfo)) and isinstance(b, (HessOpInfo, VecOpInfo, GradOpInfo)):
+                return a.inner(b)  # returns (n,) vector
             # ---- Numeric tensor with Grad basis on RHS ----
-            def is_vector(a):
-                return (isinstance(a,np.ndarray) and a.ndim == 1) or (isinstance(a,VecOpInfo) and a.role=="vector") 
-            if is_vector(a) and isinstance(b, VecOpInfo) and a.ndim == 1:
-                if b.role == "function":
-                    u_vals = np.sum(b.data, axis=1)
-                    return np.dot(a, u_vals)
-                return np.einsum("k,kn->n", a, b.data, optimize=True)
-            if is_vector(b) and isinstance(a, VecOpInfo) and b.ndim == 1:
-                if a.role == "function":
-                    u_vals = np.sum(a.data, axis=1)
-                    return np.dot(b, u_vals)
-                return np.einsum("k,kn->n", b, a.data, optimize=True)
+            if isinstance(a, ( VecOpInfo)) and isinstance(b, (np.ndarray, VecOpInfo)):
+                return a.inner(b)  # returns (n,) vector
+            if isinstance(b, ( VecOpInfo)) and isinstance(a, (np.ndarray, VecOpInfo)):
+                return b.inner(a)
             if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
                 if a.ndim == 1 and b.ndim == 1:
                     return float(np.einsum("k,k->", a, b, optimize=True))
@@ -1937,7 +1805,7 @@ class FormCompiler:
         md      = intg.measure.metadata or {}
         derivs  = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
         derivs |= {(0, 0), (1, 0), (0, 1)}  # always have value and ∂x, ∂y
-        self.ctx['is_interface'] = False
+        self.ctx['is_interface'] = True
 
         # Close up to max total order (covers Hessian cross-terms etc.)
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
