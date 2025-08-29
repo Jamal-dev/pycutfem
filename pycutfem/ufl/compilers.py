@@ -260,11 +260,14 @@ class FormCompiler:
                 row = row[field_slice]  # make it field-local unconditionally
 
             # Optional per-field side mask (field-local)
-            mask_dict = self.ctx.get("pos_mask_by_field") if side == '+' else self.ctx.get("neg_mask_by_field")
-            if isinstance(mask_dict, dict):
-                m_local = mask_dict.get(field)
-                if m_local is not None and len(row) == len(m_local):
-                    row = row * m_local  # apply while still field-local
+            apply_mask = bool(self.ctx.get("mask_basis", False))
+            mask_dict = None
+            if apply_mask:
+                mask_dict = self.ctx.get("pos_mask_by_field") if side == '+' else self.ctx.get("neg_mask_by_field")
+                if isinstance(mask_dict, dict):
+                    m_local = mask_dict.get(field)
+                    if m_local is not None and len(row) == len(m_local):
+                        row = row * m_local  # apply while still field-local
 
             # Pad to union layout only if assembling a mat/vec
             if g is not None:
@@ -678,6 +681,8 @@ class FormCompiler:
 
     def _visit_Function(self, n: Function):
         logger.debug(f"Visiting Function: {n.field_name}")
+        # gatting with the mask
+        self.ctx["mask_basis"] = True
 
         # element-union coeffs for the *current side* and the side-trace basis row
         local_dofs = self._local_dofs()
@@ -696,6 +701,8 @@ class FormCompiler:
 
     def _visit_VectorFunction(self, n: VectorFunction):
         logger.debug(f"Visiting VectorFunction: {n.field_names}")
+        # gatting with the mask
+        self.ctx["mask_basis"] = True
         # Keep only components matching an explicit side (if any filter is in effect)
         names = _hfa._filter_fields_for_side(self, n, list(n.field_names))
         comp_by_name = {fn: comp for fn, comp in zip(n.field_names, n.components)}
@@ -730,17 +737,23 @@ class FormCompiler:
     # --- Unknowns (represented by basis functions) ---
     def _visit_TestFunction(self, n):
         logger.debug(f"Visiting TestFunction: {n.field_name}")
+        # gatting with the mask
+        self.ctx["mask_basis"] = False
         row = self._lookup_basis(n.field_name, (0, 0))[np.newaxis, :]
         return self._vecinfo(row, role="test", node=n, field_names=[n.field_name])
 
     def _visit_TrialFunction(self, n):
         logger.debug(f"Visiting TrialFunction: {n.field_name}")
+        # gatting with the mask
+        self.ctx["mask_basis"] = False
         row = self._lookup_basis(n.field_name, (0, 0))[np.newaxis, :]
         return self._vecinfo(row, role="trial", node=n, field_names=[n.field_name])
 
 
     def _visit_VectorTestFunction(self, n):
         logger.debug(f"Visiting VectorTestFunction: {n.field_names}")
+        # gatting with the mask
+        self.ctx["mask_basis"] = False
         names = _hfa._filter_fields_for_side(self, n, list(n.field_names))
         rows = [self._lookup_basis(f, (0, 0)) for f in names]
         data  = np.stack(rows) if rows else np.zeros((len(n.field_names), self._zero_width()))
@@ -748,6 +761,8 @@ class FormCompiler:
 
     def _visit_VectorTrialFunction(self, n):
         logger.debug(f"Visiting VectorTrialFunction: {n.field_names}")
+        # gatting with the mask
+        self.ctx["mask_basis"] = False
         names = _hfa._filter_fields_for_side(self, n, list(n.field_names))
         rows = [self._lookup_basis(f, (0, 0)) for f in names]
         data  = np.stack(rows) if rows else np.zeros((len(n.field_names), self._zero_width()))
@@ -1805,7 +1820,7 @@ class FormCompiler:
         md      = intg.measure.metadata or {}
         derivs  = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
         derivs |= {(0, 0), (1, 0), (0, 1)}  # always have value and ∂x, ∂y
-        self.ctx['is_interface'] = True
+        self.ctx['is_interface'] = False
 
         # Close up to max total order (covers Hessian cross-terms etc.)
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)

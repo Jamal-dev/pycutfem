@@ -321,6 +321,10 @@ class VecOpInfo(BaseOpInfo):
             elif role_a in {"function"} and role_b in {"vector"}:
                 fun = _collapsed_function(self)
                 return np.dot(B, fun)
+            elif role_a in {"vector"} and role_b in {"test"}:
+                return np.dot(A, B)
+            elif role_a in {"test"} and role_b in {"vector"}:
+                return np.dot(B, A)
             elif role_a == None and A.ndim == 1:
                 if role_b in {"function"}:
                     fun = _collapsed_function(other)
@@ -341,7 +345,8 @@ class VecOpInfo(BaseOpInfo):
                 return test_var.data.T @ trial_var.data # (n,n)
 
         raise ValueError(f"Unsupported inner dims A{A.shape}, B{B.shape} for VecOpInfo."
-                         f" Roles: A={role_a}, B={role_b}.")
+                         f" Roles: A={role_a}, B={role_b}."
+                         f" is_rhs: {self.is_rhs}")
     
 
     def dot_const(self, const: np.ndarray):
@@ -682,8 +687,8 @@ class GradOpInfo(BaseOpInfo):
         raise ValueError(f"Unexpected function gradient shape: {self.data.shape}")
 
     def inner(self, other: "GradOpInfo") -> np.ndarray:
-        if not isinstance(other, GradOpInfo) or self.data.shape != other.data.shape:
-            raise ValueError(...)
+        # if not isinstance(other, GradOpInfo) or self.data.shape != other.data.shape:
+        #     raise ValueError(f"Incompatible GradOpInfo shapes: {self.data.shape} and {other.data.shape}.")
         if self.is_rhs:
             if self.role in {"function"} and other.role in {"trial", "test"}:
                 # Case: Function · Grad(Trial) or Grad(Test)  -> (n,)

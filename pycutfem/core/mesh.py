@@ -54,6 +54,10 @@ class Mesh:
         self._edge_bitsets: Dict[str, BitSet] = {}
         self.areas_list: Optional[np.ndarray] = self.areas()
 
+    def num_elements(self) -> int:
+        """Returns the number of elements in the mesh."""
+        return self.n_elements
+
     def _build_topology(self):
         """
         Builds the full mesh topology: Elements, Edges, and Neighbors.

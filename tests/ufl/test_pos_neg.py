@@ -1,6 +1,8 @@
 import numpy as np
 from collections import defaultdict
 import pytest
+from scipy.sparse.linalg import norm as spnorm
+
 
 # --- Core imports from the project ---
 from pycutfem.core.mesh import Mesh
@@ -14,9 +16,13 @@ from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
 # --- UFL / Compiler imports ---
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, Function,
-    Pos, Neg, Jump
+    Pos, Neg, Jump, ElementWiseConstant, FacetNormal, Constant,
+    dot, inner, grad
 )
 from pycutfem.ufl.compilers import FormCompiler
+from pycutfem.ufl.measures import *
+from pycutfem.ufl.forms import Equation, assemble_form
+
 
 
 # ------------------------------ Test helpers ------------------------------
@@ -189,6 +195,143 @@ def setup_multifield_environment():
         "ghost_edge_data": ghost_edge_data,
         "interface_data": interface_data
     }
+
+@pytest.fixture(scope="module")
+def mini_interface_setup():
+    poly = 2
+    L = H = 2.0
+    nx = ny = 6
+    nodes, elems, _, corners = structured_quad(L,H,nx=nx,ny=ny,poly_order=poly,offset=[-L/2,-H/2])
+    mesh = Mesh(nodes, element_connectivity=elems, 
+                elements_corner_nodes=corners, poly_order=poly, element_type='quad')
+
+    # circle centered at origin, radius so both +/− present & several cut cells
+    phi = CircleLevelSet(center=(0.0,0.0), radius=0.65)
+
+    # classify + build Γ
+    mesh.classify_elements(phi)
+    mesh.classify_edges(phi)
+    mesh.build_interface_segments(phi)
+
+    # element sets
+    inside  = mesh.element_bitset("inside")   # φ < 0
+    outside = mesh.element_bitset("outside")  # φ > 0
+    cut     = mesh.element_bitset("cut")
+
+    # ghost sets (keep them available even if we don't use them first)
+    g_pos  = mesh.edge_bitset("ghost_pos")
+    g_neg  = mesh.edge_bitset("ghost_neg")
+    g_both = mesh.edge_bitset("ghost_both")
+    g_if   = mesh.edge_bitset("interface")
+    ghost_pos = g_pos | g_both | g_if
+    ghost_neg = g_neg | g_both | g_if
+
+    me = MixedElement(mesh, field_specs={'u_outside': poly, 'u_inside': poly})
+    dh = DofHandler(me, method='cg')
+
+    dx_pos = dx(defined_on=outside | cut, level_set=phi, metadata={'side': '+', 'q': poly+2})
+    dx_neg = dx(defined_on=inside  | cut, level_set=phi, metadata={'side': '-', 'q': poly+2})
+    dGamma = dInterface(defined_on=cut, level_set=phi, metadata={'q': poly+2})
+    dGpos  = dGhost(defined_on=ghost_pos, level_set=phi, metadata={'q': poly+2})
+    dGneg  = dGhost(defined_on=ghost_neg, level_set=phi, metadata={'q': poly+2})
+
+    # trial/test
+    u_pos, v_pos = TrialFunction('u_outside', dh, side = '+'), TestFunction('u_outside', dh, side = '+')
+    u_neg, v_neg = TrialFunction('u_inside',  dh, side = '-'), TestFunction('u_inside',  dh, side = '-')
+
+    # normals & constants
+    n = FacetNormal()
+    one = Constant(1.0)
+    alpha_pos = Constant(1.0)
+    alpha_neg = Constant(20.0)
+
+    # simple kappas = 1 (avoid Hansbo scaling in the parity test)
+    kappa_p = Pos(ElementWiseConstant(np.ones(mesh.num_elements())))
+    kappa_m = Neg(ElementWiseConstant(np.ones(mesh.num_elements())))
+
+    return dict(
+        mesh=mesh, dh=dh, phi=phi,
+        dx_pos=dx_pos, dx_neg=dx_neg, dGamma=dGamma, dGpos=dGpos, dGneg=dGneg,
+        u_pos=u_pos, v_pos=v_pos, u_neg=u_neg, v_neg=v_neg,
+        n=n, one=one, alpha_pos=alpha_pos, alpha_neg=alpha_neg,
+        kappa_p=kappa_p, kappa_m=kappa_m
+    )
+
+def _assemble_K(a, dh, backend):
+    K, _ = assemble_form(Equation(a, None), dof_handler=dh, bcs=[], backend=backend)
+    return K.tocsr()
+
+
+def _compare_K(Kjit, Kpy, label, rtol=5e-12, atol=5e-13):
+    D = (Kjit - Kpy)
+    num = spnorm(D)
+    den = max(1.0, spnorm(Kjit))
+    rel = num / den
+    assert rel < rtol or num < atol, f"{label}: JIT vs PY mismatch — rel={rel:.3e}, abs={num:.3e}"
+
+
+@pytest.mark.parametrize("term", [
+    # --- volume terms (sanity) ---
+    "vol_pos", "vol_neg",
+
+    # --- interface penalty (no cells/ghost in play) ---
+    "iface_penalty",
+
+    # --- interface fluxes, each component separately and combined ---
+    "iface_flux_pos_only",
+    "iface_flux_neg_only",
+    "iface_flux_both",
+
+    # (optional) ghost grad-jump stabilizations — uncomment once volume/interface pass
+    "ghost_penalty_pos",
+    "ghost_penalty_neg",
+    "ghost_pos_gradjump",
+    "ghost_neg_gradjump",
+])
+def test_jit_python_parity(mini_interface_setup, term):
+    s = mini_interface_setup
+    u_pos, v_pos = s["u_pos"], s["v_pos"]
+    u_neg, v_neg = s["u_neg"], s["v_neg"]
+    dx_pos, dx_neg, dGamma = s["dx_pos"], s["dx_neg"], s["dGamma"]
+    n = s["n"]; alpha_pos, alpha_neg = s["alpha_pos"], s["alpha_neg"]
+    kappa_p, kappa_m = s["kappa_p"], s["kappa_m"]
+
+    jump_u = Jump(u_pos, u_neg)
+    jump_v = Jump(v_pos, v_neg)
+    # build each bilinear form in isolation
+    if term == "vol_pos":
+        a = inner(alpha_pos * grad(u_pos), grad(v_pos)) * dx_pos
+    elif term == "vol_neg":
+        a = inner(alpha_neg * grad(u_neg), grad(v_neg)) * dx_neg
+    elif term == "iface_penalty":
+        a = Constant(10.0) * jump_u * jump_v * dGamma   # pure penalty with simple constant
+    elif term == "iface_flux_pos_only":
+        jump_v = Jump(v_pos, v_neg)
+        a = (- kappa_p * alpha_pos * dot(grad(u_pos), n)) * jump_v * dGamma
+    elif term == "iface_flux_neg_only":
+        jump_v = Jump(v_pos, v_neg)
+        a = (- kappa_m * alpha_neg * dot(grad(u_neg), n)) * jump_v * dGamma
+    elif term == "iface_flux_both":
+        jump_u = Jump(u_pos, u_neg)
+        jump_v = Jump(v_pos, v_neg)
+        avg_flux_u = (- kappa_p * alpha_pos * dot(grad(u_pos), n)
+                      - kappa_m * alpha_neg * dot(grad(u_neg), n))
+        a = (avg_flux_u * jump_v + (- kappa_p * alpha_pos * dot(grad(v_pos), n)
+             - kappa_m * alpha_neg * dot(grad(v_neg), n)) * jump_u) * dGamma
+    elif term == "ghost_penalty_pos":
+        a = Constant(0.5) * jump_u * jump_v * s["dGpos"]
+    elif term == "ghost_penalty_neg":
+        a = Constant(0.5) * jump_u * jump_v * s["dGneg"]
+    elif term == "ghost_pos_gradjump":
+        a = Constant(0.5) * inner(Jump(grad(u_pos), grad(u_neg)), Jump(grad(v_pos), grad(v_neg))) * s["dGpos"]
+    elif term == "ghost_neg_gradjump":
+        a = Constant(0.5) * inner(Jump(grad(u_pos), grad(u_neg)), Jump(grad(v_pos), grad(v_neg))) * s["dGneg"]
+    else:
+        raise ValueError(term)
+
+    Kj = _assemble_K(a, s["dh"], backend="jit")
+    Kp = _assemble_K(a, s["dh"], backend="python")
+    _compare_K(Kj, Kp, term)
 
 
 # ------------------------------ Ghost-edge tests ------------------------------
