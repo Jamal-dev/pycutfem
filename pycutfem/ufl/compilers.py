@@ -996,8 +996,8 @@ class FormCompiler:
         # role_a = getattr(a, 'role', None)
         # role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Prod for  ('{n.a!r}' * '{n.b!r}') on {'RHS' if self.ctx['rhs'] else 'LHS'}") #, a.info={getattr(a, 'info', None)}, b.info={getattr(b, 'info', None)}
-        # print(f" Product: a type={type(a)}, shape={shape_a}, b type={type(b)}, shape={shape_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-        #       f" roles: a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
+        print(f" Product: a type={type(a)}, shape={shape_a}, b type={type(b)}, shape={shape_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+              f" roles: a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
 
         result = a * b
         # print(f" Product result: {getattr(result, 'shape', None)}"
@@ -2029,6 +2029,10 @@ class FormCompiler:
             geo.setdefault(f"r01_{fld}_pos", r01)
             geo.setdefault(f"r10_{fld}_neg", r10)
             geo.setdefault(f"r01_{fld}_neg", r01)
+            b = geo.get(f"b_{fld}")  # (nE, nQ, n_union) value table on interface
+            if b is not None:
+                geo.setdefault(f"r00_{fld}_pos", b)
+                geo.setdefault(f"r00_{fld}_neg", b)
 
         # ------------------------------------------------------------------
         # 3. Element‑to‑DOF map  (shape = n_cut × n_loc)

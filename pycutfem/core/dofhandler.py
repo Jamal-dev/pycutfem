@@ -303,6 +303,7 @@ class DofHandler:
 
         # Cache full per-field DOF lists (independent of node ids)
         self._field_slices = {f: np.array(sorted(field_gdof_sets[f]), dtype=int) for f in fields}
+        # self.field_num_dofs = {f: len(self._field_slices[f]) for f in fields}
 
 
 
@@ -1802,6 +1803,10 @@ class DofHandler:
             need_o4rq   = any(dx + dy == 4 for dx, dy in derivs) or need_o4
 
             # POS side reference tables
+            arr = np.empty((nE, nQ, n_f))
+            _tab(0, 0, xi_pos, eta_pos, arr)   # same _tab(...) you use for r10 etc.
+            basis_tables[f"r00_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+
             if need_grad:
                 arr = np.empty((nE, nQ, n_f)); _tab(1, 0, xi_pos, eta_pos, arr)
                 basis_tables[f"r10_{fld}_pos"] = _scatter_union(arr, sl, final_w)
@@ -1836,6 +1841,10 @@ class DofHandler:
                 basis_tables[f"r04_{fld}_pos"] = _scatter_union(arr, sl, final_w)
 
             # NEG side reference tables
+            # NEG side value (r00)
+            arr = np.empty((nE, nQ, n_f))
+            _tab(0, 0, xi_neg, eta_neg, arr)
+            basis_tables[f"r00_{fld}_neg"] = _scatter_union(arr, sl, final_w)
             if need_grad:
                 arr = np.empty((nE, nQ, n_f)); _tab(1, 0, xi_neg, eta_neg, arr)
                 basis_tables[f"r10_{fld}_neg"] = _scatter_union(arr, sl, final_w)

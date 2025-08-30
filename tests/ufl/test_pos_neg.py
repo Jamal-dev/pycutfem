@@ -232,8 +232,8 @@ def mini_interface_setup():
     dx_pos = dx(defined_on=outside | cut, level_set=phi, metadata={'side': '+', 'q': poly+2})
     dx_neg = dx(defined_on=inside  | cut, level_set=phi, metadata={'side': '-', 'q': poly+2})
     dGamma = dInterface(defined_on=cut, level_set=phi, metadata={'q': poly+2})
-    dGpos  = dGhost(defined_on=ghost_pos, level_set=phi, metadata={'q': poly+2})
-    dGneg  = dGhost(defined_on=ghost_neg, level_set=phi, metadata={'q': poly+2})
+    dGpos  = dGhost(defined_on=ghost_pos, level_set=phi, metadata={'q': poly+2, 'derivs': {(1,0),(0,1)}})
+    dGneg  = dGhost(defined_on=ghost_neg, level_set=phi, metadata={'q': poly+2, 'derivs': {(1,0),(0,1)}})
 
     # trial/test
     u_pos, v_pos = TrialFunction('u_outside', dh, side = '+'), TestFunction('u_outside', dh, side = '+')

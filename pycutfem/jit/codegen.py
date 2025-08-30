@@ -630,8 +630,11 @@ class NumbaCodeGen:
 
                 # helper: "dxy_" or "b_" + field name
                 def get_basis_arg_name(field_name, deriv):
+                    if deriv == (0, 0) and op.side in ("+", "-"):
+                        side_tag = "pos" if op.side == "+" else "neg"
+                        return f"r00_{field_name}_{side_tag}"   # <— was: "b_<field_name>"
                     d_str = f"d{deriv[0]}{deriv[1]}" if deriv != (0, 0) else "b"
-                    return f"{d_str}_{field_name}{side_suffix_basis}"
+                    return f"{d_str}_{field_name}"
 
                 basis_arg_names = [get_basis_arg_name(fname, deriv_order) for fname in field_names]
                 # Only request b_* / d** tables *here* when they are actually needed
@@ -1407,46 +1410,59 @@ class NumbaCodeGen:
             # ----------------------------------------------------------------------
             # ∇(·) operator
             # ----------------------------------------------------------------------
-            # --- UNARY OPERATORS ----------------------------------------------------------
-            # ∇(·)
-            # ------------------------------------------------------------------------------
             elif isinstance(op, Grad):
                 a = stack.pop()
 
-                # Which J^{-1} to use
-                if   a.side == "+":  jinv_sym = "J_inv_pos"; required_args.add("J_inv_pos")
-                elif a.side == "-":  jinv_sym = "J_inv_neg"; required_args.add("J_inv_neg")
-                else:                jinv_sym = "J_inv";     required_args.add("J_inv")
-                jinv_q = f"{jinv_sym}_q"    # 2×2 at (e,q)
+                # ------------------------------------------------------------------
+                # Choose the correct J^{-1} symbol (volume vs sided ghost/interface)
+                # ------------------------------------------------------------------
+                if   a.side == "+":
+                    jinv_sym = "J_inv_pos"; required_args.add("J_inv_pos")
+                elif a.side == "-":
+                    jinv_sym = "J_inv_neg"; required_args.add("J_inv_neg")
+                else:
+                    jinv_sym = "J_inv";     required_args.add("J_inv")
+                jinv_q = f"{jinv_sym}_q"  # 2x2 at (e,q)
 
                 # ======================================================================
-                # (A) grad(Test/Trial) → (k , n_loc_or_union , 2)
+                # (A) grad(Test/Trial)  -> shape (k , n_loc_or_union , 2)
                 # ======================================================================
                 if a.role in ("test", "trial"):
-                    # Keep old behavior for volume/interface (g_* tables),
-                    # but allow ghost facets to be padded to the union.
-                    grad_tab_names = [f"g_{f}" for f in a.field_names]
-                    for nm in grad_tab_names: required_args.add(nm)
 
                     phys = []
-                    for i in range(len(a.field_names)):
-                        pg_loc = new_var("grad_loc")
-                        body_lines.append(f"{pg_loc} = {grad_tab_names[i]}[e, q] @ {jinv_q}.copy()")
-                        if a.side:
-                            fld_i = a.field_names[i]
-                            s0 = self.me.component_dof_slices[fld_i].start; s1 = self.me.component_dof_slices[fld_i].stop
-                            pg_loc_s = new_var("grad_loc_s")
-                            body_lines.append(f"{pg_loc_s} = {pg_loc}[{s0}:{s1}, :]")
-                             
-                            # per-component side map (pos/neg decided per field, not by enclosing side)
+
+                    # Sided path (ghost/interface): use r10/r01 on the correct side,
+                    # map with J_inv_{pos|neg}, then pad to union via {side}_map_<field>.
+                    if a.side in ("+", "-"):
+                        required_args.add("gdofs_map")  # used for union width
+                        for i, fld_i in enumerate(a.field_names):
+                            # DOF slice for this component inside the union
+                            s0 = self.me.component_dof_slices[fld_i].start
+                            s1 = self.me.component_dof_slices[fld_i].stop
+
+                            # decide per-component side tag ("pos" or "neg")
                             side_tag = self._component_side_tag(a.side, a.field_sides, fld_i, i)
+
+                            n10 = f"r10_{fld_i}_{side_tag}"
+                            n01 = f"r01_{fld_i}_{side_tag}"
+                            required_args.update({n10, n01})
+
+                            # per-component side map (local rows -> union rows)
                             map_arr = f"{side_tag}_map_{fld_i}"
                             required_args.add(map_arr)
-                            map_e  = new_var(f"{map_arr}_e")
-                            pg_pad = new_var("grad_pad")
+
+                            pg_loc   = new_var("grad_loc")      # (n_loc, 2)
+                            pg_loc_s = new_var("grad_loc_s")    # (n_comp_loc, 2)
+                            map_e    = new_var(f"{map_arr}_e")  # (n_comp_loc,)
+                            pg_pad   = new_var("grad_pad")      # (n_union, 2)
+
                             body_lines += [
+                                f"d10_q = {n10}[e, q]",                               # (n_loc,)
+                                f"d01_q = {n01}[e, q]",                               # (n_loc,)
+                                f"{pg_loc} = np.stack((d10_q, d01_q), axis=1) @ {jinv_q}.copy()",  # (n_loc,2)
+                                f"{pg_loc_s} = {pg_loc}[{s0}:{s1}, :]",               # (n_comp_loc,2)
                                 f"{map_e} = {map_arr}[e]",
-                                f"n_union = gdofs_map[e].shape[0]",
+                                "n_union = gdofs_map[e].shape[0]",
                                 f"{pg_pad} = np.zeros((n_union, {self.spatial_dim}), dtype={self.dtype})",
                                 f"for j in range({pg_loc_s}.shape[0]):",
                                 f"    idx = {map_e}[j]",
@@ -1454,80 +1470,92 @@ class NumbaCodeGen:
                                 f"        {pg_pad}[idx] = {pg_loc_s}[j]",
                             ]
                             phys.append(pg_pad)
-                        else:
+
+                        n_dofs = -1  # union-sized
+
+                    else:
+                        # Volume (unsided): use volume gradient tables g_<field> with J_inv
+                        grad_tab_names = [f"g_{f}" for f in a.field_names]
+                        for nm in grad_tab_names:
+                            required_args.add(nm)
+
+                        for i, fld_i in enumerate(a.field_names):
+                            pg_loc = new_var("grad_loc")
+                            body_lines.append(f"{pg_loc} = {grad_tab_names[i]}[e, q] @ {jinv_q}.copy()")
                             phys.append(pg_loc)
 
-                    n_dofs = self.n_dofs_local if not a.side else -1
+                        n_dofs = self.n_dofs_local
+
+                    # Stack per-component physical gradients
                     if not a.is_vector:
-                        var = new_var("grad_scalar"); body_lines.append(f"{var} = {phys[0]}[None, :, :].copy()")
+                        var = new_var("grad_scalar")
+                        body_lines.append(f"{var} = {phys[0]}[None, :, :].copy()")
                         shape, is_vector, is_gradient = (1, n_dofs, self.spatial_dim), False, True
                     else:
-                        var = new_var("grad_stack"); body_lines.append(f"{var} = np.stack(({', '.join(phys)}))")
+                        var = new_var("grad_stack")
+                        body_lines.append(f"{var} = np.stack(({', '.join(phys)}))")
                         shape, is_vector, is_gradient = (len(a.field_names), n_dofs, self.spatial_dim), False, True
 
                     stack.append(a._replace(var_name=var, shape=shape,
-                                            is_gradient=is_gradient, is_vector=is_vector))
+                                            is_gradient=True, is_vector=False))
                     continue
 
                 # ======================================================================
-                # (B) grad(Function/VectorFunction)
+                # (B) grad(Function/VectorFunction)  (value role)
+                # returns: scalar: (2,), vector: (k,2)
                 # ======================================================================
                 if a.role == "value":
-                    # Base coefficient name (may already be an alias like "..._e" created earlier)
+                    # Base coeff alias (may already be '..._e')
                     coeff = (a.parent_name if a.parent_name.startswith("u_")
                             else f"u_{a.parent_name}_loc")
                     required_args.add(coeff)
 
                     comps = []
                     for i, fld in enumerate(a.field_names):
-                        
+
                         val = new_var("grad_val")
 
-                        if a.side in {"+", "-"}:
-                            s0 = self.me.component_dof_slices[fld].start; s1 = self.me.component_dof_slices[fld].stop
-                            # -------- GHOST FACET (side-restricted) -----------------------
-                            # per-edge, per-side reference derivative tables (length = n_loc)
+                        if a.side in ("+", "-"):
+                            # Sided: use r10/r01 on the correct side and the side map
+                            s0 = self.me.component_dof_slices[fld].start
+                            s1 = self.me.component_dof_slices[fld].stop
+
                             side_tag = self._component_side_tag(a.side, getattr(a, 'field_sides', None), fld, i)
                             d10 = f"r10_{fld}_{side_tag}"
                             d01 = f"r01_{fld}_{side_tag}"
                             required_args.update({d10, d01})
 
-                            # side map: union → this side's local dofs (length n_loc)
                             map_sym = f"{side_tag}_map_{fld}"
                             required_args.add(map_sym)
 
-                            # per-edge coeff alias: if alias already exists, use it; else slice once
                             coeff_e = coeff if coeff.endswith("_e") else f"{coeff}"
 
-                            g2   = new_var("g_ref2")   # (n_loc, 2) in (ξ,η)
-                            phys = new_var("g_phys2")  # (n_loc, 2) in (x,y)
-                            phys_s = new_var("g_phys2_s")
-                            u_sl = new_var("u_side")   # (n_loc,)
+                            g2     = new_var("g_ref2")        # (n_loc,2) in (ξ,η)
+                            phys   = new_var("g_phys2")       # (n_loc,2) in (x,y)
+                            phys_s = new_var("g_phys2_s")     # (n_comp_loc,2)
+                            u_sl   = new_var("u_side")        # (n_comp_loc,)
 
                             body_lines += [
-                                f"d10_q = {d10}[e, q]",                      # (n_loc,)
-                                f"d01_q = {d01}[e, q]",                      # (n_loc,)
-                                f"{g2}  = np.stack((d10_q, d01_q), axis=1)", # (n_loc,2)
-                                f"{phys}= {g2} @ {jinv_q}.copy()",           # J^{-1} on the correct side
-                                # slice to field rows
+                                f"d10_q = {d10}[e, q]",
+                                f"d01_q = {d01}[e, q]",
+                                f"{g2}   = np.stack((d10_q, d01_q), axis=1)",
+                                f"{phys} = {g2} @ {jinv_q}.copy()",
                                 f"{phys_s} = {phys}[{s0}:{s1}, :]",
-                                # slice union coeff -> local (n_loc,) using per-component side map
                                 f"{u_sl} = {coeff_e}[{map_sym}[e]]",
-                                f"{val} = {phys_s}.T.copy() @ {u_sl}",         # (2,)
+                                f"{val} = {phys_s}.T.copy() @ {u_sl}",   # (2,)
                             ]
 
                         else:
-                            # -------- VOLUME / INTERFACE (no side) ------------------------
+                            # Volume (unsided): use g_<field> with J_inv
                             gnm = f"g_{fld}"
                             required_args.add(gnm)
 
-                            # SAFE per-element coeff alias: never double-index
                             coeff_e = coeff if coeff.endswith("_e") else f"{coeff}"
                             pg = new_var("phys_grad_basis")
 
                             body_lines += [
                                 f"{pg}  = {gnm}[e, q] @ {jinv_q}.copy()",
-                                f"{val} = {pg}.T.copy() @ {coeff_e}",
+                                f"{val} = {pg}.T.copy() @ {coeff_e}",     # (2,)
                             ]
 
                         comps.append(val)
@@ -1548,6 +1576,7 @@ class NumbaCodeGen:
                     continue
 
                 raise NotImplementedError(f"Grad not implemented for role {a.role}")
+
 
 
 
@@ -2105,7 +2134,7 @@ class NumbaCodeGen:
                     stack.append(StackItem(var_name=res_var, role='trial',
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=a.field_names, parent_name=a.parent_name,
-                                        side=a.side, field_sides=field_sides or []))
+                                        side=a.side, field_sides=a.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot(grad(Function), grad(Trial)) and its transposed variants.
@@ -2370,13 +2399,15 @@ class NumbaCodeGen:
                             body_lines.append("# Dot: component vec · Hessian(basis)  (contract over k) -> (d1, n, d2)")
                             body_lines += [
                                 f"n_locs = {b.var_name}.shape[1]; d1 = {b.var_name}.shape[2]; d2 = {b.var_name}.shape[3]",
+                                f"print(f'n_locs: {{n_locs}}, d1: {{d1}}, d2: {{d2}}')",
                                 f"{res_var} = np.zeros((d1, n_locs, d2), dtype={self.dtype})",
                                 f"a_var = np.ascontiguousarray({a.var_name})",
                                 f"for n in range(n_locs):",
                                 f"    for j in range(d1):",
                                 f"        # (k,) · (k, d2) -> (d2,)",
                                 f"        b_slice = np.ascontiguousarray({b.var_name}[:, j, :])",
-                                f"        {res_var}[j, n, :] = np.dot(a_var, b_slice)",
+                                f"        result = a_var @ b_slice;",
+                                f"        {res_var}[j, n, :] = result",
                             ]
                             stack.append(StackItem(var_name=res_var, role=b.role,
                                                 shape=(d1, -1, d2),
