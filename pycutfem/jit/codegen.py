@@ -709,16 +709,21 @@ class NumbaCodeGen:
                             pad = new_var(f"padded_basis{i}")
                             body_lines += [
                                 f"{map_e} = {map_array_name}[e]",
-                                # slice the union-length reference vector down to this field
-                                f"{loc} = {bq}[{s0}:{s1}]",
-                                f"if n_union == {loc}.shape[0]:",            # fast path (interior facet)
+                                f"{loc}   = {bq}",
+                                "n_union = gdofs_map[e].shape[0]",
+                                # fast path: when local already matches the facet/ghost union
+                                f"if n_union == {loc}.shape[0]:",
                                 f"    {pad} = {loc}.copy()",
-                                f"else:",                                    # true ghost facet
+                                f"else:",
+                                # robust path: map length is the field-local size
+                                f"    m = {map_e}.shape[0]",
+                                # align owner-mixed (e.g. 22) to field-local (e.g. 9) only if needed
+                                f"    loc_vec = {loc} if {loc}.shape[0] == m else {loc}[{s0}:{s1}]",
                                 f"    {pad} = np.zeros(n_union, dtype={self.dtype})",
-                                f"    for j in range({loc}.shape[0]):",
+                                f"    for j in range(m):",
                                 f"        idx = {map_e}[j]",
                                 f"        if 0 <= idx < n_union:",
-                                f"            {pad}[idx] = {loc}[j]",
+                                f"            {pad}[idx] = loc_vec[j]",
                             ]
                             padded_vars.append(pad)
 
@@ -776,20 +781,21 @@ class NumbaCodeGen:
                             ]
                             if op.side:
                                 s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
-                                prow_s = new_var("prow_s")
-                                body_lines.append(f"{prow_s} = {prow}[{s0}:{s1}]")
                                 side_tag = self._component_side_tag(op.side, op.field_sides, fn, i)
                                 map_arr = f"{side_tag}_map_{fn}"
                                 required_args.add(map_arr)
                                 pad = new_var("pad"); me = new_var("me")
                                 body_lines += [
                                     f"{me} = {map_arr}[e]",
-                                    f"n_union = gdofs_map[e].shape[0]",
+                                    "n_union = gdofs_map[e].shape[0]",
+                                    # use map length; slice prow only if needed
+                                    f"m = {me}.shape[0]",
+                                    f"prow_vec = {prow} if {prow}.shape[0] == m else {prow}[{s0}:{s1}]",
                                     f"{pad} = np.zeros(n_union, dtype={self.dtype})",
-                                    f"for j in range({prow_s}.shape[0]):",
+                                    f"for j in range(m):",
                                     f"    idx = {me}[j]",
                                     "    if 0 <= idx < n_union:",
-                                    f"        {pad}[idx] = {prow_s}[j]",
+                                    f"        {pad}[idx] = prow_vec[j]",
                                 ]
                                 rows.append(pad)
                             else:
@@ -1063,6 +1069,9 @@ class NumbaCodeGen:
                         padded = []
                         for i, b_var in enumerate(basis_vars_at_q):
                             fld_i = field_names[i]
+                            # field slice bounds for conditional owner→field alignment
+                            s0 = self.me.component_dof_slices[fld_i].start
+                            s1 = self.me.component_dof_slices[fld_i].stop
                             side_tag = self._component_side_tag(op.side, op.field_sides, fld_i, i)
                             map_array_name = f"{side_tag}_map_{fld_i}"
                             required_args.add(map_array_name)
@@ -1072,15 +1081,18 @@ class NumbaCodeGen:
                             body_lines += [
                                 f"{map_e} = {map_array_name}[e]",
                                 f"{local} = {b_var}",
-                                # fast path: interior facet (no ghosts)
+                                # fast path: interior/interface facet where local already equals union
                                 f"if n_union == {local}.shape[0]:",
                                 f"    {pad} = {local}.copy()",
-                                f"else:",                                     # genuine ghost facet
+                                f"else:",
+                                # robust path for ghost: map length = n_loc(field); slice only if needed
+                                f"    m = {map_e}.shape[0]",
+                                f"    loc_vec = {local} if {local}.shape[0] == m else {local}[{s0}:{s1}]",
                                 f"    {pad} = np.zeros(n_union, dtype={self.dtype})",
-                                f"    for j in range({local}.shape[0]):",
+                                f"    for j in range(m):",
                                 f"        idx = {map_e}[j]",
                                 f"        if 0 <= idx < n_union:",
-                                f"            {pad}[idx] = {local}[j]",
+                                f"            {pad}[idx] = loc_vec[j]",
                             ]
                             padded.append(pad)
 
@@ -1137,8 +1149,6 @@ class NumbaCodeGen:
                                 rv = new_var("rv")
                                 if op.side:
                                     s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
-                                    row_s = new_var("row_s")
-                                    body_lines.append(f"{row_s} = {row}[{s0}:{s1}]")
                                     side_tag = self._component_side_tag(op.side, op.field_sides, fn, i)
                                     map_arr = f"{side_tag}_map_{fn}"
                                     required_args.add(map_arr)
@@ -1146,11 +1156,14 @@ class NumbaCodeGen:
                                     body_lines += [
                                         f"{mep} = {map_arr}[e]",
                                         "n_union = gdofs_map[e].shape[0]",
+                                        # use map length; slice row only if needed
+                                        f"m = {mep}.shape[0]",
+                                        f"row_vec = {row} if {row}.shape[0] == m else {row}[{s0}:{s1}]",
                                         f"{pad} = np.zeros(n_union, dtype={self.dtype})",
-                                        f"for j in range({row_s}.shape[0]):",
+                                        f"for j in range(m):",
                                         f"    idx = {mep}[j]",
                                         "    if 0 <= idx < n_union:",
-                                        f"        {pad}[idx] = {row_s}[j]",
+                                        f"        {pad}[idx] = row_vec[j]",
                                         f"{rv} = float(np.dot({coeff_sym}, {pad}))",
                                     ]
                                 else:

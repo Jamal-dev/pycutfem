@@ -463,37 +463,67 @@ def _build_jit_kernel_args(       # ← signature unchanged
         m_r = re.match(r"^r(\d)(\d)_(.+)_(pos|neg)$", name)
         if m_r:
             d0_s, d1_s, fld, side = m_r.groups()
+            d0, d1 = int(d0_s), int(d1_s)
 
-            # 1) Direct hit from precompute (ghost commonly provides these)
+            # tiny helpers
+            def _is_ghost(pb):  # ghost precompute exports owner_* ids
+                return (pb is not None) and (("owner_pos_id" in pb) or ("owner_neg_id" in pb))
+
+            def _pad_owner_to_union(tab: np.ndarray, side: str) -> np.ndarray:
+                """
+                tab: (nE, nQ, L_owner_mixed). Returns (nE, nQ, n_union_ghost),
+                using pos_map/neg_map that map owner-mixed dofs -> ghost-union dofs.
+                """
+                nE, nQ, L = tab.shape
+                n_union = gdofs_map.shape[1]             # ghost union length
+                out = np.zeros((nE, nQ, n_union), dtype=tab.dtype)
+                side_map_key = "pos_map" if side == "pos" else "neg_map"
+                owner2union = pre_built[side_map_key]    # shape (nE, L)
+                # vectorized over q
+                for e in range(nE):
+                    m = owner2union[e]                   # (L,)
+                    # keep only valid targets
+                    valid = (m >= 0) & (m < n_union)
+                    out[e, :, m[valid]] = tab[e, :, valid]
+                return out
+
+            # 1) If precompute already provided it, prefer that.
             if pre_built is not None and name in pre_built:
-                args[name] = pre_built[name]
+                tab = pre_built[name]
+                # GHOST: owner-mixed (22) -> ghost-union (36) pre-pad once here
+                if _is_ghost(pre_built):
+                    n_union = gdofs_map.shape[1]
+                    if tab.shape[2] != n_union:
+                        tab = _pad_owner_to_union(tab, side)
+                args[name] = tab
                 continue
 
             # 2) INTERFACE fallback (entity_kind == 'element'):
-            #    Build union-length unsided element tables at the *interface physical QPs*.
+            #    Build at interface physical QPs. Return *owner-mixed* length
+            #    so the kernel’s fixed block slices [0:9],[9:18],[18:22] stay valid.
             if pre_built is not None and pre_built.get("entity_kind") == "element":
-                d0 = int(d0_s); d1 = int(d1_s)
+                # r00 -> b_ at qp_phys; rXY -> dXY at qp_phys
                 if d0 == 0 and d1 == 0:
-                    # r00_<fld>_{pos|neg}  ->  union-length b_<fld> at qp_phys
-                    args[name] = _basis_table_phys_union(fld)
+                    # union-length (owner-mixed) basis at qp_phys
+                    args[name] = _basis_table_phys_union(fld)   # you already added this
                     continue
-                # rXY_<fld>_{pos|neg}  ->  union-length dXY_<fld> at qp_phys
                 dkey = f"d{d0}{d1}_{fld}"
-                # If an unsided union-length table is already around, reuse it; otherwise build it.
                 if dkey in args:
                     args[name] = args[dkey];  continue
                 if pre_built is not None and dkey in pre_built:
                     args[name] = pre_built[dkey];  continue
-                args[name] = _deriv_table_phys_union(fld, d0, d1)
+                args[name] = _deriv_table_phys_union(fld, d0, d1)  # you already added this
                 continue
 
-            # 3) Otherwise (e.g., GHOST): must be precomputed; give a clear hint
-            is_ghost = (pre_built is not None) and (
-                ("owner_pos_id" in pre_built) or ("owner_neg_id" in pre_built)
-            )
-            hint = (" For ghost integrals, include metadata['derivs'] (e.g. {(1,0),(0,1)}) "
-                    "so r10/r01 tables are emitted.") if is_ghost else ""
-            raise KeyError(f"_build_jit_kernel_args: kernel requests '{name}', but it wasn't provided." + hint)
+            # 3) Otherwise (GHOST with no precompute): must be provided via metadata['derivs']
+            if _is_ghost(pre_built):
+                raise KeyError(
+                    f"_build_jit_kernel_args: kernel requests '{name}', but it wasn't provided. "
+                    "For ghost integrals, include metadata['derivs'] (e.g. {(1,0),(0,1)}) so r10/r01 are emitted."
+                )
+            # If not ghost and not interface (shouldn’t happen), fail clearly
+            raise KeyError(f"_build_jit_kernel_args: kernel requests '{name}', but it wasn't provided.")
+
 
 
 
