@@ -149,7 +149,7 @@ class NumbaCodeGen:
     """
     Translates a linear IR sequence into a Numba-Python kernel source string.
     """
-    def __init__(self, nopython: bool = True, mixed_element=None,form_rank=0):
+    def __init__(self, nopython: bool = True, mixed_element=None,form_rank=0, on_facet:bool = False):
         """
         Initializes the code generator.
         
@@ -166,7 +166,8 @@ class NumbaCodeGen:
         self.spatial_dim = self.me.mesh.spatial_dim
         self.last_side_for_store = "" # Track side for detJ
         self.dtype = "np.float64"  # Default data type for arrays
-    
+        self.on_facet = on_facet
+
     # ------------------------------------------------------------------
     # Helpers for robust per-component side resolution / mapping
     # ------------------------------------------------------------------
@@ -197,10 +198,10 @@ class NumbaCodeGen:
         # Prefer the explicit +/- from the IR (ghost/interface need this to distinguish owner/neighbor)
         if default_side in ("+","-"):
             return "pos" if default_side == "+" else "neg"
-        # Only as a final hint, glean from the component name
-        hint = cls._infer_side_from_name(field_name)
-        if hint:
-            return hint
+        # # Only as a final hint, glean from the component name
+        # hint = cls._infer_side_from_name(field_name)
+        # if hint:
+        #     return hint
         return None
 
     
@@ -624,19 +625,44 @@ class NumbaCodeGen:
                 # ------------------------------------------------------------------
                 deriv_order = op.deriv_order
                 field_names = op.field_names
+                is_sided = bool(self.on_facet and op.side in ("+", "-"))
+
+
+             
 
                 # *Reference* tables are side‑agnostic (no suffix)
                 side_suffix_basis = ""
 
                 # helper: "dxy_" or "b_" + field name
-                def get_basis_arg_name(field_name, deriv):
-                    if deriv == (0, 0) and op.side in ("+", "-"):
-                        side_tag = "pos" if op.side == "+" else "neg"
-                        return f"r00_{field_name}_{side_tag}"   # <— was: "b_<field_name>"
-                    d_str = f"d{deriv[0]}{deriv[1]}" if deriv != (0, 0) else "b"
-                    return f"{d_str}_{field_name}"
+                def get_basis_arg_name(field_name: str, deriv: tuple[int, int], idx: int) -> str:
+                    """
+                    Return the correct table name for this component at the requested order.
+                    • Facets (is_sided=True): rXY_<field>_{pos|neg}
+                    • Volume/unsided        : b_<field> (00), dXY_<field> (>=10)
+                    Always returns a non-empty string.
+                    """
+                    d0, d1 = deriv
+                    if is_sided:
+                        # per-component side, with safe fallback to op.side
+                        side_tag = self._component_side_tag(op.side, getattr(op, "field_sides", None),
+                                                            field_name, idx)
+                        if side_tag not in ("pos", "neg"):
+                            side_tag = "pos" if op.side == "+" else "neg"
+                        if d0 == 0 and d1 == 0:
+                            return f"r00_{field_name}_{side_tag}"
+                        return f"r{d0}{d1}_{field_name}_{side_tag}"
+                    else:
+                        if d0 == 0 and d1 == 0:
+                            return f"b_{field_name}"
+                        return f"d{d0}{d1}_{field_name}"
 
-                basis_arg_names = [get_basis_arg_name(fname, deriv_order) for fname in field_names]
+         
+
+                # IMPORTANT: pass the index so the helper can pick the correct side per component
+                basis_arg_names = [get_basis_arg_name(fname, deriv_order, i)
+                                for i, fname in enumerate(field_names)]
+
+
                 # Only request b_* / d** tables *here* when they are actually needed
                 # (Function followed immediately by derivative ops will assemble their
                 # own derivative tables later; no b_* needed there).
@@ -664,7 +690,8 @@ class NumbaCodeGen:
 
                 if op.role in ("test", "trial"):
                     # ---------- facet integrals (+ / -) : pad to union DOFs ----------
-                    if op.side:                                              # "+" or "-"
+                    if op.side:
+                        required_args.add("gdofs_map")  # used for union width                                              # "+" or "-"
                         body_lines += [
                             "n_union = gdofs_map[e].shape[0]",               # e.g. 36 for Stokes
                         ]
@@ -1423,6 +1450,8 @@ class NumbaCodeGen:
                 else:
                     jinv_sym = "J_inv";     required_args.add("J_inv")
                 jinv_q = f"{jinv_sym}_q"  # 2x2 at (e,q)
+                body_lines.append(f"{jinv_q} = {jinv_sym}[e, q]")
+
 
                 # ======================================================================
                 # (A) grad(Test/Trial)  -> shape (k , n_loc_or_union , 2)
@@ -1433,7 +1462,7 @@ class NumbaCodeGen:
 
                     # Sided path (ghost/interface): use r10/r01 on the correct side,
                     # map with J_inv_{pos|neg}, then pad to union via {side}_map_<field>.
-                    if a.side in ("+", "-"):
+                    if a.side in ("+", "-") and self.on_facet:
                         required_args.add("gdofs_map")  # used for union width
                         for i, fld_i in enumerate(a.field_names):
                             # DOF slice for this component inside the union
@@ -1460,14 +1489,17 @@ class NumbaCodeGen:
                                 f"d10_q = {n10}[e, q]",                               # (n_loc,)
                                 f"d01_q = {n01}[e, q]",                               # (n_loc,)
                                 f"{pg_loc} = np.stack((d10_q, d01_q), axis=1) @ {jinv_q}.copy()",  # (n_loc,2)
-                                f"{pg_loc_s} = {pg_loc}[{s0}:{s1}, :]",               # (n_comp_loc,2)
-                                f"{map_e} = {map_arr}[e]",
-                                "n_union = gdofs_map[e].shape[0]",
-                                f"{pg_pad} = np.zeros((n_union, {self.spatial_dim}), dtype={self.dtype})",
-                                f"for j in range({pg_loc_s}.shape[0]):",
-                                f"    idx = {map_e}[j]",
-                                f"    if 0 <= idx < n_union:",
-                                f"        {pg_pad}[idx] = {pg_loc_s}[j]",
+                                f"n_union = gdofs_map[e].shape[0]",
+                                f"if {pg_loc}.shape[0] == n_union:",
+                                f"    {pg_pad} = {pg_loc}",                      # already union-sized → no remap
+                                f"else:",
+                                f"    {pg_loc_s} = {pg_loc}[{s0}:{s1}, :]",      # local → slice
+                                f"    {map_e} = {map_arr}[e]",
+                                f"    {pg_pad} = np.zeros((n_union, {self.spatial_dim}), dtype={self.dtype})",
+                                f"    for j in range({pg_loc_s}.shape[0]):",
+                                f"        idx = {map_e}[j]",
+                                f"        if 0 <= idx < n_union:",
+                                f"            {pg_pad}[idx] = {pg_loc_s}[j]",
                             ]
                             phys.append(pg_pad)
 
@@ -1475,7 +1507,9 @@ class NumbaCodeGen:
 
                     else:
                         # Volume (unsided): use volume gradient tables g_<field> with J_inv
+
                         grad_tab_names = [f"g_{f}" for f in a.field_names]
+
                         for nm in grad_tab_names:
                             required_args.add(nm)
 
@@ -1540,9 +1574,12 @@ class NumbaCodeGen:
                                 f"d01_q = {d01}[e, q]",
                                 f"{g2}   = np.stack((d10_q, d01_q), axis=1)",
                                 f"{phys} = {g2} @ {jinv_q}.copy()",
-                                f"{phys_s} = {phys}[{s0}:{s1}, :]",
-                                f"{u_sl} = {coeff_e}[{map_sym}[e]]",
-                                f"{val} = {phys_s}.T.copy() @ {u_sl}",   # (2,)
+                                f"if {phys}.shape[0] == {coeff_e}.shape[0]:",
+                                f"    {val} = {phys}.T.copy() @ {coeff_e}",       # union vs union
+                                f"else:",
+                                f"    {phys_s} = {phys}[{s0}:{s1}, :]",           # local vs local
+                                f"    {u_sl}   = {coeff_e}[{map_sym}[e]]",
+                                f"    {val}    = {phys_s}.T.copy() @ {u_sl}",
                             ]
 
                         else:
@@ -2307,8 +2344,8 @@ class NumbaCodeGen:
                         body_lines.append("# LHS: dot(Test, Const) (k,n)·(k) -> (1,n)")
                         shape = (1, a.shape[1])
                         role = 'test'
-                        body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype={self.dtype})",
-                                        f"for n in range({a.shape[1]}):",
+                        body_lines += [f"{res_var} = np.zeros((1,{a.var_name}.shape[1]), dtype={self.dtype})",
+                                        f"for n in range({a.var_name}.shape[1]):",
                                         f"    {res_var}[0, n] = np.sum({a.var_name}[:, n] * {b.var_name})"]
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=shape, is_vector=False,is_gradient=False,
@@ -2330,8 +2367,8 @@ class NumbaCodeGen:
                    body_lines.append("# LHS: dot(Trial, Const) (k,n)·(k) -> (1,n)")
                    shape = (1, a.shape[1])
                    role = 'trial'
-                   body_lines += [f"{res_var} = np.zeros((1,{a.shape[1]}), dtype={self.dtype})",
-                                   f"for n in range({a.shape[1]}):",
+                   body_lines += [f"{res_var} = np.zeros((1,{a.var_name}.shape[1]), dtype={self.dtype})",
+                                   f"for n in range({a.var_name}.shape[1]):",
                                    f"    {res_var}[0, n] = np.sum({a.var_name}[:, n] * {b.var_name})"]
                    stack.append(StackItem(var_name=res_var, role=role,
                                         shape=shape, is_vector=False,is_gradient=False,
@@ -2405,8 +2442,8 @@ class NumbaCodeGen:
                                 f"for n in range(n_locs):",
                                 f"    for j in range(d1):",
                                 f"        # (k,) · (k, d2) -> (d2,)",
-                                f"        b_slice = np.ascontiguousarray({b.var_name}[:, j, :])",
-                                f"        result = a_var @ b_slice;",
+                                f"        b_slice = np.ascontiguousarray({b.var_name}[:, n,j, :])",
+                                f"        result = np.dot(a_var, b_slice)",
                                 f"        {res_var}[j, n, :] = result",
                             ]
                             stack.append(StackItem(var_name=res_var, role=b.role,
@@ -3017,6 +3054,8 @@ class NumbaCodeGen:
 
         # New Newton: Remove gdofs_map from parameters, it's used before the kernel call.
         # print(f"DEBUG L:1025: required_args: {sorted(list(required_args))}")
+        # sanitize None from required_args
+        # required_args = {arg for arg in required_args if arg is not None} 
         param_order = [
             "gdofs_map",
             "node_coords",

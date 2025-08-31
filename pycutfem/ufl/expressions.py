@@ -825,16 +825,17 @@ class TrialFunction(Function):
             # If field_name is a FunctionSpace, use its name and field_names
             name = field_name.name if name is None else name
             field_name = field_name.field_names[0]
+            self.side = getattr(field_name, "side", "") if side == "" else side
         else:
+            self.side = side
             if name is None:
                 name = f"trial_{field_name}"
         super().__init__(name=name, field_name=field_name, dof_handler=dof_handler,
                          parent_vector=parent_vector, component_index=component_index)
         self.dim = 0
         self.parent_name = getattr(parent_vector, "name", "") if parent_vector else ""
-        self.side = side
-        if side in ("+","-"):
-            s = "pos" if side == "+" else "neg"
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
             self.field_sides = [s] 
         else:
             self.field_sides = None
@@ -854,16 +855,17 @@ class TestFunction(Function):
             # If field_name is a FunctionSpace, use its name and field_names
             name = field_name.name if name is None else name
             field_name = field_name.field_names[0]
+            self.side = getattr(field_name, "side", "") if side == "" else side
         else:
+            self.side = side
             if name is None:
                 name = f"test_{field_name}"
         super().__init__(name=name, field_name=field_name, dof_handler=dof_handler,
                          parent_vector=parent_vector, component_index=component_index)
         self.dim = 0  # Assuming scalar test functions for now
-        self.side = side
         self.parent_name = getattr(parent_vector, "name", "") if parent_vector else ""
-        if side in ("+","-"):
-            s = "pos" if side == "+" else "neg"
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
             self.field_sides = [s] 
         else:
             self.field_sides = None
@@ -925,16 +927,17 @@ class VectorTrialFunction(Expression):
     def __init__(self, space, dof_handler: 'DofHandler'=None, side: str = ""): # space: FunctionSpace
         self.space = space
         self.field_names = space.field_names
+        self.side = getattr(space, "side", "") if side == "" else side
         self.components = [
             TrialFunction(name=f"{space.name}_{fn}",field_name = fn, dof_handler=dof_handler, 
                           parent_vector=self, 
-                          component_index=i)
+                          component_index=i,
+                          side = self.side)
             for i, fn in enumerate(space.field_names)
         ]
         self.dim = 1
-        self.side = side
-        if side in ("+","-"):
-            s = "pos" if side == "+" else "neg"
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
             self.field_sides = [s] * len(self.field_names)
         else:
             self.field_sides = None
@@ -952,17 +955,18 @@ class VectorTestFunction(Expression):
     def __init__(self, space, dof_handler=None, side: str = ""): # space: FunctionSpace
         self.space = space
         self.field_names = space.field_names
+        self.side = getattr(space, "side", "") if side == "" else side
         self.components = [
             TestFunction(name=f"{space.name}_{fn}", 
                         field_name= fn,
-                         dof_handler = dof_handler, 
-                         parent_vector=self, component_index=i)
+                         dof_handler = dof_handler,
+                         parent_vector=self, component_index=i,
+                         side = self.side)
             for i, fn in enumerate(space.field_names)
         ]
         self.dim = 1
-        self.side = side
-        if side in ("+","-"):
-            s = "pos" if side == "+" else "neg"
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
             self.field_sides = [s] * len(self.field_names)
         else:
             self.field_sides = None 

@@ -103,6 +103,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
     from pycutfem.jit.ir import LoadVariable, LoadConstantArray
     from pycutfem.ufl.analytic import Analytic
     from pycutfem.ufl.helpers import _find_all
+    from pycutfem.fem import transform
 
     # Optional: BitSet finder (fallback to no-op if not available)
     try:
@@ -150,7 +151,55 @@ def _build_jit_kernel_args(       # ← signature unchanged
              for xi_eta in qp_ref],
             dtype=np.float64
         )
-        return _expand_per_element(ref)                                 # (n_elem, n_q, n_loc)
+        return _expand_per_element(ref) 
+    # NEW: evaluate at interface physical quadrature points (qp_phys)
+    def _n_union_for_eid(eid: int) -> int:
+        return len(dof_handler.get_elemental_dofs(int(eid)))
+
+    def _basis_table_phys_union(field: str) -> np.ndarray:
+        """
+        Union-length basis at interface physical QPs.
+        Shape: (nE, nQ, n_union) where n_union == len(gdofs_map[e]).
+        """
+        pts  = pre_built["qp_phys"]      # (nE, nQ, 2)
+        eids = pre_built["eids"]         # (nE,)
+        me   = mixed_element
+        mesh = me.mesh
+        nE, nQ, _ = pts.shape
+        # assume uniform union size across e (usual for mixed Qk)
+        n_union = _n_union_for_eid(eids[0])
+        tab = np.empty((nE, nQ, n_union), dtype=np.float64)
+        for i in range(nE):
+            eid = int(eids[i])
+            assert _n_union_for_eid(eid) == n_union, "Union length differs across elements."
+            for q in range(nQ):
+                x, y = pts[i, q]
+                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+                # NOTE: me.basis(field, ...) returns union-length, zero-padded across fields
+                tab[i, q, :] = me.basis(field, float(xi), float(eta))
+        return tab
+
+    def _deriv_table_phys_union(field: str, ax: int, ay: int) -> np.ndarray:
+        """
+        Union-length reference derivatives at interface physical QPs.
+        Shape: (nE, nQ, n_union).
+        """
+        pts  = pre_built["qp_phys"]      # (nE, nQ, 2)
+        eids = pre_built["eids"]         # (nE,)
+        me   = mixed_element
+        mesh = me.mesh
+        nE, nQ, _ = pts.shape
+        n_union = _n_union_for_eid(eids[0])
+        tab = np.empty((nE, nQ, n_union), dtype=np.float64)
+        for i in range(nE):
+            eid = int(eids[i])
+            assert _n_union_for_eid(eid) == n_union, "Union length differs across elements."
+            for q in range(nQ):
+                x, y = pts[i, q]
+                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+                # NOTE: me.deriv_ref(...) returns union-length (mixed) derivative vector
+                tab[i, q, :] = me.deriv_ref(field, float(xi), float(eta), int(ax), int(ay))
+        return tab
 
     def _decode_coeff_name(name: str):
         """
@@ -410,28 +459,44 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if name in args:
             continue
 
-        # --- NEW: sided reference derivative tables (ghost) with interface fallback ---
-        m_r = re.match(r"^r(\d)(\d)_(\w+?)_(pos|neg)$", name)
+        # --- sided reference value/derivative tables: r{d0}{d1}_{field}_{pos|neg} ---
+        m_r = re.match(r"^r(\d)(\d)_(.+)_(pos|neg)$", name)
         if m_r:
-            d0, d1, fld, _side = m_r.groups()
-            # Provided by ghost/interface precompute?
+            d0_s, d1_s, fld, side = m_r.groups()
+
+            # 1) Direct hit from precompute (ghost commonly provides these)
             if pre_built is not None and name in pre_built:
                 args[name] = pre_built[name]
                 continue
-            # Interface fallback: use dXY_<fld> if we're on elements
-            if (pre_built is not None
-                and pre_built.get("entity_kind") == "element"
-                and f"d{d0}{d1}_{fld}" in pre_built):
-                args[name] = pre_built[f"d{d0}{d1}_{fld}"]
+
+            # 2) INTERFACE fallback (entity_kind == 'element'):
+            #    Build union-length unsided element tables at the *interface physical QPs*.
+            if pre_built is not None and pre_built.get("entity_kind") == "element":
+                d0 = int(d0_s); d1 = int(d1_s)
+                if d0 == 0 and d1 == 0:
+                    # r00_<fld>_{pos|neg}  ->  union-length b_<fld> at qp_phys
+                    args[name] = _basis_table_phys_union(fld)
+                    continue
+                # rXY_<fld>_{pos|neg}  ->  union-length dXY_<fld> at qp_phys
+                dkey = f"d{d0}{d1}_{fld}"
+                # If an unsided union-length table is already around, reuse it; otherwise build it.
+                if dkey in args:
+                    args[name] = args[dkey];  continue
+                if pre_built is not None and dkey in pre_built:
+                    args[name] = pre_built[dkey];  continue
+                args[name] = _deriv_table_phys_union(fld, d0, d1)
                 continue
-            raise KeyError(
-                f"_build_jit_kernel_args: kernel requests '{name}', "
-                "but it wasn't provided. Ensure you call "
-                "DofHandler.precompute_ghost_factors(...) for ghost, or "
-                "let interface fallback map rXY->dXY when entity_kind=='element'."
-                f" args.keys()={list(args.keys())};"
-                f" pre_built.keys()={list(pre_built.keys())}"
+
+            # 3) Otherwise (e.g., GHOST): must be precomputed; give a clear hint
+            is_ghost = (pre_built is not None) and (
+                ("owner_pos_id" in pre_built) or ("owner_neg_id" in pre_built)
             )
+            hint = (" For ghost integrals, include metadata['derivs'] (e.g. {(1,0),(0,1)}) "
+                    "so r10/r01 tables are emitted.") if is_ghost else ""
+            raise KeyError(f"_build_jit_kernel_args: kernel requests '{name}', but it wasn't provided." + hint)
+
+
+
         # ---- basis tables ------------------------------------------------
         if name.startswith("b_"):
             fld = name[2:]

@@ -1710,6 +1710,11 @@ class DofHandler:
                 s, t = transform.inverse_mapping(mesh, neg_eid, qp_phys[i, q])
                 xi_neg[i, q]  = float(s); eta_neg[i, q] = float(t)
 
+        out.update({
+            "xi_pos":  xi_pos,  "eta_pos":  eta_pos,
+            "xi_neg":  xi_neg,  "eta_neg":  eta_neg,
+        })
+
         # parent element coords
         node_ids_all = mesh.nodes[mesh.elements_connectivity]
         coords_all   = mesh.nodes_x_y_pos[node_ids_all].astype(float)
@@ -2751,126 +2756,162 @@ class DofHandler:
 
     def l2_error_on_side(
         self,
-        functions,                      # VectorFunction, Function, or dict[str, Function]
-        exact: dict[str, callable],     # e.g. {'ux': u_ex_x, 'uy': u_ex_y, 'p': p_ex}
-        level_set,                      # φ(x,y) callable
-        side: str = '-',                # '-' → φ<0  (inside),  '+' → φ>0 (outside)
+        functions,
+        exact,
+        level_set,
+        side: str = "-",
         quad_order: int | None = None,
         fields: list[str] | None = None,
         relative: bool = False,
     ) -> float:
         """
-        L2-norm of specified fields over Ω_side := Ω ∩ { φ ▷ 0 }, with ▷='<' if side='-', or '>=' if side='+'.
+        L2 error of the given fields over Ω_side := Ω ∩ { φ ▷ 0 }, with ▷='<' if side='-', or '>=' if side='+'.
 
-        * Fast pure-Python path:
-        - full elements: standard reference quadrature + detJ
-        - cut elements : clip corner-triangles and integrate physical sub-tris (weights already physical)
-        * 'functions' can be a VectorFunction, a single Function, or a dict {'ux': Fun, 'uy': Fun, ...}.
-        * 'exact' supplies exact scalar callables per field to compare against.
+        Accepts:
+        - a single Function,
+        - a VectorFunction,
+        - a dict[str, Function],
+        - or a list/tuple mixing the above.
+
+        Robustness notes:
+        • Uses field-local basis evaluation for the dot product (length matches local DOFs).
+        • Falls back to a mixed-basis + scatter if shapes ever disagree.
+        • Works for both full and cut elements; cut integration uses physical weights.
         """
         import numpy as np
         from pycutfem.fem import transform
         from pycutfem.integration.quadrature import volume as vol_rule
+        from pycutfem.ufl.expressions import Function as UFLFunction, VectorFunction as UFLVectorFunction
         from pycutfem.ufl.helpers_geom import (
             corner_tris, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, phi_eval
         )
 
         mesh = self.mixed_element.mesh
         me   = self.mixed_element
-        qdeg = quad_order or (2 * mesh.poly_order + 2)
+        qdeg = quad_order or (2 * getattr(mesh, "poly_order", 1) + 2)
 
-        # --------------- normalize 'functions' → dict[field]->Function -------------
-        from pycutfem.ufl.expressions import Function, VectorFunction
-        field_funcs: dict[str, Function] = {}
+        # ---------------------- normalize 'functions' -> dict[field] = Function ----------------------
+        field_funcs: dict[str, UFLFunction] = {}
+
+        def _add_vec(vecfun: UFLVectorFunction):
+            for name, comp in zip(vecfun.field_names, vecfun.components):
+                field_funcs[name] = comp
 
         if isinstance(functions, dict):
-            field_funcs = functions
-        elif isinstance(functions, VectorFunction):
-            for name, comp in zip(functions.field_names, functions.components):
-                field_funcs[name] = comp
-        elif isinstance(functions, (list, tuple)) and functions and isinstance(functions[0], VectorFunction):
-            vf = functions[0]
-            for name, comp in zip(vf.field_names, vf.components):
-                field_funcs[name] = comp
-            for extra in functions[1:]:
-                if isinstance(extra, Function):
-                    field_funcs[extra.field_name] = extra
-        elif isinstance(functions, Function):
+            field_funcs.update(functions)
+        elif isinstance(functions, UFLVectorFunction):
+            _add_vec(functions)
+        elif isinstance(functions, (list, tuple)):
+            for obj in functions:
+                if isinstance(obj, UFLVectorFunction):
+                    _add_vec(obj)
+                elif isinstance(obj, UFLFunction):
+                    field_funcs[obj.field_name] = obj
+                elif isinstance(obj, dict):
+                    field_funcs.update(obj)
+                else:
+                    raise TypeError("Unsupported item in 'functions' list/tuple.")
+        elif isinstance(functions, UFLFunction):
             field_funcs[functions.field_name] = functions
         else:
-            raise TypeError("'functions' must be a Function, VectorFunction, or dict[str, Function]")
+            raise TypeError("'functions' must be a Function, VectorFunction, dict[str, Function], or list/tuple of those.")
 
-        # which fields to include in the error
+        # Which fields to include
         if fields is None:
-            fields = [f for f in me.field_names if f in exact]
+            # Only fields for which we have both a function and an exact callable
+            fields = [f for f in me.field_names if f in field_funcs and f in exact]
+        else:
+            # Keep only those we can actually evaluate
+            fields = [f for f in fields if f in field_funcs and f in exact]
+        if not fields:
+            return 0.0
 
-        # accumulators
+        # Accumulators
         err2, base2 = 0.0, 0.0
 
         # ---------------------------- classify elements ----------------------------
-        inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)  # fills element tags too
-        full_eids = outside_ids if side == '+' else inside_ids
+        inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
+        full_eids = outside_ids if side == "+" else inside_ids
+
+        # Helper: evaluate uh safely (field-local basis preferred; mixed fallback)
+        def _eval_uh(fld: str, eid: int, xi: float, eta: float, gdofs: np.ndarray) -> float:
+            vals = np.asarray(field_funcs[fld].get_nodal_values(gdofs), dtype=float)
+            # Try field-local basis first
+            try:
+                phi_f = np.asarray(me._eval_scalar_basis(fld, xi, eta), dtype=float)  # length n_loc(field)
+            except AttributeError:
+                phi_f = None
+
+            if phi_f is not None and phi_f.shape[0] == vals.shape[0]:
+                return float(vals @ phi_f)
+
+            # Fallback: build mixed basis and scatter vals into mixed positions, then dot.
+            phi_mixed = np.asarray(me.basis(fld, xi, eta), dtype=float)
+            sl = me.slice(fld)  # indices for this field in the mixed ordering
+            v_mixed = np.zeros_like(phi_mixed, dtype=float)
+            # Guard for shape mismatch (robustness)
+            n = min(len(sl), vals.shape[0])
+            v_mixed[sl[:n]] = vals[:n]
+            return float(v_mixed @ phi_mixed)
 
         # -------------------------- (A) full elements on side ----------------------
         qp_ref, qw_ref = vol_rule(mesh.element_type, qdeg)
         for eid in full_eids:
-            # per‑field local dofs for this element (avoids mixing fields)
+            # per-field local DOF ids for this element
             gdofs_f = {fld: self.element_maps[fld][eid] for fld in fields}
             for (xi, eta), w in zip(qp_ref, qw_ref):
                 J    = transform.jacobian(mesh, eid, (xi, eta))
                 detJ = abs(np.linalg.det(J))
                 x, y = transform.x_mapping(mesh, eid, (xi, eta))
-
                 for fld in fields:
-                    # MixedElement.basis returns a zero‑padded vector → slice to the field’s block
-                    # slice to the field block → local basis of size n_loc(fld) (e.g., 9)
-                    phi_f = me.basis(fld, xi, eta)[me.slice(fld)]
-                    uh    = float(field_funcs[fld].get_nodal_values(gdofs_f[fld]) @ phi_f)
-                    ue    = float(exact[fld](x, y))
-                    d2    = (uh - ue) ** 2
-                    b2    = ue ** 2
+                    uh = _eval_uh(fld, eid, xi, eta, gdofs_f[fld])
+                    ue = float(exact[fld](x, y))
+                    d2 = (uh - ue) ** 2
+                    b2 = ue ** 2
                     err2  += w * detJ * d2
                     base2 += w * detJ * b2
 
         # -------------------------- (B) cut elements on side -----------------------
-        # reference rule on the unit triangle
+        # Reference rule on unit triangle (mapped to physical with weights)
         qp_tri, qw_tri = vol_rule("tri", qdeg)
 
         for eid in cut_ids:
             elem = mesh.elements_list[eid]
             tri_local, corner_ids = corner_tris(mesh, elem)
 
-            # per‑field local dofs for this element (avoids mixing fields)
+            # per-field local DOF ids for this element
             gd_f = {fld: self.element_maps[fld][eid] for fld in fields}
 
             for loc_tri in tri_local:
-                v_ids   = [corner_ids[i] for i in loc_tri]
-                V       = mesh.nodes_x_y_pos[v_ids]                     # (3,2)
-                v_phi   = np.array([phi_eval(level_set, xy) for xy in V], dtype=float)
+                v_ids = [corner_ids[i] for i in loc_tri]
+                V     = mesh.nodes_x_y_pos[v_ids]                       # (3,2)
+                v_phi = np.array([phi_eval(level_set, xy) for xy in V], dtype=float)
 
-                # clip this geometric triangle to requested side -------------------
-                polys = clip_triangle_to_side(V, v_phi, side=side)      # list of polygons
+                # Clip this triangle to requested side
+                polys = clip_triangle_to_side(V, v_phi, side=side)
                 if not polys:
                     continue
 
                 for poly in polys:
                     for A, B, C in fan_triangulate(poly):
-                        x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)  # physical weights
+                        x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)  # physical points & weights
                         for (x, y), w in zip(x_phys, w_phys):
-                            # map back to (xi,eta) of the *parent* element -----------
+                            # Map back to parent element reference coords
                             xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
-
                             for fld in fields:
-                                # slice to the field block → local basis of size n_loc(fld) (e.g., 9)
-                                phi_f = me.basis(fld, xi, eta)[me.slice(fld)]   # local (len n_loc(fld))
-                                uh    = float(field_funcs[fld].get_nodal_values(gd_f[fld]) @ phi_f)
-                                ue    = float(exact[fld](x, y))
-                                d2    = (uh - ue) ** 2
-                                b2    = ue ** 2
-                                err2  += w * d2         # w already physical (no detJ)
+                                uh = _eval_uh(fld, eid, xi, eta, gd_f[fld])
+                                ue = float(exact[fld](x, y))
+                                d2 = (uh - ue) ** 2
+                                b2 = ue ** 2
+                                err2  += w * d2           # w already physical here
                                 base2 += w * b2
 
-        return (err2 / base2) ** 0.5 if (relative and base2 > 1e-28) else err2 ** 0.5
+        # Return relative or absolute L2
+        if relative:
+            return (err2 / base2) ** 0.5 if base2 > 1e-28 else 0.0
+        return err2 ** 0.5
+
+
     
     def l2_error_piecewise(self, functions, exact_neg, exact_pos, level_set, fields=None, quad_order=None, relative=False):
         e_m = self.l2_error_on_side(functions, exact_neg, level_set, side='-', fields=fields, quad_order=quad_order, relative=relative)

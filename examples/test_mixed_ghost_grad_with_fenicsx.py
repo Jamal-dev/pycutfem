@@ -174,8 +174,8 @@ def main():
     h = CellDiameter()
     n = FacetNormal()
 
-    dG_pos = dGhost(defined_on=ghost_pos, level_set=ls, metadata={"q": deg})
-    dG_neg = dGhost(defined_on=ghost_neg, level_set=ls, metadata={"q": deg})
+    dG_pos = dGhost(defined_on=ghost_pos, level_set=ls, metadata={"q": deg, "derivs": {(0,1), (1,0)}})
+    dG_neg = dGhost(defined_on=ghost_neg, level_set=ls, metadata={"q": deg, "derivs": {(0,1), (1,0)}})
 
     scale = (gamma * h) if use_h else gamma
 

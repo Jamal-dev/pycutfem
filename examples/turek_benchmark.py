@@ -68,7 +68,7 @@ print(f"Reynolds number (Re): {Re:.2f}")
 from pycutfem.utils.adaptive_mesh_ls_numba import structured_quad_levelset_adaptive
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-NX, NY = 40, 40
+NX, NY = 25, 25
 # NX, NY = 30, 40
 poly_order = 2
 level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
@@ -136,7 +136,7 @@ physical_domain = fluid_domain | cut_domain
 # Taylor-Hood elements (Q2 for velocity, Q1 for pressure)
 mixed_element = MixedElement(mesh, field_specs={'ux': 2, 'uy': 2, 'p': 1})
 dof_handler = DofHandler(mixed_element, method='cg')
-dof_handler.info()
+# dof_handler.info()
 
 print(f"Number of interface edges: {mesh.edge_bitset('interface').cardinality()}")
 print(f"Number of ghost edges: {mesh.edge_bitset('ghost').cardinality()}")
@@ -239,7 +239,7 @@ u_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handl
 p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler)
 
 # --- Parameters ---
-dt = Constant(0.02)
+dt = Constant(0.5)
 theta = Constant(1.0) # Crank-Nicolson
 mu_const = Constant(mu)
 rho_const = Constant(rho)
@@ -247,6 +247,7 @@ rho_const = Constant(rho)
 u_k.nodal_values.fill(0.0); p_k.nodal_values.fill(0.0)
 u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
 dof_handler.apply_bcs(bcs, u_n, p_n)
+dof_handler.apply_bcs(bcs, u_k, p_k)
 
 
 # In[10]:
@@ -424,7 +425,7 @@ def make_peak_filter_cb(
 # In[13]:
 
 
-from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict
+from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict, Hessian
 from pycutfem.core.geometry import hansbo_cut_ratio
 from pycutfem.ufl.expressions import ElementWiseConstant
 
@@ -448,28 +449,40 @@ def grad_inner(u, v):
 
     raise ValueError("grad_inner supports only scalars or 2‑D vectors.")
 
+# def hessian_inner(u, v):
+#     if getattr(u, "num_components", 1) == 1:      # scalar
+#         return _hess_comp(u, v)
+
+#     # vector: sum component-wise
+#     return sum(_hess_comp(u[i], v[i]) for i in range(u.num_components))
+
+
+# def _hess_comp(a, b):
+#     return (Derivative(a,2,0)*Derivative(b,2,0) +
+#             2*Derivative(a,1,1)*Derivative(b,1,1) +
+#             Derivative(a,0,2)*Derivative(b,0,2))
+
 def hessian_inner(u, v):
-    if getattr(u, "num_components", 1) == 1:      # scalar
-        return _hess_comp(u, v)
-
-    # vector: sum component-wise
-    return sum(_hess_comp(u[i], v[i]) for i in range(u.num_components))
+    return inner(Hessian(u), Hessian(v)) 
 
 
-def _hess_comp(a, b):
-    return (Derivative(a,2,0)*Derivative(b,2,0) +
-            2*Derivative(a,1,1)*Derivative(b,1,1) +
-            Derivative(a,0,2)*Derivative(b,0,2))
+def hdotn(expr):
+    """Convenience: (Hessian(expr)) · n  (vector in R^2)."""
+    n = FacetNormal()
+    return dot(Hessian(expr), n)
+def nHn(expr,n):
+    """Convenience:  n · (Hessian(expr)) · n   (vector)."""
+    return dot(dot(Hessian(expr), n),n)
 
 
 
 ghost_edges_used = mesh.edge_bitset('ghost_pos') | mesh.edge_bitset('ghost_both') | mesh.edge_bitset('interface')
 dx_phys  = dx(defined_on=physical_domain, 
               level_set=level_set,            # the cylinder level set
-              metadata   = {"q": 5, "side": "+"} # integrate only φ>0 (positive side)
+              metadata   = {"q": 6, "side": "+"} # integrate only φ>0 (positive side)
     )
-dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":5})   # interior surface
-dG       = dGhost(defined_on=ghost_edges_used, level_set=level_set,metadata={"q":5,'derivs': {(0,0),(0,1),(1,0),(2,0),(0,2),(1,1)}})  # ghost surface
+dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":6,'derivs': {(0,0),(0,1),(1,0)}})   # interior surface
+dG       = dGhost(defined_on=ghost_edges_used, level_set=level_set,metadata={"q":7,'derivs': {(0,0),(0,1),(1,0),(2,0),(0,2),(1,1)}})  # ghost surface
 
 cell_h  = CellDiameter() # length‑scale per element
 beta_N  = Constant(20.0 * poly_order**2)      # Nitsche penalty (tweak)
@@ -487,7 +500,7 @@ def scaled_penalty_interface(penalty,poly_order =poly_order,
 
     # 3) Final penalty (symbolic EWC × expression)
     return β_visc + β_iner
-β = scaled_penalty_interface(30.0, side='+')  # Nitsche penalty
+β = scaled_penalty_interface(10.0, side='+')  # Nitsche penalty
 
 def epsilon(u):
     "Symmetric gradient."
@@ -558,23 +571,25 @@ r_vol = ( rho*dot(u_k-u_n, v)/dt
 penalty_val = 1e-3
 penalty_grad = 1e-3
 penalty_hess = 1e-3
-gamma_v = Constant(penalty_val * poly_order**2)
-gamma_v_grad= Constant(penalty_grad * poly_order**2)
-gamma_p  = Constant(penalty_val * poly_order**1)
-gamma_p_grad = Constant(penalty_grad * poly_order**1)
-gamma_v_hess = Constant(penalty_hess * poly_order**2)
+gamma_v = Constant(penalty_val )
+gamma_v_grad= Constant(penalty_grad )
+gamma_p  = Constant(penalty_val )
+gamma_p_grad = Constant(penalty_grad )
+gamma_v_hess = Constant(penalty_hess )
 
 stab = ( gamma_v  / cell_h   * dot(jump(u_k), jump(v))
        + gamma_v_grad * cell_h   * grad_inner(jump(u_k), jump(v))
-         + gamma_v_hess * cell_h**3.0/4.0   * hessian_inner(jump(u_k), jump(v))
+        #  + gamma_v_hess * cell_h**3.0/4.0   * inner(nHn(jump(u_k),n), nHn(jump(v),n))
     #    + gamma_p  / cell_h   * jump(p_k) * jump(q)  # Note: use * for scalars, see issue 2
-       + gamma_p_grad * cell_h**3.0   * grad_inner(jump(p_k), jump(q)) ) * dG
+       + gamma_p_grad * cell_h**3.0   * grad_inner(jump(p_k), jump(q)) 
+       ) * dG
 
 stab_lin  = ( gamma_v  / cell_h   * dot(jump(du),  jump(v)) +
              gamma_v_grad * cell_h   * grad_inner(jump(du),  jump(v)) 
-           + gamma_v_hess * cell_h**3.0/4.0   * hessian_inner(jump(du), jump(v))
+        #    + gamma_v_hess * cell_h**3.0/4.0   * inner(nHn(jump(du),n), nHn(jump(v),n))
         #    +  gamma_p  / cell_h   * jump(dp) *  jump(q)
-            + gamma_p_grad * cell_h**3.0   * grad_inner(jump(dp),  jump(q)))   * dG
+            + gamma_p_grad * cell_h**3.0   * grad_inner(jump(dp),  jump(q))
+            )   * dG
 # complete Jacobian and residual -----------------------------------
 jacobian_form  = a_vol + J_int + stab_lin
 residual_form  = r_vol + R_int + stab
@@ -607,26 +622,37 @@ from pycutfem.io.vtk import export_vtk
 from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.fem import transform
+from pycutfem.ufl.expressions import Pos, Neg, Grad, Dot, FacetNormal, Constant
+
 output_dir = "turek_results"
 os.makedirs(output_dir, exist_ok=True)
 step_counter = 0
 histories = {}  # Store histories for CD, CL, Δp
 # --- Traction helper on Γ: (σ(u,p)·n)·v_dir  -------------------------------
 # Uses the same σ as in your Nitsche terms: μ(∇u + ∇uᵀ) - p I
-def traction_dot_dir(u_vec, p_scal, v_dir):
-    # n is provided by the interface/boundary assembler via FacetNormal()
-    a = dot(grad(u_vec),   n)      # (∇u)·n
-    b = dot(grad(u_vec).T, n)      # (∇uᵀ)·n
-    t = mu*(a + b) - p_scal*n      # σ(u,p)·n   (vector in ℝ²)
-    return dot(t, v_dir)           # scalar: (σ·n)·e_x or (σ·n)·e_y
+def traction_dot_dir(u_vec, p_scal, v_dir, side="+"):  # side: "+" (pos) or "-" (neg)
+    if side == "+":
+        du = Pos(Grad(u_vec))  # use POS trace of ∇u
+        p  = Pos(p_scal)       # use POS trace of p
+    else:
+        du = Neg(Grad(u_vec))
+        p  = Neg(p_scal)
+
+    a = Dot(du, n)          # (∇u|side)·n
+    b = Dot(du.T, n)        # (∇uᵀ|side)·n
+    t = mu*(a + b) - p*n    # σ(u,p)·n
+    return Dot(t, v_dir)
+
 
 
 def save_solution(funcs):
     """Export + compute CD, CL, Δp (Turek)."""
     global step_counter
+    orig_u_k_func = funcs[0]  # VectorFunction for velocity
+    orig_p_k_func = funcs[1]  # VectorFunction for pressure
 
-    u_k_func = funcs[0]
-    p_k_func = funcs[1]
+    u_k_func = funcs[0].copy()  # VectorFunction for velocity
+    p_k_func = funcs[1].copy()  # VectorFunction for pressure
 
     # ------------------ VTK output (as you already have) --------------------
     filename = os.path.join(output_dir, f"solution_{step_counter:04d}.vtu")
@@ -659,10 +685,10 @@ def save_solution(funcs):
     drag_hook = {I_drag.integrand: {"name": "FD"}}
     lift_hook = {I_lift.integrand: {"name": "FL"}}
 
-    res_Fd = assemble_form(I_drag == None, 
+    res_Fd = assemble_form(Equation(None , I_drag), 
                            dof_handler=dof_handler, bcs=[],
                            assembler_hooks=drag_hook, backend="python")
-    res_Fl = assemble_form(I_lift == None, 
+    res_Fl = assemble_form(Equation(None , I_lift), 
                            dof_handler=dof_handler, bcs=[],
                            assembler_hooks=lift_hook, backend="python")
 
@@ -744,7 +770,7 @@ def save_solution(funcs):
     print(f"[step {step_counter:4d}]  FD={F_D:.6e}  FL={F_L:.6e}  "
           f"CD={C_D:.6f}  CL={C_L:.6f}  Δp={dp:.6f}")
     if step_counter % 2 == 0:
-        u_k_func.plot(field = 'ux',
+        orig_u_k_func.plot(field = 'ux',
                       title=f"Velocity Ux at step {step_counter}",
                       xlabel='X-Axis', ylabel='Y-Axis',
                       levels=100, cmap='jet',
@@ -757,6 +783,8 @@ def save_solution(funcs):
 
 
     step_counter += 1
+
+save_solution([u_k, p_k])
 
 
 
@@ -924,13 +952,14 @@ solver.solve_time_interval(functions=functions,
 # In[ ]:
 
 
-plt.plot(histories["cd"], label="C_D", marker='o')
+offset = 5
+plt.plot(histories["cd"][offset:], label="C_D", marker='o')
 plt.ylabel('C_D')
 plt.figure()
-plt.plot(histories["cl"], label="C_L", marker='o')
+plt.plot(histories["cl"][offset:], label="C_L", marker='o')
 plt.ylabel('C_L')
 plt.figure()
-plt.plot(histories["dp"], label="Δp", marker='o')
+plt.plot(histories["dp"][offset:], label="Δp", marker='o')
 plt.ylabel('Δp')
 
 

@@ -149,7 +149,7 @@ def test_stokes_interface_corrected():
     This version is corrected to use the existing pycutfem API.
     """
     # ---------------- 1) Mesh, order, level set ----------------
-    backend = 'jit'
+    backend = 'python'
     poly_order = 2
     maxh = 0.125
     L,H = 2.0, 2.0

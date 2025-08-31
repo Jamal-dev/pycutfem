@@ -801,6 +801,7 @@ class FormCompiler:
         if role == "function":
             # collapse once per component and cache
             local_dofs = self._local_dofs()
+            
             for i, fld in enumerate(fields):
                 key_coll = (id(op), "grad", i, self.ctx.get("eid"), self.ctx.get("side"), self.ctx.get("phi_val"))
                 gval = self._collapsed_cache.get(key_coll)
@@ -996,8 +997,8 @@ class FormCompiler:
         # role_a = getattr(a, 'role', None)
         # role_b = getattr(b, 'role', None)
         logger.debug(f"Entering _visit_Prod for  ('{n.a!r}' * '{n.b!r}') on {'RHS' if self.ctx['rhs'] else 'LHS'}") #, a.info={getattr(a, 'info', None)}, b.info={getattr(b, 'info', None)}
-        print(f" Product: a type={type(a)}, shape={shape_a}, b type={type(b)}, shape={shape_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
-              f" roles: a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
+        # print(f" Product: a type={type(a)}, shape={shape_a}, b type={type(b)}, shape={shape_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
+        #       f" roles: a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
 
         result = a * b
         # print(f" Product result: {getattr(result, 'shape', None)}"
@@ -1068,7 +1069,11 @@ class FormCompiler:
                (isinstance(b, VecOpInfo) and role_b == "vector")) and \
              isinstance(a, (VecOpInfo)) and a.role in {"trial", "function"}:
                 # return a.dot_const(b) if a.ndim==2 else a.dot_vec(b)
-                return a.dot_const_vec(b) 
+                return a.dot_const_vec(b)
+            if isinstance(a, VecOpInfo) and role_a == "vector" and role_b == None:
+                return a.dot_const(b)
+            elif isinstance(b, VecOpInfo) and role_b == "vector" and role_a == None:
+                return b.dot_const(a)
             elif isinstance(a, np.ndarray) and isinstance(b, GradOpInfo):
                 return b.left_dot(a)  # np.ndarray · ∇u
             elif isinstance(b, np.ndarray) and isinstance(a, GradOpInfo):
@@ -1453,6 +1458,7 @@ class FormCompiler:
 
         # 1. Determine the exact subset of elements for this integral.
         defined_on = integral.measure.defined_on
+        on_facet = integral.measure.on_facet
         if defined_on is not None:
             element_ids = np.asarray(defined_on.to_indices(), dtype=np.int32) if hasattr(defined_on, "to_indices") else np.flatnonzero(np.asarray(defined_on)).astype(np.int32)
         else:
@@ -1469,7 +1475,7 @@ class FormCompiler:
         # This ensures we have the correct param_order for this exact expression.
         runner, ir = self._compile_backend(
             integral.integrand,
-            self.dh, self.me
+            self.dh, self.me, on_facet=on_facet
         )
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(integral, runner)
 
@@ -1667,17 +1673,16 @@ class FormCompiler:
                     self.ctx['normal'] = g / (np.linalg.norm(g) + 1e-30)
                     self.ctx['basis_values'] = {}  # per-QP, per-side cache for _basis_row
 
-                    if not is_functional:
-                        self.ctx['global_dofs'] = global_dofs
-                        # identity maps (generic fallback); per-field maps are primary
-                        self.ctx['pos_map'] = np.arange(len(global_dofs), dtype=int)
-                        self.ctx['neg_map'] = self.ctx['pos_map']
-                        # per-field maps (preferred)
-                        self.ctx['pos_map_by_field'] = pos_map_by_field
-                        self.ctx['neg_map_by_field'] = neg_map_by_field
-                        # masks applied inside _basis_row when present
-                        self.ctx['pos_mask_by_field'] = pos_mask_by_field
-                        self.ctx['neg_mask_by_field'] = neg_mask_by_field
+                    self.ctx['global_dofs'] = global_dofs
+                    # identity maps (generic fallback); per-field maps are primary
+                    self.ctx['pos_map'] = np.arange(len(global_dofs), dtype=int)
+                    self.ctx['neg_map'] = self.ctx['pos_map']
+                    # per-field maps (preferred)
+                    self.ctx['pos_map_by_field'] = pos_map_by_field
+                    self.ctx['neg_map_by_field'] = neg_map_by_field
+                    # masks applied inside _basis_row when present
+                    self.ctx['pos_mask_by_field'] = pos_mask_by_field
+                    self.ctx['neg_mask_by_field'] = neg_mask_by_field
 
                     # Evaluate integrand; visitors will respect Pos/Neg and padding
                     val = self._visit(intg.integrand)
@@ -1895,21 +1900,19 @@ class FormCompiler:
                     normal_vec = -normal_vec
 
                 # Local union DOFs / accumulator
-                if is_functional:
-                    loc_acc = 0.0
-                    global_dofs = pos_map = neg_map = None
-                else:
-                    pos_dofs = self.dh.get_elemental_dofs(pos_eid)
-                    neg_dofs = self.dh.get_elemental_dofs(neg_eid)
-                    global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
-                    pos_map = np.searchsorted(global_dofs, pos_dofs)
-                    neg_map = np.searchsorted(global_dofs, neg_dofs)
-                    # NEW: field-specific maps (for gradient/value padding)
-                    pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
-                        self.dh, fields, pos_eid, neg_eid, global_dofs
-                    )
-                    loc_acc = (np.zeros(len(global_dofs))
-                               if rhs else np.zeros((len(global_dofs), len(global_dofs))))
+                 # Always compute union layout & maps; accumulator depends on functional vs mat/vec
+                pos_dofs = self.dh.get_elemental_dofs(pos_eid)
+                neg_dofs = self.dh.get_elemental_dofs(neg_eid)
+                global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+                pos_map = np.searchsorted(global_dofs, pos_dofs)
+                neg_map = np.searchsorted(global_dofs, neg_dofs)
+                pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
+                    self.dh, fields, pos_eid, neg_eid, global_dofs
+                )
+                loc_acc = 0.0 if is_functional else (
+                    np.zeros(len(global_dofs)) if rhs
+                    else np.zeros((len(global_dofs), len(global_dofs)))
+                )
 
                 # ---------------- QP loop ----------------
                 for xq, w in zip(qpts_phys, qwts):
@@ -1994,6 +1997,7 @@ class FormCompiler:
         cut_bs = (intg.measure.defined_on
                 if intg.measure.defined_on is not None
                 else mesh.element_bitset("cut"))
+        on_facet = intg.measure.on_facet
 
         if cut_bs.cardinality() == 0:          # nothing to do
             return
@@ -2006,8 +2010,8 @@ class FormCompiler:
         if level_set is None:
             raise ValueError("dInterface measure requires a level_set.")
 
-        
-        runner, ir = self._compile_backend(intg.integrand, dh, me)
+
+        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
         geo = dh.precompute_interface_factors(cut_bs, qdeg, level_set, 
                                               need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
@@ -2135,6 +2139,7 @@ class FormCompiler:
         edge_ids = (intg.measure.defined_on
                     if intg.measure.defined_on is not None
                     else mesh.edge_bitset('ghost'))
+        on_facet = intg.measure.on_facet
         level_set = getattr(intg.measure, 'level_set', None)
         if level_set is None:
             raise ValueError("dGhost measure requires a 'level_set' callable.")
@@ -2143,7 +2148,7 @@ class FormCompiler:
             raise ValueError("No ghost edges found for the integral.")
 
         # 2) Compile kernel FIRST (to know exact static params it will require)
-        runner, ir = self._compile_backend(intg.integrand, dh, me)
+        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
 
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
@@ -2378,6 +2383,7 @@ class FormCompiler:
         edge_set = (intg.measure.defined_on
                     if intg.measure.defined_on is not None
                     else mesh.get_domain_bitset(intg.measure.tag, entity="edge"))
+        on_facet = intg.measure.on_facet
         if edge_set.cardinality() == 0:
             raise ValueError(f"[Assembler: boundary edge JIT] No edges defined for {intg.measure.tag}.")
         else:
@@ -2389,7 +2395,7 @@ class FormCompiler:
         qdeg = self._find_q_order(intg)
         print(f"[Assembler: boundary edge JIT] Using quadrature degree: {qdeg}")
         # 3. kernel compilation ---------------------------------------
-        runner, ir = self._compile_backend(intg.integrand, dh, me)
+        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
         geo  = dh.precompute_boundary_factors(edge_set, qdeg, derivs, 
                                               need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
@@ -2607,12 +2613,13 @@ class FormCompiler:
         qdeg   = self._find_q_order(intg)
         level_set = intg.measure.level_set
         side   = intg.measure.metadata.get('side', '+')   # '+' → φ>0, '-' → φ<0
+        on_facet = intg.measure.on_facet
 
         # --- 1) classification (must be called; sets element tags & caches)
         inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
 
         # --- compile kernel once
-        runner, ir = self._compile_backend(intg.integrand, dh, me)
+        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
 
         # helper to run kernel on a subset of elements with prebuilt geo

@@ -36,6 +36,11 @@ class Measure:
         self.level_set = level_set
         self.metadata = metadata or {}
         self.tag = tag
+    @property
+    def on_facet(self) -> bool:
+        return self.domain_type in {
+            "interior_facet", "exterior_facet", "interface", "ghost_edge"
+        }
 
     def __call__(self, 
                  defined_on: Optional[BitSet] = None, 

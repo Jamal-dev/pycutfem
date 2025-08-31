@@ -154,7 +154,7 @@ class KernelRunner:
         # ---------------------------------------------------------------
         return self.kernel(*final_args)
 
-def compile_backend(integral_expression, dof_handler,mixed_element ): # New Newton: Pass dof_handler
+def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet: bool = False ): # New Newton: Pass dof_handler
     """
     Orchestrates the JIT compilation and returns a reusable runner.
     """
@@ -168,7 +168,7 @@ def compile_backend(integral_expression, dof_handler,mixed_element ): # New Newt
         integral_expression = integral_expression.integrand
     ir_generator = IRGenerator()
     rank    = _form_rank(integral_expression)
-    codegen = NumbaCodeGen(mixed_element=mixed_element,form_rank=rank) 
+    codegen = NumbaCodeGen(mixed_element=mixed_element,form_rank=rank, on_facet=on_facet) 
     cache = KernelCache()
 
     ir_sequence = ir_generator.generate(integral_expression)
@@ -223,9 +223,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
     for intg in integrals:
         dom = intg.measure.domain_type           # "volume", "interface", "ghost_edge", ...
         qdeg = fc._find_q_order(intg)
+        on_facet = intg.measure.on_facet
 
         # Compile the backend once; reuse for all subsets of this integral
-        runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element)
+        runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element, on_facet=on_facet)
 
         # Max derivative order we need in the geometry *inverse* jets (A, A2, A3, A4)
         def _max_required_order(ir_seq):
@@ -254,6 +255,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
             # ---- Plain volume (no level set) -----------------------------
             if level_set is None:
                 geom = dof_handler.precompute_geometric_factors(qdeg, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
+                geom["is_interface"] = False
+                geom["is_ghost"] = False
                 gdofs_map = np.vstack([
                     dof_handler.get_elemental_dofs(e)
                     for e in range(mesh.n_elements)
@@ -314,6 +317,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     "h_arr":     geom_all["h_arr"][full_ids],
                     "owner_id":  geom_all.get("owner_id", geom_all["eids"])[full_ids].astype(np.int32),
                     "entity_kind": "element",
+                    "is_interface": False,
+                    "is_ghost": False
                 }
                 gdofs_map_full = np.vstack([
                     dof_handler.get_elemental_dofs(e) for e in full_ids
@@ -374,6 +379,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
             bs_def = intg.measure.defined_on
             cut_eids = (bs_def & bs_cut) if bs_def is not None else bs_cut
             geom = dof_handler.precompute_interface_factors(cut_eids, qdeg, level_set, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
+            geom["is_interface"] = True
 
             # interface assembly still uses element-local maps; safe to use all
             gdofs_map = np.vstack([
@@ -402,6 +408,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
             bs_def   = intg.measure.defined_on
             edges = (bs_def & bs_ghost) if bs_def is not None else bs_ghost
             geom = dof_handler.precompute_ghost_factors(edges, qdeg, level_set, derivs, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
+            geom["is_ghost"] = True
+            geom["is_interface"] = False
 
             # ghost precompute returns the union dof map for each edge
             gdofs_map = geom["gdofs_map"]

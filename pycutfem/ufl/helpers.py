@@ -6,7 +6,8 @@ from typing import Union, Tuple, Set, Sequence, Optional, Dict, Any
 from pycutfem.ufl.expressions import Expression, Derivative
 from pycutfem.ufl.expressions import (
     VectorFunction, TrialFunction, VectorTrialFunction,
-    TestFunction, VectorTestFunction, Restriction
+    TestFunction, VectorTestFunction, Restriction,
+    Grad as UFLGrad
 )
 from pycutfem.ufl.forms import Form, Equation
 from pycutfem.core.dofhandler import DofHandler
@@ -1298,7 +1299,11 @@ def required_multi_indices(expr: "Expression") -> Set[MultiIndex]:
             out.update({(2,0),(1,1),(0,2)}); _walk(node.operand, acc_x, acc_y); return
         if isinstance(node, UFLLaplacian):
             out.update({(2,0),(0,2)}); _walk(node.operand, acc_x, acc_y); return
-
+        
+        if isinstance(node, UFLGrad):
+            out.update({(1, 0), (0, 1)})
+            _walk(node.operand, acc_x, acc_y)
+            return
         # ---- leaf: record accumulated orders ----------------------------
         if acc_x or acc_y:
             out.add((acc_x, acc_y))
