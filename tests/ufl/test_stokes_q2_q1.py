@@ -68,8 +68,8 @@ def test_stokes_lid_driven_cavity():
     }
     # Note: mesh.tag_boundary_edges is no longer needed for the DofHandler,
     # but may be useful for other parts of your code (like visualization).
+    dh.tag_dof_by_locator('pressure_pin','p',lambda x,y: np.isclose(x, 0) and np.isclose(y,0))
     mesh.tag_boundary_edges(walls)
-    mesh.nodes_list[0].tag = 'pressure_pin'
 
     bcs = [
         *[BoundaryCondition(c, 'dirichlet', w, lambda x,y: 0.0)

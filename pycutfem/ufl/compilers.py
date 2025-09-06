@@ -55,7 +55,9 @@ from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo,
                                   phys_scalar_fourth_row,
                                   _as_indices,
                                   HelpersFieldAware as _hfa,
-                                  HelpersAlignCoefficents as _hac)
+                                  HelpersAlignCoefficents as _hac,
+                                  normalize_edge_ids,
+                                  normalize_elem_ids)
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 from pycutfem.ufl.helpers_geom import (
@@ -67,6 +69,31 @@ from pycutfem.ufl.helpers_geom import (
 logger = logging.getLogger(__name__)
 _INTERFACE_TOL = 1.0e-12 # New
 
+def interface_normal_for_edge(mesh, e, level_set):
+    # mid-point on the physical edge
+    p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+    mid = 0.5*(p0 + p1)
+    # try LS gradient first
+    g = np.asarray(level_set.gradient(mid), float)
+    if np.linalg.norm(g) > 1e-15:
+        n = g / np.linalg.norm(g)
+    else:
+        # degenerate ∇φ: fall back to edge normal
+        t = p1 - p0
+        t /= max(np.linalg.norm(t), 1e-16)
+        n = np.array([t[1], -t[0]], float)
+
+    # orient NEG -> POS using element centroids
+    cl = np.asarray(mesh.elements_list[e.left ].centroid())
+    cr = np.asarray(mesh.elements_list[e.right].centroid())
+    # pick which side is POS/NEG using φ at centroids
+    if float(level_set(*cl)) >= float(level_set(*cr)):
+        cpos, cneg = cl, cr
+    else:
+        cpos, cneg = cr, cl
+    if np.dot(n, cpos - cneg) < 0.0:
+        n = -n
+    return n
 
 
 
@@ -169,13 +196,13 @@ class FormCompiler:
         F = np.zeros(ndofs)
 
         # Assemble LHS if it is provided.
-        if eq.a is not None:
+        if eq.a is not None and not (isinstance(eq.a, (int, float)) or eq.a != 0.0):
             logger.info("Assembling LHS...")
             self.ctx["rhs"] = False
             self._assemble_form(eq.a, K)
 
         # Assemble RHS if it is provided.
-        if eq.L is not None:
+        if eq.L is not None and not (isinstance(eq.L, (int, float)) or eq.L != 0.0):
             logger.info("Assembling RHS vector F...")
             self.ctx["rhs"] = True
             self._assemble_form(eq.L, F)
@@ -622,11 +649,15 @@ class FormCompiler:
     def _visit_Pos(self, n):
         # SIDED path (interface or ghost): set side/eid and RETURN — no φ-gating.
         if self._on_sided_path():
-            return self._with_side('+', 'pos_eid', n.operand)
+            result = self._with_side('+', 'pos_eid', n.operand)
+            # print(f'Pos sided path: result={result.data if isinstance(result, VecOpInfo) else result}')
+            return result
 
         # VOLUME path: φ-gate
         val = self._with_side('+', 'pos_eid', n.operand)
-        return val if float(self.ctx.get('phi_val', 0.0)) >= 0.0 else (val * 0.0)
+        result = val if float(self.ctx.get('phi_val', 0.0)) >= 0.0 else (val * 0.0)
+        # print(f'Pos volume path: phi_val={self.ctx.get("phi_val", 0.0)}; result={result}')
+        return result
 
     def _visit_Neg(self, n):
         if self._on_sided_path():
@@ -943,9 +974,16 @@ class FormCompiler:
         eid = self.ctx.get("eid")
         if eid is None:
             eid = self.ctx.get("pos_eid", self.ctx.get("neg_eid"))
-        if eid is None:
-            raise KeyError("CellDiameter() requires 'eid' in context; set it in the element loop.")
-        return self.me.mesh.element_char_length(int(eid))
+        # if eid is None:
+        #     raise KeyError("CellDiameter() requires 'eid' in context; set it in the element loop.")
+        # h = self.me.mesh.element_char_length(eid)
+        if self.ctx.get('is_interface'):
+            # use min(h_left, h_right) on the face (robust even on aligned Γ)
+            h = self.me.mesh.face_char_length(self.ctx.get('pos_eid'), self.ctx.get('neg_eid'))
+        else:
+            h = self.me.mesh.element_char_length(eid)
+        # print(f"CellDiameter on eid={eid}: CellDiameter={h}")
+        return float(h)
 
 
     
@@ -1181,8 +1219,8 @@ class FormCompiler:
         # ------------------------------------------------------------------
         # Case:  Grad(Trial) · Grad(Function)       ∇u_trial · ∇u_k 
         # ------------------------------------------------------------------
-        if isinstance(a, GradOpInfo) and (a.role == "trial" or a.role == "function") \
-        and isinstance(b, GradOpInfo) and (b.role == "trial" or b.role == "function"):
+        if isinstance(a, GradOpInfo) and (a.role in {"trial", "function", "test"}) \
+        and isinstance(b, GradOpInfo) and (b.role in {"trial", "function", "test"}):
             return a.dot(b)
         
         # --- Hessian · vector (right) and vector · Hessian (left) -------------
@@ -1200,7 +1238,7 @@ class FormCompiler:
         # Both are numerical vectors (RHS)
         if isinstance(a, np.ndarray) and isinstance(b, np.ndarray): return np.dot(a,b)
 
-        raise TypeError(f"Unsupported dot product '{n.a} . {n.b}'"
+        raise TypeError(f"Unsupported dot product LHS '{n.a} . {n.b}'"
                         f" for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}"
                         f" and data shapes a={getattr(a_data, 'shape', None)}, b={getattr(b_data, 'shape', None)}")
 
@@ -1382,6 +1420,75 @@ class FormCompiler:
         # Set values in the RHS vector
         F[rows] = vals
     
+    def _union_element_dofs(self, eid: int, fields: list[str]) -> np.ndarray:
+        """
+        Concatenate per-field element DOFs in the same order `fields` are visited.
+        This matches the mixed-element local block layout used by the integrand.
+        """
+        return np.concatenate(
+            [np.asarray(self.dh.element_dofs(f, eid), dtype=int) for f in fields],
+            axis=0
+        )
+
+    def _scatter_local(self, eid: int, loc, fields, matvec, rhs: bool) -> None:
+        """
+        Scatter a local mixed-element block to the global vector/matrix.
+
+        If `fields` is None, uses ALL per-element DOFs as returned by
+        `DofHandler.get_elemental_dofs(eid)` so the index grid matches the
+        full local block returned by the visitor (common for mixed integrands).
+
+        If `fields` is a list of field names, concatenates their DOFs in that
+        order.
+
+        Parameters
+        ----------
+        eid : int
+            Element id.
+        loc : ndarray
+            Local vector (n) or matrix (n,n) to add.
+        fields : list[str] | None
+            Field subset to scatter (None → all fields on the element).
+        matvec : scipy.sparse matrix or ndarray
+            Global accumulation target.
+        rhs : bool
+            True for vector assembly; False for matrix.
+        """
+        import numpy as np
+
+        if fields is None:
+            gdofs = np.asarray(self.dh.get_elemental_dofs(eid), dtype=int)
+        else:
+            gdofs = np.concatenate(
+                [np.asarray(self.dh.element_dofs(f, eid), dtype=int) for f in fields],
+                axis=0
+            )
+        if rhs:
+            np.add.at(matvec, gdofs, loc)
+        else:
+            r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
+            matvec[r, c] += loc
+
+    
+    def _fields_for(self, integrand) -> list[str]:
+        """
+        Robust field discovery for an integrand:
+        _all_fields ∪ fields from (trial,test), or all handler fields as fallback.
+        Keeps a stable, sorted order.
+        """
+        fields = set(_all_fields(integrand))
+        tr, te = _trial_test(integrand)
+        for tt in (tr, te):
+            if tt is None:
+                continue
+            if hasattr(tt, "field_names"):
+                fields.update(tt.field_names)
+            elif hasattr(tt, "field_name"):
+                fields.add(tt.field_name)
+        if not fields:
+            fields = set(getattr(self.dh, "field_names", []))
+        return sorted(fields)
+    
     def _assemble_volume(self, integral: Integral, matvec):
         # if a level-set was attached to dx → do cut-cell assembly in Python path
         if getattr(integral.measure, "level_set", None) is not None:
@@ -1539,49 +1646,70 @@ class FormCompiler:
 
 
     def _assemble_volume_python(self, integral: Integral, matvec):
-        mesh = self.me.mesh
-        # Use a higher quadrature order for safety, esp. with mixed orders
-        q_order = self._find_q_order(integral)
-        qp, qw = volume(mesh.element_type, q_order)
-        fields = _all_fields(integral.integrand)
-        rhs = self.ctx["rhs"]
-        self.ctx['is_interface'] = False
+        """
+        Assemble a standard volume integral (no level-set clipping).
+
+        Respects:
+        - measure.defined_on  : optional element selection (BitSet / ids / mask / tag / int)
+        - mixed-element layout: local blocks are full-size (me.n_dofs_local)
+        - curved geometry     : quadrature order inflated by mesh.poly_order
+        """
+        import numpy as np
+        from pycutfem.fem import transform
+        from pycutfem.ufl.helpers import normalize_elem_ids
+
+        mesh   = self.me.mesh
+        rhs    = self.ctx.get("rhs", False)
+        fields = self._fields_for(integral.integrand)
+        self.ctx["is_interface"] = False
         logger.info(f"Assembling volume integral: {integral}")
 
-        for eid, element in enumerate(mesh.elements_list):
-            if rhs:
-                loc = np.zeros(self.me.n_dofs_local)
-            else:
-                loc = np.zeros((self.me.n_dofs_local, self.me.n_dofs_local))
-            
-            for (xi, eta), w in zip(qp, qw):
-                J = transform.jacobian(mesh, eid, (xi, eta))
-                detJ = abs(np.linalg.det(J))
-                Ji = np.linalg.inv(J)
-                self.ctx['x_phys'] = transform.x_mapping(mesh, eid, (xi, eta))
-                
-                # Cache basis values and gradients for this quadrature point
-                self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
-                for f in fields:
-                    val = self.me.basis(f, xi, eta)
-                    g_ref = self.me.grad_basis(f, xi, eta)
-                    self._basis_cache[f] = {"val": val, "grad": g_ref @ Ji}
-                
-                self.ctx["eid"] = eid
-                integrand_val = self._visit(integral.integrand)
-                # print(f"integrand value at element {eid}: {integrand_val.shape}, w.shape: {w.shape}, detJ: {detJ}, type(integrand_val): {type(integrand_val)}"
-                #       f"integrad.role: {integrand_val.role}")
-                loc += w * detJ * integrand_val
-            
-            gdofs = self.dh.get_elemental_dofs(eid)
-            if rhs:
-                np.add.at(matvec, gdofs, loc)
-            else:
-                # Efficiently add local matrix to sparse global matrix
-                r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
-                matvec[r, c] += loc
+        # --- element restriction via 'defined_on' (BitSet / mask / ids / tag / int)
+        allowed = normalize_elem_ids(mesh, getattr(integral.measure, "defined_on", None))
+        if allowed is None:
+            elem_ids = range(len(mesh.elements_list))
+        else:
+            elem_ids = [int(e) for e in allowed]
 
-        self.ctx.pop("eid", None); self.ctx.pop("x_phys", None); self.ctx.pop("is_interface", None);  # Clean up context
+        # --- geometry-aware quadrature for curved mapping (Qp_geo, p_geo>=1)
+        q_base  = int(self._find_q_order(integral))
+        p_geo   = int(getattr(mesh, "poly_order", 1))
+        q_infl  = 2 * max(0, p_geo - 1)
+        q_order = q_base + q_infl
+
+        qp, qw = volume(mesh.element_type, q_order)
+
+        # local block shape == full mixed-element local size (matches visitor output)
+        loc_shape = (self.me.n_dofs_local,) if rhs else (self.me.n_dofs_local, self.me.n_dofs_local)
+
+        for eid in elem_ids:
+            loc = np.zeros(loc_shape, dtype=float)
+
+            for (xi, eta), w in zip(qp, qw):
+                J     = transform.jacobian(mesh, eid, (xi, eta))
+                detJ  = abs(np.linalg.det(J))
+                Ji    = np.linalg.inv(J)
+
+                # cache basis/grad for exactly the fields used by the integrand
+                self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
+                for f in fields:
+                    self._basis_cache[f] = {
+                        "val" : self.me.basis(f, xi, eta),
+                        "grad": self.me.grad_basis(f, xi, eta) @ Ji
+                    }
+
+                self.ctx["eid"]    = eid
+                self.ctx["x_phys"] = transform.x_mapping(mesh, eid, (xi, eta))
+
+                integrand_val = self._visit(integral.integrand)
+                loc += (w * detJ) * integrand_val
+
+            # full-size local block → scatter against ALL element DOFs
+            self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
+
+        # cleanup
+        for k in ("eid", "x_phys", "is_interface"):
+            self.ctx.pop(k, None)
 
     
     
@@ -1615,7 +1743,10 @@ class FormCompiler:
 
         mesh = self.me.mesh
         qdeg = self._find_q_order(intg)
-        fields = _all_fields(intg.integrand)
+        p_geo  = int(getattr(self.me.mesh, "poly_order", 1))
+        qdeg  += 2 * max(0, p_geo - 1)
+        fields = self._fields_for(intg.integrand)
+
 
         trial, test = _trial_test(intg.integrand)
         hook = self._hook_for(intg.integrand)
@@ -1706,6 +1837,82 @@ class FormCompiler:
                         rr, cc = np.meshgrid(global_dofs, global_dofs, indexing='ij')
                         matvec[rr, cc] += acc
 
+            # --- NEW: edge‑aligned Γ (no cut cells) ----------------------------
+            # Integrate over interior edges tagged 'interface' whose neighbors
+            # are NOT cut. This covers cases where Γ coincides with a mesh edge.
+            # from collections import defaultdict
+            # edge_bs = getattr(mesh, "edge_bitset", None)
+            # if edge_bs is not None and "interface" in mesh._edge_bitsets:
+            #     for gid in mesh.edge_bitset("interface").to_indices():
+            #         e = mesh.edge(int(gid))
+            #         # only interior edges
+            #         if e.right is None:
+            #             continue
+            #         # skip edges already covered by cut‑element pass
+            #         if mesh.elements_list[e.left].tag == "cut" or \
+            #         mesh.elements_list[e.right].tag == "cut":
+            #             continue
+
+            #         # (+)/(–) by centroid values: pos = higher φ, neg = lower φ
+            #         phiL = float(level_set(np.asarray(mesh.elements_list[e.left ].centroid())))
+            #         phiR = float(level_set(np.asarray(mesh.elements_list[e.right].centroid())))
+            #         pos_eid, neg_eid = (e.left, e.right) if phiL >= phiR else (e.right, e.left)
+
+            #         # normal (–→+), consistent with ghost assembler
+            #         p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+            #         n = interface_normal_for_edge(mesh, e, level_set)
+
+            #         # line quadrature in physical space (weights already physical)
+            #         qpts_phys, qwts = line_quadrature(p0, p1, self._find_q_order(intg))
+
+            #         # union DOFs and per‑field maps
+            #         pos_dofs = self.dh.get_elemental_dofs(pos_eid)
+            #         neg_dofs = self.dh.get_elemental_dofs(neg_eid)
+            #         global_dofs = np.unique(np.r_[pos_dofs, neg_dofs])
+            #         pos_map = np.searchsorted(global_dofs, pos_dofs)
+            #         neg_map = np.searchsorted(global_dofs, neg_dofs)
+            #         pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
+            #             self.dh, fields, pos_eid, neg_eid, global_dofs
+            #         )
+
+            #         # local accumulator (functional / vector / matrix)
+            #         loc = 0.0 if is_functional else (
+            #             np.zeros(len(global_dofs)) if rhs
+            #             else np.zeros((len(global_dofs), len(global_dofs)))
+            #         )
+
+            #         # QP loop
+            #         for xq, w in zip(qpts_phys, qwts):
+            #             self.ctx.update({
+            #                 "basis_values": {"+": defaultdict(dict), "-": defaultdict(dict)},
+            #                 "normal": n,
+            #                 # do NOT set 'phi_val' here; Pos/Neg will set side explicitly
+            #                 # "phi_val": level_set(xq),     # lets Pos/Neg pick the side
+            #                 "x_phys": xq,
+            #                 "global_dofs": (global_dofs if not is_functional else None),
+            #                 "pos_map": (pos_map if not is_functional else None),
+            #                 "neg_map": (neg_map if not is_functional else None),
+            #                 "pos_map_by_field": (pos_map_by_field if not is_functional else None),
+            #                 "neg_map_by_field": (neg_map_by_field if not is_functional else None),
+            #                 "pos_eid": pos_eid,
+            #                 "neg_eid": neg_eid,
+            #             })
+            #             val = self._visit(intg.integrand)
+            #             if is_functional:
+            #                 # robust scalar reduction
+            #                 arr = np.asarray(getattr(val, "data", val))
+            #                 loc += w * (float(arr) if arr.ndim == 0 else float(arr.sum()))
+            #             else:
+            #                 loc += w * np.asarray(val)
+
+            #         # scatter
+            #         if is_functional:
+            #             self.ctx["scalar_results"][hook["name"]] += loc
+            #         elif rhs:
+            #             np.add.at(matvec, global_dofs, loc)
+            #         else:
+            #             r, c = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+            #             matvec[r, c] += loc
         finally:
             # Context cleanup
             for k in (
@@ -1835,22 +2042,25 @@ class FormCompiler:
 
         # ---- which ghost edges ------------------------------------------
         defined = intg.measure.defined_on
-        if defined is None:
-            edge_set = mesh.edge_bitset("ghost")
-            edge_ids = edge_set.to_indices() if hasattr(edge_set, "to_indices") else list(edge_set)
-        else:
-            edge_ids = defined.to_indices()
+        edge_ids = normalize_edge_ids(mesh, defined)
+        if edge_ids is None:
+            # default to the 'ghost' bitset when user didn't pass one
+            bs = mesh.edge_bitset("ghost")
+            edge_ids = bs.to_indices() if hasattr(bs, "to_indices") else list(bs)
+        edge_ids = [int(e) for e in edge_ids]
 
         # level set required to choose (+)/(–)
         level_set = getattr(intg.measure, "level_set", None)
         if level_set is None:
             raise ValueError("dGhost measure requires a 'level_set' callable.")
 
-        # Quadrature degree: safe upper bound
-        qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
+        # Quadrature degree: safe upper bound (+ light inflation for curved geometry)
+        qdeg_base = max(self._find_q_order(intg), 2 * max_total + 4)
+        p_geo     = int(getattr(mesh, "poly_order", 1))
+        qdeg      = qdeg_base + max(0, p_geo - 1)
 
         # Fields needed (fallbacks if tree-walk misses some due to Jump/Pos/Neg)
-        fields = set(_all_fields(intg.integrand))
+        fields = set(self._fields_for(intg.integrand))
         trial, test = _trial_test(intg.integrand)
         # Add from trial/test if missed
         for tt in (trial, test):
@@ -1877,27 +2087,33 @@ class FormCompiler:
                 if e.right is None:
                     continue
 
-                # Narrow band or explicitly tagged as ghost
-                lt = mesh.elements_list[e.left].tag
-                rt = mesh.elements_list[e.right].tag
-                etag = str(getattr(e, "tag", ""))
-                if not (("cut" in (lt, rt)) or etag.startswith("ghost")):
-                    continue
+                def choose_pos_neg_ids():
+                    # Choose (+)/(–) by phi at centroids: pos = higher φ, neg = lower φ
+                    phiL = float(level_set(np.asarray(mesh.elements_list[e.left ].centroid())))
+                    phiR = float(level_set(np.asarray(mesh.elements_list[e.right].centroid())))
+                    pos_eid, neg_eid = (e.left, e.right) if phiL >= phiR else (e.right, e.left)
 
-                # Choose (+)/(–) by phi at centroids: pos = higher φ, neg = lower φ
-                phiL = float(level_set(np.asarray(mesh.elements_list[e.left ].centroid())))
-                phiR = float(level_set(np.asarray(mesh.elements_list[e.right].centroid())))
-                pos_eid, neg_eid = (e.left, e.right) if phiL >= phiR else (e.right, e.left)
+                    return pos_eid, neg_eid
+
+                pos_eid, neg_eid = choose_pos_neg_ids()
+                def get_normal_vec(e):
+                    p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+                    tangent = p1 - p0
+                    magnitude = max([np.linalg.norm(tangent) , 1e-16])
+                    unit_tangent = tangent / magnitude
+                    unit_normal = np.array([unit_tangent[1], - unit_tangent[0]], float)
+                    cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
+                    cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
+                    if np.dot(unit_normal, cpos - cneg) < 0.0:
+                        unit_normal = -unit_normal
+                    return unit_normal
 
                 # Edge quadrature (physical) and oriented normal (– → +)
                 p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
                 qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
 
-                normal_vec = e.normal.copy()
-                cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
-                cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
-                if np.dot(normal_vec, cpos - cneg) < 0.0:
-                    normal_vec = -normal_vec
+                normal_vec = get_normal_vec(e)
+                
 
                 # Local union DOFs / accumulator
                  # Always compute union layout & maps; accumulator depends on functional vs mat/vec
@@ -1933,13 +2149,7 @@ class FormCompiler:
                         "pos_eid": pos_eid,
                         "neg_eid": neg_eid
                     })
-                    if not is_functional:
-                        self.ctx.update({
-                            "global_dofs": global_dofs,
-                            "pos_map": pos_map, "neg_map": neg_map,
-                            "pos_map_by_field": pos_map_by_field,
-                            "neg_map_by_field": neg_map_by_field,
-                        })
+
 
                     # Evaluate integrand and accumulate
                     val = self._visit(intg.integrand)
@@ -2279,7 +2489,7 @@ class FormCompiler:
         edge_ids = (defined.to_indices() if defined is not None
                     else np.fromiter((e.right is None for e in mesh.edges_list), bool).nonzero()[0])
 
-        fields = _all_fields(intg.integrand)
+        fields = self._fields_for(intg.integrand)
 
         if edge_ids.size == 0: raise ValueError(
             f"Integral {intg} has no defined edges. "
@@ -2477,28 +2687,31 @@ class FormCompiler:
     
     def _integrate_on_cut_element(self, eid: int, integral, level_set, q_order: int, side: str):
         """
-        Integrate over the physical part of element `eid` by clipping each geometric
-        corner-triangle against phi=0, then sub-triangulating and integrating each piece.
-        Returns the local element vector/matrix (shape matches self.ctx['rhs']).
+        Integrate over the physical portion of element `eid` on the requested side of φ:
+        • geometry is split into corner triangles (quad→2 tris, tri→1)
+        • each triangle is clipped by φ=0 to keep {φ >= 0} or {φ <= 0} by `side`
+        • each clipped polygon is fan-triangulated and integrated in physical space
+        Returns the local element block (vector or matrix) in the mixed-element local layout.
         """
+        from pycutfem.ufl.helpers_geom import volume as _vol_rule
+        from pycutfem.ufl.helpers_geom import phi_eval, corner_tris, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys  #  :contentReference[oaicite:1]{index=1}
+
         mesh   = self.me.mesh
-        fields = _all_fields(integral.integrand)
+        fields = self._fields_for(integral.integrand)
         rhs    = self.ctx.get('rhs', False)
 
-        # local accumulator
-        loc = (np.zeros(self.me.n_dofs_local) if rhs
-            else np.zeros((self.me.n_dofs_local, self.me.n_dofs_local)))
+        # local accumulator (mixed-element local layout)
+        loc = np.zeros((self.me.n_dofs_local,), dtype=float) if rhs else np.zeros((self.me.n_dofs_local, self.me.n_dofs_local), dtype=float)
 
-        # 1) split geometry into corner triangles (tri stays as-is; quad → two tris)
+        # reference triangle rule (we will map to physical sub-triangles; weights include area)
+        qp_ref, qw_ref = _vol_rule("tri", q_order)
+
+        # process each geometric triangle of the parent element
         elem = mesh.elements_list[eid]
-        tri_local, corner_ids = corner_tris(mesh, elem)
+        tri_local, corner_ids = corner_tris(mesh, elem)  # returns [(local corner triplets), corner_node_ids]
 
-        # 2) reference rule on the unit triangle
-        qp_ref, qw_ref = volume("tri", q_order)
-
-        # 3) process each geometric triangle
         for loc_tri in tri_local:
-            v_ids   = [corner_ids[i] for i in loc_tri]
+            v_ids    = [corner_ids[i] for i in loc_tri]
             v_coords = mesh.nodes_x_y_pos[v_ids]  # (3,2)
             v_phi    = np.array([phi_eval(level_set, xy) for xy in v_coords], dtype=float)
 
@@ -2506,98 +2719,163 @@ class FormCompiler:
             polygons = clip_triangle_to_side(v_coords, v_phi, side=side)
             for poly in polygons:
                 for A, B, C in fan_triangulate(poly):
-                    qp_phys, qw_phys = map_ref_tri_to_phys(A, B, C, qp_ref, qw_ref)
+                    qp_phys, qw_phys = map_ref_tri_to_phys(A, B, C, qp_ref, qw_ref)  # weights already × area
 
-                    # 4) quadrature loop in *physical* space (weights are physical)
+                    # integrate in physical space; no extra detJ scaling
                     for x_phys, w in zip(qp_phys, qw_phys):
-                        # reference point of the *parent element* that owns x_phys
+                        # inverse map to reference of the *parent* element
                         xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
                         J       = transform.jacobian(mesh, eid, (xi, eta))
-                        Ji     = np.linalg.inv(J)
+                        Ji      = np.linalg.inv(J)
 
-                        # cache bases at this point (zero-padded across mixed fields)
-                        self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
+                        # basis/grad caches for each field at this (xi,eta)
+                        self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
                         for f in fields:
                             self._basis_cache[f] = {
                                 "val" : self.me.basis(f, xi, eta),
                                 "grad": self.me.grad_basis(f, xi, eta) @ Ji
                             }
 
-                        # context for UFL visitors
+                        # UFL visitor context
                         self.ctx["eid"]     = eid
                         self.ctx["x_phys"]  = x_phys
-                        self.ctx["phi_val"] = phi_eval(level_set, x_phys)
+                        self.ctx["phi_val"] = phi_eval(level_set, x_phys)  # may be used by Pos/Neg/Jumps
 
                         integrand_val = self._visit(integral.integrand)
-                        # IMPORTANT: 'w' already includes the area Jacobian of the sub-triangle.
-                        loc += w * integrand_val
+                        loc += w * integrand_val    # w already contains area; do NOT multiply by detJ again
 
         return loc
 
+
     def _assemble_volume_cut_python(self, integral, matvec):
         """
-        Assemble a volume integral restricted by the 'side' of a level set:
-            dx(level_set=phi, metadata={'side': '+/-'})
-        - full elements on the selected side: standard reference rule
-        - cut elements: clipped sub-triangle physical quadrature
+        Assemble a volume integral restricted by a level set:
+            dx(level_set=phi, metadata={'side': '+/-', 'defined_on': <elem sel>})
+
+        • Full cells on the requested side: reference quadrature × |detJ|
+        • Cut cells: physical-space sub-triangle quadrature (weights already include area)
         """
+        import numpy as np
+        from pycutfem.fem import transform
+        from pycutfem.ufl.helpers import normalize_elem_ids
+        from pycutfem.integration.quadrature import volume as _vol_rule
+        from pycutfem.ufl.helpers_geom import (
+            phi_eval, corner_tris, clip_triangle_to_side,
+            fan_triangulate, map_ref_tri_to_phys,
+        )
+
         mesh      = self.me.mesh
         level_set = integral.measure.level_set
         if level_set is None:
             raise ValueError("Cut-cell volume assembly requires measure.level_set")
 
-        side    = integral.measure.metadata.get('side', '+')  # '+' → phi>0, '-' → phi<0
-        q_order = self._find_q_order(integral)
-        rhs     = self.ctx.get("rhs", False)
-        fields  = _all_fields(integral.integrand)
+        side     = integral.measure.metadata.get('side', '+')  # '+' → φ≥0, '-' → φ≤0
+        rhs      = self.ctx.get("rhs", False)
+        fields   = self._fields_for(integral.integrand)             # used for basis caches
         self.ctx["is_interface"] = False
 
-        # --- 1) classify (fills tags & caches)
+        # --- element restriction via 'defined_on' (BitSet / mask / ids / tag / int)
+        allowed = normalize_elem_ids(mesh, getattr(integral.measure, "defined_on", None))
+        allowed = set(allowed) if allowed is not None else None
+
+        # --- classify against φ, then restrict by 'allowed'
         inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
+        if allowed is not None:
+            inside_ids  = [e for e in inside_ids  if e in allowed]
+            outside_ids = [e for e in outside_ids if e in allowed]
+            cut_ids     = [e for e in cut_ids     if e in allowed]
 
-        # Reference rule & scatter util
-        qp_ref, qw_ref = volume(mesh.element_type, q_order)
+        # --- geometry-aware quadrature for curved mapping
+        q_base  = int(self._find_q_order(integral))
+        p_geo   = int(getattr(mesh, "poly_order", 1))
+        q_infl  = 2 * max(0, p_geo - 1)
+        q_order = q_base + q_infl
 
-        def _scatter(eid, loc):
-            gdofs = self.dh.get_elemental_dofs(eid)
-            if rhs:
-                np.add.at(matvec, gdofs, loc)
-            else:
-                r, c = np.meshgrid(gdofs, gdofs, indexing="ij")
-                matvec[r, c] += loc
+        # reference rule on parent element
+        qp_ref, qw_ref = _vol_rule(mesh.element_type, q_order)
 
-        # --- 2) full elements on the selected side → standard reference rule
+        # local block shape == full mixed-element local size (matches visitor output)
+        loc_shape = (self.me.n_dofs_local,) if rhs else (self.me.n_dofs_local, self.me.n_dofs_local)
+
+        # --- 1) full elements on requested side
         full_eids = outside_ids if side == '+' else inside_ids
+
         for eid in full_eids:
-            loc = (np.zeros(self.me.n_dofs_local) if rhs
-                else np.zeros((self.me.n_dofs_local, self.me.n_dofs_local)))
+            loc = np.zeros(loc_shape, dtype=float)
 
             for (xi, eta), w in zip(qp_ref, qw_ref):
-                J    = transform.jacobian(mesh, eid, (xi, eta))
-                detJ = abs(np.linalg.det(J))
-                Ji  = np.linalg.inv(J)
+                J     = transform.jacobian(mesh, eid, (xi, eta))
+                detJ  = abs(np.linalg.det(J))
+                Ji    = np.linalg.inv(J)
 
-                self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
+                # basis/grad caches for *exactly* the fields used by the integrand
+                self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
                 for f in fields:
                     self._basis_cache[f] = {
                         "val" : self.me.basis(f, xi, eta),
                         "grad": self.me.grad_basis(f, xi, eta) @ Ji
                     }
+
                 self.ctx["eid"]    = eid
                 self.ctx["x_phys"] = transform.x_mapping(mesh, eid, (xi, eta))
-                integrand_val      = self._visit(integral.integrand)
-                loc += w * detJ * integrand_val
+                # NEW: let Pos/Neg gating work correctly on full cells
+                self.ctx["phi_val"] = 1.0 if side == '+' else -1.0
+                integrand_val = self._visit(integral.integrand)
+                loc += (w * detJ) * integrand_val
 
-            _scatter(eid, loc)
+            # scatter against ALL element DOFs to match loc's full size
+            self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
 
-        # --- 3) cut elements → clipped sub-triangles
+        # --- 2) cut elements: integrate physical sub-triangles (weights include area)
         for eid in cut_ids:
-            loc = self._integrate_on_cut_element(eid, integral, level_set, q_order, side=side)
-            _scatter(eid, loc)
+            # local accumulator in phys space, visitor returns full-size block
+            loc = np.zeros(loc_shape, dtype=float)
+
+            # reference triangle rule
+            qp_tri, qw_tri = _vol_rule("tri", q_order)
+
+            # split parent into corner triangles
+            elem = mesh.elements_list[eid]
+            tri_local, corner_ids = corner_tris(mesh, elem)
+
+            for loc_tri in tri_local:
+                v_ids    = [corner_ids[i] for i in loc_tri]
+                v_coords = mesh.nodes_x_y_pos[v_ids]  # (3,2)
+                v_phi    = np.array([phi_eval(level_set, xy) for xy in v_coords], float)
+
+                # clip to requested side and fan-triangulate polygons
+                polygons = clip_triangle_to_side(v_coords, v_phi, side=side)
+                for poly in polygons:
+                    for A, B, C in fan_triangulate(poly):
+                        qp_phys, qw_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)
+
+                        for x_phys, w in zip(qp_phys, qw_phys):
+                            xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
+                            J       = transform.jacobian(mesh, eid, (xi, eta))
+                            Ji      = np.linalg.inv(J)
+
+                            self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
+                            for f in fields:
+                                self._basis_cache[f] = {
+                                    "val" : self.me.basis(f, xi, eta),
+                                    "grad": self.me.grad_basis(f, xi, eta) @ Ji
+                                }
+
+                            self.ctx["eid"]     = eid
+                            self.ctx["x_phys"]  = x_phys
+                            self.ctx["phi_val"] = phi_eval(level_set, x_phys)
+
+                            integrand_val = self._visit(integral.integrand)
+                            # w already contains area of the physical sub-triangle
+                            loc += w * integrand_val
+
+            self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
 
         # cleanup
         for key in ("eid", "x_phys", "phi_val"):
             self.ctx.pop(key, None)
+
+
 
     
     def _assemble_volume_cut_jit(self, intg, matvec):

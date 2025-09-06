@@ -38,7 +38,8 @@ def jacobian(mesh, elem_id, xi_eta):
     poly_order = mesh.poly_order
     ref   = get_reference(mesh.element_type, poly_order)
     _, dN = _shape_and_grad(ref, xi_eta)
-    return dN.T @ nodes_x_y_pos
+    # Standard FEM Jacobian: J = X^T dN  = [[x_ξ, x_η],[y_ξ, y_η]]
+    return nodes_x_y_pos.T @ dN
 
 def det_jacobian(mesh, elem_id, xi_eta):
     return np.linalg.det(jacobian(mesh, elem_id, xi_eta))
@@ -46,7 +47,18 @@ def det_jacobian(mesh, elem_id, xi_eta):
 def map_grad_scalar(mesh, elem_id, grad_ref, xi_eta):
     J = jacobian(mesh, elem_id, xi_eta)
     invJ = np.linalg.inv(J)
-    return invJ.T @ grad_ref
+    g = np.asarray(grad_ref)
+    # Convention:
+    #   • 1D (2,)   -> row gradient [∂ξ φ, ∂η φ]  →  g @ J^{-1}
+    #   • 2D (...,2)-> row stack                  →  g @ J^{-1}
+    #   • 2D (2,...) -> column stack              →  (J^{-T}) @ g
+    if g.ndim == 1 and g.size == 2:
+        return g @ invJ
+    if g.ndim == 2 and g.shape[-1] == 2:
+        return g @ invJ
+    if g.ndim == 2 and g.shape[0] == 2:
+        return invJ.T @ g
+    raise ValueError("map_grad_scalar expects (2,), (n,2) or (2,n) array")
 
 def inv_jac_T(mesh, elem_id, xi_eta):
     J = jacobian(mesh, elem_id, xi_eta)
@@ -158,8 +170,8 @@ if _HAVE_NUMBA:
             a00 = a01 = a10 = a11 = 0.0
             for i in range(4):
                 gx = dN[i, 0]; gy = dN[i, 1]
-                a00 += gx * coords[i, 0]; a01 += gx * coords[i, 1]
-                a10 += gy * coords[i, 0]; a11 += gy * coords[i, 1]
+                a00 += gx * coords[i, 0]; a01 += gy * coords[i, 0]
+                a10 += gx * coords[i, 1]; a11 += gy * coords[i, 1]
             det = a00 * a11 - a01 * a10
             if abs(det) < det_eps:
                 ok = False
@@ -193,8 +205,8 @@ if _HAVE_NUMBA:
             a00 = a01 = a10 = a11 = 0.0
             for i in range(9):
                 gx = dN[i, 0]; gy = dN[i, 1]
-                a00 += gx * coords[i, 0]; a01 += gx * coords[i, 1]
-                a10 += gy * coords[i, 0]; a11 += gy * coords[i, 1]
+                a00 += gx * coords[i, 0]; a01 += gy * coords[i, 0]
+                a10 += gx * coords[i, 1]; a11 += gy * coords[i, 1]
             det = a00 * a11 - a01 * a10
             if abs(det) < det_eps:
                 ok = False

@@ -41,6 +41,7 @@ class AffineLevelSet(LevelSetFunction):
     # ---- value ------------------------------------------------------
     def __call__(self, x: np.ndarray) -> np.ndarray:
         # Works with shape (2,) or (..., 2)
+        x = np.asarray(x, dtype=float)
         return self.a * x[..., 0] + self.b * x[..., 1] + self.c
 
     # ---- gradient ---------------------------------------------------

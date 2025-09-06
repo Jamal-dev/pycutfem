@@ -691,7 +691,7 @@ if __name__ == '__main__':
     # Keep track of successes and failures
     failed_tests = []
     success_count = 0
-    backend_type = "jit"
+    backend_type = "python"
     for name, forms in terms.items():
         J_pc, R_pc, J_fx, R_fx = None, None, None, None
 

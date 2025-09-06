@@ -1,5 +1,6 @@
 from pycutfem.ufl.expressions import Expression, Integral, Sum, Sub, Prod, Constant
 from typing import Callable, List, Dict
+import numbers
 
 class Form(Expression):
     """Represents the sum of several integrals that make up one side of a weak form."""
@@ -43,10 +44,38 @@ class Form(Expression):
         return Equation(other, self)
 
 class Equation:
+    def _valid_form(self, a):
+        # Accept: None, Form, Integral. Treat numeric zero as "empty".
+        if a is None:
+            return None
+        if isinstance(a, Form):
+            return a
+        if isinstance(a, Integral):
+            return Form([a])
+        # Constant is an Expression *and* a numbers.Number; handle it before numbers.Real
+        if isinstance(a, Constant):
+            if float(a) == 0.0:
+                return None
+            raise TypeError(
+                "Bare Constant on an Equation side is ambiguous. "
+                "Multiply by a Measure to make an Integral (e.g. Constant(c)*dx) "
+                "or wrap it into your form appropriately."
+            )
+        # Plain numerics: only allow exact zero to mean 'no form'
+        if isinstance(a, numbers.Real):
+            if float(a) == 0.0:
+                return None
+            raise TypeError(
+                "Numeric nonzero on an Equation side is not a Form. "
+                "Wrap it with Constant(...) and a Measure (e.g. Constant(c)*dx)."
+            )
+        raise TypeError(
+            f"Equation sides must be Form, Integral, Constant/0.0, or None, not {type(a)}"
+        )
     def __init__(self, a:Form, L:Form):
         # Allow a side to be None, otherwise ensure it's a Form object.
-        self.a = a if isinstance(a, Form) or a is None else Form([a])
-        self.L = L if isinstance(L, Form) or L is None else Form([L])
+        self.a = self._valid_form(a)
+        self.L = self._valid_form(L)
 
 class BoundaryCondition:
     def __init__(self, field: str, method: str, domain_tag: str, value: Callable):

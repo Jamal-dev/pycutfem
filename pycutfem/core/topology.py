@@ -90,20 +90,22 @@ class Edge:
     lid: Optional[int] = None      # Local edge index within the left element
     all_nodes: Tuple[int, ...] = ()
     tangent: np.ndarray = field(init=False, default=None)  # Tangent vector of the edge
-    def calc_tangent_unit_vector(self):
-        """Calculate the unit tangent vector of the edge."""
-        dx = self.nodes[1] - self.nodes[0]
-        dy = self.nodes[1] - self.nodes[0]
-        length = np.sqrt(dx**2 + dy**2)
-        if length == 0:
-            raise ValueError("Cannot calculate tangent vector for zero-length edge.")
-        self.normal = np.array([dx / length, dy / length]) 
-        return self.normal
-    def calc_normal_unit_vector(self):
-        """Calculate the unit normal vector of the edge."""
-        tangent = self.calc_tangent_unit_vector()
-        self.tangent = tangent
+    def calc_tangent_unit_vector(self, nodes_xy):
+        import numpy as np
+        i0, i1 = int(self.nodes[0]), int(self.nodes[1])
+        x0,y0 = nodes_xy[i0]; x1,y1 = nodes_xy[i1]
+        v = np.array([x1 - x0, y1 - y0], float)
+        L = float(np.linalg.norm(v))
+        if L <= 0: raise ValueError("Zero-length edge.")
+        self.tangent = v / L
         return self.tangent
+
+    def calc_normal_unit_vector(self, nodes_xy):
+        t = self.calc_tangent_unit_vector(nodes_xy)
+        self.normal = np.array([t[1], -t[0]], float)
+        return self.normal
+
+    
 
 
 @dataclass(slots=True)

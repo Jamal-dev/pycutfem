@@ -196,7 +196,7 @@ class Mesh:
         """Classifies elements against multiple level sets."""
         return {idx: self.classify_elements(ls, tol) for idx, ls in enumerate(level_sets)}
     
-    def classify_edges(self, level_set):
+    def classify_edges(self, level_set, tol=1e-12):
         """
         Classify edges as 'interface' or 'ghost' based on element tags.
         """
@@ -211,6 +211,8 @@ class Mesh:
 
             # Interior edge -> safe to reset and classify
             edge.tag = ''
+            n0, n1 = edge.nodes
+            p0, p1 = phi_nodes[n0], phi_nodes[n1]
             
 
             # --- Classification for INTERIOR edges based on element tags ---
@@ -220,7 +222,11 @@ class Mesh:
                 tags = {left_tag, right_tag}
 
                 # Prioritize 'interface' if crossed (level set lies on edge)
-                if phi_nodes[edge.nodes[0]] * phi_nodes[edge.nodes[1]] < 0:
+                if p0 * p1 < 0:
+                    # (i) strict crossing
+                    edge.tag = 'interface'
+                elif abs(p0) <= tol and abs(p1) <= tol:
+                    # (ii) whole edge on interface
                     edge.tag = 'interface'
                 elif 'cut' in tags:
                     # This logic might be flawed if both elements are 'cut'.
@@ -372,11 +378,21 @@ class Mesh:
             mask = np.fromiter((el.tag == tag for el in self.elements_list), bool)
             return BitSet(mask)
         raise ValueError(f"Unsupported entity type '{entity}'.")
+    
     # --- Public API ---
     def element_char_length(self, elem_id):
         if elem_id is None:
             return 0.0
         return np.sqrt(self.areas_list[elem_id])
+    def face_char_length(self, left_eid: int | None, right_eid: int | None) -> float:
+        hs = []
+        for eid in (left_eid, right_eid):
+            if eid is None: continue
+            a = float(self.areas_list[int(eid)])
+            if a > 0.0: hs.append(np.sqrt(a))
+        if hs: return float(min(hs))
+        pos = self.areas_list[self.areas_list > 0.0]
+        return float(np.sqrt(pos.min())) if pos.size else 1.0
     def neighbors(self) -> List[int]:
         return self._neighbors
 

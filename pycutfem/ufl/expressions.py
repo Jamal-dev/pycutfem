@@ -404,20 +404,10 @@ class VectorFunction(Expression):
         self.parent_name = ""
         # --- Side metadata for vector-valued functions ---
         self.side = side
-        if side in ("+","-"):
+        if side in ("+","-",""):
             s = "pos" if side == "+" else "neg"
             self.field_sides = [s] * len(self.field_names)
-        else:
-            # Infer from component names if present
-            inferred = []
-            for fn in self.field_names:
-                if "_pos_" in fn or fn.endswith("_pos") or fn.startswith("pos_"):
-                    inferred.append("pos")
-                elif "_neg_" in fn or fn.endswith("_neg") or fn.startswith("neg_"):
-                    inferred.append("neg")
-                else:
-                    inferred.append(None)
-            self.field_sides = inferred if any(x is not None for x in inferred) else None
+        
         
         # This function holds the data for multiple fields.
         g_dofs_list = [dof_handler.get_field_slice(f) for f in field_names]
@@ -427,7 +417,7 @@ class VectorFunction(Expression):
         self._dof_handler = dof_handler
         
         self.components = [Function(f"{name}_{f}", f, dof_handler,
-                                    parent_vector=self, component_index=i)
+                                    parent_vector=self, component_index=i, side=self.field_sides[i])
                            for i, f in enumerate(field_names)]
         
 
@@ -868,7 +858,7 @@ class TestFunction(Function):
             s = "pos" if self.side == "+" else "neg"
             self.field_sides = [s] 
         else:
-            self.field_sides = None
+            self.field_sides = ""
  
 
 class Constant(Expression, numbers.Number):
@@ -940,7 +930,7 @@ class VectorTrialFunction(Expression):
             s = "pos" if self.side == "+" else "neg"
             self.field_sides = [s] * len(self.field_names)
         else:
-            self.field_sides = None
+            self.field_sides = [""] * len(self.field_names)
     def __repr__(self):
         return f"VectorTrialFunction(space='{self.space.name}')"
     def __getitem__(self, i): return self.components[i]
@@ -969,7 +959,7 @@ class VectorTestFunction(Expression):
             s = "pos" if self.side == "+" else "neg"
             self.field_sides = [s] * len(self.field_names)
         else:
-            self.field_sides = None 
+            self.field_sides = [""] * len(self.field_names)
     def __repr__(self):
         return f"VectorTestFunction(space='{self.space.name}')"
     def __getitem__(self, i): return self.components[i]

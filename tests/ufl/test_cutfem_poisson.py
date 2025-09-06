@@ -137,8 +137,8 @@ def test_cutfem_poisson_interface(backend):
     dGhost_neg = dGhost(defined_on=ghost_neg, level_set=level_set, metadata={'q': poly_order+2, "derivs": {(0,1),(1,0)}})
 
     # --- trial/test ---
-    u_pos, v_pos = TrialFunction('u_outside', dof_handler, name='u_pos_trial'), TestFunction('u_outside', dof_handler, name='u_pos_test')
-    u_neg, v_neg = TrialFunction('u_inside',  dof_handler, name='u_neg_trial'), TestFunction('u_inside',  dof_handler, name='u_neg_test')
+    u_pos, v_pos = TrialFunction('u_outside', dof_handler, name='u_pos_trial', side='+'), TestFunction('u_outside', dof_handler, name='u_pos_test', side='+')
+    u_neg, v_neg = TrialFunction('u_inside',  dof_handler, name='u_neg_trial', side='-'), TestFunction('u_inside',  dof_handler, name='u_neg_test', side='-')
 
     one = Constant(1.0)
     Apos = assemble_form(Equation(None, one * v_pos * dx_pos), dof_handler=dof_handler)[1].sum()
@@ -148,8 +148,8 @@ def test_cutfem_poisson_interface(backend):
     print(f"A-: {Aneg}, expected: {A_neg_expected:.4f}, difference: {abs(Apos - A_pos_expected):.4f}")
 
     # --- coefficients / constants (as you had) ---
-    alpha_pos = Constant(1.0)  # α₊
-    alpha_neg = Constant(20.0)  # α₋
+    alpha_pos = Constant(20.0)  # α₊
+    alpha_neg = Constant(1.0)  # α₋
 
     h    = CellDiameter()
     stab = Constant(20.0 * (20.0 + 1.0)) / h  
@@ -201,10 +201,10 @@ def test_cutfem_poisson_interface(backend):
         BoundaryCondition('u_outside', 'dirichlet', 'right', lambda x, y: 0.0),
         BoundaryCondition('u_outside', 'dirichlet', 'bottom', lambda x, y: 0.0),
         BoundaryCondition('u_outside', 'dirichlet', 'top', lambda x, y: 0.0),
-        BoundaryCondition('u_inside', 'dirichlet', 'left', lambda x, y: 0.0),
-        BoundaryCondition('u_inside', 'dirichlet', 'right', lambda x, y: 0.0),
-        BoundaryCondition('u_inside', 'dirichlet', 'bottom', lambda x, y: 0.0),
-        BoundaryCondition('u_inside', 'dirichlet', 'top', lambda x, y: 0.0),    
+        # BoundaryCondition('u_inside', 'dirichlet', 'left', lambda x, y: 0.0),
+        # BoundaryCondition('u_inside', 'dirichlet', 'right', lambda x, y: 0.0),
+        # BoundaryCondition('u_inside', 'dirichlet', 'bottom', lambda x, y: 0.0),
+        # BoundaryCondition('u_inside', 'dirichlet', 'top', lambda x, y: 0.0),    
     ]
     
     # 8. Assemble and Solve

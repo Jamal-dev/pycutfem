@@ -769,6 +769,9 @@ class GradOpInfo(BaseOpInfo):
                 meta = _resolve_meta(self.meta(), other.meta())
                 return GradOpInfo(data, role=self.role, **self.update_meta(meta))
             else: raise NotImplementedError(self._error_msg(other, "dot between gradients"))
+        elif self.role in {"trial", "test"} and other.role in {"trial", "test"}:
+            # Special Case:  Grad(Trial) · Grad(Trial) or Grad(Test) · Grad(Test) or mixed; outer product
+            return self.inner(other)  # returns (n,n) matrix
         else:
             raise NotImplementedError(f"GradOpInfo.dot not implemented for roles {self.role} and {other.role}."
                                       f" Shapes: {self.data.shape} and {other.data.shape}.")
@@ -856,7 +859,7 @@ class GradOpInfo(BaseOpInfo):
             # return VecOpInfo(result_data, role=role)
             if self.role == "function" and other_vec.role == "trial": # introducing a new branch
                 # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u
-                grad_val = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+                grad_val = _collapsed_grad(self)  # shape (k, d) · (k,n)  —   ∇u_k(ξ)
                 if grad_val.shape[-1] == other_vec.shape[0]:
                     data = grad_val @ other_vec.data
                     meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='b')
@@ -898,10 +901,11 @@ class GradOpInfo(BaseOpInfo):
                 role = "scalar" if data.ndim == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
             if self.data.shape[-1] != other_vec.shape[0]:
-                raise ValueError(f"Cannot dot GradOpInfo {self.shape} with vector of shape {other_vec.shape}.")
-            result_data = np.einsum("knd,d->kn", self.data, other_vec, optimize=True)
-            meta = _resolve_meta(self.meta(), {}, prefer='a')
-            return VecOpInfo(result_data, role=self.role, **self.update_meta(meta))
+                raise ValueError(f"Cannot dot(∇w, n) GradOpInfo {self.shape} with vector of shape {other_vec.shape}.")
+            if self.role in {"trial", "test"}:
+                result_data = np.einsum("knd,d->kn", self.data, other_vec, optimize=True)
+                meta = _resolve_meta(self.meta(), {}, prefer='a')
+                return VecOpInfo(result_data, role=self.role, **self.update_meta(meta))
         raise NotImplementedError(f"dot_vec of GradOpInfo not implemented for role {self.role}, GradOpInfo  and type {type(other_vec)} with role: {other_vec.role}.")
 
     # ========================================================================
@@ -1897,3 +1901,102 @@ class HelpersAlignCoefficents:
         elif phi_g.ndim == 1 and u_g.ndim == 2:
             assert phi_g.shape[0] == u_g.shape[1], "Basis length vs coeff width mismatch after padding"
         return phi_g, u_g
+
+
+# helpers.py  — selection normalizers used by DofHandler and FormCompiler
+
+
+def normalize_elem_ids(mesh, elem_sel):
+    """
+    Normalize a variety of 'element selection' encodings into a list[int].
+
+    Accepts
+    -------
+    - BitSet (with .to_indices() or .array)
+    - str         : element bitset name on mesh (e.g., 'inside','outside','cut')
+    - 1D bool mask
+    - Iterable[int] (list/tuple/set/ndarray)
+    - int         : single element id
+    - None        : returns None
+
+    Returns
+    -------
+    list[int] | None
+    """
+    if elem_sel is None:
+        return None
+
+    # single id (fast path)
+    if isinstance(elem_sel, (int, np.integer)):
+        return [int(elem_sel)]
+
+    # BitSet
+    if hasattr(elem_sel, "to_indices") and callable(getattr(elem_sel, "to_indices")):
+        return [int(i) for i in elem_sel.to_indices()]
+    if hasattr(elem_sel, "array"):
+        arr = np.asarray(elem_sel.array, dtype=bool)
+        return [int(i) for i in np.nonzero(arr)[0]]
+
+    # named bitset on mesh
+    if isinstance(elem_sel, str):
+        bs = mesh.element_bitset(elem_sel)
+        if hasattr(bs, "to_indices") and callable(getattr(bs, "to_indices")):
+            return [int(i) for i in bs.to_indices()]
+        arr = np.asarray(getattr(bs, "array", []), dtype=bool)
+        return [int(i) for i in np.nonzero(arr)[0]]
+
+    # iterable ids or boolean mask
+    try:
+        seq = elem_sel if isinstance(elem_sel, np.ndarray) else list(elem_sel)
+    except TypeError:
+        arr = np.asarray(elem_sel)
+    else:
+        arr = np.asarray(seq)
+
+    if arr.dtype == bool:
+        return [int(i) for i in np.nonzero(arr)[0]]
+    if arr.ndim == 1:
+        return [int(i) for i in arr.tolist()]
+
+    raise ValueError("Unsupported element selection type.")
+
+def normalize_edge_ids(mesh, edge_sel):
+    """
+    Normalize 'edge selection' into a list[int].
+
+    Accepts BitSet (to_indices/array), str tag (mesh.edge_bitset),
+    1D bool mask, iterable[int], int, or None.
+    """
+    if edge_sel is None:
+        return None
+    import numpy as np
+
+    if isinstance(edge_sel, (int, np.integer)):
+        return [int(edge_sel)]
+
+    if hasattr(edge_sel, "to_indices") and callable(getattr(edge_sel, "to_indices")):
+        return [int(i) for i in edge_sel.to_indices()]
+    if hasattr(edge_sel, "array"):
+        arr = np.asarray(edge_sel.array, dtype=bool)
+        return [int(i) for i in np.nonzero(arr)[0]]
+
+    if isinstance(edge_sel, str):
+        bs = mesh.edge_bitset(edge_sel)
+        if hasattr(bs, "to_indices") and callable(getattr(bs, "to_indices")):
+            return [int(i) for i in bs.to_indices()]
+        arr = np.asarray(getattr(bs, "array", []), dtype=bool)
+        return [int(i) for i in np.nonzero(arr)[0]]
+
+    try:
+        seq = edge_sel if isinstance(edge_sel, np.ndarray) else list(edge_sel)
+    except TypeError:
+        arr = np.asarray(edge_sel)
+    else:
+        arr = np.asarray(seq)
+
+    if arr.dtype == bool:
+        return [int(i) for i in np.nonzero(arr)[0]]
+    if arr.ndim == 1:
+        return [int(i) for i in arr.tolist()]
+
+    raise ValueError("Unsupported edge selection type.")

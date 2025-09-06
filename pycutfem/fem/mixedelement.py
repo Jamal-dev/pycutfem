@@ -33,6 +33,17 @@ def _edge_nodes(p: int, element_type: str) -> int:
     # quads and triangles both have p+1 equally‑spaced nodes on an edge
     return p + 1
 
+class _NumberRef:
+    def shape(self, xi, eta):
+        # one basis value, identically 1
+        return np.array([1.0], dtype=float)
+    def grad(self, xi, eta):
+        # gradient is zero in physical and reference coords
+        return np.array([[0.0, 0.0]], dtype=float)
+    
+    def derivative(self, xi, eta, ox, oy):
+        return np.array([0.0], dtype=float)
+
 
 class MixedElement:
     """Mixed finite element on a single mesh with *per‑field* polynomial orders.
@@ -56,28 +67,34 @@ class MixedElement:
             field_specs = dict(field_specs)
         if not isinstance(mesh, Mesh):
             raise TypeError("'mesh' must be a pycutfem Mesh instance.")
+        self.q_orders: Dict[str, int] = {name:q for name,q in field_specs.items() if q != ':number:'}
         self.field_names: Tuple[str, ...] = tuple(field_specs.keys())
         if not self.field_names:
             raise ValueError("'field_names' cannot be empty.")
 
         self.mesh: Mesh = mesh
-        self._field_orders: Dict[str, int] = {
-            name: (field_specs[name] if field_specs and name in field_specs else mesh.poly_order)
-            for name in self.field_names
-        }
+        # detect number fields
+        self._number_fields = {name for name, p in field_specs.items()
+                       if p == ':number:'}   # sentinel
+        # keep _field_orders numeric so nothing downstream sees a string
+        self._field_orders = {name: (0 if name in self._number_fields else int(p))
+                            for name, p in field_specs.items()}
+
 
         # Build per‑field reference elements and basis counts -----------------
-        self._ref: Dict[str, object] = {}
-        self._n_basis: Dict[str, int] = {}
-        self._n_basis: Dict[str,int] = {f: (p+1)**2 if mesh.element_type=='quad'
-                                          else (p+1)*(p+2)//2
-                                        for f,p in self._field_orders.items()}
-        # print(f"number of basis functions per field: {self._n_basis}")
+        self._ref = {}
+        self._n_basis = {}
         for name in self.field_names:
-            ref = get_reference(mesh.element_type, self._field_orders[name])
-            self._ref[name] = ref
-
-
+            if name in self._number_fields:
+                self._ref[name] = _NumberRef()
+                self._n_basis[name] = 1
+            else:
+                ref = get_reference(mesh.element_type, self._field_orders[name])
+                self._ref[name] = ref
+                # or the formula you already use for quads/tris:
+                self._n_basis[name] = ((self._field_orders[name] + 1)**2
+                                    if mesh.element_type == 'quad'
+                                    else (self._field_orders[name] + 1)*(self._field_orders[name] + 2)//2)
         # Build slices into the global local‑DOF vector -----------------------
         self.component_dof_slices: Dict[str, slice] = {}
         start = 0

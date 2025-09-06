@@ -37,7 +37,7 @@ def tri_rule(order: int,dunavant_deg: int = None):
     """Degree‑exact rule built from square → reference triangle mapping."""
     degree = 2 * order if dunavant_deg is None else dunavant_deg
     if degree in range(1, 21):
-        print(f'points shape: {DUNAVANT[degree].points.shape}, weights shape: {DUNAVANT[degree].weights.shape}')
+        # print(f'points shape: {DUNAVANT[degree].points.shape}, weights shape: {DUNAVANT[degree].weights.shape}')
         return DUNAVANT[degree].points, DUNAVANT[degree].weights
     
     xi, wi = gauss_legendre(order)
@@ -138,3 +138,63 @@ def line_quadrature(p0: np.ndarray, p1: np.ndarray, order: int = 2):
     J    = np.linalg.norm(half)
     wts  = w_ref * J
     return pts, wts
+
+def _project_to_levelset(point, level_set, max_steps=3, tol=1e-12):
+    """Newton-like orthogonal projection of a point onto {phi=0}."""
+    x = np.asarray(point, float)
+    for _ in range(max_steps):
+        phi = level_set(x[0], x[1])
+        g   = level_set.gradient(x)
+        g2  = float(np.dot(g, g)) + 1e-30
+        step = -phi * g / g2
+        x = x + step
+        if abs(phi) < tol:
+            break
+    return x
+
+def curved_line_quadrature(level_set, p0, p1, order=2, nseg=1, project_steps=2, tol=1e-12):
+    """
+    Integrate along a *curved* interface inside an element by splitting the chord
+    p0–p1 into 'nseg' subsegments, Newton-projecting their endpoints to {phi=0},
+    and applying Gauss–Legendre on each projected subsegment.
+
+    Returns (qpts, qwts) in *physical* coordinates, weights already scaled by segment lengths.
+    """
+    p0 = np.asarray(p0, float); p1 = np.asarray(p1, float)
+    # parametric breakpoints along the chord
+    T = np.linspace(0.0, 1.0, int(max(1, nseg)) + 1)
+    # initial endpoints on the chord
+    P = np.outer(1 - T, p0) + np.outer(T, p1)
+
+    # project endpoints to the level set curve
+    P_proj = np.empty_like(P)
+    for i, Pi in enumerate(P):
+        x = Pi
+        for _ in range(int(max(1, project_steps))):
+            phi = level_set(x[0], x[1])
+            if abs(phi) < tol:
+                break
+            g = level_set.gradient(x)
+            g2 = float(np.dot(g, g)) + 1e-30
+            x = x - (phi / g2) * g
+        P_proj[i] = x
+
+    # accumulate quadrature from each subsegment
+    qpts_list = []
+    qwts_list = []
+    for i in range(len(P_proj) - 1):
+        a, b = P_proj[i], P_proj[i+1]
+        # (optional) skip tiny segments
+        if np.linalg.norm(b - a) < 1e-14:
+            continue
+        qp, qw = line_quadrature(a, b, order=order)  # already physical + length scaled
+        qpts_list.append(qp)
+        qwts_list.append(qw)
+
+    if not qpts_list:
+        return np.empty((0, 2), float), np.empty((0,), float)
+
+    qpts = np.vstack(qpts_list)
+    qwts = np.concatenate(qwts_list)
+    return qpts, qwts
+

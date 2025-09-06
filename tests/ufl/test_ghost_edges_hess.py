@@ -87,10 +87,10 @@ def setup_quad2():
 @pytest.mark.parametrize("backend", [ "jit", "python"])
 def test_hessian_penalty_spd(setup_quad2, backend):
     _mesh, ls, ghost, dh, comp = setup_quad2
-    u_pos = TrialFunction(field_name="u",name="u_trial_pos",dof_handler=dh) 
-    v_pos = TestFunction( field_name="u",name="v_test_pos",dof_handler=dh)
-    u_neg = TrialFunction(field_name="u",name="u_trial_neg",dof_handler=dh) 
-    v_neg = TestFunction( field_name="u",name="v_test_neg",dof_handler=dh)
+    u_pos = TrialFunction(field_name="u",name="u_trial_pos",dof_handler=dh, side="+") 
+    v_pos = TestFunction( field_name="u",name="v_test_pos",dof_handler=dh, side="+")
+    u_neg = TrialFunction(field_name="u",name="u_trial_neg",dof_handler=dh, side="-") 
+    v_neg = TestFunction( field_name="u",name="v_test_neg",dof_handler=dh, side="-")
 
     a = hessian_inner(Jump(u_pos,u_neg), Jump(v_pos,v_neg)) * dGhost(defined_on=ghost, 
                                                  level_set=ls, 
@@ -233,10 +233,10 @@ def test_hessian_penalty_quantitative_value(setup_quad2, backend):
 @pytest.mark.parametrize("backend", [ "jit", "python"])
 def test_hdotn_scalar_spd(setup_quad2, backend):
     _mesh, ls, ghost, dh, comp = setup_quad2
-    u_pos = TrialFunction("u", "u_pos", dh)
-    v_pos = TestFunction( "u", "v_pos", dh)
-    u_neg = TrialFunction("u", "u_neg", dh)
-    v_neg = TestFunction( "u", "v_neg", dh)
+    u_pos = TrialFunction("u", "u_pos", dh, side="+")
+    v_pos = TestFunction( "u", "v_pos", dh, side="+")
+    u_neg = TrialFunction("u", "u_neg", dh, side="-")
+    v_neg = TestFunction( "u", "v_neg", dh, side="-")
 
     a = inner(hdotn(Jump(u_pos, u_neg)), hdotn(Jump(v_pos, v_neg))) * dGhost(
         defined_on=ghost, level_set=ls, metadata={"q": 6}
