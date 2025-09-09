@@ -426,7 +426,7 @@ class VecOpInfo(BaseOpInfo):
                     data = u_val[0] * grad.data
                     return GradOpInfo(data, role=grad.role, **self.update_meta(meta))
 
-        elif self.role == {"trial", "test"} and grad.role == "function":
+        elif self.role in {"trial", "test"} and grad.role == "function":
             # Case:  Trial · Grad(Function)      u_trial · ∇u_k
             # (1)  value of u_trial at this quad-point
             grad_val = _collapsed_grad(grad)  # shape (k, d)  —   ∇u_k(ξ)
@@ -665,7 +665,14 @@ class GradOpInfo(BaseOpInfo):
                 grad_vals = _collapsed_grad(self)  # (k, d)
                 return self._with(grad_vals.T, role=self.role, coeffs=None)
             else: # trial and test 
-                return self._with(self.data.transpose(2, 1, 0), role=self.role, coeffs=self.coeffs)
+                G = self.data                        # (k, n, d)
+                k, n, d = G.shape
+                Gswap = np.empty_like(G)
+                # S[i, :, j] = G[j, :, i]
+                for i in range(k):
+                    for j in range(d):
+                        Gswap[i, :, j] = G[j, :, i]
+                return self._with(Gswap, role=self.role, coeffs=self.coeffs)
         if self.data.ndim == 2:        # (k, d) or (n, d)
             return self._with(self.data.T, role=self.role, coeffs=self.coeffs)
         raise ValueError(f"Cannot transpose GradOpInfo with data of shape {self.data.shape}.")

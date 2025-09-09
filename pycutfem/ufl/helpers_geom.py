@@ -58,9 +58,10 @@ def clip_triangle_to_side(v_coords, v_phi, side='+', eps=0.0):
     else:
         iK1, iK2 = keep
         iD       = drop[0]
-        I1 = segment_zero_crossing(V[iK1], V[iD], phi[iK1], phi[iD])
-        I2 = segment_zero_crossing(V[iK2], V[iD], phi[iK2], phi[iD])
-        return [[V[iK1], V[iK2], I2, I1]]
+        I1 = segment_zero_crossing(V[iK1], V[iD], phi[iK1], phi[iD])  # on K1–D
+        I2 = segment_zero_crossing(V[iK2], V[iD], phi[iK2], phi[iD])  # on K2–D
+        # Boundary order: K1 → I1 → I2 → K2
+        return [[V[iK1], I1, I2, V[iK2]]]
 
 # -------------------- JIT versions of the geometric helpers ------------------
 if _HAVE_NUMBA:
@@ -115,9 +116,10 @@ if _HAVE_NUMBA:
             K1=0; K2=2; D=1; phK1=phi0; phK2=phi2; phD=phi1
         else:
             K1=0; K2=1; D=2; phK1=phi0; phK2=phi1; phD=phi2
-        I1 = _seg_inter(V[K1], V[D], phK1, phD)
-        I2 = _seg_inter(V[K2], V[D], phK2, phD)
-        out[0] = V[K1]; out[1] = V[K2]; out[2] = I2; out[3] = I1
+        I1 = _seg_inter(V[K1], V[D], phK1, phD)  # on K1–D
+        I2 = _seg_inter(V[K2], V[D], phK2, phD)  # on K2–D
+        # Boundary order: K1 → I1 → I2 → K2
+        out[0] = V[K1]; out[1] = I1; out[2] = I2; out[3] = V[K2]
         return out, 4
 
     @_nb.njit(cache=True, fastmath=True)

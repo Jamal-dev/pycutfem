@@ -63,6 +63,8 @@ from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_c
 from pycutfem.ufl.helpers_geom import (
     phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
 )
+from contextlib import contextmanager
+
 
 
 
@@ -147,6 +149,17 @@ class FormCompiler:
             Laplacian: self._visit_Laplacian
         }
     
+    @contextmanager
+    def _push_ctx(self, key, value):
+        old = self.ctx.get(key, None)
+        self.ctx[key] = value
+        try:
+            yield
+        finally:
+            if old is None:
+                self.ctx.pop(key, None)
+            else:
+                self.ctx[key] = old
     # --------------------- OpInfo meta helpers ---------------------
     def _op_meta_from_ctx(self, node, field_names):
         """Build consistent metadata for VecOpInfo/GradOpInfo from ctx + node."""
@@ -215,6 +228,36 @@ class FormCompiler:
 
         logger.info("Assembly complete.")
         return K.tocsr(), F
+    
+    def _active_side(self, default: str | None = None) -> str:
+        """
+        Resolve the current side with a strict precedence:
+          1) explicit ctx['side'] set by Pos/Neg/Jump or the assembler,
+          2) ctx['measure_side'] injected by dx/dInterface/dGhost assemblers,
+          3) owner matching (eid == pos_eid/neg_eid) on ghost/interface,
+          4) sign of ctx['phi_val'] (last resort only),
+        and finally fall back to '+' if nothing is known.
+        """
+        s = self.ctx.get("side", None)
+        if s in ("+", "-"):
+            return s
+        ms = self.ctx.get("measure_side", None)
+        if ms in ("+", "-"):
+            return ms
+        eid = self.ctx.get("eid", None)
+        if eid is not None:
+            if eid == self.ctx.get("pos_eid", None):
+                return "+"
+            if eid == self.ctx.get("neg_eid", None):
+                return "-"
+        pv = self.ctx.get("phi_val", None)
+        if pv is not None:
+            try:
+                return "+" if float(pv) >= 0.0 else "-"
+            except Exception:
+                pass
+        return default if default in ("+", "-") else "+"
+
 
     # ===================== VISITORS: LEAF NODES =======================
     # --------------------------------------------------------------
@@ -239,11 +282,9 @@ class FormCompiler:
 
         # ---------- Ghost / Interface: side-aware path ----------
         bv = self.ctx.get("basis_values")
-        if isinstance(bv, dict):
+        if isinstance(bv, dict) and self._on_sided_path():
             # Determine active side
-            side = self.ctx.get("side")
-            if side not in ('+', '-'):
-                side = '+' if float(self.ctx.get("phi_val", 0.0)) >= 0.0 else '-'
+            side = self._active_side()
 
             # Side/field cache
             per_field = bv.setdefault(side, {}).setdefault(field, {})
@@ -381,30 +422,37 @@ class FormCompiler:
 
 
 
+
+
+
     
     #----------------------------------------------------------------------
     def _b(self, fld): 
         return self._basis_row(fld, (0,0))
     def _v(self, fld):
-        # 1) Prefer per-QP, side-aware cache
-        bv = self.ctx.get("basis_values")
-        if bv is not None:
-            side = self.ctx.get("side")
-            if side is None:
-                side = '+' if self.ctx.get("phi_val", 0.0) >= 0 else '-'
-            val = bv[side][fld].get((0, 0))
-            if val is not None:
-                return val
-        # 2) Fallback to global cache
+        # 1) Prefer per-QP, side-aware cache *only* on sided paths:
+        if self._on_sided_path():
+            bv = self.ctx.get("basis_values")
+            if isinstance(bv, dict):
+                side = self.ctx.get("side")
+                if side not in ('+','-'):
+                    # fall back to measure-side if present, never to 'phi >= 0' here
+                    side = self.ctx.get("measure_side", "")
+                if side in ('+','-'):
+                    val = bv[side][fld].get((0, 0))
+                    if val is not None:
+                        return val
+        # 2) Fallback to element-local caches (prefilled in volume paths)
         if fld in self._basis_cache:
             return self._basis_cache[fld]["val"]
-        # 3) Last resort: compute fresh (element-local)
+        # 3) Last resort: compute from eid/x_phys
         return self._basis_from_element_context(fld, kind="val")
 
     def _g(self, fld):
         gx = self._basis_row(fld, (1,0))
         gy = self._basis_row(fld, (0,1))
-        return np.stack([gx, gy], axis=1)  # (nloc, 2)
+        result = np.stack([gx, gy], axis=1)  # (nloc, 2)
+        return result
 
     def _hess(self, fld):
         d20 = self._basis_row(fld, (2,0))
@@ -624,10 +672,12 @@ class FormCompiler:
     
     
     def _on_sided_path(self) -> bool:
-        # We’re on a “sided” integral if either:
-        #  - interface loop marked it, or
-        #  - ghost/interface loops created a per-QP basis cache.
-        return bool(self.ctx.get('is_interface', False) or isinstance(self.ctx.get('basis_values'), dict))
+        """
+        Return True only for interface/ghost evaluations.
+        Volume integrals must use the element-local path, even if some
+        sided keys linger in ctx from a previous integral.
+        """
+        return bool(self.ctx.get('is_interface', False) or self.ctx.get('is_ghost', False))
 
     def _with_side(self, side: str, eid_key: str, operand):
         phi_old  = self.ctx.get('phi_val', None)
@@ -647,24 +697,20 @@ class FormCompiler:
             if eid_old  is None: self.ctx.pop('eid',     None)
             else:                self.ctx['eid']     = eid_old
     def _visit_Pos(self, n):
-        # SIDED path (interface or ghost): set side/eid and RETURN — no φ-gating.
         if self._on_sided_path():
-            result = self._with_side('+', 'pos_eid', n.operand)
-            # print(f'Pos sided path: result={result.data if isinstance(result, VecOpInfo) else result}')
-            return result
-
+            return self._with_side('+', 'pos_eid', n.operand)
         # VOLUME path: φ-gate
         val = self._with_side('+', 'pos_eid', n.operand)
-        result = val if float(self.ctx.get('phi_val', 0.0)) >= 0.0 else (val * 0.0)
-        # print(f'Pos volume path: phi_val={self.ctx.get("phi_val", 0.0)}; result={result}')
-        return result
+        # return val
+        return val if float(self.ctx.get('phi_val', 0.0)) >= 0.0 else (val * 0.0)
 
     def _visit_Neg(self, n):
         if self._on_sided_path():
             return self._with_side('-', 'neg_eid', n.operand)
-
+        # VOLUME path: φ-gate
         val = self._with_side('-', 'neg_eid', n.operand)
-        return (val * 0.0) if float(self.ctx.get('phi_val', 0.0)) >= 0.0 else val 
+        # return val
+        return (val * 0.0) if float(self.ctx.get('phi_val', 0.0)) >= 0.0 else val
 
     def _visit_Jump(self, n: Jump):
         phi_old  = self.ctx.get('phi_val', None)
@@ -701,10 +747,7 @@ class FormCompiler:
 ########### --- Functions and VectorFunctions (evaluated to numerical values) ---
 ###########################################################################################
     def _get_side(self):
-        side = self.ctx.get('side')
-        if side not in ('+','-'):
-            side = '+' if self.ctx.get('phi_val', 0.0) >= 0 else '-'
-        return side
+        return self._active_side()
     def _zero_width(self):
         g = self.ctx.get("global_dofs")
         return len(g) if g is not None else len(self._local_dofs())
@@ -940,19 +983,28 @@ class FormCompiler:
     def _visit_DivOperation(self, n: DivOperation):
         grad_op = self._visit(Grad(n.operand))           # (k, n_loc, d)
         logger.debug(f"Visiting DivOperation for operand of type {type(n.operand)}, grad_op shape: {grad_op.data.shape}")
+        d = self.me.mesh.spatial_dim
 
+        num_comps = grad_op.data.shape[0]  # k
+        if num_comps < 2:
+            raise ValueError(f"DivOperation expects a vector/tensor operand with at least 2 components, got {num_comps}.")
         if grad_op.role == "function":
             # scaled the gradient
-            if grad_op.coeffs is not None:
+            if grad_op.coeffs is not None and grad_op.data.ndim == 3:
                 grad_val = np.einsum("knd,kn->kd", grad_op.data, grad_op.coeffs, optimize=True) # (k,d) (2,2)
             else:
                 grad_val = grad_op.data
             div_vec = np.sum([grad_val[i, i] for i in range(grad_val.shape[0])], axis=0)  # sum over k
         else:
             # ∇·v  =  Σ_i ∂v_i/∂x_i   → length n_loc (22) vector
-            div_vec = np.sum([grad_op.data[i, :, i]          # pick diagonal components
-                            for i in range(grad_op.data.shape[0])],
-                            axis=0)
+            if d == num_comps:
+                div_vec = np.sum([grad_op.data[i, :, i]          # pick diagonal components
+                                for i in range(grad_op.data.shape[0])],
+                                axis=0)
+            else:
+                I = np.eye(d, dtype=grad_op.data.dtype)
+                div_k = np.einsum("knd,kd->kn", grad_op.data, I, optimize=True)  # (k, n)
+                div_vec = div_k.sum(axis=0)                                       # (n,)
 
         # Decide which side of the bilinear form this lives on
         op = n.operand
@@ -1489,6 +1541,12 @@ class FormCompiler:
             fields = set(getattr(self.dh, "field_names", []))
         return sorted(fields)
     
+    def _clear_sided_ctx(self):
+        """Remove any interface/ghost residue before a volume loop."""
+        for k in ("basis_values", "pos_map_by_field", "neg_map_by_field",
+                "pos_eid", "neg_eid", "side", "normal"):
+            self.ctx.pop(k, None)
+        # We keep 'phi_val' and 'measure_side' managed by the volume routine itself.
     def _assemble_volume(self, integral: Integral, matvec):
         # if a level-set was attached to dx → do cut-cell assembly in Python path
         if getattr(integral.measure, "level_set", None) is not None:
@@ -1497,6 +1555,7 @@ class FormCompiler:
                 self._assemble_volume_cut_jit(integral, matvec)
             else:
                 # existing pure-Python path (already working from earlier work)
+                self._clear_sided_ctx()
                 self._assemble_volume_cut_python(integral, matvec)
             return
         # … otherwise the existing back-end selection …
@@ -1662,6 +1721,9 @@ class FormCompiler:
         rhs    = self.ctx.get("rhs", False)
         fields = self._fields_for(integral.integrand)
         self.ctx["is_interface"] = False
+        self.ctx["is_ghost"] = False
+        self.ctx["measure_side"] = None          # no LS side here
+
         logger.info(f"Assembling volume integral: {integral}")
 
         # --- element restriction via 'defined_on' (BitSet / mask / ids / tag / int)
@@ -1740,6 +1802,7 @@ class FormCompiler:
 
         # Mark that we are on Γ so Pos/Neg visitors set ctx['side'] & select (pos|neg)_eid
         self.ctx['is_interface'] = True
+        self.ctx['is_ghost'] = False
 
         mesh = self.me.mesh
         qdeg = self._find_q_order(intg)
@@ -2033,6 +2096,7 @@ class FormCompiler:
         derivs  = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
         derivs |= {(0, 0), (1, 0), (0, 1)}  # always have value and ∂x, ∂y
         self.ctx['is_interface'] = False
+        self.ctx['is_ghost'] = True
 
         # Close up to max total order (covers Hessian cross-terms etc.)
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
@@ -2481,6 +2545,8 @@ class FormCompiler:
         hook  = self._hook_for(intg.integrand)
         trial, test = _trial_test(intg.integrand)
         is_functional = hook and trial is None and test is None
+        self.ctx['is_ghost'] = False
+        self.ctx['is_interface'] = False
         if is_functional:
             self.ctx.setdefault("scalar_results", {})[hook["name"]] = 0.0
 
@@ -2685,66 +2751,7 @@ class FormCompiler:
         qw_phys = qw_ref * detJ                     # area scaling → physical weights
         return qp_phys, qw_phys
     
-    def _integrate_on_cut_element(self, eid: int, integral, level_set, q_order: int, side: str):
-        """
-        Integrate over the physical portion of element `eid` on the requested side of φ:
-        • geometry is split into corner triangles (quad→2 tris, tri→1)
-        • each triangle is clipped by φ=0 to keep {φ >= 0} or {φ <= 0} by `side`
-        • each clipped polygon is fan-triangulated and integrated in physical space
-        Returns the local element block (vector or matrix) in the mixed-element local layout.
-        """
-        from pycutfem.ufl.helpers_geom import volume as _vol_rule
-        from pycutfem.ufl.helpers_geom import phi_eval, corner_tris, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys  #  :contentReference[oaicite:1]{index=1}
-
-        mesh   = self.me.mesh
-        fields = self._fields_for(integral.integrand)
-        rhs    = self.ctx.get('rhs', False)
-
-        # local accumulator (mixed-element local layout)
-        loc = np.zeros((self.me.n_dofs_local,), dtype=float) if rhs else np.zeros((self.me.n_dofs_local, self.me.n_dofs_local), dtype=float)
-
-        # reference triangle rule (we will map to physical sub-triangles; weights include area)
-        qp_ref, qw_ref = _vol_rule("tri", q_order)
-
-        # process each geometric triangle of the parent element
-        elem = mesh.elements_list[eid]
-        tri_local, corner_ids = corner_tris(mesh, elem)  # returns [(local corner triplets), corner_node_ids]
-
-        for loc_tri in tri_local:
-            v_ids    = [corner_ids[i] for i in loc_tri]
-            v_coords = mesh.nodes_x_y_pos[v_ids]  # (3,2)
-            v_phi    = np.array([phi_eval(level_set, xy) for xy in v_coords], dtype=float)
-
-            # clip to requested side and fan-triangulate each polygon
-            polygons = clip_triangle_to_side(v_coords, v_phi, side=side)
-            for poly in polygons:
-                for A, B, C in fan_triangulate(poly):
-                    qp_phys, qw_phys = map_ref_tri_to_phys(A, B, C, qp_ref, qw_ref)  # weights already × area
-
-                    # integrate in physical space; no extra detJ scaling
-                    for x_phys, w in zip(qp_phys, qw_phys):
-                        # inverse map to reference of the *parent* element
-                        xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
-                        J       = transform.jacobian(mesh, eid, (xi, eta))
-                        Ji      = np.linalg.inv(J)
-
-                        # basis/grad caches for each field at this (xi,eta)
-                        self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
-                        for f in fields:
-                            self._basis_cache[f] = {
-                                "val" : self.me.basis(f, xi, eta),
-                                "grad": self.me.grad_basis(f, xi, eta) @ Ji
-                            }
-
-                        # UFL visitor context
-                        self.ctx["eid"]     = eid
-                        self.ctx["x_phys"]  = x_phys
-                        self.ctx["phi_val"] = phi_eval(level_set, x_phys)  # may be used by Pos/Neg/Jumps
-
-                        integrand_val = self._visit(integral.integrand)
-                        loc += w * integrand_val    # w already contains area; do NOT multiply by detJ again
-
-        return loc
+    
 
 
     def _assemble_volume_cut_python(self, integral, matvec):
@@ -2754,25 +2761,79 @@ class FormCompiler:
 
         • Full cells on the requested side: reference quadrature × |detJ|
         • Cut cells: physical-space sub-triangle quadrature (weights already include area)
+        • Pure functionals (no test/trial) are accumulated as scalars into ctx['scalar_results'][hook['name']]
         """
-        import numpy as np
+        self._clear_sided_ctx()
+
         from pycutfem.fem import transform
-        from pycutfem.ufl.helpers import normalize_elem_ids
+        from pycutfem.ufl.helpers import normalize_elem_ids, _trial_test
         from pycutfem.integration.quadrature import volume as _vol_rule
         from pycutfem.ufl.helpers_geom import (
             phi_eval, corner_tris, clip_triangle_to_side,
             fan_triangulate, map_ref_tri_to_phys,
         )
 
+        def _field_side_tag(name: str) -> str | None:
+            # Returns '+' / '-' / None based on the field's name.
+            if "_pos_" in name or name.endswith("_pos") or name.startswith("pos_"):
+                return '+'
+            if "_neg_" in name or name.endswith("_neg") or name.startswith("neg_"):
+                return '-'
+            return None
+
+        def _filter_fields_by_measure_side(fields: list[str], side: str) -> list[str]:
+            # Keep only fields that belong to the requested side; ignore neutral/number fields.
+            kept = []
+            for f in fields:
+                tag = _field_side_tag(f)
+                if tag is None:
+                    # neutral fields (e.g. ':number:') should not appear in bilinear VOLUME terms
+                    continue
+                if tag == side:
+                    kept.append(f)
+            return kept
+
         mesh      = self.me.mesh
         level_set = integral.measure.level_set
         if level_set is None:
             raise ValueError("Cut-cell volume assembly requires measure.level_set")
 
-        side     = integral.measure.metadata.get('side', '+')  # '+' → φ≥0, '-' → φ≤0
-        rhs      = self.ctx.get("rhs", False)
-        fields   = self._fields_for(integral.integrand)             # used for basis caches
+        side   = integral.measure.metadata.get('side', '+')  # '+' → φ≥0, '-' → φ≤0
+        rhs    = self.ctx.get("rhs", False)
+        fields_all = self._fields_for(integral.integrand)
+        fields     = _filter_fields_by_measure_side(fields_all, side)
+        print(f"="*50)
+        print(f"fields for integral: {fields}, side: {side}, rhs: {rhs}")
+        print(f"-"*50)
+        print(f"Integral: {integral}")
+        print(f"="*50)
+        # raise NotImplementedError("Cut-cell volume assembly not implemented in Python backend.")
+
+        # --- functional detection (structure-based) ---
+        trial, test = _trial_test(integral.integrand)
+        hook = self._hook_for(integral.integrand)
+        is_pure_functional = (trial is None) and (test is None)
+        accumulate_scalar  = is_pure_functional and (hook is not None)
+        if accumulate_scalar:
+            self.ctx.setdefault('scalar_results', {}).setdefault(hook['name'], 0.0)
+
+        # indices (element-local union ordering) for the chosen fields, in order
+        if fields:
+            fld_local_idx = np.concatenate([
+                np.arange(self.me.component_dof_slices[f].start,
+                        self.me.component_dof_slices[f].stop, dtype=int)
+                for f in fields
+            ])
+            # self.ctx["global_dofs"] = fld_local_idx                    # ← align component rows
+        else:
+            fld_local_idx = np.array([], dtype=int)
+
+        # context flags for visitors
         self.ctx["is_interface"] = False
+        self.ctx["is_ghost"]     = False
+        self.ctx["measure_side"] = side
+        # default φ sign (used on full cells)
+        self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
 
         # --- element restriction via 'defined_on' (BitSet / mask / ids / tag / int)
         allowed = normalize_elem_ids(mesh, getattr(integral.measure, "defined_on", None))
@@ -2785,7 +2846,7 @@ class FormCompiler:
             outside_ids = [e for e in outside_ids if e in allowed]
             cut_ids     = [e for e in cut_ids     if e in allowed]
 
-        # --- geometry-aware quadrature for curved mapping
+        # --- quadrature orders (account for geometry order)
         q_base  = int(self._find_q_order(integral))
         p_geo   = int(getattr(mesh, "poly_order", 1))
         q_infl  = 2 * max(0, p_geo - 1)
@@ -2793,57 +2854,124 @@ class FormCompiler:
 
         # reference rule on parent element
         qp_ref, qw_ref = _vol_rule(mesh.element_type, q_order)
+        # reference rule on triangles (for fan-triangulated polygons)
+        qp_tri, qw_tri = _vol_rule("tri", q_order)
 
-        # local block shape == full mixed-element local size (matches visitor output)
-        loc_shape = (self.me.n_dofs_local,) if rhs else (self.me.n_dofs_local, self.me.n_dofs_local)
+        # local block shape for FULL cells (union-sized; visitor returns union size)
+        loc_shape_full = (self.me.n_dofs_local,) if rhs else (self.me.n_dofs_local, self.me.n_dofs_local)
 
-        # --- 1) full elements on requested side
+        # ----------------------------
+        # Functional path (no test/trial)
+        # ----------------------------
+        if is_pure_functional:
+            acc = 0.0
+
+            # 1) FULL elements on requested side
+            full_eids = outside_ids if side == '+' else inside_ids
+            for eid in full_eids:
+                for (xi, eta), w in zip(qp_ref, qw_ref):
+                    J    = transform.jacobian(mesh, eid, (xi, eta))
+                    detJ = abs(np.linalg.det(J))
+
+                    self.ctx["eid"]          = eid
+                    self.ctx["x_phys"]       = transform.x_mapping(mesh, eid, (xi, eta))
+                    self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
+                    self.ctx["measure_side"] = side
+                    self.ctx["side"]         = side
+
+                    val = self._visit(integral.integrand)
+                    arr = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                    v   = float(arr if arr.ndim == 0 else arr.sum())
+                    acc += (w * detJ) * v
+
+            # 2) CUT elements: integrate physical sub-triangles (weights already include area)
+            for eid in cut_ids:
+                elem = mesh.elements_list[eid]
+                tri_local, corner_ids = corner_tris(mesh, elem)
+
+                for loc_tri in tri_local:
+                    v_ids    = [corner_ids[i] for i in loc_tri]
+                    v_coords = mesh.nodes_x_y_pos[v_ids]  # (3,2)
+                    v_phi    = np.array([phi_eval(level_set, xy) for xy in v_coords], float)
+
+                    polygons = clip_triangle_to_side(v_coords, v_phi, side=side)
+                    for poly in polygons:
+                        for A, B, C in fan_triangulate(poly):
+                            qp_phys, qw_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)
+                            for x_phys, w in zip(qp_phys, qw_phys):
+                                self.ctx["eid"]          = eid
+                                self.ctx["x_phys"]       = x_phys
+                                self.ctx["phi_val"]      = phi_eval(level_set, x_phys)
+                                self.ctx["measure_side"] = side
+                                self.ctx["side"]         = side
+
+                                val = self._visit(integral.integrand)
+                                arr = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                                v   = float(arr if arr.ndim == 0 else arr.sum())
+                                acc += w * v   # w already includes physical area
+
+            if accumulate_scalar:
+                self.ctx['scalar_results'][hook['name']] += acc
+
+            # nothing to scatter for a pure functional
+            for key in ("eid", "x_phys", "phi_val", "measure_side", "side"):
+                self.ctx.pop(key, None)
+            return
+
+        # ----------------------------
+        # Matrix / Vector path
+        # ----------------------------
+
+        # --- 1) FULL elements on requested side (union-sized loc, scatter fields=None)
         full_eids = outside_ids if side == '+' else inside_ids
-
         for eid in full_eids:
-            loc = np.zeros(loc_shape, dtype=float)
+            loc = np.zeros(loc_shape_full, dtype=float)
 
             for (xi, eta), w in zip(qp_ref, qw_ref):
-                J     = transform.jacobian(mesh, eid, (xi, eta))
-                detJ  = abs(np.linalg.det(J))
-                Ji    = np.linalg.inv(J)
+                J    = transform.jacobian(mesh, eid, (xi, eta))
+                detJ = abs(np.linalg.det(J))
+                Ji   = np.linalg.inv(J)
 
-                # basis/grad caches for *exactly* the fields used by the integrand
+                # basis/grad caches for exactly the fields used by the integrand
                 self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
                 for f in fields:
                     self._basis_cache[f] = {
-                        "val" : self.me.basis(f, xi, eta),
-                        "grad": self.me.grad_basis(f, xi, eta) @ Ji
+                        "val":  self.me.basis(f, xi, eta),
+                        "grad": self.me.grad_basis(f, xi, eta) @ Ji,
                     }
 
-                self.ctx["eid"]    = eid
-                self.ctx["x_phys"] = transform.x_mapping(mesh, eid, (xi, eta))
-                # NEW: let Pos/Neg gating work correctly on full cells
-                self.ctx["phi_val"] = 1.0 if side == '+' else -1.0
-                integrand_val = self._visit(integral.integrand)
-                loc += (w * detJ) * integrand_val
+                self.ctx["eid"]          = eid
+                self.ctx["x_phys"]       = transform.x_mapping(mesh, eid, (xi, eta))
+                self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
+                self.ctx["measure_side"] = side
+                self.ctx["side"]         = side
+
+                val = self._visit(integral.integrand)
+                loc += (w * detJ) * val  # val is union-sized block/vector
 
             # scatter against ALL element DOFs to match loc's full size
             self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
 
-        # --- 2) cut elements: integrate physical sub-triangles (weights include area)
+        # --- 2) CUT elements: subset-sized loc, scatter fields=fields
+        if fld_local_idx.size == 0 or len(fields) == 0:
+            # Nothing to assemble for cut cells if no participating fields
+            for key in ("eid", "x_phys", "phi_val", "measure_side", "side"):
+                self.ctx.pop(key, None)
+            return
+
         for eid in cut_ids:
-            # local accumulator in phys space, visitor returns full-size block
-            loc = np.zeros(loc_shape, dtype=float)
+            # subset-sized local accumulator
+            loc = np.zeros((fld_local_idx.size,), dtype=float) if rhs else \
+                np.zeros((fld_local_idx.size, fld_local_idx.size), dtype=float)
 
-            # reference triangle rule
-            qp_tri, qw_tri = _vol_rule("tri", q_order)
-
-            # split parent into corner triangles
             elem = mesh.elements_list[eid]
             tri_local, corner_ids = corner_tris(mesh, elem)
 
             for loc_tri in tri_local:
                 v_ids    = [corner_ids[i] for i in loc_tri]
-                v_coords = mesh.nodes_x_y_pos[v_ids]  # (3,2)
+                v_coords = mesh.nodes_x_y_pos[v_ids]
                 v_phi    = np.array([phi_eval(level_set, xy) for xy in v_coords], float)
 
-                # clip to requested side and fan-triangulate polygons
                 polygons = clip_triangle_to_side(v_coords, v_phi, side=side)
                 for poly in polygons:
                     for A, B, C in fan_triangulate(poly):
@@ -2851,29 +2979,49 @@ class FormCompiler:
 
                         for x_phys, w in zip(qp_phys, qw_phys):
                             xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
-                            J       = transform.jacobian(mesh, eid, (xi, eta))
-                            Ji      = np.linalg.inv(J)
+                            J  = transform.jacobian(mesh, eid, (xi, eta))
+                            Ji = np.linalg.inv(J)
 
                             self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
                             for f in fields:
                                 self._basis_cache[f] = {
-                                    "val" : self.me.basis(f, xi, eta),
-                                    "grad": self.me.grad_basis(f, xi, eta) @ Ji
+                                    "val":  self.me.basis(f, xi, eta),
+                                    "grad": self.me.grad_basis(f, xi, eta) @ Ji,
                                 }
 
-                            self.ctx["eid"]     = eid
-                            self.ctx["x_phys"]  = x_phys
-                            self.ctx["phi_val"] = phi_eval(level_set, x_phys)
+                            self.ctx["eid"]          = eid
+                            self.ctx["x_phys"]       = x_phys
+                            self.ctx["phi_val"]      = phi_eval(level_set, x_phys)
+                            self.ctx["measure_side"] = side
+                            self.ctx["side"]         = side
 
-                            integrand_val = self._visit(integral.integrand)
-                            # w already contains area of the physical sub-triangle
-                            loc += w * integrand_val
+                            val = self._visit(integral.integrand)
 
-            self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
+                            if rhs:
+                                vec = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                                # Expect shape (n_loc,); if scalar sneaks in, ignore
+                                if vec.ndim == 1 and vec.size >= fld_local_idx.size:
+                                    loc += w * vec[fld_local_idx]
+                            else:
+                                mat = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                                # Expect shape (n_loc, n_loc); if scalar sneaks in, skip
+                                if mat.ndim == 2 and mat.shape[0] >= self.me.n_dofs_local and mat.shape[1] >= self.me.n_dofs_local:
+                                    loc += w * mat[np.ix_(fld_local_idx, fld_local_idx)]
+                                elif mat.ndim == 2 and mat.shape[0] >= fld_local_idx.max(initial=-1)+1 and mat.shape[1] >= fld_local_idx.max(initial=-1)+1:
+                                    # fallback if visitor already gave a smaller union
+                                    loc += w * mat[np.ix_(fld_local_idx, fld_local_idx)]
+                                else:
+                                    # mat.ndim == 0 or shapes not as expected → nothing to add for this point
+                                    continue
+
+            # fields-subset scatter
+            if loc.size:
+                self._scatter_local(eid, loc, fields=fields, matvec=matvec, rhs=rhs)
 
         # cleanup
-        for key in ("eid", "x_phys", "phi_val"):
+        for key in ("eid", "x_phys", "phi_val", "measure_side", "side"):
             self.ctx.pop(key, None)
+
 
 
 

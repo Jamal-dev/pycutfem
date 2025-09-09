@@ -64,23 +64,7 @@ def inv_jac_T(mesh, elem_id, xi_eta):
     J = jacobian(mesh, elem_id, xi_eta)
     return np.linalg.inv(J).T
 
-def inverse_mapping(mesh, elem_id, x, tol=1e-10, maxiter=50):
-    ref = get_reference(mesh.element_type, mesh.poly_order)
-    # Use centroid as initial guess: (0,0) for quad, (1/3,1/3) for tri
-    xi = np.array([0.0, 0.0]) if mesh.element_type == 'quad' else np.array([1/3, 1/3])
-    for iter in range(maxiter):
-        X = x_mapping(mesh, elem_id, xi)
-        J = jacobian(mesh, elem_id, xi)
-        try:
-            delta = np.linalg.solve(J, x - X)
-        except np.linalg.LinAlgError:
-            raise ValueError(f"Jacobian singular at iteration {iter} for elem {elem_id}, x={x}")
-        xi += delta
-        if np.linalg.norm(delta) < tol:
-            break
-    else:
-        raise ValueError(f"Inverse mapping did not converge after {maxiter} iterations for elem {elem_id}, x={x}, residual={np.linalg.norm(x - X)}")
-    return xi
+
 
 @staticmethod
 def jacobian_1d(mesh, elem_id: int, ref_coords: tuple, local_edge_idx: int) -> float:
