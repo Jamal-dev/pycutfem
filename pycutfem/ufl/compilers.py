@@ -2800,13 +2800,13 @@ class FormCompiler:
 
         side   = integral.measure.metadata.get('side', '+')  # '+' → φ≥0, '-' → φ≤0
         rhs    = self.ctx.get("rhs", False)
-        fields_all = self._fields_for(integral.integrand)
-        fields     = _filter_fields_by_measure_side(fields_all, side)
-        print(f"="*50)
-        print(f"fields for integral: {fields}, side: {side}, rhs: {rhs}")
-        print(f"-"*50)
-        print(f"Integral: {integral}")
-        print(f"="*50)
+        fields = self._fields_for(integral.integrand)
+        # fields     = _filter_fields_by_measure_side(fields_all, side)
+        # print(f"="*50)
+        # print(f"fields for integral: {fields}, side: {side}, rhs: {rhs}")
+        # print(f"-"*50)
+        # print(f"Integral: {integral}")
+        # print(f"="*50)
         # raise NotImplementedError("Cut-cell volume assembly not implemented in Python backend.")
 
         # --- functional detection (structure-based) ---
@@ -2846,6 +2846,9 @@ class FormCompiler:
             outside_ids = [e for e in outside_ids if e in allowed]
             cut_ids     = [e for e in cut_ids     if e in allowed]
 
+        # print(f"Volume integral on {len(inside_ids)} inside,"
+        #       f" {len(outside_ids)} outside,"
+        #       f" {len(cut_ids)} cut elements (after 'defined_on' filter).")
         # --- quadrature orders (account for geometry order)
         q_base  = int(self._find_q_order(integral))
         p_geo   = int(getattr(mesh, "poly_order", 1))
@@ -2942,9 +2945,9 @@ class FormCompiler:
 
                 self.ctx["eid"]          = eid
                 self.ctx["x_phys"]       = transform.x_mapping(mesh, eid, (xi, eta))
-                self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
-                self.ctx["measure_side"] = side
-                self.ctx["side"]         = side
+                # self.ctx["phi_val"]      = None
+                # self.ctx["measure_side"] = None
+                # self.ctx["side"]         = None
 
                 val = self._visit(integral.integrand)
                 loc += (w * detJ) * val  # val is union-sized block/vector

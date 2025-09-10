@@ -185,5 +185,8 @@ def corner_tris(mesh, elem):
     cn = list(elem.corner_nodes)
     if mesh.element_type == 'quad':
         return [(0,1,3), (1,2,3)], cn
-    else:  # 'tri'
+        # → triangles (0,1,2) and (0,2,3)
+        # return [(0,1,2), (0,2,3)], cn
+    
+    elif mesh.element_type == 'tri':
         return [ (0,1,2) ], cn
