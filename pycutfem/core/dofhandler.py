@@ -23,6 +23,8 @@ from pycutfem.ufl.helpers_geom import (
 )
 from pycutfem.utils.bitset import BitSet
 from pycutfem.fem import transform
+from pycutfem.core.sideconvention import SIDE
+
 
 _JET = transform.InverseJetCache()  # module-scope 
 
@@ -350,8 +352,8 @@ class DofHandler:
                 if f in numset:
                     if f not in num_gid:
                         num_gid[f] = next_gid; next_gid += 1
-                        field_gsets[f].add(num_gid[f])
                         dof_coords.append((0.0, 0.0))
+                    field_gsets[f].add(num_gid[f])
                     element_maps[f].append([int(num_gid[f])]) 
                     continue
                 p = int(me._field_orders[f])
@@ -2417,12 +2419,18 @@ class DofHandler:
         for i, e in enumerate(edges):
             phiL = float(level_set(np.asarray(mesh.elements_list[e.left ].centroid())))
             phiR = float(level_set(np.asarray(mesh.elements_list[e.right].centroid())))
-            if phiL >= phiR:
+
+            if SIDE.is_pos(phiL) and not SIDE.is_pos(phiR):
                 pos_eid, neg_eid = e.left, e.right
-            else:
+            elif SIDE.is_pos(phiR) and not SIDE.is_pos(phiL):
                 pos_eid, neg_eid = e.right, e.left
+            else:
+                # tie-breaker (both same side within tol): larger φ defines '+'
+                pos_eid, neg_eid = (e.left, e.right) if phiL >= phiR else (e.right, e.left)
+
             pos_ids[i] = int(pos_eid)
             neg_ids[i] = int(neg_eid)
+
 
             # ensure normal points from neg → pos
             nvec = e.normal
@@ -3211,7 +3219,10 @@ class DofHandler:
 
                 # clip triangle to requested side and fan-triangulate
                 if _HAVE_NUMBA:
-                    poly, n_pts = _clip_triangle_to_side_numba(V, v_phi, sgn)
+                    poly, n_pts = _clip_triangle_to_side_numba(V, v_phi, sgn,
+                                SIDE.pos_is_phi_nonnegative,
+                                SIDE.zero_belongs_to_pos
+                            )
                     if n_pts < 3:
                         continue
                     if n_pts == 3:
@@ -3914,10 +3925,9 @@ class DofHandler:
             coords  = self.get_dof_coords(fld)         # (n_field_dofs, 2)
             values  = np.empty(coords.shape[0], dtype=float)
             for k, (x, y) in enumerate(coords):
-                if level_set([x, y]) < 0.0:
-                    values[k] = exact_neg[fld](x, y)
-                else:
-                    values[k] = exact_pos[fld](x, y)
+                phi = float(level_set([x, y]))
+                values[k] = exact_neg[fld](x, y) if SIDE.is_neg(phi) else exact_pos[fld](x, y)
+
 
             # subtract into copy: w = u_h - I_h(u_exact)
             # write component-wise using vector function's global dofs

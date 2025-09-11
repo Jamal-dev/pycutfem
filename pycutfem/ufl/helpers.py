@@ -14,6 +14,8 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.expressions import Hessian as UFLHessian, Laplacian as UFLLaplacian
 from pycutfem.ufl.helpers_geom import phi_eval
+from pycutfem.core.sideconvention import SIDE
+
 
 
 import logging
@@ -1730,8 +1732,10 @@ class HelpersFieldAware:
             xy   = coords[gidx]
             from pycutfem.ufl.helpers_geom import phi_eval
             phi  = np.asarray([phi_eval(level_set, p) for p in xy], dtype=float)
-            pos_masks[fld] = (phi >= -float(tol)).astype(float)
-            neg_masks[fld] = (phi <  -float(tol)).astype(float)
+            # Use the single global rule
+            pos_masks[fld] = np.array([1.0 if SIDE.is_pos(val, tol=tol) else 0.0 for val in phi], dtype=float)
+            neg_masks[fld] = np.array([1.0 if SIDE.is_neg(val, tol=tol) else 0.0 for val in phi], dtype=float)
+
         return pos_masks, neg_masks
     @staticmethod
     def _side_from_node(self:"FormCompiler", n):

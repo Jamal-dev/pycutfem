@@ -350,10 +350,10 @@ def test_stokes_interface_corrected():
         # BoundaryCondition('u_neg_x', 'dirichlet', 'boundary', lambda x, y: vel_exact_neg_xy(x, y)[0]),
         # BoundaryCondition('u_neg_y', 'dirichlet', 'boundary', lambda x, y: vel_exact_neg_xy(x, y)[1]),
         # BoundaryCondition('p_neg_', 'dirichlet', 'boundary', lambda x, y: p_exact_neg_xy(x, y)),
-        BoundaryCondition('u_pos_x', 'dirichlet', 'inactive_inside_ux', lambda x, y: 0.0),
-        BoundaryCondition('u_pos_y', 'dirichlet', 'inactive_inside_uy', lambda x, y: 0.0),
-        BoundaryCondition('u_neg_x', 'dirichlet', 'inactive_outside_ux', lambda x, y: 0.0),
-        BoundaryCondition('u_neg_y', 'dirichlet', 'inactive_outside_uy', lambda x, y: 0.0),
+        # BoundaryCondition('u_pos_x', 'dirichlet', 'inactive_inside_ux', lambda x, y: 0.0),
+        # BoundaryCondition('u_pos_y', 'dirichlet', 'inactive_inside_uy', lambda x, y: 0.0),
+        # BoundaryCondition('u_neg_x', 'dirichlet', 'inactive_outside_ux', lambda x, y: 0.0),
+        # BoundaryCondition('u_neg_y', 'dirichlet', 'inactive_outside_uy', lambda x, y: 0.0),
         # BoundaryCondition('p_pos_', 'dirichlet', 'inactive_inside_p', lambda x, y: p_exact_pos_xy(x, y)),
         # BoundaryCondition('p_neg_', 'dirichlet', 'inactive_outside_p', lambda x, y: p_exact_neg_xy(x, y)),
     ]
@@ -370,16 +370,23 @@ def test_stokes_interface_corrected():
     # Build field-wise DOF sets (so tags don't accidentally drop other fields)
     field_sets = {f: set(dh.get_field_slice(f)) for f in dh.field_names}
 
+    drop_v = set()
+    for tag, fld in [
+        ("inactive_inside_ux", "u_pos_x"),
+        ("inactive_inside_uy", "u_pos_y"),
+        ("inactive_outside_ux","u_neg_x"),
+        ("inactive_outside_uy","u_neg_y"),
+    ]:
+        drop_v |= (set(dh.dof_tags.get(tag, set())) & field_sets.get(fld, set()))
+
+    # Reuse your existing pressure-dropping code:
     drop_pos = set(dh.dof_tags.get("inactive_inside_p",  set())) & field_sets.get("p_pos_", set())
     drop_neg = set(dh.dof_tags.get("inactive_outside_p", set())) & field_sets.get("p_neg_", set())
-    drop_full = np.array(sorted(drop_pos | drop_neg), dtype=int)
 
-    # Map drops into the reduced (free) index space
-    drop_red = full2red[drop_full]
-    drop_red = drop_red[drop_red >= 0]  # only those that are actually "free"
+    drop_full = np.array(sorted(drop_v | drop_pos | drop_neg), dtype=int)
+    drop_red  = full2red[drop_full]; drop_red = drop_red[drop_red >= 0]
 
-    # Keep = all free DOFs minus dropped pressure DOFs
-    all_red = np.arange(K_ff.shape[0], dtype=int)
+    all_red  = np.arange(K_ff.shape[0], dtype=int)
     keep_red = np.setdiff1d(all_red, drop_red, assume_unique=False)
 
     # Solve on the kept set

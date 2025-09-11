@@ -64,6 +64,8 @@ from pycutfem.ufl.helpers_geom import (
     phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
 )
 from contextlib import contextmanager
+from pycutfem.core.sideconvention import SIDE
+
 
 
 
@@ -75,27 +77,36 @@ def interface_normal_for_edge(mesh, e, level_set):
     # mid-point on the physical edge
     p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
     mid = 0.5*(p0 + p1)
-    # try LS gradient first
+
+    # normal from ∇φ, fallback to edge-normal
     g = np.asarray(level_set.gradient(mid), float)
     if np.linalg.norm(g) > 1e-15:
         n = g / np.linalg.norm(g)
     else:
-        # degenerate ∇φ: fall back to edge normal
         t = p1 - p0
         t /= max(np.linalg.norm(t), 1e-16)
         n = np.array([t[1], -t[0]], float)
 
-    # orient NEG -> POS using element centroids
+    # Decide which neighbor is (+) and which is (−) by the global convention
     cl = np.asarray(mesh.elements_list[e.left ].centroid())
     cr = np.asarray(mesh.elements_list[e.right].centroid())
-    # pick which side is POS/NEG using φ at centroids
-    if float(level_set(*cl)) >= float(level_set(*cr)):
+    phiL = float(level_set(*cl))
+    phiR = float(level_set(*cr))
+
+    # Primary: classify by SIDE; Fallback: compare values
+    if SIDE.is_pos(phiL) and not SIDE.is_pos(phiR):
         cpos, cneg = cl, cr
-    else:
+    elif SIDE.is_pos(phiR) and not SIDE.is_pos(phiL):
         cpos, cneg = cr, cl
+    else:
+        # ambiguous (both on same side): orient by larger φ as a stable fallback
+        cpos, cneg = (cl, cr) if phiL >= phiR else (cr, cl)
+
+    # Orient normal from (−) → (+)
     if np.dot(n, cpos - cneg) < 0.0:
         n = -n
     return n
+
 
 
 
@@ -253,9 +264,10 @@ class FormCompiler:
         pv = self.ctx.get("phi_val", None)
         if pv is not None:
             try:
-                return "+" if float(pv) >= 0.0 else "-"
+                return "+" if SIDE.is_pos(float(pv)) else "-"
             except Exception:
                 pass
+
         return default if default in ("+", "-") else "+"
 
 
@@ -378,6 +390,7 @@ class FormCompiler:
 
         # ---------- Standard element-local path (volume/boundary) ----------
         cache = self._basis_cache.setdefault(field, {})
+
 
         # Fast paths
         if alpha == (0, 0) and "val" in cache:
@@ -701,8 +714,8 @@ class FormCompiler:
             return self._with_side('+', 'pos_eid', n.operand)
         # VOLUME path: φ-gate
         val = self._with_side('+', 'pos_eid', n.operand)
-        # return val
-        return val if float(self.ctx.get('phi_val', 0.0)) >= 0.0 else (val * 0.0)
+        pv = float(self.ctx.get('phi_val', 0.0))
+        return val if SIDE.is_pos(pv) else (val * 0.0)
 
     def _visit_Neg(self, n):
         if self._on_sided_path():
@@ -710,7 +723,8 @@ class FormCompiler:
         # VOLUME path: φ-gate
         val = self._with_side('-', 'neg_eid', n.operand)
         # return val
-        return (val * 0.0) if float(self.ctx.get('phi_val', 0.0)) >= 0.0 else val
+        pv = float(self.ctx.get('phi_val', 0.0))
+        return (val * 0.0) if SIDE.is_pos(pv) else val
 
     def _visit_Jump(self, n: Jump):
         phi_old  = self.ctx.get('phi_val', None)
@@ -761,16 +775,16 @@ class FormCompiler:
         # element-union coeffs for the *current side* and the side-trace basis row
         local_dofs = self._local_dofs()
         u_loc = n.get_nodal_values(local_dofs)   # (n_loc,)
-        phi   = self._b(n.field_name)            # (n_loc,) or already padded
+        basis_00   = self._b(n.field_name)            # (n_loc,) or already padded
 
         # On ghost/interface paths, align BOTH basis and coeffs to the same global layout
         gd = self.ctx.get("global_dofs", None)
         if gd is not None:
             side = self._get_side()  # '+' or '-'
-            phi, u_loc = _hac._align_phi_and_coeffs_to_global(self.ctx, side, n.field_name, phi, u_loc)
+            basis_00, u_loc = _hac._align_phi_and_coeffs_to_global(self.ctx, side, n.field_name, basis_00, u_loc)
 
         # Elementwise product: returns a single block (keep legacy shape: list of 1 vector)
-        data = [u_loc * phi]
+        data = [u_loc * basis_00]
         return self._vecinfo(data, role="function", node=n, field_names=[n.field_name])
 
     def _visit_VectorFunction(self, n: VectorFunction):
@@ -785,15 +799,15 @@ class FormCompiler:
         blocks = []
         for fld in names:
             coeffs = comp_by_name[fld].get_nodal_values(local_dofs)  # (n_loc,) or (ncomp, n_loc)
-            phi    = self._b(fld)                                    # (n_loc,) or (ncomp, n_loc)
+            basis_00    = self._b(fld)                                    # (n_loc,) or (ncomp, n_loc)
 
             gd = self.ctx.get("global_dofs", None)
             if gd is not None:
                 side = self._get_side()
-                phi, coeffs = _hac._align_phi_and_coeffs_to_global(self.ctx, side, fld, phi, coeffs)
+                basis_00, coeffs = _hac._align_phi_and_coeffs_to_global(self.ctx, side, fld, basis_00, coeffs)
 
             # Elementwise product per component
-            blocks.append(coeffs * phi)
+            blocks.append(coeffs * basis_00)
 
         if blocks:
             # stack along component axis; resulting shape: (ncomp_total, ndofs_global_or_local)
@@ -1793,9 +1807,9 @@ class FormCompiler:
         """
 
         log = logging.getLogger(__name__)
-        log.info(f"Assembling interface integral: {intg}")
 
         rhs = bool(self.ctx.get('rhs', False))
+        log.info(f"Assembling interface integral: {intg}, is_rhs={rhs}")
         level_set = intg.measure.level_set
         if level_set is None:
             raise ValueError("dInterface measure requires a level_set.")
@@ -1803,6 +1817,9 @@ class FormCompiler:
         # Mark that we are on Γ so Pos/Neg visitors set ctx['side'] & select (pos|neg)_eid
         self.ctx['is_interface'] = True
         self.ctx['is_ghost'] = False
+        side_md = (intg.measure.metadata or {}).get('side', None)
+        if side_md in ('+', '-'):
+            self.ctx['measure_side'] = side_md
 
         mesh = self.me.mesh
         qdeg = self._find_q_order(intg)
@@ -1886,7 +1903,17 @@ class FormCompiler:
                         arr = np.asarray(val)
                         acc += w * float(arr if arr.ndim == 0 else arr.sum())
                     else:
-                        acc += w * np.asarray(val)
+                        val_arr = np.asarray(getattr(val, "data", val))
+                        if rhs:
+                            # collapse (1,n) or (n,1) → (n,)
+                            if val_arr.ndim == 2 and 1 in val_arr.shape:
+                                val_arr = val_arr.reshape(-1)
+                            if val_arr.ndim != 1:
+                                raise ValueError(f"Interface RHS expects 1D vector, got {val_arr.shape}")
+                            acc += w * val_arr
+                        else:
+                            acc += w * val_arr
+
 
                 # --- Scatter to global structures
                 if is_functional:
@@ -1984,7 +2011,8 @@ class FormCompiler:
                 "pos_map_by_field", "neg_map_by_field",
                 "pos_mask_by_field", "neg_mask_by_field",
                 "eid", "pos_eid", "neg_eid",
-                "is_interface", "x_phys", "phi_val", "normal"
+                "is_interface", "x_phys", "phi_val", "normal",
+                "measure_side"
             ):
                 self.ctx.pop(k, None)
 
@@ -2152,12 +2180,17 @@ class FormCompiler:
                     continue
 
                 def choose_pos_neg_ids():
-                    # Choose (+)/(–) by phi at centroids: pos = higher φ, neg = lower φ
-                    phiL = float(level_set(np.asarray(mesh.elements_list[e.left ].centroid())))
-                    phiR = float(level_set(np.asarray(mesh.elements_list[e.right].centroid())))
-                    pos_eid, neg_eid = (e.left, e.right) if phiL >= phiR else (e.right, e.left)
+                    cL = np.asarray(mesh.elements_list[e.left ].centroid())
+                    cR = np.asarray(mesh.elements_list[e.right].centroid())
+                    phiL = float(level_set(cL))
+                    phiR = float(level_set(cR))
+                    if SIDE.is_pos(phiL) and not SIDE.is_pos(phiR):
+                        return e.left, e.right
+                    if SIDE.is_pos(phiR) and not SIDE.is_pos(phiL):
+                        return e.right, e.left
+                    # fallback: larger φ is '+'
+                    return (e.left, e.right) if phiL >= phiR else (e.right, e.left)
 
-                    return pos_eid, neg_eid
 
                 pos_eid, neg_eid = choose_pos_neg_ids()
                 def get_normal_vec(e):
@@ -2736,20 +2769,7 @@ class FormCompiler:
             self._assemble_boundary_edge_jit(intg, matvec)
         else:
             raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
-    # --- CUT-CELL helpers -------------------------------------------------
 
-    def _physical_tri_quadrature(self, tri_coords, q_order):
-        """
-        Map the reference-triangle quadrature to the physical triangle with vertices tri_coords.
-        Returns (qpoints_phys, qweights_phys). Weights are *physical* areas.
-        """
-        v0, v1, v2 = map(np.asarray, tri_coords)
-        qp_ref, qw_ref = volume('tri', q_order)     # reference rule (r,s) on Δ(0,0)-(1,0)-(0,1)
-        J = np.column_stack((v1 - v0, v2 - v0))     # 2x2 affine map
-        detJ = abs(np.linalg.det(J))
-        qp_phys = (qp_ref @ J.T) + v0               # (nq,2)
-        qw_phys = qw_ref * detJ                     # area scaling → physical weights
-        return qp_phys, qw_phys
     
     
 
@@ -2772,26 +2792,6 @@ class FormCompiler:
             phi_eval, corner_tris, clip_triangle_to_side,
             fan_triangulate, map_ref_tri_to_phys,
         )
-
-        def _field_side_tag(name: str) -> str | None:
-            # Returns '+' / '-' / None based on the field's name.
-            if "_pos_" in name or name.endswith("_pos") or name.startswith("pos_"):
-                return '+'
-            if "_neg_" in name or name.endswith("_neg") or name.startswith("neg_"):
-                return '-'
-            return None
-
-        def _filter_fields_by_measure_side(fields: list[str], side: str) -> list[str]:
-            # Keep only fields that belong to the requested side; ignore neutral/number fields.
-            kept = []
-            for f in fields:
-                tag = _field_side_tag(f)
-                if tag is None:
-                    # neutral fields (e.g. ':number:') should not appear in bilinear VOLUME terms
-                    continue
-                if tag == side:
-                    kept.append(f)
-            return kept
 
         mesh      = self.me.mesh
         level_set = integral.measure.level_set
@@ -2963,9 +2963,8 @@ class FormCompiler:
             return
 
         for eid in cut_ids:
-            # subset-sized local accumulator
-            loc = np.zeros((fld_local_idx.size,), dtype=float) if rhs else \
-                np.zeros((fld_local_idx.size, fld_local_idx.size), dtype=float)
+            # union-sized local accumulator (match the full-cell path)
+            loc = np.zeros(loc_shape_full, dtype=float)
 
             elem = mesh.elements_list[eid]
             tri_local, corner_ids = corner_tris(mesh, elem)
@@ -3002,24 +3001,25 @@ class FormCompiler:
 
                             if rhs:
                                 vec = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                                # Expect shape (n_loc,); if scalar sneaks in, ignore
-                                if vec.ndim == 1 and vec.size >= fld_local_idx.size:
-                                    loc += w * vec[fld_local_idx]
+                                # accept any union-sized vector
+                                if vec.ndim == 1 and vec.size >= self.me.n_dofs_local:
+                                    loc += w * vec
+                                elif vec.ndim == 2 and 1 in vec.shape: # case (1,n) or (n,1)
+                                    loc += w * vec.flatten()
+                                else:
+                                    # skip scalars or malformed
+                                    continue
                             else:
                                 mat = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                                # Expect shape (n_loc, n_loc); if scalar sneaks in, skip
+                                # accept any union-sized matrix
                                 if mat.ndim == 2 and mat.shape[0] >= self.me.n_dofs_local and mat.shape[1] >= self.me.n_dofs_local:
-                                    loc += w * mat[np.ix_(fld_local_idx, fld_local_idx)]
-                                elif mat.ndim == 2 and mat.shape[0] >= fld_local_idx.max(initial=-1)+1 and mat.shape[1] >= fld_local_idx.max(initial=-1)+1:
-                                    # fallback if visitor already gave a smaller union
-                                    loc += w * mat[np.ix_(fld_local_idx, fld_local_idx)]
+                                    loc += w * mat
                                 else:
-                                    # mat.ndim == 0 or shapes not as expected → nothing to add for this point
                                     continue
 
-            # fields-subset scatter
-            if loc.size:
-                self._scatter_local(eid, loc, fields=fields, matvec=matvec, rhs=rhs)
+            
+            # scatter full block (fields=None so indices match loc)
+            self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
 
         # cleanup
         for key in ("eid", "x_phys", "phi_val", "measure_side", "side"):

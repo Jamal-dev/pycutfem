@@ -42,7 +42,10 @@ class _NumberRef:
         return np.array([[0.0, 0.0]], dtype=float)
     
     def derivative(self, xi, eta, ox, oy):
-        return np.array([0.0], dtype=float)
+        if ox == 0 and oy == 0:
+            return np.array([1.0], dtype=float)
+        else:
+            return np.array([0.0], dtype=float)
 
 
 class MixedElement:
@@ -177,6 +180,10 @@ class MixedElement:
         phi = np.zeros(self.n_dofs_per_elem)
         sl = self.component_dof_slices[field]
         p  = self._field_orders[field]
+        # ---- SPECIAL CASE: 0th order == basis value (not "derivative") ----
+        if int(order_x) == 0 and int(order_y) == 0:
+            phi[sl] = self._eval_scalar_basis(field, float(xi), float(eta))
+            return phi
         if (order_x + order_y) <= 2:
             if self.mesh.element_type == "quad" and p == 1:
                 phi[sl] = _eval_deriv_q1(float(xi), float(eta), int(order_x), int(order_y))

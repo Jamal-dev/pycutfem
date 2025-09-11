@@ -1,4 +1,6 @@
 import numpy as np
+from pycutfem.core.sideconvention import SIDE
+
 try:
     import numba as _nb
     _HAVE_NUMBA = True
@@ -36,12 +38,14 @@ def clip_triangle_to_side(v_coords, v_phi, side='+', eps=0.0):
     phi = sgn * np.asarray(v_phi, dtype=float)
     V   = [np.asarray(v, dtype=float) for v in v_coords]
 
+    # Decide membership using the single source of truth:
     if side == '+':
-        keep = [i for i in range(3) if (+1.0)*v_phi[i] >= -eps]  # φ >= -eps
-        drop = [i for i in range(3) if (+1.0)*v_phi[i] <  -eps]
-    else:  # side == '-'
-        keep = [i for i in range(3) if (-1.0)*v_phi[i] >  eps]   # φ < -eps  (strict)
-        drop = [i for i in range(3) if (-1.0)*v_phi[i] <= eps]
+        keep = [i for i in range(3) if SIDE.is_pos(phi[i], tol=eps)]
+    elif side == "-":  # side == '-'
+        keep = [i for i in range(3) if SIDE.is_neg(phi[i], tol=eps)]
+    else:
+        raise ValueError("side must be '+' or '-'")    
+    drop = [i for i in range(3) if i not in keep]
 
     if len(keep) == 3:
         return [V]
@@ -66,19 +70,37 @@ def clip_triangle_to_side(v_coords, v_phi, side='+', eps=0.0):
 # -------------------- JIT versions of the geometric helpers ------------------
 if _HAVE_NUMBA:
     @_nb.njit(cache=True, fastmath=True)
-    def _clip_triangle_to_side_numba(V, phi, sgn, eps=0.0):
+    def _clip_triangle_to_side_numba(V, phi, sgn, eps=0.0,
+                                    pos_is_phi_nonnegative=True,
+                                    zero_to_pos=True):
         """
-        V: (3,2) float64, phi: (3,) float64, sgn=+1 for '+' side, -1 for '-' side.
-        Returns (poly_pts(4,2), n_pts:int). For triangle result n_pts=3; quad → 4; empty → 0.
+        V: (3,2), phi: (3,), sgn=+1 for requested '+' side, -1 for '−'.
+        pos_is_phi_nonnegative: if False, '+' means φ≤0 (flip mapping globally).
+        zero_to_pos: if True, φ≈0 belongs to '+', otherwise to '−'.
+        Returns (poly_pts(4,2), n_pts:int). For triangle n_pts=3; quad → 4; empty → 0.
         """
-        p = _nb.types.float64
-        # phi here is the raw v_phi; we compute phiX = sgn * v_phi[X]
-        phi0 = sgn*phi[0]; phi1 = sgn*phi[1]; phi2 = sgn*phi[2]
-        if sgn == 1.0:           # '+' side: keep φ >= -eps
-            keep0 = (phi0 >= -eps); keep1 = (phi1 >= -eps); keep2 = (phi2 >= -eps)
-        else:                    # '−' side: keep φ < -eps  (strict)
-            keep0 = (phi0 >  eps); keep1 = (phi1 >  eps); keep2 = (phi2 >  eps)
+        # Apply global mapping first: if '+' means φ<=0, flip φ once up front
+        sign_posmap = 1.0 if pos_is_phi_nonnegative else -1.0
+        sgn_eff     = sgn * sign_posmap
+
+        # Work with φ' = sgn_eff * φ so we always test "inside" against '+' logic below
+        phi0 = sgn_eff * phi[0]; phi1 = sgn_eff * phi[1]; phi2 = sgn_eff * phi[2]
+
+        # Decide inclusivity at zero by zero_to_pos:
+        #   if zero_to_pos: '+' keeps ≥ -eps, '−' keeps > eps
+        #   else          : '+' keeps >  eps, '−' keeps ≥ -eps
+        def keep_at(phi_val, side_is_plus):
+            if side_is_plus:
+                return (phi_val >= -eps) if zero_to_pos else (phi_val > eps)
+            else:
+                return (phi_val >  eps)  if zero_to_pos else (phi_val >= -eps)
+
+        side_is_plus = (sgn == 1.0)
+        keep0 = keep_at(phi0, side_is_plus)
+        keep1 = keep_at(phi1, side_is_plus)
+        keep2 = keep_at(phi2, side_is_plus)
         n_keep = (1 if keep0 else 0) + (1 if keep1 else 0) + (1 if keep2 else 0)
+
         out = np.empty((4, 2), dtype=np.float64)
         if n_keep == 3:
             out[0] = V[0]; out[1] = V[1]; out[2] = V[2]
@@ -86,7 +108,7 @@ if _HAVE_NUMBA:
         if n_keep == 0:
             return out, 0
 
-        # linear interpolation on an edge
+        # linear interpolation on an edge using raw φ (not φ') for correct intersection
         def _seg_inter(Pa, Pb, phia, phib):
             denom = (phia - phib)
             if abs(denom) < 1e-14:
@@ -98,29 +120,26 @@ if _HAVE_NUMBA:
             return np.array([Pa[0] + t*(Pb[0]-Pa[0]), Pa[1] + t*(Pb[1]-Pa[1])])
 
         if n_keep == 1:
-            # one vertex inside → triangle
-            if keep0:
-                K = 0; D1 = 1; D2 = 2; phK = phi0; phD1 = phi1; phD2 = phi2
-            elif keep1:
-                K = 1; D1 = 0; D2 = 2; phK = phi1; phD1 = phi0; phD2 = phi2
-            else:
-                K = 2; D1 = 0; D2 = 1; phK = phi2; phD1 = phi0; phD2 = phi1
-            I1 = _seg_inter(V[K], V[D1], phK, phD1)
-            I2 = _seg_inter(V[K], V[D2], phK, phD2)
+            if keep0:  K=0; D1=1; D2=2
+            elif keep1:K=1; D1=0; D2=2
+            else:      K=2; D1=0; D2=1
+            I1 = _seg_inter(V[K], V[D1], phi[K], phi[D1])
+            I2 = _seg_inter(V[K], V[D2], phi[K], phi[D2])
             out[0] = V[K]; out[1] = I1; out[2] = I2
             return out, 3
+
         # n_keep == 2 → quad
         if not keep0:
-            K1=1; K2=2; D=0; phK1=phi1; phK2=phi2; phD=phi0
+            K1=1; K2=2; D=0
         elif not keep1:
-            K1=0; K2=2; D=1; phK1=phi0; phK2=phi2; phD=phi1
+            K1=0; K2=2; D=1
         else:
-            K1=0; K2=1; D=2; phK1=phi0; phK2=phi1; phD=phi2
-        I1 = _seg_inter(V[K1], V[D], phK1, phD)  # on K1–D
-        I2 = _seg_inter(V[K2], V[D], phK2, phD)  # on K2–D
-        # Boundary order: K1 → I1 → I2 → K2
+            K1=0; K2=1; D=2
+        I1 = _seg_inter(V[K1], V[D], phi[K1], phi[D])
+        I2 = _seg_inter(V[K2], V[D], phi[K2], phi[D])
         out[0] = V[K1]; out[1] = I1; out[2] = I2; out[3] = V[K2]
         return out, 4
+
 
     @_nb.njit(cache=True, fastmath=True)
     def _fan_triangulate_numba(poly, n_pts):
