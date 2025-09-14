@@ -12,7 +12,7 @@ This version includes a comprehensive and granular set of tests to isolate
 specific operators (mass, stiffness, etc.) and regions (pos, neg, bulk, interface).
 
 Run:
-    python compare_with_ngsolve_refactored.py
+    python compare_with_ngsolve.py
 """
 
 import numpy as np
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 # ---------- PyCutFEM imports ----------
 from pycutfem.core.mesh import Mesh as pycutfem_Mesh
 from pycutfem.core.dofhandler import DofHandler
-from pycutfem.utils.meshgen import structured_quad
+from pycutfem.utils.meshgen import structured_quad, _structured_pk, structured_triangles
 from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.expressions import (
     VectorTrialFunction, VectorTestFunction, TrialFunction, TestFunction,
@@ -32,9 +32,11 @@ from pycutfem.ufl.expressions import (
 )
 from pycutfem.ufl.measures import dx as pycutfem_dx, dInterface as pycutfem_dInterface
 from pycutfem.ufl.forms import Equation, assemble_form
-from pycutfem.core.levelset import CircleLevelSet
+from pycutfem.core.levelset import CircleLevelSet, LevelSetGridFunction
 from pycutfem.fem.mixedelement import MixedElement
-
+from pycutfem.io.visualization import plot_mesh_2, add_measure_area_overlay, add_element_fill, add_element_outline, zoom_to_elements
+import matplotlib.pyplot as plt
+from pycutfem.utils.area_checks import per_element_circle_split_structured_quad
 # ---------- NGSolve / XFEM imports ----------
 from netgen.geom2d import SplineGeometry
 from ngsolve import *
@@ -60,24 +62,106 @@ def verdict(err, tol=1e-8):
 def term_header(title):
     print(f"\n=== {title} ===")
 
+def numerics_vs_analytic_by_elem(dh, level_set, R, center=(0.0, 0.0), q=6, print_top=10):
+    """
+    Augments each element row with numeric Apos/Aneg from the Python assembler,
+    adds d_pos/d_neg and a 'score', and returns rows sorted by score (desc).
+    """
+    from pycutfem.ufl.measures import dx
+    # if integrate_pc_constant_dx isn't in scope here, import it too:
+    # from your_module import integrate_pc_constant_dx
+    ONE = Constant(1.0)
+
+    rows = per_element_circle_split_structured_quad(dh.mixed_element.mesh, R, center=center)
+
+    for r in rows:
+        eid = int(r['eid'])
+        # POS (= outside), NEG (= inside) on this single element
+        dx_pos = dx(defined_on=[eid], level_set=level_set, metadata={'side': '+', 'q': q})
+        dx_neg = dx(defined_on=[eid], level_set=level_set, metadata={'side': '-', 'q': q})
+
+        Apos_num = float(integrate_pc_constant_dx(dh, ONE, dx_pos))
+        Aneg_num = float(integrate_pc_constant_dx(dh, ONE, dx_neg))
+
+        r['Apos_num'] = Apos_num
+        r['Aneg_num'] = Aneg_num
+        r['d_pos']    = Apos_num - r['Apos']
+        r['d_neg']    = Aneg_num - r['Aneg']
+        r['score']    = abs(r['d_pos']) + abs(r['d_neg'])
+
+    rows_sorted = sorted(rows, key=lambda r: r['score'], reverse=True)
+
+    if print_top:
+        print("\nTop element area mismatches (analytic vs assembled):")
+        for r in rows_sorted[:print_top]:
+            print(
+                f"eid={r['eid']:4d}  "
+                f"Aneg ana/num={r['Aneg']:.8f}/{r['Aneg_num']:.8f}  "
+                f"Apos ana/num={r['Apos']:.8f}/{r['Apos_num']:.8f}  "
+                f"d_neg={r['d_neg']:+.2e}  d_pos={r['d_pos']:+.2e}  "
+                f"score={r['score']:.2e}"
+            )
+
+    return rows_sorted
+
+
+
 # ---------- PyCutFEM Setup ----------
-def setup_pc(maxh=0.125, order=2, R=2.0/3.0):
+def setup_pc(maxh=0.125, order=2, R=2.0/3.0, L = 2.0, H = 2.0, level_set_order = 1, use_quad = False):
     """
     Prepares all necessary PyCutFEM components (mesh, spaces, functions, measures)
     and returns them in a dictionary without assembling any forms.
     """
-    L = H = 2.0
     nx = int(L / maxh)
-    nodes, elems, _, corners = structured_quad(
-        L, H, nx=nx, ny=nx, poly_order=1, offset=[-L/2, -H/2]
-    )
-    mesh = pycutfem_Mesh(nodes, elems, elements_corner_nodes=corners,
-                         element_type="quad", poly_order=1)
-    level_set = CircleLevelSet(center=(0.0, 0.0), radius=R)
+    geo_order = 1
+    if use_quad:
+        nodes, elems, _, corners = structured_quad(
+            L, H, nx=nx, ny=nx, poly_order=geo_order, offset=[-L/2, -H/2]
+        )
+        mesh = pycutfem_Mesh(nodes, elems, elements_corner_nodes=corners,
+                            element_type="quad", poly_order=geo_order)
+    else:
+        nodes, elems, _, corners = structured_triangles(
+            L, H, nx_quads=nx, ny_quads=nx, poly_order=geo_order, offset=[-L/2, -H/2]
+        )
+        mesh = pycutfem_Mesh(nodes, elems, elements_corner_nodes=corners,
+                            element_type="tri", poly_order=geo_order)
+    analytical_level_set = CircleLevelSet(center=(0.0, 0.0), radius=R)
 
-    mesh.classify_elements(level_set)
-    mesh.classify_edges(level_set)
-    mesh.build_interface_segments(level_set)
+    me = MixedElement(mesh, field_specs={
+        'u_pos_x': order, 'u_pos_y': order, 'p_pos_': order-1,
+        'u_neg_x': order, 'u_neg_y': order, 'p_neg_': order-1,
+        'lm': ':number:',
+        'phi': level_set_order # level set P1
+    })
+    dh = DofHandler(me, method='cg')
+    ls = LevelSetGridFunction(dh, field='phi')
+    ls.interpolate(lambda x,y: np.hypot(x,y) - R)  # initial condition
+    ls.commit()                                     # classify & build segments
+    # mesh.classify_elements(analytical_level_set)
+    # mesh.classify_edges(analytical_level_set)
+    # mesh.build_interface_segments(analytical_level_set)
+    rows = numerics_vs_analytic_by_elem(dh, ls, R, center=(0.0,0.0), q=6)
+
+    rows_sorted = sorted(rows, key=lambda r: abs(r['d_pos']) + abs(r['d_neg']), reverse=True)
+    bad_eids = [r['eid'] for r in rows_sorted[:10]]  # top 10 mismatches
+
+    # Plot base mesh (don’t show yet)
+    ax = plot_mesh_2(mesh, level_set=ls, show=False)
+
+    # Overlay highlights (fill + outline), then extend the legend
+    _, lh1 = add_element_fill(ax, mesh, bad_eids, facecolor=(1.0, 0.0, 0.0, 0.25), label="largest mismatch")
+    _, lh2 = add_element_outline(ax, mesh, bad_eids, edgecolor="black", linewidth=2.0, label="mismatch border")
+
+    # append to existing legend instead of replacing it
+    handles, labels = ax.get_legend_handles_labels()
+    for lh in (lh1, lh2):
+        if lh is not None:
+            handles.append(lh)
+    ax.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc="upper left")
+    # Optional: zoom in on the highlighted elements
+    zoom_to_elements(ax, mesh, bad_eids, pad=0.08)
+    plt.show()
 
     inside, outside, interface = (
         mesh.element_bitset("inside"),
@@ -87,12 +171,6 @@ def setup_pc(maxh=0.125, order=2, R=2.0/3.0):
     has_inside = inside | interface
     has_outside = outside | interface
     
-    me = MixedElement(mesh, field_specs={
-        'u_pos_x': order, 'u_pos_y': order, 'p_pos_': order-1,
-        'u_neg_x': order, 'u_neg_y': order, 'p_neg_': order-1,
-        'lm': ':number:'
-    })
-    dh = DofHandler(me, method='cg')
 
     Vpos = FunctionSpace("Vpos", ['u_pos_x','u_pos_y'], side='+')
     Vneg = FunctionSpace("Vneg", ['u_neg_x','u_neg_y'], side='-')
@@ -113,30 +191,33 @@ def setup_pc(maxh=0.125, order=2, R=2.0/3.0):
         'nL': TrialFunction(name='nL', field_name='lm', dof_handler=dh), 'mL': TestFunction(name='mL', field_name='lm', dof_handler=dh),
         # 'nL': Function(name='nL', field_name='lm', dof_handler=dh), 'mL': Function(name='mL', field_name='lm', dof_handler=dh),
         'es': es,
-        'level_set': level_set,
-        'dx_pos_all': pycutfem_dx(defined_on=has_outside, level_set=level_set, metadata={'side': '+', 'q': qvol}),
-        'dx_neg_all': pycutfem_dx(defined_on=has_inside, level_set=level_set, metadata={'side': '-', 'q': qvol}),
-        'dx_pos_bulk': pycutfem_dx(defined_on=outside, level_set=level_set, metadata={'side': '+', 'q': qvol}),
-        'dx_pos_iface': pycutfem_dx(defined_on=interface, level_set=level_set, metadata={'side': '+', 'q': qvol}),
-        'dx_neg_bulk': pycutfem_dx(defined_on=inside, level_set=level_set, metadata={'side': '-', 'q': qvol}),
-        'dx_neg_iface': pycutfem_dx(defined_on=interface, level_set=level_set, metadata={'side': '-', 'q': qvol}),
-        'dGamma': pycutfem_dInterface(defined_on=interface, level_set=level_set, metadata={'q': qvol}),
+        'level_set': ls,
+        'dx_pos_all': pycutfem_dx(defined_on=has_outside, level_set=ls, metadata={'side': '+', 'q': qvol}),
+        'dx_neg_all': pycutfem_dx(defined_on=has_inside, level_set=ls, metadata={'side': '-', 'q': qvol}),
+        'dx_pos_bulk': pycutfem_dx(defined_on=outside, level_set=ls, metadata={'side': '+', 'q': qvol}),
+        'dx_pos_iface': pycutfem_dx(defined_on=interface, level_set=ls, metadata={'side': '+', 'q': qvol}),
+        'dx_neg_bulk': pycutfem_dx(defined_on=inside, level_set=ls, metadata={'side': '-', 'q': qvol}),
+        'dx_neg_iface': pycutfem_dx(defined_on=interface, level_set=ls, metadata={'side': '-', 'q': qvol}),
+        'dGamma': pycutfem_dInterface(defined_on=interface, level_set=ls, metadata={'q': qvol}),
         'mu0': Constant(1.0), 'mu1': Constant(10.0), 'lam_val': 0.5*(1.0+10.0)*20*order**2,
     }
 
 
 # ---------- NGSolve Setup ----------
-def setup_ng(maxh=0.125, order=2, R=2.0/3.0, no_dirichlet=True):
+def setup_ng(maxh=0.125, order=2, R=2.0/3.0, no_dirichlet=True, L = 2.0, H = 2.0,level_set_order = 1, use_quad = False):
     """
     Prepares all necessary NGSolve components and returns them in a dictionary.
     """
     square = SplineGeometry()
-    square.AddRectangle((-1, -1), (1, 1), bcs=[1, 2, 3, 4])
-    mesh = Mesh(square.GenerateMesh(maxh=maxh, quad_dominated=True))
+    square.AddRectangle((-L/2.0, -H/2.0), (L/2.0, H/2.0), bcs=[1, 2, 3, 4])
+    if use_quad:
+        mesh = Mesh(square.GenerateMesh(maxh=maxh, quad_dominated=True))
+    else:
+        mesh = Mesh(square.GenerateMesh(maxh=maxh, quad_dominated=False))
 
     # Level-set
     levelset = sqrt(x**2 + y**2) - R
-    lsetp1 = GridFunction(H1(mesh,order=1))
+    lsetp1 = GridFunction(H1(mesh,order=level_set_order))
     InterpolateToP1(levelset, lsetp1)
     ci = CutInfo(mesh, lsetp1)
 
@@ -289,11 +370,12 @@ class NG_DX:
 # ---------- Runner ----------
 def main():
     maxh, order, R = 0.125, 2, 2.0/3.0
+    L, H = 2.0, 2.0
     
     # --- 1. Setup Phase ---
     print("Setting up PyCutFEM and NGSolve problems...")
-    pc_setup = setup_pc(maxh, order, R)
-    ng_setup = setup_ng(maxh, order, R)
+    pc_setup = setup_pc(maxh, order, R, L, H)
+    ng_setup = setup_ng(maxh, order, R, L, H)
     quad_order = 8
     pc_dx = PC_DX(quad_order, pc_setup['level_set'], pc_setup['es'])
     ng_dx = NG_DX(quad_order, ng_setup['lsetp1'], ng_setup['ci'])
@@ -332,79 +414,110 @@ def main():
     def eps_pc(u): return 0.5*(pc_grad(u)+pc_grad(u).T)
     def eps_ng(u): return 0.5*(Grad(u)+Grad(u).trans)
 
+
+    area_pos_pc = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_all()) 
+    area_pos_ng =  integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_all())
+    area_neg_pc = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_all())
+    area_neg_ng =  integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_all())
+    area_combined_pc = area_pos_pc + area_neg_pc
+    area_combined_ng = area_pos_ng + area_neg_ng
+    total_exact_area = L * H
+    exact_neg_area = np.pi * R**2
+    exact_pos_area = total_exact_area - exact_neg_area
+    print(f"PC Areas comparison: +ve Area diff: {area_pos_pc - exact_pos_area:+.2e}, -ve Area diff: {area_neg_pc - exact_neg_area:+.2e}, Combined Area diff: {area_combined_pc - total_exact_area:+.2e}")
+    print(f"NG Areas comparison: +ve Area diff: {area_pos_ng - exact_pos_area:+.2e}, -ve Area diff: {area_neg_ng - exact_neg_area:+.2e}, Combined Area diff: {area_combined_ng - total_exact_area:+.2e}")
+    err = srelerr(area_pos_pc, area_pos_ng)
+    print(f"Relative error (Area +ve): {err:+.2e}")
+
+
+
     # --- 2. Central Test Case Definitions ---
     TEST_CASES = {
-        # # --- Mass Matrices (u,v) ---
-        # "mass_pos": {
-        #     "description": "MASS (+) (u, v)", "type": "total",
-        #     "pc_form": pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_all(),
-        #     "ng_form": InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_all(),
-        # },
-        # "mass_neg": {
-        #     "description": "MASS (-) (u, v)", "type": "total",
-        #     "pc_form": pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_all(),
-        #     "ng_form": InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_all(),
-        # },
-        # "mass_combined": {
-        #     "description": "MASS (Combined) (u, v)", "type": "total",
-        #     "pc_form": (pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_all() +
-        #                 pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_all()),
-        #     "ng_form": (InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_all() +
-        #                 InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_all()),
-        # },
-        # "mass_scalar": {
-        #     "description": "MASS (Scalar) (p, q)", "type": "total",
-        #     "pc_form": (pc_setup['pp']*pc_setup['qp']*pc_dx.pos_all() + 
-        #                 pc_setup['pn']*pc_setup['qn']*pc_dx.neg_all()),
-        #     "ng_form": (ng_setup['p'][1]*ng_setup['q'][1]*ng_dx.pos_all() + 
-        #                 ng_setup['p'][0]*ng_setup['q'][0]*ng_dx.neg_all()),
-        # },
+        # --- Mass Matrices (u,v) ---
+        "mass_pos": {
+            "description": "MASS (+) (u, v)", "type": "total",
+            "pc_form": pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_all(),
+            "ng_form": InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_all(),
+        },
+        "mass_neg": {
+            "description": "MASS (-) (u, v)", "type": "total",
+            "pc_form": pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_all(),
+            "ng_form": InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_all(),
+        },
+        "mass_combined": {
+            "description": "MASS (Combined) (u, v)", "type": "total",
+            "pc_form": (pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_all() +
+                        pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_all()),
+            "ng_form": (InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_all() +
+                        InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_all()),
+        },
+        "mass_scalar_pos": {
+            "description": "MASS (Scalar) Positive (p, q)", "type": "total",
+            "pc_form": (pc_setup['pp']*pc_setup['qp']*pc_dx.pos_all()  
+                        ),
+            "ng_form": (ng_setup['p'][1]*ng_setup['q'][1]*ng_dx.pos_all()
+                        ),
+        },
+        "mass_scalar_neg": {
+            "description": "MASS (Scalar) Negative (p, q)", "type": "total",
+            "pc_form": (
+                        pc_setup['pn']*pc_setup['qn']*pc_dx.neg_all()),
+            "ng_form": (
+                        ng_setup['p'][0]*ng_setup['q'][0]*ng_dx.neg_all()),
+        },
+        "mass_scalar_combined": {
+            "description": "MASS (Scalar) Combined (p, q)", "type": "total",
+            "pc_form": (pc_setup['pp']*pc_setup['qp']*pc_dx.pos_all() + 
+                        pc_setup['pn']*pc_setup['qn']*pc_dx.neg_all()),
+            "ng_form": (ng_setup['p'][1]*ng_setup['q'][1]*ng_dx.pos_all() + 
+                        ng_setup['p'][0]*ng_setup['q'][0]*ng_dx.neg_all()),
+        },
 
-        # # --- Stiffness/Laplacian Matrices (grad(u), grad(v)) ---
-        # "stiffness_pos": {
-        #     "description": "STIFFNESS (+) (∇u:∇v)", "type": "total",
-        #     "pc_form": pc_inner(pc_grad(pc_setup['up']), pc_grad(pc_setup['vp'])) * pc_dx.pos_all(),
-        #     "ng_form": InnerProduct(Grad(ng_setup['u'][1]), Grad(ng_setup['v'][1])) * ng_dx.pos_all(),
-        # },
-        # "stiffness_neg": {
-        #     "description": "STIFFNESS (-) (∇u:∇v)", "type": "total",
-        #     "pc_form": pc_inner(pc_grad(pc_setup['un']), pc_grad(pc_setup['vn'])) * pc_dx.neg_all(),
-        #     "ng_form": InnerProduct(Grad(ng_setup['u'][0]), Grad(ng_setup['v'][0])) * ng_dx.neg_all(),
-        # },
+        # --- Stiffness/Laplacian Matrices (grad(u), grad(v)) ---
+        "stiffness_pos": {
+            "description": "STIFFNESS (+) (∇u:∇v)", "type": "total",
+            "pc_form": pc_inner(pc_grad(pc_setup['up']), pc_grad(pc_setup['vp'])) * pc_dx.pos_all(),
+            "ng_form": InnerProduct(Grad(ng_setup['u'][1]), Grad(ng_setup['v'][1])) * ng_dx.pos_all(),
+        },
+        "stiffness_neg": {
+            "description": "STIFFNESS (-) (∇u:∇v)", "type": "total",
+            "pc_form": pc_inner(pc_grad(pc_setup['un']), pc_grad(pc_setup['vn'])) * pc_dx.neg_all(),
+            "ng_form": InnerProduct(Grad(ng_setup['u'][0]), Grad(ng_setup['v'][0])) * ng_dx.neg_all(),
+        },
 
-        # # --- Full Volume/Elasticity Terms (eps(u), eps(v)) ---
-        # "volume_pos": {
-        #     "description": "VOLUME (+) (2μ ε:ε)", "type": "total",
-        #     "pc_form": 2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_all(),
-        #     "ng_form": 2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_all(),
-        # },
-        # "volume_neg": {
-        #     "description": "VOLUME (-) (2μ ε:ε)", "type": "total",
-        #     "pc_form": 2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_all(),
-        #     "ng_form": 2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_all(),
-        # },
-        # "volume_combined": {
-        #     "description": "VOLUME (Combined) (2μ ε:ε)", "type": "total",
-        #     "parent_of_split": "volume_split", # Link to the corresponding split test
-        #     "pc_form": (2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_all() + 
-        #                 2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_all()),
-        #     "ng_form": (2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_all() +
-        #                 2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_all()),
-        # },
+        # --- Full Volume/Elasticity Terms (eps(u), eps(v)) ---
+        "volume_pos": {
+            "description": "VOLUME (+) (2μ ε:ε)", "type": "total",
+            "pc_form": 2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_all(),
+            "ng_form": 2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_all(),
+        },
+        "volume_neg": {
+            "description": "VOLUME (-) (2μ ε:ε)", "type": "total",
+            "pc_form": 2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_all(),
+            "ng_form": 2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_all(),
+        },
+        "volume_combined": {
+            "description": "VOLUME (Combined) (2μ ε:ε)", "type": "total",
+            "parent_of_split": "volume_split", # Link to the corresponding split test
+            "pc_form": (2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_all() + 
+                        2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_all()),
+            "ng_form": (2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_all() +
+                        2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_all()),
+        },
 
-        # # --- Divergence/Pressure Terms ---
-        # "divu_q": {
-        #     "description": "DIVU_Q (-div(u)·q)", "type": "total",
-        #     "parent_of_split": "divu_q_split",
-        #     "pc_form": (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_all() + (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_all(),
-        #     "ng_form": (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_all() + (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_all(),
-        # },
-        # "divv_p": {
-        #     "description": "DIVV_P (-div(v)·p)", "type": "total",
-        #     "parent_of_split": "divv_p_split",
-        #     "pc_form": (-pc_div(pc_setup['vp'])*pc_setup['pp'])*pc_dx.pos_all() + (-pc_div(pc_setup['vn'])*pc_setup['pn'])*pc_dx.neg_all(),
-        #     "ng_form": (-div(ng_setup['v'][1])*ng_setup['p'][1])*ng_dx.pos_all() + (-div(ng_setup['v'][0])*ng_setup['p'][0])*ng_dx.neg_all(),
-        # },
+        # --- Divergence/Pressure Terms ---
+        "divu_q": {
+            "description": "DIVU_Q (-div(u)·q)", "type": "total",
+            "parent_of_split": "divu_q_split",
+            "pc_form": (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_all() + (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_all(),
+            "ng_form": (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_all() + (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_all(),
+        },
+        "divv_p": {
+            "description": "DIVV_P (-div(v)·p)", "type": "total",
+            "parent_of_split": "divv_p_split",
+            "pc_form": (-pc_div(pc_setup['vp'])*pc_setup['pp'])*pc_dx.pos_all() + (-pc_div(pc_setup['vn'])*pc_setup['pn'])*pc_dx.neg_all(),
+            "ng_form": (-div(ng_setup['v'][1])*ng_setup['p'][1])*ng_dx.pos_all() + (-div(ng_setup['v'][0])*ng_setup['p'][0])*ng_dx.neg_all(),
+        },
         # --- Mean Terms ---
         "mean_split_pos_1": {
             "description": "MEAN (n *q dx_neg)", "type": "total",
@@ -507,61 +620,61 @@ def main():
             "ng_form": (integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_iface()) +
                         integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_iface())),
         },
-        # # --- Interface/Penalty Terms ---
-        # "nitsche": {
-        #     "description": "NITSCHE (jump penalty)", "type": "total",
-        #     "pc_form": (Constant(pc_setup['lam_val'])/Constant(maxh)) * pc_dot(pc_jump(pc_setup['up'],pc_setup['un']), pc_jump(pc_setup['vp'],pc_setup['vn'])) * pc_dx.dGamma(),
-        #     "ng_form": (ng_setup['lam_val']/maxh) * (ng_setup['u'][0]-ng_setup['u'][1])*(ng_setup['v'][0]-ng_setup['v'][1]) * ng_dx.dGamma(),
-        # },
+        # --- Interface/Penalty Terms ---
+        "nitsche": {
+            "description": "NITSCHE (jump penalty)", "type": "total",
+            "pc_form": (Constant(pc_setup['lam_val'])/Constant(maxh)) * pc_dot(pc_jump(pc_setup['up'],pc_setup['un']), pc_jump(pc_setup['vp'],pc_setup['vn'])) * pc_dx.dGamma(),
+            "ng_form": (ng_setup['lam_val']/maxh) * (ng_setup['u'][0]-ng_setup['u'][1])*(ng_setup['v'][0]-ng_setup['v'][1]) * ng_dx.dGamma(),
+        },
         
-        # # --- ================================== ---
-        # # --- Split-by-Region Versions of Terms ---
-        # # --- ================================== ---
-        # "mass_split": {
-        #     "description": "MASS (u,v)", "type": "split", "parent": "mass_combined",
-        #     "pc_forms": {
-        #         ("pos","bulk"):    pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_bulk(),
-        #         ("pos","interface"): pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_iface(),
-        #         ("neg","bulk"):    pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_bulk(),
-        #         ("neg","interface"): pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_iface(),
-        #     },
-        #     "ng_forms": {
-        #         ("pos","bulk"):    InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_bulk(),
-        #         ("pos","interface"): InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_iface(),
-        #         ("neg","bulk"):    InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_bulk(),
-        #         ("neg","interface"): InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_iface(),
-        #     },
-        # },
-        # "volume_split": {
-        #     "description": "VOLUME (2μ ε:ε)", "type": "split", "parent": "volume_combined",
-        #     "pc_forms": {
-        #         ("pos","bulk"):    2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_bulk(),
-        #         ("pos","interface"): 2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_iface(),
-        #         ("neg","bulk"):    2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_bulk(),
-        #         ("neg","interface"): 2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_iface(),
-        #     },
-        #     "ng_forms": {
-        #         ("pos","bulk"):    2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_bulk(),
-        #         ("pos","interface"): 2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_iface(),
-        #         ("neg","bulk"):    2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_bulk(),
-        #         ("neg","interface"): 2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_iface(),
-        #     },
-        # },
-        # "divu_q_split": {
-        #     "description": "DIVU_Q", "type": "split", "parent": "divu_q",
-        #     "pc_forms": {
-        #         ("pos","bulk"):   (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_bulk(),
-        #         ("pos","interface"): (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_iface(),
-        #         ("neg","bulk"):   (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_bulk(),
-        #         ("neg","interface"): (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_iface(),
-        #     },
-        #     "ng_forms": {
-        #         ("pos","bulk"):   (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_bulk(),
-        #         ("pos","interface"): (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_iface(),
-        #         ("neg","bulk"):   (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_bulk(),
-        #         ("neg","interface"): (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_iface(),
-        #     },
-        # },
+        # --- ================================== ---
+        # --- Split-by-Region Versions of Terms ---
+        # --- ================================== ---
+        "mass_split": {
+            "description": "MASS (u,v)", "type": "split", "parent": "mass_combined",
+            "pc_forms": {
+                ("pos","bulk"):    pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_bulk(),
+                ("pos","interface"): pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_iface(),
+                ("neg","bulk"):    pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_bulk(),
+                ("neg","interface"): pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_iface(),
+            },
+            "ng_forms": {
+                ("pos","bulk"):    InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_bulk(),
+                ("pos","interface"): InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_iface(),
+                ("neg","bulk"):    InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_bulk(),
+                ("neg","interface"): InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_iface(),
+            },
+        },
+        "volume_split": {
+            "description": "VOLUME (2μ ε:ε)", "type": "split", "parent": "volume_combined",
+            "pc_forms": {
+                ("pos","bulk"):    2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_bulk(),
+                ("pos","interface"): 2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_iface(),
+                ("neg","bulk"):    2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_bulk(),
+                ("neg","interface"): 2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_iface(),
+            },
+            "ng_forms": {
+                ("pos","bulk"):    2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_bulk(),
+                ("pos","interface"): 2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_iface(),
+                ("neg","bulk"):    2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_bulk(),
+                ("neg","interface"): 2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_iface(),
+            },
+        },
+        "divu_q_split": {
+            "description": "DIVU_Q", "type": "split", "parent": "divu_q",
+            "pc_forms": {
+                ("pos","bulk"):   (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_bulk(),
+                ("pos","interface"): (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_iface(),
+                ("neg","bulk"):   (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_bulk(),
+                ("neg","interface"): (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_iface(),
+            },
+            "ng_forms": {
+                ("pos","bulk"):   (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_bulk(),
+                ("pos","interface"): (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_iface(),
+                ("neg","bulk"):   (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_bulk(),
+                ("neg","interface"): (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_iface(),
+            },
+        },
     }
 
     # --- 3. Execution Phase ---

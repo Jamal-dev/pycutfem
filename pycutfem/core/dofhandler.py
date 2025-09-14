@@ -3219,7 +3219,7 @@ class DofHandler:
 
                 # clip triangle to requested side and fan-triangulate
                 if _HAVE_NUMBA:
-                    poly, n_pts = _clip_triangle_to_side_numba(V, v_phi, sgn,
+                    poly, n_pts = _clip_triangle_to_side_numba(V, v_phi, sgn,0,
                                 SIDE.pos_is_phi_nonnegative,
                                 SIDE.zero_belongs_to_pos
                             )
@@ -3775,7 +3775,7 @@ class DofHandler:
         from pycutfem.ufl.helpers_geom import (
             corner_tris, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, phi_eval
         )
-        from pycutfem.ufl.expressions import VectorFunction as _VF, Function as _SF
+        from pycutfem.ufl.expressions import VectorFunction as _VF, Function as Function
 
         mesh = self.mixed_element.mesh
         me   = self.mixed_element
@@ -3849,7 +3849,7 @@ class DofHandler:
             raise ValueError("error mode requires 'function', 'field', and 'exact_grad'.")
 
         # Both Function and VectorFunction expose .get_nodal_values(gd)
-        if not isinstance(function, (_VF, _SF)):
+        if not isinstance(function, (_VF, Function)):
             raise TypeError("Unsupported 'function' type for H1 error.")
         get_vals = function.get_nodal_values
 
@@ -3912,7 +3912,7 @@ class DofHandler:
         where u_exact_interp is the FE nodal interpolation of piecewise exact values:
         node in φ<0 → use exact_neg; node in φ>0 → use exact_pos.
         """
-        from pycutfem.ufl.expressions import VectorFunction as _VF, Function as _SF
+        from pycutfem.ufl.expressions import VectorFunction as _VF, Function as Function
 
         if not hasattr(u_h, "field_names"):
             raise TypeError("_build_vector_diff_from_exact expects a VectorFunction.")

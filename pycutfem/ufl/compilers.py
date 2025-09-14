@@ -71,7 +71,7 @@ from pycutfem.core.sideconvention import SIDE
 
 
 logger = logging.getLogger(__name__)
-_INTERFACE_TOL = 1.0e-12 # New
+_INTERFACE_TOL = SIDE.tol
 
 def interface_normal_for_edge(mesh, e, level_set):
     # mid-point on the physical edge
@@ -447,10 +447,7 @@ class FormCompiler:
         if self._on_sided_path():
             bv = self.ctx.get("basis_values")
             if isinstance(bv, dict):
-                side = self.ctx.get("side")
-                if side not in ('+','-'):
-                    # fall back to measure-side if present, never to 'phi >= 0' here
-                    side = self.ctx.get("measure_side", "")
+                side = self._active_side()
                 if side in ('+','-'):
                     val = bv[side][fld].get((0, 0))
                     if val is not None:
@@ -697,7 +694,7 @@ class FormCompiler:
         side_old = self.ctx.get('side', None)
         eid_old  = self.ctx.get('eid', None)
         try:
-            self.ctx['phi_val'] = +1.0 if side == '+' else -1.0
+            # self.ctx['phi_val'] = +1.0 if side == '+' else -1.0
             self.ctx['side']    = side
             if eid_key in self.ctx:
                 self.ctx['eid'] = int(self.ctx[eid_key])
@@ -1858,7 +1855,7 @@ class FormCompiler:
                 # Optional: per-field side masks (+/−) based on φ at DOF coordinates
                 try:
                     pos_mask_by_field, neg_mask_by_field = _hfa.build_side_masks_by_field(
-                        self.dh, fields, eid, level_set, tol=0.0
+                        self.dh, fields, eid, level_set, tol=SIDE.tol
                     )
                 except Exception:
                     pos_mask_by_field, neg_mask_by_field = {}, {}
@@ -1880,7 +1877,11 @@ class FormCompiler:
                     self.ctx['x_phys'] = xq
                     # On Γ; let Pos/Neg set ctx['side'], but keep phi_val ~ 0 for any gating
                     self.ctx['phi_val'] = 0.0
-                    g = level_set.gradient(xq)
+                    if hasattr(level_set, 'gradient_on_element'):
+                        xi, eta = transform.inverse_mapping(mesh, eid, xq)   # use the *known* element
+                        g = level_set.gradient_on_element(eid, (float(xi), float(eta)))
+                    else:
+                        g = level_set.gradient(xq)
                     self.ctx['normal'] = g / (np.linalg.norm(g) + 1e-30)
                     self.ctx['basis_values'] = {}  # per-QP, per-side cache for _basis_row
 
@@ -2791,6 +2792,8 @@ class FormCompiler:
         from pycutfem.ufl.helpers_geom import (
             phi_eval, corner_tris, clip_triangle_to_side,
             fan_triangulate, map_ref_tri_to_phys,
+            clip_triangle_to_side_pn, clip_cell_to_side,
+            curved_subcell_quadrature_for_cut_triangle
         )
 
         mesh      = self.me.mesh
@@ -2798,7 +2801,7 @@ class FormCompiler:
         if level_set is None:
             raise ValueError("Cut-cell volume assembly requires measure.level_set")
 
-        side   = integral.measure.metadata.get('side', '+')  # '+' → φ≥0, '-' → φ≤0
+        side   = integral.measure.metadata.get('side', '')  # '+' → φ≥0, '-' → φ≤0
         rhs    = self.ctx.get("rhs", False)
         fields = self._fields_for(integral.integrand)
         # fields     = _filter_fields_by_measure_side(fields_all, side)
@@ -2831,7 +2834,7 @@ class FormCompiler:
         # context flags for visitors
         self.ctx["is_interface"] = False
         self.ctx["is_ghost"]     = False
-        self.ctx["measure_side"] = side
+        # self.ctx["measure_side"] = side
         # default φ sign (used on full cells)
         self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
 
@@ -2862,64 +2865,22 @@ class FormCompiler:
 
         # local block shape for FULL cells (union-sized; visitor returns union size)
         loc_shape_full = (self.me.n_dofs_local,) if rhs else (self.me.n_dofs_local, self.me.n_dofs_local)
-
-        # ----------------------------
-        # Functional path (no test/trial)
-        # ----------------------------
-        if is_pure_functional:
-            acc = 0.0
-
-            # 1) FULL elements on requested side
-            full_eids = outside_ids if side == '+' else inside_ids
-            for eid in full_eids:
-                for (xi, eta), w in zip(qp_ref, qw_ref):
-                    J    = transform.jacobian(mesh, eid, (xi, eta))
-                    detJ = abs(np.linalg.det(J))
-
-                    self.ctx["eid"]          = eid
-                    self.ctx["x_phys"]       = transform.x_mapping(mesh, eid, (xi, eta))
-                    self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
-                    self.ctx["measure_side"] = side
-                    self.ctx["side"]         = side
-
-                    val = self._visit(integral.integrand)
-                    arr = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                    v   = float(arr if arr.ndim == 0 else arr.sum())
-                    acc += (w * detJ) * v
-
-            # 2) CUT elements: integrate physical sub-triangles (weights already include area)
-            for eid in cut_ids:
-                elem = mesh.elements_list[eid]
-                tri_local, corner_ids = corner_tris(mesh, elem)
-
-                for loc_tri in tri_local:
-                    v_ids    = [corner_ids[i] for i in loc_tri]
-                    v_coords = mesh.nodes_x_y_pos[v_ids]  # (3,2)
-                    v_phi    = np.array([phi_eval(level_set, xy) for xy in v_coords], float)
-
-                    polygons = clip_triangle_to_side(v_coords, v_phi, side=side)
-                    for poly in polygons:
-                        for A, B, C in fan_triangulate(poly):
-                            qp_phys, qw_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)
-                            for x_phys, w in zip(qp_phys, qw_phys):
-                                self.ctx["eid"]          = eid
-                                self.ctx["x_phys"]       = x_phys
-                                self.ctx["phi_val"]      = phi_eval(level_set, x_phys)
-                                self.ctx["measure_side"] = side
-                                self.ctx["side"]         = side
-
-                                val = self._visit(integral.integrand)
-                                arr = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                                v   = float(arr if arr.ndim == 0 else arr.sum())
-                                acc += w * v   # w already includes physical area
-
-            if accumulate_scalar:
-                self.ctx['scalar_results'][hook['name']] += acc
-
-            # nothing to scatter for a pure functional
-            for key in ("eid", "x_phys", "phi_val", "measure_side", "side"):
-                self.ctx.pop(key, None)
-            return
+        def phi_list_3(level_set, V, v_ids):
+            if hasattr(level_set, "dh") and hasattr(level_set, "field"):
+                node_map = level_set.dh.dof_map.get(level_set.field, {})
+                g2l      = getattr(level_set._f, "_g2l", {})
+                nv       = level_set._f.nodal_values
+                v_phi    = np.empty(3, float)
+                for j, nid in enumerate(v_ids):  # mesh node ids for the tri’s vertices
+                    gd = node_map.get(int(nid))
+                    if gd is not None and gd in g2l:
+                        v_phi[j] = float(nv[g2l[gd]])
+                    else:
+                        v_phi[j] = float(phi_eval(level_set, V[j]))    # rare fallback
+            else:
+                v_phi = [phi_eval(level_set, V[i]) for i in range(3)]
+            return v_phi
+        
 
         # ----------------------------
         # Matrix / Vector path
@@ -2927,7 +2888,10 @@ class FormCompiler:
 
         # --- 1) FULL elements on requested side (union-sized loc, scatter fields=None)
         full_eids = outside_ids if side == '+' else inside_ids
+        if is_pure_functional:
+            acc = 0.0
         for eid in full_eids:
+
             loc = np.zeros(loc_shape_full, dtype=float)
 
             for (xi, eta), w in zip(qp_ref, qw_ref):
@@ -2950,10 +2914,16 @@ class FormCompiler:
                 # self.ctx["side"]         = None
 
                 val = self._visit(integral.integrand)
-                loc += (w * detJ) * val  # val is union-sized block/vector
+                arr = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                if is_pure_functional:
+                    v = float(arr if arr.ndim == 0 else arr.sum())
+                    acc += (w * detJ) * v
+                else:
+                    loc += (w * detJ) * val  # val is union-sized block/vector
 
             # scatter against ALL element DOFs to match loc's full size
-            self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
+            if not is_pure_functional:
+                self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
 
         # --- 2) CUT elements: subset-sized loc, scatter fields=fields
         if fld_local_idx.size == 0 or len(fields) == 0:
@@ -2965,62 +2935,65 @@ class FormCompiler:
         for eid in cut_ids:
             # union-sized local accumulator (match the full-cell path)
             loc = np.zeros(loc_shape_full, dtype=float)
-
+            # polygons = clip_cell_to_side(mesh, eid, level_set, side=side, eps=_INTERFACE_TOL)
             elem = mesh.elements_list[eid]
             tri_local, corner_ids = corner_tris(mesh, elem)
 
             for loc_tri in tri_local:
                 v_ids    = [corner_ids[i] for i in loc_tri]
-                v_coords = mesh.nodes_x_y_pos[v_ids]
-                v_phi    = np.array([phi_eval(level_set, xy) for xy in v_coords], float)
+                # v_coords = mesh.nodes_x_y_pos[v_ids]
+                # v_phi = np.asarray(phi_list_3(level_set, v_coords, v_ids), dtype=float)
 
-                polygons = clip_triangle_to_side(v_coords, v_phi, side=side)
-                for poly in polygons:
-                    for A, B, C in fan_triangulate(poly):
-                        qp_phys, qw_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)
+                # polygons = clip_triangle_to_side(v_coords, v_phi, 
+                #                                  side=side, eps=_INTERFACE_TOL)
+                qx, qw = curved_subcell_quadrature_for_cut_triangle(
+                    mesh, eid, loc_tri, corner_ids, level_set,
+                    side=side, qvol=q_order, nseg_hint=None, tol=_INTERFACE_TOL
+                )
 
-                        for x_phys, w in zip(qp_phys, qw_phys):
-                            xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
-                            J  = transform.jacobian(mesh, eid, (xi, eta))
-                            Ji = np.linalg.inv(J)
+                for x_phys, w in zip(qx, qw):
+                    xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
+                    J  = transform.jacobian(mesh, eid, (xi, eta))
+                    Ji = np.linalg.inv(J)
 
-                            self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
-                            for f in fields:
-                                self._basis_cache[f] = {
-                                    "val":  self.me.basis(f, xi, eta),
-                                    "grad": self.me.grad_basis(f, xi, eta) @ Ji,
-                                }
+                    # prepare basis/grad only for the fields actually used
+                    self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
+                    for f in fields:
+                        self._basis_cache[f] = {
+                            "val":  self.me.basis(f, xi, eta),
+                            "grad": self.me.grad_basis(f, xi, eta) @ Ji,
+                        }
 
-                            self.ctx["eid"]          = eid
-                            self.ctx["x_phys"]       = x_phys
-                            self.ctx["phi_val"]      = phi_eval(level_set, x_phys)
-                            self.ctx["measure_side"] = side
-                            self.ctx["side"]         = side
+                    self.ctx["eid"]          = eid
+                    self.ctx["x_phys"]       = x_phys
+                    self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
+                    self.ctx["measure_side"] = side
+                    self.ctx["side"]         = side
 
-                            val = self._visit(integral.integrand)
+                    val = self._visit(integral.integrand)
 
-                            if rhs:
-                                vec = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                                # accept any union-sized vector
-                                if vec.ndim == 1 and vec.size >= self.me.n_dofs_local:
-                                    loc += w * vec
-                                elif vec.ndim == 2 and 1 in vec.shape: # case (1,n) or (n,1)
-                                    loc += w * vec.flatten()
-                                else:
-                                    # skip scalars or malformed
-                                    continue
-                            else:
-                                mat = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
-                                # accept any union-sized matrix
-                                if mat.ndim == 2 and mat.shape[0] >= self.me.n_dofs_local and mat.shape[1] >= self.me.n_dofs_local:
-                                    loc += w * mat
-                                else:
-                                    continue
+                    if is_pure_functional:
+                        arr = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                        v   = float(arr if arr.ndim == 0 else arr.sum())
+                        acc += w * v                     # **w is already a physical weight**
+                    elif rhs:
+                        vec = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                        if 1 in vec.shape:
+                            vec = vec.flatten()
+                        loc += w * vec
+                    else:
+                        mat = np.asarray(val.data) if hasattr(val, "data") else np.asarray(val)
+                        loc += w * mat
+
+                
 
             
             # scatter full block (fields=None so indices match loc)
-            self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
+            if not is_pure_functional:
+                self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
 
+        if accumulate_scalar:
+                self.ctx['scalar_results'][hook['name']] += acc
         # cleanup
         for key in ("eid", "x_phys", "phi_val", "measure_side", "side"):
             self.ctx.pop(key, None)

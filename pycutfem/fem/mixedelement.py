@@ -132,6 +132,11 @@ class MixedElement:
         self.n_union_dg = sum(2*self._n_basis[f]                      for f in self.field_names)
 
     
+    def _ensure_many_cache(self):
+        if not hasattr(self, "_tab_many_cache"):
+            # (field, kind, nqp, xi.tobytes(), eta.tobytes()) -> np.ndarray
+            self._tab_many_cache = {}
+
     def union_dofs(self, method: str = "cg") -> int:
         """Return the ghost‑edge union size for 'cg' or 'dg' numbering."""
         return self.n_union_cg if method == "cg" else self.n_union_dg
@@ -143,6 +148,54 @@ class MixedElement:
     def _eval_scalar_grad(self, field: str, xi: float, eta: float) -> np.ndarray:
         """Return the gradient of the scalar basis functions for `field`."""
         return self._ref[field].grad(xi, eta)
+    def _eval_scalar_basis_many(self, field: str, xi_arr, eta_arr):
+        """
+        Stack shape functions at many reference points.
+        Returns (n_qp, n_loc_field).
+        """
+        self._ensure_many_cache()
+        xi  = np.asarray(xi_arr, dtype=float).ravel()
+        eta = np.asarray(eta_arr, dtype=float).ravel()
+        if xi.shape != eta.shape:
+            raise ValueError("xi/eta must have same shape")
+        nqp = xi.size
+        key = (field, "basis", nqp, xi.tobytes(), eta.tobytes())
+        hit = self._tab_many_cache.get(key)
+        if hit is not None:
+            return hit
+
+        # one local to get n_loc
+        n_loc = len(self._eval_scalar_basis(field, float(xi[0]), float(eta[0])))
+        out = np.empty((nqp, n_loc), dtype=float)
+        # small nqp (e.g. 1..16) → tight Python loop is fine & cacheable
+        for i in range(nqp):
+            out[i, :] = self._eval_scalar_basis(field, float(xi[i]), float(eta[i]))
+        self._tab_many_cache[key] = out
+        return out
+
+    # --- add: vectorized reference-grad over many (xi,eta) ---
+    def _eval_scalar_grad_many(self, field: str, xi_arr, eta_arr):
+        """
+        Stack reference gradients at many points.
+        Returns (n_qp, n_loc_field, 2) with columns (d/dξ, d/dη).
+        """
+        self._ensure_many_cache()
+        xi  = np.asarray(xi_arr, dtype=float).ravel()
+        eta = np.asarray(eta_arr, dtype=float).ravel()
+        if xi.shape != eta.shape:
+            raise ValueError("xi/eta must have same shape")
+        nqp = xi.size
+        key = (field, "grad", nqp, xi.tobytes(), eta.tobytes())
+        hit = self._tab_many_cache.get(key)
+        if hit is not None:
+            return hit
+
+        n_loc = len(self._eval_scalar_basis(field, float(xi[0]), float(eta[0])))
+        out = np.empty((nqp, n_loc, 2), dtype=float)
+        for i in range(nqp):
+            out[i, :, :] = self._eval_scalar_grad(field, float(xi[i]), float(eta[i]))
+        self._tab_many_cache[key] = out
+        return out
     def _eval_scalar_deriv(self, field: str, xi: float, eta: float,order_x:int, order_y:int ):
         """Return the derivative of the scalar basis functions for `field`.
            order_x =1, order_y=1 would be ∂^2φ/∂eta∂xi

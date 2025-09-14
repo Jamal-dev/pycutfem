@@ -4,6 +4,11 @@ from matplotlib.collections import LineCollection, PolyCollection
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from typing import Union, List
+from pycutfem.ufl.helpers_geom import (corner_tris, 
+                                       clip_triangle_to_side, 
+                                       fan_triangulate,
+                                       clip_triangle_to_side_pn)
+from pycutfem.core.sideconvention import SIDE
 
 
 
@@ -254,17 +259,63 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
     # --- END MODIFIED SECTION ---
 
     if level_set is not None:
-        xmin, ymin = node_coords.min(axis=0); xmax, ymax = node_coords.max(axis=0)
-        padding = (xmax-xmin)*0.1 if xmax > xmin else 0.1
-        gx, gy = np.meshgrid(np.linspace(xmin-padding, xmax+padding, resolution),
-                             np.linspace(ymin-padding, ymax+padding, resolution))
+        # Fast FE path: use nodal φ and a mesh-based triangulation (no owner searches)
+        if hasattr(level_set, "evaluate_on_nodes") and callable(getattr(level_set, "evaluate_on_nodes")):
+            import matplotlib.tri as mtri
 
-        points_to_eval = np.c_[gx.ravel(), gy.ravel()]
-        phi_vals = np.apply_along_axis(level_set.__call__, 1, points_to_eval).reshape(gx.shape)
+            # 1) φ at mesh nodes (fast for FE-backed level set)
+            phi_nodes = np.asarray(level_set.evaluate_on_nodes(mesh), dtype=float)
 
-        contour = ax.contour(gx, gy, phi_vals, levels=[0.0], colors='green', linewidths=2.5, zorder=5)
-        if len(contour.allsegs[0]) > 0:
-            legend_handles.append(plt.Line2D([0], [0], color='green', lw=2, label='Level Set (φ=0)'))
+            # If any NaNs slipped through, fill them via point-eval (rare)
+            if np.isnan(phi_nodes).any():
+                miss = np.isnan(phi_nodes)
+                phi_nodes[miss] = np.array(
+                    [float(level_set(node_coords[i])) for i in np.where(miss)[0]],
+                    dtype=float
+                )
+
+            # 2) Build a triangulation of the mesh using corner nodes
+            #    Quads are split along the (0–2) diagonal to match NGSolve.
+            tris_idx = []
+            for e in mesh.elements_list:
+                cn = list(e.corner_nodes)
+                if len(cn) == 3:                       # triangle
+                    tris_idx.append(cn)
+                elif len(cn) == 4:                     # quad → two tris via (0–2)
+                    tris_idx.append([cn[0], cn[1], cn[2]])
+                    tris_idx.append([cn[0], cn[2], cn[3]])
+                else:
+                    # Ignore polygons of other arity in this visualization
+                    continue
+
+            tri = mtri.Triangulation(node_coords[:, 0], node_coords[:, 1],
+                                     np.asarray(tris_idx, dtype=int))
+
+            # 3) φ=0 contour directly from nodal values (fast & accurate for P1/P2)
+            contour = ax.tricontour(tri, phi_nodes, levels=[0.0],
+                                    colors='green', linewidths=2.5, zorder=5)
+            if contour.allsegs and len(contour.allsegs[0]) > 0:
+                legend_handles.append(plt.Line2D([0], [0], color='green', lw=2,
+                                                 label='Level Set (φ=0)'))
+        else:
+            # Fallback (analytic/unknown LS): sample on a grid (slower)
+            xmin, ymin = node_coords.min(axis=0); xmax, ymax = node_coords.max(axis=0)
+            padding = (xmax - xmin) * 0.1 if xmax > xmin else 0.1
+            gx, gy = np.meshgrid(
+                np.linspace(xmin - padding, xmax + padding, resolution),
+                np.linspace(ymin - padding, ymax + padding, resolution)
+            )
+
+            pts = np.c_[gx.ravel(), gy.ravel()]
+            # Keep your original per-point evaluation for maximum compatibility
+            phi_vals = np.apply_along_axis(level_set.__call__, 1, pts).reshape(gx.shape)
+
+            contour = ax.contour(gx, gy, phi_vals, levels=[0.0],
+                                 colors='green', linewidths=2.5, zorder=5)
+            if contour.allsegs and len(contour.allsegs[0]) > 0:
+                legend_handles.append(plt.Line2D([0], [0], color='green', lw=2,
+                                                 label='Level Set (φ=0)'))
+
 
     if plot_interface:
         all_pts, segments = [], []
@@ -414,3 +465,166 @@ def visualize_mesh_node_order(pts, element_connectivity, order, element_shape, t
     plt.ylabel("Y-coordinate")
     plt.grid(True, linestyle=':', alpha=0.5)
     plt.show()
+
+
+# ------------- measure area plotting
+def _tri_vertex_phi(level_set, node_coords, node_ids, mesh):
+    """
+    Fast φ at the 3 triangle vertices. Uses FE nodal values if available,
+    falls back to point-eval otherwise.
+    """
+    # FE fast path: read φ DOFs that coincide with mesh nodes
+    if hasattr(level_set, "dh") and hasattr(level_set, "field") and hasattr(level_set, "_f"):
+        node_map = level_set.dh.dof_map.get(level_set.field, {})
+        g2l      = getattr(level_set._f, "_g2l", {})
+        nv       = level_set._f.nodal_values
+        v_phi    = np.empty(3, dtype=float)
+        for j, nid in enumerate(node_ids):
+            gd = node_map.get(int(nid))
+            if gd is not None and gd in g2l:
+                v_phi[j] = float(nv[g2l[gd]])
+            else:
+                v_phi[j] = float(level_set(node_coords[j]))
+        return v_phi
+    # Generic path
+    return np.array([float(level_set(node_coords[0])),
+                     float(level_set(node_coords[1])),
+                     float(level_set(node_coords[2]))], dtype=float)
+
+
+def add_measure_area_overlay(ax, mesh, level_set, *,
+                             side='+',
+                             include_full_cells=True,
+                             facecolor=(0.90, 0.20, 0.60, 0.35),  # RGBA
+                             edgecolor='none',
+                             label=None):
+    """
+    Overlay the exact area integrated by:
+      - side='+' → dx_has_pos (full 'outside' cells + positive part of cut cells)
+      - side='-' → dx_has_neg (full 'inside' cells  + negative part of cut cells)
+    Returns (polycollection, legend_patch). Does NOT call ax.legend(...).
+    """
+    tol = getattr(SIDE, "tol", 1e-12)
+    node = mesh.nodes_x_y_pos
+
+    # classify like your assembler
+    inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
+    full_eids = outside_ids if side == '+' else inside_ids
+
+    tris_to_fill = []
+
+    # --- full cells on requested side ---
+    if include_full_cells:
+        for eid in full_eids:
+            cn = list(mesh.elements_list[eid].corner_nodes)
+            if len(cn) == 3:
+                tris_to_fill.append(node[cn])                        # (3,2)
+            elif len(cn) == 4:
+                # match NG / python path: (0–2) diagonal
+                tris_to_fill.append(node[[cn[0], cn[1], cn[2]]])
+                tris_to_fill.append(node[[cn[0], cn[2], cn[3]]])
+
+    # --- cut cells: clip each corner-triangle ---
+    # fast FE nodal φ at mesh nodes (if available)
+    def phi_at_nodes(ids):
+        if hasattr(level_set, "dh") and hasattr(level_set, "field") and hasattr(level_set, "_f"):
+            node_map = level_set.dh.dof_map.get(level_set.field, {})
+            g2l      = getattr(level_set._f, "_g2l", {})
+            nv       = level_set._f.nodal_values
+            out      = np.empty(3, float)
+            for j, nid in enumerate(ids):
+                gd = node_map.get(int(nid))
+                if gd is not None and gd in g2l:
+                    out[j] = float(nv[g2l[gd]])
+                else:
+                    out[j] = float(level_set(node[int(nid)]))
+            return out
+        # fallback
+        return np.array([float(level_set(node[int(ids[0])])),
+                         float(level_set(node[int(ids[1])])),
+                         float(level_set(node[int(ids[2])]))], float)
+
+    for eid in cut_ids:
+        elem = mesh.elements_list[eid]
+        tri_local, corner_ids = corner_tris(mesh, elem)  # uses (0–2) diagonal for quads
+        for loc_tri in tri_local:
+            v_ids    = [corner_ids[i] for i in loc_tri]
+            v_coords = node[v_ids]                       # (3,2)
+            v_phi    = phi_at_nodes(v_ids)
+
+            # polys = clip_triangle_to_side(v_coords, 
+            #                               v_phi, side=side, eps=tol)
+            polys = clip_triangle_to_side_pn(mesh, eid, loc_tri, 
+                                                        corner_ids, 
+                                                        level_set, 
+                                                        side=side, 
+                                                        eps=SIDE.tol)
+            for poly in polys:                           # <- IMPORTANT: iterate polys
+                for A, B, C in fan_triangulate(poly):
+                    tris_to_fill.append(np.vstack([A, B, C]))  # (3,2)
+
+    if not tris_to_fill:
+        return None, None
+
+    pcoll = PolyCollection(tris_to_fill, facecolors=facecolor, edgecolors=edgecolor, zorder=8)
+    ax.add_collection(pcoll)
+
+    legend_name = label or (f"has_{'pos' if side=='+' else 'neg'}")
+    legend_patch = patches.Patch(color=facecolor if isinstance(facecolor, str) else facecolor[:3],
+                                 label=legend_name)
+    return pcoll, legend_patch
+
+
+def _elem_polys(mesh, eids):
+    """Return a list of corner-polygons (in order) for the given element ids."""
+    pts = mesh.nodes_x_y_pos
+    polys = []
+    for eid in eids:
+        cn = list(mesh.elements_list[int(eid)].corner_nodes)
+        polys.append(pts[cn])  # (m,2) with m=4 for quads, 3 for tris
+    return polys
+
+def add_element_outline(ax, mesh, eids, *, edgecolor="red", linewidth=2.5, zorder=9, label=None):
+    """
+    Outline elements with thick borders. Returns (collection, legend_handle).
+    """
+    polys = _elem_polys(mesh, eids)
+    if not polys:
+        return None, None
+    coll = PolyCollection(polys, facecolors="none", edgecolors=edgecolor,
+                          linewidths=linewidth, zorder=zorder)
+    ax.add_collection(coll)
+    lh = plt.Line2D([0],[0], color=edgecolor, lw=linewidth, label=label or "highlight")
+    return coll, lh
+
+def add_element_fill(ax, mesh, eids, *, facecolor=(1.0, 0.0, 0.0, 0.25), edgecolor="none",
+                     zorder=8, label=None):
+    """
+    Softly fill elements (semi-transparent). Returns (collection, legend_handle).
+    """
+    polys = _elem_polys(mesh, eids)
+    if not polys:
+        return None, None
+    coll = PolyCollection(polys, facecolors=facecolor, edgecolors=edgecolor,
+                          linewidths=0.0, zorder=zorder)
+    ax.add_collection(coll)
+    # legend color: use RGB of facecolor
+    rgb = facecolor if isinstance(facecolor, str) else facecolor[:3]
+    lh = plt.Line2D([0],[0], color=rgb, lw=8, label=label or "highlight")
+    return coll, lh
+
+def zoom_to_elements(ax, mesh, eids, pad=0.05):
+    """
+    Zoom the view to tightly fit the given elements (with relative padding).
+    """
+    pts = mesh.nodes_x_y_pos
+    xs, ys = [], []
+    for eid in eids:
+        cn = list(mesh.elements_list[int(eid)].corner_nodes)
+        xy = pts[cn]
+        xs.extend(xy[:,0]); ys.extend(xy[:,1])
+    if xs:
+        xmin, xmax = min(xs), max(xs); xr = xmax - xmin
+        ymin, ymax = min(ys), max(ys); yr = ymax - ymin
+        ax.set_xlim(xmin - pad*xr, xmax + pad*xr)
+        ax.set_ylim(ymin - pad*yr, ymax + pad*yr)

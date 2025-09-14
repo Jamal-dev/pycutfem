@@ -6,7 +6,8 @@ from typing import Tuple, List, Dict, Optional, Callable, Union
 from pycutfem.core.topology import Edge, Node, Element
 
 from pycutfem.utils.bitset import BitSet
-
+from pycutfem.core.sideconvention import SIDE
+from pycutfem.ufl.helpers_geom import edge_root_pn
 
 class Mesh:
     """
@@ -92,7 +93,7 @@ class Mesh:
             x1, y1 = self.nodes_x_y_pos[vB]
             dx, dy = x1 - x0, y1 - y0
             L2 = dx*dx + dy*dy
-            tol = 1e-12 * np.sqrt(L2)
+            tol = SIDE.tol * np.sqrt(L2)
 
             ids = []
             for nd in self.nodes_list:
@@ -163,7 +164,7 @@ class Mesh:
         # __call__ methods that don't correctly handle batch inputs (N, 2).
         return np.apply_along_axis(level_set, 1, centroids)
 
-    def classify_elements(self, level_set, tol=1e-12):
+    def classify_elements(self, level_set, tol=SIDE.tol):
         """
         Classify each element as 'inside', 'outside', or 'cut'.
         Sets element.tag accordingly and returns indices for each class.
@@ -171,11 +172,14 @@ class Mesh:
         # Assumes level_set has a method evaluate_on_nodes(mesh)
         phi_nodes = level_set.evaluate_on_nodes(self)
         elem_phi_nodes = phi_nodes[self.corner_connectivity]
-        phi_cent = self._phi_on_centroids(level_set)
+        # phi_cent = self._phi_on_centroids(level_set)
 
-        min_phi = np.minimum(elem_phi_nodes.min(axis=1), phi_cent)
-        max_phi = np.maximum(elem_phi_nodes.max(axis=1), phi_cent)
+        # min_phi = np.minimum(elem_phi_nodes.min(axis=1), phi_cent)
+        # max_phi = np.maximum(elem_phi_nodes.max(axis=1), phi_cent)
 
+        min_phi = elem_phi_nodes.min(axis=1)
+        max_phi = elem_phi_nodes.max(axis=1)
+        
         inside_mask = (max_phi < -tol)
         outside_mask = (min_phi > tol)
         
@@ -192,11 +196,11 @@ class Mesh:
         
         return inside_inds, outside_inds, cut_inds
 
-    def classify_elements_multi(self, level_sets, tol=1e-12):
+    def classify_elements_multi(self, level_sets, tol=SIDE.tol):
         """Classifies elements against multiple level sets."""
         return {idx: self.classify_elements(ls, tol) for idx, ls in enumerate(level_sets)}
-    
-    def classify_edges(self, level_set, tol=1e-12):
+
+    def classify_edges(self, level_set, tol=SIDE.tol):
         """
         Classify edges as 'interface' or 'ghost' based on element tags.
         """
@@ -257,12 +261,21 @@ class Mesh:
     
 
 
-    def build_interface_segments(self, level_set, tol=1e-12, qorder=2):
+    def build_interface_segments(self, level_set, tol=SIDE.tol, quadrature_order=2):
         """
         Populate element.interface_pts for every 'cut' element.
         Each entry is a list of interface points, typically [p0, p1].
         """
-        phi_nodes = level_set.evaluate_on_nodes(self)      # φ at every mesh node
+        # Optional: only needed if you want a cheap endpoint precheck for p==1
+        phi_nodes = level_set.evaluate_on_nodes(self)  # φ at mesh corner nodes
+
+        # detect discrete order p of the FE level set if available (default 1)
+        p = 1
+        if hasattr(level_set, "dh") and hasattr(level_set, "field"):
+            try:
+                p = int(level_set.dh.mixed_element._field_orders[level_set.field])
+            except Exception:
+                p = 1
 
         for elem in self.elements_list:
             if elem.tag != 'cut':
@@ -270,61 +283,47 @@ class Mesh:
                 continue
 
             pts = []
-            for gid in elem.edges:                         # loop over its 4 edges
-                e = self.edge(gid)
-                n0, n1 = e.nodes
-                phi0, phi1 = phi_nodes[n0], phi_nodes[n1]
 
-                # Skip edges that are clearly on one side of the interface.
-                if (phi0 * phi1 > 0.0) and (abs(phi0) > tol and abs(phi1) > tol):
-                    continue
-                
-                # --- ROBUST INTERPOLATION ---
-                if abs(phi0 - phi1) < tol:
-                    if abs(phi0) < tol:
-                        # The whole edge is on the interface.
-                        pts.append(self.nodes_x_y_pos[n0])
-                        pts.append(self.nodes_x_y_pos[n1])
-                    continue
-                else:
-                    # Standard linear interpolation
-                    t = phi0 / (phi0 - phi1)
-                    # Clamp t to the valid range [0, 1] to prevent extrapolation.
-                    t = max(0.0, min(1.0, t))
-                    
-                    p = self.nodes_x_y_pos[n0] + t * (self.nodes_x_y_pos[n1] -
-                                                    self.nodes_x_y_pos[n0])
-                    pts.append(p)
+            # LOCAL edges in canonical order (0..2 tri, 0..3 quad)
+            nloc_edges = 3 if len(elem.corner_nodes) == 3 else 4
+            for l_edge in range(nloc_edges):
 
-            # Remove duplicate points that can occur if the interface
-            # passes exactly through a mesh node.
+                # --- DO NOT SKIP on endpoint signs for p>=2 ---
+                # Only keep the fast skip for strictly p==1 (linear along edge)
+                if p == 1:
+                    # get endpoints for a quick sign check
+                    e_gid = elem.edges[l_edge]
+                    e = self.edge(e_gid)
+                    n0, n1 = e.nodes
+                    phi0, phi1 = phi_nodes[n0], phi_nodes[n1]
+                    if (phi0 * phi1 > 0.0) and (abs(phi0) > tol and abs(phi1) > tol):
+                        continue
+
+                # robust P^n root(s) on this *local* edge
+                roots = edge_root_pn(level_set, self, int(elem.id), int(l_edge), tol=tol)
+                if not roots:
+                    continue
+                # roots may have 1 (crossing) or 2 points (whole edge on {φ=0})
+                for P in roots:
+                    pts.append(np.asarray(P, float))
+
+            # de-dup (φ=0 through a vertex)
             unique_pts = []
-            for p in pts:
-                is_duplicate = False
-                for up in unique_pts:
-                    if np.linalg.norm(p - up) < tol:
-                        is_duplicate = True
-                        break
-                if not is_duplicate:
-                    unique_pts.append(p)
-            
-            # --- FIX: A valid interface segment requires exactly two points ---
-            # After calculating all intersections and removing duplicates, only
-            # proceed if we have exactly two points. Otherwise, it's a
-            # degenerate case (grazing a node, etc.), which we filter out.
+            for pnt in pts:
+                if not any(np.linalg.norm(pnt - up) < tol for up in unique_pts):
+                    unique_pts.append(pnt)
+
+            # keep exactly two points: choose the longest chord across candidates
             if len(unique_pts) >= 2:
-                # Pick the longest chord across the collected points.
-                # This handles {2,3,4}-point degeneracies (grazing a node / lying on an edge).
                 P = np.asarray(unique_pts, float)
-                # pairwise distances
-                d2 = ((P[:,None,:]-P[None,:,:])**2).sum(axis=2)
+                d2 = ((P[:, None, :] - P[None, :, :])**2).sum(axis=2)
                 i, j = divmod(int(d2.argmax()), d2.shape[1])
-                pts = [tuple(P[i]), tuple(P[j])]
-                # Sort for reproducibility and assign
-                pts.sort(key=lambda Q: (Q[0], Q[1]))
-                elem.interface_pts = pts
+                pts2 = [tuple(P[i]), tuple(P[j])]
+                pts2.sort(key=lambda Q: (Q[0], Q[1]))
+                elem.interface_pts = pts2
             else:
                 elem.interface_pts = []
+
 
     def edge_bitset(self, tag: str) -> BitSet:
         """Return cached BitSet of edges with the given tag."""
