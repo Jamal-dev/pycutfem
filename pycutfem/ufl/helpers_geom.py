@@ -440,17 +440,50 @@ def segment_root_pn(level_set, mesh, eid: int, A_lc, B_lc, *, tol: float = SIDE.
 # ---------------------------------------------------------------------------
 
 def interface_arc_nodes(level_set, I0, I1, *, mesh, eid, nseg: int, project_steps: int = 3, tol: float = 1e-12):
-    """Return nodes on {φ=0} approximating the interface between I0 and I1."""
+    """Return nodes on {φ=0} approximating the interface between I0 and I1}.
+    Vectorized projection of all split points when the level‑set is analytic (no FE back-end).
+    Falls back to element‑aware per‑point projection otherwise.
+    """
     from pycutfem.integration.quadrature import _project_to_levelset
     I0 = np.asarray(I0, float); I1 = np.asarray(I1, float)
-    T = np.linspace(0.0, 1.0, int(max(1, nseg)) + 1)
+    nseg = int(max(1, nseg))
+    T = np.linspace(0.0, 1.0, nseg + 1)
     P = (1.0 - T)[:, None] * I0[None, :] + T[:, None] * I1[None, :]
-    out = []
-    for Pi in P:
-        x = _project_to_levelset(Pi, level_set, mesh=mesh, eid=eid,
-                                 max_steps=project_steps, tol=tol)
-        if not out or np.linalg.norm(x - out[-1]) > 1e-14:
-            out.append(x)
+
+    # FE-backed LS? keep robust element-aware projector
+    if hasattr(level_set, "value_on_element"):
+        out = []
+        for Pi in P:
+            x = _project_to_levelset(Pi, level_set, mesh=mesh, eid=eid,
+                                     max_steps=project_steps, tol=tol)
+            if not out or np.linalg.norm(x - out[-1]) > 1e-14:
+                out.append(x)
+        return np.array(out, float)
+
+    # Analytic LS → batched Newton updates
+    X = P.copy()
+    for _ in range(int(max(1, project_steps))):
+        phi_vals = np.empty(X.shape[0], dtype=float)
+        grads    = np.empty_like(X)
+        for i, xi in enumerate(X):
+            try:    phi_vals[i] = float(level_set(xi))
+            except: phi_vals[i] = float(level_set(float(xi[0]), float(xi[1])))
+            try:    grads[i]    = level_set.gradient(xi)
+            except:
+                h=1e-8
+                gx=(float(level_set(xi[0]+h,xi[1]))-float(level_set(xi[0]-h,xi[1])))/(2*h)
+                gy=(float(level_set(xi[0],xi[1]+h))-float(level_set(xi[0],xi[1]-h)))/(2*h)
+                grads[i]=[gx,gy]
+        g2 = np.sum(grads*grads, axis=1) + 1e-30
+        mask = np.abs(phi_vals) >= tol
+        if not np.any(mask): break
+        X[mask] -= (phi_vals[mask]/g2[mask])[:,None]*grads[mask]
+
+    # de-dup consecutive duplicates (very rare)
+    out = [X[0]]
+    for i in range(1, X.shape[0]):
+        if np.linalg.norm(X[i] - out[-1]) > 1e-14:
+            out.append(X[i])
     return np.array(out, float)
 
 

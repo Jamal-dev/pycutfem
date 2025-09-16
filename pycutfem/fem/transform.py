@@ -213,6 +213,14 @@ def inverse_mapping(mesh, elem_id, x, tol=1e-10, maxiter=50):
     """
     coords = mesh.nodes_x_y_pos[mesh.nodes[mesh.elements_connectivity[elem_id]]].astype(float)
     x = np.asarray(x, dtype=float)
+    if mesh.element_type == 'tri' and mesh.poly_order == 1 and coords.shape[0] >= 3:
+        # x = X0 + [B-X0, C-X0] @ [r,s]
+        X0 = coords[0]
+        J  = np.column_stack((coords[1] - X0, coords[2] - X0))  # (2,2)
+        try:
+            return np.linalg.solve(J, x - X0)  # (r,s)
+        except np.linalg.LinAlgError:
+            pass  # fall back to the generic Newton below
 
     if _HAVE_NUMBA:
         # --- Fast path for P1 / Q1 elements ---

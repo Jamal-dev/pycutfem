@@ -8,19 +8,29 @@ from pycutfem.utils.meshgen import structured_triangles, structured_quad
 import numpy as np, math
 
 
-class CircleLS:
-    """Analytic φ; we add evaluate_on_nodes so classify_elements can use it."""
-    def __init__(self, R):
-        self.R = float(R)
+class LevelSetFunction:
+    """Abstract base class"""
+    def __call__(self, x: np.ndarray) -> float:
+        raise NotImplementedError
+    def gradient(self, x: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+    def evaluate_on_nodes(self, mesh) -> np.ndarray:
+        return np.apply_along_axis(self, 1, mesh.nodes_x_y_pos)
+
+class CircleLevelSet(LevelSetFunction):
+    def __init__(self, center=(0.,0.), radius: float=1.0):
+        self.center=np.asarray(center,dtype=float)
+        self.radius=float(radius)
     def __call__(self, x):
-        x = np.asarray(x, float)
-        return self.R**2 - (x[0]**2 + x[1]**2)     # φ>=0 = inside the disk
+        """Signed distance; works for shape (..., 2) or plain (2,)."""
+        x = np.asarray(x, dtype=float)
+        rel = x - self.center
+        # norm along the last axis keeps the leading shape intact
+        return np.linalg.norm(rel, axis=-1) - self.radius
     def gradient(self, x):
-        x = np.asarray(x, float)
-        return np.array([-2*x[0], -2*x[1]], float)
-    def evaluate_on_nodes(self, mesh):
-        XY = mesh.nodes_x_y_pos
-        return self.R**2 - (XY[:, 0]**2 + XY[:, 1]**2)
+        d=np.asarray(x-self.center)
+        nrm=np.linalg.norm(d)
+        return d/nrm if nrm else np.zeros_like(d)
 
 
 def make_meshes(L=1.5, H=1.5, nx=24, ny=24):
@@ -71,9 +81,14 @@ def compute_A_side_like_compiler(mesh: Mesh, level_set, *, side='+', qvol=4, nse
 
 if __name__ == "__main__":
     # geometry & level set
-    mesh_tri, mesh_quad = make_meshes()
-    phi = CircleLS(R=2.0/3.0)
-    Atrue = math.pi * (2.0/3.0)**2
+    L, H = 2.0, 2.0
+    maxh = 0.125
+    R = 2.0/3.0
+    nx = int(L / maxh)
+    ny = int(H / maxh)
+    mesh_tri, mesh_quad = make_meshes(L=L, H=H, nx=nx, ny=ny)
+    phi = CircleLevelSet(center=(0.0, 0.0), radius=R)
+    Atrue = math.pi * R**2
 
     print("== TRI mesh (compiler-style cut assembly) ==")
     for nseg in (3, 5, 7, 9, 13, 17):

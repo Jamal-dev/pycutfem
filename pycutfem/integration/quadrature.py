@@ -179,115 +179,121 @@ def _project_to_levelset(point, level_set, *, mesh=None, eid=None, max_steps=3, 
 
 def curved_line_quadrature(level_set, p0, p1, order=2, nseg=1, project_steps=2, tol=1e-12):
     """
-    Integrate along a *curved* interface inside an element by splitting the chord
-    p0–p1 into 'nseg' subsegments, Newton-projecting their endpoints to {phi=0},
-    and applying Gauss–Legendre on each projected subsegment.
-
-    Returns (qpts, qwts) in *physical* coordinates, weights already scaled by segment lengths.
+    Vectorized line quadrature along a curved interface (batched over segments).
     """
     p0 = np.asarray(p0, float); p1 = np.asarray(p1, float)
-    # parametric breakpoints along the chord
-    T = np.linspace(0.0, 1.0, int(max(1, nseg)) + 1)
-    # initial endpoints on the chord
-    P = np.outer(1 - T, p0) + np.outer(T, p1)
+    nseg = int(max(1, nseg))
+    T = np.linspace(0.0, 1.0, nseg + 1)
+    P = (1.0 - T)[:, None] * p0[None, :] + T[:, None] * p1[None, :]   # (nseg+1,2)
 
-    # project endpoints to the level set curve
-    P_proj = np.empty_like(P)
-    for i, Pi in enumerate(P):
-        x = Pi
-        for _ in range(int(max(1, project_steps))):
-            phi = level_set(x[0], x[1])
-            if abs(phi) < tol:
-                break
-            g = level_set.gradient(x)
-            g2 = float(np.dot(g, g)) + 1e-30
-            x = x - (phi / g2) * g
-        P_proj[i] = x
+    # Batched Newton updates (generic LS); falls back to FD gradient if needed
+    X = P.copy()
+    for _ in range(int(max(1, project_steps))):
+        phi_vals = np.empty(X.shape[0]); grads = np.empty_like(X)
+        for i, xi in enumerate(X):
+            try:     phi_vals[i] = float(level_set(xi))
+            except:  phi_vals[i] = float(level_set(float(xi[0]), float(xi[1])))
+            try:     grads[i] = level_set.gradient(xi)
+            except:  # FD fallback
+                h=1e-8
+                gx=(float(level_set(xi[0]+h,xi[1]))-float(level_set(xi[0]-h,xi[1])))/(2*h)
+                gy=(float(level_set(xi[0],xi[1]+h))-float(level_set(xi[0],xi[1]-h)))/(2*h)
+                grads[i]=[gx,gy]
+        g2 = np.sum(grads*grads, axis=1) + 1e-30
+        mask = np.abs(phi_vals) >= tol
+        if not np.any(mask): break
+        X[mask] -= (phi_vals[mask]/g2[mask])[:,None]*grads[mask]
 
-    # accumulate quadrature from each subsegment
-    qpts_list = []
-    qwts_list = []
-    for i in range(len(P_proj) - 1):
-        a, b = P_proj[i], P_proj[i+1]
-        # (optional) skip tiny segments
-        if np.linalg.norm(b - a) < 1e-14:
-            continue
-        qp, qw = line_quadrature(a, b, order=order)  # already physical + length scaled
-        qpts_list.append(qp)
-        qwts_list.append(qw)
+    ξ, w_ref = gauss_legendre(int(order))
+    mid  = 0.5*(X[:-1] + X[1:])
+    half = 0.5*(X[1:] - X[:-1])
+    qpts = mid[:, None, :] + ξ.reshape(1, -1, 1) * half[:, None, :]
+    qwts = w_ref.reshape(1, -1) * np.linalg.norm(half, axis=1).reshape(-1, 1)
+    return qpts.reshape(-1, 2), qwts.reshape(-1)
 
-    if not qpts_list:
-        return np.empty((0, 2), float), np.empty((0,), float)
-
-    qpts = np.vstack(qpts_list)
-    qwts = np.concatenate(qwts_list)
-    return qpts, qwts
 
 def curved_wedge_quadrature(level_set, apex, arc_nodes, *,
                             order_t: int = 3, order_tau: int = 3):
     """
-    Quadrature for the curved wedge: union over polyline segments of the arc.
-    Returns (qpts(N,2), qwts(N)).
+    Vectorized quadrature for a curved wedge with apex K and polyline 'arc_nodes'.
+    Equivalent to the previous loop implementation but uses NumPy broadcasting.
+
+    Returns:
+        qpts(N,2), qwts(N) in physical coordinates (weights include area Jacobian).
     """
-    K = np.asarray(apex, float)
-    arc_nodes = np.asarray(arc_nodes, float)
-    if arc_nodes.shape[0] < 2:
-        return np.empty((0,2)), np.empty((0,))
+    K = np.asarray(apex, dtype=float)
+    arc = np.asarray(arc_nodes, dtype=float)
+    if arc.shape[0] < 2:
+        return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
 
-    lam_t, wt = _gl01(order_t)
-    mu,  wu   = _gl01(order_tau)
+    # Gauss nodes on [0,1] for lambda (along-arc) and mu (radial)
+    lam_t, w_lam = _gl01(int(order_t))
+    mu_t,  w_mu  = _gl01(int(order_tau))
 
-    qx = []
-    qw = []
-    for a, b in zip(arc_nodes[:-1], arc_nodes[1:]):
-        dEdlam = (b - a)                     # derivative wrt λ on [0,1]
-        # skip tiny pieces (degenerate)
-        if np.linalg.norm(dEdlam) < 1e-15:
-            continue
-        for j in range(len(lam_t)):
-            E = (1.0 - lam_t[j]) * a + lam_t[j] * b
-            cross_mag = abs((K[0]-E[0])*dEdlam[1] - (K[1]-E[1])*dEdlam[0])
-            for i in range(len(mu)):
-                X = (1.0 - mu[i]) * E + mu[i] * K
-                w = wt[j] * wu[i] * (1.0 - mu[i]) * cross_mag
-                qx.append(X);  qw.append(w)
-    return np.array(qx), np.array(qw)
+    # Segment endpoints and tangents along the arc
+    A = arc[:-1, :]   # (m,2)
+    B = arc[1:,  :]   # (m,2)
+    dE = B - A        # (m,2)
+    m = A.shape[0]
+    if m == 0:
+        return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
+
+    # E(m,L,2) = (1-lam)*A + lam*B
+    lam = lam_t.reshape(1, -1, 1)                         # (1,L,1)
+    E = (1.0 - lam) * A[:, None, :] + lam * B[:, None, :] # (m,L,2)
+
+    # |(K - E) x dE|
+    dE_exp = dE[:, None, :]                                # (m,1,2)
+    cross_mag = np.abs((K[0] - E[..., 0]) * dE_exp[..., 1] - (K[1] - E[..., 1]) * dE_exp[..., 0])  # (m,L)
+
+    # Quadrature points X(m,L,M,2) and weights W(m,L,M)
+    mu = mu_t.reshape(1, 1, -1, 1)
+    X  = (1.0 - mu) * E[:, :, None, :] + mu * K.reshape(1, 1, 1, 2)
+    W  = (cross_mag[:, :, None] *
+          w_lam.reshape(1, -1, 1) *
+          w_mu.reshape(1, 1, -1) *
+          (1.0 - mu_t).reshape(1, 1, -1))
+
+    return X.reshape(-1, 2), W.reshape(-1)
 
 def curved_quad_ruled_quadrature(K1, K2, arc_nodes, *, order_lambda=3, order_mu=3):
     """
-    Quadrature for a curved quadrilateral with straight base K1-K2 and curved top 'arc_nodes'.
-    Returns (qpts(N,2), qwts(N)) in physical coordinates with area-scaled weights.
+    Vectorized quadrature for a curved quadrilateral with straight base K1-K2 and polyline 'arc_nodes'.
+    Uses a ruled surface parameterization sharing lambda along base and arc.
+
+    Returns:
+        qpts(N,2), qwts(N) with area-scaled weights.
     """
-    K1 = np.asarray(K1, float); K2 = np.asarray(K2, float)
-    arc = np.asarray(arc_nodes, float)
+    K1 = np.asarray(K1, dtype=float)
+    K2 = np.asarray(K2, dtype=float)
+    arc = np.asarray(arc_nodes, dtype=float)
     if arc.shape[0] < 2:
-        return np.empty((0,2)), np.empty((0,))
+        return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
 
     nseg = arc.shape[0] - 1
-    lam_t, w_lam = _gl01(order_lambda)  # Gauss points on [0,1]
-    mu_t,  w_mu  = _gl01(order_mu)
+    lam_t, w_lam = _gl01(int(order_lambda))
+    mu_t,  w_mu  = _gl01(int(order_mu))
 
-    qx, qw = [], []
-    dS_dlam = (K2 - K1) / float(nseg)   # derivative of S w.r.t. local lam on each arc subsegment
+    A = arc[:-1, :]         # (m,2)
+    B = arc[1:,  :]         # (m,2)
+    dE = B - A              # (m,2)
+    m = A.shape[0]
+    if m == 0:
+        return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
 
-    for i in range(nseg):
-        a, b = arc[i], arc[i+1]
-        dE_dlam = (b - a)               # derivative of E on this local segment
+    dS_dlam = (K2 - K1) / float(nseg)  # (2,)
 
-        for j, lam in enumerate(lam_t):
-            # interpolate along arc and base with a *shared* lambda
-            E = (1.0 - lam) * a + lam * b
-            s = (i + lam) / float(nseg)                # shared parameter in [0,1] along K1->K2
-            S = (1.0 - s) * K1 + s * K2
+    lam = lam_t.reshape(1, -1, 1)  # (1,L,1)
+    E = (1.0 - lam) * A[:, None, :] + lam * B[:, None, :]                  # (m,L,2)
+    s = (np.arange(m, dtype=float).reshape(-1, 1, 1) + lam) / float(nseg)  # (m,L,1)
+    S = (1.0 - s) * K1.reshape(1, 1, 2) + s * K2.reshape(1, 1, 2)          # (m,L,2)
 
-            for k, mu in enumerate(mu_t):
-                X = (1.0 - mu) * S + mu * E
-                dX_dlam = (1.0 - mu) * dS_dlam + mu * dE_dlam
-                dX_dmu  = E - S
-                # 2D "cross product" magnitude
-                jac = abs(dX_dlam[0]*dX_dmu[1] - dX_dlam[1]*dX_dmu[0])
+    mu = mu_t.reshape(1, 1, -1, 1)
+    dX_dlam = (1.0 - mu) * dS_dlam.reshape(1, 1, 1, 2) + mu * dE.reshape(m, 1, 1, 2)
+    dX_dmu  = E[:, :, None, :] - S[:, :, None, :]                           # (m,L,1,2)
+    X       = (1.0 - mu) * S[:, :, None, :] + mu * E[:, :, None, :]
 
-                w = w_lam[j] * w_mu[k] * jac
-                qx.append(X);  qw.append(w)
+    jac = np.abs(dX_dlam[..., 0] * dX_dmu[..., 1] - dX_dlam[..., 1] * dX_dmu[..., 0])
+    W   = jac * w_lam.reshape(1, -1, 1) * w_mu.reshape(1, 1, -1)
 
-    return np.array(qx), np.array(qw)
+    return X.reshape(-1, 2), W.reshape(-1)
