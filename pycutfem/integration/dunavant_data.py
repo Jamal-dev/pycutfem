@@ -19,17 +19,17 @@ def get_dunavant_weights(degree):
     """Get the weights for a given degree."""
     return np.array(dunavant_data[str(degree)]["weights"], dtype=np.float64)
 def get_dunavant_points(degree):
-    """Get the points for a given degree."""
-    return np.array(dunavant_data[str(degree)]["points"], dtype=np.float64)
+    """Return Dunavant points in reference-triangle (xi, eta).
+    JSON stores barycentric (L1, L2, L3); we map to (xi, eta) = (L2, L3)."""
+    raw = dunavant_data[str(degree)]["points"]
+    return np.array([[p[1], p[2]] for p in raw], dtype=np.float64)
 def get_dunavant_data(degree):
-    weights = np.array(dunavant_data[str(degree)]["weights"], dtype=np.float64)
+    """Return (points, weights, num_points) with points in (xi, eta).
+    JSON file stores barycentric (L1, L2, L3); our ref triangle uses (xi, eta) = (L2, L3)."""
+    raw = dunavant_data[str(degree)]
+    weights = np.array(raw["weights"], dtype=np.float64)
+    points = np.array([[p[1], p[2]] for p in raw["points"]], dtype=np.float64)
     num_points = len(weights)
-    points = []
-    for i in range(num_points):
-        x = dunavant_data[str(degree)]["points"][i][0]
-        y = dunavant_data[str(degree)]["points"][i][1]
-        points.append([x, y])
-    points = np.array(points, dtype=np.float64)
     return points, weights, num_points
 
 class DunavantData:

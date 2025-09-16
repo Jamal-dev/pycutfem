@@ -1,6 +1,6 @@
-from .bitset import BitSet
-from .indicator import IndicatorField
-from .meshgen import delaunay_rectangle
-__all__=['BitSet','IndicatorField','delaunay_rectangle']
+from pycutfem.utils.bitset import BitSet
+from pycutfem.utils.indicator import IndicatorField
+#from pycutfem.utils.meshgen import delaunay_rectangle
+__all__=['BitSet','IndicatorField']
 
-from .meshgen import structured_quad
+

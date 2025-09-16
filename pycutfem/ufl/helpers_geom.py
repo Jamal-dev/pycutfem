@@ -1,6 +1,8 @@
+from __future__ import annotations
 import numpy as np
 from pycutfem.core.sideconvention import SIDE
 from pycutfem.fem import transform
+from typing import Iterable, Tuple, List
 
 try:
     import numba as _nb
@@ -11,71 +13,61 @@ except Exception:
 # -------- Level-set evaluation that accepts both styles: φ(x) and φ(x,y) -----
 
 
+# =============================================================================
+# Level‑set evaluation (works for analytic or FE‑backed LS)
+# =============================================================================
 def phi_eval(level_set, x_phys, *, eid=None, xi_eta=None, mesh=None):
-    # Fast path: FE level set with element context
-    if hasattr(level_set, "value_on_element") and (eid is not None):
+    """Safe φ evaluation at a physical point.
+    * If a FE level set is attached, we use the element‑aware fast path.
+    * Otherwise we call the analytic function (vector or scalar signature).
+    """
+    if hasattr(level_set,"value_on_element") and (eid is not None):
         if xi_eta is None:
             if mesh is None:
-                raise ValueError("phi_eval needs xi_eta or mesh to inverse-map.")
+                raise ValueError("phi_eval needs xi_eta or mesh to inverse‑map.")
             xi_eta = transform.inverse_mapping(mesh, int(eid), np.asarray(x_phys, float))
-        return level_set.value_on_element(int(eid), (float(xi_eta[0]), float(xi_eta[1])))
-    # Generic fallback (analytic or FE): may do owner search
+        return float(level_set.value_on_element(int(eid), (float(xi_eta[0]), float(xi_eta[1]))))
+    # generic fallback
     try:
-        return level_set(np.asarray(x_phys))
+        return float(level_set(np.asarray(x_phys, float)))
     except TypeError:
-        return level_set(x_phys[0], x_phys[1])
+        return float(level_set(float(x_phys[0]), float(x_phys[1])))
+
 
 # --------------------- Segment zero-crossing (linear φ) ----------------------
-def segment_zero_crossing(p0, p1, phi0, phi1, eps=1e-14):
-    """Return intersection on segment p0->p1 where the linearized φ crosses 0."""
+def segment_zero_crossing(p0: np.ndarray, p1: np.ndarray, phi0: float, phi1: float, eps: float = 1e-14) -> np.ndarray:
+    """Linearized crossing on segment p0→p1 where the line φ crosses zero."""
     denom = (phi0 - phi1)
     if abs(denom) < eps:
         t = 0.5
     else:
         t = phi0 / (phi0 - phi1)
         t = min(max(t, 0.0), 1.0)
-    return p0 + t * (p1 - p0)
+    return np.asarray(p0, float) + float(t) * (np.asarray(p1, float) - np.asarray(p0, float))
 
-# ------------- Clip a triangle against φ=0; keep 'side' ('+' or '-') --------
+# =============================================================================
+# Straight P1 clipping (triangle) for robust fallbacks
+# =============================================================================
 def clip_triangle_to_side(v_coords, v_phi, side='+', eps=0.0):
-    """
-    v_coords: 3x2 array of triangle vertices (physical)
-    v_phi:    φ at those vertices (length 3)
-    side:     '+' keeps {φ>=0}, '-' keeps {φ<=0}
-    Returns list of polygons (each as list of 2D points).
-    """
-    # sgn = +1.0 if side == '+' else -1.0
-    # phi = sgn * np.asarray(v_phi, dtype=float)
-    phi = np.asarray(v_phi, dtype=float)
-    V   = [np.asarray(v, dtype=float) for v in v_coords]
-
-    # Decide membership using the global convention only once
+    """Clip a triangle against φ=0; keep 'side' ('+' keeps φ≥0, '−' keeps φ≤0)."""
+    phi = np.asarray(v_phi, float)
+    V   = [np.asarray(v, float) for v in v_coords]
     if   side == '+': keep = [i for i in range(3) if SIDE.is_pos(phi[i], tol=eps)]
     elif side == '-': keep = [i for i in range(3) if not SIDE.is_pos(phi[i], tol=eps)]
     else:             raise ValueError("side must be '+' or '-'")
-    # # Map requested side into phi, then a single positivity test
-    # keep = [i for i in range(3) if SIDE.is_pos(phi[i], tol=eps)]
     drop = [i for i in range(3) if i not in keep]
-
-    if len(keep) == 3:
-        return [V]
-    if len(keep) == 0:
-        return []
-    # helper: intersection with dropped side
-    from_idx = keep if len(keep) == 1 else drop
+    if len(keep) == 3: return [V]
+    if len(keep) == 0: return []
     if len(keep) == 1:
-        iK = keep[0]
-        iD1, iD2 = drop
+        iK = keep[0]; iD1, iD2 = drop
         I1 = segment_zero_crossing(V[iK], V[iD1], phi[iK], phi[iD1])
         I2 = segment_zero_crossing(V[iK], V[iD2], phi[iK], phi[iD2])
         return [[V[iK], I1, I2]]
-    else:
-        iK1, iK2 = keep
-        iD       = drop[0]
-        I1 = segment_zero_crossing(V[iK1], V[iD], phi[iK1], phi[iD])  # on K1–D
-        I2 = segment_zero_crossing(V[iK2], V[iD], phi[iK2], phi[iD])  # on K2–D
-        # Boundary order: K1 → I1 → I2 → K2
-        return [[V[iK1], I1, I2, V[iK2]]]
+    iK1, iK2 = keep; iD = drop[0]
+    I1 = segment_zero_crossing(V[iK1], V[iD], phi[iK1], phi[iD])
+    I2 = segment_zero_crossing(V[iK2], V[iD], phi[iK2], phi[iD])
+    return [[V[iK1], I1, I2, V[iK2]]]
+
 
 # -------------------- JIT versions of the geometric helpers ------------------
 if _HAVE_NUMBA:
@@ -191,58 +183,24 @@ if _HAVE_NUMBA:
 
 
 # ---------------------------- Fan triangulation ------------------------------
-def fan_triangulate(poly):
-    """Triangulate convex polygon [v0, v1, ..., vk] into [(v0,vi,vi+1)]."""
+def fan_triangulate(poly: List[np.ndarray]) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Triangulate [v0, v1, ..., vk] into [(v0, vi, vi+1)]."""
     if len(poly) < 3: return []
     if len(poly) == 3: return [tuple(poly)]
-    return [ (poly[0], poly[i], poly[i+1]) for i in range(1, len(poly)-1) ]
+    return [(poly[0], poly[i], poly[i+1]) for i in range(1, len(poly) - 1)]
+
 
 # ------------- Map reference triangle quadrature to physical (A,B,C) --------
 def map_ref_tri_to_phys(A, B, C, qp_ref, qw_ref):
-    """
-    Transforms quadrature points and weights from a reference triangle to a physical triangle.
-
-    This function performs a standard affine mapping from the reference element
-    (with vertices at (0,0), (1,0), and (0,1)) to the physical element defined
-    by vertices A, B, and C.
-
-    The affine map is defined as:
-        x = F(ξ) = J @ ξ + A
-    where ξ is a column vector of reference coordinates [ξ, η]ᵀ, and J is the
-    Jacobian of the transformation.
-
-    **Row-Vector Convention**:
-    The input quadrature points `qp_ref` are provided as a NumPy array of shape
-    (nQ, 2), which is a stack of row vectors. To apply the linear transformation
-    `J @ ξ` to a row vector `ξ_row = [ξ, η]`, the correct matrix multiplication
-    is `ξ_row @ J.T`. This function implements this transposed multiplication
-    to correctly handle the batch of row-vector inputs.
-
-    **Weight Transformation**:
-    The quadrature weights are scaled by the absolute value of the Jacobian
-    determinant, which represents the ratio of the area of the physical element
-    to the reference element. The returned weights `w_phys` are ready for direct
-    use in the quadrature sum.
-
-    Args:
-        A (array-like): Coordinates of the first vertex of the physical triangle (2-vector).
-        B (array-like): Coordinates of the second vertex of the physical triangle (2-vector).
-        C (array-like): Coordinates of the third vertex of the physical triangle (2-vector).
-        qp_ref (np.ndarray): Quadrature points on the reference triangle, shape (nQ, 2).
-        qw_ref (np.ndarray): Quadrature weights on the reference triangle, shape (nQ,).
-
-    Returns:
-        Tuple[np.ndarray, np.ndarray]: A tuple containing:
-            - x_phys (np.ndarray): The quadrature points in physical coordinates, shape (nQ, 2).
-            - w_phys (np.ndarray): The quadrature weights in physical space, shape (nQ,).
-    """
-    A = np.asarray(A); B = np.asarray(B); C = np.asarray(C)
+    """Affine map Δ_ref→Δ_phys (row‑vector convention); scales weights by |detJ|."""
+    A = np.asarray(A, float); B = np.asarray(B, float); C = np.asarray(C, float)
     J = np.array([[B[0] - A[0], C[0] - A[0]],
-                  [B[1] - A[1], C[1] - A[1]]], dtype=float)
+                  [B[1] - A[1], C[1] - A[1]]], float)
     detJ = abs(np.linalg.det(J))
-    x_phys = (qp_ref @ J.T) + A
+    x_phys = qp_ref @ J.T + A
     w_phys = qw_ref * detJ
     return x_phys, w_phys
+
 
 # -------------------------- Corner-tri list for an element -------------------
 def corner_tris(mesh, elem):
@@ -279,7 +237,7 @@ def _bary_eval(t, tnodes, fvals, w=None) -> float:
     if w is None: w = _bary_weights(x)
     diff = t - x
     k = np.argmin(np.abs(diff))
-    if abs(diff[k]) <= 1e-15:   # exact hit
+    if abs(diff[k]) <= 1e-15:
         return float(y[k])
     num = np.sum((w * y) / diff)
     den = np.sum(w / diff)
@@ -291,29 +249,24 @@ def _brent_root(fun, a, b, fa, fb, tol=SIDE.tol, maxit=64):
     if abs(fb) == 0.0: return b, fb
     if fa*fb > 0.0:    return None, None
     c, fc = a, fa; d = e = b - a
-    for _ in range(maxit):
+    for _ in range(int(maxit)):
         if fb*fc > 0.0:
             c, fc = a, fa; d = e = b - a
         if abs(fc) < abs(fb):
-            a, b, c = b, c, b
-            fa, fb, fc = fb, fc, fb
+            a, b, c = b, c, b; fa, fb, fc = fb, fc, fb
         tol1 = 2.0*np.finfo(float).eps*abs(b) + 0.5*tol
-        xm = 0.5*(c - b)
+        xm   = 0.5*(c - b)
         if abs(xm) <= tol1 or fb == 0.0:
             return b, fb
         if abs(e) >= tol1 and abs(fa) > abs(fb):
             s = fb/fa
-            if a == c:
-                p = 2.0*xm*s; q = 1.0 - s
+            if a == c: p = 2.0*xm*s; q = 1.0 - s
             else:
                 q = fa/fc; r = fb/fc
-                p = s*(2.0*xm*q*(q-r) - (b-a)*(r-1.0))
-                q = (q-1.0)*(r-1.0)*(s-1.0)
+                p = s*(2.0*xm*q*(q-r) - (b-a)*(r-1.0)); q = (q-1.0)*(r-1.0)*(s-1.0)
             if p > 0: q = -q
             p = abs(p)
-            min1 = 3.0*xm*q - abs(tol1*q)
-            min2 = abs(e*q)
-            if 2.0*p < (min1 if min1 < min2 else min2):
+            if 2.0*p < min(3.0*xm*q - abs(tol1*q), abs(e*q)):
                 e = d; d = p/q
             else:
                 d = xm; e = d
@@ -325,32 +278,26 @@ def _brent_root(fun, a, b, fa, fb, tol=SIDE.tol, maxit=64):
     return b, fb
 
 # ------------- reference param nodes on an edge (element-type aware) ----------
-def _edge_ref_nodes(mesh, local_edge: int, p: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Return (tnodes, xi, eta) where tnodes in [0,1] are Lagrange points k/p,
-    and (xi,eta) are corresponding reference coords along the chosen edge.
-    """
-    tnodes = np.linspace(0.0, 1.0, int(p)+1)
+def _edge_ref_nodes(mesh, local_edge: int, p: int):
+    """Return (tnodes in [0,1], xi(t), eta(t)) for the chosen local edge."""
+    t = np.linspace(0.0, 1.0, int(p) + 1)
     if mesh.element_type == 'quad':
-        # local edges: 0: bottom(η=-1), 1: right(ξ=+1), 2: top(η=+1), 3: left(ξ=-1)
-        if   local_edge == 0:  xi = 2*tnodes - 1; eta = -np.ones_like(tnodes)
-        elif local_edge == 1:  xi =  np.ones_like(tnodes); eta = -1 + 2*tnodes
-        elif local_edge == 2:  xi =  1 - 2*tnodes; eta =  np.ones_like(tnodes)
-        elif local_edge == 3:  xi = -np.ones_like(tnodes); eta =  1 - 2*tnodes
+        if   local_edge == 0:  xi = 2*t - 1;  eta = -np.ones_like(t)
+        elif local_edge == 1:  xi =  np.ones_like(t); eta = -1 + 2*t
+        elif local_edge == 2:  xi =  1 - 2*t; eta =  np.ones_like(t)
+        elif local_edge == 3:  xi = -np.ones_like(t); eta =  1 - 2*t
         else: raise IndexError(local_edge)
-        return tnodes, xi, eta
+        return t, xi, eta
     elif mesh.element_type == 'tri':
-        # 0:(0,0)-(1,0)  1:(1,0)-(0,1)  2:(0,1)-(0,0)
-        if   local_edge == 0: xi, eta = tnodes, np.zeros_like(tnodes)
-        elif local_edge == 1: xi, eta = 1.0 - tnodes, tnodes
-        elif local_edge == 2: xi, eta = np.zeros_like(tnodes), 1.0 - tnodes
+        if   local_edge == 0: xi, eta = t, np.zeros_like(t)
+        elif local_edge == 1: xi, eta = 1.0 - t, t
+        elif local_edge == 2: xi, eta = np.zeros_like(t), 1.0 - t
         else: raise IndexError(local_edge)
-        return tnodes, xi, eta
+        return t, xi, eta
     else:
         raise KeyError(mesh.element_type)
 
 def _phi_on_e_points(level_set, mesh, eid: int, xi: np.ndarray, eta: np.ndarray) -> np.ndarray:
-    """φ at a *set* of reference points on element eid (fast when FE‑backed)."""
     vals = np.empty_like(xi, float)
     if hasattr(level_set, "value_on_element"):
         for k in range(xi.size):
@@ -361,98 +308,117 @@ def _phi_on_e_points(level_set, mesh, eid: int, xi: np.ndarray, eta: np.ndarray)
             vals[k] = float(level_set(np.asarray(x, float)))
     return vals
 
-def edge_root_pn(level_set, mesh, eid: int, local_edge: int, *, tol: float = SIDE.tol):
-    """
-    Return intersection point(s) between {φ=0} and *this element's* local edge.
-
-    Result:
-      []                → no intersection on this edge
-      [P]               → a single crossing
-      [P0, P1]          → whole edge lies on {φ=0} (degeneracy)
-    """
-    # 1) degree from FE level set if available; else fall back to linear sampling
-    p = 1
-    if hasattr(level_set, "dh") and hasattr(level_set, "field"):
-        p = max(1, int(level_set.dh.mixed_element._field_orders[level_set.field]))
-    tnodes, xi, eta = _edge_ref_nodes(mesh, int(local_edge), p)
-    fvals = _phi_on_e_points(level_set, mesh, int(eid), xi, eta)
-
-    # whole edge on interface?
-    if np.all(np.abs(fvals) <= tol):
-        P0 = transform.x_mapping(mesh, int(eid), (float(xi[0]),   float(eta[0])))
-        P1 = transform.x_mapping(mesh, int(eid), (float(xi[-1]),  float(eta[-1])))
-        return [np.asarray(P0, float), np.asarray(P1, float)]
-
-    # scan brackets [t_k, t_{k+1}]
-    w = _bary_weights(tnodes)
-    fun = lambda tt: _bary_eval(tt, tnodes, fvals, w)
-    crossings = []
-    for k in range(len(tnodes)-1):
-        a, b = float(tnodes[k]), float(tnodes[k+1])
-        fa, fb = float(fvals[k]), float(fvals[k+1])
-        if fa*fb > 0.0:
-            continue
-        r, _ = _brent_root(fun, a, b, fa, fb, tol=tol)
-        if r is None: 
-            continue
-        # map r → (xi,eta) and then to physical
-        if mesh.element_type == 'quad':
-            if   local_edge == 0: xy = (2*r-1, -1.0)
-            elif local_edge == 1: xy = (1.0, -1+2*r)
-            elif local_edge == 2: xy = (1-2*r, 1.0)
-            else:                  xy = (-1.0, 1-2*r)
-        else:  # tri
-            if   local_edge == 0: xy = (r, 0.0)
-            elif local_edge == 1: xy = (1-r, r)
-            else:                  xy = (0.0, 1-r)
-        P = transform.x_mapping(mesh, int(eid), (float(xy[0]), float(xy[1])))
-        crossings.append(np.asarray(P, float))
-    # de-dup close roots
-    out = []
-    for p in crossings:
-        if not any(np.linalg.norm(p-q) < SIDE.tol for q in out):
-            out.append(p)
-    return out
-
 def _corner_ref_coords(mesh):
     if mesh.element_type == 'quad':
-        # local corners 0..3
         return np.array([[-1.0,-1.0],[+1.0,-1.0],[+1.0,+1.0],[-1.0,+1.0]], float)
     elif mesh.element_type == 'tri':
-        # local corners 0..2
         return np.array([[0.0,0.0],[1.0,0.0],[0.0,1.0]], float)
     else:
         raise KeyError(mesh.element_type)
 
+def edge_root_pn(level_set, mesh, eid: int, local_edge: int, *, tol: float = SIDE.tol) -> List[np.ndarray]:
+    """Intersection(s) of {φ=0} with *this element's* local edge.
+    Returns: [] (no hit), [P], or [P0,P1] if the whole edge lies on {φ=0}.
+    """
+    # sampling order
+    if hasattr(level_set, "dh") and hasattr(level_set, "field"):
+        p = max(1, int(level_set.dh.mixed_element._field_orders[level_set.field]))
+    else:
+        p = 1
+    tnodes, xi, eta = _edge_ref_nodes(mesh, int(local_edge), p)
+    fvals = _phi_on_e_points(level_set, mesh, int(eid), xi, eta)
+
+    # whole edge on the interface?
+    if np.all(np.abs(fvals) <= tol):
+        P0 = transform.x_mapping(mesh, int(eid), (float(xi[0]),  float(eta[0])))
+        P1 = transform.x_mapping(mesh, int(eid), (float(xi[-1]), float(eta[-1])))
+        return [np.asarray(P0, float), np.asarray(P1, float)]
+
+    # Brent–Dekker on each bracket
+    w = _bary_weights(tnodes)
+    fun = lambda tt: _bary_eval(tt, tnodes, fvals, w)
+    crossings = []
+    for k in range(len(tnodes) - 1):
+        a, b = float(tnodes[k]), float(tnodes[k+1])
+        fa, fb = float(fvals[k]), float(fvals[k+1])
+        if fa * fb > 0.0:
+            continue
+        r, _ = _brent_root(fun, a, b, fa, fb, tol=tol)
+        if r is None:
+            continue
+        # map r → (xi,eta) and then to physical
+        if mesh.element_type == 'quad':
+            if   local_edge == 0: xy = (2*r - 1, -1.0)
+            elif local_edge == 1: xy = (1.0, -1 + 2*r)
+            elif local_edge == 2: xy = (1 - 2*r, 1.0)
+            else:                  xy = (-1.0, 1 - 2*r)
+        else:  # tri
+            if   local_edge == 0: xy = (r, 0.0)
+            elif local_edge == 1: xy = (1 - r, r)
+            else:                  xy = (0.0, 1 - r)
+        P = transform.x_mapping(mesh, int(eid), (float(xy[0]), float(xy[1])))
+        pphys = np.asarray(P, float)
+        # de‑dup
+        if not any(np.linalg.norm(pphys - Q) < SIDE.tol for Q in crossings):
+            crossings.append(pphys)
+    return crossings
+
+# ---------------------------------------------------------------------------
+# Local→reference corner permutation + segment root on element interior
+# ---------------------------------------------------------------------------
+
+def _ref_corners(mesh):
+    if mesh.element_type == 'quad':
+        return np.array([[-1,-1],[+1,-1],[+1,+1],[-1,+1]], float)
+    elif mesh.element_type == 'tri':
+        return np.array([[0,0],[1,0],[0,1]], float)
+    else:
+        raise KeyError(mesh.element_type)
+
+def _loc2ref_corner_perm(mesh, eid, V, tol=1e-8):
+    """perm[i_local_parent] → i_reference_corner (robust, unique)."""
+    ref = _ref_corners(mesh)
+    m = V.shape[0]
+    perm = [-1]*m; used = set()
+    for i in range(m):
+        xi, eta = transform.inverse_mapping(mesh, int(eid), (float(V[i,0]), float(V[i,1])))
+        X = np.array([float(xi), float(eta)])
+        j = int(np.argmin(np.sum((ref - X)**2, axis=1)))
+        if np.linalg.norm(ref[j] - X) > 5*tol and mesh.element_type == 'quad':
+            sx = -1 if X[0] < 0 else +1
+            sy = -1 if X[1] < 0 else +1
+            for r, RR in enumerate(ref):
+                if int(np.sign(RR[0])) == sx and int(np.sign(RR[1])) == sy and r not in used:
+                    j = r; break
+        if j in used:
+            d = np.sum((ref - X)**2, axis=1)
+            for r in np.argsort(d):
+                if r not in used:
+                    j = int(r); break
+        perm[i] = j; used.add(j)
+    return np.array(perm, int)
+
+
 def segment_root_pn(level_set, mesh, eid: int, A_lc, B_lc, *, tol: float = SIDE.tol, order_hint: int = None):
+    """Root(s) of φ((1−t)A+tB) on the *element* segment A→B in reference coords.
+    Returns None (no crossing), a point P, or a pair (P0,P1) if whole segment lies on {φ=0}.
     """
-    Root of φ((1-t)A + tB) on the *element* segment A_lc→B_lc, t∈[0,1],
-    using Pⁿ sampling (n = FE order if available, else order_hint, else 1).
-    Returns:
-      None   → no crossing on this segment
-      P      → single intersection as physical coordinates
-      (P0,P1)→ entire segment lies on φ=0 (degenerate case)
-    """
-    # decide sampling order
     if order_hint is not None:
         p = int(order_hint)
     elif hasattr(level_set, "dh") and hasattr(level_set, "field"):
         p = max(1, int(level_set.dh.mixed_element._field_orders[level_set.field]))
     else:
         p = 1
-
-    tnodes = np.linspace(0.0, 1.0, p+1)
+    tnodes = np.linspace(0.0, 1.0, p + 1)
     xi  = (1.0 - tnodes) * float(A_lc[0]) + tnodes * float(B_lc[0])
     eta = (1.0 - tnodes) * float(A_lc[1]) + tnodes * float(B_lc[1])
     fvals = _phi_on_e_points(level_set, mesh, int(eid), xi, eta)
 
-    # whole segment on interface?
     if np.all(np.abs(fvals) <= tol):
         P0 = transform.x_mapping(mesh, int(eid), (float(xi[0]),  float(eta[0])))
         P1 = transform.x_mapping(mesh, int(eid), (float(xi[-1]), float(eta[-1])))
         return (np.asarray(P0, float), np.asarray(P1, float))
 
-    # scan brackets [t_k,t_{k+1}] with Brent–Dekker on barycentric interpolant
     w = _bary_weights(tnodes); fun = lambda tt: _bary_eval(tt, tnodes, fvals, w)
     for k in range(p):
         a, b = float(tnodes[k]), float(tnodes[k+1])
@@ -467,6 +433,208 @@ def segment_root_pn(level_set, mesh, eid: int, A_lc, B_lc, *, tol: float = SIDE.
         P = transform.x_mapping(mesh, int(eid), xr)
         return np.asarray(P, float)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Interface arc sampling via element-aware projection
+# ---------------------------------------------------------------------------
+
+def interface_arc_nodes(level_set, I0, I1, *, mesh, eid, nseg: int, project_steps: int = 3, tol: float = 1e-12):
+    """Return nodes on {φ=0} approximating the interface between I0 and I1."""
+    from pycutfem.integration.quadrature import _project_to_levelset
+    I0 = np.asarray(I0, float); I1 = np.asarray(I1, float)
+    T = np.linspace(0.0, 1.0, int(max(1, nseg)) + 1)
+    P = (1.0 - T)[:, None] * I0[None, :] + T[:, None] * I1[None, :]
+    out = []
+    for Pi in P:
+        x = _project_to_levelset(Pi, level_set, mesh=mesh, eid=eid,
+                                 max_steps=project_steps, tol=tol)
+        if not out or np.linalg.norm(x - out[-1]) > 1e-14:
+            out.append(x)
+    return np.array(out, float)
+
+
+# ---------------------------------------------------------------------------
+# Triangle-only: robust search for the two interface points on ∂K
+# ---------------------------------------------------------------------------
+
+def _find_two_edge_intersections_tri(level_set, mesh, eid, V, vphi, side, tol=1e-12, qvol=3):
+    """Find the two *geometric* intersections {φ=0}∩∂K on this triangle.
+    Returns ('pair',(I1,I2)) in physical coords; for degenerate 'whole edge'
+    case, we fall back to full straight triangle quadrature ('final', (qx,qw)).
+    """
+    inter: List[np.ndarray] = []
+    for eidx in (0, 1, 2):
+        hits = edge_root_pn(level_set, mesh, int(eid), eidx, tol=tol)
+        if not hits: continue
+        if len(hits) == 2:
+            # Degenerate: whole edge lies on φ=0 → use straight triangle
+            from pycutfem.integration.quadrature import tri_rule
+            qp_ref, qw_ref = tri_rule(qvol)
+            qx, qw = map_ref_tri_to_phys(V[0], V[1], V[2], qp_ref, qw_ref)
+            return 'final', (qx, qw)
+        P = np.asarray(hits[0], float)
+        if all(np.linalg.norm(P - Q) > 1e-13 for Q in inter):
+            inter.append(P)
+    if len(inter) < 2:
+        polys = clip_triangle_to_side(V, vphi, side=side, eps=tol)
+        if not polys:
+            return 'final', (np.empty((0,2)), np.empty((0,)))
+        from pycutfem.integration.quadrature import tri_rule
+        qp_ref, qw_ref = tri_rule(qvol)
+        qx_all, qw_all = [], []
+        for poly in polys:
+            for A,B,C in fan_triangulate(poly):
+                xq, wq = map_ref_tri_to_phys(A,B,C, qp_ref, qw_ref)
+                qx_all.append(xq); qw_all.append(wq)
+        return 'final', (np.vstack(qx_all), np.hstack(qw_all))
+    # return the farthest pair if >2 (guards nearly‑duplicate hits)
+    if len(inter) > 2:
+        best = (None, None, -1.0)
+        for i in range(len(inter)):
+            for j in range(i+1, len(inter)):
+                d = np.linalg.norm(inter[i] - inter[j])
+                if d > best[2]: best = (i, j, d)
+        return 'pair', (inter[best[0]], inter[best[1]])
+    return 'pair', (inter[0], inter[1])
+
+def _normal_probe_flip(level_set, mesh, eid, side, I1, I2, keep, drop):
+    """Probe φ slightly along the interface normal at mid(I1,I2).
+    Flip keep/drop if the sign disagree with the requested 'side'.
+    """
+    mid = 0.5*(np.asarray(I1, float) + np.asarray(I2, float))
+    if hasattr(level_set, "gradient_on_element") and (mesh is not None) and (eid is not None):
+        xi, eta = transform.inverse_mapping(mesh, int(eid), mid)
+        g = level_set.gradient_on_element(int(eid), (float(xi), float(eta)))
+    else:
+        g = level_set.gradient(mid)
+    n = np.asarray(g, float); n /= (np.linalg.norm(n) + 1e-30)
+    probe = mid + (1e-10 if side == '+' else -1e-10) * n
+    phi_probe = phi_eval(level_set, probe, eid=eid, mesh=mesh)
+    want_pos = (side == '+')
+    ok = (phi_probe >= 0.0) if want_pos else (phi_probe <= 0.0)
+    if ok:
+        return False, keep, drop
+    new_keep = [i for i in (0,1,2) if i not in keep]
+    new_drop = [i for i in (0,1,2) if i not in new_keep]
+    return True, new_keep, new_drop
+# ---------------------------------------------------------------------------
+# Curved quadrature on a *corner triangle* of a parent element (tri / quad)
+# ---------------------------------------------------------------------------
+
+def curved_subcell_quadrature_for_cut_triangle(mesh, eid, tri_local_ids, corner_ids, level_set,
+                                               *, side='+', qvol: int = 3, nseg_hint: int = None, tol=1e-12):
+    """Return (qpts, qwts) on ONE corner-triangle of a parent element.
+    For triangle parents we detect I1/I2 with edge_root_pn and build either a
+    curved wedge (one kept vertex) or a ruled curved quad (two kept vertices).
+    Quads as parents are supported via the robust local→reference mapping.
+    """
+    from pycutfem.integration.quadrature import (
+        tri_rule, curved_wedge_quadrature, curved_quad_ruled_quadrature
+    )
+    Vids = [corner_ids[i] for i in tri_local_ids]
+    V    = mesh.nodes_x_y_pos[Vids].astype(float)      # (3,2)
+
+    # φ at the three triangle vertices
+    vphi = np.array([phi_eval(level_set, V[k], eid=eid, mesh=mesh) for k in range(3)], float)
+
+    # requested side
+    keep = [i for i in range(3) if (SIDE.is_pos(vphi[i], tol=tol) if side == '+' else not SIDE.is_pos(vphi[i], tol=tol))]
+    drop = [i for i in range(3) if i not in keep]
+
+    if len(keep) == 3:
+        qp_ref, qw_ref = tri_rule(qvol)
+        qx, qw = map_ref_tri_to_phys(V[0], V[1], V[2], qp_ref, qw_ref)
+        return qx, qw
+    if len(keep) == 0:
+        return np.empty((0,2)), np.empty((0,))
+
+    # element polynomial order for arc segmentation
+    p_order = getattr(level_set.dh.mixed_element, "_field_orders", {}).get(getattr(level_set, "field", ""), 1) if hasattr(level_set, "dh") else 1
+    nseg = max(3, (p_order + 1) * (qvol + 3)) if (nseg_hint is None) else max(3, int(nseg_hint))
+
+    # --- Triangle parent: get I1/I2 from element edges ----------------------
+    if mesh.element_type == 'tri':
+        status, payload = _find_two_edge_intersections_tri(level_set, mesh, eid, V, vphi, side, tol, qvol)
+        if status == 'final':
+            return payload  # (qx, qw) already
+
+        I1, I2 = payload  # two interface points on this element (physical)
+
+        # orientation guard (use the tentative pair for the sign check)
+        flipped, keep, drop = _normal_probe_flip(level_set, mesh, eid, side, I1, I2, keep, drop)
+
+        # Helper to get local edge index for a pair of local corners on a triangle
+        def _tri_edge_index(a_loc, b_loc):
+            ab = tuple(sorted((int(a_loc), int(b_loc))))
+            if ab == (0,1): return 0
+            if ab == (1,2): return 1
+            if ab == (0,2): return 2
+            raise IndexError(ab)
+
+        if len(keep) == 1:
+            # Wedge: intersections lie on the two edges adjacent to the kept vertex
+            k = keep[0]
+            d1, d2 = drop
+            e1 = _tri_edge_index(k, d1)
+            e2 = _tri_edge_index(k, d2)
+            I1 = edge_root_pn(level_set, mesh, int(eid), e1, tol=tol)[0]
+            I2 = edge_root_pn(level_set, mesh, int(eid), e2, tol=tol)[0]
+            K  = V[k]
+            arc = interface_arc_nodes(level_set, I1, I2, mesh=mesh, eid=eid,
+                                    nseg=nseg, project_steps=3, tol=tol)
+            return curved_wedge_quadrature(level_set, K, arc, order_t=qvol, order_tau=qvol)
+
+        else:  # len(keep) == 2
+            # Ruled curved quad: intersections lie on the two edges adjacent to the *dropped* vertex
+            d = drop[0]
+            k1, k2 = keep[0], keep[1]
+            e1 = _tri_edge_index(k1, d)
+            e2 = _tri_edge_index(k2, d)
+            I1 = edge_root_pn(level_set, mesh, int(eid), e1, tol=tol)[0]
+            I2 = edge_root_pn(level_set, mesh, int(eid), e2, tol=tol)[0]
+            K1, K2 = V[k1], V[k2]
+            arc = interface_arc_nodes(level_set, I1, I2, mesh=mesh, eid=eid,
+                                    nseg=nseg, project_steps=3, tol=tol)
+            return curved_quad_ruled_quadrature(K1, K2, arc, order_lambda=qvol, order_mu=qvol)
+
+
+    # --- Quad parent: build I1/I2 on triangle edges in reference coords -----
+    V_parent = mesh.nodes_x_y_pos[corner_ids].astype(float)
+    loc2ref  = _loc2ref_corner_perm(mesh, eid, V_parent)
+    corner_ref = _corner_ref_coords(mesh)
+
+    def _edge_point(a_loc, b_loc):
+        ai = int(tri_local_ids[a_loc]); bi = int(tri_local_ids[b_loc])
+        A_lc = corner_ref[int(loc2ref[ai])]; B_lc = corner_ref[int(loc2ref[bi])]
+        P = segment_root_pn(level_set, mesh, int(eid), A_lc, B_lc, tol=tol)
+        if P is not None:
+            return P if isinstance(P, np.ndarray) else P[0]
+        return segment_zero_crossing(V[a_loc], V[b_loc], vphi[a_loc], vphi[b_loc])
+
+    if len(keep) == 1:
+        I1 = _edge_point(keep[0], drop[0]); I2 = _edge_point(keep[0], drop[1])
+        flipped, keep, drop = _normal_probe_flip(level_set, mesh, eid, side, I1, I2, keep, drop)
+        if flipped:
+            I1 = _edge_point(keep[0], drop[0]); I2 = _edge_point(keep[0], drop[1])
+        K  = V[keep[0]]
+        arc = interface_arc_nodes(level_set, I1, I2, mesh=mesh, eid=eid,
+                                  nseg=nseg, project_steps=3, tol=tol)
+        return curved_wedge_quadrature(level_set, K, arc, order_t=qvol, order_tau=qvol)
+
+    # len(keep) == 2
+    I1 = _edge_point(keep[0], drop[0]); I2 = _edge_point(keep[1], drop[0])
+    flipped, keep, drop = _normal_probe_flip(level_set, mesh, eid, side, I1, I2, keep, drop)
+    if flipped:
+        I1 = _edge_point(keep[0], drop[0]); I2 = _edge_point(keep[1], drop[0])
+    K1, K2 = V[keep[0]], V[keep[1]]
+    arc = interface_arc_nodes(level_set, I1, I2, mesh=mesh, eid=eid,
+                              nseg=nseg, project_steps=3, tol=tol)
+    return curved_quad_ruled_quadrature(K1, K2, arc, order_lambda=qvol, order_mu=qvol)
+
+# ---------------------
+
+
 
 # def clip_triangle_to_side_pn(mesh, eid, tri_local_ids, corner_ids, level_set, side='+', eps=0.0):
 #     """
@@ -534,6 +702,7 @@ def segment_root_pn(level_set, mesh, eid: int, A_lc, B_lc, *, tol: float = SIDE.
 #         I1 = _edge_point(k1, d); I2 = _edge_point(k2, d)
 #         return [[V[k1], I1, I2, V[k2]]]
 
+
 def clip_triangle_to_side_pn(mesh, eid, tri_local_ids, corner_ids, level_set, side='+', eps=0.0):
     # triangle vertices (global ids → coords)
     v_ids = [corner_ids[i] for i in tri_local_ids]
@@ -584,205 +753,5 @@ def clip_triangle_to_side_pn(mesh, eid, tri_local_ids, corner_ids, level_set, si
         I1 = _edge_point(k1, d); I2 = _edge_point(k2, d)
         return [[V[k1], I1, I2, V[k2]]]
 
-def _append_if_new(poly, P, tol=1e-14):
-    P = np.asarray(P, float)
-    if not poly:
-        poly.append(P); return
-    if np.linalg.norm(poly[-1] - P) > tol:
-        poly.append(P)
-
-def _ref_corners(mesh):
-    if mesh.element_type == 'quad':
-        return np.array([[-1,-1],[+1,-1],[+1,+1],[-1,+1]], float)  # 0..3
-    elif mesh.element_type == 'tri':
-        return np.array([[0,0],[1,0],[0,1]], float)                 # 0..2
-    else:
-        raise KeyError(mesh.element_type)
-
-def _loc2ref_corner_perm(mesh, eid, V, tol=1e-8):
-    """Map element-local corner index i → reference corner index r."""
-    ref = _ref_corners(mesh)
-    m = V.shape[0]
-    perm = [-1]*m
-    used = set()
-    for i in range(m):
-        xi, eta = transform.inverse_mapping(mesh, int(eid), (float(V[i,0]), float(V[i,1])))
-        X = np.array([float(xi), float(eta)])
-        # match to nearest ref corner
-        j = int(np.argmin(np.sum((ref - X)**2, axis=1)))
-        if np.linalg.norm(ref[j]-X) > 5*tol:
-            # last resort: snap by sign of (xi,eta)
-            if mesh.element_type == 'quad':
-                sx = -1 if X[0] < 0 else +1
-                sy = -1 if X[1] < 0 else +1
-                for r, RR in enumerate(ref):
-                    if int(np.sign(RR[0])) == sx and int(np.sign(RR[1])) == sy and r not in used:
-                        j = r; break
-        # ensure permutation (unique)
-        if j in used:
-            # pick the closest unused
-            d = np.sum((ref - X)**2, axis=1)
-            for r in np.argsort(d):
-                if r not in used:
-                    j = int(r); break
-        perm[i] = j
-        used.add(j)
-    return np.array(perm, dtype=int)
-
-def _corner_phi_fast(level_set, mesh, cn):
-    """φ at corner nodes; use FE nodal read if possible."""
-    if hasattr(level_set, "dh") and hasattr(level_set, "field") and hasattr(level_set, "_f"):
-        node_map = level_set.dh.dof_map.get(level_set.field, {})
-        g2l      = getattr(level_set._f, "_g2l", {})
-        nv       = level_set._f.nodal_values
-        out = np.empty(len(cn), float)
-        for k, nid in enumerate(cn):
-            gd = node_map.get(int(nid))
-            if gd is not None and gd in g2l:
-                out[k] = float(nv[g2l[gd]])
-            else:
-                xy = mesh.nodes_x_y_pos[int(nid)]
-                out[k] = float(level_set(xy))
-        return out
-    # fallback: point eval
-    return np.array([float(level_set(mesh.nodes_x_y_pos[int(nid)])) for nid in cn], float)
-
-def clip_cell_to_side(mesh, eid: int, level_set, side: str = '+', eps: float = None):
-    """
-    Polygon(s) of the portion of element `eid` on the requested side of φ.
-    Uses Pⁿ edge roots and a robust local→reference edge map (no interior diagonal).
-    """
-    if eps is None:
-        eps = getattr(SIDE, "tol", 1e-12)
-
-    elem = mesh.elements_list[int(eid)]
-    cn   = list(elem.corner_nodes)
-    V    = mesh.nodes_x_y_pos[cn].astype(float)                 # (m,2)
-    vphi = _corner_phi_fast(level_set, mesh, cn)
-
-    def inside(phi):
-        return SIDE.is_pos(phi, tol=eps) if side == '+' else (SIDE.is_neg(phi, tol=eps))
-
-    m = V.shape[0]
-    # local corner order as given by the mesh:
-    local_pairs = [(i, (i+1) % m) for i in range(m)] if m == 4 else [(0,1),(1,2),(2,0)]
-
-    # We iterate edges in the mesh's local order, which matches the parent's edge ids.
-    # For quads: i=0..3 is exactly the parent local edge id (0: bottom, 1: right, 2: top, 3: left).
-    # For tris:  i=0..2 is the parent local edge id (0:(0,1), 1:(1,2), 2:(2,0)).
-
-   
-    poly = []
-    for (i, j) in local_pairs:
-        Pi, Pj = V[i], V[j]
-        fi, fj = vphi[i], vphi[j]
-        Ii, Ij = inside(fi), inside(fj)
-
-        # keep corner i if it lies on requested side
-        if Ii:
-            _append_if_new(poly, Pi, tol=eps)
-
-    
-        # Robust approach: just ask for roots on THIS local edge 'i'.
-        roots = edge_root_pn(level_set, mesh, int(eid), int(i), tol=eps)
-        if roots:
-            for P in roots:
-                _append_if_new(poly, P, tol=eps)
-
-    # close / validate
-    if poly and np.linalg.norm(poly[0] - poly[-1]) <= 1e-14:
-        poly = poly[:-1]
-    if len(poly) < 3:
-        return []
-
-    # make CCW for stable fan triangulation
-    A = 0.5 * sum(poly[k][0]*poly[(k+1)%len(poly)][1] - poly[(k+1)%len(poly)][0]*poly[k][1]
-                  for k in range(len(poly)))
-    if A < 0:
-        poly = poly[::-1]
-
-    return [np.asarray(poly, float)]
 
 
-def interface_arc_nodes(level_set, I0, I1, *, mesh, eid, nseg: int, project_steps: int = 3, tol: float = 1e-12):
-    """
-    Return nodes P[0..nseg] lying on {phi=0} that approximate the curved interface
-    between the edge intersections I0 and I1.  P[0]=I0, P[-1]=I1.
-    """
-    from pycutfem.integration.quadrature import _project_to_levelset
-    I0 = np.asarray(I0, float); I1 = np.asarray(I1, float)
-    T = np.linspace(0.0, 1.0, int(max(1, nseg)) + 1)
-    P = (1.0 - T)[:, None] * I0[None, :] + T[:, None] * I1[None, :]
-    # Newton‑project to phi=0
-    for k in range(P.shape[0]):
-        P[k] = _project_to_levelset(P[k], level_set, mesh=mesh, eid=eid,
-                                    max_steps=project_steps, tol=tol)
-    # drop accidental duplicates (grazing)
-    out = [P[0]]
-    for k in range(1, len(P)):
-        if np.linalg.norm(P[k] - out[-1]) > 1e-14:
-            out.append(P[k])
-    return np.array(out, float)
-def curved_subcell_quadrature_for_cut_triangle(mesh, eid, tri_local_ids, corner_ids, level_set,
-                                               *, side='+', qvol: int = 3, nseg_hint: int = None, tol=1e-12):
-    """
-    Given ONE corner-triangle of a parent cell, return (qpts, qwts) for the kept side
-    using curved wedge(s). Falls back to empty / full straight triangle otherwise.
-    """
-    from pycutfem.integration.quadrature import curved_wedge_quadrature, curved_quad_ruled_quadrature
-    Vids = [corner_ids[i] for i in tri_local_ids]
-    V    = mesh.nodes_x_y_pos[Vids].astype(float)      # (3,2)
-
-    # phi at the three triangle vertices – prefer FE fast path when available
-    vphi = np.array([phi_eval(level_set, V[k], eid=eid, mesh=mesh) for k in range(3)], float)
-
-    keep = [i for i in range(3) if (SIDE.is_pos(vphi[i], tol=tol) if side=='+' else not SIDE.is_pos(vphi[i], tol=tol))]
-    drop = [i for i in range(3) if i not in keep]
-
-    if len(keep) == 3:
-        # Full triangle – use your existing straight mapping
-        from pycutfem.integration.quadrature import tri_rule
-        qp_ref, qw_ref = tri_rule(qvol)
-        qx, qw = map_ref_tri_to_phys(V[0], V[1], V[2], qp_ref, qw_ref)
-        return qx, qw
-
-    if len(keep) == 0:
-        return np.empty((0,2)), np.empty((0,))
-
-    # --- Compute edge intersections I1,I2 on the two edges touching the dropped vertex
-    def _edge_point(a_loc, b_loc):
-        """
-        Return the *physical* intersection point on the edge (a_loc,b_loc).
-        On parent boundary edges we use Pⁿ edge_root_pn (which returns point(s));
-        on the interior diagonal we fall back to a linear zero crossing.
-        """
-        ai = int(tri_local_ids[a_loc]); bi = int(tri_local_ids[b_loc])
-        if mesh.element_type == 'quad' and {ai, bi} in ({0,1},{1,2},{2,3},{0,3}):
-            # map the pair to the parent local edge id expected by edge_root_pn
-            pairs = {(0,1):0, (1,2):1, (2,3):2, (0,3):3, (3,0):3}
-            l_edge = pairs[tuple(sorted((ai, bi)))]
-            roots = edge_root_pn(level_set, mesh, int(eid), int(l_edge), tol=tol)
-            if roots:                       # [P] or [P0,P1]
-                return np.asarray(roots[0], float)
-        # interior diagonal (or no root found) → linear fallback on the local edge
-        A = V[a_loc]; B = V[b_loc]
-        return segment_zero_crossing(A, B, vphi[a_loc], vphi[b_loc])
-
-    p_order = getattr(level_set.dh.mixed_element, "_field_orders", {}).get(level_set.field, 1) if hasattr(level_set, "dh") else 1
-    nseg    = (nseg_hint if nseg_hint is not None else max(2, int(p_order)+1))
-
-    if len(keep) == 1:
-        K      = V[keep[0]]
-        I1     = _edge_point(keep[0], drop[0])
-        I2     = _edge_point(keep[0], drop[1])
-        arc = interface_arc_nodes(level_set, I1, I2, mesh=mesh, eid=eid,
-                          nseg=nseg, project_steps=3, tol=tol)
-        return curved_wedge_quadrature(level_set, K, arc, order_t=qvol, order_tau=qvol)
-
-    # len(keep) == 2
-    K1, K2 = V[keep[0]], V[keep[1]]
-    I1     = _edge_point(keep[0], drop[0])  # on K1–D
-    I2     = _edge_point(keep[1], drop[0])  # on K2–D
-    arc    = interface_arc_nodes(level_set, I1, I2, mesh=mesh, eid=eid,
-                                  nseg=nseg, project_steps=3, tol=tol)
-    return curved_quad_ruled_quadrature(K1, K2, arc, order_lambda=qvol, order_mu=qvol)

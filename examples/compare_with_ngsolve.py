@@ -36,7 +36,7 @@ from pycutfem.core.levelset import CircleLevelSet, LevelSetGridFunction
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.io.visualization import plot_mesh_2, add_measure_area_overlay, add_element_fill, add_element_outline, zoom_to_elements
 import matplotlib.pyplot as plt
-from pycutfem.utils.area_checks import per_element_circle_split_structured_quad
+from pycutfem.utils.area_checks import per_element_circle_split_structured_quad, per_element_circle_split_structured_triangle
 # ---------- NGSolve / XFEM imports ----------
 from netgen.geom2d import SplineGeometry
 from ngsolve import *
@@ -72,7 +72,13 @@ def numerics_vs_analytic_by_elem(dh, level_set, R, center=(0.0, 0.0), q=6, print
     # from your_module import integrate_pc_constant_dx
     ONE = Constant(1.0)
 
-    rows = per_element_circle_split_structured_quad(dh.mixed_element.mesh, R, center=center)
+    mesh = dh.mixed_element.mesh
+    if mesh.element_type == "quad":
+        rows = per_element_circle_split_structured_quad(mesh, R, center=center)
+    elif mesh.element_type == "tri":
+        rows = per_element_circle_split_structured_triangle(mesh, R, center=center)
+    else:
+        raise KeyError(f"Unsupported element_type '{mesh.element_type}'")
 
     for r in rows:
         eid = int(r['eid'])
@@ -138,16 +144,17 @@ def setup_pc(maxh=0.125, order=2, R=2.0/3.0, L = 2.0, H = 2.0, level_set_order =
     ls = LevelSetGridFunction(dh, field='phi')
     ls.interpolate(lambda x,y: np.hypot(x,y) - R)  # initial condition
     ls.commit()                                     # classify & build segments
-    # mesh.classify_elements(analytical_level_set)
-    # mesh.classify_edges(analytical_level_set)
-    # mesh.build_interface_segments(analytical_level_set)
-    rows = numerics_vs_analytic_by_elem(dh, ls, R, center=(0.0,0.0), q=6)
+    mesh.classify_elements(analytical_level_set)
+    mesh.classify_edges(analytical_level_set)
+    mesh.build_interface_segments(analytical_level_set)
+    used_level_set = analytical_level_set  # could also use analytical_level_set
+    rows = numerics_vs_analytic_by_elem(dh, used_level_set, R, center=(0.0,0.0), q=6)
 
     rows_sorted = sorted(rows, key=lambda r: abs(r['d_pos']) + abs(r['d_neg']), reverse=True)
     bad_eids = [r['eid'] for r in rows_sorted[:10]]  # top 10 mismatches
 
     # Plot base mesh (don’t show yet)
-    ax = plot_mesh_2(mesh, level_set=ls, show=False)
+    ax = plot_mesh_2(mesh, level_set=used_level_set, show=False)
 
     # Overlay highlights (fill + outline), then extend the legend
     _, lh1 = add_element_fill(ax, mesh, bad_eids, facecolor=(1.0, 0.0, 0.0, 0.25), label="largest mismatch")
@@ -191,14 +198,14 @@ def setup_pc(maxh=0.125, order=2, R=2.0/3.0, L = 2.0, H = 2.0, level_set_order =
         'nL': TrialFunction(name='nL', field_name='lm', dof_handler=dh), 'mL': TestFunction(name='mL', field_name='lm', dof_handler=dh),
         # 'nL': Function(name='nL', field_name='lm', dof_handler=dh), 'mL': Function(name='mL', field_name='lm', dof_handler=dh),
         'es': es,
-        'level_set': ls,
-        'dx_pos_all': pycutfem_dx(defined_on=has_outside, level_set=ls, metadata={'side': '+', 'q': qvol}),
-        'dx_neg_all': pycutfem_dx(defined_on=has_inside, level_set=ls, metadata={'side': '-', 'q': qvol}),
-        'dx_pos_bulk': pycutfem_dx(defined_on=outside, level_set=ls, metadata={'side': '+', 'q': qvol}),
-        'dx_pos_iface': pycutfem_dx(defined_on=interface, level_set=ls, metadata={'side': '+', 'q': qvol}),
-        'dx_neg_bulk': pycutfem_dx(defined_on=inside, level_set=ls, metadata={'side': '-', 'q': qvol}),
-        'dx_neg_iface': pycutfem_dx(defined_on=interface, level_set=ls, metadata={'side': '-', 'q': qvol}),
-        'dGamma': pycutfem_dInterface(defined_on=interface, level_set=ls, metadata={'q': qvol}),
+        'level_set': used_level_set,
+        'dx_pos_all': pycutfem_dx(defined_on=has_outside, level_set=used_level_set, metadata={'side': '+', 'q': qvol}),
+        'dx_neg_all': pycutfem_dx(defined_on=has_inside, level_set=used_level_set, metadata={'side': '-', 'q': qvol}),
+        'dx_pos_bulk': pycutfem_dx(defined_on=outside, level_set=used_level_set, metadata={'side': '+', 'q': qvol}),
+        'dx_pos_iface': pycutfem_dx(defined_on=interface, level_set=used_level_set, metadata={'side': '+', 'q': qvol}),
+        'dx_neg_bulk': pycutfem_dx(defined_on=inside, level_set=used_level_set, metadata={'side': '-', 'q': qvol}),
+        'dx_neg_iface': pycutfem_dx(defined_on=interface, level_set=used_level_set, metadata={'side': '-', 'q': qvol}),
+        'dGamma': pycutfem_dInterface(defined_on=interface, level_set=used_level_set, metadata={'q': qvol}),
         'mu0': Constant(1.0), 'mu1': Constant(10.0), 'lam_val': 0.5*(1.0+10.0)*20*order**2,
     }
 
@@ -371,11 +378,13 @@ class NG_DX:
 def main():
     maxh, order, R = 0.125, 2, 2.0/3.0
     L, H = 2.0, 2.0
+    use_quad = True  # Whether to use quad elements in PyCutFEM and NGSolve
     
     # --- 1. Setup Phase ---
-    print("Setting up PyCutFEM and NGSolve problems...")
-    pc_setup = setup_pc(maxh, order, R, L, H)
-    ng_setup = setup_ng(maxh, order, R, L, H)
+    print("Setting up PyCutFEM and NGSolve problems"
+          f" with maxh={maxh}, order={order}, R={R}, use_quad={use_quad}...")
+    pc_setup = setup_pc(maxh, order, R, L, H, use_quad=use_quad)
+    ng_setup = setup_ng(maxh, order, R, L, H, use_quad=use_quad)
     quad_order = 8
     pc_dx = PC_DX(quad_order, pc_setup['level_set'], pc_setup['es'])
     ng_dx = NG_DX(quad_order, ng_setup['lsetp1'], ng_setup['ci'])
@@ -687,7 +696,7 @@ def main():
         
         E_pc = assemble_and_energy_pc(data['pc_form'], pc_setup['dh'], u_vec, v_vec)
         
-        bf_ng = BilinearForm(ng_setup['WhG'], symmetric=False)
+        bf_ng = BilinearForm(ng_setup['WhG'], symmetric=False, check_unused=False)
         bf_ng += data['ng_form']
         E_ng = assemble_and_energy_ng(bf_ng, ng_setup['gfu'], ng_setup['gfv'])
         
@@ -719,7 +728,7 @@ def main():
             
             E_pc = assemble_and_energy_pc(pc_form, pc_setup['dh'], u_vec, v_vec)
             
-            bf_ng = BilinearForm(ng_setup['WhG'], symmetric=False)
+            bf_ng = BilinearForm(ng_setup['WhG'], symmetric=False, check_unused=False)
             bf_ng += ng_form
             E_ng = assemble_and_energy_ng(bf_ng, ng_setup['gfu'], ng_setup['gfv'])
             

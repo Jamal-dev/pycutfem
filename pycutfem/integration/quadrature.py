@@ -45,8 +45,11 @@ def tri_rule(order: int,dunavant_deg: int = None):
     """Degree‑exact rule built from square → reference triangle mapping."""
     degree = 2 * order if dunavant_deg is None else dunavant_deg
     if degree in range(1, 21):
-        # print(f'points shape: {DUNAVANT[degree].points.shape}, weights shape: {DUNAVANT[degree].weights.shape}')
-        return DUNAVANT[degree].points, DUNAVANT[degree].weights
+        pts = DUNAVANT[degree].points
+        # Guard against accidental barycentric triplets
+        if pts.ndim == 2 and pts.shape[1] == 3:
+            pts = pts[:, 1:]  # (xi, eta) = (L2, L3)
+        return pts, DUNAVANT[degree].weights
     
     xi, wi = gauss_legendre(order)
     u = 0.5 * (xi + 1.0)   # [0,1]

@@ -2792,7 +2792,7 @@ class FormCompiler:
         from pycutfem.ufl.helpers_geom import (
             phi_eval, corner_tris, clip_triangle_to_side,
             fan_triangulate, map_ref_tri_to_phys,
-            clip_triangle_to_side_pn, clip_cell_to_side,
+            clip_triangle_to_side_pn,
             curved_subcell_quadrature_for_cut_triangle
         )
 
@@ -2968,7 +2968,6 @@ class FormCompiler:
                     self.ctx["x_phys"]       = x_phys
                     self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
                     self.ctx["measure_side"] = side
-                    self.ctx["side"]         = side
 
                     val = self._visit(integral.integrand)
 

@@ -44,6 +44,11 @@ class SideConvention:
             return phi < 0.0
         else:
             return phi > 0.0
+    def is_zero(self, phi: float, tol: float = None) -> bool:
+        """Checks if a point is on the interface according to the tolerance."""
+        if tol is None:
+            tol = self.tol
+        return abs(phi) <= tol
 
     def label(self, phi: float, tol: float = None) -> str:
         """Returns a label ('+', '−', 'interface', or 'gap') for a given phi value."""
