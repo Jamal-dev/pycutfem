@@ -3,6 +3,7 @@ import numpy as np
 from pycutfem.core.sideconvention import SIDE
 from pycutfem.fem import transform
 from typing import Iterable, Tuple, List
+from pycutfem.integration.quadrature import _project_to_levelset 
 
 try:
     import numba as _nb
@@ -532,22 +533,39 @@ def _find_two_edge_intersections_tri(level_set, mesh, eid, V, vphi, side, tol=1e
     return 'pair', (inter[0], inter[1])
 
 def _normal_probe_flip(level_set, mesh, eid, side, I1, I2, keep, drop):
-    """Probe φ slightly along the interface normal at mid(I1,I2).
-    Flip keep/drop if the sign disagree with the requested 'side'.
     """
-    mid = 0.5*(np.asarray(I1, float) + np.asarray(I2, float))
-    if hasattr(level_set, "gradient_on_element") and (mesh is not None) and (eid is not None):
-        xi, eta = transform.inverse_mapping(mesh, int(eid), mid)
+    Probe on the *actual* interface normal near the midpoint of I1–I2.
+    The old code sampled at the chord midpoint (off the interface), which can
+    wrongly flip sides for distance-type φ.
+    """
+    mid_chord = 0.5*(np.asarray(I1, float) + np.asarray(I2, float))
+
+    # 1) Project to φ=0 to get a reliable normal
+    x0 = _project_to_levelset(mid_chord, level_set, mesh=mesh, eid=int(eid),
+                              max_steps=8, tol=1e-14)
+
+    # 2) Gradient at the interface point (element-aware if available)
+    if hasattr(level_set, "gradient_on_element"):
+        xi, eta = transform.inverse_mapping(mesh, int(eid), x0)
         g = level_set.gradient_on_element(int(eid), (float(xi), float(eta)))
     else:
-        g = level_set.gradient(mid)
-    n = np.asarray(g, float); n /= (np.linalg.norm(n) + 1e-30)
-    probe = mid + (1e-10 if side == '+' else -1e-10) * n
-    phi_probe = phi_eval(level_set, probe, eid=eid, mesh=mesh)
-    want_pos = (side == '+')
+        g = level_set.gradient(x0)
+
+    n = np.asarray(g, float)
+    n /= (np.linalg.norm(n) + 1e-30)
+
+    # 3) Step size relative to element size (robust across meshes)
+    h = mesh.element_char_length(int(eid)) if hasattr(mesh, "element_char_length") else 1.0
+    step = max(1e-12, 1e-8 * h)
+    probe = x0 + (step if side == '+' else -step) * n
+
+    phi_probe = phi_eval(level_set, probe, eid=int(eid), mesh=mesh)
+    want_pos  = (side == '+')
     ok = (phi_probe >= 0.0) if want_pos else (phi_probe <= 0.0)
     if ok:
         return False, keep, drop
+
+    # Otherwise swap
     new_keep = [i for i in (0,1,2) if i not in keep]
     new_drop = [i for i in (0,1,2) if i not in new_keep]
     return True, new_keep, new_drop
@@ -584,7 +602,7 @@ def curved_subcell_quadrature_for_cut_triangle(mesh, eid, tri_local_ids, corner_
 
     # element polynomial order for arc segmentation
     p_order = getattr(level_set.dh.mixed_element, "_field_orders", {}).get(getattr(level_set, "field", ""), 1) if hasattr(level_set, "dh") else 1
-    nseg = max(3, (p_order + 1) * (qvol + 3)) if (nseg_hint is None) else max(3, int(nseg_hint))
+    nseg = max(3, (p_order + qvol//2 )) if (nseg_hint is None) else max(3, int(nseg_hint))
 
     # --- Triangle parent: get I1/I2 from element edges ----------------------
     if mesh.element_type == 'tri':
@@ -645,25 +663,28 @@ def curved_subcell_quadrature_for_cut_triangle(mesh, eid, tri_local_ids, corner_
             return P if isinstance(P, np.ndarray) else P[0]
         return segment_zero_crossing(V[a_loc], V[b_loc], vphi[a_loc], vphi[b_loc])
 
+    # 1) Build tentative intersections for the current keep/drop
     if len(keep) == 1:
         I1 = _edge_point(keep[0], drop[0]); I2 = _edge_point(keep[0], drop[1])
-        flipped, keep, drop = _normal_probe_flip(level_set, mesh, eid, side, I1, I2, keep, drop)
-        if flipped:
-            I1 = _edge_point(keep[0], drop[0]); I2 = _edge_point(keep[0], drop[1])
+    else:  # len(keep) == 2
+        I1 = _edge_point(keep[0], drop[0]); I2 = _edge_point(keep[1], drop[0])
+
+    # 2) Probe the normal and possibly flip keep/drop …
+    flipped, keep, drop = _normal_probe_flip(level_set, mesh, eid, side, I1, I2, keep, drop)
+
+    # 3) … then RE-BRANCH on the *updated* keep/drop
+    if len(keep) == 1:
+        I1 = _edge_point(keep[0], drop[0]); I2 = _edge_point(keep[0], drop[1])
         K  = V[keep[0]]
         arc = interface_arc_nodes(level_set, I1, I2, mesh=mesh, eid=eid,
-                                  nseg=nseg, project_steps=3, tol=tol)
+                                nseg=nseg, project_steps=3, tol=tol)
         return curved_wedge_quadrature(level_set, K, arc, order_t=qvol, order_tau=qvol)
-
-    # len(keep) == 2
-    I1 = _edge_point(keep[0], drop[0]); I2 = _edge_point(keep[1], drop[0])
-    flipped, keep, drop = _normal_probe_flip(level_set, mesh, eid, side, I1, I2, keep, drop)
-    if flipped:
+    else:  # len(keep) == 2
         I1 = _edge_point(keep[0], drop[0]); I2 = _edge_point(keep[1], drop[0])
-    K1, K2 = V[keep[0]], V[keep[1]]
-    arc = interface_arc_nodes(level_set, I1, I2, mesh=mesh, eid=eid,
-                              nseg=nseg, project_steps=3, tol=tol)
-    return curved_quad_ruled_quadrature(K1, K2, arc, order_lambda=qvol, order_mu=qvol)
+        K1, K2 = V[keep[0]], V[keep[1]]
+        arc = interface_arc_nodes(level_set, I1, I2, mesh=mesh, eid=eid,
+                                nseg=nseg, project_steps=3, tol=tol)
+        return curved_quad_ruled_quadrature(K1, K2, arc, order_lambda=qvol, order_mu=qvol)
 
 # ---------------------
 

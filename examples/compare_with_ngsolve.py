@@ -435,8 +435,13 @@ def main():
     exact_pos_area = total_exact_area - exact_neg_area
     print(f"PC Areas comparison: +ve Area diff: {area_pos_pc - exact_pos_area:+.2e}, -ve Area diff: {area_neg_pc - exact_neg_area:+.2e}, Combined Area diff: {area_combined_pc - total_exact_area:+.2e}")
     print(f"NG Areas comparison: +ve Area diff: {area_pos_ng - exact_pos_area:+.2e}, -ve Area diff: {area_neg_ng - exact_neg_area:+.2e}, Combined Area diff: {area_combined_ng - total_exact_area:+.2e}")
-    err = srelerr(area_pos_pc, area_pos_ng)
-    print(f"Relative error (Area +ve): {err:+.2e}")
+    err_A_pos = srelerr(area_pos_pc, exact_pos_area)
+    err_A_neg = srelerr(area_neg_pc, exact_neg_area)
+    print(f"Relative error (Area +ve): {err_A_pos:+.2e}, (Area -ve): {err_A_neg:+.2e}")
+    print(f"PC Areas: +ve {area_pos_pc:.8f}, -ve {area_neg_pc:.8f}, Combined {area_combined_pc:.8f}")
+    print(f"NG Areas: +ve {area_pos_ng:.8f}, -ve {area_neg_ng:.8f}, Combined {area_combined_ng:.8f}")
+    print(f"Exact Areas: +ve {exact_pos_area:.8f}, -ve {exact_neg_area:.8f}, Combined {total_exact_area:.8f}")
+
 
 
 

@@ -88,14 +88,20 @@ if __name__ == "__main__":
     ny = int(H / maxh)
     mesh_tri, mesh_quad = make_meshes(L=L, H=H, nx=nx, ny=ny)
     phi = CircleLevelSet(center=(0.0, 0.0), radius=R)
-    Atrue = math.pi * R**2
+    Acircle = math.pi * R**2
+    A_exact_inside = Acircle
+    A_exact_outside = L*H - Acircle
+    def rel_err(A, A_exact):
+        return abs(A - A_exact) / A_exact
 
     print("== TRI mesh (compiler-style cut assembly) ==")
     for nseg in (3, 5, 7, 9, 13, 17):
-        A = compute_A_side_like_compiler(mesh_tri, phi, side='+', qvol=4, nseg_hint=nseg)
-        print(f"[tri ] nseg={nseg:2d}  A+={A:.8f}  rel.err={abs(A-Atrue)/Atrue:.3e}")
+        A_pos = compute_A_side_like_compiler(mesh_tri, phi, side='+', qvol=4, nseg_hint=nseg)
+        A_neg = compute_A_side_like_compiler(mesh_tri, phi, side='-', qvol=4, nseg_hint=nseg)
+        print(f"[tri ] nseg={nseg:2d}  A+={A_pos:.8f}  rel.err(A+)={rel_err(A_pos,A_exact_outside):.3e}, A-={A_neg:.8f}  rel.err(A-)={rel_err(A_neg,A_exact_inside):.3e}")
 
     print("\n== QUAD mesh (compiler-style cut assembly) ==")
     for nseg in (3, 5, 7, 9, 13, 17):
-        A = compute_A_side_like_compiler(mesh_quad, phi, side='+', qvol=4, nseg_hint=nseg)
-        print(f"[quad] nseg={nseg:2d}  A+={A:.8f}  rel.err={abs(A-Atrue)/Atrue:.3e}")
+        A_pos = compute_A_side_like_compiler(mesh_quad, phi, side='+', qvol=4, nseg_hint=nseg)
+        A_neg = compute_A_side_like_compiler(mesh_quad, phi, side='-', qvol=4, nseg_hint=nseg)
+        print(f"[quad] nseg={nseg:2d}  A+={A_pos:.8f}  rel.err(A+)={rel_err(A_pos,A_exact_outside):.3e}, A-={A_neg:.8f}  rel.err(A-)={rel_err(A_neg,A_exact_inside):.3e}")
