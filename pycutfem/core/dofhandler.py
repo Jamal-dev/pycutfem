@@ -1807,6 +1807,7 @@ class DofHandler:
         cut_element_ids,
         qdeg: int,
         level_set,
+        nseg: int | None = None,
         reuse: bool = True,
         need_hess: bool = False,
         need_o3: bool = False,
@@ -1818,7 +1819,7 @@ class DofHandler:
         """
         import numpy as np
         from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
-        from pycutfem.integration.quadrature import line_quadrature
+        from pycutfem.integration.quadrature import line_quadrature, curved_line_quadrature
         from pycutfem.core.levelset import CircleLevelSet, AffineLevelSet
         from pycutfem.core.levelset import _circle_value, _circle_grad, _affine_value, _affine_unit_grad  # type: ignore
         from pycutfem.fem import transform
@@ -1937,7 +1938,7 @@ class DofHandler:
                 _interface_cache[cache_key] = out
             return out
 
-        # --- Prepare segments for batched mapping -----------------------------------
+        # --- Prepare segments; curved Γ quadrature ----------------------------------
         nE = len(valid_cut_eids)
         P0 = np.empty((nE, 2), dtype=float)
         P1 = np.empty((nE, 2), dtype=float)
@@ -1949,18 +1950,18 @@ class DofHandler:
             h_arr[k] = float(mesh.element_char_length(eid))
             gdofs_map[k, :] = self.get_elemental_dofs(int(eid))
 
-        xi_1d, w_ref = gauss_legendre(qdeg)
-        xi_1d = np.asarray(xi_1d, float); w_ref = np.asarray(w_ref, float)
-        nQ = xi_1d.size
-
+        # choose a uniform nseg so nQ is constant across elements
+        nseg_eff = int(nseg if nseg is not None else max(3, mesh.poly_order + qdeg//2))
+        nQ = int(qdeg) * int(nseg_eff)
         qp_phys = np.empty((nE, nQ, 2), dtype=float)
         qw      = np.empty((nE, nQ),    dtype=float)
-        if _HAVE_NUMBA:
-            _batched(P0, P1, xi_1d, w_ref, qp_phys, qw)
-        else:
-            for k in range(nE):
-                pts, wts = line_quadrature(P0[k], P1[k], qdeg)
-                qp_phys[k, :, :] = pts; qw[k, :] = wts
+        for k in range(nE):
+            pts, wts = curved_line_quadrature(level_set, P0[k], P1[k],
+                                              order=qdeg, nseg=nseg_eff,
+                                              project_steps=3, tol=SIDE.tol)
+            # All elements produce the same nQ if nseg is uniform
+            qp_phys[k, :, :] = pts.reshape(nQ, 2)
+            qw[k, :]         = wts.reshape(nQ)
 
         # --- φ and normals along the interface -------------------------------------
         phis    = np.empty((nE, nQ), dtype=float)
@@ -1998,7 +1999,7 @@ class DofHandler:
                 xi_tab[k, q]  = float(s)
                 eta_tab[k, q] = float(t)
 
-        # --- Reference geometry (N,dN) and J, detJ, J_inv ---------------------------
+        # --- Geometry J, detJ, J_inv (use *geometry* p for mapping only) -----------
         elem_type = mesh.element_type
         p_geom    = mesh.poly_order  # geometry/order on the mesh
 
@@ -2065,55 +2066,20 @@ class DofHandler:
                 f"for element id {valid_cut_eids[e_bad]} at qp {q_bad}."
             )
 
-        # --- Basis & grad-basis on REFERENCE for each field -------------------------
+        # --- Basis & grad (per-field orders; ignore p_geom) ------------------------
         b_tabs = {f: np.zeros((nE, nQ, n_union), dtype=float) for f in fields}
         g_tabs = {f: np.zeros((nE, nQ, n_union, 2), dtype=float) for f in fields}
-
-        for fld in fields:
-            sl = me.component_dof_slices[fld]    # this field's slice in union-local
-            ord_f = me._field_orders[fld]
-
-            # Fast paths
-            if _HAVE_NUMBA and elem_type == "tri" and ord_f == 1 and p_geom == 1 and 'N_tab' in locals() and N_tab.shape[2] == 3:
-                b_tabs[fld][:, :, sl]    = N_tab
-                g_tabs[fld][:, :, sl, :] = dN_tab
-                continue
-
-            if _HAVE_NUMBA and elem_type == "quad" and ord_f == 1:
-                # If geometry is Q2, build local Q1 tables
-                if p_geom == 2 and ('N_tab' not in locals() or N_tab.shape[2] != 4):
-                    Nq1  = np.empty((nE, nQ, 4), dtype=float)
-                    dNq1 = np.empty((nE, nQ, 4, 2), dtype=float)
-                    _tabulate_q1(xi_tab, eta_tab, Nq1, dNq1)
-                    b_tabs[fld][:, :, sl]    = Nq1
-                    g_tabs[fld][:, :, sl, :] = dNq1
-                else:
-                    # geometry Q1 → already have Q1 in N_tab/dN_tab
-                    b_tabs[fld][:, :, sl]    = N_tab
-                    g_tabs[fld][:, :, sl, :] = dN_tab
-                continue
-
-        if _HAVE_NUMBA and elem_type == "quad" and any(me._field_orders[f]==2 for f in fields):
-            pass  # handled per-field below
-
-        # Fallback (and Q2 fast path per field)
+        xi_flat  = xi_tab.reshape(-1)
+        eta_flat = eta_tab.reshape(-1)
         for fld in fields:
             sl = me.component_dof_slices[fld]
-            ord_f = me._field_orders[fld]
-            if _HAVE_NUMBA and elem_type == "quad" and ord_f == 2:
-                Nq2  = np.empty((nE, nQ, 9), dtype=float)
-                dNq2 = np.empty((nE, nQ, 9, 2), dtype=float)
-                _tabulate_q2(xi_tab, eta_tab, Nq2, dNq2)
-                b_tabs[fld][:, :, sl]    = Nq2
-                g_tabs[fld][:, :, sl, :] = dNq2
-                continue
-            # Generic fallback using MixedElement (reference)
-            for k, eid in enumerate(valid_cut_eids):
-                for q in range(nQ):
-                    s, t = xi_tab[k, q], eta_tab[k, q]
-                    b_tabs[fld][k, q, sl]    = me._eval_scalar_basis(fld, s, t)
-                    g_tabs[fld][k, q, sl, :] = me._eval_scalar_grad (fld, s, t)
+            # vectorized reference evals from MixedElement, then reshape back
+            B = me._eval_scalar_basis_many(fld, xi_flat, eta_flat).reshape(nE, nQ, -1)
+            G = me._eval_scalar_grad_many (fld, xi_flat, eta_flat).reshape(nE, nQ, -1, 2)
+            b_tabs[fld][:, :, sl]    = B
+            g_tabs[fld][:, :, sl, :] = G
 
+        
         # --- Reference derivative tables d.._{field} for codegen (no push-forward) --
         # Up to the requested max: 1st (always), 2nd (need_hess), 3rd (need_o3), 4th (need_o4)
         base_derivs = {(1,0), (0,1)}
@@ -3059,6 +3025,7 @@ class DofHandler:
         need_hess: bool = False,
         need_o3: bool = False,
         need_o4: bool = False,
+        nseg_hint: int | None = None,
     ) -> dict:
         """
         Pre-compute geometry/basis for ∫_{Ω ∩ {φ ▷ 0}} (…) dx on CUT elements.
@@ -3085,6 +3052,7 @@ class DofHandler:
             clip_triangle_to_side as _clip_triangle_to_side_py,
             fan_triangulate       as _fan_triangulate_py,
             map_ref_tri_to_phys   as _map_ref_tri_to_phys_py,
+            curved_subcell_quadrature_for_cut_triangle
         )
 
         try:
@@ -3211,88 +3179,39 @@ class DofHandler:
 
             # loop over the element’s corner triangles
             for loc_tri in tri_local:
-                v_ids = [cn[i] for i in loc_tri]                               # 3 node ids
-                V     = mesh.nodes_x_y_pos[v_ids].astype(float)                # (3,2)
-                v_phi = np.array([phi_eval(level_set, V[0]),
-                                phi_eval(level_set, V[1]),
-                                phi_eval(level_set, V[2])], dtype=float)
-
-                # clip triangle to requested side and fan-triangulate
-                if _HAVE_NUMBA:
-                    poly, n_pts = _clip_triangle_to_side_numba(V, v_phi, sgn,0,
-                                SIDE.pos_is_phi_nonnegative,
-                                SIDE.zero_belongs_to_pos
+                # NEW: curved subcell quadrature on this corner-triangle
+                qx, qw = curved_subcell_quadrature_for_cut_triangle(
+                    mesh, int(eid), loc_tri, cn, level_set,
+                    side=('+' if sgn == +1 else '-'),
+                    qvol=int(qdeg), nseg_hint=nseg_hint, tol=1e-12
+                )
+                if qx.size == 0:
+                    continue
+                for x, w in zip(qx, qw):
+                    s, t  = transform.inverse_mapping(mesh, int(eid), x)
+                    rec   = _JET.get(mesh, int(eid), float(s), float(t), upto=kmax_jets)
+                    Ji    = rec["A"]                          # (2,2)
+                    # store per-qp geometry
+                    xq_elem.append(np.asarray(x, dtype=float))
+                    wq_elem.append(float(w))
+                    Jinv_elem.append(Ji)
+                    phi_elem.append(float(phi_eval(level_set, x)))
+                    # inverse-jet chains if requested (unchanged)
+                    if need_hess:
+                        A2 = rec["A2"]; H0_elem.append(np.asarray(A2[0], float)); H1_elem.append(np.asarray(A2[1], float))
+                    if need_o3:
+                        A3 = rec["A3"]; T0_elem.append(np.asarray(A3[0], float)); T1_elem.append(np.asarray(A3[1], float))
+                    if need_o4:
+                        A4 = rec["A4"]; Q0_elem.append(np.asarray(A4[0], float)); Q1_elem.append(np.asarray(A4[1], float))
+                    # per-field reference basis/derivs at (s,t) — still per-field order
+                    for fld in fields:
+                        basis_lists.setdefault(f"b_{fld}", []).append(np.asarray(me._eval_scalar_basis(fld, float(s), float(t)), float))
+                        basis_lists.setdefault(f"g_{fld}", []).append(np.asarray(me._eval_scalar_grad (fld, float(s), float(t)), float))
+                        for (dx, dy) in derivs_eff:
+                            if (dx, dy) == (0, 0): continue
+                            basis_lists.setdefault(f"d{dx}{dy}_{fld}", []).append(
+                                np.asarray(me._eval_scalar_deriv(fld, float(s), float(t), int(dx), int(dy)), float)
                             )
-                    if n_pts < 3:
-                        continue
-                    if n_pts == 3:
-                        tris = [(poly[0], poly[1], poly[2])]
-                    else:
-                        tris_arr, n_tris = _fan_triangulate_numba(poly, n_pts)
-                        tris = [(tris_arr[t,0], tris_arr[t,1], tris_arr[t,2]) for t in range(n_tris)]
-                else:
-                    polys = _clip_triangle_to_side_py(V, v_phi, side=('+' if sgn == +1 else '-'))
-                    if not polys:
-                        continue
-                    tris = []
-                    for poly in polys:
-                        tris.extend(_fan_triangulate_py(poly))
-
-                # each subtriangle → map ref rule to physical and append QPs
-                for (A, B, C) in tris:
-                    if _HAVE_NUMBA:
-                        x_phys, w_phys = _map_ref_tri_to_phys_numba(
-                            np.asarray(A), np.asarray(B), np.asarray(C), qp_ref_tri, qw_ref_tri
-                        )
-                    else:
-                        x_phys, w_phys = _map_ref_tri_to_phys_py(A, B, C, qp_ref_tri, qw_ref_tri)
-
-                    for q in range(nQ_ref):
-                        x = x_phys[q]; w = float(w_phys[q])
-                        # parent reference coords and inverse-geometry jets
-                        s, t  = transform.inverse_mapping(mesh, int(eid), x)
-                        rec   = _JET.get(mesh, int(eid), float(s), float(t), upto=kmax_jets)
-                        Ji    = rec["A"]  # (2,2)
-
-                        # store per-qp geometry
-                        xq_elem.append(np.asarray(x, dtype=float))
-                        wq_elem.append(w)
-                        Jinv_elem.append(Ji)
-                        phi_elem.append(float(phi_eval(level_set, x)))
-
-                        # inverse-map jets (chain rule) if requested
-                        if need_hess:
-                            A2 = rec["A2"]  # (2,2,2)
-                            H0_elem.append(np.asarray(A2[0], dtype=float))
-                            H1_elem.append(np.asarray(A2[1], dtype=float))
-                        if need_o3:
-                            A3 = rec["A3"]  # (2,2,2,2)
-                            T0_elem.append(np.asarray(A3[0], dtype=float))
-                            T1_elem.append(np.asarray(A3[1], dtype=float))
-                        if need_o4:
-                            A4 = rec["A4"]  # (2,2,2,2,2)
-                            Q0_elem.append(np.asarray(A4[0], dtype=float))
-                            Q1_elem.append(np.asarray(A4[1], dtype=float))
-
-                        # Reference basis/derivatives per field at (s,t)
-                        for fld in fields:
-                            kb, kg = f"b_{fld}", f"g_{fld}"
-                            # b_: (n_f,), g_: (n_f,2)
-                            basis_lists.setdefault(kb, []).append(
-                                np.asarray(me._eval_scalar_basis(fld, float(s), float(t)), dtype=float)
-                            )
-                            basis_lists.setdefault(kg, []).append(
-                                np.asarray(me._eval_scalar_grad (fld, float(s), float(t)), dtype=float)
-                            )
-                            # requested derivatives (reference), with closure (derivs_eff)
-                            for (dx, dy) in derivs_eff:
-                                if (dx, dy) == (0, 0):
-                                    continue
-                                kd = f"d{dx}{dy}_{fld}"
-                                basis_lists.setdefault(kd, []).append(
-                                    np.asarray(me._eval_scalar_deriv(fld, float(s), float(t),
-                                                                    int(dx), int(dy)), dtype=float)
-                                )
 
             # no quadrature in this element? skip
             if not wq_elem:
@@ -3383,6 +3302,8 @@ class DofHandler:
             "entity_kind": "element",
             "owner_id":   np.asarray(valid_eids, dtype=np.int32),
             "is_interface": False,
+            "J_inv_pos": J_inv,   # for compatibility with interface kernels
+            "J_inv_neg": J_inv,   # ditto
         }
 
         # organize ragged per-field lists into per-element arrays

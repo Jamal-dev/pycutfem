@@ -224,6 +224,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
         dom = intg.measure.domain_type           # "volume", "interface", "ghost_edge", ...
         qdeg = fc._find_q_order(intg)
         on_facet = intg.measure.on_facet
+        md = intg.measure.metadata or {}
+        nseg = int(md.get("nseg", max(3, 1 + qdeg // 2)))
 
         # Compile the backend once; reuse for all subsets of this integral
         runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element, on_facet=on_facet)
@@ -343,7 +345,12 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 cut_bs = (bs & cut_mask) if bs is not None else cut_mask
 
                 geom_cut = dof_handler.precompute_cut_volume_factors(
-                    cut_bs, qdeg, derivs, level_set, side=side, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4
+                    cut_bs, qdeg, derivs, level_set, 
+                    side=side, 
+                    need_hess=need_hess, 
+                    need_o3=need_o3, 
+                    need_o4=need_o4,
+                    nseg=nseg
                 )
                 cut_eids = np.asarray(geom_cut.get("eids", []), dtype=np.int32)
                 if cut_eids.size:
@@ -374,11 +381,18 @@ def compile_multi(form, *, dof_handler, mixed_element,
         # INTERFACE (cut edges/faces)
         # ------------------------------------------------------------------
         if dom == "interface":
+            
             level_set = intg.measure.level_set
             bs_cut = mixed_element.mesh.element_bitset("cut")
             bs_def = intg.measure.defined_on
+
             cut_eids = (bs_def & bs_cut) if bs_def is not None else bs_cut
-            geom = dof_handler.precompute_interface_factors(cut_eids, qdeg, level_set, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
+            geom = dof_handler.precompute_interface_factors(cut_eids, qdeg, 
+                                                            level_set, 
+                                                            need_hess=need_hess, 
+                                                            need_o3=need_o3, 
+                                                            need_o4=need_o4,
+                                                            nseg=nseg)
             geom["is_interface"] = True
 
             # interface assembly still uses element-local maps; safe to use all

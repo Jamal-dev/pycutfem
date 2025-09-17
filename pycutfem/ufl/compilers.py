@@ -1802,6 +1802,7 @@ class FormCompiler:
             - accumulate into local vector/matrix or functional
         • Scatter local contributions to the global matvec.
         """
+        from pycutfem.integration.quadrature import curved_line_quadrature
 
         log = logging.getLogger(__name__)
 
@@ -1814,7 +1815,8 @@ class FormCompiler:
         # Mark that we are on Γ so Pos/Neg visitors set ctx['side'] & select (pos|neg)_eid
         self.ctx['is_interface'] = True
         self.ctx['is_ghost'] = False
-        side_md = (intg.measure.metadata or {}).get('side', None)
+        md = intg.measure.metadata or {}
+        side_md = md.get('side', None)
         if side_md in ('+', '-'):
             self.ctx['measure_side'] = side_md
 
@@ -1823,7 +1825,7 @@ class FormCompiler:
         p_geo  = int(getattr(self.me.mesh, "poly_order", 1))
         qdeg  += 2 * max(0, p_geo - 1)
         fields = self._fields_for(intg.integrand)
-
+        nseg = int(md.get("nseg", max(3, self.me.mesh.poly_order + qdeg//2)))
 
         trial, test = _trial_test(intg.integrand)
         hook = self._hook_for(intg.integrand)
@@ -1862,7 +1864,9 @@ class FormCompiler:
 
                 # Quadrature on the physical interface segment
                 p0, p1 = elem.interface_pts
-                qpts, qwts = line_quadrature(p0, p1, qdeg)
+                qpts, qwts = curved_line_quadrature(level_set, p0, p1,
+                                     order=qdeg, nseg=nseg,
+                                     project_steps=3, tol=SIDE.tol)
 
                 # Local accumulator in union layout (or scalar for functional)
                 if is_functional:
@@ -3032,7 +3036,7 @@ class FormCompiler:
             prebuilt = dict(prebuilt)
             prebuilt["gdofs_map"]  = gdofs_map
             prebuilt["node_coords"] = dh.get_all_dof_coords()  # required in param_order
-
+            prebuilt["eids"]      = eids 
             static_args = _build_jit_kernel_args(
                 ir, intg.integrand, me, qdeg,
                 dof_handler=dh,
@@ -3067,7 +3071,10 @@ class FormCompiler:
                 "phis":    None if geo_all["phis"] is None else geo_all["phis"][full_ids],
                 "owner_id": geo_all.get("owner_id", geo_all["eids"])[full_ids].astype(np.int32),
                 "entity_kind": "element",
-                "is_interface": False
+                "is_interface": False,
+                "eids": full_ids,
+                "J_inv_pos": geo_all["J_inv"][full_ids],
+                "J_inv_neg": geo_all["J_inv"][full_ids],
             }
             _run_subset(full_ids, prebuilt_full)
 

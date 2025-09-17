@@ -8,6 +8,7 @@ import pycutfem.jit.symbols as symbols
 from pycutfem.utils.bitset import BitSet
 from pycutfem.ufl.expressions import Restriction
 from pycutfem.fem.transform import element_Hxi   # new util
+# from pycutfem.ufl.helpers_jit import _find_all_bitsets
 
 
 
@@ -105,12 +106,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
     from pycutfem.ufl.helpers import _find_all
     from pycutfem.fem import transform
 
-    # Optional: BitSet finder (fallback to no-op if not available)
-    try:
-        from pycutfem.ufl.helpers import _find_all_bitsets  # type: ignore
-    except Exception:
-        def _find_all_bitsets(_expr):  # noqa: N802
-            return []
+  
 
     logger = __import__("logging").getLogger(__name__)
     dbg    = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
