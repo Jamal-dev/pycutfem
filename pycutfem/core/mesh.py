@@ -111,14 +111,43 @@ class Mesh:
             left_eid = shared_eids[0]
             vA, vB = -1, -1
             left_elem_corners = self.corner_connectivity[left_eid]
+            local_edge_idx = None
             for i in range(len(left_elem_corners)):
-                if {int(left_elem_corners[i]), int(left_elem_corners[(i + 1) % len(left_elem_corners)])} == {n_min, n_max}:
-                    vA, vB = int(left_elem_corners[i]), int(left_elem_corners[(i + 1) % len(left_elem_corners)])
+                a = int(left_elem_corners[i]); b = int(left_elem_corners[(i + 1) % len(left_elem_corners)])
+                if {a, b} == {n_min, n_max}:
+                    vA, vB = a, b
+                    local_edge_idx = i  # 0..3 for quads
                     break
             right_eid = shared_eids[1] if len(shared_eids) > 1 else None
             normal_vec = self._compute_normal((vA, vB))
-            all_edge_nodes = _locate_all_nodes_in_edge(vA, vB)
-            edge_obj = Edge(gid=edge_gid, nodes=(vA, vB), left=left_eid, right=right_eid, normal=normal_vec,all_nodes=all_edge_nodes)
+            # Collect all nodes lying on this geometric edge in O(p) using the
+            # left element's local connectivity when possible (quad, p>=1).
+            all_edge_nodes: Tuple[int, ...]
+            if (self.element_type == 'quad') and (local_edge_idx is not None):
+                # Local node layout is row-major with (p+1) nodes per row/col
+                p = int(self.poly_order)
+                n1 = p + 1
+                loc_nodes = list(self.elements_list[left_eid].nodes)
+                # Build local-index sequence for the chosen edge in the correct orientation
+                if local_edge_idx == 0:      # bottom: (0,0) -> (p,0)
+                    idxs = [k for k in range(0, n1)]
+                    oriented = (vA == left_elem_corners[0] and vB == left_elem_corners[1])
+                elif local_edge_idx == 1:    # right : (p,0) -> (p,p)
+                    idxs = [k*n1 + (n1-1) for k in range(0, n1)]
+                    oriented = (vA == left_elem_corners[1] and vB == left_elem_corners[2])
+                elif local_edge_idx == 2:    # top   : (p,p) -> (0,p)
+                    idxs = [p*n1 + k for k in range(0, n1)]
+                    oriented = (vA == left_elem_corners[2] and vB == left_elem_corners[3])
+                else:                         # left  : (0,p) -> (0,0)
+                    idxs = [k*n1 for k in range(0, n1)]
+                    oriented = (vA == left_elem_corners[3] and vB == left_elem_corners[0])
+                if not oriented:
+                    idxs = list(reversed(idxs))
+                all_edge_nodes = tuple(int(loc_nodes[ii]) for ii in idxs)
+            else:
+                # Fallback to geometric scan (rare/unstructured)
+                all_edge_nodes = _locate_all_nodes_in_edge(vA, vB)
+            edge_obj = Edge(gid=edge_gid, nodes=(vA, vB), left=left_eid, right=right_eid, normal=normal_vec, all_nodes=all_edge_nodes)
             self.edges_list.append(edge_obj)
             self._edge_dict[(n_min, n_max)] = edge_obj
             if right_eid is not None:

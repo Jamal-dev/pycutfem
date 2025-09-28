@@ -32,6 +32,22 @@ def x_mapping(mesh, elem_id, xi_eta):
     N,_ = _shape_and_grad(ref, xi_eta)
     return N @ nodes_x_y_pos                  # (2,)
 
+def x_mapping_many(mesh, elem_id, xi_arr, eta_arr):
+    """
+    Map many reference points (xi_arr, eta_arr) on one element to physical.
+    Returns an array of shape (n, 2).
+    """
+    nodes = mesh.nodes[mesh.elements_connectivity[elem_id]]
+    X = mesh.nodes_x_y_pos[nodes]  # (n_loc, 2)
+    ref = get_reference(mesh.element_type, mesh.poly_order)
+    xi = np.asarray(xi_arr, dtype=float).ravel()
+    eta = np.asarray(eta_arr, dtype=float).ravel()
+    n = xi.size
+    Ntab = np.empty((n, X.shape[0]), dtype=float)
+    for k in range(n):
+        Ntab[k, :] = np.asarray(ref.shape(float(xi[k]), float(eta[k]))).ravel()
+    return Ntab @ X  # (n,2)
+
 def jacobian(mesh, elem_id, xi_eta):
     nodes = mesh.nodes[mesh.elements_connectivity[elem_id]]
     nodes_x_y_pos = mesh.nodes_x_y_pos[nodes]

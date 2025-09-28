@@ -299,14 +299,24 @@ def _edge_ref_nodes(mesh, local_edge: int, p: int):
         raise KeyError(mesh.element_type)
 
 def _phi_on_e_points(level_set, mesh, eid: int, xi: np.ndarray, eta: np.ndarray) -> np.ndarray:
-    vals = np.empty_like(xi, float)
+    xi = np.asarray(xi, float).ravel(); eta = np.asarray(eta, float).ravel()
+    n = xi.size
+    # Fast vectorized path if available for FE-backed LS
+    if hasattr(level_set, "values_on_element_many"):
+        return np.asarray(level_set.values_on_element_many(int(eid), xi, eta), float)
+    # Otherwise, fall back to scalar loops
+    vals = np.empty(n, dtype=float)
     if hasattr(level_set, "value_on_element"):
-        for k in range(xi.size):
+        for k in range(n):
             vals[k] = float(level_set.value_on_element(int(eid), (float(xi[k]), float(eta[k]))))
     else:
-        for k in range(xi.size):
-            x = transform.x_mapping(mesh, int(eid), (float(xi[k]), float(eta[k])))
-            vals[k] = float(level_set(np.asarray(x, float)))
+        # Map all points, then evaluate LS in a vectorized call if supported
+        pts = [transform.x_mapping(mesh, int(eid), (float(xi[k]), float(eta[k]))) for k in range(n)]
+        try:
+            vals = np.asarray(level_set(np.asarray(pts, float)), float).reshape(n)
+        except Exception:
+            for k in range(n):
+                vals[k] = float(level_set(np.asarray(pts[k], float)))
     return vals
 
 def _corner_ref_coords(mesh):
@@ -324,8 +334,11 @@ def edge_root_pn(level_set, mesh, eid: int, local_edge: int, *, tol: float = SID
     # sampling order
     if hasattr(level_set, "dh") and hasattr(level_set, "field"):
         p = max(1, int(level_set.dh.mixed_element._field_orders[level_set.field]))
+        p_samp = p
     else:
+        # Analytic LS → cheap sampling is fine (final projection will correct endpoints)
         p = 1
+        p_samp = 1
     tnodes, xi, eta = _edge_ref_nodes(mesh, int(local_edge), p)
     fvals = _phi_on_e_points(level_set, mesh, int(eid), xi, eta)
 
@@ -807,5 +820,154 @@ def clip_triangle_to_side_pn(mesh, eid, tri_local_ids, corner_ids, level_set, si
         I1 = _edge_point(k1, d); I2 = _edge_point(k2, d)
         return [[V[k1], I1, I2, V[k2]]]
 
+# ============================================================================
+# Vectorized endpoint detection for quad elements (Γ ∩ ∂K endpoints)
+# ============================================================================
+def find_interface_endpoints_quads_from_cut_ids(mesh, level_set, cut_ids, tol=1e-12):
+    """
+    Fast, element‑aware endpoint detection for quad parents using p‑node
+    sampling along each edge and barycentric Brent refinement.
 
+    - Uses values_on_element_many/gradient_on_element where available
+      (no global searches; works per known element).
+    - Honors curved edges for higher‑order geometry.
 
+    Returns P0(E,2), P1(E,2), eids(E,). Only elements with two distinct
+    endpoints are kept.
+    """
+    import numpy as _np
+
+    # Q1 fast path: linear edges → cheap sign-change interpolation on corners
+    def _fast_q1_for_eid(eid):
+        edges = [(0,1), (1,2), (2,3), (3,0)]
+        cn = mesh.elements_list[int(eid)].corner_nodes
+        pts = mesh.nodes_x_y_pos[np.asarray(cn, int)]  # (4,2)
+        # local φ at the 4 corners (use FE-eval on nodes if available)
+        try:
+            phi_c = np.array([phi_eval(level_set, pts[i], eid=int(eid), mesh=mesh) for i in range(4)], float)
+        except Exception:
+            phi_c = np.array([float(level_set(pts[i])) for i in range(4)], float)
+        inters = []
+        for (i,j) in edges:
+            a, b = pts[i], pts[j]
+            pa, pb = phi_c[i], phi_c[j]
+            if pa * pb < 0.0:
+                t = pa / (pa - pb)
+                t = min(max(t, 0.0), 1.0)
+                inters.append((1.0 - t) * a + t * b)
+            else:
+                if abs(pa) <= tol: inters.append(a)
+                if abs(pb) <= tol: inters.append(b)
+        # dedup and pick pair
+        if len(inters) < 2:
+            return None
+        _in = _dedup(inters, eps=1e-12)
+        if len(_in) == 2:
+            return _in
+        # fallback: farthest pair
+        best = None
+        for i in range(len(_in)):
+            for j in range(i+1, len(_in)):
+                d = float(np.linalg.norm(np.asarray(_in[i]) - np.asarray(_in[j])))
+                if best is None or d > best[0]:
+                    best = (d, _in[i], _in[j])
+        return [best[1], best[2]] if best else None
+
+    # sampling order from FE if available
+    if hasattr(level_set, "dh") and hasattr(level_set, "field"):
+        p = max(1, int(level_set.dh.mixed_element._field_orders[level_set.field]))
+        p_samp = p
+    else:
+        # analytic LS: cheap sampling, projection will correct
+        p = 1
+        p_samp = 1
+
+    tnodes = _np.linspace(0.0, 1.0, int(p_samp) + 1)
+    w_bary = _bary_weights(tnodes)
+
+    def _edge_param(local_edge):
+        t = tnodes
+        if   local_edge == 0:  xi = 2*t - 1;  eta = -_np.ones_like(t)
+        elif local_edge == 1:  xi =  _np.ones_like(t); eta = -1 + 2*t
+        elif local_edge == 2:  xi =  1 - 2*t; eta =  _np.ones_like(t)
+        elif local_edge == 3:  xi = -_np.ones_like(t); eta =  1 - 2*t
+        else: raise IndexError(local_edge)
+        return xi, eta
+
+    def _edge_phys_point(eid, local_edge, r):
+        # Map r∈[0,1] on local edge to (xi,eta) and then to physical
+        if   local_edge == 0: xy = (2*r - 1, -1.0)
+        elif local_edge == 1: xy = ( 1.0, -1 + 2*r)
+        elif local_edge == 2: xy = (1 - 2*r,  1.0)
+        else:                  xy = (-1.0,  1 - 2*r)
+        P = transform.x_mapping(mesh, int(eid), (float(xy[0]), float(xy[1])))
+        return _np.asarray(P, float)
+
+    def _phi_edge(eid, xi, eta):
+        if hasattr(level_set, "values_on_element_many"):
+            return _np.asarray(level_set.values_on_element_many(int(eid), _np.asarray(xi,float), _np.asarray(eta,float)), float)
+        # fallback
+        return _phi_on_e_points(level_set, mesh, int(eid), _np.asarray(xi,float), _np.asarray(eta,float))
+
+    def _edge_roots(eid, local_edge):
+        # sample φ along the edge
+        xi, eta = _edge_param(local_edge)
+        fvals = _phi_edge(eid, xi, eta)
+        pts = []
+        # whole edge on Γ
+        if _np.all(_np.abs(fvals) <= tol):
+            pts.append(_edge_phys_point(eid, local_edge, 0.0))
+            pts.append(_edge_phys_point(eid, local_edge, 1.0))
+            return pts
+        # bracket each subinterval where sign changes
+        for k in range(fvals.size - 1):
+            fa, fb = float(fvals[k]), float(fvals[k+1])
+            if fa * fb > 0.0:
+                continue
+            a = float(tnodes[k]); b = float(tnodes[k+1])
+            fun = lambda tt: _bary_eval(float(tt), tnodes, fvals, w_bary)
+            r, _ = _brent_root(fun, a, b, fa, fb, tol=tol)
+            if r is None:
+                continue
+            pts.append(_edge_phys_point(eid, local_edge, float(r)))
+        return pts
+
+    def _dedup(seq, eps=1e-12):
+        out = []
+        for P in seq:
+            P = _np.asarray(P, float)
+            if not any(_np.linalg.norm(P - _np.asarray(Q, float)) < eps for Q in out):
+                out.append(P)
+        return out
+
+    P0_list = []; P1_list = []; kept = []
+    fe_backed = hasattr(level_set, 'dh') and hasattr(level_set, 'field')
+    for eid in cut_ids:
+        eid = int(eid)
+        # Fast-path for Q1 geometry OR analytic LS (projection will refine)
+        if (getattr(mesh, 'poly_order', 1) == 1) or (not fe_backed):
+            pair = _fast_q1_for_eid(eid)
+            if pair is not None:
+                P0_list.append(np.asarray(pair[0], float)); P1_list.append(np.asarray(pair[1], float)); kept.append(eid)
+                continue
+        points = []
+        for e_local in (0, 1, 2, 3):
+            points.extend(_edge_roots(eid, e_local))
+        points = _dedup(points, eps=1e-12)
+        if len(points) < 2:
+            continue
+        if len(points) > 2:
+            # farthest pair
+            best_i = best_j = -1; best_d = -1.0
+            for i in range(len(points)):
+                for j in range(i+1, len(points)):
+                    d = float(_np.linalg.norm(points[i] - points[j]))
+                    if d > best_d:
+                        best_d = d; best_i = i; best_j = j
+            P0_list.append(points[best_i]); P1_list.append(points[best_j]); kept.append(eid)
+        else:
+            P0_list.append(points[0]); P1_list.append(points[1]); kept.append(eid)
+
+    if len(kept) == 0:
+        return _np.empty((0,2), float), _np.empty((0,2), float), _np.array([], dtype=int)
+    return _np.asarray(P0_list, float), _np.asarray(P1_list, float), _np.asarray(kept, dtype=int)
