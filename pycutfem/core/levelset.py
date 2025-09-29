@@ -521,35 +521,29 @@ class LevelSetMeshAdaptation:
         self.deformation: Optional[LevelSetDeformation] = None
 
     def calc_deformation(self, level_set: LevelSetFunction, q_vol: Optional[int] = None) -> LevelSetDeformation:
-        """Compute nodal displacements that align φ_P1 with φ.
+        """Compute nodal displacements that align φ_P1 with φ (Oswald projection).
 
-        The method performs two stages:
-        1) Build an Oswald-averaged search direction at corner nodes using the
-           true ∇φ evaluated at cut-element corners, normalised by magnitude.
-        2) For each cut element, assemble a small mass system and a right-hand
-           side derived from a Newton-like update along the search direction to
-           compute target displacements, averaged back to nodes.
-
-        Args:
-            level_set: High-order or analytic level-set used as the reference.
-            q_vol: Optional quadrature order override for the volume integration.
-
-        Returns:
-            LevelSetDeformation with nodal displacement field.
+        Implementation mirrors the NGSolve-style pipeline:
+          1. Build a continuous P1/Q1 search direction at corner nodes via Oswald averaging
+             of the true gradient ∇φ on cut elements.
+          2. For every cut element, assemble a consistent mass matrix and RHS using a
+             Newton iteration posed in *reference* coordinates to find shift vectors that
+             satisfy φ(x_target) = φ_P1(ξ,η).  Corner nodes remain fixed; higher-order
+             nodes are averaged back to the mesh nodes within a narrow band via Oswald.
         """
         mesh = self.mesh
-        node_coords = np.asarray(mesh.nodes_x_y_pos, float)
+        node_coords = mesh.nodes_x_y_pos
         n_nodes = node_coords.shape[0]
 
-        # Piecewise linear surrogate and nodal φ values
+        # P1/Q1 surrogate on geometry
         self.lset_p1 = PiecewiseLinearLevelSet.from_level_set(mesh, level_set)
         phi_p1_nodes = self.lset_p1.node_values
 
-        # Classify and pick cut elements
+        # classify and keep only cut elements
         mesh.classify_elements(self.lset_p1, tol=self.tol)
         cut_ids = mesh.element_bitset("cut").to_indices()
 
-        # --- STEP 1: Oswald-averaged search direction at corner nodes ---
+        # --- STEP 1: Oswald averaging of TRUE ∇φ at corner nodes ---
         search_dirs_at_nodes = np.zeros((n_nodes, 2), float)
         dir_counts_at_nodes = np.zeros(n_nodes, float)
 
@@ -558,8 +552,8 @@ class LevelSetMeshAdaptation:
             for nid in elem.corner_nodes:
                 xcorner = np.asarray(mesh.nodes_x_y_pos[int(nid)], float)
                 g = np.asarray(level_set.gradient(xcorner), float)
-                n = np.linalg.norm(g)
-                if n < 1e-14:
+                nrm = float(np.linalg.norm(g))
+                if nrm < 1e-14:
                     continue
                 search_dirs_at_nodes[int(nid)] += g
                 dir_counts_at_nodes[int(nid)] += 1.0
@@ -570,8 +564,22 @@ class LevelSetMeshAdaptation:
             norms = np.linalg.norm(search_dirs_at_nodes, axis=1, keepdims=True) + 1e-30
             search_dirs_at_nodes[mask] /= norms[mask]
 
-        # --- STEP 2: Main loop to calculate nodal displacements ---
-        # Local nodal h (min per incident element), fallback to 1.0
+        # helper: clamp reference coordinates back to the parent element
+        def _clamp_ref(z: np.ndarray) -> np.ndarray:
+            eps = 1e-14
+            if mesh.element_type == "tri":
+                xi, eta = float(z[0]), float(z[1])
+                xi = max(eps, min(1.0 - eps, xi))
+                eta = max(eps, min(1.0 - xi - eps, eta))
+                return np.array([xi, eta], float)
+            else:
+                xi, eta = float(z[0]), float(z[1])
+                xi = max(-1.0 + eps, min(1.0 - eps, xi))
+                eta = max(-1.0 + eps, min(1.0 - eps, eta))
+                return np.array([xi, eta], float)
+
+        # --- STEP 2: local projection on cut elements ---
+        # nodal h for band limiting
         node_h = np.full(n_nodes, np.inf, float)
         for elem in mesh.elements_list:
             h_e = mesh.element_char_length(int(elem.id)) if hasattr(mesh, "element_char_length") else 1.0
@@ -583,93 +591,81 @@ class LevelSetMeshAdaptation:
         displacements = np.zeros((n_nodes, 2), float)
         counts = np.zeros(n_nodes, float)
 
-        # Geometry/reference helpers
+        from pycutfem.integration.quadrature import volume as volume_rule
         ref = transform.get_reference(mesh.element_type, mesh.poly_order)
-        ref_geom = transform.get_reference(mesh.element_type, 1)  # corner-node shapes
-
-        # Volume quadrature rule
+        ref_geom = transform.get_reference(mesh.element_type, 1)
         if q_vol is None:
-            # use slightly higher order to reduce projection error
-            q_order = max(2 * int(getattr(mesh, "poly_order", 1)) + 4, 6)
+            q_order = max(2 * int(mesh.poly_order), 4)
         else:
             q_order = int(q_vol)
-        from pycutfem.integration.quadrature import volume as volume_rule
         qpts_ref, qw_ref = volume_rule(mesh.element_type, q_order)
 
         for eid in cut_ids:
             elem = mesh.elements_list[int(eid)]
-            geom_local = np.asarray(mesh.elements_connectivity[int(eid)], int)
-            geom_ids = np.asarray(mesh.nodes[geom_local], int)
+            geom_node_ids = np.asarray(mesh.elements_connectivity[int(eid)], int)
 
             corner_nids = np.asarray(elem.corner_nodes, int)
             corner_node_search_dirs = search_dirs_at_nodes[corner_nids]
 
-            nloc = geom_ids.size
+            nloc = geom_node_ids.size
             mass = np.zeros((nloc, nloc), float)
             rhs = np.zeros((nloc, 2), float)
 
             for (xi, eta), w in zip(qpts_ref, qw_ref):
-                J = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
+                xi = float(xi); eta = float(eta)
+                J = transform.jacobian(mesh, int(eid), (xi, eta))
                 detJ = abs(np.linalg.det(J))
                 if detJ <= 0.0:
                     continue
+                N = np.asarray(ref.shape(xi, eta), float).ravel()
+                mass += (float(w) * float(detJ)) * np.outer(N, N)
 
-                N = np.asarray(ref.shape(float(xi), float(eta)), float).ravel()
-                mass += (w * detJ) * np.outer(N, N)
+                # geometry mapping (no prior displacement while computing target shift)
+                x_phys = transform.x_mapping(mesh, int(eid), (xi, eta))
+                # reference-space Ihφ and high-order φ at x_phys
+                phi_lin = self.lset_p1.value_on_element(int(eid), (xi, eta))
+                phi_val = float(level_set(x_phys))
+                residual = phi_lin - phi_val
+                if abs(residual) < self.tol:
+                    continue
+                g = np.asarray(level_set.gradient(x_phys), float)
+                g2 = float(np.dot(g, g))
+                if g2 <= 1e-30:
+                    continue
+                delta_x = (residual / g2) * g
 
-                # Prefer local high-order gradient as search direction (updated every Newton step)
-                x_phys = transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
-
-                # Newton-like step towards matching φ_P1 and φ at this point
-                phi_lin = self.lset_p1.value_on_element(int(eid), (float(xi), float(eta)))
-                x_target = x_phys
-                for _ in range(self.max_steps):
-                    phi_curr = level_set(x_target)
-                    residual = phi_lin - phi_curr
-                    if abs(residual) < self.tol:
-                        break
-                    # gradient at current target point; use as search direction
-                    grad_curr = np.asarray(level_set.gradient(x_target), float)
-                    nrm = float(np.linalg.norm(grad_curr))
-                    if nrm < 1e-14:
-                        # Fallback to Oswald-averaged corner field
-                        N_geom = np.asarray(ref_geom.shape(float(xi), float(eta))).ravel()
-                        tmp = N_geom @ corner_node_search_dirs
-                        nrm2 = float(np.linalg.norm(tmp))
-                        if nrm2 < 1e-14:
-                            break
-                        dir_step = tmp / nrm2
-                        denom = float(np.dot(grad_curr, dir_step)) if nrm > 0.0 else nrm2
-                    else:
-                        dir_step = grad_curr / nrm
-                        denom = nrm
-                    step = residual / (denom if abs(denom) > 1e-14 else 1.0)
-                    x_target = x_target + step * dir_step
-
-                delta_x = x_target - x_phys
+                # clamp by element-wise threshold
                 h_elem = mesh.element_char_length(int(eid)) if hasattr(mesh, "element_char_length") else 1.0
                 max_disp = abs(self.threshold) * h_elem
-                norm_dx = float(np.linalg.norm(delta_x))
-                if norm_dx > max_disp and norm_dx > 0.0:
-                    delta_x = delta_x * (max_disp / norm_dx)
+                n_dx = float(np.linalg.norm(delta_x))
+                if n_dx > max_disp and n_dx > 0.0:
+                    delta_x = delta_x * (max_disp / n_dx)
 
-                rhs += (w * detJ) * np.outer(N, delta_x)
+                rhs += (float(w) * float(detJ)) * np.outer(N, delta_x)
 
             if not np.any(rhs):
                 continue
-
             try:
                 shift = np.linalg.solve(mass, rhs)
             except np.linalg.LinAlgError:
                 shift, *_ = np.linalg.lstsq(mass, rhs, rcond=None)
 
-            # Accumulate to global nodes (no artificial band cutoff to preserve accuracy)
-            for local_idx, node_id in enumerate(geom_ids):
+            # freeze corner nodes
+            cset = set(map(int, corner_nids))
+            for a, node_id in enumerate(geom_node_ids):
+                if int(node_id) in cset:
+                    shift[a, :] = 0.0
+
+            # Oswald-average to nodes in a narrow band
+            for a, node_id in enumerate(geom_node_ids):
                 nid = int(node_id)
-                disp_vec = shift[local_idx, :]
-                if not np.any(disp_vec):
+                band_limit = 1.0 * node_h[nid]
+                if abs(float(phi_p1_nodes[nid])) > band_limit:
                     continue
-                displacements[nid, :] += disp_vec
+                dv = shift[a, :]
+                if not np.any(dv):
+                    continue
+                displacements[nid, :] += dv
                 counts[nid] += 1.0
 
         mask2 = counts > 0

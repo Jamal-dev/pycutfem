@@ -252,29 +252,104 @@ def _compute_A_side_like_compiler(mesh: Mesh, level_set, *, side='+', qvol=4, ns
             A += float(qw.sum())
     return float(A)
 
+def map_qpt_preserving_side(mesh, lset_p1, phi, deformation,
+                            eid: int, xi_eta, *, tol=1e-12, max_it=12):
+    """
+    Return Y such that Y ≈ Θ_h(ξ,η) and φ(Y) = I_h φ(ξ,η),
+    but drive the Newton iteration in REFERENCE space:
+        (ξ,η) ← (ξ,η) + α J^T ∇φ,  α = -(φ(Y)-c)/||J^T∇φ||^2
+    This keeps (ξ,η) inside the same parent element (no fragile inverse-map BT).
+    """
+    import numpy as np
+    from pycutfem.fem import transform
 
-def _mapping_residual_report(mesh, lset_p1, phi, deformation, *, qvol=6, tol=1e-12):
-    """Print simple residual stats on cut elements: r = Ihφ - φ(Θ_h)."""
-    from pycutfem.integration.quadrature import volume as vol
-    qp, qw = vol(mesh.element_type, qvol)
-    _, _, cut_ids = mesh.classify_elements(lset_p1, tol=tol)
-    vals = []
+    # clamp reference coords
+    def clamp_ref(z):
+        xi, eta = float(z[0]), float(z[1])
+        if mesh.element_type == 'tri':
+            eps = 1e-14
+            xi  = max(eps, min(1.0 - eps, xi))
+            eta = max(eps, min(1.0 - xi - eps, eta))
+            return np.array([xi, eta], float)
+        else:
+            eps = 1e-14
+            return np.array([max(-1.0 + eps, min(1.0 - eps, xi)),
+                             max(-1.0 + eps, min(1.0 - eps, eta))], float)
+
+    xi_eta = clamp_ref(np.asarray(xi_eta, float))
+    c = float(lset_p1.value_on_element(int(eid), (float(xi_eta[0]), float(xi_eta[1]))))
+
+    for _ in range(int(max_it)):
+        # current physical point & residual
+        y  = deformation.mapped_point(int(eid), (float(xi_eta[0]), float(xi_eta[1])))
+        r  = float(phi(y) - c)
+        if abs(r) < tol:
+            return y
+
+        # reference-space Newton direction
+        J   = transform.jacobian(mesh, int(eid), (float(xi_eta[0]), float(xi_eta[1])))
+        g   = np.asarray(phi.gradient(y), float)
+        gref = J.T @ g
+        n2  = float(np.dot(gref, gref)) + 1e-30
+
+        # step in reference; clamp to simplex/box
+        alpha  = - r / n2
+        xi_eta = clamp_ref(xi_eta + alpha * gref)
+
+    # last iterate
+    return deformation.mapped_point(int(eid), (float(xi_eta[0]), float(xi_eta[1])))
+def _reference_corner_coords(mesh: Mesh) -> np.ndarray:
+    if mesh.element_type == 'tri':
+        return np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], float)
+    if mesh.element_type == 'quad':
+        return np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], float)
+    raise KeyError(mesh.element_type)
+def mapping_residual_report(mesh, lset_p1, level_set, deformation, qvol: int = 10):
+    """
+    Check r = (Ihφ)(ξ,η) - φ( mapped_point(ξ,η) ) on CUT elements using
+    the same reference corner triangles used by area integration.
+    Also report approx. normal distance |r|/||∇φ||.
+    """
+    from pycutfem.integration.quadrature import tri_rule
+
+    from pycutfem.ufl.helpers_geom import corner_tris
+
+    qp_ref, qw_ref = tri_rule(qvol)
+    R = _reference_corner_coords(mesh)
+
+    inside_ids, outside_ids, cut_ids = mesh.classify_elements(lset_p1)
+    abs_res, nor_dist = [], []
+
     for eid in cut_ids:
-        for (xi, eta) in qp:
-            x_def = deformation.mapped_point(int(eid), (float(xi), float(eta)))
-            r = float(lset_p1.value_on_element(int(eid), (float(xi), float(eta))) - phi(x_def))
-            g = np.asarray(phi.gradient(x_def), float)
-            d = abs(r) / (np.linalg.norm(g) + 1e-30)
-            vals.append((abs(r), d))
-    if not vals:
-        print("=== Mapping residual check on CUT elements ===\n(no cut elements)\n")
-        return
-    r_abs = np.array([v[0] for v in vals], float)
-    dist = np.array([v[1] for v in vals], float)
-    def _fmt(a): return f"max={a.max():.3e}, mean={a.mean():.3e}, p95={np.quantile(a,0.95):.3e}, p99={np.quantile(a,0.99):.3e}"
+        elem = mesh.elements_list[int(eid)]
+        tri_list, corner_ids = corner_tris(mesh, elem)
+        for (i0,i1,i2) in tri_list:
+            Aref, Bref, Cref = R[i0], R[i1], R[i2]
+            for (l1,l2), w in zip(qp_ref, qw_ref):
+                l0 = 1.0 - l1 - l2
+                xi_eta = l0*Aref + l1*Bref + l2*Cref
+                y = map_qpt_preserving_side(mesh, lset_p1, level_set, deformation, int(eid), xi_eta)
+
+                phi_lin = float(lset_p1.value_on_element(int(eid), (float(xi_eta[0]), float(xi_eta[1]))))
+                phi_cur = float(level_set(y))
+                r = phi_lin - phi_cur
+                abs_res.append(abs(r))
+
+                g = np.asarray(level_set.gradient(y), float)
+                ng = float(np.linalg.norm(g))
+                if ng > 1e-14:
+                    nor_dist.append(abs(r)/ng)
+
+    def _summ(name, data):
+        if not data:
+            return f"{name}: (no samples)"
+        a = np.array(data, float)
+        return (f"{name}: max={a.max():.3e}, mean={a.mean():.3e}, "
+                f"p95={np.percentile(a,95):.3e}, p99={np.percentile(a,99):.3e}")
+
     print("=== Mapping residual check on CUT elements ===")
-    print(f"|Ihφ - φ(Θ_h)|: {_fmt(r_abs)}")
-    print(f"distance ≈ |r|/||∇φ||: {_fmt(dist)}\n")
+    print(_summ("|Ihφ - φ(Θ_h)|", abs_res))
+    print(_summ("distance ≈ |r|/||∇φ||", nor_dist))
 
 
 def main():
@@ -299,7 +374,7 @@ def main():
     adap = LevelSetMeshAdaptation(mesh_tri, order=3, threshold=10.5, max_steps=max_newton_steps)
     deformation_tri = adap.calc_deformation(phi, q_vol=q_vol + 2)
     lset_p1 = adap.lset_p1; assert lset_p1 is not None
-    _mapping_residual_report(mesh_tri, lset_p1, phi, deformation_tri, qvol=q_vol)
+    mapping_residual_report(mesh_tri, lset_p1, phi, deformation_tri, qvol=q_vol)
 
     print("== TRI mesh: P1 vs P1 + deformation ==")
     nseg = 9
@@ -332,7 +407,7 @@ def main():
     adap_q = LevelSetMeshAdaptation(mesh_quad, order=2, threshold=10.5, max_steps=max_newton_steps)
     deformation_quad = adap_q.calc_deformation(phi, q_vol=q_vol + 2)
     lset_p1_q = adap_q.lset_p1; assert lset_p1_q is not None
-    _mapping_residual_report(mesh_quad, lset_p1_q, phi, deformation_quad, qvol=q_vol)
+    mapping_residual_report(mesh_quad, lset_p1_q, phi, deformation_quad, qvol=q_vol)
 
     A_p1_pos_q = _compute_A_side_like_compiler(mesh_quad, lset_p1_q, side='+', qvol=q_vol, nseg_hint=nsegs_deformation)
     A_p1_neg_q = _compute_A_side_like_compiler(mesh_quad, lset_p1_q, side='-', qvol=q_vol, nseg_hint=nsegs_deformation)
@@ -358,8 +433,8 @@ def main():
     L_p1 = compute_interface_length(mesh_quad, lset_p1_q, deformation=None, order=4)
     L_def = compute_interface_length(mesh_quad, lset_p1_q, deformation=deformation_quad, order=4)
     print(f"Exact circumference: {exact_circumference:.8f}")
-    print(f"Level set φ_P1     : {L_p1:.8f}, rel.err={(L_p1-exact_circumference)/exact_circumference:.3e}")
-    print(f"Deformed mesh      : {L_def:.8f}, rel.err={(L_def-exact_circumference)/exact_circumference:.3e}")
+    print(f"Level set φ_P1     : {L_p1:.8f}, err={(L_p1-exact_circumference):.6e}")
+    print(f"Deformed mesh      : {L_def:.8f}, err={(L_def-exact_circumference):.6e}")
 
 
 if __name__ == "__main__":
