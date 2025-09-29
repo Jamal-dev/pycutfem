@@ -617,24 +617,10 @@ class LevelSetMeshAdaptation:
                 N = np.asarray(ref.shape(float(xi), float(eta)), float).ravel()
                 mass += (w * detJ) * np.outer(N, N)
 
-                # Prefer local high-order gradient as search direction
+                # Prefer local high-order gradient as search direction (updated every Newton step)
                 x_phys = transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
-                if hasattr(level_set, "gradient_on_element"):
-                    g0 = np.asarray(level_set.gradient_on_element(int(eid), (float(xi), float(eta))), float)
-                else:
-                    g0 = np.asarray(level_set.gradient(x_phys), float)
 
-                if np.linalg.norm(g0) >= 1e-14:
-                    search_dir_phys = g0 / np.linalg.norm(g0)
-                else:
-                    # Fallback to Oswald-averaged corner field
-                    N_geom = np.asarray(ref_geom.shape(float(xi), float(eta))).ravel()
-                    tmp = N_geom @ corner_node_search_dirs
-                    if np.linalg.norm(tmp) < 1e-14:
-                        continue
-                    search_dir_phys = tmp / np.linalg.norm(tmp)
-
-                # Newton-like step towards matching φ_P1 and φ
+                # Newton-like step towards matching φ_P1 and φ at this point
                 phi_lin = self.lset_p1.value_on_element(int(eid), (float(xi), float(eta)))
                 x_target = x_phys
                 for _ in range(self.max_steps):
@@ -642,12 +628,23 @@ class LevelSetMeshAdaptation:
                     residual = phi_lin - phi_curr
                     if abs(residual) < self.tol:
                         break
-                    grad_curr = level_set.gradient(x_target)
-                    denom = float(np.dot(grad_curr, search_dir_phys))
-                    if abs(denom) < 1e-14:
-                        break
-                    step = residual / denom
-                    x_target = x_target + step * search_dir_phys
+                    # gradient at current target point; use as search direction
+                    grad_curr = np.asarray(level_set.gradient(x_target), float)
+                    nrm = float(np.linalg.norm(grad_curr))
+                    if nrm < 1e-14:
+                        # Fallback to Oswald-averaged corner field
+                        N_geom = np.asarray(ref_geom.shape(float(xi), float(eta))).ravel()
+                        tmp = N_geom @ corner_node_search_dirs
+                        nrm2 = float(np.linalg.norm(tmp))
+                        if nrm2 < 1e-14:
+                            break
+                        dir_step = tmp / nrm2
+                        denom = float(np.dot(grad_curr, dir_step)) if nrm > 0.0 else nrm2
+                    else:
+                        dir_step = grad_curr / nrm
+                        denom = nrm
+                    step = residual / (denom if abs(denom) > 1e-14 else 1.0)
+                    x_target = x_target + step * dir_step
 
                 delta_x = x_target - x_phys
                 h_elem = mesh.element_char_length(int(eid)) if hasattr(mesh, "element_char_length") else 1.0
