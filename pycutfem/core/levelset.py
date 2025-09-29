@@ -446,6 +446,20 @@ class PiecewiseLinearLevelSet(LevelSetFunction):
         if mesh is not self.mesh:
             raise ValueError("PiecewiseLinearLevelSet only defined on its mesh")
         return self.node_values.copy()
+    def value_on_element_ref(self, eid: int, xi_eta: tuple[float,float]) -> float:
+        xi, eta = float(xi_eta[0]), float(xi_eta[1])
+        cc = np.asarray(self.mesh.corner_connectivity[int(eid)], int)
+        v  = self.node_values[cc]  # φ at the 3 (tri) or 4 (quad) corners
+        if self.mesh.element_type == "tri":
+            # reference triangle (0,0), (1,0), (0,1)
+            return float(v[0]*(1.0 - xi - eta) + v[1]*xi + v[2]*eta)
+        else:
+            # reference square [-1,1]^2
+            N00 = 0.25*(1.0 - xi)*(1.0 - eta)
+            N10 = 0.25*(1.0 + xi)*(1.0 - eta)
+            N11 = 0.25*(1.0 + xi)*(1.0 + eta)
+            N01 = 0.25*(1.0 - xi)*(1.0 + eta)
+            return float(v[0]*N00 + v[1]*N10 + v[2]*N11 + v[3]*N01)
 
 
 # -----------------------------------------------------------------------------

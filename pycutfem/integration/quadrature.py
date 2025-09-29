@@ -557,52 +557,135 @@ def _qpline_nodes_elementwise_ref(level_set, mesh, eids, P0, P1, *, p: int, proj
 
 def isoparam_interface_line_quadrature_batch(level_set, P0, P1, *, p: int = 2, order: int = 4,
                                              project_steps: int = 3, tol: float = 1e-12,
-                                             mesh=None, eids=None):
+                                             mesh=None, eids=None,
+                                             return_qref: bool = False,
+                                             return_tangent: bool = False):
     """
     Fully vectorized Qp isoparametric interface quadrature for many segments at once.
+
     Parameters
     ----------
     level_set : object
         Needs __call__(x) and gradient(x); vectorized versions speed it up further.
+        If FE-backed, may implement values_on_element_many / gradients_on_element_many.
     P0, P1 : array_like, shape (E,2)
         The two chord endpoints per cut element.
     p : int
         Geometry order (Qp); uses p+1 Lagrange nodes on [-1,1].
     order : int
-        Gauss-Legendre order along the curve.
+        Gauss–Legendre order along the curve.
+    project_steps : int
+        Newton projection steps for curve nodes.
+    tol : float
+        Projection tolerance.
+    mesh, eids :
+        When provided *and* the level set is FE-backed (has values_on_element_many),
+        the reference-aware elementwise projection is used (fast and robust).
+    return_qref : bool, default False
+        If True, also return (E, order, 2) reference coordinates (xi, eta) of each
+        quadrature point. When the FE-backed path is unavailable, returns None.
+    return_tangent : bool, default False
+        If True, also return (E, order, 2) unit tangents at quadrature points.
+
     Returns
     -------
     qpts : (E, order, 2) float
         Physical quadrature points on Γ.
     qw   : (E, order) float
         Quadrature weights (already scaled by arc-length Jacobian).
-    """
-    P0 = np.asarray(P0, float); P1 = np.asarray(P1, float)
-    E = P0.shape[0]
-    if E == 0:
-        return np.empty((0, order, 2), float), np.empty((0, order), float)
+    [t_hat] : (E, order, 2) float, optional
+        Unit tangent vectors, only when return_tangent=True.
+    [qref] : (E, order, 2) float or None, optional
+        Reference coordinates of quadrature points, only when return_qref=True.
+        If the FE-backed path is not used, this is None.
 
-    # Build Qp nodes along the curve Γ per element
-    if (mesh is not None) and (eids is not None) and hasattr(level_set, 'values_on_element_many'):
+    Notes
+    -----
+    - Backward compatible with the original signature/returns.
+    - qref is assembled as qref = N(s_i) @ Rnodes (no per-point inverse maps)
+      when the FE-backed path is available; otherwise qref=None.
+    """
+    import numpy as _np
+    from pycutfem.fem import transform as _tr  # already imported at top of module, kept local for clarity
+
+    P0 = _np.asarray(P0, float); P1 = _np.asarray(P1, float)
+    if P0.ndim != 2 or P0.shape != P1.shape or P0.shape[1] != 2:
+        raise ValueError("P0 and P1 must be (E,2) arrays")
+
+    E = P0.shape[0]
+    # Quick exit on empty batches (keep shapes consistent for extras)
+    if E == 0:
+        qpts = _np.empty((0, int(order), 2), float)
+        qw   = _np.empty((0, int(order)), float)
+        extras = []
+        if return_tangent:
+            extras.append(_np.empty_like(qpts))
+        if return_qref:
+            # No FE context to build qref; return None for generic consistency
+            extras.append(None)
+        return (qpts, qw) if not extras else (qpts, qw, *extras)
+
+    # ------------------------------------------------------------------
+    # Build Qp nodes along the curve Γ per element (Pnodes: E x m x 2)
+    # ------------------------------------------------------------------
+    fe_context = (mesh is not None) and (eids is not None) and hasattr(level_set, 'values_on_element_many')
+
+    if fe_context:
+        # Element-aware reference projection (fast path); returns ONLY physical nodes
         Pnodes = _qpline_nodes_elementwise_ref(level_set, mesh, eids, P0, P1,
                                                p=int(p), project_steps=int(project_steps), tol=float(tol))
+        # We'll reconstruct reference nodes Rnodes by inverse-mapping ONLY these (p+1) nodes,
+        # not every Gauss point; this is cheap and lets us produce qref without per-point inverses.
+        if return_qref:
+            m = Pnodes.shape[1]
+            Rnodes = _np.empty((E, m, 2), dtype=float)
+            eids_arr = _np.asarray(eids, int).ravel()
+            for ei in range(E):
+                eid = int(eids_arr[ei])
+                for k in range(m):
+                    xi, eta = _tr.inverse_mapping(mesh, eid, _np.asarray(Pnodes[ei, k, :], float))
+                    Rnodes[ei, k, 0] = float(xi)
+                    Rnodes[ei, k, 1] = float(eta)
+        else:
+            Rnodes = None
     else:
+        # Generic path: chord nodes → batched Newton projection in physical coords
         s_nodes, _ = _lagrange_nodes_weights(int(p))
-        t_nodes = 0.5*(s_nodes + 1.0)                               # map [-1,1] -> [0,1]
+        t_nodes = 0.5 * (s_nodes + 1.0)  # [-1,1] → [0,1]
         Pguess = (1.0 - t_nodes[None, :, None]) * P0[:, None, :] + t_nodes[None, :, None] * P1[:, None, :]
         Pnodes = _project_to_levelset_batch(Pguess, level_set, max_steps=int(project_steps), tol=float(tol))
-    # Basis at Gauss points
-    s_i, w_g, N, dN = _barycentric_basis_mats(int(order), int(p))   # (ng,), (ng,), (ng,m), (ng,m)
+        Rnodes = None  # no FE context → cannot assemble qref without per-point inverse maps
 
-    # x(s_i) and x'(s_i) in batch: einsum over nodes
-    # Pnodes: (E, m, 2) ; N: (ng, m) -> x: (E, ng, 2)
-    x  = np.einsum('im,emk->eik', N,  Pnodes, optimize=True)
-    xs = np.einsum('im,emk->eik', dN, Pnodes, optimize=True)
+    # ------------------------------------------------------------------
+    # Basis at Gauss points and evaluation x(s_i), x'(s_i) in batch
+    # ------------------------------------------------------------------
+    s_i, w_g, N, dN = _barycentric_basis_mats(int(order), int(p))   # (ng,), (ng,), (ng,m), (ng,m)
+    # x  : (E, ng, 2) ; xs : (E, ng, 2)
+    x  = _np.einsum('im,emk->eik', N,  Pnodes, optimize=True)
+    xs = _np.einsum('im,emk->eik', dN, Pnodes, optimize=True)
 
     # Weights scaled by |x'(s)|
-    J = np.linalg.norm(xs, axis=2)            # (E, ng)
-    qw = w_g[None, :] * J                     # broadcast
-    return x, qw
+    J = _np.linalg.norm(xs, axis=2)                  # (E, ng)
+    qw = w_g[None, :] * J
+
+    # Optional extras
+    extras = []
+
+    if return_tangent:
+        # Unit tangents: τ̂ = x' / ||x'||
+        t_hat = xs / (J[..., None] + 1e-30)          # (E, ng, 2)
+        extras.append(t_hat)
+
+    if return_qref:
+        if fe_context and (Rnodes is not None):
+            # qref = N(s_i) @ Rnodes : (ng,m) x (E,m,2) → (E,ng,2)
+            qref = _np.einsum('im,emk->eik', N, Rnodes, optimize=True)
+            extras.append(qref)
+        else:
+            extras.append(None)
+
+    return (x, qw) if not extras else (x, qw, *extras)
+
 
 # ============================================================================
 # Robust & fast polyline-based batch line quadrature for Γ segments

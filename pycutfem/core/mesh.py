@@ -58,6 +58,13 @@ class Mesh:
     def num_elements(self) -> int:
         """Returns the number of elements in the mesh."""
         return self.n_elements
+    @staticmethod
+    def _reference_corner_coords(mesh: "Mesh") -> np.ndarray:
+        if mesh.element_type == 'tri':
+            return np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], float)
+        if mesh.element_type == 'quad':
+            return np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], float)
+        raise KeyError(mesh.element_type)
 
     def _build_topology(self):
         """

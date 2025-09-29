@@ -152,13 +152,17 @@ def compute_interface_length(mesh, level_set, *, deformation=None, order: int = 
     - Builds per-cut element endpoints (P0,P1) using Mesh.build_interface_segments.
     - Uses isoparametric polyline + Gauss quadrature on the geometric interface.
     - If a deformation is supplied, each geometric weight is scaled by
-      || (I + ∂u/∂x) · t̂ || at the quadrature point, where t̂ is the geometric
-      unit tangent reconstructed from the level-set normal.
+      || (I + ∂u/∂x) · τ̂ || at the quadrature point, where τ̂ is the **geometric**
+      unit tangent along the interface.
     """
+    import numpy as np
+    from pycutfem.fem import transform
+    from pycutfem.integration.quadrature import isoparam_interface_line_quadrature_batch
+
     if not hasattr(level_set, "value_on_element"):
         raise NotImplementedError("Only FE-backed level set supported here.")
 
-    # build endpoints on geometry
+    # (1) Endpoints per cut element (same as your original)
     mesh.build_interface_segments(level_set, tol=float(tol))
     _, _, cut_ids = mesh.classify_elements(level_set, tol=tol)
     P0_list, P1_list, eids_list = [], [], []
@@ -171,59 +175,84 @@ def compute_interface_length(mesh, level_set, *, deformation=None, order: int = 
     if not P0_list:
         return 0.0
 
-    P0 = np.asarray(P0_list, float)
-    P1 = np.asarray(P1_list, float)
+    P0   = np.asarray(P0_list, float)
+    P1   = np.asarray(P1_list, float)
     eids = np.asarray(eids_list, int)
 
-    # Geometric line quadrature (points x and weights for |x'|)
-    qpts, qw_geom = isoparam_interface_line_quadrature_batch(level_set, P0, P1,
-                                                             p=int(getattr(mesh, 'poly_order', 1)),
-                                                             order=int(order), project_steps=3, tol=float(tol),
-                                                             mesh=mesh, eids=eids)
+    # (2) Geometric line quadrature on Γ: points and |x'(s)|-scaled weights
+    # Try the upgraded signature that can return unit tangents & ref points.
+    try:
+        qpts, qw_geom, t_hat, qref = isoparam_interface_line_quadrature_batch(
+            level_set, P0, P1,
+            p=int(getattr(mesh, 'poly_order', 1)),
+            order=int(order), project_steps=3, tol=float(tol),
+            mesh=mesh, eids=eids,
+            return_tangent=True, return_qref=True
+        )
+    except TypeError:
+        # Backward-compat: older function (no extras)
+        qpts, qw_geom = isoparam_interface_line_quadrature_batch(
+            level_set, P0, P1,
+            p=int(getattr(mesh, 'poly_order', 1)),
+            order=int(order), project_steps=3, tol=float(tol),
+            mesh=mesh, eids=eids
+        )
+        t_hat, qref = None, None
 
+    # Pure geometric length (no deformation)
     if deformation is None:
         return float(np.sum(qw_geom))
 
-    # Deformation-aware factor per point: || (I + ∂u/∂x) · t̂ ||
+    # (3) Deformation-aware scaling: || (I + ∂u/∂x) · τ̂ ||
     ref_geom = transform.get_reference(mesh.element_type, mesh.poly_order)
     L = 0.0
-    for i, eid in enumerate(eids):
-        for q, x in enumerate(qpts[i]):
-            # Inverse-map once per point
-            xi, eta = transform.inverse_mapping(mesh, int(eid), np.asarray(x, float))
-            # geometric Jacobian and its inverse
-            Jg = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
-            A = np.linalg.inv(Jg)
-            # displacement gradient in physical coords: (U^T dN_ref) @ J^{-1}
-            dN_ref = np.asarray(ref_geom.grad(float(xi), float(eta)), float)  # (nloc,2)
-            conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
-            Uloc = np.asarray(deformation.node_displacements[conn], float)     # (nloc,2)
-            G_ref = Uloc.T @ dN_ref                                            # (2,2)
-            G_phys = G_ref @ A
-            F = np.eye(2) + G_phys
 
-            # geometric tangent via rotated LS normal (unit)
-            if hasattr(level_set, 'gradient_on_element'):
-                n = np.asarray(level_set.gradient_on_element(int(eid), (float(xi), float(eta))), float)
-            else:
-                n = np.asarray(level_set.gradient(np.asarray(x, float)), float)
-            nn = np.linalg.norm(n)
-            if nn <= 1e-30:
-                # Fallback: finite-diff approx with a small step in xi
-                h = 1e-8
-                x_eps = transform.x_mapping(mesh, int(eid), (float(xi + h), float(eta)))
-                n = np.asarray(level_set.gradient(np.asarray(x_eps, float)), float) - np.asarray(level_set.gradient(np.asarray(x, float)), float)
-                nn = np.linalg.norm(n)
-            t_unit = np.array([n[1], -n[0]], float)
-            nt = np.linalg.norm(t_unit)
-            if nt > 0.0:
-                t_unit = t_unit / nt
-            else:
-                t_unit = np.array([1.0, 0.0], float)
+    # Pre-cache for speed
+    nE, nQ = qpts.shape[0], qpts.shape[1]
+    for i in range(nE):
+        eid = int(eids[i])
+        # geometry-node ids and their displacements for this element
+        conn = np.asarray(mesh.elements_connectivity[eid], dtype=int)
+        Uloc = np.asarray(deformation.node_displacements[conn], float)  # (nloc, 2)
 
-            L += float(qw_geom[i, q]) * float(np.linalg.norm(F @ t_unit))
+        for q in range(nQ):
+            # Reference coordinates (prefer qref if the quadrature returned them)
+            if isinstance(qref, np.ndarray):
+                xi  = float(qref[i, q, 0]);  eta = float(qref[i, q, 1])
+            else:
+                xi, eta = transform.inverse_mapping(mesh, eid, np.asarray(qpts[i, q], float))
+
+            # Geometric Jacobian J_g and gradient of shape functions in reference coords
+            Jg     = transform.jacobian(mesh, eid, (xi, eta))                         # (2,2)
+            dN_ref = np.asarray(ref_geom.grad(xi, eta), float)                        # (nloc,2)
+
+            # ∂u/∂(ξ,η) = U^T · ∇̂N   →  (2,2)
+            G_ref  = Uloc.T @ dN_ref                                                  # (2,2)
+            # ∂u/∂x = G_ref · (∂(ξ,η)/∂x)  ;  solve J_g^T X^T = G_ref^T to avoid J_g^{-1}
+            G_phys = np.linalg.solve(Jg.T, G_ref.T).T                                 # (2,2)
+            F      = np.eye(2) + G_phys
+
+            # Unit tangent τ̂ at the quadrature point
+            if isinstance(t_hat, np.ndarray):
+                tau = np.asarray(t_hat[i, q], float)
+            else:
+                # Fallback: build τ̂ from ∇φ (either element-aware or global)
+                if hasattr(level_set, 'gradient_on_element'):
+                    n = np.asarray(level_set.gradient_on_element(eid, (xi, eta)), float)
+                else:
+                    n = np.asarray(level_set.gradient(np.asarray(qpts[i, q], float)), float)
+                nn = float(np.linalg.norm(n))
+                if nn <= 1e-30:
+                    # last-resort: pick an arbitrary unit vector
+                    tau = np.array([1.0, 0.0], float)
+                else:
+                    tau = np.array([n[1], -n[0]], float) / nn
+
+            # Accumulate deformed length: geometric weight * local stretch
+            L += float(qw_geom[i, q]) * float(np.linalg.norm(F @ tau))
 
     return float(L)
+
 
 
 def _compute_A_side_like_compiler(mesh: Mesh, level_set, *, side='+', qvol=4, nseg_hint=None, tol=1e-12):
@@ -298,12 +327,7 @@ def map_qpt_preserving_side(mesh, lset_p1, phi, deformation,
 
     # last iterate
     return deformation.mapped_point(int(eid), (float(xi_eta[0]), float(xi_eta[1])))
-def _reference_corner_coords(mesh: Mesh) -> np.ndarray:
-    if mesh.element_type == 'tri':
-        return np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], float)
-    if mesh.element_type == 'quad':
-        return np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], float)
-    raise KeyError(mesh.element_type)
+
 def mapping_residual_report(mesh, lset_p1, level_set, deformation, qvol: int = 10):
     """
     Check r = (Ihφ)(ξ,η) - φ( mapped_point(ξ,η) ) on CUT elements using
@@ -315,7 +339,7 @@ def mapping_residual_report(mesh, lset_p1, level_set, deformation, qvol: int = 1
     from pycutfem.ufl.helpers_geom import corner_tris
 
     qp_ref, qw_ref = tri_rule(qvol)
-    R = _reference_corner_coords(mesh)
+    R = Mesh._reference_corner_coords(mesh)
 
     inside_ids, outside_ids, cut_ids = mesh.classify_elements(lset_p1)
     abs_res, nor_dist = [], []

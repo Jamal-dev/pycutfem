@@ -18,7 +18,8 @@ class Measure:
                  defined_on: Optional[BitSet] = None, 
                  level_set: Optional[Callable] = None,
                  metadata: Optional[Dict] = None,
-                 tag: Optional[str] = None):
+                 tag: Optional[str] = None,
+                 deformation = None):
         """
         Initializes a Measure.
         
@@ -34,7 +35,10 @@ class Measure:
         self.domain_type = domain_type
         self.defined_on = defined_on
         self.level_set = level_set
-        self.metadata = metadata or {}
+        self.metadata = metadata.copy() if metadata else {}
+        self.deformation = deformation
+        if deformation is not None:
+            self.metadata.setdefault('deformation', deformation)
         self.tag = tag
     @property
     def on_facet(self) -> bool:
@@ -46,7 +50,8 @@ class Measure:
                  defined_on: Optional[BitSet] = None, 
                  level_set: Optional[Callable] = None,
                  metadata: Optional[Dict] = None,
-                 tag: Optional[str] = None) -> 'Measure':
+                 tag: Optional[str] = None,
+                 deformation = None) -> 'Measure':
         """
         Creates a new, configured Measure instance. This allows for an
         expressive syntax like `dx(defined_on=my_set, metadata={'q': 5})`.
@@ -60,8 +65,9 @@ class Measure:
         new_defined_on = defined_on if defined_on is not None else self.defined_on
         new_level_set = level_set if level_set is not None else self.level_set
         new_tag = tag if tag is not None else self.tag
+        new_deformation = deformation if deformation is not None else self.deformation
         # Return a new Measure object with the specified configurations
-        return Measure(self.domain_type, new_defined_on, new_level_set, new_meta, new_tag)
+        return Measure(self.domain_type, new_defined_on, new_level_set, new_meta, new_tag, new_deformation)
 
     def __rmul__(self, other: Expression) -> Integral:
         """
@@ -79,6 +85,8 @@ class Measure:
         if self.tag:        parts.append(f"tag='{self.tag}'") 
         if self.metadata:
             parts.append(f"metadata={self.metadata!r}")
+        if self.deformation is not None:
+            parts.append("deformation=...")
         return f"Measure({', '.join(parts)})"
 
 # --- Pre-defined global instances for convenient use in weak forms ---

@@ -73,14 +73,18 @@ class CutIntegration:
         return [CutIntegration._brent01(f, e0, e1, f0, f1, tol=tol)]
 
     @staticmethod
-    def _horizontal_cut_segment(mesh, eid: int, lset_p1, eta: float, side: str, order: int, tol: float):
-        fl = float(lset_p1.value_on_element(int(eid), (-1.0, float(eta))))
-        fr = float(lset_p1.value_on_element(int(eid), (+1.0, float(eta))))
-        zl, zr = (abs(fl) <= tol), (abs(fr) <= tol)
-        hascut = (fl * fr < 0.0) or (zl and fr < -tol) or (zr and fl < -tol)
+    def _horizontal_cut_segment(mesh, eid, lset_p1, eta, side, order, tol):
+        # Build Q1 REF coeffs once
+        a00, a10, a01, a11 = CutIntegration._q1_coeffs_ref_from_corners(mesh, int(eid), lset_p1)
+        # φ_ref(ξ,η)=a00 + a10 ξ + a01 η + a11 ξ η
+        denom = (a10 + a11 * eta)
+        num   = -(a00 + a01 * eta)
+        hascut = abs(denom) > tol and (-1.0 - 1e-12) <= (num/denom) <= (1.0 + 1e-12)
 
         want_pos = (side == '+')
-        keep_left = SIDE.is_pos(fl, tol) if want_pos else SIDE.is_neg(fl, tol)
+        fl = a00 + a10*(-1.0) + a01*eta + a11*(-1.0)*eta
+        fr = a00 + a10*(+1.0) + a01*eta + a11*(+1.0)*eta
+        keep_left  = SIDE.is_pos(fl, tol) if want_pos else SIDE.is_neg(fl, tol)
         keep_right = SIDE.is_pos(fr, tol) if want_pos else SIDE.is_neg(fr, tol)
 
         if not hascut:
@@ -88,11 +92,7 @@ class CutIntegration:
                 return CutIntegration._segment_rule_1d(-1.0, +1.0, order)
             return np.empty((0,), float), np.empty((0,), float)
 
-        def fxi(xi):
-            return float(lset_p1.value_on_element(int(eid), (float(xi), float(eta))))
-
-        xi_cut = CutIntegration._brent01(fxi, -1.0, +1.0, fl, fr, tol=tol)
-
+        xi_cut = num/denom  # exact REF root at this η
         if want_pos:
             if SIDE.is_pos(fl, tol) and not SIDE.is_pos(fr, tol):
                 return CutIntegration._segment_rule_1d(-1.0, xi_cut, order)
@@ -251,4 +251,9 @@ class CutIntegration:
         if len(qpts) == 0:
             return (np.empty((0, 2), float), np.empty((0,), float), coeffs, None)
         return np.asarray(qpts, float), np.asarray(wref, float), coeffs, None
+    @staticmethod
+    def _edge_phi_on_eta_ref(mesh, eid, lset_p1, x_fixed, eta):
+        # Evaluate REF polynomial
+        return float(lset_p1.value_on_element_ref(int(eid), (float(x_fixed), float(eta))))
+
 
