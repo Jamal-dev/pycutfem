@@ -42,7 +42,7 @@ from netgen.geom2d import SplineGeometry
 from ngsolve import *
 from xfem import *
 from xfem.lsetcurv import *
-
+import time
 
 @dataclass
 class TestResult:
@@ -535,14 +535,17 @@ def main():
 
     # Interface length check via PyCutFEM interface assembler (with/without deformation)
     exact_circ = 2.0 * np.pi * R
-    dGamma_pc = pycutfem_dInterface(defined_on=pc_setup['es']['interface'], level_set=pc_setup['level_set'], metadata={'q': quad_order})
-    dGamma_pc_def = pycutfem_dInterface(defined_on=pc_setup['es']['interface'], level_set=pc_setup['level_set'], metadata={'q': quad_order}, deformation=pc_setup.get('deformation', None))
+    dGamma_pc = pycutfem_dInterface(defined_on=pc_setup['es']['interface'], level_set=pc_setup['level_set'], metadata={'q': quad_order, 'profile': True})
+    dGamma_pc_def = pycutfem_dInterface(defined_on=pc_setup['es']['interface'], level_set=pc_setup['level_set'], metadata={'q': quad_order, 'profile': True}, deformation=pc_setup.get('deformation', None))
+    t0 = time.time()
     L_pc = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], dGamma_pc)
     L_pc_def = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], dGamma_pc_def)
     print("\nInterface Linear Length Checks (PC assembler):")
     print(f"Exact circumference: {exact_circ:.8f}")
     print(f"PC φ_P1 length     : {L_pc:.8f}, err={L_pc - exact_circ:+.6e}")
     print(f"PC deformed length : {L_pc_def:.8f}, err={L_pc_def - exact_circ:+.6e}")
+    t1 = time.time()
+    print(f"Time taken: {t1 - t0:.4f} seconds")
 
 
 

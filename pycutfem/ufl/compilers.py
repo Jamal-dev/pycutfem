@@ -1845,77 +1845,103 @@ class FormCompiler:
             return getattr(elem, 'tag', None) == 'cut'  and len(getattr(elem, 'interface_pts', None)) == 2
 
         try:
+            # Optional simple profiler
+            import time as _time
+            prof = bool((intg.measure.metadata or {}).get('profile', False) or os.getenv('PYCUTFEM_PROFILE_INTERFACE', '').lower() in {'1','true','yes'})
+            t_all0 = _time.perf_counter()
+            t_iso = t_qploop = 0.0
+
+            # Collect valid interface elements in one pass
+            eids_valid = []
+            P0_list, P1_list = [], []
             for elem in mesh.elements_list:
-                # Only elements that are actually cut and have a valid interface segment
                 if not _is_valid_element(elem):
                     continue
+                eids_valid.append(int(elem.id))
+                p0, p1 = elem.interface_pts
+                P0_list.append(np.asarray(p0, float))
+                P1_list.append(np.asarray(p1, float))
+            if not eids_valid:
+                return
 
-                eid = int(elem.id)
-                self.ctx['eid'] = eid
-                self.ctx['pos_eid'] = eid
-                self.ctx['neg_eid'] = eid
+            eids_arr = np.asarray(eids_valid, dtype=int)
+            P0_arr = np.asarray(P0_list, dtype=float)
+            P1_arr = np.asarray(P1_list, dtype=float)
 
-                # Union dofs for this element (order provided by DofHandler)
-                global_dofs = np.asarray(self.dh.get_elemental_dofs(eid), dtype=int)
-
-                # Per-field padding maps (field-local → union index), robust to unsorted union
-                pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
-                    self.dh, fields, eid, eid, global_dofs
-                )
-
-                # Optional: per-field side masks (+/−) based on φ at DOF coordinates
+            # Precompute global_dofs and maps per valid element
+            gdofs_per_e = [np.asarray(self.dh.get_elemental_dofs(eid), dtype=int) for eid in eids_arr]
+            maps_by_field = [
+                _hfa.build_field_union_maps(self.dh, fields, int(eid), int(eid), gdofs_per_e[i])
+                for i, eid in enumerate(eids_arr)
+            ]
+            masks_by_field = []
+            for i, eid in enumerate(eids_arr):
                 try:
-                    pos_mask_by_field, neg_mask_by_field = _hfa.build_side_masks_by_field(
-                        self.dh, fields, eid, level_set, tol=SIDE.tol
+                    masks_by_field.append(_hfa.build_side_masks_by_field(self.dh, fields, int(eid), level_set, tol=SIDE.tol))
+                except Exception:
+                    masks_by_field.append(({},{ }))
+
+            # Isoparametric batch quadrature once for all elements
+            use_iso = (_iso_ifc is not None)
+            if use_iso:
+                t0 = _time.perf_counter()
+                try:
+                    qb, wb, tb, rb = _iso_ifc(
+                        level_set, P0_arr, P1_arr,
+                        p=int(getattr(mesh, 'poly_order', 1)),
+                        order=int(qdeg), project_steps=3, tol=SIDE.tol,
+                        mesh=mesh, eids=eids_arr,
+                        return_tangent=True, return_qref=True
                     )
+                    qpts_all, qwts_all, that_all, qref_all = qb, wb, tb, rb
+                except Exception:
+                    use_iso = False
+                    qpts_all = qwts_all = that_all = qref_all = None
+                t_iso += (_time.perf_counter() - t0)
+            if not use_iso:
+                # Fallback: build per-element polyline quadrature
+                qpts_all = []
+                qwts_all = []
+                that_all = None
+                qref_all = None
+                for i in range(len(eids_arr)):
+                    qpts_i, qwts_i = curved_line_quadrature(level_set, P0_arr[i], P1_arr[i], order=qdeg, nseg=nseg, project_steps=3, tol=SIDE.tol)
+                    qpts_all.append(qpts_i.reshape(1, -1, 2))
+                    qwts_all.append(qwts_i.reshape(1, -1))
+                qpts_all = np.vstack(qpts_all)
+                qwts_all = np.vstack(qwts_all)
+
+            # Main quadrature loop over all valid elements
+            t1 = _time.perf_counter()
+            for ei, eid in enumerate(eids_arr):
+                self.ctx['eid'] = int(eid)
+                self.ctx['pos_eid'] = int(eid)
+                self.ctx['neg_eid'] = int(eid)
+
+                global_dofs = gdofs_per_e[ei]
+                pos_map_by_field, neg_map_by_field = maps_by_field[ei]
+                try:
+                    pos_mask_by_field, neg_mask_by_field = masks_by_field[ei]
                 except Exception:
                     pos_mask_by_field, neg_mask_by_field = {}, {}
 
-                # Quadrature on the physical interface segment (prefer isoparametric batch rule)
-                p0, p1 = elem.interface_pts
-                use_iso = (_iso_ifc is not None)
-                qpts = qwts = t_hat = qref = None
-                if use_iso:
-                    try:
-                        qb, wb, tb, rb = _iso_ifc(level_set,
-                                                  np.asarray([p0], float), np.asarray([p1], float),
-                                                  p=int(getattr(mesh, 'poly_order', 1)),
-                                                  order=int(qdeg), project_steps=3, tol=SIDE.tol,
-                                                  mesh=mesh, eids=np.asarray([eid], int),
-                                                  return_tangent=True, return_qref=True)
-                        qpts = qb[0, :, :]
-                        qwts = wb[0, :]
-                        t_hat = tb[0, :, :]
-                        qref = rb[0, :, :] if (rb is not None) else None
-                    except Exception:
-                        qpts = qwts = t_hat = qref = None
-                        use_iso = False
-                if not use_iso:
-                    # fallback: polyline projection quadrature
-                    qpts, qwts = curved_line_quadrature(level_set, p0, p1,
-                                         order=qdeg, nseg=nseg,
-                                         project_steps=3, tol=SIDE.tol)
-
-                # Local accumulator in union layout (or scalar for functional)
+                # Local accumulator
                 if is_functional:
                     acc = 0.0
                 else:
                     n = len(global_dofs)
                     acc = np.zeros(n, dtype=float) if rhs else np.zeros((n, n), dtype=float)
 
-                # --- Quadrature loop on Γ_e
-                for i_q in range(len(qwts)):
-                    xq = qpts[i_q]
-                    w  = qwts[i_q]
-                    # Inverse-map to reference on the owner element
-                    if isinstance(qref, np.ndarray):
-                        xi  = float(qref[i_q, 0]); eta = float(qref[i_q, 1])
+                nQ = qpts_all.shape[1]
+                for iq in range(nQ):
+                    xq = qpts_all[ei, iq, :]
+                    w  = qwts_all[ei, iq]
+                    if isinstance(qref_all, np.ndarray):
+                        xi = float(qref_all[ei, iq, 0]); eta = float(qref_all[ei, iq, 1])
                     else:
-                        xi, eta = transform.inverse_mapping(mesh, eid, np.asarray(xq, float))
+                        xi, eta = transform.inverse_mapping(mesh, int(eid), np.asarray(xq, float))
 
-                    # Geometric Jacobian and deformation pieces
-                    Jg = transform.jacobian(mesh, eid, (float(xi), float(eta)))
-                    y  = transform.x_mapping(mesh, eid, (float(xi), float(eta)))
+                    Jg = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
                     if deformation is not None:
                         conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
                         dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
@@ -1923,46 +1949,38 @@ class FormCompiler:
                         Jd   = Uloc.T @ dN
                         Jt   = Jg + Jd
                         Ji   = np.linalg.inv(Jt)
-                        y    = y + deformation.displacement_ref(int(eid), (float(xi), float(eta)))
-                        # Interface stretch factor: || (I + ∂u/∂x) · τ̂ ||
+                        # Stretch
                         Gref = Uloc.T @ dN
                         Gphy = np.linalg.solve(Jg.T, Gref.T).T
                         Fmat = np.eye(2) + Gphy
-                        # Tangent: prefer t_hat if available, else gradient-based
-                        if isinstance(t_hat, np.ndarray):
-                            tau = np.asarray(t_hat[i_q, :], float)
-                        else:
-                            if hasattr(level_set, 'gradient_on_element'):
-                                gn = np.asarray(level_set.gradient_on_element(eid, (float(xi), float(eta))), float)
-                            else:
-                                gn = np.asarray(level_set.gradient(np.asarray(xq, float)), float)
-                            nn = float(np.linalg.norm(gn)) + 1e-30
-                            n_unit = gn / nn
-                            tau = np.array([n_unit[1], -n_unit[0]], float)
+                        tau = (that_all[ei, iq, :] if isinstance(that_all, np.ndarray)
+                               else np.array([1.0, 0.0], float))
                         w_eff = float(w) * float(np.linalg.norm(Fmat @ tau))
+                        y = (transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
+                             + deformation.displacement_ref(int(eid), (float(xi), float(eta))))
                     else:
-                        Ji   = np.linalg.inv(Jg)
+                        Ji = np.linalg.inv(Jg)
                         w_eff = float(w)
+                        y = np.asarray(xq, float)
 
-                    # Prime context for this QP
+                    # Context priming
                     self.ctx['x_phys'] = np.asarray(y, float)
                     self.ctx['phi_val'] = 0.0
-                    # Normal at current QP for FacetNormal
-                    g_here = (level_set.gradient(np.asarray(y, float)) if not hasattr(level_set, 'gradient_on_element')
-                              else level_set.gradient_on_element(eid, (float(xi), float(eta))))
+                    g_here = (level_set.gradient_on_element(int(eid), (float(xi), float(eta)))
+                              if hasattr(level_set, 'gradient_on_element')
+                              else level_set.gradient(np.asarray(y, float)))
                     g_here = np.asarray(g_here, float)
                     self.ctx['normal'] = g_here / (float(np.linalg.norm(g_here)) + 1e-30)
-                    # Pre-fill per-side basis values so _basis_row uses J_tot
                     self.ctx['basis_values'] = {"+": {}, "-": {}}
                     if fields:
                         for f in fields:
                             vrow = self.me.basis(f, float(xi), float(eta))
                             Gtab = self.me.grad_basis(f, float(xi), float(eta)) @ Ji
-                            for s in ('+','-'):
-                                slot = self.ctx['basis_values'][s].setdefault(f, {})
-                                slot[(0,0)] = vrow
-                                slot[(1,0)] = Gtab[:, 0]
-                                slot[(0,1)] = Gtab[:, 1]
+                            slotp = self.ctx['basis_values']['+'].setdefault(f, {})
+                            slotn = self.ctx['basis_values']['-'].setdefault(f, {})
+                            slotp[(0,0)] = vrow; slotn[(0,0)] = vrow
+                            slotp[(1,0)] = Gtab[:, 0]; slotn[(1,0)] = Gtab[:, 0]
+                            slotp[(0,1)] = Gtab[:, 1]; slotn[(0,1)] = Gtab[:, 1]
 
                     self.ctx['global_dofs'] = global_dofs
                     self.ctx['pos_map'] = np.arange(len(global_dofs), dtype=int)
@@ -1973,35 +1991,31 @@ class FormCompiler:
                     self.ctx['neg_mask_by_field'] = neg_mask_by_field
 
                     val = self._visit(intg.integrand)
-
-                    # Accumulate
                     if is_functional:
                         arr = np.asarray(val)
                         acc += w_eff * float(arr if arr.ndim == 0 else arr.sum())
                     else:
-                        val_arr = np.asarray(getattr(val, "data", val))
+                        val_arr = np.asarray(getattr(val, 'data', val))
                         if rhs:
-                            # collapse (1,n) or (n,1) → (n,)
                             if val_arr.ndim == 2 and 1 in val_arr.shape:
                                 val_arr = val_arr.reshape(-1)
-                            if val_arr.ndim != 1:
-                                raise ValueError(f"Interface RHS expects 1D vector, got {val_arr.shape}")
                             acc += w_eff * val_arr
                         else:
                             acc += w_eff * val_arr
 
-
-                # --- Scatter to global structures
+                # Scatter
                 if is_functional:
                     self.ctx['scalar_results'][hook['name']] += float(acc)
                 else:
                     if rhs:
-                        # Vector scatter
                         np.add.at(matvec, global_dofs, acc)
                     else:
-                        # Matrix scatter
                         rr, cc = np.meshgrid(global_dofs, global_dofs, indexing='ij')
                         matvec[rr, cc] += acc
+            t_qploop += (_time.perf_counter() - t1)
+
+            if prof:
+                logger.info(f"[PC] interface profile: total={_time.perf_counter()-t_all0:.4f}s, iso_setup={t_iso:.4f}s, qp_loop={t_qploop:.4f}s, elems={len(eids_arr)}, q={qdeg}")
 
             # --- NEW: edge‑aligned Γ (no cut cells) ----------------------------
             # Integrate over interior edges tagged 'interface' whose neighbors
@@ -3227,4 +3241,3 @@ class FormCompiler:
         # cleanup context (if you stored any debug keys)
         for k in ("eid", "x_phys", "phi_val"):
             self.ctx.pop(k, None)
-
