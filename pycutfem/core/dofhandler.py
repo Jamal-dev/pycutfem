@@ -1853,83 +1853,125 @@ class DofHandler:
         need_hess: bool = False,
         need_o3: bool = False,
         need_o4: bool = False,
-        deformation: Any = None
+        deformation: any = None,
     ) -> dict:
         """
-        Pre-compute geometry & basis tables for ∫_{interface∩element} ⋯ dS on *cut* elements.
-        Emits REFERENCE basis/derivative tables; push-forward (grad/Hess) is done in codegen.py.
+        Pre-compute geometry & basis tables for ∫_{Γ∩K} (·) dS on *cut* elements.
+
+        • Returns reference-space tables (b_*, g_*, d.._*) at interface QPs;
+        push-forward (J_inv, Hxi/Txi/Qxi when requested) is consumed by codegen/JIT.
+        • Weights 'qw' are physical line weights along Γ. If 'deformation' is given,
+        qw is additionally multiplied by the stretch factor ‖(I + ∇u) τ̂‖ and QPs
+        are moved to the deformed position x + u.
+        • Uses isoparametric, batched interface rules if available; otherwise falls
+        back to segmented curved-line quadrature with uniform 'nseg'.
+        • Normals are oriented by ∇φ/‖∇φ‖ (NEG→POS). When the level-set exposes
+        fast on-element evaluation (value_on_element*, gradient_on_element*), those
+        are used instead of the slow global .gradient(x).
         """
+
         import numpy as np
-        from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
-        from pycutfem.integration.quadrature import line_quadrature, curved_line_quadrature
-        from pycutfem.core.levelset import CircleLevelSet, AffineLevelSet
-        from pycutfem.core.levelset import _circle_value, _circle_grad, _affine_value, _affine_unit_grad  # type: ignore
         from pycutfem.fem import transform
         from pycutfem.integration.pre_tabulates import (
-            _tabulate_p1, _tabulate_q2, _tabulate_q1,
-            _tabulate_deriv_q1, _tabulate_deriv_q2, _tabulate_deriv_p1,
+            _tabulate_p1, _tabulate_q1, _tabulate_q2,
+            _tabulate_deriv_p1, _tabulate_deriv_q1, _tabulate_deriv_q2,
         )
+        from pycutfem.integration.quadrature import (
+            gauss_legendre,
+            curved_line_quadrature,
+        )
+        # Optional fast, batched iso-parametric rule (if present)
+        try:
+            from pycutfem.integration.quadrature import (
+                isoparam_interface_line_quadrature_batch as _iso_ifc_rule
+            )
+            _HAVE_ISO_IFC = True
+        except Exception:
+            _HAVE_ISO_IFC = False
+
+        # For fast φ evaluation fallback
+        try:
+            from pycutfem.ufl.helpers_geom import phi_eval as _phi_eval
+        except Exception:
+            _phi_eval = None
 
         try:
-            import numba as _nb  # noqa: F401
+            import numba as _nb
             _HAVE_NUMBA = True
         except Exception:
             _HAVE_NUMBA = False
 
-        # ---- Geometry from dN and coords (Numba kernel) ----------------------------
+        # ---- small numba kernel: geometry from dN and coords -------------------------
         if _HAVE_NUMBA:
             @_nb.njit(cache=True, fastmath=True, parallel=True)
-            def _geom_from_dN(coords, dN_tab):
-                # coords: (nE, nLoc, 2), dN_tab: (nE, nQ, nLoc, 2)
-                nE, nLoc = coords.shape[0], coords.shape[1]
-                nQ = dN_tab.shape[1]
+            def _geom_from_dN(_coords, _dN_tab):
+                nE, nQ = _coords.shape[0], _dN_tab.shape[1]
                 detJ = np.zeros((nE, nQ))
                 Jinv = np.zeros((nE, nQ, 2, 2))
                 for e in _nb.prange(nE):
+                    Xe = _coords[e]
+                    nLoc = Xe.shape[0]
                     for q in range(nQ):
                         a00 = 0.0; a01 = 0.0; a10 = 0.0; a11 = 0.0
                         for i in range(nLoc):
-                            gx = dN_tab[e, q, i, 0]
-                            gy = dN_tab[e, q, i, 1]
-                            x = coords[e, i, 0]; y = coords[e, i, 1]
+                            gx = _dN_tab[e, q, i, 0]
+                            gy = _dN_tab[e, q, i, 1]
+                            x  = Xe[i, 0]
+                            y  = Xe[i, 1]
                             a00 += gx * x; a01 += gy * x
                             a10 += gx * y; a11 += gy * y
                         det = a00 * a11 - a01 * a10
                         detJ[e, q] = det
-                        inv_det = 1.0 / det
-                        Jinv[e, q, 0, 0] =  a11 * inv_det
-                        Jinv[e, q, 0, 1] = -a01 * inv_det
-                        Jinv[e, q, 1, 0] = -a10 * inv_det
-                        Jinv[e, q, 1, 1] =  a00 * inv_det
+                        invd = 1.0 / det
+                        Jinv[e, q, 0, 0] =  a11 * invd
+                        Jinv[e, q, 0, 1] = -a01 * invd
+                        Jinv[e, q, 1, 0] = -a10 * invd
+                        Jinv[e, q, 1, 1] =  a00 * invd
                 return detJ, Jinv
 
+        # ---- helpers: fingerprints for caches ----------------------------------------
+        def _hash_subset(ids):
+            # stable hash from a small subset of ids (first, last, len)
+            if not ids:
+                return ("empty", 0, 0, 0)
+            return ("sub", int(ids[0]), int(ids[-1]), int(len(ids)))
+
+        def _ls_fingerprint(ls):
+            # prefer explicit token
+            tok = getattr(ls, "cache_token", None)
+            if tok is not None:
+                return ("token", tok)
+            # else: identity (safe within a single run)
+            return ("objid", int(id(ls)))
+
+        def _def_fingerprint(defm):
+            if defm is None:
+                return ("nodef",)
+            tok = getattr(defm, "cache_token", None)
+            if tok is not None:
+                return ("token", tok)
+            return ("objid", int(id(defm)))
+
+        # ------------------------------------------------------------------------------
         mesh = self.mixed_element.mesh
         me   = self.mixed_element
-        fields  = me.field_names
-        n_union = me.n_dofs_local   # union-local width per element
-        out = {}
+        fields   = list(me.field_names)
+        n_union  = me.n_dofs_local
 
-        # --- normalize ids → valid cuts with exactly 2 interface points -------------
-        ids = (cut_element_ids.to_indices()
-            if hasattr(cut_element_ids, "to_indices")
-            else list(cut_element_ids))
-        valid_cut_eids = [
-            int(eid) for eid in ids
-            if (mesh.elements_list[eid].tag == "cut"
-                and len(mesh.elements_list[eid].interface_pts) == 2)
+        # --- normalize element ids and keep only 2‑point cuts -------------------------
+        if hasattr(cut_element_ids, "to_indices"):
+            ids_all = cut_element_ids.to_indices()
+        else:
+            ids_all = list(cut_element_ids)
+        valid_eids = [
+            int(eid) for eid in ids_all
+            if (0 <= int(eid) < mesh.n_elements
+                and mesh.elements_list[int(eid)].tag == "cut"
+                and len(mesh.elements_list[int(eid)].interface_pts) == 2)
         ]
 
-        # ---- reuse cache if possible -----------------------------------------------
-        global _interface_cache
-        try:
-            _interface_cache
-        except NameError:
-            _interface_cache = {}
-        cache_key = (_hash_subset(valid_cut_eids), int(qdeg), me.signature(), self.method, bool(need_hess), bool(need_o3), bool(need_o4), id(level_set))
-        if reuse and cache_key in _interface_cache:
-            return _interface_cache[cache_key]
-
-        if not valid_cut_eids:
+        # empty → return a consistent skeleton
+        if not valid_eids:
             z2 = np.empty((0, 0, 2), dtype=float); z1 = np.empty((0, 0), dtype=float)
             out = {
                 "eids": np.empty(0, dtype=np.int32),
@@ -1951,142 +1993,165 @@ class DofHandler:
                 out[f"g_{fld}"]   = np.empty((0, 0, n_union, 2), dtype=float)
                 out[f"d10_{fld}"] = np.empty((0, 0, n_union), dtype=float)
                 out[f"d01_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                if need_hess:
-                    out[f"d20_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                    out[f"d11_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                    out[f"d02_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                if need_o3:
-                    out[f"d30_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                    out[f"d21_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                    out[f"d12_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                    out[f"d03_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                if need_o4:
-                    out[f"d40_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                    out[f"d31_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                    out[f"d22_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                    out[f"d13_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-                    out[f"d04_{fld}"] = np.empty((0, 0, n_union), dtype=float)
-            
-            if need_hess:
-                out["Hxi0"] = np.empty((0, 0, 2, 2), dtype=float)
-                out["Hxi1"] = np.empty((0, 0, 2, 2), dtype=float)
-            if need_o3:
-                out["Txi0"] = np.empty((0, 0, 2, 2, 2), dtype=float)
-                out["Txi1"] = np.empty((0, 0, 2, 2, 2), dtype=float)
-            if need_o4:
-                out["Qxi0"] = np.empty((0, 0, 2, 2, 2, 2), dtype=float)
-                out["Qxi1"] = np.empty((0, 0, 2, 2, 2, 2), dtype=float)
-            if reuse:
-                _interface_cache[cache_key] = out
             return out
 
-        # --- Prepare segments; curved Γ quadrature ----------------------------------
-        nE = len(valid_cut_eids)
-        P0 = np.empty((nE, 2), dtype=float)
-        P1 = np.empty((nE, 2), dtype=float)
-        h_arr = np.empty((nE,), dtype=float)
+        # ---- cache lookup -------------------------------------------------------------
+        global _interface_cache
+        try:
+            _interface_cache
+        except NameError:
+            _interface_cache = {}
+
+        subset_hash = _hash_subset(valid_eids)
+        ls_token    = _ls_fingerprint(level_set)
+        def_token   = _def_fingerprint(deformation)
+
+        cache_key = (
+            "iface", id(mesh), me.signature(),
+            subset_hash, int(qdeg), self.method,
+            bool(need_hess), bool(need_o3), bool(need_o4),
+            ls_token, def_token
+        )
+        if reuse and cache_key in _interface_cache:
+            return _interface_cache[cache_key]
+
+        # ---- per-element maps, h ------------------------------------------------------
+        nE = len(valid_eids)
         gdofs_map = np.empty((nE, n_union), dtype=np.int64)
-        for k, eid in enumerate(valid_cut_eids):
-            p0, p1 = mesh.elements_list[eid].interface_pts
-            P0[k] = p0; P1[k] = p1
-            h_arr[k] = float(mesh.element_char_length(eid))
-            gdofs_map[k, :] = self.get_elemental_dofs(int(eid))
+        h_arr     = np.empty((nE,), dtype=float)
+        for i, eid in enumerate(valid_eids):
+            gdofs_map[i, :] = self.get_elemental_dofs(int(eid))
+            h_arr[i]        = float(mesh.element_char_length(int(eid)) or 0.0)
 
-        # choose a uniform nseg so nQ is constant across elements
-        nseg_eff = int(nseg if nseg is not None else max(3, mesh.poly_order + qdeg//2))
-        nQ = int(qdeg) * int(nseg_eff)
-        qp_phys = np.empty((nE, nQ, 2), dtype=float)
-        qw      = np.empty((nE, nQ),    dtype=float)
-        for k in range(nE):
-            pts, wts = curved_line_quadrature(level_set, P0[k], P1[k],
-                                              order=qdeg, nseg=nseg_eff,
-                                              project_steps=3, tol=SIDE.tol)
-            # All elements produce the same nQ if nseg is uniform
-            qp_phys[k, :, :] = pts.reshape(nQ, 2)
-            qw[k, :]         = wts.reshape(nQ)
+        # ------------------------------------------------------------------------------
+        # 1) Interface quadrature (physical Γ in the current geometry)
+        #    Prefer a batched isoparametric rule (constant nQ), else fall back
+        #    to segmented curved-line quadrature with uniform nseg (also constant nQ).
+        # ------------------------------------------------------------------------------
+        qp_phys = None; qw = None; that = None; qref = None
 
-        # --- φ and normals along the interface -------------------------------------
-        phis    = np.empty((nE, nQ), dtype=float)
-        normals = np.empty((nE, nQ, 2), dtype=float)
-        if _HAVE_NUMBA and isinstance(level_set, CircleLevelSet):
-            cx, cy = float(level_set.center[0]), float(level_set.center[1])
-            r = float(level_set.radius)
-            for e in range(nE):
-                for q in range(nQ):
-                    xq = qp_phys[e, q]
-                    phis[e, q] = _circle_value(xq, cx, cy, r)
-                    normals[e, q] = _circle_grad(xq, cx, cy)
-        elif _HAVE_NUMBA and isinstance(level_set, AffineLevelSet):
-            a, b, c = level_set.a, level_set.b, level_set.c
-            g_unit = _affine_unit_grad(a, b)
-            for e in range(nE):
-                for q in range(nQ):
-                    phis[e, q] = _affine_value(qp_phys[e, q], a, b, c)
-                    normals[e, q] = g_unit
+        if _HAVE_ISO_IFC:
+            # Build segment endpoints per cut element (P0,P1)
+            P0 = np.empty((nE, 2), dtype=float)
+            P1 = np.empty((nE, 2), dtype=float)
+            for i, eid in enumerate(valid_eids):
+                p0, p1 = mesh.elements_list[int(eid)].interface_pts
+                P0[i, :] = np.asarray(p0, float)
+                P1[i, :] = np.asarray(p1, float)
+            # degree of the interface parameterization
+            p_curve = max(2, mesh.poly_order) if deformation is not None else mesh.poly_order
+            order   = max(1, int(qdeg))
+            qp_phys, qw, that, qref = _iso_ifc_rule(
+                level_set, P0, P1,
+                p=int(p_curve), order=int(order), project_steps=3, tol=SIDE.tol,
+                mesh=mesh, eids=np.asarray(valid_eids, dtype=int),
+                return_tangent=True, return_qref=True)
+            qp_phys = np.asarray(qp_phys, dtype=float)       # (nE, nQ, 2)
+            qw      = np.asarray(qw,      dtype=float)       # (nE, nQ)
+            if that is not None:
+                that = np.asarray(that, dtype=float)         # (nE, nQ, 2)
+            if qref is not None:
+                qref = np.asarray(qref, dtype=float)         # (nE, nQ, 2)
+            nQ = qp_phys.shape[1]
         else:
-            for e in range(nE):
-                for q in range(nQ):
-                    xq = qp_phys[e, q]
-                    phis[e, q] = level_set(xq)
-                    g = level_set.gradient(xq)
-                    ng = float(np.linalg.norm(g))
-                    normals[e, q] = g / (ng + 1e-30)
+            # Robust fallback: 'nseg' uniform → constant nQ = qdeg * nseg
+            nseg_eff = int(nseg if nseg is not None else max(3, mesh.poly_order + qdeg // 2))
+            nQ = int(max(1, int(qdeg)) * nseg_eff)
+            qp_phys = np.empty((nE, nQ, 2), dtype=float)
+            qw      = np.empty((nE, nQ),    dtype=float)
+            # map each cut element segment P0→P1 with curved interface quadrature
+            for i, eid in enumerate(valid_eids):
+                p0, p1 = mesh.elements_list[int(eid)].interface_pts
+                pts, wts = curved_line_quadrature(
+                    level_set, np.asarray(p0, float), np.asarray(p1, float),
+                    order=int(qdeg), nseg=nseg_eff, project_steps=3, tol=1e-12
+                )
+                qp_phys[i, :, :] = np.asarray(pts, float).reshape(nQ, 2)
+                qw[i, :]         = np.asarray(wts, float).reshape(nQ)
+            that = None
+            qref = None
 
-        # If deformation is provided: scale weights by ||(I + ∂u/∂x)·τ̂||
-        if deformation is not None:
-            from pycutfem.fem.reference import get_reference as _get_ref
-            ref_geom = _get_ref(mesh.element_type, mesh.poly_order)
-            # Build reference coordinates for each qp (element-wise inverse map)
-            xi_tab  = np.empty((nE, nQ), dtype=float)
-            eta_tab = np.empty((nE, nQ), dtype=float)
-            for i in range(nE):
-                eid = int(valid_cut_eids[i])
-                for q in range(nQ):
-                    s, t = transform.inverse_mapping(mesh, eid, qp_phys[i, q])
-                    xi_tab[i, q]  = float(s); eta_tab[i, q] = float(t)
-            # Apply stretch per qp
-            for i in range(nE):
-                eid = int(valid_cut_eids[i])
-                conn = np.asarray(mesh.elements_connectivity[eid], dtype=int)
-                Uloc = np.asarray(deformation.node_displacements[conn], float)  # (n_loc,2)
-                for q in range(nQ):
-                    xi = float(xi_tab[i, q]); eta = float(eta_tab[i, q])
-                    Jg = transform.jacobian(mesh, eid, (xi, eta))
-                    dN = np.asarray(ref_geom.grad(xi, eta), float)
-                    Gref = Uloc.T @ dN
-                    # G_phys = solve(Jg^T, Gref^T)^T
-                    Gphy = np.linalg.solve(Jg.T, Gref.T).T
-                    F = np.eye(2) + Gphy
-                    n = normals[i, q]
-                    tau = np.array([n[1], -n[0]], dtype=float)
-                    qw[q] *= float(np.linalg.norm(F @ tau))
-                    # update physical point to deformed location for ana.eval consistency
-                    xg = transform.x_mapping(mesh, eid, (xi, eta))
-                    disp = deformation.displacement_ref(eid, (xi, eta))
-                    qp_phys[i, q, :] = xg + disp
-
-        # --- (ξ,η) at each interface quadrature point -------------------------------
+        # ------------------------------------------------------------------------------
+        # 2) Reference coords (ξ,η) at each interface quadrature point
+        # ------------------------------------------------------------------------------
         xi_tab  = np.empty((nE, nQ), dtype=float)
         eta_tab = np.empty((nE, nQ), dtype=float)
-        for k, eid in enumerate(valid_cut_eids):
-            for q in range(nQ):
-                s, t = transform.inverse_mapping(mesh, int(eid), qp_phys[k, q])  # fast path if p==1
-                xi_tab[k, q]  = float(s)
-                eta_tab[k, q] = float(t)
+        if qref is not None:
+            xi_tab[:, :]  = qref[:, :, 0]
+            eta_tab[:, :] = qref[:, :, 1]
+        else:
+            for i, eid in enumerate(valid_eids):
+                for q in range(nQ):
+                    s, t = transform.inverse_mapping(mesh, int(eid), qp_phys[i, q])
+                    xi_tab[i, q]  = float(s)
+                    eta_tab[i, q] = float(t)
 
-        # --- Geometry J, detJ, J_inv (use *geometry* p for mapping only) -----------
+        # ------------------------------------------------------------------------------
+        # 3) φ values and unit normals n̂ = ∇φ / ‖∇φ‖  (NEG→POS orientation)
+        #     Use on-element fast paths when exposed by level_set.
+        # ------------------------------------------------------------------------------
+        phis    = np.empty((nE, nQ), dtype=float)
+        normals = np.empty((nE, nQ, 2), dtype=float)
+
+        have_vals_many = hasattr(level_set, "values_on_element_many")
+        have_val_elem  = hasattr(level_set, "value_on_element")
+        have_grads_many = hasattr(level_set, "gradients_on_element_many")
+        have_grad_elem  = hasattr(level_set, "gradient_on_element")
+
+        for i, eid in enumerate(valid_eids):
+            # φ (value)
+            if have_vals_many:
+                phis[i, :] = np.asarray(
+                    level_set.values_on_element_many(int(eid), xi_tab[i], eta_tab[i]),
+                    dtype=float
+                )
+            elif have_val_elem:
+                for q in range(nQ):
+                    phis[i, q] = float(
+                        level_set.value_on_element(int(eid), (float(xi_tab[i, q]), float(eta_tab[i, q])))
+                    )
+            elif _phi_eval is not None:
+                for q in range(nQ):
+                    phis[i, q] = float(_phi_eval(level_set, qp_phys[i, q]))
+            else:
+                for q in range(nQ):
+                    phis[i, q] = float(level_set(qp_phys[i, q]))
+
+            # ∇φ (gradient)
+            if have_grads_many:
+                g = np.asarray(
+                    level_set.gradients_on_element_many(int(eid), xi_tab[i], eta_tab[i]),
+                    dtype=float
+                )  # (nQ,2)
+            elif have_grad_elem:
+                g = np.empty((nQ, 2), dtype=float)
+                for q in range(nQ):
+                    g[q, :] = np.asarray(
+                        level_set.gradient_on_element(int(eid), (float(xi_tab[i, q]), float(eta_tab[i, q]))),
+                        dtype=float
+                    )
+            else:
+                g = np.empty((nQ, 2), dtype=float)
+                for q in range(nQ):
+                    g[q, :] = np.asarray(level_set.gradient(qp_phys[i, q]), dtype=float)
+
+            ng = np.linalg.norm(g, axis=1) + 1e-30
+            normals[i, :, 0] = g[:, 0] / ng
+            normals[i, :, 1] = g[:, 1] / ng
+
+        # ------------------------------------------------------------------------------
+        # 4) Geometry Jacobians at (ξ,η) — use *geometry* order only
+        # ------------------------------------------------------------------------------
         elem_type = mesh.element_type
-        p_geom    = mesh.poly_order  # geometry/order on the mesh
-
-        # parent element coordinates for geometry/J
+        p_geom    = mesh.poly_order
+        # element-node coords for geometry
         node_ids_all = mesh.nodes[mesh.elements_connectivity]
         coords_all   = mesh.nodes_x_y_pos[node_ids_all].astype(float)
-        coords_sel   = coords_all[valid_cut_eids]  # (nE, nLocGeom, 2)
+        coords_sel   = coords_all[valid_eids]
         nLocGeom     = coords_sel.shape[1]
 
         have_jit_ref = False
         kmax = 4 if need_o4 else (3 if need_o3 else 2)
-        # Build dN_tab (nE, nQ, nLocGeom, 2) and, if available, N_tab (for basis fill)
         if _HAVE_NUMBA and elem_type == "tri" and p_geom == 1:
             N_tab  = np.empty((nE, nQ, 3), dtype=float)
             dN_tab = np.empty((nE, nQ, 3, 2), dtype=float)
@@ -2103,13 +2168,12 @@ class DofHandler:
             _tabulate_q2(xi_tab, eta_tab, N_tab, dN_tab)
             have_jit_ref = True
         else:
-            ref = get_reference(elem_type, p_geom, max_deriv_order=kmax)
+            ref = transform.get_reference(elem_type, p_geom, max_deriv_order=kmax)
             dN_tab = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
-            for k in range(nE):
+            for i in range(nE):
                 for q in range(nQ):
-                    dN_tab[k, q] = np.asarray(ref.grad(xi_tab[k, q], eta_tab[k, q]), dtype=float)
+                    dN_tab[i, q] = np.asarray(ref.grad(xi_tab[i, q], eta_tab[i, q]), dtype=float)
 
-        # J, detJ, J_inv
         if _HAVE_NUMBA and have_jit_ref:
             detJ, J_inv = _geom_from_dN(coords_sel, dN_tab)
         else:
@@ -2132,90 +2196,108 @@ class DofHandler:
                     J_inv[e, q, 1, 0] = -a10 * invd
                     J_inv[e, q, 1, 1] =  a00 * invd
 
-        # Sanity: non-degenerate mapping
+        # Sanity
         bad = np.where(detJ <= 1e-12)
         if bad[0].size:
             e_bad, q_bad = int(bad[0][0]), int(bad[1][0])
             raise ValueError(
-                f"Jacobian determinant is non-positive ({detJ[e_bad, q_bad]}) "
-                f"for element id {valid_cut_eids[e_bad]} at qp {q_bad}."
+                f"[interface] Jacobian determinant non-positive ({detJ[e_bad, q_bad]}) "
+                f"for element id {valid_eids[e_bad]} at qp {q_bad}."
             )
 
-        # --- Basis & grad (per-field orders; ignore p_geom) ------------------------
+        # ------------------------------------------------------------------------------
+        # 5) Optional deformation: scale qw by ‖(I+∇u) τ̂‖ and move QPs to x+u
+        # ------------------------------------------------------------------------------
+        if deformation is not None:
+            # reference gradients for deformation
+            ref_geom = transform.get_reference(mesh.element_type, mesh.poly_order)
+            for i, eid in enumerate(valid_eids):
+                conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
+                Uloc = np.asarray(deformation.node_displacements[conn], float)  # (n_loc, 2)
+                for q in range(nQ):
+                    xi = float(xi_tab[i, q]); eta = float(eta_tab[i, q])
+                    Jg = transform.jacobian(mesh, int(eid), (xi, eta))  # (2,2)
+                    dN = np.asarray(ref_geom.grad(xi, eta), float)       # (n_loc,2)
+                    # ∇u in physical coords: solve(Jg^T, (U^T dN)^T)^T
+                    Gref = Uloc.T @ dN                   # (2,2) in ref
+                    Gphy = np.linalg.solve(Jg.T, Gref.T).T
+                    F    = np.eye(2) + Gphy
+                    # unit tangent: prefer rule's that; else rotate normal
+                    if that is not None:
+                        tau = that[i, q]
+                    else:
+                        n = normals[i, q]
+                        tau = np.array([-n[1], n[0]], dtype=float)  # any perpendicular is fine
+                    qw[i, q] *= float(np.linalg.norm(F @ tau))
+                    # move qp to the deformed location for analytic eval consistency
+                    xg   = transform.x_mapping(mesh, int(eid), (xi, eta))
+                    disp = deformation.displacement_ref(int(eid), (xi, eta))
+                    qp_phys[i, q, :] = xg + disp
+
+        # ------------------------------------------------------------------------------
+        # 6) Basis & reference derivatives up to requested order
+        # ------------------------------------------------------------------------------
         b_tabs = {f: np.zeros((nE, nQ, n_union), dtype=float) for f in fields}
         g_tabs = {f: np.zeros((nE, nQ, n_union, 2), dtype=float) for f in fields}
         xi_flat  = xi_tab.reshape(-1)
         eta_flat = eta_tab.reshape(-1)
+
         for fld in fields:
-            sl = me.component_dof_slices[fld]
-            # vectorized reference evals from MixedElement, then reshape back
+            sl = self.mixed_element.component_dof_slices[fld]
             B = me._eval_scalar_basis_many(fld, xi_flat, eta_flat).reshape(nE, nQ, -1)
             G = me._eval_scalar_grad_many (fld, xi_flat, eta_flat).reshape(nE, nQ, -1, 2)
             b_tabs[fld][:, :, sl]    = B
             g_tabs[fld][:, :, sl, :] = G
 
-        
-        # --- Reference derivative tables d.._{field} for codegen (no push-forward) --
-        # Up to the requested max: 1st (always), 2nd (need_hess), 3rd (need_o3), 4th (need_o4)
-        base_derivs = {(1,0), (0,1)}
-        if need_hess:
-            base_derivs.update({(2,0), (1,1), (0,2)})
-        if need_o3:
-            base_derivs.update({(3,0), (2,1), (1,2), (0,3)})
-        if need_o4:
-            base_derivs.update({(4,0), (3,1), (2,2), (1,3), (0,4)})
-        # If caller also asked for specific derivs, include them (superset)
-        base_derivs |= set(getattr(self, "_last_requested_interface_derivs", set()))  # optional reuse
-        # In case function parameter 'derivs' exists in your signature elsewhere:
-        try:
-            # if this function is called with a 'derivs' kw in your codebase later
-            base_derivs |= set(derivs)  # type: ignore  # noqa
-        except Exception:
-            pass
+        # which higher derivatives to tabulate?
+        base_derivs = {(1, 0), (0, 1)}
+        if need_hess: base_derivs |= {(2, 0), (1, 1), (0, 2)}
+        if need_o3:   base_derivs |= {(3, 0), (2, 1), (1, 2), (0, 3)}
+        if need_o4:   base_derivs |= {(4, 0), (3, 1), (2, 2), (1, 3), (0, 4)}
 
         d_tabs = {}
+        elem_type = mesh.element_type
+        def _tab(dx, dy, out_arr, fld_name, ord_f):
+            if _HAVE_NUMBA and elem_type == "quad" and ord_f == 1:
+                _tabulate_deriv_q1(xi_tab, eta_tab, int(dx), int(dy), out_arr)
+            elif _HAVE_NUMBA and elem_type == "quad" and ord_f == 2:
+                _tabulate_deriv_q2(xi_tab, eta_tab, int(dx), int(dy), out_arr)
+            elif _HAVE_NUMBA and elem_type == "tri"  and ord_f == 1:
+                _tabulate_deriv_p1(xi_tab, eta_tab, int(dx), int(dy), out_arr)
+            else:
+                # generic path
+                for e in range(nE):
+                    for q in range(nQ):
+                        out_arr[e, q, :] = me._eval_scalar_deriv(
+                            fld_name, float(xi_tab[e, q]), float(eta_tab[e, q]), int(dx), int(dy)
+                        )
+
         for fld in fields:
-            sl = me.component_dof_slices[fld]
-            ord_f = me._field_orders[fld]
-            n_f = sl.stop - sl.start
-
-            def _tab(dx, dy, out_arr):
-                if _HAVE_NUMBA and elem_type == "quad" and ord_f == 1:
-                    _tabulate_deriv_q1(xi_tab, eta_tab, int(dx), int(dy), out_arr)
-                elif _HAVE_NUMBA and elem_type == "quad" and ord_f == 2:
-                    _tabulate_deriv_q2(xi_tab, eta_tab, int(dx), int(dy), out_arr)
-                elif _HAVE_NUMBA and elem_type == "tri" and ord_f == 1:
-                    _tabulate_deriv_p1(xi_tab, eta_tab, int(dx), int(dy), out_arr)
-                else:
-                    for e in range(nE):
-                        for q in range(nQ):
-                            out_arr[e, q, :] = me._eval_scalar_deriv(
-                                fld, float(xi_tab[e, q]), float(eta_tab[e, q]), int(dx), int(dy)
-                            )
-
+            sl   = me.component_dof_slices[fld]
+            ordf = me._field_orders[fld]
+            n_f  = sl.stop - sl.start
             for (dx, dy) in sorted(base_derivs):
                 loc = np.empty((nE, nQ, n_f), dtype=float)
-                _tab(dx, dy, loc)
+                _tab(dx, dy, loc, fld, ordf)
                 arr = np.zeros((nE, nQ, n_union), dtype=float)
                 arr[:, :, sl] = loc
                 d_tabs[f"d{dx}{dy}_{fld}"] = arr
-        
-        #--- union map for each field
-        for fld in fields:
-            # number of local dofs for this field on one element
-            nloc_f = len(self.element_maps[fld][valid_cut_eids[0]])
-            m = np.empty((nE, nloc_f), dtype=np.int32)
-            for i, eid in enumerate(valid_cut_eids):
-                union = gdofs_map[i, :n_union]        # union layout for this element
-                col_of = {int(d): j for j, d in enumerate(union)}
-                local_gdofs_f = self.element_maps[fld][eid]
-                m[i, :] = [col_of[int(d)] for d in local_gdofs_f]
-            out[f"pos_map_{fld}"] = m
-            out[f"neg_map_{fld}"] = m  # same element both "sides" on interface
 
-        # --- Inverse-map jets for chain rule (Hxi: 2nd, Txi: 3rd, Qxi: 4th) -------
+        # ------------------------------------------------------------------------------
+        # 7) owner/side maps + (optional) inverse‑map jets (Hxi/Txi/Qxi) for chain rule
+        # ------------------------------------------------------------------------------
+        # per-field owner→union maps (same element on both "sides")
+        pos_map = np.empty((nE, n_union), dtype=np.int32)
+        neg_map = np.empty((nE, n_union), dtype=np.int32)
+        for i in range(nE):
+            pos_map[i] = np.arange(n_union, dtype=np.int32)
+            neg_map[i] = np.arange(n_union, dtype=np.int32)
+
+        # jets
+        from pycutfem.fem.transform import JET_CACHE as _JET
+        Hxi0 = Hxi1 = Txi0 = Txi1 = Qxi0 = Qxi1 = None
         if need_hess or need_o3 or need_o4:
-            kmax = 4 if need_o4 else (3 if need_o3 else 2)
+            kmax_jets = 4 if need_o4 else (3 if need_o3 else 2)
             if need_hess:
                 Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
                 Hxi1 = np.zeros_like(Hxi0)
@@ -2225,30 +2307,22 @@ class DofHandler:
             if need_o4:
                 Qxi0 = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=float)
                 Qxi1 = np.zeros_like(Qxi0)
-
-            # Use module-level inverse-jet cache; (xi_tab, eta_tab) already computed
-            for i, eid in enumerate(valid_cut_eids):
-                eidi = int(eid)
+            for i, eid in enumerate(valid_eids):
                 for q in range(nQ):
                     xi = float(xi_tab[i, q]); eta = float(eta_tab[i, q])
-                    rec = _JET.get(mesh, eidi, xi, eta, upto=kmax)
+                    rec = _JET.get(mesh, int(eid), xi, eta, upto=kmax_jets)
                     if need_hess:
-                        A2 = rec["A2"]            # (2,2,2)
-                        Hxi0[i, q] = A2[0]
-                        Hxi1[i, q] = A2[1]
+                        A2 = rec["A2"]; Hxi0[i, q] = A2[0]; Hxi1[i, q] = A2[1]
                     if need_o3:
-                        A3 = rec["A3"]            # (2,2,2,2)
-                        Txi0[i, q] = A3[0]
-                        Txi1[i, q] = A3[1]
+                        A3 = rec["A3"]; Txi0[i, q] = A3[0]; Txi1[i, q] = A3[1]
                     if need_o4:
-                        A4 = rec["A4"]            # (2,2,2,2,2)
-                        Qxi0[i, q] = A4[0]
-                        Qxi1[i, q] = A4[1]
+                        A4 = rec["A4"]; Qxi0[i, q] = A4[0]; Qxi1[i, q] = A4[1]
 
-
-        # --- Pack outputs -----------------------------------------------------------
+        # ------------------------------------------------------------------------------
+        # 8) Pack and cache
+        # ------------------------------------------------------------------------------
         out = {
-            "eids":        np.asarray(valid_cut_eids, dtype=np.int32),
+            "eids":        np.asarray(valid_eids, dtype=np.int32),
             "qp_phys":     qp_phys,
             "qw":          qw,
             "normals":     normals,
@@ -2258,17 +2332,15 @@ class DofHandler:
             "h_arr":       h_arr,
             "gdofs_map":   gdofs_map,
             "entity_kind": "element",
-
-            # Side-ready aliases for codegen (same element on both "sides")
+            # side aliases (same element on both sides for dInterface)
             "J_inv_pos":   J_inv,
             "J_inv_neg":   J_inv,
-            "pos_map":     np.tile(np.arange(n_union, dtype=np.int32), (nE, 1)),
-            "neg_map":     np.tile(np.arange(n_union, dtype=np.int32), (nE, 1)),
-
-            # Owner info (both sides are the same element)
-            "owner_id":     np.asarray(valid_cut_eids, dtype=np.int32),
-            "owner_pos_id": np.asarray(valid_cut_eids, dtype=np.int32),
-            "owner_neg_id": np.asarray(valid_cut_eids, dtype=np.int32),
+            "pos_map":     pos_map,
+            "neg_map":     neg_map,
+            # owner info (both sides = same element id)
+            "owner_id":     np.asarray(valid_eids, dtype=np.int32),
+            "owner_pos_id": np.asarray(valid_eids, dtype=np.int32),
+            "owner_neg_id": np.asarray(valid_eids, dtype=np.int32),
         }
         for fld in fields:
             out[f"b_{fld}"] = b_tabs[fld]
@@ -2284,6 +2356,7 @@ class DofHandler:
         if reuse:
             _interface_cache[cache_key] = out
         return out
+
 
 
 
@@ -3592,47 +3665,56 @@ class DofHandler:
 
 
 
-    def l2_error_on_side(
-        self,
-        functions,
-        exact,
-        level_set,
-        side: str = "-",
-        quad_order: int | None = None,
-        fields: list[str] | None = None,
-        relative: bool = False,
-    ) -> float:
+    def l2_error_on_side(self,
+                        functions=None,                       # Function | VectorFunction | dict | list/tuple
+                        exact=None,                           # dict[str -> callable], keys must match field names
+                        level_set=None,
+                        side: str = '-',
+                        fields: list[str] | None = None,
+                        quad_order: int | None = None,
+                        relative: bool = False,
+                        deformation=None,
+                        **kwargs) -> float:
         """
-        L2 error of the given fields over Ω_side := Ω ∩ { φ ▷ 0 }, with ▷='<' if side='-', or '>=' if side='+'.
+        Piecewise L2 error on Ω_side (φ<0 if side='-', φ>0 if side='+'),
+        integrating in REFERENCE space and scaling by |det(J_total)|.
+        Supports isoparametric deformation: J_total = J_geom + (Uloc^T @ dN_geom).
 
-        Accepts:
-        - a single Function,
-        - a VectorFunction,
-        - a dict[str, Function],
-        - or a list/tuple mixing the above.
-
-        Robustness notes:
-        • Uses field-local basis evaluation for the dot product (length matches local DOFs).
-        • Falls back to a mixed-basis + scatter if shapes ever disagree.
-        • Works for both full and cut elements; cut integration uses physical weights.
+        Parameters
+        ----------
+        functions : Function | VectorFunction | dict[str, Function] | list/tuple of those
+        exact     : dict[str, (x,y)->float]  (keys must match field names)
+        level_set : Level set (analytic or FE-backed)
+        side      : '-' or '+'
+        fields    : subset of field names to include; if None, intersect(functions, exact)
+        quad_order: reference volume quadrature order
+        relative  : if True returns ‖e‖/‖u_exact‖ over the side
+        deformation : object with:
+            - node_displacements[nid] -> (ux,uy)
+            - displacement_ref(eid, (xi,eta)) -> (ux,uy)
         """
-        from pycutfem.fem import transform
-        from pycutfem.integration.quadrature import volume as vol_rule
+        import numpy as np
         from pycutfem.ufl.expressions import Function as UFLFunction, VectorFunction as UFLVectorFunction
-        from pycutfem.ufl.helpers_geom import (
-            corner_tris, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, phi_eval
-        )
+        from pycutfem.integration.quadrature import volume as vol_rule
+        from pycutfem.fem import transform
+        from pycutfem.integration.cut_integration import CutIntegration
+        from pycutfem.ufl.helpers_geom import corner_tris, curved_subcell_quadrature_for_cut_triangle
+        from pycutfem.fem.reference import get_reference as _get_ref
 
         mesh = self.mixed_element.mesh
         me   = self.mixed_element
-        max_field_q = max(me.q_orders.values())
-        q_geom = mesh.poly_order
-        q_good = 2 * max_field_q + 2 * (q_geom - 1)
-        qdeg  = quad_order or q_good
 
-        # ---------------------- normalize 'functions' -> dict[field] = Function ----------------------
+        # ---- normalize 'functions' input (support function=..., vector_function=..., functions=...) ----
+        if functions is None:
+            if "vector_function" in kwargs and kwargs["vector_function"] is not None:
+                functions = kwargs["vector_function"]
+            elif "function" in kwargs and kwargs["function"] is not None:
+                functions = kwargs["function"]
+        if exact is None:
+            raise ValueError("exact must be a dict[str -> callable] matching field names.")
+
+        # collect per-field Function objects
         field_funcs: dict[str, UFLFunction] = {}
-
         def _add_vec(vecfun: UFLVectorFunction):
             for name, comp in zip(vecfun.field_names, vecfun.components):
                 field_funcs[name] = comp
@@ -3643,117 +3725,166 @@ class DofHandler:
             _add_vec(functions)
         elif isinstance(functions, (list, tuple)):
             for obj in functions:
-                if isinstance(obj, UFLVectorFunction):
-                    _add_vec(obj)
-                elif isinstance(obj, UFLFunction):
-                    field_funcs[obj.field_name] = obj
-                elif isinstance(obj, dict):
-                    field_funcs.update(obj)
-                else:
-                    raise TypeError("Unsupported item in 'functions' list/tuple.")
+                if isinstance(obj, UFLVectorFunction): _add_vec(obj)
+                elif isinstance(obj, UFLFunction):     field_funcs[obj.field_name] = obj
+                elif isinstance(obj, dict):            field_funcs.update(obj)
+                else: raise TypeError(f"Unsupported item in 'functions': {type(obj)}")
         elif isinstance(functions, UFLFunction):
             field_funcs[functions.field_name] = functions
         else:
-            raise TypeError("'functions' must be a Function, VectorFunction, dict[str, Function], or list/tuple of those.")
+            raise TypeError("Pass 'function=', 'vector_function=' or 'functions='.")
 
-        # Which fields to include
+        # which fields to use
         if fields is None:
-            # Only fields for which we have both a function and an exact callable
             fields = [f for f in me.field_names if f in field_funcs and f in exact]
         else:
-            # Keep only those we can actually evaluate
             fields = [f for f in fields if f in field_funcs and f in exact]
         if not fields:
             return 0.0
 
-        # Accumulators
+        # quadrature order: field order + geometry inflation
+        max_field_q = max(me.q_orders[f] for f in fields)
+        q_geom      = getattr(mesh, "poly_order", 1)
+        qdeg        = int(quad_order or (2*max_field_q + 2*max(q_geom-1, 0)))
+
+        # classify elements once
+        inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
+        full_eids = (outside_ids if side == "+" else inside_ids)
+
+        # helper: evaluate uh at (xi,eta) using field-local basis if available
+        def _eval_uh(fld: str, eid: int, xi: float, eta: float, coeffs: np.ndarray) -> float:
+            # prefer fast field-local basis
+            try:
+                phi_f = np.asarray(me._eval_scalar_basis(fld, xi, eta), float)
+                if phi_f.shape[0] == coeffs.shape[0]:
+                    return float(coeffs @ phi_f)
+            except AttributeError:
+                pass
+            # fall back to mixed basis
+            phi_mixed = np.asarray(me.basis(fld, xi, eta), float)
+            sl = me.slice(fld)
+            v  = np.zeros_like(phi_mixed)
+            n  = min(len(sl), coeffs.shape[0])
+            v[sl[:n]] = coeffs[:n]
+            return float(v @ phi_mixed)
+
+        # (cache) geometry reference for ∂N/∂ξ used by deformation Jacobian
+        ref_geom = _get_ref(mesh.element_type, mesh.poly_order)
+
         err2, base2 = 0.0, 0.0
 
-        # ---------------------------- classify elements ----------------------------
-        inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
-        full_eids = outside_ids if side == "+" else inside_ids
-
-        # Helper: evaluate uh safely (field-local basis preferred; mixed fallback)
-        def _eval_uh(fld: str, eid: int, xi: float, eta: float, gdofs: np.ndarray) -> float:
-            vals = np.asarray(field_funcs[fld].get_nodal_values(gdofs), dtype=float)
-            # Try field-local basis first
-            try:
-                phi_f = np.asarray(me._eval_scalar_basis(fld, xi, eta), dtype=float)  # length n_loc(field)
-            except AttributeError:
-                phi_f = None
-
-            if phi_f is not None and phi_f.shape[0] == vals.shape[0]:
-                return float(vals @ phi_f)
-
-            # Fallback: build mixed basis and scatter vals into mixed positions, then dot.
-            phi_mixed = np.asarray(me.basis(fld, xi, eta), dtype=float)
-            sl = me.slice(fld)  # indices for this field in the mixed ordering
-            v_mixed = np.zeros_like(phi_mixed, dtype=float)
-            # Guard for shape mismatch (robustness)
-            n = min(len(sl), vals.shape[0])
-            v_mixed[sl[:n]] = vals[:n]
-            return float(v_mixed @ phi_mixed)
-
-        # -------------------------- (A) full elements on side ----------------------
+        # -------------------------- A) full elements --------------------------
         qp_ref, qw_ref = vol_rule(mesh.element_type, qdeg)
         for eid in full_eids:
-            # per-field local DOF ids for this element
-            gdofs_f = {fld: self.element_maps[fld][eid] for fld in fields}
+            # gather per-field coefficients once
+            coeffs = {f: np.asarray(field_funcs[f].get_nodal_values(self.element_maps[f][eid]), float)
+                    for f in fields}
             for (xi, eta), w in zip(qp_ref, qw_ref):
-                J    = transform.jacobian(mesh, eid, (xi, eta))
-                detJ = abs(np.linalg.det(J))
-                x, y = transform.x_mapping(mesh, eid, (xi, eta))
-                for fld in fields:
-                    uh = _eval_uh(fld, eid, xi, eta, gdofs_f[fld])
-                    ue = float(exact[fld](x, y))
+                # geometric mapping
+                Jg  = transform.jacobian(mesh, eid, (xi, eta))
+                xg  = transform.x_mapping(mesh, eid, (xi, eta))
+                if deformation is None:
+                    Jt   = Jg
+                    dett = abs(float(np.linalg.det(Jt)))
+                    y    = np.asarray(xg, float)
+                else:
+                    # J_total = J_geom + (Uloc^T @ dN_geom)
+                    conn = np.asarray(mesh.elements_connectivity[eid], int)
+                    Uloc = np.asarray(deformation.node_displacements[conn], float)   # (nloc,2)
+                    dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)    # (nloc,2)
+                    Jt   = Jg + Uloc.T @ dN
+                    dett = abs(float(np.linalg.det(Jt)))
+                    y    = np.asarray(xg, float) + deformation.displacement_ref(eid, (float(xi), float(eta)))
+
+                for f in fields:
+                    uh = _eval_uh(f, eid, float(xi), float(eta), coeffs[f])
+                    ue = float(exact[f](y[0], y[1]))   # dict lookup per field name
                     d2 = (uh - ue) ** 2
                     b2 = ue ** 2
-                    err2  += w * detJ * d2
-                    base2 += w * detJ * b2
+                    err2  += w * dett * d2
+                    base2 += w * dett * b2
 
-        # -------------------------- (B) cut elements on side -----------------------
-        # Reference rule on unit triangle (mapped to physical with weights)
-        qp_tri, qw_tri = vol_rule("tri", qdeg)
-
+        # -------------------------- B) cut elements ---------------------------
+        # QUADs: straight‑cut ref rule (isoparam) → q_ref, w_ref
+        # TRIs : curved subcells in physical space → convert to reference, fix weight with det(Jt)/det(Jg)
         for eid in cut_ids:
-            elem = mesh.elements_list[eid]
-            tri_local, corner_ids = corner_tris(mesh, elem)
-
-            # per-field local DOF ids for this element
-            gd_f = {fld: self.element_maps[fld][eid] for fld in fields}
-
-            for loc_tri in tri_local:
-                v_ids = [corner_ids[i] for i in loc_tri]
-                V     = mesh.nodes_x_y_pos[v_ids]                       # (3,2)
-                v_phi = np.array([phi_eval(level_set, xy) for xy in V], dtype=float)
-
-                # Clip this triangle to requested side
-                polys = clip_triangle_to_side(V, v_phi, side=side)
-                if not polys:
+            if mesh.element_type == "quad":
+                # reference straight‑cut rule
+                order_xy = max(2, qdeg // 2)
+                qref, wref = CutIntegration.straight_cut_rule_quad_ref(
+                    mesh, int(eid), level_set, side=side, order_y=order_xy, order_x=order_xy, tol=1e-12
+                )
+                if qref.size == 0:   # nothing on this side
                     continue
+                coeffs = {f: np.asarray(field_funcs[f].get_nodal_values(self.element_maps[f][eid]), float)
+                        for f in fields}
+                for (xi, eta), w in zip(qref, wref):
+                    Jg = transform.jacobian(mesh, eid, (xi, eta))
+                    xg = transform.x_mapping(mesh, eid, (xi, eta))
+                    if deformation is None:
+                        dett = abs(float(np.linalg.det(Jg)))
+                        y    = np.asarray(xg, float)
+                    else:
+                        conn = np.asarray(mesh.elements_connectivity[eid], int)
+                        Uloc = np.asarray(deformation.node_displacements[conn], float)
+                        dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
+                        Jt   = Jg + Uloc.T @ dN
+                        dett = abs(float(np.linalg.det(Jt)))
+                        y    = np.asarray(xg, float) + deformation.displacement_ref(eid, (float(xi), float(eta)))
+                    for f in fields:
+                        uh = _eval_uh(f, eid, float(xi), float(eta), coeffs[f])
+                        ue = float(exact[f](y[0], y[1]))
+                        d2 = (uh - ue) ** 2
+                        b2 = ue ** 2
+                        err2  += w * dett * d2
+                        base2 += w * dett * b2
+            else:  # TRI parent
+                elem = mesh.elements_list[eid]
+                tri_local, corner_ids = corner_tris(mesh, elem)
+                coeffs = {f: np.asarray(field_funcs[f].get_nodal_values(self.element_maps[f][eid]), float)
+                        for f in fields}
+                for loc_tri in tri_local:
+                    # curved physical subcells on requested side
+                    qx_phys, qw_phys = curved_subcell_quadrature_for_cut_triangle(
+                        mesh, int(eid), loc_tri, corner_ids, level_set, side=side, qvol=int(qdeg), nseg_hint=None, tol=1e-12
+                    )
+                    if qx_phys.size == 0:
+                        continue
+                    for x_phys, w_phys in zip(qx_phys, qw_phys):
+                        # back to reference (ξ,η) of the *geometry* parent
+                        xi, eta = transform.inverse_mapping(mesh, int(eid), np.asarray(x_phys, float))
+                        Jg      = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
+                        det_g   = abs(float(np.linalg.det(Jg))) + 1e-300
+                        if deformation is None:
+                            dett = det_g
+                            y    = np.asarray(x_phys, float)
+                            w_eff = float(w_phys)               # already physical
+                        else:
+                            conn = np.asarray(mesh.elements_connectivity[int(eid)], int)
+                            Uloc = np.asarray(deformation.node_displacements[conn], float)
+                            dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
+                            Jt   = Jg + Uloc.T @ dN
+                            dett = abs(float(np.linalg.det(Jt)))
+                            # correct physical weight produced with det(Jg): scale by det(Jt)/det(Jg)
+                            w_eff = float(w_phys) * (dett / det_g)
+                            y     = np.asarray(x_phys, float) + deformation.displacement_ref(int(eid), (float(xi), float(eta)))
+                        for f in fields:
+                            uh = _eval_uh(f, int(eid), float(xi), float(eta), coeffs[f])
+                            ue = float(exact[f](y[0], y[1]))
+                            d2 = (uh - ue) ** 2
+                            b2 = ue ** 2
+                            err2  += w_eff * d2
+                            base2 += w_eff * b2
 
-                for poly in polys:
-                    for A, B, C in fan_triangulate(poly):
-                        x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)  # physical points & weights
-                        for (x, y), w in zip(x_phys, w_phys):
-                            # Map back to parent element reference coords
-                            xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
-                            for fld in fields:
-                                uh = _eval_uh(fld, eid, xi, eta, gd_f[fld])
-                                ue = float(exact[fld](x, y))
-                                d2 = (uh - ue) ** 2
-                                b2 = ue ** 2
-                                err2  += w * d2           # w already physical here
-                                base2 += w * b2
-
-        # Return relative or absolute L2
         if relative:
-            return (err2 / base2) ** 0.5 if base2 > 1e-28 else 0.0
+            return (err2 / max(base2, 1e-30)) ** 0.5
         return err2 ** 0.5
 
 
+
     
-    def l2_error_piecewise(self, functions, exact_neg, exact_pos, level_set, fields=None, quad_order=None, relative=False):
+    def l2_error_piecewise(self, functions, exact_neg, exact_pos, level_set, fields=None, 
+                           quad_order=None, relative=False, deformation=None) -> float:
         """
         Piecewise L² error across a two-phase split defined by a level set.
 
@@ -3778,113 +3909,146 @@ class DofHandler:
         float
             The combined piecewise error: sqrt(‖e‖²_{Ω-} + ‖e‖²_{Ω+}).
         """
-        e_m = self.l2_error_on_side(functions, exact_neg, level_set, side='-', fields=fields, quad_order=quad_order, relative=relative)
-        e_p = self.l2_error_on_side(functions, exact_pos, level_set, side='+', fields=fields, quad_order=quad_order, relative=relative)
+        e_m = self.l2_error_on_side(functions, exact_neg, level_set, side='-', fields=fields, quad_order=quad_order, relative=relative, deformation=deformation)
+        e_p = self.l2_error_on_side(functions, exact_pos, level_set, side='+', fields=fields, quad_order=quad_order, relative=relative, deformation=deformation)
         return (e_m**2 + e_p**2)**0.5
 
     
     # --------------------------------------------------------------------------
     # H1 seminorm (energy) of a VectorFunction on a *side* (φ<0 or φ>0)
     # --------------------------------------------------------------------------
-    def _h1_seminorm_on_side(self,
-                            vector_function=None,                 # VectorFunction for seminorm mode
-                            level_set=None,                       # φ(x,y)
-                            side: str = '-',                      # '-' or '+'
-                            quad_order: int | None = None,
-                            fields: list[str] | None = None,
-                            *,
-                            function=None,                        # Scalar Function or VectorFunction (error mode)
-                            field: str | None = None,
-                            exact_grad=None,                      # callable (x,y)-> [du/dx, du/dy]
-                            quad_increase: int = 0):
+    def _h1_seminorm_on_side(
+        self,
+        vector_function=None,                 # VectorFunction for seminorm mode
+        level_set=None,                       # φ(x,y)
+        side: str = '-',                      # '-' or '+'
+        quad_order: int | None = None,
+        fields: list[str] | None = None,
+        *,
+        function=None,                        # Scalar Function or VectorFunction (error mode)
+        field: str | None = None,
+        exact_grad=None,                      # callable (x,y)-> [du/dx, du/dy]
+        quad_increase: int = 0,
+        deformation=None,
+    ):
         """
         Dual-mode helper:
         (A) Seminorm mode (when `function is None` and `exact_grad is None`):
-            Returns ||∇(vector_function)||_{L2(Ω_side)}.
-
+            returns ||∇(vector_function)||_{L2(Ω_side)}.
         (B) Error mode (when `function` AND `field` AND `exact_grad` are given):
-            Returns (err2, ref2) with
+            returns (err2, ref2) with
                 err2 = ||∇u_h - ∇u_exact||_{L2(Ω_side)}^2,
                 ref2 = ||∇u_exact||_{L2(Ω_side)}^2.
         """
+        import numpy as np
+        from pycutfem.fem import transform
         from pycutfem.integration.quadrature import volume as vol_rule
         from pycutfem.ufl.helpers_geom import (
-            corner_tris, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, phi_eval
+            corner_tris, clip_triangle_to_side, fan_triangulate,
+            map_ref_tri_to_phys, phi_eval, curved_subcell_quadrature_for_cut_triangle
         )
         from pycutfem.ufl.expressions import VectorFunction as _VF, Function as Function
 
         mesh = self.mixed_element.mesh
         me   = self.mixed_element
+
         max_field_q = max(me.q_orders.values())
-        q_geom = mesh.poly_order
-        q_good = 2 * (max_field_q - 1) + 2 * (q_geom - 1) + int(quad_increase)
-        qdeg  = quad_order or q_good
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        # match your earlier stable recipe (p=2 → 2*p + 2 when quad_increase=2)
+        qdeg = int(quad_order if quad_order is not None else (2*max_field_q + 2*max(0, p_geo-1) + int(quad_increase)))
         qdeg = max(qdeg, 2)  # at least linear for gradients
 
-        # classify once
         inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
         full_eids = outside_ids if side == '+' else inside_ids
 
-        # local gradient (physical) at (xi,eta) for a scalar field `fld`
-        def _grad_at(eid, xi, eta, fld, values):
-            # reference gradients of *this field* only
-            G_ref_full = me.grad_basis(fld, xi, eta)                    # (n_loc_total, 2)
-            loc = me.component_dof_slices[fld]                          # slice for this field
-            G_ref = G_ref_full[loc, :]                                  # (n_f, 2)
-            # physical mapping: ∇_x φ = J^{-T} ∇̂φ  (row-by-row)
-            J = transform.jacobian(mesh, eid, (xi, eta))               # (2,2)
-            Jinv = np.linalg.inv(J)           # (2,2) = J
-            G_phy = G_ref @ Jinv                                       # (n_f, 2)
-            return values @ G_phy                                       # (2,)
+        # reference→physical gradient for scalar field `fld`
+        def _grad_at(eid, xi, eta, fld, values, Jinv):
+            # grad_basis returns union-sized table → slice to the field rows
+            G_ref_full = me.grad_basis(fld, float(xi), float(eta))     # (n_union, 2)
+            loc = me.component_dof_slices[fld]
+            G_ref = G_ref_full[loc, :]                                 # (n_fld, 2)
+            G_phy = G_ref @ Jinv                                       # (n_fld, 2)
+            gu    = values @ G_phy                                     # (2,)
+            return np.asarray(gu, float)
 
-        # -------- seminorm mode --------
+        # deformation helpers
+        ref_geom = transform.get_reference(mesh.element_type, p_geo) if deformation is not None else None
+
+        # --------- (A) seminorm mode: ||∇v|| over Ω_side ----------
         if function is None and exact_grad is None:
-            if vector_function is None:
-                raise ValueError("seminorm mode requires 'vector_function'.")
-            if fields is None:
-                fields = list(vector_function.field_names)
-
+            if not isinstance(vector_function, _VF):
+                raise TypeError("Seminorm mode requires a VectorFunction.")
+            fields = fields or list(vector_function.field_names)
             acc = 0.0
-            # (A) full elements
+
+            # full elements
             qp_ref, qw_ref = vol_rule(mesh.element_type, qdeg)
             for eid in full_eids:
                 gd_f = {fld: self.element_maps[fld][eid] for fld in fields}
                 for (xi, eta), w_ref in zip(qp_ref, qw_ref):
-                    J = transform.jacobian(mesh, eid, (xi, eta))
-                    w = float(w_ref * abs(np.linalg.det(J)))
+                    Jg  = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
+                    xg  = transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
+                    if deformation is None:
+                        Jt = Jg
+                        det = abs(float(np.linalg.det(Jt)))
+                        Jinv = np.linalg.inv(Jt)
+                    else:
+                        conn = np.asarray(mesh.elements_connectivity[int(eid)], int)
+                        dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
+                        Uloc = np.asarray(deformation.node_displacements[conn], float)
+                        Jt   = Jg + Uloc.T @ dN
+                        det  = abs(float(np.linalg.det(Jt)))
+                        Jinv = np.linalg.inv(Jt)
+
                     for fld in fields:
-                        vals = vector_function.get_nodal_values(gd_f[fld])
-                        gu = _grad_at(eid, xi, eta, fld, vals)
-                        acc += w * (gu[0]**2 + gu[1]**2)
+                        vals = np.asarray(vector_function.get_nodal_values(gd_f[fld]), float)
+                        gu   = _grad_at(int(eid), float(xi), float(eta), fld, vals, Jinv)
+                        acc += w_ref * det * float(gu @ gu)
 
-            # (B) cut elements
+            # cut elements: use *high-order* triangle rules on subcells
             if len(cut_ids):
-                # one-point ref rule on unit triangle; mapped by fan-triangulation
-                qp_tri = np.array([[1.0/3.0, 1.0/3.0]])
-                qw_tri = np.array([0.5])
                 for eid in cut_ids:
-                    elem = mesh.elements_list[eid]
-                    tri_list, cn = corner_tris(mesh, elem)              # ([(i,j,k)], corner node ids)
+                    elem = mesh.elements_list[int(eid)]
+                    tri_local, corner_ids = corner_tris(mesh, elem)
                     gd_f = {fld: self.element_maps[fld][eid] for fld in fields}
-                    for (i, j, k) in tri_list:
-                        tri_xy = mesh.nodes_x_y_pos[[cn[i], cn[j], cn[k]]]   # (3,2)
-                        v_phi  = [phi_eval(level_set, tri_xy[r]) for r in range(3)]
-                        for poly in clip_triangle_to_side(tri_xy, v_phi, side=side):
-                            for A, B, C in fan_triangulate(poly):
-                                x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)
-                                for (x, y), w in zip(x_phys, w_phys):
-                                    xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
-                                    for fld in fields:
-                                        vals = vector_function.get_nodal_values(gd_f[fld])
-                                        gu = _grad_at(eid, xi, eta, fld, vals)
-                                        acc += w * (gu[0]**2 + gu[1]**2)
-            return float(acc) ** 0.5
 
-        # -------- error mode --------
+                    for loc_tri in tri_local:
+                        qx_phys, qw_phys = curved_subcell_quadrature_for_cut_triangle(
+                            mesh, int(eid), loc_tri, corner_ids, level_set,
+                            side=('+' if side == '+' else '-'),
+                            qvol=int(qdeg), nseg_hint=None, tol=1e-12
+                        )
+                        if qx_phys.size == 0:
+                            continue
+                        for x, w in zip(qx_phys, qw_phys):
+                            s, t = transform.inverse_mapping(mesh, int(eid), x)
+                            if deformation is None:
+                                Jt    = transform.jacobian(mesh, int(eid), (float(s), float(t)))
+                                det_t = abs(float(np.linalg.det(Jt)))
+                                Jinv  = np.linalg.inv(Jt)
+                                w_eff = float(w)          # already physical on geometry
+                            else:
+                                Jg    = transform.jacobian(mesh, int(eid), (float(s), float(t)))
+                                conn  = np.asarray(mesh.elements_connectivity[int(eid)], int)
+                                dN    = np.asarray(ref_geom.grad(float(s), float(t)), float)
+                                Uloc  = np.asarray(deformation.node_displacements[conn], float)
+                                Jt    = Jg + Uloc.T @ dN
+                                det_g = abs(float(np.linalg.det(Jg))) + 1e-300
+                                det_t = abs(float(np.linalg.det(Jt)))
+                                Jinv  = np.linalg.inv(Jt)
+                                w_eff = float(w) * (det_t / det_g)
+
+                            for fld in fields:
+                                vals = np.asarray(vector_function.get_nodal_values(gd_f[fld]), float)
+                                gu   = _grad_at(int(eid), float(s), float(t), fld, vals, Jinv)
+                                acc += w_eff * float(gu @ gu)
+
+            return float(acc)**0.5
+
+        # --------- (B) error mode: return (err2, ref2) ----------
         if function is None or field is None or exact_grad is None:
-            raise ValueError("error mode requires 'function', 'field', and 'exact_grad'.")
+            raise ValueError("Error mode requires 'function', 'field', and 'exact_grad'.")
 
-        # Both Function and VectorFunction expose .get_nodal_values(gd)
         if not isinstance(function, (_VF, Function)):
             raise TypeError("Unsupported 'function' type for H1 error.")
         get_vals = function.get_nodal_values
@@ -3892,45 +4056,78 @@ class DofHandler:
         err2 = 0.0
         ref2 = 0.0
 
-        # (A) full elements
+        # full elements
         qp_ref, qw_ref = vol_rule(mesh.element_type, qdeg)
         for eid in full_eids:
             gd = self.element_maps[field][eid]
             for (xi, eta), w_ref in zip(qp_ref, qw_ref):
-                J = transform.jacobian(mesh, eid, (xi, eta))
-                w = float(w_ref * abs(np.linalg.det(J)))
-                vals = get_vals(gd)
-                gu = _grad_at(eid, xi, eta, field, vals)
-                x, y = transform.x_mapping(mesh, eid, (xi, eta))
-                ge = np.asarray(exact_grad(x, y), dtype=float)
-                de = gu - ge
-                err2 += w * float(de @ de)
-                ref2 += w * float(ge @ ge)
+                Jg  = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
+                xg  = transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
+                if deformation is None:
+                    Jt = Jg
+                    det = abs(float(np.linalg.det(Jt)))
+                    Jinv = np.linalg.inv(Jt)
+                    y = xg
+                else:
+                    conn = np.asarray(mesh.elements_connectivity[int(eid)], int)
+                    dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
+                    Uloc = np.asarray(deformation.node_displacements[conn], float)
+                    Jt   = Jg + Uloc.T @ dN
+                    det  = abs(float(np.linalg.det(Jt)))
+                    Jinv = np.linalg.inv(Jt)
+                    y    = xg + deformation.displacement_ref(int(eid), (float(xi), float(eta)))
 
-        # (B) cut elements
+                vals = np.asarray(get_vals(gd), float)
+                gh   = _grad_at(int(eid), float(xi), float(eta), field, vals, Jinv)
+                ge   = np.asarray(exact_grad(y[0], y[1]), float)
+                d    = gh - ge
+                err2 += w_ref * det * float(d @ d)
+                ref2 += w_ref * det * float(ge @ ge)
+
+        # cut elements (high-order subcells)
         if len(cut_ids):
-            qp_tri = np.array([[1.0/3.0, 1.0/3.0]])
-            qw_tri = np.array([0.5])
             for eid in cut_ids:
-                elem = mesh.elements_list[eid]
-                tri_list, cn = corner_tris(mesh, elem)
+                elem = mesh.elements_list[int(eid)]
+                tri_local, corner_ids = corner_tris(mesh, elem)
                 gd = self.element_maps[field][eid]
-                for (i, j, k) in tri_list:
-                    tri_xy = mesh.nodes_x_y_pos[[cn[i], cn[j], cn[k]]]   # (3,2)
-                    v_phi  = [phi_eval(level_set, tri_xy[r]) for r in range(3)]
-                    for poly in clip_triangle_to_side(tri_xy, v_phi, side=side):
-                        for A, B, C in fan_triangulate(poly):
-                            x_phys, w_phys = map_ref_tri_to_phys(A, B, C, qp_tri, qw_tri)
-                            for (x, y), w in zip(x_phys, w_phys):
-                                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
-                                vals = get_vals(gd)
-                                gu = _grad_at(eid, xi, eta, field, vals)
-                                ge = np.asarray(exact_grad(x, y), dtype=float)
-                                de = gu - ge
-                                err2 += w * float(de @ de)
-                                ref2 += w * float(ge @ ge)
+                for loc_tri in tri_local:
+                    qx_phys, qw_phys = curved_subcell_quadrature_for_cut_triangle(
+                        mesh, int(eid), loc_tri, corner_ids, level_set,
+                        side=('+' if side == '+' else '-'),
+                        qvol=int(qdeg), nseg_hint=None, tol=1e-12
+                    )
+                    if qx_phys.size == 0:
+                        continue
+                    for x, w in zip(qx_phys, qw_phys):
+                        s, t = transform.inverse_mapping(mesh, int(eid), x)
+                        if deformation is None:
+                            Jt    = transform.jacobian(mesh, int(eid), (float(s), float(t)))
+                            det_t = abs(float(np.linalg.det(Jt)))
+                            Jinv  = np.linalg.inv(Jt)
+                            y     = x
+                            w_eff = float(w)
+                        else:
+                            Jg    = transform.jacobian(mesh, int(eid), (float(s), float(t)))
+                            conn  = np.asarray(mesh.elements_connectivity[int(eid)], int)
+                            dN    = np.asarray(ref_geom.grad(float(s), float(t)), float)
+                            Uloc  = np.asarray(deformation.node_displacements[conn], float)
+                            Jt    = Jg + Uloc.T @ dN
+                            det_g = abs(float(np.linalg.det(Jg))) + 1e-300
+                            det_t = abs(float(np.linalg.det(Jt)))
+                            Jinv  = np.linalg.inv(Jt)
+                            y     = x + deformation.displacement_ref(int(eid), (float(s), float(t)))
+                            w_eff = float(w) * (det_t / det_g)
+
+                        vals = np.asarray(get_vals(gd), float)
+                        gh   = _grad_at(int(eid), float(s), float(t), field, vals, Jinv)
+                        ge   = np.asarray(exact_grad(y[0], y[1]), float)
+                        d    = gh - ge
+                        err2 += w_eff * float(d @ d)
+                        ref2 += w_eff * float(ge @ ge)
 
         return float(err2), float(ref2)
+
+
 
 
 
@@ -3981,7 +4178,8 @@ class DofHandler:
                                 exact_pos: dict[str, callable],
                                 level_set,
                                 quad_order: int | None = None,
-                                fields: list[str] | None = None) -> float:
+                                fields: list[str] | None = None,
+                                deformation=None) -> float:
         """
         Returns the FE H1-seminorm error ||∇(u_h - I_h u_exact)|| over Ω^- ∪ Ω^+,
         computed as ( ||∇w||_{Ω^-}^2 + ||∇w||_{Ω^+}^2 )^{1/2} with w := u_h - I_h u_exact.
@@ -3989,11 +4187,11 @@ class DofHandler:
         No finite differences. No exact gradients required.
         """
         w = self._build_vector_diff_from_exact(u_h, exact_neg, exact_pos, level_set)
-        e_m = self._h1_seminorm_on_side(w, level_set, side='-', quad_order=quad_order, fields=fields)
-        e_p = self._h1_seminorm_on_side(w, level_set, side='+', quad_order=quad_order, fields=fields)
+        e_m = self._h1_seminorm_on_side(w, level_set, side='-', quad_order=quad_order, fields=fields, deformation=deformation)
+        e_p = self._h1_seminorm_on_side(w, level_set, side='+', quad_order=quad_order, fields=fields, deformation=deformation)
         return (e_m**2 + e_p**2)**0.5
     
-    def h1_error_scalar_on_side(self, uh, exact_grad, level_set, side, field=None, relative=False, quad_increase=0):
+    def h1_error_scalar_on_side(self, uh, exact_grad, level_set, side, field=None, relative=False, quad_increase=0, deformation=None):
         """
         H1-seminorm error on a side: ||∇u_h - ∇u_exact||_{L2(Ω_side)} for a scalar Function.
         - uh:        Function
@@ -4006,34 +4204,40 @@ class DofHandler:
         fld = field or uh.field_name
         err2, ref2 = self._h1_seminorm_on_side(
             function=uh, field=fld, exact_grad=exact_grad,
-            level_set=level_set, side=side, quad_increase=quad_increase
+            level_set=level_set, side=side, quad_increase=quad_increase,
+            deformation=deformation
         )
         return (err2**0.5) if not relative else ((err2 / max(ref2, 1e-30))**0.5)
 
-    def h1_error_vector_on_side(self, Uh, exact_grad_vec, level_set, side, fields=None, relative=False, quad_increase=0):
+    def h1_error_vector_on_side(
+        self, Uh, exact_grad_vec, level_set, side,
+        fields=None, relative=False, quad_increase=0, quad_order=None, deformation=None
+    ):
         """
         H1-seminorm error for a 2D vector field on a side:
-        ||∇Uh - ∇U_exact||_{L2(Ω_side)} where ∇Uh and ∇U_exact are 2×2.
-        - Uh: VectorFunction
-        - exact_grad_vec: callable (x,y)-> array_like(..., 2,2)
-                        rows = component, cols = derivative (du_i/dx, du_i/dy)
-        - fields: order must match Uh.field_names if provided.
+        ||∇Uh - ∇U_exact||_{L2(Ω_side)}, with ∇(·) shape (2×2) [rows=component, cols=derivative].
         """
-        flds = fields or Uh.field_names
+        flds = fields or list(Uh.field_names)
         err2_tot = 0.0
         ref2_tot = 0.0
-        # compute per-component gradients and sum
+
         for ic, fld in enumerate(flds):
+            # component-wise exact gradient: returns [d u_i/dx, d u_i/dy]
             def exact_grad_comp(x, y, ic=ic):
-                G = exact_grad_vec(x, y)         # (..., 2, 2)
-                # return [d u_ic / dx, d u_ic / dy]
-                return G[..., ic, :]             # (..., 2)
+                G = np.asarray(exact_grad_vec(x, y), float)   # shape (2,2)
+                return np.array([G[ic, 0], G[ic, 1]], float)
+
             err2, ref2 = self._h1_seminorm_on_side(
                 function=Uh, field=fld, exact_grad=exact_grad_comp,
-                level_set=level_set, side=side, quad_increase=quad_increase
+                level_set=level_set, side=side,
+                quad_increase=quad_increase, quad_order=quad_order, deformation=deformation
             )
             err2_tot += err2; ref2_tot += ref2
+
         return (err2_tot**0.5) if not relative else ((err2_tot / max(ref2_tot, 1e-30))**0.5)
+
+
+
     def reduce_linear_system(self, A_full, R_full, *, bcs=None, return_dirichlet=False):
         """
         Reduce (K, F) to the free-DOF block with proper lifting:

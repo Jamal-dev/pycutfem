@@ -28,7 +28,7 @@ from pycutfem.ufl.analytic import x as x_ana
 from pycutfem.ufl.analytic import y as y_ana
 from pycutfem.io.visualization import plot_mesh_2
 from pycutfem.ufl.helpers import analyze_active_dofs
-
+import time
 # import logging
 # logger = logging.getLogger(__name__)
 # if not logger.hasHandlers():
@@ -144,20 +144,20 @@ def exact_solution(mu, R, gammaf):
             p_exact_neg_xy, p_exact_pos_xy)
 
 
-def test_stokes_interface_corrected(with_deformation: bool = False):
+def test_stokes_interface_corrected(with_deformation: bool = False, backend: str = 'python'):
     """
     Unfitted Stokes interface (NGSolve-style): Hansbo averaging, Nitsche coupling,
     ghost penalties, SymPy-manufactured RHS, and piecewise L2/H1 errors.
     This version is corrected to use the existing pycutfem API.
     """
     # ---------------- 1) Mesh, order, level set ----------------
-    backend = 'python'
-    # backend = 'jit'
-    with_deformation = False
+    
+    # backend may be 'python' or 'jit'
     poly_order = 2
-    geom_order = 1
-    qvol   = 2*poly_order + 2
-    print(f'Using backend: {backend}, polynomial order: {poly_order}, with_deformation={with_deformation}')
+    # For deformation to have an effect, geometry must have midside nodes (>=2)
+    geom_order = (2 if with_deformation else 1)
+    qvol   = (2*poly_order + 4) if with_deformation else (2*poly_order + 2)
+    print(f'Using backend: {backend}, polynomial order: {poly_order}, with_deformation={with_deformation}, with geometric poly order: {geom_order}')
     maxh = 0.125
     L,H = 2.0, 2.0
     mesh_size = int(L / maxh)
@@ -229,7 +229,7 @@ def test_stokes_interface_corrected(with_deformation: bool = False):
     deformation = None
     if with_deformation:
         adapter = LevelSetMeshAdaptation(mesh, order=max(2, poly_order), threshold=10.5)
-        deformation = adapter.calc_deformation(level_set, q_vol=q_vol)
+        deformation = adapter.calc_deformation(level_set, q_vol=qvol)
         level_set = adapter.lset_p1  # use P1 surrogate for cut geometry
         # Use P1/Q1 surrogate of φ for classification during assembly (adapter.lset_p1)
         # but keep 'level_set' as the same object for exact expressions
@@ -311,17 +311,20 @@ def test_stokes_interface_corrected(with_deformation: bool = False):
     jump_p_trial = jump_ng(p_trial_pos, p_trial_neg)
     jump_q_test  = jump_ng(q_test_pos,  q_test_neg)
     # Interface terms
-    a += ( 
-        #     dot(avg_flux_trial, jump_vel_test)
-        #   + dot(avg_flux_test,  jump_vel_trial)
-           (lambda_nitsche / 0.125) * dot(jump_vel_trial, jump_vel_test) ) * dGamma
+    # Symmetric Nitsche terms + penalty
+    a += (
+           dot(avg_flux_trial, jump_vel_test)
+         + dot(avg_flux_test,  jump_vel_trial)
+         + (lambda_nitsche / 0.125) * dot(jump_vel_trial, jump_vel_test)
+        ) * dGamma
 
 
 
     avg_inv_test = kappa_neg * Pos(vel_test_pos) + kappa_pos * Neg(vel_test_neg)
     f = dot(g_pos, vel_test_pos) * dx_pos \
       + dot(g_neg, vel_test_neg) * dx_neg 
-    # f += - gammaf * dot(avg_inv_test, n) * dGamma
+    # Surface tension RHS term
+    f += - gammaf * dot(avg_inv_test, n) * dGamma
 
 
    
@@ -375,6 +378,8 @@ def test_stokes_interface_corrected(with_deformation: bool = False):
 
 
     # ---------------- 6) Assemble & solve ----------------
+    import time as _time
+    t0 = _time.perf_counter()
     K, F = assemble_form(equation, dof_handler=dh, bcs=bcs, quad_order=qvol, backend= backend)
 
     K_ff, F_f, free, dir_idx, u_dir, full2red = dh.reduce_linear_system(
@@ -430,30 +435,43 @@ def test_stokes_interface_corrected(with_deformation: bool = False):
     exact_pos = {'u_pos_x': lambda x,y: vel_exact_pos_xy(x,y)[0], 'u_pos_y': lambda x,y: vel_exact_pos_xy(x,y)[1], 'p_pos_': p_exact_pos_xy}
 
     integ_order = 2 * poly_order + 2
-    err_vel_L2_neg = dh.l2_error_on_side(U_neg, exact_neg, level_set, 
+    err_vel_L2_neg = dh.l2_error_on_side(vector_function=U_neg, 
+                                         exact=exact_neg, 
+                                         level_set=level_set, 
                                          side='-', 
                                          fields=['u_neg_x', 'u_neg_y'], 
                                          relative=False,
-                                         quad_order=integ_order)
-    err_vel_L2_pos = dh.l2_error_on_side(U_pos, exact_pos, level_set, 
+                                         quad_order=integ_order,
+                                         deformation=deformation
+                                         )
+    err_vel_L2_pos = dh.l2_error_on_side(vector_function=U_pos, 
+                                         exact=exact_pos, 
+                                         level_set=level_set, 
                                          side='+', 
                                          fields=['u_pos_x', 'u_pos_y'], 
                                          relative=False,
-                                         quad_order=integ_order)
+                                         quad_order=integ_order,
+                                         deformation=deformation
+                                         )
     vel_L2 = np.sqrt(err_vel_L2_neg**2 + err_vel_L2_pos**2)
 
-    err_p_L2_neg = dh.l2_error_on_side(P_neg, exact_neg, 
-                                       level_set, 
+    err_p_L2_neg = dh.l2_error_on_side(function=P_neg, 
+                                       exact=exact_neg, 
+                                       level_set=level_set, 
                                        side='-', 
                                        fields=['p_neg_'], 
-                                       relative=False, quad_order=integ_order)
-    err_p_L2_pos = dh.l2_error_on_side(P_pos, 
-                                       exact_pos, 
-                                       level_set, 
+                                       relative=False, quad_order=integ_order,
+                                       deformation=deformation
+                                       )
+    err_p_L2_pos = dh.l2_error_on_side(function=P_pos, 
+                                       exact=exact_pos, 
+                                       level_set=level_set, 
                                        side='+', 
                                        fields=['p_pos_'], 
                                        relative=False, 
-                                       quad_order=integ_order)
+                                       quad_order=integ_order,
+                                       deformation=deformation
+                                       )
     p_L2 = np.sqrt(err_p_L2_neg**2 + err_p_L2_pos**2)
 
 
@@ -465,11 +483,16 @@ def test_stokes_interface_corrected(with_deformation: bool = False):
     vel_H1m_neg = dh.h1_error_vector_on_side(U_neg, grad_vel_neg_xy, 
                                              level_set, side='-', 
                                              fields=['u_neg_x', 'u_neg_y'], 
-                                             quad_increase=2)
+                                             quad_increase=2,
+                                             deformation=deformation
+                                             )
     vel_H1m_pos = dh.h1_error_vector_on_side(U_pos, grad_vel_pos_xy, 
                                              level_set, side='+', 
                                              fields=['u_pos_x', 'u_pos_y'], 
-                                             quad_increase=2)
+                                             quad_increase=2,
+                                             deformation=deformation
+                                             )
+                                             
     vel_H1m = np.sqrt(vel_H1m_neg**2 + vel_H1m_pos**2)   # piecewise |·|_{H1}
 
     # If you want the *full* H1 norm (seminorm + L2)
@@ -486,8 +509,12 @@ def test_stokes_interface_corrected(with_deformation: bool = False):
     export_vtk(vtk_path, mesh=mesh, dof_handler=dh,
                functions={"velocity_pos": U_pos, "pressure_pos": P_pos, "velocity_neg": U_neg, "pressure_neg": P_neg, "phi": phi_vals})
     print(f"Solution exported to {vtk_path}")
+    print(f"Total elapsed time: {(_time.perf_counter()-t0):.2f} seconds")
 
 if __name__ == "__main__":
     # Allow quick toggling via env or simple edit
     use_def = os.getenv('PYCUTFEM_STOKES_WITH_DEF', '0').lower() in {'1','true','yes'}
-    test_stokes_interface_corrected(with_deformation=use_def)
+    backend = os.getenv('PYCUTFEM_BACKEND', 'python').lower()
+    t0 = time.time()
+    test_stokes_interface_corrected(with_deformation=use_def, backend=backend)
+    print(f"Total elapsed time: {time.time() - t0:.2f} seconds")

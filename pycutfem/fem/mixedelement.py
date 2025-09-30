@@ -132,6 +132,9 @@ class MixedElement:
         self.n_union_dg = sum(2*self._n_basis[f]                      for f in self.field_names)
 
     
+    def get_field_orders(self) -> Dict[str, int]:
+        """Return a copy of the per-field polynomial orders."""
+        return dict(self._field_orders)
     def _ensure_many_cache(self):
         if not hasattr(self, "_tab_many_cache"):
             # (field, kind, nqp, xi.tobytes(), eta.tobytes()) -> np.ndarray

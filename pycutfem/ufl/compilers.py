@@ -1566,7 +1566,6 @@ class FormCompiler:
             if self.backend == "jit":
                 self._assemble_volume_cut_jit(integral, matvec)
             else:
-                # existing pure-Python path (already working from earlier work)
                 self._clear_sided_ctx()
                 self._assemble_volume_cut_python(integral, matvec)
             return
@@ -3073,6 +3072,11 @@ class FormCompiler:
         side   = intg.measure.metadata.get('side', '+')   # '+' → φ>0, '-' → φ<0
         on_facet = intg.measure.on_facet
         deformation = getattr(intg.measure, "deformation", None)
+        bs            = intg.measure.defined_on
+
+        if level_set is None:
+            # This routine is for cut-volume only
+            raise ValueError("Cut-cell volume assembly requires measure.level_set")
 
         # --- 1) classification (must be called; sets element tags & caches)
         inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
@@ -3109,6 +3113,16 @@ class FormCompiler:
 
         # --- 2) full elements on the selected side → standard volume tables sliced
         full_ids = np.asarray(outside_ids if side == '+' else inside_ids, dtype=np.int32)
+        if bs is not None:
+            # Intersect with defined_on (BitSet or boolean/indices)
+            try:
+                allowed = np.asarray(bs.to_indices(), dtype=np.int32)
+            except AttributeError:
+                arr = np.asarray(bs)
+                allowed = (np.nonzero(arr)[0].astype(np.int32)
+                        if arr.dtype == bool else arr.astype(np.int32))
+            full_ids = np.intersect1d(full_ids, allowed, assume_unique=False)
+
         if full_ids.size:
             # include level_set so 'phis' is populated (still fine if None)
             geo_all = dh.precompute_geometric_factors(qdeg, level_set, 
@@ -3127,6 +3141,7 @@ class FormCompiler:
                 "owner_id": geo_all.get("owner_id", geo_all["eids"])[full_ids].astype(np.int32),
                 "entity_kind": "element",
                 "is_interface": False,
+                "is_ghost": False,
                 "eids": full_ids,
                 "J_inv_pos": geo_all["J_inv"][full_ids],
                 "J_inv_neg": geo_all["J_inv"][full_ids],
@@ -3135,20 +3150,23 @@ class FormCompiler:
 
         # --- 3) cut elements → clipped triangles (physical weights); detJ := 1
         if len(cut_ids):
-            from pycutfem.ufl.helpers import required_multi_indices
-            derivs = required_multi_indices(intg.integrand) | {(0, 0)}
+            # The kernel may need value and first derivative tables at least
+            req_derivs = required_multi_indices(intg.integrand) | {(0, 0)}
+            cut_mask   = mesh.element_bitset("cut")
+            cut_bs     = (bs & cut_mask) if bs is not None else cut_mask
 
-            # precomputed, element-specific qp / qw / J_inv  (+ basis tables b_* / dxy_*)
             geo_cut = dh.precompute_cut_volume_factors(
-                mesh.element_bitset("cut"), qdeg, derivs, level_set, side=side, need_hess=need_hess,
+                cut_bs, qdeg, req_derivs, level_set,
+                side=side,
+                need_hess=need_hess, need_o3=need_o3, need_o4=need_o4,
                 deformation=deformation
             )
-            geo_cut["is_interface"] = False
             cut_eids = np.asarray(geo_cut.get("eids", []), dtype=np.int32)
             if cut_eids.size:
-                # ensure detJ is present and neutral (if your helper has not added it)
+                # Physical subcell weights already include area → neutral detJ
                 if "detJ" not in geo_cut:
                     geo_cut["detJ"] = np.ones_like(geo_cut["qw"])
+                geo_cut["is_interface"] = False
                 _run_subset(cut_eids, geo_cut)
 
         # cleanup context (if you stored any debug keys)

@@ -305,8 +305,8 @@ def assemble_and_energy_ng(bf: BilinearForm, gfu, gfv):
     bf.Apply(gfu.vec, tmp)
     return InnerProduct(gfv.vec, tmp)
 
-def assemble_and_energy_pc(form, dh, u_vec, v_vec):
-    K, _ = assemble_form(Equation(form, None), dof_handler=dh, quad_order=None, backend='python')
+def assemble_and_energy_pc(form, dh, u_vec, v_vec, backend='python'):
+    K, _ = assemble_form(Equation(form, None), dof_handler=dh, quad_order=None, backend=backend)
     return float(v_vec @ (K @ u_vec))
 def integrate_cf_dx(mesh, cf, dx_measure):
     """
@@ -546,8 +546,8 @@ def main():
     dGamma_pc = pycutfem_dInterface(defined_on=pc_setup['es']['interface'], level_set=pc_setup['level_set'], metadata={'q': quad_order, 'profile': True})
     dGamma_pc_def = pycutfem_dInterface(defined_on=pc_setup['es']['interface'], level_set=pc_setup['level_set'], metadata={'q': quad_order, 'profile': True}, deformation=pc_setup.get('deformation', None))
     t1 = time.time()
-    L_pc = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], dGamma_pc)
-    L_pc_def = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], dGamma_pc_def)
+    L_pc = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], dGamma_pc, backend=backend)
+    L_pc_def = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], dGamma_pc_def, backend=backend)
     print("\nInterface Linear Length Checks (PC assembler):")
     print(f"Exact circumference: {exact_circ:.8f}")
     print(f"PC φ_P1 length     : {L_pc:.8f}, err={L_pc - exact_circ:+.6e}")
@@ -612,332 +612,332 @@ def main():
 
 
 
-    # # --- 2. Central Test Case Definitions ---
-    # TEST_CASES = {
-    #     # --- Mass Matrices (u,v) ---
-    #     "mass_pos": {
-    #         "description": "MASS (+) (u, v)", "type": "total",
-    #         "pc_form": pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_all(),
-    #         "ng_form": InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_all(),
-    #     },
-    #     "mass_neg": {
-    #         "description": "MASS (-) (u, v)", "type": "total",
-    #         "pc_form": pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_all(),
-    #         "ng_form": InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_all(),
-    #     },
-    #     "mass_combined": {
-    #         "description": "MASS (Combined) (u, v)", "type": "total",
-    #         "pc_form": (pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_all() +
-    #                     pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_all()),
-    #         "ng_form": (InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_all() +
-    #                     InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_all()),
-    #     },
-    #     "mass_scalar_pos": {
-    #         "description": "MASS (Scalar) Positive (p, q)", "type": "total",
-    #         "pc_form": (pc_setup['pp']*pc_setup['qp']*pc_dx.pos_all()  
-    #                     ),
-    #         "ng_form": (ng_setup['p'][1]*ng_setup['q'][1]*ng_dx.pos_all()
-    #                     ),
-    #     },
-    #     "mass_scalar_neg": {
-    #         "description": "MASS (Scalar) Negative (p, q)", "type": "total",
-    #         "pc_form": (
-    #                     pc_setup['pn']*pc_setup['qn']*pc_dx.neg_all()),
-    #         "ng_form": (
-    #                     ng_setup['p'][0]*ng_setup['q'][0]*ng_dx.neg_all()),
-    #     },
-    #     "mass_scalar_combined": {
-    #         "description": "MASS (Scalar) Combined (p, q)", "type": "total",
-    #         "pc_form": (pc_setup['pp']*pc_setup['qp']*pc_dx.pos_all() + 
-    #                     pc_setup['pn']*pc_setup['qn']*pc_dx.neg_all()),
-    #         "ng_form": (ng_setup['p'][1]*ng_setup['q'][1]*ng_dx.pos_all() + 
-    #                     ng_setup['p'][0]*ng_setup['q'][0]*ng_dx.neg_all()),
-    #     },
+    # --- 2. Central Test Case Definitions ---
+    TEST_CASES = {
+        # --- Mass Matrices (u,v) ---
+        "mass_pos": {
+            "description": "MASS (+) (u, v)", "type": "total",
+            "pc_form": pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_all(),
+            "ng_form": InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_all(),
+        },
+        "mass_neg": {
+            "description": "MASS (-) (u, v)", "type": "total",
+            "pc_form": pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_all(),
+            "ng_form": InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_all(),
+        },
+        "mass_combined": {
+            "description": "MASS (Combined) (u, v)", "type": "total",
+            "pc_form": (pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_all() +
+                        pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_all()),
+            "ng_form": (InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_all() +
+                        InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_all()),
+        },
+        "mass_scalar_pos": {
+            "description": "MASS (Scalar) Positive (p, q)", "type": "total",
+            "pc_form": (pc_setup['pp']*pc_setup['qp']*pc_dx.pos_all()  
+                        ),
+            "ng_form": (ng_setup['p'][1]*ng_setup['q'][1]*ng_dx.pos_all()
+                        ),
+        },
+        "mass_scalar_neg": {
+            "description": "MASS (Scalar) Negative (p, q)", "type": "total",
+            "pc_form": (
+                        pc_setup['pn']*pc_setup['qn']*pc_dx.neg_all()),
+            "ng_form": (
+                        ng_setup['p'][0]*ng_setup['q'][0]*ng_dx.neg_all()),
+        },
+        "mass_scalar_combined": {
+            "description": "MASS (Scalar) Combined (p, q)", "type": "total",
+            "pc_form": (pc_setup['pp']*pc_setup['qp']*pc_dx.pos_all() + 
+                        pc_setup['pn']*pc_setup['qn']*pc_dx.neg_all()),
+            "ng_form": (ng_setup['p'][1]*ng_setup['q'][1]*ng_dx.pos_all() + 
+                        ng_setup['p'][0]*ng_setup['q'][0]*ng_dx.neg_all()),
+        },
 
-    #     # --- Stiffness/Laplacian Matrices (grad(u), grad(v)) ---
-    #     "stiffness_pos": {
-    #         "description": "STIFFNESS (+) (∇u:∇v)", "type": "total",
-    #         "pc_form": pc_inner(pc_grad(pc_setup['up']), pc_grad(pc_setup['vp'])) * pc_dx.pos_all(),
-    #         "ng_form": InnerProduct(Grad(ng_setup['u'][1]), Grad(ng_setup['v'][1])) * ng_dx.pos_all(),
-    #     },
-    #     "stiffness_neg": {
-    #         "description": "STIFFNESS (-) (∇u:∇v)", "type": "total",
-    #         "pc_form": pc_inner(pc_grad(pc_setup['un']), pc_grad(pc_setup['vn'])) * pc_dx.neg_all(),
-    #         "ng_form": InnerProduct(Grad(ng_setup['u'][0]), Grad(ng_setup['v'][0])) * ng_dx.neg_all(),
-    #     },
+        # --- Stiffness/Laplacian Matrices (grad(u), grad(v)) ---
+        "stiffness_pos": {
+            "description": "STIFFNESS (+) (∇u:∇v)", "type": "total",
+            "pc_form": pc_inner(pc_grad(pc_setup['up']), pc_grad(pc_setup['vp'])) * pc_dx.pos_all(),
+            "ng_form": InnerProduct(Grad(ng_setup['u'][1]), Grad(ng_setup['v'][1])) * ng_dx.pos_all(),
+        },
+        "stiffness_neg": {
+            "description": "STIFFNESS (-) (∇u:∇v)", "type": "total",
+            "pc_form": pc_inner(pc_grad(pc_setup['un']), pc_grad(pc_setup['vn'])) * pc_dx.neg_all(),
+            "ng_form": InnerProduct(Grad(ng_setup['u'][0]), Grad(ng_setup['v'][0])) * ng_dx.neg_all(),
+        },
 
-    #     # --- Full Volume/Elasticity Terms (eps(u), eps(v)) ---
-    #     "volume_pos": {
-    #         "description": "VOLUME (+) (2μ ε:ε)", "type": "total",
-    #         "pc_form": 2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_all(),
-    #         "ng_form": 2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_all(),
-    #     },
-    #     "volume_neg": {
-    #         "description": "VOLUME (-) (2μ ε:ε)", "type": "total",
-    #         "pc_form": 2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_all(),
-    #         "ng_form": 2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_all(),
-    #     },
-    #     "volume_combined": {
-    #         "description": "VOLUME (Combined) (2μ ε:ε)", "type": "total",
-    #         "parent_of_split": "volume_split", # Link to the corresponding split test
-    #         "pc_form": (2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_all() + 
-    #                     2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_all()),
-    #         "ng_form": (2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_all() +
-    #                     2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_all()),
-    #     },
+        # --- Full Volume/Elasticity Terms (eps(u), eps(v)) ---
+        "volume_pos": {
+            "description": "VOLUME (+) (2μ ε:ε)", "type": "total",
+            "pc_form": 2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_all(),
+            "ng_form": 2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_all(),
+        },
+        "volume_neg": {
+            "description": "VOLUME (-) (2μ ε:ε)", "type": "total",
+            "pc_form": 2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_all(),
+            "ng_form": 2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_all(),
+        },
+        "volume_combined": {
+            "description": "VOLUME (Combined) (2μ ε:ε)", "type": "total",
+            "parent_of_split": "volume_split", # Link to the corresponding split test
+            "pc_form": (2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_all() + 
+                        2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_all()),
+            "ng_form": (2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_all() +
+                        2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_all()),
+        },
 
-    #     # --- Divergence/Pressure Terms ---
-    #     "divu_q": {
-    #         "description": "DIVU_Q (-div(u)·q)", "type": "total",
-    #         "parent_of_split": "divu_q_split",
-    #         "pc_form": (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_all() + (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_all(),
-    #         "ng_form": (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_all() + (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_all(),
-    #     },
-    #     "divv_p": {
-    #         "description": "DIVV_P (-div(v)·p)", "type": "total",
-    #         "parent_of_split": "divv_p_split",
-    #         "pc_form": (-pc_div(pc_setup['vp'])*pc_setup['pp'])*pc_dx.pos_all() + (-pc_div(pc_setup['vn'])*pc_setup['pn'])*pc_dx.neg_all(),
-    #         "ng_form": (-div(ng_setup['v'][1])*ng_setup['p'][1])*ng_dx.pos_all() + (-div(ng_setup['v'][0])*ng_setup['p'][0])*ng_dx.neg_all(),
-    #     },
-    #     # --- Mean Terms ---
-    #     "mean_split_pos_1": {
-    #         "description": "MEAN (n *q dx_neg)", "type": "total",
-    #         "pc_form": (pc_setup['nL']*Neg(pc_setup['qn']) )*pc_dx.neg_all(),
-    #         "ng_form": (ng_setup['n']*ng_setup['q'][0] )*ng_dx.neg_all(),
-    #     },
-    #     "mean_split_pos_2": {
-    #         "description": "MEAN (m * p dx_neg)", "type": "total",
-    #         "pc_form": ( pc_setup['mL']*Neg(pc_setup['pn']))*pc_dx.neg_all(),
-    #         "ng_form": ( ng_setup['m']*ng_setup['p'][0])*ng_dx.neg_all(),
-    #     },
-    #     "mean_neg": {
-    #         "description": "MEAN (n *q dx_neg + m * p dx_neg)", "type": "total",
-    #         "pc_form": (pc_setup['nL']*Neg(pc_setup['qn']) + pc_setup['mL']*Neg(pc_setup['pn']))*pc_dx.neg_all(),
-    #         "ng_form": (ng_setup['n']*ng_setup['q'][0] + ng_setup['m']*ng_setup['p'][0])*ng_dx.neg_all(),
-    #     },
-    #     "mean_pos": {
-    #         "description": "MEAN (n *q dx_pos + m * p dx_pos)", "type": "total",
-    #         "pc_form": (pc_setup['nL']*Pos(pc_setup['qp']) + pc_setup['mL']*Pos(pc_setup['pp']))*pc_dx.pos_all(),
-    #         "ng_form": (ng_setup['n']*ng_setup['q'][1] + ng_setup['m']*ng_setup['p'][1])*ng_dx.pos_all(),
-    #     },
-    #     "mean_comb": {
-    #         "description": "MEAN (n *q dx_pos + m * p dx_pos + n *q dx_neg + m * p dx_neg)", "type": "total",
-    #         "pc_form": ((pc_setup['nL']*Pos(pc_setup['qp']) + pc_setup['mL']*Pos(pc_setup['pp']))*pc_dx.pos_all()
-    #                     + (pc_setup['nL']*Neg(pc_setup['qn']) + pc_setup['mL']*Neg(pc_setup['pn']))*pc_dx.neg_all()),
-    #         "ng_form": ((ng_setup['n']*ng_setup['q'][1] + ng_setup['m']*ng_setup['p'][1])*ng_dx.pos_all()
-    #                     + (ng_setup['n']*ng_setup['q'][0] + ng_setup['m']*ng_setup['p'][0])*ng_dx.neg_all()),
-    #     },
-    #     # --- Area Terms ---
-    #     "area_pos": {
-    #         "description": "AREA (+) (1 dx_has_pos)", "type": "direct",
-    #         "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_all()),
-    #         "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_all()),
-    #     },
-    #     "area_neg": {
-    #         "description": "AREA (-) (1 dx_has_neg)", "type": "direct",
-    #         "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_all()),
-    #         "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_all()),
-    #     },
-    #     "area_combined": {
-    #         "description": "AREA (Combined) (1 dx_has_pos + 1 dx_has_neg)", "type": "direct",
-    #         "pc_form": (integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_all()) +
-    #                     integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_all())),
-    #         "ng_form": (integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_all()) +
-    #                     integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_all())),
-    #     },
-    #     "area_only_pos": {
-    #         "description": "AREA (+) (1 dx_pos)", "type": "direct",
-    #         "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_bulk()),
-    #         "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_bulk()),
-    #     },
-    #     "area_only_neg": {
-    #         "description": "AREA (-) (1 dx_neg)", "type": "direct",
-    #         "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_bulk()),
-    #         "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_bulk()),
-    #     },
-    #     "area_only_pos_neg": {
-    #         "description": "AREA  (1 dx_neg) + (1 dx_pos)", "type": "direct",
-    #         "pc_form": (integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_bulk()) +
-    #                     integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_bulk())),
-    #         "ng_form": (integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_bulk()) +
-    #                     integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_bulk())),
-    #     },
-    #     "area_interface_pos_gamma": {
-    #         "description": "AREA (Interface) (1 dGamma_pos)", "type": "direct",
-    #         "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.dGamma(side='+')),
-    #         "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.dGamma()),
-    #     },
-    #     "area_interface_neg_gamma": {
-    #         "description": "AREA (Interface) (1 dGamma_neg)", "type": "direct",
-    #         "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.dGamma(side='-')),
-    #         "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.dGamma()),
-    #     },
-    #     "area_interface_combined_gamma": {
-    #         "description": "AREA (Interface) (dGamma_pos+dGamma_neg)", "type": "direct",
-    #         "pc_form": (integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.dGamma(side='+')) +
-    #                     integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.dGamma(side='-'))),
-    #         "ng_form": (integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.dGamma()) +
-    #                     integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.dGamma())),
-    #     },
-    #     "area_interface_gamma": {
-    #         "description": "AREA (Interface) (1 dGamma)", "type": "direct",
-    #         "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.dGamma()),
-    #         "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.dGamma()),
-    #     },
-    #     "area_interface_pos_iface": {
-    #         "description": "AREA (Interface) (1 pos_iface)", "type": "direct",
-    #         "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_iface()),
-    #         "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_iface()),
-    #     },
-    #     "area_interface_neg_iface": {
-    #         "description": "AREA (Interface) (1 neg_iface)", "type": "direct",
-    #         "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_iface()),
-    #         "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_iface()),
-    #     },
-    #     "area_interface_combined_iface": {
-    #         "description": "AREA (Interface) (diface_pos+diface_neg)", "type": "direct",
-    #         "pc_form": (integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_iface()) +
-    #                     integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_iface())),
-    #         "ng_form": (integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_iface()) +
-    #                     integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_iface())),
-    #     },
-    #     # --- Interface/Penalty Terms ---
-    #     "nitsche": {
-    #         "description": "NITSCHE (jump penalty)", "type": "total",
-    #         "pc_form": (Constant(pc_setup['lam_val'])/Constant(maxh)) * pc_dot(pc_jump(pc_setup['up'],pc_setup['un']), pc_jump(pc_setup['vp'],pc_setup['vn'])) * pc_dx.dGamma(),
-    #         "ng_form": (ng_setup['lam_val']/maxh) * (ng_setup['u'][0]-ng_setup['u'][1])*(ng_setup['v'][0]-ng_setup['v'][1]) * ng_dx.dGamma(),
-    #     },
+        # --- Divergence/Pressure Terms ---
+        "divu_q": {
+            "description": "DIVU_Q (-div(u)·q)", "type": "total",
+            "parent_of_split": "divu_q_split",
+            "pc_form": (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_all() + (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_all(),
+            "ng_form": (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_all() + (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_all(),
+        },
+        "divv_p": {
+            "description": "DIVV_P (-div(v)·p)", "type": "total",
+            "parent_of_split": "divv_p_split",
+            "pc_form": (-pc_div(pc_setup['vp'])*pc_setup['pp'])*pc_dx.pos_all() + (-pc_div(pc_setup['vn'])*pc_setup['pn'])*pc_dx.neg_all(),
+            "ng_form": (-div(ng_setup['v'][1])*ng_setup['p'][1])*ng_dx.pos_all() + (-div(ng_setup['v'][0])*ng_setup['p'][0])*ng_dx.neg_all(),
+        },
+        # --- Mean Terms ---
+        "mean_split_pos_1": {
+            "description": "MEAN (n *q dx_neg)", "type": "total",
+            "pc_form": (pc_setup['nL']*Neg(pc_setup['qn']) )*pc_dx.neg_all(),
+            "ng_form": (ng_setup['n']*ng_setup['q'][0] )*ng_dx.neg_all(),
+        },
+        "mean_split_pos_2": {
+            "description": "MEAN (m * p dx_neg)", "type": "total",
+            "pc_form": ( pc_setup['mL']*Neg(pc_setup['pn']))*pc_dx.neg_all(),
+            "ng_form": ( ng_setup['m']*ng_setup['p'][0])*ng_dx.neg_all(),
+        },
+        "mean_neg": {
+            "description": "MEAN (n *q dx_neg + m * p dx_neg)", "type": "total",
+            "pc_form": (pc_setup['nL']*Neg(pc_setup['qn']) + pc_setup['mL']*Neg(pc_setup['pn']))*pc_dx.neg_all(),
+            "ng_form": (ng_setup['n']*ng_setup['q'][0] + ng_setup['m']*ng_setup['p'][0])*ng_dx.neg_all(),
+        },
+        "mean_pos": {
+            "description": "MEAN (n *q dx_pos + m * p dx_pos)", "type": "total",
+            "pc_form": (pc_setup['nL']*Pos(pc_setup['qp']) + pc_setup['mL']*Pos(pc_setup['pp']))*pc_dx.pos_all(),
+            "ng_form": (ng_setup['n']*ng_setup['q'][1] + ng_setup['m']*ng_setup['p'][1])*ng_dx.pos_all(),
+        },
+        "mean_comb": {
+            "description": "MEAN (n *q dx_pos + m * p dx_pos + n *q dx_neg + m * p dx_neg)", "type": "total",
+            "pc_form": ((pc_setup['nL']*Pos(pc_setup['qp']) + pc_setup['mL']*Pos(pc_setup['pp']))*pc_dx.pos_all()
+                        + (pc_setup['nL']*Neg(pc_setup['qn']) + pc_setup['mL']*Neg(pc_setup['pn']))*pc_dx.neg_all()),
+            "ng_form": ((ng_setup['n']*ng_setup['q'][1] + ng_setup['m']*ng_setup['p'][1])*ng_dx.pos_all()
+                        + (ng_setup['n']*ng_setup['q'][0] + ng_setup['m']*ng_setup['p'][0])*ng_dx.neg_all()),
+        },
+        # --- Area Terms ---
+        "area_pos": {
+            "description": "AREA (+) (1 dx_has_pos)", "type": "direct",
+            "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_all(), backend=backend),
+            "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_all()),
+        },
+        "area_neg": {
+            "description": "AREA (-) (1 dx_has_neg)", "type": "direct",
+            "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_all(), backend=backend),
+            "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_all()),
+        },
+        "area_combined": {
+            "description": "AREA (Combined) (1 dx_has_pos + 1 dx_has_neg)", "type": "direct",
+            "pc_form": (integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_all(), backend=backend) +
+                        integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_all(), backend=backend)),
+            "ng_form": (integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_all()) +
+                        integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_all())),
+        },
+        "area_only_pos": {
+            "description": "AREA (+) (1 dx_pos)", "type": "direct",
+            "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_bulk(), backend=backend),
+            "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_bulk()),
+        },
+        "area_only_neg": {
+            "description": "AREA (-) (1 dx_neg)", "type": "direct",
+            "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_bulk(), backend=backend),
+            "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_bulk()),
+        },
+        "area_only_pos_neg": {
+            "description": "AREA  (1 dx_neg) + (1 dx_pos)", "type": "direct",
+            "pc_form": (integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_bulk(), backend=backend) +
+                        integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_bulk(), backend=backend)),
+            "ng_form": (integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_bulk()) +
+                        integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_bulk())),
+        },
+        "area_interface_pos_gamma": {
+            "description": "AREA (Interface) (1 dGamma_pos)", "type": "direct",
+            "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.dGamma(side='+'), backend=backend),
+            "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.dGamma()),
+        },
+        "area_interface_neg_gamma": {
+            "description": "AREA (Interface) (1 dGamma_neg)", "type": "direct",
+            "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.dGamma(side='-'), backend=backend),
+            "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.dGamma()),
+        },
+        "area_interface_combined_gamma": {
+            "description": "AREA (Interface) (dGamma_pos+dGamma_neg)", "type": "direct",
+            "pc_form": (integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.dGamma(side='+'), backend=backend) +
+                        integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.dGamma(side='-'), backend=backend)),
+            "ng_form": (integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.dGamma()) +
+                        integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.dGamma())),
+        },
+        "area_interface_gamma": {
+            "description": "AREA (Interface) (1 dGamma)", "type": "direct",
+            "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.dGamma(), backend=backend),
+            "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.dGamma()),
+        },
+        "area_interface_pos_iface": {
+            "description": "AREA (Interface) (1 pos_iface)", "type": "direct",
+            "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_iface(), backend=backend),
+            "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_iface()),
+        },
+        "area_interface_neg_iface": {
+            "description": "AREA (Interface) (1 neg_iface)", "type": "direct",
+            "pc_form": integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_iface(), backend=backend),
+            "ng_form": integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_iface()),
+        },
+        "area_interface_combined_iface": {
+            "description": "AREA (Interface) (diface_pos+diface_neg)", "type": "direct",
+            "pc_form": (integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_iface(), backend=backend) +
+                        integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_iface(), backend=backend)),
+            "ng_form": (integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_iface()) +
+                        integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_iface())),
+        },
+        # --- Interface/Penalty Terms ---
+        "nitsche": {
+            "description": "NITSCHE (jump penalty)", "type": "total",
+            "pc_form": (Constant(pc_setup['lam_val'])/Constant(maxh)) * pc_dot(pc_jump(pc_setup['up'],pc_setup['un']), pc_jump(pc_setup['vp'],pc_setup['vn'])) * pc_dx.dGamma(),
+            "ng_form": (ng_setup['lam_val']/maxh) * (ng_setup['u'][0]-ng_setup['u'][1])*(ng_setup['v'][0]-ng_setup['v'][1]) * ng_dx.dGamma(),
+        },
         
-    #     # --- ================================== ---
-    #     # --- Split-by-Region Versions of Terms ---
-    #     # --- ================================== ---
-    #     "mass_split": {
-    #         "description": "MASS (u,v)", "type": "split", "parent": "mass_combined",
-    #         "pc_forms": {
-    #             ("pos","bulk"):    pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_bulk(),
-    #             ("pos","interface"): pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_iface(),
-    #             ("neg","bulk"):    pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_bulk(),
-    #             ("neg","interface"): pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_iface(),
-    #         },
-    #         "ng_forms": {
-    #             ("pos","bulk"):    InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_bulk(),
-    #             ("pos","interface"): InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_iface(),
-    #             ("neg","bulk"):    InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_bulk(),
-    #             ("neg","interface"): InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_iface(),
-    #         },
-    #     },
-    #     "volume_split": {
-    #         "description": "VOLUME (2μ ε:ε)", "type": "split", "parent": "volume_combined",
-    #         "pc_forms": {
-    #             ("pos","bulk"):    2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_bulk(),
-    #             ("pos","interface"): 2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_iface(),
-    #             ("neg","bulk"):    2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_bulk(),
-    #             ("neg","interface"): 2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_iface(),
-    #         },
-    #         "ng_forms": {
-    #             ("pos","bulk"):    2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_bulk(),
-    #             ("pos","interface"): 2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_iface(),
-    #             ("neg","bulk"):    2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_bulk(),
-    #             ("neg","interface"): 2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_iface(),
-    #         },
-    #     },
-    #     "divu_q_split": {
-    #         "description": "DIVU_Q", "type": "split", "parent": "divu_q",
-    #         "pc_forms": {
-    #             ("pos","bulk"):   (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_bulk(),
-    #             ("pos","interface"): (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_iface(),
-    #             ("neg","bulk"):   (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_bulk(),
-    #             ("neg","interface"): (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_iface(),
-    #         },
-    #         "ng_forms": {
-    #             ("pos","bulk"):   (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_bulk(),
-    #             ("pos","interface"): (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_iface(),
-    #             ("neg","bulk"):   (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_bulk(),
-    #             ("neg","interface"): (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_iface(),
-    #         },
-    #     },
-    # }
+        # --- ================================== ---
+        # --- Split-by-Region Versions of Terms ---
+        # --- ================================== ---
+        "mass_split": {
+            "description": "MASS (u,v)", "type": "split", "parent": "mass_combined",
+            "pc_forms": {
+                ("pos","bulk"):    pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_bulk(),
+                ("pos","interface"): pc_inner(pc_setup['up'], pc_setup['vp']) * pc_dx.pos_iface(),
+                ("neg","bulk"):    pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_bulk(),
+                ("neg","interface"): pc_inner(pc_setup['un'], pc_setup['vn']) * pc_dx.neg_iface(),
+            },
+            "ng_forms": {
+                ("pos","bulk"):    InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_bulk(),
+                ("pos","interface"): InnerProduct(ng_setup['u'][1], ng_setup['v'][1]) * ng_dx.pos_iface(),
+                ("neg","bulk"):    InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_bulk(),
+                ("neg","interface"): InnerProduct(ng_setup['u'][0], ng_setup['v'][0]) * ng_dx.neg_iface(),
+            },
+        },
+        "volume_split": {
+            "description": "VOLUME (2μ ε:ε)", "type": "split", "parent": "volume_combined",
+            "pc_forms": {
+                ("pos","bulk"):    2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_bulk(),
+                ("pos","interface"): 2*pc_setup['mu1']*pc_inner(eps_pc(pc_setup['up']), eps_pc(pc_setup['vp']))*pc_dx.pos_iface(),
+                ("neg","bulk"):    2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_bulk(),
+                ("neg","interface"): 2*pc_setup['mu0']*pc_inner(eps_pc(pc_setup['un']), eps_pc(pc_setup['vn']))*pc_dx.neg_iface(),
+            },
+            "ng_forms": {
+                ("pos","bulk"):    2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_bulk(),
+                ("pos","interface"): 2*ng_setup['mu1']*InnerProduct(eps_ng(ng_setup['u'][1]), eps_ng(ng_setup['v'][1]))*ng_dx.pos_iface(),
+                ("neg","bulk"):    2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_bulk(),
+                ("neg","interface"): 2*ng_setup['mu0']*InnerProduct(eps_ng(ng_setup['u'][0]), eps_ng(ng_setup['v'][0]))*ng_dx.neg_iface(),
+            },
+        },
+        "divu_q_split": {
+            "description": "DIVU_Q", "type": "split", "parent": "divu_q",
+            "pc_forms": {
+                ("pos","bulk"):   (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_bulk(),
+                ("pos","interface"): (-pc_div(pc_setup['up'])*pc_setup['qp'])*pc_dx.pos_iface(),
+                ("neg","bulk"):   (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_bulk(),
+                ("neg","interface"): (-pc_div(pc_setup['un'])*pc_setup['qn'])*pc_dx.neg_iface(),
+            },
+            "ng_forms": {
+                ("pos","bulk"):   (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_bulk(),
+                ("pos","interface"): (-div(ng_setup['u'][1])*ng_setup['q'][1])*ng_dx.pos_iface(),
+                ("neg","bulk"):   (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_bulk(),
+                ("neg","interface"): (-div(ng_setup['u'][0])*ng_setup['q'][0])*ng_dx.neg_iface(),
+            },
+        },
+    }
 
-    # # --- 3. Execution Phase ---
+    # --- 3. Execution Phase ---
     
-    # # ----- TOTAL term energies (FE vs FE) -----
-    # term_header("TOTAL term energies (PyCutFEM FE vs NGSolve FE)")
-    # results_total = {}
-    # for key, data in TEST_CASES.items():
-    #     if not 'total' in data['type']  : continue
+    # ----- TOTAL term energies (FE vs FE) -----
+    term_header("TOTAL term energies (PyCutFEM FE vs NGSolve FE)")
+    results_total = {}
+    for key, data in TEST_CASES.items():
+        if not 'total' in data['type']  : continue
         
-    #     E_pc = assemble_and_energy_pc(data['pc_form'], pc_setup['dh'], u_vec, v_vec)
+        E_pc = assemble_and_energy_pc(data['pc_form'], pc_setup['dh'], u_vec, v_vec, backend=backend)
         
-    #     bf_ng = BilinearForm(ng_setup['WhG'], symmetric=False, check_unused=False)
-    #     bf_ng += data['ng_form']
-    #     E_ng = assemble_and_energy_ng(bf_ng, ng_setup['gfu'], ng_setup['gfv'])
+        bf_ng = BilinearForm(ng_setup['WhG'], symmetric=False, check_unused=False)
+        bf_ng += data['ng_form']
+        E_ng = assemble_and_energy_ng(bf_ng, ng_setup['gfu'], ng_setup['gfv'])
         
-    #     results_total[key] = {'pc': E_pc, 'ng': E_ng}
-    #     err = srelerr(E_pc, E_ng)
-    #     ok, mark = verdict(err, tol=1e-6)
-    #     print(f"{data['description']:<35} | PC: {E_pc:+.12e}  NG: {E_ng:+.12e}  err = {err:.3e} {mark}")
-    #     all_tests.append(TestResult(f"TOTAL {key}", err, ok, f"PC={E_pc:+.12e}, NG={E_ng:+.12e}"))
-    # # without bilinear forms
-    # for key, data in TEST_CASES.items():
-    #     if not 'direct' in data['type']  : continue
-    #     E_pc = data['pc_form']
-    #     E_ng = data['ng_form']
-    #     results_total[key] = {'pc': E_pc, 'ng': E_ng}
-    #     err = srelerr(E_pc, E_ng)
-    #     ok, mark = verdict(err, tol=1e-6)
-    #     print(f"{data['description']:<35} | PC: {E_pc:+.12e}  NG: {E_ng:+.12e}  err = {err:.3e} {mark}")
-    #     all_tests.append(TestResult(f"TOTAL {key}", err, ok, f"PC={E_pc:+.12e}, NG={E_ng:+.12e}"))
+        results_total[key] = {'pc': E_pc, 'ng': E_ng}
+        err = srelerr(E_pc, E_ng)
+        ok, mark = verdict(err, tol=1e-6)
+        print(f"{data['description']:<35} | PC: {E_pc:+.12e}  NG: {E_ng:+.12e}  err = {err:.3e} {mark}")
+        all_tests.append(TestResult(f"TOTAL {key}", err, ok, f"PC={E_pc:+.12e}, NG={E_ng:+.12e}"))
+    # without bilinear forms
+    for key, data in TEST_CASES.items():
+        if not 'direct' in data['type']  : continue
+        E_pc = data['pc_form']
+        E_ng = data['ng_form']
+        results_total[key] = {'pc': E_pc, 'ng': E_ng}
+        err = srelerr(E_pc, E_ng)
+        ok, mark = verdict(err, tol=1e-6)
+        print(f"{data['description']:<35} | PC: {E_pc:+.12e}  NG: {E_ng:+.12e}  err = {err:.3e} {mark}")
+        all_tests.append(TestResult(f"TOTAL {key}", err, ok, f"PC={E_pc:+.12e}, NG={E_ng:+.12e}"))
 
-    # # ----- SPLIT-by-region (PC FE vs NG FE) -----
-    # results_split = {}
-    # for key, data in TEST_CASES.items():
-    #     if not 'split' in data['type']: continue
-    #     term_header(f"{data['description']} (region split: NEG/POS × bulk/interface)")
-    #     results_split[key] = {'pc': {}, 'ng': {}}
-    #     for region_key in data['pc_forms'].keys():
-    #         pc_form = data['pc_forms'][region_key]
-    #         ng_form = data['ng_forms'][region_key]
+    # ----- SPLIT-by-region (PC FE vs NG FE) -----
+    results_split = {}
+    for key, data in TEST_CASES.items():
+        if not 'split' in data['type']: continue
+        term_header(f"{data['description']} (region split: NEG/POS × bulk/interface)")
+        results_split[key] = {'pc': {}, 'ng': {}}
+        for region_key in data['pc_forms'].keys():
+            pc_form = data['pc_forms'][region_key]
+            ng_form = data['ng_forms'][region_key]
             
-    #         E_pc = assemble_and_energy_pc(pc_form, pc_setup['dh'], u_vec, v_vec)
+            E_pc = assemble_and_energy_pc(pc_form, pc_setup['dh'], u_vec, v_vec, backend=backend)
             
-    #         bf_ng = BilinearForm(ng_setup['WhG'], symmetric=False, check_unused=False)
-    #         bf_ng += ng_form
-    #         E_ng = assemble_and_energy_ng(bf_ng, ng_setup['gfu'], ng_setup['gfv'])
+            bf_ng = BilinearForm(ng_setup['WhG'], symmetric=False, check_unused=False)
+            bf_ng += ng_form
+            E_ng = assemble_and_energy_ng(bf_ng, ng_setup['gfu'], ng_setup['gfv'])
             
-    #         results_split[key]['pc'][region_key] = E_pc
-    #         results_split[key]['ng'][region_key] = E_ng
+            results_split[key]['pc'][region_key] = E_pc
+            results_split[key]['ng'][region_key] = E_ng
 
-    #         err = srelerr(E_pc, E_ng)
-    #         ok, mark = verdict(err, tol=1e-8)
-    #         side, reg = region_key
-    #         print(f"{side.upper():3s}/{reg:9s} : PC={E_pc:+.12e}   NG={E_ng:+.12e}   err={err:.3e} {mark}")
-    #         all_tests.append(TestResult(f"SPLIT {key} {side}/{reg}", err, ok, f"PC={E_pc:+.12e}, NG={E_ng:+.12e}"))
+            err = srelerr(E_pc, E_ng)
+            ok, mark = verdict(err, tol=1e-8)
+            side, reg = region_key
+            print(f"{side.upper():3s}/{reg:9s} : PC={E_pc:+.12e}   NG={E_ng:+.12e}   err={err:.3e} {mark}")
+            all_tests.append(TestResult(f"SPLIT {key} {side}/{reg}", err, ok, f"PC={E_pc:+.12e}, NG={E_ng:+.12e}"))
 
-    # # ----- Consistency checks (PyCutFEM) -----
-    # term_header("Consistency checks (PyCutFEM)")
-    # for key, data in TEST_CASES.items():
-    #     # Only run this check for items that are 'split' and have a 'parent'
-    #     if 'split' in data.get('type') and 'parent' in data:
-    #         parent_key = data['parent']
+    # ----- Consistency checks (PyCutFEM) -----
+    term_header("Consistency checks (PyCutFEM)")
+    for key, data in TEST_CASES.items():
+        # Only run this check for items that are 'split' and have a 'parent'
+        if 'split' in data.get('type') and 'parent' in data:
+            parent_key = data['parent']
             
-    #         # Ensure the parent key and the split key exist in the results
-    #         if parent_key in results_total and key in results_split:
-    #             total_from_split = sum(results_split[key]['pc'].values())
-    #             total_from_direct = results_total[parent_key]['pc']
+            # Ensure the parent key and the split key exist in the results
+            if parent_key in results_total and key in results_split:
+                total_from_split = sum(results_split[key]['pc'].values())
+                total_from_direct = results_total[parent_key]['pc']
                 
-    #             err = srelerr(total_from_direct, total_from_split)
-    #             ok, mark = verdict(err, tol=1e-12)
-    #             print(f"total({parent_key}) vs Σsplit: {total_from_direct:+.12e} vs {total_from_split:+.12e} diff={err:.3e} {mark}")
+                err = srelerr(total_from_direct, total_from_split)
+                ok, mark = verdict(err, tol=1e-12)
+                print(f"total({parent_key}) vs Σsplit: {total_from_direct:+.12e} vs {total_from_split:+.12e} diff={err:.3e} {mark}")
 
-    # # ----- Summary -----
-    # failed = [t for t in all_tests if not t.passed]
-    # passed = [t for t in all_tests if t.passed]
-    # print(f"\n--- Test Summary ---\n{len(passed)} tests passed, {len(failed)} tests FAILED.\n")
-    # if failed:
-    #     print("--- Top 6 Failed Tests (by error magnitude) ---")
-    #     for t in sorted(failed, key=lambda z: z.error, reverse=True)[:6]:
-    #         print(f"- {t.description}: error={t.error:.6e} | {t.details}")
-    # print("\nDone. Green ✓ indicates success within tolerance; red ✗ highlights discrepancies.")
+    # ----- Summary -----
+    failed = [t for t in all_tests if not t.passed]
+    passed = [t for t in all_tests if t.passed]
+    print(f"\n--- Test Summary ---\n{len(passed)} tests passed, {len(failed)} tests FAILED.\n")
+    if failed:
+        print("--- Top 6 Failed Tests (by error magnitude) ---")
+        for t in sorted(failed, key=lambda z: z.error, reverse=True)[:6]:
+            print(f"- {t.description}: error={t.error:.6e} | {t.details}")
+    print("\nDone. Green ✓ indicates success within tolerance; red ✗ highlights discrepancies.")
 
 if __name__ == "__main__":
     main()

@@ -221,12 +221,15 @@ def compile_multi(form, *, dof_handler, mixed_element,
     else:
         integrals = form.integrals
 
+    mesh = mixed_element.mesh
+    p_geo  = int(getattr(mesh, "poly_order", 1))
     for intg in integrals:
         dom = intg.measure.domain_type           # "volume", "interface", "ghost_edge", ...
         qdeg = fc._find_q_order(intg)
         on_facet = intg.measure.on_facet
         md = intg.measure.metadata or {}
-        nseg = int(md.get("nseg", max(3, 1 + qdeg // 2)))
+        qdeg  += 2 * max(0, p_geo - 1)
+        nseg   = int(md.get("nseg", max(3, p_geo + qdeg//2)))
 
         # Compile the backend once; reuse for all subsets of this integral
         runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element, on_facet=on_facet)
@@ -406,6 +409,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 dof_handler.get_elemental_dofs(e)
                 for e in geom["eids"]
             ]).astype(np.int32)
+            # # AFTER — use the **edge-union** map built by precompute_interface_factors
+            # gdofs_map = geom["gdofs_map"].astype(np.int32)
 
             static = {"gdofs_map": gdofs_map, **geom}
             static.update(_build_jit_kernel_args(
