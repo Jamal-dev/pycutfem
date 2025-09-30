@@ -12,6 +12,7 @@ from typing import Tuple, Optional, List
 import numpy as np
 
 from pycutfem.fem import transform
+from pycutfem.ufl.helpers_geom import phi_eval
 from pycutfem.core.sideconvention import SIDE
 from pycutfem.integration.quadrature import gauss_legendre, volume as volume_rule, tri_rule
 
@@ -57,8 +58,10 @@ class CutIntegration:
 
     # ---------------------------- QUAD straight‑cut ------------------------
     @staticmethod
-    def _edge_phi_on_eta(mesh, eid: int, lset_p1, x_fixed: float, eta: float) -> float:
-        return float(lset_p1.value_on_element(int(eid), (float(x_fixed), float(eta))))
+    def _edge_phi_on_eta(mesh, eid: int, lset, x_fixed: float, eta: float) -> float:
+        # Robust to analytic or FE-backed level sets
+        x_phys = transform.x_mapping(mesh, int(eid), (float(x_fixed), float(eta)))
+        return float(phi_eval(lset, x_phys))
 
     @staticmethod
     def _edge_zero_eta(mesh, eid: int, lset_p1, x_fixed: float, tol: float) -> List[float]:
@@ -137,9 +140,14 @@ class CutIntegration:
 
     # ---------------------- Iso‑curve on Ihφ_ref = 0 -----------------------
     @staticmethod
-    def _q1_coeffs_ref_from_corners(mesh, eid: int, lset_p1) -> Tuple[float, float, float, float]:
+    def _q1_coeffs_ref_from_corners(mesh, eid: int, lset) -> Tuple[float, float, float, float]:
         R = np.array([[-1.0, -1.0], [+1.0, -1.0], [+1.0, +1.0], [-1.0, +1.0]], dtype=float)
-        v = np.array([float(lset_p1.value_on_element(int(eid), (float(R[i, 0]), float(R[i, 1])))) for i in range(4)], dtype=float)
+        # Evaluate φ at physical images of the four reference corners
+        vals = []
+        for i in range(4):
+            x_phys = transform.x_mapping(mesh, int(eid), (float(R[i, 0]), float(R[i, 1])))
+            vals.append(float(phi_eval(lset, x_phys)))
+        v = np.array(vals, dtype=float)
         a00 = 0.25 * (v[0] + v[1] + v[2] + v[3])
         a10 = 0.25 * (-v[0] + v[1] + v[2] - v[3])
         a01 = 0.25 * (-v[0] - v[1] + v[2] + v[3])
@@ -152,7 +160,10 @@ class CutIntegration:
         if et == "tri":
             R = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], float)
             edges = [(0, 1), (1, 2), (2, 0)]
-            vals = np.array([float(lset_p1.value_on_element(int(eid), (float(R[i, 0]), float(R[i, 1])))) for i in range(3)], float)
+            vals = np.empty(3, dtype=float)
+            for i in range(3):
+                x_phys = transform.x_mapping(mesh, int(eid), (float(R[i, 0]), float(R[i, 1])))
+                vals[i] = float(phi_eval(lset_p1, x_phys))
             pts: List[np.ndarray] = []
             for i, j in edges:
                 a, b = vals[i], vals[j]
@@ -253,7 +264,6 @@ class CutIntegration:
         return np.asarray(qpts, float), np.asarray(wref, float), coeffs, None
     @staticmethod
     def _edge_phi_on_eta_ref(mesh, eid, lset_p1, x_fixed, eta):
-        # Evaluate REF polynomial
-        return float(lset_p1.value_on_element_ref(int(eid), (float(x_fixed), float(eta))))
-
-
+        # Robust fallback: evaluate φ at the physical image of (ξ,η)
+        x_phys = transform.x_mapping(mesh, int(eid), (float(x_fixed), float(eta)))
+        return float(phi_eval(lset_p1, x_phys))

@@ -18,6 +18,7 @@ Run:
 import numpy as np
 import scipy.sparse.linalg as spla
 from dataclasses import dataclass
+from typing import Optional
 
 # ---------- PyCutFEM imports ----------
 from pycutfem.core.mesh import Mesh as pycutfem_Mesh
@@ -43,6 +44,7 @@ from ngsolve import *
 from xfem import *
 from xfem.lsetcurv import *
 import time
+
 
 @dataclass
 class TestResult:
@@ -318,10 +320,10 @@ def integrate_cf_dx(mesh, cf, dx_measure):
     with TaskManager():
         lf.Assemble()
     return float(lf.vec.FV()[0])
-def integrate_pc_constant_dx(dh, form, dx_measure):
+def integrate_pc_constant_dx(dh, form, dx_measure, backend='python'):
     w = TestFunction(field_name='lm', dof_handler=dh)
     L = form * w * dx_measure
-    _, F = assemble_form(Equation(None, L), dof_handler=dh, quad_order=None, backend='python')
+    _, F = assemble_form(Equation(None, L), dof_handler=dh, quad_order=None, backend=backend)
     lm_inds = dh.get_field_slice('lm')         # returns [global_index_of_lm]
     return float(F[lm_inds][0])
 
@@ -436,10 +438,12 @@ def main():
     maxh, order, R = 0.125, 2, 2.0/3.0
     L, H = 2.0, 2.0
     use_quad = True  # Whether to use quad elements in PyCutFEM and NGSolve
+    backend = 'jit'
     
     # --- 1. Setup Phase ---
+    t0 = time.time()
     print("Setting up PyCutFEM and NGSolve problems"
-          f" with maxh={maxh}, order={order}, R={R}, use_quad={use_quad}...")
+          f" with maxh={maxh}, order={order}, R={R}, use_quad={use_quad} with backend={backend}...")
     pc_setup = setup_pc(maxh, order, R, L, H, use_quad=use_quad)
     ng_setup = setup_ng(maxh, order, R, L, H, use_quad=use_quad)
     ng_setup_def = setup_ng_deformation(maxh, order, R, L, H, use_quad=use_quad)
@@ -502,23 +506,25 @@ def main():
     def eps_ng(u): return 0.5*(Grad(u)+Grad(u).trans)
 
 
-    area_pos_pc = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_all()) 
-    area_pos_pc_def = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx_def.pos_all()) 
+    area_pos_pc = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.pos_all(), backend=backend) 
+    area_pos_pc_def = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx_def.pos_all(), backend=backend) 
+    area_neg_pc = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_all(), backend=backend)
+    area_neg_pc_def = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx_def.neg_all(), backend=backend)
+    
     area_pos_ng =  integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.pos_all())
-    area_neg_pc = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx.neg_all())
-    area_neg_pc_def = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], pc_dx_def.neg_all())
     area_neg_ng =  integrate_cf_dx(ng_setup['mesh'], ONE, ng_dx.neg_all())
+    area_pos_ng_def =  integrate_cf_dx(ng_setup_def['mesh'], ONE, ng_dx_def.pos_all())
+    area_neg_ng_def =  integrate_cf_dx(ng_setup_def['mesh'], ONE, ng_dx_def.neg_all())
     area_combined_pc = area_pos_pc + area_neg_pc
     area_combined_pc_def = area_pos_pc_def + area_neg_pc_def
     area_combined_ng = area_pos_ng + area_neg_ng
-    area_pos_ng_def =  integrate_cf_dx(ng_setup_def['mesh'], ONE, ng_dx_def.pos_all())
-    area_neg_ng_def =  integrate_cf_dx(ng_setup_def['mesh'], ONE, ng_dx_def.neg_all())
     area_combined_ng_def = area_pos_ng_def + area_neg_ng_def
     total_exact_area = L * H
     exact_neg_area = np.pi * R**2
     exact_pos_area = total_exact_area - exact_neg_area
     print(f"PC Areas comparison: +ve Area diff: {area_pos_pc - exact_pos_area:+.2e}, -ve Area diff: {area_neg_pc - exact_neg_area:+.2e}, Combined Area diff: {area_combined_pc - total_exact_area:+.2e}")
     print(f"PC (with deformation) Areas comparison: +ve Area diff: {area_pos_pc_def - exact_pos_area:+.2e}, -ve Area diff: {area_neg_pc_def - exact_neg_area:+.2e}, Combined Area diff: {area_combined_pc_def - total_exact_area:+.2e}")
+    
     print(f"NG Areas comparison: +ve Area diff: {area_pos_ng - exact_pos_area:+.2e}, -ve Area diff: {area_neg_ng - exact_neg_area:+.2e}, Combined Area diff: {area_combined_ng - total_exact_area:+.2e}")
     print(f"NG (with deformation) Areas comparison: +ve Area diff: {area_pos_ng_def - exact_pos_area:+.2e}, -ve Area diff: {area_neg_ng_def - exact_neg_area:+.2e}, Combined Area diff: {area_combined_ng_def - total_exact_area:+.2e}")
     err_A_pos = srelerr(area_pos_pc, exact_pos_area)
@@ -528,6 +534,8 @@ def main():
     
     print(f"Relative error (Area +ve): {err_A_pos:+.2e}, (Area -ve): {err_A_neg:+.2e}")
     print(f"Relative error with deformation (Area +ve): {err_A_pos_def:+.2e}, (Area -ve): {err_A_neg_def:+.2e}")
+    print(f"Relative error PC (Area -ve): {err_A_neg:+.2e}, NG (Area -ve): {srelerr(area_neg_ng, exact_neg_area):+.2e}, NG with deformation (Area -ve): {srelerr(area_neg_ng_def, exact_neg_area):+.2e}")
+    print(f"Relative error PC with deformation (Area -ve): {err_A_neg_def:+.2e}, NG (Area -ve): {srelerr(area_neg_ng, exact_neg_area):+.2e}, NG with deformation (Area -ve): {srelerr(area_neg_ng_def, exact_neg_area):+.2e}")
     print(f"PC Areas: +ve {area_pos_pc:.8f}, -ve {area_neg_pc:.8f}, Combined {area_combined_pc:.8f}")
     print(f"PC (with deformation) Areas: +ve {area_pos_pc_def:.8f}, -ve {area_neg_pc_def:.8f}, Combined {area_combined_pc_def:.8f}")
     print(f"NG Areas: +ve {area_pos_ng:.8f}, -ve {area_neg_ng:.8f}, Combined {area_combined_ng:.8f}")
@@ -537,15 +545,70 @@ def main():
     exact_circ = 2.0 * np.pi * R
     dGamma_pc = pycutfem_dInterface(defined_on=pc_setup['es']['interface'], level_set=pc_setup['level_set'], metadata={'q': quad_order, 'profile': True})
     dGamma_pc_def = pycutfem_dInterface(defined_on=pc_setup['es']['interface'], level_set=pc_setup['level_set'], metadata={'q': quad_order, 'profile': True}, deformation=pc_setup.get('deformation', None))
-    t0 = time.time()
+    t1 = time.time()
     L_pc = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], dGamma_pc)
     L_pc_def = integrate_pc_constant_dx(pc_setup['dh'], pc_setup['ONE'], dGamma_pc_def)
     print("\nInterface Linear Length Checks (PC assembler):")
     print(f"Exact circumference: {exact_circ:.8f}")
     print(f"PC φ_P1 length     : {L_pc:.8f}, err={L_pc - exact_circ:+.6e}")
     print(f"PC deformed length : {L_pc_def:.8f}, err={L_pc_def - exact_circ:+.6e}")
-    t1 = time.time()
-    print(f"Time taken: {t1 - t0:.4f} seconds")
+    t2 = time.time()
+    print(f"Time taken for interface: {t2 - t1:.4f} seconds")
+    print(f"Total setup time: {t2 - t0:.4f} seconds")
+
+    # ---------------- Pretty summary as a DataFrame -----------------
+    try:
+        import pandas as pd
+
+        # Build rows: (sign, deformation)
+        rows = [
+            ("Area +", "No deformation",  area_pos_pc,     area_pos_ng,     exact_pos_area),
+            ("Area +", "With deformation", area_pos_pc_def, area_pos_ng_def, exact_pos_area),
+            ("Area -", "No deformation",  area_neg_pc,     area_neg_ng,     exact_neg_area),
+            ("Area -", "With deformation", area_neg_pc_def, area_neg_ng_def, exact_neg_area),
+        ]
+
+        idx = pd.MultiIndex.from_tuples([(r[0], r[1]) for r in rows], names=["Region", "Mode"])
+        cols = pd.MultiIndex.from_product([["PC", "NG"], ["value", "diff", "rel"]])
+
+        data = []
+        for (_, _, pc_val, ng_val, exact) in rows:
+            pc_diff = pc_val - exact
+            ng_diff = ng_val - exact
+            pc_rel  = pc_diff / exact if exact != 0.0 else 0.0
+            ng_rel  = ng_diff / exact if exact != 0.0 else 0.0
+            data.append([
+                pc_val, pc_diff, pc_rel,
+                ng_val, ng_diff, ng_rel,
+            ])
+
+        df = pd.DataFrame(data, index=idx, columns=cols)
+
+        # Print table with consistent formats
+        def fmt_val(x: Optional[float]) -> str:
+            return f"{x:.8f}" if isinstance(x, (float, int)) else f"{x}"
+        def fmt_diff(x: Optional[float]) -> str:
+            return f"{x:+.6e}" if isinstance(x, (float, int)) else f"{x}"
+        def fmt_rel(x: Optional[float]) -> str:
+            return f"{x:+.6e}" if isinstance(x, (float, int)) else f"{x}"
+
+        fmt = {
+            ("PC", "value"): fmt_val, ("PC", "diff"): fmt_diff, ("PC", "rel"): fmt_rel,
+            ("NG", "value"): fmt_val, ("NG", "diff"): fmt_diff, ("NG", "rel"): fmt_rel,
+        }
+
+        print("\n== Area Error Summary (PC vs NG) ==")
+        print(df.to_string(formatters=fmt))
+    except Exception as e:
+        print("\n[pandas unavailable] Area Error Summary (PC vs NG):")
+        print("Region/Mode | PC(value, diff, rel) | NG(value, diff, rel)")
+        for (reg, mode, pc_val, ng_val, exact) in rows:
+            pc_diff = pc_val - exact
+            ng_diff = ng_val - exact
+            pc_rel  = pc_diff / exact if exact != 0.0 else 0.0
+            ng_rel  = ng_diff / exact if exact != 0.0 else 0.0
+            print(f"{reg:5s}/{mode:16s} | {pc_val:10.6f}, {pc_diff:+.3e}, {pc_rel:+.3e}"
+                  f" | {ng_val:10.6f}, {ng_diff:+.3e}, {ng_rel:+.3e}")
 
 
 

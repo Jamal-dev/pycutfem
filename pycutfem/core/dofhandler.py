@@ -1530,7 +1530,8 @@ class DofHandler:
         reuse: bool = True,
         need_hess: bool = False,
         need_o3: bool = False,
-        need_o4: bool = False
+        need_o4: bool = False,
+        deformation: Any = None
     ) -> Dict[str, np.ndarray]:
         """
         Precompute physical quadrature data (geometry, weights, optional level-set).
@@ -1540,7 +1541,7 @@ class DofHandler:
         qp_phys (nE,nQ,2), qw (nE,nQ), detJ (nE,nQ), J_inv (nE,nQ,2,2),
         normals (nE,nQ,2), phis (nE,nQ or None), h_arr (nE,), eids (nE,),
         owner_id (nE,), entity_kind="element".
-        If need_hess=True, also Hxi0/Hxi1 (nE,nQ,2,2) are returned.
+        If need_hess=True → also Hxi0/Hxi1 (nE,nQ,2,2) are returned.
         If need_o3=True   → also Txi0/Txi1 (nE,nQ,2,2,2).
         If need_o4=True   → also Qxi0/Qxi1 (nE,nQ,2,2,2,2).
         """
@@ -1548,6 +1549,7 @@ class DofHandler:
         from typing import Dict, Callable
         from pycutfem.fem import transform
         from pycutfem.integration.quadrature import volume as _volume_rule
+        from pycutfem.fem.reference import get_reference as _get_ref
 
         # Optional numba path
         try:
@@ -1573,29 +1575,29 @@ class DofHandler:
         except NameError:
             _volume_geom_cache = {}
 
-        # ---------- fast path: use cached geometry; add phis/Hxi on-demand ----------
-        if reuse and geom_key in _volume_geom_cache:
+        # ---------- fast path: use cached geometry; add φ/Hxi on-demand ----------
+        if reuse and deformation is None and geom_key in _volume_geom_cache:
             geo = _volume_geom_cache[geom_key]
-            qp = geo["qp_phys"]
+            qp  = geo["qp_phys"]
             nE, nQ, _ = qp.shape
 
-            # On-demand φ(xq) (not cached)
+            # On-demand φ(xq) (not cached with geometry)
             phis = None
             if level_set is not None:
                 phis = np.empty((nE, nQ), dtype=np.float64)
+                eids = geo["eids"]
                 for e in range(nE):
+                    eid = int(eids[e])
                     for q in range(nQ):
-                        phis[e, q] = level_set(qp[e, q])
+                        phis[e, q] = phi_eval(level_set, qp[e, q], eid=eid, mesh=mesh)
 
             # On-demand inverse-map jets if requested (not cached; use qp_ref to avoid inverse mapping)
             if need_hess or need_o3 or need_o4:
                 qp_ref = geo.get("qp_ref", None)
                 if qp_ref is None:
-                    from pycutfem.integration.quadrature import volume as _volume_rule
                     qp_ref, _ = _volume_rule(mesh.element_type, quad_order)
                     qp_ref = np.asarray(qp_ref, dtype=np.float64)
                 kmax = 4 if need_o4 else (3 if need_o3 else 2)
-                # allocate only what’s requested
                 out = {}
                 if need_hess:
                     out["Hxi0"] = np.zeros((nE, nQ, 2, 2), dtype=np.float64)
@@ -1606,7 +1608,7 @@ class DofHandler:
                 if need_o4:
                     out["Qxi0"] = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=np.float64)
                     out["Qxi1"] = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=np.float64)
-                # fill from inverse-jet cache
+
                 eids = geo["eids"]
                 for e in range(nE):
                     eid = int(eids[e])
@@ -1614,15 +1616,15 @@ class DofHandler:
                         xi, eta = float(qp_ref[q, 0]), float(qp_ref[q, 1])
                         rec = _JET.get(mesh, eid, xi, eta, upto=kmax)
                         if need_hess:
-                            A2 = rec["A2"]  # (2,2,2)
+                            A2 = rec["A2"]
                             out["Hxi0"][e, q] = A2[0]
                             out["Hxi1"][e, q] = A2[1]
                         if need_o3:
-                            A3 = rec["A3"]  # (2,2,2,2)
+                            A3 = rec["A3"]
                             out["Txi0"][e, q] = A3[0]
                             out["Txi1"][e, q] = A3[1]
                         if need_o4:
-                            A4 = rec["A4"]  # (2,2,2,2,2)
+                            A4 = rec["A4"]
                             out["Qxi0"][e, q] = A4[0]
                             out["Qxi1"][e, q] = A4[1]
                 return {**geo, "phis": phis, **out}
@@ -1635,7 +1637,7 @@ class DofHandler:
 
         # ---------------------- reference shape/grad tables ----------------------
         kmax = 4 if need_o4 else (3 if need_o3 else 2)
-        ref = get_reference(mesh.element_type, mesh.poly_order, max_deriv_order=kmax)
+        ref = _get_ref(mesh.element_type, mesh.poly_order, max_deriv_order=kmax)
         # infer n_loc from a single evaluation (Ref has no n_functions accessor)
         n_loc = int(np.asarray(ref.shape(qp_ref[0, 0], qp_ref[0, 1])).size)
         Ntab  = np.empty((n_q, n_loc), dtype=np.float64)        # (nQ, n_loc)
@@ -1645,14 +1647,17 @@ class DofHandler:
             dNtab[q, :, :] = np.asarray(ref.grad (xi, eta), dtype=np.float64)
 
         # ---------------------- element → node coords (vectorized) ---------------
-        node_ids   = mesh.nodes[mesh.elements_connectivity]            # (nE, n_loc)
-        elem_coord = mesh.nodes_x_y_pos[node_ids].astype(np.float64)   # (nE, n_loc, 2)
+        # elem_coord[e,i,:] = (x_i, y_i) of the i-th local geometry node of element e
+        elem_coord = mesh.nodes_x_y_pos[mesh.elements_connectivity].astype(np.float64)   # (nE, n_loc, 2)
 
         # ---------------------- allocate outputs ---------------------------------
         qp_phys = np.zeros((n_el, n_q, 2), dtype=np.float64)
         qw_sc   = np.zeros((n_el, n_q),    dtype=np.float64)
         detJ    = np.zeros((n_el, n_q),    dtype=np.float64)
         J_inv   = np.zeros((n_el, n_q, 2, 2), dtype=np.float64)
+
+        # Keep geometry Jacobian for deformation step (not returned)
+        J_geo   = np.zeros((n_el, n_q, 2, 2), dtype=np.float64)
 
         # ---------------------- fast path: Numba ---------------------------------
         if _HAVE_NUMBA:
@@ -1664,25 +1669,26 @@ class DofHandler:
                 qw_sc   = np.zeros((nE, nQ))
                 detJ    = np.zeros((nE, nQ))
                 J_inv   = np.zeros((nE, nQ, 2, 2))
+                J_geo   = np.zeros((nE, nQ, 2, 2))
                 for e in _nb.prange(nE):
                     for q in range(nQ):
                         # x = Σ_i N_i * X_i
                         x0 = 0.0; x1 = 0.0
-                        for i in range(nLoc):
-                            Ni = Ntab[q, i]
-                            x0 += Ni * coords[e, i, 0]
-                            x1 += Ni * coords[e, i, 1]
-                        qp_phys[e, q, 0] = x0
-                        qp_phys[e, q, 1] = x1
-                        # J = dN^T @ X
                         a00 = 0.0; a01 = 0.0; a10 = 0.0; a11 = 0.0
                         for i in range(nLoc):
-                            dNix = dNtab[q, i, 0]
-                            dNiy = dNtab[q, i, 1]
-                            Xix  = coords[e, i, 0]
-                            Xiy  = coords[e, i, 1]
-                            a00 += dNix * Xix; a01 += dNix * Xiy
-                            a10 += dNiy * Xix; a11 += dNiy * Xiy
+                            Ni  = Ntab[q, i]
+                            dN0 = dNtab[q, i, 0]
+                            dN1 = dNtab[q, i, 1]
+                            X0  = coords[e, i, 0]
+                            X1  = coords[e, i, 1]
+                            x0 += Ni  * X0
+                            x1 += Ni  * X1
+                            a00 += dN0 * X0; a01 += dN0 * X1
+                            a10 += dN1 * X0; a11 += dN1 * X1
+                        qp_phys[e, q, 0] = x0
+                        qp_phys[e, q, 1] = x1
+                        J_geo[e, q, 0, 0] = a00; J_geo[e, q, 0, 1] = a01
+                        J_geo[e, q, 1, 0] = a10; J_geo[e, q, 1, 1] = a11
                         det = a00 * a11 - a01 * a10
                         detJ[e, q] = det
                         inv_det = 1.0 / det
@@ -1691,29 +1697,29 @@ class DofHandler:
                         J_inv[e, q, 1, 0] = -a10 * inv_det
                         J_inv[e, q, 1, 1] =  a00 * inv_det
                         qw_sc[e, q] = qwref[q] * det
-                return qp_phys, qw_sc, detJ, J_inv
+                return qp_phys, qw_sc, detJ, J_inv, J_geo
 
-            qp_phys, qw_sc, detJ, J_inv = _geom_kernel(elem_coord, Ntab, dNtab, qw_ref)
+            qp_phys, qw_sc, detJ, J_inv, J_geo = _geom_kernel(elem_coord, Ntab, dNtab, qw_ref)
 
         else:
             # ------------------ safe Python fallback ------------------------------
             for e in range(n_el):
-                for q_idx, (xi_eta, qw0) in enumerate(zip(qp_ref, qw_ref)):
-                    xi_eta_t = (float(xi_eta[0]), float(xi_eta[1]))
-                    J = transform.jacobian(mesh, e, xi_eta_t)
-                    det = float(np.linalg.det(J))
+                Xe = elem_coord[e, :, :]            # (n_loc,2)
+                for q_idx, (xi_eta, w_ref) in enumerate(zip(qp_ref, qw_ref)):
+                    xi, eta = float(xi_eta[0]), float(xi_eta[1])
+                    # Physical point
+                    x = Xe.T @ Ntab[q_idx, :]       # (2,)
+                    qp_phys[e, q_idx, :] = x
+                    # Geometry Jacobian via dN @ X  (no inv(J_inv) nonsense)
+                    dN = dNtab[q_idx, :, :]         # (n_loc,2)
+                    A  = Xe.T @ dN                  # (2,2)  (row-form dN^T @ X)
+                    J_geo[e, q_idx, :, :] = A
+                    det = float(np.linalg.det(A))
                     if det <= 1e-12:
                         raise ValueError(f"Jacobian determinant is non-positive ({det}) for element {e}.")
                     detJ[e, q_idx]  = det
-                    J_inv[e, q_idx] = np.linalg.inv(J)
-                    # physical point and scaled weight
-                    X = np.zeros(2, dtype=np.float64)
-                    for i in range(n_loc):
-                        Ni = Ntab[q_idx, i]
-                        X[0] += Ni * elem_coord[e, i, 0]
-                        X[1] += Ni * elem_coord[e, i, 1]
-                    qp_phys[e, q_idx] = X
-                    qw_sc[e, q_idx]   = qw0 * det
+                    J_inv[e, q_idx] = np.linalg.inv(A)
+                    qw_sc[e, q_idx] = w_ref * det
 
         # ---------------------- post-process & cache -----------------------------
         bad = np.where(detJ <= 1e-12)
@@ -1741,12 +1747,11 @@ class DofHandler:
             "owner_id": eids.copy(),
             "entity_kind": "element",
             # store qp_ref in cache so jets never need inverse-mapping on reuse
-            # "qp_ref":  qp_ref,
+            "qp_ref":  qp_ref,
         }
 
         # Compute inverse-map jets if requested (not cached with geometry)
         if need_hess or need_o3 or need_o4:
-            
             if need_hess:
                 Hxi0 = np.zeros((n_el, n_q, 2, 2), dtype=np.float64)
                 Hxi1 = np.zeros_like(Hxi0)
@@ -1777,22 +1782,58 @@ class DofHandler:
             if need_o4:
                 geo["Qxi0"] = Qxi0; geo["Qxi1"] = Qxi1
 
-        # Cache *geometry only* (no phis)
-        if reuse:
+        # Cache *geometry only* (no φ, jets) for reuse in undeformed case
+        if reuse and deformation is None:
             _volume_geom_cache[geom_key] = {k: v for k, v in geo.items()
                                             if k not in ("Hxi0","Hxi1","Txi0","Txi1","Qxi0","Qxi1","phis")}
 
-        # On-demand φ(xq) evaluation (cheap vs. geometry)
+        # ---------------------- deformation: update qp/detJ/J_inv/qw --------------
+        if deformation is not None:
+            # FE gradient of displacement in reference variables:
+            # u(ξ) = Σ_i U_i N_i(ξ)  →  ∂ξ u = U^T @ dN(ξ)  (2×n) @ (n×2) => (2×2)
+            qp_def   = np.empty_like(geo["qp_phys"])
+            det_def  = np.empty_like(geo["detJ"])
+            Jinv_def = np.empty_like(geo["J_inv"])
+
+            for e in range(n_el):
+                conn = np.asarray(mesh.elements_connectivity[int(e)], dtype=int)
+                Uloc = np.asarray(deformation.node_displacements[conn], float)  # (n_loc,2)
+                for q in range(n_q):
+                    # geometry part already computed in J_geo
+                    A_g = J_geo[e, q, :, :]               # J_g(ξq) (2×2)
+                    dN  = dNtab[q, :, :]                   # (n_loc,2)
+                    A_d = Uloc.T @ dN                      # (2×2)
+                    A_t = A_g + A_d                        # total J
+                    det = float(np.linalg.det(A_t))
+                    det_def[e, q]  = det
+                    Jinv_def[e, q] = np.linalg.inv(A_t)
+                    # update point: x_def = x_g + u_h(ξq)
+                    disp = Ntab[q, :] @ Uloc               # (2,)
+                    qp_def[e, q, :] = geo["qp_phys"][e, q, :] + disp
+
+            # replace geometry with deformed
+            det_geo = geo["detJ"].copy()
+            geo["qp_phys"] = qp_def
+            geo["detJ"]    = det_def
+            geo["J_inv"]   = Jinv_def
+            # rescale weights so that qw = w_ref * det_total
+            eps = 1e-300
+            geo["qw"]      = geo["qw"] * (det_def / (det_geo + eps))
+
+        # ---------------------- φ evaluation (at final qp) ------------------------
         phis = None
         if level_set is not None:
             phis = np.empty((n_el, n_q), dtype=np.float64)
+            qp   = geo["qp_phys"]
             for e in range(n_el):
+                eid = int(eids[e])
                 for q in range(n_q):
-                    phis[e, q] = level_set(qp_phys[e, q])
+                    phis[e, q] = phi_eval(level_set, qp[e, q], eid=eid, mesh=mesh)
+        geo["phis"] = phis
 
-        # Return geometry + phis + any requested jets (if present in geo)
-        ret = {**geo, "phis": phis}
-        return ret
+        # Return geometry (+ jets if added) + φ
+        return geo
+
 
 
 
@@ -1811,7 +1852,8 @@ class DofHandler:
         reuse: bool = True,
         need_hess: bool = False,
         need_o3: bool = False,
-        need_o4: bool = False
+        need_o4: bool = False,
+        deformation: Any = None
     ) -> dict:
         """
         Pre-compute geometry & basis tables for ∫_{interface∩element} ⋯ dS on *cut* elements.
@@ -1989,6 +2031,39 @@ class DofHandler:
                     g = level_set.gradient(xq)
                     ng = float(np.linalg.norm(g))
                     normals[e, q] = g / (ng + 1e-30)
+
+        # If deformation is provided: scale weights by ||(I + ∂u/∂x)·τ̂||
+        if deformation is not None:
+            from pycutfem.fem.reference import get_reference as _get_ref
+            ref_geom = _get_ref(mesh.element_type, mesh.poly_order)
+            # Build reference coordinates for each qp (element-wise inverse map)
+            xi_tab  = np.empty((nE, nQ), dtype=float)
+            eta_tab = np.empty((nE, nQ), dtype=float)
+            for i in range(nE):
+                eid = int(valid_cut_eids[i])
+                for q in range(nQ):
+                    s, t = transform.inverse_mapping(mesh, eid, qp_phys[i, q])
+                    xi_tab[i, q]  = float(s); eta_tab[i, q] = float(t)
+            # Apply stretch per qp
+            for i in range(nE):
+                eid = int(valid_cut_eids[i])
+                conn = np.asarray(mesh.elements_connectivity[eid], dtype=int)
+                Uloc = np.asarray(deformation.node_displacements[conn], float)  # (n_loc,2)
+                for q in range(nQ):
+                    xi = float(xi_tab[i, q]); eta = float(eta_tab[i, q])
+                    Jg = transform.jacobian(mesh, eid, (xi, eta))
+                    dN = np.asarray(ref_geom.grad(xi, eta), float)
+                    Gref = Uloc.T @ dN
+                    # G_phys = solve(Jg^T, Gref^T)^T
+                    Gphy = np.linalg.solve(Jg.T, Gref.T).T
+                    F = np.eye(2) + Gphy
+                    n = normals[i, q]
+                    tau = np.array([n[1], -n[0]], dtype=float)
+                    qw[q] *= float(np.linalg.norm(F @ tau))
+                    # update physical point to deformed location for ana.eval consistency
+                    xg = transform.x_mapping(mesh, eid, (xi, eta))
+                    disp = deformation.displacement_ref(eid, (xi, eta))
+                    qp_phys[i, q, :] = xg + disp
 
         # --- (ξ,η) at each interface quadrature point -------------------------------
         xi_tab  = np.empty((nE, nQ), dtype=float)
@@ -3026,6 +3101,7 @@ class DofHandler:
         need_o3: bool = False,
         need_o4: bool = False,
         nseg_hint: int | None = None,
+        deformation: Any = None,
     ) -> dict:
         """
         Pre-compute geometry/basis for ∫_{Ω ∩ {φ ▷ 0}} (…) dx on CUT elements.
@@ -3120,9 +3196,23 @@ class DofHandler:
             subset_hash = tuple(eids_all)
         ls_token = _ls_fingerprint(level_set)
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
+        def _def_fingerprint(defm):
+            if defm is None:
+                return ("nodef",)
+            tok = getattr(defm, "cache_token", None)
+            if tok is not None:
+                return ("token", tok)
+            # last resort: object identity (works within one process)
+            return ("objid", int(id(defm)))
+
+        def_token = _def_fingerprint(deformation)
+
         cache_key = (
             "cutvol", id(mesh), me.signature(), subset_hash,
-            int(qdeg), str(side), derivs_key, self.method, bool(need_hess), bool(need_o3), bool(need_o4), ls_token
+            int(qdeg), str(side), derivs_key, 
+            self.method, bool(need_hess), 
+            bool(need_o3), bool(need_o4), ls_token,
+            def_token
         )
         if reuse and cache_key in _cut_volume_cache:
             return _cut_volume_cache[cache_key]
@@ -3154,6 +3244,9 @@ class DofHandler:
         sgn = +1 if side == "+" else -1
 
         # ---------------- main loop over cut elements ------------------------------
+        from pycutfem.fem.reference import get_reference as _get_ref
+        ref_geom = _get_ref(mesh.element_type, mesh.poly_order)
+
         for eid in eids_all:
             elem = mesh.elements_list[eid]
             # corner triangles of the parent element (tri/tri or quad split into 2 tris)
@@ -3190,11 +3283,33 @@ class DofHandler:
                 for x, w in zip(qx, qw):
                     s, t  = transform.inverse_mapping(mesh, int(eid), x)
                     rec   = _JET.get(mesh, int(eid), float(s), float(t), upto=kmax_jets)
-                    Ji    = rec["A"]                          # (2,2)
+                    Ji_geo = rec["A"]                          # (2,2) = J_geom^{-1}
+                    Jg     = np.linalg.inv(Ji_geo)
+
+                    # default: geometric mapping
+                    Ji_use = Ji_geo
+                    w_eff  = float(w)
+                    x_use  = np.asarray(x, dtype=float)
+
+                    if deformation is not None:
+                        # Build deformation Jacobian in reference → physical
+                        conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
+                        Uloc = np.asarray(deformation.node_displacements[conn], float)  # (nloc,2)
+                        dN   = np.asarray(ref_geom.grad(float(s), float(t)), float)     # (nloc,2)
+                        Jd   = Uloc.T @ dN
+                        Jt   = Jg + Jd
+                        Ji_use = np.linalg.inv(Jt)
+                        det_g = abs(float(np.linalg.det(Jg))) + 1e-300
+                        det_t = abs(float(np.linalg.det(Jt)))
+                        w_eff = float(w) * (det_t / det_g)
+                        # update physical point to deformed y = x + u
+                        disp = deformation.displacement_ref(int(eid), (float(s), float(t)))
+                        x_use = x_use + disp
+
                     # store per-qp geometry
-                    xq_elem.append(np.asarray(x, dtype=float))
-                    wq_elem.append(float(w))
-                    Jinv_elem.append(Ji)
+                    xq_elem.append(x_use)
+                    wq_elem.append(w_eff)
+                    Jinv_elem.append(Ji_use)
                     phi_elem.append(float(phi_eval(level_set, x)))
                     # inverse-jet chains if requested (unchanged)
                     if need_hess:
@@ -4165,4 +4280,3 @@ if __name__ == '__main__':
         print(f"\nIs the pinned DOF ({pinned_dof}) in the list of all pressure DOFs? {'Yes' if pinned_dof in p_dofs else 'No'}")
     else:
         print("  'pressure_pin' DOF not found in results.")
-

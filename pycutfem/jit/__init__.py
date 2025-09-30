@@ -1,4 +1,5 @@
 # pycutfem/jit/__init__.py
+import re
 from pycutfem.ufl.helpers import required_multi_indices
 from .visitor import IRGenerator
 from .codegen import NumbaCodeGen
@@ -256,7 +257,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
             # ---- Plain volume (no level set) -----------------------------
             if level_set is None:
-                geom = dof_handler.precompute_geometric_factors(qdeg, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
+                geom = dof_handler.precompute_geometric_factors(qdeg, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4,
+                                                                deformation=getattr(intg.measure, 'deformation', None))
                 geom["is_interface"] = False
                 geom["is_ghost"] = False
                 gdofs_map = np.vstack([
@@ -308,7 +310,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
             # 1) FULL elements on the requested side
             if full_ids.size:
                 # include level_set so 'phis' is present (may still be None)
-                geom_all = dof_handler.precompute_geometric_factors(qdeg, level_set, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
+                geom_all = dof_handler.precompute_geometric_factors(qdeg, level_set, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4,
+                                                                    deformation=getattr(intg.measure, 'deformation', None))
                 geom_full = {
                     "qp_phys": geom_all["qp_phys"][full_ids],
                     "qw":      geom_all["qw"][full_ids],
@@ -343,6 +346,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 derivs = required_multi_indices(intg.integrand) | {(0, 0)}
                 cut_mask = mesh.element_bitset("cut")
                 cut_bs = (bs & cut_mask) if bs is not None else cut_mask
+                deformation=getattr(intg.measure, 'deformation', None)
 
                 geom_cut = dof_handler.precompute_cut_volume_factors(
                     cut_bs, qdeg, derivs, level_set, 
@@ -350,7 +354,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     need_hess=need_hess, 
                     need_o3=need_o3, 
                     need_o4=need_o4,
-                    nseg=nseg
+                    nseg_hint=nseg,
+                    deformation=deformation
                 )
                 cut_eids = np.asarray(geom_cut.get("eids", []), dtype=np.int32)
                 if cut_eids.size:
@@ -392,7 +397,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                                                             need_hess=need_hess, 
                                                             need_o3=need_o3, 
                                                             need_o4=need_o4,
-                                                            nseg=nseg)
+                                                            nseg=nseg,
+                                                            deformation=getattr(intg.measure, 'deformation', None))
             geom["is_interface"] = True
 
             # interface assembly still uses element-local maps; safe to use all

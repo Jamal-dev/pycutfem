@@ -427,7 +427,9 @@ def _build_jit_kernel_args(       # ← signature unchanged
         mask_full = _expand_subset_to_full(
             np.asarray(raw, dtype=np.bool_).ravel(), what=f"BitSet {pname}"
         )
-        args[pname] = mask_full
+        # NEW: slice to the active subset so arr[e] lines up with cut/full kernel rows
+        mask = mask_full[eids] if eids is not None else mask_full
+        args[pname] = mask
 
     # ------------------------------------------------------------------
     # 5. Constants / EWC / coefficient vectors / reference tables

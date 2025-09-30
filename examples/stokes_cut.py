@@ -20,7 +20,7 @@ from pycutfem.ufl.measures import dx, dInterface, dGhost
 from pycutfem.ufl.forms import BoundaryCondition, assemble_form, Equation
 
 # --- Level Set & Hansbo ratio ---
-from pycutfem.core.levelset import CircleLevelSet
+from pycutfem.core.levelset import CircleLevelSet, LevelSetMeshAdaptation
 from pycutfem.core.geometry import hansbo_cut_ratio
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.analytic import Analytic
@@ -144,18 +144,20 @@ def exact_solution(mu, R, gammaf):
             p_exact_neg_xy, p_exact_pos_xy)
 
 
-def test_stokes_interface_corrected():
+def test_stokes_interface_corrected(with_deformation: bool = False):
     """
     Unfitted Stokes interface (NGSolve-style): Hansbo averaging, Nitsche coupling,
     ghost penalties, SymPy-manufactured RHS, and piecewise L2/H1 errors.
     This version is corrected to use the existing pycutfem API.
     """
     # ---------------- 1) Mesh, order, level set ----------------
-    # backend = 'python'
-    backend = 'jit'
+    backend = 'python'
+    # backend = 'jit'
+    with_deformation = False
     poly_order = 2
     geom_order = 1
-    print(f'Using backend: {backend}, polynomial order: {poly_order}')
+    qvol   = 2*poly_order + 2
+    print(f'Using backend: {backend}, polynomial order: {poly_order}, with_deformation={with_deformation}')
     maxh = 0.125
     L,H = 2.0, 2.0
     mesh_size = int(L / maxh)
@@ -223,12 +225,24 @@ def test_stokes_interface_corrected():
     mL = TestFunction ('lm')   # "m" in the NGSolve snippet
 
     # Measures & parameters
-    qvol   = 2*poly_order + 2
-    dx_pos = dx(defined_on=has_outside, level_set=level_set, metadata={'side': '+', 'q': qvol})
-    dx_neg = dx(defined_on=has_inside,  level_set=level_set, metadata={'side': '-', 'q': qvol})
-    dGamma = dInterface(defined_on=cut_e,  level_set=level_set, metadata={'q': qvol+2, 'derivs': {(1,0),(0,1)}})
-    dG_pos = dGhost(defined_on=ghost_pos,    level_set=level_set, metadata={'q': qvol+2, 'derivs': {(1,0),(0,1)}})
-    dG_neg = dGhost(defined_on=ghost_neg,    level_set=level_set, metadata={'q': qvol+2, 'derivs': {(1,0),(0,1)}})
+    # Optional deformation (accuracy improvement for cut geometry integration)
+    deformation = None
+    if with_deformation:
+        adapter = LevelSetMeshAdaptation(mesh, order=max(2, poly_order), threshold=10.5)
+        deformation = adapter.calc_deformation(level_set, q_vol=q_vol)
+        level_set = adapter.lset_p1  # use P1 surrogate for cut geometry
+        # Use P1/Q1 surrogate of φ for classification during assembly (adapter.lset_p1)
+        # but keep 'level_set' as the same object for exact expressions
+        mesh.classify_elements(adapter.lset_p1)
+        mesh.classify_edges(adapter.lset_p1)
+        mesh.build_interface_segments(adapter.lset_p1)
+
+    
+    dx_pos = dx(defined_on=has_outside, level_set=level_set, metadata={'side': '+', 'q': qvol}, deformation=deformation)
+    dx_neg = dx(defined_on=has_inside,  level_set=level_set, metadata={'side': '-', 'q': qvol}, deformation=deformation)
+    dGamma = dInterface(defined_on=cut_e,  level_set=level_set, metadata={'q': qvol+2, 'derivs': {(1,0),(0,1)}}, deformation=deformation)
+    dG_pos = dGhost(defined_on=ghost_pos,    level_set=level_set, metadata={'q': qvol+2, 'derivs': {(1,0),(0,1)}}, deformation=deformation)
+    dG_neg = dGhost(defined_on=ghost_neg,    level_set=level_set, metadata={'q': qvol+2, 'derivs': {(1,0),(0,1)}}, deformation=deformation)
 
     h = CellDiameter()
     n = FacetNormal()
@@ -474,4 +488,6 @@ def test_stokes_interface_corrected():
     print(f"Solution exported to {vtk_path}")
 
 if __name__ == "__main__":
-    test_stokes_interface_corrected()
+    # Allow quick toggling via env or simple edit
+    use_def = os.getenv('PYCUTFEM_STOKES_WITH_DEF', '0').lower() in {'1','true','yes'}
+    test_stokes_interface_corrected(with_deformation=use_def)
