@@ -44,6 +44,7 @@ from ngsolve import *
 from xfem import *
 from xfem.lsetcurv import *
 import time
+import os
 
 
 @dataclass
@@ -434,11 +435,10 @@ class NG_DX:
             return dCut(self.lsetp1, IF, definedonelements=self.ci.GetElementsOfType(IF), order=quad_order, deformation=self.deformation)
         return dCut(self.lsetp1, IF, definedonelements=self.ci.GetElementsOfType(IF), order=quad_order)
 # ---------- Runner ----------
-def main():
+def main(backend='python'):
     maxh, order, R = 0.125, 2, 2.0/3.0
     L, H = 2.0, 2.0
     use_quad = True  # Whether to use quad elements in PyCutFEM and NGSolve
-    backend = 'jit'
     
     # --- 1. Setup Phase ---
     t0 = time.time()
@@ -940,4 +940,5 @@ def main():
     print("\nDone. Green ✓ indicates success within tolerance; red ✗ highlights discrepancies.")
 
 if __name__ == "__main__":
-    main()
+    backend = os.getenv('PYCUTFEM_BACKEND', 'python').lower()  
+    main(backend=backend)

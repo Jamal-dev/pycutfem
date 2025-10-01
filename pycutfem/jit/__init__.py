@@ -371,7 +371,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     ]).astype(np.int32)
 
                     # geom_cut already carries 'eids'; keep it and pass through
-                    static_cut = {"gdofs_map": gdofs_map_cut, **geom_cut}
+                    # static_cut = {"gdofs_map": gdofs_map_cut, **geom_cut}
+                    static_cut = {"gdofs_map": gdofs_map_cut, "eids": cut_eids, "owner_id": cut_eids, **geom_cut}
                     # _build_jit_kernel_args won't overwrite per-element basis we provide
                     static_cut.update(_build_jit_kernel_args(
                         ir, intg.integrand, mixed_element, qdeg,

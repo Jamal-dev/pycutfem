@@ -2324,25 +2324,25 @@ class FormCompiler:
         geo["is_interface"] = True
         cut_eids = geo["eids"].astype(np.int32)      # 1‑D array, len = n_cut
 
-        # 2a) ALIAS: for interface, both sides are the same element.
-        #    Provide r**_*_{pos|neg} by aliasing to existing d**_* tables.
-        fields = dh.mixed_element.field_names
-        for fld in fields:
-            gkey = f"g_{fld}"
-            if gkey not in geo:
-                continue
-            g = geo[gkey]                         # (nE, nQ, n_union, 2) = [d/dξ, d/dη]
-            r10 = np.ascontiguousarray(g[..., 0]) # (nE, nQ, n_union)
-            r01 = np.ascontiguousarray(g[..., 1]) # (nE, nQ, n_union)
-            # Only set if absent
-            geo.setdefault(f"r10_{fld}_pos", r10)
-            geo.setdefault(f"r01_{fld}_pos", r01)
-            geo.setdefault(f"r10_{fld}_neg", r10)
-            geo.setdefault(f"r01_{fld}_neg", r01)
-            b = geo.get(f"b_{fld}")  # (nE, nQ, n_union) value table on interface
-            if b is not None:
-                geo.setdefault(f"r00_{fld}_pos", b)
-                geo.setdefault(f"r00_{fld}_neg", b)
+        # # 2a) ALIAS: for interface, both sides are the same element.
+        # #    Provide r**_*_{pos|neg} by aliasing to existing d**_* tables.
+        # fields = dh.mixed_element.field_names
+        # for fld in fields:
+        #     gkey = f"g_{fld}"
+        #     if gkey not in geo:
+        #         continue
+        #     g = geo[gkey]                         # (nE, nQ, n_union, 2) = [d/dξ, d/dη]
+        #     r10 = np.ascontiguousarray(g[..., 0]) # (nE, nQ, n_union)
+        #     r01 = np.ascontiguousarray(g[..., 1]) # (nE, nQ, n_union)
+        #     # Only set if absent
+        #     geo.setdefault(f"r10_{fld}_pos", r10)
+        #     geo.setdefault(f"r01_{fld}_pos", r01)
+        #     geo.setdefault(f"r10_{fld}_neg", r10)
+        #     geo.setdefault(f"r01_{fld}_neg", r01)
+        #     b = geo.get(f"b_{fld}")  # (nE, nQ, n_union) value table on interface
+        #     if b is not None:
+        #         geo.setdefault(f"r00_{fld}_pos", b)
+        #         geo.setdefault(f"r00_{fld}_neg", b)
 
         # ------------------------------------------------------------------
         # 3. Element‑to‑DOF map  (shape = n_cut × n_loc)

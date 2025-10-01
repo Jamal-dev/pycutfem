@@ -34,6 +34,14 @@ def phi_eval(level_set, x_phys, *, eid=None, xi_eta=None, mesh=None):
     except TypeError:
         return float(level_set(float(x_phys[0]), float(x_phys[1])))
 
+def _keep_at(side, v_phi, tol=1e-14):
+    if side == '+':
+        keep = [i for i in range(3) if SIDE.is_pos(v_phi[i], tol=tol)]
+    elif side == '-':
+        keep = [i for i in range(3) if SIDE.is_neg(v_phi[i], tol=tol)]
+    else:
+        raise ValueError("side must be '+' or '-'")
+    return keep
 
 # --------------------- Segment zero-crossing (linear φ) ----------------------
 def segment_zero_crossing(p0: np.ndarray, p1: np.ndarray, phi0: float, phi1: float, eps: float = 1e-14) -> np.ndarray:
@@ -53,9 +61,7 @@ def clip_triangle_to_side(v_coords, v_phi, side='+', eps=0.0):
     """Clip a triangle against φ=0; keep 'side' ('+' keeps φ≥0, '−' keeps φ≤0)."""
     phi = np.asarray(v_phi, float)
     V   = [np.asarray(v, float) for v in v_coords]
-    if   side == '+': keep = [i for i in range(3) if SIDE.is_pos(phi[i], tol=eps)]
-    elif side == '-': keep = [i for i in range(3) if not SIDE.is_pos(phi[i], tol=eps)]
-    else:             raise ValueError("side must be '+' or '-'")
+    keep = _keep_at(side, phi, tol=eps)
     drop = [i for i in range(3) if i not in keep]
     if len(keep) == 3: return [V]
     if len(keep) == 0: return []
@@ -92,16 +98,16 @@ if _HAVE_NUMBA:
         # Decide inclusivity at zero by zero_to_pos:
         #   if zero_to_pos: '+' keeps ≥ -eps, '−' keeps > eps
         #   else          : '+' keeps >  eps, '−' keeps ≥ -eps
-        def keep_at(phi_val, side_is_plus):
-            if side_is_plus:
-                return (phi_val >= -eps) if zero_to_pos else (phi_val > eps)
-            else:
-                return (phi_val >  eps)  if zero_to_pos else (phi_val >= -eps)
+        # def keep_at(phi_val, side_is_plus):
+        #     if side_is_plus:
+        #         return (phi_val >= -eps) if zero_to_pos else (phi_val > eps)
+        #     else:
+        #         return (phi_val >  eps)  if zero_to_pos else (phi_val >= -eps)
 
         side_is_plus = (sgn == 1.0)
-        keep0 = keep_at(phi0, side_is_plus)
-        keep1 = keep_at(phi1, side_is_plus)
-        keep2 = keep_at(phi2, side_is_plus)
+        keep0 = _keep_at(phi0, side_is_plus,tol=eps)
+        keep1 = _keep_at(phi1, side_is_plus,tol=eps)
+        keep2 = _keep_at(phi2, side_is_plus,tol=eps)
         n_keep = (1 if keep0 else 0) + (1 if keep1 else 0) + (1 if keep2 else 0)
 
         out = np.empty((4, 2), dtype=np.float64)
@@ -381,17 +387,11 @@ def edge_root_pn(level_set, mesh, eid: int, local_edge: int, *, tol: float = SID
 # Local→reference corner permutation + segment root on element interior
 # ---------------------------------------------------------------------------
 
-def _ref_corners(mesh):
-    if mesh.element_type == 'quad':
-        return np.array([[-1,-1],[+1,-1],[+1,+1],[-1,+1]], float)
-    elif mesh.element_type == 'tri':
-        return np.array([[0,0],[1,0],[0,1]], float)
-    else:
-        raise KeyError(mesh.element_type)
+
 
 def _loc2ref_corner_perm(mesh, eid, V, tol=1e-8):
     """perm[i_local_parent] → i_reference_corner (robust, unique)."""
-    ref = _ref_corners(mesh)
+    ref = _corner_ref_coords(mesh)
     m = V.shape[0]
     perm = [-1]*m; used = set()
     for i in range(m):
@@ -603,7 +603,7 @@ def curved_subcell_quadrature_for_cut_triangle(mesh, eid, tri_local_ids, corner_
     vphi = np.array([phi_eval(level_set, V[k], eid=eid, mesh=mesh) for k in range(3)], float)
 
     # requested side
-    keep = [i for i in range(3) if (SIDE.is_pos(vphi[i], tol=tol) if side == '+' else not SIDE.is_pos(vphi[i], tol=tol))]
+    keep = _keep_at(side,vphi,tol)
     drop = [i for i in range(3) if i not in keep]
 
     if len(keep) == 3:
@@ -779,12 +779,7 @@ def clip_triangle_to_side_pn(mesh, eid, tri_local_ids, corner_ids, level_set, si
     v_phi = np.array([phi_eval(level_set, V[k], eid=eid, mesh=mesh) for k in range(3)], float)
 
     # Decide kept vs dropped (match P1 variant’s convention re: zeros)
-    if side == '+':
-        keep = [i for i in range(3) if SIDE.is_pos(v_phi[i], tol=eps)]
-    elif side == '-':
-        keep = [i for i in range(3) if not SIDE.is_pos(v_phi[i], tol=eps)]
-    else:
-        raise ValueError("side must be '+' or '-'")
+    keep = _keep_at(side, v_phi, eps)
     drop = [i for i in range(3) if i not in keep]
 
     if len(keep) == 3: return [ [V[0], V[1], V[2]] ]

@@ -196,7 +196,26 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 # NOTE: me.deriv_ref(...) returns union-length (mixed) derivative vector
                 tab[i, q, :] = me.deriv_ref(field, float(xi), float(eta), int(ax), int(ay))
         return tab
-
+    def _grad_table_phys_union(field: str) -> np.ndarray:
+        """
+        Union-length reference *gradient* tables at physical QPs.
+        Shape: (nE, nQ, n_union, 2) with components [∂/∂ξ, ∂/∂η].
+        """
+        pts  = pre_built["qp_phys"]      # (nE, nQ, 2)
+        eids = pre_built["eids"]         # (nE,)
+        me   = mixed_element
+        mesh = me.mesh
+        nE, nQ, _ = pts.shape
+        n_union = _n_union_for_eid(eids[0])
+        tab = np.empty((nE, nQ, n_union, 2), dtype=np.float64)
+        for i in range(nE):
+            eid = int(eids[i])
+            assert _n_union_for_eid(eid) == n_union, "Union length differs across elements."
+            for q in range(nQ):
+                x, y = pts[i, q]
+                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+                tab[i, q, :, :] = me.grad_basis(field, float(xi), float(eta))
+        return tab
     def _decode_coeff_name(name: str):
         """
         Resolve u_<mid>_loc into (field_key, side).
@@ -427,9 +446,9 @@ def _build_jit_kernel_args(       # ← signature unchanged
         mask_full = _expand_subset_to_full(
             np.asarray(raw, dtype=np.bool_).ravel(), what=f"BitSet {pname}"
         )
-        # NEW: slice to the active subset so arr[e] lines up with cut/full kernel rows
-        mask = mask_full[eids] if eids is not None else mask_full
-        args[pname] = mask
+        # IMPORTANT: keep FULL element-length mask.
+        # Kernels index with global owner_id[e], not the row index ‘e’.
+        args[pname] = mask_full
 
     # ------------------------------------------------------------------
     # 5. Constants / EWC / coefficient vectors / reference tables
@@ -528,18 +547,27 @@ def _build_jit_kernel_args(       # ← signature unchanged
         # ---- basis tables ------------------------------------------------
         if name.startswith("b_"):
             fld = name[2:]
-            args[name] = _basis_table(fld)
+            if pre_built is not None and pre_built.get("entity_kind") == "element" and "qp_phys" in pre_built:
+                args[name] = _basis_table_phys_union(fld)
+            else:
+                args[name] = _basis_table(fld)
 
         # ---- gradient tables ---------------------------------------------
         elif name.startswith("g_"):
             fld = name[2:]
-            args[name] = _grad_table(fld)
+            if pre_built is not None and pre_built.get("entity_kind") == "element" and "qp_phys" in pre_built:
+                args[name] = _grad_table_phys_union(fld)
+            else:
+                args[name] = _grad_table(fld)
 
         # ---- higher-order ξ-derivatives ----------------------------------
         elif re.match(r"d\d\d_", name):
             tag, fld = name.split("_", 1)
             ax, ay = int(tag[1]), int(tag[2])
-            args[name] = _deriv_table(fld, ax, ay)
+            if pre_built is not None and pre_built.get("entity_kind") == "element" and "qp_phys" in pre_built:
+                args[name] = _deriv_table_phys_union(fld, ax, ay)
+            else:
+                args[name] = _deriv_table(fld, ax, ay)
 
         # ---- constant arrays ---------------------------------------------
         elif name in const_arrays:
