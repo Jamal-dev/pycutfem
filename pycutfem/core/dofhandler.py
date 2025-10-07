@@ -2222,6 +2222,9 @@ class DofHandler:
                     Gref = Uloc.T @ dN                   # (2,2) in ref
                     Gphy = np.linalg.solve(Jg.T, Gref.T).T
                     F    = np.eye(2) + Gphy
+                    Jt = F @ Jg
+                    detJ[i, q] = float(np.linalg.det(Jt))
+                    J_inv[i, q, :, :] = np.linalg.inv(Jt)
                     # unit tangent: prefer rule's that; else rotate normal
                     if that is not None:
                         tau = that[i, q]
@@ -2332,6 +2335,7 @@ class DofHandler:
             "h_arr":       h_arr,
             "gdofs_map":   gdofs_map,
             "entity_kind": "element",
+            "qref":        np.stack((xi_tab, eta_tab), axis=-1),
             # side aliases (same element on both sides for dInterface)
             "J_inv_pos":   J_inv,
             "J_inv_neg":   J_inv,
@@ -3287,7 +3291,7 @@ class DofHandler:
 
         # ---------- per-element ragged accumulators ----------
         valid_eids = []
-        qp_blocks, qw_blocks, Jinv_blocks, phi_blocks = [], [], [], []
+        qp_blocks, qw_blocks, Jinv_blocks, det_blocks, qref_blocks, phi_blocks = [], [], [], [], [], []
         H0_blocks = [] if need_hess else None
         H1_blocks = [] if need_hess else None
         T0_blocks = [] if need_o3   else None
@@ -3316,7 +3320,7 @@ class DofHandler:
             elem = mesh.elements_list[eid]
 
             # per-element holders
-            xq_elem, wq_elem, Ji_elem, phi_elem = [], [], [], []
+            xq_elem, wq_elem, Ji_elem, det_elem, xi_eta_elem, phi_elem = [], [], [], [], [], []
             if need_hess:
                 H0_elem, H1_elem = [], []
             if need_o3:
@@ -3360,7 +3364,8 @@ class DofHandler:
                             w_eff = float(w) * det_t
 
                         # store
-                        xq_elem.append(y); wq_elem.append(w_eff); Ji_elem.append(Ji_use)
+                        xq_elem.append(y); wq_elem.append(w_eff); Ji_elem.append(Ji_use); det_elem.append(det_t)
+                        xi_eta_elem.append((float(xi), float(eta)))
                         phi_elem.append(float(phi_eval(level_set, y, eid=eid, mesh=mesh)))
 
                         # jets (inverse-geometry chains from reference xi,eta)
@@ -3398,7 +3403,9 @@ class DofHandler:
                         xi, eta = transform.inverse_mapping(mesh, eid, np.asarray(x_phys))
                         Jg  = transform.jacobian(mesh, eid, (float(xi), float(eta)))
 
+                        det_g = abs(float(np.linalg.det(Jg)))
                         if deformation is None:
+                            det_t = det_g
                             Ji_use = np.linalg.inv(Jg)
                             y = np.asarray(x_phys, float)
                             w_eff = float(w)  # already physical
@@ -3413,12 +3420,14 @@ class DofHandler:
                             det_g = abs(float(np.linalg.det(Jg))) + 1e-300
                             y = transform.x_mapping(mesh, eid, (float(xi), float(eta))) \
                                 + deformation.displacement_ref(eid, (float(xi), float(eta)))
-                            w_eff = float(w) * (det_t / det_g)
+                            w_eff = float(w) * (det_t/det_g)  # scale to true physical
 
                         # store
                         xq_elem.append(np.asarray(y, float))
                         wq_elem.append(w_eff)
                         Ji_elem.append(Ji_use)
+                        det_elem.append(det_t)
+                        xi_eta_elem.append((float(xi), float(eta)))
                         phi_elem.append(float(phi_eval(level_set, y, eid=eid, mesh=mesh)))
 
                         # jets at (xi,eta)
@@ -3447,6 +3456,8 @@ class DofHandler:
                 qp_blocks.append(np.vstack([np.asarray(p, float) for p in xq_elem]).reshape(-1, 2))
                 qw_blocks.append(np.asarray(wq_elem, float).reshape(-1))
                 Jinv_blocks.append(np.stack(Ji_elem, axis=0))
+                det_blocks.append(np.asarray(det_elem, float).reshape(-1))
+                qref_blocks.append(np.asarray(xi_eta_elem, float).reshape(-1, 2))
                 phi_blocks.append(np.asarray(phi_elem, float).reshape(-1))
                 if need_hess:
                     H0_blocks.append(np.stack(H0_elem, axis=0))
@@ -3490,6 +3501,8 @@ class DofHandler:
         qp_phys = np.zeros((nE, Qmax, 2), dtype=float)
         qw      = np.zeros((nE, Qmax),    dtype=float)
         J_inv   = np.zeros((nE, Qmax, 2, 2), dtype=float)
+        detJ    = np.zeros((nE, Qmax),    dtype=float)
+        qref    = np.zeros((nE, Qmax, 2), dtype=float)
         phis    = np.zeros((nE, Qmax), dtype=float)
         if need_hess:
             Hxi0 = np.zeros((nE, Qmax, 2, 2), dtype=float)
@@ -3506,6 +3519,8 @@ class DofHandler:
             qp_phys[i, :n, :]  = qp_blocks[i]
             qw[i, :n]          = qw_blocks[i]
             J_inv[i, :n, :, :] = Jinv_blocks[i]
+            detJ[i, :n]        = det_blocks[i]
+            qref[i, :n, :]     = qref_blocks[i]
             phis[i, :n]        = phi_blocks[i]
             if need_hess:
                 Hxi0[i, :n, :, :] = H0_blocks[i]
@@ -3523,7 +3538,8 @@ class DofHandler:
             "qp_phys":   qp_phys,
             "qw":        qw,                         # already physical
             "J_inv":     J_inv,
-            "detJ":      np.ones_like(qw),          # neutral; keep for uniformity
+            "detJ":      detJ,
+            "qref":      qref,
             "normals":   np.zeros_like(qp_phys),    # not used in volume terms
             "phis":      phis,
             "gdofs_map": np.asarray(gdofs_map, dtype=np.int64),

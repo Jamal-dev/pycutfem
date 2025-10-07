@@ -315,6 +315,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 # include level_set so 'phis' is present (may still be None)
                 geom_all = dof_handler.precompute_geometric_factors(qdeg, level_set, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4,
                                                                     deformation=getattr(intg.measure, 'deformation', None))
+                qref_all = geom_all.get("qp_ref")
+                if qref_all is not None:
+                    qref_slice = qref_all[full_ids] if getattr(qref_all, "ndim", 0) == 3 else qref_all
+                else:
+                    qref_slice = None
                 geom_full = {
                     "qp_phys": geom_all["qp_phys"][full_ids],
                     "qw":      geom_all["qw"][full_ids],
@@ -326,8 +331,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     "owner_id":  geom_all.get("owner_id", geom_all["eids"])[full_ids].astype(np.int32),
                     "entity_kind": "element",
                     "is_interface": False,
-                    "is_ghost": False
+                    "is_ghost": False,
                 }
+                if qref_slice is not None:
+                    geom_full["qref"] = qref_slice
                 gdofs_map_full = np.vstack([
                     dof_handler.get_elemental_dofs(e) for e in full_ids
                 ]).astype(np.int32)

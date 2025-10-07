@@ -3129,6 +3129,12 @@ class FormCompiler:
                                                       need_hess=need_hess, need_o3=need_o3, need_o4=need_o4,
                                                       deformation=deformation)
 
+            qref_all = geo_all.get("qp_ref")
+            if qref_all is not None:
+                qref_slice = qref_all[full_ids] if getattr(qref_all, "ndim", 0) == 3 else qref_all
+            else:
+                qref_slice = None
+
             # slice what the kernel signature expects
             prebuilt_full = {
                 "qp_phys": geo_all["qp_phys"][full_ids],
@@ -3146,6 +3152,8 @@ class FormCompiler:
                 "J_inv_pos": geo_all["J_inv"][full_ids],
                 "J_inv_neg": geo_all["J_inv"][full_ids],
             }
+            if qref_slice is not None:
+                prebuilt_full["qref"] = qref_slice
             _run_subset(full_ids, prebuilt_full)
 
         # --- 3) cut elements → clipped triangles (physical weights); detJ := 1

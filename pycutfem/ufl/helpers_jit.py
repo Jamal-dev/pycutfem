@@ -7,8 +7,7 @@ import re
 import pycutfem.jit.symbols as symbols
 from pycutfem.utils.bitset import BitSet
 from pycutfem.ufl.expressions import Restriction
-from pycutfem.fem.transform import element_Hxi   # new util
-# from pycutfem.ufl.helpers_jit import _find_all_bitsets
+from pycutfem.fem.transform import element_Hxi
 
 
 
@@ -153,33 +152,57 @@ def _build_jit_kernel_args(       # ← signature unchanged
         return len(dof_handler.get_elemental_dofs(int(eid)))
 
     def _basis_table_phys_union(field: str) -> np.ndarray:
-        """
-        Union-length basis at interface physical QPs.
-        Shape: (nE, nQ, n_union) where n_union == len(gdofs_map[e]).
-        """
+        """Union-length basis at interface physical QPs."""
+        key = f"b_{field}"
+        if pre_built is not None and key in pre_built:
+            return np.asarray(pre_built[key], dtype=np.float64)
+
         pts  = pre_built["qp_phys"]      # (nE, nQ, 2)
         eids = pre_built["eids"]         # (nE,)
         me   = mixed_element
         mesh = me.mesh
         nE, nQ, _ = pts.shape
-        # assume uniform union size across e (usual for mixed Qk)
         n_union = _n_union_for_eid(eids[0])
         tab = np.empty((nE, nQ, n_union), dtype=np.float64)
+
+        # Prefer cached reference coordinates if available to avoid inverse mapping
+        qref_raw = pre_built.get("qref")
+        if qref_raw is None:
+            qref_raw = pre_built.get("qp_ref")
+        qref_mode = None
+        if qref_raw is not None:
+            qref_arr = np.asarray(qref_raw, dtype=np.float64)
+            if qref_arr.ndim == 3 and qref_arr.shape[2] == 2:
+                qref_mode = ("per_element", qref_arr)
+            elif qref_arr.ndim == 2 and qref_arr.shape[1] == 2:
+                qref_mode = ("global", qref_arr)
+            else:
+                qref_mode = None
+        else:
+            qref_mode = None
+
         for i in range(nE):
             eid = int(eids[i])
             assert _n_union_for_eid(eid) == n_union, "Union length differs across elements."
             for q in range(nQ):
-                x, y = pts[i, q]
-                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
-                # NOTE: me.basis(field, ...) returns union-length, zero-padded across fields
+                if qref_mode is not None:
+                    mode, arr = qref_mode
+                    if mode == "per_element":
+                        xi, eta = arr[i, q]
+                    else:
+                        xi, eta = arr[q]
+                else:
+                    x, y = pts[i, q]
+                    xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
                 tab[i, q, :] = me.basis(field, float(xi), float(eta))
         return tab
 
     def _deriv_table_phys_union(field: str, ax: int, ay: int) -> np.ndarray:
-        """
-        Union-length reference derivatives at interface physical QPs.
-        Shape: (nE, nQ, n_union).
-        """
+        """Union-length derivative tables at interface physical QPs."""
+        key = f"d{ax}{ay}_{field}"
+        if pre_built is not None and key in pre_built:
+            return np.asarray(pre_built[key], dtype=np.float64)
+
         pts  = pre_built["qp_phys"]      # (nE, nQ, 2)
         eids = pre_built["eids"]         # (nE,)
         me   = mixed_element
@@ -187,20 +210,42 @@ def _build_jit_kernel_args(       # ← signature unchanged
         nE, nQ, _ = pts.shape
         n_union = _n_union_for_eid(eids[0])
         tab = np.empty((nE, nQ, n_union), dtype=np.float64)
+
+        qref_raw = pre_built.get("qref")
+        if qref_raw is None:
+            qref_raw = pre_built.get("qp_ref")
+        qref_mode = None
+        if qref_raw is not None:
+            qref_arr = np.asarray(qref_raw, dtype=np.float64)
+            if qref_arr.ndim == 3 and qref_arr.shape[2] == 2:
+                qref_mode = ("per_element", qref_arr)
+            elif qref_arr.ndim == 2 and qref_arr.shape[1] == 2:
+                qref_mode = ("global", qref_arr)
+            else:
+                qref_mode = None
+
         for i in range(nE):
             eid = int(eids[i])
             assert _n_union_for_eid(eid) == n_union, "Union length differs across elements."
             for q in range(nQ):
-                x, y = pts[i, q]
-                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
-                # NOTE: me.deriv_ref(...) returns union-length (mixed) derivative vector
+                if qref_mode is not None:
+                    mode, arr = qref_mode
+                    if mode == "per_element":
+                        xi, eta = arr[i, q]
+                    else:
+                        xi, eta = arr[q]
+                else:
+                    x, y = pts[i, q]
+                    xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
                 tab[i, q, :] = me.deriv_ref(field, float(xi), float(eta), int(ax), int(ay))
         return tab
+
     def _grad_table_phys_union(field: str) -> np.ndarray:
-        """
-        Union-length reference *gradient* tables at physical QPs.
-        Shape: (nE, nQ, n_union, 2) with components [∂/∂ξ, ∂/∂η].
-        """
+        """Union-length gradient tables at interface physical QPs."""
+        key = f"g_{field}"
+        if pre_built is not None and key in pre_built:
+            return np.asarray(pre_built[key], dtype=np.float64)
+
         pts  = pre_built["qp_phys"]      # (nE, nQ, 2)
         eids = pre_built["eids"]         # (nE,)
         me   = mixed_element
@@ -208,12 +253,33 @@ def _build_jit_kernel_args(       # ← signature unchanged
         nE, nQ, _ = pts.shape
         n_union = _n_union_for_eid(eids[0])
         tab = np.empty((nE, nQ, n_union, 2), dtype=np.float64)
+
+        qref_raw = pre_built.get("qref")
+        if qref_raw is None:
+            qref_raw = pre_built.get("qp_ref")
+        qref_mode = None
+        if qref_raw is not None:
+            qref_arr = np.asarray(qref_raw, dtype=np.float64)
+            if qref_arr.ndim == 3 and qref_arr.shape[2] == 2:
+                qref_mode = ("per_element", qref_arr)
+            elif qref_arr.ndim == 2 and qref_arr.shape[1] == 2:
+                qref_mode = ("global", qref_arr)
+            else:
+                qref_mode = None
+
         for i in range(nE):
             eid = int(eids[i])
             assert _n_union_for_eid(eid) == n_union, "Union length differs across elements."
             for q in range(nQ):
-                x, y = pts[i, q]
-                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+                if qref_mode is not None:
+                    mode, arr = qref_mode
+                    if mode == "per_element":
+                        xi, eta = arr[i, q]
+                    else:
+                        xi, eta = arr[q]
+                else:
+                    x, y = pts[i, q]
+                    xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
                 tab[i, q, :, :] = me.grad_basis(field, float(xi), float(eta))
         return tab
     def _decode_coeff_name(name: str):
@@ -309,7 +375,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
     base_allow = {
         # geometry / meta (unsided)
         "gdofs_map", "node_coords", "element_nodes",
-        "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
+        "qp_phys", "qref", "qp_ref", "qw", "detJ", "J_inv", "normals", "phis",
         "eids", "entity_kind",
         "owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids",
         "pos_map", "neg_map",
@@ -332,7 +398,10 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
     pre_built = {
         k: v for k, v in pre_built.items()
-        if (k in base_allow) or (k in needed) or (k in side_keys_present)
+        if (k in base_allow)
+        or (k in needed)
+        or (k in side_keys_present)
+        or k.startswith(("b_", "g_", "d", "r"))
     }
     args: Dict[str, Any] = dict(pre_built)
 
