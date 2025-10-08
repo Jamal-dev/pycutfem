@@ -9,9 +9,10 @@
 import numpy as np
 import time
 import scipy.sparse.linalg as sp_la
-import matplotlib.pyplot as plt
+# Matplotlib is imported lazily (only when plots are requested)
 import numba
 import os
+import argparse
 
 # --- Numba configuration ---
 try:
@@ -26,7 +27,7 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.fem.mixedelement import MixedElement
-from pycutfem.core.levelset import CircleLevelSet
+from pycutfem.core.levelset import CircleLevelSet, LevelSetMeshAdaptation
 from pycutfem.utils.domain_manager import get_domain_bitset
 
 # --- UFL-like imports ---
@@ -49,6 +50,36 @@ from pycutfem.ufl.compilers import FormCompiler
 # ============================================================================
 print("--- Setting up the Turek benchmark (2D-2) for flow around a cylinder ---")
 
+parser = argparse.ArgumentParser(description="CutFEM Turek benchmark (2D-2)")
+parser.add_argument("--with-deformation", action="store_true", help="enable isoparametric deformation for the cut geometry")
+parser.add_argument("--no-deformation", action="store_true", help="disable the deformation even if enabled elsewhere")
+parser.add_argument("--backend", choices=("python", "jit"), default="jit",
+                    help="form assembly backend (jit gives faster solves after compilation)")
+parser.add_argument("--plot", action="store_true", help="enable diagnostic plots (slower startup)")
+parser.add_argument("--clear-jit-cache", action="store_true", help="clear cached JIT kernels before running")
+
+args, _ = parser.parse_known_args()
+if args.with_deformation and args.no_deformation:
+    raise SystemExit("Choose at most one of --with-deformation or --no-deformation")
+
+with_deformation = args.with_deformation and not args.no_deformation
+print(f"with_deformation = {with_deformation}")
+print(f"backend = {args.backend}")
+
+# Optional plotting setup (imports deferred to save startup time when disabled)
+ENABLE_PLOTS = bool(args.plot)
+if ENABLE_PLOTS:
+    import matplotlib.pyplot as plt
+
+backend = args.backend
+
+if args.clear_jit_cache:
+    import shutil
+    cache_root = os.path.expanduser("~/.cache/pycutfem_jit")
+    if os.path.isdir(cache_root):
+        print("Clearing cached JIT kernels …")
+        shutil.rmtree(cache_root)
+
 # --- Geometry and Fluid Properties ---
 H = 0.41  # Channel height
 L = 2.2   # Channel length
@@ -58,7 +89,10 @@ rho = 1.0  # Density
 mu = 1e-3  # Viscosity
 U_mean = 1.0  # Mean inflow velocity
 Re = rho * U_mean * D / mu
+fe_order = 2
+geom_order = 2 if with_deformation else 1
 print(f"Reynolds number (Re): {Re:.2f}")
+print(f"Geometry order={geom_order}, FE order={fe_order}")
 
 
 # In[3]:
@@ -70,18 +104,26 @@ from pycutfem.utils.adaptive_mesh_ls_numba import structured_quad_levelset_adapt
 # A finer mesh is needed for this benchmark
 NX, NY = 25, 25
 # NX, NY = 30, 40
-poly_order = 2
-level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
+analytic_level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 )
 # h  = 0.5*(L/NX + H/NY)
 
 
 # nodes, elems, _, corners = structured_quad(L, H, nx=NX, ny=NY, poly_order=poly_order)
 
 nodes, elems, edges, corners = structured_quad_levelset_adaptive(
-        Lx=L, Ly=H, nx=NX, ny=NY, poly_order=poly_order,
+        Lx=L, Ly=H, nx=NX, ny=NY, poly_order=geom_order,
         level_set=CircleLevelSet(center=(c_x, c_y), radius=(D/2.0+0.2*D/2.0) ),
         max_refine_level=1)          # add a single halo, nothing else
-mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=poly_order)
+mesh = Mesh(nodes=nodes, element_connectivity=elems, elements_corner_nodes=corners, element_type="quad", poly_order=geom_order)
+
+deformation = None
+level_set = analytic_level_set
+volume_quadrature = 2 * fe_order + (4 if with_deformation else 2)
+
+if with_deformation:
+    adapter = LevelSetMeshAdaptation(mesh, order=max(2, geom_order), threshold=1.0, max_steps=6)
+    deformation = adapter.calc_deformation(analytic_level_set, q_vol=volume_quadrature)
+    level_set = adapter.lset_p1
 
 # ============================================================================
 #    2. BOUNDARY CONDITIONS
@@ -134,7 +176,10 @@ physical_domain = fluid_domain | cut_domain
 
 # --- Finite Element Space and DofHandler ---
 # Taylor-Hood elements (Q2 for velocity, Q1 for pressure)
-mixed_element = MixedElement(mesh, field_specs={'ux': 2, 'uy': 2, 'p': 1})
+mixed_element = MixedElement(
+    mesh,
+    field_specs={'ux': fe_order, 'uy': fe_order, 'p': 1, 'lm': ':number:'}
+)
 dof_handler = DofHandler(mixed_element, method='cg')
 # dof_handler.info()
 
@@ -150,7 +195,8 @@ print(f"Number of ghost edges (both): {mesh.edge_bitset('ghost_both').cardinalit
 
 
 # 1. Define the target point.
-target_point = np.array([1.5, 0.99 * H])
+# target_point = np.array([1.5, 0.99 * H])
+target_point = np.array([c_x, c_y])
 
 # 2. Get all node IDs that have a pressure DOF associated with them.
 p_dofs = dof_handler.get_field_slice('p')
@@ -182,14 +228,6 @@ print(f"Pinning pressure at the node closest to {target_point}, found at {actual
 # Tag velocity DOFs inside the cylinder (same tag name for both fields is OK)
 dof_handler.tag_dofs_from_element_bitset("inactive", "ux", "inside", strict=True)
 dof_handler.tag_dofs_from_element_bitset("inactive", "uy", "inside", strict=True)
-dof_handler.tag_dofs_from_element_bitset("inactive", "p", "inside", strict=True)
-
-bcs.append(BoundaryCondition('ux', 'dirichlet', 'inactive', lambda x, y: 0.0))
-bcs.append(BoundaryCondition('uy', 'dirichlet', 'inactive', lambda x, y: 0.0))
-bcs.append(BoundaryCondition('p', 'dirichlet', 'inactive', lambda x, y: 0.0))
-bcs_homog.append(BoundaryCondition('ux', 'dirichlet', 'inactive', lambda x, y: 0.0))
-bcs_homog.append(BoundaryCondition('uy', 'dirichlet', 'inactive', lambda x, y: 0.0))
-bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'inactive', lambda x, y: 0.0))
 
 
 # In[7]:
@@ -208,10 +246,20 @@ for name, bitset in mesh._edge_bitsets.items():
 # In[8]:
 
 
-from pycutfem.io.visualization import plot_mesh_2
-fig, ax = plt.subplots(figsize=(15, 30))
-plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True, 
-              plot_nodes=False, elem_tags=False, edge_colors=True, plot_interface=False,resolution=300)
+if ENABLE_PLOTS:
+    from pycutfem.io.visualization import plot_mesh_2
+    fig, ax = plt.subplots(figsize=(10, 6))
+    plot_mesh_2(
+        mesh,
+        ax=ax,
+        level_set=level_set,
+        show=True,
+        plot_nodes=False,
+        elem_tags=False,
+        edge_colors=True,
+        plot_interface=False,
+        resolution=200,
+    )
 
 
 # In[9]:
@@ -227,33 +275,39 @@ velocity_space = FunctionSpace(name="velocity", field_names=['ux', 'uy'],dim=1)
 pressure_space = FunctionSpace(name="pressure", field_names=['p'], dim=0)
 
 # Trial and Test functions
-du = VectorTrialFunction(space=velocity_space, dof_handler=dof_handler)
-dp = TrialFunction(name='trial_pressure', field_name='p', dof_handler=dof_handler)
-v = VectorTestFunction(space=velocity_space, dof_handler=dof_handler)
-q = TestFunction(name='test_pressure', field_name='p', dof_handler=dof_handler)
+du = VectorTrialFunction(space=velocity_space, dof_handler=dof_handler, side = '+')
+dp = TrialFunction(name='trial_pressure', field_name='p', dof_handler=dof_handler, side = '+')
+v = VectorTestFunction(space=velocity_space, dof_handler=dof_handler, side = '+')
+q = TestFunction(name='test_pressure', field_name='p', dof_handler=dof_handler, side = '+')
+nL = TrialFunction(name='nL', field_name='lm', dof_handler=dof_handler)
+mL = TestFunction(name='mL', field_name='lm', dof_handler=dof_handler)
 
 # Solution functions at current (k) and previous (n) time steps
-u_k = VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler)
-p_k = Function(name="p_k", field_name='p', dof_handler=dof_handler)
-u_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handler)
-p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler)
+u_k = VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler, side = '+')
+p_k = Function(name="p_k", field_name='p', dof_handler=dof_handler, side = '+')
+u_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handler, side = '+')
+p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler, side = '+')
+lambda_k = Function(name="lambda_k", field_name='lm', dof_handler=dof_handler)
+lambda_n = Function(name="lambda_n", field_name='lm', dof_handler=dof_handler)
 
 # --- Parameters ---
 dt = Constant(0.5)
-theta = Constant(1.0) # Crank-Nicolson
+theta = Constant(0.5) # Crank-Nicolson
 mu_const = Constant(mu)
 rho_const = Constant(rho)
 
 u_k.nodal_values.fill(0.0); p_k.nodal_values.fill(0.0)
 u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
-dof_handler.apply_bcs(bcs, u_n, p_n)
-dof_handler.apply_bcs(bcs, u_k, p_k)
+lambda_k.nodal_values.fill(0.0); lambda_n.nodal_values.fill(0.0)
+dof_handler.apply_bcs(bcs, u_n, p_n, lambda_n)
+dof_handler.apply_bcs(bcs, u_k, p_k, lambda_k)
 
 
 # In[10]:
 
 
-u_n.plot()
+if ENABLE_PLOTS:
+    u_n.plot()
 
 
 # In[11]:
@@ -315,9 +369,22 @@ def make_peak_filter_cb(
     # 2) Coordinates and φ at DOFs (handler-driven, not mesh ids)
     # -----------------------------------------------------------
     # all DOF coords aligned with global DOF index
-    all_coords = dh.get_all_dof_coords()             # shape (total_dofs, 2)  :contentReference[oaicite:11]{index=11}
-    # φ evaluated vectorised (CircleLevelSet etc. support array input)
-    phi_all = level_set(all_coords)
+    all_coords = dh.get_all_dof_coords()             # shape (total_dofs, 2)
+
+    def _eval_phi(points):
+        pts = np.asarray(points, dtype=float)
+        if pts.ndim == 1:
+            return np.array([float(level_set(pts))], dtype=float)
+        try:
+            vals = level_set(pts)
+            arr = np.asarray(vals, dtype=float)
+            if arr.shape == (pts.shape[0],):
+                return arr
+        except TypeError:
+            pass
+        return np.array([float(level_set(pt)) for pt in pts], dtype=float)
+
+    phi_all = np.asarray(_eval_phi(all_coords), dtype=float).reshape(-1)
 
     # -----------------------------------------------------------
     # 3) Per-DOF h: mean element char length over adjacent elems
@@ -425,7 +492,7 @@ def make_peak_filter_cb(
 # In[13]:
 
 
-from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict, Hessian
+from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict, Hessian, Pos
 from pycutfem.core.geometry import hansbo_cut_ratio
 from pycutfem.ufl.expressions import ElementWiseConstant
 
@@ -441,13 +508,18 @@ def _dn(expr):
 
 def grad_inner(u, v):
     """⟨∂ₙu, ∂ₙv⟩  (scalar or 2‑D vector)."""
-    if getattr(u, "num_components", 1) == 1:      # scalar
+    if u.num_components == 1:      # scalar
         return _dn(u) * _dn(v)
 
     if u.num_components == v.num_components == 2: # vector
         return _dn(u[0]) * _dn(v[0]) + _dn(u[1]) * _dn(v[1])
 
     raise ValueError("grad_inner supports only scalars or 2‑D vectors.")
+def grad_inner_jump(u, v):
+    """⟨∂ₙu, ∂ₙv⟩  (scalar or 2‑D vector)."""
+    a = dot(jump(grad(u)), n)
+    b = dot(jump(grad(v)), n)
+    return inner(a, b)
 
 # def hessian_inner(u, v):
 #     if getattr(u, "num_components", 1) == 1:      # scalar
@@ -477,16 +549,35 @@ def nHn(expr,n):
 
 
 ghost_edges_used = mesh.edge_bitset('ghost_pos') | mesh.edge_bitset('ghost_both') | mesh.edge_bitset('interface')
-dx_phys  = dx(defined_on=physical_domain, 
-              level_set=level_set,            # the cylinder level set
-              metadata   = {"q": 6, "side": "+"} # integrate only φ>0 (positive side)
-    )
-dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":6,'derivs': {(0,0),(0,1),(1,0)}})   # interior surface
-dG       = dGhost(defined_on=ghost_edges_used, level_set=level_set,metadata={"q":7,'derivs': {(0,0),(0,1),(1,0),(2,0),(0,2),(1,1)}})  # ghost surface
+dx_phys  = dx(
+    defined_on=physical_domain,
+    level_set=level_set,
+    metadata={"q": volume_quadrature, "side": "+"},
+    deformation=deformation,
+)
+dΓ        = dInterface(
+    defined_on=mesh.element_bitset('cut'),
+    level_set=level_set,
+    metadata={"q": volume_quadrature, 'derivs': {(0, 0), (0, 1), (1, 0)}},
+    deformation=deformation,
+)
+dG       = dGhost(
+    defined_on=ghost_edges_used,
+    level_set=analytic_level_set,
+    metadata={"q": volume_quadrature + 1, 'derivs': {(0, 0), (0, 1), (1, 0)}},
+)
+
+u_trial_phys = restrict(du, physical_domain)
+v_test_phys = restrict(v, physical_domain)
+p_trial_phys = restrict(dp, physical_domain)
+q_test_phys = restrict(q, physical_domain)
+u_k_phys = restrict(u_k, physical_domain)
+p_k_phys = restrict(p_k, physical_domain)
+u_n_phys = restrict(u_n, physical_domain)
 
 cell_h  = CellDiameter() # length‑scale per element
-beta_N  = Constant(20.0 * poly_order**2)      # Nitsche penalty (tweak)
-def scaled_penalty_interface(penalty,poly_order =poly_order,
+beta_N  = Constant(20.0 * fe_order**2)      # Nitsche penalty (tweak)
+def scaled_penalty_interface(penalty, poly_order=fe_order,
                              side='+'):
     # 1) Hansbo factor — this is a *numpy array*, one value per element
     beta0_val  = penalty * poly_order**2
@@ -508,37 +599,31 @@ def epsilon(u):
 
 
 
-def sigma_dot_n_v(u_vec, p_scal,v_test,n):
+def sigma_dot_n_v(u_vec, p_scal, v_test, normal):
     """
     Expanded form of (σ(u, p) · n) without using the '@' operator.
 
         σ(u, p)·n = μ (∇u + ∇uᵀ)·n  −  p n
     """
     # first term: μ (∇u)·n
-    a = dot(grad(u_vec), n)
+    a = dot(grad(u_vec), normal)
     # second term: μ (∇uᵀ)·n
-    b = dot(grad(u_vec).T, n)
+    b = dot(grad(u_vec).T, normal)
     # combine and subtract pressure part
-    return  mu * dot((a + b),v_test) - p_scal * dot(v_test,n)         # vector of size 2
+    return mu_const * dot((a + b), v_test) - p_scal * dot(v_test, normal)
 
 # --- Jacobian contribution on Γsolid --------------------------------
 J_int = (
-    - sigma_dot_n_v(du, dp, v,n_f)           # consistency
-    - sigma_dot_n_v(v, q, du,n_f)           # symmetry
-    # + beta_N  / cell_h * dot(du, v)     # penalty
-    # - dot(du,n) * q
-    # + beta_N/ cell_h * dot(du,n) * dot(v,n)     # penalty
-    + β  * dot(du, v)     # penalty
+    - sigma_dot_n_v(Pos(u_trial_phys), Pos(p_trial_phys), Pos(v_test_phys), n_f)
+    - sigma_dot_n_v(Pos(v_test_phys), Pos(q_test_phys), Pos(u_trial_phys), n_f)
+    + β * dot(Pos(u_trial_phys), Pos(v_test_phys))
 ) * dΓ
 
 # --- Residual contribution on Γsolid --------------------------------
 R_int = (
-    - sigma_dot_n_v(u_k, p_k, v,n_f)
-    - sigma_dot_n_v(v, q, u_k,n_f)
-    # + beta_N  / cell_h * dot(u_k, v)
-    # - dot(u_k,n) * q
-    # + beta_N/ cell_h * dot(u_k,n) * dot(v,n)
-    + β  * dot(u_k, v)  
+    - sigma_dot_n_v(Pos(u_k_phys), Pos(p_k_phys), Pos(v_test_phys), n_f)
+    - sigma_dot_n_v(Pos(v_test_phys), Pos(q_test_phys), Pos(u_k_phys), n_f)
+    + β * dot(Pos(u_k_phys), Pos(v_test_phys))
 ) * dΓ
 
 # volume ------------------------------------------------------------
@@ -550,22 +635,27 @@ R_int = (
 
 # r_vol = restrict(( rho*dot(u_k-u_n, v)/dt
 #           + theta*rho*dot(dot(grad(u_k), u_k), v)
-#           + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
-#           + theta*mu*inner(grad(u_k), grad(v))
-#           + (1-theta)*mu*inner(grad(u_n), grad(v))
-#           - p_k*div(v) + q*div(u_k) ),physical_domain) * dx_phys
-a_vol = ( rho*dot(du,v)/dt
-          + theta*rho*dot(dot(grad(u_k), du), v)
-          + theta*rho*dot(dot(grad(du), u_k), v)
-          + 2 * theta*mu*inner(epsilon(du), epsilon(v))
-          - dp*div(v) + q*div(du) ) * dx_phys
+a_vol = (
+    rho_const * dot(u_trial_phys, v_test_phys) / dt
+    + theta * rho_const * dot(dot(grad(u_k_phys), u_trial_phys), v_test_phys)
+    + theta * rho_const * dot(dot(grad(u_trial_phys), u_k_phys), v_test_phys)
+    + 2 * theta * mu_const * inner(epsilon(u_trial_phys), epsilon(v_test_phys))
+    - p_trial_phys * div(v_test_phys)
+    + q_test_phys * div(u_trial_phys)
+) * dx_phys
 
-r_vol = ( rho*dot(u_k-u_n, v)/dt
-          + theta*rho*dot(dot(grad(u_k), u_k), v)
-          + (1-theta)*rho*dot(dot(grad(u_n), u_n), v)
-          + 2 * theta*mu*inner(epsilon(u_k), epsilon(v))
-          + 2 * (1-theta)*mu*inner(epsilon(u_n), epsilon(v))
-          - p_k*div(v) + q*div(u_k) ) * dx_phys
+r_vol = (
+    rho_const * dot(u_k_phys - u_n_phys, v_test_phys) / dt
+    + theta * rho_const * dot(dot(grad(u_k_phys), u_k_phys), v_test_phys)
+    + (1 - theta) * rho_const * dot(dot(grad(u_n_phys), u_n_phys), v_test_phys)
+    + 2 * theta * mu_const * inner(epsilon(u_k_phys), epsilon(v_test_phys))
+    + 2 * (1 - theta) * mu_const * inner(epsilon(u_n_phys), epsilon(v_test_phys))
+    - p_k_phys * div(v_test_phys)
+    + q_test_phys * div(u_k_phys)
+) * dx_phys
+
+a_vol += (nL * q_test_phys + mL * p_trial_phys) * dx_phys
+r_vol += (mL * p_k_phys + lambda_k * q_test_phys) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
 penalty_val = 1e-3
@@ -577,18 +667,18 @@ gamma_p  = Constant(penalty_val )
 gamma_p_grad = Constant(penalty_grad )
 gamma_v_hess = Constant(penalty_hess )
 
-stab = ( gamma_v  / cell_h   * dot(jump(u_k), jump(v))
-       + gamma_v_grad * cell_h   * grad_inner(jump(u_k), jump(v))
+stab = ( gamma_v  / cell_h   * dot(jump(u_k_phys), jump(v_test_phys))
+       + gamma_v_grad * cell_h   * grad_inner_jump(u_k_phys, v_test_phys)
         #  + gamma_v_hess * cell_h**3.0/4.0   * inner(nHn(jump(u_k),n), nHn(jump(v),n))
     #    + gamma_p  / cell_h   * jump(p_k) * jump(q)  # Note: use * for scalars, see issue 2
-       + gamma_p_grad * cell_h**3.0   * grad_inner(jump(p_k), jump(q)) 
+    #    + gamma_p_grad * cell_h**3.0   * grad_inner(jump(p_k_phys), jump(q_test_phys)) 
        ) * dG
 
-stab_lin  = ( gamma_v  / cell_h   * dot(jump(du),  jump(v)) +
-             gamma_v_grad * cell_h   * grad_inner(jump(du),  jump(v)) 
+stab_lin  = ( gamma_v  / cell_h   * dot(jump(u_trial_phys),  jump(v_test_phys)) 
+            +  gamma_v_grad * cell_h   * grad_inner_jump(u_trial_phys, v_test_phys) 
         #    + gamma_v_hess * cell_h**3.0/4.0   * inner(nHn(jump(du),n), nHn(jump(v),n))
         #    +  gamma_p  / cell_h   * jump(dp) *  jump(q)
-            + gamma_p_grad * cell_h**3.0   * grad_inner(jump(dp),  jump(q))
+            # + gamma_p_grad * cell_h**3.0   * grad_inner(jump(p_trial_phys),  jump(q_test_phys))
             )   * dG
 # complete Jacobian and residual -----------------------------------
 jacobian_form  = a_vol + J_int + stab_lin
@@ -612,7 +702,7 @@ residual_form  = r_vol + R_int + stab
 # In[15]:
 
 
-get_ipython().system('rm -rf ~/.cache/pycutfem_jit/*')
+# get_ipython().system('rm -rf ~/.cache/pycutfem_jit/*')
 
 
 # In[16]:
@@ -769,7 +859,7 @@ def save_solution(funcs):
     # ------------------ Log / store ----------------------------------------
     print(f"[step {step_counter:4d}]  FD={F_D:.6e}  FL={F_L:.6e}  "
           f"CD={C_D:.6f}  CL={C_L:.6f}  Δp={dp:.6f}")
-    if step_counter % 2 == 0:
+    if ENABLE_PLOTS and step_counter % 2 == 0:
         orig_u_k_func.plot(field = 'ux',
                       title=f"Velocity Ux at step {step_counter}",
                       xlabel='X-Axis', ylabel='Y-Axis',
@@ -784,7 +874,7 @@ def save_solution(funcs):
 
     step_counter += 1
 
-save_solution([u_k, p_k])
+save_solution([u_k, p_k, lambda_k])
 
 
 
@@ -797,7 +887,7 @@ from pycutfem.solvers.nonlinear_solver import (NewtonSolver,
                                                AdamNewtonSolver,
                                                PetscSnesNewtonSolver)
 from pycutfem.solvers.aainhb_solver import AAINHBSolver           # or get_solver("aainhb")
-
+import time
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
 time_params = TimeStepperParameters(dt=dt.value,max_steps=50 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
@@ -810,6 +900,7 @@ post_cb = make_peak_filter_cb(
     tau=5.0,
     skip_dofs=dirichlet_dofs
 )
+t0 = time.time()
 
 solver = NewtonSolver(
     residual_form, jacobian_form,
@@ -818,8 +909,12 @@ solver = NewtonSolver(
     bcs=bcs, bcs_homog=bcs_homog,
     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
     postproc_timeloop_cb=save_solution,
+    backend=backend,
+    deformation=deformation,
     # preproc_cb=post_cb,  # Optional: peak filter callback
 )
+t1 = time.time()
+print(f"Solver setup time: {t1 - t0:.2f} seconds")
 # Unconstrained Newton (fast, robust)
 # solver = PetscSnesNewtonSolver(
 #     residual_form, jacobian_form,
@@ -893,8 +988,8 @@ solver = NewtonSolver(
 #     bounds_by_field={"ux": (-Ucap, Ucap), "uy": (-Ucap, Ucap)},
 # )
 # primary unknowns
-functions      = [u_k, p_k]
-prev_functions = [u_n, p_n]
+functions      = [u_k, p_k, lambda_k]
+prev_functions = [u_n, p_n, lambda_n]
 # solver = AdamNewtonSolver(
 #     residual_form, jacobian_form,
 #     dof_handler=dof_handler,
@@ -941,40 +1036,45 @@ def vi_clip(step, bcs_now, funs, prev_funs):
     vi._snes.setTolerances(*old)
 
 
-
+t2 = time.time()
 solver.solve_time_interval(functions=functions,
                            prev_functions= prev_functions,
                            time_params=time_params,
                            # post_step_refiner=vi_clip
                            )
+t3 = time.time()
+print(f"Total solve time: {t3 - t2:.2f} seconds")
+print(f"Total setup + solve time: {t3 - t0:.2f} seconds")
 
 
 # In[ ]:
 
 
-offset = 5
-plt.plot(histories["cd"][offset:], label="C_D", marker='o')
-plt.ylabel('C_D')
-plt.figure()
-plt.plot(histories["cl"][offset:], label="C_L", marker='o')
-plt.ylabel('C_L')
-plt.figure()
-plt.plot(histories["dp"][offset:], label="Δp", marker='o')
-plt.ylabel('Δp')
+if ENABLE_PLOTS:
+    offset = 5
+    plt.plot(histories["cd"][offset:], label="C_D", marker='o')
+    plt.ylabel('C_D')
+    plt.figure()
+    plt.plot(histories["cl"][offset:], label="C_L", marker='o')
+    plt.ylabel('C_L')
+    plt.figure()
+    plt.plot(histories["dp"][offset:], label="Δp", marker='o')
+    plt.ylabel('Δp')
 
 
 # In[ ]:
 
 
-u_n.plot(kind="contour",mask =fluid_domain,
-         title="Turek-Schafer",
-         xlabel='X-Axis', ylabel='Y-Axis',
-         levels=100, cmap='jet')
+if ENABLE_PLOTS:
+    u_n.plot(kind="contour",mask =fluid_domain,
+             title="Turek-Schafer",
+             xlabel='X-Axis', ylabel='Y-Axis',
+             levels=100, cmap='jet')
 
 
 # In[ ]:
 
 
-p_n.plot(
-         title="Pressure",mask =fluid_domain)
-
+if ENABLE_PLOTS:
+    p_n.plot(
+             title="Pressure",mask =fluid_domain)

@@ -286,6 +286,11 @@ class NewtonSolver:
         newton_params: NewtonParameters = NewtonParameters(),
         lin_params: LinearSolverParameters = LinearSolverParameters(),
         quad_order: int = 6,
+        deformation: Optional[object] = None,
+        # callback returning the updated nodal displacement array given the
+        # coefficient dictionary used for assembly. Returning ``None`` skips
+        # geometry refresh for that call.
+        deformation_update: Optional[Callable[[Dict[str, object]], np.ndarray]] = None,
         preproc_cb: Optional[Callable[[List], None]] = None,
         postproc_cb: Optional[Callable[[List], None]] = None,
         backend: str = "jit",
@@ -300,25 +305,17 @@ class NewtonSolver:
         self.pre_cb = preproc_cb
         self.post_cb = postproc_cb
         self.post_timeloop_cb = postproc_timeloop_cb
+        self.backend = backend
+        self.quad_order = quad_order
+        self.deformation = deformation
+        self._deformation_update = deformation_update
 
         # Keep original forms handy (their .integrand is needed later)
         self._residual_form = residual_form
         self._jacobian_form = jacobian_form
 
         # --- compile one kernel list for K, one for F ----------------------
-        self.kernels_K = compile_multi(        # Jacobian
-                jacobian_form,
-                dof_handler   = self.dh,
-                mixed_element = self.me,
-                backend       = backend,
-        )
-
-        self.kernels_F = compile_multi(        # Residual
-                residual_form,
-                dof_handler   = self.dh,
-                mixed_element = self.me,
-                backend       = backend,
-        )
+        self._compile_all_kernels()
         # --- NEW: A PRIORI DOF ANALYSIS ---
         # Analyze the forms once to get the definitive set of active DOFs.
         self.equation = Equation(jacobian_form, residual_form)
@@ -362,6 +359,52 @@ class NewtonSolver:
 
 
 
+
+    def _compile_all_kernels(self) -> None:
+        """(Re)compile residual and Jacobian kernels with current metadata."""
+        self.kernels_K = compile_multi(
+            self._jacobian_form,
+            dof_handler=self.dh,
+            mixed_element=self.me,
+            quad_order=self.quad_order,
+            backend=self.backend,
+        )
+
+        self.kernels_F = compile_multi(
+            self._residual_form,
+            dof_handler=self.dh,
+            mixed_element=self.me,
+            quad_order=self.quad_order,
+            backend=self.backend,
+        )
+
+        self._pattern_stale = True
+        self._last_jacobian = None
+        for attr in ("_csr_indptr", "_csr_indices", "_elem_pos", "_elem_lidx"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+    def _maybe_refresh_deformation(self, coeffs: Dict[str, object]) -> None:
+        if self.deformation is None or self._deformation_update is None:
+            return
+
+        disp = self._deformation_update(coeffs)
+        if disp is None:
+            return
+
+        disp_arr = np.asarray(disp, dtype=float)
+        target = self.deformation.node_displacements
+        if disp_arr.shape != target.shape:
+            raise ValueError(
+                "deformation_update returned displacements with shape "
+                f"{disp_arr.shape}, expected {target.shape}"
+            )
+
+        if np.allclose(disp_arr, target):
+            return
+
+        np.copyto(target, disp_arr)
+        self._compile_all_kernels()
 
         
     # ------------------------------------------------------------------
@@ -507,6 +550,8 @@ class NewtonSolver:
                 self.full_to_red = -np.ones(ndof, dtype=int)
                 self.full_to_red[self.active_dofs] = np.arange(self.active_dofs.size, dtype=int)
                 self.red_to_full = self.active_dofs
+                self._pattern_stale = True
+                self.restrictor = _ActiveReducer(self.dh, self.active_dofs)
                 # rebuild reduced CSR scatter pattern
                 self._build_reduced_pattern()
                 # re-assemble on the cleaned support
@@ -609,6 +654,7 @@ class NewtonSolver:
     #  Reduced Linear system & BC handling
     # ------------------------------------------------------------------
     def _assemble_system_reduced(self, coeffs, *, need_matrix: bool = True):
+        self._maybe_refresh_deformation(coeffs)
         nred = len(self.active_dofs)
         if need_matrix:
             A_red, R_red = self._assemble_system_reduced_fast(coeffs)
@@ -638,6 +684,7 @@ class NewtonSolver:
           enforces homogeneous Dirichlet rows in *R* so that line‑search
           evaluations are meaningful.
         """
+        self._maybe_refresh_deformation(coeffs)
         dh   = self.dh
         ndof = dh.total_dofs
 
@@ -834,6 +881,9 @@ class NewtonSolver:
         - self._elem_lidx : per-kernel list of [ per-element local active idx ]
         """
 
+        if getattr(self, "_pattern_stale", True) is False and hasattr(self, "_csr_indptr"):
+            return
+
         n = len(self.active_dofs)
         if n == 0:
             # degenerate case; keep minimal structures
@@ -841,6 +891,7 @@ class NewtonSolver:
             self._csr_indices = np.zeros(0, dtype=np.int32)
             self._elem_pos = [[] for _ in self.kernels_K]
             self._elem_lidx = [[] for _ in self.kernels_K]
+            self._pattern_stale = False
             return
 
         # 1) Collect column sets per reduced row
@@ -904,6 +955,8 @@ class NewtonSolver:
             self._elem_pos.append(pos_list)
             self._elem_lidx.append(lidx_list)
 
+        self._pattern_stale = False
+
 
     def _assemble_system_reduced_fast(self, coeffs):
         """
@@ -911,6 +964,9 @@ class NewtonSolver:
         per-element scatter plans from _build_reduced_pattern().
         Returns: (A_csr, R)
         """
+
+        if getattr(self, "_pattern_stale", True):
+            self._build_reduced_pattern()
 
         indptr, indices = self._csr_indptr, self._csr_indices
         n = indptr.size - 1
@@ -1149,7 +1205,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
         comm = PETSc.COMM_WORLD
 
         # Ensure we have the reduced pattern/active dofs
-        if not hasattr(self, "_csr_indptr"):
+        if getattr(self, "_pattern_stale", True) or not hasattr(self, "_csr_indptr"):
             self._build_reduced_pattern()
 
         # Apply BCs to the current iterate and form the reduced initial guess
@@ -1722,4 +1778,24 @@ class AdamNewtonSolver(NewtonSolver):
         print("        Line search failed – no descent direction.")
         return np.zeros_like(S)  # Signal failure to the caller
 
+    def _maybe_refresh_deformation(self, coeffs: Dict[str, object]) -> None:
+        if self.deformation is None or self._deformation_update is None:
+            return
 
+        disp = self._deformation_update(coeffs)
+        if disp is None:
+            return
+
+        disp_arr = np.asarray(disp, dtype=float)
+        target = self.deformation.node_displacements
+        if disp_arr.shape != target.shape:
+            raise ValueError(
+                "deformation_update returned displacements with shape "
+                f"{disp_arr.shape}, expected {target.shape}"
+            )
+
+        if np.allclose(disp_arr, target):
+            return
+
+        np.copyto(target, disp_arr)
+        self._compile_all_kernels()

@@ -269,10 +269,9 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     for e in range(mesh.n_elements)
                 ]).astype(np.int32)
 
+                if "eids" not in geom:
+                    geom["eids"] = np.arange(mesh.n_elements, dtype=np.int32)
                 static = {"gdofs_map": gdofs_map, **geom}
-                # Safety: ensure 'eids' exists (older helpers might omit it)
-                if "eids" not in static:
-                    static["eids"] = np.arange(mesh.n_elements, dtype=np.int32)
 
                 static.update(_build_jit_kernel_args(
                     ir, intg.integrand, mixed_element, qdeg,
@@ -335,13 +334,12 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 }
                 if qref_slice is not None:
                     geom_full["qref"] = qref_slice
+                geom_full["eids"] = full_ids
                 gdofs_map_full = np.vstack([
                     dof_handler.get_elemental_dofs(e) for e in full_ids
                 ]).astype(np.int32)
 
                 static_full = {"gdofs_map": gdofs_map_full, **geom_full}
-                # IMPORTANT: provide 'eids' for the scatter step
-                static_full = {"gdofs_map": gdofs_map_full, "eids": full_ids, **geom_full}
                 static_full.update(_build_jit_kernel_args(
                     ir, intg.integrand, mixed_element, qdeg,
                     dof_handler=dof_handler,

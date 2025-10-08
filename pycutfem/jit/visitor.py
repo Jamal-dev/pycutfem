@@ -175,7 +175,16 @@ class IRGenerator:
         
         if isinstance(node, Derivative):
             operand = node.f
+            while isinstance(operand, Restriction):
+                operand = operand.operand
             deriv_order = node.order
+
+            if isinstance(operand, Pos):
+                self._visit(Derivative(operand.operand, *deriv_order), side='+')
+                return
+            if isinstance(operand, Neg):
+                self._visit(Derivative(operand.operand, *deriv_order), side='-')
+                return
 
             # --- SPECIAL CASE: Derivative of a Jump ---
             # This is the key to handling [[D(u)]] = D(u_pos) - D(u_neg).
@@ -207,6 +216,9 @@ class IRGenerator:
             return
 
         # --- 4. Leaf Nodes ---
+        while isinstance(node, Restriction):
+            node = node.operand
+
         if isinstance(node, (TestFunction, TrialFunction, Function, VectorTestFunction, VectorTrialFunction, VectorFunction)):
             is_vec = isinstance(node, (VectorTestFunction, VectorTrialFunction, VectorFunction))
             role = 'test' if getattr(node, 'is_test', False) else 'trial' if getattr(node, 'is_trial', False) else 'function'

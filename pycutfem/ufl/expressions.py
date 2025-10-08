@@ -195,6 +195,7 @@ class Function(Expression):
     is_function = True
     is_trial = False
     is_test = False
+    num_components = 1
     def __init__(self, name: str, field_name: str, dof_handler: 'DofHandler' = None,
                  parent_vector: 'VectorFunction' = None, 
                  component_index: int = None, side: str = ""):
@@ -400,6 +401,7 @@ class VectorFunction(Expression):
                  dof_handler: 'DofHandler'=None, side: str = ""):
         super().__init__()
         self.name = name; self.field_names = field_names; self._dh = dof_handler
+        self.num_components = len(field_names)
         self.dim = 1
         self.parent_name = ""
         # --- Side metadata for vector-valued functions ---
@@ -805,6 +807,7 @@ class TrialFunction(Function):
     is_trial = True
     is_test = False
     is_function = False
+    num_components = 1
     def __init__(self, field_name: str,dof_handler: 'DofHandler' = None,
                  parent_vector: 'VectorFunction' = None, 
                  component_index: int = None, name: str = None, side: str = ""):
@@ -835,6 +838,7 @@ class TestFunction(Function):
     is_test = True
     is_trial = False
     is_function = False
+    num_components = 1
     def __init__(self, field_name: str,dof_handler: 'DofHandler' = None,
                  parent_vector: 'VectorFunction' = None, 
                  component_index: int = None, name: str = None,
@@ -917,6 +921,7 @@ class VectorTrialFunction(Expression):
     def __init__(self, space, dof_handler: 'DofHandler'=None, side: str = ""): # space: FunctionSpace
         self.space = space
         self.field_names = space.field_names
+        self.num_components = len(space.field_names)
         self.side = getattr(space, "side", "") if side == "" else side
         self.components = [
             TrialFunction(name=f"{space.name}_{fn}",field_name = fn, dof_handler=dof_handler, 
@@ -945,6 +950,7 @@ class VectorTestFunction(Expression):
     def __init__(self, space, dof_handler=None, side: str = ""): # space: FunctionSpace
         self.space = space
         self.field_names = space.field_names
+        self.num_components = len(space.field_names)
         self.side = getattr(space, "side", "") if side == "" else side
         self.components = [
             TestFunction(name=f"{space.name}_{fn}", 
@@ -1148,6 +1154,7 @@ class Jump(Expression):
         self.is_function = getattr(u_on_pos, "is_function", False)
         self.is_trial    = getattr(u_on_pos, "is_trial",    False)
         self.is_test     = getattr(u_on_pos, "is_test",     False)
+        # self.num_components = u_on_pos.num_components
   
 
     def __repr__(self):
@@ -1212,6 +1219,7 @@ class Restriction(Expression):
         self.is_function = getattr(operand, "is_function", False)
         self.is_trial    = getattr(operand, "is_trial",    False)
         self.is_test     = getattr(operand, "is_test",     False)
+        self.num_components = getattr(operand, "num_components", 1)
 
     def __repr__(self):
         return f"Restriction({self.operand!r}, '{self.domain}')"
