@@ -22,6 +22,7 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.measures import *
 from pycutfem.ufl.forms import Equation, assemble_form
+import os
 
 
 
@@ -65,6 +66,8 @@ def _ghost_ctx(dh, fields, edge, pos_eid, neg_eid, level_set):
         "x_phys": xq,
         "phi_val": float(level_set(xq)),   # the compiler sets this too
         "basis_values": basis_values,
+        "is_ghost": True,
+        "is_interface": False,
 
         # union-of-neighbors layout + maps
         "global_dofs": global_dofs,
@@ -336,7 +339,8 @@ def test_jit_python_parity(mini_interface_setup, term):
 
 # ------------------------------ Ghost-edge tests ------------------------------
 
-def test_ghost_pos_and_neg_on_own_fields(setup_multifield_environment):
+@pytest.mark.parametrize("backend", ["python", "jit"])
+def test_ghost_pos_and_neg_on_own_fields(setup_multifield_environment, backend):
     """
     On a ghost edge:
       Pos(u_pos)(xq) == u_pos(xq on + owner),
@@ -354,7 +358,7 @@ def test_ghost_pos_and_neg_on_own_fields(setup_multifield_environment):
     u_pos = Function("u_pos_func", "u_pos", dh); u_pos.set_values_from_function(lambda x,y: x + 2*y)
     u_neg = Function("u_neg_func", "u_neg", dh); u_neg.set_values_from_function(lambda x,y: 3*x - y)
 
-    fc = FormCompiler(dh, backend="python")
+    fc = FormCompiler(dh, backend=backend)
     ctx, xq = _ghost_ctx(dh, fields, edge, pos_eid, neg_eid, level_set)
     fc.ctx.update(ctx)
 
@@ -369,7 +373,8 @@ def test_ghost_pos_and_neg_on_own_fields(setup_multifield_environment):
     assert np.isclose(got, exp, rtol=1e-3), f"Neg(u_neg) got {got}, expected {exp}"
 
 
-def test_ghost_jump_mixed_and_same_field_sanity(setup_multifield_environment):
+@pytest.mark.parametrize("backend", ["python", "jit"])
+def test_ghost_jump_mixed_and_same_field_sanity(setup_multifield_environment, backend):
     """
     On a ghost edge:
       Jump(u_pos, u_neg) == u_pos(+) − u_neg(−),
@@ -385,7 +390,7 @@ def test_ghost_jump_mixed_and_same_field_sanity(setup_multifield_environment):
     u_pos = Function("u_pos_func", "u_pos", dh); u_pos.set_values_from_function(lambda x,y: x + 2*y)
     u_neg = Function("u_neg_func", "u_neg", dh); u_neg.set_values_from_function(lambda x,y: 3*x - y)
 
-    fc = FormCompiler(dh, backend="python")
+    fc = FormCompiler(dh, backend=backend)
     ctx, xq = _ghost_ctx(dh, fields, edge, pos_eid, neg_eid, level_set)
     fc.ctx.update(ctx)
 

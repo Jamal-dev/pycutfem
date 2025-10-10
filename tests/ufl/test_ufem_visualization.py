@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # --- Imports from your project structure ---
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.core.levelset import CircleLevelSet
 from pycutfem.utils.tagging import classify_by_levelset # Corrected import path

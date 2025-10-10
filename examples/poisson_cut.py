@@ -114,25 +114,23 @@ def run_step85():
         
         # --- Deactivate DoFs on exterior cells (mimics FE_Nothing) ---
         print("Deactivating degrees of freedom on exterior cells...")
-        # 1. Find all nodes belonging to active elements ('inside' or 'cut')
-        active_elements = mesh.element_bitset("inside") | mesh.element_bitset("cut")
-        active_node_ids = set()
-        for eid in active_elements.to_indices():
-            active_node_ids.update(mesh.elements_list[eid].nodes)
-
-        # 2. Identify inactive nodes (all nodes minus active nodes) and tag them
-        all_node_ids = set(range(len(mesh.nodes_list)))
-        inactive_node_ids = all_node_ids - active_node_ids
-        for nid in inactive_node_ids:
-            mesh.nodes_list[nid].tag = 'inactive'
-        print(f"Found {len(inactive_node_ids)} inactive nodes to constrain.")
+        outside_elements = mesh.element_bitset("outside")
+        inactive_dofs = dof_handler.tag_dof_bitset(
+            tag="inactive",
+            field="u",
+            elem_mask=outside_elements,
+            strict=True,
+        )
+        print(f"Found {len(inactive_dofs)} inactive dofs to constrain.")
 
         # 3. Create a boundary condition to constrain these nodes to zero.
         # This effectively removes them from the linear system.
         inactive_dof_bc = BoundaryCondition('u', 'dirichlet', 'inactive', lambda x, y: 0.0)
         
-        print(f"Number of active degrees of freedom: {len(active_node_ids)}")
-        print(f"Total degrees of freedom (before constraints): {dof_handler.total_dofs}")
+        total_dofs = dof_handler.total_dofs
+        active_dofs_count = total_dofs - len(inactive_dofs)
+        print(f"Number of active degrees of freedom: {active_dofs_count}")
+        print(f"Total degrees of freedom (before constraints): {total_dofs}")
 
 
         # ====================================================================
@@ -273,7 +271,7 @@ def run_step85():
                             l2_error_sq += (u_h_val - u_ex_val)**2 * w_phys
 
         l2_error = np.sqrt(l2_error_sq)
-        convergence_data.append({'cycle': cycle, 'h': h_max, 'L2-error': l2_error, 'ndofs': len(active_node_ids)})
+        convergence_data.append({'cycle': cycle, 'h': h_max, 'L2-error': l2_error, 'ndofs': active_dofs_count})
         print(f"Cycle {cycle} finished. L2 Error: {l2_error:.5e}")
 
     # ========================================================================

@@ -4,7 +4,7 @@ import scipy.sparse.linalg as spla
 import sympy as sp
 
 # Assume these are imported from your project structure
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 from pycutfem.assembly.dg_global import assemble_dg
 from pycutfem.utils.meshgen import structured_quad, structured_triangles
 from pycutfem.fem.reference import get_reference

@@ -262,7 +262,10 @@ class Function(Expression):
         """Populates nodal values by evaluating a function at each DoF's coordinate."""
         global_dofs = self._dof_handler.get_field_dofs_on_nodes(self.field_name)
         coords = self._dof_handler.get_dof_coords(self.field_name)
-        values = np.apply_along_axis(lambda c: func(c[0], c[1]), 1, coords).ravel()
+        values = np.asarray(
+            np.apply_along_axis(lambda c: func(c[0], c[1]), 1, coords),
+            dtype=float
+        ).ravel()
         self.set_nodal_values(global_dofs, values)
 
     def get_nodal_values(self, global_dofs: np.ndarray) -> np.ndarray:
@@ -1219,7 +1222,7 @@ class Restriction(Expression):
         self.is_function = getattr(operand, "is_function", False)
         self.is_trial    = getattr(operand, "is_trial",    False)
         self.is_test     = getattr(operand, "is_test",     False)
-        self.num_components = getattr(operand, "num_components", 1)
+        self.num_components = operand.num_components
 
     def __repr__(self):
         return f"Restriction({self.operand!r}, '{self.domain}')"

@@ -1,6 +1,6 @@
 import numpy as np
 from pycutfem.utils.meshgen import structured_quad
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 from pycutfem.assembly.local_assembler import stiffness_matrix
 
 def test_local_stiffness_symmetry():

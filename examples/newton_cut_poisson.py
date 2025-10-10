@@ -113,22 +113,22 @@ def run_step85_newton():
 
         # --- Deactivate DoFs on exterior cells ---
         print("Deactivating degrees of freedom on exterior cells...")
-        active_elements = mesh.element_bitset("inside") | mesh.element_bitset("cut")
-        active_node_ids = set()
-        for eid in active_elements.to_indices():
-            active_node_ids.update(mesh.elements_list[eid].nodes)
+        outside_elements = mesh.element_bitset("outside")
+        inactive_dofs = dof_handler.tag_dof_bitset(
+            tag="inactive",
+            field="u",
+            elem_mask=outside_elements,
+            strict=True,
+        )
+        print(f"Found {len(inactive_dofs)} inactive dofs to constrain.")
 
-        all_node_ids = set(range(len(mesh.nodes_list)))
-        inactive_node_ids = all_node_ids - active_node_ids
-        for nid in inactive_node_ids:
-            mesh.nodes_list[nid].tag = 'inactive'
-        print(f"Found {len(inactive_node_ids)} inactive nodes to constrain.")
+        total_dofs = dof_handler.total_dofs
+        active_dofs_count = total_dofs - len(inactive_dofs)
+        print(f"Number of active degrees of freedom: {active_dofs_count}")
+        print(f"Total degrees of freedom (before constraints): {total_dofs}")
 
         # --- NEW: Define Boundary Conditions for Newton Solver ---
-        # The main BC is the Nitsche condition, which is part of the weak form.
-        # We only need explicit Dirichlet conditions for the inactive DoFs.
         bcs = [BoundaryCondition('u', 'dirichlet', 'inactive', lambda x, y: 0.0)]
-        # The homogeneous BCs are needed for the Jacobian assembly
         bcs_homog = [BoundaryCondition('u', 'dirichlet', 'inactive', lambda x, y: 0.0)]
 
 
@@ -148,18 +148,9 @@ def run_step85_newton():
         n = FacetNormal()
         h = CellDiameter()
         
-        def _dn(expr):
-            """Normal derivative  n·∇expr  on an (interior) edge."""
-            return n[0] * Derivative(expr, 1, 0) + n[1] * Derivative(expr, 0, 1)
-            # return dot(grad(expr), n)
-
-        def grad_inner(u, v):
-            """⟨∂ₙu, ∂ₙv⟩  (scalar or 2‑D vector)."""
-            if getattr(u, "num_components", 1) == 1:      # scalar
-                return _dn(u) * _dn(v)
-
-            if u.num_components == v.num_components == 2: # vector
-                return _dn(u[0]) * _dn(v[0]) + _dn(u[1]) * _dn(v[1])
+        def normal_grad(expr):
+            """Compact helper for n·∇expr on interface/ghost facets."""
+            return dot(grad(expr), n)
 
         gamma_N = Constant(nitsche_parameter)
         gamma_G = Constant(ghost_parameter)
@@ -180,7 +171,7 @@ def run_step85_newton():
             - dot(grad(v), n) * (u_k - g) * dGamma
             + (gamma_N / h) * (u_k - g) * v * dGamma
             # Ghost penalty stabilization
-            + (0.5 * gamma_G * h * grad_inner(jump(u_k), jump(v))) * dGhost_stab
+            + (0.5 * gamma_G * h * jump(normal_grad(u_k)) * jump(normal_grad(v))) * dGhost_stab
         )
 
         # --- NEW: Define Jacobian Form J(du, v) ---
@@ -193,7 +184,7 @@ def run_step85_newton():
             - dot(grad(v), n) * du * dGamma
             + (gamma_N / h) * du * v * dGamma
             # Ghost penalty
-            + (0.5 * gamma_G * h * grad_inner(jump(du), jump(v))) * dGhost_stab
+            + (0.5 * gamma_G * h * jump(normal_grad(du)) * jump(normal_grad(v))) * dGhost_stab
         )
 
         # ====================================================================
@@ -287,7 +278,7 @@ def run_step85_newton():
                             l2_error_sq += (u_h_val - u_ex_val)**2 * w_phys
 
         l2_error = np.sqrt(l2_error_sq)
-        convergence_data.append({'cycle': cycle, 'h': h_max, 'L2-error': l2_error, 'ndofs': len(active_node_ids)})
+        convergence_data.append({'cycle': cycle, 'h': h_max, 'L2-error': l2_error, 'ndofs': active_dofs_count})
         print(f"Cycle {cycle} finished. L2 Error: {l2_error:.5e}")
 
     # ========================================================================

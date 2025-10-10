@@ -1,5 +1,5 @@
 import numpy as np
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 from pycutfem.fem.transform import x_mapping, det_jacobian
 from pycutfem.core.topology import Node
 def test_reference_to_global_mapping():

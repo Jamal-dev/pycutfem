@@ -1,6 +1,5 @@
 from matplotlib.pylab import norm
 from pycutfem.utils import boundary
-from pyparsing import C
 import pytest
 import numpy as np
 import scipy.sparse.linalg as spla

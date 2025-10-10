@@ -53,7 +53,14 @@ def hdotn(expr):
 def setup_quad2():
     """2×1 quadratic mesh cut vertically at x=1."""
     poly_order = 2
-    nodes, elements_connectivity, edge_connectivity, corner_nodes = structured_quad(2.0, 1.0, nx=20, ny=5, poly_order=poly_order)
+    L, H = 2.0, 1.0
+    nx, ny = 20, 5
+    (nodes, elements_connectivity, 
+     edge_connectivity, corner_nodes) = structured_quad(L, 
+                                                        H, 
+                                                        nx=nx, 
+                                                        ny=ny, 
+                                                        poly_order=poly_order)
     mesh = Mesh(nodes = nodes,
                 element_connectivity = elements_connectivity,
                 edges_connectivity = edge_connectivity,
@@ -136,20 +143,24 @@ def test_hessian_energy_zero_for_quadratic(setup_quad2, backend):
 def test_hessian_energy_known_value(setup_quad2, backend):
     _mesh, ls, ghost, dh, comp = setup_quad2
 
-    def piecewise(x, y):
+    def piecewise_pos(x, y):
         return np.where(x > 1.0, (x - 1.0) ** 2, 0.0)
+    def piecewise_neg(x, y):
+        return np.where(x > 1.0, 0.0, (x - 1.0) ** 2)
+    u_pos = Function(name ="u", field_name="u", dof_handler=dh)
+    u_pos.set_values_from_function(piecewise_pos)
+    u_neg = Function(name ="u", field_name="u", dof_handler=dh)
+    u_neg.set_values_from_function(piecewise_neg)
+    jump_u = Jump(u_pos, u_neg)
 
-    uh = Function(name ="u", field_name="u", dof_handler=dh)
-    uh.set_values_from_function(piecewise)
-
-    energy_form = hessian_inner(Jump(uh), Jump(uh)) * dGhost(defined_on=ghost, level_set=ls, metadata={"q":4})
+    energy_form = hessian_inner(jump_u, jump_u) * dGhost(defined_on=ghost, level_set=ls, metadata={"q":4})
     assembler_hooks={type(energy_form.integrand):{'name':'E'}}
     F = None
     res = assemble_form(Equation(F, energy_form),  dof_handler=dh, bcs=[], assembler_hooks=assembler_hooks, backend=backend)
 
     assembled = res["E"]
 
-    expected = 4.0 * 1.0  # jump 2, length 1
+    expected = 4.0 + 4.0 + 3.2  # jump 2, length 1
     assert np.isclose(assembled, expected, rtol=1e-2)
 
 @pytest.mark.parametrize("backend", [ "jit", "python"])
@@ -208,18 +219,24 @@ def test_hessian_penalty_quantitative_value(setup_quad2, backend):
     # The jump in the second derivative is ⟦u''⟧ = 2 - 0 = 2.
     # The only non-zero component of the Hessian jump is ⟦H_xx⟧ = 2.
     
-    def manufactured_sol(x, y):
+    def manufactured_sol_pos(x, y):
         return (x - 1.0)**2 if x > 1.0 else 0.0
+    def manufactured_sol_neg(x, y):
+        return 0.0 if x > 1.0 else (x - 1.0)**2
 
-    u_h = Function('u', 'u', dh)
-    u_h.set_values_from_function(manufactured_sol)
+    u_pos = Function('u_pos', 'u', dh)
+    u_pos.set_values_from_function(manufactured_sol_pos)
 
-    penalty_form = hessian_inner(Jump(u_h), Jump(u_h)) * dGhost(defined_on=ghost_domain, level_set=level_set, metadata={"q":4})
+    u_neg = Function('u_neg', 'u', dh)
+    u_neg.set_values_from_function(manufactured_sol_neg)
+    jump_u = Jump(u_pos, u_neg)
+
+    penalty_form = hessian_inner(jump_u, jump_u) * dGhost(defined_on=ghost_domain, level_set=level_set, metadata={"q":4})
 
     # Analytical Calculation:
     # The integral is ∫ |⟦H(u)⟧|² ds ≈ ∫ (⟦∂²u/∂x²⟧)² ds = ∫ (2)² ds = 4 * length.
     # The ghost edge runs from (1,0) to (1,1), so its length is 1.
-    expected_energy = 4.0 * 1.0
+    expected_energy = 4.0 + 4.0 + 3.2
 
     # Assemble the scalar functional
     assembler_hooks={type(penalty_form.integrand):{'name':'penalty_energy'}}
@@ -264,14 +281,19 @@ def test_hdotn_scalar_zero_for_quadratic(setup_quad2, backend):
 @pytest.mark.parametrize("backend", [ "jit", "python"])
 def test_hdotn_scalar_known_value(setup_quad2, backend):
     _mesh, ls, ghost, dh, comp = setup_quad2
-    uh = Function("u", "u", dh)
-    uh.set_values_from_function(lambda x, y: (x - 1.0) ** 2 if x > 1.0 else 0.0)
+    pos_func = lambda x, y: (x - 1.0) ** 2 if x > 1.0 else 0.0
+    neg_func = lambda x, y: 0.0 if x > 1.0 else (x - 1.0) ** 2
+    u_pos = Function("u_pos", "u", dh)
+    u_pos.set_values_from_function(pos_func)
+    u_neg = Function("u_neg", "u", dh)
+    u_neg.set_values_from_function(neg_func)
+    jump_u = Jump(u_pos, u_neg)
 
-    Eform = inner(hdotn(Jump(uh)), hdotn(Jump(uh))) * dGhost(
+    Eform = inner(hdotn(jump_u), hdotn(jump_u)) * dGhost(
         defined_on=ghost, level_set=ls, metadata={"q": 4}
     )
     hooks = {type(Eform.integrand): {"name": "E"}}
     res = assemble_form(Equation(None, Eform), dof_handler=dh,
                         bcs=[], assembler_hooks=hooks, backend=backend)
-    expected = 4.0 * 1.0
+    expected = 4.0 +4.0 
     assert np.isclose(res["E"], expected, rtol=1e-2)

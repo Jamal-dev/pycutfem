@@ -34,11 +34,15 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 
 def hessian_inner(u, v):
-    if getattr(u, "num_components", 1) == 1:      # scalar
+    if isinstance(u, Jump):
+        num_components = u.u_pos.num_components
+    elif hasattr(u, 'num_components'):
+        num_components = u.num_components
+    if num_components == 1:      # scalar
         return _hess_comp(u, v)
 
     # vector: sum component-wise
-    return sum(_hess_comp(u[i], v[i]) for i in range(u.num_components))
+    return sum(_hess_comp(u[i], v[i]) for i in range(num_components))
 
 
 def _hess_comp(a, b):
@@ -53,7 +57,13 @@ def _hess_comp(a, b):
 def setup_quad2():
     """2×1 quadratic mesh cut vertically at x=1."""
     poly_order = 2
-    nodes, elements_connectivity, edge_connectivity, corner_nodes = structured_quad(2.0, 1.0, nx=20, ny=5, poly_order=poly_order)
+    L, H = 2.0, 1.0
+    nx, ny = 20, 5
+    h_x = L / nx
+    h_y = H / ny
+    geom_info={'L':L, 'H':H, 'nx':nx, 'ny':ny, 'h_x':h_x, 'h_y':h_y}
+    print(f"Mesh spacing h_x={h_x}, h_y={h_y}")
+    nodes, elements_connectivity, edge_connectivity, corner_nodes = structured_quad(L, H, nx=nx, ny=ny, poly_order=poly_order)
     mesh = Mesh(nodes = nodes,
                 element_connectivity = elements_connectivity,
                 edges_connectivity = edge_connectivity,
@@ -64,6 +74,7 @@ def setup_quad2():
     level_set = AffineLevelSet(a=1.0, b=0, c=-1.0)  # Vertical line at x=1
 
     mesh.classify_elements(level_set)
+    mesh.build_interface_segments(level_set)
     mesh.classify_edges(level_set)
 
     ghost = mesh.edge_bitset('ghost')
@@ -79,18 +90,18 @@ def setup_quad2():
 
     comp = FormCompiler(dh, quadrature_order=4)
 
-    return mesh, level_set, ghost, dh, comp
+    return mesh, level_set, ghost, dh, comp, geom_info
 
 # ---------------------------------------------------------------------------
 # 1. Structural check – SPD + symmetry
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("backend", ["python", "jit"])
 def test_hessian_penalty_spd(setup_quad2, backend):
-    _mesh, ls, ghost, dh, comp = setup_quad2
-    u_pos = TrialFunction(field_name="u",name="u_trial_pos",dof_handler=dh) 
-    v_pos = TestFunction( field_name="u",name="v_test_pos",dof_handler=dh)
-    u_neg = TrialFunction(field_name="u",name="u_trial_neg",dof_handler=dh) 
-    v_neg = TestFunction( field_name="u",name="v_test_neg",dof_handler=dh)
+    _mesh, ls, ghost, dh, comp, geom_info = setup_quad2
+    u_pos = TrialFunction(field_name="u",name="u_trial_pos",dof_handler=dh, side = "+") 
+    v_pos = TestFunction( field_name="u",name="v_test_pos",dof_handler=dh, side="+")
+    u_neg = TrialFunction(field_name="u",name="u_trial_neg",dof_handler=dh, side="-") 
+    v_neg = TestFunction( field_name="u",name="v_test_neg",dof_handler=dh, side="-")
 
     a = hessian_inner(Jump(u_pos,u_neg), Jump(v_pos,v_neg)) * dGhost(defined_on=ghost, 
                                                  level_set=ls, 
@@ -117,9 +128,9 @@ def test_hessian_penalty_spd(setup_quad2, backend):
 
 @pytest.mark.parametrize("backend", ["python", "jit"])
 def test_hessian_energy_zero_for_quadratic(setup_quad2, backend):
-    _mesh, ls, ghost, dh, comp = setup_quad2
+    _mesh, ls, ghost, dh, comp, geom_info = setup_quad2
 
-    uh = Function(name="uh", field_name="u", dof_handler=dh)
+    uh = Function(name="uh", field_name="u", dof_handler=dh, side = "+")
     uh.set_values_from_function(lambda x, y: x**2 + y**2)  # constant Hessian
     jump_u = Jump(uh)
     energy_form = hessian_inner(jump_u, jump_u) * dGhost(defined_on=ghost, level_set=ls, metadata={"q":4})
@@ -133,28 +144,75 @@ def test_hessian_energy_zero_for_quadratic(setup_quad2, backend):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("backend", ["python", "jit"])
 def test_hessian_energy_known_value(setup_quad2, backend):
-    _mesh, ls, ghost, dh, comp = setup_quad2
+    from pycutfem.ufl.expressions import restrict, Pos, Neg
+    _mesh, ls, ghost, dh, comp, geom_info = setup_quad2
+    h_x = geom_info['h_x']
+    ghost_edges = _mesh.edge_bitset('ghost')
+    ghost_pos = _mesh.edge_bitset('ghost_pos')
+    ghost_neg = _mesh.edge_bitset('ghost_neg')
+    ghost_both = _mesh.edge_bitset('ghost_both')
+    has_pos = _mesh.element_bitset('cut') | _mesh.element_bitset('outside')
+    has_neg = _mesh.element_bitset('cut') | _mesh.element_bitset('inside')
+    #
+    print(f"ghost edges: {ghost_edges.cardinality()}, ghost_pos: {ghost_pos.cardinality()}, ghost_neg: {ghost_neg.cardinality()}, ghost_both: {ghost_both.cardinality()}")
+    use_domain = ghost_pos
 
-    def piecewise(x, y):
+    def piecewise_pos(x, y):
         return np.where(x > 1.0, (x - 1.0) ** 2, 0.0)
+    def piecewise_neg(x, y):
+        return np.where(x > 1.0, 0.0, (x - 1.0) ** 2)
 
     uh = Function(name ="u", field_name="u", dof_handler=dh)
-    uh.set_values_from_function(piecewise)
+    uh.set_values_from_function(piecewise_pos)
+    u_pos = Function(name="u_pos", field_name="u", dof_handler=dh, side = "+")
+    u_neg = Function(name="u_neg", field_name="u", dof_handler=dh, side = "-")
+    u_pos.set_values_from_function(piecewise_pos)
+    u_neg.set_values_from_function(piecewise_neg)
+    u_pos = restrict(u_pos, has_pos)
+    u_neg = restrict(u_neg, has_neg)
+    jump_u = Jump(u_pos, u_neg)
+    
+   
+    def get_result(use_domain,u):
+        dG = dGhost(defined_on=use_domain, 
+                    level_set=ls, metadata={"q":4})
+        energy_form = hessian_inner(u, u) * dG
+        assembler_hooks={type(energy_form.integrand):{'name':'E'}}
+        F = None
+        res_1 = assemble_form(Equation(F, energy_form),  dof_handler=dh, 
+                            bcs=[], assembler_hooks=assembler_hooks, backend=backend)
 
-    energy_form = hessian_inner(Jump(uh), Jump(uh)) * dGhost(defined_on=ghost, level_set=ls, metadata={"q":4})
-    assembler_hooks={type(energy_form.integrand):{'name':'E'}}
-    F = None
-    res = assemble_form(Equation(F, energy_form),  dof_handler=dh, bcs=[], assembler_hooks=assembler_hooks, backend=backend)
+        return res_1["E"]
+    def get_result_2(use_domain,u_pos,u_neg):
+        dG = dGhost(defined_on=use_domain, 
+                    level_set=ls, metadata={"q":4})
+        e_pos = hessian_inner(u_pos, u_pos)
+        e_neg = hessian_inner(u_neg, u_neg)
+        # jump_energy = Jump(e_pos, e_neg)
+        jump_energy = Pos(e_pos) - Neg(e_neg)
+        energy_form = jump_energy * dG
+        assembler_hooks={type(energy_form.integrand):{'name':'E'}}
+        F = None
+        res_1 = assemble_form(Equation(F, energy_form),  dof_handler=dh, 
+                            bcs=[], assembler_hooks=assembler_hooks, backend=backend)
 
-    assembled = res["E"]
+        return res_1["E"]
 
-    expected = 4.0 * 1.0  # jump 2, length 1
-    assert np.isclose(assembled, expected, rtol=1e-2)
+
+    expected = 4.0 * 1.0  # jump 2 (square), length 1
+    pos_energy = get_result(ghost_pos, u_pos)
+    neg_energy = get_result(ghost_pos, u_neg)
+    print(f"pos energy {pos_energy}, neg energy {neg_energy}")
+    jump_energy = get_result_2(ghost_pos, u_pos, u_neg) 
+    print(f"jump energy {jump_energy}")
+    assert np.isclose(get_result(ghost_pos, jump_u), expected, rtol=1e-2)
+    expected = 4.0 * h_x * (ghost_both.cardinality())
+    assert np.isclose(get_result(ghost_both, jump_u), expected, rtol=1e-2)
 
 @pytest.mark.parametrize("backend", ["python", "jit"])
 def test_scalar_jump_penalty_spd(setup_quad2, backend):
     """Ghost penalty K = ∫_Γ ⟦u⟧⟦v⟧ ds must be symmetric PSD."""
-    _mesh, level_set, ghost_domain, dh, compiler = setup_quad2
+    _mesh, level_set, ghost_domain, dh, compiler, geom_info = setup_quad2
 
     u = TrialFunction(field_name="u",name="u",dof_handler=dh) 
     v = TestFunction( field_name="u",name="v",dof_handler=dh)
@@ -173,7 +231,7 @@ def test_hessian_penalty_exactness_for_quadratics(setup_quad2, backend):
     Tests that the penalty energy is zero for a function whose Hessian jump is zero.
     For u(x,y) = x², the Hessian is constant, so its jump is zero.
     """
-    _mesh, level_set, ghost_domain, dh, compiler = setup_quad2
+    _mesh, level_set, ghost_domain, dh, compiler, geom_info = setup_quad2
     
     u_h = Function('u', 'u', dh)
     u_h.set_values_from_function(lambda x, y: x**2)
@@ -190,42 +248,4 @@ def test_hessian_penalty_exactness_for_quadratics(setup_quad2, backend):
     assembled_energy = res['penalty_energy']
 
     assert abs(assembled_energy) < 1e-12
-
-### Test 3: Quantitative Correctness (Constant-Jump) ###
-@pytest.mark.parametrize("backend", ["python", "jit"])
-def test_hessian_penalty_quantitative_value(setup_quad2, backend):
-    """
-    Tests that the assembled value of the Hessian penalty for a manufactured
-    solution matches the known analytical value.
-    """
-    _mesh, level_set, ghost_domain, dh, compiler = setup_quad2
-
-    # We use a function u that is C¹ continuous, but whose second derivative jumps.
-    # u(x) = 0 if x <= 1, and u(x) = (x-1)² if x > 1.
-    # u'(x) = 0 if x<=1, and 2(x-1) if x > 1. (u'(1)=0, so C¹)
-    # u''(x) = 0 if x<=1, and 2 if x > 1.
-    # The jump in the second derivative is ⟦u''⟧ = 2 - 0 = 2.
-    # The only non-zero component of the Hessian jump is ⟦H_xx⟧ = 2.
-    
-    def manufactured_sol(x, y):
-        return (x - 1.0)**2 if x > 1.0 else 0.0
-
-    u_h = Function('u', 'u', dh)
-    u_h.set_values_from_function(manufactured_sol)
-
-    penalty_form = hessian_inner(Jump(u_h), Jump(u_h)) * dGhost(defined_on=ghost_domain, level_set=level_set, metadata={"q":4})
-
-    # Analytical Calculation:
-    # The integral is ∫ |⟦H(u)⟧|² ds ≈ ∫ (⟦∂²u/∂x²⟧)² ds = ∫ (2)² ds = 4 * length.
-    # The ghost edge runs from (1,0) to (1,1), so its length is 1.
-    expected_energy = 4.0 * 1.0
-
-    # Assemble the scalar functional
-    assembler_hooks={type(penalty_form.integrand):{'name':'penalty_energy'}}
-    F = None
-    res = assemble_form(Equation(F, penalty_form),  dof_handler=dh, bcs=[], assembler_hooks=assembler_hooks, backend=backend)
-    assembled_energy = res['penalty_energy']
-    assert np.isclose(assembled_energy, expected_energy, rtol=1e-2), \
-        f"Expected {expected_energy}, got {assembled_energy} for the Hessian penalty energy."
-
 

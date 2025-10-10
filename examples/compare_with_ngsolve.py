@@ -31,7 +31,7 @@ from pycutfem.ufl.expressions import (
     grad as pc_grad, inner as pc_inner, div as pc_div, dot as pc_dot, jump as pc_jump,
     Pos, Neg, CellDiameter,
 )
-from pycutfem.ufl.measures import dx as pycutfem_dx, dInterface as pycutfem_dInterface
+from pycutfem.ufl.measures import dx as pycutfem_dx, dInterface as pycutfem_dInterface, dGhost
 from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.core.levelset import CircleLevelSet, LevelSetGridFunction, LevelSetMeshAdaptation as PCLevelSetMeshAdaptation
 from pycutfem.fem.mixedelement import MixedElement
@@ -164,7 +164,10 @@ def setup_pc(maxh=0.125, order=2, R=2.0/3.0, L = 2.0, H = 2.0, level_set_order =
     )
     has_inside = inside | interface
     has_outside = outside | interface
-    
+    ghost_all = mesh.edge_bitset("ghost")
+    ghost_pos = mesh.edge_bitset("ghost_pos")
+    ghost_neg = mesh.edge_bitset("ghost_neg")
+
 
     Vpos = FunctionSpace("Vpos", ['u_pos_x','u_pos_y'], side='+')
     Vneg = FunctionSpace("Vneg", ['u_neg_x','u_neg_y'], side='-')
@@ -172,7 +175,8 @@ def setup_pc(maxh=0.125, order=2, R=2.0/3.0, L = 2.0, H = 2.0, level_set_order =
     qvol = 2*order + 4
     es = {
         'has_outside': has_outside, 'has_inside': has_inside,
-        'inside': inside, 'outside': outside, 'interface': interface
+        'inside': inside, 'outside': outside, 'interface': interface,
+        'ghost': ghost_all, 'ghost_pos': ghost_pos, 'ghost_neg': ghost_neg
     }
     
     # Pack and return all components
@@ -210,6 +214,13 @@ def setup_ng(maxh=0.125, order=2, R=2.0/3.0, no_dirichlet=True, L = 2.0, H = 2.0
     InterpolateToP1(levelset, lsetp1)
     ci = CutInfo(mesh, lsetp1)
 
+    # Facet sets for ghost stabilization
+    ba_facets = [GetFacetsWithNeighborTypes(mesh, a=ci.GetElementsOfType(HASNEG),
+                                            b=ci.GetElementsOfType(IF)),
+                 GetFacetsWithNeighborTypes(mesh, a=ci.GetElementsOfType(HASPOS),
+                                            b=ci.GetElementsOfType(IF))]
+    dw = tuple(dFacetPatch(definedonelements=els_gp) for els_gp in ba_facets)
+
     # Function spaces
     Vhbase = VectorH1(mesh, order=order) if no_dirichlet else VectorH1(mesh, order=order, dirichlet=[1,2,3,4])
     Qhbase = H1(mesh, order=order-1)
@@ -240,6 +251,7 @@ def setup_ng(maxh=0.125, order=2, R=2.0/3.0, no_dirichlet=True, L = 2.0, H = 2.0
         'dx_neg_iface': dCut(lsetp1, NEG, definedonelements=ci.GetElementsOfType(IF)),
         'dx_pos_iface': dCut(lsetp1, POS, definedonelements=ci.GetElementsOfType(IF)),
         'mu0': mu0, 'mu1': mu1, 'lam_val': 0.5*(mu0+mu1)*20*order*order,
+        'ghost_facets': {'-': dw[0], '+': dw[1]}
     }
 
 def setup_ng_deformation(maxh=0.125, order=2, R=2.0/3.0, no_dirichlet=True, L = 2.0, H = 2.0,level_set_order = 1, use_quad = False):
@@ -260,6 +272,14 @@ def setup_ng_deformation(maxh=0.125, order=2, R=2.0/3.0, no_dirichlet=True, L = 
     deformation = lsetmeshadap.CalcDeformation(levelset)
     lsetp1 = lsetmeshadap.lset_p1
     ci = CutInfo(mesh, lsetp1)
+
+    # Facet sets for ghost stabilization
+    ba_facets = [GetFacetsWithNeighborTypes(mesh, a=ci.GetElementsOfType(HASNEG),
+                                            b=ci.GetElementsOfType(IF)),
+                 GetFacetsWithNeighborTypes(mesh, a=ci.GetElementsOfType(HASPOS),
+                                            b=ci.GetElementsOfType(IF))]
+    dw = tuple(dFacetPatch(definedonelements=els_gp, deformation=deformation)
+                for els_gp in ba_facets)
 
     # Function spaces
     Vhbase = VectorH1(mesh, order=order) if no_dirichlet else VectorH1(mesh, order=order, dirichlet=[1,2,3,4])
@@ -292,7 +312,8 @@ def setup_ng_deformation(maxh=0.125, order=2, R=2.0/3.0, no_dirichlet=True, L = 
         'dx_neg_iface': dCut(lsetp1, NEG, definedonelements=ci.GetElementsOfType(IF), deformation=deformation),
         'dx_pos_iface': dCut(lsetp1, POS, definedonelements=ci.GetElementsOfType(IF), deformation=deformation),
         'mu0': mu0, 'mu1': mu1, 'lam_val': 0.5*(mu0+mu1)*20*order*order,
-        'deformation': deformation
+        'deformation': deformation,
+        'ghost_facets': {'-': dw[0], '+': dw[1]}
     }
 
 
@@ -372,6 +393,19 @@ class PC_DX:
         return pycutfem_dx(defined_on=self.es['interface'], level_set=self.level_set,
                            metadata={'side': '-', 'q': quad_order}, deformation=self.deformation)
 
+    def ghost(self, quad_order=None, side=None):
+        if quad_order is None:
+            quad_order = self.quad_order
+        defined = self.es.get('ghost') if side is None else (
+            self.es.get('ghost_pos') if side == '+' else self.es.get('ghost_neg'))
+        if defined is None:
+            raise ValueError("Ghost bitset not available in PC setup")
+        metadata = {'q': quad_order}
+        if side in ('+','-'):
+            metadata['side'] = side
+        return dGhost(defined_on=defined, level_set=self.level_set,
+                      metadata=metadata, deformation=self.deformation)
+
     def dGamma(self, quad_order=None, side = None): # Corrected name from dGamama
         if quad_order is None:
             quad_order = self.quad_order
@@ -380,11 +414,12 @@ class PC_DX:
 
 class NG_DX:
     """A manager for NGSolve/XFEM integration measures."""
-    def __init__(self, quad_order, lsetp1, cut_info, deformation= None):
+    def __init__(self, quad_order, lsetp1, cut_info, deformation= None, ghost_facets=None):
         self.quad_order = quad_order
         self.lsetp1 = lsetp1
         self.ci = cut_info
         self.deformation = deformation
+        self.ghost_facets = ghost_facets or {}
 
     def pos_all(self, quad_order=None):
         if quad_order is None:
@@ -434,6 +469,19 @@ class NG_DX:
         if self.deformation is not None:
             return dCut(self.lsetp1, IF, definedonelements=self.ci.GetElementsOfType(IF), order=quad_order, deformation=self.deformation)
         return dCut(self.lsetp1, IF, definedonelements=self.ci.GetElementsOfType(IF), order=quad_order)
+
+    def ghost(self, quad_order=None, side=None):
+        if quad_order is None:
+            quad_order = self.quad_order
+        if not self.ghost_facets:
+            raise ValueError("Ghost facet measures not available in NG setup")
+        if side in ('-','+'):
+            meas = self.ghost_facets.get(side)
+        else:
+            meas = self.ghost_facets.get('both')
+        if meas is None:
+            raise ValueError(f"Ghost facet measure for side {side} not available")
+        return meas
 # ---------- Runner ----------
 def main(backend='python'):
     maxh, order, R = 0.125, 2, 2.0/3.0
@@ -450,8 +498,8 @@ def main(backend='python'):
     quad_order = 8
     pc_dx = PC_DX(quad_order, pc_setup['level_set'], pc_setup['es'])
     pc_dx_def = PC_DX(quad_order, pc_setup['level_set'], pc_setup['es'], deformation=pc_setup['deformation'])
-    ng_dx = NG_DX(quad_order, ng_setup['lsetp1'], ng_setup['ci'])
-    ng_dx_def = NG_DX(quad_order, ng_setup_def['lsetp1'], ng_setup_def['ci'], deformation=ng_setup_def['deformation'])
+    ng_dx = NG_DX(quad_order, ng_setup['lsetp1'], ng_setup['ci'], ghost_facets=ng_setup['ghost_facets'])
+    ng_dx_def = NG_DX(quad_order, ng_setup_def['lsetp1'], ng_setup_def['ci'], deformation=ng_setup_def['deformation'], ghost_facets=ng_setup_def['ghost_facets'])
 
     # --- Create vectors of all ONES for matrix comparison ---
     total_dofs_pc = pc_setup['dh'].total_dofs
@@ -719,6 +767,29 @@ def main(backend='python'):
             "description": "MEAN (n *q dx_pos + m * p dx_pos)", "type": "total",
             "pc_form": (pc_setup['nL']*Pos(pc_setup['qp']) + pc_setup['mL']*Pos(pc_setup['pp']))*pc_dx.pos_all(),
             "ng_form": (ng_setup['n']*ng_setup['q'][1] + ng_setup['m']*ng_setup['p'][1])*ng_dx.pos_all(),
+        },
+
+        # --- Ghost penalty terms ---
+        "ghost_mass": {
+            "description": "GHOST Mass jump(u)·jump(v)", "type": "total",
+            "pc_form": pc_inner(pc_jump(pc_setup['up']), pc_jump(pc_setup['vp'])) * pc_dx.ghost(),
+            "ng_form": (
+                InnerProduct(ng_setup['u'][0] - ng_setup['u'][0].Other(),
+                              ng_setup['v'][0] - ng_setup['v'][0].Other()) * ng_dx.ghost(side='-') +
+                InnerProduct(ng_setup['u'][1] - ng_setup['u'][1].Other(),
+                              ng_setup['v'][1] - ng_setup['v'][1].Other()) * ng_dx.ghost(side='+')
+            ),
+        },
+        "ghost_diffusion": {
+            "description": "GHOST Diffusion jump(∇u):jump(∇v)", "type": "total",
+            "pc_form": pc_inner(pc_grad(pc_jump(pc_setup['up'])),
+                                  pc_grad(pc_jump(pc_setup['vp']))) * pc_dx.ghost(),
+            "ng_form": (
+                InnerProduct(Grad(ng_setup['u'][0]) - Grad(ng_setup['u'][0].Other()),
+                              Grad(ng_setup['v'][0]) - Grad(ng_setup['v'][0].Other())) * ng_dx.ghost(side='-') +
+                InnerProduct(Grad(ng_setup['u'][1]) - Grad(ng_setup['u'][1].Other()),
+                              Grad(ng_setup['v'][1]) - Grad(ng_setup['v'][1].Other())) * ng_dx.ghost(side='+')
+            ),
         },
         "mean_comb": {
             "description": "MEAN (n *q dx_pos + m * p dx_pos + n *q dx_neg + m * p dx_neg)", "type": "total",

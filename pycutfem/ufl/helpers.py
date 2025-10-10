@@ -1425,29 +1425,58 @@ def _find_all_restrictions(form) -> list[Restriction]:
 
 
 def analyze_active_dofs(equation: Equation, dh: DofHandler, me: MixedElement, bcs: list):
-    """
-    Return (active_dofs, has_restriction).
-    - active_dofs: indices touched by Restricted domains if any, otherwise all DOFs.
-    - has_restriction: True iff Restriction operators are present in the forms.
-    """
-    active_dof_set = set()
-    all_forms = equation.a.integrals + equation.L.integrals
-    all_restrictions = _find_all_restrictions(Form(all_forms))
+    """Return (active_dofs, has_restriction) for reduced-system assembly.
 
-    if all_restrictions:
-        print("Restriction operators found. Analyzing active domains...")
-        for r in all_restrictions:
-            fields_in_operand = _all_fields(r.operand)
-            active_element_ids = r.domain.to_indices()
-            for eid in active_element_ids:
-                elemental_dofs_vector = dh.get_elemental_dofs(eid)
-                for field_name in fields_in_operand:
-                    sl = me.component_dof_slices[field_name]
-                    active_dof_set.update(elemental_dofs_vector[sl])
-        return np.array(sorted(active_dof_set), dtype=int), True
-    else:
+    When no ``Restriction`` nodes are present we simply mark every DOF as
+    active.  Otherwise, we examine each integral separately and keep **all**
+    fields that appear in that integrand, evaluated on the union of the
+    element domains referenced by its Restrictions.  This ensures auxiliary
+    fields (e.g. global Lagrange multipliers) that couple to restricted
+    fields remain active in the reduced system.
+    """
+
+    # Collect integrals from both sides of the equation
+    integrals = list(getattr(equation.a, "integrals", [])) + \
+                list(getattr(equation.L, "integrals", []))
+
+    active_dofs: Set[int] = set()
+    saw_restriction = False
+
+    for integral in integrals:
+        rnodes = _find_all_restrictions(integral.integrand)
+        if not rnodes:
+            continue
+
+        saw_restriction = True
+
+        # Union of element ids touched by any Restriction in this integrand
+        elem_ids: Set[int] = set()
+        for r in rnodes:
+            elem_ids.update(np.asarray(r.domain.to_indices(), dtype=int).tolist())
+
+        if not elem_ids:
+            continue
+
+        fields = _all_fields(integral.integrand)
+
+        for eid in elem_ids:
+            element_dofs = dh.get_elemental_dofs(int(eid))
+            for field in fields:
+                sl = me.component_dof_slices.get(field)
+                if sl is None:
+                    continue
+                active_dofs.update(element_dofs[sl])
+
+    if not saw_restriction:
         print("No Restriction operators found. All DOFs are considered active.")
         return np.arange(dh.total_dofs, dtype=int), False
+
+    print("Restriction operators found. Analyzing active domains...")
+    if not active_dofs:
+        # Fall back to everything if analysis produced nothing (shouldn't happen).
+        return np.arange(dh.total_dofs, dtype=int), True
+
+    return np.array(sorted(active_dofs), dtype=int), True
 
 from pycutfem.fem.transform import JET_CACHE, RefDerivCache
 from pycutfem.fem import transform
@@ -1733,8 +1762,19 @@ class HelpersFieldAware:
             from pycutfem.ufl.helpers_geom import phi_eval
             phi  = np.asarray([phi_eval(level_set, p) for p in xy], dtype=float)
             # Use the single global rule
-            pos_masks[fld] = np.array([1.0 if SIDE.is_pos(val, tol=tol) else 0.0 for val in phi], dtype=float)
-            neg_masks[fld] = np.array([1.0 if SIDE.is_neg(val, tol=tol) else 0.0 for val in phi], dtype=float)
+            pos_mask = np.array([1.0 if SIDE.is_pos(val, tol=tol) else 0.0 for val in phi], dtype=float)
+            neg_mask = np.array([1.0 if SIDE.is_neg(val, tol=tol) else 0.0 for val in phi], dtype=float)
+            if tol is None:
+                tol_chk = SIDE.tol
+            else:
+                tol_chk = tol
+            if pos_mask.shape == neg_mask.shape:
+                interface_idx = np.abs(phi) <= float(tol_chk)
+                if np.any(interface_idx):
+                    pos_mask[interface_idx] = 1.0
+                    neg_mask[interface_idx] = 1.0
+            pos_masks[fld] = pos_mask
+            neg_masks[fld] = neg_mask
 
         return pos_masks, neg_masks
     @staticmethod
@@ -1802,6 +1842,16 @@ class HelpersAlignCoefficents:
         if phi.ndim == 2 and phi.shape[1] == tgt:
             return phi
 
+        # If the vector is still in "side element" ordering, promote it using the side map
+        if phi.ndim == 1 and side in ('+', '-'):
+            side_map = ctx.get('pos_map') if side == '+' else ctx.get('neg_map')
+            if side_map is not None and len(side_map) == phi.shape[0]:
+                full = np.zeros(tgt, dtype=phi.dtype)
+                full[np.asarray(side_map, dtype=int)] = phi
+                phi = full
+                if phi.shape[0] == tgt:
+                    return phi
+        
         fmap = HelpersAlignCoefficents._field_map(ctx, side, field_name)
         if fmap is None:
             raise ValueError(f"Missing per-field map for basis padding: field='{field_name}', side={side}")
@@ -1902,6 +1952,21 @@ class HelpersAlignCoefficents:
             return phi, u_loc
         phi_g = HelpersAlignCoefficents._pad_basis_to_global(ctx, side, field_name, phi)
         u_g   = HelpersAlignCoefficents._pad_coeffs_to_global(ctx, side, field_name, u_loc)
+        # Apply optional union masks (used by ghost integrals to enforce owner-side DOFs)
+        mask_dict = ctx.get('pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field')
+        mask = None
+        if isinstance(mask_dict, dict):
+            mask = mask_dict.get(field_name)
+        if mask is not None:
+            mask_arr = np.asarray(mask, dtype=u_g.dtype)
+            if phi_g.ndim == 1:
+                phi_g = phi_g * mask_arr
+            else:
+                phi_g = phi_g * mask_arr[np.newaxis, :]
+            if u_g.ndim == 1:
+                u_g = u_g * mask_arr
+            else:
+                u_g = u_g * mask_arr[np.newaxis, :]
         # Final sanity: shapes must match along the dof axis
         if phi_g.ndim == 1 and u_g.ndim == 1:
             assert phi_g.shape[0] == u_g.shape[0], "Basis/coeff size mismatch after padding"

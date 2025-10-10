@@ -1955,6 +1955,10 @@ class DofHandler:
         # ------------------------------------------------------------------------------
         mesh = self.mixed_element.mesh
         me   = self.mixed_element
+        qdeg = int(qdeg)
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        q_infl = 2 * max(0, p_geo - 1)
+        qdeg_eff = qdeg + q_infl
         fields   = list(me.field_names)
         n_union  = me.n_dofs_local
 
@@ -2534,31 +2538,89 @@ class DofHandler:
         phi_arr = np.zeros((nE, nQ), dtype=float)
         pos_ids = np.empty(nE, dtype=np.int32)
         neg_ids = np.empty(nE, dtype=np.int32)
-        for i, e in enumerate(edges):
-            phiL = float(level_set(np.asarray(mesh.elements_list[e.left ].centroid())))
-            phiR = float(level_set(np.asarray(mesh.elements_list[e.right].centroid())))
+        edge_tags = [str(getattr(e, "tag", "")) for e in edges]
 
-            if SIDE.is_pos(phiL) and not SIDE.is_pos(phiR):
+        def _eval_ls(eid: int, point) -> float:
+            if hasattr(level_set, "value_on_element"):
+                xi, eta = transform.inverse_mapping(mesh, int(eid), np.asarray(point))
+                return float(level_set.value_on_element(int(eid), (float(xi), float(eta))))
+            return float(level_set(point))
+
+        def _grad_ls(eid: int, point):
+            if hasattr(level_set, "gradient_on_element"):
+                xi, eta = transform.inverse_mapping(mesh, int(eid), np.asarray(point))
+                try:
+                    g = level_set.gradient_on_element(int(eid), (float(xi), float(eta)))
+                    return np.asarray(g, dtype=float)
+                except Exception:
+                    pass
+            if hasattr(level_set, "gradient"):
+                try:
+                    g = level_set.gradient(np.asarray(point, dtype=float))
+                    return np.asarray(g, dtype=float)
+                except Exception:
+                    pass
+            return None
+
+        for i, e in enumerate(edges):
+            cL = np.asarray(mesh.elements_list[e.left ].centroid())
+            cR = np.asarray(mesh.elements_list[e.right].centroid())
+            phiL = _eval_ls(e.left, cL)
+            phiR = _eval_ls(e.right, cR)
+
+            tag_kind = edge_tags[i]
+            tag_left  = getattr(mesh.elements_list[e.left],  "tag", "")
+            tag_right = getattr(mesh.elements_list[e.right], "tag", "")
+            if tag_kind == "ghost_pos":
+                pos_eid, neg_eid = e.right, e.left
+            elif tag_kind == "ghost_neg":
+                pos_eid, neg_eid = e.left, e.right
+            elif tag_left == "cut" and tag_right != "cut":
+                pos_eid, neg_eid = e.left, e.right
+            elif tag_right == "cut" and tag_left != "cut":
+                pos_eid, neg_eid = e.right, e.left
+            elif SIDE.is_pos(phiL) and not SIDE.is_pos(phiR):
                 pos_eid, neg_eid = e.left, e.right
             elif SIDE.is_pos(phiR) and not SIDE.is_pos(phiL):
                 pos_eid, neg_eid = e.right, e.left
             else:
-                # tie-breaker (both same side within tol): larger φ defines '+'
                 pos_eid, neg_eid = (e.left, e.right) if phiL >= phiR else (e.right, e.left)
+
+            p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+            midpoint = 0.5 * (p0 + p1)
+            phi_pos_mid = _eval_ls(pos_eid, midpoint)
+            phi_neg_mid = _eval_ls(neg_eid, midpoint)
+            if phi_pos_mid < phi_neg_mid:
+                pos_eid, neg_eid = neg_eid, pos_eid
+                phi_pos_mid, phi_neg_mid = phi_neg_mid, phi_pos_mid
 
             pos_ids[i] = int(pos_eid)
             neg_ids[i] = int(neg_eid)
 
-
-            # ensure normal points from neg → pos
-            nvec = e.normal
+            nvec = e.normal.copy()
             cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
             cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
             if np.dot(nvec, cpos - cneg) < 0.0:
                 nvec = -nvec
+
+            grad_mid_pos = _grad_ls(pos_eid, midpoint)
+            grad_mid_neg = _grad_ls(neg_eid, midpoint)
+            grad_mid = None
+            if grad_mid_pos is not None and grad_mid_neg is not None:
+                grad_mid = 0.5 * (grad_mid_pos + grad_mid_neg)
+            elif grad_mid_pos is not None:
+                grad_mid = grad_mid_pos
+            elif grad_mid_neg is not None:
+                grad_mid = grad_mid_neg
+            if grad_mid is not None and np.linalg.norm(grad_mid) > 1e-14:
+                if np.dot(nvec, grad_mid) < 0.0:
+                    nvec = -nvec
+            elif phi_pos_mid < phi_neg_mid:
+                nvec = -nvec
+
             for q in range(nQ):
                 normals[i, q] = nvec
-                phi_arr[i, q] = level_set(qp_phys[i, q])
+                phi_arr[i, q] = _eval_ls(pos_eid, qp_phys[i, q])
 
         # 3) Union GDofs and side maps ----------------------------------------------
         gdofs_map = -np.ones((nE, n_union), dtype=np.int64)
@@ -3205,6 +3267,10 @@ class DofHandler:
         me   = self.mixed_element
         fields = list(me.field_names)
         n_union = me.n_dofs_per_elem
+        qdeg = int(qdeg)
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        q_infl = 2 * max(0, p_geo - 1)
+        qdeg_eff = qdeg + q_infl
 
         # ---------- which reference derivatives are actually needed ----------
         derivs = set(tuple(map(int, t)) for t in derivs)
@@ -3334,8 +3400,8 @@ class DofHandler:
 
             if mesh.element_type == 'quad':
                 # ---- QUAD: reference-space straight-cut rule ----
-                order_y = max(2, int(qdeg // 2))
-                order_x = max(2, int(qdeg // 2))
+                order_y = max(2, int(qdeg_eff // 2))
+                order_x = max(2, int(qdeg_eff // 2))
                 qpref, qwref = CutIntegration.straight_cut_rule_quad_ref(
                     mesh, eid, level_set, side=('+' if sgn == +1 else '-'),
                     order_y=order_y, order_x=order_x, tol=tol
@@ -3394,7 +3460,7 @@ class DofHandler:
                 for loc_tri in tri_local:
                     qx, qw = curved_subcell_quadrature_for_cut_triangle(
                         mesh, eid, loc_tri, corner_ids, level_set,
-                        side=('+' if sgn == +1 else '-'), qvol=int(qdeg),
+                        side=('+' if sgn == +1 else '-'), qvol=int(qdeg_eff),
                         nseg_hint=nseg_hint, tol=tol
                     )
                     if qx.size == 0:

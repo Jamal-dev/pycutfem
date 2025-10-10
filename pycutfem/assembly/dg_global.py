@@ -8,7 +8,7 @@ from typing import Callable
 from pycutfem.fem import transform
 from pycutfem.fem.reference import get_reference
 from pycutfem.integration import edge, volume
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 
 
 def assemble_dg(mesh: 'Mesh', *, n_comp: int = 1,

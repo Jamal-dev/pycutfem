@@ -8,7 +8,7 @@ from pycutfem.integration import volume, edge
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem import transform
 from typing import Callable, Tuple
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 
 # -----------------------------------------------------------------------------
 # Volume kernel (unchanged from CG, but loops over vector components if needed)

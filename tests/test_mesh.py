@@ -1,5 +1,5 @@
 import numpy as np
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 from pycutfem.core.topology import Node
 def test_neighbors_and_normals():
     n1=Node(0, 0, 0)

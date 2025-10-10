@@ -1,6 +1,6 @@
 import numpy as np, scipy.sparse as sp
 from pycutfem.utils.meshgen import structured_quad
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 from pycutfem.assembly.local_assembler import stiffness_matrix
 from pycutfem.assembly.global_matrix import assemble
 

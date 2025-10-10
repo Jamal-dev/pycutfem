@@ -5,7 +5,7 @@ from numpy.testing import assert_allclose
 # --- Imports from your project structure ---
 # Assuming these are in the same directory or accessible via python path
 from pycutfem.assembly.dg_local import face_laplace
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 from pycutfem.utils.meshgen import structured_quad # Placeholder
 
 # --- Test Setup: Helper function to find specific edges ---

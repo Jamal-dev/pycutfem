@@ -1,9 +1,8 @@
 import numpy as np
-from pycutfem.core import Mesh
-from pycutfem.core.levelset import CircleLevelSet
+from pycutfem.core.mesh import Mesh
+from pycutfem.core.levelset import CircleLevelSet, LevelSetFunction
 from pycutfem.core.topology import Node
 from pycutfem.utils.meshgen import structured_quad, structured_triangles
-from pycutfem.core.levelset import LevelSetFunction
 
 # Note: The LineLevelSet is not used by these tests but is kept as it was provided.
 class LineLevelSet(LevelSetFunction):
@@ -19,30 +18,46 @@ class LineLevelSet(LevelSetFunction):
             return np.tile(grad, (x.shape[0], 1))
         return grad
 
-def test_element_and_edge_classification_simple_corrected():
-    """
-    Tests classification on a very simple 2-element mesh.
-    This test is corrected to assert the specific 'ghost_both' tag.
-    """
-    # 1. Setup
-    nodes_list, elements_np, _, corners_np = structured_triangles(1.0, 1.0, nx_quads=1, ny_quads=1, poly_order=1)
-    mesh = Mesh(nodes=nodes_list, element_connectivity=elements_np,
-                elements_corner_nodes=corners_np,
-                element_type='tri', poly_order=1)
-    
-    ls = CircleLevelSet(center=(0.5, 0.5), radius=0.3)
+class _SaddleLevelSet(LevelSetFunction):
+    """φ(x,y) = -(x-0.5)(y-0.5) → opposite signs across the diagonal nodes."""
 
-    # 2. Classify
+    def __call__(self, x):
+        x = np.asarray(x, dtype=float)
+        return -(x[..., 0] - 0.5) * (x[..., 1] - 0.5)
+
+    def gradient(self, x):
+        x = np.asarray(x, dtype=float)
+        gx = -(x[..., 1] - 0.5)
+        gy = -(x[..., 0] - 0.5)
+        g = np.stack([gx, gy], axis=-1)
+        norm = np.linalg.norm(g, axis=-1, keepdims=True)
+        norm = np.where(norm == 0.0, 1.0, norm)
+        return g / norm if g.ndim > 1 else (g / norm)[0]
+
+
+def test_element_and_edge_classification_simple_corrected():
+    """The diagonal edge in the 2-element mesh should be tagged `ghost_both`."""
+
+    nodes_list, elements_np, _, corners_np = structured_triangles(
+        1.0, 1.0, nx_quads=1, ny_quads=1, poly_order=1
+    )
+    mesh = Mesh(
+        nodes=nodes_list,
+        element_connectivity=elements_np,
+        elements_corner_nodes=corners_np,
+        element_type='tri',
+        poly_order=1,
+    )
+
+    ls = _SaddleLevelSet()
+
     mesh.classify_elements(ls)
     mesh.classify_edges(ls)
 
-    # 3. Assert
-    # Both elements will be 'cut'. According to mesh.py logic, the
-    # edge between two 'cut' elements is tagged 'ghost_both'.
     interior_edge_tags = {e.tag for e in mesh.edges_list if e.right is not None}
-    
-    # CORRECTED ASSERTION: Check for the specific tag.
-    assert 'ghost_both' in interior_edge_tags, "The edge between two 'cut' elements should be 'ghost_both'."
+    assert 'ghost_both' in interior_edge_tags, (
+        "The shared edge of the two cut triangles must be tagged 'ghost_both'."
+    )
 
 
 def test_full_interface_and_ghost_edge_creation_corrected():

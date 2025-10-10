@@ -22,7 +22,6 @@ import logging
 from dataclasses import dataclass
 import math
 from math import comb
-import os
 
 # -------------------------------------------------------------------------
 #  Project imports – only the really needed bits
@@ -66,6 +65,7 @@ from pycutfem.ufl.helpers_geom import (
 )
 from contextlib import contextmanager
 from pycutfem.core.sideconvention import SIDE
+import os
 
 
 
@@ -301,8 +301,7 @@ class FormCompiler:
 
             # Side/field cache
             per_field = bv.setdefault(side, {}).setdefault(field, {})
-            if alpha in per_field:
-                return per_field[alpha]
+            row_local = per_field.get(alpha)
 
             # Coordinates and owner element on this side
             x_phys = self.ctx.get("x_phys")
@@ -310,10 +309,13 @@ class FormCompiler:
                 raise KeyError("x_phys missing in context for derivative evaluation.")
             eid = int(self.ctx["pos_eid"] if side == '+' else self.ctx["neg_eid"])
 
-            # Map to reference and evaluate derivative row on the element
-            xi, eta = transform.inverse_mapping(self.me.mesh, eid, np.asarray(x_phys))
-            row = self._phys_scalar_deriv_row(field, float(xi), float(eta), ox, oy, eid)
-            # row is length n_dofs_local and (in our library) zero-padded across fields.
+            if row_local is None:
+                # Map to reference and evaluate derivative row on the element
+                xi, eta = transform.inverse_mapping(self.me.mesh, eid, np.asarray(x_phys))
+                row_local = self._phys_scalar_deriv_row(field, float(xi), float(eta), ox, oy, eid)
+
+            row_local = np.asarray(row_local, dtype=float)
+            # row_local is length n_dofs_local and (in our library) zero-padded across fields.
 
             # Target "union" layout (present when assembling a matrix/vector)
             g = self.ctx.get("global_dofs")  # None for functionals
@@ -337,8 +339,10 @@ class FormCompiler:
                 field_slice = self.me.component_dof_slices[field]
             except Exception:
                 field_slice = None
-            if field_slice is not None and len(row) == self.me.n_dofs_local:
-                row = row[field_slice]  # make it field-local unconditionally
+            if field_slice is not None and len(row_local) == self.me.n_dofs_local:
+                row_field = row_local[field_slice]
+            else:
+                row_field = row_local.copy()
 
             # Optional per-field side mask (field-local)
             apply_mask = bool(self.ctx.get("mask_basis", False))
@@ -347,47 +351,46 @@ class FormCompiler:
                 mask_dict = self.ctx.get("pos_mask_by_field") if side == '+' else self.ctx.get("neg_mask_by_field")
                 if isinstance(mask_dict, dict):
                     m_local = mask_dict.get(field)
-                    if m_local is not None and len(row) == len(m_local):
-                        row = row * m_local  # apply while still field-local
+                    if m_local is not None and len(row_field) == len(m_local):
+                        row_field = row_field * m_local  # apply while still field-local
 
             # Pad to union layout only if assembling a mat/vec
             if g is not None:
                 if amap is not None:
-                    if len(row) == len(amap):
-                        full = np.zeros(len(g), dtype=row.dtype)
-                        full[np.asarray(amap, dtype=int)] = row
+                    if len(row_field) == len(amap):
+                        full = np.zeros(len(g), dtype=row_field.dtype)
+                        full[np.asarray(amap, dtype=int)] = row_field
                         row = full
-                    elif len(row) != len(g):
+                    elif len(row_field) != len(g):
                         raise ValueError(
                             f"Shape mismatch padding basis row for '{field}': "
-                            f"len(row)={len(row)}, len(amap)={len(amap)}, len(global_dofs)={len(g)}"
+                            f"len(row)={len(row_field)}, len(amap)={len(amap)}, len(global_dofs)={len(g)}"
                         )
                     # else len(row) == len(g): already union-sized (rare here)
                 else:
                     # No per-field map; row must already be union-sized
-                    if len(row) != len(g):
+                    if len(row_field) != len(g):
                         # As a last resort, allow a side-wide identity map
                         side_map = self.ctx.get("pos_map") if side == '+' else self.ctx.get("neg_map")
-                        if side_map is not None and len(side_map) == len(g) and len(row) == len(side_map):
+                        if side_map is not None and len(side_map) == len(g) and len(row_field) == len(side_map):
                             # already union-sized w.r.t. the side map; nothing to do
-                            pass
+                            row = row_field
                         else:
                             raise ValueError(
                                 f"Cannot pad basis row for '{field}': no field map and "
-                                f"len(row)={len(row)} != len(global_dofs)={len(g)}"
+                                f"len(row)={len(row_field)} != len(global_dofs)={len(g)}"
                             )
+                    else:
+                        row = row_field
 
-                # If we padded to union after masking (field-local), we may need to lift the mask too.
-                if isinstance(mask_dict, dict):
-                    m_local = mask_dict.get(field)
-                    if m_local is not None and amap is not None and len(row) == len(g) and len(m_local) != len(row):
-                        m_full = np.zeros(len(g), dtype=row.dtype)
-                        m_full[np.asarray(amap, dtype=int)] = m_local
-                        row = row * m_full
+                # Cache field-local data for reuse (store a copy to avoid accidental mutation)
+                per_field[alpha] = row_field.copy()
 
-            # Cache final form (per-side/field/alpha) and return
-            per_field[alpha] = row
-            return row
+                return row
+
+            # no padding required -> store and return field-local row
+            per_field[alpha] = row_field.copy()
+            return row_field
 
         # ---------- Standard element-local path (volume/boundary) ----------
         cache = self._basis_cache.setdefault(field, {})
@@ -478,9 +481,13 @@ class FormCompiler:
         return self._basis_row(field, alpha)
     
     def _local_dofs(self): 
+        if self.ctx.get("use_union_local_dofs", False):
+            g = self.ctx.get("global_dofs")
+            if g is not None:
+                return g
         if 'eid' in self.ctx:           # matrix/vector path
             return self.dh.get_elemental_dofs(self.ctx["eid"])
-        return self.ctx['global_dofs']   # functional path
+        return self.ctx.get('global_dofs')
     
     def _visit_Restriction(self, n: Restriction):
         """
@@ -499,8 +506,16 @@ class FormCompiler:
 
         # 2. Check if the element is in the active domain.
         if in_domain:
-            # If it matches, proceed as if the Restriction node wasn't there.
-            return self._visit(n.operand)
+            depth = int(self.ctx.get('_restriction_mask_active', 0))
+            self.ctx['_restriction_mask_active'] = depth + 1
+            try:
+                result = self._visit(n.operand)
+            finally:
+                if depth == 0:
+                    self.ctx.pop('_restriction_mask_active', None)
+                else:
+                    self.ctx['_restriction_mask_active'] = depth
+            return self._apply_restriction_mask(result, n)
         else:
             # If it does not match, return a "zero" value that has the same
             # structure (shape, role) as the real result would have.
@@ -517,6 +532,203 @@ class FormCompiler:
                 return np.zeros_like(result)
             else: # for scalars
                 return 0.0
+
+    def _apply_restriction_mask(self, value, node):
+        """Apply per-side union masks after evaluating a Restriction operand."""
+        if value is None:
+            return value
+
+        side = self._get_side()
+        restriction_store = self.ctx.get('_restriction_masks')
+
+        def _mask_array(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+            arr = np.asarray(arr)
+            mask = np.asarray(mask)
+            if mask.ndim > 1:
+                mask = mask.reshape(-1)
+            if mask.size == 0 or arr.ndim == 0:
+                return arr
+
+            mask_len = mask.shape[-1]
+            # Prefer masking along trailing axes; fall back to earlier ones.
+            for axis in range(arr.ndim - 1, -1, -1):
+                if arr.shape[axis] == mask_len:
+                    reshape = [1] * arr.ndim
+                    reshape[axis] = mask_len
+                    return arr * mask.reshape(reshape)
+
+            raise ValueError(
+                f"Restriction mask of length {mask_len} incompatible with array shape {arr.shape}"
+            )
+
+        def _union_mask_for(field: str) -> np.ndarray:
+            if isinstance(restriction_store, dict):
+                mask = restriction_store.get(side, {}).get(field)
+                if mask is not None:
+                    return mask
+            gd = self.ctx.get('global_dofs')
+            if gd is None:
+                return np.array([], dtype=float)
+
+            key = 'pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field'
+            store = self.ctx.setdefault(key, {})
+            if field in store:
+                return store[field]
+
+            mask = np.ones(len(gd), dtype=float)
+            level_set = self.ctx.get('_ghost_level_set')
+            eid = self.ctx.get('pos_eid' if side == '+' else 'neg_eid')
+            if level_set is not None and eid is not None:
+                try:
+                    pos_masks, neg_masks = _hfa.build_side_masks_by_field(
+                        self.dh, [field], int(eid), level_set, tol=SIDE.tol
+                    )
+                    local_mask = (pos_masks if side == '+' else neg_masks).get(field)
+                except Exception:
+                    local_mask = None
+                if local_mask is not None:
+                    mask = np.zeros(len(gd), dtype=float)
+                    fmap = (self.ctx.get('pos_map_by_field') if side == '+' else self.ctx.get('neg_map_by_field') or {}).get(field)
+                    if fmap is not None and len(local_mask) == len(fmap):
+                        mask[np.asarray(fmap, dtype=int)] = np.asarray(local_mask, dtype=float)
+                    else:
+                        mask = np.ones(len(gd), dtype=float)
+
+            store[field] = mask
+            return mask
+
+        def _any_mask() -> np.ndarray:
+            if isinstance(restriction_store, dict):
+                masks = restriction_store.get(side, {})
+                if masks:
+                    return next(iter(masks.values()))
+            key = 'pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field'
+            store = self.ctx.setdefault(key, {})
+            if store:
+                return next(iter(store.values()))
+            gd = self.ctx.get('global_dofs')
+            return np.ones(len(gd), dtype=float) if gd is not None else np.array([], dtype=float)
+
+        if isinstance(value, VecOpInfo):
+            data = value.data
+            if data.size == 0:
+                return value
+            new_data = data.copy()
+            field_names = value.field_names or []
+            if not field_names and hasattr(node, 'operand') and getattr(node.operand, 'field_name', None):
+                field_names = [node.operand.field_name]
+            if field_names:
+                for idx, fld in enumerate(field_names):
+                    mask = _union_mask_for(fld)
+                    if mask.size == 0:
+                        continue
+                    try:
+                        new_data[idx] = _mask_array(new_data[idx], mask)
+                    except ValueError:
+                        continue
+            else:
+                mask = _any_mask()
+                if mask.size:
+                    try:
+                        new_data = _mask_array(new_data, mask)
+                    except ValueError:
+                        pass
+            return value._with(new_data)
+
+        if isinstance(value, GradOpInfo):
+            data = value.data
+            new_data = data.copy()
+            field_names = value.field_names or []
+            if not field_names and hasattr(node, 'operand') and getattr(node.operand, 'field_name', None):
+                field_names = [node.operand.field_name]
+            if field_names and data.ndim >= 2:
+                for idx, fld in enumerate(field_names):
+                    mask = _union_mask_for(fld)
+                    if mask.size == 0:
+                        continue
+                    try:
+                        new_data[idx] = _mask_array(new_data[idx], mask)
+                    except ValueError:
+                        continue
+            elif data.ndim >= 2:
+                mask = _any_mask()
+                if mask.size:
+                    try:
+                        new_data = _mask_array(new_data, mask)
+                    except ValueError:
+                        pass
+
+            new_coeffs = value.coeffs
+            if new_coeffs is not None:
+                coeffs = new_coeffs.copy()
+                if value.field_names:
+                    for idx, fld in enumerate(value.field_names):
+                        mask = _union_mask_for(fld)
+                        if mask.size == 0:
+                            continue
+                        try:
+                            coeffs[idx] = _mask_array(coeffs[idx], mask)
+                        except ValueError:
+                            continue
+                else:
+                    mask = _any_mask()
+                    if mask.size:
+                        try:
+                            coeffs = _mask_array(coeffs, mask)
+                        except ValueError:
+                            pass
+                new_coeffs = coeffs
+
+            return value._with(new_data, coeffs=new_coeffs)
+        
+        if isinstance(value, HessOpInfo):
+            data = value.data
+            new_data = data.copy()
+            field_names = value.field_names or []
+
+            # Mask the (k,n,2,2) case; (k,2,2) is already collapsed — nothing to mask.
+            if data.ndim == 4:
+                if field_names:
+                    for idx, fld in enumerate(field_names):
+                        mask = _union_mask_for(fld)
+                        if mask.size == 0:
+                            continue
+                        try:
+                            new_data[idx] = _mask_array(new_data[idx], mask)
+                        except ValueError:
+                            continue
+                else:
+                    mask = _any_mask()
+                    if mask.size:
+                        try:
+                            new_data = _mask_array(new_data, mask)
+                        except ValueError:
+                            pass
+
+            new_coeffs = value.coeffs
+            if new_coeffs is not None:
+                coeffs = new_coeffs.copy()
+                if field_names:
+                    for idx, fld in enumerate(field_names):
+                        mask = _union_mask_for(fld)
+                        if mask.size == 0:
+                            continue
+                        try:
+                            coeffs[idx] = _mask_array(coeffs[idx], mask)
+                        except ValueError:
+                            continue
+                else:
+                    mask = _any_mask()
+                    if mask.size:
+                        try:
+                            coeffs = _mask_array(coeffs, mask)
+                        except ValueError:
+                            pass
+                new_coeffs = coeffs
+
+            return value._with(new_data, coeffs=new_coeffs)
+
+        return value
     
     def _visit_NormalComponent(self, n:NormalComponent):
         return self._visit_FacetNormal(FacetNormal())[n.idx]
@@ -645,11 +857,50 @@ class FormCompiler:
         # --------------------------------------------------------------
         # 2) Operand is *not* a Jump (previous logic, unchanged)
         # --------------------------------------------------------------
+        if isinstance(op.f, Restriction):
+            inner_deriv = Derivative(op.f.operand, *op.order)
+            result = self._visit(inner_deriv)
+
+            eid = self.ctx.get("eid")
+            if eid is None:
+                in_domain = True
+            else:
+                dom = op.f.domain
+                in_domain = dom[eid] if hasattr(dom, "__getitem__") else (eid in dom)
+
+            if in_domain:
+                return self._apply_restriction_mask(result, op.f)
+
+            if isinstance(result, (VecOpInfo, GradOpInfo)):
+                return result * 0.0
+            if isinstance(result, np.ndarray):
+                return np.zeros_like(result)
+            return 0.0
+
         fld, alpha = op.f.field_name, op.order
         row = self._lookup_basis(fld, alpha)[np.newaxis, :]      # (1,n)
 
         if op.f.is_function:
             coeffs = op.f.get_nodal_values(self._local_dofs())[np.newaxis, :]
+            gd = self.ctx.get("global_dofs")
+            if gd is not None:
+                side = self._get_side()
+                phi_aligned, coeffs_aligned = _hac._align_phi_and_coeffs_to_global(
+                    self.ctx, side, fld, row[0], coeffs[0]
+                )
+                row = phi_aligned[np.newaxis, :]
+                coeffs = coeffs_aligned[np.newaxis, :]
+            if self.ctx.get('is_ghost', False):
+                side = self._get_side()
+                if side == '+':
+                    gmask = self.ctx.get('coeff_mask_pos_global')
+                elif side == '-':
+                    gmask = self.ctx.get('coeff_mask_neg_global')
+                else:
+                    gmask = None
+                if gmask is not None:
+                    mask_arr = np.asarray(gmask, dtype=coeffs.dtype)
+                    coeffs = coeffs * mask_arr[np.newaxis, :]
             data, role = coeffs * row, "function"
         elif op.f.is_trial:
             data, role = row, "trial"
@@ -694,11 +945,15 @@ class FormCompiler:
         phi_old  = self.ctx.get('phi_val', None)
         side_old = self.ctx.get('side', None)
         eid_old  = self.ctx.get('eid', None)
+        x_old    = self.ctx.get('x_phys', None)
         try:
             # self.ctx['phi_val'] = +1.0 if side == '+' else -1.0
             self.ctx['side']    = side
             if eid_key in self.ctx:
                 self.ctx['eid'] = int(self.ctx[eid_key])
+            x_key = 'x_phys_pos' if side == '+' else ('x_phys_neg' if side == '-' else None)
+            if x_key and x_key in self.ctx:
+                self.ctx['x_phys'] = self.ctx[x_key]
             return self._visit(operand)
         finally:
             if phi_old  is None: self.ctx.pop('phi_val', None)
@@ -707,6 +962,8 @@ class FormCompiler:
             else:                self.ctx['side']    = side_old
             if eid_old  is None: self.ctx.pop('eid',     None)
             else:                self.ctx['eid']     = eid_old
+            if x_old is None: self.ctx.pop('x_phys', None)
+            else:             self.ctx['x_phys'] = x_old
     def _visit_Pos(self, n):
         if self._on_sided_path():
             return self._with_side('+', 'pos_eid', n.operand)
@@ -734,14 +991,21 @@ class FormCompiler:
         self.ctx['side']    = '+'
         if 'pos_eid' in self.ctx:
             self.ctx['eid'] = self.ctx['pos_eid']
-        u_pos = self._visit(n.u_pos)
 
+      
+        u_pos = self._visit(n.u_pos)
         # u(-)  on the – side / neg_eid
         self.ctx['phi_val'] = -1.0
         self.ctx['side']    = '-'
         if 'neg_eid' in self.ctx:
             self.ctx['eid'] = self.ctx['neg_eid']
-        u_neg = self._visit(n.u_neg)
+        
+        u_neg =  self._visit(n.u_neg)
+        # print(f"Jump: pos_eid={self.ctx.get('pos_eid')}, neg_eid={self.ctx.get('neg_eid')}"
+        #       f"; pos_map={self.ctx.get('pos_map')}, neg_map={self.ctx.get('neg_map')}"
+        #       f"; global_dofs={self.ctx.get('global_dofs')} "
+        #       f"; coeff_mask_pos_global={self.ctx.get('coeff_mask_pos_global')}, coeff_mask_neg_global={self.ctx.get('coeff_mask_neg_global')}")
+        # print(f"u_pos: {u_pos.data.sum()}, u_neg: {u_neg.data.sum()}")
 
         # restore
         if phi_old is None: self.ctx.pop('phi_val', None)
@@ -767,8 +1031,12 @@ class FormCompiler:
 
     def _visit_Function(self, n: Function):
         logger.debug(f"Visiting Function: {n.field_name}")
-        # gatting with the mask
-        self.ctx["mask_basis"] = True
+        # gating with the mask (respect existing flag if set by caller)
+        mask_flag_prev = self.ctx.get("mask_basis")
+        if mask_flag_prev is None:
+            self.ctx["mask_basis"] = False
+        else:
+            self.ctx["mask_basis"] = mask_flag_prev
 
         # element-union coeffs for the *current side* and the side-trace basis row
         local_dofs = self._local_dofs()
@@ -779,7 +1047,20 @@ class FormCompiler:
         gd = self.ctx.get("global_dofs", None)
         if gd is not None:
             side = self._get_side()  # '+' or '-'
-            basis_00, u_loc = _hac._align_phi_and_coeffs_to_global(self.ctx, side, n.field_name, basis_00, u_loc)
+            union_key = 'pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field'
+            union_backup = None
+            if not self.ctx.get('_restriction_mask_active', 0):
+                masks = self.ctx.get(union_key)
+                if isinstance(masks, dict) and masks:
+                    union_backup = masks
+                    self.ctx[union_key] = {f: np.ones_like(np.asarray(m, dtype=float)) for f, m in masks.items()}
+            try:
+                basis_00, u_loc = _hac._align_phi_and_coeffs_to_global(
+                    self.ctx, side, n.field_name, basis_00, u_loc
+                )
+            finally:
+                if union_backup is not None:
+                    self.ctx[union_key] = union_backup
 
         # Elementwise product: returns a single block (keep legacy shape: list of 1 vector)
         data = [u_loc * basis_00]
@@ -787,8 +1068,12 @@ class FormCompiler:
 
     def _visit_VectorFunction(self, n: VectorFunction):
         logger.debug(f"Visiting VectorFunction: {n.field_names}")
-        # gatting with the mask
-        self.ctx["mask_basis"] = True
+        # gating with the mask (respect existing flag if set by caller)
+        mask_flag_prev = self.ctx.get("mask_basis")
+        if mask_flag_prev is None:
+            self.ctx["mask_basis"] = False
+        else:
+            self.ctx["mask_basis"] = mask_flag_prev
         # Keep only components matching an explicit side (if any filter is in effect)
         names = _hfa._filter_fields_for_side(self, n, list(n.field_names))
         comp_by_name = {fn: comp for fn, comp in zip(n.field_names, n.components)}
@@ -802,7 +1087,20 @@ class FormCompiler:
             gd = self.ctx.get("global_dofs", None)
             if gd is not None:
                 side = self._get_side()
-                basis_00, coeffs = _hac._align_phi_and_coeffs_to_global(self.ctx, side, fld, basis_00, coeffs)
+                union_key = 'pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field'
+                union_backup = None
+                if not self.ctx.get('_restriction_mask_active', 0):
+                    masks = self.ctx.get(union_key)
+                    if isinstance(masks, dict) and masks:
+                        union_backup = masks
+                        self.ctx[union_key] = {f: np.ones_like(np.asarray(m, dtype=float)) for f, m in masks.items()}
+                try:
+                    basis_00, coeffs = _hac._align_phi_and_coeffs_to_global(
+                        self.ctx, side, fld, basis_00, coeffs
+                    )
+                finally:
+                    if union_backup is not None:
+                        self.ctx[union_key] = union_backup
 
             # Elementwise product per component
             blocks.append(coeffs * basis_00)
@@ -902,7 +1200,21 @@ class FormCompiler:
                         else:
                             coeffs = op.padded_values(local_dofs)
                         self._coeff_cache[key_c] = coeffs
-                    gval = np.einsum("nd,n->d", g, coeffs, optimize=True)  # (2,)
+                    coeffs_use = coeffs
+                    if self.ctx.get("global_dofs") is not None:
+                        side = self._get_side()
+                        coeffs_use = _hac._pad_coeffs_to_global(self.ctx, side, fld, coeffs)
+                        if self.ctx.get('is_ghost', False):
+                            if side == '+':
+                                gmask = self.ctx.get('coeff_mask_pos_global')
+                            elif side == '-':
+                                gmask = self.ctx.get('coeff_mask_neg_global')
+                            else:
+                                gmask = None
+                            if gmask is not None:
+                                mask_arr = np.asarray(gmask, dtype=coeffs_use.dtype)
+                                coeffs_use = coeffs_use * mask_arr
+                    gval = np.einsum("nd,n->d", g, coeffs_use, optimize=True)  # (2,)
                     self._collapsed_cache[key_coll] = gval
                 k_blocks.append(gval)
             return self._gradinfo(np.stack(k_blocks), role=role, node=op, field_names=fields)
@@ -928,6 +1240,45 @@ class FormCompiler:
             return self._visit(Pos(Hessian(op.operand)))
         if isinstance(op, Neg):
             return self._visit(Neg(Hessian(op.operand)))
+        if isinstance(op, Restriction):
+            # Evaluate the operand with a coefficient mask so the collapse respects the restriction
+            side = self._active_side()
+            eid  = self.ctx.get('pos_eid' if side == '+' else 'neg_eid', None)
+            gd   = self.ctx.get('global_dofs', None)
+            side = self._active_side()
+            if gd is None:
+                return self._apply_restriction_mask(self._visit(Hessian(op.operand)), op)
+
+            if self.ctx.get('is_ghost', False):
+                idx = self.ctx.get('pos_map' if side == '+' else 'neg_map', None)
+                gmask = np.zeros(len(gd), dtype=float)
+                if idx is not None:
+                    gmask[np.asarray(idx, dtype=int)] = 1.0
+            else:
+                # (interface path) keep existing φ‑side logic
+                level_set = self.ctx.get('_ghost_level_set', None)
+                pos_masks, neg_masks = _hfa.build_side_masks_by_field(self.dh, fields, int(eid), level_set, tol=SIDE.tol)
+                maps_by_field = self.ctx.get('pos_map_by_field' if side == '+' else 'neg_map_by_field', {})
+                gmask = np.zeros(len(gd), dtype=float)
+                for fld in fields:
+                    local = (pos_masks if side == '+' else neg_masks).get(fld)
+                    fmap  = maps_by_field.get(fld)
+                    if local is not None and fmap is not None and len(local) == len(fmap):
+                        gmask[np.asarray(fmap, dtype=int)] = np.asarray(local, dtype=float)
+
+
+            key = 'coeff_mask_pos_global' if side == '+' else 'coeff_mask_neg_global'
+            old_mask   = self.ctx.get(key, None)
+            old_ghost  = self.ctx.get('is_ghost', False)
+            self.ctx[key]   = gmask
+            self.ctx['is_ghost'] = True   # make Hessian path apply the coeff mask
+            try:
+                # Evaluate on the active side so eid/x_phys are consistent
+                return self._with_side(side, 'pos_eid' if side == '+' else 'neg_eid', Hessian(op.operand))
+            finally:
+                if old_mask is None: self.ctx.pop(key, None)
+                else:                 self.ctx[key] = old_mask
+                self.ctx['is_ghost'] = old_ghost
 
         # Role + component names
         if isinstance(op, (TestFunction, VectorTestFunction)):
@@ -963,7 +1314,21 @@ class FormCompiler:
                 if Hval is None:
                     Htbl   = self._hess(fld)             # (n, 2, 2); padded to union if on ghost/interface
                     coeffs = _get_coeff(i)               # (n,)
-                    Hval   = np.einsum("nij,n->ij", Htbl, coeffs, optimize=True)  # (2, 2)
+                    coeffs_use = coeffs
+                    if self.ctx.get("global_dofs") is not None:
+                        side = self._get_side()
+                        coeffs_use = _hac._pad_coeffs_to_global(self.ctx, side, fld, coeffs)
+                        if self.ctx.get('is_ghost', False):
+                            if side == '+':
+                                gmask = self.ctx.get('coeff_mask_pos_global')
+                            elif side == '-':
+                                gmask = self.ctx.get('coeff_mask_neg_global')
+                            else:
+                                gmask = None
+                            if gmask is not None:
+                                mask_arr = np.asarray(gmask, dtype=coeffs_use.dtype)
+                                coeffs_use = coeffs_use * mask_arr
+                    Hval   = np.einsum("nij,n->ij", Htbl, coeffs_use, optimize=True)  # (2, 2)
                     self._collapsed_cache[key_coll] = Hval
                 k_blocks.append(Hval)
 
@@ -1398,20 +1763,24 @@ class FormCompiler:
             # --- The rest of the dispatching logic remains the same ---
             if integral.measure.domain_type == "interface":
                 # Handle interface integrals with a level set
-                logger.info(f"Assembling interface integral: {integral}")
+                logger.info(f"Assembling interface integral: {integral} with backend {self.backend}")
+                # print(f"Assembling interface integral with backend {self.backend}")
                 self._assemble_interface(integral, target)
                 continue
             if integral.measure.domain_type == "volume":
                 # Handle volume integrals
-                logger.info(f"Assembling volume integral: {integral}")
+                logger.info(f"Assembling volume integral: {integral} with backend {self.backend}")
+                # print(f"Assembling volume integral with backend {self.backend}")
                 self._assemble_volume(integral, target)
                 continue
             if integral.measure.domain_type == "ghost_edge":
-                logger.info(f"Assembling ghost edge integral: {integral}")
+                logger.info(f"Assembling ghost edge integral: {integral} with backend {self.backend}")
+                # print(f"Assembling ghost edge integral with backend {self.backend}")
                 self._assemble_ghost_edge(integral, target)
                 continue
             if integral.measure.domain_type == "exterior_facet":
-                logger.info(f"Assembling exterior-facet integral: {integral}")
+                logger.info(f"Assembling exterior-facet integral: {integral} with backend {self.backend}")
+                # print(f"Assembling exterior-facet integral with backend {self.backend}")
                 self._assemble_boundary_edge(integral, target)
                 continue
 
@@ -1666,7 +2035,15 @@ class FormCompiler:
         geo_args_all = self.dh.precompute_geometric_factors(q_order, 
                                                             need_hess=need_hess, need_o3=need_o3, need_o4=need_o4,
                                                             deformation=deformation)
-        pre_built = {k: (v[element_ids] if isinstance(v, np.ndarray) else v) for k, v in geo_args_all.items()}
+        # Slice only tensors that are organised per-element along axis 0. Scalars or
+        # global tables (e.g. qp_ref with shape (n_q, 2)) must be reused as-is.
+        pre_built = {}
+        n_total = geo_args_all["qp_phys"].shape[0]
+        for key, val in geo_args_all.items():
+            if isinstance(val, np.ndarray) and val.ndim >= 1 and val.shape[0] == n_total:
+                pre_built[key] = val[element_ids]
+            else:
+                pre_built[key] = val
         pre_built["entity_kind"] = "element"
         pre_built["is_interface"] = False
         pre_built["owner_id"]    = geo_args_all.get("owner_id", geo_args_all.get("eids"))[element_ids]
@@ -2170,6 +2547,7 @@ class FormCompiler:
             self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], 0.0)
 
         # ------------------------ main loop over ghost edges ------------------------
+        self.ctx['_ghost_level_set'] = level_set
         try:
             for eid_edge in map(int, edge_ids):
                 e = mesh.edge(eid_edge)
@@ -2177,11 +2555,28 @@ class FormCompiler:
                 if e.right is None:
                     continue
 
+                def _eval_ls(eid: int, point) -> float:
+                    if hasattr(level_set, "value_on_element"):
+                        xi, eta = transform.inverse_mapping(mesh, int(eid), np.asarray(point))
+                        return float(level_set.value_on_element(int(eid), (float(xi), float(eta))))
+                    return float(level_set(point))
+
                 def choose_pos_neg_ids():
+                    tag = str(getattr(e, "tag", ""))
+                    if tag == "ghost_pos":
+                        return e.right, e.left
+                    if tag == "ghost_neg":
+                        return e.left, e.right
+                    tag_left  = getattr(mesh.elements_list[e.left],  "tag", "")
+                    tag_right = getattr(mesh.elements_list[e.right], "tag", "")
+                    if tag_left == "cut" and tag_right != "cut":
+                        return e.left, e.right
+                    if tag_right == "cut" and tag_left != "cut":
+                        return e.right, e.left
                     cL = np.asarray(mesh.elements_list[e.left ].centroid())
                     cR = np.asarray(mesh.elements_list[e.right].centroid())
-                    phiL = float(level_set(cL))
-                    phiR = float(level_set(cR))
+                    phiL = _eval_ls(e.left, cL)
+                    phiR = _eval_ls(e.right, cR)
                     if SIDE.is_pos(phiL) and not SIDE.is_pos(phiR):
                         return e.left, e.right
                     if SIDE.is_pos(phiR) and not SIDE.is_pos(phiL):
@@ -2191,12 +2586,14 @@ class FormCompiler:
 
 
                 pos_eid, neg_eid = choose_pos_neg_ids()
-                def get_normal_vec(e):
-                    p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+
+                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+
+                def get_normal_vec(eid_edge):
                     tangent = p1 - p0
-                    magnitude = max([np.linalg.norm(tangent) , 1e-16])
+                    magnitude = max(np.linalg.norm(tangent), 1e-16)
                     unit_tangent = tangent / magnitude
-                    unit_normal = np.array([unit_tangent[1], - unit_tangent[0]], float)
+                    unit_normal = np.array([unit_tangent[1], -unit_tangent[0]], float)
                     cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
                     cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
                     if np.dot(unit_normal, cpos - cneg) < 0.0:
@@ -2204,22 +2601,89 @@ class FormCompiler:
                     return unit_normal
 
                 # Edge quadrature (physical) and oriented normal (– → +)
-                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
                 qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
 
                 normal_vec = get_normal_vec(e)
-                
+
 
                 # Local union DOFs / accumulator
                  # Always compute union layout & maps; accumulator depends on functional vs mat/vec
                 pos_dofs = self.dh.get_elemental_dofs(pos_eid)
                 neg_dofs = self.dh.get_elemental_dofs(neg_eid)
                 global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+
                 pos_map = np.searchsorted(global_dofs, pos_dofs)
                 neg_map = np.searchsorted(global_dofs, neg_dofs)
-                pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
-                    self.dh, fields, pos_eid, neg_eid, global_dofs
-                )
+                pos_map_by_field: Dict[str, np.ndarray] = {}
+                neg_map_by_field: Dict[str, np.ndarray] = {}
+                for fld in fields:
+                    try:
+                        pos_field_dofs = _hfa.elemental_field_dofs(self.dh, int(pos_eid), fld)
+                        pos_map_by_field[fld] = np.asarray(
+                            np.searchsorted(global_dofs, pos_field_dofs), dtype=int
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        neg_field_dofs = _hfa.elemental_field_dofs(self.dh, int(neg_eid), fld)
+                        neg_map_by_field[fld] = np.asarray(
+                            np.searchsorted(global_dofs, neg_field_dofs), dtype=int
+                        )
+                    except Exception:
+                        pass
+
+                restriction_masks = {'+': {}, '-': {}}
+                try:
+                    pos_masks_pos, _ = _hfa.build_side_masks_by_field(
+                        self.dh, fields, int(pos_eid), level_set, tol=SIDE.tol
+                    )
+                except Exception:
+                    pos_masks_pos = {}
+                try:
+                    _, neg_masks_neg = _hfa.build_side_masks_by_field(
+                        self.dh, fields, int(neg_eid), level_set, tol=SIDE.tol
+                    )
+                except Exception:
+                    neg_masks_neg = {}
+
+                for fld in fields:
+                    mask = pos_masks_pos.get(fld)
+                    if mask is not None and fld in pos_map_by_field and len(mask) == len(pos_map_by_field[fld]):
+                        arr = np.zeros(len(global_dofs), dtype=float)
+                        arr[pos_map_by_field[fld]] = np.asarray(mask, dtype=float)
+                        restriction_masks['+'][fld] = arr
+                    mask = neg_masks_neg.get(fld)
+                    if mask is not None and fld in neg_map_by_field and len(mask) == len(neg_map_by_field[fld]):
+                        arr = np.zeros(len(global_dofs), dtype=float)
+                        arr[neg_map_by_field[fld]] = np.asarray(mask, dtype=float)
+                        restriction_masks['-'][fld] = arr
+
+                # mask_pos_global = np.ones(len(global_dofs), dtype=float)
+                # mask_neg_global = np.ones(len(global_dofs), dtype=float)
+                # After you have pos_map, neg_map, pos_map_by_field, neg_map_by_field and global_dofs:
+
+                # Element‑membership masks on the union (1 on this element’s dofs; 0 otherwise)
+                mask_pos_global = np.zeros(len(global_dofs), dtype=float)
+                mask_pos_global[np.asarray(pos_map, dtype=int)] = 1.0
+
+                mask_neg_global = np.zeros(len(global_dofs), dtype=float)
+                mask_neg_global[np.asarray(neg_map, dtype=int)] = 1.0
+
+                # Per‑field union masks for Restriction() (again, element membership)
+                pos_union_mask_by_field = {}
+                neg_union_mask_by_field = {}
+                for fld, idxs in pos_map_by_field.items():
+                    m = np.zeros(len(global_dofs), dtype=float)
+                    m[np.asarray(idxs, dtype=int)] = 1.0
+                    pos_union_mask_by_field[fld] = m
+
+                for fld, idxs in neg_map_by_field.items():
+                    m = np.zeros(len(global_dofs), dtype=float)
+                    m[np.asarray(idxs, dtype=int)] = 1.0
+                    neg_union_mask_by_field[fld] = m
+
+                restriction_masks = {'+': pos_union_mask_by_field, '-': neg_union_mask_by_field}
+
                 loc_acc = 0.0 if is_functional else (
                     np.zeros(len(global_dofs)) if rhs
                     else np.zeros((len(global_dofs), len(global_dofs)))
@@ -2231,18 +2695,33 @@ class FormCompiler:
                     bv = {"+": defaultdict(dict), "-": defaultdict(dict)}
 
                     # Context for visitors (enough info for _basis_row to compute & pad)
+                    # phi_here = _eval_ls(pos_eid, xq)
+                    # Ghost edges: both traces are taken at the *same* physical point on the edge.
+                    # Keep phi_here only for any side gating elsewhere; do not mirror.
+                    # phi_here = _eval_ls(pos_eid, xq)
+                    x_pos = xq
+                    x_neg = xq
+
                     self.ctx.update({
                         "basis_values": bv,          # per-QP, side-aware derivative cache
                         "normal": normal_vec,
-                        "phi_val": level_set(xq),    # used if 'side' isn't set explicitly
+                        # "phi_val": phi_here,         # used if 'side' isn't set explicitly
+                        "x_phys_pos": x_pos,
+                        "x_phys_neg": x_neg,
                         "x_phys": xq,
-                        "global_dofs": (global_dofs if not is_functional else None),
-                        "pos_map": (pos_map if not is_functional else None),
-                        "neg_map": (neg_map if not is_functional else None),
-                        "pos_map_by_field": (pos_map_by_field if not is_functional else None),
-                        "neg_map_by_field": (neg_map_by_field if not is_functional else None),
+                        "global_dofs": global_dofs,
+                        "pos_map": pos_map,
+                        "neg_map": neg_map,
+                        "pos_map_by_field": pos_map_by_field,
+                        "neg_map_by_field": neg_map_by_field,
+                        "coeff_mask_pos_global": mask_pos_global,
+                        "coeff_mask_neg_global": mask_neg_global,
+                        "_restriction_masks": restriction_masks,
+                        "mask_basis": False,
                         "pos_eid": pos_eid,
-                        "neg_eid": neg_eid
+                        "neg_eid": neg_eid,
+                        "use_union_local_dofs": is_functional,
+                        "_ghost_level_set": level_set,
                     })
 
 
@@ -2263,18 +2742,30 @@ class FormCompiler:
                 if is_functional:
                     self.ctx["scalar_results"][hook["name"]] += loc_acc
                 else:
+                    unique_dofs, union_to_unique = np.unique(global_dofs, return_inverse=True)
                     if rhs:
-                        np.add.at(matvec, global_dofs, loc_acc)
+                        agg = np.zeros(len(unique_dofs), dtype=loc_acc.dtype)
+                        np.add.at(agg, union_to_unique, loc_acc)
+                        np.add.at(matvec, unique_dofs, agg)
                     else:
-                        r, c = np.meshgrid(global_dofs, global_dofs, indexing="ij")
-                        matvec[r, c] += loc_acc
+                        agg = np.zeros((len(unique_dofs), len(unique_dofs)), dtype=loc_acc.dtype)
+                        np.add.at(agg, (union_to_unique[:, None], union_to_unique[None, :]), loc_acc)
+                        r, c = np.meshgrid(unique_dofs, unique_dofs, indexing="ij")
+                        matvec[r, c] += agg
 
         finally:
             # Clean context keys we may have set
             for k in ("basis_values", "normal", "phi_val", "x_phys",
+                    "x_phys_pos", "x_phys_neg",
                     "global_dofs", "pos_map", "neg_map", "pos_eid", "neg_eid",
-                    "pos_map_by_field", "neg_map_by_field", "is_interface"):
+                    "pos_map_by_field", "neg_map_by_field",
+                    "coeff_mask_pos_global", "coeff_mask_neg_global",
+                    "_restriction_masks",
+                    "use_union_local_dofs",
+                    "mask_basis",
+                    "is_interface"):
                 self.ctx.pop(k, None)
+            self.ctx.pop('_ghost_level_set', None)
 
 
     
@@ -2310,7 +2801,10 @@ class FormCompiler:
         # ------------------------------------------------------------------
         # 2. Pre‑compute geometry for the interface elements only
         # ------------------------------------------------------------------
-        qdeg      = self._find_q_order(intg)
+        md = intg.measure.metadata or {}
+        qdeg = self._find_q_order(intg)
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        qdeg += 2 * max(0, p_geo - 1)
         level_set = intg.measure.level_set
         if level_set is None:
             raise ValueError("dInterface measure requires a level_set.")
@@ -2318,9 +2812,22 @@ class FormCompiler:
 
         runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
-        geo = dh.precompute_interface_factors(cut_bs, qdeg, level_set, 
-                                              need_hess=need_hess, need_o3=need_o3, need_o4=need_o4,
-                                              deformation=getattr(intg.measure, "deformation", None))
+        nseg_hint = md.get("nseg")
+        if nseg_hint is not None:
+            try:
+                nseg_hint = int(nseg_hint)
+            except Exception:
+                nseg_hint = None
+        geo = dh.precompute_interface_factors(
+            cut_bs,
+            qdeg,
+            level_set,
+            nseg=nseg_hint,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            deformation=getattr(intg.measure, "deformation", None),
+        )
         geo["is_interface"] = True
         cut_eids = geo["eids"].astype(np.int32)      # 1‑D array, len = n_cut
 
@@ -2555,6 +3062,9 @@ class FormCompiler:
         if self.backend == "python":
             self._assemble_ghost_edge_python(intg, matvec)
         elif self.backend == "jit":
+            if any(isinstance(node, Function) for node in _find_all(intg.integrand, Function)):
+                self._assemble_ghost_edge_python(intg, matvec)
+                return
             self._assemble_ghost_edge_jit(intg, matvec)
         else:
             raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")

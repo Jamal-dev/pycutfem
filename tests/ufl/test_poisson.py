@@ -4,7 +4,7 @@ import scipy.sparse as spla
 from numpy.testing import assert_allclose
 
 # --- Imports from your project structure ---
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 from pycutfem.utils.meshgen import structured_quad
 # Imports from the new UFL-like library
 from pycutfem.ufl.expressions import TrialFunction,dot, TestFunction, Constant, grad, inner

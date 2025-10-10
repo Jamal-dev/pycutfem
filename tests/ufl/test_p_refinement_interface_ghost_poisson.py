@@ -51,8 +51,8 @@ def ghost_energy(elem_type: str, p: int, nx=14, ny=14) -> float:
     mesh.build_interface_segments(ls)
 
     # Ghost patches on both sides (include interface set too)
-    ghost_pos = mesh.edge_bitset("ghost_pos") | mesh.edge_bitset("ghost_both") | mesh.edge_bitset("interface")
-    ghost_neg = mesh.edge_bitset("ghost_neg") | mesh.edge_bitset("ghost_both") | mesh.edge_bitset("interface")
+    ghost_pos = mesh.edge_bitset("ghost_pos") | mesh.edge_bitset("ghost_both") #| mesh.edge_bitset("interface")
+    ghost_neg = mesh.edge_bitset("ghost_neg") | mesh.edge_bitset("ghost_both") #| mesh.edge_bitset("interface")
 
     # FE space + handler
     me = MixedElement(mesh, field_specs={'u': p})

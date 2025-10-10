@@ -17,7 +17,7 @@ class KernelCache:
     get_kernel(ir_sequence, codegen) -> (callable kernel, param_order list)
     """
 
-    _CACHE_DIR = Path.home() / ".cache" / "pycutfem_jit"
+    _CACHE_DIR = Path(os.environ.get("PYCUTFEM_CACHE_DIR", Path.home() / ".cache" / "pycutfem_jit")).expanduser()
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     def __init__(self) -> None:
@@ -86,6 +86,7 @@ class KernelCache:
     @contextmanager
     def _file_lock(self, file: Path):
         lock_path = file.with_suffix(".lock")
+        fd = None
         while True:
             try:
                 fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
@@ -94,14 +95,19 @@ class KernelCache:
                 # another proc has the lock; wait&retry
                 import time
                 time.sleep(0.05)
+            except PermissionError:
+                # Filesystems without O_EXCL (e.g. sandboxed /dev/shm) → fall back
+                fd = None
+                break
         try:
             yield
         finally:
-            os.close(fd)
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
+            if fd is not None:
+                os.close(fd)
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     # ..................................................................
     def _compile_and_write(self, target: Path, ir_seq, codegen):

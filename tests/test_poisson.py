@@ -4,7 +4,7 @@ import scipy.sparse.linalg as spla
 import sympy as sp
 
 from pycutfem.utils.meshgen import structured_quad, delaunay_rectangle, structured_triangles
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 from pycutfem.assembly import stiffness_matrix, assemble
 from pycutfem.assembly.load_vector import cg_element_load
 from pycutfem.assembly.boundary_conditions import apply_dirichlet

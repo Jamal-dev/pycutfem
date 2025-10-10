@@ -4,7 +4,7 @@ from numpy.testing import assert_equal
 import matplotlib.pyplot as plt
 
 # --- Imports from your project structure ---
-from pycutfem.core import Mesh
+from pycutfem.core.mesh import Mesh
 from pycutfem.utils.meshgen import structured_quad
 
 # --- Test Cases for Mesh Topology ---

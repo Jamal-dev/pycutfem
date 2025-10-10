@@ -173,6 +173,7 @@ rigid_domain = get_domain_bitset(mesh, "element", "inside")
 cut_domain = get_domain_bitset(mesh, "element", "cut")
 ghost_edges = mesh.edge_bitset('ghost')
 physical_domain = fluid_domain | cut_domain
+has_rigid_domain = rigid_domain | cut_domain
 
 # --- Finite Element Space and DofHandler ---
 # Taylor-Hood elements (Q2 for velocity, Q1 for pressure)
@@ -287,6 +288,8 @@ u_k = VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handl
 p_k = Function(name="p_k", field_name='p', dof_handler=dof_handler, side = '+')
 u_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handler, side = '+')
 p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler, side = '+')
+# p_trial_neg   = TrialFunction('p_neg_', dof_handler,name='pressure_neg_trial', side='-')
+# q_test_neg    = TestFunction ('p_neg_', dof_handler,name='pressure_neg_test', side='-')
 lambda_k = Function(name="lambda_k", field_name='lm', dof_handler=dof_handler)
 lambda_n = Function(name="lambda_n", field_name='lm', dof_handler=dof_handler)
 
@@ -495,6 +498,8 @@ def make_peak_filter_cb(
 from pycutfem.ufl.expressions import Derivative, FacetNormal, restrict, Hessian, Pos
 from pycutfem.core.geometry import hansbo_cut_ratio
 from pycutfem.ufl.expressions import ElementWiseConstant
+from pycutfem.ufl.expressions import Pos, Neg, Grad, Dot, FacetNormal, Constant
+
 
 n = FacetNormal()                    # vector expression (n_x, n_y)
 n_f = FacetNormal()                  # vector expression (n_x, n_y) on the fluid side
@@ -555,6 +560,12 @@ dx_phys  = dx(
     metadata={"q": volume_quadrature, "side": "+"},
     deformation=deformation,
 )
+dx_neg  = dx(
+    defined_on=physical_domain,
+    level_set=level_set,
+    metadata={"q": volume_quadrature, "side": "-"},
+    deformation=deformation,
+)
 dΓ        = dInterface(
     defined_on=mesh.element_bitset('cut'),
     level_set=level_set,
@@ -574,6 +585,8 @@ q_test_phys = restrict(q, physical_domain)
 u_k_phys = restrict(u_k, physical_domain)
 p_k_phys = restrict(p_k, physical_domain)
 u_n_phys = restrict(u_n, physical_domain)
+q_test_neg = restrict(q, has_rigid_domain)
+p_trial_neg = restrict(dp, has_rigid_domain)
 
 cell_h  = CellDiameter() # length‑scale per element
 beta_N  = Constant(20.0 * fe_order**2)      # Nitsche penalty (tweak)
@@ -654,8 +667,8 @@ r_vol = (
     + q_test_phys * div(u_k_phys)
 ) * dx_phys
 
-a_vol += (nL * q_test_phys + mL * p_trial_phys) * dx_phys
-r_vol += (mL * p_k_phys + lambda_k * q_test_phys) * dx_phys
+a_vol += (nL * Neg(q_test_neg) + mL * Neg(p_trial_neg)) * dx_neg
+# r_vol += (mL * p_k_phys + lambda_k * q_test_phys) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
 penalty_val = 1e-3
@@ -712,7 +725,6 @@ from pycutfem.io.vtk import export_vtk
 from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.fem import transform
-from pycutfem.ufl.expressions import Pos, Neg, Grad, Dot, FacetNormal, Constant
 
 output_dir = "turek_results"
 os.makedirs(output_dir, exist_ok=True)
