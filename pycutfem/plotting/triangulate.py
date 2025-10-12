@@ -30,12 +30,11 @@ def triangulate_field(mesh, dof_handler, field: str, *, strict=False):
     # ------------------------------------------------------------------
     # 1.  Coordinates of *all* DOFs that belong to <field>
     # ------------------------------------------------------------------
-    gdofs   = dof_handler.get_field_slice(field)
-    node_ids = [dof_handler._dof_to_node_map[d][1] for d in gdofs]
-    coords   = mesh.nodes_x_y_pos[node_ids]
-    x, y     = coords[:,0], coords[:,1]
+    gdofs = dof_handler.get_field_slice(field)
+    coords = dof_handler.get_dof_coords(field)
+    x, y = coords[:, 0], coords[:, 1]
 
-    id2local = {nid: i for i, nid in enumerate(node_ids)}
+    dof2local = {int(g): i for i, g in enumerate(gdofs)}
     tris     = []
 
     # ------------------------------------------------------------------
@@ -47,7 +46,13 @@ def triangulate_field(mesh, dof_handler, field: str, *, strict=False):
             if strict: raise ValueError(f"Element {eid} has <3 DOFs for '{field}'.")
             continue
 
-        local_ids   = [id2local[dof_handler._dof_to_node_map[d][1]] for d in edofs]
+        try:
+            local_ids = [dof2local[int(d)] for d in edofs]
+        except KeyError:
+            if strict:
+                missing = [int(d) for d in edofs if int(d) not in dof2local]
+                raise ValueError(f"Element {eid} has DOFs {missing} not present in field '{field}'.")
+            continue
         sub_coords  = coords[local_ids]
 
         # local Delaunay (matplotlib already has a C implementation)

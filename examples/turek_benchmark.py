@@ -554,7 +554,7 @@ def nHn(expr,n):
 
 
 
-ghost_edges_used = mesh.edge_bitset('ghost_pos') #| mesh.edge_bitset('ghost_both') | mesh.edge_bitset('interface')
+ghost_edges_used = mesh.edge_bitset('ghost_pos') | mesh.edge_bitset('interface') #| mesh.edge_bitset('ghost_both')
 dx_phys  = dx(
     defined_on=physical_domain,
     level_set=level_set,
