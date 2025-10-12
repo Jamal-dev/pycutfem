@@ -992,14 +992,24 @@ class FormCompiler:
         if 'pos_eid' in self.ctx:
             self.ctx['eid'] = self.ctx['pos_eid']
 
-      
+        def pos_gatting(u_pos):
+            if SIDE.is_pos(phi_old):
+                return u_pos
+            else:
+                return u_pos * 0.0
+        def neg_gatting(u_neg):
+            if SIDE.is_pos(phi_old):
+                return u_neg * 0.0
+            else:
+                return u_neg
+            
         u_pos = self._visit(n.u_pos)
         # u(-)  on the – side / neg_eid
         self.ctx['phi_val'] = -1.0
         self.ctx['side']    = '-'
         if 'neg_eid' in self.ctx:
             self.ctx['eid'] = self.ctx['neg_eid']
-        
+
         u_neg =  self._visit(n.u_neg)
         # print(f"Jump: pos_eid={self.ctx.get('pos_eid')}, neg_eid={self.ctx.get('neg_eid')}"
         #       f"; pos_map={self.ctx.get('pos_map')}, neg_map={self.ctx.get('neg_map')}"
@@ -2632,7 +2642,7 @@ class FormCompiler:
                     except Exception:
                         pass
 
-                restriction_masks = {'+': {}, '-': {}}
+                restriction_masks_phi = {'+': {}, '-': {}}
                 try:
                     pos_masks_pos, _ = _hfa.build_side_masks_by_field(
                         self.dh, fields, int(pos_eid), level_set, tol=SIDE.tol
@@ -2651,12 +2661,12 @@ class FormCompiler:
                     if mask is not None and fld in pos_map_by_field and len(mask) == len(pos_map_by_field[fld]):
                         arr = np.zeros(len(global_dofs), dtype=float)
                         arr[pos_map_by_field[fld]] = np.asarray(mask, dtype=float)
-                        restriction_masks['+'][fld] = arr
+                        restriction_masks_phi['+'][fld] = arr
                     mask = neg_masks_neg.get(fld)
                     if mask is not None and fld in neg_map_by_field and len(mask) == len(neg_map_by_field[fld]):
                         arr = np.zeros(len(global_dofs), dtype=float)
                         arr[neg_map_by_field[fld]] = np.asarray(mask, dtype=float)
-                        restriction_masks['-'][fld] = arr
+                        restriction_masks_phi['-'][fld] = arr
 
                 # mask_pos_global = np.ones(len(global_dofs), dtype=float)
                 # mask_neg_global = np.ones(len(global_dofs), dtype=float)
@@ -2682,7 +2692,7 @@ class FormCompiler:
                     m[np.asarray(idxs, dtype=int)] = 1.0
                     neg_union_mask_by_field[fld] = m
 
-                restriction_masks = {'+': pos_union_mask_by_field, '-': neg_union_mask_by_field}
+                restriction_masks_union = {'+': pos_union_mask_by_field, '-': neg_union_mask_by_field}
 
                 loc_acc = 0.0 if is_functional else (
                     np.zeros(len(global_dofs)) if rhs
@@ -2695,7 +2705,7 @@ class FormCompiler:
                     bv = {"+": defaultdict(dict), "-": defaultdict(dict)}
 
                     # Context for visitors (enough info for _basis_row to compute & pad)
-                    # phi_here = _eval_ls(pos_eid, xq)
+                    phi_here = _eval_ls(pos_eid, xq)
                     # Ghost edges: both traces are taken at the *same* physical point on the edge.
                     # Keep phi_here only for any side gating elsewhere; do not mirror.
                     # phi_here = _eval_ls(pos_eid, xq)
@@ -2705,7 +2715,7 @@ class FormCompiler:
                     self.ctx.update({
                         "basis_values": bv,          # per-QP, side-aware derivative cache
                         "normal": normal_vec,
-                        # "phi_val": phi_here,         # used if 'side' isn't set explicitly
+                        "phi_val": phi_here,         # used if 'side' isn't set explicitly
                         "x_phys_pos": x_pos,
                         "x_phys_neg": x_neg,
                         "x_phys": xq,
@@ -2714,9 +2724,11 @@ class FormCompiler:
                         "neg_map": neg_map,
                         "pos_map_by_field": pos_map_by_field,
                         "neg_map_by_field": neg_map_by_field,
+                        "pos_union_mask_by_field": pos_union_mask_by_field,
+                        "neg_union_mask_by_field": neg_union_mask_by_field,
                         "coeff_mask_pos_global": mask_pos_global,
                         "coeff_mask_neg_global": mask_neg_global,
-                        "_restriction_masks": restriction_masks,
+                        "_restriction_masks": restriction_masks_phi,
                         "mask_basis": False,
                         "pos_eid": pos_eid,
                         "neg_eid": neg_eid,
@@ -2742,6 +2754,8 @@ class FormCompiler:
                 if is_functional:
                     self.ctx["scalar_results"][hook["name"]] += loc_acc
                 else:
+                    if not rhs and loc_acc.ndim == 2:
+                        loc_acc = 0.5 * (loc_acc + loc_acc.T)
                     unique_dofs, union_to_unique = np.unique(global_dofs, return_inverse=True)
                     if rhs:
                         agg = np.zeros(len(unique_dofs), dtype=loc_acc.dtype)
@@ -2759,6 +2773,7 @@ class FormCompiler:
                     "x_phys_pos", "x_phys_neg",
                     "global_dofs", "pos_map", "neg_map", "pos_eid", "neg_eid",
                     "pos_map_by_field", "neg_map_by_field",
+                    "pos_union_mask_by_field", "neg_union_mask_by_field",
                     "coeff_mask_pos_global", "coeff_mask_neg_global",
                     "_restriction_masks",
                     "use_union_local_dofs",

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from re import A
 import time
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Callable, Optional, Tuple
 import inspect
@@ -35,7 +36,17 @@ try:
 except ImportError:
     giant_solver = None
     HAS_GIANT = False
-from petsc4py import PETSc
+_skip_petsc = os.getenv("PYCUTFEM_SKIP_PETSC", "").lower() in {"1", "true", "yes"}
+if not _skip_petsc:
+    try:
+        from petsc4py import PETSc
+        HAS_PETSC = True
+    except Exception:  # noqa: PERF203
+        PETSc = None
+        HAS_PETSC = False
+else:
+    PETSc = None
+    HAS_PETSC = False
 import sys
 
 def _scatter_element_contribs(
@@ -327,12 +338,22 @@ class NewtonSolver:
         )
         ndof = self.dh.total_dofs
         bc_dofs = set(self.dh.get_dirichlet_data(bcs_for_active).keys())
-        # 2) Free DOFs = (Restriction-active DOFs) \ (Dirichlet DOFs),
-        #    or (All DOFs) \ (Dirichlet DOFs) when no Restriction.
-        if has_restriction:
-            free = sorted(set(active_by_restr) - bc_dofs)
-        else:
-            free = sorted(set(range(ndof)) - bc_dofs)
+
+        # Candidate DOFs that would remain without explicit drops
+        candidate = set(active_by_restr) if has_restriction else set(range(ndof))
+
+        # Optional DOF tags (e.g. CutFEM inactive regions) are honoured here.
+        inactive_dofs: set[int] = set()
+        dh_tags = getattr(self.dh, "dof_tags", None)
+        if dh_tags:
+            inactive_dofs = set(dh_tags.get("inactive", set()))
+        # Remove DOFs tagged inactive but not already fixed by Dirichlet BCs
+        inactive_free = inactive_dofs - bc_dofs
+        inactive_removed = len(inactive_free & candidate)
+
+        # 2) Free DOFs = candidate DOFs \ (Dirichlet ∪ inactive)
+        free_set = (candidate - bc_dofs) - inactive_free
+        free = sorted(free_set)
 
         self.active_dofs = np.asarray(free, dtype=int)
         nfree = self.active_dofs.size
@@ -351,6 +372,12 @@ class NewtonSolver:
 
         # Optional sanity log:
         print(f"  Dirichlet DOFs detected: {len(bc_dofs)}; Free DOFs: {nfree}")
+        if inactive_dofs:
+            print(f"  Inactive DOFs tagged: {len(inactive_dofs)} (unique)")
+            if inactive_removed:
+                print(f"  Inactive DOFs dropped: {inactive_removed}")
+            else:
+                print("  Inactive DOFs already excluded by restriction domains.")
 
         # Build once: CSR structure & per-element scatter plan for reduced system
         self._build_reduced_pattern()
@@ -526,6 +553,9 @@ class NewtonSolver:
             print("        [warn] active_dofs == total_dofs — reduced path = full size."
                 " Check that bcs_homog correctly marks Dirichlet nodes.")
 
+        self._last_iter_timings = []
+        totals = {"assembly": 0.0, "linear_solve": 0.0, "line_search": 0.0}
+        temp_t0 = time.perf_counter()
         for it in range(self.np.max_newton_iter):
             if self.pre_cb is not None:
                 self.pre_cb(funcs)
@@ -537,7 +567,10 @@ class NewtonSolver:
                 current.update(aux_funcs)
 
             # 1) Assemble reduced system: A_ff δU_f = -R_f
+            assembly_time = 0.0
+            t_asm = time.perf_counter()
             A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
+            assembly_time += time.perf_counter() - t_asm
 
             # 1a) PRUNE decoupled rows caused by Restriction (nnz==0)
             row_nnz = np.diff(A_red.indptr)
@@ -555,27 +588,53 @@ class NewtonSolver:
                 # rebuild reduced CSR scatter pattern
                 self._build_reduced_pattern()
                 # re-assemble on the cleaned support
+                t_asm = time.perf_counter()
                 A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
+                assembly_time += time.perf_counter() - t_asm
 
             # Log residual with a full-size view (zeros on fixed DOFs) for readability
             R_full = np.zeros(ndof)
             R_full[self.active_dofs] = R_red
             norm_R = np.linalg.norm(R_full, ord=np.inf)
-            print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}")
+            t_current = time.perf_counter()
+            t_iteration = t_current - temp_t0
+            temp_t0 = t_current
+            print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}, time = {t_iteration}s")
+            linear_time = 0.0
+            line_search_time = 0.0
             if norm_R < self.np.newton_tol:
                 # Converged — return *time-step* increment for all fields
                 delta = np.hstack([
                     f.nodal_values - f_prev.nodal_values
                     for f, f_prev in zip(funcs, prev_funcs)
                 ])
+                totals["assembly"] += assembly_time
+                self._last_iter_timings.append(
+                    {
+                        "iteration": it + 1,
+                        "assembly": assembly_time,
+                        "linear_solve": 0.0,
+                        "line_search": 0.0,
+                    }
+                )
+                self._last_iteration_totals = totals
+                print(
+                    "          timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                        assembly_time, 0.0, 0.0
+                    )
+                )
                 return delta
 
             # 2) Compute reduced Newton direction
+            t_lin = time.perf_counter()
             dU_red = self._solve_linear_system(A_red, -R_red)
+            linear_time = time.perf_counter() - t_lin
 
             # 3) Optional Armijo backtracking in reduced space (no BC re-application inside)
             if getattr(self.np, "line_search", False):
+                t_ls = time.perf_counter()
                 dU_red = self._line_search_reduced(A_red, R_red, dU_red, funcs, current, bcs_now)
+                line_search_time = time.perf_counter() - t_ls
 
             # 4) Apply accepted step: expand reduced → full, update fields, then re-impose BCs
             dU_full = np.zeros(ndof)
@@ -588,7 +647,25 @@ class NewtonSolver:
             if self.post_cb is not None:
                 self.post_cb(funcs)
 
+            totals["assembly"] += assembly_time
+            totals["linear_solve"] += linear_time
+            totals["line_search"] += line_search_time
+            self._last_iter_timings.append(
+                {
+                    "iteration": it + 1,
+                    "assembly": assembly_time,
+                    "linear_solve": linear_time,
+                    "line_search": line_search_time,
+                }
+            )
+            print(
+                "          timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                    assembly_time, linear_time, line_search_time
+                )
+            )
+
         # If we get here, Newton did not converge within the iteration budget
+        self._last_iteration_totals = totals
         raise RuntimeError("Newton did not converge – adjust Δt or verify Jacobian.")
 
 
@@ -973,18 +1050,32 @@ class NewtonSolver:
         data = np.zeros(indices.size, dtype=float)
         R = np.zeros(n, dtype=float)
 
+        profile = os.getenv("PYCUTFEM_PROFILE_KERNELS", "").lower() in {"1", "true", "yes"}
+        prof_entries = []
+
         # Matrix (Jacobian) blocks
         for ker, pos_list, lidx_list in zip(self.kernels_K, self._elem_pos, self._elem_lidx):
+            t_exec = time.perf_counter()
             Kloc, _, _ = ker.exec(coeffs)  # shape [nel, nloc, nloc]
+            exec_time = time.perf_counter() - t_exec
+            t_scatter = time.perf_counter()
             for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
                 if pflat.size == 0:
                     continue
                 Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
                 data[pflat] += Kel
+            scatter_time = time.perf_counter() - t_scatter
+            if profile:
+                prof_entries.append(
+                    ("jacobian", getattr(ker, "domain", "unknown"), exec_time, scatter_time, len(pos_list))
+                )
 
         # Residual blocks
         for ker in self.kernels_F:
+            t_exec = time.perf_counter()
             _, Floc, _ = ker.exec(coeffs)  # [nel, nloc]
+            exec_time = time.perf_counter() - t_exec
+            t_scatter = time.perf_counter()
             gdofs = ker.static_args["gdofs_map"]
             for e in range(gdofs.shape[0]):
                 rmap = self.full_to_red[gdofs[e]]
@@ -993,8 +1084,21 @@ class NewtonSolver:
                     continue
                 rows = rmap[mask]
                 np.add.at(R, rows, Floc[e][mask])
+            scatter_time = time.perf_counter() - t_scatter
+            if profile:
+                prof_entries.append(
+                    ("residual", getattr(ker, "domain", "unknown"), exec_time, scatter_time, gdofs.shape[0])
+                )
 
         A = sp.csr_matrix((data, indices, indptr), shape=(n, n))
+
+        if profile and prof_entries:
+            print("        [profile] kernel timings (type, domain, exec, scatter, n_elem):")
+            for kind, domain, exec_time, scatter_time, nelem in prof_entries:
+                print(
+                    f"          {kind:8} {domain:12} exec={exec_time:.3e}s scatter={scatter_time:.3e}s elems={nelem}"
+                )
+
         return A, R
 
 
@@ -1051,6 +1155,8 @@ class PetscSnesNewtonSolver(NewtonSolver):
     """
 
     def __init__(self, *args, petsc_options: Optional[Dict] = None, **kwargs):
+        if not HAS_PETSC:
+            raise RuntimeError("petsc4py is not available; PetscSnesNewtonSolver cannot be used.")
         super().__init__(*args, **kwargs)
         self.petsc_options = dict(petsc_options or {})
         self._petsc_ctx: Dict = {}

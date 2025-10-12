@@ -255,7 +255,11 @@ class NumbaCodeGen:
                 # Compute a safe global element id, no exceptions
                 body_lines.append("eid = owner_id[e]  # global element id OR owner-element id for facets")
                 body_lines.append(f"flag = (0 <= eid < {bs}.shape[0]) and {bs}[eid]")
-                body_lines.append(f"{out} = {a.var_name} if flag else np.zeros_like({a.var_name}, dtype={self.dtype})")
+                if a.shape == () or a.shape == tuple():
+                    zero_expr = "0.0"
+                else:
+                    zero_expr = f"np.zeros_like({a.var_name}, dtype={self.dtype})"
+                body_lines.append(f"{out} = {a.var_name} if flag else {zero_expr}")
 
                 stack.append(a._replace(var_name=out))
             
@@ -3051,7 +3055,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = True
+            DEBUG: bool = False
         ):
         """
         Build complete kernel source code with parallel assembly.
@@ -3109,7 +3113,7 @@ class NumbaCodeGen:
 
         decorator = ""
         if not DEBUG:
-            decorator = "@numba.njit(parallel=True, fastmath=True)"
+            decorator = "@numba.njit(parallel=True, fastmath=True, cache=True)"
         # New Newton: The kernel signature and loop structure are updated.
         final_kernel_src = f"""
 import numba

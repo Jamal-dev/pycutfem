@@ -102,7 +102,7 @@ print(f"Geometry order={geom_order}, FE order={fe_order}")
 from pycutfem.utils.adaptive_mesh_ls_numba import structured_quad_levelset_adaptive
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-NX, NY = 25, 25
+NX, NY = 65, 45
 # NX, NY = 30, 40
 analytic_level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 )
 # h  = 0.5*(L/NX + H/NY)
@@ -229,6 +229,7 @@ print(f"Pinning pressure at the node closest to {target_point}, found at {actual
 # Tag velocity DOFs inside the cylinder (same tag name for both fields is OK)
 dof_handler.tag_dofs_from_element_bitset("inactive", "ux", "inside", strict=True)
 dof_handler.tag_dofs_from_element_bitset("inactive", "uy", "inside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "p", "inside", strict=True)
 
 
 # In[7]:
@@ -294,7 +295,7 @@ lambda_k = Function(name="lambda_k", field_name='lm', dof_handler=dof_handler)
 lambda_n = Function(name="lambda_n", field_name='lm', dof_handler=dof_handler)
 
 # --- Parameters ---
-dt = Constant(0.5)
+dt = Constant(0.15)
 theta = Constant(0.5) # Crank-Nicolson
 mu_const = Constant(mu)
 rho_const = Constant(rho)
@@ -553,7 +554,7 @@ def nHn(expr,n):
 
 
 
-ghost_edges_used = mesh.edge_bitset('ghost_pos') | mesh.edge_bitset('ghost_both') | mesh.edge_bitset('interface')
+ghost_edges_used = mesh.edge_bitset('ghost_pos') #| mesh.edge_bitset('ghost_both') | mesh.edge_bitset('interface')
 dx_phys  = dx(
     defined_on=physical_domain,
     level_set=level_set,
@@ -604,7 +605,7 @@ def scaled_penalty_interface(penalty, poly_order=fe_order,
 
     # 3) Final penalty (symbolic EWC × expression)
     return β_visc + β_iner
-β = scaled_penalty_interface(10.0, side='+')  # Nitsche penalty
+β = scaled_penalty_interface(20.0, side='+')  # Nitsche penalty
 
 def epsilon(u):
     "Symmetric gradient."

@@ -86,7 +86,7 @@ class KernelRunner:
         gdofs_map = kernel_args["gdofs_map"]          # ndarray, safe to use
 
         # ------------------------------------------------------------------
-        # C)  inject *fresh* coefficient blocks for every Function
+        # C)  inject coefficient blocks for every Function
         #      – volume ( ..._loc )
         #      – ghost  ( ..._pos_loc, ..._neg_loc )
         # ------------------------------------------------------------------
@@ -95,17 +95,19 @@ class KernelRunner:
 
         # helper ------------------------------------------------------------
         n_union = gdofs_map.shape[1]
-        # print(f"KernelRunner: gdofs_map.shape={gdofs_map.shape}, n_union={n_union}")
-        def _gather(side_map, tag):
+        total_dofs = self.dof_handler.total_dofs
+        full_cache: dict[int, np.ndarray] = {}
+
+        def _gather(full_vec: np.ndarray, side_map, tag, name):
             if side_map is None:
                 return
-            # print(f"KernelRunner: side_map.shape={side_map.shape}, tag={tag}")
             # side_map is (n_elem, n_side) with union indices (‑1 = padding)
             coeff = np.zeros((side_map.shape[0], n_union), dtype=full_vec.dtype)
             for e in range(side_map.shape[0]):
                 idx = side_map[e]
-                m   = idx >= 0                         # ignore padding
-                coeff[e, idx[m]] = full_vec[gdofs_map[e, idx[m]]]
+                m = idx >= 0
+                if np.any(m):
+                    coeff[e, idx[m]] = full_vec[gdofs_map[e, idx[m]]]
             kernel_args[f"u_{name}__{tag}_loc"] = coeff   #  **double “__”**
 
 
@@ -113,17 +115,40 @@ class KernelRunner:
             f = functions[name]                       # Function / VectorFunction
 
             # 1) global vector with current nodal values --------------------
-            full_vec = np.zeros(self.dof_handler.total_dofs,
-                                dtype=f.nodal_values.dtype)
-            for gdof, lidx in f._g2l.items():
-                full_vec[gdof] = f.nodal_values[lidx]
+            base = getattr(f, "_parent_vector", None)
+            source = base if base is not None else f
+            cache_key = id(source)
+            full_vec = full_cache.get(cache_key)
+            if full_vec is None:
+                full_vec = np.zeros(total_dofs, dtype=source.nodal_values.dtype)
+                if hasattr(source, "_g_dofs") and source._g_dofs.size:
+                    full_vec[source._g_dofs] = source.nodal_values
+                else:
+                    # Fallback: populate via mapping dict (rare path)
+                    g2l = getattr(source, "_g2l", {})
+                    if g2l:
+                        local_vals = source.nodal_values
+                        for gdof, lidx in g2l.items():
+                            full_vec[gdof] = local_vals[lidx]
+                full_cache[cache_key] = full_vec
 
             # 2a) volume coefficients  u_<name>_loc -------------------------
-            kernel_args[f"u_{name}_loc"] = full_vec[gdofs_map]
+            if base is not None and base is not f:
+                comp_key = (cache_key, f.field_name)
+                comp_vec = full_cache.get(comp_key)
+                if comp_vec is None:
+                    comp_vec = np.zeros_like(full_vec)
+                    fld_slice = self.dof_handler.get_field_slice(f.field_name)
+                    comp_vec[fld_slice] = full_vec[fld_slice]
+                    full_cache[comp_key] = comp_vec
+                target_vec = comp_vec
+            else:
+                target_vec = full_vec
+            kernel_args[f"u_{name}_loc"] = target_vec[gdofs_map]
 
             # 2b) ghost/interface  u_<name>_pos_loc / _neg_loc --------------
-            _gather(pos_map, "pos")
-            _gather(neg_map, "neg")
+            _gather(target_vec, pos_map, "pos", name)
+            _gather(target_vec, neg_map, "neg", name)
         # ---------------------------------------------------------------
         # D)  final sanity check – everything the kernel listed?
         # ---------------------------------------------------------------

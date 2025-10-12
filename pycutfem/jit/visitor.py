@@ -17,6 +17,7 @@ from pycutfem.jit.ir import (
 )
 from dataclasses import replace
 import logging
+from pycutfem.utils.bitset import bitset_cache_token
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,12 @@ class IRGenerator:
             self._visit(node.operand, side=side)
             # Then, add the instruction to check the domain tag.
             # The code generator will use this to conditionally zero the result.
-            self.ir_sequence.append(CheckDomain(bitset_id=id(node.domain)))
+            dom = node.domain
+            token = getattr(dom, "cache_token", None)
+            if token is None:
+                raw = getattr(dom, "array", dom)
+                token = bitset_cache_token(raw)
+            self.ir_sequence.append(CheckDomain(bitset_id=token))
             return
         if isinstance(node, UFLTrace):
             # First, visit the operand of the trace. This will execute all

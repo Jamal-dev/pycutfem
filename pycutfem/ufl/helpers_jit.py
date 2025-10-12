@@ -5,7 +5,7 @@ import logging # Added for logging warnings
 import os
 import re
 import pycutfem.jit.symbols as symbols
-from pycutfem.utils.bitset import BitSet
+from pycutfem.utils.bitset import BitSet, bitset_cache_token
 from pycutfem.ufl.expressions import Restriction
 from pycutfem.fem.transform import element_Hxi
 
@@ -510,7 +510,10 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
     all_bitsets_in_form = _find_all_bitsets(expression)
     for bs in all_bitsets_in_form:
-        pname = f"domain_bs_{id(bs)}"
+        token = getattr(bs, "cache_token", None)
+        if token is None:
+            token = bitset_cache_token(getattr(bs, "array", bs))
+        pname = f"domain_bs_{token}"
         raw = getattr(bs, "array", bs)
         mask_full = _expand_subset_to_full(
             np.asarray(raw, dtype=np.bool_).ravel(), what=f"BitSet {pname}"

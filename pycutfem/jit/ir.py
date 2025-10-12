@@ -104,7 +104,7 @@ class LoadFacetNormalComponent:
 @dataclass(frozen=True, slots=True)
 class CheckDomain:
     """Instruction to check if the current element is in a domain BitSet."""
-    bitset_id: int
+    bitset_id: str
 
 @dataclass(frozen=True, slots=True)
 class Trace:
