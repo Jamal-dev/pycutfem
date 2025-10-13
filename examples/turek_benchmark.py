@@ -40,6 +40,7 @@ from pycutfem.ufl.measures import dx, dS, dGhost, dInterface
 from pycutfem.ufl.forms import BoundaryCondition, Equation
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters
 from pycutfem.ufl.compilers import FormCompiler
+from pathlib import Path
 
 
 # In[2]:
@@ -102,8 +103,10 @@ print(f"Geometry order={geom_order}, FE order={fe_order}")
 from pycutfem.utils.adaptive_mesh_ls_numba import structured_quad_levelset_adaptive
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-NX, NY = 65, 45
+NX, NY = 65, 50
 # NX, NY = 30, 40
+dt = Constant(0.1)
+theta = Constant(0.56) # Crank-Nicolson
 analytic_level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 )
 # h  = 0.5*(L/NX + H/NY)
 
@@ -183,7 +186,9 @@ mixed_element = MixedElement(
 )
 dof_handler = DofHandler(mixed_element, method='cg')
 # dof_handler.info()
-
+print(f"Number of inside elements: {rigid_domain.cardinality()}")
+print(f"Number of outside elements: {fluid_domain.cardinality()}")
+print(f"Number of cut elements: {cut_domain.cardinality()}")
 print(f"Number of interface edges: {mesh.edge_bitset('interface').cardinality()}")
 print(f"Number of ghost edges: {mesh.edge_bitset('ghost').cardinality()}")
 print(f"Number of cut elements: {cut_domain.cardinality()}")
@@ -295,8 +300,7 @@ lambda_k = Function(name="lambda_k", field_name='lm', dof_handler=dof_handler)
 lambda_n = Function(name="lambda_n", field_name='lm', dof_handler=dof_handler)
 
 # --- Parameters ---
-dt = Constant(0.15)
-theta = Constant(0.5) # Crank-Nicolson
+
 mu_const = Constant(mu)
 rho_const = Constant(rho)
 
@@ -903,7 +907,7 @@ from pycutfem.solvers.aainhb_solver import AAINHBSolver           # or get_solv
 import time
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
-time_params = TimeStepperParameters(dt=dt.value,max_steps=50 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
+time_params = TimeStepperParameters(dt=dt.value,max_steps=100 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
 dirichlet_dofs = set(dof_handler.get_dirichlet_data(bcs).keys())  # bcs = your Dirichlet BCs
 post_cb = make_peak_filter_cb(
     dof_handler, level_set,
@@ -1050,44 +1054,56 @@ def vi_clip(step, bcs_now, funs, prev_funs):
 
 
 t2 = time.time()
-solver.solve_time_interval(functions=functions,
-                           prev_functions= prev_functions,
-                           time_params=time_params,
-                           # post_step_refiner=vi_clip
-                           )
-t3 = time.time()
-print(f"Total solve time: {t3 - t2:.2f} seconds")
-print(f"Total setup + solve time: {t3 - t0:.2f} seconds")
 
+def plotting():
+    t3 = time.time()
+    print(f"Total solve time: {t3 - t2:.2f} seconds")
+    print(f"Total setup + solve time: {t3 - t0:.2f} seconds")
 
-# In[ ]:
-
-
-if ENABLE_PLOTS:
+    import matplotlib.pyplot as plt
+    # if ENABLE_PLOTS:
     offset = 5
     plt.plot(histories["cd"][offset:], label="C_D", marker='o')
     plt.ylabel('C_D')
     plt.figure()
     plt.plot(histories["cl"][offset:], label="C_L", marker='o')
     plt.ylabel('C_L')
+    plt.savefig((Path(output_dir)/Path("turek_cl_cd.png")))
     plt.figure()
     plt.plot(histories["dp"][offset:], label="Δp", marker='o')
     plt.ylabel('Δp')
+    plt.savefig((Path(output_dir)/Path("turek_dp.png")))
+    plt.show()
 
 
-# In[ ]:
+    # In[ ]:
 
 
-if ENABLE_PLOTS:
-    u_n.plot(kind="contour",mask =fluid_domain,
-             title="Turek-Schafer",
-             xlabel='X-Axis', ylabel='Y-Axis',
-             levels=100, cmap='jet')
+    if ENABLE_PLOTS:
+        u_n.plot(kind="contour",mask =fluid_domain,
+                title="Turek-Schafer",
+                xlabel='X-Axis', ylabel='Y-Axis',
+                levels=100, cmap='jet')
 
 
-# In[ ]:
+    # In[ ]:
 
 
-if ENABLE_PLOTS:
-    p_n.plot(
-             title="Pressure",mask =fluid_domain)
+    if ENABLE_PLOTS:
+        p_n.plot(
+                title="Pressure",mask =fluid_domain)
+
+try:
+    solver.solve_time_interval(functions=functions,
+                           prev_functions= prev_functions,
+                           time_params=time_params,
+                           # post_step_refiner=vi_clip
+                           )
+    print("Simulation run successfully ...")
+    plotting()
+except Exception as e:
+    print("Solver failed:", e)
+    plotting()
+    
+
+

@@ -1,4 +1,5 @@
 import numpy as np
+from hashlib import blake2b
 from typing import Callable, Dict, List, Optional, Union
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
@@ -868,6 +869,19 @@ class TestFunction(Function):
             self.field_sides = ""
  
 
+def _scalar_token(value: float) -> str:
+    return f"s_{format(float(value), '.16g')}"
+
+
+def _array_token(arr: np.ndarray) -> str:
+    carr = np.ascontiguousarray(arr, dtype=np.float64)
+    h = blake2b(digest_size=16)
+    shape_info = np.asarray(carr.shape, dtype=np.int64)
+    h.update(shape_info.tobytes())
+    h.update(carr.tobytes())
+    return h.hexdigest()
+
+
 class Constant(Expression, numbers.Number):
     def __init__(self, value, dim: int = None):
         # Call the __init__ of the next class in the Method Resolution Order (MRO)
@@ -887,6 +901,10 @@ class Constant(Expression, numbers.Number):
             self.dim = dim
             if dim >0: self.value = np.asarray(value, dtype=float)
         self.role = 'none'
+        if self.dim == 0:
+            self._cache_token = _scalar_token(float(self.value))
+        else:
+            self._cache_token = f"a_{_array_token(np.asarray(self.value, dtype=np.float64))}"
     @property
     def shape(self):
         """Returns the shape of the constant value."""
@@ -915,6 +933,9 @@ class Constant(Expression, numbers.Number):
         if np.ndim(self.value) == 0:
             return hash(float(self.value))
         return hash(self.value.tobytes())
+    @property
+    def cache_token(self) -> str:
+        return self._cache_token
 
 class VectorTrialFunction(Expression):
     is_trial = True
@@ -987,6 +1008,7 @@ class ElementWiseConstant(Expression):
         if self.values.ndim == 0:
             raise ValueError("Provide one value **per element**, not a single scalar.")
         self.tensor_shape = self.values.shape[1:]   # () for scalars
+        self._cache_token = _array_token(self.values)
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -1000,6 +1022,10 @@ class ElementWiseConstant(Expression):
     def __repr__(self):
         shape = "scalar" if self.tensor_shape == () else f"tensor{self.tensor_shape}"
         return f"ElementWiseConstant({shape})"
+
+    @property
+    def cache_token(self) -> str:
+        return self._cache_token
 
 class NormalComponent(Expression):
     """Scalar component of the interface normal vector."""

@@ -238,7 +238,10 @@ class IRGenerator:
             if node.dim == 0:
                 self.ir_sequence.append(LoadConstant(value=float(node.value)))
             else:
-                name = f"const_arr_{id(node)}"
+                token = getattr(node, "cache_token", None)
+                if token is None:
+                    token = f"fallback_{id(node)}"
+                name = f"const_arr_{token}"
                 self.ir_sequence.append(LoadConstantArray(name=name, shape=node.shape))
             return
         if isinstance(node, UFLTranspose):
@@ -255,7 +258,10 @@ class IRGenerator:
             return
 
         if isinstance(node, ElementWiseConstant):
-            name = f"ewc_{id(node)}"
+            token = getattr(node, "cache_token", None)
+            if token is None:
+                token = f"fallback_{id(node)}"
+            name = f"ewc_{token}"
             # This was a bug, creating a UFL node instead of an IR node
             self.ir_sequence.append(LoadEWC_IR(name=name, tensor_shape=node.tensor_shape))
             return

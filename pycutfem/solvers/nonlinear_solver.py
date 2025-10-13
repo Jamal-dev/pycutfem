@@ -600,9 +600,7 @@ class NewtonSolver:
             t_iteration = t_current - temp_t0
             temp_t0 = t_current
             print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}, time = {t_iteration}s")
-            linear_time = 0.0
-            line_search_time = 0.0
-            if norm_R < self.np.newton_tol:
+            if norm_R <= self.np.newton_tol:
                 # Converged — return *time-step* increment for all fields
                 delta = np.hstack([
                     f.nodal_values - f_prev.nodal_values
@@ -624,6 +622,8 @@ class NewtonSolver:
                     )
                 )
                 return delta
+            linear_time = 0.0
+            line_search_time = 0.0
 
             # 2) Compute reduced Newton direction
             t_lin = time.perf_counter()

@@ -4,6 +4,7 @@ from pycutfem.integration import volume
 import logging # Added for logging warnings
 import os
 import re
+from hashlib import blake2b
 import pycutfem.jit.symbols as symbols
 from pycutfem.utils.bitset import BitSet, bitset_cache_token
 from pycutfem.ufl.expressions import Restriction
@@ -13,6 +14,14 @@ from pycutfem.fem.transform import element_Hxi
 
 logger = logging.getLogger(__name__)
 
+
+def _array_token(arr) -> str:
+    carr = np.ascontiguousarray(np.asarray(arr, dtype=np.float64))
+    h = blake2b(digest_size=16)
+    shape_info = np.asarray(carr.shape, dtype=np.int64)
+    h.update(shape_info.tobytes())
+    h.update(carr.tobytes())
+    return h.hexdigest()
 
 
 def _pad_coeffs(coeffs, phi, ctx):
@@ -525,10 +534,21 @@ def _build_jit_kernel_args(       # ← signature unchanged
     # ------------------------------------------------------------------
     # 5. Constants / EWC / coefficient vectors / reference tables
     # ------------------------------------------------------------------
-    const_arrays = {
-        f"const_arr_{id(c)}": c
-        for c in _find_all(expression, UflConst) if c.dim != 0
-    }
+    const_arrays: dict[str, UflConst] = {}
+    for c in _find_all(expression, UflConst):
+        if c.dim == 0:
+            continue
+        token = getattr(c, "cache_token", None)
+        if token is None:
+            token = _array_token(c.value)
+        const_arrays[f"const_arr_{token}"] = c
+
+    ewc_arrays: dict[str, ElementWiseConstant] = {}
+    for ewc in _find_all(expression, ElementWiseConstant):
+        token = getattr(ewc, "cache_token", None)
+        if token is None:
+            token = _array_token(ewc.values)
+        ewc_arrays[f"ewc_{token}"] = ewc
 
     # cache gdofs_map for coefficient gathering
     if gdofs_map is None:
@@ -647,10 +667,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
             args[name] = vals
 
         # ---- element-wise constants --------------------------------------
-        elif name.startswith("ewc_"):
-            obj_id = int(name.split("_", 1)[1])
-            # find the EWC by id
-            ewc = next(c for c in _find_all(expression, ElementWiseConstant) if id(c) == obj_id)
+        elif name in ewc_arrays:
+            ewc = ewc_arrays[name]
             arr = np.asarray(ewc.values, dtype=np.float64)  # shape (n_elems, ...)
             args[name] = arr
 
