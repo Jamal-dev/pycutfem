@@ -36,6 +36,7 @@ BcLike = Union[BoundaryCondition, Mapping[str, Any]]
 # ------------------------------------------------------------------
 _edge_geom_cache: dict[tuple[int,int,int], dict] = {}
 _ghost_cache: dict[tuple, dict] = {}
+_jacobian_cache: dict[tuple, dict] = {}
 
 # geometric volume-cache keyed by (MixedElement.signature(), qdeg, id(level_set) or 0)
 _volume_geom_cache: dict[tuple, dict] = {}
@@ -51,6 +52,7 @@ def clear_caches() -> None:
     _cut_volume_cache.clear()
     _edge_geom_cache.clear()
     _ghost_cache.clear()
+    _jacobian_cache.clear()
 
 
 
@@ -60,6 +62,17 @@ def _hash_subset(ids: Sequence[int]) -> int:
     h.update(np.asarray(sorted(ids), dtype=np.int32).tobytes())
     return int.from_bytes(h.digest(), "little")
 
+
+def _coords_fingerprint(coords: np.ndarray) -> bytes:
+    arr = np.asarray(coords, dtype=np.float64)
+    return blake2b(arr.tobytes(), digest_size=8).digest()
+
+
+def _def_fingerprint(defm):
+    if defm is None:
+        return ("nodef",)
+    tok = getattr(defm, "cache_token", None)
+    return ("token", tok) if tok is not None else ("objid", int(id(defm)))
 
 
 
@@ -1634,6 +1647,10 @@ class DofHandler:
         qp_ref = np.asarray(qp_ref, dtype=np.float64)
         qw_ref = np.asarray(qw_ref, dtype=np.float64)
         n_q    = int(qw_ref.shape[0])
+        subset_hash = _hash_subset(list(range(n_el)))
+        coords_hash = _coords_fingerprint(mesh.nodes_x_y_pos)
+        qref_bytes = qp_ref.tobytes()
+        base_key = ("vol_geom", id(mesh), subset_hash, coords_hash, int(quad_order), qref_bytes)
 
         # ---------------------- reference shape/grad tables ----------------------
         kmax = 4 if need_o4 else (3 if need_o3 else 2)
@@ -1700,26 +1717,33 @@ class DofHandler:
                 return qp_phys, qw_sc, detJ, J_inv, J_geo
 
             qp_phys, qw_sc, detJ, J_inv, J_geo = _geom_kernel(elem_coord, Ntab, dNtab, qw_ref)
+            if reuse:
+                _jacobian_cache[base_key] = {
+                    "J": J_geo.copy(),
+                    "det": detJ.copy(),
+                    "inv": J_inv.copy(),
+                }
 
         else:
-            # ------------------ safe Python fallback ------------------------------
-            for e in range(n_el):
-                Xe = elem_coord[e, :, :]            # (n_loc,2)
-                for q_idx, (xi_eta, w_ref) in enumerate(zip(qp_ref, qw_ref)):
-                    xi, eta = float(xi_eta[0]), float(xi_eta[1])
-                    # Physical point
-                    x = Xe.T @ Ntab[q_idx, :]       # (2,)
-                    qp_phys[e, q_idx, :] = x
-                    # Geometry Jacobian via dN @ X  (no inv(J_inv) nonsense)
-                    dN = dNtab[q_idx, :, :]         # (n_loc,2)
-                    A  = Xe.T @ dN                  # (2,2)  (row-form dN^T @ X)
-                    J_geo[e, q_idx, :, :] = A
-                    det = float(np.linalg.det(A))
-                    if det <= 1e-12:
-                        raise ValueError(f"Jacobian determinant is non-positive ({det}) for element {e}.")
-                    detJ[e, q_idx]  = det
-                    J_inv[e, q_idx] = np.linalg.inv(A)
-                    qw_sc[e, q_idx] = w_ref * det
+            # ------------------ safe Python fallback (vectorised) ----------------
+            qp_phys = np.einsum('qk,eki->eqi', Ntab, elem_coord, optimize=True)
+            J_geo   = np.einsum('eki,qkj->eqij', elem_coord, dNtab, optimize=True)
+            detJ    = J_geo[..., 0, 0] * J_geo[..., 1, 1] - J_geo[..., 0, 1] * J_geo[..., 1, 0]
+            invJ    = np.empty_like(J_geo)
+            invJ[..., 0, 0] =  J_geo[..., 1, 1]
+            invJ[..., 0, 1] = -J_geo[..., 0, 1]
+            invJ[..., 1, 0] = -J_geo[..., 1, 0]
+            invJ[..., 1, 1] =  J_geo[..., 0, 0]
+            invJ /= detJ[..., None, None]
+            qw_sc = detJ * qw_ref[None, :]
+            detJ = detJ
+            J_inv = invJ
+            if reuse:
+                _jacobian_cache[base_key] = {
+                    "J": J_geo.copy(),
+                    "det": detJ.copy(),
+                    "inv": J_inv.copy(),
+                }
 
         # ---------------------- post-process & cache -----------------------------
         bad = np.where(detJ <= 1e-12)
@@ -1789,36 +1813,52 @@ class DofHandler:
 
         # ---------------------- deformation: update qp/detJ/J_inv/qw --------------
         if deformation is not None:
+            final_key = ("vol_final", id(mesh), subset_hash, coords_hash, int(quad_order), qref_bytes, _def_fingerprint(deformation))
+            cached_final = _jacobian_cache.get(final_key)
+            if cached_final is not None:
+                detJ = cached_final["det"].copy()
+                J_inv = cached_final["inv"].copy()
+                qp_phys = cached_final["qp"].copy()
+                qw_sc = cached_final["qw"].copy()
+            else:
             # FE gradient of displacement in reference variables:
             # u(ξ) = Σ_i U_i N_i(ξ)  →  ∂ξ u = U^T @ dN(ξ)  (2×n) @ (n×2) => (2×2)
-            qp_def   = np.empty_like(geo["qp_phys"])
-            det_def  = np.empty_like(geo["detJ"])
-            Jinv_def = np.empty_like(geo["J_inv"])
+                qp_def   = np.empty_like(qp_phys)
+                det_def  = np.empty_like(detJ)
+                Jinv_def = np.empty_like(J_inv)
 
-            for e in range(n_el):
-                conn = np.asarray(mesh.elements_connectivity[int(e)], dtype=int)
-                Uloc = np.asarray(deformation.node_displacements[conn], float)  # (n_loc,2)
-                for q in range(n_q):
-                    # geometry part already computed in J_geo
-                    A_g = J_geo[e, q, :, :]               # J_g(ξq) (2×2)
-                    dN  = dNtab[q, :, :]                   # (n_loc,2)
-                    A_d = Uloc.T @ dN                      # (2×2)
-                    A_t = A_g + A_d                        # total J
-                    det = float(np.linalg.det(A_t))
-                    det_def[e, q]  = det
-                    Jinv_def[e, q] = np.linalg.inv(A_t)
-                    # update point: x_def = x_g + u_h(ξq)
-                    disp = Ntab[q, :] @ Uloc               # (2,)
-                    qp_def[e, q, :] = geo["qp_phys"][e, q, :] + disp
+                for e in range(n_el):
+                    conn = np.asarray(mesh.elements_connectivity[int(e)], dtype=int)
+                    Uloc = np.asarray(deformation.node_displacements[conn], float)  # (n_loc,2)
+                    for q in range(n_q):
+                        A_g = J_geo[e, q, :, :]
+                        dN  = dNtab[q, :, :]
+                        A_d = Uloc.T @ dN
+                        A_t = A_g + A_d
+                        det = float(np.linalg.det(A_t))
+                        det_def[e, q]  = det
+                        Jinv_def[e, q] = np.linalg.inv(A_t)
+                        disp = Ntab[q, :] @ Uloc
+                        qp_def[e, q, :] = qp_phys[e, q, :] + disp
 
-            # replace geometry with deformed
-            det_geo = geo["detJ"].copy()
-            geo["qp_phys"] = qp_def
-            geo["detJ"]    = det_def
-            geo["J_inv"]   = Jinv_def
-            # rescale weights so that qw = w_ref * det_total
-            eps = 1e-300
-            geo["qw"]      = geo["qw"] * (det_def / (det_geo + eps))
+                det_geo = detJ.copy()
+                detJ = det_def
+                J_inv = Jinv_def
+                qp_phys = qp_def
+                eps = 1e-300
+                qw_sc = qw_sc * (det_def / (det_geo + eps))
+                _jacobian_cache[final_key] = {
+                    "det": detJ.copy(),
+                    "inv": J_inv.copy(),
+                    "qp": qp_phys.copy(),
+                    "qw": qw_sc.copy(),
+                }
+
+        # keep dictionary views in sync with the final (possibly deformed) arrays
+        geo["qp_phys"] = qp_phys
+        geo["qw"] = qw_sc
+        geo["detJ"] = detJ
+        geo["J_inv"] = J_inv
 
         # ---------------------- φ evaluation (at final qp) ------------------------
         phis = None
@@ -1929,29 +1969,6 @@ class DofHandler:
                         Jinv[e, q, 1, 1] =  a00 * invd
                 return detJ, Jinv
 
-        # ---- helpers: fingerprints for caches ----------------------------------------
-        def _hash_subset(ids):
-            # stable hash from a small subset of ids (first, last, len)
-            if not ids:
-                return ("empty", 0, 0, 0)
-            return ("sub", int(ids[0]), int(ids[-1]), int(len(ids)))
-
-        def _ls_fingerprint(ls):
-            # prefer explicit token
-            tok = getattr(ls, "cache_token", None)
-            if tok is not None:
-                return ("token", tok)
-            # else: identity (safe within a single run)
-            return ("objid", int(id(ls)))
-
-        def _def_fingerprint(defm):
-            if defm is None:
-                return ("nodef",)
-            tok = getattr(defm, "cache_token", None)
-            if tok is not None:
-                return ("token", tok)
-            return ("objid", int(id(defm)))
-
         # ------------------------------------------------------------------------------
         mesh = self.mixed_element.mesh
         me   = self.mixed_element
@@ -2010,9 +2027,10 @@ class DofHandler:
         ls_token    = _ls_fingerprint(level_set)
         def_token   = _def_fingerprint(deformation)
 
+        coords_hash = _coords_fingerprint(mesh.nodes_x_y_pos)
         cache_key = (
             "iface", id(mesh), me.signature(),
-            subset_hash, int(qdeg), self.method,
+            subset_hash, coords_hash, int(qdeg), self.method,
             bool(need_hess), bool(need_o3), bool(need_o4),
             ls_token, def_token
         )
@@ -2080,6 +2098,8 @@ class DofHandler:
         # ------------------------------------------------------------------------------
         xi_tab  = np.empty((nE, nQ), dtype=float)
         eta_tab = np.empty((nE, nQ), dtype=float)
+        xi_tab  = np.empty((nE, nQ), dtype=float)
+        eta_tab = np.empty((nE, nQ), dtype=float)
         if qref is not None:
             xi_tab[:, :]  = qref[:, :, 0]
             eta_tab[:, :] = qref[:, :, 1]
@@ -2089,6 +2109,8 @@ class DofHandler:
                     s, t = transform.inverse_mapping(mesh, int(eid), qp_phys[i, q])
                     xi_tab[i, q]  = float(s)
                     eta_tab[i, q] = float(t)
+        xi_bytes = xi_tab.tobytes()
+        eta_bytes = eta_tab.tobytes()
 
         # ------------------------------------------------------------------------------
         # 3) φ values and unit normals n̂ = ∇φ / ‖∇φ‖  (NEG→POS orientation)
@@ -2173,32 +2195,40 @@ class DofHandler:
             have_jit_ref = True
         else:
             ref = transform.get_reference(elem_type, p_geom, max_deriv_order=kmax)
+            N_tab  = np.empty((nE, nQ, nLocGeom), dtype=float)
             dN_tab = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
             for i in range(nE):
                 for q in range(nQ):
+                    N_tab[i, q]  = np.asarray(ref.shape(xi_tab[i, q], eta_tab[i, q]), dtype=float)
                     dN_tab[i, q] = np.asarray(ref.grad(xi_tab[i, q], eta_tab[i, q]), dtype=float)
 
-        if _HAVE_NUMBA and have_jit_ref:
-            detJ, J_inv = _geom_from_dN(coords_sel, dN_tab)
+        base_key = ("iface_geom", id(mesh), subset_hash, coords_hash, xi_bytes, eta_bytes)
+        geom_cached = _jacobian_cache.get(base_key)
+        if geom_cached is not None:
+            J_geom = geom_cached["J"]
+            detJ = geom_cached["det"].copy()
+            J_inv = geom_cached["inv"].copy()
         else:
-            detJ = np.empty((nE, nQ), dtype=float)
-            J_inv = np.empty((nE, nQ, 2, 2), dtype=float)
-            for e in range(nE):
-                Xe = coords_sel[e]
-                for q in range(nQ):
-                    a00 = a01 = a10 = a11 = 0.0
-                    for i in range(nLocGeom):
-                        gx, gy = dN_tab[e, q, i, 0], dN_tab[e, q, i, 1]
-                        x, y = Xe[i, 0], Xe[i, 1]
-                        a00 += gx * x; a01 += gy * x
-                        a10 += gx * y; a11 += gy * y
-                    det = a00 * a11 - a01 * a10
-                    detJ[e, q] = det
-                    invd = 1.0 / det
-                    J_inv[e, q, 0, 0] =  a11 * invd
-                    J_inv[e, q, 0, 1] = -a01 * invd
-                    J_inv[e, q, 1, 0] = -a10 * invd
-                    J_inv[e, q, 1, 1] =  a00 * invd
+            if _HAVE_NUMBA and have_jit_ref:
+                det_tmp, inv_tmp = _geom_from_dN(coords_sel, dN_tab)
+                detJ = det_tmp.copy()
+                J_inv = inv_tmp.copy()
+                J_geom = np.einsum('eki,eqkj->eqij', coords_sel, dN_tab)
+            else:
+                J_geom = np.einsum('eki,eqkj->eqij', coords_sel, dN_tab)
+                detJ = J_geom[..., 0, 0] * J_geom[..., 1, 1] - J_geom[..., 0, 1] * J_geom[..., 1, 0]
+                inv_base = np.empty_like(J_geom)
+                inv_base[..., 0, 0] =  J_geom[..., 1, 1]
+                inv_base[..., 0, 1] = -J_geom[..., 0, 1]
+                inv_base[..., 1, 0] = -J_geom[..., 1, 0]
+                inv_base[..., 1, 1] =  J_geom[..., 0, 0]
+                inv_base /= detJ[..., None, None]
+                J_inv = inv_base
+            _jacobian_cache[base_key] = {
+                "J": J_geom.copy(),
+                "det": detJ.copy(),
+                "inv": J_inv.copy(),
+            }
 
         # Sanity
         bad = np.where(detJ <= 1e-12)
@@ -2213,33 +2243,66 @@ class DofHandler:
         # 5) Optional deformation: scale qw by ‖(I+∇u) τ̂‖ and move QPs to x+u
         # ------------------------------------------------------------------------------
         if deformation is not None:
-            # reference gradients for deformation
-            ref_geom = transform.get_reference(mesh.element_type, mesh.poly_order)
-            for i, eid in enumerate(valid_eids):
-                conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
-                Uloc = np.asarray(deformation.node_displacements[conn], float)  # (n_loc, 2)
-                for q in range(nQ):
-                    xi = float(xi_tab[i, q]); eta = float(eta_tab[i, q])
-                    Jg = transform.jacobian(mesh, int(eid), (xi, eta))  # (2,2)
-                    dN = np.asarray(ref_geom.grad(xi, eta), float)       # (n_loc,2)
-                    # ∇u in physical coords: solve(Jg^T, (U^T dN)^T)^T
-                    Gref = Uloc.T @ dN                   # (2,2) in ref
-                    Gphy = np.linalg.solve(Jg.T, Gref.T).T
-                    F    = np.eye(2) + Gphy
-                    Jt = F @ Jg
-                    detJ[i, q] = float(np.linalg.det(Jt))
-                    J_inv[i, q, :, :] = np.linalg.inv(Jt)
-                    # unit tangent: prefer rule's that; else rotate normal
-                    if that is not None:
-                        tau = that[i, q]
-                    else:
-                        n = normals[i, q]
-                        tau = np.array([-n[1], n[0]], dtype=float)  # any perpendicular is fine
-                    qw[i, q] *= float(np.linalg.norm(F @ tau))
-                    # move qp to the deformed location for analytic eval consistency
-                    xg   = transform.x_mapping(mesh, int(eid), (xi, eta))
-                    disp = deformation.displacement_ref(int(eid), (xi, eta))
-                    qp_phys[i, q, :] = xg + disp
+            final_key = ("iface_final", id(mesh), subset_hash, coords_hash, xi_bytes, eta_bytes, def_token)
+            cached_final = _jacobian_cache.get(final_key)
+            if cached_final is not None:
+                detJ = cached_final["det"].copy()
+                J_inv = cached_final["inv"].copy()
+                qp_phys = cached_final["qp"].copy()
+                qw = cached_final["qw"].copy()
+            else:
+                node_ids_sel = node_ids_all[np.asarray(valid_eids, dtype=int)]
+                disp_nodes = np.asarray(deformation.node_displacements, float)
+                U_all = disp_nodes[node_ids_sel]
+
+                geom_entry = _jacobian_cache[base_key]
+                J_geom = geom_entry["J"]
+                inv_geom = geom_entry["inv"]
+
+                Gref = np.einsum('eki,eqkj->eqij', U_all, dN_tab)
+                Gphy = np.einsum('eqij,eqjk->eqik', Gref, inv_geom)
+                F = np.eye(2)[None, None, :, :] + Gphy
+                Jt = np.einsum('eqij,eqjk->eqik', F, J_geom)
+                detJ = Jt[..., 0, 0] * Jt[..., 1, 1] - Jt[..., 0, 1] * Jt[..., 1, 0]
+                inv_t = np.empty_like(Jt)
+                inv_t[..., 0, 0] =  Jt[..., 1, 1]
+                inv_t[..., 0, 1] = -Jt[..., 0, 1]
+                inv_t[..., 1, 0] = -Jt[..., 1, 0]
+                inv_t[..., 1, 1] =  Jt[..., 0, 0]
+                inv_t /= detJ[..., None, None]
+                J_inv = inv_t
+
+                if that is not None:
+                    tau_base = that.copy()
+                else:
+                    tau_base = np.stack((-normals[..., 1], normals[..., 0]), axis=-1)
+                F_tau = np.einsum('eqij,eqj->eqi', F, tau_base)
+                stretch = np.linalg.norm(F_tau, axis=-1)
+                stretch = np.maximum(stretch, 1e-16)
+                qw *= stretch
+
+                x_geom = np.einsum('eqk,ekj->eqj', N_tab, coords_sel)
+                disp = np.einsum('eqk,ekj->eqj', N_tab, U_all)
+                qp_phys = x_geom + disp
+
+                _jacobian_cache[final_key] = {
+                    "det": detJ.copy(),
+                    "inv": J_inv.copy(),
+                    "qp": qp_phys.copy(),
+                    "qw": qw.copy(),
+                }
+        # ensure downstream consumers see the updated geometry tensors
+        qp_phys = np.asarray(qp_phys, dtype=np.float64, order="C")
+        qw      = np.asarray(qw, dtype=np.float64, order="C")
+        detJ    = np.asarray(detJ, dtype=np.float64, order="C")
+        J_inv   = np.asarray(J_inv, dtype=np.float64, order="C")
+        bad = np.where(detJ <= 1e-12)
+        if bad[0].size:
+            e_bad, q_bad = int(bad[0][0]), int(bad[1][0])
+            raise ValueError(
+                f"[interface] Jacobian determinant non-positive ({detJ[e_bad, q_bad]}) "
+                f"for element id {valid_eids[e_bad]} at qp {q_bad}."
+            )
 
         # ------------------------------------------------------------------------------
         # 6) Basis & reference derivatives up to requested order
@@ -2498,12 +2561,6 @@ class DofHandler:
         # Cache key: use the subset tuple directly (stable & hashable)
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
 
-        def _def_fingerprint(defm):
-            if defm is None:
-                return ("nodef",)
-            tok = getattr(defm, "cache_token", None)
-            return ("token", tok) if tok is not None else ("objid", int(id(defm)))
-
         cache_key  = (
             ghost_ids,
             int(qdeg),
@@ -2513,7 +2570,9 @@ class DofHandler:
             bool(need_o3),
             bool(need_o4),
             self.method,
+            _ls_fingerprint(level_set),
             _def_fingerprint(deformation),
+            _coords_fingerprint(mesh.nodes_x_y_pos),
         )
         global _ghost_cache
         try:
@@ -2587,6 +2646,9 @@ class DofHandler:
                     pass
             return None
 
+        edge_vectors = np.zeros((nE, 2), dtype=float)
+        centroid_pos = np.zeros((nE, 2), dtype=float)
+        centroid_neg = np.zeros((nE, 2), dtype=float)
         for i, e in enumerate(edges):
             cL = np.asarray(mesh.elements_list[e.left ].centroid())
             cR = np.asarray(mesh.elements_list[e.right].centroid())
@@ -2625,6 +2687,8 @@ class DofHandler:
             nvec = e.normal.copy()
             cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
             cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
+            centroid_pos[i] = cpos
+            centroid_neg[i] = cneg
             if np.dot(nvec, cpos - cneg) < 0.0:
                 nvec = -nvec
 
@@ -2643,6 +2707,7 @@ class DofHandler:
             elif phi_pos_mid < phi_neg_mid:
                 nvec = -nvec
 
+            edge_vectors[i] = p1 - p0
             for q in range(nQ):
                 normals[i, q] = nvec
                 phi_arr[i, q] = _eval_ls(pos_eid, qp_phys[i, q])
@@ -2698,6 +2763,12 @@ class DofHandler:
             "xi_neg":  xi_neg,  "eta_neg":  eta_neg,
         })
 
+        xi_pos_bytes = xi_pos.tobytes(); eta_pos_bytes = eta_pos.tobytes()
+        xi_neg_bytes = xi_neg.tobytes(); eta_neg_bytes = eta_neg.tobytes()
+        subset_hash_pos = _hash_subset(list(map(int, pos_ids)))
+        subset_hash_neg = _hash_subset(list(map(int, neg_ids)))
+        coords_hash = _coords_fingerprint(mesh.nodes_x_y_pos)
+
         # parent element coords
         node_ids_all = mesh.nodes[mesh.elements_connectivity]
         coords_all   = mesh.nodes_x_y_pos[node_ids_all].astype(float)
@@ -2725,48 +2796,63 @@ class DofHandler:
         # reference geometry dN on each side
         dN_pos = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
         dN_neg = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
+        N_pos  = np.empty((nE, nQ, nLocGeom), dtype=float)
+        N_neg  = np.empty((nE, nQ, nLocGeom), dtype=float)
         kmax = 4 if need_o4 else (3 if need_o3 else 2)
         if mesh.element_type == "quad" and mesh.poly_order == 1:
-            _tab_q1(xi_pos, xi_neg*0 + eta_pos, np.empty((nE, nQ, 4)), dN_pos)
-            _tab_q1(xi_neg, xi_neg*0 + eta_neg, np.empty((nE, nQ, 4)), dN_neg)
+            _tab_q1(xi_pos, xi_neg*0 + eta_pos, N_pos, dN_pos)
+            _tab_q1(xi_neg, xi_neg*0 + eta_neg, N_neg, dN_neg)
         elif mesh.element_type == "quad" and mesh.poly_order == 2:
-            _tab_q2(xi_pos, xi_neg*0 + eta_pos, np.empty((nE, nQ, 9)), dN_pos)
-            _tab_q2(xi_neg, xi_neg*0 + eta_neg, np.empty((nE, nQ, 9)), dN_neg)
+            _tab_q2(xi_pos, xi_neg*0 + eta_pos, N_pos, dN_pos)
+            _tab_q2(xi_neg, xi_neg*0 + eta_neg, N_neg, dN_neg)
         elif mesh.element_type == "tri" and mesh.poly_order == 1:
-            _tab_p1(xi_pos, xi_neg*0 + eta_pos, np.empty((nE, nQ, 3)), dN_pos)
-            _tab_p1(xi_neg, xi_neg*0 + eta_neg, np.empty((nE, nQ, 3)), dN_neg)
+            _tab_p1(xi_pos, xi_neg*0 + eta_pos, N_pos, dN_pos)
+            _tab_p1(xi_neg, xi_neg*0 + eta_neg, N_neg, dN_neg)
         else:
             ref = get_reference(mesh.element_type, mesh.poly_order, max_deriv_order = kmax)
             for i in range(nE):
                 for q in range(nQ):
+                    N_pos[i, q]  = np.asarray(ref.shape(xi_pos[i, q], eta_pos[i, q]))
+                    N_neg[i, q]  = np.asarray(ref.shape(xi_neg[i, q], eta_neg[i, q]))
                     dN_pos[i, q] = np.asarray(ref.grad(xi_pos[i, q], eta_pos[i, q]))
                     dN_neg[i, q] = np.asarray(ref.grad(xi_neg[i, q], eta_neg[i, q]))
 
-        # J, detJ, J_inv
-        if _HAVE_NUMBA:
-            detJ_pos, J_inv_pos = _geom_from_dN(coords_pos_def, dN_pos)
-            detJ_neg, J_inv_neg = _geom_from_dN(coords_neg_def, dN_neg)
+        base_key = ("ghost_geom", id(mesh), subset_hash_pos, subset_hash_neg, coords_hash,
+                    xi_pos_bytes, eta_pos_bytes, xi_neg_bytes, eta_neg_bytes)
+        geom_pair = _jacobian_cache.get(base_key) if reuse else None
+        if geom_pair is not None:
+            J_geom_pos = geom_pair["J_pos"]
+            J_geom_neg = geom_pair["J_neg"]
+            detJ_pos = geom_pair["det_pos"].copy()
+            detJ_neg = geom_pair["det_neg"].copy()
+            J_inv_pos = geom_pair["inv_pos"].copy()
+            J_inv_neg = geom_pair["inv_neg"].copy()
         else:
-            detJ_pos = np.empty((nE, nQ)); J_inv_pos = np.empty((nE, nQ, 2, 2))
-            detJ_neg = np.empty((nE, nQ)); J_inv_neg = np.empty((nE, nQ, 2, 2))
-            for coords, dN, detJ, J_inv in ((coords_pos_def, dN_pos, detJ_pos, J_inv_pos),
-                                            (coords_neg_def, dN_neg, detJ_neg, J_inv_neg)):
-                for e in range(nE):
-                    Xe = coords[e]
-                    for q in range(nQ):
-                        a00 = a01 = a10 = a11 = 0.0
-                        for iN in range(nLocGeom):
-                            gx, gy = dN[e, q, iN, 0], dN[e, q, iN, 1]
-                            x,  y  = Xe[iN, 0], Xe[iN, 1]
-                            a00 += gx * x; a01 += gy * x
-                            a10 += gx * y; a11 += gy * y
-                        det = a00 * a11 - a01 * a10
-                        detJ[e, q] = det
-                        invd = 1.0 / det
-                        J_inv[e, q, 0, 0] =  a11 * invd
-                        J_inv[e, q, 0, 1] = -a01 * invd
-                        J_inv[e, q, 1, 0] = -a10 * invd
-                        J_inv[e, q, 1, 1] =  a00 * invd
+            J_geom_pos = np.einsum('eki,eqkj->eqij', coords_pos, dN_pos, optimize=True)
+            J_geom_neg = np.einsum('eki,eqkj->eqij', coords_neg, dN_neg, optimize=True)
+            detJ_pos = J_geom_pos[..., 0, 0] * J_geom_pos[..., 1, 1] - J_geom_pos[..., 0, 1] * J_geom_pos[..., 1, 0]
+            detJ_neg = J_geom_neg[..., 0, 0] * J_geom_neg[..., 1, 1] - J_geom_neg[..., 0, 1] * J_geom_neg[..., 1, 0]
+            J_inv_pos = np.empty_like(J_geom_pos)
+            J_inv_neg = np.empty_like(J_geom_neg)
+            J_inv_pos[..., 0, 0] =  J_geom_pos[..., 1, 1]
+            J_inv_pos[..., 0, 1] = -J_geom_pos[..., 0, 1]
+            J_inv_pos[..., 1, 0] = -J_geom_pos[..., 1, 0]
+            J_inv_pos[..., 1, 1] =  J_geom_pos[..., 0, 0]
+            J_inv_neg[..., 0, 0] =  J_geom_neg[..., 1, 1]
+            J_inv_neg[..., 0, 1] = -J_geom_neg[..., 0, 1]
+            J_inv_neg[..., 1, 0] = -J_geom_neg[..., 1, 0]
+            J_inv_neg[..., 1, 1] =  J_geom_neg[..., 0, 0]
+            J_inv_pos /= detJ_pos[..., None, None]
+            J_inv_neg /= detJ_neg[..., None, None]
+            if reuse:
+                _jacobian_cache[base_key] = {
+                    "J_pos": J_geom_pos.copy(),
+                    "J_neg": J_geom_neg.copy(),
+                    "det_pos": detJ_pos.copy(),
+                    "det_neg": detJ_neg.copy(),
+                    "inv_pos": J_inv_pos.copy(),
+                    "inv_neg": J_inv_neg.copy(),
+                }
 
         # sanity check
         bad = np.where((detJ_pos <= 1e-12) | (detJ_neg <= 1e-12))
@@ -2776,45 +2862,80 @@ class DofHandler:
 
         # deformation: update quadrature positions, weights, normals
         if deformation is not None:
-            for i, e in enumerate(edges):
-                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
-                tangent = np.asarray(p1, float) - np.asarray(p0, float)
-                tang_norm = max(np.linalg.norm(tangent), 1e-16)
-                tau = tangent / tang_norm
-                cpos = np.asarray(mesh.elements_list[int(pos_ids[i])].centroid())
-                cneg = np.asarray(mesh.elements_list[int(neg_ids[i])].centroid())
-                for q in range(nQ):
-                    xi_p = float(xi_pos[i, q]); eta_p = float(eta_pos[i, q])
-                    xi_n = float(xi_neg[i, q]); eta_n = float(eta_neg[i, q])
-                    dN_p = dN_pos[i, q]
-                    dN_n = dN_neg[i, q]
-                    Jg_pos = coords_pos[i].T @ dN_p
-                    Jg_neg = coords_neg[i].T @ dN_n
-                    Gref_pos = U_pos[i].T @ dN_p
-                    Gref_neg = U_neg[i].T @ dN_n
-                    v_pos = np.linalg.solve(Jg_pos, tau)
-                    v_neg = np.linalg.solve(Jg_neg, tau)
-                    Ftau_pos = tau + Gref_pos @ v_pos
-                    Ftau_neg = tau + Gref_neg @ v_neg
-                    norm_pos = max(np.linalg.norm(Ftau_pos), 1e-16)
-                    norm_neg = max(np.linalg.norm(Ftau_neg), 1e-16)
-                    qw[i, q] = float(qw[i, q]) * 0.5 * (norm_pos + norm_neg)
+            def_token = _def_fingerprint(deformation)
+            final_key = ("ghost_final", id(mesh), subset_hash_pos, subset_hash_neg, coords_hash,
+                         xi_pos_bytes, eta_pos_bytes, xi_neg_bytes, eta_neg_bytes, def_token)
+            cached_final = _jacobian_cache.get(final_key) if reuse else None
+            if cached_final is not None:
+                detJ_pos = cached_final.get("det_pos", detJ_pos).copy()
+                detJ_neg = cached_final.get("det_neg", detJ_neg).copy()
+                J_inv_pos = cached_final.get("inv_pos", J_inv_pos).copy()
+                J_inv_neg = cached_final.get("inv_neg", J_inv_neg).copy()
+                qp_phys = cached_final["qp"].copy()
+                qw = cached_final["qw"].copy()
+                normals_cached = cached_final.get("normals", None)
+                if normals_cached is not None:
+                    normals[:] = normals_cached
+                phi_cached = cached_final.get("phi", None)
+                if phi_cached is not None:
+                    phi_arr = phi_cached.copy()
+            else:
+                tau = edge_vectors
+                tau_norm = np.linalg.norm(tau, axis=1, keepdims=True)
+                tau_norm = np.maximum(tau_norm, 1e-16)
+                tau_unit = tau / tau_norm
 
-                    tau_eff = 0.5 * (Ftau_pos + Ftau_neg)
-                    if np.linalg.norm(tau_eff) < 1e-14:
-                        tau_eff = Ftau_pos
-                    tangent_def = tau_eff / (np.linalg.norm(tau_eff) + 1e-30)
-                    normal_here = np.array([tangent_def[1], -tangent_def[0]], float)
-                    if np.dot(normal_here, cpos - cneg) < 0.0:
-                        normal_here = -normal_here
-                    normals[i, q, :] = normal_here
+                Jg_pos = J_geom_pos
+                Jg_neg = J_geom_neg
+                Gref_pos = np.einsum('eki,eqkj->eqij', U_pos, dN_pos)
+                Gref_neg = np.einsum('eki,eqkj->eqij', U_neg, dN_neg)
 
-                    shape_pos = np.asarray(ref_geom_global.shape(xi_p, eta_p), float)
-                    shape_neg = np.asarray(ref_geom_global.shape(xi_n, eta_n), float)
-                    x_pos = shape_pos @ coords_pos_def[i]
-                    x_neg = shape_neg @ coords_neg_def[i]
-                    qp_phys[i, q, :] = 0.5 * (x_pos + x_neg)
-                    phi_arr[i, q] = _eval_ls(int(pos_ids[i]), qp_phys[i, q])
+                detJg_pos = detJ_pos
+                detJg_neg = detJ_neg
+                invJg_pos = J_inv_pos
+                invJg_neg = J_inv_neg
+
+                v_pos = np.einsum('eqij,ei->eqj', invJg_pos, tau_unit)
+                v_neg = np.einsum('eqij,ei->eqj', invJg_neg, tau_unit)
+
+                Ftau_pos = tau_unit[:, None, :] + np.einsum('eqij,eqj->eqi', Gref_pos, v_pos)
+                Ftau_neg = tau_unit[:, None, :] + np.einsum('eqij,eqj->eqi', Gref_neg, v_neg)
+
+                norm_pos = np.linalg.norm(Ftau_pos, axis=-1)
+                norm_neg = np.linalg.norm(Ftau_neg, axis=-1)
+                stretch = 0.5 * (np.maximum(norm_pos, 1e-16) + np.maximum(norm_neg, 1e-16))
+                qw *= stretch
+
+                tau_eff = 0.5 * (Ftau_pos + Ftau_neg)
+                normals_def = np.stack((tau_eff[..., 1], -tau_eff[..., 0]), axis=-1)
+                normal_norm = np.linalg.norm(normals_def, axis=-1, keepdims=True) + 1e-30
+                normals_def /= normal_norm
+
+                orient_vec = centroid_pos - centroid_neg
+                orient_dot = np.einsum('eqi,ei->eq', normals_def, orient_vec)
+                flip_mask = orient_dot < 0.0
+                normals_def[flip_mask] *= -1.0
+                normals[:] = normals_def
+
+                x_pos = np.einsum('eqk,ekj->eqj', N_pos, coords_pos_def)
+                x_neg = np.einsum('eqk,ekj->eqj', N_neg, coords_neg_def)
+                qp_phys[...] = 0.5 * (x_pos + x_neg)
+                for i in range(nE):
+                    pos_eid = int(pos_ids[i])
+                    for q in range(nQ):
+                        phi_arr[i, q] = _eval_ls(pos_eid, qp_phys[i, q])
+
+                if reuse:
+                    _jacobian_cache[final_key] = {
+                        "det_pos": detJ_pos.copy(),
+                        "det_neg": detJ_neg.copy(),
+                        "inv_pos": J_inv_pos.copy(),
+                        "inv_neg": J_inv_neg.copy(),
+                        "qp": qp_phys.copy(),
+                        "qw": qw.copy(),
+                        "normals": normals.copy(),
+                        "phi": phi_arr.copy(),
+                    }
 
         elif normals.ndim == 3:
             # ensure normals arrays respect orientation with stored base normal vectors
@@ -2824,6 +2945,16 @@ class DofHandler:
                 cneg = np.asarray(mesh.elements_list[int(neg_ids[i])].centroid())
                 if np.dot(nvec, cpos - cneg) < 0.0:
                     normals[i, :, :] = -normals[i, :, :]
+
+        # ensure subsequent consumers see fresh, contiguous arrays
+        qp_phys  = np.asarray(qp_phys, dtype=np.float64, order="C")
+        qw       = np.asarray(qw, dtype=np.float64, order="C")
+        detJ_pos = np.asarray(detJ_pos, dtype=np.float64, order="C")
+        detJ_neg = np.asarray(detJ_neg, dtype=np.float64, order="C")
+        J_inv_pos = np.asarray(J_inv_pos, dtype=np.float64, order="C")
+        J_inv_neg = np.asarray(J_inv_neg, dtype=np.float64, order="C")
+        normals  = np.asarray(normals, dtype=np.float64, order="C")
+        phi_arr  = np.asarray(phi_arr, dtype=np.float64, order="C")
 
         # 5) Reference derivative tables per side/field ------------------------------
         derivs = set(derivs)  # no need to inject (0,0) here for Hessian/Lap kernels
@@ -3504,31 +3635,13 @@ class DofHandler:
             return out
 
         # ---------- cache key ----------
-        def _ls_fingerprint(ls):
-            # stable-ish token for cache
-            try:
-                return ("ls", id(ls), getattr(ls, "version", None))
-            except Exception:
-                return ("ls", id(ls))
-
-        def _hash_subset(ids):
-            # stable order-independent subset hash
-            return tuple(sorted(int(i) for i in ids))
-
-        def _def_fingerprint(defm):
-            if defm is None: return ("nodef",)
-            tok = getattr(defm, "cache_token", None)
-            return ("token", tok) if tok is not None else ("objid", int(id(defm)))
-
-        try:
-            subset_hash = _hash_subset(eids_all)
-        except Exception:
-            subset_hash = tuple(sorted(eids_all))
+        subset_hash = _hash_subset(eids_all)
         cache_key = (
             "cutvol", id(mesh), getattr(me, "signature", lambda: ("me", id(me)))(),
             subset_hash, int(qdeg), str(side), tuple(sorted(derivs_eff)),
             self.method, bool(need_hess), bool(need_o3), bool(need_o4),
-            _ls_fingerprint(level_set), _def_fingerprint(deformation)
+            _ls_fingerprint(level_set), _def_fingerprint(deformation),
+            _coords_fingerprint(mesh.nodes_x_y_pos),
         )
         global _cut_volume_cache
         try:
@@ -3780,6 +3893,13 @@ class DofHandler:
             if need_o4:
                 Qxi0[i, :n, :, :, :, :] = Q0_blocks[i]
                 Qxi1[i, :n, :, :, :, :] = Q1_blocks[i]
+
+        qp_phys = np.ascontiguousarray(qp_phys, dtype=np.float64)
+        qw      = np.ascontiguousarray(qw, dtype=np.float64)
+        J_inv   = np.ascontiguousarray(J_inv, dtype=np.float64)
+        detJ    = np.ascontiguousarray(detJ, dtype=np.float64)
+        qref    = np.ascontiguousarray(qref, dtype=np.float64)
+        phis    = np.ascontiguousarray(phis, dtype=np.float64)
 
         # ---------- rebuild per-field blocks and scatter into union ----------
         out = {

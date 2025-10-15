@@ -516,8 +516,11 @@ def compare_contributions(py_data, jit_data, detail: bool = False) -> Dict[str, 
     return report
 
 def _straight_cut_quadrature(mesh: Mesh, eid: int, level_set, qdeg: int, side: str) -> Tuple[np.ndarray, np.ndarray]:
-    order_y = max(2, qdeg // 2)
-    order_x = max(2, qdeg // 2)
+    p_geom = int(getattr(mesh, "poly_order", 1))
+    q_infl = 2 * max(0, p_geom - 1)
+    qdeg_eff = int(qdeg + q_infl)
+    order_y = max(2, qdeg_eff // 2)
+    order_x = max(2, qdeg_eff // 2)
     qpref, qwref = CutIntegration.straight_cut_rule_quad_ref(
         mesh,
         int(eid),

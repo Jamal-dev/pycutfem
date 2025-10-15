@@ -14,37 +14,39 @@ Problem setup:
 """
 
 import numpy as np
-import scipy.sparse
-import scipy.sparse.linalg as sp_la
 import os
+import argparse
+import time
 
 # --- Core pycutfem imports ---
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.fem.mixedelement import MixedElement
-from pycutfem.core.levelset import CircleLevelSet
+from pycutfem.core.levelset import CircleLevelSet, LevelSetMeshAdaptation
 
 # --- UFL-like imports ---
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction,
-    Function, Constant, grad, inner, dot, jump, FacetNormal, CellDiameter, Derivative
+    Function, Constant, grad, inner, dot, jump, FacetNormal, CellDiameter
 )
 from pycutfem.ufl.measures import dx, dGhost, dInterface
 from pycutfem.ufl.forms import BoundaryCondition
 from pycutfem.io.vtk import export_vtk
-from pycutfem.fem import transform
-from pycutfem.integration.quadrature import volume
-from pycutfem.ufl.helpers_geom import (
-    clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
-)
 # --- NEW: Import Newton Solver ---
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters
 
-def run_step85_newton():
+def run_step85_newton(*, backend: str = "jit", with_deformation: bool = False, cycles: int = 4):
     """
     Main function to run the step-85 simulation with Newton's method.
     """
+    total_start = time.perf_counter()
+    jit_warmup_time = 0.0
+    total_solver_time = 0.0
+    total_assembly_time = 0.0
+    total_linear_time = 0.0
+    total_line_search_time = 0.0
+    init_times: list[float] = []
     # ========================================================================
     #    1. PROBLEM SETUP
     # ========================================================================
@@ -69,7 +71,7 @@ def run_step85_newton():
     # ========================================================================
     #    2. CONVERGENCE LOOP
     # ========================================================================
-    n_refinements = 4
+    n_refinements = cycles
     convergence_data = []
 
     for cycle in range(n_refinements):
@@ -80,15 +82,16 @@ def run_step85_newton():
         h_max = (mesh_bounds[1] - mesh_bounds[0]) / nx
         print(f"Creating mesh with h = {h_max:.4f}...")
 
+        geom_order = 2 if with_deformation else fe_degree
         nodes, elems, _, corners = structured_quad(
             Lx=mesh_bounds[1] - mesh_bounds[0],
             Ly=mesh_bounds[1] - mesh_bounds[0],
             nx=nx, ny=ny,
-            poly_order=fe_degree,
+            poly_order=geom_order,
             offset=(mesh_bounds[0], mesh_bounds[0])
         )
         mesh = Mesh(nodes=nodes, element_connectivity=elems,
-                    elements_corner_nodes=corners, element_type="quad", poly_order=fe_degree)
+                    elements_corner_nodes=corners, element_type="quad", poly_order=geom_order)
         level_set = CircleLevelSet(center=domain_center, radius=domain_radius)
 
         # --- Mesh Classification and Domain Definition ---
@@ -108,6 +111,18 @@ def run_step85_newton():
         print('-'*60)
 
         # --- Finite Element Space and DoF Handler ---
+        if with_deformation:
+            adapter = LevelSetMeshAdaptation(
+                mesh,
+                order=max(2, geom_order),
+                threshold=1.0,
+                max_steps=6,
+            )
+            deformation = adapter.calc_deformation(level_set, q_vol=2 * fe_degree + 4)
+            level_set = adapter.lset_p1
+        else:
+            deformation = None
+
         element = MixedElement(mesh, field_specs={'u': fe_degree})
         dof_handler = DofHandler(element, method='cg')
 
@@ -156,33 +171,45 @@ def run_step85_newton():
         gamma_G = Constant(ghost_parameter)
 
         # --- Define integration measures ---
-        dx_phys = dx(defined_on=physical_domain, level_set=level_set, metadata={'side': '-',"q": fe_degree + 2})
-        dGamma = dInterface(defined_on=cut_domain, level_set=level_set, metadata={"q": fe_degree + 3})
-        dGhost_stab = dGhost(defined_on=ghost_domain, level_set=level_set, metadata={"q": fe_degree + 3})
+        q_base = fe_degree + 2 + (2 if with_deformation else 0)
+        dx_phys = dx(defined_on=physical_domain, level_set=level_set,
+                     metadata={'side': '-',"q": q_base}, deformation=deformation)
+        dGamma = dInterface(defined_on=cut_domain, level_set=level_set,
+                            metadata={"q": q_base + 1}, deformation=deformation)
+        dGhost_stab = dGhost(defined_on=ghost_domain, level_set=level_set,
+                             metadata={"q": q_base + 1}, deformation=deformation)
 
         # --- NEW: Define Residual Form R(u_k, v) ---
         # This is equivalent to a(u_k, v) - L(v) = 0
+        # interface_terms_residual = (- dot(grad(u_k), n) * v * dGamma
+        #     - dot(grad(v), n) * (u_k - g) * dGamma
+        #     + (gamma_N / h) * (u_k - g) * v * dGamma)
+        interface_terms_residual = (- dot(grad(u_k), n) * v 
+                - dot(grad(v), n) * (u_k - g)
+                + (gamma_N / h) * (u_k - g) * v )* dGamma
         residual = (
             # Volume terms
-            inner(grad(u_k), grad(v)) * dx_phys
-            -f * v * dx_phys
+            (inner(grad(u_k), grad(v)) 
+            -f * v) * dx_phys
             # Nitsche terms for BC
-            - dot(grad(u_k), n) * v * dGamma
-            - dot(grad(v), n) * (u_k - g) * dGamma
-            + (gamma_N / h) * (u_k - g) * v * dGamma
+            + interface_terms_residual
             # Ghost penalty stabilization
             + (0.5 * gamma_G * h * jump(normal_grad(u_k)) * jump(normal_grad(v))) * dGhost_stab
         )
 
         # --- NEW: Define Jacobian Form J(du, v) ---
         # This is the Gateaux derivative of the residual w.r.t u_k in direction du
+        # interface_terms_jacobian = (- dot(grad(du), n) * v * dGamma
+        #     - dot(grad(v), n) * du * dGamma
+        #     + (gamma_N / h) * du * v * dGamma)
+        interface_terms_jacobian = (- dot(grad(du), n) * v 
+                - dot(grad(v), n) * du
+                + (gamma_N / h) * du * v )* dGamma
         jacobian = (
             # Volume terms
             inner(grad(du), grad(v)) * dx_phys
             # Nitsche terms
-            - dot(grad(du), n) * v * dGamma
-            - dot(grad(v), n) * du * dGamma
-            + (gamma_N / h) * du * v * dGamma
+            + interface_terms_jacobian
             # Ghost penalty
             + (0.5 * gamma_G * h * jump(normal_grad(du)) * jump(normal_grad(v))) * dGhost_stab
         )
@@ -193,6 +220,7 @@ def run_step85_newton():
         print("Setting up and running the Newton solver...")
 
         # --- NEW: Initialize and run the solver ---
+        init_t0 = time.perf_counter()
         solver = NewtonSolver(
             residual_form=residual,
             jacobian_form=jacobian,
@@ -200,9 +228,15 @@ def run_step85_newton():
             mixed_element=element,
             bcs=bcs,
             bcs_homog=bcs_homog,
-            newton_params=NewtonParameters(newton_tol=1e-8, max_newton_iter=10)
+            newton_params=NewtonParameters(newton_tol=1e-8, max_newton_iter=10),
+            backend=backend,
+            deformation=deformation,
         )
-        
+        init_elapsed = time.perf_counter() - init_t0
+        init_times.append(init_elapsed)
+        if cycle == 0:
+            jit_warmup_time = init_elapsed
+
         # Since this is a linear problem, the Newton solver will converge in one step.
         # We need to provide the function to be solved for.
         # The solver updates u_k in place.
@@ -212,19 +246,23 @@ def run_step85_newton():
                                             max_steps = 1)
         u_k_prev = Function(name="u_k_prev", field_name="u", dof_handler=dof_handler)
         u_k_prev.nodal_values[:] = 0.0
+        solve_t0 = time.perf_counter()
         solver.solve_time_interval(
             functions=[u_k],
             prev_functions=[u_k_prev], # For steady state, prev_functions is not used but required
             time_params=time_params
         )
+        total_solver_time += time.perf_counter() - solve_t0
+
+        iter_totals = getattr(solver, "_last_iteration_totals", {})
+        total_assembly_time += iter_totals.get("assembly", 0.0)
+        total_linear_time += iter_totals.get("linear_solve", 0.0)
+        total_line_search_time += iter_totals.get("line_search", 0.0)
 
         # ====================================================================
         #    5. POST-PROCESSING AND ERROR COMPUTATION
         # ====================================================================
-        print("Post-processing and computing L2 error...")
-
-        # --- NEW: Get solution vector from the Function object ---
-        solution_vec = u_k.nodal_values
+        print("Post-processing and computing errors...")
 
         # --- Output results to VTK file for one cycle ---
         if cycle == 1:
@@ -239,64 +277,102 @@ def run_step85_newton():
                 functions={"solution": u_k}
             )
 
-        # --- Manual L2 Error Calculation (unchanged) ---
-        l2_error_sq = 0.0
-        q_order_err = 2 * fe_degree + 2
-        qp_ref, qw_ref = volume(mesh.element_type, q_order_err)
-        for eid in mesh.element_bitset("inside").to_indices():
-            gdofs = dof_handler.get_elemental_dofs(eid)
-            u_loc = u_k.get_nodal_values(gdofs)
-            for (xi, eta), w in zip(qp_ref, qw_ref):
-                J = transform.jacobian(mesh, eid, (xi, eta))
-                detJ = abs(np.linalg.det(J))
-                x, y = transform.x_mapping(mesh, eid, (xi, eta))
-                phi = element.basis('u', xi, eta)
-                u_h_val = np.dot(phi, u_loc)
-                u_ex_val = analytical_solution(x, y)
-                l2_error_sq += (u_h_val - u_ex_val)**2 * w * detJ
+        grad_exact = lambda x, y: np.array([-2.0 * x, -2.0 * y])
 
-        qp_ref_tri, qw_ref_tri = volume("tri", q_order_err)
-        for eid in mesh.element_bitset("cut").to_indices():
-            elem = mesh.elements_list[eid]
-            tri_local, corner_ids = corner_tris(mesh, elem)
-            gdofs = dof_handler.get_elemental_dofs(eid)
-            u_loc = u_k.get_nodal_values(gdofs)
+        l2_error = dof_handler.l2_error_on_side(
+            functions=u_k,
+            exact={'u': analytical_solution},
+            level_set=level_set,
+            side='-',
+            relative=False,
+            deformation=deformation,
+        )
+        h1_error = dof_handler.h1_error_scalar_on_side(
+            uh=u_k,
+            exact_grad=lambda x, y: grad_exact(x, y),
+            level_set=level_set,
+            side='-',
+            relative=False,
+            deformation=deformation,
+        )
 
-            for loc_tri in tri_local:
-                v_ids = [corner_ids[i] for i in loc_tri]
-                v_coords = mesh.nodes_x_y_pos[v_ids]
-                v_phi = np.array([level_set(np.asarray(xy)) for xy in v_coords])
-                polygons = clip_triangle_to_side(v_coords, v_phi, side='-')
-                for poly in polygons:
-                    for A, B, C in fan_triangulate(poly):
-                        qp_phys, qw_phys = map_ref_tri_to_phys(A, B, C, qp_ref_tri, qw_ref_tri)
-                        for x_phys, w_phys in zip(qp_phys, qw_phys):
-                            xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
-                            phi = element.basis('u', xi, eta)
-                            u_h_val = np.dot(phi, u_loc)
-                            u_ex_val = analytical_solution(x_phys[0], x_phys[1])
-                            l2_error_sq += (u_h_val - u_ex_val)**2 * w_phys
-
-        l2_error = np.sqrt(l2_error_sq)
-        convergence_data.append({'cycle': cycle, 'h': h_max, 'L2-error': l2_error, 'ndofs': active_dofs_count})
-        print(f"Cycle {cycle} finished. L2 Error: {l2_error:.5e}")
+        convergence_data.append({
+            'cycle': cycle,
+            'h': h_max,
+            'L2-error': l2_error,
+            'H1-error': h1_error,
+            'ndofs': active_dofs_count
+        })
+        print(f"Cycle {cycle} finished. L2 Error: {l2_error:.5e}, H1 Error: {h1_error:.5e}")
 
     # ========================================================================
     #    6. PRINT CONVERGENCE TABLE
     # ========================================================================
     print("\n" + "="*60)
-    print("                 Convergence Table for L2-Error")
+    print("        Convergence Table for L2 and H1 Errors")
     print("="*60)
-    print(f"{'Cycle':>5} | {'h':>12} | {'NDOFs':>9} | {'L2-Error':>15} | {'Rate':>6}")
+    print(f"{'Cycle':>5} | {'h':>12} | {'NDOFs':>9} | {'L2-Error':>12} | {'Rate(L2)':>8} | {'H1-Error':>12} | {'Rate(H1)':>8}")
     print("-"*60)
     for i, data in enumerate(convergence_data):
-        rate_str = "----"
+        rate_l2 = "----"
+        rate_h1 = "----"
         if i > 0:
-            rate = np.log2(convergence_data[i-1]['L2-error'] / data['L2-error'])
-            rate_str = f"{rate:.2f}"
-        print(f"{data['cycle']:>5d} | {data['h']:>12.4e} | {data['ndofs']:>9d} | {data['L2-error']:>15.5e} | {rate_str:>6}")
+            prev = convergence_data[i-1]
+            rate_l2 = f"{np.log2(prev['L2-error'] / data['L2-error']):.2f}" if data['L2-error'] > 0 else "----"
+            rate_h1 = f"{np.log2(prev['H1-error'] / data['H1-error']):.2f}" if data['H1-error'] > 0 else "----"
+        print(
+            f"{data['cycle']:>5d} | {data['h']:>12.4e} | {data['ndofs']:>9d} | "
+            f"{data['L2-error']:>12.5e} | {rate_l2:>8} | {data['H1-error']:>12.5e} | {rate_h1:>8}"
+        )
     print("="*60)
+
+    total_elapsed = time.perf_counter() - total_start
+    total_init_time = sum(init_times)
+    residual_time = total_elapsed - total_init_time - total_solver_time
+
+    print("\nTiming summary")
+    print("="*60)
+    print(f"Total wall time            : {total_elapsed:.3f} s")
+    if init_times:
+        print(f"  Solver setup (first cycle): {jit_warmup_time:.3f} s")
+        if total_init_time - jit_warmup_time > 0:
+            print(f"  Solver setup (other cycles): {total_init_time - jit_warmup_time:.3f} s")
+    print(f"  Newton solve stage        : {total_solver_time:.3f} s")
+    print(f"    Assembly subtotal       : {total_assembly_time:.3f} s")
+    print(f"    Linear solve subtotal   : {total_linear_time:.3f} s")
+    if total_line_search_time > 0.0:
+        print(f"    Line-search subtotal    : {total_line_search_time:.3f} s")
+    print(f"  Other overhead            : {max(residual_time, 0.0):.3f} s")
 
 
 if __name__ == '__main__':
-    run_step85_newton()
+    parser = argparse.ArgumentParser(description="CutFEM Poisson problem (step-85) with Newton solver")
+    parser.add_argument(
+        "--backend",
+        choices=("python", "jit"),
+        default="jit",
+        help="form assembly backend (jit is faster after first compile)",
+    )
+    parser.add_argument(
+        "--with-deformation",
+        action="store_true",
+        help="enable isoparametric deformation of the cut geometry",
+    )
+    parser.add_argument(
+        "--no-deformation",
+        action="store_true",
+        help="force the run without deformation even if other flags set it",
+    )
+    parser.add_argument(
+        "--cycles",
+        type=int,
+        default=4,
+        help="number of refinement cycles to execute (default: 4)",
+    )
+    args, _ = parser.parse_known_args()
+    if args.with_deformation and args.no_deformation:
+        raise SystemExit("Choose at most one of --with-deformation or --no-deformation.")
+    use_deformation = args.with_deformation and not args.no_deformation
+    print(f"Backend: {args.backend}")
+    print(f"With deformation: {use_deformation}")
+    run_step85_newton(backend=args.backend, with_deformation=use_deformation, cycles=args.cycles)
