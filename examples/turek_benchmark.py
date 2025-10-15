@@ -107,6 +107,7 @@ NX, NY = 65, 50
 # NX, NY = 30, 40
 dt = Constant(0.1)
 theta = Constant(0.56) # Crank-Nicolson
+max_time_steps = 200
 analytic_level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 )
 # h  = 0.5*(L/NX + H/NY)
 
@@ -772,14 +773,14 @@ def save_solution(funcs):
 
     # ------------------ Interface integrals for Drag & Lift -----------------
     # High-order quadrature helps here (Q2 velocity): use q≈11–13
-    dΓ = dInterface(defined_on=cut_domain, level_set=level_set, metadata={"q": 11})
+    dΓ = dInterface(defined_on=cut_domain, level_set=level_set, metadata={"q": 11}, deformation=deformation)
 
     e_x = Constant(np.array([1.0, 0.0]), dim =1)
     e_y = Constant(np.array([0.0, 1.0]), dim =1)
 
     # traction on the *fluid* side, then flip the sign to get the force on the cylinder
-    integrand_drag = -traction_dot_dir(u_k_func, p_k_func, e_x)   # scalar
-    integrand_lift = -traction_dot_dir(u_k_func, p_k_func, e_y)   # scalar
+    integrand_drag = traction_dot_dir(u_k_func, p_k_func, e_x)   # scalar
+    integrand_lift = traction_dot_dir(u_k_func, p_k_func, e_y)   # scalar
 
     I_drag = integrand_drag * dΓ
     I_lift = integrand_lift * dΓ
@@ -887,6 +888,7 @@ def save_solution(funcs):
     histories.setdefault("cd", []).append(C_D)
     histories.setdefault("cl", []).append(C_L)
     histories.setdefault("dp", []).append(dp)
+    histories.setdefault("time", []).append(step_counter * dt.value)
 
 
     step_counter += 1
@@ -907,7 +909,9 @@ from pycutfem.solvers.aainhb_solver import AAINHBSolver           # or get_solv
 import time
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
-time_params = TimeStepperParameters(dt=dt.value,max_steps=100 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
+time_params = TimeStepperParameters(dt=dt.value,max_steps=max_time_steps
+                                    ,stop_on_steady=True, 
+                                    steady_tol=1e-6, theta= theta.value)
 dirichlet_dofs = set(dof_handler.get_dirichlet_data(bcs).keys())  # bcs = your Dirichlet BCs
 post_cb = make_peak_filter_cb(
     dof_handler, level_set,
@@ -1063,15 +1067,22 @@ def plotting():
     import matplotlib.pyplot as plt
     # if ENABLE_PLOTS:
     offset = 5
-    plt.plot(histories["cd"][offset:], label="C_D", marker='o')
-    plt.ylabel('C_D')
+    plt.plot(histories["time"][offset:], histories["cd"][offset:], label="C_D", marker='o')
+    plt.ylabel('$C_D$')
+    plt.xlabel('Time')
+    plt.title('Turek-Schafer Benchmark: Drag Coefficient over Time')
+
     plt.figure()
-    plt.plot(histories["cl"][offset:], label="C_L", marker='o')
-    plt.ylabel('C_L')
+    plt.plot(histories["time"][offset:], histories["cl"][offset:], label="C_L", marker='o')
+    plt.ylabel('$C_L$')
+    plt.xlabel('Time')
+    plt.title('Turek-Schafer Benchmark: Lift Coefficient over Time')
     plt.savefig((Path(output_dir)/Path("turek_cl_cd.png")))
     plt.figure()
-    plt.plot(histories["dp"][offset:], label="Δp", marker='o')
+    plt.plot(histories["time"][offset:], histories["dp"][offset:], label="Δp", marker='o')
     plt.ylabel('Δp')
+    plt.xlabel('Time')
+    plt.title('Turek-Schafer Benchmark: Pressure Difference over Time')
     plt.savefig((Path(output_dir)/Path("turek_dp.png")))
     plt.show()
 
@@ -1105,5 +1116,3 @@ except Exception as e:
     print("Solver failed:", e)
     plotting()
     
-
-

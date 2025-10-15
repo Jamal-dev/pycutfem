@@ -2382,7 +2382,8 @@ class DofHandler:
         reuse: bool = True,
         need_hess: bool = False,
         need_o3: bool = False,
-        need_o4: bool = False
+        need_o4: bool = False,
+        deformation: Any = None
     ) -> dict:
         """
         Pre-compute geometry and basis tables for ∫_Γ_g ⋯ dS on ghost edges.
@@ -2405,6 +2406,8 @@ class DofHandler:
             Also pre-tabulate all third derivatives (rare).
         need_o4 : bool, default False
             Also pre-tabulate all fourth derivatives (rare).
+        deformation : object, optional
+            Optional level-set deformation providing nodal displacements for isoparametric mapping.
 
         Returns
         -------
@@ -2435,6 +2438,11 @@ class DofHandler:
         from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
         from pycutfem.integration.quadrature import line_quadrature
         from pycutfem.fem import transform
+        from pycutfem.fem.transform import (
+            hess_inverse_from_forward,
+            inverse_A3_material,
+            inverse_A4_material
+        )
         from pycutfem.integration.pre_tabulates import (
             _searchsorted_positions,
             _tabulate_deriv_q1, _tabulate_deriv_q2, _tabulate_deriv_p1,
@@ -2489,7 +2497,24 @@ class DofHandler:
 
         # Cache key: use the subset tuple directly (stable & hashable)
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
-        cache_key  = (ghost_ids, int(qdeg), me.signature(), derivs_key, bool(need_hess), bool(need_o3), bool(need_o4), self.method)
+
+        def _def_fingerprint(defm):
+            if defm is None:
+                return ("nodef",)
+            tok = getattr(defm, "cache_token", None)
+            return ("token", tok) if tok is not None else ("objid", int(id(defm)))
+
+        cache_key  = (
+            ghost_ids,
+            int(qdeg),
+            me.signature(),
+            derivs_key,
+            bool(need_hess),
+            bool(need_o3),
+            bool(need_o4),
+            self.method,
+            _def_fingerprint(deformation),
+        )
         global _ghost_cache
         try:
             _ghost_cache
@@ -2678,7 +2703,24 @@ class DofHandler:
         coords_all   = mesh.nodes_x_y_pos[node_ids_all].astype(float)
         coords_pos   = coords_all[pos_ids]
         coords_neg   = coords_all[neg_ids]
+        if deformation is not None:
+            U_pos = np.empty_like(coords_pos)
+            U_neg = np.empty_like(coords_neg)
+            disp_nodes = np.asarray(deformation.node_displacements, float)
+            for i in range(nE):
+                geom_pos_ids = node_ids_all[pos_ids[i]]
+                geom_neg_ids = node_ids_all[neg_ids[i]]
+                U_pos[i] = disp_nodes[np.asarray(geom_pos_ids, dtype=int)]
+                U_neg[i] = disp_nodes[np.asarray(geom_neg_ids, dtype=int)]
+            coords_pos_def = coords_pos + U_pos
+            coords_neg_def = coords_neg + U_neg
+        else:
+            U_pos = None
+            U_neg = None
+            coords_pos_def = coords_pos
+            coords_neg_def = coords_neg
         nLocGeom     = coords_pos.shape[1]
+        ref_geom_global = transform.get_reference(mesh.element_type, mesh.poly_order) if deformation is not None else None
 
         # reference geometry dN on each side
         dN_pos = np.empty((nE, nQ, nLocGeom, 2), dtype=float)
@@ -2702,13 +2744,13 @@ class DofHandler:
 
         # J, detJ, J_inv
         if _HAVE_NUMBA:
-            detJ_pos, J_inv_pos = _geom_from_dN(coords_pos, dN_pos)
-            detJ_neg, J_inv_neg = _geom_from_dN(coords_neg, dN_neg)
+            detJ_pos, J_inv_pos = _geom_from_dN(coords_pos_def, dN_pos)
+            detJ_neg, J_inv_neg = _geom_from_dN(coords_neg_def, dN_neg)
         else:
             detJ_pos = np.empty((nE, nQ)); J_inv_pos = np.empty((nE, nQ, 2, 2))
             detJ_neg = np.empty((nE, nQ)); J_inv_neg = np.empty((nE, nQ, 2, 2))
-            for coords, dN, detJ, J_inv in ((coords_pos, dN_pos, detJ_pos, J_inv_pos),
-                                            (coords_neg, dN_neg, detJ_neg, J_inv_neg)):
+            for coords, dN, detJ, J_inv in ((coords_pos_def, dN_pos, detJ_pos, J_inv_pos),
+                                            (coords_neg_def, dN_neg, detJ_neg, J_inv_neg)):
                 for e in range(nE):
                     Xe = coords[e]
                     for q in range(nQ):
@@ -2731,6 +2773,57 @@ class DofHandler:
         if bad[0].size:
             e_bad, q_bad = int(bad[0][0]), int(bad[1][0])
             raise ValueError(f"Non-positive detJ at edge {edges[e_bad].gid}, qp {q_bad}")
+
+        # deformation: update quadrature positions, weights, normals
+        if deformation is not None:
+            for i, e in enumerate(edges):
+                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+                tangent = np.asarray(p1, float) - np.asarray(p0, float)
+                tang_norm = max(np.linalg.norm(tangent), 1e-16)
+                tau = tangent / tang_norm
+                cpos = np.asarray(mesh.elements_list[int(pos_ids[i])].centroid())
+                cneg = np.asarray(mesh.elements_list[int(neg_ids[i])].centroid())
+                for q in range(nQ):
+                    xi_p = float(xi_pos[i, q]); eta_p = float(eta_pos[i, q])
+                    xi_n = float(xi_neg[i, q]); eta_n = float(eta_neg[i, q])
+                    dN_p = dN_pos[i, q]
+                    dN_n = dN_neg[i, q]
+                    Jg_pos = coords_pos[i].T @ dN_p
+                    Jg_neg = coords_neg[i].T @ dN_n
+                    Gref_pos = U_pos[i].T @ dN_p
+                    Gref_neg = U_neg[i].T @ dN_n
+                    v_pos = np.linalg.solve(Jg_pos, tau)
+                    v_neg = np.linalg.solve(Jg_neg, tau)
+                    Ftau_pos = tau + Gref_pos @ v_pos
+                    Ftau_neg = tau + Gref_neg @ v_neg
+                    norm_pos = max(np.linalg.norm(Ftau_pos), 1e-16)
+                    norm_neg = max(np.linalg.norm(Ftau_neg), 1e-16)
+                    qw[i, q] = float(qw[i, q]) * 0.5 * (norm_pos + norm_neg)
+
+                    tau_eff = 0.5 * (Ftau_pos + Ftau_neg)
+                    if np.linalg.norm(tau_eff) < 1e-14:
+                        tau_eff = Ftau_pos
+                    tangent_def = tau_eff / (np.linalg.norm(tau_eff) + 1e-30)
+                    normal_here = np.array([tangent_def[1], -tangent_def[0]], float)
+                    if np.dot(normal_here, cpos - cneg) < 0.0:
+                        normal_here = -normal_here
+                    normals[i, q, :] = normal_here
+
+                    shape_pos = np.asarray(ref_geom_global.shape(xi_p, eta_p), float)
+                    shape_neg = np.asarray(ref_geom_global.shape(xi_n, eta_n), float)
+                    x_pos = shape_pos @ coords_pos_def[i]
+                    x_neg = shape_neg @ coords_neg_def[i]
+                    qp_phys[i, q, :] = 0.5 * (x_pos + x_neg)
+                    phi_arr[i, q] = _eval_ls(int(pos_ids[i]), qp_phys[i, q])
+
+        elif normals.ndim == 3:
+            # ensure normals arrays respect orientation with stored base normal vectors
+            for i, e in enumerate(edges):
+                nvec = normals[i, 0]
+                cpos = np.asarray(mesh.elements_list[int(pos_ids[i])].centroid())
+                cneg = np.asarray(mesh.elements_list[int(neg_ids[i])].centroid())
+                if np.dot(nvec, cpos - cneg) < 0.0:
+                    normals[i, :, :] = -normals[i, :, :]
 
         # 5) Reference derivative tables per side/field ------------------------------
         derivs = set(derivs)  # no need to inject (0,0) here for Hessian/Lap kernels
@@ -2767,7 +2860,7 @@ class DofHandler:
 
             # POS side reference tables
             arr = np.empty((nE, nQ, n_f))
-            _tab(0, 0, xi_pos, eta_pos, arr)   # same _tab(...) you use for r10 etc.
+            _tab(0, 0, xi_pos, eta_pos, arr)
             basis_tables[f"r00_{fld}_pos"] = _scatter_union(arr, sl, final_w)
 
             if need_grad:
@@ -2841,6 +2934,88 @@ class DofHandler:
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 4, xi_neg, eta_neg, arr)
                 basis_tables[f"r04_{fld}_neg"] = _scatter_union(arr, sl, final_w)
 
+        def _inverse_jets_for_coords(coords_def_elem: np.ndarray, xi: float, eta: float, upto: int) -> Dict[str, np.ndarray]:
+            xi = float(xi); eta = float(eta)
+            dN_geom = np.asarray(ref_geom_global.grad(xi, eta), float)
+            J = coords_def_elem.T @ dN_geom
+            A = np.linalg.inv(J)
+            jets: Dict[str, np.ndarray] = {"A": A}
+            if upto >= 2:
+                try:
+                    HN = np.asarray(ref_geom_global.hess(xi, eta), float)
+                except AttributeError:
+                    HN = np.empty((coords_def_elem.shape[0], 2, 2), float)
+                    HN[:, 0, 0] = np.asarray(ref_geom_global.derivative(xi, eta, 2, 0), float)
+                    HN[:, 0, 1] = np.asarray(ref_geom_global.derivative(xi, eta, 1, 1), float)
+                    HN[:, 1, 0] = HN[:, 0, 1]
+                    HN[:, 1, 1] = np.asarray(ref_geom_global.derivative(xi, eta, 0, 2), float)
+                d20 = HN[:, 0, 0]; d11 = HN[:, 0, 1]; d02 = HN[:, 1, 1]
+                coords_x = coords_def_elem[:, 0]; coords_y = coords_def_elem[:, 1]
+                Hx0 = np.array([[np.dot(d20, coords_x), np.dot(d11, coords_x)],
+                                [np.dot(d11, coords_x), np.dot(d02, coords_x)]], dtype=float)
+                Hx1 = np.array([[np.dot(d20, coords_y), np.dot(d11, coords_y)],
+                                [np.dot(d11, coords_y), np.dot(d02, coords_y)]], dtype=float)
+                jets["F2"] = np.stack([Hx0, Hx1], axis=0)
+                jets["A2"] = hess_inverse_from_forward(A, Hx0, Hx1)
+            if upto >= 3:
+                d30 = np.asarray(ref_geom_global.derivative(xi, eta, 3, 0), float)
+                d21 = np.asarray(ref_geom_global.derivative(xi, eta, 2, 1), float)
+                d12 = np.asarray(ref_geom_global.derivative(xi, eta, 1, 2), float)
+                d03 = np.asarray(ref_geom_global.derivative(xi, eta, 0, 3), float)
+
+                def _F3_component(coords_col: np.ndarray) -> np.ndarray:
+                    v30 = float(np.dot(d30, coords_col))
+                    v21 = float(np.dot(d21, coords_col))
+                    v12 = float(np.dot(d12, coords_col))
+                    v03 = float(np.dot(d03, coords_col))
+                    T = np.empty((2, 2, 2), float)
+                    T[0, 0, 0] = v30
+                    T[0, 0, 1] = T[0, 1, 0] = T[1, 0, 0] = v21
+                    T[0, 1, 1] = T[1, 0, 1] = T[1, 1, 0] = v12
+                    T[1, 1, 1] = v03
+                    return T
+
+                coords_x = coords_def_elem[:, 0]; coords_y = coords_def_elem[:, 1]
+                F3 = np.empty((2, 2, 2, 2), float)
+                F3[0] = _F3_component(coords_x)
+                F3[1] = _F3_component(coords_y)
+                jets["F3"] = F3
+                jets["A3"] = inverse_A3_material(jets["A"], jets["F2"], F3)
+            if upto >= 4:
+                d40 = np.asarray(ref_geom_global.derivative(xi, eta, 4, 0), float)
+                d31 = np.asarray(ref_geom_global.derivative(xi, eta, 3, 1), float)
+                d22 = np.asarray(ref_geom_global.derivative(xi, eta, 2, 2), float)
+                d13 = np.asarray(ref_geom_global.derivative(xi, eta, 1, 3), float)
+                d04 = np.asarray(ref_geom_global.derivative(xi, eta, 0, 4), float)
+
+                def _F4_component(coords_col: np.ndarray) -> np.ndarray:
+                    v40 = float(np.dot(d40, coords_col))
+                    v31 = float(np.dot(d31, coords_col))
+                    v22 = float(np.dot(d22, coords_col))
+                    v13 = float(np.dot(d13, coords_col))
+                    v04 = float(np.dot(d04, coords_col))
+                    T = np.empty((2, 2, 2, 2), float)
+                    for L in (0, 1):
+                        for M in (0, 1):
+                            for N in (0, 1):
+                                for P in (0, 1):
+                                    cnt0 = 4 - (L + M + N + P)
+                                    if   cnt0 == 4: val = v40
+                                    elif cnt0 == 3: val = v31
+                                    elif cnt0 == 2: val = v22
+                                    elif cnt0 == 1: val = v13
+                                    else:           val = v04
+                                    T[L, M, N, P] = val
+                    return T
+
+                coords_x = coords_def_elem[:, 0]; coords_y = coords_def_elem[:, 1]
+                F4 = np.empty((2, 2, 2, 2, 2), float)
+                F4[0] = _F4_component(coords_x)
+                F4[1] = _F4_component(coords_y)
+                jets["F4"] = F4
+                jets["A4"] = inverse_A4_material(jets["A"], jets["A2"], jets["F2"], jets["F3"], F4)
+            return jets
+
         # 6) Inverse-map jets for chain rule (sided; up to order 4) -----------------
         pos_Hxi0 = pos_Hxi1 = neg_Hxi0 = neg_Hxi1 = None
         if need_hess or need_o3 or need_o4:
@@ -2863,8 +3038,12 @@ class DofHandler:
                 pe = int(pos_ids[i]); ne = int(neg_ids[i])
                 for q in range(nQ):
                     # POS side
-                    rec = _JET.get(mesh, pe, float(xi_pos[i, q]), float(eta_pos[i, q]),
-                                   upto = 4 if need_o4 else (3 if need_o3 else 2))
+                    if deformation is not None:
+                        rec = _inverse_jets_for_coords(coords_pos_def[i], xi_pos[i, q], eta_pos[i, q],
+                                                       upto = 4 if need_o4 else (3 if need_o3 else 2))
+                    else:
+                        rec = _JET.get(mesh, pe, float(xi_pos[i, q]), float(eta_pos[i, q]),
+                                       upto = 4 if need_o4 else (3 if need_o3 else 2))
                     if need_hess:
                         A2 = rec["A2"]; pos_Hxi0[i, q] = A2[0]; pos_Hxi1[i, q] = A2[1]
                     if need_o3:
@@ -2872,8 +3051,12 @@ class DofHandler:
                     if need_o4:
                         A4 = rec["A4"]; pos_Qxi0[i, q] = A4[0]; pos_Qxi1[i, q] = A4[1]
                     # NEG side
-                    rec = _JET.get(mesh, ne, float(xi_neg[i, q]), float(eta_neg[i, q]),
-                                   upto = 4 if need_o4 else (3 if need_o3 else 2))
+                    if deformation is not None:
+                        rec = _inverse_jets_for_coords(coords_neg_def[i], xi_neg[i, q], eta_neg[i, q],
+                                                       upto = 4 if need_o4 else (3 if need_o3 else 2))
+                    else:
+                        rec = _JET.get(mesh, ne, float(xi_neg[i, q]), float(eta_neg[i, q]),
+                                       upto = 4 if need_o4 else (3 if need_o3 else 2))
                     if need_hess:
                         A2 = rec["A2"]; neg_Hxi0[i, q] = A2[0]; neg_Hxi1[i, q] = A2[1]
                     if need_o3:

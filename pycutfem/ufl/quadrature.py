@@ -79,7 +79,9 @@ class PolynomialDegreeEstimator:
             # It represents a constant value that is element-wise, so its degree is 0.
             result = 0
         elif isinstance(expr, Jump):
-            result = self._get_degree(expr.operand)
+            deg_pos = self._get_degree(expr.u_pos)
+            deg_neg = self._get_degree(expr.u_neg)
+            result = max(deg_pos, deg_neg)
         
         elif isinstance(expr, Analytic):                 # NEW ✱
             # 1. Honour an explicit hint  (Analytic(..., degree=k))

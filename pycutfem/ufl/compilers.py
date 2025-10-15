@@ -29,6 +29,11 @@ from math import comb
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.fem import transform
+from pycutfem.fem.transform import (
+    hess_inverse_from_forward,
+    inverse_A3_material,
+    inverse_A4_material
+)
 from pycutfem.integration import volume
 from pycutfem.integration.quadrature import line_quadrature
 from pycutfem.integration.cut_integration import CutIntegration
@@ -310,8 +315,15 @@ class FormCompiler:
             eid = int(self.ctx["pos_eid"] if side == '+' else self.ctx["neg_eid"])
 
             if row_local is None:
-                # Map to reference and evaluate derivative row on the element
-                xi, eta = transform.inverse_mapping(self.me.mesh, eid, np.asarray(x_phys))
+                # Prefer cached reference coordinates when provided by ghost/interface path
+                xi_eta_cache = self.ctx.get("_xi_eta_cache")
+                xi_eta = None
+                if isinstance(xi_eta_cache, dict):
+                    xi_eta = xi_eta_cache.get(side)
+                if xi_eta is not None:
+                    xi, eta = float(xi_eta[0]), float(xi_eta[1])
+                else:
+                    xi, eta = transform.inverse_mapping(self.me.mesh, eid, np.asarray(x_phys))
                 row_local = self._phys_scalar_deriv_row(field, float(xi), float(eta), ox, oy, eid)
 
             row_local = np.asarray(row_local, dtype=float)
@@ -2417,6 +2429,21 @@ class FormCompiler:
         ref_cache = self._ref_cache
 
 
+        # deformation-aware jets provided by interface/ghost assembly (per QP)
+        geom_jets = None
+        side = self.ctx.get("side")
+        deform_ctx = self.ctx.get("_deformation_current")
+        if isinstance(deform_ctx, dict) and side in deform_ctx:
+            geom_entry = deform_ctx[side]
+            geom_jets = geom_entry.get("jets")
+            try:
+                xi = float(geom_entry.get("xi", xi))
+                eta = float(geom_entry.get("eta", eta))
+            except Exception:
+                xi, eta = float(xi), float(eta)
+        else:
+            xi, eta = float(xi), float(eta)
+
         # order 0: just values in reference
         if ox == 0 and oy == 0:
             return ref_cache.get(fld, xi, eta, 0, 0)
@@ -2424,7 +2451,7 @@ class FormCompiler:
         # pick how far we need geometry jets
         total = ox + oy
         upto = 2 if total <= 2 else (3 if total == 3 else (4 if total == 4 else 2))
-        rec = transform.JET_CACHE.get(me.mesh, eid, xi, eta, upto=upto)
+        rec = geom_jets if geom_jets is not None else transform.JET_CACHE.get(me.mesh, eid, xi, eta, upto=upto)
         A = rec["A"]  # (2,2)
 
         # order 1: ∇_x = ∇_X A
@@ -2466,12 +2493,12 @@ class FormCompiler:
         # order 3: exact (cached) f_{ijk}
         if total == 3:
             i, j, k = _as_indices(ox, oy)
-            return phys_scalar_third_row(me, fld, xi, eta, i, j, k, me.mesh, eid, ref_cache)
+            return phys_scalar_third_row(me, fld, xi, eta, i, j, k, me.mesh, eid, ref_cache, geom_jets=rec)
 
         # order 4: exact (cached) f_{ijkl}
         if total == 4:
             i, j, k, l = _as_indices(ox, oy)
-            return phys_scalar_fourth_row(me, fld, xi, eta, i, j, k, l, me.mesh, eid, ref_cache)
+            return phys_scalar_fourth_row(me, fld, xi, eta, i, j, k, l, me.mesh, eid, ref_cache, geom_jets=rec)
 
         # fallback (>=5): pure binomial chain rule (no A-derivative curvature terms)
         out = np.zeros(me.n_dofs_local, dtype=float)
@@ -2488,7 +2515,100 @@ class FormCompiler:
                 except Exception:
                     pass
         return out
-    
+
+    def _build_inverse_jets(self, ref_geom, coords_def: np.ndarray,
+                            xi: float, eta: float, upto: int) -> Dict[str, np.ndarray]:
+        """
+        Construct inverse-map jets (A, A2, A3, A4, ...) for the geometry defined by coords_def.
+        """
+        xi = float(xi); eta = float(eta)
+        dN = np.asarray(ref_geom.grad(xi, eta), float)  # (nGeom,2)
+        J = coords_def.T @ dN                           # (2,2)
+        A = np.linalg.inv(J)
+        jets: Dict[str, np.ndarray] = {"J": J, "A": A}
+
+        if upto >= 2:
+            try:
+                HN = np.asarray(ref_geom.hess(xi, eta), float)  # (nGeom,2,2)
+            except AttributeError:
+                HN = np.empty((coords_def.shape[0], 2, 2), float)
+                HN[:, 0, 0] = np.asarray(ref_geom.derivative(xi, eta, 2, 0), float)
+                HN[:, 0, 1] = np.asarray(ref_geom.derivative(xi, eta, 1, 1), float)
+                HN[:, 1, 0] = HN[:, 0, 1]
+                HN[:, 1, 1] = np.asarray(ref_geom.derivative(xi, eta, 0, 2), float)
+
+            d20 = HN[:, 0, 0]; d11 = HN[:, 0, 1]; d02 = HN[:, 1, 1]
+            coords_x = coords_def[:, 0]; coords_y = coords_def[:, 1]
+            Hx0 = np.array([[np.dot(d20, coords_x), np.dot(d11, coords_x)],
+                            [np.dot(d11, coords_x), np.dot(d02, coords_x)]], dtype=float)
+            Hx1 = np.array([[np.dot(d20, coords_y), np.dot(d11, coords_y)],
+                            [np.dot(d11, coords_y), np.dot(d02, coords_y)]], dtype=float)
+            F2 = np.empty((2, 2, 2), float)
+            F2[0] = Hx0
+            F2[1] = Hx1
+            jets["F2"] = F2
+            jets["A2"] = hess_inverse_from_forward(A, Hx0, Hx1)
+        if upto >= 3:
+            d30 = np.asarray(ref_geom.derivative(xi, eta, 3, 0), float)
+            d21 = np.asarray(ref_geom.derivative(xi, eta, 2, 1), float)
+            d12 = np.asarray(ref_geom.derivative(xi, eta, 1, 2), float)
+            d03 = np.asarray(ref_geom.derivative(xi, eta, 0, 3), float)
+
+            def _F3_component(coords_col: np.ndarray) -> np.ndarray:
+                v30 = float(np.dot(d30, coords_col))
+                v21 = float(np.dot(d21, coords_col))
+                v12 = float(np.dot(d12, coords_col))
+                v03 = float(np.dot(d03, coords_col))
+                T = np.empty((2, 2, 2), float)
+                T[0, 0, 0] = v30
+                T[0, 0, 1] = T[0, 1, 0] = T[1, 0, 0] = v21
+                T[0, 1, 1] = T[1, 0, 1] = T[1, 1, 0] = v12
+                T[1, 1, 1] = v03
+                return T
+
+            coords_x = coords_def[:, 0]; coords_y = coords_def[:, 1]
+            F3 = np.empty((2, 2, 2, 2), float)
+            F3[0] = _F3_component(coords_x)
+            F3[1] = _F3_component(coords_y)
+            jets["F3"] = F3
+            jets["A3"] = inverse_A3_material(jets["A"], jets["F2"], F3)
+
+        if upto >= 4:
+            d40 = np.asarray(ref_geom.derivative(xi, eta, 4, 0), float)
+            d31 = np.asarray(ref_geom.derivative(xi, eta, 3, 1), float)
+            d22 = np.asarray(ref_geom.derivative(xi, eta, 2, 2), float)
+            d13 = np.asarray(ref_geom.derivative(xi, eta, 1, 3), float)
+            d04 = np.asarray(ref_geom.derivative(xi, eta, 0, 4), float)
+
+            def _F4_component(coords_col: np.ndarray) -> np.ndarray:
+                v40 = float(np.dot(d40, coords_col))
+                v31 = float(np.dot(d31, coords_col))
+                v22 = float(np.dot(d22, coords_col))
+                v13 = float(np.dot(d13, coords_col))
+                v04 = float(np.dot(d04, coords_col))
+                T = np.empty((2, 2, 2, 2), float)
+                for L in (0, 1):
+                    for M in (0, 1):
+                        for N in (0, 1):
+                            for P in (0, 1):
+                                cnt0 = 4 - (L + M + N + P)
+                                if   cnt0 == 4: val = v40
+                                elif cnt0 == 3: val = v31
+                                elif cnt0 == 2: val = v22
+                                elif cnt0 == 1: val = v13
+                                else:            val = v04
+                                T[L, M, N, P] = val
+                return T
+
+            coords_x = coords_def[:, 0]; coords_y = coords_def[:, 1]
+            F4 = np.empty((2, 2, 2, 2, 2), float)
+            F4[0] = _F4_component(coords_x)
+            F4[1] = _F4_component(coords_y)
+            jets["F4"] = F4
+            jets["A4"] = inverse_A4_material(jets["A"], jets["A2"], jets["F2"], jets["F3"], F4)
+
+        return jets
+
     def _assemble_ghost_edge_python(self, intg: "Integral", matvec):
         """
         Assemble integrals over ghost facets (pure Python path).
@@ -2510,6 +2630,7 @@ class FormCompiler:
         derivs |= {(0, 0), (1, 0), (0, 1)}  # always have value and ∂x, ∂y
         self.ctx['is_interface'] = False
         self.ctx['is_ghost'] = True
+        deformation = getattr(intg.measure, "deformation", None)
 
         # Close up to max total order (covers Hessian cross-terms etc.)
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
@@ -2535,6 +2656,9 @@ class FormCompiler:
         qdeg_base = max(self._find_q_order(intg), 2 * max_total + 4)
         p_geo     = int(getattr(mesh, "poly_order", 1))
         qdeg      = qdeg_base + max(0, p_geo - 1)
+        nseg   = int(md.get("nseg", max(3, p_geo + qdeg//2)))
+        ref_geom = transform.get_reference(mesh.element_type, p_geo)
+
 
         # Fields needed (fallbacks if tree-walk misses some due to Jump/Pos/Neg)
         fields = set(self._fields_for(intg.integrand))
@@ -2599,21 +2723,8 @@ class FormCompiler:
 
                 p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
 
-                def get_normal_vec(eid_edge):
-                    tangent = p1 - p0
-                    magnitude = max(np.linalg.norm(tangent), 1e-16)
-                    unit_tangent = tangent / magnitude
-                    unit_normal = np.array([unit_tangent[1], -unit_tangent[0]], float)
-                    cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
-                    cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
-                    if np.dot(unit_normal, cpos - cneg) < 0.0:
-                        unit_normal = -unit_normal
-                    return unit_normal
-
                 # Edge quadrature (physical) and oriented normal (– → +)
                 qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
-
-                normal_vec = get_normal_vec(e)
 
 
                 # Local union DOFs / accumulator
@@ -2699,26 +2810,120 @@ class FormCompiler:
                     else np.zeros((len(global_dofs), len(global_dofs)))
                 )
 
+                pos_conn = np.asarray(mesh.elements_connectivity[int(pos_eid)], dtype=int)
+                neg_conn = np.asarray(mesh.elements_connectivity[int(neg_eid)], dtype=int)
+                coords_pos_geom = mesh.nodes_x_y_pos[pos_conn].astype(float)
+                coords_neg_geom = mesh.nodes_x_y_pos[neg_conn].astype(float)
+                if deformation is not None:
+                    Uloc_pos = np.asarray(deformation.node_displacements[pos_conn], float)
+                    Uloc_neg = np.asarray(deformation.node_displacements[neg_conn], float)
+                    coords_pos_def = coords_pos_geom + Uloc_pos
+                    coords_neg_def = coords_neg_geom + Uloc_neg
+                else:
+                    Uloc_pos = None
+                    Uloc_neg = None
+                    coords_pos_def = coords_pos_geom
+                    coords_neg_def = coords_neg_geom
+
+                tangent_vec = p1 - p0
+                tangent_norm = max(np.linalg.norm(tangent_vec), 1e-16)
+                tangent_unit = tangent_vec / tangent_norm
+                normal_base = np.array([tangent_unit[1], -tangent_unit[0]], float)
+                cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
+                cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
+                if np.dot(normal_base, cpos - cneg) < 0.0:
+                    normal_base = -normal_base
+
                 # ---------------- QP loop ----------------
                 for xq, w in zip(qpts_phys, qwts):
-                    # Side-aware store that _basis_row() will lazily populate:
                     bv = {"+": defaultdict(dict), "-": defaultdict(dict)}
+                    xi_pos, eta_pos = transform.inverse_mapping(mesh, int(pos_eid), np.asarray(xq, float))
+                    xi_neg, eta_neg = transform.inverse_mapping(mesh, int(neg_eid), np.asarray(xq, float))
+                    xi_eta_cache = {
+                        "+": (float(xi_pos), float(eta_pos)),
+                        "-": (float(xi_neg), float(eta_neg)),
+                    }
 
-                    # Context for visitors (enough info for _basis_row to compute & pad)
+                    if deformation is not None:
+                        jets_pos = self._build_inverse_jets(ref_geom, coords_pos_def, xi_pos, eta_pos, upto=max_total)
+                        jets_neg = self._build_inverse_jets(ref_geom, coords_neg_def, xi_neg, eta_neg, upto=max_total)
+                        Ji_pos = jets_pos["A"]
+                        Ji_neg = jets_neg["A"]
+
+                        dN_pos = np.asarray(ref_geom.grad(xi_pos, eta_pos), float)
+                        dN_neg = np.asarray(ref_geom.grad(xi_neg, eta_neg), float)
+                        Gref_pos = Uloc_pos.T @ dN_pos
+                        Gref_neg = Uloc_neg.T @ dN_neg
+
+                        Jg_pos = transform.jacobian(mesh, int(pos_eid), (float(xi_pos), float(eta_pos)))
+                        Jg_neg = transform.jacobian(mesh, int(neg_eid), (float(xi_neg), float(eta_neg)))
+                        v_pos = np.linalg.solve(Jg_pos, tangent_unit)
+                        v_neg = np.linalg.solve(Jg_neg, tangent_unit)
+                        Ftau_pos = tangent_unit + Gref_pos @ v_pos
+                        Ftau_neg = tangent_unit + Gref_neg @ v_neg
+                        n_pos = max(np.linalg.norm(Ftau_pos), 1e-16)
+                        n_neg = max(np.linalg.norm(Ftau_neg), 1e-16)
+                        w_eff = float(w) * 0.5 * (n_pos + n_neg)
+
+                        tau_eff = 0.5 * (Ftau_pos + Ftau_neg)
+                        if np.linalg.norm(tau_eff) < 1e-14:
+                            tau_eff = Ftau_pos
+                        tangent_def = tau_eff / (np.linalg.norm(tau_eff) + 1e-30)
+                        normal_here = np.array([tangent_def[1], -tangent_def[0]], float)
+                        if np.dot(normal_here, cpos - cneg) < 0.0:
+                            normal_here = -normal_here
+
+                        shape_pos = np.asarray(ref_geom.shape(xi_pos, eta_pos), float)
+                        shape_neg = np.asarray(ref_geom.shape(xi_neg, eta_neg), float)
+                        x_base_pos = transform.x_mapping(mesh, int(pos_eid), (float(xi_pos), float(eta_pos)))
+                        x_base_neg = transform.x_mapping(mesh, int(neg_eid), (float(xi_neg), float(eta_neg)))
+                        x_pos = x_base_pos + shape_pos @ Uloc_pos
+                        x_neg = x_base_neg + shape_neg @ Uloc_neg
+                        deform_ctx_entry = {
+                            "+": {"xi": float(xi_pos), "eta": float(eta_pos), "jets": jets_pos},
+                            "-": {"xi": float(xi_neg), "eta": float(eta_neg), "jets": jets_neg},
+                        }
+                    else:
+                        Jg_pos = transform.jacobian(mesh, int(pos_eid), (float(xi_pos), float(eta_pos)))
+                        Jg_neg = transform.jacobian(mesh, int(neg_eid), (float(xi_neg), float(eta_neg)))
+                        Ji_pos = np.linalg.inv(Jg_pos)
+                        Ji_neg = np.linalg.inv(Jg_neg)
+                        w_eff = float(w)
+                        normal_here = normal_base
+                        x_pos = np.asarray(xq, float)
+                        x_neg = np.asarray(xq, float)
+                        deform_ctx_entry = None
+
+                    for fld in fields:
+                        try:
+                            vrow_pos = self.me.basis(fld, float(xi_pos), float(eta_pos))
+                            grad_pos = self.me.grad_basis(fld, float(xi_pos), float(eta_pos)) @ Ji_pos
+                            slot_pos = bv["+"].setdefault(fld, {})
+                            slot_pos[(0, 0)] = vrow_pos
+                            slot_pos[(1, 0)] = grad_pos[:, 0]
+                            slot_pos[(0, 1)] = grad_pos[:, 1]
+                        except Exception:
+                            pass
+                        try:
+                            vrow_neg = self.me.basis(fld, float(xi_neg), float(eta_neg))
+                            grad_neg = self.me.grad_basis(fld, float(xi_neg), float(eta_neg)) @ Ji_neg
+                            slot_neg = bv["-"].setdefault(fld, {})
+                            slot_neg[(0, 0)] = vrow_neg
+                            slot_neg[(1, 0)] = grad_neg[:, 0]
+                            slot_neg[(0, 1)] = grad_neg[:, 1]
+                        except Exception:
+                            pass
+
                     phi_here = _eval_ls(pos_eid, xq)
-                    # Ghost edges: both traces are taken at the *same* physical point on the edge.
-                    # Keep phi_here only for any side gating elsewhere; do not mirror.
-                    # phi_here = _eval_ls(pos_eid, xq)
-                    x_pos = xq
-                    x_neg = xq
+                    x_mean = 0.5 * (np.asarray(x_pos, float) + np.asarray(x_neg, float))
 
-                    self.ctx.update({
-                        "basis_values": bv,          # per-QP, side-aware derivative cache
-                        "normal": normal_vec,
-                        "phi_val": phi_here,         # used if 'side' isn't set explicitly
-                        "x_phys_pos": x_pos,
-                        "x_phys_neg": x_neg,
-                        "x_phys": xq,
+                    ctx_updates = {
+                        "basis_values": bv,
+                        "normal": normal_here,
+                        "phi_val": phi_here,
+                        "x_phys_pos": np.asarray(x_pos, float),
+                        "x_phys_neg": np.asarray(x_neg, float),
+                        "x_phys": x_mean,
                         "global_dofs": global_dofs,
                         "pos_map": pos_map,
                         "neg_map": neg_map,
@@ -2734,21 +2939,23 @@ class FormCompiler:
                         "neg_eid": neg_eid,
                         "use_union_local_dofs": is_functional,
                         "_ghost_level_set": level_set,
-                    })
+                        "_xi_eta_cache": xi_eta_cache,
+                    }
+                    if deform_ctx_entry is not None:
+                        ctx_updates["_deformation_current"] = deform_ctx_entry
 
+                    self.ctx.update(ctx_updates)
 
-                    # Evaluate integrand and accumulate
                     val = self._visit(intg.integrand)
                     if is_functional:
-                        # Reduce to scalar robustly
                         if isinstance(val, VecOpInfo):
                             v = float(np.sum(val.data))
                         else:
                             arr = np.asarray(val)
                             v = float(arr if arr.ndim == 0 else arr.sum())
-                        loc_acc += w * v
+                        loc_acc += w_eff * v
                     else:
-                        loc_acc += w * np.asarray(val)
+                        loc_acc += w_eff * np.asarray(val)
 
                 # Scatter
                 if is_functional:
@@ -2778,9 +2985,12 @@ class FormCompiler:
                     "_restriction_masks",
                     "use_union_local_dofs",
                     "mask_basis",
-                    "is_interface"):
+                    "is_interface",
+                    "_xi_eta_cache"):
                 self.ctx.pop(k, None)
             self.ctx.pop('_ghost_level_set', None)
+            self.ctx.pop('_deformation_current', None)
+            self.ctx.pop("is_ghost", None)
 
 
     
@@ -2992,6 +3202,7 @@ class FormCompiler:
             need_o3=need_o3,
             need_o4=need_o4,
             reuse=True,
+            deformation=getattr(intg.measure, "deformation", None),
         )
         geo["is_interface"] = False
 

@@ -1485,7 +1485,8 @@ from pycutfem.fem import transform
 
 def phys_scalar_third_row(me, fld: str, xi: float, eta: float,
                           i: int, j: int, k: int, mesh, elem_id: int,
-                          ref_cache: RefDerivCache | None = None) -> np.ndarray:
+                          ref_cache: RefDerivCache | None = None,
+                          geom_jets: dict | None = None) -> np.ndarray:
     """
     Build the (n_loc,) row for the 3rd-order physical derivative ∂^3/∂x^i ∂x^j ∂x^k of scalar field 'fld'
     at the reference point (xi,eta) in element elem_id.
@@ -1500,7 +1501,7 @@ def phys_scalar_third_row(me, fld: str, xi: float, eta: float,
     if ref_cache is None:
         ref_cache = RefDerivCache(me)
 
-    rec = JET_CACHE.get(mesh, elem_id, xi, eta, upto=3)
+    rec = geom_jets if geom_jets is not None else JET_CACHE.get(mesh, elem_id, xi, eta, upto=3)
     A  = rec["A"]; A2 = rec["A2"]; A3 = rec["A3"]
 
     # reference derivatives (cached)
@@ -1551,7 +1552,8 @@ def phys_scalar_third_row(me, fld: str, xi: float, eta: float,
 
 def phys_scalar_fourth_row(me, fld: str, xi: float, eta: float,
                            i: int, j: int, k: int, l: int, mesh, elem_id: int,
-                           ref_cache: RefDerivCache | None = None) -> np.ndarray:
+                           ref_cache: RefDerivCache | None = None,
+                           geom_jets: dict | None = None) -> np.ndarray:
     """
     Row (length n_loc) for  ∂^4/∂x^i ∂x^j ∂x^k ∂x^l  of scalar field 'fld' at (xi,eta), element elem_id.
 
@@ -1564,7 +1566,7 @@ def phys_scalar_fourth_row(me, fld: str, xi: float, eta: float,
     if ref_cache is None:
         ref_cache = RefDerivCache(me)
 
-    rec = JET_CACHE.get(mesh, elem_id, xi, eta, upto=4)
+    rec = geom_jets if geom_jets is not None else JET_CACHE.get(mesh, elem_id, xi, eta, upto=4)
     A  = rec["A"]; A2 = rec["A2"]; A3 = rec["A3"]; A4 = rec["A4"]
 
     # reference derivatives (cached)
