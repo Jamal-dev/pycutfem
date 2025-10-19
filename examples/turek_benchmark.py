@@ -183,7 +183,9 @@ has_rigid_domain = rigid_domain | cut_domain
 # Taylor-Hood elements (Q2 for velocity, Q1 for pressure)
 mixed_element = MixedElement(
     mesh,
-    field_specs={'ux': fe_order, 'uy': fe_order, 'p': 1, 'lm': ':number:'}
+    field_specs={'ux': fe_order, 'uy': fe_order, 'p': 1, 
+                #  'lm': ':number:'
+                 }
 )
 dof_handler = DofHandler(mixed_element, method='cg')
 # dof_handler.info()
@@ -233,9 +235,11 @@ print(f"Pinning pressure at the node closest to {target_point}, found at {actual
 # bcs.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x, y: 0.0))
 # bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x, y: 0.0))
 # Tag velocity DOFs inside the cylinder (same tag name for both fields is OK)
-dof_handler.tag_dofs_from_element_bitset("inactive", "ux", "inside", strict=True)
-dof_handler.tag_dofs_from_element_bitset("inactive", "uy", "inside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("vel_x_inside", "ux", "inside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("vel_y_inside", "uy", "inside", strict=True)
 dof_handler.tag_dofs_from_element_bitset("inactive", "p", "inside", strict=True)
+bcs.append(BoundaryCondition('ux', 'dirichlet', 'vel_x_inside', lambda x, y: 0.0))
+bcs_homog.append(BoundaryCondition('uy', 'dirichlet', 'vel_y_inside', lambda x, y: 0.0))
 
 
 # In[7]:
@@ -287,8 +291,8 @@ du = VectorTrialFunction(space=velocity_space, dof_handler=dof_handler, side = '
 dp = TrialFunction(name='trial_pressure', field_name='p', dof_handler=dof_handler, side = '+')
 v = VectorTestFunction(space=velocity_space, dof_handler=dof_handler, side = '+')
 q = TestFunction(name='test_pressure', field_name='p', dof_handler=dof_handler, side = '+')
-nL = TrialFunction(name='nL', field_name='lm', dof_handler=dof_handler)
-mL = TestFunction(name='mL', field_name='lm', dof_handler=dof_handler)
+# nL = TrialFunction(name='nL', field_name='lm', dof_handler=dof_handler)
+# mL = TestFunction(name='mL', field_name='lm', dof_handler=dof_handler)
 
 # Solution functions at current (k) and previous (n) time steps
 u_k = VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler, side = '+')
@@ -297,8 +301,8 @@ u_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handl
 p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler, side = '+')
 # p_trial_neg   = TrialFunction('p_neg_', dof_handler,name='pressure_neg_trial', side='-')
 # q_test_neg    = TestFunction ('p_neg_', dof_handler,name='pressure_neg_test', side='-')
-lambda_k = Function(name="lambda_k", field_name='lm', dof_handler=dof_handler)
-lambda_n = Function(name="lambda_n", field_name='lm', dof_handler=dof_handler)
+# lambda_k = Function(name="lambda_k", field_name='lm', dof_handler=dof_handler)
+# lambda_n = Function(name="lambda_n", field_name='lm', dof_handler=dof_handler)
 
 # --- Parameters ---
 
@@ -307,9 +311,9 @@ rho_const = Constant(rho)
 
 u_k.nodal_values.fill(0.0); p_k.nodal_values.fill(0.0)
 u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
-lambda_k.nodal_values.fill(0.0); lambda_n.nodal_values.fill(0.0)
-dof_handler.apply_bcs(bcs, u_n, p_n, lambda_n)
-dof_handler.apply_bcs(bcs, u_k, p_k, lambda_k)
+# lambda_k.nodal_values.fill(0.0); lambda_n.nodal_values.fill(0.0)
+# dof_handler.apply_bcs(bcs, u_n, p_n, lambda_n)
+# dof_handler.apply_bcs(bcs, u_k, p_k, lambda_k)
 
 
 # In[10]:
@@ -591,8 +595,15 @@ q_test_phys = restrict(q, physical_domain)
 u_k_phys = restrict(u_k, physical_domain)
 p_k_phys = restrict(p_k, physical_domain)
 u_n_phys = restrict(u_n, physical_domain)
+p_n_phys = restrict(p_n, physical_domain)
 q_test_neg = restrict(q, has_rigid_domain)
 p_trial_neg = restrict(dp, has_rigid_domain)
+u_trial_neg = restrict(du, has_rigid_domain)
+v_test_neg = restrict(v, has_rigid_domain)
+u_k_neg = restrict(u_k, has_rigid_domain)
+p_k_neg = restrict(p_k, has_rigid_domain)
+u_n_neg = restrict(u_n, has_rigid_domain)
+p_n_neg = restrict(p_n, has_rigid_domain)
 
 cell_h  = CellDiameter() # length‑scale per element
 beta_N  = Constant(20.0 * fe_order**2)      # Nitsche penalty (tweak)
@@ -610,13 +621,16 @@ def scaled_penalty_interface(penalty, poly_order=fe_order,
 
     # 3) Final penalty (symbolic EWC × expression)
     return β_visc + β_iner
-β = scaled_penalty_interface(20.0, side='+')  # Nitsche penalty
 
 def epsilon(u):
     "Symmetric gradient."
     return 0.5 * (grad(u) + grad(u).T)
 
 
+def sigma_f(u, p):
+    return 2.0 * mu_const * epsilon(u) - p * Constant(np.eye(2))
+def traction_f(u, p, n):
+    return dot(sigma_f(u, p), n)
 
 def sigma_dot_n_v(u_vec, p_scal, v_test, normal):
     """
@@ -632,17 +646,68 @@ def sigma_dot_n_v(u_vec, p_scal, v_test, normal):
     return mu_const * dot((a + b), v_test) - p_scal * dot(v_test, normal)
 
 # --- Jacobian contribution on Γsolid --------------------------------
+# Hansbo weights θ^+, θ^- (per element); element-wise constants
+theta_pos_vals = hansbo_cut_ratio(mesh, level_set, side='+')
+theta_neg_vals = 1.0 - theta_pos_vals
+kappa_pos = Pos(ElementWiseConstant(theta_pos_vals))
+kappa_neg = Neg(ElementWiseConstant(theta_neg_vals))
+jump_u_trial = Pos(u_trial_phys) -  Neg(u_trial_neg)
+jump_u_test = Pos(v_test_phys) -  Neg(v_test_neg)
+jump_u_res = Pos(u_k_phys) -  Neg(u_k_neg)
+jump_u_old = Pos(u_n_phys) -  Neg(u_n_neg)
+avg_flux_trial = kappa_pos * traction_f(
+    Pos(u_trial_phys), Pos(p_trial_phys), n_f
+) + kappa_neg * traction_f(
+    Neg(u_trial_neg), Neg(p_trial_neg), -n_f
+)
+avg_flux_test = kappa_pos * traction_f(
+    Pos(v_test_phys), Pos(q_test_phys), n_f
+) + kappa_neg * traction_f(
+    Neg(v_test_neg), Neg(q_test_neg), -n_f
+)
+avg_flux_res = kappa_pos * traction_f(
+    Pos(u_k_phys), Pos(p_k_phys), n_f
+) + kappa_neg * traction_f(
+    Neg(u_k_neg), Neg(p_k_neg), -n_f
+)
+avg_flux_old = kappa_pos * traction_f(
+    Pos(u_n_phys), Pos(p_n_phys), n_f
+) + kappa_neg * traction_f(
+    Neg(u_n_neg), Neg(p_n_neg), -n_f
+)
+β = scaled_penalty_interface(2.0, side='+')  # Nitsche penalty
+
+# J_int = (
+#     - theta * dot(avg_flux_trial, jump_u_test)
+#     - theta * dot(avg_flux_test, jump_u_trial)
+#     + theta * β * dot(jump_u_trial, jump_u_test)
+# ) * dΓ
+# R_int = (
+#     - (1.0 - theta) * dot(avg_flux_old, jump_u_test)
+#     - theta * dot(avg_flux_res, jump_u_test)
+#     - (1.0 - theta) * dot(avg_flux_test, jump_u_old)
+#     - theta * dot(avg_flux_test, jump_u_old)
+#     + theta * dot(jump_u_res, jump_u_test)
+#     + (1.0 - theta) * dot(jump_u_old, jump_u_test)
+# ) * dΓ
+beta_normal_flux = scaled_penalty_interface(2.0, side='+')
 J_int = (
     - sigma_dot_n_v(Pos(u_trial_phys), Pos(p_trial_phys), Pos(v_test_phys), n_f)
-    - sigma_dot_n_v(Pos(v_test_phys), Pos(q_test_phys), Pos(u_trial_phys), n_f)
-    + β * dot(Pos(u_trial_phys), Pos(v_test_phys))
+    - sigma_dot_n_v(Pos(v_test_phys), Pos(q_test_phys), Pos(u_trial_phys), n_f) 
+    # + β * dot(Pos(u_trial_phys), Pos(v_test_phys))
+    #  + beta_normal_flux * dot(Pos(u_trial_phys), n) * dot(Pos(v_test_phys), n)
+     + β * dot(jump_u_trial, jump_u_test)
+     + beta_normal_flux * dot(jump_u_trial, n) * dot(jump_u_test, n)
 ) * dΓ
 
 # --- Residual contribution on Γsolid --------------------------------
 R_int = (
     - sigma_dot_n_v(Pos(u_k_phys), Pos(p_k_phys), Pos(v_test_phys), n_f)
-    - sigma_dot_n_v(Pos(v_test_phys), Pos(q_test_phys), Pos(u_k_phys), n_f)
-    + β * dot(Pos(u_k_phys), Pos(v_test_phys))
+    - sigma_dot_n_v(Pos(v_test_phys), Pos(q_test_phys), Pos(u_k_phys), n_f) 
+    # + β * dot(Pos(u_k_phys), Pos(v_test_phys))
+    # + beta_normal_flux * dot(Pos(u_k_phys), n) * dot(Pos(v_test_phys), n)
+    + β * dot(jump_u_res, jump_u_test)
+    + beta_normal_flux * dot(jump_u_res, n) * dot(jump_u_test, n)
 ) * dΓ
 
 # volume ------------------------------------------------------------
@@ -673,7 +738,7 @@ r_vol = (
     + q_test_phys * div(u_k_phys)
 ) * dx_phys
 
-a_vol += (nL * Neg(q_test_neg) + mL * Neg(p_trial_neg)) * dx_neg
+# a_vol += (nL * Neg(q_test_neg) + mL * Neg(p_trial_neg)) * dx_neg
 # r_vol += (mL * p_k_phys + lambda_k * q_test_phys) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
@@ -700,8 +765,10 @@ stab_lin  = ( gamma_v  / cell_h   * dot(jump(u_trial_phys),  jump(v_test_phys))
             # + gamma_p_grad * cell_h**3.0   * grad_inner(jump(p_trial_phys),  jump(q_test_phys))
             )   * dG
 # complete Jacobian and residual -----------------------------------
-jacobian_form  = a_vol + J_int + stab_lin
-residual_form  = r_vol + R_int + stab
+jacobian_form  = a_vol + J_int 
+residual_form  = r_vol + R_int 
+# jacobian_form  = a_vol + J_int + stab_lin
+# residual_form  = r_vol + R_int + stab
 # residual_form  = dot(  Constant(np.array([0.0, 0.0]),dim=1), v) * dx
 # jacobian_form  = stab_lin
 # residual_form  = stab
@@ -893,7 +960,8 @@ def save_solution(funcs):
 
     step_counter += 1
 
-save_solution([u_k, p_k, lambda_k])
+save_solution([u_k, p_k])
+# save_solution([u_k, p_k, lambda_k])
 
 
 
@@ -1009,8 +1077,10 @@ print(f"Solver setup time: {t1 - t0:.2f} seconds")
 #     bounds_by_field={"ux": (-Ucap, Ucap), "uy": (-Ucap, Ucap)},
 # )
 # primary unknowns
-functions      = [u_k, p_k, lambda_k]
-prev_functions = [u_n, p_n, lambda_n]
+functions      = [u_k, p_k]
+prev_functions = [u_n, p_n]
+# functions      = [u_k, p_k, lambda_k]
+# prev_functions = [u_n, p_n, lambda_n]
 # solver = AdamNewtonSolver(
 #     residual_form, jacobian_form,
 #     dof_handler=dof_handler,

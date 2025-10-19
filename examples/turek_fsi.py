@@ -14,12 +14,12 @@ import numba
 import os
 
 # --- Numba configuration ---
-try:
-    num_cores = os.cpu_count()
-    numba.set_num_threads(num_cores)
-    print(f"Numba is set to use {numba.get_num_threads()} threads.")
-except (ImportError, AttributeError):
-    print("Numba not found or configured. Running in pure Python mode.")
+# try:
+#     num_cores = os.cpu_count()
+#     numba.set_num_threads(num_cores)
+#     print(f"Numba is set to use {numba.get_num_threads()} threads.")
+# except (ImportError, AttributeError):
+#     print("Numba not found or configured. Running in pure Python mode.")
 
 # --- Core pycutfem imports ---
 from pycutfem.core.mesh import Mesh
@@ -72,7 +72,7 @@ from pycutfem.utils.adaptive_mesh_ls_numba import structured_quad_levelset_adapt
 # from pycutfem.utils.adaptive_mesh import structured_quad_levelset_adaptive
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-NX, NY = 40, 40
+NX, NY = 20, 20
 # NX, NY = 50, 60
 poly_order = 2
 level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
@@ -103,10 +103,10 @@ def parabolic_inflow(x, y):
 
 # --- Define Boundary Conditions List ---
 bcs = [
-    BoundaryCondition('ux', 'dirichlet', 'inlet', parabolic_inflow),
-    BoundaryCondition('uy', 'dirichlet', 'inlet', lambda x, y: 0.0),
-    BoundaryCondition('ux', 'dirichlet', 'walls', lambda x, y: 0.0),
-    BoundaryCondition('uy', 'dirichlet', 'walls', lambda x, y: 0.0),
+    BoundaryCondition('u_pos_x', 'dirichlet', 'inlet', parabolic_inflow),
+    BoundaryCondition('u_pos_y', 'dirichlet', 'inlet', lambda x, y: 0.0),
+    BoundaryCondition('u_pos_x', 'dirichlet', 'walls', lambda x, y: 0.0),
+    BoundaryCondition('u_pos_y', 'dirichlet', 'walls', lambda x, y: 0.0),
     # No-slip on the cylinder is handled by the CutFEM formulation
     # "Do-nothing" at the outlet is the natural BC
 ]
@@ -116,7 +116,7 @@ bcs_homog = [BoundaryCondition(bc.field, bc.method, bc.domain_tag, lambda x, y: 
 
 
 
-# In[4]:
+# In[ ]:
 
 
 # --- Level Set for the Cylinder Obstacle ---
@@ -134,17 +134,20 @@ cut_domain = get_domain_bitset(mesh, "element", "cut")
 ghost_edges = get_domain_bitset(mesh, "edge", "ghost")
 fluid_interface_domain = fluid_domain | cut_domain
 solid_interface_domain = solid_domain | cut_domain
-solid_ghost_edges = mesh.edge_bitset('ghost_neg') | mesh.edge_bitset('interface') | mesh.edge_bitset('ghost_both')
-fluid_ghost_edges = mesh.edge_bitset('ghost_pos') | mesh.edge_bitset('interface') | mesh.edge_bitset('ghost_both')
+solid_ghost_edges = mesh.edge_bitset('ghost_neg')  | mesh.edge_bitset('interface') #| mesh.edge_bitset('ghost_both')
+fluid_ghost_edges = mesh.edge_bitset('ghost_pos')  | mesh.edge_bitset('interface') #| mesh.edge_bitset('ghost_both')
 
 # --- Finite Element Space and DofHandler ---
 # Taylor-Hood elements (Q2 for velocity, Q1 for pressure)
-mixed_element = MixedElement(mesh, field_specs={'ux': 2, 'uy': 2, 
-                                                'p': 1
-                                                ,'vsx':1, 'vsy':1,
-                                                'dx':1,'dy':1})
+poly_order = 2
+hessian_ghost_enabled = False
+mixed_element = MixedElement(mesh, field_specs={'u_pos_x': poly_order, 'u_pos_y': poly_order, 
+                                                'p_pos_': poly_order - 1,
+                                                'vs_neg_x':poly_order - 1, 'vs_neg_y':poly_order - 1,
+                                                'd_neg_x':poly_order - 1,'d_neg_y':poly_order - 1,
+                                                })
 dof_handler = DofHandler(mixed_element, method='cg')
-dof_handler.info()
+# dof_handler.info()
 
 print(f"Number of interface edges: {mesh.edge_bitset('interface').cardinality()}")
 print(f"Number of ghost edges: {ghost_edges.cardinality()}")
@@ -155,32 +158,21 @@ print(f"Number of solid ghost edges: {solid_ghost_edges.cardinality()}")
 print(f"Number of fluid ghost edges: {fluid_ghost_edges.cardinality()}")
 
 
-# In[5]:
+# In[ ]:
 
 
-dof_handler.tag_dofs_from_element_bitset("solid_zone", "ux", "inside", strict=True)
-dof_handler.tag_dofs_from_element_bitset("solid_zone", "uy", "inside", strict=True)
-dof_handler.tag_dofs_from_element_bitset("solid_zone", "p", "inside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "u_pos_x", "inside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "u_pos_y", "inside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "p_pos_", "inside", strict=True)
+
+dof_handler.tag_dofs_from_element_bitset("inactive", "vs_neg_x", "outside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "vs_neg_y", "outside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "d_neg_x", "outside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "d_neg_y", "outside", strict=True)
 
 
 
-dof_handler.tag_dofs_from_element_bitset("fluid_zone", "vsx", "outside", strict=True)
-dof_handler.tag_dofs_from_element_bitset("fluid_zone", "vsy", "outside", strict=True)
-dof_handler.tag_dofs_from_element_bitset("fluid_zone", "dx", "outside", strict=True)
-dof_handler.tag_dofs_from_element_bitset("fluid_zone", "dy", "outside", strict=True)
-
-for zone,fields in zip( ['solid_zone', 'fluid_zone'],
-                      [('ux', 'uy', 'p'), ('vsx', 'vsy', 'dx', 'dy')]):
-    for field in fields:
-        bcs.append(
-            BoundaryCondition(field, 'dirichlet', zone, lambda x, y: 0.0)
-        )
-        bcs_homog.append(
-            BoundaryCondition(field, 'dirichlet', zone, lambda x, y: 0.0)
-        )
-
-
-# In[6]:
+# In[ ]:
 
 
 # contraining the displacement and velocity of solid to zero for cyclinder center
@@ -188,7 +180,7 @@ for zone,fields in zip( ['solid_zone', 'fluid_zone'],
 target_point = np.array([c_x,c_y])
 
 # 2. Get all node IDs that have a pressure DOF associated with them.
-pin_dofs = dof_handler.get_field_slice('vsx')
+pin_dofs = dof_handler.get_field_slice('vs_neg_x')
 pin_node_ids = np.array([dof_handler._dof_to_node_map[dof][1] for dof in pin_dofs])
 
 # 3. Get the coordinates of ONLY these pressure-carrying nodes.
@@ -202,11 +194,12 @@ local_index = np.argmin(distances)
 closest_p_node_id = pin_node_ids[local_index]
 actual_pin_coords = mesh.nodes_x_y_pos[closest_p_node_id]
 print(f"Pinning pressure at the node closest to {target_point}, found at {actual_pin_coords}")
-for field in ['vsx', 'vsy', 'dx', 'dy']:
-    name = 'pinning'
+for field in ['vs_neg_x', 'vs_neg_y', 'd_neg_x', 'd_neg_y']:
+    name = f'pinning_{field}'
     dof_handler.tag_dof_by_locator(
         name, field,
-        locator=lambda x, y: np.isclose(x, actual_pin_coords[0]) and np.isclose(y, actual_pin_coords[1]),
+        locator=lambda x, y, x0=actual_pin_coords[0], y0=actual_pin_coords[1]:
+            np.isclose(x, x0) and np.isclose(y, y0),
         find_first=True
     )
     bcs.append(
@@ -232,7 +225,7 @@ plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True,
               plot_nodes=False, elem_tags=False, edge_colors=True, plot_interface=False,resolution=300)
 
 
-# In[9]:
+# In[ ]:
 
 
 # ============================================================================
@@ -241,29 +234,29 @@ plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True,
 print("\n--- Defining the UFL weak form for Navier-Stokes with ghost penalty ---")
 
 # --- Function Spaces and Functions ---
-velocity_fluid_space = FunctionSpace(name="velocity_fluid", field_names=['ux', 'uy'],dim=1)
-pressure_fluid_space = FunctionSpace(name="pressure_fluid", field_names=['p'], dim=0)
-velocity_solid_space = FunctionSpace(name="velocity_solid", field_names=['vsx', 'vsy'], dim=1)
-displacement_space = FunctionSpace(name="displacement", field_names=['dx', 'dy'], dim=1)
+velocity_fluid_space = FunctionSpace(name="velocity_fluid", field_names=['u_pos_x', 'u_pos_y'],dim=1, side='+')
+pressure_fluid_space = FunctionSpace(name="pressure_fluid", field_names=['p_pos_'], dim=0, side='+')
+velocity_solid_space = FunctionSpace(name="velocity_solid", field_names=['vs_neg_x', 'vs_neg_y'], dim=1, side='-')
+displacement_space = FunctionSpace(name="displacement", field_names=['d_neg_x', 'd_neg_y'], dim=1, side='-')
 # Trial and Test functions
 du_f = VectorTrialFunction(space=velocity_fluid_space, dof_handler=dof_handler)
-dp_f = TrialFunction(name='trial_pressure_fluid', field_name='p', dof_handler=dof_handler)
+dp_f = TrialFunction(name='trial_pressure_fluid', field_name='p_pos_', dof_handler=dof_handler)
 du_s = VectorTrialFunction(space=velocity_solid_space, dof_handler=dof_handler)
 ddisp_s = VectorTrialFunction(space=displacement_space, dof_handler=dof_handler)
 test_vel_f = VectorTestFunction(space=velocity_fluid_space, dof_handler=dof_handler)
-test_q_f = TestFunction(name='test_pressure_fluid', field_name='p', dof_handler=dof_handler)
+test_q_f = TestFunction(name='test_pressure_fluid', field_name='p_pos_', dof_handler=dof_handler)
 test_vel_s = VectorTestFunction(space=velocity_solid_space, dof_handler=dof_handler)
 test_disp_s = VectorTestFunction(space=displacement_space, dof_handler=dof_handler)
 
 # Solution functions at current (k) and previous (n) time steps
-uf_k = VectorFunction(name="u_f_k", field_names=['ux', 'uy'], dof_handler=dof_handler)
-pf_k = Function(name="p_f_k", field_name='p', dof_handler=dof_handler)
-uf_n = VectorFunction(name="u_f_n", field_names=['ux', 'uy'], dof_handler=dof_handler)
-pf_n = Function(name="p_f_n", field_name='p', dof_handler=dof_handler)
-us_k = VectorFunction(name="u_s_k", field_names=['vsx', 'vsy'], dof_handler=dof_handler)
-us_n = VectorFunction(name="u_s_n", field_names=['vsx', 'vsy'], dof_handler=dof_handler)
-disp_k = VectorFunction(name="disp_k", field_names=['dx', 'dy'], dof_handler=dof_handler)
-disp_n = VectorFunction(name="disp_n", field_names=['dx', 'dy'], dof_handler=dof_handler)
+uf_k = VectorFunction(name="u_f_k", field_names=['u_pos_x', 'u_pos_y'], dof_handler=dof_handler)
+pf_k = Function(name="p_f_k", field_name='p_pos_', dof_handler=dof_handler)
+uf_n = VectorFunction(name="u_f_n", field_names=['u_pos_x', 'u_pos_y'], dof_handler=dof_handler)
+pf_n = Function(name="p_f_n", field_name='p_pos_', dof_handler=dof_handler)
+us_k = VectorFunction(name="u_s_k", field_names=['vs_neg_x', 'vs_neg_y'], dof_handler=dof_handler)
+us_n = VectorFunction(name="u_s_n", field_names=['vs_neg_x', 'vs_neg_y'], dof_handler=dof_handler)
+disp_k = VectorFunction(name="disp_k", field_names=['d_neg_x', 'd_neg_y'], dof_handler=dof_handler)
+disp_n = VectorFunction(name="disp_n", field_names=['d_neg_x', 'd_neg_y'], dof_handler=dof_handler)
 
 # --- Parameters ---
 dt = Constant(0.2)
@@ -287,10 +280,10 @@ dof_handler.apply_bcs(bcs, uf_n, pf_n, us_n, disp_n)
 uf_n.plot()
 
 
-# In[11]:
+# In[ ]:
 
 
-from pycutfem.ufl.expressions import Derivative, FacetNormal, trace, Jump
+from pycutfem.ufl.expressions import Derivative, FacetNormal, trace, Jump, Hessian
 n = FacetNormal()                    # vector expression (n_x, n_y)
 
 def _dn(expr):
@@ -322,69 +315,92 @@ def _hess_comp(a, b):
     return (Derivative(a,2,0)*Derivative(b,2,0) +
             2*Derivative(a,1,1)*Derivative(b,1,1) +
             Derivative(a,0,2)*Derivative(b,0,2))
+def grad_inner_jump(u, v):
+    """⟨∂ₙu, ∂ₙv⟩  (scalar or 2‑D vector)."""
+    a = dot(jump(grad(u)), n)
+    b = dot(jump(grad(v)), n)
+    return inner(a, b)
+def hess_inner_jump(u, v):
+    a = dot(n, dot(jump(Hessian(u)), n))
+    b = dot(n, dot(jump(Hessian(v)), n))
+    return inner(a, b)
 
+qvol = 6
 dx_fluid  = dx(defined_on=fluid_interface_domain,level_set=level_set,
-               metadata={"q":6, "side": "+"})               # volume
+               metadata={"q":qvol, "side": "+"})               # volume
 dx_solid  = dx(defined_on=solid_interface_domain,level_set=level_set,
-               metadata={"q":6, "side": "-"})               # volume
-dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, metadata={"q":5,'derivs': {(0,0),(0,1),(1,0)}})   # interior surface
-dG_fluid       = dGhost(defined_on=fluid_ghost_edges, level_set=level_set,metadata={"q":5,'derivs': {(0,0),(0,1),(1,0),(2,0),(0,2),(1,1)}})  # ghost fluid surface
-dG_solid       = dGhost(defined_on=solid_ghost_edges, level_set=level_set,metadata={"q":5,'derivs': {(0,0),(0,1),(1,0),(2,0),(0,2),(1,1)}})  # ghost solid surface
+               metadata={"q":qvol, "side": "-"})               # volume
+dΓ        = dInterface(defined_on=mesh.element_bitset('cut'), level_set=level_set, 
+                       metadata={"q":qvol+2,'derivs': {(0,0),(0,1),(1,0)}})   # interior surface
+if hessian_ghost_enabled:
+    dG_fluid       = dGhost(defined_on=fluid_ghost_edges, level_set=level_set,
+                            metadata={"q":qvol,'derivs': {(0,0),(0,1),(1,0),(2,0),(0,2),(1,1)}})  # ghost fluid surface
+    dG_solid       = dGhost(defined_on=solid_ghost_edges, level_set=level_set,
+                            metadata={"q":qvol,'derivs': {(0,0),(0,1),(1,0),(2,0),(0,2),(1,1)}})  # ghost solid surface
+else:
+    dG_fluid       = dGhost(defined_on=fluid_ghost_edges, level_set=level_set,
+                          metadata={"q":qvol,'derivs': {(0,1),(1,0)}})  # ghost fluid surface
+    dG_solid       = dGhost(defined_on=solid_ghost_edges, level_set=level_set,
+                            metadata={"q":qvol,'derivs': {(0,1),(1,0)}})  # ghost solid surface
 
 cell_h  = CellDiameter() # length‑scale per element
-beta_N  = Constant(10.0 * poly_order**2)      # Nitsche penalty (tweak)
+beta_N  = Constant(20.0 * poly_order**2)      # Nitsche penalty (tweak)
 
 def epsilon_f(u):
-    "Symmetric gradient."
     return 0.5 * (grad(u) + grad(u).T)
-def epsilon_s_linear_L(disp,disp_k):
-    return 0.5 * (  grad(disp) + grad(disp).T  + dot(grad(disp).T,grad(disp_k)) + dot(grad(disp_k).T,grad(disp))  ) 
-def epsilon_s_linear_R(disp_k):
-    """
-    Right-hand side of the linearized solid strain tensor.
-    """
-    return 0.5 * (grad(disp_k) + grad(disp_k).T + dot(grad(disp_k).T,  grad(disp_k)) )
 
-def sigma_s_linear_weak_L(ddisp,disp_k, grad_v_test):
-    """
-    Linearized solid stress tensor.
-    """
-    return 2.0 * mu_s * inner(epsilon_s_linear_L(ddisp, disp_k),grad_v_test) + lambda_s * trace(epsilon_s_linear_L(ddisp, disp_k))  * trace(grad_v_test)
-def sigma_s_linear_weak_R(disp_k, grad_v_test):
-    """
-    Right-hand side of the linearized solid stress tensor.
-    """
-    return 2.0 * mu_s * inner(epsilon_s_linear_R(disp_k),grad_v_test) + lambda_s * trace(epsilon_s_linear_R(disp_k))  * trace(grad_v_test)
+def epsilon_s(u):
+    return 0.5 * (grad(u) + grad(u).T)
 
-def sigma_dot_n_v(u_vec, p_scal,v_test,n):
-    """
-    Expanded form of (σ(u, p) · n) without using the '@' operator.
+I2 = Constant(np.eye(2))
 
-        σ(u, p)·n = μ (∇u + ∇uᵀ)·n  −  p n
-    """
-    # first term: μ (∇u)·n
-    a = dot(grad(u_vec), n)
-    # second term: μ (∇uᵀ)·n
-    b = dot(grad(u_vec).T, n)
-    # combine and subtract pressure part
-    return  mu_f * dot((a + b),v_test) - p_scal * dot(v_test,n)         # vector of size 2
+def solid_stress(u):
+    return 2.0 * mu_s * epsilon_s(u) + lambda_s * trace(epsilon_s(u)) * I2
+
+def traction_fluid(u_vec, p_scal):
+    return -2.0 * mu_f_const * dot(epsilon_f(u_vec), n) + p_scal * n
+
+def traction_solid(disp):
+    return dot(solid_stress(disp), n)
+
+kappa_pos = Constant(1.0)
+kappa_neg = Constant(1.0)
+
+jump_vel_trial = du_f - du_s
+jump_vel_test = test_vel_f - test_vel_s
+jump_vel_res = uf_k - us_k
+
+avg_flux_trial = (
+    kappa_pos * traction_fluid(du_f, dp_f)
+    + kappa_neg * traction_solid(ddisp_s)
+)
+
+avg_flux_test = (
+    kappa_pos * traction_fluid(test_vel_f, test_q_f)
+    + kappa_neg * traction_solid(test_disp_s)
+)
+
+avg_flux_res = (
+    kappa_pos * traction_fluid(uf_k, pf_k)
+    + kappa_neg * traction_solid(disp_k)
+)
 
 # --- Jacobian contribution on Γsolid --------------------------------
 J_int = (
-    - sigma_dot_n_v(du_f, dp_f, Jump(test_vel_f, test_vel_s),n)           # consistency
-    - sigma_dot_n_v(Jump(test_vel_f, test_vel_s), -test_q_f, Jump(du_f, du_s), n)           # symmetry
-    + beta_N * mu_f / cell_h * dot(Jump(du_f, du_s), Jump(test_vel_f, test_vel_s))     # penalty
+    dot(avg_flux_trial, jump_vel_test)
+    + dot(avg_flux_test, jump_vel_trial)
+    + (beta_N * mu_f_const / cell_h) * dot(jump_vel_trial, jump_vel_test)
 ) * dΓ
 
 # --- Residual contribution on Γsolid --------------------------------
 R_int = (
-    - sigma_dot_n_v(uf_k, pf_k, Jump(test_vel_f, test_vel_s),n)
-    - sigma_dot_n_v(Jump(test_vel_f, test_vel_s), -test_q_f, Jump(uf_k, us_k), n)
-    + beta_N * mu_f / cell_h * dot(Jump(uf_k,us_k), Jump(test_vel_f , test_vel_s))
+    dot(avg_flux_res, jump_vel_test)
+    + dot(avg_flux_test, jump_vel_res)
+    + (beta_N * mu_f_const / cell_h) * dot(jump_vel_res, jump_vel_test)
 ) * dΓ
 
 # volume -------------------fluid--------------------------------
-a_vol_f = ( rho_f*dot(du_f,test_vel_f)/dt
+a_vol_f = ( rho_f/dt*dot(du_f,test_vel_f)
           + theta*rho_f*dot(dot(grad(uf_k), du_f), test_vel_f)
           + theta*rho_f*dot(dot(grad(du_f), uf_k), test_vel_f)
           + theta*mu_f*inner(grad(du_f), grad(test_vel_f))
@@ -399,31 +415,27 @@ r_vol_f = ( rho_f*dot(uf_k-uf_n, test_vel_f)/dt
           - pf_k*div(test_vel_f) + test_q_f*div(uf_k) ) * dx_fluid
 
 # volume -------------------solid--------------------------------
-a_vol_s = ( rho_s*dot(du_s,test_vel_s)/dt
-          + theta*rho_s*dot(dot(grad(us_k), du_s), test_vel_s)
-          + theta*rho_s*dot(dot(grad(du_s), us_k), test_vel_s)
-          + theta*sigma_s_linear_weak_L(ddisp_s, disp_k, grad(test_vel_s))
-           ) * dx_solid
+a_vol_s = (
+    rho_s / dt * dot(du_s, test_vel_s)
+    + theta * inner(solid_stress(ddisp_s), epsilon_s(test_vel_s))
+) * dx_solid
 
 
-r_vol_s = ( rho_s * dot(us_k-us_n, test_vel_s)/dt
-          + theta * rho_s * dot(dot(grad(us_k), us_k), test_vel_s)
-          + (1-theta) * rho_s * dot(dot(grad(us_n), us_n), test_vel_s)
-          + theta * sigma_s_linear_weak_R(disp_k, grad(test_vel_s))
-          + (1-theta) * sigma_s_linear_weak_R(disp_n, grad(test_vel_s))
-           ) * dx_solid
+r_vol_s = (
+    rho_s / dt * dot(us_k - us_n, test_vel_s)
+    + theta * inner(solid_stress(disp_k), epsilon_s(test_vel_s))
+    + (1 - theta) * inner(solid_stress(disp_n), epsilon_s(test_vel_s))
+) * dx_solid
 # --- solid disp and solid velocity constraint --------------------------------
+# \frac{D}{Dt} disp_s = \frac{\partial}{\partialt} disp_s + (v_s^k \cdot \nabla) disp_s
 a_svc = (
-    dot(ddisp_s, test_disp_s)/dt 
-    + theta * dot( dot(grad(ddisp_s), us_k), test_disp_s)
-    + theta * dot( dot(grad(disp_k), du_s) , test_disp_s)
+    dot(ddisp_s, test_disp_s) / dt
     - theta * dot(du_s, test_disp_s)
 ) * dx_solid
-r_svc = (    dot(disp_k-disp_n, test_disp_s)/dt 
-    + theta * dot(dot(grad(disp_k), us_k), test_disp_s)
-    + (1-theta) * dot(dot(grad(disp_n), us_n), test_disp_s)
+r_svc = (
+    dot(disp_k - disp_n, test_disp_s) / dt
     - theta * dot(us_k, test_disp_s)
-    - (1-theta) * dot(us_n, test_disp_s)
+    - (1 - theta) * dot(us_n, test_disp_s)
 ) * dx_solid
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
@@ -435,28 +447,35 @@ gamma_v_grad= Constant(penalty_grad * poly_order**2)
 gamma_p  = Constant(penalty_val * poly_order**1)
 gama_p_grad = Constant(penalty_grad * poly_order**1)
 def g_v_f(gamma, phi_1, phi_2):
-    return (
-        gamma * (
-            cell_h * grad_inner(jump(phi_1), jump(phi_2)) 
-            + cell_h**3.0/4.0   * hessian_inner(jump(phi_1), jump(phi_2))
+    if hessian_ghost_enabled:
+        return (
+            gamma * (
+                cell_h * grad_inner_jump(phi_1, phi_2)
+                + cell_h**3.0/4.0   * hess_inner_jump(phi_1, phi_2)
+            )
         )
-    )
+    else:
+        return (
+            gamma * (
+                cell_h * grad_inner_jump(phi_1, phi_2)
+            )
+        )
 def g_p(gamma, phi_1, phi_2):
     return (
         gamma * (
-            cell_h**3.0 * grad_inner(jump(phi_1), jump(phi_2)) 
+            cell_h**3.0 * grad_inner_jump(phi_1, phi_2)
         )
     )
 def g_v_s(gamma, phi_1, phi_2):
     return (
         gamma * (
-            cell_h**3.0 * grad_inner(jump(phi_1), jump(phi_2)) 
+            cell_h**3.0 * grad_inner_jump(phi_1, phi_2)
         )
     )
 def g_disp_s(gamma, phi_1, phi_2):
     return (
         gamma * (
-            cell_h * grad_inner(jump(phi_1), jump(phi_2)) 
+            cell_h * grad_inner_jump(phi_1, phi_2)
         )
     )
 
@@ -495,7 +514,7 @@ residual_form  = r_vol_f + R_int + r_vol_s + r_svc + r_stab
 # In[12]:
 
 
-get_ipython().system('rm ~/.cache/pycutfem_jit/*')
+# get_ipython().system('rm ~/.cache/pycutfem_jit/*')
 
 
 # In[13]:
@@ -509,14 +528,15 @@ get_ipython().system('rm ~/.cache/pycutfem_jit/*')
 # In[14]:
 
 
-from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters, AdamNewtonSolver
-from pycutfem.solvers.aainhb_solver import AAINHBSolver           # or get_solver("aainhb")
+from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters#, AdamNewtonSolver
+# from pycutfem.solvers.aainhb_solver import AAINHBSolver           # or get_solver("aainhb")
 
 uf_k.nodal_values.fill(0.0); pf_k.nodal_values.fill(0.0)
 uf_n.nodal_values.fill(0.0); pf_n.nodal_values.fill(0.0)
 us_k.nodal_values.fill(0.0); us_n.nodal_values.fill(0.0)
 disp_k.nodal_values.fill(0.0); disp_n.nodal_values.fill(0.0)
 dof_handler.apply_bcs(bcs, uf_n, pf_n, us_n, disp_n)
+dof_handler.apply_bcs(bcs, uf_k, pf_k, us_k, disp_k)
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
 time_params = TimeStepperParameters(dt=dt.value,max_steps=36 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
@@ -561,4 +581,3 @@ uf_n.plot(kind="streamline",
          linewidth=0.8,
          cmap="plasma",
          title="Turek-Schafer",background = False)
-

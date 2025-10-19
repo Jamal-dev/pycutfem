@@ -1427,8 +1427,8 @@ class NumbaCodeGen:
                     body_lines.append(f"# Trace of a symbolic tensor -> scalar basis of shape (1, n)")
                     k, n, _ = a.shape
                     body_lines += [
-                        f"n_locs = {n}",
-                        f"n_comps = {k}",
+                        f"n_locs = {a.var_name}.shape[1]",
+                        f"n_comps = {a.var_name}.shape[0]",
                         f"{res_var} = np.zeros((1, n_locs), dtype={self.dtype})",
                         f"for j in range(n_locs):",
                         f"    local_sum = 0.0",
@@ -2163,18 +2163,19 @@ class NumbaCodeGen:
 
                 # ---------------------new block--------------------------------
                 # ---------------------------------------------------------------------
-                # dot(grad(Trial), grad(Function)) and its transposed variants.
+                # dot(grad(Trial/Test), grad(Function)) and its transposed variants.
                 # ---------------------------------------------------------------------
-                elif (a.role == 'trial' and a.is_gradient and b.role == 'value' 
+                elif (a.role in {'trial', 'test'} and a.is_gradient and b.role == 'value' 
                     and b.is_gradient 
                     and a.shape[0] == b.shape[0] and a.shape[2] == b.shape[1]): 
+                    role = "trial" if a.role == "trial" else "test"
                     k = a.shape[0]; n_locs = a.shape[1]; d = a.shape[2]
                     
                     # a: grad(du) or grad(du).T -> Trial function basis, shape (k, n, d)
                     # b: grad(u_k)             -> Function value, shape (k, d)
                     
 
-                    body_lines.append("# dot(grad(trial), grad(value)) -> (k,n,k) tensor basis")
+                    body_lines.append(f"# dot(grad({role}), grad(value)) -> (k,n,k) tensor basis")
                     body_lines += [
                         f"n_vec_comps = {a.var_name}.shape[0]; n_locs = {a.var_name}.shape[1];",
                         f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype={self.dtype})",
@@ -2185,23 +2186,24 @@ class NumbaCodeGen:
                     ]
                     
                     res_shape = (k, n_locs, d)
-                    stack.append(StackItem(var_name=res_var, role='trial',
+                    stack.append(StackItem(var_name=res_var, role=role,
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=a.field_names, parent_name=a.parent_name,
                                         side=a.side, field_sides=a.field_sides or []))
 
                 # ---------------------------------------------------------------------
-                # dot(grad(Function), grad(Trial)) and its transposed variants.
+                # dot(grad(Function), grad(Trial/Test)) and its transposed variants.
                 # ---------------------------------------------------------------------
                 elif (a.role == 'value' and a.is_gradient and 
-                    b.role == 'trial' and b.is_gradient and 
+                    b.role in {'trial', 'test'} and b.is_gradient and 
                     a.shape[0] == b.shape[0] and a.shape[1] == b.shape[2]):
                     k = b.shape[0]; n_locs = b.shape[1]; d = b.shape[2]
+                    role = "trial" if b.role == "trial" else "test"
 
                     # a: grad(u_k) or grad(u_k).T -> Function value, shape (k, d)
                     # b: grad(du)             -> Trial function basis, shape (k, n, d)
 
-                    body_lines.append("# dot(grad(value), grad(trial)) -> (k,n,k) tensor basis")
+                    body_lines.append(f"# dot(grad(value), grad({role})) -> (k,n,k) tensor basis")
                     body_lines += [
                         f"n_vec_comps = {b.var_name}.shape[0]; n_locs = {b.var_name}.shape[1];",
                         f"{res_var} = np.zeros((n_vec_comps, n_locs, {d}), dtype={self.dtype})",
@@ -2212,7 +2214,7 @@ class NumbaCodeGen:
                     ]
                     
                     res_shape = (k, n_locs, k)
-                    stack.append(StackItem(var_name=res_var, role='trial',
+                    stack.append(StackItem(var_name=res_var, role=role,
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=b.field_names, parent_name=b.parent_name,
                                         side=b.side, field_sides=b.field_sides or []))
@@ -2251,7 +2253,7 @@ class NumbaCodeGen:
                 # ---------------------------------------------------------------------
                 # dot( u_trial;u_test;u_k, scalar )     ← e.g. scalar constant time Function
                 # ---------------------------------------------------------------------
-                elif (b.role == 'const' or b.role == 'value') and not b.is_vector and not b.is_gradient and not b.is_hessian and b.shape == ():
+                elif (b.role in {'const','value'} ) and not b.is_vector and not b.is_gradient and not b.is_hessian and b.shape == ():
                     # a is vector (trial/test/Function), b is scalar
                     body_lines.append("# Scalar constant: dot(Function/Trial/Test, scalar)")
                     body_lines.append(f"{res_var} = float({b.var_name}) * {a.var_name}")
@@ -2772,6 +2774,19 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=(a.shape[0],b.shape[1]), is_vector=True, field_names=b.field_names,
                                             parent_name=b.parent_name, side=b.side, field_sides=b.field_sides))
+                    elif (a.role in {"trial", "test"} and not a.is_vector and not a.is_gradient and not a.is_hessian and len(a.shape) == 1
+                          and b.role in {"value", "const"} and b.is_vector):
+                        role = 'trial' if a.role == 'trial' else 'test'
+                        body_lines.append("# Product: scalar Trial/Test × vector → vector Trial/Test")
+                        body_lines +=[
+                            f"{res_var} = np.zeros(({b.var_name}.shape[0], {a.var_name}.shape[0]), dtype={self.dtype})",
+                            f"for k in range({b.var_name}.shape[0]):",
+                            f"    {res_var}[k] = {a.var_name}[:] * {b.var_name}[k]",
+                        ]
+
+                        stack.append(StackItem(var_name=res_var, role=role,
+                                            shape=(b.shape[0],a.shape[0]), is_vector=True, field_names=a.field_names,
+                                            parent_name=a.parent_name, side=a.side, field_sides=a.field_sides))
                     # -----------------------------------------------------------------
                     # 3. LHS block:   scalar trial/test  *  Identity   →  grad structure trial/test ex p * Id
                     # -----------------------------------------------------------------
@@ -2780,13 +2795,13 @@ class NumbaCodeGen:
                         role = 'trial' if a.role == 'trial' else 'test'
                         body_lines.append("# Product: scalar Trial/Test × Identity → grad structure Trial/Test")
                         body_lines += [
-                            f"{res_var} = np.zeros(({b.var_name}.shape[0], {a.var_name}.shape[1], {b.var_name}.shape[2]), dtype={self.dtype})",
+                            f"{res_var} = np.zeros(({b.var_name}.shape[0], {a.var_name}.shape[1], {b.var_name}.shape[1]), dtype={self.dtype})",
                             f"for i in range({b.var_name}.shape[0]):",
                             f"    for j in range({b.var_name}.shape[1]):",
                             f"        {res_var}[i,:, j] = {a.var_name}[0, :] * {b.var_name}[i, j]",
                         ]
                         stack.append(StackItem(var_name=res_var, role=role,
-                                            shape=(b.shape[0], a.shape[1], b.shape[2]), is_vector=False,
+                                            shape=(b.shape[0], a.shape[1], b.shape[1]), is_vector=False,
                                             is_gradient=True, is_hessian=False, field_names=a.field_names,
                                             parent_name=a.parent_name, side=a.side, field_sides=a.field_sides))
                     elif (b.role in {"trial", "test"} and not b.is_vector and not b.is_gradient and not b.is_hessian and b.shape[0] == 1
@@ -2794,13 +2809,13 @@ class NumbaCodeGen:
                         role = 'trial' if b.role == 'trial' else 'test'
                         body_lines.append("# Product: Identity × scalar Trial/Test → grad structure Trial/Test")
                         body_lines += [
-                            f"{res_var} = np.zeros(({a.var_name}.shape[0], {b.var_name}.shape[1], {a.var_name}.shape[2]), dtype={self.dtype})",
+                            f"{res_var} = np.zeros(({a.var_name}.shape[0], {b.var_name}.shape[1], {a.var_name}.shape[1]), dtype={self.dtype})",
                             f"for i in range({a.var_name}.shape[0]):",
                             f"    for j in range({a.var_name}.shape[1]):",
                             f"        {res_var}[i,:, j] = {b.var_name}[0, :] * {a.var_name}[i, j]",
                         ]
                         stack.append(StackItem(var_name=res_var, role=role,
-                                            shape=(a.shape[0], b.shape[1], a.shape[2]), is_vector=False,
+                                            shape=(a.shape[0], b.shape[1], a.shape[1]), is_vector=False,
                                             is_gradient=True, is_hessian=False, field_names=b.field_names,
                                             parent_name=b.parent_name, side=b.side, field_sides=b.field_sides))
 
@@ -2824,7 +2839,10 @@ class NumbaCodeGen:
 
                     # symmetric orientation
                     elif (a.role == "test" and not a.is_vector
-                        and b.role == "value" and not b.is_vector):
+                        and b.role == "value" and not b.is_vector
+                        and not a.is_gradient and not b.is_gradient
+                        and not a.is_hessian and not b.is_hessian
+                        ):
                         body_lines.append("# Load: scalar Test × scalar Function → (n_loc,)")
 
                         body_lines.append(f"{res_var} = {b.var_name} * {a.var_name}")   # (n_loc,)
@@ -2833,6 +2851,43 @@ class NumbaCodeGen:
                                             shape=(a.shape[1],), is_vector=False,
                                             field_names=field_names, parent_name=parent_name, side=side,
                                             field_sides=field_sides))
+                    # -----------------------------------------------------------------
+                    # 1. RHS p * I:   trace(test)  * identity
+                    #                (u_test)                ·  φ_v
+                    # -----------------------------------------------------------------
+                    elif (a.role in {"test"} and b.role == "const" and b.is_gradient
+                            and not a.is_vector and not a.is_gradient and not a.is_hessian
+                            and b.shape==(2,2)
+                            ):
+                        if len(a.shape) == 2:
+                            n_locs = a.shape[1]
+                        elif len(a.shape) == 1:
+                            n_locs = a.shape[0]
+                        else:
+                            raise NotImplementedError(f"trace(test)*Id not implemented for test shape {a.shape}")
+                        body_lines.append("# rhs: trace(test) * Identity → ")
+                        is_1d_array = (len(a.shape) == 1)
+                        if is_1d_array:
+                            n_locs_var = f"{a.var_name}.shape[0]"
+                        else:
+                            n_locs_var = f"{a.var_name}.shape[1]"
+                        # Each line of code is now a separate string in the list
+                        body_lines += [
+                            f"n_locs = {n_locs_var}",
+                            f"n_vec_comps = {b.var_name}.shape[0]",
+                            f"d_locs = {b.var_name}.shape[1]",
+                            f"{res_var} = np.zeros((n_vec_comps, n_locs, d_locs), dtype={self.dtype})",
+                            f"for i in range(n_vec_comps):",
+                            f"    for j in range(d_locs):",
+                            f"        {res_var}[i, :, j] = {a.var_name} * {b.var_name}[i, j]",
+                        ]
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=a, strict=False)
+                        stack.append(StackItem(var_name=res_var, role='test',
+                                            shape=(b.shape[0], n_locs, b.shape[1]), is_vector =False, # Use the string 'n_locs' if its value is determined at runtime
+                                            is_gradient=True, is_hessian=False,
+                                            field_names=field_names, parent_name=parent_name, side=side,
+                                            field_sides=field_sides))
+
                     # -----------------------------------------------------------------
                     # 4. Anything else is ***not implemented yet*** – fail fast
                     # -----------------------------------------------------------------
