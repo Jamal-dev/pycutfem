@@ -1,17 +1,101 @@
 import numpy as np
-from pycutfem.core import Mesh
-from pycutfem.core.levelset import CircleLevelSet
-from pycutfem.cutters import classify_elements, classify_edges
+from pycutfem.core.mesh import Mesh
+from pycutfem.core.levelset import CircleLevelSet, LevelSetFunction
+from pycutfem.core.topology import Node
+from pycutfem.utils.meshgen import structured_quad, structured_triangles
 
-def test_element_and_edge_classification():
-    # Square mesh 2 tris
-    nodes = np.array([[0,0],[1,0],[1,1],[0,1]])
-    elements = np.array([[0,1,2],[0,2,3]])
-    mesh = Mesh(nodes, elements, element_type='tri')
-    ls = CircleLevelSet(center=(0.5,0.5), radius=0.3)
-    inside, outside, cut = classify_elements(mesh, ls)
-    # At least one element must be cut in this simple config
-    assert len(cut) >= 1
-    classify_edges(mesh)
-    # Interface edges must exist
-    assert 'interface' in mesh.edge_tag
+# Note: The LineLevelSet is not used by these tests but is kept as it was provided.
+class LineLevelSet(LevelSetFunction):
+    """Defines a level set for a vertical line phi(x,y) = x - c."""
+    def __init__(self,m, b: float = 0.0):
+        self.m = m
+        self.b = b
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        return self.m *x[..., 0] - self.b
+    def gradient(self, x: np.ndarray) -> np.ndarray:
+        grad = self.m
+        if x.ndim > 1:
+            return np.tile(grad, (x.shape[0], 1))
+        return grad
+
+class _SaddleLevelSet(LevelSetFunction):
+    """φ(x,y) = -(x-0.5)(y-0.5) → opposite signs across the diagonal nodes."""
+
+    def __call__(self, x):
+        x = np.asarray(x, dtype=float)
+        return -(x[..., 0] - 0.5) * (x[..., 1] - 0.5)
+
+    def gradient(self, x):
+        x = np.asarray(x, dtype=float)
+        gx = -(x[..., 1] - 0.5)
+        gy = -(x[..., 0] - 0.5)
+        g = np.stack([gx, gy], axis=-1)
+        norm = np.linalg.norm(g, axis=-1, keepdims=True)
+        norm = np.where(norm == 0.0, 1.0, norm)
+        return g / norm if g.ndim > 1 else (g / norm)[0]
+
+
+def test_element_and_edge_classification_simple_corrected():
+    """The diagonal edge in the 2-element mesh should be tagged `ghost_both`."""
+
+    nodes_list, elements_np, _, corners_np = structured_triangles(
+        1.0, 1.0, nx_quads=1, ny_quads=1, poly_order=1
+    )
+    mesh = Mesh(
+        nodes=nodes_list,
+        element_connectivity=elements_np,
+        elements_corner_nodes=corners_np,
+        element_type='tri',
+        poly_order=1,
+    )
+
+    ls = _SaddleLevelSet()
+
+    mesh.classify_elements(ls)
+    mesh.classify_edges(ls)
+
+    interior_edge_tags = {e.tag for e in mesh.edges_list if e.right is not None}
+    assert 'ghost_both' in interior_edge_tags, (
+        "The shared edge of the two cut triangles must be tagged 'ghost_both'."
+    )
+
+
+def test_full_interface_and_ghost_edge_creation_corrected():
+    """
+    Creates a mesh and a circle level set that reliably partitions it, ensuring
+    all element and edge types are generated and correctly identified.
+    """
+    # 1. Setup
+    nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=8, ny=8, poly_order=1)
+    ls = CircleLevelSet(center=(0.5, 0.5), radius=0.35)
+    mesh = Mesh(nodes=nodes,
+                element_connectivity=elems,
+                elements_corner_nodes=corners,
+                element_type='quad',
+                poly_order=1)
+
+    # 2. Classify elements and edges
+    mesh.classify_elements(ls)
+    mesh.classify_edges(ls)
+
+    # 3. Verify the results
+    element_tags = {elem.tag for elem in mesh.elements_list}
+    edge_tags = {edge.tag for edge in mesh.edges_list if edge.right is not None}
+
+    print("\n--- Full Classification Test Results ---")
+    print(f"Generated Element Tags: {element_tags}")
+    print(f"Generated Interior Edge Tags: {edge_tags}")
+
+    # Assert that our setup created all the expected types of regions
+    assert 'inside' in element_tags, "Test setup failed: No 'inside' elements were created."
+    assert 'outside' in element_tags, "Test setup failed: No 'outside' elements were created."
+    assert 'cut' in element_tags, "Test setup failed: No 'cut' elements were created."
+
+    # CORRECTED ASSERTION: Check for the presence of ANY of the specific ghost tags.
+    # We check if the set of generated tags has a non-empty intersection with the
+    # set of possible ghost tags.
+    possible_ghost_tags = {'ghost_pos', 'ghost_neg', 'ghost_both'}
+    assert 'interface' in edge_tags, "Classification failed: No 'interface' edges were tagged."
+    assert not edge_tags.isdisjoint(possible_ghost_tags), "Classification failed: No ghost edges ('ghost_pos', 'ghost_neg', or 'ghost_both') were tagged."
+
+    print("\nTest PASSED: Successfully generated and identified all tag types.")

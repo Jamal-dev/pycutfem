@@ -1,6 +1,8 @@
 numpy
 scipy
 sympy
-legacy-quadpy
-pytest
 matplotlib
+legacy-quadpy
+numba
+meshio
+pytest

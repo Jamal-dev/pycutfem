@@ -1,5 +1,6 @@
 import numpy as np
 from pycutfem.fem.reference.tri_pn import tri_pn
+from pycutfem.fem.reference import get_reference
 
 def test_tri_pn_p2_values_at_specific_point():
     """
@@ -7,7 +8,7 @@ def test_tri_pn_p2_values_at_specific_point():
     at a specific point (0.25, 0.25) in the reference element.
     """
     n_order = 2
-    shape_l, grad_l_tpl, hess_l_tpl, lap_l = tri_pn(n_order)
+    ref = get_reference("tri", n_order)
 
     xi_test, eta_test = 0.25, 0.25
 
@@ -21,7 +22,7 @@ def test_tri_pn_p2_values_at_specific_point():
     # N5_V2 = L3*(2*L3-1) = 0.25*(2*0.25-1) = 0.25*(-0.5) = -0.125
     expected_N_vals = np.array([0.0, 0.5, -0.125, 0.5, 0.25, -0.125])
     
-    actual_N_vals = shape_l(xi_test, eta_test).ravel()
+    actual_N_vals = ref.shape(xi_test, eta_test)
     print(f"shape of arrays: {actual_N_vals.shape}, expected: {expected_N_vals.shape}")
     np.testing.assert_allclose(actual_N_vals, expected_N_vals, atol=1e-9,
                                err_msg="P2 Shape function values at (0.25,0.25) mismatch.")
@@ -41,7 +42,7 @@ def test_tri_pn_p2_values_at_specific_point():
     # N5 = L3(2L3-1) = y(2y-1) = 2y^2 - y
     # dN5/dx = 0
     expected_dNdxi_vals = np.array([-1.0, 1.0, 0.0, -1.0, 1.0, 0.0])
-    actual_dNdxi_vals = grad_l_tpl[0](xi_test, eta_test).ravel()
+    actual_dNdxi_vals = ref.grad_dxi(xi_test, eta_test)
     np.testing.assert_allclose(actual_dNdxi_vals, expected_dNdxi_vals, atol=1e-9,
                                err_msg="P2 dN/dxi values at (0.25,0.25) mismatch.")
 
@@ -53,6 +54,6 @@ def test_tri_pn_p2_values_at_specific_point():
     # d2N0/dy2 = 4
     # Laplacian(N0) = 4+4 = 8
     expected_lap_N0 = 8.0
-    actual_lap_vals = lap_l(xi_test, eta_test).ravel()
+    actual_lap_vals = ref.laplacian(xi_test, eta_test)
     np.testing.assert_allclose(actual_lap_vals[0], expected_lap_N0, atol=1e-9,
                                err_msg="P2 Laplacian(N0) at (0.25,0.25) mismatch.")

@@ -16,11 +16,11 @@ mesh = Mesh(nodes, elems, 'quad')
 KeFe = lambda eid: stiffness_matrix(mesh, eid)
 K = assemble(mesh, lambda eid: stiffness_matrix(mesh, eid))
 F = np.zeros(len(nodes))
-for eid,elem in enumerate(mesh.elements):
+for eid,elem in enumerate(mesh.elements_list):
     Fe = cg_element_load(mesh, eid, f_rhs)
     for a,A in enumerate(elem): F[A]+=Fe[a]
 dbc={}
-for dof,(x,y) in enumerate(mesh.nodes):
+for dof,(x,y) in enumerate(mesh.nodes_x_y_pos):
     if np.isclose(x,0) or np.isclose(x,3) or np.isclose(y,0) or np.isclose(y,2):
         dbc[dof]=u_exact(x,y)
 K,F = apply_dirichlet(K,F,dbc)

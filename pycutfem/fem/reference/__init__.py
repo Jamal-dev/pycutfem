@@ -1,3 +1,4 @@
+# pycutfem.fem.reference
 """
 Order-agnostic reference-element factory.
 """
@@ -5,46 +6,83 @@ from functools import lru_cache
 from importlib import import_module
 import numpy as np
 
+class Ref:
+    def __init__(self, shape_lambda, deriv_lambdas):
+        self.shape_lambda = shape_lambda
+        self.deriv_lambdas = deriv_lambdas
+
+    @lru_cache(maxsize=None)
+    def shape(self, xi, eta):
+        return self.shape_lambda(xi, eta).astype(float).ravel()
+
+    @lru_cache(maxsize=None)
+    def derivative(self, xi, eta, order_xi, order_eta):
+        alpha = (order_xi, order_eta)
+        if alpha not in self.deriv_lambdas:
+            raise ValueError(f"Derivative order {alpha} not computed. "
+                             f"Adjust max_deriv_order >= {order_xi + order_eta}.")
+        return self.deriv_lambdas[alpha](xi, eta).astype(float).ravel()
+
+    # Compatibility methods
+    @lru_cache(maxsize=None)
+    def grad_dxi(self, xi, eta):
+        return self.derivative(xi, eta, 1, 0)
+
+    @lru_cache(maxsize=None)
+    def grad_deta(self, xi, eta):
+        return self.derivative(xi, eta, 0, 1)
+
+    @lru_cache(maxsize=None)
+    def grad(self, xi, eta):
+        dphi_dxi = self.grad_dxi(xi, eta)
+        dphi_deta = self.grad_deta(xi, eta)
+        return np.hstack((dphi_dxi[:, None], dphi_deta[:, None]))
+
+    @lru_cache(maxsize=None)
+    def hess_dxixi(self, xi, eta):
+        return self.derivative(xi, eta, 2, 0)
+
+    @lru_cache(maxsize=None)
+    def hess_detaeta(self, xi, eta):
+        return self.derivative(xi, eta, 0, 2)
+
+    @lru_cache(maxsize=None)
+    def hess_dxieta(self, xi, eta):
+        return self.derivative(xi, eta, 1, 1)
+
+    @lru_cache(maxsize=None)
+    def laplacian(self, xi, eta):
+        return self.hess_dxixi(xi, eta) + self.hess_detaeta(xi, eta)
+    @lru_cache(maxsize=None)
+    def hess(self, xi, eta):
+        d20 = self.hess_dxixi(xi, eta)
+        d11 = self.hess_dxieta(xi, eta)
+        d02 = self.hess_detaeta(xi, eta)
+        H = np.empty((d20.shape[0], 2, 2), dtype=float)
+        H[:, 0, 0] = d20
+        H[:, 0, 1] = d11
+        H[:, 1, 0] = d11
+        H[:, 1, 1] = d02
+        return H
+
 @lru_cache(maxsize=None)
-def get_reference(element_type: str, poly_order: int = 1):
+def get_reference(element_type: str, poly_order: int = 1, max_deriv_order: int = 2):
+    """
+    Factory function to get a reference element based on type and polynomial order.
+    Args:
+        element_type (str): Type of the element ('quad', 'tri', etc.).
+        poly_order (int): Polynomial order of the reference element.
+        max_deriv_order (int): Maximum derivative order to compute.
+    Returns:
+        Ref: An instance of the Ref class containing shape and derivative functions.
+    """    
     if element_type == "quad":
-        s_l, g_l_tpl, h_l_tpl, lap_l  = import_module("pycutfem.fem.reference.quad_qn").quad_qn(poly_order)
+        shape_l, deriv_lambdas  = import_module("pycutfem.fem.reference.quad_qn").quad_qn(poly_order, max_deriv_order)
     elif element_type == "tri":
-        s_l, g_l_tpl, h_l_tpl, lap_l = import_module("pycutfem.fem.reference.tri_pn").tri_pn(poly_order)
+        shape_l, deriv_lambdas = import_module("pycutfem.fem.reference.tri_pn").tri_pn(poly_order, max_deriv_order)
     else:
         raise KeyError(element_type)
 
-    class Ref:
-        @staticmethod
-        def shape(xi, eta): return s_l(xi, eta).astype(float).ravel() # (n_loc,)
-
-        # Gradient methods
-        @staticmethod
-        def grad_dxi(xi, eta): return g_l_tpl[0](xi, eta).astype(float).ravel() # (n_loc,)
-        
-        @staticmethod
-        def grad_deta(xi, eta): return g_l_tpl[1](xi, eta).astype(float).ravel() # (n_loc,)
-
-        @staticmethod
-        def grad(xi, eta): # Returns (n_loc, 2)
-            # Reconstructs the (n_loc, 2) matrix where each row is (dNi/dxi, dNi/deta)
-            # This matches the previous Ref.grad behavior if needed for compatibility
-            dphi_dxi_vals = g_l_tpl[0](xi, eta).astype(float) # Shape (n_loc, 1)
-            dphi_deta_vals = g_l_tpl[1](xi, eta).astype(float) # Shape (n_loc, 1)
-            return np.hstack((dphi_dxi_vals, dphi_deta_vals)) # Shape (n_loc, 2)
-
-        # Hessian component methods
-        @staticmethod
-        def hess_dxixi(xi, eta): return h_l_tpl[0](xi, eta).astype(float).ravel() # (n_loc,)
-        
-        @staticmethod
-        def hess_detaeta(xi, eta): return h_l_tpl[1](xi, eta).astype(float).ravel() # (n_loc,)
-        
-        @staticmethod
-        def hess_dxieta(xi, eta): return h_l_tpl[2](xi, eta).astype(float).ravel() # (n_loc,)
-
-        # Laplacian method
-        @staticmethod
-        def laplacian(xi, eta): return lap_l(xi, eta).astype(float).ravel() # (n_loc,)
-    return Ref
+                
+    return Ref(shape_l, deriv_lambdas)
 

@@ -1,6 +1,8 @@
 import numpy as np
 import json
 import quadpy
+from pathlib import Path
+import os
 
 # Set up storage
 dunavant_data = {}
@@ -17,5 +19,5 @@ for degree in range(1, 21):
     }
 
 # Save to JSON file with high precision
-with open("dunavant_degree_1_to_20.json", "w") as f:
+with open(Path(os.path.dirname(__file__))/Path("dunavant_degree_1_to_20.json"), "w") as f:
     json.dump(dunavant_data, f, indent=2)

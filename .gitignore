@@ -197,3 +197,10 @@ cython_debug/
 .vscode
 __pycache__
 **/__pycache__/
+garbage/
+project/
+examples/*_results/
+pycutfem/solvers/giant/*
+*_results/
+scripts/
+

@@ -19,8 +19,9 @@ def cg_element_load(mesh, elem_id, rhs, *, poly_order, quad_order=None):
         Fe += w * detJ * N * rhs(*x)
     return Fe
 
-def dg_element_load(mesh, elem_id, rhs, *, poly_order, quad_order=None):
+def dg_element_load(mesh, elem_id, rhs, *, quad_order=None):
     # identical integral, just a separate helper
+    poly_order = mesh.poly_order
     return cg_element_load(mesh, elem_id, rhs,
                            poly_order=poly_order,
                            quad_order=quad_order)

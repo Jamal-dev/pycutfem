@@ -11,27 +11,43 @@ Criteria
 """
 import numpy as np
 
-def classify_edges(mesh, level_set=None):
-    tags = np.array([''] * len(mesh.edges), dtype=object)
+def classify_edges(mesh, level_set):
+    """
+    Robust interface/ghost edge classification, given each element is already
+    tagged in {'inside', 'outside', 'cut'}.
 
-    if level_set is not None:
-        phi_nodes = level_set.evaluate_on_nodes(mesh)
-        for e in mesh.edges:
-            if phi_nodes[e.nodes[0]] * phi_nodes[e.nodes[1]] < 0:
-                tags[e.id] = 'interface'
+    1. If φ changes sign between the two endpoints of an edge, tag it 'interface'.
+    2. Otherwise, for interior edges (edge.right is not None):
+       - If {left_tag, right_tag} == {'inside', 'outside'} → 'interface'
+       - Elif left_tag=='cut' and right_tag=='cut'            → 'ghost'
+       - Elif exactly one side is 'cut' (and the other is 'inside' or 'outside')
+             → 'interface'
+       - Else → leave tag as '' (no classification needed).
+    """
+    # Evaluate φ at all nodes once
+    phi_nodes = level_set.evaluate_on_nodes(mesh)
 
-    # Fallback / additional classification via element tags
-    for e in mesh.edges:
-        if tags[e.id]:  # already set
+    for edge in mesh.edges_list:
+        # 1) Primary: sign‐change in φ across the edge’s endpoints?
+        if phi_nodes[edge.nodes[0]] * phi_nodes[edge.nodes[1]] < 0:
+            edge.tag = 'interface'
             continue
-        if e.right is None:
-            continue  # boundary edge
-        left = mesh.elem_tag[e.left]
-        right = mesh.elem_tag[e.right]
-        if {'inside', 'outside'} == {left, right} or 'cut' in (left, right):
-            tags[e.id] = 'interface'
-        elif left == right == 'cut':
-            tags[e.id] = 'ghost'
 
-    mesh.edge_tag[:] = tags
-    return tags
+        # 2) Fallback: only if this is an interior edge
+        if edge.right is not None:
+            left_tag  = mesh.elements_list[edge.left].tag
+            right_tag = mesh.elements_list[edge.right].tag
+
+            # inside/outside adjacent → interface
+            if {left_tag, right_tag} == {'inside', 'outside'}:
+                edge.tag = 'interface'
+
+            # both cut → ghost
+            elif left_tag == 'cut' and right_tag == 'cut':
+                edge.tag = 'ghost'
+
+            # exactly one side cut → interface
+            elif ('cut' in (left_tag, right_tag)) and (left_tag != right_tag):
+                edge.tag = 'interface'
+
+            # otherwise (both inside or both outside), leave edge.tag as ''

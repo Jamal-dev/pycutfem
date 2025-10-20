@@ -1,255 +1,538 @@
-"""pycutfem.core.mesh"""
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Tuple, List, Dict
 import numpy as np
+from dataclasses import dataclass
+from typing import Tuple, List, Dict, Optional, Callable, Union
 
-@dataclass(slots=True)
-class Edge:
-    id: int                   
-    nodes: Tuple[int, int]      # Global node indices of the edge's endpoints      
-    left: int | None            # Element ID on the left side of the edge 
-    right: int | None           # Element ID on the right side of the edge
-    normal: np.ndarray          # Normal vector of the edge, pointing outward from the left element
-    tag: str = ""
+
+from pycutfem.core.topology import Edge, Node, Element
+
+from pycutfem.utils.bitset import BitSet
+from pycutfem.core.sideconvention import SIDE
+from pycutfem.ufl.helpers_geom import edge_root_pn
 
 class Mesh:
-    # _EDGE_TABLE defines edges based on LOCAL indices of CORNERS/VERTICES
-    # For triangles (0,1,2): edge (V0,V1), (V1,V2), (V2,V0)
-    # For quads (0,1,2,3): edge (V0,V1), (V1,V2), (V2,V3), (V3,V0) (e.g., BL,BR,TR,TL)
+    """
+    Manages mesh topology, including nodes, elements, and edges.
+
+    This class builds the full connectivity graph from basic node and element
+    definitions. It correctly identifies shared edges, assigns geometrically
+    correct "left" and "right" elements, and computes outward-pointing normal
+    vectors for each edge. It also includes methods for classifying elements
+    and edges against a level-set function.
+    """
+    # Defines the local-corner indices that form each edge, in CCW order.
     _EDGE_TABLE = {
-        'tri': ((0,1),(1,2),(2,0)),
-        'quad':((0,1),(1,2),(2,3),(3,0)),
+        'tri':  ((0, 1), (1, 2), (2, 0)),
+        'quad': ((0, 1), (1, 2), (2, 3), (3, 0)),
     }
-    def __init__(self, nodes: np.ndarray, elements: np.ndarray, element_type='tri', poly_order: int = 1, **kwargs):
-        self.nodes = np.ascontiguousarray(nodes, dtype=float)
-        self.elements = np.ascontiguousarray(elements, dtype=int)
+
+    def __init__(self,
+                 nodes: List['Node'],
+                 element_connectivity: np.ndarray,
+                 edges_connectivity: np.ndarray = None,
+                 elements_corner_nodes: np.ndarray = None,
+                 *,
+                 element_type: str = 'tri',
+                 poly_order: int = 1):
+        """
+        Initializes the mesh and builds its topology.
+        """
+        self.edges_connectivity: np.ndarray = edges_connectivity
         self.element_type = element_type
         self.poly_order = poly_order
-        if self.nodes.ndim!=2 or self.nodes.shape[1]!=2:
-            raise ValueError('nodes must be (N,2)')
-        if self.elements.ndim!=2:
-            raise ValueError('elements must be (M,k_nodes_per_element)')
-        if element_type not in self._EDGE_TABLE:
-            raise ValueError(element_type)
-        
-        expected_nodes_per_elem = -1
-        if self.element_type == 'tri':
-            if self.poly_order >= 0: # Pk elements
-                expected_nodes_per_elem = (self.poly_order + 1) * (self.poly_order + 2) // 2
-            else:
-                raise ValueError(f"Unsupported element_order {self.poly_order} for triangle.")
-        elif self.element_type == 'quad':
-            if self.poly_order >= 0: # Qn elements
-                expected_nodes_per_elem = (self.poly_order + 1)**2
-            else:
-                raise ValueError(f"Unsupported element_order {self.poly_order} for quadrilateral.")
-        else:
-            raise ValueError(f"Unknown element_type: {self.element_type}")
-        
-        if self.elements.shape[0] > 0 and self.elements.shape[1] != expected_nodes_per_elem:
-            raise ValueError(
-                f"Mismatch for {self.element_type} order {self.poly_order}: "
-                f"elements array has {self.elements.shape[1]} nodes per element, "
-                f"but expected {expected_nodes_per_elem}."
-            )
+        self.nodes_list: List['Node'] = nodes
+        self.nodes_x_y_pos = np.array([[n.x, n.y] for n in self.nodes_list], dtype=float)
+        self.nodes = np.array([n.id for n in self.nodes_list])
+        self.elements_connectivity: np.ndarray = element_connectivity
+        self.corner_connectivity: np.ndarray = elements_corner_nodes
+        self.elements_list: List['Element'] = []
+        self.edges_list: List['Edge'] = []
+        self._edge_dict: Dict[Tuple[int, int], 'Edge'] = {}
+        self._neighbors: List[List[int]] = [[] for _ in range(len(self.elements_connectivity))]
+        self._build_topology()
+        self.n_elements = len(self.elements_connectivity) # number of elements
+        self.spatial_dim = 2  # Assuming 2D mesh by default
+        self._elem_bitsets: Dict[str, BitSet] = {}
+        self._edge_bitsets: Dict[str, BitSet] = {}
+        self.areas_list: Optional[np.ndarray] = self.areas()
 
-        if self.element_type not in self._EDGE_TABLE: # Should not happen if previous check passed
-            raise ValueError(f"Element type '{self.element_type}' not in _EDGE_TABLE.")
-            
-        # --- Initialize members ---
-        self.edges: List[Edge] = []
-        self._edge_dict: Dict[Tuple[int,int], int] = {}
-        self._neighbors: List[List[int]] = [[] for _ in range(len(self.elements))]
-        self.edge_tag = np.empty(0, dtype=object)
-        self.elem_tag = np.zeros(len(self.elements), dtype=object)
-        self._build_edges()
-    # ------------------------
-    def _get_element_corner_global_indices(self, element_idx: int) -> List[int]:
+    def num_elements(self) -> int:
+        """Returns the number of elements in the mesh."""
+        return self.n_elements
+    @staticmethod
+    def _reference_corner_coords(mesh: "Mesh") -> np.ndarray:
+        if mesh.element_type == 'tri':
+            return np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], float)
+        if mesh.element_type == 'quad':
+            return np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], float)
+        raise KeyError(mesh.element_type)
+
+    def _build_topology(self):
         """
-        Returns a list of global node indices for the CORNER/PRIMARY vertices
-        of the specified element. The order of vertices returned is suitable
-        for defining a CCW polygon.
-        Assumes structured_quad/tri node ordering.
+        Builds the full mesh topology: Elements, Edges, and Neighbors.
         """
-        elem_all_nodes_gids = self.elements[element_idx]
-        order = self.poly_order
+        edge_defs = self._EDGE_TABLE[self.element_type]
 
-        if self.element_type == 'tri':
-            if order == 0: # P0
-                # A P0 element is a point; for geometric operations like area/edges,
-                # it's degenerate. Return its single node repeated if needed by callers.
-                return [elem_all_nodes_gids[0]] * 3 if len(elem_all_nodes_gids) > 0 else []
-            
-            # Pk vertices (V0, V1, V2 in CCW order for reference mapping)
-            # V0: local index 0
-            # V1: local index 'order' (k)
-            # V2: local index (k+1)(k+2)/2 - 1 (last node in the Pk sequence)
-            idx_v0 = 0
-            idx_v1 = order
-            idx_v2 = (order + 1) * (order + 2) // 2 - 1
-            
-            # Basic sanity check for indices against element's node list length
-            max_idx = len(elem_all_nodes_gids) -1
-            if not (idx_v0 <= max_idx and idx_v1 <= max_idx and idx_v2 <= max_idx):
-                 raise IndexError(f"Corner indices out of bounds for P{order} tri element {element_idx} "
-                                  f"with {len(elem_all_nodes_gids)} nodes. Requested indices: 0, {order}, {idx_v2}")
-            return [
-                elem_all_nodes_gids[idx_v0],
-                elem_all_nodes_gids[idx_v1],
-                elem_all_nodes_gids[idx_v2],
-            ]
-        elif self.element_type == 'quad':
-            if order == 0: # Q0
-                return [elem_all_nodes_gids[0]] * 4 if len(elem_all_nodes_gids) > 0 else []
+        # Step 1: Create basic Element objects
+        for eid, elem_nodes in enumerate(self.elements_connectivity):
+            centroid_x = np.mean([self.nodes_x_y_pos[nid,0] for nid in self.corner_connectivity[eid]])
+            centroid_y = np.mean([self.nodes_x_y_pos[nid,1] for nid in self.corner_connectivity[eid]])
 
-            # Qn vertices (Order: BL, BR, TR, TL for CCW polygon)
-            # BL: local index 0
-            # BR: local index 'order' (k)
-            # TL: local index 'order' * ('order' + 1)
-            # TR: local index 'order' * ('order' + 1) + 'order'
-            idx_bl = 0
-            idx_br = order
-            idx_tl = order * (order + 1)
-            idx_tr = order * (order + 1) + order
-            
-            max_idx = len(elem_all_nodes_gids) -1
-            if not (idx_bl <= max_idx and idx_br <= max_idx and idx_tl <= max_idx and idx_tr <= max_idx):
-                 raise IndexError(f"Corner indices out of bounds for Q{order} quad element {element_idx} "
-                                  f"with {len(elem_all_nodes_gids)} nodes. Requested: BL={idx_bl}, BR={idx_br}, TL={idx_tl}, TR={idx_tr}")
-            return [
-                elem_all_nodes_gids[idx_bl], # V0 (BL)
-                elem_all_nodes_gids[idx_br], # V1 (BR)
-                elem_all_nodes_gids[idx_tr], # V2 (TR)
-                elem_all_nodes_gids[idx_tl], # V3 (TL)
-            ]
-        else: # Should have been caught in __init__
-            raise ValueError(f"Unknown element_type: {self.element_type} in _get_element_corner_global_indices")
-    # ------------------------
-    def areas(self) -> np.ndarray:
-        if len(self.elements) == 0:
-            return np.array([])
-            
-        element_areas = np.zeros(len(self.elements))
-        if self.poly_order == 0: # Point elements have zero geometric area
-            return element_areas
+            self.elements_list.append(Element(
+                id=eid,
+                element_type=self.element_type,
+                poly_order=self.poly_order,
+                nodes=tuple(elem_nodes),
+                corner_nodes=tuple(self.corner_connectivity[eid]),
+                centroid_x=centroid_x,
+                centroid_y=centroid_y,
+            ))
 
-        for eid in range(len(self.elements)):
-            corner_gids = self._get_element_corner_global_indices(eid)
-            # Ensure we have enough corners to form a polygon
-            if (self.element_type == 'tri' and len(corner_gids) < 3) or \
-               (self.element_type == 'quad' and len(corner_gids) < 4):
-                element_areas[eid] = 0.0 # Or handle as error
+        # Step 2: Build map from each edge to the elements that share it
+        edge_incidences: Dict[Tuple[int, int], List[int]] = {}
+        for eid, corners in enumerate(self.corner_connectivity):
+            for i in range(len(corners)):
+                c1, c2 = int(corners[i]), int(corners[(i + 1) % len(corners)])
+                key = tuple(sorted((c1, c2)))
+                edge_incidences.setdefault(key, []).append(eid)
+
+        def _locate_all_nodes_in_edge(vA: int, vB: int) -> Tuple[int, int]:
+            x0, y0 = self.nodes_x_y_pos[vA]
+            x1, y1 = self.nodes_x_y_pos[vB]
+            dx, dy = x1 - x0, y1 - y0
+            L2 = dx*dx + dy*dy
+            tol = SIDE.tol * np.sqrt(L2)
+
+            ids = []
+            for nd in self.nodes_list:
+                cross = abs((nd.x - x0)*dy - (nd.y - y0)*dx)
+                if cross > tol:
+                    continue
+                dot = (nd.x - x0)*dx + (nd.y - y0)*dy
+                if -tol <= dot <= L2 + tol:
+                    ids.append(nd.id)
+            # sort along the edge for reproducibility
+            ids.sort(key=lambda nid: (self.nodes_x_y_pos[nid,0]-x0)*dx + (self.nodes_x_y_pos[nid,1]-y0)*dy)
+            return tuple(ids)
+        # Step 3: Create unique Edge objects
+        for edge_gid, ((n_min, n_max), shared_eids) in enumerate(edge_incidences.items()):
+            left_eid = shared_eids[0]
+            vA, vB = -1, -1
+            left_elem_corners = self.corner_connectivity[left_eid]
+            local_edge_idx = None
+            for i in range(len(left_elem_corners)):
+                a = int(left_elem_corners[i]); b = int(left_elem_corners[(i + 1) % len(left_elem_corners)])
+                if {a, b} == {n_min, n_max}:
+                    vA, vB = a, b
+                    local_edge_idx = i  # 0..3 for quads
+                    break
+            right_eid = shared_eids[1] if len(shared_eids) > 1 else None
+            normal_vec = self._compute_normal((vA, vB))
+            # Collect all nodes lying on this geometric edge in O(p) using the
+            # left element's local connectivity when possible (quad, p>=1).
+            all_edge_nodes: Tuple[int, ...]
+            if (self.element_type == 'quad') and (local_edge_idx is not None):
+                # Local node layout is row-major with (p+1) nodes per row/col
+                p = int(self.poly_order)
+                n1 = p + 1
+                loc_nodes = list(self.elements_list[left_eid].nodes)
+                # Build local-index sequence for the chosen edge in the correct orientation
+                if local_edge_idx == 0:      # bottom: (0,0) -> (p,0)
+                    idxs = [k for k in range(0, n1)]
+                    oriented = (vA == left_elem_corners[0] and vB == left_elem_corners[1])
+                elif local_edge_idx == 1:    # right : (p,0) -> (p,p)
+                    idxs = [k*n1 + (n1-1) for k in range(0, n1)]
+                    oriented = (vA == left_elem_corners[1] and vB == left_elem_corners[2])
+                elif local_edge_idx == 2:    # top   : (p,p) -> (0,p)
+                    idxs = [p*n1 + k for k in range(0, n1)]
+                    oriented = (vA == left_elem_corners[2] and vB == left_elem_corners[3])
+                else:                         # left  : (0,p) -> (0,0)
+                    idxs = [k*n1 for k in range(0, n1)]
+                    oriented = (vA == left_elem_corners[3] and vB == left_elem_corners[0])
+                if not oriented:
+                    idxs = list(reversed(idxs))
+                all_edge_nodes = tuple(int(loc_nodes[ii]) for ii in idxs)
+            else:
+                # Fallback to geometric scan (rare/unstructured)
+                all_edge_nodes = _locate_all_nodes_in_edge(vA, vB)
+            edge_obj = Edge(gid=edge_gid, nodes=(vA, vB), left=left_eid, right=right_eid, normal=normal_vec, all_nodes=all_edge_nodes)
+            self.edges_list.append(edge_obj)
+            self._edge_dict[(n_min, n_max)] = edge_obj
+            if right_eid is not None:
+                self._neighbors[left_eid].append(right_eid)
+                self._neighbors[right_eid].append(left_eid)
+
+        # Step 4: Populate each Element's list of its edge GIDs
+        for elem in self.elements_list:
+            local_edge_gids = [self._edge_dict[tuple(sorted((elem.corner_nodes[c1], elem.corner_nodes[c2])))].gid for c1, c2 in edge_defs]
+            elem.edges = tuple(local_edge_gids)
+        
+        # Step 5: Populate neighbor info on each element
+        for elem in self.elements_list:
+            for local_edge_idx, edge_gid in enumerate(elem.edges):
+                edge = self.edge(edge_gid)
+                elem.neighbors[local_edge_idx] = edge.right if edge.left == elem.id else edge.left
+
+    def _compute_normal(self, directed_edge_nodes: Tuple[int, int]) -> np.ndarray:
+        """Computes an outward-pointing unit normal for a directed edge."""
+        v_start, v_end = self.nodes_x_y_pos[directed_edge_nodes[0]], self.nodes_x_y_pos[directed_edge_nodes[1]]
+        directed_vec = v_end - v_start
+        raw_normal = np.array([directed_vec[1], -directed_vec[0]], dtype=float)
+        length = np.linalg.norm(raw_normal)
+        return raw_normal / length if length > 1e-14 else np.array([0.0, 0.0])
+
+    # --- Classification Methods ---
+
+    def _get_node_coords(self) -> np.ndarray:
+        """Helper to get node coordinates as a NumPy array."""
+        return self.nodes_x_y_pos
+        
+    def _phi_on_centroids(self, level_set) -> np.ndarray:
+        """Compute φ at each element’s centroid."""
+        node_coords = self._get_node_coords()
+        # Note: Using corner_connectivity is correct for geometric centroid.
+        conn = self.corner_connectivity
+        corner_coords = node_coords[conn]
+        centroids = corner_coords.mean(axis=1)
+        
+        # FIX: Use apply_along_axis to robustly call the level set function
+        # on each centroid, one by one. This mimics the safe evaluation
+        # from LevelSetFunction.evaluate_on_nodes and avoids issues with
+        # __call__ methods that don't correctly handle batch inputs (N, 2).
+        return np.apply_along_axis(level_set, 1, centroids)
+
+    def classify_elements(self, level_set, tol=SIDE.tol):
+        """
+        Classify each element as 'inside', 'outside', or 'cut'.
+        Sets element.tag accordingly and returns indices for each class.
+        """
+        # Assumes level_set has a method evaluate_on_nodes(mesh)
+        phi_nodes = level_set.evaluate_on_nodes(self)
+        elem_phi_nodes = phi_nodes[self.corner_connectivity]
+        # phi_cent = self._phi_on_centroids(level_set)
+
+        # min_phi = np.minimum(elem_phi_nodes.min(axis=1), phi_cent)
+        # max_phi = np.maximum(elem_phi_nodes.max(axis=1), phi_cent)
+
+        min_phi = elem_phi_nodes.min(axis=1)
+        max_phi = elem_phi_nodes.max(axis=1)
+        
+        inside_mask = (max_phi < -tol)
+        outside_mask = (min_phi > tol)
+        
+        inside_inds = np.where(inside_mask)[0]
+        outside_inds = np.where(outside_mask)[0]
+        cut_inds = np.where(~(inside_mask | outside_mask))[0]
+
+        for eid in inside_inds: self.elements_list[eid].tag = 'inside'
+        for eid in outside_inds: self.elements_list[eid].tag = 'outside'
+        for eid in cut_inds: self.elements_list[eid].tag = 'cut'
+        tags_el = np.array([e.tag for e in self.elements_list])
+
+        self._elem_bitsets = {t: BitSet(tags_el == t) for t in np.unique(tags_el)}
+        
+        return inside_inds, outside_inds, cut_inds
+
+    def classify_elements_multi(self, level_sets, tol=SIDE.tol):
+        """Classifies elements against multiple level sets."""
+        return {idx: self.classify_elements(ls, tol) for idx, ls in enumerate(level_sets)}
+
+    def classify_edges(self, level_set, tol=SIDE.tol):
+        """
+        Classify edges as 'interface' or 'ghost' based on element tags.
+        """
+        phi_nodes = level_set.evaluate_on_nodes(self)
+        for edge in self.edges_list:
+            if edge.right is None:
+                # Boundary edge: KEEP whatever tag the mesh generator gave
+                # (e.g., 'left', 'right', 'top', 'bottom' or 'boundary').
+                # If you also want to auto-fill when missing, you can set a
+                # default like: edge.tag = edge.tag or 'boundary'
                 continue
 
-            corners_coords = self.nodes[corner_gids]
+            # Interior edge -> safe to reset and classify
+            edge.tag = ''
+            n0, n1 = edge.nodes
+            p0, p1 = phi_nodes[n0], phi_nodes[n1]
+            
 
-            if self.element_type == 'tri':
-                v0, v1, v2 = corners_coords[0], corners_coords[1], corners_coords[2]
-                element_areas[eid] = 0.5 * np.abs(np.cross(v1 - v0, v2 - v0))
-            elif self.element_type == 'quad':
-                # Using BL, BR, TR, TL order from _get_element_corner_global_indices
-                v0, v1, v2, v3 = corners_coords[0], corners_coords[1], corners_coords[2], corners_coords[3]
-                # Area by splitting into two triangles (v0,v1,v2) and (v0,v2,v3)
-                area1 = 0.5 * np.abs(np.cross(v1 - v0, v2 - v0)) # Triangle (v0,v1,v2)
-                area2 = 0.5 * np.abs(np.cross(v2 - v0, v3 - v0)) # Triangle (v0,v2,v3)
-                element_areas[eid] = area1 + area2
-        return element_areas
-    # ------------------------
-    def edge(self,eid:int)->Edge:
-        return self.edges[eid]
-    def edge_dict(self):
-        return self._edge_dict
-    def neighbors(self):
+            # --- Classification for INTERIOR edges based on element tags ---
+            if edge.right is not None:
+                left_tag = self.elements_list[edge.left].tag
+                right_tag = self.elements_list[edge.right].tag
+                tags = {left_tag, right_tag}
+
+                # Prioritize 'interface' if crossed (level set lies on edge)
+                if p0 * p1 < 0:
+                    # (i) strict crossing
+                    edge.tag = 'interface'
+                elif abs(p0) <= tol and abs(p1) <= tol:
+                    # (ii) whole edge on interface
+                    edge.tag = 'interface'
+                elif 'cut' in tags:
+                    # This logic might be flawed if both elements are 'cut'.
+                    # Assuming one is 'cut' and the other is not.
+                    non_cut_tags = [t for t in tags if t != 'cut']
+                    if non_cut_tags:
+                        non_cut = non_cut_tags[0]
+                        if non_cut == 'outside':
+                            edge.tag = 'ghost_pos'  # Cut and positive side
+                        elif non_cut == 'inside':
+                            edge.tag = 'ghost_neg'  # Cut and negative side
+                    else: # This happens if both tags are 'cut'
+                        edge.tag = 'ghost_both'
+
+
+        # Build and cache BitSets *once* – O(n_edges) total
+        tags = np.array([e.tag for e in self.edges_list])
+        #Convert np.unique result to a standard Python list
+        unique_tags = np.unique(tags).tolist()
+        self._edge_bitsets = {t: BitSet(tags == t) for t in unique_tags if t}
+
+        # New: Union bitset for 'ghost' (all ghost_*)
+        ghost_pos_bs = self._edge_bitsets.get('ghost_pos', BitSet(np.zeros(len(tags), bool)))
+        ghost_neg_bs = self._edge_bitsets.get('ghost_neg', BitSet(np.zeros(len(tags), bool)))
+        ghost_both_bs = self._edge_bitsets.get('ghost_both', BitSet(np.zeros(len(tags), bool)))
+        self._edge_bitsets['ghost'] = ghost_pos_bs | ghost_neg_bs | ghost_both_bs
+
+    
+
+
+    def build_interface_segments(self, level_set, tol=SIDE.tol, quadrature_order=2):
+        """
+        Populate element.interface_pts for every 'cut' element.
+        Each entry is a list of interface points, typically [p0, p1].
+        """
+        # Optional: only needed if you want a cheap endpoint precheck for p==1
+        phi_nodes = level_set.evaluate_on_nodes(self)  # φ at mesh corner nodes
+
+        # detect discrete order p of the FE level set if available (default 1)
+        p = 1
+        if hasattr(level_set, "dh") and hasattr(level_set, "field"):
+            try:
+                p = int(level_set.dh.mixed_element._field_orders[level_set.field])
+            except Exception:
+                p = 1
+
+        for elem in self.elements_list:
+            if elem.tag != 'cut':
+                elem.interface_pts = []
+                continue
+
+            pts = []
+
+            # LOCAL edges in canonical order (0..2 tri, 0..3 quad)
+            nloc_edges = 3 if len(elem.corner_nodes) == 3 else 4
+            for l_edge in range(nloc_edges):
+
+                # --- DO NOT SKIP on endpoint signs for p>=2 ---
+                # Only keep the fast skip for strictly p==1 (linear along edge)
+                if p == 1:
+                    # get endpoints for a quick sign check
+                    e_gid = elem.edges[l_edge]
+                    e = self.edge(e_gid)
+                    n0, n1 = e.nodes
+                    phi0, phi1 = phi_nodes[n0], phi_nodes[n1]
+                    if (phi0 * phi1 > 0.0) and (abs(phi0) > tol and abs(phi1) > tol):
+                        continue
+
+                # robust P^n root(s) on this *local* edge
+                roots = edge_root_pn(level_set, self, int(elem.id), int(l_edge), tol=tol)
+                if not roots:
+                    continue
+                # roots may have 1 (crossing) or 2 points (whole edge on {φ=0})
+                for P in roots:
+                    pts.append(np.asarray(P, float))
+
+            # de-dup (φ=0 through a vertex)
+            unique_pts = []
+            for pnt in pts:
+                if not any(np.linalg.norm(pnt - up) < tol for up in unique_pts):
+                    unique_pts.append(pnt)
+
+            # keep exactly two points: choose the longest chord across candidates
+            if len(unique_pts) >= 2:
+                P = np.asarray(unique_pts, float)
+                d2 = ((P[:, None, :] - P[None, :, :])**2).sum(axis=2)
+                i, j = divmod(int(d2.argmax()), d2.shape[1])
+                pts2 = [tuple(P[i]), tuple(P[j])]
+                pts2.sort(key=lambda Q: (Q[0], Q[1]))
+                elem.interface_pts = pts2
+            else:
+                elem.interface_pts = []
+
+
+    def edge_bitset(self, tag: str) -> BitSet:
+        """Return cached BitSet of edges with the given tag."""
+        cache = getattr(self, "_edge_bitsets", None)
+        if cache is not None and tag in cache:          # fast path
+            return cache[tag]
+
+        # --- recompute on the fly (O(n_edges)) ---------------------------
+        mask = np.fromiter((e.tag == tag for e in self.edges_list), bool)
+        return BitSet(mask)
+
+    def element_bitset(self, tag: str) -> BitSet:
+        cache = getattr(self, "_elem_bitsets", None)
+        if cache is not None and tag in cache:
+            return cache[tag]
+        mask = np.fromiter((el.tag == tag for el in self.elements_list), bool)
+        return BitSet(mask)
+
+    def get_domain_bitset(self, tag: str, *, entity: str = "edge") -> BitSet:     # noqa: N802
+        """
+        Return a **BitSet** that marks all mesh entities carrying *tag*.
+        Parameters
+        ----------
+        tag     : str
+
+            Mesh or BC tag (e.g. ``'interface'``, ``'ghost'``, ``'left_wall'`` …).
+
+        entity  : {'edge', 'elem', 'element'}
+
+            Select whether the BitSet refers to edges or elements.
+        Notes
+        -----
+        *   For edges and elements the classification routines fill the
+            private caches ``_edge_bitsets`` and ``_elem_bitsets`` exactly once
+            (O(*n*)).  From then on every call is an O(1) dictionary lookup.
+        *   If a cache does *not* exist yet we compute the mask on the fly – this
+            costs at most O(*n*) and does **not** pollute the cache (avoids
+            hidden state changes).
+        """
+        entity = entity.lower()
+        if entity in {"edge", "edges"}:
+            cache = getattr(self, "_edge_bitsets", None)
+            if cache is not None and tag in cache:                     # fast path
+                return cache[tag]
+            mask = np.fromiter((e.tag == tag for e in self.edges_list), bool)  # O(n)
+            return BitSet(mask)
+        if entity in {"elem", "element", "elements"}:
+            cache = getattr(self, "_elem_bitsets", None)
+            if cache is not None and tag in cache:
+                return cache[tag]
+            mask = np.fromiter((el.tag == tag for el in self.elements_list), bool)
+            return BitSet(mask)
+        raise ValueError(f"Unsupported entity type '{entity}'.")
+    
+    # --- Public API ---
+    def element_char_length(self, elem_id):
+        if elem_id is None:
+            return 0.0
+        return np.sqrt(self.areas_list[elem_id])
+    def face_char_length(self, left_eid: int | None, right_eid: int | None) -> float:
+        hs = []
+        for eid in (left_eid, right_eid):
+            if eid is None: continue
+            a = float(self.areas_list[int(eid)])
+            if a > 0.0: hs.append(np.sqrt(a))
+        if hs: return float(min(hs))
+        pos = self.areas_list[self.areas_list > 0.0]
+        return float(np.sqrt(pos.min())) if pos.size else 1.0
+    def neighbors(self) -> List[int]:
         return self._neighbors
-    # ------------------------
-    def _build_edges(self):
-        if self.poly_order == 0 or len(self.elements) == 0: # Point elements don't have edges here
-            self.edges = []
-            self._edge_dict = {}
-            self._neighbors = [[] for _ in range(len(self.elements))]
-            self.edge_tag = np.array([], dtype=object)
-            return
 
-        # _EDGE_TABLE defines connectivity based on *local indices of conceptual corners*
-        # e.g., for a triangle, edge 0 is between conceptual corner 0 (V0) and conceptual corner 1 (V1).
-        local_corner_edge_definitions = self._EDGE_TABLE[self.element_type]
-        
-        # `inc` maps a sorted tuple of global node IDs (of an edge) to a list of element IDs sharing that edge.
-        inc: Dict[Tuple[int, int], List[int]] = {} 
+    def edge(self, edge_id: int) -> 'Edge':
+        """Return the Edge object corresponding to a global `edge_id`."""
+        if not 0 <= edge_id < len(self.edges_list):
+            raise IndexError(f"Edge ID {edge_id} out of range.")
+        return self.edges_list[edge_id]
 
-        for eid in range(len(self.elements)):
-            # Get global node IDs of the actual corner/primary vertices for this element
-            actual_corner_gids_for_elem = self._get_element_corner_global_indices(eid)
-            
-            if not actual_corner_gids_for_elem: # Should not happen if order > 0
+    def tag_boundary_edges(self, tag_functions: Dict[str, Callable[[float, float], bool]]):
+        """
+        Tag every *boundary* edge ( `edge.right is None` ) and – **new** –
+        build / refresh the private `_edge_bitsets` cache so that
+
+            >>> mesh.edge_bitset('right_wall')
+
+        is an **O(1)** dictionary lookup instead of a fresh scan.
+        """
+        n_edges          = len(self.edges_list)
+        tag_masks        = {t: np.zeros(n_edges, bool) for t in tag_functions}
+        for e in self.edges_list:
+            if e.right is not None:                  # interior → skip
+                continue
+            mpx, mpy   = self.nodes_x_y_pos[list(e.nodes)].mean(axis=0)
+            for tag, locator in tag_functions.items():
+                if locator(mpx, mpy):
+                    e.tag            = tag
+                    tag_masks[tag][e.gid] = True
+                    break
+
+        if not hasattr(self, "_edge_bitsets"):
+            self._edge_bitsets = {}
+        self._edge_bitsets.update({tag: BitSet(mask) for tag, mask in tag_masks.items()})
+    
+    def tag_edges(self, tag_functions: Dict[str, Callable[[float, float], bool]], overwrite=True):
+        """
+        Applies tags to ANY edge (boundary or interior) based on its midpoint location.
+
+        Args:
+            tag_functions: Dictionary mapping tag names to boolean functions.
+            overwrite (bool): If True, it will overwrite any existing tags on the edges.
+        """
+        for edge in self.edges_list:
+            # Skip if the edge already has a tag and we are not overwriting
+            if edge.tag and not overwrite:
                 continue
 
-            # Iterate through the conceptual edges defined by local corner indices (0,1,2 for tri; 0,1,2,3 for quad)
-            for idx_corner1_conceptual, idx_corner2_conceptual in local_corner_edge_definitions:
-                # Map these conceptual local corner indices to the global node IDs of the actual corners
-                gid1 = actual_corner_gids_for_elem[idx_corner1_conceptual]
-                gid2 = actual_corner_gids_for_elem[idx_corner2_conceptual]
-                
-                edge_tuple_sorted_gids = tuple(sorted((gid1, gid2))) # Canonical representation of the edge
-                inc.setdefault(edge_tuple_sorted_gids, []).append(eid)
-        
-        new_edges_list: List[Edge] = []
-        new_edge_dict: Dict[Tuple[int, int], int] = {}
-        new_neighbors: List[List[int]] = [[] for _ in range(len(self.elements))]
+            midpoint = self.nodes_x_y_pos[list(edge.nodes)].mean(axis=0)
+            for tag_name, func in tag_functions.items():
+                if func(midpoint[0], midpoint[1]):
+                    edge.tag = tag_name
+                    break # Stop after the first matching tag is found
 
-        for edge_id_counter, (edge_gids_pair, shared_elem_ids) in enumerate(inc.items()):
-            left_elem_id = shared_elem_ids[0]
-            right_elem_id = shared_elem_ids[1] if len(shared_elem_ids) == 2 else None
-            
-            if right_elem_id is not None: # Internal edge
-                new_neighbors[left_elem_id].append(right_elem_id)
-                new_neighbors[right_elem_id].append(left_elem_id)
-            
-            # The edge_gids_pair is already sorted. _compute_normal needs to be robust or
-            # we need to pass the directed edge based on left_elem_id's winding.
-            # For now, pass the sorted pair and let _compute_normal handle orientation.
-            normal_vector = self._compute_normal(edge_gids_pair, left_elem_id) 
-            
-            new_edges_list.append(Edge(id=edge_id_counter, nodes=edge_gids_pair, 
-                                       left=left_elem_id, right=right_elem_id, normal=normal_vector))
-            new_edge_dict[edge_gids_pair] = edge_id_counter
-            
-        self.edges = new_edges_list
-        self._edge_dict = new_edge_dict
-        self._neighbors = new_neighbors
-        self.edge_tag = np.array([''] * len(self.edges), dtype=object) # Initialize tags
+    # ==================================================================
+    # NEW FUNCTION 2: Collect DOFs from tagged edges
+    # ==================================================================
+    def get_dofs_from_tags(self, dof_map: Dict[str, List[str]]) -> Dict[str, List[int]]:
+        """
+        Collects unique node IDs (DOFs) from edges based on their tags.
 
-    def _compute_normal(self, edge_nodes_gids_tuple: Tuple[int, int], left_elem_id: int) -> np.ndarray:
-        # edge_nodes_gids_tuple is sorted (smaller_gid, larger_gid)
-        p0_gid, p1_gid = edge_nodes_gids_tuple
-        p0_coords, p1_coords = self.nodes[p0_gid], self.nodes[p1_gid]
-        
-        edge_vector = p1_coords - p0_coords # Vector from node with smaller GID to node with larger GID
-        
-        # Initial normal (90-degree rotation: (dx, dy) -> (dy, -dx) or (-dy, dx))
-        # (dy, -dx) gives an outward normal if edge is traversed CCW w.r.t element
-        raw_normal = np.array([edge_vector[1], -edge_vector[0]]) 
-        
-        norm_val = np.linalg.norm(raw_normal)
-        if norm_val < 1e-12: # Degenerate edge or coincident points
-            return np.array([0.0, 0.0]) # Or raise error
-        unit_normal = raw_normal / norm_val
-        
-        # Ensure normal points outwards from the 'left_elem_id'
-        # Centroid of the 'left_elem_id' (using all its nodes for accuracy)
-        elem_all_nodes_for_centroid = self.elements[left_elem_id]
-        centroid_coords = self.nodes[elem_all_nodes_for_centroid].mean(axis=0)
-        
-        edge_midpoint_coords = 0.5 * (p0_coords + p1_coords)
-        
-        # Vector from edge midpoint to element centroid
-        vec_mid_to_centroid = centroid_coords - edge_midpoint_coords
-        
-        # If the normal points towards the centroid (dot product > 0), flip it
-        if np.dot(vec_mid_to_centroid, unit_normal) > 1e-9: # Add tolerance for dot product check
-            unit_normal *= -1.0
-            
-        return unit_normal
+        Args:
+            dof_map: A dictionary where keys are DOF set names (e.g., 'dirichlet')
+                     and values are lists of edge tags to be included in that set.
+                     Example: {'dirichlet': ['left', 'wall'], 'neumann': ['inlet']}
+
+        Returns:
+            A dictionary where keys are the DOF set names and values are sorted
+            lists of unique node IDs.
+        """
+        # Use sets to automatically handle duplicate node IDs
+        dof_sets = {name: set() for name in dof_map.keys()}
+
+        # Create a reverse map (tag -> dof_name) for efficient lookup
+        tag_to_dof_name = {}
+        for dof_name, tags in dof_map.items():
+            for tag in tags:
+                tag_to_dof_name[tag] = dof_name
+
+        # Iterate through all edges and collect the nodes
+        for edge in self.edges_list:
+            if edge.tag in tag_to_dof_name:
+                dof_name = tag_to_dof_name[edge.tag]
+                # .update() adds all items from the tuple (n1, n2) to the set
+                dof_sets[dof_name].update(edge.nodes)
+
+        # Return a dictionary with sorted lists of unique node IDs
+        return {name: sorted(list(nodes)) for name, nodes in dof_sets.items()}
+
+
+    def areas(self) -> np.ndarray:
+        """Calculates the geometric area of each element."""
+        element_areas = np.zeros(len(self.elements_list))
+        for elem in self.elements_list:
+            corner_coords = self.nodes_x_y_pos[list(elem.corner_nodes)]
+            if self.element_type == 'tri':
+                v0, v1, v2 = corner_coords[0], corner_coords[1], corner_coords[2]
+                element_areas[elem.id] = 0.5 * np.abs(np.cross(v1 - v0, v2 - v0))
+            elif self.element_type == 'quad':
+                x, y = corner_coords[:, 0], corner_coords[:, 1]
+                element_areas[elem.id] = 0.5 * np.abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+        return element_areas
+
     def __repr__(self):
-        return f'<Mesh n_nodes={len(self.nodes)} n_elems={len(self.elements)} n_edges={len(self.edges)}>'
+        return (f"<Mesh n_nodes={len(self.nodes_list)}, "
+                f"n_elems={len(self.elements_list)}, "
+                f"n_edges={len(self.edges_list)}, "
+                f"elem_type='{self.element_type}', "
+                f"poly_order={self.poly_order}>")

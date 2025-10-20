@@ -4,7 +4,7 @@ import numpy as np, scipy.sparse as sp
 def assemble(mesh, local_cb):
     n_dofs = len(mesh.nodes)
     rows, cols, data = [], [], []
-    for eid, elem in enumerate(mesh.elements):
+    for eid, elem in enumerate(mesh.elements_connectivity):
         Ke, _ = local_cb(eid)
         for a, A in enumerate(elem):
             for b, B in enumerate(elem):
