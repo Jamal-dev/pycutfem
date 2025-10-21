@@ -88,7 +88,7 @@ D = 0.1   # Cylinder diameter
 c_x, c_y = 0.2, 0.2  # Cylinder center
 rho = 1.0  # Density
 mu = 1e-3  # Viscosity
-U_mean = 1.0  # Mean inflow velocity
+U_mean = 1.5  # Mean inflow velocity
 Re = rho * U_mean * D / mu
 fe_order = 2
 geom_order = 2 if with_deformation else 1
@@ -106,9 +106,14 @@ from pycutfem.utils.adaptive_mesh_ls_numba import structured_quad_levelset_adapt
 NX, NY = 65, 50
 # NX, NY = 30, 40
 dt = Constant(0.1)
-theta = Constant(0.56) # Crank-Nicolson
+theta = Constant(0.560) # Crank-Nicolson
 max_time_steps = 200
 analytic_level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 )
+mean_pressure_constraint = True
+# (Using booleans is cleaner, but 1 or 0 works too)
+with_interface_theta_traction = False
+with_interface_theta_pressure = False
+with_interface_theta_penalty = False
 # h  = 0.5*(L/NX + H/NY)
 
 
@@ -181,12 +186,16 @@ has_rigid_domain = rigid_domain | cut_domain
 
 # --- Finite Element Space and DofHandler ---
 # Taylor-Hood elements (Q2 for velocity, Q1 for pressure)
-mixed_element = MixedElement(
-    mesh,
-    field_specs={'ux': fe_order, 'uy': fe_order, 'p': 1, 
-                #  'lm': ':number:'
-                 }
-)
+if mean_pressure_constraint:
+    mixed_element = MixedElement(
+        mesh,
+        field_specs={'ux': fe_order, 'uy': fe_order, 'p': fe_order -1, 'lm': ':number:'}
+    )
+else:
+    mixed_element = MixedElement(
+        mesh,
+        field_specs={'ux': fe_order, 'uy': fe_order, 'p': fe_order -1}
+    )
 dof_handler = DofHandler(mixed_element, method='cg')
 # dof_handler.info()
 print(f"Number of inside elements: {rigid_domain.cardinality()}")
@@ -203,25 +212,25 @@ print(f"Number of ghost edges (both): {mesh.edge_bitset('ghost_both').cardinalit
 # In[5]:
 
 
-# 1. Define the target point.
-# target_point = np.array([1.5, 0.99 * H])
-target_point = np.array([c_x, c_y])
+# # 1. Define the target point.
+# # target_point = np.array([1.5, 0.99 * H])
+# target_point = np.array([c_x, c_y])
 
-# 2. Get all node IDs that have a pressure DOF associated with them.
-p_dofs = dof_handler.get_field_slice('p')
-p_node_ids = np.array([dof_handler._dof_to_node_map[dof][1] for dof in p_dofs])
+# # 2. Get all node IDs that have a pressure DOF associated with them.
+# p_dofs = dof_handler.get_field_slice('p')
+# p_node_ids = np.array([dof_handler._dof_to_node_map[dof][1] for dof in p_dofs])
 
-# 3. Get the coordinates of ONLY these pressure-carrying nodes.
-p_node_coords = mesh.nodes_x_y_pos[p_node_ids]
+# # 3. Get the coordinates of ONLY these pressure-carrying nodes.
+# p_node_coords = mesh.nodes_x_y_pos[p_node_ids]
 
-# 4. Find the node closest to the target point WITHIN this restricted set.
-distances = np.linalg.norm(p_node_coords - target_point, axis=1)
-local_index = np.argmin(distances)
+# # 4. Find the node closest to the target point WITHIN this restricted set.
+# distances = np.linalg.norm(p_node_coords - target_point, axis=1)
+# local_index = np.argmin(distances)
 
-# 5. Get the global ID and actual coordinates of that specific pressure node.
-closest_p_node_id = p_node_ids[local_index]
-actual_pin_coords = mesh.nodes_x_y_pos[closest_p_node_id]
-print(f"Pinning pressure at the node closest to {target_point}, found at {actual_pin_coords}")
+# # 5. Get the global ID and actual coordinates of that specific pressure node.
+# closest_p_node_id = p_node_ids[local_index]
+# actual_pin_coords = mesh.nodes_x_y_pos[closest_p_node_id]
+# print(f"Pinning pressure at the node closest to {target_point}, found at {actual_pin_coords}")
 
 
 # In[6]:
@@ -235,11 +244,9 @@ print(f"Pinning pressure at the node closest to {target_point}, found at {actual
 # bcs.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x, y: 0.0))
 # bcs_homog.append(BoundaryCondition('p', 'dirichlet', 'p_pin', lambda x, y: 0.0))
 # Tag velocity DOFs inside the cylinder (same tag name for both fields is OK)
-dof_handler.tag_dofs_from_element_bitset("vel_x_inside", "ux", "inside", strict=True)
-dof_handler.tag_dofs_from_element_bitset("vel_y_inside", "uy", "inside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "ux", "inside", strict=True)
+dof_handler.tag_dofs_from_element_bitset("inactive", "uy", "inside", strict=True)
 dof_handler.tag_dofs_from_element_bitset("inactive", "p", "inside", strict=True)
-bcs.append(BoundaryCondition('ux', 'dirichlet', 'vel_x_inside', lambda x, y: 0.0))
-bcs_homog.append(BoundaryCondition('uy', 'dirichlet', 'vel_y_inside', lambda x, y: 0.0))
 
 
 # In[7]:
@@ -283,26 +290,33 @@ if ENABLE_PLOTS:
 print("\n--- Defining the UFL weak form for Navier-Stokes with ghost penalty ---")
 
 # --- Function Spaces and Functions ---
-velocity_space = FunctionSpace(name="velocity", field_names=['ux', 'uy'],dim=1)
-pressure_space = FunctionSpace(name="pressure", field_names=['p'], dim=0)
+velocity_space = FunctionSpace(name="velocity", field_names=['ux', 'uy'],dim=1, side='+')
+pressure_space = FunctionSpace(name="pressure", field_names=['p'], dim=0, side = '+')
 
 # Trial and Test functions
 du = VectorTrialFunction(space=velocity_space, dof_handler=dof_handler, side = '+')
 dp = TrialFunction(name='trial_pressure', field_name='p', dof_handler=dof_handler, side = '+')
 v = VectorTestFunction(space=velocity_space, dof_handler=dof_handler, side = '+')
 q = TestFunction(name='test_pressure', field_name='p', dof_handler=dof_handler, side = '+')
-# nL = TrialFunction(name='nL', field_name='lm', dof_handler=dof_handler)
-# mL = TestFunction(name='mL', field_name='lm', dof_handler=dof_handler)
+if mean_pressure_constraint:
+    nL = TrialFunction(name='nL', field_name='lm', dof_handler=dof_handler)
+    mL = TestFunction(name='mL', field_name='lm', dof_handler=dof_handler)
+else:
+    nL = None
+    mL = None
 
 # Solution functions at current (k) and previous (n) time steps
 u_k = VectorFunction(name="u_k", field_names=['ux', 'uy'], dof_handler=dof_handler, side = '+')
 p_k = Function(name="p_k", field_name='p', dof_handler=dof_handler, side = '+')
 u_n = VectorFunction(name="u_n", field_names=['ux', 'uy'], dof_handler=dof_handler, side = '+')
 p_n = Function(name="p_n", field_name='p', dof_handler=dof_handler, side = '+')
-# p_trial_neg   = TrialFunction('p_neg_', dof_handler,name='pressure_neg_trial', side='-')
-# q_test_neg    = TestFunction ('p_neg_', dof_handler,name='pressure_neg_test', side='-')
-# lambda_k = Function(name="lambda_k", field_name='lm', dof_handler=dof_handler)
-# lambda_n = Function(name="lambda_n", field_name='lm', dof_handler=dof_handler)
+
+if mean_pressure_constraint:
+    lambda_k = Function(name="lambda_k", field_name='lm', dof_handler=dof_handler)
+    lambda_n = Function(name="lambda_n", field_name='lm', dof_handler=dof_handler)
+else:
+    lambda_k = None
+    lambda_n = None
 
 # --- Parameters ---
 
@@ -311,9 +325,10 @@ rho_const = Constant(rho)
 
 u_k.nodal_values.fill(0.0); p_k.nodal_values.fill(0.0)
 u_n.nodal_values.fill(0.0); p_n.nodal_values.fill(0.0)
-# lambda_k.nodal_values.fill(0.0); lambda_n.nodal_values.fill(0.0)
-# dof_handler.apply_bcs(bcs, u_n, p_n, lambda_n)
-# dof_handler.apply_bcs(bcs, u_k, p_k, lambda_k)
+if lambda_k is not None and lambda_n is not None:
+    lambda_k.nodal_values.fill(0.0); lambda_n.nodal_values.fill(0.0)
+dof_handler.apply_bcs(bcs, u_n, p_n, lambda_n)
+dof_handler.apply_bcs(bcs, u_k, p_k, lambda_k)
 
 
 # In[10]:
@@ -332,174 +347,6 @@ print(len(dof_handler.get_dirichlet_data(bcs)))
 # In[12]:
 
 
-import numpy as np
-
-def make_peak_filter_cb(
-    dh,
-    level_set,
-    *,
-    fields=('ux', 'uy'),
-    side='+',                 # '+' → φ>=0 (outside), '-' → φ<=0 (inside)
-    band_width=1.0,           # keep nodes with |φ| <= band_width * h_dof
-    tau=3.5,                  # MAD threshold
-    skip_dofs=None            # set[int] of global DOFs to skip (e.g. active Dirichlet)
-):
-    """
-    Robust outlier clamp for velocity components near the interface, operating in
-    DOF space using only the DofHandler's numbering and maps.
-
-    Usage:
-        skip_active = set(dh.get_dirichlet_data(bcs).keys()) \
-                      - set(dh.dof_tags.get('inactive', set()))
-        cb = make_peak_filter_cb(dh, level_set, side='+', band_width=1.0,
-                                 tau=3.5, skip_dofs=skip_active)
-        solver = NewtonSolver(..., post_cb=cb)
-    """
-    if skip_dofs is None:
-        skip_dofs = set()
-
-    mesh = dh.mixed_element.mesh
-
-    # -----------------------------------------------------------
-    # 1) Build 1-ring DOF adjacency per field from element maps
-    # -----------------------------------------------------------
-    def _build_dof_adjacency(field):
-        adj = {}  # gdof -> set(neighbour gdofs)
-        elem_maps = dh.element_maps[field]            # per-element global DOFs (field)
-        for gdofs in elem_maps:                       # list[int] for that element/field
-            g = list(gdofs)
-            for i in range(len(g)):
-                ai = g[i]
-                s = adj.setdefault(ai, set())
-                for j in range(len(g)):
-                    if i == j: continue
-                    s.add(g[j])
-        return adj
-
-    adj_by_field = {f: _build_dof_adjacency(f) for f in fields}
-
-    # -----------------------------------------------------------
-    # 2) Coordinates and φ at DOFs (handler-driven, not mesh ids)
-    # -----------------------------------------------------------
-    # all DOF coords aligned with global DOF index
-    all_coords = dh.get_all_dof_coords()             # shape (total_dofs, 2)
-
-    def _eval_phi(points):
-        pts = np.asarray(points, dtype=float)
-        if pts.ndim == 1:
-            return np.array([float(level_set(pts))], dtype=float)
-        try:
-            vals = level_set(pts)
-            arr = np.asarray(vals, dtype=float)
-            if arr.shape == (pts.shape[0],):
-                return arr
-        except TypeError:
-            pass
-        return np.array([float(level_set(pt)) for pt in pts], dtype=float)
-
-    phi_all = np.asarray(_eval_phi(all_coords), dtype=float).reshape(-1)
-
-    # -----------------------------------------------------------
-    # 3) Per-DOF h: mean element char length over adjacent elems
-    # -----------------------------------------------------------
-    # Build node -> {adjacent element ids} once (geometry graph),
-    # then map gdof -> node id -> elems -> average h
-    node_to_elems = {}
-    for el in mesh.elements_list:
-        for nid in el.nodes:
-            node_to_elems.setdefault(nid, set()).add(el.id)
-
-    g2n = dh._dof_to_node_map  # global dof -> (field, node_id)  :contentReference[oaicite:12]{index=12}
-
-    def _h_for_gdof(gd):
-        nid = g2n[gd][1]
-        eids = node_to_elems.get(nid, ())
-        if not eids:
-            return mesh.element_char_length(0)
-        return np.mean([mesh.element_char_length(e) for e in eids])
-
-    # cache per-DOF h in a dict (sparse – only what we touch)
-    h_cache = {}
-
-    # -----------------------------------------------------------
-    # 4) Band masks per field (by DOF), with side selection
-    # -----------------------------------------------------------
-    def _band_mask_for_field(field):
-        gdofs = dh.get_field_slice(field)            # ascending global DOFs  :contentReference[oaicite:13]{index=13}
-        phi_f = phi_all[gdofs]
-        if side == '+':
-            side_ok = (phi_f >= 0.0)
-        elif side == '-':
-            side_ok = (phi_f <= 0.0)
-        else:
-            raise ValueError("side must be '+' or '-'")
-        # build h per gdof lazily
-        h_f = np.empty_like(phi_f)
-        for i, gd in enumerate(gdofs):
-            if gd not in h_cache:
-                h_cache[gd] = _h_for_gdof(gd)
-            h_f[i] = h_cache[gd]
-        band = (np.abs(phi_f) <= band_width * h_f) & side_ok
-        return gdofs, band
-
-    band_by_field = {f: _band_mask_for_field(f) for f in fields}
-
-    # -----------------------------------------------------------
-    # 5) The actual filter that edits a VectorFunction in-place
-    # -----------------------------------------------------------
-    from pycutfem.ufl.expressions import VectorFunction
-
-    def _filter_on_vector(vf, field):
-        gdofs, band = band_by_field[field]
-        g2l = vf._g2l        # global→local map in that VectorFunction  :contentReference[oaicite:14]{index=14}
-        vals = vf.nodal_values
-
-        adj = adj_by_field[field]
-        changed = 0
-
-        # iterate only DOFs present in vf and within the band and not in skip list
-        for gd, keep in zip(gdofs, band):
-            if not keep:               # not in |φ|<=band_width*h or wrong side
-                continue
-            if gd in skip_dofs:        # e.g. active Dirichlet at walls/inlet/outlet
-                continue
-            li = g2l.get(gd, None)
-            if li is None:             # vf may not carry this DOF (shouldn't happen)
-                continue
-
-            neigh = [n for n in adj.get(gd, ()) if n in g2l]
-            if len(neigh) < 3:
-                continue
-
-            nvals = np.array([vals[g2l[n]] for n in neigh], float)
-            med   = np.median(nvals)
-            mad   = np.median(np.abs(nvals - med)) + 1e-14
-            if abs(vals[li] - med) > tau * mad:
-                vals[li] = med
-                changed += 1
-                dh._tmp_clamped_gdofs.add(gd)   # << NEW, remember this clamped gdof
-                dh._tmp_clamped_vals[gd] = med         # NEW
-        return changed
-
-    # -----------------------------------------------------------
-    # 6) The callback the Newton solver will call each iteration
-    # -----------------------------------------------------------
-    def _cb(funcs):
-        # Reset a per-call scratch set the solver can read afterwards
-        dh._tmp_clamped_gdofs = set()     # << NEW
-        dh._tmp_clamped_vals = {}
-        # Expect a VectorFunction (velocity) and a scalar Function (pressure) in funcs.
-        from pycutfem.ufl.expressions import VectorFunction
-        vf = next((f for f in funcs if isinstance(f, VectorFunction)), None)
-        if vf is None:
-            return
-        total = 0
-        for f in fields:
-            total += _filter_on_vector(vf, f)
-        if total:
-            print(f"        [peak-filter] clamped {total} DOFs in |φ|≤{band_width}h on side '{side}'")
-
-    return _cb
 
 
 # In[13]:
@@ -511,43 +358,15 @@ from pycutfem.ufl.expressions import ElementWiseConstant
 from pycutfem.ufl.expressions import Pos, Neg, Grad, Dot, FacetNormal, Constant
 
 
-n = FacetNormal()                    # vector expression (n_x, n_y)
-n_f = FacetNormal()                  # vector expression (n_x, n_y) on the fluid side
+n = FacetNormal()                  # vector expression (n_x, n_y) on the fluid side
 
-def _dn(expr):
-    """Normal derivative  n·∇expr  on an (interior) edge."""
-    Dx = Derivative(expr, 1, 0)
-    Dy = Derivative(expr, 0, 1)
-    _ = Dx + Dy
-    return n[0]*Dx + n[1]*Dy
 
-def grad_inner(u, v):
-    """⟨∂ₙu, ∂ₙv⟩  (scalar or 2‑D vector)."""
-    if u.num_components == 1:      # scalar
-        return _dn(u) * _dn(v)
-
-    if u.num_components == v.num_components == 2: # vector
-        return _dn(u[0]) * _dn(v[0]) + _dn(u[1]) * _dn(v[1])
-
-    raise ValueError("grad_inner supports only scalars or 2‑D vectors.")
 def grad_inner_jump(u, v):
     """⟨∂ₙu, ∂ₙv⟩  (scalar or 2‑D vector)."""
     a = dot(jump(grad(u)), n)
     b = dot(jump(grad(v)), n)
     return inner(a, b)
 
-# def hessian_inner(u, v):
-#     if getattr(u, "num_components", 1) == 1:      # scalar
-#         return _hess_comp(u, v)
-
-#     # vector: sum component-wise
-#     return sum(_hess_comp(u[i], v[i]) for i in range(u.num_components))
-
-
-# def _hess_comp(a, b):
-#     return (Derivative(a,2,0)*Derivative(b,2,0) +
-#             2*Derivative(a,1,1)*Derivative(b,1,1) +
-#             Derivative(a,0,2)*Derivative(b,0,2))
 
 def hessian_inner(u, v):
     return inner(Hessian(u), Hessian(v)) 
@@ -598,12 +417,6 @@ u_n_phys = restrict(u_n, physical_domain)
 p_n_phys = restrict(p_n, physical_domain)
 q_test_neg = restrict(q, has_rigid_domain)
 p_trial_neg = restrict(dp, has_rigid_domain)
-u_trial_neg = restrict(du, has_rigid_domain)
-v_test_neg = restrict(v, has_rigid_domain)
-u_k_neg = restrict(u_k, has_rigid_domain)
-p_k_neg = restrict(p_k, has_rigid_domain)
-u_n_neg = restrict(u_n, has_rigid_domain)
-p_n_neg = restrict(p_n, has_rigid_domain)
 
 cell_h  = CellDiameter() # length‑scale per element
 beta_N  = Constant(20.0 * fe_order**2)      # Nitsche penalty (tweak)
@@ -621,16 +434,13 @@ def scaled_penalty_interface(penalty, poly_order=fe_order,
 
     # 3) Final penalty (symbolic EWC × expression)
     return β_visc + β_iner
+β = scaled_penalty_interface(40.0, side='+')  # Nitsche penalty
 
 def epsilon(u):
     "Symmetric gradient."
     return 0.5 * (grad(u) + grad(u).T)
 
 
-def sigma_f(u, p):
-    return 2.0 * mu_const * epsilon(u) - p * Constant(np.eye(2))
-def traction_f(u, p, n):
-    return dot(sigma_f(u, p), n)
 
 def sigma_dot_n_v(u_vec, p_scal, v_test, normal):
     """
@@ -646,79 +456,80 @@ def sigma_dot_n_v(u_vec, p_scal, v_test, normal):
     return mu_const * dot((a + b), v_test) - p_scal * dot(v_test, normal)
 
 # --- Jacobian contribution on Γsolid --------------------------------
-# Hansbo weights θ^+, θ^- (per element); element-wise constants
-theta_pos_vals = hansbo_cut_ratio(mesh, level_set, side='+')
-theta_neg_vals = 1.0 - theta_pos_vals
-kappa_pos = Pos(ElementWiseConstant(theta_pos_vals))
-kappa_neg = Neg(ElementWiseConstant(theta_neg_vals))
-jump_u_trial = Pos(u_trial_phys) -  Neg(u_trial_neg)
-jump_u_test = Pos(v_test_phys) -  Neg(v_test_neg)
-jump_u_res = Pos(u_k_phys) -  Neg(u_k_neg)
-jump_u_old = Pos(u_n_phys) -  Neg(u_n_neg)
-avg_flux_trial = kappa_pos * traction_f(
-    Pos(u_trial_phys), Pos(p_trial_phys), n_f
-) + kappa_neg * traction_f(
-    Neg(u_trial_neg), Neg(p_trial_neg), -n_f
-)
-avg_flux_test = kappa_pos * traction_f(
-    Pos(v_test_phys), Pos(q_test_phys), n_f
-) + kappa_neg * traction_f(
-    Neg(v_test_neg), Neg(q_test_neg), -n_f
-)
-avg_flux_res = kappa_pos * traction_f(
-    Pos(u_k_phys), Pos(p_k_phys), n_f
-) + kappa_neg * traction_f(
-    Neg(u_k_neg), Neg(p_k_neg), -n_f
-)
-avg_flux_old = kappa_pos * traction_f(
-    Pos(u_n_phys), Pos(p_n_phys), n_f
-) + kappa_neg * traction_f(
-    Neg(u_n_neg), Neg(p_n_neg), -n_f
-)
-β = scaled_penalty_interface(2.0, side='+')  # Nitsche penalty
+    # - sigma_dot_n_v(Pos(u_trial_phys), Pos(p_trial_phys), Pos(v_test_phys), n_f)
+    # - sigma_dot_n_v(Pos(v_test_phys), Pos(q_test_phys), Pos(u_trial_phys), n_f)
 
-# J_int = (
-#     - theta * dot(avg_flux_trial, jump_u_test)
-#     - theta * dot(avg_flux_test, jump_u_trial)
-#     + theta * β * dot(jump_u_trial, jump_u_test)
-# ) * dΓ
-# R_int = (
-#     - (1.0 - theta) * dot(avg_flux_old, jump_u_test)
-#     - theta * dot(avg_flux_res, jump_u_test)
-#     - (1.0 - theta) * dot(avg_flux_test, jump_u_old)
-#     - theta * dot(avg_flux_test, jump_u_old)
-#     + theta * dot(jump_u_res, jump_u_test)
-#     + (1.0 - theta) * dot(jump_u_old, jump_u_test)
-# ) * dΓ
-beta_normal_flux = scaled_penalty_interface(2.0, side='+')
+
+
+# --- 2. Define the time-stepping factors based on these options ---
+# 'k' is the implicit factor (for step k, used in J_int and R_int)
+# 'n' is the explicit factor (for step n, used in R_int only)
+
+k_factor_T = theta if with_interface_theta_traction else Constant(1.0)
+n_factor_T = (1.0 - theta) if with_interface_theta_traction else Constant(0.0)
+
+k_factor_P = theta if with_interface_theta_pressure else Constant(1.0)
+n_factor_P = (1.0 - theta) if with_interface_theta_pressure else Constant(0.0)
+
+k_factor_B = theta if with_interface_theta_penalty else Constant(1.0)  # B for Beta (penalty)
+n_factor_B = (1.0 - theta) if with_interface_theta_penalty else Constant(0.0)
+
+# --- 3. Define the Jacobian (J_int) ---
+# J_int is the derivative of R_int w.r.t. the k-th step solution.
+# So, it only uses the 'k_factor' terms.
 J_int = (
-    - sigma_dot_n_v(Pos(u_trial_phys), Pos(p_trial_phys), Pos(v_test_phys), n_f)
-    - sigma_dot_n_v(Pos(v_test_phys), Pos(q_test_phys), Pos(u_trial_phys), n_f) 
-    # + β * dot(Pos(u_trial_phys), Pos(v_test_phys))
-    #  + beta_normal_flux * dot(Pos(u_trial_phys), n) * dot(Pos(v_test_phys), n)
-     + β * dot(jump_u_trial, jump_u_test)
-     + beta_normal_flux * dot(jump_u_trial, n) * dot(jump_u_test, n)
+    # Traction terms (weighted by k_factor_T)
+    - k_factor_T * 2.0 * mu_const * dot(dot(grad(Pos(u_trial_phys)) , n), Pos(v_test_phys) )
+    - k_factor_T * 2.0 * mu_const * dot(dot(grad(Pos(v_test_phys)), n), Pos(u_trial_phys) )
+    
+    # Pressure terms (weighted by k_factor_P)
+    + k_factor_P * Pos(p_trial_phys) * dot(Pos(v_test_phys), n)
+    - k_factor_P * Pos(q_test_phys) * dot(Pos(u_trial_phys), n)
+    
+    # Penalty term (weighted by k_factor_B)
+    + k_factor_B * β * dot(Pos(u_trial_phys), Pos(v_test_phys))
 ) * dΓ
 
-# --- Residual contribution on Γsolid --------------------------------
+def is_zero(a):
+    if isinstance(a, Constant):
+        return a.value == 0.0
+    else:
+        return a == 0.0
+
+
+#
 R_int = (
-    - sigma_dot_n_v(Pos(u_k_phys), Pos(p_k_phys), Pos(v_test_phys), n_f)
-    - sigma_dot_n_v(Pos(v_test_phys), Pos(q_test_phys), Pos(u_k_phys), n_f) 
-    # + β * dot(Pos(u_k_phys), Pos(v_test_phys))
-    # + beta_normal_flux * dot(Pos(u_k_phys), n) * dot(Pos(v_test_phys), n)
-    + β * dot(jump_u_res, jump_u_test)
-    + beta_normal_flux * dot(jump_u_res, n) * dot(jump_u_test, n)
-) * dΓ
+    # Traction terms
+    - k_factor_T * 2.0 * mu_const * dot(dot(grad(Pos(u_k_phys)) , n), Pos(v_test_phys) )
+    - k_factor_T * 2.0 * mu_const * dot(dot(grad(Pos(v_test_phys)), n), Pos(u_k_phys) )
+    
+    # Pressure terms
+    + k_factor_P * Pos(p_k_phys) * dot(Pos(v_test_phys), n)
+    - k_factor_P * Pos(q_test_phys) * dot(Pos(u_k_phys), n)
+
+    
+    # Penalty term
+    + k_factor_B * β * dot(Pos(u_k_phys), Pos(v_test_phys))
+
+) 
+if not is_zero(n_factor_T):
+    R_int +=  (
+        - n_factor_T * 2.0 * mu_const * dot(dot(grad(Pos(u_n_phys)) , n), Pos(v_test_phys) )
+        - n_factor_T * 2.0 * mu_const * dot(dot(grad(Pos(v_test_phys)), n), Pos(u_n_phys) )
+    )
+if not is_zero(n_factor_P):
+    R_int += (
+        + n_factor_P * Pos(p_n_phys) * dot(Pos(v_test_phys), n)
+        - n_factor_P * Pos(q_test_phys) * dot(Pos(u_n_phys), n)
+    )
+if not is_zero(n_factor_B):
+    R_int +=  (
+         n_factor_B * β * dot(Pos(u_n_phys), Pos(v_test_phys))
+    )
+R_int = R_int * dΓ
 
 # volume ------------------------------------------------------------
-# a_vol = restrict(( rho*dot(du,v)/dt
-#           + theta*rho*dot(dot(grad(u_k), du), v)
-#           + theta*rho*dot(dot(grad(du), u_k), v)
-#           + theta*mu*inner(grad(du), grad(v))
-#           - dp*div(v) + q*div(du) ),physical_domain) * dx_phys
 
-# r_vol = restrict(( rho*dot(u_k-u_n, v)/dt
-#           + theta*rho*dot(dot(grad(u_k), u_k), v)
 a_vol = (
     rho_const * dot(u_trial_phys, v_test_phys) / dt
     + theta * rho_const * dot(dot(grad(u_k_phys), u_trial_phys), v_test_phys)
@@ -738,8 +549,9 @@ r_vol = (
     + q_test_phys * div(u_k_phys)
 ) * dx_phys
 
-# a_vol += (nL * Neg(q_test_neg) + mL * Neg(p_trial_neg)) * dx_neg
-# r_vol += (mL * p_k_phys + lambda_k * q_test_phys) * dx_phys
+if mean_pressure_constraint:
+    a_vol += (nL * Neg(q_test_neg) + mL * Neg(p_trial_neg)) * dx_neg
+    # r_vol += (mL * p_k_phys + lambda_k * q_test_phys) * dx_phys
 
 # ghost stabilisation (add exactly as in your Poisson tests) --------
 penalty_val = 1e-3
@@ -751,24 +563,22 @@ gamma_p  = Constant(penalty_val )
 gamma_p_grad = Constant(penalty_grad )
 gamma_v_hess = Constant(penalty_hess )
 
-stab = ( gamma_v  / cell_h   * dot(jump(u_k_phys), jump(v_test_phys))
+R_stab = ( gamma_v  / cell_h   * dot(jump(u_k_phys), jump(v_test_phys))
        + gamma_v_grad * cell_h   * grad_inner_jump(u_k_phys, v_test_phys)
         #  + gamma_v_hess * cell_h**3.0/4.0   * inner(nHn(jump(u_k),n), nHn(jump(v),n))
-    #    + gamma_p  / cell_h   * jump(p_k) * jump(q)  # Note: use * for scalars, see issue 2
+       - gamma_p  / cell_h   * jump(p_k) * jump(q)  # Note: use * for scalars, see issue 2
     #    + gamma_p_grad * cell_h**3.0   * grad_inner(jump(p_k_phys), jump(q_test_phys)) 
        ) * dG
 
-stab_lin  = ( gamma_v  / cell_h   * dot(jump(u_trial_phys),  jump(v_test_phys)) 
+J_stab_lin  = ( gamma_v  / cell_h   * dot(jump(u_trial_phys),  jump(v_test_phys)) 
             +  gamma_v_grad * cell_h   * grad_inner_jump(u_trial_phys, v_test_phys) 
         #    + gamma_v_hess * cell_h**3.0/4.0   * inner(nHn(jump(du),n), nHn(jump(v),n))
-        #    +  gamma_p  / cell_h   * jump(dp) *  jump(q)
+           -  gamma_p  / cell_h   * jump(dp) *  jump(q)
             # + gamma_p_grad * cell_h**3.0   * grad_inner(jump(p_trial_phys),  jump(q_test_phys))
             )   * dG
 # complete Jacobian and residual -----------------------------------
-jacobian_form  = a_vol + J_int 
-residual_form  = r_vol + R_int 
-# jacobian_form  = a_vol + J_int + stab_lin
-# residual_form  = r_vol + R_int + stab
+jacobian_form  = a_vol + J_int + J_stab_lin
+residual_form  = r_vol + R_int + R_stab
 # residual_form  = dot(  Constant(np.array([0.0, 0.0]),dim=1), v) * dx
 # jacobian_form  = stab_lin
 # residual_form  = stab
@@ -960,8 +770,7 @@ def save_solution(funcs):
 
     step_counter += 1
 
-save_solution([u_k, p_k])
-# save_solution([u_k, p_k, lambda_k])
+save_solution([u_k, p_k, lambda_k])
 
 
 
@@ -970,10 +779,10 @@ save_solution([u_k, p_k])
 
 from pycutfem.solvers.nonlinear_solver import (NewtonSolver, 
                                                NewtonParameters, 
-                                               TimeStepperParameters, 
-                                               AdamNewtonSolver,
-                                               PetscSnesNewtonSolver)
-from pycutfem.solvers.aainhb_solver import AAINHBSolver           # or get_solver("aainhb")
+                                               TimeStepperParameters,) 
+                                            #    AdamNewtonSolver,
+                                            #    PetscSnesNewtonSolver)
+# from pycutfem.solvers.aainhb_solver import AAINHBSolver           # or get_solver("aainhb")
 import time
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
@@ -981,14 +790,7 @@ time_params = TimeStepperParameters(dt=dt.value,max_steps=max_time_steps
                                     ,stop_on_steady=True, 
                                     steady_tol=1e-6, theta= theta.value)
 dirichlet_dofs = set(dof_handler.get_dirichlet_data(bcs).keys())  # bcs = your Dirichlet BCs
-post_cb = make_peak_filter_cb(
-    dof_handler, level_set,
-    fields=("ux","uy"),      # or ("ux","uy","p") if you want to smooth pressure too
-    side='+',                 # use '+' if Ω = {φ>0}, '-' if Ω = {φ<0}
-    band_width=0.5,           # in units of h
-    tau=5.0,
-    skip_dofs=dirichlet_dofs
-)
+
 t0 = time.time()
 
 solver = NewtonSolver(
@@ -1077,10 +879,12 @@ print(f"Solver setup time: {t1 - t0:.2f} seconds")
 #     bounds_by_field={"ux": (-Ucap, Ucap), "uy": (-Ucap, Ucap)},
 # )
 # primary unknowns
-functions      = [u_k, p_k]
-prev_functions = [u_n, p_n]
-# functions      = [u_k, p_k, lambda_k]
-# prev_functions = [u_n, p_n, lambda_n]
+if mean_pressure_constraint:
+    functions      = [u_k, p_k, lambda_k]
+    prev_functions = [u_n, p_n, lambda_n]
+else:
+    functions      = [u_k, p_k]
+    prev_functions = [u_n, p_n]
 # solver = AdamNewtonSolver(
 #     residual_form, jacobian_form,
 #     dof_handler=dof_handler,
@@ -1095,7 +899,7 @@ prev_functions = [u_n, p_n]
 #     bcs=bcs, bcs_homog=bcs_homog,
 #     newton_params=NewtonParameters(newton_tol=1e-6),
 # )
-from petsc4py import PETSc
+# from petsc4py import PETSc
 def vi_clip(step, bcs_now, funs, prev_funs):
     if step < 1:
         return
@@ -1129,31 +933,59 @@ def vi_clip(step, bcs_now, funs, prev_funs):
 
 t2 = time.time()
 
+
+
 def plotting():
     t3 = time.time()
     print(f"Total solve time: {t3 - t2:.2f} seconds")
     print(f"Total setup + solve time: {t3 - t0:.2f} seconds")
 
     import matplotlib.pyplot as plt
-    # if ENABLE_PLOTS:
+    fig, axes = plt.subplots(3, 2, figsize=(12, 9), sharex=True)
     offset = 5
-    plt.plot(histories["time"][offset:], histories["cd"][offset:], label="C_D", marker='o')
-    plt.ylabel('$C_D$')
-    plt.xlabel('Time')
-    plt.title('Turek-Schafer Benchmark: Drag Coefficient over Time')
+    # --- Row 0: Coefficients ---
+    # Subplot (0, 0) for Drag Coefficient
+    axes[0, 0].plot(histories["time"][offset:], histories["cd"][offset:], label="Cd", color="blue")
+    axes[0, 0].set_ylabel("Drag Coefficient (Cd)")
+    axes[0, 0].grid(True, linestyle=":", linewidth=0.5)
+    axes[0, 0].set_title("Drag Coefficient over Time")
 
-    plt.figure()
-    plt.plot(histories["time"][offset:], histories["cl"][offset:], label="C_L", marker='o')
-    plt.ylabel('$C_L$')
-    plt.xlabel('Time')
-    plt.title('Turek-Schafer Benchmark: Lift Coefficient over Time')
-    plt.savefig((Path(output_dir)/Path("turek_cl_cd.png")))
-    plt.figure()
-    plt.plot(histories["time"][offset:], histories["dp"][offset:], label="Δp", marker='o')
-    plt.ylabel('Δp')
-    plt.xlabel('Time')
-    plt.title('Turek-Schafer Benchmark: Pressure Difference over Time')
-    plt.savefig((Path(output_dir)/Path("turek_dp.png")))
+    # Subplot (0, 1) for Lift Coefficient
+    axes[0, 1].plot(histories["time"][offset:], histories["cl"][offset:], label="Cl", color="green")
+    axes[0, 1].set_ylabel("Lift Coefficient (Cl)")
+    axes[0, 1].grid(True, linestyle=":", linewidth=0.5)
+    axes[0, 1].set_title("Lift Coefficient over Time")
+
+    # --- Row 1: Forces ---
+    # Subplot (1, 0) for Drag Force
+    axes[1, 0].plot(histories["time"][offset:], histories["drag"][offset:], label="Drag", color="red")
+    axes[1, 0].set_ylabel("Drag Force")
+    axes[1, 0].grid(True, linestyle=":", linewidth=0.5)
+    axes[1, 0].set_title("Drag Force over Time")
+
+    # Subplot (1, 1) for Lift Force
+    axes[1, 1].plot(histories["time"][offset:], histories["lift"][offset:], label="Lift", color="purple")
+    axes[1, 1].set_ylabel("Lift Force")
+    axes[1, 1].grid(True, linestyle=":", linewidth=0.5)
+    axes[1, 1].set_title("Lift Force over Time")
+
+    # --- Row 2: Pressure Drop ---
+    # Subplot (2, 0) for Pressure Drop
+    axes[2, 0].plot(histories["time"][offset:], histories["dp"][offset:], label="Δp", color="orange")
+    axes[2, 0].set_xlabel("Time")
+    axes[2, 0].set_ylabel("Pressure Drop (Δp)")
+    axes[2, 0].grid(True, linestyle=":", linewidth=0.5)
+    axes[2, 0].set_title("Pressure Drop over Time")
+
+    # Subplot (2, 1) is unused, so we turn it off
+    fig.delaxes(axes[2, 1])
+
+    # Add a main title to the entire figure
+    fig.suptitle("Flow Diagnostics for Turek Benchmark", fontsize=16)
+
+    # Adjust layout to prevent titles and labels from overlapping
+    fig.tight_layout(rect=[0, 0, 1, 0.96]) # rect leaves space for suptitle
+    plt.savefig((Path(output_dir)/Path("turek_results.png")))
     plt.show()
 
 

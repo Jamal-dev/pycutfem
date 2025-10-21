@@ -2791,7 +2791,8 @@ class NumbaCodeGen:
                     # 3. LHS block:   scalar trial/test  *  Identity   →  grad structure trial/test ex p * Id
                     # -----------------------------------------------------------------
                     elif (a.role in {"trial", "test"} and not a.is_vector and not a.is_gradient and not a.is_hessian and a.shape[0] == 1
-                          and b.role == "const" and b.is_gradient):
+                          and b.role == "const" and b.is_gradient and b.shape==(2,2)):
+                        # a.shape (1,n) while b.shape (2,2) for 2D, here b is identity --> (2,n,2)
                         role = 'trial' if a.role == 'trial' else 'test'
                         body_lines.append("# Product: scalar Trial/Test × Identity → grad structure Trial/Test")
                         body_lines += [
@@ -2805,7 +2806,8 @@ class NumbaCodeGen:
                                             is_gradient=True, is_hessian=False, field_names=a.field_names,
                                             parent_name=a.parent_name, side=a.side, field_sides=a.field_sides))
                     elif (b.role in {"trial", "test"} and not b.is_vector and not b.is_gradient and not b.is_hessian and b.shape[0] == 1
-                          and a.role == "const" and a.is_gradient):
+                          and a.role == "const" and a.is_gradient and a.shape==(2,2)):
+                        # b.shape (1,n) while a.shape (2,2) for 2D, here a is identity --> (2,n,2)
                         role = 'trial' if b.role == 'trial' else 'test'
                         body_lines.append("# Product: Identity × scalar Trial/Test → grad structure Trial/Test")
                         body_lines += [
@@ -2855,10 +2857,11 @@ class NumbaCodeGen:
                     # 1. RHS p * I:   trace(test)  * identity
                     #                (u_test)                ·  φ_v
                     # -----------------------------------------------------------------
-                    elif (a.role in {"test"} and b.role == "const" and b.is_gradient
+                    elif (a.role in {"test", "trial"} and b.role == "const" and b.is_gradient
                             and not a.is_vector and not a.is_gradient and not a.is_hessian
                             and b.shape==(2,2)
                             ):
+                        role = 'test' if a.role == 'test' else 'trial'
                         if len(a.shape) == 2:
                             n_locs = a.shape[1]
                         elif len(a.shape) == 1:
@@ -2882,7 +2885,7 @@ class NumbaCodeGen:
                             f"        {res_var}[i, :, j] = {a.var_name} * {b.var_name}[i, j]",
                         ]
                         field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=a, strict=False)
-                        stack.append(StackItem(var_name=res_var, role='test',
+                        stack.append(StackItem(var_name=res_var, role=role,
                                             shape=(b.shape[0], n_locs, b.shape[1]), is_vector =False, # Use the string 'n_locs' if its value is determined at runtime
                                             is_gradient=True, is_hessian=False,
                                             field_names=field_names, parent_name=parent_name, side=side,
