@@ -70,12 +70,45 @@ def export_vtk(
                 raise ValueError(f"{name}: unexpected array shape {arr.shape}")
             continue
 
-        # NEW: callable (x,y) -> value  -> evaluate at nodes
+        # NEW: callable defined on coordinates (analytic fields, level sets, ...)
         if callable(obj):
             xy = mesh.nodes_x_y_pos
-            vals = np.fromiter((obj(float(x), float(y)) for x, y in xy), count=num_nodes, dtype=float)
-            point_data[name] = vals
-            continue
+
+            def _eval_callable(f, x, y):
+                """Try f(x, y); fall back to f([x, y]) if signature differs."""
+                try:
+                    return f(x, y)
+                except TypeError:
+                    try:
+                        return f(np.array([x, y], dtype=float))
+                    except TypeError:
+                        return f((x, y))
+
+            first = _eval_callable(obj, float(xy[0, 0]), float(xy[0, 1]))
+            first_arr = np.asarray(first, dtype=float)
+
+            if first_arr.ndim == 0:
+                vals = np.empty(num_nodes, dtype=float)
+                vals[0] = float(first_arr)
+                for i, (x, y) in enumerate(xy[1:], start=1):
+                    vals[i] = float(_eval_callable(obj, float(x), float(y)))
+                point_data[name] = vals
+                continue
+
+            if first_arr.ndim == 1 and first_arr.size in (2, 3):
+                vec = np.zeros((num_nodes, 3), dtype=float)
+                vec[0, : first_arr.size] = first_arr
+                for i, (x, y) in enumerate(xy[1:], start=1):
+                    res = np.asarray(_eval_callable(obj, float(x), float(y)), dtype=float)
+                    if res.ndim != 1 or res.size != first_arr.size:
+                        raise ValueError(f"{name}: callable returned inconsistent vector shape {res.shape}")
+                    vec[i, : first_arr.size] = res
+                point_data[name] = vec
+                continue
+
+            raise ValueError(
+                f"{name}: callable result with shape {first_arr.shape} is not supported for VTK export"
+            )
 
         raise TypeError(f"{name}: unsupported data type {type(obj)}")
 

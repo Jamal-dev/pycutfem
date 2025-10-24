@@ -47,7 +47,7 @@ from pycutfem.ufl.expressions import (
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
     ElementWiseConstant, Derivative, Transpose,
     CellDiameter, NormalComponent,
-    Restriction, Power, Trace, Hessian, Laplacian
+    Restriction, Power, Trace, Determinant, Inverse, Hessian, Laplacian
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -162,6 +162,8 @@ class FormCompiler:
             Restriction: self._visit_Restriction,
             Power: self._visit_Power,
             Trace: self._visit_Trace,
+            Determinant: self._visit_Determinant,
+            Inverse: self._visit_Inverse,
             Hessian: self._visit_Hessian,
             Laplacian: self._visit_Laplacian
         }
@@ -744,6 +746,37 @@ class FormCompiler:
     
     def _visit_NormalComponent(self, n:NormalComponent):
         return self._visit_FacetNormal(FacetNormal())[n.idx]
+
+    def _materialize_matrix_value(self, tensor_value, node, op_name: str) -> np.ndarray:
+        """
+        Collapse a tensor expression result to a numeric 2×2 matrix.
+        Only function-valued gradients (or plain numpy arrays) are supported.
+        """
+        if isinstance(tensor_value, np.ndarray):
+            mat = np.asarray(tensor_value, dtype=float)
+        elif isinstance(tensor_value, GradOpInfo):
+            if tensor_value.role != "function":
+                raise TypeError(
+                    f"{op_name} is only defined for function-valued tensors at a quadrature point; "
+                    f"got role '{tensor_value.role}'."
+                )
+            data = tensor_value.data
+            if data.ndim == 3:
+                if tensor_value.coeffs is None:
+                    raise ValueError(
+                        f"{op_name} requires coefficient weights to collapse a function gradient."
+                    )
+                mat = np.einsum("knd,kn->kd", data, tensor_value.coeffs, optimize=True)
+            else:
+                mat = np.asarray(data, dtype=float)
+        else:
+            raise TypeError(
+                f"{op_name} expects a numeric tensor; got {type(tensor_value).__name__}."
+            )
+
+        if mat.shape != (2, 2):
+            raise ValueError(f"{op_name} expects a 2×2 matrix, got shape {mat.shape}.")
+        return np.asarray(mat, dtype=float)
     
     def _visit_Trace(self, node: Trace):
         """trace(A): sum of diagonal on the *first* and *last* axes for GradOpInfo.
@@ -796,11 +829,31 @@ class FormCompiler:
             else:
                 # test/trial: return (k,n) table of Laplacians
                 tr = A.data[..., 0, 0] + A.data[..., 1, 1]
-                return self._vecinfo(tr, role=A.role, node=node, field_names=A.field_names)
+            return self._vecinfo(tr, role=A.role, node=node, field_names=A.field_names)
 
         # VecOpInfo or other types are not meaningful for trace
         raise TypeError(f"Trace not implemented for {type(A)}"
                         f" for role '{A.role}' with shape {A.data.shape}.")
+
+    def _visit_Determinant(self, node: Determinant):
+        A = self._visit(node.A)
+        mat = self._materialize_matrix_value(A, node, "determinant")
+        det = mat[0, 0] * mat[1, 1] - mat[0, 1] * mat[1, 0]
+        return float(det)
+
+    def _visit_Inverse(self, node: Inverse):
+        A = self._visit(node.A)
+        mat = self._materialize_matrix_value(A, node, "inverse")
+        det = mat[0, 0] * mat[1, 1] - mat[0, 1] * mat[1, 0]
+        inv_det = 1.0 / (det + 1e-300)
+        inv_mat = np.array(
+            [
+                [mat[1, 1], -mat[0, 1]],
+                [-mat[1, 0], mat[0, 0]],
+            ],
+            dtype=float,
+        ) * inv_det
+        return inv_mat
     
     def _visit_Power(self, n: Power):
         """

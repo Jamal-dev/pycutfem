@@ -112,6 +112,16 @@ class Trace:
     pass
 
 @dataclass(frozen=True, slots=True)
+class Determinant:
+    """Instruction to compute the determinant of the tensor on top of the stack."""
+    pass
+
+@dataclass(frozen=True, slots=True)
+class Inverse:
+    """Instruction to compute the inverse of the tensor on top of the stack."""
+    pass
+
+@dataclass(frozen=True, slots=True)
 class Hessian:   pass
 
 @dataclass(frozen=True, slots=True)

@@ -6,13 +6,14 @@ from pycutfem.ufl.expressions import (
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
     ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter,
     NormalComponent, Restriction, Power as UFLPower, Trace as UFLTrace,
+    Determinant as UFLDeterminant, Inverse as UFLInverse,
     Hessian as UFLHessian, Laplacian as UFLLaplacian
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
     LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
-    CellDiameter, LoadFacetNormalComponent, CheckDomain, Trace,
+    CellDiameter, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse,
     Hessian as IRHessian, Laplacian as IRLaplacian
 )
 from dataclasses import replace
@@ -108,6 +109,14 @@ class IRGenerator:
             self._visit(node.A, side=side)
             # Then, append the instruction to take the trace of that tensor.
             self.ir_sequence.append(Trace())
+            return
+        if isinstance(node, UFLDeterminant):
+            self._visit(node.A, side=side)
+            self.ir_sequence.append(Determinant())
+            return
+        if isinstance(node, UFLInverse):
+            self._visit(node.A, side=side)
+            self.ir_sequence.append(Inverse())
             return
         
         if isinstance(node, (Sum, Sub, Prod, UflDiv, UFLPower)):

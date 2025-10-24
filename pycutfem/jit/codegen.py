@@ -7,7 +7,7 @@ from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
     BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
-    Trace, Hessian as IRHessian, Laplacian as IRLaplacian
+    Trace, Determinant, Inverse, Hessian as IRHessian, Laplacian as IRLaplacian
 )
 from pycutfem.jit.symbols import encode
 import numpy as np
@@ -1450,6 +1450,59 @@ class NumbaCodeGen:
                 else:
                     raise TypeError(f"Cannot take trace of an operand with shape {a.shape}. Must be a 2D or 3D tensor.")
             
+            elif isinstance(op, Determinant):
+                a = stack.pop()
+                if a.shape != (2, 2) or a.role not in ("value", "const"):
+                    raise NotImplementedError(
+                        "Determinant expects a 2x2 numeric tensor (role 'value' or 'const')."
+                    )
+                res_var = new_var("det2")
+                body_lines += [
+                    f"a00 = {a.var_name}[0, 0]",
+                    f"a01 = {a.var_name}[0, 1]",
+                    f"a10 = {a.var_name}[1, 0]",
+                    f"a11 = {a.var_name}[1, 1]",
+                    f"{res_var} = a00 * a11 - a01 * a10",
+                ]
+                stack.append(
+                    a._replace(
+                        var_name=res_var,
+                        role="value",
+                        shape=(),
+                        is_vector=False,
+                        is_gradient=False,
+                        is_hessian=False,
+                    )
+                )
+
+            elif isinstance(op, Inverse):
+                a = stack.pop()
+                if a.shape != (2, 2) or a.role not in ("value", "const"):
+                    raise NotImplementedError(
+                        "Inverse expects a 2x2 numeric tensor (role 'value' or 'const')."
+                    )
+                res_var = new_var("inv2")
+                body_lines += [
+                    f"a00 = {a.var_name}[0, 0]",
+                    f"a01 = {a.var_name}[0, 1]",
+                    f"a10 = {a.var_name}[1, 0]",
+                    f"a11 = {a.var_name}[1, 1]",
+                    "det = a00 * a11 - a01 * a10",
+                    "inv_det = 1.0 / (det + 1e-300)",
+                    f"{res_var} = np.empty((2, 2), dtype={self.dtype})",
+                    f"{res_var}[0, 0] =  a11 * inv_det",
+                    f"{res_var}[0, 1] = -a01 * inv_det",
+                    f"{res_var}[1, 0] = -a10 * inv_det",
+                    f"{res_var}[1, 1] =  a00 * inv_det",
+                ]
+                stack.append(
+                    a._replace(
+                        var_name=res_var,
+                        role=a.role,
+                        shape=(2, 2),
+                    )
+                )
+            
             # --- UNARY OPERATORS ---
             # ----------------------------------------------------------------------
             # ∇(·) operator
@@ -2190,6 +2243,35 @@ class NumbaCodeGen:
                                         shape=res_shape, is_vector=False, is_gradient=True,
                                         field_names=a.field_names, parent_name=a.parent_name,
                                         side=a.side, field_sides=a.field_sides or []))
+                # ---------------------------------------------------------------------
+                # dot(grad(Trial/Test), grad(Trial/Test)) and its transposed variants.
+                # ---------------------------------------------------------------------
+                # not sure about this role will be test
+                elif (a.role in {'trial', 'test'} and a.is_gradient and b.role in {'trial', 'test'} 
+                    and b.is_gradient 
+                    and a.shape==b.shape and a.shape[0] == a.shape[-1]): 
+                    role_a = "trial" if a.role == "trial" else "test"
+                    role_b = "trial" if b.role == "trial" else "test"
+                    k = a.shape[0]; n_locs = a.shape[1]; d = a.shape[2]
+                    
+                    # a: grad(du) or grad(du).T -> Trial function basis, shape (k, n, d)
+                    # b: grad(du) or grad(du).T -> Trial function basis, shape (k, n, d)
+
+                    body_lines.append(f"# dot(grad({role_a}), grad({role_b})) -> (k,n,k) tensor basis")
+                    body_lines += [
+                        f"n_vec_comps = {a.var_name}.shape[0]; n_locs = {a.var_name}.shape[1];",
+                        f"{res_var} = np.zeros((n_vec_comps, n_locs, n_vec_comps), dtype={self.dtype})",
+                        f"for n in range(n_locs):",
+                        f"    a_slice = np.ascontiguousarray({a.var_name}[:, n, :])",
+                        f"    b_slice = np.ascontiguousarray({b.var_name}[:, n, :])",
+                        f"    {res_var}[:, n, :] = a_slice @ b_slice",
+                    ]
+                    
+                    res_shape = (k, n_locs, d)
+                    stack.append(StackItem(var_name=res_var, role="test",
+                                        shape=res_shape, is_vector=False, is_gradient=True,
+                                        field_names=a.field_names, parent_name=a.parent_name,
+                                        side=a.side, field_sides=a.field_sides or []))
 
                 # ---------------------------------------------------------------------
                 # dot(grad(Function), grad(Trial/Test)) and its transposed variants.
@@ -2791,7 +2873,7 @@ class NumbaCodeGen:
                     # 3. LHS block:   scalar trial/test  *  Identity   →  grad structure trial/test ex p * Id
                     # -----------------------------------------------------------------
                     elif (a.role in {"trial", "test"} and not a.is_vector and not a.is_gradient and not a.is_hessian and a.shape[0] == 1
-                          and b.role == "const" and b.is_gradient and b.shape==(2,2)):
+                          and b.role in {"const","value"} and b.is_gradient and b.shape==(2,2)):
                         # a.shape (1,n) while b.shape (2,2) for 2D, here b is identity --> (2,n,2)
                         role = 'trial' if a.role == 'trial' else 'test'
                         body_lines.append("# Product: scalar Trial/Test × Identity → grad structure Trial/Test")
@@ -2806,7 +2888,7 @@ class NumbaCodeGen:
                                             is_gradient=True, is_hessian=False, field_names=a.field_names,
                                             parent_name=a.parent_name, side=a.side, field_sides=a.field_sides))
                     elif (b.role in {"trial", "test"} and not b.is_vector and not b.is_gradient and not b.is_hessian and b.shape[0] == 1
-                          and a.role == "const" and a.is_gradient and a.shape==(2,2)):
+                          and a.role in {"const","value"} and a.is_gradient and a.shape==(2,2)):
                         # b.shape (1,n) while a.shape (2,2) for 2D, here a is identity --> (2,n,2)
                         role = 'trial' if b.role == 'trial' else 'test'
                         body_lines.append("# Product: Identity × scalar Trial/Test → grad structure Trial/Test")
@@ -2857,7 +2939,7 @@ class NumbaCodeGen:
                     # 1. RHS p * I:   trace(test)  * identity
                     #                (u_test)                ·  φ_v
                     # -----------------------------------------------------------------
-                    elif (a.role in {"test", "trial"} and b.role == "const" and b.is_gradient
+                    elif (a.role in {"test", "trial"} and b.role in {"const", "value"} and b.is_gradient
                             and not a.is_vector and not a.is_gradient and not a.is_hessian
                             and b.shape==(2,2)
                             ):
@@ -3113,7 +3195,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = False
+            DEBUG: bool = True
         ):
         """
         Build complete kernel source code with parallel assembly.

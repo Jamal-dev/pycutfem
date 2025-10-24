@@ -12,6 +12,7 @@ import scipy.sparse.linalg as sp_la
 import matplotlib.pyplot as plt
 import numba
 import os
+from pathlib import Path
 
 # --- Numba configuration ---
 # try:
@@ -36,9 +37,12 @@ from pycutfem.ufl.expressions import (
     Function, VectorFunction, Constant, grad, inner, dot, div, jump, avg, FacetNormal, CellDiameter
 )
 from pycutfem.ufl.measures import dx, dS, dGhost, dInterface
-from pycutfem.ufl.forms import BoundaryCondition, Equation
+from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters
 from pycutfem.ufl.compilers import FormCompiler
+from pycutfem.io.vtk import export_vtk
+from pycutfem.fem import transform
+
 
 
 # In[2]:
@@ -49,19 +53,22 @@ from pycutfem.ufl.compilers import FormCompiler
 # ============================================================================
 print("--- Setting up the Turek benchmark (2D-2) for flow around a cylinder ---")
 
+ENABLE_PLOTS = False  # Toggle to True to generate diagnostic plots during post-processing
+
 # --- Geometry and Fluid Properties ---
 H = 0.41  # Channel height
 L = 2.2   # Channel length
 D = 0.1   # Cylinder diameter
 c_x, c_y = 0.2, 0.2  # Cylinder center
 rho_f = 1.0  # Density for fluid
-rho_s = 1.0  # Density for solid
+rho_s = 1000.0  # Density for solid
 mu_f = 1e-3  # Viscosity for fluid
-U_mean = 1.0 # Mean inflow velocity
+U_max = 1.0 # Maximum inflow velocity
+U_mean = 3.0/2.0 * U_max # Mean inflow velocity
 # Lame coefficients for solid
 _lambda_s = 0.5e6 # Lame's first parameter for solid
 _mu_s = 2.0e6   # Lame's second parameter for solid
-Re = rho_f * U_mean * D / mu_f
+Re = rho_f * U_max * D / mu_f
 print(f"Reynolds number (Re): {Re:.2f}")
 
 
@@ -72,7 +79,7 @@ from pycutfem.utils.adaptive_mesh_ls_numba import structured_quad_levelset_adapt
 # from pycutfem.utils.adaptive_mesh import structured_quad_levelset_adaptive
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-NX, NY = 20, 20
+NX, NY = 40, 25
 # NX, NY = 50, 60
 poly_order = 2
 level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
@@ -157,6 +164,11 @@ print(f"Number of solid elements: {solid_domain.cardinality()}")
 print(f"Number of solid ghost edges: {solid_ghost_edges.cardinality()}")
 print(f"Number of fluid ghost edges: {fluid_ghost_edges.cardinality()}")
 
+output_dir = "turek_fsi_linear_solid_results"
+os.makedirs(output_dir, exist_ok=True)
+step_counter = 0
+histories = {"time": [], "cd": [], "cl": [], "drag": [], "lift": [], "dp": []}
+
 
 # In[ ]:
 
@@ -193,7 +205,7 @@ local_index = np.argmin(distances)
 # 5. Get the global ID and actual coordinates of that specific pressure node.
 closest_p_node_id = pin_node_ids[local_index]
 actual_pin_coords = mesh.nodes_x_y_pos[closest_p_node_id]
-print(f"Pinning pressure at the node closest to {target_point}, found at {actual_pin_coords}")
+print(f"Pinning solid velocity and solid displacement at the node closest to {target_point}, found at {actual_pin_coords}")
 for field in ['vs_neg_x', 'vs_neg_y', 'd_neg_x', 'd_neg_y']:
     name = f'pinning_{field}'
     dof_handler.tag_dof_by_locator(
@@ -220,9 +232,10 @@ print(f'Total dirchlet dofs: {len(dof_handler.get_dirichlet_data(bcs))}')
 
 
 from pycutfem.io.visualization import plot_mesh_2
-fig, ax = plt.subplots(figsize=(15, 30))
-plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True, 
-              plot_nodes=False, elem_tags=False, edge_colors=True, plot_interface=False,resolution=300)
+if ENABLE_PLOTS:
+    fig, ax = plt.subplots(figsize=(15, 30))
+    plot_mesh_2(mesh, ax=ax, level_set=level_set, show=True,
+                  plot_nodes=False, elem_tags=False, edge_colors=True, plot_interface=False, resolution=300)
 
 
 # In[ ]:
@@ -277,13 +290,14 @@ dof_handler.apply_bcs(bcs, uf_n, pf_n, us_n, disp_n)
 # In[10]:
 
 
-uf_n.plot()
+if ENABLE_PLOTS:
+    uf_n.plot()
 
 
 # In[ ]:
 
 
-from pycutfem.ufl.expressions import Derivative, FacetNormal, trace, Jump, Hessian
+from pycutfem.ufl.expressions import Derivative, FacetNormal, Pos, Neg, Grad, Dot, trace, Jump, Hessian
 n = FacetNormal()                    # vector expression (n_x, n_y)
 
 def _dn(expr):
@@ -344,7 +358,7 @@ else:
                             metadata={"q":qvol,'derivs': {(0,1),(1,0)}})  # ghost solid surface
 
 cell_h  = CellDiameter() # length‑scale per element
-beta_N  = Constant(20.0 * poly_order**2)      # Nitsche penalty (tweak)
+beta_N  = Constant(80.0 * poly_order* (poly_order + 1))      # Nitsche penalty (tweak)
 
 def epsilon_f(u):
     return 0.5 * (grad(u) + grad(u).T)
@@ -358,13 +372,14 @@ def solid_stress(u):
     return 2.0 * mu_s * epsilon_s(u) + lambda_s * trace(epsilon_s(u)) * I2
 
 def traction_fluid(u_vec, p_scal):
-    return -2.0 * mu_f_const * dot(epsilon_f(u_vec), n) + p_scal * n
+    return 2.0 * mu_f_const * dot(epsilon_f(u_vec), n) - p_scal * n
+
 
 def traction_solid(disp):
     return dot(solid_stress(disp), n)
 
-kappa_pos = Constant(1.0)
-kappa_neg = Constant(1.0)
+kappa_pos = Constant(0.5)
+kappa_neg = Constant(0.5)
 
 jump_vel_trial = du_f - du_s
 jump_vel_test = test_vel_f - test_vel_s
@@ -372,57 +387,57 @@ jump_vel_res = uf_k - us_k
 
 avg_flux_trial = (
     kappa_pos * traction_fluid(du_f, dp_f)
-    + kappa_neg * traction_solid(ddisp_s)
+    - kappa_neg * traction_solid(ddisp_s)
 )
 
 avg_flux_test = (
-    kappa_pos * traction_fluid(test_vel_f, test_q_f)
-    + kappa_neg * traction_solid(test_disp_s)
+    kappa_pos * traction_fluid(test_vel_f, -test_q_f)
+    - kappa_neg * traction_solid(test_vel_s)
 )
 
 avg_flux_res = (
     kappa_pos * traction_fluid(uf_k, pf_k)
-    + kappa_neg * traction_solid(disp_k)
+    - kappa_neg * traction_solid(disp_k)
 )
 
 # --- Jacobian contribution on Γsolid --------------------------------
 J_int = (
-    dot(avg_flux_trial, jump_vel_test)
-    + dot(avg_flux_test, jump_vel_trial)
+    - dot(avg_flux_trial, jump_vel_test)
+    - dot(avg_flux_test, jump_vel_trial)
     + (beta_N * mu_f_const / cell_h) * dot(jump_vel_trial, jump_vel_test)
 ) * dΓ
 
 # --- Residual contribution on Γsolid --------------------------------
 R_int = (
-    dot(avg_flux_res, jump_vel_test)
-    + dot(avg_flux_test, jump_vel_res)
+    -dot(avg_flux_res, jump_vel_test)
+    - dot(avg_flux_test, jump_vel_res)
     + (beta_N * mu_f_const / cell_h) * dot(jump_vel_res, jump_vel_test)
 ) * dΓ
 
 # volume -------------------fluid--------------------------------
-a_vol_f = ( rho_f/dt*dot(du_f,test_vel_f)
-          + theta*rho_f*dot(dot(grad(uf_k), du_f), test_vel_f)
-          + theta*rho_f*dot(dot(grad(du_f), uf_k), test_vel_f)
-          + theta*mu_f*inner(grad(du_f), grad(test_vel_f))
+a_vol_f = ( rho_f_const/dt*dot(du_f,test_vel_f)
+          + theta*rho_f_const*dot(dot(grad(uf_k), du_f), test_vel_f)
+          + theta*rho_f_const*dot(dot(grad(du_f), uf_k), test_vel_f)
+          + theta*mu_f_const*inner(grad(du_f), grad(test_vel_f))
           - dp_f*div(test_vel_f) + test_q_f*div(du_f) ) * dx_fluid
 
 
-r_vol_f = ( rho_f*dot(uf_k-uf_n, test_vel_f)/dt
-          + theta*rho_f*dot(dot(grad(uf_k), uf_k), test_vel_f)
-          + (1-theta)*rho_f*dot(dot(grad(uf_n), uf_n), test_vel_f)
-          + theta*mu_f*inner(grad(uf_k), grad(test_vel_f))
-          + (1-theta)*mu_f*inner(grad(uf_n), grad(test_vel_f))
+r_vol_f = ( rho_f_const*dot(uf_k-uf_n, test_vel_f)/dt
+          + theta*rho_f_const*dot(dot(grad(uf_k), uf_k), test_vel_f)
+          + (1-theta)*rho_f_const*dot(dot(grad(uf_n), uf_n), test_vel_f)
+          + theta*mu_f_const*inner(grad(uf_k), grad(test_vel_f))
+          + (1-theta)*mu_f_const*inner(grad(uf_n), grad(test_vel_f))
           - pf_k*div(test_vel_f) + test_q_f*div(uf_k) ) * dx_fluid
 
 # volume -------------------solid--------------------------------
 a_vol_s = (
-    rho_s / dt * dot(du_s, test_vel_s)
+    rho_s_const / dt * dot(du_s, test_vel_s)
     + theta * inner(solid_stress(ddisp_s), epsilon_s(test_vel_s))
 ) * dx_solid
 
 
 r_vol_s = (
-    rho_s / dt * dot(us_k - us_n, test_vel_s)
+    rho_s_const / dt * dot(us_k - us_n, test_vel_s)
     + theta * inner(solid_stress(disp_k), epsilon_s(test_vel_s))
     + (1 - theta) * inner(solid_stress(disp_n), epsilon_s(test_vel_s))
 ) * dx_solid
@@ -508,6 +523,161 @@ residual_form  = r_vol_f + R_int + r_vol_s + r_svc + r_stab
 # residual_form  = r_vol_f + r_vol_s + r_svc + r_stab
 
 
+def traction_dot_dir(u_vec, p_scal, v_dir, side="+"):
+    """Return (σ(u, p)·n)·v_dir using traces on the requested side."""
+    if side == "+":
+        du = Pos(Grad(u_vec))
+        p = Pos(p_scal)
+    else:
+        du = Neg(Grad(u_vec))
+        p = Neg(p_scal)
+
+    a = Dot(du, n)
+    b = Dot(du.T, n)
+    traction = mu_f_const * (a + b) - p * n
+    return Dot(traction, v_dir)
+
+
+def _evaluate_field_at_point(dh, mesh, field, point):
+    """Evaluate scalar Function `field` at the given physical point."""
+    x, y = point
+    xy = np.asarray(point)
+
+    eid_found = None
+    for elem in mesh.elements_list:
+        node_ids = elem.nodes
+        coords = mesh.nodes_x_y_pos[list(node_ids)]
+        if not (coords[:, 0].min() <= x <= coords[:, 0].max() and coords[:, 1].min() <= y <= coords[:, 1].max()):
+            continue
+        try:
+            xi, eta = transform.inverse_mapping(mesh, elem.id, xy)
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+        if -1.00001 <= xi <= 1.00001 and -1.00001 <= eta <= 1.00001:
+            eid_found = elem.id
+            break
+
+    if eid_found is None:
+        return np.nan
+
+    me = dh.mixed_element
+    field_name = field.field_name
+    phi = me.basis(field_name, xi, eta)[me.slice(field_name)]
+    gdofs = dh.element_maps[field_name][eid_found]
+    vals = field.get_nodal_values(gdofs)
+    return float(phi @ vals)
+
+
+def save_solution(funcs, deformation=None):
+    """Export solution and update drag/lift/pressure diagnostics."""
+    global step_counter
+
+    u_f = funcs[0].copy()
+    p_f = funcs[1].copy()
+    u_s = funcs[2].copy()
+    disp = funcs[3].copy()
+
+    filename = os.path.join(output_dir, f"solution_{step_counter:04d}.vtu")
+    export_vtk(
+        filename=filename,
+        mesh=mesh,
+        dof_handler=dof_handler,
+        functions={
+            "velocity_fluid": u_f,
+            "pressure_fluid": p_f,
+            "velocity_solid": u_s,
+            "displacement_solid": disp,
+            "level_set": level_set,
+        },
+    )
+
+    dGamma = dInterface(defined_on=cut_domain,
+                        level_set=level_set,
+                        metadata={"q": 11, 'derivs': {(0, 0), (0, 1), (1, 0)}},
+                        deformation=deformation)
+
+    e_x = Constant(np.array([1.0, 0.0]), dim=1)
+    e_y = Constant(np.array([0.0, 1.0]), dim=1)
+
+    integrand_drag = traction_dot_dir(u_f, p_f, e_x)
+    integrand_lift = traction_dot_dir(u_f, p_f, e_y)
+
+    I_drag = integrand_drag * dGamma
+    I_lift = integrand_lift * dGamma
+
+    drag_hook = {I_drag.integrand: {"name": "FD"}}
+    lift_hook = {I_lift.integrand: {"name": "FL"}}
+
+    res_Fd = assemble_form(Equation(None, I_drag), dof_handler=dof_handler, bcs=[], assembler_hooks=drag_hook, backend="python")
+    res_Fl = assemble_form(Equation(None, I_lift), dof_handler=dof_handler, bcs=[], assembler_hooks=lift_hook, backend="python")
+
+    F_D = float(res_Fd["FD"])
+    F_L = float(res_Fl["FL"])
+
+    coeff = 2.0 / (rho_f * (U_mean ** 2) * D)
+    C_D = coeff * F_D
+    C_L = coeff * F_L
+
+    pA = _evaluate_field_at_point(dof_handler, mesh, p_f, (c_x - D / 2 - 0.01, c_y))
+    pB = _evaluate_field_at_point(dof_handler, mesh, p_f, (c_x + D / 2 + 0.01, c_y))
+    dp = pA - pB
+
+    print(
+        f"[step {step_counter:4d}]  FD={F_D:.6e}  FL={F_L:.6e}  "
+        f"CD={C_D:.6f}  CL={C_L:.6f}  Δp={dp:.6f}"
+    )
+
+    histories["cd"].append(C_D)
+    histories["cl"].append(C_L)
+    histories["dp"].append(dp)
+    histories["time"].append(step_counter * dt.value)
+    histories["drag"].append(F_D)
+    histories["lift"].append(F_L)
+
+    step_counter += 1
+
+
+def plotting():
+    # if not ENABLE_PLOTS or not histories["time"]:
+    #     return
+
+    fig, axes = plt.subplots(3, 2, figsize=(12, 9), sharex=True)
+    offset = min(5, len(histories["time"]))
+
+    axes[0, 0].plot(histories["time"][offset:], histories["cd"][offset:], label="Cd", color="blue")
+    axes[0, 0].set_ylabel("Drag Coefficient (Cd)")
+    axes[0, 0].grid(True, linestyle=":", linewidth=0.5)
+    axes[0, 0].set_title("Drag Coefficient over Time")
+
+    axes[0, 1].plot(histories["time"][offset:], histories["cl"][offset:], label="Cl", color="green")
+    axes[0, 1].set_ylabel("Lift Coefficient (Cl)")
+    axes[0, 1].grid(True, linestyle=":", linewidth=0.5)
+    axes[0, 1].set_title("Lift Coefficient over Time")
+
+    axes[1, 0].plot(histories["time"][offset:], histories["drag"][offset:], label="Drag", color="red")
+    axes[1, 0].set_ylabel("Drag Force")
+    axes[1, 0].grid(True, linestyle=":", linewidth=0.5)
+    axes[1, 0].set_title("Drag Force over Time")
+
+    axes[1, 1].plot(histories["time"][offset:], histories["lift"][offset:], label="Lift", color="purple")
+    axes[1, 1].set_ylabel("Lift Force")
+    axes[1, 1].grid(True, linestyle=":", linewidth=0.5)
+    axes[1, 1].set_title("Lift Force over Time")
+
+    axes[2, 0].plot(histories["time"][offset:], histories["dp"][offset:], label="Δp", color="orange")
+    axes[2, 0].set_xlabel("Time")
+    axes[2, 0].set_ylabel("Pressure Drop (Δp)")
+    axes[2, 0].grid(True, linestyle=":", linewidth=0.5)
+    axes[2, 0].set_title("Pressure Drop over Time")
+
+    fig.delaxes(axes[2, 1])
+    fig.suptitle("Flow Diagnostics for Turek FSI", fontsize=16)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig_path = Path(output_dir) / "turek_fsi_diagnostics.png"
+    fig.savefig(fig_path, dpi=150)
+    plt.show()
+
+
 
 
 
@@ -539,14 +709,18 @@ dof_handler.apply_bcs(bcs, uf_n, pf_n, us_n, disp_n)
 dof_handler.apply_bcs(bcs, uf_k, pf_k, us_k, disp_k)
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
-time_params = TimeStepperParameters(dt=dt.value,max_steps=36 ,stop_on_steady=True, steady_tol=1e-6, theta= theta.value)
+time_params = TimeStepperParameters(dt=dt.value,
+                                    max_steps=36 ,
+                                    stop_on_steady=True, 
+                                    steady_tol=1e-6, theta= theta.value)
 
 solver = NewtonSolver(
     residual_form, jacobian_form,
     dof_handler=dof_handler,
     mixed_element=mixed_element,
     bcs=bcs, bcs_homog=bcs_homog,
-    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True, max_newton_iter=30),
+    postproc_timeloop_cb=save_solution,
 )
 # primary unknowns
 functions      = [uf_k, pf_k, us_k, disp_k]
@@ -566,18 +740,16 @@ prev_functions = [uf_n, pf_n, us_n, disp_n]
 #     newton_params=NewtonParameters(newton_tol=1e-6),
 # )
 
-
-
-solver.solve_time_interval(functions=functions,
-                           prev_functions= prev_functions,
-                           time_params=time_params,)
-
-
-# In[ ]:
-
-
-uf_n.plot(kind="streamline",
-         density=4.0,
-         linewidth=0.8,
-         cmap="plasma",
-         title="Turek-Schafer",background = False)
+try:
+    save_solution(functions)
+    solver.solve_time_interval(
+        functions=functions,
+        prev_functions=prev_functions,
+        time_params=time_params,
+    )
+    print("Simulation run successfully ...")
+except Exception as exc:
+    print("Solver failed:", exc)
+finally:
+    if ENABLE_PLOTS:
+        plotting()

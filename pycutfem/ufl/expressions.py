@@ -69,6 +69,11 @@ class Expression:
         if not isinstance(other, Expression): other = Constant(other)
         return Div(self, other)
 
+    def __rtruediv__(self, other):
+        if not isinstance(other, Expression):
+            other = Constant(other)
+        return Div(other, self)
+
     def __neg__(self): return Prod(Constant(-1.0), self)
     def __hash__(self):
         return id(self)
@@ -1221,7 +1226,7 @@ class Integral(Expression):
         return Equation(Form([self]), other)
 
 class Dot(Expression):
-    def __init__(self, a, b): self.a, self.b = a, b
+    def __init__(self, a, b): self.a, self.b = a, b; 
     def __repr__(self): return f"Dot({self.a!r}, {self.b!r})"
 
 
@@ -1261,9 +1266,33 @@ class Trace(Expression):
     def __repr__(self):
         return f"Trace({self.A!r})"
 
+class Determinant(Expression):
+    """Symbolic determinant of a tensor expression."""
+    def __init__(self, A: Expression):
+        super().__init__()
+        self.A = A
+    def __repr__(self):
+        return f"Determinant({self.A!r})"
+
+class Inverse(Expression):
+    """Symbolic inverse of a tensor expression."""
+    def __init__(self, A: Expression):
+        super().__init__()
+        self.A = A
+    def __repr__(self):
+        return f"Inverse({self.A!r})"
+
 def trace(A):
     """Helper function to create a Trace expression."""
     return Trace(A)
+
+def det(A):
+    """Helper function to create a Determinant expression."""
+    return Determinant(A)
+
+def inv(A):
+    """Helper function to create an Inverse expression."""
+    return Inverse(A)
 
 # --- Helper functions to create operator instances ---
 def grad(v): return Grad(v)
