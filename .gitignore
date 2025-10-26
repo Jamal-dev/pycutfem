@@ -203,4 +203,4 @@ examples/*_results/
 pycutfem/solvers/giant/*
 *_results/
 scripts/
-
+.pycutfem_cache/

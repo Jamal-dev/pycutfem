@@ -20,7 +20,7 @@ from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner, 
-    dot, div, trace, Hessian, Laplacian, FacetNormal
+    dot, div, trace, Hessian, Laplacian, FacetNormal, Identity
 )
 from pycutfem.ufl.measures import dx, dInterface, dS
 from pycutfem.ufl.forms import assemble_form
@@ -153,6 +153,8 @@ def setup_problems():
           'dt': Constant(0.1,dim=0), 
           'theta': Constant(0.5,dim=0), 
           'mu': Constant(1.0e-2,dim=0),
+          'lambda_s': Constant(0.5e6, dim=0),
+          'mu_s': Constant(2.0e6, dim=0),
           'normal': FacetNormal()}
     
     mesh_fx = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, nx, ny, dolfinx.mesh.CellType.quadrilateral)
@@ -161,7 +163,15 @@ def setup_problems():
     P1_el = basix.ufl.element("Lagrange", 'quadrilateral', 1)
     W_el = mixed_element([P2_el, P1_el])
     W = dolfinx.fem.functionspace(mesh_fx, W_el)
-    fenicsx = {'W': W, 'rho': dolfinx.fem.Constant(mesh_fx, 1.0), 'dt': dolfinx.fem.Constant(mesh_fx, 0.1), 'theta': dolfinx.fem.Constant(mesh_fx, 0.5), 'mu': dolfinx.fem.Constant(mesh_fx, 1.0e-2)}
+    fenicsx = {
+        'W': W,
+        'rho': dolfinx.fem.Constant(mesh_fx, 1.0),
+        'dt': dolfinx.fem.Constant(mesh_fx, 0.1),
+        'theta': dolfinx.fem.Constant(mesh_fx, 0.5),
+        'mu': dolfinx.fem.Constant(mesh_fx, 1.0e-2),
+        'lambda_s': dolfinx.fem.Constant(mesh_fx, 0.5e6),
+        'mu_s': dolfinx.fem.Constant(mesh_fx, 2.0e6),
+    }
     V, _ = W.sub(0).collapse()
     fenicsx['u_n'] = dolfinx.fem.Function(V, name="u_n")
     fenicsx['u_k_p_k'] = dolfinx.fem.Function(W, name="u_k_p_k")
@@ -455,9 +465,97 @@ if __name__ == '__main__':
     def nHn_fx(u, n):     # (nᵀ H n)
         return ufl.dot(n, ufl.dot(ufl.grad(ufl.grad(u)), n))
 
+    I2_pc = Identity(2)
+    I2_fx = ufl.Identity(2)
+
+    def F_pc(u):
+        return grad(u) + I2_pc
+
+    def F_fx(u):
+        return ufl.grad(u) + I2_fx
+
+    def delta_E_pc(w, u_ref):
+        F_ref = F_pc(u_ref)
+        grad_w = grad(w)
+        return 0.5 * (dot(grad_w.T, F_ref) + dot(F_ref.T, grad_w))
+
+    def delta_E_fx(w, u_ref):
+        F_ref = F_fx(u_ref)
+        grad_w = ufl.grad(w)
+        return 0.5 * (ufl.dot(grad_w.T, F_ref) + ufl.dot(F_ref.T, grad_w))
+
+    def E_pc(u):
+        F_ref = F_pc(u)
+        return 0.5 * (dot(F_ref.T, F_ref) - I2_pc)
+
+    def E_fx(u):
+        F_ref = F_fx(u)
+        return 0.5 * (ufl.dot(F_ref.T, F_ref) - I2_fx)
+
+    def S_pc(u):
+        E_ref = E_pc(u)
+        return pc['lambda_s'] * trace(E_ref) * I2_pc + Constant(2.0, dim=0) * pc['mu_s'] * E_ref
+
+    def S_fx(u):
+        E_ref = E_fx(u)
+        return fenicsx['lambda_s'] * ufl.tr(E_ref) * I2_fx + 2.0 * fenicsx['mu_s'] * E_ref
+
+    F_k_pc = F_pc(pc['u_k'])
+    F_n_pc = F_pc(pc['u_n'])
+    F_k_fx = F_fx(u_k_fx)
+    F_n_fx = F_fx(u_n_fx)
+
+    delta_E_trial_pc = delta_E_pc(pc['du'], pc['u_k'])
+    delta_E_test_k_pc = delta_E_pc(pc['v'], pc['u_k'])
+    delta_E_test_n_pc = delta_E_pc(pc['v'], pc['u_n'])
+    delta_E_trial_fx = delta_E_fx(du, u_k_fx)
+    delta_E_test_k_fx = delta_E_fx(v_fx, u_k_fx)
+    delta_E_test_n_fx = delta_E_fx(v_fx, u_n_fx)
+
+    C_delta_E_trial_pc = pc['lambda_s'] * trace(delta_E_trial_pc) * I2_pc + Constant(2.0, dim=0) * pc['mu_s'] * delta_E_trial_pc
+    C_delta_E_trial_fx = fenicsx['lambda_s'] * ufl.tr(delta_E_trial_fx) * I2_fx + 2.0 * fenicsx['mu_s'] * delta_E_trial_fx
+
+    S_k_pc = S_pc(pc['u_k'])
+    S_n_pc = S_pc(pc['u_n'])
+    S_k_fx = S_fx(u_k_fx)
+    S_n_fx = S_fx(u_n_fx)
+
+    delta_delta_E_test_pc = 0.5 * (dot(grad(pc['du']).T, grad(pc['v'])) + dot(grad(pc['v']).T, grad(pc['du'])))
+    delta_delta_E_test_fx = 0.5 * (ufl.dot(ufl.grad(du).T, ufl.grad(v_fx)) + ufl.dot(ufl.grad(v_fx).T, ufl.grad(du)))
+
+    # delta_delta_E_test_pc_2 = 0.5 * (dot(grad(pc['du']), grad(pc['v'])) )
+    # delta_delta_E_test_fx_2 = 0.5 * (ufl.dot(ufl.grad(du), ufl.grad(v_fx)) )
+    delta_delta_E_test_pc_2 = 0.5 * (dot(grad(pc['v']).T, grad(pc['du'])) )
+    delta_delta_E_test_fx_2 = 0.5 * (ufl.dot(ufl.grad(v_fx).T, ufl.grad(du)) )
+
+
 
     
     terms = {
+        "Solid Material Tangent": {
+            'pc': pc['theta'] * inner(C_delta_E_trial_pc, delta_E_test_k_pc) * dx(metadata={"q":6}),
+            'f_lambda': lambda deg: fenicsx['theta'] * ufl.inner(C_delta_E_trial_fx, delta_E_test_k_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Solid Geometric Tangent": {
+            'pc': pc['theta'] * inner(S_k_pc, delta_delta_E_test_pc) * dx(metadata={"q":6}),
+            'f_lambda': lambda deg: fenicsx['theta'] * ufl.inner(S_k_fx, delta_delta_E_test_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Solid Residual": {
+            'pc': (
+                pc['theta'] * inner(S_k_pc, delta_E_test_k_pc)
+                + (Constant(1.0, dim=0) - pc['theta']) * inner(S_n_pc, delta_E_test_n_pc)
+            ) * dx(metadata={"q":6}),
+            'f_lambda': lambda deg: (
+                fenicsx['theta'] * ufl.inner(S_k_fx, delta_E_test_k_fx)
+                + (1.0 - fenicsx['theta']) * ufl.inner(S_n_fx, delta_E_test_n_fx)
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
         "LHS Mass":          {'pc': pc['rho'] * dot(pc['du'], pc['v']) / pc['dt'] * dx(),                                    'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(du, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
         "LHS Diffusion":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']), grad(pc['v'])) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du), ufl.grad(v)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
         "LHS Advection 1":   {'pc':  ( dot(dot(grad(pc['du']), pc['u_k']), pc['v'])) * dx(metadata={"q":6}),           'f_lambda': lambda deg:  ufl.dot(ufl.dot(ufl.grad(du),u_k_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},

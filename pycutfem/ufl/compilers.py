@@ -47,7 +47,8 @@ from pycutfem.ufl.expressions import (
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
     ElementWiseConstant, Derivative, Transpose,
     CellDiameter, NormalComponent,
-    Restriction, Power, Trace, Determinant, Inverse, Hessian, Laplacian
+    Restriction, Power, Trace, Determinant, Inverse, Hessian, Laplacian,
+    Identity
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -165,7 +166,8 @@ class FormCompiler:
             Determinant: self._visit_Determinant,
             Inverse: self._visit_Inverse,
             Hessian: self._visit_Hessian,
-            Laplacian: self._visit_Laplacian
+    Laplacian: self._visit_Laplacian,
+    Identity: self._visit_Identity
         }
     
     @contextmanager
@@ -539,18 +541,18 @@ class FormCompiler:
             result = self._visit(n.operand)
             
             if isinstance(result, (VecOpInfo, GradOpInfo)):
-                # Use the overloaded multiplication to create a zeroed-out copy.
                 return result * 0.0
             elif isinstance(result, np.ndarray):
-                # For raw numpy arrays, just return a zero-filled array of the same shape.
                 return np.zeros_like(result)
-            else: # for scalars
+            elif result is None:
+                return 0.0
+            else:
                 return 0.0
 
     def _apply_restriction_mask(self, value, node):
         """Apply per-side union masks after evaluating a Restriction operand."""
         if value is None:
-            return value
+            return 0.0
 
         side = self._get_side()
         restriction_store = self.ctx.get('_restriction_masks')
@@ -979,6 +981,11 @@ class FormCompiler:
         if n.dim ==0:
             return float(n.value)
         return np.asarray(n.value)
+
+    def _visit_Identity(self, n: Identity):
+        data = np.eye(n.size, dtype=float)
+
+        return self._gradinfo(data, role="function", node=n, field_names=[])
     
     def _visit_FacetNormal(self, n: FacetNormal): 
         """Returns the normal vector from the context.""" 
@@ -1241,6 +1248,17 @@ class FormCompiler:
             return self._visit(Neg(Grad(op.operand)))
         if isinstance(op, Jump):
             return self._visit(Jump(Grad(op.u_pos), Grad(op.u_neg)))
+        if isinstance(op, Restriction):
+            depth = int(self.ctx.get('_restriction_mask_active', 0))
+            self.ctx['_restriction_mask_active'] = depth + 1
+            try:
+                result = self._visit(Grad(op.operand))
+            finally:
+                if depth == 0:
+                    self.ctx.pop('_restriction_mask_active', None)
+                else:
+                    self.ctx['_restriction_mask_active'] = depth
+            return self._apply_restriction_mask(result, op)
 
         # 1) role
         if isinstance(op, (TestFunction, VectorTestFunction)):
@@ -1492,7 +1510,14 @@ class FormCompiler:
 
     
     # ================= VISITORS: ALGEBRAIC ==========================
-    def _visit_Sum(self, n): return self._visit(n.a) + self._visit(n.b)
+    def _visit_Sum(self, n):
+        a = self._visit(n.a)
+        b = self._visit(n.b)
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a + b
     def _visit_Sub(self, n):
         a = self._visit(n.a)
         b = self._visit(n.b)
@@ -1516,6 +1541,9 @@ class FormCompiler:
         # if isinstance(A, VecOpInfo):
         #     # VecOpInfo stores (k, n) -> transpose to (n, k)
         #     return VecOpInfo(A.data.T, role=A.role)
+
+        if isinstance(A, VecOpInfo):
+            return A._with(A.data.T)
 
         raise TypeError(f"Transpose not implemented for {type(A)}")
 
@@ -1616,16 +1644,17 @@ class FormCompiler:
                 return a.dot_const(b)
             elif isinstance(b, VecOpInfo) and role_b == "vector" and role_a == None:
                 return b.dot_const(a)
-            elif isinstance(a, np.ndarray) and isinstance(b, GradOpInfo):
+            if isinstance(a, np.ndarray) and isinstance(b, GradOpInfo):
                 return b.left_dot(a)  # np.ndarray · ∇u
-            elif isinstance(b, np.ndarray) and isinstance(a, GradOpInfo):
+            if isinstance(b, np.ndarray) and isinstance(a, GradOpInfo):
                 return a.dot_vec(b)
             # ------------------------------------------------------------------
-            # Case:  Grad(Trial) · Grad(Function)       ∇u_trial · ∇u_k 
+            # Case:  Grad(Function/Test) · Grad(Function/Test)       ∇function/Test · ∇u_k/w_test 
             # ------------------------------------------------------------------
-            if isinstance(a, GradOpInfo) and  (a.role == "function") \
-            and isinstance(b, GradOpInfo) and (b.role == "function"):
+            if isinstance(a, GradOpInfo) and  (a.role in {"function", "test"}) \
+            and isinstance(b, GradOpInfo) and (b.role in {"function", "test"}):
                 return a.dot(b)
+        
             if isinstance(b, np.ndarray) and  (role_b == None) \
             and isinstance(a, np.ndarray) and (role_a == None):
                 return np.dot(a, b)  # plain numpy dot product
@@ -1794,6 +1823,8 @@ class FormCompiler:
                 return a.inner(b)
             if a.role == "trial" and b.role == "test":
                 return b.inner(a)
+            elif a.role == "function" and b.role in {"trial", "test", "mixed"}:
+                return a.inner(b)
             raise ValueError(f"Grad LHS expects test vs trial; got {a.role} vs {b.role}.")
 
         # ---- Vec LHS (e.g., Laplacian(LHS) yields VecOpInfo) ----
@@ -1810,8 +1841,9 @@ class FormCompiler:
             return float(np.einsum("..., ...->", a, b, optimize=True)) if a.ndim == b.ndim == 1 else np.tensordot(a, b, axes=([0], [0]))
 
 
-        raise TypeError(f"Unsupported inner product '{n.a} : {n.b}' "
+        raise TypeError(f"Unsupported inner product '{type(n.a)} : {type(n.b)}' "
                         f"for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)} "
+                        f"for shapes a={getattr(a, 'shape', None)}, b={getattr(b, 'shape', None)} "
                         f"and data shapes a={getattr(a, 'data', None)}, b={getattr(b, 'data', None)}")
 
     

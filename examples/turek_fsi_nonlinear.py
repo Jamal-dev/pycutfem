@@ -80,7 +80,8 @@ from pycutfem.utils.adaptive_mesh_ls_numba import structured_quad_levelset_adapt
 # from pycutfem.utils.adaptive_mesh import structured_quad_levelset_adaptive
 # --- Mesh ---
 # A finer mesh is needed for this benchmark
-NX, NY = 40, 25
+NX, NY = 30, 20
+# NX, NY = 40, 25
 # NX, NY = 50, 60
 poly_order = 2
 level_set = CircleLevelSet(center=(c_x, c_y), radius=D/2.0 ) # needs to correct the radius, also cx modified for debugging
@@ -360,7 +361,7 @@ theta_pos_vals = np.clip(hansbo_cut_ratio(mesh, level_set, side="+"), theta_min,
 theta_neg_vals = np.clip(hansbo_cut_ratio(mesh, level_set, side="-"), theta_min, 1.0)
 kappa_pos = Pos(ElementWiseConstant(theta_pos_vals))
 kappa_neg = Neg(ElementWiseConstant(theta_neg_vals))
-use_restricted_forms = False
+use_restricted_forms = True
 if use_restricted_forms:
     du_f_R =        restrict(du_f, has_pos)
     dp_f_R =        restrict(dp_f, has_pos)
@@ -603,9 +604,9 @@ r_svc = (
     - (1 - theta) * dot(us_n_R, test_disp_s_R)
 ) * dx_solid
 
-penalty_val = 1e-3
-penalty_grad = 1e-3
-penalty_hess = 1e-3
+penalty_val = 1e-1
+penalty_grad = 1e-1
+penalty_hess = 1e-1
 gamma_v = Constant(penalty_val * poly_order**2)
 gamma_v_grad = Constant(penalty_grad * poly_order**2)
 gamma_p = Constant(penalty_val * poly_order)
@@ -656,8 +657,8 @@ r_stab = (
 
 jacobian_form = a_vol_f + J_int + a_vol_s + a_svc + a_stab
 residual_form = r_vol_f + R_int + r_vol_s + r_svc + r_stab
-# jacobian_form = a_vol_f  + a_vol_s + a_svc + a_stab
-# residual_form = r_vol_f  + r_vol_s + r_svc + r_stab
+# jacobian_form = a_vol_f   + a_svc + a_stab + a_vol_s
+# residual_form = r_vol_f  + r_svc + r_stab + r_vol_s
 
 
 

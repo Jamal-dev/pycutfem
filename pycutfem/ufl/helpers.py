@@ -3,7 +3,7 @@ from matplotlib.pylab import f
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Union, Tuple, Set, Sequence, Optional, Dict, Any
-from pycutfem.ufl.expressions import Expression, Derivative
+from pycutfem.ufl.expressions import Expression, Derivative, Constant, Identity
 from pycutfem.ufl.expressions import (
     VectorFunction, TrialFunction, VectorTrialFunction,
     TestFunction, VectorTestFunction, Restriction,
@@ -537,6 +537,20 @@ class VecOpInfo(BaseOpInfo):
                     vals = _collapsed_function(self)  # shape (k,)
                     return self._with(vals * other, role="vector")
                 return self._with(np.asarray([self.data[0,:] * comp for comp in other]), role=self.role)
+            elif other.ndim == 2:
+                if self.role in {"trial","test"} and other.shape[0] == 1 and other.shape == (2,2):
+                    # Case: Trial/Test * with identity matrix the result will be GradOpInfo
+                    n = self.data.shape[1]
+                    k = other.shape[1]
+                    res = np.zeros((k,n,n), dtype=self.data.dtype)
+                    for i in range(k):
+                        for j in range(k):
+                            res[i,:,j] = self.data[0,:] * other.data[i,j]
+                    grad_obj = GradOpInfo(res, role=self.role,
+                                          field_names=self.field_names,
+                                          parent_name=self.parent_name, side=self.side,
+                                          field_sides=self.field_sides, is_rhs=self.is_rhs)
+                    return grad_obj
             else:
                 raise ValueError(f"Cannot multiply VecOpInfo {self.data.shape} with array of shape {other.shape}."
                                  f" Roles: {self.role}, other={getattr(other, 'role', None)}.")
@@ -572,8 +586,38 @@ class VecOpInfo(BaseOpInfo):
             else:
                 raise NotImplementedError(f"VecOpInfo multiplication not implemented for roles {self.role} and {other.role}.")
                 
+        elif isinstance(other, GradOpInfo):
+            if self.shape[0] == 1 and other.shape == (2,2) and self.role in {"trial","test"}:
+                # Case: scalar trial or test with identity matrix the result will be GradOpInfo
+                # print(f"self.shape: {self.shape}, other.shape: {other.shape}"
+                #       f" with roles {self.role} and {other.role}")
+                n = self.data.shape[1]
+                k = other.shape[1]
+                res = np.zeros((k,n,k), dtype=self.data.dtype)
+                for i in range(k):
+                    for j in range(k):
+                        res[i,:,j] = self.data[0,:] * other.data[i,j]
+                grad_obj = GradOpInfo(res, role=self.role,
+                                      field_names=self.field_names,
+                                      parent_name=self.parent_name, side=self.side,
+                                      field_sides=self.field_sides, is_rhs=self.is_rhs)
+                return grad_obj
+            elif self.role == "function" and other.role == "function" and other.shape==(2,2):
+                # Case: function dot with identity matrix
+                u_vals = _collapsed_function(self)  # shape (k,)
+                data = np.zeros((2,2))  # assuming 2D
+                for i in range(2):
+                    for j in range(2):
+                        data[i,j] += u_vals[0] * other.data[i,j]
+                role = "function"
+                meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
+                return GradOpInfo(data, role=role, **self.update_meta(meta))
         else:
-            raise TypeError(f"Unsupported multiplication type: {type(other)}")
+            role_other = getattr(other, 'role', None)
+            shape_other = getattr(other, 'shape', None)
+            raise TypeError(f"Unsupported multiplication type: {type(other)}"
+                            f" for VecOpInfo with shape {self.data.shape} and role {self.role}."
+                            f" Other role: {role_other}, shape: {shape_other}.")
     def __rmul__(self, other: Union[float, np.ndarray]) -> "VecOpInfo":
         return self.__mul__(other)
 
@@ -640,6 +684,7 @@ class GradOpInfo(BaseOpInfo):
     n: number of local dofs on the active side / union mapping
     d: spatial dimension
     """
+    __array_priority__ = 1000
     coeffs: np.ndarray = field(default=None)  # (k, n) when role == "function" and data.ndim == 3
 
     def _with(self, data: np.ndarray, role: str | None = None, coeffs: np.ndarray | None = None) -> "GradOpInfo":
@@ -666,7 +711,16 @@ class GradOpInfo(BaseOpInfo):
                 # swap the coefficents to match the new shape
                 grad_vals = _collapsed_grad(self)  # (k, d)
                 return self._with(grad_vals.T, role=self.role, coeffs=None)
-            else: # trial and test 
+            elif self.role =="mixed":
+                G = self.data                        # (k, n, m, d)
+                k, n, m, d = G.shape
+                Gswap = np.empty_like(G)
+                # S[i, :, :, j] = G[j, :, :, i]
+                for i in range(k):
+                    for j in range(d):
+                        Gswap[i, :, :, j] = G[j, :, :, i]
+                return self._with(Gswap, role=self.role, coeffs=self.coeffs)
+            elif self.role in {"trial", "test"}: # trial and test
                 G = self.data                        # (k, n, d)
                 k, n, d = G.shape
                 Gswap = np.empty_like(G)
@@ -675,6 +729,8 @@ class GradOpInfo(BaseOpInfo):
                     for j in range(d):
                         Gswap[i, :, j] = G[j, :, i]
                 return self._with(Gswap, role=self.role, coeffs=self.coeffs)
+            else:
+                raise ValueError(f"Cannot transpose GradOpInfo with role '{self.role}' and data of shape {self.data.shape}.")
         if self.data.ndim == 2:        # (k, d) or (n, d)
             return self._with(self.data.T, role=self.role, coeffs=self.coeffs)
         raise ValueError(f"Cannot transpose GradOpInfo with data of shape {self.data.shape}.")
@@ -729,10 +785,26 @@ class GradOpInfo(BaseOpInfo):
         elif self.role == "trial" and other.role == "test":
             # reversed inputs: build rows=test, cols=trial anyway
             return np.einsum("knd,kmd->mn", self.data, other.data, optimize=True)
-
+        elif self.role in {"function"} and other.role in {"trial", "test"}:
+            # Case: Function · Grad(Trial) or Grad(Test)  -> (n,)
+            kd = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+            if kd.shape[0] == other.shape[0]:
+                return np.einsum("kd,knd->n", kd, other.data, optimize=True)
+            else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
+        elif self.role in {"function"} and other.role in {"mixed"}:
+            # Case: Function · Grad(Mixed)  -> (n,)
+            kd = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+            if kd.shape[0] == other.shape[0]:
+                return np.einsum("kd,knmd->nm", kd, other.data, optimize=True)
+            else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
         elif self.role == "function" and other.role == "function":
             # (RHS or unusual cases rarely hit here; keep the default if needed)
-            return np.einsum("knd,kmd->nm", self.data, other.data, optimize=True)
+            kd_self = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+            kd_other = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+            if kd_self.shape[0] == kd_other.shape[0]:
+                return np.einsum("kd,kd->", kd_self, kd_other, optimize=True)
+            else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
+            # return np.einsum("knd,kmd->nm", self.data, other.data, optimize=True)
         else:
             raise NotImplementedError(f"GradOpInfo.inner not implemented for roles {self.role} and {other.role}."
                                       f" Shapes: {self.data.shape} and {other.data.shape}."
@@ -778,9 +850,27 @@ class GradOpInfo(BaseOpInfo):
                 meta = _resolve_meta(self.meta(), other.meta())
                 return GradOpInfo(data, role=self.role, **self.update_meta(meta))
             else: raise NotImplementedError(self._error_msg(other, "dot between gradients"))
-        elif self.role in {"trial", "test"} and other.role in {"trial", "test"}:
+        elif (self.role in {"trial", "test"} and other.role in {"trial", "test"}
+             and self.shape[-1] == other.shape[0]):
             # Special Case:  Grad(Trial) · Grad(Trial) or Grad(Test) · Grad(Test) or mixed; outer product
-            return self.inner(other)  # returns (n,n) matrix
+            is_test = self.role == "test" or other.role == "test"
+            is_trial = self.role == "trial" or other.role == "trial"
+            if is_trial and is_test:
+                role = "mixed"
+                if self.role == "trial" and other.role == "test":
+                    # standard order: rows=test, cols=trial
+                    data = np.einsum("knd,dml->kmnl", self.data, other.data, optimize=True)
+                else:
+                    # reversed inputs: build rows=test, cols=trial anyway
+                    data = np.einsum("knd,dml->knml", self.data, other.data, optimize=True)
+                return GradOpInfo(data, role=role,
+                                  field_names=self.field_names,
+                                  parent_name=self.parent_name, side=self.side,
+                                  field_sides=self.field_sides, is_rhs=self.is_rhs)
+            else:
+                raise NotImplementedError("GradOpInfo.dot between two trial or two test functions is not implemented.")
+            
+        
         else:
             raise NotImplementedError(f"GradOpInfo.dot not implemented for roles {self.role} and {other.role}."
                                       f" Shapes: {self.data.shape} and {other.data.shape}.")
@@ -849,6 +939,20 @@ class GradOpInfo(BaseOpInfo):
                 else:
                     raise ValueError(f"Cannot left_dot with vector of shape {left_vec.shape}.")
 
+        if isinstance(left_vec, np.ndarray) and left_vec.ndim == 2:
+            if self.role in {"trial", "test"}:
+                if left_vec.shape[1] != self.data.shape[0]:
+                    raise ValueError(f"Cannot left_dot with matrix of shape {left_vec.shape}.")
+                data = np.einsum("im,mnd->ind", left_vec, self.data, optimize=True)
+                return self._with(data, role=self.role, coeffs=self.coeffs)
+            if self.role == "function":
+                grad_val = _collapsed_grad(self)
+                if left_vec.shape[1] != grad_val.shape[0]:
+                    raise ValueError(f"Cannot left_dot with matrix of shape {left_vec.shape}.")
+                data = left_vec @ grad_val
+                role = "vector" if data.ndim == 2 else "scalar"
+                return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
+
         raise ValueError(f"Cannot left_dot with vector of shape {left_vec.shape}.")
 
     def dot_vec(self, other_vec: np.ndarray) -> VecOpInfo:
@@ -894,7 +998,7 @@ class GradOpInfo(BaseOpInfo):
                 role = "scalar" if data.ndim == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
 
-            
+            return self._with(self.data * other_vec.data, role=self.role)
         
         if isinstance(other_vec, np.ndarray) and other_vec.ndim == 1: # dot product with a constant vector
             # print(f"GradOpInfo.dot_vec: vec={vec}, data.shape={self.data.shape}, role={self.role}"
@@ -915,7 +1019,23 @@ class GradOpInfo(BaseOpInfo):
                 result_data = np.einsum("knd,d->kn", self.data, other_vec, optimize=True)
                 meta = _resolve_meta(self.meta(), {}, prefer='a')
                 return VecOpInfo(result_data, role=self.role, **self.update_meta(meta))
-        raise NotImplementedError(f"dot_vec of GradOpInfo not implemented for role {self.role}, GradOpInfo  and type {type(other_vec)} with role: {other_vec.role}.")
+        if isinstance(other_vec, np.ndarray) and other_vec.ndim == 2:
+            if self.role in {"trial", "test"}:
+                if other_vec.shape[0] != self.data.shape[-1]:
+                    raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
+                data = np.einsum("knd,dm->knm", self.data, other_vec, optimize=True)
+                return self._with(data, role=self.role, coeffs=self.coeffs)
+            if self.role == "function":
+                grad_val = _collapsed_grad(self)
+                if other_vec.shape[0] != grad_val.shape[-1]:
+                    raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
+                data = grad_val @ other_vec
+                role = "vector" if data.ndim == 2 else "scalar"
+                return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
+        other_role = getattr(other_vec, "role", None)
+        raise NotImplementedError(
+            f"dot_vec of GradOpInfo not implemented for role {self.role}, type {type(other_vec)} with role: {other_role}."
+        )
 
     # ========================================================================
     # Dunder methods for SCALING Operations
@@ -972,28 +1092,103 @@ class GradOpInfo(BaseOpInfo):
     def __neg__(self) -> "GradOpInfo":
         return self._with(-self.data, role=self.role)
 
-    def __add__(self, other: "GradOpInfo") -> "GradOpInfo":
-        if not isinstance(other, GradOpInfo) and self.role != other.role:
-            raise ValueError("Operands must be GradOpInfo of the same shape for addition."
-                             f" Shapes: {self.data.shape} and {other.data.shape}."
-                             f" Roles: {self.role} and {other.role}.")
-        if self.role in ["test", "trial"] and other.role in ["test", "trial"]:
-            # Case: both are test or trial gradients
-            if self.data.shape != other.data.shape:
-                raise ValueError(f"GradOpInfo shapes mismatch in addition: {self.data.shape} vs {other.data.shape}.")
-            return self._with(self.data + other.data, role=self.role)
-        elif self.role == "function" and other.role == "function":
-            a = self._eval_function_to_2d()  
-            b = other._eval_function_to_2d()
-            if a.shape != b.shape:
-                raise ValueError(f"Function gradient shapes mismatch in addition: {a.shape} vs {b.shape}.")
-            return self._with(a + b, role=self.role) # collapsed gradients (2,2)
-        else:
-            raise NotImplementedError(f"GradOpInfo addition not implemented for roles {self.role} and {other.role}."
-                                      f" Shapes: {self.data.shape} and {other.data.shape}.")
+    @staticmethod
+    def _coerce_array_like(other):
+        if isinstance(other, (int, float, np.floating)):
+            return float(other)
+        if isinstance(other, np.ndarray):
+            return np.asarray(other, dtype=float)
+        if isinstance(other, Constant):
+            val = other.value
+            if np.isscalar(val):
+                return float(val)
+            return np.asarray(val, dtype=float)
+        if isinstance(other, Identity):
+            return np.eye(other.size, dtype=float)
+        return None
+
+    def _add_array(self, array_like):
+        if np.isscalar(array_like):
+            scalar = float(array_like)
+            if self.role in {"test", "trial"}:
+                return self._with(self.data + scalar, role=self.role)
+            if self.role == "function":
+                mat = self._eval_function_to_2d()
+                return self._with(mat + scalar, role=self.role)
+            raise NotImplementedError(f"Scalar addition not implemented for role {self.role}.")
+
+        arr = np.asarray(array_like, dtype=float)
+
+        if self.role == "function":
+            mat = self._eval_function_to_2d()
+            if arr.shape != mat.shape:
+                raise ValueError(f"Cannot add array of shape {arr.shape} to function gradient of shape {mat.shape}.")
+            return self._with(mat + arr, role=self.role)
+
+        if self.role in {"test", "trial"}:
+            if arr.shape == self.data.shape:
+                return self._with(self.data + arr, role=self.role)
+            if arr.ndim == 2 and arr.shape == (self.data.shape[0], self.data.shape[2]):
+                broadcast = arr[:, None, :]
+                return self._with(self.data + broadcast, role=self.role)
+            if arr.ndim == 1 and arr.shape[0] == self.data.shape[0]:
+                broadcast = arr[:, None, None]
+                return self._with(self.data + broadcast, role=self.role)
+            raise ValueError(f"Cannot add array of shape {arr.shape} to gradient data of shape {self.data.shape}.")
+
+        raise NotImplementedError(f"Array addition not implemented for role {self.role}.")
+
+    def __add__(self, other) -> "GradOpInfo":
+        if isinstance(other, GradOpInfo):
+            if self.role != other.role:
+                is_a_trial_test = self.role in {"trial", "test"}
+                is_b_trial_test = other.role in {"trial", "test"}
+                if is_a_trial_test: role = self.role
+                elif is_b_trial_test: role = other.role
+                else: 
+                    raise ValueError("Operands must be GradOpInfo of the same role for addition "
+                                 f"(got {self.role} and {other.role}).")
+                if other.shape == (2,2):
+                    data = np.zeros_like(self.data)
+                    for i in range(self.shape[0]):
+                        for j in range(self.shape[2]):
+                            data[i,:,j] = self.data[i,:,j] + other.data[i,j]
+                    return self._with(data, role=role)
+                elif self.shape == (2,2):
+                    data = np.zeros_like(other.data)
+                    for i in range(other.shape[0]):
+                        for j in range(other.shape[2]):
+                            data[i,:,j] = other.data[i,:,j] + self.data[i,j]
+                    return self._with(data, role=role)
+                else:
+                    raise ValueError("Operands must be GradOpInfo of the same role for addition "
+                                 f"(got {self.role} and {other.role}).")
+            if self.role in {"test", "trial", "mixed"}:
+                if self.data.shape != other.data.shape:
+                    raise ValueError(f"GradOpInfo shapes mismatch in addition: {self.data.shape} vs {other.data.shape}.")
+                return self._with(self.data + other.data, role=self.role)
+            if self.role == "function":
+                a = self._eval_function_to_2d()
+                b = other._eval_function_to_2d()
+                if a.shape != b.shape:
+                    raise ValueError(f"Function gradient shapes mismatch in addition: {a.shape} vs {b.shape}.")
+                return self._with(a + b, role=self.role)
+            raise NotImplementedError(f"GradOpInfo addition not implemented for role {self.role}.")
+
+        arr = self._coerce_array_like(other)
+        if arr is not None:
+            return self._add_array(arr)
+
+        return NotImplemented
+
+    def __radd__(self, other):
+        return self.__add__(other)
 
     def __sub__(self, other: "GradOpInfo") -> "GradOpInfo":
         return self.__add__(-other)
+
+    def __rsub__(self, other):
+        return (-self).__add__(other)
 
     # --- Helper properties ---
     def __repr__(self): return (f"GradOpInfo(shape={self.data.shape}, role='{self.role}')"
@@ -1838,14 +2033,30 @@ class HelpersAlignCoefficents:
         if tgt is None:
             return phi  # nothing to do
 
-        # Already global-sized?
+        fmap_full = HelpersAlignCoefficents._field_map(ctx, side, field_name)
+
+        # Already global-sized? apply field mask to ensure other slots are zeroed.
         if phi.ndim == 1 and phi.shape[0] == tgt:
+            if fmap_full is not None:
+                mask = np.zeros(tgt, dtype=phi.dtype)
+                mask[np.asarray(fmap_full, dtype=int)] = 1.0
+                return phi * mask
             return phi
         if phi.ndim == 2 and phi.shape[1] == tgt:
+            if fmap_full is not None:
+                mask = np.zeros(tgt, dtype=phi.dtype)
+                mask[np.asarray(fmap_full, dtype=int)] = 1.0
+                return phi * mask[np.newaxis, :]
             return phi
 
         # If the vector is still in "side element" ordering, promote it using the side map
         if phi.ndim == 1 and side in ('+', '-'):
+            fmap_first = HelpersAlignCoefficents._field_map(ctx, side, field_name)
+            if fmap_first is not None and len(fmap_first) == phi.shape[0]:
+                full = np.zeros(tgt, dtype=phi.dtype)
+                full[np.asarray(fmap_first, dtype=int)] = phi
+                phi = full
+                return phi
             side_map = ctx.get('pos_map') if side == '+' else ctx.get('neg_map')
             if side_map is not None and len(side_map) == phi.shape[0]:
                 full = np.zeros(tgt, dtype=phi.dtype)
@@ -1854,7 +2065,7 @@ class HelpersAlignCoefficents:
                 if phi.shape[0] == tgt:
                     return phi
         
-        fmap = HelpersAlignCoefficents._field_map(ctx, side, field_name)
+        fmap = fmap_full
         if fmap is None:
             raise ValueError(f"Missing per-field map for basis padding: field='{field_name}', side={side}")
 
@@ -1892,15 +2103,25 @@ class HelpersAlignCoefficents:
         if tgt is None:
             return u_loc  # nothing to do
 
-        # Already global-sized?
+        fmap_full = HelpersAlignCoefficents._field_map(ctx, side, field_name)
+
+        # Already global-sized? mask out slots outside the field.
         if u_loc.ndim == 1 and u_loc.shape[0] == tgt:
+            if fmap_full is not None:
+                mask = np.zeros(tgt, dtype=u_loc.dtype)
+                mask[np.asarray(fmap_full, dtype=int)] = 1.0
+                return u_loc * mask
             return u_loc
         if u_loc.ndim == 2 and u_loc.shape[1] == tgt:
+            if fmap_full is not None:
+                mask = np.zeros(tgt, dtype=u_loc.dtype)
+                mask[np.asarray(fmap_full, dtype=int)] = 1.0
+                return u_loc * mask[np.newaxis, :]
             return u_loc
 
         # Choose an indexer whose length matches u_loc's width
         smap = HelpersAlignCoefficents._side_map(ctx, side)
-        fmap = HelpersAlignCoefficents._field_map(ctx, side, field_name)
+        fmap = fmap_full
 
         # Normalize to numpy int arrays if present
         smap = None if smap is None else np.asarray(smap, dtype=np.intp)
@@ -1917,10 +2138,10 @@ class HelpersAlignCoefficents:
             return padded
 
         if u_loc.ndim == 1:
-            if smap is not None and smap.shape[0] == u_loc.shape[0]:
-                return _pad_1d(smap, u_loc)
             if fmap is not None and fmap.shape[0] == u_loc.shape[0]:
                 return _pad_1d(fmap, u_loc)
+            if smap is not None and smap.shape[0] == u_loc.shape[0]:
+                return _pad_1d(smap, u_loc)
             raise ValueError(
                 f"Cannot pad coeffs (1D) for '{field_name}' on side {side}: "
                 f"len(u_loc)={u_loc.shape[0]}, len(side_map)={None if smap is None else smap.shape[0]}, "
@@ -1928,10 +2149,10 @@ class HelpersAlignCoefficents:
             )
 
         elif u_loc.ndim == 2:
-            if smap is not None and smap.shape[0] == u_loc.shape[1]:
-                return _pad_2d(smap, u_loc)
             if fmap is not None and fmap.shape[0] == u_loc.shape[1]:
                 return _pad_2d(fmap, u_loc)
+            if smap is not None and smap.shape[0] == u_loc.shape[1]:
+                return _pad_2d(smap, u_loc)
             raise ValueError(
                 f"Cannot pad coeffs (2D) for '{field_name}' on side {side}: "
                 f"u_loc.shape[1]={'None' if u_loc.ndim < 2 else u_loc.shape[1]}, "

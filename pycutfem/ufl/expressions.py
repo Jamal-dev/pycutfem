@@ -942,6 +942,19 @@ class Constant(Expression, numbers.Number):
     def cache_token(self) -> str:
         return self._cache_token
 
+
+class Identity(Constant):
+    """
+    Identity matrix expression that behaves like a Constant np.eye(size).
+    """
+    def __init__(self, size: int):
+        size = int(size)
+        super().__init__(np.eye(size, dtype=float))
+        self.size = size
+
+    def __repr__(self):
+        return f"Identity({self.size})"
+
 class VectorTrialFunction(Expression):
     is_trial = True
     is_function = False
