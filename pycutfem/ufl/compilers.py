@@ -53,7 +53,7 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
-from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, 
+from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, lhs_num,
                                   required_multi_indices,
                                   _all_fields,_find_all,
                                   _trial_test, 
@@ -837,6 +837,7 @@ class FormCompiler:
                 # sum over the diagonal of the outermost and innermost axes
                 for i in range(m):
                     M += A.data[i, :, :, i]
+                M = M[np.newaxis, ...]  # (1, n_test, n_trial)
                 return self._vecinfo(M, role=A.role, node=node, field_names=A.field_names)
             else:
                 raise ValueError(f"Trace not defined for GradOpInfo with role '{A.role}' and shape {A.data.shape}.")
@@ -1018,7 +1019,7 @@ class FormCompiler:
     def _visit_Identity(self, n: Identity):
         data = np.eye(n.size, dtype=float)
 
-        return self._gradinfo(data, role="function", node=n, field_names=[])
+        return self._gradinfo(data, role="identity", node=n, field_names=[])
     
     def _visit_FacetNormal(self, n: FacetNormal): 
         """Returns the normal vector from the context.""" 
@@ -1746,12 +1747,14 @@ class FormCompiler:
         # mass matrix case: VecOpInfo . VecOpInfo
         if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
             logger.debug(f"visit dot: Both operands are VecOpInfo: {a.role} . {b.role}")
-            if a.role == "test" and b.role in {"trial", "function"}:
+            if a.role == "test" and b.role in {"trial", "function", "mixed"}:
                 # return np.dot(a_data.T, b_data)  # test . trial
                 return b.dot_vec(a)  # test . trial
-            elif b.role == "test" and a.role in {"trial", "function"}:
+            elif b.role == "test" and a.role in {"trial", "function", "mixed"}:
                 # return np.dot(b_data.T, a_data)  # tiral . test
                 return a.dot_vec(b)  # trial . test
+            elif a.role == "mixed" and b.role in {"function"}:
+                return a.dot_vec(b)
         
         # ------------------------------------------------------------------
         # Case:  VectorFunction · Grad(⋅)      u_k · ∇w_test
@@ -1867,6 +1870,8 @@ class FormCompiler:
             if a.role == "trial" and b.role == "test":
                 return b.inner(a)
             elif a.role == "function" and b.role in {"trial", "test", "mixed"}:
+                return a.inner(b)
+            elif a.role in {"mixed"} and b.role in {"function", "identity"}:
                 return a.inner(b)
             raise ValueError(f"Grad LHS expects test vs trial; got {a.role} vs {b.role}.")
 
@@ -2531,7 +2536,8 @@ class FormCompiler:
                         arr = np.asarray(val)
                         acc += w_eff * float(arr if arr.ndim == 0 else arr.sum())
                     else:
-                        arr = np.asarray(getattr(val, 'data', val))
+                        arr = lhs_num(val)
+                        arr = np.asarray(arr)
                         if rhs and arr.ndim == 2 and 1 in arr.shape:
                             arr = arr.reshape(-1)
                         acc += w_eff * arr

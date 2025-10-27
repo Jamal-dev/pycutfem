@@ -19,6 +19,16 @@ class Form(Expression):
             return Form(self.integrals + other.integrals)
         raise TypeError(f"Can only add an Integral or Form to a Form, not {type(other)}")
 
+    def __repr__(self):
+        if not self.integrals:
+            return "Form()"
+        pieces = []
+        for i, integral in enumerate(self.integrals, start=1):
+            pieces.append(f"  [{i}] {integral!r}")
+        return "Form(\n" + ",\n".join(pieces) + "\n)"
+
+    __str__ = __repr__
+
     def __sub__(self, other):
         # Use the __neg__ method to create negated versions of the terms to be subtracted.
         if isinstance(other, (Integral, Form)):
