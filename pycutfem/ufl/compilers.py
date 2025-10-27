@@ -1760,13 +1760,13 @@ class FormCompiler:
         # Case:  VectorFunction · Grad(⋅)      u_k · ∇w_test
         # ------------------------------------------------------------------
         if isinstance(a, VecOpInfo) and isinstance(b, GradOpInfo) \
-        and a.role == "function" and b.role == "test":
+        and a.role in {"function", "trial"} and b.role == "test":
             return b.left_dot(a)  # u_k · ∇w
         
         # ------------------------------------------------------------------
         # case grad(u_trial) . u_k
         if isinstance(a, GradOpInfo) and ((isinstance(b, VecOpInfo) \
-            and (b.role == "function" )) and a.role == "trial" 
+            and (b.role in {"function","test"} )) and a.role in {"trial", "test"}
             ):
 
             return a.dot_vec(b)  # ∇u_trial · u_k
@@ -1787,7 +1787,10 @@ class FormCompiler:
         and isinstance(b, VecOpInfo)  and b.role == "trial":
 
             return a.dot_vec(b)  # ∇u_k · u_trial
-        
+        if isinstance(a, GradOpInfo) and a.role == "test" \
+        and isinstance(b, VecOpInfo) and b.role == "trial":
+            return a.dot_vec(b)  # ∇v · u_trial
+       
         # ------------------------------------------------------------------
         # Case:  Vec(Function) · Grad(Trial)      u_k · ∇u_trial
         # ------------------------------------------------------------------
@@ -1869,11 +1872,12 @@ class FormCompiler:
                 return a.inner(b)
             if a.role == "trial" and b.role == "test":
                 return b.inner(a)
-            elif a.role == "function" and b.role in {"trial", "test", "mixed"}:
+            elif a.role == "function" and b.role in {"trial", "test", "mixed", "identity", "function"}:
                 return a.inner(b)
             elif a.role in {"mixed"} and b.role in {"function", "identity"}:
                 return a.inner(b)
-            raise ValueError(f"Grad LHS expects test vs trial; got {a.role} vs {b.role}.")
+            raise ValueError(f"Grad LHS expects test vs trial; got {a.role} vs {b.role}."
+                             f" shapes a={getattr(a.data,'shape',None)}, b={getattr(b.data,'shape',None)}")
 
         # ---- Vec LHS (e.g., Laplacian(LHS) yields VecOpInfo) ----
         if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):

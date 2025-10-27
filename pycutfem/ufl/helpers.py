@@ -446,6 +446,10 @@ class VecOpInfo(BaseOpInfo):
                 if self.is_rhs:
                     return self._with(data, role=f"{self.role}_n") # scalar basis on rhs
                 return self._with(data[np.newaxis,:], role=self.role) # scalar basis on lhs
+        elif self.role in {"mixed"}:
+            if self.shape[0] == const.shape[0]:
+                data = np.einsum("kmn,k->mn", self.data, const, optimize=True)
+                return data
         elif self.role == "scalar":
             data = self.data * const
             role = "vector" if data.ndim == 1 else "scalar"
@@ -580,11 +584,11 @@ class VecOpInfo(BaseOpInfo):
                 return VecOpInfo(data, role=self.role, **self.update_meta(meta))
             else:
                 raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
-        if self.role == "mixed" and other_vec.role == "function" and other_vec.ndim == 1:
+        if self.role == "mixed" and other_vec.role == "function":
             meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
             v_values = _collapsed_function(other_vec)  # shape (k,)
             # (k,m,n) dot (k,) -> (1,m,n)
-            if self.shape[0] == v_values.shape[0]:
+            if self.shape[0] == v_values.shape[0] and v_values.ndim == 1:
                 data = np.einsum("kmn,k->mn", self.data, v_values, optimize=True)
                 data = data[np.newaxis,:,:] # (1,m,n)
                 return VecOpInfo(data, role=self.role, **self.update_meta(meta))
@@ -601,7 +605,9 @@ class VecOpInfo(BaseOpInfo):
                 return VecOpInfo(data, role=role, **self.update_meta(meta))
             else:
                 raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
-        raise NotImplementedError(f"VecOpInfo.dot_vec not implemented for roles {self.role} and {other_vec.role}.")
+        raise NotImplementedError(f"VecOpInfo.dot_vec not implemented for roles {self.role} and {other_vec.role}."
+                                  f" Shapes: {self.data.shape} and {other_vec.data.shape}."
+                                  f" Types : {type(self)} and {type(other_vec)}.")
     # ========================================================================
     # Shape, len, and ndim methods
     def __len__(self) -> int:
@@ -634,14 +640,14 @@ class VecOpInfo(BaseOpInfo):
                                           parent_name=self.parent_name, side=self.side,
                                           field_sides=self.field_sides, is_rhs=self.is_rhs)
                     return grad_obj
-                elif self.role in {"mixed"} and other.shape == (2,2):
+                elif self.role in {"mixed"} and other.shape == (2,2) and self.shape[0] == 1:
                     # Case: Mixed * with identity matrix the result will be HessOpInfo
-                    m,n = self.data.shape
+                    _,m,n = self.data.shape
                     k,d = other.shape
                     res = np.zeros((k,m,n,d), dtype=self.data.dtype)
                     for i in range(k):
                         for j in range(d):
-                            res[i,:, :,j] = self.data[:, :] * other.data[i,j]
+                            res[i,:, :,j] = self.data[0, :, :] * other.data[i,j]
                     grad_obj = GradOpInfo(res, role=self.role,
                                           field_names=self.field_names,
                                           parent_name=self.parent_name, side=self.side,
@@ -722,7 +728,8 @@ class VecOpInfo(BaseOpInfo):
                 role = "function"
                 meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
                 return GradOpInfo(data, role=role, **self.update_meta(meta))
-            elif self.role == "mixed" and other.role in {"function", "identity"} and other.shape==(2,2) and self.shape[0]==1:
+            elif self.role == "mixed" and other.role in {"function", "identity"} \
+                and other.shape==(2,2) and self.shape[0]==1:
                 # Case: mixed dot with identity matrix
                 _,m,n = self.data.shape
                 k,d = other.shape
@@ -733,7 +740,7 @@ class VecOpInfo(BaseOpInfo):
                 role = "mixed"
                 meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
                 return GradOpInfo(data, role=role, **self.update_meta(meta))
-            elif self.role == "trial" and other.role == "test":
+            elif self.role == "trial" and other.role == "test" and self.shape[0]==1:
                 # Case: Scalar Trial * Grad(Test)
                 # (1,n) * (k, n, d) -> (k, n, d)
                 if self.shape[0] != 1:
@@ -752,7 +759,7 @@ class VecOpInfo(BaseOpInfo):
                         res[i, :, :, j] = np.outer(other.data[i, :, j], self.data[0, :])
                 return GradOpInfo(res, role="mixed", **self.update_meta(meta))
 
-            elif self.role == "test" and other.role == "trial":
+            elif self.role == "test" and other.role == "trial" and self.shape[0]==1:
                 if self.shape[0] != 1:
                     raise NotImplementedError("Only scalar test factors supported here.")
                 meta = _resolve_meta(self.meta(), other.meta(), prefer="a")
@@ -800,9 +807,16 @@ class VecOpInfo(BaseOpInfo):
         other_data = getattr(other, 'data', other)
         other_meta = getattr(other, 'meta', lambda: None)()
         other_type = getattr(other, 'type', None)
+        other_role = getattr(other, 'role', None)
         if not isinstance(other, (VecOpInfo, np.ndarray)):
             raise TypeError(f"Cannot add VecOpInfo to {type(other)}."
                             f" with shapes {self.data.shape} and {other_data.shape}")
+        if self.role in {"mixed"} and other_role is None and self.data.shape[0] == 1 and self.ndim == 3:
+            if self.shape[1] == other.shape[0] and self.shape[2] == other.shape[1]:
+                # Case: mixed + np.ndarray (k,m,n) + (m,n)
+                res = self.data[0,:,:] + other_data
+                return VecOpInfo(res[np.newaxis,:,:], role=self.role, **self.update_meta(self.meta()))
+
         if self.data.shape != other_data.shape:
             raise ValueError(f"VecOpInfo shapes mismatch in addition: {self.data.shape} vs {other_data.shape}"
                              f" Roles: {self.role}, other={getattr(other, 'role', None)}."
@@ -929,10 +943,16 @@ class GradOpInfo(BaseOpInfo):
                 if kd.shape[0] == self.shape[0]:
                     return np.einsum("knd,kd->n", self.data, kd, optimize=True)
                 else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
-            elif self.role == "function" and other.role == "function":
+            elif self.role in {"function", "identity"} and other.role in {"function", "identity"}:
                 # Case: Function · Function  -> ()
-                kd_self = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
-                kd_other = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+                if self.role == "function":
+                    kd_self = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+                else:
+                    kd_self = self.data  # shape (k, d)  —   ∇u_k(ξ)
+                if other.role == "function":
+                    kd_other = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+                else:
+                    kd_other = other.data  # shape (k, d)  —   ∇u_k(ξ)
                 if kd_self.shape[0] == kd_other.shape[0]:
                     return np.einsum("kd,kd->", kd_self, kd_other, optimize=True)
                 else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
@@ -964,10 +984,16 @@ class GradOpInfo(BaseOpInfo):
             if kd.shape[0] == self.shape[0]:
                 return np.einsum("knmd,kd->nm", self.data, kd, optimize=True)
             else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
-        elif self.role == "function" and other.role == "function":
+        elif self.role in {"function", "identity"} and other.role in {"function", "identity"}:
             # (RHS or unusual cases rarely hit here; keep the default if needed)
-            kd_self = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
-            kd_other = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+            if self.role == "function":
+                kd_self = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+            else:
+                kd_self = self.data  # shape (k, d)  —   ∇u_k(ξ)
+            if other.role == "function":
+                kd_other = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+            else:
+                kd_other = other.data  # shape (k, d)  —   ∇u_k(ξ)
             if kd_self.shape[0] == kd_other.shape[0]:
                 return np.einsum("kd,kd->", kd_self, kd_other, optimize=True)
             else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
@@ -1082,6 +1108,12 @@ class GradOpInfo(BaseOpInfo):
                     role = "vector" if data.ndim == 1 else "scalar"
                     return VecOpInfo(data, role=role, **self.update_meta(meta))
             elif self.role in {"trial", "test"}:
+                if left_vec.role in {"trial", "test"} and self.role in {"trial", "test"}:
+                    if self.data.shape[0] != left_vec.data.shape[0]:
+                        raise NotImplementedError(self._error_msg(left_vec, "left_dot with vector"))
+                    meta = _resolve_meta(self.meta(), left_vec.meta(), prefer='a')
+                    data = np.einsum("km,knd->dnm", left_vec.data, self.data, optimize=True)
+                    return VecOpInfo(data, role="mixed", **self.update_meta(meta))
                 if left_vec.role == "function":
                     u_vals = _collapsed_function(left_vec)  # shape (k,)
                     if _is_1d_vector(u_vals):
@@ -1186,6 +1218,12 @@ class GradOpInfo(BaseOpInfo):
                 data = np.einsum("kd,d->k", grad_val, v_val, optimize=True) # (k,) result
                 role = "scalar" if data.ndim == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
+            elif self.role in {"trial", "test"} and other_vec.role in {"trial", "test"}:
+                if self.data.shape[0] != other_vec.data.shape[0]:
+                    raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
+                data = np.einsum("knd,dm->knm", self.data, other_vec.data, optimize=True)
+                meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
+                return VecOpInfo(data, role="mixed", **self.update_meta(meta))
             elif self.role in {"trial", "test"} and other_vec.role == "vector":
                 vec_vals = np.asarray(other_vec.data)
                 if vec_vals.ndim == 1 and vec_vals.shape[0] == self.data.shape[0]:
@@ -1327,9 +1365,12 @@ class GradOpInfo(BaseOpInfo):
 
         if self.role == "function":
             mat = self._eval_function_to_2d()
-            if arr.shape != mat.shape:
-                raise ValueError(f"Cannot add array of shape {arr.shape} to function gradient of shape {mat.shape}.")
-            return self._with(mat + arr, role=self.role)
+            if arr.shape == mat.shape:
+                return self._with(mat + arr, role=self.role)
+            # if arr.ndim == 2 and arr.shape == (mat.shape[1], mat.shape[0]):
+            #     arr = arr.T
+            #     return self._with(mat + arr, role=self.role)
+            raise ValueError(f"Cannot add array of shape {arr.shape} to function gradient of shape {mat.shape}.")
 
         if self.role in {"test", "trial"}:
             if arr.shape == self.data.shape:
@@ -1337,66 +1378,61 @@ class GradOpInfo(BaseOpInfo):
             if arr.ndim == 2 and arr.shape == (self.data.shape[0], self.data.shape[2]):
                 broadcast = arr[:, None, :]
                 return self._with(self.data + broadcast, role=self.role)
-            if arr.ndim == 1 and arr.shape[0] == self.data.shape[0]:
-                broadcast = arr[:, None, None]
-                return self._with(self.data + broadcast, role=self.role)
+            # if arr.ndim == 2 and arr.shape == (self.data.shape[2], self.data.shape[0]):
+            #     broadcast = arr.T[:, None, :]
+            #     return self._with(self.data + broadcast, role=self.role)
+            # if arr.ndim == 1 and arr.shape[0] == self.data.shape[0]:
+            #     broadcast = arr[:, None, None]
+            #     return self._with(self.data + broadcast, role=self.role)
             raise ValueError(f"Cannot add array of shape {arr.shape} to gradient data of shape {self.data.shape}.")
+
+        if self.role == "mixed":
+            if arr.shape == self.data.shape:
+                return self._with(self.data + arr, role=self.role)
+            # if arr.ndim == 3 and arr.shape == (self.data.shape[0], self.data.shape[1], self.data.shape[3]):
+            #     broadcast = arr[:, :, None, :]
+            #     return self._with(self.data + broadcast, role=self.role)
+            # if arr.ndim == 3 and arr.shape == (self.data.shape[0], self.data.shape[2], self.data.shape[3]):
+            #     broadcast = arr[:, None, :, :]
+            #     return self._with(self.data + broadcast, role=self.role)
+            # if arr.ndim == 2 and arr.shape == (self.data.shape[0], self.data.shape[3]):
+            #     broadcast = arr[:, None, None, :]
+            #     return self._with(self.data + broadcast, role=self.role)
+            # if arr.ndim == 2 and arr.shape == (self.data.shape[3], self.data.shape[0]):
+            #     broadcast = arr.T[:, None, None, :]
+            #     return self._with(self.data + broadcast, role=self.role)
+            raise ValueError(f"Cannot add array of shape {arr.shape} to mixed gradient data of shape {self.data.shape}.")
 
         raise NotImplementedError(f"Array addition not implemented for role {self.role}.")
 
     def __add__(self, other) -> "GradOpInfo":
         if isinstance(other, GradOpInfo):
             if self.role != other.role:
-                if self.data.shape == other.data.shape:
-                    if "trial" in {self.role, other.role}:
-                        role = "trial"
-                    elif "test" in {self.role, other.role}:
-                        role = "test"
-                    elif "function" in {self.role, other.role}:
-                        role = "function"
+                if self.data.ndim < other.data.ndim:
+                    return other.__add__(self)
+
+                if other.data.shape == self.data.shape:
+                    priority = ["mixed", "trial", "test", "function"]
+                    for candidate in priority:
+                        if candidate in {self.role, other.role}:
+                            role = candidate
+                            break
                     else:
                         raise ValueError(f"Addition of {self.role} and {other.role} GradOpInfo not supported.")
                     return self._with(self.data + other.data, role=role)
-                is_a_trial_test = self.role in {"trial", "test", "mixed"}
-                is_b_trial_test = other.role in {"trial", "test", "mixed"}
-                if is_a_trial_test: role = self.role
-                elif is_b_trial_test: role = other.role
-                else: 
-                    raise ValueError("Operands must be GradOpInfo of the same role for addition "
-                                 f"(got {self.role} and {other.role}).")
-                if other.shape == (2,2) and self.data.ndim == 3:
-                    data = np.zeros_like(self.data)
-                    for i in range(self.shape[0]):
-                        for j in range(self.shape[2]):
-                            data[i,:,j] = self.data[i,:,j] + other.data[i,j]
-                    return self._with(data, role=role)
-                elif self.shape == (2,2) and other.data.ndim == 3:
-                    data = np.zeros_like(other.data)
-                    for i in range(other.shape[0]):
-                        for j in range(other.shape[2]):
-                            data[i,:,j] = other.data[i,:,j] + self.data[i,j]
-                    return self._with(data, role=role)
-                elif self.shape == (2,2) and other.data.ndim == 4:
-                    data = np.zeros_like(other.data)
-                    for i in range(self.shape[1]):
-                        for j in range(self.shape[1]):
-                            data[i,:,:,j] = other.data[i,:,:,j] + self.data[i,j]
-                    return self._with(data, role=role)
-                elif other.shape == (2,2) and self.data.ndim == 4:
-                    data = np.zeros_like(self.data)
-                    for i in range(other.shape[0]):
-                        for j in range(other.shape[1]):
-                            data[i,:,:,j] = self.data[i,:,:,j] + other.data[i,j]
-                    return self._with(data, role=role)
-                else:
-                    print("GradOpInfo role mismatch", self.role, other.role, self.data.shape, other.data.shape)
-                    raise ValueError("Operands must be GradOpInfo of the same role for addition "
+
+                if other.data.ndim <= 2:
+                    return self._add_array(other.data)
+
+                raise ValueError("Operands must be GradOpInfo of the same role for addition "
                                  f"(got {self.role} and {other.role}).")
             if self.role in {"test", "trial", "mixed"}:
                 if self.data.shape != other.data.shape:
                     raise ValueError(f"GradOpInfo shapes mismatch in addition: {self.data.shape} vs {other.data.shape}.")
                 return self._with(self.data + other.data, role=self.role)
             if self.role == "function":
+                if other.role != "function":
+                    raise ValueError(f"Cannot add GradOpInfo of role 'function' with role '{other.role}'.")
                 a = self._eval_function_to_2d()
                 b = other._eval_function_to_2d()
                 if a.shape != b.shape:
@@ -1407,6 +1443,9 @@ class GradOpInfo(BaseOpInfo):
         # arr = self._coerce_array_like(other)
         # if arr is not None:
         #     return self._add_array(arr)
+        arr = self._coerce_array_like(other)
+        if arr is not None:
+            return self._add_array(arr)
 
         raise TypeError(f"Unsupported type for addition with GradOpInfo: {type(other)}"
                         f" (role={self.role}), with shape {self.data.shape}."

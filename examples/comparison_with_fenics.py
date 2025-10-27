@@ -1,3 +1,4 @@
+from calendar import c
 import numpy as np
 import pandas as pd
 import os
@@ -32,10 +33,10 @@ from pycutfem.ufl.forms import Equation
 from scipy.optimize import linear_sum_assignment
 from scipy.sparse import csr_matrix
 import logging
-logging.basicConfig(
-    level=logging.INFO,  # show debug messages
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# logging.basicConfig(
+#     level=logging.INFO,  # show debug messages
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# )
 
 I2 = Identity(2)
 lambda_s = Constant(0.0)
@@ -113,29 +114,48 @@ D2SIGMA_TERM_A_SUBLABELS = (
 
 
 def _d2sigma_s_components(d_ref, du_trial, w_test, *, return_parts: bool = False):
+    comps = {}
     Fk = F_of(d_ref)
+    comps['Fk'] = Fk
     Jk = det(Fk)
+    comps['Jk'] = Jk
     Finv = inv(Fk)
+    comps['Finv'] = Finv
     Sk = S_stvk(E_of(Fk))
+    comps['Sk'] = Sk
 
     dFk_trial = grad(du_trial)
+    comps['dFk_trial'] = dFk_trial
     Aw_test = grad(w_test)
+    comps['Aw_test'] = Aw_test
 
     dEk_trial = Constant(0.5) * (dot(dFk_trial.T, Fk) + dot(Fk.T, dFk_trial))
+    comps['dEk_trial'] = dEk_trial
     dSk_trial = lambda_s * trace(dEk_trial) * I2 + Constant(2.0) * mu_s * dEk_trial
+    comps['dSk_trial'] = dSk_trial
 
     dEw_test = Constant(0.5) * (dot(Aw_test.T, Fk) + dot(Fk.T, Aw_test))
+    comps['dEw_test'] = dEw_test
     dSw_test = lambda_s * trace(dEw_test) * I2 + Constant(2.0) * mu_s * dEw_test
+    comps['dSw_test'] = dSw_test
 
     ddEw_mixed = Constant(0.5) * (dot(Aw_test.T, dFk_trial) + dot(dFk_trial.T, Aw_test))
+    comps['ddEw_mixed'] = ddEw_mixed
     ddSw_mixed = lambda_s * trace(ddEw_mixed) * I2 + Constant(2.0) * mu_s * ddEw_mixed
+    comps['ddSw_mixed'] = ddSw_mixed
 
+    # δτ[w]
     T_w = (
         dot(Aw_test, dot(Sk, Fk.T))
         + dot(Fk, dot(dSw_test, Fk.T))
         + dot(Fk, dot(Sk, Aw_test.T))
     )
+    comps['T_w_1'] = dot(Aw_test, dot(Sk, Fk.T))
+    comps['T_w_2'] = dot(Fk, dot(dSw_test, Fk.T))
+    comps['T_w_3'] = dot(Fk, dot(Sk, Aw_test.T))
+    comps['T_w'] = T_w
 
+    # δ²τ[w,du] split into parts
     dT_terms = (
         dot(Aw_test, dot(dSk_trial, Fk.T)),
         dot(Aw_test, dot(Sk, dFk_trial.T)),
@@ -145,28 +165,54 @@ def _d2sigma_s_components(d_ref, du_trial, w_test, *, return_parts: bool = False
         dot(dFk_trial, dot(Sk, Aw_test.T)),
         dot(Fk, dot(dSk_trial, Aw_test.T)),
     )
-    dT = dT_terms[0]
-    for _term in dT_terms[1:]:
-        dT = dT + _term
 
-    tr_Finv_dFk = trace(dot(Finv, dFk_trial))
-    tr_Finv_Aw = trace(dot(Finv, Aw_test))
-    tr_Finv_dFk_FAw = trace(dot(Finv, dot(dFk_trial, dot(Finv, Aw_test))))
+    dT = dT_terms[0]
+    comps['dT_1'] = dT
+    for k,_term in enumerate(dT_terms[1:], start=2):
+        dT = dT + _term
+        comps[f'dT_{k}'] = _term
+    comps['dT'] = dT
+    tr_Finv_dFk = trace(dot(Finv, dFk_trial))                       # β
+    tr_Finv_Aw = trace(dot(Finv, Aw_test))                           # α
+    tr_Finv_dFk_FAw = trace(dot(Finv, dot(dFk_trial, dot(Finv, Aw_test))))  # γ
+    comps['tr_Finv_dFk'] = tr_Finv_dFk
+    comps['tr_Finv_Aw'] = tr_Finv_Aw
+    comps['tr_Finv_dFk_FAw'] = tr_Finv_dFk_FAw
 
     sigma_k = sigma_s_nonlinear(d_ref)
-    ds_u = dsigma_s(d_ref, du_trial)
+    ds_u = dsigma_s(d_ref, du_trial)  # δσ[du]
+    comps['sigma_k'] = sigma_k
+    comps['ds_u'] = ds_u
 
     invJ = Constant(1.0) / Jk
+    comps['invJ'] = invJ
+
+    # (1/J) δ²τ[w,du]
     term_a_parts = tuple(invJ * part for part in dT_terms)
     term_a = term_a_parts[0]
     for _part in term_a_parts[1:]:
         term_a = term_a + _part
-    term_b = -(tr_Finv_dFk / Jk) * T_w
-    term_c = tr_Finv_dFk_FAw * sigma_k
-    term_d = -tr_Finv_Aw * ds_u
+
+    # δσ[w] = (1/J) δτ[w] - α σ
+    ds_w = invJ * T_w - tr_Finv_Aw * sigma_k
+    comps['ds_w'] = ds_w
+
+    # -β δσ[w]
+    term_b = - tr_Finv_dFk * ds_w
+    comps['term_b'] = term_b
+
+    # (γ - αβ) σ
+    term_c = (tr_Finv_dFk_FAw - tr_Finv_dFk * tr_Finv_Aw) * sigma_k
+    comps['term_c'] = term_c
+
+    # -α δσ[du]
+    term_d = - tr_Finv_Aw * ds_u
+    comps['term_d'] = term_d
+
     if return_parts:
-        return (term_a, term_b, term_c, term_d), term_a_parts
-    return term_a, term_b, term_c, term_d
+        return (term_a, term_b, term_c, term_d), term_a_parts, comps
+    return term_a, term_b, term_c, term_d, comps
+
 
 
 def d2sigma_s(d_ref, du_trial, w_test):
@@ -190,29 +236,48 @@ def dtraction_solid_ref_L(du, w, d_ref):
 
 
 def _d2sigma_s_fx_components(d_ref, du, w, *, return_parts: bool = False):
+    comps = {}
     Fk = F_fx(d_ref)
+    comps['Fk'] = Fk
     Jk = ufl.det(Fk)
+    comps['Jk'] = Jk
     Finv = ufl.inv(Fk)
+    comps['Finv'] = Finv
     Sk = S_fx(d_ref)
+    comps['Sk'] = Sk
 
     dFk = ufl.grad(du)
+    comps['dFk'] = dFk
     Aw = ufl.grad(w)
+    comps['Aw'] = Aw
 
     dEk = 0.5 * (ufl.dot(dFk.T, Fk) + ufl.dot(Fk.T, dFk))
     dSk = fenicsx['lambda_s'] * ufl.tr(dEk) * I2_fx + 2.0 * fenicsx['mu_s'] * dEk
+    comps['dEk'] = dEk
+    comps['dSk'] = dSk
 
     dEw = 0.5 * (ufl.dot(Aw.T, Fk) + ufl.dot(Fk.T, Aw))
     dSw = fenicsx['lambda_s'] * ufl.tr(dEw) * I2_fx + 2.0 * fenicsx['mu_s'] * dEw
+    comps['dEw'] = dEw
+    comps['dSw'] = dSw
 
     ddEw = 0.5 * (ufl.dot(Aw.T, dFk) + ufl.dot(dFk.T, Aw))
     ddSw = fenicsx['lambda_s'] * ufl.tr(ddEw) * I2_fx + 2.0 * fenicsx['mu_s'] * ddEw
+    comps['ddEw'] = ddEw
+    comps['ddSw'] = ddSw
 
+    # δτ[w]
     T_w = (
         ufl.dot(Aw, ufl.dot(Sk, Fk.T))
         + ufl.dot(Fk, ufl.dot(dSw, Fk.T))
         + ufl.dot(Fk, ufl.dot(Sk, Aw.T))
     )
+    comps['T_w_1'] = ufl.dot(Aw, ufl.dot(Sk, Fk.T))
+    comps['T_w_2'] = ufl.dot(Fk, ufl.dot(dSw, Fk.T))
+    comps['T_w_3'] = ufl.dot(Fk, ufl.dot(Sk, Aw.T))
+    comps['T_w'] = T_w
 
+    # δ²τ[w,du] split
     dT_terms = (
         ufl.dot(Aw, ufl.dot(dSk, Fk.T)),
         ufl.dot(Aw, ufl.dot(Sk, dFk.T)),
@@ -223,32 +288,57 @@ def _d2sigma_s_fx_components(d_ref, du, w, *, return_parts: bool = False):
         ufl.dot(Fk, ufl.dot(dSk, Aw.T)),
     )
     dT = dT_terms[0]
-    for _term in dT_terms[1:]:
+    comps['dT_1'] = dT_terms[0]
+    for k,_term in enumerate(dT_terms[1:], start=2):
         dT = dT + _term
+        comps[f'dT_{k}'] = _term
 
-    tr_Finv_dFk = ufl.tr(ufl.dot(Finv, dFk))
-    tr_Finv_Aw = ufl.tr(ufl.dot(Finv, Aw))
-    tr_Finv_dFk_FAw = ufl.tr(ufl.dot(Finv, ufl.dot(dFk, ufl.dot(Finv, Aw))))
+    tr_Finv_dFk = ufl.tr(ufl.dot(Finv, dFk))                                # β
+    tr_Finv_Aw = ufl.tr(ufl.dot(Finv, Aw))                                  # α
+    tr_Finv_dFk_FAw = ufl.tr(ufl.dot(Finv, ufl.dot(dFk, ufl.dot(Finv, Aw))))  # γ
+    comps['tr_Finv_dFk'] = tr_Finv_dFk
+    comps['tr_Finv_Aw'] = tr_Finv_Aw
+    comps['tr_Finv_dFk_FAw'] = tr_Finv_dFk_FAw
 
     sigma_k = sigma_s_nonlinear_fx(d_ref)
-    ds_u = dsigma_s_fx(d_ref, du)
+    ds_u = dsigma_s_fx(d_ref, du)  # δσ[du]
+    comps['sigma_k'] = sigma_k
+    comps['ds_u'] = ds_u
 
     invJ = 1.0 / Jk
+    comps['invJ'] = invJ
+
+    # (1/J) δ²τ[w,du]
     term_a_parts = tuple(invJ * part for part in dT_terms)
     term_a = term_a_parts[0]
     for _part in term_a_parts[1:]:
         term_a = term_a + _part
-    term_b = -(tr_Finv_dFk / Jk) * T_w
-    term_c = tr_Finv_dFk_FAw * sigma_k
-    term_d = -tr_Finv_Aw * ds_u
+
+    # δσ[w] = (1/J) δτ[w] - α σ
+    ds_w = invJ * T_w - tr_Finv_Aw * sigma_k
+    comps['ds_w'] = ds_w
+
+    # -β δσ[w]
+    term_b = - tr_Finv_dFk * ds_w
+    comps['term_b'] = term_b
+
+    # (γ - αβ) σ
+    term_c = (tr_Finv_dFk_FAw - tr_Finv_dFk * tr_Finv_Aw) * sigma_k
+    comps['term_c'] = term_c
+
+    # -α δσ[du]
+    term_d = - tr_Finv_Aw * ds_u
+    comps['term_d'] = term_d
+
     if return_parts:
-        return (term_a, term_b, term_c, term_d), term_a_parts
-    return term_a, term_b, term_c, term_d
+        return (term_a, term_b, term_c, term_d), term_a_parts, comps
+    return term_a, term_b, term_c, term_d, comps
+
 
 
 def d2sigma_s_fx(d_ref, du, w):
-    term_a, term_b, term_c, term_d = _d2sigma_s_fx_components(d_ref, du, w)
-    return term_a + term_b + term_c + term_d
+    term_a, term_b, term_c, term_d, comps = _d2sigma_s_fx_components(d_ref, du, w)
+    return (term_a + term_b + term_c + term_d), comps
 
 
 def d2sigma_s_fx_terms(d_ref, du, w):
@@ -790,12 +880,31 @@ if __name__ == '__main__':
     d2sigma_pc_terms = d2sigma_s_terms(pc['u_k'], pc['du'], pc['v'])
     d2sigma_fx_terms = d2sigma_s_fx_terms(u_k_fx, du, v_fx)
 
-    F_trial_pc = F_pc(pc['du'])
-    F_test_pc = F_pc(pc['v'])
-    F_trial_fx = F_fx(du)
-    F_test_fx = F_fx(v_fx)
-    F_inv_trial_pc = inv(F_trial_pc)
-    F_inv_trial_fx = ufl.inv(F_trial_fx)
+    # F_trial_pc = F_pc(pc['du'])
+    # F_test_pc = F_pc(pc['v'])
+    Fk_pc = F_pc(pc['u_k'])
+    Fk_fx = F_fx(u_k_fx)
+    F_trial_pc = grad(pc['du'])
+    F_test_pc = grad(pc['v'])
+    F_trial_fx = ufl.grad(du)
+    F_test_fx = ufl.grad(v_fx)
+    Aw_test_pc = F_test_pc
+    Aw_test_fx = F_test_fx
+    F_inv_trial_pc = inv(Fk_pc)
+    F_inv_trial_fx = ufl.inv(Fk_fx)
+    dEk_trial_pc =  (dot(F_trial_pc.T, Fk_pc) + dot(Fk_pc.T, F_trial_pc))
+    dEk_trial_fx =  (ufl.dot(F_trial_fx.T, Fk_fx) + ufl.dot(Fk_fx.T, F_trial_fx))
+    dSk_trial_pc =  trace(dEk_trial_pc) * I2_pc +  dEk_trial_pc
+    dSk_trial_fx =  ufl.tr(dEk_trial_fx) * I2_fx +  dEk_trial_fx
+    dEk_test_pc =  (dot(F_test_pc.T, Fk_pc) + dot(Fk_pc.T, F_test_pc))
+    dSk_test_pc = trace(dEk_test_pc) * I2_pc +  dEk_test_pc
+    dEk_test_fx =  (ufl.dot(F_test_fx.T, Fk_fx) + ufl.dot(Fk_fx.T, F_test_fx))
+    dSk_test_fx =  ufl.tr(dEk_test_fx) * I2_fx +  dEk_test_fx
+
+    ddEw_mixed_pc =  (dot(F_test_pc.T, F_trial_pc) + dot(F_trial_pc.T, F_test_pc))
+    ddSw_mixed_pc =  trace(ddEw_mixed_pc) * I2_pc +  ddEw_mixed_pc
+    ddEw_mixed_fx =  (ufl.dot(F_test_fx.T, F_trial_fx) + ufl.dot(F_trial_fx.T, F_test_fx))
+    ddSw_mixed_fx =  ufl.tr(ddEw_mixed_fx) * I2_fx +  ddEw_mixed_fx
 
     def _solid_cross_component_entry(label: str):
         pc_expr = d2sigma_pc_terms[label]
@@ -810,6 +919,81 @@ if __name__ == '__main__':
 
     
     terms = {
+        "Mixed Basic [dot(F_test^T, F_trial)]": {
+            'pc': inner(dot(F_test_pc.T, F_trial_pc), I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(
+                ufl.dot(F_test_fx.T, F_trial_fx), I2_fx
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Right Contraction [dot(dot(F_test^T, F_trial), Fk^T)]": {
+            'pc': inner(dot(dot(F_test_pc.T, F_trial_pc), Fk_pc.T), I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(
+                ufl.dot(ufl.dot(F_test_fx.T, F_trial_fx), Fk_fx.T), I2_fx
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Left Contraction [dot(Fk, dot(F_test^T, F_trial))]": {
+            'pc': inner(dot(Fk_pc, dot(F_test_pc.T, F_trial_pc)), I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(
+                ufl.dot(Fk_fx, ufl.dot(F_test_fx.T, F_trial_fx)), I2_fx
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed VecOp dot grad [dot(du, grad(v))]": {
+            'pc': dot(dot(pc['du'], grad(pc['v'])), pc['c']) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.dot(
+                ufl.dot(du, ufl.grad(v_fx)), c_fx
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed VecOp grad dot [dot(grad(v), du)]": {
+            'pc': dot(dot(grad(pc['v']), pc['du']), pc['c']) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.dot(
+                ufl.dot(ufl.grad(v_fx), du), c_fx
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Diag dT term 1 [Aw · (dSk · F^T)]": {
+            'pc': inner(dot(Aw_test_pc, dot(dSk_trial_pc, Fk_pc.T)), I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(
+                ufl.dot(Aw_test_fx, ufl.dot(dSk_trial_fx, Fk_fx.T)),
+                I2_fx
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        # "Inverse Identity [inv(F_k) · F_k]": {
+        #     'pc': inner(dot(F_inv_trial_pc, Fk_pc), Fk_pc) * dx(metadata={"q": 6}),
+        #     'f_lambda': lambda deg: ufl.inner(
+        #         ufl.dot(F_inv_trial_fx, Fk_fx), Fk_fx
+        #     ) * ufl.dx(metadata={'quadrature_degree': deg}),
+        #     'mat': True,
+        #     'deg': 6,
+        # },
+        "Solid Cross term 1": {
+            'pc':  inner(dEk_trial_pc, dEk_test_pc) * dx(metadata={"q":6}),
+            'f_lambda': lambda deg:  ufl.inner(dEk_trial_fx, dEk_test_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Solid Cross term 2": {
+            'pc':  inner(dSk_trial_pc, dSk_test_pc) * dx(metadata={"q":6}),
+            'f_lambda': lambda deg:  ufl.inner(dSk_trial_fx, dSk_test_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Solid Cross term 3": {
+            'pc':  inner(ddEw_mixed_pc, I2_pc) * dx(metadata={"q":6}),
+            'f_lambda': lambda deg:  ufl.inner(ddEw_mixed_fx, I2_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
         "Solid Material Tangent": {
             'pc': pc['theta'] * inner(C_delta_E_trial_pc, delta_E_test_k_pc) * dx(metadata={"q":6}),
             'f_lambda': lambda deg: fenicsx['theta'] * ufl.inner(C_delta_E_trial_fx, delta_E_test_k_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
