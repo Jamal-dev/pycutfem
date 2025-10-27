@@ -63,7 +63,8 @@ from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo,
                                   HelpersFieldAware as _hfa,
                                   HelpersAlignCoefficents as _hac,
                                   normalize_edge_ids,
-                                  normalize_elem_ids)
+                                  normalize_elem_ids,
+                                  build_l2_projector)
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 from pycutfem.ufl.helpers_geom import (
@@ -369,6 +370,19 @@ class FormCompiler:
                     m_local = mask_dict.get(field)
                     if m_local is not None and len(row_field) == len(m_local):
                         row_field = row_field * m_local  # apply while still field-local
+
+        use_mortar = bool(self.ctx.get("use_mortar_projectors", False))
+        if use_mortar:
+            proj_dict = self.ctx.get("pos_P_by_field" if side == '+' else "neg_P_by_field", {})
+            P = proj_dict.get(field)
+            if P is not None and P.size:
+                if self.ctx.get("debug_mortar", False):
+                    print(f"[mortar] projecting field {field} on side {side}: row len {len(row_field)}, P shape {P.shape}")
+                row_field = row_field @ P
+                maps_red = self.ctx.get("pos_map_by_field_reduced" if side == '+' else "neg_map_by_field_reduced", {})
+                amap_reduced = maps_red.get(field)
+                if amap_reduced is not None:
+                    amap = amap_reduced
 
             # Pad to union layout only if assembling a mat/vec
             if g is not None:
@@ -806,16 +820,26 @@ class FormCompiler:
                 return self._vecinfo(np.array([tr_val]), role="function", node=node, field_names=A.field_names)
 
             # Test/Trial: sum diagonal across first/last axes → (n,)
-            if A.data.ndim != 3:
-                raise ValueError(f"Trace expects a rank-3 GradOpInfo for test/trial, got {A.data.shape}.")
-            k_dim, n_loc, d_dim = A.data.shape
-            m = min(k_dim, d_dim)
-            # sum_i A[i, :, i]  — works for either (k,n,d) or (d,n,k) because we always use axes (0,2)
-            tr_vec = np.zeros((n_loc,), dtype=A.data.dtype)
-            for i in range(m):
-                tr_vec += A.data[i, :, i]
-            # Return as a 1-component vector basis block: (1, n_loc)
-            return self._vecinfo(np.stack([tr_vec]), role=A.role, node=node, field_names=A.field_names)
+            if A.role in ("test", "trial") and A.ndim == 3:
+                k_dim, n_loc, d_dim = A.data.shape
+                m = min(k_dim, d_dim)
+                # sum_i A[i, :, i]  — works for either (k,n,d) or (d,n,k) because we always use axes (0,2)
+                tr_vec = np.zeros((n_loc,), dtype=A.data.dtype)
+                for i in range(m):
+                    tr_vec += A.data[i, :, i]
+                # Return as a 1-component vector basis block: (1, n_loc)
+                return self._vecinfo(np.stack([tr_vec]), role=A.role, node=node, field_names=A.field_names)
+            elif A.role in {"mixed"} and A.ndim == 4:
+                k,m,n,d = A.data.shape
+                k_dim, n_test, n_trial, d_dim = A.data.shape
+                m = min(k_dim, d_dim)
+                M = np.zeros((n_test, n_trial), dtype=A.data.dtype)
+                # sum over the diagonal of the outermost and innermost axes
+                for i in range(m):
+                    M += A.data[i, :, :, i]
+                return self._vecinfo(M, role=A.role, node=node, field_names=A.field_names)
+            else:
+                raise ValueError(f"Trace not defined for GradOpInfo with role '{A.role}' and shape {A.data.shape}.")
 
         # Hessian-like object
         if isinstance(A, HessOpInfo):
@@ -855,6 +879,15 @@ class FormCompiler:
             ],
             dtype=float,
         ) * inv_det
+        if isinstance(A, GradOpInfo):
+            if np.shape(inv_mat) == np.shape(A.data):
+                return self._gradinfo(
+                    inv_mat,
+                    role=A.role,
+                    node=node,
+                    field_names=A.field_names,
+                    coeffs=A.coeffs,
+                )
         return inv_mat
     
     def _visit_Power(self, n: Power):
@@ -1521,6 +1554,10 @@ class FormCompiler:
     def _visit_Sub(self, n):
         a = self._visit(n.a)
         b = self._visit(n.b)
+        if b is None:
+            logger.error(f"Sub encountered None operand: a={type(a)} {getattr(a,'role',None)}; sub expr={n}; rhs operand={n.b!r}")
+        if a is None:
+            logger.error(f"Sub encountered None left operand: b={type(b)} {getattr(b,'role',None)}; expression={n}")
         return a - b
     
     def _visit_Transpose(self, node: Transpose):
@@ -1558,6 +1595,8 @@ class FormCompiler:
     def _visit_Prod(self, n: Prod):
         a = self._visit(n.a)
         b = self._visit(n.b)
+        if a is None or b is None:
+            logger.error(f"Prod operands contain None: a={a} ({type(a)}), b={b} ({type(b)}); expr={n}")
         a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo, HessOpInfo)) else a
         b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo, HessOpInfo)) else b
         shape_a = getattr(a_data,"shape", None)
@@ -1570,7 +1609,11 @@ class FormCompiler:
         # print(f" Product: a type={type(a)}, shape={shape_a}, b type={type(b)}, shape={shape_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
         #       f" roles: a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}")
 
-        result = a * b
+        try:
+            result = a * b
+        except TypeError as exc:
+            logger.error(f"Prod multiplication failed: a={type(a)} role={getattr(a,'role',None)} shape={getattr(a,'shape',None)}; b={type(b)} role={getattr(b,'role',None)} shape={getattr(b,'shape',None)}; error={exc}; expr={n}")
+            raise
         # print(f" Product result: {getattr(result, 'shape', None)}"
         #       f" roles: result={getattr(result, 'role', None)}"
         #       f" types: result={type(result)}")
@@ -1752,8 +1795,8 @@ class FormCompiler:
         # ------------------------------------------------------------------
         # Case:  Grad(Trial) · Grad(Function)       ∇u_trial · ∇u_k 
         # ------------------------------------------------------------------
-        if isinstance(a, GradOpInfo) and (a.role in {"trial", "function", "test"}) \
-        and isinstance(b, GradOpInfo) and (b.role in {"trial", "function", "test"}):
+        if isinstance(a, GradOpInfo) and (a.role in {"trial", "function", "test", "mixed"}) \
+        and isinstance(b, GradOpInfo) and (b.role in {"trial", "function", "test", "mixed"}):
             return a.dot(b)
         
         # --- Hessian · vector (right) and vector · Hessian (left) -------------
@@ -1771,7 +1814,7 @@ class FormCompiler:
         # Both are numerical vectors (RHS)
         if isinstance(a, np.ndarray) and isinstance(b, np.ndarray): return np.dot(a,b)
 
-        raise TypeError(f"Unsupported dot product LHS '{n.a} . {n.b}'"
+        raise TypeError(f"Unsupported dot product LHS '{type(a)} . {type(b)}'"
                         f" for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}"
                         f" and data shapes a={getattr(a_data, 'shape', None)}, b={getattr(b_data, 'shape', None)}")
 
@@ -1849,7 +1892,11 @@ class FormCompiler:
     
         
     # Visitor dispatch
-    def _visit(self, node): return self._dispatch[type(node)](node)
+    def _visit(self, node):
+        result = self._dispatch[type(node)](node)
+        if result is None:
+            print(f"[NoneVisit] node={node!r} type={type(node).__name__}")
+        return result
 
     def _visit_Analytic(self, node): return node.eval(self.ctx['x_phys'])
 
@@ -2295,6 +2342,18 @@ class FormCompiler:
         self.ctx['is_interface'] = True
         self.ctx['is_ghost']     = False
         md = intg.measure.metadata or {}
+        debug_mortar = bool(md.get("debug_mortar", False))
+        if debug_mortar:
+            print("[mortar] debug enabled")
+        owner_side_meta = str(md.get("owner", "+") or "+").strip()
+        owner_side_meta = owner_side_meta if owner_side_meta in ("+", "-") else "+"
+        pairs_raw = md.get("mortar_pairs", [("u_pos", "vs_neg")])
+        if isinstance(pairs_raw, (list, tuple)):
+            mortar_pairs = [tuple(p) for p in pairs_raw]
+        else:
+            mortar_pairs = [tuple(pairs_raw)]
+        mortar_pairs = [p for p in mortar_pairs if len(p) == 2]
+        project_trial = bool(md.get("project_trial", False))
         side_md = md.get('side', None)
         if side_md in ('+', '-'):
             self.ctx['measure_side'] = side_md
@@ -2813,82 +2872,112 @@ class FormCompiler:
 
 
                 # Local union DOFs / accumulator
-                 # Always compute union layout & maps; accumulator depends on functional vs mat/vec
+                # Always compute union layout & maps; accumulator depends on functional vs mat/vec
                 pos_dofs = self.dh.get_elemental_dofs(pos_eid)
                 neg_dofs = self.dh.get_elemental_dofs(neg_eid)
                 global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
 
                 pos_map = np.searchsorted(global_dofs, pos_dofs)
                 neg_map = np.searchsorted(global_dofs, neg_dofs)
-                pos_map_by_field: Dict[str, np.ndarray] = {}
-                neg_map_by_field: Dict[str, np.ndarray] = {}
-                for fld in fields:
-                    try:
-                        pos_field_dofs = _hfa.elemental_field_dofs(self.dh, int(pos_eid), fld)
-                        pos_map_by_field[fld] = np.asarray(
-                            np.searchsorted(global_dofs, pos_field_dofs), dtype=int
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        neg_field_dofs = _hfa.elemental_field_dofs(self.dh, int(neg_eid), fld)
-                        neg_map_by_field[fld] = np.asarray(
-                            np.searchsorted(global_dofs, neg_field_dofs), dtype=int
-                        )
-                    except Exception:
-                        pass
+
+                pos_map_by_field_full, neg_map_by_field_full = _hfa.build_field_union_maps(
+                    self.dh, fields, int(pos_eid), int(neg_eid), global_dofs
+                )
+                if debug_mortar and ei == 0:
+                    print("pos fields:", list(pos_map_by_field_full.keys()))
+                    print("neg fields:", list(neg_map_by_field_full.keys()))
+
+                try:
+                    pos_masks_elem, neg_masks_elem = _hfa.build_side_masks_by_field(
+                        self.dh, fields, int(eid), level_set, tol=SIDE.tol
+                    )
+                except Exception:
+                    pos_masks_elem, neg_masks_elem = {}, {}
 
                 restriction_masks_phi = {'+': {}, '-': {}}
-                try:
-                    pos_masks_pos, _ = _hfa.build_side_masks_by_field(
-                        self.dh, fields, int(pos_eid), level_set, tol=SIDE.tol
-                    )
-                except Exception:
-                    pos_masks_pos = {}
-                try:
-                    _, neg_masks_neg = _hfa.build_side_masks_by_field(
-                        self.dh, fields, int(neg_eid), level_set, tol=SIDE.tol
-                    )
-                except Exception:
-                    neg_masks_neg = {}
-
                 for fld in fields:
-                    mask = pos_masks_pos.get(fld)
-                    if mask is not None and fld in pos_map_by_field and len(mask) == len(pos_map_by_field[fld]):
-                        arr = np.zeros(len(global_dofs), dtype=float)
-                        arr[pos_map_by_field[fld]] = np.asarray(mask, dtype=float)
-                        restriction_masks_phi['+'][fld] = arr
-                    mask = neg_masks_neg.get(fld)
-                    if mask is not None and fld in neg_map_by_field and len(mask) == len(neg_map_by_field[fld]):
-                        arr = np.zeros(len(global_dofs), dtype=float)
-                        arr[neg_map_by_field[fld]] = np.asarray(mask, dtype=float)
-                        restriction_masks_phi['-'][fld] = arr
+                    mask_pos = pos_masks_elem.get(fld)
+                    mask_neg = neg_masks_elem.get(fld)
+                    if mask_pos is not None:
+                        full_idx = pos_map_by_field_full.get(fld)
+                        if full_idx is not None and len(mask_pos) == len(full_idx):
+                            arr = np.zeros(len(global_dofs), dtype=float)
+                            arr[np.asarray(full_idx, dtype=int)] = np.asarray(mask_pos, dtype=float)
+                            restriction_masks_phi['+'][fld] = arr
+                    if mask_neg is not None:
+                        full_idx = neg_map_by_field_full.get(fld)
+                        if full_idx is not None and len(mask_neg) == len(full_idx):
+                            arr = np.zeros(len(global_dofs), dtype=float)
+                            arr[np.asarray(full_idx, dtype=int)] = np.asarray(mask_neg, dtype=float)
+                            restriction_masks_phi['-'][fld] = arr
 
-                # mask_pos_global = np.ones(len(global_dofs), dtype=float)
-                # mask_neg_global = np.ones(len(global_dofs), dtype=float)
-                # After you have pos_map, neg_map, pos_map_by_field, neg_map_by_field and global_dofs:
-
-                # Element‑membership masks on the union (1 on this element’s dofs; 0 otherwise)
+                # Element‑membership masks on the union (1 on this element’s DOFs; 0 otherwise)
                 mask_pos_global = np.zeros(len(global_dofs), dtype=float)
                 mask_pos_global[np.asarray(pos_map, dtype=int)] = 1.0
 
                 mask_neg_global = np.zeros(len(global_dofs), dtype=float)
                 mask_neg_global[np.asarray(neg_map, dtype=int)] = 1.0
 
-                # Per‑field union masks for Restriction() (again, element membership)
+                # Per-field union masks for Restriction() (again, element membership)
                 pos_union_mask_by_field = {}
                 neg_union_mask_by_field = {}
-                for fld, idxs in pos_map_by_field.items():
+                for fld, idxs in pos_map_by_field_full.items():
                     m = np.zeros(len(global_dofs), dtype=float)
                     m[np.asarray(idxs, dtype=int)] = 1.0
                     pos_union_mask_by_field[fld] = m
 
-                for fld, idxs in neg_map_by_field.items():
+                for fld, idxs in neg_map_by_field_full.items():
                     m = np.zeros(len(global_dofs), dtype=float)
                     m[np.asarray(idxs, dtype=int)] = 1.0
                     neg_union_mask_by_field[fld] = m
 
                 restriction_masks_union = {'+': pos_union_mask_by_field, '-': neg_union_mask_by_field}
+
+                pos_map_by_field_red: Dict[str, np.ndarray] = {}
+                neg_map_by_field_red: Dict[str, np.ndarray] = {}
+                P_pos_by_field: Dict[str, np.ndarray] = {}
+                P_neg_by_field: Dict[str, np.ndarray] = {}
+                weights_arr = np.asarray(qwts, dtype=float)
+
+                for fld in fields:
+                    try:
+                        field_dofs_local = _hfa.elemental_field_dofs(self.dh, int(eid), fld)
+                    except Exception:
+                        continue
+                    nloc = len(field_dofs_local)
+                    if nloc == 0:
+                        continue
+
+                    B = np.empty((len(qpts_phys), nloc), dtype=float)
+                    valid_basis = True
+                    for iq, xq in enumerate(qpts_phys):
+                        try:
+                            xi, eta = transform.inverse_mapping(mesh, int(eid), np.asarray(xq, float))
+                            B[iq, :] = self.me.basis(fld, float(xi), float(eta))
+                        except Exception:
+                            valid_basis = False
+                            break
+                    if not valid_basis:
+                        continue
+
+                    mask_pos = np.asarray(pos_masks_elem.get(fld, []), dtype=bool)
+                    mask_neg = np.asarray(neg_masks_elem.get(fld, []), dtype=bool)
+                    full_pos = pos_map_by_field_full.get(fld)
+                    full_neg = neg_map_by_field_full.get(fld)
+
+                    if mask_pos.size == nloc and full_pos is not None and mask_pos.any():
+                        Jpos = np.flatnonzero(mask_pos)
+                        pos_map_by_field_red[fld] = np.asarray(full_pos[Jpos], dtype=int)
+                        P_pos_by_field[fld] = build_l2_projector(B, weights_arr, Jpos)
+                        if debug_mortar and ei == 0:
+                            print(f"[mortar] + field {fld}: P shape {P_pos_by_field[fld].shape}")
+
+                    if mask_neg.size == nloc and full_neg is not None and mask_neg.any():
+                        Jneg = np.flatnonzero(mask_neg)
+                        neg_map_by_field_red[fld] = np.asarray(full_neg[Jneg], dtype=int)
+                        P_neg_by_field[fld] = build_l2_projector(B, weights_arr, Jneg)
+                        if debug_mortar and ei == 0:
+                            print(f"[mortar] - field {fld}: P shape {P_neg_by_field[fld].shape}")
 
                 loc_acc = 0.0 if is_functional else (
                     np.zeros(len(global_dofs)) if rhs
@@ -3012,8 +3101,17 @@ class FormCompiler:
                         "global_dofs": global_dofs,
                         "pos_map": pos_map,
                         "neg_map": neg_map,
-                        "pos_map_by_field": pos_map_by_field,
-                        "neg_map_by_field": neg_map_by_field,
+                        "pos_map_by_field": pos_map_by_field_full,
+                        "neg_map_by_field": neg_map_by_field_full,
+                        "pos_map_by_field_reduced": pos_map_by_field_red,
+                        "neg_map_by_field_reduced": neg_map_by_field_red,
+                        "pos_P_by_field": P_pos_by_field,
+                        "neg_P_by_field": P_neg_by_field,
+                        "use_mortar_projectors": bool(P_pos_by_field or P_neg_by_field),
+                        "mortar_owner_side": owner_side_meta,
+                        "mortar_project_trial": project_trial,
+                        "mortar_pairs": mortar_pairs,
+                        "debug_mortar": debug_mortar,
                         "pos_union_mask_by_field": pos_union_mask_by_field,
                         "neg_union_mask_by_field": neg_union_mask_by_field,
                         "coeff_mask_pos_global": mask_pos_global,
@@ -3043,6 +3141,8 @@ class FormCompiler:
                         loc_acc += w_eff * np.asarray(val)
 
                 # Scatter
+                if debug_mortar and ei == 0 and not is_functional:
+                    print(f"[mortar] element {eid} loc_acc norm {np.linalg.norm(loc_acc)}")
                 if is_functional:
                     self.ctx["scalar_results"][hook["name"]] += loc_acc
                 else:
@@ -3065,12 +3165,19 @@ class FormCompiler:
                     "x_phys_pos", "x_phys_neg",
                     "global_dofs", "pos_map", "neg_map", "pos_eid", "neg_eid",
                     "pos_map_by_field", "neg_map_by_field",
+                    "pos_map_by_field_reduced", "neg_map_by_field_reduced",
+                    "pos_P_by_field", "neg_P_by_field",
                     "pos_union_mask_by_field", "neg_union_mask_by_field",
                     "coeff_mask_pos_global", "coeff_mask_neg_global",
                     "_restriction_masks",
                     "use_union_local_dofs",
                     "mask_basis",
                     "is_interface",
+                    "use_mortar_projectors",
+                    "mortar_owner_side",
+                    "mortar_project_trial",
+                    "mortar_pairs",
+                    "debug_mortar",
                     "_xi_eta_cache"):
                 self.ctx.pop(k, None)
             self.ctx.pop('_ghost_level_set', None)

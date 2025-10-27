@@ -19,8 +19,8 @@ from pycutfem.utils.meshgen import structured_quad
 from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
-    Function, VectorFunction, Constant, grad, inner, 
-    dot, div, trace, Hessian, Laplacian, FacetNormal, Identity
+    Function, VectorFunction, Constant, grad, inner,
+    dot, div, trace, Hessian, Laplacian, FacetNormal, Identity, det, inv
 )
 from pycutfem.ufl.measures import dx, dInterface, dS
 from pycutfem.ufl.forms import assemble_form
@@ -36,6 +36,172 @@ logging.basicConfig(
     level=logging.INFO,  # show debug messages
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+I2 = Identity(2)
+lambda_s = Constant(0.0)
+mu_s = Constant(0.0)
+
+# ------------------------------------------------------------------
+#  Nonlinear solid helpers (St. Venant–Kirchhoff)
+# ------------------------------------------------------------------
+
+
+def F_of(d):
+    """Deformation gradient of the displacement field in reference coordinates."""
+    return I2 + grad(d)
+
+
+def C_of(F):
+    """Right Cauchy–Green tensor."""
+    return dot(F.T, F)
+
+
+def E_of(F):
+    """Green–Lagrange strain."""
+    return Constant(0.5) * (C_of(F) - I2)
+
+
+def S_stvk(E):
+    """Second Piola–Kirchhoff stress for StVK material."""
+    return lambda_s * trace(E) * I2 + Constant(2.0) * mu_s * E
+
+
+def sigma_s_nonlinear(d):
+    """Cauchy stress for the current configuration."""
+    F = F_of(d)
+    E = E_of(F)
+    S = S_stvk(E)
+    J = det(F)
+    return Constant(1.0) / J * dot(dot(F, S), F.T)
+
+
+def dsigma_s(d_ref, delta_d):
+    """Directional derivative of the Cauchy stress w.r.t. displacement."""
+    Fk = F_of(d_ref)
+    Ek = E_of(Fk)
+    Sk = S_stvk(Ek)
+    dF = grad(delta_d)
+    dE = Constant(0.5) * (dot(dF.T, Fk) + dot(Fk.T, dF))
+    dS = lambda_s * trace(dE) * I2 + Constant(2.0) * mu_s * dE
+    Jk = det(Fk)
+    Finv = inv(Fk)
+    dJ = Jk * trace(dot(Finv, dF))
+    term = dot(dF, dot(Sk, Fk.T)) + dot(Fk, dot(dS, Fk.T)) + dot(Fk, dot(Sk, dF.T))
+    return Constant(1.0) / Jk * term - (dJ / Jk) * sigma_s_nonlinear(d_ref)
+
+
+def traction_solid_L(delta_d, d_ref):
+    """Linearized traction in direction delta_d."""
+    return dot(dsigma_s(d_ref, delta_d), n)
+
+
+def d2sigma_s(d_ref, du_trial, w_test):
+    Fk = F_of(d_ref)
+    Jk = det(Fk)
+    Finv = inv(Fk)
+    Sk = S_stvk(E_of(Fk))
+
+    dFk_trial = grad(du_trial)
+    Aw_test = grad(w_test)
+
+    dEk_trial = Constant(0.5) * (dot(dFk_trial.T, Fk) + dot(Fk.T, dFk_trial))
+    dSk_trial = lambda_s * trace(dEk_trial) * I2 + Constant(2.0) * mu_s * dEk_trial
+
+    dEw_test = Constant(0.5) * (dot(Aw_test.T, Fk) + dot(Fk.T, Aw_test))
+    dSw_test = lambda_s * trace(dEw_test) * I2 + Constant(2.0) * mu_s * dEw_test
+
+    ddEw_mixed = Constant(0.5) * (dot(Aw_test.T, dFk_trial) + dot(dFk_trial.T, Aw_test))
+    ddSw_mixed = lambda_s * trace(ddEw_mixed) * I2 + Constant(2.0) * mu_s * ddEw_mixed
+
+    T_w = (
+        dot(Aw_test, dot(Sk, Fk.T))
+        + dot(Fk, dot(dSw_test, Fk.T))
+        + dot(Fk, dot(Sk, Aw_test.T))
+    )
+
+    dT = (
+        dot(Aw_test, dot(dSk_trial, Fk.T))
+        + dot(Aw_test, dot(Sk, dFk_trial.T))
+        + dot(dFk_trial, dot(dSw_test, Fk.T))
+        + dot(Fk, dot(ddSw_mixed, Fk.T))
+        + dot(Fk, dot(dSw_test, dFk_trial.T))
+        + dot(dFk_trial, dot(Sk, Aw_test.T))
+        + dot(Fk, dot(dSk_trial, Aw_test.T))
+    )
+
+    tr_Finv_dFk = trace(dot(Finv, dFk_trial))
+    tr_Finv_Aw = trace(dot(Finv, Aw_test))
+    tr_Finv_dFk_FAw = trace(dot(Finv, dot(dFk_trial, dot(Finv, Aw_test))))
+
+    sigma_k = sigma_s_nonlinear(d_ref)
+    ds_u = dsigma_s(d_ref, du_trial)
+
+    return (
+        Constant(1.0) / Jk * dT
+        - (tr_Finv_dFk / Jk) * T_w
+        + tr_Finv_dFk_FAw * sigma_k
+        - tr_Finv_Aw * ds_u
+    )
+
+
+n = FacetNormal()
+
+
+def dtraction_solid_ref_L(du, w, d_ref):
+    return dot(d2sigma_s(d_ref, du, w), n)
+
+
+def d2sigma_s_fx(d_ref, du, w):
+    Fk = F_fx(d_ref)
+    Jk = ufl.det(Fk)
+    Finv = ufl.inv(Fk)
+    Sk = S_fx(d_ref)
+
+    dFk = ufl.grad(du)
+    Aw = ufl.grad(w)
+
+    dEk = 0.5 * (ufl.dot(dFk.T, Fk) + ufl.dot(Fk.T, dFk))
+    dSk = fenicsx['lambda_s'] * ufl.tr(dEk) * I2_fx + 2.0 * fenicsx['mu_s'] * dEk
+
+    dEw = 0.5 * (ufl.dot(Aw.T, Fk) + ufl.dot(Fk.T, Aw))
+    dSw = fenicsx['lambda_s'] * ufl.tr(dEw) * I2_fx + 2.0 * fenicsx['mu_s'] * dEw
+
+    ddEw = 0.5 * (ufl.dot(Aw.T, dFk) + ufl.dot(dFk.T, Aw))
+    ddSw = fenicsx['lambda_s'] * ufl.tr(ddEw) * I2_fx + 2.0 * fenicsx['mu_s'] * ddEw
+
+    T_w = (
+        ufl.dot(Aw, ufl.dot(Sk, Fk.T))
+        + ufl.dot(Fk, ufl.dot(dSw, Fk.T))
+        + ufl.dot(Fk, ufl.dot(Sk, Aw.T))
+    )
+
+    dT = (
+        ufl.dot(Aw, ufl.dot(dSk, Fk.T))
+        + ufl.dot(Aw, ufl.dot(Sk, dFk.T))
+        + ufl.dot(dFk, ufl.dot(dSw, Fk.T))
+        + ufl.dot(Fk, ufl.dot(ddSw, Fk.T))
+        + ufl.dot(Fk, ufl.dot(dSw, dFk.T))
+        + ufl.dot(dFk, ufl.dot(Sk, Aw.T))
+        + ufl.dot(Fk, ufl.dot(dSk, Aw.T))
+    )
+
+    tr_Finv_dFk = ufl.tr(ufl.dot(Finv, dFk))
+    tr_Finv_Aw = ufl.tr(ufl.dot(Finv, Aw))
+    tr_Finv_dFk_FAw = ufl.tr(ufl.dot(Finv, ufl.dot(dFk, ufl.dot(Finv, Aw))))
+
+    sigma_k = sigma_s_nonlinear_fx(d_ref)
+    ds_u = dsigma_s_fx(d_ref, du)
+
+    return (
+        (1.0 / Jk) * dT
+        - (tr_Finv_dFk / Jk) * T_w
+        + tr_Finv_dFk_FAw * sigma_k
+        - tr_Finv_Aw * ds_u
+    )
+
+
+def dtraction_solid_ref_L_fx(du, w, d_ref, normal_fx):
+    return ufl.dot(d2sigma_s_fx(d_ref, du, w), normal_fx)
 
 def debug_interpolate(self, f):
     """
@@ -156,6 +322,11 @@ def setup_problems():
           'lambda_s': Constant(0.5e6, dim=0),
           'mu_s': Constant(2.0e6, dim=0),
           'normal': FacetNormal()}
+
+    global lambda_s, mu_s, n
+    lambda_s = pc['lambda_s']
+    mu_s = pc['mu_s']
+    n = pc['normal']
     
     mesh_fx = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, nx, ny, dolfinx.mesh.CellType.quadrilateral)
     gdim = mesh_fx.geometry.dim
@@ -500,6 +671,33 @@ if __name__ == '__main__':
         E_ref = E_fx(u)
         return fenicsx['lambda_s'] * ufl.tr(E_ref) * I2_fx + 2.0 * fenicsx['mu_s'] * E_ref
 
+
+    def sigma_s_nonlinear_fx(u):
+        F = F_fx(u)
+        S = S_fx(u)
+        J = ufl.det(F)
+        return (1.0 / J) * ufl.dot(ufl.dot(F, S), F.T)
+
+
+    def dsigma_s_fx(d_ref, delta_d):
+        Fk = F_fx(d_ref)
+        Sk = S_fx(d_ref)
+        dF = ufl.grad(delta_d)
+        dE = 0.5 * (ufl.dot(dF.T, Fk) + ufl.dot(Fk.T, dF))
+        dS = fenicsx['lambda_s'] * ufl.tr(dE) * I2_fx + 2.0 * fenicsx['mu_s'] * dE
+        Jk = ufl.det(Fk)
+        Finv = ufl.inv(Fk)
+        dJ = Jk * ufl.tr(ufl.dot(Finv, dF))
+        term = (
+            ufl.dot(dF, ufl.dot(Sk, Fk.T))
+            + ufl.dot(Fk, ufl.dot(dS, Fk.T))
+            + ufl.dot(Fk, ufl.dot(Sk, dF.T))
+        )
+        return (1.0 / Jk) * term - (dJ / Jk) * sigma_s_nonlinear_fx(d_ref)
+
+
+    
+
     F_k_pc = F_pc(pc['u_k'])
     F_n_pc = F_pc(pc['u_n'])
     F_k_fx = F_fx(u_k_fx)
@@ -528,6 +726,9 @@ if __name__ == '__main__':
     delta_delta_E_test_pc_2 = 0.5 * (dot(grad(pc['v']).T, grad(pc['du'])) )
     delta_delta_E_test_fx_2 = 0.5 * (ufl.dot(ufl.grad(v_fx).T, ufl.grad(du)) )
 
+    d2sigma_pc_expr = d2sigma_s(pc['u_k'], pc['du'], pc['v'])
+    d2sigma_fx_expr = d2sigma_s_fx(u_k_fx, du, v_fx)
+
 
 
     
@@ -535,6 +736,12 @@ if __name__ == '__main__':
         "Solid Material Tangent": {
             'pc': pc['theta'] * inner(C_delta_E_trial_pc, delta_E_test_k_pc) * dx(metadata={"q":6}),
             'f_lambda': lambda deg: fenicsx['theta'] * ufl.inner(C_delta_E_trial_fx, delta_E_test_k_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Solid Cross Tangent": {
+            'pc': pc['theta'] * inner(d2sigma_pc_expr, I2_pc) * dx(metadata={"q":6}),
+            'f_lambda': lambda deg: fenicsx['theta'] * ufl.inner(d2sigma_fx_expr, I2_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
             'mat': True,
             'deg': 6,
         },
