@@ -18,6 +18,7 @@ from pycutfem.jit.ir import (
 )
 from dataclasses import replace
 import logging
+import numpy as np
 from pycutfem.utils.bitset import bitset_cache_token
 
 logger = logging.getLogger(__name__)
@@ -251,7 +252,18 @@ class IRGenerator:
                 if token is None:
                     token = f"fallback_{id(node)}"
                 name = f"const_arr_{token}"
-                self.ir_sequence.append(LoadConstantArray(name=name, shape=node.shape))
+                value_arr = np.asarray(node.value)
+                is_vec = value_arr.ndim == 1
+                is_grad = value_arr.ndim == 2 and value_arr.shape[0] == value_arr.shape[1]
+                self.ir_sequence.append(
+                    LoadConstantArray(
+                        name=name,
+                        shape=node.shape,
+                        role="const",
+                        is_vector=is_vec,
+                        is_gradient=is_grad
+                    )
+                )
             return
         if isinstance(node, UFLTranspose):
             # Transpose is a no-op in IR, just push the top-of-stack tensor.

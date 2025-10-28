@@ -1,4 +1,3 @@
-from calendar import c
 import numpy as np
 import pandas as pd
 import os
@@ -1070,14 +1069,14 @@ if __name__ == '__main__':
             'deg': 6,
         },
         "Mixed Basic [tr_Finv_dFk@tr_Finv_Aw]": {
-            'pc': inner(pc_geo["tr_Finv_dFk"], pc_geo['tr_Finv_Aw']) * dx(metadata={"q": 6}),
+            'pc': inner(pc_geo["tr_Finv_dFk"], pc_geo['tr_Finv_Aw']) * dx(metadata={"q": 8}),
             'f_lambda': lambda deg: ufl.inner(fe_geo["tr_Finv_dFk"], fe_geo['tr_Finv_Aw']) \
                                     * ufl.dx(metadata={'quadrature_degree': deg}),
             'mat': True,
             'deg': 14,
         },
         "Mixed Basic [tr_Finv_dFk_FAw]": {
-            'pc': pc_geo["tr_Finv_dFk_FAw"] * dx(metadata={"q": 6}),
+            'pc': pc_geo["tr_Finv_dFk_FAw"] * dx(metadata={"q": 8}),
             'f_lambda': lambda deg: fe_geo["tr_Finv_dFk_FAw"] \
                                     * ufl.dx(metadata={'quadrature_degree': deg}),
             'mat': True,
@@ -1159,16 +1158,16 @@ if __name__ == '__main__':
             'deg': 6,
         },
         "Solid Cross Tangent": {
-            'pc': pc['theta'] * inner(d2sigma_pc_expr, I2_pc) * dx(metadata={"q":6}),
+            'pc': pc['theta'] * inner(d2sigma_pc_expr, I2_pc) * dx(metadata={"q":8}),
             'f_lambda': lambda deg: fenicsx['theta'] * ufl.inner(d2sigma_fx_expr, I2_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
             'mat': True,
             'deg': 14,
         },
-        "Solid Cross Tangent [A: invJ*dT]": _solid_cross_component_entry("A: invJ*dT", deg_fe=14, deg_pc=6),
-        "Solid Cross Tangent [B: -(tr(F^{-1} dF) over J)*T_w]": _solid_cross_component_entry("B: -(tr(F^{-1} dF) over J)*T_w", deg_fe=14, deg_pc=6),
-        "Solid Cross Tangent [C: tr(F^{-1} dF F^{-1} Aw)*sigma]": _solid_cross_component_entry("C: tr(F^{-1} dF F^{-1} Aw)*sigma", deg_fe=14, deg_pc=6),
-        "Solid Cross Tangent [D: -tr(F^{-1} Aw)*ds_u]": _solid_cross_component_entry("D: -tr(F^{-1} Aw)*ds_u", deg_fe=14, deg_pc=6),
-    
+        "Solid Cross Tangent [A: invJ*dT]": _solid_cross_component_entry("A: invJ*dT", deg_fe=14, deg_pc=8),
+        "Solid Cross Tangent [B: -(tr(F^{-1} dF) over J)*T_w]": _solid_cross_component_entry("B: -(tr(F^{-1} dF) over J)*T_w", deg_fe=14, deg_pc=8),
+        "Solid Cross Tangent [C: tr(F^{-1} dF F^{-1} Aw)*sigma]": _solid_cross_component_entry("C: tr(F^{-1} dF F^{-1} Aw)*sigma", deg_fe=14, deg_pc=8),
+        "Solid Cross Tangent [D: -tr(F^{-1} Aw)*ds_u]": _solid_cross_component_entry("D: -tr(F^{-1} Aw)*ds_u", deg_fe=14, deg_pc=8),
+
     "Solid Geometric Tangent": {
         'pc': pc['theta'] * inner(S_k_pc, delta_delta_E_test_pc) * dx(metadata={"q":6}),
         'f_lambda': lambda deg: fenicsx['theta'] * ufl.inner(S_k_fx, delta_delta_E_test_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
@@ -1418,7 +1417,7 @@ if __name__ == '__main__':
     # Keep track of successes and failures
     failed_tests = []
     success_count = 0
-    backend_type = "python"
+    backend_type = "jit"
     for name, forms in terms.items():
         J_pc, R_pc, J_fx, R_fx = None, None, None, None
 
