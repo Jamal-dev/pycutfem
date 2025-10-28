@@ -216,12 +216,12 @@ def _d2sigma_s_components(d_ref, du_trial, w_test, *, return_parts: bool = False
 
 
 def d2sigma_s(d_ref, du_trial, w_test):
-    term_a, term_b, term_c, term_d = _d2sigma_s_components(d_ref, du_trial, w_test)
-    return term_a + term_b + term_c + term_d
+    term_a, term_b, term_c, term_d, comps = _d2sigma_s_components(d_ref, du_trial, w_test)
+    return (term_a + term_b + term_c + term_d),comps
 
 
 def d2sigma_s_terms(d_ref, du_trial, w_test):
-    components, term_a_parts = _d2sigma_s_components(d_ref, du_trial, w_test, return_parts=True)
+    components, term_a_parts, _ = _d2sigma_s_components(d_ref, du_trial, w_test, return_parts=True)
     terms = dict(zip(D2SIGMA_COMPONENT_LABELS, components))
     for label, part in zip(D2SIGMA_TERM_A_SUBLABELS, term_a_parts):
         terms[label] = part
@@ -232,7 +232,8 @@ n = FacetNormal()
 
 
 def dtraction_solid_ref_L(du, w, d_ref):
-    return dot(d2sigma_s(d_ref, du, w), n)
+    terms, _ =d2sigma_s(d_ref, du, w)
+    return dot(terms, n)
 
 
 def _d2sigma_s_fx_components(d_ref, du, w, *, return_parts: bool = False):
@@ -292,7 +293,7 @@ def _d2sigma_s_fx_components(d_ref, du, w, *, return_parts: bool = False):
     for k,_term in enumerate(dT_terms[1:], start=2):
         dT = dT + _term
         comps[f'dT_{k}'] = _term
-
+    comps['dT'] = dT
     tr_Finv_dFk = ufl.tr(ufl.dot(Finv, dFk))                                # β
     tr_Finv_Aw = ufl.tr(ufl.dot(Finv, Aw))                                  # α
     tr_Finv_dFk_FAw = ufl.tr(ufl.dot(Finv, ufl.dot(dFk, ufl.dot(Finv, Aw))))  # γ
@@ -342,7 +343,7 @@ def d2sigma_s_fx(d_ref, du, w):
 
 
 def d2sigma_s_fx_terms(d_ref, du, w):
-    components, term_a_parts = _d2sigma_s_fx_components(d_ref, du, w, return_parts=True)
+    components, term_a_parts, _ = _d2sigma_s_fx_components(d_ref, du, w, return_parts=True)
     terms = dict(zip(D2SIGMA_COMPONENT_LABELS, components))
     for label, part in zip(D2SIGMA_TERM_A_SUBLABELS, term_a_parts):
         terms[label] = part
@@ -350,7 +351,8 @@ def d2sigma_s_fx_terms(d_ref, du, w):
 
 
 def dtraction_solid_ref_L_fx(du, w, d_ref, normal_fx):
-    return ufl.dot(d2sigma_s_fx(d_ref, du, w), normal_fx)
+    terms, _ =d2sigma_s_fx(d_ref, du, w)
+    return ufl.dot(terms, normal_fx)
 
 def debug_interpolate(self, f):
     """
@@ -875,8 +877,8 @@ if __name__ == '__main__':
     delta_delta_E_test_pc_2 = 0.5 * (dot(grad(pc['v']).T, grad(pc['du'])) )
     delta_delta_E_test_fx_2 = 0.5 * (ufl.dot(ufl.grad(v_fx).T, ufl.grad(du)) )
 
-    d2sigma_pc_expr = d2sigma_s(pc['u_k'], pc['du'], pc['v'])
-    d2sigma_fx_expr = d2sigma_s_fx(u_k_fx, du, v_fx)
+    d2sigma_pc_expr, pc_geo = d2sigma_s(pc['u_k'], pc['du'], pc['v'])
+    d2sigma_fx_expr, fe_geo = d2sigma_s_fx(u_k_fx, du, v_fx)
     d2sigma_pc_terms = d2sigma_s_terms(pc['u_k'], pc['du'], pc['v'])
     d2sigma_fx_terms = d2sigma_s_fx_terms(u_k_fx, du, v_fx)
 
@@ -906,19 +908,183 @@ if __name__ == '__main__':
     ddEw_mixed_fx =  (ufl.dot(F_test_fx.T, F_trial_fx) + ufl.dot(F_trial_fx.T, F_test_fx))
     ddSw_mixed_fx =  ufl.tr(ddEw_mixed_fx) * I2_fx +  ddEw_mixed_fx
 
-    def _solid_cross_component_entry(label: str):
+    def _solid_cross_component_entry(label: str,deg_fe:int = 6, deg_pc:int = 6):
         pc_expr = d2sigma_pc_terms[label]
         fx_expr = d2sigma_fx_terms[label]
         return {
-            'pc': pc['theta'] * inner(pc_expr, I2_pc) * dx(metadata={"q":6}),
+            'pc': pc['theta'] * inner(pc_expr, I2_pc) * dx(metadata={"q":deg_pc}),
             'f_lambda': lambda deg, expr=fx_expr: fenicsx['theta'] * ufl.inner(expr, I2_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
             'mat': True,
-            'deg': 6,
+            'deg': deg_fe,
         }
 
 
     
     terms = {
+        "Mixed Basic [Fk]": {
+            'pc': inner(pc_geo["Fk"], grad(pc['v'])) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["Fk"], ufl.grad(v_fx)) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
+
+        "Mixed Basic [Fk@Finv]": {
+            'pc': inner(pc_geo["Fk"], pc_geo["Finv"]) * pc['dp'] * pc['q'] * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["Fk"], fe_geo["Finv"]) * dp * q_fx \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 8,
+        },
+        "Mixed Basic residual [Fk@Finv]": {
+            'pc': inner(pc_geo["Fk"], pc_geo["Finv"])  * pc['q'] * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["Fk"], fe_geo["Finv"])  * q_fx \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+        },
+        "Mixed Basic [Sk]": {
+            'pc': inner(pc_geo["Sk"], grad(pc['v'])) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["Sk"], ufl.grad(v_fx)) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
+        "Mixed Basic [dFk@Aw]": {
+            'pc': inner(pc_geo["dFk_trial"], pc_geo["Aw_test"]) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dFk"], fe_geo["Aw"]) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [dEk@dEw]": {
+            'pc': inner(pc_geo["dEk_trial"], pc_geo["dEw_test"]) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dEk"], fe_geo["dEw"]) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [dSk@dSw]": {
+            'pc': inner(pc_geo["dSk_trial"], pc_geo["dSw_test"]) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dSk"], fe_geo["dSw"]) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [ddEw@I2]": {
+            'pc': inner(pc_geo["ddEw_mixed"], I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["ddEw"], I2_fx) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [ddSw@I2]": {
+            'pc': inner(pc_geo["ddSw_mixed"], I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["ddSw"], I2_fx) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic residual [I2@T_w_1]": {
+            'pc': inner(I2_pc, pc_geo["T_w_1"]) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(I2_fx, fe_geo["T_w_1"]) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
+        "Mixed Basic residual [I2@T_w_2]": {
+            'pc': inner(I2_pc, pc_geo["T_w_2"]) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(I2_fx, fe_geo["T_w_2"]) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
+        "Mixed Basic residual [I2@T_w_3]": {
+            'pc': inner(I2_pc, pc_geo["T_w_3"]) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(I2_fx, fe_geo["T_w_3"]) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
+        "Mixed Basic residual [I2@T_w]": {
+            'pc': inner(I2_pc, pc_geo["T_w"]) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(I2_fx, fe_geo["T_w"]) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
+        "Mixed Basic [dT_1@I2]": {
+            'pc': inner(pc_geo["dT_1"], I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dT_1"], I2_fx) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [dT_2@I2]": {
+            'pc': inner(pc_geo["dT_2"], I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dT_2"], I2_fx) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [dT_3@I2]": {
+            'pc': inner(pc_geo["dT_3"], I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dT_3"], I2_fx) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [dT_4@I2]": {
+            'pc': inner(pc_geo["dT_4"], I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dT_4"], I2_fx) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [dT_5@I2]": {
+            'pc': inner(pc_geo["dT_5"], I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dT_5"], I2_fx) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [dT_6@I2]": {
+            'pc': inner(pc_geo["dT_6"], I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dT_6"], I2_fx) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [dT_7@I2]": {
+            'pc': inner(pc_geo["dT_7"], I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dT_7"], I2_fx) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [dT@I2]": {
+            'pc': inner(pc_geo["dT"], I2_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["dT"], I2_fx) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Mixed Basic [tr_Finv_dFk@tr_Finv_Aw]": {
+            'pc': inner(pc_geo["tr_Finv_dFk"], pc_geo['tr_Finv_Aw']) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(fe_geo["tr_Finv_dFk"], fe_geo['tr_Finv_Aw']) \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 14,
+        },
+        "Mixed Basic [tr_Finv_dFk_FAw]": {
+            'pc': pc_geo["tr_Finv_dFk_FAw"] * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: fe_geo["tr_Finv_dFk_FAw"] \
+                                    * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 14,
+        },
+        # ----------------------------------------------------------
+
         "Mixed Basic [dot(F_test^T, F_trial)]": {
             'pc': inner(dot(F_test_pc.T, F_trial_pc), I2_pc) * dx(metadata={"q": 6}),
             'f_lambda': lambda deg: ufl.inner(
@@ -968,14 +1134,6 @@ if __name__ == '__main__':
             'mat': True,
             'deg': 6,
         },
-        # "Inverse Identity [inv(F_k) · F_k]": {
-        #     'pc': inner(dot(F_inv_trial_pc, Fk_pc), Fk_pc) * dx(metadata={"q": 6}),
-        #     'f_lambda': lambda deg: ufl.inner(
-        #         ufl.dot(F_inv_trial_fx, Fk_fx), Fk_fx
-        #     ) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': True,
-        #     'deg': 6,
-        # },
         "Solid Cross term 1": {
             'pc':  inner(dEk_trial_pc, dEk_test_pc) * dx(metadata={"q":6}),
             'f_lambda': lambda deg:  ufl.inner(dEk_trial_fx, dEk_test_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
@@ -1004,259 +1162,258 @@ if __name__ == '__main__':
             'pc': pc['theta'] * inner(d2sigma_pc_expr, I2_pc) * dx(metadata={"q":6}),
             'f_lambda': lambda deg: fenicsx['theta'] * ufl.inner(d2sigma_fx_expr, I2_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
             'mat': True,
+            'deg': 14,
+        },
+        "Solid Cross Tangent [A: invJ*dT]": _solid_cross_component_entry("A: invJ*dT", deg_fe=14, deg_pc=6),
+        "Solid Cross Tangent [B: -(tr(F^{-1} dF) over J)*T_w]": _solid_cross_component_entry("B: -(tr(F^{-1} dF) over J)*T_w", deg_fe=14, deg_pc=6),
+        "Solid Cross Tangent [C: tr(F^{-1} dF F^{-1} Aw)*sigma]": _solid_cross_component_entry("C: tr(F^{-1} dF F^{-1} Aw)*sigma", deg_fe=14, deg_pc=6),
+        "Solid Cross Tangent [D: -tr(F^{-1} Aw)*ds_u]": _solid_cross_component_entry("D: -tr(F^{-1} Aw)*ds_u", deg_fe=14, deg_pc=6),
+    
+    "Solid Geometric Tangent": {
+        'pc': pc['theta'] * inner(S_k_pc, delta_delta_E_test_pc) * dx(metadata={"q":6}),
+        'f_lambda': lambda deg: fenicsx['theta'] * ufl.inner(S_k_fx, delta_delta_E_test_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+        'mat': True,
+        'deg': 6,
+    },
+        "Solid Residual": {
+            'pc': (
+                pc['theta'] * inner(S_k_pc, delta_E_test_k_pc)
+                + (Constant(1.0, dim=0) - pc['theta']) * inner(S_n_pc, delta_E_test_n_pc)
+            ) * dx(metadata={"q":6}),
+            'f_lambda': lambda deg: (
+                fenicsx['theta'] * ufl.inner(S_k_fx, delta_E_test_k_fx)
+                + (1.0 - fenicsx['theta']) * ufl.inner(S_n_fx, delta_E_test_n_fx)
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
             'deg': 6,
         },
-        "Solid Cross Tangent [A: invJ*dT]": _solid_cross_component_entry("A: invJ*dT"),
-        "Solid Cross Tangent [B: -(tr(F^{-1} dF) over J)*T_w]": _solid_cross_component_entry("B: -(tr(F^{-1} dF) over J)*T_w"),
-        "Solid Cross Tangent [C: tr(F^{-1} dF F^{-1} Aw)*sigma]": _solid_cross_component_entry("C: tr(F^{-1} dF F^{-1} Aw)*sigma"),
-        "Solid Cross Tangent [D: -tr(F^{-1} Aw)*ds_u]": _solid_cross_component_entry("D: -tr(F^{-1} Aw)*ds_u"),
+        "LHS Mass":          {'pc': pc['rho'] * dot(pc['du'], pc['v']) / pc['dt'] * dx(),                                    'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(du, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "LHS Diffusion":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']), grad(pc['v'])) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du), ufl.grad(v)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "LHS Advection 1":   {'pc':  ( dot(dot(grad(pc['du']), pc['u_k']), pc['v'])) * dx(metadata={"q":6}),           'f_lambda': lambda deg:  ufl.dot(ufl.dot(ufl.grad(du),u_k_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
+        "LHS Advection 2":   {'pc':  dot(dot(grad(pc['u_k']), pc['du']), pc['v']) * dx(metadata={"q":5}),            'f_lambda': lambda deg: ufl.dot( ufl.dot(ufl.grad(u_k_fx),du), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
+        "LHS Advection 3":   {'pc':  ( dot(dot(pc['u_k'], grad(pc['du']) ), pc['v'])) * dx(metadata={"q":5}),           'f_lambda': lambda deg:  ufl.dot(ufl.dot(u_k_fx,ufl.grad(du)), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
+        "LHS Advection 4":   {'pc': pc['theta'] * pc['rho'] * dot(dot(pc['du'],grad(pc['u_k']) ), pc['v']) * dx(metadata={"q":5}),            'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(du,ufl.grad(u_k_fx)), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
+        "LHS Pressure":      {'pc': -pc['dp'] * div(pc['v']) * dx(),                                                         'f_lambda': lambda deg: -dp * ufl.div(v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
+        "LHS Continuity":    {'pc': pc['q'] * div(pc['du']) * dx(),                                                          'f_lambda': lambda deg: q * ufl.div(du) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
+        "RHS Time Derivative": {'pc': (pc['rho'] * dot(pc['u_k'] - pc['u_n'], pc['v']) / pc['dt']) * dx(),                       'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(u_k_fx - u_n_fx, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
+        "RHS Advection":     {'pc': pc['theta'] * pc['rho'] * dot(dot(grad(pc['u_k']), pc['u_k']), pc['v']) * dx(),          'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(ufl.grad(u_k_fx),u_k_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
+        "RHS Advection 2":     {'pc': pc['theta'] * pc['rho'] * dot(dot(pc['u_k'],grad(pc['u_k']) ), pc['v']) * dx(),          'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(u_k_fx,ufl.grad(u_k_fx)), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
+        "LHS Scalar Advection": {'pc': dot(grad(pc['dp']), pc['u_k']) * pc['q'] * dx(), 'f_lambda': lambda deg: ufl.dot(ufl.grad(dp), u_k_fx) * q * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
+        "LHS Scalar Advection 2": {'pc': dot(pc['u_k'], grad(pc['dp'])) * pc['q'] * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.dot(u_k_fx, ufl.grad(dp)) * q * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
+        "LHS Vector Advection Constant": {'pc': dot(dot(grad(pc['du']), c_pc), pc['v']) * dx(), 'f_lambda': lambda deg: ufl.dot(ufl.dot(ufl.grad(du), c_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
+        "Navier Stokes LHS": {'pc': jacobian_pc, 'f_lambda':  create_fenics_ns_jacobian, 'mat': True, 'deg': 5},
+        "RHS diffusion": {'pc': inner(grad(pc['u_k']), grad(pc['v'])) * dx(metadata={"q":4}),'f_lambda': lambda deg:  ufl.inner(ufl.grad(u_k_fx), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg':4},
+        "RHS scalar diffusion": {'pc':  inner(grad(pc['p_k']), grad(pc['q'])) * dx(metadata={"q":4}),'f_lambda': lambda deg: ufl.inner(ufl.grad(p_k_fx), ufl.grad(q_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg':4},
+        "RHS diffusion 3": {'pc': (1.0 - pc['theta']) * pc['mu'] * inner(grad(pc['u_n']), grad(pc['v'])) * dx(metadata={'quadrature_degree': 4}),'f_lambda': lambda deg: (1.0 - fenicsx['theta']) * fenicsx['mu'] * ufl.inner(ufl.grad(u_n_fx), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat':False, 'deg':4},
+        "Navier Stokes RHS": {'pc': residual_pc, 'f_lambda':  create_fenics_ns_residual, 'mat': False, 'deg': 6},
+        "RHS pressure term": {'pc': pc['p_k'] * div(pc['v']) * dx, 'f_lambda': lambda deg: p_k_fx * ufl.div(v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
+        "RHS Continuity":    {'pc': pc['q'] * div(pc['u_k']) * dx, 'f_lambda': lambda deg: q_fx * ufl.div(u_k_fx) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 6},# "distributed rhs": {'pc': -(pc['q'] * div(pc['u_k']) * dx - pc['p_k'] * div(pc['v']) * dx), 'f_lambda': lambda deg: -(q_fx * ufl.div(u_k_fx) * ufl.dx(metadata={'quadrature_degree': deg}) - p_k_fx * ufl.div(v_fx) * ufl.dx(metadata={'quadrature_degree': deg})), 'mat': False, 'deg': 6}
+        "Dot of gradients LHS ohne transpose": {'pc':  inner(dot(grad(pc['du']), grad(pc['u_k'])),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du), ufl.grad(u_k_fx)), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot of gradients LHS  transpose": {'pc':  inner(dot(grad(pc['du']).T, grad(pc['u_k'])),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du).T, ufl.grad(u_k_fx)), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot of gradients LHS  transpose 2": {'pc':  inner(dot(grad(pc['du']), grad(pc['u_k']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du), ufl.grad(u_k_fx).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot of gradients LHS  transpose 3": {'pc':  inner(dot(grad(pc['du']).T, grad(pc['u_k']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du).T, ufl.grad(u_k_fx).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot of gradients LHS swap ohne transpose": {'pc':  inner(dot(grad(pc['u_k']),grad(pc['du']) ),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx),ufl.grad(du) ), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot of gradients LHS swap  transpose 1": {'pc':  inner(dot(grad(pc['u_k']),grad(pc['du']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx), ufl.grad(du).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot of gradients LHS swap transpose 2": {'pc':  inner(dot( grad(pc['u_k']).T, grad(pc['du'])),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot( ufl.grad(u_k_fx).T , ufl.grad(du)), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot of gradients LHS swap transpose 3": {'pc':  inner(dot( grad(pc['u_k']).T, grad(pc['du']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot( ufl.grad(u_k_fx).T , ufl.grad(du).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot of gradients RHS ohne transpose": {'pc':  inner(dot(grad(pc['u_k']), grad(pc['u_k'])),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx), ufl.grad(u_k_fx)), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "Dot of gradients RHS transpose": {'pc':  inner(dot(grad(pc['u_k']).T, grad(pc['u_k'])),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx).T,  ufl.grad(u_k_fx)), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "Dot of gradients RHS transpose 2": {'pc':  inner(dot(grad(pc['u_k']), grad(pc['u_k']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx),  ufl.grad(u_k_fx).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "Dot of gradients RHS transpose 3": {'pc':  inner(dot(grad(pc['u_k']).T, grad(pc['u_k']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx).T,  ufl.grad(u_k_fx).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "LHS Diffusion transpose 1":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']), grad(pc['v']).T) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du), ufl.grad(v).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "LHS Diffusion transpose 2":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']).T, grad(pc['v'])) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du).T, ufl.grad(v)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "LHS Diffusion transpose 3":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']).T, grad(pc['v']).T) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du).T, ufl.grad(v).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "LHS Diffusion transpose 4":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']) + grad(pc['du']).T, grad(pc['v']) + grad(pc['v']).T) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du) + ufl.grad(du).T, ufl.grad(v) + ufl.grad(v).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot 2 of gradients LHS ohne transpose": {'pc':  inner(dot(grad(pc['du']), grad(pc['u_k'])),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du), ufl.grad(u_k_fx)), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot 2 of gradients LHS  transpose": {'pc':  inner(dot(grad(pc['du']).T, grad(pc['u_k'])),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du).T, ufl.grad(u_k_fx)), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot 2 of gradients LHS  transpose 2": {'pc':  inner(dot(grad(pc['du']), grad(pc['u_k']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du), ufl.grad(u_k_fx).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot 2 of gradients LHS  transpose 3": {'pc':  inner(dot(grad(pc['du']).T, grad(pc['u_k']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du).T, ufl.grad(u_k_fx).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot 2 of gradients LHS swap ohne transpose": {'pc':  inner(dot(grad(pc['u_k']),grad(pc['du']) ),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx),ufl.grad(du) ), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot 2 of gradients LHS swap  transpose 1": {'pc':  inner(dot(grad(pc['u_k']),grad(pc['du']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx), ufl.grad(du).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot 2 of gradients LHS swap transpose 2": {'pc':  inner(dot( grad(pc['u_k']).T, grad(pc['du'])),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot( ufl.grad(u_k_fx).T , ufl.grad(du)), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot 2 of gradients LHS swap transpose 3": {'pc':  inner(dot( grad(pc['u_k']).T, grad(pc['du']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot( ufl.grad(u_k_fx).T , ufl.grad(du).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Dot 2 of gradients RHS ohne transpose": {'pc':  inner(dot(grad(pc['u_k']), grad(pc['u_k'])),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx), ufl.grad(u_k_fx)), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "Dot 2 of gradients RHS transpose": {'pc':  inner(dot(grad(pc['u_k']).T, grad(pc['u_k'])),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx).T,  ufl.grad(u_k_fx)), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "Dot 2 of gradients RHS transpose 2": {'pc':  inner(dot(grad(pc['u_k']), grad(pc['u_k']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx),  ufl.grad(u_k_fx).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "Dot 2 of gradients RHS transpose 3": {'pc':  inner(dot(grad(pc['u_k']).T, grad(pc['u_k']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx).T,  ufl.grad(u_k_fx).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        
+        "Linear Green Stress": {'pc':  sigma_s_linear_weak_L(pc['du'], pc['u_k'], grad(pc['v']),inner, trace, grad, dot) * dx(metadata={"q":6}), 'f_lambda': lambda deg: sigma_s_linear_weak_L(du,u_k_fx, ufl.grad(v_fx), ufl.inner, ufl.tr, ufl.grad, ufl.dot) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 6},
+        "Linearized Strain LHS": {'pc': inner(epsilon_s_linear_L(pc['du'], pc['u_k'], grad, dot), grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(epsilon_s_linear_L(du, u_k_fx, ufl.grad, ufl.dot), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+
+        "Linearized Strain RHS": {'pc': inner(epsilon_s_linear_R(pc['u_k'], grad, dot), grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(epsilon_s_linear_R(u_k_fx, ufl.grad, ufl.dot), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+
+        "Linear Green Stress RHS": {'pc': sigma_s_linear_weak_R(pc['u_k'], grad(pc['v']), inner, trace, grad, dot) * dx(metadata={"q":4}), 'f_lambda': lambda deg: sigma_s_linear_weak_R(u_k_fx, ufl.grad(v_fx), ufl.inner, ufl.tr, ufl.grad, ufl.dot) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+
+        "Trace Operator LHS": {'pc': trace(grad(pc['du'])) * trace(grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.tr(ufl.grad(du)) * ufl.tr(ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+
+        "Trace Operator RHS": {'pc': trace(grad(pc['u_k'])) * trace(grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.tr(ufl.grad(u_k_fx)) * ufl.tr(ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "Linear Strain tensor LHS": {'pc': inner(epsilon_f(pc['du'], grad), epsilon_f(pc['v'],grad))  * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(epsilon_f(du, ufl.grad), epsilon_f(v_fx, ufl.grad)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Vector Hessian LHS": {'pc': inner(Hessian(pc['du']), Hessian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(du)), ufl.grad(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Vector Hessian RHS": {'pc': inner(Hessian(pc['u_k']), Hessian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(u_k_fx)), ufl.grad(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "Vector Laplacian LHS": {'pc': inner(Laplacian(pc['du']), Laplacian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(du)), ufl.div(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Vector Laplacian RHS": {'pc': inner(Laplacian(pc['u_k']), Laplacian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(u_k_fx)), ufl.div(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "Scalar Hessian LHS": {'pc': inner(Hessian(pc['dp']), Hessian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(dp)), ufl.grad(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Scalar Hessian RHS": {'pc': inner(Hessian(pc['p_k']), Hessian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(p_k_fx)), ufl.grad(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        "Scalar Laplacian LHS": {'pc': inner(Laplacian(pc['dp']), Laplacian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(dp)), ufl.div(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "Scalar Laplacian RHS": {'pc': inner(Laplacian(pc['p_k']), Laplacian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(p_k_fx)), ufl.div(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
+        
+        
+        # ===========================
+        # Hessian contractions with facet normal (boundary tests, ds)
+        # ===========================
+        # ---------------- Hessian · c (right contraction) ----------------
+        "Vector Hdotc LHS": {
+            'pc': inner(dot(Hessian(pc['du']), c_pc), dot(Hessian(pc['v']), c_pc)) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(du, c_fx), Hdotn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector Hdotc RHS": {
+            'pc': inner(dot(Hessian(pc['u_k']), c_pc), dot(Hessian(pc['v']), c_pc)) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(u_k_fx, c_fx), Hdotn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # ---------------- c · Hessian (left contraction) ----------------
+        "Vector cdotH LHS": {
+            'pc': inner(dot(c_pc, Hessian(pc['du'])), dot(c_pc, Hessian(pc['v']))) * dx(metadata={"q":6}),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(du, c_fx), ndotH_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector cdotH RHS": {
+            'pc': inner(dot(c_pc, Hessian(pc['u_k'])), dot(c_pc, Hessian(pc['v']))) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(u_k_fx, c_fx), ndotH_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # ---------------- double contraction cᵀ H c ----------------
+        # Vector field: nHn(u) is a 2-vector; inner yields a scalar integrand
+        "Vector nHn LHS": {
+            'pc': inner( dot(c_pc, dot(Hessian(pc['du']), c_pc)),
+                        dot(c_pc, dot(Hessian(pc['v']),  c_pc)) ) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(du, c_fx), nHn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector nHn RHS": {
+            'pc': inner( dot(c_pc, dot(Hessian(pc['u_k']), c_pc)),
+                        dot(c_pc, dot(Hessian(pc['v']),   c_pc)) ) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(u_k_fx, c_fx), nHn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # ---------------- scalar versions ----------------
+        # For scalar p, H·c and c·H are d-vectors; inner gives a scalar integrand.
+        "Scalar Hdotc LHS": {
+            'pc': inner(dot(Hessian(pc['dp']), c_pc), dot(Hessian(pc['q']), c_pc)) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(dp, c_fx), Hdotn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar Hdotc RHS": {
+            'pc': inner(dot(Hessian(pc['p_k']), c_pc), dot(Hessian(pc['q']), c_pc)) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(p_k_fx, c_fx), Hdotn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        "Scalar cdotH LHS": {
+            'pc': inner(dot(c_pc, Hessian(pc['dp'])), dot(c_pc, Hessian(pc['q']))) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(dp, c_fx), ndotH_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar cdotH RHS": {
+            'pc': inner(dot(c_pc, Hessian(pc['p_k'])), dot(c_pc, Hessian(pc['q']))) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(p_k_fx, c_fx), ndotH_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # Scalar nHn: nHn(p) is scalar; inner(scalar, scalar) is fine
+        "Scalar nHn LHS": {
+            'pc': inner( dot(c_pc, dot(Hessian(pc['dp']), c_pc)),
+                        dot(c_pc, dot(Hessian(pc['q']),  c_pc)) ) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(dp, c_fx), nHn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar nHn RHS": {
+            'pc': inner( dot(c_pc, dot(Hessian(pc['p_k']), c_pc)),
+                        dot(c_pc, dot(Hessian(pc['q']),   c_pc)) ) * dx(metadata={"q":4}),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(p_k_fx, c_fx), nHn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Vector field: H · n ----------
+        "Vector Hdotn LHS (ds)": {
+            'pc': inner(dot(Hessian(pc['du']), n_pc), dot(Hessian(pc['v']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(du, n_fx), Hdotn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector Hdotn RHS (ds)": {
+            'pc': inner(dot(Hessian(pc['u_k']), n_pc), dot(Hessian(pc['v']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(u_k_fx, n_fx), Hdotn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Vector field: n · H ----------
+        "Vector ndotH LHS (ds)": {
+            'pc': inner(dot(n_pc, Hessian(pc['du'])), dot(n_pc, Hessian(pc['v']))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(du, n_fx), ndotH_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector ndotH RHS (ds)": {
+            'pc': inner(dot(n_pc, Hessian(pc['u_k'])), dot(n_pc, Hessian(pc['v']))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(u_k_fx, n_fx), ndotH_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Vector field: nᵀ H n ----------
+        "Vector nHn LHS (ds)": {
+            'pc': inner(dot(n_pc, dot(Hessian(pc['du']), n_pc)),
+                        dot(n_pc, dot(Hessian(pc['v']),  n_pc))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(du, n_fx), nHn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Vector nHn RHS (ds)": {    
+            'pc': inner(dot(n_pc, dot(Hessian(pc['u_k']), n_pc)),
+                        dot(n_pc, dot(Hessian(pc['v']),   n_pc))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(u_k_fx, n_fx), nHn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Scalar field: H · n ----------
+        "Scalar Hdotn LHS (ds)": {
+            'pc': inner(dot(Hessian(pc['dp']), n_pc), dot(Hessian(pc['q']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(dp, n_fx), Hdotn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar Hdotn RHS (ds)": {
+            'pc': inner(dot(Hessian(pc['p_k']), n_pc), dot(Hessian(pc['q']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(Hdotn_fx(p_k_fx, n_fx), Hdotn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Scalar field: n · H ----------
+        "Scalar ndotH LHS (ds)": {
+            'pc': inner(dot(n_pc, Hessian(pc['dp'])), dot(n_pc, Hessian(pc['q']))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(dp, n_fx), ndotH_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar ndotH RHS (ds)": {
+            'pc': inner(dot(n_pc, Hessian(pc['p_k'])), dot(n_pc, Hessian(pc['q']))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(ndotH_fx(p_k_fx, n_fx), ndotH_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
+
+        # -------- Scalar field: nᵀ H n ----------
+        "Scalar nHn LHS (ds)": {
+            'pc': inner(dot(n_pc, dot(Hessian(pc['dp']), n_pc)),
+                        dot(n_pc, dot(Hessian(pc['q']),  n_pc))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(dp, n_fx), nHn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': True, 'deg': 4,
+        },
+        "Scalar nHn RHS (ds)": {
+            'pc': inner(dot(n_pc, dot(Hessian(pc['p_k']), n_pc)),
+                        dot(n_pc, dot(Hessian(pc['q']),   n_pc))) * dS(metadata = {"q":4},  tag = "all"),
+            'f_lambda': lambda deg: ufl.inner(nHn_fx(p_k_fx, n_fx), nHn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
+            'mat': False, 'deg': 4,
+        },
     }
-    for sub_label in D2SIGMA_TERM_A_SUBLABELS:
-        terms[f"Solid Cross Tangent [{sub_label}]"] = _solid_cross_component_entry(sub_label)
-    # "Solid Geometric Tangent": {
-    #     'pc': pc['theta'] * inner(S_k_pc, delta_delta_E_test_pc) * dx(metadata={"q":6}),
-    #     'f_lambda': lambda deg: fenicsx['theta'] * ufl.inner(S_k_fx, delta_delta_E_test_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
-    #     'mat': True,
-    #     'deg': 6,
-    # },
-        # "Solid Residual": {
-        #     'pc': (
-        #         pc['theta'] * inner(S_k_pc, delta_E_test_k_pc)
-        #         + (Constant(1.0, dim=0) - pc['theta']) * inner(S_n_pc, delta_E_test_n_pc)
-        #     ) * dx(metadata={"q":6}),
-        #     'f_lambda': lambda deg: (
-        #         fenicsx['theta'] * ufl.inner(S_k_fx, delta_E_test_k_fx)
-        #         + (1.0 - fenicsx['theta']) * ufl.inner(S_n_fx, delta_E_test_n_fx)
-        #     ) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': False,
-        #     'deg': 6,
-        # },
-        # "LHS Mass":          {'pc': pc['rho'] * dot(pc['du'], pc['v']) / pc['dt'] * dx(),                                    'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(du, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "LHS Diffusion":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']), grad(pc['v'])) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du), ufl.grad(v)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "LHS Advection 1":   {'pc':  ( dot(dot(grad(pc['du']), pc['u_k']), pc['v'])) * dx(metadata={"q":6}),           'f_lambda': lambda deg:  ufl.dot(ufl.dot(ufl.grad(du),u_k_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
-        # "LHS Advection 2":   {'pc':  dot(dot(grad(pc['u_k']), pc['du']), pc['v']) * dx(metadata={"q":5}),            'f_lambda': lambda deg: ufl.dot( ufl.dot(ufl.grad(u_k_fx),du), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
-        # "LHS Advection 3":   {'pc':  ( dot(dot(pc['u_k'], grad(pc['du']) ), pc['v'])) * dx(metadata={"q":5}),           'f_lambda': lambda deg:  ufl.dot(ufl.dot(u_k_fx,ufl.grad(du)), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
-        # "LHS Advection 4":   {'pc': pc['theta'] * pc['rho'] * dot(dot(pc['du'],grad(pc['u_k']) ), pc['v']) * dx(metadata={"q":5}),            'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(du,ufl.grad(u_k_fx)), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
-        # "LHS Pressure":      {'pc': -pc['dp'] * div(pc['v']) * dx(),                                                         'f_lambda': lambda deg: -dp * ufl.div(v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
-        # "LHS Continuity":    {'pc': pc['q'] * div(pc['du']) * dx(),                                                          'f_lambda': lambda deg: q * ufl.div(du) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
-        # "RHS Time Derivative": {'pc': (pc['rho'] * dot(pc['u_k'] - pc['u_n'], pc['v']) / pc['dt']) * dx(),                       'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(u_k_fx - u_n_fx, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
-        # "RHS Advection":     {'pc': pc['theta'] * pc['rho'] * dot(dot(grad(pc['u_k']), pc['u_k']), pc['v']) * dx(),          'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(ufl.grad(u_k_fx),u_k_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
-        # "RHS Advection 2":     {'pc': pc['theta'] * pc['rho'] * dot(dot(pc['u_k'],grad(pc['u_k']) ), pc['v']) * dx(),          'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['rho'] * ufl.dot(ufl.dot(u_k_fx,ufl.grad(u_k_fx)), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
-        # "LHS Scalar Advection": {'pc': dot(grad(pc['dp']), pc['u_k']) * pc['q'] * dx(), 'f_lambda': lambda deg: ufl.dot(ufl.grad(dp), u_k_fx) * q * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
-        # "LHS Scalar Advection 2": {'pc': dot(pc['u_k'], grad(pc['dp'])) * pc['q'] * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.dot(u_k_fx, ufl.grad(dp)) * q * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 3},
-        # "LHS Vector Advection Constant": {'pc': dot(dot(grad(pc['du']), c_pc), pc['v']) * dx(), 'f_lambda': lambda deg: ufl.dot(ufl.dot(ufl.grad(du), c_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
-        # "Navier Stokes LHS": {'pc': jacobian_pc, 'f_lambda':  create_fenics_ns_jacobian, 'mat': True, 'deg': 5},
-        # "RHS diffusion": {'pc': inner(grad(pc['u_k']), grad(pc['v'])) * dx(metadata={"q":4}),'f_lambda': lambda deg:  ufl.inner(ufl.grad(u_k_fx), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg':4},
-        # "RHS scalar diffusion": {'pc':  inner(grad(pc['p_k']), grad(pc['q'])) * dx(metadata={"q":4}),'f_lambda': lambda deg: ufl.inner(ufl.grad(p_k_fx), ufl.grad(q_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg':4},
-        # "RHS diffusion 3": {'pc': (1.0 - pc['theta']) * pc['mu'] * inner(grad(pc['u_n']), grad(pc['v'])) * dx(metadata={'quadrature_degree': 4}),'f_lambda': lambda deg: (1.0 - fenicsx['theta']) * fenicsx['mu'] * ufl.inner(ufl.grad(u_n_fx), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat':False, 'deg':4},
-        # "Navier Stokes RHS": {'pc': residual_pc, 'f_lambda':  create_fenics_ns_residual, 'mat': False, 'deg': 6},
-        # "RHS pressure term": {'pc': pc['p_k'] * div(pc['v']) * dx, 'f_lambda': lambda deg: p_k_fx * ufl.div(v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 5},
-        # "RHS Continuity":    {'pc': pc['q'] * div(pc['u_k']) * dx, 'f_lambda': lambda deg: q_fx * ufl.div(u_k_fx) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 6},# "distributed rhs": {'pc': -(pc['q'] * div(pc['u_k']) * dx - pc['p_k'] * div(pc['v']) * dx), 'f_lambda': lambda deg: -(q_fx * ufl.div(u_k_fx) * ufl.dx(metadata={'quadrature_degree': deg}) - p_k_fx * ufl.div(v_fx) * ufl.dx(metadata={'quadrature_degree': deg})), 'mat': False, 'deg': 6}
-        # "Dot of gradients LHS ohne transpose": {'pc':  inner(dot(grad(pc['du']), grad(pc['u_k'])),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du), ufl.grad(u_k_fx)), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot of gradients LHS  transpose": {'pc':  inner(dot(grad(pc['du']).T, grad(pc['u_k'])),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du).T, ufl.grad(u_k_fx)), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot of gradients LHS  transpose 2": {'pc':  inner(dot(grad(pc['du']), grad(pc['u_k']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du), ufl.grad(u_k_fx).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot of gradients LHS  transpose 3": {'pc':  inner(dot(grad(pc['du']).T, grad(pc['u_k']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du).T, ufl.grad(u_k_fx).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot of gradients LHS swap ohne transpose": {'pc':  inner(dot(grad(pc['u_k']),grad(pc['du']) ),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx),ufl.grad(du) ), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot of gradients LHS swap  transpose 1": {'pc':  inner(dot(grad(pc['u_k']),grad(pc['du']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx), ufl.grad(du).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot of gradients LHS swap transpose 2": {'pc':  inner(dot( grad(pc['u_k']).T, grad(pc['du'])),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot( ufl.grad(u_k_fx).T , ufl.grad(du)), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot of gradients LHS swap transpose 3": {'pc':  inner(dot( grad(pc['u_k']).T, grad(pc['du']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot( ufl.grad(u_k_fx).T , ufl.grad(du).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot of gradients RHS ohne transpose": {'pc':  inner(dot(grad(pc['u_k']), grad(pc['u_k'])),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx), ufl.grad(u_k_fx)), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "Dot of gradients RHS transpose": {'pc':  inner(dot(grad(pc['u_k']).T, grad(pc['u_k'])),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx).T,  ufl.grad(u_k_fx)), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "Dot of gradients RHS transpose 2": {'pc':  inner(dot(grad(pc['u_k']), grad(pc['u_k']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx),  ufl.grad(u_k_fx).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "Dot of gradients RHS transpose 3": {'pc':  inner(dot(grad(pc['u_k']).T, grad(pc['u_k']).T),grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx).T,  ufl.grad(u_k_fx).T), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "LHS Diffusion transpose 1":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']), grad(pc['v']).T) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du), ufl.grad(v).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "LHS Diffusion transpose 2":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']).T, grad(pc['v'])) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du).T, ufl.grad(v)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "LHS Diffusion transpose 3":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']).T, grad(pc['v']).T) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du).T, ufl.grad(v).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "LHS Diffusion transpose 4":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']) + grad(pc['du']).T, grad(pc['v']) + grad(pc['v']).T) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du) + ufl.grad(du).T, ufl.grad(v) + ufl.grad(v).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot 2 of gradients LHS ohne transpose": {'pc':  inner(dot(grad(pc['du']), grad(pc['u_k'])),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du), ufl.grad(u_k_fx)), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot 2 of gradients LHS  transpose": {'pc':  inner(dot(grad(pc['du']).T, grad(pc['u_k'])),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du).T, ufl.grad(u_k_fx)), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot 2 of gradients LHS  transpose 2": {'pc':  inner(dot(grad(pc['du']), grad(pc['u_k']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du), ufl.grad(u_k_fx).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot 2 of gradients LHS  transpose 3": {'pc':  inner(dot(grad(pc['du']).T, grad(pc['u_k']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(du).T, ufl.grad(u_k_fx).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot 2 of gradients LHS swap ohne transpose": {'pc':  inner(dot(grad(pc['u_k']),grad(pc['du']) ),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx),ufl.grad(du) ), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot 2 of gradients LHS swap  transpose 1": {'pc':  inner(dot(grad(pc['u_k']),grad(pc['du']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx), ufl.grad(du).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot 2 of gradients LHS swap transpose 2": {'pc':  inner(dot( grad(pc['u_k']).T, grad(pc['du'])),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot( ufl.grad(u_k_fx).T , ufl.grad(du)), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot 2 of gradients LHS swap transpose 3": {'pc':  inner(dot( grad(pc['u_k']).T, grad(pc['du']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot( ufl.grad(u_k_fx).T , ufl.grad(du).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Dot 2 of gradients RHS ohne transpose": {'pc':  inner(dot(grad(pc['u_k']), grad(pc['u_k'])),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx), ufl.grad(u_k_fx)), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "Dot 2 of gradients RHS transpose": {'pc':  inner(dot(grad(pc['u_k']).T, grad(pc['u_k'])),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx).T,  ufl.grad(u_k_fx)), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "Dot 2 of gradients RHS transpose 2": {'pc':  inner(dot(grad(pc['u_k']), grad(pc['u_k']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx),  ufl.grad(u_k_fx).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "Dot 2 of gradients RHS transpose 3": {'pc':  inner(dot(grad(pc['u_k']).T, grad(pc['u_k']).T),grad(pc['v']).T) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.dot(ufl.grad(u_k_fx).T,  ufl.grad(u_k_fx).T), ufl.grad(v_fx).T) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        
-        # "Linear Green Stress": {'pc':  sigma_s_linear_weak_L(pc['du'], pc['u_k'], grad(pc['v']),inner, trace, grad, dot) * dx(metadata={"q":6}), 'f_lambda': lambda deg: sigma_s_linear_weak_L(du,u_k_fx, ufl.grad(v_fx), ufl.inner, ufl.tr, ufl.grad, ufl.dot) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 6},
-        # "Linearized Strain LHS": {'pc': inner(epsilon_s_linear_L(pc['du'], pc['u_k'], grad, dot), grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(epsilon_s_linear_L(du, u_k_fx, ufl.grad, ufl.dot), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-
-        # "Linearized Strain RHS": {'pc': inner(epsilon_s_linear_R(pc['u_k'], grad, dot), grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(epsilon_s_linear_R(u_k_fx, ufl.grad, ufl.dot), ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-
-        # "Linear Green Stress RHS": {'pc': sigma_s_linear_weak_R(pc['u_k'], grad(pc['v']), inner, trace, grad, dot) * dx(metadata={"q":4}), 'f_lambda': lambda deg: sigma_s_linear_weak_R(u_k_fx, ufl.grad(v_fx), ufl.inner, ufl.tr, ufl.grad, ufl.dot) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-
-        # "Trace Operator LHS": {'pc': trace(grad(pc['du'])) * trace(grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.tr(ufl.grad(du)) * ufl.tr(ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-
-        # "Trace Operator RHS": {'pc': trace(grad(pc['u_k'])) * trace(grad(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.tr(ufl.grad(u_k_fx)) * ufl.tr(ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "Linear Strain tensor LHS": {'pc': inner(epsilon_f(pc['du'], grad), epsilon_f(pc['v'],grad))  * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(epsilon_f(du, ufl.grad), epsilon_f(v_fx, ufl.grad)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Vector Hessian LHS": {'pc': inner(Hessian(pc['du']), Hessian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(du)), ufl.grad(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Vector Hessian RHS": {'pc': inner(Hessian(pc['u_k']), Hessian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(u_k_fx)), ufl.grad(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "Vector Laplacian LHS": {'pc': inner(Laplacian(pc['du']), Laplacian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(du)), ufl.div(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Vector Laplacian RHS": {'pc': inner(Laplacian(pc['u_k']), Laplacian(pc['v'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(u_k_fx)), ufl.div(ufl.grad(v_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "Scalar Hessian LHS": {'pc': inner(Hessian(pc['dp']), Hessian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(dp)), ufl.grad(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Scalar Hessian RHS": {'pc': inner(Hessian(pc['p_k']), Hessian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.grad(ufl.grad(p_k_fx)), ufl.grad(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        # "Scalar Laplacian LHS": {'pc': inner(Laplacian(pc['dp']), Laplacian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(dp)), ufl.div(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
-        # "Scalar Laplacian RHS": {'pc': inner(Laplacian(pc['p_k']), Laplacian(pc['q'])) * dx(metadata={"q":4}), 'f_lambda': lambda deg: ufl.inner(ufl.div(ufl.grad(p_k_fx)), ufl.div(ufl.grad(q_fx))) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': False, 'deg': 4},
-        
-        
-        # # ===========================
-        # # Hessian contractions with facet normal (boundary tests, ds)
-        # # ===========================
-        # # ---------------- Hessian · c (right contraction) ----------------
-        # "Vector Hdotc LHS": {
-        #     'pc': inner(dot(Hessian(pc['du']), c_pc), dot(Hessian(pc['v']), c_pc)) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(Hdotn_fx(du, c_fx), Hdotn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Vector Hdotc RHS": {
-        #     'pc': inner(dot(Hessian(pc['u_k']), c_pc), dot(Hessian(pc['v']), c_pc)) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(Hdotn_fx(u_k_fx, c_fx), Hdotn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # # ---------------- c · Hessian (left contraction) ----------------
-        # "Vector cdotH LHS": {
-        #     'pc': inner(dot(c_pc, Hessian(pc['du'])), dot(c_pc, Hessian(pc['v']))) * dx(metadata={"q":6}),
-        #     'f_lambda': lambda deg: ufl.inner(ndotH_fx(du, c_fx), ndotH_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Vector cdotH RHS": {
-        #     'pc': inner(dot(c_pc, Hessian(pc['u_k'])), dot(c_pc, Hessian(pc['v']))) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(ndotH_fx(u_k_fx, c_fx), ndotH_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # # ---------------- double contraction cᵀ H c ----------------
-        # # Vector field: nHn(u) is a 2-vector; inner yields a scalar integrand
-        # "Vector nHn LHS": {
-        #     'pc': inner( dot(c_pc, dot(Hessian(pc['du']), c_pc)),
-        #                 dot(c_pc, dot(Hessian(pc['v']),  c_pc)) ) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(nHn_fx(du, c_fx), nHn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Vector nHn RHS": {
-        #     'pc': inner( dot(c_pc, dot(Hessian(pc['u_k']), c_pc)),
-        #                 dot(c_pc, dot(Hessian(pc['v']),   c_pc)) ) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(nHn_fx(u_k_fx, c_fx), nHn_fx(v_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # # ---------------- scalar versions ----------------
-        # # For scalar p, H·c and c·H are d-vectors; inner gives a scalar integrand.
-        # "Scalar Hdotc LHS": {
-        #     'pc': inner(dot(Hessian(pc['dp']), c_pc), dot(Hessian(pc['q']), c_pc)) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(Hdotn_fx(dp, c_fx), Hdotn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Scalar Hdotc RHS": {
-        #     'pc': inner(dot(Hessian(pc['p_k']), c_pc), dot(Hessian(pc['q']), c_pc)) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(Hdotn_fx(p_k_fx, c_fx), Hdotn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # "Scalar cdotH LHS": {
-        #     'pc': inner(dot(c_pc, Hessian(pc['dp'])), dot(c_pc, Hessian(pc['q']))) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(ndotH_fx(dp, c_fx), ndotH_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Scalar cdotH RHS": {
-        #     'pc': inner(dot(c_pc, Hessian(pc['p_k'])), dot(c_pc, Hessian(pc['q']))) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(ndotH_fx(p_k_fx, c_fx), ndotH_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # # Scalar nHn: nHn(p) is scalar; inner(scalar, scalar) is fine
-        # "Scalar nHn LHS": {
-        #     'pc': inner( dot(c_pc, dot(Hessian(pc['dp']), c_pc)),
-        #                 dot(c_pc, dot(Hessian(pc['q']),  c_pc)) ) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(nHn_fx(dp, c_fx), nHn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Scalar nHn RHS": {
-        #     'pc': inner( dot(c_pc, dot(Hessian(pc['p_k']), c_pc)),
-        #                 dot(c_pc, dot(Hessian(pc['q']),   c_pc)) ) * dx(metadata={"q":4}),
-        #     'f_lambda': lambda deg: ufl.inner(nHn_fx(p_k_fx, c_fx), nHn_fx(q_fx, c_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # # -------- Vector field: H · n ----------
-        # "Vector Hdotn LHS (ds)": {
-        #     'pc': inner(dot(Hessian(pc['du']), n_pc), dot(Hessian(pc['v']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(Hdotn_fx(du, n_fx), Hdotn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Vector Hdotn RHS (ds)": {
-        #     'pc': inner(dot(Hessian(pc['u_k']), n_pc), dot(Hessian(pc['v']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(Hdotn_fx(u_k_fx, n_fx), Hdotn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # # -------- Vector field: n · H ----------
-        # "Vector ndotH LHS (ds)": {
-        #     'pc': inner(dot(n_pc, Hessian(pc['du'])), dot(n_pc, Hessian(pc['v']))) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(ndotH_fx(du, n_fx), ndotH_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Vector ndotH RHS (ds)": {
-        #     'pc': inner(dot(n_pc, Hessian(pc['u_k'])), dot(n_pc, Hessian(pc['v']))) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(ndotH_fx(u_k_fx, n_fx), ndotH_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # # -------- Vector field: nᵀ H n ----------
-        # "Vector nHn LHS (ds)": {
-        #     'pc': inner(dot(n_pc, dot(Hessian(pc['du']), n_pc)),
-        #                 dot(n_pc, dot(Hessian(pc['v']),  n_pc))) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(nHn_fx(du, n_fx), nHn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Vector nHn RHS (ds)": {    
-        #     'pc': inner(dot(n_pc, dot(Hessian(pc['u_k']), n_pc)),
-        #                 dot(n_pc, dot(Hessian(pc['v']),   n_pc))) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(nHn_fx(u_k_fx, n_fx), nHn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # # -------- Scalar field: H · n ----------
-        # "Scalar Hdotn LHS (ds)": {
-        #     'pc': inner(dot(Hessian(pc['dp']), n_pc), dot(Hessian(pc['q']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(Hdotn_fx(dp, n_fx), Hdotn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Scalar Hdotn RHS (ds)": {
-        #     'pc': inner(dot(Hessian(pc['p_k']), n_pc), dot(Hessian(pc['q']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(Hdotn_fx(p_k_fx, n_fx), Hdotn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # # -------- Scalar field: n · H ----------
-        # "Scalar ndotH LHS (ds)": {
-        #     'pc': inner(dot(n_pc, Hessian(pc['dp'])), dot(n_pc, Hessian(pc['q']))) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(ndotH_fx(dp, n_fx), ndotH_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Scalar ndotH RHS (ds)": {
-        #     'pc': inner(dot(n_pc, Hessian(pc['p_k'])), dot(n_pc, Hessian(pc['q']))) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(ndotH_fx(p_k_fx, n_fx), ndotH_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
-
-        # # -------- Scalar field: nᵀ H n ----------
-        # "Scalar nHn LHS (ds)": {
-        #     'pc': inner(dot(n_pc, dot(Hessian(pc['dp']), n_pc)),
-        #                 dot(n_pc, dot(Hessian(pc['q']),  n_pc))) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(nHn_fx(dp, n_fx), nHn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': True, 'deg': 4,
-        # },
-        # "Scalar nHn RHS (ds)": {
-        #     'pc': inner(dot(n_pc, dot(Hessian(pc['p_k']), n_pc)),
-        #                 dot(n_pc, dot(Hessian(pc['q']),   n_pc))) * dS(metadata = {"q":4},  tag = "all"),
-        #     'f_lambda': lambda deg: ufl.inner(nHn_fx(p_k_fx, n_fx), nHn_fx(q_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),
-        #     'mat': False, 'deg': 4,
-        # },
     pc_dummy_side = dot(Constant([0.0,0.0],dim=1), pc['v']) * dx()
     # Keep track of successes and failures
     failed_tests = []

@@ -197,6 +197,26 @@ def _is_scalar_field(a) -> bool:
             raise NotImplementedError(f"Unsupported HessOpInfo role: {a.role}")
     raise NotImplementedError(f"Unsupported type: {type(a)}")
 
+# ========================================================================
+#  Tensor Containers for Symbolic Basis Functions
+# ========================================================================
+def lhs_num(value: Any) -> np.ndarray:
+    """
+    Return a numeric view suitable for left-hand side assembly.
+
+    For BaseOpInfo instances with is_rhs=False we strip the leading
+    component axis when it is a singleton (e.g. shapes (1,n), (1,n,m),
+    (1,n,d), …) so the result can accumulate into plain numpy arrays
+    without broadcasting issues. All other inputs are coerced with
+    np.asarray.
+    """
+    if isinstance(value, BaseOpInfo):
+        view = np.asarray(value.data)
+        while isinstance(view, np.ndarray) and view.ndim > 0 and view.shape[0] == 1:
+            view = view[0]
+        return view
+    return np.asarray(value)
+
 @dataclass(frozen=True, slots=True)
 class BaseOpInfo:
     """Base class for operation information containers."""
@@ -236,8 +256,9 @@ class BaseOpInfo:
     __array_priority__ = 10_000
 
     def __array__(self, dtype=None):
-        """Expose data as ndarray (used only when we *choose* to coerce)."""
-        return np.asarray(self.data, dtype=dtype) if dtype is not None else np.asarray(self.data)
+        """Expose numeric view (lhs-aware) when NumPy coerces this object."""
+        arr = lhs_num(self)
+        return np.asarray(arr, dtype=dtype) if dtype is not None else np.asarray(arr)
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         """
@@ -250,17 +271,12 @@ class BaseOpInfo:
         def _num(x):
             # numeric view for accumulation; squeeze (1,n)->(n,) for vectors
             if isinstance(x, BaseOpInfo):
-                if isinstance(x, VecOpInfo):
-                    arr = x.data
-                    if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] == 1:
-                        return arr[0]
-                    return arr
-                return x.data
+                return lhs_num(x)
             return x
         
         # Allow numeric accumulation with ndarray on either side
         if ufunc in (np.add, np.subtract):
-            if any(isinstance(i, np.ndarray) for i in inputs):
+            if any(not isinstance(i, BaseOpInfo) for i in inputs):
                 args = tuple(_num(i) for i in inputs)
                 return ufunc(*args, **kwargs)
             # let VecOpInfo/GradOpInfo/HessOpInfo.__add__/__sub__ handle typed sums
@@ -328,28 +344,7 @@ class BaseOpInfo:
                 f"field_sides={self.field_sides}, is_rhs={self.is_rhs}) and "
                 f"{cls_b}(role={role_b}, shape={shape_b}, fields={fields_b}, side={side_b}, "
                 f"parent={parent_b}, field_sides={field_sides_b}, is_rhs={is_rhs_b})")
-# ========================================================================
-#  Tensor Containers for Symbolic Basis Functions
-# ========================================================================
-def lhs_num(value: Any) -> np.ndarray:
-    """
-    Return a numeric view suitable for left-hand side assembly.
 
-    For BaseOpInfo instances with is_rhs=False we strip the leading
-    component axis when it is a singleton (e.g. shapes (1,n), (1,n,m),
-    (1,n,d), …) so the result can accumulate into plain numpy arrays
-    without broadcasting issues. All other inputs are coerced with
-    np.asarray.
-    """
-    if isinstance(value, BaseOpInfo):
-        data = np.asarray(value.data)
-        if value.is_rhs:
-            return data
-        view = data
-        while isinstance(view, np.ndarray) and view.ndim > 0 and view.shape[0] == 1:
-            view = view[0]
-        return view
-    return np.asarray(value)
 
 @dataclass(slots=True, frozen=True)
 class VecOpInfo(BaseOpInfo):
@@ -618,7 +613,10 @@ class VecOpInfo(BaseOpInfo):
         if isinstance(other, (float, int)):
             return self._with(self.data * other, role=self.role)
         elif isinstance(other, np.ndarray): # np.array
-            if other.ndim == 1 and other.size == self.data.shape[0]:
+            if other.ndim == 0:
+                # Scalar multiplication
+                return self._with(self.data * other, role=self.role)
+            elif other.ndim == 1 and other.size == self.data.shape[0]:
                 return self._with(self.data * other[:, np.newaxis], role=self.role)
             elif other.ndim == 1 and self.data.shape[0] == 1:
                 # New Case: Scalar multiplication with a vector
@@ -931,13 +929,13 @@ class GradOpInfo(BaseOpInfo):
             raise ValueError(f"Inner product requires another GradOpInfo, got {type(other)}."
                 f"Or Incompatible GradOpInfo shapes: {self.data.shape} and {other.data.shape}.")
         if self.is_rhs:
-            if self.role in {"function"} and other.role in {"trial", "test"}:
+            if self.role in {"function", "identity"} and other.role in {"trial", "test"}:
                 # Case: Function · Grad(Trial) or Grad(Test)  -> (n,)
                 kd = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
                 if kd.shape[0] == other.shape[0]:
                     return  np.einsum("kd,knd->n", kd, other.data, optimize=True)
                 else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
-            elif self.role in {"trial", "test"} and other.role in {"function"}:
+            elif self.role in {"trial", "test"} and other.role in {"function", "identity"}:
                 # Case: Grad(Trial) or Grad(Test) · Function  -> (n,)
                 kd = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
                 if kd.shape[0] == self.shape[0]:
@@ -1184,13 +1182,7 @@ class GradOpInfo(BaseOpInfo):
         """
         
         if isinstance(other_vec, (VecOpInfo)): # this part is until trial grad(u) dot u_k  ((∇u) · u_k)
-            # role = self.role
-            # if vec.role == "trial":
-            #     role = vec.role
-            # if vec.data.shape[0] != self.data.shape[-1]:
-            #     raise ValueError(f"Cannot dot GradOpInfo {self.shape} with VecOpInfo of shape {vec.data.shape}.")
-            # result_data = np.einsum("ijk,kl->ij", self.data, vec.data, optimize=True)
-            # return VecOpInfo(result_data, role=role)
+
             if self.role == "function" and other_vec.role == "trial": # introducing a new branch
                 # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u
                 grad_val = _collapsed_grad(self)  # shape (k, d) · (k,n)  —   ∇u_k(ξ)
@@ -1310,7 +1302,9 @@ class GradOpInfo(BaseOpInfo):
             else:
                  raise ValueError(f"Cannot scale GradOpInfo(shape={self.shape}) with array of shape {other.shape}.")
         else:
-            return NotImplemented
+            raise TypeError(f"GradOpInfo can only be scaled by a scalar or array, not {type(other)}."
+                            f"roles : {self.role} and other.role = {getattr(other, 'role', None)}"
+                            f"Shapes : {self.data.shape} and {getattr(other, 'shape', None)}")
 
         return self._with(new_data, role=self.role)
 

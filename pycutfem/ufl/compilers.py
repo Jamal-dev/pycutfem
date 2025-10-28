@@ -822,7 +822,10 @@ class FormCompiler:
             # Test/Trial: sum diagonal across first/last axes → (n,)
             if A.role in ("test", "trial") and A.ndim == 3:
                 k_dim, n_loc, d_dim = A.data.shape
-                m = min(k_dim, d_dim)
+                if k_dim != d_dim:
+                    raise ValueError(f"Cannot take trace of non-square GradOpInfo with shape {A.data.shape}.")
+                # m = min(k_dim, d_dim)
+                m = k_dim
                 # sum_i A[i, :, i]  — works for either (k,n,d) or (d,n,k) because we always use axes (0,2)
                 tr_vec = np.zeros((n_loc,), dtype=A.data.dtype)
                 for i in range(m):
@@ -832,7 +835,10 @@ class FormCompiler:
             elif A.role in {"mixed"} and A.ndim == 4:
                 k,m,n,d = A.data.shape
                 k_dim, n_test, n_trial, d_dim = A.data.shape
-                m = min(k_dim, d_dim)
+                if k_dim != d_dim:
+                    raise ValueError(f"Cannot take trace of non-square GradOpInfo with shape {A.data.shape}.")
+                # m = min(k_dim, d_dim)
+                m = k_dim
                 M = np.zeros((n_test, n_trial), dtype=A.data.dtype)
                 # sum over the diagonal of the outermost and innermost axes
                 for i in range(m):
@@ -872,7 +878,7 @@ class FormCompiler:
         A = self._visit(node.A)
         mat = self._materialize_matrix_value(A, node, "inverse")
         det = mat[0, 0] * mat[1, 1] - mat[0, 1] * mat[1, 0]
-        inv_det = 1.0 / (det + 1e-300)
+        inv_det = 1.0 / (det )
         inv_mat = np.array(
             [
                 [mat[1, 1], -mat[0, 1]],
@@ -887,7 +893,11 @@ class FormCompiler:
                     role=A.role,
                     node=node,
                     field_names=A.field_names,
-                    coeffs=A.coeffs,
+                    coeffs=None,
+                )
+            else:
+                raise ValueError(
+                    f"Inverse result shape {inv_mat.shape} is not square GradOpInfo shape {A.data.shape}."
                 )
         return inv_mat
     
