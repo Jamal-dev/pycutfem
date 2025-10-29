@@ -363,14 +363,13 @@ class NumbaCodeGen:
                                 "n_union = gdofs_map[e].shape[0]",
                                 f"{Hsub} = {Hloc}[{s0}:{s1}, :, :]",
                                 f"{Hpad} = scatter_tensor_to_union({Hsub}, {me}, n_union, {self.dtype})",
-                                f"Hval = collapse_hessian_to_value({Hpad}, {coeff}, {self.dtype})",
+                                f"{out}[{i}] = hessian_qp({coeff}, {Hpad})",
                             ]
                         else:
                             # --- tensordot-free collapse: (n,2,2) -> (2,2)
                             body_lines += [
-                                f"Hval = collapse_hessian_to_value({Hloc}, {coeff}, {self.dtype})",
+                                f"{out}[{i}] = hessian_qp({coeff}, {Hloc})",
                             ]
-                        body_lines += [f"{out}[{i}] = Hval"]
 
                     stack.append(StackItem(var_name=out, role="value",
                                         shape=(k_comps, 2, 2),
@@ -481,11 +480,11 @@ class NumbaCodeGen:
                                 "n_union = gdofs_map[e].shape[0]",
                                 f"{lap_sub} = {laploc}[{s0}:{s1}]",
                                 f"{lap_pad} = scatter_tensor_to_union({lap_sub}, {me}, n_union, {self.dtype})",
-                                f"{out}[{i}] = collapse_vector_to_value({lap_pad}, {coeff}, {self.dtype})",
+                                f"{out}[{i}] = laplacian_qp({coeff}, {lap_pad})",
                             ]
                         else:
                             body_lines += [
-                                f"{out}[{i}] = collapse_vector_to_value({laploc}, {coeff}, {self.dtype})"
+                                f"{out}[{i}] = laplacian_qp({coeff}, {laploc})"
                             ]
 
         
@@ -1047,11 +1046,14 @@ class NumbaCodeGen:
                     # --- Case 0: value u(x_q) via b_* --------------------------------
                     if tot == 0:
                         if op.is_vector:
-                            comps = [f"np.dot({b_var}, {coeff_sym})" for b_var in basis_vars_at_q]
-                            body_lines.append(f"{val_var} = np.array([{', '.join(comps)}])")
+                            body_lines.append(f"{val_var} = np.zeros(({len(field_names)},), dtype={self.dtype})")
+                            for comp_idx, b_var in enumerate(basis_vars_at_q):
+                                comp_val = new_var("val_comp")
+                                body_lines.append(f"{comp_val} = load_variable_qp({coeff_sym}, {b_var})")
+                                body_lines.append(f"{val_var}[{comp_idx}] = {comp_val}")
                             shape = (len(field_names),)
                         else:
-                            body_lines.append(f"{val_var} = np.dot({basis_vars_at_q[0]}, {coeff_sym})")
+                            body_lines.append(f"{val_var} = load_variable_qp({coeff_sym}, {basis_vars_at_q[0]})")
                             shape = ()
                     else:
                         # We need D^{(ox,oy)}u_h. Build per-component derivative rows,
@@ -1102,10 +1104,10 @@ class NumbaCodeGen:
                                         f"    idx = {mep}[j]",
                                         "    if 0 <= idx < n_union:",
                                         f"        {pad}[idx] = row_vec[j]",
-                                        f"{rv} = float(np.dot({coeff_sym}, {pad}))",
+                                        f"{rv} = load_variable_qp({coeff_sym}, {pad})",
                                     ]
                                 else:
-                                    body_lines.append(f"{rv} = float(np.dot({coeff_sym}, {row}))")
+                                    body_lines.append(f"{rv} = load_variable_qp({coeff_sym}, {row})")
                                 rows_vec.append(rv)
 
                         else:
@@ -1260,10 +1262,10 @@ class NumbaCodeGen:
                                         f"    idx = {mep}[j]",
                                         "    if 0 <= idx < n_union:",
                                         f"        {pad}[idx] = {row}[j]",
-                                        f"{rv} = float(np.dot({coeff_sym}, {pad}))",
+                                        f"{rv} = load_variable_qp({coeff_sym}, {pad})",
                                     ]
                                 else:
-                                    body_lines.append(f"{rv} = float(np.dot({coeff_sym}, {row}))")
+                                    body_lines.append(f"{rv} = load_variable_qp({coeff_sym}, {row})")
                                 rows_vec.append(rv)
 
                         # Final value (scalar or vector)
@@ -1588,11 +1590,11 @@ class NumbaCodeGen:
                                 f"{g2}   = np.stack((d10_q, d01_q), axis=1)",
                                 f"{phys} = {g2} @ {jinv_q}.copy()",
                                 f"if {phys}.shape[0] == {coeff_e}.shape[0]:",
-                                f"    {val} = {phys}.T.copy() @ {coeff_e}",       # union vs union
+                                f"    {val} = gradient_qp({coeff_e}, {phys})",
                                 f"else:",
                                 f"    {phys_s} = {phys}[{s0}:{s1}, :]",           # local vs local
                                 f"    {u_sl}   = {coeff_e}[{map_sym}[e]]",
-                                f"    {val}    = {phys_s}.T.copy() @ {u_sl}",
+                                f"    {val}    = gradient_qp({u_sl}, {phys_s})",
                             ]
 
                         else:
@@ -1605,7 +1607,7 @@ class NumbaCodeGen:
 
                             body_lines += [
                                 f"{pg}  = {gnm}[e, q] @ {jinv_q}.copy()",
-                                f"{val} = {pg}.T.copy() @ {coeff_e}",     # (2,)
+                                f"{val} = gradient_qp({coeff_e}, {pg})",     # (2,)
                             ]
 
                         comps.append(val)
@@ -2995,7 +2997,23 @@ class NumbaCodeGen:
                                  )
                          return tuple(out)
 
-                     helper = 'binary_add' if sym == '+' else 'binary_sub'
+                     dim_a = len(a.shape)
+                     dim_b = len(b.shape)
+                     
+                     if sym == '+':
+                         if dim_a == 3 and dim_b == 4:
+                             helper = 'binary_add_3_4'
+                         elif dim_a == 4 and dim_b == 3:
+                             helper = 'binary_add_4_3'
+                         else:
+                             helper = 'binary_add_generic'
+                     else: # sym == '-'
+                         if dim_a == 3 and dim_b == 4:
+                             helper = 'binary_sub_3_4'
+                         elif dim_a == 4 and dim_b == 3:
+                             helper = 'binary_sub_4_3'
+                         else:
+                             helper = 'binary_sub_generic'
                      try:
                          new_shape = np.broadcast_shapes(a.shape, b.shape)
                      except ValueError:
@@ -3227,11 +3245,17 @@ from pycutfem.jit.numba_helpers import (
     dot_value_with_grad,
     dot_grad_with_value,
     compute_physical_hessian,
-    collapse_hessian_to_value,
     compute_physical_laplacian,
-    collapse_vector_to_value,
-    binary_add,
-    binary_sub,
+    load_variable_qp,
+    gradient_qp,
+    laplacian_qp,
+    hessian_qp,
+    binary_add_generic,
+    binary_add_3_4,
+    binary_add_4_3,
+    binary_sub_generic,
+    binary_sub_3_4,
+    binary_sub_4_3,
 )
 PARAM_ORDER = [{param_order_literal}]
 {decorator}

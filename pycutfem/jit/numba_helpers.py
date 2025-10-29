@@ -1,6 +1,6 @@
 import numba
 import numpy as np
-
+use_type = np.float64
 
 @numba.njit(cache=True)
 def dot_grad_grad_mixed(a, b, flag, dtype):
@@ -389,17 +389,6 @@ def compute_physical_hessian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
 
 
 @numba.njit(cache=True)
-def collapse_hessian_to_value(h_tensor, coeffs, dtype):
-    """
-    Collapse tensor (n,2,2) with coefficients (n,) -> (2,2).
-    """
-    mat = h_tensor.reshape(h_tensor.shape[0], -1)
-    hflat = mat.T @ coeffs.astype(dtype)
-    d_dim = h_tensor.shape[1]
-    return hflat.reshape(d_dim, d_dim)
-
-
-@numba.njit(cache=True)
 def compute_physical_laplacian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
     """
     Compute physical Laplacian entries for scalar component.
@@ -416,14 +405,6 @@ def compute_physical_laplacian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
         hphys = core + d10[j] * hx + d01[j] * hy
         res[j] = hphys[0, 0] + hphys[1, 1]
     return res
-
-
-@numba.njit(cache=True)
-def collapse_vector_to_value(vector_vals, coeffs, dtype):
-    """
-    Collapse vector (n,) with coefficients (n,) -> scalar.
-    """
-    return float(np.dot(vector_vals, coeffs.astype(dtype)))
 
 
 @numba.njit(cache=True)
@@ -806,469 +787,278 @@ def inner_hessian_hessian(test_var, trial_var, dtype):
     return res
 
 
+@numba.njit(cache=True, inline='always')
+def _binary_add_or_sub(x, y, sign):
+    """sign = +1.0 for add, -1.0 for subtract."""
+    return x + sign * y
+
+
+
+
+
+# In numba_helpers.py
+
+@numba.njit(cache=True)
+def binary_add_generic(a, b, dtype):
+    """
+    Elementwise addition for all standard broadcasting.
+    Uses Numba's native ufunc support.
+    """
+    return a + b
+
+
+
+@numba.njit(cache=True)
+def binary_add_3_4(a, b, dtype):
+    """
+    Specialized elementwise addition for:
+    (k, n, d) + (k, n, m, d) -> (k, n, m, d)
+    Uses reshape + ufunc. (Very fast to compile)
+    """
+    a_arr = np.asarray(a)
+    b_arr = np.asarray(b)
+
+    k = a_arr.shape[0]
+    n = a_arr.shape[1]
+    
+    # Reshape (k, n, d) -> (k, n, 1, d) and let Numba broadcast
+    return a_arr.reshape(k, n, 1, -1) + b_arr
+
+
+@numba.njit(cache=True)
+def binary_add_4_3(a, b, dtype):
+    """
+    Specialized elementwise addition for:
+    (k, n, m, d) + (k, n, d) -> (k, n, m, d)
+    Uses reshape + ufunc. (Very fast to compile)
+    """
+    a_arr = np.asarray(a)
+    b_arr = np.asarray(b)
+
+    k = b_arr.shape[0]
+    n = b_arr.shape[1]
+    
+    # Reshape (k, n, d) -> (k, n, 1, d) and let Numba broadcast
+    return a_arr + b_arr.reshape(k, n, 1, -1)
+
+
+@numba.njit(cache=True)
+def binary_sub_generic(a, b, dtype):
+    """
+    Elementwise subtraction for all standard broadcasting.
+    Uses Numba's native ufunc support.
+    """
+    return a - b
+
+
+@numba.njit(cache=True)
+def binary_sub_3_4(a, b, dtype):
+    """
+    Specialized elementwise subtraction for:
+    (k, n, d) - (k, n, m, d) -> (k, n, m, d)
+    Uses reshape + ufunc. (Very fast to compile)
+    """
+    a_arr = np.array(a, dtype=dtype, copy=False)
+    b_arr = np.array(b, dtype=dtype, copy=False)
+    
+    k = a_arr.shape[0]
+    n = a_arr.shape[1]
+    
+    # Reshape (k, n, d) -> (k, n, 1, d) and let Numba broadcast
+    return a_arr.reshape(k, n, 1, -1) - b_arr
+
+
+@numba.njit(cache=True)
+def binary_sub_4_3(a, b, dtype):
+    """
+    Specialized elementwise subtraction for:
+    (k, n, m, d) - (k, n, d) -> (k, n, m, d)
+    Uses reshape + ufunc. (Very fast to compile)
+    """
+    a_arr = np.array(a, dtype=dtype, copy=False)
+    b_arr = np.array(b, dtype=dtype, copy=False)
+    
+    k = b_arr.shape[0]
+    n = b_arr.shape[1]
+    
+    # Reshape (k, n, d) -> (k, n, 1, d) and let Numba broadcast
+    return a_arr - b_arr.reshape(k, n, 1, -1)
+
+
 class BinaryOpsHelpers:
-    @staticmethod
-    @numba.njit(cache=True, inline='always')
-    def _add_or_sub(x, y, sign):
-        # sign = +1.0 for add, -1.0 for sub (x - y)
-        return x + sign * y
-
-    @staticmethod
-    @numba.njit(cache=True, inline='always')
-    def _scalar_plus_nd(scalar, arr, sign, dtype):
-        # out = scalar (+|-) arr, any dim 1..4
-        if arr.ndim == 1:
-            n0 = arr.shape[0]
-            out = np.empty((n0,), dtype=dtype)
-            s = float(scalar)
-            for i0 in range(n0):
-                out[i0] = BinaryOpsHelpers._add_or_sub(s, arr[i0], sign)
-            return out
-        elif arr.ndim == 2:
-            n0, n1 = arr.shape
-            out = np.empty((n0, n1), dtype=dtype)
-            s = float(scalar)
-            for i0 in range(n0):
-                a0 = arr[i0]
-                for i1 in range(n1):
-                    out[i0, i1] = BinaryOpsHelpers._add_or_sub(s, a0[i1], sign)
-            return out
-        elif arr.ndim == 3:
-            n0, n1, n2 = arr.shape
-            out = np.empty((n0, n1, n2), dtype=dtype)
-            s = float(scalar)
-            for i0 in range(n0):
-                for i1 in range(n1):
-                    a1 = arr[i0, i1]
-                    for i2 in range(n2):
-                        out[i0, i1, i2] = BinaryOpsHelpers._add_or_sub(s, a1[i2], sign)
-            return out
-        else:  # 4D
-            n0, n1, n2, n3 = arr.shape
-            out = np.empty((n0, n1, n2, n3), dtype=dtype)
-            s = float(scalar)
-            for i0 in range(n0):
-                for i1 in range(n1):
-                    for i2 in range(n2):
-                        a2 = arr[i0, i1, i2]
-                        for i3 in range(n3):
-                            out[i0, i1, i2, i3] = BinaryOpsHelpers._add_or_sub(s, a2[i3], sign)
-            return out
+    """Backward compatibility shim for legacy imports."""
+    binary_add_generic = staticmethod(binary_add_generic)
+    binary_add_3_4 = staticmethod(binary_add_3_4)
+    binary_add_4_3 = staticmethod(binary_add_4_3)
+    binary_sub_generic = staticmethod(binary_sub_generic)
+    binary_sub_3_4 = staticmethod(binary_sub_3_4)
+    binary_sub_4_3 = staticmethod(binary_sub_4_3)
+    
 
 
-    # -------------------------------
-    # Rank-specialized elementwise ops
-    # -------------------------------
-    # These four handle ANY pair (A,B) whose output rank is 1..4.
-    # Each supports per-axis broadcast (dim == 1) without using NumPy ufuncs.
+    # --------------------------
+# IR LoadVariable helper routines
+# --------------------------
 
-    @staticmethod
-    @numba.njit(cache=True)
-    def _combine_1d(a, b, sign, dtype):
-        a0 = 1 if a.ndim == 0 else a.shape[0] if a.ndim >= 1 else 1
-        b0 = 1 if b.ndim == 0 else b.shape[0] if b.ndim >= 1 else 1
-        n0 = a0 if a0 >= b0 else b0
-        out = np.empty((n0,), dtype=dtype)
-        for i0 in range(n0):
-            ia0 = 0 if a0 == 1 else i0
-            ib0 = 0 if b0 == 1 else i0
-            va = float(a) if a.ndim == 0 else a[ia0]
-            vb = float(b) if b.ndim == 0 else b[ib0]
-            out[i0] = BinaryOpsHelpers._add_or_sub(va, vb, sign)
-        return out
-
-    @staticmethod
-    @numba.njit(cache=True)
-    def _combine_2d(a, b, sign, dtype):
-        # Promote missing leading axes logically to size 1
-        if a.ndim == 0:
-            a0, a1 = 1, 1
-        elif a.ndim == 1:
-            a0, a1 = 1, a.shape[0]
-        else:  # 2D
-            a0, a1 = a.shape[0], a.shape[1]
-
-        if b.ndim == 0:
-            b0, b1 = 1, 1
-        elif b.ndim == 1:
-            b0, b1 = 1, b.shape[0]
-        else:
-            b0, b1 = b.shape[0], b.shape[1]
-
-        n0 = a0 if a0 >= b0 else b0
-        n1 = a1 if a1 >= b1 else b1
-        out = np.empty((n0, n1), dtype=dtype)
-
-        for i0 in range(n0):
-            ia0 = 0 if a0 == 1 else i0
-            ib0 = 0 if b0 == 1 else i0
-            for i1 in range(n1):
-                ia1 = 0 if a1 == 1 else i1
-                ib1 = 0 if b1 == 1 else i1
-                if a.ndim == 0:
-                    va = float(a)
-                elif a.ndim == 1:
-                    va = a[ia1]
-                else:  # 2D
-                    va = a[ia0, ia1]
-
-                if b.ndim == 0:
-                    vb = float(b)
-                elif b.ndim == 1:
-                    vb = b[ib1]
-                else:
-                    vb = b[ib0, ib1]
-
-                out[i0, i1] = BinaryOpsHelpers._add_or_sub(va, vb, sign)
-        return out
-
-    @staticmethod
-    @numba.njit(cache=True)
-    def _combine_3d(a, b, sign, dtype):
-        # a-dims as leading-1 padded to 3 axes
-        if   a.ndim == 0: a0, a1, a2 = 1, 1, 1
-        elif a.ndim == 1: a0, a1, a2 = 1, 1, a.shape[0]
-        elif a.ndim == 2: a0, a1, a2 = 1, a.shape[0], a.shape[1]
-        else:             a0, a1, a2 = a.shape[0], a.shape[1], a.shape[2]
-
-        if   b.ndim == 0: b0, b1, b2 = 1, 1, 1
-        elif b.ndim == 1: b0, b1, b2 = 1, 1, b.shape[0]
-        elif b.ndim == 2: b0, b1, b2 = 1, b.shape[0], b.shape[1]
-        else:             b0, b1, b2 = b.shape[0], b.shape[1], b.shape[2]
-
-        n0 = a0 if a0 >= b0 else b0
-        n1 = a1 if a1 >= b1 else b1
-        n2 = a2 if a2 >= b2 else b2
-        out = np.empty((n0, n1, n2), dtype=dtype)
-
-        for i0 in range(n0):
-            ia0 = 0 if a0 == 1 else i0
-            ib0 = 0 if b0 == 1 else i0
-            for i1 in range(n1):
-                ia1 = 0 if a1 == 1 else i1
-                ib1 = 0 if b1 == 1 else i1
-                for i2 in range(n2):
-                    ia2 = 0 if a2 == 1 else i2
-                    ib2 = 0 if b2 == 1 else i2
-
-                    # index into a based on its true rank
-                    if   a.ndim == 0: va = float(a)
-                    elif a.ndim == 1: va = a[ia2]
-                    elif a.ndim == 2: va = a[ia1, ia2]
-                    else:             va = a[ia0, ia1, ia2]
-
-                    if   b.ndim == 0: vb = float(b)
-                    elif b.ndim == 1: vb = b[ib2]
-                    elif b.ndim == 2: vb = b[ib1, ib2]
-                    else:             vb = b[ib0, ib1, ib2]
-
-                    out[i0, i1, i2] = BinaryOpsHelpers._add_or_sub(va, vb, sign)
-        return out
-
-    @staticmethod
-    @numba.njit(cache=True)
-    def _combine_4d(a, b, sign, dtype):
-        if   a.ndim == 0: a0, a1, a2, a3 = 1, 1, 1, 1
-        elif a.ndim == 1: a0, a1, a2, a3 = 1, 1, 1, a.shape[0]
-        elif a.ndim == 2: a0, a1, a2, a3 = 1, 1, a.shape[0], a.shape[1]
-        elif a.ndim == 3: a0, a1, a2, a3 = 1, a.shape[0], a.shape[1], a.shape[2]
-        else:             a0, a1, a2, a3 = a.shape[0], a.shape[1], a.shape[2], a.shape[3]
-
-        if   b.ndim == 0: b0, b1, b2, b3 = 1, 1, 1, 1
-        elif b.ndim == 1: b0, b1, b2, b3 = 1, 1, 1, b.shape[0]
-        elif b.ndim == 2: b0, b1, b2, b3 = 1, 1, b.shape[0], b.shape[1]
-        elif b.ndim == 3: b0, b1, b2, b3 = 1, b.shape[0], b.shape[1], b.shape[2]
-        else:             b0, b1, b2, b3 = b.shape[0], b.shape[1], b.shape[2], b.shape[3]
-
-        n0 = a0 if a0 >= b0 else b0
-        n1 = a1 if a1 >= b1 else b1
-        n2 = a2 if a2 >= b2 else b2
-        n3 = a3 if a3 >= b3 else b3
-        out = np.empty((n0, n1, n2, n3), dtype=dtype)
-
-        for i0 in range(n0):
-            ia0 = 0 if a0 == 1 else i0
-            ib0 = 0 if b0 == 1 else i0
-            for i1 in range(n1):
-                ia1 = 0 if a1 == 1 else i1
-                ib1 = 0 if b1 == 1 else i1
-                for i2 in range(n2):
-                    ia2 = 0 if a2 == 1 else i2
-                    ib2 = 0 if b2 == 1 else i2
-                    for i3 in range(n3):
-                        ia3 = 0 if a3 == 1 else i3
-                        ib3 = 0 if b3 == 1 else i3
-
-                        if   a.ndim == 0: va = float(a)
-                        elif a.ndim == 1: va = a[ia3]
-                        elif a.ndim == 2: va = a[ia2, ia3]
-                        elif a.ndim == 3: va = a[ia1, ia2, ia3]
-                        else:             va = a[ia0, ia1, ia2, ia3]
-
-                        if   b.ndim == 0: vb = float(b)
-                        elif b.ndim == 1: vb = b[ib3]
-                        elif b.ndim == 2: vb = b[ib2, ib3]
-                        elif b.ndim == 3: vb = b[ib1, ib2, ib3]
-                        else:             vb = b[ib0, ib1, ib2, ib3]
-
-                        out[i0, i1, i2, i3] = BinaryOpsHelpers._add_or_sub(va, vb, sign)
-        return out
+@numba.njit(cache=True)
+def load_variable_qp(u_e, phi_q):
+    """Evaluate u_h at a quadrature point."""
+    ndof = phi_q.shape[0]
+    if u_e.ndim == 1:
+        acc = 0.0
+        for a in range(ndof):
+            acc += u_e[a] * phi_q[a]
+        return acc
+    ncomp = u_e.shape[1]
+    out = np.empty(ncomp, dtype=use_type)
+    for i in range(ncomp):
+        acc = 0.0
+        for a in range(ndof):
+            acc += u_e[a, i] * phi_q[a]
+        out[i] = acc
+    return out
 
 
-    # -------------------------------
-    # Public helpers (drop-in)
-    # -------------------------------
-
-    @staticmethod
-    @numba.njit(cache=True)
-    def binary_add(a, b, dtype):
-        """
-        Elementwise addition with explicit loops:
-        • grad(k,n,d) + mixed(k,n,m,d) → mixed(k,n,m,d) (fast path)
-        • otherwise, supports broadcasting across any axis (rank ≤ 4)
-        Never falls back to generic NumPy broadcasting.
-        """
-        # grad (k,n,d) + mixed (k,n,m,d)
-        if a.ndim == 3 and b.ndim == 4:
-            k, n, d = a.shape
-            if b.shape[0] == k and b.shape[1] == n and b.shape[3] == d:
-                m = b.shape[2]
-                out = np.empty((k, n, m, d), dtype=dtype)
-                for kk in range(k):
-                    for ii in range(n):
-                        for mm in range(m):
-                            for dd in range(d):
-                                out[kk, ii, mm, dd] = a[kk, ii, dd] + b[kk, ii, mm, dd]
-                return out
-        # mixed (k,n,m,d) + grad (k,n,d)
-        if a.ndim == 4 and b.ndim == 3:
-            k, n, m, d = a.shape
-            if b.shape[0] == k and b.shape[1] == n and b.shape[2] == d:
-                out = np.empty((k, n, m, d), dtype=dtype)
-                for kk in range(k):
-                    for ii in range(n):
-                        for mm in range(m):
-                            for dd in range(d):
-                                out[kk, ii, mm, dd] = a[kk, ii, mm, dd] + b[kk, ii, dd]
-                return out
-
-        # scalars (0-D) on one side: do not trigger ufuncs
-        if a.ndim == 0 and b.ndim >= 1:
-            return BinaryOpsHelpers._scalar_plus_nd(a, b, 1.0, dtype)
-        if b.ndim == 0 and a.ndim >= 1:
-            return BinaryOpsHelpers._scalar_plus_nd(b, a, 1.0, dtype)
-
-        # equal or mixed ranks (1..4) with explicit broadcasting
-        nd = a.ndim if a.ndim >= b.ndim else b.ndim
-        if   nd == 0: return float(a) + float(b)
-        elif nd == 1: return BinaryOpsHelpers._combine_1d(a, b,  1.0, dtype)
-        elif nd == 2: return BinaryOpsHelpers._combine_2d(a, b,  1.0, dtype)
-        elif nd == 3: return BinaryOpsHelpers._combine_3d(a, b,  1.0, dtype)
-        else:         return BinaryOpsHelpers._combine_4d(a, b,  1.0, dtype)
+@numba.njit(cache=True)
+def gradient_qp(u_e, grad_phi_q):
+    """Evaluate ∇u_h at a quadrature point."""
+    ndof = grad_phi_q.shape[0]
+    dim = grad_phi_q.shape[1]
+    if u_e.ndim == 1:
+        g = np.zeros(dim, dtype=use_type)
+        for d in range(dim):
+            acc = 0.0
+            for a in range(ndof):
+                acc += u_e[a] * grad_phi_q[a, d]
+            g[d] = acc
+        return g
+    ncomp = u_e.shape[1]
+    G = np.zeros((dim, ncomp), dtype=use_type)
+    for d in range(dim):
+        for i in range(ncomp):
+            acc = 0.0
+            for a in range(ndof):
+                acc += u_e[a, i] * grad_phi_q[a, d]
+            G[d, i] = acc
+    return G
 
 
-    @staticmethod
-    @numba.njit(cache=True)
-    def binary_sub(a, b, dtype):
-        """
-        Elementwise subtraction with explicit loops:
-        • grad(k,n,d) − mixed(k,n,m,d) and mixed − grad (fast paths)
-        • otherwise, supports broadcasting across any axis (rank ≤ 4)
-        Never falls back to generic NumPy broadcasting.
-        """
-        # grad (k,n,d) - mixed (k,n,m,d)
-        if a.ndim == 3 and b.ndim == 4:
-            k, n, d = a.shape
-            if b.shape[0] == k and b.shape[1] == n and b.shape[3] == d:
-                m = b.shape[2]
-                out = np.empty((k, n, m, d), dtype=dtype)
-                for kk in range(k):
-                    for ii in range(n):
-                        for mm in range(m):
-                            for dd in range(d):
-                                out[kk, ii, mm, dd] = a[kk, ii, dd] - b[kk, ii, mm, dd]
-                return out
-        # mixed (k,n,m,d) - grad (k,n,d)
-        if a.ndim == 4 and b.ndim == 3:
-            k, n, m, d = a.shape
-            if b.shape[0] == k and b.shape[1] == n and b.shape[2] == d:
-                out = np.empty((k, n, m, d), dtype=dtype)
-                for kk in range(k):
-                    for ii in range(n):
-                        for mm in range(m):
-                            for dd in range(d):
-                                out[kk, ii, mm, dd] = a[kk, ii, mm, dd] - b[kk, ii, dd]
-                return out
+@numba.njit(cache=True)
+def laplacian_qp(u_e, lap_phi_q):
+    """Evaluate Δu_h at a quadrature point."""
+    ndof = lap_phi_q.shape[0]
+    if u_e.ndim == 1:
+        acc = 0.0
+        for a in range(ndof):
+            acc += u_e[a] * lap_phi_q[a]
+        return acc
+    ncomp = u_e.shape[1]
+    out = np.empty(ncomp, dtype=use_type)
+    for i in range(ncomp):
+        acc = 0.0
+        for a in range(ndof):
+            acc += u_e[a, i] * lap_phi_q[a]
+        out[i] = acc
+    return out
 
-        # scalars on one side
-        if a.ndim == 0 and b.ndim >= 1:
-            # out = scalar - b
-            return BinaryOpsHelpers._scalar_plus_nd(a, b, -1.0, dtype)
-        if b.ndim == 0 and a.ndim >= 1:
-            # out = a - scalar  ==  (-(scalar) + a)
-            return BinaryOpsHelpers._scalar_plus_nd(-float(b), a, 1.0, dtype)
 
-        # equal or mixed ranks (1..4) with explicit broadcasting
-        nd = a.ndim if a.ndim >= b.ndim else b.ndim
-        if   nd == 0: return float(a) - float(b)
-        elif nd == 1: return BinaryOpsHelpers._combine_1d(a, b, -1.0, dtype)
-        elif nd == 2: return BinaryOpsHelpers._combine_2d(a, b, -1.0, dtype)
-        elif nd == 3: return BinaryOpsHelpers._combine_3d(a, b, -1.0, dtype)
-        else:         return BinaryOpsHelpers._combine_4d(a, b, -1.0, dtype)
+@numba.njit(cache=True)
+def hessian_qp(u_e, hess_phi_q):
+    """Evaluate ∇²u_h at a quadrature point."""
+    ndof = hess_phi_q.shape[0]
+    dim = hess_phi_q.shape[1]
+    if u_e.ndim == 1:
+        H = np.zeros((dim, dim), dtype=use_type)
+        for i in range(dim):
+            for j in range(dim):
+                acc = 0.0
+                for a in range(ndof):
+                    acc += u_e[a] * hess_phi_q[a, i, j]
+                H[i, j] = acc
+        return H
+    ncomp = u_e.shape[1]
+    H = np.zeros((ncomp, dim, dim), dtype=use_type)
+    for c in range(ncomp):
+        for i in range(dim):
+            for j in range(dim):
+                acc = 0.0
+                for a in range(ndof):
+                    acc += u_e[a, c] * hess_phi_q[a, i, j]
+                H[c, i, j] = acc
+    return H
+
+
+@numba.njit(cache=True)
+def collapse_hessian_to_value(h_tensor, coeffs, dtype):
+    """Compatibility wrapper delegating to hessian_qp."""
+    return hessian_qp(coeffs, h_tensor, dtype)
+
+
+@numba.njit(cache=True)
+def collapse_vector_to_value(vector_vals, coeffs, dtype):
+    """Compatibility wrapper delegating to laplacian_qp."""
+    return laplacian_qp(coeffs, vector_vals, dtype)
+
+
+
+BinaryOpHelpers = BinaryOpsHelpers
+
+class AssemblyHelpers:
+    """Backward compatibility shim for legacy assembly helpers."""
+    pass
+
+for _helper_name in (
+    "trace_times_identity",
+    "identity_times_trace_matrix",
+    "columnwise_dot",
+    "hessian_dot_vector",
+    "vector_dot_hessian_basis",
+    "vector_dot_hessian_value",
+    "scale_mixed_basis_with_coeffs",
+    "matrix_times_scalar_basis",
+    "scalar_vector_outer_product",
+    "scalar_basis_times_vector",
+    "scalar_trial_times_grad_test",
+    "grad_trial_times_scalar_test",
+    "trace_matrix_value",
+    "trace_basis_tensor",
+    "trace_mixed_tensor",
+    "transpose_grad_tensor",
+    "transpose_mixed_grad_tensor",
+    "transpose_hessian_tensor",
+    "transpose_matrix",
+    "mul_scalar",
+    "dot_grad_basis_vector",
+    "vector_dot_grad_basis",
+    "dot_grad_basis_with_grad_value",
+    "dot_grad_value_with_grad_basis",
+    "dot_grad_func_trial_vec",
+    "dot_trial_vec_grad_func",
+    "dot_vec_vec",
+    "dot_grad_grad_value",
+    "dot_value_with_grad",
+    "dot_grad_with_value",
+    "compute_physical_hessian",
+    "compute_physical_laplacian",
+    "load_variable_qp",
+    "gradient_qp",
+    "laplacian_qp",
+    "hessian_qp",
+):
+    setattr(AssemblyHelpers, _helper_name, staticmethod(globals()[_helper_name]))
 
 class IRLoadVariableHelpers:
-    @staticmethod
-    @numba.njit(cache=True)
-    def LoadVariable(u_e, phi_q):
-        """
-        Evaluate u_h at a quadrature point.
-        u_e: (ndof,) for scalar   or   (ndof, ncomp) for vector field
-        phi_q: (ndof,)
-        Returns:
-            scalar -> float
-            vector -> (ncomp,) ndarray
-        """
-        ndof = u_e.shape[0]
-
-        if u_e.ndim == 1:
-            acc = 0.0
-            for a in range(ndof):
-                acc += u_e[a] * phi_q[a]
-            return acc
-        else:
-            ncomp = u_e.shape[1]
-            out = np.empty(ncomp, dtype=u_e.dtype)
-            for i in range(ncomp):
-                acc = 0.0
-                for a in range(ndof):
-                    acc += u_e[a, i] * phi_q[a]
-                out[i] = acc
-            return out
-
-
-    # --------------------------
-    # Gradient at a quadrature point
-    # --------------------------
-    @staticmethod
-    @numba.njit(cache=True)
-    def IRGradient(u_e, grad_phi_q):
-        """
-        Evaluate ∇u_h at a quadrature point.
-
-        u_e:         (ndof,)           or (ndof, ncomp)
-        grad_phi_q:  (ndof, dim)   [physical gradients of basis at the qp]
-
-        Returns:
-            scalar field: (dim,)            ndarray
-            vector field: (dim, ncomp)      ndarray
-        """
-        ndof = grad_phi_q.shape[0]
-        dim  = grad_phi_q.shape[1]
-
-        if u_e.ndim == 1:
-            g = np.zeros(dim, dtype=u_e.dtype)
-            for d in range(dim):
-                acc = 0.0
-                for a in range(ndof):
-                    acc += u_e[a] * grad_phi_q[a, d]
-                g[d] = acc
-            return g
-        else:
-            ncomp = u_e.shape[1]
-            G = np.zeros((dim, ncomp), dtype=u_e.dtype)
-            for d in range(dim):
-                for i in range(ncomp):
-                    acc = 0.0
-                    for a in range(ndof):
-                        acc += u_e[a, i] * grad_phi_q[a, d]
-                    G[d, i] = acc
-            return G
-
-
-    # --------------------------
-    # Laplacian at a quadrature point
-    # --------------------------
-    @staticmethod
-    @numba.njit(cache=True)
-    def laplacian(u_e, lap_phi_q):
-        """
-        Evaluate Δu_h at a quadrature point.
-
-        u_e:        (ndof,)         or (ndof, ncomp)
-        lap_phi_q:  (ndof,)  where lap_phi_q[a] = Δφ_a at qp (trace of Hessian)
-
-        Returns:
-            scalar field: float
-            vector field: (ncomp,) ndarray
-        """
-        ndof = lap_phi_q.shape[0]
-
-        if u_e.ndim == 1:
-            acc = 0.0
-            for a in range(ndof):
-                acc += u_e[a] * lap_phi_q[a]
-            return acc
-        else:
-            ncomp = u_e.shape[1]
-            out = np.empty(ncomp, dtype=u_e.dtype)
-            for i in range(ncomp):
-                acc = 0.0
-                for a in range(ndof):
-                    acc += u_e[a, i] * lap_phi_q[a]
-                out[i] = acc
-            return out
-
-
-    # --------------------------
-    # Hessian at a quadrature point
-    # --------------------------
-    @staticmethod
-    @numba.njit(cache=True)
-    def hessian(u_e, hess_phi_q):
-        """
-        Evaluate ∇²u_h (Hessian) at a quadrature point.
-
-        u_e:         (ndof,)              or (ndof, ncomp)
-        hess_phi_q:  (ndof, dim, dim)     [physical Hessians of basis at the qp]
-
-        Returns:
-            scalar field: (dim, dim)            ndarray
-            vector field: (ncomp, dim, dim)     ndarray
-                    (component-major so it's easy to loop components, then ij)
-        """
-        ndof = hess_phi_q.shape[0]
-        dim  = hess_phi_q.shape[1]
-
-        if u_e.ndim == 1:
-            H = np.zeros((dim, dim), dtype=u_e.dtype)
-            for i in range(dim):
-                for j in range(dim):
-                    acc = 0.0
-                    for a in range(ndof):
-                        acc += u_e[a] * hess_phi_q[a, i, j]
-                    H[i, j] = acc
-            return H
-        else:
-            ncomp = u_e.shape[1]
-            H = np.zeros((ncomp, dim, dim), dtype=u_e.dtype)
-            for c in range(ncomp):
-                for i in range(dim):
-                    for j in range(dim):
-                        acc = 0.0
-                        for a in range(ndof):
-                            acc += u_e[a, c] * hess_phi_q[a, i, j]
-                        H[c, i, j] = acc
-            return H
-
+    """Backward compatibility shim for legacy load-variable helpers."""
+    LoadVariable = staticmethod(load_variable_qp)
+    IRGradient = staticmethod(gradient_qp)
+    laplacian = staticmethod(laplacian_qp)
+    hessian = staticmethod(hessian_qp)
 
 # ---------------------------------------------------------------------------
 # Public aliases (module-level) for the helper routines
 # ---------------------------------------------------------------------------
 
-binary_add = BinaryOpsHelpers.binary_add
-binary_sub = BinaryOpsHelpers.binary_sub
-
-evaluate_field_value = IRLoadVariableHelpers.LoadVariable
-evaluate_field_gradient = IRLoadVariableHelpers.IRGradient
-evaluate_field_laplacian = IRLoadVariableHelpers.laplacian
-evaluate_field_hessian = IRLoadVariableHelpers.hessian
+evaluate_field_value = load_variable_qp
+evaluate_field_gradient = gradient_qp
+evaluate_field_laplacian = laplacian_qp
+evaluate_field_hessian = hessian_qp
