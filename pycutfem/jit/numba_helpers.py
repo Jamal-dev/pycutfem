@@ -45,43 +45,44 @@ def contract_last_first(a, b, dtype):
 @numba.njit(cache=True)
 def dot_mixed_const(a, b, dtype):
     """
-    Mixed basis (k,n,m) dotted with constant vector (k,) -> (n,m).
+    Mixed basis (k, n, m) dotted with constant vector (k,) -> (n, m).
+    Vectorized via (k*nm) matvec.
     """
-    k_comps = a.shape[0]
-    res = np.zeros((a.shape[1], a.shape[2]), dtype=dtype)
-    for comp in range(k_comps):
-        res += a[comp] * b[comp]
-    return res
+    k = a.shape[0]
+    nm = a.shape[1] * a.shape[2]
+    a2 = np.ascontiguousarray(a).reshape(k, nm)
+    return (a2.T @ np.ascontiguousarray(b)).reshape(a.shape[1], a.shape[2])
+
 
 
 @numba.njit(cache=True)
 def dot_const_mixed(a, b, dtype):
     """
-    Constant vector (k,) dotted with mixed basis (k,n,m) -> (n,m).
+    Constant vector (k,) dotted with mixed basis (k, n, m) -> (n, m).
+    Vectorized via (1 x k) @ (k x nm).
     """
-    k_comps = b.shape[0]
-    res = np.zeros((b.shape[1], b.shape[2]), dtype=dtype)
-    for comp in range(k_comps):
-        res += b[comp] * a[comp]
-    return res
+    k = b.shape[0]
+    nm = b.shape[1] * b.shape[2]
+    b2 = np.ascontiguousarray(b).reshape(k, nm)
+    return (np.ascontiguousarray(a) @ b2).reshape(b.shape[1], b.shape[2])
+
 
 
 @numba.njit(cache=True)
 def dot_vector_trial_grad_test(trial_vec, grad_test, dtype):
     """
-    Vector trial · grad(test) -> mixed tensor (d, n_test, n_trial).
+    Vector trial (k, n_trial) · grad(test) (k, n_test, d) -> (d, n_test, n_trial).
+    For each spatial dim j: res[j] = grad_test[:, :, j].T @ trial_vec
     """
-    k_vec = trial_vec.shape[0]
-    n_trial = trial_vec.shape[1]
-    n_test = grad_test.shape[1]
-    d = grad_test.shape[2]
-    res = np.zeros((d, n_test, n_trial), dtype=dtype)
-    for comp in range(k_vec):
-        vec_vals = trial_vec[comp]
-        grad_block = grad_test[comp]
-        for j in range(d):
-            grad_col = grad_block[:, j]
-            res[j] += np.outer(grad_col, vec_vals)
+    k_vec, n_trial = trial_vec.shape
+    _, n_test, d = grad_test.shape
+    res = np.empty((d, n_test, n_trial), dtype=dtype)
+    G = np.ascontiguousarray(grad_test)   # (k, n_test, d)
+    V = np.ascontiguousarray(trial_vec)   # (k, n_trial)
+    for j in range(d):
+        # (k, n_test) -> (n_test, k)
+        Gj = np.ascontiguousarray(G[:, :, j].T)
+        res[j] = Gj @ V
     return res
 
 
@@ -89,36 +90,32 @@ def dot_vector_trial_grad_test(trial_vec, grad_test, dtype):
 def dot_grad_basis_vector(grad_basis, vec, dtype):
     """
     Gradient basis (k, n, d) dotted with spatial vector (d,) -> (k, n).
+    Vectorized via (k*n, d) @ (d,)
     """
-    k_comps, n_locs, d_dim = grad_basis.shape
-    if vec.shape[0] != d_dim:
-        raise ValueError("Vector length does not match gradient spatial dimension")
-    res = np.zeros((k_comps, n_locs), dtype=dtype)
-    for k in range(k_comps):
-        for d in range(d_dim):
-            res[k] += grad_basis[k, :, d] * vec[d]
-    return res
+    k, n, d = grad_basis.shape
+    G = np.ascontiguousarray(grad_basis).reshape(k * n, d)
+    out = G @ np.ascontiguousarray(vec)
+    return out.reshape(k, n)
 
 
 @numba.njit(cache=True)
 def vector_dot_grad_basis(vec, grad_basis, dtype):
     """
     Vector (component) dotted with gradient basis (k, n, d).
-    Returns (1, n) for scalar fields or (d, n) when k > 1.
+    Returns (1, n) for scalar fields or (d, n) when len(vec)==k.
     """
-    k_comps, n_locs, d_dim = grad_basis.shape
+    k, n, d = grad_basis.shape
     vlen = vec.shape[0]
-    if k_comps == 1 and vlen == d_dim:
-        res = np.zeros((1, n_locs), dtype=dtype)
-        for d in range(d_dim):
-            res[0] += vec[d] * grad_basis[0, :, d]
+    if k == 1 and vlen == d:
+        # (n,d) @ (d,) -> (n,)
+        res = np.empty((1, n), dtype=dtype)
+        res[0] = np.ascontiguousarray(grad_basis[0]) @ np.ascontiguousarray(vec)
         return res
-    if vlen == k_comps:
-        res = np.zeros((d_dim, n_locs), dtype=dtype)
-        for d in range(d_dim):
-            for k in range(k_comps):
-                res[d] += vec[k] * grad_basis[k, :, d]
-        return res
+    if vlen == k:
+        # sum_k vec[k] * grad_basis[k, :, d]  -> reshape to do one BLAS
+        A = np.ascontiguousarray(grad_basis).reshape(k, n * d)         # (k, n*d)
+        tmp = np.ascontiguousarray(vec) @ A                             # (n*d,)
+        return tmp.reshape(n, d).T.copy()                               # (d, n)
     raise ValueError("vector·grad basis: incompatible shapes")
 
 
@@ -126,50 +123,54 @@ def vector_dot_grad_basis(vec, grad_basis, dtype):
 def dot_grad_basis_with_grad_value(grad_basis, grad_value, dtype):
     """
     Grad(basis) (k, n, d) dotted with grad(value) (k, d) -> (k, n, k).
+    For each n: (k,d) @ (d,k)  (transpose on grad_value).
     """
-    k_comps, n_locs, d_dim = grad_basis.shape
-    if grad_value.shape[0] != k_comps or grad_value.shape[1] != d_dim:
+    k, n, d = grad_basis.shape
+    if grad_value.shape[0] != k or grad_value.shape[1] != d:
         raise ValueError("Gradient value shape incompatible with basis gradient")
-    res = np.zeros((k_comps, n_locs, k_comps), dtype=dtype)
-    for n in range(n_locs):
-        a_slice = grad_basis[:, n, :].copy()
-        res[:, n, :] = a_slice @ grad_value
+    res = np.empty((k, n, k), dtype=dtype)
+    GVt = np.ascontiguousarray(grad_value)  # (k, d)
+    for ii in range(n):
+        res[:, ii, :] = np.ascontiguousarray(grad_basis[:, ii, :]) @ GVt
     return res
 
 
 @numba.njit(cache=True)
 def dot_grad_value_with_grad_basis(grad_value, grad_basis, dtype):
     """
-    Grad(value) (k, d) dotted with grad(basis) (k, n, d) -> (k, n, d).
+    Grad(value) (k, k) (k==d) dotted with grad(basis) (k, n, k) -> (k, n, k).
+    Loop only over 'n' with BLAS inside: res[:, n, :] = grad_value @ grad_basis[:, n, :]
     """
-    k_comps, n_locs, d_dim = grad_basis.shape
-    if grad_value.shape[0] != k_comps or grad_value.shape[1] != d_dim:
-        raise ValueError("Gradient value shape incompatible with basis gradient")
-    res = np.zeros((k_comps, n_locs, d_dim), dtype=dtype)
-    for n in range(n_locs):
-        for i in range(k_comps):
-            for d in range(d_dim):
-                acc = 0.0
-                for k in range(k_comps):
-                    acc += grad_value[i, k] * grad_basis[k, n, d]
-                res[i, n, d] = acc
+    k, n, d = grad_basis.shape
+    if grad_value.shape[0] != k or grad_value.shape[1] != k or d != k:
+        raise ValueError("Gradient value shape incompatible with grad basis (expect square k==d)")
+    res = np.empty((k, n, k), dtype=dtype)
+    GV = np.ascontiguousarray(grad_value)
+    Gb = np.ascontiguousarray(grad_basis)
+    for ii in range(n):
+        Gb_slice = np.ascontiguousarray(Gb[:, ii, :])
+        res[:, ii, :] = GV @ Gb_slice
     return res
 
 
 @numba.njit(cache=True)
-def dot_mass_test_trial(test_vec, trial_vec, dtype):
-    """
-    Compute Test.T @ Trial for mass matrices.
-    """
-    return test_vec.T.copy() @ trial_vec
-
+def dot_vec_vec(vec_a, vec_b, dtype):
+    """Dot product between two vectors."""
+    return float(np.dot(vec_a, vec_b))
 
 @numba.njit(cache=True)
-def dot_mass_trial_test(trial_vec, test_vec, dtype):
+def dot_value_with_grad(value_vec, grad_mat, dtype):
     """
-    Compute Trial.T @ Test for mass matrices.
+    Value (k,) · grad (k,d) -> (d,)
     """
-    return trial_vec.T.copy() @ test_vec
+    return np.ascontiguousarray(value_vec) @ np.ascontiguousarray(grad_mat)
+
+@numba.njit(cache=True)
+def dot_grad_with_value(grad_mat, value_vec, dtype):
+    """
+    Grad (k,d) · value (k,) -> (d,)
+    """
+    return np.ascontiguousarray(grad_mat) @ np.ascontiguousarray(value_vec)
 
 
 @numba.njit(cache=True)
@@ -204,20 +205,7 @@ def dot_grad_grad_value(grad_a, grad_b, dtype):
     return grad_a @ grad_b
 
 
-@numba.njit(cache=True)
-def dot_value_with_grad(value_vec, grad_mat, dtype):
-    """
-    Dot product between value vector (k,) and gradient matrix (k,d).
-    """
-    return np.dot(value_vec, grad_mat)
 
-
-@numba.njit(cache=True)
-def dot_grad_with_value(grad_mat, value_vec, dtype):
-    """
-    Dot product between gradient matrix (k,d) and value vector (k,).
-    """
-    return np.dot(grad_mat, value_vec)
 
 
 @numba.njit(cache=True)
@@ -297,16 +285,14 @@ def trace_basis_tensor(tensor, dtype):
 def trace_mixed_tensor(tensor, dtype):
     """
     Trace of a mixed tensor (k, n_test, n_trial, k) -> (1, n_test, n_trial).
+    Vectorized over the last two axes; sum diagonal blocks.
     """
-    k_comps, n_test, n_trial, d_dim = tensor.shape
+    k, n_test, n_trial, d_dim = tensor.shape
+    n_diag = k if k < d_dim else d_dim
     res = np.zeros((1, n_test, n_trial), dtype=dtype)
-    n_diag = min(k_comps, d_dim)
-    for nt in range(n_test):
-        for tr in range(n_trial):
-            acc = 0.0
-            for i in range(n_diag):
-                acc += tensor[i, nt, tr, i]
-            res[0, nt, tr] = acc
+    # Sum tensor[i, :, :, i] across i
+    for i in range(n_diag):
+        res[0] += tensor[i, :, :, i]
     return res
 
 
@@ -406,16 +392,57 @@ def compute_physical_laplacian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
         res[j] = hphys[0, 0] + hphys[1, 1]
     return res
 
+@numba.njit(cache=True)
+def dot_mass_test_trial(test_vec, trial_vec, dtype):
+    """
+    Compute Test.T @ Trial for mass matrices.
+    """
+    return test_vec.T.copy() @ trial_vec
+@numba.njit(cache=True)
+def dot_mass_trial_test(trial_vec, test_vec, dtype):
+    """
+    Compute Trial.T @ Test for mass matrices.
+    """
+    return trial_vec.T.copy() @ test_vec
+
+@numba.njit(cache=True)
+def inner_grad_function_grad_test(function_grad, test_grad, dtype):
+    """
+    Inner product between grad(Function) (k,d) and grad(Test) basis (k,n,d) -> (n,).
+    Vectorized by flattening (k*d): (n x kd) @ (kd,)
+    """
+    k_comps, n_locs, d_dim = test_grad.shape
+    if function_grad.shape[0] != k_comps or function_grad.shape[1] != d_dim:
+        raise ValueError("Gradient(Function) shape incompatible with grad(Test)")
+    
+    # Vectorized implementation:
+    # (k, n, d) -> (n, k, d)
+    test_grad_T = test_grad.transpose(1, 0, 2)
+    
+    # --- THIS IS THE FIX ---
+    # Ensure the array is contiguous *before* reshaping
+    test_grad_contig = np.ascontiguousarray(test_grad_T)
+    # -----------------------
+
+    # Reshape (n, k, d) -> (n, k*d)
+    test_grad_flat = test_grad_contig.reshape(n_locs, k_comps * d_dim)
+    
+    # Reshape (k, d) -> (k*d,)
+    func_grad_flat = function_grad.reshape(k_comps * d_dim)
+    
+    # Perform (n, k*d) @ (k*d,) -> (n,)
+    res = test_grad_flat @ func_grad_flat
+    
+    return res
 
 @numba.njit(cache=True)
 def basis_dot_const_vector(basis, const_vec, dtype):
     """
     Basis (k,n) dotted with constant vector (k,) -> (1,n).
+    Vectorized: (n,k) @ (k,)
     """
-    n_locs = basis.shape[1]
-    res = np.zeros((1, n_locs), dtype=dtype)
-    for n in range(n_locs):
-        res[0, n] = np.dot(basis[:, n], const_vec)
+    res = np.empty((1, basis.shape[1]), dtype=dtype)
+    res[0] = np.ascontiguousarray(basis).T @ np.ascontiguousarray(const_vec)
     return res
 
 
@@ -423,11 +450,10 @@ def basis_dot_const_vector(basis, const_vec, dtype):
 def const_vector_dot_basis(const_vec, basis, dtype):
     """
     Constant vector (k,) dotted with basis (k,n) -> (1,n).
+    (same as above, order swapped)
     """
-    n_locs = basis.shape[1]
-    res = np.zeros((1, n_locs), dtype=dtype)
-    for n in range(n_locs):
-        res[0, n] = np.dot(basis[:, n], const_vec)
+    res = np.empty((1, basis.shape[1]), dtype=dtype)
+    res[0] = np.ascontiguousarray(basis).T @ np.ascontiguousarray(const_vec)
     return res
 
 
@@ -436,53 +462,37 @@ def const_vector_dot_basis_1d(const_vec, basis, dtype):
     """
     Constant vector (k,) dotted with basis (k,n) -> (n,).
     """
-    n_locs = basis.shape[1]
-    k_comps = basis.shape[0]
-    res = np.zeros(n_locs, dtype=dtype)
-    for n in range(n_locs):
-        acc = 0.0
-        for k in range(k_comps):
-            acc += const_vec[k] * basis[k, n]
-        res[n] = acc
-    return res
+    return np.ascontiguousarray(basis).T @ np.ascontiguousarray(const_vec)
+
 
 
 @numba.njit(cache=True)
 def scalar_basis_times_vector(scalar_basis, vector_vals, dtype):
     """
     Scalar basis (1,n) or (n,) times vector components (k,) -> (k,n).
+    Broadcasting outer product.
     """
     if scalar_basis.ndim == 2:
-        basis_vals = scalar_basis[0]
+        phi = scalar_basis[0]
     else:
-        basis_vals = scalar_basis
-    n_vec = vector_vals.shape[0]
-    n_basis = basis_vals.shape[0]
-    res = np.zeros((n_vec, n_basis), dtype=dtype)
-    for k in range(n_vec):
-        res[k, :] = basis_vals * vector_vals[k]
-    return res
+        phi = scalar_basis
+    return np.ascontiguousarray(vector_vals)[:, None] * np.ascontiguousarray(phi)[None, :]
+
 
 
 @numba.njit(cache=True)
 def matrix_times_scalar_basis(matrix_vals, scalar_basis, dtype):
     """
     Matrix (m, n) times scalar basis row (1,p) -> (1,p).
+    Algebraically equals sum(matrix_vals) * scalar_basis.
     """
     if scalar_basis.ndim == 2:
-        phi_row = scalar_basis[0]
+        phi = scalar_basis[0]
     else:
-        phi_row = scalar_basis
-    n_trial = phi_row.shape[0]
-    m_rows, n_cols = matrix_vals.shape
-    res = np.zeros((1, n_trial), dtype=dtype)
-    for i in range(m_rows):
-        accum = np.zeros(n_trial, dtype=dtype)
-        for j in range(n_cols):
-            coeff = matrix_vals[i, j]
-            if coeff != 0.0:
-                accum += coeff * phi_row
-        res[0] += accum
+        phi = scalar_basis
+    s = float(np.sum(matrix_vals))
+    res = np.empty((1, phi.shape[0]), dtype=dtype)
+    res[0] = s * phi
     return res
 
 
@@ -490,46 +500,32 @@ def matrix_times_scalar_basis(matrix_vals, scalar_basis, dtype):
 def scalar_vector_outer_product(scalar_vals, vector_vals, dtype):
     """
     Scalar values (n,) times vector (k,) -> (k,n).
+    Broadcasting outer product.
     """
-    n_basis = scalar_vals.shape[0]
-    n_vec = vector_vals.shape[0]
-    res = np.zeros((n_vec, n_basis), dtype=dtype)
-    for k in range(n_vec):
-        for n in range(n_basis):
-            res[k, n] = scalar_vals[n] * vector_vals[k]
-    return res
+    return np.ascontiguousarray(vector_vals)[:, None] * np.ascontiguousarray(scalar_vals)[None, :]
+
 
 
 @numba.njit(cache=True)
 def scalar_trial_times_grad_test(grad_test, trial_vals, dtype):
     """
-    Scalar Trial basis (n_trial,) times grad(Test) (k,n_test,d) -> (k,n_test,n_trial,d).
+    Scalar Trial (n_trial,) times grad(Test) (k,n_test,d) -> (k,n_test,n_trial,d).
+    Vectorized with broadcasting.
     """
-    k_comps, n_test, d_dim = grad_test.shape
-    n_trial = trial_vals.shape[0]
-    res = np.zeros((k_comps, n_test, n_trial, d_dim), dtype=dtype)
-    for comp in range(k_comps):
-        for dim in range(d_dim):
-            row = grad_test[comp, :, dim]
-            for nt in range(n_test):
-                res[comp, nt, :, dim] = row[nt] * trial_vals
-    return res
+    return (np.ascontiguousarray(grad_test)[:, :, None, :] *
+            np.ascontiguousarray(trial_vals)[None, None, :, None])
+
 
 
 @numba.njit(cache=True)
 def grad_trial_times_scalar_test(grad_trial, test_vals, dtype):
     """
     Grad(Trial) (k,n_trial,d) times scalar Test (n_test,) -> (k,n_test,n_trial,d).
+    Vectorized with broadcasting.
     """
-    k_comps, n_trial, d_dim = grad_trial.shape
-    n_test = test_vals.shape[0]
-    res = np.zeros((k_comps, n_test, n_trial, d_dim), dtype=dtype)
-    for comp in range(k_comps):
-        for dim in range(d_dim):
-            col = grad_trial[comp, :, dim]
-            for nt in range(n_test):
-                res[comp, nt, :, dim] = test_vals[nt] * col
-    return res
+    return (np.ascontiguousarray(grad_trial)[:, None, :, :] *
+            np.ascontiguousarray(test_vals)[None, :, None, None])
+
 
 
 @numba.njit(cache=True)
@@ -537,17 +533,12 @@ def scale_mixed_basis_with_coeffs(mixed_basis, coeffs, dtype):
     """
     Mixed basis (k_mixed, n_rows, n_cols) scaled by coeffs (k_out, d_cols)
     -> (k_out, n_rows, n_cols, d_cols).
+    Since coeffs are independent of k_mixed, this is:
+       coeffs[:,None,None,:] * sum_k mixed_basis[k]
     """
-    k_mixed, n_rows, n_cols = mixed_basis.shape
-    k_out, d_cols = coeffs.shape
-    res = np.zeros((k_out, n_rows, n_cols, d_cols), dtype=dtype)
-    for i in range(k_out):
-        for j in range(d_cols):
-            coeff = coeffs[i, j]
-            if coeff != 0.0:
-                for comp in range(k_mixed):
-                    res[i, :, :, j] += mixed_basis[comp] * coeff
-    return res
+    base = np.sum(np.ascontiguousarray(mixed_basis), axis=0)  # (n_rows, n_cols)
+    return (np.ascontiguousarray(coeffs)[:, None, None, :] *
+            base[None, :, :, None])
 
 
 @numba.njit(cache=True)
@@ -591,14 +582,10 @@ def identity_times_trace_matrix(identity, trace_matrix, dtype):
 def columnwise_dot(a_mat, b_mat, dtype):
     """
     Column-wise dot products between two (k,n) arrays -> (1,n).
+    Vectorized sum over axis=0.
     """
-    n_cols = a_mat.shape[1]
-    res = np.zeros((1, n_cols), dtype=dtype)
-    for n in range(n_cols):
-        acc = 0.0
-        for k in range(a_mat.shape[0]):
-            acc += a_mat[k, n] * b_mat[k, n]
-        res[0, n] = acc
+    res = np.empty((1, a_mat.shape[1]), dtype=dtype)
+    res[0] = np.sum(np.ascontiguousarray(a_mat) * np.ascontiguousarray(b_mat), axis=0)
     return res
 
 
@@ -606,157 +593,144 @@ def columnwise_dot(a_mat, b_mat, dtype):
 def hessian_dot_vector(hessian, vec, dtype):
     """
     Hessian (basis or value) dotted with spatial vector.
-    Returns (k, n, d1) for basis, (k, d1) for value.
+    Basis: (k,n,d1,d2) -> (k,n,d1)    Value: (k,d1,d2) -> (k,d1)
     """
-    vec_contig = np.ascontiguousarray(vec)
+    v = np.ascontiguousarray(vec)
     if hessian.ndim == 4:
-        k_comps, n_locs, d1, _ = hessian.shape
-        res = np.zeros((k_comps, n_locs, d1), dtype=dtype)
-        for kk in range(k_comps):
-            for n in range(n_locs):
-                res[kk, n, :] = np.dot(hessian[kk, n], vec_contig)
-        return res
+        k, n, d1, _ = hessian.shape
+        out = np.empty((k, n, d1), dtype=dtype)
+        H = np.ascontiguousarray(hessian)
+        for kk in range(k):
+            for nn in range(n):
+                out[kk, nn] = H[kk, nn] @ v
+        return out
     elif hessian.ndim == 3:
-        k_comps, d1, _ = hessian.shape
-        res = np.zeros((k_comps, d1), dtype=dtype)
-        for kk in range(k_comps):
-            res[kk, :] = np.dot(hessian[kk], vec_contig)
-        return res
+        k, d1, _ = hessian.shape
+        out = np.empty((k, d1), dtype=dtype)
+        H = np.ascontiguousarray(hessian)
+        for kk in range(k):
+            out[kk] = H[kk] @ v
+        return out
     else:
         raise ValueError("Unsupported Hessian shape for hessian_dot_vector")
+
 
 
 @numba.njit(cache=True)
 def vector_dot_hessian_basis(vec, hessian, dtype):
     """
     Vector dotted with Hessian basis (k,n,d1,d2).
-    Handles component and spatial vector variants.
+    vlen==k: res[j] = vec @ hessian[:, :, j, :]   (batched via reshape)
+    vlen==d1 & k==1: res[0,n,:] = vec @ hessian[0,n]
     """
-    k_comps, n_locs, d1, d2 = hessian.shape
-    vlen = vec.shape[0]
-    vec_contig = np.ascontiguousarray(vec)
-    if vlen == k_comps and k_comps > 1:
-        res = np.zeros((d1, n_locs, d2), dtype=dtype)
-        for n in range(n_locs):
-            for j in range(d1):
-                res[j, n, :] = np.dot(vec_contig, hessian[:, n, j, :])
-        return res
-    elif vlen == d1 and k_comps == 1:
-        res = np.zeros((1, n_locs, d2), dtype=dtype)
-        for n in range(n_locs):
-            res[0, n, :] = np.dot(vec_contig, hessian[0, n])
-        return res
+    k, n, d1, d2 = hessian.shape
+    v = np.ascontiguousarray(vec)
+    H = np.ascontiguousarray(hessian)
+    if v.shape[0] == k and k > 1:
+        out = np.empty((d1, n, d2), dtype=dtype)
+        for j in range(d1):
+            
+            # Slicing H[:, :, j, :] creates a non-contiguous 3D array.
+            # We must make it contiguous before reshaping.
+            H_slice = H[:, :, j, :]
+            H_slice_contig = np.ascontiguousarray(H_slice)
+            Hj = H_slice_contig.reshape(k, n * d2)      # (k, n*d2)
+
+            tmp = v @ Hj                                # (n*d2,)
+            out[j] = tmp.reshape(n, d2)
+        return out
+    elif v.shape[0] == d1 and k == 1:
+        out = np.empty((1, n, d2), dtype=dtype)
+        for nn in range(n):
+            out[0, nn] = v @ H[0, nn]
+        return out
     else:
         raise ValueError("vector·Hessian(basis): incompatible shapes")
-
 
 @numba.njit(cache=True)
 def vector_dot_hessian_value(vec, hessian, dtype):
     """
-    Vector dotted with Hessian value (k,d1,d2).
-    Handles component and spatial vector variants.
+    Vector dotted with Hessian value (k,d1,d2):
+    vlen==k: res[j,:] = vec @ hessian[:, j, :]
+    vlen==d1 & k==1:  res[0,:] = vec @ hessian[0]
     """
-    k_comps, d1, d2 = hessian.shape
-    vlen = vec.shape[0]
-    vec_contig = np.ascontiguousarray(vec)
-    if vlen == k_comps and k_comps > 1:
-        res = np.zeros((d1, d2), dtype=dtype)
+    k, d1, d2 = hessian.shape
+    v = np.ascontiguousarray(vec)
+    H = np.ascontiguousarray(hessian)
+    if v.shape[0] == k and k > 1:
+        out = np.empty((d1, d2), dtype=dtype)
         for j in range(d1):
-            res[j, :] = np.dot(vec_contig, hessian[:, j, :])
-        return res
-    elif vlen == d1 and k_comps == 1:
-        res = np.zeros((1, d2), dtype=dtype)
-        res[0, :] = np.dot(vec_contig, hessian[0])
-        return res
+            Hj = np.ascontiguousarray(H[:, j, :])
+            out[j] = v @ Hj
+        return out
+    elif v.shape[0] == d1 and k == 1:
+        out = np.empty((1, d2), dtype=dtype)
+        out[0] = v @ H[0]
+        return out
     else:
         raise ValueError("vector·Hessian(value): incompatible shapes")
 
-
-@numba.njit(cache=True)
-def inner_grad_function_grad_test(function_grad, test_grad, dtype):
-    """
-    Inner product between grad(Function) (k,d) and grad(Test) basis (k,n,d) -> (n,).
-    """
-    k_comps, n_locs, d_dim = test_grad.shape
-    if function_grad.shape[0] != k_comps or function_grad.shape[1] != d_dim:
-        raise ValueError("Gradient(Function) shape incompatible with grad(Test)")
-    res = np.zeros(n_locs, dtype=dtype)
-    for comp in range(k_comps):
-        res += test_grad[comp] @ function_grad[comp]
-    return res
-
+# ---------- “inner(·,·)” building blocks ----------
 
 @numba.njit(cache=True)
 def inner_hessian_function_hessian_test(function_hess, test_hess, dtype):
     """
-    Inner product between Hess(Function) (k,d,d) and Hess(Test) basis (k,n,d,d) -> (n,).
+    Inner product between Hess(Function) (k,d,d) and Hess(Test) (k,n,d,d) -> (n,).
+    Vectorized by flattening the (d*d) block and doing (n x dd) @ (dd,)
     """
-    k_comps, n_locs, d_dim, d_dim2 = test_hess.shape
-    if (function_hess.shape[0] != k_comps or
-            function_hess.shape[1] != d_dim or
-            function_hess.shape[2] != d_dim2):
+    k, n, d, d2 = test_hess.shape
+    if function_hess.shape[0] != k or function_hess.shape[1] != d or function_hess.shape[2] != d2:
         raise ValueError("Hessian(Function) shape incompatible with Hessian(Test)")
-    res = np.zeros(n_locs, dtype=dtype)
-    for comp in range(k_comps):
-        for n in range(n_locs):
-            acc = 0.0
-            for i in range(d_dim):
-                for j in range(d_dim2):
-                    acc += test_hess[comp, n, i, j] * function_hess[comp, i, j]
-            res[n] += acc
+    res = np.zeros(n, dtype=dtype)
+    dd = d * d2
+    fh = np.ascontiguousarray(function_hess).reshape(k, dd)
+    th = np.ascontiguousarray(test_hess).reshape(k, n, dd)
+    for comp in range(k):
+        res += th[comp] @ fh[comp]
     return res
 
 
 @numba.njit(cache=True)
 def inner_mixed_grad_const(mixed_grad, grad_const, dtype):
     """
-    Inner product of mixed gradient (k, n_test, n_trial, d)
-    with gradient of const/value (k, d) -> (n_test, n_trial).
+    Inner of mixed grad (k, n_test, n_trial, d) with grad(const) (k, d) -> (n_test, n_trial).
+    Vectorized by flattening (k*d) and a single matvec.
     """
-    k_comps, n_test, n_trial, d_dim = mixed_grad.shape
-    if grad_const.shape[0] != k_comps or grad_const.shape[1] != d_dim:
-        raise ValueError("Gradient(const) shape incompatible with mixed gradient")
-    res = np.zeros((n_test, n_trial), dtype=dtype)
-    for comp in range(k_comps):
-        for d in range(d_dim):
-            res += mixed_grad[comp, :, :, d] * grad_const[comp, d]
-    return res
+    k, n_test, n_trial, d = mixed_grad.shape
+    # (k, n_test, n_trial, d) -> (n_test, n_trial, k, d)
+    A_transposed = np.ascontiguousarray(mixed_grad).transpose(1, 2, 0, 3)
+    # Ensure the array is contiguous *before* reshaping
+    A_contig = np.ascontiguousarray(A_transposed)
+    # (n_test, n_trial, k, d) -> (n_test * n_trial, k * d)
+    A = A_contig.reshape(n_test * n_trial, k * d)
+    b = np.ascontiguousarray(grad_const).reshape(k * d)
+    return (A @ b).reshape(n_test, n_trial)
 
 
 @numba.njit(cache=True)
 def inner_grad_const_mixed(grad_const, mixed_grad, dtype):
     """
-    Inner product of grad(const/value) (k, d) with mixed gradient (k, n_test, n_trial, d)
-    -> (n_test, n_trial).
+    Inner of grad(const/value) (k, d) with mixed grad (k, n_test, n_trial, d) -> (n_test, n_trial).
+    Same vectorization as above.
     """
-    k_comps, n_test, n_trial, d_dim = mixed_grad.shape
-    if grad_const.shape[0] != k_comps or grad_const.shape[1] != d_dim:
-        raise ValueError("Gradient(const) shape incompatible with mixed gradient")
-    res = np.zeros((n_test, n_trial), dtype=dtype)
-    for comp in range(k_comps):
-        grad_vec = grad_const[comp]
-        for i in range(n_test):
-            block = mixed_grad[comp, i]
-            res[i, :] += block @ grad_vec
-    return res
+    k, n_test, n_trial, d = mixed_grad.shape
+    A_trasposed = np.ascontiguousarray(mixed_grad).transpose(1, 2, 0, 3)
+    A_contg = np.ascontiguousarray(A_trasposed)
+    A = A_contg.reshape(n_test * n_trial, k * d)
+    b = np.ascontiguousarray(grad_const).reshape(k * d)
+    return (A @ b).reshape(n_test, n_trial)
 
 
 @numba.njit(cache=True)
 def inner_grad_basis_grad_const(grad_basis, grad_const, dtype):
     """
-    Inner product of grad(Test/Trial) basis (k, n, d) with grad(const/value) (k, d) -> (n,).
+    Inner grad(basis) (k, n, d) with grad(const/value) (k, d) -> (n,).
+    Vectorized by flattening (k*d): (n x kd) @ (kd,)
     """
-    k_comps, n_locs, d_dim = grad_basis.shape
-    if grad_const.shape[0] != k_comps or grad_const.shape[1] != d_dim:
-        raise ValueError("Gradient(const) shape incompatible with grad basis")
-    res = np.zeros(n_locs, dtype=dtype)
-    for n in range(n_locs):
-        acc = 0.0
-        for comp in range(k_comps):
-            for d in range(d_dim):
-                acc += grad_basis[comp, n, d] * grad_const[comp, d]
-        res[n] = acc
-    return res
+    k, n, d = grad_basis.shape
+    A = np.ascontiguousarray(grad_basis).transpose(1, 0, 2).reshape(n, k * d)
+    b = np.ascontiguousarray(grad_const).reshape(k * d)
+    return A @ b
 
 
 @numba.njit(cache=True)
@@ -902,90 +876,65 @@ class BinaryOpsHelpers:
 
 @numba.njit(cache=True)
 def load_variable_qp(u_e, phi_q):
-    """Evaluate u_h at a quadrature point."""
-    ndof = phi_q.shape[0]
+    """
+    Evaluate u_h at a quadrature point.
+    u_e: (ndof,) or (ndof, ncomp); phi_q: (ndof,)
+    """
     if u_e.ndim == 1:
-        acc = 0.0
-        for a in range(ndof):
-            acc += u_e[a] * phi_q[a]
-        return acc
-    ncomp = u_e.shape[1]
-    out = np.empty(ncomp, dtype=use_type)
-    for i in range(ncomp):
-        acc = 0.0
-        for a in range(ndof):
-            acc += u_e[a, i] * phi_q[a]
-        out[i] = acc
-    return out
+        # (ndof,) @ (ndof,) -> scalar
+        return float(np.dot(u_e, phi_q))
+    # (ndof, ncomp).T @ (ndof,) -> (ncomp, ndof) @ (ndof,) -> (ncomp,)
+    return (u_e.T @ phi_q).astype(u_e.dtype)
 
 
 @numba.njit(cache=True)
 def gradient_qp(u_e, grad_phi_q):
-    """Evaluate ∇u_h at a quadrature point."""
-    ndof = grad_phi_q.shape[0]
-    dim = grad_phi_q.shape[1]
+    """
+    Evaluate ∇u_h at a qp. grad_phi_q: (ndof, dim)
+    Returns: scalar -> (dim,), vector -> (dim, ncomp)
+    """
     if u_e.ndim == 1:
-        g = np.zeros(dim, dtype=use_type)
-        for d in range(dim):
-            acc = 0.0
-            for a in range(ndof):
-                acc += u_e[a] * grad_phi_q[a, d]
-            g[d] = acc
-        return g
-    ncomp = u_e.shape[1]
-    G = np.zeros((dim, ncomp), dtype=use_type)
-    for d in range(dim):
-        for i in range(ncomp):
-            acc = 0.0
-            for a in range(ndof):
-                acc += u_e[a, i] * grad_phi_q[a, d]
-            G[d, i] = acc
-    return G
+        # (ndof, dim).T @ (ndof,) -> (dim, ndof) @ (ndof,) -> (dim,)
+        return (grad_phi_q.T @ u_e).astype(u_e.dtype)
+    # (ndof, dim).T @ (ndof, ncomp) -> (dim, ndof) @ (ndof, ncomp) -> (dim, ncomp)
+    return (grad_phi_q.T @ u_e).astype(u_e.dtype)
 
 
 @numba.njit(cache=True)
 def laplacian_qp(u_e, lap_phi_q):
-    """Evaluate Δu_h at a quadrature point."""
-    ndof = lap_phi_q.shape[0]
+    """
+    Evaluate Δu_h at a qp. lap_phi_q: (ndof,)
+    Returns: scalar -> float, vector -> (ncomp,)
+    """
     if u_e.ndim == 1:
-        acc = 0.0
-        for a in range(ndof):
-            acc += u_e[a] * lap_phi_q[a]
-        return acc
-    ncomp = u_e.shape[1]
-    out = np.empty(ncomp, dtype=use_type)
-    for i in range(ncomp):
-        acc = 0.0
-        for a in range(ndof):
-            acc += u_e[a, i] * lap_phi_q[a]
-        out[i] = acc
-    return out
+        # (ndof,) @ (ndof,) -> scalar
+        return float(np.dot(u_e, lap_phi_q))
+    # (ndof, ncomp).T @ (ndof,) -> (ncomp, ndof) @ (ndof,) -> (ncomp,)
+    return (u_e.T @ lap_phi_q).astype(u_e.dtype)
 
 
 @numba.njit(cache=True)
 def hessian_qp(u_e, hess_phi_q):
-    """Evaluate ∇²u_h at a quadrature point."""
+    """
+    Evaluate ∇²u_h at a qp.
+    hess_phi_q: (ndof, dim, dim)
+    Returns: scalar -> (dim,dim), vector -> (ncomp, dim, dim)
+    """
     ndof = hess_phi_q.shape[0]
-    dim = hess_phi_q.shape[1]
+    dim  = hess_phi_q.shape[1]
+    
+    # (ndof, dim, dim) -> (ndof, dim*dim)
+    Hflat = np.ascontiguousarray(hess_phi_q).reshape(ndof, dim * dim)
+    
     if u_e.ndim == 1:
-        H = np.zeros((dim, dim), dtype=use_type)
-        for i in range(dim):
-            for j in range(dim):
-                acc = 0.0
-                for a in range(ndof):
-                    acc += u_e[a] * hess_phi_q[a, i, j]
-                H[i, j] = acc
-        return H
+        # (ndof, dd).T @ (ndof,) -> (dd, ndof) @ (ndof,) -> (dd,)
+        out = (Hflat.T @ u_e).reshape(dim, dim)
+        return out.astype(u_e.dtype)
+    
+    # (ndof, ncomp).T @ (ndof, dd) -> (ncomp, ndof) @ (ndof, dd) -> (ncomp, dd)
     ncomp = u_e.shape[1]
-    H = np.zeros((ncomp, dim, dim), dtype=use_type)
-    for c in range(ncomp):
-        for i in range(dim):
-            for j in range(dim):
-                acc = 0.0
-                for a in range(ndof):
-                    acc += u_e[a, c] * hess_phi_q[a, i, j]
-                H[c, i, j] = acc
-    return H
+    out2 = (u_e.T @ Hflat).reshape(ncomp, dim, dim)
+    return out2.astype(u_e.dtype)
 
 
 @numba.njit(cache=True)
