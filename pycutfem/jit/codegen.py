@@ -3256,6 +3256,7 @@ from pycutfem.jit.numba_helpers import (
     binary_sub_generic,
     binary_sub_3_4,
     binary_sub_4_3,
+    scatter_tensor_to_union,
 )
 PARAM_ORDER = [{param_order_literal}]
 {decorator}

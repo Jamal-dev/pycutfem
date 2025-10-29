@@ -893,11 +893,12 @@ def gradient_qp(u_e, grad_phi_q):
     Evaluate ∇u_h at a qp. grad_phi_q: (ndof, dim)
     Returns: scalar -> (dim,), vector -> (dim, ncomp)
     """
+    grad_T = np.ascontiguousarray(grad_phi_q).T
     if u_e.ndim == 1:
         # (ndof, dim).T @ (ndof,) -> (dim, ndof) @ (ndof,) -> (dim,)
-        return (grad_phi_q.T @ u_e).astype(u_e.dtype)
+        return (np.ascontiguousarray(grad_T) @ u_e).astype(u_e.dtype)
     # (ndof, dim).T @ (ndof, ncomp) -> (dim, ndof) @ (ndof, ncomp) -> (dim, ncomp)
-    return (grad_phi_q.T @ u_e).astype(u_e.dtype)
+    return (np.ascontiguousarray(grad_T) @ u_e).astype(u_e.dtype)
 
 
 @numba.njit(cache=True)
@@ -910,7 +911,7 @@ def laplacian_qp(u_e, lap_phi_q):
         # (ndof,) @ (ndof,) -> scalar
         return float(np.dot(u_e, lap_phi_q))
     # (ndof, ncomp).T @ (ndof,) -> (ncomp, ndof) @ (ndof,) -> (ncomp,)
-    return (u_e.T @ lap_phi_q).astype(u_e.dtype)
+    return (np.ascontiguousarray(u_e.T) @ lap_phi_q).astype(u_e.dtype)
 
 
 @numba.njit(cache=True)
@@ -928,12 +929,14 @@ def hessian_qp(u_e, hess_phi_q):
     
     if u_e.ndim == 1:
         # (ndof, dd).T @ (ndof,) -> (dd, ndof) @ (ndof,) -> (dd,)
-        out = (Hflat.T @ u_e).reshape(dim, dim)
+        Hflat_T = np.ascontiguousarray(Hflat.T)
+        out = (Hflat_T @ u_e).reshape(dim, dim)
         return out.astype(u_e.dtype)
     
     # (ndof, ncomp).T @ (ndof, dd) -> (ncomp, ndof) @ (ndof, dd) -> (ncomp, dd)
     ncomp = u_e.shape[1]
-    out2 = (u_e.T @ Hflat).reshape(ncomp, dim, dim)
+    ue_T = np.ascontiguousarray(u_e.T)
+    out2 = (ue_T @ Hflat).reshape(ncomp, dim, dim)
     return out2.astype(u_e.dtype)
 
 
