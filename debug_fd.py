@@ -1,5 +1,7 @@
 import numpy as np
 import logging
+import os
+import sys
 from dataclasses import dataclass
 
 logging.getLogger("pycutfem").setLevel(logging.ERROR)
@@ -483,7 +485,7 @@ def fd_errors(base_pair, assemble_fn, dofs, eps=1e-6):
 
 
 
-BACKEND = "python"
+BACKEND = "jit"
 
 
 fields_to_probe = {
@@ -505,12 +507,15 @@ for field, count in fields_to_probe.items():
     selected_dofs.extend(list(local[:count]))
 selected_dofs = np.array(sorted(set(selected_dofs)), dtype=int)
 
-
+J_cross_deriv_s = (
+     kappa_neg * dot( dtraction_solid_ref_L(Neg(ddisp_s_R), Neg(test_disp_s_R), Neg(disp_k_R)),
+                    jump_vel_res )
+) * dGamma
 pair_int_components = {} if J_int is None else {name: assemble_pair(form, None, backend=BACKEND) for name, form in J_terms.items()}
 pair_res_components = {} if R_int is None else {name: assemble_pair(None, form, backend=BACKEND) for name, form in R_terms.items()}
 J_variants = {} if J_int is None else {
     "fluid_only": J_terms["trial_fluid"] + J_terms["test_fluid"],
-    "solid_only": J_terms["trial_solid"] + J_terms["test_solid"],
+    "solid_only": J_terms["trial_solid"] + J_terms["test_solid"] + J_cross_deriv_s,
     "penalty_only": J_terms["penalty"],
     "no_penalty": J_int - J_terms["penalty"],
 }
@@ -522,22 +527,27 @@ R_variants = {} if R_int is None else {
     "no_penalty": R_int - R_terms["penalty"],
 }
 pair_res_variants = {} if not R_variants else {name: assemble_pair(None, form, backend=BACKEND) for name, form in R_variants.items()}
-variant_fd_results = {}
+pair_variants_combined = {}
 if J_variants:
+    for name, form in J_variants.items():
+        R_form = R_variants.get(name) if R_variants else None
+        pair_variants_combined[name] = assemble_pair(form, R_form, backend=BACKEND)
+variant_fd_results = {}
+if pair_variants_combined:
+    for name, pair in pair_variants_combined.items():
+        J_form = J_variants.get(name)
+        R_form = R_variants.get(name) if R_variants else None
+        def _builder(Jfrm=J_form, Rfrm=R_form):
+            return assemble_pair(Jfrm, Rfrm, backend=BACKEND)
+        rows_variant, _ = fd_errors(pair, _builder, selected_dofs, eps=1e-8)
+        variant_fd_results[name] = rows_variant
+elif J_variants:
     for name, form in J_variants.items():
         def _builder(frm=form):
             return assemble_pair(frm, None, backend=BACKEND)
         base_variant = _builder()
         rows_variant, _ = fd_errors(base_variant, _builder, selected_dofs, eps=1e-8)
         variant_fd_results[name] = rows_variant
-variant_residual_fd = {}
-if R_variants:
-    for name, form in R_variants.items():
-        def _builder_res(frm=form):
-            return assemble_pair(None, frm, backend=BACKEND)
-        base_variant = _builder_res()
-        rows_variant, _ = fd_errors(base_variant, _builder_res, selected_dofs, eps=1e-8)
-        variant_residual_fd[name] = rows_variant
 pair_int = assemble_pair(J_int, R_int, backend=BACKEND) if J_int is not None else None
 pair_solid = assemble_pair(a_vol_s, r_vol_s, backend=BACKEND)
 mass_form = (rho_s_const * dot(du_s_R, test_vel_s_R) / dt) * dx_solid
@@ -583,6 +593,10 @@ if pair_res_variants:
 # -----------------------------------------------------------------------------
 # Finite difference comparison
 # -----------------------------------------------------------------------------
+
+if os.environ.get("SKIP_FD_CHECKS") == "1":
+    print("Skipping finite-difference checks (SKIP_FD_CHECKS=1).")
+    sys.exit(0)
 
 
 

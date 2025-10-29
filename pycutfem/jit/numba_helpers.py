@@ -41,6 +41,38 @@ def contract_last_first(a, b, dtype):
     out_shape = a.shape[:-1] + b.shape[1:]
     return dot_flat.reshape(out_shape)
 
+@numba.njit(cache=True)
+def contract_first_first(a, b, dtype):
+    """
+    Generic contraction over the first axis of a and first axis of b.
+    """
+    if b.ndim == 0:
+        raise ValueError("contract_first_first: second operand must have at least 1 dimension")
+    if a.shape[0] != b.shape[0]:
+        raise ValueError("Dot dimension mismatch")
+
+    # --- Setup for 'a' ---
+    left_dim = 1
+    for idx in range(1, a.ndim):
+        left_dim *= a.shape[idx]
+    # a_flat has shape (k, m*n)
+    a_flat = np.ascontiguousarray(a).reshape(a.shape[0], left_dim)
+    
+    # --- Setup for 'b'  ---
+    if b.ndim == 1:
+        # b is a 1D vector, shape (k,)
+        b_flat = np.ascontiguousarray(b)
+        # dot_flat is (m*n, k) @ (k,) -> (m*n,)
+        dot_flat = a_flat.T @ b_flat
+        # out_shape is (m, n)
+        out_shape = a.shape[1:]
+        # (m*n,).reshape(m, n) -> Correct
+        return dot_flat.reshape(out_shape)
+    
+    else:
+        raise ValueError("contract_first_first: second operand must be 1D vector")
+
+
 
 @numba.njit(cache=True)
 def dot_mixed_const(a, b, dtype):

@@ -2304,6 +2304,9 @@ class NumbaCodeGen:
                                         shape=res_shape, is_vector=False, is_gradient=False,
                                         field_names=field_names, parent_name=parent_name,
                                         side=side, field_sides=field_sides))
+                # ---------------------------------------------------------------------
+                # dot( grad(u_trial/test) ,  grad(u_test/trial) )          ← grad_u_mixed (k,m,n,d)
+                # ---------------------------------------------------------------------
                 elif (a.role in {'trial', 'test'} and a.is_gradient and not a.is_hessian
                       and b.role in {'trial', 'test'} and b.is_vector and not b.is_gradient and not b.is_hessian):
                     body_lines.append("# Dot: Grad(basis) · vector basis → mixed tensor")
@@ -2316,11 +2319,26 @@ class NumbaCodeGen:
                                         shape=res_shape, is_vector=False, is_gradient=False,
                                         field_names=field_names, parent_name=parent_name,
                                         side=side, field_sides=field_sides))
-                elif (a.role == 'mixed' and not a.is_gradient and not a.is_hessian
+                # ---------------------------------------------------------------------
+                # dot( u_mixed ,  u_k )          ←  -> (m,n)
+                # ---------------------------------------------------------------------
+                elif (a.role in {'mixed','mixed_right'} and not a.is_gradient and not a.is_hessian
                       and len(a.shape) == 3 and b.role in {'const','value'} and b.is_vector and not b.is_gradient and not b.is_hessian):
-                    body_lines.append("# Dot: mixed basis · constant vector → matrix")
+                    body_lines.append("# Dot: mixed basis (m,n,k) · constant vector → matrix")
                     body_lines.append(
                         f"{res_var} = dot_mixed_const({a.var_name}, {b.var_name}, {self.dtype})"
+                    )
+                    res_shape = (a.shape[0], a.shape[1])
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
+                    stack.append(StackItem(var_name=res_var, role='value',
+                                        shape=res_shape, is_vector=False, is_gradient=False,
+                                        field_names=field_names, parent_name=parent_name,
+                                        side=side, field_sides=field_sides))
+                elif (a.role in {'mixed_left'} and not a.is_gradient and not a.is_hessian
+                      and len(a.shape) == 3 and b.role in {'const','value'} and b.is_vector and not b.is_gradient and not b.is_hessian):
+                    body_lines.append("# Dot: mixed basis (k,m,n) · constant vector → matrix")
+                    body_lines.append(
+                        f"{res_var} = contract_first_first({a.var_name}, {b.var_name}, {self.dtype})"
                     )
                     res_shape = (a.shape[1], a.shape[2])
                     field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
@@ -2432,7 +2450,6 @@ class NumbaCodeGen:
                 # dot( Hessian ,  value/const )          ← Grad object
                 # ---------------------------------------------------------------------
                 # --- Hessian · vector (right) and vector · Hessian (left) ---
-                # Contractions only with constant geometric vectors (e.g., facet normals)
                 elif a.is_hessian and b.role in {'const','value'} and b.is_vector:
                     k_comps = a.shape[0]
                     if a.role in ('test', 'trial'):
@@ -2558,37 +2575,100 @@ class NumbaCodeGen:
                 elif (len(a.shape) >= 1 and len(b.shape) >= 1
                       and not a.is_hessian and not b.is_hessian
                       and a.shape[-1] == b.shape[0]):
+                    
                     body_lines.append("# Dot: generic contraction (last axis of A · first axis of B)")
                     body_lines.append(
                         f"{res_var} = contract_last_first({a.var_name}, {b.var_name}, {self.dtype})"
                     )
                     res_shape = a.shape[:-1] + b.shape[1:]
+
+                    # 1. Determine Resulting Role
                     if 'mixed' in (a.role, b.role):
                         res_role = 'mixed'
-                    elif a.role in {'trial', 'test'} and b.role in {'trial', 'test'}:
-                        res_role = 'mixed'
+                    elif a.role == 'trial' and b.role == 'test':
+                        res_role = 'mixed' # trial · test -> mixed
+                    elif a.role == 'test' and b.role == 'trial':
+                        res_role = 'mixed' # test · trial -> mixed
                     elif a.role in {'trial', 'test'}:
                         res_role = a.role
                     elif b.role in {'trial', 'test'}:
                         res_role = b.role
-                    elif a.role in {'value', 'function', 'identity'} or b.role in {'value', 'function', 'identity'}:
-                        res_role = 'value' if 'value' in (a.role, b.role) else ('function' if 'function' in (a.role, b.role) else 'identity')
-                    elif a.role == 'const' and b.role != 'const':
-                        res_role = b.role
+                    elif 'value' in (a.role, b.role):
+                        res_role = 'value'
+                    elif 'function' in (a.role, b.role):
+                        res_role = 'function'
+                    elif 'identity' in (a.role, b.role):
+                        res_role = 'identity'
                     else:
-                        res_role = a.role
+                        res_role = a.role # Fallback (e.g., const)
+
+                    # 2. Determine Resulting Flags (is_vector, is_gradient, is_hessian)
+                    # These flags describe the *output* tensor type
                     res_is_vector = False
-                    if res_role in {'trial', 'test'} and len(res_shape) >= 1:
+                    res_is_gradient = False
+                    res_is_hessian = False
+
+                    # The logic is based on what properties remain after contraction.
+                    # a.shape[-1] contracts with b.shape[0]
+
+                    if a.is_hessian:
+                        if b.is_vector: # H(..., d) · V(d,) -> (...) -> Gradient
+                            res_is_gradient = True
+                            res_is_vector = a.is_vector # Preserve k component
+                        else: # H · G, H · H
+                            res_is_hessian = True
+                            res_is_vector = a.is_vector # Preserve k component
+                    
+                    elif a.is_gradient:
+                        if b.is_hessian: # G(..., d) · H(d, ...)
+                            res_is_hessian = True
+                            res_is_vector = a.is_vector # Preserve k component
+                        elif b.is_gradient: # G(..., d) · G(d, ...)
+                            res_is_gradient = True
+                            res_is_vector = a.is_vector # Preserve k component
+                        elif b.is_vector: # G(..., d) · V(d,) -> (...)
+                            res_is_vector = a.is_vector # Result is (k, n) or (k,)
+                        # else G · scalar is handled by '*' operator
+
+                    elif a.is_vector:
+                        if b.is_hessian: # V(k,) · H(k, ...) -> (...)
+                            res_is_hessian = True
+                            res_is_gradient = b.is_gradient # Preserve (..., d, d) part
+                        elif b.is_gradient: # V(k,) · G(k, ...) -> (...)
+                            res_is_gradient = True
+                        elif b.is_vector: # V(k,) · V(k,) -> ()
+                            pass # Scalar result, all flags False
+                        # else V · scalar is handled by '*' operator
+
+                    # 3. Override for your specific "mixed" cases
+                    if a.role == 'mixed' and a.is_gradient and b.is_vector:
+                        # (k,m,n,d) · (d,) -> (k,m,n)
                         res_is_vector = True
-                    elif res_role in {'value', 'function', 'identity'} and len(res_shape) == 1:
-                        res_is_vector = True
-                    res_is_gradient = a.is_gradient or b.is_gradient
+                        res_is_gradient = False
+                        res_is_hessian = False
+                        res_role = 'mixed_left'
+                    elif a.is_vector and b.role == 'mixed' and b.is_gradient:
+                        # (k,) · (k,m,n,d) -> (m,n,d)
+                        res_is_vector = False
+                        res_is_gradient = True
+                        res_is_hessian = False
+                        res_role = 'mixed_right'
+
                     field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
                     stack.append(StackItem(var_name=res_var, role=res_role,
-                                        shape=res_shape, is_vector=res_is_vector, is_gradient=res_is_gradient,
+                                        shape=res_shape, 
+                                        is_vector=res_is_vector, 
+                                        is_gradient=res_is_gradient,
+                                        is_hessian=res_is_hessian,
                                         field_names=field_names, parent_name=parent_name,
                                         side=side, field_sides=field_sides))
                 else:
+                    # (Keep your debug print here, it's very useful)
+                    print("Dot failure debug:",
+                          {"a_role": a.role, "a_shape": a.shape, "a_grad": a.is_gradient,
+                           "a_vec": a.is_vector, "a_hess": a.is_hessian, "a_fields": getattr(a, 'field_names', None),
+                           "b_role": b.role, "b_shape": b.shape, "b_grad": b.is_gradient,
+                           "b_vec": b.is_vector, "b_hess": b.is_hessian, "b_fields": getattr(b, 'field_names', None)})
                     raise NotImplementedError(f"Dot not implemented for roles {a.role}/{b.role} with shapes {a.shape}/{b.shape}"
                                               f" with vectoors {a.is_vector}/{b.is_vector}"
                                               f" and gradients {a.is_gradient}/{b.is_gradient}"
@@ -3133,7 +3213,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = False
+            DEBUG: bool = True
         ):
         """
         Build complete kernel source code with parallel assembly.
@@ -3257,6 +3337,7 @@ from pycutfem.jit.numba_helpers import (
     binary_sub_3_4,
     binary_sub_4_3,
     scatter_tensor_to_union,
+    contract_first_first
 )
 PARAM_ORDER = [{param_order_literal}]
 {decorator}
