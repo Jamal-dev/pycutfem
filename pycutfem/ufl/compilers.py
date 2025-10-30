@@ -63,8 +63,7 @@ from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, lhs_num,
                                   HelpersFieldAware as _hfa,
                                   HelpersAlignCoefficents as _hac,
                                   normalize_edge_ids,
-                                  normalize_elem_ids,
-                                  build_l2_projector)
+                                  normalize_elem_ids)
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 from pycutfem.ufl.helpers_geom import (
@@ -370,19 +369,18 @@ class FormCompiler:
                     m_local = mask_dict.get(field)
                     if m_local is not None and len(row_field) == len(m_local):
                         row_field = row_field * m_local  # apply while still field-local
-
-        use_mortar = bool(self.ctx.get("use_mortar_projectors", False))
-        if use_mortar:
-            proj_dict = self.ctx.get("pos_P_by_field" if side == '+' else "neg_P_by_field", {})
-            P = proj_dict.get(field)
-            if P is not None and P.size:
-                if self.ctx.get("debug_mortar", False):
-                    print(f"[mortar] projecting field {field} on side {side}: row len {len(row_field)}, P shape {P.shape}")
-                row_field = row_field @ P
-                maps_red = self.ctx.get("pos_map_by_field_reduced" if side == '+' else "neg_map_by_field_reduced", {})
-                amap_reduced = maps_red.get(field)
-                if amap_reduced is not None:
-                    amap = amap_reduced
+            use_mortar = bool(self.ctx.get("use_mortar_projectors", False))
+            if use_mortar:
+                proj_dict = self.ctx.get("pos_P_by_field" if side == '+' else "neg_P_by_field", {})
+                P = proj_dict.get(field)
+                if P is not None and P.size:
+                    if self.ctx.get("debug_mortar", False):
+                        print(f"[mortar] projecting field {field} on side {side}: row len {len(row_field)}, P shape {P.shape}")
+                    row_field = row_field @ P
+                    maps_red = self.ctx.get("pos_map_by_field_reduced" if side == '+' else "neg_map_by_field_reduced", {})
+                    amap_reduced = maps_red.get(field)
+                    if amap_reduced is not None:
+                        amap = amap_reduced
 
             # Pad to union layout only if assembling a mat/vec
             if g is not None:
@@ -2361,18 +2359,24 @@ class FormCompiler:
         self.ctx['is_interface'] = True
         self.ctx['is_ghost']     = False
         md = intg.measure.metadata or {}
-        debug_mortar = bool(md.get("debug_mortar", False))
-        if debug_mortar:
-            print("[mortar] debug enabled")
+        project_trial = bool(md.get("project_trial", False))
+        mortar_pairs_raw = md.get("mortar_pairs")
+        mortar_pairs: list[tuple[str, str]] = []
         owner_side_meta = str(md.get("owner", "+") or "+").strip()
         owner_side_meta = owner_side_meta if owner_side_meta in ("+", "-") else "+"
-        pairs_raw = md.get("mortar_pairs", [("u_pos", "vs_neg")])
-        if isinstance(pairs_raw, (list, tuple)):
-            mortar_pairs = [tuple(p) for p in pairs_raw]
+        use_mortar = bool(md.get("use_mortar", False) or project_trial or mortar_pairs_raw)
+        debug_mortar = bool(md.get("debug_mortar", False)) if use_mortar else False
+        if use_mortar and debug_mortar:
+            print("[mortar] debug enabled")
+        if use_mortar:
+            if mortar_pairs_raw is not None:
+                if isinstance(mortar_pairs_raw, (list, tuple)):
+                    mortar_pairs = [tuple(p) for p in mortar_pairs_raw]
+                else:
+                    mortar_pairs = [tuple(mortar_pairs_raw)]
+                mortar_pairs = [p for p in mortar_pairs if len(p) == 2]
         else:
-            mortar_pairs = [tuple(pairs_raw)]
-        mortar_pairs = [p for p in mortar_pairs if len(p) == 2]
-        project_trial = bool(md.get("project_trial", False))
+            project_trial = False
         side_md = md.get('side', None)
         if side_md in ('+', '-'):
             self.ctx['measure_side'] = side_md
@@ -2903,16 +2907,19 @@ class FormCompiler:
                 pos_map_by_field_full, neg_map_by_field_full = _hfa.build_field_union_maps(
                     self.dh, fields, int(pos_eid), int(neg_eid), global_dofs
                 )
-                if debug_mortar and ei == 0:
-                    print("pos fields:", list(pos_map_by_field_full.keys()))
-                    print("neg fields:", list(neg_map_by_field_full.keys()))
 
                 try:
-                    pos_masks_elem, neg_masks_elem = _hfa.build_side_masks_by_field(
-                        self.dh, fields, int(eid), level_set, tol=SIDE.tol
+                    pos_masks_elem, _ = _hfa.build_side_masks_by_field(
+                        self.dh, fields, int(pos_eid), level_set, tol=SIDE.tol
                     )
                 except Exception:
-                    pos_masks_elem, neg_masks_elem = {}, {}
+                    pos_masks_elem = {}
+                try:
+                    _, neg_masks_elem = _hfa.build_side_masks_by_field(
+                        self.dh, fields, int(neg_eid), level_set, tol=SIDE.tol
+                    )
+                except Exception:
+                    neg_masks_elem = {}
 
                 restriction_masks_phi = {'+': {}, '-': {}}
                 for fld in fields:
@@ -2957,47 +2964,6 @@ class FormCompiler:
                 neg_map_by_field_red: Dict[str, np.ndarray] = {}
                 P_pos_by_field: Dict[str, np.ndarray] = {}
                 P_neg_by_field: Dict[str, np.ndarray] = {}
-                weights_arr = np.asarray(qwts, dtype=float)
-
-                for fld in fields:
-                    try:
-                        field_dofs_local = _hfa.elemental_field_dofs(self.dh, int(eid), fld)
-                    except Exception:
-                        continue
-                    nloc = len(field_dofs_local)
-                    if nloc == 0:
-                        continue
-
-                    B = np.empty((len(qpts_phys), nloc), dtype=float)
-                    valid_basis = True
-                    for iq, xq in enumerate(qpts_phys):
-                        try:
-                            xi, eta = transform.inverse_mapping(mesh, int(eid), np.asarray(xq, float))
-                            B[iq, :] = self.me.basis(fld, float(xi), float(eta))
-                        except Exception:
-                            valid_basis = False
-                            break
-                    if not valid_basis:
-                        continue
-
-                    mask_pos = np.asarray(pos_masks_elem.get(fld, []), dtype=bool)
-                    mask_neg = np.asarray(neg_masks_elem.get(fld, []), dtype=bool)
-                    full_pos = pos_map_by_field_full.get(fld)
-                    full_neg = neg_map_by_field_full.get(fld)
-
-                    if mask_pos.size == nloc and full_pos is not None and mask_pos.any():
-                        Jpos = np.flatnonzero(mask_pos)
-                        pos_map_by_field_red[fld] = np.asarray(full_pos[Jpos], dtype=int)
-                        P_pos_by_field[fld] = build_l2_projector(B, weights_arr, Jpos)
-                        if debug_mortar and ei == 0:
-                            print(f"[mortar] + field {fld}: P shape {P_pos_by_field[fld].shape}")
-
-                    if mask_neg.size == nloc and full_neg is not None and mask_neg.any():
-                        Jneg = np.flatnonzero(mask_neg)
-                        neg_map_by_field_red[fld] = np.asarray(full_neg[Jneg], dtype=int)
-                        P_neg_by_field[fld] = build_l2_projector(B, weights_arr, Jneg)
-                        if debug_mortar and ei == 0:
-                            print(f"[mortar] - field {fld}: P shape {P_neg_by_field[fld].shape}")
 
                 loc_acc = 0.0 if is_functional else (
                     np.zeros(len(global_dofs)) if rhs
@@ -3127,11 +3093,7 @@ class FormCompiler:
                         "neg_map_by_field_reduced": neg_map_by_field_red,
                         "pos_P_by_field": P_pos_by_field,
                         "neg_P_by_field": P_neg_by_field,
-                        "use_mortar_projectors": bool(P_pos_by_field or P_neg_by_field),
-                        "mortar_owner_side": owner_side_meta,
-                        "mortar_project_trial": project_trial,
-                        "mortar_pairs": mortar_pairs,
-                        "debug_mortar": debug_mortar,
+                        "use_mortar_projectors": False,
                         "pos_union_mask_by_field": pos_union_mask_by_field,
                         "neg_union_mask_by_field": neg_union_mask_by_field,
                         "coeff_mask_pos_global": mask_pos_global,
@@ -3161,8 +3123,6 @@ class FormCompiler:
                         loc_acc += w_eff * np.asarray(val)
 
                 # Scatter
-                if debug_mortar and ei == 0 and not is_functional:
-                    print(f"[mortar] element {eid} loc_acc norm {np.linalg.norm(loc_acc)}")
                 if is_functional:
                     self.ctx["scalar_results"][hook["name"]] += loc_acc
                 else:

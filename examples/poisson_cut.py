@@ -39,7 +39,7 @@ from pycutfem.ufl.helpers_geom import (
     clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
 )
 
-def run_step85():
+def run_step85(backend="python"):
     """
     Main function to run the step-85 simulation.
     """
@@ -189,9 +189,9 @@ def run_step85():
         # ====================================================================
         print("Assembling and solving the linear system...")
         equation = Equation(a, L)
-        
+        print(f"Using backend : {backend}")
         # Apply the constraint for inactive DoFs
-        K, F = assemble_form(equation, dof_handler=dof_handler, bcs=[inactive_dof_bc])
+        K, F = assemble_form(equation, dof_handler=dof_handler, bcs=[inactive_dof_bc], backend=backend)
 
         # Solve the linear system
         # Use a direct sparse solver
@@ -294,4 +294,5 @@ def run_step85():
 
 
 if __name__ == '__main__':
-    run_step85()
+    backend = os.getenv("BACKEND", "python")
+    run_step85(backend=backend)

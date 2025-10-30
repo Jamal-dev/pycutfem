@@ -513,8 +513,8 @@ def test_stokes_interface_corrected(with_deformation: bool = False, backend: str
 
 if __name__ == "__main__":
     # Allow quick toggling via env or simple edit
-    use_def = os.getenv('PYCUTFEM_STOKES_WITH_DEF', '0').lower() in {'1','true','yes'}
-    backend = os.getenv('PYCUTFEM_BACKEND', 'python').lower()
+    use_def = os.getenv('WITH_DEF', '0').lower() in {'1','true','yes'}
+    backend = os.getenv('BACKEND', 'python').lower()
     t0 = time.time()
     test_stokes_interface_corrected(with_deformation=use_def, backend=backend)
     print(f"Total elapsed time: {time.time() - t0:.2f} seconds")
