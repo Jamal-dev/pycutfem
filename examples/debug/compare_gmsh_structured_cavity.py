@@ -13,7 +13,7 @@ import numpy as np
 from collections import Counter
 from pathlib import Path
 
-from examples.gmsh_cavity_mesh import build_cavity_quad_mesh
+from examples.gmsh_cavity_mesh import build_caity_quad_mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
@@ -144,7 +144,7 @@ def _assemble_cavity_matrix(mesh: Mesh):
 def main():
     nx = ny = 2  # => four elements
     gmsh_path = Path("examples/meshes/cavity_quad_test.msh")
-    build_cavity_quad_mesh(gmsh_path, nx=nx, ny=ny, element_order=2)
+    build_caity_quad_mesh(gmsh_path, nx=nx, ny=ny, element_order=2)
 
     mesh_struct = _build_structured_mesh(nx, ny)
     mesh_gmsh = mesh_from_gmsh(gmsh_path)

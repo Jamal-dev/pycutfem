@@ -28,7 +28,7 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
-from examples.gmsh_cavity_mesh import build_cavity_quad_mesh
+from examples.gmsh_cavity_mesh import build_caity_quad_mesh
 
 # --- UFL-like imports ---
 from pycutfem.ufl.functionspace import FunctionSpace
@@ -79,19 +79,20 @@ args, _ = parser.parse_known_args()
 # ===============================================================================
 L, H = 1.0, 1.0
 NX, NY = args.nx, args.ny
+mesh_geometric_order = 1
 
 # Summary of chosen options
 print("="*60)
 print("\nLid-driven cavity verification (Re=100)")
 print(f"Mesh source: {'gmsh' if args.use_gmsh else 'structured quad'}")
 print(f"Number of elements: {NX} x {NY}")
+print(f"Element geometric order: {mesh_geometric_order}")
 print("="*60)
-mesh_geometric_order = 1
 
 if args.use_gmsh:
     gmsh_path = args.gmsh_file
     if args.rebuild_msh or not gmsh_path.exists():
-        build_cavity_quad_mesh(gmsh_path, L=L, H=H, nx=NX, ny=NY, element_order=mesh_geometric_order)
+        build_caity_quad_mesh(gmsh_path, L=L, H=H, nx=NX, ny=NY, element_order=mesh_geometric_order)
     mesh_q2 = mesh_from_gmsh(gmsh_path)
     if mesh_q2.element_type != "quad":
         raise RuntimeError("Expected a quadrilateral gmsh mesh for the cavity test.")

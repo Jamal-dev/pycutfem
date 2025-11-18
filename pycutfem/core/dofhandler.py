@@ -1145,8 +1145,10 @@ class DofHandler:
         import numpy as np
 
         self._require_cg("Dirichlet BC evaluation")
-        locators = locators or {}
         mesh = self.mixed_element.mesh
+        if locators is None:
+            locators = getattr(mesh, "_boundary_locators", None)
+        locators = locators or {}
 
         # make sure coords/maps exist for locator/grouping tests
         if not isinstance(getattr(self, "_dof_coords", None), np.ndarray):

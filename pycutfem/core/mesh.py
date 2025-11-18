@@ -461,6 +461,9 @@ class Mesh:
         if not hasattr(self, "_edge_bitsets"):
             self._edge_bitsets = {}
         self._edge_bitsets.update({tag: BitSet(mask) for tag, mask in tag_masks.items()})
+        # Keep a copy of the locator map so downstream code (e.g. DOF tagging)
+        # can use the same geometric tests without re-supplying them manually.
+        self._boundary_locators = dict(tag_functions)
     
     def tag_edges(self, tag_functions: Dict[str, Callable[[float, float], bool]], overwrite=True):
         """
