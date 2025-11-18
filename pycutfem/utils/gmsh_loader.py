@@ -30,6 +30,67 @@ EDGE_TABLE: Dict[str, Tuple[Tuple[int, int], ...]] = {
 }
 
 
+def _bilinear_shape(xi: float, eta: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return bilinear Q1 shape functions and gradients at (xi, eta)."""
+    N = 0.25 * np.array(
+        [
+            (1 - xi) * (1 - eta),  # bottom-left
+            (1 + xi) * (1 - eta),  # bottom-right
+            (1 + xi) * (1 + eta),  # top-right
+            (1 - xi) * (1 + eta),  # top-left
+        ],
+        dtype=float,
+    )
+    dN_dxi = 0.25 * np.array([-(1 - eta), (1 - eta), (1 + eta), -(1 + eta)], dtype=float)
+    dN_deta = 0.25 * np.array([-(1 - xi), -(1 + xi), (1 + xi), (1 - xi)], dtype=float)
+    return N, dN_dxi, dN_deta
+
+
+def _invert_bilinear_map(corners: np.ndarray, point: np.ndarray) -> Tuple[float, float]:
+    """Compute (xi, eta) such that the bilinear map of <corners> hits <point>."""
+    xi = eta = 0.0
+    for _ in range(25):
+        N, dN_dxi, dN_deta = _bilinear_shape(xi, eta)
+        mapped = N @ corners
+        residual = mapped - point
+        if np.linalg.norm(residual, ord=2) < 1e-12:
+            break
+        J = np.column_stack((dN_dxi @ corners, dN_deta @ corners))
+        try:
+            delta = np.linalg.solve(J, residual)
+        except np.linalg.LinAlgError:
+            break
+        xi -= float(delta[0])
+        eta -= float(delta[1])
+    return xi, eta
+
+
+def _row_major_permutation(points: np.ndarray) -> np.ndarray:
+    """
+    Compute a permutation that orders the element nodes row-by-row in the local
+    (ξ, η) coordinate system, regardless of the original numbering.
+    """
+    centroid = points.mean(axis=0)
+    dist2 = np.sum((points - centroid) ** 2, axis=1)
+    corner_idx = np.argsort(dist2)[-4:]
+    corner_pts = points[corner_idx]
+    angles = np.arctan2(corner_pts[:, 1] - centroid[1], corner_pts[:, 0] - centroid[0])
+    order = np.argsort(angles)
+    corner_idx = corner_idx[order]
+    # Rotate so the "bottom-left" (smallest x+y) corner is first.
+    start = int(np.argmin(corner_pts[order][:, 0] + corner_pts[order][:, 1]))
+    corner_idx = np.roll(corner_idx, -start)
+    corners = points[corner_idx]
+    local_coords = np.zeros((points.shape[0], 2), dtype=float)
+    for i, pt in enumerate(points):
+        local_coords[i] = _invert_bilinear_map(corners, pt)
+    xi = np.round(local_coords[:, 0], 8)
+    eta = np.round(local_coords[:, 1], 8)
+    perm = np.lexsort((xi, eta))
+    return perm
+
+
+
 @dataclass(slots=True)
 class GmshMeshData:
     """Light-weight container with the raw data extracted from a Gmsh file."""
@@ -229,25 +290,22 @@ def load_gmsh_mesh(
 
         element_connectivity = np.vstack(element_blocks).astype(np.int64, copy=False)
         n_corners = 3 if element_type == "tri" else 4
-        corner_nodes = element_connectivity[:, :n_corners].copy()
         if element_type == "quad":
-            for i in range(corner_nodes.shape[0]):
-                conn = corner_nodes[i]
-                pts = coords[conn]
-                centroid = pts.mean(axis=0)
-                angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
-                order = np.argsort(angles)
-                ordered_conn = conn[order]
-                ordered_pts = pts[order]
-                lex = np.lexsort((ordered_pts[:, 0], ordered_pts[:, 1]))
-                start = int(lex[0])
-                perm = np.roll(order, -start)
-                reordered = np.roll(ordered_conn, -start)
-                # Convert CCW [bl, br, tr, tl] into PyCutFEM ordering [bl, br, tl, tr]
-                target_idx = np.array([0, 1, 3, 2], dtype=int)
-                corner_nodes[i] = reordered[target_idx]
-                row = element_connectivity[i, :n_corners].copy()
-                element_connectivity[i, :n_corners] = row[perm][target_idx]
+            n_side = int(poly_order) + 1
+            for i in range(element_connectivity.shape[0]):
+                conn = element_connectivity[i]
+                perm = _row_major_permutation(coords[conn])
+                element_connectivity[i] = conn[perm]
+            corner_nodes = np.column_stack(
+                [
+                    element_connectivity[:, 0],
+                    element_connectivity[:, n_side - 1],
+                    element_connectivity[:, -1],
+                    element_connectivity[:, -n_side],
+                ]
+            )
+        else:
+            corner_nodes = element_connectivity[:, :n_corners].copy()
         edges_connectivity = _build_edge_connectivity(corner_nodes, element_type)
 
         edge_tag_map: Dict[Tuple[int, int], Tuple[str, ...]] = {}

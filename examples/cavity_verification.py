@@ -10,6 +10,8 @@ import numpy as np
 import time
 import scipy.sparse.linalg as sp_la
 import matplotlib.pyplot as plt
+import argparse
+from pathlib import Path
 import numba
 import os
 
@@ -25,6 +27,8 @@ print(f"Numba is set to use {numba.get_num_threads()} threads.")
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
+from pycutfem.utils.gmsh_loader import mesh_from_gmsh
+from examples.gmsh_cavity_mesh import build_cavity_quad_mesh
 
 # --- UFL-like imports ---
 from pycutfem.ufl.functionspace import FunctionSpace
@@ -59,34 +63,71 @@ ghia_data_re100 = {
 
 
 
-# In[3]:
-
+# Parse CLI options to choose mesh source
+parser = argparse.ArgumentParser(description="Lid-driven cavity verification (Re=100)")
+parser.add_argument("--use-gmsh", action="store_true", help="Generate the mesh from a gmsh .msh file.")
+parser.add_argument("--gmsh-file", type=Path, default=Path("examples/meshes/cavity_unit_quad.msh"),
+                    help="Path to the gmsh mesh (used when --use-gmsh is set).")
+parser.add_argument("--rebuild-msh", action="store_true",
+                    help="Rebuild the gmsh mesh if the file is missing or --rebuild-msh is passed.")
+parser.add_argument("--nx", type=int, default=30, help="Number of cells in x for the structured mesh.")
+parser.add_argument("--ny", type=int, default=30, help="Number of cells in y for the structured mesh.")
+args, _ = parser.parse_known_args()
 
 # 1. ============================================================================
 #    SETUP (Meshes, DofHandler, BCs)
 # ===============================================================================
 L, H = 1.0, 1.0
-# MODIFIED: Increased resolution for better accuracy
-NX, NY = 30, 30
-nodes_q2, elems_q2, _, corners_q2 = structured_quad(L, H, nx=NX, ny=NY, poly_order=2)
-mesh_q2 = Mesh(nodes=nodes_q2, element_connectivity=elems_q2, elements_corner_nodes=corners_q2, element_type="quad", poly_order=2)
+NX, NY = args.nx, args.ny
+
+# Summary of chosen options
+print("="*60)
+print("\nLid-driven cavity verification (Re=100)")
+print(f"Mesh source: {'gmsh' if args.use_gmsh else 'structured quad'}")
+print(f"Number of elements: {NX} x {NY}")
+print("="*60)
+mesh_geometric_order = 1
+
+if args.use_gmsh:
+    gmsh_path = args.gmsh_file
+    if args.rebuild_msh or not gmsh_path.exists():
+        build_cavity_quad_mesh(gmsh_path, L=L, H=H, nx=NX, ny=NY, element_order=mesh_geometric_order)
+    mesh_q2 = mesh_from_gmsh(gmsh_path)
+    if mesh_q2.element_type != "quad":
+        raise RuntimeError("Expected a quadrilateral gmsh mesh for the cavity test.")
+else:
+    nodes_q2, elems_q2, _, corners_q2 = structured_quad(L, H, nx=NX, ny=NY, poly_order=mesh_geometric_order)
+    mesh_q2 = Mesh(nodes=nodes_q2, element_connectivity=elems_q2, 
+                   elements_corner_nodes=corners_q2, element_type="quad", poly_order=mesh_geometric_order)
 mixed_element = MixedElement(mesh_q2, field_specs={'ux': 2, 'uy': 2, 'p': 1})
 
 dof_handler = DofHandler(mixed_element, method='cg')
 
-# Tag boundaries for applying BCs
-bc_tags = {
-    'bottom_wall': lambda x,y: np.isclose(y,0),
-    'left_wall':   lambda x,y: np.isclose(x,0),
-    'right_wall':  lambda x,y: np.isclose(x,L),
-    'top_lid':     lambda x,y: np.isclose(y,H)
+# Tag boundaries for applying BCs. Prefer Gmsh physical names when available.
+geom_tol = 1e-6
+locator_tags = {
+    'bottom_wall': lambda x,y, tol=geom_tol: np.isclose(y,0.0, atol=tol),
+    'left_wall':   lambda x,y, tol=geom_tol: np.isclose(x,0.0, atol=tol),
+    'right_wall':  lambda x,y, tol=geom_tol: np.isclose(x,L, atol=tol),
+    'top_lid':     lambda x,y, tol=geom_tol: np.isclose(y,H, atol=tol)
 }
-mesh_q2.tag_boundary_edges(bc_tags)
+if args.use_gmsh:
+    gmsh_tags = set()
+    for edge in mesh_q2.edges_list:
+        if edge.right is not None or not edge.tag:
+            continue
+        gmsh_tags.update(tag.strip() for tag in edge.tag.split(",") if tag)
+    missing = [tag for tag in locator_tags if tag not in gmsh_tags]
+    if missing:
+        print(f"Warning: gmsh mesh missing tags {missing}. Falling back to locator-based tagging.")
+        mesh_q2.tag_boundary_edges(locator_tags)
+else:
+    mesh_q2.tag_boundary_edges(locator_tags)
 
 # Tag a single node for pressure pinning
 dof_handler.tag_dof_by_locator(
     tag='pressure_pin_point', field='p',
-    locator=lambda x, y: np.isclose(x, 0.0) and np.isclose(y, 0.0),
+    locator=lambda x, y, tol=geom_tol: np.isclose(x, 0.0, atol=tol) and np.isclose(y, 0.0, atol=tol),
     find_first=True
 )
 
@@ -179,24 +220,26 @@ len(dof_handler.get_dirichlet_data(bcs))
 # In[ ]:
 
 
-from pycutfem.solvers.nonlinear_solver import (NewtonSolver, 
-                                               NewtonParameters, 
-                                               TimeStepperParameters, 
-                                               AdamNewtonSolver, 
-                                               GiantInexactNewtonSolver,
-                                               PetscSnesNewtonSolver)
-from pycutfem.solvers.aainhb_solver import AAINHBSolver
+from pycutfem.solvers.nonlinear_solver import (
+    NewtonSolver,
+    NewtonParameters,
+    TimeStepperParameters,
+    AdamNewtonSolver,
+    PetscSnesNewtonSolver,
+)
+# Optional solvers (commented out to avoid import errors if unavailable)
+# from pycutfem.solvers.aainhb_solver import AAINHBSolver
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
 time_params = TimeStepperParameters(dt=0.1, stop_on_steady=True, steady_tol=1e-6, theta= 0.49)
 
-# solver = NewtonSolver(
-#     residual_form, jacobian_form,
-#     dof_handler=dof_handler,
-#     mixed_element=mixed_element,
-#     bcs=bcs, bcs_homog=bcs_homog,
-#     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
-# )
+solver = NewtonSolver(
+    residual_form, jacobian_form,
+    dof_handler=dof_handler,
+    mixed_element=mixed_element,
+    bcs=bcs, bcs_homog=bcs_homog,
+    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+)
 # solver = AdamNewtonSolver(
 #     residual_form, jacobian_form,
 #     dof_handler=dof_handler,
@@ -218,32 +261,32 @@ time_params = TimeStepperParameters(dt=0.1, stop_on_steady=True, steady_tol=1e-6
 #     bcs=bcs, bcs_homog=bcs_homog,
 #     newton_params=NewtonParameters(newton_tol=1e-6, line_search=False),
 # )
-solver = PetscSnesNewtonSolver(
-    residual_form, jacobian_form,
-    dof_handler=dof_handler,
-    mixed_element=mixed_element,
-    bcs=bcs, bcs_homog=bcs_homog,
-    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
-    petsc_options={
-        "mat_type": "aij",
-        "ksp_type": "gmres",
-        "ksp_rtol": 1e-8,
-        "pc_type": "fieldsplit",
-        "pc_fieldsplit_type": "schur",
-        "pc_fieldsplit_schur_fact_type": "full",   # FULL Schur factorization
-        "pc_fieldsplit_schur_precondition": "selfp",
-        # (optional) monitoring
-        "snes_monitor": None, 
-        # "ksp_monitor": None,
-    },
-)
+# solver = PetscSnesNewtonSolver(
+#     residual_form, jacobian_form,
+#     dof_handler=dof_handler,
+#     mixed_element=mixed_element,
+#     bcs=bcs, bcs_homog=bcs_homog,
+#     newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+#     petsc_options={
+#         "mat_type": "aij",
+#         "ksp_type": "gmres",
+#         "ksp_rtol": 1e-8,
+#         "pc_type": "fieldsplit",
+#         "pc_fieldsplit_type": "schur",
+#         "pc_fieldsplit_schur_fact_type": "full",   # FULL Schur factorization
+#         "pc_fieldsplit_schur_precondition": "selfp",
+#         # (optional) monitoring
+#         "snes_monitor": None, 
+#         # "ksp_monitor": None,
+#     },
+# )
 
-solver.set_schur_fieldsplit(
-    {"u": ["ux", "uy"], "p": ["p"]},
-    schur_fact="full",
-    schur_pre="selfp",
-    sub_pc={"u": "hypre", "p": "jacobi"},   # defaults; tune as needed
-)
+# solver.set_schur_fieldsplit(
+#     {"u": ["ux", "uy"], "p": ["p"]},
+#     schur_fact="full",
+#     schur_pre="selfp",
+#     sub_pc={"u": "hypre", "p": "jacobi"},   # defaults; tune as needed
+# )
 
 # primary unknowns
 functions      = [u_k, p_k]
@@ -335,4 +378,3 @@ def create_verification_plot(dh, u_vec, reference_data, *,
     plt.show()
 
 create_verification_plot(dof_handler, u_n, ghia_data_re100)
-
