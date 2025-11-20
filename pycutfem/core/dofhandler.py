@@ -847,7 +847,13 @@ class DofHandler:
 
         # find local edge index 0..3 by matching endpoints to the owner's corner nodes
         el = self.mixed_element.mesh.elements_list[eid]
-        cn = list(self.mixed_element.mesh.elements_corner_nodes[eid]) if hasattr(self.mixed_element.mesh, "elements_corner_nodes") else None
+        mesh = self.mixed_element.mesh
+        if hasattr(mesh, "elements_corner_nodes"):
+            cn = list(mesh.elements_corner_nodes[eid])  # legacy name
+        elif hasattr(mesh, "corner_connectivity"):
+            cn = list(mesh.corner_connectivity[eid])
+        else:
+            cn = None
         # fallback: detect by geometry: choose the edge whose two end nodes match edge.nodes
         local_edge = None
         endset = {int(edge.nodes[0]), int(edge.nodes[1])}
@@ -1131,6 +1137,46 @@ class DofHandler:
                 self.dof_map[f][int(nid)] = int(gd)
                 self._dof_to_node_map[int(gd)] = (f, int(nid))
 
+    def _edge_tag_dofs(
+        self,
+        field: str,
+        tag: str,
+        field_ids: np.ndarray,
+        field_coords: np.ndarray,
+        existing: set[int],
+    ) -> set[int]:
+        """Select DOFs of ``field`` that lie on edges tagged with ``tag``."""
+        mesh = self.mixed_element.mesh
+        if field_ids.size == 0 or not hasattr(mesh, "edge_bitset"):
+            return set()
+
+        try:
+            bitset = mesh.edge_bitset(tag)
+        except Exception:
+            return set()
+        if bitset is None or bitset.cardinality() == 0:
+            return set()
+
+        locator = getattr(mesh, "_boundary_locators", {}).get(tag)
+        dof_coords = getattr(self, "_dof_coords", None)
+        selected: set[int] = set()
+        for edge_id in bitset.to_indices():
+            try:
+                dofs = self.edge_dofs(field, int(edge_id))
+            except Exception:
+                continue
+            for gid in dofs:
+                gid = int(gid)
+                if gid in existing:
+                    continue
+                if locator is not None and dof_coords is not None:
+                    x, y = dof_coords[gid]
+                    if not locator(float(x), float(y)):
+                        continue
+                selected.add(gid)
+
+        return selected
+
     def get_dirichlet_data(
         self,
         bcs,
@@ -1149,6 +1195,7 @@ class DofHandler:
         if locators is None:
             locators = getattr(mesh, "_boundary_locators", None)
         locators = locators or {}
+        node_coords = getattr(mesh, "nodes_x_y_pos", None)
 
         # make sure coords/maps exist for locator/grouping tests
         if not isinstance(getattr(self, "_dof_coords", None), np.ndarray):
@@ -1163,6 +1210,11 @@ class DofHandler:
             bcs = [bcs]
 
         field_sets = {f: set(self.get_field_slice(f)) for f in self.field_names}
+        field_id_cache = {f: np.asarray(sorted(field_sets[f]), dtype=int) for f in self.field_names}
+        field_coord_cache = {
+            f: (self._dof_coords[field_id_cache[f]] if field_id_cache[f].size else np.empty((0, 2), dtype=float))
+            for f in self.field_names
+        }
 
         for bc in bcs:
             # normalize inputs
@@ -1178,12 +1230,26 @@ class DofHandler:
 
             # (A) edge tag → edge.all_nodes → dof_map[field]
             node2dof = self.dof_map.get(field, {})
+            locator = locators.get(tag)
             for e in getattr(mesh, "edges_list", []):
                 if getattr(e, "tag", None) == tag:
                     for nid in getattr(e, "all_nodes", ()):
+                        if locator is not None and node_coords is not None:
+                            x, y = node_coords[int(nid)]
+                            if not locator(float(x), float(y)):
+                                continue
                         gd = node2dof.get(int(nid))
                         if gd is not None:
                             selected.add(int(gd))
+
+            # (A.1) higher-order DOFs projected onto tagged edges
+            selected |= self._edge_tag_dofs(
+                field,
+                tag,
+                field_id_cache[field],
+                field_coord_cache[field],
+                selected,
+            )
 
             # (B) pre-tagged DOFs (already in DOF space) → restrict to this field
             if tag in getattr(self, "dof_tags", {}):
@@ -3275,8 +3341,7 @@ class DofHandler:
         Returns per-edge arrays sized to the given subset and ready for JIT.
         Emits REFERENCE derivative tables d.._{field}; push-forward is done in codegen.py.
         """
-        from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
-        from pycutfem.integration.quadrature import line_quadrature
+        from pycutfem.integration.quadrature import edge as edge_rule  # type: ignore
         from pycutfem.fem import transform
         from pycutfem.integration.pre_tabulates import (
             _tabulate_q1 as _tab_q1,
@@ -3350,10 +3415,8 @@ class DofHandler:
 
         # ---- sizes -----------------------------------------------------------------
         # n_edges = len(edge_ids)
-        # representative to size arrays
-        p0r, p1r = mesh.nodes_x_y_pos[list(mesh.edge(edge_ids[0]).nodes)]
-        qpr, qwr = line_quadrature(p0r, p1r, qdeg)
-        n_q = len(qwr)
+        pts_ref, w_ref = edge_rule(mesh.element_type, 0, qdeg)
+        n_q = len(w_ref)
 
         # ---- work arrays -----------------------------------------------------------
         qp_phys  = np.zeros((n_edges, n_q, 2), dtype=float)
@@ -3368,50 +3431,65 @@ class DofHandler:
         # derivative tables (union-sized, *reference*!)
         basis_tabs = {}
 
-        # ---- batched edge mapping --------------------------------------------------
-        xi1, w_ref = gauss_legendre(qdeg)
-        xi1 = np.asarray(xi1, float); w_ref = np.asarray(w_ref, float)
-        P0 = np.empty((n_edges, 2)); P1 = np.empty((n_edges, 2))
-        for i, gid in enumerate(edge_ids):
-            n0, n1 = mesh.edge(gid).nodes
-            P0[i], P1[i] = mesh.nodes_x_y_pos[n0], mesh.nodes_x_y_pos[n1]
-        if _HAVE_NUMBA:
-            _batched(P0, P1, xi1, w_ref, qp_phys, qw)
+        # ---- per-edge metadata & reference coords ---------------------------------
+        if mesh.element_type == "quad":
+            edge_tangents = np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]], dtype=float)
+        elif mesh.element_type == "tri":
+            edge_tangents = np.array([[1.0, 0.0], [-1.0, 1.0], [0.0, -1.0]], dtype=float)
         else:
-            for i in range(n_edges):
-                pts, wts = line_quadrature(P0[i], P1[i], qdeg)
-                qp_phys[i], qw[i] = pts, wts
-
-        # ---- normals & dof maps (owner is 'left') ---------------------------------
+            raise ValueError(f"Unsupported element type '{mesh.element_type}' for boundary assembly.")
         owner = np.empty((n_edges,), dtype=np.int32)
+        local_edge_idx = np.empty((n_edges,), dtype=np.int32)
+        edge_normals = []
         for i, gid in enumerate(edge_ids):
             e = mesh.edge(gid)
             eid = e.left
             owner[i] = int(eid)
-            normals[i, :, :] = e.normal  # assumed outward for owner; constant along edge
+            edge_normals.append(e.normal.copy())
+            elem = mesh.elements_list[eid]
+            try:
+                local_edge_idx[i] = elem.edges.index(int(gid))
+            except ValueError:
+                raise RuntimeError(f"Edge {gid} not found in element {eid}")
             gdofs_map[i, :]  = self.get_elemental_dofs(eid)
-            # robust element-length proxy for face penalties
             h = mesh.element_char_length(eid)
             if h is None:
-                # fallback: geometric edge length
                 p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
                 h = float(np.linalg.norm(p1 - p0))
             h_arr[i] = float(h)
-
-        # ---- (ξ,η) tables on the owner element ------------------------------------
         xi_tab  = np.empty((n_edges, n_q), dtype=float)
         eta_tab = np.empty((n_edges, n_q), dtype=float)
-        eids_arr = owner.copy()
-        for i, eid in enumerate(eids_arr):
+        qw_ref  = np.empty((n_edges, n_q), dtype=float)
+        for i in range(n_edges):
+            pts_edge, w_edge = edge_rule(mesh.element_type, int(local_edge_idx[i]), qdeg)
+            xi_tab[i, :] = pts_edge[:, 0]
+            eta_tab[i, :] = pts_edge[:, 1]
+            qw_ref[i, :] = w_edge
+
+        # ---- map reference edge points to physical space & normals -----------------
+        for i in range(n_edges):
+            eid = int(owner[i])
+            ed_norm = edge_normals[i]
+            t_ref = edge_tangents[int(local_edge_idx[i])]
             for q in range(n_q):
-                s, t = transform.inverse_mapping(mesh, int(eid), qp_phys[i, q])
-                xi_tab[i, q]  = float(s)
-                eta_tab[i, q] = float(t)
+                xi = float(xi_tab[i, q]); eta = float(eta_tab[i, q])
+                qp_phys[i, q] = transform.x_mapping(mesh, eid, (xi, eta))
+                J = transform.jacobian(mesh, eid, (xi, eta))
+                t_vec = J @ t_ref
+                edge_len = np.linalg.norm(t_vec)
+                qw[i, q] = qw_ref[i, q] * edge_len
+                normal = np.array([t_vec[1], -t_vec[0]], dtype=float)
+                norm_len = np.linalg.norm(normal)
+                if norm_len > 0.0:
+                    normal /= norm_len
+                if np.dot(normal, ed_norm) < 0.0:
+                    normal *= -1.0
+                normals[i, q] = normal
 
         # ---- reference dN for geometry order; build J, detJ, J⁻¹ ------------------
         node_ids_all = mesh.nodes[mesh.elements_connectivity]
         coords_all   = mesh.nodes_x_y_pos[node_ids_all].astype(float)
-        coords_sel   = coords_all[eids_arr]
+        coords_sel   = coords_all[owner]
         nLocGeom     = coords_sel.shape[1]
         dN_tab = np.empty((n_edges, n_q, nLocGeom, 2), dtype=float)
         
@@ -4758,7 +4836,70 @@ class DofHandler:
 
 
 
+    def dirichlet_stats(self, bcs: Union[BcLike, Iterable[BcLike]]) -> Dict[str, Any]:
+        """
+        Calculates Dirichlet constraint statistics for a given set of BCs.
 
+        Returns
+        -------
+        Dict[str, Any]
+            A dictionary containing statistics per field:
+            {
+                'field_name': {
+                    'unique_dofs': int,
+                    'tag_summary': [
+                        {'tag': str, 'count': int}, ...
+                    ]
+                }, ...
+            }
+        """
+        if bcs is None:
+            return {}
+
+        # 1. Group BCs by field, filter for Dirichlet type
+        by_field = {f: [] for f in self.field_names}
+        input_list = bcs if isinstance(bcs, (list, tuple)) else [bcs]
+        
+        for bc in input_list:
+            typ = (getattr(bc, "bc_type", None) or 
+                   getattr(bc, "method", None) or 
+                   getattr(bc, "type", None) or "").lower()
+            bc_field = (getattr(bc, "field_name", None) or 
+                        getattr(bc, "field", None) or 
+                        getattr(bc, "name", None))
+            
+            if "dirichlet" in typ and bc_field in by_field:
+                by_field[bc_field].append(bc)
+
+        # 2. Calculate unique coverage and per-tag counts
+        stats = {}
+        for f in self.field_names:
+            field_bcs = by_field[f]
+            if not field_bcs:
+                continue
+            
+            unique_constrained = set()
+            tag_summaries = []
+            
+            for bc in field_bcs:
+                # Reuse get_dirichlet_data for precise DOF selection logic
+                data = self.get_dirichlet_data([bc])
+                count = len(data)
+                unique_constrained.update(data.keys())
+                
+                # Extract tag name
+                t_name = (getattr(bc, "domain_tag", None) or 
+                          getattr(bc, "tag", None) or 
+                          getattr(bc, "domain", "<unnamed>"))
+                
+                tag_summaries.append({'tag': t_name, 'count': count})
+            
+            stats[f] = {
+                'unique_dofs': len(unique_constrained),
+                'tag_summary': tag_summaries
+            }
+        
+        return stats
 
     
     def info(self) -> None:

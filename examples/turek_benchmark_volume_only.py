@@ -16,14 +16,20 @@ import argparse
 import math
 import os
 import time
+from collections import OrderedDict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import gmsh
+try:  # Gmsh is optional when using the structured O-grid backend
+    import gmsh
+except Exception:  # pragma: no cover - handled at runtime
+    gmsh = None
+
 import numba
 import numpy as np
 
 from pycutfem.core.dofhandler import DofHandler
+from pycutfem.core.mesh import Mesh
 from pycutfem.fem import transform
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.io.vtk import export_vtk
@@ -50,7 +56,11 @@ from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.measures import dS, dx
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
+from pycutfem.utils.ogrid_meshgen import circular_hole_ogrid
+from pycutfem.utils.bitset import BitSet
 import matplotlib.pyplot as plt
+from pycutfem.io.visualization import visualize_boundary_dofs
+
 
 # --------------------------------------------------------------------------- #
 #                        Problem / geometry parameters
@@ -80,84 +90,271 @@ def _configure_numba():
 # --------------------------------------------------------------------------- #
 def build_turek_channel_mesh(path: Path, mesh_size: float, cell_type: str = "tri", view_mesh: bool = False) -> None:
     """
-    Build the Turek benchmark mesh with a cylinder hole using Gmsh.
+    Build the Turek benchmark mesh with an O-grid type block structure.
     The mesh is written to ``path``.
     """
+    if gmsh is None:
+        raise RuntimeError("Gmsh is not available; cannot build a gmsh-based mesh.")
     if cell_type not in {"tri", "quad"}:
         raise ValueError("cell_type must be 'tri' or 'quad'")
 
     gmsh.initialize()
     try:
         gmsh.model.add("turek_channel_volume")
-        rect = gmsh.model.occ.addRectangle(0.0, 0.0, 0.0, L, H)
-        cyl = gmsh.model.occ.addDisk(*CENTER, 0.0, RADIUS, RADIUS)
-        volumes, _ = gmsh.model.occ.cut(
-            [(2, rect)],
-            [(2, cyl)],
-            removeObject=True,
-            removeTool=True,
+        occ = gmsh.model.occ
+
+        # --- helper utilities ------------------------------------------------
+        def _point_key(x, y):
+            return (round(float(x), 12), round(float(y), 12))
+
+        point_lookup: dict[tuple[float, float], int] = {}
+        point_coords: dict[int, tuple[float, float]] = {}
+
+        def add_point(x: float, y: float) -> int:
+            key = _point_key(x, y)
+            if key not in point_lookup:
+                tag = occ.addPoint(x, y, 0.0)
+                point_lookup[key] = tag
+                point_coords[tag] = (x, y)
+            return point_lookup[key]
+
+        line_lookup: dict[tuple[int, int], int] = {}
+        line_lengths: dict[int, float] = {}
+        line_target_nodes: dict[int, int] = {}
+
+        def register_line(tag: int, start: int, end: int, length: float) -> None:
+            line_lookup[(start, end)] = tag
+            line_lengths[tag] = length
+
+        def oriented_line(start: int, end: int) -> int:
+            tag = line_lookup.get((start, end))
+            if tag is not None:
+                return tag
+            tag = line_lookup.get((end, start))
+            if tag is None:
+                raise KeyError(f"No curve between points {start} and {end}.")
+            return -tag
+
+        boundary_edges: dict[str, list[int]] = {
+            "inlet": [],
+            "outlet": [],
+            "walls": [],
+            "cylinder": [],
+        }
+
+        def add_line(start: int, end: int, boundary: str | None = None) -> int:
+            tag = occ.addLine(start, end)
+            x0, y0 = point_coords[start]
+            x1, y1 = point_coords[end]
+            length = math.hypot(x1 - x0, y1 - y0)
+            register_line(tag, start, end, length)
+            if boundary:
+                boundary_edges[boundary].append(tag)
+            return tag
+
+        # --- block layout ----------------------------------------------------
+        buffer = max(2.5 * mesh_size, 0.01)
+        inner_half_x = min(CENTER[0] - buffer, L - CENTER[0] - buffer, 0.35)
+        inner_half_y = min(CENTER[1] - buffer, H - CENTER[1] - buffer, 0.35)
+        if inner_half_x <= RADIUS or inner_half_y <= RADIUS:
+            raise RuntimeError("Inner square collapsed; adjust mesh parameters.")
+        inner_x0 = CENTER[0] - inner_half_x
+        inner_x1 = CENTER[0] + inner_half_x
+        inner_y0 = CENTER[1] - inner_half_y
+        inner_y1 = CENTER[1] + inner_half_y
+
+        x_coords = [0.0, inner_x0, CENTER[0], inner_x1, L]
+        y_coords = [0.0, inner_y0, CENTER[1], inner_y1, H]
+        nx = len(x_coords)
+        ny = len(y_coords)
+
+        x_counts = [
+            max(3, int(round((x_coords[i + 1] - x_coords[i]) / mesh_size)) + 1)
+            for i in range(nx - 1)
+        ]
+        y_counts = [
+            max(3, int(round((y_coords[j + 1] - y_coords[j]) / mesh_size)) + 1)
+            for j in range(ny - 1)
+        ]
+
+        grid_points: dict[tuple[int, int], int] = {}
+        for ix, x in enumerate(x_coords):
+            for iy, y in enumerate(y_coords):
+                grid_points[(ix, iy)] = add_point(x, y)
+
+        horizontal_lines: dict[tuple[int, int], int] = {}
+        for iy in range(ny):
+            for ix in range(nx - 1):
+                start = grid_points[(ix, iy)]
+                end = grid_points[(ix + 1, iy)]
+                boundary = None
+                if iy == 0 or iy == ny - 1:
+                    boundary = "walls"
+                line_tag = add_line(start, end, boundary=boundary)
+                horizontal_lines[(iy, ix)] = line_tag
+                line_target_nodes[line_tag] = x_counts[ix]
+
+        vertical_lines: dict[tuple[int, int], int] = {}
+        for ix in range(nx):
+            for iy in range(ny - 1):
+                start = grid_points[(ix, iy)]
+                end = grid_points[(ix, iy + 1)]
+                boundary = None
+                if ix == 0:
+                    boundary = "inlet"
+                elif ix == nx - 1:
+                    boundary = "outlet"
+                line_tag = add_line(start, end, boundary=boundary)
+                vertical_lines[(ix, iy)] = line_tag
+                line_target_nodes[line_tag] = y_counts[iy]
+
+        fluid_surfaces: list[int] = []
+
+        def add_rect_surface(ix: int, iy: int) -> None:
+            loop = [
+                horizontal_lines[(iy, ix)],
+                vertical_lines[(ix + 1, iy)],
+                -horizontal_lines[(iy + 1, ix)],
+                -vertical_lines[(ix, iy)],
+            ]
+            cloop = occ.addCurveLoop(loop)
+            fluid_surfaces.append(occ.addPlaneSurface([cloop]))
+
+        for ix in range(nx - 1):
+            for iy in range(ny - 1):
+                if 1 <= ix <= 2 and 1 <= iy <= 2:
+                    continue  # hole handled separately
+                add_rect_surface(ix, iy)
+
+        # --- O-grid around the cylinder --------------------------------------
+        center_pt = grid_points[(2, 2)]  # (CENTER)
+        circle_angles = [i * math.pi / 4.0 for i in range(8)]
+        circle_points: list[int] = []
+        angle_lookup: dict[int, float] = {}
+        for angle in circle_angles:
+            x = CENTER[0] + RADIUS * math.cos(angle)
+            y = CENTER[1] + RADIUS * math.sin(angle)
+            tag = add_point(x, y)
+            circle_points.append(tag)
+            angle_lookup[tag] = angle
+
+        square_point_indices = [
+            (3, 2),  # right mid
+            (3, 3),  # top right corner
+            (2, 3),  # top mid
+            (1, 3),  # top left corner
+            (1, 2),  # left mid
+            (1, 1),  # bottom left corner
+            (2, 1),  # bottom mid
+            (3, 1),  # bottom right corner
+        ]
+        square_points = [grid_points[idx] for idx in square_point_indices]
+
+        radial_span = max(
+            math.hypot(inner_half_x, inner_half_y) - RADIUS,
+            inner_half_x - RADIUS,
+            inner_half_y - RADIUS,
         )
-        if not volumes:
-            raise RuntimeError("Boolean cut failed while creating the hole.")
-        gmsh.model.occ.synchronize()
-        surface_tags = [tag for dim, tag in volumes if dim == 2]
-        gmsh.model.addPhysicalGroup(2, surface_tags, tag=1)
+        radial_node_target = max(6, int(round(radial_span / mesh_size)) + 1)
+
+        radial_lines: list[int] = []
+        for c_tag, s_tag in zip(circle_points, square_points):
+            tag = add_line(c_tag, s_tag)
+            line_target_nodes[tag] = radial_node_target
+            radial_lines.append(tag)
+
+        square_segments: list[int] = []
+        for i in range(len(square_points)):
+            a = square_points[i]
+            b = square_points[(i + 1) % len(square_points)]
+            square_segments.append(oriented_line(a, b))
+
+        arc_lines: list[int] = []
+        for i in range(len(circle_points)):
+            start = circle_points[i]
+            end = circle_points[(i + 1) % len(circle_points)]
+            theta_start = angle_lookup[start]
+            theta_end = angle_lookup[end]
+            delta = theta_end - theta_start
+            if delta <= 0.0:
+                delta += 2.0 * math.pi
+            tag = occ.addCircleArc(start, center_pt, end)
+            register_line(tag, start, end, RADIUS * delta)
+            boundary_edges["cylinder"].append(tag)
+            matching_segment = abs(square_segments[i])
+            line_target_nodes[tag] = line_target_nodes[matching_segment]
+            arc_lines.append(tag)
+
+        for i in range(len(circle_points)):
+            # loop = [
+            #     arc_lines[i],
+            #     radial_lines[(i + 1) % len(circle_points)],
+            #     -square_segments[i],
+            #     -radial_lines[i],
+            # ]
+            next_i = (i + 1) % len(circle_points)
+            
+            loop = [
+                radial_lines[i],            # Center -> Square (Outward)
+                square_segments[i],         # Square -> Square Next (CCW along boundary)
+                -radial_lines[next_i],      # Square Next -> Center Next (Inward)
+                -arc_lines[i],              # Center Next -> Center (CW along hole)
+            ]
+            
+            # NOTE: Traversing the hole boundary CW keeps the domain on the Left.
+            # Traversing the outer square CCW keeps the domain on the Left.
+            # This is the correct orientation for a valid surface with a hole.
+            cloop = occ.addCurveLoop(loop)
+            fluid_surfaces.append(occ.addPlaneSurface([cloop]))
+
+        gmsh.model.occ.removeAllDuplicates()
+        occ.synchronize()
+
+        gmsh.model.addPhysicalGroup(2, fluid_surfaces, tag=1)
         gmsh.model.setPhysicalName(2, 1, "fluid")
 
-        if cell_type == "quad":
-            for tag in surface_tags:
-                gmsh.model.mesh.setRecombine(2, tag)
-            gmsh.option.setNumber("Mesh.Algorithm", 8)  # Frontal quad
-            gmsh.option.setNumber("Mesh.RecombineAll", 1)
-            gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 1)   # quad-dominant
-            gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 2) # Blossom
-        gmsh.model.mesh.setOrder(1)
-        gmsh.option.setNumber("Mesh.HighOrderOptimize", 0)
-
-        inlet_edges: list[int] = []
-        outlet_edges: list[int] = []
-        wall_edges: list[int] = []
-        cylinder_edges: list[int] = []
-        boundary_entities = gmsh.model.getBoundary(volumes, oriented=False, recursive=False)
-        tol = 1e-7
-        near = lambda value, target: abs(value - target) <= tol
-        for dim, tag in boundary_entities:
-            if dim != 1:
-                continue
-            cx, cy, _ = gmsh.model.occ.getCenterOfMass(dim, tag)
-            if near(cx, 0.0):
-                inlet_edges.append(tag)
-            elif near(cx, L):
-                outlet_edges.append(tag)
-            elif near(cy, 0.0) or near(cy, H):
-                wall_edges.append(tag)
-            else:
-                cylinder_edges.append(tag)
-
-        def _add_group(name: str, edges: list[int], tag_hint: int) -> None:
+        boundary_tag_hints = {"inlet": 11, "outlet": 12, "walls": 13, "cylinder": 14}
+        for name, tag_hint in boundary_tag_hints.items():
+            edges = sorted(set(boundary_edges[name]))
             if not edges:
-                return
+                continue
             tag = gmsh.model.addPhysicalGroup(1, edges, tag=tag_hint)
             gmsh.model.setPhysicalName(1, tag, name)
 
-        _add_group("inlet", inlet_edges, 11)
-        _add_group("outlet", outlet_edges, 12)
-        _add_group("walls", wall_edges, 13)
-        _add_group("cylinder", cylinder_edges, 14)
+        # --- transfinite meshing controls ------------------------------------
+        def nodes_for_length(length: float, *, min_nodes: int = 3) -> int:
+            segments = max(2, int(round(length / mesh_size)))
+            return max(min_nodes, segments + 1)
 
+        radial_set = set(radial_lines)
+        arc_set = set(arc_lines)
+
+        for tag, length in line_lengths.items():
+            target_nodes = line_target_nodes.get(tag)
+            progression = 1.0
+            if tag in radial_set:
+                progression = 1.2
+            if target_nodes is None:
+                target_nodes = nodes_for_length(length)
+            gmsh.model.mesh.setTransfiniteCurve(
+                tag,
+                target_nodes,
+                "Progression",
+                progression,
+            )
+
+        for surf in fluid_surfaces:
+            gmsh.model.mesh.setTransfiniteSurface(surf)
+            if cell_type == "quad":
+                gmsh.model.mesh.setRecombine(2, surf)
+
+        gmsh.option.setNumber("Mesh.Algorithm", 8)
+        gmsh.option.setNumber("Mesh.RecombineAll", 1 if cell_type == "quad" else 0)
+        gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 1)
         gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size)
         gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
         gmsh.model.mesh.generate(2)
-        gmsh.model.mesh.setOrder(1)  # enforce linear elements even after meshing
-        if cell_type == "quad":
-            tri_types = []
-            for etype in gmsh.model.mesh.getElementTypes(2):
-                name, *_ = gmsh.model.mesh.getElementProperties(etype)
-                if "triangle" in name.lower():
-                    tri_types.append(etype)
-            if tri_types:
-                gmsh.model.mesh.removeElements(elementTypes=tri_types)
-            gmsh.model.mesh.recombine()
+        gmsh.model.mesh.setOrder(1)
 
         path.parent.mkdir(parents=True, exist_ok=True)
         if view_mesh:
@@ -176,6 +373,8 @@ def prepare_mesh(mesh_file: Path | None, mesh_size: float, rebuild: bool, cell_t
     Generate (if needed) and load the Gmsh mesh.
     Returns the in-memory :class:`Mesh` and the path to the mesh file (if kept).
     """
+    if gmsh is None:
+        raise RuntimeError("Gmsh backend requested but the gmsh Python module is not available.")
     if mesh_file is not None:
         mesh_file = mesh_file.expanduser().resolve()
         if rebuild or not mesh_file.exists():
@@ -201,6 +400,150 @@ def prepare_mesh(mesh_file: Path | None, mesh_size: float, rebuild: bool, cell_t
         mesh = mesh_from_gmsh(tmp_path)
     # tmpdir is cleaned up here; mesh lives on in memory
     return mesh, None
+
+
+def _count_segments(width: float, mesh_size: float, *, min_cells: int = 1) -> int:
+    if width <= 1.0e-12:
+        return 0
+    return max(min_cells, int(math.ceil(width / mesh_size)))
+
+
+def build_structured_channel_mesh(mesh_size: float, poly_order: int) -> Mesh:
+    """
+    Build a structured quadrilateral mesh using the internal O-grid generator.
+    """
+    margin = max(2.5 * mesh_size, 0.015)
+    half_x_cap = min(CENTER[0], L - CENTER[0]) - margin
+    half_y_cap = min(CENTER[1], H - CENTER[1]) - margin
+    if half_x_cap <= RADIUS or half_y_cap <= RADIUS:
+        raise RuntimeError(
+            "Structured O-grid collapsed: decrease mesh size or adjust parameters."
+        )
+    hx = half_x_cap
+    hy = half_y_cap
+    ring_thickness = min(hx, hy) - RADIUS
+    if ring_thickness <= 0.0:
+        raise RuntimeError("Ring thickness must be positive for the structured mesh.")
+
+    x_inner_left = CENTER[0] - hx
+    x_inner_right = CENTER[0] + hx
+    y_inner_bottom = CENTER[1] - hy
+    y_inner_top = CENTER[1] + hy
+
+    nx_left = _count_segments(x_inner_left - 0.0, mesh_size, min_cells=1)
+    nx_right = _count_segments(L - x_inner_right, mesh_size, min_cells=1)
+    nx_mid = _count_segments(x_inner_right - x_inner_left, mesh_size, min_cells=4)
+    if nx_mid % 2:
+        nx_mid += 1
+
+    ny_bottom = _count_segments(y_inner_bottom - 0.0, mesh_size, min_cells=1)
+    ny_top = _count_segments(H - y_inner_top, mesh_size, min_cells=1)
+    ny_mid = _count_segments(y_inner_top - y_inner_bottom, mesh_size, min_cells=4)
+    if ny_mid % 2:
+        ny_mid += 1
+
+    n_radial_layers = max(2, _count_segments(ring_thickness, mesh_size, min_cells=2))
+
+    nodes, elements, edges, corners = circular_hole_ogrid(
+        L,
+        H,
+        circle_center=CENTER,
+        circle_radius=RADIUS,
+        ring_thickness=ring_thickness,
+        n_radial_layers=n_radial_layers,
+        nx_outer=(nx_left, nx_mid, nx_right),
+        ny_outer=(ny_bottom, ny_mid, ny_top),
+        poly_order=poly_order,
+        outer_box_half_lengths=(hx, hy),
+    )
+    mesh = Mesh(
+        nodes=nodes,
+        element_connectivity=elements,
+        edges_connectivity=edges,
+        elements_corner_nodes=corners,
+        element_type="quad",
+        poly_order=poly_order,
+    )
+    _tag_structured_mesh_boundaries(mesh, mesh_size)
+    return mesh
+
+
+def _tag_structured_mesh_boundaries(mesh: Mesh, mesh_size: float) -> None:
+    tol = 1.0e-9
+    circle_tol = max(0.25 * mesh_size, 1.0e-4)
+    rect_locators = OrderedDict(
+        [
+            ("inlet", lambda x, y: abs(x - 0.0) <= tol),
+            ("outlet", lambda x, y: abs(x - L) <= tol),
+            ("walls", lambda x, y: abs(y - 0.0) <= tol or abs(y - H) <= tol),
+        ]
+    )
+    mesh.tag_boundary_edges(rect_locators)
+
+    circle_locator = lambda x, y: abs(math.hypot(x - CENTER[0], y - CENTER[1]) - RADIUS) <= circle_tol
+    circle_corner_nodes = {
+        node.id
+        for node in mesh.nodes_list
+        if node.tag and "boundary_circle" in node.tag.split(",")
+    }
+    cyl_mask = np.zeros(len(mesh.edges_list), dtype=bool)
+    for edge in mesh.edges_list:
+        if edge.right is not None:
+            continue
+        node_ids = set(edge.nodes)
+        if node_ids and node_ids.issubset(circle_corner_nodes):
+            edge.tag = "cylinder"
+            cyl_mask[edge.gid] = True
+    if hasattr(mesh, "_edge_bitsets"):
+        mesh._edge_bitsets["cylinder"] = BitSet(cyl_mask)
+    # Cache locators including the circular boundary for later use in BC application
+    loc_map = getattr(mesh, "_boundary_locators", {})
+    loc_map = dict(loc_map, **rect_locators)
+    loc_map["cylinder"] = circle_locator
+    mesh._boundary_locators = loc_map
+
+
+def check_positive_jacobians(mesh: Mesh, sample_density: int | None = None):
+    """
+    Verify that det(J) > 0 for all elements at a grid of reference points.
+    Returns (ok_flag, min_det, failure_info).
+    """
+    if mesh.element_type == "quad":
+        n = sample_density or max(3, mesh.poly_order + 2)
+        coords = np.linspace(-1.0, 1.0, n)
+        sample_pts = [(float(xi), float(eta)) for xi in coords for eta in coords]
+    else:
+        n = sample_density or max(3, mesh.poly_order + 2)
+        sample_pts = []
+        for i in range(1, n):
+            for j in range(1, n - i):
+                xi = i / n
+                eta = j / n
+                sample_pts.append((float(xi), float(eta)))
+        if not sample_pts:
+            sample_pts = [(1.0 / 3.0, 1.0 / 3.0)]
+
+    min_det = float("inf")
+    for elem in mesh.elements_list:
+        for xi, eta in sample_pts:
+            detJ = float(transform.det_jacobian(mesh, elem.id, (xi, eta)))
+            min_det = min(min_det, detJ)
+            if detJ <= 0.0:
+                return False, detJ, (elem.id, xi, eta)
+    return True, min_det, None
+
+
+def generate_mesh(args):
+    """
+    Create a mesh using either gmsh (default) or the structured O-grid backend.
+    """
+    geometric_order = 2
+    if args.mesh_backend == "structured":
+        if args.mesh_type != "quad":
+            raise ValueError("The structured mesh backend only supports quadrilateral elements.")
+        mesh = build_structured_channel_mesh(args.mesh_size, poly_order=geometric_order)
+        return mesh, None
+    return prepare_mesh(args.mesh_file, args.mesh_size, args.rebuild_mesh, args.mesh_type, args.view_gmsh)
 
 
 # --------------------------------------------------------------------------- #
@@ -319,12 +662,14 @@ def main() -> None:
         description="Volume-only Turek benchmark using a Gmsh mesh."
     )
     parser.add_argument("--backend", choices=("python", "jit"), default="jit", help="Assembly backend to use.")
-    parser.add_argument("--mesh-size", type=float, default=0.02, help="Target edge size for gmsh.")
+    parser.add_argument("--mesh-backend", choices=("gmsh", "structured"), default="gmsh",
+                        help="Mesh generator: 'gmsh' (default) or the built-in structured O-grid.")
+    parser.add_argument("--mesh-size", type=float, default=0.02, help="Target edge size for the mesh generator.")
     parser.add_argument("--mesh-type", choices=("tri", "quad"), default="quad",
-                        help="Element type generated by gmsh (default: quad).")
-    parser.add_argument("--mesh-file", type=Path, help="Optional path to reuse/store the .msh file.")
+                        help="Element type generated by gmsh/structured backend (structured supports only quad).")
+    parser.add_argument("--mesh-file", type=Path, help="Optional path to reuse/store the .msh file (gmsh backend).")
     parser.add_argument("--rebuild-mesh", action="store_true", help="Force rebuilding the gmsh mesh.")
-    parser.add_argument("--view-gmsh", action="store_true", help="Preview the generated mesh in Gmsh.")
+    parser.add_argument("--view-gmsh", action="store_true", help="Preview the generated gmsh mesh.")
     parser.add_argument("--dt", type=float, default=0.1, help="Time step size.")
     parser.add_argument("--theta", type=float, default=0.5, help="Theta parameter for the time-stepping scheme.")
     parser.add_argument("--max-steps", type=int, default=36, help="Maximum number of time steps.")
@@ -348,14 +693,30 @@ def main() -> None:
         help="Directory for VTU files / diagnostic plots.",
     )
     parser.add_argument("--stop-on-steady", action="store_true", help="Stop when reaching steady state.")
+    parser.add_argument(
+        "--check-det-only",
+        action="store_true",
+        help="Only build the mesh, report det(J) statistics, and exit.",
+    )
     args = parser.parse_args()
 
     _configure_numba()
 
-    mesh, persistent_mesh_path = prepare_mesh(
-        args.mesh_file, args.mesh_size, args.rebuild_mesh, args.mesh_type, args.view_gmsh
-    )
+    mesh, persistent_mesh_path = generate_mesh(args)
     print(mesh)
+    need_det_check = args.mesh_backend == "structured" or args.check_det_only
+    if need_det_check:
+        det_ok, det_min, failure = check_positive_jacobians(mesh)
+        if not det_ok:
+            eid, xi, eta = failure
+            raise RuntimeError(
+                f"Jacobian determinant non-positive at element {eid} for (xi, eta)=({xi:.3f}, {eta:.3f})"
+            )
+        print(f"Minimum det(J) across sampled points: {det_min:.6e}")
+        if args.check_det_only:
+            if persistent_mesh_path:
+                print(f"Mesh stored at: {persistent_mesh_path}")
+            return
 
     cylinder_edges = mesh.edge_bitset("cylinder")
     if cylinder_edges.cardinality() == 0:
@@ -386,6 +747,8 @@ def main() -> None:
     bcs_homog = [
         BoundaryCondition(bc.field, bc.method, bc.domain_tag, lambda x, y: 0.0) for bc in bcs
     ]
+
+    print(f"Dirichlet data: {dof_handler.dirichlet_stats(bcs)}")
 
     # --- Function spaces / functions ---
     velocity_space = FunctionSpace(name="velocity", field_names=["ux", "uy"], dim=1, side="+")
@@ -442,12 +805,21 @@ def main() -> None:
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    histories: dict[str, list[float]] = {"time": [], "cd": [], "cl": [], "dp": []}
     monitor_point = np.array([0.15, 0.2])
+    histories: dict[str, list[float]] = {"time": [], "cd": [], "cl": [], "dp": []}
 
     probe_A = np.array([CENTER[0] - RADIUS - 0.01, CENTER[1]])
     probe_B = np.array([CENTER[0] + RADIUS + 0.01, CENTER[1]])
 
+    visualize_boundary_dofs(
+        mesh,
+        tags=["cylinder", "inlet", "outlet", "walls"],
+        dof_handler=dof_handler,
+        fields=["ux", "uy"],
+        annotate_nodes=True,
+        annotate_dofs=True,
+        title="Cylinder Dirichlet nodes",
+    )
     def save_solution(funcs):
         """Callback executed after every converged time step."""
         velocity = funcs[0]  # VectorFunction

@@ -3489,6 +3489,13 @@ class FormCompiler:
         self.ctx['is_interface'] = False
         if is_functional:
             self.ctx.setdefault("scalar_results", {})[hook["name"]] = 0.0
+        from pycutfem.integration.quadrature import edge as edge_rule
+        if mesh.element_type == "quad":
+            edge_tangents = np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]], dtype=float)
+        elif mesh.element_type == "tri":
+            edge_tangents = np.array([[1.0, 0.0], [-1.0, 1.0], [0.0, -1.0]], dtype=float)
+        else:
+            raise ValueError(f"Unsupported element type '{mesh.element_type}' for boundary assembly.")
 
         # decide which edges we visit -------------------------------------
         defined = intg.measure.defined_on
@@ -3503,38 +3510,46 @@ class FormCompiler:
         for gid in edge_ids:
             edge   = mesh.edge(gid)
             eid    = edge.left                      # the unique owner element
-            p0, p1 = mesh.nodes_x_y_pos[list(edge.nodes)]
-            qp, qw = line_quadrature(p0, p1, qdeg)  # *weights already in phys. space*
-
-            # outward normal of the *element*:
-            n = edge.normal.copy()
-            # if np.dot(n, np.asarray(mesh.elements_list[eid].centroid()) - qp[0]) < 0:
-            #     n *= -1.0
-            self.ctx["normal"] = n                  # constant along that edge
-
+            elem = mesh.elements_list[eid]
+            try:
+                local_edge_idx = elem.edges.index(int(gid))
+            except ValueError:
+                continue
+            ref_pts, ref_w = edge_rule(mesh.element_type, local_edge_idx, qdeg)
             # precompute element dofs once
             gdofs = self.dh.get_elemental_dofs(eid)
 
             # ------------------------------------------------------------------
             loc = None
-            for x_phys, w in zip(qp, qw):
-                xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
-                Ji    = np.linalg.inv(transform.jacobian(mesh, eid, (xi, eta)))
+            for (xi, eta), w_ref in zip(ref_pts, ref_w):
+                J = transform.jacobian(mesh, eid, (float(xi), float(eta)))
+                t_vec = J @ edge_tangents[local_edge_idx]
+                edge_len = np.linalg.norm(t_vec)
+                normal = np.array([t_vec[1], -t_vec[0]], dtype=float)
+                n_norm = np.linalg.norm(normal)
+                if n_norm > 0.0:
+                    normal /= n_norm
+                if np.dot(normal, edge.normal) < 0.0:
+                    normal *= -1.0
+                self.ctx["normal"] = normal
+                x_phys = transform.x_mapping(mesh, eid, (float(xi), float(eta)))
+                Ji    = np.linalg.inv(J)
 
                 # basis cache ---------------------------------------------------
                 self._basis_cache.clear();self._coeff_cache.clear(); self._collapsed_cache.clear();
                 for f in fields:
                     self._basis_cache[f] = {
-                        "val" : self.me.basis      (f, xi, eta),
-                        "grad": self.me.grad_basis (f, xi, eta) @ Ji
+                        "val" : self.me.basis      (f, float(xi), float(eta)),
+                        "grad": self.me.grad_basis (f, float(xi), float(eta)) @ Ji
                     }
 
                 # context for visitors
                 self.ctx.update({"eid": eid, "x_phys": x_phys})
 
                 val = self._visit(intg.integrand)    # scalar, vec, or matrix
-                loc = (w * np.asarray(val)           # **NO detJ re-multiplication!**
-                    if loc is None else loc + w * np.asarray(val))
+                weight = float(w_ref) * edge_len
+                loc = (weight * np.asarray(val)
+                    if loc is None else loc + weight * np.asarray(val))
 
             # ---------------- scatter -----------------------------------------
             if rhs and test:                   # linear form  (vector assemble)

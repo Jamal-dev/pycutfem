@@ -12,6 +12,7 @@ import uuid
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import permutations
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -36,13 +37,13 @@ def _bilinear_shape(xi: float, eta: float) -> Tuple[np.ndarray, np.ndarray, np.n
         [
             (1 - xi) * (1 - eta),  # bottom-left
             (1 + xi) * (1 - eta),  # bottom-right
-            (1 + xi) * (1 + eta),  # top-right
             (1 - xi) * (1 + eta),  # top-left
+            (1 + xi) * (1 + eta),  # top-right
         ],
         dtype=float,
     )
-    dN_dxi = 0.25 * np.array([-(1 - eta), (1 - eta), (1 + eta), -(1 + eta)], dtype=float)
-    dN_deta = 0.25 * np.array([-(1 - xi), -(1 + xi), (1 + xi), (1 - xi)], dtype=float)
+    dN_dxi = 0.25 * np.array([-(1 - eta), (1 - eta), -(1 + eta), (1 + eta)], dtype=float)
+    dN_deta = 0.25 * np.array([-(1 - xi), -(1 + xi), (1 - xi), (1 + xi)], dtype=float)
     return N, dN_dxi, dN_deta
 
 
@@ -71,21 +72,78 @@ def _row_major_permutation(points: np.ndarray) -> np.ndarray:
     (ξ, η) coordinate system, regardless of the original numbering.
     """
     centroid = points.mean(axis=0)
-    dist2 = np.sum((points - centroid) ** 2, axis=1)
-    corner_idx = np.argsort(dist2)[-4:]
-    corner_pts = points[corner_idx]
-    angles = np.arctan2(corner_pts[:, 1] - centroid[1], corner_pts[:, 0] - centroid[0])
-    order = np.argsort(angles)
-    corner_idx = corner_idx[order]
-    # Rotate so the "bottom-left" (smallest x+y) corner is first.
-    start = int(np.argmin(corner_pts[order][:, 0] + corner_pts[order][:, 1]))
-    corner_idx = np.roll(corner_idx, -start)
-    corners = points[corner_idx]
-    local_coords = np.zeros((points.shape[0], 2), dtype=float)
-    for i, pt in enumerate(points):
-        local_coords[i] = _invert_bilinear_map(corners, pt)
-    xi = np.round(local_coords[:, 0], 8)
-    eta = np.round(local_coords[:, 1], 8)
+    def _convex_hull_idx(pts: np.ndarray) -> list[int]:
+        order = np.lexsort((pts[:, 1], pts[:, 0]))
+        hull = []
+
+        def cross(i, j, k):
+            a = pts[j] - pts[i]
+            b = pts[k] - pts[i]
+            return a[0] * b[1] - a[1] * b[0]
+
+        for idx in order:
+            while len(hull) >= 2 and cross(hull[-2], hull[-1], idx) <= 0.0:
+                hull.pop()
+            hull.append(idx)
+        upper = []
+        for idx in order[::-1]:
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], idx) <= 0.0:
+                upper.pop()
+            upper.append(idx)
+        return hull[:-1] + upper[:-1]
+
+    hull_idx = _convex_hull_idx(points - centroid)
+    if len(hull_idx) >= 4:
+        corner_idx = np.array(hull_idx[:4], dtype=int)
+    else:
+        dist2 = np.sum((points - centroid) ** 2, axis=1)
+        corner_idx = np.argsort(dist2)[-4:]
+
+    best_idx = None
+    best_local = None
+    best_err = float("inf")
+    sample_qp = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+    for perm in permutations(range(4)):
+        idx = corner_idx[list(perm)]
+        corners = points[idx]
+        # Require positive Jacobian at the four reference corners
+        det_ok = True
+        for xi, eta in sample_qp:
+            _, dN_dxi, dN_deta = _bilinear_shape(xi, eta)
+            x_xi = float(dN_dxi @ corners[:, 0])
+            x_eta = float(dN_deta @ corners[:, 0])
+            y_xi = float(dN_dxi @ corners[:, 1])
+            y_eta = float(dN_deta @ corners[:, 1])
+            det = x_xi * y_eta - x_eta * y_xi
+            if det <= 0.0:
+                det_ok = False
+                break
+        if not det_ok:
+            continue
+        # Evaluate inversion error for all nodes
+        local_coords = np.zeros((points.shape[0], 2), dtype=float)
+        recon_err = 0.0
+        for i, pt in enumerate(points):
+            xi_eta = _invert_bilinear_map(corners, pt)
+            local_coords[i] = xi_eta
+            N, _, _ = _bilinear_shape(*xi_eta)
+            mapped = N @ corners
+            recon_err = max(recon_err, np.linalg.norm(mapped - pt))
+        if recon_err < best_err:
+            best_err = recon_err
+            best_idx = idx
+            best_local = local_coords
+
+    if best_idx is None:
+        angles = np.arctan2(points[corner_idx, 1] - centroid[1], points[corner_idx, 0] - centroid[0])
+        order = np.argsort(angles)
+        ordered = corner_idx[order]
+        start = int(np.argmin(points[ordered][:, 0] + points[ordered][:, 1]))
+        best_idx = np.roll(ordered, -start)
+        best_local = np.array([_invert_bilinear_map(points[best_idx], pt) for pt in points])
+
+    xi = np.round(best_local[:, 0], 8)
+    eta = np.round(best_local[:, 1], 8)
     perm = np.lexsort((xi, eta))
     return perm
 
