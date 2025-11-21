@@ -323,7 +323,7 @@ def _add_rect_element(
     eta_coords: np.ndarray,
     registry: _NodeRegistry,
     classifier: Callable[[float, float], Sequence[str]],
-) -> List[int]:
+) -> Tuple[List[int], List[Tuple[float, float]]]:
     nodes_per_edge = len(xi_coords)
     element_nodes: List[int] = []
     element_coords: List[Tuple[float, float]] = []
@@ -333,7 +333,7 @@ def _add_rect_element(
             x = (1.0 - xi) * x0 + xi * x1
             element_nodes.append(registry.add(x, y, classifier(x, y)))
             element_coords.append((x, y))
-    return _ensure_ccw_order(element_nodes, element_coords, nodes_per_edge)
+    return _orient_tensor_layout(element_nodes, element_coords, nodes_per_edge)
 
 
 def _add_curved_element(
@@ -349,7 +349,7 @@ def _add_curved_element(
     eta_coords: np.ndarray,
     registry: _NodeRegistry,
     classifier: Callable[[float, float], Sequence[str]],
-) -> List[int]:
+) -> Tuple[List[int], List[Tuple[float, float]]]:
     circle_center_vec = np.array(circle_center, dtype=float)
     angle_span = theta_right - theta_left
     outer_vec = outer_right - outer_left
@@ -370,15 +370,23 @@ def _add_curved_element(
             x, y = float(mapped[0]), float(mapped[1])
             element_nodes.append(registry.add(x, y, classifier(x, y)))
             element_coords.append((x, y))
-    return _ensure_ccw_order(element_nodes, element_coords, nodes_per_edge)
+    return _orient_tensor_layout(element_nodes, element_coords, nodes_per_edge)
 
 
-def _ensure_ccw_order(
+def _orient_tensor_layout(
     node_ids: Sequence[int], coords: Sequence[Tuple[float, float]], nodes_per_edge: int
 ) -> Tuple[List[int], List[Tuple[float, float]]]:
+    """Return a tensor layout with positive orientation.
+
+    The nodes are produced in tensor-product order (eta outer loop, xi inner loop).
+    We check the signed area of the corner nodes and, if necessary, flip the
+    xi or eta directions deterministically until the orientation is positive.
+    """
+
     nloc = nodes_per_edge * nodes_per_edge
     if len(node_ids) != nloc or len(coords) != nloc:
-        raise ValueError("Local node data does not match nodes_per_edge for O-grid element.")
+        raise ValueError("Local node data does not match nodes_per_edge for element.")
+
     ids = np.asarray(node_ids, dtype=np.int64).reshape(nodes_per_edge, nodes_per_edge)
     xy = np.asarray(coords, dtype=np.float64).reshape(nodes_per_edge, nodes_per_edge, 2)
 
@@ -387,61 +395,31 @@ def _ensure_ccw_order(
         br = data[0, -1]
         tr = data[-1, -1]
         tl = data[-1, 0]
-        pts = (bl, br, tr, tl)
-        area = 0.0
-        for i in range(4):
-            x1, y1 = pts[i]
-            x2, y2 = pts[(i + 1) % 4]
-            area += x1 * y2 - x2 * y1
-        return 0.5 * area
+        return 0.5 * (
+            bl[0] * br[1] - br[0] * bl[1]
+            + br[0] * tr[1] - tr[0] * br[1]
+            + tr[0] * tl[1] - tl[0] * tr[1]
+            + tl[0] * bl[1] - bl[0] * tl[1]
+        )
 
-    def _classify_corners(arr_xy: np.ndarray) -> Tuple[int, int, int, int]:
-        corners = [
-            arr_xy[0, 0],
-            arr_xy[0, -1],
-            arr_xy[-1, -1],
-            arr_xy[-1, 0],
-        ]
-        remaining = {0, 1, 2, 3}
+    def try_orientation(flip_x: bool, flip_y: bool) -> Tuple[np.ndarray, np.ndarray]:
+        arr = ids
+        pts = xy
+        if flip_x:
+            arr = arr[:, ::-1]
+            pts = pts[:, ::-1, :]
+        if flip_y:
+            arr = arr[::-1, :]
+            pts = pts[::-1, :, :]
+        return arr, pts
 
-        def _pop_min(key):
-            idx = min(remaining, key=key)
-            remaining.remove(idx)
-            return idx
+    for flip_x in (False, True):
+        for flip_y in (False, True):
+            arr, pts = try_orientation(flip_x, flip_y)
+            if signed_area(pts) > 0.0:
+                return arr.reshape(-1).tolist(), pts.reshape(-1, 2).tolist()
 
-        def _pop_max(key):
-            idx = max(remaining, key=key)
-            remaining.remove(idx)
-            return idx
-
-        bl = _pop_min(lambda i: (corners[i][1], corners[i][0]))
-        br = _pop_min(lambda i: (corners[i][1], -corners[i][0]))
-        tr = _pop_max(lambda i: (corners[i][1], corners[i][0]))
-        tl = remaining.pop()
-        return bl, br, tr, tl
-
-    bl_idx, br_idx, tr_idx, tl_idx = _classify_corners(xy)
-    ids_r = np.rot90(ids, k=bl_idx)
-    xy_r = np.rot90(xy, k=bl_idx, axes=(0, 1))
-
-    br_pos = (br_idx - bl_idx) % 4
-    if br_pos == 1:
-        pass  # already aligned
-    elif br_pos == 3:
-        ids_r = ids_r[:, ::-1]
-        xy_r = xy_r[:, ::-1, :]
-    else:
-        raise RuntimeError("Unable to orient O-grid element consistently.")
-
-    if signed_area(xy_r) <= 0.0:
-        ids_r = ids_r[::-1, :]
-        xy_r = xy_r[::-1, :, :]
-        if signed_area(xy_r) <= 0.0:
-            raise RuntimeError("Failed to orient O-grid element with positive Jacobian.")
-
-    ids_flat = ids_r.reshape(-1).tolist()
-    coords_flat = xy_r.reshape(-1, 2).tolist()
-    return ids_flat, coords_flat
+    raise RuntimeError("Failed to orient element with positive area.")
 
 
 def _extract_corner_ids(

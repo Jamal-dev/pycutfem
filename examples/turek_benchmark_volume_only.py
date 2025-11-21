@@ -88,7 +88,7 @@ def _configure_numba():
 # --------------------------------------------------------------------------- #
 #                              Mesh generation
 # --------------------------------------------------------------------------- #
-def build_turek_channel_mesh(path: Path, mesh_size: float, cell_type: str = "tri", view_mesh: bool = False) -> None:
+def build_turek_channel_mesh(path: Path, mesh_size: float, cell_type: str = "tri", view_mesh: bool = False, mesh_order: int | None = None) -> None:
     """
     Build the Turek benchmark mesh with an O-grid type block structure.
     The mesh is written to ``path``.
@@ -354,7 +354,8 @@ def build_turek_channel_mesh(path: Path, mesh_size: float, cell_type: str = "tri
         gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size)
         gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
         gmsh.model.mesh.generate(2)
-        gmsh.model.mesh.setOrder(1)
+        # Keep the geometric order consistent with the FE order unless explicitly overridden.
+        gmsh.model.mesh.setOrder(int(mesh_order) if mesh_order is not None else FE_ORDER)
 
         path.parent.mkdir(parents=True, exist_ok=True)
         if view_mesh:

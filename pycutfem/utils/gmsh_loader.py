@@ -350,10 +350,33 @@ def load_gmsh_mesh(
         n_corners = 3 if element_type == "tri" else 4
         if element_type == "quad":
             n_side = int(poly_order) + 1
+            if poly_order == 1:
+                base_perm = np.array([0, 1, 3, 2], dtype=int)
+            elif poly_order == 2:
+                base_perm = np.array([0, 4, 1, 7, 8, 5, 3, 6, 2], dtype=int)
+            else:
+                base_perm = None
             for i in range(element_connectivity.shape[0]):
                 conn = element_connectivity[i]
-                perm = _row_major_permutation(coords[conn])
-                element_connectivity[i] = conn[perm]
+                if base_perm is not None and base_perm.size == conn.size:
+                    arr = conn[base_perm].reshape(n_side, n_side)
+                else:
+                    perm = _row_major_permutation(coords[conn])
+                    arr = conn[perm].reshape(n_side, n_side)
+                # Enforce positive orientation (CCW corners) by flipping xi when needed.
+                bl = coords[arr[0, 0]]
+                br = coords[arr[0, -1]]
+                tr = coords[arr[-1, -1]]
+                tl = coords[arr[-1, 0]]
+                signed_area = 0.5 * (
+                    bl[0] * br[1] - br[0] * bl[1]
+                    + br[0] * tr[1] - tr[0] * br[1]
+                    + tr[0] * tl[1] - tl[0] * tr[1]
+                    + tl[0] * bl[1] - bl[0] * tl[1]
+                )
+                if signed_area <= 0.0:
+                    arr = arr[:, ::-1]
+                element_connectivity[i] = arr.reshape(-1)
             corner_nodes = np.column_stack(
                 [
                     element_connectivity[:, 0],
