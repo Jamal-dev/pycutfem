@@ -270,7 +270,12 @@ def _collect_boundary_tags(
                     for ln in mapped:
                         if phys_name not in node_tags[ln]:
                             node_tags[ln].append(phys_name)
-                    key = tuple(sorted((mapped[0], mapped[-1])))
+                    # Gmsh always places the two endpoints first; higher-order
+                    # nodes (midpoints, internal points) follow. Use the first
+                    # *two* entries as the edge endpoints so we get consistent
+                    # keys regardless of polynomial order.
+                    a, b = mapped[0], mapped[1]
+                    key = tuple(sorted((a, b)))
                     if phys_name not in edge_tags[key]:
                         edge_tags[key].append(phys_name)
     return node_tags, edge_tags

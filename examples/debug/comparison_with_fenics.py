@@ -1417,7 +1417,13 @@ if __name__ == '__main__':
     # Keep track of successes and failures
     failed_tests = []
     success_count = 0
-    backend_type = "jit"
+    import os
+    backend_type = os.environ.get("COMP_FENICS_BACKEND", "jit")
+    filter_terms = os.environ.get("COMP_FENICS_TERMS")
+    if filter_terms:
+        allowed = {name.strip() for name in filter_terms.split(",") if name.strip()}
+        terms = {k: v for k, v in terms.items() if k in allowed}
+        print(f"Running filtered terms only: {sorted(terms)}")
     for name, forms in terms.items():
         J_pc, R_pc, J_fx, R_fx = None, None, None, None
 

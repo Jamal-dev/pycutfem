@@ -11,8 +11,10 @@ side.  Run with
 from __future__ import annotations
 
 import functools
+import argparse
 from pathlib import Path
 from typing import Dict
+import sympy as sp
 
 import numpy as np
 import pandas as pd
@@ -22,7 +24,11 @@ import dolfinx
 import dolfinx.fem
 import dolfinx.fem.petsc
 import dolfinx.mesh
-from dolfinx.io import gmshio
+try:
+    from dolfinx.io import gmshio
+except ImportError:
+    gmshio = None
+    from dolfinx.io import gmsh
 import ufl
 import basix.ufl
 import basix.cell
@@ -37,6 +43,10 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
+from pycutfem.utils.meshgen import structured_quad
+from pycutfem.integration import volume
+from pycutfem.fem.reference import get_reference
+from pycutfem.fem import transform
 from examples.turek_benchmark_volume_only import build_turek_channel_mesh
 from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.expressions import (
@@ -100,7 +110,11 @@ def build_minimal_ogrid_mesh(mesh_size: float = 0.05) -> tuple[Mesh, np.ndarray,
     try:
         build_turek_channel_mesh(tmp_path, mesh_size, cell_type="quad", view_mesh=False)
         mesh_pc = mesh_from_gmsh(tmp_path)
-        mesh_fx, _, _ = gmshio.read_from_msh(str(tmp_path), MPI.COMM_WORLD, gdim=2)
+        if gmshio is not None:
+            mesh_fx, _, _ = gmshio.read_from_msh(str(tmp_path), MPI.COMM_WORLD, gdim=2)
+        else:
+            meshdata_fx = gmsh.read_from_msh(str(tmp_path), MPI.COMM_WORLD, gdim=2)
+            mesh_fx = meshdata_fx.mesh
     finally:
         os.remove(tmp_path)
     coords = np.array([[node.x, node.y] for node in mesh_pc.nodes_list], dtype=np.float64)
@@ -108,8 +122,135 @@ def build_minimal_ogrid_mesh(mesh_size: float = 0.05) -> tuple[Mesh, np.ndarray,
     return mesh_pc, coords, mesh_fx
 
 
-def setup_ns_problems():
-    mesh_pc, coords, mesh_fx = build_minimal_ogrid_mesh()
+def _warp_nonaffine(xy: np.ndarray) -> np.ndarray:
+    """Small smooth warp to make the mapping curved (not affine)."""
+    x, y = xy[..., 0], xy[..., 1]
+    f1 = 0.2 * (x * (1.0 - x)) * (y + 0.5 * y * y)
+    f2 = 0.15 * (y * (1.0 - y)) * (x + 0.25 * x * x)
+    out = np.empty_like(xy)
+    out[..., 0] = x + f1
+    out[..., 1] = y + f2
+    return out
+
+
+def build_single_structured_mesh(poly_order: int, *, curved: bool, seed: int | None = None, coords_override: np.ndarray | None = None) -> tuple[Mesh, dolfinx.mesh.Mesh]:
+    # Start from unit quad then optionally random affine and/or warp
+    nodes, elements, edges, corners = structured_quad(
+        1.0,
+        1.0,
+        nx=1,
+        ny=1,
+        poly_order=poly_order,
+    )
+    coords = np.array([[n.x, n.y] for n in nodes], dtype=np.float64)
+
+    if seed is not None:
+        rng = np.random.default_rng(seed)
+        angle = rng.uniform(0.0, 2.0 * np.pi)
+        rot = np.array(
+            ((np.cos(angle), -np.sin(angle)), (np.sin(angle), np.cos(angle))),
+            dtype=np.float64,
+        )
+        shear = np.array(((1.0, rng.uniform(-0.2, 0.2)), (0.0, 1.0)), dtype=np.float64)
+        shift = rng.uniform(-0.25, 0.25, size=2)
+        coords = (coords - 0.5) @ (rot @ shear).T + shift
+
+    if coords_override is not None:
+        coords = np.asarray(coords_override, dtype=float)
+    elif curved:
+        coords = _warp_nonaffine(coords)
+
+    for node, xy in zip(nodes, coords):
+        node.x = float(xy[0])
+        node.y = float(xy[1])
+
+    mesh_pc = Mesh(nodes, elements, edges, corners, element_type="quad", poly_order=poly_order)
+    mesh_pc.tag_boundary_edges({"all": lambda _x, _y: True})
+
+    # Basix Q2 geometry node ordering: vertices (bl, br, tl, tr), edge mids (bottom, right, top, left), center.
+    basix_perm = np.array([0, 2, 6, 8, 1, 5, 7, 3, 4], dtype=int)
+    coords_fx = coords[basix_perm]
+    cells_fx = np.arange(coords_fx.shape[0], dtype=np.int64).reshape(1, -1)
+    geom_el = basix.ufl.element("Lagrange", "quadrilateral", poly_order, shape=(2,))
+    mesh_fx = dolfinx.mesh.create_mesh(MPI.COMM_WORLD, cells_fx, geom_el, coords_fx)
+    return mesh_pc, mesh_fx
+
+
+def random_q2_coords(scale: float = 0.25, seed: int | None = None) -> np.ndarray:
+    """
+    Start from the unit Q2 grid and jitter mid-edge and center nodes by `scale`.
+    Corner nodes remain fixed to preserve orientation.
+    """
+    rng = np.random.default_rng(seed)
+    base = np.array(
+        [
+            [0.0, 0.0],
+            [0.5, 0.0],
+            [1.0, 0.0],
+            [0.0, 0.5],
+            [0.5, 0.5],
+            [1.0, 0.5],
+            [0.0, 1.0],
+            [0.5, 1.0],
+            [1.0, 1.0],
+        ],
+        dtype=float,
+    )
+    jitter = np.zeros_like(base)
+    jitter[1:] = scale * rng.uniform(-1.0, 1.0, size=jitter[1:].shape)
+    return base + jitter
+
+
+def setup_ns_problems(mesh_kind: str = "ogrid", seed: int | None = None):
+    if mesh_kind == "ogrid":
+        mesh_pc, coords_unused, mesh_fx = build_minimal_ogrid_mesh()
+    elif mesh_kind == "single":
+        mesh_pc, mesh_fx = build_single_structured_mesh(POLY_ORDER, curved=False, seed=seed)
+    elif mesh_kind == "curved":
+        mesh_pc, mesh_fx = build_single_structured_mesh(POLY_ORDER, curved=True, seed=None)
+    else:
+        raise ValueError(f"Unsupported mesh kind '{mesh_kind}'")
+    mixed_element_pc = MixedElement(mesh_pc, field_specs={"ux": 2, "uy": 2, "p": 1})
+    dof_handler = DofHandler(mixed_element_pc, method="cg")
+
+    velocity_fs = FunctionSpace("velocity", ["ux", "uy"], dim=1)
+    pressure_fs = FunctionSpace("pressure", ["p"], dim=0)
+    pc = {
+        "du": VectorTrialFunction(velocity_fs, dof_handler=dof_handler),
+        "dp": TrialFunction(pressure_fs, dof_handler=dof_handler),
+        "v": VectorTestFunction(velocity_fs, dof_handler=dof_handler),
+        "q": TestFunction(pressure_fs, dof_handler=dof_handler),
+        "u_k": VectorFunction("u_k", ["ux", "uy"], dof_handler),
+        "p_k": Function("p_k", "p", dof_handler),
+        "u_n": VectorFunction("u_n", ["ux", "uy"], dof_handler),
+        "rho": Constant(1.0, dim=0),
+        "dt": Constant(0.1, dim=0),
+        "theta": Constant(0.5, dim=0),
+        "mu": Constant(1.0e-2, dim=0),
+    }
+
+    tdim = mesh_fx.topology.dim
+    P2_el = basix.ufl.element("Lagrange", "quadrilateral", 2, shape=(tdim,))
+    P1_el = basix.ufl.element("Lagrange", "quadrilateral", 1)
+    W_el = mixed_element([P2_el, P1_el])
+    W = dolfinx.fem.functionspace(mesh_fx, W_el)
+
+    fenicsx = {
+        "mesh": mesh_fx,
+        "W": W,
+        "rho": dolfinx.fem.Constant(mesh_fx, 1.0),
+        "dt": dolfinx.fem.Constant(mesh_fx, 0.1),
+        "theta": dolfinx.fem.Constant(mesh_fx, 0.5),
+        "mu": dolfinx.fem.Constant(mesh_fx, 1.0e-2),
+        "u_k_p_k": dolfinx.fem.Function(W, name="u_k_p_k"),
+        "normal": ufl.FacetNormal(mesh_fx),
+    }
+    V, _ = W.sub(0).collapse()
+    fenicsx["u_n"] = dolfinx.fem.Function(V, name="u_n")
+    return pc, dof_handler, fenicsx
+
+
+def setup_from_meshes(mesh_pc: Mesh, mesh_fx: dolfinx.mesh.Mesh):
     mixed_element_pc = MixedElement(mesh_pc, field_specs={"ux": 2, "uy": 2, "p": 1})
     dof_handler = DofHandler(mixed_element_pc, method="cg")
 
@@ -268,6 +409,56 @@ def create_true_dof_map(dof_handler: DofHandler, W) -> np.ndarray:
     return mapping
 
 
+def element_area_pycutfem(mesh: Mesh, quad: int = 8) -> float:
+    """Integrate |detJ| over the element using high quadrature."""
+    ref = get_reference(mesh.element_type, mesh.poly_order)
+    pts, wts = volume(mesh.element_type, quad)
+    area = 0.0
+    for eid in range(mesh.n_elements):
+        for (xi, eta), w in zip(pts, wts):
+            J = transform.jacobian(mesh, eid, (xi, eta))
+            area += float(w) * abs(float(np.linalg.det(J)))
+    return area
+
+
+def area_from_mass_block(J: csr_matrix, rho: float, dt: float, n_comp: int = 2) -> float:
+    """Recover area from the consistent mass matrix of an n-comp vector field."""
+    total = J.toarray().sum()
+    return total / (n_comp * rho / dt)
+
+
+def exact_q2_area_from_coords(coords: np.ndarray) -> float:
+    """
+    Compute the exact area of a Q2 quad with node coordinates `coords`
+    ordered row-major on the reference grid (-1,0,1)x(-1,0,1).
+    """
+    xi, eta = sp.symbols("xi eta")
+
+    def lagrange_1d(u):
+        return [u * (u - 1) / 2, 1 - u**2, u * (u + 1) / 2]
+
+    Lx = lagrange_1d(xi)
+    Ly = lagrange_1d(eta)
+    N = []
+    for j in range(3):
+        for i in range(3):
+            N.append(Lx[i] * Ly[j])
+
+    coords = np.asarray(coords, dtype=float).reshape(9, 2)
+    x_map = sum(N[k] * coords[k, 0] for k in range(9))
+    y_map = sum(N[k] * coords[k, 1] for k in range(9))
+
+    J = sp.Matrix(
+        [
+            [sp.diff(x_map, xi), sp.diff(y_map, xi)],
+            [sp.diff(x_map, eta), sp.diff(y_map, eta)],
+        ]
+    )
+    detJ = sp.simplify(J.det())
+    area = sp.integrate(detJ, (xi, -1, 1), (eta, -1, 1))
+    return float(area.evalf())
+
+
 def navier_stokes_forms(pc: Dict, fenicsx: Dict):
     rho = pc["rho"]
     dt = pc["dt"]
@@ -326,11 +517,11 @@ def navier_stokes_forms(pc: Dict, fenicsx: Dict):
     return jacobian_pc, residual_pc, jacobian_fx, residual_fx
 
 
-def assemble_pycutfem(form, dof_handler: DofHandler, quad: int, matrix: bool):
+def assemble_pycutfem(form, dof_handler: DofHandler, quad: int, matrix: bool, backend: str):
     if matrix:
-        J_pc, _ = assemble_form(Equation(form, None), dof_handler, quad_degree=quad, backend="jit")
+        J_pc, _ = assemble_form(Equation(form, None), dof_handler, quad_degree=quad, backend=backend)
         return J_pc
-    _, R_pc = assemble_form(Equation(None, form), dof_handler, quad_degree=quad, backend="jit")
+    _, R_pc = assemble_form(Equation(None, form), dof_handler, quad_degree=quad, backend=backend)
     return R_pc
 
 
@@ -388,21 +579,69 @@ def compare_matrices(name: str, pc_mat: csr_matrix, fx_mat: csr_matrix, P: np.nd
     )
 
 
+def _parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--mesh", choices=("ogrid", "single", "curved"), default="ogrid", help="Mesh topology to compare.")
+    p.add_argument("--seed", type=int, default=0, help="Seed for affine jitter on single/curved mesh.")
+    p.add_argument("--quad-jac", type=int, default=5, help="Quadrature degree for Jacobian assembly.")
+    p.add_argument("--quad-res", type=int, default=6, help="Quadrature degree for residual assembly.")
+    p.add_argument("--backend", choices=("jit", "python"), default="jit", help="PyCutFEM assembly backend.")
+    p.add_argument("--area-sweep", type=int, default=0, help="If >0, run this many random curved-element area diagnostics and exit.")
+    p.add_argument("--perturb-scale", type=float, default=0.25, help="Max jitter for non-corner Q2 nodes in area sweep.")
+    return p.parse_args()
+
+
 def main():
-    pc, dof_handler, fenicsx = setup_ns_problems()
+    args = _parse_args()
+    print(f"Running comparison on mesh='{args.mesh}' (seed={args.seed}, backend={args.backend})")
+    if args.area_sweep > 0:
+        rng = np.random.default_rng(args.seed)
+        rows = []
+        for i in range(args.area_sweep):
+            coords = random_q2_coords(scale=args.perturb_scale, seed=int(rng.integers(0, 1_000_000)))
+            area_exact = exact_q2_area_from_coords(coords)
+            mesh_pc, mesh_fx = build_single_structured_mesh(POLY_ORDER, curved=True, coords_override=coords)
+            pc, dof_handler, fenicsx = setup_from_meshes(mesh_pc, mesh_fx)
+            initialize_state(pc, fenicsx)
+            P_map = create_true_dof_map(dof_handler, fenicsx["W"])
+
+            mass_form_pc = (pc["rho"] * dot(pc["du"], pc["v"]) / pc["dt"]) * dx()
+            Dup_fx = ufl.TrialFunction(fenicsx["W"])
+            Vq_fx = ufl.TestFunction(fenicsx["W"])
+            du_fx, _ = ufl.split(Dup_fx)
+            v_fx, _ = ufl.split(Vq_fx)
+            mass_form_fx = (fenicsx["rho"] * ufl.dot(du_fx, v_fx) / fenicsx["dt"]) * ufl.dx(metadata={"quadrature_degree": args.quad_jac})
+            J_pc = assemble_pycutfem(mass_form_pc, dof_handler, quad=args.quad_jac, matrix=True, backend="python")
+            J_fx = assemble_fenicsx(mass_form_fx, matrix=True)
+            area_pc = area_from_mass_block(J_pc, rho=float(pc["rho"].value), dt=float(pc["dt"].value), n_comp=2)
+            area_fx = area_from_mass_block(J_fx, rho=1.0, dt=0.1, n_comp=2)
+            rows.append((i, area_exact, area_pc, area_fx))
+            print(f"[trial {i}] exact={area_exact:.12f}, mass_pc={area_pc:.12f}, mass_fx={area_fx:.12f}")
+        return
+    pc, dof_handler, fenicsx = setup_ns_problems(mesh_kind=args.mesh, seed=args.seed)
     initialize_state(pc, fenicsx)
     P_map = create_true_dof_map(dof_handler, fenicsx["W"])
 
     jacobian_pc, residual_pc, jacobian_fx, residual_fx = navier_stokes_forms(pc, fenicsx)
 
+    if args.mesh == "curved":
+        area_geom = element_area_pycutfem(dof_handler.mixed_element.mesh, quad=20)
+        print(f"Geometric area (pycutfem, q=20): {area_geom:.12f}")
+
     print("Assembling Navier–Stokes Jacobian...")
-    J_pc = assemble_pycutfem(jacobian_pc, dof_handler, quad=5, matrix=True)
-    J_fx = assemble_fenicsx(jacobian_fx(5), matrix=True)
+    J_pc = assemble_pycutfem(jacobian_pc, dof_handler, quad=args.quad_jac, matrix=True, backend=args.backend)
+    J_fx = assemble_fenicsx(jacobian_fx(args.quad_jac), matrix=True)
     compare_matrices("navier_stokes", J_pc, J_fx, P_map)
+    if args.mesh == "curved":
+        rho = float(pc["rho"].value)
+        dt = float(pc["dt"].value)
+        area_mass_pc = area_from_mass_block(J_pc, rho=rho, dt=dt, n_comp=2)
+        area_mass_fx = area_from_mass_block(J_fx, rho=rho, dt=dt, n_comp=2)
+        print(f"Area from mass (pc): {area_mass_pc:.12f}, (fenicsx): {area_mass_fx:.12f}")
 
     print("Assembling Navier–Stokes residual...")
-    R_pc = assemble_pycutfem(residual_pc, dof_handler, quad=6, matrix=False)
-    R_fx = assemble_fenicsx(residual_fx(6), matrix=False)
+    R_pc = assemble_pycutfem(residual_pc, dof_handler, quad=args.quad_res, matrix=False, backend=args.backend)
+    R_fx = assemble_fenicsx(residual_fx(args.quad_res), matrix=False)
     compare_vectors("navier_stokes", R_pc, R_fx, P_map, dof_handler, fenicsx["W"])
 
 

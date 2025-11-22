@@ -1762,14 +1762,17 @@ class DofHandler:
                         a00 = 0.0; a01 = 0.0; a10 = 0.0; a11 = 0.0
                         for i in range(nLoc):
                             Ni  = Ntab[q, i]
-                            dN0 = dNtab[q, i, 0]
-                            dN1 = dNtab[q, i, 1]
-                            X0  = coords[e, i, 0]
-                            X1  = coords[e, i, 1]
+                            dN0 = dNtab[q, i, 0]   # ∂Ni/∂ξ
+                            dN1 = dNtab[q, i, 1]   # ∂Ni/∂η
+                            X0  = coords[e, i, 0]  # x‑coord
+                            X1  = coords[e, i, 1]  # y‑coord
                             x0 += Ni  * X0
                             x1 += Ni  * X1
-                            a00 += dN0 * X0; a01 += dN0 * X1
-                            a10 += dN1 * X0; a11 += dN1 * X1
+                            # Standard geometry Jacobian: rows = (x,y), cols = (ξ,η)
+                            a00 += dN0 * X0  # ∂x/∂ξ
+                            a01 += dN1 * X0  # ∂x/∂η
+                            a10 += dN0 * X1  # ∂y/∂ξ
+                            a11 += dN1 * X1  # ∂y/∂η
                         qp_phys[e, q, 0] = x0
                         qp_phys[e, q, 1] = x1
                         J_geo[e, q, 0, 0] = a00; J_geo[e, q, 0, 1] = a01
@@ -1777,10 +1780,10 @@ class DofHandler:
                         det = a00 * a11 - a01 * a10
                         detJ[e, q] = det
                         inv_det = 1.0 / det
-                        J_inv[e, q, 0, 0] =  a11 * inv_det
-                        J_inv[e, q, 0, 1] = -a01 * inv_det
-                        J_inv[e, q, 1, 0] = -a10 * inv_det
-                        J_inv[e, q, 1, 1] =  a00 * inv_det
+                        J_inv[e, q, 0, 0] =  a11 * inv_det   #  ∂ξ/∂x
+                        J_inv[e, q, 0, 1] = -a01 * inv_det   #  ∂η/∂x
+                        J_inv[e, q, 1, 0] = -a10 * inv_det   #  ∂ξ/∂y
+                        J_inv[e, q, 1, 1] =  a00 * inv_det   #  ∂η/∂y
                         qw_sc[e, q] = qwref[q] * det
                 return qp_phys, qw_sc, detJ, J_inv, J_geo
 
