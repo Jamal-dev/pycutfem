@@ -58,6 +58,55 @@ class AffineLevelSet(LevelSetFunction):
         return AffineLevelSet(self.a / norm, self.b / norm, self.c / norm)
 
 
+class BeamLevelSet(LevelSetFunction):
+    """
+    Axis-aligned rectangular beam:
+    center = (cx, cy)
+    length in x = Lb, thickness in y = Hb.
+    φ < 0 inside the beam, > 0 outside.
+    """
+
+    def __init__(self, center, Lb, Hb):
+        self.cx, self.cy = center
+        self.hx = 0.5 * Lb
+        self.hy = 0.5 * Hb
+        # Used to invalidate caches when the LS changes
+        self.cache_token = ("beam_rect_ref", float(self.cx), float(self.cy),
+                            float(self.hx), float(self.hy))
+
+    def __call__(self, x):
+        x = np.asarray(x, float)
+        dx = (x[0] - self.cx) / self.hx
+        dy = (x[1] - self.cy) / self.hy
+        ax = abs(dx)
+        ay = abs(dy)
+        m  = max(ax, ay)
+        return m - 1.0        # <0 inside
+
+    def gradient(self, x):
+        """
+        Piecewise-constant gradient pointing normal to the closest face.
+        Norm is ~1/h on that face; we normalise to a unit normal.
+        """
+        x = np.asarray(x, float)
+        dx = (x[0] - self.cx) / self.hx
+        dy = (x[1] - self.cy) / self.hy
+        ax = abs(dx)
+        ay = abs(dy)
+
+        if ax > ay:         # left/right faces dominate
+            gx = np.sign(dx) / self.hx
+            gy = 0.0
+        else:               # top/bottom faces dominate
+            gx = 0.0
+            gy = np.sign(dy) / self.hy
+
+        g = np.array([gx, gy], float)
+        nrm = np.linalg.norm(g)
+        if nrm == 0.0:
+            return np.array([0.0, 0.0])
+        return g / nrm
+
 class CompositeLevelSet(LevelSetFunction):
     """Hold several independent level‑set functions.
 
