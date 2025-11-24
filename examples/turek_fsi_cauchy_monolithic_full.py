@@ -25,6 +25,8 @@ import numpy as np
 from pycutfem.core.geometry import hansbo_cut_ratio
 from pycutfem.core.levelset import BeamLevelSet, LevelSetGridFunction
 from pycutfem.core.mesh import Mesh
+from pycutfem.core.topology import Node
+from pycutfem.fem import transform
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.utils.bitset import BitSet
@@ -60,6 +62,7 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.measures import dx, dGhost, dInterface
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.io.vtk import export_vtk
+from pycutfem.io.visualization import plot_mesh_2
 from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.helpers import analyze_active_dofs
 from pycutfem.solvers.nonlinear_solver import (
@@ -211,6 +214,156 @@ def tag_channel_boundaries(mesh: Mesh, mesh_size: float) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Localized asymmetric refinement around the beam (produces hanging nodes)
+# -----------------------------------------------------------------------------
+def _quad_corner_indices(p: int) -> tuple[int, int, int, int]:
+    """Return (bl, br, tr, tl) local indices in lattice order (eta outer, xi inner)."""
+    n = p + 1
+    bl = 0
+    br = p
+    tr = p * n + p
+    tl = p * n
+    return bl, br, tr, tl
+
+
+def _refine_element_quads(mesh: Mesh, eid: int, orientation: str, nodes, node_lookup) -> tuple[list[list[int]], list[list[int]]]:
+    """
+    Split one quad element into 2 children (vertical or horizontal).
+    Returns (child_connectivity, child_corners).
+    """
+    p = mesh.poly_order
+    nloc = (p + 1) ** 2
+    t = np.linspace(-1.0, 1.0, p + 1)
+    parent_conn = mesh.elements_connectivity[eid]
+
+    def _parent_node(xi_p: float, eta_p: float) -> int | None:
+        ix = np.where(np.isclose(t, xi_p, atol=1e-12))[0]
+        iy = np.where(np.isclose(t, eta_p, atol=1e-12))[0]
+        if ix.size and iy.size:
+            idx = int(iy[0] * (p + 1) + ix[0])
+            return int(parent_conn[idx])
+        return None
+
+    def _get_node(xi_p: float, eta_p: float) -> int:
+        # Reuse parent nodes when possible; otherwise create/reuse global by coordinate.
+        nid = _parent_node(xi_p, eta_p)
+        if nid is not None:
+            return nid
+        x_phys = transform.x_mapping(mesh, eid, (float(xi_p), float(eta_p)))
+        key = (float(round(x_phys[0], 14)), float(round(x_phys[1], 14)))
+        nid = node_lookup.get(key)
+        if nid is not None:
+            return nid
+        nid = len(nodes)
+        node_lookup[key] = nid
+        nodes.append(Node(nid, float(x_phys[0]), float(x_phys[1])))
+        return nid
+
+    def _child(refine_mode: str):
+        # refine_mode: 'left', 'right', 'bottom', 'top'
+        conn = []
+        xi_child = t
+        eta_child = t
+        for eta in eta_child:
+            for xi in xi_child:
+                if refine_mode == "left":
+                    xi_p = 0.5 * (xi - 1.0)
+                    eta_p = eta
+                elif refine_mode == "right":
+                    xi_p = 0.5 * (xi + 1.0)
+                    eta_p = eta
+                elif refine_mode == "bottom":
+                    xi_p = xi
+                    eta_p = 0.5 * (eta - 1.0)
+                elif refine_mode == "top":
+                    xi_p = xi
+                    eta_p = 0.5 * (eta + 1.0)
+                else:
+                    raise ValueError(refine_mode)
+                conn.append(_get_node(xi_p, eta_p))
+        bl, br, tr, tl = _quad_corner_indices(p)
+        corners = [conn[bl], conn[br], conn[tr], conn[tl]]
+        return conn, corners
+
+    if orientation == "vertical":
+        c1, corners1 = _child("left")
+        c2, corners2 = _child("right")
+        return [c1, c2], [corners1, corners2]
+    else:
+        c1, corners1 = _child("bottom")
+        c2, corners2 = _child("top")
+        return [c1, c2], [corners1, corners2]
+
+
+def asymmetric_refine_around_beam(mesh: Mesh, beam_ls: BeamLevelSet, levels: int = 2, band: float | None = None) -> Mesh:
+    """
+    Refine quads touching the beam level set with orientation bias:
+    left half → vertical split, right half → horizontal split.
+    Produces hanging nodes that are handled by the constraint layer.
+    """
+    if mesh.element_type != "quad":
+        return mesh
+
+    band = band or max(2.0 * beam_ls.hy, 3.0 * MESH_SIZE)
+    center_x = float(getattr(beam_ls, "cx", BEAM_CENTER[0]))
+    beam_xmin = float(beam_ls.cx - beam_ls.hx)
+    beam_xmax = float(beam_ls.cx + beam_ls.hx)
+    beam_ymin = float(beam_ls.cy - beam_ls.hy)
+    beam_ymax = float(beam_ls.cy + beam_ls.hy)
+
+    marked = set()
+    for elem in mesh.elements_list:
+        corners = mesh.nodes_x_y_pos[list(elem.corner_nodes)]
+        phi_corner = beam_ls(corners)
+        # Any corner inside/close to the beam → mark
+        hits_phi = np.any(phi_corner <= 0.0) or np.any(np.abs(phi_corner) <= band)
+        # Bounding box overlap (captures the beam body even if centroid/corners miss)
+        ex_min, ey_min = corners.min(axis=0)
+        ex_max, ey_max = corners.max(axis=0)
+        hits_bbox = (ex_min <= beam_xmax + band and ex_max >= beam_xmin - band and ey_min <= beam_ymax + band and ey_max >= beam_ymin - band)
+        if hits_phi or hits_bbox:
+            marked.add(elem.id)
+    # expand to neighbor layers
+    for _ in range(max(0, levels - 1)):
+        new = set()
+        for eid in marked:
+            for nb in mesh._neighbors[eid]:
+                if nb is not None:
+                    new.add(int(nb))
+        marked |= new
+
+    if not marked:
+        return mesh
+
+    nodes = list(mesh.nodes_list)
+    node_lookup = {(round(nd.x, 14), round(nd.y, 14)): int(nd.id) for nd in nodes}
+    new_elems = []
+    new_corners = []
+
+    for eid, elem in enumerate(mesh.elements_list):
+        if eid not in marked:
+            new_elems.append(list(mesh.elements_connectivity[eid]))
+            new_corners.append(list(mesh.corner_connectivity[eid]))
+            continue
+        cx, _ = elem.centroid()
+        orient = "vertical" if cx <= center_x else "horizontal"
+        conns, corners = _refine_element_quads(mesh, eid, orient, nodes, node_lookup)
+        new_elems.extend(conns)
+        new_corners.extend(corners)
+
+    new_mesh = Mesh(
+        nodes=nodes,
+        element_connectivity=np.asarray(new_elems, dtype=int),
+        elements_corner_nodes=np.asarray(new_corners, dtype=int),
+        element_type="quad",
+        poly_order=mesh.poly_order,
+    )
+    tag_channel_boundaries(new_mesh, MESH_SIZE)
+    print(f"[refine_beam] marked {len(marked)} elems → {len(new_elems)} elements, {len(nodes)} nodes (band={band:.4f})")
+    return new_mesh
+
+
+# -----------------------------------------------------------------------------
 # Level-set update utilities
 # -----------------------------------------------------------------------------
 
@@ -324,19 +477,20 @@ def retag_inactive(dh: DofHandler) -> None:
 
 def recompute_active_dofs(solver: NewtonSolver, bcs_active: Sequence[BoundaryCondition]) -> None:
     dh = solver.dh
-    ndof = dh.total_dofs
+    ndof_effective = solver.constraints.n_master if getattr(solver, "constraints", None) else dh.total_dofs
+    map_to_master = (lambda ids: solver.constraints.to_master_set(ids)) if getattr(solver, "constraints", None) else (lambda ids: set(ids))
     active_by_restr, has_restriction = analyze_active_dofs(solver.equation, dh, solver.me, bcs_active)
     bc_dofs = set(dh.get_dirichlet_data(bcs_active).keys())
-    candidate = set(active_by_restr) if has_restriction else set(range(ndof))
+    candidate = map_to_master(active_by_restr) if has_restriction else set(range(ndof_effective))
     inactive = set(dh.dof_tags.get("inactive", set()))
     inactive_free = inactive - bc_dofs
-    free = sorted((candidate - bc_dofs) - inactive_free)
+    free = sorted((candidate - map_to_master(bc_dofs)) - map_to_master(inactive_free))
     solver.active_dofs = np.asarray(free, dtype=int)
-    solver.full_to_red = -np.ones(ndof, dtype=int)
+    solver.full_to_red = -np.ones(ndof_effective, dtype=int)
     solver.full_to_red[solver.active_dofs] = np.arange(len(solver.active_dofs), dtype=int)
     solver.red_to_full = solver.active_dofs
-    solver.use_reduced = len(solver.active_dofs) < ndof
-    solver.restrictor = _ActiveReducer(dh, solver.active_dofs)
+    solver.use_reduced = len(solver.active_dofs) < ndof_effective
+    solver.restrictor = _ActiveReducer(dh, solver.active_dofs, constraint=getattr(solver, "constraints", None))
     solver._pattern_stale = True
 
 
@@ -422,6 +576,27 @@ mesh = build_structured_channel_mesh(MESH_SIZE, POLY_ORDER)
 
 # Beam level set (reference configuration)
 beam_ref_ls = BeamLevelSet(center=BEAM_CENTER, Lb=BEAM_LENGTH, Hb=BEAM_HEIGHT)
+
+# Optional asymmetric refinement around the beam to concentrate cells (with hanging nodes)
+refine_levels = int(os.getenv("BEAM_REFINE_LEVELS", "2"))
+refine_band_env = os.getenv("BEAM_REFINE_BAND", "")
+refine_band = float(refine_band_env) if refine_band_env else None
+mesh = asymmetric_refine_around_beam(mesh, beam_ref_ls, levels=refine_levels, band=refine_band)
+if os.getenv("PLOT_BEAM_REFINEMENT", "0") != "0":
+    ax = plot_mesh_2(mesh, level_set=beam_ref_ls, show=False)
+    out = os.getenv("PLOT_BEAM_REFINEMENT_FILE", "")
+    if out:
+        import matplotlib.pyplot as plt
+        plt.savefig(out, dpi=200, bbox_inches="tight")
+        print(f"Saved refinement plot to {out}")
+    else:
+        import matplotlib.pyplot as plt
+        plt.show()
+if os.getenv("PLOT_BEAM_REFINEMENT_ONLY", "0") != "0":
+    print("Exiting after beam refinement visualization (PLOT_BEAM_REFINEMENT_ONLY=1).")
+    import sys
+    sys.exit(0)
+
 ls_me = MixedElement(mesh, field_specs={"phi_beam": 1})
 ls_dh = DofHandler(ls_me, method="cg")
 ls_beam = LevelSetGridFunction(ls_dh, field="phi_beam")

@@ -88,7 +88,10 @@ class Edge:
     normal: np.ndarray          # Normal vector, pointing outward from the left element
     tag: str = ""
     lid: Optional[int] = None      # Local edge index within the left element
+    right_lid: Optional[int] = None  # Local edge index within the right element
     all_nodes: Tuple[int, ...] = ()
+    left_nodes: Tuple[int, ...] = ()
+    right_nodes: Tuple[int, ...] = ()
     tangent: np.ndarray = field(init=False, default=None)  # Tangent vector of the edge
     def calc_tangent_unit_vector(self, nodes_xy):
         import numpy as np
@@ -121,6 +124,20 @@ class Element:
     centroid_x: float = None
     centroid_y: float = None
     interface_pts: List[Tuple[float, float]] = field(default_factory=list)
+    edges_by_side: Tuple[Tuple[int, ...], ...] = field(default_factory=tuple)
+    edge_gid_to_local: Dict[int, int] = field(default_factory=dict)
+
+    def local_edge_index(self, edge_gid: int) -> int:
+        """
+        Return the local edge number (0-based) for a given global edge id.
+        Supports elements that have multiple sub-edges per geometric side.
+        """
+        if edge_gid in self.edge_gid_to_local:
+            return int(self.edge_gid_to_local[edge_gid])
+        if edge_gid in self.edges:
+            return int(self.edges.index(edge_gid))
+        raise ValueError(f"Edge {edge_gid} not found in element {self.id}")
+
     def contains_node(self, node_id: int) -> bool:
         """Check if the element contains a specific node."""
         return node_id in self.nodes

@@ -219,54 +219,86 @@ class LinearSolverParameters:
 # ----------------------------------------------------------------------------
 # put this in nonlinear_solver.py (top-level) -------------------------
 class _ActiveReducer:
-    def __init__(self, dh, active_dofs):
+    def __init__(self, dh, active_dofs, constraint=None):
         self.dh = dh
+        self.constraint = constraint
         self.active = np.asarray(active_dofs, dtype=int)
-        self.full2red = {i: j for j, i in enumerate(self.active)}
+        self.full_size = constraint.n_master if constraint is not None else dh.total_dofs
+        self.phys_size = dh.total_dofs
+        self.full2red = {int(i): j for j, i in enumerate(self.active)}
 
     # vectors ----------------------------------------------------------
     def restrict_vec(self, v_full):
-        return v_full[self.active]
+        if self.constraint is None:
+            return v_full[self.active]
+        v_master = self.constraint.restrict_full(v_full)
+        return v_master[self.active]
 
     def expand_vec(self, v_red):
-        v_full = np.zeros(self.dh.total_dofs, dtype=v_red.dtype)
-        v_full[self.active] = v_red
-        return v_full
+        if self.constraint is None:
+            v_full = np.zeros(self.dh.total_dofs, dtype=v_red.dtype)
+            v_full[self.active] = v_red
+            return v_full
+        v_master = np.zeros(self.full_size, dtype=v_red.dtype)
+        v_master[self.active] = v_red
+        return self.constraint.prolong(v_master)
 
     # matrices ---------------------------------------------------------
     def restrict_mat(self, A_full):
         aid = self.active
-        return A_full.tocsr()[np.ix_(aid, aid)]
+        if self.constraint is None:
+            return A_full.tocsr()[np.ix_(aid, aid)]
+        A_master = self.constraint.E_T @ (A_full @ self.constraint.E)
+        return A_master.tocsr()[np.ix_(aid, aid)]
 
     # systems (full → reduced with BCs already handled in the full space)
     def reduce_system(self, A_full, R_full, dh, bcs):
-        K_red = self.restrict_mat(A_full)
-        F_red = self.restrict_vec(R_full)
+        if self.constraint is None:
+            K_red = self.restrict_mat(A_full)
+            F_red = self.restrict_vec(R_full)
+            bc_data = dh.get_dirichlet_data(bcs)
+            if bc_data:
+                rows_full = np.fromiter(bc_data.keys(), dtype=int)
+                vals_full = np.fromiter(bc_data.values(), dtype=float)
 
-        # Dirichlet on the reduced system (identical to your current code)
-        bc_data = dh.get_dirichlet_data(bcs)
-        if bc_data:
-            rows_full = np.fromiter(bc_data.keys(), dtype=int)
-            vals_full = np.fromiter(bc_data.values(), dtype=float)
+                # keep only rows that are active
+                mask = np.isin(rows_full, self.active)
+                rows_full = rows_full[mask]
+                vals_full = vals_full[mask]
+                if rows_full.size:
+                    rows_red = np.array([self.full2red[i] for i in rows_full])
 
-            # keep only rows that are active
-            mask = np.isin(rows_full, self.active)
-            rows_full = rows_full[mask]
-            vals_full = vals_full[mask]
-            if rows_full.size:
-                rows_red = np.array([self.full2red[i] for i in rows_full])
+                    F_red -= K_red @ np.bincount(rows_red, weights=vals_full,
+                                                 minlength=self.active.size)
 
-                F_red -= K_red @ np.bincount(rows_red, weights=vals_full,
-                                             minlength=self.active.size)
+                    K_red = K_red.tolil()
+                    K_red[rows_red, :] = 0
+                    K_red[:, rows_red] = 0
+                    K_red[rows_red, rows_red] = 1.0
+                    K_red = K_red.tocsr()
 
-                K_red = K_red.tolil()
-                K_red[rows_red, :] = 0
-                K_red[:, rows_red] = 0
-                K_red[rows_red, rows_red] = 1.0
-                K_red = K_red.tocsr()
+                    F_red[rows_red] = vals_full
+            return K_red, F_red
 
-                F_red[rows_red] = vals_full
-        return K_red, F_red
+        # Constraint-aware path: condense first, then apply BCs in master space
+        A_master = self.constraint.E_T @ (A_full @ self.constraint.E)
+        R_master = self.constraint.E_T @ R_full
+
+        bc_data_full = dh.get_dirichlet_data(bcs)
+        bc_master = self.constraint.project_dirichlet(bc_data_full)
+        if bc_master:
+            rows_master = np.fromiter(bc_master.keys(), dtype=int)
+            vals_master = np.fromiter(bc_master.values(), dtype=float)
+            if rows_master.size:
+                R_master -= A_master @ np.bincount(
+                    rows_master, weights=vals_master, minlength=self.constraint.n_master
+                )
+                A_master = _zero_rows_cols(A_master, rows_master)
+                R_master[rows_master] = vals_master
+
+        A_red = A_master.tocsr()[np.ix_(self.active, self.active)]
+        R_red = R_master[self.active]
+        return A_red, R_red
 
 
 # ----------------------------------------------------------------------------
@@ -332,6 +364,19 @@ class NewtonSolver:
         self.equation = Equation(jacobian_form, residual_form)
         # Which BC list marks the fixed rows? Prefer homogeneous set.
         bcs_for_active = self.bcs_homog if getattr(self, "bcs_homog", None) else self.bcs
+        # Optional hanging-node constraints → master space
+        self.constraints = None
+        if hasattr(self.dh, "build_hanging_node_constraints"):
+            try:
+                self.constraints = self.dh.build_hanging_node_constraints()
+            except Exception:
+                self.constraints = None
+        ndof_effective = self.constraints.n_master if self.constraints is not None else self.dh.total_dofs
+
+        def _map_to_master(ids):
+            if self.constraints is None:
+                return set(ids)
+            return self.constraints.to_master_set(ids)
         # 1) What DOFs are “touched” by Restriction (if any)?
         active_by_restr, has_restriction = analyze_active_dofs(
             self.equation, self.dh, self.me, bcs_for_active
@@ -340,7 +385,7 @@ class NewtonSolver:
         bc_dofs = set(self.dh.get_dirichlet_data(bcs_for_active).keys())
 
         # Candidate DOFs that would remain without explicit drops
-        candidate = set(active_by_restr) if has_restriction else set(range(ndof))
+        candidate_master = _map_to_master(active_by_restr) if has_restriction else set(range(ndof_effective))
 
         # Optional DOF tags (e.g. CutFEM inactive regions) are honoured here.
         inactive_dofs: set[int] = set()
@@ -349,26 +394,28 @@ class NewtonSolver:
             inactive_dofs = set(dh_tags.get("inactive", set()))
         # Remove DOFs tagged inactive but not already fixed by Dirichlet BCs
         inactive_free = inactive_dofs - bc_dofs
-        inactive_removed = len(inactive_free & candidate)
+        inactive_removed = len(inactive_free & set(active_by_restr if has_restriction else range(ndof)))
 
         # 2) Free DOFs = candidate DOFs \ (Dirichlet ∪ inactive)
-        free_set = (candidate - bc_dofs) - inactive_free
+        bc_master = _map_to_master(bc_dofs)
+        inactive_master = _map_to_master(inactive_free)
+        free_set = (candidate_master - bc_master) - inactive_master
         free = sorted(free_set)
 
         self.active_dofs = np.asarray(free, dtype=int)
         nfree = self.active_dofs.size
 
         # 3) Maps full ↔ reduced
-        self.full_to_red = -np.ones(ndof, dtype=int)
+        self.full_to_red = -np.ones(ndof_effective, dtype=int)
         self.full_to_red[self.active_dofs] = np.arange(nfree, dtype=int)
         self.red_to_full = self.active_dofs
 
         # 4) Always run the reduced path when there are any fixed DOFs
-        self.use_reduced = (nfree < ndof)
+        self.use_reduced = (nfree < ndof_effective)
         if not self.use_reduced:
             print("NewtonSolver: Operating on the full, unrestricted system.")
         else:
-            print(f"NewtonSolver: Reduced system with {nfree}/{ndof} DOFs.")
+            print(f"NewtonSolver: Reduced system with {nfree}/{ndof_effective} DOFs.")
 
         # Optional sanity log:
         print(f"  Dirichlet DOFs detected: {len(bc_dofs)}; Free DOFs: {nfree}")
@@ -382,7 +429,7 @@ class NewtonSolver:
         # Build once: CSR structure & per-element scatter plan for reduced system
         self._build_reduced_pattern()
 
-        self.restrictor = _ActiveReducer(self.dh, self.active_dofs)
+        self.restrictor = _ActiveReducer(self.dh, self.active_dofs, constraint=self.constraints)
 
 
 
@@ -544,12 +591,12 @@ class NewtonSolver:
         only after an accepted step (BCs were already set before entering the loop).
         """
         dh = self.dh
-        ndof = dh.total_dofs
+        ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
 
         # Quick safety: make sure we actually have a reduced set
         # (This is only for logging; we still run the reduced pipeline.)
         nfree = len(self.active_dofs)
-        if nfree == ndof:
+        if nfree == ndof_eff:
             print("        [warn] active_dofs == total_dofs — reduced path = full size."
                 " Check that bcs_homog correctly marks Dirichlet nodes.")
 
@@ -593,7 +640,7 @@ class NewtonSolver:
                 assembly_time += time.perf_counter() - t_asm
 
             # Log residual with a full-size view (zeros on fixed DOFs) for readability
-            R_full = np.zeros(ndof)
+            R_full = np.zeros(ndof_eff)
             R_full[self.active_dofs] = R_red
             norm_R = np.linalg.norm(R_full, ord=np.inf)
             t_current = time.perf_counter()
@@ -637,8 +684,7 @@ class NewtonSolver:
                 line_search_time = time.perf_counter() - t_ls
 
             # 4) Apply accepted step: expand reduced → full, update fields, then re-impose BCs
-            dU_full = np.zeros(ndof)
-            dU_full[self.active_dofs] = dU_red
+            dU_full = self.restrictor.expand_vec(dU_red)
             dh.add_to_functions(dU_full, funcs)
 
             # Re-impose the (possibly inhomogeneous) Dirichlet values AFTER the update
@@ -698,8 +744,7 @@ class NewtonSolver:
         for _ in range(np_.ls_max_iter):
             # Trial update: expand to full, apply, and re-impose BCs
             for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
-            dU_full = np.zeros(dh.total_dofs)
-            dU_full[self.active_dofs] = alpha * S_red
+            dU_full = self.restrictor.expand_vec(alpha * S_red)
             dh.add_to_functions(dU_full, funcs)
             dh.apply_bcs(bcs_now, *funcs)
 
@@ -732,6 +777,8 @@ class NewtonSolver:
     #  Reduced Linear system & BC handling
     # ------------------------------------------------------------------
     def _assemble_system_reduced(self, coeffs, *, need_matrix: bool = True):
+        if getattr(self, "constraints", None) is not None:
+            return self._assemble_system_with_constraints(coeffs, need_matrix=need_matrix)
         self._maybe_refresh_deformation(coeffs)
         nred = len(self.active_dofs)
         if need_matrix:
@@ -750,10 +797,73 @@ class NewtonSolver:
                         np.add.at(R_red, rmap[m], Floc[e][m])
             return None, R_red
 
+    def _assemble_system_with_constraints(self, coeffs, *, need_matrix: bool = True):
+        """
+        Assemble in the full space and condense hanging nodes via Eᵀ A E / Eᵀ R.
+        """
+        A_full, R_full = self._assemble_system_raw(coeffs, need_matrix=True)
+        if need_matrix:
+            A_red, R_red = self.restrictor.reduce_system(
+                A_full, R_full, self.dh, self.bcs_homog if self.bcs_homog else self.bcs
+            )
+            return A_red, R_red
+        # Residual-only path: condense and select active entries
+        R_master = self.constraints.restrict_full(R_full)
+        bc_map = self.constraints.project_dirichlet(self.dh.get_dirichlet_data(self.bcs_homog or self.bcs))
+        if bc_map:
+            rows = np.fromiter(bc_map.keys(), dtype=int)
+            vals = np.fromiter(bc_map.values(), dtype=float)
+            R_master[rows] = vals
+        return None, R_master[self.active_dofs]
+
 
     # ------------------------------------------------------------------
     #  Linear system & BC handling        (REF‑ACTORED)
     # ------------------------------------------------------------------
+    def _assemble_system_raw(self, coeffs, *, need_matrix: bool = True):
+        """
+        Assemble full-space Jacobian and residual *without* applying Dirichlet BCs.
+        Used when hanging-node condensation is handled separately.
+        """
+        self._maybe_refresh_deformation(coeffs)
+        ndof = self.dh.total_dofs
+        A_glob = sp.lil_matrix((ndof, ndof)) if need_matrix else None
+        R_glob = np.zeros(ndof)
+
+        if need_matrix:
+            for ker in self.kernels_K:
+                Kloc, _, _ = ker.exec(coeffs)
+                _scatter_element_contribs(
+                    K_elem=Kloc,
+                    F_elem=None,
+                    J_elem=None,
+                    element_ids=ker.static_args["eids"],
+                    gdofs_map=ker.static_args["gdofs_map"],
+                    target=A_glob,
+                    ctx={"rhs": False, "add": True},
+                    integrand=ker,
+                    hook=None,
+                )
+            self._last_jacobian = A_glob
+
+        for ker in self.kernels_F:
+            _, Floc, _ = ker.exec(coeffs)
+            R_inc = np.zeros_like(R_glob)
+            _scatter_element_contribs(
+                K_elem=None,
+                F_elem=Floc,
+                J_elem=None,
+                element_ids=ker.static_args["eids"],
+                gdofs_map=ker.static_args["gdofs_map"],
+                target=R_inc,
+                ctx={"rhs": True, "add": True},
+                integrand=ker,
+                hook=None,
+            )
+            R_glob += R_inc
+
+        return (A_glob.tocsr() if need_matrix else None), R_glob
+
     def _assemble_system(self, coeffs, *, need_matrix: bool = True):
         """
         Assemble global Jacobian A (optional) and residual R.
@@ -958,6 +1068,16 @@ class NewtonSolver:
         - self._elem_pos  : per-kernel list of [ per-element 1D position arrays ]
         - self._elem_lidx : per-kernel list of [ per-element local active idx ]
         """
+
+        if getattr(self, "constraints", None) is not None:
+            # Constraint handling assembles in the full space and condenses;
+            # skip pattern building to avoid indexing physical DOF ids here.
+            self._csr_indptr = np.zeros(1, dtype=np.int32)
+            self._csr_indices = np.zeros(0, dtype=np.int32)
+            self._elem_pos = [[] for _ in self.kernels_K]
+            self._elem_lidx = [[] for _ in self.kernels_K]
+            self._pattern_stale = False
+            return
 
         if getattr(self, "_pattern_stale", True) is False and hasattr(self, "_csr_indptr"):
             return
@@ -1463,8 +1583,19 @@ class PetscSnesNewtonSolver(NewtonSolver):
             for fld in fields:
                 full_idx.extend(self.dh.get_field_slice(fld))
             full_idx = np.array(sorted(full_idx), dtype=int)
-            red_idx = self.full_to_red[full_idx]
-            red_idx = red_idx[red_idx >= 0]
+            if getattr(self, "constraints", None) is not None:
+                red_idx_list = []
+                for gd in full_idx:
+                    mcol = self.constraints.master_index_for(int(gd))
+                    if mcol is None:
+                        continue
+                    ridx = self.full_to_red[mcol]
+                    if ridx >= 0:
+                        red_idx_list.append(int(ridx))
+                red_idx = np.array(sorted(set(red_idx_list)), dtype=int)
+            else:
+                red_idx = self.full_to_red[full_idx]
+                red_idx = red_idx[red_idx >= 0]
             iset = PETSc.IS().createGeneral(red_idx.astype(PETSc.IntType))
             blocks.append((name, iset))
 
@@ -1598,19 +1729,27 @@ if HAS_GIANT:
         def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
 
             dh      = self.dh
-            n_total = dh.total_dofs
+            n_total_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
+            n_phys = getattr(self.restrictor, "phys_size", dh.total_dofs)
             active  = self.active_dofs         # free dofs (length n_free)
             n_free  = active.size
 
             # 1) pack the CURRENT iterate into a reduced vector x_red
             def _pack_reduced():
                 x_full = np.hstack([f.nodal_values for f in funcs])
+                if getattr(self, "constraints", None) is not None:
+                    x_master = self.constraints.restrict_full(x_full)
+                    return x_master[active].copy()
                 return x_full[active].copy()
 
             def _unpack_into_funcs(x_red):
                 # expand reduced → full, add to fields, re-apply BCs
-                dU_full = np.zeros(n_total)
-                dU_full[active] = x_red - _pack_reduced()  # delta on free dofs
+                delta_red = x_red - _pack_reduced()  # delta on free dofs
+                if getattr(self, "constraints", None) is not None:
+                    dU_full = self.restrictor.expand_vec(delta_red)
+                else:
+                    dU_full = np.zeros(n_phys)
+                    dU_full[active] = delta_red
                 dh.add_to_functions(dU_full, funcs)
                 dh.apply_bcs(bcs_now, *funcs)
 

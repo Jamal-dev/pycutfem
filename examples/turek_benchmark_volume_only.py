@@ -88,7 +88,15 @@ def _configure_numba():
 # --------------------------------------------------------------------------- #
 #                              Mesh generation
 # --------------------------------------------------------------------------- #
-def build_turek_channel_mesh(path: Path, mesh_size: float, cell_type: str = "tri", view_mesh: bool = False, mesh_order: int | None = None) -> None:
+def build_turek_channel_mesh(
+    path: Path,
+    mesh_size: float,
+    cell_type: str = "tri",
+    view_mesh: bool = False,
+    mesh_order: int | None = None,
+    refine_hmin: float | None = None,
+    refine_band_radius: float | None = None,
+) -> None:
     """
     Build the Turek benchmark mesh with an O-grid type block structure.
     The mesh is written to ``path``.
@@ -353,6 +361,26 @@ def build_turek_channel_mesh(path: Path, mesh_size: float, cell_type: str = "tri
         gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 1)
         gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size)
         gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
+
+        # Optional: graded refinement towards the cylinder using a Distance/Threshold field
+        if refine_hmin is not None and refine_hmin > 0.0:
+            hmin = float(refine_hmin)
+            hmax = float(mesh_size)
+            band = float(refine_band_radius or max(2.0 * mesh_size, 0.1))
+            cyl_curves = boundary_edges.get("cylinder", [])
+            if cyl_curves:
+                dist_id = gmsh.model.mesh.field.add("Distance")
+                gmsh.model.mesh.field.setNumbers(dist_id, "CurvesList", cyl_curves)
+                gmsh.model.mesh.field.setNumber(dist_id, "Sampling", 100)
+                thr_id = gmsh.model.mesh.field.add("Threshold")
+                gmsh.model.mesh.field.setNumber(thr_id, "InField", dist_id)
+                gmsh.model.mesh.field.setNumber(thr_id, "SizeMin", hmin)
+                gmsh.model.mesh.field.setNumber(thr_id, "SizeMax", hmax)
+                gmsh.model.mesh.field.setNumber(thr_id, "DistMin", 0.0)
+                gmsh.model.mesh.field.setNumber(thr_id, "DistMax", band)
+                gmsh.model.mesh.field.setAsBackgroundMesh(thr_id)
+                print(f"Applying cylinder refinement: hmin={hmin}, band={band}")
+
         gmsh.model.mesh.generate(2)
         # Keep the geometric order consistent with the FE order unless explicitly overridden.
         gmsh.model.mesh.setOrder(int(mesh_order) if mesh_order is not None else FE_ORDER)
@@ -369,7 +397,15 @@ def build_turek_channel_mesh(path: Path, mesh_size: float, cell_type: str = "tri
         gmsh.finalize()
 
 
-def prepare_mesh(mesh_file: Path | None, mesh_size: float, rebuild: bool, cell_type: str, view_mesh: bool) -> tuple:
+def prepare_mesh(
+    mesh_file: Path | None,
+    mesh_size: float,
+    rebuild: bool,
+    cell_type: str,
+    view_mesh: bool,
+    refine_hmin: float | None = None,
+    refine_band_radius: float | None = None,
+) -> tuple:
     """
     Generate (if needed) and load the Gmsh mesh.
     Returns the in-memory :class:`Mesh` and the path to the mesh file (if kept).
@@ -380,7 +416,14 @@ def prepare_mesh(mesh_file: Path | None, mesh_size: float, rebuild: bool, cell_t
         mesh_file = mesh_file.expanduser().resolve()
         if rebuild or not mesh_file.exists():
             print(f"Generating Gmsh mesh at {mesh_file} (h={mesh_size}, cell_type={cell_type})")
-            build_turek_channel_mesh(mesh_file, mesh_size, cell_type, view_mesh=view_mesh)
+            build_turek_channel_mesh(
+                mesh_file,
+                mesh_size,
+                cell_type,
+                view_mesh=view_mesh,
+                refine_hmin=refine_hmin,
+                refine_band_radius=refine_band_radius,
+            )
         else:
             print(f"Reusing existing mesh at {mesh_file}")
         if view_mesh and mesh_file.exists():
@@ -397,7 +440,14 @@ def prepare_mesh(mesh_file: Path | None, mesh_size: float, rebuild: bool, cell_t
     with TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir) / "turek_channel.msh"
         print(f"Generating temporary Gmsh mesh (h={mesh_size}, cell_type={cell_type})")
-        build_turek_channel_mesh(tmp_path, mesh_size, cell_type, view_mesh=view_mesh)
+        build_turek_channel_mesh(
+            tmp_path,
+            mesh_size,
+            cell_type,
+            view_mesh=view_mesh,
+            refine_hmin=refine_hmin,
+            refine_band_radius=refine_band_radius,
+        )
         mesh = mesh_from_gmsh(tmp_path)
     # tmpdir is cleaned up here; mesh lives on in memory
     return mesh, None
@@ -544,7 +594,15 @@ def generate_mesh(args):
             raise ValueError("The structured mesh backend only supports quadrilateral elements.")
         mesh = build_structured_channel_mesh(args.mesh_size, poly_order=geometric_order)
         return mesh, None
-    return prepare_mesh(args.mesh_file, args.mesh_size, args.rebuild_mesh, args.mesh_type, args.view_gmsh)
+    return prepare_mesh(
+        args.mesh_file,
+        args.mesh_size,
+        args.rebuild_mesh,
+        args.mesh_type,
+        args.view_gmsh,
+        refine_hmin=args.refine_hmin,
+        refine_band_radius=args.refine_band_radius,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -671,6 +729,10 @@ def main() -> None:
     parser.add_argument("--mesh-file", type=Path, help="Optional path to reuse/store the .msh file (gmsh backend).")
     parser.add_argument("--rebuild-mesh", action="store_true", help="Force rebuilding the gmsh mesh.")
     parser.add_argument("--view-gmsh", action="store_true", help="Preview the generated gmsh mesh.")
+    parser.add_argument("--refine-hmin", type=float, default=None,
+                        help="Target element size near the cylinder (gmsh background field; defaults to 0.5*mesh-size).")
+    parser.add_argument("--refine-band-radius", type=float, default=None,
+                        help="Distance from the cylinder within which --refine-hmin is enforced (gmsh backend).")
     parser.add_argument("--dt", type=float, default=0.1, help="Time step size.")
     parser.add_argument("--theta", type=float, default=0.5, help="Theta parameter for the time-stepping scheme.")
     parser.add_argument("--max-steps", type=int, default=36, help="Maximum number of time steps.")
@@ -700,6 +762,10 @@ def main() -> None:
         help="Only build the mesh, report det(J) statistics, and exit.",
     )
     args = parser.parse_args()
+    if args.refine_hmin is None and args.mesh_backend == "gmsh":
+        args.refine_hmin = 0.5 * args.mesh_size
+    if args.refine_band_radius is None and args.mesh_backend == "gmsh":
+        args.refine_band_radius = 0.2
 
     _configure_numba()
 

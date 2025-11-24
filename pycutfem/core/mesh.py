@@ -1,6 +1,6 @@
 import numpy as np
 from dataclasses import dataclass
-from typing import Tuple, List, Dict, Optional, Callable, Union
+from typing import Tuple, List, Dict, Optional, Callable, Union, Iterable
 
 
 from pycutfem.core.topology import Edge, Node, Element
@@ -69,10 +69,12 @@ class Mesh:
     def _build_topology(self):
         """
         Builds the full mesh topology: Elements, Edges, and Neighbors.
+        Respects a provided ``edges_connectivity`` if available; otherwise
+        infers edges from the polygonal corner connectivity.
         """
         edge_defs = self._EDGE_TABLE[self.element_type]
 
-        # Step 1: Create basic Element objects
+        # Step 1: Create Element objects
         for eid, elem_nodes in enumerate(self.elements_connectivity):
             centroid_x = np.mean([self.nodes_x_y_pos[nid,0] for nid in self.corner_connectivity[eid]])
             centroid_y = np.mean([self.nodes_x_y_pos[nid,1] for nid in self.corner_connectivity[eid]])
@@ -87,20 +89,14 @@ class Mesh:
                 centroid_y=centroid_y,
             ))
 
-        # Step 2: Build map from each edge to the elements that share it
-        edge_incidences: Dict[Tuple[int, int], List[int]] = {}
-        for eid, corners in enumerate(self.corner_connectivity):
-            for i in range(len(corners)):
-                c1, c2 = int(corners[i]), int(corners[(i + 1) % len(corners)])
-                key = tuple(sorted((c1, c2)))
-                edge_incidences.setdefault(key, []).append(eid)
+        elem_node_sets = [set(el.nodes) for el in self.elements_list]
 
-        def _locate_all_nodes_in_edge(vA: int, vB: int) -> Tuple[int, int]:
+        def _locate_all_nodes_in_edge(vA: int, vB: int) -> Tuple[int, ...]:
             x0, y0 = self.nodes_x_y_pos[vA]
             x1, y1 = self.nodes_x_y_pos[vB]
             dx, dy = x1 - x0, y1 - y0
             L2 = dx*dx + dy*dy
-            tol = SIDE.tol * np.sqrt(L2)
+            tol = SIDE.tol * np.sqrt(max(L2, 0.0))
 
             ids = []
             for nd in self.nodes_list:
@@ -113,64 +109,175 @@ class Mesh:
             # sort along the edge for reproducibility
             ids.sort(key=lambda nid: (self.nodes_x_y_pos[nid,0]-x0)*dx + (self.nodes_x_y_pos[nid,1]-y0)*dy)
             return tuple(ids)
-        # Step 3: Create unique Edge objects
-        for edge_gid, ((n_min, n_max), shared_eids) in enumerate(edge_incidences.items()):
-            left_eid = shared_eids[0]
-            vA, vB = -1, -1
-            left_elem_corners = self.corner_connectivity[left_eid]
-            local_edge_idx = None
-            for i in range(len(left_elem_corners)):
-                a = int(left_elem_corners[i]); b = int(left_elem_corners[(i + 1) % len(left_elem_corners)])
-                if {a, b} == {n_min, n_max}:
-                    vA, vB = a, b
-                    local_edge_idx = i  # 0..3 for quads
-                    break
-            right_eid = shared_eids[1] if len(shared_eids) > 1 else None
-            normal_vec = self._compute_normal((vA, vB))
-            # Collect all nodes lying on this geometric edge in O(p) using the
-            # left element's local connectivity when possible (quad, p>=1).
-            all_edge_nodes: Tuple[int, ...]
-            if (self.element_type == 'quad') and (local_edge_idx is not None):
-                # Local node layout is row-major with (p+1) nodes per row/col
-                p = int(self.poly_order)
-                n1 = p + 1
-                loc_nodes = list(self.elements_list[left_eid].nodes)
-                # Build local-index sequence for the chosen edge in the correct orientation
-                if local_edge_idx == 0:      # bottom: (0,0) -> (p,0)
-                    idxs = [k for k in range(0, n1)]
-                    oriented = (vA == left_elem_corners[0] and vB == left_elem_corners[1])
-                elif local_edge_idx == 1:    # right : (p,0) -> (p,p)
-                    idxs = [k*n1 + (n1-1) for k in range(0, n1)]
-                    oriented = (vA == left_elem_corners[1] and vB == left_elem_corners[2])
-                elif local_edge_idx == 2:    # top   : (p,p) -> (0,p)
-                    idxs = [p*n1 + k for k in range(0, n1)]
-                    oriented = (vA == left_elem_corners[2] and vB == left_elem_corners[3])
-                else:                         # left  : (0,p) -> (0,0)
-                    idxs = [k*n1 for k in range(0, n1)]
-                    oriented = (vA == left_elem_corners[3] and vB == left_elem_corners[0])
-                if not oriented:
-                    idxs = list(reversed(idxs))
-                all_edge_nodes = tuple(int(loc_nodes[ii]) for ii in idxs)
-            else:
-                # Fallback to geometric scan (rare/unstructured)
-                all_edge_nodes = _locate_all_nodes_in_edge(vA, vB)
-            edge_obj = Edge(gid=edge_gid, nodes=(vA, vB), left=left_eid, right=right_eid, normal=normal_vec, all_nodes=all_edge_nodes)
-            self.edges_list.append(edge_obj)
-            self._edge_dict[(n_min, n_max)] = edge_obj
-            if right_eid is not None:
-                self._neighbors[left_eid].append(right_eid)
-                self._neighbors[right_eid].append(left_eid)
 
-        # Step 4: Populate each Element's list of its edge GIDs
-        for elem in self.elements_list:
-            local_edge_gids = [self._edge_dict[tuple(sorted((elem.corner_nodes[c1], elem.corner_nodes[c2])))].gid for c1, c2 in edge_defs]
-            elem.edges = tuple(local_edge_gids)
-        
-        # Step 5: Populate neighbor info on each element
-        for elem in self.elements_list:
-            for local_edge_idx, edge_gid in enumerate(elem.edges):
-                edge = self.edge(edge_gid)
-                elem.neighbors[local_edge_idx] = edge.right if edge.left == elem.id else edge.left
+        def _sort_along_edge(n_start: int, n_end: int, nodes: Iterable[int]) -> List[int]:
+            x0, y0 = self.nodes_x_y_pos[n_start]
+            x1, y1 = self.nodes_x_y_pos[n_end]
+            dx, dy = x1 - x0, y1 - y0
+            if abs(dx) + abs(dy) < 1e-30:
+                return sorted(nodes)
+            return sorted(
+                [int(n) for n in nodes],
+                key=lambda nid: (self.nodes_x_y_pos[nid,0]-x0)*dx + (self.nodes_x_y_pos[nid,1]-y0)*dy,
+            )
+
+        # Step 2: Build edges
+        if self.edges_connectivity is not None:
+            # Existing explicit edges path – keep behaviour, but populate new metadata.
+            provided_edges = [list(map(int, e)) for e in np.asarray(self.edges_connectivity)]
+            elem_edge_map: Dict[Tuple[int, int], List[Tuple[int, int, Tuple[int, int]]]] = {}
+            for eid, corners in enumerate(self.corner_connectivity):
+                for lid, (i0, i1) in enumerate(edge_defs):
+                    a = int(corners[i0]); b = int(corners[i1])
+                    key = tuple(sorted((a, b)))
+                    elem_edge_map.setdefault(key, []).append((eid, lid, (a, b)))
+
+            elem_edges: List[List[List[int]]] = [[[] for _ in edge_defs] for _ in self.elements_list]
+            for edge_gid, edge_nodes in enumerate(provided_edges):
+                coords = self.nodes_x_y_pos[edge_nodes]
+                span_x = float(np.ptp(coords[:, 0]))
+                span_y = float(np.ptp(coords[:, 1]))
+                if span_x >= span_y:
+                    order = np.argsort(coords[:, 0] + 1e-12 * coords[:, 1])
+                else:
+                    order = np.argsort(coords[:, 1] + 1e-12 * coords[:, 0])
+                ordered_nodes = [edge_nodes[i] for i in order]
+                n_start, n_end = int(ordered_nodes[0]), int(ordered_nodes[-1])
+                # Enrich with any intermediate (hanging) nodes that lie on the geometric edge
+                geom_nodes = _locate_all_nodes_in_edge(n_start, n_end)
+                geom_set = set(geom_nodes)
+                for nd in ordered_nodes:
+                    if nd not in geom_set:
+                        geom_nodes = tuple(list(geom_nodes) + [nd])
+                        geom_set.add(nd)
+                key = tuple(sorted((n_start, n_end)))
+                incidences = elem_edge_map.get(key, [])
+                if not incidences:
+                    left_eid = None
+                    right_eid = None
+                    normal_vec = np.array([0.0, 0.0])
+                    left_lid = None
+                    right_lid = None
+                else:
+                    left_eid, left_lid, oriented = incidences[0]
+                    right_eid = incidences[1][0] if len(incidences) > 1 else None
+                    right_lid = incidences[1][1] if len(incidences) > 1 else None
+                    vA, vB = oriented
+                    normal_vec = self._compute_normal((vA, vB))
+                    if right_eid is not None:
+                        self._neighbors[left_eid].append(right_eid)
+                        self._neighbors[right_eid].append(left_eid)
+                        elem_edges[right_eid][right_lid].append(edge_gid)
+                edge_obj = Edge(
+                    gid=edge_gid,
+                    nodes=(n_start, n_end),
+                    left=left_eid,
+                    right=right_eid,
+                    normal=normal_vec,
+                    all_nodes=tuple(geom_nodes),
+                    lid=left_lid,
+                    right_lid=right_lid,
+                    left_nodes=tuple(n for n in geom_nodes if left_eid is not None and n in elem_node_sets[left_eid]),
+                    right_nodes=tuple(n for n in geom_nodes if right_eid is not None and n in elem_node_sets[right_eid]),
+                )
+                self.edges_list.append(edge_obj)
+                self._edge_dict[key] = edge_obj
+                if left_eid is not None and left_lid is not None:
+                    elem_edges[left_eid][left_lid].append(edge_gid)
+
+        else:
+            # Infer edges and allow multiple sub-edges per geometric side (hanging nodes).
+            # 1) Collect all nodes along every element side (includes hanging nodes from neighbours)
+            side_nodes: List[List[List[int]]] = []
+            for corners in self.corner_connectivity:
+                per_side: List[List[int]] = []
+                for i0, i1 in edge_defs:
+                    per_side.append(list(_locate_all_nodes_in_edge(int(corners[i0]), int(corners[i1]))))
+                side_nodes.append(per_side)
+
+            # 2) Build a segment map keyed by consecutive node pairs along a side.
+            segment_map: Dict[Tuple[int, int], List[Dict[str, Union[int, Tuple[int, ...]]]]] = {}
+            for eid, per_side in enumerate(side_nodes):
+                for lid, seq in enumerate(per_side):
+                    for a, b in zip(seq[:-1], seq[1:]):
+                        key = (min(int(a), int(b)), max(int(a), int(b)))
+                        segment_map.setdefault(key, []).append(
+                            {
+                                "eid": eid,
+                                "lid": lid,
+                                "start": int(a),
+                                "end": int(b),
+                                "nodes_full": tuple(seq),
+                            }
+                        )
+
+            elem_edges: List[List[List[int]]] = [[[] for _ in edge_defs] for _ in self.elements_list]
+
+            for edge_gid, (key, owners) in enumerate(segment_map.items()):
+                left_owner = owners[0]
+                right_owner = owners[1] if len(owners) > 1 else None
+                n_start, n_end = left_owner["start"], left_owner["end"]
+                normal_vec = self._compute_normal((n_start, n_end))
+
+                union_nodes = set()
+                for ow in owners:
+                    union_nodes.update(ow["nodes_full"])
+                all_nodes_sorted = tuple(_sort_along_edge(n_start, n_end, union_nodes))
+
+                left_nodes = tuple(n for n in left_owner["nodes_full"] if n in elem_node_sets[left_owner["eid"]])
+                right_nodes: Tuple[int, ...] = tuple()
+                right_lid = None
+                right_eid = None
+                if right_owner is not None:
+                    right_eid = int(right_owner["eid"])
+                    right_nodes = tuple(n for n in right_owner["nodes_full"] if n in elem_node_sets[right_eid])
+                    right_lid = int(right_owner["lid"])
+                    self._neighbors[left_owner["eid"]].append(right_eid)
+                    self._neighbors[right_eid].append(left_owner["eid"])
+
+                edge_obj = Edge(
+                    gid=edge_gid,
+                    nodes=(n_start, n_end),
+                    left=int(left_owner["eid"]),
+                    right=right_eid,
+                    normal=normal_vec,
+                    all_nodes=all_nodes_sorted,
+                    lid=int(left_owner["lid"]),
+                    right_lid=right_lid,
+                    left_nodes=left_nodes,
+                    right_nodes=right_nodes,
+                )
+                self.edges_list.append(edge_obj)
+                self._edge_dict[tuple(sorted((n_start, n_end)))] = edge_obj
+
+                elem_edges[int(left_owner["eid"])][int(left_owner["lid"])].append(edge_gid)
+                if right_owner is not None:
+                    elem_edges[right_eid][right_lid].append(edge_gid)
+
+        # Step 4: Populate per-element edge lists and neighbor info
+        for eid, elem in enumerate(self.elements_list):
+            if self.edges_connectivity is not None:
+                side_lists = elem_edges[eid]
+            else:
+                side_lists = elem_edges[eid]
+            elem.edges_by_side = tuple(tuple(lst) for lst in side_lists)
+            elem.edge_gid_to_local = {gid: lid for lid, lst in enumerate(side_lists) for gid in lst}
+            # Backward-compatibility: store the first edge per side
+            elem.edges = tuple(lst[0] if lst else -1 for lst in side_lists)
+            # Neighbour mapping (first neighbour if multiple)
+            elem.neighbors = {}
+            for lid, lst in enumerate(side_lists):
+                nb = None
+                for gid in lst:
+                    eobj = self.edges_list[gid]
+                    other = eobj.right if eobj.left == eid else eobj.left
+                    if other is not None:
+                        nb = other
+                        break
+                elem.neighbors[lid] = nb
+            # Deduplicate neighbours list
+            if self._neighbors[eid]:
+                self._neighbors[eid] = list(dict.fromkeys(self._neighbors[eid]))
 
     def _compute_normal(self, directed_edge_nodes: Tuple[int, int]) -> np.ndarray:
         """Computes an outward-pointing unit normal for a directed edge."""

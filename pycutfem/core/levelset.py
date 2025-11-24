@@ -75,12 +75,16 @@ class BeamLevelSet(LevelSetFunction):
                             float(self.hx), float(self.hy))
 
     def __call__(self, x):
+        """
+        Signed distance in the L∞-sense.
+        Supports both shape (2,) and (..., 2) inputs.
+        """
         x = np.asarray(x, float)
-        dx = (x[0] - self.cx) / self.hx
-        dy = (x[1] - self.cy) / self.hy
-        ax = abs(dx)
-        ay = abs(dy)
-        m  = max(ax, ay)
+        dx = (x[..., 0] - self.cx) / self.hx
+        dy = (x[..., 1] - self.cy) / self.hy
+        ax = np.abs(dx)
+        ay = np.abs(dy)
+        m = np.maximum(ax, ay)
         return m - 1.0        # <0 inside
 
     def gradient(self, x):
@@ -89,23 +93,20 @@ class BeamLevelSet(LevelSetFunction):
         Norm is ~1/h on that face; we normalise to a unit normal.
         """
         x = np.asarray(x, float)
-        dx = (x[0] - self.cx) / self.hx
-        dy = (x[1] - self.cy) / self.hy
-        ax = abs(dx)
-        ay = abs(dy)
+        dx = (x[..., 0] - self.cx) / self.hx
+        dy = (x[..., 1] - self.cy) / self.hy
+        ax = np.abs(dx)
+        ay = np.abs(dy)
 
-        if ax > ay:         # left/right faces dominate
-            gx = np.sign(dx) / self.hx
-            gy = 0.0
-        else:               # top/bottom faces dominate
-            gx = 0.0
-            gy = np.sign(dy) / self.hy
+        # Broadcast-friendly normal selection
+        prefer_x = ax > ay
+        gx = np.where(prefer_x, np.sign(dx) / self.hx, 0.0)
+        gy = np.where(prefer_x, 0.0, np.sign(dy) / self.hy)
 
-        g = np.array([gx, gy], float)
-        nrm = np.linalg.norm(g)
-        if nrm == 0.0:
-            return np.array([0.0, 0.0])
-        return g / nrm
+        g = np.stack((gx, gy), axis=-1)
+        nrm = np.linalg.norm(g, axis=-1, keepdims=True)
+        nrm_safe = np.where(nrm == 0.0, 1.0, nrm)
+        return g / nrm_safe
 
 class CompositeLevelSet(LevelSetFunction):
     """Hold several independent level‑set functions.

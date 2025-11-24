@@ -17,7 +17,7 @@ _ELEM_FILL = {
     "inside": (0.4, 0.6, 1.0, 0.7),
     "outside": (1.0, 0.8, 0.4, 0.7),
     "cut": (1.0, 0.55, 0.0, 0.7),
-    "default": (0.9, 0.9, 0.9, 0.5)
+    "default": (0.75, 0.85, 1.0, 0.55),  # light, but visible against white background
 }
 _EDGE_COLOR = {
     "boundary": "black",
@@ -35,9 +35,8 @@ def _edge_col(tag):
 
 def _elem_fill(tag):
     # If tag is not in _ELEM_FILL, use the default color.
-    # If tag is None or empty string, no fill will be used.
     if not tag:
-        return 'none'
+        return _ELEM_FILL["default"]
     return _ELEM_FILL.get(tag, _ELEM_FILL["default"])
 
 # --- Refactored and Generalized plot_mesh Function ---
@@ -219,7 +218,7 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
 
         for color, polys_list in polys_by_color.items():
             poly_collection = PolyCollection(polys_list, facecolors=color,
-                                             edgecolors='black', lw=0.5, zorder=1)
+                                             edgecolors='black', lw=0.8, zorder=1)
             ax.add_collection(poly_collection)
 
         for tag in sorted(list(unique_elem_tags)):
@@ -242,9 +241,19 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
             indices = np.flatnonzero(combined_mask)
             edges_to_draw = [mesh.edges_list[i] for i in indices]
 
-        # 2. Build segments and colors using the (potentially filtered) list
-        edge_segments = [node_coords[list(edge.nodes)] for edge in edges_to_draw]
-        colors = [_EDGE_COLOR.get(edge.tag, 'black') if edge.right is not None else _EDGE_COLOR.get('boundary', 'black') for edge in edges_to_draw]
+        # 2. Build segments and colors using the (potentially filtered) list.
+        #    If an edge carries intermediate nodes (hanging-edge subdivision),
+        #    draw each sub-segment so the nonconforming interface is visible.
+        edge_segments = []
+        colors = []
+        for edge in edges_to_draw:
+            nids = list(edge.all_nodes) if getattr(edge, "all_nodes", ()) else list(edge.nodes)
+            if len(nids) < 2:
+                continue
+            pts = node_coords[nids]
+            for i in range(len(nids) - 1):
+                edge_segments.append(pts[i : i + 2])
+                colors.append(_EDGE_COLOR.get(edge.tag, 'black') if edge.right is not None else _EDGE_COLOR.get('boundary', 'black'))
         line_collection = LineCollection(edge_segments, colors=colors, linewidths=1.2, zorder=2)
         ax.add_collection(line_collection)
 
@@ -328,13 +337,21 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
             lc = LineCollection(segments, colors='magenta', linewidths=3.5, zorder=6, label='Interface Segment')
             ax.add_collection(lc)
             legend_handles.append(lc)
-        if all_pts:
-            all_pts_np = np.array(all_pts)
-            ax.plot(all_pts_np[:, 0], all_pts_np[:, 1], 'o', color='cyan', markersize=9,
-                    markeredgecolor='black', zorder=7)
-            legend_handles.append(plt.Line2D([0], [0], marker='o', color='w',
-                                             markerfacecolor='cyan', markeredgecolor='black',
-                                             markersize=9, linestyle='None', label='Interface Point'))
+            if all_pts:
+                all_pts_np = np.array(all_pts)
+                ax.plot(all_pts_np[:, 0], all_pts_np[:, 1], 'o', color='cyan', markersize=9,
+                        markeredgecolor='black', zorder=7)
+                legend_handles.append(plt.Line2D([0], [0], marker='o', color='w',
+                                                 markerfacecolor='cyan', markeredgecolor='black',
+                                                 markersize=9, linestyle='None', label='Interface Point'))
+
+    # Ensure plot limits follow the drawn data (important when coordinates are not in [0,1]).
+    xmin, ymin = node_coords.min(axis=0)
+    xmax, ymax = node_coords.max(axis=0)
+    span = max(xmax - xmin, ymax - ymin, 1e-12)
+    pad = 0.05 * span
+    ax.set_xlim(float(xmin - pad), float(xmax + pad))
+    ax.set_ylim(float(ymin - pad), float(ymax + pad))
 
     ax.set_aspect('equal', 'box')
     ax.set_title("Mesh Visualization with Domain Tags")

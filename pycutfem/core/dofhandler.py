@@ -6,6 +6,7 @@ from __future__ import annotations
 import numpy as np
 from typing import Dict, List, Set, Tuple, Callable, Mapping, Iterable, Union, Any, Sequence
 import math
+import scipy.sparse as sp
 
 # Assume these are available in the project structure
 from pycutfem.fem.mixedelement import MixedElement
@@ -42,6 +43,74 @@ _jacobian_cache: dict[tuple, dict] = {}
 _volume_geom_cache: dict[tuple, dict] = {}
 # NEW: cut-volume cache (per subset, qdeg, side, derivs, level-set, mixed element)
 _cut_volume_cache: dict[tuple, dict] = {}
+
+
+class LinearConstraints:
+    """
+    Thin wrapper around a linear constraint matrix ``E`` such that
+    full DOFs = E @ master_dofs.  Used to eliminate hanging nodes.
+    """
+
+    def __init__(self, E: sp.csr_matrix, master_ids: Sequence[int], slave_to_master: Dict[int, List[Tuple[int, float]]]):
+        self.E = E.tocsr()
+        self.E_T = self.E.transpose().tocsr()
+        self.master_ids = np.asarray(master_ids, dtype=int)
+        self.slave_to_master = {int(k): [(int(m), float(w)) for (m, w) in v] for k, v in slave_to_master.items()}
+        self._master_index = {int(gd): i for i, gd in enumerate(self.master_ids)}
+
+    @property
+    def n_master(self) -> int:
+        return int(self.E.shape[1])
+
+    @property
+    def slaves(self) -> np.ndarray:
+        return np.asarray(sorted(self.slave_to_master.keys()), dtype=int)
+
+    def master_index_for(self, gdof: int) -> int | None:
+        return self._master_index.get(int(gdof))
+
+    def prolong(self, u_red: np.ndarray) -> np.ndarray:
+        """Map reduced/master DOFs to the full DOF vector (includes slaves)."""
+        return self.E @ np.asarray(u_red, dtype=float)
+
+    def restrict_full(self, v_full: np.ndarray) -> np.ndarray:
+        """Project a full vector (with slaves) to the master space."""
+        return self.E_T @ np.asarray(v_full, dtype=float)
+
+    def to_master_set(self, full_ids: Iterable[int]) -> set[int]:
+        """
+        Map a set of full DOF ids (masters or slaves) to the set of master
+        column indices that govern them.
+        """
+        out: set[int] = set()
+        for gd in full_ids:
+            col = self._master_index.get(int(gd))
+            if col is not None:
+                out.add(col)
+                continue
+            # slave: include all masters that define it
+            for m_id, _ in self.slave_to_master.get(int(gd), []):
+                mcol = self._master_index.get(int(m_id))
+                if mcol is not None:
+                    out.add(mcol)
+        return out
+
+    def project_dirichlet(self, bc_data: Mapping[int, float]) -> Dict[int, float]:
+        """
+        Convert {full_dof -> value} into {master_index -> value}.
+        Dirichlet data on slaves is not directly supported; these entries
+        are skipped with a warning.
+        """
+        out: Dict[int, float] = {}
+        for dof, val in bc_data.items():
+            col = self._master_index.get(int(dof))
+            if col is not None:
+                out[col] = float(val)
+            elif int(dof) in self.slave_to_master:
+                # Hanging nodes should stay constrained by their masters.
+                # If a BC hits a slave, we skip it to avoid overconstraining.
+                print(f"[hanging] Dirichlet BC on slave DOF {dof} is ignored; apply it to masters instead.")
+        return out
 
 def clear_caches() -> None:
     """
@@ -1527,6 +1596,195 @@ class DofHandler:
                     self._dof_to_node_map[int(gd)] = (f, int(nid))
                 else:
                     self._dof_to_node_map[int(gd)] = (f, None)
+
+    # ------------------------------------------------------------------
+    #  Hanging-node constraints (CG only)
+    # ------------------------------------------------------------------
+    def build_hanging_node_constraints(self, tol: float = 1e-12) -> LinearConstraints | None:
+        """
+        Detect hanging nodes on interior edges and build the constraint matrix E
+        such that ``u_full = E @ u_master``.  Only available for CG spaces.
+        """
+        if getattr(self, "_dg_mode", False):
+            self._hanging_constraints = None
+            return None
+        if getattr(self, "_hanging_constraints", None) is not None:
+            return self._hanging_constraints
+        if self.mixed_element is None:
+            self._hanging_constraints = None
+            return None
+
+        self._ensure_node_maps(tol=tol)
+        mesh = self.mixed_element.mesh
+        nodes_xy = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+        elem_node_sets = [set(el.nodes) for el in mesh.elements_list]
+
+        def _lagrange_weights_1d(s_nodes: List[float], s_eval: float) -> List[float]:
+            n = len(s_nodes)
+            w = [1.0] * n
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    denom = s_nodes[i] - s_nodes[j]
+                    if abs(denom) < 1e-30:
+                        raise ZeroDivisionError("Degenerate node positions for Lagrange weights.")
+                    w[i] *= (s_eval - s_nodes[j]) / denom
+            return w
+
+        def _direction_from_nodes(node_ids: Iterable[int]) -> Tuple[np.ndarray, np.ndarray]:
+            """Pick a robust direction vector using the widest coordinate spread."""
+            ids_list = list(node_ids)
+            coords = nodes_xy[ids_list]
+            span_x = float(np.ptp(coords[:, 0]))
+            span_y = float(np.ptp(coords[:, 1]))
+            if span_x >= span_y:
+                i0 = int(np.argmin(coords[:, 0])); i1 = int(np.argmax(coords[:, 0]))
+            else:
+                i0 = int(np.argmin(coords[:, 1])); i1 = int(np.argmax(coords[:, 1]))
+            return coords[i0], coords[i1]
+
+        def _s_param(p0: np.ndarray, t: np.ndarray, nid: int) -> float:
+            t2 = float(np.dot(t, t))
+            if t2 <= 1e-30:
+                return 0.0
+            return float(np.dot(nodes_xy[int(nid)] - p0, t) / t2)
+
+        slave_to_master: Dict[int, List[Tuple[int, float]]] = {}
+
+        # Group edges by (left, right) pair to gather all subedges of a nonconforming face
+        pair_data: Dict[Tuple[int, int], Dict[str, set]] = {}
+        for edge in mesh.edges_list:
+            if edge.left is None or edge.right is None:
+                continue
+            pair = (int(edge.left), int(edge.right))
+            rec = pair_data.setdefault(pair, {"edges": [], "left_nodes": set(), "right_nodes": set(), "end_nodes": set()})
+            rec["edges"].append(edge)
+            rec["left_nodes"].update(getattr(edge, "left_nodes", ()))
+            rec["right_nodes"].update(getattr(edge, "right_nodes", ()))
+            rec["end_nodes"].update(edge.nodes)
+            rec["end_nodes"].update(getattr(edge, "all_nodes", ()))
+
+        for pair, rec in pair_data.items():
+            left_eid, right_eid = pair
+            # Use all nodes seen on the interface to define a parametric line
+            node_pool = rec["end_nodes"] | rec["left_nodes"] | rec["right_nodes"]
+            if len(node_pool) < 2:
+                continue
+            p0, p1 = _direction_from_nodes(node_pool)
+            t_vec = p1 - p0
+            if np.linalg.norm(t_vec) <= 1e-30:
+                continue
+
+            # Determine the parametric extent of the shared interface
+            s_endpoints = [_s_param(p0, t_vec, nid) for nid in rec["end_nodes"]]
+            s_min = min(s_endpoints) if s_endpoints else 0.0
+            s_max = max(s_endpoints) if s_endpoints else 1.0
+            if abs(s_max - s_min) < 1e-14:
+                s_min, s_max = 0.0, 1.0
+
+            def _collect(nodeset: set[int]) -> Dict[int, float]:
+                out: Dict[int, float] = {}
+                for nid in nodeset:
+                    s = _s_param(p0, t_vec, nid)
+                    if s < s_min - 1e-10 or s > s_max + 1e-10:
+                        continue
+                    out[int(nid)] = (s - s_min) / (s_max - s_min)
+                return out
+
+            left_nodes = _collect(rec["left_nodes"])
+            right_nodes = _collect(rec["right_nodes"])
+            if not left_nodes or not right_nodes:
+                continue
+
+            # Select coarse (masters) vs fine (slaves)
+            def _max_spacing(values: Iterable[float]) -> float:
+                arr = sorted(values)
+                if len(arr) < 2:
+                    return 1.0
+                return max(np.diff(arr))
+
+            if len(left_nodes) < len(right_nodes):
+                coarse_side = ("left", left_nodes, left_eid)
+                fine_side = ("right", right_nodes, right_eid)
+            elif len(right_nodes) < len(left_nodes):
+                coarse_side = ("right", right_nodes, right_eid)
+                fine_side = ("left", left_nodes, left_eid)
+            else:
+                if set(left_nodes.keys()) == set(right_nodes.keys()):
+                    continue
+                if _max_spacing(left_nodes.values()) >= _max_spacing(right_nodes.values()):
+                    coarse_side = ("left", left_nodes, left_eid)
+                    fine_side = ("right", right_nodes, right_eid)
+                else:
+                    coarse_side = ("right", right_nodes, right_eid)
+                    fine_side = ("left", left_nodes, left_eid)
+
+            _, coarse_map, _ = coarse_side
+            _, fine_map, _ = fine_side
+            coarse_sorted = sorted(coarse_map.items(), key=lambda kv: kv[1])
+            if len(coarse_sorted) < 2:
+                continue
+
+            coarse_nodes = [nid for nid, _ in coarse_sorted]
+            coarse_s = [val for _, val in coarse_sorted]
+
+            for slave_nid, s_slave in fine_map.items():
+                if slave_nid in coarse_map:
+                    continue
+                for fld in self.field_names:
+                    if fld in getattr(self.mixed_element, "_number_fields", set()):
+                        continue
+                    node2dof = self.dof_map.get(fld, {})
+                    slave_dof = node2dof.get(int(slave_nid))
+                    if slave_dof is None:
+                        continue
+                    if slave_dof in slave_to_master:
+                        continue
+                    master_dofs: List[Tuple[int, float]] = []
+                    weights = _lagrange_weights_1d(coarse_s, s_slave)
+                    for nid, w in zip(coarse_nodes, weights):
+                        gd = node2dof.get(int(nid))
+                        if gd is None:
+                            continue
+                        master_dofs.append((int(gd), float(w)))
+                    if len(master_dofs) < 2:
+                        continue
+                    slave_to_master[int(slave_dof)] = master_dofs
+
+        if not slave_to_master:
+            self._hanging_constraints = None
+            return None
+
+        ndof = self.total_dofs
+        slaves = set(slave_to_master.keys())
+        masters = [int(i) for i in range(ndof) if i not in slaves]
+        col_of_master = {gd: j for j, gd in enumerate(masters)}
+
+        rows: List[int] = []
+        cols: List[int] = []
+        data: List[float] = []
+
+        for m in masters:
+            rows.append(int(m))
+            cols.append(int(col_of_master[m]))
+            data.append(1.0)
+
+        for sdof, combo in slave_to_master.items():
+            for mdof, w in combo:
+                if mdof not in col_of_master:
+                    continue
+                rows.append(int(sdof))
+                cols.append(int(col_of_master[mdof]))
+                data.append(float(w))
+
+        E = sp.csr_matrix((data, (rows, cols)), shape=(ndof, len(masters)))
+        self._hanging_constraints = LinearConstraints(E, masters, slave_to_master)
+        print(
+            f"[hanging] Detected {len(slaves)} slave DOFs on {len(masters)} masters "
+            f"({len(slave_to_master)} constraints)."
+        )
+        return self._hanging_constraints
 
 
 
@@ -3464,7 +3722,7 @@ class DofHandler:
             edge_normals.append(e.normal.copy())
             elem = mesh.elements_list[eid]
             try:
-                local_edge_idx[i] = elem.edges.index(int(gid))
+                local_edge_idx[i] = elem.local_edge_index(int(gid))
             except ValueError:
                 raise RuntimeError(f"Edge {gid} not found in element {eid}")
             gdofs_map[i, :]  = self.get_elemental_dofs(eid)

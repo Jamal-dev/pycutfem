@@ -3505,7 +3505,7 @@ class FormCompiler:
             eid    = edge.left                      # the unique owner element
             elem = mesh.elements_list[eid]
             try:
-                local_edge_idx = elem.edges.index(int(gid))
+                local_edge_idx = elem.local_edge_index(int(gid))
             except ValueError:
                 continue
             ref_pts, ref_w = edge_rule(mesh.element_type, local_edge_idx, qdeg)

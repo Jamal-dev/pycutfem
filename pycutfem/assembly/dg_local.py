@@ -70,7 +70,7 @@ def face_laplace(mesh: 'Mesh', edge_id: int, *, alpha: float = 10.0, symmetry: i
     Fe = np.zeros(n_fld)
 
     try:
-        local_edge_idx = mesh.elements_list[eL].edges.index(edge_id)
+        local_edge_idx = mesh.elements_list[eL].local_edge_index(edge_id)
     except ValueError:
         raise RuntimeError(f"Edge {edge_id} not found in element {eL}'s edge list.")
 
