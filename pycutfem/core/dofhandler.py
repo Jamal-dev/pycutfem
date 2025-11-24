@@ -2619,7 +2619,7 @@ class DofHandler:
         mesh = self.mixed_element.mesh
         me   = self.mixed_element
         fields  = me.field_names
-        n_union = self.union_dofs
+        n_union_default = self.union_dofs
         n_loc   = me.n_dofs_per_elem
         out = {}
 
@@ -2628,30 +2628,6 @@ class DofHandler:
             ghost_ids = tuple(int(i) for i in ghost_edge_ids.to_indices())
         else:
             ghost_ids = tuple(int(i) for i in ghost_edge_ids)
-
-        # Cache key: use the subset tuple directly (stable & hashable)
-        derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
-
-        cache_key  = (
-            ghost_ids,
-            int(qdeg),
-            me.signature(),
-            derivs_key,
-            bool(need_hess),
-            bool(need_o3),
-            bool(need_o4),
-            self.method,
-            _ls_fingerprint(level_set),
-            _def_fingerprint(deformation),
-            _coords_fingerprint(mesh.nodes_x_y_pos),
-        )
-        global _ghost_cache
-        try:
-            _ghost_cache
-        except NameError:
-            _ghost_cache = {}
-        if reuse and cache_key in _ghost_cache:
-            return _ghost_cache[cache_key]
 
         # Keep only true interior ghosts: either neighbor cut or already tagged
         edges = []
@@ -2784,21 +2760,34 @@ class DofHandler:
                 phi_arr[i, q] = _eval_ls(pos_eid, qp_phys[i, q])
 
         # 3) Union GDofs and side maps ----------------------------------------------
-        gdofs_map = -np.ones((nE, n_union), dtype=np.int64)
-        pos_map   = -np.ones((nE, n_loc),   dtype=np.int32)
-        neg_map   = -np.ones((nE, n_loc),   dtype=np.int32)
+        # Compute the required union length (some mixed layouts with differing orders
+        # can exceed the analytic n_union_default).
+        max_union = n_union_default
+        union_lists = []
         for i, e in enumerate(edges):
             pos_eid = int(pos_ids[i])
             neg_eid = int(neg_ids[i])
             pos_dofs = self.get_elemental_dofs(pos_eid)
             neg_dofs = self.get_elemental_dofs(neg_eid)
             global_dofs = np.unique(np.concatenate((pos_dofs, neg_dofs)))
-            if global_dofs.size != n_union:
-                raise ValueError(f"union size mismatch on edge {e.gid}: {global_dofs.size} vs {n_union}")
-            gdofs_map[i, :n_union] = global_dofs
-            pos_map[i] = _searchsorted_positions(global_dofs, pos_dofs)
-            neg_map[i] = _searchsorted_positions(global_dofs, neg_dofs)
-        
+            union_lists.append(global_dofs)
+            max_union = max(max_union, global_dofs.size)
+
+        n_union = max_union
+        gdofs_map = np.empty((nE, n_union), dtype=np.int64)
+        pos_map   = -np.ones((nE, n_loc),   dtype=np.int32)
+        neg_map   = -np.ones((nE, n_loc),   dtype=np.int32)
+        for i, e in enumerate(edges):
+            global_dofs = union_lists[i]
+            pad_val = global_dofs[-1]
+            gdofs_map[i, :] = pad_val
+            gdofs_map[i, :global_dofs.size] = global_dofs
+            pos_eid = int(pos_ids[i]); neg_eid = int(neg_ids[i])
+            pos_dofs = self.get_elemental_dofs(pos_eid)
+            neg_dofs = self.get_elemental_dofs(neg_eid)
+            pos_map[i, :len(pos_dofs)] = _searchsorted_positions(global_dofs, pos_dofs)
+            neg_map[i, :len(neg_dofs)] = _searchsorted_positions(global_dofs, neg_dofs)
+
         # 3b --- per-field, side-local -> union maps (ghost)
         for fld in fields:
             nloc_f = len(self.element_maps[fld][pos_ids[0]])
@@ -2813,9 +2802,33 @@ class DofHandler:
                 pos_loc = self.element_maps[fld][pos_eid]
                 neg_loc = self.element_maps[fld][neg_eid]
                 pm[i, :] = [col_of[int(d)] for d in pos_loc]
-                nm[i, :] = [col_of[int(d)] for d in neg_loc]
-            out[f"pos_map_{fld}"] = pm
-            out[f"neg_map_{fld}"] = nm
+            nm[i, :] = [col_of[int(d)] for d in neg_loc]
+        out[f"pos_map_{fld}"] = pm
+        out[f"neg_map_{fld}"] = nm
+
+        # 3c) Cache key after n_union is known
+        derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
+        cache_key  = (
+            ghost_ids,
+            int(qdeg),
+            me.signature(),
+            int(n_union),
+            derivs_key,
+            bool(need_hess),
+            bool(need_o3),
+            bool(need_o4),
+            self.method,
+            _ls_fingerprint(level_set),
+            _def_fingerprint(deformation),
+            _coords_fingerprint(mesh.nodes_x_y_pos),
+        )
+        global _ghost_cache
+        try:
+            _ghost_cache
+        except NameError:
+            _ghost_cache = {}
+        if reuse and cache_key in _ghost_cache:
+            return _ghost_cache[cache_key]
 
 
         # 4) Reference coords on both sides; geometry dN; build J, detJ, J_inv -------

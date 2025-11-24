@@ -189,16 +189,15 @@ class NumbaCodeGen:
                             field_name: str, idx: int) -> str | None:
         """
         Resolve the effective side for a single component:
-          1) explicit field_sides[idx] if present ('pos'/'neg')
-          2) explicit side from Jump/Pos/Neg ('+' → 'pos', '-' → 'neg')
+          1) explicit side from Jump/Pos/Neg ('+' → 'pos', '-' → 'neg')
+          2) per-component hint field_sides[idx] if present ('pos'/'neg')
           3) infer from name ('*_pos_*' / '*_neg_*')
         Returns 'pos'/'neg' or None if nothing can be determined.
         """
-        if field_sides and 0 <= idx < len(field_sides) and field_sides[idx] in ("pos","neg"):
-            return field_sides[idx]
-        # Prefer the explicit +/- from the IR (ghost/interface need this to distinguish owner/neighbor)
         if default_side in ("+","-"):
             return "pos" if default_side == "+" else "neg"
+        if field_sides and 0 <= idx < len(field_sides) and field_sides[idx] in ("pos","neg"):
+            return field_sides[idx]
         # # Only as a final hint, glean from the component name
         # hint = cls._infer_side_from_name(field_name)
         # if hint:

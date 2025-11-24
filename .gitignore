@@ -204,3 +204,4 @@ pycutfem/solvers/giant/*
 *_results/
 scripts/
 .pycutfem_cache/
+*_results_*

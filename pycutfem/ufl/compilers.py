@@ -1520,15 +1520,28 @@ class FormCompiler:
 
         # Decide which side of the bilinear form this lives on
         op = n.operand
-        fields = op.field_names if hasattr(op, "field_names") else [op.field_name]
-        if isinstance(op, (TestFunction, VectorTestFunction)):
-            role = "test"
-        elif isinstance(op, (TrialFunction, VectorTrialFunction)):
-            role = "trial"
-        elif isinstance(op, (Function, VectorFunction)):
-            role = "function"
-        else:
-            role = "none"
+        base_op = op.operand if isinstance(op, Restriction) else op
+
+        def _field_names(expr):
+            if hasattr(expr, "field_names"):
+                names = getattr(expr, "field_names", [])
+                return list(names) if names is not None else []
+            if hasattr(expr, "field_name"):
+                return [getattr(expr, "field_name")]
+            return []
+
+        fields = _field_names(base_op) or _field_names(op)
+
+        role = grad_op.role
+        if role == "none":
+            if isinstance(base_op, (TestFunction, VectorTestFunction)):
+                role = "test"
+            elif isinstance(base_op, (TrialFunction, VectorTrialFunction)):
+                role = "trial"
+            elif isinstance(base_op, (Function, VectorFunction)):
+                role = "function"
+            else:
+                role = "none"
 
         # Wrap as VecOpInfo with a single component so that _visit_Prod
         # can use the role information to orient the outer product.
@@ -3400,23 +3413,6 @@ class FormCompiler:
         if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
             kernel_args["element_nodes"] = np.asarray(mesh.elements_connectivity, dtype=np.int64)
 
-        # 4b) Patch unsided dXY_<fld> if requested but missing: average of sided rXY
-        missing_now = [p for p in runner.param_order if p not in kernel_args]
-        if missing_now:
-            for name in list(missing_now):
-                m = re.match(r"^d(\d)(\d)_([A-Za-z0-9_]+)$", name)
-                if not m:
-                    continue
-                dx, dy, fld = int(m.group(1)), int(m.group(2)), m.group(3)
-                kpos = f"r{dx}{dy}_{fld}_pos"
-                kneg = f"r{dx}{dy}_{fld}_neg"
-                if (kpos in kernel_args) and (kneg in kernel_args):
-                    kernel_args[name] = 0.5*(kernel_args[kpos] + kernel_args[kneg])
-                elif kpos in kernel_args:
-                    kernel_args[name] = kernel_args[kpos]
-                elif kneg in kernel_args:
-                    kernel_args[name] = kernel_args[kneg]
-
         # 4c) Alias sided jets from unsided if necessary (belt-and-suspenders)
         req_list = list(getattr(runner, "param_order", []))
         req = set(req_list)
@@ -3460,9 +3456,6 @@ class FormCompiler:
         if self.backend == "python":
             self._assemble_ghost_edge_python(intg, matvec)
         elif self.backend == "jit":
-            if any(isinstance(node, Function) for node in _find_all(intg.integrand, Function)):
-                self._assemble_ghost_edge_python(intg, matvec)
-                return
             self._assemble_ghost_edge_jit(intg, matvec)
         else:
             raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")

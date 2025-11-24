@@ -463,6 +463,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
             bs_ghost = mixed_element.mesh.edge_bitset("ghost")
             bs_def   = intg.measure.defined_on
             edges = (bs_def & bs_ghost) if bs_def is not None else bs_ghost
+            try:
+                if edges.cardinality() == 0:
+                    continue  # nothing to assemble for this ghost term
+            except Exception:
+                pass
             geom = dof_handler.precompute_ghost_factors(edges, qdeg, level_set, derivs, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
             geom["is_ghost"] = True
             geom["is_interface"] = False

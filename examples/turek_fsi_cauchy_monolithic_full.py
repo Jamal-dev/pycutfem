@@ -58,7 +58,8 @@ from pycutfem.ufl.expressions import (
     Jump,
 )
 from pycutfem.ufl.measures import dx, dGhost, dInterface
-from pycutfem.ufl.forms import BoundaryCondition, Equation
+from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
+from pycutfem.io.vtk import export_vtk
 from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.helpers import analyze_active_dofs
 from pycutfem.solvers.nonlinear_solver import (
@@ -86,20 +87,23 @@ L = 2.2
 RADIUS = 0.05
 CENTER = (0.2, 0.2)
 
-RHO_F = 1.0
-MU_F = 1.0e-3
-U_MAX = 1.0
-U_MEAN = 1.5
+RHO_F = 1.0e3
+MU_F = 1.0
+U_MEAN = 1.0
+U_MAX = 1.5 * U_MEAN
 
-E_S = 1.4e6
 NU_S = 0.4
-RHO_S = 1.0e3
+MU_S = 0.5e6
+E_S = 2.0 * MU_S * (1.0 + NU_S)
+RHO_S = 10.0e3
 MU_S = E_S / (2.0 * (1.0 + NU_S))
 LAMBDA_S = E_S * NU_S / ((1.0 + NU_S) * (1.0 - 2.0 * NU_S))
 
 BEAM_LENGTH = 0.35
 BEAM_HEIGHT = 0.02
 BEAM_CENTER = (CENTER[0] + RADIUS + 0.5 * BEAM_LENGTH, CENTER[1])
+POINT_B = (0.15, 0.2)
+POINT_A_INITIAL = (0.6, 0.2) # Point A will change while Point B is fixed
 
 BETA_PENALTY = 90.0 * MU_F
 DT = float(os.getenv("DT", "0.005"))
@@ -425,6 +429,14 @@ ls_beam.interpolate(lambda x, y: beam_ref_ls(np.array([x, y])))
 ls_beam.commit()
 
 domains = make_domain_sets(mesh)
+print(
+    f"Ghost edges: total={mesh.edge_bitset('ghost').cardinality()}, "
+    f"pos={mesh.edge_bitset('ghost_pos').cardinality()}, "
+    f"neg={mesh.edge_bitset('ghost_neg').cardinality()}, "
+    f"both={mesh.edge_bitset('ghost_both').cardinality()}, "
+    f"fluid_ghost(defined_on)={domains['fluid_ghost'].cardinality()}, "
+    f"solid_ghost(defined_on)={domains['solid_ghost'].cardinality()}"
+)
 
 # Mixed element for fluid/solid unknowns
 mixed_element = MixedElement(
@@ -442,8 +454,18 @@ mixed_element = MixedElement(
 dof_handler = DofHandler(mixed_element, method="cg")
 
 # Boundary conditions
-def parabolic_inflow(x, y):
-    return 4 * U_MEAN * y * (H - y) / (H**2)
+def parabolic_inflow(x, y, t=None):
+    """
+    Parabolic inflow ramped in time:
+        v_in(t,0,y) = v_base(y) * 0.5*(1 - cos(pi/2 * t))  for t < 2
+                    = v_base(y)                             otherwise
+    """
+    v_base = 1.5 * 4 * U_MEAN * y * (H - y) / (H**2)
+    if t is None:
+        return v_base
+    if t < 2.0:
+        return v_base * 0.5 * (1.0 - math.cos(0.5 * math.pi * t))
+    return v_base
 
 
 bcs: list[BoundaryCondition] = [
@@ -648,6 +670,47 @@ def sigma_s_nonlinear(d):
     J = det(F)
     return (1.0 / J) * dot(dot(F, S), F.T)
 
+# ----------------------- Diagnostic helpers -------------------------------
+def _interface_length(mesh: Mesh) -> float:
+    """Total length of edges tagged as interface."""
+    length = 0.0
+    for gid in mesh.edge_bitset("interface").to_indices():
+        e = mesh.edge(int(gid))
+        p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+        length += float(np.linalg.norm(p1 - p0))
+    return length
+
+def _eval_scalar_at_point(dh: DofHandler, mesh: Mesh, f_scalar: Function, point: tuple[float, float]) -> float:
+    """
+    Evaluate a scalar Function at a physical point using element search
+    and basis evaluation (robust to mixed-order layouts).
+    """
+    xy = np.asarray(point, float)
+    for e in mesh.elements_list:
+        verts = mesh.nodes_x_y_pos[list(e.nodes)]
+        if not (verts[:, 0].min() - 1e-12 <= xy[0] <= verts[:, 0].max() + 1e-12 and
+                verts[:, 1].min() - 1e-12 <= xy[1] <= verts[:, 1].max() + 1e-12):
+            continue
+        try:
+            xi, eta = transform.inverse_mapping(mesh, e.id, xy)
+        except Exception:
+            continue
+        if not (-1.0001 <= xi <= 1.0001 and -1.0001 <= eta <= 1.0001):
+            continue
+        me = dh.mixed_element
+        fld = f_scalar.field_name
+        phi = me.basis(fld, float(xi), float(eta))[me.slice(fld)]
+        gdofs = dh.element_maps[fld][e.id]
+        vals = f_scalar.get_nodal_values(gdofs)
+        return float(phi @ vals)
+    return float("nan")
+
+def _tip_position(dh: DofHandler, mesh: Mesh, disp: VectorFunction, ref_tip: np.ndarray) -> np.ndarray:
+    """Current position of the beam tip: X_ref + u(X_ref)."""
+    dx = _eval_scalar_at_point(dh, mesh, disp.components[0], tuple(ref_tip))
+    dy = _eval_scalar_at_point(dh, mesh, disp.components[1], tuple(ref_tip))
+    return np.asarray([ref_tip[0] + dx, ref_tip[1] + dy], float)
+
 
 def dsigma_s(d_ref, delta_d):
     Fk = F_of(d_ref)
@@ -784,10 +847,74 @@ r_stab = (
 jacobian_form = a_vol_f + J_int + a_vol_s + a_svc + a_stab
 residual_form = r_vol_f + R_int + r_vol_s + r_svc + r_stab
 
+# ----------------------------------------------------------------------------- 
+# Diagnostics: tip displacement, drag/lift (avg traction), pressure drop, VTK
+# -----------------------------------------------------------------------------
+REF_TIP = np.array([CENTER[0] + RADIUS + BEAM_LENGTH, CENTER[1]], dtype=float)
+PROBE_B = np.array([CENTER[0] - 0.05, CENTER[1]], dtype=float)
+obs_history = {"time": [], "tip": [], "drag": [], "lift": [], "dp": []}
+output_dir = os.getenv("OUTPUT_DIR", "turek_results_fsi_ii_monolithic_full")
+os.makedirs(output_dir, exist_ok=True)
+SAVE_VTK = os.getenv("SAVE_VTK", "1") not in ("0", "false", "False")
+
+def _save_vtk(step_idx: int) -> None:
+    if not SAVE_VTK:
+        return
+    fname = os.path.join(output_dir, f"solution_{step_idx:04d}.vtu")
+    export_vtk(
+        filename=fname,
+        mesh=mesh,
+        dof_handler=dof_handler,
+        functions={
+            "uf": uf_k,
+            "pf": pf_k,
+            "us": us_k,
+            "disp": disp_k,
+        },
+    )
+
+def _compute_observables(step_idx: int, t_curr: float) -> None:
+    dGamma_obs = dInterface(
+        defined_on=domains["cut_domain"],
+        level_set=ls_beam,
+        metadata={"q": qvol + 2, "derivs": {(0, 0), (1, 0), (0, 1)}},
+    )
+    ex = Constant(np.array([1.0, 0.0]), dim=1)
+    ey = Constant(np.array([0.0, 1.0]), dim=1)
+    t_fluid = traction_fluid(Pos(uf_k), Pos(pf_k))
+    t_solid = traction_solid_R(Neg(disp_k))
+    t_avg = Constant(0.5) * (t_fluid + t_solid)
+    drag_int = dot(t_avg, ex) * dGamma_obs
+    lift_int = dot(t_avg, ey) * dGamma_obs
+    hooks = {drag_int.integrand: {"name": "FD"}, lift_int.integrand: {"name": "FL"}}
+    res = assemble_form(
+        Equation(None, drag_int + lift_int),
+        dof_handler=dof_handler,
+        bcs=[],
+        assembler_hooks=hooks,
+        backend="jit",
+    )
+    F_D = float(res.get("FD", 0.0))
+    F_L = float(res.get("FL", 0.0))
+    tip_pos = _tip_position(dof_handler, mesh, disp_k, REF_TIP)
+    pA = _eval_scalar_at_point(dof_handler, mesh, pf_k, tuple(tip_pos))
+    pB = _eval_scalar_at_point(dof_handler, mesh, pf_k, tuple(PROBE_B))
+    dp = pB - pA
+    obs_history["time"].append(t_curr)
+    obs_history["drag"].append(F_D)
+    obs_history["lift"].append(F_L)
+    obs_history["dp"].append(dp)
+    obs_history["tip"].append(tip_pos.tolist())
+    print(
+        f"[obs {step_idx:04d}] t={t_curr:.3f}  FD={F_D:.4e}  FL={F_L:.4e}  Δp={dp:.4e}  "
+        f"tip=({tip_pos[0]:.5f},{tip_pos[1]:.5f})  |Γ|≈{_interface_length(mesh):.5f}"
+    )
+    _save_vtk(step_idx)
+
 # -----------------------------------------------------------------------------
 # Finite-difference alignment check
 # -----------------------------------------------------------------------------
-if os.getenv("RUN_FD_CHECK", "1") != "0":
+if os.getenv("RUN_FD_CHECK", "0") != "0":
     fd_fields = {
         "u_pos_x": uf_k,
         "u_pos_y": uf_k,
@@ -841,6 +968,9 @@ if os.getenv("RUN_TIME_STEPPING", "1") != "0":
         newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
     )
 
+    step_idx = [0]  # mutable so the closure can update
+    dt_val = DT.value if hasattr(DT, "value") else float(DT)
+
     def post_step_cb(funcs):
         update_beam_levelset_from_displacement(ls_beam, disp_k, beam_ref_ls)
         refresh_domains(mesh, domains)
@@ -848,6 +978,8 @@ if os.getenv("RUN_TIME_STEPPING", "1") != "0":
         retag_inactive(dof_handler)
         dof_handler.apply_bcs(bcs, uf_k, pf_k, us_k, disp_k)
         recompute_active_dofs(solver, solver.bcs_homog if solver.bcs_homog else solver.bcs)
+        _compute_observables(step_idx[0], step_idx[0] * dt_val)
+        step_idx[0] += 1
 
     solver.post_timeloop_cb = post_step_cb
 

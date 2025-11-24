@@ -1270,6 +1270,11 @@ class Restriction(Expression):
 
     def __repr__(self):
         return f"Restriction({self.operand!r}, '{self.domain}')"
+    
+    def __getattr__(self, name):
+        # Delegate missing attributes to the underlying operand so wrappers
+        # behave like the wrapped expression (field_name, field_names, etc.).
+        return getattr(self.operand, name)
 
 class Trace(Expression):
     """Symbolic trace of a tensor expression."""
