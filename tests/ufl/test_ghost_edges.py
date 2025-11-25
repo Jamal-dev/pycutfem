@@ -23,6 +23,7 @@ from pycutfem.ufl.measures import dGhost, dx
 from pycutfem.ufl.compilers import FormCompiler
 from tests.ufl.test_face_integrals import dof_handler
 from pycutfem.ufl.forms import BoundaryCondition, assemble_form, Equation
+from pycutfem.ufl.expressions import Pos, Neg, restrict
 from pycutfem.io.visualization import plot_mesh_2
 import matplotlib.pyplot as plt
 
@@ -249,3 +250,55 @@ def test_hessian_penalty_exactness_for_quadratics(setup_quad2, backend):
 
     assert abs(assembled_energy) < 1e-12
 
+
+# ---------------------------------------------------------------------------
+# 5. ghost_both orientation check – Pos/Neg must pull the correct owner
+# ---------------------------------------------------------------------------
+def _edge_length_sum(mesh, bitset):
+    length = 0.0
+    for eid in bitset.to_indices():
+        e = mesh.edge(int(eid))
+        p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+        length += float(np.linalg.norm(p1 - p0))
+    return length
+
+
+@pytest.mark.parametrize("backend", ["python", "jit"])
+def test_ghost_both_orientation(setup_quad2, backend):
+    """On ghost_both edges the Pos/Neg restrictions must pick the right owner."""
+    mesh, level_set, _, dh, _, _ = setup_quad2
+    ghost_both = mesh.edge_bitset("ghost_both")
+    assert ghost_both.cardinality() > 0
+
+    has_pos = mesh.element_bitset("cut") | mesh.element_bitset("outside")
+    has_neg = mesh.element_bitset("cut") | mesh.element_bitset("inside")
+
+    def assemble_jump(val_pos, val_neg):
+        u_pos = Function("u_pos", "u", dh, side="+")
+        u_neg = Function("u_neg", "u", dh, side="-")
+        u_pos.set_values_from_function(lambda x, y: val_pos)
+        u_neg.set_values_from_function(lambda x, y: val_neg)
+        u_pos_r = restrict(u_pos, has_pos)
+        u_neg_r = restrict(u_neg, has_neg)
+        jump_scalar = Pos(u_pos_r) - Neg(u_neg_r)
+        dG = dGhost(defined_on=ghost_both, level_set=level_set, metadata={"q": 4})
+        form = jump_scalar * dG
+        hooks = {form.integrand: {"name": "I"}}
+        res = assemble_form(Equation(None, form), dof_handler=dh, bcs=[], assembler_hooks=hooks, backend=backend)
+        return res["I"]
+
+    # Non-zero jump must flip sign when swapping sides.
+    I_ab = assemble_jump(2.5, 0.75)
+    I_ba = assemble_jump(0.75, 2.5)
+    assert abs(I_ab) > 1e-6
+    assert np.isclose(I_ab, -I_ba, rtol=1e-12, atol=1e-12)
+
+    # Pure positive vs pure negative must also flip sign.
+    I_pos_only = assemble_jump(1.0, 0.0)
+    I_neg_only = assemble_jump(0.0, 1.0)
+    assert np.isclose(I_pos_only, -I_neg_only, rtol=1e-12, atol=1e-12)
+
+    # Equal values on both sides should vanish.
+    I_equal = assemble_jump(1.1, 1.1)
+    scale = max(1.0, abs(I_ab), abs(I_ba))
+    assert abs(I_equal) < 1e-8 * scale

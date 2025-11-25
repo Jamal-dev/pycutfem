@@ -30,6 +30,12 @@ _EDGE_COLOR = {
     "default": "black",
 }
 
+_NODE_COLOR = {
+    "corner": "navy",
+    "ho": "deepskyblue",
+    "hanging": "magenta",
+}
+
 def _edge_col(tag):
     return _EDGE_COLOR.get(tag, 'black')
 
@@ -115,30 +121,55 @@ def plot_mesh(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True,
 
     # --- Plot Nodes (all of them, differentiating corners) ---
     if plot_nodes:
-        # Identify all unique corner node global indices
         corner_node_gids = set()
-        if hasattr(mesh, '_get_element_corner_global_indices'):
+        hanging_node_gids = set(getattr(mesh, "hanging_nodes", []))
+        if hasattr(mesh, "_get_element_corner_global_indices"):
             for eid in range(len(mesh.elements)):
                 corners = mesh._get_element_corner_global_indices(eid)
-                for gid in corners:
-                    corner_node_gids.add(gid)
-        
+                corner_node_gids.update(corners)
+
         all_node_gids = set(range(len(mesh.nodes_x_y_pos)))
-        ho_node_gids = list(all_node_gids - corner_node_gids)
+        ho_node_gids = list(all_node_gids - corner_node_gids - hanging_node_gids)
         corner_node_gids_list = list(corner_node_gids)
+        hanging_node_gids_list = list(hanging_node_gids)
 
-        # Plot higher-order nodes (e.g., edge midpoints) first, smaller and lighter
         if ho_node_gids:
-            ax.plot(mesh.nodes_x_y_pos[ho_node_gids, 0], mesh.nodes_x_y_pos[ho_node_gids, 1], 'o', 
-                    color='deepskyblue', markersize=2, zorder=3, label="Higher-Order Nodes", linestyle='None')
+            ax.plot(
+                mesh.nodes_x_y_pos[ho_node_gids, 0],
+                mesh.nodes_x_y_pos[ho_node_gids, 1],
+                "o",
+                color=_NODE_COLOR["ho"],
+                markersize=2,
+                zorder=3,
+                label="Higher-Order Nodes",
+                linestyle="None",
+            )
 
-        # Plot corner nodes on top, more prominently
+        if hanging_node_gids_list:
+            ax.plot(
+                mesh.nodes_x_y_pos[hanging_node_gids_list, 0],
+                mesh.nodes_x_y_pos[hanging_node_gids_list, 1],
+                "o",
+                color=_NODE_COLOR["hanging"],
+                markersize=4,
+                zorder=4,
+                label="Hanging Nodes",
+                linestyle="None",
+            )
+
         if corner_node_gids_list:
-            ax.plot(mesh.nodes_x_y_pos[corner_node_gids_list, 0], mesh.nodes_x_y_pos[corner_node_gids_list, 1], 'o',
-                    color='navy', markersize=4, zorder=4, label="Corner Nodes", linestyle='None')
-        
-        # Add a legend if both types of nodes were plotted
-        if ho_node_gids and corner_node_gids_list:
+            ax.plot(
+                mesh.nodes_x_y_pos[corner_node_gids_list, 0],
+                mesh.nodes_x_y_pos[corner_node_gids_list, 1],
+                "o",
+                color=_NODE_COLOR["corner"],
+                markersize=4,
+                zorder=5,
+                label="Corner Nodes",
+                linestyle="None",
+            )
+
+        if any([ho_node_gids, corner_node_gids_list, hanging_node_gids_list]):
             ax.legend()
 
 
