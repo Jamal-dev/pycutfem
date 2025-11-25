@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import argparse
 import time
 from typing import Dict, Iterable, Sequence
@@ -118,6 +119,8 @@ def _parse_args():
     parser.add_argument("--plot-show", dest="plot_show", action="store_true", help="Call plt.show() for mesh plots.")
     parser.add_argument("--no-plot-show", dest="plot_show", action="store_false", help="Do not show mesh plots (only save).")
     parser.add_argument("--plot-resolution", type=int, default=int(os.getenv("PLOT_RESOLUTION", "120")), help="Grid resolution for level-set contour in mesh plots.")
+    parser.add_argument("--plot-only", dest="plot_only", action="store_true", help="Stop after plotting the initial mesh (skip JIT/solver setup).")
+    parser.add_argument("--force-full-setup", dest="force_full_setup", action="store_true", help="Always build full solver even when only plotting.")
     parser.set_defaults(
         save_vtk=os.getenv("SAVE_VTK", "1") not in ("0", "false", "False"),
         run_fd_check=os.getenv("RUN_FD_CHECK", "0") != "0",
@@ -128,6 +131,8 @@ def _parse_args():
         plot_levelset=os.getenv("PLOT_LEVELSET", "1") != "0",
         plot_interface_points=os.getenv("PLOT_INTERFACE_POINTS", "1") != "0",
         plot_show=os.getenv("PLOT_SHOW", "0") != "0",
+        plot_only=os.getenv("PLOT_ONLY", "0") != "0",
+        force_full_setup=os.getenv("FORCE_FULL_SETUP", "0") != "0",
     )
     return parser.parse_args()
 
@@ -915,6 +920,43 @@ print(
 )
 _log_step("built domain sets / ghost counts")
 
+# Prepare output dir before any early exits
+output_dir = ARGS.output_dir
+os.makedirs(output_dir, exist_ok=True)
+
+# Fast path: only produce an initial plot and exit (skip JIT/solver setup).
+quick_plot_only = (
+    ARGS.plot_mesh
+    and (ARGS.plot_only or (not ARGS.run_time_stepping and not ARGS.run_fd_check and not ARGS.run_fd_terms))
+    and not ARGS.force_full_setup
+)
+if quick_plot_only:
+    import matplotlib.pyplot as plt
+    from pycutfem.io.visualization import plot_mesh_2
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    level_set_for_plot = beam_ref_ls if ARGS.plot_levelset else None
+    plot_mesh_2(
+        mesh,
+        level_set=level_set_for_plot,
+        plot_nodes=True,
+        plot_edges=True,
+        elem_tags=True,
+        edge_colors=True,
+        show=False,
+        ax=ax,
+        resolution=max(20, int(ARGS.plot_resolution)),
+    )
+    ax.set_title("Initial mesh (plot-only)")
+    fname = os.path.join(output_dir, f"mesh_{0:04d}.png")
+    fig.savefig(fname, dpi=200, bbox_inches="tight")
+    print(f"[plot-only] saved {fname} and exiting (skipped solver setup)")
+    if ARGS.plot_show or ARGS.interactive_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+    sys.exit(0)
+
 # Mixed element for fluid/solid unknowns
 mixed_element = MixedElement(
     mesh,
@@ -1273,39 +1315,33 @@ dsigma_s_k = dsigma_s(disp_k_R, ddisp_s_R)
 a_vol_s = (
     rho_s_const * dot(du_s_R, test_vel_s_R) / dt
     + theta * inner(dsigma_s_k, grad(test_vel_s_R))
+    + rho_s_const * theta
+      * (dot(dot(grad(us_k_R), du_s_R), test_vel_s_R) + 
+         dot(dot(grad(du_s_R), us_k_R), test_vel_s_R))
 ) * dx_solid
 r_vol_s = (
     rho_s_const * dot(us_k_R - us_n_R, test_vel_s_R) / dt
     + theta * inner(sigma_s_k, grad(test_vel_s_R))
     + (1 - theta) * inner(sigma_s_n, grad(test_vel_s_R))
-) * dx_solid
-
-# Convective transport of solid momentum (Eulerian frame)
-a_vol_s_conv = (
-    rho_s_const
-    * theta
-    * (dot(dot(grad(us_k_R), du_s_R), test_vel_s_R) + dot(dot(grad(du_s_R), us_k_R), test_vel_s_R))
-) * dx_solid
-r_vol_s_conv = (
-    rho_s_const
-    * (
+    + rho_s_const
+        * (
         theta * dot(dot(grad(us_k_R), us_k_R), test_vel_s_R)
         + (1 - theta) * dot(dot(grad(us_n_R), us_n_R), test_vel_s_R)
     )
 ) * dx_solid
 
-a_svc = (dot(ddisp_s_R, test_disp_s_R) / dt - theta * dot(du_s_R, test_disp_s_R)) * dx_solid
+
+
+a_svc = (dot(ddisp_s_R, test_disp_s_R) / dt - theta * dot(du_s_R, test_disp_s_R)
+         + theta * (dot(dot(grad(ddisp_s_R), us_k_R), test_disp_s_R) 
+                    + dot(dot(grad(disp_k_R), du_s_R), test_disp_s_R))
+         ) * dx_solid
 # Kinematic constraint with advected displacement in Eulerian frame
-a_svc_conv = (
-    theta * (dot(dot(grad(ddisp_s_R), us_k_R), test_disp_s_R) + dot(dot(grad(disp_k_R), du_s_R), test_disp_s_R))
-) * dx_solid
 r_svc = (
     dot(disp_k_R - disp_n_R, test_disp_s_R) / dt
     - theta * dot(us_k_R, test_disp_s_R)
     - (1 - theta) * dot(us_n_R, test_disp_s_R)
-) * dx_solid
-r_svc_conv = (
-    theta * dot(dot(grad(disp_k_R), us_k_R), test_disp_s_R)
+    + theta * dot(dot(grad(disp_k_R), us_k_R), test_disp_s_R)
     + (1 - theta) * dot(dot(grad(disp_n_R), us_n_R), test_disp_s_R)
 ) * dx_solid
 
@@ -1343,8 +1379,8 @@ r_stab = (
     * dG_solid
 )
 
-jacobian_form = a_vol_f + J_int + a_vol_s + a_vol_s_conv + a_svc + a_svc_conv + a_stab
-residual_form = r_vol_f + R_int + r_vol_s + r_vol_s_conv + r_svc + r_svc_conv + r_stab
+jacobian_form = a_vol_f + J_int + a_vol_s + a_stab
+residual_form = r_vol_f + R_int + r_vol_s + r_stab
 
 # ----------------------------------------------------------------------------- 
 # Diagnostics: tip displacement, drag/lift (avg traction), pressure drop, VTK
@@ -1395,6 +1431,7 @@ def _plot_mesh(step_idx: int, title: str = "Mesh / Ghost / Level-set") -> None:
         edge_colors=True,
         show=False,
         ax=ax,
+        resolution=max(20, int(ARGS.plot_resolution)),
     )
     interface_artist = None
     if ARGS.plot_interface_points:
@@ -1525,9 +1562,7 @@ if ARGS.run_fd_check:
         term_blocks = {
             "fluid_vol": (a_vol_f, r_vol_f),
             "solid_vol": (a_vol_s, r_vol_s),
-            "solid_vol_conv": (a_vol_s_conv, r_vol_s_conv),
             "solid_vel_constraint": (a_svc, r_svc),
-            "solid_vel_constraint_conv": (a_svc_conv, r_svc_conv),
             "interface": (J_int, R_int),
             "stab_fluid_vel": (
                 (Constant(2.0) * mu_f_const * g_v_f(gamma_v, du_f_R, test_vel_f_R)) * dG_fluid,

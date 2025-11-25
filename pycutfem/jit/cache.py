@@ -10,7 +10,7 @@ import numpy as np  # numba kernels rely on it
 from pycutfem.core import mesh
 from pycutfem.jit.ir import LoadAnalytic
 
-CODEGEN_ABI = "2024-12-07"
+CODEGEN_ABI = "2025-01-15"
 
 class KernelCache:
     """

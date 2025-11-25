@@ -2,6 +2,72 @@ import numba
 import numpy as np
 use_type = np.float64
 
+@numba.njit(cache=True, fastmath=True)
+def ghost_grad_jump_penalty_scalar(
+    Ke, w, cell_h, normals, grad_pos, grad_neg, gamma, dtype
+):
+    """
+    Assemble ghost gradient-jump penalty for scalar fields.
+    Ke      : (nE, n_union, n_union)
+    w       : (nE, n_q) physical quadrature weights
+    cell_h  : (nE,) background cell diameter
+    normals : (nE, n_q, 2)
+    grad_pos/grad_neg : (nE, n_q, n_union, 2)
+    """
+    nE, n_q, n_union, _ = grad_pos.shape
+    for e in range(nE):
+        h_e = cell_h[e]
+        for q in range(n_q):
+            wq = w[e, q] * gamma * h_e
+            if wq == 0.0:
+                continue
+            n0 = normals[e, q, 0]
+            n1 = normals[e, q, 1]
+            jump = np.empty(n_union, dtype=dtype)
+            for i in range(n_union):
+                gx_pos = grad_pos[e, q, i, 0]
+                gy_pos = grad_pos[e, q, i, 1]
+                gx_neg = grad_neg[e, q, i, 0]
+                gy_neg = grad_neg[e, q, i, 1]
+                jump[i] = (gx_pos - gx_neg) * n0 + (gy_pos - gy_neg) * n1
+            for i in range(n_union):
+                vi = jump[i] * wq
+                for j in range(n_union):
+                    Ke[e, i, j] += vi * jump[j]
+
+
+@numba.njit(cache=True, fastmath=True)
+def ghost_grad_jump_penalty_vector(
+    Ke, w, cell_h, normals, grad_pos, grad_neg, gamma, dtype
+):
+    """
+    Assemble ghost gradient-jump penalty for vector-valued fields.
+    grad_pos/grad_neg : (nE, n_q, n_comp, n_union, 2)
+    """
+    nE, n_q, n_comp, n_union, _ = grad_pos.shape
+    for e in range(nE):
+        h_e = cell_h[e]
+        for q in range(n_q):
+            wq = w[e, q] * gamma * h_e
+            if wq == 0.0:
+                continue
+            n0 = normals[e, q, 0]
+            n1 = normals[e, q, 1]
+            jump_n = np.empty((n_union, n_comp), dtype=dtype)
+            for i in range(n_union):
+                for k in range(n_comp):
+                    gx_pos = grad_pos[e, q, k, i, 0]
+                    gy_pos = grad_pos[e, q, k, i, 1]
+                    gx_neg = grad_neg[e, q, k, i, 0]
+                    gy_neg = grad_neg[e, q, k, i, 1]
+                    jump_n[i, k] = (gx_pos - gx_neg) * n0 + (gy_pos - gy_neg) * n1
+            for i in range(n_union):
+                for j in range(n_union):
+                    s = 0.0
+                    for k in range(n_comp):
+                        s += jump_n[i, k] * jump_n[j, k]
+                    Ke[e, i, j] += wq * s
+
 @numba.njit(cache=True)
 def dot_grad_grad_mixed(a, b, flag, dtype):
     """
@@ -422,6 +488,145 @@ def compute_physical_laplacian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
         core = j_inv.T @ (href @ j_inv)
         hphys = core + d10[j] * hx + d01[j] * hy
         res[j] = hphys[0, 0] + hphys[1, 1]
+    return res
+
+
+@numba.njit(cache=True)
+def pushforward_d3(d10, d01, d20, d11, d02, d30, d21, d12, d03, A, Hx, Hy, Tx0, Tx1, axes, dtype):
+    """
+    Exact third-order pullback using inverse-map jets.
+    Returns a (nloc,) array for the derivative specified by 'axes'.
+    """
+    nloc = d20.shape[0]
+    res = np.zeros(nloc, dtype=dtype)
+    for j in range(nloc):
+        s = 0.0
+        for a in (0, 1):
+            for b in (0, 1):
+                for c in (0, 1):
+                    ones = (a == 1) + (b == 1) + (c == 1)
+                    if ones == 0:
+                        g3 = d30[j]
+                    elif ones == 1:
+                        g3 = d21[j]
+                    elif ones == 2:
+                        g3 = d12[j]
+                    else:
+                        g3 = d03[j]
+                    s += g3 * A[a, axes[0]] * A[b, axes[1]] * A[c, axes[2]]
+        for a in (0, 1):
+            for b in (0, 1):
+                if a == 0 and b == 0:
+                    g2 = d20[j]
+                elif a != b:
+                    g2 = d11[j]
+                else:
+                    g2 = d02[j]
+                Hb = Hx if b == 0 else Hy
+                s += g2 * (
+                    A[a, axes[0]] * Hb[axes[1], axes[2]]
+                    + A[a, axes[1]] * Hb[axes[0], axes[2]]
+                    + A[a, axes[2]] * Hb[axes[0], axes[1]]
+                )
+        s += d10[j] * Tx0[axes[0], axes[1], axes[2]] + d01[j] * Tx1[axes[0], axes[1], axes[2]]
+        res[j] = s
+    return res
+
+
+@numba.njit(cache=True)
+def pushforward_d4(
+    d10,
+    d01,
+    d20,
+    d11,
+    d02,
+    d30,
+    d21,
+    d12,
+    d03,
+    d40,
+    d31,
+    d22,
+    d13,
+    d04,
+    A,
+    Hx,
+    Hy,
+    Tx0,
+    Tx1,
+    Qx0,
+    Qx1,
+    axes,
+    dtype,
+):
+    """
+    Exact fourth-order pullback using inverse-map jets.
+    Returns a (nloc,) array for the derivative specified by 'axes'.
+    """
+    nloc = d20.shape[0]
+    res = np.zeros(nloc, dtype=dtype)
+    for j in range(nloc):
+        s = 0.0
+        for a in (0, 1):
+            for b in (0, 1):
+                for c in (0, 1):
+                    for d in (0, 1):
+                        ones = (a == 1) + (b == 1) + (c == 1) + (d == 1)
+                        if ones == 0:
+                            g4 = d40[j]
+                        elif ones == 1:
+                            g4 = d31[j]
+                        elif ones == 2:
+                            g4 = d22[j]
+                        elif ones == 3:
+                            g4 = d13[j]
+                        else:
+                            g4 = d04[j]
+                        s += g4 * A[a, axes[0]] * A[b, axes[1]] * A[c, axes[2]] * A[d, axes[3]]
+        for a in (0, 1):
+            for b in (0, 1):
+                for c in (0, 1):
+                    ones = a + b + c
+                    if ones == 0:
+                        g3v = d30[j]
+                    elif ones == 1:
+                        g3v = d21[j]
+                    elif ones == 2:
+                        g3v = d12[j]
+                    else:
+                        g3v = d03[j]
+                    for holder in (0, 1, 2):
+                        hb = [a, b, c][holder]
+                        Hb = Hx if hb == 0 else Hy
+                        others = [a, b, c][:holder] + [a, b, c][holder + 1 :]
+                        for p in range(4):
+                            for q in range(p + 1, 4):
+                                r = [0, 1, 2, 3]
+                                r.remove(p)
+                                r.remove(q)
+                                s += g3v * Hb[axes[p], axes[q]] * A[others[0], axes[r[0]]] * A[others[1], axes[r[1]]]
+        for a in (0, 1):
+            for b in (0, 1):
+                if a == 0 and b == 0:
+                    g2v = d20[j]
+                elif a != b:
+                    g2v = d11[j]
+                else:
+                    g2v = d02[j]
+                Ha = Hx if a == 0 else Hy
+                Hb = Hx if b == 0 else Hy
+                s += g2v * (
+                    Ha[axes[0], axes[1]] * Hb[axes[2], axes[3]]
+                    + Ha[axes[0], axes[2]] * Hb[axes[1], axes[3]]
+                    + Ha[axes[0], axes[3]] * Hb[axes[1], axes[2]]
+                )
+                Tb = Tx0 if b == 0 else Tx1
+                Ta = Tx0 if a == 0 else Tx1
+                for p in range(4):
+                    rest = [axes[i] for i in range(4) if i != p]
+                    s += g2v * (A[a, axes[p]] * Tb[rest[0], rest[1], rest[2]] + A[b, axes[p]] * Ta[rest[0], rest[1], rest[2]])
+        s += d10[j] * Qx0[axes[0], axes[1], axes[2], axes[3]] + d01[j] * Qx1[axes[0], axes[1], axes[2], axes[3]]
+        res[j] = s
     return res
 
 @numba.njit(cache=True)
@@ -1024,10 +1229,14 @@ for _helper_name in (
     "dot_grad_with_value",
     "compute_physical_hessian",
     "compute_physical_laplacian",
+    "pushforward_d3",
+    "pushforward_d4",
     "load_variable_qp",
     "gradient_qp",
     "laplacian_qp",
     "hessian_qp",
+    "ghost_grad_jump_penalty_scalar",
+    "ghost_grad_jump_penalty_vector",
 ):
     setattr(AssemblyHelpers, _helper_name, staticmethod(globals()[_helper_name]))
 

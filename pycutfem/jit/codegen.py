@@ -805,6 +805,11 @@ class NumbaCodeGen:
                         body_lines.append(f"axes = np.array([{', '.join(map(str, [0]*ox + [1]*oy))}], dtype=np.int32)")
 
                         # 2nd-order contribution (and extraction of xx/xy/yy)
+                        d10v = "d10_s" if op.side else "d10_q"
+                        d01v = "d01_s" if op.side else "d01_q"
+                        d20v = "d20_s" if op.side else "d20_q"
+                        d11v = "d11_s" if op.side else "d11_q"
+                        d02v = "d02_s" if op.side else "d02_q"
                         if tot == 2:
                             body_lines += [
                                 f"Hx = {H0}[e, q]; Hy = {H1}[e, q]",
@@ -824,90 +829,27 @@ class NumbaCodeGen:
                                 f"    {row}[j] = val",
                             ]
                         elif tot == 3:
+                            d30v = "d30_s" if op.side else "d30_q"
+                            d21v = "d21_s" if op.side else "d21_q"
+                            d12v = "d12_s" if op.side else "d12_q"
+                            d03v = "d03_s" if op.side else "d03_q"
                             body_lines += [
                                 f"Hx = {H0}[e, q]; Hy = {H1}[e, q]; Tx0={T0}[e,q]; Tx1={T1}[e,q]",
-                                "for j in range(nloc):",
-                                "    s = 0.0",
-                                "    # g3 term",
-                                "    for a in (0,1):",
-                                "      for b in (0,1):",
-                                "        for c in (0,1):",
-                                "          ones = (a==1)+(b==1)+(c==1)",
-                                ("          g3 = d30_s[j] if ones==0 else (d21_s[j] if ones==1 else (d12_s[j] if ones==2 else d03_s[j]))"
-                                 if op.side else
-                                 "          g3 = d30_q[j] if ones==0 else (d21_q[j] if ones==1 else (d12_q[j] if ones==2 else d03_q[j]) )"),
-                                f"          s += g3 * {A_loc}[a, axes[0]] * {A_loc}[b, axes[1]] * {A_loc}[c, axes[2]]",
-                                "    # g2 · A2 term (3 permutations)",
-                                "    for a in (0,1):",
-                                "      for b in (0,1):",
-                                ("        g2 = d20_s[j] if (a==0 and b==0) else (d11_s[j] if a!=b else d02_s[j])"
-                                 if op.side else
-                                 "        g2 = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])"),
-                                "        Hb = Hx if b==0 else Hy",
-                                f"        s += g2 * ( {A_loc}[a,axes[0]]*Hb[axes[1],axes[2]] + {A_loc}[a,axes[1]]*Hb[axes[0],axes[2]] + {A_loc}[a,axes[2]]*Hb[axes[0],axes[1]] )",
-                                "    # g1 · A3 term",
-                                ("    s += d10_s[j] * Tx0[axes[0],axes[1],axes[2]] + d01_s[j] * Tx1[axes[0],axes[1],axes[2]]"
-                                 if op.side else
-                                 "    s += d10_q[j] * Tx0[axes[0],axes[1],axes[2]] + d01_q[j] * Tx1[axes[0],axes[1],axes[2]]"),
-
-                                f"    {row}[j] = s",
+                                f"{row} = pushforward_d3({d10v}, {d01v}, {d20v}, {d11v}, {d02v}, {d30v}, {d21v}, {d12v}, {d03v}, {A_loc}, Hx, Hy, Tx0, Tx1, axes, {self.dtype})",
                             ]
                         else:  # tot == 4
+                            d30v = "d30_s" if op.side else "d30_q"
+                            d21v = "d21_s" if op.side else "d21_q"
+                            d12v = "d12_s" if op.side else "d12_q"
+                            d03v = "d03_s" if op.side else "d03_q"
+                            d40v = "d40_s" if op.side else "d40_q"
+                            d31v = "d31_s" if op.side else "d31_q"
+                            d22v = "d22_s" if op.side else "d22_q"
+                            d13v = "d13_s" if op.side else "d13_q"
+                            d04v = "d04_s" if op.side else "d04_q"
                             body_lines += [
                                 f"Hx = {H0}[e, q]; Hy = {H1}[e, q]; Tx0={T0}[e,q]; Tx1={T1}[e,q]; Qx0={Q0}[e,q]; Qx1={Q1}[e,q]",
-                                "for j in range(nloc):",
-                                "    s = 0.0",
-                                "    # g4 term",
-                                "    for a in (0,1):",
-                                "      for b in (0,1):",
-                                "        for c in (0,1):",
-                                "          for d in (0,1):",
-                                "            ones = (a==1)+(b==1)+(c==1)+(d==1)",
-                                ("            g4 = d40_s[j] if ones==0 else (d31_s[j] if ones==1 else (d22_s[j] if ones==2 else (d13_s[j] if ones==3 else d04_s[j])))"
-                                 if op.side else
-                                 "            g4 = d40_q[j] if ones==0 else (d31_q[j] if ones==1 else (d22_q[j] if ones==2 else (d13_q[j] if ones==3 else d04_q[j])))"),
-
-                                f"            s += g4 * {A_loc}[a,axes[0]]*{A_loc}[b,axes[1]]*{A_loc}[c,axes[2]]*{A_loc}[d,axes[3]]",
-                                "    # g3 · A2 term (choose the A2 holder, choose a pair)",
-                                "    for a in (0,1):",
-                                "      for b in (0,1):",
-                                "        for c in (0,1):",
-                                ("        g3v = d30_s[j] if (a+b+c)==0 else (d21_s[j] if (a+b+c)==1 else (d12_s[j] if (a+b+c)==2 else d03_s[j]))"
-                                 if op.side else
-                                 "        g3v = d30_q[j] if (a+b+c)==0 else (d21_q[j] if (a+b+c)==1 else (d12_q[j] if (a+b+c)==2 else d03_q[j]))"),
-
-                                "          for holder in (0,1,2):",
-                                "            hb = [a,b,c][holder]",
-                                "            Hb = Hx if hb==0 else Hy",
-                                "            others = [a,b,c][:holder]+[a,b,c][holder+1:]",
-                                "            for p in range(4):",
-                                "              for q in range(p+1,4):",
-                                "                r = [0,1,2,3]",
-                                "                r.remove(p); r.remove(q)",
-                                f"                s += g3v * Hb[axes[p],axes[q]] * {A_loc}[others[0],axes[r[0]]] * {A_loc}[others[1],axes[r[1]]]",
-                                "    # g2 · (A2·A2) term",
-                                "    for a in (0,1):",
-                                "      for b in (0,1):",
-                                ("        g2v = d20_s[j] if (a==0 and b==0) else (d11_s[j] if a!=b else d02_s[j])"
-                                 if op.side else
-                                 "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])"),
-                                "        Ha = Hx if a==0 else Hy; Hb = Hx if b==0 else Hy",
-                                "        s += g2v * ( Ha[axes[0],axes[1]]*Hb[axes[2],axes[3]] + Ha[axes[0],axes[2]]*Hb[axes[1],axes[3]] + Ha[axes[0],axes[3]]*Hb[axes[1],axes[2]] )",
-                                "    # g2 · A3 term (pick the single-A index)",
-                                "    for a in (0,1):",
-                                "      for b in (0,1):",
-                                ("        g2v = d20_s[j] if (a==0 and b==0) else (d11_s[j] if a!=b else d02_s[j])"
-                                 if op.side else
-                                 "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])"),
-                                "        Tb = Tx0 if b==0 else Tx1; Ta = Tx0 if a==0 else Tx1",
-                                "        for p in range(4):",
-                                "            rest = [axes[i] for i in range(4) if i != p]",
-                                f"            s += g2v * ( {A_loc}[a,axes[p]] * Tb[rest[0],rest[1],rest[2]] + {A_loc}[b,axes[p]] * Ta[rest[0],rest[1],rest[2]] )",
-                                "    # g1 · A4 term",
-                                ("    s += d10_s[j] * Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_s[j] * Qx1[axes[0],axes[1],axes[2],axes[3]]"
-                                 if op.side else
-                                 "    s += d10_q[j] * Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_q[j] * Qx1[axes[0],axes[1],axes[2],axes[3]]"),
-                                f"    {row}[j] = s",
+                                f"{row} = pushforward_d4({d10v}, {d01v}, {d20v}, {d11v}, {d02v}, {d30v}, {d21v}, {d12v}, {d03v}, {d40v}, {d31v}, {d22v}, {d13v}, {d04v}, {A_loc}, Hx, Hy, Tx0, Tx1, Qx0, Qx1, axes, {self.dtype})",
                             ]
 
                         # Pad to union if side-restricted
@@ -1150,6 +1092,11 @@ class NumbaCodeGen:
                                 axes_lit = ",".join(["0"]*ox + ["1"]*oy)
                                 body_lines.append(f"axes = np.array([{axes_lit}], dtype=np.int32)")
 
+                                d10v = "d10_s" if op.side else "d10_q"
+                                d01v = "d01_s" if op.side else "d01_q"
+                                d20v = "d20_s" if op.side else "d20_q"
+                                d11v = "d11_s" if op.side else "d11_q"
+                                d02v = "d02_s" if op.side else "d02_q"
                                 if tot == 2:
                                     body_lines += [
                                         f"Hx = {H0}[e,q]; Hy = {H1}[e,q]",
@@ -1168,82 +1115,27 @@ class NumbaCodeGen:
                                         f"    {row}[j] = val",
                                     ]
                                 elif tot == 3:
+                                    d30v = "d30_s" if op.side else "d30_q"
+                                    d21v = "d21_s" if op.side else "d21_q"
+                                    d12v = "d12_s" if op.side else "d12_q"
+                                    d03v = "d03_s" if op.side else "d03_q"
                                     body_lines += [
                                         f"Hx = {H0}[e,q]; Hy = {H1}[e,q]; Tx0={T0}[e,q]; Tx1={T1}[e,q]",
-                                        "for j in range(nloc):",
-                                        "    s = 0.0",
-                                        "    # g3 term",
-                                        "    for a in (0,1):",
-                                        "      for b in (0,1):",
-                                        "        for c in (0,1):",
-                                        "          ones = (a==1)+(b==1)+(c==1)",
-                                        ("          g3 = d30_s[j] if ones==0 else (d21_s[j] if ones==1 else (d12_s[j] if ones==2 else d03_s[j]))"
-                                         if op.side else
-                                         "          g3 = d30_q[j] if ones==0 else (d21_q[j] if ones==1 else (d12_q[j] if ones==2 else d03_q[j]))"),
-
-                                        f"          s += g3 * {A_loc}[a,axes[0]]*{A_loc}[b,axes[1]]*{A_loc}[c,axes[2]]",
-                                        "    # g2 · A2 (3 permutations)",
-                                        "    for a in (0,1):",
-                                        "      for b in (0,1):",
-                                        ("        g2 = d20_s[j] if (a==0 and b==0) else (d11_s[j] if a!=b else d02_s[j])"
-                                         if op.side else
-                                         "        g2 = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])"),
-
-                                        "        Hb = Hx if b==0 else Hy",
-                                        f"        s += g2 * ( {A_loc}[a,axes[0]]*Hb[axes[1],axes[2]] + {A_loc}[a,axes[1]]*Hb[axes[0],axes[2]] + {A_loc}[a,axes[2]]*Hb[axes[0],axes[1]] )",
-                                        "    # g1 · A3",
-                                        ("    s += d10_s[j]*Tx0[axes[0],axes[1],axes[2]] + d01_s[j]*Tx1[axes[0],axes[1],axes[2]]"
-                                     if op.side else
-                                     "    s += d10_q[j]*Tx0[axes[0],axes[1],axes[2]] + d01_q[j]*Tx1[axes[0],axes[1],axes[2]]"),
-
-                                        f"    {row}[j] = s",
+                                        f"{row} = pushforward_d3({d10v}, {d01v}, {d20v}, {d11v}, {d02v}, {d30v}, {d21v}, {d12v}, {d03v}, {A_loc}, Hx, Hy, Tx0, Tx1, axes, {self.dtype})",
                                     ]
                                 else:  # tot == 4
+                                    d30v = "d30_s" if op.side else "d30_q"
+                                    d21v = "d21_s" if op.side else "d21_q"
+                                    d12v = "d12_s" if op.side else "d12_q"
+                                    d03v = "d03_s" if op.side else "d03_q"
+                                    d40v = "d40_s" if op.side else "d40_q"
+                                    d31v = "d31_s" if op.side else "d31_q"
+                                    d22v = "d22_s" if op.side else "d22_q"
+                                    d13v = "d13_s" if op.side else "d13_q"
+                                    d04v = "d04_s" if op.side else "d04_q"
                                     body_lines += [
                                         f"Hx = {H0}[e,q]; Hy = {H1}[e,q]; Tx0={T0}[e,q]; Tx1={T1}[e,q]; Qx0={Q0}[e,q]; Qx1={Q1}[e,q]",
-                                        "for j in range(nloc):",
-                                        "    s = 0.0",
-                                        "    # g4 term",
-                                        "    for a in (0,1):",
-                                        "      for b in (0,1):",
-                                        "        for c in (0,1):",
-                                        "          for d in (0,1):",
-                                        "            ones = (a==1)+(b==1)+(c==1)+(d==1)",
-                                        ("            g4 = d40_s[j] if ones==0 else (d31_s[j] if ones==1 else (d22_s[j] if ones==2 else (d13_s[j] if ones==3 else d04_s[j]))"
-                                         if op.side else
-                                         "            g4 = d40_q[j] if ones==0 else (d31_q[j] if ones==1 else (d22_q[j] if ones==2 else (d13_q[j] if ones==3 else d04_q[j]))"),
-                                        f"            s += g4 * {A_loc}[a,axes[0]]*{A_loc}[b,axes[1]]*{A_loc}[c,axes[2]]*{A_loc}[d,axes[3]]",
-                                        "    # g3 · A2 (place A2 in one slot, A in the others)",
-                                        "    for a in (0,1):",
-                                        "      for b in (0,1):",
-                                        ("        g3v = d30_s[j] if (a+b)==0 else (d21_s[j] if (a+b)==1 else (d12_s[j] if (a+b)==2 else d03_s[j]))"
-                                         if op.side else 
-                                         "        g3v = d30_q[j] if (a+b)==0 else (d21_q[j] if (a+b)==1 else (d12_q[j] if (a+b)==2 else d03_q[j]))"),
-                                        "        for holder in (0,1,2):",
-                                        "            hb = [a,b,0][holder]  # dummy pick; indices only drive ones count",
-                                        "            Hb = Hx if hb==0 else Hy",
-                                        "            for p in range(4):",
-                                        "              for q2 in range(p+1,4):",
-                                        "                r = [0,1,2,3]",
-                                        "                r.remove(p); r.remove(q2)",
-                                        f"                s += g3v * Hb[axes[p],axes[q2]] * {A_loc}[a,axes[r[0]]] * {A_loc}[b,axes[r[1]]]",
-                                        "    # g2 · (A2·A2) + g2 · A3",
-                                        "    for a in (0,1):",
-                                        "      for b in (0,1):",
-                                        ("        g2v = d20_s[j] if (a==0 and b==0) else (d11_s[j] if a!=b else d02_s[j])"
-                                         if op.side else
-                                         "        g2v = d20_q[j] if (a==0 and b==0) else (d11_q[j] if a!=b else d02_q[j])"),
-                                        "        Ha = Hx if a==0 else Hy; Hb = Hx if b==0 else Hy",
-                                        "        s += g2v * ( Ha[axes[0],axes[1]]*Hb[axes[2],axes[3]] + Ha[axes[0],axes[2]]*Hb[axes[1],axes[3]] + Ha[axes[0],axes[3]]*Hb[axes[1],axes[2]] )",
-                                        "        Tb = Tx0 if b==0 else Tx1; Ta = Tx0 if a==0 else Tx1",
-                                        "        for p in range(4):",
-                                        "            rest = [axes[i] for i in range(4) if i != p]",
-                                        f"            s += g2v * ( {A_loc}[a,axes[p]] * Tb[rest[0],rest[1],rest[2]] + {A_loc}[b,axes[p]] * Ta[rest[0],rest[1],rest[2]] )",
-                                        "    # g1 · A4",
-                                        ("    s += d10_s[j]*Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_s[j]*Qx1[axes[0],axes[1],axes[2],axes[3]]"
-                                         if op.side else
-                                         "    s += d10_q[j]*Qx0[axes[0],axes[1],axes[2],axes[3]] + d01_q[j]*Qx1[axes[0],axes[1],axes[2],axes[3]]"),
-                                        f"    {row}[j] = s",
+                                        f"{row} = pushforward_d4({d10v}, {d01v}, {d20v}, {d11v}, {d02v}, {d30v}, {d21v}, {d12v}, {d03v}, {d40v}, {d31v}, {d22v}, {d13v}, {d04v}, {A_loc}, Hx, Hy, Tx0, Tx1, Qx0, Qx1, axes, {self.dtype})",
                                     ]
 
                                 # collapse with coefficients; pad to union if sided
@@ -3323,12 +3215,16 @@ from pycutfem.jit.numba_helpers import (
     transpose_matrix,
     dot_value_with_grad,
     dot_grad_with_value,
+    pushforward_d3,
+    pushforward_d4,
     compute_physical_hessian,
     compute_physical_laplacian,
     load_variable_qp,
     gradient_qp,
     laplacian_qp,
     hessian_qp,
+    ghost_grad_jump_penalty_scalar,
+    ghost_grad_jump_penalty_vector,
     binary_add_generic,
     binary_add_3_4,
     binary_add_4_3,
