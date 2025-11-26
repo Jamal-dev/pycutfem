@@ -24,10 +24,20 @@ _EDGE_COLOR = {
     "ghost": "blue",
     "ghost_pos": "cyan",
     "ghost_neg": "darkviolet",
-    "ghost_both": "red",
-    "interface": "green",
+    "ghost_both": "azure",
+    "interface": "olive",
     "cut_boundary": "red",
     "default": "black",
+}
+_EDGE_WIDTH = {
+    "boundary": 1.2,
+    "ghost": 1.0,
+    "ghost_pos": 2.5,
+    "ghost_neg": 2.5,
+    "ghost_both": 2.5,
+    "interface": 3.0,
+    "cut_boundary": 1.6,
+    "default": 0.9,
 }
 
 _NODE_COLOR = {
@@ -38,6 +48,9 @@ _NODE_COLOR = {
 
 def _edge_col(tag):
     return _EDGE_COLOR.get(tag, 'black')
+
+def _edge_lw(tag):
+    return _EDGE_WIDTH.get(tag, _EDGE_WIDTH["default"])
 
 def _elem_fill(tag):
     # If tag is not in _ELEM_FILL, use the default color.
@@ -105,18 +118,24 @@ def plot_mesh(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True,
     if plot_edges and hasattr(mesh, 'edges'):
         edge_segments = [mesh.nodes_x_y_pos[list(edge.nodes)] for edge in mesh.edges]
         edge_colors_list = []
+        edge_widths_list = []
         for edge in mesh.edges:
             color = 'black'  # Default for internal, untagged edges
+            lw = _edge_lw("default")
             # Check for boundary edges first
             if edge.right is None:
                 color = 'dimgray' # Specific color for boundary edges
+                lw = _edge_lw("boundary")
             # Tagged edges override other colors
             if edge_colors and hasattr(mesh, 'edge_tag') and mesh.edge_tag[edge.id]:
-                color = _EDGE_COLOR.get(mesh.edge_tag[edge.id], color)
+                tag = mesh.edge_tag[edge.id]
+                color = _EDGE_COLOR.get(tag, color)
+                lw = _edge_lw(tag)
             edge_colors_list.append(color)
+            edge_widths_list.append(lw)
         
         line_collection = LineCollection(edge_segments, colors=edge_colors_list, 
-                                         linewidths=0.9, zorder=2)
+                                         linewidths=edge_widths_list, zorder=2)
         ax.add_collection(line_collection)
 
     # --- Plot Nodes (all of them, differentiating corners) ---
@@ -307,7 +326,15 @@ def plot_mesh_2(
 
         for tag in sorted(list(unique_edge_tags)):
             if tag in _EDGE_COLOR:
-                legend_handles.append(plt.Line2D([0], [0], color=_EDGE_COLOR[tag], lw=2, label=f'Edge: {tag}'))
+                legend_handles.append(
+                    plt.Line2D(
+                        [0],
+                        [0],
+                        color=_EDGE_COLOR[tag],
+                        lw=_edge_lw(tag),
+                        label=f'Edge: {tag}',
+                    )
+                )
 
         # 4. Highlight problematic edges (e.g., cracks/zero-length) if provided
         if highlight_edges is not None:
