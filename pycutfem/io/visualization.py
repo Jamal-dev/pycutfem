@@ -222,10 +222,22 @@ def plot_mesh(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True,
         
     return ax
 
-def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True,
-              plot_edges=True, elem_tags=True, edge_colors=True,
-              show=True, ax=None, resolution=200, plot_interface=True,
-              edge_filter: Union[str, List[str]] = None):
+def plot_mesh_2(
+    mesh,
+    *,
+    solution_on_nodes=None,
+    level_set=None,
+    plot_nodes=True,
+    plot_edges=True,
+    elem_tags=True,
+    edge_colors=True,
+    show=True,
+    ax=None,
+    resolution=200,
+    plot_interface=True,
+    edge_filter: Union[str, List[str]] = None,
+    highlight_edges: Optional[Iterable[int]] = None,
+):
     """
     Plots a 2D mesh, correctly using the nodes_x_y_pos attribute for coordinates
     and adding a descriptive legend for tags.
@@ -294,8 +306,33 @@ def plot_mesh_2(mesh, *, solution_on_nodes=None, level_set=None, plot_nodes=True
             unique_edge_tags.add('boundary')
 
         for tag in sorted(list(unique_edge_tags)):
-             if tag in _EDGE_COLOR:
+            if tag in _EDGE_COLOR:
                 legend_handles.append(plt.Line2D([0], [0], color=_EDGE_COLOR[tag], lw=2, label=f'Edge: {tag}'))
+
+        # 4. Highlight problematic edges (e.g., cracks/zero-length) if provided
+        if highlight_edges is not None:
+            hl_edges = list(highlight_edges)
+            midpoints = []
+            edge_segments_hl = []
+            for gid in hl_edges:
+                if gid is None or gid < 0 or gid >= len(mesh.edges_list):
+                    continue
+                e = mesh.edges_list[int(gid)]
+                nids = list(e.all_nodes) if getattr(e, "all_nodes", ()) else list(e.nodes)
+                if len(nids) < 2:
+                    continue
+                pts = node_coords[nids]
+                midpoints.append(pts.mean(axis=0))
+                for i in range(len(nids) - 1):
+                    edge_segments_hl.append(pts[i : i + 2])
+            # Always add a legend entry when a list was provided so users know what to look for.
+            legend_handles.append(plt.Line2D([0], [0], color='red', lw=3.5, label='Pathology edge'))
+            if edge_segments_hl:
+                lc_hl = LineCollection(edge_segments_hl, colors='red', linewidths=4.5, zorder=8, capstyle='round')
+                ax.add_collection(lc_hl)
+            if midpoints:
+                mp = np.asarray(midpoints, float)
+                ax.plot(mp[:, 0], mp[:, 1], 'o', color='red', markersize=5.5, markeredgecolor='white', zorder=9)
     # --- END MODIFIED SECTION ---
 
     if level_set is not None:

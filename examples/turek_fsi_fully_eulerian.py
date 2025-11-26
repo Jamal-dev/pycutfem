@@ -19,6 +19,7 @@ import os
 import sys
 import argparse
 import time
+from functools import lru_cache
 from typing import Dict, Iterable, Sequence
 
 import numba
@@ -31,6 +32,7 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.utils.bitset import BitSet
 from pycutfem.utils.ogrid_meshgen import circular_hole_ogrid
+from pycutfem.fem.reference import get_reference
 
 from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.expressions import (
@@ -185,11 +187,17 @@ def build_structured_channel_mesh(mesh_size: float, poly_order: int) -> Mesh:
     """
     Structured O-grid mesh of the channel with a circular hole.
     """
-    margin = max(2.5 * mesh_size, 0.015)
+    # Keep a thin gap between the circle and the inner box even for coarse meshes.
+    base_margin = max(2.5 * mesh_size, 0.015)
+    min_half_cap = min(CENTER[0], L - CENTER[0], CENTER[1], H - CENTER[1])
+    min_ring = max(0.5 * mesh_size, 0.005)
+    max_margin = min_half_cap - (RADIUS + min_ring)
+    if max_margin <= 0.0:
+        raise RuntimeError("O-grid collapsed: circle too close to boundary; reduce radius or move center.")
+    margin = min(base_margin, max_margin)
+
     half_x_cap = min(CENTER[0], L - CENTER[0]) - margin
     half_y_cap = min(CENTER[1], H - CENTER[1]) - margin
-    if half_x_cap <= RADIUS or half_y_cap <= RADIUS:
-        raise RuntimeError("O-grid collapsed: decrease mesh size or adjust parameters.")
     hx = half_x_cap
     hy = half_y_cap
     ring_thickness = min(hx, hy) - RADIUS
@@ -503,6 +511,63 @@ def _generate_sequences(primary_orientation: str, depth: int) -> list[list[str]]
     return seqs
 
 
+def _parent_parametric_grid(p: int) -> np.ndarray:
+    """Full parent reference grid (no split applied)."""
+    t = np.linspace(-1.0, 1.0, p + 1)
+    xi, eta = np.meshgrid(t, t, indexing="xy")
+    return np.column_stack([xi.ravel(), eta.ravel()])
+
+
+def _grid_key(grid: np.ndarray, ndp: int = 12) -> tuple[tuple[float, float], ...]:
+    """Hashable, rounded representation of a parametric grid."""
+    return tuple((float(np.round(pt[0], ndp)), float(np.round(pt[1], ndp))) for pt in np.asarray(grid))
+
+
+@lru_cache(maxsize=None)
+def _shape_table_for_grid(element_type: str, poly_order: int, grid_key: tuple[tuple[float, float], ...]) -> np.ndarray:
+    """
+    Tabulate reference shape functions for all points in `grid_key`.
+    Cached so repeated refinement stages reuse the same tables.
+    """
+    ref = get_reference(element_type, poly_order)
+    n_pts = len(grid_key)
+    n_loc = len(ref.shape(0.0, 0.0))
+    tab = np.empty((n_pts, n_loc), dtype=float)
+    for i, (xi, eta) in enumerate(grid_key):
+        tab[i, :] = ref.shape(float(xi), float(eta))
+    return tab
+
+
+def _map_grid_to_physical(mesh: Mesh, eid: int, grid: np.ndarray) -> np.ndarray:
+    """
+    Fast batched parent→physical mapping for all points in `grid` on element `eid`.
+    Uses cached reference shape tables to avoid thousands of transform.x_mapping calls.
+    """
+    key = _grid_key(grid)
+    Ntab = _shape_table_for_grid(mesh.element_type, mesh.poly_order, key)
+    coords = mesh.nodes_x_y_pos[mesh.elements_connectivity[eid]]
+    return Ntab @ coords
+
+
+def _on_parent_edge(pt: np.ndarray, corners_xy: np.ndarray, tol: float = 1.0e-12) -> bool:
+    """Detect whether point lies on any parent edge (straight edges only)."""
+    edge_pairs = ((0, 1), (1, 2), (2, 3), (3, 0))
+    for i0, i1 in edge_pairs:
+        a = corners_xy[i0]
+        b = corners_xy[i1]
+        ab = b - a
+        L2 = float(np.dot(ab, ab))
+        if L2 <= tol:
+            continue
+        cross = abs((pt[0] - a[0]) * ab[1] - (pt[1] - a[1]) * ab[0])
+        if cross > tol * max(1.0, math.sqrt(L2)):
+            continue
+        s = np.dot(pt - a, ab) / L2
+        if -tol <= s <= 1.0 + tol:
+            return True
+    return False
+
+
 def mark_elements_near_levelset(mesh: Mesh, level_set, band: float, levels: int = 1) -> set[int]:
     """Mark elements whose corner box intersects the level set band; expand to neighbor layers."""
     marked: set[int] = set()
@@ -541,81 +606,80 @@ def mark_elements_near_levelset(mesh: Mesh, level_set, band: float, levels: int 
     return marked
 
 
-def _precompute_child_parametric_fast(p: int) -> dict[str, np.ndarray]:
-    t = np.linspace(-1.0, 1.0, p + 1)
-    grids = {}
-    for ref in ("left", "right", "bottom", "top"):
-        xi_list = []
-        eta_list = []
-        for eta in t:
-            for xi in t:
-                if ref == "left":
-                    xi_p = 0.5 * (xi - 1.0)
-                    eta_p = eta
-                elif ref == "right":
-                    xi_p = 0.5 * (xi + 1.0)
-                    eta_p = eta
-                elif ref == "bottom":
-                    xi_p = xi
-                    eta_p = 0.5 * (eta - 1.0)
-                elif ref == "top":
-                    xi_p = xi
-                    eta_p = 0.5 * (eta + 1.0)
-                xi_list.append(xi_p)
-                eta_list.append(eta_p)
-        grids[ref] = np.column_stack([np.asarray(xi_list), np.asarray(eta_list)])
-    return grids
-
-
-def _apply_sequence_to_grid(base_grid: np.ndarray, sequence: list[str]) -> np.ndarray:
-    xi_eta = base_grid.copy()
-    for op in sequence:
-        if op == "left":
-            xi_eta[:, 0] = 0.5 * (xi_eta[:, 0] - 1.0)
-        elif op == "right":
-            xi_eta[:, 0] = 0.5 * (xi_eta[:, 0] + 1.0)
-        elif op == "bottom":
-            xi_eta[:, 1] = 0.5 * (xi_eta[:, 1] - 1.0)
-        elif op == "top":
-            xi_eta[:, 1] = 0.5 * (xi_eta[:, 1] + 1.0)
-    return xi_eta
-
-
-def _generate_sequences(primary_orientation: str, depth: int) -> list[list[str]]:
-    if primary_orientation == "vertical":
-        seqs = [["left"], ["right"]]
-    else:
-        seqs = [["bottom"], ["top"]]
-    orient = primary_orientation
-    for _ in range(1, depth):
-        orient = "horizontal" if orient == "vertical" else "vertical"
-        ops = ["bottom", "top"] if orient == "horizontal" else ["left", "right"]
-        seqs = [s + [op] for s in seqs for op in ops]
-    return seqs
+def enforce_balance(mesh: Mesh, marked_set: set[int], max_ratio: float = 2.0) -> set[int]:
+    """
+    Propagate refinement markers to enforce a simple 2:1 balance.
+    If a neighbour is more than ~1.5x larger, mark it too.
+    Also guard against long chains of hanging nodes along a shared edge by
+    forcing the coarse neighbour to refine when the subdivision ratio exceeds
+    `max_ratio`.
+    """
+    marked = set(marked_set)
+    changed = True
+    while changed:
+        changed = False
+        for eid in list(marked):
+            h_curr = mesh.element_char_length(eid)
+            for nb_id in mesh._neighbors[eid]:
+                if nb_id is None:
+                    continue
+                if nb_id not in marked:
+                    h_nb = mesh.element_char_length(nb_id)
+                    if h_nb > 1.3 * h_curr:
+                        marked.add(int(nb_id))
+                        changed = True
+                        continue
+                # Shared edge subdivision check (hanging node ratio)
+                for gid in mesh.elements_list[eid].edges:
+                    if gid is None or gid < 0:
+                        continue
+                    e = mesh.edges_list[int(gid)]
+                    other = e.right if e.left == eid else e.left
+                    if other != nb_id:
+                        continue
+                    l_cnt = max(len(e.left_nodes), 1)
+                    r_cnt = max(len(e.right_nodes), 1)
+                    coarse = min(l_cnt, r_cnt)
+                    fine = max(l_cnt, r_cnt)
+                    if coarse > 0 and fine > max_ratio * coarse:
+                        target = e.left if l_cnt < r_cnt else e.right
+                        if target is not None and target not in marked:
+                            marked.add(int(target))
+                            changed = True
+                    break
+    return marked
 
 
 def _refine_element_with_sequences_fast(mesh: Mesh, eid: int, sequences: list[list[str]], nodes, node_lookup, base_grid: np.ndarray, xi_to_idx, bl, br, tr, tl) -> tuple[list[list[int]], list[list[int]]]:
     conns_out: list[list[int]] = []
     corners_out: list[list[int]] = []
 
-    def _get_node(xi_p: float, eta_p: float) -> int:
-        key_pe = (float(np.round(xi_p, 12)), float(np.round(eta_p, 12)))
-        idx = xi_to_idx.get(key_pe)
-        if idx is not None:
-            return int(mesh.elements_connectivity[eid][idx])
-        x_phys = transform.x_mapping(mesh, eid, (float(xi_p), float(eta_p)))
-        key = (float(round(x_phys[0], 14)), float(round(x_phys[1], 14)))
-        nid = node_lookup.get(key)
-        if nid is not None:
-            return nid
-        nid = len(nodes)
-        node_lookup[key] = nid
-        nodes.append(Node(nid, float(x_phys[0]), float(x_phys[1])))
-        return nid
+    # Cache parametric grids per sequence for this element to avoid repeated transforms.
+    seq_cache: dict[tuple[str, ...], np.ndarray] = {}
 
     for seq in sequences:
-        grid = _apply_sequence_to_grid(base_grid, seq)
-        conn = [_get_node(float(xi), float(eta)) for xi, eta in grid]
+        key = tuple(seq)
+        grid = seq_cache.get(key)
+        if grid is None:
+            grid = _apply_sequence_to_grid(base_grid, seq)
+            seq_cache[key] = grid
+        phys_pts = _map_grid_to_physical(mesh, eid, grid)
+        conn = []
+        for (xi, eta), p_phys in zip(grid, phys_pts):
+            xi_p = float(np.round(xi, 12))
+            eta_p = float(np.round(eta, 12))
+            key_pe = (xi_p, eta_p)
+            idx = xi_to_idx.get(key_pe)
+            if idx is not None:
+                conn.append(int(mesh.elements_connectivity[eid][idx]))
+                continue
+            key = (float(round(p_phys[0], 14)), float(round(p_phys[1], 14)))
+            nid = node_lookup.get(key)
+            if nid is None:
+                nid = len(nodes)
+                node_lookup[key] = nid
+                nodes.append(Node(nid, float(p_phys[0]), float(p_phys[1])))
+            conn.append(int(nid))
         corners = [conn[bl], conn[br], conn[tr], conn[tl]]
         conns_out.append(conn)
         corners_out.append(corners)
@@ -626,9 +690,9 @@ def asymmetric_refine_around_beam_fast(mesh: Mesh, beam_ls: BeamLevelSet, levels
     """Optimized refinement around the beam using precomputed param grids."""
     if mesh.element_type != "quad":
         return mesh
-    band = band or max(3.0 * beam_ls.hy, 4.0 * MESH_SIZE)
+    band = band or max(4.0 * beam_ls.hy, 1.5 * MESH_SIZE)
     center_x = float(getattr(beam_ls, "cx", BEAM_CENTER[0]))
-    splits_per_mark = max(1, min(int(splits_per_mark), 3))
+    base_splits = max(1, int(splits_per_mark))
 
     marked = mark_elements_near_levelset(mesh, beam_ls, band=band, levels=levels)
     print(f"[refine_beam_fast] total marked {len(marked)} elems (band={band:.4f}, levels={levels})")
@@ -644,7 +708,7 @@ def asymmetric_refine_around_beam_fast(mesh: Mesh, beam_ls: BeamLevelSet, levels
     t = np.linspace(-1.0, 1.0, p + 1)
     xi_to_idx_template = {(float(xi), float(eta)): int(j * (p + 1) + i) for j, eta in enumerate(t) for i, xi in enumerate(t)}
     bl, br, tr, tl = _quad_corner_indices(p)
-    base_grid_left = _precompute_child_parametric_fast(p)["left"]
+    base_grid_parent = _parent_parametric_grid(p)
 
     t0_split = time.perf_counter()
     for eid, elem in enumerate(mesh.elements_list):
@@ -653,10 +717,31 @@ def asymmetric_refine_around_beam_fast(mesh: Mesh, beam_ls: BeamLevelSet, levels
             new_corners.append(list(mesh.corner_connectivity[eid]))
             continue
         cx, _ = elem.centroid()
-        primary = "vertical" if cx <= center_x else "horizontal"
-        sequences = _generate_sequences(primary, splits_per_mark)
+        corners = mesh.nodes_x_y_pos[list(elem.corner_nodes)]
+        h_y = float(corners[:, 1].max() - corners[:, 1].min())
+        h_x = float(corners[:, 0].max() - corners[:, 0].min())
+
+        # target thickness: resolve beam height by at least ~3 layers
+        target_h = max(beam_ls.hy / 3.0, 0.25 * MESH_SIZE)
+
+        # Bias orientation when elements are too tall relative to beam thickness.
+        if h_y > 1.1 * target_h:
+            primary = "horizontal"
+        else:
+            primary = "vertical" if cx <= center_x else "horizontal"
+
+        ratio = max(h_y / max(target_h, 1e-14), 1.0)
+        needed_horiz = int(math.ceil(math.log(ratio, 2))) if ratio > 1.0 else 0
+        # horizontals: left of center → occur on even splits; right → on odd splits
+        if primary == "vertical":
+            min_splits = 2 * needed_horiz if needed_horiz > 0 else base_splits
+        else:
+            min_splits = max(base_splits, max(1, 2 * needed_horiz - 1) if needed_horiz > 0 else base_splits)
+        splits = max(base_splits, min_splits)
+        splits = min(splits, 7)  # allow more refinement across beam thickness
+        sequences = _generate_sequences(primary, splits)
         conns, corners = _refine_element_with_sequences_fast(
-            mesh, eid, sequences, nodes, node_lookup, base_grid_left, xi_to_idx_template, bl, br, tr, tl
+            mesh, eid, sequences, nodes, node_lookup, base_grid_parent, xi_to_idx_template, bl, br, tr, tl
         )
         new_elems.extend(conns)
         new_corners.extend(corners)
@@ -672,6 +757,759 @@ def asymmetric_refine_around_beam_fast(mesh: Mesh, beam_ls: BeamLevelSet, levels
     tag_channel_boundaries(new_mesh, MESH_SIZE)
     print(f"[refine_beam_fast] final mesh: {len(new_mesh.elements_list)} elems, {len(new_mesh.nodes_list)} nodes")
     return new_mesh
+
+
+def refine_beam_anisotropic(mesh: Mesh, beam_ls: BeamLevelSet, *, levels: int = 2, target_h: float | None = None) -> Mesh:
+    """
+    Anisotropic refinement around the beam:
+      1) mark cells intersecting the beam band (plus neighbour halo)
+      2) split marked cells with orientation chosen to reduce height first
+      3) propagate tags/hanging nodes and run diagnostics after each pass
+    """
+    if mesh.element_type != "quad":
+        return mesh
+
+    target_h = target_h or float(getattr(beam_ls, "hy", BEAM_HEIGHT * 0.5))
+    # Keep the band tight to the beam but wide enough to include a neighbour halo.
+    band = max(2.5 * target_h, 1.2 * getattr(beam_ls, "hy", target_h))
+
+    p = mesh.poly_order
+    t = np.linspace(-1.0, 1.0, p + 1)
+    xi_to_idx_template = {(float(xi), float(eta)): int(j * (p + 1) + i) for j, eta in enumerate(t) for i, xi in enumerate(t)}
+    bl, br, tr, tl = _quad_corner_indices(p)
+    base_grid_parent = _parent_parametric_grid(p)
+
+    def _on_parent_edge(pt: np.ndarray, corners_xy: np.ndarray, tol: float = 1.0e-12) -> bool:
+        # Detect whether point lies on any parent edge (straight edges only).
+        edge_pairs = ((0, 1), (1, 2), (2, 3), (3, 0))
+        for i0, i1 in edge_pairs:
+            a = corners_xy[i0]
+            b = corners_xy[i1]
+            ab = b - a
+            L2 = float(np.dot(ab, ab))
+            if L2 <= tol:
+                continue
+            cross = abs((pt[0] - a[0]) * ab[1] - (pt[1] - a[1]) * ab[0])
+            if cross > tol * max(1.0, math.sqrt(L2)):
+                continue
+            s = np.dot(pt - a, ab) / L2
+            if -tol <= s <= 1.0 + tol:
+                return True
+        return False
+
+    beam_xmin = float(beam_ls.cx - beam_ls.hx)
+    beam_xmax = float(beam_ls.cx + beam_ls.hx)
+
+    def _refine_once(mesh_in: Mesh, marked: set[int]) -> Mesh:
+        nodes = list(mesh_in.nodes_list)
+        node_lookup = {(round(nd.x, 14), round(nd.y, 14)): int(nd.id) for nd in nodes}
+        hanging_nodes: set[int] = set(getattr(mesh_in, "hanging_nodes", []))
+        new_elems: list[list[int]] = []
+        new_corners: list[list[int]] = []
+        parent_to_children: dict[int, list[int]] = {}
+
+        for eid, elem in enumerate(mesh_in.elements_list):
+            if eid not in marked:
+                new_elems.append(list(mesh_in.elements_connectivity[eid]))
+                new_corners.append(list(mesh_in.corner_connectivity[eid]))
+                parent_to_children[eid] = [len(new_elems) - 1]
+                continue
+
+            corners_xy = mesh_in.nodes_x_y_pos[list(elem.corner_nodes)]
+            h_y = float(corners_xy[:, 1].max() - corners_xy[:, 1].min())
+            h_x = float(corners_xy[:, 0].max() - corners_xy[:, 0].min())
+
+            # Number of horizontal splits required to drive height below target.
+            horiz_needed = int(math.ceil(math.log(h_y / target_h, 2))) if h_y > target_h + 1.0e-12 else 0
+            depth = max(1, 2 * horiz_needed - 1) if horiz_needed > 0 else 1
+
+            # Enforce some vertical splits when element spans beam in x-direction.
+            vert_needed = 0
+            if corners_xy[:, 0].min() <= beam_xmax and corners_xy[:, 0].max() >= beam_xmin:
+                vert_needed = int(math.ceil(math.log(h_x / target_h, 2))) if h_x > target_h + 1.0e-12 else 0
+            depth = max(depth, 2 * vert_needed) if vert_needed > 0 else depth
+
+            # Insert an extra vertical split for very elongated cells to avoid stripes.
+            if h_x > 2.0 * max(h_y, 1.0e-14):
+                depth = min(depth + 1, 9)
+            depth = min(depth, 9)
+
+            sequences = _generate_sequences("horizontal", depth)
+
+            before_nodes = len(nodes)
+            conns, corners = _refine_element_with_sequences_fast(
+                mesh_in, eid, sequences, nodes, node_lookup, base_grid_parent, xi_to_idx_template, bl, br, tr, tl
+            )
+            new_node_ids = range(before_nodes, len(nodes))
+            for nid in new_node_ids:
+                pt = np.array([nodes[nid].x, nodes[nid].y], float)
+                if _on_parent_edge(pt, corners_xy):
+                    hanging_nodes.add(nid)
+
+            idx_children = []
+            for conn_child, corners_child in zip(conns, corners):
+                idx_children.append(len(new_elems))
+                new_elems.append(conn_child)
+                new_corners.append(corners_child)
+            parent_to_children[eid] = idx_children
+
+        refined = Mesh(
+            nodes=nodes,
+            element_connectivity=np.asarray(new_elems, dtype=int),
+            elements_corner_nodes=np.asarray(new_corners, dtype=int),
+            element_type="quad",
+            poly_order=mesh_in.poly_order,
+        )
+        refined.hanging_nodes = sorted(hanging_nodes)
+        refined.parent_to_children = parent_to_children
+        tag_channel_boundaries(refined, MESH_SIZE)
+        return refined
+    def _refine_tjunctions_by_side(mesh_in: Mesh, max_segments: int = 2) -> Mesh:
+        """
+        Refine coarse neighbours to remove >2:1 chains along *entire sides*.
+
+        A side is 'bad' if len(elem.edges_by_side[side]) > max_segments.
+        We then refine that element in the orientation orthogonal to the side
+        (vertical split for bottom/top, horizontal for left/right).
+        """
+        if mesh_in.element_type != "quad":
+            return mesh_in
+
+        nodes = list(mesh_in.nodes_list)
+        node_lookup = {(round(nd.x, 14), round(nd.y, 14)): int(nd.id) for nd in nodes}
+        hanging_nodes: set[int] = set(getattr(mesh_in, "hanging_nodes", []))
+        new_elems: list[list[int]] = []
+        new_corners: list[list[int]] = []
+        parent_to_children: dict[int, list[int]] = {}
+
+        # --- 1) Decide which parents to refine and in which orientation(s) ---
+        orient_map: dict[int, set[str]] = {}
+
+        for elem in mesh_in.elements_list:
+            for lid, side_edges in enumerate(elem.edges_by_side):
+                if not side_edges:
+                    continue
+                n_seg = len(side_edges)
+                if n_seg <= max_segments:
+                    continue
+
+                # side index convention: see _EDGE_TABLE in Mesh
+                # 0: (0,1) bottom, 1: (1,2) right, 2: (2,3) top, 3: (3,0) left
+                if lid in (0, 2):          # bottom/top → segments in x
+                    orient = "vertical"    # split in x to halve segments
+                else:                      # left/right → segments in y
+                    orient = "horizontal"
+
+                orient_map.setdefault(elem.id, set()).add(orient)
+
+        if not orient_map:
+            # nothing to fix
+            return mesh_in
+
+        # Precompute parametric helpers (identical to _refine_once)
+        p = mesh_in.poly_order
+        t = np.linspace(-1.0, 1.0, p + 1)
+        xi_to_idx_template = {
+            (float(xi), float(eta)): int(j * (p + 1) + i)
+            for j, eta in enumerate(t)
+            for i, xi in enumerate(t)
+        }
+        bl, br, tr, tl = _quad_corner_indices(p)
+        base_grid_parent = _parent_parametric_grid(p)
+
+        # --- 2) Actually refine the marked parents ---
+        for eid, elem in enumerate(mesh_in.elements_list):
+            requested = orient_map.get(eid)
+            if not requested:
+                # just copy
+                new_elems.append(list(mesh_in.elements_connectivity[eid]))
+                new_corners.append(list(mesh_in.corner_connectivity[eid]))
+                parent_to_children[eid] = [len(new_elems) - 1]
+                continue
+
+            # choose a primary orientation (if both, favour vertical first)
+            primary = "vertical" if "vertical" in requested else "horizontal"
+
+            # how bad is this element? (largest #segments over its four sides)
+            worst_ratio = max(len(side) for side in elem.edges_by_side if side)
+            # We want enough splits so that each child sees at most `max_segments`
+            # segments on its side. A vertical/horizontal split roughly halves
+            # segments on that side, so depth ≈ ceil(log2(worst_ratio/max_segments)).
+            depth_needed = int(
+                math.ceil(
+                    math.log(max(worst_ratio / max_segments, 1.0), 2.0)
+                )
+            )
+            depth = max(1, min(depth_needed, 4))  # keep it reasonable
+
+            sequences = _generate_sequences(primary, depth)
+
+            corners_xy = mesh_in.nodes_x_y_pos[list(elem.corner_nodes)]
+            before_nodes = len(nodes)
+            conns, corners = _refine_element_with_sequences_fast(
+                mesh_in,
+                eid,
+                sequences,
+                nodes,
+                node_lookup,
+                base_grid_parent,
+                xi_to_idx_template,
+                bl,
+                br,
+                tr,
+                tl,
+            )
+
+            # mark newly created nodes that lie on the old parent edges as hanging
+            new_node_ids = range(before_nodes, len(nodes))
+            for nid in new_node_ids:
+                pt = np.array([nodes[nid].x, nodes[nid].y], float)
+                if _on_parent_edge(pt, corners_xy):
+                    hanging_nodes.add(nid)
+
+            idx_children = []
+            for conn_child, corners_child in zip(conns, corners):
+                idx_children.append(len(new_elems))
+                new_elems.append(conn_child)
+                new_corners.append(corners_child)
+            parent_to_children[eid] = idx_children
+
+        # --- 3) Build new mesh & re-tag boundaries ---
+        refined = Mesh(
+            nodes=nodes,
+            element_connectivity=np.asarray(new_elems, dtype=int),
+            elements_corner_nodes=np.asarray(new_corners, dtype=int),
+            element_type="quad",
+            poly_order=mesh_in.poly_order,
+        )
+        refined.hanging_nodes = sorted(hanging_nodes)
+        refined.parent_to_children = parent_to_children
+        tag_channel_boundaries(refined, MESH_SIZE)  # same as elsewhere
+        return refined
+
+
+    def _refine_tjunctions(mesh_in: Mesh, max_ratio: float = 2.0) -> Mesh:
+        """
+        Refine coarse neighbours on edges that violate the 2:1 T-junction rule.
+        Splits the coarse element once across the offending edge orientation.
+        """
+        if mesh_in.element_type != "quad":
+            print(f"refine t-junctions: unsupported element type {mesh_in.element_type}; skipping.")
+            return mesh_in
+        nodes = list(mesh_in.nodes_list)
+        node_lookup = {(round(nd.x, 14), round(nd.y, 14)): int(nd.id) for nd in nodes}
+        hanging_nodes: set[int] = set(getattr(mesh_in, "hanging_nodes", []))
+        new_elems: list[list[int]] = []
+        new_corners: list[list[int]] = []
+        parent_to_children: dict[int, list[int]] = {}
+
+        # Map element id -> required split orientations
+        orient_map: dict[int, set[str]] = {}
+        for e in mesh_in.edges_list:
+            if e.left is None or e.right is None:
+                continue
+            l_cnt, r_cnt, shared_cnt = mesh_in._edge_owner_counts(e)
+            fine = max(l_cnt, r_cnt)
+            coarse = min(l_cnt, r_cnt)
+            needs_refine = fine > max_ratio * coarse or shared_cnt < 1
+            if not needs_refine:
+                continue
+            targets = []
+            if shared_cnt < 1:
+                targets.extend([e.left, e.right])
+            else:
+                targets.append(e.left if l_cnt < r_cnt else e.right)
+            p0, p1 = mesh_in.nodes_x_y_pos[list(e.nodes)]
+            dx, dy = p1 - p0
+            orient = "vertical" if abs(dx) >= abs(dy) else "horizontal"
+            for coarse_eid in targets:
+                if coarse_eid is None:
+                    continue
+                orient_map.setdefault(int(coarse_eid), set()).add(orient)
+
+        if not orient_map:
+            return mesh_in
+
+        for eid, elem in enumerate(mesh_in.elements_list):
+            orient_set = orient_map.get(eid)
+            if not orient_set:
+                new_elems.append(list(mesh_in.elements_connectivity[eid]))
+                new_corners.append(list(mesh_in.corner_connectivity[eid]))
+                parent_to_children[eid] = [len(new_elems) - 1]
+                continue
+
+            primary = "vertical" if "vertical" in orient_set else "horizontal"
+            depth = 2 if len(orient_set) > 1 else 1
+            sequences = _generate_sequences(primary, depth)
+
+            corners_xy = mesh_in.nodes_x_y_pos[list(elem.corner_nodes)]
+            before_nodes = len(nodes)
+            conns, corners = _refine_element_with_sequences_fast(
+                mesh_in, eid, sequences, nodes, node_lookup, base_grid_parent, xi_to_idx_template, bl, br, tr, tl
+            )
+            new_node_ids = range(before_nodes, len(nodes))
+            for nid in new_node_ids:
+                pt = np.array([nodes[nid].x, nodes[nid].y], float)
+                if _on_parent_edge(pt, corners_xy):
+                    hanging_nodes.add(nid)
+
+            idx_children = []
+            for conn_child, corners_child in zip(conns, corners):
+                idx_children.append(len(new_elems))
+                new_elems.append(conn_child)
+                new_corners.append(corners_child)
+            parent_to_children[eid] = idx_children
+
+        refined = Mesh(
+            nodes=nodes,
+            element_connectivity=np.asarray(new_elems, dtype=int),
+            elements_corner_nodes=np.asarray(new_corners, dtype=int),
+            element_type="quad",
+            poly_order=mesh_in.poly_order,
+        )
+        refined.hanging_nodes = sorted(hanging_nodes)
+        refined.parent_to_children = parent_to_children
+        tag_channel_boundaries(refined, MESH_SIZE)
+        return refined
+
+    mesh_cur = mesh
+    max_cycles = 5
+    for cycle in range(max_cycles):
+        marked_all = mark_elements_near_levelset(mesh_cur, beam_ls, band=band, levels=levels)
+        if not marked_all:
+            break
+        to_refine: set[int] = set()
+        for eid in marked_all:
+            cn = mesh_cur.nodes_x_y_pos[list(mesh_cur.elements_list[eid].corner_nodes)]
+            h_y = float(cn[:, 1].max() - cn[:, 1].min())
+            if h_y > target_h + 1.0e-12:
+                to_refine.add(int(eid))
+
+        # Ripple refinement to enforce 2:1 balance before splitting.
+        to_refine = enforce_balance(mesh_cur, to_refine)
+
+        if not to_refine:
+            break
+
+        t0 = time.perf_counter()
+        mesh_cur = _refine_once(mesh_cur, to_refine)
+        elapsed = time.perf_counter() - t0
+
+        diag = mesh_topology_diagnostics(mesh_cur)
+        print(
+            f"[refine_beam_aniso] cycle {cycle + 1}: refined {len(to_refine)} elems → "
+            f"{len(mesh_cur.elements_list)} elems in {elapsed:.3f}s "
+            f"(missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} "
+            f"degenerate_shared={diag['degenerate_shared']} t_ratio={diag['t_ratio_violation']})"
+        )
+        if cycle == max_cycles - 1 and (diag["missing_side"] > 0 or diag["ownerless_edges"] > 0):
+            print("[refine_beam_aniso] stopping: unresolved topology at max cycle; aborting to avoid divergence.")
+            sys.exit(1)
+        # Repair when topological issues remain (ignore degenerate_shared T-junctions).
+        if diag["missing_side"] > 0 or diag["ownerless_edges"] > 0:
+            repaired = repair_degenerate_edges(mesh_cur)
+            diag = mesh_topology_diagnostics(mesh_cur)
+            print(
+                f"[refine_beam_aniso] repaired {repaired} edges → "
+                f"missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} "
+                f"degenerate_shared={diag['degenerate_shared']} t_ratio={diag['t_ratio_violation']}"
+            )
+        for _ in range(2):
+            tj_bad = mesh_cur.count_tjunction_violations()
+            if tj_bad["count"] == 0:
+                break
+            # mesh_cur = _refine_tjunctions(mesh_cur)
+            mesh_cur = _refine_tjunctions_by_side(mesh_cur)
+            diag = mesh_topology_diagnostics(mesh_cur)
+            print(
+                f"[refine_beam_aniso] t-junction fix: refined {len(tj_bad['edges'])} coarse neighbours → "
+                f"{len(mesh_cur.elements_list)} elems "
+                f"(t_ratio={diag['t_ratio_violation']} degenerate_shared={diag['degenerate_shared']})"
+            )
+        if diag["degenerate_shared"] > 0:
+            repaired = repair_degenerate_edges(mesh_cur)
+            diag = mesh_topology_diagnostics(mesh_cur)
+            print(
+                f"[refine_beam_aniso] repaired {repaired} degenerate edges → "
+                f"degenerate_shared={diag['degenerate_shared']} t_ratio={diag['t_ratio_violation']}"
+            )
+        cov = coverage_diagnostics(mesh_cur, n_samples=80)
+        if cov["gaps_x"]:
+            msg = ", ".join(f"{x:.4f}" for x in cov["gaps_x"][:8])
+            if len(cov["gaps_x"]) > 8:
+                msg += " ..."
+            print(f"[refine_beam_aniso] coverage gaps at x≈ {msg}")
+        else:
+            print("[refine_beam_aniso] no coverage gaps on sampled lines")
+        center_gaps = inside_centerline_gaps(mesh_cur, x_end=0.6, n_samples=120, require_tags=False)
+        if center_gaps:
+            msg = ", ".join(f"{x:.4f}" for x in center_gaps[:8])
+            if len(center_gaps) > 8:
+                msg += " ..."
+            print(f"[refine_beam_aniso] missing inside/cut cells along beam centreline at x≈ {msg}")
+        else:
+            print("[refine_beam_aniso] centreline is fully covered up to x=0.6")
+
+    # Enforce inside coverage explicitly if columns are missing.
+    mesh_cur = _enforce_inside_columns(mesh_cur, beam_ls, target_h, _refine_once, _refine_tjunctions)
+
+    return mesh_cur
+
+
+def _enforce_inside_columns(mesh: Mesh, beam_ls: BeamLevelSet, target_h: float, refine_once, refine_tj, *, attempts: int = 1) -> Mesh:
+    """
+    If the beam interior is not fully covered by inside elements, refine
+    elements whose centroid lies in the beam box until a full inside column exists.
+    """
+    mesh_cur = mesh
+    for _ in range(attempts):
+        cov_inside = beam_inside_coverage(mesh_cur, beam_ls, nx=160, ny=10, inside_only=True)
+        missing_x = cov_inside["missing_x"][:24]  # limit scope to reduce blow-up
+        if not missing_x:
+            break
+        marked: set[int] = set()
+        x_tol = target_h
+        y0 = beam_ls.cy - beam_ls.hy - 1e-10
+        y1 = beam_ls.cy + beam_ls.hy + 1e-10
+        for eid, e in enumerate(mesh_cur.elements_list):
+            cn = mesh_cur.nodes_x_y_pos[list(e.corner_nodes)]
+            ex0, ex1 = cn[:, 0].min(), cn[:, 0].max()
+            ey0, ey1 = cn[:, 1].min(), cn[:, 1].max()
+            if ey1 < y0 or ey0 > y1:
+                continue
+            cx = 0.5 * (ex0 + ex1)
+            if any(abs(cx - x0) <= x_tol for x0 in missing_x):
+                marked.add(int(eid))
+        if not marked:
+            break
+        marked = enforce_balance(mesh_cur, marked)
+        mesh_cur = refine_once(mesh_cur, marked)
+        diag = mesh_topology_diagnostics(mesh_cur)
+        # Fix any large hanging ratios introduced by this pass
+        for _ in range(2):
+            tj_bad = mesh_cur.count_tjunction_violations()
+            if tj_bad["count"] == 0:
+                break
+            mesh_cur = refine_tj(mesh_cur)
+            diag = mesh_topology_diagnostics(mesh_cur)
+        if diag["degenerate_shared"] > 0:
+            repaired = repair_degenerate_edges(mesh_cur)
+            diag = mesh_topology_diagnostics(mesh_cur)
+        print(
+            f"[inside-fix] refined {len(marked)} elems for inside coverage → "
+            f"{len(mesh_cur.elements_list)} elems (t_ratio={diag['t_ratio_violation']} deg_shared={diag['degenerate_shared']})"
+        )
+    return mesh_cur
+
+
+# -----------------------------------------------------------------------------
+# Post-refinement clean-up: fix highly fragmented sides (4:1, …)
+# -----------------------------------------------------------------------------
+def _refine_tjunctions_by_side_global(mesh_in: Mesh, max_segments: int = 2) -> Mesh:
+    """
+    Refine coarse neighbours to remove >2:1 chains along entire sides.
+    Standalone version so we can reuse the logic after the main refinement loop.
+    """
+    if mesh_in.element_type != "quad":
+        return mesh_in
+
+    nodes = list(mesh_in.nodes_list)
+    node_lookup = {(round(nd.x, 14), round(nd.y, 14)): int(nd.id) for nd in nodes}
+    hanging_nodes: set[int] = set(getattr(mesh_in, "hanging_nodes", []))
+    new_elems: list[list[int]] = []
+    new_corners: list[list[int]] = []
+    parent_to_children: dict[int, list[int]] = {}
+
+    orient_map: dict[int, set[str]] = {}
+    for elem in mesh_in.elements_list:
+        for lid, side_edges in enumerate(elem.edges_by_side):
+            if not side_edges:
+                continue
+            n_seg = len(side_edges)
+            if n_seg <= max_segments:
+                continue
+            # side index convention: 0 bottom, 1 right, 2 top, 3 left
+            if lid in (0, 2):
+                orient = "vertical"   # split in x
+            else:
+                orient = "horizontal" # split in y
+            orient_map.setdefault(elem.id, set()).add(orient)
+
+    if not orient_map:
+        return mesh_in
+
+    p = mesh_in.poly_order
+    t = np.linspace(-1.0, 1.0, p + 1)
+    xi_to_idx_template = {(float(xi), float(eta)): int(j * (p + 1) + i) for j, eta in enumerate(t) for i, xi in enumerate(t)}
+    bl, br, tr, tl = _quad_corner_indices(p)
+    base_grid_parent = _parent_parametric_grid(p)
+
+    for eid, elem in enumerate(mesh_in.elements_list):
+        requested = orient_map.get(eid)
+        if not requested:
+            new_elems.append(list(mesh_in.elements_connectivity[eid]))
+            new_corners.append(list(mesh_in.corner_connectivity[eid]))
+            parent_to_children[eid] = [len(new_elems) - 1]
+            continue
+
+        primary = "vertical" if "vertical" in requested else "horizontal"
+        worst_ratio = max(len(side) for side in elem.edges_by_side if side)
+        depth_needed = int(math.ceil(math.log(max(worst_ratio / max_segments, 1.0), 2.0)))
+        depth = max(1, min(depth_needed, 5))
+        sequences = _generate_sequences(primary, depth)
+
+        corners_xy = mesh_in.nodes_x_y_pos[list(elem.corner_nodes)]
+        before_nodes = len(nodes)
+        conns, corners = _refine_element_with_sequences_fast(
+            mesh_in,
+            eid,
+            sequences,
+            nodes,
+            node_lookup,
+            base_grid_parent,
+            xi_to_idx_template,
+            bl,
+            br,
+            tr,
+            tl,
+        )
+
+        new_node_ids = range(before_nodes, len(nodes))
+        for nid in new_node_ids:
+            pt = np.array([nodes[nid].x, nodes[nid].y], float)
+            if _on_parent_edge(pt, corners_xy):
+                hanging_nodes.add(nid)
+
+        idx_children = []
+        for conn_child, corners_child in zip(conns, corners):
+            idx_children.append(len(new_elems))
+            new_elems.append(conn_child)
+            new_corners.append(corners_child)
+        parent_to_children[eid] = idx_children
+
+    refined = Mesh(
+        nodes=nodes,
+        element_connectivity=np.asarray(new_elems, dtype=int),
+        elements_corner_nodes=np.asarray(new_corners, dtype=int),
+        element_type="quad",
+        poly_order=mesh_in.poly_order,
+    )
+    refined.hanging_nodes = sorted(hanging_nodes)
+    refined.parent_to_children = parent_to_children
+    tag_channel_boundaries(refined, MESH_SIZE)
+    return refined
+
+
+def _refine_tjunctions_edge_global(mesh_in: Mesh, max_ratio: float = 2.0) -> Mesh:
+    """
+    Refine coarse neighbours on edges that violate the 2:1 T-junction rule
+    (based on node counts on each side of the shared edge).
+    """
+    if mesh_in.element_type != "quad":
+        return mesh_in
+    nodes = list(mesh_in.nodes_list)
+    node_lookup = {(round(nd.x, 14), round(nd.y, 14)): int(nd.id) for nd in nodes}
+    hanging_nodes: set[int] = set(getattr(mesh_in, "hanging_nodes", []))
+    new_elems: list[list[int]] = []
+    new_corners: list[list[int]] = []
+    parent_to_children: dict[int, list[int]] = {}
+
+    orient_map: dict[int, set[str]] = {}
+    for e in mesh_in.edges_list:
+        if e.left is None or e.right is None:
+            continue
+        l_cnt, r_cnt, shared_cnt = mesh_in._edge_owner_counts(e)
+        fine = max(l_cnt, r_cnt)
+        coarse = min(l_cnt, r_cnt)
+        needs_refine = fine > max_ratio * max(coarse, 1) or shared_cnt < 1
+        if not needs_refine:
+            continue
+        targets = []
+        if shared_cnt < 1:
+            targets.extend([e.left, e.right])
+        else:
+            targets.append(e.left if l_cnt < r_cnt else e.right)
+        p0, p1 = mesh_in.nodes_x_y_pos[list(e.nodes)]
+        dx, dy = p1 - p0
+        orient = "vertical" if abs(dx) >= abs(dy) else "horizontal"
+        for coarse_eid in targets:
+            if coarse_eid is None:
+                continue
+            orient_map.setdefault(int(coarse_eid), set()).add(orient)
+
+    if not orient_map:
+        return mesh_in
+
+    p = mesh_in.poly_order
+    t = np.linspace(-1.0, 1.0, p + 1)
+    xi_to_idx_template = {(float(xi), float(eta)): int(j * (p + 1) + i) for j, eta in enumerate(t) for i, xi in enumerate(t)}
+    bl, br, tr, tl = _quad_corner_indices(p)
+    base_grid_parent = _parent_parametric_grid(p)
+
+    for eid, elem in enumerate(mesh_in.elements_list):
+        orient_set = orient_map.get(eid)
+        if not orient_set:
+            new_elems.append(list(mesh_in.elements_connectivity[eid]))
+            new_corners.append(list(mesh_in.corner_connectivity[eid]))
+            parent_to_children[eid] = [len(new_elems) - 1]
+            continue
+
+        primary = "vertical" if "vertical" in orient_set else "horizontal"
+        depth = 2 if len(orient_set) > 1 else 1
+        sequences = _generate_sequences(primary, depth)
+
+        corners_xy = mesh_in.nodes_x_y_pos[list(elem.corner_nodes)]
+        before_nodes = len(nodes)
+        conns, corners = _refine_element_with_sequences_fast(
+            mesh_in, eid, sequences, nodes, node_lookup, base_grid_parent, xi_to_idx_template, bl, br, tr, tl
+        )
+        new_node_ids = range(before_nodes, len(nodes))
+        for nid in new_node_ids:
+            pt = np.array([nodes[nid].x, nodes[nid].y], float)
+            if _on_parent_edge(pt, corners_xy):
+                hanging_nodes.add(nid)
+
+        idx_children = []
+        for conn_child, corners_child in zip(conns, corners):
+            idx_children.append(len(new_elems))
+            new_elems.append(conn_child)
+            new_corners.append(corners_child)
+        parent_to_children[eid] = idx_children
+
+    refined = Mesh(
+        nodes=nodes,
+        element_connectivity=np.asarray(new_elems, dtype=int),
+        elements_corner_nodes=np.asarray(new_corners, dtype=int),
+        element_type="quad",
+        poly_order=mesh_in.poly_order,
+    )
+    refined.hanging_nodes = sorted(hanging_nodes)
+    refined.parent_to_children = parent_to_children
+    tag_channel_boundaries(refined, MESH_SIZE)
+    return refined
+
+
+def _refine_side_balance_global(mesh_in: Mesh, max_ratio: float = 2.0) -> Mesh:
+    """
+    Refine the coarse neighbour along any shared side where the number of edge
+    fragments differs by more than `max_ratio` (targets the coarse side of 4:1 gaps).
+    """
+    if mesh_in.element_type != "quad":
+        return mesh_in
+
+    nodes = list(mesh_in.nodes_list)
+    node_lookup = {(round(nd.x, 14), round(nd.y, 14)): int(nd.id) for nd in nodes}
+    hanging_nodes: set[int] = set(getattr(mesh_in, "hanging_nodes", []))
+    new_elems: list[list[int]] = []
+    new_corners: list[list[int]] = []
+    parent_to_children: dict[int, list[int]] = {}
+
+    orient_map: dict[int, set[str]] = {}
+    for elem in mesh_in.elements_list:
+        for lid, side_edges in enumerate(elem.edges_by_side):
+            if not side_edges:
+                continue
+            nb = elem.neighbors.get(lid)
+            if nb is None:
+                continue
+            nb_elem = mesh_in.elements_list[int(nb)]
+            edge_gid = side_edges[0]
+            nb_lid = nb_elem.edge_gid_to_local.get(edge_gid)
+            if nb_lid is None:
+                continue
+            len_this = len(side_edges)
+            len_nb = len(nb_elem.edges_by_side[int(nb_lid)])
+            fine = max(len_this, len_nb)
+            coarse = min(len_this, len_nb)
+            if coarse * max_ratio >= fine or coarse == 0:
+                continue
+            target = elem.id if len_this < len_nb else nb_elem.id
+            orient = "vertical" if lid in (0, 2) else "horizontal"
+            orient_map.setdefault(int(target), set()).add(orient)
+
+    if not orient_map:
+        return mesh_in
+
+    p = mesh_in.poly_order
+    t = np.linspace(-1.0, 1.0, p + 1)
+    xi_to_idx_template = {(float(xi), float(eta)): int(j * (p + 1) + i) for j, eta in enumerate(t) for i, xi in enumerate(t)}
+    bl, br, tr, tl = _quad_corner_indices(p)
+    base_grid_parent = _parent_parametric_grid(p)
+
+    for eid, elem in enumerate(mesh_in.elements_list):
+        requested = orient_map.get(eid)
+        if not requested:
+            new_elems.append(list(mesh_in.elements_connectivity[eid]))
+            new_corners.append(list(mesh_in.corner_connectivity[eid]))
+            parent_to_children[eid] = [len(new_elems) - 1]
+            continue
+
+        primary = "vertical" if "vertical" in requested else "horizontal"
+        depth = 1 if len(requested) == 1 else 2
+        sequences = _generate_sequences(primary, depth)
+
+        corners_xy = mesh_in.nodes_x_y_pos[list(elem.corner_nodes)]
+        before_nodes = len(nodes)
+        conns, corners = _refine_element_with_sequences_fast(
+            mesh_in,
+            eid,
+            sequences,
+            nodes,
+            node_lookup,
+            base_grid_parent,
+            xi_to_idx_template,
+            bl,
+            br,
+            tr,
+            tl,
+        )
+        new_node_ids = range(before_nodes, len(nodes))
+        for nid in new_node_ids:
+            pt = np.array([nodes[nid].x, nodes[nid].y], float)
+            if _on_parent_edge(pt, corners_xy):
+                hanging_nodes.add(nid)
+
+        idx_children = []
+        for conn_child, corners_child in zip(conns, corners):
+            idx_children.append(len(new_elems))
+            new_elems.append(conn_child)
+            new_corners.append(corners_child)
+        parent_to_children[eid] = idx_children
+
+    refined = Mesh(
+        nodes=nodes,
+        element_connectivity=np.asarray(new_elems, dtype=int),
+        elements_corner_nodes=np.asarray(new_corners, dtype=int),
+        element_type="quad",
+        poly_order=mesh_in.poly_order,
+    )
+    refined.hanging_nodes = sorted(hanging_nodes)
+    refined.parent_to_children = parent_to_children
+    tag_channel_boundaries(refined, MESH_SIZE)
+    return refined
+
+
+def fix_fragmented_sides(mesh: Mesh, max_segments: int = 2, max_iters: int = 2) -> Mesh:
+    """
+    Run a few global passes that split coarse elements until no side has more than
+    `max_segments` sub-edges (removes lingering 4:1 T-junctions).
+    """
+    mesh_cur = mesh
+    for it in range(max_iters):
+        tj = mesh_cur.count_tjunction_violations(max_ratio=max_segments)
+        if tj["count"] == 0 or tj.get("worst_ratio", 0.0) <= max_segments:
+            break
+        mesh_cur = _refine_side_balance_global(mesh_cur, max_ratio=max_segments)
+        mesh_cur = _refine_tjunctions_edge_global(mesh_cur, max_ratio=max_segments)
+        mesh_cur = _refine_tjunctions_by_side_global(mesh_cur, max_segments=max_segments)
+        tj_next = mesh_cur.count_tjunction_violations(max_ratio=max_segments)
+        print(
+            f"[tjunction-fix] iter {it + 1}: elems={len(mesh_cur.elements_list)} "
+            f"remaining={tj_next['count']} worst_ratio={tj_next.get('worst_ratio', 0.0):.2f}"
+        )
+        if tj_next["count"] == 0:
+            break
+    return mesh_cur
 
 
 # -----------------------------------------------------------------------------
@@ -778,6 +1616,256 @@ def refresh_hansbo_kappa(
     theta_neg_vals[:] = np.clip(hansbo_cut_ratio(mesh, level_set, side="-"), theta_min, 1.0)
 
 
+def mesh_topology_diagnostics(mesh: Mesh) -> dict[str, int]:
+    """
+    Quick consistency checks:
+      - Every element side has at least one edge (no gaps).
+      - Every interior edge has both owners.
+      - Edge owners share nodes (edge not degenerate). Allow single-node
+        intersections to support T-junction/hanging configurations.
+      - Optional 2:1 balance sanity: flag edges where one side has many more
+        subdivisions than its neighbour (T-junction ratio > 2).
+    Returns counts of issues to guide refinement/debugging.
+    """
+    missing_side = 0
+    boundary_edges = 0
+    ownerless_edges = 0
+    degenerate_shared = 0
+    t_ratio_violation = 0
+    t_junctions = 0
+    for elem in mesh.elements_list:
+        for side_edges in elem.edges_by_side:
+            if not side_edges:
+                missing_side += 1
+        for gid in elem.edges:
+            if gid == -1:
+                continue
+            e = mesh.edges_list[int(gid)]
+            if e.right is None:
+                boundary_edges += 1
+    for e in mesh.edges_list:
+        if e.right is None:
+            continue
+        if e.left is None:
+            ownerless_edges += 1
+            continue
+        left_nodes = set(e.left_nodes)
+        right_nodes = set(e.right_nodes)
+        shared = left_nodes.intersection(right_nodes)
+        if len(shared) < 1:
+            degenerate_shared += 1
+        if len(left_nodes) != len(right_nodes):
+            t_junctions += 1
+        l_count = max(len(left_nodes), 1)
+        r_count = max(len(right_nodes), 1)
+        coarse = min(l_count, r_count)
+        fine = max(l_count, r_count)
+        if coarse > 0 and fine > 2 * coarse:
+            t_ratio_violation += 1
+    return {
+        "missing_side": int(missing_side),
+        "boundary_edges": int(boundary_edges),
+        "ownerless_edges": int(ownerless_edges),
+        "degenerate_shared": int(degenerate_shared),
+        "t_junctions": int(t_junctions),
+        "t_ratio_violation": int(t_ratio_violation),
+    }
+
+
+def coverage_diagnostics(mesh: Mesh, n_samples: int = 40, tol: float = 1.0e-6) -> dict[str, list[float]]:
+    """
+    Sample vertical lines across the domain and report x-locations
+    where the union of element y-intervals leaves a gap (potential holes).
+    Ignores the rigid cylinder hole.
+    """
+    xs = np.linspace(mesh.nodes_x_y_pos[:, 0].min(), mesh.nodes_x_y_pos[:, 0].max(), n_samples)
+    gaps = []
+    for x0 in xs:
+        # Skip the circle hole on purpose
+        if abs(x0 - CENTER[0]) <= RADIUS + tol:
+            continue
+        intervals = []
+        for e in mesh.elements_list:
+            cn = mesh.nodes_x_y_pos[list(e.corner_nodes)]
+            xmin, xmax = cn[:, 0].min(), cn[:, 0].max()
+            if xmin - tol <= x0 <= xmax + tol:
+                ymin, ymax = cn[:, 1].min(), cn[:, 1].max()
+                intervals.append((ymin, ymax))
+        if not intervals:
+            gaps.append(float(x0))
+            continue
+        intervals.sort()
+        y0 = intervals[0][0]
+        y1 = intervals[0][1]
+        for a, b in intervals[1:]:
+            if a > y1 + tol:
+                gaps.append(float(x0))
+                break
+            y1 = max(y1, b)
+        if y0 > mesh.nodes_x_y_pos[:, 1].min() + tol or y1 < mesh.nodes_x_y_pos[:, 1].max() - tol:
+            gaps.append(float(x0))
+    return {"gaps_x": gaps}
+
+
+def inside_centerline_gaps(mesh: Mesh, x_end: float = 0.6, n_samples: int = 80, tol: float = 1.0e-6, require_tags: bool = True) -> list[float]:
+    """
+    Sample points along the beam centreline (y = BEAM_CENTER[1]) and detect
+    x-locations without an inside/cut element covering the point.
+    Useful to catch missing inside elements near the beam attachment.
+    When `require_tags` is False, any element covering the query point counts
+    (used before the mesh has been classified).
+    """
+    xs = np.linspace(CENTER[0] + RADIUS, x_end, n_samples)
+    y0 = BEAM_CENTER[1]
+    gaps: list[float] = []
+    for x0 in xs:
+        found = False
+        for e in mesh.elements_list:
+            if require_tags:
+                tag = getattr(e, "tag", "")
+                if tag not in ("inside", "cut"):
+                    continue
+            cn = mesh.nodes_x_y_pos[list(e.corner_nodes)]
+            if x0 < cn[:, 0].min() - tol or x0 > cn[:, 0].max() + tol:
+                continue
+            if y0 < cn[:, 1].min() - tol or y0 > cn[:, 1].max() + tol:
+                continue
+            try:
+                xi, eta = transform.inverse_mapping(mesh, e.id, (x0, y0))
+            except Exception:
+                continue
+            if -1.001 <= xi <= 1.001 and -1.001 <= eta <= 1.001:
+                found = True
+                break
+        if not found:
+            gaps.append(float(x0))
+    return gaps
+
+
+def interface_approx_error(mesh: Mesh, beam_ls: BeamLevelSet) -> dict[str, float]:
+    """
+    Measure how well the discrete interface points approximate the beam level set.
+    Returns max/mean |φ| evaluated at interface points (0 is exact).
+    """
+    errs: list[float] = []
+    n_pts = 0
+    for e in mesh.edge_bitset("interface").to_indices():
+        edge = mesh.edge(int(e))
+        pts: list[tuple[float, float]] = []
+        for owner in (edge.left, edge.right):
+            if owner is None:
+                continue
+            el = mesh.elements_list[int(owner)]
+            if getattr(el, "interface_pts", None):
+                pts.extend(el.interface_pts)
+        if not pts:
+            mid = mesh.nodes_x_y_pos[list(edge.nodes)].mean(axis=0)
+            pts.append((float(mid[0]), float(mid[1])))
+        for pt in pts:
+            errs.append(abs(float(beam_ls(np.asarray(pt, float)))))
+            n_pts += 1
+    if not errs:
+        return {"max_abs_phi": 0.0, "mean_abs_phi": 0.0, "n_pts": 0}
+    errs_arr = np.asarray(errs, float)
+    return {
+        "max_abs_phi": float(errs_arr.max()),
+        "mean_abs_phi": float(errs_arr.mean()),
+        "n_pts": int(n_pts),
+    }
+
+
+def beam_inside_coverage(mesh: Mesh, beam_ls: BeamLevelSet, nx: int = 120, ny: int = 8, tol: float = 1.0e-8, *, inside_only: bool = False) -> dict[str, object]:
+    """
+    Sample the beam rectangle and report coverage by inside/cut elements.
+    Returns coverage fraction and x-locations missing coverage.
+    Set inside_only=True to require elements tagged strictly 'inside'.
+    """
+    x0 = beam_ls.cx - beam_ls.hx
+    x1 = beam_ls.cx + beam_ls.hx
+    y0 = beam_ls.cy - beam_ls.hy
+    y1 = beam_ls.cy + beam_ls.hy
+    xs = np.linspace(x0, x1, nx)
+    ys = np.linspace(y0, y1, ny)
+    total = 0
+    covered = 0
+    missing_x: list[float] = []
+    for x in xs:
+        column_missing = False
+        for y in ys:
+            total += 1
+            found = False
+            for e in mesh.elements_list:
+                tag = getattr(e, "tag", "")
+                if inside_only:
+                    if tag != "inside":
+                        continue
+                else:
+                    if tag not in ("inside", "cut"):
+                        continue
+                cn = mesh.nodes_x_y_pos[list(e.corner_nodes)]
+                if x < cn[:, 0].min() - tol or x > cn[:, 0].max() + tol:
+                    continue
+                if y < cn[:, 1].min() - tol or y > cn[:, 1].max() + tol:
+                    continue
+                try:
+                    xi, eta = transform.inverse_mapping(mesh, e.id, (x, y))
+                except Exception:
+                    continue
+                if -1.01 <= xi <= 1.01 and -1.01 <= eta <= 1.01:
+                    found = True
+                    break
+            if found:
+                covered += 1
+            else:
+                column_missing = True
+        if column_missing:
+            missing_x.append(float(x))
+    frac = covered / max(total, 1)
+    return {"coverage": frac, "missing_x": missing_x, "samples": total}
+
+def repair_degenerate_edges(mesh: Mesh, tol: float = 1.0e-10) -> int:
+    """
+    For interior edges whose owners share no common node, rebuild the node
+    lists along the edge using geometric collinearity so hanging nodes are
+    consistently shared. Returns number of repaired edges.
+    """
+    repaired = 0
+    pts = mesh.nodes_x_y_pos
+    for e in mesh.edges_list:
+        if e.left is None or e.right is None:
+            continue
+        shared = set(e.left_nodes).intersection(set(e.right_nodes))
+        # Allow single-node (T-junction/hanging) intersections; only repair
+        # when owners have no common node.
+        if len(shared) >= 1:
+            continue
+        n0, n1 = e.nodes
+        p0, p1 = pts[n0], pts[n1]
+        d = p1 - p0
+        L2 = np.dot(d, d)
+        if L2 < tol:
+            continue
+        # Collect candidate nodes from both owners that lie on the segment.
+        cand_ids = set(mesh.elements_list[e.left].nodes) | set(mesh.elements_list[e.right].nodes)
+        on_edge = []
+        for nid in cand_ids:
+            q = pts[int(nid)]
+            cross = abs((q[0] - p0[0]) * d[1] - (q[1] - p0[1]) * d[0])
+            if cross > np.sqrt(L2) * tol:
+                continue
+            t = np.dot(q - p0, d) / L2
+            if -tol <= t <= 1.0 + tol:
+                on_edge.append((t, int(nid)))
+        on_edge.sort()
+        seq = [nid for _, nid in on_edge]
+        if len(seq) < 2:
+            seq = [int(n0), int(n1)]
+        e.all_nodes = tuple(seq)
+        e.left_nodes = tuple(n for n in seq if n in mesh.elements_list[e.left].nodes)
+        e.right_nodes = tuple(n for n in seq if n in mesh.elements_list[e.right].nodes)
+        repaired += 1
+    return repaired
+
 def retag_inactive(dh: DofHandler) -> None:
     dh.dof_tags["inactive"] = set()
     dh.tag_dofs_from_element_bitset("inactive", "u_pos_x", "inside", strict=True)
@@ -877,6 +1965,112 @@ def finite_difference_check(
         print(f"  {gd:5d}  {fld:10s}  err={err:9.3e}  |J|={mag:9.3e}  rel={rel:9.3e}")
 
 
+def detect_mesh_pathologies(mesh: Mesh, tol: float = 1e-10):
+    """
+    Detects degenerate features, zombie entities, and internal topological cracks.
+    """
+    pathologies = {
+        "zero_length_edges": [],
+        "zombie_edges": [],  # Edges with NO owners
+        "internal_cracks": [], # Edges with 1 owner that are NOT on the boundary
+        "orphan_nodes": [], # Nodes not used by any element
+    }
+
+    # --- 1. Detect Zero-Length Edges ---
+    # Calculate lengths of all edges
+    nodes_all = mesh.nodes_x_y_pos
+    span = float(np.ptp(nodes_all, axis=0).max() or 1.0)
+    tol_len = max(tol, 1e-9 * span)
+    edge_nodes = np.array([list(e.nodes) for e in mesh.edges_list])
+    p0 = nodes_all[edge_nodes[:, 0]]
+    p1 = nodes_all[edge_nodes[:, 1]]
+    lengths = np.linalg.norm(p1 - p0, axis=1)
+    
+    bad_len_indices = np.where(lengths < tol_len)[0]
+    pathologies["zero_length_edges"] = bad_len_indices.tolist()
+
+    # --- 2. Detect Zombie Edges (No Owners) ---
+    # An edge should have at least a 'left' or 'right' element.
+    # If both are None, it's a ghost object floating in memory.
+    zombies = []
+    internal_cracks = []
+    
+    # Pre-calculate domain bounding box to help identify 'internal' cracks
+    xmin, ymin = nodes_all.min(axis=0)
+    xmax, ymax = nodes_all.max(axis=0)
+    
+    for e in mesh.edges_list:
+        if e.left is None and e.right is None:
+            zombies.append(e.gid)
+            continue
+            
+        # --- 3. Detect Internal Cracks ---
+        # If an edge has only 1 owner, it MUST be on the physical boundary.
+        # If it is geometrically inside the domain, it is a topological crack.
+        if (e.left is None) ^ (e.right is None): # XOR: exactly one is None
+            # Check midpoint
+            mid = (nodes_all[e.nodes[0]] + nodes_all[e.nodes[1]]) * 0.5
+            
+            # Simple bounding box check (strict interior)
+            # (A robust check would use your boundary_locators)
+            on_boundary = (
+                abs(mid[0] - xmin) < 1e-4 or abs(mid[0] - xmax) < 1e-4 or
+                abs(mid[1] - ymin) < 1e-4 or abs(mid[1] - ymax) < 1e-4
+            )
+            
+            # Check cylinder boundary (specific to Turek FSI)
+            # Center=(0.2, 0.2), Radius=0.05
+            dx = mid[0] - 0.2
+            dy = mid[1] - 0.2
+            dist_cyl = math.sqrt(dx*dx + dy*dy)
+            on_cylinder = abs(dist_cyl - 0.05) < 1e-3
+            
+            if not (on_boundary or on_cylinder):
+                internal_cracks.append(e.gid)
+
+    pathologies["zombie_edges"] = zombies
+    pathologies["internal_cracks"] = internal_cracks
+    if internal_cracks:
+        crack_lengths = lengths[np.array(internal_cracks, dtype=int)]
+        print(
+            f"  crack length stats: min={crack_lengths.min():.3e}, "
+            f"median={np.median(crack_lengths):.3e}, max={crack_lengths.max():.3e}"
+        )
+        sample = internal_cracks[:5]
+        for gid in sample:
+            e = mesh.edges_list[int(gid)]
+            mid = nodes_all[list(e.nodes)].mean(axis=0)
+            print(
+                f"    crack edge {gid}: left={e.left} right={e.right} "
+                f"mid=({mid[0]:.4f},{mid[1]:.4f}) len={np.linalg.norm(nodes_all[list(e.nodes)][1]-nodes_all[list(e.nodes)][0]):.3e}"
+            )
+
+    # --- 4. Detect Orphan Nodes ---
+    # Nodes that exist in the list but are not referenced by any active element
+    active_nodes = set()
+    for el in mesh.elements_list:
+        active_nodes.update(el.nodes)
+        
+    all_node_ids = set(n.id for n in mesh.nodes_list)
+    orphans = list(all_node_ids - active_nodes)
+    pathologies["orphan_nodes"] = orphans
+
+    # --- Report ---
+    print("\n--- Mesh Pathology Report ---")
+    print(f"Zero-length edges: {len(pathologies['zero_length_edges'])}")
+    if pathologies['zero_length_edges']:
+        print(f"  -> IDs: {pathologies['zero_length_edges'][:10]}...")
+        
+    print(f"Zombie edges (no owner): {len(pathologies['zombie_edges'])}")
+    
+    print(f"Internal Cracks (1 owner, inside domain): {len(pathologies['internal_cracks'])}")
+    if pathologies['internal_cracks']:
+        print(f"  -> IDs: {pathologies['internal_cracks'][:10]}...")
+        
+    print(f"Orphan Nodes (unused): {len(pathologies['orphan_nodes'])}")
+    
+    return pathologies
+
 # -----------------------------------------------------------------------------
 # Main setup
 # -----------------------------------------------------------------------------
@@ -890,10 +2084,15 @@ mesh = build_structured_channel_mesh(MESH_SIZE, POLY_ORDER)
 _log_step("built base mesh")
 
 # Beam level set (reference configuration)
-beam_ref_ls = BeamLevelSet(center=BEAM_CENTER, Lb=BEAM_LENGTH, Hb=BEAM_HEIGHT)
-# Local refinement around the beam to capture the interface with hanging nodes
-mesh = asymmetric_refine_around_beam_fast(mesh, beam_ref_ls, levels=2, band=None, splits_per_mark=2)
+move_beam_dela_x = 0.01
+beam_cx = BEAM_CENTER[0] - move_beam_dela_x
+beam_ref_ls = BeamLevelSet(center=(beam_cx, BEAM_CENTER[1]), 
+                           Lb=BEAM_LENGTH + move_beam_dela_x, Hb=BEAM_HEIGHT)
+# Anisotropic refinement around the beam (resolve thickness to ~half beam height)
+mesh = refine_beam_anisotropic(mesh, beam_ref_ls, levels=2, target_h=0.5 * BEAM_HEIGHT)
 _log_step("refined mesh around beam")
+# Final clean-up: eliminate lingering 4:1 T-junctions before classification/plots
+mesh = fix_fragmented_sides(mesh, max_segments=2, max_iters=2)
 
 # Use higher order for φ_beam to reduce geometric distortion of the zero set
 ls_me = MixedElement(mesh, field_specs={"phi_beam": POLY_ORDER})
@@ -901,6 +2100,10 @@ ls_dh = DofHandler(ls_me, method="cg")
 ls_beam = LevelSetGridFunction(ls_dh, field="phi_beam")
 ls_beam.interpolate(lambda x, y: beam_ref_ls(np.array([x, y])))
 ls_beam.commit()
+# Classify mesh against beam level set
+mesh.classify_elements(ls_beam)
+mesh.build_interface_segments(ls_beam)
+mesh.classify_edges(ls_beam)
 _log_step("interpolated/committed level set")
 
 domains = make_domain_sets(mesh)
@@ -910,6 +2113,40 @@ if inside_elems.size:
     print(f"Inside elements: {inside_elems.size}, x-span=({x_in.min():.3f},{x_in.max():.3f})")
 else:
     print("Inside elements: 0")
+cut_elems = mesh.element_bitset("cut").to_indices()
+if cut_elems.size:
+    x_cut = mesh.nodes_x_y_pos[np.unique(np.concatenate([mesh.corner_connectivity[i] for i in cut_elems]))][:, 0]
+    print(f"Cut elements: {cut_elems.size}, x-span=({x_cut.min():.3f},{x_cut.max():.3f})")
+centerline_gaps = inside_centerline_gaps(mesh, x_end=0.6, n_samples=160)
+if centerline_gaps:
+    msg = ", ".join(f"{x:.4f}" for x in centerline_gaps[:8])
+    if len(centerline_gaps) > 8:
+        msg += " ..."
+    print(f"[inside-check] Missing inside/cut coverage along beam centreline at x≈ {msg}")
+iface_err = interface_approx_error(mesh, beam_ref_ls)
+print(
+    f"Interface approximation: max|phi|={iface_err['max_abs_phi']:.3e}, "
+    f"mean|phi|={iface_err['mean_abs_phi']:.3e} over {iface_err['n_pts']} pts"
+)
+tj_bad = mesh.count_tjunction_violations()
+worst = tj_bad.get("worst_ratio", 0.0)
+print(f"T-junction violations (>2:1): {tj_bad['count']} (worst ratio={worst:.2f})")
+coverage = beam_inside_coverage(mesh, beam_ref_ls, nx=160, ny=12)
+coverage_inside = beam_inside_coverage(mesh, beam_ref_ls, nx=160, ny=12, inside_only=True)
+if coverage["missing_x"]:
+    msg = ", ".join(f"{x:.4f}" for x in coverage["missing_x"][:8])
+    if len(coverage["missing_x"]) > 8:
+        msg += " ..."
+    print(f"[inside-coverage] coverage={coverage['coverage']:.3f}, missing columns at x≈ {msg}")
+else:
+    print(f"[inside-coverage] coverage={coverage['coverage']:.3f} (beam fully covered by inside/cut)")
+if coverage_inside["missing_x"]:
+    msg = ", ".join(f"{x:.4f}" for x in coverage_inside["missing_x"][:8])
+    if len(coverage_inside["missing_x"]) > 8:
+        msg += " ..."
+    print(f"[inside-only] coverage={coverage_inside['coverage']:.3f}, missing inside columns at x≈ {msg}")
+else:
+    print(f"[inside-only] coverage={coverage_inside['coverage']:.3f} (beam fully covered by inside)")
 print(
     f"Ghost edges: total={mesh.edge_bitset('ghost').cardinality()}, "
     f"pos={mesh.edge_bitset('ghost_pos').cardinality()}, "
@@ -930,6 +2167,20 @@ quick_plot_only = (
     and (ARGS.plot_only or (not ARGS.run_time_stepping and not ARGS.run_fd_check and not ARGS.run_fd_terms))
     and not ARGS.force_full_setup
 )
+
+# After your refinement loop:
+diagnoisis = detect_mesh_pathologies(mesh)
+
+# If internal cracks > 0, do NOT proceed to solver. 
+# The mesh is topologically broken.
+if len(diagnoisis["internal_cracks"]) > 0:
+    print("CRITICAL: Mesh has internal cracks. Visualizing crack locations...")
+    print(diagnoisis)
+
+PATHOLOGY_EDGES: list[int] = []
+for _key in ("internal_cracks", "zombie_edges", "zero_length_edges"):
+    PATHOLOGY_EDGES.extend(diagnoisis.get(_key, []))
+PATHOLOGY_EDGES = sorted(set(PATHOLOGY_EDGES))
 if quick_plot_only:
     import matplotlib.pyplot as plt
     from pycutfem.io.visualization import plot_mesh_2
@@ -943,13 +2194,35 @@ if quick_plot_only:
         plot_edges=True,
         elem_tags=True,
         edge_colors=True,
+        plot_interface=bool(ARGS.plot_interface_points),
         show=False,
         ax=ax,
         resolution=max(20, int(ARGS.plot_resolution)),
+        highlight_edges=PATHOLOGY_EDGES,
     )
     ax.set_title("Initial mesh (plot-only)")
     fname = os.path.join(output_dir, f"mesh_{0:04d}.png")
     fig.savefig(fname, dpi=200, bbox_inches="tight")
+    diag = mesh_topology_diagnostics(mesh)
+    print(
+        f"[mesh-check] missing_side={diag['missing_side']} "
+        f"ownerless_edges={diag['ownerless_edges']} "
+        f"degenerate_shared={diag['degenerate_shared']}"
+    )
+    if diag["degenerate_shared"] > 0:
+        repaired = repair_degenerate_edges(mesh)
+        diag = mesh_topology_diagnostics(mesh)
+        print(
+            f"[mesh-repair] repaired={repaired} → "
+            f"missing_side={diag['missing_side']} "
+            f"ownerless_edges={diag['ownerless_edges']} "
+            f"degenerate_shared={diag['degenerate_shared']}"
+        )
+    cov = coverage_diagnostics(mesh, n_samples=60)
+    if cov["gaps_x"]:
+        print(f"[coverage] gaps at x≈ {', '.join(f'{x:.4f}' for x in cov['gaps_x'][:10])}" + (" ..." if len(cov['gaps_x']) > 10 else ""))
+    else:
+        print("[coverage] no vertical gaps detected in sampled lines")
     print(f"[plot-only] saved {fname} and exiting (skipped solver setup)")
     if ARGS.plot_show or ARGS.interactive_plot:
         plt.show()
@@ -1191,7 +2464,6 @@ def sigma_s_nonlinear(d):
     J = det(F)
     return (1.0 / J) * dot(dot(F, S), F.T)
 
-# ----------------------- Diagnostic helpers -------------------------------
 def _interface_length(mesh: Mesh) -> float:
     """Total length of edges tagged as interface."""
     length = 0.0
@@ -1200,6 +2472,7 @@ def _interface_length(mesh: Mesh) -> float:
         p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
         length += float(np.linalg.norm(p1 - p0))
     return length
+
 
 def _eval_scalar_at_point(dh: DofHandler, mesh: Mesh, f_scalar: Function, point: tuple[float, float]) -> float:
     """
@@ -1429,19 +2702,28 @@ def _plot_mesh(step_idx: int, title: str = "Mesh / Ghost / Level-set") -> None:
         plot_edges=True,
         elem_tags=True,
         edge_colors=True,
+        plot_interface=False,  # handled below for toggling
         show=False,
         ax=ax,
         resolution=max(20, int(ARGS.plot_resolution)),
+        highlight_edges=PATHOLOGY_EDGES,
     )
-    interface_artist = None
+    interface_artists = []
     if ARGS.plot_interface_points:
         segments = []
+        pts_all = []
         for elem in mesh.elements_list:
             pts = getattr(elem, "interface_pts", [])
             if len(pts) == 2:
                 segments.append(np.asarray(pts, float))
+            pts_all.extend(pts)
         if segments:
-            interface_artist = ax.add_collection(LineCollection(segments, colors="magenta", linewidths=1.5, zorder=6, label="Interface pts"))
+            interface_artists.append(
+                ax.add_collection(LineCollection(segments, colors="magenta", linewidths=1.5, zorder=6, label="Interface"))
+            )
+        if pts_all:
+            pts_np = np.asarray(pts_all, float)
+            interface_artists.append(ax.plot(pts_np[:, 0], pts_np[:, 1], "o", color="cyan", markersize=6, markeredgecolor="black", label="Interface pts")[0])
 
     levelset_artists = []
     if level_set_for_plot is not None:
@@ -1465,9 +2747,9 @@ def _plot_mesh(step_idx: int, title: str = "Mesh / Ghost / Level-set") -> None:
         labels.append("Level set")
         artists.append(levelset_artists)
         toggles.append(True)
-    if interface_artist is not None:
+    if interface_artists:
         labels.append("Interface pts")
-        artists.append([interface_artist])
+        artists.append(interface_artists)
         toggles.append(True)
 
     if ARGS.interactive_plot and labels:
@@ -1504,6 +2786,17 @@ def _plot_mesh(step_idx: int, title: str = "Mesh / Ghost / Level-set") -> None:
 
 # Plot initial mesh/level set before any expensive steps (FD checks/time stepping)
 _plot_mesh(step_idx=0, title="Initial mesh")
+diag = mesh_topology_diagnostics(mesh)
+print(f"[mesh-check] missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} degenerate_shared={diag['degenerate_shared']}")
+if diag["degenerate_shared"] > 0:
+    repaired = repair_degenerate_edges(mesh)
+    diag = mesh_topology_diagnostics(mesh)
+    print(f"[mesh-repair] repaired={repaired} → missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} degenerate_shared={diag['degenerate_shared']}")
+cov = coverage_diagnostics(mesh, n_samples=60)
+if cov["gaps_x"]:
+    print(f"[coverage] gaps at x≈ {', '.join(f'{x:.4f}' for x in cov['gaps_x'][:10])}" + (" ..." if len(cov['gaps_x']) > 10 else ""))
+else:
+    print("[coverage] no vertical gaps detected in sampled lines")
 
 def _compute_observables(step_idx: int, t_curr: float) -> None:
     dGamma_obs = dInterface(

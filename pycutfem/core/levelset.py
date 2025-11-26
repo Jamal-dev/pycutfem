@@ -356,17 +356,39 @@ def _find_owner_element(mesh, x: np.ndarray, tol: float = 1e-12) -> int:
         Integer element id.
     """
     x = np.asarray(x, float)
+    
+    # 1. Try Fast Grid Search
+    if hasattr(mesh, 'find_owner_element_fast'):
+        candidates = mesh.find_owner_element_fast(x, tol)
+        # Verify candidates
+        for eid in candidates:
+            try:
+                xi, eta = transform.inverse_mapping(mesh, int(eid), x)
+                if mesh.element_type == "quad":
+                    if -1.0 - tol <= xi <= 1.0 + tol and -1.0 - tol <= eta <= 1.0 + tol:
+                        return int(eid)
+                else: 
+                    if xi >= -tol and eta >= -tol and xi + eta <= 1.0 + tol:
+                        return int(eid)
+            except Exception:
+                pass
+        # If fast search failed (robustness), fall back to global could be added here
+        # but typically grid search covers it.
+
+    # 2. Standard Global Search (Fallback / Original)
     for e in mesh.elements_list:
         try:
             xi, eta = transform.inverse_mapping(mesh, int(e.id), x)
             if mesh.element_type == "quad":
                 if -1.0 - tol <= xi <= 1.0 + tol and -1.0 - tol <= eta <= 1.0 + tol:
                     return int(e.id)
-            else:  # tri
+            else:
                 if xi >= -tol and eta >= -tol and xi + eta <= 1.0 + tol:
                     return int(e.id)
         except Exception:
             pass
+            
+    # Nearest centroid fallback
     d = [np.linalg.norm(np.asarray(e.centroid()) - x) for e in mesh.elements_list]
     return int(np.argmin(d))
 

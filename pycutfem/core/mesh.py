@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from dataclasses import dataclass
 from typing import Tuple, List, Dict, Optional, Callable, Union, Iterable
@@ -44,6 +45,8 @@ class Mesh:
         self.nodes = np.array([n.id for n in self.nodes_list])
         self.elements_connectivity: np.ndarray = element_connectivity
         self.corner_connectivity: np.ndarray = elements_corner_nodes
+        self._char_length = float(np.ptp(self.nodes_x_y_pos, axis=0).max() or 1.0)
+        self._deduplicate_nodes()
         self.elements_list: List['Element'] = []
         self.edges_list: List['Edge'] = []
         self._edge_dict: Dict[Tuple[int, int], 'Edge'] = {}
@@ -66,6 +69,44 @@ class Mesh:
             return np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], float)
         raise KeyError(mesh.element_type)
 
+    def _deduplicate_nodes(self, rel_tol: float = 1e-9, abs_tol: float = 1e-12) -> None:
+        """
+        Merge nearly coincident nodes (within a small absolute/relative tolerance)
+        before rebuilding topology so shared edges line up exactly.
+        """
+        coords = self.nodes_x_y_pos
+        span = float(np.ptp(coords, axis=0).max() or 1.0)
+        snap = max(abs_tol, rel_tol * span)
+        scale = 1.0 / snap
+
+        key_to_new: Dict[Tuple[int, int], int] = {}
+        mapping = np.empty(len(coords), dtype=int)
+        new_nodes: List['Node'] = []
+
+        for old_id, (x, y) in enumerate(coords):
+            key = (int(round(x * scale)), int(round(y * scale)))
+            new_id = key_to_new.get(key)
+            if new_id is None:
+                new_id = len(new_nodes)
+                key_to_new[key] = new_id
+                tag = getattr(self.nodes_list[old_id], "tag", None)
+                new_nodes.append(Node(new_id, float(x), float(y), tag))
+            mapping[old_id] = int(new_id)
+
+        if len(new_nodes) == len(coords):
+            return
+
+        # Remap connectivity to the deduplicated node ids
+        self.elements_connectivity = mapping[self.elements_connectivity]
+        self.corner_connectivity = mapping[self.corner_connectivity]
+        if self.edges_connectivity is not None:
+            self.edges_connectivity = mapping[self.edges_connectivity]
+
+        self.nodes_list = new_nodes
+        self.nodes_x_y_pos = np.array([[n.x, n.y] for n in self.nodes_list], dtype=float)
+        self.nodes = np.array([n.id for n in self.nodes_list])
+        self._char_length = float(np.ptp(self.nodes_x_y_pos, axis=0).max() or 1.0)
+
     def _build_topology(self):
         """
         Builds the full mesh topology: Elements, Edges, and Neighbors.
@@ -73,6 +114,7 @@ class Mesh:
         infers edges from the polygonal corner connectivity.
         """
         edge_defs = self._EDGE_TABLE[self.element_type]
+        char_len = float(getattr(self, "_char_length", 1.0) or 1.0)
 
         # Step 1: Create Element objects
         for eid, elem_nodes in enumerate(self.elements_connectivity):
@@ -92,34 +134,46 @@ class Mesh:
         elem_node_sets = [set(el.nodes) for el in self.elements_list]
 
         def _locate_all_nodes_in_edge(vA: int, vB: int) -> Tuple[int, ...]:
-            x0, y0 = self.nodes_x_y_pos[vA]
-            x1, y1 = self.nodes_x_y_pos[vB]
-            dx, dy = x1 - x0, y1 - y0
-            L2 = dx*dx + dy*dy
-            tol = SIDE.tol * np.sqrt(max(L2, 0.0))
+            """
+            Return every node that lies on the geometric edge vA→vB.
+            Vectorized to avoid Python loops (hot when rebuilding topology
+            after adaptive refinement).
+            """
+            p0 = self.nodes_x_y_pos[vA]
+            p1 = self.nodes_x_y_pos[vB]
+            d = p1 - p0
+            L2 = float(np.dot(d, d))
+            if L2 < 1e-30:
+                return (int(vA), int(vB))
+            L = math.sqrt(L2)
+            # Allow small geometric noise relative to both the edge length and global mesh span
+            dist_tol = max(SIDE.tol * L, 1e-8 * max(L, char_len))
+            proj_tol = max(dist_tol * L, 1e-12 * L2)
 
-            ids = []
-            for nd in self.nodes_list:
-                cross = abs((nd.x - x0)*dy - (nd.y - y0)*dx)
-                if cross > tol:
-                    continue
-                dot = (nd.x - x0)*dx + (nd.y - y0)*dy
-                if -tol <= dot <= L2 + tol:
-                    ids.append(nd.id)
-            # sort along the edge for reproducibility
-            ids.sort(key=lambda nid: (self.nodes_x_y_pos[nid,0]-x0)*dx + (self.nodes_x_y_pos[nid,1]-y0)*dy)
-            return tuple(ids)
+            rel = self.nodes_x_y_pos - p0  # (n_nodes, 2)
+            cross = np.abs(rel[:, 0] * d[1] - rel[:, 1] * d[0])
+            dot = rel @ d
+            # cross/|d| is the perpendicular distance from the line
+            mask = (cross <= dist_tol * L) & (dot >= -proj_tol) & (dot <= L2 + proj_tol)
+            cand = np.nonzero(mask)[0]
+            if cand.size == 0:
+                return (int(vA), int(vB))
+
+            proj = dot[cand]
+            order = np.argsort(proj)
+            ordered = cand[order]
+            return tuple(int(idx) for idx in ordered)
 
         def _sort_along_edge(n_start: int, n_end: int, nodes: Iterable[int]) -> List[int]:
-            x0, y0 = self.nodes_x_y_pos[n_start]
-            x1, y1 = self.nodes_x_y_pos[n_end]
-            dx, dy = x1 - x0, y1 - y0
-            if abs(dx) + abs(dy) < 1e-30:
+            p0 = self.nodes_x_y_pos[n_start]
+            p1 = self.nodes_x_y_pos[n_end]
+            d = p1 - p0
+            if float(np.dot(d, d)) < 1e-30:
                 return sorted(nodes)
-            return sorted(
-                [int(n) for n in nodes],
-                key=lambda nid: (self.nodes_x_y_pos[nid,0]-x0)*dx + (self.nodes_x_y_pos[nid,1]-y0)*dy,
-            )
+            nodes_arr = np.fromiter((int(n) for n in nodes), dtype=int)
+            rel = self.nodes_x_y_pos[nodes_arr] - p0
+            proj = rel @ d
+            return [int(n) for n in nodes_arr[np.argsort(proj)]]
 
         # Step 2: Build edges
         if self.edges_connectivity is not None:
@@ -520,6 +574,155 @@ class Mesh:
             mask = np.fromiter((el.tag == tag for el in self.elements_list), bool)
             return BitSet(mask)
         raise ValueError(f"Unsupported entity type '{entity}'.")
+
+    def count_tjunction_violations(self, max_ratio: float = 2.0) -> Dict[str, Union[int, List[int], float]]:
+        """
+        Count element sides that are subdivided more than `max_ratio` times.
+        Correctly detects 4:1 mismatches by checking the number of edges per geometric side.
+        """
+        bad_edges: List[int] = []
+        worst_ratio = 0.0
+
+        baseline_segments = max(int(self.poly_order), 1)
+
+        # (A) element-side fragmentation (multiple sub-edges on one side)
+        for elem in self.elements_list:
+            for side_edges in elem.edges_by_side:
+                if not side_edges:
+                    continue
+                ratio = float(len(side_edges)) / float(baseline_segments)
+                worst_ratio = max(worst_ratio, ratio)
+                if ratio > max_ratio:
+                    bad_edges.extend([int(gid) for gid in side_edges])
+
+        # (B) edge-based owner mismatch (4:1 etc. across a shared edge)
+        for e in self.edges_list:
+            if e.left is None or e.right is None:
+                continue
+            l_cnt, r_cnt, shared_cnt = self._edge_owner_counts(e)
+            fine = max(l_cnt, r_cnt)
+            coarse = min(l_cnt, r_cnt)
+            ratio = float(fine) / float(max(coarse, 1))
+            worst_ratio = max(worst_ratio, ratio)
+            needs = (fine > max_ratio * max(coarse, 1)) or (shared_cnt < 1)
+            if needs:
+                bad_edges.append(int(e.gid))
+
+        bad_edges = sorted(list(set(bad_edges)))
+
+        return {
+            "count": len(bad_edges),
+            "edges": bad_edges,
+            "worst_ratio": worst_ratio,
+            "count_zero_shared": 0,
+        }
+
+    # --- Performance Optimization: Spatial Acceleration ---
+
+    def build_grid_search(self, n_bins: int = 50):
+        """Builds a simple spatial hash for fast element lookup."""
+        nodes = self.nodes_x_y_pos
+        xmin, ymin = nodes.min(axis=0)
+        xmax, ymax = nodes.max(axis=0)
+        self._grid_mins = np.array([xmin, ymin]) - 1e-4
+        self._grid_maxs = np.array([xmax, ymax]) + 1e-4
+        self._grid_bins = (n_bins, n_bins)
+        self._grid_step = (self._grid_maxs - self._grid_mins) / self._grid_bins
+        
+        self._grid_buckets = {}
+        
+        for eid, elem in enumerate(self.elements_list):
+            # map element bounding box to buckets
+            cn = nodes[list(elem.corner_nodes)]
+            ex_min, ey_min = cn.min(axis=0)
+            ex_max, ey_max = cn.max(axis=0)
+            
+            i0 = int((ex_min - self._grid_mins[0]) / self._grid_step[0])
+            j0 = int((ey_min - self._grid_mins[1]) / self._grid_step[1])
+            i1 = int((ex_max - self._grid_mins[0]) / self._grid_step[0])
+            j1 = int((ey_max - self._grid_mins[1]) / self._grid_step[1])
+            
+            for i in range(max(0, i0), min(n_bins, i1 + 1)):
+                for j in range(max(0, j0), min(n_bins, j1 + 1)):
+                    self._grid_buckets.setdefault((i, j), []).append(eid)
+
+    def find_owner_element_fast(self, x: np.ndarray, tol: float = 1e-12) -> int:
+        """Finds element containing x using grid search (O(1))."""
+        if not hasattr(self, '_grid_buckets'):
+            self.build_grid_search()
+            
+        i = int((x[0] - self._grid_mins[0]) / self._grid_step[0])
+        j = int((x[1] - self._grid_mins[1]) / self._grid_step[1])
+        
+        # Check buckets (center and neighbors to be safe against boundary cases)
+        candidates = []
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                key = (i + di, j + dj)
+                if key in self._grid_buckets:
+                    candidates.extend(self._grid_buckets[key])
+        
+        # Fallback to global search if bucket empty or point slightly outside
+        search_list = candidates if candidates else range(len(self.elements_list))
+        
+        # Use existing geometry check (needs to be imported or copied, 
+        # but typically this is called from levelset which has access to transform)
+        # Here we rely on the caller (LevelSet) to do the geometry check, 
+        # but since this method is in Mesh, we can just return candidates to iterate.
+        # NOTE: To keep it compatible with LevelSet logic, we return the LIST of candidates
+        # and let the caller loop.
+        return candidates
+
+    def _edge_owner_counts(self, edge: Edge, tol: float = 1.0e-12) -> Tuple[int, int, int]:
+        """
+        Return (#nodes_on_edge_left, #nodes_on_edge_right, #shared_nodes) using
+        geometric tests so detection works even when Edge.left_nodes/right_nodes
+        are missing intermediate hanging nodes. Prefer edge.all_nodes when present
+        to avoid counting unrelated collinear nodes.
+        """
+        span = float(getattr(self, "_char_length", 1.0) or 1.0)
+        tol_dist = max(tol, 1e-8 * span)
+        def _count_from_all_nodes(eid: Optional[int]) -> Tuple[int, set]:
+            if eid is None:
+                return 0, set()
+            elem_nodes = set(self.elements_list[int(eid)].nodes)
+            ids = {int(nid) for nid in edge.all_nodes if int(nid) in elem_nodes}
+            return len(ids), ids
+
+        # Prefer stored all_nodes when available
+        if edge.all_nodes:
+            l_cnt, l_ids = _count_from_all_nodes(edge.left)
+            r_cnt, r_ids = _count_from_all_nodes(edge.right)
+            shared = l_ids.intersection(r_ids)
+            if l_cnt or r_cnt:
+                return l_cnt, r_cnt, len(shared)
+
+        # Fallback: geometric detection
+        p0, p1 = self.nodes_x_y_pos[list(edge.nodes)]
+        d = p1 - p0
+        L2 = float(np.dot(d, d))
+        if L2 < tol_dist * tol_dist:
+            return 0, 0, 0
+
+        def _count_nodes(eid: Optional[int]) -> Tuple[int, set]:
+            if eid is None:
+                return 0, set()
+            elem = self.elements_list[int(eid)]
+            ids = set()
+            for nid in elem.nodes:
+                q = self.nodes_x_y_pos[int(nid)]
+                cross = abs((q[0] - p0[0]) * d[1] - (q[1] - p0[1]) * d[0])
+                if cross > math.sqrt(L2) * tol_dist:
+                    continue
+                t = np.dot(q - p0, d) / L2
+                if -tol_dist <= t <= 1.0 + tol_dist:
+                    ids.add(int(nid))
+            return len(ids), ids
+
+        l_cnt, l_ids = _count_nodes(edge.left)
+        r_cnt, r_ids = _count_nodes(edge.right)
+        shared = l_ids.intersection(r_ids)
+        return l_cnt, r_cnt, len(shared)
     
     # --- Public API ---
     def element_char_length(self, elem_id):
