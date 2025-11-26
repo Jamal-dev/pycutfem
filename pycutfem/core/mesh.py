@@ -133,7 +133,7 @@ class Mesh:
 
         elem_node_sets = [set(el.nodes) for el in self.elements_list]
 
-        def _locate_all_nodes_in_edge(vA: int, vB: int) -> Tuple[int, ...]:
+        def _locate_all_nodes_in_edge(vA: int, vB: int, edge_nodes_hint: Optional[Tuple[int, ...]] = None) -> Tuple[int, ...]:
             """
             Return every node that lies on the geometric edge vA→vB.
             Vectorized to avoid Python loops (hot when rebuilding topology
@@ -146,9 +146,17 @@ class Mesh:
             if L2 < 1e-30:
                 return (int(vA), int(vB))
             L = math.sqrt(L2)
-            # Allow small geometric noise relative to both the edge length and global mesh span
-            dist_tol = max(SIDE.tol * L, 1e-8 * max(L, char_len))
-            proj_tol = max(dist_tol * L, 1e-12 * L2)
+            # Base tolerance for straight edges.
+            span_ref = max(L, char_len)
+            dist_tol = max(SIDE.tol * L, 5e-8 * span_ref, 1e-10)
+            # If this element stores edge nodes (p>1), allow curvature by
+            # inflating the tolerance with the edge sagitta.
+            if edge_nodes_hint:
+                coords_hint = self.nodes_x_y_pos[list(edge_nodes_hint)]
+                cross_hint = np.abs((coords_hint[:, 0] - p0[0]) * d[1] - (coords_hint[:, 1] - p0[1]) * d[0])
+                sagitta = float(np.max(cross_hint / L)) if cross_hint.size else 0.0
+                dist_tol = max(dist_tol, 1.25 * sagitta + 1e-9 * span_ref)
+            proj_tol = max(dist_tol * L, 1e-12 * L2, 1e-8 * span_ref * L)
 
             rel = self.nodes_x_y_pos - p0  # (n_nodes, 2)
             cross = np.abs(rel[:, 0] * d[1] - rel[:, 1] * d[0])
@@ -242,11 +250,25 @@ class Mesh:
         else:
             # Infer edges and allow multiple sub-edges per geometric side (hanging nodes).
             # 1) Collect all nodes along every element side (includes hanging nodes from neighbours)
+            edge_hint_indices = None
+            if self.element_type == "quad":
+                n_lat = self.poly_order + 1
+                edge_hint_indices = (
+                    [i for i in range(n_lat)],  # bottom
+                    [k * n_lat + (n_lat - 1) for k in range(n_lat)],  # right
+                    [n_lat * (n_lat - 1) + i for i in range(n_lat)],  # top
+                    [k * n_lat for k in range(n_lat)],  # left
+                )
+
             side_nodes: List[List[List[int]]] = []
-            for corners in self.corner_connectivity:
+            for eid, corners in enumerate(self.corner_connectivity):
                 per_side: List[List[int]] = []
-                for i0, i1 in edge_defs:
-                    per_side.append(list(_locate_all_nodes_in_edge(int(corners[i0]), int(corners[i1]))))
+                lattice = self.elements_connectivity[eid]
+                for lid, (i0, i1) in enumerate(edge_defs):
+                    hint = None
+                    if edge_hint_indices is not None:
+                        hint = tuple(int(lattice[idx]) for idx in edge_hint_indices[lid])
+                    per_side.append(list(_locate_all_nodes_in_edge(int(corners[i0]), int(corners[i1]), hint)))
                 side_nodes.append(per_side)
 
             # 2) Build a segment map keyed by consecutive node pairs along a side.
@@ -583,19 +605,7 @@ class Mesh:
         bad_edges: List[int] = []
         worst_ratio = 0.0
 
-        baseline_segments = max(int(self.poly_order), 1)
-
-        # (A) element-side fragmentation (multiple sub-edges on one side)
-        for elem in self.elements_list:
-            for side_edges in elem.edges_by_side:
-                if not side_edges:
-                    continue
-                ratio = float(len(side_edges)) / float(baseline_segments)
-                worst_ratio = max(worst_ratio, ratio)
-                if ratio > max_ratio:
-                    bad_edges.extend([int(gid) for gid in side_edges])
-
-        # (B) edge-based owner mismatch (4:1 etc. across a shared edge)
+        # (A) edge-based owner mismatch (4:1 etc. across a shared edge)
         for e in self.edges_list:
             if e.left is None or e.right is None:
                 continue

@@ -32,6 +32,7 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.utils.bitset import BitSet
 from pycutfem.utils.ogrid_meshgen import circular_hole_ogrid
+from pycutfem.utils.refinement import TensorRefiner
 from pycutfem.fem.reference import get_reference
 
 from pycutfem.ufl.functionspace import FunctionSpace
@@ -564,90 +565,8 @@ def _on_parent_edge(pt: np.ndarray, corners_xy: np.ndarray, tol: float = 1.0e-12
             continue
         s = np.dot(pt - a, ab) / L2
         if -tol <= s <= 1.0 + tol:
-            return True
+                return True
     return False
-
-
-def mark_elements_near_levelset(mesh: Mesh, level_set, band: float, levels: int = 1) -> set[int]:
-    """Mark elements whose corner box intersects the level set band; expand to neighbor layers."""
-    marked: set[int] = set()
-    corners_all = mesh.nodes_x_y_pos[mesh.corner_connectivity]
-    phi_corners = level_set(corners_all.reshape(-1, 2)).reshape(corners_all.shape[:-1])
-    ex_min = corners_all[..., 0].min(axis=1)
-    ex_max = corners_all[..., 0].max(axis=1)
-    ey_min = corners_all[..., 1].min(axis=1)
-    ey_max = corners_all[..., 1].max(axis=1)
-
-    cx = getattr(level_set, "cx", None)
-    hx = getattr(level_set, "hx", None)
-    cy = getattr(level_set, "cy", None)
-    hy = getattr(level_set, "hy", None)
-    if cx is not None and hx is not None and cy is not None and hy is not None:
-        beam_xmin = float(cx - hx)
-        beam_xmax = float(cx + hx)
-        beam_ymin = float(cy - hy)
-        beam_ymax = float(cy + hy)
-    else:
-        beam_xmin = beam_xmax = beam_ymin = beam_ymax = 0.0
-
-    for eid, (phi, xmin, xmax, ymin, ymax) in enumerate(zip(phi_corners, ex_min, ex_max, ey_min, ey_max)):
-        hits_phi = np.any(phi <= 0.0) or np.any(np.abs(phi) <= band)
-        hits_bbox = (xmin <= beam_xmax + band and xmax >= beam_xmin - band and ymin <= beam_ymax + band and ymax >= beam_ymin - band)
-        if hits_phi or hits_bbox:
-            marked.add(int(eid))
-
-    for _ in range(max(0, levels - 1)):
-        new = set()
-        for eid in marked:
-            for nb in mesh._neighbors[eid]:
-                if nb is not None:
-                    new.add(int(nb))
-        marked |= new
-    return marked
-
-
-def enforce_balance(mesh: Mesh, marked_set: set[int], max_ratio: float = 2.0) -> set[int]:
-    """
-    Propagate refinement markers to enforce a simple 2:1 balance.
-    If a neighbour is more than ~1.5x larger, mark it too.
-    Also guard against long chains of hanging nodes along a shared edge by
-    forcing the coarse neighbour to refine when the subdivision ratio exceeds
-    `max_ratio`.
-    """
-    marked = set(marked_set)
-    changed = True
-    while changed:
-        changed = False
-        for eid in list(marked):
-            h_curr = mesh.element_char_length(eid)
-            for nb_id in mesh._neighbors[eid]:
-                if nb_id is None:
-                    continue
-                if nb_id not in marked:
-                    h_nb = mesh.element_char_length(nb_id)
-                    if h_nb > 1.3 * h_curr:
-                        marked.add(int(nb_id))
-                        changed = True
-                        continue
-                # Shared edge subdivision check (hanging node ratio)
-                for gid in mesh.elements_list[eid].edges:
-                    if gid is None or gid < 0:
-                        continue
-                    e = mesh.edges_list[int(gid)]
-                    other = e.right if e.left == eid else e.left
-                    if other != nb_id:
-                        continue
-                    l_cnt = max(len(e.left_nodes), 1)
-                    r_cnt = max(len(e.right_nodes), 1)
-                    coarse = min(l_cnt, r_cnt)
-                    fine = max(l_cnt, r_cnt)
-                    if coarse > 0 and fine > max_ratio * coarse:
-                        target = e.left if l_cnt < r_cnt else e.right
-                        if target is not None and target not in marked:
-                            marked.add(int(target))
-                            changed = True
-                    break
-    return marked
 
 
 def _refine_element_with_sequences_fast(mesh: Mesh, eid: int, sequences: list[list[str]], nodes, node_lookup, base_grid: np.ndarray, xi_to_idx, bl, br, tr, tl) -> tuple[list[list[int]], list[list[int]]]:
@@ -693,8 +612,10 @@ def asymmetric_refine_around_beam_fast(mesh: Mesh, beam_ls: BeamLevelSet, levels
     band = band or max(4.0 * beam_ls.hy, 1.5 * MESH_SIZE)
     center_x = float(getattr(beam_ls, "cx", BEAM_CENTER[0]))
     base_splits = max(1, int(splits_per_mark))
+    refiner = TensorRefiner()
+    bbox_hint = (beam_ls.cx - beam_ls.hx, beam_ls.cx + beam_ls.hx, beam_ls.cy - beam_ls.hy, beam_ls.cy + beam_ls.hy)
 
-    marked = mark_elements_near_levelset(mesh, beam_ls, band=band, levels=levels)
+    marked = refiner.mark_near_levelset(mesh, beam_ls, band=band, levels=levels, bbox_hint=bbox_hint)
     print(f"[refine_beam_fast] total marked {len(marked)} elems (band={band:.4f}, levels={levels})")
     if not marked:
         return mesh
@@ -761,402 +682,79 @@ def asymmetric_refine_around_beam_fast(mesh: Mesh, beam_ls: BeamLevelSet, levels
 
 def refine_beam_anisotropic(mesh: Mesh, beam_ls: BeamLevelSet, *, levels: int = 2, target_h: float | None = None) -> Mesh:
     """
-    Anisotropic refinement around the beam:
-      1) mark cells intersecting the beam band (plus neighbour halo)
-      2) split marked cells with orientation chosen to reduce height first
-      3) propagate tags/hanging nodes and run diagnostics after each pass
+    Anisotropic refinement around the beam using a balanced tensor-product split
+    (2^nx × 2^ny children per refined parent). We plan nx, ny from element
+    sizes relative to the beam height and a small x-band, then enforce a 2:1
+    balance so neighbouring sides differ by at most one level.
     """
     if mesh.element_type != "quad":
         return mesh
 
+    refiner = TensorRefiner(max_ratio=2.0, max_ref=6)
     target_h = target_h or float(getattr(beam_ls, "hy", BEAM_HEIGHT * 0.5))
-    # Keep the band tight to the beam but wide enough to include a neighbour halo.
     band = max(2.5 * target_h, 1.2 * getattr(beam_ls, "hy", target_h))
+    bbox_hint = (beam_ls.cx - beam_ls.hx, beam_ls.cx + beam_ls.hx, beam_ls.cy - beam_ls.hy, beam_ls.cy + beam_ls.hy)
 
-    p = mesh.poly_order
-    t = np.linspace(-1.0, 1.0, p + 1)
-    xi_to_idx_template = {(float(xi), float(eta)): int(j * (p + 1) + i) for j, eta in enumerate(t) for i, xi in enumerate(t)}
-    bl, br, tr, tl = _quad_corner_indices(p)
-    base_grid_parent = _parent_parametric_grid(p)
-
-    def _on_parent_edge(pt: np.ndarray, corners_xy: np.ndarray, tol: float = 1.0e-12) -> bool:
-        # Detect whether point lies on any parent edge (straight edges only).
-        edge_pairs = ((0, 1), (1, 2), (2, 3), (3, 0))
-        for i0, i1 in edge_pairs:
-            a = corners_xy[i0]
-            b = corners_xy[i1]
-            ab = b - a
-            L2 = float(np.dot(ab, ab))
-            if L2 <= tol:
-                continue
-            cross = abs((pt[0] - a[0]) * ab[1] - (pt[1] - a[1]) * ab[0])
-            if cross > tol * max(1.0, math.sqrt(L2)):
-                continue
-            s = np.dot(pt - a, ab) / L2
-            if -tol <= s <= 1.0 + tol:
-                return True
-        return False
+    marked = refiner.mark_near_levelset(mesh, beam_ls, band=band, levels=max(levels, 1), bbox_hint=bbox_hint)
+    if not marked:
+        return mesh
 
     beam_xmin = float(beam_ls.cx - beam_ls.hx)
     beam_xmax = float(beam_ls.cx + beam_ls.hx)
+    rx_plan, ry_plan = refiner.plan_tensor_levels(
+        mesh,
+        marked,
+        target_h=target_h,
+        span_x=(beam_xmin, beam_xmax),
+        target_x=max(target_h, 0.4 * getattr(beam_ls, "hy", target_h)),
+        span_x_halo=0.35 * band,
+    )
+    rx_bal, ry_bal = refiner.balance_levels(mesh, rx_plan, ry_plan)
+    active = np.nonzero((rx_bal > 0) | (ry_bal > 0))[0]
+    if active.size == 0:
+        return mesh
 
-    def _refine_once(mesh_in: Mesh, marked: set[int]) -> Mesh:
-        nodes = list(mesh_in.nodes_list)
-        node_lookup = {(round(nd.x, 14), round(nd.y, 14)): int(nd.id) for nd in nodes}
-        hanging_nodes: set[int] = set(getattr(mesh_in, "hanging_nodes", []))
-        new_elems: list[list[int]] = []
-        new_corners: list[list[int]] = []
-        parent_to_children: dict[int, list[int]] = {}
+    t0 = time.perf_counter()
+    mesh_cur = refiner.refine(mesh, rx_bal, ry_bal)
+    tag_channel_boundaries(mesh_cur, MESH_SIZE)
+    elapsed = time.perf_counter() - t0
+    diag = mesh_topology_diagnostics(mesh_cur)
+    print(
+        f"[refine_beam_aniso] refined {len(active)} parents → {len(mesh_cur.elements_list)} elems in {elapsed:.3f}s "
+        f"(missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} "
+        f"degenerate_shared={diag['degenerate_shared']} t_ratio={diag['t_ratio_violation']})"
+    )
 
-        for eid, elem in enumerate(mesh_in.elements_list):
-            if eid not in marked:
-                new_elems.append(list(mesh_in.elements_connectivity[eid]))
-                new_corners.append(list(mesh_in.corner_connectivity[eid]))
-                parent_to_children[eid] = [len(new_elems) - 1]
-                continue
-
-            corners_xy = mesh_in.nodes_x_y_pos[list(elem.corner_nodes)]
-            h_y = float(corners_xy[:, 1].max() - corners_xy[:, 1].min())
-            h_x = float(corners_xy[:, 0].max() - corners_xy[:, 0].min())
-
-            # Number of horizontal splits required to drive height below target.
-            horiz_needed = int(math.ceil(math.log(h_y / target_h, 2))) if h_y > target_h + 1.0e-12 else 0
-            depth = max(1, 2 * horiz_needed - 1) if horiz_needed > 0 else 1
-
-            # Enforce some vertical splits when element spans beam in x-direction.
-            vert_needed = 0
-            if corners_xy[:, 0].min() <= beam_xmax and corners_xy[:, 0].max() >= beam_xmin:
-                vert_needed = int(math.ceil(math.log(h_x / target_h, 2))) if h_x > target_h + 1.0e-12 else 0
-            depth = max(depth, 2 * vert_needed) if vert_needed > 0 else depth
-
-            # Insert an extra vertical split for very elongated cells to avoid stripes.
-            if h_x > 2.0 * max(h_y, 1.0e-14):
-                depth = min(depth + 1, 9)
-            depth = min(depth, 9)
-
-            sequences = _generate_sequences("horizontal", depth)
-
-            before_nodes = len(nodes)
-            conns, corners = _refine_element_with_sequences_fast(
-                mesh_in, eid, sequences, nodes, node_lookup, base_grid_parent, xi_to_idx_template, bl, br, tr, tl
-            )
-            new_node_ids = range(before_nodes, len(nodes))
-            for nid in new_node_ids:
-                pt = np.array([nodes[nid].x, nodes[nid].y], float)
-                if _on_parent_edge(pt, corners_xy):
-                    hanging_nodes.add(nid)
-
-            idx_children = []
-            for conn_child, corners_child in zip(conns, corners):
-                idx_children.append(len(new_elems))
-                new_elems.append(conn_child)
-                new_corners.append(corners_child)
-            parent_to_children[eid] = idx_children
-
-        refined = Mesh(
-            nodes=nodes,
-            element_connectivity=np.asarray(new_elems, dtype=int),
-            elements_corner_nodes=np.asarray(new_corners, dtype=int),
-            element_type="quad",
-            poly_order=mesh_in.poly_order,
-        )
-        refined.hanging_nodes = sorted(hanging_nodes)
-        refined.parent_to_children = parent_to_children
-        tag_channel_boundaries(refined, MESH_SIZE)
-        return refined
-    def _refine_tjunctions_by_side(mesh_in: Mesh, max_segments: int = 2) -> Mesh:
-        """
-        Refine coarse neighbours to remove >2:1 chains along *entire sides*.
-
-        A side is 'bad' if len(elem.edges_by_side[side]) > max_segments.
-        We then refine that element in the orientation orthogonal to the side
-        (vertical split for bottom/top, horizontal for left/right).
-        """
-        if mesh_in.element_type != "quad":
-            return mesh_in
-
-        nodes = list(mesh_in.nodes_list)
-        node_lookup = {(round(nd.x, 14), round(nd.y, 14)): int(nd.id) for nd in nodes}
-        hanging_nodes: set[int] = set(getattr(mesh_in, "hanging_nodes", []))
-        new_elems: list[list[int]] = []
-        new_corners: list[list[int]] = []
-        parent_to_children: dict[int, list[int]] = {}
-
-        # --- 1) Decide which parents to refine and in which orientation(s) ---
-        orient_map: dict[int, set[str]] = {}
-
-        for elem in mesh_in.elements_list:
-            for lid, side_edges in enumerate(elem.edges_by_side):
-                if not side_edges:
-                    continue
-                n_seg = len(side_edges)
-                if n_seg <= max_segments:
-                    continue
-
-                # side index convention: see _EDGE_TABLE in Mesh
-                # 0: (0,1) bottom, 1: (1,2) right, 2: (2,3) top, 3: (3,0) left
-                if lid in (0, 2):          # bottom/top → segments in x
-                    orient = "vertical"    # split in x to halve segments
-                else:                      # left/right → segments in y
-                    orient = "horizontal"
-
-                orient_map.setdefault(elem.id, set()).add(orient)
-
-        if not orient_map:
-            # nothing to fix
-            return mesh_in
-
-        # Precompute parametric helpers (identical to _refine_once)
-        p = mesh_in.poly_order
-        t = np.linspace(-1.0, 1.0, p + 1)
-        xi_to_idx_template = {
-            (float(xi), float(eta)): int(j * (p + 1) + i)
-            for j, eta in enumerate(t)
-            for i, xi in enumerate(t)
-        }
-        bl, br, tr, tl = _quad_corner_indices(p)
-        base_grid_parent = _parent_parametric_grid(p)
-
-        # --- 2) Actually refine the marked parents ---
-        for eid, elem in enumerate(mesh_in.elements_list):
-            requested = orient_map.get(eid)
-            if not requested:
-                # just copy
-                new_elems.append(list(mesh_in.elements_connectivity[eid]))
-                new_corners.append(list(mesh_in.corner_connectivity[eid]))
-                parent_to_children[eid] = [len(new_elems) - 1]
-                continue
-
-            # choose a primary orientation (if both, favour vertical first)
-            primary = "vertical" if "vertical" in requested else "horizontal"
-
-            # how bad is this element? (largest #segments over its four sides)
-            worst_ratio = max(len(side) for side in elem.edges_by_side if side)
-            # We want enough splits so that each child sees at most `max_segments`
-            # segments on its side. A vertical/horizontal split roughly halves
-            # segments on that side, so depth ≈ ceil(log2(worst_ratio/max_segments)).
-            depth_needed = int(
-                math.ceil(
-                    math.log(max(worst_ratio / max_segments, 1.0), 2.0)
-                )
-            )
-            depth = max(1, min(depth_needed, 4))  # keep it reasonable
-
-            sequences = _generate_sequences(primary, depth)
-
-            corners_xy = mesh_in.nodes_x_y_pos[list(elem.corner_nodes)]
-            before_nodes = len(nodes)
-            conns, corners = _refine_element_with_sequences_fast(
-                mesh_in,
-                eid,
-                sequences,
-                nodes,
-                node_lookup,
-                base_grid_parent,
-                xi_to_idx_template,
-                bl,
-                br,
-                tr,
-                tl,
-            )
-
-            # mark newly created nodes that lie on the old parent edges as hanging
-            new_node_ids = range(before_nodes, len(nodes))
-            for nid in new_node_ids:
-                pt = np.array([nodes[nid].x, nodes[nid].y], float)
-                if _on_parent_edge(pt, corners_xy):
-                    hanging_nodes.add(nid)
-
-            idx_children = []
-            for conn_child, corners_child in zip(conns, corners):
-                idx_children.append(len(new_elems))
-                new_elems.append(conn_child)
-                new_corners.append(corners_child)
-            parent_to_children[eid] = idx_children
-
-        # --- 3) Build new mesh & re-tag boundaries ---
-        refined = Mesh(
-            nodes=nodes,
-            element_connectivity=np.asarray(new_elems, dtype=int),
-            elements_corner_nodes=np.asarray(new_corners, dtype=int),
-            element_type="quad",
-            poly_order=mesh_in.poly_order,
-        )
-        refined.hanging_nodes = sorted(hanging_nodes)
-        refined.parent_to_children = parent_to_children
-        tag_channel_boundaries(refined, MESH_SIZE)  # same as elsewhere
-        return refined
-
-
-    def _refine_tjunctions(mesh_in: Mesh, max_ratio: float = 2.0) -> Mesh:
-        """
-        Refine coarse neighbours on edges that violate the 2:1 T-junction rule.
-        Splits the coarse element once across the offending edge orientation.
-        """
-        if mesh_in.element_type != "quad":
-            print(f"refine t-junctions: unsupported element type {mesh_in.element_type}; skipping.")
-            return mesh_in
-        nodes = list(mesh_in.nodes_list)
-        node_lookup = {(round(nd.x, 14), round(nd.y, 14)): int(nd.id) for nd in nodes}
-        hanging_nodes: set[int] = set(getattr(mesh_in, "hanging_nodes", []))
-        new_elems: list[list[int]] = []
-        new_corners: list[list[int]] = []
-        parent_to_children: dict[int, list[int]] = {}
-
-        # Map element id -> required split orientations
-        orient_map: dict[int, set[str]] = {}
-        for e in mesh_in.edges_list:
-            if e.left is None or e.right is None:
-                continue
-            l_cnt, r_cnt, shared_cnt = mesh_in._edge_owner_counts(e)
-            fine = max(l_cnt, r_cnt)
-            coarse = min(l_cnt, r_cnt)
-            needs_refine = fine > max_ratio * coarse or shared_cnt < 1
-            if not needs_refine:
-                continue
-            targets = []
-            if shared_cnt < 1:
-                targets.extend([e.left, e.right])
-            else:
-                targets.append(e.left if l_cnt < r_cnt else e.right)
-            p0, p1 = mesh_in.nodes_x_y_pos[list(e.nodes)]
-            dx, dy = p1 - p0
-            orient = "vertical" if abs(dx) >= abs(dy) else "horizontal"
-            for coarse_eid in targets:
-                if coarse_eid is None:
-                    continue
-                orient_map.setdefault(int(coarse_eid), set()).add(orient)
-
-        if not orient_map:
-            return mesh_in
-
-        for eid, elem in enumerate(mesh_in.elements_list):
-            orient_set = orient_map.get(eid)
-            if not orient_set:
-                new_elems.append(list(mesh_in.elements_connectivity[eid]))
-                new_corners.append(list(mesh_in.corner_connectivity[eid]))
-                parent_to_children[eid] = [len(new_elems) - 1]
-                continue
-
-            primary = "vertical" if "vertical" in orient_set else "horizontal"
-            depth = 2 if len(orient_set) > 1 else 1
-            sequences = _generate_sequences(primary, depth)
-
-            corners_xy = mesh_in.nodes_x_y_pos[list(elem.corner_nodes)]
-            before_nodes = len(nodes)
-            conns, corners = _refine_element_with_sequences_fast(
-                mesh_in, eid, sequences, nodes, node_lookup, base_grid_parent, xi_to_idx_template, bl, br, tr, tl
-            )
-            new_node_ids = range(before_nodes, len(nodes))
-            for nid in new_node_ids:
-                pt = np.array([nodes[nid].x, nodes[nid].y], float)
-                if _on_parent_edge(pt, corners_xy):
-                    hanging_nodes.add(nid)
-
-            idx_children = []
-            for conn_child, corners_child in zip(conns, corners):
-                idx_children.append(len(new_elems))
-                new_elems.append(conn_child)
-                new_corners.append(corners_child)
-            parent_to_children[eid] = idx_children
-
-        refined = Mesh(
-            nodes=nodes,
-            element_connectivity=np.asarray(new_elems, dtype=int),
-            elements_corner_nodes=np.asarray(new_corners, dtype=int),
-            element_type="quad",
-            poly_order=mesh_in.poly_order,
-        )
-        refined.hanging_nodes = sorted(hanging_nodes)
-        refined.parent_to_children = parent_to_children
-        tag_channel_boundaries(refined, MESH_SIZE)
-        return refined
-
-    mesh_cur = mesh
-    max_cycles = 5
-    for cycle in range(max_cycles):
-        marked_all = mark_elements_near_levelset(mesh_cur, beam_ls, band=band, levels=levels)
-        if not marked_all:
-            break
-        to_refine: set[int] = set()
-        for eid in marked_all:
-            cn = mesh_cur.nodes_x_y_pos[list(mesh_cur.elements_list[eid].corner_nodes)]
-            h_y = float(cn[:, 1].max() - cn[:, 1].min())
-            if h_y > target_h + 1.0e-12:
-                to_refine.add(int(eid))
-
-        # Ripple refinement to enforce 2:1 balance before splitting.
-        to_refine = enforce_balance(mesh_cur, to_refine)
-
-        if not to_refine:
-            break
-
-        t0 = time.perf_counter()
-        mesh_cur = _refine_once(mesh_cur, to_refine)
-        elapsed = time.perf_counter() - t0
-
+    if diag["missing_side"] > 0 or diag["ownerless_edges"] > 0:
+        repaired = repair_degenerate_edges(mesh_cur)
         diag = mesh_topology_diagnostics(mesh_cur)
         print(
-            f"[refine_beam_aniso] cycle {cycle + 1}: refined {len(to_refine)} elems → "
-            f"{len(mesh_cur.elements_list)} elems in {elapsed:.3f}s "
-            f"(missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} "
-            f"degenerate_shared={diag['degenerate_shared']} t_ratio={diag['t_ratio_violation']})"
+            f"[refine_beam_aniso] repaired {repaired} edges → "
+            f"missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} "
+            f"degenerate_shared={diag['degenerate_shared']} t_ratio={diag['t_ratio_violation']}"
         )
-        if cycle == max_cycles - 1 and (diag["missing_side"] > 0 or diag["ownerless_edges"] > 0):
-            print("[refine_beam_aniso] stopping: unresolved topology at max cycle; aborting to avoid divergence.")
-            sys.exit(1)
-        # Repair when topological issues remain (ignore degenerate_shared T-junctions).
-        if diag["missing_side"] > 0 or diag["ownerless_edges"] > 0:
-            repaired = repair_degenerate_edges(mesh_cur)
-            diag = mesh_topology_diagnostics(mesh_cur)
-            print(
-                f"[refine_beam_aniso] repaired {repaired} edges → "
-                f"missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} "
-                f"degenerate_shared={diag['degenerate_shared']} t_ratio={diag['t_ratio_violation']}"
-            )
-        for _ in range(2):
-            tj_bad = mesh_cur.count_tjunction_violations()
-            if tj_bad["count"] == 0:
-                break
-            # mesh_cur = _refine_tjunctions(mesh_cur)
-            mesh_cur = _refine_tjunctions_by_side(mesh_cur)
-            diag = mesh_topology_diagnostics(mesh_cur)
-            print(
-                f"[refine_beam_aniso] t-junction fix: refined {len(tj_bad['edges'])} coarse neighbours → "
-                f"{len(mesh_cur.elements_list)} elems "
-                f"(t_ratio={diag['t_ratio_violation']} degenerate_shared={diag['degenerate_shared']})"
-            )
-        if diag["degenerate_shared"] > 0:
-            repaired = repair_degenerate_edges(mesh_cur)
-            diag = mesh_topology_diagnostics(mesh_cur)
-            print(
-                f"[refine_beam_aniso] repaired {repaired} degenerate edges → "
-                f"degenerate_shared={diag['degenerate_shared']} t_ratio={diag['t_ratio_violation']}"
-            )
-        cov = coverage_diagnostics(mesh_cur, n_samples=80)
-        if cov["gaps_x"]:
-            msg = ", ".join(f"{x:.4f}" for x in cov["gaps_x"][:8])
-            if len(cov["gaps_x"]) > 8:
-                msg += " ..."
-            print(f"[refine_beam_aniso] coverage gaps at x≈ {msg}")
-        else:
-            print("[refine_beam_aniso] no coverage gaps on sampled lines")
-        center_gaps = inside_centerline_gaps(mesh_cur, x_end=0.6, n_samples=120, require_tags=False)
-        if center_gaps:
-            msg = ", ".join(f"{x:.4f}" for x in center_gaps[:8])
-            if len(center_gaps) > 8:
-                msg += " ..."
-            print(f"[refine_beam_aniso] missing inside/cut cells along beam centreline at x≈ {msg}")
-        else:
-            print("[refine_beam_aniso] centreline is fully covered up to x=0.6")
+
+    # Safety net for rare fragmented sides (should be rare after balancing)
+    mesh_cur = fix_fragmented_sides(mesh_cur, max_segments=2, max_iters=1)
+    cov = coverage_diagnostics(mesh_cur, n_samples=80)
+    if cov["gaps_x"]:
+        msg = ", ".join(f"{x:.4f}" for x in cov["gaps_x"][:8])
+        if len(cov["gaps_x"]) > 8:
+            msg += " ..."
+        print(f"[refine_beam_aniso] coverage gaps at x≈ {msg}")
+    center_gaps = inside_centerline_gaps(mesh_cur, x_end=0.6, n_samples=120, require_tags=False)
+    if center_gaps:
+        msg = ", ".join(f"{x:.4f}" for x in center_gaps[:8])
+        if len(center_gaps) > 8:
+            msg += " ..."
+        print(f"[refine_beam_aniso] missing inside/cut cells along beam centreline at x≈ {msg}")
 
     # Enforce inside coverage explicitly if columns are missing.
-    mesh_cur = _enforce_inside_columns(mesh_cur, beam_ls, target_h, _refine_once, _refine_tjunctions)
-
+    mesh_cur = _enforce_inside_columns(mesh_cur, beam_ls, target_h, refiner=refiner, attempts=2)
     return mesh_cur
 
 
-def _enforce_inside_columns(mesh: Mesh, beam_ls: BeamLevelSet, target_h: float, refine_once, refine_tj, *, attempts: int = 1) -> Mesh:
+def _enforce_inside_columns(mesh: Mesh, beam_ls: BeamLevelSet, target_h: float, *, refiner: TensorRefiner, attempts: int = 1) -> Mesh:
     """
     If the beam interior is not fully covered by inside elements, refine
     elements whose centroid lies in the beam box until a full inside column exists.
@@ -1167,36 +765,18 @@ def _enforce_inside_columns(mesh: Mesh, beam_ls: BeamLevelSet, target_h: float, 
         missing_x = cov_inside["missing_x"][:24]  # limit scope to reduce blow-up
         if not missing_x:
             break
-        marked: set[int] = set()
-        x_tol = target_h
+
         y0 = beam_ls.cy - beam_ls.hy - 1e-10
         y1 = beam_ls.cy + beam_ls.hy + 1e-10
-        for eid, e in enumerate(mesh_cur.elements_list):
-            cn = mesh_cur.nodes_x_y_pos[list(e.corner_nodes)]
-            ex0, ex1 = cn[:, 0].min(), cn[:, 0].max()
-            ey0, ey1 = cn[:, 1].min(), cn[:, 1].max()
-            if ey1 < y0 or ey0 > y1:
-                continue
-            cx = 0.5 * (ex0 + ex1)
-            if any(abs(cx - x0) <= x_tol for x0 in missing_x):
-                marked.add(int(eid))
-        if not marked:
-            break
-        marked = enforce_balance(mesh_cur, marked)
-        mesh_cur = refine_once(mesh_cur, marked)
+        mesh_cur = refiner.ensure_column_coverage(mesh_cur, beam_ls, target_h, missing_x=missing_x, y_interval=(y0, y1))
+        tag_channel_boundaries(mesh_cur, MESH_SIZE)
         diag = mesh_topology_diagnostics(mesh_cur)
-        # Fix any large hanging ratios introduced by this pass
-        for _ in range(2):
-            tj_bad = mesh_cur.count_tjunction_violations()
-            if tj_bad["count"] == 0:
-                break
-            mesh_cur = refine_tj(mesh_cur)
-            diag = mesh_topology_diagnostics(mesh_cur)
         if diag["degenerate_shared"] > 0:
             repaired = repair_degenerate_edges(mesh_cur)
             diag = mesh_topology_diagnostics(mesh_cur)
+        mesh_cur = fix_fragmented_sides(mesh_cur, max_segments=2, max_iters=1)
         print(
-            f"[inside-fix] refined {len(marked)} elems for inside coverage → "
+            f"[inside-fix] refined {len(missing_x)} columns for inside coverage → "
             f"{len(mesh_cur.elements_list)} elems (t_ratio={diag['t_ratio_violation']} deg_shared={diag['degenerate_shared']})"
         )
     return mesh_cur
