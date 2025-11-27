@@ -388,31 +388,38 @@ class Mesh:
         Classify each element as 'inside', 'outside', or 'cut'.
         Sets element.tag accordingly and returns indices for each class.
         """
-        # Assumes level_set has a method evaluate_on_nodes(mesh)
-        phi_nodes = level_set.evaluate_on_nodes(self)
+        phi_nodes      = level_set.evaluate_on_nodes(self)
         elem_phi_nodes = phi_nodes[self.corner_connectivity]
-        # phi_cent = self._phi_on_centroids(level_set)
 
-        # min_phi = np.minimum(elem_phi_nodes.min(axis=1), phi_cent)
-        # max_phi = np.maximum(elem_phi_nodes.max(axis=1), phi_cent)
+        has_neg = elem_phi_nodes < -tol
+        has_pos = elem_phi_nodes >  tol
 
-        min_phi = elem_phi_nodes.min(axis=1)
-        max_phi = elem_phi_nodes.max(axis=1)
-        
-        inside_mask = (max_phi < -tol)
-        outside_mask = (min_phi > tol)
-        
-        inside_inds = np.where(inside_mask)[0]
+        any_neg = has_neg.any(axis=1)
+        any_pos = has_pos.any(axis=1)
+
+        # True sign change → genuine cut element
+        cut_mask = any_neg & any_pos
+
+        # Only negative or zero → inside
+        inside_mask = any_neg & ~any_pos
+
+        # Only positive or zero → outside
+        outside_mask = ~any_neg & any_pos
+
+        # Narrow φ≈0 band (all nodes ~0): treat as cut for safety
+        narrow_band_mask = ~any_neg & ~any_pos
+        cut_mask |= narrow_band_mask
+
+        inside_inds  = np.where(inside_mask)[0]
         outside_inds = np.where(outside_mask)[0]
-        cut_inds = np.where(~(inside_mask | outside_mask))[0]
+        cut_inds     = np.where(cut_mask)[0]
 
-        for eid in inside_inds: self.elements_list[eid].tag = 'inside'
-        for eid in outside_inds: self.elements_list[eid].tag = 'outside'
-        for eid in cut_inds: self.elements_list[eid].tag = 'cut'
+        for eid in inside_inds:  self.elements_list[eid].tag = "inside"
+        for eid in outside_inds: self.elements_list[eid].tag = "outside"
+        for eid in cut_inds:     self.elements_list[eid].tag = "cut"
+
         tags_el = np.array([e.tag for e in self.elements_list])
-
         self._elem_bitsets = {t: BitSet(tags_el == t) for t in np.unique(tags_el)}
-        
         return inside_inds, outside_inds, cut_inds
 
     def classify_elements_multi(self, level_sets, tol=SIDE.tol):
@@ -424,58 +431,123 @@ class Mesh:
         Classify edges as 'interface' or 'ghost' based on element tags.
         """
         phi_nodes = level_set.evaluate_on_nodes(self)
+        
         for edge in self.edges_list:
             if edge.right is None:
-                # Boundary edge: KEEP whatever tag the mesh generator gave
-                # (e.g., 'left', 'right', 'top', 'bottom' or 'boundary').
-                # If you also want to auto-fill when missing, you can set a
-                # default like: edge.tag = edge.tag or 'boundary'
                 continue
 
-            # Interior edge -> safe to reset and classify
             edge.tag = ''
             n0, n1 = edge.nodes
             p0, p1 = phi_nodes[n0], phi_nodes[n1]
+
+            # 1. First priority: Check for Perfect Alignment (Interface Edges)
+            # If both nodes are effectively zero, this IS the interface.
+            if abs(p0) <= tol and abs(p1) <= tol:
+                edge.tag = 'interface'
+                continue
+
+            # 2. Ghost Edge Classification based on Element Tags
+            left_el = self.elements_list[edge.left]
+            right_el = self.elements_list[edge.right]
+            tags = {left_el.tag, right_el.tag}
+            
+            # We only care about stabilization if a Cut element is involved
+            if 'cut' in tags:
+                # Case A: Cut + Cut -> Stabilizes Both
+                if left_el.tag == 'cut' and right_el.tag == 'cut':
+                    edge.tag = 'ghost_both'
+                
+                # Case B: Cut + Outside -> Stabilizes Fluid (Positive)
+                elif 'outside' in tags:
+                    edge.tag = 'ghost_pos'
+                
+                # Case C: Cut + Inside -> Stabilizes Solid (Negative)
+                elif 'inside' in tags:
+                    edge.tag = 'ghost_neg'
+            
+            # Note: Edges between 'inside' and 'outside' (without 'cut') 
+            # are handled by the 'interface' check above or remain standard boundaries.
+
+        # 3. Build BitSets (same as before)
+        tags_arr = np.array([e.tag for e in self.edges_list])
+        unique_tags = np.unique(tags_arr).tolist()
+        self._edge_bitsets = {t: BitSet(tags_arr == t) for t in unique_tags if t}
+
+        # Union for solver sets
+        ghost_pos_bs = self._edge_bitsets.get('ghost_pos', BitSet(np.zeros(len(tags_arr), bool)))
+        ghost_neg_bs = self._edge_bitsets.get('ghost_neg', BitSet(np.zeros(len(tags_arr), bool)))
+        ghost_both_bs = self._edge_bitsets.get('ghost_both', BitSet(np.zeros(len(tags_arr), bool)))
+        
+        self._edge_bitsets['ghost_pos'] = ghost_pos_bs | ghost_both_bs
+        self._edge_bitsets['ghost_neg'] = ghost_neg_bs | ghost_both_bs
+        self._edge_bitsets['ghost'] = ghost_pos_bs | ghost_neg_bs | ghost_both_bs
+    
+    # def classify_edges(self, level_set, tol=SIDE.tol):
+    #     """
+    #     Classify edges as 'interface' or 'ghost' based on element tags.
+    #     """
+    #     from pycutfem.core.levelset import phi_eval
+    #     phi_nodes = level_set.evaluate_on_nodes(self)
+    #     for edge in self.edges_list:
+    #         if edge.right is None:
+    #             # Boundary edge: KEEP whatever tag the mesh generator gave
+    #             # (e.g., 'left', 'right', 'top', 'bottom' or 'boundary').
+    #             # If you also want to auto-fill when missing, you can set a
+    #             # default like: edge.tag = edge.tag or 'boundary'
+    #             continue
+
+    #         # Interior edge -> safe to reset and classify
+    #         edge.tag = ''
+    #         n0, n1 = edge.nodes
+    #         # mid_xy = 0.5 * (self.nodes_x_y_pos[n0] + self.nodes_x_y_pos[n1])
+    #         p0, p1 = phi_nodes[n0], phi_nodes[n1]
+    #         # pm = phi_eval(level_set, mid_xy, mesh=self)
             
 
-            # --- Classification for INTERIOR edges based on element tags ---
-            if edge.right is not None:
-                left_tag = self.elements_list[edge.left].tag
-                right_tag = self.elements_list[edge.right].tag
-                tags = {left_tag, right_tag}
+    #         # --- Classification for INTERIOR edges based on element tags ---
+    #         if edge.right is not None:
+    #             left_tag = self.elements_list[edge.left].tag
+    #             right_tag = self.elements_list[edge.right].tag
+    #             tags = {left_tag, right_tag}
 
-                # Prioritize 'interface' if crossed (level set lies on edge)
-                if p0 * p1 < 0:
-                    # (i) strict crossing
-                    edge.tag = 'interface'
-                elif abs(p0) <= tol and abs(p1) <= tol:
-                    # (ii) whole edge on interface
-                    edge.tag = 'interface'
-                elif 'cut' in tags:
-                    # This logic might be flawed if both elements are 'cut'.
-                    # Assuming one is 'cut' and the other is not.
-                    non_cut_tags = [t for t in tags if t != 'cut']
-                    if non_cut_tags:
-                        non_cut = non_cut_tags[0]
-                        if non_cut == 'outside':
-                            edge.tag = 'ghost_pos'  # Cut and positive side
-                        elif non_cut == 'inside':
-                            edge.tag = 'ghost_neg'  # Cut and negative side
-                    else: # This happens if both tags are 'cut'
-                        edge.tag = 'ghost_both'
+    #             # Prioritize 'interface' if crossed (level set lies on edge)
+    #             if p0 * p1 < -tol:
+    #                 # (i) strict crossing
+    #                 edge.tag = 'ghost_both'
+    #             elif abs(p0) <= tol and abs(p1) <= tol:
+    #                 # (ii) whole edge on interface
+    #                 edge.tag = 'interface'
+    #             elif 'cut' in tags:
+    #                 # This logic might be flawed if both elements are 'cut'.
+    #                 # Assuming one is 'cut' and the other is not.
+    #                 non_cut_tags = [t for t in tags if t != 'cut']
+    #                 if non_cut_tags:
+    #                     non_cut = non_cut_tags[0]
+    #                     if non_cut == 'outside':
+    #                         edge.tag = 'ghost_pos'  # Cut and positive side
+    #                     elif non_cut == 'inside':
+    #                         edge.tag = 'ghost_neg'  # Cut and negative side
+    #                 else: # This happens if both tags are 'cut'
+    #                     print(f"[warning!] p0={p0}, p1={p1}, tags={tags}")
+    #                     if (p0 <=tol and p1 >=tol) or (p1 <=tol and p0 >=tol):
+    #                         edge.tag = 'ghost_pos'
+    #                     elif (p0 <=-tol and p1 <=tol) or (p1 <=-tol and p0 <=tol):
+    #                         edge.tag = 'ghost_neg'
+    #                     else:
+    #                         edge.tag = 'ghost_both'
 
 
-        # Build and cache BitSets *once* – O(n_edges) total
-        tags = np.array([e.tag for e in self.edges_list])
-        #Convert np.unique result to a standard Python list
-        unique_tags = np.unique(tags).tolist()
-        self._edge_bitsets = {t: BitSet(tags == t) for t in unique_tags if t}
+    #     # Build and cache BitSets *once* – O(n_edges) total
+    #     tags = np.array([e.tag for e in self.edges_list])
+    #     #Convert np.unique result to a standard Python list
+    #     unique_tags = np.unique(tags).tolist()
+    #     self._edge_bitsets = {t: BitSet(tags == t) for t in unique_tags if t}
 
-        # New: Union bitset for 'ghost' (all ghost_*)
-        ghost_pos_bs = self._edge_bitsets.get('ghost_pos', BitSet(np.zeros(len(tags), bool)))
-        ghost_neg_bs = self._edge_bitsets.get('ghost_neg', BitSet(np.zeros(len(tags), bool)))
-        ghost_both_bs = self._edge_bitsets.get('ghost_both', BitSet(np.zeros(len(tags), bool)))
-        self._edge_bitsets['ghost'] = ghost_pos_bs | ghost_neg_bs | ghost_both_bs
+    #     # New: Union bitset for 'ghost' (all ghost_*)
+    #     ghost_pos_bs = self._edge_bitsets.get('ghost_pos', BitSet(np.zeros(len(tags), bool)))
+    #     ghost_neg_bs = self._edge_bitsets.get('ghost_neg', BitSet(np.zeros(len(tags), bool)))
+    #     ghost_both_bs = self._edge_bitsets.get('ghost_both', BitSet(np.zeros(len(tags), bool)))
+    #     self._edge_bitsets['ghost'] = ghost_pos_bs | ghost_neg_bs | ghost_both_bs
 
     
 
