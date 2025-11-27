@@ -424,7 +424,14 @@ def plot_mesh_2(
     if plot_interface:
         all_pts, segments = [], []
         for elem in mesh.elements_list:
-            if hasattr(elem, 'interface_pts') and elem.interface_pts:
+            # Prefer polyline segments when available, fall back to endpoints
+            if hasattr(elem, "interface_segments") and elem.interface_segments:
+                for seg in elem.interface_segments:
+                    if len(seg) == 2:
+                        p0, p1 = seg
+                        segments.append([p0, p1])
+                        all_pts.extend([p0, p1])
+            elif hasattr(elem, 'interface_pts') and elem.interface_pts:
                 all_pts.extend(elem.interface_pts)
                 if len(elem.interface_pts) == 2:
                     segments.append(elem.interface_pts)

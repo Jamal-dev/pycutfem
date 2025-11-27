@@ -2308,31 +2308,46 @@ class DofHandler:
         fields   = list(me.field_names)
         n_union  = me.n_dofs_local
 
-        # --- normalize element ids and keep only 2‑point cuts -------------------------
+        # --- normalize element ids and expand per-segment -------------------------
         if hasattr(cut_element_ids, "to_indices"):
             ids_all = cut_element_ids.to_indices()
         else:
             ids_all = list(cut_element_ids)
-        valid_eids = [
-            int(eid) for eid in ids_all
-            if (0 <= int(eid) < mesh.n_elements
-                and mesh.elements_list[int(eid)].tag == "cut"
-                and len(mesh.elements_list[int(eid)].interface_pts) == 2)
-        ]
+
+        segment_records: list[tuple[int, int, np.ndarray, np.ndarray]] = []
+        for raw_eid in ids_all:
+            eid = int(raw_eid)
+            if not (0 <= eid < mesh.n_elements):
+                continue
+            elem = mesh.elements_list[eid]
+            if elem.tag != "cut":
+                continue
+            segs = getattr(elem, "interface_segments", None)
+            if segs:
+                for sid, seg in enumerate(segs):
+                    if seg and len(seg) == 2:
+                        p0, p1 = seg
+                        segment_records.append((eid, int(sid), np.asarray(p0, float), np.asarray(p1, float)))
+                continue
+            if len(getattr(elem, "interface_pts", ())) == 2:
+                p0, p1 = elem.interface_pts
+                segment_records.append((eid, 0, np.asarray(p0, float), np.asarray(p1, float)))
+
+        seg_eids = [rec[0] for rec in segment_records]
 
         # empty → return a consistent skeleton
-        if not valid_eids:
+        if not segment_records:
             z2 = np.empty((0, 0, 2), dtype=float); z1 = np.empty((0, 0), dtype=float)
             out = {
                 "eids": np.empty(0, dtype=np.int32),
                 "qp_phys": z2, "qw": z1, "normals": z2, "phis": z1,
                 "detJ": z1, "J_inv": np.empty((0, 0, 2, 2), dtype=float),
                 "h_arr": np.empty((0,), dtype=float),
-                "gdofs_map": np.empty((0, n_union), dtype=np.int64),
-                "entity_kind": "element",
-                "owner_id": np.empty(0, dtype=np.int32),
-                "owner_pos_id": np.empty(0, dtype=np.int32),
-                "owner_neg_id": np.empty(0, dtype=np.int32),
+            "gdofs_map": np.empty((0, n_union), dtype=np.int64),
+            "entity_kind": "element",
+            "owner_id": np.empty(0, dtype=np.int32),
+            "owner_pos_id": np.empty(0, dtype=np.int32),
+            "owner_neg_id": np.empty(0, dtype=np.int32),
                 "J_inv_pos": np.empty((0, 0, 2, 2), dtype=float),
                 "J_inv_neg": np.empty((0, 0, 2, 2), dtype=float),
                 "pos_map": np.empty((0, n_union), dtype=np.int32),
@@ -2352,7 +2367,7 @@ class DofHandler:
         except NameError:
             _interface_cache = {}
 
-        subset_hash = _hash_subset(valid_eids)
+        subset_hash = _hash_subset([(int(eid) << 16) ^ int(sid) for (eid, sid, _, _) in segment_records])
         ls_token    = _ls_fingerprint(level_set)
         def_token   = _def_fingerprint(deformation)
 
@@ -2367,10 +2382,10 @@ class DofHandler:
             return _interface_cache[cache_key]
 
         # ---- per-element maps, h ------------------------------------------------------
-        nE = len(valid_eids)
+        nE = len(segment_records)
         gdofs_map = np.empty((nE, n_union), dtype=np.int64)
         h_arr     = np.empty((nE,), dtype=float)
-        for i, eid in enumerate(valid_eids):
+        for i, (eid, _, _, _) in enumerate(segment_records):
             gdofs_map[i, :] = self.get_elemental_dofs(int(eid))
             h_arr[i]        = float(mesh.element_char_length(int(eid)) or 0.0)
 
@@ -2385,8 +2400,7 @@ class DofHandler:
             # Build segment endpoints per cut element (P0,P1)
             P0 = np.empty((nE, 2), dtype=float)
             P1 = np.empty((nE, 2), dtype=float)
-            for i, eid in enumerate(valid_eids):
-                p0, p1 = mesh.elements_list[int(eid)].interface_pts
+            for i, (_, _, p0, p1) in enumerate(segment_records):
                 P0[i, :] = np.asarray(p0, float)
                 P1[i, :] = np.asarray(p1, float)
             # degree of the interface parameterization
@@ -2395,7 +2409,7 @@ class DofHandler:
             qp_phys, qw, that, qref = _iso_ifc_rule(
                 level_set, P0, P1,
                 p=int(p_curve), order=int(order), project_steps=3, tol=SIDE.tol,
-                mesh=mesh, eids=np.asarray(valid_eids, dtype=int),
+                mesh=mesh, eids=np.asarray(seg_eids, dtype=int),
                 return_tangent=True, return_qref=True)
             qp_phys = np.asarray(qp_phys, dtype=float)       # (nE, nQ, 2)
             qw      = np.asarray(qw,      dtype=float)       # (nE, nQ)
@@ -2411,8 +2425,7 @@ class DofHandler:
             qp_phys = np.empty((nE, nQ, 2), dtype=float)
             qw      = np.empty((nE, nQ),    dtype=float)
             # map each cut element segment P0→P1 with curved interface quadrature
-            for i, eid in enumerate(valid_eids):
-                p0, p1 = mesh.elements_list[int(eid)].interface_pts
+            for i, (_, _, p0, p1) in enumerate(segment_records):
                 pts, wts = curved_line_quadrature(
                     level_set, np.asarray(p0, float), np.asarray(p1, float),
                     order=int(qdeg), nseg=nseg_eff, project_steps=3, tol=1e-12
@@ -2433,7 +2446,7 @@ class DofHandler:
             xi_tab[:, :]  = qref[:, :, 0]
             eta_tab[:, :] = qref[:, :, 1]
         else:
-            for i, eid in enumerate(valid_eids):
+            for i, eid in enumerate(seg_eids):
                 for q in range(nQ):
                     s, t = transform.inverse_mapping(mesh, int(eid), qp_phys[i, q])
                     xi_tab[i, q]  = float(s)
@@ -2453,7 +2466,7 @@ class DofHandler:
         have_grads_many = hasattr(level_set, "gradients_on_element_many")
         have_grad_elem  = hasattr(level_set, "gradient_on_element")
 
-        for i, eid in enumerate(valid_eids):
+        for i, eid in enumerate(seg_eids):
             # φ (value)
             if have_vals_many:
                 phis[i, :] = np.asarray(
@@ -2502,7 +2515,7 @@ class DofHandler:
         # element-node coords for geometry
         node_ids_all = mesh.nodes[mesh.elements_connectivity]
         coords_all   = mesh.nodes_x_y_pos[node_ids_all].astype(float)
-        coords_sel   = coords_all[valid_eids]
+        coords_sel   = coords_all[seg_eids]
         nLocGeom     = coords_sel.shape[1]
 
         have_jit_ref = False
@@ -2565,7 +2578,7 @@ class DofHandler:
             e_bad, q_bad = int(bad[0][0]), int(bad[1][0])
             raise ValueError(
                 f"[interface] Jacobian determinant non-positive ({detJ[e_bad, q_bad]}) "
-                f"for element id {valid_eids[e_bad]} at qp {q_bad}."
+                f"for element id {seg_eids[e_bad]} at qp {q_bad}."
             )
 
         # ------------------------------------------------------------------------------
@@ -2580,7 +2593,7 @@ class DofHandler:
                 qp_phys = cached_final["qp"].copy()
                 qw = cached_final["qw"].copy()
             else:
-                node_ids_sel = node_ids_all[np.asarray(valid_eids, dtype=int)]
+                node_ids_sel = node_ids_all[np.asarray(seg_eids, dtype=int)]
                 disp_nodes = np.asarray(deformation.node_displacements, float)
                 U_all = disp_nodes[node_ids_sel]
 
@@ -2630,7 +2643,7 @@ class DofHandler:
             e_bad, q_bad = int(bad[0][0]), int(bad[1][0])
             raise ValueError(
                 f"[interface] Jacobian determinant non-positive ({detJ[e_bad, q_bad]}) "
-                f"for element id {valid_eids[e_bad]} at qp {q_bad}."
+                f"for element id {seg_eids[e_bad]} at qp {q_bad}."
             )
 
         # ------------------------------------------------------------------------------
@@ -2706,7 +2719,7 @@ class DofHandler:
             if need_o4:
                 Qxi0 = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=float)
                 Qxi1 = np.zeros_like(Qxi0)
-            for i, eid in enumerate(valid_eids):
+            for i, eid in enumerate(seg_eids):
                 for q in range(nQ):
                     xi = float(xi_tab[i, q]); eta = float(eta_tab[i, q])
                     rec = _JET.get(mesh, int(eid), xi, eta, upto=kmax_jets)
@@ -2721,7 +2734,7 @@ class DofHandler:
         # 8) Pack and cache
         # ------------------------------------------------------------------------------
         out = {
-            "eids":        np.asarray(valid_eids, dtype=np.int32),
+            "eids":        np.asarray(seg_eids, dtype=np.int32),
             "qp_phys":     qp_phys,
             "qw":          qw,
             "normals":     normals,
@@ -2738,9 +2751,9 @@ class DofHandler:
             "pos_map":     pos_map,
             "neg_map":     neg_map,
             # owner info (both sides = same element id)
-            "owner_id":     np.asarray(valid_eids, dtype=np.int32),
-            "owner_pos_id": np.asarray(valid_eids, dtype=np.int32),
-            "owner_neg_id": np.asarray(valid_eids, dtype=np.int32),
+            "owner_id":     np.asarray(seg_eids, dtype=np.int32),
+            "owner_pos_id": np.asarray(seg_eids, dtype=np.int32),
+            "owner_neg_id": np.asarray(seg_eids, dtype=np.int32),
         }
         for fld in fields:
             out[f"b_{fld}"] = b_tabs[fld]
@@ -2771,6 +2784,7 @@ class DofHandler:
         qdeg: int,
         level_set,
         derivs: set[tuple[int, int]],
+        allow_interface: bool = False,
         reuse: bool = True,
         need_hess: bool = False,
         need_o3: bool = False,
@@ -2792,6 +2806,8 @@ class DofHandler:
             Set of derivative multi-indices (dx, dy) to tabulate for basis functions.
         reuse : bool, default True
             Reuse cached factors for identical (edge subset, qdeg, field orders, derivs, flags).
+        allow_interface : bool, default False
+            When True, also accept edges tagged as 'interface' even if neither side is cut.
         need_hess : bool, default False
             Also pre-tabulate all second derivatives (enables Hessian-based terms).
         need_o3 : bool, default False
@@ -2896,7 +2912,7 @@ class DofHandler:
             lt = mesh.elements_list[e.left].tag
             rt = mesh.elements_list[e.right].tag
             et = str(getattr(e, "tag", ""))
-            if (("cut" in (lt, rt)) or et.startswith("ghost")):
+            if (("cut" in (lt, rt)) or et.startswith("ghost") or (allow_interface and et == "interface")):
                 edges.append(e)
         if not edges:
             raise ValueError("No valid ghost edges found.")
@@ -3076,6 +3092,7 @@ class DofHandler:
             bool(need_o3),
             bool(need_o4),
             self.method,
+            bool(allow_interface),
             _ls_fingerprint(level_set),
             _def_fingerprint(deformation),
             _coords_fingerprint(mesh.nodes_x_y_pos),
@@ -3557,6 +3574,10 @@ class DofHandler:
             "qp_phys":     qp_phys,
             "qw":          qw,
             "normals":     normals,
+            "xi_pos":      xi_pos,
+            "eta_pos":     eta_pos,
+            "xi_neg":      xi_neg,
+            "eta_neg":     eta_neg,
             "gdofs_map":   gdofs_map,
             "pos_map":     pos_map,
             "neg_map":     neg_map,

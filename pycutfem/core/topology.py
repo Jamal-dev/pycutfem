@@ -124,6 +124,7 @@ class Element:
     centroid_x: float = None
     centroid_y: float = None
     interface_pts: List[Tuple[float, float]] = field(default_factory=list)
+    interface_segments: List[List[Tuple[float, float]]] = field(default_factory=list)
     edges_by_side: Tuple[Tuple[int, ...], ...] = field(default_factory=tuple)
     edge_gid_to_local: Dict[int, int] = field(default_factory=dict)
 

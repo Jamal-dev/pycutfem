@@ -2288,7 +2288,6 @@ class FormCompiler:
         - curved geometry     : quadrature order inflated by mesh.poly_order
         """
         import numpy as np
-        from pycutfem.fem import transform
         from pycutfem.ufl.helpers import normalize_elem_ids
 
         mesh   = self.me.mesh
@@ -2408,22 +2407,25 @@ class FormCompiler:
         if is_functional:
             self.ctx.setdefault('scalar_results', {}).setdefault(hook['name'], 0.0)
 
-        def _is_valid(elem):
-            return getattr(elem, 'tag', None) == 'cut' and len(getattr(elem, 'interface_pts', ())) == 2
-
-        # gather interface elements
-        eids, P0, P1 = [], [], []
+        segments: list[tuple[int, np.ndarray, np.ndarray]] = []
         for elem in mesh.elements_list:
-            if _is_valid(elem):
-                eids.append(int(elem.id))
+            if getattr(elem, "tag", None) != "cut":
+                continue
+            segs = getattr(elem, "interface_segments", None)
+            if segs:
+                for seg in segs:
+                    if seg and len(seg) == 2:
+                        p0, p1 = seg
+                        segments.append((int(elem.id), np.asarray(p0, float), np.asarray(p1, float)))
+            elif len(getattr(elem, "interface_pts", ())) == 2:
                 p0, p1 = elem.interface_pts
-                P0.append(np.asarray(p0, float)); P1.append(np.asarray(p1, float))
-        if not eids:
+                segments.append((int(elem.id), np.asarray(p0, float), np.asarray(p1, float)))
+        if not segments:
             return
 
-        eids  = np.asarray(eids, dtype=int)
-        P0    = np.asarray(P0, float)
-        P1    = np.asarray(P1, float)
+        eids = np.asarray([s[0] for s in segments], dtype=int)
+        P0   = np.asarray([s[1] for s in segments], float)
+        P1   = np.asarray([s[2] for s in segments], float)
 
         # per‑element global dofs & maps
         gdofs_per_e = [np.asarray(dh.get_elemental_dofs(e), dtype=int) for e in eids]
@@ -2595,8 +2597,233 @@ class FormCompiler:
   
 
     
+    def _assemble_aligned_interface_python(self, intg: Integral, matvec, aligned_edges):
+        """
+        Assemble integrals over edges tagged as 'interface' (aligned φ≈0) using the Python backend.
+        Geometry and orientation come from precompute_ghost_factors with allow_interface=True.
+        """
+        import numpy as np
+        from pycutfem.fem import transform
+
+        rhs = bool(self.ctx.get("rhs", False))
+        mesh, dh, me = self.me.mesh, self.dh, self.me
+        level_set = getattr(intg.measure, "level_set", None)
+        if level_set is None:
+            raise ValueError("Aligned interface assembly requires a level_set.")
+
+        md = intg.measure.metadata or {}
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0), (1, 0), (0, 1)}
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        for p in range(max_total + 1):
+            for ox in range(p + 1):
+                derivs.add((ox, p - ox))
+        need_hess = any((dx + dy) >= 2 for (dx, dy) in derivs)
+        need_o3 = any((dx + dy) >= 3 for (dx, dy) in derivs)
+        need_o4 = any((dx + dy) >= 4 for (dx, dy) in derivs)
+
+        qdeg_base = max(self._find_q_order(intg), 2 * max_total + 4)
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        qdeg = qdeg_base + max(0, p_geo - 1)
+
+        fields = set(self._fields_for(intg.integrand))
+        trial, test = _trial_test(intg.integrand)
+        for tt in (trial, test):
+            if tt is None:
+                continue
+            if hasattr(tt, "field_names"):
+                fields.update(tt.field_names)
+            elif hasattr(tt, "field_name"):
+                fields.add(tt.field_name)
+        fields = sorted(fields)
+
+        hook = self._hook_for(intg.integrand)
+        is_functional = hook is not None and trial is None and test is None
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {})[hook["name"]] = 0.0
+
+        geo = dh.precompute_ghost_factors(
+            ghost_edge_ids=aligned_edges,
+            qdeg=qdeg,
+            level_set=level_set,
+            derivs=derivs,
+            allow_interface=True,
+            reuse=True,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            deformation=getattr(intg.measure, "deformation", None),
+        )
+        edge_ids = geo.get("eids")
+        if edge_ids is None or len(edge_ids) == 0:
+            return
+
+        nE = len(edge_ids)
+        nQ = geo["qw"].shape[1]
+        phis_arr = geo.get("phis", None)
+
+        self.ctx["is_interface"] = True
+        self.ctx["is_ghost"] = False
+
+        xi_pos_all = geo["xi_pos"]; eta_pos_all = geo["eta_pos"]
+        xi_neg_all = geo["xi_neg"]; eta_neg_all = geo["eta_neg"]
+        normals_all = geo["normals"]
+        qp_phys_all = geo["qp_phys"]
+        Jinv_pos_all = geo["J_inv_pos"]
+        Jinv_neg_all = geo["J_inv_neg"]
+        qw_all = geo["qw"]
+        pos_ids = geo["owner_pos_id"]
+        neg_ids = geo["owner_neg_id"]
+
+        for ei in range(nE):
+            pos_eid = int(pos_ids[ei])
+            neg_eid = int(neg_ids[ei])
+
+            pos_dofs = dh.get_elemental_dofs(pos_eid)
+            neg_dofs = dh.get_elemental_dofs(neg_eid)
+            global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+
+            pos_map = np.searchsorted(global_dofs, pos_dofs)
+            neg_map = np.searchsorted(global_dofs, neg_dofs)
+
+            pos_map_by_field_full, neg_map_by_field_full = _hfa.build_field_union_maps(
+                dh, fields, pos_eid, neg_eid, global_dofs
+            )
+
+            try:
+                pos_masks_elem, _ = _hfa.build_side_masks_by_field(dh, fields, pos_eid, level_set, tol=SIDE.tol)
+            except Exception:
+                pos_masks_elem = {}
+            try:
+                _, neg_masks_elem = _hfa.build_side_masks_by_field(dh, fields, neg_eid, level_set, tol=SIDE.tol)
+            except Exception:
+                neg_masks_elem = {}
+
+            restriction_masks_phi = {"+": {}, "-": {}}
+            for fld in fields:
+                mask_pos = pos_masks_elem.get(fld)
+                mask_neg = neg_masks_elem.get(fld)
+                if mask_pos is not None:
+                    full_idx = pos_map_by_field_full.get(fld)
+                    if full_idx is not None and len(mask_pos) == len(full_idx):
+                        arr = np.zeros(len(global_dofs), dtype=float)
+                        arr[np.asarray(full_idx, dtype=int)] = np.asarray(mask_pos, dtype=float)
+                        restriction_masks_phi["+"][fld] = arr
+                if mask_neg is not None:
+                    full_idx = neg_map_by_field_full.get(fld)
+                    if full_idx is not None and len(mask_neg) == len(full_idx):
+                        arr = np.zeros(len(global_dofs), dtype=float)
+                        arr[np.asarray(full_idx, dtype=int)] = np.asarray(mask_neg, dtype=float)
+                        restriction_masks_phi["-"][fld] = arr
+
+            mask_pos_global = np.zeros(len(global_dofs), dtype=float)
+            mask_neg_global = np.zeros(len(global_dofs), dtype=float)
+            mask_pos_global[pos_map] = 1.0
+            mask_neg_global[neg_map] = 1.0
+
+            pos_map_by_field_reduced = {}
+            neg_map_by_field_reduced = {}
+            pos_P_by_field = {}
+            neg_P_by_field = {}
+            pos_union_mask_by_field = {}
+            neg_union_mask_by_field = {}
+            for fld in fields:
+                pos_full = np.asarray(pos_map_by_field_full.get(fld, []), dtype=int)
+                neg_full = np.asarray(neg_map_by_field_full.get(fld, []), dtype=int)
+                if pos_full.size:
+                    pos_map_by_field_reduced[fld] = pos_full
+                    pos_P_by_field[fld] = np.eye(len(global_dofs))[pos_full]
+                    pos_union_mask_by_field[fld] = np.zeros(len(global_dofs), dtype=float)
+                    pos_union_mask_by_field[fld][pos_full] = 1.0
+                if neg_full.size:
+                    neg_map_by_field_reduced[fld] = neg_full
+                    neg_P_by_field[fld] = np.eye(len(global_dofs))[neg_full]
+                    neg_union_mask_by_field[fld] = np.zeros(len(global_dofs), dtype=float)
+                    neg_union_mask_by_field[fld][neg_full] = 1.0
+
+            if is_functional:
+                acc = 0.0
+            else:
+                n = len(global_dofs)
+                acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
+
+            for q in range(nQ):
+                xi_p = float(xi_pos_all[ei, q]); eta_p = float(eta_pos_all[ei, q])
+                xi_n = float(xi_neg_all[ei, q]); eta_n = float(eta_neg_all[ei, q])
+                Ji_pos = np.asarray(Jinv_pos_all[ei, q], float)
+                Ji_neg = np.asarray(Jinv_neg_all[ei, q], float)
+
+                self.ctx["basis_values"] = {"+": {}, "-": {}}
+                for f in fields:
+                    v_pos = me.basis(f, xi_p, eta_p)
+                    g_pos = me.grad_basis(f, xi_p, eta_p) @ Ji_pos
+                    v_neg = me.basis(f, xi_n, eta_n)
+                    g_neg = me.grad_basis(f, xi_n, eta_n) @ Ji_neg
+                    slotp = self.ctx["basis_values"]["+"].setdefault(f, {})
+                    slotn = self.ctx["basis_values"]["-"].setdefault(f, {})
+                    slotp[(0, 0)] = v_pos; slotn[(0, 0)] = v_neg
+                    slotp[(1, 0)] = g_pos[:, 0]; slotn[(1, 0)] = g_neg[:, 0]
+                    slotp[(0, 1)] = g_pos[:, 1]; slotn[(0, 1)] = g_neg[:, 1]
+
+                self.ctx.update({
+                    "eid": int(edge_ids[ei]),
+                    "pos_eid": pos_eid,
+                    "neg_eid": neg_eid,
+                    "normal": np.asarray(normals_all[ei, q], float),
+                    "x_phys": np.asarray(qp_phys_all[ei, q], float),
+                    "phi_val": float(phis_arr[ei, q]) if phis_arr is not None else 0.0,
+                    "global_dofs": global_dofs,
+                    "pos_map": pos_map,
+                    "neg_map": neg_map,
+                    "pos_map_by_field": pos_map_by_field_full,
+                    "neg_map_by_field": neg_map_by_field_full,
+                    "pos_map_by_field_reduced": pos_map_by_field_reduced,
+                    "neg_map_by_field_reduced": neg_map_by_field_reduced,
+                    "pos_P_by_field": pos_P_by_field,
+                    "neg_P_by_field": neg_P_by_field,
+                    "pos_union_mask_by_field": pos_union_mask_by_field,
+                    "neg_union_mask_by_field": neg_union_mask_by_field,
+                    "_restriction_masks": restriction_masks_phi,
+                    "use_union_local_dofs": True,
+                })
+
+                val = self._visit(intg.integrand)
+                w = float(qw_all[ei, q])
+                if is_functional:
+                    acc += w * float(val if np.ndim(val) == 0 else np.sum(val))
+                else:
+                    arr = lhs_num(val)
+                    arr = np.asarray(arr)
+                    if rhs and arr.ndim == 2 and 1 in arr.shape:
+                        arr = arr.reshape(-1)
+                    acc += w * arr
+
+            if is_functional:
+                self.ctx["scalar_results"][hook["name"]] += float(acc)
+            else:
+                if rhs:
+                    np.add.at(matvec, global_dofs, acc)
+                else:
+                    rr, cc = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                    matvec[rr, cc] += acc
+
+        for k in (
+            "basis_values", "global_dofs", "pos_map", "neg_map",
+            "pos_map_by_field", "neg_map_by_field",
+            "pos_map_by_field_reduced", "neg_map_by_field_reduced",
+            "pos_P_by_field", "neg_P_by_field",
+            "pos_union_mask_by_field", "neg_union_mask_by_field",
+            "_restriction_masks", "use_union_local_dofs",
+            "mask_basis", "is_interface",
+            "pos_eid", "neg_eid", "eid", "x_phys", "phi_val", "normal"
+        ):
+            self.ctx.pop(k, None)
+        self.ctx.pop("is_ghost", None)
+
+    
+    
     def _phys_scalar_deriv_row(self, fld: str, xi: float, eta: float,
-                           ox: int, oy: int, eid: int) -> np.ndarray:
+                            ox: int, oy: int, eid: int) -> np.ndarray:
         """
         Return a length-(nloc_elem) row for D^{(ox,oy)} of scalar field 'fld' in physical coords.
         Exact for orders 0, 1, 2 (includes inverse-map curvature). Uses cached exact formulas for
@@ -3239,7 +3466,7 @@ class FormCompiler:
             deformation=getattr(intg.measure, "deformation", None),
         )
         geo["is_interface"] = True
-        cut_eids = geo["eids"].astype(np.int32)      # 1‑D array, len = n_cut
+        cut_eids = geo["eids"].astype(np.int32)      # 1‑D array, len = n_cut_segments
 
         # # 2a) ALIAS: for interface, both sides are the same element.
         # #    Provide r**_*_{pos|neg} by aliasing to existing d**_* tables.
@@ -3264,10 +3491,13 @@ class FormCompiler:
         # ------------------------------------------------------------------
         # 3. Element‑to‑DOF map  (shape = n_cut × n_loc)
         # ------------------------------------------------------------------
-        gdofs_map = np.vstack(
-            [dh.get_elemental_dofs(eid) for eid in cut_eids]
-        ).astype(np.int32)
-        geo["gdofs_map"] = gdofs_map
+        if "gdofs_map" in geo:
+            gdofs_map = np.asarray(geo["gdofs_map"], dtype=np.int32)
+        else:
+            gdofs_map = np.vstack(
+                [dh.get_elemental_dofs(eid) for eid in cut_eids]
+            ).astype(np.int32)
+            geo["gdofs_map"] = gdofs_map
         geo["entity_kind"] = "element"
 
         # ------------------------------------------------------------------
@@ -3311,12 +3541,134 @@ class FormCompiler:
         )
 
 
+    def _assemble_aligned_interface_jit(self, intg, matvec, aligned_edges):
+        """Assemble aligned interface edges (φ≈0 along an edge) with the JIT backend."""
+        mesh = self.me.mesh
+        dh, me = self.dh, self.me
+
+        edge_ids = aligned_edges
+        on_facet = intg.measure.on_facet
+        level_set = getattr(intg.measure, "level_set", None)
+        if level_set is None:
+            raise ValueError("Aligned interface assembly requires a level_set.")
+
+        try:
+            if edge_ids.cardinality() == 0:
+                return
+        except Exception:
+            if not edge_ids:
+                return
+
+        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
+
+        geo = self.dh.precompute_ghost_factors(
+            ghost_edge_ids=edge_ids,
+            qdeg=qdeg,
+            level_set=level_set,
+            derivs=derivs,
+            allow_interface=True,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            reuse=True,
+            deformation=getattr(intg.measure, "deformation", None),
+        )
+        geo["is_interface"] = True
+
+        valid_eids = geo.get("eids")
+        if valid_eids is None or len(valid_eids) == 0:
+            return
+
+        kernel_args = _build_jit_kernel_args(
+            ir=ir,
+            expression=intg.integrand,
+            mixed_element=me,
+            q_order=qdeg,
+            dof_handler=dh,
+            gdofs_map=geo["gdofs_map"],
+            param_order=runner.param_order,
+            pre_built=geo,
+        )
+
+        if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+            kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+        if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+            kernel_args["element_nodes"] = np.asarray(mesh.elements_connectivity, dtype=np.int64)
+
+        req_list = list(getattr(runner, "param_order", []))
+        req = set(req_list)
+        for side in ("pos", "neg"):
+            for t in ("Hxi0", "Hxi1", "Txi0", "Txi1", "Qxi0", "Qxi1"):
+                need_key = f"{side}_{t}"
+                if (need_key in req) and (need_key not in kernel_args) and (t in geo):
+                    kernel_args[need_key] = geo[t]
+
+        missing = [p for p in runner.param_order if p not in kernel_args]
+        if missing:
+            raise KeyError(f"Aligned interface kernel missing static args: {missing}")
+
+        current_funcs = self._get_data_functions_objs(intg)
+        K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
+
+        hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_edge, hook):
+            return
+
+        _scatter_element_contribs(
+            K_edge, F_edge, J_edge,
+            valid_eids,
+            geo["gdofs_map"],
+            matvec, self.ctx, intg.integrand,
+            hook=hook,
+        )
+
+
     def _assemble_interface(self, intg: Integral, matvec):
         """Assemble integrals over non-conforming interfaces defined by a level set."""
+        mesh = self.me.mesh
+        aligned_edges = None
+        try:
+            aligned_edges = mesh.edge_bitset("interface")
+        except Exception:
+            aligned_edges = None
+        has_aligned = False
+        if aligned_edges is not None:
+            try:
+                has_aligned = aligned_edges.cardinality() > 0
+            except Exception:
+                has_aligned = bool(aligned_edges)
+        if has_aligned:
+            self._assemble_aligned_interface(intg, matvec, aligned_edges)
+
         if self.backend == "python":
             self._assemble_interface_python(intg, matvec)
         elif self.backend == "jit":
             self._assemble_interface_jit(intg, matvec)
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+
+    def _assemble_aligned_interface(self, intg: Integral, matvec, aligned_edges=None):
+        """Assemble interface integrals on edges tagged as 'interface'."""
+        if aligned_edges is None:
+            try:
+                aligned_edges = self.me.mesh.edge_bitset("interface")
+            except Exception:
+                aligned_edges = None
+        try:
+            has_edges = aligned_edges is not None and aligned_edges.cardinality() > 0
+        except Exception:
+            has_edges = bool(aligned_edges)
+        if not has_edges:
+            return
+
+        if self.backend == "python":
+            self._assemble_aligned_interface_python(intg, matvec, aligned_edges)
+        elif self.backend == "jit":
+            self._assemble_aligned_interface_jit(intg, matvec, aligned_edges)
         else:
             raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
 

@@ -477,10 +477,11 @@ class Mesh:
         ghost_pos_bs = self._edge_bitsets.get('ghost_pos', BitSet(np.zeros(len(tags_arr), bool)))
         ghost_neg_bs = self._edge_bitsets.get('ghost_neg', BitSet(np.zeros(len(tags_arr), bool)))
         ghost_both_bs = self._edge_bitsets.get('ghost_both', BitSet(np.zeros(len(tags_arr), bool)))
+        interface_bs = self._edge_bitsets.get('interface', BitSet(np.zeros(len(tags_arr), bool)))
         
-        self._edge_bitsets['ghost_pos'] = ghost_pos_bs | ghost_both_bs
-        self._edge_bitsets['ghost_neg'] = ghost_neg_bs | ghost_both_bs
-        self._edge_bitsets['ghost'] = ghost_pos_bs | ghost_neg_bs | ghost_both_bs
+        self._edge_bitsets['ghost_pos'] = (ghost_pos_bs | ghost_both_bs) - interface_bs
+        self._edge_bitsets['ghost_neg'] = (ghost_neg_bs | ghost_both_bs) - interface_bs
+        self._edge_bitsets['ghost'] = (ghost_pos_bs | ghost_neg_bs | ghost_both_bs) - interface_bs
     
     # def classify_edges(self, level_set, tol=SIDE.tol):
     #     """
@@ -557,6 +558,52 @@ class Mesh:
         Populate element.interface_pts for every 'cut' element.
         Each entry is a list of interface points, typically [p0, p1].
         """
+        from pycutfem.core.levelset import phi_eval as _phi_eval
+        from pycutfem.fem import transform
+
+        def _dedup(points: list[np.ndarray]) -> list[np.ndarray]:
+            out: list[np.ndarray] = []
+            for pnt in points:
+                if not any(np.linalg.norm(pnt - q) < tol for q in out):
+                    out.append(pnt)
+            return out
+
+        def _ordered_polyline(points: list[np.ndarray]) -> list[np.ndarray]:
+            """Return a simple polyline through all points (small n, brute force)."""
+            if len(points) <= 2:
+                return points
+            pts = [np.asarray(p, float) for p in points]
+            P = np.stack(pts, axis=0)
+            d2 = ((P[:, None, :] - P[None, :, :]) ** 2).sum(axis=2)
+            i, j = divmod(int(d2.argmax()), d2.shape[1])  # farthest pair → endpoints
+            rest = [k for k in range(len(pts)) if k not in (i, j)]
+            best_order = None
+            best_len = np.inf
+            # brute-force the small set of interior permutations (interfaces rarely have many nodes)
+            import itertools
+            for perm in itertools.permutations(rest):
+                order = [i, *perm, j]
+                length = sum(
+                    float(np.linalg.norm(P[order[k + 1]] - P[order[k]]))
+                    for k in range(len(order) - 1)
+                )
+                if length < best_len:
+                    best_len = length
+                    best_order = order
+            return [pts[k] for k in best_order] if best_order is not None else pts
+
+        def _edge_ref_coords(local_edge: int, t: float, *, etype: str) -> tuple[float, float]:
+            """Reference (xi, eta) on a local edge parameterised by t∈[0,1]."""
+            if etype == "quad":
+                if   local_edge == 0: return (2*t - 1.0, -1.0)
+                if   local_edge == 1: return (1.0, -1.0 + 2*t)
+                if   local_edge == 2: return (1.0 - 2*t, 1.0)
+                return (-1.0, 1.0 - 2*t)
+            # tri
+            if   local_edge == 0: return (t, 0.0)
+            if   local_edge == 1: return (1.0 - t, t)
+            return (0.0, 1.0 - t)
+
         # Optional: only needed if you want a cheap endpoint precheck for p==1
         phi_nodes = level_set.evaluate_on_nodes(self)  # φ at mesh corner nodes
 
@@ -571,6 +618,7 @@ class Mesh:
         for elem in self.elements_list:
             if elem.tag != 'cut':
                 elem.interface_pts = []
+                elem.interface_segments = []
                 continue
 
             pts = []
@@ -593,27 +641,71 @@ class Mesh:
                 # robust P^n root(s) on this *local* edge
                 roots = edge_root_pn(level_set, self, int(elem.id), int(l_edge), tol=tol)
                 if not roots:
+                    # No sign change detected; try a soft snap if φ is very small along the edge
+                    e_gid = elem.edges[l_edge]
+                    e = self.edge(e_gid)
+                    pA, pB = self.nodes_x_y_pos[e.nodes[0]], self.nodes_x_y_pos[e.nodes[1]]
+                    h_edge = np.linalg.norm(pB - pA)
+                    tol_snap = max(10 * tol, 1e-6 * h_edge)
+                    ts = np.linspace(0.0, 1.0, 5)
+                    fvals = []
+                    for t in ts:
+                        xi, eta = _edge_ref_coords(l_edge, float(t), etype=self.element_type)
+                        phys = transform.x_mapping(self, int(elem.id), (xi, eta))
+                        try:
+                            val = _phi_eval(level_set, phys, eid=int(elem.id), xi_eta=(xi, eta), mesh=self)
+                        except Exception:
+                            val = float(level_set(phys))
+                        fvals.append(val)
+                    fvals = np.asarray(fvals, float)
+                    k = int(np.argmin(np.abs(fvals)))
+                    if abs(fvals[k]) <= tol_snap:
+                        xi, eta = _edge_ref_coords(l_edge, float(ts[k]), etype=self.element_type)
+                        P_soft = transform.x_mapping(self, int(elem.id), (float(xi), float(eta)))
+                        pts.append(np.asarray(P_soft, float))
                     continue
                 # roots may have 1 (crossing) or 2 points (whole edge on {φ=0})
                 for P in roots:
                     pts.append(np.asarray(P, float))
 
             # de-dup (φ=0 through a vertex)
-            unique_pts = []
-            for pnt in pts:
-                if not any(np.linalg.norm(pnt - up) < tol for up in unique_pts):
-                    unique_pts.append(pnt)
+            unique_pts = _dedup([np.asarray(pnt, float) for pnt in pts])
 
-            # keep exactly two points: choose the longest chord across candidates
+            # Interior kink detection: add centroid and edge midpoints if φ≈0
+            try:
+                c = np.asarray(elem.centroid(), float)
+                phi_c = _phi_eval(level_set, c, eid=int(elem.id), mesh=self)
+                if abs(phi_c) <= max(tol, 1e-12):
+                    unique_pts.append(c)
+            except Exception:
+                pass
+            for e_gid in elem.edges:
+                e = self.edge(int(e_gid))
+                mid = 0.5 * (self.nodes_x_y_pos[e.nodes[0]] + self.nodes_x_y_pos[e.nodes[1]])
+                try:
+                    phi_m = _phi_eval(level_set, mid, eid=int(elem.id), mesh=self)
+                except Exception:
+                    try:
+                        phi_m = level_set(np.asarray(mid, float))
+                    except Exception:
+                        phi_m = np.inf
+                if abs(phi_m) <= max(tol, 1e-12):
+                    unique_pts.append(np.asarray(mid, float))
+
+            unique_pts = _dedup(unique_pts)
+
             if len(unique_pts) >= 2:
-                P = np.asarray(unique_pts, float)
-                d2 = ((P[:, None, :] - P[None, :, :])**2).sum(axis=2)
-                i, j = divmod(int(d2.argmax()), d2.shape[1])
-                pts2 = [tuple(P[i]), tuple(P[j])]
-                pts2.sort(key=lambda Q: (Q[0], Q[1]))
-                elem.interface_pts = pts2
+                ordered = _ordered_polyline(unique_pts)
+                segments = []
+                for k in range(len(ordered) - 1):
+                    p0 = tuple(np.asarray(ordered[k], float))
+                    p1 = tuple(np.asarray(ordered[k + 1], float))
+                    segments.append([p0, p1])
+                elem.interface_segments = segments
+                elem.interface_pts = [tuple(np.asarray(ordered[0], float)), tuple(np.asarray(ordered[-1], float))]
             else:
                 elem.interface_pts = []
+                elem.interface_segments = []
 
 
     def edge_bitset(self, tag: str) -> BitSet:
