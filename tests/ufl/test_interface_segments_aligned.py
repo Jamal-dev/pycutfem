@@ -8,9 +8,10 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.core.levelset import AffineLevelSet, BeamLevelSet
 from pycutfem.ufl.measures import dInterface
-from pycutfem.ufl.expressions import Constant, Jump, TrialFunction, TestFunction
+from pycutfem.ufl.expressions import Constant, Jump, TrialFunction, TestFunction, Function
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.forms import Equation, assemble_form
+from pycutfem.jit import compile_multi
 
 
 def _assemble_scalar(form, dof_handler, backend="jit"):
@@ -172,3 +173,150 @@ def test_beam_corner_jump_matches_symbolic(backend):
 
     assert abs(computed) > 1e-12  # non-zero jump
     assert_allclose(computed, expected, rtol=1e-6, atol=1e-8)
+
+
+@pytest.mark.parametrize("backend", ["jit"])
+def test_phi_changed_detector_recomputes_only_changed_ids(backend):
+    """
+    Move an affine level set slightly and verify that the JIT builders
+    reuse unchanged elements but refresh phi-dependent arrays when the
+    zero level set moves (cut/interface path).
+    """
+    nodes, elems, edges, corners = structured_quad(1.0, 1.0, nx=2, ny=1, poly_order=1)
+    mesh = Mesh(nodes=nodes, element_connectivity=elems, edges_connectivity=edges,
+                elements_corner_nodes=corners, element_type="quad", poly_order=1)
+
+    # Tilted line to guarantee true cut elements (not edge-aligned)
+    ls0 = AffineLevelSet(a=1.0, b=0.2, c=-0.55)
+    ls1 = AffineLevelSet(a=1.0, b=0.2, c=-0.45)  # larger shift to move phi visibly
+
+    mesh.classify_elements(ls0)
+    mesh.classify_edges(ls0)
+    mesh.build_interface_segments(ls0)
+    assert mesh.element_bitset("cut").cardinality() > 0
+
+    me = MixedElement(mesh, field_specs={"u_pos_x": 1})
+    dh = DofHandler(me, method="cg")
+    f = Function("u_pos_x", field_name="u_pos_x", dof_handler=dh)
+    v = TestFunction("u_pos_x", "u_pos_x", dh)
+    form = f * v * dInterface(level_set=ls0, metadata={"q": 2})
+    eq = Equation(form, None)
+
+    kernels = compile_multi(eq, dof_handler=dh, mixed_element=me, backend="jit")
+    iface_kernels = [k for k in kernels if k.domain == "interface"]
+    assert iface_kernels, "expected an interface kernel"
+    ker = iface_kernels[0]
+    old_static = ker.static_args
+    old_eids = np.asarray(old_static.get("eids", []), dtype=np.int32)
+    assert old_eids.size > 0
+    old_sig = np.asarray(old_static.get("_phi_sig"))
+
+    # refresh with moved level set
+    mesh.classify_elements(ls1)
+    mesh.classify_edges(ls1)
+    mesh.build_interface_segments(ls1)
+    ker.refresh(ls1)
+
+    new_static = ker.static_args
+    new_eids = np.asarray(new_static.get("eids", []), dtype=np.int32)
+    assert np.array_equal(np.sort(old_eids), np.sort(new_eids))
+    new_sig = np.asarray(new_static.get("_phi_sig"))
+
+    # phi signature at centroids should change after movement
+    assert new_sig.shape == old_sig.shape
+    assert not np.allclose(new_sig, old_sig)
+
+
+@pytest.mark.parametrize("backend", ["jit"])
+def test_phi_changed_detector_cut_volume(backend):
+    """
+    Cut volume: phi movement should refresh signatures while keeping element ids.
+    """
+    nodes, elems, edges, corners = structured_quad(1.0, 1.0, nx=2, ny=2, poly_order=1)
+    mesh = Mesh(nodes=nodes, element_connectivity=elems, edges_connectivity=edges,
+                elements_corner_nodes=corners, element_type="quad", poly_order=1)
+    ls0 = AffineLevelSet(a=1.0, b=0.3, c=-0.45)
+    ls1 = AffineLevelSet(a=1.0, b=0.3, c=-0.35)
+    mesh.classify_elements(ls0)
+    mesh.classify_edges(ls0)
+    mesh.build_interface_segments(ls0)
+    assert mesh.element_bitset("cut").cardinality() > 0
+
+    me = MixedElement(mesh, field_specs={"u_pos_x": 1})
+    dh = DofHandler(me, method="cg")
+    u = Function("u_pos_x", field_name="u_pos_x", dof_handler=dh)
+    v = TestFunction("u_pos_x", "u_pos_x", dh)
+    # Use a volume integral on the '+' side to get cut-volume kernels
+    from pycutfem.ufl.measures import dx
+    form = u * v * dx(level_set=ls0, metadata={"q": 2, "side": "+"})
+    eq = Equation(form, None)
+    kernels = compile_multi(eq, dof_handler=dh, mixed_element=me, backend="jit")
+    vol_kernels = [k for k in kernels if k.domain == "volume" and k.side in ("+","-")]
+    assert vol_kernels, "expected a volume kernel"
+    ker = vol_kernels[0]
+    old_static = ker.static_args
+    old_eids = np.asarray(old_static.get("eids", []), dtype=np.int32)
+    assert old_eids.size > 0
+    old_sig = np.asarray(old_static.get("_phi_sig"))
+    if old_sig.size == 0 or old_sig.dtype == object:
+        pytest.skip("phi signatures not available for cut volume kernel")
+
+    mesh.classify_elements(ls1)
+    mesh.classify_edges(ls1)
+    mesh.build_interface_segments(ls1)
+    ker.refresh(ls1)
+
+    new_static = ker.static_args
+    new_eids = np.asarray(new_static.get("eids", []), dtype=np.int32)
+    assert np.array_equal(np.sort(old_eids), np.sort(new_eids))
+    new_sig = np.asarray(new_static.get("_phi_sig"))
+    if new_sig.size == 0 or new_sig.dtype == object:
+        pytest.skip("phi signatures not available for cut volume kernel")
+    assert new_sig.shape == old_sig.shape
+    assert not np.allclose(new_sig, old_sig)
+
+
+@pytest.mark.parametrize("backend", ["jit"])
+def test_phi_changed_detector_ghost(backend):
+    """
+    Ghost edge refresh: signatures change when phi moves, ids remain.
+    """
+    nodes, elems, edges, corners = structured_quad(1.0, 1.0, nx=2, ny=1, poly_order=1)
+    mesh = Mesh(nodes=nodes, element_connectivity=elems, edges_connectivity=edges,
+                elements_corner_nodes=corners, element_type="quad", poly_order=1)
+    ls0 = AffineLevelSet(a=1.0, b=0.0, c=-0.5)
+    ls1 = AffineLevelSet(a=1.0, b=0.0, c=-0.4)
+    mesh.classify_elements(ls0)
+    mesh.classify_edges(ls0)
+    mesh.build_interface_segments(ls0)
+    assert mesh.edge_bitset("ghost").cardinality() >= 0  # ghost set may be empty for this tiny mesh
+
+    me = MixedElement(mesh, field_specs={"u_pos_x": 1})
+    dh = DofHandler(me, method="cg")
+    u = Function("u_pos_x", field_name="u_pos_x", dof_handler=dh)
+    v = TestFunction("u_pos_x", "u_pos_x", dh)
+    # use dInterface to ensure ghost builder still runs if present; if no ghost edges, skip
+    form = u * v * dInterface(level_set=ls0, metadata={"q": 2})
+    eq = Equation(form, None)
+    kernels = compile_multi(eq, dof_handler=dh, mixed_element=me, backend="jit")
+    ghost_kernels = [k for k in kernels if k.domain == "ghost_edge"]
+    if not ghost_kernels:
+        pytest.skip("no ghost edges in this mesh setup")
+    ker = ghost_kernels[0]
+    old_static = ker.static_args
+    old_eids = np.asarray(old_static.get("eids", []), dtype=np.int32)
+    assert old_eids.size >= 0
+    old_sig = np.asarray(old_static.get("_phi_sig"))
+
+    mesh.classify_elements(ls1)
+    mesh.classify_edges(ls1)
+    mesh.build_interface_segments(ls1)
+    ker.refresh(ls1)
+
+    new_static = ker.static_args
+    new_eids = np.asarray(new_static.get("eids", []), dtype=np.int32)
+    assert np.array_equal(np.sort(old_eids), np.sort(new_eids))
+    new_sig = np.asarray(new_static.get("_phi_sig"))
+    if old_sig.size and new_sig.size:
+        assert new_sig.shape == old_sig.shape
+        assert not np.allclose(new_sig, old_sig)

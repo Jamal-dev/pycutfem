@@ -630,10 +630,10 @@ class Mesh:
                 # --- DO NOT SKIP on endpoint signs for p>=2 ---
                 # Only keep the fast skip for strictly p==1 (linear along edge)
                 if p == 1:
-                    # get endpoints for a quick sign check
-                    e_gid = elem.edges[l_edge]
-                    e = self.edge(e_gid)
-                    n0, n1 = e.nodes
+                    # Quick sign check using the *corner* nodes of this side;
+                    # elem.edges[l_edge] may be a subdivided segment (hanging nodes).
+                    c0, c1 = self._EDGE_TABLE[self.element_type][l_edge]
+                    n0 = int(elem.corner_nodes[c0]); n1 = int(elem.corner_nodes[c1])
                     phi0, phi1 = phi_nodes[n0], phi_nodes[n1]
                     if (phi0 * phi1 > 0.0) and (abs(phi0) > tol and abs(phi1) > tol):
                         continue
@@ -679,9 +679,9 @@ class Mesh:
                     unique_pts.append(c)
             except Exception:
                 pass
-            for e_gid in elem.edges:
-                e = self.edge(int(e_gid))
-                mid = 0.5 * (self.nodes_x_y_pos[e.nodes[0]] + self.nodes_x_y_pos[e.nodes[1]])
+            for (i0, i1) in self._EDGE_TABLE[self.element_type]:
+                n0 = int(elem.corner_nodes[i0]); n1 = int(elem.corner_nodes[i1])
+                mid = 0.5 * (self.nodes_x_y_pos[n0] + self.nodes_x_y_pos[n1])
                 try:
                     phi_m = _phi_eval(level_set, mid, eid=int(elem.id), mesh=self)
                 except Exception:

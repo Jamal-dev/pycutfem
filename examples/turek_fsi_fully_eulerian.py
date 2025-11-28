@@ -1629,17 +1629,15 @@ def make_domain_sets(mesh: Mesh) -> Dict[str, BitSet]:
     fluid = mesh.element_bitset("outside")
     solid = mesh.element_bitset("inside")
     cut = mesh.element_bitset("cut")
-    # Interface integrals live strictly on the cut band.
-    fluid_ifc = _copy_bitset(cut)
-    solid_ifc = _copy_bitset(cut)
+    # These are not interface integrals; they are volume integrals
+    fluid_ifc = fluid | cut
+    solid_ifc = solid | cut
     has_pos = fluid | cut
     has_neg = solid | cut
-    # By convention include the true interface edges in both ghost sets
-    # (they are common to pos/neg ghost layers). ghost_both contains edges
-    # that are shared by both ghost layers and should be present on each side.
+
     ghost_both = mesh.edge_bitset("ghost_both")
-    solid_ghost = mesh.edge_bitset("ghost_neg") | ghost_both | mesh.edge_bitset("interface")
-    fluid_ghost = mesh.edge_bitset("ghost_pos") | ghost_both | mesh.edge_bitset("interface")
+    solid_ghost = mesh.edge_bitset("ghost_neg") | ghost_both 
+    fluid_ghost = mesh.edge_bitset("ghost_pos") | ghost_both 
     return {
         "fluid_domain": _copy_bitset(fluid),
         "solid_domain": _copy_bitset(solid),
@@ -1661,11 +1659,13 @@ def refresh_domains(mesh: Mesh, domains: Dict[str, BitSet]) -> None:
     fluid = mesh.element_bitset("outside")
     solid = mesh.element_bitset("inside")
     cut = mesh.element_bitset("cut")
+    has_fluid = fluid | cut
+    has_solid = solid | cut
     _update_bs(domains["fluid_domain"], fluid.mask)
     _update_bs(domains["solid_domain"], solid.mask)
     _update_bs(domains["cut_domain"], cut.mask)
-    _update_bs(domains["fluid_interface"], cut.mask)
-    _update_bs(domains["solid_interface"], cut.mask)
+    _update_bs(domains["fluid_interface"], has_fluid.mask)
+    _update_bs(domains["solid_interface"], has_solid.mask)
     _update_bs(domains["has_pos"], fluid.mask | cut.mask)
     _update_bs(domains["has_neg"], solid.mask | cut.mask)
     ghost_both = mesh.edge_bitset("ghost_both")

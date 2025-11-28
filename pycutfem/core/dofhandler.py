@@ -3076,9 +3076,9 @@ class DofHandler:
                 pos_loc = self.element_maps[fld][pos_eid]
                 neg_loc = self.element_maps[fld][neg_eid]
                 pm[i, :] = [col_of[int(d)] for d in pos_loc]
-            nm[i, :] = [col_of[int(d)] for d in neg_loc]
-        out[f"pos_map_{fld}"] = pm
-        out[f"neg_map_{fld}"] = nm
+                nm[i, :] = [col_of[int(d)] for d in neg_loc]
+            out[f"pos_map_{fld}"] = pm
+            out[f"neg_map_{fld}"] = nm
 
         # 3c) Cache key after n_union is known
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))

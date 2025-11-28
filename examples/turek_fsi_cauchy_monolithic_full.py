@@ -929,9 +929,9 @@ def make_domain_sets(mesh: Mesh) -> Dict[str, BitSet]:
     fluid = mesh.element_bitset("outside")
     solid = mesh.element_bitset("inside")
     cut = mesh.element_bitset("cut")
-    # Interface integrals should live strictly on the cut band.
-    fluid_ifc = _copy_bitset(cut)
-    solid_ifc = _copy_bitset(cut)
+    # These are not interface integrals; they are volume integrals
+    fluid_ifc = fluid | cut   # instead of just cut
+    solid_ifc = solid | cut
     has_pos = fluid | cut
     has_neg = solid | cut
     # Ghost penalties live on ghost edges only; interface edges are handled via dInterface.
@@ -959,11 +959,13 @@ def refresh_domains(mesh: Mesh, domains: Dict[str, BitSet]) -> None:
     fluid = mesh.element_bitset("outside")
     solid = mesh.element_bitset("inside")
     cut = mesh.element_bitset("cut")
+    has_fluid = fluid | cut
+    has_solid = solid | cut
     _update_bs(domains["fluid_domain"], fluid.mask)
     _update_bs(domains["solid_domain"], solid.mask)
     _update_bs(domains["cut_domain"], cut.mask)
-    _update_bs(domains["fluid_interface"], cut.mask)
-    _update_bs(domains["solid_interface"], cut.mask)
+    _update_bs(domains["fluid_interface"], has_fluid.mask)
+    _update_bs(domains["solid_interface"], has_solid.mask)
     _update_bs(domains["has_pos"], fluid.mask | cut.mask)
     _update_bs(domains["has_neg"], solid.mask | cut.mask)
     ghost_both = mesh.edge_bitset("ghost_both") if "ghost_both" in mesh._edge_bitsets else BitSet(np.zeros(len(mesh.edges_list), bool))
@@ -1685,6 +1687,7 @@ if os.getenv("RUN_TIME_STEPPING", "1") != "0":
         update_beam_levelset_from_displacement(ls_beam, disp_k, beam_ref_ls)
         refresh_domains(mesh, domains)
         refresh_hansbo_kappa(mesh, ls_beam, theta_pos_vals, theta_neg_vals)
+        solver.refresh_levelset_kernels(ls_beam)
         retag_inactive(dof_handler)
         dof_handler.apply_bcs(bcs, uf_k, pf_k, us_k, disp_k)
         recompute_active_dofs(solver, solver.bcs_homog if solver.bcs_homog else solver.bcs)

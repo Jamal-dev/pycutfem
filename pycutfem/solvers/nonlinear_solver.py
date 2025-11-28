@@ -471,6 +471,28 @@ class NewtonSolver:
             if hasattr(self, attr):
                 delattr(self, attr)
 
+    def refresh_levelset_kernels(self, level_set):
+        """
+        Refresh precomputed static arguments for kernels that depend on a moving
+        level set without re-JIT compilation. Marks the scatter pattern as stale
+        so it will be rebuilt on the next assembly.
+        """
+        if self.backend != "jit":
+            return
+        t0 = time.perf_counter()
+        changed = 0
+        for ker in list(getattr(self, "kernels_K", [])) + list(getattr(self, "kernels_F", [])):
+            if getattr(ker, "level_set", None) is not level_set:
+                continue
+            try:
+                updated = ker.refresh(level_set)
+            except Exception:
+                updated = False
+            if updated:
+                changed += 1
+        if changed:
+            self._pattern_stale = True
+            print(f"[jit] refreshed {changed} kernels for moving level set in {time.perf_counter() - t0:.3f}s")
     def _python_form_compiler(self):
         """Lazily construct the pure-Python FormCompiler."""
         if getattr(self, "_python_fc", None) is None:

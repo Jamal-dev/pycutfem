@@ -218,10 +218,132 @@ class _IntegralKernel:
     runner:        Callable              # compiled Numba function
     static_args:   dict[str, Any]        # geometry, basis tables, maps …
     domain:        str                   # "volume" | "interface" | "ghost"
+    level_set:     Any | None = None     # moving level-set this kernel depends on
+    side:          str | None = None     # '+' / '-' for sided volume terms
+    builder:       Callable[[Any], dict[str, Any]] | None = None  # refresh hook
+    eids:          np.ndarray | None = None  # cached element ids for quick diff
 
     def exec(self, current_funcs):
         """Execute the kernel and *return* (Kloc, Floc, Jloc)."""
         return self.runner(current_funcs, self.static_args)
+
+    def refresh(self, level_set=None):
+        """
+        Rebuild static arguments for a (potentially) updated level set without
+        re-JIT'ing the kernel. Returns True when the static args were replaced.
+        """
+        if self.builder is None:
+            return False
+        try:
+            new_args = self.builder(level_set, reuse_static=self.static_args)
+        except TypeError:
+            new_args = self.builder(level_set)
+        if new_args is None:
+            return False
+        self.static_args = new_args
+        self.eids = np.asarray(new_args.get("eids", []), dtype=np.int32)
+        return True
+
+
+def _merge_static_arrays(target_eids: np.ndarray,
+                         old_static: dict[str, Any] | None,
+                         new_static: dict[str, Any] | None) -> dict[str, Any]:
+    """
+    Merge per-element static arrays from *old_static* (reused elements)
+    and *new_static* (freshly computed subset) into a single dict whose
+    first axis matches *target_eids* order. Non array entries are taken
+    from new_static when present, else old_static.
+    """
+    target_eids = np.asarray(target_eids, dtype=np.int32)
+    n_total = len(target_eids)
+    old_eids = np.asarray(old_static.get("eids", []), dtype=np.int32) if old_static else np.zeros(0, dtype=np.int32)
+    new_eids = np.asarray(new_static.get("eids", []), dtype=np.int32) if new_static else np.zeros(0, dtype=np.int32)
+    old_index = {int(e): i for i, e in enumerate(old_eids)}
+    new_index = {int(e): i for i, e in enumerate(new_eids)}
+
+    def _is_elem_array(val, n_expected):
+        return isinstance(val, np.ndarray) and val.ndim >= 1 and val.shape[0] == n_expected
+
+    merged: dict[str, Any] = {}
+    keys: set[str] = set()
+    if old_static:
+        keys.update(old_static.keys())
+    if new_static:
+        keys.update(new_static.keys())
+
+    # allocate arrays
+    for key in keys:
+        o_val = old_static.get(key) if old_static else None
+        n_val = new_static.get(key) if new_static else None
+        if _is_elem_array(o_val, len(old_eids)) or _is_elem_array(n_val, len(new_eids)):
+            proto = n_val if _is_elem_array(n_val, len(new_eids)) else o_val
+            if proto is None:
+                continue
+            tail_shape = proto.shape[1:]
+            merged[key] = np.zeros((n_total, *tail_shape), dtype=proto.dtype)
+        else:
+            merged[key] = n_val if n_val is not None else o_val
+
+    merged["eids"] = target_eids
+
+    # fill reused entries
+    for dst, eid in enumerate(target_eids):
+        if eid in old_index:
+            src = old_index[eid]
+            for key, arr in merged.items():
+                if isinstance(arr, np.ndarray) and arr.shape[0] == n_total:
+                    o_val = old_static.get(key) if old_static else None
+                    if _is_elem_array(o_val, len(old_eids)):
+                        arr[dst] = o_val[src]
+        if eid in new_index:
+            src = new_index[eid]
+            for key, arr in merged.items():
+                if isinstance(arr, np.ndarray) and arr.shape[0] == n_total:
+                    n_val = new_static.get(key) if new_static else None
+                    if _is_elem_array(n_val, len(new_eids)):
+                        arr[dst] = n_val[src]
+
+    return merged
+
+
+def _phi_signature_from_static(static: dict[str, Any] | None) -> dict[int, float]:
+    """
+    Build a cheap per-element signature for phi to detect changed cuts.
+    Uses stored '_phi_sig' when present; otherwise falls back to the
+    first quadrature-point value in 'phis' when available.
+    """
+    sig: dict[int, float] = {}
+    if static is None:
+        return sig
+    phi_sig_arr = static.get("_phi_sig")
+    eids = static.get("eids")
+    if eids is None:
+        return sig
+    arr_eids = np.asarray(eids, dtype=np.int32)
+    if phi_sig_arr is not None:
+        try:
+            arr_sig = np.asarray(phi_sig_arr, dtype=float)
+            if arr_sig.shape[0] == arr_eids.shape[0]:
+                for eid, val in zip(arr_eids, arr_sig):
+                    sig[int(eid)] = float(val)
+                return sig
+        except Exception:
+            pass
+
+    phis = static.get("phis")
+    if phis is None:
+        return sig
+    try:
+        arr_phi = np.asarray(phis)
+        if arr_phi.ndim >= 2 and arr_phi.shape[0] == arr_eids.shape[0]:
+            for eid, vals in zip(arr_eids, arr_phi):
+                try:
+                    sig[int(eid)] = float(vals.flat[0])
+                except Exception:
+                    continue
+    except Exception:
+        return {}
+    return sig
 
 def compile_multi(form, *, dof_handler, mixed_element,
                   quad_order: int | None = None, backend: str = "jit"):
@@ -245,7 +367,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
     # Normalize to a list of Integrals
     if isinstance(form, Equation):   # (a, L)
-        integrals = form.a.integrals + form.L.integrals
+        integrals = []
+        if form.a is not None:
+            integrals += form.a.integrals
+        if form.L is not None:
+            integrals += form.L.integrals
     elif isinstance(form, Integral):
         integrals = [form]
     else:
@@ -260,6 +386,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
         md = intg.measure.metadata or {}
         qdeg  += 2 * max(0, p_geo - 1)
         nseg   = int(md.get("nseg", max(3, p_geo + qdeg//2)))
+        n_loc  = mixed_element.n_dofs_per_elem
 
         # Compile the backend once; reuse for all subsets of this integral
         runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element, on_facet=on_facet)
@@ -310,113 +437,238 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     param_order = runner.param_order,
                     pre_built   = geom,
                 ))
-                kernels.append(_IntegralKernel(runner, static, "volume"))
+                kernels.append(_IntegralKernel(runner, static, "volume", eids=np.asarray(geom.get("eids", []), dtype=np.int32)))
                 continue  # done with this integral
 
             # ---- Cut volume (level set present) --------------------------
-            inside_ids, outside_ids, cut_ids = mesh.classify_elements(level_set)
-            # By convention in this codebase:
-            #   inside_ids  ↔ elements with  φ < 0
-            #   outside_ids ↔ elements with  φ > 0
-            if side not in ("+", "-"):
-                raise ValueError(f"volume(side=...) must be '+' or '-', got {side!r}")
-            side_full = inside_ids if side == "-" else outside_ids
-
-            # Start from full elements on the requested side
-            full_ids = np.asarray(side_full, dtype=np.int32)
-
-            # Respect 'defined_on' for the full-element subset too, if provided.
-            # (The cut subset already uses defined_on via 'cut_bs' below.)
             bs = intg.measure.defined_on
-            if bs is not None:
-                # Try the common BitSet APIs first.
+            deformation = getattr(intg.measure, "deformation", None)
+
+            # Geometry for full (uncut) elements does not depend on the moving LS
+            geom_bg = dof_handler.precompute_geometric_factors(
+                qdeg,
+                level_set if "phis" in runner.param_order else None,
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+                deformation=deformation,
+            )
+            _full_cache = {"ids": None, "static": None}
+
+            def _current_sets(ls_obj):
+                """Return (inside, outside, cut) ids based on current mesh tags or by reclassifying."""
+                reclassify = False
+                try:
+                    inside_now = np.asarray(mesh.element_bitset("inside").to_indices(), dtype=np.int32)
+                    outside_now = np.asarray(mesh.element_bitset("outside").to_indices(), dtype=np.int32)
+                    cut_now = np.asarray(mesh.element_bitset("cut").to_indices(), dtype=np.int32)
+                    if (inside_now.size + outside_now.size + cut_now.size) == 0:
+                        reclassify = True
+                except Exception:
+                    reclassify = True
+
+                if reclassify:
+                    inside_raw, outside_raw, cut_raw = mesh.classify_elements(ls_obj)
+                    inside_now = np.asarray(inside_raw, dtype=np.int32)
+                    outside_now = np.asarray(outside_raw, dtype=np.int32)
+                    cut_now = np.asarray(cut_raw, dtype=np.int32)
+                return inside_now, outside_now, cut_now
+
+            def _apply_defined_on(ids: np.ndarray) -> np.ndarray:
+                if bs is None:
+                    return ids
                 try:
                     allowed = np.asarray(bs.to_indices(), dtype=np.int32)
                 except AttributeError:
                     arr = np.asarray(bs)
-                    allowed = (np.nonzero(arr)[0].astype(np.int32)
-                               if arr.dtype == bool else arr.astype(np.int32))
-                # Intersect: full elements from the requested side ∩ defined_on
-                full_ids = np.intersect1d(full_ids, allowed, assume_unique=False)
+                    allowed = (np.nonzero(arr)[0].astype(np.int32) if arr.dtype == bool else arr.astype(np.int32))
+                return np.intersect1d(ids, allowed, assume_unique=False)
 
-            # 1) FULL elements on the requested side
-            if full_ids.size:
-                # include level_set so 'phis' is present (may still be None)
-                geom_all = dof_handler.precompute_geometric_factors(qdeg, level_set, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4,
-                                                                    deformation=getattr(intg.measure, 'deformation', None))
-                qref_all = geom_all.get("qp_ref")
+            def _full_static(ls_obj, reuse_static=None):
+                if side not in ("+", "-"):
+                    raise ValueError(f"volume(side=...) must be '+' or '-', got {side!r}")
+                inside_now, outside_now, _ = _current_sets(ls_obj)
+                side_full = inside_now if side == "-" else outside_now
+                full_ids = _apply_defined_on(side_full)
+                prev_ids = _full_cache.get("ids")
+                if (
+                    prev_ids is not None
+                    and full_ids.size
+                    and np.array_equal(full_ids, prev_ids)
+                    and "phis" not in runner.param_order
+                ):
+                    cached = _full_cache.get("static")
+                    if cached is not None:
+                        return cached
+                if full_ids.size == 0:
+                    empty_map = np.zeros((0, n_loc), dtype=np.int32)
+                    return {
+                        "gdofs_map": empty_map,
+                        "eids": np.zeros(0, dtype=np.int32),
+                        "entity_kind": "element",
+                        "is_interface": False,
+                        "is_ghost": False,
+                    }
+
+                qref_all = geom_bg.get("qp_ref")
                 if qref_all is not None:
                     qref_slice = qref_all[full_ids] if getattr(qref_all, "ndim", 0) == 3 else qref_all
                 else:
                     qref_slice = None
+
                 geom_full = {
-                    "qp_phys": geom_all["qp_phys"][full_ids],
-                    "qw":      geom_all["qw"][full_ids],
-                    "detJ":    geom_all["detJ"][full_ids],
-                    "J_inv":   geom_all["J_inv"][full_ids],
-                    "normals": geom_all["normals"][full_ids],
-                    "phis":    None if geom_all["phis"] is None else geom_all["phis"][full_ids],
-                    "h_arr":     geom_all["h_arr"][full_ids],
-                    "owner_id":  geom_all.get("owner_id", geom_all["eids"])[full_ids].astype(np.int32),
+                    "qp_phys": geom_bg["qp_phys"][full_ids],
+                    "qw": geom_bg["qw"][full_ids],
+                    "detJ": geom_bg["detJ"][full_ids],
+                    "J_inv": geom_bg["J_inv"][full_ids],
+                    "normals": geom_bg["normals"][full_ids],
+                    "phis": None if geom_bg.get("phis") is None else geom_bg["phis"][full_ids],
+                    "h_arr": geom_bg["h_arr"][full_ids],
+                    "owner_id": geom_bg.get("owner_id", geom_bg.get("eids", np.arange(len(geom_bg["qw"]))))[full_ids].astype(np.int32),
                     "entity_kind": "element",
                     "is_interface": False,
                     "is_ghost": False,
+                    "eids": full_ids,
                 }
                 if qref_slice is not None:
                     geom_full["qref"] = qref_slice
-                geom_full["eids"] = full_ids
-                gdofs_map_full = np.vstack([
-                    dof_handler.get_elemental_dofs(e) for e in full_ids
-                ]).astype(np.int32)
 
-                static_full = {"gdofs_map": gdofs_map_full, **geom_full}
-                static_full.update(_build_jit_kernel_args(
-                    ir, intg.integrand, mixed_element, qdeg,
-                    dof_handler=dof_handler,
-                    gdofs_map   = gdofs_map_full,
-                    param_order = runner.param_order,
-                    pre_built   = geom_full,
-                ))
-                kernels.append(_IntegralKernel(runner, static_full, "volume"))
+                gdofs_map_full = np.vstack([dof_handler.get_elemental_dofs(e) for e in full_ids]).astype(np.int32)
+                geom_full["gdofs_map"] = gdofs_map_full
 
-            # 2) CUT elements (clipped physical quadrature & per-element basis)
-            if len(cut_ids):
-                derivs = required_multi_indices(intg.integrand) | {(0, 0)}
-                cut_mask = mesh.element_bitset("cut")
-                cut_bs = (bs & cut_mask) if bs is not None else cut_mask
-                deformation=getattr(intg.measure, 'deformation', None)
-
-                geom_cut = dof_handler.precompute_cut_volume_factors(
-                    cut_bs, qdeg, derivs, level_set, 
-                    side=side, 
-                    need_hess=need_hess, 
-                    need_o3=need_o3, 
-                    need_o4=need_o4,
-                    nseg_hint=nseg,
-                    deformation=deformation
+                static_full = dict(geom_full)
+                static_full.update(
+                    _build_jit_kernel_args(
+                        ir,
+                        intg.integrand,
+                        mixed_element,
+                        qdeg,
+                        dof_handler=dof_handler,
+                        gdofs_map=gdofs_map_full,
+                        param_order=runner.param_order,
+                        pre_built=geom_full,
+                    )
                 )
-                cut_eids = np.asarray(geom_cut.get("eids", []), dtype=np.int32)
-                if cut_eids.size:
-                    # ensure detJ exists (weights already physical)
+                _full_cache["ids"] = full_ids
+                _full_cache["static"] = static_full
+                return static_full
+
+            derivs_cut = required_multi_indices(intg.integrand) | {(0, 0)}
+
+            def _cut_static(ls_obj, reuse_static=None):
+                _, _, cut_now = _current_sets(ls_obj)
+                cut_ids = np.asarray(_apply_defined_on(cut_now), dtype=np.int32)
+                cut_ids = np.unique(cut_ids)
+                if cut_ids.size == 0:
+                    empty_map = np.zeros((0, n_loc), dtype=np.int32)
+                    return {
+                        "gdofs_map": empty_map,
+                        "eids": np.zeros(0, dtype=np.int32),
+                        "owner_id": np.zeros(0, dtype=np.int32),
+                        "entity_kind": "element",
+                        "is_interface": False,
+                        "is_ghost": False,
+                        "detJ": np.ones((0, 0), dtype=float),
+                        "qw": np.zeros((0, 0), dtype=float),
+                    }
+
+                old_static = reuse_static if isinstance(reuse_static, dict) else None
+                old_phi_sig = _phi_signature_from_static(old_static)
+                old_eids = np.asarray(old_static.get("eids", []), dtype=np.int32) if old_static else np.zeros(0, dtype=np.int32)
+                # recompute if new eid or phi value changed
+                need_recompute: list[int] = []
+                for eid in cut_ids:
+                    if eid not in old_phi_sig:
+                        need_recompute.append(int(eid))
+                        continue
+                    try:
+                        # evaluate phi at element centroid as a cheap signature
+                        xc = np.asarray(mesh.elements_list[int(eid)].centroid(), float)
+                        val = float(ls_obj(xc))
+                    except Exception:
+                        val = old_phi_sig.get(int(eid), None)
+                    old_val = old_phi_sig.get(int(eid), None)
+                    if old_val is None or not np.isclose(val, old_val, rtol=0, atol=1e-12):
+                        need_recompute.append(int(eid))
+                new_ids = np.asarray(sorted(set(need_recompute)), dtype=np.int32)
+
+                static_new = None
+                if new_ids.size:
+                    geom_cut = dof_handler.precompute_cut_volume_factors(
+                        new_ids,
+                        qdeg,
+                        derivs_cut,
+                        ls_obj,
+                        side=side,
+                        need_hess=need_hess,
+                        need_o3=need_o3,
+                        need_o4=need_o4,
+                        nseg_hint=nseg,
+                        deformation=deformation,
+                    )
+                    cut_eids_new = np.asarray(geom_cut.get("eids", new_ids), dtype=np.int32)
                     if "detJ" not in geom_cut:
                         geom_cut["detJ"] = np.ones_like(geom_cut["qw"])
 
-                    gdofs_map_cut = np.vstack([
-                        dof_handler.get_elemental_dofs(e) for e in cut_eids
-                    ]).astype(np.int32)
+                    gdofs_map_cut = np.vstack([dof_handler.get_elemental_dofs(e) for e in cut_eids_new]).astype(np.int32)
+                    static_new = {"gdofs_map": gdofs_map_cut, "eids": cut_eids_new, "owner_id": cut_eids_new, **geom_cut}
+                    static_new.update(
+                        _build_jit_kernel_args(
+                            ir,
+                            intg.integrand,
+                            mixed_element,
+                            qdeg,
+                            dof_handler=dof_handler,
+                            gdofs_map=gdofs_map_cut,
+                            param_order=runner.param_order,
+                            pre_built=geom_cut,
+                        )
+                    )
 
-                    # geom_cut already carries 'eids'; keep it and pass through
-                    # static_cut = {"gdofs_map": gdofs_map_cut, **geom_cut}
-                    static_cut = {"gdofs_map": gdofs_map_cut, "eids": cut_eids, "owner_id": cut_eids, **geom_cut}
-                    # _build_jit_kernel_args won't overwrite per-element basis we provide
-                    static_cut.update(_build_jit_kernel_args(
-                        ir, intg.integrand, mixed_element, qdeg,
-                        dof_handler=dof_handler,
-                        gdofs_map   = gdofs_map_cut,
-                        param_order = runner.param_order,
-                        pre_built   = geom_cut,
-                    ))
-                    kernels.append(_IntegralKernel(runner, static_cut, "volume"))
+                # Merge reused rows with newly computed ones; arrays are built in target cut_ids order
+                merged = _merge_static_arrays(cut_ids, old_static, static_new)
+                merged["owner_id"] = merged.get("owner_id", cut_ids)
+                merged["is_interface"] = False
+                merged["is_ghost"] = False
+                merged["entity_kind"] = "element"
+                # store phi signature at centroids for future refresh decisions
+                try:
+                    merged["_phi_sig"] = np.asarray(
+                        [float(ls_obj(mesh.elements_list[int(e)].centroid())) for e in cut_ids],
+                        dtype=float,
+                    )
+                except Exception:
+                    pass
+                return merged
+
+            static_full = _full_static(level_set)
+            full_eids = np.asarray(static_full.get("eids", []), dtype=np.int32)
+            kernels.append(
+                _IntegralKernel(
+                    runner,
+                    static_full,
+                    "volume",
+                    level_set=level_set,
+                    side=side,
+                    builder=_full_static,
+                    eids=full_eids,
+                )
+            )
+
+            static_cut = _cut_static(level_set)
+            cut_eids = np.asarray(static_cut.get("eids", []), dtype=np.int32)
+            kernels.append(
+                _IntegralKernel(
+                    runner,
+                    static_cut,
+                    "volume",
+                    level_set=level_set,
+                    side=side,
+                    builder=_cut_static,
+                    eids=cut_eids,
+                )
+            )
+            continue
 
             # finished handling this integral (even if one subset was empty)
             continue
@@ -425,38 +677,97 @@ def compile_multi(form, *, dof_handler, mixed_element,
         # INTERFACE (cut edges/faces)
         # ------------------------------------------------------------------
         if dom == "interface":
-            
             level_set = intg.measure.level_set
             bs_cut = mixed_element.mesh.element_bitset("cut")
             bs_def = intg.measure.defined_on
+            deformation = getattr(intg.measure, "deformation", None)
 
-            cut_eids = (bs_def & bs_cut) if bs_def is not None else bs_cut
-            geom = dof_handler.precompute_interface_factors(cut_eids, qdeg, 
-                                                            level_set, 
-                                                            need_hess=need_hess, 
-                                                            need_o3=need_o3, 
-                                                            need_o4=need_o4,
-                                                            nseg=nseg,
-                                                            deformation=getattr(intg.measure, 'deformation', None))
-            geom["is_interface"] = True
+            def _interface_static(ls_obj, reuse_static=None):
+                cut_eids_bitset = (bs_def & bs_cut) if bs_def is not None else bs_cut
+                try:
+                    new_eids_full = np.asarray(cut_eids_bitset.to_indices(), dtype=np.int32)
+                except Exception:
+                    new_eids_full = np.asarray(cut_eids_bitset, dtype=np.int32)
+                new_eids_full = np.unique(new_eids_full)
 
-            # interface assembly still uses element-local maps; safe to use all
-            gdofs_map = np.vstack([
-                dof_handler.get_elemental_dofs(e)
-                for e in geom["eids"]
-            ]).astype(np.int32)
-            # # AFTER — use the **edge-union** map built by precompute_interface_factors
-            # gdofs_map = geom["gdofs_map"].astype(np.int32)
+                old_static = reuse_static if isinstance(reuse_static, dict) else None
+                old_phi_sig = _phi_signature_from_static(old_static)
+                old_eids = np.asarray(old_static.get("eids", []), dtype=np.int32) if old_static else np.zeros(0, dtype=np.int32)
+                need_recompute: list[int] = []
+                for eid in new_eids_full:
+                    if eid not in old_phi_sig:
+                        need_recompute.append(int(eid))
+                        continue
+                    try:
+                        xc = np.asarray(mixed_element.mesh.elements_list[int(eid)].centroid(), float)
+                        val = float(ls_obj(xc))
+                    except Exception:
+                        val = old_phi_sig.get(int(eid), None)
+                    old_val = old_phi_sig.get(int(eid), None)
+                    if old_val is None or not np.isclose(val, old_val, rtol=0, atol=1e-12):
+                        need_recompute.append(int(eid))
+                new_ids = np.asarray(sorted(set(need_recompute)), dtype=np.int32)
 
-            static = {"gdofs_map": gdofs_map, **geom}
-            static.update(_build_jit_kernel_args(
-                ir, intg.integrand, mixed_element, qdeg,
-                dof_handler=dof_handler,
-                gdofs_map   = gdofs_map,
-                param_order = runner.param_order,
-                pre_built   = geom,
-            ))
-            kernels.append(_IntegralKernel(runner, static, "interface"))
+                static_new = None
+                if new_ids.size:
+                    geom = dof_handler.precompute_interface_factors(
+                        new_ids,
+                        qdeg,
+                        ls_obj,
+                        need_hess=need_hess,
+                        need_o3=need_o3,
+                        need_o4=need_o4,
+                        nseg=nseg,
+                        deformation=deformation,
+                    )
+                    geom["is_interface"] = True
+                    geom["is_ghost"] = False
+
+                    eids_arr = np.asarray(geom.get("eids", new_ids), dtype=np.int32)
+                    if "gdofs_map" in geom:
+                        gdofs_map = np.asarray(geom["gdofs_map"], dtype=np.int32)
+                    else:
+                        gdofs_map = np.vstack([dof_handler.get_elemental_dofs(e) for e in eids_arr]).astype(np.int32)
+
+                    static_new = {"gdofs_map": gdofs_map, **geom}
+                    static_new.update(
+                        _build_jit_kernel_args(
+                            ir,
+                            intg.integrand,
+                            mixed_element,
+                            qdeg,
+                            dof_handler=dof_handler,
+                            gdofs_map=gdofs_map,
+                            param_order=runner.param_order,
+                            pre_built=geom,
+                        )
+                    )
+
+                merged = _merge_static_arrays(new_eids_full, old_static, static_new)
+                merged["is_interface"] = True
+                merged["is_ghost"] = False
+                merged["entity_kind"] = "element"
+                try:
+                    merged["_phi_sig"] = np.asarray(
+                        [float(ls_obj(mixed_element.mesh.elements_list[int(e)].centroid())) for e in new_eids_full],
+                        dtype=float,
+                    )
+                except Exception:
+                    pass
+                return merged
+
+            static = _interface_static(level_set)
+            eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
+            kernels.append(
+                _IntegralKernel(
+                    runner,
+                    static,
+                    "interface",
+                    level_set=level_set,
+                    builder=_interface_static,
+                    eids=eids_arr,
+                )
+            )
             continue
 
         # ------------------------------------------------------------------
@@ -468,27 +779,86 @@ def compile_multi(form, *, dof_handler, mixed_element,
             bs_ghost = mixed_element.mesh.edge_bitset("ghost")
             bs_def   = intg.measure.defined_on
             edges = (bs_def & bs_ghost) if bs_def is not None else bs_ghost
-            try:
-                if edges.cardinality() == 0:
-                    continue  # nothing to assemble for this ghost term
-            except Exception:
-                pass
-            geom = dof_handler.precompute_ghost_factors(edges, qdeg, level_set, derivs, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4)
-            geom["is_ghost"] = True
-            geom["is_interface"] = False
+            def _ghost_static(ls_obj, reuse_static=None):
+                old_static = reuse_static if isinstance(reuse_static, dict) else None
+                old_phi_sig = _phi_signature_from_static(old_static)
+                old_eids = np.asarray(old_static.get("eids", []), dtype=np.int32) if old_static else np.zeros(0, dtype=np.int32)
 
-            # ghost precompute returns the union dof map for each edge
-            gdofs_map = geom["gdofs_map"]
+                try:
+                    all_eids = np.asarray(edges.to_indices(), dtype=np.int32)
+                except Exception:
+                    all_eids = np.asarray(edges, dtype=np.int32)
+                all_eids = np.unique(all_eids)
 
-            static = {"gdofs_map": gdofs_map, **geom}
-            static.update(_build_jit_kernel_args(
-                ir, intg.integrand, mixed_element, qdeg,
-                dof_handler=dof_handler,
-                gdofs_map   = gdofs_map,
-                param_order = runner.param_order,
-                pre_built   = geom,
-            ))
-            kernels.append(_IntegralKernel(runner, static, "ghost_edge"))
+                need_recompute: list[int] = []
+                for eid in all_eids:
+                    if eid not in old_phi_sig:
+                        need_recompute.append(int(eid))
+                        continue
+                    try:
+                        xc = np.asarray(mixed_element.mesh.edges_list[int(eid)].midpoint(), float)
+                        val = float(ls_obj(xc))
+                    except Exception:
+                        val = old_phi_sig.get(int(eid), None)
+                    old_val = old_phi_sig.get(int(eid), None)
+                    if old_val is None or not np.isclose(val, old_val, rtol=0, atol=1e-12):
+                        need_recompute.append(int(eid))
+                new_ids = np.asarray(sorted(set(need_recompute)), dtype=np.int32)
+
+                static_new = None
+                if new_ids.size:
+                    geom = dof_handler.precompute_ghost_factors(
+                        new_ids,
+                        qdeg,
+                        ls_obj,
+                        derivs,
+                        need_hess=need_hess,
+                        need_o3=need_o3,
+                        need_o4=need_o4,
+                    )
+                    geom["is_ghost"] = True
+                    geom["is_interface"] = False
+                    gdofs_map = np.asarray(geom.get("gdofs_map", np.zeros((len(new_ids), n_loc), dtype=np.int32)), dtype=np.int32)
+
+                    static_new = {"gdofs_map": gdofs_map, **geom}
+                    static_new.update(
+                        _build_jit_kernel_args(
+                            ir,
+                            intg.integrand,
+                            mixed_element,
+                            qdeg,
+                            dof_handler=dof_handler,
+                            gdofs_map=gdofs_map,
+                            param_order=runner.param_order,
+                            pre_built=geom,
+                        )
+                    )
+
+                merged = _merge_static_arrays(all_eids, old_static, static_new)
+                merged["is_ghost"] = True
+                merged["is_interface"] = False
+                merged["entity_kind"] = "edge"
+                try:
+                    merged["_phi_sig"] = np.asarray(
+                        [float(ls_obj(np.asarray(mixed_element.mesh.edges_list[int(e)].midpoint(), float))) for e in all_eids],
+                        dtype=float,
+                    )
+                except Exception:
+                    pass
+                return merged
+
+            static = _ghost_static(level_set)
+            eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
+            kernels.append(
+                _IntegralKernel(
+                    runner,
+                    static,
+                    "ghost_edge",
+                    level_set=level_set,
+                    builder=_ghost_static,
+                    eids=eids_arr,
+                )
+            )
             continue
 
         raise NotImplementedError(f"{dom!r} integrals are not supported by JIT.")
