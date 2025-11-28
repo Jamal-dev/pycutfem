@@ -915,6 +915,10 @@ def update_beam_levelset_from_displacement(
         phi_vals[int(li)] = float(phi_new)
 
     ls_beam.commit()
+    # Rebuild interface classification/segments for aligned interface terms
+    mesh.classify_elements(ls_beam)
+    mesh.classify_edges(ls_beam)
+    mesh.build_interface_segments(ls_beam)
 
 
 def _copy_bitset(bs: BitSet) -> BitSet:
@@ -925,14 +929,15 @@ def make_domain_sets(mesh: Mesh) -> Dict[str, BitSet]:
     fluid = mesh.element_bitset("outside")
     solid = mesh.element_bitset("inside")
     cut = mesh.element_bitset("cut")
-    fluid_ifc = fluid | cut
-    solid_ifc = solid | cut
+    # Interface integrals should live strictly on the cut band.
+    fluid_ifc = _copy_bitset(cut)
+    solid_ifc = _copy_bitset(cut)
     has_pos = fluid | cut
     has_neg = solid | cut
-    # By convention include the true interface edges in both ghost sets
-    # (they are common to pos/neg ghost layers).
-    solid_ghost = mesh.edge_bitset("ghost_neg") | mesh.edge_bitset("interface")
-    fluid_ghost = mesh.edge_bitset("ghost_pos") | mesh.edge_bitset("interface")
+    # Ghost penalties live on ghost edges only; interface edges are handled via dInterface.
+    ghost_both = mesh.edge_bitset("ghost_both") if "ghost_both" in mesh._edge_bitsets else BitSet(np.zeros(len(mesh.edges_list), bool))
+    solid_ghost = mesh.edge_bitset("ghost_neg") | ghost_both
+    fluid_ghost = mesh.edge_bitset("ghost_pos") | ghost_both
     return {
         "fluid_domain": _copy_bitset(fluid),
         "solid_domain": _copy_bitset(solid),
@@ -957,12 +962,13 @@ def refresh_domains(mesh: Mesh, domains: Dict[str, BitSet]) -> None:
     _update_bs(domains["fluid_domain"], fluid.mask)
     _update_bs(domains["solid_domain"], solid.mask)
     _update_bs(domains["cut_domain"], cut.mask)
-    _update_bs(domains["fluid_interface"], fluid.mask | cut.mask)
-    _update_bs(domains["solid_interface"], solid.mask | cut.mask)
+    _update_bs(domains["fluid_interface"], cut.mask)
+    _update_bs(domains["solid_interface"], cut.mask)
     _update_bs(domains["has_pos"], fluid.mask | cut.mask)
     _update_bs(domains["has_neg"], solid.mask | cut.mask)
-    solid_ghost = mesh.edge_bitset("ghost_neg") | mesh.edge_bitset("interface")
-    fluid_ghost = mesh.edge_bitset("ghost_pos") | mesh.edge_bitset("interface")
+    ghost_both = mesh.edge_bitset("ghost_both") if "ghost_both" in mesh._edge_bitsets else BitSet(np.zeros(len(mesh.edges_list), bool))
+    solid_ghost = mesh.edge_bitset("ghost_neg") | ghost_both
+    fluid_ghost = mesh.edge_bitset("ghost_pos") | ghost_both
     _update_bs(domains["solid_ghost"], solid_ghost.mask)
     _update_bs(domains["fluid_ghost"], fluid_ghost.mask)
 
@@ -1089,13 +1095,26 @@ print(f"Reynolds number: {Re:.2f}")
 mesh = build_channel_mesh(MESH_SIZE, POLY_ORDER)
 
 # Beam level set (reference configuration)
-beam_ref_ls = BeamLevelSet(center=BEAM_CENTER, Lb=BEAM_LENGTH, Hb=BEAM_HEIGHT)
+move_beam_dela_x = 0.01
+beam_cx = BEAM_CENTER[0] - move_beam_dela_x
+beam_ref_ls = BeamLevelSet(center=(beam_cx, BEAM_CENTER[1]), 
+                           Lb=BEAM_LENGTH + 2*move_beam_dela_x, Hb=BEAM_HEIGHT)
+
+# Classify and extract interface geometry (required for aligned interface assembly)
+mesh.classify_elements(beam_ref_ls)
+mesh.classify_edges(beam_ref_ls)
+mesh.build_interface_segments(beam_ref_ls)
 
 # Optional asymmetric refinement around the beam to concentrate cells (with hanging nodes)
 if ARGS.refine_initial:
     refine_levels = int(getattr(ARGS, "refine_levels", 2))
     refine_band = getattr(ARGS, "refine_band", None)
     mesh = asymmetric_refine_around_beam(mesh, beam_ref_ls, levels=refine_levels, band=refine_band)
+
+# Re-classify after refinement to refresh cut/ghost/interface sets and segments
+mesh.classify_elements(beam_ref_ls)
+mesh.classify_edges(beam_ref_ls)
+mesh.build_interface_segments(beam_ref_ls)
 
 if ARGS.plot_mesh:
     ax = plot_mesh_2(mesh, level_set=beam_ref_ls, show=False)

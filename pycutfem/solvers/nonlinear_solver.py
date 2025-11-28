@@ -651,11 +651,11 @@ class NewtonSolver:
                 keep_mask[inactive] = False
                 # rebuild maps
                 self.active_dofs = self.active_dofs[keep_mask]
-                self.full_to_red = -np.ones(ndof, dtype=int)
+                self.full_to_red = -np.ones(ndof_eff, dtype=int)
                 self.full_to_red[self.active_dofs] = np.arange(self.active_dofs.size, dtype=int)
                 self.red_to_full = self.active_dofs
                 self._pattern_stale = True
-                self.restrictor = _ActiveReducer(self.dh, self.active_dofs)
+                self.restrictor = _ActiveReducer(self.dh, self.active_dofs, constraint=getattr(self, "constraints", None))
                 # rebuild reduced CSR scatter pattern
                 self._build_reduced_pattern()
                 # re-assemble on the cleaned support

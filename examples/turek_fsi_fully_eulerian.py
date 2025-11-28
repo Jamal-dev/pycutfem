@@ -1629,8 +1629,9 @@ def make_domain_sets(mesh: Mesh) -> Dict[str, BitSet]:
     fluid = mesh.element_bitset("outside")
     solid = mesh.element_bitset("inside")
     cut = mesh.element_bitset("cut")
-    fluid_ifc = fluid | cut
-    solid_ifc = solid | cut
+    # Interface integrals live strictly on the cut band.
+    fluid_ifc = _copy_bitset(cut)
+    solid_ifc = _copy_bitset(cut)
     has_pos = fluid | cut
     has_neg = solid | cut
     # By convention include the true interface edges in both ghost sets
@@ -1663,8 +1664,8 @@ def refresh_domains(mesh: Mesh, domains: Dict[str, BitSet]) -> None:
     _update_bs(domains["fluid_domain"], fluid.mask)
     _update_bs(domains["solid_domain"], solid.mask)
     _update_bs(domains["cut_domain"], cut.mask)
-    _update_bs(domains["fluid_interface"], fluid.mask | cut.mask)
-    _update_bs(domains["solid_interface"], solid.mask | cut.mask)
+    _update_bs(domains["fluid_interface"], cut.mask)
+    _update_bs(domains["solid_interface"], cut.mask)
     _update_bs(domains["has_pos"], fluid.mask | cut.mask)
     _update_bs(domains["has_neg"], solid.mask | cut.mask)
     ghost_both = mesh.edge_bitset("ghost_both")
@@ -2156,7 +2157,7 @@ _log_step(f"built base mesh ({ARGS.mesh_backend})")
 move_beam_dela_x = 0.01
 beam_cx = BEAM_CENTER[0] - move_beam_dela_x
 beam_ref_ls = BeamLevelSet(center=(beam_cx, BEAM_CENTER[1]), 
-                           Lb=BEAM_LENGTH + move_beam_dela_x, Hb=BEAM_HEIGHT)
+                           Lb=BEAM_LENGTH + 2 * move_beam_dela_x, Hb=BEAM_HEIGHT)
 if ARGS.refine_initial:
     mesh = refine_beam_anisotropic(mesh, beam_ref_ls, levels=2, target_h=0.5 * BEAM_HEIGHT)
     _log_step("refined mesh around beam")
@@ -2173,8 +2174,8 @@ ls_beam.interpolate(lambda x, y: beam_ref_ls(np.array([x, y])))
 ls_beam.commit()
 # Classify mesh against beam level set
 mesh.classify_elements(ls_beam)
-mesh.build_interface_segments(ls_beam)
 mesh.classify_edges(ls_beam)
+mesh.build_interface_segments(ls_beam)
 _log_step("interpolated/committed level set")
 
 domains = make_domain_sets(mesh)
