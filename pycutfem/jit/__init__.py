@@ -230,6 +230,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
     _IntegralKernel objects. Supports plain volume, cut volume (level set
     with side), interface, and ghost-edge integrals.
     """
+    if backend != "jit":
+        raise ValueError(
+            f"compile_multi supports backend='jit'; got backend={backend!r}. "
+            "Use FormCompiler(backend='python') for the pure-Python path."
+        )
     from pycutfem.ufl.measures import Integral
     from pycutfem.ufl.forms    import Equation
     from pycutfem.ufl.helpers_jit import _build_jit_kernel_args

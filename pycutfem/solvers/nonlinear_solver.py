@@ -425,7 +425,7 @@ class NewtonSolver:
                 print(f"  Inactive DOFs dropped: {inactive_removed}")
             else:
                 print("  Inactive DOFs already excluded by restriction domains.")
-
+        print(f"NewtonSolver using backend '{self.backend}'.")
         # Build once: CSR structure & per-element scatter plan for reduced system
         self._build_reduced_pattern()
 
@@ -436,27 +436,50 @@ class NewtonSolver:
 
     def _compile_all_kernels(self) -> None:
         """(Re)compile residual and Jacobian kernels with current metadata."""
-        self.kernels_K = compile_multi(
-            self._jacobian_form,
-            dof_handler=self.dh,
-            mixed_element=self.me,
-            quad_order=self.quad_order,
-            backend=self.backend,
-        )
+        if self.backend == "jit":
+            self.kernels_K = compile_multi(
+                self._jacobian_form,
+                dof_handler=self.dh,
+                mixed_element=self.me,
+                quad_order=self.quad_order,
+                backend=self.backend,
+            )
 
-        self.kernels_F = compile_multi(
-            self._residual_form,
-            dof_handler=self.dh,
-            mixed_element=self.me,
-            quad_order=self.quad_order,
-            backend=self.backend,
-        )
+            self.kernels_F = compile_multi(
+                self._residual_form,
+                dof_handler=self.dh,
+                mixed_element=self.me,
+                quad_order=self.quad_order,
+                backend=self.backend,
+            )
+            self._python_fc = None
+        elif self.backend == "python":
+            # Python backend: defer to the pure-Python FormCompiler at assembly time.
+            from pycutfem.ufl.compilers import FormCompiler
+
+            self._python_fc = FormCompiler(
+                self.dh, quadrature_order=self.quad_order, backend="python"
+            )
+            self.kernels_K = []
+            self.kernels_F = []
+        else:
+            raise ValueError(f"Unknown backend '{self.backend}'.")
 
         self._pattern_stale = True
         self._last_jacobian = None
         for attr in ("_csr_indptr", "_csr_indices", "_elem_pos", "_elem_lidx"):
             if hasattr(self, attr):
                 delattr(self, attr)
+
+    def _python_form_compiler(self):
+        """Lazily construct the pure-Python FormCompiler."""
+        if getattr(self, "_python_fc", None) is None:
+            from pycutfem.ufl.compilers import FormCompiler
+
+            self._python_fc = FormCompiler(
+                self.dh, quadrature_order=self.quad_order, backend="python"
+            )
+        return self._python_fc
 
     def _maybe_refresh_deformation(self, coeffs: Dict[str, object]) -> None:
         if self.deformation is None or self._deformation_update is None:
@@ -590,6 +613,7 @@ class NewtonSolver:
         - Inhomogeneous Dirichlet values are NOT re-applied inside the iteration,
         only after an accepted step (BCs were already set before entering the loop).
         """
+        self._current_bcs = bcs_now
         dh = self.dh
         ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
 
@@ -777,6 +801,8 @@ class NewtonSolver:
     #  Reduced Linear system & BC handling
     # ------------------------------------------------------------------
     def _assemble_system_reduced(self, coeffs, *, need_matrix: bool = True):
+        if self.backend == "python":
+            return self._assemble_system_reduced_python(coeffs, need_matrix=need_matrix)
         if getattr(self, "constraints", None) is not None:
             return self._assemble_system_with_constraints(coeffs, need_matrix=need_matrix)
         self._maybe_refresh_deformation(coeffs)
@@ -796,6 +822,32 @@ class NewtonSolver:
                     if np.any(m):
                         np.add.at(R_red, rmap[m], Floc[e][m])
             return None, R_red
+
+    def _assemble_full_system_python(self, apply_bcs=None):
+        """
+        Assemble the full-space Jacobian and residual using the Python backend.
+        Dirichlet conditions are applied only if *apply_bcs* is provided.
+        """
+        fc = self._python_form_compiler()
+        return fc.assemble(self.equation, bcs=apply_bcs)
+
+    def _assemble_system_reduced_python(self, coeffs, *, need_matrix: bool = True):
+        """
+        Python-backend assembly: build the full system once and condense to the
+        active DOFs (and optional constraints) via the existing reducer.
+        """
+        self._maybe_refresh_deformation(coeffs)
+        A_full, R_full = self._assemble_full_system_python(apply_bcs=None)
+
+        # Prefer the time-frozen BCs when available
+        bcs_apply = getattr(self, "_current_bcs", None)
+        if bcs_apply is None:
+            bcs_apply = self.bcs_homog if self.bcs_homog else self.bcs
+
+        A_red, R_red = self.restrictor.reduce_system(A_full, R_full, self.dh, bcs_apply)
+        if need_matrix:
+            return A_red, R_red
+        return None, R_red
 
     def _assemble_system_with_constraints(self, coeffs, *, need_matrix: bool = True):
         """
@@ -825,6 +877,11 @@ class NewtonSolver:
         Assemble full-space Jacobian and residual *without* applying Dirichlet BCs.
         Used when hanging-node condensation is handled separately.
         """
+        if self.backend == "python":
+            self._maybe_refresh_deformation(coeffs)
+            A_full, R_full = self._assemble_full_system_python(apply_bcs=None)
+            return (A_full if need_matrix else None), R_full
+
         self._maybe_refresh_deformation(coeffs)
         ndof = self.dh.total_dofs
         A_glob = sp.lil_matrix((ndof, ndof)) if need_matrix else None
@@ -872,6 +929,28 @@ class NewtonSolver:
           enforces homogeneous Dirichlet rows in *R* so that line‑search
           evaluations are meaningful.
         """
+        if self.backend == "python":
+            self._maybe_refresh_deformation(coeffs)
+            A_glob, R_glob = self._assemble_full_system_python(apply_bcs=None)
+            dh = self.dh
+            ndof = dh.total_dofs
+
+            if self.bcs_homog:
+                bc_data = dh.get_dirichlet_data(self.bcs_homog)
+                if bc_data:
+                    rows = np.fromiter(bc_data.keys(), dtype=int)
+                    vals = np.fromiter(bc_data.values(), dtype=float)
+
+                    if need_matrix and A_glob is not None:
+                        bc_vec = np.zeros(ndof)
+                        bc_vec[rows] = vals
+                        R_glob -= A_glob @ bc_vec
+                        A_glob = _zero_rows_cols(A_glob, rows)
+
+                    R_glob[rows] = vals
+
+            return (A_glob if need_matrix else None), R_glob
+
         self._maybe_refresh_deformation(coeffs)
         dh   = self.dh
         ndof = dh.total_dofs
@@ -1068,6 +1147,16 @@ class NewtonSolver:
         - self._elem_pos  : per-kernel list of [ per-element 1D position arrays ]
         - self._elem_lidx : per-kernel list of [ per-element local active idx ]
         """
+
+        if self.backend == "python":
+            # Python backend assembles in the full space; reduced scatter is unused.
+            n = len(getattr(self, "active_dofs", []))
+            self._csr_indptr = np.zeros(n + 1, dtype=np.int32)
+            self._csr_indices = np.zeros(0, dtype=np.int32)
+            self._elem_pos = []
+            self._elem_lidx = []
+            self._pattern_stale = False
+            return
 
         if getattr(self, "constraints", None) is not None:
             # Constraint handling assembles in the full space and condenses;
@@ -1429,6 +1518,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
     # ------------------------------------------------------------------ #
     def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
         dh = self.dh
+        self._current_bcs = bcs_now
         comm = PETSc.COMM_WORLD
 
         # Ensure we have the reduced pattern/active dofs
@@ -1729,6 +1819,7 @@ if HAS_GIANT:
         def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
 
             dh      = self.dh
+            self._current_bcs = bcs_now
             n_total_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
             n_phys = getattr(self.restrictor, "phys_size", dh.total_dofs)
             active  = self.active_dofs         # free dofs (length n_free)
@@ -1908,6 +1999,7 @@ class AdamNewtonSolver(NewtonSolver):
     def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
         dh     = self.dh
         np_    = self.np
+        self._current_bcs = bcs_now
 
         # allocate Adam buffers lazily
         ndof = sum(f.nodal_values.size for f in funcs)

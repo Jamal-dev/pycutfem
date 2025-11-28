@@ -72,6 +72,9 @@ parser.add_argument("--rebuild-msh", action="store_true",
                     help="Rebuild the gmsh mesh if the file is missing or --rebuild-msh is passed.")
 parser.add_argument("--nx", type=int, default=30, help="Number of cells in x for the structured mesh.")
 parser.add_argument("--ny", type=int, default=30, help="Number of cells in y for the structured mesh.")
+parser.add_argument("--backend", type=str, default="jit", help="Assembly backend to use: 'jit' or 'python'.")
+parser.add_argument("--max-time-steps", type=int, default=200, help="Maximum number of time steps to run.")
+parser.add_argument("--show-plots", action="store_true", help="Show verification plots after the simulation.")
 args, _ = parser.parse_known_args()
 
 # 1. ============================================================================
@@ -232,14 +235,17 @@ from pycutfem.solvers.nonlinear_solver import (
 # from pycutfem.solvers.aainhb_solver import AAINHBSolver
 
 # build residual_form, jacobian_form, dof_handler, mixed_element, bcs, bcs_homog …
-time_params = TimeStepperParameters(dt=0.1, stop_on_steady=True, steady_tol=1e-6, theta= 0.49)
+time_params = TimeStepperParameters(dt=0.1, stop_on_steady=True, steady_tol=1e-6, theta= 0.49,
+                                    max_steps=args.max_time_steps)
 
 solver = NewtonSolver(
     residual_form, jacobian_form,
     dof_handler=dof_handler,
     mixed_element=mixed_element,
     bcs=bcs, bcs_homog=bcs_homog,
-    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+    backend=args.backend,
+    newton_params=NewtonParameters(newton_tol=1e-6, line_search=True,
+                                   ),
 )
 # solver = AdamNewtonSolver(
 #     residual_form, jacobian_form,
@@ -299,12 +305,12 @@ solver.solve_time_interval(functions=functions,prev_functions= prev_functions,
 
 # In[ ]:
 
-
-u_n.plot(kind="streamline",
-         density=4.0,
-         linewidth=0.8,
-         cmap="plasma",
-         title="Lid-driven cavity – stream-lines",background = False)
+if args.show_plots:
+    u_n.plot(kind="streamline",
+            density=4.0,
+            linewidth=0.8,
+            cmap="plasma",
+            title="Lid-driven cavity – stream-lines",background = False)
 
 
 # In[ ]:
@@ -317,6 +323,59 @@ from pycutfem.plotting import _extract_profile_1d
 
 # ---------------------------------------------------------------------------
 
+
+def calculate_ghia_error(y_sol, u_sol, x_sol, v_sol, reference_data):
+    """
+    Calculates error metrics between dense FEM solution and sparse Ghia data.
+    """
+    
+    # --- 1. PREPARE U-VELOCITY DATA (Vertical Centerline) ---
+    y_ref = np.array(reference_data['y_locations'])
+    u_ref = np.array(reference_data['u_velocity_on_vertical_centerline'])
+    
+    # IMPORTANT: np.interp requires the x-coordinate (y_sol here) to be sorted!
+    # FEM node extraction is often unsorted.
+    sort_idx_u = np.argsort(y_sol)
+    y_sol_sorted = y_sol[sort_idx_u]
+    u_sol_sorted = u_sol[sort_idx_u]
+
+    # Interpolate FEM solution onto Reference Y-locations
+    u_fem_at_ref_locs = np.interp(y_ref, y_sol_sorted, u_sol_sorted)
+
+    # --- 2. PREPARE V-VELOCITY DATA (Horizontal Centerline) ---
+    x_ref = np.array(reference_data['x_locations'])
+    v_ref = np.array(reference_data['v_velocity_on_horizontal_centerline'])
+    
+    sort_idx_v = np.argsort(x_sol)
+    x_sol_sorted = x_sol[sort_idx_v]
+    v_sol_sorted = v_sol[sort_idx_v]
+
+    # Interpolate FEM solution onto Reference X-locations
+    v_fem_at_ref_locs = np.interp(x_ref, x_sol_sorted, v_sol_sorted)
+
+    # --- 3. CALCULATE METRICS ---
+    
+    # Calculate differences (residuals)
+    diff_u = u_fem_at_ref_locs - u_ref
+    diff_v = v_fem_at_ref_locs - v_ref
+
+    # Metric 1: Root Mean Square Error (RMSE) - Good for average deviation
+    rmse_u = np.sqrt(np.mean(diff_u**2))
+    rmse_v = np.sqrt(np.mean(diff_v**2))
+
+    # Metric 2: L2 Norm (Euclidean Distance)
+    l2_u = np.linalg.norm(diff_u)
+    l2_v = np.linalg.norm(diff_v)
+
+    # Metric 3: L-Infinity Norm (Max Absolute Error)
+    max_err_u = np.max(np.abs(diff_u))
+    max_err_v = np.max(np.abs(diff_v))
+
+    print(f"--- Verification Results (Re=100) ---")
+    print(f"U-Velocity: RMSE={rmse_u:.5f}, L2={l2_u:.5f}, MaxErr={max_err_u:.5f}")
+    print(f"V-Velocity: RMSE={rmse_v:.5f}, L2={l2_v:.5f}, MaxErr={max_err_v:.5f}")
+
+    return rmse_u, rmse_v
 
 def create_verification_plot(dh, u_vec, reference_data, *,
                              x_center=0.5, y_center=0.5):
@@ -347,10 +406,12 @@ def create_verification_plot(dh, u_vec, reference_data, *,
                                        line_axis='x', line_pos=x_center)
     x_sol, v_sol = _extract_profile_1d('uy', dh, uy_vals,
                                        line_axis='y', line_pos=y_center)
-
+    rmse_u, rmse_v = calculate_ghia_error(y_sol, u_sol, x_sol, v_sol, reference_data)
     # ------------------------------------------------------------------
     # 2. Plot comparison
     # ------------------------------------------------------------------
+    if not args.show_plots:
+        return
     fig, (ax_u, ax_v) = plt.subplots(1, 2, figsize=(14, 6), sharey=False)
     fig.suptitle("Lid-driven cavity – comparison with Ghia et al. (Re = 100)",
                  fontsize=16)
@@ -377,5 +438,7 @@ def create_verification_plot(dh, u_vec, reference_data, *,
 
     plt.tight_layout()
     plt.show()
+
+
 
 create_verification_plot(dof_handler, u_n, ghia_data_re100)

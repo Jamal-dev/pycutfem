@@ -17,7 +17,16 @@ from __future__ import annotations
 import math
 import os
 import time
+import argparse
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Dict, Iterable, Sequence
+
+try:
+    import gmsh  # type: ignore
+except Exception:
+    gmsh = None
 
 import numba
 import numpy as np
@@ -30,6 +39,7 @@ from pycutfem.fem import transform
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.utils.bitset import BitSet
+from pycutfem.utils.gmsh_loader import mesh_from_gmsh
 from pycutfem.utils.ogrid_meshgen import circular_hole_ogrid
 
 from pycutfem.ufl.functionspace import FunctionSpace
@@ -83,6 +93,51 @@ except Exception:
     print("Numba not configured; continuing without thread pinning.")
 
 # -----------------------------------------------------------------------------
+# CLI / environment options
+# -----------------------------------------------------------------------------
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Monolithic CutFEM Turek–Hron FSI-2 (Cauchy solid).")
+    parser.add_argument("--dt", type=float, default=float(os.getenv("DT", "0.005")), help="Time step size.")
+    parser.add_argument("--poly-order", type=int, default=int(os.getenv("POLY_ORDER", "2")), help="Polynomial order for primary fields.")
+    parser.add_argument("--mesh-size", type=float, default=float(os.getenv("MESH_SIZE", "0.025")), help="Target mesh size for structured O-grid.")
+    parser.add_argument(
+        "--mesh-backend",
+        choices=("gmsh", "structured"),
+        default=os.getenv("MESH_BACKEND", "gmsh"),
+        help="Mesh generator: 'gmsh' (beam-aware blocked grid) or the legacy structured O-grid.",
+    )
+    parser.add_argument("--mesh-file", type=Path, default=None, help="Optional path to reuse/store the gmsh .msh file.")
+    parser.add_argument("--rebuild-mesh", action="store_true", help="Force rebuilding the gmsh mesh instead of reusing an existing file.")
+    parser.add_argument("--view-gmsh", action="store_true", help="Preview the gmsh model before meshing.")
+    parser.add_argument(
+        "--refine-initial",
+        dest="refine_initial",
+        action="store_true",
+        help="Apply asymmetric refinement around the beam in the initial mesh.",
+    )
+    parser.add_argument(
+        "--no-refine-initial",
+        dest="refine_initial",
+        action="store_false",
+        help="Skip initial refinement around the beam.",
+    )
+    parser.add_argument("--refine-levels", type=int, default=int(os.getenv("BEAM_REFINE_LEVELS", "2")), help="Number of refinement expansion layers.")
+    parser.add_argument("--refine-band", type=float, default=None, help="Optional refinement band half-width around the beam (override default heuristic).")
+    parser.add_argument("--plot-mesh", dest="plot_mesh", action="store_true", help="Plot the initial mesh/level-set using plot_mesh_2.")
+    parser.add_argument("--no-plot-mesh", dest="plot_mesh", action="store_false", help="Disable initial mesh plotting.")
+    parser.add_argument("--plot-mesh-file", type=Path, default=None, help="If set, save the mesh plot to this path.")
+    parser.add_argument("--plot-only", dest="plot_only", action="store_true", help="Plot the initial mesh and exit.")
+    parser.set_defaults(
+        refine_initial=os.getenv("REFINE_INITIAL", "1") != "0",
+        plot_mesh=os.getenv("PLOT_MESH", "0") != "0",
+        plot_only=os.getenv("PLOT_ONLY", "0") != "0",
+    )
+    return parser.parse_args()
+
+
+ARGS = _parse_args()
+
+# -----------------------------------------------------------------------------
 # Problem parameters (Turek–Hron FSI-2)
 # -----------------------------------------------------------------------------
 H = 0.41
@@ -109,9 +164,9 @@ POINT_B = (0.15, 0.2)
 POINT_A_INITIAL = (0.6, 0.2) # Point A will change while Point B is fixed
 
 BETA_PENALTY = 90.0 * MU_F
-DT = float(os.getenv("DT", "0.005"))
-POLY_ORDER = int(os.getenv("POLY_ORDER", "2"))
-MESH_SIZE = float(os.getenv("MESH_SIZE", "0.025"))
+DT = float(ARGS.dt)
+POLY_ORDER = int(ARGS.poly_order)
+MESH_SIZE = float(ARGS.mesh_size)
 
 # -----------------------------------------------------------------------------
 # Mesh and boundary helpers
@@ -122,6 +177,421 @@ def _count_segments(width: float, mesh_size: float, *, min_cells: int = 1) -> in
     if width <= 1.0e-12:
         return 0
     return max(min_cells, int(math.ceil(width / mesh_size)))
+
+
+def _nodes_for_length(length: float, mesh_size: float, *, min_nodes: int = 3) -> int:
+    segments = max(1, int(round(length / mesh_size)))
+    return max(min_nodes, segments + 1)
+
+
+def build_blocked_gmsh_mesh(path: Path, mesh_size: float, poly_order: int, *, view: bool = False) -> None:
+    """
+    Build a blocked, beam-aligned O-grid mesh with gmsh.
+    """
+    if gmsh is None:
+        raise RuntimeError("Gmsh backend requested but the gmsh Python module is not available.")
+
+    gmsh.initialize()
+    try:
+        gmsh.model.add("turek_fsi_blocked")
+        occ = gmsh.model.occ
+
+        # Helper registries ---------------------------------------------------
+        def _point_key(x: float, y: float) -> tuple[float, float]:
+            return (round(float(x), 12), round(float(y), 12))
+
+        point_lookup: dict[tuple[float, float], int] = {}
+        point_coords: dict[int, tuple[float, float]] = {}
+
+        def add_point(x: float, y: float) -> int:
+            key = _point_key(x, y)
+            if key in point_lookup:
+                return point_lookup[key]
+            tag = occ.addPoint(x, y, 0.0)
+            point_lookup[key] = tag
+            point_coords[tag] = (float(x), float(y))
+            return tag
+
+        line_lookup: dict[tuple[int, int], int] = {}
+        line_lengths: dict[int, float] = {}
+        line_target_nodes: dict[int, int] = {}
+        line_meta: dict[int, tuple[int, int]] = {}
+
+        def register_line(tag: int, start: int, end: int, length: float) -> None:
+            line_lookup[(start, end)] = tag
+            line_lengths[tag] = length
+
+        def oriented_line(start: int, end: int) -> int:
+            tag = line_lookup.get((start, end))
+            if tag is not None:
+                return tag
+            tag = line_lookup.get((end, start))
+            if tag is None:
+                raise KeyError(f"No curve between points {start} and {end}.")
+            return -tag
+
+        boundary_edges: dict[str, list[int]] = {"inlet": [], "outlet": [], "walls": [], "cylinder": []}
+
+        def add_line(start: int, end: int, boundary: str | None = None) -> int:
+            tag = occ.addLine(start, end)
+            x0, y0 = point_coords[start]
+            x1, y1 = point_coords[end]
+            length = math.hypot(x1 - x0, y1 - y0)
+            register_line(tag, start, end, length)
+            line_meta[tag] = (start, end)
+            if boundary:
+                boundary_edges[boundary].append(tag)
+            line_target_nodes[tag] = line_target_nodes.get(tag, _nodes_for_length(length, mesh_size))
+            return tag
+
+        def _coord_index(seq: Sequence[float], value: float) -> int:
+            for i, v in enumerate(seq):
+                if abs(v - value) <= 1.0e-12:
+                    return i
+            raise ValueError(f"{value} not found in coordinate list.")
+
+        def _arc_length(a_tag: int, b_tag: int) -> float:
+            xa, ya = point_coords[a_tag]
+            xb, yb = point_coords[b_tag]
+            ang_a = math.atan2(ya - CENTER[1], xa - CENTER[0])
+            ang_b = math.atan2(yb - CENTER[1], xb - CENTER[0])
+            delta = ang_b - ang_a
+            if delta <= 0.0:
+                delta += 2.0 * math.pi
+            return RADIUS * delta
+
+        # Beam-aware square around the cylinder --------------------------------
+        beam_x0 = CENTER[0] + RADIUS
+        beam_x1 = beam_x0 + BEAM_LENGTH
+        beam_y0 = BEAM_CENTER[1] - 0.5 * BEAM_HEIGHT
+        beam_y1 = BEAM_CENTER[1] + 0.5 * BEAM_HEIGHT
+
+        pad = max(0.6 * mesh_size, 0.008)
+        hx = max(RADIUS + pad, min(CENTER[0] - pad, L - CENTER[0] - pad, 0.35))
+        hy = max(RADIUS + pad, min(CENTER[1] - pad, H - CENTER[1] - pad, 0.35))
+        if hx <= RADIUS or hy <= RADIUS:
+            raise RuntimeError("Beam-aware O-grid collapsed; increase mesh size or adjust parameters.")
+
+        square_left = CENTER[0] - hx
+        square_right = CENTER[0] + hx
+        square_bottom = CENTER[1] - hy
+        square_top = CENTER[1] + hy
+
+        beam_nodes = max(4, _nodes_for_length(BEAM_HEIGHT, mesh_size, min_nodes=4))
+
+        x_coords = sorted({0.0, square_left, square_right, beam_x0, beam_x1, L})
+        y_coords = sorted({0.0, square_bottom, beam_y0, CENTER[1], beam_y1, square_top, H})
+
+        x_interval_nodes = []
+        for ix in range(len(x_coords) - 1):
+            length = x_coords[ix + 1] - x_coords[ix]
+            x_interval_nodes.append(_nodes_for_length(length, mesh_size))
+
+        y_interval_nodes = []
+        for iy in range(len(y_coords) - 1):
+            length = y_coords[iy + 1] - y_coords[iy]
+            count = _nodes_for_length(length, mesh_size)
+            if y_coords[iy] >= square_bottom - 1.0e-12 and y_coords[iy + 1] <= square_top + 1.0e-12:
+                count = max(count, beam_nodes)
+            y_interval_nodes.append(count)
+
+        grid_points: dict[tuple[int, int], int] = {}
+        for ix, x in enumerate(x_coords):
+            for iy, y in enumerate(y_coords):
+                grid_points[(ix, iy)] = add_point(x, y)
+
+        def _inside_inner(x_mid: float, y_mid: float) -> bool:
+            return (square_left < x_mid < square_right) and (square_bottom < y_mid < square_top)
+
+        horizontal_lines: dict[tuple[int, int], int] = {}
+        for iy, y in enumerate(y_coords):
+            for ix in range(len(x_coords) - 1):
+                x0, x1 = x_coords[ix], x_coords[ix + 1]
+                if _inside_inner(0.5 * (x0 + x1), y):
+                    continue
+                boundary = None
+                if abs(y - 0.0) <= 1.0e-12 or abs(y - H) <= 1.0e-12:
+                    boundary = "walls"
+                tag = add_line(grid_points[(ix, iy)], grid_points[(ix + 1, iy)], boundary=boundary)
+                horizontal_lines[(iy, ix)] = tag
+                line_target_nodes[tag] = max(line_target_nodes.get(tag, 0), x_interval_nodes[ix])
+
+        vertical_lines: dict[tuple[int, int], int] = {}
+        for ix, x in enumerate(x_coords):
+            for iy in range(len(y_coords) - 1):
+                y0, y1 = y_coords[iy], y_coords[iy + 1]
+                if _inside_inner(x, 0.5 * (y0 + y1)):
+                    continue
+                boundary = None
+                if abs(x - 0.0) <= 1.0e-12:
+                    boundary = "inlet"
+                elif abs(x - L) <= 1.0e-12:
+                    boundary = "outlet"
+                tag = add_line(grid_points[(ix, iy)], grid_points[(ix, iy + 1)], boundary=boundary)
+                vertical_lines[(ix, iy)] = tag
+                line_target_nodes[tag] = max(line_target_nodes.get(tag, 0), y_interval_nodes[iy])
+
+        fluid_surfaces: list[int] = []
+        surface_loops: list[list[int]] = []
+        for ix in range(len(x_coords) - 1):
+            for iy in range(len(y_coords) - 1):
+                xm = 0.5 * (x_coords[ix] + x_coords[ix + 1])
+                ym = 0.5 * (y_coords[iy] + y_coords[iy + 1])
+                if _inside_inner(xm, ym):
+                    continue
+                loop = [
+                    horizontal_lines[(iy, ix)],
+                    vertical_lines[(ix + 1, iy)],
+                    -horizontal_lines[(iy + 1, ix)],
+                    -vertical_lines[(ix, iy)],
+                ]
+                cloop = occ.addCurveLoop(loop)
+                fluid_surfaces.append(occ.addPlaneSurface([cloop]))
+                surface_loops.append(loop)
+
+        # Beam-aware O-grid ring around the circle -----------------------------
+        x_right_idx = _coord_index(x_coords, square_right)
+        x_left_idx = _coord_index(x_coords, square_left)
+        y_bot_idx = _coord_index(y_coords, square_bottom)
+        y_top_idx = _coord_index(y_coords, square_top)
+        y_beam_bot_idx = _coord_index(y_coords, beam_y0)
+        y_beam_top_idx = _coord_index(y_coords, beam_y1)
+        y_mid_idx = _coord_index(y_coords, CENTER[1])
+
+        # Build square boundary points aligned with grid intersections to avoid T-junctions.
+        y_seq = [y_bot_idx, y_beam_bot_idx, y_mid_idx, y_beam_top_idx, y_top_idx]
+        top_x_indices = sorted(
+            {idx for idx, xv in enumerate(x_coords) if square_left - 1e-12 <= xv <= square_right + 1e-12},
+            reverse=True,
+        )
+
+        def _append_unique(coords_list: list[tuple[int, int]], coord: tuple[int, int]) -> None:
+            if not coords_list or coords_list[-1] != coord:
+                coords_list.append(coord)
+
+        square_point_coords: list[tuple[int, int]] = []
+        # right edge bottom→top
+        for yi in y_seq:
+            _append_unique(square_point_coords, (x_right_idx, yi))
+        # top edge right→left
+        for idx in top_x_indices[1:]:
+            _append_unique(square_point_coords, (idx, y_top_idx))
+        # left edge top→bottom (skip repeating top)
+        for yi in reversed(y_seq[:-1]):
+            _append_unique(square_point_coords, (x_left_idx, yi))
+        # bottom edge left→right (skip left corner)
+        bot_x_indices = sorted({idx for idx in top_x_indices}, reverse=False)
+        for idx in bot_x_indices[1:]:
+            _append_unique(square_point_coords, (idx, y_bot_idx))
+        # close by omitting duplicate of starting point
+        if square_point_coords and square_point_coords[-1] == square_point_coords[0]:
+            square_point_coords.pop()
+
+        square_points = [grid_points[(ix, iy)] for ix, iy in square_point_coords]
+
+        center_pt = add_point(CENTER[0], CENTER[1])
+
+        def _circle_point_through_square(nid_square: int) -> int:
+            xs, ys = point_coords[nid_square]
+            vec = np.array([xs - CENTER[0], ys - CENTER[1]], float)
+            rlen = float(np.hypot(vec[0], vec[1]))
+            if rlen <= 1.0e-14:
+                raise RuntimeError("Square point coincides with circle center.")
+            scale = RADIUS / rlen
+            xc = CENTER[0] + scale * vec[0]
+            yc = CENTER[1] + scale * vec[1]
+            return add_point(xc, yc)
+
+        circle_points = [_circle_point_through_square(pid) for pid in square_points]
+
+        arc_lines: list[int] = []
+        for i in range(len(circle_points)):
+            start = circle_points[i]
+            end = circle_points[(i + 1) % len(circle_points)]
+            tag = occ.addCircleArc(start, center_pt, end)
+            length = _arc_length(start, end)
+            register_line(tag, start, end, length)
+            line_target_nodes[tag] = max(line_target_nodes.get(tag, 0), _nodes_for_length(length, mesh_size))
+            boundary_edges["cylinder"].append(tag)
+            arc_lines.append(tag)
+
+        square_segments: list[int] = []
+        def _segment_target_nodes(a_tag: int, b_tag: int) -> int:
+            xa, ya = point_coords[a_tag]
+            xb, yb = point_coords[b_tag]
+            if abs(ya - yb) <= 1.0e-12:
+                ix0 = _coord_index(x_coords, min(xa, xb))
+                return x_interval_nodes[ix0]
+            if abs(xa - xb) <= 1.0e-12:
+                iy0 = _coord_index(y_coords, min(ya, yb))
+                return y_interval_nodes[iy0]
+            return _nodes_for_length(math.hypot(xb - xa, yb - ya), mesh_size)
+
+        for i in range(len(square_points)):
+            a = square_points[i]
+            b = square_points[(i + 1) % len(square_points)]
+            try:
+                seg = oriented_line(a, b)
+            except KeyError:
+                seg = add_line(a, b)
+            square_segments.append(seg)
+            seg_tag = abs(seg)
+            line_target_nodes[seg_tag] = max(line_target_nodes.get(seg_tag, 0), _segment_target_nodes(a, b))
+
+        radial_nodes = max(beam_nodes, _nodes_for_length(max(hx, hy) - RADIUS, mesh_size, min_nodes=4))
+        radial_lines: list[int] = []
+        for i, (c_pt, s_pt) in enumerate(zip(circle_points, square_points)):
+            tag = add_line(c_pt, s_pt)
+            default_nodes = max(radial_nodes, beam_nodes)
+            line_target_nodes[tag] = max(default_nodes, line_target_nodes.get(tag, default_nodes))
+            radial_lines.append(tag)
+
+        for i, arc in enumerate(arc_lines):
+            seg_tag = abs(square_segments[i])
+            a = square_points[i]
+            b = square_points[(i + 1) % len(square_points)]
+            seg_nodes = _segment_target_nodes(a, b)
+            arc_nodes = _nodes_for_length(line_lengths[arc], mesh_size)
+            pair_count = max(seg_nodes, arc_nodes)
+            xa, ya = point_coords[a]
+            xb, yb = point_coords[b]
+            if abs(ya - yb) <= 1.0e-12:
+                ix0 = _coord_index(x_coords, min(xa, xb))
+                x_interval_nodes[ix0] = max(x_interval_nodes[ix0], pair_count)
+                pair_count = max(pair_count, x_interval_nodes[ix0])
+            elif abs(xa - xb) <= 1.0e-12:
+                iy0 = _coord_index(y_coords, min(ya, yb))
+                y_interval_nodes[iy0] = max(y_interval_nodes[iy0], pair_count)
+                pair_count = max(pair_count, y_interval_nodes[iy0])
+            line_target_nodes[arc] = pair_count
+            line_target_nodes[seg_tag] = pair_count
+
+            ra = radial_lines[i]
+            rb = radial_lines[(i + 1) % len(radial_lines)]
+            radial_count = max(
+                pair_count,
+                line_target_nodes.get(ra, radial_nodes),
+                line_target_nodes.get(rb, radial_nodes),
+                radial_nodes,
+            )
+            line_target_nodes[ra] = radial_count
+            line_target_nodes[rb] = radial_count
+
+        for (iy, ix), tag in horizontal_lines.items():
+            line_target_nodes[tag] = max(line_target_nodes.get(tag, 0), x_interval_nodes[ix])
+        for (ix, iy), tag in vertical_lines.items():
+            line_target_nodes[tag] = max(line_target_nodes.get(tag, 0), y_interval_nodes[iy])
+        for i, seg in enumerate(square_segments):
+            a = square_points[i]
+            b = square_points[(i + 1) % len(square_points)]
+            xa, ya = point_coords[a]
+            xb, yb = point_coords[b]
+            if abs(ya - yb) <= 1.0e-12:
+                ix0 = _coord_index(x_coords, min(xa, xb))
+                target = x_interval_nodes[ix0]
+            elif abs(xa - xb) <= 1.0e-12:
+                iy0 = _coord_index(y_coords, min(ya, yb))
+                target = y_interval_nodes[iy0]
+            else:
+                target = line_target_nodes.get(abs(seg), _segment_target_nodes(a, b))
+            line_target_nodes[abs(seg)] = max(line_target_nodes.get(abs(seg), 0), target)
+            line_target_nodes[arc_lines[i]] = max(line_target_nodes.get(arc_lines[i], 0), target)
+
+        for i in range(len(arc_lines)):
+            pair = max(line_target_nodes.get(arc_lines[i], 0), line_target_nodes.get(abs(square_segments[i]), 0))
+            line_target_nodes[arc_lines[i]] = pair
+            line_target_nodes[abs(square_segments[i])] = pair
+            rad_pair = max(
+                line_target_nodes.get(radial_lines[i], 0),
+                line_target_nodes.get(radial_lines[(i + 1) % len(radial_lines)], 0),
+            )
+            line_target_nodes[radial_lines[i]] = rad_pair
+            line_target_nodes[radial_lines[(i + 1) % len(radial_lines)]] = rad_pair
+
+        for i in range(len(circle_points)):
+            next_i = (i + 1) % len(circle_points)
+            loop = [
+                arc_lines[i],
+                radial_lines[next_i],
+                -square_segments[i],
+                -radial_lines[i],
+            ]
+            cloop = occ.addCurveLoop(loop)
+            fluid_surfaces.append(occ.addPlaneSurface([cloop]))
+            surface_loops.append(loop)
+
+        for tag, loop in zip(fluid_surfaces, surface_loops):
+            if len(loop) != 4:
+                continue
+            a = abs(loop[0])
+            b = abs(loop[1])
+            c = abs(loop[2])
+            d = abs(loop[3])
+            na = line_target_nodes.get(a)
+            nc = line_target_nodes.get(c)
+            nb = line_target_nodes.get(b)
+            nd = line_target_nodes.get(d)
+            if na != nc or nb != nd:
+                def _edge_info(edge_tag: int) -> str:
+                    pts = line_meta.get(abs(edge_tag))
+                    if pts:
+                        p0, p1 = pts
+                        x0, y0 = point_coords[p0]
+                        x1, y1 = point_coords[p1]
+                        return f"{abs(edge_tag)}:({x0:.4f},{y0:.4f})->({x1:.4f},{y1:.4f})"
+                    return str(abs(edge_tag))
+                raise RuntimeError(
+                    f"Transfinite mismatch on surface {tag}: "
+                    f"edges {[ _edge_info(e) for e in loop ]} have node counts {(na, nc, nb, nd)}"
+                )
+
+        occ.synchronize()
+        gmsh.model.mesh.setCompound(2, fluid_surfaces)
+
+        gmsh.model.addPhysicalGroup(2, fluid_surfaces, tag=1)
+        gmsh.model.setPhysicalName(2, 1, "fluid")
+        boundary_tag_hints = {"inlet": 11, "outlet": 12, "walls": 13, "cylinder": 14}
+        for name, tag_hint in boundary_tag_hints.items():
+            edges = sorted(set(boundary_edges[name]))
+            if not edges:
+                continue
+            tag = gmsh.model.addPhysicalGroup(1, edges, tag=tag_hint)
+            gmsh.model.setPhysicalName(1, tag, name)
+
+        radial_set = set(radial_lines)
+        for tag, length in line_lengths.items():
+            target_nodes = int(line_target_nodes.get(tag, _nodes_for_length(length, mesh_size)))
+            progression = 1.0
+            if tag in radial_set:
+                progression = 1.12
+            gmsh.model.mesh.setTransfiniteCurve(tag, target_nodes, "Progression", progression)
+
+        for surf in fluid_surfaces:
+            gmsh.model.mesh.setTransfiniteSurface(surf)
+            gmsh.model.mesh.setRecombine(2, surf)
+
+        gmsh.option.setNumber("Mesh.Algorithm", 8)
+        gmsh.option.setNumber("Mesh.RecombineAll", 1)
+        gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 1)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
+        gmsh.option.setNumber("General.Verbosity", 1)
+        gmsh.option.setNumber("Mesh.HighOrderOptimize", 0)
+        gmsh.option.setNumber("Mesh.SecondOrderLinear", 1)
+
+        gmsh.model.mesh.generate(2)
+        gmsh.model.mesh.setOrder(int(poly_order))
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if view:
+            try:
+                gmsh.fltk.initialize()
+                gmsh.fltk.run()
+            except Exception:
+                print("Gmsh GUI not available; skipping mesh preview.")
+        gmsh.write(str(path))
+    finally:
+        gmsh.finalize()
 
 
 def build_structured_channel_mesh(mesh_size: float, poly_order: int) -> Mesh:
@@ -178,6 +648,50 @@ def build_structured_channel_mesh(mesh_size: float, poly_order: int) -> Mesh:
         element_type="quad",
         poly_order=poly_order,
     )
+    tag_channel_boundaries(mesh, mesh_size)
+    return mesh
+
+
+def _load_gmsh_mesh(mesh_size: float, poly_order: int, *, mesh_file: Path | None, rebuild: bool, view: bool) -> tuple[Mesh, Path | None]:
+    if gmsh is None:
+        raise RuntimeError("Gmsh backend requested but gmsh is not available.")
+    mesh_path = mesh_file.expanduser().resolve() if mesh_file is not None else None
+    if mesh_path is not None:
+        if rebuild or not mesh_path.exists():
+            print(f"Generating gmsh blocked mesh at {mesh_path} (h={mesh_size}, Q{poly_order})")
+            build_blocked_gmsh_mesh(mesh_path, mesh_size, poly_order, view=view)
+        else:
+            print(f"Reusing gmsh mesh at {mesh_path}")
+        return mesh_from_gmsh(mesh_path), mesh_path
+
+    with TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir) / "turek_fsi_block.msh"
+        print(f"Generating temporary gmsh blocked mesh (h={mesh_size}, Q{poly_order})")
+        build_blocked_gmsh_mesh(tmp_path, mesh_size, poly_order, view=view)
+        mesh = mesh_from_gmsh(tmp_path)
+    return mesh, None
+
+
+def build_channel_mesh(mesh_size: float, poly_order: int) -> Mesh:
+    """
+    Select mesh backend (gmsh blocked grid or legacy structured O-grid) and
+    validate the resulting mesh for Q{poly_order}.
+    """
+    backend = getattr(ARGS, "mesh_backend", "gmsh")
+    if backend == "gmsh":
+        mesh, _ = _load_gmsh_mesh(
+            mesh_size,
+            poly_order,
+            mesh_file=getattr(ARGS, "mesh_file", None),
+            rebuild=bool(getattr(ARGS, "rebuild_mesh", False)),
+            view=bool(getattr(ARGS, "view_gmsh", False)),
+        )
+    else:
+        mesh = build_structured_channel_mesh(mesh_size, poly_order)
+    if mesh.element_type != "quad":
+        raise RuntimeError(f"Expected a quadrilateral mesh, got {mesh.element_type}.")
+    if int(mesh.poly_order) != int(poly_order):
+        raise RuntimeError(f"Gmsh mesh order {mesh.poly_order} does not match requested Q{poly_order}.")
     tag_channel_boundaries(mesh, mesh_size)
     return mesh
 
@@ -572,30 +1086,32 @@ Re = RHO_F * U_MAX * (2 * RADIUS) / MU_F
 print(f"Reynolds number: {Re:.2f}")
 
 # Mesh with rigid hole
-mesh = build_structured_channel_mesh(MESH_SIZE, POLY_ORDER)
+mesh = build_channel_mesh(MESH_SIZE, POLY_ORDER)
 
 # Beam level set (reference configuration)
 beam_ref_ls = BeamLevelSet(center=BEAM_CENTER, Lb=BEAM_LENGTH, Hb=BEAM_HEIGHT)
 
 # Optional asymmetric refinement around the beam to concentrate cells (with hanging nodes)
-refine_levels = int(os.getenv("BEAM_REFINE_LEVELS", "2"))
-refine_band_env = os.getenv("BEAM_REFINE_BAND", "")
-refine_band = float(refine_band_env) if refine_band_env else None
-mesh = asymmetric_refine_around_beam(mesh, beam_ref_ls, levels=refine_levels, band=refine_band)
-if os.getenv("PLOT_BEAM_REFINEMENT", "0") != "0":
+if ARGS.refine_initial:
+    refine_levels = int(getattr(ARGS, "refine_levels", 2))
+    refine_band = getattr(ARGS, "refine_band", None)
+    mesh = asymmetric_refine_around_beam(mesh, beam_ref_ls, levels=refine_levels, band=refine_band)
+
+if ARGS.plot_mesh:
     ax = plot_mesh_2(mesh, level_set=beam_ref_ls, show=False)
-    out = os.getenv("PLOT_BEAM_REFINEMENT_FILE", "")
-    if out:
+    out_path = getattr(ARGS, "plot_mesh_file", None)
+    if out_path:
         import matplotlib.pyplot as plt
-        plt.savefig(out, dpi=200, bbox_inches="tight")
-        print(f"Saved refinement plot to {out}")
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        print(f"Saved mesh plot to {out_path}")
     else:
         import matplotlib.pyplot as plt
         plt.show()
-if os.getenv("PLOT_BEAM_REFINEMENT_ONLY", "0") != "0":
-    print("Exiting after beam refinement visualization (PLOT_BEAM_REFINEMENT_ONLY=1).")
-    import sys
-    sys.exit(0)
+    if getattr(ARGS, "plot_only", False):
+        import sys
+        sys.exit(0)
 
 ls_me = MixedElement(mesh, field_specs={"phi_beam": 1})
 ls_dh = DofHandler(ls_me, method="cg")
