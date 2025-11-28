@@ -240,7 +240,8 @@ def test_phi_changed_detector_cut_volume(backend):
     mesh.classify_elements(ls0)
     mesh.classify_edges(ls0)
     mesh.build_interface_segments(ls0)
-    assert mesh.element_bitset("cut").cardinality() > 0
+    cut_ids = np.asarray(mesh.element_bitset("cut").to_indices(), dtype=np.int32)
+    assert cut_ids.size > 0
 
     me = MixedElement(mesh, field_specs={"u_pos_x": 1})
     dh = DofHandler(me, method="cg")
@@ -251,15 +252,20 @@ def test_phi_changed_detector_cut_volume(backend):
     form = u * v * dx(level_set=ls0, metadata={"q": 2, "side": "+"})
     eq = Equation(form, None)
     kernels = compile_multi(eq, dof_handler=dh, mixed_element=me, backend="jit")
-    vol_kernels = [k for k in kernels if k.domain == "volume" and k.side in ("+","-")]
+    vol_kernels = [k for k in kernels if k.domain == "volume" and k.side in ("+", "-")]
     assert vol_kernels, "expected a volume kernel"
-    ker = vol_kernels[0]
+    ker = None
+    for k in vol_kernels:
+        eids_arr = np.asarray(k.static_args.get("eids", []), dtype=np.int32)
+        if np.array_equal(np.sort(eids_arr), np.sort(cut_ids)) or k.static_args.get("_phi_sig") is not None:
+            ker = k
+            break
+    assert ker is not None, "expected a cut-volume kernel with phi signatures"
     old_static = ker.static_args
     old_eids = np.asarray(old_static.get("eids", []), dtype=np.int32)
-    assert old_eids.size > 0
-    old_sig = np.asarray(old_static.get("_phi_sig"))
-    if old_sig.size == 0 or old_sig.dtype == object:
-        pytest.skip("phi signatures not available for cut volume kernel")
+    assert np.array_equal(np.sort(old_eids), np.sort(cut_ids))
+    old_sig = np.asarray(old_static.get("_phi_sig"), dtype=float)
+    assert old_sig.size > 0
 
     mesh.classify_elements(ls1)
     mesh.classify_edges(ls1)
@@ -269,9 +275,7 @@ def test_phi_changed_detector_cut_volume(backend):
     new_static = ker.static_args
     new_eids = np.asarray(new_static.get("eids", []), dtype=np.int32)
     assert np.array_equal(np.sort(old_eids), np.sort(new_eids))
-    new_sig = np.asarray(new_static.get("_phi_sig"))
-    if new_sig.size == 0 or new_sig.dtype == object:
-        pytest.skip("phi signatures not available for cut volume kernel")
+    new_sig = np.asarray(new_static.get("_phi_sig"), dtype=float)
     assert new_sig.shape == old_sig.shape
     assert not np.allclose(new_sig, old_sig)
 
@@ -284,29 +288,30 @@ def test_phi_changed_detector_ghost(backend):
     nodes, elems, edges, corners = structured_quad(1.0, 1.0, nx=2, ny=1, poly_order=1)
     mesh = Mesh(nodes=nodes, element_connectivity=elems, edges_connectivity=edges,
                 elements_corner_nodes=corners, element_type="quad", poly_order=1)
-    ls0 = AffineLevelSet(a=1.0, b=0.0, c=-0.5)
-    ls1 = AffineLevelSet(a=1.0, b=0.0, c=-0.4)
+    ls0 = AffineLevelSet(a=1.0, b=0.2, c=-0.45)
+    ls1 = AffineLevelSet(a=1.0, b=0.2, c=-0.35)
     mesh.classify_elements(ls0)
     mesh.classify_edges(ls0)
     mesh.build_interface_segments(ls0)
-    assert mesh.edge_bitset("ghost").cardinality() >= 0  # ghost set may be empty for this tiny mesh
+    ghost_ids = np.asarray(mesh.edge_bitset("ghost").to_indices(), dtype=np.int32)
+    assert ghost_ids.size > 0, "expected at least one ghost edge in this setup"
 
     me = MixedElement(mesh, field_specs={"u_pos_x": 1})
     dh = DofHandler(me, method="cg")
     u = Function("u_pos_x", field_name="u_pos_x", dof_handler=dh)
     v = TestFunction("u_pos_x", "u_pos_x", dh)
-    # use dInterface to ensure ghost builder still runs if present; if no ghost edges, skip
-    form = u * v * dInterface(level_set=ls0, metadata={"q": 2})
+    from pycutfem.ufl.measures import dGhost
+    form = u * v * dGhost(level_set=ls0, metadata={"q": 2})
     eq = Equation(form, None)
     kernels = compile_multi(eq, dof_handler=dh, mixed_element=me, backend="jit")
     ghost_kernels = [k for k in kernels if k.domain == "ghost_edge"]
-    if not ghost_kernels:
-        pytest.skip("no ghost edges in this mesh setup")
+    assert ghost_kernels, "expected ghost-edge kernel"
     ker = ghost_kernels[0]
     old_static = ker.static_args
     old_eids = np.asarray(old_static.get("eids", []), dtype=np.int32)
-    assert old_eids.size >= 0
-    old_sig = np.asarray(old_static.get("_phi_sig"))
+    assert np.array_equal(np.sort(old_eids), np.sort(ghost_ids))
+    old_sig = np.asarray(old_static.get("_phi_sig"), dtype=float)
+    assert old_sig.size > 0
 
     mesh.classify_elements(ls1)
     mesh.classify_edges(ls1)
@@ -316,7 +321,6 @@ def test_phi_changed_detector_ghost(backend):
     new_static = ker.static_args
     new_eids = np.asarray(new_static.get("eids", []), dtype=np.int32)
     assert np.array_equal(np.sort(old_eids), np.sort(new_eids))
-    new_sig = np.asarray(new_static.get("_phi_sig"))
-    if old_sig.size and new_sig.size:
-        assert new_sig.shape == old_sig.shape
-        assert not np.allclose(new_sig, old_sig)
+    new_sig = np.asarray(new_static.get("_phi_sig"), dtype=float)
+    assert new_sig.shape == old_sig.shape
+    assert not np.allclose(new_sig, old_sig)

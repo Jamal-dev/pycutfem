@@ -450,6 +450,34 @@ def scatter_tensor_to_union(values, mapping, n_union, dtype):
     return res
 
 
+@numba.njit(cache=True, fastmath=True)
+def pad_basis_to_union(local, mapping, n_union, s0, s1, dtype):
+    """
+    Pad a 1D local basis/derivative vector to the union layout using a side map.
+    """
+    if n_union == local.shape[0]:
+        return local.copy()
+    m = mapping.shape[0]
+    loc_vec = local if local.shape[0] == m else local[s0:s1]
+    out = np.zeros(n_union, dtype=dtype)
+    for j in range(m):
+        idx = mapping[j]
+        if 0 <= idx < n_union:
+            out[idx] = loc_vec[j]
+    return out
+
+
+@numba.njit(cache=True, fastmath=True)
+def pushforward_grad_to_union(d10, d01, j_inv, mapping, n_union, s0, s1, dtype):
+    """
+    Push forward (d10,d01) with J^{-1} and scatter to the union layout.
+    """
+    grad_loc = np.stack((d10, d01), axis=1) @ j_inv.copy()
+    if grad_loc.shape[0] == n_union:
+        return grad_loc
+    return scatter_tensor_to_union(grad_loc[s0:s1], mapping, n_union, dtype)
+
+
 @numba.njit(cache=True)
 def compute_physical_hessian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
     """

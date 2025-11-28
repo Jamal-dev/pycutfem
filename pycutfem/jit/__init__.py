@@ -780,6 +780,16 @@ def compile_multi(form, *, dof_handler, mixed_element,
             bs_def   = intg.measure.defined_on
             edges = (bs_def & bs_ghost) if bs_def is not None else bs_ghost
             def _ghost_static(ls_obj, reuse_static=None):
+                mesh_obj = mixed_element.mesh
+                nodes_xy = getattr(mesh_obj, "nodes_x_y_pos", None)
+
+                def _edge_midpoint(eid: int) -> np.ndarray:
+                    edge = mesh_obj.edges_list[int(eid)]
+                    idx = np.asarray(edge.all_nodes if edge.all_nodes else edge.nodes, dtype=int)
+                    if nodes_xy is None:
+                        raise ValueError("Mesh nodes are unavailable for midpoint computation.")
+                    return np.asarray(nodes_xy[idx].mean(axis=0), dtype=float)
+
                 old_static = reuse_static if isinstance(reuse_static, dict) else None
                 old_phi_sig = _phi_signature_from_static(old_static)
                 old_eids = np.asarray(old_static.get("eids", []), dtype=np.int32) if old_static else np.zeros(0, dtype=np.int32)
@@ -796,8 +806,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         need_recompute.append(int(eid))
                         continue
                     try:
-                        xc = np.asarray(mixed_element.mesh.edges_list[int(eid)].midpoint(), float)
-                        val = float(ls_obj(xc))
+                        val = float(ls_obj(_edge_midpoint(eid)))
                     except Exception:
                         val = old_phi_sig.get(int(eid), None)
                     old_val = old_phi_sig.get(int(eid), None)
@@ -839,10 +848,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 merged["is_interface"] = False
                 merged["entity_kind"] = "edge"
                 try:
-                    merged["_phi_sig"] = np.asarray(
-                        [float(ls_obj(np.asarray(mixed_element.mesh.edges_list[int(e)].midpoint(), float))) for e in all_eids],
-                        dtype=float,
-                    )
+                    merged["_phi_sig"] = np.asarray([float(ls_obj(_edge_midpoint(e))) for e in all_eids], dtype=float)
                 except Exception:
                     pass
                 return merged
