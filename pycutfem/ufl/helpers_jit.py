@@ -129,6 +129,27 @@ def _build_jit_kernel_args(       # ← signature unchanged
         dtype=np.float64
     )
 
+    # Active fields & union mask for this kernel
+    def _active_field_order():
+        seen = set(); order = []
+        for op in ir:
+            if hasattr(op, "field_names"):
+                for f in getattr(op, "field_names", []) or []:
+                    if f in seen or f not in mixed_element.field_names:
+                        continue
+                    seen.add(f); order.append(f)
+        if not order:
+            order = list(mixed_element.field_names)
+        return order
+
+    _active_fields = _active_field_order()
+    _active_cols = np.concatenate(
+        [np.arange(mixed_element.component_dof_slices[f].start,
+                   mixed_element.component_dof_slices[f].stop, dtype=np.int32)
+         for f in _active_fields]
+    ) if _active_fields else np.arange(mixed_element.n_dofs_local, dtype=np.int32)
+    _active_n = int(len(_active_cols))
+
     def _expand_per_element(ref_tab: np.ndarray) -> np.ndarray:
         """
         Replicate a reference-space table so that shape[0] == n_elem.
@@ -171,7 +192,11 @@ def _build_jit_kernel_args(       # ← signature unchanged
         me   = mixed_element
         mesh = me.mesh
         nE, nQ, _ = pts.shape
-        n_union = _n_union_for_eid(eids[0])
+        gmap = pre_built.get("gdofs_map", None)
+        if gmap is not None:
+            n_union = np.asarray(gmap).shape[1]
+        else:
+            n_union = _n_union_for_eid(eids[0])
         tab = np.empty((nE, nQ, n_union), dtype=np.float64)
 
         # Prefer cached reference coordinates if available to avoid inverse mapping
@@ -217,7 +242,11 @@ def _build_jit_kernel_args(       # ← signature unchanged
         me   = mixed_element
         mesh = me.mesh
         nE, nQ, _ = pts.shape
-        n_union = _n_union_for_eid(eids[0])
+        gmap = pre_built.get("gdofs_map", None)
+        if gmap is not None:
+            n_union = np.asarray(gmap).shape[1]
+        else:
+            n_union = _n_union_for_eid(eids[0])
         tab = np.empty((nE, nQ, n_union), dtype=np.float64)
 
         qref_raw = pre_built.get("qref")
@@ -577,7 +606,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
     # cache gdofs_map for coefficient gathering
     if gdofs_map is None:
         gdofs_map = np.vstack([
-            dof_handler.get_elemental_dofs(eid)
+            np.asarray(dof_handler.get_elemental_dofs(eid), dtype=np.int32)[_active_cols]
             for eid in range(mixed_element.mesh.n_elements)
         ]).astype(np.int32)
 

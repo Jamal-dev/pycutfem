@@ -164,10 +164,44 @@ class NumbaCodeGen:
             raise ValueError("NumbaCodeGen requires an instance of a MixedElement.")
         self.me = mixed_element
         self.n_dofs_local = self.me.n_dofs_local
+        self.active_fields: tuple[str, ...] | None = None
+        self.active_slices: dict[str, slice] = {}
+        self.active_n_dofs: int = self.n_dofs_local
         self.spatial_dim = self.me.mesh.spatial_dim
         self.last_side_for_store = "" # Track side for detJ
         self.dtype = "np.float64"  # Default data type for arrays
         self.on_facet = on_facet
+
+    def _field_slice(self, field: str) -> slice:
+        """Return the contiguous slice for an active field."""
+        if field in self.active_slices:
+            return self.active_slices[field]
+        return self.me.component_dof_slices[field]
+
+    def _field_nloc(self, field: str) -> int:
+        sl = self._field_slice(field)
+        return int(sl.stop - sl.start)
+
+    def _init_active_fields(self, ir_sequence):
+        if self.active_fields is not None:
+            return
+        seen = set(); order = []
+        for op in ir_sequence:
+            if isinstance(op, LoadVariable):
+                for f in op.field_names or []:
+                    if f in seen:
+                        continue
+                    seen.add(f)
+                    order.append(f)
+        if not order:
+            order = list(self.me.field_names)
+        self.active_fields = tuple(order)
+        start = 0
+        for f in self.active_fields:
+            nloc = self._field_nloc(f)
+            self.active_slices[f] = slice(start, start + nloc)
+            start += nloc
+        self.active_n_dofs = start
 
     # ------------------------------------------------------------------
     # Helpers for robust per-component side resolution / mapping
@@ -214,6 +248,7 @@ class NumbaCodeGen:
         functional_shape = None # () for scalar, (k,) for vector, 
         # Track names of Function/VectorFunction objects that provide coefficients
         solution_func_names = set()
+        self._init_active_fields(ir_sequence)
 
         def new_var(prefix="tmp"):
             nonlocal var_counter
@@ -295,7 +330,7 @@ class NumbaCodeGen:
                         f"{out} = np.empty(({k_comps}, n_union, 2, 2), dtype={self.dtype})",
                     ]
                     for i, fn in enumerate(a.field_names):
-                        s0 = self.me.component_dof_slices[fn].start; s1 = self.me.component_dof_slices[fn].stop
+                        s0 = self._field_slice(fn).start; s1 = self._field_slice(fn).stop
                         Hloc = new_var("Hloc")
                         body_lines += [
                             f"A  = {jinv}[e, q]",
@@ -313,7 +348,7 @@ class NumbaCodeGen:
                             body_lines += [
                                 f"{me} = {map_arr}[e]",
                                 # slice down to this field first
-                                f"{Hsub} = {Hloc}[{s0}:{s1}, :, :]",
+                                f"{Hsub} = {Hloc}[{self._field_slice(fn).start}:{self._field_slice(fn).stop}, :, :]",
                                 f"{Hpad} = scatter_tensor_to_union({Hsub}, {me}, n_union, {self.dtype})",
                                 f"{out}[{i}] = {Hpad}",
                             ]
@@ -337,7 +372,7 @@ class NumbaCodeGen:
 
                     body_lines += [f"{out} = np.zeros(({k_comps}, 2, 2), dtype={self.dtype})"]
                     for i, fn in enumerate(a.field_names):
-                        s0 = self.me.component_dof_slices[fn].start; s1 = self.me.component_dof_slices[fn].stop
+                        s0 = self._field_slice(fn).start; s1 = self._field_slice(fn).stop
                         Hloc = new_var("Hloc")
                         body_lines += [
                             f"A  = {jinv}[e, q]",
@@ -414,7 +449,7 @@ class NumbaCodeGen:
                         f"{out} = np.empty(({k_comps}, n_union), dtype={self.dtype})",
                     ]
                     for i, fn in enumerate(a.field_names):
-                        s0 = self.me.component_dof_slices[fn].start; s1 = self.me.component_dof_slices[fn].stop
+                        s0 = self._field_slice(fn).start; s1 = self._field_slice(fn).stop
                         laploc = new_var("laploc")
                         body_lines += [
                             f"A  = {jinv}[e, q]",
@@ -453,7 +488,7 @@ class NumbaCodeGen:
 
                     body_lines += [f"{out} = np.zeros(({k_comps},), dtype={self.dtype})"]
                     for i, fn in enumerate(a.field_names):
-                        s0 = self.me.component_dof_slices[fn].start; s1 = self.me.component_dof_slices[fn].stop
+                        s0 = self._field_slice(fn).start; s1 = self._field_slice(fn).stop
                         laploc = new_var("laploc")
                         body_lines += [
                             f"A  = {jinv}[e, q]",
@@ -624,8 +659,8 @@ class NumbaCodeGen:
                         for i, bq in enumerate(basis_vars_at_q):
                             fld_i = field_names[i]
                             # field slice in the element-union vector
-                            s0 = self.me.component_dof_slices[fld_i].start
-                            s1 = self.me.component_dof_slices[fld_i].stop
+                            s0 = self._field_slice(fld_i).start
+                            s1 = self._field_slice(fld_i).stop
                             side_tag = self._component_side_tag(op.side, op.field_sides, fld_i, i)
                             map_array_name = f"{side_tag}_map_{fld_i}"
                             required_args.add(map_array_name)
@@ -642,7 +677,7 @@ class NumbaCodeGen:
                     # ---------- volume / interface -----------------------------------
                     else:
                         final_basis_var = basis_vars_at_q[0]
-                        n_dofs = self.me.n_dofs_local
+                        n_dofs = self.active_n_dofs
 
                     ox, oy = deriv_order
                     tot = ox + oy
@@ -688,7 +723,7 @@ class NumbaCodeGen:
                                 f"{prow} = {gloc}[:, {comp}]",
                             ]
                             if op.side:
-                                s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
+                                s0 = self._field_slice(fn).start; s1 = self._field_slice(fn).stop
                                 side_tag = self._component_side_tag(op.side, op.field_sides, fn, i)
                                 map_arr = f"{side_tag}_map_{fn}"
                                 required_args.add(map_arr)
@@ -702,10 +737,10 @@ class NumbaCodeGen:
                         var_name = new_var("d1_stack")
                         if not op.is_vector:
                             body_lines.append(f"{var_name} = {rows[0]}[None, :].copy()")
-                            shape = (1, -1 if op.side else self.n_dofs_local)
+                            shape = (1, -1 if op.side else self.active_n_dofs)
                         else:
                             body_lines.append(f"{var_name} = np.stack(({', '.join(rows)}))")
-                            shape = (len(field_names), -1 if op.side else self.n_dofs_local)
+                            shape = (len(field_names), -1 if op.side else self.active_n_dofs)
                         stack.append(StackItem(var_name=var_name, role=op.role, shape=shape,
                                             is_vector=op.is_vector, field_names=field_names, 
                                             parent_name=op.name, side=op.side,
@@ -748,7 +783,7 @@ class NumbaCodeGen:
                         row = new_var("drow")
                         # pull derivative arrays; slice ONLY on sided paths
                         if op.side:
-                            s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
+                            s0 = self._field_slice(fn).start; s1 = self._field_slice(fn).stop
                             for tag, nm in names.items():
                                 body_lines += [f"{tag}_q = {nm}[e, q]",
                                                f"{tag}_s = {tag}_q[{s0}:{s1}]"]
@@ -820,7 +855,7 @@ class NumbaCodeGen:
                             side_tag = self._component_side_tag(op.side, op.field_sides, fn, i)
                             map_arr = f"{side_tag}_map_{fn}"
                             required_args.add(map_arr)
-                            s0 = self.me.component_dof_slices[fn].start; s1 = self.me.component_dof_slices[fn].stop
+                            s0 = self._field_slice(fn).start; s1 = self._field_slice(fn).stop
                             pad = new_var("pad")
                             body_lines.append(
                                 f"{pad} = pad_basis_to_union({row}, {map_arr}[e], n_union, {s0}, {s1}, {self.dtype})"
@@ -833,10 +868,10 @@ class NumbaCodeGen:
                     var_name = new_var("d_stack")
                     if not op.is_vector:
                         body_lines.append(f"{var_name} = {out_rows[0]}[None, :].copy()")
-                        shape = (1, -1 if op.side else self.n_dofs_local)
+                        shape = (1, -1 if op.side else self.active_n_dofs)
                     else:
                         body_lines.append(f"{var_name} = np.stack(({', '.join(out_rows)}))")
-                        shape = (len(field_names), -1 if op.side else self.n_dofs_local)
+                        shape = (len(field_names), -1 if op.side else self.active_n_dofs)
 
                     stack.append(StackItem(var_name=var_name, role=op.role, shape=shape,
                                         is_vector=op.is_vector, field_names=field_names, 
@@ -902,8 +937,8 @@ class NumbaCodeGen:
                         for i, b_var in enumerate(basis_vars_at_q):
                             fld_i = field_names[i]
                             # field slice bounds for conditional owner→field alignment
-                            s0 = self.me.component_dof_slices[fld_i].start
-                            s1 = self.me.component_dof_slices[fld_i].stop
+                            s0 = self._field_slice(fld_i).start
+                            s1 = self._field_slice(fld_i).stop
                             side_tag = self._component_side_tag(op.side, op.field_sides, fld_i, i)
                             map_array_name = f"{side_tag}_map_{fld_i}"
                             required_args.add(map_array_name)
@@ -968,7 +1003,7 @@ class NumbaCodeGen:
                                 # pad to union if sided
                                 rv = new_var("rv")
                                 if op.side:
-                                    s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
+                                    s0 = self._field_slice(fn).start; s1 = self._field_slice(fn).stop
                                     side_tag = self._component_side_tag(op.side, op.field_sides, fn, i)
                                     map_arr = f"{side_tag}_map_{fn}"
                                     required_args.add(map_arr)
@@ -1008,7 +1043,7 @@ class NumbaCodeGen:
                                     body_lines.append(f"d{tg}_q = {nm}[e,q]")
 
                                 if op.side:
-                                    s0 = self.me.slice(fn).start; s1 = self.me.slice(fn).stop
+                                    s0 = self._field_slice(fn).start; s1 = self._field_slice(fn).stop
                                     for tg in need_tags:
                                         body_lines.append(f"d{tg}_s = d{tg}_q[{s0}:{s1}]")
                                     body_lines.append("nloc = d20_s.shape[0]")
@@ -1074,7 +1109,7 @@ class NumbaCodeGen:
                                     side_tag = self._component_side_tag(op.side, op.field_sides, fn, 0)
                                     map_arr = f"{side_tag}_map_{fn}"
                                     required_args.add(map_arr)
-                                    s0 = self.me.component_dof_slices[fn].start; s1 = self.me.component_dof_slices[fn].stop
+                                    s0 = self._field_slice(fn).start; s1 = self._field_slice(fn).stop
                                     pad = new_var("pad")
                                     body_lines.append(
                                         f"{pad} = pad_basis_to_union({row}, {map_arr}[e], n_union, {s0}, {s1}, {self.dtype})"
@@ -1301,8 +1336,8 @@ class NumbaCodeGen:
                         required_args.add("gdofs_map")  # used for union width
                         for i, fld_i in enumerate(a.field_names):
                             # DOF slice for this component inside the union
-                            s0 = self.me.component_dof_slices[fld_i].start
-                            s1 = self.me.component_dof_slices[fld_i].stop
+                            s0 = self._field_slice(fld_i).start
+                            s1 = self._field_slice(fld_i).stop
 
                             # decide per-component side tag ("pos" or "neg")
                             side_tag = self._component_side_tag(a.side, a.field_sides, fld_i, i)
@@ -1337,7 +1372,7 @@ class NumbaCodeGen:
                             body_lines.append(f"{pg_loc} = {grad_tab_names[i]}[e, q] @ {jinv_q}.copy()")
                             phys.append(pg_loc)
 
-                        n_dofs = self.n_dofs_local
+                        n_dofs = self.active_n_dofs
 
                     # Stack per-component physical gradients
                     if not a.is_vector:
@@ -1370,8 +1405,8 @@ class NumbaCodeGen:
 
                         if a.side in ("+", "-"):
                             # Sided: use r10/r01 on the correct side and the side map
-                            s0 = self.me.component_dof_slices[fld].start
-                            s1 = self.me.component_dof_slices[fld].stop
+                            s0 = self._field_slice(fld).start
+                            s1 = self._field_slice(fld).stop
 
                             side_tag = self._component_side_tag(a.side, getattr(a, 'field_sides', None), fld, i)
                             d10 = f"r10_{fld}_{side_tag}"
@@ -3154,7 +3189,7 @@ def {kernel_name}(
         {", ".join(param_order)}
     ):
     num_elements        = qp_phys.shape[0]
-    # n_dofs_per_element  = {self.n_dofs_local}
+    # n_dofs_per_element  = {self.active_n_dofs}
     n_dofs_per_element  = gdofs_map.shape[1]            # 9 for volume, 15 on ghost edge
     # print(f"num_elements: {{num_elements}},n_dofs_per_element: {{n_dofs_per_element}}")
     # print(f"number of quadrature points: {{qw.shape[1]}}")

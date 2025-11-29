@@ -26,6 +26,83 @@ def _form_rank(expr):
     return 2 if (has_trial and has_test) else 1 if (has_test) else 0
 
 
+# ----------------------------------------------------------------------
+#  Active-field bookkeeping (per-kernel)
+# ----------------------------------------------------------------------
+def _active_field_order(ir_sequence, me) -> tuple[str, ...]:
+    """Return the ordered list of fields actually referenced in the IR."""
+    seen = set()
+    order: list[str] = []
+    for op in ir_sequence:
+        if hasattr(op, "field_names"):
+            for f in getattr(op, "field_names", []) or []:
+                if f in seen:
+                    continue
+                if f in getattr(me, "field_names", ()):
+                    seen.add(f)
+                    order.append(f)
+    if not order:
+        order = list(getattr(me, "field_names", ()))
+    return tuple(order)
+
+
+def _active_columns(me, active_fields: tuple[str, ...]) -> np.ndarray:
+    """Concatenate component slices for the active fields."""
+    cols: list[int] = []
+    for f in active_fields:
+        sl = getattr(me, "component_dof_slices")[f]
+        cols.extend(range(sl.start, sl.stop))
+    return np.asarray(cols, dtype=np.int32)
+
+
+def _compress_static_for_active(static: dict[str, Any],
+                                me,
+                                active_cols: np.ndarray) -> dict[str, Any]:
+    """
+    Reduce union-sized arrays/maps to the active DOF columns only.
+    Keeps geometry untouched; only reshapes arrays that carry union dimensions
+    or union-mapping indices.
+    """
+    full_n = int(getattr(me, "n_dofs_local", active_cols.size))
+    if active_cols.size == full_n:
+        return static
+
+    col_map = -np.ones(full_n, dtype=np.int32)
+    for i, old in enumerate(active_cols):
+        col_map[int(old)] = int(i)
+
+    def _remap_union(arr: np.ndarray) -> np.ndarray:
+        for ax in range(1, arr.ndim):
+            if arr.shape[ax] == full_n:
+                idx = [slice(None)] * arr.ndim
+                idx[ax] = active_cols
+                return arr[tuple(idx)]
+        return arr
+
+    def _remap_map(arr: np.ndarray) -> np.ndarray:
+        out = -np.ones_like(arr)
+        m = (arr >= 0) & (arr < full_n)
+        out[m] = col_map[arr[m]]
+        return out
+
+    compressed: dict[str, Any] = {}
+    for k, v in static.items():
+        if k == "gdofs_map" and isinstance(v, np.ndarray):
+            compressed[k] = v[:, active_cols]
+            continue
+        if isinstance(v, np.ndarray):
+            if k.startswith(("pos_map", "neg_map")) and v.ndim == 2 and v.dtype.kind in {"i", "u"}:
+                compressed[k] = _remap_map(v)
+                continue
+            arr = v
+            if arr.ndim >= 2 and arr.dtype.kind != "O":
+                arr = _remap_union(arr)
+            compressed[k] = arr
+        else:
+            compressed[k] = v
+    return compressed
+
+
 # New Newton: Create a class to handle data preparation and execution.
 class KernelRunner:
     def __init__(self, kernel, param_order, ir_sequence, dof_handler):
@@ -390,6 +467,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
         # Compile the backend once; reuse for all subsets of this integral
         runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element, on_facet=on_facet)
+        active_fields = _active_field_order(ir, mixed_element)
+        active_cols = _active_columns(mixed_element, active_fields)
 
         # Max derivative order we need in the geometry *inverse* jets (A, A2, A3, A4)
         def _max_required_order(ir_seq):
@@ -422,9 +501,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 geom["is_interface"] = False
                 geom["is_ghost"] = False
                 gdofs_map = np.vstack([
-                    dof_handler.get_elemental_dofs(e)
+                    np.asarray(dof_handler.get_elemental_dofs(e), dtype=np.int32)[active_cols]
                     for e in range(mesh.n_elements)
                 ]).astype(np.int32)
+                geom["gdofs_map"] = gdofs_map
 
                 if "eids" not in geom:
                     geom["eids"] = np.arange(mesh.n_elements, dtype=np.int32)
@@ -437,6 +517,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     param_order = runner.param_order,
                     pre_built   = geom,
                 ))
+                static = _compress_static_for_active(static, mixed_element, active_cols)
                 kernels.append(_IntegralKernel(runner, static, "volume", eids=np.asarray(geom.get("eids", []), dtype=np.int32)))
                 continue  # done with this integral
 
@@ -533,7 +614,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 if qref_slice is not None:
                     geom_full["qref"] = qref_slice
 
-                gdofs_map_full = np.vstack([dof_handler.get_elemental_dofs(e) for e in full_ids]).astype(np.int32)
+                gdofs_map_full = np.vstack([
+                    np.asarray(dof_handler.get_elemental_dofs(e), dtype=np.int32)[active_cols]
+                    for e in full_ids
+                ]).astype(np.int32)
                 geom_full["gdofs_map"] = gdofs_map_full
 
                 static_full = dict(geom_full)
@@ -549,6 +633,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         pre_built=geom_full,
                     )
                 )
+                static_full = _compress_static_for_active(static_full, mixed_element, active_cols)
                 _full_cache["ids"] = full_ids
                 _full_cache["static"] = static_full
                 return static_full
@@ -610,7 +695,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     if "detJ" not in geom_cut:
                         geom_cut["detJ"] = np.ones_like(geom_cut["qw"])
 
-                    gdofs_map_cut = np.vstack([dof_handler.get_elemental_dofs(e) for e in cut_eids_new]).astype(np.int32)
+                    gdofs_map_cut = np.vstack([
+                        np.asarray(dof_handler.get_elemental_dofs(e), dtype=np.int32)[active_cols]
+                        for e in cut_eids_new
+                    ]).astype(np.int32)
+                    geom_cut["gdofs_map"] = gdofs_map_cut
                     static_new = {"gdofs_map": gdofs_map_cut, "eids": cut_eids_new, "owner_id": cut_eids_new, **geom_cut}
                     static_new.update(
                         _build_jit_kernel_args(
@@ -624,6 +713,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             pre_built=geom_cut,
                         )
                     )
+                    static_new = _compress_static_for_active(static_new, mixed_element, active_cols)
 
                 # Merge reused rows with newly computed ones; arrays are built in target cut_ids order
                 merged = _merge_static_arrays(cut_ids, old_static, static_new)
@@ -726,8 +816,13 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     eids_arr = np.asarray(geom.get("eids", new_ids), dtype=np.int32)
                     if "gdofs_map" in geom:
                         gdofs_map = np.asarray(geom["gdofs_map"], dtype=np.int32)
+                        gdofs_map = gdofs_map[:, active_cols] if gdofs_map.size else gdofs_map
                     else:
-                        gdofs_map = np.vstack([dof_handler.get_elemental_dofs(e) for e in eids_arr]).astype(np.int32)
+                        gdofs_map = np.vstack([
+                            np.asarray(dof_handler.get_elemental_dofs(e), dtype=np.int32)[active_cols]
+                            for e in eids_arr
+                        ]).astype(np.int32)
+                    geom["gdofs_map"] = gdofs_map
 
                     static_new = {"gdofs_map": gdofs_map, **geom}
                     static_new.update(
@@ -742,6 +837,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             pre_built=geom,
                         )
                     )
+                    static_new = _compress_static_for_active(static_new, mixed_element, active_cols)
 
                 merged = _merge_static_arrays(new_eids_full, old_static, static_new)
                 merged["is_interface"] = True
@@ -827,7 +923,9 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     )
                     geom["is_ghost"] = True
                     geom["is_interface"] = False
-                    gdofs_map = np.asarray(geom.get("gdofs_map", np.zeros((len(new_ids), n_loc), dtype=np.int32)), dtype=np.int32)
+                    gdofs_map_raw = np.asarray(geom.get("gdofs_map", np.zeros((len(new_ids), n_loc), dtype=np.int32)), dtype=np.int32)
+                    gdofs_map = gdofs_map_raw[:, active_cols] if gdofs_map_raw.size else gdofs_map_raw
+                    geom["gdofs_map"] = gdofs_map
 
                     static_new = {"gdofs_map": gdofs_map, **geom}
                     static_new.update(
@@ -842,6 +940,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             pre_built=geom,
                         )
                     )
+                    static_new = _compress_static_for_active(static_new, mixed_element, active_cols)
 
                 merged = _merge_static_arrays(all_eids, old_static, static_new)
                 merged["is_ghost"] = True
