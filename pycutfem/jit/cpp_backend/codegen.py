@@ -424,6 +424,15 @@ class CppCodeGen:
                         emit_line(f"Eigen::MatrixXd {nm} = {b.name}.transpose() * {a.name};")
                         stack.append(StackItem(nm, "mat", "value", (-1, -1)))
                         continue
+                    # Scalar test/trial basis (1,n) multiplied by value vector (k,) -> vector of length n
+                    if a.kind == "vec" and b.kind == "mat" and b.role in {"test", "trial"} and b.shape[0] == 1:
+                        emit_line(f"Eigen::VectorXd {nm} = {b.name}.row(0).transpose() * {a.name}(0);")
+                        stack.append(StackItem(nm, "vec", b.role, (-1,), b.field_names, b.parent))
+                        continue
+                    if a.kind == "mat" and a.role in {"test", "trial"} and a.shape[0] == 1 and b.kind == "vec":
+                        emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() * {b.name}(0);")
+                        stack.append(StackItem(nm, "vec", a.role, (-1,), a.field_names, a.parent))
+                        continue
                     if a.kind == "scalar" and b.kind == "grad":
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
                         emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {b.name}[_i] * {a.name};")
@@ -577,8 +586,18 @@ class CppCodeGen:
                 a = stack.pop()
                 nm = new_tmp("inner")
                 if a.kind == "grad" and b.kind == "grad":
-                    emit_line(f"Eigen::MatrixXd {nm} = inner_grad_grad({a.name}, {b.name});")
-                    stack.append(StackItem(nm, "mat", "value", (-1, -1)))
+                    # Preserve test/trial orientation for LHS matrices
+                    if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
+                        test_var  = a.name if a.role == "test" else b.name
+                        trial_var = a.name if a.role == "trial" else b.name
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_grad_grad({test_var}, {trial_var});")
+                        test_shape = a.shape if a.role == "test" else b.shape
+                        trial_shape = a.shape if a.role == "trial" else b.shape
+                        out_shape = (test_shape[1], trial_shape[1]) if len(test_shape) > 1 and len(trial_shape) > 1 else (-1, -1)
+                        stack.append(StackItem(nm, "mat", "value", out_shape))
+                    else:
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_grad_grad({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "mat", "value", (-1, -1)))
                 elif a.kind == "mat" and b.kind == "mat":
                     emit_line(f"double {nm} = ({a.name}.cwiseProduct({b.name})).sum();")
                     stack.append(StackItem(nm, "scalar", "value", ()))
@@ -601,8 +620,7 @@ class CppCodeGen:
                     stack.append(StackItem(nm, "mat", a.role, a.shape[::-1] if len(a.shape)>=2 else a.shape))
                 elif a.kind == "grad":
                     emit_line(f"auto {nm} = transpose_grad_stack({a.name});")
-                    new_shape = (a.shape[2], a.shape[1], a.shape[0]) if len(a.shape) >= 3 else a.shape
-                    stack.append(StackItem(nm, "grad", a.role, new_shape, a.field_names))
+                    stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names))
                 else:
                     raise NotImplementedError("Transpose only implemented for matrices/grad stacks")
             elif isinstance(op, Determinant):

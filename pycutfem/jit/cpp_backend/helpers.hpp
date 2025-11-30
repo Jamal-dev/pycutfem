@@ -373,18 +373,12 @@ inline py::array_t<double> transpose_grad_tensor(const py::array_t<double>& tens
     auto in_v = tensor.unchecked<3>();
     auto out_v = out.mutable_unchecked<3>();
 
-    for (ssize_t i=0; i<k; ++i) {
-        for (ssize_t j=0; j<n; ++j) {
-            for (ssize_t l=0; l<d; ++l) {
-                // Swap dim 0 (component) and dim 2 (spatial)
-                // In generic transpose(grad u), (grad u)_ij = d u_i / d x_j
-                // (grad u)^T _ij = d u_j / d x_i
-                // Here tensor is G_ijk = d psi_j / d x_k (for component i) -- wait.
-                // Standard layout (k, n, d) -> basis 'n' for component 'k', deriv 'd'.
-                // If we transpose the gradient of the vector field:
-                // We map input (k, n, d) -> output (d, n, k).
-                // But numba_helper returns (k, n, d) and assumes k=d.
-                out_v(l, j, i) = in_v(i, j, l);
+    // Mirror numba_helpers.transpose_grad_tensor:
+    // res[i, n, l] = tensor[l, n, i] (assumes square k==d)
+    for (ssize_t j = 0; j < n; ++j) {
+        for (ssize_t i = 0; i < k; ++i) {
+            for (ssize_t l = 0; l < d; ++l) {
+                out_v(i, j, l) = in_v(l, j, i);
             }
         }
     }
@@ -652,12 +646,14 @@ inline std::vector<Eigen::MatrixXd> dot_grad_basis_with_grad_value(
 
     int n = static_cast<int>(grad_basis[0].rows()); // The 'n' dimension
     int d = static_cast<int>(grad_basis[0].cols()); // The 'd' dimension (Inner dimension)
+    if (k != d) {
+        throw std::runtime_error("dot_grad_basis: currently expects k == d (square vector gradients)");
+    }
 
     // 2. Validation
-    // For Matrix Multiplication (n,d) * (rows, cols), 
-    // the rows of grad_value must match 'd'.
-    if (grad_value.rows() != d) {
-        throw std::runtime_error("dot_grad_basis: Dimension mismatch. Basis cols (d) must match grad_value rows.");
+    // grad_value is the gradient of a vector value: shape (k, d).
+    if (grad_value.rows() != k || grad_value.cols() != d) {
+        throw std::runtime_error("dot_grad_basis: Dimension mismatch. grad_value must be (k, d).");
     }
     
     // Let 'j' be the number of columns in grad_value
@@ -760,14 +756,21 @@ inline std::vector<Eigen::MatrixXd> transpose_grad_stack(const std::vector<Eigen
     if (k == 0) return {};
     int n = static_cast<int>(tensor[0].rows());
     int d = static_cast<int>(tensor[0].cols());
-    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(d), Eigen::MatrixXd(n, k));
+    if (d != k) {
+        throw std::runtime_error("transpose_grad_stack expects square gradient (k == d).");
+    }
+    // Keep the outer vector sized by component axis (k) to mirror numba_helpers.
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k), Eigen::MatrixXd(n, d));
     for (int c = 0; c < k; ++c) {
         if (tensor[c].rows() != n || tensor[c].cols() != d) {
             throw std::runtime_error("transpose_grad_stack: inconsistent component shape");
         }
-        for (int j = 0; j < n; ++j) {
+    }
+    // out[i](j, r) = tensor[r](j, i)
+    for (int j = 0; j < n; ++j) {
+        for (int i = 0; i < k; ++i) {
             for (int r = 0; r < d; ++r) {
-                out[r](j, c) = tensor[c](j, r);
+                out[i](j, r) = tensor[r](j, i);
             }
         }
     }
