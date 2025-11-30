@@ -72,7 +72,11 @@ class CppCodeGen:
             LoadVariable,
             LoadConstant,
             LoadConstantArray,
+            LoadFacetNormal,
+            LoadFacetNormalComponent,
             Grad,
+            Hessian as IRHessian,
+            Laplacian as IRLaplacian,
             Div,
             BinaryOp,
             Dot,
@@ -122,6 +126,9 @@ class CppCodeGen:
         needs_b: set[str] = set()
         needs_g: set[str] = set()
         needs_u: set[str] = set()
+        needs_h: set[str] = set()
+        needs_hx: bool = False
+        needs_normals = False
         for op in ir_sequence:
             if isinstance(op, LoadVariable):
                 for fn in op.field_names or []:
@@ -129,6 +136,12 @@ class CppCodeGen:
                     needs_b.add(f"b_{fn}")
                 if op.role == "function":
                     needs_u.add(f"u_{op.name}_loc")
+            if isinstance(op, (IRHessian, IRLaplacian)):
+                needs_hx = True
+                for fn in getattr(op, "field_names", []) or []:
+                    needs_h.update({f"d10_{fn}", f"d01_{fn}", f"d20_{fn}", f"d11_{fn}", f"d02_{fn}"})
+            if isinstance(op, (LoadFacetNormal, LoadFacetNormalComponent)):
+                needs_normals = True
         for name in sorted(needs_b):
             if name not in param_order:
                 param_order.append(name)
@@ -136,6 +149,15 @@ class CppCodeGen:
             if name not in param_order:
                 param_order.append(name)
         for name in sorted(needs_u):
+            if name not in param_order:
+                param_order.append(name)
+        if needs_hx:
+            for base in ("Hxi0", "Hxi1"):
+                if base not in param_order:
+                    param_order.append(base)
+        if needs_normals and "normals" not in param_order:
+            param_order.append("normals")
+        for name in sorted(needs_h):
             if name not in param_order:
                 param_order.append(name)
         # If we saw gradient tables but no corresponding basis, add them.
@@ -159,6 +181,10 @@ class CppCodeGen:
             LoadVariable,
             LoadConstant,
             Grad,
+            Hessian as IRHessian,
+            Laplacian as IRLaplacian,
+            LoadFacetNormal,
+            LoadFacetNormalComponent,
             Div,
             BinaryOp,
             Dot,
@@ -217,8 +243,14 @@ class CppCodeGen:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
             if name.startswith("g_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
+            if name == "normals":
+                view_lines.append(f"    auto normals_view = normals.unchecked<3>();")
+            if name.startswith(("d10_", "d01_", "d20_", "d11_", "d02_")):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
             if name.startswith("u_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+            if name in {"Hxi0", "Hxi1"}:
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
 
         prologue = [
             "    ssize_t n_elem = qp_view.shape(0);",
@@ -276,6 +308,16 @@ class CppCodeGen:
                 emit_line("}")
                 emit_line("else { throw std::runtime_error(\"Unsupported constant array rank for C++ backend\"); }")
                 stack.append(StackItem(nm, kind, "const", shape))
+            elif isinstance(op, LoadFacetNormal):
+                nm = new_tmp("nrm")
+                emit_line(f"Eigen::Vector2d {nm};")
+                emit_line(f"{nm}(0) = normals_view(e,q,0);")
+                emit_line(f"{nm}(1) = normals_view(e,q,1);")
+                stack.append(StackItem(nm, "vec", "const", (2,)))
+            elif isinstance(op, LoadFacetNormalComponent):
+                nm = new_tmp("nrm_c")
+                emit_line(f"double {nm} = normals_view(e,q,{op.idx});")
+                stack.append(StackItem(nm, "scalar", "const", ()))
             elif isinstance(op, LoadVariable):
                 followed_by_diff = isinstance(next_op, (Grad,))
                 if op.role in {"test", "trial"} and op.deriv_order == (0, 0):
@@ -341,6 +383,97 @@ class CppCodeGen:
                     stack.append(StackItem(nm, "mat", "value", (k, 2), a.field_names, a.parent))
                 else:
                     raise NotImplementedError("Grad on unsupported item")
+            elif isinstance(op, IRHessian):
+                a = stack.pop()
+                if a.role in {"test", "trial"}:
+                    k = len(a.field_names)
+                    nm = new_tmp("hess")
+                    emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({k});")
+                    for idx, fn in enumerate(a.field_names):
+                        emit_line(f"{nm}[{idx}] = Eigen::MatrixXd(n_union, 4);")
+                        emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
+                        emit_line(f"    double d20 = d20_{fn}_view(e,q,j); double d11 = d11_{fn}_view(e,q,j); double d02 = d02_{fn}_view(e,q,j);")
+                        emit_line(f"    double d10 = d10_{fn}_view(e,q,j); double d01 = d01_{fn}_view(e,q,j);")
+                        emit_line(f"    double tmp00 = d20 * Jloc(0,0) + d11 * Jloc(1,0);")
+                        emit_line(f"    double tmp01 = d20 * Jloc(0,1) + d11 * Jloc(1,1);")
+                        emit_line(f"    double tmp10 = d11 * Jloc(0,0) + d02 * Jloc(1,0);")
+                        emit_line(f"    double tmp11 = d11 * Jloc(0,1) + d02 * Jloc(1,1);")
+                        emit_line(f"    double h00 = Jloc(0,0)*tmp00 + Jloc(1,0)*tmp10 + d10*Hx(0,0) + d01*Hy(0,0);")
+                        emit_line(f"    double h01 = Jloc(0,1)*tmp00 + Jloc(1,1)*tmp10 + d10*Hx(0,1) + d01*Hy(0,1);")
+                        emit_line(f"    double h10 = Jloc(0,0)*tmp01 + Jloc(1,0)*tmp11 + d10*Hx(1,0) + d01*Hy(1,0);")
+                        emit_line(f"    double h11 = Jloc(0,1)*tmp01 + Jloc(1,1)*tmp11 + d10*Hx(1,1) + d01*Hy(1,1);")
+                        emit_line(f"    {nm}[{idx}](j,0)=h00; {nm}[{idx}](j,1)=h01; {nm}[{idx}](j,2)=h10; {nm}[{idx}](j,3)=h11;");
+                        emit_line("}")
+                    stack.append(StackItem(nm, "hess", a.role, (k, -1, 2, 2), a.field_names, a.parent))
+                elif a.role == "value":
+                    k = len(a.field_names)
+                    nm = new_tmp("hessv")
+                    emit_line(f"Eigen::MatrixXd {nm}({k}, 4);")
+                    emit_line(f"{nm}.setZero();")
+                    coeff = f"u_{a.parent}_loc"
+                    for idx, fn in enumerate(a.field_names):
+                        s0 = field_slices.get(fn, slice(0, 0)).start
+                        s1 = field_slices.get(fn, slice(0, 0)).stop
+                        emit_line(f"for (ssize_t j={s0}; j<{s1}; ++j) {{")
+                        emit_line(f"    double coeff = {coeff}_view(e,j);")
+                        emit_line(f"    double d20 = d20_{fn}_view(e,q,j); double d11 = d11_{fn}_view(e,q,j); double d02 = d02_{fn}_view(e,q,j);")
+                        emit_line(f"    double d10 = d10_{fn}_view(e,q,j); double d01 = d01_{fn}_view(e,q,j);")
+                        emit_line(f"    double tmp00 = d20 * Jloc(0,0) + d11 * Jloc(1,0);")
+                        emit_line(f"    double tmp01 = d20 * Jloc(0,1) + d11 * Jloc(1,1);")
+                        emit_line(f"    double tmp10 = d11 * Jloc(0,0) + d02 * Jloc(1,0);")
+                        emit_line(f"    double tmp11 = d11 * Jloc(0,1) + d02 * Jloc(1,1);")
+                        emit_line(f"    double h00 = Jloc(0,0)*tmp00 + Jloc(1,0)*tmp10 + d10*Hx(0,0) + d01*Hy(0,0);")
+                        emit_line(f"    double h01 = Jloc(0,1)*tmp00 + Jloc(1,1)*tmp10 + d10*Hx(0,1) + d01*Hy(0,1);")
+                        emit_line(f"    double h10 = Jloc(0,0)*tmp01 + Jloc(1,0)*tmp11 + d10*Hx(1,0) + d01*Hy(1,0);")
+                        emit_line(f"    double h11 = Jloc(0,1)*tmp01 + Jloc(1,1)*tmp11 + d10*Hx(1,1) + d01*Hy(1,1);")
+                        emit_line(f"    {nm}({idx},0)+=coeff*h00; {nm}({idx},1)+=coeff*h01; {nm}({idx},2)+=coeff*h10; {nm}({idx},3)+=coeff*h11;");
+                        emit_line("}")
+                    stack.append(StackItem(nm, "hess", "value", (k, 2, 2), a.field_names, a.parent))
+                else:
+                    raise NotImplementedError("Hessian on unsupported item")
+            elif isinstance(op, IRLaplacian):
+                a = stack.pop()
+                if a.role in {"test", "trial"}:
+                    k = len(a.field_names)
+                    nm = new_tmp("lap")
+                    emit_line(f"Eigen::MatrixXd {nm}({k}, n_union);")
+                    for idx, fn in enumerate(a.field_names):
+                        emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
+                        emit_line(f"    double d20 = d20_{fn}_view(e,q,j); double d11 = d11_{fn}_view(e,q,j); double d02 = d02_{fn}_view(e,q,j);")
+                        emit_line(f"    double d10 = d10_{fn}_view(e,q,j); double d01 = d01_{fn}_view(e,q,j);")
+                        emit_line(f"    double tmp00 = d20 * Jloc(0,0) + d11 * Jloc(1,0);")
+                        emit_line(f"    double tmp01 = d20 * Jloc(0,1) + d11 * Jloc(1,1);")
+                        emit_line(f"    double tmp10 = d11 * Jloc(0,0) + d02 * Jloc(1,0);")
+                        emit_line(f"    double tmp11 = d11 * Jloc(0,1) + d02 * Jloc(1,1);")
+                        emit_line(f"    double h00 = Jloc(0,0)*tmp00 + Jloc(1,0)*tmp10 + d10*Hx(0,0) + d01*Hy(0,0);")
+                        emit_line(f"    double h11 = Jloc(0,1)*tmp01 + Jloc(1,1)*tmp11 + d10*Hx(1,1) + d01*Hy(1,1);")
+                        emit_line(f"    {nm}({idx}, j) = h00 + h11;");
+                        emit_line("}")
+                    stack.append(StackItem(nm, "mat", a.role, (k, -1), a.field_names, a.parent))
+                elif a.role == "value":
+                    k = len(a.field_names)
+                    nm = new_tmp("lapv")
+                    emit_line(f"Eigen::VectorXd {nm}({k});")
+                    emit_line(f"{nm}.setZero();")
+                    coeff = f"u_{a.parent}_loc"
+                    for idx, fn in enumerate(a.field_names):
+                        s0 = field_slices.get(fn, slice(0, 0)).start
+                        s1 = field_slices.get(fn, slice(0, 0)).stop
+                        emit_line(f"for (ssize_t j={s0}; j<{s1}; ++j) {{")
+                        emit_line(f"    double coeff = {coeff}_view(e,j);")
+                        emit_line(f"    double d20 = d20_{fn}_view(e,q,j); double d11 = d11_{fn}_view(e,q,j); double d02 = d02_{fn}_view(e,q,j);")
+                        emit_line(f"    double d10 = d10_{fn}_view(e,q,j); double d01 = d01_{fn}_view(e,q,j);")
+                        emit_line(f"    double tmp00 = d20 * Jloc(0,0) + d11 * Jloc(1,0);")
+                        emit_line(f"    double tmp01 = d20 * Jloc(0,1) + d11 * Jloc(1,1);")
+                        emit_line(f"    double tmp10 = d11 * Jloc(0,0) + d02 * Jloc(1,0);")
+                        emit_line(f"    double tmp11 = d11 * Jloc(0,1) + d02 * Jloc(1,1);")
+                        emit_line(f"    double h00 = Jloc(0,0)*tmp00 + Jloc(1,0)*tmp10 + d10*Hx(0,0) + d01*Hy(0,0);")
+                        emit_line(f"    double h11 = Jloc(0,1)*tmp01 + Jloc(1,1)*tmp11 + d10*Hx(1,1) + d01*Hy(1,1);")
+                        emit_line(f"    {nm}({idx}) += coeff * (h00 + h11);");
+                        emit_line("}")
+                    stack.append(StackItem(nm, "vec", "value", (k,), a.field_names, a.parent))
+                else:
+                    raise NotImplementedError("Laplacian on unsupported item")
             elif isinstance(op, Div):
                 a = stack.pop()
                 if a.kind == "grad":
@@ -509,7 +642,6 @@ class CppCodeGen:
                     stack.append(StackItem(nm, "mat", "value", (-1, -1)))
                 elif a.kind == "grad" and b.kind == "mat":
                     # grad(test/trial) with basis matrix -> standard assembly helper
-                    print(f"salma " * 10)
                     if a.role in {"test", "trial"} and b.role in {"value"}:
                         emit_line(f"auto {nm} = dot_grad_basis_with_grad_value({a.name}, {b.name});")
                         stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, a.parent))
@@ -545,6 +677,20 @@ class CppCodeGen:
                 elif a.kind == "grad" and b.kind == "vec":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_grad_basis_vector({a.name}, {b.name});")
                     stack.append(StackItem(nm, "mat", a.role, (a.shape[0], a.shape[1]), a.field_names, a.parent))
+                elif a.kind == "hess" and b.kind == "vec":
+                    if a.role in {"test", "trial"}:
+                        emit_line(f"auto {nm} = hessian_dot_vector_basis({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "grad", a.role, (a.shape[0], a.shape[1], 2), a.field_names, a.parent))
+                    else:
+                        emit_line(f"auto {nm} = hessian_dot_vector_value({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "mat", a.role, (a.shape[0], 2), a.field_names, a.parent))
+                elif a.kind == "vec" and b.kind == "hess":
+                    if b.role in {"test", "trial"}:
+                        emit_line(f"auto {nm} = vector_dot_hessian_basis({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "grad", b.role, (2, b.shape[1], 2), b.field_names, b.parent))
+                    else:
+                        emit_line(f"auto {nm} = vector_dot_hessian_value({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "mat", "value", (2, 2)))
                 elif a.kind == "grad" and b.kind == "grad":
                     emit_line(f"Eigen::MatrixXd {nm} = inner_grad_grad({a.name}, {b.name});")
                     stack.append(StackItem(nm, "mat", "value", (-1, -1)))
@@ -599,11 +745,38 @@ class CppCodeGen:
                         emit_line(f"Eigen::MatrixXd {nm} = inner_grad_grad({a.name}, {b.name});")
                         stack.append(StackItem(nm, "mat", "value", (-1, -1)))
                 elif a.kind == "mat" and b.kind == "mat":
-                    emit_line(f"double {nm} = ({a.name}.cwiseProduct({b.name})).sum();")
-                    stack.append(StackItem(nm, "scalar", "value", ()))
+                    if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
+                        test_var = a.name if a.role == "test" else b.name
+                        trial_var = a.name if a.role == "trial" else b.name
+                        emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({test_var}, {trial_var});")
+                        stack.append(StackItem(nm, "mat", "value", (-1, -1)))
+                    else:
+                        emit_line(f"double {nm} = ({a.name}.cwiseProduct({b.name})).sum();")
+                        stack.append(StackItem(nm, "scalar", "value", ()))
                 elif a.kind == "vec" and b.kind == "vec":
                     emit_line(f"double {nm} = {a.name}.dot({b.name});")
                     stack.append(StackItem(nm, "scalar", "value", ()))
+                elif a.kind == "vec" and b.kind == "mat":
+                    emit_line(f"Eigen::VectorXd {nm} = {b.name}.transpose() * {a.name};")
+                    stack.append(StackItem(nm, "vec", "value", (-1,)))
+                elif a.kind == "mat" and b.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.transpose() * {b.name};")
+                    stack.append(StackItem(nm, "vec", "value", (-1,)))
+                elif a.kind == "hess" and b.kind == "hess":
+                    if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
+                        test_var = a.name if a.role == "test" else b.name
+                        trial_var = a.name if a.role == "trial" else b.name
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_hessian_hessian({test_var}, {trial_var});")
+                        stack.append(StackItem(nm, "mat", "value", (-1, -1)))
+                    elif a.role == "value" and b.role in {"test", "trial"}:
+                        emit_line(f"Eigen::VectorXd {nm} = inner_hessian_const({b.name}, {a.name});")
+                        stack.append(StackItem(nm, "vec", "value", (-1,)))
+                    elif b.role == "value" and a.role in {"test", "trial"}:
+                        emit_line(f"Eigen::VectorXd {nm} = inner_hessian_const({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "vec", "value", (-1,)))
+                    else:
+                        emit_line(f"Eigen::MatrixXd {nm} = inner_hessian_hessian({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "mat", "value", (-1, -1)))
                 elif a.kind == "grad" and b.kind == "mat":
                     emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({a.name}, {b.name});")
                     stack.append(StackItem(nm, "vec", "value", (-1,)))
@@ -695,6 +868,17 @@ class CppCodeGen:
 
         loop_block = "\n".join(body_lines)
 
+        hxhy_lines: list[str] = []
+        if "Hxi0" in param_order and "Hxi1" in param_order:
+            hxhy_lines = [
+                "            Eigen::Matrix<double,2,2> Hx;",
+                "            Eigen::Matrix<double,2,2> Hy;",
+                "            Hx(0,0)=Hxi0_view(e,q,0,0); Hx(0,1)=Hxi0_view(e,q,0,1);",
+                "            Hx(1,0)=Hxi0_view(e,q,1,0); Hx(1,1)=Hxi0_view(e,q,1,1);",
+                "            Hy(0,0)=Hxi1_view(e,q,0,0); Hy(0,1)=Hxi1_view(e,q,0,1);",
+                "            Hy(1,0)=Hxi1_view(e,q,1,0); Hy(1,1)=Hxi1_view(e,q,1,1);",
+            ]
+
         full_src = (
             CPP_HEADER
             + f"""
@@ -709,6 +893,7 @@ static py::tuple {kernel_name}(
             Eigen::Matrix<double,2,2> Jloc;
             Jloc(0,0)=Jinv_view(e,q,0,0); Jloc(0,1)=Jinv_view(e,q,0,1);
             Jloc(1,0)=Jinv_view(e,q,1,0); Jloc(1,1)=Jinv_view(e,q,1,1);
+{chr(10).join(hxhy_lines)}
 {loop_block}
         }}
     }}

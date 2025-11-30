@@ -66,6 +66,57 @@ inline py::array_t<double> compute_physical_laplacian(const py::array_t<double>&
 }
 
 // ---------------------------------------------------------------------------
+// compute_physical_hessian (single component)
+// Mirrors pycutfem.jit.numba_helpers.compute_physical_hessian
+// ---------------------------------------------------------------------------
+inline py::array_t<double> compute_physical_hessian(const py::array_t<double>& d20,
+                                                    const py::array_t<double>& d11,
+                                                    const py::array_t<double>& d02,
+                                                    const py::array_t<double>& d10,
+                                                    const py::array_t<double>& d01,
+                                                    const py::array_t<double>& j_inv,
+                                                    const py::array_t<double>& hx,
+                                                    const py::array_t<double>& hy,
+                                                    py::object /*dtype*/ = py::none()) {
+    auto d20v = d20.unchecked<1>();
+    auto d11v = d11.unchecked<1>();
+    auto d02v = d02.unchecked<1>();
+    auto d10v = d10.unchecked<1>();
+    auto d01v = d01.unchecked<1>();
+    auto J    = j_inv.unchecked<2>(); // (2,2)
+    auto Hxv  = hx.unchecked<2>();    // (2,2)
+    auto Hyv  = hy.unchecked<2>();    // (2,2)
+
+    ssize_t nloc = d20v.shape(0);
+    std::vector<ssize_t> shape = {nloc, 2, 2};
+    py::array_t<double> out(shape);
+    auto ov = out.mutable_unchecked<3>();
+
+    for (ssize_t j = 0; j < nloc; ++j) {
+        double href00 = d20v(j);
+        double href01 = d11v(j);
+        double href11 = d02v(j);
+
+        double tmp00 = href00 * J(0, 0) + href01 * J(1, 0);
+        double tmp01 = href00 * J(0, 1) + href01 * J(1, 1);
+        double tmp10 = href01 * J(0, 0) + href11 * J(1, 0);
+        double tmp11 = href01 * J(0, 1) + href11 * J(1, 1);
+
+        double core00 = J(0, 0) * tmp00 + J(1, 0) * tmp10;
+        double core01 = J(0, 1) * tmp00 + J(1, 1) * tmp10;
+        double core10 = J(0, 0) * tmp01 + J(1, 0) * tmp11;
+        double core11 = J(0, 1) * tmp01 + J(1, 1) * tmp11;
+
+        ov(j, 0, 0) = core00 + d10v(j) * Hxv(0, 0) + d01v(j) * Hyv(0, 0);
+        ov(j, 0, 1) = core01 + d10v(j) * Hxv(0, 1) + d01v(j) * Hyv(0, 1);
+        ov(j, 1, 0) = core10 + d10v(j) * Hxv(1, 0) + d01v(j) * Hyv(1, 0);
+        ov(j, 1, 1) = core11 + d10v(j) * Hxv(1, 1) + d01v(j) * Hyv(1, 1);
+    }
+
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // pushforward_d3 (exact third-order pullback)
 // Mirrors pycutfem.jit.numba_helpers.pushforward_d3
 // ---------------------------------------------------------------------------
@@ -213,6 +264,59 @@ inline py::array_t<double> gradient_qp(const py::array_t<double>& u_e,
         Eigen::MatrixXd res = G.transpose() * U;
         return py::cast(res);
     }
+}
+
+// Laplacian evaluation at a qp
+inline py::object laplacian_qp(const py::array_t<double>& u_e,
+                               const py::array_t<double>& lap_phi_q) {
+    auto u_req = u_e.request();
+    auto l_req = lap_phi_q.request();
+    ssize_t ndof = l_req.shape[0];
+    Eigen::Map<const Eigen::VectorXd> lap((double*)l_req.ptr, ndof);
+
+    if (u_req.ndim == 1) {
+        Eigen::Map<const Eigen::VectorXd> u((double*)u_req.ptr, ndof);
+        double val = lap.dot(u);
+        return py::cast(val);
+    }
+    ssize_t ncomp = u_req.shape[1];
+    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+        U((double*)u_req.ptr, ndof, ncomp);
+    Eigen::VectorXd res = U.transpose() * lap;
+    return py::cast(res);
+}
+
+// Hessian evaluation at a qp
+inline py::object hessian_qp(const py::array_t<double>& u_e,
+                             const py::array_t<double>& hess_phi_q) {
+    auto u_req = u_e.request();
+    auto h_req = hess_phi_q.request();
+
+    ssize_t ndof = h_req.shape[0];
+    ssize_t dim  = h_req.shape[1];
+    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+        Hflat((double*)h_req.ptr, ndof, dim * dim);
+
+    if (u_req.ndim == 1) {
+        Eigen::Map<const Eigen::VectorXd> u((double*)u_req.ptr, ndof);
+        Eigen::VectorXd res = Hflat.transpose() * u; // (dim*dim,)
+        Eigen::MatrixXd out = Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
+            res.data(), dim, dim);
+        return py::cast(out);
+    }
+
+    ssize_t ncomp = u_req.shape[1];
+    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+        U((double*)u_req.ptr, ndof, ncomp);
+    Eigen::MatrixXd prod = U.transpose() * Hflat; // (ncomp, dim*dim)
+    std::vector<Eigen::MatrixXd> out;
+    out.reserve(static_cast<size_t>(ncomp));
+    for (ssize_t i = 0; i < ncomp; ++i) {
+        Eigen::MatrixXd m = Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
+            prod.row(i).data(), dim, dim);
+        out.push_back(m);
+    }
+    return py::cast(out);
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +671,119 @@ inline Eigen::VectorXd inner_grad_const(const std::vector<Eigen::MatrixXd>& grad
     for (int c = 0; c < k; ++c) {
         out += grad_test[c] * grad_val.row(c).transpose();
     }
+    return out;
+}
+
+// Inner product of Hessian stacks stored as (n,4) flattened blocks
+inline Eigen::MatrixXd inner_hessian_hessian(const std::vector<Eigen::MatrixXd>& test,
+                                             const std::vector<Eigen::MatrixXd>& trial) {
+    std::cout<< "-----------------inner_hessian_hessian---------------------"<<std::endl;
+    int k = static_cast<int>(test.size());
+    if (k == 0) return Eigen::MatrixXd();
+    int n_test = static_cast<int>(test[0].rows());
+    int n_trial = static_cast<int>(trial[0].rows());
+    Eigen::MatrixXd out = Eigen::MatrixXd::Zero(n_test, n_trial);
+    for (int c = 0; c < k; ++c) {
+        out += test[c] * trial[c].transpose();
+    }
+    return out;
+}
+
+// Inner of Hessian(value) (k,4) with Hessian(test) (k,n,4) -> (n,)
+inline Eigen::VectorXd inner_hessian_const(const std::vector<Eigen::MatrixXd>& hess_test,
+                                           const Eigen::MatrixXd& hess_value) {
+    std::cout<< "-----------------inner_hessian_const---------------------"<<std::endl;
+    int k = static_cast<int>(hess_test.size());
+    if (k == 0) return Eigen::VectorXd();
+    int n = static_cast<int>(hess_test[0].rows());
+    if (hess_value.rows() != k || hess_value.cols() != 4) {
+        throw std::runtime_error("inner_hessian_const: value Hessian must be (k,4)");
+    }
+    Eigen::VectorXd out = Eigen::VectorXd::Zero(n);
+    for (int c = 0; c < k; ++c) {
+        if (hess_test[c].cols() != 4 || hess_test[c].rows() != n) {
+            throw std::runtime_error("inner_hessian_const: inconsistent test Hessian shape");
+        }
+        out += hess_test[c] * hess_value.row(c).transpose();
+    }
+    return out;
+}
+
+// Hessian (basis/value flattened as (n,4) or (k,4)) dotted with spatial vector -> grad-like
+inline std::vector<Eigen::MatrixXd> hessian_dot_vector_basis(const std::vector<Eigen::MatrixXd>& hess,
+                                                             const Eigen::VectorXd& vec) {
+    std::cout<< "-----------------hessian_dot_vector_basis---------------------"<<std::endl;
+    int k = static_cast<int>(hess.size());
+    if (k == 0) return {};
+    int n = static_cast<int>(hess[0].rows());
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k), Eigen::MatrixXd(n, 2));
+    double v0 = vec(0), v1 = vec(1);
+    for (int c = 0; c < k; ++c) {
+        const auto& H = hess[c];
+        for (int j = 0; j < n; ++j) {
+            double h00 = H(j, 0), h01 = H(j, 1), h10 = H(j, 2), h11 = H(j, 3);
+            out[c](j, 0) = h00 * v0 + h01 * v1;
+            out[c](j, 1) = h10 * v0 + h11 * v1;
+        }
+    }
+    return out;
+}
+
+inline Eigen::MatrixXd hessian_dot_vector_value(const Eigen::MatrixXd& hess,
+                                                const Eigen::VectorXd& vec) {
+    std::cout<< "-----------------hessian_dot_vector_value---------------------"<<std::endl;
+    int k = static_cast<int>(hess.rows());
+    Eigen::MatrixXd out(k, 2);
+    double v0 = vec(0), v1 = vec(1);
+    for (int c = 0; c < k; ++c) {
+        double h00 = hess(c, 0), h01 = hess(c, 1), h10 = hess(c, 2), h11 = hess(c, 3);
+        out(c, 0) = h00 * v0 + h01 * v1;
+        out(c, 1) = h10 * v0 + h11 * v1;
+    }
+    return out;
+}
+
+// vector · Hessian(basis/value)
+inline std::vector<Eigen::MatrixXd> vector_dot_hessian_basis(const Eigen::VectorXd& vec,
+                                                             const std::vector<Eigen::MatrixXd>& hess) {
+    std::cout<< "-----------------vector_dot_hessian_basis---------------------"<<std::endl;
+    int k = static_cast<int>(hess.size());
+    if (k == 0) return {};
+    int n = static_cast<int>(hess[0].rows());
+    std::vector<Eigen::MatrixXd> out(2, Eigen::MatrixXd(n, 2));
+    for (int j = 0; j < n; ++j) {
+        double acc00 = 0.0, acc01 = 0.0, acc10 = 0.0, acc11 = 0.0;
+        for (int c = 0; c < k; ++c) {
+            const auto& H = hess[c];
+            double v = vec(c);
+            acc00 += v * H(j, 0);
+            acc01 += v * H(j, 1);
+            acc10 += v * H(j, 2);
+            acc11 += v * H(j, 3);
+        }
+        out[0](j, 0) = acc00;
+        out[0](j, 1) = acc01;
+        out[1](j, 0) = acc10;
+        out[1](j, 1) = acc11;
+    }
+    return out;
+}
+
+inline Eigen::MatrixXd vector_dot_hessian_value(const Eigen::VectorXd& vec,
+                                                const Eigen::MatrixXd& hess) {
+    std::cout<< "-----------------vector_dot_hessian_value---------------------"<<std::endl;
+    int k = static_cast<int>(hess.rows());
+    double acc00 = 0.0, acc01 = 0.0, acc10 = 0.0, acc11 = 0.0;
+    for (int c = 0; c < k; ++c) {
+        double v = vec(c);
+        acc00 += v * hess(c, 0);
+        acc01 += v * hess(c, 1);
+        acc10 += v * hess(c, 2);
+        acc11 += v * hess(c, 3);
+    }
+    Eigen::MatrixXd out(2, 2);
+    out(0, 0) = acc00; out(0, 1) = acc01;
+    out(1, 0) = acc10; out(1, 1) = acc11;
     return out;
 }
 
