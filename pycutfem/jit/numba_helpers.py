@@ -227,9 +227,9 @@ def dot_grad_basis_with_grad_value(grad_basis, grad_value, dtype):
     if grad_value.shape[0] != k or grad_value.shape[1] != d:
         raise ValueError("Gradient value shape incompatible with basis gradient")
     res = np.empty((k, n, k), dtype=dtype)
-    GVt = np.ascontiguousarray(grad_value)  # (k, d)
+    GV = np.ascontiguousarray(grad_value)  # (k, d)
     for ii in range(n):
-        res[:, ii, :] = np.ascontiguousarray(grad_basis[:, ii, :]) @ GVt
+        res[:, ii, :] = np.ascontiguousarray(grad_basis[:, ii, :]) @ GV
     return res
 
 
