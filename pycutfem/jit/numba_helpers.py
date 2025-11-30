@@ -193,7 +193,7 @@ def dot_grad_basis_vector(grad_basis, vec, dtype):
     k, n, d = grad_basis.shape
     G = np.ascontiguousarray(grad_basis).reshape(k * n, d)
     out = G @ np.ascontiguousarray(vec)
-    return out.reshape(k, n)
+    return np.ascontiguousarray(out.reshape(k, n))
 
 
 @numba.njit(cache=True)
@@ -1145,11 +1145,14 @@ def load_variable_qp(u_e, phi_q):
     Evaluate u_h at a quadrature point.
     u_e: (ndof,) or (ndof, ncomp); phi_q: (ndof,)
     """
-    if u_e.ndim == 1:
+    u_c = np.ascontiguousarray(u_e)
+    phi_c = np.ascontiguousarray(phi_q)
+    if u_c.ndim == 1:
         # (ndof,) @ (ndof,) -> scalar
-        return float(np.dot(u_e, phi_q))
+        return float(np.dot(u_c, phi_c))
     # (ndof, ncomp).T @ (ndof,) -> (ncomp, ndof) @ (ndof,) -> (ncomp,)
-    return (u_e.T @ phi_q).astype(u_e.dtype)
+    u_e_T = u_c.T.copy()
+    return u_e_T @ phi_c
 
 
 @numba.njit(cache=True)
@@ -1159,11 +1162,12 @@ def gradient_qp(u_e, grad_phi_q):
     Returns: scalar -> (dim,), vector -> (dim, ncomp)
     """
     grad_T = np.ascontiguousarray(grad_phi_q).T
-    if u_e.ndim == 1:
+    u_c = np.ascontiguousarray(u_e)
+    if u_c.ndim == 1:
         # (ndof, dim).T @ (ndof,) -> (dim, ndof) @ (ndof,) -> (dim,)
-        return (np.ascontiguousarray(grad_T) @ u_e).astype(u_e.dtype)
+        return grad_T @ u_c
     # (ndof, dim).T @ (ndof, ncomp) -> (dim, ndof) @ (ndof, ncomp) -> (dim, ncomp)
-    return (np.ascontiguousarray(grad_T) @ u_e).astype(u_e.dtype)
+    return grad_T @ u_c
 
 
 @numba.njit(cache=True)

@@ -14,6 +14,11 @@ from pycutfem.fem.transform import element_Hxi
 
 logger = logging.getLogger(__name__)
 
+# Cache for reference-space tables to avoid rebuilding identical basis/grad
+# stacks during JIT warm-up. Keys include element signature, quadrature order,
+# target element count and derivative kind.
+_REF_TABLE_CACHE: dict[tuple, np.ndarray] = {}
+
 
 def _array_token(arr) -> str:
     carr = np.ascontiguousarray(np.asarray(arr, dtype=np.float64))
@@ -122,10 +127,27 @@ def _build_jit_kernel_args(       # ← signature unchanged
     # ------------------------------------------------------------------
     # 0. Helpers
     # ------------------------------------------------------------------
+    # Target element count for per-element tables (respect subsets when provided)
     n_elem = mixed_element.mesh.n_elements
+    if gdofs_map is not None:
+        try:
+            n_elem = int(np.asarray(gdofs_map).shape[0])
+        except Exception:
+            pass
+    elif pre_built is not None:
+        for _key in ("qp_phys", "qw", "eids", "gdofs_map"):
+            arr = pre_built.get(_key)
+            if arr is None:
+                continue
+            try:
+                n_elem = int(np.asarray(arr).shape[0])
+                break
+            except Exception:
+                continue
+
     # full-length element size for CellDiameter() lookups via owner ids
     _h_global = np.asarray(
-        [mixed_element.mesh.element_char_length(i) for i in range(n_elem)],
+        [mixed_element.mesh.element_char_length(i) for i in range(mixed_element.mesh.n_elements)],
         dtype=np.float64
     )
 
@@ -149,6 +171,14 @@ def _build_jit_kernel_args(       # ← signature unchanged
          for f in _active_fields]
     ) if _active_fields else np.arange(mixed_element.n_dofs_local, dtype=np.int32)
     _active_n = int(len(_active_cols))
+    def _cached_ref_table(kind: str, field: str, builder, deriv: tuple[int, int] | None = None):
+        key = (mixed_element.signature(), q_order, n_elem, tuple(_active_cols.tolist()), kind, field, deriv)
+        hit = _REF_TABLE_CACHE.get(key)
+        if hit is not None:
+            return hit
+        arr = builder()
+        _REF_TABLE_CACHE[key] = arr
+        return arr
 
     def _expand_per_element(ref_tab: np.ndarray) -> np.ndarray:
         """
@@ -160,23 +190,32 @@ def _build_jit_kernel_args(       # ← signature unchanged
     qp_ref, _ = volume(mixed_element.mesh.element_type, q_order)
 
     def _basis_table(field: str):
-        ref = np.asarray([mixed_element.basis(field, *xi_eta)
-                          for xi_eta in qp_ref], dtype=np.float64)      # (n_q , n_loc)
-        return _expand_per_element(ref)                                 # (n_elem , n_q , n_loc)
+        def _build():
+            ref = np.asarray(
+                [mixed_element.basis(field, *xi_eta) for xi_eta in qp_ref],
+                dtype=np.float64,
+            )  # (n_q , n_loc)
+            return _expand_per_element(ref)  # (n_elem , n_q , n_loc)
+        return _cached_ref_table("basis", field, _build)
 
     def _grad_table(field: str):
-        ref = np.asarray([mixed_element.grad_basis(field, *xi_eta)
-                          for xi_eta in qp_ref], dtype=np.float64)      # (n_q , n_loc , 2)
-        return _expand_per_element(ref)                                 # (n_elem , n_q , n_loc , 2)
+        def _build():
+            ref = np.asarray(
+                [mixed_element.grad_basis(field, *xi_eta) for xi_eta in qp_ref],
+                dtype=np.float64,
+            )  # (n_q , n_loc , 2)
+            return np.ascontiguousarray(_expand_per_element(ref))  # (n_elem , n_q , n_loc , 2)
+        return _cached_ref_table("grad", field, _build)
 
     def _deriv_table(field: str, ax: int, ay: int):
         """∂^{ax+ay} φ_i / ∂ξ^{ax} ∂η^{ay}"""
-        ref = np.asarray(
-            [mixed_element.deriv_ref(field, *xi_eta, ax, ay)
-             for xi_eta in qp_ref],
-            dtype=np.float64
-        )
-        return _expand_per_element(ref) 
+        def _build():
+            ref = np.asarray(
+                [mixed_element.deriv_ref(field, *xi_eta, ax, ay) for xi_eta in qp_ref],
+                dtype=np.float64,
+            )
+            return _expand_per_element(ref)
+        return _cached_ref_table("deriv", field, _build, deriv=(ax, ay))
     # NEW: evaluate at interface physical quadrature points (qp_phys)
     def _n_union_for_eid(eid: int) -> int:
         return len(dof_handler.get_elemental_dofs(int(eid)))
@@ -192,11 +231,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
         me   = mixed_element
         mesh = me.mesh
         nE, nQ, _ = pts.shape
-        gmap = pre_built.get("gdofs_map", None)
-        if gmap is not None:
-            n_union = np.asarray(gmap).shape[1]
-        else:
-            n_union = _n_union_for_eid(eids[0])
+        n_union = _n_union_for_eid(eids[0])
         tab = np.empty((nE, nQ, n_union), dtype=np.float64)
 
         # Prefer cached reference coordinates if available to avoid inverse mapping
@@ -217,7 +252,6 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
         for i in range(nE):
             eid = int(eids[i])
-            assert _n_union_for_eid(eid) == n_union, "Union length differs across elements."
             for q in range(nQ):
                 if qref_mode is not None:
                     mode, arr = qref_mode
@@ -229,7 +263,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
                     x, y = pts[i, q]
                     xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
                 tab[i, q, :] = me.basis(field, float(xi), float(eta))
-        return tab
+        return np.ascontiguousarray(tab)
 
     def _deriv_table_phys_union(field: str, ax: int, ay: int) -> np.ndarray:
         """Union-length derivative tables at interface physical QPs."""
@@ -242,11 +276,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
         me   = mixed_element
         mesh = me.mesh
         nE, nQ, _ = pts.shape
-        gmap = pre_built.get("gdofs_map", None)
-        if gmap is not None:
-            n_union = np.asarray(gmap).shape[1]
-        else:
-            n_union = _n_union_for_eid(eids[0])
+        n_union = _n_union_for_eid(eids[0])
         tab = np.empty((nE, nQ, n_union), dtype=np.float64)
 
         qref_raw = pre_built.get("qref")
@@ -264,7 +294,6 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
         for i in range(nE):
             eid = int(eids[i])
-            assert _n_union_for_eid(eid) == n_union, "Union length differs across elements."
             for q in range(nQ):
                 if qref_mode is not None:
                     mode, arr = qref_mode
@@ -282,7 +311,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
         """Union-length gradient tables at interface physical QPs."""
         key = f"g_{field}"
         if pre_built is not None and key in pre_built:
-            return np.asarray(pre_built[key], dtype=np.float64)
+            return np.ascontiguousarray(np.asarray(pre_built[key], dtype=np.float64))
 
         pts  = pre_built["qp_phys"]      # (nE, nQ, 2)
         eids = pre_built["eids"]         # (nE,)
@@ -307,7 +336,6 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
         for i in range(nE):
             eid = int(eids[i])
-            assert _n_union_for_eid(eid) == n_union, "Union length differs across elements."
             for q in range(nQ):
                 if qref_mode is not None:
                     mode, arr = qref_mode
@@ -319,7 +347,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
                     x, y = pts[i, q]
                     xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
                 tab[i, q, :, :] = me.grad_basis(field, float(xi), float(eta))
-        return tab
+        return np.ascontiguousarray(tab)
     def _decode_coeff_name(name: str):
         """
         Resolve u_<mid>_loc into (field_key, side).
@@ -507,14 +535,25 @@ def _build_jit_kernel_args(       # ← signature unchanged
                     loc_lists = dof_handler.element_maps[fld]
                     # all elements share same nloc for that field
                     nloc_f = len(loc_lists[int(side_ids[0])])
-                    m_arr = np.empty((nE, nloc_f), dtype=np.int32)
+                    m_arr = -np.ones((nE, nloc_f), dtype=np.int32)
                     for i in range(nE):
                         eid = int(side_ids[i])
                         union_row = gdofs[i, :n_union]
                         # map: global dof id -> union column
                         col_of = {int(d): j for j, d in enumerate(union_row)}
                         local_gdofs_f = loc_lists[eid]
-                        m_arr[i, :] = [col_of[int(d)] for d in local_gdofs_f]
+                        for j, d in enumerate(local_gdofs_f):
+                            try:
+                                m_arr[i, j] = col_of[int(d)]
+                            except KeyError:
+                                # If a field was dropped from active_cols, mark as padding (-1)
+                                m_arr[i, j] = -1
+                    missing_mask = m_arr < 0
+                    if missing_mask.any():
+                        logger.debug(
+                            "Side map for field '%s' missed %d entries (likely pruned by active_cols); padding with -1.",
+                            fld, int(missing_mask.sum()),
+                        )
                     args[f"{side}_map_{fld}"] = m_arr
 
     # ------------------------------------------------------------------
@@ -744,18 +783,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
         # ---- coefficient vectors (gather) --------------------------------
         elif (name.startswith("u_") and name.endswith("_loc")):
-            field, _side = _decode_coeff_name(name)
-            fobj = func_map.get(field)
-            if fobj is None:
-                raise NameError(
-                    "Kernel requests coefficient array for unknown Function/VectorFunction "
-                    f"'{field}'. Input name: {name}"
-                )
-            # Build the GLOBAL vector once
-            full = np.zeros(total_dofs, dtype=np.float64)
-            full[list(fobj._g2l.keys())] = fobj.nodal_values
-            # Gather per-element block (union-local ordering)
-            args[name] = full[gdofs_map]
+            # Live coefficient blocks are injected by KernelRunner; skip static gather.
+            continue
 
     # ------------------------------------------------------------------
     # 6. Optional debug print

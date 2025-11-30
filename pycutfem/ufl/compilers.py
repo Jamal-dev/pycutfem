@@ -66,6 +66,7 @@ from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, lhs_num,
                                   normalize_elem_ids)
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
+from pycutfem.jit import _active_field_order, _active_columns, _compress_static_for_active
 from pycutfem.ufl.helpers_geom import (
     phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris
 )
@@ -3608,6 +3609,8 @@ class FormCompiler:
                     kernel_args[need_key] = geo[t]
 
         missing = [p for p in runner.param_order if p not in kernel_args]
+        # Coefficient blocks (u_*_loc) are injected at call time by KernelRunner
+        missing = [p for p in missing if not (p.startswith("u_") and p.endswith("_loc"))]
         if missing:
             raise KeyError(f"Aligned interface kernel missing static args: {missing}")
 
@@ -3775,7 +3778,11 @@ class FormCompiler:
                     kernel_args[need_key] = geo[t]
 
         # Final sanity: everything the kernel listed must be present now
-        still_missing = [p for p in runner.param_order if p not in kernel_args]
+        still_missing = [
+            p
+            for p in runner.param_order
+            if p not in kernel_args and not (isinstance(p, str) and p.startswith("u_") and p.endswith("_loc"))
+        ]
         if still_missing:
             raise KeyError(
                 "KernelRunner: the following static arrays are still missing after automatic completion: "
@@ -4352,12 +4359,26 @@ class FormCompiler:
         # --- compile kernel once
         runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+        # Active DOF subset for this kernel
+        active_fields = _active_field_order(ir, me)
+        _param_fields: list[str] = []
+        for name in getattr(runner, "param_order", []):
+            has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
+            if name.startswith(("b_", "g_")) or has_deriv:
+                fld = name.split("_", 1)[1] if "_" in name else name
+                if fld in getattr(me, "field_names", ()):
+                    _param_fields.append(fld)
+        if _param_fields:
+            active_fields = tuple(dict.fromkeys(_param_fields))
+        active_cols = _active_columns(me, active_fields)
+        if os.getenv("PYCUTFEM_JIT_DEBUG_ACTIVE", "").lower() in {"1", "true", "yes"}:
+            print(f"[jit-cut] active_fields={active_fields}, n_cols={len(active_cols)}")
 
         # helper to run kernel on a subset of elements with prebuilt geo
         def _run_subset(eids: np.ndarray, prebuilt: dict):
             if eids.size == 0:
                 return
-            gdofs_map = np.vstack([dh.get_elemental_dofs(e) for e in eids]).astype(np.int32)
+            gdofs_map = np.vstack([dh.get_elemental_dofs(e)[active_cols] for e in eids]).astype(np.int32)
             # kernel wants node_coords in the signature, provide it once
             prebuilt = dict(prebuilt)
             prebuilt["gdofs_map"]  = gdofs_map
@@ -4370,6 +4391,7 @@ class FormCompiler:
                 param_order=runner.param_order,
                 pre_built=prebuilt
             )
+            static_args = _compress_static_for_active(static_args, me, active_cols)
             current_funcs = self._get_data_functions_objs(intg)
             K_loc, F_loc, J_loc = runner(current_funcs, static_args)
 

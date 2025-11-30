@@ -1369,7 +1369,7 @@ class NumbaCodeGen:
 
                         for i, fld_i in enumerate(a.field_names):
                             pg_loc = new_var("grad_loc")
-                            body_lines.append(f"{pg_loc} = {grad_tab_names[i]}[e, q] @ {jinv_q}.copy()")
+                            body_lines.append(f"{pg_loc} = np.ascontiguousarray({grad_tab_names[i]}[e, q]) @ np.ascontiguousarray({jinv_q}.copy())")
                             phys.append(pg_loc)
 
                         n_dofs = self.active_n_dofs
@@ -1427,7 +1427,7 @@ class NumbaCodeGen:
                                 f"d10_q = {d10}[e, q]",
                                 f"d01_q = {d01}[e, q]",
                                 f"{g2}   = np.stack((d10_q, d01_q), axis=1)",
-                                f"{phys} = {g2} @ {jinv_q}.copy()",
+                                f"{phys} = np.ascontiguousarray({g2}) @ np.ascontiguousarray({jinv_q}.copy())",
                                 f"if {phys}.shape[0] == {coeff_e}.shape[0]:",
                                 f"    {val} = gradient_qp({coeff_e}, {phys})",
                                 f"else:",
@@ -1445,7 +1445,7 @@ class NumbaCodeGen:
                             pg = new_var("phys_grad_basis")
 
                             body_lines += [
-                                f"{pg}  = {gnm}[e, q] @ {jinv_q}.copy()",
+                                f"{pg}  = np.ascontiguousarray({gnm}[e, q]) @ np.ascontiguousarray({jinv_q}.copy())",
                                 f"{val} = gradient_qp({coeff_e}, {pg})",     # (2,)
                             ]
 

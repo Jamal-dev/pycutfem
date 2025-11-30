@@ -1143,8 +1143,8 @@ ls_beam.commit()
 domains = make_domain_sets(mesh)
 print(
     f"Ghost edges: total={mesh.edge_bitset('ghost').cardinality()}, "
-    f"pos={mesh.edge_bitset('ghost_pos').cardinality()}, "
-    f"neg={mesh.edge_bitset('ghost_neg').cardinality()}, "
+    f"pos + ghost_both={mesh.edge_bitset('ghost_pos').cardinality()}, "
+    f"neg + ghost_both={mesh.edge_bitset('ghost_neg').cardinality()}, "
     f"both={mesh.edge_bitset('ghost_both').cardinality()}, "
     f"fluid_ghost(defined_on)={domains['fluid_ghost'].cardinality()}, "
     f"solid_ghost(defined_on)={domains['solid_ghost'].cardinality()}"

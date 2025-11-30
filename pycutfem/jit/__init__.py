@@ -41,6 +41,15 @@ def _active_field_order(ir_sequence, me) -> tuple[str, ...]:
                 if f in getattr(me, "field_names", ()):
                     seen.add(f)
                     order.append(f)
+        elif hasattr(op, "field_name"):
+            f = getattr(op, "field_name", None)
+            if f is None:
+                continue
+            if f in seen:
+                continue
+            if f in getattr(me, "field_names", ()):
+                seen.add(f)
+                order.append(f)
     if not order:
         order = list(getattr(me, "field_names", ()))
     return tuple(order)
@@ -88,7 +97,10 @@ def _compress_static_for_active(static: dict[str, Any],
     compressed: dict[str, Any] = {}
     for k, v in static.items():
         if k == "gdofs_map" and isinstance(v, np.ndarray):
-            compressed[k] = v[:, active_cols]
+            if v.shape[1] == active_cols.size:
+                compressed[k] = v
+            else:
+                compressed[k] = v[:, active_cols]
             continue
         if isinstance(v, np.ndarray):
             if k.startswith(("pos_map", "neg_map")) and v.ndim == 2 and v.dtype.kind in {"i", "u"}:
@@ -115,6 +127,18 @@ class KernelRunner:
         self.func_names = {
             op.name for op in ir_sequence if isinstance(op, LoadVariable) and op.role == 'function'
         }
+        # Also infer function names from PARAM_ORDER entries (u_<name>[_pos/_neg]_loc)
+        for tag in param_order:
+            if not (isinstance(tag, str) and tag.startswith("u_") and tag.endswith("_loc")):
+                continue
+            mid = tag[2:-4]  # strip leading 'u_' and trailing '_loc'
+            # strip optional side suffix
+            for suf in ("__pos", "__neg", "_pos", "_neg"):
+                if mid.endswith(suf):
+                    mid = mid[: -len(suf)]
+                    break
+            if mid:
+                self.func_names.add(mid)
 
 
     def __call__(self, functions: dict, static_args: dict):
@@ -255,7 +279,18 @@ class KernelRunner:
         # ---------------------------------------------------------------
         # F)  fire the kernel and return its result tuple
         # ---------------------------------------------------------------
-        return self.kernel(*final_args)
+        try:
+            return self.kernel(*final_args)
+        except Exception as exc:
+            # Debug aid: surface argument shapes/types when a compiled kernel fails.
+            import sys
+            print("[KernelRunner] kernel execution failed; argument dump:", file=sys.stderr)
+            for tag, arr in zip(self.param_order, final_args):
+                if isinstance(arr, np.ndarray):
+                    print(f"    {tag:<20} shape={arr.shape} dtype={arr.dtype}", file=sys.stderr)
+                else:
+                    print(f"    {tag:<20} type={type(arr).__name__}", file=sys.stderr)
+            raise
 
 def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet: bool = False ): # New Newton: Pass dof_handler
     """
@@ -468,7 +503,21 @@ def compile_multi(form, *, dof_handler, mixed_element,
         # Compile the backend once; reuse for all subsets of this integral
         runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element, on_facet=on_facet)
         active_fields = _active_field_order(ir, mixed_element)
+
+        # Fallback: infer active fields from param_order when IR lacks field annotations
+        _param_fields: list[str] = []
+        for name in getattr(runner, "param_order", []):
+            has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
+            if name.startswith(("b_", "g_")) or has_deriv:
+                fld = name.split("_", 1)[1] if "_" in name else name
+                if fld in getattr(mixed_element, "field_names", ()):
+                    _param_fields.append(fld)
+        if _param_fields:
+            active_fields = tuple(dict.fromkeys(_param_fields))  # preserve order, drop dups
+
         active_cols = _active_columns(mixed_element, active_fields)
+        if os.getenv("PYCUTFEM_JIT_DEBUG_ACTIVE", "").lower() in {"1", "true", "yes"}:
+            print(f"[jit] active fields for {intg.measure.domain_type}: {active_fields} (cols={len(active_cols)})")
 
         # Max derivative order we need in the geometry *inverse* jets (A, A2, A3, A4)
         def _max_required_order(ir_seq):
@@ -924,7 +973,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     geom["is_ghost"] = True
                     geom["is_interface"] = False
                     gdofs_map_raw = np.asarray(geom.get("gdofs_map", np.zeros((len(new_ids), n_loc), dtype=np.int32)), dtype=np.int32)
-                    gdofs_map = gdofs_map_raw[:, active_cols] if gdofs_map_raw.size else gdofs_map_raw
+                    ncols = gdofs_map_raw.shape[1] if gdofs_map_raw.ndim == 2 else 0
+                    eff_cols = active_cols[active_cols < ncols] if ncols else active_cols
+                    if eff_cols.size == 0 and ncols:
+                        eff_cols = np.arange(ncols, dtype=np.int32)
+                    gdofs_map = gdofs_map_raw[:, eff_cols] if gdofs_map_raw.size else gdofs_map_raw
                     geom["gdofs_map"] = gdofs_map
 
                     static_new = {"gdofs_map": gdofs_map, **geom}
@@ -940,7 +993,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             pre_built=geom,
                         )
                     )
-                    static_new = _compress_static_for_active(static_new, mixed_element, active_cols)
+                    static_new = _compress_static_for_active(static_new, mixed_element, eff_cols)
 
                 merged = _merge_static_arrays(all_eids, old_static, static_new)
                 merged["is_ghost"] = True
