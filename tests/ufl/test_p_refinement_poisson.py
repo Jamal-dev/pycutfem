@@ -15,6 +15,7 @@ from pycutfem.ufl.forms import Equation, BoundaryCondition, assemble_form
 from pycutfem.core.levelset import CircleLevelSet
 import matplotlib.pyplot as plt
 from pycutfem.ufl.analytic import Analytic
+import os
 # ----- MMS: u = x^2 + y^2, f = -Δu = -4 --------------------------------------
 x, y = sp.symbols("x y")
 u_sym = sp.sin(2*sp.pi*x) * sp.sinh(sp.pi*y)   # or sp.exp(x+y), sp.sin(pi x)sin(pi y)
@@ -43,7 +44,7 @@ radius = 4*max(L,H)
 level_set_all = CircleLevelSet(center=center, radius=radius)
 
 # ----- one p-run on a given element type -------------------------------------
-def run_once(elem_type: str, p: int, nx=10, ny=10):
+def run_once(elem_type: str, p: int, nx=10, ny=10, *, backend: str = "python"):
     # mesh
     if elem_type == "quad":
         nodes, elems, edges, corners = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=p)
@@ -76,7 +77,7 @@ def run_once(elem_type: str, p: int, nx=10, ny=10):
     bcs = [BoundaryCondition('u', 'dirichlet', 'boundary', lambda X, Y: u_exact(X, Y))]
 
     # assemble & solve
-    K, F = assemble_form(eq, dof_handler=dh, bcs=bcs, quad_order=qvol, backend='python')
+    K, F = assemble_form(eq, dof_handler=dh, bcs=bcs, quad_order=qvol, backend=backend)
     uh = spla.spsolve(K, F)
 
     # --- L2 error over Ω using built-in
@@ -93,14 +94,14 @@ def run_once(elem_type: str, p: int, nx=10, ny=10):
                                     relative=False, quad_increase=2)
     return l2, h1
 
-def run_suite(elem_type, orders=(1,2,3,4,5), nx=10, ny=10):
+def run_suite(elem_type, orders=(1,2,3,4,5), nx=10, ny=10, *, backend: str = "python"):
     print(f"\n== {elem_type.upper()} p-refinement on {nx}x{ny} mesh ==")
     print(f"{'p':>2}  {'L2':>12}  {'H1-semi':>12}")
     prevL2 = prevH1 = None
     l2_errors = []
     h1_errors = []
     for p in orders:
-        l2, h1 = run_once(elem_type, p, nx=nx, ny=ny)
+        l2, h1 = run_once(elem_type, p, nx=nx, ny=ny, backend=backend)
         print(f"{p:2d}  {l2:12.4e}  {h1:12.4e}")
         # if prevL2 is not None:
         #     # soft monotonicity check
@@ -117,33 +118,40 @@ def check_monotonicity(errors):
         if prev is not None:
             assert e <= prev * 1.05 + 1e-14, "Error did not decrease with p"
         prev = e
-def test_quad_p_refinement():
+@pytest.mark.parametrize("backend", ["python", "jit"])
+def test_quad_p_refinement(monkeypatch, backend):
+    if backend == "jit":
+        monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
     orders = (1,2,3,4,5)
-    l2_errors, h1_errors = run_suite("quad", orders=orders, nx=8,  ny=8)
-    plt.figure()
-    plt.loglog(orders, l2_errors, 'o-', label='L2 error')
-    plt.loglog(orders, h1_errors, 's-', label='H1-semi error')
-    plt.xlabel('Polynomial order p')
-    plt.ylabel('Error')
-    plt.title('p-refinement errors on quad mesh')
-    plt.legend()
-    plt.show()
-    # if l2 is monotonic:
+    l2_errors, h1_errors = run_suite("quad", orders=orders, nx=8,  ny=8, backend=backend)
+    if os.getenv("PYCUTFEM_SHOW_PLOTS"):
+        plt.figure()
+        plt.loglog(orders, l2_errors, 'o-', label='L2 error')
+        plt.loglog(orders, h1_errors, 's-', label='H1-semi error')
+        plt.xlabel('Polynomial order p')
+        plt.ylabel('Error')
+        plt.title('p-refinement errors on quad mesh')
+        plt.legend()
+        plt.show()
     check_monotonicity(l2_errors)
     check_monotonicity(h1_errors)
 
-def test_tri_p_refinement():
+
+@pytest.mark.parametrize("backend", ["python", "jit"])
+def test_tri_p_refinement(monkeypatch, backend):
+    if backend == "jit":
+        monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
     orders = (1,2,3,4,5)
-    l2_errors, h1_errors = run_suite("tri",  orders=orders, nx=12, ny=12)
-    plt.figure()
-    plt.loglog(orders, l2_errors, 'o-', label='L2 error')
-    plt.loglog(orders, h1_errors, 's-', label='H1-semi error')
-    plt.xlabel('Polynomial order p')
-    plt.ylabel('Error')
-    plt.title('p-refinement errors on tri mesh')
-    plt.legend()
-    plt.show()
-    # if l2 is monotonic:
+    l2_errors, h1_errors = run_suite("tri",  orders=orders, nx=12, ny=12, backend=backend)
+    if os.getenv("PYCUTFEM_SHOW_PLOTS"):
+        plt.figure()
+        plt.loglog(orders, l2_errors, 'o-', label='L2 error')
+        plt.loglog(orders, h1_errors, 's-', label='H1-semi error')
+        plt.xlabel('Polynomial order p')
+        plt.ylabel('Error')
+        plt.title('p-refinement errors on tri mesh')
+        plt.legend()
+        plt.show()
     check_monotonicity(l2_errors)
     check_monotonicity(h1_errors)
 
@@ -151,4 +159,3 @@ if __name__ == "__main__":
     # use a slightly finer tri grid so p-refinement isn’t overly coarse
     run_suite("quad", orders=(1,2,3,4,5), nx=8,  ny=8)
     run_suite("tri",  orders=(1,2,3,4,5), nx=12, ny=12)
-

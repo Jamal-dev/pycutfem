@@ -4,5 +4,6 @@ sympy
 matplotlib
 legacy-quadpy
 numba
+pybind11
 meshio
 pytest

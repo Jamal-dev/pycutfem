@@ -76,3 +76,18 @@ ParaView or any VTK viewer.
   assembly.
 - The repository contains Jupyter notebooks under `examples/` for exploratory
   studies and comparisons against external FEM codes.
+
+### Experimental C++ backend
+
+An early scaffold for a C++/Eigen codegen path lives under
+`pycutfem/jit/cpp_backend`. Set `PYCUTFEM_JIT_BACKEND=cpp` to route kernel
+compilation through the pybind11-based cache. Requirements:
+
+- `pybind11` (added to `requirements.txt`) and a compiler with C++17 support.
+- Eigen headers available (set `EIGEN_INCLUDE_DIR` if they are not under
+  `/usr/include/eigen3`).
+
+The generated kernels currently raise a runtime error because the C++ bodies
+are still under construction; the code falls back to the existing Numba path
+when compilation fails. The structure mirrors the Python backend so we can
+incrementally port kernels without touching the assembly front-end.

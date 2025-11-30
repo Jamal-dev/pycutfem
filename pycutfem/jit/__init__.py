@@ -296,6 +296,17 @@ def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet:
     """
     Orchestrates the JIT compilation and returns a reusable runner.
     """
+    backend = os.getenv("PYCUTFEM_JIT_BACKEND", "").lower()
+    if backend in {"cpp", "c++"}:
+        from pycutfem.jit.cpp_backend import compile_backend_cpp
+        # Do not fall back silently; raise so we fix missing ops immediately.
+        return compile_backend_cpp(
+            integral_expression,
+            dof_handler,
+            mixed_element,
+            on_facet=on_facet,
+        )
+
     # Accept Form / Integral / plain Expression alike -----------------
     from pycutfem.ufl.measures import Integral as _Integral
     if hasattr(integral_expression, "integrals"):            # it is a Form
