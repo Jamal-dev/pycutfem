@@ -646,6 +646,32 @@ inline Eigen::MatrixXd vector_dot_grad_basis(const Eigen::VectorXd& vec,
     return dot_vec_grad(vec, grad_basis);
 }
 
+// Contract vector basis (components) with grad basis: sum_c grad[c][:,r] * vec_basis[c,:]
+// Produces one matrix per spatial component (d) of shape (rows x cols).
+inline std::vector<Eigen::MatrixXd> dot_vec_grad_components(const Eigen::MatrixXd& vec_basis,
+                                                            const std::vector<Eigen::MatrixXd>& grad_basis,
+                                                            bool swap_roles=false) {
+    std::cout<< "-----------------dot_vec_grad_components---------------------"<<std::endl;
+    int k = static_cast<int>(grad_basis.size());
+    if (k == 0) return {};
+    int d = static_cast<int>(grad_basis[0].cols());
+    int n_rows = swap_roles ? static_cast<int>(vec_basis.cols()) : static_cast<int>(grad_basis[0].rows());
+    int n_cols = swap_roles ? static_cast<int>(grad_basis[0].rows()) : static_cast<int>(vec_basis.cols());
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(d), Eigen::MatrixXd::Zero(n_rows, n_cols));
+    for (int r = 0; r < d; ++r) {
+        for (int c = 0; c < k; ++c) {
+            if (!swap_roles) {
+                // rows from grad_basis (test), cols from vec_basis (trial)
+                out[r].noalias() += grad_basis[c].col(r) * vec_basis.row(c);
+            } else {
+                // rows from vec_basis (test), cols from grad_basis (trial)
+                out[r].noalias() += vec_basis.row(c).transpose() * grad_basis[c].col(r).transpose();
+            }
+        }
+    }
+    return out;
+}
+
 // Inner product of grad stacks -> n x n
 inline Eigen::MatrixXd inner_grad_grad(const std::vector<Eigen::MatrixXd>& test,
                                        const std::vector<Eigen::MatrixXd>& trial) {
@@ -965,6 +991,226 @@ inline Eigen::MatrixXd dot_trial_vec_grad_func(const Eigen::MatrixXd& trial_vec,
         throw std::runtime_error("dot_trial_vec_grad_func: incompatible shapes");
     }
     return grad_func.transpose() * trial_vec;
+}
+
+// Mixed gradient tensor helpers (mirror numba_helpers mixed ops)
+inline std::vector<Eigen::MatrixXd> dot_grad_grad_mixed(const std::vector<Eigen::MatrixXd>& a,
+                                                        const std::vector<Eigen::MatrixXd>& b,
+                                                        int flag) {
+    std::cout<< "-----------------dot_grad_grad_mixed---------------------"<<std::endl;
+    int k = static_cast<int>(a.size());
+    if (k == 0 || b.empty()) return {};
+    int d = static_cast<int>(a[0].cols());   // spatial dimension (assumed equal to k)
+    int n_a = static_cast<int>(a[0].rows()); // test/trial basis size for 'a'
+    int n_b = static_cast<int>(b[0].rows()); // test/trial basis size for 'b'
+    if (static_cast<int>(b.size()) != d) {
+        throw std::runtime_error("dot_grad_grad_mixed expects square gradient tensor (k == d).");
+    }
+
+    // Flatten a: (k, n_a, d) -> (k*n_a, d)
+    Eigen::MatrixXd A(k * n_a, d);
+    for (int i = 0; i < k; ++i) {
+        A.block(i * n_a, 0, n_a, d) = a[i];
+    }
+
+    // Flatten b treating the first axis as the contracted dimension (d == k):
+    // b shape (k, n_b, d) -> B shape (d, n_b * d) with column ordering (basis, spatial)
+    Eigen::MatrixXd B(d, n_b * d);
+    for (int r = 0; r < d; ++r) {          // contracted dimension (component/spatial)
+        for (int s = 0; s < n_b; ++s) {    // basis index
+            for (int j = 0; j < d; ++j) {  // spatial axis (last of b)
+                B(r, s * d + j) = b[r](s, j);
+            }
+        }
+    }
+
+    Eigen::MatrixXd prod = A * B; // (k*n_a) x (n_b*d)
+
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k * d), Eigen::MatrixXd(n_a, n_b));
+    for (int i = 0; i < k; ++i) {
+        for (int j = 0; j < d; ++j) {
+            Eigen::MatrixXd block(n_a, n_b);
+            for (int p = 0; p < n_a; ++p) {
+                for (int s = 0; s < n_b; ++s) {
+                    block(p, s) = prod(i * n_a + p, s * d + j);
+                }
+            }
+            if (flag == 1) {
+                out[static_cast<size_t>(i * d + j)] = block.transpose(); // (n_b x n_a)
+            } else {
+                out[static_cast<size_t>(i * d + j)] = block;             // (n_a x n_b)
+            }
+        }
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> transpose_mixed_grad_tensor(const std::vector<Eigen::MatrixXd>& tensor,
+                                                                int k, int d) {
+    std::cout<< "-----------------transpose_mixed_grad_tensor---------------------"<<std::endl;
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k * d));
+    for (int i = 0; i < k; ++i) {
+        for (int j = 0; j < d; ++j) {
+            int dst = i * d + j;
+            int src = j * d + i;
+            if (src < static_cast<int>(tensor.size())) {
+                out[static_cast<size_t>(dst)] = tensor[static_cast<size_t>(src)];
+            }
+        }
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> trace_mixed_tensor(const std::vector<Eigen::MatrixXd>& tensor,
+                                                       int k, int d) {
+    std::cout<< "-----------------trace_mixed_tensor---------------------"<<std::endl;
+    if (tensor.empty()) return {};
+    int n_rows = static_cast<int>(tensor[0].rows());
+    int n_cols = static_cast<int>(tensor[0].cols());
+    Eigen::MatrixXd acc = Eigen::MatrixXd::Zero(n_rows, n_cols);
+    int diag = std::min(k, d);
+    for (int i = 0; i < diag; ++i) {
+        int idx = i * d + i;
+        if (idx < static_cast<int>(tensor.size())) acc += tensor[static_cast<size_t>(idx)];
+    }
+    return {acc};
+}
+
+inline std::vector<Eigen::MatrixXd> scale_mixed_basis_with_coeffs(const std::vector<Eigen::MatrixXd>& mixed_basis,
+                                                                  const Eigen::MatrixXd& coeffs) {
+    std::cout<< "-----------------scale_mixed_basis_with_coeffs---------------------"<<std::endl;
+    if (mixed_basis.empty()) return {};
+    Eigen::MatrixXd base = Eigen::MatrixXd::Zero(mixed_basis[0].rows(), mixed_basis[0].cols());
+    for (const auto& m : mixed_basis) base += m;
+    int k_out = static_cast<int>(coeffs.rows());
+    int d_cols = static_cast<int>(coeffs.cols());
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k_out * d_cols));
+    for (int i = 0; i < k_out; ++i) {
+        for (int j = 0; j < d_cols; ++j) {
+            out[static_cast<size_t>(i * d_cols + j)] = base * coeffs(i, j);
+        }
+    }
+    return out;
+}
+
+inline Eigen::MatrixXd inner_mixed_grad_const(const std::vector<Eigen::MatrixXd>& mixed_grad,
+                                              const Eigen::MatrixXd& grad_const,
+                                              int k, int d) {
+    std::cout<< "-----------------inner_mixed_grad_const---------------------"<<std::endl;
+    if (mixed_grad.empty()) return Eigen::MatrixXd();
+    Eigen::Index n_rows = mixed_grad[0].rows();
+    Eigen::Index n_cols = mixed_grad[0].cols();
+    Eigen::MatrixXd out = Eigen::MatrixXd::Zero(n_rows, n_cols);
+    for (int i = 0; i < k; ++i) {
+        for (int j = 0; j < d; ++j) {
+            int idx = i * d + j;
+            if (idx < static_cast<int>(mixed_grad.size())) {
+                double coeff = 0.0;
+                if (i < grad_const.rows() && j < grad_const.cols()) coeff = grad_const(i, j);
+                out += mixed_grad[static_cast<size_t>(idx)] * coeff;
+            }
+        }
+    }
+    return out;
+}
+
+inline Eigen::MatrixXd inner_grad_const_mixed(const Eigen::MatrixXd& grad_const,
+                                              const std::vector<Eigen::MatrixXd>& mixed_grad,
+                                              int k, int d) {
+    return inner_mixed_grad_const(mixed_grad, grad_const, k, d);
+}
+
+inline std::vector<Eigen::MatrixXd> add_mixed(const std::vector<Eigen::MatrixXd>& a,
+                                              const std::vector<Eigen::MatrixXd>& b) {
+    if (a.size() != b.size()) throw std::runtime_error("add_mixed: size mismatch");
+    std::vector<Eigen::MatrixXd> out = a;
+    for (size_t i = 0; i < out.size(); ++i) out[i] += b[i];
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> sub_mixed(const std::vector<Eigen::MatrixXd>& a,
+                                              const std::vector<Eigen::MatrixXd>& b) {
+    if (a.size() != b.size()) throw std::runtime_error("sub_mixed: size mismatch");
+    std::vector<Eigen::MatrixXd> out = a;
+    for (size_t i = 0; i < out.size(); ++i) out[i] -= b[i];
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> scale_mixed(const std::vector<Eigen::MatrixXd>& a, double s) {
+    std::vector<Eigen::MatrixXd> out = a;
+    for (auto& m : out) m *= s;
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> dot_mixed_mat(const std::vector<Eigen::MatrixXd>& mixed,
+                                                  const Eigen::MatrixXd& mat,
+                                                  int k, int d) {
+    std::cout<< "-----------------dot_mixed_mat---------------------"<<std::endl;
+    if (mixed.empty()) return {};
+    int d_out = static_cast<int>(mat.cols());
+    Eigen::Index n_rows = mixed[0].rows();
+    Eigen::Index n_cols = mixed[0].cols();
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k * d_out), Eigen::MatrixXd::Zero(n_rows, n_cols));
+    for (int i = 0; i < k; ++i) {
+        for (int j = 0; j < d_out; ++j) {
+            Eigen::MatrixXd acc = Eigen::MatrixXd::Zero(n_rows, n_cols);
+            for (int r = 0; r < d; ++r) {
+                int idx = i * d + r;
+                if (idx < static_cast<int>(mixed.size()) && r < mat.rows()) {
+                    acc += mixed[static_cast<size_t>(idx)] * mat(r, j);
+                }
+            }
+            out[static_cast<size_t>(i * d_out + j)] = acc;
+        }
+    }
+    return out;
+}
+
+inline std::vector<Eigen::MatrixXd> dot_mat_mixed(const Eigen::MatrixXd& mat,
+                                                  const std::vector<Eigen::MatrixXd>& mixed,
+                                                  int k, int d) {
+    std::cout<< "-----------------dot_mat_mixed---------------------"<<std::endl;
+    if (mixed.empty()) return {};
+    int k_out = static_cast<int>(mat.rows());
+    Eigen::Index n_rows = mixed[0].rows();
+    Eigen::Index n_cols = mixed[0].cols();
+    std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k_out * d), Eigen::MatrixXd::Zero(n_rows, n_cols));
+    for (int i = 0; i < k_out; ++i) {
+        for (int j = 0; j < d; ++j) {
+            Eigen::MatrixXd acc = Eigen::MatrixXd::Zero(n_rows, n_cols);
+            for (int r = 0; r < k; ++r) {
+                int idx = r * d + j;
+                if (idx < static_cast<int>(mixed.size()) && r < mat.cols()) {
+                    acc += mat(i, r) * mixed[static_cast<size_t>(idx)];
+                }
+            }
+            out[static_cast<size_t>(i * d + j)] = acc;
+        }
+    }
+    return out;
+}
+
+// Contract mixed tensor (k, rows, cols, d) with spatial vector (d,)
+inline Eigen::MatrixXd dot_mixed_with_vec(const std::vector<Eigen::MatrixXd>& mixed,
+                                          const Eigen::VectorXd& vec,
+                                          int k, int d) {
+    std::cout<< "-----------------dot_mixed_with_vec---------------------"<<std::endl;
+    if (mixed.empty()) return Eigen::MatrixXd();
+    if (vec.size() != d) {
+        throw std::runtime_error("dot_mixed_with_vec: vector length must match spatial dimension");
+    }
+    Eigen::Index n_rows = mixed[0].rows();
+    Eigen::Index n_cols = mixed[0].cols();
+    Eigen::MatrixXd out = Eigen::MatrixXd::Zero(n_rows, n_cols);
+    for (int i = 0; i < k; ++i) {
+        for (int r = 0; r < d; ++r) {
+            int idx = i * d + r;
+            if (idx < static_cast<int>(mixed.size())) {
+                out.noalias() += mixed[static_cast<size_t>(idx)] * vec(r);
+            }
+        }
+    }
+    return out;
 }
 
 // Transpose gradient stack: swap component and spatial axes (k,n,d) -> (d,n,k)
