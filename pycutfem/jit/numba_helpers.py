@@ -1,7 +1,7 @@
 import numba
 import numpy as np
 use_type = np.float64
-
+DEBUG = True
 @numba.njit(cache=True, fastmath=True)
 def ghost_grad_jump_penalty_scalar(
     Ke, w, cell_h, normals, grad_pos, grad_neg, gamma, dtype
@@ -14,6 +14,7 @@ def ghost_grad_jump_penalty_scalar(
     normals : (nE, n_q, 2)
     grad_pos/grad_neg : (nE, n_q, n_union, 2)
     """
+    if DEBUG:print("ghost_grad_jump_penalty_scalar")
     nE, n_q, n_union, _ = grad_pos.shape
     for e in range(nE):
         h_e = cell_h[e]
@@ -44,6 +45,7 @@ def ghost_grad_jump_penalty_vector(
     Assemble ghost gradient-jump penalty for vector-valued fields.
     grad_pos/grad_neg : (nE, n_q, n_comp, n_union, 2)
     """
+    if DEBUG:print("ghost_grad_jump_penalty_vector")
     nE, n_q, n_comp, n_union, _ = grad_pos.shape
     for e in range(nE):
         h_e = cell_h[e]
@@ -73,6 +75,7 @@ def dot_grad_grad_mixed(a, b, flag, dtype):
     """
     Matmul for grad(test/trial) · grad(trial/test).
     """
+    if DEBUG: print("dot_grad_grad_mixed")
     k_comps, n_basis_a, d_comps = a.shape
     d_comps_b, n_basis_b, l_comps = b.shape
     if d_comps != d_comps_b:
@@ -91,6 +94,7 @@ def contract_last_first(a, b, dtype):
     """
     Generic contraction over the last axis of a and first axis of b.
     """
+    if DEBUG: print("contract_last_first")
     if b.ndim == 0:
         raise ValueError("contract_last_first: second operand must have at least 1 dimension")
     if a.shape[-1] != b.shape[0]:
@@ -112,6 +116,7 @@ def contract_first_first(a, b, dtype):
     """
     Generic contraction over the first axis of a and first axis of b.
     """
+    if DEBUG: print("contract_first_first")
     if b.ndim == 0:
         raise ValueError("contract_first_first: second operand must have at least 1 dimension")
     if a.shape[0] != b.shape[0]:
@@ -146,6 +151,7 @@ def dot_mixed_const(a, b, dtype):
     Mixed basis (k, n, m) dotted with constant vector (k,) -> (n, m).
     Vectorized via (k*nm) matvec.
     """
+    if DEBUG: print("dot_mixed_const")
     k = a.shape[0]
     nm = a.shape[1] * a.shape[2]
     a2 = np.ascontiguousarray(a).reshape(k, nm)
@@ -159,6 +165,7 @@ def dot_const_mixed(a, b, dtype):
     Constant vector (k,) dotted with mixed basis (k, n, m) -> (n, m).
     Vectorized via (1 x k) @ (k x nm).
     """
+    if DEBUG: print("dot_const_mixed")
     k = b.shape[0]
     nm = b.shape[1] * b.shape[2]
     b2 = np.ascontiguousarray(b).reshape(k, nm)
@@ -172,6 +179,7 @@ def dot_vector_trial_grad_test(trial_vec, grad_test, dtype):
     Vector trial (k, n_trial) · grad(test) (k, n_test, d) -> (d, n_test, n_trial).
     For each spatial dim j: res[j] = grad_test[:, :, j].T @ trial_vec
     """
+    if DEBUG: print("dot_vector_trial_grad_test")
     k_vec, n_trial = trial_vec.shape
     _, n_test, d = grad_test.shape
     res = np.empty((d, n_test, n_trial), dtype=dtype)
@@ -190,6 +198,7 @@ def dot_grad_basis_vector(grad_basis, vec, dtype):
     Gradient basis (k, n, d) dotted with spatial vector (d,) -> (k, n).
     Vectorized via (k*n, d) @ (d,)
     """
+    if DEBUG: print("dot_grad_basis_vector")
     k, n, d = grad_basis.shape
     G = np.ascontiguousarray(grad_basis).reshape(k * n, d)
     out = G @ np.ascontiguousarray(vec)
@@ -202,6 +211,7 @@ def vector_dot_grad_basis(vec, grad_basis, dtype):
     Vector (component) dotted with gradient basis (k, n, d).
     Returns (1, n) for scalar fields or (d, n) when len(vec)==k.
     """
+    if DEBUG: print("vector_dot_grad_basis")
     k, n, d = grad_basis.shape
     vlen = vec.shape[0]
     if k == 1 and vlen == d:
@@ -223,6 +233,7 @@ def dot_grad_basis_with_grad_value(grad_basis, grad_value, dtype):
     Grad(basis) (k, n, d) dotted with grad(value) (k, d) -> (k, n, k).
     For each n: (k,d) @ (d,k)  (transpose on grad_value).
     """
+    if DEBUG: print("dot_grad_basis_with_grad_value")
     k, n, d = grad_basis.shape
     if grad_value.shape[0] != k or grad_value.shape[1] != d:
         raise ValueError("Gradient value shape incompatible with basis gradient")
@@ -239,6 +250,7 @@ def dot_grad_value_with_grad_basis(grad_value, grad_basis, dtype):
     Grad(value) (k, k) (k==d) dotted with grad(basis) (k, n, k) -> (k, n, k).
     Loop only over 'n' with BLAS inside: res[:, n, :] = grad_value @ grad_basis[:, n, :]
     """
+    if DEBUG: print("dot_grad_value_with_grad_basis")
     k, n, d = grad_basis.shape
     if grad_value.shape[0] != k or grad_value.shape[1] != k or d != k:
         raise ValueError("Gradient value shape incompatible with grad basis (expect square k==d)")
@@ -254,6 +266,7 @@ def dot_grad_value_with_grad_basis(grad_value, grad_basis, dtype):
 @numba.njit(cache=True)
 def dot_vec_vec(vec_a, vec_b, dtype):
     """Dot product between two vectors."""
+    if DEBUG: print("dot_vec_vec")
     return float(np.dot(vec_a, vec_b))
 
 @numba.njit(cache=True)
@@ -261,6 +274,7 @@ def dot_value_with_grad(value_vec, grad_mat, dtype):
     """
     Value (k,) · grad (k,d) -> (d,)
     """
+    if DEBUG: print("dot_value_with_grad")
     return np.ascontiguousarray(value_vec) @ np.ascontiguousarray(grad_mat)
 
 @numba.njit(cache=True)
@@ -268,6 +282,7 @@ def dot_grad_with_value(grad_mat, value_vec, dtype):
     """
     Grad (k,d) · value (k,) -> (d,)
     """
+    if DEBUG: print("dot_grad_with_value")
     return np.ascontiguousarray(grad_mat) @ np.ascontiguousarray(value_vec)
 
 
@@ -276,6 +291,7 @@ def dot_grad_func_trial_vec(grad_func, trial_vec, dtype):
     """
     Compute grad(Function) @ Trial vector basis.
     """
+    if DEBUG: print("dot_grad_func_trial_vec")
     return grad_func @ trial_vec
 
 
@@ -284,6 +300,7 @@ def dot_trial_vec_grad_func(trial_vec, grad_func, dtype):
     """
     Compute Trial vector basis @ grad(Function).T.
     """
+    if DEBUG: print("dot_trial_vec_grad_func")
     return grad_func.T.copy() @ trial_vec
 
 
@@ -292,6 +309,7 @@ def dot_vec_vec(vec_a, vec_b, dtype):
     """
     Dot product between two vectors.
     """
+    if DEBUG: print("dot_vec_vec")
     return np.dot(vec_a, vec_b)
 
 
@@ -300,6 +318,7 @@ def dot_grad_grad_value(grad_a, grad_b, dtype):
     """
     Compute grad(value) @ grad(value).
     """
+    if DEBUG: print("dot_grad_grad_value")
     return grad_a @ grad_b
 
 
@@ -311,6 +330,7 @@ def mul_scalar(scalar, array, dtype):
     """
     Multiply scalar with array.
     """
+    # if DEBUG: print("mul_scalar")
     return float(scalar) * array
 
 
@@ -319,6 +339,7 @@ def _flatten_to_1d(array_like, dtype):
     """
     Convert scalar/array-like input to contiguous 1D array of dtype.
     """
+    # if DEBUG: print("_flatten_to_1d")
     arr = np.ascontiguousarray(array_like)
     target = np.dtype(dtype)
     arr = arr.astype(target)
@@ -334,6 +355,7 @@ def _ensure_matrix(array_like, dtype):
     """
     Convert scalar/vector/array-like input to contiguous 2D array of dtype.
     """
+    # if DEBUG: print("_ensure_matrix")
     arr = np.ascontiguousarray(array_like)
     target = np.dtype(dtype)
     arr = arr.astype(target)
@@ -361,6 +383,7 @@ def trace_matrix_value(matrix, dtype):
     """
     Trace of a dense square matrix -> scalar.
     """
+    # if DEBUG: print("trace_matrix_value")
     return float(np.trace(np.ascontiguousarray(matrix)))
 
 
@@ -369,6 +392,7 @@ def trace_basis_tensor(tensor, dtype):
     """
     Trace of a basis tensor (k, n, k) -> (1, n).
     """
+    # if DEBUG: print("trace_basis_tensor")
     k_comps, n_locs, _ = tensor.shape
     res = np.zeros((1, n_locs), dtype=dtype)
     for j in range(n_locs):
@@ -385,6 +409,7 @@ def trace_mixed_tensor(tensor, dtype):
     Trace of a mixed tensor (k, n_test, n_trial, k) -> (1, n_test, n_trial).
     Vectorized over the last two axes; sum diagonal blocks.
     """
+    if DEBUG: print("trace_mixed_tensor")
     k, n_test, n_trial, d_dim = tensor.shape
     n_diag = k if k < d_dim else d_dim
     res = np.zeros((1, n_test, n_trial), dtype=dtype)
@@ -399,6 +424,7 @@ def transpose_grad_tensor(tensor, dtype):
     """
     Transpose vector gradient tensor (k,n,d) assuming square k==d.
     """
+    # if DEBUG: print("transpose_grad_tensor")
     k_comps, n_locs, d_dim = tensor.shape
     res = np.zeros((k_comps, n_locs, d_dim), dtype=dtype)
     for n in range(n_locs):
@@ -411,6 +437,7 @@ def transpose_mixed_grad_tensor(tensor, dtype):
     """
     Transpose mixed gradient tensor (k,n,m,d) by swapping component/spatial axes.
     """
+    if DEBUG: print("transpose_mixed_grad_tensor")
     k_dim, n_rows, n_cols, d_dim = tensor.shape
     res = np.zeros((k_dim, n_rows, n_cols, d_dim), dtype=dtype)
     for i in range(k_dim):
@@ -424,6 +451,7 @@ def transpose_hessian_tensor(tensor, dtype):
     """
     Transpose Hessian tensor (k,n,d,d) swapping the last two axes.
     """
+    if DEBUG: print("transpose_hessian_tensor")
     return tensor.swapaxes(2, 3).copy()
 
 
@@ -432,6 +460,7 @@ def transpose_matrix(matrix, dtype):
     """
     Transpose a 2D matrix.
     """
+    # if DEBUG: print("transpose_matrix")
     return matrix.T.copy()
 
 
@@ -440,6 +469,7 @@ def scatter_tensor_to_union(values, mapping, n_union, dtype):
     """
     Scatter local rows (m, ...) into a union-sized tensor (n_union, ...).
     """
+    if DEBUG: print("scatter_tensor_to_union")
     out_shape = (n_union,) + values.shape[1:]
     res = np.zeros(out_shape, dtype=dtype)
     m = values.shape[0]
@@ -455,6 +485,7 @@ def pad_basis_to_union(local, mapping, n_union, s0, s1, dtype):
     """
     Pad a 1D local basis/derivative vector to the union layout using a side map.
     """
+    if DEBUG: print("pad_basis_to_union")
     if n_union == local.shape[0]:
         return local.copy()
     m = mapping.shape[0]
@@ -472,6 +503,7 @@ def pushforward_grad_to_union(d10, d01, j_inv, mapping, n_union, s0, s1, dtype):
     """
     Push forward (d10,d01) with J^{-1} and scatter to the union layout.
     """
+    if DEBUG: print("pushforward_grad_to_union")
     grad_loc = np.stack((d10, d01), axis=1) @ j_inv.copy()
     if grad_loc.shape[0] == n_union:
         return grad_loc
@@ -483,6 +515,7 @@ def compute_physical_hessian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
     """
     Compute physical Hessian for a single component.
     """
+    if DEBUG: print("compute_physical_hessian")
     nloc = d20.shape[0]
     d_dim = j_inv.shape[0]
     res = np.zeros((nloc, d_dim, d_dim), dtype=dtype)
@@ -505,6 +538,7 @@ def compute_physical_laplacian(d20, d11, d02, d10, d01, j_inv, hx, hy, dtype):
     """
     Compute physical Laplacian entries for scalar component.
     """
+    if DEBUG: print("compute_physical_laplacian")
     nloc = d20.shape[0]
     res = np.zeros(nloc, dtype=dtype)
     for j in range(nloc):
@@ -525,6 +559,7 @@ def pushforward_d3(d10, d01, d20, d11, d02, d30, d21, d12, d03, A, Hx, Hy, Tx0, 
     Exact third-order pullback using inverse-map jets.
     Returns a (nloc,) array for the derivative specified by 'axes'.
     """
+    if DEBUG: print("pushforward_d3")
     nloc = d20.shape[0]
     res = np.zeros(nloc, dtype=dtype)
     for j in range(nloc):
@@ -591,6 +626,7 @@ def pushforward_d4(
     Exact fourth-order pullback using inverse-map jets.
     Returns a (nloc,) array for the derivative specified by 'axes'.
     """
+    if DEBUG: print("pushforward_d4")
     nloc = d20.shape[0]
     res = np.zeros(nloc, dtype=dtype)
     for j in range(nloc):
@@ -662,12 +698,14 @@ def dot_mass_test_trial(test_vec, trial_vec, dtype):
     """
     Compute Test.T @ Trial for mass matrices.
     """
+    if DEBUG: print("dot_mass_test_trial")
     return test_vec.T.copy() @ trial_vec
 @numba.njit(cache=True)
 def dot_mass_trial_test(trial_vec, test_vec, dtype):
     """
     Compute Trial.T @ Test for mass matrices.
     """
+    if DEBUG: print("dot_mass_trial_test")
     return trial_vec.T.copy() @ test_vec
 
 @numba.njit(cache=True)
@@ -676,6 +714,7 @@ def inner_grad_function_grad_test(function_grad, test_grad, dtype):
     Inner product between grad(Function) (k,d) and grad(Test) basis (k,n,d) -> (n,).
     Vectorized by flattening (k*d): (n x kd) @ (kd,)
     """
+    if DEBUG: print("inner_grad_function_grad_test")
     k_comps, n_locs, d_dim = test_grad.shape
     if function_grad.shape[0] != k_comps or function_grad.shape[1] != d_dim:
         raise ValueError("Gradient(Function) shape incompatible with grad(Test)")
@@ -703,9 +742,11 @@ def inner_grad_function_grad_test(function_grad, test_grad, dtype):
 @numba.njit(cache=True)
 def basis_dot_const_vector(basis, const_vec, dtype):
     """
+
     Basis (k,n) dotted with constant vector (k,) -> (1,n).
     Vectorized: (n,k) @ (k,)
     """
+    if DEBUG: print("basis_dot_const_vector")
     res = np.empty((1, basis.shape[1]), dtype=dtype)
     res[0] = np.ascontiguousarray(basis).T @ np.ascontiguousarray(const_vec)
     return res
@@ -717,6 +758,7 @@ def const_vector_dot_basis(const_vec, basis, dtype):
     Constant vector (k,) dotted with basis (k,n) -> (1,n).
     (same as above, order swapped)
     """
+    if DEBUG: print("const_vector_dot_basis")
     res = np.empty((1, basis.shape[1]), dtype=dtype)
     res[0] = np.ascontiguousarray(basis).T @ np.ascontiguousarray(const_vec)
     return res
@@ -727,6 +769,7 @@ def const_vector_dot_basis_1d(const_vec, basis, dtype):
     """
     Constant vector (k,) dotted with basis (k,n) -> (n,).
     """
+    if DEBUG: print("const_vector_dot_basis_1d")
     return np.ascontiguousarray(basis).T @ np.ascontiguousarray(const_vec)
 
 
@@ -737,6 +780,7 @@ def scalar_basis_times_vector(scalar_basis, vector_vals, dtype):
     Scalar basis (1,n) or (n,) times vector components (k,) -> (k,n).
     Broadcasting outer product.
     """
+    if DEBUG: print("scalar_basis_times_vector")
     if scalar_basis.ndim == 2:
         phi = scalar_basis[0]
     else:
@@ -751,6 +795,7 @@ def matrix_times_scalar_basis(matrix_vals, scalar_basis, dtype):
     Matrix (m, n) times scalar basis row (1,p) -> (1,p).
     Algebraically equals sum(matrix_vals) * scalar_basis.
     """
+    if DEBUG: print("matrix_times_scalar_basis")
     if scalar_basis.ndim == 2:
         phi = scalar_basis[0]
     else:
@@ -767,6 +812,7 @@ def scalar_vector_outer_product(scalar_vals, vector_vals, dtype):
     Scalar values (n,) times vector (k,) -> (k,n).
     Broadcasting outer product.
     """
+    if DEBUG: print("scalar_vector_outer_product")
     return np.ascontiguousarray(vector_vals)[:, None] * np.ascontiguousarray(scalar_vals)[None, :]
 
 
@@ -777,6 +823,7 @@ def scalar_trial_times_grad_test(grad_test, trial_vals, dtype):
     Scalar Trial (n_trial,) times grad(Test) (k,n_test,d) -> (k,n_test,n_trial,d).
     Vectorized with broadcasting.
     """
+    if DEBUG: print("scalar_trial_times_grad_test")
     return (np.ascontiguousarray(grad_test)[:, :, None, :] *
             np.ascontiguousarray(trial_vals)[None, None, :, None])
 
@@ -788,6 +835,7 @@ def grad_trial_times_scalar_test(grad_trial, test_vals, dtype):
     Grad(Trial) (k,n_trial,d) times scalar Test (n_test,) -> (k,n_test,n_trial,d).
     Vectorized with broadcasting.
     """
+    if DEBUG: print("grad_trial_times_scalar_test")
     return (np.ascontiguousarray(grad_trial)[:, None, :, :] *
             np.ascontiguousarray(test_vals)[None, :, None, None])
 
@@ -801,6 +849,7 @@ def scale_mixed_basis_with_coeffs(mixed_basis, coeffs, dtype):
     Since coeffs are independent of k_mixed, this is:
        coeffs[:,None,None,:] * sum_k mixed_basis[k]
     """
+    if DEBUG: print("scale_mixed_basis_with_coeffs")
     base = np.sum(np.ascontiguousarray(mixed_basis), axis=0)  # (n_rows, n_cols)
     return (np.ascontiguousarray(coeffs)[:, None, None, :] *
             base[None, :, :, None])
@@ -811,6 +860,7 @@ def trace_times_identity(trace_vals, identity, dtype):
     """
     Trace data (flattened) times identity matrix (k,d) -> (k, n_rows, d).
     """
+    if DEBUG: print("trace_times_identity")
     flat = _flatten_to_1d(trace_vals, dtype)
     identity_mat = _ensure_matrix(identity, dtype)
     n_rows = flat.shape[0]
@@ -829,6 +879,7 @@ def identity_times_trace_matrix(identity, trace_matrix, dtype):
     """
     Identity (k,d) times trace matrix (n_rows,n_cols) -> (k,n_rows,n_cols,d).
     """
+    if DEBUG: print("identity_times_trace_matrix")
     identity_mat = _ensure_matrix(identity, dtype)
     base = _ensure_matrix(trace_matrix, dtype)
     n_rows, n_cols = base.shape
@@ -849,6 +900,7 @@ def columnwise_dot(a_mat, b_mat, dtype):
     Column-wise dot products between two (k,n) arrays -> (1,n).
     Vectorized sum over axis=0.
     """
+    if DEBUG: print("columnwise_dot")
     res = np.empty((1, a_mat.shape[1]), dtype=dtype)
     res[0] = np.sum(np.ascontiguousarray(a_mat) * np.ascontiguousarray(b_mat), axis=0)
     return res
@@ -860,6 +912,7 @@ def hessian_dot_vector(hessian, vec, dtype):
     Hessian (basis or value) dotted with spatial vector.
     Basis: (k,n,d1,d2) -> (k,n,d1)    Value: (k,d1,d2) -> (k,d1)
     """
+    if DEBUG: print("hessian_dot_vector")
     v = np.ascontiguousarray(vec)
     if hessian.ndim == 4:
         k, n, d1, _ = hessian.shape
@@ -888,6 +941,7 @@ def vector_dot_hessian_basis(vec, hessian, dtype):
     vlen==k: res[j] = vec @ hessian[:, :, j, :]   (batched via reshape)
     vlen==d1 & k==1: res[0,n,:] = vec @ hessian[0,n]
     """
+    if DEBUG: print("vector_dot_hessian_basis")
     k, n, d1, d2 = hessian.shape
     v = np.ascontiguousarray(vec)
     H = np.ascontiguousarray(hessian)
@@ -919,6 +973,7 @@ def vector_dot_hessian_value(vec, hessian, dtype):
     vlen==k: res[j,:] = vec @ hessian[:, j, :]
     vlen==d1 & k==1:  res[0,:] = vec @ hessian[0]
     """
+    if DEBUG: print("vector_dot_hessian_value")
     k, d1, d2 = hessian.shape
     v = np.ascontiguousarray(vec)
     H = np.ascontiguousarray(hessian)
@@ -943,6 +998,7 @@ def inner_hessian_function_hessian_test(function_hess, test_hess, dtype):
     Inner product between Hess(Function) (k,d,d) and Hess(Test) (k,n,d,d) -> (n,).
     Vectorized by flattening the (d*d) block and doing (n x dd) @ (dd,)
     """
+    if DEBUG: print("inner_hessian_function_hessian_test")
     k, n, d, d2 = test_hess.shape
     if function_hess.shape[0] != k or function_hess.shape[1] != d or function_hess.shape[2] != d2:
         raise ValueError("Hessian(Function) shape incompatible with Hessian(Test)")
@@ -961,6 +1017,7 @@ def inner_mixed_grad_const(mixed_grad, grad_const, dtype):
     Inner of mixed grad (k, n_test, n_trial, d) with grad(const) (k, d) -> (n_test, n_trial).
     Vectorized by flattening (k*d) and a single matvec.
     """
+    if DEBUG: print("inner_mixed_grad_const")
     k, n_test, n_trial, d = mixed_grad.shape
     # (k, n_test, n_trial, d) -> (n_test, n_trial, k, d)
     A_transposed = np.ascontiguousarray(mixed_grad).transpose(1, 2, 0, 3)
@@ -978,6 +1035,7 @@ def inner_grad_const_mixed(grad_const, mixed_grad, dtype):
     Inner of grad(const/value) (k, d) with mixed grad (k, n_test, n_trial, d) -> (n_test, n_trial).
     Same vectorization as above.
     """
+    if DEBUG: print("inner_grad_const_mixed")
     k, n_test, n_trial, d = mixed_grad.shape
     A_trasposed = np.ascontiguousarray(mixed_grad).transpose(1, 2, 0, 3)
     A_contg = np.ascontiguousarray(A_trasposed)
@@ -992,6 +1050,7 @@ def inner_grad_basis_grad_const(grad_basis, grad_const, dtype):
     Inner grad(basis) (k, n, d) with grad(const/value) (k, d) -> (n,).
     Vectorized by flattening (k*d): (n x kd) @ (kd,)
     """
+    if DEBUG: print("inner_grad_basis_grad_const")
     k, n, d = grad_basis.shape
     A = np.ascontiguousarray(grad_basis).transpose(1, 0, 2).reshape(n, k * d)
     b = np.ascontiguousarray(grad_const).reshape(k * d)
@@ -1003,6 +1062,7 @@ def inner_grad_grad(test_var, trial_var, dtype):
     """
     Inner product of gradient bases -> (n_test, n_trial).
     """
+    if DEBUG: print("inner_grad_grad")
     n_test = test_var.shape[1]
     n_trial = trial_var.shape[1]
     res = np.zeros((n_test, n_trial), dtype=dtype)
@@ -1016,6 +1076,7 @@ def inner_hessian_hessian(test_var, trial_var, dtype):
     """
     Inner product of Hessian bases -> (n_test, n_trial).
     """
+    if DEBUG: print("inner_hessian_hessian")
     n_test = test_var.shape[1]
     n_trial = trial_var.shape[1]
     res = np.zeros((n_test, n_trial), dtype=dtype)
@@ -1029,6 +1090,7 @@ def inner_hessian_hessian(test_var, trial_var, dtype):
 @numba.njit(cache=True, inline='always')
 def _binary_add_or_sub(x, y, sign):
     """sign = +1.0 for add, -1.0 for subtract."""
+    # if DEBUG: print("_binary_add_or_sub")
     return x + sign * y
 
 
@@ -1043,6 +1105,7 @@ def binary_add_generic(a, b, dtype):
     Elementwise addition for all standard broadcasting.
     Uses Numba's native ufunc support.
     """
+    # if DEBUG: print("binary_add_generic")
     return a + b
 
 
@@ -1054,6 +1117,7 @@ def binary_add_3_4(a, b, dtype):
     (k, n, d) + (k, n, m, d) -> (k, n, m, d)
     Uses reshape + ufunc. (Very fast to compile)
     """
+    # if DEBUG: print("binary_add_3_4")
     a_arr = np.asarray(a)
     b_arr = np.asarray(b)
 
@@ -1071,6 +1135,7 @@ def binary_add_4_3(a, b, dtype):
     (k, n, m, d) + (k, n, d) -> (k, n, m, d)
     Uses reshape + ufunc. (Very fast to compile)
     """
+    # if DEBUG: print("binary_add_4_3")
     a_arr = np.asarray(a)
     b_arr = np.asarray(b)
 
@@ -1087,6 +1152,7 @@ def binary_sub_generic(a, b, dtype):
     Elementwise subtraction for all standard broadcasting.
     Uses Numba's native ufunc support.
     """
+    # if DEBUG: print("binary_sub_generic")
     return a - b
 
 
@@ -1097,6 +1163,7 @@ def binary_sub_3_4(a, b, dtype):
     (k, n, d) - (k, n, m, d) -> (k, n, m, d)
     Uses reshape + ufunc. (Very fast to compile)
     """
+    # if DEBUG: print("binary_sub_3_4")
     a_arr = np.array(a, dtype=dtype, copy=False)
     b_arr = np.array(b, dtype=dtype, copy=False)
     
@@ -1114,6 +1181,7 @@ def binary_sub_4_3(a, b, dtype):
     (k, n, m, d) - (k, n, d) -> (k, n, m, d)
     Uses reshape + ufunc. (Very fast to compile)
     """
+    # if DEBUG: print("binary_sub_4_3")
     a_arr = np.array(a, dtype=dtype, copy=False)
     b_arr = np.array(b, dtype=dtype, copy=False)
     
@@ -1145,6 +1213,7 @@ def load_variable_qp(u_e, phi_q):
     Evaluate u_h at a quadrature point.
     u_e: (ndof,) or (ndof, ncomp); phi_q: (ndof,)
     """
+    # if DEBUG: print("load_variable_qp")
     u_c = np.ascontiguousarray(u_e)
     phi_c = np.ascontiguousarray(phi_q)
     if u_c.ndim == 1:
@@ -1161,6 +1230,7 @@ def gradient_qp(u_e, grad_phi_q):
     Evaluate ∇u_h at a qp. grad_phi_q: (ndof, dim)
     Returns: scalar -> (dim,), vector -> (dim, ncomp)
     """
+    # if DEBUG: print("gradient_qp")
     grad_T = np.ascontiguousarray(grad_phi_q).T
     u_c = np.ascontiguousarray(u_e)
     if u_c.ndim == 1:

@@ -583,6 +583,7 @@ class CppCodeGen:
                         emit_line(f"auto {nm} = {a.name} - {b.name};")
                         stack.append(StackItem(nm, a.kind, a.role, a.shape))
                 elif op.op_symbol == "*":
+                    print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})")
                     if a.kind == "mixed" and b.kind == "mixed":
                         emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')
                         continue
@@ -603,6 +604,17 @@ class CppCodeGen:
                         emit_line(f"auto {nm} = scale_mixed_basis_with_coeffs({b.name}, {a.name});")
                         new_shape = (a.shape[0], b.shape[1], b.shape[2], a.shape[1])
                         stack.append(StackItem(nm, "mixed", b.role, new_shape, b.field_names, b.parent))
+                        continue
+                    # Multiplication of basis with Identity matrix
+                    if a.kind == "mat" and b.kind == "mat" \
+                        and a.role in {"test", "trial"} and b.role in {"const"} and b.shape == (2, 2):
+                        emit_line(f"auto {nm} = trace_times_identity({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "grad", a.role, (b.shape[0], -1, b.shape[1]), a.field_names, a.parent))
+                        continue
+                    if a.kind == "mat" and b.kind == "mat" \
+                        and b.role in {"test", "trial"} and a.role in {"const"} and a.shape == (2, 2):
+                        emit_line(f"auto {nm} = trace_times_identity({b.name}, {a.name});")
+                        stack.append(StackItem(nm, "grad", b.role, (a.shape[0], -1, a.shape[1]), b.field_names, b.parent))
                         continue
                     # Outer product when scaling test/trial basis (1,n) with value vector (1,n) -> n x n
                     if a.kind == "mat" and a.shape[0] == 1 and a.role in {"test", "trial"} and b.kind == "mat" and b.shape[0] == 1 and b.role == "value":
@@ -630,6 +642,27 @@ class CppCodeGen:
                     if a.kind == "mat" and a.role in {"test", "trial"} and a.shape[0] == 1 and b.kind == "vec":
                         emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() * {b.name}(0);")
                         stack.append(StackItem(nm, "vec", a.role, (-1,), a.field_names, a.parent))
+                        continue
+                    # Mixed gradients: scalar basis × grad basis
+                    if a.kind == "mat" and a.role == "trial" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "test":
+                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {a.name}.transpose();")
+                        emit_line(f"auto {nm} = scalar_trial_times_grad_test({b.name}, _scalar_{nm});")
+                        stack.append(StackItem(nm, "mixed", "mixed", (b.shape[0], b.shape[1], a.shape[1], b.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
+                        continue
+                    if a.kind == "grad" and a.role == "test" and b.kind == "mat" and b.role == "trial" and len(b.shape) >= 2 and b.shape[0] == 1:
+                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {b.name}.transpose();")
+                        emit_line(f"auto {nm} = scalar_trial_times_grad_test({a.name}, _scalar_{nm});")
+                        stack.append(StackItem(nm, "mixed", "mixed", (a.shape[0], a.shape[1], b.shape[1], a.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
+                        continue
+                    if a.kind == "mat" and a.role == "test" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "trial":
+                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {a.name}.transpose();")
+                        emit_line(f"auto {nm} = grad_trial_times_scalar_test({b.name}, _scalar_{nm});")
+                        stack.append(StackItem(nm, "mixed", "mixed", (b.shape[0], a.shape[1], b.shape[1], b.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
+                        continue
+                    if a.kind == "grad" and a.role == "trial" and b.kind == "mat" and b.role == "test" and len(b.shape) >= 2 and b.shape[0] == 1:
+                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {b.name}.transpose();")
+                        emit_line(f"auto {nm} = grad_trial_times_scalar_test({a.name}, _scalar_{nm});")
+                        stack.append(StackItem(nm, "mixed", "mixed", (a.shape[0], b.shape[1], a.shape[1], a.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
                         continue
                     if a.kind == "scalar" and b.kind == "grad":
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
@@ -678,7 +711,12 @@ class CppCodeGen:
                 nm = new_tmp("dot")
                 a_union_mat = a.kind == "mat" and len(a.shape) >= 2 and a.shape[1] == -1
                 b_union_mat = b.kind == "mat" and len(b.shape) >= 2 and b.shape[1] == -1
-                print(f"(a,b): kind=({a.kind}, {b.kind}), role=({a.role}, {b.role}), shape=({a.shape}, {b.shape})")
+                is_a_2x2 = a.kind == "mat" and a.shape == (2,2)
+                is_b_2x2 = b.kind == "mat" and b.shape == (2,2)
+                is_a_1d = a.kind == "vec" and a.shape[0] > 1
+                is_b_1d = b.kind == "vec" and b.shape[0] > 1
+                print(f"(a,b): kind=({a.kind}, {b.kind}), role=({a.role}, {b.role}), shape=({a.shape}, {b.shape})"
+                      f" -> union_mat=({a_union_mat}, {b_union_mat})")
                 # trial/test mass
                 # Gradient advection combinations: grad(Function) · Trial  or Trial · grad(Function)
                 if a.kind == "grad" and b.kind == "grad" and a.role in {"test", "trial"} and b.role in {"test", "trial"}:
@@ -689,21 +727,25 @@ class CppCodeGen:
                     rows = b.shape[1] if flag == 1 else a.shape[1]
                     cols = a.shape[1] if flag == 1 else b.shape[1]
                     stack.append(StackItem(nm, "mixed", "mixed", (a.shape[0], rows, cols, a.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
-                elif a.role == "value" and b.role == "trial" and a.kind == "mat" and b.kind == "mat":
+                elif a.kind == "mat" and b.kind == "mat" and a.role == "value" and b.role == "trial":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_grad_func_trial_vec({a.name}, {b.name});")
                     stack.append(StackItem(nm, "mat", "trial", (a.shape[1] if len(a.shape)>1 else -1, -1), b.field_names, b.parent))
-                elif a.role == "trial" and b.role == "value" and a.kind == "mat" and b.kind == "mat":
+                elif a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "value":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_trial_vec_grad_func({a.name}, {b.name});")
                     stack.append(StackItem(nm, "mat", "trial", (b.shape[1] if len(b.shape)>1 else -1, -1), a.field_names, a.parent))
                 # Explicit Test/Trial mass-like dot even when shapes are concrete (not -1 flagged)
-                elif a.role == "trial" and b.role == "test" and a.kind == "mat" and b.kind == "mat":
+                elif a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "test":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({b.name}, {a.name});")
                     stack.append(StackItem(nm, "mat", "value", (-1, -1)))
-                elif a.role == "test" and b.role == "trial" and a.kind == "mat" and b.kind == "mat":
+                elif a.kind == "mat" and b.kind == "mat" and a.role == "test" and b.role == "trial":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({a.name}, {b.name});")
                     stack.append(StackItem(nm, "mat", "value", (-1, -1)))
+                elif a.kind == "mat" and b.kind == "mat" and is_a_2x2 and is_b_2x2:
+                    emit_line(f"Eigen::MatrixXd {nm} = dot_grad_grad_value({a.name}, {b.name});")
+                    stack.append(StackItem(nm, "mat", "const", a.shape))
                 elif a.kind == "mat" and b.kind == "mat" and a_union_mat and b_union_mat:
                     # Preserve Test/Trial orientation (test^T @ trial)
+                    role = "value"
                     if b.role == "test":
                         emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({b.name}, {a.name});")
                     elif a.role == "test":
@@ -711,26 +753,37 @@ class CppCodeGen:
                     elif a.role == "trial" and b.role == "trial":
                         emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({a.name}, {b.name});")
                     else:
-                        emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({a.name}, {b.name});")
-                    stack.append(StackItem(nm, "mat", "value", (-1, -1)))
-                elif a.kind == "mat" and b.kind == "grad" and a.role in {"trial", "test"} and b.role in {"trial", "test"} and a.shape[0] == b.shape[0]:
-                    # Contract vector basis (components) with grad basis -> collapse component axis, keep spatial
-                    swap_roles = a.role == "test" and b.role == "trial"
-                    emit_line(f"auto {nm} = dot_vec_grad_components({a.name}, {b.name}, {str(swap_roles).lower()});")
-                    rows = a.shape[1] if swap_roles else b.shape[1]
-                    cols = b.shape[1] if swap_roles else a.shape[1]
-                    stack.append(StackItem(nm, "mixed", "mixed", (1, rows, cols, b.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
+                        raise NotImplementedError(f"dot(mat, mat) with union shapes supports only test/trial/value roles"
+                                                  f" (got roles {a.role}, {b.role})"
+                                                  f" (shapes {a.shape}, {b.shape})")
+                    stack.append(StackItem(nm, "mat", role, (-1, -1)))
+                elif a.kind == "mat" and b.kind == "grad" :
+                    if a.role in {"const", "value"} and b.role in {"test", "trial"}:
+                        emit_line(f"auto {nm} = dot_grad_value_with_grad_basis({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "grad", b.role, b.shape, b.field_names, b.parent))
+                    elif  a.role in {"trial", "test"} and b.role in {"trial", "test"} and a.shape[0] == b.shape[0]:
+                        # Contract vector basis (components) with grad basis -> collapse component axis, keep spatial
+                        swap_roles = a.role == "test" and b.role == "trial"
+                        emit_line(f"auto {nm} = dot_vec_grad_components({a.name}, {b.name}, {str(swap_roles).lower()});")
+                        rows = a.shape[1] if swap_roles else b.shape[1]
+                        cols = b.shape[1] if swap_roles else a.shape[1]
+                        stack.append(StackItem(nm, "mixed", "mixed", (1, rows, cols, b.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
                 elif a.kind == "grad" and b.kind == "mat":
                     # grad(test/trial) with basis matrix -> standard assembly helper
-                    if a.role in {"test", "trial"} and b.role in {"value"}:
+                    if a.role in {"test", "trial"} and b.role in {"value", "const"}:
                         emit_line(f"auto {nm} = dot_grad_basis_with_grad_value({a.name}, {b.name});")
                         stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, a.parent))
                     elif a.role in {"value"} and b.role in {"test", "trial"}:
                         emit_line(f"auto {nm} = dot_grad_value_with_basis({a.name}, {b.name});")
                         stack.append(StackItem(nm, "grad", b.role, b.shape, b.field_names, b.parent))
                     elif len(b.shape) >= 2 and b.shape[1] == -1:
-                        emit_line(f"Eigen::MatrixXd {nm} = dot_grad_trial({a.name}, {b.name});")
-                        stack.append(StackItem(nm, "mat", "value", (-1, -1)))
+                        if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
+                            emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
+                            res_shape = a.shape[:-1] + b.shape[1:]
+                            stack.append(StackItem(nm, "grad", "mixed", res_shape))
+                        else:    
+                            emit_line(f"Eigen::MatrixXd {nm} = dot_grad_trial({a.name}, {b.name});")
+                            stack.append(StackItem(nm, "mat", "value", (-1, -1)))
                     else:
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
                         emit_line(f"for (size_t _c=0; _c<{a.name}.size(); ++_c) {{")
@@ -744,43 +797,65 @@ class CppCodeGen:
                         )
                         stack.append(StackItem(nm, "grad", a.role, out_shape, a.field_names, a.parent))
                 elif a.kind == "mat" and b.kind == "vec":
-                    emit_line(f"Eigen::VectorXd {nm};")
-                    emit_line(f"if ({a.name}.cols() == {b.name}.size()) {{")
-                    emit_line(f"    {nm} = {a.name} * {b.name};")
-                    emit_line(f"}} else if ({a.name}.rows() == {b.name}.size()) {{")
-                    emit_line(f"    {nm} = {a.name}.transpose() * {b.name};")
-                    emit_line("} else {")
-                    emit_line('    throw std::runtime_error("dot(mat, vec): dimension mismatch");')
-                    emit_line("}")
+                    if a.role in {"test", "trial"}:
+                        emit_line(f"Eigen::VectorXd {nm} = {a.name}.transpose() * {b.name};")
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm};")
+                        emit_line(f"if ({a.name}.cols() == {b.name}.size()) {{")
+                        emit_line(f"    {nm} = {a.name} * {b.name};")
+                        emit_line(f"}} else if ({a.name}.rows() == {b.name}.size()) {{")
+                        emit_line(f"    {nm} = {a.name}.transpose() * {b.name};")
+                        emit_line("} else {")
+                        emit_line('    throw std::runtime_error("dot(mat, vec): dimension mismatch");')
+                        emit_line("}")
                     stack.append(StackItem(nm, "vec", "value", (-1,)))
                 elif a.kind == "vec" and b.kind == "mat":
-                    emit_line(f"Eigen::VectorXd {nm};")
-                    emit_line(f"if ({b.name}.rows() == {a.name}.size()) {{")
-                    emit_line(f"    {nm} = {b.name} * {a.name};")
-                    emit_line(f"}} else if ({b.name}.cols() == {a.name}.size()) {{")
-                    emit_line(f"    {nm} = {b.name}.transpose() * {a.name};")
-                    emit_line("} else {")
-                    emit_line('    throw std::runtime_error("dot(vec, mat): dimension mismatch");')
-                    emit_line("}")
+                    if b.role in {"test", "trial"}:
+                        emit_line(f"Eigen::VectorXd {nm} = {b.name}.transpose() * {a.name};")
+                    # elif a.role in {"value"} and b.role in {"value"}:
+                    #     emit_line(f"Eigen::VectorXd {nm} = dot_value_with_grad({a.name}, {b.name});")
+                    elif is_a_1d and is_b_2x2:
+                        emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm};")
+                        emit_line(f"if ({b.name}.cols() == {a.name}.size()) {{")
+                        emit_line(f"    {nm} = {b.name} * {a.name};")
+                        emit_line(f"}} else if ({b.name}.rows() == {a.name}.size()) {{")
+                        emit_line(f"    {nm} = {b.name}.transpose() * {a.name};")
+                        emit_line("} else {")
+                        emit_line('    throw std::runtime_error("dot(vec, mat): dimension mismatch");')
+                        emit_line("}")
                     stack.append(StackItem(nm, "vec", "value", (-1,)))
                 elif a.kind == "vec" and b.kind == "grad":
-                    emit_line(f"Eigen::MatrixXd {nm} = vector_dot_grad_basis({a.name}, {b.name});")
-                    out_rows = 1 if b.shape[0] == 1 else (b.shape[2] if len(b.shape) > 2 else -1)
-                    out_shape = (out_rows, b.shape[1] if len(b.shape) > 1 else -1)
+                    if b.parent == "hess_dot_vec":
+                        emit_line(f"Eigen::MatrixXd {nm} = vector_dot_grad_basis({a.name}, {b.name});")
+                        out_rows = 1 if b.shape[0] == 1 else (b.shape[2] if len(b.shape) > 2 else -1)
+                        out_shape = (out_rows, b.shape[1] if len(b.shape) > 1 else -1)
+                    elif not a.field_names and b.field_names:
+                        emit_line(f"Eigen::MatrixXd {nm} = dot_grad_basis_vector({b.name}, {a.name});")
+                        out_shape = (b.shape[0], b.shape[1])
+                    else:
+                        emit_line(f"Eigen::MatrixXd {nm} = vector_dot_grad_basis({a.name}, {b.name});")
+                        out_rows = 1 if b.shape[0] == 1 else (b.shape[2] if len(b.shape) > 2 else -1)
+                        out_shape = (out_rows, b.shape[1] if len(b.shape) > 1 else -1)
                     stack.append(StackItem(nm, "mat", b.role, out_shape, b.field_names, b.parent))
                 elif a.kind == "grad" and b.kind == "vec":
-                    emit_line(f"Eigen::MatrixXd {nm} = dot_grad_basis_vector({a.name}, {b.name});")
-                    stack.append(StackItem(nm, "mat", a.role, (a.shape[0], a.shape[1]), a.field_names, a.parent))
+                    if a.role in {"mixed"} and b.role in {"const"}:
+                        emit_line(f"Eigen::MatrixXd {nm} = contract_first_first({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "mat", a.role, (-1, -1), a.field_names, a.parent))
+                    else:
+                        emit_line(f"Eigen::MatrixXd {nm} = dot_grad_basis_vector({a.name}, {b.name});")
+                        stack.append(StackItem(nm, "mat", a.role, (a.shape[0], a.shape[1]), a.field_names, a.parent))
                 elif a.kind == "mixed" and b.kind == "vec":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_mixed_with_vec({a.name}, {b.name}, {a.shape[0]}, {a.shape[3] if len(a.shape)>3 else 1});")
                     stack.append(StackItem(nm, "mat", a.role, (-1, -1), a.field_names, a.parent))
                 elif a.kind == "hess" and b.kind == "vec":
                     if a.role in {"test", "trial"}:
                         emit_line(f"auto {nm} = hessian_dot_vector_basis({a.name}, {b.name});")
-                        stack.append(StackItem(nm, "grad", a.role, (a.shape[0], a.shape[1], 2), a.field_names, a.parent))
+                        stack.append(StackItem(nm, "grad", a.role, (a.shape[0], a.shape[1], 2), a.field_names, "hess_dot_vec"))
                     else:
                         emit_line(f"auto {nm} = hessian_dot_vector_value({a.name}, {b.name});")
-                        stack.append(StackItem(nm, "mat", a.role, (a.shape[0], 2), a.field_names, a.parent))
+                        stack.append(StackItem(nm, "mat", a.role, (a.shape[0], 2), a.field_names, "hess_dot_vec"))
                 elif a.kind == "vec" and b.kind == "hess":
                     if b.role in {"test", "trial"}:
                         emit_line(f"auto {nm} = vector_dot_hessian_basis({a.name}, {b.name});")
@@ -834,11 +909,12 @@ class CppCodeGen:
                 b = stack.pop()
                 a = stack.pop()
                 nm = new_tmp("inner")
+                print(f"[inner]: (a,b): kind=({a.kind}, {b.kind}), role=({a.role}, {b.role}), shape=({a.shape}, {b.shape})")
                 if a.kind == "mixed" and b.kind == "mat" and len(a.shape) == 4:
-                    emit_line(f"Eigen::MatrixXd {nm} = inner_mixed_grad_const({a.name}, {b.name}, {a.shape[0]}, {a.shape[3]});")
+                    emit_line(f"Eigen::MatrixXd {nm} = inner_mixed_grad_const({a.name}, {b.name}, {a.shape[0]}, {a.shape[3]}, {a.shape[1]}, {a.shape[2]});")
                     stack.append(StackItem(nm, "mat", "value", (-1, -1)))
                 elif a.kind == "mat" and b.kind == "mixed" and len(b.shape) == 4:
-                    emit_line(f"Eigen::MatrixXd {nm} = inner_grad_const_mixed({a.name}, {b.name}, {b.shape[0]}, {b.shape[3]});")
+                    emit_line(f"Eigen::MatrixXd {nm} = inner_grad_const_mixed({a.name}, {b.name}, {b.shape[0]}, {b.shape[3]}, {b.shape[1]}, {b.shape[2]});")
                     stack.append(StackItem(nm, "mat", "value", (-1, -1)))
                 elif a.kind == "grad" and b.kind == "grad":
                     # Preserve test/trial orientation for LHS matrices
@@ -866,10 +942,13 @@ class CppCodeGen:
                     emit_line(f"double {nm} = {a.name}.dot({b.name});")
                     stack.append(StackItem(nm, "scalar", "value", ()))
                 elif a.kind == "vec" and b.kind == "mat":
+                    # emit_line(f"std::cout << \"[inner] vec·mat: \" << {a.name}.size() << \" x \" << {b.name}.rows() << \", \" << {b.name}.cols() << std::endl;")
                     emit_line(f"Eigen::VectorXd {nm} = {b.name}.transpose() * {a.name};")
+                    # emit_line(f"Eigen::VectorXd {nm} = {a.name} * {b.name};")
                     stack.append(StackItem(nm, "vec", "value", (-1,)))
                 elif a.kind == "mat" and b.kind == "vec":
                     emit_line(f"Eigen::VectorXd {nm} = {a.name}.transpose() * {b.name};")
+                    # emit_line(f"Eigen::VectorXd {nm} = {a.name} * {b.name};")
                     stack.append(StackItem(nm, "vec", "value", (-1,)))
                 elif a.kind == "hess" and b.kind == "hess":
                     if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
@@ -1008,7 +1087,7 @@ class CppCodeGen:
                     elif a.kind == "grad":
                         emit_line(f"Eigen::VectorXd _tmpF = Eigen::VectorXd::Zero(n_union);")
                         emit_line(f"for (auto& _m : {a.name}) {{")
-                        emit_line(f"    Eigen::Index _cols = std::min<Eigen::Index>(_m.cols(), 1);")
+                        emit_line(f"    Eigen::Index _cols = _m.cols();")
                         emit_line(f"    for (ssize_t _i=0; _i<n_union; ++_i) for (Eigen::Index _j=0; _j<_cols; ++_j) _tmpF(_i) += _m(_i,_j);")
                         emit_line("    }")
                         emit_line(f"for (ssize_t i=0;i<n_union;++i) F_view(e,i)+= _tmpF(i) * qw_view(e,q);")

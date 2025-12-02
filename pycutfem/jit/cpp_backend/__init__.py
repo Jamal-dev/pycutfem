@@ -30,7 +30,6 @@ def compile_backend_cpp(
     The return value matches the Numba backend: (runner, ir_sequence).
     """
     from pycutfem.jit.visitor import IRGenerator
-    from pycutfem.jit.cache import KernelCache
     from pycutfem.jit.codegen import NumbaCodeGen
     from .codegen import CppCodeGen
     from .cache import CppKernelCache
@@ -65,16 +64,6 @@ def compile_backend_cpp(
     ir_sequence = ir_generator.generate(integral_expression)
 
     try:
-        fallback_kernel, fallback_param_order = KernelCache().get_kernel(
-            ir_sequence, numba_codegen, mixed_element.signature()
-        )
-        fallback_runner = KernelRunnerCpp(
-            fallback_kernel, fallback_param_order, ir_sequence, dof_handler, fallback_runner=None
-        )
-    except Exception:
-        fallback_runner = None
-
-    try:
         kernel, param_order = cache.get_kernel(
             ir_sequence, cpp_codegen, mixed_element.signature()
         )
@@ -82,7 +71,7 @@ def compile_backend_cpp(
         # Fail hard so missing op coverage is fixed immediately.
         raise
 
-    runner = KernelRunnerCpp(kernel, param_order, ir_sequence, dof_handler, fallback_runner=fallback_runner)
+    runner = KernelRunnerCpp(kernel, param_order, ir_sequence, dof_handler, fallback_runner=None)
     return runner, ir_sequence
 
 

@@ -977,6 +977,7 @@ if __name__ == '__main__':
             'mat': True,
             'deg': 6,
         },
+        # looked until here
         "Mixed Basic [ddSw@I2]": {
             'pc': inner(pc_geo["ddSw_mixed"], I2_pc) * dx(metadata={"q": 6}),
             'f_lambda': lambda deg: ufl.inner(fe_geo["ddSw"], I2_fx) \
@@ -1337,7 +1338,7 @@ if __name__ == '__main__':
             'mat': False, 'deg': 4,
         },
 
-        # # -------- Vector field: H · n ----------
+        # -------- Vector field: H · n ----------
         # "Vector Hdotn LHS (ds)": {
         #     'pc': inner(dot(Hessian(pc['du']), n_pc), dot(Hessian(pc['v']), n_pc)) * dS(metadata = {"q":4},  tag = "all"),
         #     'f_lambda': lambda deg: ufl.inner(Hdotn_fx(du, n_fx), Hdotn_fx(v_fx, n_fx)) * ufl.ds(metadata={'quadrature_degree': deg}),

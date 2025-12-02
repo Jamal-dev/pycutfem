@@ -2144,7 +2144,7 @@ class NumbaCodeGen:
                                         field_names=field_names, parent_name=parent_name,
                                         side=side, field_sides=field_sides))
                 # ---------------------------------------------------------------------
-                # dot( grad(u_trial/test) ,  grad(u_test/trial) )          ← grad_u_mixed (k,m,n,d)
+                # dot( grad(u_trial/test) ,  u_test/trial )          ← grad_u_mixed (k,m,n,d)
                 # ---------------------------------------------------------------------
                 elif (a.role in {'trial', 'test'} and a.is_gradient and not a.is_hessian
                       and b.role in {'trial', 'test'} and b.is_vector and not b.is_gradient and not b.is_hessian):
