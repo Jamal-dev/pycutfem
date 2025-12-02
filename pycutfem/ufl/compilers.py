@@ -3841,13 +3841,7 @@ class FormCompiler:
         self.ctx['is_interface'] = False
         if is_functional:
             self.ctx.setdefault("scalar_results", {})[hook["name"]] = 0.0
-        from pycutfem.integration.quadrature import edge as edge_rule
-        if mesh.element_type == "quad":
-            edge_tangents = np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]], dtype=float)
-        elif mesh.element_type == "tri":
-            edge_tangents = np.array([[1.0, 0.0], [-1.0, 1.0], [0.0, -1.0]], dtype=float)
-        else:
-            raise ValueError(f"Unsupported element type '{mesh.element_type}' for boundary assembly.")
+        from pycutfem.integration.quadrature import line_quadrature
 
         # decide which edges we visit -------------------------------------
         defined = intg.measure.defined_on
@@ -3867,24 +3861,31 @@ class FormCompiler:
                 local_edge_idx = elem.local_edge_index(int(gid))
             except ValueError:
                 continue
-            ref_pts, ref_w = edge_rule(mesh.element_type, local_edge_idx, qdeg)
+            # physical endpoints of this *edge segment*
+            p0 = mesh.nodes_x_y_pos[edge.nodes[0]]
+            p1 = mesh.nodes_x_y_pos[edge.nodes[1]]
+            # Quadrature directly on the physical segment; weights already carry |J|
+            phys_pts, phys_w = line_quadrature(p0, p1, qdeg)
             # precompute element dofs once
             gdofs = self.dh.get_elemental_dofs(eid)
 
             # ------------------------------------------------------------------
             loc = None
-            for (xi, eta), w_ref in zip(ref_pts, ref_w):
+            tangent = p1 - p0
+            n_vec = np.array([tangent[1], -tangent[0]], dtype=float)
+            n_norm = np.linalg.norm(n_vec)
+            if n_norm > 0.0:
+                n_vec /= n_norm
+            # align with stored edge normal when available
+            if edge.normal is not None and np.dot(n_vec, edge.normal) < 0.0:
+                n_vec *= -1.0
+
+            for q_phys, w_phys in zip(phys_pts, phys_w):
+                x_phys = np.asarray(q_phys, dtype=float)
+                xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
                 J = transform.jacobian(mesh, eid, (float(xi), float(eta)))
-                t_vec = J @ edge_tangents[local_edge_idx]
-                edge_len = np.linalg.norm(t_vec)
-                normal = np.array([t_vec[1], -t_vec[0]], dtype=float)
-                n_norm = np.linalg.norm(normal)
-                if n_norm > 0.0:
-                    normal /= n_norm
-                if np.dot(normal, edge.normal) < 0.0:
-                    normal *= -1.0
+                normal = n_vec
                 self.ctx["normal"] = normal
-                x_phys = transform.x_mapping(mesh, eid, (float(xi), float(eta)))
                 Ji    = np.linalg.inv(J)
 
                 # basis cache ---------------------------------------------------
@@ -3899,9 +3900,8 @@ class FormCompiler:
                 self.ctx.update({"eid": eid, "x_phys": x_phys})
 
                 val = self._visit(intg.integrand)    # scalar, vec, or matrix
-                weight = float(w_ref) * edge_len
-                loc = (weight * np.asarray(val)
-                    if loc is None else loc + weight * np.asarray(val))
+                loc_val = float(w_phys) * np.asarray(val)
+                loc = loc_val if loc is None else loc + loc_val
 
             # ---------------- scatter -----------------------------------------
             if rhs and test:                   # linear form  (vector assemble)

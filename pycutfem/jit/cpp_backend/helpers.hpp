@@ -510,6 +510,12 @@ inline Eigen::MatrixXd contract_last_first(const Eigen::VectorXd& A,
     return A.transpose() * B;
 }
 
+// Convenience overload for fixed-size 2-vectors to avoid overload ambiguity
+inline Eigen::MatrixXd contract_last_first(const Eigen::Vector2d& A,
+                                           const Eigen::MatrixXd& B) {
+    return contract_last_first(static_cast<Eigen::VectorXd>(A), B);
+}
+
 // ALSO handle the case where A is passed as a thin MatrixXd (K, 1)
 inline Eigen::MatrixXd contract_last_first(const Eigen::MatrixXd& A, 
                                            const Eigen::MatrixXd& B) {

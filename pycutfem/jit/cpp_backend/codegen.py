@@ -66,6 +66,7 @@ class CppCodeGen:
         """
         analytic_map: dict[str, Any] = {}
         param_order: list[str] = []
+        required_args: set[str] = set()
 
         # IR op classes
         from pycutfem.jit.ir import (
@@ -180,6 +181,7 @@ class CppCodeGen:
         from pycutfem.jit.ir import (
             LoadVariable,
             LoadConstant,
+            LoadAnalytic,
             Grad,
             Hessian as IRHessian,
             Laplacian as IRLaplacian,
@@ -203,16 +205,32 @@ class CppCodeGen:
             counter["i"] += 1
             return f"{prefix}_{counter['i']}"
 
-        class StackItem:
-            __slots__ = ("name", "kind", "role", "shape", "field_names", "parent")
+        def component_side_tag(side: str, field_sides: list, idx: int) -> str:
+            if not side:
+                return ""
+            if field_sides and idx < len(field_sides) and field_sides[idx]:
+                return field_sides[idx]
+            return "pos" if side == "+" else "neg"
 
-            def __init__(self, name, kind, role, shape, field_names=None, parent=""):
+        def deriv_name(base: str, fn: str, side: str, field_sides: list, idx: int) -> str:
+            if not side:
+                return f"{base}_{fn}"
+            tag = component_side_tag(side, field_sides, idx)
+            rbase = "r" + base[1:]  # d10 -> r10 etc.
+            return f"{rbase}_{fn}_{tag}"
+
+        class StackItem:
+            __slots__ = ("name", "kind", "role", "shape", "field_names", "parent", "side", "field_sides")
+
+            def __init__(self, name, kind, role, shape, field_names=None, parent="", side="", field_sides=None):
                 self.name = name
                 self.kind = kind  # scalar | mat | grad | vec | const_arr
                 self.role = role
                 self.shape = shape
                 self.field_names = field_names or []
                 self.parent = parent  # parent symbol name for functions
+                self.side = side or ""
+                self.field_sides = field_sides or []
 
         # argument declaration ---------------------------------------------
         arg_decls: list[str] = []
@@ -221,7 +239,7 @@ class CppCodeGen:
                 arg_decls.append(
                     "py::array_t<int32_t, py::array::c_style | py::array::forcecast> gdofs_map"
                 )
-            elif name in {"qp_phys", "qw", "detJ", "J_inv", "normals", "phis"}:
+            elif name in {"qp_phys", "qw", "detJ", "J_inv", "J_inv_pos", "J_inv_neg", "normals", "phis"} or name.startswith(("pos_Hxi", "neg_Hxi")):
                 arg_decls.append(
                     f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}"
                 )
@@ -236,8 +254,13 @@ class CppCodeGen:
         view_lines = [
             "    auto qp_view = qp_phys.unchecked<3>();",
             "    auto qw_view = qw.unchecked<2>();",
-            "    auto Jinv_view = J_inv.unchecked<4>();",
         ]
+        if "J_inv" in param_order:
+            view_lines.append("    auto Jinv_view = J_inv.unchecked<4>();")
+        if "J_inv_pos" in param_order:
+            view_lines.append("    auto Jinv_pos_view = J_inv_pos.unchecked<4>();")
+        if "J_inv_neg" in param_order:
+            view_lines.append("    auto Jinv_neg_view = J_inv_neg.unchecked<4>();")
         for name in param_order:
             if name.startswith("b_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
@@ -245,11 +268,11 @@ class CppCodeGen:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
             if name == "normals":
                 view_lines.append(f"    auto normals_view = normals.unchecked<3>();")
-            if name.startswith(("d10_", "d01_", "d20_", "d11_", "d02_")):
+            if name.startswith(("d10_", "d01_", "d20_", "d11_", "d02_", "r10_", "r01_", "r20_", "r11_", "r02_")):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
             if name.startswith("u_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
-            if name in {"Hxi0", "Hxi1"}:
+            if name in {"Hxi0", "Hxi1", "pos_Hxi0", "pos_Hxi1", "neg_Hxi0", "neg_Hxi1"}:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
 
         prologue = [
@@ -324,12 +347,29 @@ class CppCodeGen:
                 nm = new_tmp("nrm_c")
                 emit_line(f"double {nm} = normals_view(e,q,{op.idx});")
                 stack.append(StackItem(nm, "scalar", "const", ()))
+            elif isinstance(op, LoadAnalytic):
+                name = f"ana_{op.func_id}"
+                required_args.add(name)
+                nm = new_tmp("ana")
+                if len(op.tensor_shape or ()) == 0:
+                    emit_line(f"auto {name}_view = {name}.unchecked<2>();")
+                    emit_line(f"double {nm} = {name}_view(e,q);")
+                    stack.append(StackItem(nm, "scalar", "const", ()))
+                elif len(op.tensor_shape) == 1:
+                    k = int(op.tensor_shape[0])
+                    emit_line(f"auto {name}_view = {name}.unchecked<3>();")
+                    emit_line(f"Eigen::VectorXd {nm}({k});")
+                    for ii in range(k):
+                        emit_line(f"{nm}({ii}) = {name}_view(e,q,{ii});")
+                    stack.append(StackItem(nm, "vec", "const", (k,)))
+                else:
+                    raise NotImplementedError("LoadAnalytic only implemented for scalar/vector tensors in C++ backend")
             elif isinstance(op, LoadVariable):
                 followed_by_diff = isinstance(next_op, (Grad,))
                 if op.role in {"test", "trial"} and op.deriv_order == (0, 0):
                     if followed_by_diff:
                         stack.append(
-                            StackItem("__basis__", "basis_ref", op.role, (len(op.field_names), -1), op.field_names, op.name)
+                            StackItem("__basis__", "basis_ref", op.role, (len(op.field_names), -1), op.field_names, op.name, op.side, op.field_sides)
                         )
                         continue
                     k = len(op.field_names)
@@ -339,7 +379,7 @@ class CppCodeGen:
                         emit_line(
                             f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx2}, j) = b_{fn}_view(e, q, j);"
                         )
-                    stack.append(StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name))
+                    stack.append(StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides))
                 elif op.role in {"test", "trial"} and op.deriv_order == (1, 0) or op.deriv_order == (0, 1):
                     raise NotImplementedError("Direct derivative load not handled; Grad op expected.")
                 elif op.role == "function":
@@ -347,14 +387,20 @@ class CppCodeGen:
                     coeff_name = f"u_{op.name}_loc"
                     k = len(op.field_names)
                     nm = new_tmp("val")
-                    emit_line(f"Eigen::VectorXd {nm}({k});")
-                    for idx, fn in enumerate(op.field_names):
-                        s0 = field_slices.get(fn, slice(0, 0)).start
-                        s1 = field_slices.get(fn, slice(0, 0)).stop
-                        emit_line(
-                            f"{nm}({idx}) = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0}, {s1});"
-                        )
-                    stack.append(StackItem(nm, "vec", "value", (k,), op.field_names, op.name))
+                    if k == 1:
+                        s0 = field_slices.get(op.field_names[0], slice(0, 0)).start
+                        s1 = field_slices.get(op.field_names[0], slice(0, 0)).stop
+                        emit_line(f"double {nm} = load_variable_component({coeff_name}_view, b_{op.field_names[0]}_view, e, q, {s0}, {s1});")
+                        stack.append(StackItem(nm, "scalar", "value", (), op.field_names, op.name, op.side, op.field_sides))
+                    else:
+                        emit_line(f"Eigen::VectorXd {nm}({k});")
+                        for idx, fn in enumerate(op.field_names):
+                            s0 = field_slices.get(fn, slice(0, 0)).start
+                            s1 = field_slices.get(fn, slice(0, 0)).stop
+                            emit_line(
+                                f"{nm}({idx}) = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0}, {s1});"
+                            )
+                        stack.append(StackItem(nm, "vec", "value", (k,), op.field_names, op.name, op.side, op.field_sides))
                 else:
                     raise NotImplementedError(f"LoadVariable role {op.role} unsupported in C++ backend")
             elif isinstance(op, Grad):
@@ -364,17 +410,19 @@ class CppCodeGen:
                     nm = new_tmp("grad")
                     emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({k});")
                     for idx, fn in enumerate(a.field_names):
+                        jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
+                        gname = f"g_{fn}_pos_view" if a.side == "+" else f"g_{fn}_neg_view" if a.side == "-" else f"g_{fn}_view"
                         emit_line(f"{nm}[{idx}] = Eigen::MatrixXd(n_union, 2);")
                         emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
                         emit_line(
-                            f"    double gx = g_{fn}_view(e,q,j,0); double gy = g_{fn}_view(e,q,j,1);"
+                            f"    double gx = {gname}(e,q,j,0); double gy = {gname}(e,q,j,1);"
                         )
                         emit_line(
-                            f"    double px = gx*Jloc(0,0) + gy*Jloc(1,0); double py = gx*Jloc(0,1) + gy*Jloc(1,1);"
+                            f"    double px = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0); double py = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);"
                         )
                         emit_line(f"    {nm}[{idx}](j,0)=px; {nm}[{idx}](j,1)=py;")
                         emit_line("}")
-                    stack.append(StackItem(nm, "grad", a.role, (k, -1, 2), a.field_names, a.parent))
+                    stack.append(StackItem(nm, "grad", a.role, (k, -1, 2), a.field_names, a.parent, a.side, a.field_sides))
                 elif a.kind == "vec" and a.role == "value":
                     # gradient of function value: use coefficient map and grad basis
                     k = len(a.field_names)
@@ -383,10 +431,11 @@ class CppCodeGen:
                     for idx, fn in enumerate(a.field_names):
                         s0 = field_slices.get(fn, slice(0, 0)).start
                         s1 = field_slices.get(fn, slice(0, 0)).stop
+                        jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
                         emit_line(
-                            f"gradient_component({nm}, {idx}, u_{a.parent}_loc_view, g_{fn}_view, Jloc, e, q, {s0}, {s1});"
+                            f"gradient_component({nm}, {idx}, u_{a.parent}_loc_view, g_{fn}_view, {jloc_var}, e, q, {s0}, {s1});"
                         )
-                    stack.append(StackItem(nm, "mat", "value", (k, 2), a.field_names, a.parent))
+                    stack.append(StackItem(nm, "mat", "value", (k, 2), a.field_names, a.parent, a.side, a.field_sides))
                 else:
                     raise NotImplementedError("Grad on unsupported item")
             elif isinstance(op, IRHessian):
@@ -398,16 +447,24 @@ class CppCodeGen:
                     for idx, fn in enumerate(a.field_names):
                         emit_line(f"{nm}[{idx}] = Eigen::MatrixXd(n_union, 4);")
                         emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
-                        emit_line(f"    double d20 = d20_{fn}_view(e,q,j); double d11 = d11_{fn}_view(e,q,j); double d02 = d02_{fn}_view(e,q,j);")
-                        emit_line(f"    double d10 = d10_{fn}_view(e,q,j); double d01 = d01_{fn}_view(e,q,j);")
-                        emit_line(f"    double tmp00 = d20 * Jloc(0,0) + d11 * Jloc(1,0);")
-                        emit_line(f"    double tmp01 = d20 * Jloc(0,1) + d11 * Jloc(1,1);")
-                        emit_line(f"    double tmp10 = d11 * Jloc(0,0) + d02 * Jloc(1,0);")
-                        emit_line(f"    double tmp11 = d11 * Jloc(0,1) + d02 * Jloc(1,1);")
-                        emit_line(f"    double h00 = Jloc(0,0)*tmp00 + Jloc(1,0)*tmp10 + d10*Hx(0,0) + d01*Hy(0,0);")
-                        emit_line(f"    double h01 = Jloc(0,1)*tmp00 + Jloc(1,1)*tmp10 + d10*Hx(0,1) + d01*Hy(0,1);")
-                        emit_line(f"    double h10 = Jloc(0,0)*tmp01 + Jloc(1,0)*tmp11 + d10*Hx(1,0) + d01*Hy(1,0);")
-                        emit_line(f"    double h11 = Jloc(0,1)*tmp01 + Jloc(1,1)*tmp11 + d10*Hx(1,1) + d01*Hy(1,1);")
+                        jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
+                        hx_var = "Hx_pos" if a.side == "+" else "Hx_neg" if a.side == "-" else "Hx"
+                        hy_var = "Hy_pos" if a.side == "+" else "Hy_neg" if a.side == "-" else "Hy"
+                        d20n = deriv_name("d20", fn, a.side, a.field_sides, idx)
+                        d11n = deriv_name("d11", fn, a.side, a.field_sides, idx)
+                        d02n = deriv_name("d02", fn, a.side, a.field_sides, idx)
+                        d10n = deriv_name("d10", fn, a.side, a.field_sides, idx)
+                        d01n = deriv_name("d01", fn, a.side, a.field_sides, idx)
+                        emit_line(f"    double d20 = {d20n}_view(e,q,j); double d11 = {d11n}_view(e,q,j); double d02 = {d02n}_view(e,q,j);")
+                        emit_line(f"    double d10 = {d10n}_view(e,q,j); double d01 = {d01n}_view(e,q,j);")
+                        emit_line(f"    double tmp00 = d20 * {jloc_var}(0,0) + d11 * {jloc_var}(1,0);")
+                        emit_line(f"    double tmp01 = d20 * {jloc_var}(0,1) + d11 * {jloc_var}(1,1);")
+                        emit_line(f"    double tmp10 = d11 * {jloc_var}(0,0) + d02 * {jloc_var}(1,0);")
+                        emit_line(f"    double tmp11 = d11 * {jloc_var}(0,1) + d02 * {jloc_var}(1,1);")
+                        emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10*{hx_var}(0,0) + d01*{hy_var}(0,0);")
+                        emit_line(f"    double h01 = {jloc_var}(0,1)*tmp00 + {jloc_var}(1,1)*tmp10 + d10*{hx_var}(0,1) + d01*{hy_var}(0,1);")
+                        emit_line(f"    double h10 = {jloc_var}(0,0)*tmp01 + {jloc_var}(1,0)*tmp11 + d10*{hx_var}(1,0) + d01*{hy_var}(1,0);")
+                        emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
                         emit_line(f"    {nm}[{idx}](j,0)=h00; {nm}[{idx}](j,1)=h01; {nm}[{idx}](j,2)=h10; {nm}[{idx}](j,3)=h11;");
                         emit_line("}")
                     stack.append(StackItem(nm, "hess", a.role, (k, -1, 2, 2), a.field_names, a.parent))
@@ -422,19 +479,27 @@ class CppCodeGen:
                         s1 = field_slices.get(fn, slice(0, 0)).stop
                         emit_line(f"for (ssize_t j={s0}; j<{s1}; ++j) {{")
                         emit_line(f"    double coeff = {coeff}_view(e,j);")
-                        emit_line(f"    double d20 = d20_{fn}_view(e,q,j); double d11 = d11_{fn}_view(e,q,j); double d02 = d02_{fn}_view(e,q,j);")
-                        emit_line(f"    double d10 = d10_{fn}_view(e,q,j); double d01 = d01_{fn}_view(e,q,j);")
-                        emit_line(f"    double tmp00 = d20 * Jloc(0,0) + d11 * Jloc(1,0);")
-                        emit_line(f"    double tmp01 = d20 * Jloc(0,1) + d11 * Jloc(1,1);")
-                        emit_line(f"    double tmp10 = d11 * Jloc(0,0) + d02 * Jloc(1,0);")
-                        emit_line(f"    double tmp11 = d11 * Jloc(0,1) + d02 * Jloc(1,1);")
-                        emit_line(f"    double h00 = Jloc(0,0)*tmp00 + Jloc(1,0)*tmp10 + d10*Hx(0,0) + d01*Hy(0,0);")
-                        emit_line(f"    double h01 = Jloc(0,1)*tmp00 + Jloc(1,1)*tmp10 + d10*Hx(0,1) + d01*Hy(0,1);")
-                        emit_line(f"    double h10 = Jloc(0,0)*tmp01 + Jloc(1,0)*tmp11 + d10*Hx(1,0) + d01*Hy(1,0);")
-                        emit_line(f"    double h11 = Jloc(0,1)*tmp01 + Jloc(1,1)*tmp11 + d10*Hx(1,1) + d01*Hy(1,1);")
+                        jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
+                        hx_var = "Hx_pos" if a.side == "+" else "Hx_neg" if a.side == "-" else "Hx"
+                        hy_var = "Hy_pos" if a.side == "+" else "Hy_neg" if a.side == "-" else "Hy"
+                        d20n = deriv_name("d20", fn, a.side, a.field_sides, idx)
+                        d11n = deriv_name("d11", fn, a.side, a.field_sides, idx)
+                        d02n = deriv_name("d02", fn, a.side, a.field_sides, idx)
+                        d10n = deriv_name("d10", fn, a.side, a.field_sides, idx)
+                        d01n = deriv_name("d01", fn, a.side, a.field_sides, idx)
+                        emit_line(f"    double d20 = {d20n}_view(e,q,j); double d11 = {d11n}_view(e,q,j); double d02 = {d02n}_view(e,q,j);")
+                        emit_line(f"    double d10 = {d10n}_view(e,q,j); double d01 = {d01n}_view(e,q,j);")
+                        emit_line(f"    double tmp00 = d20 * {jloc_var}(0,0) + d11 * {jloc_var}(1,0);")
+                        emit_line(f"    double tmp01 = d20 * {jloc_var}(0,1) + d11 * {jloc_var}(1,1);")
+                        emit_line(f"    double tmp10 = d11 * {jloc_var}(0,0) + d02 * {jloc_var}(1,0);")
+                        emit_line(f"    double tmp11 = d11 * {jloc_var}(0,1) + d02 * {jloc_var}(1,1);")
+                        emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10*{hx_var}(0,0) + d01*{hy_var}(0,0);")
+                        emit_line(f"    double h01 = {jloc_var}(0,1)*tmp00 + {jloc_var}(1,1)*tmp10 + d10*{hx_var}(0,1) + d01*{hy_var}(0,1);")
+                        emit_line(f"    double h10 = {jloc_var}(0,0)*tmp01 + {jloc_var}(1,0)*tmp11 + d10*{hx_var}(1,0) + d01*{hy_var}(1,0);")
+                        emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
                         emit_line(f"    {nm}({idx},0)+=coeff*h00; {nm}({idx},1)+=coeff*h01; {nm}({idx},2)+=coeff*h10; {nm}({idx},3)+=coeff*h11;");
                         emit_line("}")
-                    stack.append(StackItem(nm, "hess", "value", (k, 2, 2), a.field_names, a.parent))
+                    stack.append(StackItem(nm, "hess", "value", (k, 2, 2), a.field_names, a.parent, a.side, a.field_sides))
                 else:
                     raise NotImplementedError("Hessian on unsupported item")
             elif isinstance(op, IRLaplacian):
@@ -445,14 +510,22 @@ class CppCodeGen:
                     emit_line(f"Eigen::MatrixXd {nm}({k}, n_union);")
                     for idx, fn in enumerate(a.field_names):
                         emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
-                        emit_line(f"    double d20 = d20_{fn}_view(e,q,j); double d11 = d11_{fn}_view(e,q,j); double d02 = d02_{fn}_view(e,q,j);")
-                        emit_line(f"    double d10 = d10_{fn}_view(e,q,j); double d01 = d01_{fn}_view(e,q,j);")
-                        emit_line(f"    double tmp00 = d20 * Jloc(0,0) + d11 * Jloc(1,0);")
-                        emit_line(f"    double tmp01 = d20 * Jloc(0,1) + d11 * Jloc(1,1);")
-                        emit_line(f"    double tmp10 = d11 * Jloc(0,0) + d02 * Jloc(1,0);")
-                        emit_line(f"    double tmp11 = d11 * Jloc(0,1) + d02 * Jloc(1,1);")
-                        emit_line(f"    double h00 = Jloc(0,0)*tmp00 + Jloc(1,0)*tmp10 + d10*Hx(0,0) + d01*Hy(0,0);")
-                        emit_line(f"    double h11 = Jloc(0,1)*tmp01 + Jloc(1,1)*tmp11 + d10*Hx(1,1) + d01*Hy(1,1);")
+                        jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
+                        hx_var = "Hx_pos" if a.side == "+" else "Hx_neg" if a.side == "-" else "Hx"
+                        hy_var = "Hy_pos" if a.side == "+" else "Hy_neg" if a.side == "-" else "Hy"
+                        d20n = deriv_name("d20", fn, a.side, a.field_sides, idx)
+                        d11n = deriv_name("d11", fn, a.side, a.field_sides, idx)
+                        d02n = deriv_name("d02", fn, a.side, a.field_sides, idx)
+                        d10n = deriv_name("d10", fn, a.side, a.field_sides, idx)
+                        d01n = deriv_name("d01", fn, a.side, a.field_sides, idx)
+                        emit_line(f"    double d20 = {d20n}_view(e,q,j); double d11 = {d11n}_view(e,q,j); double d02 = {d02n}_view(e,q,j);")
+                        emit_line(f"    double d10 = {d10n}_view(e,q,j); double d01 = {d01n}_view(e,q,j);")
+                        emit_line(f"    double tmp00 = d20 * {jloc_var}(0,0) + d11 * {jloc_var}(1,0);")
+                        emit_line(f"    double tmp01 = d20 * {jloc_var}(0,1) + d11 * {jloc_var}(1,1);")
+                        emit_line(f"    double tmp10 = d11 * {jloc_var}(0,0) + d02 * {jloc_var}(1,0);")
+                        emit_line(f"    double tmp11 = d11 * {jloc_var}(0,1) + d02 * {jloc_var}(1,1);")
+                        emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10*{hx_var}(0,0) + d01*{hy_var}(0,0);")
+                        emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
                         emit_line(f"    {nm}({idx}, j) = h00 + h11;");
                         emit_line("}")
                     stack.append(StackItem(nm, "mat", a.role, (k, -1), a.field_names, a.parent))
@@ -467,17 +540,25 @@ class CppCodeGen:
                         s1 = field_slices.get(fn, slice(0, 0)).stop
                         emit_line(f"for (ssize_t j={s0}; j<{s1}; ++j) {{")
                         emit_line(f"    double coeff = {coeff}_view(e,j);")
-                        emit_line(f"    double d20 = d20_{fn}_view(e,q,j); double d11 = d11_{fn}_view(e,q,j); double d02 = d02_{fn}_view(e,q,j);")
-                        emit_line(f"    double d10 = d10_{fn}_view(e,q,j); double d01 = d01_{fn}_view(e,q,j);")
-                        emit_line(f"    double tmp00 = d20 * Jloc(0,0) + d11 * Jloc(1,0);")
-                        emit_line(f"    double tmp01 = d20 * Jloc(0,1) + d11 * Jloc(1,1);")
-                        emit_line(f"    double tmp10 = d11 * Jloc(0,0) + d02 * Jloc(1,0);")
-                        emit_line(f"    double tmp11 = d11 * Jloc(0,1) + d02 * Jloc(1,1);")
-                        emit_line(f"    double h00 = Jloc(0,0)*tmp00 + Jloc(1,0)*tmp10 + d10*Hx(0,0) + d01*Hy(0,0);")
-                        emit_line(f"    double h11 = Jloc(0,1)*tmp01 + Jloc(1,1)*tmp11 + d10*Hx(1,1) + d01*Hy(1,1);")
+                        jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
+                        hx_var = "Hx_pos" if a.side == "+" else "Hx_neg" if a.side == "-" else "Hx"
+                        hy_var = "Hy_pos" if a.side == "+" else "Hy_neg" if a.side == "-" else "Hy"
+                        d20n = deriv_name("d20", fn, a.side, a.field_sides, idx)
+                        d11n = deriv_name("d11", fn, a.side, a.field_sides, idx)
+                        d02n = deriv_name("d02", fn, a.side, a.field_sides, idx)
+                        d10n = deriv_name("d10", fn, a.side, a.field_sides, idx)
+                        d01n = deriv_name("d01", fn, a.side, a.field_sides, idx)
+                        emit_line(f"    double d20 = {d20n}_view(e,q,j); double d11 = {d11n}_view(e,q,j); double d02 = {d02n}_view(e,q,j);")
+                        emit_line(f"    double d10 = {d10n}_view(e,q,j); double d01 = {d01n}_view(e,q,j);")
+                        emit_line(f"    double tmp00 = d20 * {jloc_var}(0,0) + d11 * {jloc_var}(1,0);")
+                        emit_line(f"    double tmp01 = d20 * {jloc_var}(0,1) + d11 * {jloc_var}(1,1);")
+                        emit_line(f"    double tmp10 = d11 * {jloc_var}(0,0) + d02 * {jloc_var}(1,0);")
+                        emit_line(f"    double tmp11 = d11 * {jloc_var}(0,1) + d02 * {jloc_var}(1,1);")
+                        emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10*{hx_var}(0,0) + d01*{hy_var}(0,0);")
+                        emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
                         emit_line(f"    {nm}({idx}) += coeff * (h00 + h11);");
                         emit_line("}")
-                    stack.append(StackItem(nm, "vec", "value", (k,), a.field_names, a.parent))
+                    stack.append(StackItem(nm, "mat", "value", (k,), a.field_names, a.parent, a.side, a.field_sides))
                 else:
                     raise NotImplementedError("Laplacian on unsupported item")
             elif isinstance(op, Div):
@@ -1102,15 +1183,53 @@ class CppCodeGen:
 
         loop_block = "\n".join(body_lines)
 
+        jloc_lines: list[str] = []
+        if "J_inv" in param_order:
+            jloc_lines += [
+                "            Eigen::Matrix<double,2,2> Jloc;",
+                "            Jloc(0,0)=Jinv_view(e,q,0,0); Jloc(0,1)=Jinv_view(e,q,0,1);",
+                "            Jloc(1,0)=Jinv_view(e,q,1,0); Jloc(1,1)=Jinv_view(e,q,1,1);",
+            ]
+        if "J_inv_pos" in param_order:
+            jloc_lines += [
+                "            Eigen::Matrix<double,2,2> Jloc_pos;",
+                "            Jloc_pos(0,0)=Jinv_pos_view(e,q,0,0); Jloc_pos(0,1)=Jinv_pos_view(e,q,0,1);",
+                "            Jloc_pos(1,0)=Jinv_pos_view(e,q,1,0); Jloc_pos(1,1)=Jinv_pos_view(e,q,1,1);",
+            ]
+        if "J_inv_neg" in param_order:
+            jloc_lines += [
+                "            Eigen::Matrix<double,2,2> Jloc_neg;",
+                "            Jloc_neg(0,0)=Jinv_neg_view(e,q,0,0); Jloc_neg(0,1)=Jinv_neg_view(e,q,0,1);",
+                "            Jloc_neg(1,0)=Jinv_neg_view(e,q,1,0); Jloc_neg(1,1)=Jinv_neg_view(e,q,1,1);",
+            ]
+
         hxhy_lines: list[str] = []
         if "Hxi0" in param_order and "Hxi1" in param_order:
-            hxhy_lines = [
+            hxhy_lines += [
                 "            Eigen::Matrix<double,2,2> Hx;",
                 "            Eigen::Matrix<double,2,2> Hy;",
                 "            Hx(0,0)=Hxi0_view(e,q,0,0); Hx(0,1)=Hxi0_view(e,q,0,1);",
                 "            Hx(1,0)=Hxi0_view(e,q,1,0); Hx(1,1)=Hxi0_view(e,q,1,1);",
                 "            Hy(0,0)=Hxi1_view(e,q,0,0); Hy(0,1)=Hxi1_view(e,q,0,1);",
                 "            Hy(1,0)=Hxi1_view(e,q,1,0); Hy(1,1)=Hxi1_view(e,q,1,1);",
+            ]
+        if "pos_Hxi0" in param_order and "pos_Hxi1" in param_order:
+            hxhy_lines += [
+                "            Eigen::Matrix<double,2,2> Hx_pos;",
+                "            Eigen::Matrix<double,2,2> Hy_pos;",
+                "            Hx_pos(0,0)=pos_Hxi0_view(e,q,0,0); Hx_pos(0,1)=pos_Hxi0_view(e,q,0,1);",
+                "            Hx_pos(1,0)=pos_Hxi0_view(e,q,1,0); Hx_pos(1,1)=pos_Hxi0_view(e,q,1,1);",
+                "            Hy_pos(0,0)=pos_Hxi1_view(e,q,0,0); Hy_pos(0,1)=pos_Hxi1_view(e,q,0,1);",
+                "            Hy_pos(1,0)=pos_Hxi1_view(e,q,1,0); Hy_pos(1,1)=pos_Hxi1_view(e,q,1,1);",
+            ]
+        if "neg_Hxi0" in param_order and "neg_Hxi1" in param_order:
+            hxhy_lines += [
+                "            Eigen::Matrix<double,2,2> Hx_neg;",
+                "            Eigen::Matrix<double,2,2> Hy_neg;",
+                "            Hx_neg(0,0)=neg_Hxi0_view(e,q,0,0); Hx_neg(0,1)=neg_Hxi0_view(e,q,0,1);",
+                "            Hx_neg(1,0)=neg_Hxi0_view(e,q,1,0); Hx_neg(1,1)=neg_Hxi0_view(e,q,1,1);",
+                "            Hy_neg(0,0)=neg_Hxi1_view(e,q,0,0); Hy_neg(0,1)=neg_Hxi1_view(e,q,0,1);",
+                "            Hy_neg(1,0)=neg_Hxi1_view(e,q,1,0); Hy_neg(1,1)=neg_Hxi1_view(e,q,1,1);",
             ]
 
         full_src = (
@@ -1124,9 +1243,7 @@ static py::tuple {kernel_name}(
 
     for (ssize_t e = 0; e < n_elem; ++e) {{
         for (ssize_t q = 0; q < n_q; ++q) {{
-            Eigen::Matrix<double,2,2> Jloc;
-            Jloc(0,0)=Jinv_view(e,q,0,0); Jloc(0,1)=Jinv_view(e,q,0,1);
-            Jloc(1,0)=Jinv_view(e,q,1,0); Jloc(1,1)=Jinv_view(e,q,1,1);
+{chr(10).join(jloc_lines)}
 {chr(10).join(hxhy_lines)}
 {loop_block}
         }}

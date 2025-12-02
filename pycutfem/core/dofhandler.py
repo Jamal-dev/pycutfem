@@ -2844,7 +2844,7 @@ class DofHandler:
         """
         import numpy as np
         from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
-        from pycutfem.integration.quadrature import line_quadrature
+        from pycutfem.integration.quadrature import line_quadrature, curved_line_quadrature_batch
         from pycutfem.fem import transform
         from pycutfem.fem.transform import (
             hess_inverse_from_forward,
@@ -2925,18 +2925,30 @@ class DofHandler:
             p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
             P0[i] = p0; P1[i] = p1
 
-        xi1, w_ref = gauss_legendre(qdeg)
-        xi1 = np.asarray(xi1, float); w_ref = np.asarray(w_ref, float)
-        nQ  = xi1.size
-
-        qp_phys = np.empty((nE, nQ, 2), dtype=float)
-        qw      = np.empty((nE, nQ),    dtype=float)
-        if _HAVE_NUMBA:
-            _batched(P0, P1, xi1, w_ref, qp_phys, qw)
-        else:
-            for i in range(nE):
-                pts, wts = line_quadrature(P0[i], P1[i], qdeg)
-                qp_phys[i, :, :] = pts; qw[i, :] = wts
+        qp_phys = None
+        qw      = None
+        if nE > 0:
+            # prefer curved projection when available (captures curved interfaces)
+            try:
+                qpts_curved, qw_curved = curved_line_quadrature_batch(
+                    level_set, P0, P1, order=qdeg, nseg=max(1, getattr(mesh, "poly_order", 1)),
+                    mesh=mesh, eids=np.array([e.left for e in edges], dtype=int)
+                )
+                qp_phys = np.asarray(qpts_curved, dtype=float)
+                qw = np.asarray(qw_curved, dtype=float)
+            except Exception:
+                xi1, w_ref = gauss_legendre(qdeg)
+                xi1 = np.asarray(xi1, float); w_ref = np.asarray(w_ref, float)
+                nQ  = xi1.size
+                qp_phys = np.empty((nE, nQ, 2), dtype=float)
+                qw      = np.empty((nE, nQ),    dtype=float)
+                if _HAVE_NUMBA:
+                    _batched(P0, P1, xi1, w_ref, qp_phys, qw)
+                else:
+                    for i in range(nE):
+                        pts, wts = line_quadrature(P0[i], P1[i], qdeg)
+                        qp_phys[i, :, :] = pts; qw[i, :] = wts
+        nQ = 0 if qp_phys is None else qp_phys.shape[1]
 
         # 2) Oriented normals & signed distance φ -----------------------------------
         normals = np.empty((nE, nQ, 2), dtype=float)
@@ -3636,7 +3648,21 @@ class DofHandler:
         Returns per-edge arrays sized to the given subset and ready for JIT.
         Emits REFERENCE derivative tables d.._{field}; push-forward is done in codegen.py.
         """
-        from pycutfem.integration.quadrature import edge as edge_rule  # type: ignore
+        from pycutfem.integration.quadrature import (
+            edge as edge_rule,  # type: ignore
+            line_quadrature,
+            curved_line_quadrature,
+        )
+        # Minimal level-set placeholder for curved quadrature when only geometry matters
+        class _ZeroLS:
+            def __call__(self, x0, x1=None):
+                try:
+                    return 0.0 * float(x0)
+                except Exception:
+                    return 0.0
+            def gradient(self, x):
+                return np.zeros_like(np.asarray(x, float))
+        _zero_ls = _ZeroLS()
         from pycutfem.fem import transform
         from pycutfem.integration.pre_tabulates import (
             _tabulate_q1 as _tab_q1,
@@ -3691,7 +3717,8 @@ class DofHandler:
         else:
             edge_ids = list(int(i) for i in edge_ids)        # already a sequence
 
-        edge_ids = np.asarray(edge_ids, dtype=np.int32)
+        # Deduplicate any repeated boundary edges (some meshes may list both orientations)
+        edge_ids = np.unique(np.asarray(edge_ids, dtype=np.int32))
         n_edges  = int(edge_ids.shape[0])
         if n_edges == 0:
             return {"eids": np.empty(0, dtype=np.int32)}  # nothing to do
@@ -3708,17 +3735,12 @@ class DofHandler:
         if reuse and cache_key in _edge_geom_cache:
             return _edge_geom_cache[cache_key]
 
-        # ---- sizes -----------------------------------------------------------------
-        # n_edges = len(edge_ids)
-        pts_ref, w_ref = edge_rule(mesh.element_type, 0, qdeg)
-        n_q = len(w_ref)
-
-        # ---- work arrays -----------------------------------------------------------
-        qp_phys  = np.zeros((n_edges, n_q, 2), dtype=float)
-        qw       = np.zeros((n_edges, n_q),    dtype=float)
-        normals  = np.zeros((n_edges, n_q, 2), dtype=float)
-        detJ     = np.zeros((n_edges, n_q),    dtype=float)
-        J_inv    = np.zeros((n_edges, n_q, 2, 2), dtype=float)
+        # ---- work arrays (sized after picking quadrature rule) ---------------------
+        qp_phys  = None
+        qw       = None
+        normals  = None
+        detJ     = None
+        J_inv    = None
         phis     = None  # boundary integral has no level-set
         gdofs_map = np.zeros((n_edges, n_loc), dtype=np.int64)
         h_arr     = np.zeros((n_edges,), dtype=float)
@@ -3733,6 +3755,7 @@ class DofHandler:
             edge_tangents = np.array([[1.0, 0.0], [-1.0, 1.0], [0.0, -1.0]], dtype=float)
         else:
             raise ValueError(f"Unsupported element type '{mesh.element_type}' for boundary assembly.")
+
         owner = np.empty((n_edges,), dtype=np.int32)
         local_edge_idx = np.empty((n_edges,), dtype=np.int32)
         edge_normals = []
@@ -3752,27 +3775,38 @@ class DofHandler:
                 p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
                 h = float(np.linalg.norm(p1 - p0))
             h_arr[i] = float(h)
-        xi_tab  = np.empty((n_edges, n_q), dtype=float)
-        eta_tab = np.empty((n_edges, n_q), dtype=float)
-        qw_ref  = np.empty((n_edges, n_q), dtype=float)
+        # ---- quadrature (curved-aware via line inversion) --------------------------
+        xi_tab_list  = []
+        eta_tab_list = []
+        use_curved = getattr(mesh, "poly_order", 1) > 1
         for i in range(n_edges):
-            pts_edge, w_edge = edge_rule(mesh.element_type, int(local_edge_idx[i]), qdeg)
-            xi_tab[i, :] = pts_edge[:, 0]
-            eta_tab[i, :] = pts_edge[:, 1]
-            qw_ref[i, :] = w_edge
+            e = mesh.edge(int(edge_ids[i]))
+            p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+            if use_curved:
+                qpts, qwts = curved_line_quadrature(_zero_ls, p0, p1, order=qdeg, nseg=max(1, getattr(mesh, "poly_order", 1)))
+            else:
+                qpts, qwts = line_quadrature(p0, p1, qdeg)
+            if qp_phys is None:
+                n_q = len(qwts)
+                qp_phys = np.zeros((n_edges, n_q, 2), dtype=float)
+                qw      = np.zeros((n_edges, n_q),    dtype=float)
+                normals = np.zeros((n_edges, n_q, 2), dtype=float)
+                detJ    = np.zeros((n_edges, n_q),    dtype=float)
+                J_inv   = np.zeros((n_edges, n_q, 2, 2), dtype=float)
+            qp_phys[i, :, :] = qpts.reshape(-1, 2)
+            qw[i, :] = qwts
 
-        # ---- map reference edge points to physical space & normals -----------------
-        for i in range(n_edges):
-            eid = int(owner[i])
+            xi_eta = np.zeros((len(qwts), 2), dtype=float)
             ed_norm = edge_normals[i]
-            t_ref = edge_tangents[int(local_edge_idx[i])]
-            for q in range(n_q):
-                xi = float(xi_tab[i, q]); eta = float(eta_tab[i, q])
-                qp_phys[i, q] = transform.x_mapping(mesh, eid, (xi, eta))
-                J = transform.jacobian(mesh, eid, (xi, eta))
-                t_vec = J @ t_ref
-                edge_len = np.linalg.norm(t_vec)
-                qw[i, q] = qw_ref[i, q] * edge_len
+            eid = int(owner[i])
+            for q in range(len(qwts)):
+                xi, eta = transform.inverse_mapping(mesh, eid, qp_phys[i, q])
+                xi_eta[q, 0] = xi; xi_eta[q, 1] = eta
+                J = transform.jacobian(mesh, eid, (float(xi), float(eta)))
+                t_ref = edge_tangents[int(local_edge_idx[i])]
+                t_ref_len = float(np.linalg.norm(t_ref))
+                t_hat = t_ref / t_ref_len if t_ref_len > 0.0 else t_ref
+                t_vec = J @ t_hat
                 normal = np.array([t_vec[1], -t_vec[0]], dtype=float)
                 norm_len = np.linalg.norm(normal)
                 if norm_len > 0.0:
@@ -3780,6 +3814,10 @@ class DofHandler:
                 if np.dot(normal, ed_norm) < 0.0:
                     normal *= -1.0
                 normals[i, q] = normal
+            xi_tab_list.append(xi_eta[:, 0])
+            eta_tab_list.append(xi_eta[:, 1])
+        xi_tab  = np.asarray(xi_tab_list, dtype=float)
+        eta_tab = np.asarray(eta_tab_list, dtype=float)
 
         # ---- reference dN for geometry order; build J, detJ, J⁻¹ ------------------
         node_ids_all = mesh.nodes[mesh.elements_connectivity]
@@ -3833,7 +3871,7 @@ class DofHandler:
             if need_o4:
                 Qxi0 = np.zeros((n_edges, n_q, 2, 2, 2, 2), dtype=float)
                 Qxi1 = np.zeros_like(Qxi0)
-            for i, eid in enumerate(eids_arr):
+            for i, eid in enumerate(owner):
                 eidi = int(eid)
                 for q in range(n_q):
                     rec = _JET.get(mesh, eidi, float(xi_tab[i, q]), float(eta_tab[i, q]), upto=kmax)
