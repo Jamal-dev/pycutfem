@@ -67,15 +67,18 @@ class CppCodeGen:
         analytic_map: dict[str, Any] = {}
         param_order: list[str] = []
         required_args: set[str] = set()
+        ewc_rank: dict[str, int] = {}
 
         # IR op classes
         from pycutfem.jit.ir import (
             LoadVariable,
             LoadConstant,
             LoadConstantArray,
+            LoadElementWiseConstant,
             LoadFacetNormal,
             LoadFacetNormalComponent,
             CellDiameter,
+            CheckDomain,
             Grad,
             Hessian as IRHessian,
             Laplacian as IRLaplacian,
@@ -170,6 +173,11 @@ class CppCodeGen:
                                 f"r10_{fn}_{tg}", f"r01_{fn}_{tg}",
                                 f"r20_{fn}_{tg}", f"r11_{fn}_{tg}", f"r02_{fn}_{tg}",
                             })
+            if isinstance(op, LoadElementWiseConstant):
+                rank = 1 + len(getattr(op, "tensor_shape", ()) or ())
+                ewc_rank[op.name] = rank
+                if op.name not in param_order:
+                    param_order.append(op.name)
             if isinstance(op, (LoadFacetNormal, LoadFacetNormalComponent)):
                 needs_normals = True
             if isinstance(op, CellDiameter):
@@ -216,6 +224,10 @@ class CppCodeGen:
         for name in sorted(needs_r00):
             if name not in param_order:
                 param_order.append(name)
+        # Domain flags requested by CheckDomain
+        for name in sorted([n for n in required_args if isinstance(n, str) and n.startswith("domain_flag_")]):
+            if name not in param_order:
+                param_order.append(name)
 
         module_name = module_name or kernel_name
 
@@ -226,12 +238,14 @@ class CppCodeGen:
             LoadVariable,
             LoadConstant,
             LoadAnalytic,
+            LoadElementWiseConstant,
             Grad,
             Hessian as IRHessian,
             Laplacian as IRLaplacian,
             LoadFacetNormal,
             LoadFacetNormalComponent,
             CellDiameter,
+            CheckDomain,
             Div,
             BinaryOp,
             Dot,
@@ -258,6 +272,56 @@ class CppCodeGen:
 
         def choose_field_sides(fs_a, fs_b):
             return fs_a if fs_a else fs_b
+
+        def resolve_metadata(a: StackItem, b: StackItem, prefer: str | None = None, strict: bool = False):
+            """
+            Merge (field_names, parent_name, side, field_sides) from two operands.
+            Mirrors the helper in pycutfem/jit/codegen.py.
+            """
+            def default_for(attr: str):
+                return [] if attr == "field_names" else ""
+
+            def has_value(item: StackItem, attr: str) -> bool:
+                if attr == "field_names":
+                    return bool(item.field_names)
+                if attr == "parent":
+                    return bool(item.parent)
+                if attr == "side":
+                    return bool(item.side)
+                if attr == "field_sides":
+                    return any(bool(s) for s in (item.field_sides or []))
+                return False
+
+            def pick(attr: str, aval, bval, ahas, bhas):
+                if prefer == "a" and ahas: return aval
+                if prefer == "b" and bhas: return bval
+                if prefer == "basis":
+                    a_is_basis = a.role in {"test","trial"}
+                    b_is_basis = b.role in {"test","trial"}
+                    if a_is_basis and not b_is_basis and ahas: return aval
+                    if b_is_basis and not a_is_basis and bhas: return bval
+                    if a_is_basis and b_is_basis:
+                        if a.role == "test" and ahas: return aval
+                        if b.role == "test" and bhas: return bval
+                if ahas and not bhas: return aval
+                if bhas and not ahas: return bval
+                if ahas and bhas:
+                    if aval == bval:
+                        return aval
+                    if strict and attr in ("field_names","parent"):
+                        raise ValueError(f"Metadata conflict for '{attr}': {aval} vs {bval}")
+                    return default_for(attr)
+                return default_for(attr)
+
+            resolved = {}
+            resolved["field_names"] = pick("field_names", a.field_names, b.field_names, has_value(a,"field_names"), has_value(b,"field_names"))
+            resolved["parent"] = pick("parent", a.parent, b.parent, has_value(a,"parent"), has_value(b,"parent"))
+            resolved["side"] = pick("side", a.side, b.side, has_value(a,"side"), has_value(b,"side"))
+            fs = pick("field_sides", a.field_sides, b.field_sides, has_value(a,"field_sides"), has_value(b,"field_sides"))
+            if not resolved["side"]:
+                fs = []
+            resolved["field_sides"] = fs
+            return resolved["field_names"], resolved["parent"], resolved["side"], resolved["field_sides"]
 
         def component_side_tag(side: str, field_sides: list, field_name, idx: int) -> str:
             if not side:
@@ -303,6 +367,10 @@ class CppCodeGen:
                 arg_decls.append(
                     f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}"
                 )
+            elif name.startswith("domain_flag_"):
+                arg_decls.append(
+                    f"py::array_t<uint8_t, py::array::c_style | py::array::forcecast> {name}"
+                )
             else:
                 arg_decls.append(
                     f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}"
@@ -336,6 +404,10 @@ class CppCodeGen:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
             if name.startswith("u_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+            if name.startswith("domain_flag_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+            if name in ewc_rank:
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<{ewc_rank[name]}>();")
             if name in {"Hxi0", "Hxi1", "pos_Hxi0", "pos_Hxi1", "neg_Hxi0", "neg_Hxi1"}:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
             if name.startswith(("pos_map", "neg_map")):
@@ -386,6 +458,22 @@ class CppCodeGen:
                 emit_line("}")
                 emit_line("else { throw std::runtime_error(\"Unsupported constant array rank for C++ backend\"); }")
                 stack.append(StackItem(nm, kind, "const", shape))
+            elif isinstance(op, LoadElementWiseConstant):
+                required_args.add(op.name)
+                required_args.add("owner_id")
+                tshape = tuple(op.tensor_shape or ())
+                if len(tshape) == 0:
+                    nm = new_tmp("ewc")
+                    emit_line(f"double {nm} = {op.name}_view(owner_id_view(e));")
+                    stack.append(StackItem(nm, "scalar", "value", ()))
+                elif len(tshape) == 1:
+                    k = int(tshape[0])
+                    nm = new_tmp("ewc_vec")
+                    emit_line(f"Eigen::VectorXd {nm}({k});")
+                    emit_line(f"for (int _i=0; _i<{k}; ++_i) {nm}(_i) = {op.name}_view(owner_id_view(e), _i);")
+                    stack.append(StackItem(nm, "vec", "value", (k,)))
+                else:
+                    raise NotImplementedError("LoadElementWiseConstant only implemented for scalar/vector tensors in C++ backend")
             elif isinstance(op, CellDiameter):
                 required_args.add("owner_id")
                 required_args.add("h_arr")
@@ -402,6 +490,25 @@ class CppCodeGen:
                 nm = new_tmp("nrm_c")
                 emit_line(f"double {nm} = normals_view(e,q,{op.idx});")
                 stack.append(StackItem(nm, "scalar", "const", ()))
+            elif isinstance(op, CheckDomain):
+                a = stack.pop()
+                flag = f"domain_flag_{op.bitset_id}"
+                required_args.add(flag)
+                nm = new_tmp("restricted")
+                if a.kind == "scalar" and (a.shape == () or a.shape == tuple()):
+                    emit_line(f"double {nm} = {flag}_view(e,q) ? {a.name} : 0.0;")
+                elif a.kind in {"vec", "mat"}:
+                    emit_line(f"auto {nm} = {a.name};")
+                    emit_line(f"if (!{flag}_view(e,q)) {nm}.setZero();")
+                elif a.kind in {"grad", "mixed", "hess"}:
+                    emit_line(f"auto {nm} = {a.name};")
+                    emit_line(f"if (!{flag}_view(e,q)) {{")
+                    emit_line(f"    for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i].setZero();")
+                    emit_line("}")
+                else:
+                    emit_line(f"auto {nm} = {a.name};")
+                    emit_line(f"if (!{flag}_view(e,q)) {nm}.setZero();")
+                stack.append(StackItem(nm, a.kind, a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
             elif isinstance(op, LoadAnalytic):
                 name = f"ana_{op.func_id}"
                 required_args.add(name)
@@ -445,7 +552,8 @@ class CppCodeGen:
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : ({s0} + j);")
+                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(f"    if (src >= {basis_len}) continue;")
                             emit_line(f"    {nm}({idx2}, col) = {basis_name}_view(e, q, src);")
                             emit_line("}")
                         else:
@@ -454,7 +562,46 @@ class CppCodeGen:
                             )
                     stack.append(StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides))
                 elif op.role in {"test", "trial"} and op.deriv_order in {(1, 0), (0, 1)}:
-                    raise NotImplementedError("Direct derivative load not handled; Grad op expected.")
+                    # First derivative requested directly (no Grad op).
+                    # Build a (k x n_union) matrix with the selected physical component.
+                    k = len(op.field_names)
+                    nm = new_tmp("d1")
+                    emit_line(f"Eigen::MatrixXd {nm}({k}, n_union);")
+                    emit_line(f"{nm}.setZero();")
+                    comp = 0 if op.deriv_order == (1, 0) else 1
+                    jloc_var = "Jloc_pos" if op.side == "+" else "Jloc_neg" if op.side == "-" else "Jloc"
+                    for idx2, fn in enumerate(op.field_names):
+                        side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx2)
+                        bool_sided = self.on_facet and side_tag in ("pos", "neg")
+                        if bool_sided:
+                            d10 = f"r10_{fn}_{side_tag}"
+                            d01 = f"r01_{fn}_{side_tag}"
+                            map_name = f"{side_tag}_map_{fn}"
+                            required_args.update({d10, d01, map_name})
+                            map_len = new_tmp("map_len")
+                            basis_len = new_tmp("basis_len")
+                            emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
+                            emit_line(f"ssize_t {basis_len} = {d10}_view.shape(2);")
+                            emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
+                            emit_line(f"    int col = {map_name}_view(e, j);")
+                            emit_line(f"    if (col < 0 || col >= n_union) continue;")
+                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(f"    if (src >= {basis_len}) continue;")
+                            emit_line(f"    double gr0 = {d10}_view(e,q,src); double gr1 = {d01}_view(e,q,src);")
+                            emit_line(f"    double px = gr0*{jloc_var}(0,0) + gr1*{jloc_var}(1,0);")
+                            emit_line(f"    double py = gr0*{jloc_var}(0,1) + gr1*{jloc_var}(1,1);")
+                            emit_line(f"    {nm}({idx2}, col) = ({comp}==0 ? px : py);")
+                            emit_line("}")
+                        else:
+                            gname = f"g_{fn}_view"
+                            required_args.add(f"g_{fn}")
+                            emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
+                            emit_line(f"    double gx = {gname}(e,q,j,0); double gy = {gname}(e,q,j,1);")
+                            emit_line(f"    double px = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
+                            emit_line(f"    double py = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
+                            emit_line(f"    {nm}({idx2}, j) = ({comp}==0 ? px : py);")
+                            emit_line("}")
+                    stack.append(StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides))
                 elif op.role in {"test", "trial"} and op.deriv_order in {(2, 0), (1, 1), (0, 2)}:
                     k = len(op.field_names)
                     nm = new_tmp("d2")
@@ -476,11 +623,12 @@ class CppCodeGen:
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : ({s0} + j);")
+                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(f"    if (src >= {basis_len}) continue;")
                             emit_line(f"    {nm}({idx2}, col) = {table_name}_view(e, q, src);")
                             emit_line("}")
-                        else:
-                            emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx2}, j) = {table_name}_view(e, q, j);")
+                    else:
+                        emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx2}, j) = {table_name}_view(e, q, j);")
                     stack.append(StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides))
                 elif op.role == "function":
                     # coeffs are pre-gathered u_<name>_loc[e, :]
@@ -491,9 +639,12 @@ class CppCodeGen:
                             StackItem("__func__", "vec", "value", (len(op.field_names),), op.field_names, op.name, op.side, op.field_sides)
                         )
                     else:
+                        # Normal unsided functions should not carry field_sides.
+                        fs_clean = [] if not op.side else (op.field_sides or [])
                         k = len(op.field_names)
                         nm = new_tmp("val")
                         emit_line(f"Eigen::VectorXd {nm}({k});")
+                        emit_line(f"{nm}.setZero();")
                         for idx, fn in enumerate(op.field_names):
                             s0 = field_slices.get(fn, slice(0, 0)).start
                             s1 = field_slices.get(fn, slice(0, 0)).stop
@@ -509,18 +660,24 @@ class CppCodeGen:
                                 emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                                 emit_line(f"    int col = {map_name}_view(e, j);")
                                 emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                                emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : ({s0} + j);")
+                                emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                                emit_line(f"    if (src >= {basis_len}) continue;")
                                 emit_line(f"    {nm}({idx}) += {coeff_name}_view(e, col) * {basis_name}_view(e, q, src);")
                                 emit_line("}")
                             else:
+                                s0_adj = new_tmp("s0")
+                                s1_adj = new_tmp("s1")
+                                emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                                emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                                emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
                                 emit_line(
-                                    f"{nm}({idx}) = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0}, {s1});"
+                                    f"{nm}({idx}) = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0_adj}, {s1_adj});"
                                 )
                         if k == 1:
                             emit_line(f"double {nm}_scalar = {nm}(0);")
-                            stack.append(StackItem(f"{nm}_scalar", "scalar", "value", (), op.field_names, op.name, op.side, op.field_sides))
+                            stack.append(StackItem(f"{nm}_scalar", "scalar", "value", (), op.field_names, op.name, op.side, fs_clean))
                         else:
-                            stack.append(StackItem(nm, "vec", "value", (k,), op.field_names, op.name, op.side, op.field_sides))
+                            stack.append(StackItem(nm, "vec", "value", (k,), op.field_names, op.name, op.side, fs_clean))
                 else:
                     raise NotImplementedError(f"LoadVariable role {op.role} unsupported in C++ backend")
             elif isinstance(op, Grad):
@@ -546,7 +703,8 @@ class CppCodeGen:
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : ({s0} + j);")
+                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(f"    if (src >= {basis_len}) continue;")
                             emit_line(f"    double gx = {d10}_view(e,q,src); double gy = {d01}_view(e,q,src);")
                             emit_line(f"    double px = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
                             emit_line(f"    double py = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
@@ -587,7 +745,8 @@ class CppCodeGen:
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : ({s0} + j);")
+                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(f"    if (src >= {basis_len}) continue;")
                             emit_line(f"    double gr0 = {d10}_view(e,q,src); double gr1 = {d01}_view(e,q,src);")
                             emit_line(f"    double px = gr0*{jloc_var}(0,0) + gr1*{jloc_var}(1,0);")
                             emit_line(f"    double py = gr0*{jloc_var}(0,1) + gr1*{jloc_var}(1,1);")
@@ -596,8 +755,13 @@ class CppCodeGen:
                             emit_line("}")
                             emit_line(f"{nm}({idx},0) = {gx_var}; {nm}({idx},1) = {gy_var};")
                         else:
+                            s0_adj = new_tmp("s0")
+                            s1_adj = new_tmp("s1")
+                            emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                            emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                            emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
                             emit_line(
-                                f"gradient_component({nm}, {idx}, u_{a.parent}_loc_view, g_{fn}_view, {jloc_var}, e, q, {s0}, {s1});"
+                                f"gradient_component({nm}, {idx}, u_{a.parent}_loc_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
                             )
                     stack.append(StackItem(nm, "mat", "value", (k, 2), a.field_names, a.parent, a.side, a.field_sides))
                 else:
@@ -641,7 +805,12 @@ class CppCodeGen:
                     for idx, fn in enumerate(a.field_names):
                         s0 = field_slices.get(fn, slice(0, 0)).start
                         s1 = field_slices.get(fn, slice(0, 0)).stop
-                        emit_line(f"for (ssize_t j={s0}; j<{s1}; ++j) {{")
+                        s0_adj = new_tmp("s0")
+                        s1_adj = new_tmp("s1")
+                        emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                        emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                        emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                        emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
                         emit_line(f"    double coeff = {coeff}_view(e,j);")
                         jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
                         hx_var = "Hx_pos" if a.side == "+" else "Hx_neg" if a.side == "-" else "Hx"
@@ -702,7 +871,12 @@ class CppCodeGen:
                     for idx, fn in enumerate(a.field_names):
                         s0 = field_slices.get(fn, slice(0, 0)).start
                         s1 = field_slices.get(fn, slice(0, 0)).stop
-                        emit_line(f"for (ssize_t j={s0}; j<{s1}; ++j) {{")
+                        s0_adj = new_tmp("s0")
+                        s1_adj = new_tmp("s1")
+                        emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                        emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                        emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                        emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
                         emit_line(f"    double coeff = {coeff}_view(e,j);")
                         jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
                         hx_var = "Hx_pos" if a.side == "+" else "Hx_neg" if a.side == "-" else "Hx"
@@ -748,225 +922,11 @@ class CppCodeGen:
                 b = stack.pop()
                 a = stack.pop()
                 nm = new_tmp("bin")
-                if op.op_symbol == "+":
-                    if a.kind == "grad" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name}[_i];")
-                        stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "mixed" and b.kind == "mixed":
-                        emit_line(f"auto {nm} = add_mixed({a.name}, {b.name});")
-                        stack.append(StackItem(nm, "mixed", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "mixed" and b.kind == "mat":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name};")
-                        stack.append(StackItem(nm, "mixed", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "mat" and b.kind == "mixed":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name} + {b.name}[_i];")
-                        stack.append(StackItem(nm, "mixed", b.role, b.shape, b.field_names, b.parent))
-                    elif a.kind == "mixed" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name}[_i];")
-                        stack.append(StackItem(nm, "mixed", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "grad" and b.kind == "mixed":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name}[_i];")
-                        stack.append(StackItem(nm, "mixed", b.role, b.shape, b.field_names, b.parent))
-                    elif a.kind == "mat" and b.kind == "grad":
-                        emit_line(f"auto {nm} = add_grad_mat(GradStack{{{b.name}}}, {a.name}).comps;")
-                        stack.append(StackItem(nm, "grad", b.role, b.shape, b.field_names, b.parent))
-                    elif a.kind == "grad" and b.kind == "mat":
-                        emit_line(f"auto {nm} = add_grad_mat(GradStack{{{a.name}}}, {b.name}).comps;")
-                        stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, a.parent))
-                    else:
-                        emit_line(f"auto {nm} = {a.name} + {b.name};")
-                        stack.append(StackItem(nm, a.kind, a.role, a.shape))
-                elif op.op_symbol == "-":
-                    if a.kind == "grad" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
-                        stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "mixed" and b.kind == "mixed":
-                        emit_line(f"auto {nm} = sub_mixed({a.name}, {b.name});")
-                        stack.append(StackItem(nm, "mixed", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "mixed" and b.kind == "mat":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name};")
-                        stack.append(StackItem(nm, "mixed", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "mat" and b.kind == "mixed":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name} - {b.name}[_i];")
-                        stack.append(StackItem(nm, "mixed", b.role, b.shape, b.field_names, b.parent))
-                    elif a.kind == "mixed" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
-                        stack.append(StackItem(nm, "mixed", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "grad" and b.kind == "mixed":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
-                        stack.append(StackItem(nm, "mixed", b.role, b.shape, b.field_names, b.parent))
-                    elif a.kind == "hess" and b.kind == "hess":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(std::min({a.name}.size(), {b.name}.size()));")
-                        emit_line(f"for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
-                        stack.append(StackItem(nm, "hess", a.role or b.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, combine_side(a.side, b.side), choose_field_sides(a.field_sides, b.field_sides)))
-                    elif a.kind == "mat" and b.kind == "grad":
-                        emit_line(f"auto {nm} = mat_sub_grad({a.name}, GradStack{{{b.name}}}).comps;")
-                        stack.append(StackItem(nm, "grad", b.role, b.shape, b.field_names, b.parent))
-                    elif a.kind == "grad" and b.kind == "mat":
-                        emit_line(f"auto {nm} = sub_grad_mat(GradStack{{{a.name}}}, {b.name}).comps;")
-                        stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "scalar" and b.kind == "mat":
-                        emit_line(f"Eigen::MatrixXd {nm}(n_union, {b.name}.cols());")
-                        emit_line(f"{nm}.setConstant({a.name});")
-                        emit_line(f"{nm} -= {b.name};")
-                        stack.append(StackItem(nm, "mat", b.role, (-1, -1), b.field_names, b.parent))
-                    elif a.kind == "scalar" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {{")
-                        emit_line(f"    {nm}[_i] = Eigen::MatrixXd(n_union, {b.name}[_i].cols());")
-                        emit_line(f"    {nm}[_i].setConstant({a.name});")
-                        emit_line(f"    {nm}[_i] -= {b.name}[_i];")
-                        emit_line("}")
-                        stack.append(StackItem(nm, "grad", b.role, b.shape, b.field_names, b.parent))
-                    else:
-                        emit_line(f"auto {nm} = {a.name} - {b.name};")
-                        stack.append(StackItem(nm, a.kind, a.role, a.shape))
-                elif op.op_symbol == "*":
-                    print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})")
-                    if a.kind == "mixed" and b.kind == "mixed":
-                        emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')
-                        continue
-                    if a.kind == "scalar" and b.kind == "mixed":
-                        emit_line(f"auto {nm} = scale_mixed({b.name}, {a.name});")
-                        stack.append(StackItem(nm, "mixed", b.role, b.shape, b.field_names, b.parent))
-                        continue
-                    if b.kind == "scalar" and a.kind == "mixed":
-                        emit_line(f"auto {nm} = scale_mixed({a.name}, {b.name});")
-                        stack.append(StackItem(nm, "mixed", a.role, a.shape, a.field_names, a.parent))
-                        continue
-                    if a.kind == "mixed" and len(a.shape) == 3 and b.kind == "mat":
-                        emit_line(f"auto {nm} = scale_mixed_basis_with_coeffs({a.name}, {b.name});")
-                        new_shape = (b.shape[0], a.shape[1], a.shape[2], b.shape[1])
-                        stack.append(StackItem(nm, "mixed", a.role, new_shape, a.field_names, a.parent))
-                        continue
-                    if b.kind == "mixed" and len(b.shape) == 3 and a.kind == "mat":
-                        emit_line(f"auto {nm} = scale_mixed_basis_with_coeffs({b.name}, {a.name});")
-                        new_shape = (a.shape[0], b.shape[1], b.shape[2], a.shape[1])
-                        stack.append(StackItem(nm, "mixed", b.role, new_shape, b.field_names, b.parent))
-                        continue
-                    # Multiplication of basis with Identity matrix
-                    if a.kind == "mat" and b.kind == "mat" \
-                        and a.role in {"test", "trial"} and b.role in {"const"} and b.shape == (2, 2):
-                        emit_line(f"auto {nm} = trace_times_identity({a.name}, {b.name});")
-                        stack.append(StackItem(nm, "grad", a.role, (b.shape[0], -1, b.shape[1]), a.field_names, a.parent))
-                        continue
-                    if a.kind == "mat" and b.kind == "mat" \
-                        and b.role in {"test", "trial"} and a.role in {"const"} and a.shape == (2, 2):
-                        emit_line(f"auto {nm} = trace_times_identity({b.name}, {a.name});")
-                        stack.append(StackItem(nm, "grad", b.role, (a.shape[0], -1, a.shape[1]), b.field_names, b.parent))
-                        continue
-                    # Outer product when scaling test/trial basis (1,n) with value vector (1,n) -> n x n
-                    if a.kind == "mat" and a.shape[0] == 1 and a.role in {"test", "trial"} and b.kind == "mat" and b.shape[0] == 1 and b.role == "value":
-                        emit_line(f"Eigen::MatrixXd {nm} = {a.name}.transpose() * {b.name};")
-                        stack.append(StackItem(nm, "mat", "value", (-1, -1)))
-                        continue
-                    if b.kind == "mat" and b.shape[0] == 1 and b.role in {"test", "trial"} and a.kind == "mat" and a.shape[0] == 1 and a.role == "value":
-                        emit_line(f"Eigen::MatrixXd {nm} = {b.name}.transpose() * {a.name};")
-                        stack.append(StackItem(nm, "mat", "value", (-1, -1)))
-                        continue
-                    # Outer product for scalar test/trial factors (e.g., pressure · div(velocity))
-                    if a.kind == "mat" and b.kind == "mat" and a.role == "test" and b.role == "trial" and a.shape[0] == 1 and b.shape[0] == 1:
-                        emit_line(f"Eigen::MatrixXd {nm} = {a.name}.transpose() * {b.name};")
-                        stack.append(StackItem(nm, "mat", "value", (-1, -1)))
-                        continue
-                    if a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "test" and a.shape[0] == 1 and b.shape[0] == 1:
-                        emit_line(f"Eigen::MatrixXd {nm} = {b.name}.transpose() * {a.name};")
-                        stack.append(StackItem(nm, "mat", "value", (-1, -1)))
-                        continue
-                    # Scalar test/trial basis (1,n) multiplied by value vector (k,) -> vector of length n
-                    if a.kind == "vec" and b.kind == "mat" and b.role in {"test", "trial"} and b.shape[0] == 1:
-                        emit_line(f"Eigen::VectorXd {nm} = {b.name}.row(0).transpose() * {a.name}(0);")
-                        stack.append(StackItem(nm, "vec", b.role, (-1,), b.field_names, b.parent))
-                        continue
-                    if a.kind == "mat" and a.role in {"test", "trial"} and a.shape[0] == 1 and b.kind == "vec":
-                        emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() * {b.name}(0);")
-                        stack.append(StackItem(nm, "vec", a.role, (-1,), a.field_names, a.parent))
-                        continue
-                    # Mixed gradients: scalar basis × grad basis
-                    if a.kind == "mat" and a.role == "trial" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "test":
-                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {a.name}.transpose();")
-                        emit_line(f"auto {nm} = scalar_trial_times_grad_test({b.name}, _scalar_{nm});")
-                        stack.append(StackItem(nm, "mixed", "mixed", (b.shape[0], b.shape[1], a.shape[1], b.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
-                        continue
-                    if a.kind == "grad" and a.role == "test" and b.kind == "mat" and b.role == "trial" and len(b.shape) >= 2 and b.shape[0] == 1:
-                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {b.name}.transpose();")
-                        emit_line(f"auto {nm} = scalar_trial_times_grad_test({a.name}, _scalar_{nm});")
-                        stack.append(StackItem(nm, "mixed", "mixed", (a.shape[0], a.shape[1], b.shape[1], a.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
-                        continue
-                    if a.kind == "mat" and a.role == "test" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "trial":
-                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {a.name}.transpose();")
-                        emit_line(f"auto {nm} = grad_trial_times_scalar_test({b.name}, _scalar_{nm});")
-                        stack.append(StackItem(nm, "mixed", "mixed", (b.shape[0], a.shape[1], b.shape[1], b.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
-                        continue
-                    if a.kind == "grad" and a.role == "trial" and b.kind == "mat" and b.role == "test" and len(b.shape) >= 2 and b.shape[0] == 1:
-                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {b.name}.transpose();")
-                        emit_line(f"auto {nm} = grad_trial_times_scalar_test({a.name}, _scalar_{nm});")
-                        stack.append(StackItem(nm, "mixed", "mixed", (a.shape[0], b.shape[1], a.shape[1], a.shape[2]), a.field_names or b.field_names, a.parent or b.parent))
-                        continue
-                    if a.kind == "scalar" and b.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {b.name}[_i] * {a.name};")
-                        stack.append(StackItem(nm, "grad", b.role, b.shape, b.field_names, b.parent))
-                    elif b.kind == "scalar" and a.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] * {b.name};")
-                        stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "grad" and b.kind == "grad":
-                        emit_line(f"auto {nm} = cwise_grad_grad(GradStack{{{a.name}}}, GradStack{{{b.name}}}).comps;")
-                        stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "grad" and b.kind == "mat":
-                        emit_line(f"auto {nm} = cwise_grad_mat(GradStack{{{a.name}}}, {b.name}).comps;")
-                        stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, a.parent))
-                    elif a.kind == "mat" and b.kind == "grad":
-                        emit_line(f"auto {nm} = cwise_mat_grad({a.name}, GradStack{{{b.name}}}).comps;")
-                        stack.append(StackItem(nm, "grad", b.role, b.shape, b.field_names, b.parent))
-                    elif a.kind == "hess" and b.kind == "hess":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(std::min({a.name}.size(), {b.name}.size()));")
-                        emit_line(f"for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
-                        stack.append(StackItem(nm, "hess", a.role or b.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, combine_side(a.side, b.side), choose_field_sides(a.field_sides, b.field_sides)))
-                    elif a.kind == "scalar" and b.kind != "scalar":
-                        emit_line(f"auto {nm} = {b.name} * {a.name};")
-                        stack.append(StackItem(nm, b.kind, b.role, b.shape))
-                    elif b.kind == "scalar" and a.kind != "scalar":
-                        emit_line(f"auto {nm} = {a.name} * {b.name};")
-                        stack.append(StackItem(nm, a.kind, a.role, a.shape))
-                    elif a.kind == "scalar" and b.kind == "scalar":
-                        emit_line(f"double {nm} = {a.name} * {b.name};")
-                        stack.append(StackItem(nm, "scalar", a.role, ()))
-                    else:
-                        emit_line(f"auto {nm} = {a.name}.cwiseProduct({b.name});")
-                        stack.append(StackItem(nm, a.kind, a.role, a.shape))
-                elif op.op_symbol == "/":
-                    if b.kind == "scalar" and a.kind == "grad":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] / {b.name};")
-                        stack.append(StackItem(nm, "grad", a.role, a.shape, a.field_names, a.parent))
-                    elif b.kind == "scalar":
-                        emit_line(f"auto {nm} = {a.name} / {b.name};")
-                        stack.append(StackItem(nm, a.kind, a.role, a.shape))
-                    else:
-                        raise NotImplementedError("Only scalar denominator supported")
-                else:
-                    raise NotImplementedError(f"Binary op {op.op_symbol} unsupported")
-            elif isinstance(op, Dot):
-                b = stack.pop()
-                a = stack.pop()
-                nm = new_tmp("dot")
                 side = combine_side(a.side, b.side)
                 f_sides = choose_field_sides(a.field_sides, b.field_sides)
                 f_names = a.field_names or b.field_names
                 parent = a.parent or b.parent
-                def push(kind, role, shape, field_names=None, parent_name=None, side_override=None, field_sides=None):
+                def push_bin(kind, role, shape, field_names=None, parent_name=None, side_override=None, field_sides=None):
                     stack.append(
                         StackItem(
                             nm,
@@ -979,12 +939,269 @@ class CppCodeGen:
                             field_sides if field_sides is not None else f_sides,
                         )
                     )
+                if op.op_symbol == "+":
+                    if a.kind == "grad" and b.kind == "grad":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name}[_i];")
+                        push_bin("grad", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "mixed" and b.kind == "mixed":
+                        emit_line(f"auto {nm} = add_mixed({a.name}, {b.name});")
+                        push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "mixed" and b.kind == "mat":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name};")
+                        push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "mat" and b.kind == "mixed":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name} + {b.name}[_i];")
+                        push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
+                    elif a.kind == "mixed" and b.kind == "grad":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name}[_i];")
+                        push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "grad" and b.kind == "mixed":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name}[_i];")
+                        push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
+                    elif a.kind == "mat" and b.kind == "grad":
+                        emit_line(f"auto {nm} = add_grad_mat(GradStack{{{b.name}}}, {a.name}).comps;")
+                        push_bin("grad", b.role, b.shape, b.field_names, b.parent)
+                    elif a.kind == "grad" and b.kind == "mat":
+                        emit_line(f"auto {nm} = add_grad_mat(GradStack{{{a.name}}}, {b.name}).comps;")
+                        push_bin("grad", a.role, a.shape, a.field_names, a.parent)
+                    else:
+                        emit_line(f"auto {nm} = {a.name} + {b.name};")
+                        push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
+                elif op.op_symbol == "-":
+                    if a.kind == "grad" and b.kind == "grad":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
+                        push_bin("grad", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "mixed" and b.kind == "mixed":
+                        emit_line(f"auto {nm} = sub_mixed({a.name}, {b.name});")
+                        push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "mixed" and b.kind == "mat":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name};")
+                        push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "mat" and b.kind == "mixed":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name} - {b.name}[_i];")
+                        push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
+                    elif a.kind == "mixed" and b.kind == "grad":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
+                        push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "grad" and b.kind == "mixed":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
+                        push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
+                    elif a.kind == "hess" and b.kind == "hess":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(std::min({a.name}.size(), {b.name}.size()));")
+                        emit_line(f"for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
+                        push_bin("hess", a.role or b.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, combine_side(a.side, b.side), choose_field_sides(a.field_sides, b.field_sides))
+                    elif a.kind == "mat" and b.kind == "grad":
+                        emit_line(f"auto {nm} = mat_sub_grad({a.name}, GradStack{{{b.name}}}).comps;")
+                        push_bin("grad", b.role, b.shape, b.field_names, b.parent)
+                    elif a.kind == "grad" and b.kind == "mat":
+                        emit_line(f"auto {nm} = sub_grad_mat(GradStack{{{a.name}}}, {b.name}).comps;")
+                        push_bin("grad", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "scalar" and b.kind == "mat":
+                        emit_line(f"Eigen::MatrixXd {nm}(n_union, {b.name}.cols());")
+                        emit_line(f"{nm}.setConstant({a.name});")
+                        emit_line(f"{nm} -= {b.name};")
+                        push_bin("mat", b.role, (-1, -1), b.field_names, b.parent)
+                    elif a.kind == "scalar" and b.kind == "grad":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {{")
+                        emit_line(f"    {nm}[_i] = Eigen::MatrixXd(n_union, {b.name}[_i].cols());")
+                        emit_line(f"    {nm}[_i].setConstant({a.name});")
+                        emit_line(f"    {nm}[_i] -= {b.name}[_i];")
+                        emit_line("}")
+                        push_bin("grad", b.role, b.shape, b.field_names, b.parent)
+                    else:
+                        emit_line(f"auto {nm} = {a.name} - {b.name};")
+                        push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
+                elif op.op_symbol == "*":
+                    print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})")
+                    if a.kind == "mixed" and b.kind == "mixed":
+                        emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')
+                        continue
+                    if a.kind == "scalar" and b.kind == "mixed":
+                        emit_line(f"auto {nm} = scale_mixed({b.name}, {a.name});")
+                        push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
+                        continue
+                    if b.kind == "scalar" and a.kind == "mixed":
+                        emit_line(f"auto {nm} = scale_mixed({a.name}, {b.name});")
+                        push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
+                        continue
+                    if a.kind == "mixed" and len(a.shape) == 3 and b.kind == "mat":
+                        emit_line(f"auto {nm} = scale_mixed_basis_with_coeffs({a.name}, {b.name});")
+                        new_shape = (b.shape[0], a.shape[1], a.shape[2], b.shape[1])
+                        push_bin("mixed", a.role, new_shape, a.field_names, a.parent)
+                        continue
+                    if b.kind == "mixed" and len(b.shape) == 3 and a.kind == "mat":
+                        emit_line(f"auto {nm} = scale_mixed_basis_with_coeffs({b.name}, {a.name});")
+                        new_shape = (a.shape[0], b.shape[1], b.shape[2], a.shape[1])
+                        push_bin("mixed", b.role, new_shape, b.field_names, b.parent)
+                        continue
+                    # Multiplication of basis with Identity matrix
+                    if a.kind == "mat" and b.kind == "mat" \
+                        and a.role in {"test", "trial"} and b.role in {"const"} and b.shape == (2, 2):
+                        emit_line(f"auto {nm} = trace_times_identity({a.name}, {b.name});")
+                        push_bin("grad", a.role, (b.shape[0], -1, b.shape[1]), a.field_names, a.parent)
+                        continue
+                    if a.kind == "mat" and b.kind == "mat" \
+                        and b.role in {"test", "trial"} and a.role in {"const"} and a.shape == (2, 2):
+                        emit_line(f"auto {nm} = trace_times_identity({b.name}, {a.name});")
+                        push_bin("grad", b.role, (a.shape[0], -1, a.shape[1]), b.field_names, b.parent)
+                        continue
+                    # Outer product when scaling test/trial basis (1,n) with value vector (1,n) -> n x n
+                    if a.kind == "mat" and a.shape[0] == 1 and a.role in {"test", "trial"} and b.kind == "mat" and b.shape[0] == 1 and b.role == "value":
+                        emit_line(f"Eigen::MatrixXd {nm} = {a.name}.transpose() * {b.name};")
+                        push_bin("mat", "value", (-1, -1))
+                        continue
+                    if b.kind == "mat" and b.shape[0] == 1 and b.role in {"test", "trial"} and a.kind == "mat" and a.shape[0] == 1 and a.role == "value":
+                        emit_line(f"Eigen::MatrixXd {nm} = {b.name}.transpose() * {a.name};")
+                        push_bin("mat", "value", (-1, -1))
+                        continue
+                    # Outer product for scalar test/trial factors (e.g., pressure · div(velocity))
+                    if a.kind == "mat" and b.kind == "mat" and a.role == "test" and b.role == "trial" and a.shape[0] == 1 and b.shape[0] == 1:
+                        emit_line(f"Eigen::MatrixXd {nm} = {a.name}.transpose() * {b.name};")
+                        push_bin("mat", "value", (-1, -1))
+                        continue
+                    if a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "test" and a.shape[0] == 1 and b.shape[0] == 1:
+                        emit_line(f"Eigen::MatrixXd {nm} = {b.name}.transpose() * {a.name};")
+                        push_bin("mat", "value", (-1, -1))
+                        continue
+                    # Scalar test/trial basis (1,n) multiplied by value vector (k,) -> vector of length n
+                    if a.kind == "vec" and b.kind == "mat" and b.role in {"test", "trial"} and b.shape[0] == 1:
+                        emit_line(f"Eigen::VectorXd {nm} = {b.name}.row(0).transpose() * {a.name}(0);")
+                        push_bin("vec", b.role, (-1,), b.field_names, b.parent)
+                        continue
+                    if a.kind == "mat" and a.role in {"test", "trial"} and a.shape[0] == 1 and b.kind == "vec":
+                        emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() * {b.name}(0);")
+                        push_bin("vec", a.role, (-1,), a.field_names, a.parent)
+                        continue
+                    # Mixed gradients: scalar basis × grad basis
+                    if a.kind == "mat" and a.role == "trial" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "test":
+                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {a.name}.transpose();")
+                        emit_line(f"auto {nm} = scalar_trial_times_grad_test({b.name}, _scalar_{nm});")
+                        push_bin("mixed", "mixed", (b.shape[0], b.shape[1], a.shape[1], b.shape[2]), a.field_names or b.field_names, a.parent or b.parent)
+                        continue
+                    if a.kind == "grad" and a.role == "test" and b.kind == "mat" and b.role == "trial" and len(b.shape) >= 2 and b.shape[0] == 1:
+                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {b.name}.transpose();")
+                        emit_line(f"auto {nm} = scalar_trial_times_grad_test({a.name}, _scalar_{nm});")
+                        push_bin("mixed", "mixed", (a.shape[0], a.shape[1], b.shape[1], a.shape[2]), a.field_names or b.field_names, a.parent or b.parent)
+                        continue
+                    if a.kind == "mat" and a.role == "test" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "trial":
+                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {a.name}.transpose();")
+                        emit_line(f"auto {nm} = grad_trial_times_scalar_test({b.name}, _scalar_{nm});")
+                        push_bin("mixed", "mixed", (b.shape[0], a.shape[1], b.shape[1], b.shape[2]), a.field_names or b.field_names, a.parent or b.parent)
+                        continue
+                    if a.kind == "grad" and a.role == "trial" and b.kind == "mat" and b.role == "test" and len(b.shape) >= 2 and b.shape[0] == 1:
+                        emit_line(f"Eigen::VectorXd _scalar_{nm} = {b.name}.transpose();")
+                        emit_line(f"auto {nm} = grad_trial_times_scalar_test({a.name}, _scalar_{nm});")
+                        push_bin("mixed", "mixed", (a.shape[0], b.shape[1], a.shape[1], a.shape[2]), a.field_names or b.field_names, a.parent or b.parent)
+                        continue
+                    if a.kind == "scalar" and b.kind == "grad":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {b.name}[_i] * {a.name};")
+                        push_bin("grad", b.role, b.shape, b.field_names, b.parent)
+                    elif b.kind == "scalar" and a.kind == "grad":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] * {b.name};")
+                        push_bin("grad", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "grad" and b.kind == "grad":
+                        emit_line(f"auto {nm} = cwise_grad_grad(GradStack{{{a.name}}}, GradStack{{{b.name}}}).comps;")
+                        push_bin("grad", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "grad" and b.kind == "mat":
+                        emit_line(f"auto {nm} = cwise_grad_mat(GradStack{{{a.name}}}, {b.name}).comps;")
+                        push_bin("grad", a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "mat" and b.kind == "grad":
+                        emit_line(f"auto {nm} = cwise_mat_grad({a.name}, GradStack{{{b.name}}}).comps;")
+                        push_bin("grad", b.role, b.shape, b.field_names, b.parent)
+                    elif a.kind == "hess" and b.kind == "hess":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(std::min({a.name}.size(), {b.name}.size()));")
+                        emit_line(f"for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
+                        push_bin("hess", a.role or b.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, combine_side(a.side, b.side), choose_field_sides(a.field_sides, b.field_sides))
+                    elif a.kind == "scalar" and b.kind != "scalar":
+                        emit_line(f"auto {nm} = {b.name} * {a.name};")
+                        push_bin(b.kind, b.role, b.shape, b.field_names, b.parent)
+                    elif b.kind == "scalar" and a.kind != "scalar":
+                        emit_line(f"auto {nm} = {a.name} * {b.name};")
+                        push_bin(a.kind, a.role, a.shape, a.field_names, a.parent)
+                    elif a.kind == "scalar" and b.kind == "scalar":
+                        emit_line(f"double {nm} = {a.name} * {b.name};")
+                        push_bin("scalar", a.role, (), a.field_names or b.field_names, a.parent or b.parent)
+                    else:
+                        emit_line(f"auto {nm} = {a.name}.cwiseProduct({b.name});")
+                        push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
+                elif op.op_symbol == "/":
+                    if b.kind == "scalar" and a.kind == "grad":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] / {b.name};")
+                        push_bin("grad", a.role, a.shape, a.field_names, a.parent)
+                    elif b.kind == "scalar":
+                        emit_line(f"auto {nm} = {a.name} / {b.name};")
+                        push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
+                    else:
+                        raise NotImplementedError("Only scalar denominator supported")
+                else:
+                    raise NotImplementedError(f"Binary op {op.op_symbol} unsupported")
+            elif isinstance(op, Dot):
+                b = stack.pop()
+                a = stack.pop()
+                nm = new_tmp("dot")
+                side = combine_side(a.side, b.side)
+                f_sides = choose_field_sides(a.field_sides, b.field_sides)
+                f_names = a.field_names or b.field_names
+                parent = a.parent or b.parent
+                def dot_role(role_in: str) -> str:
+                    # Preserve mixed role if either operand is mixed
+                    if a.kind == "mixed" or b.kind == "mixed" or a.role == "mixed" or b.role == "mixed":
+                        return "mixed"
+                    # If one side is a basis (test/trial) and the other is const/value/scalar, keep basis role.
+                    basis_roles = {"test", "trial"}
+                    const_roles = {"const", "value", "scalar", ""}
+                    if a.role in basis_roles and b.role in const_roles:
+                        return a.role
+                    if b.role in basis_roles and a.role in const_roles:
+                        return b.role
+                    return role_in
+
+                def push(kind, role, shape, field_names=None, parent_name=None, side_override=None, field_sides=None):
+                    role = dot_role(role)
+                    # Merge metadata, preferring basis operands when applicable
+                    meta_fnames, meta_parent, meta_side, meta_fsides = resolve_metadata(a, b, prefer="basis")
+                    if field_names is not None:
+                        meta_fnames = field_names
+                    if parent_name is not None:
+                        meta_parent = parent_name
+                    if side_override is not None:
+                        meta_side = side_override
+                    if field_sides is not None:
+                        meta_fsides = field_sides
+                    stack.append(
+                        StackItem(
+                            nm,
+                            kind,
+                            role,
+                            shape,
+                            meta_fnames,
+                            meta_parent,
+                            meta_side,
+                            meta_fsides,
+                        )
+                    )
                 a_union_mat = a.kind == "mat" and len(a.shape) >= 2 and a.shape[1] == -1
                 b_union_mat = b.kind == "mat" and len(b.shape) >= 2 and b.shape[1] == -1
                 is_a_2x2 = a.kind == "mat" and a.shape == (2,2)
                 is_b_2x2 = b.kind == "mat" and b.shape == (2,2)
                 is_a_1d = a.kind == "vec" and a.shape[0] > 1
                 is_b_1d = b.kind == "vec" and b.shape[0] > 1
+                print(f"[dot] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
+                      f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})")
                 # trial/test mass
                 # Gradient advection combinations: grad(Function) · Trial  or Trial · grad(Function)
                 if a.kind == "grad" and b.kind == "grad" and a.role in {"test", "trial"} and b.role in {"test", "trial"}:
@@ -1109,12 +1326,19 @@ class CppCodeGen:
                         out_shape = (out_rows, b.shape[1] if len(b.shape) > 1 else -1)
                     push("mat", b.role, out_shape, b.field_names, b.parent, side, b.field_sides)
                 elif a.kind == "grad" and b.kind == "vec":
+                    meta_fn, meta_parent, meta_side, meta_fsides = resolve_metadata(a, b, prefer="basis")
+                    # Keep basis field ordering/parent when present
+                    if a.field_names:
+                        meta_fn = a.field_names
+                    if a.parent:
+                        meta_parent = a.parent
+                    role_out = a.role if a.role in {"test", "trial", "mixed"} else b.role
                     if a.role in {"mixed"} and b.role in {"const"}:
                         emit_line(f"Eigen::MatrixXd {nm} = contract_first_first({a.name}, {b.name});")
-                        push("mat", a.role, (-1, -1), a.field_names, a.parent, side, a.field_sides)
+                        push("mat", role_out, (-1, -1), meta_fn, meta_parent, meta_side, meta_fsides)
                     else:
                         emit_line(f"Eigen::MatrixXd {nm} = dot_grad_basis_vector({a.name}, {b.name});")
-                        push("mat", a.role, (a.shape[0], a.shape[1]), a.field_names, a.parent, side, a.field_sides)
+                        push("mat", role_out, (a.shape[0], a.shape[1]), meta_fn, meta_parent, meta_side, meta_fsides)
                 elif a.kind == "mixed" and b.kind == "vec":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_mixed_with_vec({a.name}, {b.name}, {a.shape[0]}, {a.shape[3] if len(a.shape)>3 else 1});")
                     push("mat", a.role, (-1, -1))
