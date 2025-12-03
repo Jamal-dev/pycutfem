@@ -73,7 +73,10 @@ def _compress_static_for_active(static: dict[str, Any],
     or union-mapping indices.
     """
     full_n = int(getattr(me, "n_dofs_local", active_cols.size))
-    if active_cols.size == full_n:
+    # If we are already using all columns in their natural order, nothing to do.
+    if active_cols.size == full_n and np.array_equal(
+        active_cols, np.arange(full_n, dtype=np.int32)
+    ):
         return static
 
     col_map = -np.ones(full_n, dtype=np.int32)

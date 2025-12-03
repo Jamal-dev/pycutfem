@@ -9,7 +9,7 @@
 #include <Eigen/Dense>
 #include <unsupported/Eigen/CXX11/Tensor>
 #include <iostream>
-
+bool is_debug = false;
 namespace py = pybind11;
 namespace pycutfem::cpp_backend {
 
@@ -436,7 +436,7 @@ inline std::vector<Eigen::MatrixXd> contract_last_first(
     const Eigen::MatrixXd& B) 
 {
 
-    std::cout << "C++ backend: contract_last_first called" << std::endl;
+    if (is_debug) {std::cout << "C++ backend: contract_last_first called" << std::endl;}
     if (A.empty()) return {};
 
     // 1. Get dimensions
@@ -731,14 +731,14 @@ inline py::array_t<double> binary_add_generic(const py::array_t<double>& a,
 // Dot(Test, Trial) mass matrix
 inline Eigen::MatrixXd dot_mass_test_trial(const Eigen::MatrixXd& test_vec,
                                            const Eigen::MatrixXd& trial_vec) {
-    std::cout<< "-----------------dot_mass_test_trial---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_mass_test_trial---------------------"<<std::endl;}
     return test_vec.transpose() * trial_vec;
 }
 
 inline Eigen::MatrixXd dot_grad_grad_value(const Eigen::MatrixXd& grad_a,
                                            const Eigen::MatrixXd& grad_b) {
     
-    std::cout<< "-----------------dot_grad_grad_value---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_grad_grad_value---------------------"<<std::endl;}
                                             // Optional: Safety check for dimensions
     if (grad_a.cols() != grad_b.rows()) {
         throw std::runtime_error("Dimension mismatch in dot_grad_grad_value: " 
@@ -751,21 +751,21 @@ inline Eigen::MatrixXd dot_grad_grad_value(const Eigen::MatrixXd& grad_a,
 
 inline Eigen::MatrixXd dot_mass_trial_test(const Eigen::MatrixXd& trial_vec,
                                            const Eigen::MatrixXd& test_vec) {
-    std::cout<< "-----------------dot_mass_trial_test---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_mass_trial_test---------------------"<<std::endl;}
     return trial_vec.transpose() * test_vec;
 }
 
 // grad(Function) @ Trial (grad_func: k x d, trial: k x n) -> d x n
 inline Eigen::MatrixXd dot_grad_func_trial_vec(const Eigen::MatrixXd& grad_func,
                                                const Eigen::MatrixXd& trial_vec) {
-    std::cout<< "-----------------dot_grad_func_trial_vec---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_grad_func_trial_vec---------------------"<<std::endl;}
     return grad_func * trial_vec;
 }
 
 // grad(basis) (vector<k x n, dim>) dotted with vector (dim,) -> k x n
 inline Eigen::MatrixXd dot_grad_basis_vector(const std::vector<Eigen::MatrixXd>& grad_basis,
                                              const Eigen::VectorXd& vec) {
-    std::cout<< "-----------------dot_grad_basis_vector---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_grad_basis_vector---------------------"<<std::endl;}
     int k = static_cast<int>(grad_basis.size());
     if (k == 0) return Eigen::MatrixXd();
     int n = static_cast<int>(grad_basis[0].rows());
@@ -779,7 +779,7 @@ inline Eigen::MatrixXd dot_grad_basis_vector(const std::vector<Eigen::MatrixXd>&
 // Vector dotted with grad(basis) -> d x n
 inline Eigen::MatrixXd dot_vec_grad(const Eigen::VectorXd& vec,
                                     const std::vector<Eigen::MatrixXd>& grad_basis) {
-    std::cout<< "-----------------dot_vec_grad---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_vec_grad---------------------"<<std::endl;}
     int k = static_cast<int>(grad_basis.size());
     if (k == 0) return Eigen::MatrixXd();
     int n = static_cast<int>(grad_basis[0].rows());
@@ -793,7 +793,7 @@ inline Eigen::MatrixXd dot_vec_grad(const Eigen::VectorXd& vec,
 
 inline Eigen::MatrixXd vector_dot_grad_basis(const Eigen::VectorXd& vec,
                                              const std::vector<Eigen::MatrixXd>& grad_basis) {
-    std::cout<< "-----------------vector_dot_grad_basis---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------vector_dot_grad_basis---------------------"<<std::endl;}
     int k = static_cast<int>(grad_basis.size());
     if (k == 0) return Eigen::MatrixXd();
     int d = static_cast<int>(grad_basis[0].cols());
@@ -809,7 +809,7 @@ inline Eigen::MatrixXd vector_dot_grad_basis(const Eigen::VectorXd& vec,
 inline std::vector<Eigen::MatrixXd> dot_vec_grad_components(const Eigen::MatrixXd& vec_basis,
                                                             const std::vector<Eigen::MatrixXd>& grad_basis,
                                                             bool swap_roles=false) {
-    std::cout<< "-----------------dot_vec_grad_components---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_vec_grad_components---------------------"<<std::endl;}
     int k = static_cast<int>(grad_basis.size());
     if (k == 0) return {};
     int d = static_cast<int>(grad_basis[0].cols());
@@ -840,7 +840,7 @@ inline std::vector<Eigen::MatrixXd> scalar_trial_times_grad_test(
     const std::vector<Eigen::MatrixXd>& grad_test, // Size k, Mats (n_test, d)
     const Eigen::VectorXd& trial_vals)             // Size n_trial
 {
-    // std::cout << "-----------------scalar_trial_times_grad_test---------------------" << std::endl;
+    if (is_debug) {std::cout << "-----------------scalar_trial_times_grad_test---------------------" << std::endl;}
 
     int k = static_cast<int>(grad_test.size());
     if (k == 0) return {};
@@ -888,7 +888,7 @@ inline std::vector<Eigen::MatrixXd> grad_trial_times_scalar_test(
 // Inner product of grad stacks -> n x n
 inline Eigen::MatrixXd inner_grad_grad(const std::vector<Eigen::MatrixXd>& test,
                                        const std::vector<Eigen::MatrixXd>& trial) {
-    std::cout<< "-----------------inner_grad_grad---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------inner_grad_grad---------------------"<<std::endl;}
     int k = static_cast<int>(test.size());
     if (k == 0) return Eigen::MatrixXd();
     
@@ -910,7 +910,7 @@ inline Eigen::MatrixXd inner_grad_grad(const std::vector<Eigen::MatrixXd>& test,
 // Inner of grad(test) (k,n,d) with grad(value) (k,d) -> (n,)
 inline Eigen::VectorXd inner_grad_const(const std::vector<Eigen::MatrixXd>& grad_test,
                                         const Eigen::MatrixXd& grad_val) {
-    std::cout<< "-----------------inner_grad_const---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------inner_grad_const---------------------"<<std::endl;}
     int k = static_cast<int>(grad_test.size());
     if (k == 0) return Eigen::VectorXd();
     int n = static_cast<int>(grad_test[0].rows());
@@ -924,7 +924,7 @@ inline Eigen::VectorXd inner_grad_const(const std::vector<Eigen::MatrixXd>& grad
 // Inner product of Hessian stacks stored as (n,4) flattened blocks
 inline Eigen::MatrixXd inner_hessian_hessian(const std::vector<Eigen::MatrixXd>& test,
                                              const std::vector<Eigen::MatrixXd>& trial) {
-    std::cout<< "-----------------inner_hessian_hessian---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------inner_hessian_hessian---------------------"<<std::endl;}
     int k = static_cast<int>(test.size());
     if (k == 0) return Eigen::MatrixXd();
     int n_test = static_cast<int>(test[0].rows());
@@ -939,7 +939,7 @@ inline Eigen::MatrixXd inner_hessian_hessian(const std::vector<Eigen::MatrixXd>&
 // Inner of Hessian(value) (k,4) with Hessian(test) (k,n,4) -> (n,)
 inline Eigen::VectorXd inner_hessian_const(const std::vector<Eigen::MatrixXd>& hess_test,
                                            const Eigen::MatrixXd& hess_value) {
-    std::cout<< "-----------------inner_hessian_const---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------inner_hessian_const---------------------"<<std::endl;}
     int k = static_cast<int>(hess_test.size());
     if (k == 0) return Eigen::VectorXd();
     int n = static_cast<int>(hess_test[0].rows());
@@ -959,7 +959,7 @@ inline Eigen::VectorXd inner_hessian_const(const std::vector<Eigen::MatrixXd>& h
 // Hessian (basis/value flattened as (n,4) or (k,4)) dotted with spatial vector -> grad-like
 inline std::vector<Eigen::MatrixXd> hessian_dot_vector_basis(const std::vector<Eigen::MatrixXd>& hess,
                                                              const Eigen::VectorXd& vec) {
-    std::cout<< "-----------------hessian_dot_vector_basis---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------hessian_dot_vector_basis---------------------"<<std::endl;}
     int k = static_cast<int>(hess.size());
     if (k == 0) return {};
     int n = static_cast<int>(hess[0].rows());
@@ -978,7 +978,7 @@ inline std::vector<Eigen::MatrixXd> hessian_dot_vector_basis(const std::vector<E
 
 inline Eigen::MatrixXd hessian_dot_vector_value(const Eigen::MatrixXd& hess,
                                                 const Eigen::VectorXd& vec) {
-    std::cout<< "-----------------hessian_dot_vector_value---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------hessian_dot_vector_value---------------------"<<std::endl;}
     int k = static_cast<int>(hess.rows());
     Eigen::MatrixXd out(k, 2);
     double v0 = vec(0), v1 = vec(1);
@@ -993,7 +993,7 @@ inline Eigen::MatrixXd hessian_dot_vector_value(const Eigen::MatrixXd& hess,
 // vector · Hessian(basis/value)
 inline std::vector<Eigen::MatrixXd> vector_dot_hessian_basis(const Eigen::VectorXd& vec,
                                                              const std::vector<Eigen::MatrixXd>& hess) {
-    // std::cout << "-----------------vector_dot_hessian_basis---------------------" << std::endl;
+    if (is_debug) {std::cout << "-----------------vector_dot_hessian_basis---------------------" << std::endl;}
 
     int k = static_cast<int>(hess.size());
     if (k == 0) return {};
@@ -1070,7 +1070,7 @@ inline std::vector<Eigen::MatrixXd> vector_dot_hessian_basis(const Eigen::Vector
 
 inline Eigen::MatrixXd vector_dot_hessian_value(const Eigen::VectorXd& vec,
                                                 const Eigen::MatrixXd& hess) {
-    std::cout<< "-----------------vector_dot_hessian_value---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------vector_dot_hessian_value---------------------"<<std::endl;}
     int k = static_cast<int>(hess.rows());
     double acc00 = 0.0, acc01 = 0.0, acc10 = 0.0, acc11 = 0.0;
     for (int c = 0; c < k; ++c) {
@@ -1138,7 +1138,7 @@ inline void gradient_component(Eigen::MatrixXd& out, int row,
 inline Eigen::MatrixXd dot_grad_trial(const std::vector<Eigen::MatrixXd>& grad_stack,
                                       const Eigen::MatrixXd& trial) {
 
-    std::cout<< "-----------------dot_grad_trial---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_grad_trial---------------------"<<std::endl;}
     int k = static_cast<int>(grad_stack.size());
     int n = static_cast<int>(trial.cols());
     Eigen::MatrixXd out(grad_stack[0].cols(), n);
@@ -1154,7 +1154,7 @@ inline std::vector<Eigen::MatrixXd> dot_grad_basis_with_grad_value(
     const std::vector<Eigen::MatrixXd>& grad_basis, // Shape: (k, n, d)
     const Eigen::MatrixXd& grad_value) {            // Shape: (d, j)
 
-    std::cout << "-----------------dot_grad_basis_with_grad_value---------------------" << std::endl;
+    if (is_debug) {std::cout << "-----------------dot_grad_basis_with_grad_value---------------------" << std::endl;}
 
     // 1. Get Dimensions from the Basis
     int k = static_cast<int>(grad_basis.size()); // The 'i' dimension (List size)
@@ -1202,7 +1202,7 @@ inline std::vector<Eigen::MatrixXd> dot_grad_basis_with_grad_value(
 inline std::vector<Eigen::MatrixXd> dot_grad_value_with_grad_basis(
     const Eigen::MatrixXd& grad_value,
     const std::vector<Eigen::MatrixXd>& grad_basis) {
-    std::cout << "-----------------dot_grad_value_with_grad_basis---------------------" << std::endl;
+    if (is_debug) {std::cout << "-----------------dot_grad_value_with_grad_basis---------------------" << std::endl;}
     // 1. Checks
     int k = static_cast<int>(grad_basis.size());
     if (k == 0) return {};
@@ -1244,7 +1244,7 @@ inline std::vector<Eigen::MatrixXd> dot_grad_value_with_grad_basis(
 // value (k,) dotted with grad (k,d) -> (d,)
 inline Eigen::VectorXd dot_value_with_grad(const Eigen::VectorXd& value_vec,
                                            const Eigen::MatrixXd& grad_mat) {
-    std::cout<< "-----------------dot_value_with_grad---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_value_with_grad---------------------"<<std::endl;}
     if (grad_mat.rows() != value_vec.size()) {
         throw std::runtime_error("dot_value_with_grad: incompatible shapes");
     }
@@ -1254,6 +1254,7 @@ inline Eigen::VectorXd dot_value_with_grad(const Eigen::VectorXd& value_vec,
 // grad (k,d) dotted with value (k,) -> (d,)  (contracts components)
 inline Eigen::VectorXd dot_grad_with_value(const Eigen::MatrixXd& grad_mat,
                                            const Eigen::VectorXd& value_vec) {
+    if (is_debug) {std::cout<< "-----------------dot_grad_with_value---------------------"<<std::endl;}
     if (grad_mat.rows() != value_vec.size()) {
         throw std::runtime_error("dot_grad_with_value: incompatible shapes");
     }
@@ -1263,6 +1264,7 @@ inline Eigen::VectorXd dot_grad_with_value(const Eigen::MatrixXd& grad_mat,
 // Trial vector basis (k,n) dotted with grad(Function).T (d,k) -> (d,n)
 inline Eigen::MatrixXd dot_trial_vec_grad_func(const Eigen::MatrixXd& trial_vec,
                                                const Eigen::MatrixXd& grad_func) {
+    if (is_debug) {std::cout<< "-----------------dot_trial_vec_grad_func---------------------"<<std::endl;}
     if (grad_func.cols() != trial_vec.rows()) {
         throw std::runtime_error("dot_trial_vec_grad_func: incompatible shapes");
     }
@@ -1273,7 +1275,7 @@ inline Eigen::MatrixXd dot_trial_vec_grad_func(const Eigen::MatrixXd& trial_vec,
 inline std::vector<Eigen::MatrixXd> dot_grad_grad_mixed(const std::vector<Eigen::MatrixXd>& a,
                                                         const std::vector<Eigen::MatrixXd>& b,
                                                         int flag) {
-    std::cout<< "-----------------dot_grad_grad_mixed---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_grad_grad_mixed---------------------"<<std::endl;}
     int k = static_cast<int>(a.size());
     if (k == 0 || b.empty()) return {};
     int d = static_cast<int>(a[0].cols());   // spatial dimension (assumed equal to k)
@@ -1323,7 +1325,7 @@ inline std::vector<Eigen::MatrixXd> dot_grad_grad_mixed(const std::vector<Eigen:
 
 inline std::vector<Eigen::MatrixXd> transpose_mixed_grad_tensor(const std::vector<Eigen::MatrixXd>& tensor,
                                                                 int k, int d) {
-    std::cout<< "-----------------transpose_mixed_grad_tensor---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------transpose_mixed_grad_tensor---------------------"<<std::endl;}
     std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k * d));
     for (int i = 0; i < k; ++i) {
         for (int j = 0; j < d; ++j) {
@@ -1339,7 +1341,7 @@ inline std::vector<Eigen::MatrixXd> transpose_mixed_grad_tensor(const std::vecto
 
 inline std::vector<Eigen::MatrixXd> trace_mixed_tensor(const std::vector<Eigen::MatrixXd>& tensor,
                                                        int k, int d) {
-    std::cout<< "-----------------trace_mixed_tensor---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------trace_mixed_tensor---------------------"<<std::endl;}
     if (tensor.empty()) return {};
     int n_rows = static_cast<int>(tensor[0].rows());
     int n_cols = static_cast<int>(tensor[0].cols());
@@ -1354,7 +1356,7 @@ inline std::vector<Eigen::MatrixXd> trace_mixed_tensor(const std::vector<Eigen::
 
 inline std::vector<Eigen::MatrixXd> scale_mixed_basis_with_coeffs(const std::vector<Eigen::MatrixXd>& mixed_basis,
                                                                   const Eigen::MatrixXd& coeffs) {
-    std::cout<< "-----------------scale_mixed_basis_with_coeffs---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------scale_mixed_basis_with_coeffs---------------------"<<std::endl;}
     if (mixed_basis.empty()) return {};
     Eigen::MatrixXd base = Eigen::MatrixXd::Zero(mixed_basis[0].rows(), mixed_basis[0].cols());
     for (const auto& m : mixed_basis) base += m;
@@ -1373,7 +1375,7 @@ inline Eigen::MatrixXd inner_mixed_grad_const(const std::vector<Eigen::MatrixXd>
                                               const Eigen::MatrixXd& grad_const,
                                               int k, int d,
                                               int n_test, int n_trial) {
-    std::cout<< "-----------------inner_mixed_grad_const---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------inner_mixed_grad_const---------------------"<<std::endl;}
     if (mixed_grad.empty()) return Eigen::MatrixXd();
     const int total_entries = static_cast<int>(mixed_grad.size());
     Eigen::Index mat_rows = mixed_grad[0].rows();
@@ -1552,7 +1554,7 @@ inline std::vector<Eigen::MatrixXd> scale_mixed(const std::vector<Eigen::MatrixX
 inline std::vector<Eigen::MatrixXd> dot_mixed_mat(const std::vector<Eigen::MatrixXd>& mixed,
                                                   const Eigen::MatrixXd& mat,
                                                   int k, int d) {
-    std::cout<< "-----------------dot_mixed_mat---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_mixed_mat---------------------"<<std::endl;}
     if (mixed.empty()) return {};
     int d_out = static_cast<int>(mat.cols());
     Eigen::Index n_rows = mixed[0].rows();
@@ -1576,7 +1578,7 @@ inline std::vector<Eigen::MatrixXd> dot_mixed_mat(const std::vector<Eigen::Matri
 inline std::vector<Eigen::MatrixXd> dot_mat_mixed(const Eigen::MatrixXd& mat,
                                                   const std::vector<Eigen::MatrixXd>& mixed,
                                                   int k, int d) {
-    std::cout<< "-----------------dot_mat_mixed---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_mat_mixed---------------------"<<std::endl;}
     if (mixed.empty()) return {};
     int k_out = static_cast<int>(mat.rows());
     Eigen::Index n_rows = mixed[0].rows();
@@ -1601,7 +1603,7 @@ inline std::vector<Eigen::MatrixXd> dot_mat_mixed(const Eigen::MatrixXd& mat,
 inline Eigen::MatrixXd dot_mixed_with_vec(const std::vector<Eigen::MatrixXd>& mixed,
                                           const Eigen::VectorXd& vec,
                                           int k, int d) {
-    std::cout<< "-----------------dot_mixed_with_vec---------------------"<<std::endl;
+    if (is_debug) {std::cout<< "-----------------dot_mixed_with_vec---------------------"<<std::endl;}
     if (mixed.empty()) return Eigen::MatrixXd();
     if (vec.size() != d) {
         throw std::runtime_error("dot_mixed_with_vec: vector length must match spatial dimension");
@@ -1861,7 +1863,7 @@ inline Eigen::VectorXd flatten_to_1d(const Eigen::MatrixXd& input) {
  */
 inline std::vector<Eigen::MatrixXd> trace_times_identity(const Eigen::MatrixXd& trace_vals_in,
                                                          const Eigen::MatrixXd& identity) {
-    std::cout << "-----------------trace_times_identity---------------------" << std::endl;
+    if (is_debug) {std::cout << "-----------------trace_times_identity---------------------" << std::endl;}
     // 1. Flatten trace_vals (corresponds to _flatten_to_1d)
     //    We take MatrixXd as input to support both vectors and matrices genericly.
     Eigen::VectorXd flat = flatten_to_1d(trace_vals_in);

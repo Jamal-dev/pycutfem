@@ -1,7 +1,7 @@
 import numba
 import numpy as np
 use_type = np.float64
-DEBUG = True
+DEBUG = False
 @numba.njit(cache=True, fastmath=True)
 def ghost_grad_jump_penalty_scalar(
     Ke, w, cell_h, normals, grad_pos, grad_neg, gamma, dtype
