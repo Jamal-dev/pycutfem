@@ -143,10 +143,33 @@ class CppCodeGen:
                         needs_r00.add(f"r00_{fn}_{tag}")
                 if op.role == "function":
                     needs_u.add(f"u_{op.name}_loc")
+                if sum(op.deriv_order) >= 2:
+                    needs_hx = True
+                    for fn in op.field_names or []:
+                        needs_h.update({f"d10_{fn}", f"d01_{fn}", f"d20_{fn}", f"d11_{fn}", f"d02_{fn}"})
+                        if self.on_facet:
+                            tags: set[str] = set()
+                            if op.side in ("+", "-"):
+                                tags.add("pos" if op.side == "+" else "neg")
+                            if getattr(op, "field_sides", None):
+                                tags.update(t for t in op.field_sides if t in ("+", "-"))
+                            if not tags:
+                                tags.update({"pos", "neg"})
+                            for tg in tags:
+                                needs_h.update({
+                                    f"r10_{fn}_{tg}", f"r01_{fn}_{tg}",
+                                    f"r20_{fn}_{tg}", f"r11_{fn}_{tg}", f"r02_{fn}_{tg}",
+                                })
             if isinstance(op, (IRHessian, IRLaplacian)):
                 needs_hx = True
                 for fn in getattr(op, "field_names", []) or []:
                     needs_h.update({f"d10_{fn}", f"d01_{fn}", f"d20_{fn}", f"d11_{fn}", f"d02_{fn}"})
+                    if self.on_facet:
+                        for tg in ("pos", "neg"):
+                            needs_h.update({
+                                f"r10_{fn}_{tg}", f"r01_{fn}_{tg}",
+                                f"r20_{fn}_{tg}", f"r11_{fn}_{tg}", f"r02_{fn}_{tg}",
+                            })
             if isinstance(op, (LoadFacetNormal, LoadFacetNormalComponent)):
                 needs_normals = True
             if isinstance(op, CellDiameter):
@@ -161,9 +184,14 @@ class CppCodeGen:
             if name not in param_order:
                 param_order.append(name)
         if needs_hx:
-            for base in ("Hxi0", "Hxi1"):
-                if base not in param_order:
-                    param_order.append(base)
+            if self.on_facet:
+                for base in ("pos_Hxi0", "pos_Hxi1", "neg_Hxi0", "neg_Hxi1"):
+                    if base not in param_order:
+                        param_order.append(base)
+            else:
+                for base in ("Hxi0", "Hxi1"):
+                    if base not in param_order:
+                        param_order.append(base)
         if needs_normals and "normals" not in param_order:
             param_order.append("normals")
         for name in sorted(needs_h):
@@ -425,8 +453,35 @@ class CppCodeGen:
                                 f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx2}, j) = {basis_name}_view(e, q, j);"
                             )
                     stack.append(StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides))
-                elif op.role in {"test", "trial"} and op.deriv_order == (1, 0) or op.deriv_order == (0, 1):
+                elif op.role in {"test", "trial"} and op.deriv_order in {(1, 0), (0, 1)}:
                     raise NotImplementedError("Direct derivative load not handled; Grad op expected.")
+                elif op.role in {"test", "trial"} and op.deriv_order in {(2, 0), (1, 1), (0, 2)}:
+                    k = len(op.field_names)
+                    nm = new_tmp("d2")
+                    emit_line(f"Eigen::MatrixXd {nm}({k}, n_union);")
+                    emit_line(f"{nm}.setZero();")
+                    for idx2, fn in enumerate(op.field_names):
+                        side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx2)
+                        use_side = (self.on_facet and side_tag in ("pos", "neg"))
+                        base = "r" if use_side else "d"
+                        deriv_key = "20" if op.deriv_order == (2, 0) else "11" if op.deriv_order == (1, 1) else "02"
+                        table_name = f"{base}{deriv_key}_{fn}" + (f"_{side_tag}" if use_side else "")
+                        map_name = f"{side_tag}_map_{fn}" if use_side else None
+                        s0 = field_slices.get(fn, slice(0, 0)).start
+                        if use_side:
+                            map_len = new_tmp("map_len")
+                            basis_len = new_tmp("basis_len")
+                            emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
+                            emit_line(f"ssize_t {basis_len} = {table_name}_view.shape(2);")
+                            emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
+                            emit_line(f"    int col = {map_name}_view(e, j);")
+                            emit_line(f"    if (col < 0 || col >= n_union) continue;")
+                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : ({s0} + j);")
+                            emit_line(f"    {nm}({idx2}, col) = {table_name}_view(e, q, src);")
+                            emit_line("}")
+                        else:
+                            emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx2}, j) = {table_name}_view(e, q, j);")
+                    stack.append(StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides))
                 elif op.role == "function":
                     # coeffs are pre-gathered u_<name>_loc[e, :]
                     coeff_name = f"u_{op.name}_loc"
@@ -750,6 +805,10 @@ class CppCodeGen:
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
                         emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
                         stack.append(StackItem(nm, "mixed", b.role, b.shape, b.field_names, b.parent))
+                    elif a.kind == "hess" and b.kind == "hess":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(std::min({a.name}.size(), {b.name}.size()));")
+                        emit_line(f"for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
+                        stack.append(StackItem(nm, "hess", a.role or b.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, combine_side(a.side, b.side), choose_field_sides(a.field_sides, b.field_sides)))
                     elif a.kind == "mat" and b.kind == "grad":
                         emit_line(f"auto {nm} = mat_sub_grad({a.name}, GradStack{{{b.name}}}).comps;")
                         stack.append(StackItem(nm, "grad", b.role, b.shape, b.field_names, b.parent))
@@ -871,6 +930,10 @@ class CppCodeGen:
                     elif a.kind == "mat" and b.kind == "grad":
                         emit_line(f"auto {nm} = cwise_mat_grad({a.name}, GradStack{{{b.name}}}).comps;")
                         stack.append(StackItem(nm, "grad", b.role, b.shape, b.field_names, b.parent))
+                    elif a.kind == "hess" and b.kind == "hess":
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(std::min({a.name}.size(), {b.name}.size()));")
+                        emit_line(f"for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
+                        stack.append(StackItem(nm, "hess", a.role or b.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, combine_side(a.side, b.side), choose_field_sides(a.field_sides, b.field_sides)))
                     elif a.kind == "scalar" and b.kind != "scalar":
                         emit_line(f"auto {nm} = {b.name} * {a.name};")
                         stack.append(StackItem(nm, b.kind, b.role, b.shape))

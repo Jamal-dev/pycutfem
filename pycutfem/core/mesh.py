@@ -393,18 +393,23 @@ class Mesh:
 
         has_neg = elem_phi_nodes < -tol
         has_pos = elem_phi_nodes >  tol
+        has_zero = np.abs(elem_phi_nodes) <= tol
 
         any_neg = has_neg.any(axis=1)
         any_pos = has_pos.any(axis=1)
+        any_zero = has_zero.any(axis=1)
 
         # True sign change → genuine cut element
         cut_mask = any_neg & any_pos
 
-        # Only negative or zero → inside
-        inside_mask = any_neg & ~any_pos
+        # Touching interface (zeros) plus one side → treat as cut to enable ghost/interface on aligned edges
+        cut_mask |= (any_zero & any_pos) | (any_zero & any_neg)
 
-        # Only positive or zero → outside
-        outside_mask = ~any_neg & any_pos
+        # Only negative → inside
+        inside_mask = any_neg & ~any_pos & ~any_zero
+
+        # Only positive → outside
+        outside_mask = ~any_neg & any_pos & ~any_zero
 
         # Narrow φ≈0 band (all nodes ~0): treat as cut for safety
         narrow_band_mask = ~any_neg & ~any_pos
@@ -479,8 +484,9 @@ class Mesh:
         ghost_both_bs = self._edge_bitsets.get('ghost_both', BitSet(np.zeros(len(tags_arr), bool)))
         interface_bs = self._edge_bitsets.get('interface', BitSet(np.zeros(len(tags_arr), bool)))
         
-        self._edge_bitsets['ghost_pos'] = (ghost_pos_bs | ghost_both_bs) - interface_bs
-        self._edge_bitsets['ghost_neg'] = (ghost_neg_bs | ghost_both_bs) - interface_bs
+        self._edge_bitsets['ghost_pos'] = ghost_pos_bs - interface_bs
+        self._edge_bitsets['ghost_neg'] = ghost_neg_bs - interface_bs
+        self._edge_bitsets['ghost_both'] = ghost_both_bs - interface_bs
         self._edge_bitsets['ghost'] = (ghost_pos_bs | ghost_neg_bs | ghost_both_bs) - interface_bs
     
     # def classify_edges(self, level_set, tol=SIDE.tol):

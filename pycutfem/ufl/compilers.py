@@ -3361,7 +3361,7 @@ class FormCompiler:
                         "mask_basis": False,
                         "pos_eid": pos_eid,
                         "neg_eid": neg_eid,
-                        "use_union_local_dofs": is_functional,
+                        "use_union_local_dofs": False,
                         "_ghost_level_set": level_set,
                         "_xi_eta_cache": xi_eta_cache,
                     }
@@ -3374,6 +3374,8 @@ class FormCompiler:
                     if is_functional:
                         data = val.data if isinstance(val, VecOpInfo) else val
                         arr = np.asarray(data, dtype=float)
+                        if arr.ndim > 0:
+                            arr = np.array(arr.sum(), dtype=float)
                         if loc_acc is None:
                             loc_acc = np.zeros_like(arr, dtype=float)
                         loc_acc += w_eff * arr
@@ -3544,6 +3546,10 @@ class FormCompiler:
 
         static_args = {k: v for k, v in geo.items() if k != "eids"}
         static_args.update(basis_args)
+        active_fields = _active_field_order(ir, me)
+        active_cols   = _active_columns(me, active_fields)
+        static_args   = _compress_static_for_active(static_args, me, active_cols)
+        gdofs_map     = static_args.get("gdofs_map", gdofs_map)
 
         # ------------------------------------------------------------------
         # 6. Execute kernel  → element buffers K/F/J
@@ -3616,6 +3622,11 @@ class FormCompiler:
             param_order=runner.param_order,
             pre_built=geo,
         )
+
+        active_fields = _active_field_order(ir, me)
+        active_cols   = _active_columns(me, active_fields)
+        kernel_args   = _compress_static_for_active(kernel_args, me, active_cols)
+        geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
 
         if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
             kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
@@ -3784,6 +3795,11 @@ class FormCompiler:
             pre_built=geo,
         )
 
+        active_fields = _active_field_order(ir, me)
+        active_cols   = _active_columns(me, active_fields)
+        kernel_args   = _compress_static_for_active(kernel_args, me, active_cols)
+        geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+
         # ---- baseline statics some kernels always expect ----
         if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
             kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
@@ -3815,6 +3831,14 @@ class FormCompiler:
         # 5) Gather current coefficient Functions and run the kernel
         current_funcs = self._get_data_functions_objs(intg)
         K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
+
+        if (not self.ctx.get("rhs", False)) and (K_edge is not None) and K_edge.ndim == 3:
+            K_edge = 0.5 * (K_edge + np.swapaxes(K_edge, 1, 2))
+            max_abs = float(np.max(np.abs(K_edge))) if K_edge.size else 0.0
+            if max_abs > 0.0:
+                eps = 1e-12 * max_abs
+                diag = np.arange(K_edge.shape[1])
+                K_edge[:, diag, diag] += eps
 
         hook = self._hook_for(intg.integrand)
         if self._functional_calculate(intg, J_edge, hook):
