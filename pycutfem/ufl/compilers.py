@@ -2406,7 +2406,7 @@ class FormCompiler:
         hook = self._hook_for(intg.integrand)
         is_functional = (hook is not None) and not (trial or test)
         if is_functional:
-            self.ctx.setdefault('scalar_results', {}).setdefault(hook['name'], 0.0)
+            self.ctx.setdefault('scalar_results', {}).setdefault(hook['name'], None)
 
         segments: list[tuple[int, np.ndarray, np.ndarray]] = []
         for elem in mesh.elements_list:
@@ -2490,7 +2490,7 @@ class FormCompiler:
 
                 # local accumulator
                 if is_functional:
-                    acc = 0.0
+                    acc = None
                 else:
                     n = len(global_dofs)
                     acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
@@ -2567,8 +2567,11 @@ class FormCompiler:
                     # evaluate & accumulate
                     val = self._visit(intg.integrand)
                     if is_functional:
-                        arr = np.asarray(val)
-                        acc += w_eff * float(arr if arr.ndim == 0 else arr.sum())
+                        data = val.data if isinstance(val, VecOpInfo) else val
+                        arr = np.asarray(data, dtype=float)
+                        if acc is None:
+                            acc = np.zeros_like(arr, dtype=float)
+                        acc += w_eff * arr
                     else:
                         arr = lhs_num(val)
                         arr = np.asarray(arr)
@@ -2578,7 +2581,12 @@ class FormCompiler:
 
                 # scatter
                 if is_functional:
-                    self.ctx['scalar_results'][hook['name']] += float(acc)
+                    results = self.ctx.setdefault('scalar_results', {})
+                    if results.get(hook['name']) is None or (
+                        isinstance(results.get(hook['name']), (int, float)) and isinstance(acc, np.ndarray)
+                    ):
+                        results[hook['name']] = np.zeros_like(acc, dtype=float)
+                    results[hook['name']] += acc
                 else:
                     if rhs:
                         np.add.at(matvec, global_dofs, acc)
@@ -2641,7 +2649,7 @@ class FormCompiler:
         hook = self._hook_for(intg.integrand)
         is_functional = hook is not None and trial is None and test is None
         if is_functional:
-            self.ctx.setdefault("scalar_results", {})[hook["name"]] = 0.0
+            self.ctx.setdefault("scalar_results", {})[hook["name"]] = None
 
         geo = dh.precompute_ghost_factors(
             ghost_edge_ids=aligned_edges,
@@ -2743,7 +2751,7 @@ class FormCompiler:
                     neg_union_mask_by_field[fld][neg_full] = 1.0
 
             if is_functional:
-                acc = 0.0
+                acc = None
             else:
                 n = len(global_dofs)
                 acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
@@ -2791,7 +2799,11 @@ class FormCompiler:
                 val = self._visit(intg.integrand)
                 w = float(qw_all[ei, q])
                 if is_functional:
-                    acc += w * float(val if np.ndim(val) == 0 else np.sum(val))
+                    data = val.data if isinstance(val, VecOpInfo) else val
+                    arr = np.asarray(data, dtype=float)
+                    if acc is None:
+                        acc = np.zeros_like(arr, dtype=float)
+                    acc += w * arr
                 else:
                     arr = lhs_num(val)
                     arr = np.asarray(arr)
@@ -2800,7 +2812,12 @@ class FormCompiler:
                     acc += w * arr
 
             if is_functional:
-                self.ctx["scalar_results"][hook["name"]] += float(acc)
+                results = self.ctx.setdefault("scalar_results", {})
+                if results.get(hook["name"]) is None or (
+                    isinstance(results.get(hook["name"]), (int, float)) and isinstance(acc, np.ndarray)
+                ):
+                    results[hook["name"]] = np.zeros_like(acc, dtype=float)
+                results[hook["name"]] += acc
             else:
                 if rhs:
                     np.add.at(matvec, global_dofs, acc)
@@ -3087,7 +3104,7 @@ class FormCompiler:
         hook = self._hook_for(intg.integrand)
         is_functional = (hook is not None and trial is None and test is None)
         if is_functional:
-            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], 0.0)
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], None)
 
         # ------------------------ main loop over ghost edges ------------------------
         self.ctx['_ghost_level_set'] = level_set
@@ -3110,12 +3127,6 @@ class FormCompiler:
                         return e.right, e.left
                     if tag == "ghost_neg":
                         return e.left, e.right
-                    tag_left  = getattr(mesh.elements_list[e.left],  "tag", "")
-                    tag_right = getattr(mesh.elements_list[e.right], "tag", "")
-                    if tag_left == "cut" and tag_right != "cut":
-                        return e.left, e.right
-                    if tag_right == "cut" and tag_left != "cut":
-                        return e.right, e.left
                     cL = np.asarray(mesh.elements_list[e.left ].centroid())
                     cR = np.asarray(mesh.elements_list[e.right].centroid())
                     phiL = _eval_ls(e.left, cL)
@@ -3206,7 +3217,7 @@ class FormCompiler:
                 P_pos_by_field: Dict[str, np.ndarray] = {}
                 P_neg_by_field: Dict[str, np.ndarray] = {}
 
-                loc_acc = 0.0 if is_functional else (
+                loc_acc = None if is_functional else (
                     np.zeros(len(global_dofs)) if rhs
                     else np.zeros((len(global_dofs), len(global_dofs)))
                 )
@@ -3232,7 +3243,14 @@ class FormCompiler:
                 normal_base = np.array([tangent_unit[1], -tangent_unit[0]], float)
                 cpos = np.asarray(mesh.elements_list[pos_eid].centroid())
                 cneg = np.asarray(mesh.elements_list[neg_eid].centroid())
-                if np.dot(normal_base, cpos - cneg) < 0.0:
+                orient_vec = None
+                try:
+                    orient_vec = np.asarray(level_set.gradient(0.5 * (p0 + p1)), float)
+                except Exception:
+                    orient_vec = None
+                if orient_vec is None or not np.isfinite(orient_vec).all() or np.linalg.norm(orient_vec) < 1e-15:
+                    orient_vec = cpos - cneg
+                if np.dot(normal_base, orient_vec) < 0.0:
                     normal_base = -normal_base
 
                 # ---------------- QP loop ----------------
@@ -3271,7 +3289,7 @@ class FormCompiler:
                             tau_eff = Ftau_pos
                         tangent_def = tau_eff / (np.linalg.norm(tau_eff) + 1e-30)
                         normal_here = np.array([tangent_def[1], -tangent_def[0]], float)
-                        if np.dot(normal_here, cpos - cneg) < 0.0:
+                        if np.dot(normal_here, orient_vec) < 0.0:
                             normal_here = -normal_here
 
                         shape_pos = np.asarray(ref_geom.shape(xi_pos, eta_pos), float)
@@ -3354,18 +3372,22 @@ class FormCompiler:
 
                     val = self._visit(intg.integrand)
                     if is_functional:
-                        if isinstance(val, VecOpInfo):
-                            v = float(np.sum(val.data))
-                        else:
-                            arr = np.asarray(val)
-                            v = float(arr if arr.ndim == 0 else arr.sum())
-                        loc_acc += w_eff * v
+                        data = val.data if isinstance(val, VecOpInfo) else val
+                        arr = np.asarray(data, dtype=float)
+                        if loc_acc is None:
+                            loc_acc = np.zeros_like(arr, dtype=float)
+                        loc_acc += w_eff * arr
                     else:
                         loc_acc += w_eff * np.asarray(val)
 
                 # Scatter
                 if is_functional:
-                    self.ctx["scalar_results"][hook["name"]] += loc_acc
+                    results = self.ctx.setdefault("scalar_results", {})
+                    if results.get(hook["name"]) is None or (
+                        isinstance(results.get(hook["name"]), (int, float)) and isinstance(loc_acc, np.ndarray)
+                    ):
+                        results[hook["name"]] = np.zeros_like(loc_acc, dtype=float)
+                    results[hook["name"]] += loc_acc
                 else:
                     if not rhs and loc_acc.ndim == 2:
                         loc_acc = 0.5 * (loc_acc + loc_acc.T)
@@ -3812,6 +3834,11 @@ class FormCompiler:
     
     def _assemble_ghost_edge(self, intg: "Integral", matvec):
         """Assemble ghost edge integrals."""
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self.backend == "jit":
+            # Ghost-edge functionals rely on Python path for correct normal orientation.
+            self._assemble_ghost_edge_python(intg, matvec)
+            return
         if self.backend == "python":
             self._assemble_ghost_edge_python(intg, matvec)
         elif self.backend == "jit":
@@ -3947,15 +3974,14 @@ class FormCompiler:
         if is_functional:
             # J_loc is (n_edges,) or scalar; collapse to plain float
             if J_loc is not None:
-                if J_loc.ndim > 1:
-                    total = np.sum(J_loc, axis=0)  # (n_edges,) → scalar
-                    # print(f"J_loc.shape={J_loc.shape}, total={total}")
-                if J_loc.ndim == 1:
-                    total = J_loc.sum()
-                    # print(f"J_loc.shape={J_loc.shape}, total={total}")
+                total = np.sum(J_loc, axis=0)
             name  = hook["name"]               # retrieved earlier via _hook_for
             scal  = self.ctx.setdefault("scalar_results", {})
-            scal[name] =  total
+            if name not in scal or (
+                isinstance(scal[name], (int, float)) and isinstance(total, np.ndarray)
+            ):
+                scal[name] = np.zeros_like(total, dtype=float)
+            scal[name] += total
             flag = True
         return flag                            # 🔑  skip the scatter stage
 

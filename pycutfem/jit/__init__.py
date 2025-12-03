@@ -216,7 +216,15 @@ class KernelRunner:
 
 
         for name in self.func_names:                  # 'u_k', 'p'
-            f = functions[name]                       # Function / VectorFunction
+            try:
+                f = functions[name]                   # Function / VectorFunction
+            except KeyError:
+                # Fallback: match by field_name when the exact symbol name is absent
+                candidates = [obj for obj in functions.values() if getattr(obj, "field_name", None) == name]
+                if len(candidates) == 1:
+                    f = candidates[0]
+                else:
+                    continue
 
             # 1) global vector with current nodal values --------------------
             base = getattr(f, "_parent_vector", None)
@@ -325,7 +333,7 @@ def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet:
 
     ir_sequence = ir_generator.generate(integral_expression)
     
-    kernel, param_order = cache.get_kernel(ir_sequence, codegen,mixed_element.signature())
+    kernel, param_order = cache.get_kernel(ir_sequence, codegen, mixed_element.signature())
     
     if hasattr(kernel, "py_func"):
         kernel.python = kernel.py_func

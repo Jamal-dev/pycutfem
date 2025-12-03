@@ -11,7 +11,7 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, grad, dot,
     Pos, Neg, FacetNormal, CellDiameter, Constant,
-    VectorFunction, Function
+    VectorFunction, Function, inner
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.measures import dx, dInterface
@@ -48,7 +48,7 @@ f_neg_xy = f_side(alpha_minus, k_minus)
 f_pos_xy = f_side(alpha_plus,  k_plus)
 
 
-def solve_once(p: int, nx=16, ny=16):
+def solve_once(p: int, backend, nx=16, ny=16 ):
     """Solve the interface problem with symmetric Nitsche; return (u_vec, dh, level_set, cut_e)."""
     # -- Mesh: straight-sided geometry; p only affects FE order
     Lx = Ly = 1.0
@@ -105,8 +105,8 @@ def solve_once(p: int, nx=16, ny=16):
     lam  = Constant(beta * max(k_minus, k_plus) * (p+1)**2) / h
 
     a = (
-        k_minus*dot(grad(Neg(u_neg)), grad(Neg(v_neg)))*dx_neg +
-        k_plus *dot(grad(Pos(u_pos)), grad(Pos(v_pos)))*dx_pos +
+        k_minus*inner(grad(Neg(u_neg)), grad(Neg(v_neg)))*dx_neg +
+        k_plus *inner(grad(Pos(u_pos)), grad(Pos(v_pos)))*dx_pos +
         ( avg_flux_trial*jump_v + avg_flux_test*jump_u + lam*jump_u*jump_v )*dG
     )
 
@@ -120,15 +120,14 @@ def solve_once(p: int, nx=16, ny=16):
         BoundaryCondition('u_neg','dirichlet','inactive_outside', 0.0),
     ]
 
-    K, rhs = assemble_form(Equation(a, F), dof_handler=dh, bcs=bcs, backend='python')
+    K, rhs = assemble_form(Equation(a, F), dof_handler=dh, bcs=bcs, backend=backend)
     assert np.isfinite(K.data).all() and np.isfinite(rhs).all(), "NaN/Inf in assembled system"
     u_vec = spsolve(K, rhs)
     assert np.isfinite(u_vec).all(), "NaN/Inf in solution vector"
 
     return u_vec, dh, ls, cut_e
 
-
-def interface_energies(u_vec, dh: DofHandler, ls, cut_e, p):
+def interface_energies(u_vec, dh: DofHandler, ls, cut_e, p, backend):
     """Compute unscaled jump and flux-jump energies on Γ for a solved u_vec."""
     # Reuse the same sided functions and measures
     u_neg = TrialFunction("u_neg", dh, side="-"); v_neg = TestFunction("u_neg", dh, side="-")
@@ -149,9 +148,8 @@ def interface_energies(u_vec, dh: DofHandler, ls, cut_e, p):
     flux_v = k_plus*tr(Pos(v_pos)) - k_minus*tr(Neg(v_neg))
     a_flux = (flux_u * flux_v) * dG
 
-    K_jump, _ = assemble_form(Equation(a_jump, 0.0), dof_handler=dh, backend="python")
-    K_flux, _ = assemble_form(Equation(a_flux, 0.0), dof_handler=dh, backend="python")
-
+    K_jump, _ = assemble_form(Equation(a_jump, 0.0), dof_handler=dh, backend=backend)
+    K_flux, _ = assemble_form(Equation(a_flux, 0.0), dof_handler=dh, backend=backend)
     assert np.isfinite(K_jump.data).all() and np.isfinite(K_flux.data).all(), "NaN/Inf in Γ matrices"
 
     Ejump = float(u_vec.T @ (K_jump @ u_vec))
@@ -179,30 +177,39 @@ def h1_errors_piecewise(u_vec, dh: DofHandler, ls):
     return eH1_neg, eH1_pos, eH1_tot
 
 
-@pytest.mark.parametrize("p", [1, 2, 3, 4])
-def test_interface_p_refinement_jump_flux_and_h1(p):
-    u_vec, dh, ls, cut_e = solve_once(p)
-    Ejump, Eflux = interface_energies(u_vec, dh, ls, cut_e, p)
-    eH1_neg, eH1_pos, eH1_tot = h1_errors_piecewise(u_vec, dh, ls)
-    print(f"[p={p}]  E_jump={Ejump:.3e}  E_flux={Eflux:.3e}  "
-          f"H1-: {eH1_neg:.3e}  H1+: {eH1_pos:.3e}  H1tot: {eH1_tot:.3e}")
+
 
 # A simple convergence guard across p
-def test_interface_convergence_overall():
+@pytest.mark.parametrize("backend", [ "jit"])
+def test_interface_convergence_overall(backend):
+    """
+    Solve for p=1,2,3,4 and verify that the error metrics decrease 
+    as the polynomial order increases.
+    """
     p_list = [1, 2, 3, 4]
-    vals = []
-    for p in p_list:
-        u_vec, dh, ls, cut_e = solve_once(p)
-        Ejump, Eflux = interface_energies(u_vec, dh, ls, cut_e, p)
-        eH1_neg, eH1_pos, eH1_tot = h1_errors_piecewise(u_vec, dh, ls)
-        vals.append((p, Ejump, Eflux, eH1_tot))
-    # Print for inspection
-    for p, Ej, Ef, Eh in vals:
-        print(f"[p={p}]  E_jump={Ej:.3e}  E_flux={Ef:.3e}  H1tot={Eh:.3e}")
+    results = []
 
-    # Require overall decrease from p=1 to p=max
-    Ej1, Ef1, Eh1 = vals[0][1], vals[0][2], vals[0][3]
-    EjL, EfL, EhL = vals[-1][1], vals[-1][2], vals[-1][3]
-    assert EjL < Ej1, "Jump energy did not decrease overall with p."
-    assert EfL < Ef1, "Flux-jump energy did not decrease overall with p."
-    assert EhL < Eh1, "H1-seminorm error did not decrease overall with p."
+    print(f"\n--- Checking Convergence for Backend: {backend} ---")
+    
+    for p in p_list:
+        # 1. Solve
+        u_vec, dh, ls, cut_e = solve_once(p, backend)
+        
+        # 2. Compute Metrics
+        Ejump, Eflux = interface_energies(u_vec, dh, ls, cut_e, p, backend=backend)
+        eH1_neg, eH1_pos, eH1_tot = h1_errors_piecewise(u_vec, dh, ls)
+        
+        results.append((p, Ejump, Eflux, eH1_tot))
+        
+        # 3. Print immediately (useful for debugging if it fails mid-loop)
+        print(f"[p={p}] E_jump={Ejump:.3e}  E_flux={Eflux:.3e}  H1tot={eH1_tot:.3e}")
+
+    # 4. Verify Convergence (Compare p=1 vs p=4)
+    # Unpack first (p=1) and last (p=4) results
+    _, Ej_start, Ef_start, Eh_start = results[0]
+    _, Ej_end,   Ef_end,   Eh_end   = results[-1]
+
+    # Assertions: Errors at p=4 must be strictly lower than at p=1
+    assert Ej_end < Ej_start, f"Jump energy did not decrease: {Ej_start:.2e} -> {Ej_end:.2e}"
+    assert Ef_end < Ef_start, f"Flux-jump energy did not decrease: {Ef_start:.2e} -> {Ef_end:.2e}"
+    assert Eh_end < Eh_start, f"H1 error did not decrease: {Eh_start:.2e} -> {Eh_end:.2e}"
