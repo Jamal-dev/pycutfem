@@ -500,14 +500,14 @@ inline Eigen::MatrixXd contract_last_first(const Eigen::VectorXd& A,
     // 1. Check dimensions
     // We expect A (length K) to contract with B (rows K)
     if (A.size() != B.rows()) {
-        throw std::runtime_error("Dimension mismatch: Vector size must match Matrix rows");
+        throw std::runtime_error("contract_last_first Dimension mismatch: Vector size must match Matrix rows");
     }
 
     // 2. Perform Multiplication
     // In Eigen, VectorXd is a column vector.
     // A.transpose() turns it into a RowVector (1, K).
     // (1, K) * (K, N) = (1, N)
-    return A.transpose() * B;
+    return (A.transpose() * B).transpose(); // Return as (N, 1) column vector
 }
 
 // Convenience overload for fixed-size 2-vectors to avoid overload ambiguity
@@ -826,6 +826,20 @@ inline std::vector<Eigen::MatrixXd> dot_vec_grad_components(const Eigen::MatrixX
                 out[r].noalias() += vec_basis.row(c).transpose() * grad_basis[c].col(r).transpose();
             }
         }
+    }
+    return out;
+}
+
+// Component-wise contraction for Hessian·vec outputs (k,n,2) with a spatial vector (2,) -> (k,n)
+inline Eigen::MatrixXd hessvec_dot_vector_basis(const std::vector<Eigen::MatrixXd>& hessvec_basis,
+                                                const Eigen::VectorXd& vec) {
+    if (is_debug) {std::cout<< "-----------------hessvec_dot_vector_basis---------------------"<<std::endl;}
+    int k = static_cast<int>(hessvec_basis.size());
+    if (k == 0) return Eigen::MatrixXd();
+    int n = static_cast<int>(hessvec_basis[0].rows());
+    Eigen::MatrixXd out(k, n);
+    for (int c = 0; c < k; ++c) {
+        out.row(c) = hessvec_basis[c] * vec;
     }
     return out;
 }
@@ -1258,7 +1272,38 @@ inline Eigen::VectorXd dot_grad_with_value(const Eigen::MatrixXd& grad_mat,
     if (grad_mat.rows() != value_vec.size()) {
         throw std::runtime_error("dot_grad_with_value: incompatible shapes");
     }
-    return grad_mat.transpose() * value_vec;
+    return grad_mat * value_vec;
+}
+
+inline Eigen::VectorXd const_vector_dot_basis_1d(const Eigen::VectorXd& const_vec,
+                                                 const Eigen::MatrixXd& basis) {
+    //
+    // Constant vector (k,) dotted with basis (k,n) -> (n,).
+    //
+    if (is_debug) {std::cout<< "-----------------const_vector_dot_basis_1d---------------------"<<std::endl;}
+    if (basis.rows() != const_vec.size()) {
+        throw std::runtime_error("const_vector_dot_basis_1d: incompatible shapes "
+                                 + std::to_string(basis.cols()) + " vs " + std::to_string(const_vec.size())
+                                + ". The shapes were given as basis (" + std::to_string(basis.rows()) + ", " 
+                                + std::to_string(basis.cols()) + 
+                                ") and const_vec (" + std::to_string(const_vec.size()) + ")." );
+    }
+    return basis.transpose() * const_vec;
+}
+inline Eigen::MatrixXd const_vector_dot_basis_1d(const Eigen::MatrixXd& const_mat,
+                                                 const Eigen::MatrixXd& basis) {
+
+    // Constant matrix  (k,k) dotted with basis (k,n) -> (n,).
+    
+    if (is_debug) {std::cout<< "-----------------const_vector_dot_basis_1d---------------------"<<std::endl;}
+    if (basis.rows() != const_mat.rows()) {
+        throw std::runtime_error("const_vector_dot_basis_1d: incompatible shapes "
+                                 + std::to_string(basis.cols()) + " vs " + std::to_string(const_mat.rows())
+                                + ". The shapes were given as basis (" + std::to_string(basis.rows()) + ", " 
+                                + std::to_string(basis.cols()) + ") and const_mat (" + std::to_string(const_mat.rows()) 
+                                + ", " + std::to_string(const_mat.cols()) + ")." );
+    }
+    return basis.transpose() * const_mat;
 }
 
 // Trial vector basis (k,n) dotted with grad(Function).T (d,k) -> (d,n)

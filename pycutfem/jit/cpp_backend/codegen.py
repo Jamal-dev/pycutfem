@@ -1023,7 +1023,7 @@ class CppCodeGen:
                         emit_line(f"auto {nm} = {a.name} - {b.name};")
                         push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
                 elif op.op_symbol == "*":
-                    print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})")
+                    # print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})")
                     if a.kind == "mixed" and b.kind == "mixed":
                         emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')
                         continue
@@ -1074,14 +1074,18 @@ class CppCodeGen:
                         emit_line(f"Eigen::MatrixXd {nm} = {b.name}.transpose() * {a.name};")
                         push_bin("mat", "value", (-1, -1))
                         continue
-                    # Scalar test/trial basis (1,n) multiplied by value vector (k,) -> vector of length n
+                    # Scalar test/trial basis (1,n) multiplied by value vector (k,) -> k x n matrix
                     if a.kind == "vec" and b.kind == "mat" and b.role in {"test", "trial"} and b.shape[0] == 1:
-                        emit_line(f"Eigen::VectorXd {nm} = {b.name}.row(0).transpose() * {a.name}(0);")
-                        push_bin("vec", b.role, (-1,), b.field_names, b.parent)
+                        emit_line(f"int {nm}_vdim = static_cast<int>({a.name}.size());")
+                        emit_line(f"Eigen::MatrixXd {nm}({nm}_vdim, n_union);")
+                        emit_line(f"for (int _c=0; _c<{nm}_vdim; ++_c) {nm}.row(_c) = {b.name}.row(0) * {a.name}(_c);")
+                        push_bin("mat", b.role, (b.shape[0] if len(b.shape)>0 else -1, -1), b.field_names, b.parent)
                         continue
                     if a.kind == "mat" and a.role in {"test", "trial"} and a.shape[0] == 1 and b.kind == "vec":
-                        emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() * {b.name}(0);")
-                        push_bin("vec", a.role, (-1,), a.field_names, a.parent)
+                        emit_line(f"int {nm}_vdim = static_cast<int>({b.name}.size());")
+                        emit_line(f"Eigen::MatrixXd {nm}({nm}_vdim, n_union);")
+                        emit_line(f"for (int _c=0; _c<{nm}_vdim; ++_c) {nm}.row(_c) = {a.name}.row(0) * {b.name}(_c);")
+                        push_bin("mat", a.role, (a.shape[0] if len(a.shape)>0 else -1, -1), a.field_names, a.parent)
                         continue
                     # Mixed gradients: scalar basis × grad basis
                     if a.kind == "mat" and a.role == "trial" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "test":
@@ -1201,7 +1205,8 @@ class CppCodeGen:
                 is_a_1d = a.kind == "vec" and a.shape[0] > 1
                 is_b_1d = b.kind == "vec" and b.shape[0] > 1
                 print(f"[dot] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
-                      f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})")
+                      f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})"
+                      f", union ({a_union_mat}, {b_union_mat})")
                 # trial/test mass
                 # Gradient advection combinations: grad(Function) · Trial  or Trial · grad(Function)
                 if a.kind == "grad" and b.kind == "grad" and a.role in {"test", "trial"} and b.role in {"test", "trial"}:
@@ -1228,10 +1233,16 @@ class CppCodeGen:
                 elif a.kind == "mat" and b.kind == "mat" and is_a_2x2 and is_b_2x2:
                     emit_line(f"Eigen::MatrixXd {nm} = dot_grad_grad_value({a.name}, {b.name});")
                     push("mat", "const", a.shape)
-                elif a.kind == "mat" and b.kind == "mat" and a_union_mat and b_union_mat:
+                elif a.kind == "mat" and b.kind == "mat" and (a_union_mat or b_union_mat):
                     # Preserve Test/Trial orientation (test^T @ trial)
                     role = "value"
-                    if b.role == "test":
+                    if b.role == "test" and b_union_mat:
+                        # If component counts match, use the streamlined contraction; otherwise fall back to mass dot
+                        if (a.shape[0] not in (-1, 0) and b.shape[0] not in (-1, 0) ):
+                            emit_line(f"auto {nm} = const_vector_dot_basis_1d({a.name}, {b.name});")
+                        # else:
+                            # emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({b.name}, {a.name});")
+                    elif b.role == "test":
                         emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({b.name}, {a.name});")
                     elif a.role == "test":
                         emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({a.name}, {b.name});")
@@ -1282,8 +1293,20 @@ class CppCodeGen:
                         )
                         push("grad", a.role, out_shape, a.field_names, a.parent, side, a.field_sides)
                 elif a.kind == "mat" and b.kind == "vec":
+                    vec_dim = b.shape[0] if len(b.shape) > 0 and b.shape[0] not in (-1, 0) else -1
                     if a.role in {"test", "trial"}:
-                        emit_line(f"Eigen::VectorXd {nm} = {a.name}.transpose() * {b.name};")
+                        emit_line(f"int {nm}_vdim = static_cast<int>({b.name}.size());")
+                        emit_line(f"Eigen::MatrixXd {nm};")
+                        if_branch = f"if ({nm}_vdim == {a.shape[0]} || {a.shape[0]} < 0)"
+                        emit_line(f"{if_branch} {{")
+                        emit_line(f"    {nm} = {a.name}.transpose() * {b.name};")
+                        emit_line("} else {")
+                        emit_line(f"    {nm} = Eigen::MatrixXd::Zero({nm}_vdim, n_union);")
+                        emit_line(f"    for (int _c=0; _c<{nm}_vdim; ++_c) {nm}.row(_c) = {a.name}.row(0) * {b.name}(_c);")
+                        emit_line("}")
+                        vec_dim = -1  # treat as dynamic below
+                    elif is_a_2x2 and is_b_1d:
+                        emit_line(f"auto {nm} = dot_grad_with_value({a.name}, {b.name});")
                     else:
                         emit_line(f"Eigen::VectorXd {nm};")
                         emit_line(f"if ({a.name}.cols() == {b.name}.size()) {{")
@@ -1293,13 +1316,27 @@ class CppCodeGen:
                         emit_line("} else {")
                         emit_line('    throw std::runtime_error("dot(mat, vec): dimension mismatch");')
                         emit_line("}")
-                    res_shape = (a.shape[0] if len(a.shape) > 0 and a.shape[0] not in (-1, 0) else -1,)
-                    push("vec", "value", res_shape)
+                    res_shape = (
+                        vec_dim if vec_dim not in (-1, 0) else (a.shape[0] if len(a.shape) > 0 else -1),
+                        a.shape[1] if len(a.shape) > 1 else -1,
+                    )
+                    push("mat", a.role if a.role in {"test", "trial"} else "value", res_shape, a.field_names, a.parent, side, a.field_sides)
                 elif a.kind == "vec" and b.kind == "mat":
-                    if b.role in {"test", "trial"}:
+                    if b.parent == "hess_dot_vec":
                         emit_line(f"Eigen::VectorXd {nm} = {b.name}.transpose() * {a.name};")
-                    # elif a.role in {"value"} and b.role in {"value"}:
-                    #     emit_line(f"Eigen::VectorXd {nm} = dot_value_with_grad({a.name}, {b.name});")
+                        push("vec", b.role, (b.shape[1] if len(b.shape) > 1 else -1,), b.field_names, b.parent, side, b.field_sides)
+                        continue
+                    mat_rows = b.shape[0] if len(b.shape) > 0 and b.shape[0] not in (-1, 0) else -1
+                    if b.role in {"test", "trial"}:
+                        emit_line(f"int {nm}_vdim = static_cast<int>({a.name}.size());")
+                        emit_line(f"Eigen::MatrixXd {nm};")
+                        emit_line(f"if ({nm}_vdim == {mat_rows} || {mat_rows} < 0) {{")
+                        emit_line(f"    {nm} = {b.name}.transpose() * {a.name};")
+                        emit_line("} else {")
+                        emit_line(f"    {nm} = Eigen::MatrixXd::Zero({nm}_vdim, n_union);")
+                        emit_line(f"    for (int _c=0; _c<{nm}_vdim; ++_c) {nm}.row(_c) = {b.name}.row(0) * {a.name}(_c);")
+                        emit_line("}")
+                        mat_rows = -1
                     elif is_a_1d and is_b_2x2:
                         emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
                     else:
@@ -1311,12 +1348,16 @@ class CppCodeGen:
                         emit_line("} else {")
                         emit_line('    throw std::runtime_error("dot(vec, mat): dimension mismatch");')
                         emit_line("}")
-                    push("vec", "value", (-1,))
+                    res_shape = (
+                        mat_rows if mat_rows not in (-1, 0) else -1,
+                        b.shape[1] if len(b.shape) > 1 else -1,
+                    )
+                    push("mat", b.role if b.role in {"test", "trial"} else "value", res_shape, b.field_names, b.parent, side, b.field_sides)
                 elif a.kind == "vec" and b.kind == "grad":
                     if b.parent == "hess_dot_vec":
+                        # Numba path uses contract_last_first + vector_dot_grad_basis: (k,n,2) -> (d,n)
                         emit_line(f"Eigen::MatrixXd {nm} = vector_dot_grad_basis({a.name}, {b.name});")
-                        out_rows = 1 if b.shape[0] == 1 else (b.shape[2] if len(b.shape) > 2 else -1)
-                        out_shape = (out_rows, b.shape[1] if len(b.shape) > 1 else -1)
+                        out_shape = (b.shape[2] if len(b.shape) > 2 else -1, b.shape[1] if len(b.shape) > 1 else -1)
                     elif not a.field_names and b.field_names:
                         emit_line(f"Eigen::MatrixXd {nm} = dot_grad_basis_vector({b.name}, {a.name});")
                         out_shape = (b.shape[0], b.shape[1])
@@ -1451,13 +1492,10 @@ class CppCodeGen:
                     emit_line(f"double {nm} = {a.name}.dot({b.name});")
                     push_inner("scalar", "value", ())
                 elif a.kind == "vec" and b.kind == "mat":
-                    # emit_line(f"std::cout << \"[inner] vec·mat: \" << {a.name}.size() << \" x \" << {b.name}.rows() << \", \" << {b.name}.cols() << std::endl;")
                     emit_line(f"Eigen::VectorXd {nm} = {b.name}.transpose() * {a.name};")
-                    # emit_line(f"Eigen::VectorXd {nm} = {a.name} * {b.name};")
                     push_inner("vec", "value", (-1,))
                 elif a.kind == "mat" and b.kind == "vec":
                     emit_line(f"Eigen::VectorXd {nm} = {a.name}.transpose() * {b.name};")
-                    # emit_line(f"Eigen::VectorXd {nm} = {a.name} * {b.name};")
                     push_inner("vec", "value", (-1,))
                 elif a.kind == "hess" and b.kind == "hess":
                     if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
@@ -1593,6 +1631,19 @@ class CppCodeGen:
                 elif op.store_type == "vector":
                     if a.kind == "scalar":
                         emit_line(f"for (ssize_t i=0;i<n_union;++i) F_view(e,i)+= {a.name} * qw_view(e,q);")
+                    elif a.kind == "mat":
+                        emit_line(f"Eigen::VectorXd _tmpF = Eigen::VectorXd::Zero(n_union);")
+                        emit_line(f"Eigen::Index _rows = {a.name}.rows();")
+                        emit_line(f"Eigen::Index _cols = {a.name}.cols();")
+                        emit_line(f"if (_cols == n_union) {{")
+                        emit_line(f"    _tmpF = {a.name}.colwise().sum().transpose();")
+                        emit_line("} else if (_rows == n_union) {")
+                        emit_line(f"    _tmpF = {a.name}.rowwise().sum();")
+                        emit_line("} else {")
+                        emit_line(f"    Eigen::Index _limit = std::min<Eigen::Index>(n_union, _rows);")
+                        emit_line(f"    for (Eigen::Index _i=0; _i<_limit; ++_i) _tmpF(_i) = {a.name}(_i,0);")
+                        emit_line("}")
+                        emit_line(f"for (ssize_t i=0;i<n_union;++i) F_view(e,i)+= _tmpF(i) * qw_view(e,q);")
                     elif a.kind == "grad":
                         emit_line(f"Eigen::VectorXd _tmpF = Eigen::VectorXd::Zero(n_union);")
                         emit_line(f"for (auto& _m : {a.name}) {{")

@@ -3859,6 +3859,18 @@ class DofHandler:
                     J_inv[e, q, 1, 0] = -a10 * invd
                     J_inv[e, q, 1, 1] =  a00 * invd
 
+        # ---- basis & first derivatives (union-sized, boundary quadrature) ---------
+        b_tabs = {f: np.zeros((n_edges, n_q, n_loc), dtype=float) for f in fields}
+        g_tabs = {f: np.zeros((n_edges, n_q, n_loc, 2), dtype=float) for f in fields}
+        xi_flat  = xi_tab.reshape(-1)
+        eta_flat = eta_tab.reshape(-1)
+        for fld in fields:
+            sl = self.mixed_element.component_dof_slices[fld]
+            B = me._eval_scalar_basis_many(fld, xi_flat, eta_flat).reshape(n_edges, n_q, -1)
+            G = me._eval_scalar_grad_many (fld, xi_flat, eta_flat).reshape(n_edges, n_q, -1, 2)
+            b_tabs[fld][:, :, sl]    = B
+            g_tabs[fld][:, :, sl, :] = G
+
         # ---- Inverse-map jets for chain rule (Hxi: 2nd, Txi: 3rd, Qxi: 4th) -------
         if need_hess or need_o3 or need_o4:
             kmax = 4 if need_o4 else (3 if need_o3 else 2)
@@ -3939,6 +3951,9 @@ class DofHandler:
             "owner_neg_id": -np.ones_like(owner, dtype=np.int32),
         }
         out.update(basis_tabs)
+        for fld in fields:
+            out[f"b_{fld}"] = b_tabs[fld]
+            out[f"g_{fld}"] = g_tabs[fld]
         if need_hess:
             out["Hxi0"] = Hxi0; out["Hxi1"] = Hxi1
         if need_o3:
