@@ -255,31 +255,74 @@ class CppCodeGen:
         )
 
         # local helpers ----------------------------------------------------
-        # Respect the active-field ordering used by compile_multi/_compress_static_for_active.
-        # The param_order advertises how union-sized arrays were compressed; if basis/gradient
-        # entries appear in a different order (e.g., ["b_p", "b_ux", "b_uy"]), mirror that
-        # ordering so local column slices line up with the compressed gdofs_map/basis tables.
-        def _field_order_from_params():
+        # Field slice policy: mirror the active-field ordering used by the Python
+        # codegen (first-seen LoadVariable order, fallback to full element order).
+        def _active_fields_from_ir():
+            """Gather field ordering as they appear in the IR."""
+            seen = set()
             order: list[str] = []
-            prefixes = ("b_", "g_", "d10_", "d01_", "d20_", "d11_", "d02_", "r00_", "r10_", "r01_", "r20_", "r11_", "r02_")
-            for tag in param_order:
-                if not isinstance(tag, str):
-                    continue
-                if tag.startswith(prefixes):
-                    fld = tag.split("_", 1)[1]
-                    if fld in getattr(self.mixed_element, "field_names", ()) and fld not in order:
-                        order.append(fld)
+            for op in ir_sequence:
+                fns = getattr(op, "field_names", None)
+                if fns:
+                    for f in fns or []:
+                        if f in seen or f not in getattr(self.mixed_element, "field_names", ()):
+                            continue
+                        seen.add(f)
+                        order.append(f)
+                elif hasattr(op, "field_name"):
+                    f = getattr(op, "field_name", None)
+                    if f and f not in seen and f in getattr(self.mixed_element, "field_names", ()):
+                        seen.add(f)
+                        order.append(f)
+            if not order:
+                order = list(getattr(self.mixed_element, "field_names", ()))
             return order
 
-        field_order = _field_order_from_params() or list(getattr(self.mixed_element, "field_names", ()))
+        def _active_fields_from_param_order(params: list[str]) -> list[str]:
+            """Mirror the active-field order encoded in PARAM_ORDER (b_*, g_*, …)."""
+            order: list[str] = []
+            for name in params:
+                if not isinstance(name, str):
+                    continue
+                prefix = name.split("_", 1)[0]
+                if prefix not in {"b", "g", "d", "r"}:
+                    continue
+                base = name.split("_", 1)[1] if "_" in name else ""
+                # strip sided suffixes (pos/neg) when present
+                base = base.split("__", 1)[0]
+                if base in getattr(self.mixed_element, "field_names", ()) and base not in order:
+                    order.append(base)
+            return order
 
-        field_slices = {}
-        offset = 0
-        for name in field_order:
-            base_slice = self.mixed_element.component_dof_slices[name]
-            width = base_slice.stop - base_slice.start
-            field_slices[name] = slice(offset, offset + width)
-            offset += width
+        # Prefer the mirror’s active_fields (Numba) to stay in lockstep with
+        # how static args are compressed; fall back to PARAM_ORDER hints, then IR.
+        active_fields: list[str] = []
+        if self._mirror is not None and getattr(self._mirror, "active_fields", None):
+            active_fields = list(self._mirror.active_fields)
+        if not active_fields and param_order:
+            active_fields = _active_fields_from_param_order(param_order)
+        if not active_fields:
+            active_fields = _active_fields_from_ir()
+
+        # Persist for downstream callers (static arg compression).
+        self.active_fields = tuple(active_fields)
+
+        me_fields = list(getattr(self.mixed_element, "field_names", ()))
+
+        # Default: native component ordering (matches uncompressed gdofs_map)
+        field_slices = dict(self.mixed_element.component_dof_slices)
+
+        # When the IR ordering differs from the MixedElement order (subset or
+        # permutation), the assembler compresses/reorders static arrays to
+        # match the active_fields sequence. Mirror that layout here.
+        if tuple(active_fields) != tuple(me_fields):
+            field_slices = {}
+            offset = 0
+            for name in active_fields:
+                base_slice = self.mixed_element.component_dof_slices[name]
+                width = base_slice.stop - base_slice.start
+                field_slices[name] = slice(offset, offset + width)
+                offset += width
         functional_dim = 1  # number of output components for functionals
 
         def new_tmp(prefix="tmp", counter={"i": 0}):
@@ -398,6 +441,7 @@ class CppCodeGen:
                 )
         arg_sig = ",\n        ".join(arg_decls)
         param_list = ", ".join([f'py::str("{p}")' for p in param_order])
+        active_list = ", ".join([f'py::str("{f}")' for f in active_fields])
 
         # views for arrays used frequently
         view_lines = [
@@ -1086,7 +1130,7 @@ class CppCodeGen:
                         emit_line(f"auto {nm} = {a.name} - {b.name};")
                         push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
                 elif op.op_symbol == "*":
-                    # print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})")
+                    print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})")
                     if a.kind == "mixed" and b.kind == "mixed":
                         emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')
                         continue
@@ -1097,6 +1141,14 @@ class CppCodeGen:
                     if b.kind == "scalar" and a.kind == "mixed":
                         emit_line(f"auto {nm} = scale_mixed({a.name}, {b.name});")
                         push_bin("mixed", a.role, a.shape, a.field_names, a.parent)
+                        continue
+                    if a.kind == "scalar" and b.kind == "mat":
+                        emit_line(f"Eigen::MatrixXd {nm} = {a.name} * {b.name};")
+                        push_bin("mat", b.role, b.shape, b.field_names, b.parent)
+                        continue
+                    if b.kind == "scalar" and a.kind == "mat":
+                        emit_line(f"Eigen::MatrixXd {nm} = {b.name} * {a.name};")
+                        push_bin("mat", a.role, a.shape, a.field_names, a.parent)
                         continue
                     if a.kind == "mixed" and len(a.shape) == 3 and b.kind == "mat":
                         emit_line(f"auto {nm} = scale_mixed_basis_with_coeffs({a.name}, {b.name});")
@@ -1421,12 +1473,13 @@ class CppCodeGen:
                         # Numba path uses contract_last_first + vector_dot_grad_basis: (k,n,2) -> (d,n)
                         emit_line(f"Eigen::MatrixXd {nm} = vector_dot_grad_basis({a.name}, {b.name});")
                         out_shape = (b.shape[2] if len(b.shape) > 2 else -1, b.shape[1] if len(b.shape) > 1 else -1)
-                    elif not a.field_names and b.field_names:
-                        emit_line(f"Eigen::MatrixXd {nm} = dot_grad_basis_vector({b.name}, {a.name});")
-                        out_shape = (b.shape[0], b.shape[1])
                     else:
+                        # Prefer spatial-axis contraction when vector length matches spatial dimension.
                         emit_line(f"Eigen::MatrixXd {nm} = vector_dot_grad_basis({a.name}, {b.name});")
-                        out_rows = 1 if b.shape[0] == 1 else (b.shape[2] if len(b.shape) > 2 else -1)
+                        vec_dim = a.shape[0] if len(a.shape) > 0 and a.shape[0] not in (-1, 0) else -1
+                        spatial_dim = b.shape[2] if len(b.shape) > 2 else -1
+                        use_spatial = (spatial_dim > 0 and vec_dim == spatial_dim) or b.shape[0] == 1
+                        out_rows = b.shape[0] if use_spatial else (spatial_dim if spatial_dim > 0 else -1)
                         out_shape = (out_rows, b.shape[1] if len(b.shape) > 1 else -1)
                     push("mat", b.role, out_shape, b.field_names, b.parent, side, b.field_sides)
                 elif a.kind == "grad" and b.kind == "vec":
@@ -1523,6 +1576,16 @@ class CppCodeGen:
                             field_sides if field_sides is not None else f_sides,
                         )
                     )
+                is_a_2x2 = a.kind == "mat" and a.shape == (2,2)
+                is_b_2x2 = b.kind == "mat" and b.shape == (2,2)
+                is_a_1d = a.kind in {"vec", "mat"} and a.shape[0] > 1 and len(a.shape) == 1
+                is_b_basis = b.kind == "mat" and b.role in {"test", "trial"}
+                is_b_1d = b.kind in {"vec", "mat"} and b.shape[0] > 1 and len(b.shape) == 1
+                is_a_basis = a.kind == "mat" and a.role in {"test", "trial"}
+                is_a_scalar = a.kind in {"scalar", "vec", "mat"} and (a.shape == () or a.shape == (1,))
+                is_b_scalar = b.kind in {"scalar", "vec", "mat"} and (b.shape == () or b.shape == (1,))
+                is_a_grad_basis = a.kind == "grad" and a.role in {"test", "trial"} and len(a.shape) == 3
+                is_b_grad_basis = b.kind == "grad" and b.role in {"test", "trial"} and len(b.shape) == 3
                 if a.kind == "mixed" and b.kind == "mat" and len(a.shape) == 4:
                     emit_line(f"Eigen::MatrixXd {nm} = inner_mixed_grad_const({a.name}, {b.name}, {a.shape[0]}, {a.shape[3]}, {a.shape[1]}, {a.shape[2]});")
                     push_inner("mat", "value", (-1, -1))
@@ -1530,27 +1593,44 @@ class CppCodeGen:
                     emit_line(f"Eigen::MatrixXd {nm} = inner_grad_const_mixed({a.name}, {b.name}, {b.shape[0]}, {b.shape[3]}, {b.shape[1]}, {b.shape[2]});")
                     push_inner("mat", "value", (-1, -1))
                 elif a.kind == "grad" and b.kind == "grad":
-                    # Preserve test/trial orientation for LHS matrices
                     if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
                         test_var  = a.name if a.role == "test" else b.name
                         trial_var = a.name if a.role == "trial" else b.name
                         emit_line(f"Eigen::MatrixXd {nm} = inner_grad_grad({test_var}, {trial_var});")
-                        test_shape = a.shape if a.role == "test" else b.shape
-                        trial_shape = a.shape if a.role == "trial" else b.shape
-                        out_shape = (test_shape[1], trial_shape[1]) if len(test_shape) > 1 and len(trial_shape) > 1 else (-1, -1)
-                        push_inner("mat", "value", out_shape)
-                    else:
-                        emit_line(f"Eigen::MatrixXd {nm} = inner_grad_grad({a.name}, {b.name});")
                         push_inner("mat", "value", (-1, -1))
+                    elif a.role in {"value", "const"} and b.role == "test":
+                        emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({b.name}, {a.name});")
+                        push_inner("vec", "value", (b.shape[1] if len(b.shape)>1 else -1,))
+                    elif b.role in {"value", "const"} and a.role == "test":
+                        emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({a.name}, {b.name});")
+                        push_inner("vec", "value", (a.shape[1] if len(a.shape)>1 else -1,))
+                    else:
+                        raise NotImplementedError(f"inner(grad, grad) unsupported for roles {a.role}/{b.role}")
                 elif a.kind == "mat" and b.kind == "mat":
                     if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
                         test_var = a.name if a.role == "test" else b.name
                         trial_var = a.name if a.role == "trial" else b.name
                         emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({test_var}, {trial_var});")
                         push_inner("mat", "value", (-1, -1))
-                    else:
+                    elif is_a_2x2 and is_b_2x2:
                         emit_line(f"double {nm} = ({a.name}.cwiseProduct({b.name})).sum();")
                         push_inner("scalar", "value", ())
+                    elif is_a_1d and is_b_basis:
+                        emit_line(f"auto {nm} = const_vector_dot_basis_1d({a.name}, {b.name});")
+                        push_inner("vec", "value", (-1,))
+                    elif is_b_1d and is_a_basis:
+                        emit_line(f"auto {nm} = const_vector_dot_basis_1d({b.name}, {a.name});")
+                        push_inner("vec", "value", (-1,))
+                    elif is_a_scalar and is_b_basis:
+                        emit_line(f"auto {nm} = ({a.name}* {b.name}).transpose();")
+                        push_inner("vec", "value", (-1,))
+                    elif is_b_scalar and is_a_basis:
+                        emit_line(f"auto {nm} = ({b.name}* {a.name}).transpose();")
+                        push_inner("vec", "value", (-1,))
+                    else:
+                        raise NotImplementedError("Inner(mat, mat) supports only test/trial or 2x2 value combinations"
+                                                  f" (got roles {a.role}, {b.role})"
+                                                  f" (shapes {a.shape}, {b.shape})")
                 elif a.kind == "vec" and b.kind == "vec":
                     emit_line(f"double {nm} = {a.name}.dot({b.name});")
                     push_inner("scalar", "value", ())
@@ -1845,6 +1925,7 @@ PYBIND11_MODULE({module_name}, m) {{
     m.doc() = "pycutfem experimental C++ kernel";
     m.def("{kernel_name}", &{kernel_name}, "Experimental C++ kernel");
     m.attr("PARAM_ORDER") = py::make_tuple({param_list});
+    m.attr("ACTIVE_FIELDS") = py::make_tuple({active_list});
     m.attr("CODEGEN_ABI") = "{CODEGEN_ABI_CPP}";
 }}
 """
@@ -1898,6 +1979,7 @@ PYBIND11_MODULE({module_name}, m) {{
 
         arg_sig = ",\n        ".join(arg_decls)
         param_list = ", ".join([f'py::str("{p}")' for p in param_order])
+        active_list = ", ".join([f'py::str("{f}")' for f in [*vel_fields, p_field]])
 
         un_block = ""
         if un:
@@ -2085,6 +2167,7 @@ PYBIND11_MODULE({module_name}, m) {{
     m.doc() = "pycutfem experimental C++ Navier-Stokes kernel";
     m.def("{kernel_name}", &{kernel_name}, "Experimental C++ kernel");
     m.attr("PARAM_ORDER") = py::make_tuple({param_list});
+    m.attr("ACTIVE_FIELDS") = py::make_tuple({active_list});
     m.attr("CODEGEN_ABI") = "{CODEGEN_ABI_CPP}";
 }}
 """

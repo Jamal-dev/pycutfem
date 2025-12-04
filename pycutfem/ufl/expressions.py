@@ -415,9 +415,12 @@ class VectorFunction(Expression):
         self.parent_name = ""
         # --- Side metadata for vector-valued functions ---
         self.side = side
-        if side in ("+","-",""):
+        if side in ("+","-"):
             s = "pos" if side == "+" else "neg"
             self.field_sides = [s] * len(self.field_names)
+        else:
+            # Volume/default case: no per-component side tagging
+            self.field_sides = [""] * len(self.field_names)
         
         
         # This function holds the data for multiple fields.

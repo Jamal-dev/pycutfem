@@ -40,7 +40,7 @@ class CppKernelCache:
     def get_kernel(self, ir_sequence: list, codegen, mesh_sig=None):
         """
         Build (or load) a kernel for the given IR sequence and return
-        (kernel_fn, param_order list).
+        (kernel_fn, param_order list, active_fields list).
         """
         ir_hash = KernelCache._hash_ir(ir_sequence, mesh_sig)
 
@@ -93,10 +93,15 @@ class CppKernelCache:
             else param_order
             or []
         )
+        active_fields = (
+            list(getattr(module, "ACTIVE_FIELDS"))
+            if hasattr(module, "ACTIVE_FIELDS")
+            else list(getattr(codegen, "active_fields", []) or [])
+        )
 
         kernel_fn = getattr(module, codegen.kernel_export_name("kernel"))
-        self.in_memory_cache[ir_hash] = (kernel_fn, param_order)
-        return kernel_fn, param_order
+        self.in_memory_cache[ir_hash] = (kernel_fn, param_order, active_fields)
+        return kernel_fn, param_order, active_fields
 
     # ------------------------------------------------------------------
     @staticmethod

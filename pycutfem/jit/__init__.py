@@ -340,6 +340,9 @@ def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet:
         
     # New Newton: Return the runner, not the raw kernel
     runner = KernelRunner(kernel, param_order, ir_sequence, dof_handler)
+    # Surface the active-field ordering from the codegen so callers can
+    # mirror the static argument compression if needed.
+    runner.active_fields = getattr(codegen, "active_fields", None)
     return runner, ir_sequence
 
 
@@ -526,16 +529,21 @@ def compile_multi(form, *, dof_handler, mixed_element,
         runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element, on_facet=on_facet)
         active_fields = _active_field_order(ir, mixed_element)
 
-        # Fallback: infer active fields from param_order when IR lacks field annotations
-        _param_fields: list[str] = []
-        for name in getattr(runner, "param_order", []):
-            has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
-            if name.startswith(("b_", "g_")) or has_deriv:
-                fld = name.split("_", 1)[1] if "_" in name else name
-                if fld in getattr(mixed_element, "field_names", ()):
-                    _param_fields.append(fld)
-        if _param_fields:
-            active_fields = tuple(dict.fromkeys(_param_fields))  # preserve order, drop dups
+        # Prefer an explicit hint from the runner/codegen when present.
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_fields = tuple(runner_active)
+        else:
+            # Fallback: infer active fields from param_order when IR lacks field annotations
+            _param_fields: list[str] = []
+            for name in getattr(runner, "param_order", []):
+                has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
+                if name.startswith(("b_", "g_")) or has_deriv:
+                    fld = name.split("_", 1)[1] if "_" in name else name
+                    if fld in getattr(mixed_element, "field_names", ()):
+                        _param_fields.append(fld)
+            if _param_fields:
+                active_fields = tuple(dict.fromkeys(_param_fields))  # preserve order, drop dups
 
         active_cols = _active_columns(mixed_element, active_fields)
         if os.getenv("PYCUTFEM_JIT_DEBUG_ACTIVE", "").lower() in {"1", "true", "yes"}:

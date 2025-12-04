@@ -2210,6 +2210,23 @@ class FormCompiler:
         )
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(integral, runner)
 
+        # Active subset/permutation used by the kernel (needed for static arg layout)
+        active_fields = _active_field_order(ir, self.me)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_fields = tuple(runner_active)
+        else:
+            _param_fields: list[str] = []
+            for name in getattr(runner, "param_order", []):
+                has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
+                if name.startswith(("b_", "g_")) or has_deriv:
+                    fld = name.split("_", 1)[1] if "_" in name else name
+                    if fld in getattr(self.me, "field_names", ()):
+                        _param_fields.append(fld)
+            if _param_fields:
+                active_fields = tuple(dict.fromkeys(_param_fields))  # preserve order, drop dups
+        active_cols = _active_columns(self.me, active_fields)
+
 
         # 4. Build the static arguments required by this specific kernel.
         # We build these fresh every time to avoid caching collisions.
@@ -2236,7 +2253,7 @@ class FormCompiler:
 
         # (B) Build the DOF map for the subset.
         gdofs_map = np.vstack([
-            self.dh.get_elemental_dofs(e) for e in element_ids
+            self.dh.get_elemental_dofs(e)[active_cols] for e in element_ids
         ]).astype(np.int32)
 
         # (C) Build all other required tables (basis, etc.) based on the correct param_order.
@@ -2255,6 +2272,8 @@ class FormCompiler:
             **pre_built,
             **basis_args,
         }
+        static_args = _compress_static_for_active(static_args, self.me, active_cols)
+        gdofs_map = static_args.get("gdofs_map", gdofs_map)
 
         # 5. Execute the kernel via the runner.
         K_loc, F_loc, J_loc = runner(current_funcs, static_args)

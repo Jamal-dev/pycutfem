@@ -791,17 +791,24 @@ inline Eigen::MatrixXd dot_vec_grad(const Eigen::VectorXd& vec,
     return out;
 }
 
+// Vector dotted with grad(basis) with optional spatial-vs-component disambiguation.
+// If the vector length matches spatial dim and k==1, contract spatially to preserve basis rows (1 x n).
+// Otherwise, if the vector length matches component count (k), contract components -> (d x n).
 inline Eigen::MatrixXd vector_dot_grad_basis(const Eigen::VectorXd& vec,
                                              const std::vector<Eigen::MatrixXd>& grad_basis) {
     if (is_debug) {std::cout<< "-----------------vector_dot_grad_basis---------------------"<<std::endl;}
     int k = static_cast<int>(grad_basis.size());
     if (k == 0) return Eigen::MatrixXd();
     int d = static_cast<int>(grad_basis[0].cols());
-    if (k == 1 && vec.size() == d) {
+    int vlen = static_cast<int>(vec.size());
+    if (k == 1 && vlen == d) {
         Eigen::RowVectorXd row = grad_basis[0] * vec;
-        return Eigen::MatrixXd(row);
+        return Eigen::MatrixXd(row); // (1, n)
     }
-    return dot_vec_grad(vec, grad_basis);
+    if (vlen == k) {
+        return dot_vec_grad(vec, grad_basis); // (d, n)
+    }
+    throw std::runtime_error("vector_dot_grad_basis: incompatible shapes.");
 }
 
 // Contract vector basis (components) with grad basis: sum_c grad[c][:,r] * vec_basis[c,:]

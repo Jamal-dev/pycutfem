@@ -64,7 +64,7 @@ def compile_backend_cpp(
     ir_sequence = ir_generator.generate(integral_expression)
 
     try:
-        kernel, param_order = cache.get_kernel(
+        kernel, param_order, active_fields = cache.get_kernel(
             ir_sequence, cpp_codegen, mixed_element.signature()
         )
     except Exception as exc:
@@ -72,6 +72,9 @@ def compile_backend_cpp(
         raise
 
     runner = KernelRunnerCpp(kernel, param_order, ir_sequence, dof_handler, fallback_runner=None)
+    # Expose the field ordering used by the codegen so static arg compression
+    # in the solver can mirror it (avoids misaligned gdofs_map columns).
+    runner.active_fields = active_fields or getattr(cpp_codegen, "active_fields", None)
     return runner, ir_sequence
 
 
