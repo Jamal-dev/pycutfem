@@ -13,8 +13,12 @@ class KernelRunnerCpp:
         from pycutfem.jit import KernelRunner as _KernelRunner
 
         self.kernel = kernel
-        self.param_order = param_order
-        self._delegate = _KernelRunner(kernel, param_order, ir_sequence, dof_handler)
+        # Prefer the ABI-advertised order from the compiled module when available.
+        # This guards against any mismatch between the Python-side param_order and
+        # the actual C++ signature, which can lead to silently wrong argument
+        # placement (e.g. zeroed coefficients).
+        self.param_order = list(getattr(kernel, "PARAM_ORDER", param_order))
+        self._delegate = _KernelRunner(kernel, self.param_order, ir_sequence, dof_handler)
         self._fallback = fallback_runner  # kept for API compatibility; unused
 
     def __call__(self, functions, static_args):

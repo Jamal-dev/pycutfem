@@ -255,10 +255,31 @@ class CppCodeGen:
         )
 
         # local helpers ----------------------------------------------------
-        field_slices = {
-            name: self.mixed_element.component_dof_slices[name]
-            for name in self.mixed_element.field_names
-        }
+        # Respect the active-field ordering used by compile_multi/_compress_static_for_active.
+        # The param_order advertises how union-sized arrays were compressed; if basis/gradient
+        # entries appear in a different order (e.g., ["b_p", "b_ux", "b_uy"]), mirror that
+        # ordering so local column slices line up with the compressed gdofs_map/basis tables.
+        def _field_order_from_params():
+            order: list[str] = []
+            prefixes = ("b_", "g_", "d10_", "d01_", "d20_", "d11_", "d02_", "r00_", "r10_", "r01_", "r20_", "r11_", "r02_")
+            for tag in param_order:
+                if not isinstance(tag, str):
+                    continue
+                if tag.startswith(prefixes):
+                    fld = tag.split("_", 1)[1]
+                    if fld in getattr(self.mixed_element, "field_names", ()) and fld not in order:
+                        order.append(fld)
+            return order
+
+        field_order = _field_order_from_params() or list(getattr(self.mixed_element, "field_names", ()))
+
+        field_slices = {}
+        offset = 0
+        for name in field_order:
+            base_slice = self.mixed_element.component_dof_slices[name]
+            width = base_slice.stop - base_slice.start
+            field_slices[name] = slice(offset, offset + width)
+            offset += width
         functional_dim = 1  # number of output components for functionals
 
         def new_tmp(prefix="tmp", counter={"i": 0}):
@@ -528,7 +549,49 @@ class CppCodeGen:
                     raise NotImplementedError("LoadAnalytic only implemented for scalar/vector tensors in C++ backend")
             elif isinstance(op, LoadVariable):
                 followed_by_diff = isinstance(next_op, (Grad,))
-                if op.role in {"test", "trial"} and op.deriv_order == (0, 0):
+                # ------------------------------------------------------------------
+                # Functions / coefficients: treat like "value" (gather with basis)
+                # ------------------------------------------------------------------
+                if op.role == "function" and op.deriv_order == (0, 0):
+                    coeff_name = f"u_{op.name}_loc"
+                    required_args.add(coeff_name)
+                    k = len(op.field_names)
+                    nm = new_tmp("val")
+                    emit_line(f"Eigen::VectorXd {nm}({k});")
+                    emit_line(f"{nm}.setZero();")
+                    for idx, fn in enumerate(op.field_names):
+                        s0 = field_slices.get(fn, slice(0, 0)).start
+                        s1 = field_slices.get(fn, slice(0, 0)).stop
+                        side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx)
+                        if self.on_facet and side_tag in ("pos", "neg"):
+                            basis_name = f"r00_{fn}_{side_tag}"
+                            map_name   = f"{side_tag}_map_{fn}"
+                            required_args.update({basis_name, map_name})
+                            emit_line(f"{nm}({idx}) = 0.0;")
+                            map_len = new_tmp("map_len"); basis_len = new_tmp("basis_len")
+                            emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
+                            emit_line(f"ssize_t {basis_len} = {basis_name}_view.shape(2);")
+                            emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
+                            emit_line(f"    int col = {map_name}_view(e, j);")
+                            emit_line(f"    if (col < 0 || col >= n_union) continue;")
+                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(f"    if (src >= {basis_len}) continue;")
+                            emit_line(f"    {nm}({idx}) += {coeff_name}_view(e, col) * {basis_name}_view(e, q, src);")
+                            emit_line("}")
+                        else:
+                            s0_adj = new_tmp("s0"); s1_adj = new_tmp("s1")
+                            emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                            emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                            emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                            emit_line(
+                                f"{nm}({idx}) = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0_adj}, {s1_adj});"
+                            )
+                    if k == 1:
+                        emit_line(f"double {nm}_scalar = {nm}(0);")
+                        stack.append(StackItem(f"{nm}_scalar", "scalar", "value", (), op.field_names, op.name, op.side, op.field_sides or []))
+                    else:
+                        stack.append(StackItem(nm, "vec", "value", (k,), op.field_names, op.name, op.side, op.field_sides or []))
+                elif op.role in {"test", "trial"} and op.deriv_order == (0, 0):
                     if followed_by_diff:
                         stack.append(
                             StackItem("__basis__", "basis_ref", op.role, (len(op.field_names), -1), op.field_names, op.name, op.side, op.field_sides)
