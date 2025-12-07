@@ -9,7 +9,7 @@ from pycutfem.ufl.expressions import (
     Expression, Constant, TestFunction, TrialFunction, VectorTestFunction,
     VectorTrialFunction, Function, VectorFunction, Grad, DivOperation, Inner,
     Dot, Sum, Sub, Prod, Pos, Neg, Div, FacetNormal, ElementWiseConstant, Jump,
-    Derivative
+    Derivative, Transpose
 )
 
 if TYPE_CHECKING:
@@ -72,6 +72,9 @@ class PolynomialDegreeEstimator:
             result = self._get_degree(expr.a) + self._get_degree(expr.b)
         elif isinstance(expr, (Pos, Neg)):
             result = self._get_degree(expr.operand)
+        elif isinstance(expr, Transpose):
+            # Transpose does not change polynomial degree.
+            result = self._get_degree(expr.A)
         elif isinstance(expr, FacetNormal):
             result = self._geom_deg
         elif isinstance(expr, ElementWiseConstant):

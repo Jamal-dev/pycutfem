@@ -110,6 +110,17 @@ class StackItem:
         return resolved["field_names"], resolved["parent_name"], resolved["side"], resolved["field_sides"]
     
 
+def _basis_col_dim(shape: tuple) -> int:
+    """
+    Return the basis column dimension, tolerating both (k, n) and (n,) / (1, n)
+    layouts. This makes the mass-matrix dot cases robust to 1D arrays.
+    """
+    if len(shape) >= 2:
+        return int(shape[1])
+    if len(shape) == 1:
+        return int(shape[0])
+    raise ValueError(f"Unexpected basis shape {shape!r} for dot product")
+
 
 # ── scalar * Vector/Tensor  (or Vector/Tensor * scalar) ────────────
 def _mul_scalar_vector(self,first_is_scalar,res_var,a, b, body_lines, stack):
@@ -1208,7 +1219,7 @@ class NumbaCodeGen:
                                             side=a.side,
                                             field_sides=a.field_sides or []))
 
-                # --- Case 2: Trace of a Test/Trial function tensor (e.g., shape (2, n, 2)) ---
+                # --- Case 2: Trace of a grad(Test/Trial) function tensor (e.g., shape (2, n, 2)) ---
                 elif len(a.shape) == 3:
                     # First, validate that the tensor is square over its first and last dimensions.
                     if a.shape[0] != a.shape[2]:
@@ -1679,7 +1690,7 @@ class NumbaCodeGen:
                         )
                     # Push RHS vector (n,) with resolved metadata (prefer test’s side)
                     field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=b, strict=False)
-                    stack.append(StackItem(var_name=res_var, role='value',
+                    stack.append(StackItem(var_name=res_var, role='test',
                                            shape=(b.shape[1],), is_vector=False, is_gradient=False,
                                            field_names=field_names, parent_name=parent_name, side=side,
                                            field_sides=field_sides))
@@ -1707,7 +1718,7 @@ class NumbaCodeGen:
                                            field_sides=field_sides))
                     continue
                 elif a.role in {'test','trial'} and a.is_gradient and b.role in {'const','value'} and b.is_gradient:
-                    role = 'value'
+                    role = a.role
                     body_lines.append("# Inner(grad(Test/Trial), grad(const))")
                     body_lines.append(
                         f"{res_var} = inner_grad_basis_grad_const({a.var_name}, {b.var_name}, {self.dtype})"
@@ -1715,6 +1726,18 @@ class NumbaCodeGen:
                     field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
                     stack.append(StackItem(var_name=res_var, role=role,
                                            shape=(a.shape[1],), is_vector=False, is_gradient=False,
+                                           field_names=field_names, parent_name=parent_name, side=side,
+                                           field_sides=field_sides))
+                    continue
+                elif a.role in {'const','value'} and a.is_gradient and b.role in {'test','trial'} and b.is_gradient:
+                    role = b.role
+                    body_lines.append("# Inner(grad(const), grad(Test/Trial))")
+                    body_lines.append(
+                        f"{res_var} = inner_grad_function_grad_test({a.var_name}, {b.var_name}, {self.dtype})"
+                    )
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='b', strict=False)
+                    stack.append(StackItem(var_name=res_var, role=role,
+                                           shape=(b.shape[1],), is_vector=False, is_gradient=False,
                                            field_names=field_names, parent_name=parent_name, side=side,
                                            field_sides=field_sides))
                     continue
@@ -1803,6 +1826,9 @@ class NumbaCodeGen:
                                            is_vector=True, is_gradient=False, field_names=a.field_names, parent_name=a.parent_name, side =a.side,
                                            field_sides=a.field_sides or []))
                
+                # ---------------------------------------------------------------------
+                # dot( u_trial ,  u_test )      ← mass-matrix block
+                # ---------------------------------------------------------------------
                 # Final advection term: dot(advection_vector_trial, v_test)
                 elif (a.role == 'trial' and (not a.is_gradient and not a.is_hessian) and b.role == 'test' and (not b.is_gradient and not b.is_hessian) ):
                     body_lines.append(f"# Mass: dot(Trial, Test)")
@@ -1811,23 +1837,32 @@ class NumbaCodeGen:
                     )
                     # collapsing all
                     field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
+                    test_cols = _basis_col_dim(b.shape)
+                    trial_cols = _basis_col_dim(a.shape)
                     stack.append(StackItem(var_name=res_var, 
                                             role='value', 
-                                            shape=(b.shape[1],a.shape[1]), 
+                                            shape=(test_cols, trial_cols), 
                                             is_vector=False, field_names=field_names, 
                                             parent_name=parent_name, side=side, field_sides=field_sides))
-                elif (a.role == 'test' and (not a.is_gradient and not a.is_hessian) and b.role == 'trial' and (not b.is_gradient and not b.is_hessian) ):
+                # ---------------------------------------------------------------------
+                # dot( u_test ,  u_trial )      ← mass-matrix block
+                # ---------------------------------------------------------------------
+                elif (a.role == 'test' and (not a.is_gradient and not a.is_hessian) 
+                      and b.role == 'trial' and (not b.is_gradient and not b.is_hessian) ):
                     body_lines.append(f"# Mass: dot(Test, Trial)")
                     body_lines.append(
                         f"{res_var} = dot_mass_test_trial({a.var_name}, {b.var_name}, {self.dtype})"
                     )
                     # Collapsing all
                     field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
+                    test_cols = _basis_col_dim(a.shape)
+                    trial_cols = _basis_col_dim(b.shape)
                     stack.append(StackItem(var_name=res_var, 
                                             role='value', 
-                                            shape=(a.shape[1],b.shape[1]), 
+                                            shape=(test_cols, trial_cols), 
                                             is_vector=False, field_names=field_names, 
                                             parent_name=parent_name, side=side, field_sides=field_sides))
+                
 
                 # ---------------------------------------------------------------------
                 # dot( grad(u_test) ,  const_vec )  ← symmetric term -> Test vec
@@ -1941,20 +1976,7 @@ class NumbaCodeGen:
                                         parent_name=b.parent_name, side=b.side,
                                         field_sides=b.field_sides or []))
 
-                # ---------------------------------------------------------------------
-                # dot( u_test ,  u_trial )      ← mass-matrix block
-                # ---------------------------------------------------------------------
-                elif a.role == 'test' and a.is_vector and b.role == 'trial' and b.is_vector:
-                    body_lines.append("# Mass: dot(Test, Trial)")
-                    body_lines.append(
-                        f"{res_var} = dot_mass_test_trial({a.var_name}, {b.var_name}, {self.dtype})"
-                    )
-                    # collapsing all
-                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
-                    stack.append(StackItem(var_name=res_var, role='value',
-                                        shape=(a.shape[1],b.shape[1]), is_vector=False,
-                                        field_names=field_names, parent_name=parent_name, side=side,
-                                        field_sides=field_sides or []))
+                
 
                 # ---------------------new block--------------------------------
                 # ---------------------------------------------------------------------
@@ -2127,7 +2149,7 @@ class NumbaCodeGen:
                     body_lines.append(
                         f"{res_var} = const_vector_dot_basis_1d({a.var_name}, {b.var_name}, {self.dtype})"
                     )
-                    stack.append(StackItem(var_name=res_var, role='value',
+                    stack.append(StackItem(var_name=res_var, role=b.role,
                                         shape=(b.shape[1],), is_vector=False,
                                         is_gradient=False, field_names=b.field_names,
                                         parent_name=b.parent_name,
@@ -2215,7 +2237,7 @@ class NumbaCodeGen:
                             f"{res_var} = dot_mass_trial_test({a.var_name}, {b.var_name}, {self.dtype})"
                         )
                         shape = (b.shape[1],)
-                        role = 'value'
+                        role = 'test'
                     stack.append(StackItem(var_name=res_var, role=role,
                                         shape=shape, is_vector=False,is_gradient=False,
                                         field_names=b.field_names, parent_name=b.parent_name,
@@ -2238,7 +2260,7 @@ class NumbaCodeGen:
                             f"{res_var} = dot_mass_trial_test({b.var_name}, {a.var_name}, {self.dtype})"
                         )
                         shape = (a.shape[1],)
-                        role = 'value'
+                        role = 'test'
                     stack.append(StackItem(var_name=res_var, role=role,
                                         shape=shape, is_vector=False,is_gradient=False,
                                         field_names=a.field_names, parent_name=a.parent_name,
@@ -2264,7 +2286,7 @@ class NumbaCodeGen:
                             f"{res_var} = dot_mass_trial_test({a.var_name}, {b.var_name}, {self.dtype})"
                         )
                         shape = (a.shape[1],)
-                        role = 'value'
+                        role = 'test'
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=shape, is_vector=False,is_gradient=False,
                                             field_names=a.field_names, parent_name=a.parent_name,

@@ -815,8 +815,7 @@ class NewtonSolver:
         if best_alpha > 0.0:
             print(f"        Armijo failed, using best-effort α = {best_alpha:.2e}.")
             return best_alpha * S_red
-        print("        Line search failed – no descent.")
-        raise RuntimeError("Line search in reduced space failed to find a descent step.")
+        print("        Line search failed – no descent; taking zero step.")
         return np.zeros_like(S_red)
 
     # ------------------------------------------------------------------

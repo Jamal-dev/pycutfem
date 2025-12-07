@@ -356,26 +356,17 @@ def _ensure_matrix(array_like, dtype):
     Convert scalar/vector/array-like input to contiguous 2D array of dtype.
     """
     # if DEBUG: print("_ensure_matrix")
-    arr = np.ascontiguousarray(array_like)
-    target = np.dtype(dtype)
-    arr = arr.astype(target)
+    arr = np.asarray(array_like, dtype=dtype)
     if arr.ndim == 0:
-        res = np.zeros((1, 1), dtype=target)
+        res = np.zeros((1, 1), dtype=dtype)
         res[0, 0] = arr.item()
-        return res
-    if arr.ndim == 1:
-        return arr.reshape(arr.shape[0], 1)
-    if arr.ndim == 2:
-        return arr
-    # For higher-dimensional inputs, flatten trailing axes
-    rows = arr.shape[0]
-    cols = arr.size // rows
-    reshaped = arr.reshape(rows, cols)
-    res = np.zeros((rows, cols), dtype=target)
-    for i in range(rows):
-        for j in range(cols):
-            res[i, j] = reshaped[i, j]
-    return res
+    elif arr.ndim == 1:
+        res = arr.reshape(arr.shape[0], 1)
+    else:
+        rows = arr.shape[0]
+        cols = arr.size // rows
+        res = arr.reshape(rows, cols)
+    return np.ascontiguousarray(res)
 
 
 @numba.njit(cache=True)
@@ -697,16 +688,46 @@ def pushforward_d4(
 def dot_mass_test_trial(test_vec, trial_vec, dtype):
     """
     Compute Test.T @ Trial for mass matrices.
+    Accepts inputs shaped (n_q, n) or flattened (n,), (1, n); always returns (n, n).
     """
     if DEBUG: print("dot_mass_test_trial")
-    return test_vec.T.copy() @ trial_vec
+    # Normalize to 2-D with quadrature points along axis 0 and basis along axis 1.
+    if test_vec.ndim == 1:
+        test_arr = test_vec.reshape(1, test_vec.shape[0])
+    elif test_vec.ndim == 2:
+        test_arr = test_vec
+    else:
+        raise ValueError(f"dot_mass_test_trial: unsupported test_vec ndim={test_vec.ndim}")
+
+    if trial_vec.ndim == 1:
+        trial_arr = trial_vec.reshape(1, trial_vec.shape[0])
+    elif trial_vec.ndim == 2:
+        trial_arr = trial_vec
+    else:
+        raise ValueError(f"dot_mass_test_trial: unsupported trial_vec ndim={trial_vec.ndim}")
+
+    return test_arr.T.copy() @ trial_arr
 @numba.njit(cache=True)
 def dot_mass_trial_test(trial_vec, test_vec, dtype):
     """
     Compute Trial.T @ Test for mass matrices.
     """
     if DEBUG: print("dot_mass_trial_test")
-    return trial_vec.T.copy() @ test_vec
+    if trial_vec.ndim == 1:
+        trial_arr = trial_vec.reshape(1, trial_vec.shape[0])
+    elif trial_vec.ndim == 2:
+        trial_arr = trial_vec
+    else:
+        raise ValueError(f"dot_mass_trial_test: unsupported trial_vec ndim={trial_vec.ndim}")
+
+    if test_vec.ndim == 1:
+        test_arr = test_vec.reshape(1, test_vec.shape[0])
+    elif test_vec.ndim == 2:
+        test_arr = test_vec
+    else:
+        raise ValueError(f"dot_mass_trial_test: unsupported test_vec ndim={test_vec.ndim}")
+
+    return trial_arr.T.copy() @ test_arr
 
 @numba.njit(cache=True)
 def inner_grad_function_grad_test(function_grad, test_grad, dtype):
@@ -897,12 +918,30 @@ def identity_times_trace_matrix(identity, trace_matrix, dtype):
 @numba.njit(cache=True)
 def columnwise_dot(a_mat, b_mat, dtype):
     """
-    Column-wise dot products between two (k,n) arrays -> (1,n).
-    Vectorized sum over axis=0.
+    Column-wise dot products between two basis/value arrays -> (1,n).
+    Accepts inputs shaped (k,n), (k,), or (k,1). If one operand has a single
+    column, it is broadcast to the other's column count.
     """
     if DEBUG: print("columnwise_dot")
-    res = np.empty((1, a_mat.shape[1]), dtype=dtype)
-    res[0] = np.sum(np.ascontiguousarray(a_mat) * np.ascontiguousarray(b_mat), axis=0)
+    A = _ensure_matrix(a_mat, dtype)
+    B = _ensure_matrix(b_mat, dtype)
+    if A.shape[0] != B.shape[0]:
+        raise ValueError("columnwise_dot: incompatible row counts")
+    n_cols = A.shape[1] if A.shape[1] > B.shape[1] else B.shape[1]
+    if A.shape[1] == 1 and n_cols > 1:
+        A_b = np.empty((A.shape[0], n_cols), dtype=dtype)
+        for j in range(n_cols):
+            for i in range(A.shape[0]):
+                A_b[i, j] = A[i, 0]
+        A = A_b
+    if B.shape[1] == 1 and n_cols > 1:
+        B_b = np.empty((B.shape[0], n_cols), dtype=dtype)
+        for j in range(n_cols):
+            for i in range(B.shape[0]):
+                B_b[i, j] = B[i, 0]
+        B = B_b
+    res = np.empty((1, n_cols), dtype=dtype)
+    res[0] = np.sum(np.ascontiguousarray(A) * np.ascontiguousarray(B), axis=0)
     return res
 
 

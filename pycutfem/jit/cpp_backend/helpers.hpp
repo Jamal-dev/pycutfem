@@ -9,7 +9,7 @@
 #include <Eigen/Dense>
 #include <unsupported/Eigen/CXX11/Tensor>
 #include <iostream>
-bool is_debug = false;
+bool is_debug = true;
 namespace py = pybind11;
 namespace pycutfem::cpp_backend {
 
@@ -395,42 +395,6 @@ inline py::array_t<double> pushforward_grad_to_union(const py::array_t<double>& 
 // Tensor Algebra (Dot Products / Contractions)
 // ---------------------------------------------------------------------------
 
-// Mirrors contract_last_first
-// Generic contraction: A[..., i] * B[i, ...]
-// inline py::array_t<double> contract_last_first(const py::array_t<double>& A,
-//                                                const py::array_t<double>& B) {
-    
-//     std::cout << "C++ backend: contract_last_first called" << std::endl;
-//     auto A_req = A.request();
-//     auto B_req = B.request();
-//     1
-//     ssize_t K = A_req.shape[A_req.ndim - 1]; // Contraction dim
-//     if (B_req.shape[0] != K) throw std::runtime_error("Dimension mismatch in contract_last_first");
-
-//     // Flatten A to (Rows, K) and B to (K, Cols)
-//     ssize_t rows = A_req.size / K;
-//     ssize_t cols = B_req.size / K;
-
-//     Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> 
-//         MatA((double*)A_req.ptr, rows, K);
-//     Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> 
-//         MatB((double*)B_req.ptr, K, cols);
-
-//     Eigen::MatrixXd Res = MatA * MatB; // (Rows, Cols)
-
-//     // Reshape output to A.shape[:-1] + B.shape[1:]
-//     std::vector<ssize_t> out_shape;
-//     for(int i=0; i<A_req.ndim-1; ++i) out_shape.push_back(A_req.shape[i]);
-//     for(int i=1; i<B_req.ndim; ++i)   out_shape.push_back(B_req.shape[i]);
-
-//     // If B was 1D (vector), the trailing dimension is gone (numpy dot behavior)
-//     if (B_req.ndim == 1 && out_shape.empty()) {
-//         // Scalar result
-//         return py::cast(Res(0,0));
-//     }
-    
-//     return py::array_t<double>(out_shape, Res.data());
-// }
 inline std::vector<Eigen::MatrixXd> contract_last_first(
     const std::vector<Eigen::MatrixXd>& A, 
     const Eigen::MatrixXd& B) 
@@ -1300,7 +1264,7 @@ inline Eigen::VectorXd const_vector_dot_basis_1d(const Eigen::VectorXd& const_ve
 inline Eigen::MatrixXd const_vector_dot_basis_1d(const Eigen::MatrixXd& const_mat,
                                                  const Eigen::MatrixXd& basis) {
 
-    // Constant matrix  (k,k) dotted with basis (k,n) -> (n,).
+    // Constant matrix  (k,k) dotted with basis (k,n) -> (k,n).
     
     if (is_debug) {std::cout<< "-----------------const_vector_dot_basis_1d---------------------"<<std::endl;}
     if (basis.rows() != const_mat.rows()) {

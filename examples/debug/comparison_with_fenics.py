@@ -486,6 +486,7 @@ def setup_problems():
     W = dolfinx.fem.functionspace(mesh_fx, W_el)
     fenicsx = {
         'W': W,
+        'mesh': mesh_fx,
         'rho': dolfinx.fem.Constant(mesh_fx, 1.0),
         'dt': dolfinx.fem.Constant(mesh_fx, 0.1),
         'theta': dolfinx.fem.Constant(mesh_fx, 0.5),
@@ -564,7 +565,7 @@ def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
     np.testing.assert_allclose(np.sort(pycutfem_uk_values), np.sort(u_k_values), rtol=1e-8, atol=1e-15)
     print("\n✅ ASSERTION PASSED: pycutfem and FEniCSx calculated the same set of nodal values for u_k.")
 
-def compare_term(term_name, J_pc, R_pc, J_fx, R_fx, P_map, dof_handler_pc, W_fenicsx):
+def compare_term(term_name, J_pc, R_pc, J_fx, R_fx, P_map, dof_handler_pc, W_fenicsx, rtol=1e-8, atol=1e-8):
     print("\n" + f"--- Comparing Term: {term_name} ---")
 
     output_dir = "garbage"
@@ -593,7 +594,7 @@ def compare_term(term_name, J_pc, R_pc, J_fx, R_fx, P_map, dof_handler_pc, W_fen
         print(f"✅ Residual comparison data saved to '{filename}'")
 
         try:
-            np.testing.assert_allclose(R_pc_flat, R_fx_reordered_flat, rtol=1e-8, atol=1e-8)
+            np.testing.assert_allclose(R_pc_flat, R_fx_reordered_flat, rtol=rtol, atol=atol)
             print(f"✅ Residual vector for '{term_name}' is numerically equivalent.")
         except AssertionError as e:
             print(f"❌ Residual vector for '{term_name}' is NOT equivalent!")
@@ -610,7 +611,7 @@ def compare_term(term_name, J_pc, R_pc, J_fx, R_fx, P_map, dof_handler_pc, W_fen
             pd.DataFrame(np.abs(J_pc_dense - J_fx_reordered)<1e-12).to_excel(writer, sheet_name='difference', index=False, header=False)
         print(f"✅ Jacobian matrices saved to '{filename}'")
         try:
-            np.testing.assert_allclose(J_pc_dense, J_fx_reordered, rtol=1e-8, atol=1e-8)
+            np.testing.assert_allclose(J_pc_dense, J_fx_reordered, rtol=rtol, atol=atol)
             print(f"✅ Jacobian matrix for '{term_name}' is numerically equivalent.")
         except AssertionError as e:
             print(f"❌ Jacobian matrix for '{term_name}' is NOT equivalent!")
@@ -650,8 +651,12 @@ if __name__ == '__main__':
     
     V_subspace = W_fx.sub(0)
     Q_subspace = W_fx.sub(1)
-    du, v = ufl.TrialFunction(V_subspace), ufl.TestFunction(V_subspace)
-    dp, q = ufl.TrialFunction(Q_subspace), ufl.TestFunction(Q_subspace)
+    w_trial = ufl.TrialFunction(W_fx)
+    w_test = ufl.TestFunction(W_fx)
+    du, dp = ufl.split(w_trial)
+    v_fx, q_fx = ufl.split(w_test)
+    v = v_fx
+    q = q_fx
 
     advection_1_pc = ( dot(dot(grad(pc['du']), pc['u_k']), pc['v'])) * dx()
     c_pc = pc['c']
@@ -907,6 +912,55 @@ if __name__ == '__main__':
     ddEw_mixed_fx =  (ufl.dot(F_test_fx.T, F_trial_fx) + ufl.dot(F_trial_fx.T, F_test_fx))
     ddSw_mixed_fx =  ufl.tr(ddEw_mixed_fx) * I2_fx +  ddEw_mixed_fx
 
+    # --- Basic ALE geometry for fluid forms (mirrors build_forms) ---
+    Finv_pc = inv(Fk_pc)
+    Finv_fx = ufl.inv(Fk_fx)
+    J_geo_pc = det(Fk_pc)
+    J_geo_fx = ufl.det(Fk_fx)
+    grad_uk_phys_pc = dot(grad(pc['u_k']), Finv_pc)
+    grad_v_phys_pc = dot(grad(pc['v']), Finv_pc)
+    grad_uk_phys_fx = ufl.dot(ufl.grad(u_k_fx), Finv_fx)
+    grad_v_phys_fx = ufl.dot(ufl.grad(v_fx), Finv_fx)
+    grad_v_phys_vel = ufl.dot(ufl.grad(v), Finv_fx)
+    eps_uk_pc = 0.5 * (grad_uk_phys_pc + grad_uk_phys_pc.T)
+    eps_v_pc = 0.5 * (grad_v_phys_pc + grad_v_phys_pc.T)
+    eps_uk_fx = 0.5 * (grad_uk_phys_fx + grad_uk_phys_fx.T)
+    eps_v_fx = 0.5 * (grad_v_phys_fx + grad_v_phys_fx.T)
+    eps_v_vel = 0.5 * (grad_v_phys_vel + grad_v_phys_vel.T)
+    div_uk_pc = trace(grad_uk_phys_pc)
+    div_v_pc = trace(grad_v_phys_pc)
+    div_uk_fx = ufl.tr(grad_uk_phys_fx)
+    div_v_fx = ufl.tr(grad_v_phys_fx)
+    div_v_vel = ufl.tr(grad_v_phys_vel)
+    dF_pc = grad(pc['du'])
+    dF_fx = ufl.grad(du)
+    dFinv_pc = -dot(Finv_pc, dot(dF_pc, Finv_pc))
+    dFinv_fx = -ufl.dot(Finv_fx, ufl.dot(dF_fx, Finv_fx))
+    dJ_pc = J_geo_pc * trace(dot(Finv_pc, dF_pc))
+    dJ_fx = J_geo_fx * ufl.tr(ufl.dot(Finv_fx, dF_fx))
+    grad_uk_shape_pc = dot(grad(pc['u_k']), dFinv_pc)
+    grad_v_shape_pc = dot(grad(pc['v']), dFinv_pc)
+    grad_uk_shape_fx = ufl.dot(ufl.grad(u_k_fx), dFinv_fx)
+    grad_v_shape_fx = ufl.dot(ufl.grad(v_fx), dFinv_fx)
+    eps_uk_shape_pc = 0.5 * (grad_uk_shape_pc + grad_uk_shape_pc.T)
+    eps_v_shape_pc = 0.5 * (grad_v_shape_pc + grad_v_shape_pc.T)
+    eps_uk_shape_fx = 0.5 * (grad_uk_shape_fx + grad_uk_shape_fx.T)
+    eps_v_shape_fx = 0.5 * (grad_v_shape_fx + grad_v_shape_fx.T)
+    two_mu_f_pc = Constant(2.0, dim=0) * pc['mu']
+    two_mu_f_fx = dolfinx.fem.Constant(fenicsx['mesh'], 2.0) * fenicsx['mu']
+    sigma_uk_pc = two_mu_f_pc * eps_uk_pc
+    sigma_uk_fx = two_mu_f_fx * eps_uk_fx
+    term_b_dJ_pc = trace(dot(sigma_uk_pc, eps_v_pc))
+    term_b_dJ_fx = ufl.tr(ufl.dot(sigma_uk_fx, eps_v_fx))
+    grad_du_phys_pc = dot(grad(pc['du']), Finv_pc)
+    grad_du_phys_fx = ufl.dot(ufl.grad(du), Finv_fx)
+    eps_du_pc = 0.5 * (grad_du_phys_pc + grad_du_phys_pc.T)
+    eps_du_fx = 0.5 * (grad_du_phys_fx + grad_du_phys_fx.T)
+    div_du_pc = trace(grad_du_phys_pc)
+    div_du_fx = ufl.tr(grad_du_phys_fx)
+    stab_eps_pc = Constant(1e-8, dim=0)
+    stab_eps_fx = dolfinx.fem.Constant(fenicsx['mesh'], 1e-8)
+
     def _solid_cross_component_entry(label: str,deg_fe:int = 6, deg_pc:int = 6):
         pc_expr = d2sigma_pc_terms[label]
         fx_expr = d2sigma_fx_terms[label]
@@ -926,6 +980,114 @@ if __name__ == '__main__':
                                     * ufl.dx(metadata={'quadrature_degree': deg}),
             'mat': False,
             'deg': 6,
+        },
+        # ALE fluid shape terms (from build_forms)
+        "Fluid mass_jac_d": {
+            'pc': (pc['rho'] / pc['dt']) * pc['theta'] * dJ_pc * dot(pc['u_k'] - pc['u_n'], pc['v']) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: (fenicsx['rho'] / fenicsx['dt']) * fenicsx['theta'] * dJ_fx
+                                    * ufl.dot(u_k_fx - u_n_fx, v_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "Fluid mass_res": {
+            'pc': (pc['rho'] / pc['dt']) * (pc['theta'] * J_geo_pc + (Constant(1.0, dim=0) - pc['theta']) * J_geo_pc)
+                   * inner(pc['u_k'] - pc['u_n'], pc['v']) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: (fenicsx['rho'] / fenicsx['dt']) * (fenicsx['theta'] * J_geo_fx + (dolfinx.fem.Constant(fenicsx['mesh'], 1.0) - fenicsx['theta']) * J_geo_fx)
+                   * ufl.inner(u_k_fx - u_n_fx, v) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+            # 'rtol': 1e-6,
+            # 'atol': 1e-6,
+        },
+        "Fluid visc_res": {
+            'pc': (pc['theta'] * J_geo_pc * inner(sigma_uk_pc, eps_v_pc) + (Constant(1.0, dim=0) - pc['theta']) * J_geo_pc * inner(two_mu_f_pc * eps_uk_pc, eps_v_pc)) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: (fenicsx['theta'] * J_geo_fx * ufl.inner(sigma_uk_fx, eps_v_vel) + (dolfinx.fem.Constant(fenicsx['mesh'], 1.0) - fenicsx['theta']) * J_geo_fx * ufl.inner(two_mu_f_fx * eps_uk_fx, eps_v_vel)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 8,
+            # 'rtol': 1e-6,
+            # 'atol': 1e-6,
+        },
+        "Fluid adv_res": {
+            'pc': pc['rho'] * ( pc['theta'] * J_geo_pc * dot(dot(grad_uk_phys_pc, pc['u_k']), pc['v'])
+                               + (Constant(1.0, dim=0) - pc['theta']) * J_geo_pc * dot(dot(grad_uk_phys_pc, pc['u_k']), pc['v']) ) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: fenicsx['rho'] * ( fenicsx['theta'] * J_geo_fx * ufl.dot(ufl.dot(grad_uk_phys_fx, u_k_fx), v)
+                               + (dolfinx.fem.Constant(fenicsx['mesh'], 1.0) - fenicsx['theta']) * J_geo_fx * ufl.dot(ufl.dot(grad_uk_phys_fx, u_k_fx), v) ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+            # 'rtol': 1e-6,
+            # 'atol': 1e-6,
+        },
+        "Fluid pres_res": {
+            'pc': (-J_geo_pc * (pc['p_k'] * div_v_pc + pc['q'] * div_uk_pc) + stab_eps_pc * pc['p_k'] * pc['q']) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: (-J_geo_fx * (p_k_fx * div_v_fx + q * div_uk_fx) + stab_eps_fx * p_k_fx * q) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+            # 'rtol': 1e-6,
+            # 'atol': 1e-6,
+        },
+        "Fluid visc_jac_d": {
+            'pc': pc['theta'] * (
+                dJ_pc * term_b_dJ_pc
+                + J_geo_pc * two_mu_f_pc * inner(eps_uk_shape_pc, eps_v_pc)
+                + J_geo_pc * inner(sigma_uk_pc, eps_v_shape_pc)
+            ) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: fenicsx['theta'] * (
+                dJ_fx * term_b_dJ_fx
+                + J_geo_fx * two_mu_f_fx * ufl.inner(eps_uk_shape_fx, eps_v_fx)
+                + J_geo_fx * ufl.inner(sigma_uk_fx, eps_v_shape_fx)
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 10,
+            # 'rtol': 1e-6,
+            # 'atol': 2e-5,
+        },
+        "Fluid mass_jac_u": {
+            'pc': (pc['rho'] / pc['dt']) * (pc['theta'] * J_geo_pc + (Constant(1.0, dim=0) - pc['theta']) * J_geo_pc) * inner(pc['du'], pc['v']) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: (fenicsx['rho'] / fenicsx['dt']) * (fenicsx['theta'] * J_geo_fx + (dolfinx.fem.Constant(fenicsx['mesh'], 1.0) - fenicsx['theta']) * J_geo_fx) * ufl.inner(du, v_fx) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+            # 'rtol': 1e-6,
+            # 'atol': 1e-6,
+        },
+        "Fluid visc_jac_u": {
+            'pc': pc['theta'] * J_geo_pc * inner(two_mu_f_pc * eps_du_pc, eps_v_pc) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: fenicsx['theta'] * J_geo_fx * ufl.inner(two_mu_f_fx * eps_du_fx, eps_v_vel) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 10,
+            # 'rtol': 1e-5,
+            # 'atol': 1e-5,
+        },
+        "Fluid conv_jac_u 1": {
+            'pc': pc['rho'] * pc['theta'] * J_geo_pc * ( dot(dot(grad_du_phys_pc, pc['u_k']), pc['v'])  ) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: fenicsx['rho'] * fenicsx['theta'] * J_geo_fx * ( ufl.dot(ufl.dot(grad_du_phys_fx, u_k_fx), v)  ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+            # 'rtol': 1e-6,
+            # 'atol': 1e-6,
+        },
+        "Fluid conv_jac_u 2": {
+            'pc': pc['rho'] * pc['theta'] * J_geo_pc * (  dot(dot(grad_uk_phys_pc, pc['du']), pc['v']) ) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: fenicsx['rho'] * fenicsx['theta'] * J_geo_fx * (  ufl.dot(ufl.dot(grad_uk_phys_fx, du), v) ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+            # 'rtol': 1e-6,
+            # 'atol': 1e-6,
+        },
+        "Fluid conv_jac_u": {
+            'pc': pc['rho'] * pc['theta'] * J_geo_pc * ( dot(dot(grad_du_phys_pc, pc['u_k']), pc['v']) + dot(dot(grad_uk_phys_pc, pc['du']), pc['v']) ) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: fenicsx['rho'] * fenicsx['theta'] * J_geo_fx * ( ufl.dot(ufl.dot(grad_du_phys_fx, u_k_fx), v) + ufl.dot(ufl.dot(grad_uk_phys_fx, du), v) ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+            # 'rtol': 1e-6,
+            # 'atol': 1e-6,
+        },
+        "Fluid pres_jac": {
+            'pc': (-J_geo_pc * pc['q'] * div_du_pc - J_geo_pc * pc['dp'] * div_v_pc + stab_eps_pc * pc['dp'] * pc['q']) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: (-J_geo_fx * q * div_du_fx - J_geo_fx * dp * div_v_vel + stab_eps_fx * dp * q) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+            # 'rtol': 1e-6,
+            # 'atol': 1e-6,
         },
 
         "Mixed Basic [Fk@Finv]": {
@@ -1188,6 +1350,7 @@ if __name__ == '__main__':
             'deg': 6,
         },
         "LHS Mass":          {'pc': pc['rho'] * dot(pc['du'], pc['v']) / pc['dt'] * dx(),                                    'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(du, v) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
+        "LHS Mass 2":          {'pc': pc['rho'] * dot(pc['v'], pc['du']) / pc['dt'] * dx(),                                    'f_lambda': lambda deg: fenicsx['rho'] * ufl.dot(v, du) / fenicsx['dt'] * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
         "LHS Diffusion":     {'pc': pc['theta'] * pc['mu'] * inner(grad(pc['du']), grad(pc['v'])) * dx(metadata={"q":4}),                     'f_lambda': lambda deg: fenicsx['theta'] * fenicsx['mu'] * ufl.inner(ufl.grad(du), ufl.grad(v)) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 4},
         "LHS Advection 1":   {'pc':  ( dot(dot(grad(pc['du']), pc['u_k']), pc['v'])) * dx(metadata={"q":6}),           'f_lambda': lambda deg:  ufl.dot(ufl.dot(ufl.grad(du),u_k_fx), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
         "LHS Advection 2":   {'pc':  dot(dot(grad(pc['u_k']), pc['du']), pc['v']) * dx(metadata={"q":5}),            'f_lambda': lambda deg: ufl.dot( ufl.dot(ufl.grad(u_k_fx),du), v) * ufl.dx(metadata={'quadrature_degree': deg}), 'mat': True, 'deg': 5},
@@ -1447,7 +1610,9 @@ if __name__ == '__main__':
             # CORRECTED: ghostUpdate is not needed for serial runs.
             R_fx = vec.array
 
-        is_success = compare_term(name, J_pc, R_pc, J_fx, R_fx, P_map, dof_handler_pc, W_fx)
+        rtol = forms.get('rtol', 1e-8)
+        atol = forms.get('atol', 1e-8)
+        is_success = compare_term(name, J_pc, R_pc, J_fx, R_fx, P_map, dof_handler_pc, W_fx, rtol=rtol, atol=atol)
         if is_success:
             success_count += 1
         else:

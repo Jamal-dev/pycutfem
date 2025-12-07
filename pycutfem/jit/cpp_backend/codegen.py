@@ -1321,7 +1321,8 @@ class CppCodeGen:
                 is_b_1d = b.kind == "vec" and b.shape[0] > 1
                 print(f"[dot] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
                       f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})"
-                      f", union ({a_union_mat}, {b_union_mat})")
+                      f", union ({a_union_mat}, {b_union_mat})"
+                      f", is_2x2 ({is_a_2x2}, {is_b_2x2}), is_1d ({is_a_1d}, {is_b_1d})")
                 # trial/test mass
                 # Gradient advection combinations: grad(Function) · Trial  or Trial · grad(Function)
                 if a.kind == "grad" and b.kind == "grad" and a.role in {"test", "trial"} and b.role in {"test", "trial"}:
@@ -1351,23 +1352,32 @@ class CppCodeGen:
                 elif a.kind == "mat" and b.kind == "mat" and (a_union_mat or b_union_mat):
                     # Preserve Test/Trial orientation (test^T @ trial)
                     role = "value"
-                    if b.role == "test" and b_union_mat:
+                    shape = (-1, -1)
+                    if is_a_1d and b.role in {"test", "trial"} and b_union_mat:
                         # If component counts match, use the streamlined contraction; otherwise fall back to mass dot
                         if (a.shape[0] not in (-1, 0) and b.shape[0] not in (-1, 0) ):
+                            role = b.role
                             emit_line(f"auto {nm} = const_vector_dot_basis_1d({a.name}, {b.name});")
+                            shape = (1, b.shape[1])
                         # else:
                             # emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({b.name}, {a.name});")
-                    elif b.role == "test":
-                        emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({b.name}, {a.name});")
-                    elif a.role == "test":
+                    
+                    elif is_a_2x2 and b.role in {"test", "trial"} and b_union_mat and a.shape[1] == b.shape[0]:
+                        role = b.role
+                        shape = (a.shape[0], b.shape[1])
+                        emit_line(f"auto {nm} = {a.name} * {b.name};")
+                    elif a.role == "trial" and b.role == "test":
+                        emit_line(f"Eigen::MatrixXd {nm} = dot_mass_trial_test({a.name}, {b.name});")
+                    elif a.role == "test" and b.role == "trial":
                         emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({a.name}, {b.name});")
-                    elif a.role == "trial" and b.role == "trial":
-                        emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({a.name}, {b.name});")
+                    # elif a.role == "test":
+                    #     emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({a.name}, {b.name});")
                     else:
                         raise NotImplementedError(f"dot(mat, mat) with union shapes supports only test/trial/value roles"
                                                   f" (got roles {a.role}, {b.role})"
-                                                  f" (shapes {a.shape}, {b.shape})")
-                    push("mat", role, (-1, -1))
+                                                  f" (shapes {a.shape}, {b.shape})"
+                                                  f", union ({a_union_mat}, {b_union_mat})")
+                    push("mat", role, shape)
                 elif a.kind == "mat" and b.kind == "grad" :
                     if a.role in {"const", "value"} and b.role in {"test", "trial"}:
                         emit_line(f"auto {nm} = dot_grad_value_with_grad_basis({a.name}, {b.name});")
