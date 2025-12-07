@@ -67,7 +67,8 @@ BEAM_CENTER = (CENTER[0] + RADIUS + 0.5 * BEAM_LENGTH, CENTER[1])
 # Material parameters (from examples/debug/fsi_TaylorHood_xfem.py)
 RHO_F = 1.0e3
 NU_F = 1.0e-3  # kinematic viscosity
-MU_F = NU_F    # dynamic viscosity (rho=1 reference)
+# Dynamic viscosity = rho * nu
+MU_F = RHO_F * NU_F
 RHO_S = 1.0e4
 NU_S = 0.4
 MU_S = 0.5e6
@@ -1217,6 +1218,82 @@ def solve_initial_stokes(dh, vel_space, disp_space, p_space, vel_bcs, disp_bcs, 
     return sol
 
 
+def warm_start_displacement_from_velocity(
+    *,
+    dh: DofHandler,
+    disp_space: FunctionSpace,
+    solid_bs,
+    uk: VectorFunction,
+    dk: VectorFunction,
+    d_prev: VectorFunction,
+    dt_const: Constant,
+    backend: str,
+    beam_outer_tag: str = "beam_outer",
+    beam_root_tag: str = "beam_root",
+):
+    """
+    Build an initial displacement by solving a Laplace problem on the beam/solid
+    with Dirichlet data taken from the velocity field (dt * u) on the outer beam
+    boundary and zero on the beam root.
+    """
+    dt_val = float(dt_const.value)
+
+    def _make_bc_func(field_name: str):
+        coords = dh.get_dof_coords(field_name)
+        gslice = np.array(dh.get_field_slice(field_name), dtype=int)
+        vals = uk.get_nodal_values(gslice)
+        cache = {(round(float(x), 12), round(float(y), 12)): float(v) for (x, y), v in zip(coords, vals)}
+
+        def _bc(x, y, t=0.0):
+            return dt_val * cache.get((round(float(x), 12), round(float(y), 12)), 0.0)
+
+        return _bc
+
+    bc_dx = _make_bc_func("ux")
+    bc_dy = _make_bc_func("uy")
+
+    dd_po = VectorTrialFunction(space=disp_space, dof_handler=dh)
+    w_po = VectorTestFunction(space=disp_space, dof_handler=dh)
+    kill = Constant(1e-6)
+    dx_s = dx(defined_on=solid_bs)
+    # Pure Laplace plus small mass term; RHS is identically zero
+    a_po = (inner(grad(dd_po), grad(w_po)) + kill * inner(dd_po, w_po)) * dx_s
+    r_po = None
+    eq_po = Equation(a_po, r_po)
+    from pycutfem.ufl.forms import BoundaryCondition
+
+    po_bcs = [
+        BoundaryCondition("dx", "dirichlet", beam_root_tag, lambda x, y, t=0.0: 0.0),
+        BoundaryCondition("dy", "dirichlet", beam_root_tag, lambda x, y, t=0.0: 0.0),
+        BoundaryCondition("dx", "dirichlet", beam_outer_tag, bc_dx),
+        BoundaryCondition("dy", "dirichlet", beam_outer_tag, bc_dy),
+    ]
+    K_po, F_po = assemble_form(eq_po, dof_handler=dh, bcs=po_bcs, backend=backend)
+    # Restrict to displacement DOFs that live in the solid region only
+    solid_eids = solid_bs.to_indices()
+    disp_ids: set[int] = set()
+    for eid in solid_eids:
+        gdofs = dh.get_elemental_dofs(int(eid))
+        for gd in gdofs:
+            fld, _ = dh._dof_to_node_map[int(gd)]
+            if fld in ("dx", "dy"):
+                disp_ids.add(int(gd))
+    disp_slice = np.array(sorted(disp_ids), dtype=int)
+    from scipy.sparse.linalg import spsolve
+
+    K_block = K_po.tocsr()[np.ix_(disp_slice, disp_slice)]
+    F_block = F_po[disp_slice]
+    sol_block = spsolve(K_block, F_block)
+
+    # Write into displacement fields (use per-field slices)
+    idx_map = {gd: i for i, gd in enumerate(disp_slice)}
+    dx_slice = np.array(dh.get_field_slice("dx"), dtype=int)
+    dy_slice = np.array(dh.get_field_slice("dy"), dtype=int)
+    dk.set_nodal_values(dx_slice, np.array([sol_block[idx_map.get(int(gd), 0)] for gd in dx_slice]))
+    dk.set_nodal_values(dy_slice, np.array([sol_block[idx_map.get(int(gd), 0)] for gd in dy_slice]))
+    d_prev.nodal_values[:] = dk.nodal_values[:]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Conforming ALE FSI (Neo-Hookean solid, ALE fluid).")
     ap.add_argument("--dt", type=float, default=0.004)
@@ -1230,6 +1307,7 @@ def main():
     ap.add_argument("--run-fd", action="store_true", help="Run finite-difference Jacobian check.", default=True)
     ap.add_argument("--no-fd", dest="run_fd", action="store_false", help="Skip FD Jacobian check.")
     ap.add_argument("--no-line-search", dest="line_search", action="store_false", help="Disable Newton line search.")
+    ap.add_argument("--no-stokes-start", action="store_true", help="Skip Stokes warm start; keep initial fields at BCs only.")
     ap.set_defaults(line_search=True)
     args = ap.parse_args()
 
@@ -1267,8 +1345,13 @@ def main():
     beam_ls = BeamCircularRootLevelSet(center=BEAM_CENTER, Lb=BEAM_LENGTH, Hb=BEAM_HEIGHT, circle_center=CENTER, radius=RADIUS, offset=1e-6)
 
     classify_conforming(mesh)
-    fluid_bs = mesh.element_bitset("outside")
-    solid_bs = mesh.element_bitset("inside")
+    tags = getattr(mesh, "_elem_bitsets", {})
+    if "fluid" in tags and "solid" in tags:
+        fluid_bs = mesh.element_bitset("fluid")
+        solid_bs = mesh.element_bitset("solid")
+    else:
+        fluid_bs = mesh.element_bitset("outside")
+        solid_bs = mesh.element_bitset("inside")
 
     element = MixedElement(mesh, field_specs={"ux": args.poly_order, "uy": args.poly_order, "dx": args.poly_order, "dy": args.poly_order, "p": args.poly_order - 1})
     dh = DofHandler(element, method="cg")
@@ -1346,17 +1429,18 @@ def main():
         BoundaryCondition("ux", "dirichlet", "beam_root", zero),
         BoundaryCondition("uy", "dirichlet", "beam_root", zero),
     ]
+    # Clamp beam root and the outer fluid boundaries to keep the ALE mesh fixed there.
     disp_bcs = [
-        BoundaryCondition("dx", "dirichlet", "inlet", zero),
-        BoundaryCondition("dy", "dirichlet", "inlet", zero),
-        BoundaryCondition("dx", "dirichlet", "outlet", zero),
-        BoundaryCondition("dy", "dirichlet", "outlet", zero),
-        BoundaryCondition("dx", "dirichlet", "walls", zero),
-        BoundaryCondition("dy", "dirichlet", "walls", zero),
-        BoundaryCondition("dx", "dirichlet", "cylinder", zero),
-        BoundaryCondition("dy", "dirichlet", "cylinder", zero),
         BoundaryCondition("dx", "dirichlet", "beam_root", zero),
         BoundaryCondition("dy", "dirichlet", "beam_root", zero),
+        BoundaryCondition("dx", "dirichlet", "inlet", zero),
+        BoundaryCondition("dy", "dirichlet", "inlet", zero),
+        BoundaryCondition("dx", "dirichlet", "walls", zero),
+        BoundaryCondition("dy", "dirichlet", "walls", zero),
+        BoundaryCondition("dx", "dirichlet", "outlet", zero),
+        BoundaryCondition("dy", "dirichlet", "outlet", zero),
+        BoundaryCondition("dx", "dirichlet", "cylinder", zero),
+        BoundaryCondition("dy", "dirichlet", "cylinder", zero),
     ]
     p_bcs = [BoundaryCondition("p", "dirichlet", "outlet", zero)]
     bcs = vel_bcs + disp_bcs + p_bcs
@@ -1367,10 +1451,27 @@ def main():
         for nm in names:
             sl = dh.get_field_slice(nm)
             field.set_nodal_values(sl, stokes_sol[sl])
-    _set(uk, ["ux", "uy"])
-    _set(pk, ["p"])
-    u_prev.nodal_values[:] = uk.nodal_values[:]
-    p_prev.nodal_values[:] = pk.nodal_values[:]
+    if not args.no_stokes_start:
+        _set(uk, ["ux", "uy"])
+        _set(pk, ["p"])
+        u_prev.nodal_values[:] = uk.nodal_values[:]
+        p_prev.nodal_values[:] = pk.nodal_values[:]
+    else:
+        # Start from zero but enforce boundary data below
+        for f in (uk, u_prev, pk, p_prev, dk, d_prev):
+            f.nodal_values.fill(0.0)
+
+    # Warm-start displacement inside the beam by solving a Laplace problem
+    warm_start_displacement_from_velocity(
+        dh=dh,
+        disp_space=disp_space,
+        solid_bs=solid_bs,
+        uk=uk,
+        dk=dk,
+        d_prev=d_prev,
+        dt_const=dt_const,
+        backend=args.backend,
+    )
 
     dh.apply_bcs(bcs, uk, u_prev, dk, d_prev, pk, p_prev)
     print(f"Total DOFs: {dh.total_dofs}")

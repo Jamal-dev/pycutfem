@@ -189,7 +189,8 @@ class NewtonParameters:
 
     # Armijo back‑tracking line‑search
     line_search: bool = True
-    ls_max_iter: int = 8
+    # Allow deeper backtracking; some stiff problems only descend for very small α
+    ls_max_iter: int = 12
     ls_reduction: float = 0.5           # α ← β·α after reject
     ls_c1: float = 0.1#1.0e-4               # sufficient‑decrease parameter
 
@@ -776,9 +777,11 @@ class NewtonSolver:
         g = A_red.T @ R_red
         gTS = float(g @ S_red)
         if gTS >= 0.0:
-            # Not a descent direction – reject and take zero step
-            print("        Warning: Not a descent direction in reduced space.")
-            return np.zeros_like(S_red)
+            # Newton direction is not a descent; fall back to steepest descent.
+            # This keeps the iteration moving instead of taking a zero step.
+            print("        Warning: Not a descent direction in reduced space; using steepest descent.")
+            S_red = -g
+            gTS = float(g @ S_red)  # = -||g||^2 <= 0
 
         phi0 = 0.5 * float(R_red @ R_red)
         alpha = 1.0
@@ -815,8 +818,10 @@ class NewtonSolver:
         if best_alpha > 0.0:
             print(f"        Armijo failed, using best-effort α = {best_alpha:.2e}.")
             return best_alpha * S_red
-        print("        Line search failed – no descent; taking zero step.")
-        return np.zeros_like(S_red)
+        # No decrease found; still take the smallest tried step to avoid stagnation.
+        min_alpha = alpha
+        print(f"        Line search failed – taking minimal step α = {min_alpha:.2e}.")
+        return min_alpha * S_red
 
     # ------------------------------------------------------------------
     #  Reduced Linear system & BC handling

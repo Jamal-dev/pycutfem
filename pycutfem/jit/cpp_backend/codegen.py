@@ -1130,7 +1130,7 @@ class CppCodeGen:
                         emit_line(f"auto {nm} = {a.name} - {b.name};")
                         push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
                 elif op.op_symbol == "*":
-                    print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})")
+                    # print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})")
                     if a.kind == "mixed" and b.kind == "mixed":
                         emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')
                         continue
@@ -1323,10 +1323,10 @@ class CppCodeGen:
                 is_b_row_vec = b.kind == "mat" and b.shape[0] == 1 and (b.shape[1] > 1 or b.shape[1] <0)
                 is_a_col_vec = a.kind == "mat" and a.shape[1] == 1 and (a.shape[0] > 1 or a.shape[0] <0)
                 is_b_col_vec = b.kind == "mat" and b.shape[1] == 1 and (b.shape[0] > 1 or b.shape[0] <0)
-                print(f"[dot] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
-                      f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})"
-                      f", union ({a_union_mat}, {b_union_mat})"
-                      f", is_2x2 ({is_a_2x2}, {is_b_2x2}), is_1d ({is_a_1d}, {is_b_1d})")
+                # print(f"[dot] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
+                #       f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})"
+                #       f", union ({a_union_mat}, {b_union_mat})"
+                #       f", is_2x2 ({is_a_2x2}, {is_b_2x2}), is_1d ({is_a_1d}, {is_b_1d})")
                 # trial/test mass
                 # Gradient advection combinations: grad(Function) · Trial  or Trial · grad(Function)
                 if a.kind == "grad" and b.kind == "grad" and a.role in {"test", "trial"} and b.role in {"test", "trial"}:

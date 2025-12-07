@@ -1189,7 +1189,11 @@ class FormCompiler:
 
         # Elementwise product: returns a single block (keep legacy shape: list of 1 vector)
         data = [u_loc * basis_00]
-        return self._vecinfo(data, role="function", node=n, field_names=[n.field_name])
+        arr = np.asarray(data)
+        # Collapse basis-weighted coefficients immediately: (k,n) -> (k,)
+        if arr.ndim == 2 and arr.shape[0] != arr.shape[1]:
+            arr = arr.sum(axis=1)
+        return self._vecinfo(arr, role="function", node=n, field_names=[n.field_name])
 
     def _visit_VectorFunction(self, n: VectorFunction):
         logger.debug(f"Visiting VectorFunction: {n.field_names}")
@@ -1237,6 +1241,10 @@ class FormCompiler:
             # produce an empty (0, width) block with the correct width for downstream code
             width = len(self.ctx["global_dofs"]) if self.ctx.get("global_dofs") is not None else len(local_dofs)
             data = np.zeros((0, width))
+
+        # Collapse basis-weighted coefficients immediately: (k,n) -> (k,)
+        if data.ndim == 2 and data.shape[0] != data.shape[1]:
+            data = data.sum(axis=1)
 
         return self._vecinfo(data, role="function", node=n, field_names=names)
 
@@ -1740,10 +1748,13 @@ class FormCompiler:
             result = rhs()
             if result is not None:
                 return result
-            else:
-                raise TypeError(f"Unsupported dot product for RHS: '{n.a} . {n.b}'"
-                                f" (roles: {role_a}, {role_b})"
-                                f" (shapes: {getattr(a_data, 'shape', None)}, {getattr(b_data, 'shape', None)})")
+
+        if role_a is None and role_b is not None:
+            return b * a
+        elif role_b is None and role_a is not None:
+            return a * b
+        elif role_a is None and role_b is None:
+            return a * b
 
         if role_a == None and role_b == "test":
             # Special case like dot( Constat(np.array([u1,u2])), TestFunction('v') )
@@ -1769,10 +1780,10 @@ class FormCompiler:
         # mass matrix case: VecOpInfo . VecOpInfo
         if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
             logger.debug(f"visit dot: Both operands are VecOpInfo: {a.role} . {b.role}")
-            if a.role == "test" and b.role in {"trial", "function", "mixed"}:
+            if a.role == "test" and b.role in {"trial", "function", "mixed", "vector"}:
                 # return np.dot(a_data.T, b_data)  # test . trial
                 return b.dot_vec(a)  # test . trial
-            elif b.role == "test" and a.role in {"trial", "function", "mixed"}:
+            elif b.role == "test" and a.role in {"trial", "function", "mixed", "vector"}:
                 # return np.dot(b_data.T, a_data)  # tiral . test
                 return a.dot_vec(b)  # trial . test
             elif a.role == "mixed" and b.role in {"function"}:
@@ -1788,7 +1799,7 @@ class FormCompiler:
         # ------------------------------------------------------------------
         # case grad(u_trial) . u_k
         if isinstance(a, GradOpInfo) and ((isinstance(b, VecOpInfo) \
-            and (b.role in {"function","test"} )) and a.role in {"trial", "test"}
+            and (b.role in {"function","test"} )) and a.role in {"trial", "test", "function"}
             ):
 
             return a.dot_vec(b)  # ∇u_trial · u_k

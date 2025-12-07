@@ -532,7 +532,7 @@ class VecOpInfo(BaseOpInfo):
             raise ValueError(f"Input vector of shape {other_vec.shape} cannot be dotted with VecOpInfo of shape {self.data.shape}.")
         
         # case 1 function dot test
-        if  self.role == "function" and other_vec.role in {"test", "trial"}: # rhs time derivative term
+        if  self.role in {"function", "vector"} and other_vec.role in {"test", "trial"}: # rhs time derivative term
             func_values_at_qp = _collapsed_function(self)  # shape (k,)
             meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='b')
             if func_values_at_qp.shape[0] > 1:
@@ -563,7 +563,7 @@ class VecOpInfo(BaseOpInfo):
             return np.einsum("km,kn->mn", self.data, other_vec.data, optimize=True)
         
         # case 3 trial and function
-        if self.role in {"trial", "test"} and other_vec.role == "function":
+        if self.role in {"trial", "test"} and other_vec.role in {"function", "vector"}:
             meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
             v_values = _collapsed_function(other_vec)  # shape (k,)
             if self.shape[0] == 1 and v_values.shape[0] > 1:
@@ -608,6 +608,15 @@ class VecOpInfo(BaseOpInfo):
     def __len__(self) -> int:
         """Returns the size of the first dimension (number of components)."""
         return self.data.shape[0] if self.data.ndim > 0 else 1
+    def is_scalar_function(self) -> bool:
+        """Check if the VecOpInfo represents a scalar function."""
+        if self.role == "function":
+            vals = _collapsed_function(self)  # shape (k,)
+            return vals.shape[0] == 1
+        elif self.role in {"trial", "test"}:
+            return self.data.shape[0] == 1
+        return False
+
     def __mul__(self, other: Union[float, np.ndarray]) -> "VecOpInfo":
         """Element-wise multiplication with a scalar or vector."""
         if isinstance(other, (float, int)):
@@ -684,8 +693,34 @@ class VecOpInfo(BaseOpInfo):
                 u_vals = _collapsed_function(self)  # shape (k,)
                 data = np.einsum("k,kn->n", u_vals, other.data, optimize=True)
                 return self._expand_axis_lhs(data, other.role, meta)
+            elif self.role == "function" and other.role == "mixed":
+                # Scalar function scaling a mixed block (e.g., shape sensitivities)
+                u_vals = _collapsed_function(self)  # (k,)
+                if u_vals.shape[0] not in (1, other.data.shape[0]):
+                    raise ValueError(f"Cannot scale mixed VecOpInfo of shape {other.data.shape} with function of shape {u_vals.shape}.")
+                # allow either per-component scaling or a single scalar
+                if u_vals.shape[0] == other.data.shape[0]:
+                    scale = u_vals.reshape((u_vals.shape[0],) + (1,) * (other.data.ndim - 1))
+                else:
+                    scale = u_vals[0]
+                data = other.data * scale
+                meta = _resolve_meta(self.meta(), other.meta(), prefer='b')
+                return VecOpInfo(data, role=other.role, **self.update_meta(meta))
+            elif self.role == "mixed" and other.role == "function":
+                # Mixed block scaled by a scalar function on the right
+                v_vals = _collapsed_function(other)  # (k,)
+                if v_vals.shape[0] not in (1, self.data.shape[0]):
+                    raise ValueError(f"Cannot scale mixed VecOpInfo of shape {self.data.shape} with function of shape {v_vals.shape}.")
+                if v_vals.shape[0] == self.data.shape[0]:
+                    scale = v_vals.reshape((v_vals.shape[0],) + (1,) * (self.data.ndim - 1))
+                else:
+                    scale = v_vals[0]
+                data = self.data * scale
+                meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
+                return VecOpInfo(data, role=self.role, **self.update_meta(meta))
             else:
-                raise NotImplementedError(f"VecOpInfo multiplication not implemented for roles {self.role} and {other.role}.")
+                raise NotImplementedError(f"VecOpInfo multiplication not implemented for roles {self.role} and {other.role}."
+                                          f" (self.shape={self.shape}, other.shape={other.shape})")
                 
         elif isinstance(other, GradOpInfo):
             if self.shape[0] == 1 and other.shape == (2,2) and self.role in {"trial","test"}:
@@ -770,6 +805,14 @@ class VecOpInfo(BaseOpInfo):
                     for j in range(d):
                         res[i, :, :, j] = np.outer(self.data[0, :], other.data[i, :, j])
                 return GradOpInfo(res, role="mixed", **self.update_meta(meta))
+            elif self.role == "function" and other.role in {"trial", "test", "mixed"} and self.is_scalar_function():
+                # Case: Scalar Function * Grad(Trial/Test)
+                u_vals = _collapsed_function(self)  # shape (k,)
+                if u_vals.shape[0] != 1:
+                    raise NotImplementedError("Only scalar function factors supported here.")
+                meta = _resolve_meta(self.meta(), other.meta(), prefer="b")
+                data = u_vals[0] * other.data
+                return GradOpInfo(data, role=other.role, **self.update_meta(meta))
 
 
             else:
@@ -875,13 +918,8 @@ class GradOpInfo(BaseOpInfo):
 
         (k, d)     -> (d, k)
         """
-        if self.data.ndim == 3:        # (k, n, d)
-            if self.role == "function":
-                # Transpose for function gradients
-                # swap the coefficents to match the new shape
-                grad_vals = _collapsed_grad(self)  # (k, d)
-                return self._with(grad_vals.T, role=self.role, coeffs=None)
-            elif self.role =="mixed":
+        if self.data.ndim == 4:      # (k, n, m, d)
+            if self.role == "mixed":
                 G = self.data                        # (k, n, m, d)
                 k, n, m, d = G.shape
                 Gswap = np.empty_like(G)
@@ -890,6 +928,12 @@ class GradOpInfo(BaseOpInfo):
                     for j in range(d):
                         Gswap[i, :, :, j] = G[j, :, :, i]
                 return self._with(Gswap, role=self.role, coeffs=self.coeffs)
+        if self.data.ndim == 3:        # (k, n, d)
+            if self.role == "function":
+                # Transpose for function gradients
+                # swap the coefficents to match the new shape
+                grad_vals = _collapsed_grad(self)  # (k, d)
+                return self._with(grad_vals.T, role=self.role, coeffs=None)
             elif self.role in {"trial", "test"}: # trial and test
                 G = self.data                        # (k, n, d)
                 k, n, d = G.shape
