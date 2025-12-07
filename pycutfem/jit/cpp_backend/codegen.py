@@ -1319,6 +1319,10 @@ class CppCodeGen:
                 is_b_2x2 = b.kind == "mat" and b.shape == (2,2)
                 is_a_1d = a.kind == "vec" and a.shape[0] > 1
                 is_b_1d = b.kind == "vec" and b.shape[0] > 1
+                is_a_row_vec = a.kind == "mat" and a.shape[0] == 1 and (a.shape[1] > 1 or a.shape[1] <0)
+                is_b_row_vec = b.kind == "mat" and b.shape[0] == 1 and (b.shape[1] > 1 or b.shape[1] <0)
+                is_a_col_vec = a.kind == "mat" and a.shape[1] == 1 and (a.shape[0] > 1 or a.shape[0] <0)
+                is_b_col_vec = b.kind == "mat" and b.shape[1] == 1 and (b.shape[0] > 1 or b.shape[0] <0)
                 print(f"[dot] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
                       f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})"
                       f", union ({a_union_mat}, {b_union_mat})"
@@ -1366,6 +1370,10 @@ class CppCodeGen:
                         role = b.role
                         shape = (a.shape[0], b.shape[1])
                         emit_line(f"auto {nm} = {a.name} * {b.name};")
+                    elif (is_a_row_vec or is_a_col_vec) and b.role in {"test", "trial"} and b_union_mat:
+                        role = b.role
+                        shape = (a.shape[0], b.shape[1])
+                        emit_line(f"auto {nm} = contract_vector_matrix({a.name}, {b.name});")
                     elif a.role == "trial" and b.role == "test":
                         emit_line(f"Eigen::MatrixXd {nm} = dot_mass_trial_test({a.name}, {b.name});")
                     elif a.role == "test" and b.role == "trial":
@@ -1389,6 +1397,11 @@ class CppCodeGen:
                         rows = a.shape[1] if swap_roles else b.shape[1]
                         cols = b.shape[1] if swap_roles else a.shape[1]
                         push("mixed", "mixed", (1, rows, cols, b.shape[2]))
+                    else:
+                        raise NotImplementedError("dot(mat, grad) only supported for value · test/trial"
+                                                  f" or test/trial · test/trial with matching component counts in C++ backend"
+                                                  f" (got roles {a.role}, {b.role})"
+                                                  f" (shapes {a.shape}, {b.shape})")
                 elif a.kind == "grad" and b.kind == "mat":
                     # grad(test/trial) with basis matrix -> standard assembly helper
                     if a.role in {"test", "trial"} and b.role in {"value", "const"}:
@@ -1419,64 +1432,53 @@ class CppCodeGen:
                         push("grad", a.role, out_shape, a.field_names, a.parent, side, a.field_sides)
                 elif a.kind == "mat" and b.kind == "vec":
                     vec_dim = b.shape[0] if len(b.shape) > 0 and b.shape[0] not in (-1, 0) else -1
-                    if a.role in {"test", "trial"}:
-                        emit_line(f"int {nm}_vdim = static_cast<int>({b.name}.size());")
-                        emit_line(f"Eigen::MatrixXd {nm};")
-                        if_branch = f"if ({nm}_vdim == {a.shape[0]} || {a.shape[0]} < 0)"
-                        emit_line(f"{if_branch} {{")
-                        emit_line(f"    {nm} = {a.name}.transpose() * {b.name};")
-                        emit_line("} else {")
-                        emit_line(f"    {nm} = Eigen::MatrixXd::Zero({nm}_vdim, n_union);")
-                        emit_line(f"    for (int _c=0; _c<{nm}_vdim; ++_c) {nm}.row(_c) = {a.name}.row(0) * {b.name}(_c);")
-                        emit_line("}")
-                        vec_dim = -1  # treat as dynamic below
-                    elif is_a_2x2 and is_b_1d:
-                        emit_line(f"auto {nm} = dot_grad_with_value({a.name}, {b.name});")
+                    if a.role in {"test", "trial"} and a_union_mat \
+                          and a.shape[0] == b.shape[0] \
+                          and (is_b_1d or is_b_col_vec or is_b_row_vec):
+                        # a would have the shape of (k,n)
+                        emit_line(f"auto {nm} = contract_mat_vector_first_index({a.name}, {b.name});")
+
+                        res_shape = (1, a.shape[0])
+                    elif is_a_2x2 and (is_b_1d or is_b_col_vec or is_b_row_vec):
+                        emit_line(f"auto {nm} = contract_matrix_vector({a.name}, {b.name});")
+                        res_shape = (1, a.shape[0])
                     else:
-                        emit_line(f"Eigen::VectorXd {nm};")
-                        emit_line(f"if ({a.name}.cols() == {b.name}.size()) {{")
-                        emit_line(f"    {nm} = {a.name} * {b.name};")
-                        emit_line(f"}} else if ({a.name}.rows() == {b.name}.size()) {{")
-                        emit_line(f"    {nm} = {a.name}.transpose() * {b.name};")
-                        emit_line("} else {")
-                        emit_line('    throw std::runtime_error("dot(mat, vec): dimension mismatch");')
-                        emit_line("}")
-                    res_shape = (
-                        vec_dim if vec_dim not in (-1, 0) else (a.shape[0] if len(a.shape) > 0 else -1),
-                        a.shape[1] if len(a.shape) > 1 else -1,
-                    )
+                        raise NotImplementedError("dot(mat, vec) only supported for test/trial basis matrices in C++ backend"
+                                                  f" (got roles {a.role}, {b.role})"
+                                                  f" (shapes {a.shape}, {b.shape})"
+                                                  f", is_2x2 ({is_a_2x2}, {is_b_2x2}), is_1d ({is_a_1d}, {is_b_1d}), is_col_vec ({is_b_col_vec}), is_row_vec ({is_b_row_vec})"
+                                                  f", vec_dim {vec_dim}")
+
                     push("mat", a.role if a.role in {"test", "trial"} else "value", res_shape, a.field_names, a.parent, side, a.field_sides)
                 elif a.kind == "vec" and b.kind == "mat":
-                    if b.parent == "hess_dot_vec":
-                        emit_line(f"Eigen::VectorXd {nm} = {b.name}.transpose() * {a.name};")
-                        push("vec", b.role, (b.shape[1] if len(b.shape) > 1 else -1,), b.field_names, b.parent, side, b.field_sides)
-                        continue
                     mat_rows = b.shape[0] if len(b.shape) > 0 and b.shape[0] not in (-1, 0) else -1
-                    if b.role in {"test", "trial"}:
-                        emit_line(f"int {nm}_vdim = static_cast<int>({a.name}.size());")
-                        emit_line(f"Eigen::MatrixXd {nm};")
-                        emit_line(f"if ({nm}_vdim == {mat_rows} || {mat_rows} < 0) {{")
-                        emit_line(f"    {nm} = {b.name}.transpose() * {a.name};")
-                        emit_line("} else {")
-                        emit_line(f"    {nm} = Eigen::MatrixXd::Zero({nm}_vdim, n_union);")
-                        emit_line(f"    for (int _c=0; _c<{nm}_vdim; ++_c) {nm}.row(_c) = {b.name}.row(0) * {a.name}(_c);")
-                        emit_line("}")
-                        mat_rows = -1
-                    elif is_a_1d and is_b_2x2:
-                        emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
-                    else:
-                        emit_line(f"Eigen::VectorXd {nm};")
-                        emit_line(f"if ({b.name}.cols() == {a.name}.size()) {{")
-                        emit_line(f"    {nm} = {b.name} * {a.name};")
-                        emit_line(f"}} else if ({b.name}.rows() == {a.name}.size()) {{")
-                        emit_line(f"    {nm} = {b.name}.transpose() * {a.name};")
-                        emit_line("} else {")
-                        emit_line('    throw std::runtime_error("dot(vec, mat): dimension mismatch");')
-                        emit_line("}")
                     res_shape = (
                         mat_rows if mat_rows not in (-1, 0) else -1,
                         b.shape[1] if len(b.shape) > 1 else -1,
                     )
+                    if b.parent == "hess_dot_vec":
+                        # a is assumed to have the shape of (n,1)
+                        emit_line(f"Eigen::VectorXd {nm} = {b.name}.transpose() * {a.name};")
+                        push("vec", b.role, (b.shape[1] if len(b.shape) > 1 else -1,), b.field_names, b.parent, side, b.field_sides)
+                        continue
+                    if b.role in {"test", "trial"}:
+                        # np.einsum('k,kn->n', a, b)
+                        emit_line(f"auto {nm} = contract_vector_matrix({a.name}, {b.name});")
+
+                        mat_rows = -1
+                        res_shape = (1, b.shape[1])
+                    elif is_a_1d and is_b_2x2:
+                        # np.einsum('i,ij->j', a, b)
+                        emit_line(f"auto {nm} = contract_vector_matrix({a.name}, {b.name});")
+                        res_shape = (1, b.shape[1])
+                    else:
+                        raise NotImplementedError("dot(vec, mat) only supported for test/trial basis matrices in C++ backend"
+                                                  f" (got roles {a.role}, {b.role})"
+                                                  f" (shapes {a.shape}, {b.shape})"
+                                                  f", is_1d ({is_a_1d}, {is_b_1d}), is_2x2 ({is_b_2x2}, {is_b_2x2})"
+                                                  f", mat_rows {mat_rows}")
+
+                    
                     push("mat", b.role if b.role in {"test", "trial"} else "value", res_shape, b.field_names, b.parent, side, b.field_sides)
                 elif a.kind == "vec" and b.kind == "grad":
                     if b.parent == "hess_dot_vec":

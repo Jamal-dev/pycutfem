@@ -9,7 +9,7 @@
 #include <Eigen/Dense>
 #include <unsupported/Eigen/CXX11/Tensor>
 #include <iostream>
-bool is_debug = true;
+bool is_debug = false;
 namespace py = pybind11;
 namespace pycutfem::cpp_backend {
 
@@ -391,6 +391,110 @@ inline py::array_t<double> pushforward_grad_to_union(const py::array_t<double>& 
     return out;
 }
 
+/**
+ * Robustly performs the contraction: c_n = sum_k (A_kn * b_k).
+ * * Logic:
+ * - A is (K, N). b is vector of size K.
+ * - Contracts the first index (rows) of A with b.
+ * - This is mathematically equivalent to b.transpose() * A.
+ * - Result is ALWAYS returned as a Row Vector (1, N).
+ */
+template <typename DerivedA, typename DerivedB>
+Eigen::MatrixXd contract_mat_vector_first_index(const Eigen::MatrixBase<DerivedA>& A, 
+                                                const Eigen::MatrixBase<DerivedB>& b) {
+    
+    // 1. Identify the length of vector 'b'
+    //    Prioritize rows() for standard columns (K, 1).
+    long b_len = (b.cols() == 1) ? b.rows() : b.cols();
+
+    // 2. Validate Dimensions: b must match A's ROWS
+    if (A.rows() != b_len) {
+        throw std::runtime_error("Dimension mismatch in contract_mat_vector_first_index: "
+                                 "Matrix rows must match Vector size.");
+    }
+
+    // 3. Perform Multiplication enforcing (1, N) result
+    if (b.cols() == 1) {
+        // Case 1: 'b' is a Column Vector (K, 1)
+        // Operation: (K, 1)^T * (K, N) -> (1, K) * (K, N) -> (1, N)
+        return b.transpose() * A;
+    } else {
+        // Case 2: 'b' is a Row Vector (1, K)
+        // Operation: (1, K) * (K, N) -> (1, N)
+        return b * A;
+    }
+}
+
+/**
+ * Robustly performs Matrix-Vector contraction: c_i = sum_j (A_ij * b_j).
+ * * Logic:
+ * - Treats 'b' as a vector of size N (auto-detects row vs column).
+ * - Contracts columns of A (M x N) with b (N).
+ * - Result is ALWAYS returned as a Row Vector (1, M).
+ */
+template <typename DerivedA, typename DerivedB>
+Eigen::MatrixXd contract_matrix_vector(const Eigen::MatrixBase<DerivedA>& A, 
+                                       const Eigen::MatrixBase<DerivedB>& b) {
+    
+    // 1. Identify the length of vector 'b'
+    //    If b.cols() == 1, it's a column vector -> size is rows().
+    //    Otherwise (including 1x1 treated as row), size is cols().
+    //    Note: We prioritize column checking to handle (N, 1) correctly.
+    long b_len = (b.cols() == 1) ? b.rows() : b.cols();
+
+    // 2. Validate Dimensions: A.cols() must match b's length
+    if (A.cols() != b_len) {
+        throw std::runtime_error("Dimension mismatch in contract_matrix_vector: "
+                                 "Matrix columns must match Vector size.");
+    }
+
+    // 3. Perform Multiplication enforcing (1, M) result
+    if (b.cols() == 1) {
+        // Case 1: 'b' is a Column Vector (N, 1)
+        // Operation: (M, N) * (N, 1) -> (M, 1)
+        // We transpose result to satisfy (1, M) requirement.
+        return (A * b).transpose();
+    } else {
+        // Case 2: 'b' is a Row Vector (1, N)
+        // We implicitly transpose 'b' to contract with A's columns.
+        // Operation: (M, N) * (1, N)^T -> (M, N) * (N, 1) -> (M, 1)
+        // Then transpose result to (1, M).
+        return (A * b.transpose()).transpose();
+    }
+}
+
+/**
+ * Robustly performs the contraction c_j = sum_i (a_i * b_ij).
+ * * Logic:
+ * - Always treats 'a' as a row vector (1, M) to contract with the rows of 'b'.
+ * - Result is ALWAYS a MatrixXd of shape (1, N).
+ */
+template <typename DerivedA, typename DerivedB>
+Eigen::MatrixXd contract_vector_matrix(const Eigen::MatrixBase<DerivedA>& a, 
+                                       const Eigen::MatrixBase<DerivedB>& b) {
+    
+    // 1. Identify the size of the contraction dimension from 'a'
+    //    If 'a' is (1, M), size is cols(). If (M, 1), size is rows().
+    long a_dim = (a.rows() == 1) ? a.cols() : a.rows();
+
+    // 2. Validate Dimensions: 'a' must contract with the ROWS of 'b'
+    if (a_dim != b.rows()) {
+        throw std::runtime_error("Dimension mismatch in contract_vector_matrix: "
+                                 "Vector size must match Matrix rows.");
+    }
+
+    // 3. Perform Multiplication enforcing (1, N) result
+    if (a.rows() == 1) {
+        // Case 1: 'a' is already a Row Vector (1, M)
+        // Operation: (1, M) * (M, N) -> (1, N)
+        return a * b;
+    } else {
+        // Case 2: 'a' is a Column Vector (M, 1)
+        // Operation: (M, 1)^T * (M, N) -> (1, M) * (M, N) -> (1, N)
+        return a.transpose() * b;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tensor Algebra (Dot Products / Contractions)
 // ---------------------------------------------------------------------------
@@ -741,17 +845,42 @@ inline Eigen::MatrixXd dot_grad_basis_vector(const std::vector<Eigen::MatrixXd>&
 }
 
 // Vector dotted with grad(basis) -> d x n
-inline Eigen::MatrixXd dot_vec_grad(const Eigen::VectorXd& vec,
+template <typename DerivedVec>
+inline Eigen::MatrixXd dot_vec_grad(const Eigen::MatrixBase<DerivedVec>& vec,
                                     const std::vector<Eigen::MatrixXd>& grad_basis) {
-    if (is_debug) {std::cout<< "-----------------dot_vec_grad---------------------"<<std::endl;}
-    int k = static_cast<int>(grad_basis.size());
-    if (k == 0) return Eigen::MatrixXd();
-    int n = static_cast<int>(grad_basis[0].rows());
-    Eigen::MatrixXd out(grad_basis[0].cols(), n);
+    if (is_debug) { std::cout << "-----------------dot_vec_grad---------------------" << std::endl; }
+    
+    // 1. Safety Checks
+    if (grad_basis.empty()) return Eigen::MatrixXd();
+    
+    long k = static_cast<long>(grad_basis.size());
+    
+    // Validate Vector Size
+    if (vec.size() != k) {
+        throw std::runtime_error("Dimension mismatch: Vector size must match grad_basis size (k).");
+    }
+
+    // 2. Get Dimensions
+    // grad_basis[0] is (n, d). We want output (d, n).
+    long n = grad_basis[0].rows();
+    long d = grad_basis[0].cols();
+
+    // 3. Allocate Output
+    Eigen::MatrixXd out(d, n);
     out.setZero();
-    for (int c = 0; c < k; ++c) {
+
+    // 4. Compute Weighted Sum
+    // vec(c) works correctly for both RowVector and ColumnVector in Eigen
+    for (long c = 0; c < k; ++c) {
+        // Validation check for inner matrices (optional but safe)
+        if (grad_basis[c].rows() != n || grad_basis[c].cols() != d) {
+             throw std::runtime_error("Irregular matrix size in grad_basis vector.");
+        }
+        
+        // Accumulate: scalar * (n, d).transpose() -> (d, n)
         out += grad_basis[c].transpose() * vec(c);
     }
+
     return out;
 }
 

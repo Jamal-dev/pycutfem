@@ -1017,6 +1017,14 @@ if __name__ == '__main__':
             # 'rtol': 1e-6,
             # 'atol': 1e-6,
         },
+        "Fluid pres_res 1": {
+            'pc': (-J_geo_pc * (pc['p_k'] * div_v_pc ) ) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: (-J_geo_fx * (p_k_fx * div_v_fx ) ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+            # 'rtol': 1e-6,
+            # 'atol': 1e-6,
+        },
         "Fluid pres_res": {
             'pc': (-J_geo_pc * (pc['p_k'] * div_v_pc + pc['q'] * div_uk_pc) + stab_eps_pc * pc['p_k'] * pc['q']) * dx(metadata={"q": 6}),
             'f_lambda': lambda deg: (-J_geo_fx * (p_k_fx * div_v_fx + q * div_uk_fx) + stab_eps_fx * p_k_fx * q) * ufl.dx(metadata={'quadrature_degree': deg}),
