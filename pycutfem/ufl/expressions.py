@@ -1303,6 +1303,14 @@ class Inverse(Expression):
     def __repr__(self):
         return f"Inverse({self.A!r})"
 
+class Cofactor(Expression):
+    """Symbolic cofactor (adjugate) of a 2×2 tensor expression."""
+    def __init__(self, A: Expression):
+        super().__init__()
+        self.A = A
+    def __repr__(self):
+        return f"Cofactor({self.A!r})"
+
 def trace(A):
     """Helper function to create a Trace expression."""
     return Trace(A)
@@ -1314,6 +1322,10 @@ def det(A):
 def inv(A):
     """Helper function to create an Inverse expression."""
     return Inverse(A)
+
+def cof(A):
+    """Helper function to create a Cofactor expression."""
+    return Cofactor(A)
 
 # --- Helper functions to create operator instances ---
 def grad(v): return Grad(v)

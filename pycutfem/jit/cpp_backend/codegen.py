@@ -90,6 +90,7 @@ class CppCodeGen:
             Transpose,
             Determinant,
             Inverse,
+            Cofactor,
             Trace,
         )
 
@@ -1735,6 +1736,18 @@ class CppCodeGen:
                     stack.append(StackItem(nm, "scalar", a.role, ()))
                 else:
                     raise NotImplementedError("Determinant only implemented for matrices")
+            elif isinstance(op, Cofactor):
+                a = stack.pop()
+                nm = new_tmp("cof")
+                if a.kind in {"mat", "grad"}:
+                    emit_line(f"Eigen::MatrixXd {nm}(2,2);")
+                    emit_line(f"{nm}(0,0) = {a.name}(1,1);")
+                    emit_line(f"{nm}(0,1) = -{a.name}(1,0);")
+                    emit_line(f"{nm}(1,0) = -{a.name}(0,1);")
+                    emit_line(f"{nm}(1,1) = {a.name}(0,0);")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape))
+                else:
+                    raise NotImplementedError("Cofactor only implemented for matrices")
             elif isinstance(op, Inverse):
                 a = stack.pop()
                 nm = new_tmp("inv")

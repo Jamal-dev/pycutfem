@@ -125,6 +125,11 @@ class Inverse:
     pass
 
 @dataclass(frozen=True, slots=True)
+class Cofactor:
+    """Instruction to compute the cofactor (adjugate) of the tensor on top of the stack."""
+    pass
+
+@dataclass(frozen=True, slots=True)
 class Hessian:   pass
 
 @dataclass(frozen=True, slots=True)

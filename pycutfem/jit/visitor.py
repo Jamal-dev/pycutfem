@@ -6,14 +6,14 @@ from pycutfem.ufl.expressions import (
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
     ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter,
     NormalComponent, Restriction, Power as UFLPower, Trace as UFLTrace,
-    Determinant as UFLDeterminant, Inverse as UFLInverse,
+    Determinant as UFLDeterminant, Inverse as UFLInverse, Cofactor as UFLCofactor,
     Hessian as UFLHessian, Laplacian as UFLLaplacian
 )
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
     LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
-    CellDiameter, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse,
+    CellDiameter, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse, Cofactor,
     Hessian as IRHessian, Laplacian as IRLaplacian
 )
 from dataclasses import replace
@@ -114,6 +114,10 @@ class IRGenerator:
         if isinstance(node, UFLDeterminant):
             self._visit(node.A, side=side)
             self.ir_sequence.append(Determinant())
+            return
+        if isinstance(node, UFLCofactor):
+            self._visit(node.A, side=side)
+            self.ir_sequence.append(Cofactor())
             return
         if isinstance(node, UFLInverse):
             self._visit(node.A, side=side)

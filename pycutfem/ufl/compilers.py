@@ -48,7 +48,7 @@ from pycutfem.ufl.expressions import (
     ElementWiseConstant, Derivative, Transpose,
     CellDiameter, NormalComponent,
     Restriction, Power, Trace, Determinant, Inverse, Hessian, Laplacian,
-    Identity
+    Identity, Cofactor
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -166,6 +166,7 @@ class FormCompiler:
             Trace: self._visit_Trace,
             Determinant: self._visit_Determinant,
             Inverse: self._visit_Inverse,
+            Cofactor: self._visit_Cofactor,
             Hessian: self._visit_Hessian,
     Laplacian: self._visit_Laplacian,
     Identity: self._visit_Identity
@@ -872,6 +873,30 @@ class FormCompiler:
         mat = self._materialize_matrix_value(A, node, "determinant")
         det = mat[0, 0] * mat[1, 1] - mat[0, 1] * mat[1, 0]
         return float(det)
+
+    def _visit_Cofactor(self, node: Cofactor):
+        A = self._visit(node.A)
+        mat = self._materialize_matrix_value(A, node, "cofactor")
+        cof_mat = np.array(
+            [
+                [mat[1, 1], -mat[1, 0]],
+                [-mat[0, 1], mat[0, 0]],
+            ],
+            dtype=float,
+        )
+        if isinstance(A, GradOpInfo):
+            if np.shape(cof_mat) == np.shape(A.data):
+                return self._gradinfo(
+                    cof_mat,
+                    role=A.role,
+                    node=node,
+                    field_names=A.field_names,
+                    coeffs=None,
+                )
+            raise ValueError(
+                f"Cofactor result shape {cof_mat.shape} is not square GradOpInfo shape {A.data.shape}."
+            )
+        return cof_mat
 
     def _visit_Inverse(self, node: Inverse):
         A = self._visit(node.A)

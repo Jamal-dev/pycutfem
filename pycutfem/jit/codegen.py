@@ -7,7 +7,7 @@ from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
     BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
-    Trace, Determinant, Inverse, Hessian as IRHessian, Laplacian as IRLaplacian
+    Trace, Determinant, Inverse, Cofactor, Hessian as IRHessian, Laplacian as IRLaplacian
 )
 from pycutfem.jit.symbols import encode
 import numpy as np
@@ -1283,6 +1283,28 @@ class NumbaCodeGen:
                         is_vector=False,
                         is_gradient=False,
                         is_hessian=False,
+                    )
+                )
+
+            elif isinstance(op, Cofactor):
+                a = stack.pop()
+                if a.shape != (2, 2) or a.role not in ("value", "const"):
+                    raise NotImplementedError(
+                        "Cofactor expects a 2x2 numeric tensor (role 'value' or 'const')."
+                    )
+                res_var = new_var("cof2")
+                body_lines += [
+                    f"a00 = {a.var_name}[0, 0]",
+                    f"a01 = {a.var_name}[0, 1]",
+                    f"a10 = {a.var_name}[1, 0]",
+                    f"a11 = {a.var_name}[1, 1]",
+                    f"{res_var} = np.array([[a11, -a10], [-a01, a00]], dtype={self.dtype})",
+                ]
+                stack.append(
+                    a._replace(
+                        var_name=res_var,
+                        role=a.role,
+                        shape=(2, 2),
                     )
                 )
 
