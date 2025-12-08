@@ -1003,10 +1003,16 @@ def build_forms(
     kappa: Constant,
     mesh_reg: Constant,
     stab_eps: Constant,
+    stab_solid: Constant | None = None,
     fluid_bs,
     solid_bs,
     quad_order: int,
 ):
+    # Pressure only lives in the fluid. On the solid, give it a strong penalty
+    # so the nearly-uncoupled solid p-DOFs do not pollute the Newton system.
+    if stab_solid is None:
+        stab_solid = stab_eps
+
     dx_f = dx(defined_on=fluid_bs, metadata={"q": quad_order})
     dx_s = dx(defined_on=solid_bs, metadata={"q": quad_order})
 
@@ -1082,7 +1088,7 @@ def build_forms(
     residual_form = (mass_res_f + visc_res_f + adv_res_f + pres_res_f) * dx_f
 
     # If p DOFs exist in the solid region in your mixed space, this avoids singular rows
-    residual_form += stab_eps * pk * q * dx_s
+    residual_form += stab_solid * pk * q * dx_s
 
     # Solid: Neo-Hookean + time update
     P, cache = neo_hookean_pk1(Fk, c10=c10, kappa=kappa)
@@ -1149,7 +1155,7 @@ def build_forms(
     )
 
     # Same stabilization on solid for dp*q
-    jacobian_form += stab_eps * dp * q * dx_s
+    jacobian_form += stab_solid * dp * q * dx_s
 
     # Solid Jacobian
     deltaP = neo_hookean_delta_P(Fk, cache, grad(dd), c10=c10, kappa=kappa)
@@ -1386,7 +1392,14 @@ def main():
     kappa = Constant(LAMBDA_S + (2.0 / 3.0) * MU_S)
     mesh_reg = Constant(1e-6 * MU_S)
     stab_eps = Constant(1e-8)
+    # Strongly anchor the spurious pressure DOFs that live only in the solid
+    stab_solid = Constant(1.0)
     quad_order = 2 * args.poly_order + 4
+
+    # Pressure is a fluid variable; drop DOFs whose support lies entirely in the solid.
+    dropped_p = dh.tag_dofs_from_element_bitset("inactive", "p", solid_bs, strict=True)
+    if dropped_p:
+        print(f"Marked {len(dropped_p)} pressure DOFs inside the solid as inactive.")
 
     jac_form, res_form = build_forms(
         uk=uk,
@@ -1410,6 +1423,7 @@ def main():
         kappa=kappa,
         mesh_reg=mesh_reg,
         stab_eps=stab_eps,
+        stab_solid=stab_solid,
         fluid_bs=fluid_bs,
         solid_bs=solid_bs,
         quad_order=quad_order,
