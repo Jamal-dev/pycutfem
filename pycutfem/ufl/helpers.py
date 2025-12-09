@@ -619,6 +619,10 @@ class VecOpInfo(BaseOpInfo):
 
     def __mul__(self, other: Union[float, np.ndarray]) -> "VecOpInfo":
         """Element-wise multiplication with a scalar or vector."""
+        # shape_a = self.data.shape
+        # shape_b = getattr(other, 'shape', "None")
+        # role_b = getattr(other, 'role', "None")
+        # print(f"VecOpInfo.__mul__: roles=({self.role}, {role_b}), shapes=({shape_a}, {shape_b})")
         if isinstance(other, (float, int)):
             return self._with(self.data * other, role=self.role)
         elif isinstance(other, np.ndarray): # np.array
@@ -681,18 +685,38 @@ class VecOpInfo(BaseOpInfo):
                 meta = _resolve_meta(self.meta(), other.meta())
                 role = "scalar" if np.ndim(data) == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(meta))
-            elif self.role in {"trial","test"} and other.role == "function":
-                # Case: Trial * Function , dot product case
-                meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
+            elif self.role in {"trial","test"} and other.role in {"function", "vector"}:
+                # Case: Scalar Trial/Test * Function 
                 v_vals = _collapsed_function(other)  # shape (k,)
-                data = np.einsum("kn,k->n", self.data, v_vals, optimize=True)
-                return self._expand_axis_lhs(data, self.role, meta)
-            elif self.role == "function" and other.role in {"trial", "test"}:
-                meta = _resolve_meta(self.meta(), other.meta(), prefer='b')
-                # Case: Function * Trial , dot product case
+                if self.shape[0] == 1 and self.shape[1] >1 and v_vals.shape[0] > 1:
+                    # Special case: single component trial/test function
+                    data = np.asarray([self.data[0,:] * comp for comp in v_vals])
+                    meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
+                    return VecOpInfo(data, role=self.role, **self.update_meta(meta))
+                else:
+                    raise NotImplementedError(self._error_msg(other, "VecOpInfo.__mul__"))
+            elif self.role in {"function", "vector"} and other.role in {"trial","test"}:
+                # Case: Function * Scalar Trial/Test
                 u_vals = _collapsed_function(self)  # shape (k,)
-                data = np.einsum("k,kn->n", u_vals, other.data, optimize=True)
-                return self._expand_axis_lhs(data, other.role, meta)
+                if other.shape[0] == 1 and other.shape[1] >1 and u_vals.shape[0] > 1:
+                    # Special case: single component trial/test function
+                    data = np.asarray([other.data[0,:] * comp for comp in u_vals])
+                    meta = _resolve_meta(self.meta(), other.meta(), prefer='b')
+                    return VecOpInfo(data, role=other.role, **self.update_meta(meta))
+                else:
+                    raise NotImplementedError(self._error_msg(other, "VecOpInfo.__mul__"))
+            # elif self.role in {"trial","test"} and other.role == "function":
+            #     # Case: Trial * Function , dot product case
+            #     meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
+            #     v_vals = _collapsed_function(other)  # shape (k,)
+            #     data = np.einsum("kn,k->n", self.data, v_vals, optimize=True)
+            #     return self._expand_axis_lhs(data, self.role, meta)
+            # elif self.role == "function" and other.role in {"trial", "test"}:
+            #     meta = _resolve_meta(self.meta(), other.meta(), prefer='b')
+            #     # Case: Function * Trial , dot product case
+            #     u_vals = _collapsed_function(self)  # shape (k,)
+            #     data = np.einsum("k,kn->n", u_vals, other.data, optimize=True)
+            #     return self._expand_axis_lhs(data, other.role, meta)
             elif self.role == "function" and other.role == "mixed":
                 # Scalar function scaling a mixed block (e.g., shape sensitivities)
                 u_vals = _collapsed_function(self)  # (k,)
@@ -1008,11 +1032,17 @@ class GradOpInfo(BaseOpInfo):
         elif self.role == "trial" and other.role == "test":
             # reversed inputs: build rows=test, cols=trial anyway
             return np.einsum("knd,kmd->mn", self.data, other.data, optimize=True)
-        elif self.role in {"function"} and other.role in {"trial", "test"}:
+        elif self.role in {"function", "identity"} and other.role in {"trial", "test"}:
             # Case: Function · Grad(Trial) or Grad(Test)  -> (n,)
             kd = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
             if kd.shape[0] == other.shape[0]:
                 return np.einsum("kd,knd->n", kd, other.data, optimize=True)
+            else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
+        elif self.role in {"trial", "test"} and other.role in {"function", "identity"}:
+            # Case: Grad(Trial) or Grad(Test) · Function  -> (n,)
+            kd = _collapsed_grad(other)  # shape (k, d)  —   ∇u_k(ξ)
+            if kd.shape[0] == self.shape[0]:
+                return np.einsum("knd,kd->n", self.data, kd, optimize=True)
             else: raise NotImplementedError(self._error_msg(other, "inner between gradients"))
         elif self.role in {"function", "identity"} and other.role in {"mixed"}:
             # Case: Function · Grad(Mixed)  -> (n,)

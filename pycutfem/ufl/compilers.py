@@ -768,6 +768,8 @@ class FormCompiler:
         Collapse a tensor expression result to a numeric 2×2 matrix.
         Only function-valued gradients (or plain numpy arrays) are supported.
         """
+        a_shape = getattr(tensor_value, "shape", None)
+        a_role = getattr(tensor_value, "role", None)
         if isinstance(tensor_value, np.ndarray):
             mat = np.asarray(tensor_value, dtype=float)
         elif isinstance(tensor_value, GradOpInfo):
@@ -788,6 +790,7 @@ class FormCompiler:
         else:
             raise TypeError(
                 f"{op_name} expects a numeric tensor; got {type(tensor_value).__name__}."
+                f" Role: '{a_role}', shape: {a_shape}."
             )
 
         if mat.shape != (2, 2):
@@ -876,6 +879,22 @@ class FormCompiler:
 
     def _visit_Cofactor(self, node: Cofactor):
         A = self._visit(node.A)
+        # The cofactor map is linear only in 2x2 case
+        # we can calculate it for grad of basis functions
+        if isinstance(A, GradOpInfo):
+            if A.role in ("test", "trial") and A.ndim == 3 and A.shape[0] == A.shape[2] == 2:
+                cofactor_data = np.empty_like(A.data)
+                cofactor_data[0, :, 0] = A.data[1, :, 1]  #
+                cofactor_data[0, :, 1] = -A.data[1, :, 0]
+                cofactor_data[1, :, 0] = -A.data[0, :, 1]
+                cofactor_data[1, :, 1] = A.data[0, :, 0]
+                return self._gradinfo(
+                    cofactor_data,
+                    role=A.role,
+                    node=node,
+                    field_names=A.field_names,
+                    coeffs=None,
+                )
         mat = self._materialize_matrix_value(A, node, "cofactor")
         cof_mat = np.array(
             [
@@ -1824,7 +1843,7 @@ class FormCompiler:
         # ------------------------------------------------------------------
         # case grad(u_trial) . u_k
         if isinstance(a, GradOpInfo) and ((isinstance(b, VecOpInfo) \
-            and (b.role in {"function","test"} )) and a.role in {"trial", "test", "function"}
+            and (b.role in {"function","test","vector"} )) and a.role in {"trial", "test", "function"}
             ):
 
             return a.dot_vec(b)  # ∇u_trial · u_k
@@ -1931,7 +1950,28 @@ class FormCompiler:
             if a.role == "trial" and b.role == "test":
                 return b.inner(a)
             elif a.role == "function" and b.role in {"trial", "test", "mixed", "identity", "function"}:
-                return a.inner(b)
+                result = a.inner(b)
+                if b.role in {"trial", "test"}:
+                    role = b.role
+                    if result.ndim ==1:
+                        # expand to (1, n) 
+                        result = result[np.newaxis, :]
+                        return self._vecinfo(result, role=role, node=n, field_names=b.field_names)
+                    else:
+                        return self._vecinfo(result, role=role, node=n, field_names=b.field_names)
+                return result
+            elif a.role in {"trial", "test"} and b.role in {"function", "identity"}:
+                result = a.inner(b)
+                if a.role in {"trial", "test"}:
+                    role = a.role
+                    if result.ndim ==1:
+                        # expand to (1, n)
+                        result = result[np.newaxis, :]
+                        return self._vecinfo(result, role=role, node=n, field_names=a.field_names)
+                    else:
+                        return self._vecinfo(result, role=role, node=n, field_names=a.field_names)
+                return result
+            
             elif a.role in {"mixed"} and b.role in {"function", "identity"}:
                 return a.inner(b)
             raise ValueError(f"Grad LHS expects test vs trial; got {a.role} vs {b.role}."
