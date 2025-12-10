@@ -1091,7 +1091,8 @@ def inner_grad_basis_grad_const(grad_basis, grad_const, dtype):
     """
     if DEBUG: print("inner_grad_basis_grad_const")
     k, n, d = grad_basis.shape
-    A = np.ascontiguousarray(grad_basis).transpose(1, 0, 2).reshape(n, k * d)
+    # Make contiguous *after* transpose so reshape is legal for numba
+    A = np.ascontiguousarray(grad_basis.transpose(1, 0, 2)).reshape(n, k * d)
     b = np.ascontiguousarray(grad_const).reshape(k * d)
     return A @ b
 
