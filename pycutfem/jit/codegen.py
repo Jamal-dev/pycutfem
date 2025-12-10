@@ -1288,25 +1288,44 @@ class NumbaCodeGen:
 
             elif isinstance(op, Cofactor):
                 a = stack.pop()
-                if a.shape != (2, 2) or a.role not in ("value", "const"):
-                    raise NotImplementedError(
-                        "Cofactor expects a 2x2 numeric tensor (role 'value' or 'const')."
+                if a.role in ("trial", "test") and len(a.shape) == 3 and a.shape[0] == a.shape[-1] == 2:
+                    res_var = new_var(f"cof_basis_{a.role}")
+                    body_lines += [f"# Cofactor of a symbolic tensor -> tensor basis of shape (2, n, 2) ! only valid for 2d",
+                                   f"a00 = {a.var_name}[0, :, 0]",
+                                   f"a01 = {a.var_name}[0, :, 1]",
+                                   f"a10 = {a.var_name}[1, :, 0]",
+                                   f"a11 = {a.var_name}[1, :, 1]",
+                                   f"{res_var} = np.zeros_like({a.var_name})",
+                                   f"{res_var}[0, :, 0] = a11",
+                                   f"{res_var}[0, :, 1] = -a10",
+                                   f"{res_var}[1, :, 0] = -a01",
+                                   f"{res_var}[1, :, 1] = a00",]
+                    stack.append(
+                        a._replace(
+                            var_name=res_var,
+                            shape=(2, a.shape[1], 2),
+                        )
                     )
-                res_var = new_var("cof2")
-                body_lines += [
-                    f"a00 = {a.var_name}[0, 0]",
-                    f"a01 = {a.var_name}[0, 1]",
-                    f"a10 = {a.var_name}[1, 0]",
-                    f"a11 = {a.var_name}[1, 1]",
-                    f"{res_var} = np.array([[a11, -a10], [-a01, a00]], dtype={self.dtype})",
-                ]
-                stack.append(
-                    a._replace(
-                        var_name=res_var,
-                        role=a.role,
-                        shape=(2, 2),
+                else:
+                    if a.shape != (2, 2) or a.role not in ("value", "const"):
+                        raise NotImplementedError(
+                            "Cofactor expects a 2x2 numeric tensor (role 'value' or 'const')."
+                        )
+                    res_var = new_var("cof2")
+                    body_lines += [
+                        f"a00 = {a.var_name}[0, 0]",
+                        f"a01 = {a.var_name}[0, 1]",
+                        f"a10 = {a.var_name}[1, 0]",
+                        f"a11 = {a.var_name}[1, 1]",
+                        f"{res_var} = np.array([[a11, -a10], [-a01, a00]], dtype={self.dtype})",
+                    ]
+                    stack.append(
+                        a._replace(
+                            var_name=res_var,
+                            role=a.role,
+                            shape=(2, 2),
+                        )
                     )
-                )
 
             elif isinstance(op, Inverse):
                 a = stack.pop()
@@ -2624,6 +2643,7 @@ class NumbaCodeGen:
                  # ------------ PRODUCT ---------------
                  # -------------------------------------
                  if op.op_symbol == '*':
+                    print(f"[*] shapes: ({a.shape}, {b.shape}) roles: ({a.role}, {b.role})")
                     body_lines.append(f"# Product: {a.role} * {b.role}")
                     # -----------------------------------------------------------------
                     # 0. scalar:   scalar   *  scalar/np.ndarray    →  scalar/np.ndarray 
@@ -2690,7 +2710,17 @@ class NumbaCodeGen:
                           not a.is_hessian and not b.is_hessian and
                         ((a.role, b.role) == ("test", "trial") or
                         (a.role, b.role) == ("trial", "test"))):
-                        n_locs = a.shape[1]
+                        if len(a.shape) == 2 and len(b.shape) == 2:
+                            n_locs = a.shape[1]
+                        elif len(a.shape) == 1 and len(b.shape) == 1:
+                            n_locs = a.shape[0]
+                        elif len(a.shape) == 2 and len(b.shape) == 1 and a.shape[1] == b.shape[0]:
+                            n_locs = a.shape[1]
+                        elif len(b.shape) == 2 and len(a.shape) == 1 and b.shape[1] == a.shape[0]:
+                            n_locs = b.shape[1]
+                        else:
+                            raise NotImplementedError(f"Product not implemented for {a.role}/{b.role} shapes "
+                                                      f"{a.shape}, {b.shape}")
                         body_lines.append("# Product: scalar Test × scalar Trial → mixed (1,n,n)")
 
                         # orient rows = test , columns = trial
@@ -2706,6 +2736,7 @@ class NumbaCodeGen:
                                             shape=(1, n_locs, n_locs), is_vector=False,
                                             field_names=field_names, parent_name=parent_name, side=side,
                                             field_sides=field_sides))
+             
                     # -----------------------------------------------------------------
                     # 2. LHS block:   scalar trial/test  *  vector   →  vector trial/test
                     # -----------------------------------------------------------------
@@ -2889,6 +2920,23 @@ class NumbaCodeGen:
                         field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=a, strict=False)
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=(b.shape[0], -1, b.shape[1]),
+                                            is_vector =False,
+                                            is_gradient=True, is_hessian=False,
+                                            field_names=field_names, parent_name=parent_name, side=side,
+                                            field_sides=field_sides))
+                    elif (a.role in {"const", "value"} and b.role in {"const", "value"} and b.is_gradient
+                          and not a.is_vector and not a.is_gradient and not a.is_hessian
+                           and (len(a.shape) == 1 )
+                          and b.shape == (2, 2)):
+                        # scale up to matrix
+                        role = "value"
+                        body_lines.append("# rhs: pk * Identity → ")
+                        body_lines.append(
+                            f"{res_var} = {a.var_name} * {b.var_name}"
+                        )
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=a, strict=False)
+                        stack.append(StackItem(var_name=res_var, role=role,
+                                            shape=(b.shape[0], b.shape[1]),
                                             is_vector =False,
                                             is_gradient=True, is_hessian=False,
                                             field_names=field_names, parent_name=parent_name, side=side,

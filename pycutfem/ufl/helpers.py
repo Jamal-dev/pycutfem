@@ -693,6 +693,11 @@ class VecOpInfo(BaseOpInfo):
                     data = np.asarray([self.data[0,:] * comp for comp in v_vals])
                     meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
                     return VecOpInfo(data, role=self.role, **self.update_meta(meta))
+                elif self.shape[0] == 1 and self.shape[1] >1 and v_vals.shape[0] == 1:
+                    # Special case: single component function
+                    data = v_vals[0] * self.data
+                    meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
+                    return VecOpInfo(data, role=self.role, **self.update_meta(meta))
                 else:
                     raise NotImplementedError(self._error_msg(other, "VecOpInfo.__mul__"))
             elif self.role in {"function", "vector"} and other.role in {"trial","test"}:
@@ -701,6 +706,11 @@ class VecOpInfo(BaseOpInfo):
                 if other.shape[0] == 1 and other.shape[1] >1 and u_vals.shape[0] > 1:
                     # Special case: single component trial/test function
                     data = np.asarray([other.data[0,:] * comp for comp in u_vals])
+                    meta = _resolve_meta(self.meta(), other.meta(), prefer='b')
+                    return VecOpInfo(data, role=other.role, **self.update_meta(meta))
+                elif other.shape[0] == 1 and other.shape[1] >1 and u_vals.shape[0] == 1:
+                    # Special case: single component function
+                    data = u_vals[0] * other.data
                     meta = _resolve_meta(self.meta(), other.meta(), prefer='b')
                     return VecOpInfo(data, role=other.role, **self.update_meta(meta))
                 else:
@@ -882,6 +892,20 @@ class VecOpInfo(BaseOpInfo):
                 res = self.data[0,:,:] + other_data
                 return VecOpInfo(res[np.newaxis,:,:], role=self.role, **self.update_meta(self.meta()))
 
+        if self.role in {"test", "test_n"} and other_role in {"test", "test_n"}:
+            # a: (1,n) or (n,) and b: (1,n) or (n,)
+            is_a_row_vec = self.data.ndim ==2 and self.data.shape[0]==1
+            is_b_row_vec = other_data.ndim ==2 and other_data.shape[0]==1
+            if is_a_row_vec and is_b_row_vec:
+                data = self.data + other_data
+            elif is_a_row_vec and not is_b_row_vec:
+                data = self.data[0,:] + other_data
+            elif not is_a_row_vec and is_b_row_vec:
+                data = self.data + other_data[0,:]
+            else:
+                data = self.data + other_data
+            meta = _resolve_meta(self.meta(), other_meta, prefer='a')
+            return VecOpInfo(data, role=self.role, **self.update_meta(meta))
         if self.data.shape != other_data.shape:
             raise ValueError(f"VecOpInfo shapes mismatch in addition: {self.data.shape} vs {other_data.shape}"
                              f" Roles: {self.role}, other={getattr(other, 'role', None)}."

@@ -55,6 +55,7 @@ from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.ufl.measures import dx, dS
 from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.solvers.nonlinear_solver import NewtonParameters, NewtonSolver, TimeStepperParameters
+from pycutfem.utils.gmsh_loader import mesh_from_gmsh
 
 # ----------------------------------------------------------------------------- 
 # Geometry helpers (Turek–Hron benchmark)
@@ -177,6 +178,112 @@ def retag_boundaries(mesh: Mesh, tol: float = 1.0e-8) -> None:
             "beam_outer": on_beam_outer,
         }
     )
+
+
+def tag_nodes_from_edges(mesh: Mesh) -> Dict[str, int]:
+    """
+    Populate Node.tag with a comma-separated list of incident boundary tags.
+    Returns a count per tag for quick diagnostics.
+    """
+    tag_to_nodes: Dict[str, set[int]] = {}
+    for edge in mesh.edges_list:
+        if edge.right is not None:
+            continue
+        tag = getattr(edge, "tag", "") or ""
+        if not tag:
+            continue
+        nodes = edge.all_nodes if edge.all_nodes else edge.nodes
+        tag_to_nodes.setdefault(tag, set()).update(int(n) for n in nodes)
+
+    for nid in range(len(mesh.nodes_list)):
+        mesh.nodes_list[nid].tag = ""
+    for tag, nodes in tag_to_nodes.items():
+        for nid in nodes:
+            node = mesh.nodes_list[int(nid)]
+            pieces = set(node.tag.split(",")) if node.tag else set()
+            pieces.add(tag)
+            node.tag = ",".join(sorted(p for p in pieces if p))
+
+    return {tag: len(nodes) for tag, nodes in tag_to_nodes.items()}
+
+
+def classify_fluid_solid(mesh: Mesh, tol: float = 1.0e-9) -> Tuple[BitSet, BitSet]:
+    """
+    Ensure the mesh has fluid/solid element bitsets. If tags already exist, reuse them;
+    otherwise classify geometrically (beam box minus the circular hole is 'solid').
+    """
+    cached = getattr(mesh, "_elem_bitsets", {})
+    if "fluid" in cached and "solid" in cached:
+        return mesh.element_bitset("fluid"), mesh.element_bitset("solid")
+
+    beam_x0 = CENTER[0] + RADIUS
+    beam_x1 = beam_x0 + BEAM_LENGTH
+    beam_y0 = CENTER[1] - 0.5 * BEAM_HEIGHT
+    beam_y1 = CENTER[1] + 0.5 * BEAM_HEIGHT
+    rad_tol = RADIUS + tol
+
+    coords = mesh.nodes_x_y_pos[mesh.corner_connectivity].mean(axis=1).T
+    cx, cy = coords[0], coords[1]
+    inside_mask = (
+        (cx >= beam_x0 - tol)
+        & (cx <= beam_x1 + tol)
+        & (cy >= beam_y0 - tol)
+        & (cy <= beam_y1 + tol)
+        & (np.hypot(cx - CENTER[0], cy - CENTER[1]) >= rad_tol)
+    )
+    tags = np.where(inside_mask, "solid", "fluid")
+    for el, tag in zip(mesh.elements_list, tags):
+        el.tag = str(tag)
+    mesh._elem_bitsets = {
+        "fluid": BitSet(tags == "fluid"),
+        "solid": BitSet(tags == "solid"),
+    }
+    return mesh._elem_bitsets["fluid"], mesh._elem_bitsets["solid"]
+
+
+def ensure_boundary_tags(mesh: Mesh, tol: float = 1.0e-6) -> Dict[str, Tuple[int, int]]:
+    """
+    Make sure standard boundary tags exist; if outlet (or inlet) is empty,
+    fall back to geometric retagging. Returns counts before/after.
+    """
+    tags = ("inlet", "outlet", "walls", "cylinder", "beam_outer", "beam_root")
+    counts_before = {t: mesh.edge_bitset(t).cardinality() for t in tags}
+    need_retag = counts_before.get("outlet", 0) == 0 or counts_before.get("inlet", 0) == 0
+    if need_retag:
+        retag_boundaries(mesh, tol=tol)
+    counts_after = {t: mesh.edge_bitset(t).cardinality() for t in tags}
+
+    # If outlet is still empty, force-tag boundary edges near x=L.
+    if counts_after.get("outlet", 0) == 0:
+        for edge in mesh.edges_list:
+            if edge.right is not None:
+                continue
+            mpx, mpy = mesh.nodes_x_y_pos[list(edge.nodes)].mean(axis=0)
+            if abs(mpx - L) < max(tol, 1e-6):
+                edge.tag = "outlet"
+        mask = np.fromiter((e.tag == "outlet" for e in mesh.edges_list), bool)
+        if not hasattr(mesh, "_edge_bitsets"):
+            mesh._edge_bitsets = {}
+        mesh._edge_bitsets["outlet"] = BitSet(mask)
+        counts_after["outlet"] = int(mask.sum())
+    return {t: (counts_before.get(t, 0), counts_after.get(t, 0)) for t in tags}
+
+
+def boundary_nodes_by_tag(mesh: Mesh) -> Dict[str, set[int]]:
+    """
+    Collect boundary nodes for each edge tag, using all_nodes to capture
+    higher-order edge nodes.
+    """
+    out: Dict[str, set[int]] = {}
+    for e in mesh.edges_list:
+        if e.right is not None:
+            continue
+        tag = getattr(e, "tag", "") or ""
+        if not tag:
+            continue
+        nodes = e.all_nodes if e.all_nodes else e.nodes
+        out.setdefault(tag, set()).update(int(n) for n in nodes)
+    return out
 
 
 def symgrad(u):
@@ -592,6 +699,21 @@ class Structure_Terms:
         trE = trace(E)
         return lambda_s * trE * I + 2.0 * mu_s * E
     @staticmethod
+    def get_Cauchy_stress(F, mu_s, lambda_s):
+        r"""
+        Cauchy stress (STVK):
+
+        E = 1/2 (F^T F - I),
+
+        S = λ tr(E) I + 2 μ E,
+
+        σ = 1/J F S F^T.
+        """
+        J = det(F)
+        E = Structure_Terms.get_E(F)
+        S = Structure_Terms.get_S(E, mu_s, lambda_s)
+        return (1.0 / J) * dot(dot(F, S), F.T)
+    @staticmethod
     def get_F_LinU(grad_dd):
         r"""
         Linearization of F w.r.t. displacement d.
@@ -672,7 +794,7 @@ def build_jac(
     du, dd, dp,       # Trial functions (δv, δd, δp)
     test_v, test_w, test_q,          # Test functions (ψ_v, ψ_d, ψ_p)
     timestep: Constant,
-    theta_const: Constant,
+    theta: Constant,
     rho_f: Constant,
     mu_f: Constant,
     rho_s: Constant,
@@ -709,7 +831,7 @@ def build_jac(
     # These represent the variation of geometric terms w.r.t displacement trial function (dd)
     grad_dd = grad(dd)
     J_F_inv_T_LinU = cof(grad_dd)  # δ(J F^{-T}) # trial of displacement
-    J_LinU = ALE_Helpers.get_J_LinU(Finv, grad_dd) # trial of displacement
+    J_LinU = ALE_Helpers.get_J_LinU(F, grad_dd) # trial of displacement
     Finv_LinU = ALE_Helpers.get_F_inv_LinU(Finv, grad_dd) # trial of displacement
     cof_F_LinU = ALE_Helpers.get_cof_F_LinU(F, Finv, grad_dd) # δ(J F^{-T}) # trial of displacement
 
@@ -768,11 +890,11 @@ def build_jac(
         mu_f,
     )
     jac_mass_du = dot(acc_term_jac, test_v) 
-    jac_convection_du = timestep * theta_const * dot(convection_fluid_v, test_v)
-    jac_convection_du += dot(convection_fluid_d, test_v)
+    jac_convection_du = timestep * theta * dot(convection_fluid_v, test_v)
+    jac_convection_du += -dot(convection_fluid_d, test_v)
     jac_convection_du += dot(convection_fluid_u_old, test_v)
     jac_diffusion_du = timestep * inner(stress_fluid_term_1, test_grad_v)
-    jac_diffusion_du += timestep * theta_const * inner(stress_fluid_term_2, test_grad_v)
+    jac_diffusion_du += timestep * theta * inner(stress_fluid_term_2, test_grad_v)
     # -------- Biharmonic equation ----------
     jac_biharmonic_dd = (-alpha_u/(J*J) * J_LinU * inner(grad(dk), grad(test_w))
                          + alpha_u/J * inner(grad(dd), grad(test_w)))
@@ -800,7 +922,7 @@ def build_jac(
         J_F_inv_T_LinU,
     )
     neuman_flux = dot(neuman_term, n)
-    out_flow_jac = - timestep * theta_const * dot(neuman_flux, test_v) * dS_outlet
+    out_flow_jac = - timestep * theta * dot(neuman_flux, test_v) * dS_outlet
 
     #-----------------------------------------------------------------------
     #---------------- Solid terms ---------------------------------------
@@ -809,9 +931,9 @@ def build_jac(
         F, grad_dd, mu_s, lambda_s
     )
     jac_solid = ( rho_s * dot(du, test_v)
-                    + timestep * theta_const *inner(solid_stress_LinU, grad(test_v))
+                    + timestep * theta *inner(solid_stress_LinU, grad(test_v))
                     + rho_s * dot(dd, test_w)
-                    - theta_const * theta_const * dot(du, test_w)
+                    - timestep * theta  * dot(du, test_w)
                     + dp * test_q
 
     ) * dx_s
@@ -819,17 +941,15 @@ def build_jac(
 
     # return volume_terms_fluid + out_flow_jac + jac_solid
     return volume_terms_fluid  + jac_solid
-            
 
-def build_forms(
+def build_residual(
     *,
     uk, u_prev,       # Fluid Velocity (current, old)
     dk, d_prev,       # Displacement (current, old)
     pk, p_prev,       # Pressure (current, old)
-    du, dd, dp,       # Trial functions (δv, δd, δp)
-    v, w, q,          # Test functions (ψ_v, ψ_d, ψ_p)
-    dt_const: Constant,
-    theta_const: Constant,
+    v_test, w_test, q_test,          # Test functions (ψ_v, ψ_d, ψ_p)
+    dt: Constant,
+    theta: Constant,
     rho_f: Constant,
     mu_f: Constant,
     rho_s: Constant,
@@ -839,261 +959,98 @@ def build_forms(
     stab_eps: Constant,
     fluid_bs,
     solid_bs,
+    outlet_bs,
     quad_order: int,
 ):
     # --- Integration Measures ---
     dx_f = dx(defined_on=fluid_bs, metadata={"q": quad_order})
     dx_s = dx(defined_on=solid_bs, metadata={"q": quad_order})
-    
-    # --- Geometric State (Current Newton Iteration) ---
+    dS_outlet = dS(defined_on=outlet_bs, metadata={"q": quad_order})
     I = Identity(2)
-    F = ALE_Helpers.get_F(grad(dk))
-    J = ALE_Helpers.get_J(F)
+    n =  FacetNormal()
+    grad_v = grad(uk)
+    grad_d = grad(dk)
+    grad_v_old = grad(u_prev)
+    grad_d_old = grad(d_prev)
+    F = ALE_Helpers.get_F(grad_d)
     Finv = ALE_Helpers.get_F_inv(F)
-    cof_F = ALE_Helpers.get_cof_F(F)  # J * Finv.T
-
-    # --- Geometric State (Previous Timestep) ---
-    F_old = ALE_Helpers.get_F(grad(d_prev))
-    J_old = ALE_Helpers.get_J(F_old)
-    
-    # --- Geometric Linearization (Shape Derivatives) ---
-    # These represent the variation of geometric terms w.r.t displacement trial function (dd)
-    grad_dd = grad(dd)
-    J_LinU = ALE_Helpers.get_J_LinU(J, Finv, grad_dd)
-    Finv_LinU = ALE_Helpers.get_F_inv_LinU(Finv, grad_dd)
-    cof_F_LinU = ALE_Helpers.get_cof_F_LinU(grad_dd) # δ(J F^{-T})
-
-    # ========================================================================
-    # 1. FLUID RESIDUAL (ALE Navier-Stokes)
-    # ========================================================================
-    
-    # --- Velocity & Gradients ---
-    grad_uk = grad(uk)
-    grad_u_prev = grad(u_prev)
-    
-    # --- 1a. Mass / Acceleration Term ---
-    # C++: rho * (J + J_old)/2 * (u - u_old)/dt
-    acc_term = (rho_f / dt_const) * 0.5 * (J + J_old) * (uk - u_prev)
-    
-    # --- 1b. ALE Convection Term ---
-    # Fluid velocity v, Grid velocity w_g ~ (d - d_old)/dt
-    # Term: ρ J ((v - w_g) · F^{-T}∇) v  => ρ J (∇v F^{-1}) (v - w_g)
-    vel_mesh = (dk - d_prev) / dt_const
-    diff_vel = uk - vel_mesh
-    # Convection: rho * J * (grad(u) * Finv) * (u - u_mesh)
-    # Note: dot(grad(u), Finv) is (∇u F^{-1})
-    conv_term = rho_f * J * dot(dot(grad_uk, Finv), diff_vel)
-    
-    # Previous timestep convection (for Theta scheme)
-    # Note: Using current geometry F/J for old velocity is a common approximation, 
-    # but step-fsi.cc uses old geometry for old convection if theta != 1. 
-    # Let's stick to the structure implied by C++ 'old_timestep_convection_fluid'.
+    J = ALE_Helpers.get_J(F)
+    F_old = ALE_Helpers.get_F(grad_d_old)
     Finv_old = ALE_Helpers.get_F_inv(F_old)
-    # Assuming old mesh velocity was stored or approximated. 
-    # step-fsi.cc approximates old convection using old J, old F, old u.
-    conv_term_old = rho_f * J_old * dot(dot(grad_u_prev, Finv_old), u_prev) # Simplifying assumption: w_g_old ~ 0 or small
+    J_old = ALE_Helpers.get_J(F_old)
+    pI = pk * Identity(2)
+    # acceleration term
+    acc_term = rho_f * 0.5 * (J + J_old) * dot((uk - u_prev), v_test)
+    # convection term
+    convection_fluid = rho_f * J * dot(dot(grad_v, Finv), uk)
+    convection_fluid_with_u = rho_f * J * dot(dot(grad_v, Finv), dk)
+    convection_fluid_with_u_old = rho_f * J * dot(dot(grad_v, Finv), d_prev)
+    old_convection_fluid = rho_f * J_old * dot(dot(grad_v_old, Finv_old), u_prev)
+    convec_term = (
+        dt * theta * dot(convection_fluid, v_test)
+        + dt * (1.0-theta) * dot(old_convection_fluid, v_test)
+        - dot(convection_fluid_with_u - convection_fluid_with_u_old, v_test)
+    ) 
+    # incompressibility term
+    fluid_pressure = -(J * dot(pI, Finv.T))
+    pressure_term = dt * inner(fluid_pressure, grad(v_test))
+    # stress terms
+    sigma_ALE = NSE_ALE.get_stress_fluid_except_pressure_ALE(mu_f, grad_v, Finv)
+    sigma_ALE_old = NSE_ALE.get_stress_fluid_except_pressure_ALE(mu_f, grad_v_old, Finv_old)
+    stress_fluid_viscous = J * dot(sigma_ALE, Finv.T)
+    stress_fluid_viscous_old = J_old * dot(sigma_ALE_old, Finv_old.T)
+    stress_term = dt * theta * inner(stress_fluid_viscous, grad(v_test))
+    stress_term += dt * (1.0-theta) * inner(stress_fluid_viscous_old, grad(v_test))
+    # biharmonic stabilization
+    biharmonic_term = (
+        alpha_u / J * inner(grad(dk), grad(w_test))
+    )
+    # incompressibility
+    incompressibility_fluid = NSE_ALE.get_Incompressibility_ALE(uk, F)
+    incompressibility_term = incompressibility_fluid * q_test
 
-    # --- 1c. Stress Term (Viscous + Pressure) ---
-    # σ_visc = μ (∇u F^{-1} + F^{-T} ∇u^T)
-    sigma_visc = NSE_ALE.get_stress_fluid_ALE(mu_f, 0.0, grad_uk, Finv) # p=0 here
-    sigma_visc_old = NSE_ALE.get_stress_fluid_ALE(mu_f, 0.0, grad_u_prev, Finv_old)
-    
-    # Piola-Kirchhoff I (excluding pressure for now) = J * σ * F^{-T}
-    # We integrate (P : ∇ψ)
-    P_visc = J * dot(sigma_visc, Finv.T)
-    P_visc_old = J_old * dot(sigma_visc_old, Finv_old.T)
-    
-    # Pressure part: - p * J * F^{-T}
-    P_pres = -pk * cof_F
-
-    # --- 1d. Incompressibility ---
-    # J ∇·u = cof(F) : ∇u
-    continuity = inner(cof_F, grad_uk)
-
-    # --- Fluid Residual Assembly ---
-    # R_mom = (Acc + Convection)·v + (P_visc + P_pres) : ∇v
-    # Time stepping: θ * current + (1-θ) * old
-    
-    res_f_mom = (
-        dot(acc_term, v) 
-        + theta_const * (dot(conv_term, v) + inner(P_visc, grad(v)))
-        + (1.0 - theta_const) * (dot(conv_term_old, v) + inner(P_visc_old, grad(v)))
-        + inner(P_pres, grad(v)) # Pressure is implicit
+    residual_fluid = (
+        acc_term
+        + convec_term
+        + pressure_term
+        + stress_term
+        + biharmonic_term
+        + incompressibility_term
     ) * dx_f
-    
-    res_f_cont = (continuity * q) * dx_f
-    
-    # Stabilization (optional, usually 0 in step-fsi but good for iterative solvers)
-    # res_f_stab = stab_eps * pk * q * dx_f # Can add if needed
+    # do-nothing BC at outlet
+    sigma_ALE_tilde = mu_f * dot(Finv.T, grad_v.T) 
+    sigma_ALE_tilde_old = mu_f * dot(Finv_old.T, grad_v_old.T)
+    stress_fluid_transpose = J * dot(sigma_ALE_tilde, Finv.T)
+    stress_fluid_transpose_old = J_old * dot(sigma_ALE_tilde_old, Finv_old.T)
+    neuman_flux = dot(stress_fluid_transpose, n)
+    neuman_flux_old = dot(stress_fluid_transpose_old, n)
+    out_flow = (- dt * theta * dot(neuman_flux, v_test) 
+                - dt * (1.0-theta) * dot(neuman_flux_old, v_test)
+    ) 
+    residual_outlet = out_flow * dS_outlet
 
-    # ========================================================================
-    # 2. SOLID RESIDUAL (St. Venant-Kirchhoff)
-    # ========================================================================
-    
-    # --- Kinematics ---
-    # Green-Lagrange Strain
-    E = Structure_Terms.get_E(F)
-    E_old = Structure_Terms.get_E(F_old)
-    
-    # 2nd Piola-Kirchhoff Stress
-    S = Structure_Terms.get_S(E, mu_s, lambda_s)
-    S_old = Structure_Terms.get_S(E_old, mu_s, lambda_s)
-    
-    # 1st Piola-Kirchhoff P = F * S
-    P_s = dot(F, S)
-    P_s_old = dot(F_old, S_old)
-    
-    # --- Solid Residual ---
-    # Mass: ρ_s/dt * (u - u_old) · v  (Velocity is state variable in monolithic FSI)
-    # Momentum: P : ∇v
-    # Kinematic link: ρ_s * ( (d - d_old)/dt - (θ u + (1-θ) u_old) ) · w
-    
-    res_s_mom = (
-        (rho_s / dt_const) * dot(uk - u_prev, v)
-        + theta_const * inner(P_s, grad(v))
-        + (1.0 - theta_const) * inner(P_s_old, grad(v))
-        - rho_s * theta_const * dot(Constant((0.0, 0.0)), v) # Body force if any
+    #-----------------------------------------------------------------------
+    #---------------- Solid terms ---------------------------------------
+    #-----------------------------------------------------------------------
+    solid_stress = Structure_Terms.get_Cauchy_stress(F, mu_s, lambda_s)
+    solid_stress_old = Structure_Terms.get_Cauchy_stress(F_old, mu_s, lambda_s)
+    solid_stress_transfomed = J * dot(solid_stress, Finv.T)
+    solid_stress_transfomed_old = J_old * dot(solid_stress_old, Finv_old.T)
+    residual_solid = (
+        rho_s * dot(uk - u_prev, v_test)
+        + dt * theta * inner(solid_stress_transfomed, grad(v_test))
+        + dt * (1.0-theta) * inner(solid_stress_transfomed_old, grad(v_test))
+        + rho_s * dot(dk - d_prev, w_test)
+        - rho_s * dt * theta * dot(uk, w_test)
+        - rho_s * dt * (1.0-theta) * dot(u_prev, w_test)
+        + pk * q_test
     ) * dx_s
-    
-    vel_theta = theta_const * uk + (1.0 - theta_const) * u_prev
-    res_s_kin = rho_s * dot((dk - d_prev)/dt_const - vel_theta, w) * dx_s
 
-    # ========================================================================
-    # 3. MESH MOTION RESIDUAL (Nonlinear Harmonic)
-    # ========================================================================
-    # - div( (alpha_u / J) * grad(d) ) = 0
-    # Weak form: (alpha_u / J) * ∇d : ∇w
-    # Jacobian factor 1/J stiffens small elements to prevent inversion
     
-    # Note: step-fsi.cc uses (alpha_u * J^{-1} * ∇u : ∇φ)
-    # Here u is displacement d.
-    res_m = (alpha_u / J) * inner(grad(dk), grad(w)) * dx_f
+    # return residual_fluid + residual_outlet + residual_solid
+    return residual_fluid  + residual_solid
+            
 
-
-    # ========================================================================
-    # 4. JACOBIAN ASSEMBLY (Manual Linearization)
-    # ========================================================================
-    
-    # --- FLUID BLOCKS ---
-    
-    # 4a. Mass Matrix Linearization
-    # δ(Acc) = ρ/2dt * [ δJ(u - u_old) + (J + J_old)δu ]
-    # J_LinU is δJ w.r.t d. du is δu.
-    jac_mass_du = (rho_f / dt_const) * 0.5 * (J + J_old) * dot(du, v)
-    jac_mass_dd = (rho_f / dt_const) * 0.5 * dot(J_LinU * (uk - u_prev), v)
-    
-    # 4b. Convection Linearization
-    # Uses helper: δ(ρ J ∇u F^{-1} (u - w))
-    # We split this into parts w.r.t du and dd
-    
-    # Part 1: Linearization w.r.t Velocity (du)
-    # δ_v (Conv) = ρ J [ ∇δu F^{-1} (u-w) + ∇u F^{-1} δu ]
-    conv_du = NSE_ALE.get_Convection_LinAll_short(
-        J, 0.0, Finv, 0.0, diff_vel, grad_uk, du, grad(du), rho_f
-    ) # Passing 0.0 for geometric linearizations here to isolate velocity part
-    
-    # Part 2: Linearization w.r.t Geometry (dd)
-    # Includes δJ, δF^{-1}, and δw = δd/dt
-    # Term A: Geometric changes to transport: ρ [δJ ∇u F^{-1} (u-w) + J ∇u δF^{-1} (u-w)]
-    conv_dd_geom = NSE_ALE.get_Convection_LinAll_short(
-        0.0, J_LinU, Finv, Finv_LinU, diff_vel, grad_uk, Constant((0,0)), Constant(((0,0),(0,0))), rho_f
-    )
-    # Term B: Change in grid velocity w: - ρ J ∇u F^{-1} (δd/dt)
-    grad_u_Finv = dot(grad_uk, Finv)
-    conv_dd_grid = -rho_f * J * dot(grad_u_Finv, dd / dt_const)
-    
-    conv_dd = conv_dd_geom + conv_dd_grid
-
-    # 4c. Stress Linearization
-    # P_visc = J σ F^{-T}. 
-    # δP = δJ σ F^{-T} + J δσ F^{-T} + J σ δF^{-T}
-    
-    # Velocity part (du): J * δσ(du) * F^{-T}
-    # Helper 'get_stress...2nd_term' handles J * (δσ_v + δσ_u) * F^{-T} + σ * δ(J F^{-T})
-    # We call it twice: once for du (where geometric variations are 0) and once for dd.
-    
-    # W.r.t du:
-    jac_stress_du = NSE_ALE.get_stress_fluid_ALE_2nd_term_LinAll_short(
-        0.0, sigma_visc, grad_uk, grad(du), Finv, 0.0, J, mu_f
-    )
-    # W.r.t dd:
-    jac_stress_dd = NSE_ALE.get_stress_fluid_ALE_2nd_term_LinAll_short(
-        cof_F_LinU, sigma_visc, grad_uk, Constant(((0,0),(0,0))), Finv, Finv_LinU, J, mu_f
-    )
-    
-    # 4d. Pressure Linearization
-    # P_pres = - p * cof(F)
-    # W.r.t dp: - δp * cof(F)
-    jac_pres_dp = -dp * cof_F
-    # W.r.t dd: - p * δ(cof(F))
-    jac_pres_dd = -pk * cof_F_LinU
-    
-    # 4e. Continuity Linearization
-    # δ(cof(F) : ∇u) = cof(F) : ∇δu + δcof(F) : ∇u
-    jac_cont_du = inner(cof_F, grad(du))
-    jac_cont_dd = inner(cof_F_LinU, grad_uk)
-
-    # --- SOLID BLOCKS ---
-    
-    # 4f. Solid Momentum
-    # P = F S. δP = δF S + F δS.
-    # δF = ∇δd. δS from STVK helper.
-    delta_S, delta_E = Structure_Terms.get_S_LinU(F, grad_dd, mu_s, lambda_s)
-    delta_P_s = dot(grad_dd, S) + dot(F, delta_S)
-    
-    jac_s_du = (rho_s / dt_const) * dot(du, v)
-    jac_s_dd = theta_const * inner(delta_P_s, grad(v))
-    
-    # 4g. Solid Kinematic Link
-    # ρ ( δd/dt - θ δu ) · w
-    jac_kin_dd = rho_s * dot(dd / dt_const, w)
-    jac_kin_du = -rho_s * theta_const * dot(du, w)
-
-    # --- MESH BLOCKS ---
-    
-    # 4h. Mesh Motion Linearization
-    # R_m = α J^{-1} ∇d : ∇w
-    # δR_m = α [ δ(J^{-1}) ∇d + J^{-1} ∇δd ] : ∇w
-    # δ(J^{-1}) = - J^{-2} δJ = - J^{-2} (J tr(F^{-1} ∇δd)) = - J^{-1} (F^{-T} : ∇δd)
-    term_m_1 = (alpha_u / J) * inner(grad_dd, grad(w))
-    term_m_2 = - (alpha_u / J) * inner(F_inv.T, grad_dd) * inner(grad(dk), grad(w))
-    jac_m_dd = term_m_1 + term_m_2
-
-
-    # ========================================================================
-    # 5. FINAL FORMS
-    # ========================================================================
-    
-    residual_form = (
-        res_f_mom + res_f_cont # + res_f_stab
-        + res_s_mom + res_s_kin
-        + res_m
-    )
-    
-    # Combine Jacobian blocks
-    # Terms * v
-    jac_v = (
-        # Fluid Momentum
-        jac_mass_du + theta_const*(dot(conv_du, v) + inner(jac_stress_du, grad(v))) # w.r.t u
-        + jac_mass_dd + theta_const*(dot(conv_dd, v) + inner(jac_stress_dd, grad(v))) # w.r.t d
-        + inner(jac_pres_dp + jac_pres_dd, grad(v)) # w.r.t p and d
-    ) * dx_f + (
-        # Solid Momentum
-        jac_s_du + jac_s_dd 
-    ) * dx_s
-    
-    # Terms * q (Continuity)
-    jac_q = (jac_cont_du + jac_cont_dd) * q * dx_f # + stab...
-    
-    # Terms * w (Displacement/Mesh)
-    jac_w = (
-        jac_m_dd * dx_f  # Mesh motion
-        + (jac_kin_dd + jac_kin_du) * dx_s # Solid kinematics
-    )
-    
-    jacobian_form = jac_v + jac_q + jac_w
-
-    return jacobian_form, residual_form
 
 
 def compute_drag_lift(dh: DofHandler, mesh, u: VectorFunction, d: VectorFunction, p: Function, rho: float, mu: float):
@@ -1177,12 +1134,15 @@ def build_bcs(
 # -----------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Deal.II FSI benchmark in pycutfem (ALE, conforming mesh).")
-    ap.add_argument("--mesh", type=Path, default=Path("../fsi/fsi.inp"), help="Path to fsi.inp UCD mesh.")
+    ap.add_argument("--mesh", type=Path, default=Path("examples/meshes/fsi_conforming.msh"), help="Path to mesh (.msh from gmsh or .inp UCD).")
+    ap.add_argument("--mesh-format", choices=("auto", "gmsh", "ucd"), default="auto", help="Override mesh loader; auto picks by file extension.")
     ap.add_argument("--poly-order", type=int, default=2, help="Polynomial order for velocity/displacement (Taylor–Hood).")
     ap.add_argument("--dt", type=float, default=1.0, help="Time step size (default from step-fsi.prm).")
     ap.add_argument("--theta", type=float, default=1.0, help="Theta scheme parameter (1=BE, 0.5=CN).")
     ap.add_argument("--n-steps", type=int, default=3, help="Number of time steps (default small for quick verification).")
     ap.add_argument("--backend", choices=("jit", "python"), default="python", help="Form compiler backend.")
+    ap.add_argument("--boundary-tol", type=float, default=1.0e-6, help="Tolerance for geometric boundary retagging.")
+    ap.add_argument("--assemble-only", action="store_true", help="Assemble residual/Jacobian once and exit (no Newton solve).")
     return ap.parse_args()
 
 
@@ -1192,9 +1152,23 @@ def main() -> None:
     if not mesh_path.exists():
         raise FileNotFoundError(f"Mesh file not found: {mesh_path}")
 
-    mesh, fluid_bs, solid_bs = load_ucd_mesh(mesh_path, poly_order=1)
-    retag_boundaries(mesh)
+    use_gmsh = args.mesh_format == "gmsh" or (args.mesh_format == "auto" and mesh_path.suffix.lower() == ".msh")
+    if use_gmsh:
+        mesh = mesh_from_gmsh(mesh_path, apply_boundary_tags=True)
+        fluid_bs, solid_bs = classify_fluid_solid(mesh)
+    else:
+        mesh, fluid_bs, solid_bs = load_ucd_mesh(mesh_path, poly_order=1)
+        fluid_bs, solid_bs = classify_fluid_solid(mesh)
+
+    counts = ensure_boundary_tags(mesh, tol=args.boundary_tol)
+    node_counts = tag_nodes_from_edges(mesh)
     outlet_bs = mesh.edge_bitset("outlet")
+    if outlet_bs.cardinality() == 0:
+        raise RuntimeError("Outlet boundary is empty after retagging; check mesh geometry.")
+    counts_msg = ", ".join(f"{k}:{v[0]}->{v[1]}" for k, v in counts.items())
+    nodes_msg = ", ".join(f"{k}:{v}" for k, v in node_counts.items())
+    print(f"Boundary edges (before→after): {counts_msg}")
+    print(f"Boundary nodes per tag: {nodes_msg}")
 
     # Quick orientation check
     coords = mesh.nodes_x_y_pos
@@ -1250,6 +1224,30 @@ def main() -> None:
     dropped_p = dh.tag_dofs_from_element_bitset("inactive", "p", solid_bs, strict=True)
     if dropped_p:
         print(f"Dropped {len(dropped_p)} pressure DOFs inside the solid.")
+    
+    res_form = build_residual(
+        uk=uk,
+        u_prev=u_prev,
+        dk=dk,
+        d_prev=d_prev,
+        pk=pk,
+        p_prev=p_prev,
+        v_test=v,   w_test=w, q_test=q,
+        dt=dt_const,
+        theta=theta_const,
+        rho_f=rho_f,
+        mu_f=mu_f,
+        rho_s=rho_s,
+        lambda_s=lambda_s,
+        mu_s=mu_s,
+        alpha_u=alpha_u,
+        stab_eps=stab_eps,
+        fluid_bs=fluid_bs,
+        solid_bs=solid_bs,
+        outlet_bs=outlet_bs,
+        quad_order=quad_order,
+    )
+    # return assemble_form(Equation(None, res_form), dh, backend='python')
 
     jac_form = build_jac(
         uk=uk,
@@ -1265,7 +1263,7 @@ def main() -> None:
         test_w=w,
         test_q=q,
         timestep=dt_const,
-        theta_const=theta_const,
+        theta=theta_const,
         rho_f=rho_f,
         mu_f=mu_f,
         rho_s=rho_s,
@@ -1278,33 +1276,8 @@ def main() -> None:
         outlet_bs=outlet_bs,
         quad_order=quad_order,
     )
-    return assemble_form(Equation(jac_form, None), dh, backend='python')
-    jac_form, res_form = build_forms(
-        uk=uk,
-        u_prev=u_prev,
-        dk=dk,
-        d_prev=d_prev,
-        pk=pk,
-        p_prev=p_prev,
-        du=du,
-        dd=dd,
-        dp=dp,
-        v=v,
-        w=w,
-        q=q,
-        dt_const=dt_const,
-        theta_const=theta_const,
-        rho_f=rho_f,
-        mu_f=mu_f,
-        rho_s=rho_s,
-        lambda_s=lambda_s,
-        mu_s=mu_s,
-        alpha_u=alpha_u,
-        stab_eps=stab_eps,
-        fluid_bs=fluid_bs,
-        solid_bs=solid_bs,
-        quad_order=quad_order,
-    )
+    # return assemble_form(Equation(jac_form, None), dh, backend='python')
+    
 
     bcs, bcs_homog = build_bcs(u_mean=0.2, theta=args.theta)
 
@@ -1313,6 +1286,54 @@ def main() -> None:
     print(f"Total DOFs: {dh.total_dofs}")
     bc_dofs = dh.get_dirichlet_data(bcs)
     print(f"Dirichlet constraints: {len(bc_dofs)} DOFs")
+    bc_dof_set = set(bc_dofs.keys())
+    boundary_nodes = boundary_nodes_by_tag(mesh)
+    bc_fields_by_tag: Dict[str, set[str]] = {}
+    for bc in bcs:
+        if getattr(bc, "method", "") != "dirichlet":
+            continue
+        bc_fields_by_tag.setdefault(bc.domain_tag, set()).add(bc.field)
+
+    coverage_report = []
+    geom_nodes_union: set[int] = set()
+    for tag, fields in bc_fields_by_tag.items():
+        nodes = boundary_nodes.get(tag, set())
+        geom_nodes_union |= nodes
+        for field in fields:
+            node2dof = dh.dof_map.get(field, {})
+            expected = {node2dof[n] for n in nodes if n in node2dof}
+            missing = expected - bc_dof_set
+            coverage_report.append((field, tag, len(expected), len(missing)))
+    print(f"Boundary geometry nodes touched by BCs: {len(geom_nodes_union)}")
+    for field, tag, exp, miss in coverage_report:
+        msg = f"{field}@{tag}: expected {exp}, missing {miss}"
+        if miss:
+            msg += f" (first few missing: {sorted(list(missing))[:5]})"
+        print("  " + msg)
+    # Hard verification: all expected boundary DOFs must be present.
+    expected_all: set[int] = set()
+    for tag, fields in bc_fields_by_tag.items():
+        nodes = boundary_nodes.get(tag, set())
+        for field in fields:
+            node2dof = dh.dof_map.get(field, {})
+            expected_all |= {node2dof[n] for n in nodes if n in node2dof}
+    missing_all = expected_all - bc_dof_set
+    extra_all = bc_dof_set - expected_all
+    if missing_all:
+        raise RuntimeError(f"Dirichlet coverage incomplete: {len(missing_all)} boundary DOFs missing (examples: {sorted(list(missing_all))[:10]}).")
+    if extra_all:
+        print(f"[warn] Dirichlet set has {len(extra_all)} DOFs not on tagged boundaries (examples: {sorted(list(extra_all))[:10]}).")
+    else:
+        print("All boundary DOFs covered by supplied Dirichlet tags.")
+
+    if args.assemble_only:
+        print("Assembling once with backend='{0}' for diagnostics...".format(args.backend))
+        eq_res = Equation(None, res_form)
+        eq_jac = Equation(jac_form, None)
+        assemble_form(eq_res, dof_handler=dh, bcs=bcs, backend=args.backend)
+        assemble_form(eq_jac, dof_handler=dh, bcs=bcs, backend=args.backend)
+        print("Assembly completed; exiting early (--assemble-only).")
+        return
 
     solver = NewtonSolver(
         residual_form=res_form,
