@@ -256,6 +256,7 @@ def plot_mesh_2(
     plot_interface=True,
     edge_filter: Union[str, List[str]] = None,
     highlight_edges: Optional[Iterable[int]] = None,
+    fluid_solid_overlay: bool = True,
 ):
     """
     Plots a 2D mesh, correctly using the nodes_x_y_pos attribute for coordinates
@@ -266,6 +267,24 @@ def plot_mesh_2(
 
     node_coords = mesh.nodes_x_y_pos
     legend_handles = []
+
+    if fluid_solid_overlay and hasattr(mesh, "elements_list"):
+        fluid_polys, solid_polys = [], []
+        for elem in mesh.elements_list:
+            tag = getattr(elem, "tag", "")
+            coords = node_coords[list(elem.corner_nodes)]
+            if tag == "fluid":
+                fluid_polys.append(coords)
+            elif tag == "solid":
+                solid_polys.append(coords)
+        if fluid_polys:
+            pc = PolyCollection(fluid_polys, facecolors=(0.0, 0.5, 1.0, 0.18), edgecolors='none', zorder=0)
+            ax.add_collection(pc)
+            legend_handles.append(patches.Patch(color=(0.0, 0.5, 1.0, 0.3), label="Fluid domain"))
+        if solid_polys:
+            pc = PolyCollection(solid_polys, facecolors=(1.0, 0.5, 0.0, 0.18), edgecolors='none', zorder=0)
+            ax.add_collection(pc)
+            legend_handles.append(patches.Patch(color=(1.0, 0.5, 0.0, 0.3), label="Solid domain"))
 
     if elem_tags:
         polys_by_color = {}

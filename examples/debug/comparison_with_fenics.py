@@ -974,6 +974,36 @@ if __name__ == '__main__':
 
     
     terms = {
+        "RHS Identiy [I2:grad(v)]": {
+            'pc': inner(I2_pc, grad(pc['v'])) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(I2_fx, ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
+        "RHS Identiy [I2*pk:grad(v)]": {
+            'pc': inner(I2_pc * pc['p_k'], grad(pc['v'])) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(I2_fx * p_k_fx, ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
+        "RHS Identiy [pk*I2:grad(v)]": {
+            'pc': inner(pc['p_k'] *I2_pc , grad(pc['v'])) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(p_k_fx *I2_fx , ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
+        "LHS Identiy [p_trial*I2:grad(v)]": {
+            'pc': inner(pc['dp'] *I2_pc , grad(pc['v'])) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(dp *I2_fx , ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
+        "LHS Identiy [I2 * p_trial:grad(v)]": {
+            'pc': inner(I2_pc * pc['dp'], grad(pc['v'])) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: ufl.inner(I2_fx * dp, ufl.grad(v_fx)) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
         "Mixed Basic [Fk]": {
             'pc': inner(pc_geo["Fk"], grad(pc['v'])) * dx(metadata={"q": 6}),
             'f_lambda': lambda deg: ufl.inner(fe_geo["Fk"], ufl.grad(v_fx)) \

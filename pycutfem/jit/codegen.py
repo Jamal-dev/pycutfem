@@ -2913,7 +2913,7 @@ class NumbaCodeGen:
                           and len(a.shape) in (1, 2) and (len(a.shape) == 1 or a.shape[0] == 1)
                           and b.shape == (2, 2)):
                         role = 'test' if a.role == 'test' else 'trial'
-                        body_lines.append("# rhs: trace(test) * Identity → ")
+                        body_lines.append(f"# rhs: trace({role}) * Identity → ")
                         body_lines.append(
                             f"{res_var} = trace_times_identity({a.var_name}, {b.var_name}, {self.dtype})"
                         )
@@ -2924,10 +2924,26 @@ class NumbaCodeGen:
                                             is_gradient=True, is_hessian=False,
                                             field_names=field_names, parent_name=parent_name, side=side,
                                             field_sides=field_sides))
+                    elif (b.role in {"test", "trial"} and a.role in {"const", "value"} and a.is_gradient
+                          and not b.is_vector and not b.is_gradient and not b.is_hessian
+                          and len(b.shape) in (1, 2) and (len(b.shape) == 1 or b.shape[0] == 1)
+                          and a.shape == (2, 2)):
+                        role = 'test' if b.role == 'test' else 'trial'
+                        body_lines.append(f"# rhs: Identity * trace({role}) → ")
+                        body_lines.append(
+                            f"{res_var} = trace_times_identity({b.var_name}, {a.var_name}, {self.dtype})"
+                        )
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=b, strict=False)
+                        stack.append(StackItem(var_name=res_var, role=role,
+                                            shape=(a.shape[0], -1, a.shape[1]),
+                                            is_vector =False,
+                                            is_gradient=True, is_hessian=False,
+                                            field_names=field_names, parent_name=parent_name, side=side,
+                                            field_sides=field_sides))
                     elif (a.role in {"const", "value"} and b.role in {"const", "value"} and b.is_gradient
                           and not a.is_vector and not a.is_gradient and not a.is_hessian
                            and (len(a.shape) == 1 )
-                          and b.shape == (2, 2)):
+                          and b.shape == (2, 2)) and a.shape[0] == 1:
                         # scale up to matrix
                         role = "value"
                         body_lines.append("# rhs: pk * Identity → ")
@@ -2937,6 +2953,22 @@ class NumbaCodeGen:
                         field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=a, strict=False)
                         stack.append(StackItem(var_name=res_var, role=role,
                                             shape=(b.shape[0], b.shape[1]),
+                                            is_vector =False,
+                                            is_gradient=True, is_hessian=False,
+                                            field_names=field_names, parent_name=parent_name, side=side,
+                                            field_sides=field_sides))
+                    elif (b.role in {"const", "value"} and a.role in {"const", "value"} and a.is_gradient
+                          and not b.is_vector and not b.is_gradient and not b.is_hessian
+                           and (len(b.shape) == 1  and b.shape[0] == 1) and a.shape == (2, 2)):
+                        # scale up to matrix
+                        role = "value"
+                        body_lines.append("# rhs: Identity * pk → ")
+                        body_lines.append(
+                            f"{res_var} = {b.var_name} * {a.var_name}"
+                        )
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=b, strict=False)
+                        stack.append(StackItem(var_name=res_var, role=role,
+                                            shape=(a.shape[0], a.shape[1]),
                                             is_vector =False,
                                             is_gradient=True, is_hessian=False,
                                             field_names=field_names, parent_name=parent_name, side=side,

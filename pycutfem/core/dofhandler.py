@@ -1230,6 +1230,10 @@ class DofHandler:
         dof_coords = getattr(self, "_dof_coords", None)
         selected: set[int] = set()
         for edge_id in bitset.to_indices():
+            e_obj = mesh.edge(int(edge_id))
+            # Only apply Dirichlet data on true boundary edges
+            if (e_obj.left is not None) and (e_obj.right is not None):
+                continue
             try:
                 dofs = self.edge_dofs(field, int(edge_id))
             except Exception:
@@ -1301,6 +1305,10 @@ class DofHandler:
             node2dof = self.dof_map.get(field, {})
             locator = locators.get(tag)
             for e in getattr(mesh, "edges_list", []):
+                # Skip interior edges even if they carry tags (guards against
+                # accidental tagging of interface edges as Dirichlet boundaries).
+                if (getattr(e, "left", None) is not None) and (getattr(e, "right", None) is not None):
+                    continue
                 if getattr(e, "tag", None) == tag:
                     for nid in getattr(e, "all_nodes", ()):
                         if locator is not None and node_coords is not None:

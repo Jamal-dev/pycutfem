@@ -56,6 +56,7 @@ from pycutfem.ufl.measures import dx, dS
 from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.solvers.nonlinear_solver import NewtonParameters, NewtonSolver, TimeStepperParameters
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
+from pycutfem.io.visualization import plot_mesh_2
 
 # ----------------------------------------------------------------------------- 
 # Geometry helpers (Turek–Hron benchmark)
@@ -146,38 +147,88 @@ def load_ucd_mesh(path: Path, poly_order: int = 1) -> Tuple[Mesh, BitSet, BitSet
     return mesh, mesh.element_bitset("fluid"), mesh.element_bitset("solid")
 
 
-def retag_boundaries(mesh: Mesh, tol: float = 1.0e-8) -> None:
+def _adaptive_locators(mesh: Mesh, tol: float):
     """
-    Geometric tagging of boundary edges to mirror the deal.II boundary ids:
-    - inlet  (x=0)
-    - outlet (x=L)
-    - walls  (y=0 or y=H)
-    - cylinder (circle at CENTER, radius RADIUS)
-    - beam_outer (outer beam box except the circular interface)
+    Build locator functions for inlet/outlet/walls using actual boundary extents,
+    plus geometric tests for cylinder/beam.
     """
     cx, cy = CENTER
     r2 = RADIUS * RADIUS
     beam_x1 = BEAM_X0 + BEAM_LENGTH
 
+    coords = np.asarray(getattr(mesh, "nodes_x_y_pos", []), float)
+    xmin_raw, ymin_raw, xmax_raw, ymax_raw = 0.0, 0.0, L, H
+    if coords.size:
+        xmin_raw, ymin_raw = coords.min(axis=0)
+        xmax_raw, ymax_raw = coords.max(axis=0)
+
+    mids = []
+    for e in mesh.edges_list:
+        if e.right is None:
+            mids.append(mesh.nodes_x_y_pos[list(e.nodes)].mean(axis=0))
+    if mids:
+        mids = np.asarray(mids, float)
+        xmin_raw = min(xmin_raw, float(mids[:, 0].min()))
+        ymin_raw = min(ymin_raw, float(mids[:, 1].min()))
+        xmax_raw = max(xmax_raw, float(mids[:, 0].max()))
+        ymax_raw = max(ymax_raw, float(mids[:, 1].max()))
+
+    xmin = max(0.0, xmin_raw)
+    xmax = min(L, xmax_raw)
+    ymin = max(0.0, ymin_raw)
+    ymax = min(H, ymax_raw)
+    span = float(max(xmax - xmin, ymax - ymin, 1.0))
+    tol_loc = max(tol, 1e-4 * span)
+    tol_cyl = max(tol_loc, 5e-4 * span)
+
     def on_cylinder(x: float, y: float) -> bool:
-        return abs((x - cx) ** 2 + (y - cy) ** 2 - r2) < 1e-6
+        return abs((x - cx) ** 2 + (y - cy) ** 2 - r2) < tol_cyl
 
     def on_beam_outer(x: float, y: float) -> bool:
-        on_x0 = abs(x - BEAM_X0) < tol and BEAM_Y0 - tol <= y <= BEAM_Y1 + tol
-        on_x1 = abs(x - beam_x1) < tol and BEAM_Y0 - tol <= y <= BEAM_Y1 + tol
-        on_y0 = abs(y - BEAM_Y0) < tol and BEAM_X0 - tol <= x <= beam_x1 + tol
-        on_y1 = abs(y - BEAM_Y1) < tol and BEAM_X0 - tol <= x <= beam_x1 + tol
+        on_x0 = abs(x - BEAM_X0) < tol_loc and BEAM_Y0 - tol_loc <= y <= BEAM_Y1 + tol_loc
+        on_x1 = abs(x - beam_x1) < tol_loc and BEAM_Y0 - tol_loc <= y <= BEAM_Y1 + tol_loc
+        on_y0 = abs(y - BEAM_Y0) < tol_loc and BEAM_X0 - tol_loc <= x <= beam_x1 + tol_loc
+        on_y1 = abs(y - BEAM_Y1) < tol_loc and BEAM_X0 - tol_loc <= x <= beam_x1 + tol_loc
         return on_x0 or on_x1 or on_y0 or on_y1
 
-    mesh.tag_boundary_edges(
-        {
-            "inlet": lambda x, y: abs(x - 0.0) < tol,
-            "outlet": lambda x, y: abs(x - L) < tol,
-            "walls": lambda x, y: abs(y - 0.0) < tol or abs(y - H) < tol,
-            "cylinder": on_cylinder,
-            "beam_outer": on_beam_outer,
-        }
-    )
+    def on_beam_root(x: float, y: float) -> bool:
+        return abs(x - BEAM_X0) < tol_loc and (BEAM_Y0 - tol_loc) <= y <= (BEAM_Y1 + tol_loc)
+
+    return {
+        "inlet": lambda x, y: abs(x - xmin) < tol_loc,
+        "outlet": lambda x, y: abs(x - xmax) < tol_loc,
+        "walls": lambda x, y: abs(y - ymin) < tol_loc or abs(y - ymax) < tol_loc,
+        "cylinder": on_cylinder,
+        "beam_outer": on_beam_outer,
+        "beam_root": on_beam_root,
+    }
+
+
+def retag_boundaries(mesh: Mesh, tol: float = 1.0e-8, *, overwrite: bool = True) -> None:
+    """
+    Geometric tagging of boundary edges to mirror the deal.II boundary ids on the
+    canonical channel (x in [0,L], y in [0,H]).
+    - cylinder (circle at CENTER, radius RADIUS)
+    - beam_outer (outer beam box except the circular interface)
+    - beam_root (left edge of the beam)
+    """
+    locators = _adaptive_locators(mesh, tol)
+    try:
+        mesh.tag_boundary_edges(locators, overwrite=overwrite)
+    except TypeError:
+        mesh.tag_boundary_edges(locators)
+    # Drop any boundary tags whose midpoints fail their own locator (guards against padded meshes)
+    for e in mesh.edges_list:
+        if e.right is not None:
+            continue
+        tag = getattr(e, "tag", "") or ""
+        if not tag:
+            continue
+        if tag not in locators:
+            continue
+        mpx, mpy = mesh.nodes_x_y_pos[list(e.nodes)].mean(axis=0)
+        if not locators[tag](mpx, mpy):
+            e.tag = ""
 
 
 def tag_nodes_from_edges(mesh: Mesh) -> Dict[str, int]:
@@ -241,16 +292,37 @@ def classify_fluid_solid(mesh: Mesh, tol: float = 1.0e-9) -> Tuple[BitSet, BitSe
     return mesh._elem_bitsets["fluid"], mesh._elem_bitsets["solid"]
 
 
-def ensure_boundary_tags(mesh: Mesh, tol: float = 1.0e-6) -> Dict[str, Tuple[int, int]]:
+def ensure_boundary_tags(mesh: Mesh, tol: float = 1.0e-6, *, force_geometric: bool = True, mesh_size: float | None = None) -> Dict[str, Tuple[int, int]]:
     """
-    Make sure standard boundary tags exist; if outlet (or inlet) is empty,
-    fall back to geometric retagging. Returns counts before/after.
+    Ensure standard boundary tags exist. By default, re-tag geometrically to
+    match the reference Turek–Hron channel (x∈[0,L], y∈[0,H]) regardless of
+    what the .msh provides. Returns counts before/after.
     """
     tags = ("inlet", "outlet", "walls", "cylinder", "beam_outer", "beam_root")
     counts_before = {t: mesh.edge_bitset(t).cardinality() for t in tags}
-    need_retag = counts_before.get("outlet", 0) == 0 or counts_before.get("inlet", 0) == 0
-    if need_retag:
-        retag_boundaries(mesh, tol=tol)
+
+    if force_geometric:
+        # Always enforce canonical tags; overwrite existing ones.
+        tol_eff = tol
+        if mesh_size is not None:
+            tol_eff = max(tol, 1e-4 * mesh_size)
+        retag_boundaries(mesh, tol=tol_eff, overwrite=True)
+    else:
+        need_retag = counts_before.get("outlet", 0) == 0 or counts_before.get("inlet", 0) == 0
+        if need_retag:
+            retag_boundaries(mesh, tol=tol, overwrite=False)
+
+    # Remove tags that fail locator checks (prune stray/hanging boundaries).
+    locators = _adaptive_locators(mesh, tol)
+    for e in mesh.edges_list:
+        if e.right is not None:
+            continue
+        tag = getattr(e, "tag", "") or ""
+        if tag and tag in locators:
+            mpx, mpy = mesh.nodes_x_y_pos[list(e.nodes)].mean(axis=0)
+            if not locators[tag](mpx, mpy):
+                e.tag = ""
+
     counts_after = {t: mesh.edge_bitset(t).cardinality() for t in tags}
 
     # If outlet is still empty, force-tag boundary edges near x=L.
@@ -259,13 +331,14 @@ def ensure_boundary_tags(mesh: Mesh, tol: float = 1.0e-6) -> Dict[str, Tuple[int
             if edge.right is not None:
                 continue
             mpx, mpy = mesh.nodes_x_y_pos[list(edge.nodes)].mean(axis=0)
-            if abs(mpx - L) < max(tol, 1e-6):
+            if abs(mpx - L) < max(tol, 1e-6) and not getattr(edge, "tag", None):
                 edge.tag = "outlet"
         mask = np.fromiter((e.tag == "outlet" for e in mesh.edges_list), bool)
         if not hasattr(mesh, "_edge_bitsets"):
             mesh._edge_bitsets = {}
         mesh._edge_bitsets["outlet"] = BitSet(mask)
         counts_after["outlet"] = int(mask.sum())
+
     return {t: (counts_before.get(t, 0), counts_after.get(t, 0)) for t in tags}
 
 
@@ -284,6 +357,24 @@ def boundary_nodes_by_tag(mesh: Mesh) -> Dict[str, set[int]]:
         nodes = e.all_nodes if e.all_nodes else e.nodes
         out.setdefault(tag, set()).update(int(n) for n in nodes)
     return out
+
+
+def find_hanging_edges(mesh: Mesh, tol: float = 1.0e-8) -> List[Tuple[int, float, float]]:
+    """
+    Detect single-owner edges whose midpoints do not belong to any canonical
+    boundary locator (inlet, outlet, walls, cylinder, beam box). These edges
+    indicate hanging nodes / non-conforming interfaces.
+    Returns a list of (edge_id, mid_x, mid_y).
+    """
+    locators = _adaptive_locators(mesh, tol)
+    coords = mesh.nodes_x_y_pos
+    hanging: List[Tuple[int, float, float]] = []
+    for edge in mesh.edges_list:
+        if (edge.left is None) or (edge.right is None):
+            mid = coords[list(edge.nodes)].mean(axis=0)
+            if not any(loc(float(mid[0]), float(mid[1])) for loc in locators.values()):
+                hanging.append((int(edge.gid), float(mid[0]), float(mid[1])))
+    return hanging
 
 
 def symgrad(u):
@@ -1136,14 +1227,88 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Deal.II FSI benchmark in pycutfem (ALE, conforming mesh).")
     ap.add_argument("--mesh", type=Path, default=Path("examples/meshes/fsi_conforming.msh"), help="Path to mesh (.msh from gmsh or .inp UCD).")
     ap.add_argument("--mesh-format", choices=("auto", "gmsh", "ucd"), default="auto", help="Override mesh loader; auto picks by file extension.")
+    ap.add_argument("--mesh-size", type=float, default=None, help="Optional characteristic mesh size (used for tagging tolerances).")
     ap.add_argument("--poly-order", type=int, default=2, help="Polynomial order for velocity/displacement (Taylor–Hood).")
     ap.add_argument("--dt", type=float, default=1.0, help="Time step size (default from step-fsi.prm).")
     ap.add_argument("--theta", type=float, default=1.0, help="Theta scheme parameter (1=BE, 0.5=CN).")
     ap.add_argument("--n-steps", type=int, default=3, help="Number of time steps (default small for quick verification).")
     ap.add_argument("--backend", choices=("jit", "python"), default="python", help="Form compiler backend.")
     ap.add_argument("--boundary-tol", type=float, default=1.0e-6, help="Tolerance for geometric boundary retagging.")
+    ap.add_argument("--mesh-report", action="store_true", help="Print mesh diagnostics (boundary coverage, hanging nodes) and exit before assembly.")
     ap.add_argument("--assemble-only", action="store_true", help="Assemble residual/Jacobian once and exit (no Newton solve).")
+    ap.add_argument("--plot-bcs", action="store_true", help="Save a PNG of Dirichlet DOFs using plot_mesh_2.")
     return ap.parse_args()
+
+
+def _collect_edge_dofs(mesh: Mesh, dh: DofHandler, tag: str, field: str) -> set[int]:
+    """
+    Return all DOFs of ``field`` that lie on edges carrying ``tag``.
+    Uses DofHandler.edge_dofs so higher-order edge nodes are included.
+    """
+    try:
+        edge_ids = mesh.edge_bitset(tag).to_indices()
+    except Exception:
+        return set()
+    out: set[int] = set()
+    for eid in edge_ids:
+        try:
+            out.update(int(d) for d in dh.edge_dofs(field, int(eid)))
+        except Exception:
+            continue
+    return out
+
+
+def _plot_dirichlet(mesh: Mesh, dh: DofHandler, bc_dofs: Dict[int, float], missing: set[int], extra: set[int], output_path: Path) -> None:
+    """
+    Save a diagnostic plot of Dirichlet DOFs per field using plot_mesh_2.
+    """
+    import matplotlib
+    # matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    plot_mesh_2(mesh, plot_nodes=False, plot_edges=True, elem_tags=False, edge_colors=True, show=False, ax=ax)
+
+    if getattr(dh, "_dof_coords", None) is None:
+        _ = dh.get_field_slice(dh.field_names[0])  # force coord build
+    coords = dh._dof_coords
+
+    palette = {"ux": "#d62728", "uy": "#2ca02c", "dx": "#1f77b4", "dy": "#ff7f0e", "p": "#9467bd"}
+    grouped: Dict[str, list[int]] = {}
+    for gd in bc_dofs.keys():
+        fld, _ = dh._dof_to_node_map.get(int(gd), (None, None))
+        if fld is None:
+            continue
+        grouped.setdefault(fld, []).append(int(gd))
+
+    for fld, ids in grouped.items():
+        pts = coords[ids]
+        ax.plot(
+            pts[:, 0],
+            pts[:, 1],
+            "o",
+            markersize=3.2,
+            markerfacecolor=palette.get(fld, "k"),
+            markeredgecolor="white",
+            markeredgewidth=0.35,
+            linestyle="None",
+            label=f"{fld} BC",
+        )
+
+    if missing:
+        pts = coords[list(missing)]
+        ax.plot(pts[:, 0], pts[:, 1], "x", color="black", markersize=6, markeredgewidth=1.4, label="missing")
+    if extra:
+        pts = coords[list(extra)]
+        ax.plot(pts[:, 0], pts[:, 1], "s", color="gold", markersize=4.5, markeredgecolor="black", label="extra")
+
+    ax.legend(loc="upper right", fontsize=7, ncol=3)
+    ax.set_title("Dirichlet DOFs by field")
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=220)
+    plt.show()
+    # plt.close(fig)
 
 
 def main() -> None:
@@ -1160,7 +1325,7 @@ def main() -> None:
         mesh, fluid_bs, solid_bs = load_ucd_mesh(mesh_path, poly_order=1)
         fluid_bs, solid_bs = classify_fluid_solid(mesh)
 
-    counts = ensure_boundary_tags(mesh, tol=args.boundary_tol)
+    counts = ensure_boundary_tags(mesh, tol=args.boundary_tol, mesh_size=args.mesh_size)
     node_counts = tag_nodes_from_edges(mesh)
     outlet_bs = mesh.edge_bitset("outlet")
     if outlet_bs.cardinality() == 0:
@@ -1169,6 +1334,18 @@ def main() -> None:
     nodes_msg = ", ".join(f"{k}:{v}" for k, v in node_counts.items())
     print(f"Boundary edges (before→after): {counts_msg}")
     print(f"Boundary nodes per tag: {nodes_msg}")
+
+    hanging_edges = find_hanging_edges(mesh, tol=args.boundary_tol)
+    if hanging_edges:
+        xs = np.array([x for _, x, _ in hanging_edges], dtype=float)
+        ys = np.array([y for _, _, y in hanging_edges], dtype=float)
+        sample = [(eid, round(float(x), 4), round(float(y), 4)) for eid, x, y in hanging_edges[:8]]
+        print(
+            f"[warn] Hanging edges (single-owner off-boundary): {len(hanging_edges)} "
+            f"(x≈{xs.min():.3f}…{xs.max():.3f}, y≈{ys.min():.3f}…{ys.max():.3f}, examples={sample})"
+        )
+    else:
+        print("Hanging edges: none detected (all single-owner edges lie on boundaries).")
 
     # Quick orientation check
     coords = mesh.nodes_x_y_pos
@@ -1284,7 +1461,8 @@ def main() -> None:
     dh.apply_bcs(bcs, uk, u_prev, dk, d_prev, pk, p_prev)
     print(f"Mesh elements: fluid={fluid_bs.cardinality()}, solid={solid_bs.cardinality()}")
     print(f"Total DOFs: {dh.total_dofs}")
-    bc_dofs = dh.get_dirichlet_data(bcs)
+    # Use explicit locators override to avoid sweeping up interior DOFs; rely on edge tags instead.
+    bc_dofs = dh.get_dirichlet_data(bcs, locators={})
     print(f"Dirichlet constraints: {len(bc_dofs)} DOFs")
     bc_dof_set = set(bc_dofs.keys())
     boundary_nodes = boundary_nodes_by_tag(mesh)
@@ -1317,14 +1495,29 @@ def main() -> None:
         for field in fields:
             node2dof = dh.dof_map.get(field, {})
             expected_all |= {node2dof[n] for n in nodes if n in node2dof}
+            # include higher-order edge DOFs that live on tagged edges
+            expected_all |= _collect_edge_dofs(mesh, dh, tag, field)
     missing_all = expected_all - bc_dof_set
     extra_all = bc_dof_set - expected_all
     if missing_all:
-        raise RuntimeError(f"Dirichlet coverage incomplete: {len(missing_all)} boundary DOFs missing (examples: {sorted(list(missing_all))[:10]}).")
+        msg = f"{len(missing_all)} boundary DOFs missing (examples: {sorted(list(missing_all))[:10]})."
+        if args.mesh_report:
+            print(f"[warn] Dirichlet coverage incomplete: {msg}")
+        else:
+            raise RuntimeError(f"Dirichlet coverage incomplete: {msg}")
     if extra_all:
         print(f"[warn] Dirichlet set has {len(extra_all)} DOFs not on tagged boundaries (examples: {sorted(list(extra_all))[:10]}).")
-    else:
+    elif not missing_all:
         print("All boundary DOFs covered by supplied Dirichlet tags.")
+
+    if args.mesh_report:
+        print("Mesh diagnostics requested (--mesh-report); skipping assembly/solve.")
+        return
+
+    if args.plot_bcs:
+        out_path = Path("examples/plots/fsi_dirichlet_bcs.png")
+        _plot_dirichlet(mesh, dh, bc_dofs, missing_all, extra_all, out_path)
+        print(f"Saved Dirichlet BC plot to {out_path}")
 
     if args.assemble_only:
         print("Assembling once with backend='{0}' for diagnostics...".format(args.backend))

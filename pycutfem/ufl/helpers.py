@@ -1380,12 +1380,14 @@ class GradOpInfo(BaseOpInfo):
         Performs SCALING and always returns a new GradOpInfo object.
         This operator preserves the shape (k, n, d).
         """
-        if isinstance(other, (float, int)):
+        if isinstance(other, (float, int, Constant)):
             # Case 1: Scaling by a single scalar
             new_data = self.data * other
+            role = self.role
             
         elif isinstance(other, np.ndarray):
             other = np.asarray(other)
+            role = self.role
             if other.ndim == 0:
                 # Case 1b: Scaling by a 0-D array (e.g., np.array(2))
                 new_data = self.data * other
@@ -1399,12 +1401,42 @@ class GradOpInfo(BaseOpInfo):
                 new_data = self.data * other[np.newaxis, :, np.newaxis]
             else:
                  raise ValueError(f"Cannot scale GradOpInfo(shape={self.shape}) with array of shape {other.shape}.")
-        else:
-            raise TypeError(f"GradOpInfo can only be scaled by a scalar or array, not {type(other)}."
-                            f"roles : {self.role} and other.role = {getattr(other, 'role', None)}"
-                            f"Shapes : {self.data.shape} and {getattr(other, 'shape', None)}")
+        elif isinstance(other, VecOpInfo):
+            if self.role in ("identity", "function") and other.role in ( "function"):
+                # Case 4: Scaling by a vector of size d (e.g., a constant vector field)
+                grad_vals = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
+                vec_vals = _collapsed_function(other)  # shape (k,)  —   u
+                if vec_vals.shape[0] == 1:
+                    # Scalar multiplication
+                    new_data = grad_vals * vec_vals[0]
+                    role = "function"
+                else:
+                    raise ValueError(f"Cannot scale GradOpInfo(shape={self.shape}) with VecOpInfo of shape {other.data.shape}.")
+            elif self.role in ("identity", "function") and other.role in ( "trial", "test") and _is_scalar_field(other):
+                # Case 5: Scale trial and test promote them to (k,n,d) shape
+                grad_vals = _collapsed_grad(self)  # shape (k, d)  —
+                new_data = grad_vals[:, np.newaxis, :] * other.data[:, :, np.newaxis]  # broadcasting
+                role = other.role
+            elif self.role in ("trial", "test") and other.role in ( "function"):
+                # Case 6: Scale trial and test promote them to (k,n,d) shape
+                vec_vals = _collapsed_function(other)  # shape (k,)  —   u
+                if vec_vals.shape[0] == 1:
+                    # Scalar multiplication
+                    new_data = self.data * vec_vals[0]
+                    role = self.role
+                else:
+                    raise ValueError(f"Cannot scale GradOpInfo(shape={self.shape}) with VecOpInfo of shape {other.data.shape}.")
+            else:
+                raise TypeError(f"GradOpInfo can only be scaled by a scalar or array, not VecOpInfo with role {other.role}.\n"
+                                f"Got roles : a:{self.role} , b:{other.role}\n"
+                                f"Shapes : a:{self.data.shape}, b: {other.data.shape}")
 
-        return self._with(new_data, role=self.role)
+        else:
+            raise TypeError(f"GradOpInfo can only be scaled by a scalar or array, not {type(other).__name__}.\n"
+                            f"Got roles : a:{self.role} , b:{getattr(other, 'role', None), }\n"
+                            f"Shapes : a:{self.data.shape}, b: {getattr(other, 'shape', None)}")
+
+        return self._with(new_data, role=role)
 
     def __rmul__(self, other: Union[float, int, np.ndarray]) -> "GradOpInfo":
         return self.__mul__(other)
