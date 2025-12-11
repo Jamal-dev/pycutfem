@@ -1630,10 +1630,10 @@ class NumbaCodeGen:
             elif isinstance(op, Inner):
                 b = stack.pop(); a = stack.pop()
                 res_var = new_var("inner")
-                print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}"
-                      f", is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}"
-                      f", a.is_transpose: {a.is_transpose}, b.is_transpose: {b.is_transpose}"
-                      f", a.is_hessian: {a.is_hessian}, b.is_hessian: {b.is_hessian}")
+                # print(f"Inner operation: a.role={a.role}, b.role={b.role}, a.shape={a.shape}, b.shape={b.shape}"
+                #       f", is_vector: {a.is_vector}/{b.is_vector}, is_gradient: {a.is_gradient}/{b.is_gradient}"
+                #       f", a.is_transpose: {a.is_transpose}, b.is_transpose: {b.is_transpose}"
+                #       f", a.is_hessian: {a.is_hessian}, b.is_hessian: {b.is_hessian}")
 
                 # LHS Bilinear Form: always rows=test, cols=trial
                 if a.role in ('test', 'trial') and b.role in ('test', 'trial'):
@@ -1851,11 +1851,11 @@ class NumbaCodeGen:
                 a = stack.pop()
                 res_var = new_var("dot")
 
-                print(f"Dot operation: a.role={a.role}, b.role={b.role}, "
-                      f"a.shape={a.shape}, b.shape={b.shape}, "
-                      f"is_vector: {a.is_vector}/{b.is_vector}, "
-                      f"is_gradient: {a.is_gradient}/{b.is_gradient}, "
-                      f"is_hessian: {a.is_hessian}/{b.is_hessian}")
+                # print(f"Dot operation: a.role={a.role}, b.role={b.role}, "
+                #       f"a.shape={a.shape}, b.shape={b.shape}, "
+                #       f"is_vector: {a.is_vector}/{b.is_vector}, "
+                #       f"is_gradient: {a.is_gradient}/{b.is_gradient}, "
+                #       f"is_hessian: {a.is_hessian}/{b.is_hessian}")
 
                 # Advection term: dot(grad(u_trial), u_k)
                 if a.role == 'trial' and a.is_gradient and b.role == 'value' and b.is_vector:
@@ -2644,7 +2644,7 @@ class NumbaCodeGen:
                  # ------------ PRODUCT ---------------
                  # -------------------------------------
                  if op.op_symbol == '*':
-                    print(f"[*] shapes: ({a.shape}, {b.shape}) roles: ({a.role}, {b.role})")
+                    # print(f"[*] shapes: ({a.shape}, {b.shape}) roles: ({a.role}, {b.role})")
                     body_lines.append(f"# Product: {a.role} * {b.role}")
                     # -----------------------------------------------------------------
                     # 0. scalar:   scalar   *  scalar/np.ndarray    →  scalar/np.ndarray 
@@ -3177,7 +3177,7 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = True
+            DEBUG: bool = False
         ):
         """
         Build complete kernel source code with parallel assembly.

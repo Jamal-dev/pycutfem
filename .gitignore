@@ -206,3 +206,4 @@ scripts/
 .pycutfem_cache/
 *_results_*
 examples/meshes/
+examples/plots/

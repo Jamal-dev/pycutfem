@@ -1757,7 +1757,7 @@ class FormCompiler:
                (isinstance(b, VecOpInfo) and role_b == "vector")) and \
              isinstance(a, (VecOpInfo)) and a.role in {"trial", "function"}:
                 # return a.dot_const(b) if a.ndim==2 else a.dot_vec(b)
-                return a.dot_const_vec(b)
+                return a.dot_const(b) 
             if isinstance(a, VecOpInfo) and role_a == "vector" and role_b == None:
                 return a.dot_const(b)
             elif isinstance(b, VecOpInfo) and role_b == "vector" and role_a == None:
@@ -4149,7 +4149,13 @@ class FormCompiler:
 
         for name in runner.param_order:
             arr = args.get(name)
-            if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] != n_edges:
+            if (
+                isinstance(arr, np.ndarray)
+                and arr.ndim >= 1
+                and arr.shape[0] != n_edges
+                # Constant arrays (e.g., Identity) are not per-edge; skip shape enforcement.
+                and not str(name).startswith("const_arr_")
+            ):
                 if arr.shape[0] == n_elems and owner is not None:
                     # Gather per-edge rows from per-element array
                     args[name] = arr[owner]

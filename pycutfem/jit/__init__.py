@@ -1049,6 +1049,69 @@ def compile_multi(form, *, dof_handler, mixed_element,
             )
             continue
 
+        # ------------------------------------------------------------------
+        # EXTERIOR FACET (boundary edges)
+        # ------------------------------------------------------------------
+        if dom == "exterior_facet":
+            mesh = mixed_element.mesh
+            edge_set = (
+                intg.measure.defined_on
+                if intg.measure.defined_on is not None
+                else mesh.get_domain_bitset(intg.measure.tag, entity="edge")
+            )
+            if edge_set is None:
+                raise ValueError(f"[jit] No edges defined for tag {intg.measure.tag!r}.")
+
+            derivs = required_multi_indices(intg.integrand)
+            geo = dof_handler.precompute_boundary_factors(
+                edge_set,
+                qdeg,
+                derivs,
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+            )
+            if geo.get("eids", np.zeros(0, dtype=np.int32)).size == 0:
+                continue
+
+            gdofs_raw = np.asarray(geo.get("gdofs_map", np.zeros((0, n_loc), dtype=np.int32)), dtype=np.int32)
+            ncols = gdofs_raw.shape[1] if gdofs_raw.ndim == 2 else 0
+            eff_cols = active_cols[active_cols < ncols] if ncols else active_cols
+            if eff_cols.size == 0 and ncols:
+                eff_cols = np.arange(ncols, dtype=np.int32)
+            gdofs_map = gdofs_raw[:, eff_cols] if gdofs_raw.size else gdofs_raw
+            geo["gdofs_map"] = gdofs_map
+            geo["is_interface"] = False
+            geo["is_ghost"] = False
+            geo["entity_kind"] = "edge"
+
+            static = {"gdofs_map": gdofs_map, **geo}
+            static.update(
+                _build_jit_kernel_args(
+                    ir,
+                    intg.integrand,
+                    mixed_element,
+                    qdeg,
+                    dof_handler=dof_handler,
+                    gdofs_map=gdofs_map,
+                    param_order=runner.param_order,
+                    pre_built=geo,
+                )
+            )
+            static = _compress_static_for_active(static, mixed_element, eff_cols)
+            eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
+            kernels.append(
+                _IntegralKernel(
+                    runner,
+                    static,
+                    "exterior_facet",
+                    level_set=None,
+                    builder=None,
+                    eids=eids_arr,
+                )
+            )
+            continue
+
         raise NotImplementedError(f"{dom!r} integrals are not supported by JIT.")
 
     return kernels

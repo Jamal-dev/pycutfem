@@ -50,9 +50,9 @@ I2_FX = ufl.Identity(2)
 def _cof2(A):
     """
     2x2 cofactor without ufl.cofactor (dolfinx UFL may lack it).
-    Returns [[a22, -a12], [-a21, a11]].
+    Returns [[a22, -a21], [-a12, a11]].
     """
-    return ufl.as_tensor(((A[1, 1], -A[0, 1]), (-A[1, 0], A[0, 0])))
+    return ufl.as_tensor(((A[1, 1], -A[1, 0]), (-A[0, 1], A[0, 0])))
 
 
 def one_to_one_map_coords(coords_pc: np.ndarray, coords_fx: np.ndarray) -> np.ndarray:

@@ -179,7 +179,10 @@ def _adaptive_locators(mesh: Mesh, tol: float):
     ymax = min(H, ymax_raw)
     span = float(max(xmax - xmin, ymax - ymin, 1.0))
     tol_loc = max(tol, 1e-4 * span)
-    tol_cyl = max(tol_loc, 5e-4 * span)
+    tol_cyl = max(tol_loc, 2e-3 * span)       # allow slight curvature drift
+    tol_root = max(tol_loc, 4.5e-3 * span)      # beam root points sit on the curved cylinder/beam junction
+    tol_y = max(tol_loc, 8e-4 * span)
+    tol_x_root = max(tol_loc, 1.5e-3 * span)
 
     def on_cylinder(x: float, y: float) -> bool:
         return abs((x - cx) ** 2 + (y - cy) ** 2 - r2) < tol_cyl
@@ -192,7 +195,15 @@ def _adaptive_locators(mesh: Mesh, tol: float):
         return on_x0 or on_x1 or on_y0 or on_y1
 
     def on_beam_root(x: float, y: float) -> bool:
-        return abs(x - BEAM_X0) < tol_loc and (BEAM_Y0 - tol_loc) <= y <= (BEAM_Y1 + tol_loc)
+        # Straight portion plus small curved interface near the cylinder/beam junction.
+        on_vertical = abs(x - BEAM_X0) < tol_x_root and (BEAM_Y0 - tol_y) <= y <= (BEAM_Y1 + tol_y)
+        on_arc = (
+            abs((x - cx) ** 2 + (y - cy) ** 2 - r2) < tol_root
+            and abs(x - BEAM_X0) < tol_x_root
+            and (BEAM_Y0 - tol_y) <= y <= (BEAM_Y1 + tol_y)
+            and x >= cx
+        )
+        return on_vertical or on_arc
 
     return {
         "inlet": lambda x, y: abs(x - xmin) < tol_loc,
@@ -201,6 +212,8 @@ def _adaptive_locators(mesh: Mesh, tol: float):
         "cylinder": on_cylinder,
         "beam_outer": on_beam_outer,
         "beam_root": on_beam_root,
+        # Combined locator for cylinder + full beam perimeter
+        "obstacle_set": lambda x, y: on_cylinder(x, y) or on_beam_outer(x, y),
     }
 
 
@@ -1013,6 +1026,7 @@ def build_jac(
         J_F_inv_T_LinU,
     )
     neuman_flux = dot(neuman_term, n)
+
     out_flow_jac = - timestep * theta * dot(neuman_flux, test_v) * dS_outlet
 
     #-----------------------------------------------------------------------
@@ -1030,8 +1044,8 @@ def build_jac(
     ) * dx_s
 
 
-    # return volume_terms_fluid + out_flow_jac + jac_solid
-    return volume_terms_fluid  + jac_solid
+    return volume_terms_fluid + out_flow_jac + jac_solid
+    # return volume_terms_fluid  + jac_solid
 
 def build_residual(
     *,
@@ -1071,7 +1085,7 @@ def build_residual(
     J_old = ALE_Helpers.get_J(F_old)
     pI = pk * Identity(2)
     # acceleration term
-    acc_term = rho_f * 0.5 * (J + J_old) * dot((uk - u_prev), v_test)
+    acc_term = rho_f * 0.5 * (J + J_old) * inner((uk - u_prev), v_test)
     # convection term
     convection_fluid = rho_f * J * dot(dot(grad_v, Finv), uk)
     convection_fluid_with_u = rho_f * J * dot(dot(grad_v, Finv), dk)
@@ -1128,25 +1142,124 @@ def build_residual(
     solid_stress_transfomed = J * dot(solid_stress, Finv.T)
     solid_stress_transfomed_old = J_old * dot(solid_stress_old, Finv_old.T)
     residual_solid = (
-        rho_s * dot(uk - u_prev, v_test)
+        rho_s * inner(uk - u_prev, v_test)
         + dt * theta * inner(solid_stress_transfomed, grad(v_test))
         + dt * (1.0-theta) * inner(solid_stress_transfomed_old, grad(v_test))
-        + rho_s * dot(dk - d_prev, w_test)
-        - rho_s * dt * theta * dot(uk, w_test)
-        - rho_s * dt * (1.0-theta) * dot(u_prev, w_test)
+        + rho_s * inner(dk - d_prev, w_test)
+        - rho_s * dt * theta * inner(uk, w_test)
+        - rho_s * dt * (1.0-theta) * inner(u_prev, w_test)
         + pk * q_test
     ) * dx_s
 
     
-    # return residual_fluid + residual_outlet + residual_solid
-    return residual_fluid  + residual_solid
-            
+    return residual_fluid + residual_outlet + residual_solid
+    # return residual_fluid  + residual_solid
+
+
+def finite_difference_jacobian_check(
+    *,
+    dh: DofHandler,
+    res_form,
+    jac_form,
+    funcs: list,
+    bcs,
+    bcs_homog,
+    quad_order: int,
+    backend: str,
+    eps: float = 1.0e-6,
+    seed: int = 0,
+):
+    """
+    Compare assembled Jacobian action against a finite-difference residual.
+    Returns basic diagnostics as a dict.
+    """
+    rng = np.random.default_rng(seed)
+    eq_res = Equation(None, res_form)
+    eq_jac = Equation(jac_form, None)
+
+    # Use homogeneous BCs consistently for both residual and Jacobian assembly.
+    bc_active = bcs_homog or bcs
+    bc_map = dh.get_dirichlet_data(bc_active)
+    bc_rows = np.fromiter(bc_map.keys(), dtype=int) if bc_map else np.array([], dtype=int)
+    inactive = np.asarray(sorted(dh.dof_tags.get("inactive", [])), dtype=int) if getattr(dh, "dof_tags", None) else np.array([], dtype=int)
+    frozen = np.unique(np.concatenate([bc_rows, inactive])) if (bc_rows.size or inactive.size) else np.array([], dtype=int)
+    mask = np.ones(dh.total_dofs, dtype=bool)
+    if frozen.size:
+        mask[frozen] = False
+
+    direction = rng.standard_normal(dh.total_dofs)
+    direction[~mask] = 0.0
+    max_dir = float(np.linalg.norm(direction, ord=np.inf))
+    if max_dir == 0.0:
+        raise RuntimeError("All DOFs are constrained; cannot run finite-difference check.")
+    delta = (eps / max_dir) * direction
+
+    K, _ = assemble_form(eq_jac, dof_handler=dh, bcs=bcs_homog, quad_degree=quad_order, backend=backend)
+    _, R0 = assemble_form(eq_res, dof_handler=dh, bcs=bcs_homog, quad_degree=quad_order, backend=backend)
+
+    snap = [f.nodal_values.copy() for f in funcs]
+    dh.add_to_functions(delta, funcs)
+    dh.apply_bcs(bc_active, *funcs)
+    _, R1 = assemble_form(eq_res, dof_handler=dh, bcs=bc_active, quad_degree=quad_order, backend=backend)
+    for f, buf in zip(funcs, snap):
+        f.nodal_values[:] = buf
+    dh.apply_bcs(bc_active, *funcs)
+
+    Jd = K @ delta
+    fd = (R1 - R0) / eps
+
+    active = np.flatnonzero(mask)
+    err = Jd - fd
+    max_abs = float(np.max(np.abs(err[active]))) if active.size else 0.0
+    fd_norm = float(np.linalg.norm(fd[active], ord=np.inf)) if active.size else 0.0
+    Jd_norm = float(np.linalg.norm(Jd[active], ord=np.inf)) if active.size else 0.0
+    worst_gdof = int(active[np.argmax(np.abs(err[active]))]) if active.size else -1
+
+    return {
+        "max_abs_diff": max_abs,
+        "fd_norm_inf": fd_norm,
+        "Jd_norm_inf": Jd_norm,
+        "worst_gdof": worst_gdof,
+        "delta_norm_inf": float(np.linalg.norm(delta, ord=np.inf)),
+    }
 
 
 
-def compute_drag_lift(dh: DofHandler, mesh, u: VectorFunction, d: VectorFunction, p: Function, rho: float, mu: float):
-    n = grad(d) * 0  # placeholder to silence linter
-    
+def _collect_boundary_edges(mesh, tags: tuple[str, ...]):
+    bs = None
+    missing = []
+    for t in tags:
+        try:
+            bst = mesh.edge_bitset(t)
+        except KeyError:
+            missing.append(t)
+            continue
+        if bst is None or bst.cardinality() == 0:
+            missing.append(t)
+            continue
+        bs = bst if bs is None else (bs | bst)
+    return bs, missing
+
+
+def compute_drag_lift(
+    dh: DofHandler,
+    mesh,
+    u: VectorFunction,
+    d: VectorFunction,
+    p: Function,
+    rho: float,
+    mu: float,
+    tags: tuple[str, ...] = ("cylinder", "beam_outer", "beam_root", "obstacle_set"),
+):
+    """
+    Compute drag/lift on the perimeter of the cylinder **and** beam (including beam root).
+    Falls back to the combined ``obstacle_set`` tag if explicit beam tags are absent.
+    """
+    edge_set, missing = _collect_boundary_edges(mesh, tags)
+    if edge_set is None or edge_set.cardinality() == 0:
+        raise ValueError(f"No boundary edges found for tags {tags}; missing={missing}")
+    if missing:
+        print(f"[warn] Drag/Lift: missing boundary tags with zero edges: {missing}")
 
     n = FacetNormal()
     I = Identity(2)
@@ -1154,13 +1267,16 @@ def compute_drag_lift(dh: DofHandler, mesh, u: VectorFunction, d: VectorFunction
     Finv = inv(F)
     J = det(F)
     grad_u = dot(grad(u), Finv)
-    sigma = -p * I + rho * mu * (grad_u + grad_u.T)
-    Piola = J * sigma * Finv.T
-    traction = dot(Piola, n)
-    ex = Constant((1.0, 0.0))
-    ey = Constant((0.0, 1.0))
-    drag = dot(traction, ex) * dS(defined_on=mesh.edge_bitset("cylinder"))
-    lift = dot(traction, ey) * dS(defined_on=mesh.edge_bitset("cylinder"))
+    pI = p * I
+    sigma_viscous_ALE = NSE_ALE.get_stress_fluid_except_pressure_ALE(mu, grad_u, Finv)
+    stress_viscous = J * dot(sigma_viscous_ALE, Finv.T)
+    fluid_pressure = -(J * dot(pI, Finv.T))
+    traction = dot(stress_viscous + fluid_pressure, n)
+    ex = Constant([1.0, 0.0], dim=1)
+    ey = Constant([0.0, 1.0], dim=1)
+    measure = dS(defined_on=edge_set)
+    drag = dot(traction, ex) * measure
+    lift = dot(traction, ey) * measure
     comp = FormCompiler(dh, backend="python")
     drag_val = comp.assemble(Equation(drag, None))[1].sum()
     lift_val = comp.assemble(Equation(lift, None))[1].sum()
@@ -1201,6 +1317,9 @@ def build_bcs(
         BoundaryCondition("uy", "dirichlet", "walls", zero),
         BoundaryCondition("ux", "dirichlet", "cylinder", zero),
         BoundaryCondition("uy", "dirichlet", "cylinder", zero),
+        # Clamp the beam root to the rigid cylinder (locator-based; no explicit edge tag)
+        BoundaryCondition("ux", "dirichlet", "beam_root", zero),
+        BoundaryCondition("uy", "dirichlet", "beam_root", zero),
     ]
     # Keep the ALE mesh fixed on the outer fluid boundary and the rigid cylinder.
     disp_bcs = [
@@ -1212,10 +1331,13 @@ def build_bcs(
         BoundaryCondition("dy", "dirichlet", "outlet", zero),
         BoundaryCondition("dx", "dirichlet", "cylinder", zero),
         BoundaryCondition("dy", "dirichlet", "cylinder", zero),
+        # Clamp beam root (no boundary edges; picked up via locator)
+        BoundaryCondition("dx", "dirichlet", "beam_root", zero),
+        BoundaryCondition("dy", "dirichlet", "beam_root", zero),
     ]
     # Anchor one pressure node to avoid the nullspace
     # p_bcs = [BoundaryCondition("p", "dirichlet", "outlet", zero)]
-    bcs = vel_bcs + disp_bcs #+ p_bcs
+    bcs = vel_bcs + disp_bcs 
     bcs_homog = [BoundaryCondition(b.field, b.method, b.domain_tag, zero) for b in bcs]
     return bcs, bcs_homog
 
@@ -1237,6 +1359,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--mesh-report", action="store_true", help="Print mesh diagnostics (boundary coverage, hanging nodes) and exit before assembly.")
     ap.add_argument("--assemble-only", action="store_true", help="Assemble residual/Jacobian once and exit (no Newton solve).")
     ap.add_argument("--plot-bcs", action="store_true", help="Save a PNG of Dirichlet DOFs using plot_mesh_2.")
+    ap.add_argument("--plot-bc-bitsets", action="store_true", help="Plot BC DOF sets per boundary tag (diagnostic).")
+    ap.add_argument("--force-geometric-tags", action="store_true", default=True, help="Overwrite existing boundary tags with geometric retagging.")
+    ap.add_argument("--fd-check", action="store_true", help="Run a finite-difference Jacobian check and report the max discrepancy.")
+    ap.add_argument("--fd-eps", type=float, default=1.0e-6, help="Step length for the finite-difference Jacobian check.")
     return ap.parse_args()
 
 
@@ -1311,6 +1437,71 @@ def _plot_dirichlet(mesh: Mesh, dh: DofHandler, bc_dofs: Dict[int, float], missi
     # plt.close(fig)
 
 
+def _plot_bc_bitsets(mesh: Mesh, dh: DofHandler, bcs: List[BoundaryCondition], output_path: Path) -> None:
+    """
+    Plot Dirichlet DOF sets per boundary tag on subplots using plot_mesh_2.
+    """
+    import math
+    import matplotlib
+    # matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # Collect DOFs per tag by re-querying get_dirichlet_data for each tag separately.
+    tag_to_bcs: Dict[str, List[BoundaryCondition]] = {}
+    for bc in bcs:
+        if getattr(bc, "method", "") != "dirichlet":
+            continue
+        tag_to_bcs.setdefault(bc.domain_tag, []).append(bc)
+
+    tag_to_dofs: Dict[str, Dict[str, list[int]]] = {}
+    for tag, bclist in tag_to_bcs.items():
+        dofs = dh.get_dirichlet_data(bclist)
+        by_field: Dict[str, list[int]] = {}
+        for gd in dofs:
+            field, _ = dh._dof_to_node_map.get(int(gd), (None, None))
+            if field is None:
+                continue
+            by_field.setdefault(field, []).append(int(gd))
+        tag_to_dofs[tag] = by_field
+
+    if not tag_to_dofs:
+        print("[plot-bc-bitsets] No Dirichlet DOFs found.")
+        return
+
+    palette = {"ux": "#d62728", "uy": "#2ca02c", "dx": "#1f77b4", "dy": "#ff7f0e", "p": "#9467bd"}
+    n_tags = len(tag_to_dofs)
+    ncols = min(3, n_tags)
+    nrows = math.ceil(n_tags / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.2 * nrows))
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax in axes[n_tags:]:
+        ax.axis("off")
+
+    for ax, (tag, by_field) in zip(axes, tag_to_dofs.items()):
+        plot_mesh_2(mesh, plot_nodes=False, plot_edges=True, elem_tags=False, edge_colors=True, show=False, ax=ax)
+        for fld, ids in by_field.items():
+            pts = dh._dof_coords[ids]
+            ax.plot(
+                pts[:, 0],
+                pts[:, 1],
+                "o",
+                markersize=2.5,
+                markerfacecolor=palette.get(fld, "k"),
+                markeredgecolor="white",
+                markeredgewidth=0.25,
+                linestyle="None",
+                label=fld,
+            )
+        ax.set_title(tag)
+        ax.legend(loc="upper right", fontsize=6)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=200)
+    plt.show()
+    # plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     mesh_path = args.mesh.resolve()
@@ -1325,7 +1516,12 @@ def main() -> None:
         mesh, fluid_bs, solid_bs = load_ucd_mesh(mesh_path, poly_order=1)
         fluid_bs, solid_bs = classify_fluid_solid(mesh)
 
-    counts = ensure_boundary_tags(mesh, tol=args.boundary_tol, mesh_size=args.mesh_size)
+    counts = ensure_boundary_tags(
+        mesh,
+        tol=args.boundary_tol,
+        mesh_size=args.mesh_size,
+        force_geometric=args.force_geometric_tags,
+    )
     node_counts = tag_nodes_from_edges(mesh)
     outlet_bs = mesh.edge_bitset("outlet")
     if outlet_bs.cardinality() == 0:
@@ -1401,7 +1597,31 @@ def main() -> None:
     dropped_p = dh.tag_dofs_from_element_bitset("inactive", "p", solid_bs, strict=True)
     if dropped_p:
         print(f"Dropped {len(dropped_p)} pressure DOFs inside the solid.")
-    
+
+    # If the mesh lacks an explicit beam_root tag, derive it from cylinder edges.
+    if mesh.edge_bitset("beam_root").cardinality() == 0:
+        loc_map = _adaptive_locators(mesh, args.boundary_tol)
+        beam_root_loc = loc_map.get("beam_root", lambda *_: False)
+        cyl_edges = mesh.edge_bitset("cylinder").to_indices()
+        if cyl_edges.size:
+            # Use corner nodes on the selected cylinder edges to avoid sweeping high-order interior DOFs.
+            for field in ("ux", "uy", "dx", "dy"):
+                ids: set[int] = set()
+                node2dof = dh.dof_map.get(field, {})
+                for eid in cyl_edges:
+                    try:
+                        e_obj = mesh.edge(int(eid))
+                    except Exception:
+                        continue
+                    for nid in (e_obj.all_nodes if e_obj.all_nodes else e_obj.nodes):
+                        x, y = mesh.nodes_x_y_pos[int(nid)]
+                        if beam_root_loc(float(x), float(y)):
+                            gd = node2dof.get(int(nid))
+                            if gd is not None:
+                                ids.add(int(gd))
+                if ids:
+                    dh.dof_tags.setdefault("beam_root", set()).update(ids)
+
     res_form = build_residual(
         uk=uk,
         u_prev=u_prev,
@@ -1461,7 +1681,7 @@ def main() -> None:
     dh.apply_bcs(bcs, uk, u_prev, dk, d_prev, pk, p_prev)
     print(f"Mesh elements: fluid={fluid_bs.cardinality()}, solid={solid_bs.cardinality()}")
     print(f"Total DOFs: {dh.total_dofs}")
-    # Use explicit locators override to avoid sweeping up interior DOFs; rely on edge tags instead.
+    # Avoid locator-based sweep of interior DOFs; rely on tagged boundary edges.
     bc_dofs = dh.get_dirichlet_data(bcs, locators={})
     print(f"Dirichlet constraints: {len(bc_dofs)} DOFs")
     bc_dof_set = set(bc_dofs.keys())
@@ -1473,6 +1693,8 @@ def main() -> None:
         bc_fields_by_tag.setdefault(bc.domain_tag, set()).add(bc.field)
 
     coverage_report = []
+    locators = getattr(mesh, "_boundary_locators", {})
+    field_sets = {f: set(dh.get_field_slice(f)) for f in dh.field_names}
     geom_nodes_union: set[int] = set()
     for tag, fields in bc_fields_by_tag.items():
         nodes = boundary_nodes.get(tag, set())
@@ -1480,6 +1702,8 @@ def main() -> None:
         for field in fields:
             node2dof = dh.dof_map.get(field, {})
             expected = {node2dof[n] for n in nodes if n in node2dof}
+            if tag in dh.dof_tags:
+                expected |= (set(dh.dof_tags[tag]) & field_sets[field])
             missing = expected - bc_dof_set
             coverage_report.append((field, tag, len(expected), len(missing)))
     print(f"Boundary geometry nodes touched by BCs: {len(geom_nodes_union)}")
@@ -1497,6 +1721,8 @@ def main() -> None:
             expected_all |= {node2dof[n] for n in nodes if n in node2dof}
             # include higher-order edge DOFs that live on tagged edges
             expected_all |= _collect_edge_dofs(mesh, dh, tag, field)
+            if tag in dh.dof_tags:
+                expected_all |= (set(dh.dof_tags[tag]) & field_sets[field])
     missing_all = expected_all - bc_dof_set
     extra_all = bc_dof_set - expected_all
     if missing_all:
@@ -1510,14 +1736,39 @@ def main() -> None:
     elif not missing_all:
         print("All boundary DOFs covered by supplied Dirichlet tags.")
 
-    if args.mesh_report:
-        print("Mesh diagnostics requested (--mesh-report); skipping assembly/solve.")
-        return
-
     if args.plot_bcs:
         out_path = Path("examples/plots/fsi_dirichlet_bcs.png")
         _plot_dirichlet(mesh, dh, bc_dofs, missing_all, extra_all, out_path)
         print(f"Saved Dirichlet BC plot to {out_path}")
+    if args.plot_bc_bitsets:
+        out_path = Path("examples/plots/fsi_dirichlet_bc_sets.png")
+        _plot_bc_bitsets(mesh, dh, bcs, out_path)
+        print(f"Saved Dirichlet BC bitsets to {out_path}")
+
+    if args.mesh_report:
+        print("Mesh diagnostics requested (--mesh-report); skipping assembly/solve.")
+        return
+
+    if args.fd_check:
+        stats = finite_difference_jacobian_check(
+            dh=dh,
+            res_form=res_form,
+            jac_form=jac_form,
+            funcs=[uk, dk, pk],
+            bcs=bcs,
+            bcs_homog=bcs_homog,
+            quad_order=quad_order,
+            backend=args.backend,
+            eps=args.fd_eps,
+        )
+        print(
+            f"[fd-check] ||J·δ||_inf={stats['Jd_norm_inf']:.3e}, "
+            f"||FD||_inf={stats['fd_norm_inf']:.3e}, "
+            f"max|diff|={stats['max_abs_diff']:.3e} at gdof {stats['worst_gdof']}, "
+            f"||δ||_inf={stats['delta_norm_inf']:.3e}"
+        )
+        if args.assemble_only:
+            return
 
     if args.assemble_only:
         print("Assembling once with backend='{0}' for diagnostics...".format(args.backend))
