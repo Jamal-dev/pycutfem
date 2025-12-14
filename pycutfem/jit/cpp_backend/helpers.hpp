@@ -9,7 +9,7 @@
 #include <Eigen/Dense>
 #include <unsupported/Eigen/CXX11/Tensor>
 #include <iostream>
-bool is_debug = false;
+bool is_debug = true;
 namespace py = pybind11;
 namespace pycutfem::cpp_backend {
 

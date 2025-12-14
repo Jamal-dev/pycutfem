@@ -1131,7 +1131,34 @@ class CppCodeGen:
                         emit_line(f"auto {nm} = {a.name} - {b.name};")
                         push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
                 elif op.op_symbol == "*":
-                    # print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})")
+                    is_a_basis = a.role in {"test", "trial"}
+                    if a.kind == "vec" and len(a.shape) == 1 and (a.shape[0] < 0 or a.shape[0] > 2):
+                        is_a_basis = True
+                    is_b_basis = b.role in {"test", "trial"}
+                    if b.kind == "vec" and len(b.shape) == 1 and (b.shape[0] < 0 or b.shape[0] > 2):
+                        is_b_basis = True
+                    is_a_vec_2k = a.kind == "vec" and len(a.shape) == 1 and a.shape[0] == 2
+                    is_b_vec_2k = b.kind == "vec" and len(b.shape) == 1 and b.shape[0] == 2
+                    # Debug info
+
+                    print(f"[*] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
+                          f", is_basis ({is_a_basis}, {is_b_basis})")
+                    if a.kind == "vec" and b.kind == "vec" and is_a_basis and is_b_vec_2k:
+                        # a: basis vector (-1,) and b: value vector (2,) -> matrix (2, -1)
+                        emit_line(f"Eigen::MatrixXd {nm}({b.name}.size(), {a.name}.size());")
+                        emit_line(f"{nm}.setZero();")
+                        emit_line(f"{nm}.col(0) = {a.name} * {b.name}(0);")
+                        emit_line(f"{nm}.col(1) = {a.name} * {b.name}(1);")
+                        push_bin("mat", a.role, (b.shape[0], -1))
+                        continue
+                    if b.kind == "vec" and a.kind == "vec" and is_b_basis and is_a_vec_2k:
+                        # b: basis vector (-1,) and a: value vector (2,) -> matrix (2, -1)
+                        emit_line(f"Eigen::MatrixXd {nm}({a.name}.size(), {b.name}.size());")
+                        emit_line(f"{nm}.setZero();")
+                        emit_line(f"{nm}.col(0) = {b.name} * {a.name}(0);")
+                        emit_line(f"{nm}.col(1) = {b.name} * {a.name}(1);")
+                        push_bin("mat", b.role, (a.shape[0], -1))
+                        continue
                     if a.kind == "mixed" and b.kind == "mixed":
                         emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')
                         continue
@@ -1324,10 +1351,10 @@ class CppCodeGen:
                 is_b_row_vec = b.kind == "mat" and b.shape[0] == 1 and (b.shape[1] > 1 or b.shape[1] <0)
                 is_a_col_vec = a.kind == "mat" and a.shape[1] == 1 and (a.shape[0] > 1 or a.shape[0] <0)
                 is_b_col_vec = b.kind == "mat" and b.shape[1] == 1 and (b.shape[0] > 1 or b.shape[0] <0)
-                # print(f"[dot] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
-                #       f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})"
-                #       f", union ({a_union_mat}, {b_union_mat})"
-                #       f", is_2x2 ({is_a_2x2}, {is_b_2x2}), is_1d ({is_a_1d}, {is_b_1d})")
+                print(f"[dot] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
+                      f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})"
+                      f", union ({a_union_mat}, {b_union_mat})"
+                      f", is_2x2 ({is_a_2x2}, {is_b_2x2}), is_1d ({is_a_1d}, {is_b_1d})")
                 # trial/test mass
                 # Gradient advection combinations: grad(Function) · Trial  or Trial · grad(Function)
                 if a.kind == "grad" and b.kind == "grad" and a.role in {"test", "trial"} and b.role in {"test", "trial"}:
@@ -1599,6 +1626,25 @@ class CppCodeGen:
                 is_b_scalar = b.kind in {"scalar", "vec", "mat"} and (b.shape == () or b.shape == (1,))
                 is_a_grad_basis = a.kind == "grad" and a.role in {"test", "trial"} and len(a.shape) == 3
                 is_b_grad_basis = b.kind == "grad" and b.role in {"test", "trial"} and len(b.shape) == 3
+                is_a_trial_test = a.role in {"test", "trial"}
+                is_b_trial_test = b.role in {"test", "trial"}
+                is_a_mixed = a.kind == "mixed"
+                is_b_mixed = b.kind == "mixed"
+                role = "value"
+                if not is_a_mixed and not is_b_mixed:
+                    if is_a_trial_test and not is_b_trial_test:
+                        role = a.role
+                    elif is_b_trial_test and not is_a_trial_test:
+                        role = b.role
+                    elif is_a_trial_test and is_b_trial_test:
+                        role = "mixed"
+                    else:
+                        role = "value"
+                else:
+                    role = "mixed"
+                print(f"[inner] kind ({a.kind}, {b.kind}), roles ({a.role}, {b.role}), shapes ({a.shape}, {b.shape})"
+                      f", sides ({a.side}, {b.side}), field_sides ({a.field_sides}, {b.field_sides})"
+                      f", is_2x2 ({is_a_2x2}, {is_b_2x2}), is_1d ({is_a_1d}, {is_b_1d}), is_grad_basis ({is_a_grad_basis}, {is_b_grad_basis})")
                 if a.kind == "mixed" and b.kind == "mat" and len(a.shape) == 4:
                     emit_line(f"Eigen::MatrixXd {nm} = inner_mixed_grad_const({a.name}, {b.name}, {a.shape[0]}, {a.shape[3]}, {a.shape[1]}, {a.shape[2]});")
                     push_inner("mat", "value", (-1, -1))
@@ -1613,10 +1659,10 @@ class CppCodeGen:
                         push_inner("mat", "value", (-1, -1))
                     elif a.role in {"value", "const"} and b.role == "test":
                         emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({b.name}, {a.name});")
-                        push_inner("vec", "value", (b.shape[1] if len(b.shape)>1 else -1,))
+                        push_inner("vec", "test", (b.shape[1] if len(b.shape)>1 else -1,))
                     elif b.role in {"value", "const"} and a.role == "test":
                         emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({a.name}, {b.name});")
-                        push_inner("vec", "value", (a.shape[1] if len(a.shape)>1 else -1,))
+                        push_inner("vec", "test", (a.shape[1] if len(a.shape)>1 else -1,))
                     else:
                         raise NotImplementedError(f"inner(grad, grad) unsupported for roles {a.role}/{b.role}")
                 elif a.kind == "mat" and b.kind == "mat":
@@ -1630,16 +1676,16 @@ class CppCodeGen:
                         push_inner("scalar", "value", ())
                     elif is_a_1d and is_b_basis:
                         emit_line(f"auto {nm} = const_vector_dot_basis_1d({a.name}, {b.name});")
-                        push_inner("vec", "value", (-1,))
+                        push_inner("vec", b.role, (-1,))
                     elif is_b_1d and is_a_basis:
                         emit_line(f"auto {nm} = const_vector_dot_basis_1d({b.name}, {a.name});")
-                        push_inner("vec", "value", (-1,))
+                        push_inner("vec", a.role, (-1,))
                     elif is_a_scalar and is_b_basis:
                         emit_line(f"auto {nm} = ({a.name}* {b.name}).transpose();")
-                        push_inner("vec", "value", (-1,))
+                        push_inner("vec", b.role, (-1,))
                     elif is_b_scalar and is_a_basis:
                         emit_line(f"auto {nm} = ({b.name}* {a.name}).transpose();")
-                        push_inner("vec", "value", (-1,))
+                        push_inner("vec", a.role, (-1,))
                     else:
                         raise NotImplementedError("Inner(mat, mat) supports only test/trial or 2x2 value combinations"
                                                   f" (got roles {a.role}, {b.role})"
@@ -1670,10 +1716,10 @@ class CppCodeGen:
                         push_inner("mat", "value", (-1, -1))
                 elif a.kind == "grad" and b.kind == "mat":
                     emit_line(f"Eigen::VectorXd {nm} = inner_grad_const({a.name}, {b.name});")
-                    push_inner("vec", "value", (-1,))
+                    push_inner("vec", role, (-1,))
                 elif a.kind == "mat" and b.kind == "grad":
                     emit_line(f"Eigen::VectorXd {nm} = inner_const_grad({a.name}, {b.name});")
-                    push_inner("vec", "value", (-1,))
+                    push_inner("vec", role, (-1,))
                 elif a.kind == b.kind and a.kind not in {"grad", "hess", "mixed"}:
                     # Fallback: elementwise inner for matching shapes
                     emit_line(f"double {nm} = ({a.name}.cwiseProduct({b.name})).sum();")

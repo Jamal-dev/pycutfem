@@ -1786,7 +1786,15 @@ def main() -> None:
         mixed_element=element,
         bcs=bcs,
         bcs_homog=bcs_homog,
-        newton_params=NewtonParameters(newton_tol=1e-8, max_newton_iter=20, line_search=True),
+        # Match deal.II `step-fsi.cc` line-search settings (damping=0.6, 10 tries).
+        newton_params=NewtonParameters(
+            newton_tol=1e-8,
+            max_newton_iter=20,
+            line_search=True,
+            ls_max_iter=10,
+            ls_reduction=0.6,
+            ls_c1=1.0e-4,
+        ),
         quad_order=quad_order,
         backend=args.backend,
     )

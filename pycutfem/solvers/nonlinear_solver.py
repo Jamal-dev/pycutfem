@@ -192,7 +192,9 @@ class NewtonParameters:
     # Allow deeper backtracking; some stiff problems only descend for very small α
     ls_max_iter: int = 12
     ls_reduction: float = 0.5           # α ← β·α after reject
-    ls_c1: float = 0.1#1.0e-4               # sufficient‑decrease parameter
+    # NOTE: A too-large `ls_c1` makes the Armijo test overly strict and can
+    # stall Newton (tiny accepted steps). Use a standard small value.
+    ls_c1: float = 1.0e-4               # sufficient‑decrease parameter
 
 
 @dataclass
