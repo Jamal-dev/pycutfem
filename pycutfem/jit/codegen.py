@@ -2276,7 +2276,7 @@ class NumbaCodeGen:
                     elif self.form_rank == 1:
                         body_lines.append("# RHS: dot(Function, Test)")
                         body_lines.append(
-                            f"{res_var} = dot_mass_trial_test({a.var_name}, {b.var_name}, {self.dtype})"
+                            f"{res_var} = const_vector_dot_basis_1d({a.var_name}, {b.var_name}, {self.dtype})"
                         )
                         shape = (b.shape[1],)
                         role = 'test'
@@ -2299,7 +2299,7 @@ class NumbaCodeGen:
                     elif self.form_rank == 1:
                         body_lines.append("# RHS: dot(Test, Function)")
                         body_lines.append(
-                            f"{res_var} = dot_mass_trial_test({b.var_name}, {a.var_name}, {self.dtype})"
+                            f"{res_var} = const_vector_dot_basis_1d({b.var_name}, {a.var_name}, {self.dtype})"
                         )
                         shape = (a.shape[1],)
                         role = 'test'
@@ -2325,7 +2325,7 @@ class NumbaCodeGen:
                     elif self.form_rank == 1:
                         body_lines.append("# RHS: dot(Test, Const)")
                         body_lines.append(
-                            f"{res_var} = dot_mass_trial_test({a.var_name}, {b.var_name}, {self.dtype})"
+                            f"{res_var} = const_vector_dot_basis_1d({a.var_name}, {b.var_name}, {self.dtype})"
                         )
                         shape = (a.shape[1],)
                         role = 'test'
