@@ -1148,6 +1148,8 @@ class CppCodeGen:
                     is_b_col_vec = b.kind == "mat" and len(b.shape) == 2 and b.shape[1] == 1
                     is_a_row_vec_or_col_vec_2k = (is_a_row_vec and a.shape[1] == 2) or (is_a_col_vec and a.shape[0] == 2)
                     is_b_row_vec_or_col_vec_2k = (is_b_row_vec and b.shape[1] == 2) or (is_b_col_vec and b.shape[0] == 2)
+                    is_a_2x2 = a.kind == "mat" and len(a.shape) == 2 and a.shape[0] == 2 and a.shape[1] == 2
+                    is_b_2x2 = b.kind == "mat" and len(b.shape) == 2 and b.shape[0] == 2 and b.shape[1] == 2
                     # Debug info
 
                     if CODEGEN_DEBUG:
@@ -1201,6 +1203,17 @@ class CppCodeGen:
                         emit_line(f"for (int _c=0; _c<({b.name}.cols() == 1 ? {b.name}.rows() : {b.name}.cols()); ++_c) {nm}.row(_c) = {a.name}.transpose() * ({b.name}.cols() == 1 ? {b.name}(_c,0) : {b.name}(0,_c));")
                         push_bin("mat", a.role, (2, -1))
                         continue
+                    elif a.kind == "vec" and is_a_basis and is_b_2x2:
+                        # a: basis vector (-1,) and b: value 2x2 matrix -> grad (2,-1,2)
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}(2);")
+                        emit_line(f"for (int _i=0; _i<2; ++_i) {{")
+                        emit_line(f"    {nm}[_i] = Eigen::MatrixXd({b.name}.rows(), {a.name}.size());")
+                        emit_line(f"    for (int _c=0; _c<{b.name}.rows(); ++_c) {{")
+                        emit_line(f"        {nm}[_i].row(_c) = {a.name}.transpose() * {b.name}(_c,_i);")
+                        emit_line("    }")
+                        emit_line("}")
+                        push_bin("grad", a.role, (2, -1, 2))
+                        continue
                     if a.kind == "vec" and b.kind == "vec" and is_b_basis and not is_a_basis:
                         # b: basis vector (-1,) and a: value vector (k,) -> matrix (k, -1)
                         emit_line(f"Eigen::MatrixXd {nm}({a.name}.size(), {b.name}.size());")
@@ -1213,6 +1226,17 @@ class CppCodeGen:
                         emit_line(f"Eigen::MatrixXd {nm}({a.name}.cols() == 1 ? {a.name}.rows() : {a.name}.cols(), {b.name}.size());")
                         emit_line(f"for (int _c=0; _c<({a.name}.cols() == 1 ? {a.name}.rows() : {a.name}.cols()); ++_c) {nm}.row(_c) = {b.name}.transpose() * ({a.name}.cols() == 1 ? {a.name}(_c,0) : {a.name}(0,_c));")
                         push_bin("mat", b.role, (2, -1))
+                        continue
+                    elif b.kind == "vec" and is_b_basis and is_a_2x2:
+                        # b: basis vector (-1,) and a: value 2x2 matrix -> grad (2,-1,2)
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}(2);")
+                        emit_line(f"for (int _i=0; _i<2; ++_i) {{")
+                        emit_line(f"    {nm}[_i] = Eigen::MatrixXd({a.name}.rows(), {b.name}.size());")
+                        emit_line(f"    for (int _c=0; _c<{a.name}.rows(); ++_c) {{")
+                        emit_line(f"        {nm}[_i].row(_c) = {b.name}.transpose() * {a.name}(_c,_i);")
+                        emit_line("    }")
+                        emit_line("}")
+                        push_bin("grad", b.role, (2, -1, 2))
                         continue
                     if a.kind == "mixed" and b.kind == "mixed":
                         emit_line('throw std::runtime_error("Mixed * mixed not supported in C++ backend");')

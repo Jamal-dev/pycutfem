@@ -4165,6 +4165,32 @@ class FormCompiler:
                         f"but boundary kernel expects {n_edges} edges."
                     )
 
+        # ------------------------------------------------------------------
+        # Active-field compression / reordering
+        #
+        # Boundary kernels (especially the C++ backend) may encode a field order
+        # that differs from the MixedElement's native union ordering. If we do
+        # not reorder `gdofs_map` (and all union-sized tables) accordingly, the
+        # kernel will read the wrong DOF columns and can silently return zeros.
+        # ------------------------------------------------------------------
+        active_fields = _active_field_order(ir, me)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_fields = tuple(runner_active)
+        else:
+            _param_fields: list[str] = []
+            for name in getattr(runner, "param_order", []):
+                has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
+                if name.startswith(("b_", "g_")) or has_deriv:
+                    fld = name.split("_", 1)[1] if "_" in name else name
+                    if fld in getattr(me, "field_names", ()):
+                        _param_fields.append(fld)
+            if _param_fields:
+                active_fields = tuple(dict.fromkeys(_param_fields))  # preserve order, drop dups
+        active_cols = _active_columns(me, active_fields)
+        args = _compress_static_for_active(args, me, active_cols)
+        gdofs_map = args.get("gdofs_map", geo.get("gdofs_map"))
+
         # 4. up-to-date coefficient Functions -------------------------
         #    • ignore test/trial symbols
         #    • add parent vectors only if they look like real coefficient vectors
@@ -4180,7 +4206,7 @@ class FormCompiler:
         _scatter_element_contribs(
             K_loc, F_loc, J_loc,
             element_ids=geo["eids"],                 # rows ≡ edge ids
-            gdofs_map=geo["gdofs_map"],
+            gdofs_map=gdofs_map,
             matvec=matvec, 
             ctx=self.ctx, 
             integrand=intg.integrand,

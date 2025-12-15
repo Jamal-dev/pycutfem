@@ -399,30 +399,13 @@ inline py::array_t<double> pushforward_grad_to_union(const py::array_t<double>& 
  * - This is mathematically equivalent to b.transpose() * A.
  * - Result is ALWAYS returned as a Row Vector (1, N).
  */
-template <typename DerivedA, typename DerivedB>
-Eigen::MatrixXd contract_mat_vector_first_index(const Eigen::MatrixBase<DerivedA>& A, 
-                                                const Eigen::MatrixBase<DerivedB>& b) {
-    
-    // 1. Identify the length of vector 'b'
-    //    Prioritize rows() for standard columns (K, 1).
-    long b_len = (b.cols() == 1) ? b.rows() : b.cols();
-
-    // 2. Validate Dimensions: b must match A's ROWS
-    if (A.rows() != b_len) {
+inline Eigen::MatrixXd contract_mat_vector_first_index(const Eigen::MatrixXd& A,
+                                                       const Eigen::VectorXd& b) {
+    if (A.rows() != b.size()) {
         throw std::runtime_error("Dimension mismatch in contract_mat_vector_first_index: "
                                  "Matrix rows must match Vector size.");
     }
-
-    // 3. Perform Multiplication enforcing (1, N) result
-    if (b.cols() == 1) {
-        // Case 1: 'b' is a Column Vector (K, 1)
-        // Operation: (K, 1)^T * (K, N) -> (1, K) * (K, N) -> (1, N)
-        return b.transpose() * A;
-    } else {
-        // Case 2: 'b' is a Row Vector (1, K)
-        // Operation: (1, K) * (K, N) -> (1, N)
-        return b * A;
-    }
+    return b.transpose() * A;  // (1,N)
 }
 
 /**
@@ -432,35 +415,13 @@ Eigen::MatrixXd contract_mat_vector_first_index(const Eigen::MatrixBase<DerivedA
  * - Contracts columns of A (M x N) with b (N).
  * - Result is ALWAYS returned as a Row Vector (1, M).
  */
-template <typename DerivedA, typename DerivedB>
-Eigen::MatrixXd contract_matrix_vector(const Eigen::MatrixBase<DerivedA>& A, 
-                                       const Eigen::MatrixBase<DerivedB>& b) {
-    
-    // 1. Identify the length of vector 'b'
-    //    If b.cols() == 1, it's a column vector -> size is rows().
-    //    Otherwise (including 1x1 treated as row), size is cols().
-    //    Note: We prioritize column checking to handle (N, 1) correctly.
-    long b_len = (b.cols() == 1) ? b.rows() : b.cols();
-
-    // 2. Validate Dimensions: A.cols() must match b's length
-    if (A.cols() != b_len) {
+inline Eigen::MatrixXd contract_matrix_vector(const Eigen::MatrixXd& A,
+                                              const Eigen::VectorXd& b) {
+    if (A.cols() != b.size()) {
         throw std::runtime_error("Dimension mismatch in contract_matrix_vector: "
                                  "Matrix columns must match Vector size.");
     }
-
-    // 3. Perform Multiplication enforcing (1, M) result
-    if (b.cols() == 1) {
-        // Case 1: 'b' is a Column Vector (N, 1)
-        // Operation: (M, N) * (N, 1) -> (M, 1)
-        // We transpose result to satisfy (1, M) requirement.
-        return (A * b).transpose();
-    } else {
-        // Case 2: 'b' is a Row Vector (1, N)
-        // We implicitly transpose 'b' to contract with A's columns.
-        // Operation: (M, N) * (1, N)^T -> (M, N) * (N, 1) -> (M, 1)
-        // Then transpose result to (1, M).
-        return (A * b.transpose()).transpose();
-    }
+    return (A * b).transpose();  // (1,M)
 }
 
 /**
@@ -469,30 +430,13 @@ Eigen::MatrixXd contract_matrix_vector(const Eigen::MatrixBase<DerivedA>& A,
  * - Always treats 'a' as a row vector (1, M) to contract with the rows of 'b'.
  * - Result is ALWAYS a MatrixXd of shape (1, N).
  */
-template <typename DerivedA, typename DerivedB>
-Eigen::MatrixXd contract_vector_matrix(const Eigen::MatrixBase<DerivedA>& a, 
-                                       const Eigen::MatrixBase<DerivedB>& b) {
-    
-    // 1. Identify the size of the contraction dimension from 'a'
-    //    If 'a' is (1, M), size is cols(). If (M, 1), size is rows().
-    long a_dim = (a.rows() == 1) ? a.cols() : a.rows();
-
-    // 2. Validate Dimensions: 'a' must contract with the ROWS of 'b'
-    if (a_dim != b.rows()) {
+inline Eigen::MatrixXd contract_vector_matrix(const Eigen::VectorXd& a,
+                                              const Eigen::MatrixXd& b) {
+    if (a.size() != b.rows()) {
         throw std::runtime_error("Dimension mismatch in contract_vector_matrix: "
                                  "Vector size must match Matrix rows.");
     }
-
-    // 3. Perform Multiplication enforcing (1, N) result
-    if (a.rows() == 1) {
-        // Case 1: 'a' is already a Row Vector (1, M)
-        // Operation: (1, M) * (M, N) -> (1, N)
-        return a * b;
-    } else {
-        // Case 2: 'a' is a Column Vector (M, 1)
-        // Operation: (M, 1)^T * (M, N) -> (1, M) * (M, N) -> (1, N)
-        return a.transpose() * b;
-    }
+    return a.transpose() * b;  // (1,N)
 }
 
 // ---------------------------------------------------------------------------
@@ -845,8 +789,7 @@ inline Eigen::MatrixXd dot_grad_basis_vector(const std::vector<Eigen::MatrixXd>&
 }
 
 // Vector dotted with grad(basis) -> d x n
-template <typename DerivedVec>
-inline Eigen::MatrixXd dot_vec_grad(const Eigen::MatrixBase<DerivedVec>& vec,
+inline Eigen::MatrixXd dot_vec_grad(const Eigen::VectorXd& vec,
                                     const std::vector<Eigen::MatrixXd>& grad_basis) {
     if (is_debug) { std::cout << "-----------------dot_vec_grad---------------------" << std::endl; }
     
@@ -881,6 +824,29 @@ inline Eigen::MatrixXd dot_vec_grad(const Eigen::MatrixBase<DerivedVec>& vec,
         out += grad_basis[c].transpose() * vec(c);
     }
 
+    return out;
+}
+
+inline Eigen::MatrixXd dot_vec_grad(const Eigen::RowVectorXd& vec,
+                                    const std::vector<Eigen::MatrixXd>& grad_basis) {
+    if (is_debug) { std::cout << "-----------------dot_vec_grad---------------------" << std::endl; }
+
+    if (grad_basis.empty()) return Eigen::MatrixXd();
+    long k = static_cast<long>(grad_basis.size());
+    if (vec.size() != k) {
+        throw std::runtime_error("Dimension mismatch: Vector size must match grad_basis size (k).");
+    }
+
+    long n = grad_basis[0].rows();
+    long d = grad_basis[0].cols();
+    Eigen::MatrixXd out(d, n);
+    out.setZero();
+    for (long c = 0; c < k; ++c) {
+        if (grad_basis[c].rows() != n || grad_basis[c].cols() != d) {
+            throw std::runtime_error("Irregular matrix size in grad_basis vector.");
+        }
+        out += grad_basis[c].transpose() * vec(c);
+    }
     return out;
 }
 
@@ -958,10 +924,8 @@ inline std::vector<Eigen::MatrixXd> scalar_trial_times_grad_test(
 
     int k = static_cast<int>(grad_test.size());
     if (k == 0) return {};
-    
-    long n_test = grad_test[0].rows();
+
     long d = grad_test[0].cols();
-    long n_trial = trial_vals.size();
 
     std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k * d));
     for (int c = 0; c < k; ++c) {
@@ -984,9 +948,7 @@ inline std::vector<Eigen::MatrixXd> grad_trial_times_scalar_test(
     const Eigen::VectorXd& test_vals) {
     int k = static_cast<int>(grad_trial.size());
     if (k == 0) return {};
-    long n_trial = grad_trial[0].rows();
     long d = grad_trial[0].cols();
-    long n_test = test_vals.size();
 
     std::vector<Eigen::MatrixXd> out(static_cast<size_t>(k * d));
     for (int c = 0; c < k; ++c) {
@@ -1206,25 +1168,25 @@ inline Eigen::VectorXd inner_const_grad(const Eigen::MatrixXd& grad_val,
     return inner_grad_const(grad_test, grad_val);
 }
 
-// elementwise add/sub for Eigen matrices/vectors
-template <typename T>
-inline T binary_add(const T& a, const T& b) {
-    return a + b;
-}
-template <typename T>
-inline T binary_sub(const T& a, const T& b) {
-    return a - b;
-}
+// elementwise add/sub for common scalar/vector/matrix types
+inline double binary_add(double a, double b) { return a + b; }
+inline double binary_sub(double a, double b) { return a - b; }
+inline Eigen::VectorXd binary_add(const Eigen::VectorXd& a, const Eigen::VectorXd& b) { return a + b; }
+inline Eigen::VectorXd binary_sub(const Eigen::VectorXd& a, const Eigen::VectorXd& b) { return a - b; }
+inline Eigen::MatrixXd binary_add(const Eigen::MatrixXd& a, const Eigen::MatrixXd& b) { return a + b; }
+inline Eigen::MatrixXd binary_sub(const Eigen::MatrixXd& a, const Eigen::MatrixXd& b) { return a - b; }
 
 // Load variable component value: coeffs (nE,nU), basis (nE,nQ,nU)
 inline double load_variable_component(const py::detail::unchecked_reference<double, 2>& coeffs,
                                       const py::detail::unchecked_reference<double, 3>& basis,
                                       ssize_t e, ssize_t q, int s0, int s1) {
-    double val = 0.0;
-    for (int j = s0; j < s1; ++j) {
-        val += coeffs(e, j) * basis(e, q, j);
-    }
-    return val;
+    const int n = s1 - s0;
+    if (n <= 0) return 0.0;
+    const double* cptr = coeffs.data(e, s0);
+    const double* bptr = basis.data(e, q, s0);
+    Eigen::Map<const Eigen::VectorXd> cvec(cptr, n);
+    Eigen::Map<const Eigen::VectorXd> bvec(bptr, n);
+    return cvec.dot(bvec);
 }
 
 // gradient of a component: accumulates coefficients * phys grad
@@ -1233,16 +1195,23 @@ inline void gradient_component(Eigen::MatrixXd& out, int row,
                                const py::detail::unchecked_reference<double, 4>& gref,
                                const Eigen::Matrix<double, 2, 2>& Jloc,
                                ssize_t e, ssize_t q, int s0, int s1) {
-    double gx = 0.0, gy = 0.0;
-    for (int j = s0; j < s1; ++j) {
-        double gr0 = gref(e, q, j, 0);
-        double gr1 = gref(e, q, j, 1);
-        double px = gr0 * Jloc(0, 0) + gr1 * Jloc(1, 0);
-        double py = gr0 * Jloc(0, 1) + gr1 * Jloc(1, 1);
-        double c = coeffs(e, j);
-        gx += c * px;
-        gy += c * py;
+    const int n = s1 - s0;
+    if (n <= 0) {
+        out(row, 0) = 0.0;
+        out(row, 1) = 0.0;
+        return;
     }
+
+    const double* cptr = coeffs.data(e, s0);
+    const double* gptr0 = gref.data(e, q, s0, 0);  // interleaved (..,0),(..,1)
+    Eigen::Map<const Eigen::VectorXd> cvec(cptr, n);
+    Eigen::Map<const Eigen::VectorXd, 0, Eigen::InnerStride<2>> g0(gptr0, n);
+    Eigen::Map<const Eigen::VectorXd, 0, Eigen::InnerStride<2>> g1(gptr0 + 1, n);
+
+    const double s_g0 = cvec.dot(g0);
+    const double s_g1 = cvec.dot(g1);
+    const double gx = Jloc(0, 0) * s_g0 + Jloc(1, 0) * s_g1;
+    const double gy = Jloc(0, 1) * s_g0 + Jloc(1, 1) * s_g1;
     // Store as (ncomp, dim): rows are components, cols are spatial dimensions
     out(row, 0) = gx;
     out(row, 1) = gy;
@@ -2012,11 +1981,9 @@ inline std::vector<Eigen::MatrixXd> trace_times_identity(const Eigen::MatrixXd& 
     // 1. Flatten trace_vals (corresponds to _flatten_to_1d)
     //    We take MatrixXd as input to support both vectors and matrices genericly.
     Eigen::VectorXd flat = flatten_to_1d(trace_vals_in);
-    long n_rows = flat.size();
 
     // 2. Get dimensions from identity matrix
     long k_comps = identity.rows();
-    long d_dim = identity.cols();
 
     // 3. Initialize Output Vector (representing the 'k' axis)
     std::vector<Eigen::MatrixXd> res(k_comps);
