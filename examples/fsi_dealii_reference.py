@@ -6,8 +6,9 @@ Deal.II FSI benchmark (FSI-1) reproduced in pycutfem.
   code (channel 2.5 x 0.41 with a rigid cylinder and an attached beam).
 - Formulation: conforming ALE Navier–Stokes + compressible Neo-Hookean solid,
   monolithic theta-scheme as in `fsi_ale_conforming.py`.
-- Parameters: identical to `step-fsi.prm` (rho_f=1000, mu_f=1e-3, rho_s=1000,
-  mu_s=0.5e6, nu_s=0.4, alpha_u=1e-8, dt=1.0, theta=1.0, 25 steps).
+- Parameters: identical to `step-fsi.prm` (rho_f=1000, nu_f=1e-3, rho_s=1000,
+  mu_s=0.5e6, nu_s=0.4, alpha_u=1e-8, dt=1.0, theta=1.0, 25 steps), with
+  dynamic viscosity μ = ρ·ν as in `step-fsi.cc`.
 
 The goal is to mirror the established deal.II example and verify that the
 pycutfem formulation converges on the same data set.
@@ -54,7 +55,12 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.ufl.measures import dx, dS
 from pycutfem.ufl.compilers import FormCompiler
-from pycutfem.solvers.nonlinear_solver import NewtonParameters, NewtonSolver, TimeStepperParameters
+from pycutfem.solvers.nonlinear_solver import (
+    NewtonParameters,
+    NewtonSolver,
+    PetscSnesNewtonSolver,
+    TimeStepperParameters,
+)
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
 from pycutfem.io.visualization import plot_mesh_2
 
@@ -84,11 +90,41 @@ def load_ucd_mesh(path: Path, poly_order: int = 1) -> Tuple[Mesh, BitSet, BitSet
         n_nodes, n_cells = int(header[0]), int(header[1])
 
         nodes: List[Node] = []
+        node_id_map: Dict[int, int] = {}
         for _ in range(n_nodes):
             nid, xs, ys, *_ = f.readline().split()
-            nodes.append(Node(int(nid), float(xs), float(ys)))
+            old_id = int(nid)
+            new_id = len(nodes)
+            node_id_map[old_id] = new_id
+            nodes.append(Node(new_id, float(xs), float(ys)))
 
         coords = np.array([[n.x, n.y] for n in nodes], dtype=float)
+
+        def _signed_area_quad(node_ids: List[int]) -> float:
+            pts = coords[np.asarray(node_ids, dtype=int)]
+            x = pts[:, 0]
+            y = pts[:, 1]
+            return 0.5 * float(np.sum(x * np.roll(y, -1) - y * np.roll(x, -1)))
+
+        def _order_corners_perimeter_ccw(node_ids: List[int]) -> List[int]:
+            """
+            Return the 4 corner node ids in a CCW perimeter order starting from the
+            geometrically bottom-left corner (min x, then min y).
+
+            This yields a stable corner ordering for Mesh corner_connectivity, while
+            allowing element_connectivity to use the row-major lattice ordering
+            required by higher-order routines.
+            """
+            pts = coords[np.asarray(node_ids, dtype=int)]
+            centroid = pts.mean(axis=0)
+            angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
+            order = np.argsort(angles)
+            perim = [node_ids[int(i)] for i in order]
+            if _signed_area_quad(perim) < 0.0:
+                perim = list(reversed(perim))
+            pts_perim = coords[np.asarray(perim, dtype=int)]
+            start = int(np.lexsort((pts_perim[:, 1], pts_perim[:, 0]))[0])
+            return perim[start:] + perim[:start]
 
         elem_conn: List[List[int]] = []
         corner_conn: List[List[int]] = []
@@ -101,28 +137,19 @@ def load_ucd_mesh(path: Path, poly_order: int = 1) -> Tuple[Mesh, BitSet, BitSet
             _, mat_id, cell_type, *conn = parts
             ctype = cell_type.lower()
             if ctype == "quad":
-                conn_int = list(map(int, conn))
+                conn_int = [node_id_map[int(n)] for n in conn]
                 corn = conn_int[:4]
-                pts = coords[corn]
-                xmin, xmax = pts[:, 0].min(), pts[:, 0].max()
-                ymin, ymax = pts[:, 1].min(), pts[:, 1].max()
-
-                def _closest(target: Tuple[float, float]) -> int:
-                    dist = np.sum((pts - target) ** 2, axis=1)
-                    return int(np.argmin(dist))
-
-                bl = _closest((xmin, ymin))
-                br = _closest((xmax, ymin))
-                tl = _closest((xmin, ymax))
-                tr = _closest((xmax, ymax))
-                # Ordering (BL, BR, TL, TR) keeps the bilinear map positive on this mesh
-                ordered = [corn[i] for i in (bl, br, tl, tr)]
-                elem_conn.append(ordered)
-                corner_conn.append(ordered)
+                # Mesh expects:
+                # - corner_connectivity: perimeter order (BL, BR, TR, TL) up to rotation
+                # - element_connectivity: row-major lattice order (BL, BR, TL, TR) for FE_Q
+                perim = _order_corners_perimeter_ccw(corn)
+                lattice = [perim[0], perim[1], perim[3], perim[2]]
+                elem_conn.append(lattice)
+                corner_conn.append(perim)
                 elem_tags.append("solid" if int(mat_id) == 1 else "fluid")
             elif ctype == "line" and len(conn) >= 2:
-                n1, n2 = map(int, conn[:2])
-                boundary_segments.append((int(mat_id), n1, n2))
+                n1, n2 = (node_id_map[int(conn[0])], node_id_map[int(conn[1])])
+                boundary_segments.append((int(mat_id), int(n1), int(n2)))
             else:
                 continue
 
@@ -1035,12 +1062,12 @@ def build_jac(
     solid_stress_LinU = Structure_Terms.get_Piola_Kirchhoff_1st_LinAll(
         F, grad_dd, mu_s, lambda_s
     )
-    jac_solid = ( rho_s * dot(du, test_v)
-                    + timestep * theta *inner(solid_stress_LinU, grad(test_v))
-                    + rho_s * dot(dd, test_w)
-                    - timestep * theta  * dot(du, test_w)
-                    + dp * test_q
-
+    jac_solid = (
+        rho_s * dot(du, test_v)
+        + timestep * theta * inner(solid_stress_LinU, grad(test_v))
+        + rho_s * dot(dd, test_w)
+        - rho_s * timestep * theta * dot(du, test_w)
+        + dp * test_q
     ) * dx_s
 
 
@@ -1144,10 +1171,10 @@ def build_residual(
     residual_solid = (
         rho_s * inner(uk - u_prev, v_test)
         + dt * theta * inner(solid_stress_transfomed, grad(v_test))
-        + dt * (1.0-theta) * inner(solid_stress_transfomed_old, grad(v_test))
+        + dt * (1.0 - theta) * inner(solid_stress_transfomed_old, grad(v_test))
         + rho_s * inner(dk - d_prev, w_test)
         - rho_s * dt * theta * inner(uk, w_test)
-        - rho_s * dt * (1.0-theta) * inner(u_prev, w_test)
+        - rho_s * dt * (1.0 - theta) * inner(u_prev, w_test)
         + pk * q_test
     ) * dx_s
 
@@ -1325,7 +1352,7 @@ def build_bcs(
     disp_bcs = [
         BoundaryCondition("dx", "dirichlet", "inlet", zero),
         BoundaryCondition("dy", "dirichlet", "inlet", zero),
-        BoundaryCondition("dx", "dirichlet", "walls", zero),
+        # Match step-fsi.cc: allow tangential mesh slip on the walls (fix normal component only).
         BoundaryCondition("dy", "dirichlet", "walls", zero),
         BoundaryCondition("dx", "dirichlet", "outlet", zero),
         BoundaryCondition("dy", "dirichlet", "outlet", zero),
@@ -1353,8 +1380,25 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--poly-order", type=int, default=2, help="Polynomial order for velocity/displacement (Taylor–Hood).")
     ap.add_argument("--dt", type=float, default=1.0, help="Time step size (default from step-fsi.prm).")
     ap.add_argument("--theta", type=float, default=1.0, help="Theta scheme parameter (1=BE, 0.5=CN).")
-    ap.add_argument("--n-steps", type=int, default=3, help="Number of time steps (default small for quick verification).")
+    ap.add_argument("--n-steps", type=int, default=2, help="Number of time steps (default small for quick verification).")
     ap.add_argument("--backend", choices=("jit", "python"), default="python", help="Form compiler backend.")
+    ap.add_argument(
+        "--nonlinear-solver",
+        choices=("snes", "newton"),
+        default="newton",
+        help="Nonlinear solver: PETSc SNES (robust) or pure Python Newton.",
+    )
+    ap.add_argument("--newton-tol", type=float, default=1.0e-8, help="Newton convergence tolerance on ‖R‖∞.")
+    ap.add_argument("--max-newton-iter", type=int, default=40, help="Maximum Newton iterations per time step.")
+    ap.add_argument(
+        "--ls-mode",
+        choices=("armijo", "dealii"),
+        default="armijo",
+        help="Line search: Armijo on ½‖R‖² (robust) or deal.II-style ‖R‖∞ decrease.",
+    )
+    ap.add_argument("--ls-max-iter", type=int, default=25, help="Maximum backtracking steps in the line search.")
+    ap.add_argument("--ls-reduction", type=float, default=0.5, help="Backtracking reduction factor α←β·α.")
+    ap.add_argument("--ls-c1", type=float, default=1.0e-4, help="Armijo sufficient decrease parameter c1.")
     ap.add_argument("--boundary-tol", type=float, default=1.0e-6, help="Tolerance for geometric boundary retagging.")
     ap.add_argument("--mesh-report", action="store_true", help="Print mesh diagnostics (boundary coverage, hanging nodes) and exit before assembly.")
     ap.add_argument("--assemble-only", action="store_true", help="Assemble residual/Jacobian once and exit (no Newton solve).")
@@ -1363,7 +1407,44 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--force-geometric-tags", action="store_true", default=True, help="Overwrite existing boundary tags with geometric retagging.")
     ap.add_argument("--fd-check", action="store_true", help="Run a finite-difference Jacobian check and report the max discrepancy.")
     ap.add_argument("--fd-eps", type=float, default=1.0e-6, help="Step length for the finite-difference Jacobian check.")
+    ap.add_argument(
+        "--no-anchor-pressure",
+        action="store_false",
+        dest="anchor_pressure",
+        help="Disable pinning one pressure DOF (gauge fixing).",
+    )
+    ap.set_defaults(anchor_pressure=True)
     return ap.parse_args()
+
+
+def _pin_pressure_gauge(mesh: Mesh, dh: DofHandler, *, tag: str = "p_anchor") -> int | None:
+    """
+    Pin a single pressure DOF to remove the (near) constant-pressure nullspace.
+    Returns the pinned global DOF id, or None if not found.
+    """
+    try:
+        coords_p = dh.get_dof_coords("p")
+        p_dofs = np.asarray(dh.get_field_slice("p"), dtype=int)
+    except Exception:
+        return None
+    if coords_p is None or len(coords_p) == 0 or p_dofs.size == 0:
+        return None
+
+    # Prefer a DOF on the outlet boundary (x ≈ xmax), closest to the mid-height.
+    try:
+        x_max = float(np.max(coords_p[:, 0]))
+        outlet = np.where(np.isclose(coords_p[:, 0], x_max, atol=1.0e-10))[0]
+    except Exception:
+        outlet = np.array([], dtype=int)
+    if outlet.size == 0:
+        outlet = np.arange(coords_p.shape[0], dtype=int)
+
+    y_mid = 0.5 * H
+    loc = int(outlet[np.argmin(np.abs(coords_p[outlet, 1] - y_mid))])
+    gdof = int(p_dofs[loc])
+
+    dh.dof_tags.setdefault(tag, set()).add(gdof)
+    return gdof
 
 
 def _collect_edge_dofs(mesh: Mesh, dh: DofHandler, tag: str, field: str) -> set[int]:
@@ -1548,7 +1629,9 @@ def main() -> None:
     areas = []
     for el in mesh.elements_list:
         pts = coords[list(el.corner_nodes)]
-        area = 0.5 * np.cross(pts, np.roll(pts, -1, axis=0)).sum()
+        x = pts[:, 0]
+        y = pts[:, 1]
+        area = 0.5 * float(np.sum(x * np.roll(y, -1) - y * np.roll(x, -1)))
         areas.append(abs(area))
     print(f"Element area stats: min={np.min(areas):.3e}, max={np.max(areas):.3e}")
 
@@ -1556,7 +1639,8 @@ def main() -> None:
         mesh,
         field_specs={"ux": args.poly_order, "uy": args.poly_order, "dx": args.poly_order, "dy": args.poly_order, "p": args.poly_order - 1},
     )
-    dh = DofHandler(element, method="cg")
+    # Match step-fsi.cc: CG velocity/displacement, DG pressure (FE_DGP).
+    dh = DofHandler(element, method="cg", field_methods={"p": "dg"})
 
     vel_space = FunctionSpace(name="vel", field_names=["ux", "uy"], dim=1)
     disp_space = FunctionSpace(name="disp", field_names=["dx", "dy"], dim=1)
@@ -1580,6 +1664,8 @@ def main() -> None:
 
     # Physical parameters from step-fsi.prm
     rho_f = Constant(1.0e3)
+    # step-fsi.cc uses ν (kinematic viscosity) and multiplies by density in the stress:
+    # μ = ρ ν, with ν = 1e-3 from step-fsi.prm.
     nu_f = Constant(1.0e-3)
     mu_f = rho_f * nu_f
     rho_s = Constant(1.0e3)
@@ -1594,9 +1680,11 @@ def main() -> None:
     quad_order = 2 * args.poly_order + 4
 
     # Drop pressure DOFs living purely in the solid.
-    dropped_p = dh.tag_dofs_from_element_bitset("inactive", "p", solid_bs, strict=True)
-    if dropped_p:
-        print(f"Dropped {len(dropped_p)} pressure DOFs inside the solid.")
+    # NOTE: step-fsi.cc keeps pressure unknowns in the solid and enforces p=0 there
+    # via a mass term; leave them enabled here to mirror the reference.
+    # dropped_p = dh.tag_dofs_from_element_bitset("inactive", "p", solid_bs, strict=True)
+    # if dropped_p:
+    #     print(f"Dropped {len(dropped_p)} pressure DOFs inside the solid.")
 
     # If the mesh lacks an explicit beam_root tag, derive it from cylinder edges.
     if mesh.edge_bitset("beam_root").cardinality() == 0:
@@ -1677,6 +1765,15 @@ def main() -> None:
     
 
     bcs, bcs_homog = build_bcs(u_mean=0.2, theta=args.theta)
+    if args.anchor_pressure:
+        pinned = _pin_pressure_gauge(mesh, dh, tag="p_anchor")
+        if pinned is None:
+            print("[warn] Could not pin a pressure DOF; continuing without gauge fixing.")
+        else:
+            zero = lambda x, y, t=0.0: 0.0
+            bcs.append(BoundaryCondition("p", "dirichlet", "p_anchor", zero))
+            bcs_homog.append(BoundaryCondition("p", "dirichlet", "p_anchor", zero))
+            print(f"Pinned pressure DOF for gauge fixing: {pinned}")
 
     dh.apply_bcs(bcs, uk, u_prev, dk, d_prev, pk, p_prev)
     print(f"Mesh elements: fluid={fluid_bs.cardinality()}, solid={solid_bs.cardinality()}")
@@ -1779,25 +1876,46 @@ def main() -> None:
         print("Assembly completed; exiting early (--assemble-only).")
         return
 
-    solver = NewtonSolver(
-        residual_form=res_form,
-        jacobian_form=jac_form,
-        dof_handler=dh,
-        mixed_element=element,
-        bcs=bcs,
-        bcs_homog=bcs_homog,
-        # Match deal.II `step-fsi.cc` line-search settings (damping=0.6, 10 tries).
-        newton_params=NewtonParameters(
-            newton_tol=1e-8,
-            max_newton_iter=20,
-            line_search=True,
-            ls_max_iter=10,
-            ls_reduction=0.6,
-            ls_c1=1.0e-4,
-        ),
-        quad_order=quad_order,
-        backend=args.backend,
+    newton_params = NewtonParameters(
+        newton_tol=float(args.newton_tol),
+        max_newton_iter=int(args.max_newton_iter),
+        line_search=True,
+        ls_mode=str(args.ls_mode),
+        ls_max_iter=int(args.ls_max_iter),
+        ls_reduction=float(args.ls_reduction),
+        ls_c1=float(args.ls_c1),
     )
+    if args.nonlinear_solver == "snes":
+        solver = PetscSnesNewtonSolver(
+            residual_form=res_form,
+            jacobian_form=jac_form,
+            dof_handler=dh,
+            mixed_element=element,
+            bcs=bcs,
+            bcs_homog=bcs_homog,
+            newton_params=newton_params,
+            quad_order=quad_order,
+            backend=args.backend,
+            petsc_options={
+                "snes_type": "newtonls",
+                "snes_linesearch_type": "bt",
+                "ksp_type": "preonly",
+                "pc_type": "lu",
+                # Let PETSc pick an available LU backend.
+            },
+        )
+    else:
+        solver = NewtonSolver(
+            residual_form=res_form,
+            jacobian_form=jac_form,
+            dof_handler=dh,
+            mixed_element=element,
+            bcs=bcs,
+            bcs_homog=bcs_homog,
+            newton_params=newton_params,
+            quad_order=quad_order,
+            backend=args.backend,
+        )
     time_params = TimeStepperParameters(dt=args.dt, max_steps=args.n_steps, stop_on_steady=False, final_time=args.dt * args.n_steps)
     aux_funcs: Dict[str, object] = {
         "u_ux": uk.components[0],
@@ -1817,8 +1935,10 @@ def main() -> None:
         time_params=time_params,
     )
 
+    rho_f_val = float(rho_f.value)
+    mu_f_val = float(rho_f.value) * float(nu_f.value)
     try:
-        drag, lift = compute_drag_lift(dh, mesh, uk, dk, pk, rho_f.value, mu_f.value)
+        drag, lift = compute_drag_lift(dh, mesh, uk, dk, pk, rho_f_val, mu_f_val)
     except Exception as exc:
         drag = lift = float("nan")
         print(f"Drag/lift computation skipped: {exc}")

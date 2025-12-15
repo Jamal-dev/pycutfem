@@ -142,14 +142,17 @@ def _scatter_element_contribs_reduced(
     if A_red is not None and K_elem is not None and K_elem.ndim == 3:
         for i in range(len(element_ids)):
             gdofs = gdofs_map[i]
-            rmap  = full_to_red[gdofs]
+            valid_full = gdofs >= 0
+            rmap = -np.ones_like(gdofs, dtype=int)
+            if np.any(valid_full):
+                rmap[valid_full] = full_to_red[gdofs[valid_full]]
             rmask = rmap >= 0
             if not np.any(rmask):
                 continue
             rows = rmap[rmask]
 
             # columns use the same element gdofs (bilinear form)
-            cmap  = full_to_red[gdofs]
+            cmap = rmap
             cmask = cmap >= 0
             if not np.any(cmask):
                 continue
@@ -162,7 +165,10 @@ def _scatter_element_contribs_reduced(
     if R_red is not None and F_elem is not None:
         for i in range(len(element_ids)):
             gdofs = gdofs_map[i]
-            rmap  = full_to_red[gdofs]
+            valid_full = gdofs >= 0
+            rmap = -np.ones_like(gdofs, dtype=int)
+            if np.any(valid_full):
+                rmap[valid_full] = full_to_red[gdofs[valid_full]]
             rmask = rmap >= 0
             if not np.any(rmask):
                 continue
@@ -189,6 +195,10 @@ class NewtonParameters:
 
     # Armijo back‑tracking line‑search
     line_search: bool = True
+    # Line-search mode:
+    # - "armijo": backtracking on ½‖R‖² with Armijo sufficient decrease
+    # - "dealii": backtracking that only requires ‖R‖_∞ to decrease (step-fsi.cc style)
+    ls_mode: str = "armijo"
     # Allow deeper backtracking; some stiff problems only descend for very small α
     ls_max_iter: int = 12
     ls_reduction: float = 0.5           # α ← β·α after reject
@@ -570,12 +580,14 @@ class NewtonSolver:
         """
 
         dh = self.dh
-        dt = time_params.dt
         delta_U = np.zeros(dh.total_dofs)
 
         t_start = time.perf_counter()
-        for step in range(time_params.max_steps):
-            t_n = step * dt
+        step = 0
+        t_n = 0.0
+        prev_delta_inf: float | None = None
+        while step < time_params.max_steps and t_n < time_params.final_time:
+            dt = float(time_params.dt)
 
             # Predictor: copy previous solution ---------------------
             for f, f_prev in zip(functions, prev_functions):
@@ -587,26 +599,25 @@ class NewtonSolver:
 
             # Newton loop -----------------------------------------
             delta_U = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
-            print(f"    Time step {step+1}: ΔU = {np.linalg.norm(delta_U, ord=np.inf):.2e}")
+            delta_inf = float(np.linalg.norm(delta_U, ord=np.inf))
+            print(f"    Time step {step+1}: ΔU = {delta_inf:.2e}")
             
             # Post-step refiner (VI clip) **before** promotion so prev matches clipped state
             if post_step_refiner is not None:
                 post_step_refiner(step, bcs_now, functions, prev_functions)
-            
-             # Accept: promote current → previous
-            for f_prev, f in zip(prev_functions, functions):
-                f_prev.nodal_values[:] = f.nodal_values[:]
 
-            if step > 0:
-                # Reject and retry with smaller Δt if the update blows up
-                if np.linalg.norm(delta_U, np.inf) > 5.0 * (np.linalg.norm(self.delta_U_prev, np.inf) if step else 1.0):
-                    # restore current to previous and cut dt
-                    for f, fp in zip(functions, prev_functions):
-                        f.nodal_values[:] = fp.nodal_values[:]
+            # Reject and retry with smaller Δt if the update blows up
+            if step > 0 and prev_delta_inf is not None and prev_delta_inf > 0.0:
+                if delta_inf > 5.0 * prev_delta_inf:
                     time_params.dt *= 0.5
                     print(f"    Rejecting step {step+1}; reducing Δt → {time_params.dt:.3e} and retrying.")
                     continue
-            self.delta_U_prev = delta_U.copy()
+
+            # Accept: promote current → previous
+            for f_prev, f in zip(prev_functions, functions):
+                f_prev.nodal_values[:] = f.nodal_values[:]
+            prev_delta_inf = delta_inf
+
             # Steady‑state test -----------------------------------
             if (
                 time_params.stop_on_steady
@@ -622,11 +633,11 @@ class NewtonSolver:
             # Post time-loop callback
             if self.post_timeloop_cb is not None:
                 self.post_timeloop_cb(functions)
-            if t_n + dt >= time_params.final_time:
-                break
+            t_n += dt
+            step += 1
 
         elapsed = time.perf_counter() - t_start
-        return delta_U, step + 1, elapsed
+        return delta_U, step, elapsed
 
     # ------------------------------------------------------------------
     #  Newton iteration (internal)
@@ -725,6 +736,47 @@ class NewtonSolver:
             t_lin = time.perf_counter()
             dU_red = self._solve_linear_system(A_red, -R_red)
             linear_time = time.perf_counter() - t_lin
+            if os.getenv("PYCUTFEM_NEWTON_TRACE", "").lower() in {"1", "true", "yes"}:
+                lin_inf = float(np.linalg.norm(A_red @ dU_red + R_red, ord=np.inf))
+                du_inf = float(np.linalg.norm(dU_red, ord=np.inf))
+                dU_full_dbg = self.restrictor.expand_vec(dU_red)
+                field_norms = []
+                for fld in getattr(self.dh, "field_names", []):
+                    try:
+                        sl = self.dh.get_field_slice(fld)
+                    except Exception:
+                        continue
+                    if sl is None or len(sl) == 0:
+                        continue
+                    field_norms.append(f"{fld}:{np.linalg.norm(dU_full_dbg[sl], ord=np.inf):.2e}")
+                extra = ("  [" + ", ".join(field_norms) + "]") if field_norms else ""
+                print(f"        [lin] ‖A·δU+R‖∞={lin_inf:.3e}  ‖δU‖∞={du_inf:.3e}{extra}")
+
+            if os.getenv("PYCUTFEM_DIRDERIV_CHECK", "").lower() in {"1", "true", "yes"}:
+                # Directional derivative check: (R(u+ε·δ) - R(u))/ε ≈ J·δ = -R(u)
+                eps = float(os.getenv("PYCUTFEM_DIRDERIV_EPS", "1e-6"))
+                snap = [f.nodal_values.copy() for f in funcs]
+                dU_full = self.restrictor.expand_vec(eps * dU_red)
+                dh.add_to_functions(dU_full, funcs)
+                dh.apply_bcs(bcs_now, *funcs)
+                _, R_eps = self._assemble_system_reduced(current, need_matrix=False)
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                derr = (R_eps - R_red) / eps + R_red
+                dir_err = float(np.linalg.norm(derr, ord=np.inf))
+                worst_red = int(np.argmax(np.abs(derr))) if derr.size else -1
+                worst_full = int(self.active_dofs[worst_red]) if worst_red >= 0 else -1
+                worst_val = float(derr[worst_red]) if worst_red >= 0 else 0.0
+                field = None
+                try:
+                    field = getattr(self.dh, "_dof_to_node_map", {}).get(worst_full, (None, None))[0]
+                except Exception:
+                    field = None
+                fmsg = f", field={field}" if field is not None else ""
+                print(
+                    f"        [dd] ‖(R(u+ε·δ)-R(u))/ε + R(u)‖∞={dir_err:.3e} "
+                    f"(ε={eps:.1e}, worst_gdof={worst_full}, worst_val={worst_val:.3e}{fmsg})"
+                )
 
             # 3) Optional Armijo backtracking in reduced space (no BC re-application inside)
             if getattr(self.np, "line_search", False):
@@ -773,7 +825,53 @@ class NewtonSolver:
         """
         dh   = self.dh
         np_  = self.np
+        mode = getattr(np_, "ls_mode", "armijo")
         c1   = getattr(np_, "ls_c1", 1.0e-4)
+
+        if mode not in {"armijo", "dealii"}:
+            raise ValueError(f"Unknown line-search mode '{mode}'.")
+
+        # Deal.II style: accept the first step that reduces the infinity norm of the residual.
+        if mode == "dealii":
+            trace = os.getenv("PYCUTFEM_LS_TRACE", "").lower() in {"1", "true", "yes"}
+            # Warm-start: reuse last accepted α (try slightly larger first).
+            alpha = float(getattr(self, "_ls_alpha_prev", 1.0))
+            alpha = min(1.0, alpha / float(np_.ls_reduction))
+            norm0 = float(np.linalg.norm(R_red, ord=np.inf))
+            best_alpha, best_norm = 0.0, norm0
+            snap = [f.nodal_values.copy() for f in funcs]
+
+            for _ in range(np_.ls_max_iter):
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                dU_full = self.restrictor.expand_vec(alpha * S_red)
+                dh.add_to_functions(dU_full, funcs)
+                dh.apply_bcs(bcs_now, *funcs)
+
+                _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
+                norm_try = float(np.linalg.norm(R_try, ord=np.inf))
+                if trace:
+                    print(f"        [ls] α={alpha:.6e}  ‖R‖∞={norm_try:.6e}  (‖R‖∞0={norm0:.6e})")
+
+                if norm_try < best_norm:
+                    best_norm, best_alpha = norm_try, alpha
+                if norm_try < norm0:
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+                    print(f"        Line search accepted α = {alpha:.2e} (‖R‖∞ decreased)")
+                    self._ls_alpha_prev = alpha
+                    return alpha * S_red
+
+                alpha *= np_.ls_reduction
+
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            if best_alpha > 0.0:
+                print(f"        Line search failed, using best-effort α = {best_alpha:.2e} (‖R‖∞ decreased).")
+                self._ls_alpha_prev = best_alpha
+                return best_alpha * S_red
+            print("        Line search failed – no decreasing step found; taking α = 0.")
+            return np.zeros_like(S_red)
 
         # Gradient g_f = J_ff^T R_f  (reduced variables only)
         g = A_red.T @ R_red
@@ -786,7 +884,9 @@ class NewtonSolver:
             gTS = float(g @ S_red)  # = -||g||^2 <= 0
 
         phi0 = 0.5 * float(R_red @ R_red)
-        alpha = 1.0
+        # Warm-start: reuse last accepted α (try slightly larger first).
+        alpha = float(getattr(self, "_ls_alpha_prev", 1.0))
+        alpha = min(1.0, alpha / float(np_.ls_reduction))
         best_alpha, best_phi = 0.0, phi0
 
         # Snapshot the *full* iterate
@@ -811,6 +911,7 @@ class NewtonSolver:
             if phi <= phi0 + c1 * alpha * gTS:
                 for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
                 print(f"        Armijo search accepted α = {alpha:.2e}")
+                self._ls_alpha_prev = alpha
                 return alpha * S_red
 
             alpha *= np_.ls_reduction
@@ -819,10 +920,12 @@ class NewtonSolver:
         for f, buf in zip(funcs, snap): f.nodal_values[:] = buf
         if best_alpha > 0.0:
             print(f"        Armijo failed, using best-effort α = {best_alpha:.2e}.")
+            self._ls_alpha_prev = best_alpha
             return best_alpha * S_red
         # No decrease found; still take the smallest tried step to avoid stagnation.
         min_alpha = alpha
         print(f"        Line search failed – taking minimal step α = {min_alpha:.2e}.")
+        self._ls_alpha_prev = min_alpha
         return min_alpha * S_red
 
     # ------------------------------------------------------------------
@@ -843,9 +946,14 @@ class NewtonSolver:
             R_red = np.zeros(nred)
             for ker in self.kernels_F:
                 _, Floc, _ = ker.exec(coeffs)
-                eids = ker.static_args["eids"]; gdofs = ker.static_args["gdofs_map"]
-                for e in range(len(eids)):
-                    rmap = self.full_to_red[gdofs[e]]
+                gdofs = ker.static_args["gdofs_map"]
+                for e in range(gdofs.shape[0]):
+                    full = gdofs[e]
+                    valid_full = full >= 0
+                    if not np.any(valid_full):
+                        continue
+                    rmap = -np.ones_like(full, dtype=int)
+                    rmap[valid_full] = self.full_to_red[full[valid_full]]
                     m = rmap >= 0
                     if np.any(m):
                         np.add.at(R_red, rmap[m], Floc[e][m])
@@ -1062,10 +1170,42 @@ class NewtonSolver:
         """
         dh = self.dh
         np_ = self.np
-        c1 = 1e-4
+        mode = getattr(np_, "ls_mode", "armijo")
+        c1 = getattr(np_, "ls_c1", 1.0e-4)
+
+        if mode not in {"armijo", "dealii"}:
+            raise ValueError(f"Unknown line-search mode '{mode}'.")
 
         snap = [f.nodal_values.copy() for f in funcs]
         phi0 = 0.5 * np.dot(R0_vec, R0_vec)
+        norm0 = float(np.linalg.norm(R0_vec, ord=np.inf))
+
+        if mode == "dealii":
+            alpha = 1.0
+            best_alpha, best_norm = 0.0, norm0
+            for _ in range(np_.ls_max_iter):
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                dh.add_to_functions(alpha * dU, funcs)
+                dh.apply_bcs(bcs_now, *funcs)
+                _, R_trial = self._assemble_system(coeffs, need_matrix=False)
+                norm_trial = float(np.linalg.norm(R_trial, ord=np.inf))
+                if norm_trial < best_norm:
+                    best_norm, best_alpha = norm_trial, alpha
+                if norm_trial < norm0:
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+                    print(f"        Line search accepted α = {alpha:.2e} (‖R‖∞ decreased)")
+                    return alpha * dU
+                alpha *= np_.ls_reduction
+
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            if best_alpha > 0.0:
+                print(f"        Line search failed, using best-effort α = {best_alpha:.2e} (‖R‖∞ decreased).")
+                return best_alpha * dU
+            print("        Line search failed – no decreasing step found; taking α = 0.")
+            return np.zeros_like(dU)
 
         # Initialize "best-effort" tracking variables
         best_alpha = 1.0
@@ -1214,7 +1354,11 @@ class NewtonSolver:
         for ker in self.kernels_K:
             gdofs = ker.static_args["gdofs_map"]
             for e in range(gdofs.shape[0]):
-                rmap = self.full_to_red[gdofs[e]]
+                full = gdofs[e]
+                valid_full = full >= 0
+                if not np.any(valid_full):
+                    continue
+                rmap = self.full_to_red[full[valid_full]]
                 rows = rmap[rmap >= 0]
                 if rows.size == 0:
                     continue
@@ -1248,7 +1392,13 @@ class NewtonSolver:
             lidx_list = []
             for e in range(gdofs.shape[0]):
                 full = gdofs[e]
-                rmap = self.full_to_red[full]
+                valid_full = full >= 0
+                if not np.any(valid_full):
+                    pos_list.append(np.empty(0, dtype=np.int32))
+                    lidx_list.append(np.empty(0, dtype=np.int32))
+                    continue
+                rmap = -np.ones_like(full, dtype=int)
+                rmap[valid_full] = self.full_to_red[full[valid_full]]
                 mask = rmap >= 0
                 rows = rmap[mask]
                 if rows.size == 0:
@@ -1316,7 +1466,12 @@ class NewtonSolver:
             t_scatter = time.perf_counter()
             gdofs = ker.static_args["gdofs_map"]
             for e in range(gdofs.shape[0]):
-                rmap = self.full_to_red[gdofs[e]]
+                full = gdofs[e]
+                valid_full = full >= 0
+                if not np.any(valid_full):
+                    continue
+                rmap = -np.ones_like(full, dtype=int)
+                rmap[valid_full] = self.full_to_red[full[valid_full]]
                 mask = rmap >= 0
                 if not np.any(mask):
                     continue
@@ -1582,6 +1737,14 @@ class PetscSnesNewtonSolver(NewtonSolver):
 
         # Solve the nonlinear system on the reduced space
         self._snes.solve(None, self._x_red)
+        reason = int(self._snes.getConvergedReason())
+        if reason <= 0:
+            its = int(self._snes.getIterationNumber())
+            try:
+                fnorm = float(self._snes.getFunctionNorm())
+            except Exception:
+                fnorm = float("nan")
+            print(f"    [warn] SNES did not converge (reason={reason}, iters={its}, ‖F‖={fnorm:.3e}). Continuing with best iterate.")
 
         # Write back the absolute solution (not an increment)
         x_fin = self._x_red.getArray(readonly=True)

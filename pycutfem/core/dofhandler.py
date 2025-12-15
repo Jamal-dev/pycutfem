@@ -199,7 +199,14 @@ class DofHandler:
     """Centralised DOF numbering and boundary‑condition helpers."""
 
     # .........................................................................
-    def __init__(self, fe_space: Union[Dict[str, Mesh], 'MixedElement'], method: str = "cg",DEBUG = False):
+    def __init__(
+        self,
+        fe_space: Union[Dict[str, Mesh], "MixedElement"],
+        method: str = "cg",
+        DEBUG: bool = False,
+        *,
+        field_methods: Dict[str, str] | None = None,
+    ):
         """
         Initialize a DOF handler.
 
@@ -212,6 +219,9 @@ class DofHandler:
             Discretization connectivity:
             - 'cg' builds continuous Lagrange spaces (global continuity within each field).
             - 'dg' builds fully discontinuous spaces (element-local DOFs).
+        field_methods : dict[str, {'cg','dg'}] | None, default None
+            Optional per-field override of the connectivity. This is primarily useful
+            for mixed discretizations like CG velocity/displacement + DG pressure.
         DEBUG : bool, default False
             Enable extra assertions and verbose internal checks.
 
@@ -259,6 +269,17 @@ class DofHandler:
         if MixedElement is not None and isinstance(fe_space, MixedElement):
             self.mixed_element: MixedElement = fe_space
             self.field_names: List[str] = list(self.mixed_element.field_names)
+            # Optional per-field method overrides (CG/DG per field).
+            if field_methods is not None:
+                bad = {k: v for k, v in field_methods.items() if k not in self.field_names or v not in {"cg", "dg"}}
+                if bad:
+                    raise ValueError(f"Invalid field_methods entries: {bad}")
+                self._field_methods = {f: field_methods.get(f, method) for f in self.field_names}
+            else:
+                self._field_methods = {f: method for f in self.field_names}
+            # Cache token used in internal geometry caches; must change when per-field
+            # continuity changes since gdofs_map depends on the numbering.
+            self._method_token = (self.method, tuple(sorted(self._field_methods.items())))
             self.q_orders: Dict[str, int] = self.mixed_element.q_orders
             # For compatibility keep a fe_map (field → mesh) even though all
             # fields share the same mesh.
@@ -281,6 +302,8 @@ class DofHandler:
             self.fe_map: Dict[str, Mesh] = fe_space  # type: ignore[assignment]
             self.method = method
             self.field_names: List[str] = list(self.fe_map.keys())
+            if field_methods is not None:
+                raise ValueError("field_methods is only supported for MixedElement-backed DofHandler.")
             self.field_offsets: Dict[str, int] = {}
             self.field_num_dofs: Dict[str, int] = {}
             self.element_maps: Dict[str, List[List[int]]] = {f: [] for f in self.field_names}
@@ -292,6 +315,10 @@ class DofHandler:
             else:
                 self._dg_mode = True
                 self._build_maps_dg()
+
+        # For legacy mode (no MixedElement), keep a stable method token for caches.
+        if not hasattr(self, "_method_token"):
+            self._method_token = self.method
 
         # After maps are built, create the reverse map for CG mode
         if not self._dg_mode:
@@ -438,6 +465,7 @@ class DofHandler:
                     field_gsets[f].add(num_gid[f])
                     element_maps[f].append([int(num_gid[f])]) 
                     continue
+                is_dg_field = bool(getattr(self, "_field_methods", {}).get(f, "cg") == "dg")
                 p = int(me._field_orders[f])
                 lat = _lattice_tri(p) if mesh.element_type == "tri" else _lattice_quad(p)
                 loc_gids: list[int] = []
@@ -446,11 +474,12 @@ class DofHandler:
                     X = transform.x_mapping(mesh, int(eid), (xi, eta))  # (x,y)
                     k = (_q(float(X[0])), _q(float(X[1])))
 
-                    gd = key2gdof[f].get(k)
+                    gd = None if is_dg_field else key2gdof[f].get(k)
                     if gd is None:
                         gd = next_gid
                         next_gid += 1
-                        key2gdof[f][k] = gd
+                        if not is_dg_field:
+                            key2gdof[f][k] = gd
                         dof_coords.append((float(X[0]), float(X[1])))
 
                     loc_gids.append(gd)
@@ -620,6 +649,17 @@ class DofHandler:
         """Number of distinct global DOFs on one ghost edge (all fields)."""
         if self.mixed_element is None:
             raise RuntimeError("union_dofs requires a MixedElement‑backed DofHandler.")
+        field_methods = getattr(self, "_field_methods", None)
+        if field_methods and any(m != self.method for m in field_methods.values()):
+            me = self.mixed_element
+            total = 0
+            for fld in self.field_names:
+                n_basis = int(me._n_basis[fld])
+                if field_methods.get(fld, self.method) == "dg":
+                    total += 2 * n_basis
+                else:
+                    total += 2 * n_basis - int(me._n_edge[fld])
+            return int(total)
         if self.method == "cg":
             return self.mixed_element.union_dofs("cg")
         return self.mixed_element.union_dofs("dg")
@@ -1332,13 +1372,35 @@ class DofHandler:
             if tag in getattr(self, "dof_tags", {}):
                 selected |= (set(self.dof_tags[tag]) & field_sets[field])
 
-            # (C) locator override (evaluate on this field's DOF coords)
+            # (C) locator fallback (BOUNDARY-ONLY)
+            # Never sweep *all* DOFs by coordinate: it can accidentally constrain interior
+            # DOFs whenever a locator is "fat" (e.g. distance-to-circle with tolerance).
+            # If a user supplies only a locator (no tagged boundary edges / dof_tags),
+            # restrict its application to DOFs that lie on boundary edges.
             locator = locators.get(tag)
-            if locator is not None:
-                idx = np.asarray(list(field_sets[field]), dtype=int)
-                XY  = self._dof_coords[idx]
-                mask = np.array([bool(locator(float(x), float(y))) for (x, y) in XY], dtype=bool)
-                selected |= set(int(g) for g, m in zip(idx, mask) if m)
+            if locator is not None and not selected:
+                dof_coords = getattr(self, "_dof_coords", None)
+                for e in getattr(mesh, "edges_list", []):
+                    # Only boundary edges
+                    if (getattr(e, "left", None) is not None) and (getattr(e, "right", None) is not None):
+                        continue
+                    mpx, mpy = mesh.nodes_x_y_pos[list(e.nodes)].mean(axis=0)
+                    if not locator(float(mpx), float(mpy)):
+                        continue
+                    try:
+                        dofs = self.edge_dofs(field, int(e.gid))
+                    except Exception:
+                        dofs = []
+                        for nid in getattr(e, "all_nodes", ()) or getattr(e, "nodes", ()):
+                            gd = node2dof.get(int(nid))
+                            if gd is not None:
+                                dofs.append(int(gd))
+                    for gd in dofs:
+                        if dof_coords is not None:
+                            x, y = dof_coords[int(gd)]
+                            if not locator(float(x), float(y)):
+                                continue
+                        selected.add(int(gd))
 
             # (D) assign values
             val = getattr(bc, "value", 0.0)
@@ -2382,7 +2444,7 @@ class DofHandler:
         coords_hash = _coords_fingerprint(mesh.nodes_x_y_pos)
         cache_key = (
             "iface", id(mesh), me.signature(),
-            subset_hash, coords_hash, int(qdeg), self.method,
+            subset_hash, coords_hash, int(qdeg), getattr(self, "_method_token", self.method),
             bool(need_hess), bool(need_o3), bool(need_o4),
             ls_token, def_token
         )
@@ -3111,7 +3173,7 @@ class DofHandler:
             bool(need_hess),
             bool(need_o3),
             bool(need_o4),
-            self.method,
+            getattr(self, "_method_token", self.method),
             bool(allow_interface),
             _ls_fingerprint(level_set),
             _def_fingerprint(deformation),
@@ -3739,7 +3801,7 @@ class DofHandler:
             _edge_geom_cache = {}
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
         cache_key  = (tuple(edge_ids.tolist()), int(qdeg),
-                    me.signature(), derivs_key, self.method, bool(need_hess), bool(need_o3), bool(need_o4))
+                    me.signature(), derivs_key, getattr(self, "_method_token", self.method), bool(need_hess), bool(need_o3), bool(need_o4))
         if reuse and cache_key in _edge_geom_cache:
             return _edge_geom_cache[cache_key]
 
@@ -4075,7 +4137,7 @@ class DofHandler:
         cache_key = (
             "cutvol", id(mesh), getattr(me, "signature", lambda: ("me", id(me)))(),
             subset_hash, int(qdeg), str(side), tuple(sorted(derivs_eff)),
-            self.method, bool(need_hess), bool(need_o3), bool(need_o4),
+            getattr(self, "_method_token", self.method), bool(need_hess), bool(need_o3), bool(need_o4),
             _ls_fingerprint(level_set), _def_fingerprint(deformation),
             _coords_fingerprint(mesh.nodes_x_y_pos),
         )
