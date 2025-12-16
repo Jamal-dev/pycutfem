@@ -724,6 +724,33 @@ class Mesh:
         mask = np.fromiter((e.tag == tag for e in self.edges_list), bool)
         return BitSet(mask)
 
+    def rebuild_edge_bitsets(self) -> None:
+        """
+        Rebuild the `_edge_bitsets` cache from current `Edge.tag` values.
+
+        This is useful after manual tag edits (e.g. geometric pruning, UCD tag import,
+        mesh refinement) where previously cached BitSets may become stale.
+        """
+        n_edges = len(self.edges_list)
+        if n_edges == 0:
+            self._edge_bitsets = {}
+            return
+
+        tags_arr = np.asarray([str(getattr(e, "tag", "") or "") for e in self.edges_list], dtype=object)
+        unique_tags = np.unique(tags_arr).tolist()
+        self._edge_bitsets = {t: BitSet(tags_arr == t) for t in unique_tags if t}
+
+        # Preserve the convenience unions used by CutFEM paths.
+        ghost_pos_bs = self._edge_bitsets.get("ghost_pos", BitSet(np.zeros(n_edges, bool)))
+        ghost_neg_bs = self._edge_bitsets.get("ghost_neg", BitSet(np.zeros(n_edges, bool)))
+        ghost_both_bs = self._edge_bitsets.get("ghost_both", BitSet(np.zeros(n_edges, bool)))
+        interface_bs = self._edge_bitsets.get("interface", BitSet(np.zeros(n_edges, bool)))
+
+        self._edge_bitsets["ghost_pos"] = ghost_pos_bs - interface_bs
+        self._edge_bitsets["ghost_neg"] = ghost_neg_bs - interface_bs
+        self._edge_bitsets["ghost_both"] = ghost_both_bs - interface_bs
+        self._edge_bitsets["ghost"] = (ghost_pos_bs | ghost_neg_bs | ghost_both_bs) - interface_bs
+
     def element_bitset(self, tag: str) -> BitSet:
         cache = getattr(self, "_elem_bitsets", None)
         if cache is not None and tag in cache:
@@ -973,6 +1000,126 @@ class Mesh:
                 if func(midpoint[0], midpoint[1]):
                     edge.tag = tag_name
                     break # Stop after the first matching tag is found
+
+    def refine_uniform(self, levels: int = 1) -> "Mesh":
+        """
+        Uniformly refine a quad mesh by regular 1→4 subdivision.
+
+        - Produces a conforming mesh (no hanging nodes) by refining **all** cells
+          each level (deal.II-style global refinement).
+        - Child elements inherit their parent element tags.
+        - Child boundary edges inherit their parent edge tags.
+        """
+        if levels <= 0:
+            return self
+        mesh = self
+        for _ in range(int(levels)):
+            mesh = mesh._refine_uniform_once()
+        return mesh
+
+    def _refine_uniform_once(self) -> "Mesh":
+        if self.element_type != "quad":
+            raise NotImplementedError("Uniform refinement is implemented for quad meshes only.")
+        if int(getattr(self, "poly_order", 1)) != 1:
+            raise NotImplementedError("Uniform refinement currently supports poly_order=1 geometry only.")
+        if self.corner_connectivity is None:
+            raise ValueError("Mesh.corner_connectivity is required for refinement.")
+
+        coords_old = np.asarray(self.nodes_x_y_pos, dtype=float)
+        n_old_nodes = len(self.nodes_list)
+
+        # Preserve parent edge tags for propagation.
+        parent_edge_tags: Dict[Tuple[int, int], str] = {}
+        for e in self.edges_list:
+            tag = str(getattr(e, "tag", "") or "")
+            if not tag:
+                continue
+            a, b = (int(e.nodes[0]), int(e.nodes[1]))
+            parent_edge_tags[(min(a, b), max(a, b))] = tag
+
+        # Start new node list with existing nodes (keep Node.tag if present).
+        new_nodes: List["Node"] = []
+        for nid, (x, y) in enumerate(coords_old):
+            tag = getattr(self.nodes_list[nid], "tag", None)
+            new_nodes.append(Node(int(nid), float(x), float(y), tag))
+
+        edge_to_mid: Dict[Tuple[int, int], int] = {}
+        mid_info: Dict[int, Tuple[int, int, str]] = {}  # mid_id -> (a,b,parent_tag)
+
+        def _midpoint(a: int, b: int) -> int:
+            key = (min(a, b), max(a, b))
+            mid = edge_to_mid.get(key)
+            if mid is not None:
+                return int(mid)
+            xa, ya = coords_old[key[0]]
+            xb, yb = coords_old[key[1]]
+            mx, my = 0.5 * (xa + xb), 0.5 * (ya + yb)
+            mid = len(new_nodes)
+            new_nodes.append(Node(int(mid), float(mx), float(my)))
+            edge_to_mid[key] = int(mid)
+            mid_info[int(mid)] = (int(key[0]), int(key[1]), parent_edge_tags.get(key, ""))
+            return int(mid)
+
+        new_elem_conn: List[List[int]] = []
+        new_corner_conn: List[List[int]] = []
+        new_elem_tags: List[str] = []
+
+        for eid, corners in enumerate(np.asarray(self.corner_connectivity, dtype=int)):
+            n0, n1, n2, n3 = (int(corners[0]), int(corners[1]), int(corners[2]), int(corners[3]))
+            m01 = _midpoint(n0, n1)
+            m12 = _midpoint(n1, n2)
+            m23 = _midpoint(n2, n3)
+            m30 = _midpoint(n3, n0)
+
+            cx = float(0.25 * (coords_old[n0, 0] + coords_old[n1, 0] + coords_old[n2, 0] + coords_old[n3, 0]))
+            cy = float(0.25 * (coords_old[n0, 1] + coords_old[n1, 1] + coords_old[n2, 1] + coords_old[n3, 1]))
+            c_id = len(new_nodes)
+            new_nodes.append(Node(int(c_id), cx, cy))
+
+            parent_tag = str(getattr(self.elements_list[eid], "tag", "") or "")
+            children_perim = (
+                [n0, m01, c_id, m30],   # bottom-left
+                [m01, n1, m12, c_id],   # bottom-right
+                [c_id, m12, n2, m23],   # top-right
+                [m30, c_id, m23, n3],   # top-left
+            )
+            for perim in children_perim:
+                new_corner_conn.append([int(v) for v in perim])
+                # Mesh expects lattice row-major order: [BL, BR, TL, TR]
+                new_elem_conn.append([int(perim[0]), int(perim[1]), int(perim[3]), int(perim[2])])
+                new_elem_tags.append(parent_tag)
+
+        refined = Mesh(
+            nodes=new_nodes,
+            element_connectivity=np.asarray(new_elem_conn, dtype=int),
+            elements_corner_nodes=np.asarray(new_corner_conn, dtype=int),
+            element_type="quad",
+            poly_order=1,
+        )
+
+        # Propagate element tags (and caches) from parents.
+        if new_elem_tags:
+            for el, tag in zip(refined.elements_list, new_elem_tags):
+                el.tag = tag
+            tags_el = np.asarray(new_elem_tags, dtype=object)
+            refined._elem_bitsets = {t: BitSet(tags_el == t) for t in np.unique(tags_el).tolist() if t}
+
+        # Propagate edge tags: only edges that split a parent edge inherit its tag.
+        for e in refined.edges_list:
+            a, b = int(e.nodes[0]), int(e.nodes[1])
+            info = mid_info.get(a)
+            other = b
+            if info is None:
+                info = mid_info.get(b)
+                other = a
+            if info is None:
+                continue
+            pa, pb, tag = info
+            if tag and other in (pa, pb):
+                e.tag = tag
+
+        refined.rebuild_edge_bitsets()
+        return refined
 
     # ==================================================================
     # NEW FUNCTION 2: Collect DOFs from tagged edges

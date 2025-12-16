@@ -54,7 +54,6 @@ from pycutfem.ufl.expressions import (
 )
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.ufl.measures import dx, dS
-from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.solvers.nonlinear_solver import (
     NewtonParameters,
     NewtonSolver,
@@ -153,7 +152,6 @@ def load_ucd_mesh(path: Path, poly_order: int = 1) -> Tuple[Mesh, BitSet, BitSet
             else:
                 continue
 
-    # Remaining boundary segments are ignored here; we retag geometrically.
     mesh = Mesh(
         nodes=nodes,
         element_connectivity=np.asarray(elem_conn, dtype=int),
@@ -171,6 +169,33 @@ def load_ucd_mesh(path: Path, poly_order: int = 1) -> Tuple[Mesh, BitSet, BitSet
         "fluid": BitSet(fluid_mask),
         "solid": BitSet(solid_mask),
     }
+
+    # Transfer boundary ids from UCD "line" elements onto the matching Mesh edges.
+    # deal.II boundary ids: 0=inlet, 1=outlet, 2=walls, 80=cylinder, 81=beam_root arc.
+    ucd_id_to_tag = {
+        0: "inlet",
+        1: "outlet",
+        2: "walls",
+        80: "cylinder",
+        81: "beam_root",
+    }
+    edge_by_key = {tuple(sorted(map(int, e.nodes))): e for e in mesh.edges_list}
+    hit = miss = 0
+    for mat_id, n1, n2 in boundary_segments:
+        tag = ucd_id_to_tag.get(int(mat_id))
+        if not tag:
+            continue
+        key = (min(int(n1), int(n2)), max(int(n1), int(n2)))
+        edge = edge_by_key.get(key)
+        if edge is None:
+            miss += 1
+            continue
+        edge.tag = tag
+        hit += 1
+    if miss:
+        print(f"[warn] UCD boundary tagging: {miss} line segments did not match any mesh edge.")
+    if hit:
+        mesh.rebuild_edge_bitsets()
     return mesh, mesh.element_bitset("fluid"), mesh.element_bitset("solid")
 
 
@@ -269,6 +294,7 @@ def retag_boundaries(mesh: Mesh, tol: float = 1.0e-8, *, overwrite: bool = True)
         mpx, mpy = mesh.nodes_x_y_pos[list(e.nodes)].mean(axis=0)
         if not locators[tag](mpx, mpy):
             e.tag = ""
+    mesh.rebuild_edge_bitsets()
 
 
 def tag_nodes_from_edges(mesh: Mesh) -> Dict[str, int]:
@@ -341,27 +367,33 @@ def ensure_boundary_tags(mesh: Mesh, tol: float = 1.0e-6, *, force_geometric: bo
     tags = ("inlet", "outlet", "walls", "cylinder", "beam_outer", "beam_root")
     counts_before = {t: mesh.edge_bitset(t).cardinality() for t in tags}
 
+    did_geometric = False
     if force_geometric:
         # Always enforce canonical tags; overwrite existing ones.
         tol_eff = tol
         if mesh_size is not None:
             tol_eff = max(tol, 1e-4 * mesh_size)
         retag_boundaries(mesh, tol=tol_eff, overwrite=True)
+        did_geometric = True
     else:
         need_retag = counts_before.get("outlet", 0) == 0 or counts_before.get("inlet", 0) == 0
         if need_retag:
             retag_boundaries(mesh, tol=tol, overwrite=False)
+            did_geometric = True
 
-    # Remove tags that fail locator checks (prune stray/hanging boundaries).
-    locators = _adaptive_locators(mesh, tol)
-    for e in mesh.edges_list:
-        if e.right is not None:
-            continue
-        tag = getattr(e, "tag", "") or ""
-        if tag and tag in locators:
-            mpx, mpy = mesh.nodes_x_y_pos[list(e.nodes)].mean(axis=0)
-            if not locators[tag](mpx, mpy):
-                e.tag = ""
+    # Only prune when tags were produced geometrically; mesh-provided tags (UCD/Gmsh)
+    # should be trusted and may not match our simplistic locators.
+    if did_geometric:
+        locators = _adaptive_locators(mesh, tol)
+        for e in mesh.edges_list:
+            if e.right is not None:
+                continue
+            tag = getattr(e, "tag", "") or ""
+            if tag and tag in locators:
+                mpx, mpy = mesh.nodes_x_y_pos[list(e.nodes)].mean(axis=0)
+                if not locators[tag](mpx, mpy):
+                    e.tag = ""
+        mesh.rebuild_edge_bitsets()
 
     counts_after = {t: mesh.edge_bitset(t).cardinality() for t in tags}
 
@@ -373,13 +405,55 @@ def ensure_boundary_tags(mesh: Mesh, tol: float = 1.0e-6, *, force_geometric: bo
             mpx, mpy = mesh.nodes_x_y_pos[list(edge.nodes)].mean(axis=0)
             if abs(mpx - L) < max(tol, 1e-6) and not getattr(edge, "tag", None):
                 edge.tag = "outlet"
-        mask = np.fromiter((e.tag == "outlet" for e in mesh.edges_list), bool)
-        if not hasattr(mesh, "_edge_bitsets"):
-            mesh._edge_bitsets = {}
-        mesh._edge_bitsets["outlet"] = BitSet(mask)
-        counts_after["outlet"] = int(mask.sum())
+        mesh.rebuild_edge_bitsets()
+        counts_after["outlet"] = int(mesh.edge_bitset("outlet").cardinality())
 
     return {t: (counts_before.get(t, 0), counts_after.get(t, 0)) for t in tags}
+
+
+def tag_fluid_solid_interface_edges(mesh: Mesh, *, tag: str = "beam_outer") -> int:
+    """
+    Tag conforming fluid–solid interface edges (interior edges where element tags differ).
+
+    For drag/lift, we integrate the *fluid* traction and need the outward normal from
+    the fluid cell. Enforce `edge.left` to be the fluid owner for these edges.
+    """
+    count = 0
+    for e in mesh.edges_list:
+        if e.left is None or e.right is None:
+            continue
+        left_tag = str(getattr(mesh.elements_list[int(e.left)], "tag", "") or "")
+        right_tag = str(getattr(mesh.elements_list[int(e.right)], "tag", "") or "")
+        if {left_tag, right_tag} != {"fluid", "solid"}:
+            continue
+        if left_tag != "fluid":
+            e.left, e.right = e.right, e.left
+            e.lid, e.right_lid = e.right_lid, e.lid
+            e.left_nodes, e.right_nodes = e.right_nodes, e.left_nodes
+            if getattr(e, "normal", None) is not None:
+                e.normal = -np.asarray(e.normal, dtype=float)
+        e.tag = tag
+        count += 1
+    mesh.rebuild_edge_bitsets()
+    return count
+
+
+def ensure_obstacle_set(mesh: Mesh, *, name: str = "obstacle_set") -> BitSet:
+    """
+    Ensure a combined obstacle edge BitSet exists even though edges carry only one tag.
+    """
+    obstacle = None
+    for t in ("cylinder", "beam_outer", "beam_root"):
+        bs = mesh.edge_bitset(t)
+        if bs is None or bs.cardinality() == 0:
+            continue
+        obstacle = bs if obstacle is None else (obstacle | bs)
+    if obstacle is None:
+        obstacle = BitSet(np.zeros(len(mesh.edges_list), bool))
+    if not hasattr(mesh, "_edge_bitsets"):
+        mesh._edge_bitsets = {}
+    mesh._edge_bitsets[name] = obstacle
+    return obstacle
 
 
 def boundary_nodes_by_tag(mesh: Mesh) -> Dict[str, set[int]]:
@@ -1298,16 +1372,26 @@ def compute_drag_lift(
     sigma_viscous_ALE = NSE_ALE.get_stress_fluid_except_pressure_ALE(mu, grad_u, Finv)
     stress_viscous = J * dot(sigma_viscous_ALE, Finv.T)
     fluid_pressure = -(J * dot(pI, Finv.T))
-    traction = dot(stress_viscous + fluid_pressure, n)
+    # deal.II reference (step-fsi.cc): integrate the force on the obstacle,
+    # i.e. -(σ·n) with n the outward normal from the fluid cell.
+    traction = -dot(stress_viscous + fluid_pressure, n)
     ex = Constant([1.0, 0.0], dim=1)
     ey = Constant([0.0, 1.0], dim=1)
     measure = dS(defined_on=edge_set)
     drag = dot(traction, ex) * measure
     lift = dot(traction, ey) * measure
-    comp = FormCompiler(dh, backend="python")
-    drag_val = comp.assemble(Equation(drag, None))[1].sum()
-    lift_val = comp.assemble(Equation(lift, None))[1].sum()
-    return drag_val, lift_val
+    hooks = {
+        drag.integrand: {"name": "drag"},
+        lift.integrand: {"name": "lift"},
+    }
+    res = assemble_form(
+        Equation(None, drag + lift),
+        dof_handler=dh,
+        bcs=[],
+        assembler_hooks=hooks,
+        backend="python",
+    )
+    return float(res["drag"]), float(res["lift"])
 
 
 def tip_displacement(dh: DofHandler, d: VectorFunction):
@@ -1404,7 +1488,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--assemble-only", action="store_true", help="Assemble residual/Jacobian once and exit (no Newton solve).")
     ap.add_argument("--plot-bcs", action="store_true", help="Save a PNG of Dirichlet DOFs using plot_mesh_2.")
     ap.add_argument("--plot-bc-bitsets", action="store_true", help="Plot BC DOF sets per boundary tag (diagnostic).")
-    ap.add_argument("--force-geometric-tags", action="store_true", default=True, help="Overwrite existing boundary tags with geometric retagging.")
+    ap.add_argument(
+        "--force-geometric-tags",
+        action="store_true",
+        default=False,
+        help="Overwrite existing boundary tags with geometric retagging (useful if the mesh has no/incorrect tags).",
+    )
+    ap.add_argument("--n-refinements", type=int, default=0, help="Uniform refinement levels (deal.II: triangulation.refine_global(n)).")
+    ap.add_argument("--save-vtk", dest="save_vtk", action="store_true", help="Enable VTK output.")
+    ap.add_argument("--no-save-vtk", dest="save_vtk", action="store_false", help="Disable VTK output.")
+    ap.set_defaults(save_vtk=False)
+    ap.add_argument("--vtk-every", type=int, default=1, help="VTK output frequency (in time steps).")
+    ap.add_argument("--output-dir", type=Path, default=Path("fsi_dealii_reference_results"), help="Directory for VTK output.")
     ap.add_argument("--fd-check", action="store_true", help="Run a finite-difference Jacobian check and report the max discrepancy.")
     ap.add_argument("--fd-eps", type=float, default=1.0e-6, help="Step length for the finite-difference Jacobian check.")
     ap.add_argument(
@@ -1592,9 +1687,12 @@ def main() -> None:
     use_gmsh = args.mesh_format == "gmsh" or (args.mesh_format == "auto" and mesh_path.suffix.lower() == ".msh")
     if use_gmsh:
         mesh = mesh_from_gmsh(mesh_path, apply_boundary_tags=True)
-        fluid_bs, solid_bs = classify_fluid_solid(mesh)
     else:
-        mesh, fluid_bs, solid_bs = load_ucd_mesh(mesh_path, poly_order=1)
+        mesh, _fluid, _solid = load_ucd_mesh(mesh_path, poly_order=1)
+    fluid_bs, solid_bs = classify_fluid_solid(mesh)
+
+    if args.n_refinements > 0:
+        mesh = mesh.refine_uniform(int(args.n_refinements))
         fluid_bs, solid_bs = classify_fluid_solid(mesh)
 
     counts = ensure_boundary_tags(
@@ -1603,6 +1701,10 @@ def main() -> None:
         mesh_size=args.mesh_size,
         force_geometric=args.force_geometric_tags,
     )
+    n_ifc = tag_fluid_solid_interface_edges(mesh, tag="beam_outer")
+    ensure_obstacle_set(mesh)
+    if n_ifc:
+        print(f"Tagged fluid–solid interface edges: {n_ifc} ('beam_outer').")
     node_counts = tag_nodes_from_edges(mesh)
     outlet_bs = mesh.edge_bitset("outlet")
     if outlet_bs.cardinality() == 0:
@@ -1764,7 +1866,8 @@ def main() -> None:
     # return assemble_form(Equation(jac_form, None), dh, backend='python')
     
 
-    bcs, bcs_homog = build_bcs(u_mean=0.2, theta=args.theta)
+    u_mean_ref = 0.2
+    bcs, bcs_homog = build_bcs(u_mean=u_mean_ref, theta=args.theta)
     if args.anchor_pressure:
         pinned = _pin_pressure_gauge(mesh, dh, tag="p_anchor")
         if pinned is None:
@@ -1916,7 +2019,86 @@ def main() -> None:
             quad_order=quad_order,
             backend=args.backend,
         )
-    time_params = TimeStepperParameters(dt=args.dt, max_steps=args.n_steps, stop_on_steady=False, final_time=args.dt * args.n_steps)
+
+    outdir = Path(args.output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    time_params = TimeStepperParameters(
+        dt=args.dt,
+        max_steps=args.n_steps,
+        stop_on_steady=False,
+        final_time=args.dt * args.n_steps,
+    )
+
+    rho_f_val = float(rho_f.value)
+    mu_f_val = float(rho_f.value) * float(nu_f.value)
+    diameter = 2.0 * float(RADIUS)
+    coeff_scale = float("nan")
+    if rho_f_val > 0.0 and u_mean_ref > 0.0 and diameter > 0.0:
+        coeff_scale = 2.0 / (rho_f_val * (u_mean_ref**2) * diameter)
+
+    history_records: list[dict[str, float | int]] = []
+    post_state = {"step": 0, "time": 0.0}
+    warned_drag_lift = False
+
+    def _record_metrics(step_idx: int, time_val: float) -> None:
+        nonlocal warned_drag_lift
+        try:
+            drag, lift = compute_drag_lift(dh, mesh, uk, dk, pk, rho_f_val, mu_f_val)
+        except Exception as exc:
+            drag = lift = float("nan")
+            if not warned_drag_lift:
+                warned_drag_lift = True
+                print(f"Drag/lift computation skipped: {exc}")
+        tip_dx, tip_dy = tip_displacement(dh, dk)
+        cd = coeff_scale * drag
+        cl = coeff_scale * lift
+        history_records.append(
+            {
+                "step": int(step_idx),
+                "time": float(time_val),
+                "drag": float(drag),
+                "lift": float(lift),
+                "cd": float(cd),
+                "cl": float(cl),
+                "tip_dx": float(tip_dx),
+                "tip_dy": float(tip_dy),
+            }
+        )
+        print(
+            f"    step={step_idx:4d}, t={time_val:8.3f} | "
+            f"Cd={cd: .6e}, Cl={cl: .6e} | tip=({tip_dx: .6e}, {tip_dy: .6e})"
+        )
+
+    def _dump(_step_idx: int) -> None:
+        return
+
+    if args.save_vtk:
+        from pycutfem.io.vtk import export_vtk
+
+        def _dump(step_idx: int) -> None:
+            fname = outdir / f"fsi_{step_idx:04d}.vtu"
+            export_vtk(
+                str(fname),
+                mesh=mesh,
+                dof_handler=dh,
+                functions={"u": uk, "d": dk, "p": pk},
+            )
+
+        _dump(0)
+
+    _record_metrics(0, 0.0)
+
+    def _post_step(_funcs) -> None:
+        post_state["step"] += 1
+        post_state["time"] += float(time_params.dt)
+        k = int(post_state["step"])
+        t = float(post_state["time"])
+        if args.save_vtk and k % max(int(args.vtk_every), 1) == 0:
+            _dump(k)
+        _record_metrics(k, t)
+
+    solver.post_timeloop_cb = _post_step
     aux_funcs: Dict[str, object] = {
         "u_ux": uk.components[0],
         "u_uy": uk.components[1],
@@ -1935,18 +2117,30 @@ def main() -> None:
         time_params=time_params,
     )
 
-    rho_f_val = float(rho_f.value)
-    mu_f_val = float(rho_f.value) * float(nu_f.value)
+    csv_path = outdir / "fsi_benchmark.csv"
     try:
-        drag, lift = compute_drag_lift(dh, mesh, uk, dk, pk, rho_f_val, mu_f_val)
-    except Exception as exc:
-        drag = lift = float("nan")
-        print(f"Drag/lift computation skipped: {exc}")
-    tip_dx, tip_dy = tip_displacement(dh, dk)
+        import pandas as pd
+    except ImportError as exc:
+        import csv
+
+        if not history_records:
+            raise RuntimeError("No benchmark history recorded; cannot write CSV.") from exc
+        with csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(history_records[0].keys()))
+            writer.writeheader()
+            writer.writerows(history_records)
+        print(f"[warn] pandas not available; wrote CSV via csv module ({exc})")
+    else:
+        df = pd.DataFrame.from_records(history_records)
+        df.to_csv(csv_path, index=False)
+
+    final = history_records[-1] if history_records else {}
     print(
         f"Solved {steps} step(s) in {elapsed:.2f}s, ||ΔU||_inf={np.linalg.norm(delta, np.inf):.3e}, "
-        f"drag={drag:.3e}, lift={lift:.3e}, tip=({tip_dx:.3e},{tip_dy:.3e})"
+        f"Cd={float(final.get('cd', float('nan'))):.3e}, Cl={float(final.get('cl', float('nan'))):.3e}, "
+        f"tip=({float(final.get('tip_dx', float('nan'))):.3e},{float(final.get('tip_dy', float('nan'))):.3e})"
     )
+    print(f"Wrote benchmark time history to {csv_path}")
 
 
 if __name__ == "__main__":

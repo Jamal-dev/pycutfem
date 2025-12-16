@@ -9,7 +9,7 @@ from pycutfem.ufl.expressions import (
     Expression, Constant, TestFunction, TrialFunction, VectorTestFunction,
     VectorTrialFunction, Function, VectorFunction, Grad, DivOperation, Inner,
     Dot, Sum, Sub, Prod, Pos, Neg, Div, FacetNormal, ElementWiseConstant, Jump,
-    Derivative, Transpose
+    Derivative, Transpose, Trace, Determinant, Cofactor, Inverse
 )
 
 if TYPE_CHECKING:
@@ -75,6 +75,22 @@ class PolynomialDegreeEstimator:
         elif isinstance(expr, Transpose):
             # Transpose does not change polynomial degree.
             result = self._get_degree(expr.A)
+        elif isinstance(expr, Trace):
+            # trace(A) is a sum of diagonal entries → same degree as A.
+            result = self._get_degree(expr.A)
+        elif isinstance(expr, Determinant):
+            # In 2D: det(A) = a11*a22 - a12*a21 → degree bounded by 2*max(deg(A_ij)).
+            # Use spatial_dim*deg(A) as a conservative heuristic.
+            dim = int(getattr(self.me.mesh, "spatial_dim", 2) or 2)
+            result = dim * self._get_degree(expr.A)
+        elif isinstance(expr, Cofactor):
+            # cof(A) contains (dim-1)x(dim-1) minors. In 2D this is the same degree as A.
+            dim = int(getattr(self.me.mesh, "spatial_dim", 2) or 2)
+            result = max(0, dim - 1) * self._get_degree(expr.A)
+        elif isinstance(expr, Inverse):
+            # inv(A) is generally rational (adj(A)/det(A)); pick a conservative polynomial proxy.
+            dim = int(getattr(self.me.mesh, "spatial_dim", 2) or 2)
+            result = dim * self._get_degree(expr.A)
         elif isinstance(expr, FacetNormal):
             result = self._geom_deg
         elif isinstance(expr, ElementWiseConstant):
