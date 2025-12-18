@@ -1402,6 +1402,153 @@ def tip_displacement(dh: DofHandler, d: VectorFunction):
     return float(d.nodal_values[idx]), float(d.nodal_values[idx + len(coords)])
 
 
+def _vector_on_mesh_nodes(dh: DofHandler, mesh: Mesh, vf: VectorFunction) -> np.ndarray:
+    """
+    Extract a (n_nodes, 2) array by taking the vector components at mesh nodes.
+
+    For higher-order fields (e.g. Q2), this returns the values on the *geometry*
+    nodes only (corner nodes for Q1 geometry). This is suitable for lightweight
+    VTK/Matplotlib visualization and avoids corrupting node data with interior DOFs.
+    """
+    n_nodes = len(mesh.nodes_list)
+    out = np.zeros((n_nodes, 2), dtype=float)
+    comps = list(getattr(vf, "components", ()))[:2]
+    for comp_idx, comp in enumerate(comps):
+        for gdof, lidx in comp._g2l.items():
+            _field, node_id = dh._dof_to_node_map.get(int(gdof), ("", None))
+            if node_id is None:
+                continue
+            out[int(node_id), comp_idx] = float(comp.nodal_values[lidx])
+    return out
+
+
+def _split_corner_cells_to_tris(mesh: Mesh) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return (triangles, tri_elem_ids) for Matplotlib Triangulation on mesh corners.
+
+    - triangles: (n_tri, 3) int array of node indices
+    - tri_elem_ids: (n_tri,) int array mapping each triangle to its parent element id
+    """
+    corners = np.asarray(mesh.corner_connectivity, dtype=int)
+    n_elem = corners.shape[0]
+    if mesh.element_type == "tri" or corners.shape[1] == 3:
+        tris = corners[:, :3].copy()
+        elem_ids = np.arange(n_elem, dtype=int)
+        return tris, elem_ids
+    if mesh.element_type == "quad" or corners.shape[1] == 4:
+        tris = np.vstack((corners[:, [0, 1, 2]], corners[:, [0, 2, 3]])).astype(int, copy=False)
+        elem_ids = np.repeat(np.arange(n_elem, dtype=int), 2)
+        return tris, elem_ids
+    raise ValueError(f"Unsupported element type for triangulation: {mesh.element_type} ({corners.shape[1]} corners)")
+
+
+def _cellwise_mean_pressure(dh: DofHandler, p: Function, *, fluid_bs: BitSet | None = None) -> np.ndarray:
+    """Compute a simple per-cell pressure value for VTK cell data."""
+    n_cells = len(dh.mixed_element.mesh.corner_connectivity)
+    out = np.full(n_cells, np.nan, dtype=float)
+    for eid in range(n_cells):
+        if fluid_bs is not None and not bool(fluid_bs.mask[int(eid)]):
+            continue
+        gdofs = np.asarray(dh.element_maps["p"][int(eid)], dtype=int)
+        vals = p.get_nodal_values(gdofs)
+        out[int(eid)] = float(np.mean(vals)) if vals.size else np.nan
+    return out
+
+
+def save_fsi_frame(
+    *,
+    outdir: Path,
+    mesh: Mesh,
+    dh: DofHandler,
+    u: VectorFunction,
+    d: VectorFunction,
+    fluid_bs: BitSet,
+    step: int,
+    time: float,
+    cd: float,
+    cl: float,
+    tip_dx: float,
+    tip_dy: float,
+    scale: float = 1.0,
+    dpi: int = 150,
+) -> Path:
+    """
+    Save a single PNG snapshot showing fluid velocity magnitude + deformed beam outline.
+
+    The plot uses a lightweight corner triangulation (Q1 geometry) and warps the
+    coordinates by `scale * d` for visualization.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    from matplotlib.tri import Triangulation
+
+    frames_dir = outdir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    path = frames_dir / f"frame_{step:04d}.png"
+
+    u_nodes = _vector_on_mesh_nodes(dh, mesh, u)
+    d_nodes = _vector_on_mesh_nodes(dh, mesh, d)
+
+    coords = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+    x_def = coords[:, 0] + float(scale) * d_nodes[:, 0]
+    y_def = coords[:, 1] + float(scale) * d_nodes[:, 1]
+
+    tris, tri_elem = _split_corner_cells_to_tris(mesh)
+    tri = Triangulation(x_def, y_def, tris)
+    tri.set_mask(~np.asarray(fluid_bs.mask, dtype=bool)[tri_elem])
+
+    u_mag = np.linalg.norm(u_nodes, axis=1)
+    u_mag = np.nan_to_num(u_mag, nan=0.0)
+
+    fig, ax = plt.subplots(figsize=(12, 3.6))
+    pcm = ax.tripcolor(tri, u_mag, shading="gouraud", cmap="turbo")
+    cbar = fig.colorbar(pcm, ax=ax, fraction=0.04, pad=0.02)
+    cbar.set_label("|u| (velocity magnitude)")
+
+    # Draw all outer boundaries (channel) lightly, then obstacle boundary thicker.
+    segs_outer: list[np.ndarray] = []
+    segs_obs: list[np.ndarray] = []
+    for edge in mesh.edges_list:
+        nids = list(edge.all_nodes) if getattr(edge, "all_nodes", ()) else list(edge.nodes)
+        if len(nids) < 2:
+            continue
+        pts = np.c_[x_def[nids], y_def[nids]]
+        out = segs_outer if edge.right is None else None
+        obs = segs_obs if getattr(edge, "tag", "") in {"cylinder", "beam_outer", "beam_root", "obstacle_set"} else None
+        for i in range(len(nids) - 1):
+            if out is not None:
+                out.append(pts[i : i + 2])
+            if obs is not None:
+                obs.append(pts[i : i + 2])
+
+    if segs_outer:
+        ax.add_collection(LineCollection(segs_outer, colors="black", linewidths=0.6, alpha=0.65, zorder=5))
+    if segs_obs:
+        ax.add_collection(LineCollection(segs_obs, colors="black", linewidths=2.2, zorder=6))
+
+    tip_ref = np.array([BEAM_X0 + BEAM_LENGTH, CENTER[1]], dtype=float)
+    tip_xy = tip_ref + float(scale) * np.array([tip_dx, tip_dy], dtype=float)
+    ax.plot([tip_xy[0]], [tip_xy[1]], marker="o", markersize=4, color="crimson", zorder=7)
+
+    ax.set_aspect("equal", "box")
+    xmin, ymin = float(np.min(x_def)), float(np.min(y_def))
+    xmax, ymax = float(np.max(x_def)), float(np.max(y_def))
+    span = max(xmax - xmin, ymax - ymin, 1e-12)
+    pad = 0.05 * span
+    ax.set_xlim(xmin - pad, xmax + pad)
+    ax.set_ylim(ymin - pad, ymax + pad)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title(f"FSI-1 | step={step}, t={time:.3f} | Cd={cd:.4e}, Cl={cl:.4e}")
+    fig.tight_layout()
+    fig.savefig(path, dpi=int(dpi))
+    plt.close(fig)
+    return path
+
+
 # ----------------------------------------------------------------------------- 
 # Boundary data (matches BoundaryParabola in step-fsi.cc)
 # -----------------------------------------------------------------------------
@@ -1500,6 +1647,10 @@ def parse_args() -> argparse.Namespace:
     ap.set_defaults(save_vtk=False)
     ap.add_argument("--vtk-every", type=int, default=1, help="VTK output frequency (in time steps).")
     ap.add_argument("--output-dir", type=Path, default=Path("fsi_dealii_reference_results"), help="Directory for VTK output.")
+    ap.add_argument("--save-frames", action="store_true", help="Save Matplotlib PNG frames (velocity + beam motion).")
+    ap.add_argument("--frames-every", type=int, default=1, help="PNG frame output frequency (in time steps).")
+    ap.add_argument("--frames-dpi", type=int, default=150, help="DPI for saved PNG frames.")
+    ap.add_argument("--frames-scale", type=float, default=1.0, help="Scale factor applied to displacement for plotting (visual only).")
     ap.add_argument("--fd-check", action="store_true", help="Run a finite-difference Jacobian check and report the max discrepancy.")
     ap.add_argument("--fd-eps", type=float, default=1.0e-6, help="Step length for the finite-difference Jacobian check.")
     ap.add_argument(
@@ -2041,7 +2192,7 @@ def main() -> None:
     post_state = {"step": 0, "time": 0.0}
     warned_drag_lift = False
 
-    def _record_metrics(step_idx: int, time_val: float) -> None:
+    def _record_metrics(step_idx: int, time_val: float) -> dict[str, float | int]:
         nonlocal warned_drag_lift
         try:
             drag, lift = compute_drag_lift(dh, mesh, uk, dk, pk, rho_f_val, mu_f_val)
@@ -2053,41 +2204,71 @@ def main() -> None:
         tip_dx, tip_dy = tip_displacement(dh, dk)
         cd = coeff_scale * drag
         cl = coeff_scale * lift
-        history_records.append(
-            {
-                "step": int(step_idx),
-                "time": float(time_val),
-                "drag": float(drag),
-                "lift": float(lift),
-                "cd": float(cd),
-                "cl": float(cl),
-                "tip_dx": float(tip_dx),
-                "tip_dy": float(tip_dy),
-            }
-        )
+        record: dict[str, float | int] = {
+            "step": int(step_idx),
+            "time": float(time_val),
+            "drag": float(drag),
+            "lift": float(lift),
+            "cd": float(cd),
+            "cl": float(cl),
+            "tip_dx": float(tip_dx),
+            "tip_dy": float(tip_dy),
+        }
+        history_records.append(record)
         print(
             f"    step={step_idx:4d}, t={time_val:8.3f} | "
             f"Cd={cd: .6e}, Cl={cl: .6e} | tip=({tip_dx: .6e}, {tip_dy: .6e})"
         )
+        return record
 
     def _dump(_step_idx: int) -> None:
         return
+
+    subdomain = np.where(np.asarray(solid_bs.mask, dtype=bool), 1, 0).astype(np.int32, copy=False)
 
     if args.save_vtk:
         from pycutfem.io.vtk import export_vtk
 
         def _dump(step_idx: int) -> None:
             fname = outdir / f"fsi_{step_idx:04d}.vtu"
+            u_nodes = _vector_on_mesh_nodes(dh, mesh, uk)
+            d_nodes = _vector_on_mesh_nodes(dh, mesh, dk)
             export_vtk(
                 str(fname),
                 mesh=mesh,
                 dof_handler=dh,
-                functions={"u": uk, "d": dk, "p": pk},
+                functions={
+                    "u": uk,
+                    "d": dk,
+                    "u_mag": np.linalg.norm(u_nodes, axis=1),
+                    "d_mag": np.linalg.norm(d_nodes, axis=1),
+                },
+                cell_data={
+                    "subdomain": subdomain,
+                    "p_cell": _cellwise_mean_pressure(dh, pk, fluid_bs=fluid_bs),
+                },
             )
 
         _dump(0)
 
-    _record_metrics(0, 0.0)
+    rec0 = _record_metrics(0, 0.0)
+    if args.save_frames:
+        save_fsi_frame(
+            outdir=outdir,
+            mesh=mesh,
+            dh=dh,
+            u=uk,
+            d=dk,
+            fluid_bs=fluid_bs,
+            step=int(rec0["step"]),
+            time=float(rec0["time"]),
+            cd=float(rec0["cd"]),
+            cl=float(rec0["cl"]),
+            tip_dx=float(rec0["tip_dx"]),
+            tip_dy=float(rec0["tip_dy"]),
+            scale=float(args.frames_scale),
+            dpi=int(args.frames_dpi),
+        )
 
     def _post_step(_funcs) -> None:
         post_state["step"] += 1
@@ -2096,7 +2277,24 @@ def main() -> None:
         t = float(post_state["time"])
         if args.save_vtk and k % max(int(args.vtk_every), 1) == 0:
             _dump(k)
-        _record_metrics(k, t)
+        rec = _record_metrics(k, t)
+        if args.save_frames and k % max(int(args.frames_every), 1) == 0:
+            save_fsi_frame(
+                outdir=outdir,
+                mesh=mesh,
+                dh=dh,
+                u=uk,
+                d=dk,
+                fluid_bs=fluid_bs,
+                step=int(rec["step"]),
+                time=float(rec["time"]),
+                cd=float(rec["cd"]),
+                cl=float(rec["cl"]),
+                tip_dx=float(rec["tip_dx"]),
+                tip_dy=float(rec["tip_dy"]),
+                scale=float(args.frames_scale),
+                dpi=int(args.frames_dpi),
+            )
 
     solver.post_timeloop_cb = _post_step
     aux_funcs: Dict[str, object] = {

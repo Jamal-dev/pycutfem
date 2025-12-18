@@ -1,6 +1,6 @@
 import numpy as np
 import meshio
-from typing import Dict, Union, Callable
+from typing import Dict, Union, Callable, Optional
 
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
@@ -10,7 +10,9 @@ def export_vtk(
     filename: str,
     mesh: Mesh,
     dof_handler: DofHandler,
-    functions: Dict[str, Union[Function, VectorFunction, np.ndarray, Callable[[float, float], float]]]
+    functions: Dict[str, Union[Function, VectorFunction, np.ndarray, Callable[[float, float], float]]],
+    *,
+    cell_data: Optional[Dict[str, np.ndarray]] = None,
 ):
     """
     Exports simulation data to a VTK (.vtu) file for visualization. (CORRECTED)
@@ -42,6 +44,8 @@ def export_vtk(
             vec = np.zeros((num_nodes, 3))
             for gdof, lidx in obj._g2l.items():
                 field, node_id = dof_handler._dof_to_node_map[gdof]
+                if node_id is None:
+                    continue
                 if field in obj.field_names:
                     comp = obj.field_names.index(field)
                     vec[node_id, comp] = obj.nodal_values[lidx]
@@ -53,6 +57,8 @@ def export_vtk(
             scal = np.zeros(num_nodes)
             for gdof, lidx in obj._g2l.items():
                 _field, node_id = dof_handler._dof_to_node_map[gdof]
+                if node_id is None:
+                    continue
                 scal[node_id] = obj.nodal_values[lidx]
             point_data[name] = scal
             continue
@@ -113,5 +119,17 @@ def export_vtk(
         raise TypeError(f"{name}: unsupported data type {type(obj)}")
 
     # 3) write
-    meshio.Mesh(points_3d, cells, point_data=point_data).write(filename)
+    cell_data_payload = None
+    if cell_data:
+        n_cells = len(mesh.corner_connectivity)
+        cell_data_payload = {}
+        for key, values in cell_data.items():
+            arr = np.asarray(values)
+            if arr.shape[0] != n_cells:
+                raise ValueError(
+                    f"cell_data['{key}'] has length {arr.shape[0]}, expected {n_cells} (one value per cell)."
+                )
+            cell_data_payload[key] = [arr]
+
+    meshio.Mesh(points_3d, cells, point_data=point_data, cell_data=cell_data_payload).write(filename)
     print(f"Solution exported to {filename}")
