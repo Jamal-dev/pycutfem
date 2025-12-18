@@ -1153,10 +1153,87 @@ class NewtonSolver:
 
 
     def _solve_linear_system(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
-        if self.lp.backend == "scipy":
+        backend = str(getattr(self.lp, "backend", "scipy") or "scipy").lower()
+        if backend == "scipy":
             return spla.spsolve(A, rhs)
-        else:
-            raise ValueError(f"Unknown linear solver backend '{self.lp.backend}'.")
+        if backend == "petsc":
+            if not HAS_PETSC:
+                raise RuntimeError(
+                    "LinearSolverParameters.backend='petsc' requested but petsc4py is not available."
+                )
+            return self._solve_linear_system_petsc(A, rhs)
+        raise ValueError(f"Unknown linear solver backend '{self.lp.backend}'.")
+
+    def _solve_linear_system_petsc(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        """
+        Solve A x = rhs using PETSc KSP on COMM_SELF (serial) while reusing
+        the matrix sparsity pattern across Newton iterations.
+        """
+        from petsc4py import PETSc  # type: ignore
+
+        if not sp.isspmatrix_csr(A):
+            A = A.tocsr()
+
+        n = int(A.shape[0])
+        if int(A.shape[1]) != n:
+            raise ValueError("PETSc linear solve expects a square matrix.")
+
+        cache = getattr(self, "_petsc_linear_cache", None)
+        if cache is None or cache.get("n") != n:
+            comm = PETSc.COMM_SELF
+            mat = PETSc.Mat().createAIJ(size=(n, n), comm=comm)
+            # Preallocate once using the CSR pattern (indices/indptr).
+            ia = np.asarray(A.indptr, dtype=PETSc.IntType)
+            ja = np.asarray(A.indices, dtype=PETSc.IntType)
+            try:
+                mat.setPreallocationCSR((ia, ja))
+            except Exception:
+                pass
+            mat.setUp()
+
+            ksp = PETSc.KSP().create(comm=comm)
+            ksp.setOperators(mat)
+            # Robust defaults: exact Newton step.
+            ksp.setType("preonly")
+            pc = ksp.getPC()
+            pc.setType("lu")
+            # Prefer MUMPS when available; otherwise let PETSc pick.
+            try:
+                pc.setFactorSolverType("mumps")
+            except Exception:
+                pass
+            # Allow users to override via PETSc options (e.g. -pc_factor_mat_solver_type superlu_dist).
+            ksp.setFromOptions()
+
+            b = PETSc.Vec().createSeq(n, comm=comm)
+            x = PETSc.Vec().createSeq(n, comm=comm)
+
+            cache = {"n": n, "mat": mat, "ksp": ksp, "b": b, "x": x}
+            self._petsc_linear_cache = cache
+
+        mat: PETSc.Mat = cache["mat"]
+        ksp: PETSc.KSP = cache["ksp"]
+        b: PETSc.Vec = cache["b"]
+        x: PETSc.Vec = cache["x"]
+
+        # Update numeric values (pattern is the same).
+        mat.zeroEntries()
+        ia = np.asarray(A.indptr, dtype=PETSc.IntType)
+        ja = np.asarray(A.indices, dtype=PETSc.IntType)
+        a = np.asarray(A.data, dtype=np.float64)
+        try:
+            mat.setValuesCSR((ia, ja), a)
+        except TypeError:
+            mat.setValuesCSR(ia, ja, a)
+        mat.assemblyBegin()
+        mat.assemblyEnd()
+
+        # Load RHS and solve.
+        b_arr = b.getArray()
+        b_arr[:] = rhs
+        x.set(0.0)
+        ksp.solve(b, x)
+        return x.getArray(readonly=True).copy()
 
 
     def _phi(self, vec):                 # ½‖·‖² helper

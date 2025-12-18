@@ -575,29 +575,76 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
             # ---- Plain volume (no level set) -----------------------------
             if level_set is None:
-                geom = dof_handler.precompute_geometric_factors(qdeg, need_hess=need_hess, need_o3=need_o3, need_o4=need_o4,
-                                                                deformation=getattr(intg.measure, 'deformation', None))
-                geom["is_interface"] = False
-                geom["is_ghost"] = False
-                gdofs_map = np.vstack([
-                    np.asarray(dof_handler.get_elemental_dofs(e), dtype=np.int32)[active_cols]
-                    for e in range(mesh.n_elements)
-                ]).astype(np.int32)
+                # Respect measure.defined_on by slicing the element batch up-front.
+                # Otherwise we'd execute the kernel on *all* elements and then
+                # zero contributions post-hoc (wasted work; very expensive for
+                # small subdomains like the solid in FSI).
+                from pycutfem.ufl.helpers import normalize_elem_ids as _norm_eids
+
+                sel = getattr(intg.measure, "defined_on", None)
+                allowed = _norm_eids(mesh, sel)
+                if allowed is None:
+                    element_ids = np.arange(mesh.n_elements, dtype=np.int32)
+                else:
+                    element_ids = np.asarray(allowed, dtype=np.int32)
+
+                geom_all = dof_handler.precompute_geometric_factors(
+                    qdeg,
+                    need_hess=need_hess,
+                    need_o3=need_o3,
+                    need_o4=need_o4,
+                    deformation=getattr(intg.measure, "deformation", None),
+                )
+                geom_all["is_interface"] = False
+                geom_all["is_ghost"] = False
+
+                # Slice only per-element arrays; keep global tables as-is.
+                geom = {}
+                n_total = int(np.asarray(geom_all["qp_phys"]).shape[0])
+                for key, val in geom_all.items():
+                    if isinstance(val, np.ndarray) and val.ndim >= 1 and int(val.shape[0]) == n_total:
+                        geom[key] = val[element_ids]
+                    else:
+                        geom[key] = val
+
+                geom["eids"] = element_ids
+
+                if element_ids.size:
+                    gdofs_map = np.vstack(
+                        [
+                            np.asarray(dof_handler.get_elemental_dofs(int(e)), dtype=np.int32)[
+                                active_cols
+                            ]
+                            for e in element_ids
+                        ]
+                    ).astype(np.int32)
+                else:
+                    gdofs_map = np.zeros((0, int(active_cols.size)), dtype=np.int32)
                 geom["gdofs_map"] = gdofs_map
 
-                if "eids" not in geom:
-                    geom["eids"] = np.arange(mesh.n_elements, dtype=np.int32)
                 static = {"gdofs_map": gdofs_map, **geom}
 
-                static.update(_build_jit_kernel_args(
-                    ir, intg.integrand, mixed_element, qdeg,
-                    dof_handler=dof_handler,
-                    gdofs_map   = gdofs_map,
-                    param_order = runner.param_order,
-                    pre_built   = geom,
-                ))
+                static.update(
+                    _build_jit_kernel_args(
+                        ir,
+                        intg.integrand,
+                        mixed_element,
+                        qdeg,
+                        dof_handler=dof_handler,
+                        gdofs_map=gdofs_map,
+                        param_order=runner.param_order,
+                        pre_built=geom,
+                    )
+                )
                 static = _compress_static_for_active(static, mixed_element, active_cols)
-                kernels.append(_IntegralKernel(runner, static, "volume", eids=np.asarray(geom.get("eids", []), dtype=np.int32)))
+                kernels.append(
+                    _IntegralKernel(
+                        runner,
+                        static,
+                        "volume",
+                        eids=np.asarray(element_ids, dtype=np.int32),
+                    )
+                )
                 continue  # done with this integral
 
             # ---- Cut volume (level set present) --------------------------

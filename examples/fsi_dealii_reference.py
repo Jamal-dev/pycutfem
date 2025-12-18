@@ -58,6 +58,7 @@ from pycutfem.solvers.nonlinear_solver import (
     NewtonParameters,
     NewtonSolver,
     PetscSnesNewtonSolver,
+    LinearSolverParameters,
     TimeStepperParameters,
 )
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
@@ -1622,6 +1623,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--newton-tol", type=float, default=1.0e-8, help="Newton convergence tolerance on ‖R‖∞.")
     ap.add_argument("--max-newton-iter", type=int, default=40, help="Maximum Newton iterations per time step.")
     ap.add_argument(
+        "--linear-solver",
+        choices=("scipy", "petsc"),
+        default="scipy",
+        help="Linear solver backend for --nonlinear-solver=newton.",
+    )
+    ap.add_argument(
         "--ls-mode",
         choices=("armijo", "dealii"),
         default="armijo",
@@ -2167,6 +2174,7 @@ def main() -> None:
             bcs=bcs,
             bcs_homog=bcs_homog,
             newton_params=newton_params,
+            lin_params=LinearSolverParameters(backend=str(args.linear_solver)),
             quad_order=quad_order,
             backend=args.backend,
         )

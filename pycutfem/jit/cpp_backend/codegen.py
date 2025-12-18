@@ -484,6 +484,67 @@ class CppCodeGen:
             if name in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<1>();")
 
+        # Hoist constant-array mapping out of the quadrature loop.
+        # NOTE: calling pybind11 APIs (like .request()) inside an OpenMP region
+        # is not thread-safe and can segfault. These constants are invariant
+        # across elements/quadrature points, so we map them once here.
+        const_arr_vars: dict[str, tuple[str, str, tuple[int, ...]]] = {}
+        for op in ir_sequence:
+            if not isinstance(op, LoadConstantArray):
+                continue
+            if op.name in const_arr_vars:
+                continue
+            if len(op.shape) == 0:
+                kind = "scalar"
+                shape = ()
+            elif len(op.shape) == 1 or getattr(op, "is_vector", False):
+                kind = "vec"
+                shape = (int(op.shape[0]),)
+            else:
+                kind = "mat"
+                shape = tuple(int(s) for s in op.shape)
+            var = f"{op.name}_const"
+            buf = f"{op.name}_buf"
+            const_arr_vars[op.name] = (var, kind, shape)
+            view_lines.append(f"    auto {buf} = {op.name}.request();")
+            if kind == "scalar":
+                view_lines.append(f"    double {var} = 0.0;")
+                view_lines.append(f"    if ({buf}.ndim == 0) {{")
+                view_lines.append(f"        {var} = *static_cast<double*>({buf}.ptr);")
+                view_lines.append(f"    }} else if ({buf}.ndim == 1 && {buf}.shape[0] >= 1) {{")
+                view_lines.append(f"        {var} = static_cast<double*>({buf}.ptr)[0];")
+                view_lines.append(f"    }} else if ({buf}.ndim == 2 && {buf}.shape[0] >= 1 && {buf}.shape[1] >= 1) {{")
+                view_lines.append(f"        {var} = static_cast<double*>({buf}.ptr)[0];")
+                view_lines.append("    } else { throw std::runtime_error(\"Unsupported constant scalar array rank\"); }")
+            elif kind == "vec":
+                view_lines.append(f"    Eigen::VectorXd {var};")
+                view_lines.append(f"    if ({buf}.ndim == 0) {{")
+                view_lines.append(f"        double _c = *static_cast<double*>({buf}.ptr);")
+                # Prefer the declared shape when available, else fall back to length 1.
+                decl_n = int(shape[0]) if shape and int(shape[0]) > 0 else 1
+                view_lines.append(f"        {var} = Eigen::VectorXd::Constant({decl_n}, _c);")
+                view_lines.append(f"    }} else if ({buf}.ndim == 1) {{")
+                view_lines.append(f"        Eigen::Map<const Eigen::VectorXd> _map_{var}(static_cast<double*>({buf}.ptr), {buf}.shape[0]);")
+                view_lines.append(f"        {var} = _map_{var};")
+                view_lines.append("    } else { throw std::runtime_error(\"Unsupported constant vector array rank\"); }")
+            else:
+                view_lines.append(f"    Eigen::MatrixXd {var};")
+                view_lines.append(f"    if ({buf}.ndim == 0) {{")
+                view_lines.append(f"        double _c = *static_cast<double*>({buf}.ptr);")
+                view_lines.append(f"        {var} = Eigen::MatrixXd::Constant(1, 1, _c);")
+                view_lines.append("    }")
+                view_lines.append(f"    else if ({buf}.ndim == 1) {{")
+                view_lines.append(f"        Eigen::Map<const Eigen::VectorXd> _map_{var}(static_cast<double*>({buf}.ptr), {buf}.shape[0]);")
+                view_lines.append(f"        {var} = _map_{var};")
+                view_lines.append("    }")
+                view_lines.append(f"    else if ({buf}.ndim == 2) {{")
+                view_lines.append(
+                    f"        Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> _map_{var}(static_cast<double*>({buf}.ptr), {buf}.shape[0], {buf}.shape[1]);"
+                )
+                view_lines.append(f"        {var} = _map_{var};")
+                view_lines.append("    }")
+                view_lines.append("    else { throw std::runtime_error(\"Unsupported constant matrix array rank\"); }")
+
         # body generation --------------------------------------------------
         stack: list[StackItem] = []
         body_lines: list[str] = []
@@ -499,34 +560,8 @@ class CppCodeGen:
                 emit_line(f"double {nm} = {float(op.value)};")
                 stack.append(StackItem(nm, "scalar", "const", ()))
             elif isinstance(op, LoadConstantArray):
-                req = new_tmp("buf")
-                emit_line(f"auto {req} = {op.name}.request();")
-                nm = new_tmp("const_arr")
-                emit_line(f"Eigen::MatrixXd {nm};")
-                # Decide the logical kind from the declared shape
-                if len(op.shape) == 0:
-                    kind = "scalar"
-                    shape = ()
-                elif len(op.shape) == 1 or op.is_vector:
-                    kind = "vec"
-                    shape = (op.shape[0],)
-                else:
-                    kind = "mat"
-                    shape = op.shape
-                emit_line(f"if ({req}.ndim == 0) {{")
-                emit_line(f"    double _c = *static_cast<double*>({req}.ptr);")
-                emit_line(f"    {nm} = Eigen::MatrixXd::Constant(1, 1, _c);")
-                emit_line("}")
-                emit_line(f"else if ({req}.ndim == 1) {{")
-                emit_line(f"    Eigen::Map<const Eigen::VectorXd> _map_{nm}(static_cast<double*>({req}.ptr), {req}.shape[0]);")
-                emit_line(f"    {nm} = _map_{nm};")
-                emit_line("}")
-                emit_line(f"else if ({req}.ndim == 2) {{")
-                emit_line(f"    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> _map_{nm}(static_cast<double*>({req}.ptr), {req}.shape[0], {req}.shape[1]);")
-                emit_line(f"    {nm} = _map_{nm};")
-                emit_line("}")
-                emit_line("else { throw std::runtime_error(\"Unsupported constant array rank for C++ backend\"); }")
-                stack.append(StackItem(nm, kind, "const", shape))
+                var, kind, shape = const_arr_vars[op.name]
+                stack.append(StackItem(var, kind, "const", shape))
             elif isinstance(op, LoadElementWiseConstant):
                 required_args.add(op.name)
                 required_args.add("owner_id")
@@ -2098,11 +2133,16 @@ static py::tuple {kernel_name}(
 {chr(10).join(view_lines)}
 {chr(10).join(prologue)}
 
-    for (ssize_t e = 0; e < n_elem; ++e) {{
-        for (ssize_t q = 0; q < n_q; ++q) {{
+    {{
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (ssize_t e = 0; e < n_elem; ++e) {{
+            for (ssize_t q = 0; q < n_q; ++q) {{
 {chr(10).join(jloc_lines)}
 {chr(10).join(hxhy_lines)}
 {loop_block}
+            }}
         }}
     }}
 
