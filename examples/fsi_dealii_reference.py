@@ -1,14 +1,13 @@
 #!/usr/bin/env python
 """
-Deal.II FSI benchmark (FSI-1) reproduced in pycutfem.
+Deal.II FSI benchmark (Turek–Hron) reproduced in pycutfem.
 
 - Geometry and mesh: use the reference `fsi.inp` UCD mesh from the deal.II
   code (channel 2.5 x 0.41 with a rigid cylinder and an attached beam).
 - Formulation: conforming ALE Navier–Stokes + compressible Neo-Hookean solid,
   monolithic theta-scheme as in `fsi_ale_conforming.py`.
-- Parameters: identical to `step-fsi.prm` (rho_f=1000, nu_f=1e-3, rho_s=1000,
-  mu_s=0.5e6, nu_s=0.4, alpha_u=1e-8, dt=1.0, theta=1.0, 25 steps), with
-  dynamic viscosity μ = ρ·ν as in `step-fsi.cc`.
+- Parameters: by default mirrors `step-fsi.prm` (FSI-1 / Re≈20). Use
+  `--turek-case fsi2` (Re≈100) to obtain the oscillatory benchmark.
 
 The goal is to mirror the established deal.II example and verify that the
 pycutfem formulation converges on the same data set.
@@ -16,6 +15,7 @@ pycutfem formulation converges on the same data set.
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import sys
 from pathlib import Path
@@ -867,11 +867,11 @@ class NSE_ALE:
         r"""
         C++ idea:
 
-        ρ/2 [ (J + J_old)/dt (v - v_old) ].
+        ρ/2 [ (J + J_old) (v - v_old) ].
 
         Linearized:
 
-        δa = ρ/2 [ J_LinU (v - v_old)/dt + (J + J_old)/dt δv ].
+        δa = ρ/2 [ J_LinU (v - v_old) + (J + J_old) δv ].
         """
         term_geom = (J_LinU_trial * (v - v_old)) 
         term_vel  = (J + J_old) * v_trial 
@@ -1086,9 +1086,11 @@ def build_jac(
         pI_LinP_trial,
         J
     )
+    stress_visc_no_mu = dot(grad_uk, Finv) + dot(F_inv_T, grad_uk_T)  # no pressure, no mu
+
     stress_fluid_term_2 = NSE_ALE.get_stress_fluid_ALE_2nd_term_LinAll_short(
         J_F_inv_T_LinU,
-        sigma_ALE,
+        stress_visc_no_mu,#sigma_ALE,
         grad_uk,
         grad(du),
         Finv, Finv_LinU,
@@ -1186,8 +1188,10 @@ def build_residual(
     Finv_old = ALE_Helpers.get_F_inv(F_old)
     J_old = ALE_Helpers.get_J(F_old)
     pI = pk * Identity(2)
-    # acceleration term
-    acc_term = rho_f * 0.5 * (J + J_old) * inner((uk - u_prev), v_test)
+    J_theta = theta * J + (1.0 - theta) * J_old
+
+    # acceleration term *DT
+    acc_term = rho_f * J_theta * inner((uk - u_prev), v_test)
     # convection term
     convection_fluid = rho_f * J * dot(dot(grad_v, Finv), uk)
     convection_fluid_with_u = rho_f * J * dot(dot(grad_v, Finv), dk)
@@ -1368,7 +1372,9 @@ def compute_drag_lift(
     F = I + grad(d)
     Finv = inv(F)
     J = det(F)
-    grad_u = dot(grad(u), Finv)
+    #grad_u = dot(grad(u), Finv)
+    grad_u = grad(u)  # NOT dot(grad(u), Finv)
+
     pI = p * I
     sigma_viscous_ALE = NSE_ALE.get_stress_fluid_except_pressure_ALE(mu, grad_u, Finv)
     stress_viscous = J * dot(sigma_viscous_ALE, Finv.T)
@@ -1458,6 +1464,7 @@ def _cellwise_mean_pressure(dh: DofHandler, p: Function, *, fluid_bs: BitSet | N
 
 def save_fsi_frame(
     *,
+    case_label: str = "FSI",
     outdir: Path,
     mesh: Mesh,
     dh: DofHandler,
@@ -1543,7 +1550,7 @@ def save_fsi_frame(
     ax.set_ylim(ymin - pad, ymax + pad)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title(f"FSI-1 | step={step}, t={time:.3f} | Cd={cd:.4e}, Cl={cl:.4e}")
+    ax.set_title(f"{case_label} | step={step}, t={time:.3f} | Cd={cd:.4e}, Cl={cl:.4e}")
     fig.tight_layout()
     fig.savefig(path, dpi=int(dpi))
     plt.close(fig)
@@ -1610,8 +1617,41 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--mesh-format", choices=("auto", "gmsh", "ucd"), default="auto", help="Override mesh loader; auto picks by file extension.")
     ap.add_argument("--mesh-size", type=float, default=None, help="Optional characteristic mesh size (used for tagging tolerances).")
     ap.add_argument("--poly-order", type=int, default=2, help="Polynomial order for velocity/displacement (Taylor–Hood).")
-    ap.add_argument("--dt", type=float, default=1.0, help="Time step size (default from step-fsi.prm).")
-    ap.add_argument("--theta", type=float, default=1.0, help="Theta scheme parameter (1=BE, 0.5=CN).")
+    ap.add_argument(
+        "--turek-case",
+        choices=("fsi1", "fsi2", "fsi3"),
+        default="fsi1",
+        help="Turek–Hron benchmark case preset: fsi1=steady (Re≈20), fsi2=periodic (Re≈100), fsi3=chaotic (Re≈200).",
+    )
+    ap.add_argument(
+        "--u-mean",
+        type=float,
+        default=None,
+        help="Mean inflow velocity U_mean (overrides --turek-case preset).",
+    )
+    ap.add_argument(
+        "--rho-s",
+        type=float,
+        default=None,
+        help="Solid density rho_s (overrides --turek-case preset).",
+    )
+    ap.add_argument(
+        "--dt",
+        type=float,
+        default=None,
+        help="Time step size; defaults to the selected --turek-case preset (fsi1:1.0, fsi2/3:0.005).",
+    )
+    ap.add_argument(
+        "--theta",
+        type=float,
+        default=None,
+        help="Theta scheme parameter (1=BE, 0.5=CN); defaults to the selected --turek-case preset (fsi1:1.0, fsi2/3:0.5).",
+    )
+    ap.add_argument(
+        "--allow-dt-reduction",
+        action="store_true",
+        help="Allow adaptive dt reduction when Newton updates blow up (requires re-JIT of dt-dependent kernels).",
+    )
     ap.add_argument("--n-steps", type=int, default=2, help="Number of time steps (default small for quick verification).")
     ap.add_argument("--backend", choices=("jit", "python"), default="python", help="Form compiler backend.")
     ap.add_argument(
@@ -1838,6 +1878,37 @@ def _plot_bc_bitsets(mesh: Mesh, dh: DofHandler, bcs: List[BoundaryCondition], o
 
 def main() -> None:
     args = parse_args()
+
+    # ------------------------------------------------------------------
+    # Turek–Hron benchmark presets
+    # ------------------------------------------------------------------
+    case_label_map = {"fsi1": "FSI-1", "fsi2": "FSI-2", "fsi3": "FSI-3"}
+    case_defaults = {
+        # Matches deal.II step-fsi / "FSI-1" steady benchmark (Re≈20).
+        "fsi1": {"u_mean": 0.2, "rho_s": 1.0e3, "dt": 1.0, "theta": 1.0},
+        # Oscillatory benchmarks (Re≈100/200). Keep rho_s aligned with the other
+        # pycutfem Turek FSI examples.
+        "fsi2": {"u_mean": 1.0, "rho_s": 1.0e4, "dt": 0.005, "theta": 0.5},
+        "fsi3": {"u_mean": 2.0, "rho_s": 1.0e4, "dt": 0.005, "theta": 0.5},
+    }
+
+    case_label = case_label_map.get(str(args.turek_case), str(args.turek_case))
+    preset = case_defaults.get(str(args.turek_case), case_defaults["fsi1"])
+    u_mean_ref = float(args.u_mean) if args.u_mean is not None else float(preset["u_mean"])
+    rho_s_val = float(args.rho_s) if args.rho_s is not None else float(preset["rho_s"])
+    args.dt = float(args.dt) if args.dt is not None else float(preset["dt"])
+    args.theta = float(args.theta) if args.theta is not None else float(preset["theta"])
+    if not math.isclose(float(args.dt), float(preset["dt"])):
+        print(
+            f"[warn] dt={float(args.dt):g} differs from {float(preset['dt']):g} for {case_label}; "
+            "large dt can suppress the expected oscillatory response."
+        )
+    if not math.isclose(float(args.theta), float(preset["theta"])):
+        print(
+            f"[warn] theta={float(args.theta):g} differs from {float(preset['theta']):g} for {case_label}; "
+            "theta>0.5 adds numerical damping."
+        )
+
     mesh_path = args.mesh.resolve()
     if not mesh_path.exists():
         raise FileNotFoundError(f"Mesh file not found: {mesh_path}")
@@ -1928,7 +1999,7 @@ def main() -> None:
     # μ = ρ ν, with ν = 1e-3 from step-fsi.prm.
     nu_f = Constant(1.0e-3)
     mu_f = rho_f * nu_f
-    rho_s = Constant(1.0e3)
+    rho_s = Constant(float(rho_s_val))
     mu_s = Constant(0.5e6)
     nu_s = 0.4 # Poisson ratio
     E_s = 2.0 * float(mu_s.value) * (1.0 + nu_s)
@@ -2024,7 +2095,12 @@ def main() -> None:
     # return assemble_form(Equation(jac_form, None), dh, backend='python')
     
 
-    u_mean_ref = 0.2
+    diameter = 2.0 * float(RADIUS)
+    re_mean = float(u_mean_ref) * diameter / float(nu_f.value)
+    print(
+        f"Benchmark preset: {case_label} | U_mean={float(u_mean_ref):g}, rho_s={float(rho_s_val):g}, "
+        f"dt={float(args.dt):g}, theta={float(args.theta):g} | Re_mean≈{re_mean:.1f}"
+    )
     bcs, bcs_homog = build_bcs(u_mean=u_mean_ref, theta=args.theta)
     if args.anchor_pressure:
         pinned = _pin_pressure_gauge(mesh, dh, tag="p_anchor")
@@ -2137,6 +2213,15 @@ def main() -> None:
         print("Assembly completed; exiting early (--assemble-only).")
         return
 
+    time_params = TimeStepperParameters(
+        dt=args.dt,
+        max_steps=args.n_steps,
+        theta=float(args.theta),
+        stop_on_steady=False,
+        final_time=args.dt * args.n_steps,
+        allow_dt_reduction=bool(args.allow_dt_reduction),
+    )
+
     newton_params = NewtonParameters(
         newton_tol=float(args.newton_tol),
         max_newton_iter=int(args.max_newton_iter),
@@ -2179,15 +2264,44 @@ def main() -> None:
             backend=args.backend,
         )
 
+    def _sync_dt(new_dt: float) -> None:
+        if math.isclose(float(dt_const.value), float(new_dt)):
+            return
+        dt_const.value = float(new_dt)
+        if solver.backend == "jit":
+            solver._compile_all_kernels()
+
+    time_params.on_dt_change = _sync_dt
+
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
+    csv_path = outdir / "fsi_benchmark.csv"
+    csv_fieldnames = ["step", "time", "drag", "lift", "cd", "cl", "tip_dx", "tip_dy"]
+    csv_file = None
+    csv_writer = None
+    try:
+        csv_file = csv_path.open("w", newline="", encoding="utf-8")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fieldnames)
+        csv_writer.writeheader()
+        csv_file.flush()
+    except Exception as exc:
+        print(f"[warn] Could not open benchmark CSV at {csv_path} for incremental writes: {exc}")
+        csv_file = None
+        csv_writer = None
 
-    time_params = TimeStepperParameters(
-        dt=args.dt,
-        max_steps=args.n_steps,
-        stop_on_steady=False,
-        final_time=args.dt * args.n_steps,
-    )
+    # Inlet BC ramps up until t=2.0 (see inlet_parabola). If the run ends before
+    # that, the forcing is tiny and the tip motion will look one-signed/non-oscillatory.
+    ramp_time = 2.0
+    if float(time_params.final_time) < ramp_time:
+        n_ramp = int(math.ceil(ramp_time / float(time_params.dt)))
+        ramp_fac = 0.5 * (1.0 - math.cos(0.5 * math.pi * float(time_params.final_time)))
+        u_max_now = 1.5 * float(u_mean_ref) * ramp_fac
+        u_max_full = 1.5 * float(u_mean_ref)
+        print(
+            f"[note] final_time={float(time_params.final_time):.3f} < {ramp_time:.1f}s inflow ramp: "
+            f"u_in,max≈{u_max_now:.3e} (full={u_max_full:.3e}). "
+            f"Use --n-steps>={n_ramp} (dt={float(time_params.dt):g}) to reach full inflow."
+        )
 
     rho_f_val = float(rho_f.value)
     mu_f_val = float(rho_f.value) * float(nu_f.value)
@@ -2223,6 +2337,12 @@ def main() -> None:
             "tip_dy": float(tip_dy),
         }
         history_records.append(record)
+        if csv_writer is not None and csv_file is not None:
+            try:
+                csv_writer.writerow(record)
+                csv_file.flush()
+            except Exception as exc:
+                print(f"[warn] Failed to append to {csv_path}: {exc}")
         print(
             f"    step={step_idx:4d}, t={time_val:8.3f} | "
             f"Cd={cd: .6e}, Cl={cl: .6e} | tip=({tip_dx: .6e}, {tip_dy: .6e})"
@@ -2262,6 +2382,7 @@ def main() -> None:
     rec0 = _record_metrics(0, 0.0)
     if args.save_frames:
         save_fsi_frame(
+            case_label=str(case_label),
             outdir=outdir,
             mesh=mesh,
             dh=dh,
@@ -2300,6 +2421,7 @@ def main() -> None:
                 cl=float(rec["cl"]),
                 tip_dx=float(rec["tip_dx"]),
                 tip_dy=float(rec["tip_dy"]),
+                case_label=str(case_label),
                 scale=float(args.frames_scale),
                 dpi=int(args.frames_dpi),
             )
@@ -2316,29 +2438,19 @@ def main() -> None:
         "d_prev_dy": d_prev.components[1],
     }
 
-    delta, steps, elapsed = solver.solve_time_interval(
-        functions=[uk, dk, pk],
-        prev_functions=[u_prev, d_prev, p_prev],
-        aux_functions=aux_funcs,
-        time_params=time_params,
-    )
-
-    csv_path = outdir / "fsi_benchmark.csv"
     try:
-        import pandas as pd
-    except ImportError as exc:
-        import csv
-
-        if not history_records:
-            raise RuntimeError("No benchmark history recorded; cannot write CSV.") from exc
-        with csv_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(history_records[0].keys()))
-            writer.writeheader()
-            writer.writerows(history_records)
-        print(f"[warn] pandas not available; wrote CSV via csv module ({exc})")
-    else:
-        df = pd.DataFrame.from_records(history_records)
-        df.to_csv(csv_path, index=False)
+        delta, steps, elapsed = solver.solve_time_interval(
+            functions=[uk, dk, pk],
+            prev_functions=[u_prev, d_prev, p_prev],
+            aux_functions=aux_funcs,
+            time_params=time_params,
+        )
+    finally:
+        if csv_file is not None:
+            try:
+                csv_file.close()
+            except Exception:
+                pass
 
     final = history_records[-1] if history_records else {}
     print(
@@ -2346,7 +2458,7 @@ def main() -> None:
         f"Cd={float(final.get('cd', float('nan'))):.3e}, Cl={float(final.get('cl', float('nan'))):.3e}, "
         f"tip=({float(final.get('tip_dx', float('nan'))):.3e},{float(final.get('tip_dy', float('nan'))):.3e})"
     )
-    print(f"Wrote benchmark time history to {csv_path}")
+    print(f"Wrote benchmark time history (incremental) to {csv_path}")
 
 
 if __name__ == "__main__":

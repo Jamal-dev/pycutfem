@@ -17,6 +17,7 @@ from __future__ import annotations
 from re import A
 import time
 import os
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Callable, Optional, Tuple
 import inspect
@@ -217,6 +218,11 @@ class TimeStepperParameters:
     theta: float = 1.0                  # 1.0 = backward Euler, 0.5 = CN
     stop_on_steady: bool = True         # early exit when steady‑state reached
     final_time: float = max_steps * dt  
+    allow_dt_reduction: bool = False    # opt-in adaptive dt reduction
+    dt_reduction_factor: float = 0.5    # dt <- factor * dt on rejection
+    dt_reduction_threshold: float = 5.0 # reject if ||ΔU|| grows by this factor
+    on_dt_change: Optional[Callable[[float], None]] = None
+    adjust_max_steps_on_dt_change: bool = True  # keep final_time reachable
 
 
 @dataclass
@@ -586,19 +592,61 @@ class NewtonSolver:
         step = 0
         t_n = 0.0
         prev_delta_inf: float | None = None
+        last_dt: float | None = None
         while step < time_params.max_steps and t_n < time_params.final_time:
             dt = float(time_params.dt)
+            if last_dt is None or not math.isclose(dt, last_dt, rel_tol=0.0, abs_tol=0.0):
+                on_dt_change = getattr(time_params, "on_dt_change", None)
+                if callable(on_dt_change):
+                    on_dt_change(dt)
+                last_dt = dt
 
             # Predictor: copy previous solution ---------------------
             for f, f_prev in zip(functions, prev_functions):
                 f.nodal_values[:] = f_prev.nodal_values[:]
 
             # Time‑dependent BCs -----------------------------------
-            bcs_now = self._freeze_bcs(self.bcs, t_n)
+            # For theta-schemes, apply time-dependent Dirichlet data at t_{n+θ}
+            # (implicit Euler θ=1 → end-of-step, CN θ=0.5 → midpoint).
+            t_bc = t_n + float(getattr(time_params, "theta", 1.0)) * dt
+            bcs_now = self._freeze_bcs(self.bcs, t_bc)
             dh.apply_bcs(bcs_now, *functions)
 
             # Newton loop -----------------------------------------
-            delta_U = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
+            try:
+                delta_U, converged, n_iters = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
+                reduce_dt = False
+            except Exception as e:
+                reduce_dt = True
+                print(f"    Newton failed at step {step+1} with dt={dt:.3e}: {e}")
+            # Crieteria if converged but number of Newton iterations are more than 20, reduce dt
+            if (converged and n_iters >= 20) or reduce_dt:
+                if not bool(getattr(time_params, "allow_dt_reduction", False)):
+                    raise RuntimeError(
+                        "Time step reduction requested but disabled. "
+                        "Reduce dt manually or enable allow_dt_reduction with on_dt_change."
+                    )
+                on_dt_change = getattr(time_params, "on_dt_change", None)
+                if not callable(on_dt_change):
+                    raise RuntimeError(
+                        "Time step reduction requires TimeStepperParameters.on_dt_change "
+                        "to keep dt-dependent coefficients in sync."
+                    )
+                factor = float(getattr(time_params, "dt_reduction_factor", 0.5))
+                time_params.dt = float(time_params.dt) * factor
+                if bool(getattr(time_params, "adjust_max_steps_on_dt_change", True)):
+                    try:
+                        final_time = float(time_params.final_time)
+                    except Exception:
+                        final_time = None
+                    if final_time is not None and final_time > t_n:
+                        remaining = final_time - t_n
+                        extra = int(math.ceil(remaining / max(float(time_params.dt), 1.0e-16)))
+                        time_params.max_steps = max(int(time_params.max_steps), int(step + extra))
+                on_dt_change(float(time_params.dt))
+                last_dt = float(time_params.dt)
+                print(f"    Reducing Δt → {time_params.dt:.3e} due to slow Newton convergence and retrying.")
+                continue
             delta_inf = float(np.linalg.norm(delta_U, ord=np.inf))
             print(f"    Time step {step+1}: ΔU = {delta_inf:.2e}")
             
@@ -606,12 +654,36 @@ class NewtonSolver:
             if post_step_refiner is not None:
                 post_step_refiner(step, bcs_now, functions, prev_functions)
 
-            # Reject and retry with smaller Δt if the update blows up
-            if step > 0 and prev_delta_inf is not None and prev_delta_inf > 0.0:
-                if delta_inf > 5.0 * prev_delta_inf:
-                    time_params.dt *= 0.5
-                    print(f"    Rejecting step {step+1}; reducing Δt → {time_params.dt:.3e} and retrying.")
-                    continue
+            # # Reject and retry with smaller Δt if the update blows up
+            # if step > 0 and prev_delta_inf is not None and prev_delta_inf > 0.0:
+            #     threshold = float(getattr(time_params, "dt_reduction_threshold", 5.0))
+            #     if delta_inf > threshold * prev_delta_inf:
+            #         if not bool(getattr(time_params, "allow_dt_reduction", False)):
+            #             raise RuntimeError(
+            #                 "Time step reduction requested but disabled. "
+            #                 "Reduce dt manually or enable allow_dt_reduction with on_dt_change."
+            #             )
+            #         on_dt_change = getattr(time_params, "on_dt_change", None)
+            #         if not callable(on_dt_change):
+            #             raise RuntimeError(
+            #                 "Time step reduction requires TimeStepperParameters.on_dt_change "
+            #                 "to keep dt-dependent coefficients in sync."
+            #             )
+            #         factor = float(getattr(time_params, "dt_reduction_factor", 0.5))
+            #         time_params.dt = float(time_params.dt) * factor
+            #         if bool(getattr(time_params, "adjust_max_steps_on_dt_change", True)):
+            #             try:
+            #                 final_time = float(time_params.final_time)
+            #             except Exception:
+            #                 final_time = None
+            #             if final_time is not None and final_time > t_n:
+            #                 remaining = final_time - t_n
+            #                 extra = int(math.ceil(remaining / max(float(time_params.dt), 1.0e-16)))
+            #                 time_params.max_steps = max(int(time_params.max_steps), int(step + extra))
+            #         on_dt_change(float(time_params.dt))
+            #         last_dt = float(time_params.dt)
+            #         print(f"    Rejecting step {step+1}; reducing Δt → {time_params.dt:.3e} and retrying.")
+            #         continue
 
             # Accept: promote current → previous
             for f_prev, f in zip(prev_functions, functions):
@@ -663,6 +735,7 @@ class NewtonSolver:
         self._last_iter_timings = []
         totals = {"assembly": 0.0, "linear_solve": 0.0, "line_search": 0.0}
         temp_t0 = time.perf_counter()
+        converged = False
         for it in range(self.np.max_newton_iter):
             if self.pre_cb is not None:
                 self.pre_cb(funcs)
@@ -709,6 +782,7 @@ class NewtonSolver:
             print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}, time = {t_iteration}s")
             if norm_R <= self.np.newton_tol:
                 # Converged — return *time-step* increment for all fields
+                converged = True
                 delta = np.hstack([
                     f.nodal_values - f_prev.nodal_values
                     for f, f_prev in zip(funcs, prev_funcs)
@@ -720,6 +794,8 @@ class NewtonSolver:
                         "assembly": assembly_time,
                         "linear_solve": 0.0,
                         "line_search": 0.0,
+                        "residual_norm": norm_R,
+                        "converged": True,
                     }
                 )
                 self._last_iteration_totals = totals
@@ -728,7 +804,7 @@ class NewtonSolver:
                         assembly_time, 0.0, 0.0
                     )
                 )
-                return delta
+                return delta, converged, it + 1
             linear_time = 0.0
             line_search_time = 0.0
 
@@ -786,6 +862,15 @@ class NewtonSolver:
 
             # 4) Apply accepted step: expand reduced → full, update fields, then re-impose BCs
             dU_full = self.restrictor.expand_vec(dU_red)
+
+            if os.getenv("PYCUTFEM_CHECK_DIRICHLET_INCREMENT", "").lower() in {"1", "true", "yes"}:
+                try:
+                    bc_rows = np.fromiter(dh.get_dirichlet_data(bcs_now).keys(), dtype=int)
+                    if bc_rows.size:
+                        max_bc_du = float(np.max(np.abs(dU_full[bc_rows])))
+                        print(f"        [bc] max|δU| on Dirichlet DOFs = {max_bc_du:.3e}")
+                except Exception as exc:
+                    print(f"        [bc] Dirichlet increment check skipped: {exc}")
             dh.add_to_functions(dU_full, funcs)
 
             # Re-impose the (possibly inhomogeneous) Dirichlet values AFTER the update
@@ -803,6 +888,8 @@ class NewtonSolver:
                     "assembly": assembly_time,
                     "linear_solve": linear_time,
                     "line_search": line_search_time,
+                    "residual_norm": norm_R,
+                    "converged": False,
                 }
             )
             print(
