@@ -5,8 +5,9 @@ Monolithic CutFEM setup for the Turek–Hron FSI-2 benchmark.
 
 - Geometry: channel with a *rigid* circular hole; the elastic beam is described
   by a level-set that is advected with the solid displacement.
-- Mechanics: nonlinear St. Venant–Kirchhoff solid in a fully Eulerian frame
-  (Cauchy stress, advective transport), incompressible Navier–Stokes for the fluid.
+- Mechanics: solid stress in a fully Eulerian frame (Cauchy stress, advective transport),
+  optionally linearized for robustness (set USE_LINEAR_SOLID=0 for full nonlinear StVK),
+  incompressible Navier–Stokes for the fluid.
 - The beam level set is updated every time step and the mesh is reclassified so
   curved deformations of the beam are captured.
 - A small finite-difference Jacobian check is run to validate the assembled
@@ -22,7 +23,7 @@ import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from functools import lru_cache
-from typing import Dict, Iterable, Sequence
+from typing import Callable, Dict, Iterable, Sequence
 
 try:
     import gmsh  # type: ignore
@@ -194,6 +195,10 @@ LAMBDA_S = E_S * NU_S / ((1.0 + NU_S) * (1.0 - 2.0 * NU_S))
 BEAM_LENGTH = 0.35 
 BEAM_HEIGHT = 0.02
 BEAM_CENTER = (CENTER[0] + RADIUS + 0.5 * BEAM_LENGTH, CENTER[1])
+BEAM_SHIFT_X = float(os.getenv("BEAM_SHIFT_X", "0.0"))
+BEAM_REF_CENTER = (BEAM_CENTER[0] - BEAM_SHIFT_X, BEAM_CENTER[1])
+BEAM_REF_LENGTH = BEAM_LENGTH + 2.0 * BEAM_SHIFT_X
+BEAM_REF_HEIGHT = BEAM_HEIGHT
 POINT_B = (0.15, 0.2)
 POINT_A_INITIAL = (0.6, 0.2) # Point A will change while Point B is fixed
 
@@ -202,10 +207,131 @@ DT = float(ARGS.dt)
 POLY_ORDER = int(ARGS.poly_order)
 MESH_SIZE = float(ARGS.mesh_size)
 FD_BACKEND = ARGS.fd_backend
+BEAM_ROOT_TOL = float(max(1.0e-6, 1.0e-3 * MESH_SIZE))
+BEAM_ROOT_BIAS = float(max(1.0e-8, 1.0e-4 * MESH_SIZE))
+BEAM_ROOT_INSET = float(os.getenv("BEAM_ROOT_INSET", str(max(5.0e-4, 0.04 * MESH_SIZE))))
+BEAM_ROOT_DOF_TOL = float(os.getenv("BEAM_ROOT_DOF_TOL", str(max(0.2 * MESH_SIZE, 1.0e-3))))
+PIN_PRESSURE = os.getenv("PIN_PRESSURE", "1") not in ("0", "false", "False")
+SOLID_CUT_DROP = float(os.getenv("SOLID_CUT_DROP", "0.0"))
+USE_ALIGNED_INTERFACE = os.getenv("USE_ALIGNED_INTERFACE", "0") not in ("0", "false", "False")
+SOLID_ADVECT_LAGGED = os.getenv("SOLID_ADVECT_LAGGED", "1") not in ("0", "false", "False")
+USE_RESTRICTED_FORMS = os.getenv("USE_RESTRICTED_FORMS", "1") not in ("0", "false", "False")
+USE_LINEAR_SOLID = os.getenv("USE_LINEAR_SOLID", "1") not in ("0", "false", "False")
+LEVELSET_ZERO_EPS = float(os.getenv("LEVELSET_ZERO_EPS", str(max(1.0e-10, 1.0e-8 * MESH_SIZE))))
+LEVELSET_ZERO_SIDE = os.getenv("LEVELSET_ZERO_SIDE", "neg").strip().lower()
+LEVELSET_PREFER_NEGATIVE = LEVELSET_ZERO_SIDE != "pos"
 
 # -----------------------------------------------------------------------------
 # Mesh and boundary helpers
 # -----------------------------------------------------------------------------
+
+
+class BeamArcRootLevelSet:
+    """
+    Beam level set with a curved root that follows the cylinder arc, so the
+    beam attaches without leaving a vertical gap at x=beam_x0.
+    """
+
+    def __init__(
+        self,
+        *,
+        beam_center: tuple[float, float],
+        beam_length: float,
+        beam_height: float,
+        cyl_center: tuple[float, float],
+        cyl_radius: float,
+        root_inset: float,
+        root_bias: float,
+        root_tol: float,
+    ):
+        self.cx = float(beam_center[0])
+        self.cy = float(beam_center[1])
+        self.hx = 0.5 * float(beam_length)
+        self.hy = 0.5 * float(beam_height)
+        self._beam_x1 = self.cx + self.hx
+        self._beam_y0 = self.cy - self.hy
+        self._beam_y1 = self.cy + self.hy
+        self._cyl_center = np.asarray(cyl_center, dtype=float)
+        self._cyl_radius = float(cyl_radius)
+        self._root_inset = float(root_inset)
+        self._root_bias = float(root_bias)
+        self._root_tol = float(root_tol)
+        self.cache_token = (
+            "beam_arc_root",
+            float(beam_center[0]),
+            float(beam_center[1]),
+            float(beam_length),
+            float(beam_height),
+            float(cyl_radius),
+            float(root_inset),
+            float(root_bias),
+            float(root_tol),
+        )
+
+    def _x_arc(self, y: np.ndarray) -> np.ndarray:
+        dy = y - self._cyl_center[1]
+        rad2 = self._cyl_radius * self._cyl_radius
+        inside = np.maximum(rad2 - dy * dy, 0.0)
+        return self._cyl_center[0] + np.sqrt(inside) - self._root_inset
+
+    def __call__(self, x):
+        x = np.asarray(x, float)
+        x_coord = x[..., 0]
+        y_coord = x[..., 1]
+
+        x_arc = self._x_arc(y_coord)
+        phi_left = x_arc - x_coord
+        phi_right = x_coord - self._beam_x1
+        phi_top = y_coord - self._beam_y1
+        phi_bottom = self._beam_y0 - y_coord
+
+        phi = np.max(np.stack((phi_left, phi_right, phi_top, phi_bottom), axis=-1), axis=-1)
+        if self._root_bias > 0.0:
+            if x.ndim == 1:
+                on_root = (
+                    (np.abs(phi_left) <= self._root_tol)
+                    and (self._beam_y0 - self._root_tol <= y_coord <= self._beam_y1 + self._root_tol)
+                    and (x_coord >= self._cyl_center[0])
+                )
+                if on_root:
+                    phi = min(float(phi), -self._root_bias)
+            else:
+                on_root = (
+                    (np.abs(phi_left) <= self._root_tol)
+                    & (y_coord >= self._beam_y0 - self._root_tol)
+                    & (y_coord <= self._beam_y1 + self._root_tol)
+                    & (x_coord >= self._cyl_center[0])
+                )
+                phi = np.where(on_root, np.minimum(phi, -self._root_bias), phi)
+        return phi
+
+    def gradient(self, x):
+        x = np.asarray(x, float)
+        x_coord = x[..., 0]
+        y_coord = x[..., 1]
+
+        x_arc = self._x_arc(y_coord)
+        phi_left = x_arc - x_coord
+        phi_right = x_coord - self._beam_x1
+        phi_top = y_coord - self._beam_y1
+        phi_bottom = self._beam_y0 - y_coord
+        phis = np.stack((phi_left, phi_right, phi_top, phi_bottom), axis=-1)
+        idx = np.argmax(phis, axis=-1)
+
+        dy = y_coord - self._cyl_center[1]
+        rad2 = self._cyl_radius * self._cyl_radius
+        denom = np.sqrt(np.maximum(rad2 - dy * dy, 1.0e-18))
+        dx_arc_dy = -dy / denom
+
+        grad_left = np.stack((-np.ones_like(x_coord), dx_arc_dy), axis=-1)
+        grad_right = np.stack((np.ones_like(x_coord), np.zeros_like(x_coord)), axis=-1)
+        grad_top = np.stack((np.zeros_like(x_coord), np.ones_like(x_coord)), axis=-1)
+        grad_bottom = np.stack((np.zeros_like(x_coord), -np.ones_like(x_coord)), axis=-1)
+        grads = np.stack((grad_left, grad_right, grad_top, grad_bottom), axis=-2)
+        if x.ndim == 1:
+            return grads[int(idx)]
+        grad = np.take_along_axis(grads, idx[..., None, None], axis=-2).squeeze(-2)
+        return grad
 
 
 def _count_segments(width: float, mesh_size: float, *, min_cells: int = 1) -> int:
@@ -219,12 +345,28 @@ def _nodes_for_length(length: float, mesh_size: float, *, min_nodes: int = 3) ->
     return max(min_nodes, segments + 1)
 
 
-def build_blocked_gmsh_mesh(path: Path, mesh_size: float, poly_order: int, *, view: bool = False) -> None:
+def build_blocked_gmsh_mesh(
+    path: Path,
+    mesh_size: float,
+    poly_order: int,
+    *,
+    view: bool = False,
+    beam_center: tuple[float, float] | None = None,
+    beam_length: float | None = None,
+    beam_height: float | None = None,
+) -> None:
     """
     Build a blocked, beam-aligned O-grid mesh with gmsh.
     """
     if gmsh is None:
         raise RuntimeError("Gmsh backend requested but the gmsh Python module is not available.")
+
+    if beam_center is None:
+        beam_center = BEAM_CENTER
+    if beam_length is None:
+        beam_length = BEAM_LENGTH
+    if beam_height is None:
+        beam_height = BEAM_HEIGHT
 
     gmsh.initialize()
     try:
@@ -296,10 +438,10 @@ def build_blocked_gmsh_mesh(path: Path, mesh_size: float, poly_order: int, *, vi
             return RADIUS * delta
 
         # Beam-aware square around the cylinder --------------------------------
-        beam_x0 = CENTER[0] + RADIUS
-        beam_x1 = beam_x0 + BEAM_LENGTH
-        beam_y0 = BEAM_CENTER[1] - 0.5 * BEAM_HEIGHT
-        beam_y1 = BEAM_CENTER[1] + 0.5 * BEAM_HEIGHT
+        beam_x0 = beam_center[0] - 0.5 * beam_length
+        beam_x1 = beam_center[0] + 0.5 * beam_length
+        beam_y0 = beam_center[1] - 0.5 * beam_height
+        beam_y1 = beam_center[1] + 0.5 * beam_height
 
         pad = max(0.6 * mesh_size, 0.008)
         hx = max(RADIUS + pad, min(CENTER[0] - pad, L - CENTER[0] - pad, 0.35))
@@ -312,10 +454,10 @@ def build_blocked_gmsh_mesh(path: Path, mesh_size: float, poly_order: int, *, vi
         square_bottom = CENTER[1] - hy
         square_top = CENTER[1] + hy
 
-        beam_nodes = max(4, _nodes_for_length(BEAM_HEIGHT, mesh_size, min_nodes=4))
+        beam_nodes = max(4, _nodes_for_length(beam_height, mesh_size, min_nodes=4))
 
         x_coords = sorted({0.0, square_left, square_right, beam_x0, beam_x1, L})
-        y_coords = sorted({0.0, square_bottom, beam_y0, CENTER[1], beam_y1, square_top, H})
+        y_coords = sorted({0.0, square_bottom, beam_y0, beam_center[1], beam_y1, square_top, H})
 
         x_interval_nodes = []
         for ix in range(len(x_coords) - 1):
@@ -724,14 +866,156 @@ def tag_channel_boundaries(mesh: Mesh, mesh_size: float) -> None:
     mesh._boundary_locators = loc_map
 
 
-def _load_gmsh_mesh(mesh_size: float, poly_order: int, *, mesh_file: Path | None, rebuild: bool, view: bool) -> tuple[Mesh, Path | None]:
+def _beam_root_locator(
+    mesh: Mesh,
+    beam_center: tuple[float, float],
+    beam_length: float,
+    beam_height: float,
+    *,
+    tol: float = 0.0,
+):
+    cx, cy = CENTER
+    r2 = RADIUS * RADIUS
+    beam_x0 = beam_center[0] - 0.5 * beam_length
+    beam_y0 = beam_center[1] - 0.5 * beam_height
+    beam_y1 = beam_center[1] + 0.5 * beam_height
+
+    coords = np.asarray(getattr(mesh, "nodes_x_y_pos", []), float)
+    xmin_raw, ymin_raw, xmax_raw, ymax_raw = 0.0, 0.0, L, H
+    if coords.size:
+        xmin_raw, ymin_raw = coords.min(axis=0)
+        xmax_raw, ymax_raw = coords.max(axis=0)
+    span = float(max(xmax_raw - xmin_raw, ymax_raw - ymin_raw, 1.0))
+    tol_loc = max(tol, 1.0e-4 * span)
+    tol_root = max(tol_loc, 4.5e-3 * span)
+    tol_y = max(tol_loc, 8e-4 * span)
+    tol_x_root = max(tol_loc, 1.5e-3 * span)
+
+    def on_beam_root(x: float, y: float) -> bool:
+        on_vertical = abs(x - beam_x0) < tol_x_root and (beam_y0 - tol_y) <= y <= (beam_y1 + tol_y)
+        on_arc = (
+            abs((x - cx) ** 2 + (y - cy) ** 2 - r2) < tol_root
+            and (beam_y0 - tol_y) <= y <= (beam_y1 + tol_y)
+            and x >= cx
+        )
+        return on_vertical or on_arc
+
+    return on_beam_root
+
+
+def _tag_beam_root_from_cylinder(
+    dh: DofHandler,
+    mesh: Mesh,
+    locator,
+    fields: Sequence[str],
+    *,
+    tag: str = "beam_root",
+) -> None:
+    loc_map = getattr(mesh, "_boundary_locators", {})
+    loc_map[tag] = locator
+    mesh._boundary_locators = loc_map
+
+    edge_mask = np.zeros(len(mesh.edges_list), dtype=bool)
+    try:
+        candidates = mesh.edge_bitset("cylinder").to_indices()
+    except Exception:
+        candidates = np.arange(len(mesh.edges_list))
+    for eid in candidates:
+        try:
+            e_obj = mesh.edge(int(eid))
+        except Exception:
+            continue
+        if (e_obj.left is not None) and (e_obj.right is not None):
+            continue
+        mpx, mpy = mesh.nodes_x_y_pos[list(e_obj.nodes)].mean(axis=0)
+        if locator(float(mpx), float(mpy)):
+            edge_mask[int(eid)] = True
+
+    if edge_mask.any():
+        mesh._edge_bitsets = getattr(mesh, "_edge_bitsets", {})
+        mesh._edge_bitsets[tag] = BitSet(edge_mask)
+    else:
+        return
+
+    node_coords = mesh.nodes_x_y_pos
+    for field in fields:
+        node2dof = dh.dof_map.get(field, {})
+        ids: set[int] = set()
+        for eid in np.flatnonzero(edge_mask):
+            e_obj = mesh.edge(int(eid))
+            nodes = e_obj.all_nodes if getattr(e_obj, "all_nodes", ()) else e_obj.nodes
+            for nid in nodes:
+                x, y = node_coords[int(nid)]
+                if locator(float(x), float(y)):
+                    gd = node2dof.get(int(nid))
+                    if gd is not None:
+                        ids.add(int(gd))
+        if ids:
+            dh.dof_tags.setdefault(tag, set()).update(ids)
+
+
+def _tag_beam_root_from_levelset(
+    dh: DofHandler,
+    beam_ls: "BeamArcRootLevelSet",
+    fields: Sequence[str],
+    *,
+    tag: str = "beam_root",
+    tol: float | None = None,
+) -> int:
+    if not hasattr(beam_ls, "_x_arc"):
+        return 0
+    if not fields:
+        return 0
+    _ = dh.get_field_slice(fields[0])
+    coords = getattr(dh, "_dof_coords", None)
+    if coords is None or not len(coords):
+        return 0
+    tol_x = float(BEAM_ROOT_DOF_TOL if tol is None else tol)
+    tol_y = max(0.5 * tol_x, 1.0e-4)
+    y = coords[:, 1]
+    x_arc = beam_ls._x_arc(y)
+    on_root = (
+        (np.abs(coords[:, 0] - x_arc) <= tol_x)
+        & (y >= beam_ls._beam_y0 - tol_y)
+        & (y <= beam_ls._beam_y1 + tol_y)
+        & (coords[:, 0] >= beam_ls._cyl_center[0] - tol_x)
+    )
+    added = 0
+    for field in fields:
+        ids = np.asarray(dh.get_field_slice(field), dtype=int)
+        sel = ids[on_root[ids]]
+        if sel.size:
+            dh.dof_tags.setdefault(tag, set()).update(map(int, sel))
+            added += int(sel.size)
+    return added
+
+
+def _load_gmsh_mesh(
+    mesh_size: float,
+    poly_order: int,
+    *,
+    mesh_file: Path | None,
+    rebuild: bool,
+    view: bool,
+    beam_center: tuple[float, float] | None = None,
+    beam_length: float | None = None,
+    beam_height: float | None = None,
+) -> tuple[Mesh, Path | None]:
     if gmsh is None:
         raise RuntimeError("Gmsh backend requested but gmsh is not available.")
     mesh_path = mesh_file.expanduser().resolve() if mesh_file is not None else None
     if mesh_path is not None:
         if rebuild or not mesh_path.exists():
             print(f"Generating gmsh blocked mesh at {mesh_path} (h={mesh_size}, Q{poly_order})")
-            build_blocked_gmsh_mesh(mesh_path, mesh_size, poly_order, view=view)
+            build_blocked_gmsh_mesh(
+                mesh_path,
+                mesh_size,
+                poly_order,
+                view=view,
+                beam_center=beam_center,
+                beam_length=beam_length,
+                beam_height=beam_height,
+            )
         else:
             print(f"Reusing gmsh mesh at {mesh_path}")
         return mesh_from_gmsh(mesh_path), mesh_path
@@ -739,12 +1023,27 @@ def _load_gmsh_mesh(mesh_size: float, poly_order: int, *, mesh_file: Path | None
     with TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir) / "turek_fsi_block.msh"
         print(f"Generating temporary gmsh blocked mesh (h={mesh_size}, Q{poly_order})")
-        build_blocked_gmsh_mesh(tmp_path, mesh_size, poly_order, view=view)
+        build_blocked_gmsh_mesh(
+            tmp_path,
+            mesh_size,
+            poly_order,
+            view=view,
+            beam_center=beam_center,
+            beam_length=beam_length,
+            beam_height=beam_height,
+        )
         mesh = mesh_from_gmsh(tmp_path)
     return mesh, None
 
 
-def build_channel_mesh(mesh_size: float, poly_order: int) -> Mesh:
+def build_channel_mesh(
+    mesh_size: float,
+    poly_order: int,
+    *,
+    beam_center: tuple[float, float] | None = None,
+    beam_length: float | None = None,
+    beam_height: float | None = None,
+) -> Mesh:
     """
     Select mesh backend (gmsh blocked grid or legacy structured O-grid) and
     validate the resulting mesh for Q{poly_order}.
@@ -757,6 +1056,9 @@ def build_channel_mesh(mesh_size: float, poly_order: int) -> Mesh:
             mesh_file=getattr(ARGS, "mesh_file", None),
             rebuild=bool(getattr(ARGS, "rebuild_mesh", False)),
             view=bool(getattr(ARGS, "view_gmsh", False)),
+            beam_center=beam_center,
+            beam_length=beam_length,
+            beam_height=beam_height,
         )
     else:
         mesh = build_structured_channel_mesh(mesh_size, poly_order)
@@ -1586,8 +1888,34 @@ def fix_fragmented_sides(mesh: Mesh, max_segments: int = 2, max_iters: int = 2) 
 # -----------------------------------------------------------------------------
 
 
+def _nudge_levelset_zeros(
+    ls_beam: LevelSetGridFunction,
+    eps: float,
+    *,
+    prefer_negative: bool = True,
+) -> int:
+    """
+    Prevent φ=0 nodes from aligning with mesh edges by nudging to ±eps.
+    This avoids degenerate interface segments when the interface falls on edges.
+    """
+    if eps <= 0.0:
+        return 0
+    phi_vals = ls_beam.nodal_values()
+    mask = np.abs(phi_vals) <= eps
+    if not np.any(mask):
+        return 0
+    phi_vals[mask] = -eps if prefer_negative else eps
+    ls_beam.commit()
+    return int(mask.sum())
+
+
 def update_beam_levelset_from_displacement(
-    ls_beam: LevelSetGridFunction, disp_vec: VectorFunction, beam_ref_ls: BeamLevelSet
+    ls_beam: LevelSetGridFunction,
+    disp_vec: VectorFunction,
+    beam_ref_ls: Callable[[np.ndarray], float],
+    *,
+    zero_eps: float = 0.0,
+    prefer_negative: bool = True,
 ) -> None:
     """
     Advect the beam LevelSetGridFunction with the current solid displacement:
@@ -1619,16 +1947,55 @@ def update_beam_levelset_from_displacement(
         phi_vals[int(li)] = float(phi_new)
 
     ls_beam.commit()
+    if zero_eps > 0.0:
+        _nudge_levelset_zeros(ls_beam, zero_eps, prefer_negative=prefer_negative)
 
 
 def _copy_bitset(bs: BitSet) -> BitSet:
     return BitSet(np.array(bs.mask, dtype=bool))
+
+def _disable_aligned_interface_edges(mesh: Mesh) -> int:
+    """Disable aligned-interface edge tags to force cut-cell interface integration."""
+    interface_edges = [e for e in mesh.edges_list if getattr(e, "tag", "") == "interface"]
+    if not interface_edges:
+        return 0
+    for e in interface_edges:
+        e.tag = ""
+    mesh.rebuild_edge_bitsets()
+    return len(interface_edges)
+
+def _aligned_cut_mask(mesh: Mesh) -> np.ndarray:
+    """Flag cut elements whose interface lies exactly on an element edge."""
+    try:
+        interface_edges = mesh.edge_bitset("interface").to_indices()
+    except Exception:
+        interface_edges = np.array([], dtype=int)
+    if interface_edges.size == 0:
+        return np.zeros(len(mesh.elements_list), dtype=bool)
+    interface_set = set(map(int, interface_edges))
+    aligned = np.zeros(len(mesh.elements_list), dtype=bool)
+    for elem in mesh.elements_list:
+        if getattr(elem, "tag", "") != "cut":
+            continue
+        for side_edges in elem.edges_by_side:
+            for gid in side_edges:
+                if int(gid) in interface_set:
+                    aligned[int(elem.id)] = True
+                    break
+            if aligned[int(elem.id)]:
+                break
+    return aligned
 
 
 def make_domain_sets(mesh: Mesh) -> Dict[str, BitSet]:
     fluid = mesh.element_bitset("outside")
     solid = mesh.element_bitset("inside")
     cut = mesh.element_bitset("cut")
+    if USE_ALIGNED_INTERFACE and mesh.edge_bitset("interface").cardinality() > 0:
+        aligned_cut = _aligned_cut_mask(mesh)
+        cut_interface = BitSet(cut.mask & ~aligned_cut)
+    else:
+        cut_interface = _copy_bitset(cut)
     # These are not interface integrals; they are volume integrals
     fluid_ifc = fluid | cut
     solid_ifc = solid | cut
@@ -1642,6 +2009,7 @@ def make_domain_sets(mesh: Mesh) -> Dict[str, BitSet]:
         "fluid_domain": _copy_bitset(fluid),
         "solid_domain": _copy_bitset(solid),
         "cut_domain": _copy_bitset(cut),
+        "cut_interface": _copy_bitset(cut_interface),
         "fluid_interface": _copy_bitset(fluid_ifc),
         "solid_interface": _copy_bitset(solid_ifc),
         "has_pos": _copy_bitset(has_pos),
@@ -1661,16 +2029,22 @@ def refresh_domains(mesh: Mesh, domains: Dict[str, BitSet]) -> None:
     cut = mesh.element_bitset("cut")
     has_fluid = fluid | cut
     has_solid = solid | cut
+    if USE_ALIGNED_INTERFACE and mesh.edge_bitset("interface").cardinality() > 0:
+        aligned_cut = _aligned_cut_mask(mesh)
+        cut_interface = cut.mask & ~aligned_cut
+    else:
+        cut_interface = cut.mask
     _update_bs(domains["fluid_domain"], fluid.mask)
     _update_bs(domains["solid_domain"], solid.mask)
     _update_bs(domains["cut_domain"], cut.mask)
+    _update_bs(domains["cut_interface"], cut_interface)
     _update_bs(domains["fluid_interface"], has_fluid.mask)
     _update_bs(domains["solid_interface"], has_solid.mask)
     _update_bs(domains["has_pos"], fluid.mask | cut.mask)
     _update_bs(domains["has_neg"], solid.mask | cut.mask)
     ghost_both = mesh.edge_bitset("ghost_both")
-    solid_ghost = mesh.edge_bitset("ghost_neg") | ghost_both | mesh.edge_bitset("interface")
-    fluid_ghost = mesh.edge_bitset("ghost_pos") | ghost_both | mesh.edge_bitset("interface")
+    solid_ghost = mesh.edge_bitset("ghost_neg") | ghost_both
+    fluid_ghost = mesh.edge_bitset("ghost_pos") | ghost_both
     _update_bs(domains["solid_ghost"], solid_ghost.mask)
     _update_bs(domains["fluid_ghost"], fluid_ghost.mask)
 
@@ -1819,21 +2193,30 @@ def interface_approx_error(mesh: Mesh, beam_ls: BeamLevelSet) -> dict[str, float
     """
     errs: list[float] = []
     n_pts = 0
-    for e in mesh.edge_bitset("interface").to_indices():
-        edge = mesh.edge(int(e))
-        pts: list[tuple[float, float]] = []
-        for owner in (edge.left, edge.right):
-            if owner is None:
+    edge_ids = mesh.edge_bitset("interface").to_indices()
+    if edge_ids.size:
+        for e in edge_ids:
+            edge = mesh.edge(int(e))
+            pts: list[tuple[float, float]] = []
+            for owner in (edge.left, edge.right):
+                if owner is None:
+                    continue
+                el = mesh.elements_list[int(owner)]
+                if getattr(el, "interface_pts", None):
+                    pts.extend(el.interface_pts)
+            if not pts:
+                mid = mesh.nodes_x_y_pos[list(edge.nodes)].mean(axis=0)
+                pts.append((float(mid[0]), float(mid[1])))
+            for pt in pts:
+                errs.append(abs(float(beam_ls(np.asarray(pt, float)))))
+                n_pts += 1
+    else:
+        for elem in mesh.elements_list:
+            if getattr(elem, "tag", "") != "cut":
                 continue
-            el = mesh.elements_list[int(owner)]
-            if getattr(el, "interface_pts", None):
-                pts.extend(el.interface_pts)
-        if not pts:
-            mid = mesh.nodes_x_y_pos[list(edge.nodes)].mean(axis=0)
-            pts.append((float(mid[0]), float(mid[1])))
-        for pt in pts:
-            errs.append(abs(float(beam_ls(np.asarray(pt, float)))))
-            n_pts += 1
+            for pt in getattr(elem, "interface_pts", []):
+                errs.append(abs(float(beam_ls(np.asarray(pt, float)))))
+                n_pts += 1
     if not errs:
         return {"max_abs_phi": 0.0, "mean_abs_phi": 0.0, "n_pts": 0}
     errs_arr = np.asarray(errs, float)
@@ -1936,7 +2319,12 @@ def repair_degenerate_edges(mesh: Mesh, tol: float = 1.0e-10) -> int:
         repaired += 1
     return repaired
 
-def retag_inactive(dh: DofHandler) -> None:
+def retag_inactive(
+    dh: DofHandler,
+    *,
+    theta_neg: np.ndarray | None = None,
+    solid_cut_drop: float = 0.0,
+) -> None:
     dh.dof_tags["inactive"] = set()
     dh.tag_dofs_from_element_bitset("inactive", "u_pos_x", "inside", strict=True)
     dh.tag_dofs_from_element_bitset("inactive", "u_pos_y", "inside", strict=True)
@@ -1945,6 +2333,12 @@ def retag_inactive(dh: DofHandler) -> None:
     dh.tag_dofs_from_element_bitset("inactive", "vs_neg_y", "outside", strict=True)
     dh.tag_dofs_from_element_bitset("inactive", "d_neg_x", "outside", strict=True)
     dh.tag_dofs_from_element_bitset("inactive", "d_neg_y", "outside", strict=True)
+    if theta_neg is not None and solid_cut_drop > 0.0:
+        cut_mask = mesh.element_bitset("cut").mask
+        bad = cut_mask & (theta_neg < solid_cut_drop)
+        if np.any(bad):
+            for field in ("vs_neg_x", "vs_neg_y", "d_neg_x", "d_neg_y"):
+                dh.tag_dofs_from_element_bitset("inactive", field, bad, strict=False)
 
 
 def recompute_active_dofs(solver: NewtonSolver, bcs_active: Sequence[BoundaryCondition]) -> None:
@@ -1993,10 +2387,24 @@ def finite_difference_check(
     eps: float = 1.0e-6,
 ) -> None:
     backend = FD_BACKEND
+    if jac_form is None or res_form is None:
+        print("Skipping FD check: Jacobian or residual form missing.")
+        return
     compiler = FormCompiler(dh, backend=backend)
-    eq = Equation(jac_form, res_form)
-    base_K, base_R = compiler.assemble(eq, bcs=bcs)
-    if base_K is None or base_R is None:
+    eq_jac = Equation(jac_form, None)
+    eq_res = Equation(None, res_form)
+    bc_active = list(bcs) if bcs else []
+    uniq_funcs = []
+    seen = set()
+    for func in functions.values():
+        if id(func) in seen:
+            continue
+        seen.add(id(func))
+        uniq_funcs.append(func)
+    if bc_active:
+        dh.apply_bcs(bc_active, *uniq_funcs)
+    base_K, _ = compiler.assemble(eq_jac, bcs=bc_active)
+    if base_K is None:
         print("Skipping FD check: Jacobian or residual form missing.")
         return
 
@@ -2007,8 +2415,13 @@ def finite_difference_check(
         return old
 
     rows = []
-    bc_dofs = set(dh.get_dirichlet_data(bcs).keys())
+    bc_dofs = set(dh.get_dirichlet_data(bc_active).keys())
     inactive = set(dh.dof_tags.get("inactive", set()))
+    active_mask = np.ones(dh.total_dofs, dtype=bool)
+    if bc_dofs:
+        active_mask[np.fromiter(bc_dofs, dtype=int)] = False
+    if inactive:
+        active_mask[np.fromiter(inactive, dtype=int)] = False
     for gdof in probe_dofs:
         field, _ = dh._dof_to_node_map[int(gdof)]
         if field not in functions:
@@ -2019,15 +2432,21 @@ def finite_difference_check(
             continue
         old_val = functions[field].get_nodal_values(np.array([gdof], dtype=int))[0]
         perturb(field, int(gdof), old_val + eps)
-        K_plus, R_plus = compiler.assemble(eq, bcs=bcs)
+        if bc_active:
+            dh.apply_bcs(bc_active, *uniq_funcs)
+        _, R_plus = compiler.assemble(eq_res, bcs=bc_active)
         perturb(field, int(gdof), old_val - eps)
-        K_minus, R_minus = compiler.assemble(eq, bcs=bcs)
+        if bc_active:
+            dh.apply_bcs(bc_active, *uniq_funcs)
+        _, R_minus = compiler.assemble(eq_res, bcs=bc_active)
         perturb(field, int(gdof), old_val)
+        if bc_active:
+            dh.apply_bcs(bc_active, *uniq_funcs)
         fd_col = (R_plus - R_minus) / (2 * eps)
         jac_col = base_K[:, int(gdof)].toarray().ravel()
         err_vec = fd_col - jac_col
-        err = np.linalg.norm(err_vec, ord=np.inf)
-        mag = np.linalg.norm(jac_col, ord=np.inf)
+        err = np.linalg.norm(err_vec[active_mask], ord=np.inf)
+        mag = np.linalg.norm(jac_col[active_mask], ord=np.inf)
         rel = err / (mag + 1.0e-14)
         rows.append((gdof, field, err, mag, rel))
     print("Finite-difference Jacobian check (gdof, field, err, |J|, rel):")
@@ -2149,15 +2568,31 @@ Re = RHO_F * U_MAX * (2 * RADIUS) / MU_F
 print(f"Reynolds number: {Re:.2f}")
 _log_step("start setup")
 
+# Beam level set (reference configuration)
+beam_ref_center = BEAM_REF_CENTER
+beam_ref_length = BEAM_REF_LENGTH
+beam_ref_height = BEAM_REF_HEIGHT
+
 # Mesh with rigid hole
-mesh = build_channel_mesh(MESH_SIZE, POLY_ORDER)
+mesh = build_channel_mesh(
+    MESH_SIZE,
+    POLY_ORDER,
+    beam_center=beam_ref_center,
+    beam_length=beam_ref_length,
+    beam_height=beam_ref_height,
+)
 _log_step(f"built base mesh ({ARGS.mesh_backend})")
 
-# Beam level set (reference configuration)
-move_beam_dela_x = 0.01
-beam_cx = BEAM_CENTER[0] - move_beam_dela_x
-beam_ref_ls = BeamLevelSet(center=(beam_cx, BEAM_CENTER[1]), 
-                           Lb=BEAM_LENGTH + 2 * move_beam_dela_x, Hb=BEAM_HEIGHT)
+beam_ref_ls = BeamArcRootLevelSet(
+    beam_center=beam_ref_center,
+    beam_length=beam_ref_length,
+    beam_height=beam_ref_height,
+    cyl_center=CENTER,
+    cyl_radius=RADIUS,
+    root_inset=BEAM_ROOT_INSET,
+    root_bias=BEAM_ROOT_BIAS,
+    root_tol=BEAM_ROOT_TOL,
+)
 if ARGS.refine_initial:
     mesh = refine_beam_anisotropic(mesh, beam_ref_ls, levels=2, target_h=0.5 * BEAM_HEIGHT)
     _log_step("refined mesh around beam")
@@ -2172,11 +2607,23 @@ ls_dh = DofHandler(ls_me, method="cg")
 ls_beam = LevelSetGridFunction(ls_dh, field="phi_beam")
 ls_beam.interpolate(lambda x, y: beam_ref_ls(np.array([x, y])))
 ls_beam.commit()
+nudged = _nudge_levelset_zeros(ls_beam, LEVELSET_ZERO_EPS, prefer_negative=LEVELSET_PREFER_NEGATIVE)
+if nudged:
+    print(
+        f"[levelset] nudged {nudged} near-zero nodes by {LEVELSET_ZERO_EPS:.2e} "
+        f"towards {'-' if LEVELSET_PREFER_NEGATIVE else '+'}"
+    )
 # Classify mesh against beam level set
 mesh.classify_elements(ls_beam)
 mesh.classify_edges(ls_beam)
 mesh.build_interface_segments(ls_beam)
 _log_step("interpolated/committed level set")
+if not USE_ALIGNED_INTERFACE:
+    disabled = _disable_aligned_interface_edges(mesh)
+    if disabled:
+        print(f"[interface] disabled {disabled} aligned interface edges; using cut-cell interface integrals only.")
+    if mesh.edge_bitset("interface").cardinality() > 0:
+        print("[warn] Interface edges are still tagged; aligned-interface assembly may be active.")
 
 domains = make_domain_sets(mesh)
 inside_elems = mesh.element_bitset("inside").to_indices()
@@ -2342,31 +2789,31 @@ bcs: list[BoundaryCondition] = [
 ]
 
 # Pressure pin to remove nullspace
-# pin_tag = "pressure_pin"
-# dof_handler.tag_dof_by_locator(
-#     pin_tag,
-#     "p_pos_",
-#     locator=lambda x, y: abs(x - L) <= 1.0e-9 and abs(y - 0.5 * H) <= 1.0e-3,
-#     find_first=True,
-# )
-# bcs.append(BoundaryCondition("p_pos_", "dirichlet", pin_tag, lambda x, y: 0.0))
+if PIN_PRESSURE:
+    pin_tag = "pressure_pin"
+    dof_handler.tag_dof_by_locator(
+        pin_tag,
+        "p_pos_",
+        locator=lambda x, y: abs(x - L) <= 1.0e-9 and abs(y - 0.5 * H) <= 1.0e-3,
+        find_first=True,
+    )
+    bcs.append(BoundaryCondition("p_pos_", "dirichlet", pin_tag, lambda x, y: 0.0))
 
 # Clamp beam at the circle interface
 beam_clamp_tag = "beam_root"
-beam_root_locator = lambda x, y: x <= CENTER[0] + RADIUS + 1.0e-6 and abs(y - CENTER[1]) <= 0.5 * BEAM_HEIGHT
-for field in ["vs_neg_x", "vs_neg_y", "d_neg_x", "d_neg_y"]:
-    dof_handler.tag_dof_by_locator(
-        beam_clamp_tag,
-        field,
-        locator=beam_root_locator,
-        find_first=False,
-    )
+beam_root_locator = _beam_root_locator(mesh, beam_ref_center, beam_ref_length, beam_ref_height)
+beam_root_fields = ["vs_neg_x", "vs_neg_y", "d_neg_x", "d_neg_y"]
+_tag_beam_root_from_cylinder(dof_handler, mesh, beam_root_locator, beam_root_fields, tag=beam_clamp_tag)
+_tag_beam_root_from_levelset(dof_handler, beam_ref_ls, beam_root_fields, tag=beam_clamp_tag)
+beam_root_dofs = len(dof_handler.dof_tags.get(beam_clamp_tag, set()))
+if beam_root_dofs == 0:
+    print("[warn] Beam root DOF tagging found no DOFs; check BEAM_ROOT_DOF_TOL or beam geometry.")
+else:
+    print(f"Beam root DOFs tagged: {beam_root_dofs}")
+for field in beam_root_fields:
     bcs.append(BoundaryCondition(field, "dirichlet", beam_clamp_tag, lambda x, y: 0.0))
 
 bcs_homog = [BoundaryCondition(bc.field, bc.method, bc.domain_tag, lambda x, y: 0.0) for bc in bcs]
-
-# Tag inactive DOFs according to current classification
-retag_inactive(dof_handler)
 
 print(f"Interface edges: {mesh.edge_bitset('interface').cardinality()}")
 print(f"Cut elements:    {mesh.element_bitset('cut').cardinality()}")
@@ -2420,7 +2867,7 @@ dx_solid = dx(
     metadata={"q": qvol, "side": "-"},
 )
 dΓ = dInterface(
-    defined_on=domains["cut_domain"],
+    defined_on=domains["cut_interface"],
     level_set=ls_beam,
     metadata={"q": qvol + 2, "derivs": {(0, 0), (0, 1), (1, 0)}},
 )
@@ -2443,8 +2890,9 @@ theta_pos_vals = np.clip(hansbo_cut_ratio(mesh, ls_beam, side="+"), theta_min, 1
 theta_neg_vals = np.clip(hansbo_cut_ratio(mesh, ls_beam, side="-"), theta_min, 1.0)
 kappa_pos = Pos(ElementWiseConstant(theta_pos_vals))
 kappa_neg = Neg(ElementWiseConstant(theta_neg_vals))
+retag_inactive(dof_handler, theta_neg=theta_neg_vals, solid_cut_drop=SOLID_CUT_DROP)
 
-use_restricted_forms = True
+use_restricted_forms = USE_RESTRICTED_FORMS
 if use_restricted_forms:
     du_f_R = restrict(du_f, domains["has_pos"])
     dp_f_R = restrict(dp_f, domains["has_pos"])
@@ -2514,7 +2962,8 @@ def traction_fluid(u_vec, p_scal):
 
 
 def F_of(d):
-    return I2 + grad(d)
+    # Eulerian displacement: X = x - d(x) ⇒ F = (I - ∇d)^{-1}
+    return inv(I2 - grad(d))
 
 
 def C_of(F):
@@ -2529,7 +2978,19 @@ def S_stvk(E):
     return Constant(LAMBDA_S) * trace(E) * I2 + Constant(2.0 * MU_S) * E
 
 
+def sigma_s_linear(d):
+    eps = 0.5 * (grad(d) + grad(d).T)
+    return Constant(2.0 * MU_S) * eps + Constant(LAMBDA_S) * trace(eps) * I2
+
+
+def dsigma_s_linear(delta_d):
+    eps = 0.5 * (grad(delta_d) + grad(delta_d).T)
+    return Constant(2.0 * MU_S) * eps + Constant(LAMBDA_S) * trace(eps) * I2
+
+
 def sigma_s_nonlinear(d):
+    if USE_LINEAR_SOLID:
+        return sigma_s_linear(d)
     F = F_of(d)
     E = E_of(F)
     S = S_stvk(E)
@@ -2579,15 +3040,17 @@ def _tip_position(dh: DofHandler, mesh: Mesh, disp: VectorFunction, ref_tip: np.
 
 
 def dsigma_s(d_ref, delta_d):
+    if USE_LINEAR_SOLID:
+        return dsigma_s_linear(delta_d)
     Fk = F_of(d_ref)
     Ek = E_of(Fk)
     Sk = S_stvk(Ek)
-    dF = grad(delta_d)
+    # δF = F * ∇(δd) * F  (since F = (I - ∇d)^{-1})
+    dF = dot(Fk, dot(grad(delta_d), Fk))
     dE = 0.5 * (dot(dF.T, Fk) + dot(Fk.T, dF))
     dS = Constant(LAMBDA_S) * trace(dE) * I2 + Constant(2.0 * MU_S) * dE
     Jk = det(Fk)
-    Finv = inv(Fk)
-    dJ = Jk * trace(dot(Finv, dF))
+    dJ = Jk * trace(dot(grad(delta_d), Fk))
     term = dot(dF, dot(Sk, Fk.T)) + dot(Fk, dot(dS, Fk.T)) + dot(Fk, dot(Sk, dF.T))
     return (1.0 / Jk) * term - (dJ / Jk) * sigma_s_nonlinear(d_ref)
 
@@ -2627,12 +3090,23 @@ jump_vel_trial = Jump(du_f, du_s)
 jump_vel_test = Jump(test_vel_f, test_vel_s)
 jump_vel_res = Jump(uf_k, us_k)
 
+solid_adv_vel = us_n_R if SOLID_ADVECT_LAGGED else us_k_R
+
 avg_flux_trial = kappa_pos * traction_fluid(Pos(du_f), Pos(dp_f)) - kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
-avg_flux_test = kappa_pos * traction_fluid(Pos(test_vel_f), -Pos(test_q_f)) - kappa_neg * traction_solid_L(Neg(test_disp_s), Neg(disp_k))
+avg_flux_test = kappa_pos * traction_fluid(Pos(test_vel_f), -Pos(test_q_f)) - kappa_neg * traction_solid_L(Neg(test_vel_s), Neg(disp_k))
 avg_flux_res = kappa_pos * traction_fluid(Pos(uf_k), Pos(pf_k)) - kappa_neg * traction_solid_R(Neg(disp_k))
 
-J_int = (-dot(avg_flux_trial, jump_vel_test) - dot(avg_flux_test, jump_vel_trial) + (beta_N * mu_f_const / cell_h) * dot(jump_vel_trial, jump_vel_test)) * dΓ
-R_int = (-dot(avg_flux_res, jump_vel_test) - dot(avg_flux_test, jump_vel_res) + (beta_N * mu_f_const / cell_h) * dot(jump_vel_res, jump_vel_test)) * dΓ
+s_nitsche = Constant(float(os.getenv("S_NITSCHE", "0.0")))   # 1 = symmetric, 0 = incomplete, -1 = skew-symmetric
+
+J_int = (-dot(avg_flux_trial, jump_vel_test)
+         - s_nitsche * dot(avg_flux_test, jump_vel_trial)
+         + (beta_N * mu_f_const / cell_h) * dot(jump_vel_trial, jump_vel_test)) * dΓ
+
+R_int = (-dot(avg_flux_res,  jump_vel_test)
+         - s_nitsche * dot(avg_flux_test, jump_vel_res)
+         + (beta_N * mu_f_const / cell_h) * dot(jump_vel_res,  jump_vel_test)) * dΓ
+
+
 
 a_vol_f = (
     rho_f_const / dt * dot(du_f_R, test_vel_f_R)
@@ -2660,9 +3134,18 @@ dsigma_s_k = dsigma_s(disp_k_R, ddisp_s_R)
 a_vol_s = (
     rho_s_const * dot(du_s_R, test_vel_s_R) / dt
     + theta * inner(dsigma_s_k, grad(test_vel_s_R))
-    + rho_s_const * theta
-      * (dot(dot(grad(us_k_R), du_s_R), test_vel_s_R) + 
-         dot(dot(grad(du_s_R), us_k_R), test_vel_s_R))
+    + (
+        rho_s_const
+        * theta
+        * (
+            dot(dot(grad(du_s_R), solid_adv_vel), test_vel_s_R)
+            if SOLID_ADVECT_LAGGED
+            else (
+                dot(dot(grad(us_k_R), du_s_R), test_vel_s_R)
+                + dot(dot(grad(du_s_R), us_k_R), test_vel_s_R)
+            )
+        )
+    )
 ) * dx_solid
 r_vol_s = (
     rho_s_const * dot(us_k_R - us_n_R, test_vel_s_R) / dt
@@ -2670,31 +3153,43 @@ r_vol_s = (
     + (1 - theta) * inner(sigma_s_n, grad(test_vel_s_R))
     + rho_s_const
         * (
-        theta * dot(dot(grad(us_k_R), us_k_R), test_vel_s_R)
-        + (1 - theta) * dot(dot(grad(us_n_R), us_n_R), test_vel_s_R)
-    )
+            theta * dot(dot(grad(us_k_R), solid_adv_vel), test_vel_s_R)
+            + (1 - theta) * dot(dot(grad(us_n_R), us_n_R), test_vel_s_R)
+        )
 ) * dx_solid
 
 
 
-a_svc = (dot(ddisp_s_R, test_disp_s_R) / dt - theta * dot(du_s_R, test_disp_s_R)
-         + theta * (dot(dot(grad(ddisp_s_R), us_k_R), test_disp_s_R) 
-                    + dot(dot(grad(disp_k_R), du_s_R), test_disp_s_R))
-         ) * dx_solid
+a_svc = (
+    dot(ddisp_s_R, test_disp_s_R) / dt
+    - theta * dot(du_s_R, test_disp_s_R)
+    + (
+        theta
+        * (
+            dot(dot(grad(ddisp_s_R), solid_adv_vel), test_disp_s_R)
+            if SOLID_ADVECT_LAGGED
+            else (
+                dot(dot(grad(ddisp_s_R), us_k_R), test_disp_s_R)
+                + dot(dot(grad(disp_k_R), du_s_R), test_disp_s_R)
+            )
+        )
+    )
+) * dx_solid
 # Kinematic constraint with advected displacement in Eulerian frame
 r_svc = (
     dot(disp_k_R - disp_n_R, test_disp_s_R) / dt
     - theta * dot(us_k_R, test_disp_s_R)
     - (1 - theta) * dot(us_n_R, test_disp_s_R)
-    + theta * dot(dot(grad(disp_k_R), us_k_R), test_disp_s_R)
+    + theta * dot(dot(grad(disp_k_R), solid_adv_vel), test_disp_s_R)
     + (1 - theta) * dot(dot(grad(disp_n_R), us_n_R), test_disp_s_R)
 ) * dx_solid
 
-penalty_val = 1e-1
-penalty_grad = 1e-1
+penalty_val = float(os.getenv("PENALTY_VAL", "0.0"))
+penalty_grad = float(os.getenv("PENALTY_GRAD", "0.0"))
 gamma_v = Constant(penalty_val * POLY_ORDER**2)
 gamma_v_grad = Constant(penalty_grad * POLY_ORDER**2)
 gamma_p = Constant(penalty_val * POLY_ORDER)
+solid_reg_eps = Constant(float(os.getenv("SOLID_REG_EPS", "1e-6")))
 
 
 def g_v_f(gamma, phi_1, phi_2):
@@ -2724,8 +3219,11 @@ r_stab = (
     * dG_solid
 )
 
-jacobian_form = a_vol_f + J_int + a_vol_s + a_stab
-residual_form = r_vol_f + R_int + r_vol_s + r_stab
+a_reg = solid_reg_eps * (dot(du_s_R, test_vel_s_R) + dot(ddisp_s_R, test_disp_s_R)) * dx_solid
+r_reg = solid_reg_eps * (dot(us_k_R, test_vel_s_R) + dot(disp_k_R, test_disp_s_R)) * dx_solid
+
+jacobian_form = a_vol_f + J_int + a_vol_s + a_stab + a_svc + a_reg
+residual_form = r_vol_f + R_int + r_vol_s + r_stab + r_svc + r_reg
 
 # ----------------------------------------------------------------------------- 
 # Diagnostics: tip displacement, drag/lift (avg traction), pressure drop, VTK
@@ -2810,7 +3308,11 @@ def _plot_mesh(step_idx: int, title: str = "Mesh / Ghost / Level-set") -> None:
         pts = np.column_stack([gx.ravel(), gy.ravel()])
         vals = np.apply_along_axis(level_set_for_plot, 1, pts).reshape(gx.shape)
         cs = ax.contour(gx, gy, vals, levels=[0.0], colors="green", linewidths=1.5, zorder=5)
-        levelset_artists = cs.collections
+        collections = getattr(cs, "collections", None)
+        if collections:
+            levelset_artists = list(collections)
+        else:
+            levelset_artists = [cs]
 
     toggles = []
     labels = []
@@ -2872,7 +3374,7 @@ else:
 
 def _compute_observables(step_idx: int, t_curr: float) -> None:
     dGamma_obs = dInterface(
-        defined_on=domains["cut_domain"],
+        defined_on=domains["cut_interface"],
         level_set=ls_beam,
         metadata={"q": qvol + 2, "derivs": {(0, 0), (1, 0), (0, 1)}},
     )
@@ -2922,7 +3424,7 @@ if ARGS.run_fd_check:
         "d_neg_y": disp_k,
     }
     probe = select_fd_dofs(dof_handler, {"u_pos_x": 2, "u_pos_y": 2, "vs_neg_x": 2, "d_neg_x": 2}, elem_tag="cut")
-    finite_difference_check(jacobian_form, residual_form, dof_handler, bcs_homog, fd_fields, probe, eps=1.0e-7)
+    finite_difference_check(jacobian_form, residual_form, dof_handler, bcs, fd_fields, probe, eps=1.0e-7)
     if ARGS.run_fd_terms:
         term_blocks = {
             "fluid_vol": (a_vol_f, r_vol_f),
@@ -2946,15 +3448,25 @@ if ARGS.run_fd_check:
                 (Constant(2.0) * mu_s_const * g_disp_s(gamma_v_grad, disp_k_R, test_disp_s_R)) * dG_solid,
             ),
         }
+        term_filter = os.getenv("FD_TERM", "").strip()
+        if term_filter:
+            term_blocks = {k: v for k, v in term_blocks.items() if term_filter in k}
+            if not term_blocks:
+                print(f"[FD term] no terms match filter '{term_filter}'")
         for name, (jf, rf) in term_blocks.items():
             print(f"\n[FD term] {name}")
-            finite_difference_check(jf, rf, dof_handler, bcs_homog, fd_fields, probe, eps=1.0e-7)
+            finite_difference_check(jf, rf, dof_handler, bcs, fd_fields, probe, eps=1.0e-7)
 
 # -----------------------------------------------------------------------------
 # Time stepping
 # -----------------------------------------------------------------------------
 if ARGS.run_time_stepping:
-    time_params = TimeStepperParameters(dt=DT, max_steps=50, stop_on_steady=True, steady_tol=1e-6, theta=theta.value)
+    max_steps = int(os.getenv("MAX_STEPS", "50"))
+    time_params = TimeStepperParameters(dt=DT, max_steps=max_steps, stop_on_steady=True, steady_tol=1e-6, theta=theta.value)
+    newton_tol = float(os.getenv("NEWTON_TOL", "1e-6"))
+    max_newton_iter = int(os.getenv("MAX_NEWTON_ITER", "20"))
+    ls_mode = os.getenv("LS_MODE", "dealii")
+    ls_max_iter = int(os.getenv("LS_MAX_ITER", "12"))
     solver = NewtonSolver(
         residual_form,
         jacobian_form,
@@ -2962,17 +3474,29 @@ if ARGS.run_time_stepping:
         mixed_element=mixed_element,
         bcs=bcs,
         bcs_homog=bcs_homog,
-        newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
+        newton_params=NewtonParameters(
+            newton_tol=newton_tol,
+            max_newton_iter=max_newton_iter,
+            line_search=True,
+            ls_mode=ls_mode,
+            ls_max_iter=ls_max_iter,
+        ),
     )
 
     step_idx = [0]  # mutable so the closure can update
     dt_val = DT.value if hasattr(DT, "value") else float(DT)
 
     def post_step_cb(funcs):
-        update_beam_levelset_from_displacement(ls_beam, disp_k, beam_ref_ls)
+        update_beam_levelset_from_displacement(
+            ls_beam,
+            disp_k,
+            beam_ref_ls,
+            zero_eps=LEVELSET_ZERO_EPS,
+            prefer_negative=LEVELSET_PREFER_NEGATIVE,
+        )
         refresh_domains(mesh, domains)
         refresh_hansbo_kappa(mesh, ls_beam, theta_pos_vals, theta_neg_vals)
-        retag_inactive(dof_handler)
+        retag_inactive(dof_handler, theta_neg=theta_neg_vals, solid_cut_drop=SOLID_CUT_DROP)
         dof_handler.apply_bcs(bcs, uf_k, pf_k, us_k, disp_k)
         recompute_active_dofs(solver, solver.bcs_homog if solver.bcs_homog else solver.bcs)
         _compute_observables(step_idx[0], step_idx[0] * dt_val)

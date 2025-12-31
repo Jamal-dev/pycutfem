@@ -21,11 +21,16 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Callable, Optional, Tuple
 import inspect
+import warnings
 
 
 import numpy as np
 import scipy.sparse.linalg as spla
 import scipy.sparse as sp
+try:
+    from scipy.sparse.linalg import MatrixRankWarning
+except Exception:
+    MatrixRankWarning = None
 # from pycutfem.ufl.helpers_jit import _scatter_element_contribs
 from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
 from pycutfem.jit import compile_multi        
@@ -618,6 +623,9 @@ class NewtonSolver:
                 reduce_dt = False
             except Exception as e:
                 reduce_dt = True
+                converged = False
+                n_iters = 0
+                delta_U = np.zeros_like(delta_U)
                 print(f"    Newton failed at step {step+1} with dt={dt:.3e}: {e}")
             # Crieteria if converged but number of Newton iterations are more than 20, reduce dt
             if (converged and n_iters >= 20) or reduce_dt:
@@ -752,10 +760,22 @@ class NewtonSolver:
             A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
             assembly_time += time.perf_counter() - t_asm
 
-            # 1a) PRUNE decoupled rows caused by Restriction (nnz==0)
-            row_nnz = np.diff(A_red.indptr)
-            inactive = np.where(row_nnz == 0)[0]
-            if inactive.size:
+            # 1a) PRUNE decoupled rows/cols caused by Restriction (nnz==0)
+            for _ in range(2):
+                row_nnz = np.diff(A_red.indptr)
+                col_nnz = np.bincount(A_red.indices, minlength=A_red.shape[1]) if A_red.indices.size else np.zeros(A_red.shape[1], dtype=int)
+                inactive_mask = (row_nnz == 0) | (col_nnz == 0)
+                drop_tol = float(os.getenv("PYCUTFEM_DROP_TOL", "1e-12"))
+                if drop_tol > 0.0 and A_red.data.size:
+                    abs_data = np.abs(A_red.data)
+                    row_abs = np.add.reduceat(abs_data, A_red.indptr[:-1])
+                    col_abs = np.bincount(A_red.indices, weights=abs_data, minlength=A_red.shape[1])
+                    scale = float(abs_data.max())
+                    thresh = drop_tol * max(1.0, scale)
+                    inactive_mask |= (row_abs <= thresh) | (col_abs <= thresh)
+                inactive = np.where(inactive_mask)[0]
+                if not inactive.size:
+                    break
                 keep_mask = np.ones(len(self.active_dofs), dtype=bool)
                 keep_mask[inactive] = False
                 # rebuild maps
@@ -957,8 +977,10 @@ class NewtonSolver:
                 print(f"        Line search failed, using best-effort α = {best_alpha:.2e} (‖R‖∞ decreased).")
                 self._ls_alpha_prev = best_alpha
                 return best_alpha * S_red
-            print("        Line search failed – no decreasing step found; taking α = 0.")
-            return np.zeros_like(S_red)
+            min_alpha = alpha
+            print(f"        Line search failed – taking minimal step α = {min_alpha:.2e}.")
+            self._ls_alpha_prev = min_alpha
+            return min_alpha * S_red
 
         # Gradient g_f = J_ff^T R_f  (reduced variables only)
         g = A_red.T @ R_red
@@ -1242,7 +1264,24 @@ class NewtonSolver:
     def _solve_linear_system(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
         backend = str(getattr(self.lp, "backend", "scipy") or "scipy").lower()
         if backend == "scipy":
-            return spla.spsolve(A, rhs)
+            try:
+                with warnings.catch_warnings():
+                    if MatrixRankWarning is not None:
+                        warnings.filterwarnings("error", category=MatrixRankWarning)
+                    sol = spla.spsolve(A, rhs)
+                if not np.isfinite(sol).all():
+                    raise np.linalg.LinAlgError("spsolve returned non-finite values")
+                return sol
+            except Exception as exc:
+                if not np.isfinite(A.data).all() or not np.isfinite(rhs).all():
+                    raise
+                shift_scale = float(os.getenv("PYCUTFEM_LIN_SHIFT", "1e-8"))
+                diag = A.diagonal()
+                diag_scale = float(np.max(np.abs(diag))) if diag.size else 1.0
+                shift = max(shift_scale * max(1.0, diag_scale), 1.0e-14)
+                A_reg = A + (shift * sp.eye(A.shape[0], format="csr"))
+                print(f"        [lin] adding diagonal shift {shift:.3e} after solver failure: {exc}")
+                return spla.spsolve(A_reg, rhs)
         if backend == "petsc":
             if not HAS_PETSC:
                 raise RuntimeError(

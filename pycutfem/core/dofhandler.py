@@ -2998,15 +2998,19 @@ class DofHandler:
         qp_phys = None
         qw      = None
         if nE > 0:
-            # prefer curved projection when available (captures curved interfaces)
-            try:
-                qpts_curved, qw_curved = curved_line_quadrature_batch(
-                    level_set, P0, P1, order=qdeg, nseg=max(1, getattr(mesh, "poly_order", 1)),
-                    mesh=mesh, eids=np.array([e.left for e in edges], dtype=int)
-                )
-                qp_phys = np.asarray(qpts_curved, dtype=float)
-                qw = np.asarray(qw_curved, dtype=float)
-            except Exception:
+            use_curved = bool(allow_interface)
+            if use_curved:
+                # prefer curved projection when interface edges are allowed
+                try:
+                    qpts_curved, qw_curved = curved_line_quadrature_batch(
+                        level_set, P0, P1, order=qdeg, nseg=max(1, getattr(mesh, "poly_order", 1)),
+                        mesh=mesh, eids=np.array([e.left for e in edges], dtype=int)
+                    )
+                    qp_phys = np.asarray(qpts_curved, dtype=float)
+                    qw = np.asarray(qw_curved, dtype=float)
+                except Exception:
+                    use_curved = False
+            if not use_curved:
                 xi1, w_ref = gauss_legendre(qdeg)
                 xi1 = np.asarray(xi1, float); w_ref = np.asarray(w_ref, float)
                 nQ  = xi1.size
