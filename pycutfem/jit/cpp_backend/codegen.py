@@ -309,10 +309,16 @@ class CppCodeGen:
         if not active_fields:
             active_fields = _active_fields_from_ir()
 
+        me_fields = list(getattr(self.mixed_element, "field_names", ()))
+        if active_fields:
+            ordered = [f for f in me_fields if f in active_fields]
+            if ordered:
+                active_fields = ordered
+        else:
+            active_fields = me_fields
+
         # Persist for downstream callers (static arg compression).
         self.active_fields = tuple(active_fields)
-
-        me_fields = list(getattr(self.mixed_element, "field_names", ()))
 
         # Default: native component ordering (matches uncompressed gdofs_map)
         field_slices = dict(self.mixed_element.component_dof_slices)

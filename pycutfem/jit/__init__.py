@@ -502,6 +502,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
     kernels : list[_IntegralKernel] = []
     fc = FormCompiler(dof_handler, quadrature_order=quad_order, backend=backend)
 
+    def _append_kernel(kernel, integral):
+        kernel.integral_id = id(integral)
+        kernels.append(kernel)
+
     # Normalize to a list of Integrals
     if isinstance(form, Equation):   # (a, L)
         integrals = []
@@ -637,13 +641,14 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     )
                 )
                 static = _compress_static_for_active(static, mixed_element, active_cols)
-                kernels.append(
+                _append_kernel(
                     _IntegralKernel(
                         runner,
                         static,
                         "volume",
                         eids=np.asarray(element_ids, dtype=np.int32),
-                    )
+                    ),
+                    intg,
                 )
                 continue  # done with this integral
 
@@ -859,7 +864,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
             static_full = _full_static(level_set)
             full_eids = np.asarray(static_full.get("eids", []), dtype=np.int32)
-            kernels.append(
+            _append_kernel(
                 _IntegralKernel(
                     runner,
                     static_full,
@@ -868,12 +873,13 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     side=side,
                     builder=_full_static,
                     eids=full_eids,
-                )
+                ),
+                intg,
             )
 
             static_cut = _cut_static(level_set)
             cut_eids = np.asarray(static_cut.get("eids", []), dtype=np.int32)
-            kernels.append(
+            _append_kernel(
                 _IntegralKernel(
                     runner,
                     static_cut,
@@ -882,7 +888,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     side=side,
                     builder=_cut_static,
                     eids=cut_eids,
-                )
+                ),
+                intg,
             )
             continue
 
@@ -941,11 +948,16 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
                     eids_arr = np.asarray(geom.get("eids", new_ids), dtype=np.int32)
                     if "gdofs_map" in geom:
-                        gdofs_map = np.asarray(geom["gdofs_map"], dtype=np.int32)
-                        gdofs_map = gdofs_map[:, active_cols] if gdofs_map.size else gdofs_map
+                        gdofs_map_raw = np.asarray(geom["gdofs_map"], dtype=np.int32)
+                        ncols = gdofs_map_raw.shape[1] if gdofs_map_raw.ndim == 2 else 0
+                        eff_cols = active_cols[active_cols < ncols] if ncols else active_cols
+                        if eff_cols.size == 0 and ncols:
+                            eff_cols = np.arange(ncols, dtype=np.int32)
+                        gdofs_map = gdofs_map_raw[:, eff_cols] if gdofs_map_raw.size else gdofs_map_raw
                     else:
+                        eff_cols = active_cols
                         gdofs_map = np.vstack([
-                            np.asarray(dof_handler.get_elemental_dofs(e), dtype=np.int32)[active_cols]
+                            np.asarray(dof_handler.get_elemental_dofs(e), dtype=np.int32)[eff_cols]
                             for e in eids_arr
                         ]).astype(np.int32)
                     geom["gdofs_map"] = gdofs_map
@@ -963,7 +975,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             pre_built=geom,
                         )
                     )
-                    static_new = _compress_static_for_active(static_new, mixed_element, active_cols)
+                    static_new = _compress_static_for_active(static_new, mixed_element, eff_cols)
 
                 merged = _merge_static_arrays(new_eids_full, old_static, static_new)
                 merged["is_interface"] = True
@@ -980,7 +992,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
             static = _interface_static(level_set)
             eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
-            kernels.append(
+            _append_kernel(
                 _IntegralKernel(
                     runner,
                     static,
@@ -988,7 +1000,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     level_set=level_set,
                     builder=_interface_static,
                     eids=eids_arr,
-                )
+                ),
+                intg,
             )
             continue
 
@@ -1084,7 +1097,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
             static = _ghost_static(level_set)
             eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
-            kernels.append(
+            _append_kernel(
                 _IntegralKernel(
                     runner,
                     static,
@@ -1092,7 +1105,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     level_set=level_set,
                     builder=_ghost_static,
                     eids=eids_arr,
-                )
+                ),
+                intg,
             )
             continue
 
@@ -1147,7 +1161,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
             )
             static = _compress_static_for_active(static, mixed_element, eff_cols)
             eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
-            kernels.append(
+            _append_kernel(
                 _IntegralKernel(
                     runner,
                     static,
@@ -1155,7 +1169,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     level_set=None,
                     builder=None,
                     eids=eids_arr,
-                )
+                ),
+                intg,
             )
             continue
 

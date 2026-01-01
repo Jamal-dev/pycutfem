@@ -2385,15 +2385,30 @@ def finite_difference_check(
     functions: Dict[str, VectorFunction | Function],
     probe_dofs: Iterable[int],
     eps: float = 1.0e-6,
+    *,
+    bcs_elim: Sequence[BoundaryCondition] | None = None,
+    coeffs: Dict[str, VectorFunction | Function] | None = None,
+    backend: str | None = None,
+    apply_bcs_each: bool = False,
+    label: str | None = None,
+    kernel_pool: Dict[str, Dict[int, object]] | None = None,
 ) -> None:
-    backend = FD_BACKEND
+    backend = backend or FD_BACKEND
+    debug_timing = os.getenv("FD_TIMING", "").lower() in {"1", "true", "yes"}
+    cols_only = os.getenv("FD_JAC_COLS_ONLY", "1") != "0"
+    timings: Dict[str, float] = {}
+    t_total = time.perf_counter() if debug_timing else None
+
+    def _t_add(key: str, dt: float) -> None:
+        timings[key] = timings.get(key, 0.0) + dt
+
     if jac_form is None or res_form is None:
         print("Skipping FD check: Jacobian or residual form missing.")
         return
-    compiler = FormCompiler(dh, backend=backend)
     eq_jac = Equation(jac_form, None)
     eq_res = Equation(None, res_form)
-    bc_active = list(bcs) if bcs else []
+    bc_values = list(bcs) if bcs else []
+    bc_elim = list(bcs_elim) if bcs_elim else []
     uniq_funcs = []
     seen = set()
     for func in functions.values():
@@ -2401,12 +2416,249 @@ def finite_difference_check(
             continue
         seen.add(id(func))
         uniq_funcs.append(func)
-    if bc_active:
-        dh.apply_bcs(bc_active, *uniq_funcs)
-    base_K, _ = compiler.assemble(eq_jac, bcs=bc_active)
+    if bc_values:
+        dh.apply_bcs(bc_values, *uniq_funcs)
+
+    probe_list = list(probe_dofs)
+    if debug_timing:
+        lbl = f" ({label})" if label else ""
+        print(
+            f"[FD timing{lbl}] start backend={backend} fast_jit={backend=='jit' and coeffs is not None} "
+            f"probes={len(probe_list)} eps={eps:.1e} cols_only={cols_only}"
+        )
+
+    def _form_integrals(form):
+        if form is None:
+            return []
+        ints = getattr(form, "integrals", None)
+        return list(ints) if ints is not None else [form]
+
+    def _select_kernels_from_pool(form, pool, tag):
+        if not pool:
+            return None
+        ints = _form_integrals(form)
+        missing = 0
+        selected = []
+        for intg in ints:
+            ker_list = pool.get(id(intg))
+            if ker_list is None:
+                missing += 1
+            else:
+                if isinstance(ker_list, list):
+                    selected.extend(ker_list)
+                else:
+                    selected.append(ker_list)
+        if missing:
+            if debug_timing:
+                print(
+                    f"[FD timing] kernel pool missing {missing}/{len(ints)} integrals for {tag}; "
+                    "falling back to compile."
+                )
+            return None
+        return selected
+
+    def _apply_dirichlet(K, R, bcs_apply):
+        if not bcs_apply:
+            return
+        data = dh.get_dirichlet_data(bcs_apply)
+        if not data:
+            return
+        rows = np.fromiter(data.keys(), dtype=int)
+        vals = np.fromiter(data.values(), dtype=float)
+        if K is not None:
+            if R is not None and np.any(vals):
+                bc_vec = np.zeros(R.size)
+                bc_vec[rows] = vals
+                R -= K @ bc_vec
+            K_lil = K.tolil()
+            K_lil[rows, :] = 0
+            K_lil[:, rows] = 0
+            K_lil[rows, rows] = 1.0
+            K[:] = K_lil
+        if R is not None:
+            R[rows] = vals
+
+    # Fast JIT path: precompile kernels and reuse static geometry for FD sweeps.
+    use_fast_jit = backend == "jit" and coeffs is not None
+    base_cols = None
+    if use_fast_jit:
+        import scipy.sparse as sp
+        from pycutfem.jit import compile_multi
+        from pycutfem.ufl.helpers_jit import _scatter_element_contribs
+
+        ndof = dh.total_dofs
+        kernels_K = None
+        kernels_R = None
+        if kernel_pool:
+            kernels_K = _select_kernels_from_pool(jac_form, kernel_pool.get("jac", {}), "jac")
+            kernels_R = _select_kernels_from_pool(res_form, kernel_pool.get("res", {}), "res")
+            if debug_timing and kernels_K is not None and kernels_R is not None:
+                print("[FD timing] reusing kernel pool (no compile).")
+        if kernels_K is None:
+            if debug_timing:
+                print("[FD timing] compiling jac kernels...")
+            t0 = time.perf_counter() if debug_timing else None
+            kernels_K = compile_multi(
+                jac_form,
+                dof_handler=dh,
+                mixed_element=dh.mixed_element,
+                backend=backend,
+            )
+            if debug_timing and t0 is not None:
+                dt = time.perf_counter() - t0
+                _t_add("compile_jac", dt)
+                print(f"[FD timing] compiled jac kernels in {dt:.3f}s (n={len(kernels_K)})")
+        if kernels_R is None:
+            if debug_timing:
+                print("[FD timing] compiling res kernels...")
+            t0 = time.perf_counter() if debug_timing else None
+            kernels_R = compile_multi(
+                res_form,
+                dof_handler=dh,
+                mixed_element=dh.mixed_element,
+                backend=backend,
+            )
+            if debug_timing and t0 is not None:
+                dt = time.perf_counter() - t0
+                _t_add("compile_res", dt)
+                print(f"[FD timing] compiled res kernels in {dt:.3f}s (n={len(kernels_R)})")
+
+        def _slice_static_args(static_args, idx):
+            n_total = int(np.asarray(static_args.get("eids")).shape[0])
+            sliced = {}
+            for key, val in static_args.items():
+                if isinstance(val, np.ndarray) and val.ndim >= 1 and int(val.shape[0]) == n_total:
+                    sliced[key] = val[idx]
+                else:
+                    sliced[key] = val
+            return sliced
+
+        def assemble_K_cols(probes):
+            probe_set = {int(p) for p in probes}
+            probe_arr = np.fromiter(probe_set, dtype=int)
+            jac_cols = {int(p): np.zeros(ndof) for p in probes}
+            domain_times: Dict[str, float] = {}
+            for ker in kernels_K:
+                gdofs_map = ker.static_args["gdofs_map"]
+                if gdofs_map.size == 0:
+                    continue
+                mask = np.any(np.isin(gdofs_map, probe_arr), axis=1)
+                if not np.any(mask):
+                    continue
+                idx = np.where(mask)[0]
+                static_args = _slice_static_args(ker.static_args, idx)
+                t0 = time.perf_counter() if debug_timing else None
+                Kloc, _, _ = ker.runner(coeffs, static_args)
+                if debug_timing and t0 is not None:
+                    dt = time.perf_counter() - t0
+                    domain_times[ker.domain] = domain_times.get(ker.domain, 0.0) + dt
+                gdofs_sub = static_args["gdofs_map"]
+                for e in range(gdofs_sub.shape[0]):
+                    gdofs = gdofs_sub[e]
+                    valid_rows = gdofs >= 0
+                    if not np.any(valid_rows):
+                        continue
+                    row_idx = np.where(valid_rows)[0]
+                    rows = gdofs[valid_rows]
+                    Kloc_e = Kloc[e]
+                    cols = [j for j, g in enumerate(gdofs) if g in probe_set]
+                    for j in cols:
+                        gcol = int(gdofs[j])
+                        if gcol < 0:
+                            continue
+                        jac_cols[gcol][rows] += Kloc_e[row_idx, j]
+            if debug_timing:
+                for dom, dt in domain_times.items():
+                    _t_add(f"assemble_K:{dom}", dt)
+            if bc_elim:
+                data = dh.get_dirichlet_data(bc_elim)
+                if data:
+                    bc_rows = np.fromiter(data.keys(), dtype=int)
+                    for gcol in jac_cols:
+                        col = jac_cols[gcol]
+                        col[bc_rows] = 0.0
+                        if gcol in data:
+                            col[:] = 0.0
+                            col[gcol] = 1.0
+            return jac_cols
+
+        def assemble_K():
+            K = sp.lil_matrix((ndof, ndof))
+            domain_times: Dict[str, float] = {}
+            for ker in kernels_K:
+                t0 = time.perf_counter() if debug_timing else None
+                Kloc, _, _ = ker.exec(coeffs)
+                _scatter_element_contribs(
+                    K_elem=Kloc,
+                    F_elem=None,
+                    J_elem=None,
+                    element_ids=ker.static_args["eids"],
+                    gdofs_map=ker.static_args["gdofs_map"],
+                    matvec=K,
+                    ctx={"rhs": False, "add": True},
+                    integrand=ker,
+                    hook=None,
+                )
+                if debug_timing and t0 is not None:
+                    dt = time.perf_counter() - t0
+                    domain_times[ker.domain] = domain_times.get(ker.domain, 0.0) + dt
+            if debug_timing:
+                for dom, dt in domain_times.items():
+                    _t_add(f"assemble_K:{dom}", dt)
+            if bc_elim:
+                _apply_dirichlet(K, None, bc_elim)
+            return K.tocsr()
+
+        def assemble_R():
+            R = np.zeros(ndof)
+            domain_times: Dict[str, float] = {}
+            for ker in kernels_R:
+                t0 = time.perf_counter() if debug_timing else None
+                _, Floc, _ = ker.exec(coeffs)
+                _scatter_element_contribs(
+                    K_elem=None,
+                    F_elem=Floc,
+                    J_elem=None,
+                    element_ids=ker.static_args["eids"],
+                    gdofs_map=ker.static_args["gdofs_map"],
+                    matvec=R,
+                    ctx={"rhs": True, "add": True},
+                    integrand=ker,
+                    hook=None,
+                )
+                if debug_timing and t0 is not None:
+                    dt = time.perf_counter() - t0
+                    domain_times[ker.domain] = domain_times.get(ker.domain, 0.0) + dt
+            if debug_timing:
+                for dom, dt in domain_times.items():
+                    _t_add(f"assemble_R:{dom}", dt)
+            if bc_elim:
+                _apply_dirichlet(None, R, bc_elim)
+            return R
+
+        base_K = None
+        base_cols = None
+        t0 = time.perf_counter() if debug_timing else None
+        if cols_only:
+            base_cols = assemble_K_cols(probe_list)
+        else:
+            base_K = assemble_K()
+        if debug_timing and t0 is not None:
+            dt = time.perf_counter() - t0
+            _t_add("assemble_base_K", dt)
+            print(f"[FD timing] assembled base K in {dt:.3f}s")
+    else:
+        compiler = FormCompiler(dh, backend=backend)
+        t0 = time.perf_counter() if debug_timing else None
+        base_K, _ = compiler.assemble(eq_jac, bcs=bc_elim or None)
+        if debug_timing and t0 is not None:
+            dt = time.perf_counter() - t0
+            _t_add("assemble_base_K", dt)
+            print(f"[FD timing] assembled base K in {dt:.3f}s")
     if base_K is None:
-        print("Skipping FD check: Jacobian or residual form missing.")
-        return
+        if base_cols is None:
+            print("Skipping FD check: Jacobian or residual form missing.")
+            return
 
     def perturb(field: str, gdof: int, new_value: float) -> float:
         func = functions[field]
@@ -2415,14 +2667,17 @@ def finite_difference_check(
         return old
 
     rows = []
-    bc_dofs = set(dh.get_dirichlet_data(bc_active).keys())
+    debug_col = os.getenv("FD_DEBUG_COL", "").strip()
+    debug_top = int(os.getenv("FD_DEBUG_TOP", "5") or "5")
+    bc_src = bc_values if bc_values else bc_elim
+    bc_dofs = set(dh.get_dirichlet_data(bc_src).keys()) if bc_src else set()
     inactive = set(dh.dof_tags.get("inactive", set()))
     active_mask = np.ones(dh.total_dofs, dtype=bool)
     if bc_dofs:
         active_mask[np.fromiter(bc_dofs, dtype=int)] = False
     if inactive:
         active_mask[np.fromiter(inactive, dtype=int)] = False
-    for gdof in probe_dofs:
+    for gdof in probe_list:
         field, _ = dh._dof_to_node_map[int(gdof)]
         if field not in functions:
             continue
@@ -2432,26 +2687,64 @@ def finite_difference_check(
             continue
         old_val = functions[field].get_nodal_values(np.array([gdof], dtype=int))[0]
         perturb(field, int(gdof), old_val + eps)
-        if bc_active:
-            dh.apply_bcs(bc_active, *uniq_funcs)
-        _, R_plus = compiler.assemble(eq_res, bcs=bc_active)
+        if apply_bcs_each and bc_values:
+            dh.apply_bcs(bc_values, *uniq_funcs)
+        t0 = time.perf_counter() if debug_timing else None
+        if use_fast_jit:
+            R_plus = assemble_R()
+        else:
+            _, R_plus = compiler.assemble(eq_res, bcs=bc_elim or None)
+        if debug_timing and t0 is not None:
+            _t_add("assemble_R_plus", time.perf_counter() - t0)
         perturb(field, int(gdof), old_val - eps)
-        if bc_active:
-            dh.apply_bcs(bc_active, *uniq_funcs)
-        _, R_minus = compiler.assemble(eq_res, bcs=bc_active)
+        if apply_bcs_each and bc_values:
+            dh.apply_bcs(bc_values, *uniq_funcs)
+        t0 = time.perf_counter() if debug_timing else None
+        if use_fast_jit:
+            R_minus = assemble_R()
+        else:
+            _, R_minus = compiler.assemble(eq_res, bcs=bc_elim or None)
+        if debug_timing and t0 is not None:
+            _t_add("assemble_R_minus", time.perf_counter() - t0)
         perturb(field, int(gdof), old_val)
-        if bc_active:
-            dh.apply_bcs(bc_active, *uniq_funcs)
+        if apply_bcs_each and bc_values:
+            dh.apply_bcs(bc_values, *uniq_funcs)
         fd_col = (R_plus - R_minus) / (2 * eps)
-        jac_col = base_K[:, int(gdof)].toarray().ravel()
+        if base_K is not None:
+            jac_col = base_K[:, int(gdof)].toarray().ravel()
+        else:
+            jac_col = base_cols.get(int(gdof), np.zeros(dh.total_dofs))
         err_vec = fd_col - jac_col
         err = np.linalg.norm(err_vec[active_mask], ord=np.inf)
         mag = np.linalg.norm(jac_col[active_mask], ord=np.inf)
         rel = err / (mag + 1.0e-14)
         rows.append((gdof, field, err, mag, rel))
+        if debug_col and int(debug_col) == int(gdof):
+            abs_err = np.abs(err_vec)
+            top_n = min(debug_top, abs_err.size)
+            top_idx = np.argpartition(abs_err, -top_n)[-top_n:]
+            top_idx = top_idx[np.argsort(abs_err[top_idx])[::-1]]
+            print(f"[FD debug] gdof={gdof} field={field} top_diff_idx={top_idx.tolist()}")
+            for idx in top_idx:
+                row_field, _ = dh._dof_to_node_map[int(idx)]
+                row_active = bool(active_mask[int(idx)])
+                print(
+                    f"[FD debug] row={int(idx)} field={row_field} active={row_active} "
+                    f"fd={fd_col[int(idx)]:.3e} jac={jac_col[int(idx)]:.3e} diff={err_vec[int(idx)]:.3e}"
+                )
+        if debug_timing and t_total is not None:
+            print(
+                f"[FD timing] dof={gdof} field={field} total_elapsed={time.perf_counter() - t_total:.3f}s"
+            )
     print("Finite-difference Jacobian check (gdof, field, err, |J|, rel):")
     for gd, fld, err, mag, rel in rows:
         print(f"  {gd:5d}  {fld:10s}  err={err:9.3e}  |J|={mag:9.3e}  rel={rel:9.3e}")
+    if debug_timing and t_total is not None:
+        total = time.perf_counter() - t_total
+        lbl = f" ({label})" if label else ""
+        print(f"[FD timing{lbl}] total {total:.3f}s")
+        for key in sorted(timings):
+            print(f"[FD timing]   {key} {timings[key]:.3f}s")
 
 
 def detect_mesh_pathologies(mesh: Mesh, tol: float = 1e-10):
@@ -3086,25 +3379,42 @@ mu_f_const = Constant(MU_F)
 mu_s_const = Constant(MU_S)
 lambda_s_const = Constant(LAMBDA_S)
 
-jump_vel_trial = Jump(du_f, du_s)
-jump_vel_test = Jump(test_vel_f, test_vel_s)
-jump_vel_res = Jump(uf_k, us_k)
+jump_vel_trial = Pos(du_f_R) - Neg(du_s_R)
+jump_vel_test = Pos(test_vel_f_R) - Neg(test_vel_s_R)
+jump_vel_res = Pos(uf_k_R) - Neg(us_k_R)
+jump_test_f = Pos(test_vel_f_R)
+jump_test_s = Neg(test_vel_s_R)
 
 solid_adv_vel = us_n_R if SOLID_ADVECT_LAGGED else us_k_R
 
-avg_flux_trial = kappa_pos * traction_fluid(Pos(du_f), Pos(dp_f)) - kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
-avg_flux_test = kappa_pos * traction_fluid(Pos(test_vel_f), -Pos(test_q_f)) - kappa_neg * traction_solid_L(Neg(test_vel_s), Neg(disp_k))
-avg_flux_res = kappa_pos * traction_fluid(Pos(uf_k), Pos(pf_k)) - kappa_neg * traction_solid_R(Neg(disp_k))
+avg_flux_fluid_trial = kappa_pos * traction_fluid(Pos(du_f_R), Pos(dp_f_R))
+avg_flux_fluid_test = kappa_pos * traction_fluid(Pos(test_vel_f_R), -Pos(test_q_f_R))
+avg_flux_fluid_res = kappa_pos * traction_fluid(Pos(uf_k_R), Pos(pf_k_R))
 
-s_nitsche = Constant(float(os.getenv("S_NITSCHE", "0.0")))   # 1 = symmetric, 0 = incomplete, -1 = skew-symmetric
+avg_flux_solid_trial = -kappa_neg * traction_solid_L(Neg(ddisp_s_R), Neg(disp_k_R))
+avg_flux_solid_test = -kappa_neg * traction_solid_L(Neg(test_vel_s_R), Neg(disp_k_R))
+avg_flux_solid_res = -kappa_neg * traction_solid_R(Neg(disp_k_R))
 
-J_int = (-dot(avg_flux_trial, jump_vel_test)
-         - s_nitsche * dot(avg_flux_test, jump_vel_trial)
-         + (beta_N * mu_f_const / cell_h) * dot(jump_vel_trial, jump_vel_test)) * dΓ
+s_nitsche_value = float(os.getenv("S_NITSCHE", "0.0"))
+s_nitsche = Constant(s_nitsche_value)   # 1 = symmetric, 0 = incomplete, -1 = skew-symmetric
 
-R_int = (-dot(avg_flux_res,  jump_vel_test)
-         - s_nitsche * dot(avg_flux_test, jump_vel_res)
-         + (beta_N * mu_f_const / cell_h) * dot(jump_vel_res,  jump_vel_test)) * dΓ
+J_int_fluid = (-dot(avg_flux_fluid_trial, jump_test_f)) * dΓ + (dot(avg_flux_fluid_trial, jump_test_s)) * dΓ
+R_int_fluid = (-dot(avg_flux_fluid_res, jump_test_f)) * dΓ + (dot(avg_flux_fluid_res, jump_test_s)) * dΓ
+J_int_solid = (-dot(avg_flux_solid_trial, jump_test_f)) * dΓ + (dot(avg_flux_solid_trial, jump_test_s)) * dΓ
+R_int_solid = (-dot(avg_flux_solid_res, jump_test_f)) * dΓ + (dot(avg_flux_solid_res, jump_test_s)) * dΓ
+J_int_pen = (beta_N * mu_f_const / cell_h) * dot(jump_vel_trial, jump_vel_test) * dΓ
+R_int_pen = (beta_N * mu_f_const / cell_h) * dot(jump_vel_res, jump_vel_test) * dΓ
+
+J_int = J_int_fluid + J_int_solid + J_int_pen
+R_int = R_int_fluid + R_int_solid + R_int_pen
+
+if s_nitsche_value != 0.0:
+    J_int_sym_fluid = (-s_nitsche * dot(avg_flux_fluid_test, jump_vel_trial)) * dΓ
+    J_int_sym_solid = (-s_nitsche * dot(avg_flux_solid_test, jump_vel_trial)) * dΓ
+    R_int_sym_fluid = (-s_nitsche * dot(avg_flux_fluid_test, jump_vel_res)) * dΓ
+    R_int_sym_solid = (-s_nitsche * dot(avg_flux_solid_test, jump_vel_res)) * dΓ
+    J_int = J_int + J_int_sym_fluid + J_int_sym_solid
+    R_int = R_int + R_int_sym_fluid + R_int_sym_solid
 
 
 
@@ -3423,31 +3733,115 @@ if ARGS.run_fd_check:
         "d_neg_x": disp_k,
         "d_neg_y": disp_k,
     }
-    probe = select_fd_dofs(dof_handler, {"u_pos_x": 2, "u_pos_y": 2, "vs_neg_x": 2, "d_neg_x": 2}, elem_tag="cut")
-    finite_difference_check(jacobian_form, residual_form, dof_handler, bcs, fd_fields, probe, eps=1.0e-7)
-    if ARGS.run_fd_terms:
-        term_blocks = {
-            "fluid_vol": (a_vol_f, r_vol_f),
-            "solid_vol": (a_vol_s, r_vol_s),
-            "solid_vel_constraint": (a_svc, r_svc),
-            "interface": (J_int, R_int),
-            "stab_fluid_vel": (
-                (Constant(2.0) * mu_f_const * g_v_f(gamma_v, du_f_R, test_vel_f_R)) * dG_fluid,
-                (Constant(2.0) * mu_f_const * g_v_f(gamma_v, uf_k_R, test_vel_f_R)) * dG_fluid,
-            ),
-            "stab_fluid_p": (
-                g_p(gamma_p, dp_f_R, test_q_f_R) * dG_fluid,
-                g_p(gamma_p, pf_k_R, test_q_f_R) * dG_fluid,
-            ),
-            "stab_solid_vel": (
-                (rho_s_const * g_v_s(gamma_v, du_s_R, test_vel_s_R)) * dG_solid,
-                (rho_s_const * g_v_s(gamma_v, us_k_R, test_vel_s_R)) * dG_solid,
-            ),
-            "stab_solid_disp": (
-                (Constant(2.0) * mu_s_const * g_disp_s(gamma_v_grad, ddisp_s_R, test_disp_s_R)) * dG_solid,
-                (Constant(2.0) * mu_s_const * g_disp_s(gamma_v_grad, disp_k_R, test_disp_s_R)) * dG_solid,
-            ),
+    fd_coeffs = {f.name: f for f in (uf_k, pf_k, uf_n, pf_n, us_k, us_n, disp_k, disp_n)}
+    fd_kernel_pool = None
+    if FD_BACKEND == "jit" and os.getenv("FD_REUSE_KERNELS", "1") != "0":
+        from pycutfem.jit import compile_multi
+
+        def _pool_from_form(form, kernels):
+            pool: Dict[int, list] = {}
+            for ker in kernels:
+                key = getattr(ker, "integral_id", None)
+                if key is None:
+                    continue
+                pool.setdefault(int(key), []).append(ker)
+            if pool:
+                return pool
+            ints = getattr(form, "integrals", None)
+            integrals = list(ints) if ints is not None else [form]
+            return {id(intg): [ker] for intg, ker in zip(integrals, kernels)}
+
+        debug_timing = os.getenv("FD_TIMING", "").lower() in {"1", "true", "yes"}
+        if debug_timing:
+            print("[FD timing] precompiling full-form kernels for reuse...")
+        t0 = time.perf_counter() if debug_timing else None
+        full_kernels_K = compile_multi(
+            jacobian_form,
+            dof_handler=dof_handler,
+            mixed_element=dof_handler.mixed_element,
+            backend=FD_BACKEND,
+        )
+        if debug_timing and t0 is not None:
+            print(f"[FD timing] full jac kernels compiled in {time.perf_counter() - t0:.3f}s")
+        t0 = time.perf_counter() if debug_timing else None
+        full_kernels_R = compile_multi(
+            residual_form,
+            dof_handler=dof_handler,
+            mixed_element=dof_handler.mixed_element,
+            backend=FD_BACKEND,
+        )
+        if debug_timing and t0 is not None:
+            print(f"[FD timing] full res kernels compiled in {time.perf_counter() - t0:.3f}s")
+        fd_kernel_pool = {
+            "jac": _pool_from_form(jacobian_form, full_kernels_K),
+            "res": _pool_from_form(residual_form, full_kernels_R),
         }
+    probe = select_fd_dofs(dof_handler, {"u_pos_x": 2, "u_pos_y": 2, "vs_neg_x": 2, "d_neg_x": 2}, elem_tag="cut")
+    if os.getenv("FD_SKIP_FULL", "0") == "0":
+        finite_difference_check(
+            jacobian_form,
+            residual_form,
+            dof_handler,
+            bcs,
+            fd_fields,
+            probe,
+            eps=1.0e-7,
+            bcs_elim=bcs_homog,
+            coeffs=fd_coeffs,
+            label="full",
+            kernel_pool=fd_kernel_pool,
+        )
+    if ARGS.run_fd_terms:
+        split_terms = os.getenv("FD_TERM_SPLIT", "0") != "0"
+        split_interface = os.getenv("FD_INTERFACE_SPLIT", "0") != "0"
+        if split_terms:
+            term_blocks = {
+                "fluid_vol": (a_vol_f, r_vol_f),
+                "solid_vol": (a_vol_s, r_vol_s),
+                "solid_vel_constraint": (a_svc, r_svc),
+                "interface": (J_int, R_int),
+                "stab_fluid_vel": (
+                    (Constant(2.0) * mu_f_const * g_v_f(gamma_v, du_f_R, test_vel_f_R)) * dG_fluid,
+                    (Constant(2.0) * mu_f_const * g_v_f(gamma_v, uf_k_R, test_vel_f_R)) * dG_fluid,
+                ),
+                "stab_fluid_p": (
+                    g_p(gamma_p, dp_f_R, test_q_f_R) * dG_fluid,
+                    g_p(gamma_p, pf_k_R, test_q_f_R) * dG_fluid,
+                ),
+                "stab_solid_vel": (
+                    (rho_s_const * g_v_s(gamma_v, du_s_R, test_vel_s_R)) * dG_solid,
+                    (rho_s_const * g_v_s(gamma_v, us_k_R, test_vel_s_R)) * dG_solid,
+                ),
+                "stab_solid_disp": (
+                    (Constant(2.0) * mu_s_const * g_disp_s(gamma_v_grad, ddisp_s_R, test_disp_s_R)) * dG_solid,
+                    (Constant(2.0) * mu_s_const * g_disp_s(gamma_v_grad, disp_k_R, test_disp_s_R)) * dG_solid,
+                ),
+            }
+        else:
+            term_blocks = {
+                "fluid_vol": (a_vol_f, r_vol_f),
+                "solid_vol": (a_vol_s, r_vol_s),
+                "solid_vel_constraint": (a_svc, r_svc),
+                "interface": (J_int, R_int),
+                "stab": (a_stab, r_stab),
+                "reg": (a_reg, r_reg),
+            }
+        if split_interface:
+            term_blocks.pop("interface", None)
+            term_blocks.update(
+                {
+                    "interface_fluid": (J_int_fluid, R_int_fluid),
+                    "interface_solid": (J_int_solid, R_int_solid),
+                    "interface_penalty": (J_int_pen, R_int_pen),
+                }
+            )
+            if s_nitsche_value != 0.0:
+                term_blocks.update(
+                    {
+                        "interface_sym_fluid": (J_int_sym_fluid, R_int_sym_fluid),
+                        "interface_sym_solid": (J_int_sym_solid, R_int_sym_solid),
+                    }
+                )
         term_filter = os.getenv("FD_TERM", "").strip()
         if term_filter:
             term_blocks = {k: v for k, v in term_blocks.items() if term_filter in k}
@@ -3455,7 +3849,19 @@ if ARGS.run_fd_check:
                 print(f"[FD term] no terms match filter '{term_filter}'")
         for name, (jf, rf) in term_blocks.items():
             print(f"\n[FD term] {name}")
-            finite_difference_check(jf, rf, dof_handler, bcs, fd_fields, probe, eps=1.0e-7)
+            finite_difference_check(
+                jf,
+                rf,
+                dof_handler,
+                bcs,
+                fd_fields,
+                probe,
+                eps=1.0e-7,
+                bcs_elim=bcs_homog,
+                coeffs=fd_coeffs,
+                label=name,
+                kernel_pool=fd_kernel_pool,
+            )
 
 # -----------------------------------------------------------------------------
 # Time stepping

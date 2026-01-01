@@ -1218,8 +1218,8 @@ class FormCompiler:
             side = self._get_side()  # '+' or '-'
             union_key = 'pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field'
             union_backup = None
-            if not self.ctx.get('_restriction_mask_active', 0):
-                masks = self.ctx.get(union_key)
+            masks = self.ctx.get(union_key)
+            if self.ctx.get('_restriction_mask_active', 0):
                 if isinstance(masks, dict) and masks:
                     union_backup = masks
                     self.ctx[union_key] = {f: np.ones_like(np.asarray(m, dtype=float)) for f, m in masks.items()}
@@ -1262,8 +1262,8 @@ class FormCompiler:
                 side = self._get_side()
                 union_key = 'pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field'
                 union_backup = None
-                if not self.ctx.get('_restriction_mask_active', 0):
-                    masks = self.ctx.get(union_key)
+                masks = self.ctx.get(union_key)
+                if self.ctx.get('_restriction_mask_active', 0):
                     if isinstance(masks, dict) and masks:
                         union_backup = masks
                         self.ctx[union_key] = {f: np.ones_like(np.asarray(m, dtype=float)) for f, m in masks.items()}
@@ -1392,6 +1392,11 @@ class FormCompiler:
                     if self.ctx.get("global_dofs") is not None:
                         side = self._get_side()
                         coeffs_use = _hac._pad_coeffs_to_global(self.ctx, side, fld, coeffs)
+                        mask_dict = self.ctx.get('pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field')
+                        if isinstance(mask_dict, dict):
+                            mask = mask_dict.get(fld)
+                            if mask is not None:
+                                coeffs_use = coeffs_use * np.asarray(mask, dtype=coeffs_use.dtype)
                         if self.ctx.get('is_ghost', False):
                             if side == '+':
                                 gmask = self.ctx.get('coeff_mask_pos_global')

@@ -206,6 +206,11 @@ class NumbaCodeGen:
                     order.append(f)
         if not order:
             order = list(self.me.field_names)
+        else:
+            me_order = list(self.me.field_names)
+            order = [f for f in me_order if f in order]
+            if not order:
+                order = list(self.me.field_names)
         self.active_fields = tuple(order)
         start = 0
         for f in self.active_fields:
