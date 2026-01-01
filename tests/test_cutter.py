@@ -95,7 +95,7 @@ def test_full_interface_and_ghost_edge_creation_corrected():
     # We check if the set of generated tags has a non-empty intersection with the
     # set of possible ghost tags.
     possible_ghost_tags = {'ghost_pos', 'ghost_neg', 'ghost_both'}
-    assert 'interface' in edge_tags, "Classification failed: No 'interface' edges were tagged."
+    assert 'interface' not in edge_tags, "Classification failed: It should not have 'interface' edges for the circular level set."
     assert not edge_tags.isdisjoint(possible_ghost_tags), "Classification failed: No ghost edges ('ghost_pos', 'ghost_neg', or 'ghost_both') were tagged."
 
     print("\nTest PASSED: Successfully generated and identified all tag types.")

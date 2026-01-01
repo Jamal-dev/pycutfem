@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-Monolithic CutFEM setup for the Turek–Hron FSI-2 benchmark.
+Monolithic CutFEM setup for the Turek–Hron FSI-2/FSI-3 benchmarks.
 
 - Geometry: channel with a *rigid* circular hole; the elastic beam is described
   by a level-set that is advected with the solid displacement.
@@ -12,6 +12,11 @@ Monolithic CutFEM setup for the Turek–Hron FSI-2 benchmark.
   curved deformations of the beam are captured.
 - A small finite-difference Jacobian check is run to validate the assembled
   Jacobian against the residual.
+
+Example:
+  PENALTY_VAL=1e-3 PENALTY_GRAD=1e-3 PYCUTFEM_JIT_BACKEND=cpp FD_BACKEND=python \
+    conda run --no-capture-output -n fenicsx python -u examples/turek_fsi_fully_eulerian.py \
+    --no-refine-initial
 """
 from __future__ import annotations
 
@@ -104,16 +109,75 @@ def _log_step(msg: str) -> None:
 # -----------------------------------------------------------------------------
 # CLI / environment options
 # -----------------------------------------------------------------------------
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw not in ("0", "false", "False", "no", "No")
+
+
+def _env_float(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    return float(raw)
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    return int(raw)
+
+
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Monolithic CutFEM Turek–Hron FSI-2 (fully Eulerian solid).")
-    parser.add_argument("--dt", type=float, default=float(os.getenv("DT", "0.005")), help="Time step size.")
-    parser.add_argument("--poly-order", type=int, default=int(os.getenv("POLY_ORDER", "2")), help="Polynomial order for primary fields.")
-    parser.add_argument("--mesh-size", type=float, default=float(os.getenv("MESH_SIZE", "0.025")), help="Target mesh size for structured O-grid.")
+    parser = argparse.ArgumentParser(
+        description="Monolithic CutFEM Turek–Hron FSI-2/FSI-3 (fully Eulerian solid)."
+    )
+    turek_case_default = os.getenv("TUREK_CASE", "fsi2").strip().lower()
+    if not turek_case_default:
+        turek_case_default = "fsi2"
+    parser.add_argument(
+        "--turek-case",
+        choices=("fsi1", "fsi2", "fsi3"),
+        default=turek_case_default,
+        help="Turek–Hron preset: fsi1=steady, fsi2=periodic, fsi3=chaotic. Env: TUREK_CASE.",
+    )
+    parser.add_argument("--u-mean", type=float, default=None, help="Mean inflow velocity U_mean. Env: U_MEAN.")
+    parser.add_argument("--rho-s", type=float, default=None, help="Solid density rho_s. Env: RHO_S.")
+    parser.add_argument("--dt", type=float, default=None, help="Time step size. Env: DT.")
+    parser.add_argument(
+        "--theta",
+        type=float,
+        default=None,
+        help="Theta scheme parameter (1=BE, 0.5=CN). Env: THETA.",
+    )
+    parser.add_argument(
+        "--poly-order",
+        type=int,
+        default=int(os.getenv("POLY_ORDER", "2")),
+        help="Polynomial order for primary fields. Env: POLY_ORDER.",
+    )
+    parser.add_argument(
+        "--mesh-size",
+        type=float,
+        default=float(os.getenv("MESH_SIZE", "0.025")),
+        help="Target mesh size for structured O-grid. Env: MESH_SIZE.",
+    )
+    mesh_backend_default = os.getenv("MESH_BACKEND", "gmsh").strip().lower()
+    if not mesh_backend_default:
+        mesh_backend_default = "gmsh"
     parser.add_argument(
         "--mesh-backend",
         choices=("gmsh", "structured"),
-        default=os.getenv("MESH_BACKEND", "gmsh"),
-        help="Mesh generator: 'gmsh' (beam-aware blocked grid) or the legacy structured O-grid.",
+        default=mesh_backend_default,
+        help="Mesh generator: gmsh or structured. Env: MESH_BACKEND.",
     )
     parser.add_argument("--mesh-file", type=Path, default=None, help="Optional path to reuse/store the gmsh .msh file.")
     parser.add_argument("--rebuild-mesh", action="store_true", help="Force rebuilding the gmsh mesh instead of reusing an existing file.")
@@ -121,56 +185,328 @@ def _parse_args():
     parser.add_argument(
         "--no-refine-initial",
         dest="refine_initial",
-        action="store_false",
-        help="Skip anisotropic refinement around the beam in the initial mesh.",
+        action="store_true",
+        help="Skip anisotropic refinement around the beam in the initial mesh. Env: REFINE_INITIAL.",
     )
     parser.add_argument(
         "--refine-initial",
         dest="refine_initial",
-        action="store_true",
-        help="Apply anisotropic refinement around the beam in the initial mesh (default).",
+        action="store_false",
+        help="Apply anisotropic refinement around the beam in the initial mesh. Env: REFINE_INITIAL.",
     )
-    parser.add_argument("--fd-backend", type=str, default=os.getenv("FD_BACKEND", "jit"), choices=["jit", "python"], help="Backend for FD Jacobian checks.")
-    parser.add_argument("--output-dir", type=str, default=os.getenv("OUTPUT_DIR", "turek_results_fsi_ii_eulerian"), help="Directory for VTK output.")
-    parser.add_argument("--save-vtk", dest="save_vtk", action="store_true", help="Enable VTK output.")
-    parser.add_argument("--no-save-vtk", dest="save_vtk", action="store_false", help="Disable VTK output.")
-    parser.add_argument("--run-fd-check", dest="run_fd_check", action="store_true", help="Run finite-difference Jacobian alignment check.")
-    parser.add_argument("--no-run-fd-check", dest="run_fd_check", action="store_false", help="Skip finite-difference check.")
-    parser.add_argument("--run-fd-terms", dest="run_fd_terms", action="store_true", help="Run per-term FD checks (requires --run-fd-check).")
-    parser.add_argument("--no-run-fd-terms", dest="run_fd_terms", action="store_false", help="Skip per-term FD checks.")
-    parser.add_argument("--run-time-stepping", dest="run_time_stepping", action="store_true", help="Run transient solve.")
-    parser.add_argument("--no-run-time-stepping", dest="run_time_stepping", action="store_false", help="Skip transient solve.")
-    parser.add_argument("--plot-mesh", dest="plot_mesh", action="store_true", help="Save mesh/ghost/level-set plot each step.")
-    parser.add_argument("--no-plot-mesh", dest="plot_mesh", action="store_false", help="Disable mesh plotting.")
-    parser.add_argument("--plot-mesh-every", type=int, default=int(os.getenv("PLOT_MESH_EVERY", "1")), help="Plot mesh every N steps when enabled.")
-    parser.add_argument("--interactive-plot", dest="interactive_plot", action="store_true", help="Show interactive mesh plot with toggles.")
-    parser.add_argument("--no-interactive-plot", dest="interactive_plot", action="store_false", help="Disable interactive mesh plot.")
-    parser.add_argument("--plot-levelset", dest="plot_levelset", action="store_true", help="Overlay level-set zero contour on mesh plot.")
-    parser.add_argument("--no-plot-levelset", dest="plot_levelset", action="store_false", help="Hide level-set on mesh plot.")
-    parser.add_argument("--plot-interface-points", dest="plot_interface_points", action="store_true", help="Overlay interface points/segments on mesh plot.")
-    parser.add_argument("--no-plot-interface-points", dest="plot_interface_points", action="store_false", help="Hide interface points on mesh plot.")
-    parser.add_argument("--plot-show", dest="plot_show", action="store_true", help="Call plt.show() for mesh plots.")
-    parser.add_argument("--no-plot-show", dest="plot_show", action="store_false", help="Do not show mesh plots (only save).")
-    parser.add_argument("--plot-resolution", type=int, default=int(os.getenv("PLOT_RESOLUTION", "120")), help="Grid resolution for level-set contour in mesh plots.")
-    parser.add_argument("--plot-only", dest="plot_only", action="store_true", help="Stop after plotting the initial mesh (skip JIT/solver setup).")
-    parser.add_argument("--force-full-setup", dest="force_full_setup", action="store_true", help="Always build full solver even when only plotting.")
+    fd_backend_default = os.getenv("FD_BACKEND", "jit").strip().lower()
+    if not fd_backend_default:
+        fd_backend_default = "jit"
+    parser.add_argument(
+        "--fd-backend",
+        type=str,
+        default=fd_backend_default,
+        choices=["jit", "python"],
+        help="Backend for FD Jacobian checks. Env: FD_BACKEND.",
+    )
+    jit_backend_env = os.getenv("PYCUTFEM_JIT_BACKEND", "").strip().lower()
+    jit_backend_default = "cpp" if jit_backend_env in {"cpp", "c++"} else "numba"
+    parser.add_argument(
+        "--jit-backend",
+        choices=("numba", "cpp"),
+        default=jit_backend_default,
+        help="JIT backend selection. Env: PYCUTFEM_JIT_BACKEND.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=os.getenv("OUTPUT_DIR", "turek_results_fsi_ii_eulerian"),
+        help="Directory for VTK output. Env: OUTPUT_DIR.",
+    )
+    parser.add_argument("--save-vtk", dest="save_vtk", action="store_true", help="Enable VTK output. Env: SAVE_VTK.")
+    parser.add_argument("--no-save-vtk", dest="save_vtk", action="store_false", help="Disable VTK output. Env: SAVE_VTK.")
+    parser.add_argument(
+        "--vtk-interface-clamp",
+        type=float,
+        default=float(os.getenv("VTK_INTERFACE_CLAMP", "0.0")),
+        help="Clamp |value| at interface nodes in VTK output (0 disables). Env: VTK_INTERFACE_CLAMP.",
+    )
+    parser.add_argument("--run-fd-check", dest="run_fd_check", action="store_true", help="Run finite-difference Jacobian check. Env: RUN_FD_CHECK.")
+    parser.add_argument("--no-run-fd-check", dest="run_fd_check", action="store_false", help="Skip finite-difference check. Env: RUN_FD_CHECK.")
+    parser.add_argument("--run-fd-terms", dest="run_fd_terms", action="store_true", help="Run per-term FD checks. Env: RUN_FD_TERMS.")
+    parser.add_argument("--no-run-fd-terms", dest="run_fd_terms", action="store_false", help="Skip per-term FD checks. Env: RUN_FD_TERMS.")
+    parser.add_argument("--run-time-stepping", dest="run_time_stepping", action="store_true", help="Run transient solve. Env: RUN_TIME_STEPPING.")
+    parser.add_argument("--no-run-time-stepping", dest="run_time_stepping", action="store_false", help="Skip transient solve. Env: RUN_TIME_STEPPING.")
+    parser.add_argument("--plot-mesh", dest="plot_mesh", action="store_true", help="Save mesh/ghost/level-set plot each step. Env: PLOT_MESH.")
+    parser.add_argument("--no-plot-mesh", dest="plot_mesh", action="store_false", help="Disable mesh plotting. Env: PLOT_MESH.")
+    parser.add_argument(
+        "--plot-mesh-every",
+        type=int,
+        default=int(os.getenv("PLOT_MESH_EVERY", "1")),
+        help="Plot mesh every N steps when enabled. Env: PLOT_MESH_EVERY.",
+    )
+    parser.add_argument("--interactive-plot", dest="interactive_plot", action="store_true", help="Show interactive mesh plot. Env: INTERACTIVE_PLOT.")
+    parser.add_argument("--no-interactive-plot", dest="interactive_plot", action="store_false", help="Disable interactive mesh plot. Env: INTERACTIVE_PLOT.")
+    parser.add_argument("--plot-levelset", dest="plot_levelset", action="store_true", help="Overlay level-set zero contour. Env: PLOT_LEVELSET.")
+    parser.add_argument("--no-plot-levelset", dest="plot_levelset", action="store_false", help="Hide level-set in mesh plot. Env: PLOT_LEVELSET.")
+    parser.add_argument("--plot-interface-points", dest="plot_interface_points", action="store_true", help="Overlay interface points/segments. Env: PLOT_INTERFACE_POINTS.")
+    parser.add_argument("--no-plot-interface-points", dest="plot_interface_points", action="store_false", help="Hide interface points. Env: PLOT_INTERFACE_POINTS.")
+    parser.add_argument("--plot-show", dest="plot_show", action="store_true", help="Call plt.show() for mesh plots. Env: PLOT_SHOW.")
+    parser.add_argument("--no-plot-show", dest="plot_show", action="store_false", help="Do not show mesh plots. Env: PLOT_SHOW.")
+    parser.add_argument(
+        "--plot-resolution",
+        type=int,
+        default=int(os.getenv("PLOT_RESOLUTION", "120")),
+        help="Grid resolution for level-set contour. Env: PLOT_RESOLUTION.",
+    )
+    parser.add_argument("--plot-only", dest="plot_only", action="store_true", help="Stop after plotting the initial mesh. Env: PLOT_ONLY.")
+    parser.add_argument("--no-plot-only", dest="plot_only", action="store_false", help="Run full setup after plotting. Env: PLOT_ONLY.")
+    parser.add_argument("--force-full-setup", dest="force_full_setup", action="store_true", help="Build full solver even when plotting. Env: FORCE_FULL_SETUP.")
+    parser.add_argument("--no-force-full-setup", dest="force_full_setup", action="store_false", help="Allow early exit when plotting only. Env: FORCE_FULL_SETUP.")
+    parser.add_argument("--beam-shift-x", type=float, default=_env_float("BEAM_SHIFT_X") or 0.0, help="Shift beam root in x. Env: BEAM_SHIFT_X.")
+    parser.add_argument("--beam-root-inset", type=float, default=None, help="Inset for curved beam root. Env: BEAM_ROOT_INSET.")
+    parser.add_argument("--beam-root-dof-tol", type=float, default=None, help="Beam root DOF locator tolerance. Env: BEAM_ROOT_DOF_TOL.")
+    parser.add_argument("--pin-pressure", dest="pin_pressure", action="store_true", help="Pin one pressure DOF. Env: PIN_PRESSURE.")
+    parser.add_argument("--no-pin-pressure", dest="pin_pressure", action="store_false", help="Disable pressure pinning. Env: PIN_PRESSURE.")
+    parser.add_argument("--solid-cut-drop", type=float, default=float(os.getenv("SOLID_CUT_DROP", "0.0")), help="Drop solid DOFs for tiny cuts. Env: SOLID_CUT_DROP.")
+    parser.add_argument("--use-aligned-interface", dest="use_aligned_interface", action="store_true", help="Keep aligned interface edges. Env: USE_ALIGNED_INTERFACE.")
+    parser.add_argument("--no-use-aligned-interface", dest="use_aligned_interface", action="store_false", help="Disable aligned interface edges. Env: USE_ALIGNED_INTERFACE.")
+    parser.add_argument("--solid-advect-lagged", dest="solid_advect_lagged", action="store_true", help="Lag solid advection velocity. Env: SOLID_ADVECT_LAGGED.")
+    parser.add_argument("--no-solid-advect-lagged", dest="solid_advect_lagged", action="store_false", help="Use current solid velocity in advection. Env: SOLID_ADVECT_LAGGED.")
+    parser.add_argument("--use-restricted-forms", dest="use_restricted_forms", action="store_true", help="Restrict forms to active subdomains. Env: USE_RESTRICTED_FORMS.")
+    parser.add_argument("--no-use-restricted-forms", dest="use_restricted_forms", action="store_false", help="Disable restricted forms. Env: USE_RESTRICTED_FORMS.")
+    parser.add_argument("--use-linear-solid", dest="use_linear_solid", action="store_true", help="Use linearized solid stress. Env: USE_LINEAR_SOLID.")
+    parser.add_argument("--no-use-linear-solid", dest="use_linear_solid", action="store_false", help="Use nonlinear StVK solid. Env: USE_LINEAR_SOLID.")
+    parser.add_argument("--levelset-zero-eps", type=float, default=None, help="Nudge epsilon for level-set zeros. Env: LEVELSET_ZERO_EPS.")
+    levelset_side_default = os.getenv("LEVELSET_ZERO_SIDE", "neg").strip().lower()
+    if not levelset_side_default:
+        levelset_side_default = "neg"
+    parser.add_argument("--levelset-zero-side", choices=("neg", "pos"), default=levelset_side_default, help="Preferred level-set sign. Env: LEVELSET_ZERO_SIDE.")
+    parser.add_argument(
+        "--levelset-update-tol",
+        type=float,
+        default=None,
+        help="Skip level-set refresh if max |Δφ| <= tol. Env: LEVELSET_UPDATE_TOL.",
+    )
+    parser.add_argument("--fd-timing", dest="fd_timing", action="store_true", help="Print FD timing diagnostics. Env: FD_TIMING.")
+    parser.add_argument("--no-fd-timing", dest="fd_timing", action="store_false", help="Disable FD timing diagnostics. Env: FD_TIMING.")
+    parser.add_argument("--fd-jac-cols-only", dest="fd_jac_cols_only", action="store_true", help="Only build FD Jacobian columns. Env: FD_JAC_COLS_ONLY.")
+    parser.add_argument("--no-fd-jac-cols-only", dest="fd_jac_cols_only", action="store_false", help="Build full FD Jacobian. Env: FD_JAC_COLS_ONLY.")
+    fd_debug_top_default = _env_int("FD_DEBUG_TOP")
+    parser.add_argument("--fd-debug-col", type=str, default=os.getenv("FD_DEBUG_COL", ""), help="Debug FD column index. Env: FD_DEBUG_COL.")
+    parser.add_argument(
+        "--fd-debug-top",
+        type=int,
+        default=fd_debug_top_default if fd_debug_top_default is not None else 5,
+        help="Number of largest FD errors to report. Env: FD_DEBUG_TOP.",
+    )
+    s_nitsche_env = os.getenv("S_NITSCHE_VALUE")
+    if s_nitsche_env is None or not s_nitsche_env.strip():
+        s_nitsche_env = os.getenv("S_NITSCHE")
+    if s_nitsche_env is None or not s_nitsche_env.strip():
+        s_nitsche_env = "1.0"
+    parser.add_argument("--penalty-val", type=float, default=float(os.getenv("PENALTY_VAL", "0.0")), help="Stabilization penalty value. Env: PENALTY_VAL.")
+    parser.add_argument("--penalty-grad", type=float, default=float(os.getenv("PENALTY_GRAD", "0.0")), help="Stabilization penalty gradient. Env: PENALTY_GRAD.")
+    parser.add_argument("--solid-reg-eps", type=float, default=float(os.getenv("SOLID_REG_EPS", "1e-6")), help="Solid regularization weight. Env: SOLID_REG_EPS.")
+    parser.add_argument("--fd-reuse-kernels", dest="fd_reuse_kernels", action="store_true", help="Reuse FD JIT kernels. Env: FD_REUSE_KERNELS.")
+    parser.add_argument("--no-fd-reuse-kernels", dest="fd_reuse_kernels", action="store_false", help="Do not reuse FD kernels. Env: FD_REUSE_KERNELS.")
+    parser.add_argument("--fd-skip-full", dest="fd_skip_full", action="store_true", help="Skip full-form FD check. Env: FD_SKIP_FULL.")
+    parser.add_argument("--no-fd-skip-full", dest="fd_skip_full", action="store_false", help="Run full-form FD check. Env: FD_SKIP_FULL.")
+    parser.add_argument("--fd-term-split", dest="fd_term_split", action="store_true", help="Split FD checks by term. Env: FD_TERM_SPLIT.")
+    parser.add_argument("--no-fd-term-split", dest="fd_term_split", action="store_false", help="Disable term-split FD checks. Env: FD_TERM_SPLIT.")
+    parser.add_argument("--fd-interface-split", dest="fd_interface_split", action="store_true", help="Split interface FD terms. Env: FD_INTERFACE_SPLIT.")
+    parser.add_argument("--no-fd-interface-split", dest="fd_interface_split", action="store_false", help="Disable interface FD split. Env: FD_INTERFACE_SPLIT.")
+    parser.add_argument("--fd-term", type=str, default=os.getenv("FD_TERM", ""), help="Filter FD term name. Env: FD_TERM.")
+    max_steps_default = _env_int("MAX_STEPS")
+    parser.add_argument("--max-steps", type=int, default=max_steps_default if max_steps_default is not None else 50, help="Maximum time steps. Env: MAX_STEPS.")
+    parser.add_argument("--allow-dt-reduction", dest="allow_dt_reduction", action="store_true", help="Allow adaptive dt reduction. Env: ALLOW_DT_REDUCTION.")
+    parser.add_argument("--no-allow-dt-reduction", dest="allow_dt_reduction", action="store_false", help="Disable adaptive dt reduction. Env: ALLOW_DT_REDUCTION.")
+    parser.add_argument(
+        "--dt-reduction-factor",
+        type=float,
+        default=float(os.getenv("DT_REDUCTION_FACTOR", "0.5")),
+        help="Factor for dt reduction. Env: DT_REDUCTION_FACTOR.",
+    )
+    parser.add_argument(
+        "--dt-reduction-threshold",
+        type=float,
+        default=float(os.getenv("DT_REDUCTION_THRESHOLD", "5.0")),
+        help="ΔU growth threshold for dt reduction. Env: DT_REDUCTION_THRESHOLD.",
+    )
+    parser.add_argument("--newton-tol", type=float, default=float(os.getenv("NEWTON_TOL", "1e-6")), help="Newton residual tolerance. Env: NEWTON_TOL.")
+    parser.add_argument("--max-newton-iter", type=int, default=int(os.getenv("MAX_NEWTON_ITER", "50")), help="Maximum Newton iterations. Env: MAX_NEWTON_ITER.")
+    ls_mode_default = os.getenv("LS_MODE", "dealii").strip().lower()
+    if not ls_mode_default:
+        ls_mode_default = "dealii"
+    parser.add_argument("--ls-mode", type=str, default=ls_mode_default, choices=("armijo", "dealii"), help="Line-search mode. Env: LS_MODE.")
+    parser.add_argument("--ls-max-iter", type=int, default=int(os.getenv("LS_MAX_ITER", "12")), help="Line-search max iterations. Env: LS_MAX_ITER.")
+    parser.add_argument(
+        "--s-nitsche",
+        "--s-nitsche-value",
+        "--s-intsche",
+        dest="s_nitsche_value",
+        type=float,
+        default=float(s_nitsche_env),
+        help=(
+            "Nitsche value (1 = symmetric, 0 = incomplete, -1 = skew-symmetric). "
+            "Env: S_NITSCHE_VALUE or S_NITSCHE."
+        ),
+    )
     parser.set_defaults(
-        save_vtk=os.getenv("SAVE_VTK", "1") not in ("0", "false", "False"),
-        run_fd_check=os.getenv("RUN_FD_CHECK", "0") != "0",
-        run_fd_terms=os.getenv("RUN_FD_TERMS", "0") != "0",
-        run_time_stepping=os.getenv("RUN_TIME_STEPPING", "1") != "0",
-        plot_mesh=os.getenv("PLOT_MESH", "0") != "0",
-        interactive_plot=os.getenv("INTERACTIVE_PLOT", "0") != "0",
-        plot_levelset=os.getenv("PLOT_LEVELSET", "1") != "0",
-        plot_interface_points=os.getenv("PLOT_INTERFACE_POINTS", "1") != "0",
-        plot_show=os.getenv("PLOT_SHOW", "0") != "0",
-        plot_only=os.getenv("PLOT_ONLY", "0") != "0",
-        force_full_setup=os.getenv("FORCE_FULL_SETUP", "0") != "0",
-        refine_initial=os.getenv("REFINE_INITIAL", "1") != "0",
+        save_vtk=_env_bool("SAVE_VTK", True),
+        run_fd_check=_env_bool("RUN_FD_CHECK", False),
+        run_fd_terms=_env_bool("RUN_FD_TERMS", False),
+        run_time_stepping=_env_bool("RUN_TIME_STEPPING", True),
+        plot_mesh=_env_bool("PLOT_MESH", False),
+        interactive_plot=_env_bool("INTERACTIVE_PLOT", False),
+        plot_levelset=_env_bool("PLOT_LEVELSET", True),
+        plot_interface_points=_env_bool("PLOT_INTERFACE_POINTS", True),
+        plot_show=_env_bool("PLOT_SHOW", False),
+        plot_only=_env_bool("PLOT_ONLY", False),
+        force_full_setup=_env_bool("FORCE_FULL_SETUP", False),
+        refine_initial=_env_bool("REFINE_INITIAL", True),
+        pin_pressure=_env_bool("PIN_PRESSURE", False),
+        use_aligned_interface=_env_bool("USE_ALIGNED_INTERFACE", False),
+        solid_advect_lagged=_env_bool("SOLID_ADVECT_LAGGED", True),
+        use_restricted_forms=_env_bool("USE_RESTRICTED_FORMS", True),
+        use_linear_solid=_env_bool("USE_LINEAR_SOLID", True),
+        fd_timing=_env_bool("FD_TIMING", False),
+        fd_jac_cols_only=_env_bool("FD_JAC_COLS_ONLY", True),
+        fd_reuse_kernels=_env_bool("FD_REUSE_KERNELS", True),
+        fd_skip_full=_env_bool("FD_SKIP_FULL", False),
+        fd_term_split=_env_bool("FD_TERM_SPLIT", False),
+        fd_interface_split=_env_bool("FD_INTERFACE_SPLIT", False),
+        allow_dt_reduction=_env_bool("ALLOW_DT_REDUCTION", False),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    case_label_map = {"fsi1": "FSI-1", "fsi2": "FSI-2", "fsi3": "FSI-3"}
+    case_defaults = {
+        "fsi1": {"u_mean": 0.2, "rho_s": 1.0e3, "dt": 1.0, "theta": 1.0},
+        "fsi2": {"u_mean": 1.0, "rho_s": 1.0e4, "dt": 0.005, "theta": 0.5},
+        "fsi3": {"u_mean": 2.0, "rho_s": 1.0e4, "dt": 0.005, "theta": 0.5},
+    }
+    preset = case_defaults.get(str(args.turek_case), case_defaults["fsi2"])
+    env_u_mean = _env_float("U_MEAN")
+    env_rho_s = _env_float("RHO_S")
+    env_dt = _env_float("DT")
+    env_theta = _env_float("THETA")
+    if args.u_mean is None and env_u_mean is not None:
+        args.u_mean = env_u_mean
+    if args.rho_s is None and env_rho_s is not None:
+        args.rho_s = env_rho_s
+    if args.dt is None and env_dt is not None:
+        args.dt = env_dt
+    if args.theta is None and env_theta is not None:
+        args.theta = env_theta
+    if args.u_mean is None:
+        args.u_mean = float(preset["u_mean"])
+    if args.rho_s is None:
+        args.rho_s = float(preset["rho_s"])
+    if args.dt is None:
+        args.dt = float(preset["dt"])
+    if args.theta is None:
+        args.theta = float(preset["theta"])
+    args.case_label = case_label_map.get(str(args.turek_case), str(args.turek_case))
+    if not math.isclose(float(args.dt), float(preset["dt"])):
+        print(
+            f"[warn] dt={float(args.dt):g} differs from {float(preset['dt']):g} for {args.case_label}; "
+            "large dt can suppress the expected oscillatory response."
+        )
+    if not math.isclose(float(args.theta), float(preset["theta"])):
+        print(
+            f"[warn] theta={float(args.theta):g} differs from {float(preset['theta']):g} for {args.case_label}; "
+            "theta>0.5 adds numerical damping."
+        )
+    if args.beam_root_inset is None:
+        env_root_inset = _env_float("BEAM_ROOT_INSET")
+        args.beam_root_inset = env_root_inset if env_root_inset is not None else max(5.0e-4, 0.04 * args.mesh_size)
+    if args.beam_root_dof_tol is None:
+        env_root_tol = _env_float("BEAM_ROOT_DOF_TOL")
+        args.beam_root_dof_tol = env_root_tol if env_root_tol is not None else max(0.2 * args.mesh_size, 1.0e-3)
+    if args.levelset_zero_eps is None:
+        env_zero = _env_float("LEVELSET_ZERO_EPS")
+        args.levelset_zero_eps = env_zero if env_zero is not None else max(1.0e-10, 1.0e-8 * args.mesh_size)
+    if args.levelset_update_tol is None:
+        env_update_tol = _env_float("LEVELSET_UPDATE_TOL")
+        args.levelset_update_tol = env_update_tol if env_update_tol is not None else max(1.0e-12, 1.0e-10 * args.mesh_size)
+    if "--no-refine-initial" in sys.argv:
+        args.refine_initial = False
+    if "--refine-initial" in sys.argv:
+        args.refine_initial = True
+    return args
 
 ARGS = _parse_args()
+
+
+def _apply_env_overrides(args: argparse.Namespace) -> None:
+    def _set_env(name: str, value) -> None:
+        if value is None:
+            return
+        os.environ[name] = str(value)
+
+    def _set_env_bool(name: str, value: bool) -> None:
+        os.environ[name] = "1" if value else "0"
+
+    _set_env("DT", args.dt)
+    _set_env("POLY_ORDER", args.poly_order)
+    _set_env("MESH_SIZE", args.mesh_size)
+    _set_env("MESH_BACKEND", args.mesh_backend)
+    _set_env("FD_BACKEND", args.fd_backend)
+    _set_env("OUTPUT_DIR", args.output_dir)
+    _set_env("PLOT_MESH_EVERY", args.plot_mesh_every)
+    _set_env("PLOT_RESOLUTION", args.plot_resolution)
+    _set_env_bool("SAVE_VTK", args.save_vtk)
+    _set_env_bool("RUN_FD_CHECK", args.run_fd_check)
+    _set_env_bool("RUN_FD_TERMS", args.run_fd_terms)
+    _set_env_bool("RUN_TIME_STEPPING", args.run_time_stepping)
+    _set_env_bool("PLOT_MESH", args.plot_mesh)
+    _set_env_bool("INTERACTIVE_PLOT", args.interactive_plot)
+    _set_env_bool("PLOT_LEVELSET", args.plot_levelset)
+    _set_env_bool("PLOT_INTERFACE_POINTS", args.plot_interface_points)
+    _set_env_bool("PLOT_SHOW", args.plot_show)
+    _set_env_bool("PLOT_ONLY", args.plot_only)
+    _set_env_bool("FORCE_FULL_SETUP", args.force_full_setup)
+    _set_env_bool("REFINE_INITIAL", args.refine_initial)
+    _set_env("BEAM_SHIFT_X", args.beam_shift_x)
+    _set_env("BEAM_ROOT_INSET", args.beam_root_inset)
+    _set_env("BEAM_ROOT_DOF_TOL", args.beam_root_dof_tol)
+    _set_env_bool("PIN_PRESSURE", args.pin_pressure)
+    _set_env("SOLID_CUT_DROP", args.solid_cut_drop)
+    _set_env_bool("USE_ALIGNED_INTERFACE", args.use_aligned_interface)
+    _set_env_bool("SOLID_ADVECT_LAGGED", args.solid_advect_lagged)
+    _set_env_bool("USE_RESTRICTED_FORMS", args.use_restricted_forms)
+    _set_env_bool("USE_LINEAR_SOLID", args.use_linear_solid)
+    _set_env("LEVELSET_ZERO_EPS", args.levelset_zero_eps)
+    _set_env("LEVELSET_ZERO_SIDE", args.levelset_zero_side)
+    _set_env("LEVELSET_UPDATE_TOL", args.levelset_update_tol)
+    _set_env_bool("FD_TIMING", args.fd_timing)
+    _set_env_bool("FD_JAC_COLS_ONLY", args.fd_jac_cols_only)
+    _set_env("FD_DEBUG_COL", args.fd_debug_col)
+    _set_env("FD_DEBUG_TOP", args.fd_debug_top)
+    _set_env("S_NITSCHE", args.s_nitsche_value)
+    _set_env("S_NITSCHE_VALUE", args.s_nitsche_value)
+    _set_env("PENALTY_VAL", args.penalty_val)
+    _set_env("PENALTY_GRAD", args.penalty_grad)
+    _set_env("SOLID_REG_EPS", args.solid_reg_eps)
+    _set_env_bool("FD_REUSE_KERNELS", args.fd_reuse_kernels)
+    _set_env_bool("FD_SKIP_FULL", args.fd_skip_full)
+    _set_env_bool("FD_TERM_SPLIT", args.fd_term_split)
+    _set_env_bool("FD_INTERFACE_SPLIT", args.fd_interface_split)
+    _set_env("FD_TERM", args.fd_term)
+    _set_env("MAX_STEPS", args.max_steps)
+    _set_env_bool("ALLOW_DT_REDUCTION", args.allow_dt_reduction)
+    _set_env("DT_REDUCTION_FACTOR", args.dt_reduction_factor)
+    _set_env("DT_REDUCTION_THRESHOLD", args.dt_reduction_threshold)
+    _set_env("NEWTON_TOL", args.newton_tol)
+    _set_env("MAX_NEWTON_ITER", args.max_newton_iter)
+    _set_env("LS_MODE", args.ls_mode)
+    _set_env("LS_MAX_ITER", args.ls_max_iter)
+    _set_env("U_MEAN", args.u_mean)
+    _set_env("RHO_S", args.rho_s)
+    _set_env("THETA", args.theta)
+    _set_env("TUREK_CASE", args.turek_case)
+    _set_env("VTK_INTERFACE_CLAMP", args.vtk_interface_clamp)
+    if args.jit_backend:
+        os.environ["PYCUTFEM_JIT_BACKEND"] = str(args.jit_backend)
+
+
+_apply_env_overrides(ARGS)
 
 # -----------------------------------------------------------------------------
 # Problem parameters (Turek–Hron FSI-2)
@@ -182,13 +518,13 @@ CENTER = (0.2, 0.2)
 
 RHO_F = 1.0e3
 MU_F = 1.0
-U_MEAN = 1.0
+U_MEAN = float(ARGS.u_mean)
 U_MAX = 1.5 * U_MEAN
 
 NU_S = 0.4
 MU_S = 0.5e6
 E_S = 2.0 * MU_S * (1.0 + NU_S)
-RHO_S = 10.0e3
+RHO_S = float(ARGS.rho_s)
 MU_S = E_S / (2.0 * (1.0 + NU_S))
 LAMBDA_S = E_S * NU_S / ((1.0 + NU_S) * (1.0 - 2.0 * NU_S))
 
@@ -207,6 +543,7 @@ DT = float(ARGS.dt)
 POLY_ORDER = int(ARGS.poly_order)
 MESH_SIZE = float(ARGS.mesh_size)
 FD_BACKEND = ARGS.fd_backend
+CASE_LABEL = str(getattr(ARGS, "case_label", "FSI-2"))
 BEAM_ROOT_TOL = float(max(1.0e-6, 1.0e-3 * MESH_SIZE))
 BEAM_ROOT_BIAS = float(max(1.0e-8, 1.0e-4 * MESH_SIZE))
 BEAM_ROOT_INSET = float(os.getenv("BEAM_ROOT_INSET", str(max(5.0e-4, 0.04 * MESH_SIZE))))
@@ -220,6 +557,7 @@ USE_LINEAR_SOLID = os.getenv("USE_LINEAR_SOLID", "1") not in ("0", "false", "Fal
 LEVELSET_ZERO_EPS = float(os.getenv("LEVELSET_ZERO_EPS", str(max(1.0e-10, 1.0e-8 * MESH_SIZE))))
 LEVELSET_ZERO_SIDE = os.getenv("LEVELSET_ZERO_SIDE", "neg").strip().lower()
 LEVELSET_PREFER_NEGATIVE = LEVELSET_ZERO_SIDE != "pos"
+LEVELSET_UPDATE_TOL = float(os.getenv("LEVELSET_UPDATE_TOL", str(max(1.0e-12, 1.0e-10 * MESH_SIZE))))
 
 # -----------------------------------------------------------------------------
 # Mesh and boundary helpers
@@ -1893,6 +2231,7 @@ def _nudge_levelset_zeros(
     eps: float,
     *,
     prefer_negative: bool = True,
+    commit: bool = True,
 ) -> int:
     """
     Prevent φ=0 nodes from aligning with mesh edges by nudging to ±eps.
@@ -1905,7 +2244,8 @@ def _nudge_levelset_zeros(
     if not np.any(mask):
         return 0
     phi_vals[mask] = -eps if prefer_negative else eps
-    ls_beam.commit()
+    if commit:
+        ls_beam.commit()
     return int(mask.sum())
 
 
@@ -1916,10 +2256,12 @@ def update_beam_levelset_from_displacement(
     *,
     zero_eps: float = 0.0,
     prefer_negative: bool = True,
-) -> None:
+    update_tol: float = 0.0,
+) -> bool:
     """
     Advect the beam LevelSetGridFunction with the current solid displacement:
     φ^{k+1}(x_node) = φ_ref(x_node - d^{k+1}(x_node)).
+    Returns True if the level set was updated beyond the tolerance.
     """
     dh_ls = ls_beam.dh
     mesh = dh_ls.mixed_element.mesh
@@ -1931,6 +2273,7 @@ def update_beam_levelset_from_displacement(
     disp_x = disp_vec.components[0]
     disp_y = disp_vec.components[1]
     phi_vals = ls_beam.nodal_values()
+    phi_new_vals = np.empty_like(phi_vals)
 
     for gd_phi, nid in zip(gphi, node_ids):
         x, y = mesh.nodes_x_y_pos[int(nid)]
@@ -1944,11 +2287,20 @@ def update_beam_levelset_from_displacement(
         phi_new = beam_ref_ls(X_ref)
 
         li = ls_beam._g2l[int(gd_phi)]
-        phi_vals[int(li)] = float(phi_new)
-
-    ls_beam.commit()
+        phi_new = float(phi_new)
+        phi_new_vals[int(li)] = phi_new
     if zero_eps > 0.0:
-        _nudge_levelset_zeros(ls_beam, zero_eps, prefer_negative=prefer_negative)
+        nudge_mask = np.abs(phi_new_vals) <= zero_eps
+        if np.any(nudge_mask):
+            phi_new_vals[nudge_mask] = -zero_eps if prefer_negative else zero_eps
+
+    max_diff = float(np.max(np.abs(phi_new_vals - phi_vals))) if phi_vals.size else 0.0
+    if max_diff <= update_tol:
+        return False
+
+    phi_vals[:] = phi_new_vals
+    ls_beam.commit()
+    return True
 
 
 def _copy_bitset(bs: BitSet) -> BitSet:
@@ -2856,9 +3208,12 @@ def detect_mesh_pathologies(mesh: Mesh, tol: float = 1e-10):
 # -----------------------------------------------------------------------------
 # Main setup
 # -----------------------------------------------------------------------------
-print("--- Setting up the Turek–Hron FSI-2 benchmark ---")
-Re = RHO_F * U_MAX * (2 * RADIUS) / MU_F
-print(f"Reynolds number: {Re:.2f}")
+print(f"--- Setting up the Turek–Hron {CASE_LABEL} benchmark ---")
+re_mean = RHO_F * U_MEAN * (2 * RADIUS) / MU_F
+print(
+    f"Benchmark preset: {CASE_LABEL} | U_mean={U_MEAN:g}, rho_s={RHO_S:g}, "
+    f"dt={DT:g}, theta={float(ARGS.theta):g} | Re_mean≈{re_mean:.1f}"
+)
 _log_step("start setup")
 
 # Beam level set (reference configuration)
@@ -3325,6 +3680,15 @@ def _eval_scalar_at_point(dh: DofHandler, mesh: Mesh, f_scalar: Function, point:
         return float(phi @ vals)
     return float("nan")
 
+
+def _eval_vector_at_point(dh: DofHandler, mesh: Mesh, f_vec: VectorFunction, point: tuple[float, float]) -> np.ndarray:
+    """Evaluate a 2D VectorFunction at a physical point."""
+    vals = [
+        _eval_scalar_at_point(dh, mesh, comp, point)
+        for comp in f_vec.components
+    ]
+    return np.asarray(vals, dtype=float)
+
 def _tip_position(dh: DofHandler, mesh: Mesh, disp: VectorFunction, ref_tip: np.ndarray) -> np.ndarray:
     """Current position of the beam tip: X_ref + u(X_ref)."""
     dx = _eval_scalar_at_point(dh, mesh, disp.components[0], tuple(ref_tip))
@@ -3372,7 +3736,7 @@ def grad_inner_jump(u, v):
 # Weak forms
 # -----------------------------------------------------------------------------
 dt = Constant(DT)
-theta = Constant(1.0)
+theta = Constant(float(ARGS.theta))
 rho_f_const = Constant(RHO_F)
 rho_s_const = Constant(RHO_S)
 mu_f_const = Constant(MU_F)
@@ -3395,7 +3759,7 @@ avg_flux_solid_trial = -kappa_neg * traction_solid_L(Neg(ddisp_s_R), Neg(disp_k_
 avg_flux_solid_test = -kappa_neg * traction_solid_L(Neg(test_vel_s_R), Neg(disp_k_R))
 avg_flux_solid_res = -kappa_neg * traction_solid_R(Neg(disp_k_R))
 
-s_nitsche_value = float(os.getenv("S_NITSCHE", "0.0"))
+s_nitsche_value = float(ARGS.s_nitsche_value)
 s_nitsche = Constant(s_nitsche_value)   # 1 = symmetric, 0 = incomplete, -1 = skew-symmetric
 
 J_int_fluid = (-dot(avg_flux_fluid_trial, jump_test_f)) * dΓ + (dot(avg_flux_fluid_trial, jump_test_s)) * dΓ
@@ -3540,16 +3904,108 @@ residual_form = r_vol_f + R_int + r_vol_s + r_stab + r_svc + r_reg
 # -----------------------------------------------------------------------------
 REF_TIP = np.array([CENTER[0] + RADIUS + BEAM_LENGTH, CENTER[1]], dtype=float)
 PROBE_B = np.array([CENTER[0] - 0.05, CENTER[1]], dtype=float)
+FLOW_PROBE_TOL = 1.0e-10
+FLOW_PROBES = [
+    ("inlet_mid", (0.05, 0.5 * H)),
+    ("above_beam", (BEAM_REF_CENTER[0], BEAM_REF_CENTER[1] + 0.12)),
+    ("below_beam", (BEAM_REF_CENTER[0], BEAM_REF_CENTER[1] - 0.12)),
+    ("mid_channel", (1.1, 0.5 * H)),
+    ("outlet_mid", (L - 0.2, 0.5 * H)),
+]
 obs_history = {"time": [], "tip": [], "drag": [], "lift": [], "dp": []}
 output_dir = ARGS.output_dir
 os.makedirs(output_dir, exist_ok=True)
 SAVE_VTK = bool(ARGS.save_vtk)
 PLOT_MESH_EVERY = max(1, int(ARGS.plot_mesh_every))
+VTK_INTERFACE_CLAMP = float(os.getenv("VTK_INTERFACE_CLAMP", "0.0"))
+VTK_CLAMP_BAND = max(1.5 * MESH_SIZE, 5.0 * LEVELSET_ZERO_EPS)
+
+
+def _is_fluid_point(point: tuple[float, float]) -> bool:
+    x, y = point
+    if (x - CENTER[0]) ** 2 + (y - CENTER[1]) ** 2 <= RADIUS ** 2:
+        return False
+    try:
+        phi = float(ls_beam(np.array([x, y], dtype=float)))
+    except Exception:
+        phi = float(beam_ref_ls(np.array([x, y], dtype=float)))
+    return phi > 0.0
+
+
+def _probe_flow_velocity(step_idx: int) -> None:
+    mags: list[float] = []
+    entries: list[str] = []
+    for label, pt in FLOW_PROBES:
+        if not _is_fluid_point(pt):
+            entries.append(f"{label}=skip")
+            continue
+        vel = _eval_vector_at_point(dof_handler, mesh, uf_k, pt)
+        if not np.all(np.isfinite(vel)):
+            entries.append(f"{label}=nan")
+            continue
+        mag = float(np.linalg.norm(vel))
+        mags.append(mag)
+        entries.append(f"{label}=({vel[0]:.2e},{vel[1]:.2e})|u|={mag:.2e}")
+    if entries:
+        print(f"[probe {step_idx:04d}] " + " ".join(entries))
+    if mags and all(m <= FLOW_PROBE_TOL for m in mags):
+        print(
+            f"[probe {step_idx:04d}] WARNING: flow velocity ~0 at all probe points "
+            f"(max|u|={max(mags):.2e})."
+        )
 
 def _save_vtk(step_idx: int) -> None:
     if not SAVE_VTK:
         return
     fname = os.path.join(output_dir, f"solution_{step_idx:04d}.vtu")
+    if VTK_INTERFACE_CLAMP > 0.0:
+        num_nodes = len(mesh.nodes_list)
+
+        def _scalar_to_nodes(f_scalar: Function) -> np.ndarray:
+            scal = np.zeros(num_nodes)
+            for gdof, lidx in f_scalar._g2l.items():
+                _, nid = dof_handler._dof_to_node_map.get(gdof, (None, None))
+                if nid is None:
+                    continue
+                scal[int(nid)] = f_scalar.nodal_values[int(lidx)]
+            return scal
+
+        def _vector_to_nodes(f_vec: VectorFunction) -> np.ndarray:
+            vec = np.zeros((num_nodes, 2))
+            for gdof, lidx in f_vec._g2l.items():
+                fld, nid = dof_handler._dof_to_node_map.get(gdof, (None, None))
+                if nid is None or fld not in f_vec.field_names:
+                    continue
+                comp = f_vec.field_names.index(fld)
+                vec[int(nid), comp] = f_vec.nodal_values[int(lidx)]
+            return vec
+
+        phi_nodes = ls_beam.evaluate_on_nodes(mesh)
+        mask = np.isfinite(phi_nodes) & (np.abs(phi_nodes) <= VTK_CLAMP_BAND)
+
+        uf_nodes = _vector_to_nodes(uf_k)
+        us_nodes = _vector_to_nodes(us_k)
+        disp_nodes = _vector_to_nodes(disp_k)
+        pf_nodes = _scalar_to_nodes(pf_k)
+
+        if np.any(mask):
+            uf_nodes[mask] = np.clip(uf_nodes[mask], -VTK_INTERFACE_CLAMP, VTK_INTERFACE_CLAMP)
+            us_nodes[mask] = np.clip(us_nodes[mask], -VTK_INTERFACE_CLAMP, VTK_INTERFACE_CLAMP)
+            disp_nodes[mask] = np.clip(disp_nodes[mask], -VTK_INTERFACE_CLAMP, VTK_INTERFACE_CLAMP)
+            pf_nodes[mask] = np.clip(pf_nodes[mask], -VTK_INTERFACE_CLAMP, VTK_INTERFACE_CLAMP)
+
+        export_vtk(
+            filename=fname,
+            mesh=mesh,
+            dof_handler=dof_handler,
+            functions={
+                "uf": uf_nodes,
+                "pf": pf_nodes,
+                "us": us_nodes,
+                "disp": disp_nodes,
+            },
+        )
+        return
     export_vtk(
         filename=fname,
         mesh=mesh,
@@ -3701,10 +4157,10 @@ def _compute_observables(step_idx: int, t_curr: float) -> None:
         dof_handler=dof_handler,
         bcs=[],
         assembler_hooks=hooks,
-        backend="jit",
+        backend="python",
     )
-    F_D = float(res.get("FD", 0.0))
-    F_L = float(res.get("FL", 0.0))
+    F_D = float(np.asarray(res.get("FD", 0.0)).reshape(-1)[0])
+    F_L = float(np.asarray(res.get("FL", 0.0)).reshape(-1)[0])
     tip_pos = _tip_position(dof_handler, mesh, disp_k, REF_TIP)
     pA = _eval_scalar_at_point(dof_handler, mesh, pf_k, tuple(tip_pos))
     pB = _eval_scalar_at_point(dof_handler, mesh, pf_k, tuple(PROBE_B))
@@ -3868,7 +4324,24 @@ if ARGS.run_fd_check:
 # -----------------------------------------------------------------------------
 if ARGS.run_time_stepping:
     max_steps = int(os.getenv("MAX_STEPS", "50"))
-    time_params = TimeStepperParameters(dt=DT, max_steps=max_steps, stop_on_steady=True, steady_tol=1e-6, theta=theta.value)
+
+    def _on_dt_change(new_dt: float) -> None:
+        try:
+            dt.value = float(new_dt)
+        except Exception:
+            pass
+
+    time_params = TimeStepperParameters(
+        dt=DT,
+        max_steps=max_steps,
+        stop_on_steady=True,
+        steady_tol=1e-6,
+        theta=theta.value,
+        allow_dt_reduction=bool(getattr(ARGS, "allow_dt_reduction", False)),
+        dt_reduction_factor=float(getattr(ARGS, "dt_reduction_factor", 0.5)),
+        dt_reduction_threshold=float(getattr(ARGS, "dt_reduction_threshold", 5.0)),
+        on_dt_change=_on_dt_change,
+    )
     newton_tol = float(os.getenv("NEWTON_TOL", "1e-6"))
     max_newton_iter = int(os.getenv("MAX_NEWTON_ITER", "20"))
     ls_mode = os.getenv("LS_MODE", "dealii")
@@ -3890,22 +4363,28 @@ if ARGS.run_time_stepping:
     )
 
     step_idx = [0]  # mutable so the closure can update
-    dt_val = DT.value if hasattr(DT, "value") else float(DT)
+    dt_val = float(dt.value) if hasattr(dt, "value") else float(DT)
 
     def post_step_cb(funcs):
-        update_beam_levelset_from_displacement(
+        ls_changed = update_beam_levelset_from_displacement(
             ls_beam,
             disp_k,
             beam_ref_ls,
             zero_eps=LEVELSET_ZERO_EPS,
             prefer_negative=LEVELSET_PREFER_NEGATIVE,
+            update_tol=LEVELSET_UPDATE_TOL,
         )
-        refresh_domains(mesh, domains)
-        refresh_hansbo_kappa(mesh, ls_beam, theta_pos_vals, theta_neg_vals)
-        retag_inactive(dof_handler, theta_neg=theta_neg_vals, solid_cut_drop=SOLID_CUT_DROP)
+        if ls_changed:
+            refresh_domains(mesh, domains)
+            refresh_hansbo_kappa(mesh, ls_beam, theta_pos_vals, theta_neg_vals)
+            retag_inactive(dof_handler, theta_neg=theta_neg_vals, solid_cut_drop=SOLID_CUT_DROP)
+            solver.refresh_levelset_kernels(ls_beam)
         dof_handler.apply_bcs(bcs, uf_k, pf_k, us_k, disp_k)
-        recompute_active_dofs(solver, solver.bcs_homog if solver.bcs_homog else solver.bcs)
-        _compute_observables(step_idx[0], step_idx[0] * dt_val)
+        if ls_changed:
+            recompute_active_dofs(solver, solver.bcs_homog if solver.bcs_homog else solver.bcs)
+        t_curr = step_idx[0] * (float(dt.value) if hasattr(dt, "value") else float(DT))
+        _compute_observables(step_idx[0], t_curr)
+        _probe_flow_velocity(step_idx[0])
         _plot_mesh(step_idx[0], title="Mesh / level-set")
         step_idx[0] += 1
 

@@ -15,7 +15,7 @@ from pycutfem.ufl.measures import dx
 from pycutfem.ufl.forms import assemble_form
 from pycutfem.ufl.expressions import Function, inner, grad
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, TimeStepperParameters
-
+from pycutfem.ufl.forms import Equation
 
 # ---------------------------
 # Helpers
@@ -37,10 +37,11 @@ def assemble_rhs_area(mesh, level_set=None, side='+', q=6, poly_order=1, backend
     meas = dx() if level_set is None else dx(level_set=level_set, metadata={'side': side})
 
     # zero bilinear form to keep assembler API consistent
-    a = (Constant(0.0) * u * v) * dx()
+    # a = (Constant(0.0) * u * v) * dx()
+    a = None
     f = (Constant(1.0) * v) * meas
 
-    K, F = assemble_form(a == f, dof_handler=dh, bcs=[], quad_order=q, backend=backend)
+    K, F = assemble_form(Equation(a,f), dof_handler=dh, bcs=[], quad_order=q, backend=backend)
     return float(F.sum())
 
 def assemble_mass_matrix(mesh, level_set=None, side='+', q=6, poly_order=1, backend='jit'):
@@ -54,7 +55,7 @@ def assemble_mass_matrix(mesh, level_set=None, side='+', q=6, poly_order=1, back
     meas = dx() if level_set is None else dx(level_set=level_set, metadata={'side': side})
 
     a = (u * v) * meas
-    K, F = assemble_form(a == (Constant(0.0) * v) * dx(), dof_handler=dh, bcs=[], quad_order=q, backend=backend)
+    K, F = assemble_form(Equation(a,None), dof_handler=dh, bcs=[], quad_order=q, backend=backend)
     return K
 
 

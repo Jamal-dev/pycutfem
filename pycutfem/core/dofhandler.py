@@ -1926,10 +1926,7 @@ class DofHandler:
     # ==================================================================
     def get_all_dof_coords(self) -> np.ndarray:
         """Coordinates for every global DOF (total_dofs, 2)."""
-        if getattr(self, "_dg_mode", False):
-            raise NotImplementedError("get_all_dof_coords not yet implemented for DG.")
-        if not hasattr(self, "_dof_coords"):
-            raise RuntimeError("Geometry-independent coords not initialized.")
+        self._ensure_dof_coords()
         return self._dof_coords.copy()
     
     def precompute_geometric_factors(

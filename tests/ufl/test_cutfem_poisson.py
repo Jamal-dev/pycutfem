@@ -125,8 +125,8 @@ def test_cutfem_poisson_interface(backend):
     g_neg  = mesh.edge_bitset("ghost_neg")
     g_both = mesh.edge_bitset("ghost_both")
     g_interface = mesh.edge_bitset("interface")
-    ghost_pos = g_pos | g_both | g_interface
-    ghost_neg = g_neg | g_both | g_interface
+    ghost_pos = g_pos | g_both 
+    ghost_neg = g_neg | g_both 
 
     # --- measures ---
     dx_pos  = dx(defined_on=has_outside_elements, level_set=level_set, metadata={'side': '+', 'q': poly_order+2})
@@ -169,6 +169,7 @@ def test_cutfem_poisson_interface(backend):
                - kappa_m * alpha_neg * dot(grad(u_neg), n) )
     avg_flux_v = ( - kappa_p * alpha_pos * dot(grad(v_pos), n)
                 - kappa_m * alpha_neg * dot(grad(v_neg), n) )
+    
 
     # --- core bilinear ---
     a  = inner(alpha_pos * grad(u_pos), grad(v_pos)) * dx_pos
@@ -182,7 +183,7 @@ def test_cutfem_poisson_interface(backend):
     # --- Interface Nitsche terms (unchanged algebra) ---
     jump_u = Jump(u_pos, u_neg)
     jump_v = Jump(v_pos, v_neg)
-    a += ( avg_flux_u * jump_v + avg_flux_v * jump_u + stab * jump_u * jump_v ) * dGamma
+    a += ( dot(avg_flux_u , jump_v) + dot(avg_flux_v , jump_u) + stab * jump_u * jump_v ) * dGamma
 
     # --- RHS
     # to match the NGSolve notebook: f = [1, 0]

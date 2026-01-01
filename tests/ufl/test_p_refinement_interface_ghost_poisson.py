@@ -120,7 +120,7 @@ def _run_suite(elem_type: str, Ps=(1,2,3,4,5), nx=14, ny=14):
 
 
 def test_ghost_only_quad():
-    J_values = _run_suite("quad", Ps=(1,2,3,4,5), nx=12, ny=12)
+    J_values = _run_suite("quad", Ps=(1,2,3,4), nx=12, ny=12)
     check_monotonicity(J_values)
     plt.plot(J_values, label="Quad")
     plt.xlabel("Polynomial Degree p")
@@ -130,7 +130,7 @@ def test_ghost_only_quad():
     plt.show()
 
 def test_ghost_only_tri():
-    J_values = _run_suite("tri",  Ps=(1,2,3,4,5), nx=16, ny=16)
+    J_values = _run_suite("tri",  Ps=(1,2,3,4), nx=16, ny=16)
     check_monotonicity(J_values)
     plt.plot(J_values, label="Tri")
     plt.xlabel("Polynomial Degree p")

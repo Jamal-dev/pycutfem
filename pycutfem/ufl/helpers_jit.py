@@ -220,6 +220,12 @@ def _build_jit_kernel_args(       # ← signature unchanged
     def _n_union_for_eid(eid: int) -> int:
         return len(dof_handler.get_elemental_dofs(int(eid)))
 
+    def _union_size_from_prebuilt() -> int:
+        gmap = pre_built.get("gdofs_map") if pre_built is not None else None
+        if isinstance(gmap, np.ndarray) and gmap.ndim == 2:
+            return int(gmap.shape[1])
+        return int(getattr(mixed_element, "n_dofs_per_elem", getattr(mixed_element, "n_dofs_local", 0)))
+
     def _basis_table_phys_union(field: str) -> np.ndarray:
         """Union-length basis at interface physical QPs."""
         key = f"b_{field}"
@@ -231,6 +237,9 @@ def _build_jit_kernel_args(       # ← signature unchanged
         me   = mixed_element
         mesh = me.mesh
         nE, nQ, _ = pts.shape
+        if nE == 0:
+            n_union = _union_size_from_prebuilt()
+            return np.empty((0, nQ, n_union), dtype=np.float64)
         n_union = _n_union_for_eid(eids[0])
         tab = np.empty((nE, nQ, n_union), dtype=np.float64)
 
@@ -276,6 +285,9 @@ def _build_jit_kernel_args(       # ← signature unchanged
         me   = mixed_element
         mesh = me.mesh
         nE, nQ, _ = pts.shape
+        if nE == 0:
+            n_union = _union_size_from_prebuilt()
+            return np.empty((0, nQ, n_union), dtype=np.float64)
         n_union = _n_union_for_eid(eids[0])
         tab = np.empty((nE, nQ, n_union), dtype=np.float64)
 
@@ -318,6 +330,9 @@ def _build_jit_kernel_args(       # ← signature unchanged
         me   = mixed_element
         mesh = me.mesh
         nE, nQ, _ = pts.shape
+        if nE == 0:
+            n_union = _union_size_from_prebuilt()
+            return np.empty((0, nQ, n_union, 2), dtype=np.float64)
         n_union = _n_union_for_eid(eids[0])
         tab = np.empty((nE, nQ, n_union, 2), dtype=np.float64)
 
@@ -657,9 +672,6 @@ def _build_jit_kernel_args(       # ← signature unchanged
             args["h_arr"] = _h_global
             continue
 
-        if name in args:
-            continue
-
         # --- sided reference value/derivative tables: r{d0}{d1}_{field}_{pos|neg} ---
         m_r = re.match(r"^r(\d)(\d)_(.+)_(pos|neg)$", name)
         if m_r:
@@ -724,6 +736,9 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 )
             # If not ghost and not interface (shouldn’t happen), fail clearly
             raise KeyError(f"_build_jit_kernel_args: kernel requests '{name}', but it wasn't provided.")
+
+        if name in args:
+            continue
 
 
 

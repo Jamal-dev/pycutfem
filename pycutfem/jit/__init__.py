@@ -84,18 +84,37 @@ def _compress_static_for_active(static: dict[str, Any],
         col_map[int(old)] = int(i)
 
     def _remap_union(arr: np.ndarray) -> np.ndarray:
-        for ax in range(1, arr.ndim):
-            if arr.shape[ax] == full_n:
-                idx = [slice(None)] * arr.ndim
-                idx[ax] = active_cols
-                return arr[tuple(idx)]
-        return arr
+        # Prefer the *last* axis matching full_n to avoid slicing nQ when
+        # nQ happens to equal the union size (common on cut cells).
+        axes = [ax for ax in range(1, arr.ndim) if arr.shape[ax] == full_n]
+        if not axes:
+            return arr
+        ax = axes[-1]
+        idx = [slice(None)] * arr.ndim
+        idx[ax] = active_cols
+        return arr[tuple(idx)]
 
     def _remap_map(arr: np.ndarray) -> np.ndarray:
         out = -np.ones_like(arr)
         m = (arr >= 0) & (arr < full_n)
         out[m] = col_map[arr[m]]
         return out
+
+    geom_keys = {
+        "qp_phys", "qp_ref", "qref", "qw", "detJ",
+        "J_inv", "J_inv_pos", "J_inv_neg",
+        "normals", "phis", "h_arr",
+        "node_coords", "element_nodes",
+        "owner_id", "owner_pos_id", "owner_neg_id",
+        "eids", "pos_eids", "neg_eids",
+        "entity_kind", "is_interface", "is_ghost",
+    }
+
+    def _is_union_key(key: str) -> bool:
+        return (
+            key == "gdofs_map"
+            or key.startswith(("b_", "g_", "d", "r", "pos_map", "neg_map"))
+        )
 
     compressed: dict[str, Any] = {}
     for k, v in static.items():
@@ -110,7 +129,13 @@ def _compress_static_for_active(static: dict[str, Any],
                 compressed[k] = _remap_map(v)
                 continue
             arr = v
-            if arr.ndim >= 2 and arr.dtype.kind != "O":
+            if (
+                arr.ndim >= 2
+                and arr.dtype.kind != "O"
+                and k not in geom_keys
+                and not k.startswith(("domain_bs_", "domain_flag_"))
+                and _is_union_key(k)
+            ):
                 arr = _remap_union(arr)
             compressed[k] = arr
         else:
@@ -371,12 +396,17 @@ class _IntegralKernel:
         """
         if self.builder is None:
             return False
+        old_args = self.static_args if isinstance(self.static_args, dict) else None
         try:
             new_args = self.builder(level_set, reuse_static=self.static_args)
         except TypeError:
             new_args = self.builder(level_set)
         if new_args is None:
             return False
+        if old_args is not None and isinstance(new_args, dict):
+            for key, val in old_args.items():
+                if key not in new_args:
+                    new_args[key] = val
         self.static_args = new_args
         self.eids = np.asarray(new_args.get("eids", []), dtype=np.int32)
         return True
@@ -489,9 +519,9 @@ def compile_multi(form, *, dof_handler, mixed_element,
     _IntegralKernel objects. Supports plain volume, cut volume (level set
     with side), interface, and ghost-edge integrals.
     """
-    if backend != "jit":
+    if backend not in {"jit", "cpp", "c++"}:
         raise ValueError(
-            f"compile_multi supports backend='jit'; got backend={backend!r}. "
+            f"compile_multi supports backend='jit' or 'cpp'; got backend={backend!r}. "
             "Use FormCompiler(backend='python') for the pure-Python path."
         )
     from pycutfem.ufl.measures import Integral
@@ -712,15 +742,6 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     cached = _full_cache.get("static")
                     if cached is not None:
                         return cached
-                if full_ids.size == 0:
-                    empty_map = np.zeros((0, n_loc), dtype=np.int32)
-                    return {
-                        "gdofs_map": empty_map,
-                        "eids": np.zeros(0, dtype=np.int32),
-                        "entity_kind": "element",
-                        "is_interface": False,
-                        "is_ghost": False,
-                    }
 
                 qref_all = geom_bg.get("qp_ref")
                 if qref_all is not None:
@@ -745,10 +766,13 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 if qref_slice is not None:
                     geom_full["qref"] = qref_slice
 
-                gdofs_map_full = np.vstack([
-                    np.asarray(dof_handler.get_elemental_dofs(e), dtype=np.int32)[active_cols]
-                    for e in full_ids
-                ]).astype(np.int32)
+                if full_ids.size:
+                    gdofs_map_full = np.vstack([
+                        np.asarray(dof_handler.get_elemental_dofs(e), dtype=np.int32)[active_cols]
+                        for e in full_ids
+                    ]).astype(np.int32)
+                else:
+                    gdofs_map_full = np.zeros((0, int(active_cols.size)), dtype=np.int32)
                 geom_full["gdofs_map"] = gdofs_map_full
 
                 static_full = dict(geom_full)
@@ -765,8 +789,9 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     )
                 )
                 static_full = _compress_static_for_active(static_full, mixed_element, active_cols)
-                _full_cache["ids"] = full_ids
-                _full_cache["static"] = static_full
+                if full_ids.size:
+                    _full_cache["ids"] = full_ids
+                    _full_cache["static"] = static_full
                 return static_full
 
             derivs_cut = required_multi_indices(intg.integrand) | {(0, 0)}
@@ -776,17 +801,42 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 cut_ids = np.asarray(_apply_defined_on(cut_now), dtype=np.int32)
                 cut_ids = np.unique(cut_ids)
                 if cut_ids.size == 0:
-                    empty_map = np.zeros((0, n_loc), dtype=np.int32)
-                    return {
-                        "gdofs_map": empty_map,
-                        "eids": np.zeros(0, dtype=np.int32),
-                        "owner_id": np.zeros(0, dtype=np.int32),
-                        "entity_kind": "element",
-                        "is_interface": False,
-                        "is_ghost": False,
-                        "detJ": np.ones((0, 0), dtype=float),
-                        "qw": np.zeros((0, 0), dtype=float),
-                    }
+                    geom_cut = dof_handler.precompute_cut_volume_factors(
+                        cut_ids,
+                        qdeg,
+                        derivs_cut,
+                        ls_obj,
+                        side=side,
+                        need_hess=need_hess,
+                        need_o3=need_o3,
+                        need_o4=need_o4,
+                        nseg_hint=nseg,
+                        deformation=deformation,
+                    )
+                    geom_cut["is_interface"] = False
+                    geom_cut["is_ghost"] = False
+                    geom_cut["entity_kind"] = "element"
+                    if "owner_id" not in geom_cut:
+                        geom_cut["owner_id"] = np.asarray(geom_cut.get("eids", cut_ids), dtype=np.int32)
+
+                    gdofs_map_cut = np.zeros((0, int(active_cols.size)), dtype=np.int32)
+                    geom_cut["gdofs_map"] = gdofs_map_cut
+
+                    static_cut = {"gdofs_map": gdofs_map_cut, **geom_cut}
+                    static_cut.update(
+                        _build_jit_kernel_args(
+                            ir,
+                            intg.integrand,
+                            mixed_element,
+                            qdeg,
+                            dof_handler=dof_handler,
+                            gdofs_map=gdofs_map_cut,
+                            param_order=runner.param_order,
+                            pre_built=geom_cut,
+                        )
+                    )
+                    static_cut = _compress_static_for_active(static_cut, mixed_element, active_cols)
+                    return static_cut
 
                 old_static = reuse_static if isinstance(reuse_static, dict) else None
                 old_phi_sig = _phi_signature_from_static(old_static)

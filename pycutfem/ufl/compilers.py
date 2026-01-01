@@ -137,9 +137,20 @@ class FormCompiler:
         self._basis_cache: Dict[str, Dict[str, np.ndarray]] = {}
         self.degree_estimator = PolynomialDegreeEstimator(dh)
         self.backend = backend
-        if self.backend == "jit":
-            from pycutfem.jit import compile_backend
-            self._compile_backend = compile_backend
+        self._jit_backend = None
+        if self.backend == "python":
+            self._compile_backend = None
+        elif self.backend in {"jit", "cpp", "c++"}:
+            if self.backend in {"cpp", "c++"}:
+                from pycutfem.jit.cpp_backend import compile_backend_cpp
+                self._compile_backend = compile_backend_cpp
+                self._jit_backend = "cpp"
+            else:
+                from pycutfem.jit import compile_backend
+                self._compile_backend = compile_backend
+                self._jit_backend = "jit"
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'.")
         self._dispatch = {
             Constant: self._visit_Constant, 
             TestFunction: self._visit_TestFunction,
@@ -183,6 +194,9 @@ class FormCompiler:
                 self.ctx.pop(key, None)
             else:
                 self.ctx[key] = old
+
+    def _is_jit_backend(self) -> bool:
+        return self.backend in {"jit", "cpp", "c++"}
     # --------------------- OpInfo meta helpers ---------------------
     def _op_meta_from_ctx(self, node, field_names):
         """Build consistent metadata for VecOpInfo/GradOpInfo from ctx + node."""
@@ -1711,6 +1725,9 @@ class FormCompiler:
         role_b = getattr(b, 'role', None)
         shape_a = getattr(a_data,"shape", None)
         shape_b = getattr(b_data,"shape", None)
+        is_a_scalar = np.isscalar(a_data) or (isinstance(a_data, np.ndarray) and a_data.ndim == 0)
+        is_b_scalar = np.isscalar(b_data) or (isinstance(b_data, np.ndarray) and b_data.ndim == 0)
+        
         # print(f"visit dot: role_a={role_a}, role_b={role_b}, side: {'RHS' if self.ctx['rhs'] else 'LHS'}"
         #       f" type_a={type(a)}, type_b={type(b)}"
         #       f" shape_a={shape_a}, shape_b={shape_b}")
@@ -1798,11 +1815,11 @@ class FormCompiler:
             if result is not None:
                 return result
 
-        if role_a is None and role_b is not None:
+        if role_a is None and is_a_scalar and role_b is not None:
             return b * a
-        elif role_b is None and role_a is not None:
+        elif role_b is None and is_b_scalar and role_a is not None:
             return a * b
-        elif role_a is None and role_b is None:
+        elif role_a is None and role_b is None and is_a_scalar and is_b_scalar:
             return a * b
 
         if role_a == None and role_b == "test":
@@ -2198,7 +2215,7 @@ class FormCompiler:
         # if a level-set was attached to dx → do cut-cell assembly in Python path
         if getattr(integral.measure, "level_set", None) is not None:
             # CUT-VOLUME integral
-            if self.backend == "jit":
+            if self._is_jit_backend():
                 self._assemble_volume_cut_jit(integral, matvec)
             else:
                 self._clear_sided_ctx()
@@ -2207,10 +2224,12 @@ class FormCompiler:
         # … otherwise the existing back-end selection …
         if self.backend == "python":
             self._assemble_volume_python(integral, matvec)
-        elif self.backend == "jit":
+        elif self._is_jit_backend():
             self._assemble_volume_jit(integral, matvec)
         else:
-            raise ValueError("Unsupported backend.")
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
     
     # ----------------------------------------------------------------------
     def _expr_requires_hess(self, node):
@@ -3647,6 +3666,19 @@ class FormCompiler:
         static_args = {k: v for k, v in geo.items() if k != "eids"}
         static_args.update(basis_args)
         active_fields = _active_field_order(ir, me)
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_fields = tuple(runner_active)
+        else:
+            _param_fields: list[str] = []
+            for name in getattr(runner, "param_order", []):
+                has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
+                if name.startswith(("b_", "g_")) or has_deriv:
+                    fld = name.split("_", 1)[1] if "_" in name else name
+                    if fld in getattr(me, "field_names", ()):
+                        _param_fields.append(fld)
+            if _param_fields:
+                active_fields = tuple(dict.fromkeys(_param_fields))
         active_cols   = _active_columns(me, active_fields)
         static_args   = _compress_static_for_active(static_args, me, active_cols)
         gdofs_map     = static_args.get("gdofs_map", gdofs_map)
@@ -3782,10 +3814,12 @@ class FormCompiler:
 
         if self.backend == "python":
             self._assemble_interface_python(intg, matvec)
-        elif self.backend == "jit":
+        elif self._is_jit_backend():
             self._assemble_interface_jit(intg, matvec)
         else:
-            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
 
     def _assemble_aligned_interface(self, intg: Integral, matvec, aligned_edges=None):
         """Assemble interface integrals on edges tagged as 'interface'."""
@@ -3803,10 +3837,12 @@ class FormCompiler:
 
         if self.backend == "python":
             self._assemble_aligned_interface_python(intg, matvec, aligned_edges)
-        elif self.backend == "jit":
+        elif self._is_jit_backend():
             self._assemble_aligned_interface_jit(intg, matvec, aligned_edges)
         else:
-            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
 
     def _find_req_derivs(self, intg: "Integral", runner):
         """Find all required derivative multi-indices for the given integral."""
@@ -3959,16 +3995,18 @@ class FormCompiler:
     def _assemble_ghost_edge(self, intg: "Integral", matvec):
         """Assemble ghost edge integrals."""
         trial, test = _trial_test(intg.integrand)
-        if trial is None and test is None and self.backend == "jit":
+        if trial is None and test is None and self._is_jit_backend():
             # Ghost-edge functionals rely on Python path for correct normal orientation.
             self._assemble_ghost_edge_python(intg, matvec)
             return
         if self.backend == "python":
             self._assemble_ghost_edge_python(intg, matvec)
-        elif self.backend == "jit":
+        elif self._is_jit_backend():
             self._assemble_ghost_edge_jit(intg, matvec)
         else:
-            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
 
 
     # inside FormCompiler -------------------------------------------------
@@ -3979,7 +4017,7 @@ class FormCompiler:
         and scalar functional forms – scalar forms can be captured with the
         same “assembler_hooks” mechanism used for interfaces / ghost edges.
         """
-        if self.backend == "jit":
+        if self._is_jit_backend():
             raise NotImplementedError("dS + JIT not wired yet")
 
         rhs   = self.ctx.get("rhs", False)
@@ -4221,10 +4259,12 @@ class FormCompiler:
         """Assemble integrals over boundary edges."""
         if self.backend == "python":
             self._assemble_boundary_edge_python(intg, matvec)
-        elif self.backend == "jit":
+        elif self._is_jit_backend():
             self._assemble_boundary_edge_jit(intg, matvec)
         else:
-            raise ValueError(f"Unsupported backend: {self.backend}. Use 'python' or 'jit'.")
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
 
     
     

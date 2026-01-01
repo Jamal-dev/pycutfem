@@ -181,13 +181,20 @@ def test_locator_single_node_pin_q3q1():
     me = MixedElement(mesh, field_specs={'ux': 3, 'uy': 3, 'p': 1})
     dh = DofHandler(me, method='cg')
 
-    bcs = [BoundaryCondition('p', 'dirichlet', 'pin', 99.0)]
-    locs = {'pin': lambda x, y: np.isclose(x, 0.5) and np.isclose(y, 0.5)}
+    dh.tag_dof_by_locator(
+            tag="pinned",
+            field="p",
+            locator=lambda x, y: np.isclose(x, 0.5) and np.isclose(y, 0.5),
+            find_first=True,
+        )
 
-    data = dh.get_dirichlet_data(bcs, locators=locs)
-    grouped = _group_dirichlet_by_field_and_node(dh, data)
+    bcs = [BoundaryCondition(field="p", domain_tag="pinned", method="dirichlet", value=99.0)]
+    dirichlet_data = dh.get_dirichlet_data(bcs)
 
-    assert len(data) == 1
+
+    grouped = _group_dirichlet_by_field_and_node(dh, dirichlet_data)
+
+    assert len(dirichlet_data) == 1
     assert len(grouped['p']) == 1
     nid = next(iter(grouped['p'].keys()))
     xy = mesh.nodes_x_y_pos[int(nid)]

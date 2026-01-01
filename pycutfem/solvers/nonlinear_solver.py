@@ -456,11 +456,15 @@ class NewtonSolver:
         self.restrictor = _ActiveReducer(self.dh, self.active_dofs, constraint=self.constraints)
 
 
+    def _is_jit_backend(self) -> bool:
+        return self.backend in {"jit", "cpp", "c++"}
+
+
 
 
     def _compile_all_kernels(self) -> None:
         """(Re)compile residual and Jacobian kernels with current metadata."""
-        if self.backend == "jit":
+        if self._is_jit_backend():
             self.kernels_K = compile_multi(
                 self._jacobian_form,
                 dof_handler=self.dh,
@@ -487,7 +491,9 @@ class NewtonSolver:
             self.kernels_K = []
             self.kernels_F = []
         else:
-            raise ValueError(f"Unknown backend '{self.backend}'.")
+            raise ValueError(
+                f"Unknown backend '{self.backend}'. Use 'python', 'jit', or 'cpp'."
+            )
 
         self._pattern_stale = True
         self._last_jacobian = None
@@ -501,7 +507,7 @@ class NewtonSolver:
         level set without re-JIT compilation. Marks the scatter pattern as stale
         so it will be rebuilt on the next assembly.
         """
-        if self.backend != "jit":
+        if not self._is_jit_backend():
             return
         t0 = time.perf_counter()
         changed = 0
@@ -1054,8 +1060,12 @@ class NewtonSolver:
             # residual only: keep a light path that avoids fancy indexing
             R_red = np.zeros(nred)
             for ker in self.kernels_F:
+                gdofs = ker.static_args.get("gdofs_map")
+                if isinstance(gdofs, np.ndarray) and gdofs.shape[0] == 0:
+                    continue
                 _, Floc, _ = ker.exec(coeffs)
-                gdofs = ker.static_args["gdofs_map"]
+                if not isinstance(gdofs, np.ndarray):
+                    gdofs = ker.static_args["gdofs_map"]
                 for e in range(gdofs.shape[0]):
                     full = gdofs[e]
                     valid_full = full >= 0
@@ -1646,6 +1656,9 @@ class NewtonSolver:
 
         # Matrix (Jacobian) blocks
         for ker, pos_list, lidx_list in zip(self.kernels_K, self._elem_pos, self._elem_lidx):
+            gdofs = ker.static_args.get("gdofs_map")
+            if isinstance(gdofs, np.ndarray) and gdofs.shape[0] == 0:
+                continue
             t_exec = time.perf_counter()
             Kloc, _, _ = ker.exec(coeffs)  # shape [nel, nloc, nloc]
             exec_time = time.perf_counter() - t_exec
@@ -1663,11 +1676,15 @@ class NewtonSolver:
 
         # Residual blocks
         for ker in self.kernels_F:
+            gdofs = ker.static_args.get("gdofs_map")
+            if isinstance(gdofs, np.ndarray) and gdofs.shape[0] == 0:
+                continue
             t_exec = time.perf_counter()
             _, Floc, _ = ker.exec(coeffs)  # [nel, nloc]
             exec_time = time.perf_counter() - t_exec
             t_scatter = time.perf_counter()
-            gdofs = ker.static_args["gdofs_map"]
+            if not isinstance(gdofs, np.ndarray):
+                gdofs = ker.static_args["gdofs_map"]
             for e in range(gdofs.shape[0]):
                 full = gdofs[e]
                 valid_full = full >= 0

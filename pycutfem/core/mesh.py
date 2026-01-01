@@ -963,15 +963,37 @@ class Mesh:
 
         is an **O(1)** dictionary lookup instead of a fresh scan.
         """
-        n_edges          = len(self.edges_list)
-        tag_masks        = {t: np.zeros(n_edges, bool) for t in tag_functions}
+        n_edges = len(self.edges_list)
+        tag_masks = {t: np.zeros(n_edges, bool) for t in tag_functions}
+
+        def _edge_matches(locator, coords: np.ndarray) -> bool:
+            if coords.size == 0:
+                return False
+            if coords.shape[0] >= 3:
+                mid = coords[int(coords.shape[0] // 2)]
+            else:
+                mid = coords.mean(axis=0)
+            if locator(float(mid[0]), float(mid[1])):
+                return True
+            if coords.shape[0] >= 2:
+                p0 = coords[0]
+                p1 = coords[-1]
+                if locator(float(p0[0]), float(p0[1])) and locator(float(p1[0]), float(p1[1])):
+                    return True
+            for pt in coords:
+                if not locator(float(pt[0]), float(pt[1])):
+                    return False
+            return True
+
         for e in self.edges_list:
-            if e.right is not None:                  # interior → skip
+            if e.right is not None:  # interior → skip
                 continue
-            mpx, mpy   = self.nodes_x_y_pos[list(e.nodes)].mean(axis=0)
+
+            edge_nodes = getattr(e, "all_nodes", None) or e.nodes
+            coords = self.nodes_x_y_pos[list(edge_nodes)]
             for tag, locator in tag_functions.items():
-                if locator(mpx, mpy):
-                    e.tag            = tag
+                if _edge_matches(locator, coords):
+                    e.tag = tag
                     tag_masks[tag][e.gid] = True
                     break
 
