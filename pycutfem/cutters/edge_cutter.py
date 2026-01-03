@@ -1,53 +1,41 @@
 """pycutfem.cutters.edge_cutter
-Robust interface/ghost edge classification.
+Interface/ghost edge classification for cut meshes.
 
 Criteria
 --------
-1. If *level_set* is given: an edge is 'interface' when φ(a)⋅φ(b) < 0.
-2. Else: use element tags produced by *classify_elements*:
-   - 'interface' when incident element tags differ ('inside' vs 'outside')
-     OR one side is 'cut'.
-   - 'ghost' when both incident elements are 'cut'.
+1. Aligned interface edges: adjacent elements are inside/outside and both
+   edge endpoints satisfy |φ|<=tol.
+2. Ghost edges: any interior edge with at least one cut element.
 """
-import numpy as np
-
-def classify_edges(mesh, level_set):
+def classify_edges(mesh, level_set, tol=1e-12):
     """
-    Robust interface/ghost edge classification, given each element is already
+    Interface/ghost edge classification, given each element is already
     tagged in {'inside', 'outside', 'cut'}.
 
-    1. If φ changes sign between the two endpoints of an edge, tag it 'interface'.
-    2. Otherwise, for interior edges (edge.right is not None):
-       - If {left_tag, right_tag} == {'inside', 'outside'} → 'interface'
-       - Elif left_tag=='cut' and right_tag=='cut'            → 'ghost'
-       - Elif exactly one side is 'cut' (and the other is 'inside' or 'outside')
-             → 'interface'
-       - Else → leave tag as '' (no classification needed).
+    1. Interface edges: only when they separate inside/outside elements and
+       φ≈0 at both endpoints (aligned interface).
+    2. Ghost edges: any interior edge with at least one cut element.
     """
     # Evaluate φ at all nodes once
     phi_nodes = level_set.evaluate_on_nodes(mesh)
 
     for edge in mesh.edges_list:
-        # 1) Primary: sign‐change in φ across the edge’s endpoints?
-        if phi_nodes[edge.nodes[0]] * phi_nodes[edge.nodes[1]] < 0:
-            edge.tag = 'interface'
+        if edge.right is None:
             continue
 
-        # 2) Fallback: only if this is an interior edge
-        if edge.right is not None:
-            left_tag  = mesh.elements_list[edge.left].tag
-            right_tag = mesh.elements_list[edge.right].tag
+        edge.tag = ''
+        left_tag = mesh.elements_list[edge.left].tag
+        right_tag = mesh.elements_list[edge.right].tag
+        tags = {left_tag, right_tag}
 
-            # inside/outside adjacent → interface
-            if {left_tag, right_tag} == {'inside', 'outside'}:
+        # Aligned interface facets: inside/outside neighbors with φ≈0 endpoints.
+        if left_tag in {"inside", "outside"} and right_tag in {"inside", "outside"} and left_tag != right_tag:
+            n0, n1 = edge.nodes
+            p0, p1 = phi_nodes[n0], phi_nodes[n1]
+            if abs(p0) <= tol and abs(p1) <= tol:
                 edge.tag = 'interface'
+            continue
 
-            # both cut → ghost
-            elif left_tag == 'cut' and right_tag == 'cut':
-                edge.tag = 'ghost'
-
-            # exactly one side cut → interface
-            elif ('cut' in (left_tag, right_tag)) and (left_tag != right_tag):
-                edge.tag = 'interface'
-
-            # otherwise (both inside or both outside), leave edge.tag as ''
+        # Ghost stabilization edges: any edge touching a cut element.
+        if 'cut' in tags:
+            edge.tag = 'ghost'

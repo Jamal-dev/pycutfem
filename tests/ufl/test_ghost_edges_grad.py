@@ -21,9 +21,11 @@ from pycutfem.io.visualization import plot_mesh_2
 import matplotlib.pyplot as plt
 from pycutfem.ufl.compilers import FormCompiler
 
+X_IFACE = 1.03  # avoid mesh-aligned interface so ghost edges are non-empty
+
 @pytest.fixture(scope="module")
 def setup_quad2():
-    """2×1 quadratic mesh cut vertically at x=1."""
+    """2×1 quadratic mesh cut vertically at x=X_IFACE."""
     poly_order = 2
     nodes, elements_connectivity, edge_connectivity, corner_nodes = structured_quad(2.0, 1.0, nx=20, ny=5, poly_order=poly_order)
     mesh = Mesh(nodes = nodes,
@@ -33,7 +35,7 @@ def setup_quad2():
                 element_type="quad",
                 poly_order=poly_order)
     
-    level_set = AffineLevelSet(a=1.0, b=0, c=-1.0)  # Vertical line at x=1
+    level_set = AffineLevelSet(a=1.0, b=0, c=-X_IFACE)  # Vertical line at x=X_IFACE
 
     mesh.classify_elements(level_set)
     mesh.classify_edges(level_set)

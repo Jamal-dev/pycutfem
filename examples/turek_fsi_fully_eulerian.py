@@ -373,7 +373,7 @@ def _parse_args():
         force_full_setup=_env_bool("FORCE_FULL_SETUP", False),
         refine_initial=_env_bool("REFINE_INITIAL", True),
         pin_pressure=_env_bool("PIN_PRESSURE", False),
-        use_aligned_interface=_env_bool("USE_ALIGNED_INTERFACE", False),
+        use_aligned_interface=_env_bool("USE_ALIGNED_INTERFACE", True),
         solid_advect_lagged=_env_bool("SOLID_ADVECT_LAGGED", True),
         use_restricted_forms=_env_bool("USE_RESTRICTED_FORMS", True),
         use_linear_solid=_env_bool("USE_LINEAR_SOLID", True),
@@ -560,9 +560,9 @@ BEAM_ROOT_TOL = float(max(1.0e-6, 1.0e-3 * MESH_SIZE))
 BEAM_ROOT_BIAS = float(max(1.0e-8, 1.0e-4 * MESH_SIZE))
 BEAM_ROOT_INSET = float(os.getenv("BEAM_ROOT_INSET", str(max(5.0e-4, 0.04 * MESH_SIZE))))
 BEAM_ROOT_DOF_TOL = float(os.getenv("BEAM_ROOT_DOF_TOL", str(max(0.2 * MESH_SIZE, 1.0e-3))))
-PIN_PRESSURE = os.getenv("PIN_PRESSURE", "1") not in ("0", "false", "False")
+PIN_PRESSURE = os.getenv("PIN_PRESSURE", "0") not in ("0", "false", "False")
 SOLID_CUT_DROP = float(os.getenv("SOLID_CUT_DROP", "0.0"))
-USE_ALIGNED_INTERFACE = os.getenv("USE_ALIGNED_INTERFACE", "0") not in ("0", "false", "False")
+USE_ALIGNED_INTERFACE = os.getenv("USE_ALIGNED_INTERFACE", "1") not in ("0", "false", "False")
 SOLID_ADVECT_LAGGED = os.getenv("SOLID_ADVECT_LAGGED", "1") not in ("0", "false", "False")
 USE_RESTRICTED_FORMS = os.getenv("USE_RESTRICTED_FORMS", "1") not in ("0", "false", "False")
 USE_LINEAR_SOLID = os.getenv("USE_LINEAR_SOLID", "1") not in ("0", "false", "False")
@@ -570,6 +570,9 @@ LEVELSET_ZERO_EPS = float(os.getenv("LEVELSET_ZERO_EPS", str(max(1.0e-10, 1.0e-8
 LEVELSET_ZERO_SIDE = os.getenv("LEVELSET_ZERO_SIDE", "neg").strip().lower()
 LEVELSET_PREFER_NEGATIVE = LEVELSET_ZERO_SIDE != "pos"
 LEVELSET_UPDATE_TOL = float(os.getenv("LEVELSET_UPDATE_TOL", str(max(1.0e-12, 1.0e-10 * MESH_SIZE))))
+if USE_ALIGNED_INTERFACE and LEVELSET_ZERO_EPS > 0.0:
+    print("[interface] USE_ALIGNED_INTERFACE=1 -> disabling level-set zero nudging (LEVELSET_ZERO_EPS=0)")
+    LEVELSET_ZERO_EPS = 0.0
 
 # -----------------------------------------------------------------------------
 # Mesh and boundary helpers
@@ -3417,11 +3420,11 @@ mixed_element = MixedElement(
     field_specs={
         "u_pos_x": POLY_ORDER,
         "u_pos_y": POLY_ORDER,
-        "p_pos_": POLY_ORDER - 1,
-        "vs_neg_x": POLY_ORDER - 1,
-        "vs_neg_y": POLY_ORDER - 1,
-        "d_neg_x": POLY_ORDER - 1,
-        "d_neg_y": POLY_ORDER - 1,
+        "p_pos_": POLY_ORDER ,
+        "vs_neg_x": POLY_ORDER ,
+        "vs_neg_y": POLY_ORDER ,
+        "d_neg_x":  POLY_ORDER ,
+        "d_neg_y":  POLY_ORDER ,
     },
 )
 dof_handler = DofHandler(mixed_element, method="cg")

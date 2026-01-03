@@ -27,6 +27,8 @@ from pycutfem.ufl.expressions import Pos, Neg, restrict
 from pycutfem.io.visualization import plot_mesh_2
 import matplotlib.pyplot as plt
 
+X_IFACE = 1.03  # avoid mesh-aligned interface so ghost edges are non-empty
+
 
 # Lx,Ly = 2.0, 1.0
 # level_set = CircleLevelSet(radius=0.5, center=(Lx/2, Ly/2))
@@ -51,12 +53,26 @@ def _hess_comp(a, b):
             2*Derivative(a,1,1)*Derivative(b,1,1) +
             Derivative(a,0,2)*Derivative(b,0,2))
 
+def _q2_second_derivative_1d(v0, v1, v2, h):
+    return 4.0 * (v0 - 2.0 * v1 + v2) / (h * h)
+
+def _cut_column_positions(mesh, x_iface):
+    corner_nodes = np.asarray(mesh.corner_connectivity).ravel()
+    xs = np.unique(mesh.nodes_x_y_pos[corner_nodes, 0])
+    xs.sort()
+    idx = int(np.searchsorted(xs, x_iface) - 1)
+    if idx < 0 or idx + 1 >= xs.size:
+        raise ValueError("Interface not inside mesh bounds.")
+    x_left = float(xs[idx])
+    x_right = float(xs[idx + 1])
+    x_mid = 0.5 * (x_left + x_right)
+    return x_left, x_mid, x_right, x_right - x_left
 
 
 
 @pytest.fixture(scope="module")
 def setup_quad2():
-    """2×1 quadratic mesh cut vertically at x=1."""
+    """2×1 quadratic mesh cut vertically at x=X_IFACE."""
     poly_order = 2
     L, H = 2.0, 1.0
     nx, ny = 20, 5
@@ -72,7 +88,7 @@ def setup_quad2():
                 element_type="quad",
                 poly_order=poly_order)
     
-    level_set = AffineLevelSet(a=1.0, b=0, c=-1.0)  # Vertical line at x=1
+    level_set = AffineLevelSet(a=1.0, b=0, c=-X_IFACE)  # Vertical line at x=X_IFACE
 
     mesh.classify_elements(level_set)
     mesh.build_interface_segments(level_set)
@@ -147,7 +163,6 @@ def test_hessian_energy_zero_for_quadratic(setup_quad2, backend):
 def test_hessian_energy_known_value(setup_quad2, backend):
     from pycutfem.ufl.expressions import restrict, Pos, Neg
     _mesh, ls, ghost, dh, comp, geom_info = setup_quad2
-    h_x = geom_info['h_x']
     ghost_edges = _mesh.edge_bitset('ghost')
     ghost_pos = _mesh.edge_bitset('ghost_pos')
     ghost_neg = _mesh.edge_bitset('ghost_neg')
@@ -159,9 +174,9 @@ def test_hessian_energy_known_value(setup_quad2, backend):
     use_domain = ghost_pos
 
     def piecewise_pos(x, y):
-        return np.where(x > 1.0, (x - 1.0) ** 2, 0.0)
+        return np.where(x > X_IFACE, (x - X_IFACE) ** 2, 0.0)
     def piecewise_neg(x, y):
-        return np.where(x > 1.0, 0.0, (x - 1.0) ** 2)
+        return np.where(x > X_IFACE, 0.0, (x - X_IFACE) ** 2)
 
     uh = Function(name ="u", field_name="u", dof_handler=dh)
     uh.set_values_from_function(piecewise_pos)
@@ -174,7 +189,7 @@ def test_hessian_energy_known_value(setup_quad2, backend):
     jump_u = Jump(u_pos, u_neg)
     
    
-    def get_result(use_domain,u):
+    def get_result(use_domain, u):
         dG = dGhost(defined_on=use_domain, 
                     level_set=ls, metadata={"q":4})
         energy_form = hessian_inner(u, u) * dG
@@ -184,7 +199,7 @@ def test_hessian_energy_known_value(setup_quad2, backend):
                             bcs=[], assembler_hooks=assembler_hooks, backend=backend)
 
         return res_1["E"]
-    def get_result_2(use_domain,u_pos,u_neg):
+    def get_result_2(use_domain, u_pos, u_neg):
         dG = dGhost(defined_on=use_domain, 
                     level_set=ls, metadata={"q":4})
         e_pos = hessian_inner(u_pos, u_pos)
@@ -200,15 +215,27 @@ def test_hessian_energy_known_value(setup_quad2, backend):
         return res_1["E"]
 
 
-    expected = 4.0 * 1.0  # jump 2 (square), length 1
+    expected = 4.0 * _edge_length_sum(_mesh, ghost_pos)  # jump 2 (square)
     pos_energy = get_result(ghost_pos, u_pos)
     neg_energy = get_result(ghost_pos, u_neg)
     print(f"pos energy {pos_energy}, neg energy {neg_energy}")
     jump_energy = get_result_2(ghost_pos, u_pos, u_neg) 
     print(f"jump energy {jump_energy}")
-    assert np.isclose(get_result(ghost_pos, jump_u), expected, rtol=1e-2)
-    expected = 4.0 * h_x * (ghost_both.cardinality())
-    assert np.isclose(get_result(ghost_both, jump_u), expected, rtol=1e-2)
+    assert np.isclose(pos_energy, expected, rtol=1e-2)
+    assert np.isclose(neg_energy, 0.0, atol=1e-12)
+    jump_val = get_result(ghost_pos, jump_u)
+    jump_both = get_result(ghost_both, jump_u)
+
+    x_left, x_mid, x_right, h_x = _cut_column_positions(_mesh, X_IFACE)
+    pos_vals = [piecewise_pos(x_left, 0.0), piecewise_pos(x_mid, 0.0), piecewise_pos(x_right, 0.0)]
+    neg_vals = [piecewise_neg(x_left, 0.0), piecewise_neg(x_mid, 0.0), piecewise_neg(x_right, 0.0)]
+    hxx_pos_cut = _q2_second_derivative_1d(pos_vals[0], pos_vals[1], pos_vals[2], h_x)
+    hxx_neg_cut = _q2_second_derivative_1d(neg_vals[0], neg_vals[1], neg_vals[2], h_x)
+
+    expected_jump = (2.0 - hxx_neg_cut) ** 2 * _edge_length_sum(_mesh, ghost_pos)
+    expected_both = (hxx_pos_cut - hxx_neg_cut) ** 2 * _edge_length_sum(_mesh, ghost_both)
+    assert np.isclose(jump_val, expected_jump, rtol=1e-10, atol=1e-12)
+    assert np.isclose(jump_both, expected_both, rtol=1e-10, atol=1e-12)
 
 @pytest.mark.parametrize("backend", ["python", "jit"])
 def test_scalar_jump_penalty_spd(setup_quad2, backend):

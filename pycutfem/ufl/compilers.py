@@ -3303,12 +3303,21 @@ class FormCompiler:
                         return float(level_set.value_on_element(int(eid), (float(xi), float(eta))))
                     return float(level_set(point))
 
+                tag_left = getattr(mesh.elements_list[e.left], "tag", "")
+                tag_right = getattr(mesh.elements_list[e.right], "tag", "")
+
                 def choose_pos_neg_ids():
                     tag = str(getattr(e, "tag", ""))
                     if tag == "ghost_pos":
-                        return e.right, e.left
+                        if tag_left == "outside" and tag_right == "cut":
+                            return e.left, e.right
+                        if tag_right == "outside" and tag_left == "cut":
+                            return e.right, e.left
                     if tag == "ghost_neg":
-                        return e.left, e.right
+                        if tag_left == "inside" and tag_right == "cut":
+                            return e.right, e.left
+                        if tag_right == "inside" and tag_left == "cut":
+                            return e.left, e.right
                     cL = np.asarray(mesh.elements_list[e.left ].centroid())
                     cR = np.asarray(mesh.elements_list[e.right].centroid())
                     phiL = _eval_ls(e.left, cL)

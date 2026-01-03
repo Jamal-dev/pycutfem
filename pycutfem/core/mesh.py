@@ -388,32 +388,31 @@ class Mesh:
         Classify each element as 'inside', 'outside', or 'cut'.
         Sets element.tag accordingly and returns indices for each class.
         """
-        phi_nodes      = level_set.evaluate_on_nodes(self)
+        phi_nodes = level_set.evaluate_on_nodes(self)
         elem_phi_nodes = phi_nodes[self.corner_connectivity]
+        try:
+            phi_cent = self._phi_on_centroids(level_set)
+            phi_samples = np.concatenate([elem_phi_nodes, phi_cent[:, None]], axis=1)
+        except Exception:
+            phi_samples = elem_phi_nodes
 
-        has_neg = elem_phi_nodes < -tol
-        has_pos = elem_phi_nodes >  tol
-        has_zero = np.abs(elem_phi_nodes) <= tol
+        has_neg = phi_samples < -tol
+        has_pos = phi_samples > tol
 
         any_neg = has_neg.any(axis=1)
         any_pos = has_pos.any(axis=1)
-        any_zero = has_zero.any(axis=1)
 
         # True sign change → genuine cut element
         cut_mask = any_neg & any_pos
 
-        # Touching interface (zeros) plus one side → treat as cut to enable ghost/interface on aligned edges
-        cut_mask |= (any_zero & any_pos) | (any_zero & any_neg)
-
         # Only negative → inside
-        inside_mask = any_neg & ~any_pos & ~any_zero
+        inside_mask = any_neg & ~any_pos
 
         # Only positive → outside
-        outside_mask = ~any_neg & any_pos & ~any_zero
+        outside_mask = any_pos & ~any_neg
 
-        # Narrow φ≈0 band (all nodes ~0): treat as cut for safety
-        narrow_band_mask = ~any_neg & ~any_pos
-        cut_mask |= narrow_band_mask
+        # Narrow φ≈0 band (all samples ~0): treat as cut for safety
+        cut_mask |= ~(inside_mask | outside_mask | cut_mask)
 
         inside_inds  = np.where(inside_mask)[0]
         outside_inds = np.where(outside_mask)[0]
@@ -444,22 +443,24 @@ class Mesh:
             edge.tag = ''
             n0, n1 = edge.nodes
             p0, p1 = phi_nodes[n0], phi_nodes[n1]
-
-            # 1. First priority: Check for Perfect Alignment (Interface Edges)
-            # If both nodes are effectively zero, this IS the interface.
-            if abs(p0) <= tol and abs(p1) <= tol:
-                edge.tag = 'interface'
-                continue
-
-            # 2. Ghost Edge Classification based on Element Tags
             left_el = self.elements_list[edge.left]
             right_el = self.elements_list[edge.right]
-            tags = {left_el.tag, right_el.tag}
+            left_tag = left_el.tag
+            right_tag = right_el.tag
+            tags = {left_tag, right_tag}
+
+            # 1. Interface edges: only when they separate inside/outside elements.
+            if left_tag in {"inside", "outside"} and right_tag in {"inside", "outside"} and left_tag != right_tag:
+                # Require φ≈0 at both endpoints for aligned interface facets.
+                if abs(p0) <= tol and abs(p1) <= tol:
+                    edge.tag = 'interface'
+                continue
             
-            # We only care about stabilization if a Cut element is involved
+            # 2. Ghost Edge Classification based on Element Tags
+            # We only care about stabilization if a Cut element is involved.
             if 'cut' in tags:
                 # Case A: Cut + Cut -> Stabilizes Both
-                if left_el.tag == 'cut' and right_el.tag == 'cut':
+                if left_tag == 'cut' and right_tag == 'cut':
                     edge.tag = 'ghost_both'
                 
                 # Case B: Cut + Outside -> Stabilizes Fluid (Positive)

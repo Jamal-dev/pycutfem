@@ -43,9 +43,9 @@ def classify_elements(mesh, level_set, tol=1e-12):
       - φ evaluated at the element’s centroid
 
     An element is:
-      • 'inside'  if max(φ(corners), φ(centroid)) < -tol
-      • 'outside' if min(φ(corners), φ(centroid)) > +tol
-      • 'cut'     otherwise
+      • 'inside'  if φ samples are below -tol and none are above +tol
+      • 'outside' if φ samples are above +tol and none are below -tol
+      • 'cut'     if both signs appear or all samples are within tol
 
     Sets mesh.elements_list[eid].tag accordingly, and returns
     (inside_indices, outside_indices, cut_indices).
@@ -59,16 +59,17 @@ def classify_elements(mesh, level_set, tol=1e-12):
 
     # 3) φ at centroids
     phi_cent = _phi_on_centroids(mesh, level_set)                       # shape (n_elems,)
+    phi_samples = np.concatenate([elem_phi_nodes, phi_cent[:, None]], axis=1)
 
-    # 4) Compute per-element min/max
-    min_corner = elem_phi_nodes.min(axis=1)
-    max_corner = elem_phi_nodes.max(axis=1)
-    min_phi_per_elem = np.minimum(min_corner, phi_cent)
-    max_phi_per_elem = np.maximum(max_corner, phi_cent)
+    has_neg = phi_samples < -tol
+    has_pos = phi_samples > tol
+    any_neg = has_neg.any(axis=1)
+    any_pos = has_pos.any(axis=1)
 
-    inside_mask  = (max_phi_per_elem < -tol)
-    outside_mask = (min_phi_per_elem >  tol)
-    cut_mask     = ~(inside_mask | outside_mask)
+    cut_mask = any_neg & any_pos
+    inside_mask = any_neg & ~any_pos
+    outside_mask = any_pos & ~any_neg
+    cut_mask |= ~(inside_mask | outside_mask | cut_mask)
 
     inside_inds  = np.where(inside_mask)[0]
     outside_inds = np.where(outside_mask)[0]

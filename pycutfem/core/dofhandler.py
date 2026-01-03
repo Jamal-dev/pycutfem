@@ -3089,10 +3089,31 @@ class DofHandler:
             tag_kind = edge_tags[i]
             tag_left  = getattr(mesh.elements_list[e.left],  "tag", "")
             tag_right = getattr(mesh.elements_list[e.right], "tag", "")
-            if tag_kind == "ghost_pos":
-                pos_eid, neg_eid = e.right, e.left
+            if (
+                allow_interface
+                and tag_kind == "interface"
+                and tag_left in {"inside", "outside"}
+                and tag_right in {"inside", "outside"}
+                and tag_left != tag_right
+            ):
+                if tag_left == "outside":
+                    pos_eid, neg_eid = e.left, e.right
+                else:
+                    pos_eid, neg_eid = e.right, e.left
+            elif tag_kind == "ghost_pos":
+                if tag_left == "outside" and tag_right == "cut":
+                    pos_eid, neg_eid = e.left, e.right
+                elif tag_right == "outside" and tag_left == "cut":
+                    pos_eid, neg_eid = e.right, e.left
+                else:
+                    pos_eid, neg_eid = e.right, e.left
             elif tag_kind == "ghost_neg":
-                pos_eid, neg_eid = e.left, e.right
+                if tag_left == "inside" and tag_right == "cut":
+                    pos_eid, neg_eid = e.right, e.left
+                elif tag_right == "inside" and tag_left == "cut":
+                    pos_eid, neg_eid = e.left, e.right
+                else:
+                    pos_eid, neg_eid = e.left, e.right
             elif tag_left == "cut" and tag_right != "cut":
                 pos_eid, neg_eid = e.left, e.right
             elif tag_right == "cut" and tag_left != "cut":

@@ -26,6 +26,7 @@ from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.ufl.measures import dGhost
 
 BACKENDS = ("python", "jit", "cpp")
+X_IFACE = 1.03  # avoid mesh-aligned interface so ghost edges are non-empty
 
 
 def build_mesh(nx: int = 8, ny: int = 4, poly_order: int = 2):
@@ -40,7 +41,7 @@ def build_mesh(nx: int = 8, ny: int = 4, poly_order: int = 2):
         element_type="quad",
         poly_order=poly_order,
     )
-    level_set = AffineLevelSet(a=1.0, b=0.0, c=-1.0)
+    level_set = AffineLevelSet(a=1.0, b=0.0, c=-X_IFACE)
     mesh.classify_elements(level_set)
     mesh.classify_edges(level_set)
     return mesh, level_set
