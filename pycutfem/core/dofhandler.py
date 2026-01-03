@@ -2425,6 +2425,8 @@ class DofHandler:
                 out[f"g_{fld}"]   = np.empty((0, 0, n_union, 2), dtype=float)
                 out[f"d10_{fld}"] = np.empty((0, 0, n_union), dtype=float)
                 out[f"d01_{fld}"] = np.empty((0, 0, n_union), dtype=float)
+                out[f"restrict_mask_{fld}_pos"] = np.empty((0, n_union), dtype=float)
+                out[f"restrict_mask_{fld}_neg"] = np.empty((0, n_union), dtype=float)
             return out
 
         # ---- cache lookup -------------------------------------------------------------
@@ -2772,6 +2774,28 @@ class DofHandler:
             pos_map[i] = np.arange(n_union, dtype=np.int32)
             neg_map[i] = np.arange(n_union, dtype=np.int32)
 
+        # per-field restriction masks on cut elements (pos/neg within the same owner)
+        restrict_pos_by_field: Dict[str, np.ndarray] = {}
+        restrict_neg_by_field: Dict[str, np.ndarray] = {}
+        if level_set is not None:
+            from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
+            for fld in fields:
+                restrict_pos_by_field[fld] = np.zeros((nE, n_union), dtype=float)
+                restrict_neg_by_field[fld] = np.zeros((nE, n_union), dtype=float)
+
+            for i, eid in enumerate(seg_eids):
+                pos_masks_elem, neg_masks_elem = _hfa.build_side_masks_by_field(
+                    self, fields, int(eid), level_set, tol=SIDE.tol
+                )
+                for fld in fields:
+                    sl = me.component_dof_slices[fld]
+                    mask_pos = pos_masks_elem.get(fld)
+                    mask_neg = neg_masks_elem.get(fld)
+                    if mask_pos is not None and mask_pos.shape[0] == (sl.stop - sl.start):
+                        restrict_pos_by_field[fld][i, sl] = mask_pos
+                    if mask_neg is not None and mask_neg.shape[0] == (sl.stop - sl.start):
+                        restrict_neg_by_field[fld][i, sl] = mask_neg
+
         # jets
         from pycutfem.fem.transform import JET_CACHE as _JET
         Hxi0 = Hxi1 = Txi0 = Txi1 = Qxi0 = Qxi1 = None
@@ -2825,6 +2849,9 @@ class DofHandler:
         for fld in fields:
             out[f"b_{fld}"] = b_tabs[fld]
             out[f"g_{fld}"] = g_tabs[fld]
+            if level_set is not None:
+                out[f"restrict_mask_{fld}_pos"] = restrict_pos_by_field[fld]
+                out[f"restrict_mask_{fld}_neg"] = restrict_neg_by_field[fld]
         out.update(d_tabs)
         if need_hess:
             out["Hxi0"] = Hxi0; out["Hxi1"] = Hxi1
@@ -3145,23 +3172,56 @@ class DofHandler:
             pos_map[i, :len(pos_dofs)] = _searchsorted_positions(global_dofs, pos_dofs)
             neg_map[i, :len(neg_dofs)] = _searchsorted_positions(global_dofs, neg_dofs)
 
-        # 3b --- per-field, side-local -> union maps (ghost)
+        # 3b --- per-field, side-local -> union maps (ghost) + restriction masks
+        # Build per-field side maps using the *true* union list (no padding),
+        # then expand restriction masks to union layout for each field.
+        maps_by_field: Dict[str, np.ndarray] = {}
+        masks_by_field: Dict[str, np.ndarray] = {}
+        mask_cache: Dict[int, tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]] = {}
+        if level_set is not None:
+            from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
+
+            def _elem_masks(eid: int):
+                if eid not in mask_cache:
+                    mask_cache[eid] = _hfa.build_side_masks_by_field(
+                        self, fields, int(eid), level_set, tol=SIDE.tol
+                    )
+                return mask_cache[eid]
+
         for fld in fields:
             nloc_f = len(self.element_maps[fld][pos_ids[0]])
             pm = np.empty((nE, nloc_f), dtype=np.int32)
             nm = np.empty((nE, nloc_f), dtype=np.int32)
+            pos_mask = np.zeros((nE, n_union), dtype=float)
+            neg_mask = np.zeros((nE, n_union), dtype=float)
             for i in range(nE):
                 pos_eid = int(pos_ids[i]); neg_eid = int(neg_ids[i])
-                # union for this edge
-                union = gdofs_map[i, :n_union]
+                # union for this edge (true length, no padding)
+                union = union_lists[i]
                 col_of = {int(d): j for j, d in enumerate(union)}
                 # side-local gdofs for this field
                 pos_loc = self.element_maps[fld][pos_eid]
                 neg_loc = self.element_maps[fld][neg_eid]
                 pm[i, :] = [col_of[int(d)] for d in pos_loc]
                 nm[i, :] = [col_of[int(d)] for d in neg_loc]
-            out[f"pos_map_{fld}"] = pm
-            out[f"neg_map_{fld}"] = nm
+                if level_set is not None:
+                    pos_masks_elem, _ = _elem_masks(pos_eid)
+                    _, neg_masks_elem = _elem_masks(neg_eid)
+                    mask_pos_local = pos_masks_elem.get(fld)
+                    if mask_pos_local is not None and mask_pos_local.shape[0] == pm.shape[1]:
+                        for j, col in enumerate(pm[i]):
+                            if 0 <= col < n_union:
+                                pos_mask[i, col] = float(mask_pos_local[j])
+                    mask_neg_local = neg_masks_elem.get(fld)
+                    if mask_neg_local is not None and mask_neg_local.shape[0] == nm.shape[1]:
+                        for j, col in enumerate(nm[i]):
+                            if 0 <= col < n_union:
+                                neg_mask[i, col] = float(mask_neg_local[j])
+            maps_by_field[f"pos_map_{fld}"] = pm
+            maps_by_field[f"neg_map_{fld}"] = nm
+            if level_set is not None:
+                masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
+                masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
 
         # 3c) Cache key after n_union is known
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
@@ -3678,6 +3738,8 @@ class DofHandler:
             "owner_id":     pos_ids,  # convenience alias
         }
         out.update(basis_tables)
+        out.update(maps_by_field)
+        out.update(masks_by_field)
         if need_hess:
             out.update({
                 "pos_Hxi0": pos_Hxi0, "pos_Hxi1": pos_Hxi1,

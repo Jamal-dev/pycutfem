@@ -113,7 +113,7 @@ def _compress_static_for_active(static: dict[str, Any],
     def _is_union_key(key: str) -> bool:
         return (
             key == "gdofs_map"
-            or key.startswith(("b_", "g_", "d", "r", "pos_map", "neg_map"))
+            or key.startswith(("b_", "g_", "d", "r", "pos_map", "neg_map", "restrict_mask_"))
         )
 
     compressed: dict[str, Any] = {}
@@ -357,6 +357,8 @@ def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet:
     cache = KernelCache()
 
     ir_sequence = ir_generator.generate(integral_expression)
+    from pycutfem.jit.ir import strip_side_metadata
+    ir_sequence = strip_side_metadata(ir_sequence, on_facet=on_facet)
     
     kernel, param_order = cache.get_kernel(ir_sequence, codegen, mixed_element.signature())
     
@@ -1112,11 +1114,17 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     )
                     geom["is_ghost"] = True
                     geom["is_interface"] = False
-                    gdofs_map_raw = np.asarray(geom.get("gdofs_map", np.zeros((len(new_ids), n_loc), dtype=np.int32)), dtype=np.int32)
+                    gdofs_map_raw = np.asarray(
+                        geom.get("gdofs_map", np.zeros((len(new_ids), n_loc), dtype=np.int32)), dtype=np.int32
+                    )
                     ncols = gdofs_map_raw.shape[1] if gdofs_map_raw.ndim == 2 else 0
-                    eff_cols = active_cols[active_cols < ncols] if ncols else active_cols
-                    if eff_cols.size == 0 and ncols:
+                    use_full_union = bool(ncols and ncols != mixed_element.n_dofs_local)
+                    if use_full_union:
                         eff_cols = np.arange(ncols, dtype=np.int32)
+                    else:
+                        eff_cols = active_cols[active_cols < ncols] if ncols else active_cols
+                        if eff_cols.size == 0 and ncols:
+                            eff_cols = np.arange(ncols, dtype=np.int32)
                     gdofs_map = gdofs_map_raw[:, eff_cols] if gdofs_map_raw.size else gdofs_map_raw
                     geom["gdofs_map"] = gdofs_map
 
@@ -1133,7 +1141,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             pre_built=geom,
                         )
                     )
-                    static_new = _compress_static_for_active(static_new, mixed_element, eff_cols)
+                    if not use_full_union:
+                        static_new = _compress_static_for_active(static_new, mixed_element, eff_cols)
 
                 merged = _merge_static_arrays(all_eids, old_static, static_new)
                 merged["is_ghost"] = True

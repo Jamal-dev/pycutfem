@@ -13,6 +13,8 @@ from pycutfem.ufl.expressions import (
     Jump,
     Neg,
     Pos,
+    grad,
+    restrict,
     TestFunction,
     TrialFunction,
     VectorFunction,
@@ -198,6 +200,52 @@ def test_jump_zero_matches_reference(ghost_setup, backend):
     expected = 0.0
     val = assemble_jump_integral(dh, jump_expr, measure, backend)
     assert abs(val - expected) < 1e-12
+
+
+def test_ghost_grad_restricted_mixed_fields_parity():
+    mesh, level_set = build_mesh(nx=6, ny=3, poly_order=2)
+    ghost_neg = mesh.edge_bitset("ghost_neg") | mesh.edge_bitset("ghost_both")
+    if ghost_neg.cardinality() == 0:
+        pytest.skip("No negative-side ghost edges found for mixed-field restriction test.")
+
+    inside = mesh.element_bitset("inside")
+    cut = mesh.element_bitset("cut")
+    has_neg = inside | cut
+
+    me = MixedElement(mesh, field_specs={"u_pos": 2, "u_neg": 1})
+    dh = DofHandler(me, method="cg")
+
+    s0 = me.component_dof_slices["u_neg"].start
+    geo = dh.precompute_ghost_factors(
+        ghost_edge_ids=ghost_neg,
+        qdeg=4,
+        level_set=level_set,
+        derivs={(1, 0), (0, 1)},
+        reuse=False,
+    )
+    map_neg = np.asarray(geo["neg_map_u_neg"], dtype=int)
+    local = s0 + np.arange(map_neg.shape[1], dtype=int)
+    if not np.any(map_neg != local[None, :]):
+        pytest.skip("Ghost neg-map matches local ordering; test not sensitive to union indexing.")
+
+    u = TrialFunction(field_name="u_neg", name="u_trial", dof_handler=dh)
+    v = TestFunction(field_name="u_neg", name="v_test", dof_handler=dh)
+    u_k = Function(name="u_k", field_name="u_neg", dof_handler=dh)
+    u_k.set_values_from_function(lambda x, y: x + 0.25 * y)
+
+    u_R = restrict(Neg(u), has_neg)
+    v_R = restrict(Neg(v), has_neg)
+    u_k_R = restrict(Neg(u_k), has_neg)
+
+    dG = dGhost(
+        defined_on=ghost_neg,
+        level_set=level_set,
+        metadata={"q": 4, "derivs": {(1, 0), (0, 1)}},
+    )
+    a = Inner(grad(u_R), grad(v_R)) * dG
+    L = Inner(grad(u_k_R), grad(v_R)) * dG
+
+    assert_backends_agree(Equation(a, L), dh, tol=1e-9)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

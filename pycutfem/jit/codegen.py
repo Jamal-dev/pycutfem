@@ -265,6 +265,21 @@ class NumbaCodeGen:
         # Track names of Function/VectorFunction objects that provide coefficients
         solution_func_names = set()
         self._init_active_fields(ir_sequence)
+        if not self.on_facet:
+            def _strip_side(op):
+                if isinstance(op, LoadVariable):
+                    if op.side or getattr(op, "field_sides", None):
+                        return replace(op, side="", field_sides=None)
+                    return op
+                if isinstance(op, CheckDomain) and op.side:
+                    return replace(op, side="")
+                return op
+            if any(
+                (isinstance(op, LoadVariable) and (op.side or getattr(op, "field_sides", None)))
+                or (isinstance(op, CheckDomain) and op.side)
+                for op in ir_sequence
+            ):
+                ir_sequence = [_strip_side(op) for op in ir_sequence]
 
         def new_var(prefix="tmp"):
             nonlocal var_counter
@@ -298,7 +313,13 @@ class NumbaCodeGen:
                 a = stack.pop()
                 out = new_var("restricted")
 
-                flag_arr = f"domain_flag_{op.bitset_id}"
+                side = op.side or a.side
+                if side == "+":
+                    flag_arr = f"domain_flag_{op.bitset_id}_pos"
+                elif side == "-":
+                    flag_arr = f"domain_flag_{op.bitset_id}_neg"
+                else:
+                    flag_arr = f"domain_flag_{op.bitset_id}"
                 required_args.add(flag_arr)
 
                 body_lines.append(f"# Restriction via {flag_arr}")
@@ -307,6 +328,31 @@ class NumbaCodeGen:
                 else:
                     zero_expr = f"np.zeros_like({a.var_name}, dtype={self.dtype})"
                 body_lines.append(f"{out} = {a.var_name} if {flag_arr}[e, q] else {zero_expr}")
+
+                # Apply per-field restriction masks on facet integrals (ghost/interface)
+                if (
+                    self.on_facet
+                    and side in ("+", "-")
+                    and a.field_names
+                    and any(dim == -1 for dim in a.shape)
+                ):
+                    for i, fld in enumerate(a.field_names):
+                        side_tag = self._component_side_tag(
+                            side, getattr(a, "field_sides", None), fld, i
+                        )
+                        if side_tag not in ("pos", "neg"):
+                            side_tag = "pos" if side == "+" else "neg"
+                        mask_name = f"restrict_mask_{fld}_{side_tag}"
+                        required_args.add(mask_name)
+                        if len(a.shape) == 1:
+                            body_lines.append(f"for j in range(n_union): {out}[j] *= {mask_name}[e, j]")
+                            break
+                        if len(a.shape) == 2:
+                            body_lines.append(f"for j in range(n_union): {out}[{i}, j] *= {mask_name}[e, j]")
+                        elif len(a.shape) == 3:
+                            body_lines.append(f"for j in range(n_union): {out}[{i}, j, :] *= {mask_name}[e, j]")
+                        elif len(a.shape) == 4:
+                            body_lines.append(f"for j in range(n_union): {out}[{i}, j, :, :] *= {mask_name}[e, j]")
 
                 stack.append(a._replace(var_name=out))
             
@@ -916,6 +962,7 @@ class NumbaCodeGen:
                         coeff_sym = f"u_{op.name}{coeff_side}_loc"
                     required_args.add(coeff_sym)
                     solution_func_names.add(coeff_sym)
+                    apply_restrict_mask = isinstance(next_op, CheckDomain)
 
                     if _next_is_deriv():
                         # Push a lightweight placeholder – IRGrad/IRHessian/IRLaplacian
@@ -980,11 +1027,37 @@ class NumbaCodeGen:
                             body_lines.append(f"{val_var} = np.zeros(({len(field_names)},), dtype={self.dtype})")
                             for comp_idx, b_var in enumerate(basis_vars_at_q):
                                 comp_val = new_var("val_comp")
-                                body_lines.append(f"{comp_val} = load_variable_qp({coeff_sym}, {b_var})")
+                                if apply_restrict_mask and op.side in ("+", "-"):
+                                    fld_i = field_names[comp_idx]
+                                    side_tag = self._component_side_tag(
+                                        op.side, getattr(op, "field_sides", None), fld_i, comp_idx
+                                    )
+                                    if side_tag not in ("pos", "neg"):
+                                        side_tag = "pos" if op.side == "+" else "neg"
+                                    mask_sym = f"restrict_mask_{fld_i}_{side_tag}"
+                                    required_args.add(mask_sym)
+                                    coeff_masked = new_var("coeff_masked")
+                                    body_lines.append(f"{coeff_masked} = {coeff_sym} * {mask_sym}[e]")
+                                    body_lines.append(f"{comp_val} = load_variable_qp({coeff_masked}, {b_var})")
+                                else:
+                                    body_lines.append(f"{comp_val} = load_variable_qp({coeff_sym}, {b_var})")
                                 body_lines.append(f"{val_var}[{comp_idx}] = {comp_val}")
                             shape = (len(field_names),)
                         else:
-                            body_lines.append(f"{val_var} = load_variable_qp({coeff_sym}, {basis_vars_at_q[0]})")
+                            if apply_restrict_mask and op.side in ("+", "-"):
+                                fld_i = field_names[0]
+                                side_tag = self._component_side_tag(
+                                    op.side, getattr(op, "field_sides", None), fld_i, 0
+                                )
+                                if side_tag not in ("pos", "neg"):
+                                    side_tag = "pos" if op.side == "+" else "neg"
+                                mask_sym = f"restrict_mask_{fld_i}_{side_tag}"
+                                required_args.add(mask_sym)
+                                coeff_masked = new_var("coeff_masked")
+                                body_lines.append(f"{coeff_masked} = {coeff_sym} * {mask_sym}[e]")
+                                body_lines.append(f"{val_var} = load_variable_qp({coeff_masked}, {basis_vars_at_q[0]})")
+                            else:
+                                body_lines.append(f"{val_var} = load_variable_qp({coeff_sym}, {basis_vars_at_q[0]})")
                             shape = ()
                     else:
                         # We need D^{(ox,oy)}u_h. Build per-component derivative rows,
@@ -1456,6 +1529,7 @@ class NumbaCodeGen:
                     required_args.add(coeff)
 
                     comps = []
+                    apply_restrict_mask = isinstance(next_op, CheckDomain)
                     for i, fld in enumerate(a.field_names):
 
                         val = new_var("grad_val")
@@ -1472,6 +1546,10 @@ class NumbaCodeGen:
 
                             map_sym = f"{side_tag}_map_{fld}"
                             required_args.add(map_sym)
+                            mask_sym = None
+                            if apply_restrict_mask and side_tag in ("pos", "neg"):
+                                mask_sym = f"restrict_mask_{fld}_{side_tag}"
+                                required_args.add(mask_sym)
 
                             coeff_e = coeff if coeff.endswith("_e") else f"{coeff}"
 
@@ -1479,6 +1557,8 @@ class NumbaCodeGen:
                             phys   = new_var("g_phys2")       # (n_loc,2) in (x,y)
                             phys_s = new_var("g_phys2_s")     # (n_comp_loc,2)
                             u_sl   = new_var("u_side")        # (n_comp_loc,)
+                            coeff_masked = new_var("coeff_masked")
+                            mask_sl = new_var("mask_sl")
 
                             body_lines += [
                                 f"d10_q = {d10}[e, q]",
@@ -1486,10 +1566,21 @@ class NumbaCodeGen:
                                 f"{g2}   = np.stack((d10_q, d01_q), axis=1)",
                                 f"{phys} = np.ascontiguousarray({g2}) @ np.ascontiguousarray({jinv_q}.copy())",
                                 f"if {phys}.shape[0] == {coeff_e}.shape[0]:",
-                                f"    {val} = gradient_qp({coeff_e}, {phys})",
+                                (
+                                    f"    {coeff_masked} = {coeff_e} * {mask_sym}[e]"
+                                    if mask_sym is not None
+                                    else f"    {coeff_masked} = {coeff_e}"
+                                ),
+                                f"    {val} = gradient_qp({coeff_masked}, {phys})",
                                 f"else:",
                                 f"    {phys_s} = {phys}[{s0}:{s1}, :]",           # local vs local
                                 f"    {u_sl}   = {coeff_e}[{map_sym}[e]]",
+                                (
+                                    f"    {mask_sl} = {mask_sym}[e][{map_sym}[e]]"
+                                    if mask_sym is not None
+                                    else f"    {mask_sl} = 1.0"
+                                ),
+                                f"    {u_sl}   = {u_sl} * {mask_sl}",
                                 f"    {val}    = gradient_qp({u_sl}, {phys_s})",
                             ]
 

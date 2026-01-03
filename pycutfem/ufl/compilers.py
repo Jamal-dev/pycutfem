@@ -241,6 +241,10 @@ class FormCompiler:
 
     # ============================ PUBLIC API ===============================
     def assemble(self, eq: Equation, bcs: Union[Mapping, Iterable, None] = None):
+        # Coefficients may change between assembly calls (e.g., FD checks); reset caches.
+        self._basis_cache.clear()
+        self._coeff_cache.clear()
+        self._collapsed_cache.clear()
         ndofs = self.dh.total_dofs
         K = sp.lil_matrix((ndofs, ndofs))
         F = np.zeros(ndofs)
@@ -582,7 +586,22 @@ class FormCompiler:
         if value is None:
             return 0.0
 
-        side = self._get_side()
+        def _resolve_side():
+            # Prefer the side captured on the evaluated value; fall back to node hints.
+            s = getattr(value, "side", None)
+            if s in ("+", "-"):
+                return s
+            op = getattr(node, "operand", None)
+            if isinstance(op, Pos):
+                return "+"
+            if isinstance(op, Neg):
+                return "-"
+            side_attr = getattr(op, "side", None)
+            if side_attr in ("+", "-"):
+                return side_attr
+            return self._get_side()
+
+        side = _resolve_side()
         restriction_store = self.ctx.get('_restriction_masks')
 
         def _mask_array(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -1385,9 +1404,53 @@ class FormCompiler:
 
         k_blocks = []
         if role == "function":
-            # collapse once per component and cache
+            # collapse once per component and cache (unless restriction masks need DOF layout)
             local_dofs = self._local_dofs()
-            
+            mask_active = bool(self.ctx.get("_restriction_mask_active", 0))
+
+            if mask_active:
+                grad_blocks = []
+                coeff_blocks = []
+                for i, fld in enumerate(fields):
+                    g = self._g(fld)  # (n,2)
+                    # coefficients padded once per component
+                    key_c = (id(op), i, tuple(local_dofs))
+                    coeffs = self._coeff_cache.get(key_c)
+                    if coeffs is None:
+                        if hasattr(op, "components"):
+                            coeffs = op.components[i].padded_values(local_dofs)
+                        else:
+                            coeffs = op.padded_values(local_dofs)
+                        self._coeff_cache[key_c] = coeffs
+                    coeffs_use = coeffs
+                    if self.ctx.get("global_dofs") is not None:
+                        side = self._get_side()
+                        coeffs_use = _hac._pad_coeffs_to_global(self.ctx, side, fld, coeffs)
+                        mask_dict = self.ctx.get("pos_union_mask_by_field" if side == "+" else "neg_union_mask_by_field")
+                        if isinstance(mask_dict, dict):
+                            mask = mask_dict.get(fld)
+                            if mask is not None:
+                                coeffs_use = coeffs_use * np.asarray(mask, dtype=coeffs_use.dtype)
+                        if self.ctx.get("is_ghost", False):
+                            if side == "+":
+                                gmask = self.ctx.get("coeff_mask_pos_global")
+                            elif side == "-":
+                                gmask = self.ctx.get("coeff_mask_neg_global")
+                            else:
+                                gmask = None
+                            if gmask is not None:
+                                mask_arr = np.asarray(gmask, dtype=coeffs_use.dtype)
+                                coeffs_use = coeffs_use * mask_arr
+                    grad_blocks.append(g)
+                    coeff_blocks.append(coeffs_use)
+                return self._gradinfo(
+                    np.stack(grad_blocks),
+                    role=role,
+                    node=op,
+                    field_names=fields,
+                    coeffs=np.stack(coeff_blocks),
+                )
+
             for i, fld in enumerate(fields):
                 key_coll = (id(op), "grad", i, self.ctx.get("eid"), self.ctx.get("side"), self.ctx.get("phi_val"))
                 gval = self._collapsed_cache.get(key_coll)
@@ -3757,8 +3820,10 @@ class FormCompiler:
 
         active_fields = _active_field_order(ir, me)
         active_cols   = _active_columns(me, active_fields)
-        kernel_args   = _compress_static_for_active(kernel_args, me, active_cols)
-        geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+        use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me.n_dofs_local)
+        if not use_full_union:
+            kernel_args = _compress_static_for_active(kernel_args, me, active_cols)
+            geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
 
         if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
             kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
@@ -3933,8 +3998,10 @@ class FormCompiler:
 
         active_fields = _active_field_order(ir, me)
         active_cols   = _active_columns(me, active_fields)
-        kernel_args   = _compress_static_for_active(kernel_args, me, active_cols)
-        geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+        use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me.n_dofs_local)
+        if not use_full_union:
+            kernel_args = _compress_static_for_active(kernel_args, me, active_cols)
+            geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
 
         # ---- baseline statics some kernels always expect ----
         if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
@@ -4581,17 +4648,21 @@ class FormCompiler:
         # --- compile kernel once
         runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
-        # Active DOF subset for this kernel
+        # Active DOF subset for this kernel (must match the compiled runner layout)
         active_fields = _active_field_order(ir, me)
-        _param_fields: list[str] = []
-        for name in getattr(runner, "param_order", []):
-            has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
-            if name.startswith(("b_", "g_")) or has_deriv:
-                fld = name.split("_", 1)[1] if "_" in name else name
-                if fld in getattr(me, "field_names", ()):
-                    _param_fields.append(fld)
-        if _param_fields:
-            active_fields = tuple(dict.fromkeys(_param_fields))
+        runner_active = getattr(runner, "active_fields", None)
+        if runner_active:
+            active_fields = tuple(runner_active)
+        else:
+            _param_fields: list[str] = []
+            for name in getattr(runner, "param_order", []):
+                has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
+                if name.startswith(("b_", "g_")) or has_deriv:
+                    fld = name.split("_", 1)[1] if "_" in name else name
+                    if fld in getattr(me, "field_names", ()):
+                        _param_fields.append(fld)
+            if _param_fields:
+                active_fields = tuple(dict.fromkeys(_param_fields))
         active_cols = _active_columns(me, active_fields)
         if os.getenv("PYCUTFEM_JIT_DEBUG_ACTIVE", "").lower() in {"1", "true", "yes"}:
             print(f"[jit-cut] active_fields={active_fields}, n_cols={len(active_cols)}")

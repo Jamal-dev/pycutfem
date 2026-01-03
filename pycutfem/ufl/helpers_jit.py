@@ -600,8 +600,14 @@ def _build_jit_kernel_args(       # ← signature unchanged
             f"or len(eids)={0 if eids is None else int(eids.shape[0])}."
         )
 
-    _re_flag = re.compile(r"^domain_flag_(.+)$")
-    requested_flags = {m.group(1) for m in (_re_flag.match(n) for n in required) if m}
+    _re_flag = re.compile(r"^domain_flag_(.+?)(?:_(pos|neg))?$")
+    requested_flags: dict[str, set[str]] = {}
+    for name in required:
+        m = _re_flag.match(name)
+        if not m:
+            continue
+        token, side = m.group(1), m.group(2) or ""
+        requested_flags.setdefault(token, set()).add(side)
     requested_bs = {n.split("domain_bs_", 1)[1] for n in required if n.startswith("domain_bs_")}
 
     all_bitsets_in_form = _find_all_bitsets(expression)
@@ -621,22 +627,35 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if need_bs:
             args[pname] = mask_full
         if need_flag:
-            owners = args.get("owner_id")
-            if owners is None:
-                owners = args.get("eids")
-            if owners is None:
-                owners = np.arange(mask_full.shape[0], dtype=np.int32)
-            owners = np.asarray(owners, dtype=np.int32)
-            flag = mask_full[owners] if mask_full.ndim else np.full(owners.shape, bool(mask_full), dtype=np.bool_)
-            n_q = 1
-            qw_arr = args.get("qw", None)
-            if isinstance(qw_arr, np.ndarray) and qw_arr.ndim >= 2:
-                n_q = qw_arr.shape[1]
-            if flag.ndim == 1:
-                flag = flag.reshape(flag.shape[0], 1)
-            if n_q > flag.shape[1]:
-                flag = np.broadcast_to(flag, (flag.shape[0], n_q)).copy()
-            args[f"domain_flag_{token}"] = flag
+            for side in sorted(requested_flags.get(token, {""})):
+                if side == "pos":
+                    owners = _first_present(args, "owner_pos_id", "pos_eids", "owner_id", "eids")
+                elif side == "neg":
+                    owners = _first_present(args, "owner_neg_id", "neg_eids", "owner_id", "eids")
+                else:
+                    owners = args.get("owner_id")
+                    if owners is None:
+                        owners = args.get("eids")
+                if owners is None:
+                    owners = np.arange(mask_full.shape[0], dtype=np.int32)
+                owners = np.asarray(owners, dtype=np.int32)
+                if mask_full.ndim:
+                    flag = np.zeros(owners.shape, dtype=np.bool_)
+                    valid = owners >= 0
+                    if np.any(valid):
+                        flag[valid] = mask_full[owners[valid]]
+                else:
+                    flag = np.full(owners.shape, bool(mask_full), dtype=np.bool_)
+                n_q = 1
+                qw_arr = args.get("qw", None)
+                if isinstance(qw_arr, np.ndarray) and qw_arr.ndim >= 2:
+                    n_q = qw_arr.shape[1]
+                if flag.ndim == 1:
+                    flag = flag.reshape(flag.shape[0], 1)
+                if n_q > flag.shape[1]:
+                    flag = np.broadcast_to(flag, (flag.shape[0], n_q)).copy()
+                suffix = f"_{side}" if side else ""
+                args[f"domain_flag_{token}{suffix}"] = flag
 
     # ------------------------------------------------------------------
     # 5. Constants / EWC / coefficient vectors / reference tables

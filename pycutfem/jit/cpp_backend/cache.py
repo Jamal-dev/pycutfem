@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Tuple
 from pycutfem.jit.cache import KernelCache
 from .compiler import compile_extension
 
-CODEGEN_ABI_CPP = "2025-03-05-cpp-active-order"
+CODEGEN_ABI_CPP = "2025-03-13-cpp-inner-scalar-row"
 
 
 class CppKernelCache:
@@ -51,12 +51,21 @@ class CppKernelCache:
         source_file = self._CACHE_DIR / f"{module_name}.cpp"
         built_module = self._CACHE_DIR / f"{module_name}{self._ext_suffix}"
 
-        # Generate source if needed.
-        if not source_file.exists():
+        # Generate source if needed (or if stale ABI is detected).
+        regenerate = True
+        if source_file.exists():
+            try:
+                text = source_file.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            regenerate = f'CODEGEN_ABI") = "{CODEGEN_ABI_CPP}"' not in text
+
+        if regenerate:
             src, _, param_order = codegen.generate_source(
                 ir_sequence, "kernel", module_name=module_name
             )
             source_file.write_text(src, encoding="utf-8")
+            built_module.unlink(missing_ok=True)
         else:
             param_order = None
 

@@ -1,5 +1,5 @@
 # pycutfem/jit/ir.py
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Union, Tuple, Callable, Any, Optional, List
 
 # --- IR Node Definitions ---
@@ -108,6 +108,29 @@ class LoadFacetNormalComponent:
 class CheckDomain:
     """Instruction to check if the current element is in a domain BitSet."""
     bitset_id: str
+    side: str = ""
+
+
+def strip_side_metadata(ir_sequence: list, *, on_facet: bool) -> list:
+    """
+    Remove side/field_sides annotations for volume kernels.
+    This keeps Pos/Neg gating intact while preventing sided tables/args
+    from being requested outside facet integrals.
+    """
+    if on_facet:
+        return ir_sequence
+    out = []
+    for op in ir_sequence:
+        if isinstance(op, LoadVariable):
+            if op.side or getattr(op, "field_sides", None):
+                out.append(replace(op, side="", field_sides=None))
+            else:
+                out.append(op)
+        elif isinstance(op, CheckDomain) and op.side:
+            out.append(replace(op, side=""))
+        else:
+            out.append(op)
+    return out
 
 @dataclass(frozen=True, slots=True)
 class Trace:

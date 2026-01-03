@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Iterable, Tuple
+from dataclasses import replace
 
 from matplotlib.pylab import f
 
@@ -68,6 +69,24 @@ class CppCodeGen:
         """
         Produce C++ source, the analytic function map, and parameter order.
         """
+        if not self.on_facet:
+            from pycutfem.jit.ir import LoadVariable, CheckDomain
+
+            def _strip_side(op):
+                if isinstance(op, LoadVariable):
+                    if op.side or getattr(op, "field_sides", None):
+                        return replace(op, side="", field_sides=None)
+                    return op
+                if isinstance(op, CheckDomain) and op.side:
+                    return replace(op, side="")
+                return op
+
+            if any(
+                (isinstance(op, LoadVariable) and (op.side or getattr(op, "field_sides", None)))
+                or (isinstance(op, CheckDomain) and op.side)
+                for op in ir_sequence
+            ):
+                ir_sequence = [_strip_side(op) for op in ir_sequence]
         analytic_map: dict[str, Any] = {}
         param_order: list[str] = []
         required_args: set[str] = set()
@@ -98,6 +117,14 @@ class CppCodeGen:
             Trace,
         )
 
+        def coeff_array_name(base: str, side: str) -> str:
+            """Match Numba's u_<name>__pos/_neg_loc convention for sided coeffs."""
+            suffix = "__pos" if side == "+" else "__neg" if side == "-" else ""
+            if base.startswith("u_") and base.endswith("_loc"):
+                core = base[:-4]
+                return f"{core}{suffix}_loc"
+            return f"u_{base}{suffix}_loc"
+
         if self._mirror is not None:
             try:
                 _, analytic_map, param_order = self._mirror.generate_source(
@@ -118,7 +145,7 @@ class CppCodeGen:
                             else:
                                 needs_g.add(f"g_{fn}")
                         if op.role == "function":
-                            needs_u.add(f"u_{op.name}_loc")
+                            needs_u.add(coeff_array_name(op.name, op.side))
                 param_order = [
                     "gdofs_map",
                     "node_coords",
@@ -150,7 +177,7 @@ class CppCodeGen:
                         tag = "pos" if op.side == "+" else "neg"
                         needs_r00.add(f"r00_{fn}_{tag}")
                 if op.role == "function":
-                    needs_u.add(f"u_{op.name}_loc")
+                    needs_u.add(coeff_array_name(op.name, op.side))
                 if sum(op.deriv_order) >= 2:
                     needs_hx = True
                     for fn in op.field_names or []:
@@ -399,11 +426,12 @@ class CppCodeGen:
             return resolved["field_names"], resolved["parent"], resolved["side"], resolved["field_sides"]
 
         def component_side_tag(side: str, field_sides: list, field_name, idx: int) -> str:
-            if not side:
-                return ""
+            # Match python codegen: explicit side from Jump/Pos/Neg wins.
+            if side in ("+", "-"):
+                return "pos" if side == "+" else "neg"
             if field_sides and idx < len(field_sides) and field_sides[idx]:
                 return field_sides[idx]
-            return "pos" if side == "+" else "neg"
+            return ""
 
         def deriv_name(base: str, fn: str, side: str, field_sides: list, idx: int) -> str:
             if not side:
@@ -487,6 +515,8 @@ class CppCodeGen:
             if name in {"Hxi0", "Hxi1", "pos_Hxi0", "pos_Hxi1", "neg_Hxi0", "neg_Hxi1"}:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
             if name.startswith(("pos_map", "neg_map")):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+            if name.startswith("restrict_mask_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
             if name in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<1>();")
@@ -603,7 +633,13 @@ class CppCodeGen:
                 stack.append(StackItem(nm, "scalar", "const", ()))
             elif isinstance(op, CheckDomain):
                 a = stack.pop()
-                flag = f"domain_flag_{op.bitset_id}"
+                side = op.side or a.side
+                if side == "+":
+                    flag = f"domain_flag_{op.bitset_id}_pos"
+                elif side == "-":
+                    flag = f"domain_flag_{op.bitset_id}_neg"
+                else:
+                    flag = f"domain_flag_{op.bitset_id}"
                 required_args.add(flag)
                 nm = new_tmp("restricted")
                 if a.kind == "scalar" and (a.shape == () or a.shape == tuple()):
@@ -619,6 +655,27 @@ class CppCodeGen:
                 else:
                     emit_line(f"auto {nm} = {a.name};")
                     emit_line(f"if (!{flag}_view(e,q)) {nm}.setZero();")
+
+                # Apply per-field restriction masks on facet integrals (ghost/interface)
+                if (
+                    self.on_facet
+                    and side in ("+", "-")
+                    and a.field_names
+                    and any(dim == -1 for dim in a.shape)
+                ):
+                    for idx, fld in enumerate(a.field_names):
+                        side_tag = component_side_tag(side, a.field_sides or [], fld, idx)
+                        if side_tag not in ("pos", "neg"):
+                            side_tag = "pos" if side == "+" else "neg"
+                        mask = f"restrict_mask_{fld}_{side_tag}"
+                        required_args.add(mask)
+                        if a.kind == "mat":
+                            emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx}, j) *= {mask}_view(e, j);")
+                        elif a.kind in {"grad", "mixed", "hess"}:
+                            emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
+                            emit_line(f"    double w = {mask}_view(e, j);")
+                            emit_line(f"    for (ssize_t d=0; d<{nm}[{idx}].cols(); ++d) {nm}[{idx}](j, d) *= w;")
+                            emit_line("}")
                 stack.append(StackItem(nm, a.kind, a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
             elif isinstance(op, LoadAnalytic):
                 name = f"ana_{op.func_id}"
@@ -643,8 +700,9 @@ class CppCodeGen:
                 # Functions / coefficients: treat like "value" (gather with basis)
                 # ------------------------------------------------------------------
                 if op.role == "function" and op.deriv_order == (0, 0):
-                    coeff_name = f"u_{op.name}_loc"
+                    coeff_name = coeff_array_name(op.name, op.side)
                     required_args.add(coeff_name)
+                    apply_restrict_mask = isinstance(next_op, CheckDomain)
                     k = len(op.field_names)
                     nm = new_tmp("val")
                     emit_line(f"Eigen::VectorXd {nm}({k});")
@@ -657,6 +715,10 @@ class CppCodeGen:
                             basis_name = f"r00_{fn}_{side_tag}"
                             map_name   = f"{side_tag}_map_{fn}"
                             required_args.update({basis_name, map_name})
+                            mask_name = None
+                            if apply_restrict_mask:
+                                mask_name = f"restrict_mask_{fn}_{side_tag}"
+                                required_args.add(mask_name)
                             emit_line(f"{nm}({idx}) = 0.0;")
                             map_len = new_tmp("map_len"); basis_len = new_tmp("basis_len")
                             emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
@@ -664,9 +726,14 @@ class CppCodeGen:
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(
+                                f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                            )
                             emit_line(f"    if (src >= {basis_len}) continue;")
-                            emit_line(f"    {nm}({idx}) += {coeff_name}_view(e, col) * {basis_name}_view(e, q, src);")
+                            emit_line(f"    double coeff = {coeff_name}_view(e, col);")
+                            if mask_name is not None:
+                                emit_line(f"    coeff *= {mask_name}_view(e, col);")
+                            emit_line(f"    {nm}({idx}) += coeff * {basis_name}_view(e, q, src);")
                             emit_line("}")
                         else:
                             s0_adj = new_tmp("s0"); s1_adj = new_tmp("s1")
@@ -705,7 +772,9 @@ class CppCodeGen:
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(
+                                f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                            )
                             emit_line(f"    if (src >= {basis_len}) continue;")
                             emit_line(f"    {nm}({idx2}, col) = {basis_name}_view(e, q, src);")
                             emit_line("}")
@@ -724,6 +793,7 @@ class CppCodeGen:
                     comp = 0 if op.deriv_order == (1, 0) else 1
                     jloc_var = "Jloc_pos" if op.side == "+" else "Jloc_neg" if op.side == "-" else "Jloc"
                     for idx2, fn in enumerate(op.field_names):
+                        s0 = field_slices.get(fn, slice(0, 0)).start
                         side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx2)
                         bool_sided = self.on_facet and side_tag in ("pos", "neg")
                         if bool_sided:
@@ -738,7 +808,9 @@ class CppCodeGen:
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(
+                                f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                            )
                             emit_line(f"    if (src >= {basis_len}) continue;")
                             emit_line(f"    double gr0 = {d10}_view(e,q,src); double gr1 = {d01}_view(e,q,src);")
                             emit_line(f"    double px = gr0*{jloc_var}(0,0) + gr1*{jloc_var}(1,0);")
@@ -776,7 +848,9 @@ class CppCodeGen:
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(
+                                f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                            )
                             emit_line(f"    if (src >= {basis_len}) continue;")
                             emit_line(f"    {nm}({idx2}, col) = {table_name}_view(e, q, src);")
                             emit_line("}")
@@ -784,8 +858,9 @@ class CppCodeGen:
                         emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx2}, j) = {table_name}_view(e, q, j);")
                     stack.append(StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides))
                 elif op.role == "function":
-                    # coeffs are pre-gathered u_<name>_loc[e, :]
-                    coeff_name = f"u_{op.name}_loc"
+                    # coeffs are pre-gathered u_<name>__pos/_neg_loc[e, :] when sided
+                    coeff_name = coeff_array_name(op.name, op.side)
+                    required_args.add(coeff_name)
                     # If a differential operator follows, defer evaluation and use coefficients directly.
                     if followed_by_diff:
                         stack.append(
@@ -813,7 +888,9 @@ class CppCodeGen:
                                 emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                                 emit_line(f"    int col = {map_name}_view(e, j);")
                                 emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                                emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                                emit_line(
+                                    f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                                )
                                 emit_line(f"    if (src >= {basis_len}) continue;")
                                 emit_line(f"    {nm}({idx}) += {coeff_name}_view(e, col) * {basis_name}_view(e, q, src);")
                                 emit_line("}")
@@ -856,7 +933,9 @@ class CppCodeGen:
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(
+                                f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                            )
                             emit_line(f"    if (src >= {basis_len}) continue;")
                             emit_line(f"    double gx = {d10}_view(e,q,src); double gy = {d01}_view(e,q,src);")
                             emit_line(f"    double px = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
@@ -880,6 +959,9 @@ class CppCodeGen:
                     k = len(a.field_names)
                     nm = new_tmp("gval")
                     emit_line(f"Eigen::MatrixXd {nm}({k}, 2);")
+                    apply_restrict_mask = isinstance(next_op, CheckDomain)
+                    coeff_name = coeff_array_name(a.parent, a.side)
+                    required_args.add(coeff_name)
                     for idx, fn in enumerate(a.field_names):
                         s0 = field_slices.get(fn, slice(0, 0)).start
                         s1 = field_slices.get(fn, slice(0, 0)).stop
@@ -889,6 +971,10 @@ class CppCodeGen:
                             d10 = f"r10_{fn}_{side_tag}"
                             d01 = f"r01_{fn}_{side_tag}"
                             map_name = f"{side_tag}_map_{fn}"
+                            mask_name = None
+                            if apply_restrict_mask:
+                                mask_name = f"restrict_mask_{fn}_{side_tag}"
+                                required_args.add(mask_name)
                             gx_var = new_tmp("gx"); gy_var = new_tmp("gy")
                             emit_line(f"double {gx_var} = 0.0, {gy_var} = 0.0;")
                             map_len = new_tmp("map_len")
@@ -898,12 +984,16 @@ class CppCodeGen:
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(f"    ssize_t src = ({basis_len} == {map_len}) ? j : col;")
+                            emit_line(
+                                f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                            )
                             emit_line(f"    if (src >= {basis_len}) continue;")
                             emit_line(f"    double gr0 = {d10}_view(e,q,src); double gr1 = {d01}_view(e,q,src);")
                             emit_line(f"    double px = gr0*{jloc_var}(0,0) + gr1*{jloc_var}(1,0);")
                             emit_line(f"    double py = gr0*{jloc_var}(0,1) + gr1*{jloc_var}(1,1);")
-                            emit_line(f"    double coeff = u_{a.parent}_loc_view(e, col);")
+                            emit_line(f"    double coeff = {coeff_name}_view(e, col);")
+                            if mask_name is not None:
+                                emit_line(f"    coeff *= {mask_name}_view(e, col);")
                             emit_line(f"    {gx_var} += coeff * px; {gy_var} += coeff * py;")
                             emit_line("}")
                             emit_line(f"{nm}({idx},0) = {gx_var}; {nm}({idx},1) = {gy_var};")
@@ -914,7 +1004,7 @@ class CppCodeGen:
                             emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
                             emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
                             emit_line(
-                                f"gradient_component({nm}, {idx}, u_{a.parent}_loc_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
+                                f"gradient_component({nm}, {idx}, {coeff_name}_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
                             )
                     stack.append(StackItem(nm, "mat", "value", (k, 2), a.field_names, a.parent, a.side, a.field_sides))
                 else:
@@ -954,7 +1044,8 @@ class CppCodeGen:
                     nm = new_tmp("hessv")
                     emit_line(f"Eigen::MatrixXd {nm}({k}, 4);")
                     emit_line(f"{nm}.setZero();")
-                    coeff = f"u_{a.parent}_loc"
+                    coeff = coeff_array_name(a.parent, a.side)
+                    required_args.add(coeff)
                     for idx, fn in enumerate(a.field_names):
                         s0 = field_slices.get(fn, slice(0, 0)).start
                         s1 = field_slices.get(fn, slice(0, 0)).stop
@@ -1020,7 +1111,8 @@ class CppCodeGen:
                     nm = new_tmp("lapv")
                     emit_line(f"Eigen::VectorXd {nm}({k});")
                     emit_line(f"{nm}.setZero();")
-                    coeff = f"u_{a.parent}_loc"
+                    coeff = coeff_array_name(a.parent, a.side)
+                    required_args.add(coeff)
                     for idx, fn in enumerate(a.field_names):
                         s0 = field_slices.get(fn, slice(0, 0)).start
                         s1 = field_slices.get(fn, slice(0, 0)).stop
@@ -1921,6 +2013,18 @@ class CppCodeGen:
                         push_inner("vec", "test", (a.shape[1] if len(a.shape)>1 else -1,))
                     else:
                         raise NotImplementedError(f"inner(grad, grad) unsupported for roles {a.role}/{b.role}")
+                elif a.kind == "scalar" and b.kind == "mat" and len(b.shape) >= 2 and b.shape[0] == 1:
+                    # Scalar * (1 x n) basis/value row: return (n,) vector.
+                    emit_line(f"Eigen::VectorXd {nm} = {b.name}.row(0).transpose() * {a.name};")
+                    out_len = b.shape[1] if len(b.shape) > 1 else -1
+                    out_role = b.role if b.role in {"test", "trial"} else "value"
+                    push_inner("vec", out_role, (out_len,))
+                elif b.kind == "scalar" and a.kind == "mat" and len(a.shape) >= 2 and a.shape[0] == 1:
+                    # (1 x n) basis/value row * scalar: return (n,) vector.
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() * {b.name};")
+                    out_len = a.shape[1] if len(a.shape) > 1 else -1
+                    out_role = a.role if a.role in {"test", "trial"} else "value"
+                    push_inner("vec", out_role, (out_len,))
                 elif a.kind == "mat" and b.kind == "mat":
                     if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
                         test_var = a.name if a.role == "test" else b.name

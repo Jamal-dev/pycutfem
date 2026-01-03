@@ -950,7 +950,9 @@ class GradOpInfo(BaseOpInfo):
 
     def _with(self, data: np.ndarray, role: str | None = None, coeffs: np.ndarray | None = None) -> "GradOpInfo":
         return GradOpInfo(
-            np.asarray(data), role=(role or self.role), coeffs=coeffs or self.coeffs,
+            np.asarray(data),
+            role=(role or self.role),
+            coeffs=self.coeffs if coeffs is None else coeffs,
             field_names=self.field_names, parent_name=self.parent_name,
             side=self.side, field_sides=self.field_sides, is_rhs=self.is_rhs
         )

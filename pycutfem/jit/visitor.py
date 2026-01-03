@@ -62,6 +62,20 @@ class IRGenerator:
 
         return self.ir_sequence
 
+    def _emit_restriction(self, domain, side: str, operand: Expression) -> None:
+        """Append a CheckDomain op, inferring side from Pos/Neg when needed."""
+        token = getattr(domain, "cache_token", None)
+        if token is None:
+            raw = getattr(domain, "array", domain)
+            token = bitset_cache_token(raw)
+        dom_side = side
+        if dom_side not in ("+", "-"):
+            if isinstance(operand, Pos):
+                dom_side = "+"
+            elif isinstance(operand, Neg):
+                dom_side = "-"
+        self.ir_sequence.append(CheckDomain(bitset_id=token, side=dom_side))
+
     def _visit(self, node: Expression, side: str = ""):
         """
         Recursive post-order traversal to generate IR. The `side` parameter
@@ -97,12 +111,7 @@ class IRGenerator:
             self._visit(node.operand, side=side)
             # Then, add the instruction to check the domain tag.
             # The code generator will use this to conditionally zero the result.
-            dom = node.domain
-            token = getattr(dom, "cache_token", None)
-            if token is None:
-                raw = getattr(dom, "array", dom)
-                token = bitset_cache_token(raw)
-            self.ir_sequence.append(CheckDomain(bitset_id=token))
+            self._emit_restriction(node.domain, side, node.operand)
             return
         if isinstance(node, UFLTrace):
             # First, visit the operand of the trace. This will execute all
@@ -153,6 +162,11 @@ class IRGenerator:
                 self._visit(UflGrad(op.u_neg), side='-')
                 self.ir_sequence.append(BinaryOp(op_symbol='-'))
                 return
+            if isinstance(op, Restriction):
+                # grad(restrict(u)) -> restrict(grad(u))
+                self._visit(UflGrad(op.operand), side=side)
+                self._emit_restriction(op.domain, side, op.operand)
+                return
             self._visit(op, side=side)
             self.ir_sequence.append(Grad())
             return
@@ -164,6 +178,10 @@ class IRGenerator:
                 self._visit(UFLHessian(op.u_neg), side="-")
                 self.ir_sequence.append(BinaryOp(op_symbol='-'))
                 return
+            if isinstance(op, Restriction):
+                self._visit(UFLHessian(op.operand), side=side)
+                self._emit_restriction(op.domain, side, op.operand)
+                return
             self._visit(op, side=side)
             self.ir_sequence.append(IRHessian())
             return
@@ -174,6 +192,10 @@ class IRGenerator:
                 self._visit(UFLLaplacian(op.u_pos), side="+")
                 self._visit(UFLLaplacian(op.u_neg), side="-")
                 self.ir_sequence.append(BinaryOp(op_symbol='-'))
+                return
+            if isinstance(op, Restriction):
+                self._visit(UFLLaplacian(op.operand), side=side)
+                self._emit_restriction(op.domain, side, op.operand)
                 return
             self._visit(op, side=side)
             self.ir_sequence.append(IRLaplacian())
@@ -188,6 +210,10 @@ class IRGenerator:
                 self._visit(DivOperation(op.u_neg), side='-')
                 self.ir_sequence.append(BinaryOp(op_symbol='-'))
                 return
+            if isinstance(op, Restriction):
+                self._visit(DivOperation(op.operand), side=side)
+                self._emit_restriction(op.domain, side, op.operand)
+                return
             self._visit(node.operand, side=side)
             self.ir_sequence.append(Grad()) 
             self.ir_sequence.append(Div())
@@ -195,9 +221,12 @@ class IRGenerator:
         
         if isinstance(node, Derivative):
             operand = node.f
-            while isinstance(operand, Restriction):
-                operand = operand.operand
             deriv_order = node.order
+
+            if isinstance(operand, Restriction):
+                self._visit(Derivative(operand.operand, *deriv_order), side=side)
+                self._emit_restriction(operand.domain, side, operand.operand)
+                return
 
             if isinstance(operand, Pos):
                 self._visit(Derivative(operand.operand, *deriv_order), side='+')
@@ -226,11 +255,16 @@ class IRGenerator:
             field_names = getattr(operand, 'field_names', None) or [getattr(operand, 'field_name')]
             name = getattr(getattr(operand, 'space', operand), 'name', 'anon')
 
+            side_hint = side
+            if side_hint not in ("+", "-"):
+                node_side = getattr(operand, "side", "")
+                if node_side in ("+", "-"):
+                    side_hint = node_side
 
             self.ir_sequence.append(
                 LoadVariable(name=name, role=role, is_vector=is_vec,
                              deriv_order=deriv_order, field_names=field_names,
-                             side=side,
+                             side=side_hint,
                              field_sides=getattr(operand, "field_sides", None))
             )
             return
@@ -245,7 +279,12 @@ class IRGenerator:
             field_names = getattr(node, 'field_names', None) or [getattr(node, 'field_name')]
             name = getattr(getattr(node, 'space', node), 'name', 'anon')
             field_sides = getattr(node, "field_sides", None)
-            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=field_names, side=side, field_sides=field_sides))
+            side_hint = side
+            if side_hint not in ("+", "-"):
+                node_side = getattr(node, "side", "")
+                if node_side in ("+", "-"):
+                    side_hint = node_side
+            self.ir_sequence.append(LoadVariable(name=name, role=role, is_vector=is_vec, field_names=field_names, side=side_hint, field_sides=field_sides))
             return
             
         if isinstance(node, Constant):

@@ -17,6 +17,12 @@ Example:
   PENALTY_VAL=1e-3 PENALTY_GRAD=1e-3 PYCUTFEM_JIT_BACKEND=cpp FD_BACKEND=python \
     conda run --no-capture-output -n fenicsx python -u examples/turek_fsi_fully_eulerian.py \
     --no-refine-initial
+  PENALTY_VAL=1e-3 PENALTY_GRAD=1e-3 PYCUTFEM_JIT_BACKEND=cpp \
+    ALLOW_DT_REDUCTION=1 REFINE_INITIAL=0 LEVELSET_UPDATE_TOL=1e-8 \
+    conda run --no-capture-output -n fenicsx python -u examples/turek_fsi_fully_eulerian.py \
+    --run-fd-check --run-fd-terms --fd-term stab --fd-skip-full --no-run-time-stepping
+
+
 """
 from __future__ import annotations
 
@@ -170,6 +176,12 @@ def _parse_args():
         default=float(os.getenv("MESH_SIZE", "0.025")),
         help="Target mesh size for structured O-grid. Env: MESH_SIZE.",
     )
+    parser.add_argument(
+        "--mesh-diagnostics-enabled",
+        type=bool,
+        default=_env_bool("MESH_DIAGNOSTICS_ENABLED", False),
+        help="Enable mesh diagnostics output. Env: MESH_DIAGNOSTICS_ENABLED.",
+    ) 
     mesh_backend_default = os.getenv("MESH_BACKEND", "gmsh").strip().lower()
     if not mesh_backend_default:
         mesh_backend_default = "gmsh"
@@ -3284,36 +3296,37 @@ cut_elems = mesh.element_bitset("cut").to_indices()
 if cut_elems.size:
     x_cut = mesh.nodes_x_y_pos[np.unique(np.concatenate([mesh.corner_connectivity[i] for i in cut_elems]))][:, 0]
     print(f"Cut elements: {cut_elems.size}, x-span=({x_cut.min():.3f},{x_cut.max():.3f})")
-centerline_gaps = inside_centerline_gaps(mesh, x_end=0.6, n_samples=160)
-if centerline_gaps:
-    msg = ", ".join(f"{x:.4f}" for x in centerline_gaps[:8])
-    if len(centerline_gaps) > 8:
-        msg += " ..."
-    print(f"[inside-check] Missing inside/cut coverage along beam centreline at x≈ {msg}")
-iface_err = interface_approx_error(mesh, beam_ref_ls)
-print(
-    f"Interface approximation: max|phi|={iface_err['max_abs_phi']:.3e}, "
-    f"mean|phi|={iface_err['mean_abs_phi']:.3e} over {iface_err['n_pts']} pts"
-)
-tj_bad = mesh.count_tjunction_violations()
-worst = tj_bad.get("worst_ratio", 0.0)
-print(f"T-junction violations (>2:1): {tj_bad['count']} (worst ratio={worst:.2f})")
-coverage = beam_inside_coverage(mesh, beam_ref_ls, nx=160, ny=12)
-coverage_inside = beam_inside_coverage(mesh, beam_ref_ls, nx=160, ny=12, inside_only=True)
-if coverage["missing_x"]:
-    msg = ", ".join(f"{x:.4f}" for x in coverage["missing_x"][:8])
-    if len(coverage["missing_x"]) > 8:
-        msg += " ..."
-    print(f"[inside-coverage] coverage={coverage['coverage']:.3f}, missing columns at x≈ {msg}")
-else:
-    print(f"[inside-coverage] coverage={coverage['coverage']:.3f} (beam fully covered by inside/cut)")
-if coverage_inside["missing_x"]:
-    msg = ", ".join(f"{x:.4f}" for x in coverage_inside["missing_x"][:8])
-    if len(coverage_inside["missing_x"]) > 8:
-        msg += " ..."
-    print(f"[inside-only] coverage={coverage_inside['coverage']:.3f}, missing inside columns at x≈ {msg}")
-else:
-    print(f"[inside-only] coverage={coverage_inside['coverage']:.3f} (beam fully covered by inside)")
+if ARGS.mesh_diagnostics_enabled:
+    centerline_gaps = inside_centerline_gaps(mesh, x_end=0.6, n_samples=160)
+    if centerline_gaps:
+        msg = ", ".join(f"{x:.4f}" for x in centerline_gaps[:8])
+        if len(centerline_gaps) > 8:
+            msg += " ..."
+        print(f"[inside-check] Missing inside/cut coverage along beam centreline at x≈ {msg}")
+    iface_err = interface_approx_error(mesh, beam_ref_ls)
+    print(
+        f"Interface approximation: max|phi|={iface_err['max_abs_phi']:.3e}, "
+        f"mean|phi|={iface_err['mean_abs_phi']:.3e} over {iface_err['n_pts']} pts"
+    )
+    tj_bad = mesh.count_tjunction_violations()
+    worst = tj_bad.get("worst_ratio", 0.0)
+    print(f"T-junction violations (>2:1): {tj_bad['count']} (worst ratio={worst:.2f})")
+    coverage = beam_inside_coverage(mesh, beam_ref_ls, nx=160, ny=12)
+    coverage_inside = beam_inside_coverage(mesh, beam_ref_ls, nx=160, ny=12, inside_only=True)
+    if coverage["missing_x"]:
+        msg = ", ".join(f"{x:.4f}" for x in coverage["missing_x"][:8])
+        if len(coverage["missing_x"]) > 8:
+            msg += " ..."
+        print(f"[inside-coverage] coverage={coverage['coverage']:.3f}, missing columns at x≈ {msg}")
+    else:
+        print(f"[inside-coverage] coverage={coverage['coverage']:.3f} (beam fully covered by inside/cut)")
+    if coverage_inside["missing_x"]:
+        msg = ", ".join(f"{x:.4f}" for x in coverage_inside["missing_x"][:8])
+        if len(coverage_inside["missing_x"]) > 8:
+            msg += " ..."
+        print(f"[inside-only] coverage={coverage_inside['coverage']:.3f}, missing inside columns at x≈ {msg}")
+    else:
+        print(f"[inside-only] coverage={coverage_inside['coverage']:.3f} (beam fully covered by inside)")
 print(
     f"Ghost edges: total={mesh.edge_bitset('ghost').cardinality()}, "
     f"pos={mesh.edge_bitset('ghost_pos').cardinality()}, "
@@ -3336,18 +3349,19 @@ quick_plot_only = (
 )
 
 # After your refinement loop:
-diagnoisis = detect_mesh_pathologies(mesh)
+if ARGS.mesh_diagnostics_enabled:
+    diagnoisis = detect_mesh_pathologies(mesh)
 
-# If internal cracks > 0, do NOT proceed to solver. 
-# The mesh is topologically broken.
-if len(diagnoisis["internal_cracks"]) > 0:
-    print("CRITICAL: Mesh has internal cracks. Visualizing crack locations...")
-    print(diagnoisis)
+    # If internal cracks > 0, do NOT proceed to solver. 
+    # The mesh is topologically broken.
+    if len(diagnoisis["internal_cracks"]) > 0:
+        print("CRITICAL: Mesh has internal cracks. Visualizing crack locations...")
+        print(diagnoisis)
 
-PATHOLOGY_EDGES: list[int] = []
-for _key in ("internal_cracks", "zombie_edges", "zero_length_edges"):
-    PATHOLOGY_EDGES.extend(diagnoisis.get(_key, []))
-PATHOLOGY_EDGES = sorted(set(PATHOLOGY_EDGES))
+    PATHOLOGY_EDGES: list[int] = []
+    for _key in ("internal_cracks", "zombie_edges", "zero_length_edges"):
+        PATHOLOGY_EDGES.extend(diagnoisis.get(_key, []))
+    PATHOLOGY_EDGES = sorted(set(PATHOLOGY_EDGES))
 if quick_plot_only:
     import matplotlib.pyplot as plt
     from pycutfem.io.visualization import plot_mesh_2
@@ -4126,17 +4140,18 @@ def _plot_mesh(step_idx: int, title: str = "Mesh / Ghost / Level-set") -> None:
 
 # Plot initial mesh/level set before any expensive steps (FD checks/time stepping)
 _plot_mesh(step_idx=0, title="Initial mesh")
-diag = mesh_topology_diagnostics(mesh)
-print(f"[mesh-check] missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} degenerate_shared={diag['degenerate_shared']}")
-if diag["degenerate_shared"] > 0:
-    repaired = repair_degenerate_edges(mesh)
+if ARGS.mesh_diagnostics_enabled:
     diag = mesh_topology_diagnostics(mesh)
-    print(f"[mesh-repair] repaired={repaired} → missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} degenerate_shared={diag['degenerate_shared']}")
-cov = coverage_diagnostics(mesh, n_samples=60)
-if cov["gaps_x"]:
-    print(f"[coverage] gaps at x≈ {', '.join(f'{x:.4f}' for x in cov['gaps_x'][:10])}" + (" ..." if len(cov['gaps_x']) > 10 else ""))
-else:
-    print("[coverage] no vertical gaps detected in sampled lines")
+    print(f"[mesh-check] missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} degenerate_shared={diag['degenerate_shared']}")
+    if diag["degenerate_shared"] > 0:
+        repaired = repair_degenerate_edges(mesh)
+        diag = mesh_topology_diagnostics(mesh)
+        print(f"[mesh-repair] repaired={repaired} → missing_side={diag['missing_side']} ownerless_edges={diag['ownerless_edges']} degenerate_shared={diag['degenerate_shared']}")
+    cov = coverage_diagnostics(mesh, n_samples=60)
+    if cov["gaps_x"]:
+        print(f"[coverage] gaps at x≈ {', '.join(f'{x:.4f}' for x in cov['gaps_x'][:10])}" + (" ..." if len(cov['gaps_x']) > 10 else ""))
+    else:
+        print("[coverage] no vertical gaps detected in sampled lines")
 
 def _compute_observables(step_idx: int, t_curr: float) -> None:
     dGamma_obs = dInterface(

@@ -62,6 +62,8 @@ def compile_backend_cpp(
     cache = CppKernelCache()
 
     ir_sequence = ir_generator.generate(integral_expression)
+    from pycutfem.jit.ir import strip_side_metadata
+    ir_sequence = strip_side_metadata(ir_sequence, on_facet=on_facet)
 
     try:
         kernel, param_order, active_fields = cache.get_kernel(
