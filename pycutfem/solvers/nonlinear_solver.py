@@ -767,36 +767,10 @@ class NewtonSolver:
             assembly_time += time.perf_counter() - t_asm
 
             # 1a) PRUNE decoupled rows/cols caused by Restriction (nnz==0)
-            for _ in range(2):
-                row_nnz = np.diff(A_red.indptr)
-                col_nnz = np.bincount(A_red.indices, minlength=A_red.shape[1]) if A_red.indices.size else np.zeros(A_red.shape[1], dtype=int)
-                inactive_mask = (row_nnz == 0) | (col_nnz == 0)
-                drop_tol = float(os.getenv("PYCUTFEM_DROP_TOL", "1e-12"))
-                if drop_tol > 0.0 and A_red.data.size:
-                    abs_data = np.abs(A_red.data)
-                    row_abs = np.add.reduceat(abs_data, A_red.indptr[:-1])
-                    col_abs = np.bincount(A_red.indices, weights=abs_data, minlength=A_red.shape[1])
-                    scale = float(abs_data.max())
-                    thresh = drop_tol * max(1.0, scale)
-                    inactive_mask |= (row_abs <= thresh) | (col_abs <= thresh)
-                inactive = np.where(inactive_mask)[0]
-                if not inactive.size:
-                    break
-                keep_mask = np.ones(len(self.active_dofs), dtype=bool)
-                keep_mask[inactive] = False
-                # rebuild maps
-                self.active_dofs = self.active_dofs[keep_mask]
-                self.full_to_red = -np.ones(ndof_eff, dtype=int)
-                self.full_to_red[self.active_dofs] = np.arange(self.active_dofs.size, dtype=int)
-                self.red_to_full = self.active_dofs
-                self._pattern_stale = True
-                self.restrictor = _ActiveReducer(self.dh, self.active_dofs, constraint=getattr(self, "constraints", None))
-                # rebuild reduced CSR scatter pattern
-                self._build_reduced_pattern()
-                # re-assemble on the cleaned support
-                t_asm = time.perf_counter()
-                A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
-                assembly_time += time.perf_counter() - t_asm
+            A_red, R_red, _pruned, extra_asm = self._prune_decoupled_rows_cols(
+                current, A_red, R_red, ndof_eff
+            )
+            assembly_time += extra_asm
 
             # Log residual with a full-size view (zeros on fixed DOFs) for readability
             R_full = np.zeros(ndof_eff)
@@ -930,6 +904,48 @@ class NewtonSolver:
 
 
    
+    def _prune_decoupled_rows_cols(self, coeffs, A_red, R_red, ndof_eff: int):
+        """
+        Drop decoupled (zero) rows/cols in the reduced system and rebuild the
+        reduced pattern. Returns (A_red, R_red, pruned, extra_asm_time).
+        """
+        pruned = False
+        extra_asm = 0.0
+        for _ in range(2):
+            row_nnz = np.diff(A_red.indptr)
+            if A_red.indices.size:
+                col_nnz = np.bincount(A_red.indices, minlength=A_red.shape[1])
+            else:
+                col_nnz = np.zeros(A_red.shape[1], dtype=int)
+            inactive_mask = (row_nnz == 0) | (col_nnz == 0)
+            drop_tol = float(os.getenv("PYCUTFEM_DROP_TOL", "1e-12"))
+            if drop_tol > 0.0 and A_red.data.size:
+                abs_data = np.abs(A_red.data)
+                row_abs = np.add.reduceat(abs_data, A_red.indptr[:-1])
+                col_abs = np.bincount(A_red.indices, weights=abs_data, minlength=A_red.shape[1])
+                scale = float(abs_data.max())
+                thresh = drop_tol * max(1.0, scale)
+                inactive_mask |= (row_abs <= thresh) | (col_abs <= thresh)
+            inactive = np.where(inactive_mask)[0]
+            if not inactive.size:
+                break
+            keep_mask = np.ones(len(self.active_dofs), dtype=bool)
+            keep_mask[inactive] = False
+            self.active_dofs = self.active_dofs[keep_mask]
+            self.full_to_red = -np.ones(ndof_eff, dtype=int)
+            self.full_to_red[self.active_dofs] = np.arange(self.active_dofs.size, dtype=int)
+            self.red_to_full = self.active_dofs
+            self._pattern_stale = True
+            self.restrictor = _ActiveReducer(
+                self.dh, self.active_dofs, constraint=getattr(self, "constraints", None)
+            )
+            self._build_reduced_pattern()
+            t_asm = time.perf_counter()
+            A_red, R_red = self._assemble_system_reduced(coeffs, need_matrix=True)
+            extra_asm += time.perf_counter() - t_asm
+            pruned = True
+        return A_red, R_red, pruned, extra_asm
+
     def _line_search_reduced(self, A_red, R_red, S_red, funcs, coeffs, bcs_now):
         """
         Backtracking Armijo search performed entirely in the reduced space.
@@ -1805,6 +1821,16 @@ class PetscSnesNewtonSolver(NewtonSolver):
         for k, v in self.petsc_options.items():
             key = k if k.startswith("-") else k
             opts[key] = "" if v is None else str(v)
+
+    def _invalidate_petsc_cache(self) -> None:
+        """Drop cached PETSc objects so they are rebuilt with the current pattern."""
+        self._snes = None
+        self._x_red = None
+        self._r_red = None
+        self._J = None
+        self._P = None
+        self._XL = None
+        self._XU = None
     
     def set_box_bounds(self, lower=None, upper=None, by_field: dict | None=None):
         """
@@ -1924,13 +1950,25 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._current_bcs = bcs_now
         comm = PETSc.COMM_WORLD
 
-        # Ensure we have the reduced pattern/active dofs
-        if getattr(self, "_pattern_stale", True) or not hasattr(self, "_csr_indptr"):
-            self._build_reduced_pattern()
+        pattern_was_stale = getattr(self, "_pattern_stale", True) or not hasattr(self, "_csr_indptr")
 
         # Apply BCs to the current iterate and form the reduced initial guess
         dh.apply_bcs(bcs_now, *funcs)
         x0_full = np.hstack([f.nodal_values for f in funcs]).copy()
+
+        # Assemble once to prune any decoupled rows/cols (matches Python Newton behavior).
+        current: Dict[str, "Function"] = {f.name: f for f in funcs}
+        current.update({f.name: f for f in prev_funcs})
+        if aux_funcs:
+            current.update(aux_funcs)
+        ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
+        A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
+        A_red, R_red, pruned, _extra_asm = self._prune_decoupled_rows_cols(
+            current, A_red, R_red, ndof_eff
+        )
+        if pattern_was_stale or pruned:
+            self._invalidate_petsc_cache()
+
         x0_red = x0_full[self.active_dofs].copy()
 
         # Context for callbacks
@@ -1958,13 +1996,17 @@ class PetscSnesNewtonSolver(NewtonSolver):
         # Solve the nonlinear system on the reduced space
         self._snes.solve(None, self._x_red)
         reason = int(self._snes.getConvergedReason())
-        if reason <= 0:
-            its = int(self._snes.getIterationNumber())
+        converged = reason > 0
+        n_iters = int(self._snes.getIterationNumber())
+        if not converged:
             try:
                 fnorm = float(self._snes.getFunctionNorm())
             except Exception:
                 fnorm = float("nan")
-            print(f"    [warn] SNES did not converge (reason={reason}, iters={its}, ‖F‖={fnorm:.3e}). Continuing with best iterate.")
+            print(
+                f"    [warn] SNES did not converge (reason={reason}, iters={n_iters}, ‖F‖={fnorm:.3e}). "
+                "Continuing with best iterate."
+            )
 
         # Write back the absolute solution (not an increment)
         x_fin = self._x_red.getArray(readonly=True)
@@ -1976,7 +2018,8 @@ class PetscSnesNewtonSolver(NewtonSolver):
         dh.apply_bcs(bcs_now, *funcs)
 
         prev_vals = np.hstack([f.nodal_values for f in prev_funcs])
-        return np.hstack([f.nodal_values for f in funcs]) - prev_vals
+        delta = np.hstack([f.nodal_values for f in funcs]) - prev_vals
+        return delta, converged, n_iters
 
     # ------------------------------------------------------------------ #
     # SNES callbacks: residual and Jacobian on the reduced space

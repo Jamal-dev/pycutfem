@@ -93,6 +93,8 @@ from pycutfem.fem import transform
 from pycutfem.solvers.nonlinear_solver import (
     NewtonParameters,
     NewtonSolver,
+    PetscSnesNewtonSolver,
+    LinearSolverParameters,
     TimeStepperParameters,
     _ActiveReducer,
 )
@@ -342,6 +344,24 @@ def _parse_args():
     )
     parser.add_argument("--newton-tol", type=float, default=float(os.getenv("NEWTON_TOL", "1e-6")), help="Newton residual tolerance. Env: NEWTON_TOL.")
     parser.add_argument("--max-newton-iter", type=int, default=int(os.getenv("MAX_NEWTON_ITER", "50")), help="Maximum Newton iterations. Env: MAX_NEWTON_ITER.")
+    nonlinear_solver_default = os.getenv("NONLINEAR_SOLVER", "newton").strip().lower()
+    if not nonlinear_solver_default:
+        nonlinear_solver_default = "newton"
+    parser.add_argument(
+        "--nonlinear-solver",
+        choices=("newton", "snes"),
+        default=nonlinear_solver_default,
+        help="Nonlinear solver: Python Newton or PETSc SNES. Env: NONLINEAR_SOLVER.",
+    )
+    linear_solver_default = os.getenv("LINEAR_SOLVER", "scipy").strip().lower()
+    if not linear_solver_default:
+        linear_solver_default = "scipy"
+    parser.add_argument(
+        "--linear-solver",
+        choices=("scipy", "petsc"),
+        default=linear_solver_default,
+        help="Linear solver backend for --nonlinear-solver=newton. Env: LINEAR_SOLVER.",
+    )
     ls_mode_default = os.getenv("LS_MODE", "dealii").strip().lower()
     if not ls_mode_default:
         ls_mode_default = "dealii"
@@ -507,6 +527,8 @@ def _apply_env_overrides(args: argparse.Namespace) -> None:
     _set_env("DT_REDUCTION_THRESHOLD", args.dt_reduction_threshold)
     _set_env("NEWTON_TOL", args.newton_tol)
     _set_env("MAX_NEWTON_ITER", args.max_newton_iter)
+    _set_env("NONLINEAR_SOLVER", args.nonlinear_solver)
+    _set_env("LINEAR_SOLVER", args.linear_solver)
     _set_env("LS_MODE", args.ls_mode)
     _set_env("LS_MAX_ITER", args.ls_max_iter)
     _set_env("U_MEAN", args.u_mean)
@@ -2290,13 +2312,59 @@ def update_beam_levelset_from_displacement(
     phi_vals = ls_beam.nodal_values()
     phi_new_vals = np.empty_like(phi_vals)
 
+    n_nodes = mesh.nodes_x_y_pos.shape[0]
+    cache = getattr(ls_beam, "_disp_eval_cache", None)
+    if (
+        cache is None
+        or cache.get("mesh_id") != id(mesh)
+        or cache.get("n_nodes") != n_nodes
+        or cache.get("n_elems") != len(mesh.elements_list)
+    ):
+        node_owner = np.full(n_nodes, -1, dtype=int)
+        for eid, conn in enumerate(mesh.elements_connectivity):
+            for nid in conn:
+                if node_owner[int(nid)] == -1:
+                    node_owner[int(nid)] = int(eid)
+        ref_coords = np.full((n_nodes, 2), np.nan, dtype=float)
+        cache = {
+            "mesh_id": id(mesh),
+            "n_nodes": n_nodes,
+            "n_elems": len(mesh.elements_list),
+            "node_owner": node_owner,
+            "ref_coords": ref_coords,
+        }
+        setattr(ls_beam, "_disp_eval_cache", cache)
+    node_owner = cache["node_owner"]
+    ref_coords = cache["ref_coords"]
+    me_disp = disp_dh.mixed_element
+    fld_x = disp_x.field_name
+    fld_y = disp_y.field_name
+
     for gd_phi, nid in zip(gphi, node_ids):
         x, y = mesh.nodes_x_y_pos[int(nid)]
-        gd_dx = disp_dh.dof_map["d_neg_x"].get(int(nid), None)
-        gd_dy = disp_dh.dof_map["d_neg_y"].get(int(nid), None)
-
-        ux = disp_x.get_nodal_values(np.array([gd_dx], dtype=int))[0] if gd_dx is not None else 0.0
-        uy = disp_y.get_nodal_values(np.array([gd_dy], dtype=int))[0] if gd_dy is not None else 0.0
+        eid = int(node_owner[int(nid)])
+        ux = float("nan")
+        uy = float("nan")
+        if eid >= 0:
+            xi, eta = ref_coords[int(nid)]
+            if not np.isfinite(xi) or not np.isfinite(eta):
+                try:
+                    xi, eta = transform.inverse_mapping(mesh, eid, (float(x), float(y)))
+                except Exception:
+                    xi, eta = float("nan"), float("nan")
+                ref_coords[int(nid), 0] = float(xi)
+                ref_coords[int(nid), 1] = float(eta)
+            if np.isfinite(xi) and np.isfinite(eta):
+                phi_x = me_disp.basis(fld_x, float(xi), float(eta))[me_disp.slice(fld_x)]
+                phi_y = me_disp.basis(fld_y, float(xi), float(eta))[me_disp.slice(fld_y)]
+                gdofs_x = disp_dh.element_maps[fld_x][eid]
+                gdofs_y = disp_dh.element_maps[fld_y][eid]
+                ux = float(phi_x @ disp_x.get_nodal_values(gdofs_x))
+                uy = float(phi_y @ disp_y.get_nodal_values(gdofs_y))
+        if not np.isfinite(ux) or not np.isfinite(uy):
+            disp_val = _eval_vector_at_point(disp_dh, mesh, disp_vec, (float(x), float(y)))
+            ux = float(disp_val[0])
+            uy = float(disp_val[1])
 
         X_ref = np.array([x - ux, y - uy], float)
         phi_new = beam_ref_ls(X_ref)
@@ -2731,17 +2799,74 @@ def recompute_active_dofs(solver: NewtonSolver, bcs_active: Sequence[BoundaryCon
 # -----------------------------------------------------------------------------
 
 
-def select_fd_dofs(dh: DofHandler, fields_to_probe: Dict[str, int], elem_tag: str = "cut") -> np.ndarray:
+def select_fd_dofs(
+    dh: DofHandler,
+    fields_to_probe: Dict[str, int],
+    elem_tag: str = "cut",
+    *,
+    bc_dofs: set[int] | None = None,
+    inactive: set[int] | None = None,
+    max_elems: int = 50,
+) -> np.ndarray:
     selected: list[int] = []
+    seen = set()
     elems = dh.element_bitset(elem_tag).to_indices()
-    probe_eid = int(elems[0]) if len(elems) else 0
-    for field, count in fields_to_probe.items():
-        try:
-            local = dh.element_dofs(field, probe_eid)
-        except Exception:
-            local = []
-        selected.extend(list(local[:count]))
+    if elems.size == 0:
+        return np.array([], dtype=int)
+    remaining = dict(fields_to_probe)
+    for eid in elems[:max_elems]:
+        done = True
+        for field, count in list(remaining.items()):
+            if count <= 0:
+                continue
+            done = False
+            if field not in dh.field_names:
+                remaining[field] = 0
+                continue
+            try:
+                local = dh.element_dofs(field, int(eid))
+            except Exception:
+                continue
+            for gdof in local:
+                gdof_i = int(gdof)
+                if gdof_i < 0:
+                    continue
+                if bc_dofs and gdof_i in bc_dofs:
+                    continue
+                if inactive and gdof_i in inactive:
+                    continue
+                if gdof_i in seen:
+                    continue
+                selected.append(gdof_i)
+                seen.add(gdof_i)
+                remaining[field] = remaining[field] - 1
+                if remaining[field] <= 0:
+                    break
+        if done or all(val <= 0 for val in remaining.values()):
+            break
     return np.array(sorted(set(selected)), dtype=int)
+
+
+def select_fd_probes(
+    dh: DofHandler,
+    probes_by_tag: Dict[str, Dict[str, int]],
+    *,
+    bc_dofs: set[int] | None = None,
+    inactive: set[int] | None = None,
+) -> tuple[np.ndarray, Dict[str, np.ndarray]]:
+    all_dofs: list[int] = []
+    by_tag: Dict[str, np.ndarray] = {}
+    for tag, fields in probes_by_tag.items():
+        dofs = select_fd_dofs(
+            dh,
+            fields,
+            elem_tag=tag,
+            bc_dofs=bc_dofs,
+            inactive=inactive,
+        )
+        by_tag[tag] = dofs
+        all_dofs.extend(dofs.tolist())
+    return np.array(sorted(set(all_dofs)), dtype=int), by_tag
 
 
 def finite_difference_check(
@@ -4180,6 +4305,7 @@ def _compute_observables(step_idx: int, t_curr: float) -> None:
     F_D = float(np.asarray(res.get("FD", 0.0)).reshape(-1)[0])
     F_L = float(np.asarray(res.get("FL", 0.0)).reshape(-1)[0])
     tip_pos = _tip_position(dof_handler, mesh, disp_k, REF_TIP)
+    tip_disp = tip_pos - REF_TIP
     pA = _eval_scalar_at_point(dof_handler, mesh, pf_k, tuple(tip_pos))
     pB = _eval_scalar_at_point(dof_handler, mesh, pf_k, tuple(PROBE_B))
     dp = pB - pA
@@ -4190,7 +4316,8 @@ def _compute_observables(step_idx: int, t_curr: float) -> None:
     obs_history["tip"].append(tip_pos.tolist())
     print(
         f"[obs {step_idx:04d}] t={t_curr:.3f}  FD={F_D:.4e}  FL={F_L:.4e}  Δp={dp:.4e}  "
-        f"tip=({tip_pos[0]:.5f},{tip_pos[1]:.5f})  |Γ|≈{_interface_length(mesh):.5f}"
+        f"tip=({tip_pos[0]:.5f},{tip_pos[1]:.5f})  "
+        f"tip_disp=({tip_disp[0]:.5f},{tip_disp[1]:.5f})  |Γ|≈{_interface_length(mesh):.5f}"
     )
     _save_vtk(step_idx)
 
@@ -4250,7 +4377,34 @@ if ARGS.run_fd_check:
             "jac": _pool_from_form(jacobian_form, full_kernels_K),
             "res": _pool_from_form(residual_form, full_kernels_R),
         }
-    probe = select_fd_dofs(dof_handler, {"u_pos_x": 2, "u_pos_y": 2, "vs_neg_x": 2, "d_neg_x": 2}, elem_tag="cut")
+    bc_probe_src = bcs if bcs else bcs_homog
+    bc_probe_dofs = set(dof_handler.get_dirichlet_data(bc_probe_src).keys()) if bc_probe_src else set()
+    inactive_probe = set(dof_handler.dof_tags.get("inactive", set()))
+    probe_sets = {
+        "cut": {
+            "u_pos_x": 2,
+            "u_pos_y": 2,
+            "p_pos_": 2,
+            "vs_neg_x": 2,
+            "vs_neg_y": 2,
+            "d_neg_x": 2,
+            "d_neg_y": 2,
+        },
+        "outside": {"u_pos_x": 2, "u_pos_y": 2, "p_pos_": 2},
+        "inside": {"vs_neg_x": 2, "vs_neg_y": 2, "d_neg_x": 2, "d_neg_y": 2},
+    }
+    probe, probe_by_tag = select_fd_probes(
+        dof_handler,
+        probe_sets,
+        bc_dofs=bc_probe_dofs,
+        inactive=inactive_probe,
+    )
+    tag_labels = {"cut": "cut", "outside": "fluid(outside)", "inside": "solid(inside)"}
+    for tag, dofs in probe_by_tag.items():
+        label = tag_labels.get(tag, tag)
+        print(f"[FD probe] {label}: {len(dofs)} dofs")
+    if probe.size == 0:
+        print("[FD probe] warning: no active DOFs selected for FD checks.")
     if os.getenv("FD_SKIP_FULL", "0") == "0":
         finite_difference_check(
             jacobian_form,
@@ -4364,21 +4518,35 @@ if ARGS.run_time_stepping:
     max_newton_iter = int(os.getenv("MAX_NEWTON_ITER", "20"))
     ls_mode = os.getenv("LS_MODE", "dealii")
     ls_max_iter = int(os.getenv("LS_MAX_ITER", "12"))
-    solver = NewtonSolver(
-        residual_form,
-        jacobian_form,
-        dof_handler=dof_handler,
-        mixed_element=mixed_element,
-        bcs=bcs,
-        bcs_homog=bcs_homog,
-        newton_params=NewtonParameters(
-            newton_tol=newton_tol,
-            max_newton_iter=max_newton_iter,
-            line_search=True,
-            ls_mode=ls_mode,
-            ls_max_iter=ls_max_iter,
-        ),
+    newton_params = NewtonParameters(
+        newton_tol=newton_tol,
+        max_newton_iter=max_newton_iter,
+        line_search=True,
+        ls_mode=ls_mode,
+        ls_max_iter=ls_max_iter,
     )
+    nonlinear_solver = getattr(ARGS, "nonlinear_solver", "newton")
+    if nonlinear_solver == "snes":
+        solver = PetscSnesNewtonSolver(
+            residual_form,
+            jacobian_form,
+            dof_handler=dof_handler,
+            mixed_element=mixed_element,
+            bcs=bcs,
+            bcs_homog=bcs_homog,
+            newton_params=newton_params,
+        )
+    else:
+        solver = NewtonSolver(
+            residual_form,
+            jacobian_form,
+            dof_handler=dof_handler,
+            mixed_element=mixed_element,
+            bcs=bcs,
+            bcs_homog=bcs_homog,
+            newton_params=newton_params,
+            lin_params=LinearSolverParameters(backend=str(getattr(ARGS, "linear_solver", "scipy"))),
+        )
 
     step_idx = [0]  # mutable so the closure can update
     dt_val = float(dt.value) if hasattr(dt, "value") else float(DT)
