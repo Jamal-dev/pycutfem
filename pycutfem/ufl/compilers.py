@@ -2124,6 +2124,10 @@ class FormCompiler:
                 # print(f"Assembling ghost edge integral with backend {self.backend}")
                 self._assemble_ghost_edge(integral, target)
                 continue
+            if integral.measure.domain_type == "interior_facet":
+                logger.info(f"Assembling interior-facet integral: {integral} with backend {self.backend}")
+                self._assemble_interior_edge(integral, target)
+                continue
             if integral.measure.domain_type == "exterior_facet":
                 logger.info(f"Assembling exterior-facet integral: {integral} with backend {self.backend}")
                 # print(f"Assembling exterior-facet integral with backend {self.backend}")
@@ -4065,6 +4069,287 @@ class FormCompiler:
             hook=hook,
         )
 
+
+    def _assemble_interior_edge_python(self, intg: Integral, matvec):
+        """
+        Assemble integrals over interior facets (ds) using the Python backend.
+        Supports Jump/Pos/Neg terms for DG fluxes by treating the facet as a
+        sided path with a union DOF layout.
+        """
+        rhs = bool(self.ctx.get("rhs", False))
+        mesh, me, dh = self.me.mesh, self.me, self.dh
+        md = intg.measure.metadata or {}
+
+        self.ctx["is_interface"] = False
+        self.ctx["is_ghost"] = True
+        side_md = md.get("side")
+        if side_md in ("+", "-"):
+            self.ctx["measure_side"] = side_md
+
+        # Derivative-aware quadrature order
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0), (1, 0), (0, 1)}
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg_base = max(self._find_q_order(intg), 2 * max_total + 4)
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        qdeg = qdeg_base + max(0, p_geo - 1)
+
+        # Edge selection: all interior edges if none provided
+        edge_ids = normalize_edge_ids(mesh, intg.measure.defined_on)
+        if edge_ids is None:
+            edge_ids = [int(e.gid) for e in mesh.edges_list if e.right is not None]
+        edge_ids = [int(eid) for eid in edge_ids]
+
+        # Fields needed for basis tabulation
+        fields = set(self._fields_for(intg.integrand))
+        trial, test = _trial_test(intg.integrand)
+        for tt in (trial, test):
+            if tt is None:
+                continue
+            if hasattr(tt, "field_names"):
+                fields.update(tt.field_names)
+            elif hasattr(tt, "field_name"):
+                fields.add(tt.field_name)
+        if not fields:
+            fields = set(getattr(dh, "field_names", []))
+        fields = sorted(fields)
+
+        # Scalar functional support
+        hook = self._hook_for(intg.integrand)
+        is_functional = hook is not None and trial is None and test is None
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], None)
+
+        try:
+            for edge_id in edge_ids:
+                e = mesh.edge(int(edge_id))
+                if e.right is None:
+                    continue
+
+                # Orient: pos = right, neg = left so normal points (neg -> pos)
+                pos_eid = int(e.right)
+                neg_eid = int(e.left)
+
+                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+                qpts_phys, qwts = line_quadrature(p0, p1, qdeg)
+
+                pos_dofs = dh.get_elemental_dofs(pos_eid)
+                neg_dofs = dh.get_elemental_dofs(neg_eid)
+                global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+                pos_map = np.searchsorted(global_dofs, pos_dofs)
+                neg_map = np.searchsorted(global_dofs, neg_dofs)
+
+                pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
+                    dh, fields, pos_eid, neg_eid, global_dofs
+                )
+
+                if is_functional:
+                    acc = None
+                else:
+                    n = len(global_dofs)
+                    acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
+
+                normal = getattr(e, "normal", None)
+                if normal is None:
+                    tangent = p1 - p0
+                    normal = np.array([tangent[1], -tangent[0]], dtype=float)
+                    nrm = np.linalg.norm(normal)
+                    if nrm > 0.0:
+                        normal /= nrm
+                else:
+                    normal = np.asarray(normal, dtype=float)
+
+                for x_phys, w in zip(qpts_phys, qwts):
+                    xi_pos, eta_pos = transform.inverse_mapping(mesh, pos_eid, np.asarray(x_phys, float))
+                    xi_neg, eta_neg = transform.inverse_mapping(mesh, neg_eid, np.asarray(x_phys, float))
+
+                    J_pos = transform.jacobian(mesh, pos_eid, (float(xi_pos), float(eta_pos)))
+                    J_neg = transform.jacobian(mesh, neg_eid, (float(xi_neg), float(eta_neg)))
+                    Ji_pos = np.linalg.inv(J_pos)
+                    Ji_neg = np.linalg.inv(J_neg)
+
+                    self.ctx["basis_values"] = {"+": {}, "-": {}}
+                    for f in fields:
+                        v_pos = me.basis(f, float(xi_pos), float(eta_pos))
+                        g_pos = me.grad_basis(f, float(xi_pos), float(eta_pos)) @ Ji_pos
+                        v_neg = me.basis(f, float(xi_neg), float(eta_neg))
+                        g_neg = me.grad_basis(f, float(xi_neg), float(eta_neg)) @ Ji_neg
+
+                        slotp = self.ctx["basis_values"]["+"].setdefault(f, {})
+                        slotn = self.ctx["basis_values"]["-"].setdefault(f, {})
+                        slotp[(0, 0)] = v_pos
+                        slotp[(1, 0)] = g_pos[:, 0]
+                        slotp[(0, 1)] = g_pos[:, 1]
+                        slotn[(0, 0)] = v_neg
+                        slotn[(1, 0)] = g_neg[:, 0]
+                        slotn[(0, 1)] = g_neg[:, 1]
+
+                    self.ctx.update(
+                        {
+                            "eid": pos_eid,
+                            "pos_eid": pos_eid,
+                            "neg_eid": neg_eid,
+                            "normal": normal,
+                            "x_phys": np.asarray(x_phys, float),
+                            "x_phys_pos": np.asarray(x_phys, float),
+                            "x_phys_neg": np.asarray(x_phys, float),
+                            "phi_val": 0.0,
+                            "global_dofs": global_dofs,
+                            "pos_map": pos_map,
+                            "neg_map": neg_map,
+                            "pos_map_by_field": pos_map_by_field,
+                            "neg_map_by_field": neg_map_by_field,
+                            "use_union_local_dofs": False,
+                            "_xi_eta_cache": {
+                                "+": (float(xi_pos), float(eta_pos)),
+                                "-": (float(xi_neg), float(eta_neg)),
+                            },
+                        }
+                    )
+
+                    val = self._visit(intg.integrand)
+                    w = float(w)
+                    if is_functional:
+                        data = val.data if isinstance(val, VecOpInfo) else val
+                        arr = np.asarray(data, dtype=float)
+                        if acc is None:
+                            acc = np.zeros_like(arr, dtype=float)
+                        acc += w * arr
+                    else:
+                        arr = lhs_num(val)
+                        arr = np.asarray(arr)
+                        if rhs and arr.ndim == 2 and 1 in arr.shape:
+                            arr = arr.reshape(-1)
+                        acc += w * arr
+
+                if is_functional:
+                    results = self.ctx.setdefault("scalar_results", {})
+                    if results.get(hook["name"]) is None or (
+                        isinstance(results.get(hook["name"]), (int, float)) and isinstance(acc, np.ndarray)
+                    ):
+                        results[hook["name"]] = np.zeros_like(acc, dtype=float)
+                    results[hook["name"]] += acc
+                else:
+                    if rhs:
+                        np.add.at(matvec, global_dofs, acc)
+                    else:
+                        rr, cc = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                        matvec[rr, cc] += acc
+        finally:
+            for k in (
+                "basis_values",
+                "normal",
+                "phi_val",
+                "x_phys",
+                "x_phys_pos",
+                "x_phys_neg",
+                "global_dofs",
+                "pos_map",
+                "neg_map",
+                "pos_eid",
+                "neg_eid",
+                "eid",
+                "pos_map_by_field",
+                "neg_map_by_field",
+                "use_union_local_dofs",
+                "measure_side",
+                "_xi_eta_cache",
+            ):
+                self.ctx.pop(k, None)
+            self.ctx.pop("is_ghost", None)
+            self.ctx.pop("is_interface", None)
+
+    def _assemble_interior_edge_jit(self, intg: Integral, matvec):
+        mesh, dh, me = self.me.mesh, self.dh, self.me
+
+        edge_ids = intg.measure.defined_on
+        if edge_ids is None:
+            edge_ids = [int(e.gid) for e in mesh.edges_list if e.right is not None]
+        elif hasattr(edge_ids, "cardinality") and edge_ids.cardinality() == 0:
+            return
+
+        on_facet = intg.measure.on_facet
+        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
+
+        geo = dh.precompute_interior_factors(
+            edge_ids=edge_ids,
+            qdeg=qdeg,
+            derivs=derivs,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            reuse=True,
+            deformation=getattr(intg.measure, "deformation", None),
+        )
+        geo["is_interface"] = False
+        geo["is_ghost"] = False
+
+        valid_eids = geo.get("eids")
+        if valid_eids is None or len(valid_eids) == 0:
+            return
+
+        kernel_args = _build_jit_kernel_args(
+            ir=ir,
+            expression=intg.integrand,
+            mixed_element=me,
+            q_order=qdeg,
+            dof_handler=dh,
+            gdofs_map=geo["gdofs_map"],
+            param_order=runner.param_order,
+            pre_built=geo,
+        )
+
+        active_fields = _active_field_order(ir, me)
+        active_cols = _active_columns(me, active_fields)
+        use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me.n_dofs_local)
+        if not use_full_union:
+            kernel_args = _compress_static_for_active(kernel_args, me, active_cols)
+            geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+
+        if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+            kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+        if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+            kernel_args["element_nodes"] = np.asarray(mesh.elements_connectivity, dtype=np.int64)
+
+        req = set(getattr(runner, "param_order", []))
+        for side in ("pos", "neg"):
+            for t in ("Hxi0", "Hxi1", "Txi0", "Txi1", "Qxi0", "Qxi1"):
+                need_key = f"{side}_{t}"
+                if (need_key in req) and (need_key not in kernel_args) and (t in geo):
+                    kernel_args[need_key] = geo[t]
+
+        current_funcs = self._get_data_functions_objs(intg)
+        K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
+
+        hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_edge, hook):
+            return
+
+        _scatter_element_contribs(
+            K_edge, F_edge, J_edge,
+            valid_eids,
+            geo["gdofs_map"],
+            matvec, self.ctx, intg.integrand,
+            hook=hook,
+        )
+
+    def _assemble_interior_edge(self, intg: Integral, matvec):
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self._is_jit_backend():
+            self._assemble_interior_edge_python(intg, matvec)
+            return
+        if self.backend == "python":
+            self._assemble_interior_edge_python(intg, matvec)
+        elif self._is_jit_backend():
+            self._assemble_interior_edge_jit(intg, matvec)
+        else:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
 
 
     

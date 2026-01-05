@@ -1170,6 +1170,76 @@ def compile_multi(form, *, dof_handler, mixed_element,
             continue
 
         # ------------------------------------------------------------------
+        # INTERIOR FACET (ds)
+        # ------------------------------------------------------------------
+        if dom == "interior_facet":
+            mesh = mixed_element.mesh
+            edge_set = intg.measure.defined_on
+            if edge_set is None:
+                edge_ids = [int(e.gid) for e in mesh.edges_list if e.right is not None]
+            else:
+                edge_ids = edge_set
+
+            derivs = required_multi_indices(intg.integrand)
+
+            def _interior_static():
+                geom = dof_handler.precompute_interior_factors(
+                    edge_ids=edge_ids,
+                    qdeg=qdeg,
+                    derivs=derivs,
+                    need_hess=need_hess,
+                    need_o3=need_o3,
+                    need_o4=need_o4,
+                )
+                geom["is_ghost"] = False
+                geom["is_interface"] = False
+
+                gdofs_map_raw = np.asarray(
+                    geom.get("gdofs_map", np.zeros((len(geom.get("eids", [])), n_loc), dtype=np.int32)),
+                    dtype=np.int32,
+                )
+                ncols = gdofs_map_raw.shape[1] if gdofs_map_raw.ndim == 2 else 0
+                use_full_union = bool(ncols and ncols != mixed_element.n_dofs_local)
+                if use_full_union:
+                    eff_cols = np.arange(ncols, dtype=np.int32)
+                else:
+                    eff_cols = active_cols[active_cols < ncols] if ncols else active_cols
+                    if eff_cols.size == 0 and ncols:
+                        eff_cols = np.arange(ncols, dtype=np.int32)
+                gdofs_map = gdofs_map_raw[:, eff_cols] if gdofs_map_raw.size else gdofs_map_raw
+                geom["gdofs_map"] = gdofs_map
+
+                static = {"gdofs_map": gdofs_map, **geom}
+                static.update(
+                    _build_jit_kernel_args(
+                        ir,
+                        intg.integrand,
+                        mixed_element,
+                        qdeg,
+                        dof_handler=dof_handler,
+                        gdofs_map=gdofs_map,
+                        param_order=runner.param_order,
+                        pre_built=geom,
+                    )
+                )
+                if not use_full_union:
+                    static = _compress_static_for_active(static, mixed_element, eff_cols)
+                return static
+
+            static = _interior_static()
+            eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
+            _append_kernel(
+                _IntegralKernel(
+                    runner,
+                    static,
+                    "interior_facet",
+                    eids=eids_arr,
+                ),
+                intg,
+            )
+            continue
+
+        # ------------------------------------------------------------------
         # EXTERIOR FACET (boundary edges)
         # ------------------------------------------------------------------
         if dom == "exterior_facet":

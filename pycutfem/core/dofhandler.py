@@ -38,6 +38,7 @@ BcLike = Union[BoundaryCondition, Mapping[str, Any]]
 _edge_geom_cache: dict[tuple[int,int,int], dict] = {}
 _ghost_cache: dict[tuple, dict] = {}
 _jacobian_cache: dict[tuple, dict] = {}
+_interior_cache: dict[tuple, dict] = {}
 
 # geometric volume-cache keyed by (MixedElement.signature(), qdeg, id(level_set) or 0)
 _volume_geom_cache: dict[tuple, dict] = {}
@@ -122,6 +123,7 @@ def clear_caches() -> None:
     _edge_geom_cache.clear()
     _ghost_cache.clear()
     _jacobian_cache.clear()
+    _interior_cache.clear()
 
 
 
@@ -323,8 +325,24 @@ class DofHandler:
         # After maps are built, create the reverse map for CG mode
         if not self._dg_mode:
             for fld in self.field_names:
+                if self._is_dg_field(fld):
+                    continue
                 for nid, dof in self.dof_map[fld].items():
                     self._dof_to_node_map[dof] = (fld, nid)
+
+    # ------------------------------------------------------------------
+    #  Field method helpers (CG/DG per field)
+    # ------------------------------------------------------------------
+    def _field_method(self, field: str) -> str:
+        """Return the continuity method for a field ('cg' or 'dg')."""
+        fm = getattr(self, "_field_methods", None)
+        if fm is not None:
+            return fm.get(field, self.method)
+        return self.method
+
+    def _is_dg_field(self, field: str) -> bool:
+        """True if a field is DG under the current handler configuration."""
+        return self._field_method(field) == "dg"
 
     # ------------------------------------------------------------------
     # MixedElement-aware Builders
@@ -501,29 +519,55 @@ class DofHandler:
         node_lookup = {(_q(float(x)), _q(float(y))): int(nid)
                     for nid, (x, y) in enumerate(nodes_xy)}
 
-        self.dof_map = {f: {} for f in fields}        # node_id -> gdof (per field)
+        self.dof_map = {f: {} for f in fields}        # node_id -> gdof or {elem_id->gdof}
         self._dof_to_node_map = {}                    # gdof -> (field, node_id|None)
 
         TOL = 1e-12  # geometric snap tolerance (squared distance check uses TOL^2)
 
-        for f in fields:
-            for gd in self._field_slices[f]:
-                x, y = self._dof_coords[int(gd)]
-                nkey = (_q(x), _q(y))
-                nid = node_lookup.get(nkey, None)
-                if nid is None:
-                    # nearest neighbor fallback for tiny drift
-                    dx = nodes_xy[:, 0] - x
-                    dy = nodes_xy[:, 1] - y
-                    j = int(np.argmin(dx*dx + dy*dy))
-                    if (dx[j]*dx[j] + dy[j]*dy[j]) <= (TOL*TOL):
-                        nid = j
+        def _find_node_id(x: float, y: float) -> int | None:
+            nkey = (_q(x), _q(y))
+            nid = node_lookup.get(nkey, None)
+            if nid is None:
+                # nearest neighbor fallback for tiny drift
+                dx = nodes_xy[:, 0] - x
+                dy = nodes_xy[:, 1] - y
+                j = int(np.argmin(dx*dx + dy*dy))
+                if (dx[j]*dx[j] + dy[j]*dy[j]) <= (TOL*TOL):
+                    nid = j
+            return nid
 
-                if nid is not None:
-                    self.dof_map[f][int(nid)] = int(gd)
-                    self._dof_to_node_map[int(gd)] = (f, int(nid))
-                else:
+        for f in fields:
+            if f in numset:
+                # NumberSpace fields have no geometric location.
+                for gd in self._field_slices[f]:
                     self._dof_to_node_map[int(gd)] = (f, None)
+                continue
+
+            if not self._is_dg_field(f):
+                # CG: one DOF per mesh node.
+                for gd in self._field_slices[f]:
+                    x, y = self._dof_coords[int(gd)]
+                    nid = _find_node_id(x, y)
+                    if nid is not None:
+                        self.dof_map[f][int(nid)] = int(gd)
+                        self._dof_to_node_map[int(gd)] = (f, int(nid))
+                    else:
+                        self._dof_to_node_map[int(gd)] = (f, None)
+                continue
+
+            # DG: element-local DOFs (store nested map node -> {elem_id -> gdof})
+            per_node: Dict[int, Dict[int, int]] = {}
+            for eid, cell in enumerate(self.element_maps[f]):
+                for gd in cell:
+                    gd = int(gd)
+                    x, y = self._dof_coords[gd]
+                    nid = _find_node_id(float(x), float(y))
+                    if nid is not None:
+                        per_node.setdefault(int(nid), {})[int(eid)] = gd
+                        self._dof_to_node_map[gd] = (f, int(nid))
+                    else:
+                        self._dof_to_node_map[gd] = (f, None)
+            self.dof_map[f] = per_node
 
         # -------- optional metadata kept minimal & compatible ---------------------
         # Some code reads these; keep harmless defaults.
@@ -535,30 +579,16 @@ class DofHandler:
 
 
     def _build_maps_dg_mixed(self) -> None:
-        """Discontinuous‑Galerkin numbering – element‑local uniqueness."""
-        mesh = self.mixed_element.mesh
-        p_mesh = mesh.poly_order
+        """
+        Discontinuous‑Galerkin numbering – element‑local uniqueness.
 
-        offset = 0
-        for elem in mesh.elements_list:
-            loc2phys = {loc: nid for loc, nid in enumerate(elem.nodes)}
-            for fld in self.field_names:
-                p_f = self.mixed_element._field_orders[fld]
-                loc_idx = self._local_node_indices_for_field(p_mesh, p_f, mesh.element_type, fld)
-                n_local = len(loc_idx)
-                dofs = list(range(offset, offset + n_local))
-                self.element_maps[fld].append(dofs)
-
-                # Build per‑node map for BCs ------------------------------
-                nd2d: Dict[int, Dict[int, int]] = self.dof_map.setdefault(fld, {})
-                for loc, dof in zip(loc_idx, dofs):
-                    phys_nid = loc2phys[loc]
-                    nd2d.setdefault(phys_nid, {})[elem.id] = dof
-
-                offset += n_local
-        self.total_dofs = offset
-        self.field_offsets = {fld: 0 for fld in self.field_names}
-        self.field_num_dofs = {fld: self.total_dofs for fld in self.field_names} # This is not quite right, but reflects that all DOFs are "in" the field space
+        Implementation note
+        -------------------
+        This reuses the mixed builder with per‑field methods; when all fields are
+        DG (the default for method='dg'), it yields element‑local DOFs while still
+        building field slices and coordinates.
+        """
+        self._build_maps_cg_mixed()
     # ------------------------------------------------------------------
     # Legacy Builders (for backward compatibility)
     # ------------------------------------------------------------------
@@ -577,13 +607,16 @@ class DofHandler:
         • This path is only used when the handler is constructed with a dict[str, Mesh].
         • For MixedElement, use `_build_maps_cg_mixed` instead.
         """
+        self._field_slices = {}
         offset = 0
         for fld, mesh in self.fe_map.items():
+            start = offset
             self.field_offsets[fld] = offset
             self.field_num_dofs[fld] = len(mesh.nodes_list)
             self.dof_map[fld] = {nd.id: offset + i for i, nd in enumerate(mesh.nodes_list)}
             self.element_maps[fld] = [[self.dof_map[fld][nid] for nid in el.nodes]
                                        for el in mesh.elements_list]
+            self._field_slices[fld] = np.arange(start, start + len(mesh.nodes_list), dtype=int)
             offset += len(mesh.nodes_list)
         self.total_dofs = offset
 
@@ -603,8 +636,10 @@ class DofHandler:
         • This path is only used when the handler is constructed with a dict[str, Mesh].
         • For MixedElement DG, use `_build_maps_dg_mixed`.
         """
+        self._field_slices = {}
         offset = 0
         for fld, mesh in self.fe_map.items():
+            start = offset
             self.field_offsets[fld] = offset
             per_node: Dict[int, Dict[int, int]] = {nd.id: {} for nd in mesh.nodes_list}
             field_dofs = 0
@@ -617,6 +652,7 @@ class DofHandler:
                 field_dofs += len(el.nodes)
             self.dof_map[fld] = per_node
             self.field_num_dofs[fld] = field_dofs
+            self._field_slices[fld] = np.arange(start, start + field_dofs, dtype=int)
         self.total_dofs = offset
 
     # ------------------------------------------------------------------
@@ -700,24 +736,44 @@ class DofHandler:
         Raises
         ------
         RuntimeError
-            If called in CG mode.
+            If called for a CG field.
         ValueError
             If the edge is a boundary (missing one owner).
-
-        Notes
-        -----
-        • This requires a precise local-edge → lattice-index mapping per element.
-        The DG mixed-order version is not implemented here and will need a careful
-        owner/edge-localization consistent with your basis tabulation.
+        NotImplementedError
+            If the element type is unsupported.
         """
-        if not self._dg_mode:
-            raise RuntimeError("Edge DOF pairs only relevant for DG spaces.")
-        mesh = self.fe_map[field]
+        if not self._is_dg_field(field):
+            raise RuntimeError("Edge DOF pairs only relevant for DG fields.")
+        if self.mixed_element is None:
+            raise RuntimeError("get_dof_pairs_for_edge requires a MixedElement‑backed DofHandler.")
+        mesh = self.mixed_element.mesh
         edge = mesh.edges_list[edge_gid]
         if edge.left is None or edge.right is None:
             raise ValueError("Edge is on boundary – no right element.")
-        
-        raise NotImplementedError("get_dof_pairs_for_edge needs careful implementation for mixed DG.")
+        if mesh.element_type != "quad":
+            raise NotImplementedError("get_dof_pairs_for_edge currently supports quad elements only.")
+
+        left = self.edge_dofs(field, edge_gid, owner="left")
+        right = self.edge_dofs(field, edge_gid, owner="right")
+        if not left or not right:
+            return left, right
+
+        # Orient both lists along the global edge direction (edge.nodes[0] -> edge.nodes[1])
+        p0 = mesh.nodes_x_y_pos[int(edge.nodes[0])]
+        p1 = mesh.nodes_x_y_pos[int(edge.nodes[1])]
+
+        def _orient(dofs: list[int]) -> list[int]:
+            c0 = self._dof_coords[int(dofs[0])]
+            c1 = self._dof_coords[int(dofs[-1])]
+            d_fwd = float(np.linalg.norm(c0 - p0) + np.linalg.norm(c1 - p1))
+            d_rev = float(np.linalg.norm(c0 - p1) + np.linalg.norm(c1 - p0))
+            return dofs if d_fwd <= d_rev else list(reversed(dofs))
+
+        left = _orient(left)
+        right = _orient(right)
+        if len(left) != len(right):
+            raise RuntimeError(f"Edge DOF mismatch for field '{field}' on edge {edge_gid}.")
+        return left, right
 
     def _require_cg(self, name: str) -> None:
         """
@@ -738,7 +794,7 @@ class DofHandler:
 
     def get_field_slice(self, field: str):
         """
-        Return the sorted list of global DOF ids that belong to a field (CG only).
+        Return the sorted list of global DOF ids that belong to a field.
 
         Parameters
         ----------
@@ -754,23 +810,25 @@ class DofHandler:
         ------
         KeyError
             If the field is unknown.
-        NotImplementedError
-            If called in DG mode.
 
         Notes
         -----
         • In MixedElement CG, `_field_slices[field]` is authoritative.
         • A legacy fallback uses `dof_map[field].values()` if slices are absent.
         """
-        self._require_cg("get_field_slice")
-        try:
-            return self._field_slices[field].tolist()
-        except Exception:
+        if field not in self.field_names:
             raise KeyError(f"Unknown field '{field}'")
+        if hasattr(self, "_field_slices") and field in self._field_slices:
+            return self._field_slices[field].tolist()
+        # fallback: unique DOFs appearing in element maps
+        s: set[int] = set()
+        for cell in self.element_maps.get(field, []):
+            s.update(int(g) for g in cell)
+        return sorted(s)
         
     def get_field_dof_coords(self, field: str) -> np.ndarray:
         """
-        Physical coordinates of all DOFs of a field (CG).
+        Physical coordinates of all DOFs of a field.
 
         Equivalent to `get_dof_coords(field)`.
 
@@ -780,7 +838,7 @@ class DofHandler:
             Coordinates in the same order as `get_field_slice(field)`.
         """
         import numpy as np
-        self._require_cg("get_field_dof_coords")
+        self._ensure_dof_coords()
         idx = np.asarray(self.get_field_slice(field), dtype=int)
         return self._dof_coords[idx]
 
@@ -808,15 +866,18 @@ class DofHandler:
         ValueError
             If the field is unknown.
         NotImplementedError
-            If called in DG mode.
+            If called for a DG field.
 
         Notes
         -----
         • Interior high-order DOFs (that do not sit on nodes) are not included.
         """
-        self._require_cg("get_field_dofs_on_nodes")
         if field not in self.field_names:
             raise ValueError(f"Unknown field '{field}'.")
+        if self._is_dg_field(field):
+            raise NotImplementedError(
+                f"get_field_dofs_on_nodes is not available for DG field '{field}'."
+            )
         return np.asarray(sorted(self.dof_map[field].values()), dtype=int)
 
 
@@ -1231,6 +1292,8 @@ class DofHandler:
         self._dof_to_node_map = {}
 
         for f in self.field_names:
+            if self._is_dg_field(f):
+                continue
             for gd in self.get_field_slice(f):
                 x, y = self._dof_coords[int(gd)]
                 k = _key((x, y))
@@ -1303,7 +1366,6 @@ class DofHandler:
         """
         import numpy as np
 
-        self._require_cg("Dirichlet BC evaluation")
         mesh = self.mixed_element.mesh
         if locators is None:
             locators = getattr(mesh, "_boundary_locators", None)
@@ -1318,15 +1380,20 @@ class DofHandler:
             # after the patch above, dof_map is built in _build_maps_cg_mixed
             pass
 
+        # Strong Dirichlet elimination is only valid for CG fields.
+        cg_fields = [f for f in self.field_names if not self._is_dg_field(f)]
+        if not cg_fields:
+            return {}
+
         out: Dict[int, float] = {}
         if not hasattr(bcs, "__iter__") or isinstance(bcs, (str, bytes)):
             bcs = [bcs]
 
-        field_sets = {f: set(self.get_field_slice(f)) for f in self.field_names}
-        field_id_cache = {f: np.asarray(sorted(field_sets[f]), dtype=int) for f in self.field_names}
+        field_sets = {f: set(self.get_field_slice(f)) for f in cg_fields}
+        field_id_cache = {f: np.asarray(sorted(field_sets[f]), dtype=int) for f in cg_fields}
         field_coord_cache = {
             f: (self._dof_coords[field_id_cache[f]] if field_id_cache[f].size else np.empty((0, 2), dtype=float))
-            for f in self.field_names
+            for f in cg_fields
         }
 
         for bc in bcs:
@@ -1337,6 +1404,8 @@ class DofHandler:
             field = (getattr(bc, "field_name", None) or getattr(bc, "field", None) or getattr(bc, "name", None))
             tag   = (getattr(bc, "domain_tag", None) or getattr(bc, "domain", None) or getattr(bc, "tag", None))
             if not isinstance(field, str) or not isinstance(tag, str):
+                continue
+            if field not in cg_fields:
                 continue
 
             selected: set[int] = set()
@@ -1651,6 +1720,8 @@ class DofHandler:
         self._dof_to_node_map = {}
 
         for f in self.field_names:
+            if self._is_dg_field(f):
+                continue
             ids = self.get_field_slice(f)
             for gd in ids:
                 x, y = self._dof_coords[int(gd)]
@@ -3782,6 +3853,373 @@ class DofHandler:
         return out
 
 
+    # --------------------------------------------------------------------
+    #  DofHandler.precompute_interior_factors   (∫ ⋯ ds on interior facets)
+    # --------------------------------------------------------------------
+    def precompute_interior_factors(
+        self,
+        edge_ids: "BitSet | Sequence[int]",
+        qdeg: int,
+        derivs: set[tuple[int, int]],
+        reuse: bool = True,
+        need_hess: bool = False,
+        need_o3: bool = False,
+        need_o4: bool = False,
+        deformation: Any = None,
+    ) -> dict:
+        """
+        Pre-compute geometry & basis tables for interior-facet (ds) integrals.
+        Produces sided reference tables (r**_pos/neg) and union DOF maps.
+        """
+        import numpy as np
+        from pycutfem.fem import transform
+        from pycutfem.integration.pre_tabulates import (
+            _searchsorted_positions,
+            _tabulate_deriv_q1,
+            _tabulate_deriv_q2,
+            _tabulate_deriv_p1,
+        )
+
+        mesh = self.mixed_element.mesh
+        me = self.mixed_element
+        fields = me.field_names
+        n_loc = me.n_dofs_per_elem
+
+        # Normalize edge ids
+        if hasattr(edge_ids, "to_indices"):
+            edge_ids = list(int(i) for i in edge_ids.to_indices())
+        else:
+            edge_ids = list(int(i) for i in edge_ids)
+
+        # Keep only interior edges
+        edges = []
+        for gid in edge_ids:
+            e = mesh.edge(int(gid))
+            if e.right is None:
+                continue
+            edges.append(e)
+        if not edges:
+            return {"eids": np.empty(0, dtype=np.int32)}
+
+        # Cache key
+        derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
+        cache_key = (
+            tuple(int(e.gid) for e in edges),
+            int(qdeg),
+            me.signature(),
+            derivs_key,
+            bool(need_hess),
+            bool(need_o3),
+            bool(need_o4),
+            getattr(self, "_method_token", self.method),
+            _def_fingerprint(deformation),
+            _coords_fingerprint(mesh.nodes_x_y_pos),
+        )
+        if reuse and cache_key in _interior_cache:
+            return _interior_cache[cache_key]
+
+        nE = len(edges)
+        pos_ids = np.empty((nE,), dtype=np.int32)
+        neg_ids = np.empty((nE,), dtype=np.int32)
+        for i, e in enumerate(edges):
+            # pos = right, neg = left so normal is neg -> pos
+            pos_ids[i] = int(e.right)
+            neg_ids[i] = int(e.left)
+
+        # Quadrature points and weights per edge (physical)
+        qp_phys = None
+        qw = None
+        for i, e in enumerate(edges):
+            p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+            qpts, wts = line_quadrature(p0, p1, qdeg)
+            if qp_phys is None:
+                nQ = len(wts)
+                qp_phys = np.zeros((nE, nQ, 2), dtype=float)
+                qw = np.zeros((nE, nQ), dtype=float)
+            qp_phys[i, :, :] = qpts
+            qw[i, :] = wts
+        nQ = 0 if qp_phys is None else qp_phys.shape[1]
+
+        # Normals oriented from neg -> pos (edge.normal is outward from left)
+        normals = np.zeros((nE, nQ, 2), dtype=float)
+        for i, e in enumerate(edges):
+            nvec = np.asarray(e.normal, dtype=float)
+            normals[i, :, :] = nvec
+
+        # Union DOF maps
+        union_lists = []
+        max_union = 0
+        for i in range(nE):
+            pos_dofs = self.get_elemental_dofs(int(pos_ids[i]))
+            neg_dofs = self.get_elemental_dofs(int(neg_ids[i]))
+            union = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+            union_lists.append(union)
+            max_union = max(max_union, union.size)
+
+        n_union = max_union
+        gdofs_map = np.empty((nE, n_union), dtype=np.int64)
+        pos_map = -np.ones((nE, n_loc), dtype=np.int32)
+        neg_map = -np.ones((nE, n_loc), dtype=np.int32)
+        for i in range(nE):
+            union = union_lists[i]
+            pad_val = union[-1]
+            gdofs_map[i, :] = pad_val
+            gdofs_map[i, : union.size] = union
+            pos_dofs = self.get_elemental_dofs(int(pos_ids[i]))
+            neg_dofs = self.get_elemental_dofs(int(neg_ids[i]))
+            pos_map[i, : len(pos_dofs)] = _searchsorted_positions(union, pos_dofs)
+            neg_map[i, : len(neg_dofs)] = _searchsorted_positions(union, neg_dofs)
+
+        # Per-field union maps
+        maps_by_field: Dict[str, np.ndarray] = {}
+        for fld in fields:
+            nloc_f = len(self.element_maps[fld][int(pos_ids[0])])
+            pm = np.empty((nE, nloc_f), dtype=np.int32)
+            nm = np.empty((nE, nloc_f), dtype=np.int32)
+            for i in range(nE):
+                union = union_lists[i]
+                col_of = {int(d): j for j, d in enumerate(union)}
+                pos_loc = self.element_maps[fld][int(pos_ids[i])]
+                neg_loc = self.element_maps[fld][int(neg_ids[i])]
+                pm[i, :] = [col_of[int(d)] for d in pos_loc]
+                nm[i, :] = [col_of[int(d)] for d in neg_loc]
+            maps_by_field[f"pos_map_{fld}"] = pm
+            maps_by_field[f"neg_map_{fld}"] = nm
+
+        # Reference coordinates and Jacobians
+        xi_pos = np.zeros((nE, nQ), dtype=float)
+        eta_pos = np.zeros_like(xi_pos)
+        xi_neg = np.zeros_like(xi_pos)
+        eta_neg = np.zeros_like(xi_pos)
+        detJ_pos = np.zeros_like(xi_pos)
+        detJ_neg = np.zeros_like(xi_pos)
+        J_inv_pos = np.zeros((nE, nQ, 2, 2), dtype=float)
+        J_inv_neg = np.zeros((nE, nQ, 2, 2), dtype=float)
+
+        for i in range(nE):
+            pe = int(pos_ids[i])
+            ne = int(neg_ids[i])
+            for q in range(nQ):
+                xq = qp_phys[i, q]
+                xi_p, eta_p = transform.inverse_mapping(mesh, pe, np.asarray(xq, float))
+                xi_n, eta_n = transform.inverse_mapping(mesh, ne, np.asarray(xq, float))
+                xi_pos[i, q] = xi_p
+                eta_pos[i, q] = eta_p
+                xi_neg[i, q] = xi_n
+                eta_neg[i, q] = eta_n
+
+                Jp = transform.jacobian(mesh, pe, (float(xi_p), float(eta_p)))
+                Jn = transform.jacobian(mesh, ne, (float(xi_n), float(eta_n)))
+                detJ_pos[i, q] = float(np.linalg.det(Jp))
+                detJ_neg[i, q] = float(np.linalg.det(Jn))
+                J_inv_pos[i, q] = np.linalg.inv(Jp)
+                J_inv_neg[i, q] = np.linalg.inv(Jn)
+
+        # Inverse-map jets for chain rule (sided; up to order 4)
+        pos_Hxi0 = pos_Hxi1 = neg_Hxi0 = neg_Hxi1 = None
+        if need_hess or need_o3 or need_o4:
+            if need_hess:
+                pos_Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+                pos_Hxi1 = np.zeros_like(pos_Hxi0)
+                neg_Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+                neg_Hxi1 = np.zeros_like(neg_Hxi0)
+            if need_o3:
+                pos_Txi0 = np.zeros((nE, nQ, 2, 2, 2), dtype=float)
+                pos_Txi1 = np.zeros_like(pos_Txi0)
+                neg_Txi0 = np.zeros((nE, nQ, 2, 2, 2), dtype=float)
+                neg_Txi1 = np.zeros_like(neg_Txi0)
+            if need_o4:
+                pos_Qxi0 = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=float)
+                pos_Qxi1 = np.zeros_like(pos_Qxi0)
+                neg_Qxi0 = np.zeros((nE, nQ, 2, 2, 2, 2), dtype=float)
+                neg_Qxi1 = np.zeros_like(neg_Qxi0)
+
+            for i in range(nE):
+                pe = int(pos_ids[i])
+                ne = int(neg_ids[i])
+                for q in range(nQ):
+                    rec = _JET.get(mesh, pe, float(xi_pos[i, q]), float(eta_pos[i, q]),
+                                   upto=4 if need_o4 else (3 if need_o3 else 2))
+                    if need_hess:
+                        A2 = rec["A2"]; pos_Hxi0[i, q] = A2[0]; pos_Hxi1[i, q] = A2[1]
+                    if need_o3:
+                        A3 = rec["A3"]; pos_Txi0[i, q] = A3[0]; pos_Txi1[i, q] = A3[1]
+                    if need_o4:
+                        A4 = rec["A4"]; pos_Qxi0[i, q] = A4[0]; pos_Qxi1[i, q] = A4[1]
+
+                    rec = _JET.get(mesh, ne, float(xi_neg[i, q]), float(eta_neg[i, q]),
+                                   upto=4 if need_o4 else (3 if need_o3 else 2))
+                    if need_hess:
+                        A2 = rec["A2"]; neg_Hxi0[i, q] = A2[0]; neg_Hxi1[i, q] = A2[1]
+                    if need_o3:
+                        A3 = rec["A3"]; neg_Txi0[i, q] = A3[0]; neg_Txi1[i, q] = A3[1]
+                    if need_o4:
+                        A4 = rec["A4"]; neg_Qxi0[i, q] = A4[0]; neg_Qxi1[i, q] = A4[1]
+
+        # Edge size for CellDiameter() on facets
+        h_arr = np.empty((nE,), dtype=float)
+        for i, e in enumerate(edges):
+            hL = mesh.element_char_length(e.left)
+            hR = mesh.element_char_length(e.right)
+            if hL is None and hR is not None:
+                h_arr[i] = hR
+            elif hR is None and hL is not None:
+                h_arr[i] = hL
+            elif hL is not None and hR is not None:
+                h_arr[i] = max(hL, hR)
+            else:
+                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+                h_arr[i] = float(np.linalg.norm(p1 - p0))
+
+        # Reference derivative tables per side/field
+        derivs = set(derivs)
+        basis_tables = {}
+        final_w = n_loc
+
+        def _tab_generic(fld: str, dx: int, dy: int, xi, eta, out_arr):
+            for e in range(nE):
+                for q in range(nQ):
+                    out_arr[e, q, :] = me._eval_scalar_deriv(
+                        fld, float(xi[e, q]), float(eta[e, q]), int(dx), int(dy)
+                    )
+
+        for fld in fields:
+            p_f = me._field_orders[fld]
+            sl = me.component_dof_slices[fld]
+            n_f = sl.stop - sl.start
+
+            def _tab(dx, dy, xi, eta, out_arr):
+                if mesh.element_type == "quad" and p_f == 1:
+                    _tabulate_deriv_q1(xi, eta, dx, dy, out_arr)
+                elif mesh.element_type == "quad" and p_f == 2:
+                    _tabulate_deriv_q2(xi, eta, dx, dy, out_arr)
+                elif mesh.element_type == "tri" and p_f == 1:
+                    _tabulate_deriv_p1(xi, eta, dx, dy, out_arr)
+                else:
+                    _tab_generic(fld, dx, dy, xi, eta, out_arr)
+
+            need_grad = any(dx + dy == 1 for dx, dy in derivs) or need_hess
+            need_h2 = any(dx + dy == 2 for dx, dy in derivs) or need_hess
+            need_o3rq = any(dx + dy == 3 for dx, dy in derivs) or need_o3
+            need_o4rq = any(dx + dy == 4 for dx, dy in derivs) or need_o4
+
+            # POS side
+            arr = np.empty((nE, nQ, n_f))
+            _tab(0, 0, xi_pos, eta_pos, arr)
+            basis_tables[f"r00_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_grad:
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r10_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r01_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_h2:
+                arr = np.empty((nE, nQ, n_f)); _tab(2, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r20_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r11_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 2, xi_pos, eta_pos, arr)
+                basis_tables[f"r02_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_o3rq:
+                arr = np.empty((nE, nQ, n_f)); _tab(3, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r30_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(2, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r21_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 2, xi_pos, eta_pos, arr)
+                basis_tables[f"r12_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 3, xi_pos, eta_pos, arr)
+                basis_tables[f"r03_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_o4rq:
+                arr = np.empty((nE, nQ, n_f)); _tab(4, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r40_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(3, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r31_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(2, 2, xi_pos, eta_pos, arr)
+                basis_tables[f"r22_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 3, xi_pos, eta_pos, arr)
+                basis_tables[f"r13_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 4, xi_pos, eta_pos, arr)
+                basis_tables[f"r04_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+
+            # NEG side
+            arr = np.empty((nE, nQ, n_f))
+            _tab(0, 0, xi_neg, eta_neg, arr)
+            basis_tables[f"r00_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_grad:
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r10_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r01_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_h2:
+                arr = np.empty((nE, nQ, n_f)); _tab(2, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r20_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r11_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 2, xi_neg, eta_neg, arr)
+                basis_tables[f"r02_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_o3rq:
+                arr = np.empty((nE, nQ, n_f)); _tab(3, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r30_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(2, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r21_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 2, xi_neg, eta_neg, arr)
+                basis_tables[f"r12_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 3, xi_neg, eta_neg, arr)
+                basis_tables[f"r03_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_o4rq:
+                arr = np.empty((nE, nQ, n_f)); _tab(4, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r40_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(3, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r31_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(2, 2, xi_neg, eta_neg, arr)
+                basis_tables[f"r22_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(1, 3, xi_neg, eta_neg, arr)
+                basis_tables[f"r13_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f)); _tab(0, 4, xi_neg, eta_neg, arr)
+                basis_tables[f"r04_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+
+        out = {
+            "eids": np.asarray([e.gid for e in edges], dtype=np.int32),
+            "qp_phys": qp_phys,
+            "qw": qw,
+            "normals": normals,
+            "gdofs_map": gdofs_map,
+            "pos_map": pos_map,
+            "neg_map": neg_map,
+            "J_inv_pos": J_inv_pos,
+            "J_inv_neg": J_inv_neg,
+            "detJ_pos": detJ_pos,
+            "detJ_neg": detJ_neg,
+            "detJ": 0.5 * (detJ_pos + detJ_neg),
+            "J_inv": 0.5 * (J_inv_pos + J_inv_neg),
+            "phis": np.zeros_like(qw),
+            "h_arr": h_arr,
+            "entity_kind": "edge",
+            "owner_pos_id": pos_ids,
+            "owner_neg_id": neg_ids,
+            "owner_id": pos_ids,
+        }
+        out.update(basis_tables)
+        out.update(maps_by_field)
+        if need_hess:
+            out.update({
+                "pos_Hxi0": pos_Hxi0, "pos_Hxi1": pos_Hxi1,
+                "neg_Hxi0": neg_Hxi0, "neg_Hxi1": neg_Hxi1,
+            })
+        if need_o3:
+            out.update({
+                "pos_Txi0": pos_Txi0, "pos_Txi1": pos_Txi1,
+                "neg_Txi0": neg_Txi0, "neg_Txi1": neg_Txi1,
+            })
+        if need_o4:
+            out.update({
+                "pos_Qxi0": pos_Qxi0, "pos_Qxi1": pos_Qxi1,
+                "neg_Qxi0": neg_Qxi0, "neg_Qxi1": neg_Qxi1,
+            })
+
+        if reuse:
+            _interior_cache[cache_key] = out
+        return out
+
 
     
     # --------------------------------------------------------------------
@@ -4627,8 +5065,7 @@ class DofHandler:
         inside_set = set(int(e) for e in elem_ids)
 
         # --- DG path: tag every DOF from selected elements ------------------------
-        method = getattr(self, "method", "cg").lower()
-        if method == "dg" or getattr(self, "_dg_mode", False):
+        if self._is_dg_field(field):
             selected: set[int] = set()
             for eid in elem_ids:
                 selected.update(int(g) for g in self.element_maps[field][int(eid)])

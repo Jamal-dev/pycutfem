@@ -91,6 +91,7 @@ class CppCodeGen:
         param_order: list[str] = []
         required_args: set[str] = set()
         ewc_rank: dict[str, int] = {}
+        analytic_shapes: dict[str, tuple[int, ...]] = {}
 
         # IR op classes
         from pycutfem.jit.ir import (
@@ -100,6 +101,7 @@ class CppCodeGen:
             LoadElementWiseConstant,
             LoadFacetNormal,
             LoadFacetNormalComponent,
+            LoadAnalytic,
             CellDiameter,
             CheckDomain,
             Grad,
@@ -169,6 +171,16 @@ class CppCodeGen:
         needs_cell_diam = False
         needs_r00: set[str] = set()
         for op in ir_sequence:
+            if isinstance(op, LoadAnalytic):
+                name = f"ana_{op.func_id}"
+                shape = tuple(getattr(op, "tensor_shape", ()) or ())
+                prev = analytic_shapes.setdefault(name, shape)
+                if prev != shape:
+                    raise ValueError(
+                        f"Analytic shape mismatch for {name}: {prev} vs {shape}"
+                    )
+                if name not in param_order:
+                    param_order.append(name)
             if isinstance(op, LoadVariable):
                 for fn in op.field_names or []:
                     needs_g.add(f"g_{fn}")
@@ -496,6 +508,16 @@ class CppCodeGen:
         if "h_arr" in param_order:
             view_lines.append("    auto h_arr_view = h_arr.unchecked<1>();")
         for name in param_order:
+            if name.startswith("ana_"):
+                shape = analytic_shapes.get(name, ())
+                if len(shape) == 0:
+                    view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+                elif len(shape) == 1:
+                    view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
+                else:
+                    raise NotImplementedError(
+                        "LoadAnalytic only implemented for scalar/vector tensors in C++ backend"
+                    )
             if name.startswith("b_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
             if name.startswith("g_"):
@@ -680,17 +702,16 @@ class CppCodeGen:
             elif isinstance(op, LoadAnalytic):
                 name = f"ana_{op.func_id}"
                 required_args.add(name)
+                view_name = f"{name}_view"
                 nm = new_tmp("ana")
                 if len(op.tensor_shape or ()) == 0:
-                    emit_line(f"auto {name}_view = {name}.unchecked<2>();")
-                    emit_line(f"double {nm} = {name}_view(e,q);")
+                    emit_line(f"double {nm} = {view_name}(e,q);")
                     stack.append(StackItem(nm, "scalar", "const", ()))
                 elif len(op.tensor_shape) == 1:
                     k = int(op.tensor_shape[0])
-                    emit_line(f"auto {name}_view = {name}.unchecked<3>();")
                     emit_line(f"Eigen::VectorXd {nm}({k});")
                     for ii in range(k):
-                        emit_line(f"{nm}({ii}) = {name}_view(e,q,{ii});")
+                        emit_line(f"{nm}({ii}) = {view_name}(e,q,{ii});")
                     stack.append(StackItem(nm, "vec", "const", (k,)))
                 else:
                     raise NotImplementedError("LoadAnalytic only implemented for scalar/vector tensors in C++ backend")

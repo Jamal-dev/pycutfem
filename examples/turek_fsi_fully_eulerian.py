@@ -3797,13 +3797,22 @@ def _interface_length(mesh: Mesh) -> float:
     return length
 
 
-def _eval_scalar_at_point(dh: DofHandler, mesh: Mesh, f_scalar: Function, point: tuple[float, float]) -> float:
+def _eval_scalar_at_point(
+    dh: DofHandler,
+    mesh: Mesh,
+    f_scalar: Function,
+    point: tuple[float, float],
+    *,
+    elem_tags: set[str] | None = None,
+) -> float:
     """
     Evaluate a scalar Function at a physical point using element search
     and basis evaluation (robust to mixed-order layouts).
     """
     xy = np.asarray(point, float)
     for e in mesh.elements_list:
+        if elem_tags is not None and e.tag not in elem_tags:
+            continue
         verts = mesh.nodes_x_y_pos[list(e.nodes)]
         if not (verts[:, 0].min() - 1e-12 <= xy[0] <= verts[:, 0].max() + 1e-12 and
                 verts[:, 1].min() - 1e-12 <= xy[1] <= verts[:, 1].max() + 1e-12):
@@ -3823,19 +3832,78 @@ def _eval_scalar_at_point(dh: DofHandler, mesh: Mesh, f_scalar: Function, point:
     return float("nan")
 
 
-def _eval_vector_at_point(dh: DofHandler, mesh: Mesh, f_vec: VectorFunction, point: tuple[float, float]) -> np.ndarray:
+def _eval_vector_at_point(
+    dh: DofHandler,
+    mesh: Mesh,
+    f_vec: VectorFunction,
+    point: tuple[float, float],
+    *,
+    elem_tags: set[str] | None = None,
+) -> np.ndarray:
     """Evaluate a 2D VectorFunction at a physical point."""
-    vals = [
-        _eval_scalar_at_point(dh, mesh, comp, point)
-        for comp in f_vec.components
-    ]
+    vals = [_eval_scalar_at_point(dh, mesh, comp, point, elem_tags=elem_tags) for comp in f_vec.components]
     return np.asarray(vals, dtype=float)
 
+# Cache for the previous tip position (important for Eulerian/ref-map tracking)
+_TIP_POS_CACHE: np.ndarray | None = None
+
+def _material_point_position_ref_map(
+    dh: DofHandler,
+    mesh: Mesh,
+    disp: VectorFunction,
+    X_ref: np.ndarray,
+    *,
+    x0: np.ndarray | None = None,
+    max_iter: int = 20,
+    tol: float = 1e-12,
+    damping: float = 1.0,
+) -> np.ndarray:
+    """Track a solid material point in the Eulerian *reference-map* formulation.
+
+    In this code, the solid displacement is Eulerian: X(x,t) = x - d(x,t).
+    A material point with reference coordinate X_ref therefore satisfies
+        X(x,t) = X_ref  ⇔  x - d(x,t) = X_ref  ⇔  x = X_ref + d(x,t).
+
+    We solve this fixed-point relation by iteration, starting from x0 (typically the
+    previous time-step tip position).
+    """
+
+    X_ref = np.asarray(X_ref, dtype=float)
+    x = np.asarray(X_ref if x0 is None else x0, dtype=float).copy()
+
+    # Evaluate displacement from the solid side (inside/cut) to avoid picking a fluid cell
+    # when the query point is on/near the interface.
+    solid_tags = {"inside", "cut"}
+
+    for _ in range(int(max_iter)):
+        d = _eval_vector_at_point(dh, mesh, disp, (float(x[0]), float(x[1])), elem_tags=solid_tags)
+        if not np.all(np.isfinite(d)):
+            # Fallback: try evaluating at the reference point.
+            d = _eval_vector_at_point(dh, mesh, disp, (float(X_ref[0]), float(X_ref[1])), elem_tags=solid_tags)
+        x_new = X_ref + d
+        if damping != 1.0:
+            x_new = x + float(damping) * (x_new - x)
+        if float(np.linalg.norm(x_new - x)) < tol:
+            x = x_new
+            break
+        x = x_new
+    return x
+
+
 def _tip_position(dh: DofHandler, mesh: Mesh, disp: VectorFunction, ref_tip: np.ndarray) -> np.ndarray:
-    """Current position of the beam tip: X_ref + u(X_ref)."""
-    dx = _eval_scalar_at_point(dh, mesh, disp.components[0], tuple(ref_tip))
-    dy = _eval_scalar_at_point(dh, mesh, disp.components[1], tuple(ref_tip))
-    return np.asarray([ref_tip[0] + dx, ref_tip[1] + dy], float)
+    """Current position of the beam tip (Eulerian / reference-map consistent).
+
+    NOTE: This project uses the Eulerian reference-map displacement d(x) with
+        X(x) = x - d(x)
+    (see also the level-set update φ(x) = φ_ref(x - d(x)) and F = (I - ∇d)^{-1}).
+    Therefore, the standard Lagrangian formula X_ref + u(X_ref) is *not* valid.
+    """
+
+    global _TIP_POS_CACHE
+    x0 = _TIP_POS_CACHE
+    x_tip = _material_point_position_ref_map(dh, mesh, disp, ref_tip, x0=x0)
+    _TIP_POS_CACHE = x_tip.copy()
+    return x_tip
 
 
 def dsigma_s(d_ref, delta_d):
@@ -3897,9 +3965,9 @@ avg_flux_fluid_trial = kappa_pos * traction_fluid(Pos(du_f_R), Pos(dp_f_R))
 avg_flux_fluid_test = kappa_pos * traction_fluid(Pos(test_vel_f_R), -Pos(test_q_f_R))
 avg_flux_fluid_res = kappa_pos * traction_fluid(Pos(uf_k_R), Pos(pf_k_R))
 
-avg_flux_solid_trial = -kappa_neg * traction_solid_L(Neg(ddisp_s_R), Neg(disp_k_R))
-avg_flux_solid_test = -kappa_neg * traction_solid_L(Neg(test_vel_s_R), Neg(disp_k_R))
-avg_flux_solid_res = -kappa_neg * traction_solid_R(Neg(disp_k_R))
+avg_flux_solid_trial = kappa_neg * traction_solid_L(Neg(ddisp_s_R), Neg(disp_k_R))
+avg_flux_solid_test = kappa_neg * traction_solid_L(Neg(test_vel_s_R), Neg(disp_k_R))
+avg_flux_solid_res = kappa_neg * traction_solid_R(Neg(disp_k_R))
 
 s_nitsche_value = float(ARGS.s_nitsche_value)
 s_nitsche = Constant(s_nitsche_value)   # 1 = symmetric, 0 = incomplete, -1 = skew-symmetric
@@ -4100,6 +4168,7 @@ def _save_vtk(step_idx: int) -> None:
     if not SAVE_VTK:
         return
     fname = os.path.join(output_dir, f"solution_{step_idx:04d}.vtu")
+    phi_nodes = ls_beam.evaluate_on_nodes(mesh)
     if VTK_INTERFACE_CLAMP > 0.0:
         num_nodes = len(mesh.nodes_list)
 
@@ -4122,7 +4191,7 @@ def _save_vtk(step_idx: int) -> None:
                 vec[int(nid), comp] = f_vec.nodal_values[int(lidx)]
             return vec
 
-        phi_nodes = ls_beam.evaluate_on_nodes(mesh)
+        
         mask = np.isfinite(phi_nodes) & (np.abs(phi_nodes) <= VTK_CLAMP_BAND)
 
         uf_nodes = _vector_to_nodes(uf_k)
@@ -4145,6 +4214,8 @@ def _save_vtk(step_idx: int) -> None:
                 "pf": pf_nodes,
                 "us": us_nodes,
                 "disp": disp_nodes,
+                # Beam level-set (negative inside solid, zero on interface)
+                "phi_beam": phi_nodes
             },
         )
         return
@@ -4157,6 +4228,8 @@ def _save_vtk(step_idx: int) -> None:
             "pf": pf_k,
             "us": us_k,
             "disp": disp_k,
+            # Beam level-set (negative inside solid, zero on interface)
+            "phi_beam": phi_nodes
         },
     )
 

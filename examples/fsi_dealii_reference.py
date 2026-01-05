@@ -1008,6 +1008,7 @@ def build_jac(
     mu_s: Constant,
     alpha_u: Constant,
     stab_eps: Constant,
+    p_gauge: Constant | None = None,
     fluid_bs,
     solid_bs,
     outlet_bs,
@@ -1118,6 +1119,8 @@ def build_jac(
             + jac_biharmonic_dd
             + jac_incompressibility_dp
             ) * dx_f
+    if p_gauge is not None:
+        volume_terms_fluid += (p_gauge * dp * test_q) * dx_f
     # -----------------------------------------------------------------------
     # ----------------- do-nothing bc ---------------------------------------
     neuman_term = NSE_ALE.get_stress_fluid_ALE_3rd_term_LinAll_short(
@@ -1146,6 +1149,8 @@ def build_jac(
         - rho_s * timestep * theta * dot(du, test_w)
         + dp * test_q
     ) * dx_s
+    if p_gauge is not None:
+        jac_solid += (p_gauge * dp * test_q) * dx_s
 
 
     return volume_terms_fluid + out_flow_jac + jac_solid
@@ -1166,6 +1171,7 @@ def build_residual(
     mu_s: Constant,
     alpha_u: Constant,
     stab_eps: Constant,
+    p_gauge: Constant | None = None,
     fluid_bs,
     solid_bs,
     outlet_bs,
@@ -1228,6 +1234,8 @@ def build_residual(
         + biharmonic_term
         + incompressibility_term
     ) * dx_f
+    if p_gauge is not None:
+        residual_fluid += (p_gauge * pk * q_test) * dx_f
     # do-nothing BC at outlet
     sigma_ALE_tilde = mu_f * dot(Finv.T, grad_v.T) 
     sigma_ALE_tilde_old = mu_f * dot(Finv_old.T, grad_v_old.T)
@@ -1256,6 +1264,8 @@ def build_residual(
         - rho_s * dt * (1.0 - theta) * inner(u_prev, w_test)
         + pk * q_test
     ) * dx_s
+    if p_gauge is not None:
+        residual_solid += (p_gauge * pk * q_test) * dx_s
 
     
     return residual_fluid + residual_outlet + residual_solid
@@ -2041,6 +2051,9 @@ def main() -> None:
                 if ids:
                     dh.dof_tags.setdefault("beam_root", set()).update(ids)
 
+    pressure_is_dg = bool(getattr(dh, "_is_dg_field", lambda f: False)("p"))
+    p_gauge = Constant(1.0e-6) if pressure_is_dg else None
+
     res_form = build_residual(
         uk=uk,
         u_prev=u_prev,
@@ -2058,6 +2071,7 @@ def main() -> None:
         mu_s=mu_s,
         alpha_u=alpha_u,
         stab_eps=stab_eps,
+        p_gauge=p_gauge,
         fluid_bs=fluid_bs,
         solid_bs=solid_bs,
         outlet_bs=outlet_bs,
@@ -2087,6 +2101,7 @@ def main() -> None:
         mu_s=mu_s,
         alpha_u=alpha_u,
         stab_eps=stab_eps,
+        p_gauge=p_gauge,
         fluid_bs=fluid_bs,
         solid_bs=solid_bs,
         outlet_bs=outlet_bs,
@@ -2102,7 +2117,7 @@ def main() -> None:
         f"dt={float(args.dt):g}, theta={float(args.theta):g} | Re_mean≈{re_mean:.1f}"
     )
     bcs, bcs_homog = build_bcs(u_mean=u_mean_ref, theta=args.theta)
-    if args.anchor_pressure:
+    if args.anchor_pressure and not pressure_is_dg:
         pinned = _pin_pressure_gauge(mesh, dh, tag="p_anchor")
         if pinned is None:
             print("[warn] Could not pin a pressure DOF; continuing without gauge fixing.")
@@ -2111,6 +2126,8 @@ def main() -> None:
             bcs.append(BoundaryCondition("p", "dirichlet", "p_anchor", zero))
             bcs_homog.append(BoundaryCondition("p", "dirichlet", "p_anchor", zero))
             print(f"Pinned pressure DOF for gauge fixing: {pinned}")
+    elif args.anchor_pressure and pressure_is_dg:
+        print("[info] DG pressure uses a weak gauge term; skipping strong pinning.")
 
     dh.apply_bcs(bcs, uk, u_prev, dk, d_prev, pk, p_prev)
     print(f"Mesh elements: fluid={fluid_bs.cardinality()}, solid={solid_bs.cardinality()}")

@@ -307,9 +307,9 @@ def build_fsi_eulerian_forms(
     avg_flux_fluid_test = kappa_pos * traction_fluid(Pos(test_vel_f), -Pos(test_q_f))
     avg_flux_fluid_res = kappa_pos * traction_fluid(Pos(uf_k), Pos(pf_k))
 
-    avg_flux_solid_trial = -kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
-    avg_flux_solid_test = -kappa_neg * traction_solid_L(Neg(test_vel_s), Neg(disp_k))
-    avg_flux_solid_res = -kappa_neg * traction_solid_R(Neg(disp_k))
+    avg_flux_solid_trial = kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
+    avg_flux_solid_test = kappa_neg * traction_solid_L(Neg(test_vel_s), Neg(disp_k))
+    avg_flux_solid_res = kappa_neg * traction_solid_R(Neg(disp_k))
 
     s_nitsche = Constant(s_nitsche_value)
 
