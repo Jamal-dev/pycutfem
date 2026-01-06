@@ -19,6 +19,7 @@ from pycutfem.jit.ir import (
 from dataclasses import replace
 import logging
 import numpy as np
+import re
 from pycutfem.utils.bitset import bitset_cache_token
 
 logger = logging.getLogger(__name__)
@@ -289,7 +290,18 @@ class IRGenerator:
             
         if isinstance(node, Constant):
             if node.dim == 0:
-                self.ir_sequence.append(LoadConstant(value=float(node.value)))
+                jit_name = getattr(node, "_jit_name", None) or getattr(node, "jit_name", None)
+                if jit_name:
+                    jit_name = str(jit_name)
+                    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", jit_name):
+                        raise ValueError(
+                            f"Invalid JIT constant name {jit_name!r}; must be a valid identifier."
+                        )
+                    self.ir_sequence.append(
+                        LoadConstantArray(name=jit_name, shape=(), role="const", is_vector=False, is_gradient=False)
+                    )
+                else:
+                    self.ir_sequence.append(LoadConstant(value=float(node.value)))
             else:
                 token = getattr(node, "cache_token", None)
                 if token is None:

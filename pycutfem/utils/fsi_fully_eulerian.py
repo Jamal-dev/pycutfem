@@ -33,6 +33,24 @@ def _copy_bitset(bs: BitSet) -> BitSet:
     return BitSet(np.array(bs.mask, dtype=bool))
 
 
+def nudge_levelset_zeros(level_set, eps: float, *, prefer_negative: bool = True, commit: bool = True) -> int:
+    """Nudge |phi|<=eps nodes away from 0 to avoid aligned-interface degeneracy."""
+    if eps <= 0.0:
+        return 0
+    if not hasattr(level_set, "nodal_values"):
+        raise TypeError("level_set must provide nodal_values() for nudging.")
+    phi_vals = level_set.nodal_values()
+    mask = np.abs(phi_vals) <= eps
+    if not np.any(mask):
+        return 0
+    phi_vals[mask] = -eps if prefer_negative else eps
+    if commit:
+        if not hasattr(level_set, "commit"):
+            raise TypeError("level_set must provide commit() when commit=True.")
+        level_set.commit()
+    return int(mask.sum())
+
+
 def _aligned_cut_mask(mesh: Mesh) -> np.ndarray:
     """Flag cut elements whose interface lies exactly on an element edge."""
     try:
@@ -125,6 +143,56 @@ def hansbo_kappa(
     theta_pos_vals = np.clip(hansbo_cut_ratio(mesh, level_set, side="+"), theta_min, 1.0)
     theta_neg_vals = np.clip(hansbo_cut_ratio(mesh, level_set, side="-"), theta_min, 1.0)
     return theta_pos_vals, theta_neg_vals
+
+
+def refresh_sliver_weights(
+    mesh: Mesh,
+    theta_pos_vals: np.ndarray,
+    theta_neg_vals: np.ndarray,
+    w_pos_vals: np.ndarray,
+    w_neg_vals: np.ndarray,
+    *,
+    theta0: float = 0.05,
+    p: float = 1.0,
+    wmax: float = 1000.0,
+    thetamin: float = 1.0e-6,
+    smooth: float = 0.3,
+) -> None:
+    """
+    Update per-element sliver weights based on Hansbo cut ratios.
+
+    Weights are only amplified on cut elements with tiny theta to avoid
+    blow-ups when a nearly aligned interface produces extreme slivers.
+    """
+    theta0 = max(float(theta0), float(thetamin))
+    wmax = max(float(wmax), 1.0)
+    cut_ids = mesh.element_bitset("cut").to_indices()
+    target_pos = np.ones_like(w_pos_vals)
+    target_neg = np.ones_like(w_neg_vals)
+
+    if cut_ids.size:
+        thp = np.maximum(theta_pos_vals[cut_ids], thetamin)
+        thn = np.maximum(theta_neg_vals[cut_ids], thetamin)
+
+        scale_p = np.ones_like(thp)
+        mask_p = thp < theta0
+        if np.any(mask_p):
+            scale_p[mask_p] = np.minimum(wmax, (theta0 / thp[mask_p]) ** p)
+
+        scale_n = np.ones_like(thn)
+        mask_n = thn < theta0
+        if np.any(mask_n):
+            scale_n[mask_n] = np.minimum(wmax, (theta0 / thn[mask_n]) ** p)
+
+        target_pos[cut_ids] = scale_p
+        target_neg[cut_ids] = scale_n
+
+    if smooth <= 0.0 or smooth >= 1.0:
+        w_pos_vals[:] = target_pos
+        w_neg_vals[:] = target_neg
+    else:
+        w_pos_vals[:] = (1.0 - smooth) * w_pos_vals + smooth * target_pos
+        w_neg_vals[:] = (1.0 - smooth) * w_neg_vals + smooth * target_neg
 
 
 def retag_inactive(
@@ -226,8 +294,11 @@ def build_fsi_eulerian_forms(
     def epsilon_f(u):
         return 0.5 * (grad(u) + grad(u).T)
 
-    def traction_fluid(u_vec, p_scal):
+    def traction_fluid_primal(u_vec, p_scal):
         return 2.0 * mu_f * dot(epsilon_f(u_vec), n) - p_scal * n
+
+    def traction_fluid_adjoint(v_vec, q_scal):
+        return 2.0 * mu_f * dot(epsilon_f(v_vec), n) + q_scal * n
 
     def F_of(d):
         return inv(I2 - grad(d))
@@ -303,13 +374,13 @@ def build_fsi_eulerian_forms(
 
     solid_adv_vel = us_n if solid_advect_lagged else us_k
 
-    avg_flux_fluid_trial = kappa_pos * traction_fluid(Pos(du_f), Pos(dp_f))
-    avg_flux_fluid_test = kappa_pos * traction_fluid(Pos(test_vel_f), -Pos(test_q_f))
-    avg_flux_fluid_res = kappa_pos * traction_fluid(Pos(uf_k), Pos(pf_k))
+    avg_flux_fluid_trial = kappa_pos * traction_fluid_primal(Pos(du_f), Pos(dp_f))
+    avg_flux_fluid_test = kappa_pos * traction_fluid_adjoint(Pos(test_vel_f), Pos(test_q_f))
+    avg_flux_fluid_res = kappa_pos * traction_fluid_primal(Pos(uf_k), Pos(pf_k))
 
-    avg_flux_solid_trial = kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
-    avg_flux_solid_test = kappa_neg * traction_solid_L(Neg(test_vel_s), Neg(disp_k))
-    avg_flux_solid_res = kappa_neg * traction_solid_R(Neg(disp_k))
+    avg_flux_solid_trial = -kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
+    avg_flux_solid_test = -kappa_neg * traction_solid_L(Neg(test_vel_s), Neg(disp_k))
+    avg_flux_solid_res = -kappa_neg * traction_solid_R(Neg(disp_k))
 
     s_nitsche = Constant(s_nitsche_value)
 

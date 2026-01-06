@@ -434,6 +434,12 @@ class Mesh:
         """
         Classify edges as 'interface' or 'ghost' based on element tags.
         """
+        try:
+            prev_tol = getattr(level_set, "edge_tol", None)
+            if prev_tol is None or float(tol) > float(prev_tol):
+                setattr(level_set, "edge_tol", float(tol))
+        except Exception:
+            pass
         phi_nodes = level_set.evaluate_on_nodes(self)
         
         for edge in self.edges_list:

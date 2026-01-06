@@ -2346,6 +2346,15 @@ class HelpersFieldAware:
         Per-element masks: for each field, mark which local DOFs lie on φ>=-tol ('+') vs φ<-tol ('−').
         """
         coords = dh.get_all_dof_coords()
+        tol_eff = SIDE.tol if tol is None else float(tol)
+        ls_tol = getattr(level_set, "edge_tol", None)
+        if ls_tol is None:
+            ls_tol = getattr(level_set, "tol", None)
+        if ls_tol is not None:
+            try:
+                tol_eff = max(tol_eff, float(ls_tol))
+            except Exception:
+                pass
         pos_masks: Dict[str, np.ndarray] = {}
         neg_masks: Dict[str, np.ndarray] = {}
         for fld in fields:
@@ -2357,12 +2366,9 @@ class HelpersFieldAware:
             from pycutfem.ufl.helpers_geom import phi_eval
             phi  = np.asarray([phi_eval(level_set, p) for p in xy], dtype=float)
             # Use the single global rule
-            pos_mask = np.array([1.0 if SIDE.is_pos(val, tol=tol) else 0.0 for val in phi], dtype=float)
-            neg_mask = np.array([1.0 if SIDE.is_neg(val, tol=tol) else 0.0 for val in phi], dtype=float)
-            if tol is None:
-                tol_chk = SIDE.tol
-            else:
-                tol_chk = tol
+            pos_mask = np.array([1.0 if SIDE.is_pos(val, tol=tol_eff) else 0.0 for val in phi], dtype=float)
+            neg_mask = np.array([1.0 if SIDE.is_neg(val, tol=tol_eff) else 0.0 for val in phi], dtype=float)
+            tol_chk = tol_eff
             if pos_mask.shape == neg_mask.shape:
                 interface_idx = np.abs(phi) <= float(tol_chk)
                 if np.any(interface_idx):

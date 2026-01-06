@@ -131,6 +131,32 @@ def test_aligned_interface_couples_neighbors(backend):
 
 
 @pytest.mark.parametrize("backend", ["python", "jit"])
+def test_aligned_rectangle_interface_perimeter(backend):
+    """
+    Rectangle aligned with mesh lines should be handled purely by aligned-interface assembly.
+    """
+    nodes, elems, edges, corners = structured_quad(1.0, 1.0, nx=4, ny=4, poly_order=1)
+    mesh = Mesh(nodes=nodes, element_connectivity=elems, edges_connectivity=edges,
+                elements_corner_nodes=corners, element_type="quad", poly_order=1)
+
+    # Beam edges at x/y = 0.25, 0.75 align with the grid.
+    ls = BeamLevelSet(center=(0.5, 0.5), Lb=0.5, Hb=0.5)
+    mesh.classify_elements(ls)
+    mesh.classify_edges(ls)
+    mesh.build_interface_segments(ls)
+
+    assert mesh.edge_bitset("interface").cardinality() > 0
+    assert mesh.element_bitset("cut").cardinality() == 0
+
+    me = MixedElement(mesh, field_specs={"u": 1})
+    dh = DofHandler(me, method="cg")
+
+    form = Constant(1.0) * dInterface(level_set=ls, metadata={"q": 4})
+    val = _assemble_scalar(form, dh, backend=backend)
+    assert_allclose(val, 2.0, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("backend", ["python", "jit"])
 def test_beam_corner_jump_matches_symbolic(backend):
     """
     Beam level set corner in a single element produces two segments (one aligned).
@@ -217,7 +243,8 @@ def test_phi_changed_detector_recomputes_only_changed_ids(backend):
 
     # Tilted line to guarantee true cut elements (not edge-aligned)
     ls0 = AffineLevelSet(a=1.0, b=0.2, c=-0.55)
-    ls1 = AffineLevelSet(a=1.0, b=0.2, c=-0.45)  # larger shift to move phi visibly
+    # Keep the cut element set unchanged (still crosses x=0.5 somewhere in y∈[0,1])
+    ls1 = AffineLevelSet(a=1.0, b=0.2, c=-0.53)
 
     mesh.classify_elements(ls0)
     mesh.classify_edges(ls0)
@@ -331,6 +358,36 @@ def test_aligned_interface_tagging_no_cut():
         assert np.allclose(coords[:, 0], 0.5, atol=1e-12)
         phi_vals = np.array([ls(np.asarray(pt, float)) for pt in coords], dtype=float)
         assert np.all(np.abs(phi_vals) <= tol)
+
+
+@pytest.mark.parametrize("backend", ["jit"])
+def test_compile_multi_aligned_interface_edges(backend):
+    mesh, ls = _aligned_mesh()
+    mesh.build_interface_segments(ls)
+    iface_edges = np.asarray(mesh.edge_bitset("interface").to_indices(), dtype=np.int32)
+    assert iface_edges.size > 0
+
+    me = MixedElement(mesh, field_specs={"u_pos_x": 1})
+    dh = DofHandler(me, method="cg")
+    u = Function("u_pos_x", field_name="u_pos_x", dof_handler=dh)
+    v = TestFunction("u_pos_x", "u_pos_x", dh)
+    form = u * v * dInterface(level_set=ls, metadata={"q": 2})
+    eq = Equation(form, None)
+
+    kernels = compile_multi(eq, dof_handler=dh, mixed_element=me, backend=backend)
+    iface_kernels = [k for k in kernels if k.domain == "interface"]
+    assert iface_kernels, "expected interface kernels for aligned edges"
+
+    edge_kernels = [k for k in iface_kernels if k.static_args.get("entity_kind") == "edge"]
+    assert edge_kernels, "expected aligned-edge interface kernel"
+    edge_ids = np.unique(np.concatenate([np.asarray(k.static_args.get("eids", []), dtype=np.int32) for k in edge_kernels]))
+    assert np.array_equal(np.sort(edge_ids), np.sort(iface_edges))
+
+    cut_kernels = [k for k in iface_kernels if k.static_args.get("entity_kind") == "element"]
+    assert cut_kernels, "expected cut-interface kernel"
+    for k in cut_kernels:
+        eids = np.asarray(k.static_args.get("eids", []), dtype=np.int32)
+        assert eids.size == 0
 
 
 def test_aligned_interface_tagging_high_order_nodes():

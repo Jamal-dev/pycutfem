@@ -293,9 +293,12 @@ def build_stokes_problem(with_deformation: bool) -> ProblemData:
     n = FacetNormal()
 
     theta_pos_vals = hansbo_cut_ratio(mesh, level_set, side="+")
-    theta_neg_vals = 1.0 - theta_pos_vals
-    kappa_pos = Pos(ElementWiseConstant(theta_pos_vals))
-    kappa_neg = Neg(ElementWiseConstant(theta_neg_vals))
+    theta_neg_vals = hansbo_cut_ratio(mesh, level_set, side="-")
+    theta_pos_cell = ElementWiseConstant(theta_pos_vals)
+    theta_neg_cell = ElementWiseConstant(theta_neg_vals)
+    theta_sum = Pos(theta_pos_cell) + Neg(theta_neg_cell) + Constant(1.0e-12)
+    kappa_pos = Pos(theta_pos_cell) / theta_sum
+    kappa_neg = Neg(theta_neg_cell) / theta_sum
 
     lambda_nitsche = Constant(0.5 * (mu[0].value + mu[1].value) * 20 * poly_order**2)
     gamma_stab_v = Constant(0.05)

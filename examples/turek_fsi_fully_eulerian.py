@@ -50,6 +50,10 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.utils.bitset import BitSet
+from pycutfem.utils.fsi_fully_eulerian import (
+    nudge_levelset_zeros as _nudge_levelset_zeros,
+    refresh_sliver_weights,
+)
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
 from pycutfem.utils.ogrid_meshgen import circular_hole_ogrid
 from pycutfem.utils.refinement import TensorRefiner
@@ -286,7 +290,18 @@ def _parse_args():
     parser.add_argument("--no-use-restricted-forms", dest="use_restricted_forms", action="store_false", help="Disable restricted forms. Env: USE_RESTRICTED_FORMS.")
     parser.add_argument("--use-linear-solid", dest="use_linear_solid", action="store_true", help="Use linearized solid stress. Env: USE_LINEAR_SOLID.")
     parser.add_argument("--no-use-linear-solid", dest="use_linear_solid", action="store_false", help="Use nonlinear StVK solid. Env: USE_LINEAR_SOLID.")
-    parser.add_argument("--levelset-zero-eps", type=float, default=None, help="Nudge epsilon for level-set zeros. Env: LEVELSET_ZERO_EPS.")
+    parser.add_argument(
+        "--levelset-zero-eps",
+        type=float,
+        default=None,
+        help="Interface edge tolerance (zero band). Env: LEVELSET_ZERO_EPS.",
+    )
+    parser.add_argument(
+        "--levelset-nudge-eps",
+        type=float,
+        default=None,
+        help="Nudge epsilon for level-set nodes. Env: LEVELSET_NUDGE_EPS.",
+    )
     levelset_side_default = os.getenv("LEVELSET_ZERO_SIDE", "neg").strip().lower()
     if not levelset_side_default:
         levelset_side_default = "neg"
@@ -392,7 +407,7 @@ def _parse_args():
         plot_only=_env_bool("PLOT_ONLY", False),
         force_full_setup=_env_bool("FORCE_FULL_SETUP", False),
         refine_initial=_env_bool("REFINE_INITIAL", True),
-        pin_pressure=_env_bool("PIN_PRESSURE", False),
+        pin_pressure=_env_bool("PIN_PRESSURE", True),
         use_aligned_interface=_env_bool("USE_ALIGNED_INTERFACE", True),
         solid_advect_lagged=_env_bool("SOLID_ADVECT_LAGGED", True),
         use_restricted_forms=_env_bool("USE_RESTRICTED_FORMS", True),
@@ -454,6 +469,9 @@ def _parse_args():
     if args.levelset_zero_eps is None:
         env_zero = _env_float("LEVELSET_ZERO_EPS")
         args.levelset_zero_eps = env_zero if env_zero is not None else max(1.0e-10, 1.0e-8 * args.mesh_size)
+    if args.levelset_nudge_eps is None:
+        env_nudge = _env_float("LEVELSET_NUDGE_EPS")
+        args.levelset_nudge_eps = env_nudge
     if args.levelset_update_tol is None:
         env_update_tol = _env_float("LEVELSET_UPDATE_TOL")
         args.levelset_update_tol = env_update_tol if env_update_tol is not None else max(1.0e-12, 1.0e-10 * args.mesh_size)
@@ -505,6 +523,7 @@ def _apply_env_overrides(args: argparse.Namespace) -> None:
     _set_env_bool("USE_RESTRICTED_FORMS", args.use_restricted_forms)
     _set_env_bool("USE_LINEAR_SOLID", args.use_linear_solid)
     _set_env("LEVELSET_ZERO_EPS", args.levelset_zero_eps)
+    _set_env("LEVELSET_NUDGE_EPS", args.levelset_nudge_eps)
     _set_env("LEVELSET_ZERO_SIDE", args.levelset_zero_side)
     _set_env("LEVELSET_UPDATE_TOL", args.levelset_update_tol)
     _set_env_bool("FD_TIMING", args.fd_timing)
@@ -582,19 +601,32 @@ BEAM_ROOT_TOL = float(max(1.0e-6, 1.0e-3 * MESH_SIZE))
 BEAM_ROOT_BIAS = float(max(1.0e-8, 1.0e-4 * MESH_SIZE))
 BEAM_ROOT_INSET = float(os.getenv("BEAM_ROOT_INSET", str(max(5.0e-4, 0.04 * MESH_SIZE))))
 BEAM_ROOT_DOF_TOL = float(os.getenv("BEAM_ROOT_DOF_TOL", str(max(0.2 * MESH_SIZE, 1.0e-3))))
-PIN_PRESSURE = os.getenv("PIN_PRESSURE", "0") not in ("0", "false", "False")
+PIN_PRESSURE = os.getenv("PIN_PRESSURE", "1") not in ("0", "false", "False")
 SOLID_CUT_DROP = float(os.getenv("SOLID_CUT_DROP", "0.0"))
 USE_ALIGNED_INTERFACE = os.getenv("USE_ALIGNED_INTERFACE", "1") not in ("0", "false", "False")
 SOLID_ADVECT_LAGGED = os.getenv("SOLID_ADVECT_LAGGED", "1") not in ("0", "false", "False")
 USE_RESTRICTED_FORMS = os.getenv("USE_RESTRICTED_FORMS", "1") not in ("0", "false", "False")
 USE_LINEAR_SOLID = os.getenv("USE_LINEAR_SOLID", "1") not in ("0", "false", "False")
 LEVELSET_ZERO_EPS = float(os.getenv("LEVELSET_ZERO_EPS", str(max(1.0e-10, 1.0e-8 * MESH_SIZE))))
+LEVELSET_EDGE_TOL = float(os.getenv("LEVELSET_EDGE_TOL", str(LEVELSET_ZERO_EPS)))
 LEVELSET_ZERO_SIDE = os.getenv("LEVELSET_ZERO_SIDE", "neg").strip().lower()
 LEVELSET_PREFER_NEGATIVE = LEVELSET_ZERO_SIDE != "pos"
 LEVELSET_UPDATE_TOL = float(os.getenv("LEVELSET_UPDATE_TOL", str(max(1.0e-12, 1.0e-10 * MESH_SIZE))))
-if USE_ALIGNED_INTERFACE and LEVELSET_ZERO_EPS > 0.0:
-    print("[interface] USE_ALIGNED_INTERFACE=1 -> disabling level-set zero nudging (LEVELSET_ZERO_EPS=0)")
-    LEVELSET_ZERO_EPS = 0.0
+LEVELSET_EDGE_TOL = max(LEVELSET_EDGE_TOL, LEVELSET_UPDATE_TOL)
+_nudge_env = os.getenv("LEVELSET_NUDGE_EPS", "").strip()
+if _nudge_env:
+    LEVELSET_NUDGE_EPS = float(_nudge_env)
+else:
+    LEVELSET_NUDGE_EPS = 0.0 if USE_ALIGNED_INTERFACE else LEVELSET_EDGE_TOL
+if USE_ALIGNED_INTERFACE and LEVELSET_NUDGE_EPS > 0.0:
+    print("[interface] LEVELSET_NUDGE_EPS>0 with USE_ALIGNED_INTERFACE=1 will shift aligned edges.")
+
+# Sliver stabilization weights for near-aligned cuts
+SLIVER_THETA0 = float(os.getenv("SLIVER_THETA0", "0.05"))
+SLIVER_P = float(os.getenv("SLIVER_P", "1.0"))
+SLIVER_WMAX = float(os.getenv("SLIVER_WMAX", "1000.0"))
+SLIVER_THETAMIN = float(os.getenv("SLIVER_THETAMIN", "1e-6"))
+SLIVER_SMOOTH = float(os.getenv("SLIVER_SMOOTH", "0.3"))
 
 # -----------------------------------------------------------------------------
 # Mesh and boundary helpers
@@ -2263,35 +2295,13 @@ def fix_fragmented_sides(mesh: Mesh, max_segments: int = 2, max_iters: int = 2) 
 # -----------------------------------------------------------------------------
 
 
-def _nudge_levelset_zeros(
-    ls_beam: LevelSetGridFunction,
-    eps: float,
-    *,
-    prefer_negative: bool = True,
-    commit: bool = True,
-) -> int:
-    """
-    Prevent φ=0 nodes from aligning with mesh edges by nudging to ±eps.
-    This avoids degenerate interface segments when the interface falls on edges.
-    """
-    if eps <= 0.0:
-        return 0
-    phi_vals = ls_beam.nodal_values()
-    mask = np.abs(phi_vals) <= eps
-    if not np.any(mask):
-        return 0
-    phi_vals[mask] = -eps if prefer_negative else eps
-    if commit:
-        ls_beam.commit()
-    return int(mask.sum())
-
-
 def update_beam_levelset_from_displacement(
     ls_beam: LevelSetGridFunction,
     disp_vec: VectorFunction,
     beam_ref_ls: Callable[[np.ndarray], float],
     *,
-    zero_eps: float = 0.0,
+    nudge_eps: float = 0.0,
+    edge_tol: float | None = None,
     prefer_negative: bool = True,
     update_tol: float = 0.0,
 ) -> bool:
@@ -2372,17 +2382,48 @@ def update_beam_levelset_from_displacement(
         li = ls_beam._g2l[int(gd_phi)]
         phi_new = float(phi_new)
         phi_new_vals[int(li)] = phi_new
-    if zero_eps > 0.0:
-        nudge_mask = np.abs(phi_new_vals) <= zero_eps
+    if nudge_eps > 0.0:
+        nudge_mask = np.abs(phi_new_vals) <= nudge_eps
         if np.any(nudge_mask):
-            phi_new_vals[nudge_mask] = -zero_eps if prefer_negative else zero_eps
+            phi_new_vals[nudge_mask] = -nudge_eps if prefer_negative else nudge_eps
 
     max_diff = float(np.max(np.abs(phi_new_vals - phi_vals))) if phi_vals.size else 0.0
+    phi_diff = np.abs(phi_new_vals - phi_vals) if phi_vals.size else np.array([], dtype=float)
     if max_diff <= update_tol:
+        ls_beam._last_update_stats = {
+            "changed": False,
+            "max_diff": max_diff,
+            "max_diff_cut": 0.0,
+            "cut_elems": 0,
+            "interface_edges": 0,
+        }
         return False
 
     phi_vals[:] = phi_new_vals
-    ls_beam.commit()
+    tol_commit = edge_tol if edge_tol is not None else LEVELSET_EDGE_TOL
+    ls_beam.commit(tol=tol_commit)
+    if edge_tol is not None:
+        mesh.classify_edges(ls_beam, tol=edge_tol)
+        mesh.build_interface_segments(ls_beam, tol=edge_tol)
+
+    cut_ids = mesh.element_bitset("cut").to_indices()
+    interface_edges = mesh.edge_bitset("interface").to_indices()
+    max_diff_cut = 0.0
+    if cut_ids.size and phi_diff.size:
+        diff_by_node = np.full(n_nodes, np.nan, dtype=float)
+        diff_by_node[node_ids] = phi_diff
+        cut_nodes = np.unique(np.concatenate([mesh.elements_connectivity[int(eid)] for eid in cut_ids]))
+        if cut_nodes.size:
+            cut_vals = diff_by_node[cut_nodes]
+            if np.any(np.isfinite(cut_vals)):
+                max_diff_cut = float(np.nanmax(cut_vals))
+    ls_beam._last_update_stats = {
+        "changed": True,
+        "max_diff": max_diff,
+        "max_diff_cut": max_diff_cut,
+        "cut_elems": int(cut_ids.size),
+        "interface_edges": int(interface_edges.size),
+    }
     return True
 
 
@@ -2493,6 +2534,36 @@ def refresh_hansbo_kappa(
 ) -> None:
     theta_pos_vals[:] = np.clip(hansbo_cut_ratio(mesh, level_set, side="+"), theta_min, 1.0)
     theta_neg_vals[:] = np.clip(hansbo_cut_ratio(mesh, level_set, side="-"), theta_min, 1.0)
+
+
+def log_sliver_stats(
+    mesh: Mesh,
+    theta_pos_vals: np.ndarray,
+    theta_neg_vals: np.ndarray,
+    w_pos_vals: np.ndarray,
+    w_neg_vals: np.ndarray,
+    *,
+    theta0: float,
+) -> None:
+    cut_ids = mesh.element_bitset("cut").to_indices()
+    if cut_ids.size == 0:
+        print("[sliver] no cut elements (weights stay at 1.0)")
+        return
+    thp = theta_pos_vals[cut_ids]
+    thn = theta_neg_vals[cut_ids]
+    wp = w_pos_vals[cut_ids]
+    wn = w_neg_vals[cut_ids]
+    print(
+        "[sliver] min θ+ = {:.3e}  min θ- = {:.3e}  max w+ = {:.3e}  max w- = {:.3e}  "
+        "#(θ+<θ0) = {}  #(θ-<θ0) = {}".format(
+            float(thp.min()),
+            float(thn.min()),
+            float(wp.max()),
+            float(wn.max()),
+            int((thp < theta0).sum()),
+            int((thn < theta0).sum()),
+        )
+    )
 
 
 def mesh_topology_diagnostics(mesh: Mesh) -> dict[str, int]:
@@ -3394,17 +3465,22 @@ ls_me = MixedElement(mesh, field_specs={"phi_beam": POLY_ORDER})
 ls_dh = DofHandler(ls_me, method="cg")
 ls_beam = LevelSetGridFunction(ls_dh, field="phi_beam")
 ls_beam.interpolate(lambda x, y: beam_ref_ls(np.array([x, y])))
-ls_beam.commit()
-nudged = _nudge_levelset_zeros(ls_beam, LEVELSET_ZERO_EPS, prefer_negative=LEVELSET_PREFER_NEGATIVE)
+ls_beam.commit(tol=LEVELSET_EDGE_TOL)
+nudged = _nudge_levelset_zeros(
+    ls_beam,
+    LEVELSET_NUDGE_EPS,
+    prefer_negative=LEVELSET_PREFER_NEGATIVE,
+    commit=False,
+)
 if nudged:
     print(
-        f"[levelset] nudged {nudged} near-zero nodes by {LEVELSET_ZERO_EPS:.2e} "
+        f"[levelset] nudged {nudged} near-zero nodes by {LEVELSET_NUDGE_EPS:.2e} "
         f"towards {'-' if LEVELSET_PREFER_NEGATIVE else '+'}"
     )
 # Classify mesh against beam level set
-mesh.classify_elements(ls_beam)
-mesh.classify_edges(ls_beam)
-mesh.build_interface_segments(ls_beam)
+mesh.classify_elements(ls_beam, tol=LEVELSET_EDGE_TOL)
+mesh.classify_edges(ls_beam, tol=LEVELSET_EDGE_TOL)
+mesh.build_interface_segments(ls_beam, tol=LEVELSET_EDGE_TOL)
 _log_step("interpolated/committed level set")
 if not USE_ALIGNED_INTERFACE:
     disabled = _disable_aligned_interface_edges(mesh)
@@ -3678,8 +3754,40 @@ beta_N = Constant(BETA_PENALTY * POLY_ORDER * (POLY_ORDER + 1))
 theta_min = 1.0e-3
 theta_pos_vals = np.clip(hansbo_cut_ratio(mesh, ls_beam, side="+"), theta_min, 1.0)
 theta_neg_vals = np.clip(hansbo_cut_ratio(mesh, ls_beam, side="-"), theta_min, 1.0)
-kappa_pos = Pos(ElementWiseConstant(theta_pos_vals))
-kappa_neg = Neg(ElementWiseConstant(theta_neg_vals))
+w_pos_vals = np.ones_like(theta_pos_vals)
+w_neg_vals = np.ones_like(theta_neg_vals)
+refresh_sliver_weights(
+    mesh,
+    theta_pos_vals,
+    theta_neg_vals,
+    w_pos_vals,
+    w_neg_vals,
+    theta0=SLIVER_THETA0,
+    p=SLIVER_P,
+    wmax=SLIVER_WMAX,
+    thetamin=SLIVER_THETAMIN,
+    smooth=SLIVER_SMOOTH,
+)
+
+theta_pos_cell = ElementWiseConstant(theta_pos_vals)
+theta_neg_cell = ElementWiseConstant(theta_neg_vals)
+theta_sum = Pos(theta_pos_cell) + Neg(theta_neg_cell) + Constant(1.0e-12)
+kappa_pos = Pos(theta_pos_cell) / theta_sum
+kappa_neg = Neg(theta_neg_cell) / theta_sum
+
+w_pos_cell = ElementWiseConstant(w_pos_vals)
+w_neg_cell = ElementWiseConstant(w_neg_vals)
+w_gp_fluid = Constant(0.5) * (Pos(w_pos_cell) + Neg(w_pos_cell))
+w_gp_solid = Constant(0.5) * (Pos(w_neg_cell) + Neg(w_neg_cell))
+w_gp_ifc = Constant(0.5) * (w_gp_fluid + w_gp_solid)
+log_sliver_stats(
+    mesh,
+    theta_pos_vals,
+    theta_neg_vals,
+    w_pos_vals,
+    w_neg_vals,
+    theta0=SLIVER_THETA0,
+)
 retag_inactive(dof_handler, theta_neg=theta_neg_vals, solid_cut_drop=SOLID_CUT_DROP)
 
 use_restricted_forms = USE_RESTRICTED_FORMS
@@ -3747,9 +3855,12 @@ def sigma_s_linear_weak_nonlinear_residual(disp_k, grad_v_test):
     return 2.0 * Constant(MU_S) * inner(eps, grad_v_test) + Constant(LAMBDA_S) * trace(eps) * trace(grad_v_test)
 
 
-def traction_fluid(u_vec, p_scal):
+def traction_fluid_primal(u_vec, p_scal):
     return 2.0 * Constant(MU_F) * dot(epsilon_f(u_vec), n) - p_scal * n
 
+
+def traction_fluid_adjoint(v_vec, q_scal):
+    return 2.0 * Constant(MU_F) * dot(epsilon_f(v_vec), n) + q_scal * n
 
 def F_of(d):
     # Eulerian displacement: X = x - d(x) ⇒ F = (I - ∇d)^{-1}
@@ -3946,6 +4057,7 @@ def grad_inner_jump(u, v):
 # Weak forms
 # -----------------------------------------------------------------------------
 dt = Constant(DT)
+dt._jit_name = "dt"
 theta = Constant(float(ARGS.theta))
 rho_f_const = Constant(RHO_F)
 rho_s_const = Constant(RHO_S)
@@ -3953,31 +4065,45 @@ mu_f_const = Constant(MU_F)
 mu_s_const = Constant(MU_S)
 lambda_s_const = Constant(LAMBDA_S)
 
-jump_vel_trial = Pos(du_f_R) - Neg(du_s_R)
-jump_vel_test = Pos(test_vel_f_R) - Neg(test_vel_s_R)
-jump_vel_res = Pos(uf_k_R) - Neg(us_k_R)
-jump_test_f = Pos(test_vel_f_R)
-jump_test_s = Neg(test_vel_s_R)
+du_f_ifc = du_f
+dp_f_ifc = dp_f
+test_vel_f_ifc = test_vel_f
+test_q_f_ifc = test_q_f
+uf_k_ifc = uf_k
+pf_k_ifc = pf_k
+du_s_ifc = du_s
+ddisp_s_ifc = ddisp_s
+test_vel_s_ifc = test_vel_s
+us_k_ifc = us_k
+disp_k_ifc = disp_k
+
+jump_vel_trial = Pos(du_f_ifc) - Neg(du_s_ifc)
+jump_vel_test = Pos(test_vel_f_ifc) - Neg(test_vel_s_ifc)
+jump_vel_res = Pos(uf_k_ifc) - Neg(us_k_ifc)
+jump_test_f = Pos(test_vel_f_ifc)
+jump_test_s = Neg(test_vel_s_ifc)
 
 solid_adv_vel = us_n_R if SOLID_ADVECT_LAGGED else us_k_R
 
-avg_flux_fluid_trial = kappa_pos * traction_fluid(Pos(du_f_R), Pos(dp_f_R))
-avg_flux_fluid_test = kappa_pos * traction_fluid(Pos(test_vel_f_R), -Pos(test_q_f_R))
-avg_flux_fluid_res = kappa_pos * traction_fluid(Pos(uf_k_R), Pos(pf_k_R))
+avg_flux_fluid_trial = kappa_pos * traction_fluid_primal(Pos(du_f_ifc), Pos(dp_f_ifc))
+avg_flux_fluid_test =  kappa_pos * traction_fluid_adjoint(Pos(test_vel_f_ifc), Pos(test_q_f_ifc))
+avg_flux_fluid_res =   kappa_pos * traction_fluid_primal(Pos(uf_k_ifc), Pos(pf_k_ifc))
 
-avg_flux_solid_trial = kappa_neg * traction_solid_L(Neg(ddisp_s_R), Neg(disp_k_R))
-avg_flux_solid_test = kappa_neg * traction_solid_L(Neg(test_vel_s_R), Neg(disp_k_R))
-avg_flux_solid_res = kappa_neg * traction_solid_R(Neg(disp_k_R))
+# Should we have a negative sign here?
+avg_flux_solid_trial = kappa_neg * traction_solid_L(Neg(ddisp_s_ifc), Neg(disp_k_ifc))
+avg_flux_solid_test =  kappa_neg * traction_solid_L(Neg(test_vel_s_ifc), Neg(disp_k_ifc))
+avg_flux_solid_res =   kappa_neg * traction_solid_R(Neg(disp_k_ifc))
 
 s_nitsche_value = float(ARGS.s_nitsche_value)
 s_nitsche = Constant(s_nitsche_value)   # 1 = symmetric, 0 = incomplete, -1 = skew-symmetric
 
-J_int_fluid = (-dot(avg_flux_fluid_trial, jump_test_f)) * dΓ + (dot(avg_flux_fluid_trial, jump_test_s)) * dΓ
-R_int_fluid = (-dot(avg_flux_fluid_res, jump_test_f)) * dΓ + (dot(avg_flux_fluid_res, jump_test_s)) * dΓ
-J_int_solid = (-dot(avg_flux_solid_trial, jump_test_f)) * dΓ + (dot(avg_flux_solid_trial, jump_test_s)) * dΓ
-R_int_solid = (-dot(avg_flux_solid_res, jump_test_f)) * dΓ + (dot(avg_flux_solid_res, jump_test_s)) * dΓ
-J_int_pen = (beta_N * mu_f_const / cell_h) * dot(jump_vel_trial, jump_vel_test) * dΓ
-R_int_pen = (beta_N * mu_f_const / cell_h) * dot(jump_vel_res, jump_vel_test) * dΓ
+# What should be the sign here?
+J_int_fluid = (-dot(avg_flux_fluid_trial, jump_test_f)) * dΓ - (dot(avg_flux_fluid_trial, jump_test_s)) * dΓ
+R_int_fluid = (-dot(avg_flux_fluid_res, jump_test_f)) * dΓ   - (dot(avg_flux_fluid_res, jump_test_s)) * dΓ
+J_int_solid = (-dot(avg_flux_solid_trial, jump_test_f)) * dΓ - (dot(avg_flux_solid_trial, jump_test_s)) * dΓ
+R_int_solid = (-dot(avg_flux_solid_res, jump_test_f)) * dΓ   - (dot(avg_flux_solid_res, jump_test_s)) * dΓ
+J_int_pen = (beta_N * mu_f_const / cell_h) * w_gp_ifc * dot(jump_vel_trial, jump_vel_test) * dΓ
+R_int_pen = (beta_N * mu_f_const / cell_h) * w_gp_ifc * dot(jump_vel_res, jump_vel_test) * dΓ
 
 J_int = J_int_fluid + J_int_solid + J_int_pen
 R_int = R_int_fluid + R_int_solid + R_int_pen
@@ -4070,9 +4196,10 @@ r_svc = (
 
 penalty_val = float(os.getenv("PENALTY_VAL", "0.0"))
 penalty_grad = float(os.getenv("PENALTY_GRAD", "0.0"))
-gamma_v = Constant(penalty_val * POLY_ORDER**2)
-gamma_v_grad = Constant(penalty_grad * POLY_ORDER**2)
-gamma_p = Constant(penalty_val * POLY_ORDER)
+gamma_v_f = Constant(penalty_val * POLY_ORDER**2) * w_gp_fluid
+gamma_p_f = Constant(penalty_val * POLY_ORDER) * w_gp_fluid
+gamma_v_s = Constant(penalty_val * POLY_ORDER**2) * w_gp_solid
+gamma_disp_s = Constant(penalty_grad * POLY_ORDER**2) * w_gp_solid
 solid_reg_eps = Constant(float(os.getenv("SOLID_REG_EPS", "1e-6")))
 
 
@@ -4093,13 +4220,13 @@ def g_disp_s(gamma, phi_1, phi_2):
 
 
 a_stab = (
-    (Constant(2.0) * mu_f_const * g_v_f(gamma_v, du_f_R, test_vel_f_R) + g_p(gamma_p, dp_f_R, test_q_f_R)) * dG_fluid
-    + (rho_s_const * g_v_s(gamma_v, du_s_R, test_vel_s_R) + Constant(2.0) * mu_s_const * g_disp_s(gamma_v_grad, ddisp_s_R, test_disp_s_R))
+    (Constant(2.0) * mu_f_const * g_v_f(gamma_v_f, du_f_R, test_vel_f_R) + g_p(gamma_p_f, dp_f_R, test_q_f_R)) * dG_fluid
+    + (rho_s_const * g_v_s(gamma_v_s, du_s_R, test_vel_s_R) + Constant(2.0) * mu_s_const * g_disp_s(gamma_disp_s, ddisp_s_R, test_disp_s_R))
     * dG_solid
 )
 r_stab = (
-    (Constant(2.0) * mu_f_const * g_v_f(gamma_v, uf_k_R, test_vel_f_R) + g_p(gamma_p, pf_k_R, test_q_f_R)) * dG_fluid
-    + (rho_s_const * g_v_s(gamma_v, us_k_R, test_vel_s_R) + Constant(2.0) * mu_s_const * g_disp_s(gamma_v_grad, disp_k_R, test_disp_s_R))
+    (Constant(2.0) * mu_f_const * g_v_f(gamma_v_f, uf_k_R, test_vel_f_R) + g_p(gamma_p_f, pf_k_R, test_q_f_R)) * dG_fluid
+    + (rho_s_const * g_v_s(gamma_v_s, us_k_R, test_vel_s_R) + Constant(2.0) * mu_s_const * g_disp_s(gamma_disp_s, disp_k_R, test_disp_s_R))
     * dG_solid
 )
 
@@ -4108,6 +4235,86 @@ r_reg = solid_reg_eps * (dot(us_k_R, test_vel_s_R) + dot(disp_k_R, test_disp_s_R
 
 jacobian_form = a_vol_f + J_int + a_vol_s + a_stab + a_svc + a_reg
 residual_form = r_vol_f + R_int + r_vol_s + r_stab + r_svc + r_reg
+
+# -----------------------------------------------------------------------------
+# Interface residual diagnostics (optional)
+# -----------------------------------------------------------------------------
+def _trace_interface_residuals(label: str = "ifc") -> None:
+    if os.getenv("PYCUTFEM_INTERFACE_RESIDUAL_TRACE", "").lower() not in {"1", "true", "yes"}:
+        return
+    backend = os.getenv("PYCUTFEM_INTERFACE_RESIDUAL_TRACE_BACKEND", "jit").strip() or "jit"
+    seed_fields = os.getenv("PYCUTFEM_INTERFACE_RESIDUAL_SEED", "").lower() in {"1", "true", "yes"}
+    terms = {
+        "R_int": R_int,
+        "R_int_fluid": R_int_fluid,
+        "R_int_solid": R_int_solid,
+        "R_int_pen": R_int_pen,
+        "R_int_sym_fluid": R_int_sym_fluid,
+        "R_int_sym_solid": R_int_sym_solid,
+    }
+    solid_vel = np.concatenate(
+        [
+            np.asarray(dof_handler.get_field_slice("vs_neg_x"), dtype=int),
+            np.asarray(dof_handler.get_field_slice("vs_neg_y"), dtype=int),
+        ]
+    )
+    fluid_vel = np.concatenate(
+        [
+            np.asarray(dof_handler.get_field_slice("u_pos_x"), dtype=int),
+            np.asarray(dof_handler.get_field_slice("u_pos_y"), dtype=int),
+        ]
+    )
+    saved = None
+    if seed_fields:
+        seed_pressure = os.getenv("PYCUTFEM_INTERFACE_RESIDUAL_SEED_PRESSURE", "1").lower() not in {"0", "false", "no"}
+        saved = (
+            uf_k.nodal_values.copy(),
+            pf_k.nodal_values.copy(),
+        )
+        u_coords = dof_handler.get_dof_coords("u_pos_x")
+        u_vals = np.array([parabolic_inflow(float(x), float(y), t=2.0) for x, y in u_coords], dtype=float)
+        u_dofs = np.asarray(dof_handler.get_field_slice("u_pos_x"), dtype=int)
+        v_dofs = np.asarray(dof_handler.get_field_slice("u_pos_y"), dtype=int)
+        uf_k.set_nodal_values(u_dofs, u_vals)
+        uf_k.set_nodal_values(v_dofs, np.zeros_like(v_dofs, dtype=float))
+        if seed_pressure:
+            p_coords = dof_handler.get_dof_coords("p_pos_")
+            pf_k.nodal_values[:] = -np.asarray(p_coords[:, 0], dtype=float)
+        else:
+            pf_k.nodal_values.fill(0.0)
+        dof_handler.apply_bcs(bcs, uf_k, pf_k)
+        print(f"[{label}] seeded uf_k/pf_k for interface residual trace")
+
+    print(f"[{label}] interface residual trace backend={backend}")
+    for name, term in terms.items():
+        if term is None:
+            continue
+        _, R = assemble_form(Equation(None, term), dof_handler=dof_handler, bcs=[], backend=backend)
+        if R is None:
+            continue
+        solid_norm = float(np.linalg.norm(R[solid_vel], ord=np.inf)) if solid_vel.size else 0.0
+        fluid_norm = float(np.linalg.norm(R[fluid_vel], ord=np.inf)) if fluid_vel.size else 0.0
+        print(f"[{label}] {name}: |R|_solid_vel_inf={solid_norm:.3e} |R|_fluid_vel_inf={fluid_norm:.3e}")
+
+    if os.getenv("PYCUTFEM_INTERFACE_RESIDUAL_TRACE_FIELDS", "").lower() in {"1", "true", "yes"}:
+        u_pos_sq = dot(Pos(uf_k_ifc), Pos(uf_k_ifc)) * dΓ
+        jump_sq = dot(jump_vel_res, jump_vel_res) * dΓ
+        hooks = {
+            u_pos_sq.integrand: {"name": "u_pos_sq"},
+            jump_sq.integrand: {"name": "jump_sq"},
+        }
+        res = assemble_form(Equation(None, u_pos_sq + jump_sq), dof_handler=dof_handler, bcs=[], backend=backend, assembler_hooks=hooks)
+        u_pos_val = float(np.asarray(res.get("u_pos_sq", 0.0)).reshape(-1)[0])
+        jump_val = float(np.asarray(res.get("jump_sq", 0.0)).reshape(-1)[0])
+        print(f"[{label}] ⟨|u_pos|^2⟩_Γ={u_pos_val:.3e} ⟨|jump|^2⟩_Γ={jump_val:.3e}")
+
+    if saved is not None:
+        uf_k.nodal_values[:] = saved[0]
+        pf_k.nodal_values[:] = saved[1]
+        dof_handler.apply_bcs(bcs, uf_k, pf_k)
+
+# Optional: trace interface residual contributions at the initial state.
+_trace_interface_residuals("ifc_init")
 
 # ----------------------------------------------------------------------------- 
 # Diagnostics: tip displacement, drag/lift (avg traction), pressure drop, VTK
@@ -4128,7 +4335,7 @@ os.makedirs(output_dir, exist_ok=True)
 SAVE_VTK = bool(ARGS.save_vtk)
 PLOT_MESH_EVERY = max(1, int(ARGS.plot_mesh_every))
 VTK_INTERFACE_CLAMP = float(os.getenv("VTK_INTERFACE_CLAMP", "0.0"))
-VTK_CLAMP_BAND = max(1.5 * MESH_SIZE, 5.0 * LEVELSET_ZERO_EPS)
+VTK_CLAMP_BAND = max(1.5 * MESH_SIZE, 5.0 * LEVELSET_EDGE_TOL)
 
 
 def _is_fluid_point(point: tuple[float, float]) -> bool:
@@ -4362,7 +4569,7 @@ def _compute_observables(step_idx: int, t_curr: float) -> None:
     )
     ex = Constant(np.array([1.0, 0.0]), dim=1)
     ey = Constant(np.array([0.0, 1.0]), dim=1)
-    t_fluid = traction_fluid(Pos(uf_k), Pos(pf_k))
+    t_fluid = traction_fluid_primal(Pos(uf_k), Pos(pf_k))
     t_solid = traction_solid_R(Neg(disp_k))
     t_avg = Constant(0.5) * (t_fluid + t_solid)
     drag_int = dot(t_avg, ex) * dGamma_obs
@@ -4408,6 +4615,7 @@ if ARGS.run_fd_check:
         "d_neg_y": disp_k,
     }
     fd_coeffs = {f.name: f for f in (uf_k, pf_k, uf_n, pf_n, us_k, us_n, disp_k, disp_n)}
+    fd_coeffs["dt"] = dt
     fd_kernel_pool = None
     if FD_BACKEND == "jit" and os.getenv("FD_REUSE_KERNELS", "1") != "0":
         from pycutfem.jit import compile_multi
@@ -4502,20 +4710,20 @@ if ARGS.run_fd_check:
                 "solid_vel_constraint": (a_svc, r_svc),
                 "interface": (J_int, R_int),
                 "stab_fluid_vel": (
-                    (Constant(2.0) * mu_f_const * g_v_f(gamma_v, du_f_R, test_vel_f_R)) * dG_fluid,
-                    (Constant(2.0) * mu_f_const * g_v_f(gamma_v, uf_k_R, test_vel_f_R)) * dG_fluid,
+                    (Constant(2.0) * mu_f_const * g_v_f(gamma_v_f, du_f_R, test_vel_f_R)) * dG_fluid,
+                    (Constant(2.0) * mu_f_const * g_v_f(gamma_v_f, uf_k_R, test_vel_f_R)) * dG_fluid,
                 ),
                 "stab_fluid_p": (
-                    g_p(gamma_p, dp_f_R, test_q_f_R) * dG_fluid,
-                    g_p(gamma_p, pf_k_R, test_q_f_R) * dG_fluid,
+                    g_p(gamma_p_f, dp_f_R, test_q_f_R) * dG_fluid,
+                    g_p(gamma_p_f, pf_k_R, test_q_f_R) * dG_fluid,
                 ),
                 "stab_solid_vel": (
-                    (rho_s_const * g_v_s(gamma_v, du_s_R, test_vel_s_R)) * dG_solid,
-                    (rho_s_const * g_v_s(gamma_v, us_k_R, test_vel_s_R)) * dG_solid,
+                    (rho_s_const * g_v_s(gamma_v_s, du_s_R, test_vel_s_R)) * dG_solid,
+                    (rho_s_const * g_v_s(gamma_v_s, us_k_R, test_vel_s_R)) * dG_solid,
                 ),
                 "stab_solid_disp": (
-                    (Constant(2.0) * mu_s_const * g_disp_s(gamma_v_grad, ddisp_s_R, test_disp_s_R)) * dG_solid,
-                    (Constant(2.0) * mu_s_const * g_disp_s(gamma_v_grad, disp_k_R, test_disp_s_R)) * dG_solid,
+                    (Constant(2.0) * mu_s_const * g_disp_s(gamma_disp_s, ddisp_s_R, test_disp_s_R)) * dG_solid,
+                    (Constant(2.0) * mu_s_const * g_disp_s(gamma_disp_s, disp_k_R, test_disp_s_R)) * dG_solid,
                 ),
             }
         else:
@@ -4585,6 +4793,7 @@ if ARGS.run_time_stepping:
         allow_dt_reduction=bool(getattr(ARGS, "allow_dt_reduction", False)),
         dt_reduction_factor=float(getattr(ARGS, "dt_reduction_factor", 0.5)),
         dt_reduction_threshold=float(getattr(ARGS, "dt_reduction_threshold", 5.0)),
+        dt_min=float(os.getenv("DT_MIN", "1e-4")),
         on_dt_change=_on_dt_change,
     )
     newton_tol = float(os.getenv("NEWTON_TOL", "1e-6"))
@@ -4621,6 +4830,108 @@ if ARGS.run_time_stepping:
             lin_params=LinearSolverParameters(backend=str(getattr(ARGS, "linear_solver", "scipy"))),
         )
 
+    if os.getenv("PYCUTFEM_ACTIVE_DOFS_TRACE", "").lower() in {"1", "true", "yes"}:
+        active = np.asarray(solver.active_dofs, dtype=int)
+        counts = []
+        for fld in getattr(dof_handler, "field_names", []):
+            try:
+                sl = np.asarray(dof_handler.get_field_slice(fld), dtype=int)
+            except Exception:
+                continue
+            if sl.size == 0:
+                continue
+            n_active = np.intersect1d(active, sl).size
+            counts.append(f"{fld}:{n_active}")
+        if counts:
+            print("[active] DOFs by field: " + ", ".join(counts))
+
+    # Optional: run FD Jacobian check at a specific time step (1-based).
+    # Enable with: FD_STEP=2 (uses existing FD_* env vars for backend/term filters).
+    fd_step_target = int(os.getenv("FD_STEP", "0") or "0")
+    fd_step_ran: set[int] = set()
+    if fd_step_target > 0:
+        fd_fields_step = {
+            "u_pos_x": uf_k,
+            "u_pos_y": uf_k,
+            "p_pos_": pf_k,
+            "vs_neg_x": us_k,
+            "vs_neg_y": us_k,
+            "d_neg_x": disp_k,
+            "d_neg_y": disp_k,
+        }
+        fd_coeffs_step = {f.name: f for f in (uf_k, pf_k, uf_n, pf_n, us_k, us_n, disp_k, disp_n)}
+        fd_coeffs_step["dt"] = dt
+        bc_probe_dofs_step = set(dof_handler.get_dirichlet_data(bcs_homog or bcs).keys())
+        inactive_probe_step = set(dof_handler.dof_tags.get("inactive", set()))
+        probe_sets_step = {
+            "cut": {
+                "u_pos_x": 6,
+                "u_pos_y": 6,
+                "p_pos_": 6,
+                "vs_neg_x": 4,
+                "vs_neg_y": 4,
+                "d_neg_x": 4,
+                "d_neg_y": 4,
+            },
+            "outside": {"u_pos_x": 2, "u_pos_y": 2, "p_pos_": 2},
+            "inside": {"vs_neg_x": 2, "vs_neg_y": 2, "d_neg_x": 2, "d_neg_y": 2},
+        }
+        probe_step, _ = select_fd_probes(
+            dof_handler,
+            probe_sets_step,
+            bc_dofs=bc_probe_dofs_step,
+            inactive=inactive_probe_step,
+        )
+        fd_step_only = os.getenv("FD_STEP_ONLY", "").strip()
+        if fd_step_only:
+            try:
+                probe_step = np.array([int(fd_step_only)], dtype=int)
+            except Exception:
+                pass
+
+        fd_kernel_pool_step = None
+        if FD_BACKEND == "jit" and os.getenv("FD_REUSE_KERNELS", "1") != "0":
+            def _pool_from_kernels(kernels):
+                pool: Dict[int, list] = {}
+                for ker in kernels:
+                    key = getattr(ker, "integral_id", None)
+                    if key is None:
+                        continue
+                    pool.setdefault(int(key), []).append(ker)
+                return pool if pool else None
+
+            pool_jac = _pool_from_kernels(getattr(solver, "kernels_K", []))
+            pool_res = _pool_from_kernels(getattr(solver, "kernels_F", []))
+            if pool_jac is not None and pool_res is not None:
+                fd_kernel_pool_step = {"jac": pool_jac, "res": pool_res}
+
+        prev_pre_cb = getattr(solver, "pre_cb", None)
+
+        def _fd_pre_cb(funcs):
+            if callable(prev_pre_cb):
+                prev_pre_cb(funcs)
+            step_no = step_idx[0] + 1  # step_idx counts completed steps
+            if step_no != fd_step_target or step_no in fd_step_ran:
+                return
+            bcs_now = getattr(solver, "_current_bcs", None) or bcs
+            print(f"[FD step] running FD check at step {step_no} (backend={FD_BACKEND})")
+            finite_difference_check(
+                jacobian_form,
+                residual_form,
+                dof_handler,
+                bcs_now,
+                fd_fields_step,
+                probe_step,
+                eps=1.0e-7,
+                bcs_elim=bcs_homog,
+                coeffs=fd_coeffs_step,
+                label=f"step{step_no}",
+                kernel_pool=fd_kernel_pool_step,
+            )
+            fd_step_ran.add(step_no)
+
+        solver.pre_cb = _fd_pre_cb
+
     step_idx = [0]  # mutable so the closure can update
     dt_val = float(dt.value) if hasattr(dt, "value") else float(DT)
 
@@ -4629,13 +4940,44 @@ if ARGS.run_time_stepping:
             ls_beam,
             disp_k,
             beam_ref_ls,
-            zero_eps=LEVELSET_ZERO_EPS,
+            nudge_eps=LEVELSET_NUDGE_EPS,
+            edge_tol=LEVELSET_EDGE_TOL,
             prefer_negative=LEVELSET_PREFER_NEGATIVE,
             update_tol=LEVELSET_UPDATE_TOL,
         )
         if ls_changed:
             refresh_domains(mesh, domains)
             refresh_hansbo_kappa(mesh, ls_beam, theta_pos_vals, theta_neg_vals)
+            refresh_sliver_weights(
+                mesh,
+                theta_pos_vals,
+                theta_neg_vals,
+                w_pos_vals,
+                w_neg_vals,
+                theta0=SLIVER_THETA0,
+                p=SLIVER_P,
+                wmax=SLIVER_WMAX,
+                thetamin=SLIVER_THETAMIN,
+                smooth=SLIVER_SMOOTH,
+            )
+            log_sliver_stats(
+                mesh,
+                theta_pos_vals,
+                theta_neg_vals,
+                w_pos_vals,
+                w_neg_vals,
+                theta0=SLIVER_THETA0,
+            )
+            ls_stats = getattr(ls_beam, "_last_update_stats", None)
+            if isinstance(ls_stats, dict) and ls_stats.get("changed", False):
+                print(
+                    "[levelset] max|Δφ|={:.3e} max|Δφ|_cut={:.3e} cut_elems={} interface_edges={}".format(
+                        float(ls_stats.get("max_diff", 0.0)),
+                        float(ls_stats.get("max_diff_cut", 0.0)),
+                        int(ls_stats.get("cut_elems", 0)),
+                        int(ls_stats.get("interface_edges", 0)),
+                    )
+                )
             retag_inactive(dof_handler, theta_neg=theta_neg_vals, solid_cut_drop=SOLID_CUT_DROP)
             solver.refresh_levelset_kernels(ls_beam)
         dof_handler.apply_bcs(bcs, uf_k, pf_k, us_k, disp_k)
@@ -4653,4 +4995,5 @@ if ARGS.run_time_stepping:
         functions=[uf_k, pf_k, us_k, disp_k],
         prev_functions=[uf_n, pf_n, us_n, disp_n],
         time_params=time_params,
+        aux_functions={"dt": dt},
     )

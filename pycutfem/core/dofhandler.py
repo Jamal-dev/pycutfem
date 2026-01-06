@@ -1499,7 +1499,7 @@ class DofHandler:
         m = self.mixed_element.mesh
         m.classify_elements(level_set, tol=tol)
         m.classify_edges(level_set, tol=tol)
-        m.build_interface_segments(level_set)
+        m.build_interface_segments(level_set, tol=tol)
 
     def tag_boundary_edges(self, tag_map: dict[str, "Callable[[float,float], bool]"]):
         """

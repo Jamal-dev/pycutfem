@@ -226,6 +226,7 @@ class TimeStepperParameters:
     allow_dt_reduction: bool = False    # opt-in adaptive dt reduction
     dt_reduction_factor: float = 0.5    # dt <- factor * dt on rejection
     dt_reduction_threshold: float = 5.0 # reject if ||ΔU|| grows by this factor
+    dt_min: float = 0.0                 # minimum allowed dt when reducing
     on_dt_change: Optional[Callable[[float], None]] = None
     adjust_max_steps_on_dt_change: bool = True  # keep final_time reachable
 
@@ -509,17 +510,82 @@ class NewtonSolver:
         """
         if not self._is_jit_backend():
             return
+        refresh_mode = os.getenv("PYCUTFEM_LEVELSET_KERNEL_REFRESH", "").strip().lower()
+        if refresh_mode in {"recompile", "compile", "full"}:
+            t0 = time.perf_counter()
+            self._compile_all_kernels()
+            print(
+                f"[jit] recompiled kernels for moving level set in {time.perf_counter() - t0:.3f}s"
+            )
+            return
+        debug_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_DEBUG", "").lower() in {"1", "true", "yes"}
+        raise_on_fail = os.getenv("PYCUTFEM_LEVELSET_REFRESH_RAISE", "").lower() in {"1", "true", "yes"}
+        rebuild_no_reuse = refresh_mode in {"rebuild", "rebuild_static", "no_reuse", "noreuse"}
+        # Default: refresh static args in-place (fast).
         t0 = time.perf_counter()
         changed = 0
+        any_fail = False
         for ker in list(getattr(self, "kernels_K", [])) + list(getattr(self, "kernels_F", [])):
             if getattr(ker, "level_set", None) is not level_set:
                 continue
             try:
-                updated = ker.refresh(level_set)
-            except Exception:
+                if rebuild_no_reuse:
+                    if getattr(ker, "builder", None) is None:
+                        updated = False
+                    else:
+                        new_args = ker.builder(level_set)
+                        if new_args is None:
+                            updated = False
+                        else:
+                            old_args = ker.static_args if isinstance(ker.static_args, dict) else None
+                            if old_args is not None and isinstance(new_args, dict):
+                                for key, val in old_args.items():
+                                    if key not in new_args:
+                                        new_args[key] = val
+                            ker.static_args = new_args
+                            ker.eids = np.asarray(new_args.get("eids", []), dtype=np.int32)
+                            updated = True
+                else:
+                    updated = ker.refresh(level_set)
+            except Exception as exc:
+                any_fail = True
+                if debug_refresh:
+                    dom = getattr(ker, "domain", "unknown")
+                    side = getattr(ker, "side", None)
+                    kind = None
+                    try:
+                        kind = ker.static_args.get("entity_kind", None)
+                    except Exception:
+                        kind = None
+                    try:
+                        eids_len = int(np.asarray(ker.static_args.get("eids", [])).shape[0])
+                    except Exception:
+                        eids_len = -1
+                    try:
+                        gdofs_shape = tuple(np.asarray(ker.static_args.get("gdofs_map")).shape)
+                    except Exception:
+                        gdofs_shape = ()
+                    print(f"[jit] refresh failed: dom={dom} side={side} kind={kind} err={exc}")
+                    print(f"[jit]   old static: nEnt={eids_len} gdofs_map={gdofs_shape}")
+                    try:
+                        import traceback as _tb
+                        print(_tb.format_exc().rstrip())
+                    except Exception:
+                        pass
+                if raise_on_fail:
+                    raise
                 updated = False
             if updated:
                 changed += 1
+        if any_fail and not raise_on_fail:
+            # Avoid running with a partially refreshed kernel set (inconsistent
+            # Jacobian/residual). Fall back to a full recompile.
+            t_re = time.perf_counter()
+            self._compile_all_kernels()
+            print(
+                f"[jit] kernel refresh failed; recompiled kernels in {time.perf_counter() - t_re:.3f}s"
+            )
+            return
         if changed:
             self._pattern_stale = True
             print(f"[jit] refreshed {changed} kernels for moving level set in {time.perf_counter() - t0:.3f}s")
@@ -606,6 +672,11 @@ class NewtonSolver:
         last_dt: float | None = None
         while step < time_params.max_steps and t_n < time_params.final_time:
             dt = float(time_params.dt)
+            dt_min = float(getattr(time_params, "dt_min", 0.0))
+            if dt_min > 0.0 and dt < dt_min:
+                raise RuntimeError(
+                    f"Δt={dt:.3e} dropped below dt_min={dt_min:.3e}; aborting time stepping."
+                )
             if last_dt is None or not math.isclose(dt, last_dt, rel_tol=0.0, abs_tol=0.0):
                 on_dt_change = getattr(time_params, "on_dt_change", None)
                 if callable(on_dt_change):
@@ -647,7 +718,13 @@ class NewtonSolver:
                         "to keep dt-dependent coefficients in sync."
                     )
                 factor = float(getattr(time_params, "dt_reduction_factor", 0.5))
-                time_params.dt = float(time_params.dt) * factor
+                new_dt = float(time_params.dt) * factor
+                dt_min = float(getattr(time_params, "dt_min", 0.0))
+                if dt_min > 0.0 and new_dt < dt_min:
+                    raise RuntimeError(
+                        f"Δt reduction would drop below dt_min={dt_min:.3e} (new_dt={new_dt:.3e})."
+                    )
+                time_params.dt = new_dt
                 if bool(getattr(time_params, "adjust_max_steps_on_dt_change", True)):
                     try:
                         final_time = float(time_params.final_time)
@@ -853,6 +930,66 @@ class NewtonSolver:
                     f"        [dd] ‖(R(u+ε·δ)-R(u))/ε + R(u)‖∞={dir_err:.3e} "
                     f"(ε={eps:.1e}, worst_gdof={worst_full}, worst_val={worst_val:.3e}{fmsg})"
                 )
+                if os.getenv("PYCUTFEM_DIRDERIV_BREAKDOWN", "").lower() in {"1", "true", "yes"} and worst_red >= 0:
+                    # Optional per-kernel breakdown of the DD mismatch at the worst DOF.
+                    # This runs extra kernel evaluations; enable only when debugging.
+                    def _residual_contrib_at_red(kernel, red_index: int) -> float:
+                        gdofs = kernel.static_args.get("gdofs_map")
+                        if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2 or gdofs.shape[0] == 0:
+                            return 0.0
+                        _, Floc, _ = kernel.exec(current)
+                        acc = 0.0
+                        for e in range(gdofs.shape[0]):
+                            full = gdofs[e]
+                            valid_full = full >= 0
+                            if not np.any(valid_full):
+                                continue
+                            rmap = -np.ones_like(full, dtype=int)
+                            rmap[valid_full] = self.full_to_red[full[valid_full]]
+                            hit = np.nonzero(rmap == int(red_index))[0]
+                            if hit.size:
+                                acc += float(np.sum(Floc[e][hit]))
+                        return float(acc)
+
+                    base = []
+                    for k_idx, kerF in enumerate(self.kernels_F):
+                        base.append((k_idx, kerF, _residual_contrib_at_red(kerF, worst_red)))
+
+                    snap2 = [f.nodal_values.copy() for f in funcs]
+                    dh.add_to_functions(dU_full, funcs)  # already scaled by eps above
+                    dh.apply_bcs(bcs_now, *funcs)
+                    pert = []
+                    for k_idx, kerF in enumerate(self.kernels_F):
+                        pert.append((k_idx, kerF, _residual_contrib_at_red(kerF, worst_red)))
+                    for f, buf in zip(funcs, snap2):
+                        f.nodal_values[:] = buf
+
+                    entries = []
+                    for (k_idx, kerF, r0), (_, _, r1) in zip(base, pert):
+                        dd_k = (r1 - r0) / eps + r0
+                        if dd_k == 0.0:
+                            continue
+                        entries.append(
+                            (
+                                abs(dd_k),
+                                dd_k,
+                                r0,
+                                r1,
+                                k_idx,
+                                getattr(kerF, "domain", "unknown"),
+                                getattr(kerF, "side", None),
+                                getattr(kerF.static_args, "get", lambda _k, _d=None: _d)("entity_kind", None),
+                                int(getattr(kerF.static_args.get("gdofs_map"), "shape", (0,))[0]),
+                            )
+                        )
+                    entries.sort(reverse=True, key=lambda t: t[0])
+                    print("        [dd] per-kernel breakdown (|dd_k|, dd_k, R0_k, R1_k, k, domain, side, kind, nEnt):")
+                    for item in entries[:12]:
+                        _, dd_k, r0, r1, k_idx, dom_k, side_k, kind_k, n_ent = item
+                        print(
+                            f"          |{abs(dd_k):.3e}|  dd={dd_k:+.3e}  R0={r0:+.3e}  R1={r1:+.3e}  "
+                            f"k={k_idx:03d}  dom={dom_k}  side={side_k}  kind={kind_k}  n={n_ent}"
+                        )
 
             # 3) Optional Armijo backtracking in reduced space (no BC re-application inside)
             if getattr(self.np, "line_search", False):
@@ -921,7 +1058,12 @@ class NewtonSolver:
             drop_tol = float(os.getenv("PYCUTFEM_DROP_TOL", "1e-12"))
             if drop_tol > 0.0 and A_red.data.size:
                 abs_data = np.abs(A_red.data)
-                row_abs = np.add.reduceat(abs_data, A_red.indptr[:-1])
+                row_abs = np.zeros_like(row_nnz, dtype=abs_data.dtype)
+                starts = A_red.indptr[:-1]
+                ends = A_red.indptr[1:]
+                nonempty = ends > starts
+                if np.any(nonempty):
+                    row_abs[nonempty] = np.add.reduceat(abs_data, starts[nonempty])
                 col_abs = np.bincount(A_red.indices, weights=abs_data, minlength=A_red.shape[1])
                 scale = float(abs_data.max())
                 thresh = drop_tol * max(1.0, scale)
@@ -1001,6 +1143,8 @@ class NewtonSolver:
                 return best_alpha * S_red
             min_alpha = alpha
             print(f"        Line search failed – taking minimal step α = {min_alpha:.2e}.")
+            if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
+                raise RuntimeError("Line search failed: no residual decrease.")
             self._ls_alpha_prev = min_alpha
             return min_alpha * S_red
 
@@ -1056,6 +1200,8 @@ class NewtonSolver:
         # No decrease found; still take the smallest tried step to avoid stagnation.
         min_alpha = alpha
         print(f"        Line search failed – taking minimal step α = {min_alpha:.2e}.")
+        if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
+            raise RuntimeError("Line search failed: no residual decrease.")
         self._ls_alpha_prev = min_alpha
         return min_alpha * S_red
 
@@ -1434,6 +1580,8 @@ class NewtonSolver:
                 print(f"        Line search failed, using best-effort α = {best_alpha:.2e} (‖R‖∞ decreased).")
                 return best_alpha * dU
             print("        Line search failed – no decreasing step found; taking α = 0.")
+            if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
+                raise RuntimeError("Line search failed: no residual decrease.")
             return np.zeros_like(dU)
 
         # Initialize "best-effort" tracking variables
@@ -1488,7 +1636,9 @@ class NewtonSolver:
             print(f"        Armijo failed, using best-effort α = {best_alpha:.2e} instead.")
             return best_alpha * dU
         else:
-            print(f"        Line search failed catastrophically. No descent found.")
+            print("        Line search failed catastrophically. No descent found.")
+            if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
+                raise RuntimeError("Line search failed: no residual decrease.")
             return np.zeros_like(dU)
     
     def _create_reduced_system(self, K_full, F_full, bcs):
