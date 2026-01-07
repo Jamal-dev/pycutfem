@@ -62,6 +62,7 @@ def compile_backend_cpp(
     cache = CppKernelCache()
 
     ir_sequence = ir_generator.generate(integral_expression)
+    param = getattr(ir_generator, "_param", None)
     from pycutfem.jit.ir import strip_side_metadata
     ir_sequence = strip_side_metadata(ir_sequence, on_facet=on_facet)
 
@@ -74,6 +75,10 @@ def compile_backend_cpp(
         raise
 
     runner = KernelRunnerCpp(kernel, param_order, ir_sequence, dof_handler, fallback_runner=None)
+    try:
+        runner._delegate._jit_param = param
+    except Exception:
+        pass
     # Expose the field ordering used by the codegen so static arg compression
     # in the solver can mirror it (avoids misaligned gdofs_map columns).
     runner.active_fields = active_fields or getattr(cpp_codegen, "active_fields", None)

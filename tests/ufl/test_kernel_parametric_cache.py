@@ -10,6 +10,7 @@ from pycutfem.utils.meshgen import structured_quad
 from pycutfem.jit.cache import KernelCache
 from pycutfem.jit.ir import LoadConstant, strip_side_metadata
 from pycutfem.jit.visitor import IRGenerator
+from pycutfem.jit import compile_backend
 
 from pycutfem.ufl.analytic import Analytic, x as x_ana
 from pycutfem.ufl.expressions import (
@@ -25,6 +26,7 @@ from pycutfem.ufl.expressions import (
     inner,
     restrict,
 )
+from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
 
 
 def _make_dh(*, nx: int, ny: int, poly_order: int = 1):
@@ -162,3 +164,45 @@ def test_kernel_hash_ignores_analytic_identity():
     h1 = _kernel_hash(a1 * v, mixed_element=me, on_facet=False)
     h2 = _kernel_hash(a2 * v, mixed_element=me, on_facet=False)
     assert h1 == h2
+
+
+@pytest.mark.parametrize("backend", ("jit", "cpp"))
+def test_constant_value_change_updates_kernel_inputs_without_recompile(backend, monkeypatch, tmp_path):
+    if backend == "cpp":
+        monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
+    else:
+        monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / backend))
+
+    dh, me = _make_dh(nx=1, ny=1, poly_order=1)
+    u = TrialFunction(field_name="u", name="u", dof_handler=dh)
+    v = TestFunction(field_name="u", name="v", dof_handler=dh)
+    alpha = Constant(1.5)
+    expr = alpha * inner(grad(u), grad(v))
+
+    runner, ir = compile_backend(expr, dh, me, on_facet=False)
+
+    geom = dh.precompute_geometric_factors(quad_order=2, level_set=lambda *_: 0.0, reuse=False)
+    static_args = dict(geom)
+    static_args["gdofs_map"] = np.vstack(
+        [np.asarray(dh.get_elemental_dofs(eid), dtype=np.int32) for eid in range(me.mesh.n_elements)]
+    ).astype(np.int32)
+    static_args.update(
+        _build_jit_kernel_args(
+            ir,
+            expr,
+            me,
+            2,
+            dof_handler=dh,
+            gdofs_map=static_args["gdofs_map"],
+            param_order=getattr(runner, "param_order", []),
+            pre_built=static_args,
+        )
+    )
+
+    K1, *_ = runner({}, static_args)
+    alpha.value = 2.5
+    K2, *_ = runner({}, static_args)
+
+    factor = 2.5 / 1.5
+    assert np.allclose(K2, factor * K1)

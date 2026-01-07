@@ -150,6 +150,7 @@ class KernelRunner:
         self.param_order = param_order
         self._param_set = set(param_order or [])
         self.dof_handler = dof_handler
+        self._jit_param = None
         
         # Identify which function coefficients are needed from the IR
         from pycutfem.jit.ir import LoadVariable
@@ -199,6 +200,24 @@ class KernelRunner:
         # A)  start from a shallow copy of the caller-supplied dict
         # ---------------------------------------------------------------
         kernel_args = dict(static_args)
+
+        # ---------------------------------------------------------------
+        # A0) refresh Constant parameters from the original expression
+        #     (so Constant.value changes do not require kernel regeneration)
+        # ---------------------------------------------------------------
+        param = getattr(self, "_jit_param", None)
+        if param is not None:
+            const_by_name = getattr(param, "const_by_name", None)
+            if isinstance(const_by_name, dict) and const_by_name:
+                for name, const in const_by_name.items():
+                    if name not in self._param_set:
+                        continue
+                    try:
+                        # Scalars are carried as 0d arrays for ABI compatibility.
+                        kernel_args[name] = np.asarray(getattr(const, "value", const), dtype=np.float64)
+                    except Exception:
+                        # Leave as-is; missing/invalid will be caught below.
+                        pass
 
         # ---------------------------------------------------------------
         # B)  guarantee presence of 'gdofs_map'  and  'node_coords'
@@ -378,6 +397,7 @@ def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet:
     cache = KernelCache()
 
     ir_sequence = ir_generator.generate(integral_expression)
+    param = getattr(ir_generator, "_param", None)
     from pycutfem.jit.ir import strip_side_metadata
     ir_sequence = strip_side_metadata(ir_sequence, on_facet=on_facet)
     
@@ -388,6 +408,7 @@ def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet:
         
     # New Newton: Return the runner, not the raw kernel
     runner = KernelRunner(kernel, param_order, ir_sequence, dof_handler)
+    runner._jit_param = param
     # Surface the active-field ordering from the codegen so callers can
     # mirror the static argument compression if needed.
     runner.active_fields = getattr(codegen, "active_fields", None)
