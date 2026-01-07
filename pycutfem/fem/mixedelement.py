@@ -301,7 +301,8 @@ class MixedElement:
         element-local layout changes (geometry type, mesh order, per-field order,
         or the resulting local DOF count).  Safe to use as part of a JIT cache key.
         """
-        field_info = tuple(sorted(self._field_orders.items()))    # (('p',1),('ux',2),('uy',2))
+        # Preserve field order: MixedElement DOF layout is order-dependent.
+        field_info = tuple((name, self._field_orders[name]) for name in self.field_names)
         return (self.mesh.element_type,            # 'quad' / 'tri'
                 self.mesh.poly_order,              # geometry order
                 field_info,                        # heterogeneous field orders

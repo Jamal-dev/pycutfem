@@ -36,6 +36,7 @@ from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
 from pycutfem.jit import compile_multi        
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.helpers import analyze_active_dofs
+from pycutfem.solvers.dt_controller import AdaptiveDtController, DtControllerParams
 try:
     from pycutfem.solvers.giant import giant_solver
     HAS_GIANT = True
@@ -222,13 +223,29 @@ class TimeStepperParameters:
     steady_tol: float = 1e-6            # ‖ΔU‖_∞ < tol ⇒ steady
     theta: float = 1.0                  # 1.0 = backward Euler, 0.5 = CN
     stop_on_steady: bool = True         # early exit when steady‑state reached
-    final_time: float = max_steps * dt  
+    final_time: Optional[float] = None  # default: max_steps * dt (set in __post_init__)
     allow_dt_reduction: bool = False    # opt-in adaptive dt reduction
     dt_reduction_factor: float = 0.5    # dt <- factor * dt on rejection
     dt_reduction_threshold: float = 5.0 # reject if ||ΔU|| grows by this factor
     dt_min: float = 0.0                 # minimum allowed dt when reducing
     on_dt_change: Optional[Callable[[float], None]] = None
     adjust_max_steps_on_dt_change: bool = True  # keep final_time reachable
+
+    # Iteration-count based dt adaptation (used when allow_dt_reduction=True)
+    dt_max: Optional[float] = None
+    dt_increase_factor: float = 1.1
+    dt_decrease_factor_slow: float = 0.9
+    dt_iters_increase_threshold: int = 8
+    dt_iters_decrease_threshold: int = 20
+    dt_easy_steps_before_increase: int = 2
+    dt_slow_steps_before_decrease: int = 1
+    dt_reject_on_slow: bool = False
+
+    def __post_init__(self) -> None:
+        if self.final_time is None:
+            self.final_time = float(self.max_steps) * float(self.dt)
+        if self.dt_max is None:
+            self.dt_max = float(self.dt)
 
 
 @dataclass
@@ -670,6 +687,56 @@ class NewtonSolver:
         t_n = 0.0
         prev_delta_inf: float | None = None
         last_dt: float | None = None
+
+        dt_controller: AdaptiveDtController | None = None
+        if bool(getattr(time_params, "allow_dt_reduction", False)):
+            dt_controller = AdaptiveDtController(
+                dt0=float(time_params.dt),
+                params=DtControllerParams(
+                    dt_min=float(getattr(time_params, "dt_min", 0.0)),
+                    dt_max=getattr(time_params, "dt_max", None),
+                    iters_increase_threshold=int(getattr(time_params, "dt_iters_increase_threshold", 8)),
+                    iters_decrease_threshold=int(getattr(time_params, "dt_iters_decrease_threshold", 20)),
+                    easy_steps_before_increase=int(getattr(time_params, "dt_easy_steps_before_increase", 2)),
+                    slow_steps_before_decrease=int(getattr(time_params, "dt_slow_steps_before_decrease", 1)),
+                    increase_factor=float(getattr(time_params, "dt_increase_factor", 1.1)),
+                    decrease_factor_slow=float(getattr(time_params, "dt_decrease_factor_slow", 0.9)),
+                    decrease_factor_fail=float(getattr(time_params, "dt_reduction_factor", 0.5)),
+                    reject_on_slow=bool(getattr(time_params, "dt_reject_on_slow", False)),
+                ),
+            )
+
+        def _adjust_max_steps_for_final_time(*, t_now: float, step_now: int, dt_new: float) -> None:
+            if not bool(getattr(time_params, "adjust_max_steps_on_dt_change", True)):
+                return
+            final_time = getattr(time_params, "final_time", None)
+            try:
+                final_time_val = float(final_time) if final_time is not None else None
+            except Exception:
+                final_time_val = None
+            if final_time_val is None or final_time_val <= t_now:
+                return
+            remaining = float(final_time_val) - float(t_now)
+            needed = int(math.ceil(remaining / max(float(dt_new), 1.0e-16)))
+            time_params.max_steps = max(int(time_params.max_steps), int(step_now + needed))
+
+        def _require_dt_callback() -> Callable[[float], None]:
+            on_dt_change = getattr(time_params, "on_dt_change", None)
+            if not callable(on_dt_change):
+                raise RuntimeError(
+                    "Adaptive dt requires TimeStepperParameters.on_dt_change "
+                    "to keep dt-dependent coefficients in sync."
+                )
+            return on_dt_change
+
+        def _classify_newton_exception(exc: Exception) -> str:
+            msg = str(exc)
+            if isinstance(exc, RuntimeError) and "Line search failed" in msg:
+                return "line_search"
+            if "did not converge" in msg:
+                return "max_iter"
+            return type(exc).__name__
+
         while step < time_params.max_steps and t_n < time_params.final_time:
             dt = float(time_params.dt)
             dt_min = float(getattr(time_params, "dt_min", 0.0))
@@ -697,47 +764,70 @@ class NewtonSolver:
             # Newton loop -----------------------------------------
             try:
                 delta_U, converged, n_iters = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
-                reduce_dt = False
             except Exception as e:
-                reduce_dt = True
-                converged = False
-                n_iters = 0
-                delta_U = np.zeros_like(delta_U)
                 print(f"    Newton failed at step {step+1} with dt={dt:.3e}: {e}")
-            # Crieteria if converged but number of Newton iterations are more than 20, reduce dt
-            if (converged and n_iters >= 20) or reduce_dt:
-                if not bool(getattr(time_params, "allow_dt_reduction", False)):
+                if not bool(getattr(time_params, "allow_dt_reduction", False)) or dt_controller is None:
+                    raise
+                _require_dt_callback()
+                reason = _classify_newton_exception(e)
+                decision = dt_controller.on_failure(dt=dt, reason=reason)
+                if dt_min > 0.0 and decision.dt < dt_min:
                     raise RuntimeError(
-                        "Time step reduction requested but disabled. "
-                        "Reduce dt manually or enable allow_dt_reduction with on_dt_change."
-                    )
-                on_dt_change = getattr(time_params, "on_dt_change", None)
-                if not callable(on_dt_change):
-                    raise RuntimeError(
-                        "Time step reduction requires TimeStepperParameters.on_dt_change "
-                        "to keep dt-dependent coefficients in sync."
-                    )
-                factor = float(getattr(time_params, "dt_reduction_factor", 0.5))
-                new_dt = float(time_params.dt) * factor
-                dt_min = float(getattr(time_params, "dt_min", 0.0))
-                if dt_min > 0.0 and new_dt < dt_min:
-                    raise RuntimeError(
-                        f"Δt reduction would drop below dt_min={dt_min:.3e} (new_dt={new_dt:.3e})."
-                    )
-                time_params.dt = new_dt
-                if bool(getattr(time_params, "adjust_max_steps_on_dt_change", True)):
-                    try:
-                        final_time = float(time_params.final_time)
-                    except Exception:
-                        final_time = None
-                    if final_time is not None and final_time > t_n:
-                        remaining = final_time - t_n
-                        extra = int(math.ceil(remaining / max(float(time_params.dt), 1.0e-16)))
-                        time_params.max_steps = max(int(time_params.max_steps), int(step + extra))
-                on_dt_change(float(time_params.dt))
-                last_dt = float(time_params.dt)
-                print(f"    Reducing Δt → {time_params.dt:.3e} due to slow Newton convergence and retrying.")
+                        f"Δt reduction would drop below dt_min={dt_min:.3e} (new_dt={decision.dt:.3e})."
+                    ) from e
+                time_params.dt = float(decision.dt)
+                _adjust_max_steps_for_final_time(t_now=t_n, step_now=step, dt_new=float(time_params.dt))
+                print(f"    Rejecting step {step+1}; reducing Δt → {time_params.dt:.3e} ({decision.reason}) and retrying.")
                 continue
+
+            if not converged:
+                # Some solver backends (e.g. SNES) may return the best iterate without raising.
+                if not bool(getattr(time_params, "allow_dt_reduction", False)) or dt_controller is None:
+                    raise RuntimeError(
+                        f"Newton did not converge at step {step+1} with dt={dt:.3e}."
+                    )
+                _require_dt_callback()
+                decision = dt_controller.on_failure(dt=dt, reason="not_converged")
+                if dt_min > 0.0 and decision.dt < dt_min:
+                    raise RuntimeError(
+                        f"Δt reduction would drop below dt_min={dt_min:.3e} (new_dt={decision.dt:.3e})."
+                    )
+                time_params.dt = float(decision.dt)
+                _adjust_max_steps_for_final_time(t_now=t_n, step_now=step, dt_new=float(time_params.dt))
+                print(f"    Rejecting step {step+1}; reducing Δt → {time_params.dt:.3e} ({decision.reason}) and retrying.")
+                continue
+
+            # Optional dt adaptation based on Newton iteration count (success path)
+            if bool(getattr(time_params, "allow_dt_reduction", False)) and dt_controller is not None:
+                decision = dt_controller.on_success(dt=dt, n_iters=int(n_iters))
+                if decision.dt != dt:
+                    _require_dt_callback()
+                    dt_min = float(getattr(time_params, "dt_min", 0.0))
+                    if dt_min > 0.0 and decision.dt < dt_min:
+                        raise RuntimeError(
+                            f"Δt update would drop below dt_min={dt_min:.3e} (new_dt={decision.dt:.3e})."
+                        )
+                    time_params.dt = float(decision.dt)
+                    # For reject-on-slow mode, retry the same step at the new dt.
+                    if decision.retry_step:
+                        _adjust_max_steps_for_final_time(t_now=t_n, step_now=step, dt_new=float(time_params.dt))
+                        print(
+                            f"    Rejecting step {step+1}; setting Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
+                        )
+                        continue
+                    # Otherwise, apply on next step (after advancing time).
+                    _adjust_max_steps_for_final_time(
+                        t_now=float(t_n + dt), step_now=int(step + 1), dt_new=float(time_params.dt)
+                    )
+                    if decision.reason == "slow_newton":
+                        print(
+                            f"    Slow Newton convergence ({n_iters} iters); setting next Δt → {time_params.dt:.3e}."
+                        )
+                    elif decision.reason == "fast_newton":
+                        print(
+                            f"    Fast Newton convergence ({n_iters} iters); setting next Δt → {time_params.dt:.3e}."
+                        )
+
             delta_inf = float(np.linalg.norm(delta_U, ord=np.inf))
             print(f"    Time step {step+1}: ΔU = {delta_inf:.2e}")
             
@@ -994,8 +1084,49 @@ class NewtonSolver:
             # 3) Optional Armijo backtracking in reduced space (no BC re-application inside)
             if getattr(self.np, "line_search", False):
                 t_ls = time.perf_counter()
-                dU_red = self._line_search_reduced(A_red, R_red, dU_red, funcs, current, bcs_now)
-                line_search_time = time.perf_counter() - t_ls
+                try:
+                    dU_red = self._line_search_reduced(A_red, R_red, dU_red, funcs, current, bcs_now)
+                except RuntimeError as exc:
+                    line_search_time = time.perf_counter() - t_ls
+                    msg = str(exc)
+                    if "Line search failed" in msg:
+                        accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "10.0"))
+                        tol = float(getattr(self.np, "newton_tol", 0.0))
+                        if accept_factor > 0.0 and tol > 0.0 and norm_R <= accept_factor * tol:
+                            print(
+                                "        Line search failed near convergence "
+                                f"(|R|_∞={norm_R:.2e}, tol={tol:.2e}); accepting iterate."
+                            )
+                            converged = True
+                            delta = np.hstack(
+                                [
+                                    f.nodal_values - f_prev.nodal_values
+                                    for f, f_prev in zip(funcs, prev_funcs)
+                                ]
+                            )
+                            totals["assembly"] += assembly_time
+                            totals["linear_solve"] += linear_time
+                            totals["line_search"] += line_search_time
+                            self._last_iter_timings.append(
+                                {
+                                    "iteration": it + 1,
+                                    "assembly": assembly_time,
+                                    "linear_solve": linear_time,
+                                    "line_search": line_search_time,
+                                    "residual_norm": norm_R,
+                                    "converged": True,
+                                }
+                            )
+                            self._last_iteration_totals = totals
+                            print(
+                                "          timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                                    assembly_time, linear_time, line_search_time
+                                )
+                            )
+                            return delta, converged, it + 1
+                    raise
+                else:
+                    line_search_time = time.perf_counter() - t_ls
 
             # 4) Apply accepted step: expand reduced → full, update fields, then re-impose BCs
             dU_full = self.restrictor.expand_vec(dU_red)

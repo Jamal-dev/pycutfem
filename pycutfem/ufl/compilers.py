@@ -2381,17 +2381,10 @@ class FormCompiler:
         active_fields = _active_field_order(ir, self.me)
         runner_active = getattr(runner, "active_fields", None)
         if runner_active:
-            active_fields = tuple(runner_active)
-        else:
-            _param_fields: list[str] = []
-            for name in getattr(runner, "param_order", []):
-                has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
-                if name.startswith(("b_", "g_")) or has_deriv:
-                    fld = name.split("_", 1)[1] if "_" in name else name
-                    if fld in getattr(self.me, "field_names", ()):
-                        _param_fields.append(fld)
-            if _param_fields:
-                active_fields = tuple(dict.fromkeys(_param_fields))  # preserve order, drop dups
+            # Normalize to MixedElement ordering: cached kernels may not expose active_fields.
+            active_set = set(runner_active)
+            me_order = getattr(self.me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
         active_cols = _active_columns(self.me, active_fields)
 
 
@@ -3744,17 +3737,9 @@ class FormCompiler:
         active_fields = _active_field_order(ir, me)
         runner_active = getattr(runner, "active_fields", None)
         if runner_active:
-            active_fields = tuple(runner_active)
-        else:
-            _param_fields: list[str] = []
-            for name in getattr(runner, "param_order", []):
-                has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
-                if name.startswith(("b_", "g_")) or has_deriv:
-                    fld = name.split("_", 1)[1] if "_" in name else name
-                    if fld in getattr(me, "field_names", ()):
-                        _param_fields.append(fld)
-            if _param_fields:
-                active_fields = tuple(dict.fromkeys(_param_fields))
+            active_set = set(runner_active)
+            me_order = getattr(me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
         active_cols   = _active_columns(me, active_fields)
         static_args   = _compress_static_for_active(static_args, me, active_cols)
         gdofs_map     = static_args.get("gdofs_map", gdofs_map)
@@ -4588,17 +4573,9 @@ class FormCompiler:
         active_fields = _active_field_order(ir, me)
         runner_active = getattr(runner, "active_fields", None)
         if runner_active:
-            active_fields = tuple(runner_active)
-        else:
-            _param_fields: list[str] = []
-            for name in getattr(runner, "param_order", []):
-                has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
-                if name.startswith(("b_", "g_")) or has_deriv:
-                    fld = name.split("_", 1)[1] if "_" in name else name
-                    if fld in getattr(me, "field_names", ()):
-                        _param_fields.append(fld)
-            if _param_fields:
-                active_fields = tuple(dict.fromkeys(_param_fields))  # preserve order, drop dups
+            active_set = set(runner_active)
+            me_order = getattr(me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
         active_cols = _active_columns(me, active_fields)
         args = _compress_static_for_active(args, me, active_cols)
         gdofs_map = args.get("gdofs_map", geo.get("gdofs_map"))
@@ -4954,17 +4931,9 @@ class FormCompiler:
         active_fields = _active_field_order(ir, me)
         runner_active = getattr(runner, "active_fields", None)
         if runner_active:
-            active_fields = tuple(runner_active)
-        else:
-            _param_fields: list[str] = []
-            for name in getattr(runner, "param_order", []):
-                has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
-                if name.startswith(("b_", "g_")) or has_deriv:
-                    fld = name.split("_", 1)[1] if "_" in name else name
-                    if fld in getattr(me, "field_names", ()):
-                        _param_fields.append(fld)
-            if _param_fields:
-                active_fields = tuple(dict.fromkeys(_param_fields))
+            active_set = set(runner_active)
+            me_order = getattr(me, "field_names", ())
+            active_fields = tuple([f for f in me_order if f in active_set]) if me_order else tuple(runner_active)
         active_cols = _active_columns(me, active_fields)
         if os.getenv("PYCUTFEM_JIT_DEBUG_ACTIVE", "").lower() in {"1", "true", "yes"}:
             print(f"[jit-cut] active_fields={active_fields}, n_cols={len(active_cols)}")

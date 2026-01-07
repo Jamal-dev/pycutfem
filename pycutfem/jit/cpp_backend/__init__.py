@@ -67,8 +67,9 @@ def compile_backend_cpp(
     ir_sequence = strip_side_metadata(ir_sequence, on_facet=on_facet)
 
     try:
+        cache_sig = (mixed_element.signature(), bool(on_facet), int(rank))
         kernel, param_order, active_fields = cache.get_kernel(
-            ir_sequence, cpp_codegen, mixed_element.signature()
+            ir_sequence, cpp_codegen, cache_sig
         )
     except Exception as exc:
         # Fail hard so missing op coverage is fixed immediately.

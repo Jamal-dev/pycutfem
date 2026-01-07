@@ -31,28 +31,24 @@ def _form_rank(expr):
 # ----------------------------------------------------------------------
 def _active_field_order(ir_sequence, me) -> tuple[str, ...]:
     """Return the ordered list of fields actually referenced in the IR."""
-    seen = set()
-    order: list[str] = []
+    me_order = list(getattr(me, "field_names", ()))
+    me_fields = set(me_order)
+    seen: set[str] = set()
     for op in ir_sequence:
         if hasattr(op, "field_names"):
             for f in getattr(op, "field_names", []) or []:
-                if f in seen:
-                    continue
-                if f in getattr(me, "field_names", ()):
+                if f in me_fields:
                     seen.add(f)
-                    order.append(f)
         elif hasattr(op, "field_name"):
             f = getattr(op, "field_name", None)
             if f is None:
                 continue
-            if f in seen:
-                continue
-            if f in getattr(me, "field_names", ()):
+            if f in me_fields:
                 seen.add(f)
-                order.append(f)
-    if not order:
-        order = list(getattr(me, "field_names", ()))
-    return tuple(order)
+    if not seen:
+        return tuple(me_order)
+    # Preserve MixedElement field order: DOF layout is order-dependent.
+    return tuple([f for f in me_order if f in seen])
 
 
 def _active_columns(me, active_fields: tuple[str, ...]) -> np.ndarray:
@@ -401,7 +397,8 @@ def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet:
     from pycutfem.jit.ir import strip_side_metadata
     ir_sequence = strip_side_metadata(ir_sequence, on_facet=on_facet)
     
-    kernel, param_order = cache.get_kernel(ir_sequence, codegen, mixed_element.signature())
+    cache_sig = (mixed_element.signature(), bool(on_facet), int(rank))
+    kernel, param_order = cache.get_kernel(ir_sequence, codegen, cache_sig)
     
     if hasattr(kernel, "py_func"):
         kernel.python = kernel.py_func
