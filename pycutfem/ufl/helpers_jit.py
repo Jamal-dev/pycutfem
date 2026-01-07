@@ -9,6 +9,7 @@ import pycutfem.jit.symbols as symbols
 from pycutfem.utils.bitset import BitSet, bitset_cache_token
 from pycutfem.ufl.expressions import Restriction
 from pycutfem.fem.transform import element_Hxi
+from pycutfem.ufl.jit_parametrization import build_jit_parametrization
 
 
 
@@ -123,6 +124,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
     logger = __import__("logging").getLogger(__name__)
     dbg    = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
+    param_map = build_jit_parametrization(expression)
 
     # ------------------------------------------------------------------
     # 0. Helpers
@@ -610,17 +612,13 @@ def _build_jit_kernel_args(       # ← signature unchanged
         requested_flags.setdefault(token, set()).add(side)
     requested_bs = {n.split("domain_bs_", 1)[1] for n in required if n.startswith("domain_bs_")}
 
-    all_bitsets_in_form = _find_all_bitsets(expression)
-    for bs in all_bitsets_in_form:
-        token = getattr(bs, "cache_token", None)
-        if token is None:
-            token = bitset_cache_token(getattr(bs, "array", bs))
+    for token, dom in param_map.domain_by_token.items():
         pname = f"domain_bs_{token}"
         need_flag = token in requested_flags
         need_bs = token in requested_bs
         if not (need_flag or need_bs):
             continue
-        raw = getattr(bs, "array", bs)
+        raw = getattr(dom, "array", dom)
         mask_full = _expand_subset_to_full(
             np.asarray(raw, dtype=np.bool_).ravel(), what=f"BitSet {pname}"
         )
@@ -660,21 +658,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
     # ------------------------------------------------------------------
     # 5. Constants / EWC / coefficient vectors / reference tables
     # ------------------------------------------------------------------
-    const_arrays: dict[str, UflConst] = {}
-    for c in _find_all(expression, UflConst):
-        if c.dim == 0:
-            continue
-        token = getattr(c, "cache_token", None)
-        if token is None:
-            token = _array_token(c.value)
-        const_arrays[f"const_arr_{token}"] = c
-
-    ewc_arrays: dict[str, ElementWiseConstant] = {}
-    for ewc in _find_all(expression, ElementWiseConstant):
-        token = getattr(ewc, "cache_token", None)
-        if token is None:
-            token = _array_token(ewc.values)
-        ewc_arrays[f"ewc_{token}"] = ewc
+    const_arrays: dict[str, UflConst] = dict(param_map.const_by_name)
+    ewc_arrays: dict[str, ElementWiseConstant] = dict(param_map.ewc_by_name)
 
     # cache gdofs_map for coefficient gathering
     if gdofs_map is None:
@@ -795,13 +780,21 @@ def _build_jit_kernel_args(       # ← signature unchanged
         # ---- element-wise constants --------------------------------------
         elif name in ewc_arrays:
             ewc = ewc_arrays[name]
-            arr = np.asarray(ewc.values, dtype=np.float64)  # shape (n_elems, ...)
+            arr = _expand_subset_to_full(
+                np.asarray(ewc.values, dtype=np.float64), what=f"EWC {name}"
+            )
             args[name] = arr
 
         # ---- analytic expressions ----------------------------------------
         elif name.startswith("ana_"):
             func_id = int(name.split("_", 1)[1])
-            ana = next(a for a in _find_all(expression, Analytic) if id(a) == func_id)
+            try:
+                ana = param_map.analytic_by_id[func_id]
+            except KeyError as exc:
+                raise KeyError(
+                    f"_build_jit_kernel_args: kernel requested analytic '{name}', "
+                    "but no matching Analytic node was found in the expression."
+                ) from exc
 
             qp_phys = args["qp_phys"]                 # (n_elem, n_qp, 2)
             n_elem_, n_qp, _ = qp_phys.shape

@@ -703,7 +703,8 @@ class CppCodeGen:
                 name = f"ana_{op.func_id}"
                 required_args.add(name)
                 view_name = f"{name}_view"
-                nm = new_tmp("ana")
+                # Avoid collisions with parameter names like "ana_0"/"ana_1".
+                nm = new_tmp("ana_val")
                 if len(op.tensor_shape or ()) == 0:
                     emit_line(f"double {nm} = {view_name}(e,q);")
                     stack.append(StackItem(nm, "scalar", "const", ()))

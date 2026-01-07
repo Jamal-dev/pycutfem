@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Tuple
 from pycutfem.jit.cache import KernelCache
 from .compiler import compile_extension
 
-CODEGEN_ABI_CPP = "2025-03-13-cpp-inner-scalar-row"
+CODEGEN_ABI_CPP = "2026-01-07-cpp-ana-tmp"
 
 
 class CppKernelCache:

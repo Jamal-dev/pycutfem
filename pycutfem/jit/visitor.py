@@ -21,6 +21,7 @@ import logging
 import numpy as np
 import re
 from pycutfem.utils.bitset import bitset_cache_token
+from pycutfem.ufl.jit_parametrization import build_jit_parametrization
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +46,14 @@ class IRGenerator:
     """
     def __init__(self):
         self.ir_sequence = []
+        self._param = None
 
     def generate(self, node: Expression) -> list:
         """
         Public method to generate the IR for a given UFL expression.
         """
         self.ir_sequence.clear()
+        self._param = build_jit_parametrization(node)
         form_type = _find_form_type(node)
         
         self._visit(node) # Initial call with default side=""
@@ -65,10 +68,18 @@ class IRGenerator:
 
     def _emit_restriction(self, domain, side: str, operand: Expression) -> None:
         """Append a CheckDomain op, inferring side from Pos/Neg when needed."""
-        token = getattr(domain, "cache_token", None)
+        token = None
+        if self._param is not None:
+            try:
+                token = self._param.domain_token_by_id.get(id(domain))
+            except Exception:
+                token = None
         if token is None:
-            raw = getattr(domain, "array", domain)
-            token = bitset_cache_token(raw)
+            # Fallback for callers bypassing generate(); keep stable within process.
+            token = getattr(domain, "cache_token", None)
+            if token is None:
+                raw = getattr(domain, "array", domain)
+                token = bitset_cache_token(raw)
         dom_side = side
         if dom_side not in ("+", "-"):
             if isinstance(operand, Pos):
@@ -289,36 +300,34 @@ class IRGenerator:
             return
             
         if isinstance(node, Constant):
-            if node.dim == 0:
-                jit_name = getattr(node, "_jit_name", None) or getattr(node, "jit_name", None)
-                if jit_name:
-                    jit_name = str(jit_name)
-                    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", jit_name):
+            # Always parameterize Constants so their values do not affect kernel caching.
+            name = None
+            if self._param is not None:
+                name = self._param.const_name_by_id.get(id(node))
+            if name is None:
+                # Fallback: preserve explicit jit_name; otherwise use a process-stable token.
+                name = getattr(node, "_jit_name", None) or getattr(node, "jit_name", None)
+                if name:
+                    name = str(name)
+                    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
                         raise ValueError(
-                            f"Invalid JIT constant name {jit_name!r}; must be a valid identifier."
+                            f"Invalid JIT constant name {name!r}; must be a valid identifier."
                         )
-                    self.ir_sequence.append(
-                        LoadConstantArray(name=jit_name, shape=(), role="const", is_vector=False, is_gradient=False)
-                    )
                 else:
-                    self.ir_sequence.append(LoadConstant(value=float(node.value)))
-            else:
-                token = getattr(node, "cache_token", None)
-                if token is None:
-                    token = f"fallback_{id(node)}"
-                name = f"const_arr_{token}"
-                value_arr = np.asarray(node.value)
-                is_vec = value_arr.ndim == 1
-                is_grad = value_arr.ndim == 2 and value_arr.shape[0] == value_arr.shape[1]
-                self.ir_sequence.append(
-                    LoadConstantArray(
-                        name=name,
-                        shape=node.shape,
-                        role="const",
-                        is_vector=is_vec,
-                        is_gradient=is_grad
-                    )
+                    name = f"jit_const_fallback_{id(node)}"
+
+            value_arr = np.asarray(node.value)
+            is_vec = value_arr.ndim == 1
+            is_grad = value_arr.ndim == 2 and value_arr.shape[0] == value_arr.shape[1]
+            self.ir_sequence.append(
+                LoadConstantArray(
+                    name=str(name),
+                    shape=node.shape,
+                    role="const",
+                    is_vector=is_vec,
+                    is_gradient=is_grad,
                 )
+            )
             return
         if isinstance(node, UFLTranspose):
             # Transpose is a no-op in IR, just push the top-of-stack tensor.
@@ -334,16 +343,22 @@ class IRGenerator:
             return
 
         if isinstance(node, ElementWiseConstant):
-            token = getattr(node, "cache_token", None)
-            if token is None:
-                token = f"fallback_{id(node)}"
-            name = f"ewc_{token}"
+            name = None
+            if self._param is not None:
+                name = self._param.ewc_name_by_id.get(id(node))
+            if name is None:
+                name = f"jit_ewc_fallback_{id(node)}"
             # This was a bug, creating a UFL node instead of an IR node
             self.ir_sequence.append(LoadEWC_IR(name=name, tensor_shape=node.tensor_shape))
             return
 
         if isinstance(node, Analytic):
-            self.ir_sequence.append(LoadAnalytic(func_id=id(node), func_ref=node.eval,
+            func_id = None
+            if self._param is not None:
+                func_id = self._param.analytic_id_by_id.get(id(node))
+            if func_id is None:
+                func_id = int(id(node))
+            self.ir_sequence.append(LoadAnalytic(func_id=int(func_id), func_ref=node.eval,
                                                  tensor_shape=getattr(node, "tensor_shape", ())))
             return
 

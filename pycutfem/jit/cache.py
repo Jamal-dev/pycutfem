@@ -10,7 +10,8 @@ import numpy as np  # numba kernels rely on it
 from pycutfem.core import mesh
 from pycutfem.jit.ir import LoadAnalytic
 
-CODEGEN_ABI = "2025-03-13-restrict-mask-values"
+# Bump when generated kernel source semantics/signature change.
+CODEGEN_ABI = "2026-01-07-const-scalars-item-ana-tmp"
 
 class KernelCache:
     """

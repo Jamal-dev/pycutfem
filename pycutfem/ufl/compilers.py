@@ -4545,6 +4545,14 @@ class FormCompiler:
             param_order = runner.param_order,
             pre_built   = geo
         )
+        try:
+            from pycutfem.ufl.jit_parametrization import build_jit_parametrization
+
+            _const_param_names = set(
+                build_jit_parametrization(intg.integrand).const_by_name.keys()
+            )
+        except Exception:
+            _const_param_names = set()
 
         # if anything is not aligned to edges
         n_edges = geo["qp_phys"].shape[0]
@@ -4558,7 +4566,7 @@ class FormCompiler:
                 and arr.ndim >= 1
                 and arr.shape[0] != n_edges
                 # Constant arrays (e.g., Identity) are not per-edge; skip shape enforcement.
-                and not str(name).startswith("const_arr_")
+                and name not in _const_param_names
             ):
                 if arr.shape[0] == n_elems and owner is not None:
                     # Gather per-edge rows from per-element array

@@ -606,7 +606,9 @@ class NumbaCodeGen:
             elif isinstance(op, LoadAnalytic):
                 param = f"ana_{op.func_id}"                  # unique name in PARAM_ORDER
                 required_args.add(param)
-                var_name = new_var("ana")
+                # Avoid collisions with PARAM_ORDER names like "ana_0"/"ana_1" when
+                # Analytic ids are small integers (we use stable indices for caching).
+                var_name = new_var("ana_val")
                 body_lines.append(f"{var_name} = {param}[e, q]")
                 tshape = tuple(getattr(op, "tensor_shape", ()))
                 is_vec = (len(tshape) == 1)
@@ -1242,9 +1244,15 @@ class NumbaCodeGen:
             
             elif isinstance(op, LoadConstantArray):
                 required_args.add(op.name)
-                np_array_var = new_var("const_np_arr")
-                # retain metadata from IR (role/is_vector/is_gradient) to allow identity handling
-                body_lines.append(f"{np_array_var} = {op.name}")
+                # Scalars are passed as 0d NumPy arrays (for ABI compatibility with the C++ backend).
+                # Convert them once to a true scalar to keep Numba typing happy (e.g. float(x) on
+                # a 0d array is not supported).
+                if getattr(op, "shape", ()) == ():
+                    np_array_var = new_var("const_val")
+                    body_lines.append(f"{np_array_var} = {op.name}.item()")
+                else:
+                    np_array_var = new_var("const_np_arr")
+                    body_lines.append(f"{np_array_var} = {op.name}")
                 stack.append(StackItem(
                     var_name   = np_array_var,
                     role       = getattr(op, 'role', 'const'),
