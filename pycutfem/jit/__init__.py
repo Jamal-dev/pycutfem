@@ -533,7 +533,7 @@ def _merge_static_arrays(target_eids: np.ndarray,
             for key, arr in merged.items():
                 if key == "eids":
                     continue
-                if isinstance(arr, np.ndarray) and arr.shape[0] == n_total:
+                if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] == n_total:
                     o_val = old_static.get(key) if old_static else None
                     if _is_elem_array(o_val, len(old_eids)):
                         try:
@@ -550,7 +550,7 @@ def _merge_static_arrays(target_eids: np.ndarray,
             for key, arr in merged.items():
                 if key == "eids":
                     continue
-                if isinstance(arr, np.ndarray) and arr.shape[0] == n_total:
+                if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] == n_total:
                     n_val = new_static.get(key) if new_static else None
                     if _is_elem_array(n_val, len(new_eids)):
                         try:
