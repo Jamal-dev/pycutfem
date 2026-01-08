@@ -613,6 +613,11 @@ LEVELSET_ZERO_SIDE = os.getenv("LEVELSET_ZERO_SIDE", "neg").strip().lower()
 LEVELSET_PREFER_NEGATIVE = LEVELSET_ZERO_SIDE != "pos"
 LEVELSET_UPDATE_TOL = float(os.getenv("LEVELSET_UPDATE_TOL", str(max(1.0e-12, 1.0e-10 * MESH_SIZE))))
 LEVELSET_EDGE_TOL = max(LEVELSET_EDGE_TOL, LEVELSET_UPDATE_TOL)
+_snap_env = os.getenv("LEVELSET_SNAP_EPS", "").strip()
+if _snap_env:
+    LEVELSET_SNAP_EPS = float(_snap_env)
+else:
+    LEVELSET_SNAP_EPS = max(1.0e-3 * MESH_SIZE, 10.0 * LEVELSET_EDGE_TOL) if USE_ALIGNED_INTERFACE else 0.0
 _nudge_env = os.getenv("LEVELSET_NUDGE_EPS", "").strip()
 if _nudge_env:
     LEVELSET_NUDGE_EPS = float(_nudge_env)
@@ -2301,6 +2306,7 @@ def update_beam_levelset_from_displacement(
     beam_ref_ls: Callable[[np.ndarray], float],
     *,
     nudge_eps: float = 0.0,
+    snap_eps: float = 0.0,
     edge_tol: float | None = None,
     prefer_negative: bool = True,
     update_tol: float = 0.0,
@@ -2323,58 +2329,76 @@ def update_beam_levelset_from_displacement(
     phi_new_vals = np.empty_like(phi_vals)
 
     n_nodes = mesh.nodes_x_y_pos.shape[0]
+    me_disp = disp_dh.mixed_element
+    fld_x = disp_x.field_name
+    fld_y = disp_y.field_name
     cache = getattr(ls_beam, "_disp_eval_cache", None)
     if (
         cache is None
         or cache.get("mesh_id") != id(mesh)
         or cache.get("n_nodes") != n_nodes
         or cache.get("n_elems") != len(mesh.elements_list)
+        or cache.get("fld_x") != fld_x
+        or cache.get("fld_y") != fld_y
     ):
-        node_owner = np.full(n_nodes, -1, dtype=int)
-        for eid, conn in enumerate(mesh.elements_connectivity):
-            for nid in conn:
-                if node_owner[int(nid)] == -1:
-                    node_owner[int(nid)] = int(eid)
-        ref_coords = np.full((n_nodes, 2), np.nan, dtype=float)
+        li_x = np.full(n_nodes, -1, dtype=int)
+        li_y = np.full(n_nodes, -1, dtype=int)
+
+        dof_map_x = disp_dh.dof_map.get(fld_x, {})
+        dof_map_y = disp_dh.dof_map.get(fld_y, {})
+        g2l = getattr(disp_vec, "_g2l", {}) or {}
+
+        for nid, gd in dof_map_x.items():
+            li = g2l.get(int(gd))
+            if li is not None:
+                li_x[int(nid)] = int(li)
+        for nid, gd in dof_map_y.items():
+            li = g2l.get(int(gd))
+            if li is not None:
+                li_y[int(nid)] = int(li)
+
         cache = {
             "mesh_id": id(mesh),
             "n_nodes": n_nodes,
             "n_elems": len(mesh.elements_list),
-            "node_owner": node_owner,
-            "ref_coords": ref_coords,
+            "fld_x": fld_x,
+            "fld_y": fld_y,
+            "li_x": li_x,
+            "li_y": li_y,
         }
         setattr(ls_beam, "_disp_eval_cache", cache)
-    node_owner = cache["node_owner"]
-    ref_coords = cache["ref_coords"]
-    me_disp = disp_dh.mixed_element
-    fld_x = disp_x.field_name
-    fld_y = disp_y.field_name
+    li_x = cache["li_x"]
+    li_y = cache["li_y"]
+    try:
+        inside_eids = mesh.element_bitset("inside").to_indices()
+    except Exception:
+        inside_eids = np.array([], dtype=int)
+    try:
+        cut_eids = mesh.element_bitset("cut").to_indices()
+    except Exception:
+        cut_eids = np.array([], dtype=int)
+    if inside_eids.size or cut_eids.size:
+        active_eids = np.unique(np.concatenate([inside_eids, cut_eids]).astype(int, copy=False))
+        active_nodes = np.unique(mesh.elements_connectivity[active_eids].ravel())
+        node_active = np.zeros(n_nodes, dtype=bool)
+        node_active[active_nodes.astype(int, copy=False)] = True
+    else:
+        node_active = np.zeros(n_nodes, dtype=bool)
 
     for gd_phi, nid in zip(gphi, node_ids):
         x, y = mesh.nodes_x_y_pos[int(nid)]
-        eid = int(node_owner[int(nid)])
-        ux = float("nan")
-        uy = float("nan")
-        if eid >= 0:
-            xi, eta = ref_coords[int(nid)]
-            if not np.isfinite(xi) or not np.isfinite(eta):
-                try:
-                    xi, eta = transform.inverse_mapping(mesh, eid, (float(x), float(y)))
-                except Exception:
-                    xi, eta = float("nan"), float("nan")
-                ref_coords[int(nid), 0] = float(xi)
-                ref_coords[int(nid), 1] = float(eta)
-            if np.isfinite(xi) and np.isfinite(eta):
-                phi_x = me_disp.basis(fld_x, float(xi), float(eta))[me_disp.slice(fld_x)]
-                phi_y = me_disp.basis(fld_y, float(xi), float(eta))[me_disp.slice(fld_y)]
-                gdofs_x = disp_dh.element_maps[fld_x][eid]
-                gdofs_y = disp_dh.element_maps[fld_y][eid]
-                ux = float(phi_x @ disp_x.get_nodal_values(gdofs_x))
-                uy = float(phi_y @ disp_y.get_nodal_values(gdofs_y))
-        if not np.isfinite(ux) or not np.isfinite(uy):
-            disp_val = _eval_vector_at_point(disp_dh, mesh, disp_vec, (float(x), float(y)))
-            ux = float(disp_val[0])
-            uy = float(disp_val[1])
+        ux = 0.0
+        uy = 0.0
+        if node_active[int(nid)]:
+            lix = int(li_x[int(nid)])
+            liy = int(li_y[int(nid)])
+            if lix >= 0 and liy >= 0:
+                ux = float(disp_vec.nodal_values[lix])
+                uy = float(disp_vec.nodal_values[liy])
+            else:
+                disp_val = _eval_vector_at_point(disp_dh, mesh, disp_vec, (float(x), float(y)))
+                ux = float(disp_val[0])
+                uy = float(disp_val[1])
 
         X_ref = np.array([x - ux, y - uy], float)
         phi_new = beam_ref_ls(X_ref)
@@ -2386,6 +2410,11 @@ def update_beam_levelset_from_displacement(
         nudge_mask = np.abs(phi_new_vals) <= nudge_eps
         if np.any(nudge_mask):
             phi_new_vals[nudge_mask] = -nudge_eps if prefer_negative else nudge_eps
+
+    if snap_eps > 0.0:
+        snap_mask = np.abs(phi_new_vals) <= snap_eps
+        if np.any(snap_mask):
+            phi_new_vals[snap_mask] = 0.0
 
     max_diff = float(np.max(np.abs(phi_new_vals - phi_vals))) if phi_vals.size else 0.0
     phi_diff = np.abs(phi_new_vals - phi_vals) if phi_vals.size else np.array([], dtype=float)
@@ -4941,6 +4970,7 @@ if ARGS.run_time_stepping:
             disp_k,
             beam_ref_ls,
             nudge_eps=LEVELSET_NUDGE_EPS,
+            snap_eps=LEVELSET_SNAP_EPS,
             edge_tol=LEVELSET_EDGE_TOL,
             prefer_negative=LEVELSET_PREFER_NEGATIVE,
             update_tol=LEVELSET_UPDATE_TOL,
