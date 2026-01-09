@@ -59,7 +59,10 @@ class CutIntegration:
     # ---------------------------- QUAD straight‑cut ------------------------
     @staticmethod
     def _edge_phi_on_eta(mesh, eid: int, lset, x_fixed: float, eta: float) -> float:
-        # Robust to analytic or FE-backed level sets
+        # Prefer element-aware evaluation for FE-backed level sets to avoid
+        # a costly owner search / inverse mapping.
+        if hasattr(lset, "value_on_element"):
+            return float(lset.value_on_element(int(eid), (float(x_fixed), float(eta))))
         x_phys = transform.x_mapping(mesh, int(eid), (float(x_fixed), float(eta)))
         return float(phi_eval(lset, x_phys))
 
@@ -142,12 +145,19 @@ class CutIntegration:
     @staticmethod
     def _q1_coeffs_ref_from_corners(mesh, eid: int, lset) -> Tuple[float, float, float, float]:
         R = np.array([[-1.0, -1.0], [+1.0, -1.0], [+1.0, +1.0], [-1.0, +1.0]], dtype=float)
-        # Evaluate φ at physical images of the four reference corners
-        vals = []
-        for i in range(4):
-            x_phys = transform.x_mapping(mesh, int(eid), (float(R[i, 0]), float(R[i, 1])))
-            vals.append(float(phi_eval(lset, x_phys)))
-        v = np.array(vals, dtype=float)
+        # Evaluate φ at the four reference corners. For FE-backed level sets,
+        # use the element-local fast path (no mapping needed).
+        if hasattr(lset, "value_on_element"):
+            v = np.array(
+                [float(lset.value_on_element(int(eid), (float(R[i, 0]), float(R[i, 1])))) for i in range(4)],
+                dtype=float,
+            )
+        else:
+            vals = []
+            for i in range(4):
+                x_phys = transform.x_mapping(mesh, int(eid), (float(R[i, 0]), float(R[i, 1])))
+                vals.append(float(phi_eval(lset, x_phys)))
+            v = np.array(vals, dtype=float)
         a00 = 0.25 * (v[0] + v[1] + v[2] + v[3])
         a10 = 0.25 * (-v[0] + v[1] + v[2] - v[3])
         a01 = 0.25 * (-v[0] - v[1] + v[2] + v[3])
@@ -161,9 +171,13 @@ class CutIntegration:
             R = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], float)
             edges = [(0, 1), (1, 2), (2, 0)]
             vals = np.empty(3, dtype=float)
-            for i in range(3):
-                x_phys = transform.x_mapping(mesh, int(eid), (float(R[i, 0]), float(R[i, 1])))
-                vals[i] = float(phi_eval(lset_p1, x_phys))
+            if hasattr(lset_p1, "value_on_element"):
+                for i in range(3):
+                    vals[i] = float(lset_p1.value_on_element(int(eid), (float(R[i, 0]), float(R[i, 1]))))
+            else:
+                for i in range(3):
+                    x_phys = transform.x_mapping(mesh, int(eid), (float(R[i, 0]), float(R[i, 1])))
+                    vals[i] = float(phi_eval(lset_p1, x_phys))
             pts: List[np.ndarray] = []
             for i, j in edges:
                 a, b = vals[i], vals[j]

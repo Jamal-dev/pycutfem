@@ -159,7 +159,9 @@ def clear_caches() -> None:
 def _hash_subset(ids: Sequence[int]) -> int:
     """Stable 64-bit hash for a list / BitSet of indices."""
     h = blake2b(digest_size=8)
-    h.update(np.asarray(sorted(ids), dtype=np.int32).tobytes())
+    # Use int64 to avoid overflow when callers pack multiple indices into a
+    # single integer (e.g. (eid<<16)|sid for interface segments on large meshes).
+    h.update(np.asarray(sorted((int(i) for i in ids)), dtype=np.int64).tobytes())
     return int.from_bytes(h.digest(), "little")
 
 
@@ -3390,25 +3392,26 @@ class DofHandler:
                 pos_eid = int(pos_ids[i]); neg_eid = int(neg_ids[i])
                 # union for this edge (true length, no padding)
                 union = union_lists[i]
-                col_of = {int(d): j for j, d in enumerate(union)}
                 # side-local gdofs for this field
-                pos_loc = self.element_maps[fld][pos_eid]
-                neg_loc = self.element_maps[fld][neg_eid]
-                pm[i, :] = [col_of[int(d)] for d in pos_loc]
-                nm[i, :] = [col_of[int(d)] for d in neg_loc]
+                pos_loc = np.asarray(self.element_maps[fld][pos_eid], dtype=np.int64)
+                neg_loc = np.asarray(self.element_maps[fld][neg_eid], dtype=np.int64)
+                pm[i, :] = _searchsorted_positions(np.asarray(union, dtype=np.int64), pos_loc)
+                nm[i, :] = _searchsorted_positions(np.asarray(union, dtype=np.int64), neg_loc)
                 if level_set is not None:
                     pos_masks_elem, _ = _elem_masks(pos_eid)
                     _, neg_masks_elem = _elem_masks(neg_eid)
                     mask_pos_local = pos_masks_elem.get(fld)
                     if mask_pos_local is not None and mask_pos_local.shape[0] == pm.shape[1]:
-                        for j, col in enumerate(pm[i]):
-                            if 0 <= col < n_union:
-                                pos_mask[i, col] = float(mask_pos_local[j])
+                        cols = pm[i]
+                        ok = (cols >= 0) & (cols < n_union)
+                        if np.any(ok):
+                            pos_mask[i, cols[ok]] = np.asarray(mask_pos_local, dtype=float)[ok]
                     mask_neg_local = neg_masks_elem.get(fld)
                     if mask_neg_local is not None and mask_neg_local.shape[0] == nm.shape[1]:
-                        for j, col in enumerate(nm[i]):
-                            if 0 <= col < n_union:
-                                neg_mask[i, col] = float(mask_neg_local[j])
+                        cols = nm[i]
+                        ok = (cols >= 0) & (cols < n_union)
+                        if np.any(ok):
+                            neg_mask[i, cols[ok]] = np.asarray(mask_neg_local, dtype=float)[ok]
             maps_by_field[f"pos_map_{fld}"] = pm
             maps_by_field[f"neg_map_{fld}"] = nm
             if level_set is not None:
@@ -4951,6 +4954,351 @@ class DofHandler:
                     deform=bool(deformation is not None),
                 )
             return _cut_volume_cache[cache_key]
+
+        # ------------------------------------------------------------------
+        # Fast path: QUAD mesh, no deformation
+        # ------------------------------------------------------------------
+        fast_cutvol = (
+            os.getenv("PYCUTFEM_CUTVOL_FASTTAB", "1").lower() not in {"0", "false", "no"}
+            and mesh.element_type == "quad"
+            and deformation is None
+        )
+        if fast_cutvol:
+            from pycutfem.integration.pre_tabulates import (
+                _tabulate_q1 as _tab_q1,
+                _tabulate_q2 as _tab_q2,
+                _tabulate_deriv_q1 as _tab_d_q1,
+                _tabulate_deriv_q2 as _tab_d_q2,
+                _tabulate_p1 as _tab_p1,
+                _tabulate_deriv_p1 as _tab_d_p1,
+            )
+
+            # A) reference cut quadrature per element (ragged)
+            order_y = max(2, int(qdeg_eff // 2))
+            order_x = max(2, int(qdeg_eff // 2))
+            side_char = "+" if str(side) == "+" else "-"
+            tol_fast = 1e-12
+            valid_eids: list[int] = []
+            qref_blocks: list[np.ndarray] = []
+            wref_blocks: list[np.ndarray] = []
+            gdofs_blocks: list[np.ndarray] = []
+            h_list: list[float] = []
+
+            for eid in eids_all:
+                qpref, qwref = CutIntegration.straight_cut_rule_quad_ref(
+                    mesh,
+                    int(eid),
+                    level_set,
+                    side=side_char,
+                    order_y=order_y,
+                    order_x=order_x,
+                    tol=tol_fast,
+                )
+                if np.asarray(qpref).size == 0:
+                    continue
+                qpref = np.asarray(qpref, dtype=float)
+                qwref = np.asarray(qwref, dtype=float).ravel()
+                if qpref.ndim != 2 or qpref.shape[1] != 2 or qwref.ndim != 1:
+                    raise ValueError("[cut_volume] invalid reference quadrature shape.")
+                if qpref.shape[0] != qwref.shape[0]:
+                    raise ValueError("[cut_volume] qref/weights length mismatch.")
+
+                valid_eids.append(int(eid))
+                qref_blocks.append(qpref)
+                wref_blocks.append(qwref)
+                gdofs_blocks.append(np.asarray(self.get_elemental_dofs(int(eid)), dtype=np.int64))
+                h_list.append(float(mesh.element_char_length(int(eid)) or 0.0))
+
+            if not valid_eids:
+                out = {
+                    "eids": np.array([], dtype=np.int32),
+                    "qp_phys": np.empty((0, 0, 2), dtype=float),
+                    "qw":      np.empty((0, 0),    dtype=float),
+                    "J_inv":   np.empty((0, 0, 2, 2), dtype=float),
+                    "detJ":    np.empty((0, 0), dtype=float),
+                    "normals": np.empty((0, 0, 2), dtype=float),
+                    "phis":    np.empty((0, 0), dtype=float),
+                    "gdofs_map": np.empty((0, n_union), dtype=np.int64),
+                    "h_arr":     np.empty((0,), dtype=float),
+                    "entity_kind": "element",
+                    "is_interface": False,
+                }
+                for f in fields:
+                    out[f"b_{f}"] = np.empty((0, 0, n_union), dtype=float)
+                    out[f"g_{f}"] = np.empty((0, 0, n_union, 2), dtype=float)
+                for (dx, dy) in sorted(derivs_eff):
+                    if (dx, dy) != (0, 0):
+                        for f in fields:
+                            out[f"d{dx}{dy}_{f}"] = np.empty((0, 0, n_union), dtype=float)
+                return out
+
+            nE = int(len(valid_eids))
+            sizes = np.asarray([blk.shape[0] for blk in wref_blocks], dtype=np.int32)
+            Qmax = int(sizes.max()) if sizes.size else 0
+
+            qref = np.zeros((nE, Qmax, 2), dtype=float)
+            wref = np.zeros((nE, Qmax), dtype=float)
+            for i in range(nE):
+                n = int(sizes[i])
+                if n:
+                    qref[i, :n, :] = qref_blocks[i]
+                    wref[i, :n] = wref_blocks[i]
+
+            xi_tab = qref[:, :, 0]
+            eta_tab = qref[:, :, 1]
+
+            # B) Geometry mapping for all elements/points (vectorized)
+            node_ids_all = mesh.nodes[mesh.elements_connectivity]
+            coords_all = mesh.nodes_x_y_pos[node_ids_all].astype(float)
+            coords_sel = coords_all[np.asarray(valid_eids, dtype=np.int32)]
+            nLocGeom = int(coords_sel.shape[1])
+
+            N_geom = np.empty((nE, Qmax, nLocGeom), dtype=float)
+            dN_geom = np.empty((nE, Qmax, nLocGeom, 2), dtype=float)
+            if mesh.element_type == "quad" and int(mesh.poly_order) == 1 and nLocGeom == 4:
+                _tab_q1(xi_tab, eta_tab, N_geom, dN_geom)
+            elif mesh.element_type == "quad" and int(mesh.poly_order) == 2 and nLocGeom == 9:
+                _tab_q2(xi_tab, eta_tab, N_geom, dN_geom)
+            elif mesh.element_type == "tri" and int(mesh.poly_order) == 1 and nLocGeom == 3:
+                _tab_p1(xi_tab, eta_tab, N_geom, dN_geom)
+            else:
+                ref_g = get_reference(mesh.element_type, mesh.poly_order, max_deriv_order=1)
+                for e in range(nE):
+                    for q in range(Qmax):
+                        N_geom[e, q, :] = np.asarray(ref_g.shape(float(xi_tab[e, q]), float(eta_tab[e, q])), dtype=float)
+                        dN_geom[e, q, :, :] = np.asarray(ref_g.grad(float(xi_tab[e, q]), float(eta_tab[e, q])), dtype=float)
+
+            qp_phys = np.einsum("eqk,ekj->eqj", N_geom, coords_sel, optimize=True)
+            J_geom = np.einsum("eki,eqkj->eqij", coords_sel, dN_geom, optimize=True)
+            det_raw = J_geom[..., 0, 0] * J_geom[..., 1, 1] - J_geom[..., 0, 1] * J_geom[..., 1, 0]
+            detJ = np.abs(det_raw)
+
+            invJ = np.empty_like(J_geom)
+            invJ[..., 0, 0] =  J_geom[..., 1, 1]
+            invJ[..., 0, 1] = -J_geom[..., 0, 1]
+            invJ[..., 1, 0] = -J_geom[..., 1, 0]
+            invJ[..., 1, 1] =  J_geom[..., 0, 0]
+            invJ /= det_raw[..., None, None]
+
+            # Physical weights: w_ref * |detJ|
+            qw = wref * detJ
+
+            # Zero-out padded slots (match the legacy ragged-padding output)
+            pad_mask = (wref == 0.0)
+            if np.any(pad_mask):
+                qp_phys[pad_mask] = 0.0
+                detJ[pad_mask] = 0.0
+                invJ[pad_mask] = 0.0
+
+            qp_phys = np.ascontiguousarray(qp_phys, dtype=np.float64)
+            qw = np.ascontiguousarray(qw, dtype=np.float64)
+            detJ = np.ascontiguousarray(detJ, dtype=np.float64)
+            invJ = np.ascontiguousarray(invJ, dtype=np.float64)
+            qref = np.ascontiguousarray(qref, dtype=np.float64)
+
+            # C) φ values at QPs (avoid inverse-mapping by using known (xi,eta))
+            phis = np.zeros((nE, Qmax), dtype=np.float64)
+            if level_set is not None:
+                have_vals_many = hasattr(level_set, "values_on_element_many")
+                have_val_elem = hasattr(level_set, "value_on_element")
+                for i, eid in enumerate(valid_eids):
+                    n = int(sizes[i])
+                    if n <= 0:
+                        continue
+                    if have_vals_many:
+                        phis[i, :n] = np.asarray(
+                            level_set.values_on_element_many(int(eid), xi_tab[i, :n], eta_tab[i, :n]),
+                            dtype=np.float64,
+                        )
+                    elif have_val_elem:
+                        for q in range(n):
+                            phis[i, q] = float(
+                                level_set.value_on_element(int(eid), (float(xi_tab[i, q]), float(eta_tab[i, q])))
+                            )
+                    else:
+                        # generic fallback (may be analytic)
+                        pts = qp_phys[i, :n, :]
+                        try:
+                            phis[i, :n] = np.asarray(level_set(pts), dtype=np.float64).reshape(-1)
+                        except Exception:
+                            for q in range(n):
+                                phis[i, q] = float(phi_eval(level_set, pts[q]))
+
+            # D) Optional inverse-jet tables (rare; keep the looped fallback)
+            from pycutfem.fem.transform import JET_CACHE as _JET
+            Hxi0 = Hxi1 = Txi0 = Txi1 = Qxi0 = Qxi1 = None
+            if need_hess or need_o3 or need_o4:
+                kmax_jets = 4 if need_o4 else (3 if need_o3 else 2)
+                if need_hess:
+                    Hxi0 = np.zeros((nE, Qmax, 2, 2), dtype=np.float64)
+                    Hxi1 = np.zeros_like(Hxi0)
+                if need_o3:
+                    Txi0 = np.zeros((nE, Qmax, 2, 2, 2), dtype=np.float64)
+                    Txi1 = np.zeros_like(Txi0)
+                if need_o4:
+                    Qxi0 = np.zeros((nE, Qmax, 2, 2, 2, 2), dtype=np.float64)
+                    Qxi1 = np.zeros_like(Qxi0)
+                for i, eid in enumerate(valid_eids):
+                    n = int(sizes[i])
+                    for q in range(n):
+                        rec = _JET.get(mesh, int(eid), float(xi_tab[i, q]), float(eta_tab[i, q]), upto=kmax_jets)
+                        if need_hess:
+                            A2 = rec["A2"]
+                            Hxi0[i, q] = np.asarray(A2[0], dtype=np.float64)
+                            Hxi1[i, q] = np.asarray(A2[1], dtype=np.float64)
+                        if need_o3:
+                            A3 = rec["A3"]
+                            Txi0[i, q] = np.asarray(A3[0], dtype=np.float64)
+                            Txi1[i, q] = np.asarray(A3[1], dtype=np.float64)
+                        if need_o4:
+                            A4 = rec["A4"]
+                            Qxi0[i, q] = np.asarray(A4[0], dtype=np.float64)
+                            Qxi1[i, q] = np.asarray(A4[1], dtype=np.float64)
+
+            # E) Basis/grad/derivative tables (reference-space)
+            slices = {f: me.component_dof_slices[f] for f in fields}
+            fields_by_order: dict[int, list[str]] = {}
+            for f in fields:
+                fields_by_order.setdefault(int(me._field_orders[f]), []).append(f)
+
+            tab_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+            xi_tab_c = np.asarray(xi_tab, dtype=float)
+            eta_tab_c = np.asarray(eta_tab, dtype=float)
+            for p_f, flds in fields_by_order.items():
+                if p_f == 0:
+                    Nf = np.ones((nE, Qmax, 1), dtype=np.float64)
+                    dNf = np.zeros((nE, Qmax, 1, 2), dtype=np.float64)
+                    tab_cache[p_f] = (Nf, dNf)
+                    continue
+                if mesh.element_type == "quad" and p_f == 1:
+                    Nf = np.empty((nE, Qmax, 4), dtype=np.float64)
+                    dNf = np.empty((nE, Qmax, 4, 2), dtype=np.float64)
+                    _tab_q1(xi_tab_c, eta_tab_c, Nf, dNf)
+                    tab_cache[p_f] = (Nf, dNf)
+                    continue
+                if mesh.element_type == "quad" and p_f == 2:
+                    Nf = np.empty((nE, Qmax, 9), dtype=np.float64)
+                    dNf = np.empty((nE, Qmax, 9, 2), dtype=np.float64)
+                    _tab_q2(xi_tab_c, eta_tab_c, Nf, dNf)
+                    tab_cache[p_f] = (Nf, dNf)
+                    continue
+                if mesh.element_type == "tri" and p_f == 1:
+                    Nf = np.empty((nE, Qmax, 3), dtype=np.float64)
+                    dNf = np.empty((nE, Qmax, 3, 2), dtype=np.float64)
+                    _tab_p1(xi_tab_c, eta_tab_c, Nf, dNf)
+                    tab_cache[p_f] = (Nf, dNf)
+                    continue
+                # Generic: reuse a representative field for this order.
+                rep = flds[0]
+                xi_flat = xi_tab_c.reshape(-1)
+                eta_flat = eta_tab_c.reshape(-1)
+                Nf = me._eval_scalar_basis_many(rep, xi_flat, eta_flat).reshape(nE, Qmax, -1)
+                dNf = me._eval_scalar_grad_many(rep, xi_flat, eta_flat).reshape(nE, Qmax, -1, 2)
+                tab_cache[p_f] = (np.asarray(Nf, dtype=np.float64), np.asarray(dNf, dtype=np.float64))
+
+            deriv_cache: dict[tuple[int, int, int], np.ndarray] = {}
+            def _deriv_tab(p_f: int, dx: int, dy: int, nloc: int, rep_field: str) -> np.ndarray:
+                key = (p_f, int(dx), int(dy))
+                hit = deriv_cache.get(key)
+                if hit is not None:
+                    return hit
+                if p_f == 0:
+                    out_loc = np.zeros((nE, Qmax, 1), dtype=np.float64)
+                    if int(dx) == 0 and int(dy) == 0:
+                        out_loc[:, :, 0] = 1.0
+                    deriv_cache[key] = out_loc
+                    return out_loc
+                if mesh.element_type == "quad" and p_f == 1:
+                    out_loc = np.empty((nE, Qmax, 4), dtype=np.float64)
+                    _tab_d_q1(xi_tab_c, eta_tab_c, int(dx), int(dy), out_loc)
+                    deriv_cache[key] = out_loc
+                    return out_loc
+                if mesh.element_type == "quad" and p_f == 2:
+                    out_loc = np.empty((nE, Qmax, 9), dtype=np.float64)
+                    _tab_d_q2(xi_tab_c, eta_tab_c, int(dx), int(dy), out_loc)
+                    deriv_cache[key] = out_loc
+                    return out_loc
+                if mesh.element_type == "tri" and p_f == 1:
+                    out_loc = np.empty((nE, Qmax, 3), dtype=np.float64)
+                    _tab_d_p1(xi_tab_c, eta_tab_c, int(dx), int(dy), out_loc)
+                    deriv_cache[key] = out_loc
+                    return out_loc
+                # generic fallback: tabulate with the representative field
+                out_loc = np.empty((nE, Qmax, int(nloc)), dtype=np.float64)
+                for e in range(nE):
+                    for q in range(Qmax):
+                        out_loc[e, q, :] = me._eval_scalar_deriv(rep_field, float(xi_tab_c[e, q]), float(eta_tab_c[e, q]), int(dx), int(dy))
+                deriv_cache[key] = out_loc
+                return out_loc
+
+            out: dict[str, Any] = {
+                "eids":      np.asarray(valid_eids, dtype=np.int32),
+                "qp_phys":   qp_phys,
+                "qw":        qw,
+                "J_inv":     invJ,
+                "detJ":      detJ,
+                "qref":      qref,
+                "normals":   np.zeros_like(qp_phys),
+                "phis":      phis,
+                "gdofs_map": np.asarray(gdofs_blocks, dtype=np.int64),
+                "h_arr":     np.asarray(h_list, dtype=np.float64),
+                "entity_kind": "element",
+                "owner_id":   np.asarray(valid_eids, dtype=np.int32),
+                "is_interface": False,
+                "J_inv_pos": invJ,
+                "J_inv_neg": invJ,
+            }
+
+            # b_/g_
+            for f in fields:
+                sl = slices[f]
+                p_f = int(me._field_orders[f])
+                Nf, dNf = tab_cache[p_f]
+                # Scatter into union-sized arrays (zeros outside the slice)
+                b_pad = np.zeros((nE, Qmax, n_union), dtype=np.float64)
+                g_pad = np.zeros((nE, Qmax, n_union, 2), dtype=np.float64)
+                b_pad[:, :, sl] = Nf
+                g_pad[:, :, sl, :] = dNf
+                out[f"b_{f}"] = b_pad
+                out[f"g_{f}"] = g_pad
+
+            # d{dx}{dy}_*
+            for (dx, dy) in sorted(derivs_eff):
+                if (dx, dy) == (0, 0):
+                    continue
+                for f in fields:
+                    sl = slices[f]
+                    p_f = int(me._field_orders[f])
+                    nloc = int(sl.stop - sl.start)
+                    rep_field = fields_by_order[p_f][0]
+                    loc = _deriv_tab(p_f, int(dx), int(dy), nloc, rep_field)
+                    d_pad = np.zeros((nE, Qmax, n_union), dtype=np.float64)
+                    d_pad[:, :, sl] = loc
+                    out[f"d{dx}{dy}_{f}"] = d_pad
+
+            if need_hess:
+                out["Hxi0"] = Hxi0
+                out["Hxi1"] = Hxi1
+            if need_o3:
+                out["Txi0"] = Txi0
+                out["Txi1"] = Txi1
+            if need_o4:
+                out["Qxi0"] = Qxi0
+                out["Qxi1"] = Qxi1
+
+            if reuse:
+                _cut_volume_cache[cache_key] = out
+            if _prof:
+                _pc_print(
+                    "cut_volume_factors",
+                    time.perf_counter() - _t0,
+                    nE=int(np.asarray(out.get("qp_phys")).shape[0]),
+                    nQ=int(np.asarray(out.get("qp_phys")).shape[1]),
+                    q=int(qdeg),
+                    side=str(side),
+                    deform=False,
+                )
+            return out
 
         # ---------- per-element ragged accumulators ----------
         valid_eids = []

@@ -1,6 +1,7 @@
 import re
 from matplotlib.pylab import f
 import numpy as np
+from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Union, Tuple, Set, Sequence, Optional, Dict, Any
 from pycutfem.ufl.expressions import Expression, Derivative, Constant, Identity
@@ -2274,6 +2275,46 @@ def _as_indices(ox: int, oy: int) -> tuple[int, ...]:
 #-----------------------------------------------------------------------
 class HelpersFieldAware:
     @staticmethod
+    @lru_cache(maxsize=128)
+    def _field_ref_nodes(element_type: str, p: int) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Reference-node coordinates for scalar Lagrange nodes in the ordering used
+        by `pycutfem.fem.reference` (quads: eta outer, xi inner; tris: j outer, i inner).
+        """
+        import numpy as np
+
+        element_type = str(element_type)
+        p = int(p)
+        if p < 0:
+            raise ValueError("p must be non-negative")
+        if element_type == "quad":
+            if p == 0:
+                xi = np.array([0.0], dtype=float)
+                eta = np.array([0.0], dtype=float)
+                return xi, eta
+            nodes = np.linspace(-1.0, 1.0, p + 1, dtype=float)
+            xi_list = []
+            eta_list = []
+            for et in nodes:
+                for xs in nodes:
+                    xi_list.append(float(xs))
+                    eta_list.append(float(et))
+            return np.asarray(xi_list, dtype=float), np.asarray(eta_list, dtype=float)
+        if element_type == "tri":
+            if p == 0:
+                xi = np.array([0.0], dtype=float)
+                eta = np.array([0.0], dtype=float)
+                return xi, eta
+            xi_list = []
+            eta_list = []
+            for j in range(p + 1):
+                for i in range(p + 1 - j):
+                    xi_list.append(float(i) / float(p))
+                    eta_list.append(float(j) / float(p))
+            return np.asarray(xi_list, dtype=float), np.asarray(eta_list, dtype=float)
+        raise KeyError(f"Unsupported element_type '{element_type}'")
+
+    @staticmethod
     def infer_side_from_field_name(field: str) -> Optional[str]:
         """Return 'pos' or 'neg' if the field name encodes a side; else None."""
         if "_pos_" in field or field.endswith("_pos") or field.startswith("pos_"):
@@ -2345,7 +2386,6 @@ class HelpersFieldAware:
         """
         Per-element masks: for each field, mark which local DOFs lie on φ>=-tol ('+') vs φ<-tol ('−').
         """
-        coords = dh.get_all_dof_coords()
         tol_eff = SIDE.tol if tol is None else float(tol)
         ls_tol = getattr(level_set, "edge_tol", None)
         if ls_tol is None:
@@ -2357,23 +2397,60 @@ class HelpersFieldAware:
                 pass
         pos_masks: Dict[str, np.ndarray] = {}
         neg_masks: Dict[str, np.ndarray] = {}
+
+        # Fast path: FE-backed level set with element-aware evaluation.
+        mesh = getattr(getattr(dh, "mixed_element", None), "mesh", None)
+        have_val_elem = hasattr(level_set, "value_on_element")
+        have_vals_many = hasattr(level_set, "values_on_element_many")
+        fast_eval = have_val_elem and (mesh is not None) and (getattr(mesh, "element_type", None) in {"quad", "tri"})
+
         for fld in fields:
             try:
                 gidx = np.asarray(dh.element_maps[fld][eid], dtype=int)
             except Exception:
                 continue
-            xy   = coords[gidx]
-            from pycutfem.ufl.helpers_geom import phi_eval
-            phi  = np.asarray([phi_eval(level_set, p) for p in xy], dtype=float)
-            # Use the single global rule
-            pos_mask = np.array([1.0 if SIDE.is_pos(val, tol=tol_eff) else 0.0 for val in phi], dtype=float)
-            neg_mask = np.array([1.0 if SIDE.is_neg(val, tol=tol_eff) else 0.0 for val in phi], dtype=float)
-            tol_chk = tol_eff
-            if pos_mask.shape == neg_mask.shape:
-                interface_idx = np.abs(phi) <= float(tol_chk)
-                if np.any(interface_idx):
-                    pos_mask[interface_idx] = 1.0
-                    neg_mask[interface_idx] = 1.0
+
+            if fast_eval:
+                p_f = int(getattr(dh.mixed_element, "_field_orders", {}).get(fld, 0))
+                xi_ref, eta_ref = HelpersFieldAware._field_ref_nodes(str(mesh.element_type), p_f)
+                if xi_ref.shape[0] != gidx.shape[0]:
+                    # Fallback to the slow geometric path if orders/layouts mismatch.
+                    fast_eval_this = False
+                else:
+                    fast_eval_this = True
+
+                if fast_eval_this:
+                    if have_vals_many:
+                        phi = np.asarray(level_set.values_on_element_many(int(eid), xi_ref, eta_ref), dtype=float)
+                    else:
+                        phi = np.asarray(
+                            [float(level_set.value_on_element(int(eid), (float(xi), float(eta))))
+                             for (xi, eta) in zip(xi_ref, eta_ref)],
+                            dtype=float,
+                        )
+                else:
+                    phi = None
+            else:
+                phi = None
+
+            if phi is None:
+                # Slow fallback: evaluate at physical DOF coordinates (generic LS / exotic layouts).
+                coords = dh.get_all_dof_coords()
+                xy = coords[gidx]
+                from pycutfem.ufl.helpers_geom import phi_eval
+                phi = np.asarray([phi_eval(level_set, p) for p in xy], dtype=float)
+
+            # Apply the convention (bulk sign) and include interface DOFs on both sides.
+            if SIDE.pos_is_phi_nonnegative:
+                pos_mask = (phi > 0.0).astype(float)
+                neg_mask = (phi < 0.0).astype(float)
+            else:
+                pos_mask = (phi < 0.0).astype(float)
+                neg_mask = (phi > 0.0).astype(float)
+            interface_idx = np.abs(phi) <= float(tol_eff)
+            if np.any(interface_idx):
+                pos_mask[interface_idx] = 1.0
+                neg_mask[interface_idx] = 1.0
             pos_masks[fld] = pos_mask
             neg_masks[fld] = neg_mask
 
