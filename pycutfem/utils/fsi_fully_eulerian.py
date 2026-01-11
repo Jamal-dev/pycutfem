@@ -32,6 +32,44 @@ from pycutfem.ufl.measures import dx, dGhost, dInterface
 def _copy_bitset(bs: BitSet) -> BitSet:
     return BitSet(np.array(bs.mask, dtype=bool))
 
+def _ghost_band_edges(mesh: Mesh, seed: BitSet, *, layers: int = 2) -> BitSet:
+    """Return a ghost-edge BitSet from an element band around `seed`.
+
+    The band is built by a BFS over element adjacency (`mesh.neighbors()`). We then
+    mark all *interior* edges whose two owner elements lie in the band, excluding
+    aligned interface edges.
+    """
+    layers = max(int(layers), 0)
+    if seed.cardinality() == 0:
+        return BitSet(np.zeros(len(mesh.edges_list), dtype=bool))
+
+    seed_ids = seed.to_indices()
+    band: set[int] = set(map(int, seed_ids))
+    frontier: set[int] = set(band)
+    nbs = mesh.neighbors()
+
+    for _ in range(layers):
+        if not frontier:
+            break
+        nxt: set[int] = set()
+        for eid in frontier:
+            for nb in nbs[int(eid)]:
+                nb = int(nb)
+                if nb not in band:
+                    nxt.add(nb)
+        band.update(nxt)
+        frontier = nxt
+
+    mask = np.zeros(len(mesh.edges_list), dtype=bool)
+    for e in mesh.edges_list:
+        if e.right is None:
+            continue
+        if int(e.left) in band and int(e.right) in band:
+            mask[int(e.gid)] = True
+
+    interface_bs = mesh.edge_bitset("interface")
+    return BitSet(mask) - interface_bs
+
 
 def nudge_levelset_zeros(level_set, eps: float, *, prefer_negative: bool = True, commit: bool = True) -> int:
     """Nudge |phi|<=eps nodes away from 0 to avoid aligned-interface degeneracy."""
@@ -88,9 +126,31 @@ def make_domain_sets(mesh: Mesh, *, use_aligned_interface: bool = False) -> Dict
     has_pos = fluid | cut
     has_neg = solid | cut
 
-    ghost_both = mesh.edge_bitset("ghost_both")
-    solid_ghost = mesh.edge_bitset("ghost_neg") | ghost_both
-    fluid_ghost = mesh.edge_bitset("ghost_pos") | ghost_both
+    interface_bs = mesh.edge_bitset("interface")
+    ghost_pos = mesh.edge_bitset("ghost_pos") - interface_bs
+    ghost_neg = mesh.edge_bitset("ghost_neg") - interface_bs
+    ghost_both = mesh.edge_bitset("ghost_both") - interface_bs
+    ghost_all = (ghost_pos | ghost_neg | ghost_both) - interface_bs
+
+    solid_ghost = ghost_neg | ghost_both
+    fluid_ghost = ghost_pos | ghost_both
+
+    # Sliver/corner robustness:
+    # If one side has no fully-inside/outside elements, cut cells can be supported
+    # by only a handful of facets (or none), which can make stabilization too weak.
+    # In that case, use a small element-band around the cut region and include all
+    # interior edges within that band for ghost stabilization.
+    if cut.cardinality() > 0:
+        if fluid.cardinality() == 0 or solid.cardinality() == 0:
+            band_ghost = _ghost_band_edges(mesh, cut, layers=2)
+            if band_ghost.cardinality() > 0:
+                fluid_ghost = _copy_bitset(band_ghost)
+                solid_ghost = _copy_bitset(band_ghost)
+        else:
+            if fluid_ghost.cardinality() == 0 and ghost_all.cardinality() > 0:
+                fluid_ghost = _copy_bitset(ghost_all)
+            if solid_ghost.cardinality() == 0 and ghost_all.cardinality() > 0:
+                solid_ghost = _copy_bitset(ghost_all)
     return {
         "fluid_domain": _copy_bitset(fluid),
         "solid_domain": _copy_bitset(solid),

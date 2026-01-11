@@ -2578,6 +2578,7 @@ class FormCompiler:
         qdeg  += 2 * max(0, p_geo - 1)
         fields = self._fields_for(intg.integrand)
         nseg   = int(md.get("nseg", max(3, p_geo + qdeg//2)))
+        linear_interface = bool(md.get("linear_interface", False))
         ref_geom = transform.get_reference(mesh.element_type, p_geo)
 
         # scalar‑functional?
@@ -2620,7 +2621,22 @@ class FormCompiler:
 
         # one iso call for all Γ segments: return reference coords + tangents
         t0 = _time.perf_counter()
-        if _iso_ifc is not None:
+        if linear_interface:
+            from pycutfem.integration.quadrature import gauss_legendre
+
+            order = max(1, int(qdeg))
+            xi_1d, w_1d = gauss_legendre(int(order))
+            s = 0.5 * (np.asarray(xi_1d, dtype=float) + 1.0)
+            ws = 0.5 * np.asarray(w_1d, dtype=float)
+            d = P1 - P0
+            L = np.linalg.norm(d, axis=1)
+            L_safe = np.maximum(L, 1e-30)
+            tau = d / L_safe[:, None]
+            qpts_all = P0[:, None, :] + s[None, :, None] * d[:, None, :]
+            qwts_all = ws[None, :] * L[:, None]
+            that_all = np.broadcast_to(tau[:, None, :], qpts_all.shape).copy()
+            qref_all = None
+        elif _iso_ifc is not None:
             qb, wb, tb, rb = _iso_ifc(level_set, P0, P1,
                                     p=p_geo, order=qdeg, project_steps=3, tol=SIDE.tol,
                                     mesh=mesh, eids=eids,
@@ -3668,10 +3684,12 @@ class FormCompiler:
                 nseg_hint = int(nseg_hint)
             except Exception:
                 nseg_hint = None
+        linear_interface = bool(md.get("linear_interface", False))
         geo = dh.precompute_interface_factors(
             cut_bs,
             qdeg,
             level_set,
+            linear_interface=linear_interface,
             nseg=nseg_hint,
             need_hess=need_hess,
             need_o3=need_o3,
@@ -4268,6 +4286,7 @@ class FormCompiler:
             need_o3=need_o3,
             need_o4=need_o4,
             reuse=True,
+            level_set=getattr(intg.measure, "level_set", None),
             deformation=getattr(intg.measure, "deformation", None),
         )
         geo["is_interface"] = False

@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
@@ -185,18 +186,23 @@ def test_beam_corner_jump_matches_symbolic(backend):
     # Interface geometry: two segments meeting at (1, 0.75)
     segments = getattr(target_elem, "interface_segments", [])
     assert len(segments) >= 2
-    expected_segments = [
-        [(1.0, 0.5), (1.0, 0.75)],        # vertical aligned edge piece
-        [(1.0, 0.75), (0.75, 0.75)],      # first half of horizontal
-        [(0.75, 0.75), (0.5, 0.75)],      # second half (ordering from root finder)
-    ]
-    for exp in expected_segments:
-        found = any(
-            (np.allclose(seg[0], exp[0], atol=1e-12) and np.allclose(seg[1], exp[1], atol=1e-12))
-            or (np.allclose(seg[0], exp[1], atol=1e-12) and np.allclose(seg[1], exp[0], atol=1e-12))
+
+    def _has_segment(a, b, *, atol=1e-12):
+        a = np.asarray(a, float)
+        b = np.asarray(b, float)
+        return any(
+            (np.allclose(seg[0], a, atol=atol) and np.allclose(seg[1], b, atol=atol))
+            or (np.allclose(seg[0], b, atol=atol) and np.allclose(seg[1], a, atol=atol))
             for seg in segments
         )
-        assert found, f"Expected segment {exp} not found in {segments}"
+
+    # Vertical aligned edge piece must exist.
+    assert _has_segment((1.0, 0.5), (1.0, 0.75))
+
+    # Horizontal segment may be represented either as one segment or split in two.
+    if not _has_segment((1.0, 0.75), (0.5, 0.75)):
+        assert _has_segment((1.0, 0.75), (0.75, 0.75))
+        assert _has_segment((0.75, 0.75), (0.5, 0.75))
 
     length = sum(np.linalg.norm(np.asarray(seg[1]) - np.asarray(seg[0])) for seg in segments)
     assert_allclose(length, 0.75, atol=1e-12)
@@ -213,18 +219,24 @@ def test_beam_corner_jump_matches_symbolic(backend):
     res = assemble_form(Equation(form, None), dof_handler=dh, bcs=[], backend=backend, assembler_hooks=hook)
     computed = res["jump"]
 
-    # Symbolic reference for the full beam perimeter (aligned + interior cuts across elements)
-    import sympy as sp
-
-    x, y = sp.symbols("x y", real=True)
-    expr = x**2 - sp.sin(x * y)
+    # Fast analytic reference for the full beam perimeter (avoids slow sympy).
     y0, y1 = 0.25, 0.75
     x0, x1 = 0.0, 1.0
-    seg_right = sp.integrate(expr.subs(x, x1), (y, y0, y1))
-    seg_left  = sp.integrate(expr.subs(x, x0), (y, y0, y1))
-    seg_top   = sp.integrate(expr.subs(y, y1), (x, x0, x1))
-    seg_bot   = sp.integrate(expr.subs(y, y0), (x, x0, x1))
-    expected = float(sp.N(seg_right + seg_left + seg_top + seg_bot))
+
+    # Right edge (x=1): ∫_{y0}^{y1} (1 - sin(y)) dy
+    seg_right = (y1 - y0) + math.cos(y1) - math.cos(y0)
+
+    # Left edge (x=0): integrand is 0 - sin(0) = 0
+    seg_left = 0.0
+
+    def _horiz(yval: float) -> float:
+        # ∫_{0}^{1} (x^2 - sin(yval*x)) dx
+        a = float(yval)
+        return (1.0 / 3.0) - (1.0 - math.cos(a)) / a
+
+    seg_top = _horiz(y1)  # y=y1
+    seg_bot = _horiz(y0)  # y=y0
+    expected = float(seg_right + seg_left + seg_top + seg_bot)
 
     assert abs(computed) > 1e-12  # non-zero jump
     assert_allclose(computed, expected, rtol=1e-6, atol=1e-8)

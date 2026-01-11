@@ -3269,8 +3269,14 @@ class NumbaCodeGen:
             else:
                 raise NotImplementedError(f"Opcode {type(op).__name__} not handled in JIT codegen.")
 
+        needs_phis = any(isinstance(op, (PosOp, NegOp)) for op in ir_sequence)
         source, param_order = self._build_kernel_string(
-            kernel_name, body_lines, required_args, solution_func_names, functional_shape
+            kernel_name,
+            body_lines,
+            required_args,
+            solution_func_names,
+            functional_shape,
+            needs_phis=needs_phis,
         )
         return source, {}, param_order
 
@@ -3281,7 +3287,9 @@ class NumbaCodeGen:
             required_args: set,
             solution_func_names: set,
             functional_shape: tuple = None,
-            DEBUG: bool = False
+            DEBUG: bool = False,
+            *,
+            needs_phis: bool = False,
         ):
         """
         Build complete kernel source code with parallel assembly.
@@ -3299,12 +3307,10 @@ class NumbaCodeGen:
         # print(f"DEBUG L:1025: required_args: {sorted(list(required_args))}")
         # sanitize None from required_args
         # required_args = {arg for arg in required_args if arg is not None} 
-        param_order = [
-            "gdofs_map",
-            "node_coords",
-            "qp_phys", "qw", "detJ", "J_inv", "normals", "phis",
-            *sorted(list(required_args))
-        ]
+        param_order = ["gdofs_map", "node_coords", "qp_phys", "qw", "detJ", "J_inv", "normals"]
+        if needs_phis:
+            param_order.append("phis")
+        param_order += sorted(list(required_args))
         if 'global_dofs' in param_order:
             param_order.append('union_sizes')
         param_order = list(dict.fromkeys(param_order))  # Remove duplicates while preserving order
@@ -3334,6 +3340,12 @@ class NumbaCodeGen:
 
         body_code_block = "\n".join(
             f"            {line.replace('_loc', '_loc_e')}" for line in body_lines if line.strip()
+        )
+
+        phi_q_line = (
+            "            phi_q    = phis[e, q] if phis is not None else 0.0"
+            if needs_phis
+            else "            phi_q    = 0.0"
         )
 
         decorator = ""
@@ -3444,7 +3456,7 @@ def {kernel_name}(
         for q in range(qw.shape[1]):
             x_q, w_q, J_inv_q = qp_phys[e, q], qw[e, q], J_inv[e, q]
             normal_q = normals[e, q] if normals is not None else np.zeros(2, dtype={self.dtype})
-            phi_q    = phis[e, q] if phis is not None else 0.0
+{phi_q_line}
 {basis_unpack_block}
 {body_code_block}
 

@@ -98,17 +98,38 @@ class CutIntegration:
                 return CutIntegration._segment_rule_1d(-1.0, +1.0, order)
             return np.empty((0,), float), np.empty((0,), float)
 
-        xi_cut = num/denom  # exact REF root at this η
+        # exact REF root at this η (clamp for safety)
+        xi_cut = float(num / denom)
+        xi_cut = -1.0 if xi_cut < -1.0 else (1.0 if xi_cut > 1.0 else xi_cut)
+
+        # Robust selection: decide which sub-interval belongs to the requested side by
+        # sampling φ strictly inside each candidate interval. This avoids degeneracies
+        # when the cut hits an endpoint (φ=0 at ξ=±1), which can otherwise cause
+        # + and - rules to overlap and double-count.
+        def _phi_at(xi: float) -> float:
+            return float(a00 + a10 * xi + a01 * eta + a11 * xi * eta)
+
+        intervals: list[tuple[float, float, float]] = []
+        left_len = xi_cut + 1.0
+        right_len = 1.0 - xi_cut
+        if left_len > 1e-14:
+            xi_m = -1.0 + 0.5 * left_len
+            intervals.append((-1.0, xi_cut, _phi_at(xi_m)))
+        if right_len > 1e-14:
+            xi_m = xi_cut + 0.5 * right_len
+            intervals.append((xi_cut, 1.0, _phi_at(xi_m)))
+
         if want_pos:
-            if SIDE.is_pos(fl, tol) and not SIDE.is_pos(fr, tol):
-                return CutIntegration._segment_rule_1d(-1.0, xi_cut, order)
-            else:
-                return CutIntegration._segment_rule_1d(xi_cut, +1.0, order)
+            keep = [(a, b) for (a, b, phi_m) in intervals if SIDE.is_pos(phi_m, tol)]
         else:
-            if SIDE.is_neg(fl, tol) and not SIDE.is_neg(fr, tol):
-                return CutIntegration._segment_rule_1d(-1.0, xi_cut, order)
-            else:
-                return CutIntegration._segment_rule_1d(xi_cut, +1.0, order)
+            keep = [(a, b) for (a, b, phi_m) in intervals if SIDE.is_neg(phi_m, tol)]
+
+        if not keep:
+            return np.empty((0,), float), np.empty((0,), float)
+        if len(keep) == 2:
+            return CutIntegration._segment_rule_1d(-1.0, +1.0, order)
+        a, b = keep[0]
+        return CutIntegration._segment_rule_1d(float(a), float(b), order)
 
     @staticmethod
     def straight_cut_rule_quad_ref(mesh, eid: int, lset_p1, *, side: str = '+', order_y: int = 3, order_x: int = 3, tol: float = 1e-12):

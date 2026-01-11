@@ -388,8 +388,13 @@ class Mesh:
         Classify each element as 'inside', 'outside', or 'cut'.
         Sets element.tag accordingly and returns indices for each class.
         """
+        from pycutfem.fem import transform
+        from pycutfem.core.levelset import phi_eval as _phi_eval
+
         phi_nodes = level_set.evaluate_on_nodes(self)
-        elem_phi_nodes = phi_nodes[self.corner_connectivity]
+        # Use *all* element nodes (not just corners) so higher-order meshes/level-sets
+        # cannot miss interior sign changes (a common source of spurious "aligned" edges).
+        elem_phi_nodes = phi_nodes[self.elements_connectivity]
         try:
             phi_cent = self._phi_on_centroids(level_set)
             phi_samples = np.concatenate([elem_phi_nodes, phi_cent[:, None]], axis=1)
@@ -413,6 +418,74 @@ class Mesh:
 
         # Narrow φ≈0 band (all samples ~0): treat as cut for safety
         cut_mask |= ~(inside_mask | outside_mask | cut_mask)
+
+        # ------------------------------------------------------------------
+        # Sliver / grazing robustness:
+        # Even if all element nodes are on the same side, higher-order/analytic
+        # level sets can cross an element in a tiny corner region (two roots on
+        # a single edge). Detect this by probing edge roots on a narrow band
+        # around Γ, but avoid re-tagging fully aligned interface facets.
+        # ------------------------------------------------------------------
+        try:
+            h_elem = np.sqrt(np.asarray(self.areas_list, float))
+        except Exception:
+            h_elem = np.full(len(self.elements_list), float(getattr(self, "_char_length", 1.0) or 1.0))
+        min_abs = np.min(np.abs(phi_samples), axis=1)
+        cand = np.where((inside_mask | outside_mask) & (min_abs <= h_elem))[0]
+        nloc_edges = 4 if self.element_type == "quad" else 3
+        for eid in cand:
+            if cut_mask[eid]:
+                continue
+            for l_edge in range(nloc_edges):
+                roots = edge_root_pn(level_set, self, int(eid), int(l_edge), tol=tol)
+                if not roots:
+                    continue
+
+                # Ignore pure vertex hits: roots at edge endpoints only.
+                c0, c1 = self._EDGE_TABLE[self.element_type][l_edge]
+                n0 = int(self.elements_list[int(eid)].corner_nodes[c0])
+                n1 = int(self.elements_list[int(eid)].corner_nodes[c1])
+                P0 = self.nodes_x_y_pos[n0]
+                P1 = self.nodes_x_y_pos[n1]
+                eps_end = max(10.0 * float(tol), 1.0e-8 * float(h_elem[eid]))
+                has_interior = False
+                for R in roots:
+                    R = np.asarray(R, float)
+                    if (np.linalg.norm(R - P0) > eps_end) and (np.linalg.norm(R - P1) > eps_end):
+                        has_interior = True
+                        break
+                if not has_interior:
+                    continue
+
+                # Skip fully aligned edges (φ=0 along the whole edge): those are
+                # handled by edge tagging and the aligned-interface assembler.
+                if self.element_type == "quad":
+                    if l_edge == 0:
+                        xi_eta = (0.0, -1.0)
+                    elif l_edge == 1:
+                        xi_eta = (1.0, 0.0)
+                    elif l_edge == 2:
+                        xi_eta = (0.0, 1.0)
+                    else:
+                        xi_eta = (-1.0, 0.0)
+                else:  # tri
+                    if l_edge == 0:
+                        xi_eta = (0.5, 0.0)
+                    elif l_edge == 1:
+                        xi_eta = (0.5, 0.5)
+                    else:
+                        xi_eta = (0.0, 0.5)
+
+                x_mid = transform.x_mapping(self, int(eid), (float(xi_eta[0]), float(xi_eta[1])))
+                phi_mid = float(_phi_eval(level_set, x_mid, eid=int(eid), xi_eta=xi_eta, mesh=self))
+                if abs(phi_mid) <= tol:
+                    continue
+
+                # Genuine intersection missed by nodal sampling → mark cut
+                cut_mask[eid] = True
+                inside_mask[eid] = False
+                outside_mask[eid] = False
+                break
 
         inside_inds  = np.where(inside_mask)[0]
         outside_inds = np.where(outside_mask)[0]
@@ -447,8 +520,13 @@ class Mesh:
                 continue
 
             edge.tag = ''
-            n0, n1 = edge.nodes
-            p0, p1 = phi_nodes[n0], phi_nodes[n1]
+            # Detect fully-aligned interface facets using *all* nodes on the edge.
+            # For higher-order meshes, endpoints alone are insufficient: the edge can
+            # "hit" φ=0 at vertices while remaining strictly on one side in-between.
+            edge_nodes = getattr(edge, "all_nodes", None) or edge.nodes
+            edge_nodes = tuple(int(n) for n in edge_nodes)
+            phi_edge = phi_nodes[list(edge_nodes)]
+            edge_aligned = bool(np.all(np.abs(phi_edge) <= tol))
             left_el = self.elements_list[edge.left]
             right_el = self.elements_list[edge.right]
             left_tag = left_el.tag
@@ -457,9 +535,8 @@ class Mesh:
 
             # 1. Interface edges: only when they separate inside/outside elements.
             if left_tag in {"inside", "outside"} and right_tag in {"inside", "outside"} and left_tag != right_tag:
-                # Require φ≈0 at both endpoints for aligned interface facets.
-                if abs(p0) <= tol and abs(p1) <= tol:
-                    edge.tag = 'interface'
+                if edge_aligned:
+                    edge.tag = "interface"
                 continue
             
             # 2. Ghost Edge Classification based on Element Tags
@@ -617,12 +694,88 @@ class Mesh:
             if   local_edge == 1: return (1.0 - t, t)
             return (0.0, 1.0 - t)
 
+        def _unit(v: np.ndarray) -> np.ndarray:
+            v = np.asarray(v, float).reshape(-1)
+            if v.size != 2:
+                v = v[:2]
+            nrm = float(np.linalg.norm(v))
+            if nrm <= 1e-30:
+                return np.zeros(2, dtype=float)
+            return (v / nrm).astype(float)
+
+        def _in_element(eid: int, P: np.ndarray, eps: float = 1e-10) -> bool:
+            try:
+                xi, eta = transform.inverse_mapping(self, int(eid), np.asarray(P, float))
+            except Exception:
+                return False
+            if self.element_type == "quad":
+                return (abs(float(xi)) <= 1.0 + eps) and (abs(float(eta)) <= 1.0 + eps)
+            return (float(xi) >= -eps) and (float(eta) >= -eps) and (float(xi) + float(eta) <= 1.0 + eps)
+
+        def _prune_shared_edge_segments(elem, segs: list[list[tuple[float, float]]]) -> list[list[tuple[float, float]]]:
+            """Avoid double-counting when Γ lies on a shared element edge segment.
+
+            If a segment lies on an interior mesh edge and *both* adjacent elements
+            are tagged 'cut', keep it only for the global-edge 'left' owner.
+            """
+            if not segs:
+                return segs
+
+            def _on_segment_line(P: np.ndarray, A: np.ndarray, B: np.ndarray, *, tol_line: float) -> bool:
+                v = B - A
+                Lv = float(np.linalg.norm(v))
+                if Lv <= 1e-30:
+                    return False
+                w = P - A
+                # distance to line via 2D cross product magnitude / |v|
+                d = abs(float(v[0] * w[1] - v[1] * w[0])) / Lv
+                if d > tol_line:
+                    return False
+                t = float(np.dot(w, v)) / (Lv * Lv)
+                return (-1e-12 <= t <= 1.0 + 1e-12)
+
+            nloc_edges = 4 if len(elem.corner_nodes) == 4 else 3
+            cn = self.nodes_x_y_pos[list(elem.corner_nodes)]
+            h_loc = float(np.max(np.linalg.norm(np.roll(cn, -1, axis=0) - cn, axis=1)))
+            tol_line = max(1e-10, 1e-10 * h_loc)
+
+            out: list[list[tuple[float, float]]] = []
+            for p0, p1 in segs:
+                P0 = np.asarray(p0, float)
+                P1 = np.asarray(p1, float)
+                drop = False
+
+                for l_edge in range(nloc_edges):
+                    c0, c1 = self._EDGE_TABLE[self.element_type][l_edge]
+                    A = self.nodes_x_y_pos[int(elem.corner_nodes[c0])]
+                    B = self.nodes_x_y_pos[int(elem.corner_nodes[c1])]
+                    if _on_segment_line(P0, A, B, tol_line=tol_line) and _on_segment_line(P1, A, B, tol_line=tol_line):
+                        # Segment lies on this element edge; if it's shared by two cut elements,
+                        # keep only on the global edge's 'left' owner.
+                        try:
+                            gid = int(elem.edges[l_edge])
+                        except Exception:
+                            gid = None
+                        if gid is not None:
+                            e = self.edge(gid)
+                            if e.right is not None:
+                                lt = self.elements_list[int(e.left)].tag
+                                rt = self.elements_list[int(e.right)].tag
+                                if lt == "cut" and rt == "cut" and int(elem.id) != int(e.left):
+                                    drop = True
+                        break
+
+                if not drop:
+                    out.append([tuple(P0), tuple(P1)])
+            return out
+
         # Optional: only needed if you want a cheap endpoint precheck for p==1
         phi_nodes = level_set.evaluate_on_nodes(self)  # φ at mesh corner nodes
 
         # detect discrete order p of the FE level set if available (default 1)
+        is_fe_ls = hasattr(level_set, "value_on_element") or hasattr(level_set, "values_on_element_many")
         p = 1
-        if hasattr(level_set, "dh") and hasattr(level_set, "field"):
+        if is_fe_ls and hasattr(level_set, "dh") and hasattr(level_set, "field"):
             try:
                 p = int(level_set.dh.mixed_element._field_orders[level_set.field])
             except Exception:
@@ -642,7 +795,7 @@ class Mesh:
 
                 # --- DO NOT SKIP on endpoint signs for p>=2 ---
                 # Only keep the fast skip for strictly p==1 (linear along edge)
-                if p == 1:
+                if is_fe_ls and p == 1:
                     # Quick sign check using the *corner* nodes of this side;
                     # elem.edges[l_edge] may be a subdivided segment (hanging nodes).
                     c0, c1 = self._EDGE_TABLE[self.element_type][l_edge]
@@ -684,41 +837,184 @@ class Mesh:
             # de-dup (φ=0 through a vertex)
             unique_pts = _dedup([np.asarray(pnt, float) for pnt in pts])
 
-            # Interior kink detection: add centroid and edge midpoints if φ≈0
-            try:
-                c = np.asarray(elem.centroid(), float)
-                phi_c = _phi_eval(level_set, c, eid=int(elem.id), mesh=self)
-                if abs(phi_c) <= max(tol, 1e-12):
-                    unique_pts.append(c)
-            except Exception:
-                pass
-            for (i0, i1) in self._EDGE_TABLE[self.element_type]:
-                n0 = int(elem.corner_nodes[i0]); n1 = int(elem.corner_nodes[i1])
-                mid = 0.5 * (self.nodes_x_y_pos[n0] + self.nodes_x_y_pos[n1])
+            # If we still have <2 boundary intersections, try a very conservative
+            # interior probe (helps near-tangencies) but do not add extra points
+            # when we already have enough to define segments: that can create
+            # spurious kinks on piecewise-linear interfaces (boxes).
+            if len(unique_pts) < 2:
                 try:
-                    phi_m = _phi_eval(level_set, mid, eid=int(elem.id), mesh=self)
+                    c = np.asarray(elem.centroid(), float)
+                    phi_c = _phi_eval(level_set, c, eid=int(elem.id), mesh=self)
+                    if abs(phi_c) <= max(tol, 1e-12):
+                        unique_pts.append(c)
                 except Exception:
+                    pass
+                for (i0, i1) in self._EDGE_TABLE[self.element_type]:
+                    n0 = int(elem.corner_nodes[i0]); n1 = int(elem.corner_nodes[i1])
+                    mid = 0.5 * (self.nodes_x_y_pos[n0] + self.nodes_x_y_pos[n1])
                     try:
-                        phi_m = level_set(np.asarray(mid, float))
+                        phi_m = _phi_eval(level_set, mid, eid=int(elem.id), mesh=self)
                     except Exception:
-                        phi_m = np.inf
-                if abs(phi_m) <= max(tol, 1e-12):
-                    unique_pts.append(np.asarray(mid, float))
+                        try:
+                            phi_m = level_set(np.asarray(mid, float))
+                        except Exception:
+                            phi_m = np.inf
+                    if abs(phi_m) <= max(tol, 1e-12):
+                        unique_pts.append(np.asarray(mid, float))
 
-            unique_pts = _dedup(unique_pts)
+                unique_pts = _dedup(unique_pts)
 
-            if len(unique_pts) >= 2:
+            # Corner/kink fixup: if the interface inside this element is not smooth,
+            # two boundary intersections alone may represent an L-shaped polyline
+            # (e.g. sharp corners of a box). Detect via large normal change and
+            # insert the interior kink point as the intersection of tangents.
+            if len(unique_pts) == 2 and hasattr(level_set, "gradient"):
+                P0 = np.asarray(unique_pts[0], float)
+                P1 = np.asarray(unique_pts[1], float)
+                try:
+                    n0 = _unit(level_set.gradient(P0))
+                    n1 = _unit(level_set.gradient(P1))
+                except Exception:
+                    n0 = np.zeros(2, float)
+                    n1 = np.zeros(2, float)
+
+                if (np.linalg.norm(n0) > 0.0) and (np.linalg.norm(n1) > 0.0):
+                    cosang = float(np.clip(np.dot(n0, n1), -1.0, 1.0))
+                    # If normals differ a lot, the interface may have a kink.
+                    if cosang < 0.75:  # ~ > 41 degrees
+                        t0 = np.array([-n0[1], n0[0]], dtype=float)
+                        t1 = np.array([-n1[1], n1[0]], dtype=float)
+                        A = np.column_stack((t0, -t1))
+                        det = float(np.linalg.det(A))
+                        if abs(det) > 1.0e-14:
+                            try:
+                                s, _u = np.linalg.solve(A, (P1 - P0))
+                            except Exception:
+                                s = None
+                            if s is not None:
+                                C = P0 + float(s) * t0
+                                if _in_element(int(elem.id), C, eps=1e-8):
+                                    # Project the intersection onto Γ to robustly handle small
+                                    # errors in the tangent intersection (e.g. near-degenerate
+                                    # corner situations).
+                                    from pycutfem.integration.quadrature import _project_to_levelset
+
+                                    C0 = np.asarray(C, float)
+                                    Cg = _project_to_levelset(C0, level_set, mesh=self, eid=int(elem.id), max_steps=6, tol=max(1e-14, float(tol)))
+                                    Cg = np.asarray(Cg, float)
+
+                                    # Accept only if projection displacement is tiny relative to h.
+                                    cn = self.nodes_x_y_pos[list(elem.corner_nodes)]
+                                    edges = np.roll(cn, -1, axis=0) - cn
+                                    h_elem = float(np.max(np.linalg.norm(edges, axis=1)))
+                                    if (np.linalg.norm(Cg - C0) <= max(1e-10, 0.05 * h_elem)) and _in_element(int(elem.id), Cg, eps=1e-8):
+                                        if (np.linalg.norm(Cg - P0) > 1e-12) and (np.linalg.norm(Cg - P1) > 1e-12):
+                                            unique_pts.append(Cg)
+                                            unique_pts = _dedup(unique_pts)
+
+            npts = len(unique_pts)
+            if npts < 2:
+                elem.interface_pts = []
+                elem.interface_segments = []
+                continue
+
+            # 1) The common case: a single connected segment (2 points)
+            if npts == 2:
+                p0 = tuple(np.asarray(unique_pts[0], float))
+                p1 = tuple(np.asarray(unique_pts[1], float))
+                segs = _prune_shared_edge_segments(elem, [[p0, p1]])
+                elem.interface_segments = segs
+                elem.interface_pts = [segs[0][0], segs[0][1]] if segs else []
+                continue
+
+            # 2) A kinked polyline (typically 3 points: corner inside the element)
+            if npts == 3:
                 ordered = _ordered_polyline(unique_pts)
                 segments = []
                 for k in range(len(ordered) - 1):
                     p0 = tuple(np.asarray(ordered[k], float))
                     p1 = tuple(np.asarray(ordered[k + 1], float))
                     segments.append([p0, p1])
+                segments = _prune_shared_edge_segments(elem, segments)
                 elem.interface_segments = segments
-                elem.interface_pts = [tuple(np.asarray(ordered[0], float)), tuple(np.asarray(ordered[-1], float))]
-            else:
-                elem.interface_pts = []
-                elem.interface_segments = []
+                elem.interface_pts = [segments[0][0], segments[-1][1]] if segments else []
+                continue
+
+            # 3) Potentially multiple disconnected components: pair points into segments.
+            # This occurs near sharp corners where two interface branches enter through
+            # the same element edge, but the corner itself lies in a neighbour element.
+            pts_arr = [np.asarray(pnt, float) for pnt in unique_pts]
+            normals = None
+            if hasattr(level_set, "gradient"):
+                normals = []
+                for P in pts_arr:
+                    try:
+                        normals.append(_unit(level_set.gradient(P)))
+                    except Exception:
+                        normals.append(np.zeros(2, float))
+
+            def _pair_cost(i: int, j: int) -> float:
+                Pi, Pj = pts_arr[i], pts_arr[j]
+                d = float(np.linalg.norm(Pj - Pi))
+                if normals is None:
+                    return d
+                ni, nj = normals[i], normals[j]
+                if (np.linalg.norm(ni) <= 0.0) or (np.linalg.norm(nj) <= 0.0):
+                    return d
+                # Prefer pairing points on the same interface branch (similar normals).
+                penalty = 1.0 - abs(float(np.dot(ni, nj)))
+                return d + 0.25 * penalty
+
+            def _best_pairs(ids: list[int]) -> list[tuple[int, int]] | None:
+                best_cost = float("inf")
+                best: list[tuple[int, int]] | None = None
+
+                def rec(rem: list[int], acc: list[tuple[int, int]], cost: float) -> None:
+                    nonlocal best_cost, best
+                    if not rem:
+                        if cost < best_cost:
+                            best_cost = cost
+                            best = list(acc)
+                        return
+                    i = rem[0]
+                    for k in range(1, len(rem)):
+                        j = rem[k]
+                        c = _pair_cost(i, j)
+                        new_cost = cost + c
+                        if new_cost >= best_cost:
+                            continue
+                        acc.append((i, j))
+                        nxt = rem[1:k] + rem[k + 1 :]
+                        rec(nxt, acc, new_cost)
+                        acc.pop()
+
+                rec(list(ids), [], 0.0)
+                return best
+
+            # Only apply pairing when we have an even number of points; otherwise fall back.
+            if (npts % 2) == 0:
+                pairs = _best_pairs(list(range(npts)))
+                if pairs:
+                    segs = []
+                    for i, j in pairs:
+                        p0 = tuple(np.asarray(pts_arr[i], float))
+                        p1 = tuple(np.asarray(pts_arr[j], float))
+                        segs.append([p0, p1])
+                    segs = _prune_shared_edge_segments(elem, segs)
+                    elem.interface_segments = segs
+                    elem.interface_pts = [segs[0][0], segs[0][1]] if segs else []
+                    continue
+
+            # Fallback: a single polyline through all points.
+            ordered = _ordered_polyline(unique_pts)
+            segments = []
+            for k in range(len(ordered) - 1):
+                p0 = tuple(np.asarray(ordered[k], float))
+                p1 = tuple(np.asarray(ordered[k + 1], float))
+                segments.append([p0, p1])
+            segments = _prune_shared_edge_segments(elem, segments)
+            elem.interface_segments = segments
+            elem.interface_pts = [segments[0][0], segments[-1][1]] if segments else []
 
 
     def edge_bitset(self, tag: str) -> BitSet:

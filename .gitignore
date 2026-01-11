@@ -207,3 +207,5 @@ scripts/
 *_results_*
 examples/meshes/
 examples/plots/
+_turek_levelset_dumps/
+_turek_*

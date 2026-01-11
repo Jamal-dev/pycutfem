@@ -86,7 +86,7 @@ from pycutfem.ufl.expressions import (
     trace,
     Jump,
 )
-from pycutfem.ufl.measures import dx, dGhost, dInterface
+from pycutfem.ufl.measures import dx, ds, dGhost, dInterface
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.io.vtk import export_vtk
 from pycutfem.io.visualization import plot_mesh_2
@@ -175,6 +175,18 @@ def _parse_args():
         type=int,
         default=int(os.getenv("POLY_ORDER", "2")),
         help="Polynomial order for primary fields. Env: POLY_ORDER.",
+    )
+    parser.add_argument(
+        "--taylor-hood",
+        dest="taylor_hood",
+        action="store_true",
+        help="Use Taylor–Hood pressure (p=k-1). Env: PYCUTFEM_TAYLOR_HOOD.",
+    )
+    parser.add_argument(
+        "--no-taylor-hood",
+        dest="taylor_hood",
+        action="store_false",
+        help="Use equal-order pressure (p=k). Env: PYCUTFEM_TAYLOR_HOOD.",
     )
     parser.add_argument(
         "--mesh-size",
@@ -281,7 +293,12 @@ def _parse_args():
     parser.add_argument("--beam-root-dof-tol", type=float, default=None, help="Beam root DOF locator tolerance. Env: BEAM_ROOT_DOF_TOL.")
     parser.add_argument("--pin-pressure", dest="pin_pressure", action="store_true", help="Pin one pressure DOF. Env: PIN_PRESSURE.")
     parser.add_argument("--no-pin-pressure", dest="pin_pressure", action="store_false", help="Disable pressure pinning. Env: PIN_PRESSURE.")
-    parser.add_argument("--solid-cut-drop", type=float, default=float(os.getenv("SOLID_CUT_DROP", "0.0")), help="Drop solid DOFs for tiny cuts. Env: SOLID_CUT_DROP.")
+    parser.add_argument(
+        "--solid-cut-drop",
+        type=float,
+        default=float(os.getenv("SOLID_CUT_DROP", "1e-3")),
+        help="Drop solid DOFs for tiny cuts. Env: SOLID_CUT_DROP.",
+    )
     parser.add_argument("--use-aligned-interface", dest="use_aligned_interface", action="store_true", help="Keep aligned interface edges. Env: USE_ALIGNED_INTERFACE.")
     parser.add_argument("--no-use-aligned-interface", dest="use_aligned_interface", action="store_false", help="Disable aligned interface edges. Env: USE_ALIGNED_INTERFACE.")
     parser.add_argument("--solid-advect-lagged", dest="solid_advect_lagged", action="store_true", help="Lag solid advection velocity. Env: SOLID_ADVECT_LAGGED.")
@@ -328,7 +345,9 @@ def _parse_args():
     if s_nitsche_env is None or not s_nitsche_env.strip():
         s_nitsche_env = os.getenv("S_NITSCHE")
     if s_nitsche_env is None or not s_nitsche_env.strip():
-        s_nitsche_env = "1.0"
+        # Default to *incomplete* Nitsche for robustness in the fully Eulerian cut setting.
+        # Symmetric Nitsche (s=+1) can be re-enabled via S_NITSCHE_VALUE=1.
+        s_nitsche_env = "0.0"
     parser.add_argument("--penalty-val", type=float, default=float(os.getenv("PENALTY_VAL", "0.0")), help="Stabilization penalty value. Env: PENALTY_VAL.")
     parser.add_argument("--penalty-grad", type=float, default=float(os.getenv("PENALTY_GRAD", "0.0")), help="Stabilization penalty gradient. Env: PENALTY_GRAD.")
     parser.add_argument("--solid-reg-eps", type=float, default=float(os.getenv("SOLID_REG_EPS", "1e-6")), help="Solid regularization weight. Env: SOLID_REG_EPS.")
@@ -343,6 +362,43 @@ def _parse_args():
     parser.add_argument("--fd-term", type=str, default=os.getenv("FD_TERM", ""), help="Filter FD term name. Env: FD_TERM.")
     max_steps_default = _env_int("MAX_STEPS")
     parser.add_argument("--max-steps", type=int, default=max_steps_default if max_steps_default is not None else 50, help="Maximum time steps. Env: MAX_STEPS.")
+    final_time_default = _env_float("FINAL_TIME")
+    parser.add_argument(
+        "--final-time",
+        type=float,
+        default=final_time_default,
+        help="Stop when physical time reaches this value (overrides max_steps-derived default). Env: FINAL_TIME.",
+    )
+
+    restart_dir_default = os.getenv("RESTART_DIR", "").strip()
+    parser.add_argument(
+        "--restart-dir",
+        type=Path,
+        default=Path(restart_dir_default) if restart_dir_default else None,
+        help="Base directory containing levelset_dumps/ and state_dumps/ for restart. Env: RESTART_DIR.",
+    )
+    parser.add_argument(
+        "--restart-step",
+        type=int,
+        default=int(os.getenv("RESTART_STEP", "-1") or "-1"),
+        help="Dump index to restart from (0-based). Env: RESTART_STEP.",
+    )
+    restart_tag_default = os.getenv("RESTART_TAG", "step").strip().lower() or "step"
+    parser.add_argument(
+        "--restart-tag",
+        choices=("step", "fail"),
+        default=restart_tag_default,
+        help="Which dump tag to load: step (accepted) or fail (Newton failure). Env: RESTART_TAG.",
+    )
+    parser.add_argument(
+        "--restart-reset-counters",
+        action="store_true",
+        default=_env_bool("RESTART_RESET_COUNTERS", False),
+        help=(
+            "Reset step counters for logs/dumps after restart (physical time t is still taken from the checkpoint). "
+            "Env: RESTART_RESET_COUNTERS."
+        ),
+    )
     parser.add_argument("--allow-dt-reduction", dest="allow_dt_reduction", action="store_true", help="Allow adaptive dt reduction. Env: ALLOW_DT_REDUCTION.")
     parser.add_argument("--no-allow-dt-reduction", dest="allow_dt_reduction", action="store_false", help="Disable adaptive dt reduction. Env: ALLOW_DT_REDUCTION.")
     parser.add_argument(
@@ -357,7 +413,18 @@ def _parse_args():
         default=float(os.getenv("DT_REDUCTION_THRESHOLD", "5.0")),
         help="ΔU growth threshold for dt reduction. Env: DT_REDUCTION_THRESHOLD.",
     )
-    parser.add_argument("--newton-tol", type=float, default=float(os.getenv("NEWTON_TOL", "1e-6")), help="Newton residual tolerance. Env: NEWTON_TOL.")
+    parser.add_argument(
+        "--newton-tol",
+        type=float,
+        default=float(os.getenv("NEWTON_TOL", "1e-8")),
+        help="Newton residual tolerance. Env: NEWTON_TOL.",
+    )
+    parser.add_argument(
+        "--newton-rtol",
+        type=float,
+        default=float(os.getenv("NEWTON_RTOL", "1e-8")),
+        help="Newton relative residual tolerance (‖R‖∞ ≤ rtol·‖R0‖∞). Env: NEWTON_RTOL.",
+    )
     parser.add_argument("--max-newton-iter", type=int, default=int(os.getenv("MAX_NEWTON_ITER", "50")), help="Maximum Newton iterations. Env: MAX_NEWTON_ITER.")
     nonlinear_solver_default = os.getenv("NONLINEAR_SOLVER", "newton").strip().lower()
     if not nonlinear_solver_default:
@@ -377,9 +444,9 @@ def _parse_args():
         default=linear_solver_default,
         help="Linear solver backend for --nonlinear-solver=newton. Env: LINEAR_SOLVER.",
     )
-    ls_mode_default = os.getenv("LS_MODE", "dealii").strip().lower()
+    ls_mode_default = os.getenv("LS_MODE", "armijo").strip().lower()
     if not ls_mode_default:
-        ls_mode_default = "dealii"
+        ls_mode_default = "armijo"
     parser.add_argument("--ls-mode", type=str, default=ls_mode_default, choices=("armijo", "dealii"), help="Line-search mode. Env: LS_MODE.")
     parser.add_argument("--ls-max-iter", type=int, default=int(os.getenv("LS_MAX_ITER", "12")), help="Line-search max iterations. Env: LS_MAX_ITER.")
     parser.add_argument(
@@ -407,6 +474,7 @@ def _parse_args():
         plot_only=_env_bool("PLOT_ONLY", False),
         force_full_setup=_env_bool("FORCE_FULL_SETUP", False),
         refine_initial=_env_bool("REFINE_INITIAL", True),
+        taylor_hood=_env_bool("PYCUTFEM_TAYLOR_HOOD", False),
         pin_pressure=_env_bool("PIN_PRESSURE", True),
         use_aligned_interface=_env_bool("USE_ALIGNED_INTERFACE", True),
         solid_advect_lagged=_env_bool("SOLID_ADVECT_LAGGED", True),
@@ -495,9 +563,11 @@ def _apply_env_overrides(args: argparse.Namespace) -> None:
 
     _set_env("DT", args.dt)
     _set_env("POLY_ORDER", args.poly_order)
+    _set_env_bool("PYCUTFEM_TAYLOR_HOOD", args.taylor_hood)
     _set_env("MESH_SIZE", args.mesh_size)
     _set_env("MESH_BACKEND", args.mesh_backend)
     _set_env("FD_BACKEND", args.fd_backend)
+    _set_env("NEWTON_RTOL", args.newton_rtol)
     _set_env("OUTPUT_DIR", args.output_dir)
     _set_env("PLOT_MESH_EVERY", args.plot_mesh_every)
     _set_env("PLOT_RESOLUTION", args.plot_resolution)
@@ -541,6 +611,7 @@ def _apply_env_overrides(args: argparse.Namespace) -> None:
     _set_env_bool("FD_INTERFACE_SPLIT", args.fd_interface_split)
     _set_env("FD_TERM", args.fd_term)
     _set_env("MAX_STEPS", args.max_steps)
+    _set_env("FINAL_TIME", args.final_time)
     _set_env_bool("ALLOW_DT_REDUCTION", args.allow_dt_reduction)
     _set_env("DT_REDUCTION_FACTOR", args.dt_reduction_factor)
     _set_env("DT_REDUCTION_THRESHOLD", args.dt_reduction_threshold)
@@ -591,9 +662,15 @@ BEAM_REF_HEIGHT = BEAM_HEIGHT
 POINT_B = (0.15, 0.2)
 POINT_A_INITIAL = (0.6, 0.2) # Point A will change while Point B is fixed
 
-BETA_PENALTY = 90.0 * MU_F
+BETA_PENALTY = float(os.getenv("BETA_PENALTY", "90.0")) * MU_F
 DT = float(ARGS.dt)
 POLY_ORDER = int(ARGS.poly_order)
+USE_TAYLOR_HOOD = os.getenv("PYCUTFEM_TAYLOR_HOOD", "0") not in ("0", "false", "False")
+PRESSURE_ORDER = (POLY_ORDER - 1) if USE_TAYLOR_HOOD else POLY_ORDER
+if PRESSURE_ORDER < 1:
+    PRESSURE_ORDER = 1
+    if USE_TAYLOR_HOOD:
+        print("[element] Requested Taylor–Hood but POLY_ORDER<2; falling back to equal-order pressure.")
 MESH_SIZE = float(ARGS.mesh_size)
 FD_BACKEND = ARGS.fd_backend
 CASE_LABEL = str(getattr(ARGS, "case_label", "FSI-2"))
@@ -607,6 +684,21 @@ USE_ALIGNED_INTERFACE = os.getenv("USE_ALIGNED_INTERFACE", "1") not in ("0", "fa
 SOLID_ADVECT_LAGGED = os.getenv("SOLID_ADVECT_LAGGED", "1") not in ("0", "false", "False")
 USE_RESTRICTED_FORMS = os.getenv("USE_RESTRICTED_FORMS", "1") not in ("0", "false", "False")
 USE_LINEAR_SOLID = os.getenv("USE_LINEAR_SOLID", "1") not in ("0", "false", "False")
+USE_LINEAR_INTERFACE = os.getenv("PYCUTFEM_LINEAR_INTERFACE", "0") not in ("0", "false", "False")
+USE_SKEW_CONVECTION = os.getenv("PYCUTFEM_SKEW_CONVECTION", "0") not in ("0", "false", "False")
+SOLID_SKEW_ADD_DIV = os.getenv("PYCUTFEM_SOLID_SKEW_ADD_DIV", "0") not in ("0", "false", "False")
+USE_DT_SCALED_NITSCHE_PENALTY = os.getenv("PYCUTFEM_NITSCHE_PENALTY_DT", "0") not in ("0", "false", "False")
+SOLID_SYM_NITSCHE_LAGGED = os.getenv("SOLID_SYM_NITSCHE_LAGGED", "1") not in ("0", "false", "False")
+SOLID_VEL_GHOST_DT_SCALE = os.getenv("PYCUTFEM_SOLID_VEL_GHOST_DT_SCALE", "1") not in ("0", "false", "False")
+SOLID_VEL_GHOST_MASS = float(os.getenv("PYCUTFEM_SOLID_VEL_GHOST_MASS", "0.0"))
+FLUID_VEL_GHOST_INERTIA = os.getenv("PYCUTFEM_FLUID_VEL_GHOST_INERTIA", "0") not in ("0", "false", "False")
+SOLID_KINEMATIC_STAB = float(os.getenv("SOLID_KINEMATIC_STAB", "0.0"))
+SOLID_KINEMATIC_STAB_EXP = float(os.getenv("SOLID_KINEMATIC_STAB_EXP", "2.0"))
+PYCUTFEM_INTERFACE_PENALTY_SLIVER_WEIGHT = os.getenv("PYCUTFEM_INTERFACE_PENALTY_SLIVER_WEIGHT", "0") not in (
+    "0",
+    "false",
+    "False",
+)
 LEVELSET_ZERO_EPS = float(os.getenv("LEVELSET_ZERO_EPS", str(max(1.0e-10, 1.0e-8 * MESH_SIZE))))
 LEVELSET_EDGE_TOL = float(os.getenv("LEVELSET_EDGE_TOL", str(LEVELSET_ZERO_EPS)))
 LEVELSET_ZERO_SIDE = os.getenv("LEVELSET_ZERO_SIDE", "neg").strip().lower()
@@ -632,6 +724,32 @@ SLIVER_P = float(os.getenv("SLIVER_P", "1.0"))
 SLIVER_WMAX = float(os.getenv("SLIVER_WMAX", "1000.0"))
 SLIVER_THETAMIN = float(os.getenv("SLIVER_THETAMIN", "1e-6"))
 SLIVER_SMOOTH = float(os.getenv("SLIVER_SMOOTH", "0.3"))
+
+# Optional CIP stabilization (ghost-edge interior penalty) to damp advection-driven peaks.
+# CIP-like stabilization (ghost-edge gradient-jump penalty) scaled by rho*h*|u|.
+# Default is enabled at a mild level for robustness of the fully Eulerian FSI-2 run.
+PYCUTFEM_CIP_BETA_FLUID = float(os.getenv("PYCUTFEM_CIP_BETA_FLUID", "0.1"))
+PYCUTFEM_CIP_BETA_SOLID = float(os.getenv("PYCUTFEM_CIP_BETA_SOLID", "0.1"))
+PYCUTFEM_CIP_BETA_DISP = float(os.getenv("PYCUTFEM_CIP_BETA_DISP", "0.1"))
+PYCUTFEM_CIP_LAGGED = os.getenv("PYCUTFEM_CIP_LAGGED", "1") not in ("0", "false", "False")
+PYCUTFEM_CIP_U_EPS = float(os.getenv("PYCUTFEM_CIP_U_EPS", "1e-12"))
+
+# Optional fluid mass-jump ghost penalty (helps control near-nullspace modes in extreme slivers).
+PYCUTFEM_FLUID_VEL_GHOST_MASS = float(os.getenv("PYCUTFEM_FLUID_VEL_GHOST_MASS", "0.0"))
+
+# Optional sliver-robust cut-cell mass regularization:
+# adds (ρ/dt) * (1/θ) * ⟨u, v⟩ on the *cut* subdomain so tiny cut volumes cannot
+# carry arbitrarily large values with negligible cost.
+PYCUTFEM_SLIVER_MASS_FLUID = float(os.getenv("PYCUTFEM_SLIVER_MASS_FLUID", "0.0"))
+PYCUTFEM_SLIVER_MASS_SOLID = float(os.getenv("PYCUTFEM_SLIVER_MASS_SOLID", "0.0"))
+
+# Optional: pressure stabilization on the fluid ghost-edge set (Richter-style).
+# This targets equal-order (Q2/Q2) pressure robustness near the moving interface.
+# Set one or both to a small value (e.g. 0.1–10) to enable:
+# - PYCUTFEM_PRESSURE_STAB_JUMP:   h^3 [∇p]·[∇q]  on ghost edges (jump form)
+# - PYCUTFEM_PRESSURE_STAB_AVG:    h^3 {∇p·∇q}    on ghost edges (average form)
+PYCUTFEM_PRESSURE_STAB_JUMP = float(os.getenv("PYCUTFEM_PRESSURE_STAB_JUMP", "0.0"))
+PYCUTFEM_PRESSURE_STAB_AVG = float(os.getenv("PYCUTFEM_PRESSURE_STAB_AVG", "0.0"))
 
 # -----------------------------------------------------------------------------
 # Mesh and boundary helpers
@@ -2329,6 +2447,8 @@ def update_beam_levelset_from_displacement(
     phi_new_vals = np.empty_like(phi_vals)
 
     n_nodes = mesh.nodes_x_y_pos.shape[0]
+    phi_by_node = np.full(n_nodes, np.nan, dtype=float)
+    phi_by_node[node_ids] = phi_vals
     me_disp = disp_dh.mixed_element
     fld_x = disp_x.field_name
     fld_y = disp_y.field_name
@@ -2385,18 +2505,26 @@ def update_beam_levelset_from_displacement(
     else:
         node_active = np.zeros(n_nodes, dtype=bool)
 
+    disp_eval_tags = {"inside", "cut"}
+    phi_disp_cutoff = float(edge_tol) if edge_tol is not None else 0.0
     for gd_phi, nid in zip(gphi, node_ids):
         x, y = mesh.nodes_x_y_pos[int(nid)]
         ux = 0.0
         uy = 0.0
-        if node_active[int(nid)]:
+        phi_n = phi_by_node[int(nid)]
+        # The solid displacement is only meaningful on the negative side of the
+        # interface. Values on the positive side can be unconstrained and may
+        # blow up, which would corrupt the level-set update.
+        if node_active[int(nid)] and np.isfinite(phi_n) and phi_n <= phi_disp_cutoff:
             lix = int(li_x[int(nid)])
             liy = int(li_y[int(nid)])
             if lix >= 0 and liy >= 0:
                 ux = float(disp_vec.nodal_values[lix])
                 uy = float(disp_vec.nodal_values[liy])
             else:
-                disp_val = _eval_vector_at_point(disp_dh, mesh, disp_vec, (float(x), float(y)))
+                disp_val = _eval_vector_at_point(
+                    disp_dh, mesh, disp_vec, (float(x), float(y)), elem_tags=disp_eval_tags
+                )
                 ux = float(disp_val[0])
                 uy = float(disp_val[1])
 
@@ -2456,8 +2584,432 @@ def update_beam_levelset_from_displacement(
     return True
 
 
+def _zero_inactive_side_values(
+    *,
+    ls_beam: LevelSetGridFunction,
+    dof_handler: DofHandler,
+    mesh: Mesh,
+    uf: list[VectorFunction],
+    pf: list[Function],
+    us: list[VectorFunction],
+    disp: list[VectorFunction],
+    tol: float,
+) -> None:
+    """
+    Enforce the physical domain extension by zero:
+    - Fluid unknowns (u,p) are meaningful only on the '+' side (phi>0).
+    - Solid unknowns (vs,d) are meaningful only on the '-' side (phi<=0).
+
+    This prevents unconstrained/inactive DOFs on the opposite side from
+    drifting to huge values (which can poison debugging and the level-set update).
+    """
+    cache = getattr(ls_beam, "_side_zero_cache", None)
+    if (
+        cache is None
+        or cache.get("mesh_id") != id(mesh)
+        or cache.get("n_nodes") != int(mesh.nodes_x_y_pos.shape[0])
+    ):
+        field_node_ids: dict[str, np.ndarray] = {}
+        for fld in [
+            "u_pos_x",
+            "u_pos_y",
+            "p_pos_",
+            "vs_neg_x",
+            "vs_neg_y",
+            "d_neg_x",
+            "d_neg_y",
+        ]:
+            gdofs = np.asarray(dof_handler.get_field_slice(fld), dtype=int)
+            node_ids = np.array([dof_handler._dof_to_node_map[int(gd)][1] for gd in gdofs], dtype=int)
+            field_node_ids[fld] = node_ids
+        cache = {
+            "mesh_id": id(mesh),
+            "n_nodes": int(mesh.nodes_x_y_pos.shape[0]),
+            "field_node_ids": field_node_ids,
+            "vec_ranges": {},
+            "phi_token": None,
+            "phi_tol": None,
+            "solid_nodes": None,
+            "fluid_nodes": None,
+        }
+        setattr(ls_beam, "_side_zero_cache", cache)
+
+    field_node_ids = cache["field_node_ids"]
+    vec_ranges = cache["vec_ranges"]
+    tol = float(tol)
+    phi_token = getattr(ls_beam, "cache_token", None)
+    if cache.get("phi_token") != phi_token or cache.get("phi_tol") != tol:
+        phi_nodes = ls_beam.evaluate_on_nodes(mesh)
+        solid_nodes = np.asarray(phi_nodes <= tol, dtype=bool)
+        cache["phi_token"] = phi_token
+        cache["phi_tol"] = tol
+        cache["solid_nodes"] = solid_nodes
+        cache["fluid_nodes"] = ~solid_nodes
+    solid_nodes = np.asarray(cache.get("solid_nodes"), dtype=bool)
+    fluid_nodes = np.asarray(cache.get("fluid_nodes"), dtype=bool)
+
+    def _field_ranges_for(vf: VectorFunction) -> dict[str, tuple[int, int]]:
+        key = tuple(vf.field_names)
+        ranges = vec_ranges.get(key)
+        if ranges is not None:
+            return ranges
+        off = 0
+        out: dict[str, tuple[int, int]] = {}
+        for fld in vf.field_names:
+            n = int(np.asarray(dof_handler.get_field_slice(fld), dtype=int).size)
+            out[fld] = (off, off + n)
+            off += n
+        vec_ranges[key] = out
+        return out
+
+    def _zero_vec(vf: VectorFunction, fld: str, node_mask: np.ndarray) -> None:
+        start, stop = _field_ranges_for(vf)[fld]
+        seg = vf.nodal_values[start:stop]
+        ids = field_node_ids[fld]
+        m = node_mask[ids]
+        if np.any(m):
+            seg[m] = 0.0
+
+    def _zero_scalar(f: Function, fld: str, node_mask: np.ndarray) -> None:
+        ids = field_node_ids[fld]
+        m = node_mask[ids]
+        if np.any(m):
+            f.nodal_values[m] = 0.0
+
+    # Fluid: zero on solid side
+    for vf in uf:
+        _zero_vec(vf, "u_pos_x", solid_nodes)
+        _zero_vec(vf, "u_pos_y", solid_nodes)
+    for f in pf:
+        _zero_scalar(f, "p_pos_", solid_nodes)
+
+    # Solid: zero on fluid side
+    for vf in us:
+        _zero_vec(vf, "vs_neg_x", fluid_nodes)
+        _zero_vec(vf, "vs_neg_y", fluid_nodes)
+    for vf in disp:
+        _zero_vec(vf, "d_neg_x", fluid_nodes)
+        _zero_vec(vf, "d_neg_y", fluid_nodes)
+
+
+def _stitch_fluid_velocity_to_solid_near_interface(
+    *,
+    mesh: Mesh,
+    dof_handler: DofHandler,
+    ls_beam: LevelSetGridFunction,
+    uf: list[VectorFunction],
+    us: list[VectorFunction],
+    band: float,
+    only_cut_nodes: bool = True,
+) -> int:
+    """
+    Initialize the *fluid* velocity extension near Γ by copying the solid velocity
+    extension at the same nodes. This improves Newton robustness after sudden
+    re-tagging (cut ↔ interface set changes) by reducing the Nitsche penalty jump
+    in the initial guess.
+
+    Note: this is a *guess* conditioning step; the converged solution is still
+    determined by the monolithic Newton solve.
+    """
+    band = float(band)
+    if band <= 0.0:
+        return 0
+
+    cache = getattr(ls_beam, "_ifc_stitch_cache", None)
+    if cache is None or cache.get("mesh_id") != id(mesh):
+        n_nodes = int(mesh.nodes_x_y_pos.shape[0])
+        field_to_node = {}
+        field_to_gdofs = {}
+        for fld in ("u_pos_x", "u_pos_y", "vs_neg_x", "vs_neg_y"):
+            gdofs = np.asarray(dof_handler.get_field_slice(fld), dtype=int)
+            node_ids = np.array([dof_handler._dof_to_node_map[int(gd)][1] for gd in gdofs], dtype=int)
+            field_to_node[fld] = node_ids
+            field_to_gdofs[fld] = gdofs
+
+        # node -> solid gdof maps (fast lookup by node id)
+        vsx_at_node = -np.ones(n_nodes, dtype=int)
+        vsy_at_node = -np.ones(n_nodes, dtype=int)
+        vsx_at_node[field_to_node["vs_neg_x"]] = field_to_gdofs["vs_neg_x"]
+        vsy_at_node[field_to_node["vs_neg_y"]] = field_to_gdofs["vs_neg_y"]
+
+        cache = {
+            "mesh_id": id(mesh),
+            "n_nodes": n_nodes,
+            "field_to_node": field_to_node,
+            "field_to_gdofs": field_to_gdofs,
+            "vsx_at_node": vsx_at_node,
+            "vsy_at_node": vsy_at_node,
+            "cut_nodes_mask": None,
+        }
+        setattr(ls_beam, "_ifc_stitch_cache", cache)
+
+    n_nodes = int(cache["n_nodes"])
+    try:
+        phi_nodes = np.asarray(ls_beam.evaluate_on_nodes(mesh), dtype=float)
+    except Exception:
+        try:
+            phi_nodes = np.asarray(ls_beam.nodal_values(), dtype=float)
+        except Exception:
+            phi_nodes = np.zeros(n_nodes, dtype=float)
+    if int(phi_nodes.size) != n_nodes:
+        phi_nodes = np.resize(phi_nodes, n_nodes)
+    near = np.abs(phi_nodes) <= band
+
+    if only_cut_nodes:
+        cut_nodes_mask = cache.get("cut_nodes_mask")
+        if cut_nodes_mask is None:
+            cut_eids = np.nonzero(mesh.element_bitset("cut").mask)[0]
+            cut_nodes_mask = np.zeros(n_nodes, dtype=bool)
+            if cut_eids.size:
+                cut_nodes_mask[np.asarray(mesh.elements_connectivity[cut_eids].ravel(), dtype=int)] = True
+            cache["cut_nodes_mask"] = cut_nodes_mask
+        near = near & np.asarray(cut_nodes_mask, dtype=bool)
+
+    if not np.any(near):
+        return 0
+
+    field_to_node = cache["field_to_node"]
+    field_to_gdofs = cache["field_to_gdofs"]
+    vsx_at_node = np.asarray(cache["vsx_at_node"], dtype=int)
+    vsy_at_node = np.asarray(cache["vsy_at_node"], dtype=int)
+
+    # Select u-pos gdofs by node mask, then map to corresponding solid gdofs.
+    u_nodes_x = np.asarray(field_to_node["u_pos_x"], dtype=int)
+    u_nodes_y = np.asarray(field_to_node["u_pos_y"], dtype=int)
+    u_gdofs_x = np.asarray(field_to_gdofs["u_pos_x"], dtype=int)
+    u_gdofs_y = np.asarray(field_to_gdofs["u_pos_y"], dtype=int)
+
+    sel_x = np.nonzero(near[u_nodes_x])[0]
+    sel_y = np.nonzero(near[u_nodes_y])[0]
+    if sel_x.size == 0 and sel_y.size == 0:
+        return 0
+
+    n_stitched = 0
+    for uf_v in uf:
+        for us_v in us:
+            # X component
+            if sel_x.size:
+                nodes = u_nodes_x[sel_x]
+                u_gd = u_gdofs_x[sel_x]
+                s_gd = vsx_at_node[nodes]
+                ok = s_gd >= 0
+                if np.any(ok):
+                    vals = us_v.get_nodal_values(s_gd[ok])
+                    uf_v.set_nodal_values(u_gd[ok], vals)
+                    n_stitched = max(n_stitched, int(u_gd[ok].size))
+            # Y component
+            if sel_y.size:
+                nodes = u_nodes_y[sel_y]
+                u_gd = u_gdofs_y[sel_y]
+                s_gd = vsy_at_node[nodes]
+                ok = s_gd >= 0
+                if np.any(ok):
+                    vals = us_v.get_nodal_values(s_gd[ok])
+                    uf_v.set_nodal_values(u_gd[ok], vals)
+                    n_stitched = max(n_stitched, int(u_gd[ok].size))
+            # Only need one solid vector for values (same field slices).
+            break
+    return int(n_stitched)
+
+
+def _reextend_wrong_side_by_nearest(
+    *,
+    mesh: Mesh,
+    dof_handler: DofHandler,
+    ls_beam: LevelSetGridFunction,
+    uf: list[VectorFunction],
+    pf: list[Function],
+    us: list[VectorFunction],
+    disp: list[VectorFunction],
+    tol: float,
+    only_cut_nodes: bool = True,
+    trace: bool = False,
+) -> dict[str, int]:
+    """
+    Re-initialize extension values on the *wrong* side of the level set by copying
+    from the nearest node on the correct side (within the cut band, by default).
+
+    This is a robustness tool for sudden re-tagging events: it prevents stale
+    (and potentially huge) extension values from poisoning the interface Nitsche
+    penalty when the cut/interface sets change.
+    """
+    from scipy.spatial import cKDTree  # local import to keep base deps light
+
+    tol = float(tol)
+    n_nodes = int(mesh.nodes_x_y_pos.shape[0])
+    try:
+        phi = np.asarray(ls_beam.evaluate_on_nodes(mesh), dtype=float)
+    except Exception:
+        try:
+            phi = np.asarray(ls_beam.nodal_values(), dtype=float)
+        except Exception:
+            phi = np.zeros(n_nodes, dtype=float)
+    if int(phi.size) != n_nodes:
+        phi = np.resize(phi, n_nodes)
+
+    cut_mask = np.ones(n_nodes, dtype=bool)
+    if only_cut_nodes:
+        cut_eids = np.nonzero(mesh.element_bitset("cut").mask)[0]
+        cut_mask = np.zeros(n_nodes, dtype=bool)
+        if cut_eids.size:
+            cut_mask[np.asarray(mesh.elements_connectivity[cut_eids].ravel(), dtype=int)] = True
+
+    coords = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+    # Fluid fields live on '+' (phi > tol)
+    fluid_ok = (phi > tol) & cut_mask
+    fluid_bad = (phi <= tol) & cut_mask
+    # Solid fields live on '-' (phi <= tol)
+    solid_ok = (phi <= tol) & cut_mask
+    solid_bad = (phi > tol) & cut_mask
+
+    stats = {"u_pos": 0, "p_pos": 0, "vs_neg": 0, "d_neg": 0}
+
+    def _node_to_gdof(field: str) -> np.ndarray:
+        gdofs = np.asarray(dof_handler.get_field_slice(field), dtype=int)
+        node_ids = np.array([dof_handler._dof_to_node_map[int(gd)][1] for gd in gdofs], dtype=int)
+        out = -np.ones(n_nodes, dtype=int)
+        out[node_ids] = gdofs
+        return out
+
+    # Precompute nearest-neighbour maps once (fluid->fluid, solid->solid)
+    def _nearest(src_mask: np.ndarray, dst_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        src = np.nonzero(src_mask)[0]
+        dst = np.nonzero(dst_mask)[0]
+        if src.size == 0 or dst.size == 0:
+            return src, np.empty(0, dtype=int)
+        tree = cKDTree(coords[dst])
+        _, j = tree.query(coords[src], k=1)
+        return src, dst[np.asarray(j, dtype=int)]
+
+    fluid_src, fluid_nn = _nearest(fluid_bad, fluid_ok)
+    solid_src, solid_nn = _nearest(solid_bad, solid_ok)
+
+    if trace:
+        print(
+            f"[reextend] cut_nodes={int(cut_mask.sum())} "
+            f"fluid_bad={int(fluid_src.size)} solid_bad={int(solid_src.size)} tol={tol:.3e}"
+        )
+
+    if fluid_src.size:
+        u_px = _node_to_gdof("u_pos_x")
+        u_py = _node_to_gdof("u_pos_y")
+        p_p = _node_to_gdof("p_pos_")
+        gd_u_x = u_px[fluid_src]
+        gd_u_y = u_py[fluid_src]
+        gd_p = p_p[fluid_src]
+        gd_u_x_nn = u_px[fluid_nn]
+        gd_u_y_nn = u_py[fluid_nn]
+        gd_p_nn = p_p[fluid_nn]
+        ok_x = (gd_u_x >= 0) & (gd_u_x_nn >= 0)
+        ok_y = (gd_u_y >= 0) & (gd_u_y_nn >= 0)
+        ok_p = (gd_p >= 0) & (gd_p_nn >= 0)
+        for vf in uf:
+            if np.any(ok_x):
+                vf.set_nodal_values(gd_u_x[ok_x], vf.get_nodal_values(gd_u_x_nn[ok_x]))
+                stats["u_pos"] = max(stats["u_pos"], int(gd_u_x[ok_x].size))
+            if np.any(ok_y):
+                vf.set_nodal_values(gd_u_y[ok_y], vf.get_nodal_values(gd_u_y_nn[ok_y]))
+                stats["u_pos"] = max(stats["u_pos"], int(gd_u_y[ok_y].size))
+        for f in pf:
+            if np.any(ok_p):
+                # Scalar Function has same API as VectorFunction for set_nodal_values/get_nodal_values.
+                f.set_nodal_values(gd_p[ok_p], f.get_nodal_values(gd_p_nn[ok_p]))
+                stats["p_pos"] = max(stats["p_pos"], int(gd_p[ok_p].size))
+
+    if solid_src.size:
+        vsx = _node_to_gdof("vs_neg_x")
+        vsy = _node_to_gdof("vs_neg_y")
+        dx_ = _node_to_gdof("d_neg_x")
+        dy_ = _node_to_gdof("d_neg_y")
+        gd_vx = vsx[solid_src]
+        gd_vy = vsy[solid_src]
+        gd_dx = dx_[solid_src]
+        gd_dy = dy_[solid_src]
+        gd_vx_nn = vsx[solid_nn]
+        gd_vy_nn = vsy[solid_nn]
+        gd_dx_nn = dx_[solid_nn]
+        gd_dy_nn = dy_[solid_nn]
+        ok_vx = (gd_vx >= 0) & (gd_vx_nn >= 0)
+        ok_vy = (gd_vy >= 0) & (gd_vy_nn >= 0)
+        ok_dx = (gd_dx >= 0) & (gd_dx_nn >= 0)
+        ok_dy = (gd_dy >= 0) & (gd_dy_nn >= 0)
+        for vf in us:
+            if np.any(ok_vx):
+                vf.set_nodal_values(gd_vx[ok_vx], vf.get_nodal_values(gd_vx_nn[ok_vx]))
+                stats["vs_neg"] = max(stats["vs_neg"], int(gd_vx[ok_vx].size))
+            if np.any(ok_vy):
+                vf.set_nodal_values(gd_vy[ok_vy], vf.get_nodal_values(gd_vy_nn[ok_vy]))
+                stats["vs_neg"] = max(stats["vs_neg"], int(gd_vy[ok_vy].size))
+        for vf in disp:
+            if np.any(ok_dx):
+                vf.set_nodal_values(gd_dx[ok_dx], vf.get_nodal_values(gd_dx_nn[ok_dx]))
+                stats["d_neg"] = max(stats["d_neg"], int(gd_dx[ok_dx].size))
+            if np.any(ok_dy):
+                vf.set_nodal_values(gd_dy[ok_dy], vf.get_nodal_values(gd_dy_nn[ok_dy]))
+                stats["d_neg"] = max(stats["d_neg"], int(gd_dy[ok_dy].size))
+
+    return stats
+
+
 def _copy_bitset(bs: BitSet) -> BitSet:
     return BitSet(np.array(bs.mask, dtype=bool))
+
+def _ghost_band_edges(mesh: Mesh, seed: BitSet, *, layers: int = 2) -> BitSet:
+    layers = max(int(layers), 0)
+    if seed.cardinality() == 0:
+        return BitSet(np.zeros(len(mesh.edges_list), dtype=bool))
+
+    seed_ids = seed.to_indices()
+    band: set[int] = set(map(int, seed_ids))
+    frontier: set[int] = set(band)
+    nbs = mesh.neighbors()
+
+    for _ in range(layers):
+        if not frontier:
+            break
+        nxt: set[int] = set()
+        for eid in frontier:
+            for nb in nbs[int(eid)]:
+                nb = int(nb)
+                if nb not in band:
+                    nxt.add(nb)
+        band.update(nxt)
+        frontier = nxt
+
+    mask = np.zeros(len(mesh.edges_list), dtype=bool)
+    for e in mesh.edges_list:
+        if e.right is None:
+            continue
+        if int(e.left) in band and int(e.right) in band:
+            mask[int(e.gid)] = True
+
+    interface_bs = mesh.edge_bitset("interface")
+    return BitSet(mask) - interface_bs
+
+
+def _fluid_quad_edge_mask(mesh: Mesh) -> np.ndarray:
+    """
+    Edges between two *outside* (quadrilateral) elements (Richter: E_h^0 subset).
+    Used for pressure stabilization on the uncut fluid mesh.
+    """
+    mask = np.zeros(len(mesh.edges_list), dtype=bool)
+    for edge in mesh.edges_list:
+        if edge.right is None:
+            continue
+        lt = getattr(mesh.elements_list[int(edge.left)], "tag", "")
+        rt = getattr(mesh.elements_list[int(edge.right)], "tag", "")
+        if lt == "outside" and rt == "outside":
+            gid = int(getattr(edge, "gid", getattr(edge, "id", 0)))
+            if 0 <= gid < mask.size:
+                mask[gid] = True
+    # Safety: exclude aligned interface edges (should already be absent here).
+    try:
+        iface = np.asarray(mesh.edge_bitset("interface").mask, dtype=bool)
+        if iface.shape == mask.shape:
+            mask &= ~iface
+    except Exception:
+        pass
+    return mask
 
 def _disable_aligned_interface_edges(mesh: Mesh) -> int:
     """Disable aligned-interface edge tags to force cut-cell interface integration."""
@@ -2507,9 +3059,30 @@ def make_domain_sets(mesh: Mesh) -> Dict[str, BitSet]:
     has_pos = fluid | cut
     has_neg = solid | cut
 
-    ghost_both = mesh.edge_bitset("ghost_both")
-    solid_ghost = mesh.edge_bitset("ghost_neg") | ghost_both 
-    fluid_ghost = mesh.edge_bitset("ghost_pos") | ghost_both 
+    interface_bs = mesh.edge_bitset("interface")
+    ghost_pos = mesh.edge_bitset("ghost_pos") - interface_bs
+    ghost_neg = mesh.edge_bitset("ghost_neg") - interface_bs
+    ghost_both = mesh.edge_bitset("ghost_both") - interface_bs
+    ghost_all = (ghost_pos | ghost_neg | ghost_both) - interface_bs
+
+    solid_ghost = ghost_neg | ghost_both
+    fluid_ghost = ghost_pos | ghost_both
+
+    # Sliver/corner robustness:
+    # When one side has no fully-inside/outside elements, stabilize on an element
+    # band around cut cells (includes interior edges beyond immediate cut-neighbors).
+    if cut.cardinality() > 0:
+        if fluid.cardinality() == 0 or solid.cardinality() == 0:
+            band_ghost = _ghost_band_edges(mesh, cut, layers=2)
+            if band_ghost.cardinality() > 0:
+                fluid_ghost = _copy_bitset(band_ghost)
+                solid_ghost = _copy_bitset(band_ghost)
+        else:
+            if fluid_ghost.cardinality() == 0 and ghost_all.cardinality() > 0:
+                fluid_ghost = _copy_bitset(ghost_all)
+            if solid_ghost.cardinality() == 0 and ghost_all.cardinality() > 0:
+                solid_ghost = _copy_bitset(ghost_all)
+    fluid_quad_edges = BitSet(_fluid_quad_edge_mask(mesh))
     return {
         "fluid_domain": _copy_bitset(fluid),
         "solid_domain": _copy_bitset(solid),
@@ -2521,6 +3094,7 @@ def make_domain_sets(mesh: Mesh) -> Dict[str, BitSet]:
         "has_neg": _copy_bitset(has_neg),
         "solid_ghost": _copy_bitset(solid_ghost),
         "fluid_ghost": _copy_bitset(fluid_ghost),
+        "fluid_quad_edges": _copy_bitset(fluid_quad_edges),
     }
 
 
@@ -2547,11 +3121,29 @@ def refresh_domains(mesh: Mesh, domains: Dict[str, BitSet]) -> None:
     _update_bs(domains["solid_interface"], has_solid.mask)
     _update_bs(domains["has_pos"], fluid.mask | cut.mask)
     _update_bs(domains["has_neg"], solid.mask | cut.mask)
-    ghost_both = mesh.edge_bitset("ghost_both")
-    solid_ghost = mesh.edge_bitset("ghost_neg") | ghost_both
-    fluid_ghost = mesh.edge_bitset("ghost_pos") | ghost_both
+    interface_bs = mesh.edge_bitset("interface")
+    ghost_pos = mesh.edge_bitset("ghost_pos") - interface_bs
+    ghost_neg = mesh.edge_bitset("ghost_neg") - interface_bs
+    ghost_both = mesh.edge_bitset("ghost_both") - interface_bs
+    ghost_all = (ghost_pos | ghost_neg | ghost_both) - interface_bs
+
+    solid_ghost = ghost_neg | ghost_both
+    fluid_ghost = ghost_pos | ghost_both
+    if cut.cardinality() > 0:
+        if fluid.cardinality() == 0 or solid.cardinality() == 0:
+            band_ghost = _ghost_band_edges(mesh, mesh.element_bitset("cut"), layers=2)
+            if band_ghost.cardinality() > 0:
+                fluid_ghost = _copy_bitset(band_ghost)
+                solid_ghost = _copy_bitset(band_ghost)
+        else:
+            if fluid_ghost.cardinality() == 0 and ghost_all.cardinality() > 0:
+                fluid_ghost = _copy_bitset(ghost_all)
+            if solid_ghost.cardinality() == 0 and ghost_all.cardinality() > 0:
+                solid_ghost = _copy_bitset(ghost_all)
     _update_bs(domains["solid_ghost"], solid_ghost.mask)
     _update_bs(domains["fluid_ghost"], fluid_ghost.mask)
+    if "fluid_quad_edges" in domains:
+        _update_bs(domains["fluid_quad_edges"], _fluid_quad_edge_mask(mesh))
 
 
 def refresh_hansbo_kappa(
@@ -2559,10 +3151,25 @@ def refresh_hansbo_kappa(
     level_set,
     theta_pos_vals: np.ndarray,
     theta_neg_vals: np.ndarray,
-    theta_min: float = 1.0e-3,
+    theta_pos_raw_vals: np.ndarray | None = None,
+    theta_neg_raw_vals: np.ndarray | None = None,
+    theta_min: float = 1.0e-12,
 ) -> None:
-    theta_pos_vals[:] = np.clip(hansbo_cut_ratio(mesh, level_set, side="+"), theta_min, 1.0)
-    theta_neg_vals[:] = np.clip(hansbo_cut_ratio(mesh, level_set, side="-"), theta_min, 1.0)
+    # IMPORTANT:
+    # - `theta_*_vals` are clipped (>=theta_min) for stable kappa/weight computations.
+    # - `theta_*_raw_vals` retain the true (possibly ~0) cut ratio, which is used for
+    #   sliver DOF dropping decisions (SOLID_CUT_DROP) to avoid masking tiny slivers
+    #   by the clipping floor.
+    thp_raw = hansbo_cut_ratio(mesh, level_set, side="+")
+    thn_raw = hansbo_cut_ratio(mesh, level_set, side="-")
+    if theta_pos_raw_vals is not None:
+        theta_pos_raw_vals[:] = thp_raw
+        thp_raw = theta_pos_raw_vals
+    if theta_neg_raw_vals is not None:
+        theta_neg_raw_vals[:] = thn_raw
+        thn_raw = theta_neg_raw_vals
+    theta_pos_vals[:] = np.clip(thp_raw, theta_min, 1.0)
+    theta_neg_vals[:] = np.clip(thn_raw, theta_min, 1.0)
 
 
 def log_sliver_stats(
@@ -2876,22 +3483,155 @@ def retag_inactive(
                 dh.tag_dofs_from_element_bitset("inactive", field, bad, strict=False)
 
 
-def recompute_active_dofs(solver: NewtonSolver, bcs_active: Sequence[BoundaryCondition]) -> None:
+def recompute_active_dofs(solver: NewtonSolver, bcs_active: Sequence[BoundaryCondition]) -> bool:
     dh = solver.dh
     ndof = dh.total_dofs
+    old_active = np.asarray(getattr(solver, "active_dofs", np.empty(0, dtype=int)), dtype=int)
     active_by_restr, has_restriction = analyze_active_dofs(solver.equation, dh, solver.me, bcs_active)
     bc_dofs = set(dh.get_dirichlet_data(bcs_active).keys())
     candidate = set(active_by_restr) if has_restriction else set(range(ndof))
     inactive = set(dh.dof_tags.get("inactive", set()))
     inactive_free = inactive - bc_dofs
     free = sorted((candidate - bc_dofs) - inactive_free)
-    solver.active_dofs = np.asarray(free, dtype=int)
+    new_active = np.asarray(free, dtype=int)
+    dec_mask = getattr(solver, "_decoupled_full_mask", None)
+    if isinstance(dec_mask, np.ndarray) and dec_mask.dtype == bool and int(dec_mask.size) == int(ndof):
+        if new_active.size:
+            new_active = new_active[~dec_mask[new_active]]
+    if old_active.size == new_active.size and np.array_equal(old_active, new_active):
+        return False
+    solver.active_dofs = new_active
     solver.full_to_red = -np.ones(ndof, dtype=int)
     solver.full_to_red[solver.active_dofs] = np.arange(len(solver.active_dofs), dtype=int)
     solver.red_to_full = solver.active_dofs
     solver.use_reduced = len(solver.active_dofs) < ndof
-    solver.restrictor = _ActiveReducer(dh, solver.active_dofs)
+    solver.restrictor = _ActiveReducer(dh, solver.active_dofs, constraint=getattr(solver, "constraints", None))
     solver._pattern_stale = True
+    return True
+
+
+# -----------------------------------------------------------------------------
+# Robustness: initialize newly-active DOFs after geometry changes
+# -----------------------------------------------------------------------------
+
+
+def extend_newly_active_dofs_nearest(
+    *,
+    dh: DofHandler,
+    newly_active: np.ndarray,
+    active_old: np.ndarray,
+    active_new: np.ndarray,
+    field_to_current,
+    field_to_prev,
+    k: int = 4,
+    trace: bool = False,
+) -> None:
+    """
+    When the interface moves, some DOFs transition from inactive→active and were
+    not solved for previously. If left at stale/zero values, the time-derivative
+    terms can create large residual jumps and Newton can fail.
+
+    This routine initializes those newly-active DOFs by a nearest-neighbor (or
+    k-NN inverse-distance weighted) extension from DOFs that remained active.
+    """
+    newly_active = np.asarray(newly_active, dtype=int).ravel()
+    if newly_active.size == 0:
+        return
+
+    # Restrict sources to DOFs that are active *now* and were already active before.
+    active_old = np.asarray(active_old, dtype=int).ravel()
+    active_new = np.asarray(active_new, dtype=int).ravel()
+    stable_active = np.setdiff1d(active_new, newly_active, assume_unique=False)
+    if stable_active.size == 0:
+        return
+
+    try:
+        dh._ensure_dof_coords()  # internal but reliable; coords are geometry-independent
+        coords = np.asarray(dh._dof_coords, dtype=float)
+    except Exception:
+        return
+
+    try:
+        from scipy.spatial import cKDTree  # type: ignore
+    except Exception:
+        cKDTree = None  # noqa: N806
+
+    if cKDTree is None:
+        return
+
+    field_names = sorted(set(field_to_current.keys()) & set(field_to_prev.keys()))
+    if not field_names:
+        return
+
+    # Precompute per-field DOF slices and per-carrier offsets (VectorFunction layout is concatenated slices).
+    field_slices: dict[str, np.ndarray] = {
+        f: np.asarray(dh.get_field_slice(f), dtype=int) for f in field_names
+    }
+
+    def _carrier_field_view(carrier, field: str) -> np.ndarray | None:
+        if carrier is None:
+            return None
+        if hasattr(carrier, "field_name"):
+            if getattr(carrier, "field_name", None) != field:
+                return None
+            return carrier.nodal_values
+        if hasattr(carrier, "field_names"):
+            names = list(getattr(carrier, "field_names", []))
+            if field not in names:
+                return None
+            start = 0
+            for nm in names:
+                n = int(field_slices[nm].size)
+                if nm == field:
+                    return carrier.nodal_values[start : start + n]
+                start += n
+        return None
+
+    for field in field_names:
+        fs = field_slices[field]
+        # Newly active DOFs for this field (global ids).
+        new_f = np.intersect1d(newly_active, fs, assume_unique=False)
+        if new_f.size == 0:
+            continue
+
+        # Source DOFs: stable active DOFs for this field.
+        src_f = np.intersect1d(stable_active, fs, assume_unique=False)
+        if src_f.size == 0:
+            if trace:
+                print(f"[extend] field={field}: no stable active source DOFs; skipping {new_f.size} targets")
+            continue
+
+        cur_car = field_to_current[field]
+        prev_car = field_to_prev[field]
+        cur_view = _carrier_field_view(cur_car, field)
+        prev_view = _carrier_field_view(prev_car, field)
+        if cur_view is None or prev_view is None:
+            continue
+
+        # Map src/target global DOFs to local indices in the field slice.
+        src_pos = np.searchsorted(fs, src_f)
+        src_vals = np.asarray(cur_view[src_pos], dtype=float)
+
+        # Build k-NN extension
+        k_eff = int(max(1, min(int(k), int(src_f.size))))
+        tree = cKDTree(coords[src_f])
+        dist, idx = tree.query(coords[new_f], k=k_eff)
+        if k_eff == 1:
+            new_vals = src_vals[np.asarray(idx, dtype=int)]
+        else:
+            idx = np.asarray(idx, dtype=int)
+            dist = np.asarray(dist, dtype=float)
+            w = 1.0 / np.maximum(dist, 1.0e-12)
+            wsum = np.sum(w, axis=1)
+            new_vals = np.sum(w * src_vals[idx], axis=1) / np.maximum(wsum, 1.0e-30)
+
+        tgt_pos = np.searchsorted(fs, new_f)
+        cur_view[tgt_pos] = new_vals
+        prev_view[tgt_pos] = new_vals
+
+        if trace:
+            maxd = float(np.max(dist)) if np.size(dist) else 0.0
+            print(f"[extend] field={field}: filled {new_f.size} DOFs from {src_f.size} sources (k={k_eff}, max_dist={maxd:.3e})")
 
 
 # -----------------------------------------------------------------------------
@@ -3645,12 +4385,13 @@ if quick_plot_only:
     sys.exit(0)
 
 # Mixed element for fluid/solid unknowns
+# Default is equal-order P^k/P^k. Set PYCUTFEM_TAYLOR_HOOD=1 for P^k/P^(k-1).
 mixed_element = MixedElement(
     mesh,
     field_specs={
         "u_pos_x": POLY_ORDER,
         "u_pos_y": POLY_ORDER,
-        "p_pos_": POLY_ORDER ,
+        "p_pos_": PRESSURE_ORDER,
         "vs_neg_x": POLY_ORDER ,
         "vs_neg_y": POLY_ORDER ,
         "d_neg_x":  POLY_ORDER ,
@@ -3742,8 +4483,12 @@ disp_n = VectorFunction(name="disp_n", field_names=["d_neg_x", "d_neg_y"], dof_h
 for func in [uf_k, pf_k, uf_n, pf_n, us_k, us_n, disp_k, disp_n]:
     func.nodal_values.fill(0.0)
 
-dof_handler.apply_bcs(bcs, uf_k, pf_k, us_k, disp_k)
-dof_handler.apply_bcs(bcs, uf_n, pf_n, us_n, disp_n)
+# IMPORTANT: time-dependent BCs must be frozen; otherwise `parabolic_inflow(x,y,t=None)`
+# is evaluated with t=None (i.e. *full* inflow, no ramp), which corrupts restart dumps
+# and can destabilize early transient steps.
+bcs_t0 = NewtonSolver._freeze_bcs(bcs, 0.0)
+dof_handler.apply_bcs(bcs_t0, uf_k, pf_k, us_k, disp_k)
+dof_handler.apply_bcs(bcs_t0, uf_n, pf_n, us_n, disp_n)
 
 # -----------------------------------------------------------------------------
 # Measures and stabilization weights
@@ -3761,10 +4506,20 @@ dx_solid = dx(
     level_set=ls_beam,
     metadata={"q": qvol, "side": "-"},
 )
+dx_fluid_cut = dx(
+    defined_on=domains["cut_domain"],
+    level_set=ls_beam,
+    metadata={"q": qvol, "side": "+"},
+)
+dx_solid_cut = dx(
+    defined_on=domains["cut_domain"],
+    level_set=ls_beam,
+    metadata={"q": qvol, "side": "-"},
+)
 dΓ = dInterface(
     defined_on=domains["cut_interface"],
     level_set=ls_beam,
-    metadata={"q": qvol + 2, "derivs": {(0, 0), (0, 1), (1, 0)}},
+    metadata={"q": qvol + 2, "derivs": {(0, 0), (0, 1), (1, 0)}, "linear_interface": USE_LINEAR_INTERFACE},
 )
 dG_fluid = dGhost(
     defined_on=domains["fluid_ghost"],
@@ -3776,13 +4531,27 @@ dG_solid = dGhost(
     level_set=ls_beam,
     metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
 )
+dS_fluid_quad = ds(
+    defined_on=domains["fluid_quad_edges"],
+    level_set=ls_beam,
+    metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
+)
 
 cell_h = CellDiameter()
 beta_N = Constant(BETA_PENALTY * POLY_ORDER * (POLY_ORDER + 1))
 
-theta_min = 1.0e-3
-theta_pos_vals = np.clip(hansbo_cut_ratio(mesh, ls_beam, side="+"), theta_min, 1.0)
-theta_neg_vals = np.clip(hansbo_cut_ratio(mesh, ls_beam, side="-"), theta_min, 1.0)
+# Cut-ratio floor used for:
+# - sliver weights (refresh_sliver_weights)
+# - kappa weights in Nitsche averages
+#
+# Using the same floor as the sliver logic avoids artificially capping the
+# stabilization strength on extreme slivers (raw θ ≪ 1e-3) while still
+# preventing divide-by-zero.
+theta_min = max(float(SLIVER_THETAMIN), 1.0e-12)
+theta_pos_raw_vals = hansbo_cut_ratio(mesh, ls_beam, side="+")
+theta_neg_raw_vals = hansbo_cut_ratio(mesh, ls_beam, side="-")
+theta_pos_vals = np.clip(theta_pos_raw_vals, theta_min, 1.0)
+theta_neg_vals = np.clip(theta_neg_raw_vals, theta_min, 1.0)
 w_pos_vals = np.ones_like(theta_pos_vals)
 w_neg_vals = np.ones_like(theta_neg_vals)
 refresh_sliver_weights(
@@ -3817,7 +4586,7 @@ log_sliver_stats(
     w_neg_vals,
     theta0=SLIVER_THETA0,
 )
-retag_inactive(dof_handler, theta_neg=theta_neg_vals, solid_cut_drop=SOLID_CUT_DROP)
+retag_inactive(dof_handler, theta_neg=theta_neg_raw_vals, solid_cut_drop=SOLID_CUT_DROP)
 
 use_restricted_forms = USE_RESTRICTED_FORMS
 if use_restricted_forms:
@@ -4120,7 +4889,8 @@ avg_flux_fluid_res =   kappa_pos * traction_fluid_primal(Pos(uf_k_ifc), Pos(pf_k
 
 # Should we have a negative sign here?
 avg_flux_solid_trial = kappa_neg * traction_solid_L(Neg(ddisp_s_ifc), Neg(disp_k_ifc))
-avg_flux_solid_test =  kappa_neg * traction_solid_L(Neg(test_vel_s_ifc), Neg(disp_k_ifc))
+_sym_ref = disp_n if (SOLID_SYM_NITSCHE_LAGGED and not USE_LINEAR_SOLID) else disp_k_ifc
+avg_flux_solid_test =  kappa_neg * traction_solid_L(Neg(test_vel_s_ifc), Neg(_sym_ref))
 avg_flux_solid_res =   kappa_neg * traction_solid_R(Neg(disp_k_ifc))
 
 s_nitsche_value = float(ARGS.s_nitsche_value)
@@ -4131,12 +4901,20 @@ J_int_fluid = (-dot(avg_flux_fluid_trial, jump_test_f)) * dΓ - (dot(avg_flux_fl
 R_int_fluid = (-dot(avg_flux_fluid_res, jump_test_f)) * dΓ   - (dot(avg_flux_fluid_res, jump_test_s)) * dΓ
 J_int_solid = (-dot(avg_flux_solid_trial, jump_test_f)) * dΓ - (dot(avg_flux_solid_trial, jump_test_s)) * dΓ
 R_int_solid = (-dot(avg_flux_solid_res, jump_test_f)) * dΓ   - (dot(avg_flux_solid_res, jump_test_s)) * dΓ
-J_int_pen = (beta_N * mu_f_const / cell_h) * w_gp_ifc * dot(jump_vel_trial, jump_vel_test) * dΓ
-R_int_pen = (beta_N * mu_f_const / cell_h) * w_gp_ifc * dot(jump_vel_res, jump_vel_test) * dΓ
+nitsche_pen_scale = mu_f_const / cell_h
+if USE_DT_SCALED_NITSCHE_PENALTY:
+    nitsche_pen_scale = nitsche_pen_scale + (rho_f_const * cell_h / dt)
+pen_weight = w_gp_ifc if PYCUTFEM_INTERFACE_PENALTY_SLIVER_WEIGHT else Constant(1.0)
+J_int_pen = beta_N * nitsche_pen_scale * pen_weight * dot(jump_vel_trial, jump_vel_test) * dΓ
+R_int_pen = beta_N * nitsche_pen_scale * pen_weight * dot(jump_vel_res, jump_vel_test) * dΓ
 
 J_int = J_int_fluid + J_int_solid + J_int_pen
 R_int = R_int_fluid + R_int_solid + R_int_pen
 
+J_int_sym_fluid = None
+J_int_sym_solid = None
+R_int_sym_fluid = None
+R_int_sym_solid = None
 if s_nitsche_value != 0.0:
     J_int_sym_fluid = (-s_nitsche * dot(avg_flux_fluid_test, jump_vel_trial)) * dΓ
     J_int_sym_solid = (-s_nitsche * dot(avg_flux_solid_test, jump_vel_trial)) * dΓ
@@ -4147,10 +4925,39 @@ if s_nitsche_value != 0.0:
 
 
 
+def _conv_adv(u, v):
+    return dot(dot(grad(u), u), v)
+
+
+def _conv_adv_jac(u_ref, du, v):
+    return dot(dot(grad(u_ref), du), v) + dot(dot(grad(du), u_ref), v)
+
+
+def _conv_skew(u, v):
+    return Constant(0.5) * (dot(dot(grad(u), u), v) - dot(dot(grad(v), u), u))
+
+
+def _conv_skew_jac(u_ref, du, v):
+    return Constant(0.5) * (
+        dot(dot(grad(u_ref), du), v)
+        + dot(dot(grad(du), u_ref), v)
+        - dot(dot(grad(v), du), u_ref)
+        - dot(dot(grad(v), u_ref), du)
+    )
+
+
+if USE_SKEW_CONVECTION:
+    conv_f_jac = _conv_skew_jac(uf_k_R, du_f_R, test_vel_f_R)
+    conv_f_k = _conv_skew(uf_k_R, test_vel_f_R)
+    conv_f_n = _conv_skew(uf_n_R, test_vel_f_R)
+else:
+    conv_f_jac = _conv_adv_jac(uf_k_R, du_f_R, test_vel_f_R)
+    conv_f_k = _conv_adv(uf_k_R, test_vel_f_R)
+    conv_f_n = _conv_adv(uf_n_R, test_vel_f_R)
+
 a_vol_f = (
     rho_f_const / dt * dot(du_f_R, test_vel_f_R)
-    + theta * rho_f_const * dot(dot(grad(uf_k_R), du_f_R), test_vel_f_R)
-    + theta * rho_f_const * dot(dot(grad(du_f_R), uf_k_R), test_vel_f_R)
+    + theta * rho_f_const * conv_f_jac
     + theta * mu_f_const * inner(grad(du_f_R), grad(test_vel_f_R))
     - dp_f_R * div(test_vel_f_R)
     + test_q_f_R * div(du_f_R)
@@ -4158,8 +4965,8 @@ a_vol_f = (
 
 r_vol_f = (
     rho_f_const * dot(uf_k_R - uf_n_R, test_vel_f_R) / dt
-    + theta * rho_f_const * dot(dot(grad(uf_k_R), uf_k_R), test_vel_f_R)
-    + (1 - theta) * rho_f_const * dot(dot(grad(uf_n_R), uf_n_R), test_vel_f_R)
+    + theta * rho_f_const * conv_f_k
+    + (1 - theta) * rho_f_const * conv_f_n
     + theta * mu_f_const * inner(grad(uf_k_R), grad(test_vel_f_R))
     + (1 - theta) * mu_f_const * inner(grad(uf_n_R), grad(test_vel_f_R))
     - pf_k_R * div(test_vel_f_R)
@@ -4170,65 +4977,135 @@ sigma_s_k = sigma_s_nonlinear(disp_k_R)  # Cauchy stress in current frame
 sigma_s_n = sigma_s_nonlinear(disp_n_R)
 dsigma_s_k = dsigma_s(disp_k_R, ddisp_s_R)
 
+a_half = Constant(0.5)
+
+def _advect(w, u, v):
+    return dot(dot(grad(u), w), v)
+
+
+def _advect_jac_w_fixed(w, du, v):
+    return dot(dot(grad(du), w), v)
+
+
+def _advect_skew(w, u, v):
+    return a_half * (dot(dot(grad(u), w), v) - dot(dot(grad(v), w), u))
+
+
+def _advect_skew_jac_w_fixed(w, du, v):
+    return a_half * (dot(dot(grad(du), w), v) - dot(dot(grad(v), w), du))
+
+
+def _advect_skew_div(w, u, v):
+    return a_half * (dot(dot(grad(u), w), v) - dot(dot(grad(v), w), u) + div(w) * dot(u, v))
+
+
+def _advect_skew_div_jac_w_fixed(w, du, v):
+    return a_half * (dot(dot(grad(du), w), v) - dot(dot(grad(v), w), du) + div(w) * dot(du, v))
+
+
+if USE_SKEW_CONVECTION:
+    if SOLID_ADVECT_LAGGED:
+        if SOLID_SKEW_ADD_DIV:
+            adv_s_jac = _advect_skew_div_jac_w_fixed(solid_adv_vel, du_s_R, test_vel_s_R)
+            adv_s_k = _advect_skew_div(solid_adv_vel, us_k_R, test_vel_s_R)
+            adv_s_n = _advect_skew_div(us_n_R, us_n_R, test_vel_s_R)
+        else:
+            adv_s_jac = _advect_skew_jac_w_fixed(solid_adv_vel, du_s_R, test_vel_s_R)
+            adv_s_k = _advect_skew(solid_adv_vel, us_k_R, test_vel_s_R)
+            adv_s_n = _advect_skew(us_n_R, us_n_R, test_vel_s_R)
+    else:
+        adv_s_jac = _conv_skew_jac(us_k_R, du_s_R, test_vel_s_R)
+        adv_s_k = _conv_skew(us_k_R, test_vel_s_R)
+        adv_s_n = _conv_skew(us_n_R, test_vel_s_R)
+else:
+    if SOLID_ADVECT_LAGGED:
+        adv_s_jac = _advect_jac_w_fixed(solid_adv_vel, du_s_R, test_vel_s_R)
+        adv_s_k = _advect(solid_adv_vel, us_k_R, test_vel_s_R)
+        adv_s_n = _advect(us_n_R, us_n_R, test_vel_s_R)
+    else:
+        adv_s_jac = dot(dot(grad(us_k_R), du_s_R), test_vel_s_R) + dot(dot(grad(du_s_R), us_k_R), test_vel_s_R)
+        adv_s_k = _conv_adv(us_k_R, test_vel_s_R)
+        adv_s_n = _conv_adv(us_n_R, test_vel_s_R)
+
 a_vol_s = (
     rho_s_const * dot(du_s_R, test_vel_s_R) / dt
     + theta * inner(dsigma_s_k, grad(test_vel_s_R))
-    + (
-        rho_s_const
-        * theta
-        * (
-            dot(dot(grad(du_s_R), solid_adv_vel), test_vel_s_R)
-            if SOLID_ADVECT_LAGGED
-            else (
-                dot(dot(grad(us_k_R), du_s_R), test_vel_s_R)
-                + dot(dot(grad(du_s_R), us_k_R), test_vel_s_R)
-            )
-        )
-    )
+    + (rho_s_const * theta * adv_s_jac)
 ) * dx_solid
 r_vol_s = (
     rho_s_const * dot(us_k_R - us_n_R, test_vel_s_R) / dt
     + theta * inner(sigma_s_k, grad(test_vel_s_R))
     + (1 - theta) * inner(sigma_s_n, grad(test_vel_s_R))
-    + rho_s_const
-        * (
-            theta * dot(dot(grad(us_k_R), solid_adv_vel), test_vel_s_R)
-            + (1 - theta) * dot(dot(grad(us_n_R), us_n_R), test_vel_s_R)
-        )
+    + rho_s_const * (theta * adv_s_k + (1 - theta) * adv_s_n)
 ) * dx_solid
 
 
+
+if USE_SKEW_CONVECTION and SOLID_ADVECT_LAGGED:
+    if SOLID_SKEW_ADD_DIV:
+        adv_disp_jac = _advect_skew_div_jac_w_fixed(solid_adv_vel, ddisp_s_R, test_disp_s_R)
+        adv_disp_k = _advect_skew_div(solid_adv_vel, disp_k_R, test_disp_s_R)
+        adv_disp_n = _advect_skew_div(us_n_R, disp_n_R, test_disp_s_R)
+    else:
+        adv_disp_jac = _advect_skew_jac_w_fixed(solid_adv_vel, ddisp_s_R, test_disp_s_R)
+        adv_disp_k = _advect_skew(solid_adv_vel, disp_k_R, test_disp_s_R)
+        adv_disp_n = _advect_skew(us_n_R, disp_n_R, test_disp_s_R)
+else:
+    adv_disp_jac = (
+        dot(dot(grad(ddisp_s_R), solid_adv_vel), test_disp_s_R)
+        if SOLID_ADVECT_LAGGED
+        else (
+            dot(dot(grad(ddisp_s_R), us_k_R), test_disp_s_R)
+            + dot(dot(grad(disp_k_R), du_s_R), test_disp_s_R)
+        )
+    )
+    adv_disp_k = dot(dot(grad(disp_k_R), solid_adv_vel), test_disp_s_R)
+    adv_disp_n = dot(dot(grad(disp_n_R), us_n_R), test_disp_s_R)
 
 a_svc = (
     dot(ddisp_s_R, test_disp_s_R) / dt
     - theta * dot(du_s_R, test_disp_s_R)
-    + (
-        theta
-        * (
-            dot(dot(grad(ddisp_s_R), solid_adv_vel), test_disp_s_R)
-            if SOLID_ADVECT_LAGGED
-            else (
-                dot(dot(grad(ddisp_s_R), us_k_R), test_disp_s_R)
-                + dot(dot(grad(disp_k_R), du_s_R), test_disp_s_R)
-            )
-        )
-    )
+    + theta * adv_disp_jac
 ) * dx_solid
+if SOLID_KINEMATIC_STAB > 0.0:
+    alpha_s = Constant(float(SOLID_KINEMATIC_STAB))
+    s_exp = float(SOLID_KINEMATIC_STAB_EXP)
+    a_svc = a_svc + (-alpha_s * cell_h**s_exp * inner(grad(du_s_R), grad(test_disp_s_R))) * dx_solid
 # Kinematic constraint with advected displacement in Eulerian frame
 r_svc = (
     dot(disp_k_R - disp_n_R, test_disp_s_R) / dt
     - theta * dot(us_k_R, test_disp_s_R)
     - (1 - theta) * dot(us_n_R, test_disp_s_R)
-    + theta * dot(dot(grad(disp_k_R), solid_adv_vel), test_disp_s_R)
-    + (1 - theta) * dot(dot(grad(disp_n_R), us_n_R), test_disp_s_R)
+    + theta * adv_disp_k
+    + (1 - theta) * adv_disp_n
 ) * dx_solid
+if SOLID_KINEMATIC_STAB > 0.0:
+    r_svc = r_svc + (-alpha_s * cell_h**s_exp * inner(grad(us_k_R), grad(test_disp_s_R))) * dx_solid
 
 penalty_val = float(os.getenv("PENALTY_VAL", "0.0"))
 penalty_grad = float(os.getenv("PENALTY_GRAD", "0.0"))
-gamma_v_f = Constant(penalty_val * POLY_ORDER**2) * w_gp_fluid
-gamma_p_f = Constant(penalty_val * POLY_ORDER) * w_gp_fluid
-gamma_v_s = Constant(penalty_val * POLY_ORDER**2) * w_gp_solid
-gamma_disp_s = Constant(penalty_grad * POLY_ORDER**2) * w_gp_solid
+# Keep the scalar Constants around so we can scale them (e.g. on Newton failure)
+# without regenerating forms/kernels.
+gamma_v_f0 = Constant(penalty_val * POLY_ORDER**2)
+gamma_p_f0 = Constant(penalty_val * PRESSURE_ORDER)
+gamma_v_s0 = Constant(penalty_val * POLY_ORDER**2)
+gamma_disp_s0 = Constant(penalty_grad * POLY_ORDER**2)
+gamma_v_f_mass0 = Constant(float(PYCUTFEM_FLUID_VEL_GHOST_MASS))
+gamma_v_s_mass0 = Constant(float(SOLID_VEL_GHOST_MASS))
+gamma_sliver_mass_f0 = Constant(float(PYCUTFEM_SLIVER_MASS_FLUID))
+gamma_sliver_mass_s0 = Constant(float(PYCUTFEM_SLIVER_MASS_SOLID))
+gamma_v_f = gamma_v_f0 * w_gp_fluid
+gamma_p_f = gamma_p_f0 * w_gp_fluid
+gamma_v_s = gamma_v_s0 * w_gp_solid
+gamma_disp_s = gamma_disp_s0 * w_gp_solid
+gamma_v_s_mass = gamma_v_s_mass0
+gamma_v_f_mass = gamma_v_f_mass0
+gamma_sliver_mass_f = gamma_sliver_mass_f0
+gamma_sliver_mass_s = gamma_sliver_mass_s0
+gamma_p_stab_jump0 = Constant(PYCUTFEM_PRESSURE_STAB_JUMP)
+gamma_p_stab_avg0 = Constant(PYCUTFEM_PRESSURE_STAB_AVG)
+gamma_p_stab_jump = gamma_p_stab_jump0 * w_gp_fluid
+gamma_p_stab_avg = gamma_p_stab_avg0 * w_gp_fluid
 solid_reg_eps = Constant(float(os.getenv("SOLID_REG_EPS", "1e-6")))
 
 
@@ -4236,34 +5113,117 @@ def g_v_f(gamma, phi_1, phi_2):
     return gamma * (cell_h * grad_inner_jump(phi_1, phi_2))
 
 
+def g_v_f_inertia(gamma, phi_1, phi_2):
+    return gamma * ((cell_h**3.0 / dt) * grad_inner_jump(phi_1, phi_2))
+
+
+def g_v_f_mass(gamma, phi_1, phi_2):
+    return gamma * (cell_h * inner(jump(phi_1), jump(phi_2)))
+
+
 def g_p(gamma, phi_1, phi_2):
     return gamma * (cell_h**3.0 * grad_inner_jump(phi_1, phi_2))
 
 
+def grad_inner_jump_full(u, v):
+    return inner(jump(grad(u)), jump(grad(v)))
+
+
+def grad_inner_avg(u, v):
+    # Average of a scalar quantity across the edge: 0.5*(pos + neg).
+    return Constant(0.5) * (Pos(inner(grad(u), grad(v))) + Neg(inner(grad(u), grad(v))))
+
+
 def g_v_s(gamma, phi_1, phi_2):
-    return gamma * (cell_h**3.0 * grad_inner_jump(phi_1, phi_2))
+    scale = cell_h**3.0
+    if SOLID_VEL_GHOST_DT_SCALE:
+        scale = scale / dt
+    return gamma * (scale * grad_inner_jump(phi_1, phi_2))
+
+
+def g_v_s_mass(gamma, phi_1, phi_2):
+    return gamma * (cell_h * inner(jump(phi_1), jump(phi_2)))
 
 
 def g_disp_s(gamma, phi_1, phi_2):
     return gamma * (cell_h * grad_inner_jump(phi_1, phi_2))
 
 
-a_stab = (
-    (Constant(2.0) * mu_f_const * g_v_f(gamma_v_f, du_f_R, test_vel_f_R) + g_p(gamma_p_f, dp_f_R, test_q_f_R)) * dG_fluid
-    + (rho_s_const * g_v_s(gamma_v_s, du_s_R, test_vel_s_R) + Constant(2.0) * mu_s_const * g_disp_s(gamma_disp_s, ddisp_s_R, test_disp_s_R))
-    * dG_solid
+a_stab_fluid = (
+    Constant(2.0) * mu_f_const * g_v_f(gamma_v_f, du_f_R, test_vel_f_R)
+    + (rho_f_const / dt) * g_v_f_mass(gamma_v_f_mass, du_f_R, test_vel_f_R)
+    + g_p(gamma_p_f, dp_f_R, test_q_f_R)
 )
-r_stab = (
-    (Constant(2.0) * mu_f_const * g_v_f(gamma_v_f, uf_k_R, test_vel_f_R) + g_p(gamma_p_f, pf_k_R, test_q_f_R)) * dG_fluid
-    + (rho_s_const * g_v_s(gamma_v_s, us_k_R, test_vel_s_R) + Constant(2.0) * mu_s_const * g_disp_s(gamma_disp_s, disp_k_R, test_disp_s_R))
-    * dG_solid
+r_stab_fluid = (
+    Constant(2.0) * mu_f_const * g_v_f(gamma_v_f, uf_k_R, test_vel_f_R)
+    + (rho_f_const / dt) * g_v_f_mass(gamma_v_f_mass, uf_k_R, test_vel_f_R)
+    + g_p(gamma_p_f, pf_k_R, test_q_f_R)
 )
+if FLUID_VEL_GHOST_INERTIA:
+    a_stab_fluid = a_stab_fluid + rho_f_const * g_v_f_inertia(gamma_v_f, du_f_R, test_vel_f_R)
+    r_stab_fluid = r_stab_fluid + rho_f_const * g_v_f_inertia(gamma_v_f, uf_k_R, test_vel_f_R)
+
+a_stab_solid = (
+    rho_s_const * g_v_s(gamma_v_s, du_s_R, test_vel_s_R)
+    + (rho_s_const / dt) * g_v_s_mass(gamma_v_s_mass, du_s_R, test_vel_s_R)
+    + Constant(2.0) * mu_s_const * g_disp_s(gamma_disp_s, ddisp_s_R, test_disp_s_R)
+)
+r_stab_solid = (
+    rho_s_const * g_v_s(gamma_v_s, us_k_R, test_vel_s_R)
+    + (rho_s_const / dt) * g_v_s_mass(gamma_v_s_mass, us_k_R, test_vel_s_R)
+    + Constant(2.0) * mu_s_const * g_disp_s(gamma_disp_s, disp_k_R, test_disp_s_R)
+)
+
+a_stab = a_stab_fluid * dG_fluid + a_stab_solid * dG_solid
+r_stab = r_stab_fluid * dG_fluid + r_stab_solid * dG_solid
+
+a_p_stab = Constant(0.0) * dx_fluid
+r_p_stab = Constant(0.0) * dx_fluid
+if PYCUTFEM_PRESSURE_STAB_JUMP > 0.0:
+    a_p_stab = a_p_stab + (gamma_p_stab_jump * (cell_h**3.0 * grad_inner_jump_full(dp_f, test_q_f))) * dS_fluid_quad
+    r_p_stab = r_p_stab + (gamma_p_stab_jump * (cell_h**3.0 * grad_inner_jump_full(pf_k, test_q_f))) * dS_fluid_quad
+if PYCUTFEM_PRESSURE_STAB_AVG > 0.0:
+    a_p_stab = a_p_stab + (gamma_p_stab_avg * (cell_h**3.0 * grad_inner_avg(dp_f, test_q_f))) * dG_fluid
+    r_p_stab = r_p_stab + (gamma_p_stab_avg * (cell_h**3.0 * grad_inner_avg(pf_k, test_q_f))) * dG_fluid
+
+a_cip = Constant(0.0) * dx_fluid
+r_cip = Constant(0.0) * dx_fluid
+if (PYCUTFEM_CIP_BETA_FLUID > 0.0) or (PYCUTFEM_CIP_BETA_SOLID > 0.0) or (PYCUTFEM_CIP_BETA_DISP > 0.0):
+    cip_eps = Constant(PYCUTFEM_CIP_U_EPS)
+    u_cip_f = uf_n_R if PYCUTFEM_CIP_LAGGED else uf_k_R
+    u_cip_s = us_n_R if PYCUTFEM_CIP_LAGGED else us_k_R
+    u_mag_f = (dot(u_cip_f, u_cip_f) + cip_eps) ** 0.5
+    u_mag_s = (dot(u_cip_s, u_cip_s) + cip_eps) ** 0.5
+    tau_cip_f = Constant(PYCUTFEM_CIP_BETA_FLUID) * rho_f_const * cell_h * u_mag_f
+    tau_cip_s = Constant(PYCUTFEM_CIP_BETA_SOLID) * rho_s_const * cell_h * u_mag_s
+    tau_cip_d = Constant(PYCUTFEM_CIP_BETA_DISP) * rho_s_const * cell_h * u_mag_s
+    a_cip = (
+        tau_cip_f * grad_inner_jump(du_f_R, test_vel_f_R) * dG_fluid
+        + tau_cip_s * grad_inner_jump(du_s_R, test_vel_s_R) * dG_solid
+        + tau_cip_d * grad_inner_jump(ddisp_s_R, test_disp_s_R) * dG_solid
+    )
+    r_cip = (
+        tau_cip_f * grad_inner_jump(uf_k_R, test_vel_f_R) * dG_fluid
+        + tau_cip_s * grad_inner_jump(us_k_R, test_vel_s_R) * dG_solid
+        + tau_cip_d * grad_inner_jump(disp_k_R, test_disp_s_R) * dG_solid
+    )
 
 a_reg = solid_reg_eps * (dot(du_s_R, test_vel_s_R) + dot(ddisp_s_R, test_disp_s_R)) * dx_solid
 r_reg = solid_reg_eps * (dot(us_k_R, test_vel_s_R) + dot(disp_k_R, test_disp_s_R)) * dx_solid
 
-jacobian_form = a_vol_f + J_int + a_vol_s + a_stab + a_svc + a_reg
-residual_form = r_vol_f + R_int + r_vol_s + r_stab + r_svc + r_reg
+j_inv_theta_f = Constant(1.0) / (theta_pos_cell + Constant(1.0e-12))
+j_inv_theta_s = Constant(1.0) / (theta_neg_cell + Constant(1.0e-12))
+a_sliver_mass = (
+    gamma_sliver_mass_f * (rho_f_const / dt) * j_inv_theta_f * dot(du_f_R, test_vel_f_R) * dx_fluid_cut
+    + gamma_sliver_mass_s * (rho_s_const / dt) * j_inv_theta_s * dot(du_s_R, test_vel_s_R) * dx_solid_cut
+)
+r_sliver_mass = (
+    gamma_sliver_mass_f * (rho_f_const / dt) * j_inv_theta_f * dot(uf_k_R, test_vel_f_R) * dx_fluid_cut
+    + gamma_sliver_mass_s * (rho_s_const / dt) * j_inv_theta_s * dot(us_k_R, test_vel_s_R) * dx_solid_cut
+)
+
+jacobian_form = a_vol_f + J_int + a_vol_s + a_stab + a_p_stab + a_cip + a_svc + a_reg + a_sliver_mass
+residual_form = r_vol_f + R_int + r_vol_s + r_stab + r_p_stab + r_cip + r_svc + r_reg + r_sliver_mass
 
 # -----------------------------------------------------------------------------
 # Interface residual diagnostics (optional)
@@ -4345,6 +5305,229 @@ def _trace_interface_residuals(label: str = "ifc") -> None:
 # Optional: trace interface residual contributions at the initial state.
 _trace_interface_residuals("ifc_init")
 
+# -----------------------------------------------------------------------------
+# Peclet number diagnostics (optional)
+# -----------------------------------------------------------------------------
+_PECLET_FORM_CACHE: dict[tuple[str, int, bool], dict[str, object]] = {}
+
+
+def _peclet_diagnostics(
+    label: str = "pe",
+    *,
+    step: int | None = None,
+    t: float | None = None,
+    dt: float | None = None,
+    backend: str | None = None,
+) -> None:
+    if os.getenv("PYCUTFEM_PECLET_TRACE", "").lower() not in {"1", "true", "yes"}:
+        return
+    mode = os.getenv("PYCUTFEM_PECLET_MODE", "nodal").strip().lower()
+    backend = (backend or os.getenv("PYCUTFEM_PECLET_BACKEND", "")).strip() or assembly_backend
+    try:
+        p = int(os.getenv("PYCUTFEM_PECLET_P", "8") or "8")
+    except Exception:
+        p = 8
+    p = int(max(2, min(p, 24)))
+    try:
+        eps = float(os.getenv("PYCUTFEM_PECLET_EPS", "1e-12") or "1e-12")
+    except Exception:
+        eps = 1.0e-12
+    eps = float(max(eps, 1.0e-30))
+    lagged = os.getenv("PYCUTFEM_PECLET_LAGGED", "0").lower() in {"1", "true", "yes"}
+
+    if mode not in {"integral", "assemble", "ufl"}:
+        cache = getattr(_peclet_diagnostics, "_nodal_cache", None)
+        if cache is None:
+            try:
+                ux_gdofs = np.asarray(dof_handler.get_field_slice("u_pos_x"), dtype=int)
+                uy_gdofs = np.asarray(dof_handler.get_field_slice("u_pos_y"), dtype=int)
+                ux_nodes = np.array([dof_handler._dof_to_node_map[int(gd)][1] for gd in ux_gdofs], dtype=int)
+                uy_nodes = np.array([dof_handler._dof_to_node_map[int(gd)][1] for gd in uy_gdofs], dtype=int)
+            except Exception:
+                ux_gdofs = np.empty(0, dtype=int)
+                uy_gdofs = np.empty(0, dtype=int)
+                ux_nodes = np.empty(0, dtype=int)
+                uy_nodes = np.empty(0, dtype=int)
+            cache = {
+                "ux_gdofs": ux_gdofs,
+                "uy_gdofs": uy_gdofs,
+                "ux_nodes": ux_nodes,
+                "uy_nodes": uy_nodes,
+            }
+            setattr(_peclet_diagnostics, "_nodal_cache", cache)
+
+        try:
+            h_diag = float(os.getenv("PYCUTFEM_PECLET_H", str(MESH_SIZE)) or str(MESH_SIZE))
+        except Exception:
+            h_diag = float(MESH_SIZE)
+        pe_scale = float(RHO_F) * float(h_diag) / (2.0 * float(MU_F) + 1.0e-30)
+
+        u_ref_vals = np.asarray((uf_n if lagged else uf_k).nodal_values, dtype=float)
+        n_ux = int(np.asarray(cache["ux_gdofs"], dtype=int).size)
+        n_uy = int(np.asarray(cache["uy_gdofs"], dtype=int).size)
+        ux_vals = u_ref_vals[:n_ux] if n_ux else np.empty(0, dtype=float)
+        uy_vals = u_ref_vals[n_ux : n_ux + n_uy] if n_uy else np.empty(0, dtype=float)
+
+        n_nodes = int(getattr(mesh.nodes_x_y_pos, "shape", (0,))[0])
+        ux_node = np.zeros(n_nodes, dtype=float)
+        uy_node = np.zeros(n_nodes, dtype=float)
+        sol = globals().get("solver", None)
+        active_full = np.asarray(getattr(sol, "active_dofs", np.empty(0, dtype=int)), dtype=int) if sol is not None else np.empty(0, dtype=int)
+        if n_ux:
+            ux_nodes = np.asarray(cache["ux_nodes"], dtype=int)
+            ux_gdofs = np.asarray(cache["ux_gdofs"], dtype=int)
+            if active_full.size:
+                ux_mask = np.isin(ux_gdofs, active_full, assume_unique=False)
+                ux_node[ux_nodes[ux_mask]] = ux_vals[ux_mask]
+            else:
+                ux_node[ux_nodes] = ux_vals
+        if n_uy:
+            uy_nodes = np.asarray(cache["uy_nodes"], dtype=int)
+            uy_gdofs = np.asarray(cache["uy_gdofs"], dtype=int)
+            if active_full.size:
+                uy_mask = np.isin(uy_gdofs, active_full, assume_unique=False)
+                uy_node[uy_nodes[uy_mask]] = uy_vals[uy_mask]
+            else:
+                uy_node[uy_nodes] = uy_vals
+
+        u_mag = np.sqrt(ux_node * ux_node + uy_node * uy_node + float(eps))
+        pe_nodes = pe_scale * u_mag
+
+        cut_eids = np.nonzero(mesh.element_bitset("cut").mask)[0]
+        cut_nodes_mask = np.zeros(n_nodes, dtype=bool)
+        if cut_eids.size:
+            cut_nodes_mask[np.asarray(mesh.elements_connectivity[cut_eids].ravel(), dtype=int)] = True
+        try:
+            phi = np.asarray(ls_beam.nodal_values(), dtype=float)
+        except Exception:
+            phi = np.asarray(getattr(ls_beam, "nodal_values", np.zeros(n_nodes, dtype=float)), dtype=float)
+        if int(phi.size) != int(n_nodes):
+            phi = np.resize(phi, n_nodes)
+        fluid_nodes_mask = phi >= 0.0
+        cut_nodes_mask = cut_nodes_mask & fluid_nodes_mask
+
+        def _stats(mask: np.ndarray) -> tuple[float, float]:
+            vals = np.asarray(pe_nodes[mask], dtype=float)
+            if vals.size == 0:
+                return float("nan"), float("nan")
+            mean = float(np.mean(vals))
+            pnorm = float(np.mean(vals**p) ** (1.0 / p))
+            return mean, pnorm
+
+        pe_mean_all, pe_pnorm_all = _stats(fluid_nodes_mask)
+        pe_mean_cut, pe_pnorm_cut = _stats(cut_nodes_mask)
+        u_max_all = float(np.max(u_mag[fluid_nodes_mask])) if np.any(fluid_nodes_mask) else float("nan")
+        u_max_cut = float(np.max(u_mag[cut_nodes_mask])) if np.any(cut_nodes_mask) else float("nan")
+        pe_max_all = float(np.max(pe_nodes[fluid_nodes_mask])) if np.any(fluid_nodes_mask) else float("nan")
+        pe_max_cut = float(np.max(pe_nodes[cut_nodes_mask])) if np.any(cut_nodes_mask) else float("nan")
+        loc_trace = os.getenv("PYCUTFEM_PECLET_TRACE_LOC", "").lower() in {"1", "true", "yes"}
+        loc_msg = ""
+        if loc_trace and np.any(fluid_nodes_mask):
+            idxs = np.nonzero(fluid_nodes_mask)[0]
+            i_max = int(idxs[int(np.argmax(u_mag[idxs]))])
+            try:
+                x_max, y_max = map(float, mesh.nodes_x_y_pos[i_max])
+            except Exception:
+                x_max, y_max = float("nan"), float("nan")
+            phi_max = float(phi[i_max]) if int(phi.size) > i_max else float("nan")
+            in_cut = bool(cut_nodes_mask[i_max]) if int(cut_nodes_mask.size) > i_max else False
+            loc_msg = f" max@node={i_max} (x={x_max:.3f},y={y_max:.3f},phi={phi_max:.2e},cut={int(in_cut)})"
+
+        step_s = f"{int(step):04d}" if step is not None else "????"
+        t_s = f"{float(t):.6f}" if t is not None else "nan"
+        dt_s = f"{float(dt):.3e}" if dt is not None else "nan"
+        print(
+            f"[{label}] step={step_s} t={t_s} dt={dt_s} "
+            f"Pe(mean={pe_mean_all:.3e}, p{p}={pe_pnorm_all:.3e}) "
+            f"Pe_cut(mean={pe_mean_cut:.3e}, p{p}={pe_pnorm_cut:.3e}) "
+            f"|u|max={u_max_all:.3e} Pe_max≈{pe_max_all:.3e} "
+            f"|u|max_cut={u_max_cut:.3e} Pe_cut_max≈{pe_max_cut:.3e} "
+            f"(mode={mode}){loc_msg}"
+        )
+        return
+
+    cache_key = (str(backend), int(p), bool(lagged))
+    cache = _PECLET_FORM_CACHE.get(cache_key)
+    if cache is None:
+        eps0 = Constant(float(eps))
+        # IMPORTANT: use distinct Constant objects per integral so the
+        # `assembler_hooks` lookup (by integrand equality) can distinguish
+        # integrals that share the same algebraic integrand but live on
+        # different measures (dx_fluid vs dx_fluid_cut).
+        one_area_all = Constant(1.0)
+        one_area_cut = Constant(1.0)
+        one_pe_all = Constant(1.0)
+        one_pe_cut = Constant(1.0)
+        one_pe_p_all = Constant(1.0)
+        one_pe_p_cut = Constant(1.0)
+        two = Constant(2.0)
+        tiny = Constant(1.0e-30)
+        u_ref = uf_n_R if lagged else uf_k_R
+        u_mag = (dot(u_ref, u_ref) + eps0) ** 0.5
+        pe = (rho_f_const * u_mag * cell_h) / (two * mu_f_const + tiny)
+
+        area_all = one_area_all * dx_fluid
+        area_cut = one_area_cut * dx_fluid_cut
+        pe_all = (one_pe_all * pe) * dx_fluid
+        pe_cut = (one_pe_cut * pe) * dx_fluid_cut
+        pe_p_all = (one_pe_p_all * (pe**int(p))) * dx_fluid
+        pe_p_cut = (one_pe_p_cut * (pe**int(p))) * dx_fluid_cut
+
+        hooks = {
+            area_all.integrand: {"name": "area_all"},
+            area_cut.integrand: {"name": "area_cut"},
+            pe_all.integrand: {"name": "pe_int_all"},
+            pe_cut.integrand: {"name": "pe_int_cut"},
+            pe_p_all.integrand: {"name": "pe_p_int_all"},
+            pe_p_cut.integrand: {"name": "pe_p_int_cut"},
+        }
+        equation = Equation(None, area_all + area_cut + pe_all + pe_cut + pe_p_all + pe_p_cut)
+        cache = {"equation": equation, "hooks": hooks, "eps": eps0}
+        _PECLET_FORM_CACHE[cache_key] = cache
+    else:
+        eps0 = cache.get("eps")
+        if hasattr(eps0, "value"):
+            eps0.value = float(eps)
+
+    res = assemble_form(
+        cache["equation"],
+        dof_handler=dof_handler,
+        bcs=[],
+        backend=backend,
+        assembler_hooks=cache["hooks"],
+    )
+
+    def _scalar(name: str) -> float:
+        try:
+            return float(np.asarray(res.get(name, 0.0)).reshape(-1)[0])
+        except Exception:
+            try:
+                return float(res.get(name, 0.0))
+            except Exception:
+                return 0.0
+
+    A_all = max(_scalar("area_all"), 0.0)
+    A_cut = max(_scalar("area_cut"), 0.0)
+    pe_int_all = _scalar("pe_int_all")
+    pe_int_cut = _scalar("pe_int_cut")
+    pe_p_int_all = max(_scalar("pe_p_int_all"), 0.0)
+    pe_p_int_cut = max(_scalar("pe_p_int_cut"), 0.0)
+
+    pe_mean_all = pe_int_all / A_all if A_all > 0.0 else float("nan")
+    pe_mean_cut = pe_int_cut / A_cut if A_cut > 0.0 else float("nan")
+    pe_pnorm_all = (pe_p_int_all / A_all) ** (1.0 / p) if A_all > 0.0 else float("nan")
+    pe_pnorm_cut = (pe_p_int_cut / A_cut) ** (1.0 / p) if A_cut > 0.0 else float("nan")
+
+    step_s = f"{int(step)}" if step is not None else "?"
+    t_s = f"{float(t):.6f}" if t is not None else "?"
+    dt_s = f"{float(dt):.3e}" if dt is not None else "?"
+    print(
+        f"[{label}] step={step_s} t={t_s} dt={dt_s} "
+        f"Pe(mean={pe_mean_all:.3e}, p{p}={pe_pnorm_all:.3e}) "
+        f"Pe_cut(mean={pe_mean_cut:.3e}, p{p}={pe_pnorm_cut:.3e}) "
+        f"(backend={backend}, lagged={int(lagged)})"
+    )
+
 # ----------------------------------------------------------------------------- 
 # Diagnostics: tip displacement, drag/lift (avg traction), pressure drop, VTK
 # -----------------------------------------------------------------------------
@@ -4365,6 +5548,186 @@ SAVE_VTK = bool(ARGS.save_vtk)
 PLOT_MESH_EVERY = max(1, int(ARGS.plot_mesh_every))
 VTK_INTERFACE_CLAMP = float(os.getenv("VTK_INTERFACE_CLAMP", "0.0"))
 VTK_CLAMP_BAND = max(1.5 * MESH_SIZE, 5.0 * LEVELSET_EDGE_TOL)
+
+# -----------------------------------------------------------------------------
+# Debug: dump level-set DOF coordinates + nodal values per step
+# -----------------------------------------------------------------------------
+DUMP_LEVELSET = os.getenv("PYCUTFEM_DUMP_LEVELSET", "").lower() in {"1", "true", "yes"}
+DUMP_LEVELSET_EVERY = max(1, int(os.getenv("PYCUTFEM_DUMP_LEVELSET_EVERY", "1") or "1"))
+LEVELSET_DUMP_DIR = (
+    os.getenv("PYCUTFEM_LEVELSET_DUMP_DIR", "").strip()
+    or os.getenv("PYCUTFEM_DUMP_LEVELSET_DIR", "").strip()
+    or os.path.join(output_dir, "levelset_dumps")
+)
+LEVELSET_DUMP_MESH_FILE = os.path.join(LEVELSET_DUMP_DIR, "mesh.npz")
+
+# Optional: dump full solution vectors for offline Newton replay/debugging.
+# Use sparingly: these are large (~O(10^5–10^6) DOFs).
+DUMP_STATE = os.getenv("PYCUTFEM_DUMP_STATE", "").lower() in {"1", "true", "yes"}
+try:
+    DUMP_STATE_EVERY = int(os.getenv("PYCUTFEM_DUMP_STATE_EVERY", "0") or "0")
+except Exception:
+    DUMP_STATE_EVERY = 0
+STATE_DUMP_DIR = os.getenv("PYCUTFEM_STATE_DUMP_DIR", "").strip() or os.path.join(output_dir, "state_dumps")
+
+
+def _dump_levelset_mesh_once() -> None:
+    if not DUMP_LEVELSET:
+        return
+    os.makedirs(LEVELSET_DUMP_DIR, exist_ok=True)
+    if os.path.exists(LEVELSET_DUMP_MESH_FILE):
+        return
+    try:
+        phi_coords = np.asarray(ls_dh.get_dof_coords("phi_beam"), dtype=float)
+    except Exception:
+        phi_coords = np.empty((0, 2), dtype=float)
+    np.savez_compressed(
+        LEVELSET_DUMP_MESH_FILE,
+        element_type=str(getattr(mesh, "element_type", "")),
+        poly_order=int(getattr(mesh, "poly_order", 1)),
+        nodes=np.asarray(mesh.nodes_x_y_pos, dtype=float),
+        elements=np.asarray(mesh.elements_connectivity, dtype=np.int64),
+        edges=np.asarray(mesh.edges_connectivity, dtype=np.int64),
+        corners=np.asarray(mesh.corner_connectivity, dtype=np.int64),
+        phi_field="phi_beam",
+        phi_poly_order=int(POLY_ORDER),
+        phi_dof_coords=phi_coords,
+    )
+    print(f"[dump] wrote {LEVELSET_DUMP_MESH_FILE}")
+
+
+def _dump_levelset_step(step_no: int, t_curr: float, *, tag: str = "step") -> None:
+    if not DUMP_LEVELSET:
+        return
+    if (int(step_no) % int(DUMP_LEVELSET_EVERY)) != 0:
+        return
+    _dump_levelset_mesh_once()
+    os.makedirs(LEVELSET_DUMP_DIR, exist_ok=True)
+    try:
+        phi = np.asarray(ls_beam.nodal_values(), dtype=float).copy()
+    except Exception:
+        phi = np.asarray(ls_beam.nodal_values, dtype=float).copy()
+    stats = getattr(ls_beam, "_last_update_stats", None)
+    payload = {
+        "step": int(step_no),
+        "t": float(t_curr),
+        "dt": float(getattr(dt, "value", DT)),
+        "phi": phi,
+        "cut_elems": int(mesh.element_bitset("cut").cardinality()),
+        "interface_edges": int(mesh.edge_bitset("interface").cardinality()),
+    }
+    if isinstance(stats, dict):
+        for k in ("max_diff", "max_diff_cut", "cut_elems", "interface_edges"):
+            if k in stats:
+                payload[f"ls_{k}"] = float(stats[k]) if "diff" in k else int(stats[k])
+    fname = os.path.join(LEVELSET_DUMP_DIR, f"phi_{tag}_{int(step_no):04d}.npz")
+    np.savez_compressed(fname, **payload)
+    print(f"[dump] wrote {fname}")
+
+
+def _dump_state_step(
+    step_no: int,
+    t_curr: float,
+    *,
+    tag: str,
+    funcs: list | None = None,
+    prev_funcs: list | None = None,
+) -> None:
+    if not DUMP_STATE:
+        return
+    if tag == "step" and int(DUMP_STATE_EVERY) > 0 and (int(step_no) % int(DUMP_STATE_EVERY)) != 0:
+        return
+    os.makedirs(STATE_DUMP_DIR, exist_ok=True)
+    payload: dict[str, object] = {
+        "step": int(step_no),
+        "t": float(t_curr),
+        "dt": float(getattr(dt, "value", DT)),
+        "mesh_n_nodes": int(getattr(mesh.nodes_x_y_pos, "shape", (0,))[0]),
+        "mesh_n_elements": int(getattr(mesh, "n_elements", len(getattr(mesh, "elements_list", [])))),
+        "mesh_n_edges": int(len(getattr(mesh, "edges_list", []))),
+        "mesh_element_type": str(getattr(mesh, "element_type", "")),
+        "mesh_poly_order": int(getattr(mesh, "poly_order", 1)),
+        "dof_total": int(getattr(dof_handler, "total_dofs", -1)),
+        "phi_field": str(getattr(ls_beam, "field", "")),
+    }
+    # Make state dumps restartable without requiring a separate level-set dump:
+    # persist the current φ nodal values + basic tag counts alongside U^n/U^{n-1}.
+    try:
+        phi_vals = np.asarray(ls_beam.nodal_values(), dtype=float).copy()
+    except Exception:
+        phi_vals = np.asarray(getattr(ls_beam, "nodal_values", np.array([])), dtype=float).copy()
+    payload["phi"] = phi_vals
+    try:
+        payload["cut_elems"] = int(mesh.element_bitset("cut").cardinality())
+        payload["interface_edges"] = int(mesh.edge_bitset("interface").cardinality())
+    except Exception:
+        payload["cut_elems"] = -1
+        payload["interface_edges"] = -1
+    if funcs is not None:
+        for f in funcs:
+            name = getattr(f, "name", None)
+            if not name:
+                continue
+            payload[f"{name}_k"] = np.asarray(getattr(f, "nodal_values", np.array([])), dtype=float).copy()
+    if prev_funcs is not None:
+        for f in prev_funcs:
+            name = getattr(f, "name", None)
+            if not name:
+                continue
+            payload[f"{name}_n"] = np.asarray(getattr(f, "nodal_values", np.array([])), dtype=float).copy()
+    fname = os.path.join(STATE_DUMP_DIR, f"state_{tag}_{int(step_no):04d}.npz")
+    np.savez_compressed(fname, **payload)
+    print(f"[dump] wrote {fname}")
+
+
+def _load_npz_dict(path: Path) -> dict[str, np.ndarray]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    with np.load(str(path)) as data:
+        return {k: data[k] for k in data.files}
+
+
+def _load_restart_payload(*, restart_dir: Path, step_no: int, tag: str) -> dict[str, object]:
+    restart_dir = Path(restart_dir)
+    if not restart_dir.exists():
+        raise FileNotFoundError(str(restart_dir))
+    ls_dir_raw = os.getenv("RESTART_LEVELSET_DIR", "").strip()
+    st_dir_raw = os.getenv("RESTART_STATE_DIR", "").strip()
+    levelset_dir = Path(ls_dir_raw) if ls_dir_raw else restart_dir / "levelset_dumps"
+    state_dir = Path(st_dir_raw) if st_dir_raw else restart_dir / "state_dumps"
+
+    phi_path = levelset_dir / f"phi_{str(tag)}_{int(step_no):04d}.npz"
+    state_path = state_dir / f"state_{str(tag)}_{int(step_no):04d}.npz"
+
+    state_npz = _load_npz_dict(state_path)
+    phi_npz: dict[str, np.ndarray] = {}
+    try:
+        phi_npz = _load_npz_dict(phi_path)
+    except FileNotFoundError:
+        phi_npz = {}
+
+    t_val = float(state_npz.get("t", phi_npz.get("t", 0.0)))
+    dt_val = float(state_npz.get("dt", phi_npz.get("dt", DT)))
+    step_val = int(state_npz.get("step", phi_npz.get("step", step_no)))
+    phi_arr = phi_npz.get("phi", state_npz.get("phi", np.array([])))
+    phi_arr = np.asarray(phi_arr, dtype=float)
+    if phi_arr.size == 0:
+        raise FileNotFoundError(str(phi_path))
+
+    out: dict[str, object] = {
+        "restart_dir": str(restart_dir),
+        "levelset_dir": str(levelset_dir),
+        "state_dir": str(state_dir),
+        "phi_path": str(phi_path),
+        "state_path": str(state_path),
+        "step": step_val,
+        "t": t_val,
+        "dt": dt_val,
+        "phi": phi_arr,
+        "state": state_npz,
+    }
+    return out
 
 
 def _is_fluid_point(point: tuple[float, float]) -> bool:
@@ -4594,7 +5957,7 @@ def _compute_observables(step_idx: int, t_curr: float) -> None:
     dGamma_obs = dInterface(
         defined_on=domains["cut_interface"],
         level_set=ls_beam,
-        metadata={"q": qvol + 2, "derivs": {(0, 0), (1, 0), (0, 1)}},
+        metadata={"q": qvol + 2, "derivs": {(0, 0), (1, 0), (0, 1)}, "linear_interface": USE_LINEAR_INTERFACE},
     )
     ex = Constant(np.array([1.0, 0.0]), dim=1)
     ey = Constant(np.array([0.0, 1.0]), dim=1)
@@ -4738,6 +6101,7 @@ if ARGS.run_fd_check:
                 "solid_vol": (a_vol_s, r_vol_s),
                 "solid_vel_constraint": (a_svc, r_svc),
                 "interface": (J_int, R_int),
+                "cip": (a_cip, r_cip),
                 "stab_fluid_vel": (
                     (Constant(2.0) * mu_f_const * g_v_f(gamma_v_f, du_f_R, test_vel_f_R)) * dG_fluid,
                     (Constant(2.0) * mu_f_const * g_v_f(gamma_v_f, uf_k_R, test_vel_f_R)) * dG_fluid,
@@ -4746,6 +6110,7 @@ if ARGS.run_fd_check:
                     g_p(gamma_p_f, dp_f_R, test_q_f_R) * dG_fluid,
                     g_p(gamma_p_f, pf_k_R, test_q_f_R) * dG_fluid,
                 ),
+                "pressure_stab": (a_p_stab, r_p_stab),
                 "stab_solid_vel": (
                     (rho_s_const * g_v_s(gamma_v_s, du_s_R, test_vel_s_R)) * dG_solid,
                     (rho_s_const * g_v_s(gamma_v_s, us_k_R, test_vel_s_R)) * dG_solid,
@@ -4762,6 +6127,8 @@ if ARGS.run_fd_check:
                 "solid_vel_constraint": (a_svc, r_svc),
                 "interface": (J_int, R_int),
                 "stab": (a_stab, r_stab),
+                "pressure_stab": (a_p_stab, r_p_stab),
+                "cip": (a_cip, r_cip),
                 "reg": (a_reg, r_reg),
             }
         if split_interface:
@@ -4806,6 +6173,9 @@ if ARGS.run_fd_check:
 # -----------------------------------------------------------------------------
 if ARGS.run_time_stepping:
     max_steps = int(os.getenv("MAX_STEPS", "50"))
+    dt_adapt_on_success = _env_bool("DT_ADAPT_ON_SUCCESS", False)
+    dt_increase_factor = float(os.getenv("DT_INCREASE_FACTOR", "1.1")) if dt_adapt_on_success else 1.0
+    dt_decrease_factor_slow = float(os.getenv("DT_DECREASE_FACTOR_SLOW", "0.9")) if dt_adapt_on_success else 1.0
 
     def _on_dt_change(new_dt: float) -> None:
         try:
@@ -4813,30 +6183,272 @@ if ARGS.run_time_stepping:
         except Exception:
             pass
 
+    # -------------------------------------------------------------------------
+    # Optional restart: load level set + solution snapshots from a prior run.
+    # -------------------------------------------------------------------------
+    restart_payload = None
+    restart_t0 = 0.0
+    restart_step0 = 0
+    restart_step_idx0 = 0
+    dt0 = float(DT)
+
+    restart_dir = getattr(ARGS, "restart_dir", None)
+    restart_step = int(getattr(ARGS, "restart_step", -1))
+    restart_tag = str(getattr(ARGS, "restart_tag", "step"))
+    restart_reset = bool(getattr(ARGS, "restart_reset_counters", False))
+
+    if restart_dir is not None and restart_step >= 0:
+        restart_payload = _load_restart_payload(restart_dir=Path(restart_dir), step_no=restart_step, tag=restart_tag)
+        dt0 = float(restart_payload.get("dt", DT))
+        restart_t0 = float(restart_payload.get("t", 0.0))
+        loaded_step = int(restart_payload.get("step", restart_step))
+
+        try:
+            dt.value = float(dt0)
+        except Exception:
+            pass
+
+        phi_arr = np.asarray(restart_payload.get("phi", np.array([])), dtype=float)
+        if phi_arr.size:
+            ls_beam.set_from_array(phi_arr)
+            ls_beam.commit(tol=LEVELSET_EDGE_TOL)
+
+            refresh_domains(mesh, domains)
+            refresh_hansbo_kappa(
+                mesh,
+                ls_beam,
+                theta_pos_vals,
+                theta_neg_vals,
+                theta_pos_raw_vals=theta_pos_raw_vals,
+                theta_neg_raw_vals=theta_neg_raw_vals,
+                theta_min=theta_min,
+            )
+            refresh_sliver_weights(
+                mesh,
+                theta_pos_vals,
+                theta_neg_vals,
+                w_pos_vals,
+                w_neg_vals,
+                theta0=SLIVER_THETA0,
+                p=SLIVER_P,
+                wmax=SLIVER_WMAX,
+                thetamin=SLIVER_THETAMIN,
+                smooth=SLIVER_SMOOTH,
+            )
+            log_sliver_stats(mesh, theta_pos_vals, theta_neg_vals, w_pos_vals, w_neg_vals, theta0=SLIVER_THETA0)
+            retag_inactive(dof_handler, theta_neg=theta_neg_raw_vals, solid_cut_drop=SOLID_CUT_DROP)
+
+        state_npz = restart_payload.get("state", {})
+
+        def _restore_function(f, arr, *, label: str) -> None:
+            vec = np.asarray(arr, dtype=float).ravel()
+            target = getattr(f, "nodal_values", np.array([]))
+            if target.shape == vec.shape:
+                f.nodal_values[:] = vec
+                return
+
+            # Backward/forward compatible restart for pressure when switching between
+            # equal-order (Q2) and Taylor–Hood (Q1) pressure. We map between:
+            # - Q1 pressure vector: values on unique corner nodes (len == n_vertices)
+            # - Q2 pressure vector: values on all mesh nodes (len == n_nodes)
+            if getattr(f, "field_name", "") == "p_pos_":
+                try:
+                    n_nodes = int(np.asarray(mesh.nodes_x_y_pos).shape[0])
+                except Exception:
+                    n_nodes = int(vec.size)
+                corner_conn = getattr(mesh, "corner_connectivity", None)
+                if corner_conn is not None:
+                    vertex_ids = np.unique(np.asarray(corner_conn, dtype=int).ravel())
+                    n_vertices = int(vertex_ids.size)
+                    if int(vec.size) == n_vertices and int(target.size) == n_nodes:
+                        full = np.full((n_nodes,), np.nan, dtype=float)
+                        full[vertex_ids] = vec.astype(float, copy=False)
+
+                        # Mid-edge nodes (when present): average endpoints
+                        edges_conn = getattr(mesh, "edges_connectivity", None)
+                        if edges_conn is not None:
+                            for nodes in np.asarray(edges_conn, dtype=int):
+                                if nodes.size < 3:
+                                    continue
+                                a = int(nodes[0])
+                                b = int(nodes[-1])
+                                va = full[a]
+                                vb = full[b]
+                                if not (np.isfinite(va) and np.isfinite(vb)):
+                                    continue
+                                mids = nodes[1:-1]
+                                if mids.size:
+                                    full[mids] = 0.5 * (va + vb)
+
+                        # Remaining nodes (e.g. element centers): average of element corners
+                        try:
+                            elems = np.asarray(mesh.elements_connectivity, dtype=int)
+                            corners = np.asarray(mesh.corner_connectivity, dtype=int)
+                            for eid in range(int(elems.shape[0])):
+                                cn = corners[eid]
+                                if cn.size == 0:
+                                    continue
+                                val = float(np.nanmean(full[cn]))
+                                if not np.isfinite(val):
+                                    continue
+                                for nid in elems[eid]:
+                                    nid = int(nid)
+                                    if 0 <= nid < n_nodes and not np.isfinite(full[nid]):
+                                        full[nid] = val
+                        except Exception:
+                            pass
+
+                        full = np.nan_to_num(full, nan=0.0)
+                        f.nodal_values[:] = full
+                        print(f"[restart] mapped {label} from Q1({n_vertices}) → Q2({n_nodes}) pressure.")
+                        return
+                    if int(vec.size) == n_nodes and int(target.size) == n_vertices:
+                        f.nodal_values[:] = np.asarray(vec, dtype=float)[vertex_ids]
+                        print(f"[restart] mapped {label} from Q2({n_nodes}) → Q1({n_vertices}) pressure.")
+                        return
+
+            raise ValueError(
+                f"Restart mismatch for {label}: got {vec.shape}, expected {target.shape}."
+            )
+
+        # Load current iterate and previous snapshot when available.
+        field_pairs = [(uf_k, uf_n), (pf_k, pf_n), (us_k, us_n), (disp_k, disp_n)]
+        loaded_prev: set[str] = set()
+        for f_cur, f_prev in field_pairs:
+            name_k = getattr(f_cur, "name", "") or ""
+            name_n = getattr(f_prev, "name", "") or ""
+            key_k = f"{name_k}_k" if name_k else ""
+            key_n = f"{name_n}_n" if name_n else ""
+            if key_k and key_k in state_npz:
+                _restore_function(f_cur, state_npz[key_k], label=key_k)
+            if key_n and key_n in state_npz:
+                _restore_function(f_prev, state_npz[key_n], label=key_n)
+                loaded_prev.add(name_n)
+
+        # If prev snapshots are missing (common for accepted-step dumps), mirror the current state.
+        for f_cur, f_prev in field_pairs:
+            name_n = getattr(f_prev, "name", "") or ""
+            if name_n and name_n not in loaded_prev:
+                f_prev.nodal_values[:] = f_cur.nodal_values[:]
+
+        bcs_restart = NewtonSolver._freeze_bcs(bcs, float(restart_t0))
+        dof_handler.apply_bcs(bcs_restart, uf_k, pf_k, us_k, disp_k)
+        dof_handler.apply_bcs(bcs_restart, uf_n, pf_n, us_n, disp_n)
+        if os.getenv("PYCUTFEM_ZERO_INACTIVE_SIDES", "0").lower() in {"1", "true", "yes"}:
+            _zero_inactive_side_values(
+                ls_beam=ls_beam,
+                dof_handler=dof_handler,
+                mesh=mesh,
+                uf=[uf_k, uf_n],
+                pf=[pf_k, pf_n],
+                us=[us_k, us_n],
+                disp=[disp_k, disp_n],
+                tol=LEVELSET_EDGE_TOL,
+            )
+        if os.getenv("PYCUTFEM_REEXTEND_WRONG_SIDE", "0").lower() in {"1", "true", "yes"}:
+            stats = _reextend_wrong_side_by_nearest(
+                mesh=mesh,
+                dof_handler=dof_handler,
+                ls_beam=ls_beam,
+                uf=[uf_k, uf_n],
+                pf=[pf_k, pf_n],
+                us=[us_k, us_n],
+                disp=[disp_k, disp_n],
+                tol=LEVELSET_EDGE_TOL,
+                only_cut_nodes=True,
+                trace=os.getenv("PYCUTFEM_REEXTEND_TRACE", "").lower() in {"1", "true", "yes"},
+            )
+            if any(int(v) for v in stats.values()):
+                print(
+                    "[reextend] wrong-side copied by nearest: "
+                    + ", ".join(f"{k}={int(v)}" for k, v in stats.items() if int(v))
+                )
+                dof_handler.apply_bcs(bcs_restart, uf_k, pf_k, us_k, disp_k, uf_n, pf_n, us_n, disp_n)
+        if os.getenv("PYCUTFEM_STITCH_INTERFACE_VELOCITY", "0").lower() in {"1", "true", "yes"}:
+            try:
+                band = float(
+                    os.getenv("PYCUTFEM_STITCH_INTERFACE_BAND", str(max(0.5 * MESH_SIZE, 2.0 * LEVELSET_EDGE_TOL)))
+                )
+            except Exception:
+                band = float(max(0.5 * MESH_SIZE, 2.0 * LEVELSET_EDGE_TOL))
+            n0 = _stitch_fluid_velocity_to_solid_near_interface(
+                mesh=mesh,
+                dof_handler=dof_handler,
+                ls_beam=ls_beam,
+                uf=[uf_k, uf_n],
+                us=[us_k, us_n],
+                band=band,
+                only_cut_nodes=True,
+            )
+            if n0:
+                print(f"[stitch] copied solid→fluid velocity at {n0} cut-band nodes (band={band:.3e})")
+                dof_handler.apply_bcs(bcs_restart, uf_k, pf_k, us_k, disp_k, uf_n, pf_n, us_n, disp_n)
+
+        # Step offsets:
+        # - tag="step": dumps are 0-based indices of completed steps, so next step is (idx+2).
+        # - tag="fail": dumps are tied to the failing step number (1-based).
+        if restart_tag == "step":
+            completed = int(loaded_step) + 1
+            restart_step0 = 0 if restart_reset else completed
+            restart_step_idx0 = 0 if restart_reset else completed
+        else:
+            fail_step_no = int(loaded_step)
+            completed = max(0, fail_step_no - 1)
+            restart_step0 = 0 if restart_reset else max(0, fail_step_no - 1)
+            restart_step_idx0 = 0 if restart_reset else completed
+
+        if restart_reset:
+            print(
+                f"[restart] reset counters; starting new run at physical t0={restart_t0:.6f} (dt={dt0:.3e})."
+            )
+        else:
+            print(
+                f"[restart] loaded step={loaded_step} tag={restart_tag} → t0={restart_t0:.6f} dt={dt0:.3e} "
+                f"(solver step0={restart_step0}, dump step_idx0={restart_step_idx0})."
+            )
+
+    # If a final time is requested, ensure max_steps is large enough to reach it.
+    final_time_target = getattr(ARGS, "final_time", None)
+    if final_time_target is not None:
+        remaining = max(0.0, float(final_time_target) - float(restart_t0))
+        needed_steps = int(math.ceil(remaining / max(float(dt0), 1.0e-16)))
+        if needed_steps > int(max_steps):
+            print(f"[time] max_steps {max_steps} → {needed_steps} to reach final_time={float(final_time_target):.6f}.")
+            max_steps = int(needed_steps)
+
     time_params = TimeStepperParameters(
-        dt=DT,
+        dt=dt0,
         max_steps=max_steps,
         stop_on_steady=True,
         steady_tol=1e-6,
+        t0=float(restart_t0),
+        step0=int(restart_step0),
+        final_time=float(ARGS.final_time) if getattr(ARGS, "final_time", None) is not None else None,
         theta=theta.value,
         allow_dt_reduction=bool(getattr(ARGS, "allow_dt_reduction", False)),
         dt_reduction_factor=float(getattr(ARGS, "dt_reduction_factor", 0.5)),
         dt_reduction_threshold=float(getattr(ARGS, "dt_reduction_threshold", 5.0)),
         dt_min=float(os.getenv("DT_MIN", "1e-4")),
+        dt_increase_factor=dt_increase_factor,
+        dt_decrease_factor_slow=dt_decrease_factor_slow,
         on_dt_change=_on_dt_change,
     )
-    newton_tol = float(os.getenv("NEWTON_TOL", "1e-6"))
+    newton_tol = float(os.getenv("NEWTON_TOL", "1e-8"))
+    newton_rtol = float(os.getenv("NEWTON_RTOL", "1e-8"))
     max_newton_iter = int(os.getenv("MAX_NEWTON_ITER", "20"))
-    ls_mode = os.getenv("LS_MODE", "dealii")
+    ls_mode = os.getenv("LS_MODE", "armijo")
     ls_max_iter = int(os.getenv("LS_MAX_ITER", "12"))
     newton_params = NewtonParameters(
         newton_tol=newton_tol,
+        newton_rtol=newton_rtol,
         max_newton_iter=max_newton_iter,
         line_search=True,
         ls_mode=ls_mode,
         ls_max_iter=ls_max_iter,
     )
     nonlinear_solver = getattr(ARGS, "nonlinear_solver", "newton")
+    jit_backend_choice = str(getattr(ARGS, "jit_backend", "numba") or "numba").strip().lower()
+    assembly_backend = "cpp" if jit_backend_choice in {"cpp", "c++"} else "jit"
     if nonlinear_solver == "snes":
         solver = PetscSnesNewtonSolver(
             residual_form,
@@ -4846,6 +6458,7 @@ if ARGS.run_time_stepping:
             bcs=bcs,
             bcs_homog=bcs_homog,
             newton_params=newton_params,
+            backend=assembly_backend,
         )
     else:
         solver = NewtonSolver(
@@ -4857,6 +6470,7 @@ if ARGS.run_time_stepping:
             bcs_homog=bcs_homog,
             newton_params=newton_params,
             lin_params=LinearSolverParameters(backend=str(getattr(ARGS, "linear_solver", "scipy"))),
+            backend=assembly_backend,
         )
 
     if os.getenv("PYCUTFEM_ACTIVE_DOFS_TRACE", "").lower() in {"1", "true", "yes"}:
@@ -4873,6 +6487,121 @@ if ARGS.run_time_stepping:
             counts.append(f"{fld}:{n_active}")
         if counts:
             print("[active] DOFs by field: " + ", ".join(counts))
+
+    # Keep unknowns on their physical side: prevent inactive-side DOFs from drifting.
+    zero_inactive_every_newton = os.getenv("PYCUTFEM_ZERO_INACTIVE_SIDES", "0").lower() in {"1", "true", "yes"}
+    if zero_inactive_every_newton:
+        def _post_newton_zero_inactive(funcs_now):
+            try:
+                uf_now, pf_now, us_now, disp_now = funcs_now
+            except Exception:
+                return
+            _zero_inactive_side_values(
+                ls_beam=ls_beam,
+                dof_handler=dof_handler,
+                mesh=mesh,
+                uf=[uf_now],
+                pf=[pf_now],
+                us=[us_now],
+                disp=[disp_now],
+                tol=LEVELSET_EDGE_TOL,
+            )
+
+        solver.post_cb = _post_newton_zero_inactive
+
+    # -------------------------------------------------------------------------
+    # Debug hooks: penalty retry + failure dumps (no adaptive dt ping-pong)
+    # -------------------------------------------------------------------------
+    base_beta_N = float(getattr(beta_N, "value", beta_N))
+    base_gamma_v_f0 = float(getattr(gamma_v_f0, "value", gamma_v_f0))
+    base_gamma_p_f0 = float(getattr(gamma_p_f0, "value", gamma_p_f0))
+    base_gamma_v_s0 = float(getattr(gamma_v_s0, "value", gamma_v_s0))
+    base_gamma_disp_s0 = float(getattr(gamma_disp_s0, "value", gamma_disp_s0))
+    base_gamma_v_f_mass0 = float(getattr(gamma_v_f_mass0, "value", gamma_v_f_mass0))
+    base_gamma_v_s_mass0 = float(getattr(gamma_v_s_mass0, "value", gamma_v_s_mass0))
+    base_gamma_sliver_mass_f0 = float(getattr(gamma_sliver_mass_f0, "value", gamma_sliver_mass_f0))
+    base_gamma_sliver_mass_s0 = float(getattr(gamma_sliver_mass_s0, "value", gamma_sliver_mass_s0))
+    base_gamma_p_stab_jump0 = float(getattr(gamma_p_stab_jump0, "value", gamma_p_stab_jump0))
+    base_gamma_p_stab_avg0 = float(getattr(gamma_p_stab_avg0, "value", gamma_p_stab_avg0))
+
+    def _set_penalty_scale(scale: float) -> None:
+        s = float(scale)
+        beta_N.value = base_beta_N * s
+        gamma_v_f0.value = base_gamma_v_f0 * s
+        gamma_p_f0.value = base_gamma_p_f0 * s
+        gamma_v_s0.value = base_gamma_v_s0 * s
+        gamma_disp_s0.value = base_gamma_disp_s0 * s
+        gamma_v_f_mass0.value = base_gamma_v_f_mass0 * s
+        gamma_v_s_mass0.value = base_gamma_v_s_mass0 * s
+        gamma_sliver_mass_f0.value = base_gamma_sliver_mass_f0 * s
+        gamma_sliver_mass_s0.value = base_gamma_sliver_mass_s0 * s
+        gamma_p_stab_jump0.value = base_gamma_p_stab_jump0 * s
+        gamma_p_stab_avg0.value = base_gamma_p_stab_avg0 * s
+
+    retry_penalties = os.getenv("PYCUTFEM_RETRY_PENALTIES", "").lower() in {"1", "true", "yes"}
+    retry_scales_raw = os.getenv("PYCUTFEM_RETRY_PENALTY_SCALES", "1.0,2.0,5.0,10.0")
+    retry_scales: list[float] = []
+    if retry_penalties:
+        for tok in retry_scales_raw.replace(";", ",").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                retry_scales.append(float(tok))
+            except Exception:
+                pass
+    retry_state = {"step": None, "idx": 0}
+
+    def _on_step_failure(**ctx):
+        step = int(ctx.get("step_no", ctx.get("step", 0)))
+        t_fail = float(ctx.get("t", 0.0))
+        dt_fail = float(ctx.get("dt", DT))
+        exc = ctx.get("exception", None)
+        print(f"[fail] step={step} t={t_fail:.6f} dt={dt_fail:.3e} exc={exc}")
+
+        _peclet_diagnostics(
+            f"pe_fail_step{step:04d}",
+            step=step,
+            t=t_fail,
+            dt=dt_fail,
+        )
+
+        # Dump current level set state (and mesh once) for offline replay.
+        _dump_levelset_step(step, t_fail, tag="fail")
+        _dump_state_step(
+            step,
+            t_fail,
+            tag="fail",
+            funcs=list(ctx.get("functions", []) or []),
+            prev_funcs=list(ctx.get("prev_functions", []) or []),
+        )
+
+        # Optional: term-by-term interface residual traces.
+        _trace_interface_residuals(f"ifc_fail_step{step:04d}")
+
+        if not retry_penalties or not retry_scales:
+            return False
+
+        if retry_state["step"] != step:
+            retry_state["step"] = step
+            retry_state["idx"] = 0
+
+        idx = int(retry_state["idx"])
+        if idx >= len(retry_scales):
+            print("[retry] penalty scales exhausted; not retrying.")
+            return False
+
+        scale = float(retry_scales[idx])
+        retry_state["idx"] = idx + 1
+        _set_penalty_scale(scale)
+        print(
+            "[retry] scaling penalties by {:.3g} and retrying Newton at same dt "
+            "(set PYCUTFEM_ABORT_ON_DT_REDUCTION=1 to stop on dt reduction).".format(scale)
+        )
+        # Keep the last iterate as the initial guess (more informative for debugging).
+        return "retry_keep_guess"
+
+    time_params.on_step_failure = _on_step_failure
 
     # Optional: run FD Jacobian check at a specific time step (1-based).
     # Enable with: FD_STEP=2 (uses existing FD_* env vars for backend/term filters).
@@ -4961,10 +6690,130 @@ if ARGS.run_time_stepping:
 
         solver.pre_cb = _fd_pre_cb
 
-    step_idx = [0]  # mutable so the closure can update
-    dt_val = float(dt.value) if hasattr(dt, "value") else float(DT)
+    # Optional: print Peclet diagnostics once per (global) time step (at Newton it=0).
+    if os.getenv("PYCUTFEM_PECLET_TRACE", "").lower() in {"1", "true", "yes"}:
+        pe_state = {"step": None}
+        prev_pre_cb = getattr(solver, "pre_cb", None)
+
+        def _pe_pre_cb(_funcs):  # noqa: ANN001
+            step_no = int(getattr(solver, "_current_step_no", -1))
+            if pe_state["step"] == step_no:
+                return
+            pe_state["step"] = step_no
+            _peclet_diagnostics(
+                f"pe_step{step_no:04d}",
+                step=step_no,
+                t=float(getattr(solver, "_current_t", 0.0)),
+                dt=float(getattr(solver, "_current_dt", DT)),
+            )
+
+        if prev_pre_cb is None:
+            solver.pre_cb = _pe_pre_cb
+        else:
+            def _combined_pre_cb(funcs):  # noqa: ANN001
+                _pe_pre_cb(funcs)
+                prev_pre_cb(funcs)
+
+            solver.pre_cb = _combined_pre_cb
+
+    # Optional: cheap per-Newton-iteration Peclet estimate (DOF-wise |u|_inf scaling).
+    # This is useful because the step-level Pe diagnostic is evaluated at Newton it=0,
+    # while some failures only appear after Newton updates blow up the velocity field.
+    if os.getenv("PYCUTFEM_PECLET_TRACE_NEWTON", "").lower() in {"1", "true", "yes"}:
+        try:
+            ux_gdofs = np.asarray(dof_handler.get_field_slice("u_pos_x"), dtype=int)
+            uy_gdofs = np.asarray(dof_handler.get_field_slice("u_pos_y"), dtype=int)
+            ux_nodes = np.array([dof_handler._dof_to_node_map[int(gd)][1] for gd in ux_gdofs], dtype=int)
+            uy_nodes = np.array([dof_handler._dof_to_node_map[int(gd)][1] for gd in uy_gdofs], dtype=int)
+        except Exception:
+            ux_gdofs = np.empty(0, dtype=int)
+            uy_gdofs = np.empty(0, dtype=int)
+            ux_nodes = np.empty(0, dtype=int)
+            uy_nodes = np.empty(0, dtype=int)
+
+        try:
+            h_diag = float(os.getenv("PYCUTFEM_PECLET_H", str(MESH_SIZE)) or str(MESH_SIZE))
+        except Exception:
+            h_diag = float(MESH_SIZE)
+        pe_scale = float(RHO_F) * float(h_diag) / (2.0 * float(MU_F) + 1.0e-30)
+
+        pe_newton_state: dict[str, object] = {"step": None, "it": 0, "mask_x": None, "mask_y": None}
+        prev_post_cb = getattr(solver, "post_cb", None)
+
+        def _pe_post_cb(funcs):  # noqa: ANN001
+            if callable(prev_post_cb):
+                prev_post_cb(funcs)
+            try:
+                uf_now = funcs[0]
+            except Exception:
+                return
+            step_no = int(getattr(solver, "_current_step_no", -1))
+            t_now = float(getattr(solver, "_current_t", 0.0))
+            dt_now = float(getattr(solver, "_current_dt", DT))
+            if pe_newton_state["step"] != step_no:
+                pe_newton_state["step"] = step_no
+                pe_newton_state["it"] = 0
+                try:
+                    cut_eids = mesh.element_bitset("cut").to_indices()
+                    if cut_eids.size:
+                        cut_nodes = np.unique(mesh.elements_connectivity[cut_eids].ravel())
+                        node_in_cut = np.zeros(int(mesh.nodes_x_y_pos.shape[0]), dtype=bool)
+                        node_in_cut[cut_nodes.astype(int, copy=False)] = True
+                        pe_newton_state["mask_x"] = node_in_cut[ux_nodes] if ux_nodes.size else None
+                        pe_newton_state["mask_y"] = node_in_cut[uy_nodes] if uy_nodes.size else None
+                    else:
+                        pe_newton_state["mask_x"] = None
+                        pe_newton_state["mask_y"] = None
+                except Exception:
+                    pe_newton_state["mask_x"] = None
+                    pe_newton_state["mask_y"] = None
+
+            pe_newton_state["it"] = int(pe_newton_state.get("it", 0)) + 1
+            it_no = int(pe_newton_state["it"])
+
+            try:
+                v = np.asarray(getattr(uf_now, "nodal_values", np.array([])), dtype=float).ravel()
+            except Exception:
+                return
+            nux = int(ux_gdofs.size)
+            nuy = int(uy_gdofs.size)
+            if nux <= 0 or nuy <= 0 or v.size < (nux + nuy):
+                return
+            ux = v[:nux]
+            uy = v[nux : nux + nuy]
+            u_inf = float(max(np.max(np.abs(ux)), np.max(np.abs(uy))))
+            pe_inf = pe_scale * u_inf
+
+            u_inf_cut = float("nan")
+            try:
+                mx = pe_newton_state.get("mask_x", None)
+                my = pe_newton_state.get("mask_y", None)
+                if mx is not None and my is not None:
+                    mx = np.asarray(mx, dtype=bool)
+                    my = np.asarray(my, dtype=bool)
+                    if mx.size == ux.size and my.size == uy.size and (np.any(mx) or np.any(my)):
+                        ux_inf = float(np.max(np.abs(ux[mx]))) if np.any(mx) else 0.0
+                        uy_inf = float(np.max(np.abs(uy[my]))) if np.any(my) else 0.0
+                        u_inf_cut = float(max(ux_inf, uy_inf))
+            except Exception:
+                u_inf_cut = float("nan")
+
+            pe_cut = pe_scale * float(u_inf_cut) if np.isfinite(u_inf_cut) else float("nan")
+            print(
+                f"[pe_newton] step={step_no} it={it_no} t={t_now:.6f} dt={dt_now:.3e} "
+                f"|u|_inf={u_inf:.3e} Pe_inf≈{pe_inf:.3e} "
+                f"|u|_inf_cut={u_inf_cut:.3e} Pe_cut≈{pe_cut:.3e}"
+            )
+
+        solver.post_cb = _pe_post_cb
+
+    step_idx = [int(restart_step_idx0)]  # mutable so the closure can update
+    t_accum = [float(restart_t0)]
 
     def post_step_cb(funcs):
+        dt_step = float(dt.value) if hasattr(dt, "value") else float(DT)
+        t_curr = float(t_accum[0]) + dt_step
+        old_active = np.asarray(getattr(solver, "active_dofs", []), dtype=int).copy()
         ls_changed = update_beam_levelset_from_displacement(
             ls_beam,
             disp_k,
@@ -4977,7 +6826,15 @@ if ARGS.run_time_stepping:
         )
         if ls_changed:
             refresh_domains(mesh, domains)
-            refresh_hansbo_kappa(mesh, ls_beam, theta_pos_vals, theta_neg_vals)
+            refresh_hansbo_kappa(
+                mesh,
+                ls_beam,
+                theta_pos_vals,
+                theta_neg_vals,
+                theta_pos_raw_vals=theta_pos_raw_vals,
+                theta_neg_raw_vals=theta_neg_raw_vals,
+                theta_min=theta_min,
+            )
             refresh_sliver_weights(
                 mesh,
                 theta_pos_vals,
@@ -5008,12 +6865,106 @@ if ARGS.run_time_stepping:
                         int(ls_stats.get("interface_edges", 0)),
                     )
                 )
-            retag_inactive(dof_handler, theta_neg=theta_neg_vals, solid_cut_drop=SOLID_CUT_DROP)
+            retag_inactive(dof_handler, theta_neg=theta_neg_raw_vals, solid_cut_drop=SOLID_CUT_DROP)
             solver.refresh_levelset_kernels(ls_beam)
-        dof_handler.apply_bcs(bcs, uf_k, pf_k, us_k, disp_k)
+        # Re-apply time-dependent BCs at the *current* physical time (t_curr) so
+        # post-step diagnostics and restart dumps remain consistent.
+        bcs_curr = NewtonSolver._freeze_bcs(bcs, t_curr)
+        dof_handler.apply_bcs(bcs_curr, uf_k, pf_k, us_k, disp_k, uf_n, pf_n, us_n, disp_n)
+        if os.getenv("PYCUTFEM_ZERO_INACTIVE_SIDES", "0").lower() in {"1", "true", "yes"}:
+            _zero_inactive_side_values(
+                ls_beam=ls_beam,
+                dof_handler=dof_handler,
+                mesh=mesh,
+                uf=[uf_k, uf_n],
+                pf=[pf_k, pf_n],
+                us=[us_k, us_n],
+                disp=[disp_k, disp_n],
+                tol=LEVELSET_EDGE_TOL,
+            )
         if ls_changed:
-            recompute_active_dofs(solver, solver.bcs_homog if solver.bcs_homog else solver.bcs)
-        t_curr = step_idx[0] * (float(dt.value) if hasattr(dt, "value") else float(DT))
+            active_changed = recompute_active_dofs(solver, solver.bcs_homog if solver.bcs_homog else solver.bcs)
+            extend_enabled = os.getenv("PYCUTFEM_EXTEND_NEWLY_ACTIVE_DOFS", "1").lower() in {"1", "true", "yes"}
+            if extend_enabled and active_changed:
+                new_active = np.asarray(getattr(solver, "active_dofs", []), dtype=int)
+                newly_active = np.setdiff1d(new_active, old_active, assume_unique=False)
+                if newly_active.size:
+                    extend_newly_active_dofs_nearest(
+                        dh=dof_handler,
+                        newly_active=newly_active,
+                        active_old=old_active,
+                        active_new=new_active,
+                        field_to_current={
+                            "u_pos_x": uf_k,
+                            "u_pos_y": uf_k,
+                            "p_pos_": pf_k,
+                            "vs_neg_x": us_k,
+                            "vs_neg_y": us_k,
+                            "d_neg_x": disp_k,
+                            "d_neg_y": disp_k,
+                        },
+                        field_to_prev={
+                            "u_pos_x": uf_n,
+                            "u_pos_y": uf_n,
+                            "p_pos_": pf_n,
+                            "vs_neg_x": us_n,
+                            "vs_neg_y": us_n,
+                            "d_neg_x": disp_n,
+                            "d_neg_y": disp_n,
+                        },
+                        k=int(os.getenv("PYCUTFEM_EXTEND_NEWLY_ACTIVE_K", "4") or "4"),
+                        trace=os.getenv("PYCUTFEM_EXTEND_NEWLY_ACTIVE_TRACE", "").lower()
+	                        in {"1", "true", "yes"},
+	                    )
+            reextend_enabled = os.getenv("PYCUTFEM_REEXTEND_WRONG_SIDE", "0").lower() in {"1", "true", "yes"}
+            if reextend_enabled:
+                stats = _reextend_wrong_side_by_nearest(
+                    mesh=mesh,
+                    dof_handler=dof_handler,
+                    ls_beam=ls_beam,
+                    uf=[uf_k, uf_n],
+                    pf=[pf_k, pf_n],
+                    us=[us_k, us_n],
+                    disp=[disp_k, disp_n],
+                    tol=LEVELSET_EDGE_TOL,
+                    only_cut_nodes=True,
+                    trace=os.getenv("PYCUTFEM_REEXTEND_TRACE", "").lower() in {"1", "true", "yes"},
+                )
+                if any(int(v) for v in stats.values()):
+                    print(
+                        "[reextend] wrong-side copied by nearest: "
+                        + ", ".join(f"{k}={int(v)}" for k, v in stats.items() if int(v))
+                    )
+                    dof_handler.apply_bcs(bcs_curr, uf_k, pf_k, us_k, disp_k, uf_n, pf_n, us_n, disp_n)
+            stitch_enabled = os.getenv("PYCUTFEM_STITCH_INTERFACE_VELOCITY", "0").lower() in {"1", "true", "yes"}
+            if stitch_enabled:
+                try:
+                    band = float(
+                        os.getenv("PYCUTFEM_STITCH_INTERFACE_BAND", str(max(0.5 * MESH_SIZE, 2.0 * LEVELSET_EDGE_TOL)))
+                    )
+                except Exception:
+                    band = float(max(0.5 * MESH_SIZE, 2.0 * LEVELSET_EDGE_TOL))
+                n0 = _stitch_fluid_velocity_to_solid_near_interface(
+                    mesh=mesh,
+                    dof_handler=dof_handler,
+                    ls_beam=ls_beam,
+                    uf=[uf_k, uf_n],
+                    us=[us_k, us_n],
+                    band=band,
+                    only_cut_nodes=True,
+                )
+                if n0:
+                    print(f"[stitch] copied solid→fluid velocity at {n0} cut-band nodes (band={band:.3e})")
+                    dof_handler.apply_bcs(bcs_curr, uf_k, pf_k, us_k, disp_k, uf_n, pf_n, us_n, disp_n)
+        t_accum[0] = t_curr
+        _dump_levelset_step(step_idx[0], t_curr, tag="step")
+        _dump_state_step(
+            step_idx[0],
+            t_curr,
+            tag="step",
+            funcs=[uf_k, pf_k, us_k, disp_k],
+            prev_funcs=[uf_n, pf_n, us_n, disp_n],
+        )
         _compute_observables(step_idx[0], t_curr)
         _probe_flow_velocity(step_idx[0])
         _plot_mesh(step_idx[0], title="Mesh / level-set")

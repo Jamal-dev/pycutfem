@@ -15,6 +15,7 @@ control logic.
 from __future__ import annotations
 
 from re import A
+import hashlib
 import time
 import os
 import math
@@ -198,6 +199,7 @@ class NewtonParameters:
     """Settings that govern a *single* Newton solve."""
 
     newton_tol: float = 1e-8            # ‖R‖_∞ convergence threshold
+    newton_rtol: float = 0.0           # optional relative tolerance (‖R‖_∞ ≤ rtol·‖R₀‖_∞)
     max_newton_iter: int = 20           # hard cap on inner Newton iterations
 
     # Armijo back‑tracking line‑search
@@ -223,6 +225,8 @@ class TimeStepperParameters:
     steady_tol: float = 1e-6            # ‖ΔU‖_∞ < tol ⇒ steady
     theta: float = 1.0                  # 1.0 = backward Euler, 0.5 = CN
     stop_on_steady: bool = True         # early exit when steady‑state reached
+    t0: float = 0.0                     # start time (for restarts)
+    step0: int = 0                      # global step offset (for logs/callbacks)
     final_time: Optional[float] = None  # default: max_steps * dt (set in __post_init__)
     allow_dt_reduction: bool = False    # opt-in adaptive dt reduction
     dt_reduction_factor: float = 0.5    # dt <- factor * dt on rejection
@@ -241,9 +245,20 @@ class TimeStepperParameters:
     dt_slow_steps_before_decrease: int = 1
     dt_reject_on_slow: bool = False
 
+    # Optional: step-failure handler for debugging/recovery.
+    #
+    # Called when Newton fails or returns non-converged at a step.
+    # The callback may mutate coefficients (e.g. penalty Constants) and request a retry.
+    #
+    # Return values:
+    # - False / None: not handled; solver applies its default failure handling (e.g. dt reduction / raise)
+    # - True or "retry": retry the same step (keeps the default predictor: current <- prev)
+    # - "retry_keep_guess": retry the same step but keep the current iterate (skip predictor reset)
+    on_step_failure: Optional[Callable[..., object]] = None
+
     def __post_init__(self) -> None:
         if self.final_time is None:
-            self.final_time = float(self.max_steps) * float(self.dt)
+            self.final_time = float(self.t0) + float(self.max_steps) * float(self.dt)
         if self.dt_max is None:
             self.dt_max = float(self.dt)
 
@@ -523,7 +538,9 @@ class NewtonSolver:
         """
         Refresh precomputed static arguments for kernels that depend on a moving
         level set without re-JIT compilation. Marks the scatter pattern as stale
-        so it will be rebuilt on the next assembly.
+        so it will be rebuilt on the next assembly **only if** the kernel/entity
+        layout changed (eids/gdofs_map shape). Pure geometry updates (same entity
+        sets, new quadrature/weights) should not force a sparsity rebuild.
         """
         if not self._is_jit_backend():
             return
@@ -537,14 +554,112 @@ class NewtonSolver:
             return
         debug_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_DEBUG", "").lower() in {"1", "true", "yes"}
         raise_on_fail = os.getenv("PYCUTFEM_LEVELSET_REFRESH_RAISE", "").lower() in {"1", "true", "yes"}
+        trace_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_TRACE", "").lower() in {"1", "true", "yes"}
+        assert_full_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_ASSERT_FULL", "").lower() in {"1", "true", "yes"}
+        validate_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_VALIDATE", "").lower() in {"1", "true", "yes"}
+        validate_raise = os.getenv("PYCUTFEM_LEVELSET_REFRESH_VALIDATE_RAISE", "").lower() in {"1", "true", "yes"}
+        profile_refresh = os.getenv("PYCUTFEM_LEVELSET_REFRESH_PROFILE", "").lower() in {"1", "true", "yes"}
+        try:
+            validate_samples = int(os.getenv("PYCUTFEM_LEVELSET_REFRESH_VALIDATE_SAMPLES", "25") or "25")
+        except Exception:
+            validate_samples = 25
         rebuild_no_reuse = refresh_mode in {"rebuild", "rebuild_static", "no_reuse", "noreuse"}
+
+        kernels_all = list(getattr(self, "kernels_K", [])) + list(getattr(self, "kernels_F", []))
+        kernels_ls = [ker for ker in kernels_all if getattr(ker, "level_set", None) is level_set]
+        kernels_ls_buildable = [ker for ker in kernels_ls if callable(getattr(ker, "builder", None))]
+
+        if trace_refresh:
+            from collections import Counter
+
+            def _kind_of(ker) -> str:
+                try:
+                    if isinstance(getattr(ker, "static_args", None), dict):
+                        k = ker.static_args.get("entity_kind", None)
+                        if k:
+                            return str(k)
+                except Exception:
+                    pass
+                if str(getattr(ker, "domain", "")).lower() in {"ghost_edge"}:
+                    return "edge"
+                return "element"
+
+            key_counts = Counter()
+            for ker in kernels_ls:
+                dom = str(getattr(ker, "domain", "") or "unknown")
+                side = str(getattr(ker, "side", "") or "")
+                kind = _kind_of(ker)
+                key_counts[(dom, side, kind)] += 1
+
+            print(
+                "[jit] level-set refresh: total_kernels={} (K={}, F={}), ls_dependent={}, buildable={}".format(
+                    int(len(kernels_all)),
+                    int(len(getattr(self, "kernels_K", []) or [])),
+                    int(len(getattr(self, "kernels_F", []) or [])),
+                    int(len(kernels_ls)),
+                    int(len(kernels_ls_buildable)),
+                )
+            )
+            if key_counts:
+                pretty = ", ".join(
+                    f"{dom}{('/'+side) if side else ''}/{kind}:{n}"
+                    for (dom, side, kind), n in sorted(key_counts.items())
+                )
+                print(f"[jit] level-set kernels by domain: {pretty}")
+
+        if kernels_ls and not kernels_ls_buildable:
+            msg = "[jit] level-set refresh: found ls-dependent kernels but none are refreshable (missing builder hooks)."
+            print(msg)
+            if assert_full_refresh:
+                raise RuntimeError(msg)
+
+        def _pattern_sig(ker) -> tuple:
+            """
+            Return a lightweight signature of the kernel layout that impacts
+            reduced sparsity/scatter plans. We intentionally ignore quadrature
+            data and other geometry-dependent arrays.
+            """
+            static = getattr(ker, "static_args", None)
+            if not isinstance(static, dict):
+                return (0, b"", 0, 0)
+            eids = static.get("eids", None)
+            if eids is None:
+                try:
+                    eids = getattr(ker, "eids", None)
+                except Exception:
+                    eids = None
+            if eids is None:
+                eids = np.asarray([], dtype=np.int64)
+            else:
+                eids = np.asarray(eids, dtype=np.int64).ravel()
+            if eids.size:
+                eids_u8 = np.ascontiguousarray(eids).view(np.uint8)
+                eids_digest = hashlib.blake2b(eids_u8, digest_size=16).digest()
+            else:
+                eids_digest = b""
+
+            gdofs = static.get("gdofs_map", None)
+            if isinstance(gdofs, np.ndarray):
+                gdofs_shape0 = int(gdofs.shape[0])
+                gdofs_shape1 = int(gdofs.shape[1]) if gdofs.ndim >= 2 else 0
+            else:
+                gdofs_shape0, gdofs_shape1 = 0, 0
+
+            return (int(eids.size), eids_digest, gdofs_shape0, gdofs_shape1)
+
         # Default: refresh static args in-place (fast).
         t0 = time.perf_counter()
         changed = 0
+        pattern_changed = False
         any_fail = False
+        first_fail: tuple[str, str | None, str | None, Exception] | None = None
+        refreshed_kernels: list = []
+        prof_rows: list[tuple[float, str, str | None, str | None, int]] = []
         for ker in list(getattr(self, "kernels_K", [])) + list(getattr(self, "kernels_F", [])):
             if getattr(ker, "level_set", None) is not level_set:
                 continue
+            sig_before = _pattern_sig(ker)
+            t_ker0 = time.perf_counter() if profile_refresh else 0.0
             try:
                 if rebuild_no_reuse:
                     if getattr(ker, "builder", None) is None:
@@ -566,6 +681,18 @@ class NewtonSolver:
                     updated = ker.refresh(level_set)
             except Exception as exc:
                 any_fail = True
+                if first_fail is None:
+                    try:
+                        dom = str(getattr(ker, "domain", "unknown"))
+                        side = getattr(ker, "side", None)
+                        kind = None
+                        try:
+                            kind = ker.static_args.get("entity_kind", None)
+                        except Exception:
+                            kind = None
+                        first_fail = (dom, side, kind, exc)
+                    except Exception:
+                        first_fail = ("unknown", None, None, exc)
                 if debug_refresh:
                     dom = getattr(ker, "domain", "unknown")
                     side = getattr(ker, "side", None)
@@ -594,18 +721,157 @@ class NewtonSolver:
                 updated = False
             if updated:
                 changed += 1
+                refreshed_kernels.append(ker)
+            sig_after = _pattern_sig(ker)
+            if sig_after != sig_before:
+                pattern_changed = True
+            if profile_refresh:
+                dt_ker = time.perf_counter() - t_ker0
+                dom = str(getattr(ker, "domain", "unknown"))
+                side = getattr(ker, "side", None)
+                kind = None
+                try:
+                    if isinstance(getattr(ker, "static_args", None), dict):
+                        kind = ker.static_args.get("entity_kind", None)
+                except Exception:
+                    kind = None
+                n_ent = 0
+                try:
+                    n_ent = int(np.asarray(getattr(ker, "eids", np.asarray([]))).shape[0])
+                except Exception:
+                    n_ent = 0
+                prof_rows.append((float(dt_ker), dom, side, str(kind) if kind is not None else None, int(n_ent)))
         if any_fail and not raise_on_fail:
             # Avoid running with a partially refreshed kernel set (inconsistent
             # Jacobian/residual). Fall back to a full recompile.
             t_re = time.perf_counter()
             self._compile_all_kernels()
-            print(
-                f"[jit] kernel refresh failed; recompiled kernels in {time.perf_counter() - t_re:.3f}s"
-            )
+            if first_fail is not None:
+                dom, side, kind, exc = first_fail
+                print(
+                    "[jit] kernel refresh failed (dom={}, side={}, kind={}): {}; recompiled kernels in {:.3f}s".format(
+                        dom,
+                        side,
+                        kind,
+                        exc,
+                        time.perf_counter() - t_re,
+                    )
+                )
+            else:
+                print(f"[jit] kernel refresh failed; recompiled kernels in {time.perf_counter() - t_re:.3f}s")
             return
+        if kernels_ls_buildable and changed != len(kernels_ls_buildable):
+            msg = "[jit] level-set refresh: refreshed {}/{} refreshable kernels (stale kernels possible).".format(
+                int(changed), int(len(kernels_ls_buildable))
+            )
+            print(msg)
+            if assert_full_refresh:
+                raise RuntimeError(msg)
+
+        if validate_refresh and refreshed_kernels:
+            mesh = getattr(getattr(self, "me", None), "mesh", None) or getattr(self.dh.mixed_element, "mesh", None)
+            if mesh is not None:
+                rng = np.random.default_rng(0)
+
+                def _sample(arr: np.ndarray, k: int) -> np.ndarray:
+                    arr = np.asarray(arr, dtype=int)
+                    if arr.size <= k:
+                        return arr
+                    idx = rng.choice(arr.size, size=int(k), replace=False)
+                    return arr[idx]
+
+                bad: list[str] = []
+                for ker in refreshed_kernels:
+                    static = getattr(ker, "static_args", None)
+                    if not isinstance(static, dict):
+                        continue
+                    eids = np.asarray(static.get("eids", []), dtype=int)
+                    kind = static.get("entity_kind", None)
+                    dom = str(getattr(ker, "domain", "") or "unknown")
+                    side = getattr(ker, "side", None)
+                    if kind not in {"edge", "element"}:
+                        kind = "edge" if dom == "ghost_edge" else "element"
+
+                    gdofs = static.get("gdofs_map", None)
+                    if isinstance(gdofs, np.ndarray):
+                        try:
+                            if int(gdofs.shape[0]) != int(eids.shape[0]):
+                                bad.append(
+                                    f"gdofs_map rows != eids ({dom}, kind={kind}, side={side}): {gdofs.shape[0]} vs {eids.shape[0]}"
+                                )
+                        except Exception:
+                            pass
+
+                    samp = _sample(eids, max(0, int(validate_samples)))
+                    if samp.size == 0:
+                        continue
+                    if kind == "element":
+                        tags = [str(getattr(mesh.elements_list[int(e)], "tag", "")) for e in samp]
+                        tagset = set(tags)
+                        if dom == "interface":
+                            if any(t != "cut" for t in tags):
+                                bad.append(f"interface/element has non-cut tags: {sorted(tagset)}")
+                        elif dom == "volume":
+                            # Full-volume kernels should be pure inside/outside; cut-volume kernels are separate.
+                            if static.get("_full_fixed", False):
+                                # Fixed-size full kernels may include all element ids, with inactive
+                                # elements masked out by zero quadrature weights.
+                                qw = static.get("qw", None)
+                                if (
+                                    isinstance(qw, np.ndarray)
+                                    and qw.ndim >= 2
+                                    and int(qw.shape[0]) >= int(mesh.n_elements)
+                                ):
+                                    wrong = []
+                                    for eid, t in zip(samp, tags):
+                                        if str(side) == "+" and t != "outside":
+                                            wrong.append(int(eid))
+                                        if str(side) == "-" and t != "inside":
+                                            wrong.append(int(eid))
+                                    if wrong:
+                                        if not np.allclose(qw[np.asarray(wrong, dtype=int)], 0.0):
+                                            bad.append(
+                                                f"volume/{side} fixed kernel has nonzero weights on non-{('outside' if str(side)== '+' else 'inside')} ids"
+                                            )
+                            else:
+                                if "cut" in tagset and (len(tagset) > 1):
+                                    bad.append(f"volume kernel mixes 'cut' with {sorted(tagset)} (side={side})")
+                                if "cut" not in tagset:
+                                    if str(side) == "+" and any(t != "outside" for t in tags):
+                                        bad.append(f"volume/+ has non-outside tags: {sorted(tagset)}")
+                                    if str(side) == "-" and any(t != "inside" for t in tags):
+                                        bad.append(f"volume/- has non-inside tags: {sorted(tagset)}")
+                    else:
+                        tags = [str(getattr(mesh.edges_list[int(g)], "tag", "")) for g in samp]
+                        tagset = set(tags)
+                        if dom == "interface":
+                            if any(t != "interface" for t in tags):
+                                bad.append(f"interface/edge has non-interface tags: {sorted(tagset)}")
+                        elif dom == "ghost_edge":
+                            if any((not t.startswith("ghost")) or t == "interface" for t in tags):
+                                bad.append(f"ghost_edge has unexpected tags: {sorted(tagset)}")
+
+                if bad:
+                    msg = "[jit] level-set refresh validation failed: " + " | ".join(bad[:6])
+                    print(msg)
+                    if validate_raise:
+                        raise RuntimeError(msg)
+
         if changed:
-            self._pattern_stale = True
-            print(f"[jit] refreshed {changed} kernels for moving level set in {time.perf_counter() - t0:.3f}s")
+            if pattern_changed:
+                self._pattern_stale = True
+                if hasattr(self, "_decoupled_full_mask"):
+                    try:
+                        delattr(self, "_decoupled_full_mask")
+                    except Exception:
+                        pass
+            total_dt = time.perf_counter() - t0
+            if profile_refresh and prof_rows:
+                prof_rows.sort(reverse=True, key=lambda t: t[0])
+                print("[jit] level-set refresh slow kernels (dt, domain, side, kind, nEnt):")
+                for dt_ker, dom, side, kind, n_ent in prof_rows[:12]:
+                    print(f"  {dt_ker:7.3f}s  dom={dom}  side={side}  kind={kind}  n={n_ent}")
+            print(f"[jit] refreshed {changed} kernels for moving level set in {total_dt:.3f}s")
     def _python_form_compiler(self):
         """Lazily construct the pure-Python FormCompiler."""
         if getattr(self, "_python_fc", None) is None:
@@ -683,10 +949,14 @@ class NewtonSolver:
         delta_U = np.zeros(dh.total_dofs)
 
         t_start = time.perf_counter()
-        step = 0
-        t_n = 0.0
+        step = 0  # local step counter within this solve call
+        t_n = float(getattr(time_params, "t0", 0.0) or 0.0)
+        step0 = int(getattr(time_params, "step0", 0) or 0)
         prev_delta_inf: float | None = None
         last_dt: float | None = None
+
+        abort_on_dt_reduction = os.getenv("PYCUTFEM_ABORT_ON_DT_REDUCTION", "").lower() in {"1", "true", "yes"}
+        keep_guess = False  # set by on_step_failure="retry_keep_guess"
 
         dt_controller: AdaptiveDtController | None = None
         if bool(getattr(time_params, "allow_dt_reduction", False)):
@@ -738,6 +1008,8 @@ class NewtonSolver:
             return type(exc).__name__
 
         while step < time_params.max_steps and t_n < time_params.final_time:
+            global_step = int(step0 + step)
+            global_step_no = int(global_step + 1)
             dt = float(time_params.dt)
             dt_min = float(getattr(time_params, "dt_min", 0.0))
             if dt_min > 0.0 and dt < dt_min:
@@ -751,8 +1023,11 @@ class NewtonSolver:
                 last_dt = dt
 
             # Predictor: copy previous solution ---------------------
-            for f, f_prev in zip(functions, prev_functions):
-                f.nodal_values[:] = f_prev.nodal_values[:]
+            if not keep_guess:
+                for f, f_prev in zip(functions, prev_functions):
+                    f.nodal_values[:] = f_prev.nodal_values[:]
+            else:
+                keep_guess = False
 
             # Time‑dependent BCs -----------------------------------
             # For theta-schemes, apply time-dependent Dirichlet data at t_{n+θ}
@@ -762,10 +1037,44 @@ class NewtonSolver:
             dh.apply_bcs(bcs_now, *functions)
 
             # Newton loop -----------------------------------------
+            # Expose step metadata for debug hooks (e.g. step-scoped FD checks).
+            self._current_step_no = int(global_step_no)
+            self._current_t = float(t_n)
+            self._current_dt = float(dt)
             try:
                 delta_U, converged, n_iters = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
             except Exception as e:
-                print(f"    Newton failed at step {step+1} with dt={dt:.3e}: {e}")
+                print(f"    Newton failed at step {global_step_no} with dt={dt:.3e}: {e}")
+                on_fail = getattr(time_params, "on_step_failure", None)
+                if callable(on_fail):
+                    try:
+                        action = on_fail(
+                            step=int(global_step),
+                            step_no=int(global_step_no),
+                            global_step=int(global_step),
+                            global_step_no=int(global_step_no),
+                            local_step=int(step),
+                            local_step_no=int(step + 1),
+                            t=float(t_n),
+                            dt=float(dt),
+                            exception=e,
+                            functions=functions,
+                            prev_functions=prev_functions,
+                            bcs=bcs_now,
+                            aux_functions=aux_functions,
+                        )
+                    except TypeError:
+                        action = on_fail(step, t_n, dt, e)
+                    except Exception as cb_exc:  # noqa: PERF203
+                        print(f"    [warn] on_step_failure callback raised: {cb_exc}")
+                        action = None
+                    if action in (True, "retry"):
+                        continue
+                    if action == "retry_keep_guess":
+                        keep_guess = True
+                        continue
+                    if action == "abort":
+                        raise
                 if not bool(getattr(time_params, "allow_dt_reduction", False)) or dt_controller is None:
                     raise
                 _require_dt_callback()
@@ -777,14 +1086,53 @@ class NewtonSolver:
                     ) from e
                 time_params.dt = float(decision.dt)
                 _adjust_max_steps_for_final_time(t_now=t_n, step_now=step, dt_new=float(time_params.dt))
-                print(f"    Rejecting step {step+1}; reducing Δt → {time_params.dt:.3e} ({decision.reason}) and retrying.")
+                print(
+                    f"    Rejecting step {global_step_no}; reducing Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
+                )
+                if abort_on_dt_reduction and float(time_params.dt) < float(dt):
+                    raise RuntimeError(
+                        f"Aborting after Δt reduction request at step {global_step_no}: "
+                        f"{dt:.3e} -> {float(time_params.dt):.3e} ({decision.reason})."
+                    ) from e
                 continue
 
             if not converged:
                 # Some solver backends (e.g. SNES) may return the best iterate without raising.
+                on_fail = getattr(time_params, "on_step_failure", None)
+                if callable(on_fail):
+                    try:
+                        action = on_fail(
+                            step=int(global_step),
+                            step_no=int(global_step_no),
+                            global_step=int(global_step),
+                            global_step_no=int(global_step_no),
+                            local_step=int(step),
+                            local_step_no=int(step + 1),
+                            t=float(t_n),
+                            dt=float(dt),
+                            exception=RuntimeError("Newton did not converge."),
+                            functions=functions,
+                            prev_functions=prev_functions,
+                            bcs=bcs_now,
+                            aux_functions=aux_functions,
+                        )
+                    except TypeError:
+                        action = on_fail(step, t_n, dt, None)
+                    except Exception as cb_exc:  # noqa: PERF203
+                        print(f"    [warn] on_step_failure callback raised: {cb_exc}")
+                        action = None
+                    if action in (True, "retry"):
+                        continue
+                    if action == "retry_keep_guess":
+                        keep_guess = True
+                        continue
+                    if action == "abort":
+                        raise RuntimeError(
+                            f"Newton did not converge at step {global_step_no} with dt={dt:.3e}."
+                        )
                 if not bool(getattr(time_params, "allow_dt_reduction", False)) or dt_controller is None:
                     raise RuntimeError(
-                        f"Newton did not converge at step {step+1} with dt={dt:.3e}."
+                        f"Newton did not converge at step {global_step_no} with dt={dt:.3e}."
                     )
                 _require_dt_callback()
                 decision = dt_controller.on_failure(dt=dt, reason="not_converged")
@@ -794,7 +1142,14 @@ class NewtonSolver:
                     )
                 time_params.dt = float(decision.dt)
                 _adjust_max_steps_for_final_time(t_now=t_n, step_now=step, dt_new=float(time_params.dt))
-                print(f"    Rejecting step {step+1}; reducing Δt → {time_params.dt:.3e} ({decision.reason}) and retrying.")
+                print(
+                    f"    Rejecting step {global_step_no}; reducing Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
+                )
+                if abort_on_dt_reduction and float(time_params.dt) < float(dt):
+                    raise RuntimeError(
+                        f"Aborting after Δt reduction request at step {global_step_no}: "
+                        f"{dt:.3e} -> {float(time_params.dt):.3e} ({decision.reason})."
+                    )
                 continue
 
             # Optional dt adaptation based on Newton iteration count (success path)
@@ -812,13 +1167,23 @@ class NewtonSolver:
                     if decision.retry_step:
                         _adjust_max_steps_for_final_time(t_now=t_n, step_now=step, dt_new=float(time_params.dt))
                         print(
-                            f"    Rejecting step {step+1}; setting Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
+                            f"    Rejecting step {global_step_no}; setting Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
                         )
+                        if abort_on_dt_reduction and float(time_params.dt) < float(dt):
+                            raise RuntimeError(
+                                f"Aborting after Δt reduction request at step {global_step_no}: "
+                                f"{dt:.3e} -> {float(time_params.dt):.3e} ({decision.reason})."
+                            )
                         continue
                     # Otherwise, apply on next step (after advancing time).
                     _adjust_max_steps_for_final_time(
                         t_now=float(t_n + dt), step_now=int(step + 1), dt_new=float(time_params.dt)
                     )
+                    if abort_on_dt_reduction and float(time_params.dt) < float(dt):
+                        raise RuntimeError(
+                            f"Aborting after Δt reduction request at step {global_step_no}: "
+                            f"{dt:.3e} -> {float(time_params.dt):.3e} ({decision.reason})."
+                        )
                     if decision.reason == "slow_newton":
                         print(
                             f"    Slow Newton convergence ({n_iters} iters); setting next Δt → {time_params.dt:.3e}."
@@ -829,7 +1194,7 @@ class NewtonSolver:
                         )
 
             delta_inf = float(np.linalg.norm(delta_U, ord=np.inf))
-            print(f"    Time step {step+1}: ΔU = {delta_inf:.2e}")
+            print(f"    Time step {global_step_no}: ΔU = {delta_inf:.2e}")
             
             # Post-step refiner (VI clip) **before** promotion so prev matches clipped state
             if post_step_refiner is not None:
@@ -917,6 +1282,7 @@ class NewtonSolver:
         totals = {"assembly": 0.0, "linear_solve": 0.0, "line_search": 0.0}
         temp_t0 = time.perf_counter()
         converged = False
+        norm_R0: float | None = None
         for it in range(self.np.max_newton_iter):
             if self.pre_cb is not None:
                 self.pre_cb(funcs)
@@ -943,11 +1309,92 @@ class NewtonSolver:
             R_full = np.zeros(ndof_eff)
             R_full[self.active_dofs] = R_red
             norm_R = np.linalg.norm(R_full, ord=np.inf)
+            if os.getenv("PYCUTFEM_RESIDUAL_TRACE", "").lower() in {"1", "true", "yes"}:
+                worst_full = int(np.argmax(np.abs(R_full))) if R_full.size else -1
+                worst_val = float(R_full[worst_full]) if worst_full >= 0 else 0.0
+                field = None
+                try:
+                    field = getattr(self.dh, "_dof_to_node_map", {}).get(worst_full, (None, None))[0]
+                except Exception:
+                    field = None
+                fmsg = f", field={field}" if field is not None else ""
+                print(f"        [res] worst_gdof={worst_full} worst_val={worst_val:.3e}{fmsg}")
+                if os.getenv("PYCUTFEM_RESIDUAL_TRACE_FIELDS", "").lower() in {"1", "true", "yes"}:
+                    field_norms = []
+                    for fld in getattr(self.dh, "field_names", []):
+                        try:
+                            sl = self.dh.get_field_slice(fld)
+                        except Exception:
+                            continue
+                        if sl is None or len(sl) == 0:
+                            continue
+                        field_norms.append(f"{fld}:{np.linalg.norm(R_full[sl], ord=np.inf):.2e}")
+                    if field_norms:
+                        print("        [res] per-field |R|_∞: " + ", ".join(field_norms))
+
+                # Optional per-kernel/domain breakdown of the residual at the worst DOF.
+                # Useful to separate volume/interface/ghost contributions in CutFEM.
+                if os.getenv("PYCUTFEM_RESIDUAL_BREAKDOWN", "").lower() in {"1", "true", "yes"}:
+                    it_target = os.getenv("PYCUTFEM_RESIDUAL_BREAKDOWN_IT", "").strip()
+                    if not it_target or int(it_target) == int(it + 1):
+                        try:
+                            worst_red = int(self.full_to_red[worst_full]) if worst_full >= 0 else -1
+                        except Exception:
+                            worst_red = -1
+                        if worst_red >= 0:
+                            def _residual_contrib_at_red(kernel, red_index: int) -> float:
+                                gdofs = kernel.static_args.get("gdofs_map")
+                                if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2 or gdofs.shape[0] == 0:
+                                    return 0.0
+                                _, Floc, _ = kernel.exec(current)
+                                acc = 0.0
+                                for e in range(gdofs.shape[0]):
+                                    full = gdofs[e]
+                                    valid_full = full >= 0
+                                    if not np.any(valid_full):
+                                        continue
+                                    rmap = -np.ones_like(full, dtype=int)
+                                    rmap[valid_full] = self.full_to_red[full[valid_full]]
+                                    hit = np.nonzero(rmap == int(red_index))[0]
+                                    if hit.size:
+                                        acc += float(np.sum(Floc[e][hit]))
+                                return float(acc)
+
+                            entries = []
+                            for k_idx, kerF in enumerate(self.kernels_F):
+                                r0 = _residual_contrib_at_red(kerF, worst_red)
+                                if r0 == 0.0:
+                                    continue
+                                entries.append(
+                                    (
+                                        abs(r0),
+                                        r0,
+                                        k_idx,
+                                        getattr(kerF, "domain", "unknown"),
+                                        getattr(kerF, "side", None),
+                                        getattr(kerF.static_args, "get", lambda _k, _d=None: _d)("entity_kind", None),
+                                        int(getattr(kerF.static_args.get("gdofs_map"), "shape", (0,))[0]),
+                                    )
+                                )
+                            entries.sort(reverse=True, key=lambda t: t[0])
+                            print("        [res] per-kernel contrib at worst DOF (|Rk|, Rk, k, domain, side, kind, nEnt):")
+                            for item in entries[:12]:
+                                _, r0, k_idx, dom_k, side_k, kind_k, n_ent = item
+                                print(
+                                    f"          |{abs(r0):.3e}|  Rk={r0:+.3e}  k={k_idx:03d}  "
+                                    f"dom={dom_k}  side={side_k}  kind={kind_k}  n={n_ent}"
+                                )
+            if norm_R0 is None:
+                norm_R0 = float(norm_R)
+            tol_eff = float(getattr(self.np, "newton_tol", 0.0))
+            rtol = float(getattr(self.np, "newton_rtol", 0.0))
+            if rtol > 0.0 and norm_R0 > 0.0:
+                tol_eff = max(tol_eff, rtol * norm_R0)
             t_current = time.perf_counter()
             t_iteration = t_current - temp_t0
             temp_t0 = t_current
             print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}, time = {t_iteration}s")
-            if norm_R <= self.np.newton_tol:
+            if norm_R <= tol_eff:
                 # Converged — return *time-step* increment for all fields
                 converged = True
                 delta = np.hstack([
@@ -995,9 +1442,21 @@ class NewtonSolver:
                 extra = ("  [" + ", ".join(field_norms) + "]") if field_norms else ""
                 print(f"        [lin] ‖A·δU+R‖∞={lin_inf:.3e}  ‖δU‖∞={du_inf:.3e}{extra}")
 
-            if os.getenv("PYCUTFEM_DIRDERIV_CHECK", "").lower() in {"1", "true", "yes"}:
+            dd_enabled = (
+                os.getenv("PYCUTFEM_DIRDERIV_CHECK", "").lower() in {"1", "true", "yes"}
+                or os.getenv("PYCUTFEM_NEWTON_FD_CHECK", "").lower() in {"1", "true", "yes"}
+            )
+            dd_step = os.getenv("PYCUTFEM_DIRDERIV_STEP", "").strip() or os.getenv("PYCUTFEM_NEWTON_FD_STEP", "").strip()
+            if dd_enabled and dd_step:
+                try:
+                    dd_step_i = int(dd_step)
+                except Exception:
+                    dd_step_i = None
+                if dd_step_i is not None and int(getattr(self, "_current_step_no", -1)) != dd_step_i:
+                    dd_enabled = False
+            if dd_enabled:
                 # Directional derivative check: (R(u+ε·δ) - R(u))/ε ≈ J·δ = -R(u)
-                eps = float(os.getenv("PYCUTFEM_DIRDERIV_EPS", "1e-6"))
+                eps = float(os.getenv("PYCUTFEM_DIRDERIV_EPS", os.getenv("PYCUTFEM_NEWTON_FD_EPS", "1e-6")))
                 snap = [f.nodal_values.copy() for f in funcs]
                 dU_full = self.restrictor.expand_vec(eps * dU_red)
                 dh.add_to_functions(dU_full, funcs)
@@ -1020,9 +1479,19 @@ class NewtonSolver:
                     f"        [dd] ‖(R(u+ε·δ)-R(u))/ε + R(u)‖∞={dir_err:.3e} "
                     f"(ε={eps:.1e}, worst_gdof={worst_full}, worst_val={worst_val:.3e}{fmsg})"
                 )
-                if os.getenv("PYCUTFEM_DIRDERIV_BREAKDOWN", "").lower() in {"1", "true", "yes"} and worst_red >= 0:
+                dd_breakdown = os.getenv("PYCUTFEM_DIRDERIV_BREAKDOWN", "").lower() in {"1", "true", "yes"}
+                dd_breakdown_tol = float(os.getenv("PYCUTFEM_DIRDERIV_BREAKDOWN_TOL", "0.0") or "0.0")
+                dd_breakdown_once = os.getenv("PYCUTFEM_DIRDERIV_BREAKDOWN_ONCE", "").lower() in {"1", "true", "yes"}
+                if dd_breakdown and worst_red >= 0:
+                    if dd_breakdown_tol > 0.0 and dir_err < dd_breakdown_tol:
+                        dd_breakdown = False
+                    if dd_breakdown_once and getattr(self, "_dd_breakdown_done", False):
+                        dd_breakdown = False
+
+                if dd_breakdown and worst_red >= 0:
                     # Optional per-kernel breakdown of the DD mismatch at the worst DOF.
                     # This runs extra kernel evaluations; enable only when debugging.
+                    self._dd_breakdown_done = True
                     def _residual_contrib_at_red(kernel, red_index: int) -> float:
                         gdofs = kernel.static_args.get("gdofs_map")
                         if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2 or gdofs.shape[0] == 0:
@@ -1086,16 +1555,17 @@ class NewtonSolver:
                 t_ls = time.perf_counter()
                 try:
                     dU_red = self._line_search_reduced(A_red, R_red, dU_red, funcs, current, bcs_now)
-                except RuntimeError as exc:
                     line_search_time = time.perf_counter() - t_ls
+                except RuntimeError as exc:
                     msg = str(exc)
                     if "Line search failed" in msg:
                         accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "10.0"))
-                        tol = float(getattr(self.np, "newton_tol", 0.0))
-                        if accept_factor > 0.0 and tol > 0.0 and norm_R <= accept_factor * tol:
+                        tol_accept = float(tol_eff) if "tol_eff" in locals() else float(getattr(self.np, "newton_tol", 0.0))
+                        if accept_factor > 0.0 and tol_accept > 0.0 and norm_R <= accept_factor * tol_accept:
+                            line_search_time = time.perf_counter() - t_ls
                             print(
                                 "        Line search failed near convergence "
-                                f"(|R|_∞={norm_R:.2e}, tol={tol:.2e}); accepting iterate."
+                                f"(|R|_∞={norm_R:.2e}, tol={tol_accept:.2e}); accepting iterate."
                             )
                             converged = True
                             delta = np.hstack(
@@ -1124,9 +1594,32 @@ class NewtonSolver:
                                 )
                             )
                             return delta, converged, it + 1
-                    raise
-                else:
-                    line_search_time = time.perf_counter() - t_ls
+
+                    # Robustness: if the Deal.II-style infinity-norm line-search fails,
+                    # try Armijo (L2 residual) before giving up.
+                    fallback = os.getenv("PYCUTFEM_LS_FALLBACK", "armijo").strip().lower()
+                    if (
+                        fallback in {"1", "true", "yes", "armijo"}
+                        and getattr(self.np, "ls_mode", "armijo") == "dealii"
+                    ):
+                        print("        Line search failed in 'dealii' mode; retrying with Armijo.")
+                        self.np.ls_mode = "armijo"
+                        # Reset the warm-start alpha: the Deal.II backtracking may have
+                        # driven `_ls_alpha_prev` to ~0, which makes Armijo fallback fail
+                        # trivially (no measurable residual decrease).
+                        self._ls_alpha_prev = 1.0
+                        try:
+                            dU_red = self._line_search_reduced(A_red, R_red, dU_red, funcs, current, bcs_now)
+                        except Exception as exc_fallback:  # noqa: PERF203
+                            line_search_time = time.perf_counter() - t_ls
+                            print(f"        [ls] Armijo fallback also failed: {exc_fallback}")
+                            raise
+                        line_search_time = time.perf_counter() - t_ls
+                    else:
+                        line_search_time = time.perf_counter() - t_ls
+                        raise
+            else:
+                line_search_time = 0.0
 
             # 4) Apply accepted step: expand reduced → full, update fields, then re-impose BCs
             dU_full = self.restrictor.expand_vec(dU_red)
@@ -1167,6 +1660,28 @@ class NewtonSolver:
             )
 
         # If we get here, Newton did not converge within the iteration budget
+        accept_factor_raw = os.getenv("PYCUTFEM_NEWTON_MAXITER_ACCEPT_FACTOR", "").strip()
+        try:
+            accept_factor = float(accept_factor_raw) if accept_factor_raw else 0.0
+        except Exception:
+            accept_factor = 0.0
+        if accept_factor > 0.0:
+            tol_eff_last = float(tol_eff) if "tol_eff" in locals() else float(getattr(self.np, "newton_tol", 0.0))
+            if tol_eff_last > 0.0 and float(norm_R) <= accept_factor * tol_eff_last:
+                print(
+                    "        Newton hit max iterations but is near tolerance "
+                    f"(|R|_∞={float(norm_R):.2e}, tol={tol_eff_last:.2e}, factor={accept_factor:.2g}); accepting iterate."
+                )
+                converged = True
+                delta = np.hstack(
+                    [
+                        f.nodal_values - f_prev.nodal_values
+                        for f, f_prev in zip(funcs, prev_funcs)
+                    ]
+                )
+                self._last_iteration_totals = totals
+                return delta, converged, int(self.np.max_newton_iter)
+
         self._last_iteration_totals = totals
         raise RuntimeError("Newton did not converge – adjust Δt or verify Jacobian.")
 
@@ -1179,6 +1694,7 @@ class NewtonSolver:
         """
         pruned = False
         extra_asm = 0.0
+        trace = os.getenv("PYCUTFEM_PRUNE_TRACE", "").lower() in {"1", "true", "yes"}
         for _ in range(2):
             row_nnz = np.diff(A_red.indptr)
             if A_red.indices.size:
@@ -1202,6 +1718,25 @@ class NewtonSolver:
             inactive = np.where(inactive_mask)[0]
             if not inactive.size:
                 break
+            if trace:
+                print(f"        [prune] dropping {int(inactive.size)}/{int(A_red.shape[0])} decoupled rows/cols")
+            # Track structurally decoupled full-space DOFs so external active-DOF
+            # recomputation (e.g. on moving interfaces) can avoid re-introducing
+            # them when the entity layout did not change.
+            try:
+                removed_full = np.asarray(self.active_dofs[inactive], dtype=int)
+                if removed_full.size:
+                    mask = getattr(self, "_decoupled_full_mask", None)
+                    if (
+                        not isinstance(mask, np.ndarray)
+                        or mask.dtype != bool
+                        or int(mask.size) != int(ndof_eff)
+                    ):
+                        mask = np.zeros(int(ndof_eff), dtype=bool)
+                        self._decoupled_full_mask = mask
+                    mask[removed_full] = True
+            except Exception:
+                pass
             keep_mask = np.ones(len(self.active_dofs), dtype=bool)
             keep_mask[inactive] = False
             self.active_dofs = self.active_dofs[keep_mask]
@@ -1885,6 +2420,17 @@ class NewtonSolver:
             cols = sorted(rows_cols[i])
             indices[indptr[i] : indptr[i + 1]] = cols
         self._csr_indptr, self._csr_indices = indptr, indices
+
+        # PETSc matrix cache: sparsity can change when the interface moves and/or the
+        # active DOF set is recomputed. The cached PETSc.Mat preallocation must be
+        # rebuilt when the CSR pattern changes, otherwise PETSc can raise
+        # "new nonzero" insertion errors.
+        try:
+            if str(getattr(self.lp, "backend", "scipy") or "scipy").lower() == "petsc":
+                if hasattr(self, "_petsc_linear_cache"):
+                    delattr(self, "_petsc_linear_cache")
+        except Exception:
+            pass
 
         # 3) Map (row, col) → absolute position in CSR "data"
         pos = {}

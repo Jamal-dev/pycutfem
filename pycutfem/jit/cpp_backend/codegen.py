@@ -105,6 +105,8 @@ class CppCodeGen:
             CellDiameter,
             CheckDomain,
             Grad,
+            PosOp,
+            NegOp,
             Hessian as IRHessian,
             Laplacian as IRLaplacian,
             Div,
@@ -118,6 +120,7 @@ class CppCodeGen:
             Cofactor,
             Trace,
         )
+        needs_phis = any(isinstance(op, (PosOp, NegOp)) for op in ir_sequence)
 
         def coeff_array_name(base: str, side: str) -> str:
             """Match Numba's u_<name>__pos/_neg_loc convention for sided coeffs."""
@@ -156,11 +159,10 @@ class CppCodeGen:
                     "detJ",
                     "J_inv",
                     "normals",
-                    "phis",
-                    *sorted(needs_b),
-                    *sorted(needs_g),
-                    *sorted(needs_u),
                 ]
+                if needs_phis:
+                    param_order.append("phis")
+                param_order += [*sorted(needs_b), *sorted(needs_g), *sorted(needs_u)]
         # Ensure required basis/grad tables are present even if mirror omitted them
         needs_b: set[str] = set()
         needs_g: set[str] = set()
@@ -181,6 +183,13 @@ class CppCodeGen:
                     )
                 if name not in param_order:
                     param_order.append(name)
+            if isinstance(op, (LoadConstant, LoadConstantArray)):
+                # Scalar and array Constants are passed as runtime coeff arrays
+                # (e.g. dt, jit_const_*). Even when we fall back to a minimal
+                # PARAM_ORDER (mirror codegen failed), we must include them in
+                # the kernel signature so the generated prologue can map them.
+                if op.name and op.name not in param_order:
+                    param_order.append(op.name)
             if isinstance(op, LoadVariable):
                 for fn in op.field_names or []:
                     needs_g.add(f"g_{fn}")
@@ -226,6 +235,20 @@ class CppCodeGen:
                 needs_normals = True
             if isinstance(op, CellDiameter):
                 needs_cell_diam = True
+            if isinstance(op, CheckDomain):
+                # Domain restriction flags are provided as uint8 arrays:
+                # domain_flag_<bitset_id>[_pos/_neg]
+                bitset_id = str(getattr(op, "bitset_id", "") or "")
+                if bitset_id:
+                    side = str(getattr(op, "side", "") or "")
+                    if side == "+":
+                        flag = f"domain_flag_{bitset_id}_pos"
+                    elif side == "-":
+                        flag = f"domain_flag_{bitset_id}_neg"
+                    else:
+                        flag = f"domain_flag_{bitset_id}"
+                    if flag not in param_order:
+                        param_order.append(flag)
         for name in sorted(needs_b):
             if name not in param_order:
                 param_order.append(name)

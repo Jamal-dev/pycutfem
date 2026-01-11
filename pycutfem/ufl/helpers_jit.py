@@ -551,7 +551,13 @@ def _build_jit_kernel_args(       # ← signature unchanged
                     # element-local gdofs for this field on each owner element of the side
                     loc_lists = dof_handler.element_maps[fld]
                     # all elements share same nloc for that field
-                    nloc_f = len(loc_lists[int(side_ids[0])])
+                    if side_ids.size:
+                        sample_eid = int(side_ids[0])
+                    else:
+                        # Empty entity set (e.g. no aligned interface edges). Still build
+                        # a correctly-shaped empty map so kernel arg building succeeds.
+                        sample_eid = 0
+                    nloc_f = len(loc_lists[int(sample_eid)]) if loc_lists else 0
                     m_arr = -np.ones((nE, nloc_f), dtype=np.int32)
                     for i in range(nE):
                         eid = int(side_ids[i])
@@ -715,10 +721,10 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 args[name] = tab
                 continue
 
-            # 2) INTERFACE fallback (entity_kind == 'element'):
+            # 2) INTERFACE fallback (entity_kind == 'element' or 'edge'):
             #    Build at interface physical QPs. Return *owner-mixed* length
             #    so the kernel’s fixed block slices [0:9],[9:18],[18:22] stay valid.
-            if pre_built is not None and pre_built.get("entity_kind") == "element":
+            if pre_built is not None and pre_built.get("entity_kind") in {"element", "edge"}:
                 # r00 -> b_ at qp_phys; rXY -> dXY at qp_phys
                 if d0 == 0 and d1 == 0:
                     # union-length (owner-mixed) basis at qp_phys

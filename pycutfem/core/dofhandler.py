@@ -2418,6 +2418,8 @@ class DofHandler:
         cut_element_ids,
         qdeg: int,
         level_set,
+        *,
+        linear_interface: bool = False,
         nseg: int | None = None,
         reuse: bool = True,
         need_hess: bool = False,
@@ -2435,6 +2437,8 @@ class DofHandler:
         are moved to the deformed position x + u.
         • Uses isoparametric, batched interface rules if available; otherwise falls
         back to segmented curved-line quadrature with uniform 'nseg'.
+        • When ``linear_interface=True``, skip projection and integrate on the straight
+        chord between the two extracted interface points (stable for piecewise-linear Γ).
         • Normals are oriented by ∇φ/‖∇φ‖ (NEG→POS). When the level-set exposes
         fast on-element evaluation (value_on_element*, gradient_on_element*), those
         are used instead of the slow global .gradient(x).
@@ -2584,6 +2588,7 @@ class DofHandler:
             "iface", id(mesh), me.signature(),
             subset_hash, coords_hash, int(qdeg), getattr(self, "_method_token", self.method),
             bool(need_hess), bool(need_o3), bool(need_o4),
+            bool(linear_interface),
             ls_token, def_token
         )
         if reuse and cache_key in _interface_cache:
@@ -2619,7 +2624,35 @@ class DofHandler:
         # ------------------------------------------------------------------------------
         qp_phys = None; qw = None; that = None; qref = None
 
-        if _HAVE_ISO_IFC:
+        linear_interface = bool(linear_interface)
+        if linear_interface:
+            # Straight segment rule on the chord between the two interface points.
+            order = max(1, int(qdeg))
+            xi_1d, w_1d = gauss_legendre(int(order))
+            s = 0.5 * (np.asarray(xi_1d, dtype=float) + 1.0)
+            ws = 0.5 * np.asarray(w_1d, dtype=float)
+
+            nQ = int(order)
+            qp_phys = np.empty((nE, nQ, 2), dtype=float)
+            qw = np.empty((nE, nQ), dtype=float)
+            that = np.empty((nE, nQ, 2), dtype=float)
+            for i, (_, _, p0, p1) in enumerate(segment_records):
+                P0 = np.asarray(p0, dtype=float).reshape(2)
+                P1 = np.asarray(p1, dtype=float).reshape(2)
+                d = P1 - P0
+                L = float(np.linalg.norm(d))
+                if L <= 1e-30:
+                    qp_phys[i, :, :] = P0[None, :]
+                    qw[i, :] = 0.0
+                    that[i, :, :] = np.array([1.0, 0.0], dtype=float)[None, :]
+                    continue
+                tau = d / L
+                qp_phys[i, :, :] = P0[None, :] + s[:, None] * d[None, :]
+                qw[i, :] = ws * L
+                that[i, :, :] = tau[None, :]
+            qref = None
+
+        elif _HAVE_ISO_IFC:
             # Build segment endpoints per cut element (P0,P1)
             P0 = np.empty((nE, 2), dtype=float)
             P1 = np.empty((nE, 2), dtype=float)
@@ -3105,6 +3138,7 @@ class DofHandler:
         without recomputing mapping, normals, or basis derivatives.
         • Results are cached by a stable key unless `reuse=False`.
         """
+        import os
         import numpy as np
         from pycutfem.integration.quadrature import gauss_legendre, _map_line_rule_batched as _batched  # type: ignore
         from pycutfem.integration.quadrature import line_quadrature, curved_line_quadrature_batch
@@ -3194,13 +3228,27 @@ class DofHandler:
         qp_phys = None
         qw      = None
         if nE > 0:
-            use_curved = bool(allow_interface)
+            # NOTE: Ghost-edge and aligned-interface integrals are *edge* integrals.
+            # Do NOT project quadrature points onto {phi=0} by default: that changes the
+            # geometry of the integration domain and can introduce discontinuities when
+            # switching between cut-cell and aligned-edge representations.
+            #
+            # If you explicitly want to project points onto {phi=0} for interface edges,
+            # enable it via PYCUTFEM_INTERFACE_EDGE_PROJECT=1.
+            use_curved = (
+                bool(allow_interface)
+                and os.getenv("PYCUTFEM_INTERFACE_EDGE_PROJECT", "").lower() in {"1", "true", "yes"}
+            )
             if use_curved:
-                # prefer curved projection when interface edges are allowed
                 try:
                     qpts_curved, qw_curved = curved_line_quadrature_batch(
-                        level_set, P0, P1, order=qdeg, nseg=max(1, getattr(mesh, "poly_order", 1)),
-                        mesh=mesh, eids=np.array([e.left for e in edges], dtype=int)
+                        level_set,
+                        P0,
+                        P1,
+                        order=qdeg,
+                        nseg=max(1, getattr(mesh, "poly_order", 1)),
+                        mesh=mesh,
+                        eids=np.array([e.left for e in edges], dtype=int),
                     )
                     qp_phys = np.asarray(qpts_curved, dtype=float)
                     qw = np.asarray(qw_curved, dtype=float)
@@ -4129,6 +4177,7 @@ class DofHandler:
         need_hess: bool = False,
         need_o3: bool = False,
         need_o4: bool = False,
+        level_set: Any = None,
         deformation: Any = None,
     ) -> dict:
         """
@@ -4176,6 +4225,7 @@ class DofHandler:
             bool(need_o3),
             bool(need_o4),
             getattr(self, "_method_token", self.method),
+            _ls_fingerprint(level_set),
             _def_fingerprint(deformation),
             _coords_fingerprint(mesh.nodes_x_y_pos),
         )
@@ -4236,10 +4286,35 @@ class DofHandler:
 
         # Per-field union maps
         maps_by_field: Dict[str, np.ndarray] = {}
+        masks_by_field: Dict[str, np.ndarray] = {}
+        mask_cache: Dict[int, tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]] = {}
+        if level_set is not None:
+            import re
+            from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
+
+            def _infer_field_side(fld: str) -> str | None:
+                if re.search(r"(^|_)pos(_|$)", fld):
+                    return "pos"
+                if re.search(r"(^|_)neg(_|$)", fld):
+                    return "neg"
+                return None
+
+            field_side_hint = {fld: _infer_field_side(fld) for fld in fields}
+
+            def _elem_masks(eid: int):
+                if eid not in mask_cache:
+                    mask_cache[eid] = _hfa.build_side_masks_by_field(
+                        self, fields, int(eid), level_set, tol=SIDE.tol
+                    )
+                return mask_cache[eid]
+        else:
+            field_side_hint = {fld: None for fld in fields}
         for fld in fields:
             nloc_f = len(self.element_maps[fld][int(pos_ids[0])])
             pm = np.empty((nE, nloc_f), dtype=np.int32)
             nm = np.empty((nE, nloc_f), dtype=np.int32)
+            pos_mask = np.ones((nE, n_union), dtype=float)
+            neg_mask = np.ones((nE, n_union), dtype=float)
             for i in range(nE):
                 union = union_lists[i]
                 col_of = {int(d): j for j, d in enumerate(union)}
@@ -4247,8 +4322,41 @@ class DofHandler:
                 neg_loc = self.element_maps[fld][int(neg_ids[i])]
                 pm[i, :] = [col_of[int(d)] for d in pos_loc]
                 nm[i, :] = [col_of[int(d)] for d in neg_loc]
+                if level_set is not None:
+                    side_hint = field_side_hint.get(fld)
+                    if side_hint in ("pos", "neg"):
+                        pos_eid = int(pos_ids[i])
+                        neg_eid = int(neg_ids[i])
+                        pos_masks_elem, neg_masks_elem = _elem_masks(pos_eid)
+                        pos_masks_elem_n, neg_masks_elem_n = _elem_masks(neg_eid)
+
+                        if side_hint == "pos":
+                            mask_pos_local = pos_masks_elem.get(fld)
+                            mask_neg_local = pos_masks_elem_n.get(fld)
+                        else:
+                            mask_pos_local = neg_masks_elem.get(fld)
+                            mask_neg_local = neg_masks_elem_n.get(fld)
+
+                        if (
+                            mask_pos_local is not None
+                            and np.asarray(mask_pos_local).shape[0] == pm.shape[1]
+                        ):
+                            cols = pm[i]
+                            ok = (cols >= 0) & (cols < n_union)
+                            if np.any(ok):
+                                pos_mask[i, cols[ok]] = np.asarray(mask_pos_local, dtype=float)[ok]
+                        if (
+                            mask_neg_local is not None
+                            and np.asarray(mask_neg_local).shape[0] == nm.shape[1]
+                        ):
+                            cols = nm[i]
+                            ok = (cols >= 0) & (cols < n_union)
+                            if np.any(ok):
+                                neg_mask[i, cols[ok]] = np.asarray(mask_neg_local, dtype=float)[ok]
             maps_by_field[f"pos_map_{fld}"] = pm
             maps_by_field[f"neg_map_{fld}"] = nm
+            masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
+            masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
 
         # Reference coordinates and Jacobians
         xi_pos = np.zeros((nE, nQ), dtype=float)
@@ -4464,6 +4572,7 @@ class DofHandler:
         }
         out.update(basis_tables)
         out.update(maps_by_field)
+        out.update(masks_by_field)
         if need_hess:
             out.update({
                 "pos_Hxi0": pos_Hxi0, "pos_Hxi1": pos_Hxi1,
@@ -5671,6 +5780,7 @@ class DofHandler:
         derivs_cut: set[tuple[int, int]],
         derivs_ghost: set[tuple[int, int]],
         allow_interface: bool = True,
+        linear_interface: bool = False,
         need_hess: bool = False,
         need_o3: bool = False,
         need_o4: bool = False,
@@ -5757,6 +5867,7 @@ class DofHandler:
             ifc_ids,
             int(qifc),
             level_set,
+            linear_interface=bool(linear_interface),
             nseg=nseg_ifc_eff,
             need_hess=bool(need_hess),
             need_o3=bool(need_o3),

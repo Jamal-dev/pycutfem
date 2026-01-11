@@ -672,6 +672,9 @@ def compile_multi(form, *, dof_handler, mixed_element,
     def _single_int(vals: set[int]) -> int | None:
         return next(iter(vals)) if len(vals) == 1 else None
 
+    def _single_bool(vals: set[bool]) -> bool | None:
+        return next(iter(vals)) if len(vals) == 1 else None
+
     def _ctx_for(ls_obj) -> dict[str, Any]:
         k = int(id(ls_obj))
         ctx = unified_reqs.get(k)
@@ -682,6 +685,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 "ghost_qs": set(),
                 "cut_nseg": set(),
                 "ifc_nseg": set(),
+                "ifc_linear": set(),
                 "derivs_cut": set(),
                 "derivs_ghost": set(),
                 "need_hess": False,
@@ -717,7 +721,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
         qghost = _single_int(ctx["ghost_qs"])
 
         can_cut = bool(ctx["want_cut"]) and qvol is not None and len(ctx["cut_nseg"]) <= 1
-        can_ifc = bool(ctx["want_ifc"]) and qifc is not None and len(ctx["ifc_nseg"]) <= 1
+        can_ifc = bool(ctx["want_ifc"]) and qifc is not None and len(ctx["ifc_nseg"]) <= 1 and len(ctx["ifc_linear"]) <= 1
         can_ghost = bool(ctx["want_ghost"]) and qghost is not None
         if not (can_cut or can_ifc or can_ghost):
             return None
@@ -729,6 +733,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
         nseg_cut = _single_int(ctx["cut_nseg"]) if can_cut else None
         nseg_ifc = _single_int(ctx["ifc_nseg"]) if can_ifc else None
+        linear_ifc = _single_bool(ctx["ifc_linear"]) if can_ifc else None
 
         q_default = int(qvol or qifc or qghost or 1)
         qvol_eff = int(qvol or q_default)
@@ -777,6 +782,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
             bool(ctx["need_o4"]),
             int(nseg_cut) if nseg_cut is not None else None,
             int(nseg_ifc) if nseg_ifc is not None else None,
+            bool(linear_ifc) if linear_ifc is not None else None,
             int(id(deformation)) if deformation is not None else 0,
             bool(can_cut),
             bool(can_ifc),
@@ -804,6 +810,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
             need_o4=bool(ctx["need_o4"]),
             nseg_cut=nseg_cut,
             nseg_interface=nseg_ifc,
+            linear_interface=bool(linear_ifc) if linear_ifc is not None else False,
             deformation=deformation,
             include_volume=False,
             reuse=True,
@@ -1067,26 +1074,201 @@ def compile_multi(form, *, dof_handler, mixed_element,
             ):
                 if _side not in ("+", "-"):
                     raise ValueError(f"volume(side=...) must be '+' or '-', got {_side!r}")
-                # Invalidate the full-element cache whenever the level set changes.
-                ls_token = getattr(ls_obj, "cache_token", None)
-                if ls_token is None:
-                    ls_token = ("objid", int(id(ls_obj)))
-                inside_now, outside_now, _ = _current_sets(ls_obj)
+                inside_now, outside_now, _cut_now = _current_sets(ls_obj)
                 side_full = inside_now if _side == "-" else outside_now
-                full_ids = _apply_defined_on(side_full)
+                full_ids = np.asarray(_apply_defined_on(side_full), dtype=np.int32)
+
+                # ------------------------------------------------------------------
+                # Fast-path: keep full-volume statics at full-mesh size and only
+                # update quadrature weights when the element set changes.
+                #
+                # Motivation: helpers_jit expands/caches reference-space tables with
+                # a key that includes n_elem == gdofs_map.shape[0]. If we rebuild the
+                # full-element subset every refresh (and its size changes), we keep
+                # allocating enormous (nElem x nQ x nLoc) tables which dominates the
+                # "kernel refresh" time. By compiling a fixed-size full-mesh kernel
+                # for large subsets and masking inactive elements by zeroing weights,
+                # refresh becomes O(nElem*nQ) copy/zero instead of reallocating tables.
+                #
+                # Cut elements are always excluded here (weight=0) and are handled by
+                # the separate _cut_static kernel for this integral.
+                # ------------------------------------------------------------------
+                has_phis = "phis" in _param_order
+                const_phi_on = (
+                    has_phis
+                    and os.getenv("PYCUTFEM_FULL_STATIC_CONST_PHI", "1").lower() not in {"0", "false", "no"}
+                )
+                phi_const_val = 1.0 if _side == "+" else -1.0
+
+                fixed_on = os.getenv("PYCUTFEM_FULL_STATIC_FIXED", "1").lower() not in {"0", "false", "no"}
+                try:
+                    fixed_thresh = int(os.getenv("PYCUTFEM_FULL_STATIC_FIXED_THRESHOLD", "1000") or "1000")
+                except Exception:
+                    fixed_thresh = 1000
+                treat_phis_static = (not has_phis) or const_phi_on
+                use_fixed = fixed_on and treat_phis_static and (int(full_ids.size) >= fixed_thresh)
+                if use_fixed:
+                    n_elems = int(getattr(_me.mesh, "n_elements", len(getattr(_me.mesh, "elements_list", []))))
+                    all_eids = np.arange(n_elems, dtype=np.int32)
+                    # Active full elements for this side (already excludes cut ids).
+                    active_ids = np.asarray(full_ids, dtype=np.int32)
+                    active_mask = np.zeros((n_elems,), dtype=bool)
+                    if active_ids.size:
+                        active_mask[active_ids] = True
+
+                    base_qw = np.asarray(_geom_bg["qw"], dtype=float)
+
+                    if (
+                        reuse_static is not None
+                        and isinstance(reuse_static, dict)
+                        and bool(reuse_static.get("_full_fixed", False))
+                        and isinstance(reuse_static.get("qw", None), np.ndarray)
+                        and int(np.asarray(reuse_static["qw"]).shape[0]) == int(base_qw.shape[0])
+                    ):
+                        qw = reuse_static["qw"]
+                        # Reset to baseline then zero inactive element rows.
+                        np.copyto(qw, base_qw)
+                        if np.any(~active_mask):
+                            qw[~active_mask] = 0.0
+                        if has_phis and const_phi_on and isinstance(reuse_static.get("phis", None), np.ndarray):
+                            # For full elements, only the sign of phi is used by Pos/Neg; make it constant.
+                            ph = reuse_static["phis"]
+                            ph[...] = phi_const_val
+                        reuse_static["eids"] = all_eids
+                        reuse_static["owner_id"] = all_eids
+                        return reuse_static
+
+                    qw = np.array(base_qw, copy=True)
+                    if np.any(~active_mask):
+                        qw[~active_mask] = 0.0
+                    phis = None
+                    if has_phis:
+                        phis = np.full_like(base_qw, phi_const_val) if const_phi_on else _geom_bg.get("phis")
+
+                    qref_all = _geom_bg.get("qp_ref")
+                    geom_full = {
+                        "qp_phys": _geom_bg["qp_phys"],
+                        "qw": qw,
+                        "detJ": _geom_bg["detJ"],
+                        "J_inv": _geom_bg["J_inv"],
+                        "normals": _geom_bg["normals"],
+                        "phis": phis,
+                        "h_arr": _geom_bg["h_arr"],
+                        "owner_id": all_eids,
+                        "entity_kind": "element",
+                        "is_interface": False,
+                        "is_ghost": False,
+                        "eids": all_eids,
+                    }
+                    if qref_all is not None:
+                        geom_full["qref"] = qref_all
+
+                    # Precompute mixed-space DOFs for every element once.
+                    gdofs_all = np.asarray(
+                        [np.asarray(_dof_handler.get_elemental_dofs(int(e)), dtype=np.int64) for e in all_eids],
+                        dtype=np.int64,
+                    )
+                    gdofs_map_full = np.asarray(gdofs_all[:, _active_cols], dtype=np.int32)
+                    geom_full["gdofs_map"] = gdofs_map_full
+
+                    static_full = dict(geom_full)
+                    static_full.update(
+                        _build_jit_kernel_args(
+                            _ir,
+                            _integrand,
+                            _me,
+                            _qdeg,
+                            dof_handler=_dof_handler,
+                            gdofs_map=gdofs_map_full,
+                            param_order=_param_order,
+                            pre_built=geom_full,
+                        )
+                    )
+                    static_full = _compress_static_for_active(static_full, _me, _active_cols)
+                    static_full["_full_fixed"] = True
+                    return static_full
 
                 phis_src = _geom_bg.get("phis")
+
+                # Fast in-place refresh: when the full-element set changes by only a few
+                # elements, update the affected rows instead of rebuilding huge arrays.
+                if reuse_static is not None and isinstance(reuse_static, dict) and treat_phis_static:
+                    try:
+                        old_eids = np.asarray(reuse_static.get("eids", []), dtype=np.int32)
+                    except Exception:
+                        old_eids = np.zeros((0,), dtype=np.int32)
+                    if (
+                        os.getenv("PYCUTFEM_FULL_STATIC_INPLACE_TRACE", "").lower() in {"1", "true", "yes"}
+                        and int(full_ids.size) >= 1000
+                        and old_eids.size
+                        and old_eids.size != full_ids.size
+                    ):
+                        print(
+                            f"[jit] full_static inplace skipped (size change): side={_side} "
+                            f"old_n={int(old_eids.size)} new_n={int(full_ids.size)}"
+                        )
+                    if old_eids.size and old_eids.size == full_ids.size:
+                        if np.array_equal(old_eids, full_ids):
+                            if has_phis and const_phi_on and isinstance(reuse_static.get("phis", None), np.ndarray):
+                                reuse_static["phis"][...] = phi_const_val
+                            return reuse_static
+                        removed_mask = ~np.isin(old_eids, full_ids)
+                        removed_n = int(np.count_nonzero(removed_mask))
+                        if removed_n == 0:
+                            # Membership identical (possibly reordered). Order is irrelevant for assembly.
+                            if has_phis and const_phi_on and isinstance(reuse_static.get("phis", None), np.ndarray):
+                                reuse_static["phis"][...] = phi_const_val
+                            return reuse_static
+                        added = full_ids[~np.isin(full_ids, old_eids)]
+                        if (
+                            os.getenv("PYCUTFEM_FULL_STATIC_INPLACE_TRACE", "").lower() in {"1", "true", "yes"}
+                            and int(full_ids.size) >= 1000
+                        ):
+                            print(
+                                f"[jit] full_static inplace: side={_side} n={int(full_ids.size)} "
+                                f"removed={removed_n} added={int(added.size)}"
+                            )
+                        if int(added.size) == removed_n:
+                            slots = np.nonzero(removed_mask)[0]
+                            for slot, new_eid in zip(slots, added):
+                                ee = int(new_eid)
+                                old_eids[slot] = ee
+                                # Update geometry rows (qp/weights/J) from the global background cache.
+                                for key in ("qp_phys", "qw", "detJ", "J_inv", "normals"):
+                                    try:
+                                        dst = reuse_static.get(key, None)
+                                        src = _geom_bg.get(key, None)
+                                        if isinstance(dst, np.ndarray) and isinstance(src, np.ndarray):
+                                            dst[slot] = src[ee]
+                                    except Exception:
+                                        pass
+                                if has_phis and const_phi_on and isinstance(reuse_static.get("phis", None), np.ndarray):
+                                    reuse_static["phis"][slot] = phi_const_val
+                                # owner_id is used to index global h_arr / EWC arrays in kernels.
+                                try:
+                                    if isinstance(reuse_static.get("owner_id", None), np.ndarray):
+                                        reuse_static["owner_id"][slot] = ee
+                                except Exception:
+                                    pass
+                                # Update the per-element DOF map row for coefficient gathering.
+                                try:
+                                    if isinstance(reuse_static.get("gdofs_map", None), np.ndarray):
+                                        reuse_static["gdofs_map"][slot] = np.asarray(
+                                            _dof_handler.get_elemental_dofs(ee), dtype=np.int32
+                                        )[_active_cols]
+                                except Exception:
+                                    pass
+                            reuse_static["eids"] = old_eids
+                            _full_cache["ids"] = old_eids
+                            _full_cache["static"] = reuse_static
+                            return reuse_static
+
                 prev_ids = _full_cache.get("ids")
-                prev_tok = _full_cache.get("ls_token")
-                if (
-                    prev_ids is not None
-                    and full_ids.size
-                    and np.array_equal(full_ids, prev_ids)
-                    and prev_tok == ls_token
-                    and "phis" not in _param_order
-                ):
+                if prev_ids is not None and np.array_equal(full_ids, prev_ids) and treat_phis_static:
                     cached = _full_cache.get("static")
                     if cached is not None:
+                        if has_phis and const_phi_on and isinstance(cached.get("phis", None), np.ndarray):
+                            cached["phis"][...] = phi_const_val
                         return cached
 
                 qref_all = _geom_bg.get("qp_ref")
@@ -1101,7 +1283,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     "detJ": _geom_bg["detJ"][full_ids],
                     "J_inv": _geom_bg["J_inv"][full_ids],
                     "normals": _geom_bg["normals"][full_ids],
-                    "phis": None if phis_src is None else phis_src[full_ids],
+                    "phis": (
+                        np.full_like(_geom_bg["qw"][full_ids], phi_const_val)
+                        if (has_phis and const_phi_on)
+                        else (None if phis_src is None else phis_src[full_ids])
+                    ),
                     "h_arr": _geom_bg["h_arr"][full_ids],
                     "owner_id": _geom_bg.get("owner_id", _geom_bg.get("eids", np.arange(len(_geom_bg["qw"]))))[full_ids].astype(np.int32),
                     "entity_kind": "element",
@@ -1138,7 +1324,6 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 if full_ids.size:
                     _full_cache["ids"] = full_ids
                     _full_cache["static"] = static_full
-                    _full_cache["ls_token"] = ls_token
                 return static_full
 
             derivs_cut = set(intg.measure.metadata.get("derivs", required_multi_indices(intg.integrand))) | {(0, 0)}
@@ -1268,10 +1453,12 @@ def compile_multi(form, *, dof_handler, mixed_element,
             level_set = intg.measure.level_set
             bs_def = intg.measure.defined_on
             deformation = getattr(intg.measure, "deformation", None)
+            linear_interface = bool(md.get("linear_interface", False))
             ctx = _ctx_for(level_set)
             ctx["want_ifc"] = True
             ctx["ifc_qs"].add(int(qdeg))
             ctx["ifc_nseg"].add(int(nseg))
+            ctx["ifc_linear"].add(bool(linear_interface))
             ctx["need_hess"] = bool(ctx["need_hess"] or need_hess)
             ctx["need_o3"] = bool(ctx["need_o3"] or need_o3)
             ctx["need_o4"] = bool(ctx["need_o4"] or need_o4)
@@ -1293,6 +1480,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 _need_o3=need_o3,
                 _need_o4=need_o4,
                 _nseg=nseg,
+                _linear_interface=bool(linear_interface),
                 _deformation=deformation,
             ):
                 # IMPORTANT: mesh element/edge BitSets are rebuilt by classification,
@@ -1345,6 +1533,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         new_eids_full,
                         _qdeg,
                         ls_obj,
+                        linear_interface=bool(_linear_interface),
                         need_hess=_need_hess,
                         need_o3=_need_o3,
                         need_o4=_need_o4,
@@ -1712,6 +1901,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     need_hess=need_hess,
                     need_o3=need_o3,
                     need_o4=need_o4,
+                    level_set=getattr(intg.measure, "level_set", None),
+                    deformation=getattr(intg.measure, "deformation", None),
                 )
                 geom_local = dict(geom)
                 geom_local["is_ghost"] = False
