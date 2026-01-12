@@ -6462,11 +6462,14 @@ class DofHandler:
         qvol: int,
         qifc: int,
         qghost: int,
+        qfacet_patch: int | None = None,
         cut_element_ids,
         interface_element_ids,
         ghost_edge_ids,
+        facet_patch_edge_ids=None,
         derivs_cut: set[tuple[int, int]],
         derivs_ghost: set[tuple[int, int]],
+        derivs_facet_patch: set[tuple[int, int]] | None = None,
         allow_interface: bool = True,
         linear_interface: bool = False,
         need_hess: bool = False,
@@ -6505,6 +6508,7 @@ class DofHandler:
         cut_ids = np.unique(_to_ids(cut_element_ids))
         ifc_ids = np.unique(_to_ids(interface_element_ids))
         ghost_ids = np.unique(_to_ids(ghost_edge_ids))
+        facet_patch_ids = np.unique(_to_ids(facet_patch_edge_ids)) if facet_patch_edge_ids is not None else np.zeros((0,), dtype=np.int32)
 
         out: dict[str, Any] = {}
 
@@ -6659,7 +6663,23 @@ class DofHandler:
                 "owner_id": np.empty((0,), dtype=np.int32),
                 "owner_pos_id": np.empty((0,), dtype=np.int32),
                 "owner_neg_id": np.empty((0,), dtype=np.int32),
-            }
+                }
+
+        # Facet-patch factors (NGSolve-style dFacetPatch).
+        if qfacet_patch is not None:
+            derivs_fp = {(int(a), int(b)) for (a, b) in (derivs_facet_patch or set())}
+            # Default to current ghost edges when no explicit ids are provided.
+            if facet_patch_edge_ids is None:
+                facet_patch_ids = np.unique(_to_ids(mesh.edge_bitset("ghost")))
+            out["facet_patch"] = self.precompute_facet_patch_factors(
+                facet_ids=facet_patch_ids,
+                qdeg=int(qfacet_patch),
+                level_set=level_set,
+                derivs=derivs_fp,
+                reuse=reuse,
+                allow_interface=False,
+                deformation=deformation,
+            )
 
         return out
 

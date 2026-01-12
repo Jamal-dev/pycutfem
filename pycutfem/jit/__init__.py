@@ -690,11 +690,13 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 "cut_qs": set(),
                 "ifc_qs": set(),
                 "ghost_qs": set(),
+                "facet_patch_qs": set(),
                 "cut_nseg": set(),
                 "ifc_nseg": set(),
                 "ifc_linear": set(),
                 "derivs_cut": set(),
                 "derivs_ghost": set(),
+                "derivs_facet_patch": set(),
                 "need_hess": False,
                 "need_o3": False,
                 "need_o4": False,
@@ -703,6 +705,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 "want_cut": False,
                 "want_ifc": False,
                 "want_ghost": False,
+                "want_facet_patch": False,
             }
             unified_reqs[k] = ctx
         return ctx
@@ -715,7 +718,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
     def _get_unified(ls_obj, ctx: dict[str, Any]):
         """
-        Lazily compute a unified precompute bundle (cut +/- , interface, ghost, aligned-interface)
+        Lazily compute a unified precompute bundle (cut +/- , interface, ghost, aligned-interface, facet-patch)
         for the current level set state. Returns None when unsupported/ineligible.
         """
         if not use_unified:
@@ -726,11 +729,13 @@ def compile_multi(form, *, dof_handler, mixed_element,
         qvol = _single_int(ctx["cut_qs"])
         qifc = _single_int(ctx["ifc_qs"])
         qghost = _single_int(ctx["ghost_qs"])
+        qfacet = _single_int(ctx["facet_patch_qs"])
 
         can_cut = bool(ctx["want_cut"]) and qvol is not None and len(ctx["cut_nseg"]) <= 1
         can_ifc = bool(ctx["want_ifc"]) and qifc is not None and len(ctx["ifc_nseg"]) <= 1 and len(ctx["ifc_linear"]) <= 1
         can_ghost = bool(ctx["want_ghost"]) and qghost is not None
-        if not (can_cut or can_ifc or can_ghost):
+        can_facet = bool(ctx["want_facet_patch"]) and qfacet is not None
+        if not (can_cut or can_ifc or can_ghost or can_facet):
             return None
 
         # We only support a single deformation object per unified bundle.
@@ -742,10 +747,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
         nseg_ifc = _single_int(ctx["ifc_nseg"]) if can_ifc else None
         linear_ifc = _single_bool(ctx["ifc_linear"]) if can_ifc else None
 
-        q_default = int(qvol or qifc or qghost or 1)
+        q_default = int(qvol or qifc or qghost or qfacet or 1)
         qvol_eff = int(qvol or q_default)
         qifc_eff = int(qifc or q_default)
         qghost_eff = int(qghost or q_default)
+        qfacet_eff = int(qfacet or q_default)
 
         # Determine current ids (mesh BitSets are rebuilt on classify_*).
         if can_cut or can_ifc:
@@ -758,6 +764,9 @@ def compile_multi(form, *, dof_handler, mixed_element,
         cut_ids = cut_ids_all if can_cut else np.zeros((0,), dtype=np.int32)
         ifc_ids = cut_ids_all if can_ifc else np.zeros((0,), dtype=np.int32)
 
+        # Edge ids required by:
+        # - ghost-edge kernels (ghost) and aligned-interface kernels (interface)
+        # - facet-patch kernels (ghost edges only)
         if can_ghost and can_ifc:
             bs = mixed_element.mesh.edge_bitset("ghost") | mixed_element.mesh.edge_bitset("interface")
         elif can_ghost:
@@ -774,6 +783,15 @@ def compile_multi(form, *, dof_handler, mixed_element,
         else:
             ghost_ids = np.zeros((0,), dtype=np.int32)
 
+        if can_facet:
+            bs_fp = mixed_element.mesh.edge_bitset("ghost")
+            try:
+                facet_patch_ids = np.asarray(bs_fp.to_indices(), dtype=np.int32)
+            except Exception:
+                facet_patch_ids = np.asarray(bs_fp, dtype=np.int32)
+        else:
+            facet_patch_ids = np.zeros((0,), dtype=np.int32)
+
         ls_token = getattr(ls_obj, "cache_token", None)
         if ls_token is None:
             ls_token = ("objid", int(id(ls_obj)))
@@ -782,8 +800,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
             qvol_eff,
             qifc_eff,
             qghost_eff,
+            qfacet_eff,
             tuple(sorted((int(a), int(b)) for (a, b) in ctx["derivs_cut"])),
             tuple(sorted((int(a), int(b)) for (a, b) in ctx["derivs_ghost"])),
+            tuple(sorted((int(a), int(b)) for (a, b) in ctx["derivs_facet_patch"])),
             bool(ctx["need_hess"]),
             bool(ctx["need_o3"]),
             bool(ctx["need_o4"]),
@@ -794,6 +814,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
             bool(can_cut),
             bool(can_ifc),
             bool(can_ghost),
+            bool(can_facet),
         )
 
         k = int(id(ls_obj))
@@ -806,11 +827,14 @@ def compile_multi(form, *, dof_handler, mixed_element,
             qvol=qvol_eff,
             qifc=qifc_eff,
             qghost=qghost_eff,
+            qfacet_patch=qfacet_eff if can_facet else None,
             cut_element_ids=cut_ids,
             interface_element_ids=ifc_ids,
             ghost_edge_ids=ghost_ids,
+            facet_patch_edge_ids=facet_patch_ids if can_facet else None,
             derivs_cut=set(ctx["derivs_cut"]),
             derivs_ghost=set(ctx["derivs_ghost"]),
+            derivs_facet_patch=set(ctx["derivs_facet_patch"]),
             allow_interface=bool(can_ifc),
             need_hess=bool(ctx["need_hess"]),
             need_o3=bool(ctx["need_o3"]),
@@ -1945,12 +1969,21 @@ def compile_multi(form, *, dof_handler, mixed_element,
             derivs = set(intg.measure.metadata.get("derivs", required_multi_indices(intg.integrand)))
             bs_def = intg.measure.defined_on
             deformation = getattr(intg.measure, "deformation", None)
+            ctx = _ctx_for(level_set)
+            ctx["want_facet_patch"] = True
+            ctx["facet_patch_qs"].add(int(qdeg))
+            ctx["derivs_facet_patch"].update(tuple((int(a), int(b)) for (a, b) in derivs))
+            ctx["need_hess"] = bool(ctx["need_hess"] or need_hess)
+            ctx["need_o3"] = bool(ctx["need_o3"] or need_o3)
+            ctx["need_o4"] = bool(ctx["need_o4"] or need_o4)
+            _note_deformation(ctx, deformation)
 
             def _facet_patch_static(
                 ls_obj,
                 reuse_static=None,
                 _bs_def=bs_def,
                 _derivs=derivs,
+                _ctx=ctx,
                 _dof_handler=dof_handler,
                 _me=me_kernel,
                 _ir=ir,
@@ -1998,16 +2031,25 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     )
                     return empty
 
-                geom = _dof_handler.precompute_facet_patch_factors(
-                    facet_ids=all_eids,
-                    qdeg=_qdeg,
-                    level_set=ls_obj,
-                    derivs=_derivs,
-                    reuse=True,
-                    allow_interface=False,
-                    deformation=_deformation,
-                )
-                geom = dict(geom)
+                geom_src = None
+                uni = _get_unified(ls_obj, _ctx)
+                if uni is not None and _single_int(_ctx.get("facet_patch_qs", set())) == int(_qdeg):
+                    geom_src = uni.get("facet_patch")
+                    if isinstance(geom_src, dict):
+                        eids_uni = np.asarray(geom_src.get("eids", []), dtype=np.int32)
+                        if all_eids.size and eids_uni.size:
+                            geom_src = _subset_entity_rows(geom_src, np.isin(eids_uni, all_eids))
+                if geom_src is None:
+                    geom_src = _dof_handler.precompute_facet_patch_factors(
+                        facet_ids=all_eids,
+                        qdeg=_qdeg,
+                        level_set=ls_obj,
+                        derivs=_derivs,
+                        reuse=True,
+                        allow_interface=False,
+                        deformation=_deformation,
+                    )
+                geom = dict(geom_src)
 
                 gdofs_map_raw = np.asarray(
                     geom.get("gdofs_map", np.zeros((len(all_eids), n_loc), dtype=np.int32)), dtype=np.int32
