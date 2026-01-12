@@ -887,7 +887,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
         # element-local layout when enrichment is active.
         me_kernel = mixed_element
         try:
-            if dom in {"interface", "ghost_edge"} and hasattr(dof_handler, "n_enriched") and callable(getattr(dof_handler, "n_enriched")):
+            if dom in {"interface", "ghost_edge", "facet_patch"} and hasattr(dof_handler, "n_enriched") and callable(getattr(dof_handler, "n_enriched")):
                 if dof_handler.n_enriched() > 0 and hasattr(dof_handler, "xfem_mixed_element") and callable(getattr(dof_handler, "xfem_mixed_element")):
                     me_kernel = dof_handler.xfem_mixed_element()
         except Exception:
@@ -1931,6 +1931,139 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     "ghost_edge",
                     level_set=level_set,
                     builder=_ghost_static,
+                    eids=eids_arr,
+                ),
+                intg,
+            )
+            continue
+
+        # ------------------------------------------------------------------
+        # FACET PATCH (NGSolve-style ghost stabilization on two-element patches)
+        # ------------------------------------------------------------------
+        if dom == "facet_patch":
+            level_set = intg.measure.level_set
+            derivs = set(intg.measure.metadata.get("derivs", required_multi_indices(intg.integrand)))
+            bs_def = intg.measure.defined_on
+            deformation = getattr(intg.measure, "deformation", None)
+
+            def _facet_patch_static(
+                ls_obj,
+                reuse_static=None,
+                _bs_def=bs_def,
+                _derivs=derivs,
+                _dof_handler=dof_handler,
+                _me=me_kernel,
+                _ir=ir,
+                _integrand=intg.integrand,
+                _qdeg=int(qdeg),
+                _param_order=tuple(getattr(runner, "param_order", []) or []),
+                _active_cols=np.asarray(active_cols, dtype=np.int32),
+                _deformation=deformation,
+            ):
+                mesh_obj = _me.mesh
+                bs_ghost_now = mesh_obj.edge_bitset("ghost")
+                edge_sel = (_bs_def & bs_ghost_now) if _bs_def is not None else bs_ghost_now
+                try:
+                    all_eids = np.asarray(edge_sel.to_indices(), dtype=np.int32)
+                except Exception:
+                    all_eids = np.asarray(edge_sel, dtype=np.int32)
+                all_eids = np.unique(all_eids)
+                if all_eids.size == 0:
+                    gdofs_map_empty = np.zeros((0, int(_active_cols.size)), dtype=np.int32)
+                    empty = {
+                        "eids": np.asarray([], dtype=np.int32),
+                        "qp_phys": np.empty((0, 0, 2), dtype=float),
+                        "qw": np.empty((0, 0), dtype=float),
+                        "normals": np.empty((0, 0, 2), dtype=float),
+                        "phis": np.empty((0, 0), dtype=float),
+                        "_phi_sig": np.empty((0,), dtype=float),
+                        "pos_map": np.empty((0, 0), dtype=np.int32),
+                        "neg_map": np.empty((0, 0), dtype=np.int32),
+                        "gdofs_map": gdofs_map_empty,
+                        "entity_kind": "edge",
+                        "is_ghost": True,
+                        "is_interface": False,
+                    }
+                    empty.update(
+                        _build_jit_kernel_args(
+                            _ir,
+                            _integrand,
+                            _me,
+                            _qdeg,
+                            dof_handler=_dof_handler,
+                            gdofs_map=gdofs_map_empty,
+                            param_order=_param_order,
+                            pre_built=empty,
+                        )
+                    )
+                    return empty
+
+                geom = _dof_handler.precompute_facet_patch_factors(
+                    facet_ids=all_eids,
+                    qdeg=_qdeg,
+                    level_set=ls_obj,
+                    derivs=_derivs,
+                    reuse=True,
+                    allow_interface=False,
+                    deformation=_deformation,
+                )
+                geom = dict(geom)
+
+                gdofs_map_raw = np.asarray(
+                    geom.get("gdofs_map", np.zeros((len(all_eids), n_loc), dtype=np.int32)), dtype=np.int32
+                )
+                ncols = gdofs_map_raw.shape[1] if gdofs_map_raw.ndim == 2 else 0
+                use_full_union = bool(ncols and ncols != _me.n_dofs_local)
+                if use_full_union:
+                    eff_cols = np.arange(ncols, dtype=np.int32)
+                else:
+                    eff_cols = _active_cols[_active_cols < ncols] if ncols else _active_cols
+                    if eff_cols.size == 0 and ncols:
+                        eff_cols = np.arange(ncols, dtype=np.int32)
+                gdofs_map_eff = gdofs_map_raw[:, eff_cols] if gdofs_map_raw.size else gdofs_map_raw
+
+                static = {
+                    **geom,
+                    "gdofs_map": gdofs_map_eff,
+                    "is_ghost": True,
+                    "is_interface": False,
+                    "entity_kind": "edge",
+                }
+
+                eids_sig = np.asarray(static.get("eids", all_eids), dtype=np.int32)
+                n_sig = int(eids_sig.shape[0])
+                phis_arr = np.asarray(geom.get("phis", np.empty((len(all_eids), 0))), dtype=float)
+                if phis_arr.ndim >= 2 and phis_arr.shape[0] == n_sig and phis_arr.shape[1] > 0:
+                    static["_phi_sig"] = np.asarray(phis_arr[:, 0], dtype=float)
+                else:
+                    static["_phi_sig"] = np.zeros((n_sig,), dtype=float)
+
+                static.update(
+                    _build_jit_kernel_args(
+                        _ir,
+                        _integrand,
+                        _me,
+                        _qdeg,
+                        dof_handler=_dof_handler,
+                        gdofs_map=gdofs_map_eff,
+                        param_order=_param_order,
+                        pre_built=static,
+                    )
+                )
+
+                if not use_full_union:
+                    static = _compress_static_for_active(static, _me, eff_cols)
+                return static
+
+            static = _facet_patch_static(level_set)
+            eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
+            _append_kernel(
+                _IntegralKernel(
+                    runner,
+                    static,
+                    "facet_patch",
+                    level_set=level_set,
+                    builder=_facet_patch_static,
                     eids=eids_arr,
                 ),
                 intg,

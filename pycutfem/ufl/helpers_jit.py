@@ -561,12 +561,22 @@ def _build_jit_kernel_args(       # ← signature unchanged
                                 f"_build_jit_kernel_args: cannot build '{side}_map_{fld}': "
                                 f"missing component_dof_slices for field '{fld}'."
                             )
-                        if int(sl.stop) > int(n_union):
+                        # `compile_multi` may compress `gdofs_map` to the kernel's active columns
+                        # (subset of mixed-element local indices). In that case, the union width
+                        # is `len(active_cols)` and component slices must be mapped through the
+                        # active-col permutation.
+                        full_to_union = {int(old): int(new) for new, old in enumerate(_active_cols)}
+                        row = np.asarray(
+                            [full_to_union.get(int(i), -1) for i in range(int(sl.start), int(sl.stop))],
+                            dtype=np.int32,
+                        )
+                        if np.any(row < 0):
+                            missing = [int(i) for i in range(int(sl.start), int(sl.stop)) if int(i) not in full_to_union]
                             raise ValueError(
                                 f"_build_jit_kernel_args: cannot build '{side}_map_{fld}': "
-                                f"field slice {sl} exceeds union width n_union={n_union}."
+                                f"active-col compression dropped local indices {missing} for slice {sl} "
+                                f"(union width n_union={n_union})."
                             )
-                        row = np.arange(int(sl.start), int(sl.stop), dtype=np.int32)
                         args[f"{side}_map_{fld}"] = np.tile(row, (nE, 1))
                         continue
 
@@ -781,6 +791,28 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
                 args[name] = tab
                 continue
+
+            # 2b) Aligned-interface edge kernel placeholders:
+            # compile_multi always registers an aligned-interface kernel so newly-aligned
+            # edges can appear during refresh. When there are no interface-aligned edges,
+            # the "edge" precompute is empty and does not carry r** tables. Create
+            # correctly-shaped empty tables so kernel arg building succeeds.
+            if pre_built is not None and pre_built.get("entity_kind") == "edge":
+                try:
+                    qp_phys = np.asarray(pre_built.get("qp_phys"), dtype=np.float64)
+                    nE = int(qp_phys.shape[0])
+                    nQ = int(qp_phys.shape[1]) if qp_phys.ndim >= 2 else 0
+                except Exception:
+                    nE = int(np.asarray(gdofs_map).shape[0]) if gdofs_map is not None else 0
+                    nQ = 0
+                if nE == 0:
+                    n_union = (
+                        int(np.asarray(gdofs_map).shape[1])
+                        if gdofs_map is not None
+                        else int(_union_size_from_prebuilt())
+                    )
+                    args[name] = np.empty((0, nQ, n_union), dtype=np.float64)
+                    continue
 
             # 3) Otherwise (GHOST with no precompute): must be provided via metadata['derivs']
             if _is_ghost(pre_built):

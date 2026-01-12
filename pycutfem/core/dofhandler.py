@@ -2726,43 +2726,56 @@ class DofHandler:
                     qref = None
 
             if qp_phys is None and _HAVE_ISO_IFC:
-            # Build segment endpoints per cut element (P0,P1)
-            P0 = np.empty((nE, 2), dtype=float)
-            P1 = np.empty((nE, 2), dtype=float)
-            for i, (_, _, p0, p1) in enumerate(segment_records):
-                P0[i, :] = np.asarray(p0, float)
-                P1[i, :] = np.asarray(p1, float)
-            # degree of the interface parameterization
-            p_curve = max(2, mesh.poly_order) if deformation is not None else mesh.poly_order
-            order   = max(1, int(qdeg))
-            qp_phys, qw, that, qref = _iso_ifc_rule(
-                level_set, P0, P1,
-                p=int(p_curve), order=int(order), project_steps=3, tol=SIDE.tol,
-                mesh=mesh, eids=np.asarray(seg_eids, dtype=int),
-                return_tangent=True, return_qref=True)
-            qp_phys = np.asarray(qp_phys, dtype=float)       # (nE, nQ, 2)
-            qw      = np.asarray(qw,      dtype=float)       # (nE, nQ)
-            if that is not None:
-                that = np.asarray(that, dtype=float)         # (nE, nQ, 2)
-            if qref is not None:
-                qref = np.asarray(qref, dtype=float)         # (nE, nQ, 2)
-            nQ = qp_phys.shape[1]
-        elif qp_phys is None:
-            # Robust fallback: 'nseg' uniform → constant nQ = qdeg * nseg
-            nseg_eff = int(nseg if nseg is not None else max(3, mesh.poly_order + qdeg // 2))
-            nQ = int(max(1, int(qdeg)) * nseg_eff)
-            qp_phys = np.empty((nE, nQ, 2), dtype=float)
-            qw      = np.empty((nE, nQ),    dtype=float)
-            # map each cut element segment P0→P1 with curved interface quadrature
-            for i, (_, _, p0, p1) in enumerate(segment_records):
-                pts, wts = curved_line_quadrature(
-                    level_set, np.asarray(p0, float), np.asarray(p1, float),
-                    order=int(qdeg), nseg=nseg_eff, project_steps=3, tol=1e-12
+                # Build segment endpoints per cut element (P0,P1)
+                P0 = np.empty((nE, 2), dtype=float)
+                P1 = np.empty((nE, 2), dtype=float)
+                for i, (_, _, p0, p1) in enumerate(segment_records):
+                    P0[i, :] = np.asarray(p0, float)
+                    P1[i, :] = np.asarray(p1, float)
+                # degree of the interface parameterization
+                p_curve = max(2, mesh.poly_order) if deformation is not None else mesh.poly_order
+                order = max(1, int(qdeg))
+                qp_phys, qw, that, qref = _iso_ifc_rule(
+                    level_set,
+                    P0,
+                    P1,
+                    p=int(p_curve),
+                    order=int(order),
+                    project_steps=3,
+                    tol=SIDE.tol,
+                    mesh=mesh,
+                    eids=np.asarray(seg_eids, dtype=int),
+                    return_tangent=True,
+                    return_qref=True,
                 )
-                qp_phys[i, :, :] = np.asarray(pts, float).reshape(nQ, 2)
-                qw[i, :]         = np.asarray(wts, float).reshape(nQ)
-            that = None
-            qref = None
+                qp_phys = np.asarray(qp_phys, dtype=float)  # (nE, nQ, 2)
+                qw = np.asarray(qw, dtype=float)  # (nE, nQ)
+                if that is not None:
+                    that = np.asarray(that, dtype=float)  # (nE, nQ, 2)
+                if qref is not None:
+                    qref = np.asarray(qref, dtype=float)  # (nE, nQ, 2)
+                nQ = qp_phys.shape[1]
+            elif qp_phys is None:
+                # Robust fallback: 'nseg' uniform → constant nQ = qdeg * nseg
+                nseg_eff = int(nseg if nseg is not None else max(3, mesh.poly_order + qdeg // 2))
+                nQ = int(max(1, int(qdeg)) * nseg_eff)
+                qp_phys = np.empty((nE, nQ, 2), dtype=float)
+                qw = np.empty((nE, nQ), dtype=float)
+                # map each cut element segment P0→P1 with curved interface quadrature
+                for i, (_, _, p0, p1) in enumerate(segment_records):
+                    pts, wts = curved_line_quadrature(
+                        level_set,
+                        np.asarray(p0, float),
+                        np.asarray(p1, float),
+                        order=int(qdeg),
+                        nseg=nseg_eff,
+                        project_steps=3,
+                        tol=1e-12,
+                    )
+                    qp_phys[i, :, :] = np.asarray(pts, float).reshape(nQ, 2)
+                    qw[i, :] = np.asarray(wts, float).reshape(nQ)
+                that = None
+                qref = None
 
         # ------------------------------------------------------------------------------
         # 2) Reference coords (ξ,η) at each interface quadrature point

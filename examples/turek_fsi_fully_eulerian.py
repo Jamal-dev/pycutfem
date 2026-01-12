@@ -86,7 +86,7 @@ from pycutfem.ufl.expressions import (
     trace,
     Jump,
 )
-from pycutfem.ufl.measures import dx, ds, dGhost, dInterface
+from pycutfem.ufl.measures import dx, ds, dGhost, dInterface, dFacetPatch
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.io.vtk import export_vtk
 from pycutfem.io.visualization import plot_mesh_2
@@ -250,6 +250,24 @@ def _parse_args():
     )
     parser.add_argument("--save-vtk", dest="save_vtk", action="store_true", help="Enable VTK output. Env: SAVE_VTK.")
     parser.add_argument("--no-save-vtk", dest="save_vtk", action="store_false", help="Disable VTK output. Env: SAVE_VTK.")
+    parser.add_argument(
+        "--compute-observables",
+        dest="compute_observables",
+        action="store_true",
+        help="Compute drag/lift/Δp each step (python backend). Env: COMPUTE_OBSERVABLES.",
+    )
+    parser.add_argument(
+        "--no-compute-observables",
+        dest="compute_observables",
+        action="store_false",
+        help="Disable observables computation. Env: COMPUTE_OBSERVABLES.",
+    )
+    parser.add_argument(
+        "--obs-every",
+        type=int,
+        default=int(os.getenv("OBS_EVERY", "1")),
+        help="Compute observables every N steps when enabled (0 disables). Env: OBS_EVERY.",
+    )
     parser.add_argument(
         "--vtk-interface-clamp",
         type=float,
@@ -463,6 +481,7 @@ def _parse_args():
     )
     parser.set_defaults(
         save_vtk=_env_bool("SAVE_VTK", True),
+        compute_observables=_env_bool("COMPUTE_OBSERVABLES", True),
         run_fd_check=_env_bool("RUN_FD_CHECK", False),
         run_fd_terms=_env_bool("RUN_FD_TERMS", False),
         run_time_stepping=_env_bool("RUN_TIME_STEPPING", True),
@@ -572,6 +591,8 @@ def _apply_env_overrides(args: argparse.Namespace) -> None:
     _set_env("PLOT_MESH_EVERY", args.plot_mesh_every)
     _set_env("PLOT_RESOLUTION", args.plot_resolution)
     _set_env_bool("SAVE_VTK", args.save_vtk)
+    _set_env_bool("COMPUTE_OBSERVABLES", args.compute_observables)
+    _set_env("OBS_EVERY", args.obs_every)
     _set_env_bool("RUN_FD_CHECK", args.run_fd_check)
     _set_env_bool("RUN_FD_TERMS", args.run_fd_terms)
     _set_env_bool("RUN_TIME_STEPPING", args.run_time_stepping)
@@ -662,7 +683,7 @@ BEAM_REF_HEIGHT = BEAM_HEIGHT
 POINT_B = (0.15, 0.2)
 POINT_A_INITIAL = (0.6, 0.2) # Point A will change while Point B is fixed
 
-BETA_PENALTY = float(os.getenv("BETA_PENALTY", "90.0")) * MU_F
+BETA_PENALTY = float(os.getenv("BETA_PENALTY", "20.0")) * MU_F
 DT = float(ARGS.dt)
 POLY_ORDER = int(ARGS.poly_order)
 USE_TAYLOR_HOOD = os.getenv("PYCUTFEM_TAYLOR_HOOD", "0") not in ("0", "false", "False")
@@ -4521,12 +4542,18 @@ dΓ = dInterface(
     level_set=ls_beam,
     metadata={"q": qvol + 2, "derivs": {(0, 0), (0, 1), (1, 0)}, "linear_interface": USE_LINEAR_INTERFACE},
 )
-dG_fluid = dGhost(
+
+use_facet_patch_ghost = _env_bool(
+    "USE_FACET_PATCH_GHOST", str(getattr(dof_handler, "method", "")).lower() == "cg"
+)
+ghost_measure = dFacetPatch if use_facet_patch_ghost else dGhost
+
+dG_fluid = ghost_measure(
     defined_on=domains["fluid_ghost"],
     level_set=ls_beam,
     metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
 )
-dG_solid = dGhost(
+dG_solid = ghost_measure(
     defined_on=domains["solid_ghost"],
     level_set=ls_beam,
     metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
@@ -4863,17 +4890,17 @@ mu_f_const = Constant(MU_F)
 mu_s_const = Constant(MU_S)
 lambda_s_const = Constant(LAMBDA_S)
 
-du_f_ifc = du_f
-dp_f_ifc = dp_f
-test_vel_f_ifc = test_vel_f
-test_q_f_ifc = test_q_f
-uf_k_ifc = uf_k
-pf_k_ifc = pf_k
-du_s_ifc = du_s
-ddisp_s_ifc = ddisp_s
-test_vel_s_ifc = test_vel_s
-us_k_ifc = us_k
-disp_k_ifc = disp_k
+du_f_ifc = du_f_R
+dp_f_ifc = dp_f_R
+test_vel_f_ifc = test_vel_f_R
+test_q_f_ifc = test_q_f_R
+uf_k_ifc = uf_k_R
+pf_k_ifc = pf_k_R
+du_s_ifc = du_s_R
+ddisp_s_ifc = ddisp_s_R
+test_vel_s_ifc = test_vel_s_R
+us_k_ifc = us_k_R
+disp_k_ifc = disp_k_R
 
 jump_vel_trial = Pos(du_f_ifc) - Neg(du_s_ifc)
 jump_vel_test = Pos(test_vel_f_ifc) - Neg(test_vel_s_ifc)
@@ -5228,11 +5255,12 @@ residual_form = r_vol_f + R_int + r_vol_s + r_stab + r_p_stab + r_cip + r_svc + 
 # -----------------------------------------------------------------------------
 # Interface residual diagnostics (optional)
 # -----------------------------------------------------------------------------
-def _trace_interface_residuals(label: str = "ifc") -> None:
+def _trace_interface_residuals(label: str = "ifc", *, bcs_apply=None) -> None:
     if os.getenv("PYCUTFEM_INTERFACE_RESIDUAL_TRACE", "").lower() not in {"1", "true", "yes"}:
         return
     backend = os.getenv("PYCUTFEM_INTERFACE_RESIDUAL_TRACE_BACKEND", "jit").strip() or "jit"
     seed_fields = os.getenv("PYCUTFEM_INTERFACE_RESIDUAL_SEED", "").lower() in {"1", "true", "yes"}
+    bcs_apply = bcs if bcs_apply is None else bcs_apply
     terms = {
         "R_int": R_int,
         "R_int_fluid": R_int_fluid,
@@ -5274,6 +5302,23 @@ def _trace_interface_residuals(label: str = "ifc") -> None:
         dof_handler.apply_bcs(bcs, uf_k, pf_k)
         print(f"[{label}] seeded uf_k/pf_k for interface residual trace")
 
+    bc_dofs: set[int] = set()
+    try:
+        bc_dofs = {int(k) for k in dof_handler.get_dirichlet_data(bcs_apply).keys()}
+    except Exception:
+        bc_dofs = set()
+    inactive_dofs = {int(k) for k in getattr(dof_handler, "dof_tags", {}).get("inactive", set())}
+    active_dofs: set[int] = set()
+    try:
+        solver_obj = globals().get("solver", None)
+        active_raw = getattr(solver_obj, "active_dofs", None) if solver_obj is not None else None
+        if active_raw is None:
+            active_dofs = set()
+        else:
+            active_dofs = {int(k) for k in np.asarray(active_raw, dtype=int).ravel()}
+    except Exception:
+        active_dofs = set()
+
     print(f"[{label}] interface residual trace backend={backend}")
     for name, term in terms.items():
         if term is None:
@@ -5285,6 +5330,35 @@ def _trace_interface_residuals(label: str = "ifc") -> None:
         fluid_norm = float(np.linalg.norm(R[fluid_vel], ord=np.inf)) if fluid_vel.size else 0.0
         print(f"[{label}] {name}: |R|_solid_vel_inf={solid_norm:.3e} |R|_fluid_vel_inf={fluid_norm:.3e}")
 
+        if os.getenv("PYCUTFEM_INTERFACE_RESIDUAL_TRACE_WORST", "").lower() in {"1", "true", "yes"}:
+            def _dump_worst(tag: str, subset: np.ndarray) -> None:
+                if subset.size == 0:
+                    return
+                vals = np.asarray(R[subset], dtype=float)
+                idx = int(np.argmax(np.abs(vals)))
+                gdof = int(subset[idx])
+                val = float(vals[idx])
+                field = None
+                try:
+                    field = getattr(dof_handler, "_dof_to_node_map", {}).get(gdof, (None, None))[0]
+                except Exception:
+                    field = None
+                status = "active" if gdof in active_dofs else ("inactive" if gdof in inactive_dofs else "other")
+                bc = "bc" if gdof in bc_dofs else "free"
+                red = None
+                try:
+                    solver_obj = globals().get("solver", None)
+                    if solver_obj is not None and hasattr(solver_obj, "full_to_red"):
+                        red = int(np.asarray(getattr(solver_obj, "full_to_red"))[gdof])
+                except Exception:
+                    red = None
+                fmsg = f", field={field}" if field is not None else ""
+                rmsg = f", red={red}" if red is not None else ""
+                print(f"[{label}] {name}: worst_{tag} gdof={gdof} val={val:+.3e} ({status},{bc}{fmsg}{rmsg})")
+
+            _dump_worst("solid", solid_vel)
+            _dump_worst("fluid", fluid_vel)
+
     if os.getenv("PYCUTFEM_INTERFACE_RESIDUAL_TRACE_FIELDS", "").lower() in {"1", "true", "yes"}:
         u_pos_sq = dot(Pos(uf_k_ifc), Pos(uf_k_ifc)) * dΓ
         jump_sq = dot(jump_vel_res, jump_vel_res) * dΓ
@@ -5292,7 +5366,9 @@ def _trace_interface_residuals(label: str = "ifc") -> None:
             u_pos_sq.integrand: {"name": "u_pos_sq"},
             jump_sq.integrand: {"name": "jump_sq"},
         }
-        res = assemble_form(Equation(None, u_pos_sq + jump_sq), dof_handler=dof_handler, bcs=[], backend=backend, assembler_hooks=hooks)
+        res = assemble_form(
+            Equation(None, u_pos_sq + jump_sq), dof_handler=dof_handler, bcs=[], backend=backend, assembler_hooks=hooks
+        )
         u_pos_val = float(np.asarray(res.get("u_pos_sq", 0.0)).reshape(-1)[0])
         jump_val = float(np.asarray(res.get("jump_sq", 0.0)).reshape(-1)[0])
         print(f"[{label}] ⟨|u_pos|^2⟩_Γ={u_pos_val:.3e} ⟨|jump|^2⟩_Γ={jump_val:.3e}")
@@ -5303,7 +5379,7 @@ def _trace_interface_residuals(label: str = "ifc") -> None:
         dof_handler.apply_bcs(bcs, uf_k, pf_k)
 
 # Optional: trace interface residual contributions at the initial state.
-_trace_interface_residuals("ifc_init")
+_trace_interface_residuals("ifc_init", bcs_apply=bcs_t0)
 
 # -----------------------------------------------------------------------------
 # Peclet number diagnostics (optional)
@@ -5545,6 +5621,11 @@ obs_history = {"time": [], "tip": [], "drag": [], "lift": [], "dp": []}
 output_dir = ARGS.output_dir
 os.makedirs(output_dir, exist_ok=True)
 SAVE_VTK = bool(ARGS.save_vtk)
+COMPUTE_OBSERVABLES = bool(getattr(ARGS, "compute_observables", True))
+try:
+    OBS_EVERY = int(getattr(ARGS, "obs_every", 1))
+except Exception:
+    OBS_EVERY = 1
 PLOT_MESH_EVERY = max(1, int(ARGS.plot_mesh_every))
 VTK_INTERFACE_CLAMP = float(os.getenv("VTK_INTERFACE_CLAMP", "0.0"))
 VTK_CLAMP_BAND = max(1.5 * MESH_SIZE, 5.0 * LEVELSET_EDGE_TOL)
@@ -6577,7 +6658,7 @@ if ARGS.run_time_stepping:
         )
 
         # Optional: term-by-term interface residual traces.
-        _trace_interface_residuals(f"ifc_fail_step{step:04d}")
+        _trace_interface_residuals(f"ifc_fail_step{step:04d}", bcs_apply=ctx.get("bcs", bcs))
 
         if not retry_penalties or not retry_scales:
             return False
@@ -6965,7 +7046,8 @@ if ARGS.run_time_stepping:
             funcs=[uf_k, pf_k, us_k, disp_k],
             prev_funcs=[uf_n, pf_n, us_n, disp_n],
         )
-        _compute_observables(step_idx[0], t_curr)
+        if COMPUTE_OBSERVABLES and int(OBS_EVERY) > 0 and (int(step_idx[0]) % int(OBS_EVERY)) == 0:
+            _compute_observables(step_idx[0], t_curr)
         _probe_flow_velocity(step_idx[0])
         _plot_mesh(step_idx[0], title="Mesh / level-set")
         step_idx[0] += 1

@@ -1611,7 +1611,7 @@ class NewtonSolver:
                 except RuntimeError as exc:
                     msg = str(exc)
                     if "Line search failed" in msg:
-                        accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "10.0"))
+                        accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
                         tol_accept = float(tol_eff) if "tol_eff" in locals() else float(getattr(self.np, "newton_tol", 0.0))
                         if accept_factor > 0.0 and tol_accept > 0.0 and norm_R <= accept_factor * tol_accept:
                             line_search_time = time.perf_counter() - t_ls
@@ -1935,8 +1935,6 @@ class NewtonSolver:
     def _assemble_system_reduced(self, coeffs, *, need_matrix: bool = True):
         if self.backend == "python":
             return self._assemble_system_reduced_python(coeffs, need_matrix=need_matrix)
-        if getattr(self, "constraints", None) is not None:
-            return self._assemble_system_with_constraints(coeffs, need_matrix=need_matrix)
         self._maybe_refresh_deformation(coeffs)
         nred = len(self.active_dofs)
         if need_matrix:
@@ -1944,6 +1942,8 @@ class NewtonSolver:
             return A_red, R_red
         else:
             # residual only: keep a light path that avoids fancy indexing
+            if getattr(self, "_pattern_stale", True):
+                self._build_reduced_pattern()
             R_red = np.zeros(nred)
             for ker in self.kernels_F:
                 gdofs = ker.static_args.get("gdofs_map")
@@ -1957,11 +1957,45 @@ class NewtonSolver:
                     valid_full = full >= 0
                     if not np.any(valid_full):
                         continue
-                    rmap = -np.ones_like(full, dtype=int)
-                    rmap[valid_full] = self.full_to_red[full[valid_full]]
-                    m = rmap >= 0
-                    if np.any(m):
-                        np.add.at(R_red, rmap[m], Floc[e][m])
+                    if getattr(self, "constraints", None) is None:
+                        rmap = -np.ones_like(full, dtype=int)
+                        rmap[valid_full] = self.full_to_red[full[valid_full]]
+                        m = rmap >= 0
+                        if np.any(m):
+                            np.add.at(R_red, rmap[m], Floc[e][m])
+                    else:
+                        full_to_master = getattr(self, "_constr_full_to_master", None)
+                        is_slave = getattr(self, "_constr_is_slave", None)
+                        slave_map = getattr(self, "_constr_slave_map", None)
+                        if (
+                            not isinstance(full_to_master, np.ndarray)
+                            or not isinstance(is_slave, np.ndarray)
+                            or not isinstance(slave_map, dict)
+                        ):
+                            continue
+                        for loc_i, gd in zip(np.nonzero(valid_full)[0].tolist(), full[valid_full].tolist()):
+                            gd_i = int(gd)
+                            if gd_i < 0 or gd_i >= int(full_to_master.size):
+                                continue
+                            val = float(Floc[e][int(loc_i)])
+                            if not np.isfinite(val) or val == 0.0:
+                                continue
+                            if bool(is_slave[gd_i]):
+                                combo = slave_map.get(gd_i)
+                                if combo is None:
+                                    continue
+                                mcols, wts = combo
+                                for mcol, wv in zip(mcols.tolist(), wts.tolist()):
+                                    red = int(self.full_to_red[int(mcol)])
+                                    if red >= 0:
+                                        R_red[red] += float(wv) * val
+                            else:
+                                mcol = int(full_to_master[gd_i])
+                                if mcol < 0:
+                                    continue
+                                red = int(self.full_to_red[mcol])
+                                if red >= 0:
+                                    R_red[red] += val
             return None, R_red
 
     def _assemble_full_system_python(self, apply_bcs=None):
@@ -2211,6 +2245,12 @@ class NewtonSolver:
                 mat.setPreallocationCSR((ia, ja))
             except Exception:
                 pass
+            try:
+                # When the interface moves or the active set changes, the CSR
+                # pattern can legitimately change; do not hard-fail on new nonzeros.
+                mat.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
+            except Exception:
+                pass
             mat.setUp()
 
             ksp = PETSc.KSP().create(comm=comm)
@@ -2244,9 +2284,9 @@ class NewtonSolver:
         ja = np.asarray(A.indices, dtype=PETSc.IntType)
         a = np.asarray(A.data, dtype=np.float64)
         try:
-            mat.setValuesCSR((ia, ja), a)
-        except TypeError:
             mat.setValuesCSR(ia, ja, a)
+        except TypeError:
+            mat.setValuesCSR((ia, ja), a)
         mat.assemblyBegin()
         mat.assemblyEnd()
 
@@ -2429,16 +2469,6 @@ class NewtonSolver:
             self._pattern_stale = False
             return
 
-        if getattr(self, "constraints", None) is not None:
-            # Constraint handling assembles in the full space and condenses;
-            # skip pattern building to avoid indexing physical DOF ids here.
-            self._csr_indptr = np.zeros(1, dtype=np.int32)
-            self._csr_indices = np.zeros(0, dtype=np.int32)
-            self._elem_pos = [[] for _ in self.kernels_K]
-            self._elem_lidx = [[] for _ in self.kernels_K]
-            self._pattern_stale = False
-            return
-
         if getattr(self, "_pattern_stale", True) is False and hasattr(self, "_csr_indptr"):
             return
 
@@ -2450,6 +2480,10 @@ class NewtonSolver:
             self._elem_pos = [[] for _ in self.kernels_K]
             self._elem_lidx = [[] for _ in self.kernels_K]
             self._pattern_stale = False
+            return
+
+        if getattr(self, "constraints", None) is not None:
+            self._build_reduced_pattern_constraints()
             return
 
         # 1) Collect column sets per reduced row
@@ -2534,6 +2568,254 @@ class NewtonSolver:
             self._elem_pos.append(pos_list)
             self._elem_lidx.append(lidx_list)
 
+        # No constraint metadata in this mode.
+        self._elem_extra = None
+        self._pattern_stale = False
+
+
+    def _build_reduced_pattern_constraints(self) -> None:
+        """
+        Build reduced CSR pattern + per-entity scatter plans when hanging-node
+        constraints are present.
+
+        We assemble directly in the master space (u_full = E @ u_master) by
+        distributing slave DOF contributions to their master DOFs using the
+        constraint weights, avoiding the expensive full-space assembly and the
+        subsequent Eᵀ A E condensation.
+        """
+
+        constraints = getattr(self, "constraints", None)
+        if constraints is None:
+            raise RuntimeError("_build_reduced_pattern_constraints called without constraints.")
+
+        n = int(len(self.active_dofs))
+        if n <= 0:
+            self._csr_indptr = np.zeros(1, dtype=np.int32)
+            self._csr_indices = np.zeros(0, dtype=np.int32)
+            self._elem_pos = [[] for _ in self.kernels_K]
+            self._elem_lidx = [[] for _ in self.kernels_K]
+            self._elem_extra = [[] for _ in self.kernels_K]
+            self._pattern_stale = False
+            return
+
+        # Lookup tables:
+        # - full gdof -> master column index (or -1 if slave/unmapped)
+        # - slave full gdof -> (master_cols[], weights[])
+        ndof_full = int(getattr(self.dh, "total_dofs", 0))
+        full_to_master = np.full(ndof_full, -1, dtype=np.int32)
+        master_ids = np.asarray(getattr(constraints, "master_ids", np.array([], dtype=int)), dtype=int)
+        for col, gd in enumerate(master_ids.tolist()):
+            gd_i = int(gd)
+            if 0 <= gd_i < ndof_full:
+                full_to_master[gd_i] = int(col)
+
+        slave_to_master_cols: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        is_slave = np.zeros(ndof_full, dtype=bool)
+        for sdof, combo in getattr(constraints, "slave_to_master", {}).items():
+            sdof_i = int(sdof)
+            if sdof_i < 0 or sdof_i >= ndof_full:
+                continue
+            is_slave[sdof_i] = True
+            mcols: list[int] = []
+            wts: list[float] = []
+            for mdof, w in combo:
+                mdof_i = int(mdof)
+                if mdof_i < 0 or mdof_i >= ndof_full:
+                    continue
+                mcol = int(full_to_master[mdof_i])
+                if mcol < 0:
+                    continue
+                mcols.append(mcol)
+                wts.append(float(w))
+            if mcols:
+                slave_to_master_cols[sdof_i] = (np.asarray(mcols, dtype=np.int32), np.asarray(wts, dtype=float))
+
+        # Save for residual-only assembly path.
+        self._constr_full_to_master = full_to_master
+        self._constr_is_slave = is_slave
+        self._constr_slave_map = slave_to_master_cols
+
+        full_to_red_master = np.asarray(self.full_to_red, dtype=int)
+
+        def _add_red(red_set: set[int], gd: int) -> None:
+            if gd < 0 or gd >= ndof_full:
+                return
+            if bool(is_slave[gd]):
+                combo = slave_to_master_cols.get(int(gd))
+                if combo is None:
+                    return
+                mcols, _w = combo
+                for mcol in mcols.tolist():
+                    red = int(full_to_red_master[int(mcol)])
+                    if red >= 0:
+                        red_set.add(red)
+                return
+            mcol = int(full_to_master[int(gd)])
+            if mcol < 0:
+                return
+            red = int(full_to_red_master[mcol])
+            if red >= 0:
+                red_set.add(red)
+
+        # 1) Collect column sets per reduced row
+        rows_cols: list[set[int]] = [set() for _ in range(n)]
+        for ker in self.kernels_K:
+            gdofs = ker.static_args.get("gdofs_map")
+            if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2 or gdofs.shape[0] == 0:
+                continue
+            for e in range(int(gdofs.shape[0])):
+                full = np.asarray(gdofs[e], dtype=int)
+                red_set: set[int] = set()
+                for gd in full.tolist():
+                    _add_red(red_set, int(gd))
+                if not red_set:
+                    continue
+                for r in red_set:
+                    rows_cols[r].update(red_set)
+
+        # 2) Build CSR (row-wise sorted for determinism)
+        indptr = np.zeros(n + 1, dtype=np.int32)
+        for i in range(n):
+            indptr[i + 1] = indptr[i] + len(rows_cols[i])
+        indices = np.empty(indptr[-1], dtype=np.int32)
+        for i in range(n):
+            cols = sorted(rows_cols[i])
+            indices[indptr[i] : indptr[i + 1]] = np.asarray(cols, dtype=np.int32)
+        self._csr_indptr, self._csr_indices = indptr, indices
+
+        # Pattern changed → drop PETSc cache
+        try:
+            if str(getattr(self.lp, "backend", "scipy") or "scipy").lower() == "petsc":
+                if hasattr(self, "_petsc_linear_cache"):
+                    delattr(self, "_petsc_linear_cache")
+        except Exception:
+            pass
+
+        # 3) Per-kernel scatter plans
+        self._elem_pos = []
+        self._elem_lidx = []
+        self._elem_extra = []
+
+        def _pflat(rows: np.ndarray) -> np.ndarray:
+            rows = np.asarray(rows, dtype=np.int32)
+            m = int(rows.size)
+            if m <= 0:
+                return np.empty(0, dtype=np.int32)
+            out = np.empty(m * m, dtype=np.int32)
+            for ai, r in enumerate(rows.tolist()):
+                r_i = int(r)
+                s = int(indptr[r_i])
+                t = int(indptr[r_i + 1])
+                cols = indices[s:t]
+                jj = np.searchsorted(cols, rows)
+                out[ai * m : (ai + 1) * m] = s + jj.astype(np.int32, copy=False)
+            return out
+
+        for ker in self.kernels_K:
+            gdofs = ker.static_args.get("gdofs_map")
+            if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2:
+                self._elem_pos.append([])
+                self._elem_lidx.append([])
+                self._elem_extra.append([])
+                continue
+            nel = int(gdofs.shape[0])
+            nloc = int(gdofs.shape[1]) if gdofs.ndim == 2 else 0
+            pos_list: list[np.ndarray] = []
+            lidx_list: list[np.ndarray] = []
+            extra_list: list[object | None] = []
+
+            for e in range(nel):
+                full = np.asarray(gdofs[e], dtype=int)
+                valid = full >= 0
+                if not np.any(valid):
+                    pos_list.append(np.empty(0, dtype=np.int32))
+                    lidx_list.append(np.empty(0, dtype=np.int32))
+                    extra_list.append(None)
+                    continue
+
+                full_valid = full[valid].astype(int, copy=False)
+                has_slave = bool(np.any(is_slave[full_valid]))
+
+                if not has_slave:
+                    mcols = full_to_master[full_valid]
+                    ok = mcols >= 0
+                    if not np.any(ok):
+                        pos_list.append(np.empty(0, dtype=np.int32))
+                        lidx_list.append(np.empty(0, dtype=np.int32))
+                        extra_list.append(None)
+                        continue
+                    reds = full_to_red_master[mcols[ok]]
+                    keep = reds >= 0
+                    if not np.any(keep):
+                        pos_list.append(np.empty(0, dtype=np.int32))
+                        lidx_list.append(np.empty(0, dtype=np.int32))
+                        extra_list.append(None)
+                        continue
+                    rows = np.asarray(reds[keep], dtype=np.int32)
+                    lidx = np.nonzero(valid)[0][ok][keep].astype(np.int32, copy=False)
+                    pos_list.append(_pflat(rows))
+                    lidx_list.append(lidx)
+                    extra_list.append(None)
+                    continue
+
+                # Constrained entity: local mapping P via ragged rows
+                maps: list[list[tuple[int, float]]] = [[] for _ in range(nloc)]
+                red_set: set[int] = set()
+                for i in range(nloc):
+                    gd = int(full[i])
+                    if gd < 0:
+                        continue
+                    if bool(is_slave[gd]):
+                        combo = slave_to_master_cols.get(gd)
+                        if combo is None:
+                            continue
+                        mcols, wts = combo
+                        for mcol, w in zip(mcols.tolist(), wts.tolist()):
+                            red = int(full_to_red_master[int(mcol)])
+                            if red >= 0:
+                                maps[i].append((red, float(w)))
+                                red_set.add(red)
+                    else:
+                        mcol = int(full_to_master[gd])
+                        if mcol < 0:
+                            continue
+                        red = int(full_to_red_master[mcol])
+                        if red >= 0:
+                            maps[i].append((red, 1.0))
+                            red_set.add(red)
+
+                if not red_set:
+                    pos_list.append(np.empty(0, dtype=np.int32))
+                    lidx_list.append(np.empty(0, dtype=np.int32))
+                    extra_list.append(None)
+                    continue
+
+                rows_unique = np.asarray(sorted(red_set), dtype=np.int32)
+                red_to_local = {int(r): j for j, r in enumerate(rows_unique.tolist())}
+
+                ptr = np.zeros(nloc + 1, dtype=np.int32)
+                j_acc: list[int] = []
+                w_acc: list[float] = []
+                for i in range(nloc):
+                    tmp: dict[int, float] = {}
+                    for red, w in maps[i]:
+                        jj = int(red_to_local[int(red)])
+                        tmp[jj] = tmp.get(jj, 0.0) + float(w)
+                    for jj, w in tmp.items():
+                        j_acc.append(int(jj))
+                        w_acc.append(float(w))
+                    ptr[i + 1] = int(len(j_acc))
+                rep_j = np.asarray(j_acc, dtype=np.int32)
+                rep_w = np.asarray(w_acc, dtype=float)
+
+                pos_list.append(_pflat(rows_unique))
+                lidx_list.append(np.empty(0, dtype=np.int32))
+                extra_list.append((rows_unique, ptr, rep_j, rep_w))
+
+            self._elem_pos.append(pos_list)
+            self._elem_lidx.append(lidx_list)
+            self._elem_extra.append(extra_list)
+
         self._pattern_stale = False
 
 
@@ -2556,7 +2838,11 @@ class NewtonSolver:
         prof_entries = []
 
         # Matrix (Jacobian) blocks
-        for ker, pos_list, lidx_list in zip(self.kernels_K, self._elem_pos, self._elem_lidx):
+        extra_lists = getattr(self, "_elem_extra", None)
+        if extra_lists is None:
+            extra_lists = [None for _ in self.kernels_K]
+
+        for ker, pos_list, lidx_list, extra_list in zip(self.kernels_K, self._elem_pos, self._elem_lidx, extra_lists):
             gdofs = ker.static_args.get("gdofs_map")
             if isinstance(gdofs, np.ndarray) and gdofs.shape[0] == 0:
                 continue
@@ -2564,11 +2850,52 @@ class NewtonSolver:
             Kloc, _, _ = ker.exec(coeffs)  # shape [nel, nloc, nloc]
             exec_time = time.perf_counter() - t_exec
             t_scatter = time.perf_counter()
-            for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
-                if pflat.size == 0:
-                    continue
-                Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
-                data[pflat] += Kel
+            if extra_list is None:
+                for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
+                    if pflat.size == 0:
+                        continue
+                    Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
+                    data[pflat] += Kel
+            else:
+                # Constraint-aware scatter for entities with hanging-node slaves.
+                for e, (pflat, lidx, meta) in enumerate(zip(pos_list, lidx_list, extra_list)):
+                    if pflat.size == 0:
+                        continue
+                    if meta is None:
+                        Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
+                        data[pflat] += Kel
+                        continue
+                    rows_unique, ptr, rep_j, rep_w = meta
+                    m = int(rows_unique.size)
+                    if m <= 0:
+                        continue
+                    Ke = Kloc[e]
+                    nloc = int(Ke.shape[0])
+
+                    # B = Ke @ P, where P maps local full dofs to local reduced rows.
+                    B = np.zeros((nloc, m), dtype=float)
+                    for j_loc in range(nloc):
+                        s0 = int(ptr[j_loc])
+                        s1 = int(ptr[j_loc + 1])
+                        if s1 <= s0:
+                            continue
+                        col = Ke[:, j_loc]
+                        for k in range(s0, s1):
+                            a = int(rep_j[k])
+                            wv = float(rep_w[k])
+                            B[:, a] += wv * col
+
+                    # Scatter K_m = Pᵀ B directly into global CSR data.
+                    for i_loc in range(nloc):
+                        s0 = int(ptr[i_loc])
+                        s1 = int(ptr[i_loc + 1])
+                        if s1 <= s0:
+                            continue
+                        brow = B[i_loc, :]
+                        for k in range(s0, s1):
+                            a = int(rep_j[k])
+                            wv = float(rep_w[k])
+                            data[pflat[a * m : (a + 1) * m]] += wv * brow
             scatter_time = time.perf_counter() - t_scatter
             if profile:
                 prof_entries.append(
@@ -2591,13 +2918,47 @@ class NewtonSolver:
                 valid_full = full >= 0
                 if not np.any(valid_full):
                     continue
-                rmap = -np.ones_like(full, dtype=int)
-                rmap[valid_full] = self.full_to_red[full[valid_full]]
-                mask = rmap >= 0
-                if not np.any(mask):
-                    continue
-                rows = rmap[mask]
-                np.add.at(R, rows, Floc[e][mask])
+                if getattr(self, "constraints", None) is None:
+                    rmap = -np.ones_like(full, dtype=int)
+                    rmap[valid_full] = self.full_to_red[full[valid_full]]
+                    mask = rmap >= 0
+                    if not np.any(mask):
+                        continue
+                    rows = rmap[mask]
+                    np.add.at(R, rows, Floc[e][mask])
+                else:
+                    full_to_master = getattr(self, "_constr_full_to_master", None)
+                    is_slave = getattr(self, "_constr_is_slave", None)
+                    slave_map = getattr(self, "_constr_slave_map", None)
+                    if (
+                        not isinstance(full_to_master, np.ndarray)
+                        or not isinstance(is_slave, np.ndarray)
+                        or not isinstance(slave_map, dict)
+                    ):
+                        continue
+                    for loc_i, gd in zip(np.nonzero(valid_full)[0].tolist(), full[valid_full].tolist()):
+                        gd_i = int(gd)
+                        if gd_i < 0 or gd_i >= int(full_to_master.size):
+                            continue
+                        val = float(Floc[e][int(loc_i)])
+                        if not np.isfinite(val) or val == 0.0:
+                            continue
+                        if bool(is_slave[gd_i]):
+                            combo = slave_map.get(gd_i)
+                            if combo is None:
+                                continue
+                            mcols, wts = combo
+                            for mcol, wv in zip(mcols.tolist(), wts.tolist()):
+                                red = int(self.full_to_red[int(mcol)])
+                                if red >= 0:
+                                    R[red] += float(wv) * val
+                        else:
+                            mcol = int(full_to_master[gd_i])
+                            if mcol < 0:
+                                continue
+                            red = int(self.full_to_red[mcol])
+                            if red >= 0:
+                                R[red] += val
             scatter_time = time.perf_counter() - t_scatter
             if profile:
                 prof_entries.append(

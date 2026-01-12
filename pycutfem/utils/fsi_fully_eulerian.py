@@ -26,7 +26,7 @@ from pycutfem.ufl.expressions import (
     inv,
     trace,
 )
-from pycutfem.ufl.measures import dx, dGhost, dInterface
+from pycutfem.ufl.measures import dx, dGhost, dInterface, dFacetPatch
 
 
 def _copy_bitset(bs: BitSet) -> BitSet:
@@ -165,7 +165,14 @@ def make_domain_sets(mesh: Mesh, *, use_aligned_interface: bool = False) -> Dict
     }
 
 
-def build_measures(mesh: Mesh, level_set, domains: Dict[str, BitSet], qvol: int = 6):
+def build_measures(
+    mesh: Mesh,
+    level_set,
+    domains: Dict[str, BitSet],
+    qvol: int = 6,
+    *,
+    use_facet_patch_ghost: bool = False,
+):
     dx_fluid = dx(
         defined_on=domains["fluid_interface"],
         level_set=level_set,
@@ -181,12 +188,13 @@ def build_measures(mesh: Mesh, level_set, domains: Dict[str, BitSet], qvol: int 
         level_set=level_set,
         metadata={"q": qvol + 2, "derivs": {(0, 0), (0, 1), (1, 0)}},
     )
-    dG_fluid = dGhost(
+    ghost_measure = dFacetPatch if use_facet_patch_ghost else dGhost
+    dG_fluid = ghost_measure(
         defined_on=domains["fluid_ghost"],
         level_set=level_set,
         metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
     )
-    dG_solid = dGhost(
+    dG_solid = ghost_measure(
         defined_on=domains["solid_ghost"],
         level_set=level_set,
         metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
