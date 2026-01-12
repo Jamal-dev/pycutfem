@@ -391,6 +391,8 @@ class NewtonSolver:
         # coefficient dictionary used for assembly. Returning ``None`` skips
         # geometry refresh for that call.
         deformation_update: Optional[Callable[[Dict[str, object]], np.ndarray]] = None,
+        constraints: Optional[object] = None,
+        use_hanging_constraints: bool = True,
         preproc_cb: Optional[Callable[[List], None]] = None,
         postproc_cb: Optional[Callable[[List], None]] = None,
         backend: str = "jit",
@@ -421,9 +423,9 @@ class NewtonSolver:
         self.equation = Equation(jacobian_form, residual_form)
         # Which BC list marks the fixed rows? Prefer homogeneous set.
         bcs_for_active = self.bcs_homog if getattr(self, "bcs_homog", None) else self.bcs
-        # Optional hanging-node constraints → master space
-        self.constraints = None
-        if hasattr(self.dh, "build_hanging_node_constraints"):
+        # Optional linear constraints → master space (AgFEM / hanging nodes)
+        self.constraints = constraints
+        if self.constraints is None and use_hanging_constraints and hasattr(self.dh, "build_hanging_node_constraints"):
             try:
                 self.constraints = self.dh.build_hanging_node_constraints()
             except Exception:
@@ -491,6 +493,51 @@ class NewtonSolver:
 
     def _is_jit_backend(self) -> bool:
         return self.backend in {"jit", "cpp", "c++"}
+
+    def _enforce_constraints_on_functions(self, functions: list) -> None:
+        """
+        Ensure the *stored* Function/VectorFunction values satisfy the active
+        linear constraints (slaves are overwritten from masters).
+
+        This is required because the solver stores solution vectors in the full
+        DOF space even when assembling/solving in the constrained master space.
+        """
+        if getattr(self, "constraints", None) is None:
+            return
+        slave_to_master = getattr(self.constraints, "slave_to_master", None)
+        if not isinstance(slave_to_master, dict) or not slave_to_master:
+            return
+
+        from pycutfem.ufl.expressions import Function, VectorFunction
+
+        ndof = int(self.dh.total_dofs)
+        U = np.zeros(ndof, dtype=float)
+
+        # Gather full vector from the provided function objects.
+        for func in functions:
+            if not isinstance(func, (Function, VectorFunction)):
+                continue
+            g2l = getattr(func, "_g2l", None)
+            vals = getattr(func, "nodal_values", None)
+            if g2l is None or vals is None:
+                continue
+            for gdof, lidx in g2l.items():
+                U[int(gdof)] = float(vals[int(lidx)])
+
+        # Overwrite slave DOFs from masters.
+        for sdof, combo in slave_to_master.items():
+            U[int(sdof)] = sum(float(w) * U[int(mdof)] for (mdof, w) in combo)
+
+        # Scatter back into the function objects.
+        for func in functions:
+            if not isinstance(func, (Function, VectorFunction)):
+                continue
+            g2l = getattr(func, "_g2l", None)
+            vals = getattr(func, "nodal_values", None)
+            if g2l is None or vals is None:
+                continue
+            for gdof, lidx in g2l.items():
+                vals[int(lidx)] = U[int(gdof)]
 
 
 
@@ -1287,6 +1334,11 @@ class NewtonSolver:
             if self.pre_cb is not None:
                 self.pre_cb(funcs)
 
+            if getattr(self, "constraints", None) is not None:
+                # Keep stored full vectors consistent with master DOFs.
+                self._enforce_constraints_on_functions(funcs)
+                self._enforce_constraints_on_functions(prev_funcs)
+
             # Build the coefficients dict expected by kernels
             current: Dict[str, "Function"] = {f.name: f for f in funcs}
             current.update({f.name: f for f in prev_funcs})
@@ -1636,6 +1688,8 @@ class NewtonSolver:
 
             # Re-impose the (possibly inhomogeneous) Dirichlet values AFTER the update
             dh.apply_bcs(bcs_now, *funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
 
             if self.post_cb is not None:
                 self.post_cb(funcs)
@@ -1784,6 +1838,8 @@ class NewtonSolver:
                 dU_full = self.restrictor.expand_vec(alpha * S_red)
                 dh.add_to_functions(dU_full, funcs)
                 dh.apply_bcs(bcs_now, *funcs)
+                if getattr(self, "constraints", None) is not None:
+                    self._enforce_constraints_on_functions(funcs)
 
                 _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
                 norm_try = float(np.linalg.norm(R_try, ord=np.inf))
@@ -1839,6 +1895,8 @@ class NewtonSolver:
             dU_full = self.restrictor.expand_vec(alpha * S_red)
             dh.add_to_functions(dU_full, funcs)
             dh.apply_bcs(bcs_now, *funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
 
             # Evaluate residual in reduced space (matrix not needed)
             _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)

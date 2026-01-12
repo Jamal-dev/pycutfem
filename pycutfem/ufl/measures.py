@@ -43,7 +43,7 @@ class Measure:
     @property
     def on_facet(self) -> bool:
         return self.domain_type in {
-            "interior_facet", "exterior_facet", "interface", "ghost_edge"
+            "interior_facet", "exterior_facet", "interface", "ghost_edge", "facet_patch"
         }
 
     def __call__(self, 
@@ -105,3 +105,7 @@ dInterface = Measure("interface")
 
 # New: Measure for integration over ghost edges for CutFEM stabilization.
 dGhost = Measure("ghost_edge")
+
+# New: NGSolve-style facet-patch (two-element) integrals (e.g. ghost penalties).
+# This matches the semantics of NGSXFEM's `dFacetPatch` (volume patch around a facet).
+dFacetPatch = Measure("facet_patch")

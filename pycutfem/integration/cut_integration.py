@@ -162,6 +162,55 @@ class CutIntegration:
             return np.empty((0, 2), float), np.empty((0,), float)
         return np.asarray(qpts, float), np.asarray(qwts, float)
 
+    # ---------------------------- TRI straight‑cut -------------------------
+    @staticmethod
+    def straight_cut_rule_tri_ref(
+        mesh,
+        eid: int,
+        lset_p1,
+        *,
+        side: str = "+",
+        order: int = 3,
+        tol: float = 1e-12,
+    ):
+        """Straight-cut quadrature for TRI elements in the parent reference triangle.
+
+        Returns (qpts(N,2), qw(N,)) on the parent reference triangle:
+          (0,0) - (1,0) - (0,1).
+
+        Notes
+        -----
+        This is exact for piecewise-linear level sets (P1/Q1) because the cut
+        region is a polygon in reference space that can be triangulated.
+        """
+        from pycutfem.ufl.helpers_geom import clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys
+
+        R = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=float)
+        vals = np.empty(3, dtype=float)
+        if hasattr(lset_p1, "value_on_element"):
+            for i in range(3):
+                vals[i] = float(lset_p1.value_on_element(int(eid), (float(R[i, 0]), float(R[i, 1]))))
+        else:
+            for i in range(3):
+                x_phys = transform.x_mapping(mesh, int(eid), (float(R[i, 0]), float(R[i, 1])))
+                vals[i] = float(phi_eval(lset_p1, x_phys))
+
+        polys = clip_triangle_to_side(R, vals, side=str(side), eps=float(tol))
+        if not polys:
+            return np.empty((0, 2), float), np.empty((0,), float)
+
+        qp_std, qw_std = tri_rule(int(order))
+        qpts = []
+        qwts = []
+        for (A, B, C) in fan_triangulate(polys[0]):
+            q_sub, w_sub = map_ref_tri_to_phys(A, B, C, qp_std, qw_std)
+            qpts.append(np.asarray(q_sub, float))
+            qwts.append(np.asarray(w_sub, float).ravel())
+
+        if not qpts:
+            return np.empty((0, 2), float), np.empty((0,), float)
+        return np.vstack(qpts), np.concatenate(qwts)
+
     # ---------------------- Iso‑curve on Ihφ_ref = 0 -----------------------
     @staticmethod
     def _q1_coeffs_ref_from_corners(mesh, eid: int, lset) -> Tuple[float, float, float, float]:
@@ -264,11 +313,47 @@ class CutIntegration:
             return qref, w01, coeffs, tauhat
         # QUAD
         a00, a10, a01, a11 = coeffs
-        slice_along = 'xi' if abs(a01) >= abs(a10) else 'eta'
-        xi_nodes, xi_w = gauss_legendre(int(order))
+        # Integrate only over the parameter interval covered by the interface segment.
+        # The iso-curve in reference is generally a hyperbola; integrating over the full
+        # [-1,1] and skipping out-of-range points introduces a systematic bias.
+        P0 = np.asarray(P[0], float)
+        P1 = np.asarray(P[1], float)
+        dxi = abs(float(P1[0] - P0[0]))
+        deta = abs(float(P1[1] - P0[1]))
+
+        # Prefer parameterization along the dominant varying reference coordinate,
+        # but avoid directions where the implicit-function denominator crosses 0.
+        prefer_xi = dxi >= deta
+        xi_min, xi_max = (float(min(P0[0], P1[0])), float(max(P0[0], P1[0])))
+        eta_min, eta_max = (float(min(P0[1], P1[1])), float(max(P0[1], P1[1])))
+        safe_xi = True
+        safe_eta = True
+        if abs(float(a11)) > 1e-14:
+            root_xi = -float(a01) / float(a11)   # where ∂φ/∂η = 0
+            root_eta = -float(a10) / float(a11)  # where ∂φ/∂ξ = 0
+            safe_xi = not (xi_min - 1e-12 <= root_xi <= xi_max + 1e-12)
+            safe_eta = not (eta_min - 1e-12 <= root_eta <= eta_max + 1e-12)
+
+        if prefer_xi and safe_xi and dxi > 1e-14:
+            slice_along = "xi"
+        elif safe_eta and deta > 1e-14:
+            slice_along = "eta"
+        elif safe_xi and dxi > 1e-14:
+            slice_along = "xi"
+        else:
+            # Degenerate / difficult case: fall back to the legacy global-range rule.
+            slice_along = 'xi' if abs(a01) >= abs(a10) else 'eta'
+
+        xi_hat, w_hat = gauss_legendre(int(order))
         qpts: List[List[float]] = []
         wref: List[float] = []
         if slice_along == 'xi':
+            a = xi_min if dxi > 1e-14 else -1.0
+            b = xi_max if dxi > 1e-14 else +1.0
+            xm = 0.5 * (a + b)
+            xr = 0.5 * (b - a)
+            xi_nodes = xm + xr * xi_hat
+            xi_w = xr * w_hat
             for xi, w in zip(xi_nodes, xi_w):
                 den = (a01 + a11 * xi); num = -(a00 + a10 * xi)
                 if abs(den) < 1e-14:
@@ -279,10 +364,15 @@ class CutIntegration:
                 gx = a10 + a11 * eta; gy = a01 + a11 * xi
                 iface_scale = float(np.hypot(gx, gy)) / abs(den)
                 qpts.append([float(xi), float(eta)])
-                # GL weights are on [-1,1] already; no extra factor 2
                 wref.append(float(w) * iface_scale)
         else:
-            for eta, w in zip(xi_nodes, xi_w):
+            a = eta_min if deta > 1e-14 else -1.0
+            b = eta_max if deta > 1e-14 else +1.0
+            xm = 0.5 * (a + b)
+            xr = 0.5 * (b - a)
+            eta_nodes = xm + xr * xi_hat
+            eta_w = xr * w_hat
+            for eta, w in zip(eta_nodes, eta_w):
                 den = (a10 + a11 * eta); num = -(a00 + a01 * eta)
                 if abs(den) < 1e-14:
                     continue
@@ -292,7 +382,6 @@ class CutIntegration:
                 gx = a10 + a11 * eta; gy = a01 + a11 * xi
                 iface_scale = float(np.hypot(gx, gy)) / abs(den)
                 qpts.append([float(xi), float(eta)])
-                # GL weights are on [-1,1] already; no extra factor 2
                 wref.append(float(w) * iface_scale)
         if len(qpts) == 0:
             return (np.empty((0, 2), float), np.empty((0,), float), coeffs, None)

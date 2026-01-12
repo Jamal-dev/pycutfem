@@ -484,7 +484,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if (k in base_allow)
         or (k in needed)
         or (k in side_keys_present)
-        or k.startswith(("b_", "g_", "d", "r"))
+        or k.startswith(("b_", "g_", "d", "r", "restrict_mask_"))
     }
     args: Dict[str, Any] = dict(pre_built)
 
@@ -548,6 +548,38 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
                 # Build each requested map for this side
                 for fld in sorted(fld_set):
+                    # Element-based kernels (e.g. dInterface) use the union-local
+                    # layout of the element itself. In that case the per-field
+                    # side maps are purely index maps into the union vector and
+                    # must follow the MixedElement component slices (XFEM needs
+                    # this to include enriched DOFs on the interface).
+                    entity_kind = args.get("entity_kind", None)
+                    if entity_kind == "element":
+                        sl = getattr(mixed_element, "component_dof_slices", {}).get(fld, None)
+                        if sl is None:
+                            raise KeyError(
+                                f"_build_jit_kernel_args: cannot build '{side}_map_{fld}': "
+                                f"missing component_dof_slices for field '{fld}'."
+                            )
+                        if int(sl.stop) > int(n_union):
+                            raise ValueError(
+                                f"_build_jit_kernel_args: cannot build '{side}_map_{fld}': "
+                                f"field slice {sl} exceeds union width n_union={n_union}."
+                            )
+                        row = np.arange(int(sl.start), int(sl.stop), dtype=np.int32)
+                        args[f"{side}_map_{fld}"] = np.tile(row, (nE, 1))
+                        continue
+
+                    if nE == 0 or side_ids.size == 0:
+                        # Empty entity set: still provide correctly-shaped placeholders so
+                        # kernel signatures stay consistent, even though the kernel will not run.
+                        sl = getattr(mixed_element, "component_dof_slices", {}).get(fld, None)
+                        if sl is not None:
+                            nloc_f = int(sl.stop - sl.start)
+                        else:
+                            nloc_f = int(getattr(getattr(dof_handler, "mixed_element", None), "_n_basis", {}).get(fld, 0))
+                        args[f"{side}_map_{fld}"] = -np.ones((nE, nloc_f), dtype=np.int32)
+                        continue
                     # element-local gdofs for this field on each owner element of the side
                     loc_lists = dof_handler.element_maps[fld]
                     # all elements share same nloc for that field
@@ -724,18 +756,30 @@ def _build_jit_kernel_args(       # ← signature unchanged
             # 2) INTERFACE fallback (entity_kind == 'element' or 'edge'):
             #    Build at interface physical QPs. Return *owner-mixed* length
             #    so the kernel’s fixed block slices [0:9],[9:18],[18:22] stay valid.
-            if pre_built is not None and pre_built.get("entity_kind") in {"element", "edge"}:
-                # r00 -> b_ at qp_phys; rXY -> dXY at qp_phys
+            if pre_built is not None and pre_built.get("entity_kind") == "element":
+                # r00/rXY tables are used for sided operations (Pos/Neg/Jump) on dInterface.
+                #
+                # IMPORTANT: For element-based interface kernels (Γ inside a cut element),
+                # the underlying CG basis is side-agnostic. The "side" here selects which
+                # *trace* is being evaluated, but must NOT zero out a subset of DOFs.
+                # Doing so breaks core identities such as grad(x^2) == grad(x^2-1) and
+                # causes JIT/Python parity failures in Jump/Pos/Neg tests.
+                #
+                # If a restricted (one-sided) space is desired, it must be expressed
+                # explicitly (e.g. via Restriction(...) or a dedicated restricted space),
+                # not by implicitly masking r** tables here.
                 if d0 == 0 and d1 == 0:
-                    # union-length (owner-mixed) basis at qp_phys
-                    args[name] = _basis_table_phys_union(fld)   # you already added this
-                    continue
-                dkey = f"d{d0}{d1}_{fld}"
-                if dkey in args:
-                    args[name] = args[dkey];  continue
-                if pre_built is not None and dkey in pre_built:
-                    args[name] = pre_built[dkey];  continue
-                args[name] = _deriv_table_phys_union(fld, d0, d1)  # you already added this
+                    tab = _basis_table_phys_union(fld)
+                else:
+                    dkey = f"d{d0}{d1}_{fld}"
+                    if dkey in args:
+                        tab = args[dkey]
+                    elif pre_built is not None and dkey in pre_built:
+                        tab = pre_built[dkey]
+                    else:
+                        tab = _deriv_table_phys_union(fld, d0, d1)
+
+                args[name] = tab
                 continue
 
             # 3) Otherwise (GHOST with no precompute): must be provided via metadata['derivs']

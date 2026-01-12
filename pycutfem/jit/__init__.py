@@ -666,6 +666,13 @@ def compile_multi(form, *, dof_handler, mixed_element,
     # Unified precompute support (reduce redundant per-integral precomputes)
     # ------------------------------------------------------------------
     use_unified = os.getenv("PYCUTFEM_UNIFIED_PRECOMPUTE", "1").lower() not in {"0", "false", "no"}
+    # XFEM changes the local union layout dynamically; disable unified precompute
+    # until it is explicitly made XFEM-aware.
+    try:
+        if hasattr(dof_handler, "n_enriched") and callable(getattr(dof_handler, "n_enriched")) and dof_handler.n_enriched() > 0:
+            use_unified = False
+    except Exception:
+        pass
     unified_reqs: dict[int, dict[str, Any]] = {}
     unified_cache: dict[int, dict[str, Any]] = {}
 
@@ -876,11 +883,21 @@ def compile_multi(form, *, dof_handler, mixed_element,
         md = intg.measure.metadata or {}
         qdeg  += 2 * max(0, p_geo - 1)
         nseg   = int(md.get("nseg", max(3, p_geo + qdeg//2)))
-        n_loc  = mixed_element.n_dofs_per_elem
+        # XFEM: interface/ghost-edge kernels need to compile against the expanded
+        # element-local layout when enrichment is active.
+        me_kernel = mixed_element
+        try:
+            if dom in {"interface", "ghost_edge"} and hasattr(dof_handler, "n_enriched") and callable(getattr(dof_handler, "n_enriched")):
+                if dof_handler.n_enriched() > 0 and hasattr(dof_handler, "xfem_mixed_element") and callable(getattr(dof_handler, "xfem_mixed_element")):
+                    me_kernel = dof_handler.xfem_mixed_element()
+        except Exception:
+            me_kernel = mixed_element
+
+        n_loc  = me_kernel.n_dofs_per_elem
 
         # Compile the backend once; reuse for all subsets of this integral
-        runner, ir = fc._compile_backend(intg.integrand, dof_handler, mixed_element, on_facet=on_facet)
-        active_fields = _active_field_order(ir, mixed_element)
+        runner, ir = fc._compile_backend(intg.integrand, dof_handler, me_kernel, on_facet=on_facet)
+        active_fields = _active_field_order(ir, me_kernel)
 
         # Prefer an explicit hint from the runner/codegen when present.
         runner_active = getattr(runner, "active_fields", None)
@@ -893,12 +910,12 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
                 if name.startswith(("b_", "g_")) or has_deriv:
                     fld = name.split("_", 1)[1] if "_" in name else name
-                    if fld in getattr(mixed_element, "field_names", ()):
+                    if fld in getattr(me_kernel, "field_names", ()):
                         _param_fields.append(fld)
             if _param_fields:
                 active_fields = tuple(dict.fromkeys(_param_fields))  # preserve order, drop dups
 
-        active_cols = _active_columns(mixed_element, active_fields)
+        active_cols = _active_columns(me_kernel, active_fields)
         if os.getenv("PYCUTFEM_JIT_DEBUG_ACTIVE", "").lower() in {"1", "true", "yes"}:
             print(f"[jit] active fields for {intg.measure.domain_type}: {active_fields} (cols={len(active_cols)})")
 
@@ -1023,6 +1040,34 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 deformation=deformation,
             )
             _full_cache = {"ids": None, "static": None}
+            # Optional XFEM kernel/layout for cut elements (keeps full elements on base layout)
+            use_xfem_cut = False
+            runner_cut = runner
+            ir_cut = ir
+            me_cut = mixed_element
+            active_cols_cut = np.asarray(active_cols, dtype=np.int32)
+            try:
+                if (
+                    hasattr(dof_handler, "n_enriched")
+                    and callable(getattr(dof_handler, "n_enriched"))
+                    and dof_handler.n_enriched() > 0
+                    and hasattr(dof_handler, "xfem_mixed_element")
+                    and callable(getattr(dof_handler, "xfem_mixed_element"))
+                ):
+                    me_cut = dof_handler.xfem_mixed_element()
+                    runner_cut, ir_cut = fc._compile_backend(intg.integrand, dof_handler, me_cut, on_facet=on_facet)
+                    active_fields_cut = _active_field_order(ir_cut, me_cut)
+                    runner_active_cut = getattr(runner_cut, "active_fields", None)
+                    if runner_active_cut:
+                        active_fields_cut = tuple(runner_active_cut)
+                    active_cols_cut = _active_columns(me_cut, active_fields_cut)
+                    use_xfem_cut = True
+            except Exception:
+                use_xfem_cut = False
+                runner_cut = runner
+                ir_cut = ir
+                me_cut = mixed_element
+                active_cols_cut = np.asarray(active_cols, dtype=np.int32)
 
             # NOTE: These helper/build functions are called later via kernel.refresh().
             # Bind loop-variant values as default args to avoid Python's late-binding
@@ -1337,18 +1382,19 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 _ctx=ctx,
                 _current_sets=_current_sets,
                 _apply_defined_on=_apply_defined_on,
-                _active_cols=np.asarray(active_cols, dtype=np.int32),
-                _ir=ir,
+                _active_cols=np.asarray(active_cols_cut, dtype=np.int32),
+                _ir=ir_cut,
                 _integrand=intg.integrand,
                 _qdeg=int(qdeg),
-                _param_order=tuple(getattr(runner, "param_order", []) or []),
+                _param_order=tuple(getattr(runner_cut, "param_order", []) or []),
                 _dof_handler=dof_handler,
-                _me=mixed_element,
+                _me=me_cut,
                 _nseg=nseg,
                 _need_hess=need_hess,
                 _need_o3=need_o3,
                 _need_o4=need_o4,
                 _deformation=deformation,
+                _use_xfem=bool(use_xfem_cut),
             ):
                 _, _, cut_now = _current_sets(ls_obj)
                 cut_ids = np.asarray(_apply_defined_on(cut_now), dtype=np.int32)
@@ -1380,10 +1426,21 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     geom_cut["detJ"] = np.ones_like(geom_cut["qw"])
 
                 if cut_eids.size:
-                    gdofs_map_cut = np.vstack([
-                        np.asarray(_dof_handler.get_elemental_dofs(int(e)), dtype=np.int32)[_active_cols]
-                        for e in cut_eids
-                    ]).astype(np.int32)
+                    # Prefer precomputed gdofs_map when available (XFEM path).
+                    gmap_src = geom_cut.get("gdofs_map")
+                    if isinstance(gmap_src, np.ndarray) and gmap_src.ndim == 2 and gmap_src.shape[0] == cut_eids.size:
+                        gdofs_full = np.asarray(gmap_src, dtype=np.int32)
+                    elif _use_xfem and hasattr(_dof_handler, "get_elemental_dofs_xfem"):
+                        gdofs_full = np.vstack([
+                            np.asarray(_dof_handler.get_elemental_dofs_xfem(int(e)), dtype=np.int32)
+                            for e in cut_eids
+                        ]).astype(np.int32)
+                    else:
+                        gdofs_full = np.vstack([
+                            np.asarray(_dof_handler.get_elemental_dofs(int(e)), dtype=np.int32)
+                            for e in cut_eids
+                        ]).astype(np.int32)
+                    gdofs_map_cut = gdofs_full[:, _active_cols]
                 else:
                     gdofs_map_cut = np.zeros((0, int(_active_cols.size)), dtype=np.int32)
 
@@ -1431,7 +1488,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
             cut_eids = np.asarray(static_cut.get("eids", []), dtype=np.int32)
             _append_kernel(
                 _IntegralKernel(
-                    runner,
+                    runner_cut,
                     static_cut,
                     "volume",
                     level_set=level_set,
@@ -1470,7 +1527,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 _bs_def=bs_def,
                 _ctx=ctx,
                 _dof_handler=dof_handler,
-                _me=mixed_element,
+                _me=me_kernel,
                 _ir=ir,
                 _integrand=intg.integrand,
                 _qdeg=int(qdeg),
@@ -1606,7 +1663,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 _derivs_ifc=derivs_ifc,
                 _ctx=ctx,
                 _dof_handler=dof_handler,
-                _me=mixed_element,
+                _me=me_kernel,
                 _ir=ir,
                 _integrand=intg.integrand,
                 _qdeg=int(qdeg),
@@ -1647,8 +1704,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         "neg_map": np.empty((0, 0), dtype=np.int32),
                         "gdofs_map": gdofs_map,
                         "entity_kind": "edge",
-                        "is_ghost": False,
                         "is_interface": True,
+                        "is_ghost": False,
                     }
                     empty.update(
                         _build_jit_kernel_args(
@@ -1759,7 +1816,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 _derivs=derivs,
                 _ctx=ctx,
                 _dof_handler=dof_handler,
-                _me=mixed_element,
+                _me=me_kernel,
                 _ir=ir,
                 _integrand=intg.integrand,
                 _qdeg=int(qdeg),

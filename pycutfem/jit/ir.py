@@ -100,6 +100,11 @@ class CellDiameter:
     pass
 
 @dataclass(frozen=True, slots=True)
+class MeshSize:
+    """Pointwise NGSolve-like specialcf.mesh_size (depends on detJ at the QP)."""
+    pass
+
+@dataclass(frozen=True, slots=True)
 class LoadFacetNormalComponent:
     """Load n[idx] (scalar component of the facet normal)."""
     idx: int

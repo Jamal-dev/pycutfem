@@ -399,43 +399,25 @@ def edge_root_pn(level_set, mesh, eid: int, local_edge: int, *, tol: float = SID
     # on the true φ(t) evaluated in physical space.
     # ------------------------------------------------------------------
     else:
-        # Dense sampling to detect narrow enter/exit segments robustly.
-        # Keep it modest to avoid heavy work; this is primarily for tests/debug.
-        p = int(max(64, 16 * int(getattr(mesh, "poly_order", 1) or 1)))
-        tnodes, xi_s, eta_s = _edge_ref_nodes(mesh, int(local_edge), p)
-        fvals = _phi_on_e_points(level_set, mesh, int(eid), xi_s, eta_s)
+        # Analytic or black-box level set:
+        # a segment can enter and exit {phi<0} with both endpoints having the same sign,
+        # so we must oversample to detect multiple crossings.
+        p_geo = int(getattr(mesh, "poly_order", 1) or 1)
+        p_samp = int(max(12, 8 * p_geo))
+        tnodes, xi, eta = _edge_ref_nodes(mesh, int(local_edge), p_samp)
+        fvals = _phi_on_e_points(level_set, mesh, int(eid), xi, eta)
 
         if np.all(np.abs(fvals) <= tol):
-            P0 = transform.x_mapping(mesh, int(eid), (float(xi_s[0]), float(eta_s[0])))
-            P1 = transform.x_mapping(mesh, int(eid), (float(xi_s[-1]), float(eta_s[-1])))
+            P0 = transform.x_mapping(mesh, int(eid), (float(xi[0]), float(eta[0])))
+            P1 = transform.x_mapping(mesh, int(eid), (float(xi[-1]), float(eta[-1])))
             return [np.asarray(P0, float), np.asarray(P1, float)]
 
-        def _phi_t(tt: float) -> float:
-            t = float(tt)
-            if mesh.element_type == "quad":
-                if local_edge == 0:
-                    xi, eta = 2.0 * t - 1.0, -1.0
-                elif local_edge == 1:
-                    xi, eta = 1.0, -1.0 + 2.0 * t
-                elif local_edge == 2:
-                    xi, eta = 1.0 - 2.0 * t, 1.0
-                else:
-                    xi, eta = -1.0, 1.0 - 2.0 * t
-            else:  # tri
-                if local_edge == 0:
-                    xi, eta = t, 0.0
-                elif local_edge == 1:
-                    xi, eta = 1.0 - t, t
-                else:
-                    xi, eta = 0.0, 1.0 - t
-            x_phys = transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
-            return float(phi_eval(level_set, np.asarray(x_phys, float), eid=int(eid), xi_eta=(xi, eta), mesh=mesh))
-
-        roots: list[float] = []
+        roots = []
         zero = np.abs(fvals) <= tol
         if np.any(zero):
             idx = np.where(zero)[0]
-            start = int(idx[0]); prev = start
+            start = int(idx[0])
+            prev = start
             for i in idx[1:]:
                 i = int(i)
                 if i == prev + 1:
@@ -449,6 +431,8 @@ def edge_root_pn(level_set, mesh, eid: int, local_edge: int, *, tol: float = SID
             if prev != start:
                 roots.append(float(tnodes[prev]))
 
+        w = _bary_weights(tnodes)
+        fun = lambda tt: _bary_eval(tt, tnodes, fvals, w)
         for k in range(len(tnodes) - 1):
             fa, fb = float(fvals[k]), float(fvals[k + 1])
             if (abs(fa) <= tol) or (abs(fb) <= tol):
@@ -456,12 +440,11 @@ def edge_root_pn(level_set, mesh, eid: int, local_edge: int, *, tol: float = SID
             if fa * fb > 0.0:
                 continue
             a, b = float(tnodes[k]), float(tnodes[k + 1])
-            r, _ = _brent_root(_phi_t, a, b, fa, fb, tol=tol)
+            r, _ = _brent_root(fun, a, b, fa, fb, tol=tol)
             if r is None:
                 continue
             roots.append(float(r))
 
-        # de-dup and keep within [0,1]
         roots = [r for r in roots if -1e-14 <= r <= 1.0 + 1e-14]
         roots = sorted(set([round(float(r), 14) for r in roots]))
 
@@ -484,6 +467,7 @@ def edge_root_pn(level_set, mesh, eid: int, local_edge: int, *, tol: float = SID
                 xy = (1.0 - r, r)
             else:
                 xy = (0.0, 1.0 - r)
+
         P = transform.x_mapping(mesh, int(eid), (float(xy[0]), float(xy[1])))
         pphys = np.asarray(P, float)
         if not any(np.linalg.norm(pphys - Q) < SIDE.tol for Q in crossings):

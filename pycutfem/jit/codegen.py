@@ -7,6 +7,7 @@ from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
     BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
+    MeshSize,
     Trace, Determinant, Inverse, Cofactor, Hessian as IRHessian, Laplacian as IRLaplacian
 )
 from pycutfem.jit.symbols import encode
@@ -1275,6 +1276,14 @@ class NumbaCodeGen:
                                     is_gradient=False))
                 if "h_arr" not in required_args:
                     required_args.add("h_arr")
+
+            elif isinstance(op, MeshSize):
+                # Pointwise mesh size from the (possibly deformed) Jacobian determinant.
+                required_args.add("detJ")
+                res = new_var("mesh_h")
+                factor = 2.0 if getattr(self.me.mesh, "element_type", "tri") == "quad" else 1.0
+                body_lines.append(f"{res} = {factor} * np.sqrt(abs(detJ[e, q]))")
+                stack.append(StackItem(var_name=res, shape=(), is_vector=False, role='const', is_gradient=False))
 
 
             # ------------------------------------------------------------------

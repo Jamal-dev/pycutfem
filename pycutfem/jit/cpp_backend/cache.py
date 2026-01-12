@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Tuple
 from pycutfem.jit.cache import KernelCache
 from .compiler import compile_extension
 
-CODEGEN_ABI_CPP = "2026-01-10-cpp-abi-optional-phis-1"
+CODEGEN_ABI_CPP = "2026-01-12-cpp-abi-facetpatch-xfem-merge-1"
 
 
 class CppKernelCache:

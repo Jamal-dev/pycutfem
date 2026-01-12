@@ -880,13 +880,23 @@ class VecOpInfo(BaseOpInfo):
 
     def __add__(self, other: "VecOpInfo") -> "VecOpInfo":
         """Element-wise addition with another VecOpInfo/np.ndarray."""
+        import numbers as _numbers
+
+        # Allow adding scalar constants (float/int/0d arrays) to vector-like ops.
+        if isinstance(other, (_numbers.Number, np.number)):
+            val = float(other)
+            return VecOpInfo(self.data + val, role=self.role, **self.update_meta(self.meta()))
+        if isinstance(other, np.ndarray) and other.ndim == 0:
+            val = float(other)
+            return VecOpInfo(self.data + val, role=self.role, **self.update_meta(self.meta()))
+
         other_data = getattr(other, 'data', other)
         other_meta = getattr(other, 'meta', lambda: None)()
         other_type = getattr(other, 'type', None)
         other_role = getattr(other, 'role', None)
         if not isinstance(other, (VecOpInfo, np.ndarray)):
             raise TypeError(f"Cannot add VecOpInfo to {type(other)}."
-                            f" with shapes {self.data.shape} and {other_data.shape}")
+                            f" with shapes {self.data.shape} and {getattr(other_data, 'shape', ())}")
         if self.role in {"mixed"} and other_role is None and self.data.shape[0] == 1 and self.ndim == 3:
             if self.shape[1] == other.shape[0] and self.shape[2] == other.shape[1]:
                 # Case: mixed + np.ndarray (k,m,n) + (m,n)
@@ -2036,6 +2046,19 @@ def analyze_active_dofs(equation: Equation, dh: DofHandler, me: MixedElement, bc
     active_dofs: Set[int] = set()
     saw_restriction = False
 
+    # XFEM: restrictions must account for enriched DOFs on cut elements.
+    xfem_active = False
+    xfem_me = None
+    try:
+        if hasattr(dh, "n_enriched") and callable(getattr(dh, "n_enriched")) and dh.n_enriched() > 0:
+            if hasattr(dh, "xfem_mixed_element") and callable(getattr(dh, "xfem_mixed_element")):
+                xfem_me = dh.xfem_mixed_element()
+                xfem_active = xfem_me is not None
+    except Exception:
+        xfem_active = False
+        xfem_me = None
+    mesh = getattr(getattr(dh, "mixed_element", None), "mesh", None)
+
     for integral in integrals:
         rnodes = _find_all_restrictions(integral.integrand)
         if not rnodes:
@@ -2054,9 +2077,25 @@ def analyze_active_dofs(equation: Equation, dh: DofHandler, me: MixedElement, bc
         fields = _all_fields(integral.integrand)
 
         for eid in elem_ids:
-            element_dofs = dh.get_elemental_dofs(int(eid))
+            ee = int(eid)
+            element_dofs = None
+            me_use = me
+            if xfem_active and xfem_me is not None and mesh is not None:
+                try:
+                    tag = str(getattr(mesh.elements_list[ee], "tag", ""))
+                except Exception:
+                    tag = ""
+                if tag == "cut" and hasattr(dh, "get_elemental_dofs_xfem"):
+                    try:
+                        element_dofs = dh.get_elemental_dofs_xfem(ee)
+                        me_use = xfem_me
+                    except Exception:
+                        element_dofs = None
+                        me_use = me
+            if element_dofs is None:
+                element_dofs = dh.get_elemental_dofs(ee)
             for field in fields:
-                sl = me.component_dof_slices.get(field)
+                sl = me_use.component_dof_slices.get(field)
                 if sl is None:
                     continue
                 active_dofs.update(element_dofs[sl])

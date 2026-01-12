@@ -31,6 +31,108 @@ class CircleLevelSet(LevelSetFunction):
         nrm=np.linalg.norm(d)
         return d/nrm if nrm else np.zeros_like(d)
 
+class AnnulusLevelSet(LevelSetFunction):
+    """
+    Annulus (ring) level set centered at `center`:
+
+        φ(x) < 0  for r_inner < ‖x-center‖ < r_outer
+        φ(x) = 0  on both circles r = r_inner and r = r_outer
+        φ(x) > 0  otherwise
+
+    The value is a *piecewise* signed distance to the nearest of the two circles:
+      - outside (near r_outer):  φ = r - r_outer
+      - inside (near r_inner):  φ = r_inner - r
+
+    This matches the sign pattern used in NGSXFEM ring demos.
+    """
+
+    def __init__(
+        self,
+        center: Tuple[float, float] = (0.0, 0.0),
+        r_inner: float = 0.25,
+        r_outer: float = 0.75,
+    ):
+        self.center = np.asarray(center, dtype=float)
+        self.r_inner = float(r_inner)
+        self.r_outer = float(r_outer)
+        if not (self.r_inner > 0.0 and self.r_outer > self.r_inner):
+            raise ValueError("Require 0 < r_inner < r_outer.")
+
+    def __call__(self, x):
+        x = np.asarray(x, dtype=float)
+        rel = x - self.center
+        r = np.linalg.norm(rel, axis=-1)
+        rc = 0.5 * (self.r_inner + self.r_outer)
+        return np.where(r >= rc, r - self.r_outer, self.r_inner - r)
+
+    def gradient(self, x):
+        x = np.asarray(x, dtype=float)
+        rel = x - self.center
+        r = np.linalg.norm(rel, axis=-1)
+        rc = 0.5 * (self.r_inner + self.r_outer)
+
+        # unit radial direction (safe at r=0)
+        r_safe = np.where(r == 0.0, 1.0, r)
+        unit = rel / r_safe[..., None]
+
+        # φ = r - r_outer  -> grad =  +unit
+        # φ = r_inner - r  -> grad =  -unit
+        sign = np.where(r >= rc, 1.0, -1.0)
+        g = unit * sign[..., None]
+        if x.ndim == 1:
+            return g.reshape(2,)
+        return g
+
+class SuperellipseLevelSet(LevelSetFunction):
+    """
+    L^4 "ball" (superellipse / squircle-like):
+
+        φ(x,y) = (|x-cx|^4 + |y-cy|^4)^(1/4) - radius
+
+    Negative inside, positive outside.
+    """
+
+    def __init__(
+        self,
+        center: Tuple[float, float] = (0.0, 0.0),
+        radius: float = 1.0,
+    ):
+        self.center = np.asarray(center, dtype=float)
+        self.radius = float(radius)
+        if not (self.radius > 0.0):
+            raise ValueError("radius must be positive.")
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        rel = x - self.center
+        ax = np.abs(rel[..., 0])
+        ay = np.abs(rel[..., 1])
+        r44 = ax**4 + ay**4
+        r41 = np.power(r44, 0.25)
+        return r41 - self.radius
+
+    def gradient(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        rel = x - self.center
+        # Use the analytic derivative of (ax^4 + ay^4)^(1/4)
+        ax = np.abs(rel[..., 0])
+        ay = np.abs(rel[..., 1])
+        sx = np.sign(rel[..., 0])
+        sy = np.sign(rel[..., 1])
+        r44 = ax**4 + ay**4
+        denom = np.power(r44, 0.75)
+
+        denom_safe = np.where(denom == 0.0, 1.0, denom)
+        gx = (ax**3 * sx) / denom_safe
+        gy = (ay**3 * sy) / denom_safe
+        gx = np.where(denom == 0.0, 0.0, gx)
+        gy = np.where(denom == 0.0, 0.0, gy)
+
+        g = np.stack((gx, gy), axis=-1)
+        if x.ndim == 1:
+            return g.reshape(2,)
+        return g
+
 class AffineLevelSet(LevelSetFunction):
     """
     φ(x, y) = a * x + b * y + c
@@ -400,13 +502,15 @@ class PiecewiseLinearLevelSet(LevelSetFunction):
     """Per-element P1 (tri) or Q1 (quad) approximation of a high-order level set.
 
     This class builds a piecewise linear/bilinear surrogate by matching φ on
-    element corner nodes, and uses closed-form evaluation and gradients.
+    element corner nodes.
 
     Args:
         mesh: Geometry mesh whose corner topology defines elements.
         coeffs: For each element, the coefficient vector:
-            - tri: [a, b, c] s.t. φ = a x + b y + c
-            - quad: [c0, c1, c2, c3] s.t. φ = c0 + c1 x + c2 y + c3 x y
+            - tri: [a, b, c] s.t. φ(x,y) = a x + b y + c (affine on the element)
+            - quad: [v00, v10, v11, v01] corner nodal values on the reference
+              square [-1,1]^2 in the mesh corner ordering
+              (-1,-1),(1,-1),(1,1),(-1,1).
         node_values: φ evaluated at all mesh nodes (for quick nodal access).
 
     Notes:
@@ -448,14 +552,11 @@ class PiecewiseLinearLevelSet(LevelSetFunction):
                 M = np.column_stack((verts, np.ones(3)))
                 coeffs.append(np.linalg.solve(M, phi))
         elif mesh.element_type == "quad":
-            # Four corners determine a bilinear form φ = c0 + c1 x + c2 y + c3 x y
+            # Store the corner nodal values (Q1 field is bilinear in reference coords,
+            # not in physical x/y on general quads).
             for corner_ids in mesh.corner_connectivity:
                 cids = np.asarray(corner_ids, int)
-                verts = XY[cids]
-                phi = node_values[cids]
-                X, Y = verts[:, 0], verts[:, 1]
-                M = np.column_stack((np.ones(4), X, Y, X * Y))
-                coeffs.append(np.linalg.solve(M, phi))
+                coeffs.append(node_values[cids])
         else:
             raise KeyError(mesh.element_type)
 
@@ -486,10 +587,16 @@ class PiecewiseLinearLevelSet(LevelSetFunction):
         if self.element_type == "tri":
             a, b, d = c
             return float(a * x[0] + b * x[1] + d)
-        # quad bilinear
-        c0, c1, c2, c3 = c
-        px, py = float(x[0]), float(x[1])
-        return float(c0 + c1 * px + c2 * py + c3 * px * py)
+        # quad: Q1 (bilinear in reference coords)
+        xi, eta = transform.inverse_mapping(self.mesh, int(eid), x)
+        xi = float(xi)
+        eta = float(eta)
+        v00, v10, v11, v01 = c
+        N00 = 0.25 * (1.0 - xi) * (1.0 - eta)
+        N10 = 0.25 * (1.0 + xi) * (1.0 - eta)
+        N11 = 0.25 * (1.0 + xi) * (1.0 + eta)
+        N01 = 0.25 * (1.0 - xi) * (1.0 + eta)
+        return float(v00 * N00 + v10 * N10 + v11 * N11 + v01 * N01)
 
     def gradient(self, x: np.ndarray, eid: Optional[int] = None) -> np.ndarray:
         """Gradient ∇φ(x) with optional owner element hint."""
@@ -500,19 +607,47 @@ class PiecewiseLinearLevelSet(LevelSetFunction):
         if self.element_type == "tri":
             a, b, _ = c
             return np.array([a, b], float)
-        c0, c1, c2, c3 = c
-        px, py = float(x[0]), float(x[1])
-        return np.array([c1 + c3 * py, c2 + c3 * px], float)
+        # quad: ∇φ = (∇̂φ)·J^{-1}, where φ is Q1 on the reference square.
+        xi, eta = transform.inverse_mapping(self.mesh, int(eid), x)
+        return self.gradient_on_element(int(eid), (float(xi), float(eta)))
 
     def value_on_element(self, eid: int, xi_eta: Tuple[float, float]) -> float:
         """Fast φ when element id and (ξ,η) are known."""
-        x = transform.x_mapping(self.mesh, int(eid), (float(xi_eta[0]), float(xi_eta[1])))
-        return self.__call__(np.asarray(x, float), eid=int(eid))
+        if self.element_type == "tri":
+            x = transform.x_mapping(self.mesh, int(eid), (float(xi_eta[0]), float(xi_eta[1])))
+            return self.__call__(np.asarray(x, float), eid=int(eid))
+        return self.value_on_element_ref(int(eid), (float(xi_eta[0]), float(xi_eta[1])))
 
     def gradient_on_element(self, eid: int, xi_eta: Tuple[float, float]) -> np.ndarray:
         """Fast ∇φ when element id and (ξ,η) are known (physical gradient)."""
-        x = transform.x_mapping(self.mesh, int(eid), (float(xi_eta[0]), float(xi_eta[1])))
-        return self.gradient(np.asarray(x, float), eid=int(eid))
+        if self.element_type == "tri":
+            x = transform.x_mapping(self.mesh, int(eid), (float(xi_eta[0]), float(xi_eta[1])))
+            return self.gradient(np.asarray(x, float), eid=int(eid))
+
+        xi, eta = float(xi_eta[0]), float(xi_eta[1])
+        v00, v10, v11, v01 = self._coeff(int(eid))
+
+        # reference derivatives of Q1 basis
+        dN00_dxi = -0.25 * (1.0 - eta)
+        dN10_dxi = 0.25 * (1.0 - eta)
+        dN11_dxi = 0.25 * (1.0 + eta)
+        dN01_dxi = -0.25 * (1.0 + eta)
+
+        dN00_deta = -0.25 * (1.0 - xi)
+        dN10_deta = -0.25 * (1.0 + xi)
+        dN11_deta = 0.25 * (1.0 + xi)
+        dN01_deta = 0.25 * (1.0 - xi)
+
+        dphi_dxi = v00 * dN00_dxi + v10 * dN10_dxi + v11 * dN11_dxi + v01 * dN01_dxi
+        dphi_deta = v00 * dN00_deta + v10 * dN10_deta + v11 * dN11_deta + v01 * dN01_deta
+        grad_ref = np.array([dphi_dxi, dphi_deta], float)
+
+        J = transform.jacobian(self.mesh, int(eid), (xi, eta))
+        try:
+            invJ = np.linalg.inv(J)
+        except np.linalg.LinAlgError:
+            invJ = np.linalg.pinv(J)
+        return grad_ref @ invJ
 
     def evaluate_on_nodes(self, mesh) -> np.ndarray:
         if mesh is not self.mesh:
@@ -520,8 +655,7 @@ class PiecewiseLinearLevelSet(LevelSetFunction):
         return self.node_values.copy()
     def value_on_element_ref(self, eid: int, xi_eta: tuple[float,float]) -> float:
         xi, eta = float(xi_eta[0]), float(xi_eta[1])
-        cc = np.asarray(self.mesh.corner_connectivity[int(eid)], int)
-        v  = self.node_values[cc]  # φ at the 3 (tri) or 4 (quad) corners
+        v = np.asarray(self._coeff(int(eid)), float)  # φ at the 3 (tri) or 4 (quad) corners
         if self.mesh.element_type == "tri":
             # reference triangle (0,0), (1,0), (0,1)
             return float(v[0]*(1.0 - xi - eta) + v[1]*xi + v[2]*eta)

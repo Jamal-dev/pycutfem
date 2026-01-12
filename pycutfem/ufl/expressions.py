@@ -1,17 +1,27 @@
 import numpy as np
 from hashlib import blake2b
 from typing import Callable, Dict, List, Optional, Union
-import matplotlib.pyplot as plt
-import matplotlib.tri as tri
-from matplotlib.tri import LinearTriInterpolator
 import numbers
-from matplotlib.colors import LinearSegmentedColormap
-from pycutfem.plotting.triangulate import triangulate_field
-from matplotlib.animation import FuncAnimation
 from pycutfem.utils.bitset import BitSet
 
+try:  # optional plotting dependency
+    import matplotlib.pyplot as plt
+    import matplotlib.tri as tri
+    from matplotlib.tri import LinearTriInterpolator
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.animation import FuncAnimation
+except ModuleNotFoundError:  # pragma: no cover
+    plt = None
+    tri = None
+    LinearTriInterpolator = None
+    LinearSegmentedColormap = None
+    FuncAnimation = None
 
-custom_cmap = LinearSegmentedColormap.from_list('blue_red', ['blue', 'red'])
+custom_cmap = (
+    LinearSegmentedColormap.from_list("blue_red", ["blue", "red"])
+    if LinearSegmentedColormap is not None
+    else None
+)
 
 
 
@@ -319,6 +329,8 @@ class Function(Expression):
             mask : BitSet | ndarray[bool] | callable(x,y)->bool, optional
                 Only plot within this region. Implemented by masking triangles.
         """
+        if plt is None:
+            raise RuntimeError("Plotting requires matplotlib; install it to use Function.plot().")
         if self._dof_handler is None:
             raise RuntimeError("Cannot plot a function without an associated DofHandler.")
         mask_arg = kwargs.pop('mask', None)
@@ -329,6 +341,7 @@ class Function(Expression):
             raise RuntimeError(f"Field '{self.field_name}' not found in DofHandler's fe_map.")
 
         z = self.nodal_values
+        from pycutfem.plotting.triangulate import triangulate_field
         tri = triangulate_field(mesh, dh, self.field_name)
 
         if mask_arg is not None:
@@ -368,11 +381,14 @@ class Function(Expression):
         **kwargs     :
             Passed straight to `tricontourf` (cmap, levels, …).
         """
+        if plt is None or tri is None:
+            raise RuntimeError("Plotting requires matplotlib; install it to use Function.plot_deformed().")
         if self._dof_handler is None:
             raise RuntimeError("Function needs an attached DofHandler.")
         mesh = self._dof_handler.fe_map[self.field_name]
 
         # --- original triangulation & coords --------------------------------
+        from pycutfem.plotting.triangulate import triangulate_field
         tri_orig = triangulate_field(mesh, self._dof_handler, self.field_name)
         node_ids = [self._dof_handler._dof_to_node_map[d][1]
                     for d in self._dof_handler.get_field_slice(self.field_name)]
@@ -1248,6 +1264,21 @@ class Dot(Expression):
 
 class CellDiameter(Expression):
     """Return element‑wise √area — identical to mesh.element_char_length(eid)."""
+    def __init__(self):
+        super().__init__()
+        self.role = "none"
+
+
+class MeshSize(Expression):
+    """Pointwise NGSolve-like `specialcf.mesh_size`.
+
+    Evaluated at the current quadrature point using the (possibly deformed)
+    geometry Jacobian determinant:
+
+      - tri  reference (0,0)-(1,0)-(0,1):        h = sqrt(|detJ|)
+      - quad reference [-1,1]^2 (area factor 4): h = 2*sqrt(|detJ|)
+    """
+
     def __init__(self):
         super().__init__()
         self.role = "none"

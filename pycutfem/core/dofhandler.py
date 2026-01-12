@@ -39,6 +39,7 @@ BcLike = Union[BoundaryCondition, Mapping[str, Any]]
 # ------------------------------------------------------------------
 _edge_geom_cache: dict[tuple[int,int,int], dict] = {}
 _ghost_cache: dict[tuple, dict] = {}
+_facet_patch_cache: dict[tuple, dict] = {}
 _jacobian_cache: dict[tuple, dict] = {}
 _interior_cache: dict[tuple, dict] = {}
 
@@ -147,6 +148,7 @@ def clear_caches() -> None:
     _cut_volume_cache.clear()
     _edge_geom_cache.clear()
     _ghost_cache.clear()
+    _facet_patch_cache.clear()
     _jacobian_cache.clear()
     _interior_cache.clear()
     # Lazily created caches (defined on first use).
@@ -2652,7 +2654,78 @@ class DofHandler:
                 that[i, :, :] = tau[None, :]
             qref = None
 
-        elif _HAVE_ISO_IFC:
+        else:
+            # Special-case: QUAD + Q1 level set (PiecewiseLinearLevelSet-like)
+            # Use an exact reference iso-curve rule on Ih(φ)=0 and map via the geometry.
+            # This avoids polynomial curve approximation errors that otherwise persist
+            # even as the quadrature order is increased, and matches NGSXFEM-style
+            # iterated-integral interface integration on quads more closely.
+            use_ref_iso_q1_quad = (
+                mesh.element_type == "quad"
+                and hasattr(level_set, "value_on_element_ref")
+                and hasattr(level_set, "value_on_element")
+            )
+            if use_ref_iso_q1_quad:
+                try:
+                    from pycutfem.integration.cut_integration import CutIntegration
+
+                    order = max(1, int(qdeg))
+                    nQ = int(order)
+                    qp_phys = np.empty((nE, nQ, 2), dtype=float)
+                    qw = np.empty((nE, nQ), dtype=float)
+                    that = np.empty((nE, nQ, 2), dtype=float)
+                    qref = np.empty((nE, nQ, 2), dtype=float)
+
+                    ok = True
+                    for i, (eid0, _, _, _) in enumerate(segment_records):
+                        eid = int(eid0)
+                        qref_e, wref_e, coeffs, _ = CutIntegration.iso_interface_rule_ref(
+                            mesh, eid, level_set, order=order, tol=SIDE.tol
+                        )
+                        if qref_e.shape[0] != nQ:
+                            ok = False
+                            break
+                        a00, a10, a01, a11 = (
+                            float(coeffs[0]),
+                            float(coeffs[1]),
+                            float(coeffs[2]),
+                            float(coeffs[3]),
+                        )
+                        for q in range(nQ):
+                            xi = float(qref_e[q, 0])
+                            eta = float(qref_e[q, 1])
+                            qref[i, q, 0] = xi
+                            qref[i, q, 1] = eta
+
+                            xq = transform.x_mapping(mesh, eid, (xi, eta))
+                            qp_phys[i, q, :] = np.asarray(xq, float)
+
+                            # Reference unit tangent τ̂_ref = rot90(∇̂φ)/||∇̂φ||
+                            gx = a10 + a11 * eta  # ∂φ/∂ξ
+                            gy = a01 + a11 * xi  # ∂φ/∂η
+                            gn = float(np.hypot(gx, gy)) + 1e-30
+                            tref = np.array([gy / gn, -gx / gn], dtype=float)
+
+                            # Push-forward to physical tangent and scale weights:
+                            # ds_x = ||J_g * τ̂_ref|| ds_ref
+                            Jg = transform.jacobian(mesh, eid, (xi, eta))
+                            tphys = Jg @ tref
+                            tn = float(np.linalg.norm(tphys)) + 1e-30
+                            that[i, q, :] = tphys / tn
+                            qw[i, q] = float(wref_e[q]) * tn
+
+                    if not ok:
+                        qp_phys = None
+                        qw = None
+                        that = None
+                        qref = None
+                except Exception:
+                    qp_phys = None
+                    qw = None
+                    that = None
+                    qref = None
+
+            if qp_phys is None and _HAVE_ISO_IFC:
             # Build segment endpoints per cut element (P0,P1)
             P0 = np.empty((nE, 2), dtype=float)
             P1 = np.empty((nE, 2), dtype=float)
@@ -2674,7 +2747,7 @@ class DofHandler:
             if qref is not None:
                 qref = np.asarray(qref, dtype=float)         # (nE, nQ, 2)
             nQ = qp_phys.shape[1]
-        else:
+        elif qp_phys is None:
             # Robust fallback: 'nseg' uniform → constant nQ = qdeg * nseg
             nseg_eff = int(nseg if nseg is not None else max(3, mesh.poly_order + qdeg // 2))
             nQ = int(max(1, int(qdeg)) * nseg_eff)
@@ -2848,6 +2921,9 @@ class DofHandler:
                 J_inv = cached_final["inv"].copy()
                 qp_phys = cached_final["qp"].copy()
                 qw = cached_final["qw"].copy()
+                normals_cached = cached_final.get("normals", None)
+                if normals_cached is not None:
+                    normals = np.asarray(normals_cached, dtype=float).copy()
             else:
                 node_ids_sel = node_ids_all[np.asarray(seg_eids, dtype=int)]
                 disp_nodes = np.asarray(deformation.node_displacements, float)
@@ -2883,11 +2959,30 @@ class DofHandler:
                 disp = np.einsum('eqk,ekj->eqj', N_tab, U_all)
                 qp_phys = x_geom + disp
 
+                # Transform normals to the deformed configuration.
+                # For the mapping y = x + u(x), the interface normal transforms as:
+                #   n_y ∝ F^{-T} n_x
+                # where F = I + ∇u (w.r.t. physical x). We already formed F above.
+                a = F[..., 0, 0]
+                b = F[..., 0, 1]
+                c = F[..., 1, 0]
+                d = F[..., 1, 1]
+                detF = a * d - b * c
+                inv_detF = 1.0 / (detF + 1e-300)
+                n0x = normals[..., 0]
+                n0y = normals[..., 1]
+                nx = (d * n0x - c * n0y) * inv_detF
+                ny = (-b * n0x + a * n0y) * inv_detF
+                nn = np.sqrt(nx * nx + ny * ny) + 1e-30
+                normals[..., 0] = nx / nn
+                normals[..., 1] = ny / nn
+
                 _jacobian_cache[final_key] = {
                     "det": detJ.copy(),
                     "inv": J_inv.copy(),
                     "qp": qp_phys.copy(),
                     "qw": qw.copy(),
+                    "normals": normals.copy(),
                 }
         # ensure downstream consumers see the updated geometry tensors
         qp_phys = np.asarray(qp_phys, dtype=np.float64, order="C")
@@ -3215,7 +3310,59 @@ class DofHandler:
             if (("cut" in (lt, rt)) or et.startswith("ghost") or (allow_interface and et == "interface")):
                 edges.append(e)
         if not edges:
-            raise ValueError("No valid ghost edges found.")
+            # Empty → return a consistent skeleton (allows JIT compilation even
+            # when no ghost/interface edges are present).
+            derivs_eff = {(0, 0)} | set(tuple((int(dx), int(dy))) for (dx, dy) in derivs)
+            z2 = np.empty((0, 0, 2), dtype=float)
+            z1 = np.empty((0, 0), dtype=float)
+            z22 = np.empty((0, 0, 2, 2), dtype=float)
+            n_union = int(n_union_default)
+
+            out = {
+                "eids": np.empty((0,), dtype=np.int32),
+                "qp_phys": z2,
+                "qw": z1,
+                "normals": z2,
+                "xi_pos": z1,
+                "eta_pos": z1,
+                "xi_neg": z1,
+                "eta_neg": z1,
+                "gdofs_map": np.empty((0, n_union), dtype=np.int64),
+                "pos_map": np.empty((0, n_union), dtype=np.int32),
+                "neg_map": np.empty((0, n_union), dtype=np.int32),
+                "J_inv_pos": z22,
+                "J_inv_neg": z22,
+                "detJ_pos": z1,
+                "detJ_neg": z1,
+                "detJ": z1,
+                "J_inv": z22,
+                "phis": z1,
+                "h_arr": np.empty((0,), dtype=float),
+                "entity_kind": "edge",
+                "owner_pos_id": np.empty((0,), dtype=np.int32),
+                "owner_neg_id": np.empty((0,), dtype=np.int32),
+                "owner_id": np.empty((0,), dtype=np.int32),
+            }
+            for fld in fields:
+                nloc_f = int(getattr(me, "_n_basis", {}).get(fld, 0))
+                out[f"pos_map_{fld}"] = np.empty((0, nloc_f), dtype=np.int32)
+                out[f"neg_map_{fld}"] = np.empty((0, nloc_f), dtype=np.int32)
+                out[f"restrict_mask_{fld}_pos"] = np.empty((0, n_union), dtype=float)
+                out[f"restrict_mask_{fld}_neg"] = np.empty((0, n_union), dtype=float)
+                for (dx, dy) in sorted(derivs_eff):
+                    out[f"r{dx}{dy}_{fld}_pos"] = np.empty((0, 0, n_union), dtype=float)
+                    out[f"r{dx}{dy}_{fld}_neg"] = np.empty((0, 0, n_union), dtype=float)
+            if _prof:
+                _pc_print(
+                    "ghost_factors(empty)",
+                    time.perf_counter() - _t0,
+                    nE=0,
+                    nQ=0,
+                    q=int(qdeg),
+                    allow_interface=bool(allow_interface),
+                    deform=bool(deformation is not None),
+                )
+            return out
 
         # 1) Batched line quadrature on segments ------------------------------------
         nE = len(edges)
@@ -4162,6 +4309,437 @@ class DofHandler:
                 allow_interface=bool(allow_interface),
                 deform=bool(deformation is not None),
             )
+        return out
+
+
+    def precompute_facet_patch_factors(
+        self,
+        facet_ids: "BitSet | Sequence[int]",
+        qdeg: int,
+        level_set,
+        derivs: set[tuple[int, int]],
+        *,
+        reuse: bool = True,
+        allow_interface: bool = False,
+        deformation: Any = None,
+    ) -> dict:
+        """
+        Pre-compute geometry and basis tables for NGSolve-style facet *patch* integrals.
+
+        This is the analogue of NGSXFEM's `dFacetPatch`: integration over the union
+        of the two adjacent element volumes, evaluating traces as *polynomial
+        extensions* across the shared facet.
+
+        Notes
+        -----
+        - Patch quadrature points are built from a volume rule on each element and
+          then mapped to the neighbor element by solving X_pos(ξ,η)=X_neg(ξ',η').
+          The mapped reference coordinates are generally outside the reference cell.
+        - For CG spaces, this yields non-zero "jumps" even for globally continuous
+          functions (since extensions differ away from the facet).
+        - The output format is compatible with the JIT ghost-edge kernels: it
+          provides `owner_pos_id/owner_neg_id`, `gdofs_map`, `pos_map/neg_map`, and
+          sided `r**_<field>_(pos|neg)` tables on the union layout.
+        """
+        import numpy as np
+        from pycutfem.integration.quadrature import volume as vol_rule
+        from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
+
+        mesh = self.mixed_element.mesh
+        me = self.mixed_element
+        fields = me.field_names
+        n_union_default = int(self.union_dofs)
+
+        if level_set is None:
+            raise ValueError("facet-patch precompute requires a 'level_set' (used for per-field side masks).")
+
+        if hasattr(facet_ids, "to_indices"):
+            facet_gid_tuple = tuple(int(i) for i in facet_ids.to_indices())
+        else:
+            facet_gid_tuple = tuple(int(i) for i in facet_ids)
+
+        # Keep only interior facets that are relevant for CutFEM stabilization.
+        edges = []
+        for gid in facet_gid_tuple:
+            e = mesh.edge(int(gid))
+            if e.right is None:
+                continue
+            lt = mesh.elements_list[e.left].tag
+            rt = mesh.elements_list[e.right].tag
+            et = str(getattr(e, "tag", ""))
+            if (("cut" in (lt, rt)) or et.startswith("ghost") or (allow_interface and et == "interface")):
+                edges.append(e)
+
+        # Empty output (keeps JIT compile path happy even when no patches exist).
+        if not edges:
+            derivs_eff = {(0, 0)} | set(tuple((int(dx), int(dy))) for (dx, dy) in derivs)
+            z2 = np.empty((0, 0, 2), dtype=float)
+            z1 = np.empty((0, 0), dtype=float)
+            z22 = np.empty((0, 0, 2, 2), dtype=float)
+            out = {
+                "eids": np.empty((0,), dtype=np.int32),
+                "qp_phys": z2,
+                "qw": z1,
+                "normals": z2,
+                "phis": z1,
+                "xi_pos": z1,
+                "eta_pos": z1,
+                "xi_neg": z1,
+                "eta_neg": z1,
+                "gdofs_map": np.empty((0, n_union_default), dtype=np.int64),
+                "pos_map": np.empty((0, me.n_dofs_local), dtype=np.int32),
+                "neg_map": np.empty((0, me.n_dofs_local), dtype=np.int32),
+                "owner_pos_id": np.empty((0,), dtype=np.int32),
+                "owner_neg_id": np.empty((0,), dtype=np.int32),
+                "entity_kind": "edge",
+            }
+            for fld in fields:
+                for (dx, dy) in sorted(derivs_eff):
+                    out[f"r{dx}{dy}_{fld}_pos"] = np.empty((0, 0, n_union_default), dtype=float)
+                    out[f"r{dx}{dy}_{fld}_neg"] = np.empty((0, 0, n_union_default), dtype=float)
+                out[f"restrict_mask_{fld}_pos"] = np.empty((0, n_union_default), dtype=float)
+                out[f"restrict_mask_{fld}_neg"] = np.empty((0, n_union_default), dtype=float)
+            return out
+
+        # Union maps (same as ghost-edge, but patch quadrature differs).
+        nE = len(edges)
+        pos_ids = np.asarray([int(e.left) for e in edges], dtype=np.int32)
+        neg_ids = np.asarray([int(e.right) for e in edges], dtype=np.int32)
+
+        # Compute union lengths.
+        union_lists: list[np.ndarray] = []
+        max_union = n_union_default
+        for i in range(nE):
+            pos_eid = int(pos_ids[i])
+            neg_eid = int(neg_ids[i])
+            pos_dofs = self.get_elemental_dofs(pos_eid)
+            neg_dofs = self.get_elemental_dofs(neg_eid)
+            union = np.unique(np.concatenate((pos_dofs, neg_dofs)))
+            union_lists.append(union)
+            max_union = max(max_union, int(union.size))
+
+        n_union = int(max_union)
+
+        derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
+        cache_key = (
+            facet_gid_tuple,
+            int(qdeg),
+            me.signature(),
+            int(n_union),
+            derivs_key,
+            getattr(self, "_method_token", self.method),
+            bool(allow_interface),
+            _ls_fingerprint(level_set),
+            _def_fingerprint(deformation),
+            _coords_fingerprint(mesh.nodes_x_y_pos),
+        )
+        if reuse and cache_key in _facet_patch_cache:
+            return _facet_patch_cache[cache_key]
+
+        # DOF maps: owner-mixed local -> union indices
+        n_loc = int(me.n_dofs_local)
+        gdofs_map = np.empty((nE, n_union), dtype=np.int64)
+        pos_map = -np.ones((nE, n_loc), dtype=np.int32)
+        neg_map = -np.ones((nE, n_loc), dtype=np.int32)
+        for i in range(nE):
+            union = union_lists[i]
+            pad_val = int(union[-1])
+            gdofs_map[i, :] = pad_val
+            gdofs_map[i, : union.size] = union
+            pos_dofs = self.get_elemental_dofs(int(pos_ids[i]))
+            neg_dofs = self.get_elemental_dofs(int(neg_ids[i]))
+            pos_map[i, : len(pos_dofs)] = np.searchsorted(union, pos_dofs)
+            neg_map[i, : len(neg_dofs)] = np.searchsorted(union, neg_dofs)
+
+        # Per-field side masks (for Restriction masking on patch paths)
+        masks_by_field: dict[str, np.ndarray] = {}
+        mask_cache: dict[int, tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = {}
+
+        def _elem_masks(eid: int):
+            if eid not in mask_cache:
+                mask_cache[eid] = _hfa.build_side_masks_by_field(self, fields, int(eid), level_set, tol=SIDE.tol)
+            return mask_cache[eid]
+
+        for fld in fields:
+            pos_mask = np.zeros((nE, n_union), dtype=float)
+            neg_mask = np.zeros((nE, n_union), dtype=float)
+            for i in range(nE):
+                union = union_lists[i]
+                (pos_masks_elem, _) = _elem_masks(int(pos_ids[i]))
+                (_, neg_masks_elem) = _elem_masks(int(neg_ids[i]))
+                try:
+                    gidx_pos_f = np.asarray(self.element_maps[fld][int(pos_ids[i])], dtype=int)
+                    gidx_neg_f = np.asarray(self.element_maps[fld][int(neg_ids[i])], dtype=int)
+                except Exception:
+                    continue
+                mp_f = np.searchsorted(union, gidx_pos_f)
+                mn_f = np.searchsorted(union, gidx_neg_f)
+
+                mask_pos_local = pos_masks_elem.get(fld)
+                if mask_pos_local is not None and mask_pos_local.shape[0] == mp_f.shape[0]:
+                    pos_mask[i, mp_f] = np.asarray(mask_pos_local, dtype=float)
+
+                mask_neg_local = neg_masks_elem.get(fld)
+                if mask_neg_local is not None and mask_neg_local.shape[0] == mn_f.shape[0]:
+                    neg_mask[i, mn_f] = np.asarray(mask_neg_local, dtype=float)
+            masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
+            masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
+
+        # Build patch quadrature: 2 * (volume rule points)
+        qref, wref = vol_rule(mesh.element_type, int(qdeg))
+        qref = np.asarray(qref, dtype=float)
+        wref = np.asarray(wref, dtype=float).ravel()
+        nQv = int(wref.shape[0])
+        nQ = 2 * nQv
+
+        xi_pos = np.empty((nE, nQ), dtype=float)
+        eta_pos = np.empty((nE, nQ), dtype=float)
+        xi_neg = np.empty((nE, nQ), dtype=float)
+        eta_neg = np.empty((nE, nQ), dtype=float)
+        qp_phys = np.empty((nE, nQ, 2), dtype=float)
+        qw = np.empty((nE, nQ), dtype=float)
+        # Jacobians for optional JIT params (some kernels request these even for value-only forms).
+        detJ = np.empty((nE, nQ), dtype=float)
+        J_inv = np.empty((nE, nQ, 2, 2), dtype=float)
+        detJ_pos = np.empty((nE, nQ), dtype=float)
+        detJ_neg = np.empty((nE, nQ), dtype=float)
+        J_inv_pos = np.empty((nE, nQ, 2, 2), dtype=float)
+        J_inv_neg = np.empty((nE, nQ, 2, 2), dtype=float)
+        phis = np.empty((nE, nQ), dtype=float)
+        normals = np.zeros((nE, nQ, 2), dtype=float)
+
+        # Geometry reference (for mapping and Jacobians). Uses mesh poly_order.
+        ref_geom = get_reference(mesh.element_type, int(getattr(mesh, "poly_order", 1)))
+
+        def _invmap_coords(coords_def: np.ndarray, x_target: np.ndarray, xi0: np.ndarray) -> np.ndarray:
+            """Newton inverse mapping for isoparametric geometry defined by coords_def."""
+            xi_eta = np.asarray(xi0, dtype=float).copy()
+            for _ in range(40):
+                xi, eta = float(xi_eta[0]), float(xi_eta[1])
+                N = np.asarray(ref_geom.shape(xi, eta), dtype=float).ravel()
+                dN = np.asarray(ref_geom.grad(xi, eta), dtype=float)
+                X = N @ coords_def
+                J = coords_def.T @ dN
+                rhs = np.asarray(x_target, dtype=float) - np.asarray(X, dtype=float)
+                try:
+                    delta = np.linalg.solve(J, rhs)
+                except np.linalg.LinAlgError:
+                    delta = np.linalg.lstsq(J, rhs, rcond=None)[0]
+                xi_eta += delta
+                if float(np.linalg.norm(delta)) < 1e-12:
+                    break
+            return xi_eta
+
+        # Patch construction per facet
+        for i, e in enumerate(edges):
+            pos_eid = int(pos_ids[i])
+            neg_eid = int(neg_ids[i])
+
+            # Constant facet normal (used only if integrand asks for FacetNormal()).
+            p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+            t = np.asarray(p1 - p0, dtype=float)
+            tn = float(np.linalg.norm(t))
+            if tn < 1e-30:
+                nvec = np.array([1.0, 0.0], dtype=float)
+            else:
+                t /= tn
+                nvec = np.array([t[1], -t[0]], dtype=float)
+
+            conn_pos = np.asarray(mesh.elements_connectivity[pos_eid], dtype=int)
+            conn_neg = np.asarray(mesh.elements_connectivity[neg_eid], dtype=int)
+            coords_pos_geom = np.asarray(mesh.nodes_x_y_pos[conn_pos], dtype=float)
+            coords_neg_geom = np.asarray(mesh.nodes_x_y_pos[conn_neg], dtype=float)
+            if deformation is not None:
+                Upos = np.asarray(deformation.node_displacements[conn_pos], dtype=float)
+                Uneg = np.asarray(deformation.node_displacements[conn_neg], dtype=float)
+                coords_pos_def = coords_pos_geom + Upos
+                coords_neg_def = coords_neg_geom + Uneg
+            else:
+                Upos = None
+                Uneg = None
+                coords_pos_def = coords_pos_geom
+                coords_neg_def = coords_neg_geom
+
+            for q in range(nQv):
+                xi0, eta0 = float(qref[q, 0]), float(qref[q, 1])
+                # -------- points originating from POS element ----------------------
+                xi_pos[i, q] = xi0
+                eta_pos[i, q] = eta0
+                N = np.asarray(ref_geom.shape(xi0, eta0), dtype=float).ravel()
+                dN = np.asarray(ref_geom.grad(xi0, eta0), dtype=float)
+                x_phys = N @ coords_pos_def
+                qp_phys[i, q, :] = x_phys
+                normals[i, q, :] = nvec
+
+                J = coords_pos_def.T @ dN
+                det = float(np.linalg.det(J))
+                qw[i, q] = float(wref[q]) * abs(det)
+                detJ_pos[i, q] = det
+                detJ[i, q] = det
+                try:
+                    Jip = np.linalg.inv(J)
+                except np.linalg.LinAlgError:
+                    Jip = np.linalg.pinv(J)
+                J_inv_pos[i, q, :, :] = Jip
+                J_inv[i, q, :, :] = Jip
+                # Level set is defined on the *undeformed* background mesh. Avoid
+                # evaluating it at deformed coordinates to prevent owner-search
+                # failures for FE-backed level sets.
+                if hasattr(level_set, "value_on_element"):
+                    phis[i, q] = float(level_set.value_on_element(int(pos_eid), (float(xi0), float(eta0))))
+                else:
+                    phis[i, q] = float(level_set(np.asarray(N @ coords_pos_geom, dtype=float)))
+
+                # map to NEG element
+                if deformation is None:
+                    xi_eta_n = transform.inverse_mapping(mesh, neg_eid, np.asarray(x_phys, dtype=float))
+                else:
+                    x_base = N @ coords_pos_geom
+                    xi_guess = transform.inverse_mapping(mesh, neg_eid, np.asarray(x_base, dtype=float))
+                    xi_eta_n = _invmap_coords(coords_neg_def, np.asarray(x_phys, dtype=float), np.asarray(xi_guess, dtype=float))
+                xi_neg[i, q] = float(xi_eta_n[0])
+                eta_neg[i, q] = float(xi_eta_n[1])
+                dNn = np.asarray(ref_geom.grad(float(xi_neg[i, q]), float(eta_neg[i, q])), dtype=float)
+                Jn = coords_neg_def.T @ dNn
+                detJn = float(np.linalg.det(Jn))
+                detJ_neg[i, q] = detJn
+                try:
+                    Jin = np.linalg.inv(Jn)
+                except np.linalg.LinAlgError:
+                    Jin = np.linalg.pinv(Jn)
+                J_inv_neg[i, q, :, :] = Jin
+
+                # -------- points originating from NEG element ----------------------
+                qq = q + nQv
+                xi_neg[i, qq] = xi0
+                eta_neg[i, qq] = eta0
+                x_phys2 = N @ coords_neg_def
+                qp_phys[i, qq, :] = x_phys2
+                normals[i, qq, :] = nvec
+
+                J2 = coords_neg_def.T @ dN
+                det2 = float(np.linalg.det(J2))
+                qw[i, qq] = float(wref[q]) * abs(det2)
+                detJ_neg[i, qq] = det2
+                detJ[i, qq] = det2
+                try:
+                    Jin2 = np.linalg.inv(J2)
+                except np.linalg.LinAlgError:
+                    Jin2 = np.linalg.pinv(J2)
+                J_inv_neg[i, qq, :, :] = Jin2
+                J_inv[i, qq, :, :] = Jin2
+                if hasattr(level_set, "value_on_element"):
+                    phis[i, qq] = float(level_set.value_on_element(int(neg_eid), (float(xi0), float(eta0))))
+                else:
+                    phis[i, qq] = float(level_set(np.asarray(N @ coords_neg_geom, dtype=float)))
+
+                # map to POS element
+                if deformation is None:
+                    xi_eta_p = transform.inverse_mapping(mesh, pos_eid, np.asarray(x_phys2, dtype=float))
+                else:
+                    x_base2 = N @ coords_neg_geom
+                    xi_guess2 = transform.inverse_mapping(mesh, pos_eid, np.asarray(x_base2, dtype=float))
+                    xi_eta_p = _invmap_coords(coords_pos_def, np.asarray(x_phys2, dtype=float), np.asarray(xi_guess2, dtype=float))
+                xi_pos[i, qq] = float(xi_eta_p[0])
+                eta_pos[i, qq] = float(xi_eta_p[1])
+                dNp = np.asarray(ref_geom.grad(float(xi_pos[i, qq]), float(eta_pos[i, qq])), dtype=float)
+                Jp = coords_pos_def.T @ dNp
+                detJp = float(np.linalg.det(Jp))
+                detJ_pos[i, qq] = detJp
+                try:
+                    Jip2 = np.linalg.inv(Jp)
+                except np.linalg.LinAlgError:
+                    Jip2 = np.linalg.pinv(Jp)
+                J_inv_pos[i, qq, :, :] = Jip2
+
+        # Basis tables (union layout) for requested derivatives
+        derivs_eff = {(0, 0)} | set(tuple((int(dx), int(dy))) for (dx, dy) in derivs)
+        basis_tables: dict[str, np.ndarray] = {}
+        for fld in fields:
+            for (dx, dy) in sorted(derivs_eff):
+                tab_pos = np.zeros((nE, nQ, n_union), dtype=float)
+                tab_neg = np.zeros((nE, nQ, n_union), dtype=float)
+                for i in range(nE):
+                    pos_eid = int(pos_ids[i])
+                    neg_eid = int(neg_ids[i])
+                    conn_pos = np.asarray(mesh.elements_connectivity[pos_eid], dtype=int)
+                    conn_neg = np.asarray(mesh.elements_connectivity[neg_eid], dtype=int)
+                    coords_pos_geom = np.asarray(mesh.nodes_x_y_pos[conn_pos], dtype=float)
+                    coords_neg_geom = np.asarray(mesh.nodes_x_y_pos[conn_neg], dtype=float)
+                    if deformation is not None:
+                        coords_pos_def = coords_pos_geom + np.asarray(deformation.node_displacements[conn_pos], dtype=float)
+                        coords_neg_def = coords_neg_geom + np.asarray(deformation.node_displacements[conn_neg], dtype=float)
+                    else:
+                        coords_pos_def = coords_pos_geom
+                        coords_neg_def = coords_neg_geom
+
+                    for q in range(nQ):
+                        xip, etap = float(xi_pos[i, q]), float(eta_pos[i, q])
+                        xin, etan = float(xi_neg[i, q]), float(eta_neg[i, q])
+                        dNp = np.asarray(ref_geom.grad(xip, etap), dtype=float)
+                        dNn = np.asarray(ref_geom.grad(xin, etan), dtype=float)
+                        Jp = coords_pos_def.T @ dNp
+                        Jn = coords_neg_def.T @ dNn
+                        try:
+                            Jip = np.linalg.inv(Jp)
+                        except np.linalg.LinAlgError:
+                            Jip = np.linalg.pinv(Jp)
+                        try:
+                            Jin = np.linalg.inv(Jn)
+                        except np.linalg.LinAlgError:
+                            Jin = np.linalg.pinv(Jn)
+
+                        if (dx, dy) == (0, 0):
+                            vp = me.basis(fld, xip, etap)
+                            vn = me.basis(fld, xin, etan)
+                            tab_pos[i, q, pos_map[i]] = vp
+                            tab_neg[i, q, neg_map[i]] = vn
+                        elif (dx, dy) in {(1, 0), (0, 1)}:
+                            gp = me.grad_basis(fld, xip, etap) @ Jip
+                            gn = me.grad_basis(fld, xin, etan) @ Jin
+                            col = 0 if (dx, dy) == (1, 0) else 1
+                            tab_pos[i, q, pos_map[i]] = gp[:, col]
+                            tab_neg[i, q, neg_map[i]] = gn[:, col]
+                        else:
+                            raise NotImplementedError(
+                                "facet-patch precompute currently supports only (0,0),(1,0),(0,1) derivatives; "
+                                f"requested ({dx},{dy})."
+                            )
+
+                basis_tables[f"r{dx}{dy}_{fld}_pos"] = tab_pos
+                basis_tables[f"r{dx}{dy}_{fld}_neg"] = tab_neg
+
+        out = {
+            "eids": np.asarray([int(e.gid) for e in edges], dtype=np.int32),
+            "qp_phys": qp_phys,
+            "qw": qw,
+            "detJ": detJ,
+            "J_inv": J_inv,
+            "detJ_pos": detJ_pos,
+            "detJ_neg": detJ_neg,
+            "J_inv_pos": J_inv_pos,
+            "J_inv_neg": J_inv_neg,
+            "normals": normals,
+            "phis": phis,
+            "xi_pos": xi_pos,
+            "eta_pos": eta_pos,
+            "xi_neg": xi_neg,
+            "eta_neg": eta_neg,
+            "gdofs_map": gdofs_map,
+            "pos_map": pos_map,
+            "neg_map": neg_map,
+            "owner_pos_id": pos_ids,
+            "owner_neg_id": neg_ids,
+            # Some kernels (e.g. CellDiameter()) expect an unsided owner element id.
+            # For facet-patch integrals this is only used for per-edge constants (uniform meshes => exact).
+            "owner_id": pos_ids,
+            "entity_kind": "edge",
+        }
+        out.update(masks_by_field)
+        out.update(basis_tables)
+
+        if reuse:
+            _facet_patch_cache[cache_key] = out
         return out
 
 
@@ -5195,7 +5773,10 @@ class DofHandler:
             # Zero-out padded slots (match the legacy ragged-padding output)
             pad_mask = (wref == 0.0)
             if np.any(pad_mask):
-                qp_phys[pad_mask] = 0.0
+                # Keep qp_phys at a valid in-element coordinate (it currently
+                # corresponds to the mapped reference point (0,0) due to qref
+                # padding) so that evaluating coefficient functions does not
+                # produce NaNs that contaminate 0-weight contributions.
                 detJ[pad_mask] = 0.0
                 invJ[pad_mask] = 0.0
 
@@ -5486,7 +6067,9 @@ class DofHandler:
                         # store
                         xq_elem.append(y); wq_elem.append(w_eff); Ji_elem.append(Ji_use); det_elem.append(det_t)
                         xi_eta_elem.append((float(xi), float(eta)))
-                        phi_elem.append(float(phi_eval(level_set, y, eid=eid, mesh=mesh)))
+                        phi_elem.append(
+                            float(phi_eval(level_set, y, eid=eid, xi_eta=(float(xi), float(eta)), mesh=mesh))
+                        )
 
                         # jets (inverse-geometry chains from reference xi,eta)
                         rec = _JET.get(mesh, eid, float(xi), float(eta), upto=kmax_jets)
@@ -5509,49 +6092,130 @@ class DofHandler:
                                 d_lists[(dx, dy, f)].append(d_loc[None, :])
 
             else:
-                # ---- TRI parents (and quad split via corner-triangles) ----
-                tri_local, corner_ids = corner_tris(mesh, elem)
-                for loc_tri in tri_local:
-                    qx, qw = curved_subcell_quadrature_for_cut_triangle(
-                        mesh, eid, loc_tri, corner_ids, level_set,
-                        side=('+' if sgn == +1 else '-'), qvol=int(qdeg_eff),
-                        nseg_hint=nseg_hint, tol=tol
-                    )
-                    if qx.size == 0:
-                        continue
-                    for x_phys, w in zip(qx, qw):
-                        xi, eta = transform.inverse_mapping(mesh, eid, np.asarray(x_phys))
-                        Jg  = transform.jacobian(mesh, eid, (float(xi), float(eta)))
+                # ---- TRI: reference-space straight-cut rule (exact for P1/Q1 LS) ----
+                if mesh.element_type != "tri":
+                    raise KeyError(mesh.element_type)
 
-                        det_g = abs(float(np.linalg.det(Jg)))
+                qpref, qwref = CutIntegration.straight_cut_rule_tri_ref(
+                    mesh,
+                    eid,
+                    level_set,
+                    side=("+" if sgn == +1 else "-"),
+                    order=int(qdeg_eff),
+                    tol=tol,
+                )
+
+                if qpref.size == 0:
+                    # Fallback: physical subcell quadrature (curved iso-curve rule)
+                    tri_local, corner_ids = corner_tris(mesh, elem)
+                    for loc_tri in tri_local:
+                        qx, qw = curved_subcell_quadrature_for_cut_triangle(
+                            mesh,
+                            eid,
+                            loc_tri,
+                            corner_ids,
+                            level_set,
+                            side=("+" if sgn == +1 else "-"),
+                            qvol=int(qdeg_eff),
+                            nseg_hint=nseg_hint,
+                            tol=tol,
+                        )
+                        if qx.size == 0:
+                            continue
+                        for x_phys, w in zip(qx, qw):
+                            xi, eta = transform.inverse_mapping(mesh, eid, np.asarray(x_phys))
+                            Jg = transform.jacobian(mesh, eid, (float(xi), float(eta)))
+
+                            det_g = abs(float(np.linalg.det(Jg)))
+                            if deformation is None:
+                                det_t = det_g
+                                Ji_use = np.linalg.inv(Jg)
+                                y = np.asarray(x_phys, float)
+                                w_eff = float(w)  # already physical
+                            else:
+                                conn = np.asarray(mesh.elements_connectivity[eid], dtype=int)
+                                dN = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
+                                Uloc = np.asarray(deformation.node_displacements[conn], float)
+                                Jd = Uloc.T @ dN
+                                Jt = Jg + Jd
+                                Ji_use = np.linalg.inv(Jt)
+                                det_t = abs(float(np.linalg.det(Jt)))
+                                det_g = abs(float(np.linalg.det(Jg))) + 1e-300
+                                y = transform.x_mapping(mesh, eid, (float(xi), float(eta))) + deformation.displacement_ref(
+                                    eid, (float(xi), float(eta))
+                                )
+                                w_eff = float(w) * (det_t / det_g)  # scale to true physical
+
+                            # store
+                            xq_elem.append(np.asarray(y, float))
+                            wq_elem.append(w_eff)
+                            Ji_elem.append(Ji_use)
+                            det_elem.append(det_t)
+                            xi_eta_elem.append((float(xi), float(eta)))
+                            phi_elem.append(
+                                float(phi_eval(level_set, y, eid=eid, xi_eta=(float(xi), float(eta)), mesh=mesh))
+                            )
+
+                            # jets at (xi,eta)
+                            rec = _JET.get(mesh, eid, float(xi), float(eta), upto=kmax_jets)
+                            if need_hess:
+                                A2 = rec["A2"]; H0_elem.append(np.asarray(A2[0], float)); H1_elem.append(np.asarray(A2[1], float))
+                            if need_o3:
+                                A3 = rec["A3"]; T0_elem.append(np.asarray(A3[0], float)); T1_elem.append(np.asarray(A3[1], float))
+                            if need_o4:
+                                A4 = rec["A4"]; Q0_elem.append(np.asarray(A4[0], float)); Q1_elem.append(np.asarray(A4[1], float))
+
+                            # field‑local basis/derivs at (xi,eta) (REF) → scatter later
+                            for f in fields:
+                                b_loc = np.asarray(me._eval_scalar_basis(f, float(xi), float(eta)), float)
+                                g_loc = np.asarray(me._eval_scalar_grad(f, float(xi), float(eta)), float)
+                                b_lists[f].append(b_loc[None, :])
+                                g_lists[f].append(g_loc[None, :, :])
+                                for (dx, dy) in derivs_eff:
+                                    if (dx, dy) == (0, 0):
+                                        continue
+                                    d_loc = np.asarray(
+                                        me._eval_scalar_deriv(f, float(xi), float(eta), int(dx), int(dy)), float
+                                    )
+                                    d_lists[(dx, dy, f)].append(d_loc[None, :])
+                else:
+                    # Reference-space rule: map via geometry (and optional deformation)
+                    for (xi, eta), w_ref in zip(qpref, qwref):
+                        xi = float(xi)
+                        eta = float(eta)
+                        # geometric mapping
+                        Jg = transform.jacobian(mesh, eid, (xi, eta))
+                        xg = transform.x_mapping(mesh, eid, (xi, eta))
+
                         if deformation is None:
-                            det_t = det_g
+                            Jt = Jg
+                            det_t = abs(float(np.linalg.det(Jg)))
                             Ji_use = np.linalg.inv(Jg)
-                            y = np.asarray(x_phys, float)
-                            w_eff = float(w)  # already physical
+                            y = np.asarray(xg, float)
+                            w_eff = float(w_ref) * det_t
                         else:
                             conn = np.asarray(mesh.elements_connectivity[eid], dtype=int)
-                            dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
+                            dN = np.asarray(ref_geom.grad(xi, eta), float)
                             Uloc = np.asarray(deformation.node_displacements[conn], float)
-                            Jd   = Uloc.T @ dN
-                            Jt   = Jg + Jd
-                            Ji_use = np.linalg.inv(Jt)
+                            Jd = Uloc.T @ dN
+                            Jt = Jg + Jd
                             det_t = abs(float(np.linalg.det(Jt)))
-                            det_g = abs(float(np.linalg.det(Jg))) + 1e-300
-                            y = transform.x_mapping(mesh, eid, (float(xi), float(eta))) \
-                                + deformation.displacement_ref(eid, (float(xi), float(eta)))
-                            w_eff = float(w) * (det_t/det_g)  # scale to true physical
+                            Ji_use = np.linalg.inv(Jt)
+                            y = np.asarray(xg, float) + deformation.displacement_ref(eid, (xi, eta))
+                            w_eff = float(w_ref) * det_t
 
                         # store
                         xq_elem.append(np.asarray(y, float))
                         wq_elem.append(w_eff)
                         Ji_elem.append(Ji_use)
                         det_elem.append(det_t)
-                        xi_eta_elem.append((float(xi), float(eta)))
-                        phi_elem.append(float(phi_eval(level_set, y, eid=eid, mesh=mesh)))
+                        xi_eta_elem.append((xi, eta))
+                        phi_elem.append(
+                            float(phi_eval(level_set, y, eid=eid, xi_eta=(float(xi), float(eta)), mesh=mesh))
+                        )
 
                         # jets at (xi,eta)
-                        rec = _JET.get(mesh, eid, float(xi), float(eta), upto=kmax_jets)
+                        rec = _JET.get(mesh, eid, xi, eta, upto=kmax_jets)
                         if need_hess:
                             A2 = rec["A2"]; H0_elem.append(np.asarray(A2[0], float)); H1_elem.append(np.asarray(A2[1], float))
                         if need_o3:
@@ -5561,13 +6225,14 @@ class DofHandler:
 
                         # field‑local basis/derivs at (xi,eta) (REF) → scatter later
                         for f in fields:
-                            b_loc = np.asarray(me._eval_scalar_basis(f, float(xi), float(eta)), float)
-                            g_loc = np.asarray(me._eval_scalar_grad (f, float(xi), float(eta)), float)
+                            b_loc = np.asarray(me._eval_scalar_basis(f, xi, eta), float)
+                            g_loc = np.asarray(me._eval_scalar_grad(f, xi, eta), float)
                             b_lists[f].append(b_loc[None, :])
                             g_lists[f].append(g_loc[None, :, :])
                             for (dx, dy) in derivs_eff:
-                                if (dx, dy) == (0, 0): continue
-                                d_loc = np.asarray(me._eval_scalar_deriv(f, float(xi), float(eta), int(dx), int(dy)), float)
+                                if (dx, dy) == (0, 0):
+                                    continue
+                                d_loc = np.asarray(me._eval_scalar_deriv(f, xi, eta, int(dx), int(dy)), float)
                                 d_lists[(dx, dy, f)].append(d_loc[None, :])
 
             # commit this element (if it has points)
@@ -5642,6 +6307,16 @@ class DofHandler:
             detJ[i, :n]        = det_blocks[i]
             qref[i, :n, :]     = qref_blocks[i]
             phis[i, :n]        = phi_blocks[i]
+            # Guard against NaNs from evaluating coefficients at padded points.
+            # Many JIT kernels vectorize across the full Qmax; with qw=0 for the
+            # tail, we still want qp_phys/qref/geom factors to stay finite so
+            # that (0 * f(qp)) does not produce NaN when f(qp) is singular.
+            if n > 0 and n < Qmax:
+                qp_phys[i, n:, :] = qp_phys[i, n - 1, :]
+                qref[i, n:, :] = qref[i, n - 1, :]
+                J_inv[i, n:, :, :] = J_inv[i, n - 1, :, :]
+                detJ[i, n:] = detJ[i, n - 1]
+                phis[i, n:] = phis[i, n - 1]
             if need_hess:
                 Hxi0[i, :n, :, :] = H0_blocks[i]
                 Hxi1[i, :n, :, :] = H1_blocks[i]
