@@ -342,10 +342,12 @@ def edge_root_pn(level_set, mesh, eid: int, local_edge: int, *, tol: float = SID
         p = max(1, int(level_set.dh.mixed_element._field_orders[level_set.field]))
         p_samp = p
     else:
-        # Analytic LS → cheap sampling is fine (final projection will correct endpoints)
+        # Analytic or black-box level set:
+        # a segment can enter and exit {phi<0} with both endpoints having the same sign,
+        # so we must oversample to detect multiple crossings.
         p = 1
-        p_samp = 1
-    tnodes, xi, eta = _edge_ref_nodes(mesh, int(local_edge), p)
+        p_samp = 12
+    tnodes, xi, eta = _edge_ref_nodes(mesh, int(local_edge), p_samp)
     fvals = _phi_on_e_points(level_set, mesh, int(eid), xi, eta)
 
     # whole edge on the interface?
@@ -354,11 +356,53 @@ def edge_root_pn(level_set, mesh, eid: int, local_edge: int, *, tol: float = SID
         P1 = transform.x_mapping(mesh, int(eid), (float(xi[-1]), float(eta[-1])))
         return [np.asarray(P0, float), np.asarray(P1, float)]
 
+    # Partial edge on the interface (e.g. piecewise / L∞ level sets like BeamLevelSet):
+    # if φ(t) == 0 over an interval, return only the interval endpoints rather than
+    # a dense set of sample points.
+    on_if = np.abs(fvals) <= tol
+    crossings: list[np.ndarray] = []
+    if np.any(on_if):
+        idx = np.where(on_if)[0]
+        run_start = int(idx[0])
+        run_end = int(idx[0])
+        for k in idx[1:]:
+            k = int(k)
+            if k == run_end + 1:
+                run_end = k
+            else:
+                # finalize previous run
+                if run_end > run_start:
+                    crossings.append(
+                        np.asarray(transform.x_mapping(mesh, int(eid), (float(xi[run_start]), float(eta[run_start]))), float)
+                    )
+                    crossings.append(
+                        np.asarray(transform.x_mapping(mesh, int(eid), (float(xi[run_end]), float(eta[run_end]))), float)
+                    )
+                else:
+                    crossings.append(
+                        np.asarray(transform.x_mapping(mesh, int(eid), (float(xi[run_start]), float(eta[run_start]))), float)
+                    )
+                run_start = run_end = k
+        # last run
+        if run_end > run_start:
+            crossings.append(
+                np.asarray(transform.x_mapping(mesh, int(eid), (float(xi[run_start]), float(eta[run_start]))), float)
+            )
+            crossings.append(
+                np.asarray(transform.x_mapping(mesh, int(eid), (float(xi[run_end]), float(eta[run_end]))), float)
+            )
+        else:
+            crossings.append(
+                np.asarray(transform.x_mapping(mesh, int(eid), (float(xi[run_start]), float(eta[run_start]))), float)
+            )
+
     # Brent–Dekker on each bracket
     w = _bary_weights(tnodes)
     fun = lambda tt: _bary_eval(tt, tnodes, fvals, w)
-    crossings = []
     for k in range(len(tnodes) - 1):
+        # Skip brackets fully on the interface; those are handled above.
+        if on_if[k] and on_if[k + 1]:
+            continue
         a, b = float(tnodes[k]), float(tnodes[k+1])
         fa, fb = float(fvals[k]), float(fvals[k+1])
         if fa * fb > 0.0:

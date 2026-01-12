@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Tuple
 from pycutfem.jit.cache import KernelCache
 from .compiler import compile_extension
 
-CODEGEN_ABI_CPP = "2026-01-07-cpp-abi-refresh-1"
+CODEGEN_ABI_CPP = "2026-01-11-meshsize-detj-view-1"
 
 
 class CppKernelCache:

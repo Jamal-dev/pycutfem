@@ -4,7 +4,8 @@ from pycutfem.ufl.expressions import (
     VectorTestFunction, VectorTrialFunction, VectorFunction,
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, 
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
-    ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter,
+    Avg,
+    ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter, MeshSize as UFLMeshSize,
     NormalComponent, Restriction, Power as UFLPower, Trace as UFLTrace,
     Determinant as UFLDeterminant, Inverse as UFLInverse, Cofactor as UFLCofactor,
     Hessian as UFLHessian, Laplacian as UFLLaplacian
@@ -13,7 +14,7 @@ from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
     LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
-    CellDiameter, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse, Cofactor,
+    CellDiameter, MeshSize, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse, Cofactor,
     Hessian as IRHessian, Laplacian as IRLaplacian
 )
 from dataclasses import replace
@@ -118,6 +119,21 @@ class IRGenerator:
             self.ir_sequence.append(BinaryOp(op_symbol='-'))
             return
 
+        if isinstance(node, Avg):
+            # avg(u) := 0.5 * (u(+) + u(-))
+            def _visit_with_side(expr, sgn):
+                from pycutfem.ufl.expressions import Pos, Neg
+                if isinstance(expr, (Pos, Neg)):
+                    self._visit(expr)
+                else:
+                    self._visit(expr, side=sgn)
+            _visit_with_side(node.v, "+")
+            _visit_with_side(node.v, "-")
+            self.ir_sequence.append(BinaryOp(op_symbol="+"))
+            self.ir_sequence.append(LoadConstant(value=0.5))
+            self.ir_sequence.append(BinaryOp(op_symbol="*"))
+            return
+
         if isinstance(node, Restriction):
             # Visit the operand first (post-order traversal)
             self._visit(node.operand, side=side)
@@ -158,6 +174,9 @@ class IRGenerator:
             
         if isinstance(node, UFLCellDiameter):           # ==> your Expression
             self.ir_sequence.append(CellDiameter())     # push scalar at runtime
+            return
+        if isinstance(node, UFLMeshSize):
+            self.ir_sequence.append(MeshSize())
             return
         if isinstance(node, (UflInner, UflDot)):
             self._visit(node.a, side=side)

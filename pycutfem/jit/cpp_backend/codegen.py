@@ -103,6 +103,7 @@ class CppCodeGen:
             LoadFacetNormalComponent,
             LoadAnalytic,
             CellDiameter,
+            MeshSize,
             CheckDomain,
             Grad,
             Hessian as IRHessian,
@@ -289,6 +290,7 @@ class CppCodeGen:
             LoadFacetNormal,
             LoadFacetNormalComponent,
             CellDiameter,
+            MeshSize,
             CheckDomain,
             Div,
             BinaryOp,
@@ -499,6 +501,8 @@ class CppCodeGen:
             "    auto qp_view = qp_phys.unchecked<3>();",
             "    auto qw_view = qw.unchecked<2>();",
         ]
+        if "detJ" in param_order:
+            view_lines.append("    auto detJ_view = detJ.unchecked<2>();")
         if "J_inv" in param_order:
             view_lines.append("    auto Jinv_view = J_inv.unchecked<4>();")
         if "J_inv_pos" in param_order:
@@ -642,6 +646,12 @@ class CppCodeGen:
                 required_args.add("h_arr")
                 nm = new_tmp("h")
                 emit_line(f"double {nm} = h_arr_view(owner_id_view(e));")
+                stack.append(StackItem(nm, "scalar", "const", ()))
+            elif isinstance(op, MeshSize):
+                required_args.add("detJ")
+                nm = new_tmp("mesh_h")
+                factor = 2.0 if getattr(self.mixed_element.mesh, "element_type", "tri") == "quad" else 1.0
+                emit_line(f"double {nm} = {factor} * std::sqrt(std::abs(detJ_view(e,q)));")
                 stack.append(StackItem(nm, "scalar", "const", ()))
             elif isinstance(op, LoadFacetNormal):
                 nm = new_tmp("nrm")

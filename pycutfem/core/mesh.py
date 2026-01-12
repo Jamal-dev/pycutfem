@@ -622,11 +622,18 @@ class Mesh:
 
         # detect discrete order p of the FE level set if available (default 1)
         p = 1
+        is_fe_backed = False
         if hasattr(level_set, "dh") and hasattr(level_set, "field"):
             try:
                 p = int(level_set.dh.mixed_element._field_orders[level_set.field])
+                is_fe_backed = True
             except Exception:
                 p = 1
+                is_fe_backed = False
+        if not is_fe_backed:
+            # Analytic / black-box level sets are not linear along edges, so the
+            # endpoint sign shortcut (valid only for FE P1) must be disabled.
+            p = max(int(p), 2)
 
         for elem in self.elements_list:
             if elem.tag != 'cut':
