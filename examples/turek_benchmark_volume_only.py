@@ -72,7 +72,11 @@ CENTER = (0.2, 0.2)
 RADIUS = D / 2.0
 RHO = 1.0
 MU = 1.0e-3
-U_MEAN = 1.5
+# DFG/FeatFlow convention:
+# - mean inflow velocity U_mean = 1.0
+# - parabolic inflow reaches U_max = 1.5 at the channel centerline
+U_MEAN = 1.0
+U_MAX = 1.5
 FE_ORDER = 2  # Taylor–Hood (Q2/Q1) equivalent on triangles
 
 
@@ -667,6 +671,17 @@ def epsilon(u):
     return 0.5 * (grad(u) + grad(u).T)
 
 
+def _advect_standard(w, u, v):
+    return dot(dot(grad(u), w), v)
+
+
+def _advect_skew(w, u, v):
+    # Standard skew-symmetric convection form (energy-conserving for v=u):
+    #   1/2 * ( (w·∇u, v) - (w·∇v, u) )
+    # For the incompressible Navier–Stokes nonlinearity we use w=u.
+    return 0.5 * (dot(dot(grad(u), w), v) - dot(dot(grad(v), w), u))
+
+
 def build_volume_forms(
     u_trial,
     v_test,
@@ -680,22 +695,56 @@ def build_volume_forms(
     mu_const,
     dt_const,
     theta_const,
+    mass_factor,
+    convection_factor,
     dx_measure,
+    convection_form: str = "standard",
 ):
     """Return (jacobian_form, residual_form) for the standard theta-scheme."""
+    convection_form = str(convection_form)
+    if convection_form not in {"standard", "skew"}:
+        raise ValueError("convection_form must be 'standard' or 'skew'")
+
+    conv_lin = (
+        dot(dot(grad(u_k), u_trial), v_test)
+        + dot(dot(grad(u_trial), u_k), v_test)
+        if convection_form == "standard"
+        else 0.5
+        * (
+            (
+                dot(dot(grad(u_k), u_trial), v_test)
+                + dot(dot(grad(u_trial), u_k), v_test)
+            )
+            - (
+                dot(dot(grad(v_test), u_trial), u_k)
+                + dot(dot(grad(v_test), u_k), u_trial)
+            )
+        )
+    )
+
+    conv_k = (
+        dot(dot(grad(u_k), u_k), v_test)
+        if convection_form == "standard"
+        else _advect_skew(u_k, u_k, v_test)
+    )
+    conv_n = (
+        dot(dot(grad(u_n), u_n), v_test)
+        if convection_form == "standard"
+        else _advect_skew(u_n, u_n, v_test)
+    )
+
     a_vol = (
-        rho_const * dot(u_trial, v_test) / dt_const
-        + theta_const * rho_const * dot(dot(grad(u_k), u_trial), v_test)
-        + theta_const * rho_const * dot(dot(grad(u_trial), u_k), v_test)
+        mass_factor * rho_const * dot(u_trial, v_test) / dt_const
+        + convection_factor * theta_const * rho_const * conv_lin
         + 2.0 * theta_const * mu_const * inner(epsilon(u_trial), epsilon(v_test))
         - p_trial * div(v_test)
         + q_test * div(u_trial)
     ) * dx_measure
 
     r_vol = (
-        rho_const * dot(u_k - u_n, v_test) / dt_const
-        + theta_const * rho_const * dot(dot(grad(u_k), u_k), v_test)
-        + (1.0 - theta_const) * rho_const * dot(dot(grad(u_n), u_n), v_test)
+        mass_factor * rho_const * dot(u_k - u_n, v_test) / dt_const
+        + convection_factor * theta_const * rho_const * conv_k
+        + convection_factor * (1.0 - theta_const) * rho_const * conv_n
         + 2.0 * theta_const * mu_const * inner(epsilon(u_k), epsilon(v_test))
         + 2.0 * (1.0 - theta_const) * mu_const * inner(epsilon(u_n), epsilon(v_test))
         - p_k * div(v_test)
@@ -709,7 +758,10 @@ def traction_dot_direction(u_vec, p_scal, direction, mu_const):
     """Return ((σ(u,p)·n)·direction) on boundary facets."""
     n = FacetNormal()
     grad_u = grad(u_vec)
-    sigma_n = mu_const * (dot(grad_u, n) + dot(grad_u.T, n)) - p_scal * n
+    # DFG benchmark convention uses the (non-symmetric) stress:
+    #   σ := ν ∇u - p I
+    # so σ·n = ν (∇u·n) - p n.
+    sigma_n = mu_const * dot(grad_u, n) - p_scal * n
     return dot(sigma_n, direction)
 
 
@@ -720,7 +772,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Volume-only Turek benchmark using a Gmsh mesh."
     )
-    parser.add_argument("--backend", choices=("python", "jit"), default="jit", help="Assembly backend to use.")
+    parser.add_argument(
+        "--backend",
+        choices=("python", "jit", "cpp"),
+        default="cpp",
+        help="Assembly backend to use.",
+    )
+    parser.add_argument(
+        "--inflow",
+        choices=("constant", "dfg"),
+        default="constant",
+        help="Inflow profile: constant or FeatFlow/DFG ramp.",
+    )
     parser.add_argument("--mesh-backend", choices=("gmsh", "structured"), default="gmsh",
                         help="Mesh generator: 'gmsh' (default) or the built-in structured O-grid.")
     parser.add_argument("--mesh-size", type=float, default=0.02, help="Target edge size for the mesh generator.")
@@ -736,6 +799,14 @@ def main() -> None:
     parser.add_argument("--dt", type=float, default=0.1, help="Time step size.")
     parser.add_argument("--theta", type=float, default=0.5, help="Theta parameter for the time-stepping scheme.")
     parser.add_argument("--max-steps", type=int, default=36, help="Maximum number of time steps.")
+    parser.add_argument("--disable-mass", action="store_true", help="Disable transient mass term (rho/dt (u^{n+1}-u^n, v)).")
+    parser.add_argument("--disable-convection", action="store_true", help="Disable convection term (rho (u·∇u, v)).")
+    parser.add_argument(
+        "--convection-form",
+        choices=("standard", "skew"),
+        default="standard",
+        help="Convection discretization: standard (u·∇u) or skew-symmetric (energy-conserving).",
+    )
     parser.add_argument(
         "--save-vtk",
         dest="save_vtk",
@@ -756,6 +827,17 @@ def main() -> None:
         help="Directory for VTU files / diagnostic plots.",
     )
     parser.add_argument("--stop-on-steady", action="store_true", help="Stop when reaching steady state.")
+    parser.add_argument(
+        "--visualize-boundary-dofs",
+        action="store_true",
+        help="Plot cylinder/wall/inlet boundary DOFs (debug; slow).",
+    )
+    parser.add_argument(
+        "--init",
+        choices=("zero", "stokes"),
+        default="zero",
+        help="Initial condition: zero field or steady Stokes solve at t=0.",
+    )
     parser.add_argument(
         "--check-det-only",
         action="store_true",
@@ -799,8 +881,13 @@ def main() -> None:
     dof_handler = DofHandler(mixed_element, method="cg")
 
     # Boundary conditions (no-slip on walls + cylinder, parabolic inflow)
-    def parabolic_inflow(x, y):
-        return 4.0 * U_MEAN * y * (H - y) / (H**2)
+    inflow_mode = str(args.inflow)
+
+    def parabolic_inflow(x, y, t=0.0):
+        amp = 1.0
+        if inflow_mode == "dfg":
+            amp = 0.2 + 0.8 * np.sin(np.pi * float(t) / 8.0)
+        return 4.0 * (U_MAX * amp) * y * (H - y) / (H**2)
 
     bcs: list[BoundaryCondition] = [
         BoundaryCondition("ux", "dirichlet", "inlet", parabolic_inflow),
@@ -836,13 +923,17 @@ def main() -> None:
         func.nodal_values.fill(0.0)
     for func in (p_k, p_n):
         func.nodal_values.fill(0.0)
-    dof_handler.apply_bcs(bcs, u_n, p_n)
-    dof_handler.apply_bcs(bcs, u_k, p_k)
+    # Apply BCs at t=0 (DFG ramp starts at amp(0)=0.2).
+    bcs_init = NewtonSolver._freeze_bcs(bcs, 0.0)
+    dof_handler.apply_bcs(bcs_init, u_n, p_n)
+    dof_handler.apply_bcs(bcs_init, u_k, p_k)
 
     rho_const = Constant(RHO)
     mu_const = Constant(MU)
     dt_const = Constant(args.dt)
     theta_const = Constant(args.theta)
+    mass_factor = Constant(0.0 if args.disable_mass else 1.0)
+    convection_factor = Constant(0.0 if args.disable_convection else 1.0)
 
     volume_quadrature = 2 * FE_ORDER + 2
     dx_vol = dx(metadata={"q": volume_quadrature})
@@ -860,11 +951,34 @@ def main() -> None:
         mu_const,
         dt_const,
         theta_const,
+        mass_factor,
+        convection_factor,
         dx_vol,
+        convection_form=str(args.convection_form),
     )
 
-    # --- Force diagnostics on the cylinder boundary ---
+    # --- Do-nothing outlet boundary condition (DFG benchmark) ---
+    # Benchmark definition (with outward normal η):
+    #   ν ∂_η u - p η = 0   on Γ_out
+    #
+    # Our viscous volume form uses 2ν ε(u):ε(v), whose natural traction is
+    #   (ν(∇u + ∇uᵀ) - p I)·η.
+    # To recover the DFG outflow condition based on ν∇u - pI while keeping the
+    # symmetric interior form, add the transpose correction on Γ_out:
+    #   + ⟨ ν (∇uᵀ·η), v ⟩_{Γ_out}.
     boundary_quadrature = max(8, FE_ORDER * 3)
+    outlet_edges = mesh.edge_bitset("outlet")
+    if outlet_edges.cardinality() == 0:
+        raise RuntimeError("Outlet boundary tag not found in the imported mesh.")
+    d_gamma_outlet = dS(defined_on=outlet_edges, metadata={"q": boundary_quadrature})
+    n_out = FacetNormal()
+    jacobian_form += theta_const * mu_const * dot(dot(grad(du).T, n_out), v) * d_gamma_outlet
+    residual_form += mu_const * (
+        theta_const * dot(dot(grad(u_k).T, n_out), v)
+        + (1.0 - theta_const) * dot(dot(grad(u_n).T, n_out), v)
+    ) * d_gamma_outlet
+
+    # --- Force diagnostics on the cylinder boundary ---
     d_gamma_cyl = dS(defined_on=cylinder_edges, metadata={"q": boundary_quadrature})
 
     e_x = Constant(np.array([1.0, 0.0]), dim=1)
@@ -872,74 +986,138 @@ def main() -> None:
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    monitor_point = np.array([0.15, 0.2])
+    monitor_point = np.array([0.15, 0.199999])
     histories: dict[str, list[float]] = {"time": [], "cd": [], "cl": [], "dp": []}
 
-    probe_A = np.array([CENTER[0] - RADIUS - 0.01, CENTER[1]])
-    probe_B = np.array([CENTER[0] + RADIUS + 0.01, CENTER[1]])
+    # FeatFlow reference probes (DFG benchmark):
+    # upstream/downstream pressure points along the centerline.
+    probe_A = np.array([0.15, 0.199999])
+    probe_B = np.array([0.25, 0.199999])
 
-    visualize_boundary_dofs(
-        mesh,
-        tags=["cylinder", "inlet", "outlet", "walls"],
-        dof_handler=dof_handler,
-        fields=["ux", "uy"],
-        annotate_nodes=True,
-        annotate_dofs=True,
-        title="Cylinder Dirichlet nodes",
-    )
-    def save_solution(funcs):
-        """Callback executed after every converged time step."""
-        velocity = funcs[0]  # VectorFunction
-        pressure = funcs[1]  # Function
+    if args.visualize_boundary_dofs:
+        visualize_boundary_dofs(
+            mesh,
+            tags=["cylinder", "inlet", "outlet", "walls"],
+            dof_handler=dof_handler,
+            fields=["ux", "uy"],
+            annotate_nodes=True,
+            annotate_dofs=True,
+            title="Cylinder Dirichlet nodes",
+            show=True,
+        )
+
+    def save_solution(funcs, prev_funcs, *, step_idx: int):
+        """Compute Cd/Cl/Δp at t_{n+θ} using θ-interpolation."""
+        velocity_k = funcs[0]  # VectorFunction at n+1
+        pressure_k = funcs[1]  # Function at n+1
+        velocity_n = prev_funcs[0]  # VectorFunction at n
+        pressure_n = prev_funcs[1]  # Function at n
 
         # Optionally write VTK outputs
-        step_id = len(histories["time"])
         if args.save_vtk:
-            filename = output_dir / f"solution_{step_id:04d}.vtu"
+            filename = output_dir / f"solution_{step_idx:04d}.vtu"
             export_vtk(
                 filename=str(filename),
                 mesh=mesh,
                 dof_handler=dof_handler,
-                functions={"velocity": velocity, "pressure": pressure},
+                functions={"velocity": velocity_k, "pressure": pressure_k},
             )
 
-        traction_drag = traction_dot_direction(velocity, pressure, e_x, mu_const) * d_gamma_cyl
-        traction_lift = traction_dot_direction(velocity, pressure, e_y, mu_const) * d_gamma_cyl
+        theta_num = float(args.theta)
+        # Postprocessing fields at t_{n+θ}.
+        velocity_theta = VectorFunction(
+            name="u_theta",
+            field_names=["ux", "uy"],
+            dof_handler=dof_handler,
+            side="+",
+        )
+        pressure_theta = Function(
+            name="p_theta",
+            field_name="p",
+            dof_handler=dof_handler,
+            side="+",
+        )
+        velocity_theta.nodal_values[:] = (
+            theta_num * velocity_k.nodal_values + (1.0 - theta_num) * velocity_n.nodal_values
+        )
+        pressure_theta.nodal_values[:] = (
+            theta_num * pressure_k.nodal_values + (1.0 - theta_num) * pressure_n.nodal_values
+        )
 
-        drag = assemble_form(
+        traction_drag = traction_dot_direction(velocity_theta, pressure_theta, e_x, mu_const) * d_gamma_cyl
+        traction_lift = traction_dot_direction(velocity_theta, pressure_theta, e_y, mu_const) * d_gamma_cyl
+
+        drag_raw = assemble_form(
             Equation(None, traction_drag),
             dof_handler=dof_handler,
             assembler_hooks={traction_drag.integrand: {"name": "drag"}},
-            backend="python",
+            backend=args.backend,
         )["drag"]
-        lift = assemble_form(
+        lift_raw = assemble_form(
             Equation(None, traction_lift),
             dof_handler=dof_handler,
             assembler_hooks={traction_lift.integrand: {"name": "lift"}},
-            backend="python",
+            backend=args.backend,
         )["lift"]
 
+        # dS uses the outward normal of the *fluid* domain (points into the cylinder).
+        # The benchmark reports the force on the cylinder, i.e. minus the force on the fluid.
+        drag = -float(np.asarray(drag_raw, dtype=float).reshape(-1)[0])
+        lift = -float(np.asarray(lift_raw, dtype=float).reshape(-1)[0])
+
         coeff = 2.0 / (RHO * U_MEAN**2 * D)
-        c_d = coeff * drag
-        c_l = coeff * lift
+        c_d = float(coeff) * drag
+        c_l = float(coeff) * lift
 
         # Pressure drop measurement (points upstream/downstream of cylinder)
-        pA, _ = nearest_pressure_dof_value(dof_handler, pressure, probe_A)
-        pB, _ = nearest_pressure_dof_value(dof_handler, pressure, probe_B)
-        dp = pA - pB
+        pA_k, _ = nearest_pressure_dof_value(dof_handler, pressure_k, probe_A)
+        pB_k, _ = nearest_pressure_dof_value(dof_handler, pressure_k, probe_B)
+        pA_n, _ = nearest_pressure_dof_value(dof_handler, pressure_n, probe_A)
+        pB_n, _ = nearest_pressure_dof_value(dof_handler, pressure_n, probe_B)
+        pA = theta_num * pA_k + (1.0 - theta_num) * pA_n
+        pB = theta_num * pB_k + (1.0 - theta_num) * pB_n
+        dp = float(pA - pB)
 
-        u_monitor = evaluate_vector_field(dof_handler, mesh, velocity, monitor_point)
+        u_monitor = evaluate_vector_field(dof_handler, mesh, velocity_theta, monitor_point)
 
-        histories["time"].append(step_id * args.dt)
+        t_out = (int(step_idx) + float(args.theta)) * float(args.dt)
+        histories["time"].append(float(t_out))
         histories["cd"].append(c_d)
         histories["cl"].append(c_l)
         histories["dp"].append(dp)
 
         print(
-            f"[step {step_id:04d}] "
-            f"Cd={c_d:.4f}  Cl={c_l:.4f}  Δp={dp:.4f}  "
+            f"[step {step_idx+1:04d}] t={t_out:.6f} "
+            f"Cd={c_d:.6f}  Cl={c_l:.6f}  Δp={dp:.6f}  "
             f"u(0.15,0.20)=({u_monitor[0]:.4f}, {u_monitor[1]:.4f})"
         )
+
+    def write_functionals_csv(out_dir: Path) -> Path:
+        """Write time series of (Cd, Cl, dp) to `functionals.csv`."""
+        import csv
+
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / "functionals.csv"
+
+        n = int(len(histories.get("time", [])))
+        if n == 0:
+            return path
+
+        with path.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["step", "time", "Cd", "Cl", "dp"])
+            for i in range(n):
+                w.writerow(
+                    [
+                        i,
+                        float(histories["time"][i]),
+                        float(histories["cd"][i]),
+                        float(histories["cl"][i]),
+                        float(histories["dp"][i]),
+                    ]
+                )
+        return path
 
     # Solver setup
     time_params = TimeStepperParameters(
@@ -958,12 +1136,30 @@ def main() -> None:
         bcs=bcs,
         bcs_homog=bcs_homog,
         newton_params=NewtonParameters(newton_tol=1e-6, line_search=True),
-        postproc_timeloop_cb=save_solution,
+        postproc_timeloop_cb=None,
         backend=args.backend,
     )
 
     functions = [u_k, p_k]
     prev_functions = [u_n, p_n]
+
+    if str(args.init) == "stokes":
+        print("[init] Solving steady Stokes problem for initial condition …")
+        rho_saved = float(rho_const.value)
+        theta_saved = float(theta_const.value)
+        rho_const.value = 0.0
+        theta_const.value = 1.0
+        try:
+            _delta, _converged, _iters = solver._newton_loop(functions, prev_functions, None, bcs_init)
+        finally:
+            rho_const.value = rho_saved
+            theta_const.value = theta_saved
+        if not bool(_converged):
+            raise RuntimeError("[init] steady Stokes solve did not converge")
+        # Promote Stokes solution to the previous state so time stepping starts from it.
+        for f_prev, f in zip(prev_functions, functions):
+            f_prev.nodal_values[:] = f.nodal_values[:]
+        print(f"[init] steady Stokes converged in {_iters} Newton iterations")
 
     t0 = time.time()
     try:
@@ -971,6 +1167,9 @@ def main() -> None:
             functions=functions,
             prev_functions=prev_functions,
             time_params=time_params,
+            post_step_refiner=lambda step, bcs_now, funs, prev_funs: save_solution(
+                funs, prev_funs, step_idx=step
+            ),
         )
     except Exception as exc:  # pragma: no cover - diagnostic output
         print(f"Solver failed: {exc}")
@@ -985,6 +1184,11 @@ def main() -> None:
                 f"Cl={histories['cl'][-1]:.4f}, "
                 f"Δp={histories['dp'][-1]:.4f}"
             )
+            try:
+                csv_path = write_functionals_csv(output_dir)
+                print(f"[volume-only] wrote {csv_path}")
+            except Exception as exc:  # pragma: no cover
+                print(f"[volume-only] failed to write functionals.csv: {exc}")
             try:
                 import matplotlib.pyplot as plt
 

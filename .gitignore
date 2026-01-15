@@ -209,3 +209,9 @@ examples/meshes/
 examples/plots/
 _turek_levelset_dumps/
 _turek_*
+_smoke_*/
+_tmp_*/
+_sweep_*/
+turek_2D-*/
+_sweep_results*
+examples/turek_cylinder/tmp*/

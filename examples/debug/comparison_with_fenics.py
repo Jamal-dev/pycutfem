@@ -1119,6 +1119,35 @@ if __name__ == '__main__':
             # 'rtol': 1e-6,
             # 'atol': 1e-6,
         },
+        # Skew-symmetric convection (energy-conserving): 1/2 * ((u·∇u, v) - (u·∇v, u))
+        "Fluid conv_skew_res (u_k)": {
+            'pc': pc['rho'] * pc['theta'] * J_geo_pc * Constant(0.5, dim=0) * (
+                dot(dot(grad_uk_phys_pc, pc['u_k']), pc['v'])
+                - dot(dot(grad_v_phys_pc, pc['u_k']), pc['u_k'])
+            ) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: fenicsx['rho'] * fenicsx['theta'] * J_geo_fx * dolfinx.fem.Constant(fenicsx['mesh'], 0.5) * (
+                ufl.dot(ufl.dot(grad_uk_phys_fx, u_k_fx), v)
+                - ufl.dot(ufl.dot(grad_v_phys_vel, u_k_fx), u_k_fx)
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': False,
+            'deg': 6,
+        },
+        "Fluid conv_skew_jac_u": {
+            'pc': pc['rho'] * pc['theta'] * J_geo_pc * Constant(0.5, dim=0) * (
+                dot(dot(grad_uk_phys_pc, pc['du']), pc['v'])
+                + dot(dot(grad_du_phys_pc, pc['u_k']), pc['v'])
+                - dot(dot(grad_v_phys_pc, pc['du']), pc['u_k'])
+                - dot(dot(grad_v_phys_pc, pc['u_k']), pc['du'])
+            ) * dx(metadata={"q": 6}),
+            'f_lambda': lambda deg: fenicsx['rho'] * fenicsx['theta'] * J_geo_fx * dolfinx.fem.Constant(fenicsx['mesh'], 0.5) * (
+                ufl.dot(ufl.dot(grad_uk_phys_fx, du), v)
+                + ufl.dot(ufl.dot(grad_du_phys_fx, u_k_fx), v)
+                - ufl.dot(ufl.dot(grad_v_phys_fx, du), u_k_fx)
+                - ufl.dot(ufl.dot(grad_v_phys_fx, u_k_fx), du)
+            ) * ufl.dx(metadata={'quadrature_degree': deg}),
+            'mat': True,
+            'deg': 6,
+        },
         "Fluid pres_jac": {
             'pc': (-J_geo_pc * pc['q'] * div_du_pc - J_geo_pc * pc['dp'] * div_v_pc + stab_eps_pc * pc['dp'] * pc['q']) * dx(metadata={"q": 6}),
             'f_lambda': lambda deg: (-J_geo_fx * q * div_du_fx - J_geo_fx * dp * div_v_vel + stab_eps_fx * dp * q) * ufl.dx(metadata={'quadrature_degree': deg}),

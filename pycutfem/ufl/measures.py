@@ -43,7 +43,12 @@ class Measure:
     @property
     def on_facet(self) -> bool:
         return self.domain_type in {
-            "interior_facet", "exterior_facet", "interface", "ghost_edge", "facet_patch"
+            "interior_facet",
+            "cut_interior_facet",
+            "exterior_facet",
+            "interface",
+            "ghost_edge",
+            "facet_patch",
         }
 
     def __call__(self, 
@@ -97,6 +102,19 @@ dx = Measure("volume")
 #: Measure for integration over interior facets (edges).
 ds = Measure("interior_facet")
 
+#: Measure for integration over (a subset of) interior facets, restricted to one
+#: side of a level-set-defined domain.
+#:
+#: Mathematically, this represents integrals of the form
+#:
+#:   ∫_{F_h ∩ Ω^±}  f  ds,
+#:
+#: where F_h is the mesh skeleton (interior facets) and Ω^± = {φ ≶ 0}.
+#: This is used by facet-based stabilizations (e.g. CIP/ghost-penalty terms)
+#: that penalize jumps of derivatives across interior facets to control
+#: cut-cell ill-conditioning while remaining consistent with the physical side Ω^±.
+dCutSkeleton = Measure("cut_interior_facet")
+
 #: Measure for integration over exterior (boundary) facets (edges).
 dS = Measure("exterior_facet")
 
@@ -106,6 +124,9 @@ dInterface = Measure("interface")
 # New: Measure for integration over ghost edges for CutFEM stabilization.
 dGhost = Measure("ghost_edge")
 
-# New: NGSolve-style facet-patch (two-element) integrals (e.g. ghost penalties).
-# This matches the semantics of NGSXFEM's `dFacetPatch` (volume patch around a facet).
+# Facet-patch (two-element volume patch) integrals.
+# These represent patch measures on the union of the two elements adjacent to an
+# interior facet, with polynomial extension/traces evaluated from both sides.
+# Patch integrals are a standard device for CutFEM/AgFEM stabilizations because
+# they give control on small cut cells by coupling them to their neighbors.
 dFacetPatch = Measure("facet_patch")

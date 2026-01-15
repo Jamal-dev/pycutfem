@@ -1716,7 +1716,13 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     all_eids = np.asarray(edge_sel, dtype=np.int32)
                 all_eids = np.unique(all_eids)
                 if all_eids.size == 0:
-                    gdofs_map = np.zeros((0, int(_active_cols.size)), dtype=np.int32)
+                    # Empty aligned-interface set: still return a complete static dict so
+                    # kernels that request sided r** tables (e.g. pressure terms) compile.
+                    #
+                    # Keep the "compressed" width (active_cols) for empty kernels so
+                    # per-integral builder closures stay consistent (regression test).
+                    ncols = int(_active_cols.size)
+                    gdofs_map = np.zeros((0, ncols), dtype=np.int32)
                     empty = {
                         "eids": np.asarray([], dtype=np.int32),
                         "qp_phys": np.empty((0, 0, 2), dtype=float),
@@ -1731,6 +1737,20 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         "is_interface": True,
                         "is_ghost": False,
                     }
+
+                    # Provide empty sided tables requested by the kernel runner.
+                    for name in _param_order:
+                        if not isinstance(name, str):
+                            continue
+                        if name.startswith("restrict_mask_") and (name.endswith("_pos") or name.endswith("_neg")):
+                            empty[name] = np.empty((0, ncols), dtype=float)
+                        elif name.startswith(("pos_map_", "neg_map_")):
+                            empty[name] = np.empty((0, 0), dtype=np.int32)
+                        else:
+                            m = re.match(r"r(\d)(\d)_(.+)_(pos|neg)$", name)
+                            if m:
+                                empty[name] = np.empty((0, 0, ncols), dtype=float)
+
                     empty.update(
                         _build_jit_kernel_args(
                             _ir,
@@ -1962,13 +1982,19 @@ def compile_multi(form, *, dof_handler, mixed_element,
             continue
 
         # ------------------------------------------------------------------
-        # FACET PATCH (NGSolve-style ghost stabilization on two-element patches)
+        # FACET PATCH (two-element volume patch / polynomial extensions)
         # ------------------------------------------------------------------
         if dom == "facet_patch":
             level_set = intg.measure.level_set
             derivs = set(intg.measure.metadata.get("derivs", required_multi_indices(intg.integrand)))
             bs_def = intg.measure.defined_on
             deformation = getattr(intg.measure, "deformation", None)
+
+            if need_hess or need_o3 or need_o4:
+                raise NotImplementedError(
+                    "facet_patch JIT currently supports value/grad terms only (no higher jets)."
+                )
+
             ctx = _ctx_for(level_set)
             ctx["want_facet_patch"] = True
             ctx["facet_patch_qs"].add(int(qdeg))
@@ -2001,35 +2027,6 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 except Exception:
                     all_eids = np.asarray(edge_sel, dtype=np.int32)
                 all_eids = np.unique(all_eids)
-                if all_eids.size == 0:
-                    gdofs_map_empty = np.zeros((0, int(_active_cols.size)), dtype=np.int32)
-                    empty = {
-                        "eids": np.asarray([], dtype=np.int32),
-                        "qp_phys": np.empty((0, 0, 2), dtype=float),
-                        "qw": np.empty((0, 0), dtype=float),
-                        "normals": np.empty((0, 0, 2), dtype=float),
-                        "phis": np.empty((0, 0), dtype=float),
-                        "_phi_sig": np.empty((0,), dtype=float),
-                        "pos_map": np.empty((0, 0), dtype=np.int32),
-                        "neg_map": np.empty((0, 0), dtype=np.int32),
-                        "gdofs_map": gdofs_map_empty,
-                        "entity_kind": "edge",
-                        "is_ghost": True,
-                        "is_interface": False,
-                    }
-                    empty.update(
-                        _build_jit_kernel_args(
-                            _ir,
-                            _integrand,
-                            _me,
-                            _qdeg,
-                            dof_handler=_dof_handler,
-                            gdofs_map=gdofs_map_empty,
-                            param_order=_param_order,
-                            pre_built=empty,
-                        )
-                    )
-                    return empty
 
                 geom_src = None
                 uni = _get_unified(ls_obj, _ctx)
@@ -2037,14 +2034,14 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     geom_src = uni.get("facet_patch")
                     if isinstance(geom_src, dict):
                         eids_uni = np.asarray(geom_src.get("eids", []), dtype=np.int32)
-                        if all_eids.size and eids_uni.size:
+                        if eids_uni.size:
                             geom_src = _subset_entity_rows(geom_src, np.isin(eids_uni, all_eids))
                 if geom_src is None:
                     geom_src = _dof_handler.precompute_facet_patch_factors(
                         facet_ids=all_eids,
                         qdeg=_qdeg,
                         level_set=ls_obj,
-                        derivs=_derivs,
+                        derivs=set(tuple((int(a), int(b))) for (a, b) in _derivs),
                         reuse=True,
                         allow_interface=False,
                         deformation=_deformation,
@@ -2052,7 +2049,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 geom = dict(geom_src)
 
                 gdofs_map_raw = np.asarray(
-                    geom.get("gdofs_map", np.zeros((len(all_eids), n_loc), dtype=np.int32)), dtype=np.int32
+                    geom.get(
+                        "gdofs_map",
+                        np.zeros((len(geom.get("eids", [])), _me.n_dofs_local), dtype=np.int32),
+                    ),
+                    dtype=np.int32,
                 )
                 ncols = gdofs_map_raw.shape[1] if gdofs_map_raw.ndim == 2 else 0
                 use_full_union = bool(ncols and ncols != _me.n_dofs_local)
@@ -2062,19 +2063,12 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     eff_cols = _active_cols[_active_cols < ncols] if ncols else _active_cols
                     if eff_cols.size == 0 and ncols:
                         eff_cols = np.arange(ncols, dtype=np.int32)
-                gdofs_map_eff = gdofs_map_raw[:, eff_cols] if gdofs_map_raw.size else gdofs_map_raw
+                gdofs_map = gdofs_map_raw[:, eff_cols] if gdofs_map_raw.size else gdofs_map_raw
 
-                static = {
-                    **geom,
-                    "gdofs_map": gdofs_map_eff,
-                    "is_ghost": True,
-                    "is_interface": False,
-                    "entity_kind": "edge",
-                }
-
+                static = {**geom, "gdofs_map": gdofs_map, "is_ghost": True, "is_interface": False, "entity_kind": "edge"}
                 eids_sig = np.asarray(static.get("eids", all_eids), dtype=np.int32)
                 n_sig = int(eids_sig.shape[0])
-                phis_arr = np.asarray(geom.get("phis", np.empty((len(all_eids), 0))), dtype=float)
+                phis_arr = np.asarray(geom.get("phis", np.empty((n_sig, 0))), dtype=float)
                 if phis_arr.ndim >= 2 and phis_arr.shape[0] == n_sig and phis_arr.shape[1] > 0:
                     static["_phi_sig"] = np.asarray(phis_arr[:, 0], dtype=float)
                 else:
@@ -2087,12 +2081,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         _me,
                         _qdeg,
                         dof_handler=_dof_handler,
-                        gdofs_map=gdofs_map_eff,
+                        gdofs_map=gdofs_map,
                         param_order=_param_order,
                         pre_built=static,
                     )
                 )
-
                 if not use_full_union:
                     static = _compress_static_for_active(static, _me, eff_cols)
                 return static
@@ -2124,6 +2117,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 edge_ids = edge_set
 
             derivs = required_multi_indices(intg.integrand)
+            deformation = getattr(intg.measure, "deformation", None)
 
             def _interior_static():
                 geom = dof_handler.precompute_interior_factors(
@@ -2134,7 +2128,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     need_o3=need_o3,
                     need_o4=need_o4,
                     level_set=getattr(intg.measure, "level_set", None),
-                    deformation=getattr(intg.measure, "deformation", None),
+                    deformation=deformation,
                 )
                 geom_local = dict(geom)
                 geom_local["is_ghost"] = False
@@ -2186,6 +2180,91 @@ def compile_multi(form, *, dof_handler, mixed_element,
             continue
 
         # ------------------------------------------------------------------
+        # CUT INTERIOR FACET (CutFEM skeleton on ds)
+        # ------------------------------------------------------------------
+        if dom == "cut_interior_facet":
+            mesh = mixed_element.mesh
+            edge_set = intg.measure.defined_on
+            if edge_set is None:
+                edge_ids = [int(e.gid) for e in mesh.edges_list if e.right is not None]
+            else:
+                edge_ids = edge_set
+
+            level_set = getattr(intg.measure, "level_set", None)
+            if level_set is None:
+                raise ValueError("[jit] cut_interior_facet requires measure.level_set")
+            side = (intg.measure.metadata or {}).get("side")
+            if side not in {"+", "-"}:
+                raise ValueError("[jit] cut_interior_facet requires metadata['side'] in {'+','-'}")
+
+            derivs = required_multi_indices(intg.integrand)
+            deformation = getattr(intg.measure, "deformation", None)
+
+            def _cut_interior_static(ls_obj, reuse_static=None):
+                geom = dof_handler.precompute_interior_factors(
+                    edge_ids=edge_ids,
+                    qdeg=qdeg,
+                    derivs=derivs,
+                    need_hess=need_hess,
+                    need_o3=need_o3,
+                    need_o4=need_o4,
+                    deformation=deformation,
+                    level_set=ls_obj,
+                    side=str(side),
+                )
+                geom_local = dict(geom)
+                geom_local["is_ghost"] = False
+                geom_local["is_interface"] = False
+
+                gdofs_map_raw = np.asarray(
+                    geom_local.get("gdofs_map", np.zeros((len(geom_local.get("eids", [])), n_loc), dtype=np.int32)),
+                    dtype=np.int32,
+                )
+                ncols = gdofs_map_raw.shape[1] if gdofs_map_raw.ndim == 2 else 0
+                use_full_union = bool(ncols and ncols != mixed_element.n_dofs_local)
+                if use_full_union:
+                    eff_cols = np.arange(ncols, dtype=np.int32)
+                else:
+                    eff_cols = active_cols[active_cols < ncols] if ncols else active_cols
+                    if eff_cols.size == 0 and ncols:
+                        eff_cols = np.arange(ncols, dtype=np.int32)
+                gdofs_map = gdofs_map_raw[:, eff_cols] if gdofs_map_raw.size else gdofs_map_raw
+                geom_local["gdofs_map"] = gdofs_map
+
+                static = {"gdofs_map": gdofs_map, **geom_local}
+                static.update(
+                    _build_jit_kernel_args(
+                        ir,
+                        intg.integrand,
+                        mixed_element,
+                        qdeg,
+                        dof_handler=dof_handler,
+                        gdofs_map=gdofs_map,
+                        param_order=runner.param_order,
+                        pre_built=static,
+                    )
+                )
+                if not use_full_union:
+                    static = _compress_static_for_active(static, mixed_element, eff_cols)
+                return static
+
+            static = _cut_interior_static(level_set)
+            eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
+            _append_kernel(
+                _IntegralKernel(
+                    runner,
+                    static,
+                    "cut_interior_facet",
+                    level_set=level_set,
+                    side=str(side),
+                    builder=_cut_interior_static,
+                    eids=eids_arr,
+                ),
+                intg,
+            )
+            continue
+
+        # ------------------------------------------------------------------
         # EXTERIOR FACET (boundary edges)
         # ------------------------------------------------------------------
         if dom == "exterior_facet":
@@ -2198,7 +2277,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
             if edge_set is None:
                 raise ValueError(f"[jit] No edges defined for tag {intg.measure.tag!r}.")
 
-            derivs = required_multi_indices(intg.integrand)
+            # Boundary (dS) kernels may need both value (r00) and derivative (r10/r01/...)
+            # reference tables. `required_multi_indices` collects only derivative orders
+            # explicitly requested by grad/Hessian/etc., so always include (0,0) here.
+            derivs = set(intg.measure.metadata.get("derivs", required_multi_indices(intg.integrand)))
+            derivs.add((0, 0))
             geo = dof_handler.precompute_boundary_factors(
                 edge_set,
                 qdeg,
