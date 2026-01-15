@@ -1,5 +1,4 @@
 import re
-from matplotlib.pylab import f
 import numpy as np
 from functools import lru_cache
 from dataclasses import dataclass, field
@@ -639,6 +638,10 @@ class VecOpInfo(BaseOpInfo):
                     return self._with(vals * other, role="vector")
                 return self._with(np.asarray([self.data[0,:] * comp for comp in other]), role=self.role)
             elif other.ndim == 2:
+                # Scale a matrix by a scalar-valued function (e.g. div(u_k) * dot(u_trial, v_test)
+                # in the skew-symmetric convection Jacobian).
+                if self.data.ndim == 1 and self.data.shape[0] == 1:
+                    return other * float(self.data[0])
                 if self.role in {"trial","test"} and self.shape[0] == 1 and other.shape == (2,2):
                     # Case: Trial/Test * with identity matrix the result will be GradOpInfo
                     n = self.data.shape[1]
@@ -753,6 +756,15 @@ class VecOpInfo(BaseOpInfo):
                 data = self.data * scale
                 meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
                 return VecOpInfo(data, role=self.role, **self.update_meta(meta))
+            elif self.role == "function" and other.role in {"trial_n", "test_n"} and self.is_scalar_function():
+                # Scalar function scaling a RHS basis vector (e.g. div(u_k) * dot(u_k, v_test))
+                scale = float(_collapsed_function(self)[0])
+                meta = _resolve_meta(self.meta(), other.meta(), prefer="b")
+                return VecOpInfo(scale * other.data, role=other.role, **self.update_meta(meta))
+            elif self.role in {"trial_n", "test_n"} and other.role == "function" and other.is_scalar_function():
+                scale = float(_collapsed_function(other)[0])
+                meta = _resolve_meta(self.meta(), other.meta(), prefer="a")
+                return VecOpInfo(scale * self.data, role=self.role, **self.update_meta(meta))
             else:
                 raise NotImplementedError(f"VecOpInfo multiplication not implemented for roles {self.role} and {other.role}."
                                           f" (self.shape={self.shape}, other.shape={other.shape})")
@@ -1311,6 +1323,15 @@ class GradOpInfo(BaseOpInfo):
                 data = np.einsum("kld,d->kl", self.data, v_val, optimize=True)
                 meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
                 return VecOpInfo(data, role=self.role, **other_vec.update_meta(meta))
+            elif self.role == "test" and other_vec.role == "function":
+                # Case:  Grad(Test) · Vec(Function)      (∇v_test) · u_k
+                # Needed for skew-symmetric convection forms.
+                v_val = _collapsed_function(other_vec)  # shape (k,)  —   u_k(ξ)
+                if self.data.shape[-1] != v_val.shape[0]:
+                    raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
+                data = np.einsum("knd,d->kn", self.data, v_val, optimize=True)
+                meta = _resolve_meta(self.meta(), other_vec.meta(), prefer="a")
+                return VecOpInfo(data, role=self.role, **self.update_meta(meta))
             elif self.role == "function" and other_vec.role == "function":
                 # Case:  Grad(Function) · Vec(Function)      (∇u_k) · u_k
                 # (1)  value of ∇u_k at this quad-point

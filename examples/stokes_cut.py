@@ -434,75 +434,220 @@ def test_stokes_interface_corrected(with_deformation: bool = False, backend: str
 
 
 
-    exact_neg = {'u_neg_x': lambda x,y: vel_exact_neg_xy(x,y)[0], 'u_neg_y': lambda x,y: vel_exact_neg_xy(x,y)[1], 'p_neg_': p_exact_neg_xy}
-    exact_pos = {'u_pos_x': lambda x,y: vel_exact_pos_xy(x,y)[0], 'u_pos_y': lambda x,y: vel_exact_pos_xy(x,y)[1], 'p_pos_': p_exact_pos_xy}
+    # IMPORTANT: use `[..., i]` (vectorized) instead of `[i]` so the exact callables
+    # work both for scalar (x,y) and for NumPy-batched quadrature points.
+    exact_neg = {
+        'u_neg_x': lambda x, y: vel_exact_neg_xy(x, y)[..., 0],
+        'u_neg_y': lambda x, y: vel_exact_neg_xy(x, y)[..., 1],
+        'p_neg_': p_exact_neg_xy,
+    }
+    exact_pos = {
+        'u_pos_x': lambda x, y: vel_exact_pos_xy(x, y)[..., 0],
+        'u_pos_y': lambda x, y: vel_exact_pos_xy(x, y)[..., 1],
+        'p_pos_': p_exact_pos_xy,
+    }
 
     integ_order = 2 * poly_order + 2
-    err_vel_L2_neg = dh.l2_error_on_side(vector_function=U_neg, 
-                                         exact=exact_neg, 
-                                         level_set=level_set, 
-                                         side='-', 
-                                         fields=['u_neg_x', 'u_neg_y'], 
-                                         relative=False,
-                                         quad_order=integ_order,
-                                         deformation=deformation
-                                         )
-    err_vel_L2_pos = dh.l2_error_on_side(vector_function=U_pos, 
-                                         exact=exact_pos, 
-                                         level_set=level_set, 
-                                         side='+', 
-                                         fields=['u_pos_x', 'u_pos_y'], 
-                                         relative=False,
-                                         quad_order=integ_order,
-                                         deformation=deformation
-                                         )
+    bench = os.getenv("PYCUTFEM_BENCH_ERRORS", "").lower() in {"1", "true", "yes"}
+
+    def _timeit(label, fn):
+        import time as _time
+        t0 = _time.perf_counter()
+        out = fn()
+        dt = _time.perf_counter() - t0
+        if bench:
+            print(f"[bench] {label}: {dt:.4f}s")
+        return out
+
+    # --- Velocity L2 (compiled default) ---
+    err_vel_L2_neg = _timeit(
+        "L2 vel (-) compiled",
+        lambda: dh.l2_error_on_side_compiled(
+            vector_function=U_neg,
+            exact=exact_neg,
+            level_set=level_set,
+            side='-',
+            fields=['u_neg_x', 'u_neg_y'],
+            relative=False,
+            quad_order=integ_order,
+            deformation=deformation,
+        ),
+    )
+    err_vel_L2_pos = _timeit(
+        "L2 vel (+) compiled",
+        lambda: dh.l2_error_on_side_compiled(
+            vector_function=U_pos,
+            exact=exact_pos,
+            level_set=level_set,
+            side='+',
+            fields=['u_pos_x', 'u_pos_y'],
+            relative=False,
+            quad_order=integ_order,
+            deformation=deformation,
+        ),
+    )
     vel_L2 = np.sqrt(err_vel_L2_neg**2 + err_vel_L2_pos**2)
 
-    err_p_L2_neg = dh.l2_error_on_side(function=P_neg, 
-                                       exact=exact_neg, 
-                                       level_set=level_set, 
-                                       side='-', 
-                                       fields=['p_neg_'], 
-                                       relative=False, quad_order=integ_order,
-                                       deformation=deformation
-                                       )
-    err_p_L2_pos = dh.l2_error_on_side(function=P_pos, 
-                                       exact=exact_pos, 
-                                       level_set=level_set, 
-                                       side='+', 
-                                       fields=['p_pos_'], 
-                                       relative=False, 
-                                       quad_order=integ_order,
-                                       deformation=deformation
-                                       )
+    # --- Pressure L2 (keep Python default; compiled is benchmarked below) ---
+    err_p_L2_neg = _timeit(
+        "L2 p (-) python",
+        lambda: dh.l2_error_on_side(
+            function=P_neg,
+            exact=exact_neg,
+            level_set=level_set,
+            side='-',
+            fields=['p_neg_'],
+            relative=False,
+            quad_order=integ_order,
+            deformation=deformation,
+        ),
+    )
+    err_p_L2_pos = _timeit(
+        "L2 p (+) python",
+        lambda: dh.l2_error_on_side(
+            function=P_pos,
+            exact=exact_pos,
+            level_set=level_set,
+            side='+',
+            fields=['p_pos_'],
+            relative=False,
+            quad_order=integ_order,
+            deformation=deformation,
+        ),
+    )
     p_L2 = np.sqrt(err_p_L2_neg**2 + err_p_L2_pos**2)
 
-
-    print(f"L2 Error (velocity): {vel_L2:10.8e}")
-    # print(f"H1 Error (velocity): {vel_H1:10.8e}")
-    print(f"L2 Error (pressure): {p_L2:10.8e}")
-    # vel_H1 = dh.h1_error_vector_piecewise(U_pos, exact_neg, exact_pos, level_set)
-    # H1-seminorm of velocity on each side
-    vel_H1m_neg = dh.h1_error_vector_on_side(U_neg, grad_vel_neg_xy, 
-                                             level_set, side='-', 
-                                             fields=['u_neg_x', 'u_neg_y'], 
-                                             quad_increase=2,
-                                             deformation=deformation
-                                             )
-    vel_H1m_pos = dh.h1_error_vector_on_side(U_pos, grad_vel_pos_xy, 
-                                             level_set, side='+', 
-                                             fields=['u_pos_x', 'u_pos_y'], 
-                                             quad_increase=2,
-                                             deformation=deformation
-                                             )
-                                             
+    # --- Velocity H1 (keep Python default; compiled is benchmarked below) ---
+    vel_H1m_neg = _timeit(
+        "H1-semi vel (-) python",
+        lambda: dh.h1_error_vector_on_side(
+            U_neg,
+            grad_vel_neg_xy,
+            level_set,
+            side='-',
+            fields=['u_neg_x', 'u_neg_y'],
+            quad_increase=2,
+            deformation=deformation,
+        ),
+    )
+    vel_H1m_pos = _timeit(
+        "H1-semi vel (+) python",
+        lambda: dh.h1_error_vector_on_side(
+            U_pos,
+            grad_vel_pos_xy,
+            level_set,
+            side='+',
+            fields=['u_pos_x', 'u_pos_y'],
+            quad_increase=2,
+            deformation=deformation,
+        ),
+    )
     vel_H1m = np.sqrt(vel_H1m_neg**2 + vel_H1m_pos**2)   # piecewise |·|_{H1}
-
-    # If you want the *full* H1 norm (seminorm + L2)
     vel_H1 = np.sqrt(vel_L2**2 + vel_H1m**2)
 
-    # print(f"H1-seminorm (velocity): {vel_H1m:10.8e}")
+    print(f"L2 Error (velocity): {vel_L2:10.8e}")
+    print(f"L2 Error (pressure): {p_L2:10.8e}")
     print(f"H1 norm      (velocity): {vel_H1:10.8e}")
+
+    if bench:
+        # Warm-cache timings (compiled kernels + static args cached in the DofHandler instance).
+        _timeit(
+            "L2 vel (-) python (cold)",
+            lambda: dh.l2_error_on_side(
+                vector_function=U_neg,
+                exact=exact_neg,
+                level_set=level_set,
+                side='-',
+                fields=['u_neg_x', 'u_neg_y'],
+                relative=False,
+                quad_order=integ_order,
+                deformation=deformation,
+            ),
+        )
+        _timeit(
+            "L2 vel (+) python (cold)",
+            lambda: dh.l2_error_on_side(
+                vector_function=U_pos,
+                exact=exact_pos,
+                level_set=level_set,
+                side='+',
+                fields=['u_pos_x', 'u_pos_y'],
+                relative=False,
+                quad_order=integ_order,
+                deformation=deformation,
+            ),
+        )
+        _timeit(
+            "L2 vel (-) compiled warm",
+            lambda: dh.l2_error_on_side_compiled(
+                vector_function=U_neg,
+                exact=exact_neg,
+                level_set=level_set,
+                side='-',
+                fields=['u_neg_x', 'u_neg_y'],
+                relative=False,
+                quad_order=integ_order,
+                deformation=deformation,
+            ),
+        )
+        _timeit(
+            "H1-semi vel (-) compiled (cold)",
+            lambda: dh.h1_error_vector_on_side_compiled(
+                U_neg,
+                grad_vel_neg_xy,
+                level_set,
+                side='-',
+                fields=['u_neg_x', 'u_neg_y'],
+                relative=False,
+                quad_increase=2,
+                quad_order=None,
+                deformation=deformation,
+                backend="cpp",
+            ),
+        )
+        _timeit(
+            "H1-semi vel (-) compiled (warm)",
+            lambda: dh.h1_error_vector_on_side_compiled(
+                U_neg,
+                grad_vel_neg_xy,
+                level_set,
+                side='-',
+                fields=['u_neg_x', 'u_neg_y'],
+                relative=False,
+                quad_increase=2,
+                quad_order=None,
+                deformation=deformation,
+                backend="cpp",
+            ),
+        )
+        _timeit(
+            "L2 p (-) compiled (cold)",
+            lambda: dh.l2_error_on_side_compiled(
+                function=P_neg,
+                exact=exact_neg,
+                level_set=level_set,
+                side='-',
+                fields=['p_neg_'],
+                relative=False,
+                quad_order=integ_order,
+                deformation=deformation,
+                backend="cpp",
+            ),
+        )
+        _timeit(
+            "L2 p (-) compiled (warm)",
+            lambda: dh.l2_error_on_side_compiled(
+                function=P_neg,
+                exact=exact_neg,
+                level_set=level_set,
+                side='-',
+                fields=['p_neg_'],
+                relative=False,
+                quad_order=integ_order,
+                deformation=deformation,
+                backend="cpp",
+            ),
+        )
 
     # ---------------- 8) Export ----------------
     outdir = "stokes_interface_results"

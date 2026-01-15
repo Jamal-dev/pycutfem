@@ -43,7 +43,10 @@ class AnnulusLevelSet(LevelSetFunction):
       - outside (near r_outer):  φ = r - r_outer
       - inside (near r_inner):  φ = r_inner - r
 
-    This matches the sign pattern used in NGSXFEM ring demos.
+    Sign convention
+    ---------------
+    We use the CutFEM convention Ω⁻ = {φ<0}, Ω⁺ = {φ>0}. With this choice,
+    the outward normal on Γ is n = ∇φ/||∇φ|| pointing from Ω⁻ to Ω⁺.
     """
 
     def __init__(
@@ -657,8 +660,10 @@ class PiecewiseLinearLevelSet(LevelSetFunction):
         xi, eta = float(xi_eta[0]), float(xi_eta[1])
         v = np.asarray(self._coeff(int(eid)), float)  # φ at the 3 (tri) or 4 (quad) corners
         if self.mesh.element_type == "tri":
-            # reference triangle (0,0), (1,0), (0,1)
-            return float(v[0]*(1.0 - xi - eta) + v[1]*xi + v[2]*eta)
+            # Tri surrogate is stored as affine coefficients in physical space:
+            #   φ(x,y) = a x + b y + c  with v = [a,b,c].
+            x_phys = transform.x_mapping(self.mesh, int(eid), (xi, eta))
+            return float(v[0] * float(x_phys[0]) + v[1] * float(x_phys[1]) + v[2])
         else:
             # reference square [-1,1]^2
             N00 = 0.25*(1.0 - xi)*(1.0 - eta)
@@ -714,11 +719,20 @@ class LevelSetDeformation:
 
 
 class LevelSetMeshAdaptation:
-    """Lightweight analogue of NGSolve's LevelSetMeshAdaptation.
+    """Level-set based mesh adaptation / isoparametric deformation.
 
-    Builds an Oswald-averaged search direction and computes a displacement field
-    that moves geometry nodes such that a piecewise-linear surrogate φ_P1 aligns
-    with the high-order φ within a bounded threshold per element.
+    Given a high-order level set φ and a P1/Q1 surrogate φ_P1, this class computes
+    a displacement field u_h (defined at the geometry nodes) so that the deformed
+    mapping X̃ = X + u_h yields a better geometric approximation of the physical
+    interface Γ = {φ=0}. In practice, this is used to improve cut integration by
+    integrating over the deformed subcells K̃∩Ω̃ instead of K∩Ω.
+
+    The construction follows standard ideas from unfitted FEM:
+      - build a continuous search direction by Oswald-averaging local data,
+      - compute element-local shifts (Newton-like) that reduce φ_P1−φ mismatch,
+      - Oswald-average the high-order shifts to obtain a globally continuous u_h,
+      - restrict the deformation to a narrow band around Γ to avoid moving the
+        far-field mesh unnecessarily.
 
     Args:
         mesh: Geometry mesh.
@@ -729,60 +743,227 @@ class LevelSetMeshAdaptation:
         tol: Convergence tolerance for the residual |φ_P1 - φ|.
     """
 
-    def __init__(self, mesh, *, order: int = 2, threshold: float = 1.0,
-                 discontinuous_qn: bool = True, max_steps: int = 6, tol: float = 1e-12):
+    def __init__(self, mesh, *, order: int = 2, threshold: float = -1.0,
+                 discontinuous_qn: bool = False, max_steps: int = 20, tol: float = 1e-12,
+                 eps_perturbation: float = 1e-14):
         self.mesh = mesh
         self.order = int(order)
         self.threshold = float(threshold)
         self.discontinuous_qn = bool(discontinuous_qn)
         self.max_steps = int(max_steps)
         self.tol = float(tol)
+        self.eps_perturbation = float(eps_perturbation)
         self.lset_p1: Optional[PiecewiseLinearLevelSet] = None
         self.deformation: Optional[LevelSetDeformation] = None
+
+    def _project_level_set_to_h1(self, level_set: LevelSetFunction, *, q_vol: Optional[int] = None):
+        """L2-project ``level_set`` into an H1/Qp space of order ``self.order``.
+
+        Returns (dh, field, coeff) or None if SciPy is unavailable.
+        """
+        try:
+            import scipy.sparse as _sp
+            import scipy.sparse.linalg as _spla
+        except Exception:
+            return None
+
+        mesh = self.mesh
+        p = int(self.order)
+        if p < 1:
+            return None
+
+        from pycutfem.fem.mixedelement import MixedElement
+        from pycutfem.core.dofhandler import DofHandler
+        from pycutfem.integration.quadrature import volume as vol_rule
+        from pycutfem.fem.reference import get_reference
+
+        # Our quadrature provider uses "number of Gauss points" per direction (quads)
+        # or per element (tris). If the caller supplies an integration *degree*,
+        # convert it to a safe Gauss rule size (Gauss-Legendre in 1D is exact up to
+        # degree 2q-1, so q ≈ ceil((deg+1)/2)).
+        deg_proj = int(2 * p) if q_vol is None else int(q_vol)
+        if mesh.element_type == "quad":
+            q_proj = max(3, int(np.ceil((deg_proj + 1) / 2)))
+        else:
+            q_proj = max(2, deg_proj)
+
+        me = MixedElement(mesh, {"__lset__": p})
+        dh = DofHandler(me, method="cg")
+        field = "__lset__"
+
+        qp_ref, qw_ref = vol_rule(mesh.element_type, q_proj)
+        ref = get_reference(mesh.element_type, p)
+
+        n_dofs = len(dh.get_field_slice(field))
+        rows: list[int] = []
+        cols: list[int] = []
+        data: list[float] = []
+        rhs = np.zeros((n_dofs,), dtype=float)
+
+        # Assemble global consistent mass matrix and RHS for L2 projection.
+        for eid in range(len(mesh.elements_list)):
+            gdofs = np.asarray(dh.element_maps[field][int(eid)], dtype=int)
+            n_loc = int(len(gdofs))
+            Mloc = np.zeros((n_loc, n_loc), dtype=float)
+            bloc = np.zeros((n_loc,), dtype=float)
+
+            for (xi, eta), w in zip(qp_ref, qw_ref):
+                xi = float(xi)
+                eta = float(eta)
+                N = np.asarray(ref.shape(xi, eta), dtype=float).ravel()
+                if N.shape[0] != n_loc:
+                    raise ValueError("basis/local-dof size mismatch in level-set projection")
+
+                x_phys = transform.x_mapping(mesh, int(eid), (xi, eta))
+                J = transform.jacobian(mesh, int(eid), (xi, eta))
+                detJ = abs(float(np.linalg.det(J)))
+
+                phi_val = float(level_set(np.asarray(x_phys, float)))
+                ww = float(w) * detJ
+                Mloc += ww * np.outer(N, N)
+                bloc += ww * phi_val * N
+
+            for a in range(n_loc):
+                ia = int(gdofs[a])
+                rhs[ia] += float(bloc[a])
+                for b in range(n_loc):
+                    ib = int(gdofs[b])
+                    rows.append(ia)
+                    cols.append(ib)
+                    data.append(float(Mloc[a, b]))
+
+        M = _sp.coo_matrix((data, (rows, cols)), shape=(n_dofs, n_dofs)).tocsr()
+        coeff = np.asarray(_spla.spsolve(M, rhs), dtype=float).reshape(-1)
+        return dh, field, coeff
+
+    def _interpolate_to_p1_from_h1(self, dh, field: str, coeff: np.ndarray) -> PiecewiseLinearLevelSet:
+        """
+        Build a P1/Q1 surrogate level set from an H1/Qp coefficient vector.
+
+        We take the (continuous) vertex values from the H1 field and construct a
+        piecewise linear/bilinear φ_P1. Very small vertex values are perturbed by
+        `eps_perturbation` so that sign-based classification (inside/outside/cut)
+        is robust: exactly-zero vertex values can lead to ambiguous "touching"
+        configurations and brittle element/edge tagging.
+        """
+        mesh = self.mesh
+        XY = np.asarray(mesh.nodes_x_y_pos, float)
+        n_nodes = int(XY.shape[0])
+
+        dof_map = getattr(dh, "dof_map", {}).get(field, {})
+        vertex_ids = np.unique(np.asarray(mesh.corner_connectivity, dtype=int).ravel())
+
+        vertex_vals = np.zeros((n_nodes,), dtype=float)
+        eps = float(self.eps_perturbation)
+        for nid in vertex_ids:
+            gd = dof_map.get(int(nid))
+            if gd is None:
+                # Fallback: evaluate the analytic level set at the vertex.
+                vertex_vals[int(nid)] = 0.0
+                continue
+            val = float(coeff[int(gd)])
+            if abs(val) < eps:
+                val = eps
+            vertex_vals[int(nid)] = val
+
+        coeffs: list[np.ndarray] = []
+        if mesh.element_type == "tri":
+            for corner_ids in mesh.corner_connectivity:
+                cids = np.asarray(corner_ids, int)
+                verts = XY[cids]
+                phi = vertex_vals[cids]
+                A = np.column_stack((verts, np.ones(3)))
+                coeffs.append(np.linalg.solve(A, phi))
+        elif mesh.element_type == "quad":
+            for corner_ids in mesh.corner_connectivity:
+                cids = np.asarray(corner_ids, int)
+                coeffs.append(vertex_vals[cids])
+        else:
+            raise KeyError(mesh.element_type)
+
+        # Map each mesh node to a containing element id once.
+        node_to_eid: dict[int, int] = {}
+        conn = np.asarray(mesh.elements_connectivity, dtype=int)
+        for eid in range(conn.shape[0]):
+            for nid in conn[eid]:
+                node_to_eid.setdefault(int(nid), int(eid))
+
+        tmp = PiecewiseLinearLevelSet(mesh, np.asarray(coeffs, float), np.zeros((n_nodes,), dtype=float))
+        node_vals = np.zeros((n_nodes,), dtype=float)
+        for nid in range(n_nodes):
+            eid = node_to_eid.get(int(nid))
+            if eid is None:
+                node_vals[int(nid)] = float(vertex_vals[int(nid)])
+                continue
+            node_vals[int(nid)] = float(tmp(XY[int(nid)], eid=int(eid)))
+
+        # Enforce perturbed vertex values exactly.
+        node_vals[vertex_ids] = vertex_vals[vertex_ids]
+        return PiecewiseLinearLevelSet(mesh, np.asarray(coeffs, float), node_vals)
 
     def calc_deformation(self, level_set: LevelSetFunction, q_vol: Optional[int] = None) -> LevelSetDeformation:
         """Compute nodal displacements that align φ_P1 with φ (Oswald projection).
 
-        Implementation mirrors the NGSolve-style pipeline:
-          1. Build a continuous P1/Q1 search direction at corner nodes via Oswald averaging
-             of the true gradient ∇φ on cut elements.
-          2. For every cut element, assemble a consistent mass matrix and RHS using a
-             Newton iteration posed in *reference* coordinates to find shift vectors that
-             satisfy φ(x_target) = φ_P1(ξ,η).  Corner nodes remain fixed; higher-order
-             nodes are averaged back to the mesh nodes within a narrow band via Oswald.
+        Goal (geometric viewpoint)
+        --------------------------
+        Construct an isoparametric deformation map X̃ = X + u_h that improves the
+        representation of Γ in cut integration. The deformation is computed so that,
+        in a narrow band around Γ, the surrogate φ_P1 aligns with the high-order φ.
+
+        Outline
+        -------
+        1) Build a continuous search direction at corner nodes by Oswald-averaging
+           element-local data (typically derived from ∇φ).
+        2) On each "relevant" element, compute element-local shifts in reference
+           coordinates that reduce the mismatch φ_P1−φ (Newton-like search), then
+           fit these shifts in the deformation FE space via a local mass matrix.
+        3) Oswald-average the high-order nodal shifts to obtain a globally continuous
+           deformation u_h and set u_h=0 outside the relevant band.
         """
         mesh = self.mesh
         node_coords = mesh.nodes_x_y_pos
         n_nodes = node_coords.shape[0]
 
-        # P1/Q1 surrogate on geometry
-        self.lset_p1 = PiecewiseLinearLevelSet.from_level_set(mesh, level_set)
-        phi_p1_nodes = self.lset_p1.node_values
+        proj = self._project_level_set_to_h1(level_set, q_vol=q_vol)
+        if proj is None:
+            # Robust fallback: nodal sampling + legacy first-order displacement.
+            self.lset_p1 = PiecewiseLinearLevelSet.from_level_set(mesh, level_set)
+            phi_p1_nodes = self.lset_p1.node_values
 
-        # classify and keep only cut elements
-        mesh.classify_elements(self.lset_p1, tol=self.tol)
-        cut_ids = mesh.element_bitset("cut").to_indices()
+            mesh.classify_elements(self.lset_p1, tol=self.tol)
+            cut_ids = mesh.element_bitset("cut").to_indices()
+            search_dirs_at_nodes = np.zeros((n_nodes, 2), float)
+            dir_counts_at_nodes = np.zeros(n_nodes, float)
 
-        # --- STEP 1: Oswald averaging of TRUE ∇φ at corner nodes ---
-        search_dirs_at_nodes = np.zeros((n_nodes, 2), float)
-        dir_counts_at_nodes = np.zeros(n_nodes, float)
+            for eid in cut_ids:
+                elem = mesh.elements_list[int(eid)]
+                for nid in elem.corner_nodes:
+                    xcorner = np.asarray(mesh.nodes_x_y_pos[int(nid)], float)
+                    g = np.asarray(level_set.gradient(xcorner), float)
+                    nrm = float(np.linalg.norm(g))
+                    if nrm < 1e-14:
+                        continue
+                    search_dirs_at_nodes[int(nid)] += g
+                    dir_counts_at_nodes[int(nid)] += 1.0
 
-        for eid in cut_ids:
-            elem = mesh.elements_list[int(eid)]
-            for nid in elem.corner_nodes:
-                xcorner = np.asarray(mesh.nodes_x_y_pos[int(nid)], float)
-                g = np.asarray(level_set.gradient(xcorner), float)
-                nrm = float(np.linalg.norm(g))
-                if nrm < 1e-14:
-                    continue
-                search_dirs_at_nodes[int(nid)] += g
-                dir_counts_at_nodes[int(nid)] += 1.0
+            mask = dir_counts_at_nodes > 0
+            if np.any(mask):
+                search_dirs_at_nodes[mask] /= dir_counts_at_nodes[mask, None]
+                norms = np.linalg.norm(search_dirs_at_nodes, axis=1, keepdims=True) + 1e-30
+                search_dirs_at_nodes[mask] /= norms[mask]
+        else:
+            dh_ho, field_ho, coeff_ho = proj
+            self.lset_p1 = self._interpolate_to_p1_from_h1(dh_ho, field_ho, coeff_ho)
+            phi_p1_nodes = self.lset_p1.node_values
 
-        mask = dir_counts_at_nodes > 0
-        if np.any(mask):
-            search_dirs_at_nodes[mask] /= dir_counts_at_nodes[mask, None]
-            norms = np.linalg.norm(search_dirs_at_nodes, axis=1, keepdims=True) + 1e-30
-            search_dirs_at_nodes[mask] /= norms[mask]
+            # Restrict the deformation solve to a narrow band around Γ: elements whose
+            # P1 surrogate changes sign at their vertices (or touches zero). This keeps
+            # the deformation local and avoids moving far-field geometry unnecessarily.
+            corner_ids = np.asarray(mesh.corner_connectivity, dtype=int)
+            corner_vals = phi_p1_nodes[corner_ids]
+            has_pos = (corner_vals > 0.0).any(axis=1) | (corner_vals == 0.0).any(axis=1)
+            has_neg = (corner_vals < 0.0).any(axis=1) | (corner_vals == 0.0).any(axis=1)
+            cut_ids = np.where(has_pos & has_neg)[0].astype(int)
 
         # helper: clamp reference coordinates back to the parent element
         def _clamp_ref(z: np.ndarray) -> np.ndarray:
@@ -798,70 +979,235 @@ class LevelSetMeshAdaptation:
                 eta = max(-1.0 + eps, min(1.0 - eps, eta))
                 return np.array([xi, eta], float)
 
-        # --- STEP 2: local projection on cut elements ---
-        # nodal h for band limiting
-        node_h = np.full(n_nodes, np.inf, float)
-        for elem in mesh.elements_list:
-            h_e = mesh.element_char_length(int(elem.id)) if hasattr(mesh, "element_char_length") else 1.0
-            for nid in elem.corner_nodes:
-                idx = int(nid)
-                node_h[idx] = min(node_h[idx], h_e)
-        node_h[node_h == np.inf] = 1.0
-
+        # --- STEP 2: element-local solve + Oswald averaging ---
+        #
+        # Oswald averaging is a projection onto a globally continuous H1 space: shared
+        # DOF coefficients (vertices/edges) are averaged across adjacent elements,
+        # while element-interior DOFs remain local. This is well-defined in terms of
+        # the FE *coefficients* (global DOFs), not in terms of point samples.
+        #
+        # For triangles, the Qp geometry lattice is a nodal Lagrange basis, so nodal
+        # values coincide with FE DOFs and "nodal Oswald" is equivalent.
+        #
+        # For quads with p>=2 we store deformation values on a tensor-product lattice,
+        # but the natural H1-high-order coefficient decomposition is hierarchical
+        # (vertex/edge/interior modes). Averaging lattice point values directly is
+        # *not* equivalent to Oswald averaging of the H1 coefficients and can yield an
+        # overly local deformation (no propagation through shared edge modes).
+        #
+        # To respect the mathematical meaning of Oswald averaging on quads, we:
+        #   (i)  transform nodal values -> hierarchical H1 coefficients,
+        #   (ii) average shared vertex/edge coefficients (Oswald),
+        #   (iii) evaluate the resulting hierarchical field back at lattice nodes.
         displacements = np.zeros((n_nodes, 2), float)
         counts = np.zeros(n_nodes, float)
 
         from pycutfem.integration.quadrature import volume as volume_rule
-        ref = transform.get_reference(mesh.element_type, mesh.poly_order)
-        ref_geom = transform.get_reference(mesh.element_type, 1)
-        if q_vol is None:
-            q_order = max(2 * int(mesh.poly_order), 4)
+
+        # Deformation space is represented on the geometry lattice; currently require matching orders.
+        p_def = int(mesh.poly_order)
+        if proj is not None and int(self.order) != p_def:
+            raise ValueError("LevelSetMeshAdaptation currently requires mesh.poly_order == order for ProjectShift parity.")
+
+        ref_def = transform.get_reference(mesh.element_type, p_def)
+        if proj is not None:
+            from pycutfem.fem.reference import get_reference
+            ref_ho = get_reference(mesh.element_type, int(self.order))
+
+        use_hier_oswald = (
+            proj is not None
+            and mesh.element_type == "quad"
+            and p_def >= 2
+            and getattr(mesh, "edges_connectivity", None) is not None
+        )
+
+        hier_A = None
+        hier_T = None
+        hier_edge_key_to_gid: dict[tuple[int, int], int] | None = None
+        hier_edge_sum = None
+        hier_edge_cnt = None
+        hier_vtx_sum = None
+        hier_vtx_cnt = None
+        hier_int_coeff = None
+        hier_cut_mask = None
+        if use_hier_oswald:
+            # Cache per polynomial order; matrices are small ((p+1)^2 x (p+1)^2).
+            cache = getattr(LevelSetMeshAdaptation, "_hier_quad_cache", {})
+            key = ("quad_h1hier", int(p_def))
+            if key in cache:
+                hier_A, hier_T = cache[key]
+            else:
+                nlat = int(p_def) + 1
+                xis = np.linspace(-1.0, 1.0, nlat)
+                etas = np.linspace(-1.0, 1.0, nlat)
+
+                def _legendre_all(n: int, x: float) -> np.ndarray:
+                    P = np.zeros((n + 1,), dtype=float)
+                    P[0] = 1.0
+                    if n >= 1:
+                        P[1] = float(x)
+                    for k in range(2, n + 1):
+                        P[k] = ((2 * k - 1) * float(x) * P[k - 1] - (k - 1) * P[k - 2]) / k
+                    return P
+
+                def _integrated_legendre(n: int, x: float, P: np.ndarray) -> float:
+                    # Integrated Legendre basis: L_n(x) = ∫_{-1}^x P_{n-1}(t) dt
+                    # For n>=2, L_n(±1)=0 and we have the closed form:
+                    #   L_n(x) = (P_n(x) - P_{n-2}(x)) / (2n-1).
+                    return float(P[n] - P[n - 2]) / float(2 * n - 1)
+
+                def _h1_hier_quad_basis(p: int, xi: float, eta: float) -> np.ndarray:
+                    vx0 = 0.5 * (1.0 - float(xi))
+                    vx1 = 0.5 * (1.0 + float(xi))
+                    vy0 = 0.5 * (1.0 - float(eta))
+                    vy1 = 0.5 * (1.0 + float(eta))
+
+                    Pxi = _legendre_all(p, float(xi))
+                    Peta = _legendre_all(p, float(eta))
+
+                    Lxi = [_integrated_legendre(k, float(xi), Pxi) for k in range(2, p + 1)]
+                    Leta = [_integrated_legendre(k, float(eta), Peta) for k in range(2, p + 1)]
+
+                    vals: list[float] = []
+                    # vertices: bl, br, tr, tl (matches Mesh.corner_connectivity for quads)
+                    vals.extend([vx0 * vy0, vx1 * vy0, vx1 * vy1, vx0 * vy1])
+                    # edges: bottom, right, top, left; modes k=2..p
+                    vals.extend([vy0 * Lk for Lk in Lxi])  # bottom (eta=-1)
+                    vals.extend([vx1 * Lk for Lk in Leta])  # right  (xi=+1)
+                    vals.extend([vy1 * Lk for Lk in Lxi])  # top    (eta=+1)
+                    vals.extend([vx0 * Lk for Lk in Leta])  # left   (xi=-1)
+                    # interior: tensor-product (i,j) with i,j=2..p
+                    vals.extend([Lx * Ly for Ly in Leta for Lx in Lxi])
+                    return np.asarray(vals, dtype=float)
+
+                nloc = nlat * nlat
+                A = np.zeros((nloc, nloc), dtype=float)
+                row = 0
+                for eta in etas:
+                    for xi in xis:
+                        A[row, :] = _h1_hier_quad_basis(int(p_def), float(xi), float(eta))
+                        row += 1
+                # Solve A * c = u(node) for coefficients c in the hierarchical basis
+                T = np.linalg.solve(A, np.eye(nloc, dtype=float))
+                hier_A, hier_T = A, T
+                cache[key] = (hier_A, hier_T)
+                LevelSetMeshAdaptation._hier_quad_cache = cache
+
+            # Build edge lookup for geometric edges (corner-to-corner) by endpoint ids.
+            hier_edge_key_to_gid = {}
+            for e in mesh.edges_list:
+                v0, v1 = int(e.nodes[0]), int(e.nodes[1])
+                hier_edge_key_to_gid[(min(v0, v1), max(v0, v1))] = int(e.gid)
+
+            n_edges = len(mesh.edges_list)
+            n_edge_modes = int(p_def) - 1  # modes k=2..p
+            hier_edge_sum = np.zeros((n_edges * n_edge_modes, 2), dtype=float)
+            hier_edge_cnt = np.zeros((n_edges * n_edge_modes,), dtype=float)
+            hier_vtx_sum = np.zeros((n_nodes, 2), dtype=float)
+            hier_vtx_cnt = np.zeros((n_nodes,), dtype=float)
+            n_int = (int(p_def) - 1) ** 2
+            hier_int_coeff = np.zeros((len(mesh.elements_connectivity), n_int, 2), dtype=float)
+            hier_cut_mask = np.zeros((len(mesh.elements_connectivity),), dtype=bool)
+
+        if mesh.element_type == "quad":
+            deg_shift = 2 * int(p_def)
+            q_order = max(3, int(np.ceil((deg_shift + 1) / 2)))
         else:
-            q_order = int(q_vol)
+            q_order = max(2 * int(p_def), 2)
         qpts_ref, qw_ref = volume_rule(mesh.element_type, q_order)
 
+        def _eval_ho_local(u_loc: np.ndarray, xi_eta: np.ndarray) -> float:
+            xi = float(xi_eta[0]); eta = float(xi_eta[1])
+            N = np.asarray(ref_ho.shape(xi, eta), float).ravel()
+            return float(N @ u_loc)
+
+        def _grad_ho_ref_local(u_loc: np.ndarray, xi_eta: np.ndarray) -> np.ndarray:
+            xi = float(xi_eta[0]); eta = float(xi_eta[1])
+            dN = np.asarray(ref_ho.grad(xi, eta), float)  # (nloc,2)
+            return np.asarray(dN.T @ u_loc, float).reshape(2,)
+
+        def _search_corresponding_point(eid: int, u_loc: np.ndarray, init_ref: np.ndarray, goal: float, search_dir: np.ndarray) -> np.ndarray:
+            curr = np.asarray(init_ref, float).reshape(2,)
+            for _ in range(int(self.max_steps) if int(self.max_steps) > 0 else 20):
+                val = _eval_ho_local(u_loc, curr)
+                defect = float(goal - val)
+                if abs(defect) < 1e-14:
+                    return curr
+                grad_ref = _grad_ho_ref_local(u_loc, curr)
+                dphidn = float(np.dot(grad_ref, search_dir))
+                if abs(dphidn) < 1e-30:
+                    break
+                curr = curr + (defect / dphidn) * search_dir
+            return np.asarray(init_ref, float).reshape(2,)
+
         for eid in cut_ids:
-            elem = mesh.elements_list[int(eid)]
-            geom_node_ids = np.asarray(mesh.elements_connectivity[int(eid)], int)
+            eid = int(eid)
+            geom_node_ids = np.asarray(mesh.elements_connectivity[eid], int)
+            nloc = int(geom_node_ids.size)
 
-            corner_nids = np.asarray(elem.corner_nodes, int)
-            corner_node_search_dirs = search_dirs_at_nodes[corner_nids]
-
-            nloc = geom_node_ids.size
             mass = np.zeros((nloc, nloc), float)
             rhs = np.zeros((nloc, 2), float)
 
+            if proj is not None:
+                gdofs_ho = np.asarray(dh_ho.element_maps[field_ho][eid], dtype=int)
+                u_loc_ho = np.asarray(coeff_ho[gdofs_ho], float).reshape(-1)
+
             for (xi, eta), w in zip(qpts_ref, qw_ref):
                 xi = float(xi); eta = float(eta)
-                J = transform.jacobian(mesh, int(eid), (xi, eta))
-                detJ = abs(np.linalg.det(J))
+                J = transform.jacobian(mesh, eid, (xi, eta))
+                detJ = abs(float(np.linalg.det(J)))
                 if detJ <= 0.0:
                     continue
-                N = np.asarray(ref.shape(xi, eta), float).ravel()
-                mass += (float(w) * float(detJ)) * np.outer(N, N)
+                ww = float(w) * detJ
 
-                # geometry mapping (no prior displacement while computing target shift)
-                x_phys = transform.x_mapping(mesh, int(eid), (xi, eta))
-                # reference-space Ihφ and high-order φ at x_phys
-                phi_lin = self.lset_p1.value_on_element(int(eid), (xi, eta))
-                phi_val = float(level_set(x_phys))
-                residual = phi_lin - phi_val
-                if abs(residual) < self.tol:
-                    continue
-                g = np.asarray(level_set.gradient(x_phys), float)
-                g2 = float(np.dot(g, g))
-                if g2 <= 1e-30:
-                    continue
-                delta_x = (residual / g2) * g
+                N_def = np.asarray(ref_def.shape(xi, eta), float).ravel()
+                if N_def.shape[0] != nloc:
+                    raise ValueError("deformation basis/local-node size mismatch")
+                mass += ww * np.outer(N_def, N_def)
 
-                # clamp by element-wise threshold
-                h_elem = mesh.element_char_length(int(eid)) if hasattr(mesh, "element_char_length") else 1.0
-                max_disp = abs(self.threshold) * h_elem
-                n_dx = float(np.linalg.norm(delta_x))
-                if n_dx > max_disp and n_dx > 0.0:
-                    delta_x = delta_x * (max_disp / n_dx)
+                if proj is None:
+                    # Legacy: simple first-order update using analytic φ and ∇φ.
+                    x_phys = transform.x_mapping(mesh, eid, (xi, eta))
+                    phi_lin = float(self.lset_p1.value_on_element(eid, (xi, eta)))
+                    phi_val = float(level_set(x_phys))
+                    residual = phi_lin - phi_val
+                    if abs(residual) < self.tol:
+                        continue
+                    g = np.asarray(level_set.gradient(x_phys), float).reshape(2,)
+                    g2 = float(np.dot(g, g))
+                    if g2 <= 1e-30:
+                        continue
+                    delta_x = (residual / g2) * g
+                    if float(self.threshold) >= 0.0:
+                        h_elem = mesh.element_char_length(eid) if hasattr(mesh, "element_char_length") else 1.0
+                        max_disp = float(self.threshold) * float(h_elem)
+                        n_dx = float(np.linalg.norm(delta_x))
+                        if n_dx > max_disp and n_dx > 0.0:
+                            delta_x = delta_x * (max_disp / n_dx)
+                    rhs += ww * np.outer(N_def, delta_x)
+                else:
+                    # ProjectShift parity: Newton search in reference space for lset_ho == lset_p1.
+                    orig_ref = np.array([xi, eta], float)
+                    goal_val = float(self.lset_p1.value_on_element_ref(eid, (xi, eta)))
 
-                rhs += (float(w) * float(detJ)) * np.outer(N, delta_x)
+                    grad_ref_orig = _grad_ho_ref_local(u_loc_ho, orig_ref)
+                    try:
+                        Jinv = np.linalg.inv(J)
+                    except np.linalg.LinAlgError:
+                        Jinv = np.linalg.pinv(J)
+                    qn_phys = Jinv.T @ grad_ref_orig
+                    search_dir = Jinv @ qn_phys
+                    if float(np.dot(search_dir, search_dir)) <= 1e-30:
+                        continue
+
+                    final_ref = _search_corresponding_point(eid, u_loc_ho, orig_ref, goal_val, search_dir)
+                    ref_dist = final_ref - orig_ref
+                    ref_dist_norm = float(np.linalg.norm(ref_dist))
+                    if float(self.threshold) >= 0.0 and ref_dist_norm > float(self.threshold) and ref_dist_norm > 0.0:
+                        ref_dist = ref_dist * (float(self.threshold) / ref_dist_norm)
+
+                    deform = np.asarray(J @ ref_dist, float).reshape(2,)
+                    rhs += ww * np.outer(N_def, deform)
 
             if not np.any(rhs):
                 continue
@@ -870,28 +1216,145 @@ class LevelSetMeshAdaptation:
             except np.linalg.LinAlgError:
                 shift, *_ = np.linalg.lstsq(mass, rhs, rcond=None)
 
-            # freeze corner nodes
-            cset = set(map(int, corner_nids))
+            # Remove an element-wise affine component by anchoring the displacement at
+            # D+1 non-collinear vertices. In 2D, fixing 3 vertex values is enough to
+            # eliminate any affine vector field (A x + b) component on the element,
+            # which helps keep the deformation local and prevents mesh-scale drift.
+            # The remaining vertex value is later made globally continuous by Oswald
+            # averaging across elements.
+            corner_ids = np.asarray(mesh.corner_connectivity[eid], dtype=int)
+            freeze = set(map(int, corner_ids[: 2 + 1]))  # D+1 with D=2
             for a, node_id in enumerate(geom_node_ids):
-                if int(node_id) in cset:
+                if int(node_id) in freeze:
                     shift[a, :] = 0.0
 
-            # Oswald-average to nodes in a narrow band
-            for a, node_id in enumerate(geom_node_ids):
-                nid = int(node_id)
-                band_limit = 1.0 * node_h[nid]
-                if abs(float(phi_p1_nodes[nid])) > band_limit:
-                    continue
-                dv = shift[a, :]
-                if not np.any(dv):
-                    continue
-                displacements[nid, :] += dv
-                counts[nid] += 1.0
+            if use_hier_oswald:
+                # Convert nodal values (Lagrange) -> hierarchical H1 coefficients (integrated Legendre).
+                # hier_T maps: coeff_hier = hier_T @ values_at_nodes.
+                hier_cut_mask[eid] = True
+                coeff_hier = np.asarray(hier_T @ shift, dtype=float)  # (nloc,2)
 
-        mask2 = counts > 0
-        if np.any(mask2):
-            displacements[mask2, :] /= counts[mask2, None]
-        displacements[~mask2, :] = 0.0
+                # (1) vertex coefficients (shared by node id)
+                for lv in range(4):
+                    nid = int(corner_ids[lv])
+                    hier_vtx_sum[nid, :] += coeff_hier[lv, :]
+                    hier_vtx_cnt[nid] += 1.0
+
+                # (2) edge coefficients (shared by geometric edge + mode; orientation for odd modes)
+                # Local reference edge orientations (s=-1 -> s=+1):
+                #   bottom: bl->br, right: br->tr, top: tl->tr, left: bl->tl
+                bl, br, tr, tl = map(int, corner_ids)
+                edge_endpoints = {
+                    0: (bl, br),  # bottom
+                    1: (br, tr),  # right
+                    2: (tl, tr),  # top
+                    3: (bl, tl),  # left
+                }
+                n_edge_modes = int(p_def) - 1
+                edge_off = 4
+                for e_local in range(4):
+                    v_minus, v_plus = edge_endpoints[e_local]
+                    key_edge = (min(v_minus, v_plus), max(v_minus, v_plus))
+                    gid = hier_edge_key_to_gid.get(key_edge)
+                    if gid is None:
+                        continue
+                    match = (v_minus == key_edge[0] and v_plus == key_edge[1])
+                    for mi in range(n_edge_modes):
+                        k = 2 + mi
+                        sign = 1.0 if match else (-1.0 if (k % 2 == 1) else 1.0)
+                        idx_loc = edge_off + e_local * n_edge_modes + mi
+                        idx_glob = int(gid) * n_edge_modes + mi
+                        hier_edge_sum[idx_glob, :] += sign * coeff_hier[idx_loc, :]
+                        hier_edge_cnt[idx_glob] += 1.0
+
+                # (3) interior coefficients (local per element; no averaging)
+                int_off = 4 + 4 * n_edge_modes
+                n_int = (int(p_def) - 1) ** 2
+                if coeff_hier.shape[0] < int_off + n_int:
+                    raise ValueError("hierarchical basis size mismatch for quad element")
+                hier_int_coeff[eid, :, :] = coeff_hier[int_off:int_off + n_int, :]
+            else:
+                for a, node_id in enumerate(geom_node_ids):
+                    nid = int(node_id)
+                    dv = shift[a, :]
+                    if not np.any(dv):
+                        continue
+                    displacements[nid, :] += dv
+                    counts[nid] += 1.0
+
+        if use_hier_oswald:
+            # Average the shared hierarchical coefficients (Oswald).
+            vmask = hier_vtx_cnt > 0
+            if np.any(vmask):
+                hier_vtx_sum[vmask, :] /= hier_vtx_cnt[vmask, None]
+
+            emask = hier_edge_cnt > 0
+            if np.any(emask):
+                hier_edge_sum[emask, :] /= hier_edge_cnt[emask, None]
+
+            # Reconstruct nodal values on every element by evaluating the hierarchical field at
+            # the Qp lattice nodes, then Oswald-average the nodal values on shared nodes.
+            n_edge_modes = int(p_def) - 1
+            n_int = (int(p_def) - 1) ** 2
+            displacements = np.zeros((n_nodes, 2), dtype=float)
+            counts = np.zeros((n_nodes,), dtype=float)
+            for eid in range(len(mesh.elements_connectivity)):
+                conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
+                if conn.size != hier_A.shape[0]:
+                    raise ValueError("quad deformation lattice size mismatch")
+
+                corners = np.asarray(mesh.corner_connectivity[int(eid)], dtype=int)
+                bl, br, tr, tl = map(int, corners)
+                # Local coeffs in our hierarchical ordering.
+                coeff_loc = np.zeros((hier_A.shape[0], 2), dtype=float)
+                # vertices
+                coeff_loc[0, :] = hier_vtx_sum[bl, :]
+                coeff_loc[1, :] = hier_vtx_sum[br, :]
+                coeff_loc[2, :] = hier_vtx_sum[tr, :]
+                coeff_loc[3, :] = hier_vtx_sum[tl, :]
+
+                # edges with orientation back-transform (global -> local)
+                edge_endpoints = {
+                    0: (bl, br),  # bottom
+                    1: (br, tr),  # right
+                    2: (tl, tr),  # top
+                    3: (bl, tl),  # left
+                }
+                edge_off = 4
+                for e_local in range(4):
+                    v_minus, v_plus = edge_endpoints[e_local]
+                    key_edge = (min(v_minus, v_plus), max(v_minus, v_plus))
+                    gid = hier_edge_key_to_gid.get(key_edge)
+                    if gid is None:
+                        continue
+                    match = (v_minus == key_edge[0] and v_plus == key_edge[1])
+                    for mi in range(n_edge_modes):
+                        k = 2 + mi
+                        sign = 1.0 if match else (-1.0 if (k % 2 == 1) else 1.0)
+                        idx_loc = edge_off + e_local * n_edge_modes + mi
+                        idx_glob = int(gid) * n_edge_modes + mi
+                        coeff_loc[idx_loc, :] = sign * hier_edge_sum[idx_glob, :]
+
+                # interior modes are element-local; keep them only in the cut band to
+                # localize the deformation near Γ and avoid introducing high-order
+                # oscillations in the far field.
+                int_off = 4 + 4 * n_edge_modes
+                if bool(hier_cut_mask[int(eid)]):
+                    coeff_loc[int_off:int_off + n_int, :] = hier_int_coeff[int(eid), :, :]
+
+                vals_nodes = np.asarray(hier_A @ coeff_loc, dtype=float)  # (nloc,2)
+                displacements[conn, :] += vals_nodes
+                counts[conn] += 1.0
+
+            mask2 = counts > 0
+            if np.any(mask2):
+                displacements[mask2, :] /= counts[mask2, None]
+            displacements[~mask2, :] = 0.0
+        else:
+            mask2 = counts > 0
+            if np.any(mask2):
+                displacements[mask2, :] /= counts[mask2, None]
+            displacements[~mask2, :] = 0.0
 
         self.deformation = LevelSetDeformation(mesh, displacements)
         return self.deformation

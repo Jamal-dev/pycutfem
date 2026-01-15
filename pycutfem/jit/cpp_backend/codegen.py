@@ -133,7 +133,12 @@ class CppCodeGen:
                 _, analytic_map, param_order = self._mirror.generate_source(
                     ir_sequence, kernel_name
                 )
-            except Exception:
+            except Exception as exc:
+                if CODEGEN_DEBUG:
+                    print(
+                        "[cpp_codegen] mirror codegen failed; "
+                        f"falling back to IR-derived param_order: {exc}"
+                    )
                 # Fall back to a minimal param_order built from the IR.
                 param_order = []
                 needs_b: set[str] = set()
@@ -182,6 +187,11 @@ class CppCodeGen:
                     )
                 if name not in param_order:
                     param_order.append(name)
+            if isinstance(op, LoadConstantArray):
+                # Mirror Numba's parameter ordering: Constant() objects are passed as
+                # runtime "jit_const_*" arrays so kernels are cacheable w.r.t. values.
+                if op.name not in param_order:
+                    param_order.append(op.name)
             if isinstance(op, LoadVariable):
                 for fn in op.field_names or []:
                     needs_g.add(f"g_{fn}")
@@ -1907,7 +1917,12 @@ class CppCodeGen:
                     if a.parent:
                         meta_parent = a.parent
                     role_out = a.role if a.role in {"test", "trial", "mixed"} else b.role
-                    if a.role in {"mixed"} and b.role in {"const"}:
+                    # Special case: when `a` is a *mixed* stack produced by something like
+                    #   dot(grad(test), trial)
+                    # it represents a stack of (n_test x n_trial) matrices over the component axis.
+                    # The subsequent dot with a value/const vector must contract that *component*
+                    # axis (linear combination), not do a spatial matrix-vector product.
+                    if a.role in {"mixed"} and b.role in {"const", "value"}:
                         emit_line(f"Eigen::MatrixXd {nm} = contract_first_first({a.name}, {b.name});")
                         push("mat", role_out, (-1, -1), meta_fn, meta_parent, meta_side, meta_fsides)
                     else:

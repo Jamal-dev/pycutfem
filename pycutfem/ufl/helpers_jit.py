@@ -715,8 +715,19 @@ def _build_jit_kernel_args(       # ← signature unchanged
             d0, d1 = int(d0_s), int(d1_s)
 
             # tiny helpers
-            def _is_ghost(pb):  # ghost precompute exports owner_* ids
-                return (pb is not None) and (("owner_pos_id" in pb) or ("owner_neg_id" in pb))
+            def _is_ghost(pb):
+                # Ghost precompute exports explicit side maps (pos_map/neg_map or per-field variants).
+                # Boundary-edge precompute also stores owner ids for convenience, so *do not*
+                # classify by owner_* keys alone.
+                if pb is None:
+                    return False
+                return any(
+                    k == "pos_map"
+                    or k == "neg_map"
+                    or k.startswith("pos_map_")
+                    or k.startswith("neg_map_")
+                    for k in pb.keys()
+                )
 
             def _pad_owner_to_union(tab: np.ndarray, side: str) -> np.ndarray:
                 """

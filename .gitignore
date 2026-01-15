@@ -207,3 +207,9 @@ scripts/
 *_results_*
 examples/meshes/
 examples/plots/
+_smoke_*/
+_tmp_*/
+_sweep_*/
+turek_2D-*/
+_sweep_results*
+examples/turek_cylinder/tmp*/

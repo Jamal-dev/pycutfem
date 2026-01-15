@@ -2021,12 +2021,12 @@ class NumbaCodeGen:
                 # ---------------------------------------------------------------------
                 # dot( grad(u_test) ,  const_vec )  ← symmetric term -> Test vec
                 # ---------------------------------------------------------------------
-                elif a.role == 'test' and a.is_gradient and b.role == 'const' and b.is_vector:
+                elif a.role == 'test' and a.is_gradient and b.role in {'const', 'value'} and b.is_vector:
                     k_comps = a.shape[0]; n_locs = a.shape[1]; d = a.shape[2]
                     if k_comps > 1: is_vector = True
                     else: is_vector = False
                     if a.shape[2] == b.shape[0]:
-                        body_lines.append("# Symmetric term: dot(grad(Test), constant vector)")
+                        body_lines.append("# Symmetric/skew term: dot(grad(Test), (constant|value) vector)")
                         body_lines.append(
                             f"{res_var} = dot_grad_basis_vector({a.var_name}, {b.var_name}, {self.dtype})"
                         )
@@ -2344,7 +2344,8 @@ class NumbaCodeGen:
                     body_lines.append(
                         f"{res_var} = dot_mixed_const({a.var_name}, {b.var_name}, {self.dtype})"
                     )
-                    res_shape = (a.shape[0], a.shape[1])
+                    # dot_mixed_const contracts over the *first* axis (k) and returns (n, m).
+                    res_shape = (a.shape[1], a.shape[2])
                     field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
                     stack.append(StackItem(var_name=res_var, role='value',
                                         shape=res_shape, is_vector=False, is_gradient=False,

@@ -466,7 +466,17 @@ class FormCompiler:
         x_phys = self.ctx.get("x_phys")
         if eid is None or x_phys is None:
             raise KeyError("Derivative requested outside element context (missing 'eid'/'x_phys').")
-        xi, eta = transform.inverse_mapping(self.me.mesh, int(eid), np.asarray(x_phys))
+        # Prefer reference coordinates when the assembler provides them.
+        # This avoids an inverse-mapping fallback that becomes invalid under
+        # isoparametric deformations (x_phys lives on the deformed geometry).
+        xi_eta = self.ctx.get("_xi_eta")
+        if xi_eta is not None:
+            try:
+                xi, eta = float(xi_eta[0]), float(xi_eta[1])
+            except Exception:
+                xi, eta = transform.inverse_mapping(self.me.mesh, int(eid), np.asarray(x_phys))
+        else:
+            xi, eta = transform.inverse_mapping(self.me.mesh, int(eid), np.asarray(x_phys))
         row = self._phys_scalar_deriv_row(field, float(xi), float(eta), ox, oy, int(eid))
 
         # If we just computed one Hessian entry and none cached yet, compute all and store
@@ -1721,19 +1731,27 @@ class FormCompiler:
         return float(h)
 
     def _visit_MeshSize(self, node: MeshSize):
-        """Pointwise mesh size (NGSolve-like) for JIT backends.
+        """Pointwise NGSolve-like `specialcf.mesh_size`.
 
-        Notes:
-          - The JIT backends handle this symbolically; this Python visitor is a
-            best-effort fallback for the pure-Python backend.
-          - With deformation active, the Python backend does not currently keep
-            (xi,eta) and Jt in the context, so we fall back to `CellDiameter`.
+        JIT backends lower this symbolically to `factor*sqrt(|detJ|)` at the QP.
+        For the Python backend we evaluate the same formula when the assembler
+        provides `ctx['detJ']` for the current QP, otherwise we fall back to an
+        element-wise `CellDiameter`.
         """
         if self._is_jit_backend():
             # JIT compilers lower MeshSize directly; return a harmless scalar here.
             return 1.0
 
-        # Python backend: approximate with cell diameter (element-wise).
+        detJ = self.ctx.get("detJ")
+        if detJ is not None:
+            try:
+                det = float(detJ)
+            except Exception:
+                det = float(np.asarray(detJ).reshape(()))
+            factor = 2.0 if getattr(self.me.mesh, "element_type", "tri") == "quad" else 1.0
+            return factor * float(np.sqrt(abs(det)))
+
+        # Python backend fallback: element-wise diameter.
         return self._visit_CellDiameter(CellDiameter())
 
 
@@ -2171,6 +2189,10 @@ class FormCompiler:
                 logger.info(f"Assembling interior-facet integral: {integral} with backend {self.backend}")
                 self._assemble_interior_edge(integral, target)
                 continue
+            if integral.measure.domain_type == "cut_interior_facet":
+                logger.info(f"Assembling cut interior-facet integral: {integral} with backend {self.backend}")
+                self._assemble_cut_interior_edge(integral, target)
+                continue
             if integral.measure.domain_type == "exterior_facet":
                 logger.info(f"Assembling exterior-facet integral: {integral} with backend {self.backend}")
                 # print(f"Assembling exterior-facet integral with backend {self.backend}")
@@ -2518,7 +2540,7 @@ class FormCompiler:
         - curved geometry     : quadrature order inflated by mesh.poly_order
         """
         import numpy as np
-        from pycutfem.ufl.helpers import normalize_elem_ids
+        from pycutfem.ufl.helpers import normalize_elem_ids, _trial_test
 
         mesh   = self.me.mesh
         rhs    = self.ctx.get("rhs", False)
@@ -2528,6 +2550,19 @@ class FormCompiler:
         self.ctx["measure_side"] = None          # no LS side here
 
         logger.info(f"Assembling volume integral: {integral}")
+
+        # --- functional detection (structure-based) ---
+        trial, test = _trial_test(integral.integrand)
+        hook = self._hook_for(integral.integrand)
+        is_pure_functional = (trial is None) and (test is None)
+        accumulate_scalar = is_pure_functional and (hook is not None)
+        if is_pure_functional and hook is None:
+            raise ValueError(
+                "Pure functionals on the python backend require an assembler hook "
+                "(e.g. assemble_form(..., assembler_hooks={integrand:{'name':'I'}}))."
+            )
+        if accumulate_scalar:
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], 0.0)
 
         # --- element restriction via 'defined_on' (BitSet / mask / ids / tag / int)
         allowed = normalize_elem_ids(mesh, getattr(integral.measure, "defined_on", None))
@@ -2544,11 +2579,14 @@ class FormCompiler:
 
         qp, qw = volume(mesh.element_type, q_order)
 
-        # local block shape == full mixed-element local size (matches visitor output)
-        loc_shape = (self.me.n_dofs_local,) if rhs else (self.me.n_dofs_local, self.me.n_dofs_local)
+        loc_shape = None
+        if not accumulate_scalar:
+            loc_shape = (self.me.n_dofs_local,) if rhs else (self.me.n_dofs_local, self.me.n_dofs_local)
 
         for eid in elem_ids:
-            loc = np.zeros(loc_shape, dtype=float)
+            loc = None
+            if not accumulate_scalar:
+                loc = np.zeros(loc_shape, dtype=float)
 
             for (xi, eta), w in zip(qp, qw):
                 J     = transform.jacobian(mesh, eid, (xi, eta))
@@ -2567,10 +2605,24 @@ class FormCompiler:
                 self.ctx["x_phys"] = transform.x_mapping(mesh, eid, (xi, eta))
 
                 integrand_val = self._visit(integral.integrand)
-                loc += (w * detJ) * integrand_val
-
-            # full-size local block → scatter against ALL element DOFs
-            self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
+                if accumulate_scalar:
+                    val_data = getattr(integrand_val, "data", integrand_val)
+                    val_arr = np.asarray(val_data, dtype=float)
+                    if val_arr.ndim == 0:
+                        val = float(val_arr)
+                    else:
+                        val_arr = val_arr.reshape(-1)
+                        if val_arr.size != 1:
+                            raise ValueError(
+                                f"Pure functional integrand must be scalar; got shape {val_arr.shape}."
+                            )
+                        val = float(val_arr[0])
+                    self.ctx["scalar_results"][hook["name"]] += float(w * detJ) * val
+                else:
+                    loc += (w * detJ) * integrand_val
+            if not accumulate_scalar:
+                # full-size local block → scatter against ALL element DOFs
+                self._scatter_local(eid, loc, fields=None, matvec=matvec, rhs=rhs)
 
         # cleanup
         for k in ("eid", "x_phys", "is_interface"):
@@ -2982,8 +3034,26 @@ class FormCompiler:
         need_o4 = any((dx + dy) >= 4 for (dx, dy) in derivs)
 
         qdeg_base = max(self._find_q_order(intg), 2 * max_total + 4)
-        p_geo = int(getattr(mesh, "poly_order", 1))
-        qdeg = qdeg_base + max(0, p_geo - 1)
+        p_geo_mesh = int(getattr(mesh, "poly_order", 1))
+        qdeg = qdeg_base + max(0, p_geo_mesh - 1)
+
+        # Geometry mode for facet patches (mirrors DofHandler.precompute_facet_patch_factors):
+        # For curved/isoparametric meshes, polynomial extension far outside the reference
+        # cell can make the inverse map ill-conditioned and lead to huge basis/gradient
+        # values. Since facet-patch terms are stabilizations (not consistency-critical),
+        # we default to an affine, corner-based geometry map when p_geo>1.
+        _geo_mode = os.getenv("PYCUTFEM_FACET_PATCH_GEO_MODE", "").strip().lower()
+        use_affine_geo = bool(p_geo_mesh > 1)
+        if _geo_mode:
+            if _geo_mode in {"iso", "isoparametric", "curved"}:
+                use_affine_geo = False
+            elif _geo_mode in {"affine", "linear"}:
+                use_affine_geo = True
+        if use_affine_geo and (
+            getattr(mesh, "corner_connectivity", None) is None or getattr(mesh, "element_type", "") not in {"quad", "tri"}
+        ):
+            use_affine_geo = False
+        p_geo_eval = 1 if use_affine_geo else p_geo_mesh
 
         fields = set(self._fields_for(intg.integrand))
         trial, test = _trial_test(intg.integrand)
@@ -3216,9 +3286,18 @@ class FormCompiler:
                 xi = float(geom_entry.get("xi", xi))
                 eta = float(geom_entry.get("eta", eta))
             except Exception:
-                xi, eta = float(xi), float(eta)
+                pass
         else:
-            xi, eta = float(xi), float(eta)
+            # Element-local deformation jets (e.g. cut-volume integrals).
+            deform_elem = self.ctx.get("_deformation_current_elem")
+            if isinstance(deform_elem, dict):
+                geom_jets = deform_elem.get("jets")
+                try:
+                    xi = float(deform_elem.get("xi", xi))
+                    eta = float(deform_elem.get("eta", eta))
+                except Exception:
+                    pass
+        xi, eta = float(xi), float(eta)
 
         # order 0: just values in reference
         if ox == 0 and oy == 0:
@@ -3790,13 +3869,21 @@ class FormCompiler:
 
     def _assemble_facet_patch_python(self, intg: "Integral", matvec):
         """
-        Assemble NGSolve-style facet-patch integrals (pure Python path).
+        Assemble facet-patch (two-element) integrals (pure Python path).
 
         The patch quadrature is built by taking a volume rule on each of the
         two facet-adjacent elements and mapping each point to the neighbor
         element such that the *physical* coordinates match. The mapped
-        reference coordinates are generally outside the reference cell and
-        yield polynomial extensions (matching NGSXFEM's `dFacetPatch`).
+        reference coordinates are generally outside the reference cell; when
+        basis functions are evaluated there, this is a *polynomial extension*
+        of the element shape functions across the shared facet.
+
+        Mathematical motivation
+        -----------------------
+        Patch/extension-based facet integrals are a standard stabilization tool
+        in unfitted FEM: they couple small cut cells to their neighbors and
+        provide uniform control of jumps/penalties without depending on the
+        possibly tiny physical intersection K∩Ω.
         """
         import numpy as np
         from collections import defaultdict
@@ -3822,8 +3909,26 @@ class FormCompiler:
         derivs |= {(0, 0), (1, 0), (0, 1)}
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
         qdeg_base = max(self._find_q_order(intg), 2 * max_total + 4)
-        p_geo = int(getattr(mesh, "poly_order", 1))
-        qdeg = qdeg_base + max(0, p_geo - 1)
+        p_geo_mesh = int(getattr(mesh, "poly_order", 1))
+        qdeg = qdeg_base + max(0, p_geo_mesh - 1)
+
+        # Geometry mode for facet patches (mirrors DofHandler.precompute_facet_patch_factors):
+        # For curved/isoparametric meshes, polynomial extension far outside the reference
+        # cell can make the inverse map ill-conditioned and lead to huge basis/gradient
+        # values. Since facet-patch terms are stabilizations (not consistency-critical),
+        # we default to an affine, corner-based geometry map when p_geo>1.
+        _geo_mode = os.getenv("PYCUTFEM_FACET_PATCH_GEO_MODE", "").strip().lower()
+        use_affine_geo = bool(p_geo_mesh > 1)
+        if _geo_mode:
+            if _geo_mode in {"iso", "isoparametric", "curved"}:
+                use_affine_geo = False
+            elif _geo_mode in {"affine", "linear"}:
+                use_affine_geo = True
+        if use_affine_geo and (
+            getattr(mesh, "corner_connectivity", None) is None or getattr(mesh, "element_type", "") not in {"quad", "tri"}
+        ):
+            use_affine_geo = False
+        p_geo_eval = 1 if use_affine_geo else p_geo_mesh
 
         # Which facets form patches?
         edge_ids = normalize_edge_ids(mesh, intg.measure.defined_on)
@@ -3855,26 +3960,114 @@ class FormCompiler:
         qref = np.asarray(qref, dtype=float)
         wref = np.asarray(wref, dtype=float).ravel()
 
-        ref_geom = transform.get_reference(mesh.element_type, p_geo)
+        ref_geom = transform.get_reference(mesh.element_type, p_geo_eval)
 
         def _invmap_coords(coords_def: np.ndarray, x_target: np.ndarray, xi0: np.ndarray) -> np.ndarray:
-            """Newton inverse map for deformed element geometry (coords_def)."""
-            xi_eta = np.asarray(xi0, dtype=float).copy()
+            """
+            Robust Newton inverse map for deformed element geometry (coords_def).
+
+            For facet-patch quadrature we intentionally allow (ξ,η) outside [-1,1]^2
+            (polynomial extension). Under deformation, a plain Newton update can
+            occasionally diverge and produce huge reference coordinates, which in
+            turn yields astronomically large basis/gradient values and breaks the
+            facet-patch Jacobian.
+            """
+            xi_eta = np.asarray(xi0, dtype=float).reshape(2,).copy()
+            x_target = np.asarray(x_target, dtype=float).reshape(2,)
+            if not np.isfinite(xi_eta).all() or not np.isfinite(x_target).all():
+                return xi_eta
+
+            # Allow moderate extension outside the reference cell, but avoid blow-up.
+            max_abs = float(os.getenv("PYCUTFEM_FACET_PATCH_INV_MAXABS", "20.0"))
+            max_step = float(os.getenv("PYCUTFEM_FACET_PATCH_INV_MAXSTEP", "2.0"))
+            tol = 1e-12
+
+            best = xi_eta.copy()
+            best_r = np.inf
             for _ in range(40):
                 xi, eta = float(xi_eta[0]), float(xi_eta[1])
                 N = np.asarray(ref_geom.shape(xi, eta), dtype=float).ravel()
                 dN = np.asarray(ref_geom.grad(xi, eta), dtype=float)
                 X = N @ coords_def
+                rhs = x_target - np.asarray(X, dtype=float).reshape(2,)
+                rnorm = float(np.linalg.norm(rhs))
+                if rnorm < best_r:
+                    best_r = rnorm
+                    best[:] = xi_eta
+                if rnorm < tol:
+                    break
+
                 J = coords_def.T @ dN
-                rhs = np.asarray(x_target, dtype=float) - np.asarray(X, dtype=float)
                 try:
                     delta = np.linalg.solve(J, rhs)
                 except np.linalg.LinAlgError:
                     delta = np.linalg.lstsq(J, rhs, rcond=None)[0]
-                xi_eta += delta
-                if float(np.linalg.norm(delta)) < 1e-12:
+                delta = np.asarray(delta, dtype=float).reshape(2,)
+
+                dnorm = float(np.linalg.norm(delta))
+                if not np.isfinite(dnorm):
                     break
-            return xi_eta
+                if dnorm > max_step and dnorm > 0.0:
+                    delta *= max_step / dnorm
+
+                xi_eta_next = xi_eta + delta
+                if not np.isfinite(xi_eta_next).all():
+                    break
+                if max_abs > 0.0:
+                    xi_eta_next = np.clip(xi_eta_next, -max_abs, max_abs)
+
+                if float(np.linalg.norm(xi_eta_next - xi_eta)) < tol:
+                    xi_eta = xi_eta_next
+                    break
+                xi_eta = xi_eta_next
+
+            return best
+
+        def _affine_data(coords: np.ndarray):
+            coords = np.asarray(coords, dtype=float)
+            if mesh.element_type == "quad":
+                if coords.shape[0] < 4:
+                    raise ValueError("quad affine geometry requires 4 corner coordinates.")
+                x0 = coords[0]
+                e1 = coords[1] - x0
+                e2 = coords[3] - x0
+            else:
+                if coords.shape[0] < 3:
+                    raise ValueError("tri affine geometry requires 3 corner coordinates.")
+                x0 = coords[0]
+                e1 = coords[1] - x0
+                e2 = coords[2] - x0
+
+            B = np.stack((e1, e2), axis=1)
+            detB = float(np.linalg.det(B))
+            try:
+                Binv = np.linalg.inv(B)
+            except np.linalg.LinAlgError:
+                Binv = np.linalg.pinv(B)
+
+            if mesh.element_type == "quad":
+                detJ_aff = 0.25 * detB
+                Jinv_aff = 2.0 * Binv
+            else:
+                detJ_aff = detB
+                Jinv_aff = Binv
+            return x0, e1, e2, detJ_aff, Jinv_aff, Binv
+
+        if mesh.element_type == "quad":
+            def _map_aff(x0: np.ndarray, e1: np.ndarray, e2: np.ndarray, xi: float, eta: float) -> np.ndarray:
+                return x0 + 0.5 * (float(xi) + 1.0) * e1 + 0.5 * (float(eta) + 1.0) * e2
+        else:
+            def _map_aff(x0: np.ndarray, e1: np.ndarray, e2: np.ndarray, xi: float, eta: float) -> np.ndarray:
+                return x0 + float(xi) * e1 + float(eta) * e2
+
+        if mesh.element_type == "quad":
+            def _invmap_aff(x0: np.ndarray, Binv: np.ndarray, x: np.ndarray) -> np.ndarray:
+                tu = Binv @ (np.asarray(x, dtype=float).reshape(2,) - x0)
+                return np.array([2.0 * float(tu[0]) - 1.0, 2.0 * float(tu[1]) - 1.0], dtype=float)
+        else:
+            def _invmap_aff(x0: np.ndarray, Binv: np.ndarray, x: np.ndarray) -> np.ndarray:
+                st = Binv @ (np.asarray(x, dtype=float).reshape(2,) - x0)
+                return np.array([float(st[0]), float(st[1])], dtype=float)
 
         try:
             for gid in edge_ids:
@@ -3931,8 +4124,12 @@ class FormCompiler:
                     normal_base = np.array([t[1], -t[0]], dtype=float)
 
                 # Geometry nodes and (optional) deformation
-                pos_conn = np.asarray(mesh.elements_connectivity[pos_eid], dtype=int)
-                neg_conn = np.asarray(mesh.elements_connectivity[neg_eid], dtype=int)
+                if use_affine_geo:
+                    pos_conn = np.asarray(mesh.corner_connectivity[pos_eid], dtype=int)
+                    neg_conn = np.asarray(mesh.corner_connectivity[neg_eid], dtype=int)
+                else:
+                    pos_conn = np.asarray(mesh.elements_connectivity[pos_eid], dtype=int)
+                    neg_conn = np.asarray(mesh.elements_connectivity[neg_eid], dtype=int)
                 coords_pos_geom = np.asarray(mesh.nodes_x_y_pos[pos_conn], dtype=float)
                 coords_neg_geom = np.asarray(mesh.nodes_x_y_pos[neg_conn], dtype=float)
                 if deformation is not None:
@@ -3950,6 +4147,11 @@ class FormCompiler:
                     np.zeros(len(global_dofs)) if rhs else np.zeros((len(global_dofs), len(global_dofs)))
                 )
 
+                # Precompute affine inverse Jacobians for the stabilization geometry path.
+                if use_affine_geo:
+                    x0_pos, e1_pos, e2_pos, detJ_pos, Jinv_pos, Binv_pos = _affine_data(coords_pos_def)
+                    x0_neg, e1_neg, e2_neg, detJ_neg, Jinv_neg, Binv_neg = _affine_data(coords_neg_def)
+
                 # Build the facet patch: points from pos + points from neg.
                 for origin_side in ("+", "-"):
                     origin_eid = pos_eid if origin_side == "+" else neg_eid
@@ -3960,21 +4162,32 @@ class FormCompiler:
 
                     for (xi0, eta0), w in zip(qref, wref):
                         xi0 = float(xi0); eta0 = float(eta0)
-                        N = np.asarray(ref_geom.shape(xi0, eta0), dtype=float).ravel()
-                        dN = np.asarray(ref_geom.grad(xi0, eta0), dtype=float)
-                        x_origin = N @ coords_origin_def
-
-                        # detJ on origin element provides physical weight
-                        J0 = coords_origin_def.T @ dN
-                        det0 = float(np.linalg.det(J0))
-                        w_eff = float(w) * abs(det0)
-
-                        if deformation is None:
-                            xi_eta_other = transform.inverse_mapping(mesh, int(other_eid), np.asarray(x_origin, dtype=float))
+                        if use_affine_geo:
+                            if origin_side == "+":
+                                x_origin = _map_aff(x0_pos, e1_pos, e2_pos, xi0, eta0)
+                                w_eff = float(w) * abs(float(detJ_pos))
+                                x0o, Binvo = (x0_neg, Binv_neg)
+                            else:
+                                x_origin = _map_aff(x0_neg, e1_neg, e2_neg, xi0, eta0)
+                                w_eff = float(w) * abs(float(detJ_neg))
+                                x0o, Binvo = (x0_pos, Binv_pos)
+                            xi_eta_other = _invmap_aff(x0o, Binvo, np.asarray(x_origin, dtype=float))
                         else:
-                            x_base = N @ coords_origin_geom
-                            xi_guess = transform.inverse_mapping(mesh, int(other_eid), np.asarray(x_base, dtype=float))
-                            xi_eta_other = _invmap_coords(coords_other_def, np.asarray(x_origin, dtype=float), np.asarray(xi_guess, dtype=float))
+                            N = np.asarray(ref_geom.shape(xi0, eta0), dtype=float).ravel()
+                            dN = np.asarray(ref_geom.grad(xi0, eta0), dtype=float)
+                            x_origin = N @ coords_origin_def
+
+                            # detJ on origin element provides physical weight
+                            J0 = coords_origin_def.T @ dN
+                            det0 = float(np.linalg.det(J0))
+                            w_eff = float(w) * abs(det0)
+
+                            if deformation is None:
+                                xi_eta_other = transform.inverse_mapping(mesh, int(other_eid), np.asarray(x_origin, dtype=float))
+                            else:
+                                x_base = N @ coords_origin_geom
+                                xi_guess = transform.inverse_mapping(mesh, int(other_eid), np.asarray(x_base, dtype=float))
+                                xi_eta_other = _invmap_coords(coords_other_def, np.asarray(x_origin, dtype=float), np.asarray(xi_guess, dtype=float))
 
                         # Assign (xi,eta) per side in the compiler's (+)/(-) convention
                         if origin_side == "+":
@@ -3985,7 +4198,13 @@ class FormCompiler:
                             xi_pos = float(xi_eta_other[0]); eta_pos = float(xi_eta_other[1])
 
                         # Geometry jets / inverse Jacobians for derivative mapping
-                        if deformation is not None:
+                        if use_affine_geo:
+                            Ji_pos = np.asarray(Jinv_pos, dtype=float)
+                            Ji_neg = np.asarray(Jinv_neg, dtype=float)
+                            deform_ctx_entry = None
+                            x_pos = np.asarray(x_origin, dtype=float)
+                            x_neg = np.asarray(x_origin, dtype=float)
+                        elif deformation is not None:
                             jets_pos = self._build_inverse_jets(ref_geom, coords_pos_def, xi_pos, eta_pos, upto=max_total)
                             jets_neg = self._build_inverse_jets(ref_geom, coords_neg_def, xi_neg, eta_neg, upto=max_total)
                             Ji_pos = jets_pos["A"]
@@ -4653,6 +4872,8 @@ class FormCompiler:
         rhs = bool(self.ctx.get("rhs", False))
         mesh, me, dh = self.me.mesh, self.me, self.dh
         md = intg.measure.metadata or {}
+        deformation = getattr(intg.measure, "deformation", None)
+        ref_geom = transform.get_reference(mesh.element_type, int(getattr(mesh, "poly_order", 1))) if deformation is not None else None
 
         self.ctx["is_interface"] = False
         self.ctx["is_ghost"] = True
@@ -4733,14 +4954,74 @@ class FormCompiler:
                 else:
                     normal = np.asarray(normal, dtype=float)
 
+                # Base unit tangent and orientation vector (used only when deformation is active).
+                tau = np.asarray(p1, float) - np.asarray(p0, float)
+                tau_unit = tau / (float(np.linalg.norm(tau)) + 1e-30)
+                orient_vec = np.asarray(mesh.elements_list[pos_eid].centroid(), float) - np.asarray(
+                    mesh.elements_list[neg_eid].centroid(), float
+                )
+
+                if deformation is not None:
+                    conn_pos = np.asarray(mesh.elements_connectivity[pos_eid], dtype=int)
+                    conn_neg = np.asarray(mesh.elements_connectivity[neg_eid], dtype=int)
+                    Upos = np.asarray(deformation.node_displacements[conn_pos], dtype=float)
+                    Uneg = np.asarray(deformation.node_displacements[conn_neg], dtype=float)
+
                 for x_phys, w in zip(qpts_phys, qwts):
                     xi_pos, eta_pos = transform.inverse_mapping(mesh, pos_eid, np.asarray(x_phys, float))
                     xi_neg, eta_neg = transform.inverse_mapping(mesh, neg_eid, np.asarray(x_phys, float))
 
                     J_pos = transform.jacobian(mesh, pos_eid, (float(xi_pos), float(eta_pos)))
                     J_neg = transform.jacobian(mesh, neg_eid, (float(xi_neg), float(eta_neg)))
+                    # Default: undeformed geometry.
                     Ji_pos = np.linalg.inv(J_pos)
                     Ji_neg = np.linalg.inv(J_neg)
+                    w_eff = float(w)
+                    normal_here = normal
+                    x_phys_pos = np.asarray(x_phys, float)
+                    x_phys_neg = np.asarray(x_phys, float)
+                    x_phys_use = np.asarray(x_phys, float)
+
+                    if deformation is not None:
+                        if ref_geom is None:
+                            raise RuntimeError("ref_geom missing for deformed interior facet assembly")
+
+                        invJg_pos = np.linalg.inv(J_pos)
+                        invJg_neg = np.linalg.inv(J_neg)
+
+                        dN_pos = np.asarray(ref_geom.grad(float(xi_pos), float(eta_pos)), float)
+                        dN_neg = np.asarray(ref_geom.grad(float(xi_neg), float(eta_neg)), float)
+                        Jd_pos = Upos.T @ dN_pos
+                        Jd_neg = Uneg.T @ dN_neg
+                        Jt_pos = J_pos + Jd_pos
+                        Jt_neg = J_neg + Jd_neg
+                        Ji_pos = np.linalg.inv(Jt_pos)
+                        Ji_neg = np.linalg.inv(Jt_neg)
+
+                        # Stretch factor for ds on the deformed facet: ‖(I+∇u) τ̂‖
+                        F_pos = Jt_pos @ invJg_pos
+                        F_neg = Jt_neg @ invJg_neg
+                        Ftau_pos = F_pos @ tau_unit
+                        Ftau_neg = F_neg @ tau_unit
+                        stretch = 0.5 * (float(np.linalg.norm(Ftau_pos)) + float(np.linalg.norm(Ftau_neg)))
+                        w_eff = float(w) * max(stretch, 1e-16)
+
+                        tau_eff = 0.5 * (Ftau_pos + Ftau_neg)
+                        nvec = np.array([tau_eff[1], -tau_eff[0]], dtype=float)
+                        nn = float(np.linalg.norm(nvec))
+                        if nn > 1e-30:
+                            nvec /= nn
+                        if float(np.dot(nvec, orient_vec)) < 0.0:
+                            nvec *= -1.0
+                        normal_here = nvec
+
+                        N_pos = np.asarray(ref_geom.shape(float(xi_pos), float(eta_pos)), float).ravel()
+                        N_neg = np.asarray(ref_geom.shape(float(xi_neg), float(eta_neg)), float).ravel()
+                        x_base_pos = np.asarray(transform.x_mapping(mesh, pos_eid, (float(xi_pos), float(eta_pos))), float)
+                        x_base_neg = np.asarray(transform.x_mapping(mesh, neg_eid, (float(xi_neg), float(eta_neg))), float)
+                        x_phys_pos = x_base_pos + N_pos @ Upos
+                        x_phys_neg = x_base_neg + N_neg @ Uneg
+                        x_phys_use = 0.5 * (x_phys_pos + x_phys_neg)
 
                     self.ctx["basis_values"] = {"+": {}, "-": {}}
                     for f in fields:
@@ -4763,10 +5044,10 @@ class FormCompiler:
                             "eid": pos_eid,
                             "pos_eid": pos_eid,
                             "neg_eid": neg_eid,
-                            "normal": normal,
-                            "x_phys": np.asarray(x_phys, float),
-                            "x_phys_pos": np.asarray(x_phys, float),
-                            "x_phys_neg": np.asarray(x_phys, float),
+                            "normal": np.asarray(normal_here, float),
+                            "x_phys": np.asarray(x_phys_use, float),
+                            "x_phys_pos": np.asarray(x_phys_pos, float),
+                            "x_phys_neg": np.asarray(x_phys_neg, float),
                             "phi_val": 0.0,
                             "global_dofs": global_dofs,
                             "pos_map": pos_map,
@@ -4782,7 +5063,7 @@ class FormCompiler:
                     )
 
                     val = self._visit(intg.integrand)
-                    w = float(w)
+                    w = float(w_eff)
                     if is_functional:
                         data = val.data if isinstance(val, VecOpInfo) else val
                         arr = np.asarray(data, dtype=float)
@@ -4920,6 +5201,420 @@ class FormCompiler:
             self._assemble_interior_edge_python(intg, matvec)
         elif self._is_jit_backend():
             self._assemble_interior_edge_jit(intg, matvec)
+        else:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
+
+    def _assemble_cut_interior_edge_python(self, intg: Integral, matvec):
+        """
+        Assemble integrals over the *cut part* of interior facets (CutFEM skeleton).
+
+        Requires:
+          - measure.level_set
+          - measure.metadata['side'] in {'+','-'}
+
+        This measure represents a facet integral restricted to one side of a
+        level set:
+
+            ∫_{F_h ∩ Ω^±} f ds,
+
+        where F_h is a chosen subset of interior facets and Ω^± = {φ ≶ 0}.
+        Facet-based stabilizations (CIP/ghost penalties) are naturally written
+        in this form because they penalize jumps across mesh facets while
+        remaining consistent with the physical subdomain.
+        """
+        rhs = bool(self.ctx.get("rhs", False))
+        mesh, me, dh = self.me.mesh, self.me, self.dh
+        md = intg.measure.metadata or {}
+        deformation = getattr(intg.measure, "deformation", None)
+        ref_geom = transform.get_reference(mesh.element_type, int(getattr(mesh, "poly_order", 1))) if deformation is not None else None
+
+        level_set = getattr(intg.measure, "level_set", None)
+        if level_set is None:
+            raise ValueError("cut_interior_facet measure requires a 'level_set' callable.")
+        side_md = md.get("side")
+        if side_md not in ("+", "-"):
+            raise ValueError("cut_interior_facet measure requires metadata['side'] in {'+','-'}")
+
+        self.ctx["is_interface"] = False
+        self.ctx["is_ghost"] = True
+        self.ctx["measure_side"] = side_md
+
+        # Derivative-aware quadrature order (do not inflate beyond explicit md['q'])
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0), (1, 0), (0, 1)}
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = self._find_q_order(intg)
+        # Only apply a safety floor when the user did not explicitly request a quadrature order.
+        if not any(k in md for k in ("quad_degree", "quad_order", "q")):
+            qdeg = max(int(qdeg), 2 * max_total + 4)
+
+        # dCutSkeleton is a *facet* measure clipped by the level set.
+        # Any mesh-dependent scaling (e.g. h^k factors in CIP/ghost-penalty terms)
+        # belongs in the weak form, not in the definition of the measure.
+
+        # Edge selection
+        edge_ids = normalize_edge_ids(mesh, intg.measure.defined_on)
+        if edge_ids is None:
+            edge_ids = [int(e.gid) for e in mesh.edges_list if e.right is not None]
+        edge_ids = [int(eid) for eid in edge_ids]
+
+        fields = set(self._fields_for(intg.integrand))
+        trial, test = _trial_test(intg.integrand)
+        for tt in (trial, test):
+            if tt is None:
+                continue
+            if hasattr(tt, "field_names"):
+                fields.update(tt.field_names)
+            elif hasattr(tt, "field_name"):
+                fields.add(tt.field_name)
+        if not fields:
+            fields = set(getattr(dh, "field_names", []))
+        fields = sorted(fields)
+
+        hook = self._hook_for(intg.integrand)
+        is_functional = hook is not None and trial is None and test is None
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], None)
+
+        tol = float(SIDE.tol)
+        try:
+            for edge_id in edge_ids:
+                e = mesh.edge(int(edge_id))
+                if e.right is None:
+                    continue
+
+                pos_eid = int(e.right)
+                neg_eid = int(e.left)
+
+                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+                a0 = np.asarray(p0, float)
+                a1 = np.asarray(p1, float)
+                a0_orig = a0.copy()
+                a1_orig = a1.copy()
+
+                phi0 = phi_eval(level_set, a0, eid=neg_eid, mesh=mesh)
+                phi1 = phi_eval(level_set, a1, eid=neg_eid, mesh=mesh)
+
+                if side_md == "+":
+                    in0 = phi0 >= -tol
+                    in1 = phi1 >= -tol
+                else:
+                    in0 = phi0 <= tol
+                    in1 = phi1 <= tol
+
+                if (not in0) and (not in1):
+                    a1 = a0  # empty
+                elif in0 and in1:
+                    pass
+                elif in0 != in1:
+                    denom = float(phi0 - phi1)
+                    t = 0.5 if abs(denom) <= 1e-30 else float(phi0 / denom)
+                    t = float(min(max(t, 0.0), 1.0))
+                    pc = a0_orig + t * (a1_orig - a0_orig)
+                    if in0 and (not in1):
+                        a1 = pc
+                    elif (not in0) and in1:
+                        a0 = pc
+
+                qpts_phys, qw = line_quadrature(a0, a1, qdeg)
+
+                pos_dofs = dh.get_elemental_dofs(pos_eid)
+                neg_dofs = dh.get_elemental_dofs(neg_eid)
+                global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+                pos_map = np.searchsorted(global_dofs, pos_dofs)
+                neg_map = np.searchsorted(global_dofs, neg_dofs)
+
+                pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
+                    dh, fields, pos_eid, neg_eid, global_dofs
+                )
+
+                if is_functional:
+                    acc = None
+                else:
+                    n = len(global_dofs)
+                    acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
+
+                normal = getattr(e, "normal", None)
+                if normal is None:
+                    tangent = a1 - a0
+                    normal = np.array([tangent[1], -tangent[0]], dtype=float)
+                    nrm = np.linalg.norm(normal)
+                    if nrm > 0.0:
+                        normal /= nrm
+                else:
+                    normal = np.asarray(normal, dtype=float)
+
+                # Base unit tangent (on the cut segment) and orientation vector (used only when deformation is active).
+                tau = np.asarray(a1, float) - np.asarray(a0, float)
+                tau_unit = tau / (float(np.linalg.norm(tau)) + 1e-30)
+                orient_vec = np.asarray(mesh.elements_list[pos_eid].centroid(), float) - np.asarray(
+                    mesh.elements_list[neg_eid].centroid(), float
+                )
+
+                if deformation is not None:
+                    conn_pos = np.asarray(mesh.elements_connectivity[pos_eid], dtype=int)
+                    conn_neg = np.asarray(mesh.elements_connectivity[neg_eid], dtype=int)
+                    Upos = np.asarray(deformation.node_displacements[conn_pos], dtype=float)
+                    Uneg = np.asarray(deformation.node_displacements[conn_neg], dtype=float)
+
+                for x_phys, w_eff in zip(qpts_phys, qw):
+                    xi_pos, eta_pos = transform.inverse_mapping(mesh, pos_eid, np.asarray(x_phys, float))
+                    xi_neg, eta_neg = transform.inverse_mapping(mesh, neg_eid, np.asarray(x_phys, float))
+
+                    J_pos = transform.jacobian(mesh, pos_eid, (float(xi_pos), float(eta_pos)))
+                    J_neg = transform.jacobian(mesh, neg_eid, (float(xi_neg), float(eta_neg)))
+                    Ji_pos = np.linalg.inv(J_pos)
+                    Ji_neg = np.linalg.inv(J_neg)
+                    normal_here = normal
+                    x_phys_pos = np.asarray(x_phys, float)
+                    x_phys_neg = np.asarray(x_phys, float)
+                    x_phys_use = np.asarray(x_phys, float)
+                    det_pos = abs(float(np.linalg.det(J_pos)))
+                    det_neg = abs(float(np.linalg.det(J_neg)))
+                    w_eff = float(w_eff)
+
+                    if deformation is not None:
+                        if ref_geom is None:
+                            raise RuntimeError("ref_geom missing for deformed cut interior facet assembly")
+
+                        invJg_pos = np.linalg.inv(J_pos)
+                        invJg_neg = np.linalg.inv(J_neg)
+
+                        dN_pos = np.asarray(ref_geom.grad(float(xi_pos), float(eta_pos)), float)
+                        dN_neg = np.asarray(ref_geom.grad(float(xi_neg), float(eta_neg)), float)
+                        Jd_pos = Upos.T @ dN_pos
+                        Jd_neg = Uneg.T @ dN_neg
+                        Jt_pos = J_pos + Jd_pos
+                        Jt_neg = J_neg + Jd_neg
+                        Ji_pos = np.linalg.inv(Jt_pos)
+                        Ji_neg = np.linalg.inv(Jt_neg)
+                        det_pos = abs(float(np.linalg.det(Jt_pos)))
+                        det_neg = abs(float(np.linalg.det(Jt_neg)))
+
+                        F_pos = Jt_pos @ invJg_pos
+                        F_neg = Jt_neg @ invJg_neg
+                        Ftau_pos = F_pos @ tau_unit
+                        Ftau_neg = F_neg @ tau_unit
+
+                        tau_eff = 0.5 * (Ftau_pos + Ftau_neg)
+                        stretch = 0.5 * (float(np.linalg.norm(Ftau_pos)) + float(np.linalg.norm(Ftau_neg)))
+                        w_eff *= max(stretch, 1e-16)
+
+                        nvec = np.array([tau_eff[1], -tau_eff[0]], dtype=float)
+                        nn = float(np.linalg.norm(nvec))
+                        if nn > 1e-30:
+                            nvec /= nn
+                        if float(np.dot(nvec, orient_vec)) < 0.0:
+                            nvec *= -1.0
+                        normal_here = nvec
+
+                        N_pos = np.asarray(ref_geom.shape(float(xi_pos), float(eta_pos)), float).ravel()
+                        N_neg = np.asarray(ref_geom.shape(float(xi_neg), float(eta_neg)), float).ravel()
+                        x_base_pos = np.asarray(transform.x_mapping(mesh, pos_eid, (float(xi_pos), float(eta_pos))), float)
+                        x_base_neg = np.asarray(transform.x_mapping(mesh, neg_eid, (float(xi_neg), float(eta_neg))), float)
+                        x_phys_pos = x_base_pos + N_pos @ Upos
+                        x_phys_neg = x_base_neg + N_neg @ Uneg
+                        x_phys_use = 0.5 * (x_phys_pos + x_phys_neg)
+
+                    det_avg = 0.5 * float(det_pos + det_neg)
+
+                    self.ctx["basis_values"] = {"+": {}, "-": {}}
+                    for f in fields:
+                        v_pos = me.basis(f, float(xi_pos), float(eta_pos))
+                        g_pos = me.grad_basis(f, float(xi_pos), float(eta_pos)) @ Ji_pos
+                        v_neg = me.basis(f, float(xi_neg), float(eta_neg))
+                        g_neg = me.grad_basis(f, float(xi_neg), float(eta_neg)) @ Ji_neg
+
+                        slotp = self.ctx["basis_values"]["+"].setdefault(f, {})
+                        slotn = self.ctx["basis_values"]["-"].setdefault(f, {})
+                        slotp[(0, 0)] = v_pos
+                        slotp[(1, 0)] = g_pos[:, 0]
+                        slotp[(0, 1)] = g_pos[:, 1]
+                        slotn[(0, 0)] = v_neg
+                        slotn[(1, 0)] = g_neg[:, 0]
+                        slotn[(0, 1)] = g_neg[:, 1]
+
+                    self.ctx.update(
+                        {
+                            "eid": pos_eid,
+                            "pos_eid": pos_eid,
+                            "neg_eid": neg_eid,
+                            "normal": np.asarray(normal_here, float),
+                            "x_phys": np.asarray(x_phys_use, float),
+                            "x_phys_pos": np.asarray(x_phys_pos, float),
+                            "x_phys_neg": np.asarray(x_phys_neg, float),
+                            "phi_val": 0.0,
+                            "detJ": float(det_avg),
+                            "global_dofs": global_dofs,
+                            "pos_map": pos_map,
+                            "neg_map": neg_map,
+                            "pos_map_by_field": pos_map_by_field,
+                            "neg_map_by_field": neg_map_by_field,
+                            "use_union_local_dofs": False,
+                            "_xi_eta_cache": {
+                                "+": (float(xi_pos), float(eta_pos)),
+                                "-": (float(xi_neg), float(eta_neg)),
+                            },
+                        }
+                    )
+
+                    val = self._visit(intg.integrand)
+                    if is_functional:
+                        data = val.data if isinstance(val, VecOpInfo) else val
+                        arr = np.asarray(data, dtype=float)
+                        if acc is None:
+                            acc = np.zeros_like(arr, dtype=float)
+                        acc += w_eff * arr
+                    else:
+                        arr = lhs_num(val)
+                        arr = np.asarray(arr)
+                        if rhs and arr.ndim == 2 and 1 in arr.shape:
+                            arr = arr.reshape(-1)
+                        acc += w_eff * arr
+
+                if is_functional:
+                    results = self.ctx.setdefault("scalar_results", {})
+                    if results.get(hook["name"]) is None or (
+                        isinstance(results.get(hook["name"]), (int, float)) and isinstance(acc, np.ndarray)
+                    ):
+                        results[hook["name"]] = np.zeros_like(acc, dtype=float)
+                    results[hook["name"]] += acc
+                else:
+                    if rhs:
+                        np.add.at(matvec, global_dofs, acc)
+                    else:
+                        rr, cc = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                        matvec[rr, cc] += acc
+        finally:
+            for k in (
+                "basis_values",
+                "normal",
+                "phi_val",
+                "x_phys",
+                "x_phys_pos",
+                "x_phys_neg",
+                "global_dofs",
+                "pos_map",
+                "neg_map",
+                "pos_eid",
+                "neg_eid",
+                "eid",
+                "pos_map_by_field",
+                "neg_map_by_field",
+                "use_union_local_dofs",
+                "measure_side",
+                "detJ",
+                "_xi_eta_cache",
+            ):
+                self.ctx.pop(k, None)
+            self.ctx.pop("is_ghost", None)
+            self.ctx.pop("is_interface", None)
+
+    def _assemble_cut_interior_edge_jit(self, intg: Integral, matvec):
+        mesh, dh, me = self.me.mesh, self.dh, self.me
+
+        md = intg.measure.metadata or {}
+        level_set = getattr(intg.measure, "level_set", None)
+        if level_set is None:
+            raise ValueError("cut_interior_facet measure requires a 'level_set' callable.")
+        side = md.get("side")
+        if side not in ("+", "-"):
+            raise ValueError("cut_interior_facet measure requires metadata['side'] in {'+','-'}")
+
+        edge_ids = intg.measure.defined_on
+        if edge_ids is None:
+            edge_ids = [int(e.gid) for e in mesh.edges_list if e.right is not None]
+        elif hasattr(edge_ids, "cardinality") and edge_ids.cardinality() == 0:
+            return
+
+        on_facet = intg.measure.on_facet
+        runner, ir = self._compile_backend(intg.integrand, dh, me, on_facet=on_facet)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = self._find_q_order(intg)
+        if not any(k in md for k in ("quad_degree", "quad_order", "q")):
+            qdeg = max(int(qdeg), 2 * max_total + 4)
+
+        geo = dh.precompute_interior_factors(
+            edge_ids=edge_ids,
+            qdeg=qdeg,
+            derivs=derivs,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            reuse=True,
+            deformation=getattr(intg.measure, "deformation", None),
+            level_set=level_set,
+            side=str(side),
+        )
+        geo["is_interface"] = False
+        geo["is_ghost"] = False
+
+        valid_eids = geo.get("eids")
+        if valid_eids is None or len(valid_eids) == 0:
+            return
+
+        kernel_args = _build_jit_kernel_args(
+            ir=ir,
+            expression=intg.integrand,
+            mixed_element=me,
+            q_order=qdeg,
+            dof_handler=dh,
+            gdofs_map=geo["gdofs_map"],
+            param_order=runner.param_order,
+            pre_built=geo,
+        )
+
+        active_fields = _active_field_order(ir, me)
+        active_cols = _active_columns(me, active_fields)
+        use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me.n_dofs_local)
+        if not use_full_union:
+            kernel_args = _compress_static_for_active(kernel_args, me, active_cols)
+            geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+
+        if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+            kernel_args["node_coords"] = np.asarray(mesh.nodes_x_y_pos, dtype=float)
+        if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+            kernel_args["element_nodes"] = np.asarray(mesh.elements_connectivity, dtype=np.int64)
+
+        req = set(getattr(runner, "param_order", []))
+        for side_key in ("pos", "neg"):
+            for t in ("Hxi0", "Hxi1", "Txi0", "Txi1", "Qxi0", "Qxi1"):
+                need_key = f"{side_key}_{t}"
+                if (need_key in req) and (need_key not in kernel_args) and (t in geo):
+                    kernel_args[need_key] = geo[t]
+
+        current_funcs = self._get_data_functions_objs(intg)
+        K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
+
+        hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_edge, hook):
+            return
+
+        _scatter_element_contribs(
+            K_edge,
+            F_edge,
+            J_edge,
+            valid_eids,
+            geo["gdofs_map"],
+            matvec,
+            self.ctx,
+            intg.integrand,
+            hook=hook,
+        )
+
+    def _assemble_cut_interior_edge(self, intg: Integral, matvec):
+        trial, test = _trial_test(intg.integrand)
+        if trial is None and test is None and self._is_jit_backend():
+            self._assemble_cut_interior_edge_python(intg, matvec)
+            return
+        if self.backend == "python":
+            self._assemble_cut_interior_edge_python(intg, matvec)
+        elif self._is_jit_backend():
+            self._assemble_cut_interior_edge_jit(intg, matvec)
         else:
             raise ValueError(
                 f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
@@ -5245,6 +5940,7 @@ class FormCompiler:
         mesh      = self.me.mesh
         level_set = integral.measure.level_set
         deformation = getattr(integral.measure, "deformation", None)
+        md = getattr(integral.measure, "metadata", None) or {}
         if level_set is None:
             raise ValueError("Cut-cell volume assembly requires measure.level_set")
 
@@ -5299,11 +5995,21 @@ class FormCompiler:
         # print(f"Volume integral on {len(inside_ids)} inside,"
         #       f" {len(outside_ids)} outside,"
         #       f" {len(cut_ids)} cut elements (after 'defined_on' filter).")
-        # --- quadrature orders (account for geometry order)
-        q_base  = int(self._find_q_order(integral))
-        p_geo   = int(getattr(mesh, "poly_order", 1))
-        q_infl  = 2 * max(0, p_geo - 1)
-        q_order = q_base + q_infl
+        # --- quadrature order (match JIT cut-volume precompute which inflates for geometry order)
+        q_order = int(self._find_q_order(integral))
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        q_order += 2 * max(0, p_geo - 1)
+
+        # Derivatives required by the integrand (used for deformation-aware jets in Python).
+        req_derivs = set(md.get("derivs", set())) | set(required_multi_indices(integral.integrand))
+        max_total = max((ox + oy for (ox, oy) in req_derivs), default=0)
+        need_geom_jets = (deformation is not None) and (max_total >= 2)
+        if max_total <= 2:
+            jets_upto = 2
+        elif max_total == 3:
+            jets_upto = 3
+        else:
+            jets_upto = 4
 
         # reference rule on parent element
         qp_ref, qw_ref = _vol_rule(mesh.element_type, q_order)
@@ -5341,6 +6047,14 @@ class FormCompiler:
             acc = 0.0
         for eid in full_eids:
             loc = np.zeros(loc_shape_full, dtype=float)
+            conn = None
+            Uloc = None
+            coords_def = None
+            if deformation is not None:
+                conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
+                Uloc = np.asarray(deformation.node_displacements[conn], float)
+                if need_geom_jets:
+                    coords_def = np.asarray(mesh.nodes_x_y_pos[conn], float) + Uloc
             for (xi, eta), w in zip(qp_ref, qw_ref):
                 Jg = transform.jacobian(mesh, int(eid), (float(xi), float(eta)))
                 xg = transform.x_mapping(mesh, int(eid), (float(xi), float(eta)))
@@ -5349,9 +6063,7 @@ class FormCompiler:
                     Ji = np.linalg.inv(Jg)
                     y  = xg
                 else:
-                    conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
                     dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
-                    Uloc = np.asarray(deformation.node_displacements[conn], float)
                     Jd   = Uloc.T @ dN
                     Jt   = Jg + Jd
                     det_t = abs(float(np.linalg.det(Jt)))
@@ -5368,6 +6080,17 @@ class FormCompiler:
 
                 self.ctx["eid"]    = int(eid)
                 self.ctx["x_phys"] = np.asarray(y, float)
+                self.ctx["detJ"]   = float(det_t)
+                self.ctx["_xi_eta"] = (float(xi), float(eta))
+                if need_geom_jets and coords_def is not None:
+                    jets = self._build_inverse_jets(ref_geom, coords_def, float(xi), float(eta), upto=jets_upto)
+                    self.ctx["_deformation_current_elem"] = {
+                        "xi": float(xi),
+                        "eta": float(eta),
+                        "jets": jets,
+                    }
+                else:
+                    self.ctx.pop("_deformation_current_elem", None)
 
                 val = self._visit(integral.integrand)
                 if is_pure_functional:
@@ -5383,7 +6106,7 @@ class FormCompiler:
         # --- 2) CUT elements: subset-sized loc, scatter fields=fields
         if fld_local_idx.size == 0 or len(fields) == 0:
             # Nothing to assemble for cut cells if no participating fields
-            for key in ("eid", "x_phys", "phi_val", "measure_side", "side"):
+            for key in ("eid", "x_phys", "phi_val", "measure_side", "side", "detJ", "_xi_eta", "_deformation_current_elem"):
                 self.ctx.pop(key, None)
             return
 
@@ -5429,6 +6152,15 @@ class FormCompiler:
                             continue
                         alpha_elem[f] = alpha_from_side_masks(pm, nm, side=side)
             try:
+                conn = None
+                Uloc = None
+                coords_def = None
+                if deformation is not None:
+                    conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
+                    Uloc = np.asarray(deformation.node_displacements[conn], float)
+                    if need_geom_jets:
+                        coords_def = np.asarray(mesh.nodes_x_y_pos[conn], float) + Uloc
+
 
                 if mesh.element_type == 'quad':
                     order_y = max(2, q_order // 2)
@@ -5445,9 +6177,7 @@ class FormCompiler:
                                 Ji = np.linalg.inv(Jg)
                                 y  = xg
                             else:
-                                conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
                                 dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
-                                Uloc = np.asarray(deformation.node_displacements[conn], float)
                                 Jd   = Uloc.T @ dN
                                 Jt   = Jg + Jd
                                 det_t = abs(float(np.linalg.det(Jt)))
@@ -5479,6 +6209,17 @@ class FormCompiler:
                                     }
                             self.ctx["eid"]    = int(eid)
                             self.ctx["x_phys"] = np.asarray(y, float)
+                            self.ctx["detJ"]   = float(det_t)
+                            self.ctx["_xi_eta"] = (float(xi), float(eta))
+                            if need_geom_jets and coords_def is not None:
+                                jets = self._build_inverse_jets(ref_geom, coords_def, float(xi), float(eta), upto=jets_upto)
+                                self.ctx["_deformation_current_elem"] = {
+                                    "xi": float(xi),
+                                    "eta": float(eta),
+                                    "jets": jets,
+                                }
+                            else:
+                                self.ctx.pop("_deformation_current_elem", None)
 
                             val = self._visit(integral.integrand)
                             if is_pure_functional:
@@ -5507,18 +6248,18 @@ class FormCompiler:
                     for x_phys, w in zip(qx, qw):
                         xi, eta = transform.inverse_mapping(mesh, eid, x_phys)
                         Jg  = transform.jacobian(mesh, eid, (xi, eta))
+                        det_g = abs(float(np.linalg.det(Jg)))
                         if deformation is None:
                             Ji = np.linalg.inv(Jg)
                             y  = np.asarray(x_phys, float)
                             w_eff = float(w)
+                            det_t = det_g
                         else:
-                            conn = np.asarray(mesh.elements_connectivity[int(eid)], dtype=int)
                             dN   = np.asarray(ref_geom.grad(float(xi), float(eta)), float)
-                            Uloc = np.asarray(deformation.node_displacements[conn], float)
                             Jd   = Uloc.T @ dN
                             Jt   = Jg + Jd
                             det_t = abs(float(np.linalg.det(Jt)))
-                            det_g = abs(float(np.linalg.det(Jg))) + 1e-300
+                            det_g = det_g + 1e-300
                             Ji = np.linalg.inv(Jt)
                             y  = transform.x_mapping(mesh, int(eid), (float(xi), float(eta))) \
                                  + deformation.displacement_ref(int(eid), (float(xi), float(eta)))
@@ -5551,6 +6292,17 @@ class FormCompiler:
                         self.ctx["x_phys"]       = np.asarray(y, float)
                         self.ctx["phi_val"]      = 1.0 if side == '+' else -1.0
                         self.ctx["measure_side"] = side
+                        self.ctx["detJ"]         = float(det_t)
+                        self.ctx["_xi_eta"] = (float(xi), float(eta))
+                        if need_geom_jets and coords_def is not None:
+                            jets = self._build_inverse_jets(ref_geom, coords_def, float(xi), float(eta), upto=jets_upto)
+                            self.ctx["_deformation_current_elem"] = {
+                                "xi": float(xi),
+                                "eta": float(eta),
+                                "jets": jets,
+                            }
+                        else:
+                            self.ctx.pop("_deformation_current_elem", None)
 
                         val = self._visit(integral.integrand)
                         if is_pure_functional:
@@ -5576,7 +6328,7 @@ class FormCompiler:
         if accumulate_scalar:
             self.ctx['scalar_results'][hook['name']] += acc
         # cleanup
-        for key in ("eid", "x_phys", "phi_val", "measure_side", "side"):
+        for key in ("eid", "x_phys", "phi_val", "measure_side", "side", "detJ", "_xi_eta", "_deformation_current_elem"):
             self.ctx.pop(key, None)
 
 
@@ -5717,6 +6469,19 @@ class FormCompiler:
                 "J_inv_pos": geo_all["J_inv"][full_ids],
                 "J_inv_neg": geo_all["J_inv"][full_ids],
             }
+            # Higher-order inverse-map jets (required for Hessian / 3rd / 4th derivatives).
+            if need_hess:
+                if "Hxi0" in geo_all and "Hxi1" in geo_all:
+                    prebuilt_full["Hxi0"] = geo_all["Hxi0"][full_ids]
+                    prebuilt_full["Hxi1"] = geo_all["Hxi1"][full_ids]
+            if need_o3:
+                if "Txi0" in geo_all and "Txi1" in geo_all:
+                    prebuilt_full["Txi0"] = geo_all["Txi0"][full_ids]
+                    prebuilt_full["Txi1"] = geo_all["Txi1"][full_ids]
+            if need_o4:
+                if "Qxi0" in geo_all and "Qxi1" in geo_all:
+                    prebuilt_full["Qxi0"] = geo_all["Qxi0"][full_ids]
+                    prebuilt_full["Qxi1"] = geo_all["Qxi1"][full_ids]
             if qref_slice is not None:
                 prebuilt_full["qref"] = qref_slice
             _run_subset(full_ids, prebuilt_full, runner=runner_full, ir=ir_full, me_used=me, active_cols=active_cols_full)

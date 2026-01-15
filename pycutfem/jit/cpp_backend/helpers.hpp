@@ -781,9 +781,16 @@ inline Eigen::MatrixXd dot_grad_basis_vector(const std::vector<Eigen::MatrixXd>&
     int k = static_cast<int>(grad_basis.size());
     if (k == 0) return Eigen::MatrixXd();
     int n = static_cast<int>(grad_basis[0].rows());
+    int d = static_cast<int>(grad_basis[0].cols());
+    if (vec.size() != d) {
+        throw std::runtime_error("dot_grad_basis_vector: vector length must match gradient columns");
+    }
     Eigen::MatrixXd out(k, n);
     for (int c = 0; c < k; ++c) {
-        out.row(c) = grad_basis[c] * vec;
+        if (grad_basis[c].rows() != n || grad_basis[c].cols() != d) {
+            throw std::runtime_error("dot_grad_basis_vector: inconsistent grad_basis matrix shapes");
+        }
+        out.row(c) = (grad_basis[c] * vec).transpose();
     }
     return out;
 }
