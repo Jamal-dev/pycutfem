@@ -1,6 +1,60 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+"""
+CutFEM cylinder benchmark (DFG / Schäfer–Turek).
+
+This script supports both:
+- **constant** parabolic inflow (DFG benchmark 2D-2 style), and
+- **dfg** time-dependent inflow ramp (DFG benchmark 2D-3 style): `U(t)=0.2+0.8*sin(pi t/8)`.
+
+Recommended run commands (fastest: compiled C++ backend)
+--------------------------------------------------------
+Run in the `xfemcustom` conda environment:
+
+Constant inflow (good for debug / term-by-term parity):
+  conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py \\
+    --backend cpp --with-deformation --inflow constant --init stokes \\
+    --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 1e-2 \\
+    --dt 0.01 --theta 0.5 --max-steps 600 --vtk-every 20 --level 3
+
+DFG time-dependent inflow (target for the benchmark 2D-3 setup; runs to t=8):
+  conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py \\
+    --backend cpp --with-deformation --inflow dfg --init stokes \\
+    --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 1e-2 \\
+    --dt 0.005 --theta 0.5 --max-steps 1600 --vtk-every 20 --level 3
+
+Mesh level sweep (levels 1..6)
+------------------------------
+Each `--level k` uses a reproducible (nx, ny, refine-level) preset and writes to
+a dedicated output directory (see below). Example sweep:
+
+  for lv in 1 2 3 4 5 6; do
+    conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py \\
+      --backend cpp --with-deformation --inflow dfg --init stokes \\
+      --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 1e-2 \\
+      --dt 0.005 --theta 0.5 --max-steps 1600 --vtk-every 50 --level ${lv}
+  done
+
+Outputs / VTK
+-------------
+- Output directory:
+  - without `--level`: `examples/turek_cylinder/turek_results/`
+  - with `--level k`:  `examples/turek_cylinder/turek_results_lv{k}/`
+- `functionals.csv` is written at the end of the run (Cd/Cl/dp evaluated at `t_{n+theta}`).
+- Enable VTU output via `--vtk-every N`:
+  - `--vtk-every 0`: disable VTU output
+  - `--vtk-every 1`: write every step
+  - `--vtk-every 20`: write every 20 steps (recommended for long runs)
+  VTU files are written as `solution_####.vtu` inside the output folder.
+
+Comparing to bundled FeatFlow reference
+---------------------------------------
+After a run, compare against the reference data (same `--level`):
+  conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/compare_featflow.py \\
+    --level 3 --sim examples/turek_cylinder/turek_results_lv3/functionals.csv
+"""
+
 # # Test case 2D-2 (unsteady)
 
 # In[1]:
