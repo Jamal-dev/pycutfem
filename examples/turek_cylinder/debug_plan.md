@@ -262,3 +262,22 @@ Quick validation (volume-only, structured O-grid, coarse, cpp backend):
 - Run: `examples/turek_benchmark_volume_only.py` with `--mesh-size 0.05 --dt 0.01 --max-steps 500 --inflow constant --init stokes`.
 - Last-cycle window (T≈0.33): `Cl_min≈-1.028`, `Cl_max≈1.003` (close to FeatFlow’s ~±1), with extrema separated by ~`0.18s` (close to the expected ~`0.165s` half-period).
 - Cd is still low on this coarse mesh (`Cd_mean≈2.79` vs FeatFlow ~`3.13`), but the **Cl amplitude is now in-family**.
+
+---
+
+## 2026-01-16 (DFG 2D-1 steady Re=20: force validation)
+
+Motivation:
+- Before tuning the full unsteady Re=100 case, validate drag/lift/Δp evaluation against a *steady* reference (fast feedback).
+
+Reference (DFG benchmark 1, Re=20):
+- `Cd=5.57953523384`, `Cl=0.010618948146`, `pdiff=0.11752016697`.
+
+CutFEM run (cpp backend, `--benchmark 2d-1`, level 4, Q2/Q1, isoparametric deformation):
+- With ghost penalty `--gamma-gp 1e-2`: **biased** results (`Cd≈4.586`, `dp≈0.066`), i.e. too much artificial dissipation.
+- With ghost penalty disabled `--gamma-gp 0`: matches reference closely:
+  - `Cd≈5.564533`, `Cl≈0.009129`, `dp≈0.117815` (absolute errors: `1.5e-2`, `1.5e-3`, `3e-4`).
+
+Conclusion:
+- Surface traction postprocessing (DFG stress `σ := ν∇u − pI` with cylinder outward normal) is consistent.
+- For 2D-1, ghost penalty must be **off or extremely small**; otherwise it changes the physical forces noticeably.

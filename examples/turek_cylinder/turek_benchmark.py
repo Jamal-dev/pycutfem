@@ -4,23 +4,34 @@
 """
 CutFEM cylinder benchmark (DFG / Schäfer–Turek).
 
-This script supports both:
-- **constant** parabolic inflow (DFG benchmark 2D-2 style), and
-- **dfg** time-dependent inflow ramp (DFG benchmark 2D-3 style): `U(t)=0.2+0.8*sin(pi t/8)`.
+This script supports the DFG variants via `--benchmark`:
+- `--benchmark 2d-1`: steady Navier–Stokes (Re=20)
+- `--benchmark 2d-2`: unsteady, constant inflow (Re=100)
+- `--benchmark 2d-3`: unsteady, time-dependent inflow (Re=100)
+
+The inflow is selected with `--inflow`:
+- `--inflow constant`: constant parabolic profile
+- `--inflow dfg`: time-dependent ramp (FeatFlow-style): `U(t)=0.2+0.8*sin(pi t/8)`
 
 Recommended run commands (fastest: compiled C++ backend)
 --------------------------------------------------------
 Run in the `xfemcustom` conda environment:
 
+DFG 2D-1 (steady, Re=20):
+  conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py \\
+    --benchmark 2d-1 --backend cpp --with-deformation --init stokes \\
+    --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 0 \\
+    --force-eval surface --disable-mass --theta 1 --max-steps 1 --vtk-every 0 --level 4
+
 Constant inflow (good for debug / term-by-term parity):
   conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py \\
-    --backend cpp --with-deformation --inflow constant --init stokes \\
+    --benchmark 2d-2 --backend cpp --with-deformation --inflow constant --init stokes \\
     --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 1e-2 \\
-    --dt 0.01 --theta 0.5 --max-steps 600 --vtk-every 20 --level 3
+    --dt 0.01 --theta 0.5 --max-steps 600 --vtk-every 20 --level 3 --newton-tol 1e-8
 
 DFG time-dependent inflow (target for the benchmark 2D-3 setup; runs to t=8):
   conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py \\
-    --backend cpp --with-deformation --inflow dfg --init stokes \\
+    --benchmark 2d-3 --backend cpp --with-deformation --inflow dfg --init stokes \\
     --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 1e-2 \\
     --dt 0.005 --theta 0.5 --max-steps 1600 --vtk-every 20 --level 3
 
@@ -31,7 +42,7 @@ a dedicated output directory (see below). Example sweep:
 
   for lv in 1 2 3 4 5 6; do
     conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py \\
-      --backend cpp --with-deformation --inflow dfg --init stokes \\
+      --benchmark 2d-3 --backend cpp --with-deformation --inflow dfg --init stokes \\
       --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 1e-2 \\
       --dt 0.005 --theta 0.5 --max-steps 1600 --vtk-every 50 --level ${lv}
   done
@@ -67,6 +78,7 @@ import scipy.sparse.linalg as sp_la
 import numba
 import os
 import argparse
+import sys
 
 # --- Numba configuration ---
 try:
@@ -103,9 +115,15 @@ from pathlib import Path
 # ============================================================================
 #    1. BENCHMARK PROBLEM SETUP
 # ============================================================================
-print("--- Setting up the Turek benchmark (2D-2) for flow around a cylinder ---")
+print("--- Setting up the Turek benchmark (DFG) for flow around a cylinder ---")
 
-parser = argparse.ArgumentParser(description="CutFEM Turek benchmark (2D-2)")
+parser = argparse.ArgumentParser(description="CutFEM Turek benchmark (DFG cylinder)")
+parser.add_argument(
+    "--benchmark",
+    choices=("2d-1", "2d-2", "2d-3"),
+    default="2d-2",
+    help="DFG benchmark variant: 2d-1 (steady, Re=20), 2d-2 (unsteady constant inflow, Re=100), 2d-3 (unsteady ramp inflow, Re=100).",
+)
 parser.add_argument("--with-deformation", action="store_true", help="enable isoparametric deformation for the cut geometry")
 parser.add_argument("--no-deformation", action="store_true", help="disable the deformation even if enabled elsewhere")
 parser.add_argument(
@@ -201,9 +219,14 @@ args, _ = parser.parse_known_args()
 if args.with_deformation and args.no_deformation:
     raise SystemExit("Choose at most one of --with-deformation or --no-deformation")
 
+def _argv_has(flag: str) -> bool:
+    return any(a == flag or a.startswith(flag + "=") for a in sys.argv[1:])
+
 with_deformation = args.with_deformation and not args.no_deformation
 print(f"with_deformation = {with_deformation}")
 print(f"backend = {args.backend}")
+benchmark = str(args.benchmark)
+print(f"benchmark = {benchmark}")
 
 # Optional plotting setup (imports deferred to save startup time when disabled)
 ENABLE_PLOTS = bool(args.plot)
@@ -255,6 +278,28 @@ disable_mass = bool(args.disable_mass)
 disable_convection = bool(args.disable_convection)
 convection_form = str(args.convection_form)
 
+if benchmark == "2d-1":
+    # DFG 2D-1 is a stationary (steady) Navier–Stokes solve at Re=20.
+    # Apply steady defaults unless the user explicitly overrides them.
+    # Also, disable ghost-penalty stabilization by default for accuracy on 2D-1
+    # (it acts like extra dissipation and biases Cd/dp unless very small).
+    if not _argv_has("--gamma-gp"):
+        args.gamma_gp = 0.0
+        if args.gamma_gp_p is None and not _argv_has("--gamma-gp-p"):
+            gamma_gp_p_val = 0.0
+    if not _argv_has("--disable-mass"):
+        disable_mass = True
+    if not _argv_has("--theta"):
+        theta_val = 1.0
+    if not _argv_has("--max-steps"):
+        max_time_steps = 1
+    if not _argv_has("--dt"):
+        dt_val = 0.5
+    if not _argv_has("--init"):
+        init_mode = "stokes"
+    if not _argv_has("--inflow"):
+        inflow_mode = "constant"
+
 if args.clear_jit_cache:
     import shutil
     cache_root = os.path.expanduser("~/.cache/pycutfem_jit")
@@ -269,11 +314,15 @@ D = 0.1   # Cylinder diameter
 c_x, c_y = 0.2, 0.2  # Cylinder center
 rho = 1.0  # Density
 mu = 1e-3  # Viscosity
-# DFG/FeatFlow convention:
-# - Mean inflow velocity U_mean = 1.0
-# - Parabolic inflow reaches U_max = 1.5 at the channel centerline
-U_mean = 1.0
-U_max = 1.5
+# DFG/FeatFlow conventions:
+# - 2d-1 (Re=20):  U_mean=0.2, U_max=0.3, nu=1e-3  -> Re = U_mean*D/nu = 20
+# - 2d-2/2d-3 (Re=100): U_mean=1.0, U_max=1.5, nu=1e-3 -> Re = 100
+if benchmark == "2d-1":
+    U_mean = 0.2
+    U_max = 0.3
+else:
+    U_mean = 1.0
+    U_max = 1.5
 Re = rho * U_mean * D / mu
 geom_order = 2 if with_deformation else 1
 print(f"Reynolds number (Re): {Re:.2f}")
@@ -1991,6 +2040,20 @@ def _finalize_outputs(status: str) -> None:
         print(f"[turek] wrote {csv_path}")
     except Exception as exc:
         print(f"[turek] failed to write functionals.csv: {exc}")
+    if benchmark == "2d-1":
+        # DFG 2D-1 reference values (high-order spectral methods, see FeatFlow page).
+        ref_cd = 5.57953523384
+        ref_cl = 0.010618948146
+        ref_dp = 0.11752016697
+        try:
+            cd = float(histories.get("cd_surf", [float("nan")])[-1])
+            cl = float(histories.get("cl_surf", [float("nan")])[-1])
+            dp = float(histories.get("dp", [float("nan")])[-1])
+            print(f"[DFG 2D-1 ref]   Cd={ref_cd:.12f}  Cl={ref_cl:.12f}  dp={ref_dp:.12f}")
+            print(f"[DFG 2D-1 last]  Cd={cd:.12f}  Cl={cl:.12f}  dp={dp:.12f}")
+            print(f"[DFG 2D-1 |err|] Cd={abs(cd-ref_cd):.3e}  Cl={abs(cl-ref_cl):.3e}  dp={abs(dp-ref_dp):.3e}")
+        except Exception as exc:
+            print(f"[DFG 2D-1] failed to summarize reference errors: {exc}")
     try:
         plotting()
     except Exception as exc:
