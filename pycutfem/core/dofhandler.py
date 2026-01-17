@@ -40,6 +40,7 @@ BcLike = Union[BoundaryCondition, Mapping[str, Any]]
 _edge_geom_cache: dict[tuple[int,int,int], dict] = {}
 _ghost_cache: dict[tuple, dict] = {}
 _facet_patch_cache: dict[tuple, dict] = {}
+_facet_patch_geo_cache: dict[tuple, dict] = {}
 _jacobian_cache: dict[tuple, dict] = {}
 _interior_cache: dict[tuple, dict] = {}
 
@@ -70,6 +71,47 @@ def _pc_print(tag: str, dt: float, **info) -> None:
                 continue
         extra = "  " + " ".join(parts) if parts else ""
     print(f"[precompute] {tag}: {dt:.3f}s{extra}")
+
+def _facet_patch_cache_max_entries() -> int:
+    """
+    Full facet-patch outputs can be very large (nE*nQ*n_union per field/deriv).
+    In time-dependent runs the level-set token changes every refresh, so caching
+    every snapshot can quickly blow memory. Keep this cache bounded.
+    """
+    try:
+        return int(os.getenv("PYCUTFEM_FACET_PATCH_CACHE_MAX", "1") or 1)
+    except Exception:
+        return 1
+
+def _facet_patch_cache_put(key, value) -> None:
+    max_entries = _facet_patch_cache_max_entries()
+    if max_entries <= 0:
+        return
+    _facet_patch_cache.pop(key, None)
+    _facet_patch_cache[key] = value
+    while len(_facet_patch_cache) > max_entries:
+        try:
+            _facet_patch_cache.pop(next(iter(_facet_patch_cache)))
+        except Exception:
+            break
+
+def _facet_patch_geo_cache_max_entries() -> int:
+    try:
+        return int(os.getenv("PYCUTFEM_FACET_PATCH_GEO_CACHE_MAX", "4") or 4)
+    except Exception:
+        return 4
+
+def _facet_patch_geo_cache_put(key, value) -> None:
+    max_entries = _facet_patch_geo_cache_max_entries()
+    if max_entries <= 0:
+        return
+    _facet_patch_geo_cache.pop(key, None)
+    _facet_patch_geo_cache[key] = value
+    while len(_facet_patch_geo_cache) > max_entries:
+        try:
+            _facet_patch_geo_cache.pop(next(iter(_facet_patch_geo_cache)))
+        except Exception:
+            break
 
 
 class LinearConstraints:
@@ -149,6 +191,7 @@ def clear_caches() -> None:
     _edge_geom_cache.clear()
     _ghost_cache.clear()
     _facet_patch_cache.clear()
+    _facet_patch_geo_cache.clear()
     _jacobian_cache.clear()
     _interior_cache.clear()
     # Lazily created caches (defined on first use).
@@ -4550,6 +4593,9 @@ class DofHandler:
         from pycutfem.integration.quadrature import volume as vol_rule
         from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
 
+        _prof = _pc_enabled()
+        _t0 = time.perf_counter() if _prof else 0.0
+
         mesh = self.mixed_element.mesh
         me = self.mixed_element
         fields = me.field_names
@@ -4604,6 +4650,15 @@ class DofHandler:
                     out[f"r{dx}{dy}_{fld}_neg"] = np.empty((0, 0, n_union_default), dtype=float)
                 out[f"restrict_mask_{fld}_pos"] = np.empty((0, n_union_default), dtype=float)
                 out[f"restrict_mask_{fld}_neg"] = np.empty((0, n_union_default), dtype=float)
+            if _prof:
+                _pc_print(
+                    "facet_patch_factors(empty)",
+                    time.perf_counter() - _t0,
+                    nE=0,
+                    nQ=0,
+                    q=int(qdeg),
+                    deform=bool(deformation is not None),
+                )
             return out
 
         # Union maps (same as ghost-edge, but patch quadrature differs).
@@ -4625,9 +4680,11 @@ class DofHandler:
 
         n_union = int(max_union)
 
+        edges_gid_tuple = tuple(int(e.gid) for e in edges)
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
-        cache_key = (
-            facet_gid_tuple,
+        _geo_mode_key = os.getenv("PYCUTFEM_FACET_PATCH_GEO_MODE", "").strip().lower()
+        geo_cache_key = (
+            edges_gid_tuple,
             int(qdeg),
             me.signature(),
             int(n_union),
@@ -4635,13 +4692,253 @@ class DofHandler:
             getattr(self, "_method_token", self.method),
             bool(allow_interface),
             int(getattr(mesh, "poly_order", 1)),
-            os.getenv("PYCUTFEM_FACET_PATCH_GEO_MODE", "").strip().lower(),
+            _geo_mode_key,
+            _def_fingerprint(deformation),
+            _coords_fingerprint(mesh.nodes_x_y_pos),
+        )
+        cache_key = (
+            edges_gid_tuple,
+            int(qdeg),
+            me.signature(),
+            int(n_union),
+            derivs_key,
+            getattr(self, "_method_token", self.method),
+            bool(allow_interface),
+            int(getattr(mesh, "poly_order", 1)),
+            _geo_mode_key,
             _ls_fingerprint(level_set),
             _def_fingerprint(deformation),
             _coords_fingerprint(mesh.nodes_x_y_pos),
         )
         if reuse and cache_key in _facet_patch_cache:
-            return _facet_patch_cache[cache_key]
+            out = _facet_patch_cache[cache_key]
+            # LRU touch
+            try:
+                _facet_patch_cache_put(cache_key, out)
+            except Exception:
+                pass
+            if _prof:
+                try:
+                    nE_out = int(np.asarray(out.get("qp_phys")).shape[0])
+                    nQ_out = int(np.asarray(out.get("qp_phys")).shape[1])
+                except Exception:
+                    nE_out = -1
+                    nQ_out = -1
+                _pc_print(
+                    "facet_patch_factors(cache)",
+                    time.perf_counter() - _t0,
+                    nE=nE_out,
+                    nQ=nQ_out,
+                    q=int(qdeg),
+                    deform=bool(deformation is not None),
+                )
+            return out
+
+        # Fast path: reuse cached geometry/basis tables (independent of the level set),
+        # then refresh only the level-set dependent arrays (per-field masks + φ values).
+        geom_cached = None
+        if reuse:
+            geom_cached = _facet_patch_geo_cache.get(geo_cache_key)
+
+            # If the ghost-edge set changes slightly after a refresh, try to reuse a cached
+            # superset and subset rows. This avoids re-running the expensive facet-patch
+            # inverse-mapping/basis tabulation for almost-identical edge selections.
+            if geom_cached is None and _facet_patch_geo_cache:
+                req_eids = np.asarray(edges_gid_tuple, dtype=np.int32)
+                suffix = geo_cache_key[1:]
+                for k_alt, v_alt in _facet_patch_geo_cache.items():
+                    try:
+                        if not isinstance(k_alt, tuple) or len(k_alt) != len(geo_cache_key):
+                            continue
+                        if k_alt[1:] != suffix:
+                            continue
+                        eids_cached = np.asarray(v_alt.get("eids", []), dtype=np.int32)
+                        if eids_cached.size < req_eids.size:
+                            continue
+
+                        idx = None
+                        if eids_cached.size == 0:
+                            idx = np.zeros((0,), dtype=np.int32)
+                        elif np.all(eids_cached[:-1] <= eids_cached[1:]):
+                            idx_try = np.searchsorted(eids_cached, req_eids)
+                            if (
+                                idx_try.size == req_eids.size
+                                and (idx_try.size == 0 or int(np.max(idx_try)) < int(eids_cached.size))
+                                and (idx_try.size == 0 or np.all(eids_cached[idx_try] == req_eids))
+                            ):
+                                idx = idx_try.astype(np.int32, copy=False)
+                        if idx is None:
+                            mapping = {int(e): i for i, e in enumerate(eids_cached.tolist())}
+                            idx_try = np.asarray([mapping.get(int(e), -1) for e in req_eids.tolist()], dtype=np.int32)
+                            if np.all(idx_try >= 0):
+                                idx = idx_try
+                        if idx is None:
+                            continue
+
+                        n_total = int(eids_cached.size)
+                        geom_subset: dict[str, Any] = {}
+                        for kk, vv in v_alt.items():
+                            if isinstance(vv, np.ndarray) and vv.ndim >= 1 and int(vv.shape[0]) == n_total:
+                                geom_subset[kk] = vv[idx]
+                            else:
+                                geom_subset[kk] = vv
+                        geom_cached = geom_subset
+                        try:
+                            _facet_patch_geo_cache_put(geo_cache_key, geom_subset)
+                        except Exception:
+                            pass
+                        break
+                    except Exception:
+                        continue
+
+        if geom_cached is not None:
+            out = dict(geom_cached)
+
+            # Per-field side masks (for Restriction masking on patch paths)
+            masks_by_field: dict[str, np.ndarray] = {}
+            mask_cache: dict[int, tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = {}
+
+            def _elem_masks(eid: int):
+                if eid not in mask_cache:
+                    mask_cache[eid] = _hfa.build_side_masks_by_field(self, fields, int(eid), level_set, tol=SIDE.tol)
+                return mask_cache[eid]
+
+            # Cached per-edge local->union maps
+            pos_map_cached = np.asarray(out.get("pos_map", np.empty((0, 0), dtype=np.int32)), dtype=np.int32)
+            neg_map_cached = np.asarray(out.get("neg_map", np.empty((0, 0), dtype=np.int32)), dtype=np.int32)
+
+            for fld in fields:
+                sl = getattr(me, "component_dof_slices", {}).get(fld, None)
+                if not isinstance(sl, slice):
+                    continue
+                pos_mask = np.zeros((nE, n_union), dtype=float)
+                neg_mask = np.zeros((nE, n_union), dtype=float)
+                for i in range(nE):
+                    pos_eid = int(pos_ids[i])
+                    neg_eid = int(neg_ids[i])
+                    (pos_masks_elem, _) = _elem_masks(pos_eid)
+                    (_, neg_masks_elem) = _elem_masks(neg_eid)
+
+                    mask_pos_local = pos_masks_elem.get(fld)
+                    if mask_pos_local is not None:
+                        cols = np.asarray(pos_map_cached[i, sl], dtype=np.int32)
+                        vals = np.asarray(mask_pos_local, dtype=float)
+                        if cols.shape[0] == vals.shape[0]:
+                            ok = cols >= 0
+                            if np.any(ok):
+                                pos_mask[i, cols[ok]] = vals[ok]
+
+                    mask_neg_local = neg_masks_elem.get(fld)
+                    if mask_neg_local is not None:
+                        cols = np.asarray(neg_map_cached[i, sl], dtype=np.int32)
+                        vals = np.asarray(mask_neg_local, dtype=float)
+                        if cols.shape[0] == vals.shape[0]:
+                            ok = cols >= 0
+                            if np.any(ok):
+                                neg_mask[i, cols[ok]] = vals[ok]
+
+                masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
+                masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
+
+            # Refresh φ values at patch quadrature points (used for refresh signatures/tests).
+            qp_phys = np.asarray(out.get("qp_phys", np.empty((0, 0, 2))), dtype=float)
+            xi_pos = np.asarray(out.get("xi_pos", np.empty((0, 0))), dtype=float)
+            eta_pos = np.asarray(out.get("eta_pos", np.empty((0, 0))), dtype=float)
+            xi_neg = np.asarray(out.get("xi_neg", np.empty((0, 0))), dtype=float)
+            eta_neg = np.asarray(out.get("eta_neg", np.empty((0, 0))), dtype=float)
+            nQ = int(qp_phys.shape[1]) if qp_phys.ndim >= 2 else 0
+            nQv = nQ // 2 if nQ else 0
+            phis_new = np.zeros((nE, nQ), dtype=float)
+
+            have_val_elem = hasattr(level_set, "value_on_element")
+            need_base_coords = (not have_val_elem) and (deformation is not None)
+            if need_base_coords:
+                p_geo_mesh = int(getattr(mesh, "poly_order", 1))
+                use_affine_geo = bool(p_geo_mesh > 1)
+                if _geo_mode_key:
+                    if _geo_mode_key in {"iso", "isoparametric", "curved"}:
+                        use_affine_geo = False
+                    elif _geo_mode_key in {"affine", "linear"}:
+                        use_affine_geo = True
+                if use_affine_geo and (
+                    getattr(mesh, "corner_connectivity", None) is None or mesh.element_type not in {"quad", "tri"}
+                ):
+                    use_affine_geo = False
+                ref_geom = get_reference(mesh.element_type, int(p_geo_mesh))
+            else:
+                use_affine_geo = False
+                ref_geom = None
+            for i in range(nE):
+                pos_eid = int(pos_ids[i])
+                neg_eid = int(neg_ids[i])
+                for q in range(nQ):
+                    if have_val_elem:
+                        if q < nQv:
+                            phis_new[i, q] = float(
+                                level_set.value_on_element(int(pos_eid), (float(xi_pos[i, q]), float(eta_pos[i, q])))
+                            )
+                        else:
+                            phis_new[i, q] = float(
+                                level_set.value_on_element(int(neg_eid), (float(xi_neg[i, q]), float(eta_neg[i, q])))
+                            )
+                    else:
+                        if deformation is None:
+                            # No mesh deformation: qp_phys is already in background coordinates.
+                            x_eval = qp_phys[i, q]
+                        else:
+                            # Evaluate φ on the *background* mesh coordinates, matching the
+                            # original facet-patch precompute behavior.
+                            if q < nQv:
+                                eid0 = int(pos_eid)
+                                xi0 = float(xi_pos[i, q])
+                                eta0 = float(eta_pos[i, q])
+                            else:
+                                eid0 = int(neg_eid)
+                                xi0 = float(xi_neg[i, q])
+                                eta0 = float(eta_neg[i, q])
+                            if use_affine_geo:
+                                conn = np.asarray(mesh.corner_connectivity[eid0], dtype=int)
+                                coords = np.asarray(mesh.nodes_x_y_pos[conn], dtype=float)
+                                x0 = coords[0]
+                                if mesh.element_type == "quad":
+                                    e1 = coords[1] - x0
+                                    e2 = coords[3] - x0
+                                    x_eval = x0 + 0.5 * (xi0 + 1.0) * e1 + 0.5 * (eta0 + 1.0) * e2
+                                else:
+                                    e1 = coords[1] - x0
+                                    e2 = coords[2] - x0
+                                    x_eval = x0 + xi0 * e1 + eta0 * e2
+                            else:
+                                conn = np.asarray(mesh.elements_connectivity[eid0], dtype=int)
+                                coords = np.asarray(mesh.nodes_x_y_pos[conn], dtype=float)
+                                N = np.asarray(ref_geom.shape(xi0, eta0), dtype=float).ravel()
+                                x_eval = N @ coords
+                        try:
+                            phis_new[i, q] = float(level_set(np.asarray(x_eval, dtype=float)))
+                        except TypeError:
+                            phis_new[i, q] = float(level_set(float(x_eval[0]), float(x_eval[1])))
+
+            out["phis"] = phis_new
+            out.update(masks_by_field)
+
+            if reuse:
+                _facet_patch_cache_put(cache_key, out)
+            if _prof:
+                try:
+                    nE_out = int(np.asarray(out.get("qp_phys")).shape[0])
+                    nQ_out = int(np.asarray(out.get("qp_phys")).shape[1])
+                except Exception:
+                    nE_out = -1
+                    nQ_out = -1
+                _pc_print(
+                    "facet_patch_factors(refresh)",
+                    time.perf_counter() - _t0,
+                    nE=nE_out,
+                    nQ=nQ_out,
+                    q=int(qdeg),
+                    deform=bool(deformation is not None),
+                )
+            return out
 
         # DOF maps: owner-mixed local -> union indices
         n_loc = int(me.n_dofs_local)
@@ -5107,7 +5404,23 @@ class DofHandler:
         out.update(basis_tables)
 
         if reuse:
-            _facet_patch_cache[cache_key] = out
+            _facet_patch_geo_cache_put(geo_cache_key, out)
+            _facet_patch_cache_put(cache_key, out)
+        if _prof:
+            try:
+                nE_out = int(np.asarray(out.get("qp_phys")).shape[0])
+                nQ_out = int(np.asarray(out.get("qp_phys")).shape[1])
+            except Exception:
+                nE_out = -1
+                nQ_out = -1
+            _pc_print(
+                "facet_patch_factors",
+                time.perf_counter() - _t0,
+                nE=nE_out,
+                nQ=nQ_out,
+                q=int(qdeg),
+                deform=bool(deformation is not None),
+            )
         return out
 
 

@@ -235,3 +235,123 @@ def test_compile_multi_uses_unified_precompute(monkeypatch, tmp_path):
     assert counts["cut"] <= 2
     assert counts["ghost"] <= 1
     assert counts["facet_patch"] <= 1
+
+
+def test_facet_patch_geo_cache_reuse_and_subset_reuse_avoid_inverse_mapping(monkeypatch, tmp_path):
+    """
+    Regression test for facet-patch refresh performance:
+    - When only the level-set token changes, facet-patch should reuse cached geometry/basis tables
+      (no inverse-mapping recomputation).
+    - When the requested facet-id set is a subset of a previously cached set, geometry should be
+      reused by subsetting, again avoiding inverse-mapping.
+    """
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / "pycutfem_jit_cache"))
+
+    from pycutfem.core.dofhandler import clear_caches
+    from pycutfem.utils.turek_fsi2 import build_turek_fsi2_setup
+
+    setup = build_turek_fsi2_setup(mesh_size=0.05, poly_order=2)
+    dh = setup.dof_handler
+    mesh = setup.mesh
+    ls = setup.level_set
+
+    ghost_ids = np.asarray(mesh.edge_bitset("ghost").to_indices(), dtype=np.int32)
+    assert ghost_ids.size >= 12
+    facet_ids_big = ghost_ids[:12]
+    facet_ids_small = ghost_ids[:9]
+
+    q = 2
+    derivs = {(0, 0)}
+
+    clear_caches()
+    ls.cache_token = ("test_facet_patch", 0)
+    dh.precompute_facet_patch_factors(
+        facet_ids=facet_ids_big,
+        qdeg=q,
+        level_set=ls,
+        derivs=derivs,
+        allow_interface=False,
+        reuse=True,
+    )
+
+    # If the cache reuse is working, changing only the token (or requesting a subset)
+    # should not call inverse_mapping (which is the expensive geometry path).
+    import pycutfem.fem.transform as _tf
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("inverse_mapping should not be called when facet-patch geo cache is reused")
+
+    monkeypatch.setattr(_tf, "inverse_mapping", _boom)
+
+    ls.cache_token = ("test_facet_patch", 1)
+    out_same = dh.precompute_facet_patch_factors(
+        facet_ids=facet_ids_big,
+        qdeg=q,
+        level_set=ls,
+        derivs=derivs,
+        allow_interface=False,
+        reuse=True,
+    )
+    assert np.asarray(out_same.get("eids", np.array([], dtype=np.int32))).size > 0
+
+    ls.cache_token = ("test_facet_patch", 2)
+    out_subset = dh.precompute_facet_patch_factors(
+        facet_ids=facet_ids_small,
+        qdeg=q,
+        level_set=ls,
+        derivs=derivs,
+        allow_interface=False,
+        reuse=True,
+    )
+    eids_subset = np.asarray(out_subset.get("eids", np.array([], dtype=np.int32)), dtype=np.int32)
+    assert eids_subset.size > 0
+    assert set(int(i) for i in eids_subset.tolist()).issubset(set(int(i) for i in facet_ids_small.tolist()))
+
+
+def test_facet_patch_caches_are_bounded(monkeypatch, tmp_path):
+    """
+    Time-dependent runs refresh the level-set token frequently. The facet-patch caches
+    must stay bounded to avoid runaway memory usage.
+    """
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / "pycutfem_jit_cache"))
+    monkeypatch.setenv("PYCUTFEM_FACET_PATCH_CACHE_MAX", "1")
+    monkeypatch.setenv("PYCUTFEM_FACET_PATCH_GEO_CACHE_MAX", "1")
+
+    import pycutfem.core.dofhandler as dhmod
+    from pycutfem.core.dofhandler import clear_caches
+    from pycutfem.utils.turek_fsi2 import build_turek_fsi2_setup
+
+    setup = build_turek_fsi2_setup(mesh_size=0.05, poly_order=2)
+    dh = setup.dof_handler
+    mesh = setup.mesh
+    ls = setup.level_set
+
+    ghost_ids = np.asarray(mesh.edge_bitset("ghost").to_indices(), dtype=np.int32)
+    assert ghost_ids.size >= 10
+    facet_ids = ghost_ids[:10]
+
+    q = 2
+    derivs = {(0, 0)}
+
+    clear_caches()
+    ls.cache_token = ("bounded_cache", 0)
+    dh.precompute_facet_patch_factors(
+        facet_ids=facet_ids,
+        qdeg=q,
+        level_set=ls,
+        derivs=derivs,
+        allow_interface=False,
+        reuse=True,
+    )
+    ls.cache_token = ("bounded_cache", 1)
+    dh.precompute_facet_patch_factors(
+        facet_ids=facet_ids,
+        qdeg=q,
+        level_set=ls,
+        derivs=derivs,
+        allow_interface=False,
+        reuse=True,
+    )
+
+    assert len(getattr(dhmod, "_facet_patch_cache", {})) <= 1
+    assert len(getattr(dhmod, "_facet_patch_geo_cache", {})) <= 1

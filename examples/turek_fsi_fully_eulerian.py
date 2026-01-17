@@ -22,6 +22,16 @@ Example:
     conda run --no-capture-output -n fenicsx python -u examples/turek_fsi_fully_eulerian.py \
     --run-fd-check --run-fd-terms --fd-term stab --fd-skip-full --no-run-time-stepping
 
+Long-run validation (FSI-2, `dFacetPatch`, cpp backend):
+  PYCUTFEM_JIT_BACKEND=cpp PYCUTFEM_UNIFIED_PRECOMPUTE=1 USE_FACET_PATCH_GHOST=1 \
+    PENALTY_VAL=1e-3 PENALTY_GRAD=1e-3 BETA_PENALTY=20 \
+    python -u examples/turek_fsi_fully_eulerian.py \
+      --turek-case fsi2 --mesh-backend structured --mesh-size 0.05 \
+      --dt 0.005 --final-time 3.0 \
+      --newton-tol 1e-6 --newton-rtol 0 --max-newton-iter 10 \
+      --obs-every 20 --no-save-vtk --no-run-fd-check --no-run-fd-terms
+  For nonlinear StVK solid, add: `USE_LINEAR_SOLID=0` (more expensive).
+
 
 """
 from __future__ import annotations
@@ -561,7 +571,9 @@ def _parse_args():
         args.levelset_nudge_eps = env_nudge
     if args.levelset_update_tol is None:
         env_update_tol = _env_float("LEVELSET_UPDATE_TOL")
-        args.levelset_update_tol = env_update_tol if env_update_tol is not None else max(1.0e-12, 1.0e-10 * args.mesh_size)
+        args.levelset_update_tol = (
+            env_update_tol if env_update_tol is not None else max(1.0e-10, 1.0e-8 * args.mesh_size)
+        )
     if "--no-refine-initial" in sys.argv:
         args.refine_initial = False
     if "--refine-initial" in sys.argv:
@@ -724,7 +736,7 @@ LEVELSET_ZERO_EPS = float(os.getenv("LEVELSET_ZERO_EPS", str(max(1.0e-10, 1.0e-8
 LEVELSET_EDGE_TOL = float(os.getenv("LEVELSET_EDGE_TOL", str(LEVELSET_ZERO_EPS)))
 LEVELSET_ZERO_SIDE = os.getenv("LEVELSET_ZERO_SIDE", "neg").strip().lower()
 LEVELSET_PREFER_NEGATIVE = LEVELSET_ZERO_SIDE != "pos"
-LEVELSET_UPDATE_TOL = float(os.getenv("LEVELSET_UPDATE_TOL", str(max(1.0e-12, 1.0e-10 * MESH_SIZE))))
+LEVELSET_UPDATE_TOL = float(os.getenv("LEVELSET_UPDATE_TOL", str(max(1.0e-10, 1.0e-8 * MESH_SIZE))))
 LEVELSET_EDGE_TOL = max(LEVELSET_EDGE_TOL, LEVELSET_UPDATE_TOL)
 _snap_env = os.getenv("LEVELSET_SNAP_EPS", "").strip()
 if _snap_env:
@@ -3506,27 +3518,38 @@ def retag_inactive(
 
 def recompute_active_dofs(solver: NewtonSolver, bcs_active: Sequence[BoundaryCondition]) -> bool:
     dh = solver.dh
-    ndof = dh.total_dofs
+    constraints = getattr(solver, "constraints", None)
+    ndof_eff = int(constraints.n_master) if constraints is not None else int(dh.total_dofs)
     old_active = np.asarray(getattr(solver, "active_dofs", np.empty(0, dtype=int)), dtype=int)
     active_by_restr, has_restriction = analyze_active_dofs(solver.equation, dh, solver.me, bcs_active)
-    bc_dofs = set(dh.get_dirichlet_data(bcs_active).keys())
-    candidate = set(active_by_restr) if has_restriction else set(range(ndof))
-    inactive = set(dh.dof_tags.get("inactive", set()))
-    inactive_free = inactive - bc_dofs
-    free = sorted((candidate - bc_dofs) - inactive_free)
-    new_active = np.asarray(free, dtype=int)
+    bc_dofs_full = set(dh.get_dirichlet_data(bcs_active).keys())
+    inactive_full = set(dh.dof_tags.get("inactive", set()))
+    inactive_free_full = inactive_full - bc_dofs_full
+
+    if constraints is None:
+        candidate = set(active_by_restr) if has_restriction else set(range(ndof_eff))
+        free = sorted((candidate - bc_dofs_full) - inactive_free_full)
+        new_active = np.asarray(free, dtype=int)
+    else:
+        candidate_master = (
+            constraints.to_master_set(active_by_restr) if has_restriction else set(range(ndof_eff))
+        )
+        bc_master = constraints.to_master_set(bc_dofs_full)
+        inactive_master = constraints.to_master_set(inactive_free_full)
+        free = sorted((candidate_master - bc_master) - inactive_master)
+        new_active = np.asarray(free, dtype=int)
     dec_mask = getattr(solver, "_decoupled_full_mask", None)
-    if isinstance(dec_mask, np.ndarray) and dec_mask.dtype == bool and int(dec_mask.size) == int(ndof):
+    if isinstance(dec_mask, np.ndarray) and dec_mask.dtype == bool and int(dec_mask.size) == int(ndof_eff):
         if new_active.size:
             new_active = new_active[~dec_mask[new_active]]
     if old_active.size == new_active.size and np.array_equal(old_active, new_active):
         return False
     solver.active_dofs = new_active
-    solver.full_to_red = -np.ones(ndof, dtype=int)
+    solver.full_to_red = -np.ones(ndof_eff, dtype=int)
     solver.full_to_red[solver.active_dofs] = np.arange(len(solver.active_dofs), dtype=int)
     solver.red_to_full = solver.active_dofs
-    solver.use_reduced = len(solver.active_dofs) < ndof
-    solver.restrictor = _ActiveReducer(dh, solver.active_dofs, constraint=getattr(solver, "constraints", None))
+    solver.use_reduced = len(solver.active_dofs) < ndof_eff
+    solver.restrictor = _ActiveReducer(dh, solver.active_dofs, constraint=constraints)
     solver._pattern_stale = True
     return True
 
@@ -5662,14 +5685,33 @@ def _dump_levelset_mesh_once() -> None:
         phi_coords = np.asarray(ls_dh.get_dof_coords("phi_beam"), dtype=float)
     except Exception:
         phi_coords = np.empty((0, 2), dtype=float)
+    # Some meshes (e.g. refined structured) do not carry an explicit `edges_connectivity`
+    # array. For replay/debug, we only need edge endpoints; Mesh will recover
+    # intermediate/hanging nodes along the geometric edge.
+    try:
+        edges_conn = getattr(mesh, "edges_connectivity", None)
+        if edges_conn is None:
+            edges_conn = np.asarray([tuple(map(int, e.nodes)) for e in getattr(mesh, "edges_list", [])], dtype=np.int64)
+        else:
+            edges_conn = np.asarray(edges_conn, dtype=np.int64)
+    except Exception:
+        edges_conn = np.empty((0, 2), dtype=np.int64)
+    try:
+        corners_conn = getattr(mesh, "corner_connectivity", None)
+        if corners_conn is None:
+            corners_conn = np.asarray([tuple(map(int, el.corner_nodes)) for el in getattr(mesh, "elements_list", [])], dtype=np.int64)
+        else:
+            corners_conn = np.asarray(corners_conn, dtype=np.int64)
+    except Exception:
+        corners_conn = np.empty((0, 0), dtype=np.int64)
     np.savez_compressed(
         LEVELSET_DUMP_MESH_FILE,
         element_type=str(getattr(mesh, "element_type", "")),
         poly_order=int(getattr(mesh, "poly_order", 1)),
         nodes=np.asarray(mesh.nodes_x_y_pos, dtype=float),
         elements=np.asarray(mesh.elements_connectivity, dtype=np.int64),
-        edges=np.asarray(mesh.edges_connectivity, dtype=np.int64),
-        corners=np.asarray(mesh.corner_connectivity, dtype=np.int64),
+        edges=edges_conn,
+        corners=corners_conn,
         phi_field="phi_beam",
         phi_poly_order=int(POLY_ORDER),
         phi_dof_coords=phi_coords,
@@ -6556,6 +6598,12 @@ if ARGS.run_time_stepping:
 
     if os.getenv("PYCUTFEM_ACTIVE_DOFS_TRACE", "").lower() in {"1", "true", "yes"}:
         active = np.asarray(solver.active_dofs, dtype=int)
+        constraints = getattr(solver, "constraints", None)
+        if constraints is not None:
+            try:
+                active = np.asarray(constraints.master_ids, dtype=int)[active]
+            except Exception:
+                pass
         counts = []
         for fld in getattr(dof_handler, "field_names", []):
             try:
@@ -6967,14 +7015,25 @@ if ARGS.run_time_stepping:
             active_changed = recompute_active_dofs(solver, solver.bcs_homog if solver.bcs_homog else solver.bcs)
             extend_enabled = os.getenv("PYCUTFEM_EXTEND_NEWLY_ACTIVE_DOFS", "1").lower() in {"1", "true", "yes"}
             if extend_enabled and active_changed:
+                constraints = getattr(solver, "constraints", None)
                 new_active = np.asarray(getattr(solver, "active_dofs", []), dtype=int)
-                newly_active = np.setdiff1d(new_active, old_active, assume_unique=False)
+                if constraints is not None:
+                    try:
+                        old_full = np.asarray(constraints.master_ids, dtype=int)[np.asarray(old_active, dtype=int)]
+                        new_full = np.asarray(constraints.master_ids, dtype=int)[np.asarray(new_active, dtype=int)]
+                    except Exception:
+                        old_full = np.asarray(old_active, dtype=int)
+                        new_full = np.asarray(new_active, dtype=int)
+                else:
+                    old_full = np.asarray(old_active, dtype=int)
+                    new_full = np.asarray(new_active, dtype=int)
+                newly_active = np.setdiff1d(new_full, old_full, assume_unique=False)
                 if newly_active.size:
                     extend_newly_active_dofs_nearest(
                         dh=dof_handler,
                         newly_active=newly_active,
-                        active_old=old_active,
-                        active_new=new_active,
+                        active_old=old_full,
+                        active_new=new_full,
                         field_to_current={
                             "u_pos_x": uf_k,
                             "u_pos_y": uf_k,

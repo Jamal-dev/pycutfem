@@ -51,6 +51,9 @@ from pycutfem.utils.meshgen import structured_quad
 def exact_u(x: float, y: float) -> float:
     r = math.hypot(x, y)
     theta = math.atan2(y, x)
+    # Map θ to [0, 2π) so the L-shape wedge around (0,0) corresponds to θ∈[0,3π/2].
+    if theta < 0.0:
+        theta += 2.0 * math.pi
     return (r ** (2.0 / 3.0)) * math.sin((2.0 / 3.0) * theta) if r > 1e-14 else 0.0
 
 
@@ -59,6 +62,8 @@ def grad_exact_u(x: float, y: float) -> Tuple[float, float]:
     if r < 1e-14:
         return (0.0, 0.0)
     theta = math.atan2(y, x)
+    if theta < 0.0:
+        theta += 2.0 * math.pi
     pref = (2.0 / 3.0) * (r ** (-1.0 / 3.0))
     dtheta_dx = -y / (r * r)
     dtheta_dy = x / (r * r)
@@ -78,9 +83,11 @@ def tag_lshape_boundaries(mesh: Mesh, tol: float = 1e-12) -> None:
         {
             "left": lambda x, y: abs(x - xmin) <= tol,
             "right": lambda x, y: abs(x - xmax) <= tol,
+            # Outer bottom plus the internal horizontal segment y=0, x>0 (cut-out boundary).
             "bottom": lambda x, y: (abs(y - ymin) <= tol) or (x > 0 and abs(y) <= tol),
             "top": lambda x, y: abs(y - ymax) <= tol,
-            "reentrant": lambda x, y: (x >= 0) and (abs(y) <= tol) and (y < 0 + tol),
+            # Internal vertical segment x=0, y<0 (cut-out boundary).
+            "reentrant": lambda x, y: (abs(x) <= tol) and (y < 0 + tol),
         }
     )
 
@@ -454,6 +461,10 @@ def adaptive_solve(poly_order: int = 2, cycles: int = 3, mark_fraction: float = 
     for cycle in range(cycles):
         print(f"\n=== Cycle {cycle} ===")
         result = solve_once(mesh, poly_order)
+        constraints = result.dof_handler.build_hanging_node_constraints()
+        ndof_full = int(result.dof_handler.total_dofs)
+        ndof_master = int(constraints.n_master) if constraints is not None else ndof_full
+        print(f"DOFs: full={ndof_full}  master={ndof_master}")
         print(f"L2 error: {result.l2_error:.3e}, continuity jump: {result.continuity_jump:.3e}")
         print(result.constraints_info)
         print(f"number of elements: {mesh.n_elements}")

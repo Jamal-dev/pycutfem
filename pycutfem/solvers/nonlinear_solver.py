@@ -1370,7 +1370,25 @@ class NewtonSolver:
                 except Exception:
                     field = None
                 fmsg = f", field={field}" if field is not None else ""
-                print(f"        [res] worst_gdof={worst_full} worst_val={worst_val:.3e}{fmsg}")
+
+                extra = ""
+                if os.getenv("PYCUTFEM_RESIDUAL_TRACE_CLASSIFY", "").lower() in {"1", "true", "yes"}:
+                    try:
+                        constraints = getattr(self, "constraints", None)
+                        bc_full = dh.get_dirichlet_data(bcs_now)
+                        if constraints is not None:
+                            bc_master = constraints.project_dirichlet(bc_full)
+                            is_dirichlet = int(worst_full) in bc_master
+                            inactive_master = constraints.to_master_set(dh.dof_tags.get("inactive", set()))
+                            is_inactive = int(worst_full) in inactive_master
+                        else:
+                            is_dirichlet = int(worst_full) in bc_full
+                            is_inactive = int(worst_full) in set(dh.dof_tags.get("inactive", set()))
+                        extra = f", dirichlet={int(bool(is_dirichlet))}, inactive={int(bool(is_inactive))}"
+                    except Exception:
+                        extra = ""
+
+                print(f"        [res] worst_gdof={worst_full} worst_val={worst_val:.3e}{fmsg}{extra}")
                 if os.getenv("PYCUTFEM_RESIDUAL_TRACE_FIELDS", "").lower() in {"1", "true", "yes"}:
                     field_norms = []
                     for fld in getattr(self.dh, "field_names", []):
@@ -1400,16 +1418,60 @@ class NewtonSolver:
                                     return 0.0
                                 _, Floc, _ = kernel.exec(current)
                                 acc = 0.0
+                                constraints = getattr(self, "constraints", None)
+                                if constraints is None:
+                                    ndof_eff = int(self.full_to_red.size)
+                                    for e in range(gdofs.shape[0]):
+                                        full = np.asarray(gdofs[e], dtype=int)
+                                        valid_full = (full >= 0) & (full < ndof_eff)
+                                        if not np.any(valid_full):
+                                            continue
+                                        rmap = -np.ones_like(full, dtype=int)
+                                        rmap[valid_full] = self.full_to_red[full[valid_full]]
+                                        hit = np.nonzero(rmap == int(red_index))[0]
+                                        if hit.size:
+                                            acc += float(np.sum(Floc[e][hit]))
+                                    return float(acc)
+
+                                full_to_master = getattr(self, "_constr_full_to_master", None)
+                                is_slave = getattr(self, "_constr_is_slave", None)
+                                slave_map = getattr(self, "_constr_slave_map", None)
+                                if (
+                                    not isinstance(full_to_master, np.ndarray)
+                                    or not isinstance(is_slave, np.ndarray)
+                                    or not isinstance(slave_map, dict)
+                                ):
+                                    return 0.0
+
                                 for e in range(gdofs.shape[0]):
-                                    full = gdofs[e]
+                                    full = np.asarray(gdofs[e], dtype=int)
                                     valid_full = full >= 0
                                     if not np.any(valid_full):
                                         continue
-                                    rmap = -np.ones_like(full, dtype=int)
-                                    rmap[valid_full] = self.full_to_red[full[valid_full]]
-                                    hit = np.nonzero(rmap == int(red_index))[0]
-                                    if hit.size:
-                                        acc += float(np.sum(Floc[e][hit]))
+                                    for loc_i, gd in zip(np.nonzero(valid_full)[0].tolist(), full[valid_full].tolist()):
+                                        gd_i = int(gd)
+                                        if gd_i < 0 or gd_i >= int(full_to_master.size):
+                                            continue
+                                        val = float(Floc[e][int(loc_i)])
+                                        if not np.isfinite(val) or val == 0.0:
+                                            continue
+                                        if bool(is_slave[gd_i]):
+                                            combo = slave_map.get(gd_i)
+                                            if combo is None:
+                                                continue
+                                            mcols, wts = combo
+                                            for mcol, wv in zip(mcols.tolist(), wts.tolist()):
+                                                red = int(self.full_to_red[int(mcol)])
+                                                if red == int(red_index):
+                                                    acc += float(wv) * val
+                                        else:
+                                            mcol = int(full_to_master[gd_i])
+                                            if mcol < 0:
+                                                continue
+                                            red = int(self.full_to_red[mcol])
+                                            if red == int(red_index):
+                                                acc += val
+
                                 return float(acc)
 
                             entries = []
@@ -1493,6 +1555,40 @@ class NewtonSolver:
                     field_norms.append(f"{fld}:{np.linalg.norm(dU_full_dbg[sl], ord=np.inf):.2e}")
                 extra = ("  [" + ", ".join(field_norms) + "]") if field_norms else ""
                 print(f"        [lin] ‖A·δU+R‖∞={lin_inf:.3e}  ‖δU‖∞={du_inf:.3e}{extra}")
+                if os.getenv("PYCUTFEM_NEWTON_TRACE_WORST", "").lower() in {"1", "true", "yes"}:
+                    try:
+                        worst_red = int(np.argmax(np.abs(R_red))) if R_red.size else -1
+                        worst_full = int(self.active_dofs[worst_red]) if worst_red >= 0 else -1
+                        du_w = float(dU_red[worst_red]) if worst_red >= 0 else 0.0
+                        r_w = float(R_red[worst_red]) if worst_red >= 0 else 0.0
+                        start = int(A_red.indptr[worst_red]) if worst_red >= 0 else 0
+                        end = int(A_red.indptr[worst_red + 1]) if worst_red >= 0 else 0
+                        row_nnz = int(end - start) if worst_red >= 0 else 0
+                        row_abs = float(np.sum(np.abs(A_red.data[start:end]))) if row_nnz else 0.0
+                        diag = 0.0
+                        if row_nnz:
+                            cols = A_red.indices[start:end]
+                            hit = np.nonzero(cols == worst_red)[0]
+                            if hit.size:
+                                diag = float(A_red.data[start + int(hit[0])])
+                        col_nnz = 0
+                        col_abs = 0.0
+                        try:
+                            col = A_red.getcol(worst_red) if worst_red >= 0 else None
+                            if col is not None:
+                                col_nnz = int(getattr(col, "nnz", 0))
+                                col_abs = float(np.sum(np.abs(getattr(col, "data", np.asarray([], dtype=float))))) if col_nnz else 0.0
+                        except Exception:
+                            col_nnz = 0
+                            col_abs = 0.0
+                        print(
+                            f"        [lin] worst_red={worst_red} worst_gdof={worst_full} "
+                            f"R={r_w:+.3e} dU={du_w:+.3e} "
+                            f"row_nnz={row_nnz} row_abs={row_abs:.3e} diag={diag:+.3e} "
+                            f"col_nnz={col_nnz} col_abs={col_abs:.3e}"
+                        )
+                    except Exception:
+                        pass
 
             dd_enabled = (
                 os.getenv("PYCUTFEM_DIRDERIV_CHECK", "").lower() in {"1", "true", "yes"}
@@ -1550,16 +1646,60 @@ class NewtonSolver:
                             return 0.0
                         _, Floc, _ = kernel.exec(current)
                         acc = 0.0
+                        constraints = getattr(self, "constraints", None)
+                        if constraints is None:
+                            ndof_eff = int(self.full_to_red.size)
+                            for e in range(gdofs.shape[0]):
+                                full = np.asarray(gdofs[e], dtype=int)
+                                valid_full = (full >= 0) & (full < ndof_eff)
+                                if not np.any(valid_full):
+                                    continue
+                                rmap = -np.ones_like(full, dtype=int)
+                                rmap[valid_full] = self.full_to_red[full[valid_full]]
+                                hit = np.nonzero(rmap == int(red_index))[0]
+                                if hit.size:
+                                    acc += float(np.sum(Floc[e][hit]))
+                            return float(acc)
+
+                        full_to_master = getattr(self, "_constr_full_to_master", None)
+                        is_slave = getattr(self, "_constr_is_slave", None)
+                        slave_map = getattr(self, "_constr_slave_map", None)
+                        if (
+                            not isinstance(full_to_master, np.ndarray)
+                            or not isinstance(is_slave, np.ndarray)
+                            or not isinstance(slave_map, dict)
+                        ):
+                            return 0.0
+
                         for e in range(gdofs.shape[0]):
-                            full = gdofs[e]
+                            full = np.asarray(gdofs[e], dtype=int)
                             valid_full = full >= 0
                             if not np.any(valid_full):
                                 continue
-                            rmap = -np.ones_like(full, dtype=int)
-                            rmap[valid_full] = self.full_to_red[full[valid_full]]
-                            hit = np.nonzero(rmap == int(red_index))[0]
-                            if hit.size:
-                                acc += float(np.sum(Floc[e][hit]))
+                            for loc_i, gd in zip(np.nonzero(valid_full)[0].tolist(), full[valid_full].tolist()):
+                                gd_i = int(gd)
+                                if gd_i < 0 or gd_i >= int(full_to_master.size):
+                                    continue
+                                val = float(Floc[e][int(loc_i)])
+                                if not np.isfinite(val) or val == 0.0:
+                                    continue
+                                if bool(is_slave[gd_i]):
+                                    combo = slave_map.get(gd_i)
+                                    if combo is None:
+                                        continue
+                                    mcols, wts = combo
+                                    for mcol, wv in zip(mcols.tolist(), wts.tolist()):
+                                        red = int(self.full_to_red[int(mcol)])
+                                        if red == int(red_index):
+                                            acc += float(wv) * val
+                                else:
+                                    mcol = int(full_to_master[gd_i])
+                                    if mcol < 0:
+                                        continue
+                                    red = int(self.full_to_red[mcol])
+                                    if red == int(red_index):
+                                        acc += val
+
                         return float(acc)
 
                     base = []
@@ -1766,9 +1906,10 @@ class NewtonSolver:
                 if np.any(nonempty):
                     row_abs[nonempty] = np.add.reduceat(abs_data, starts[nonempty])
                 col_abs = np.bincount(A_red.indices, weights=abs_data, minlength=A_red.shape[1])
-                scale = float(abs_data.max())
-                thresh = drop_tol * max(1.0, scale)
-                inactive_mask |= (row_abs <= thresh) | (col_abs <= thresh)
+                # Treat PYCUTFEM_DROP_TOL as an *absolute* row/col L1 threshold.
+                # A global relative threshold (scaled by max|A|) is brittle: a single
+                # huge penalty block can cause legitimate physics rows to be dropped.
+                inactive_mask |= (row_abs <= drop_tol) | (col_abs <= drop_tol)
             inactive = np.where(inactive_mask)[0]
             if not inactive.size:
                 break
@@ -1879,6 +2020,14 @@ class NewtonSolver:
             print("        Warning: Not a descent direction in reduced space; using steepest descent.")
             S_red = -g
             gTS = float(g @ S_red)  # = -||g||^2 <= 0
+            if os.getenv("PYCUTFEM_LS_DEBUG", "").lower() in {"1", "true", "yes"}:
+                try:
+                    r_inf = float(np.linalg.norm(R_red, ord=np.inf))
+                    g_inf = float(np.linalg.norm(g, ord=np.inf))
+                    s_inf = float(np.linalg.norm(S_red, ord=np.inf))
+                    print(f"        [ls] ‖R‖∞={r_inf:.3e}  ‖g‖∞={g_inf:.3e}  ‖S‖∞={s_inf:.3e}")
+                except Exception:
+                    pass
 
         phi0 = 0.5 * float(R_red @ R_red)
         # Warm-start: reuse last accepted α (try slightly larger first).
@@ -1921,6 +2070,44 @@ class NewtonSolver:
             print(f"        Armijo failed, using best-effort α = {best_alpha:.2e}.")
             self._ls_alpha_prev = best_alpha
             return best_alpha * S_red
+
+        # As a last resort, try a simple residual-direction backtracking step.
+        # This is useful when the assembled Jacobian is inconsistent enough that
+        # the Gauss-Newton gradient g = JᵀR does not produce an actual decrease.
+        try_alt = os.getenv("PYCUTFEM_LS_ALT_RESIDUAL", "1").lower() in {"1", "true", "yes"}
+        if try_alt:
+            S_alt = -np.asarray(R_red, dtype=float)
+            alt_norm = float(np.linalg.norm(S_alt, ord=np.inf))
+            if np.isfinite(alt_norm) and alt_norm > 0.0:
+                alpha_alt = float(getattr(self, "_ls_alpha_prev", 1.0))
+                alpha_alt = min(1.0, alpha_alt / float(np_.ls_reduction))
+                best_alpha_alt = 0.0
+                best_phi_alt = phi0
+                for _ in range(np_.ls_max_iter):
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+                    dU_full = self.restrictor.expand_vec(alpha_alt * S_alt)
+                    dh.add_to_functions(dU_full, funcs)
+                    dh.apply_bcs(bcs_now, *funcs)
+                    if getattr(self, "constraints", None) is not None:
+                        self._enforce_constraints_on_functions(funcs)
+                    _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
+                    phi = 0.5 * float(R_try @ R_try)
+                    if phi < best_phi_alt:
+                        best_phi_alt, best_alpha_alt = phi, alpha_alt
+                    if phi < phi0:
+                        for f, buf in zip(funcs, snap):
+                            f.nodal_values[:] = buf
+                        print(f"        Armijo alt (S=-R) accepted α = {alpha_alt:.2e}")
+                        self._ls_alpha_prev = alpha_alt
+                        return alpha_alt * S_alt
+                    alpha_alt *= np_.ls_reduction
+                if best_alpha_alt > 0.0:
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+                    print(f"        Armijo alt (S=-R) best-effort α = {best_alpha_alt:.2e}.")
+                    self._ls_alpha_prev = best_alpha_alt
+                    return best_alpha_alt * S_alt
         # No decrease found; still take the smallest tried step to avoid stagnation.
         min_alpha = alpha
         print(f"        Line search failed – taking minimal step α = {min_alpha:.2e}.")
@@ -2836,6 +3023,12 @@ class NewtonSolver:
 
         profile = os.getenv("PYCUTFEM_PROFILE_KERNELS", "").lower() in {"1", "true", "yes"}
         prof_entries = []
+        debug_kernel = os.getenv("PYCUTFEM_DEBUG_KERNELS", "").lower() in {"1", "true", "yes"}
+        debug_kernel_min_elems = int(os.getenv("PYCUTFEM_DEBUG_KERNELS_MIN_ELEMS", "0") or "0")
+        debug_seen = getattr(self, "_debug_kernel_seen", None)
+        if debug_kernel and debug_seen is None:
+            debug_seen = set()
+            self._debug_kernel_seen = debug_seen
 
         # Matrix (Jacobian) blocks
         extra_lists = getattr(self, "_elem_extra", None)
@@ -2849,6 +3042,39 @@ class NewtonSolver:
             t_exec = time.perf_counter()
             Kloc, _, _ = ker.exec(coeffs)  # shape [nel, nloc, nloc]
             exec_time = time.perf_counter() - t_exec
+            if debug_kernel and isinstance(debug_seen, set) and (id(ker) not in debug_seen):
+                try:
+                    n_ent = int(getattr(Kloc, "shape", (0,))[0])
+                except Exception:
+                    n_ent = 0
+                if n_ent >= debug_kernel_min_elems:
+                    try:
+                        qw = ker.static_args.get("qw")
+                        qw_sum = float(np.nansum(np.abs(qw))) if isinstance(qw, np.ndarray) else float("nan")
+                        qw_min = float(np.nanmin(qw)) if isinstance(qw, np.ndarray) and qw.size else float("nan")
+                        qw_max = float(np.nanmax(qw)) if isinstance(qw, np.ndarray) and qw.size else float("nan")
+                        kmax = float(np.nanmax(np.abs(Kloc))) if isinstance(Kloc, np.ndarray) and Kloc.size else float("nan")
+                        n_valid = n_active = 0
+                        active_frac = float("nan")
+                        if isinstance(gdofs, np.ndarray):
+                            valid = gdofs >= 0
+                            if np.any(valid):
+                                rmap = -np.ones_like(gdofs, dtype=int)
+                                rmap[valid] = self.full_to_red[gdofs[valid]]
+                                active = rmap >= 0
+                                n_valid = int(np.count_nonzero(valid))
+                                n_active = int(np.count_nonzero(active))
+                                active_frac = float(n_active) / float(max(1, n_valid))
+                        side = getattr(ker, "side", None)
+                        print(
+                            f"[kern] jacobian dom={getattr(ker,'domain','?')} side={side} "
+                            f"elems={n_ent} max|K|={kmax:.3e} "
+                            f"qw_sum={qw_sum:.3e} qw=[{qw_min:.3e},{qw_max:.3e}] "
+                            f"active_frac={active_frac:.3e} ({n_active}/{n_valid})"
+                        )
+                    except Exception:
+                        pass
+                debug_seen.add(id(ker))
             t_scatter = time.perf_counter()
             if extra_list is None:
                 for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
@@ -2910,6 +3136,48 @@ class NewtonSolver:
             t_exec = time.perf_counter()
             _, Floc, _ = ker.exec(coeffs)  # [nel, nloc]
             exec_time = time.perf_counter() - t_exec
+            if debug_kernel and isinstance(debug_seen, set) and (id(ker) not in debug_seen):
+                try:
+                    n_ent = int(getattr(Floc, "shape", (0,))[0])
+                except Exception:
+                    n_ent = 0
+                if n_ent >= debug_kernel_min_elems:
+                    try:
+                        qw = ker.static_args.get("qw")
+                        qw_sum = float(np.nansum(np.abs(qw))) if isinstance(qw, np.ndarray) else float("nan")
+                        qw_min = float(np.nanmin(qw)) if isinstance(qw, np.ndarray) and qw.size else float("nan")
+                        qw_max = float(np.nanmax(qw)) if isinstance(qw, np.ndarray) and qw.size else float("nan")
+                        absF = np.abs(Floc) if isinstance(Floc, np.ndarray) else None
+                        fmax = float(np.nanmax(absF)) if isinstance(absF, np.ndarray) and absF.size else float("nan")
+                        n_valid = n_active = 0
+                        active_frac = float("nan")
+                        fmax_active = 0.0
+                        fmax_dropped = 0.0
+                        if isinstance(gdofs, np.ndarray) and isinstance(absF, np.ndarray) and absF.size:
+                            valid = gdofs >= 0
+                            if np.any(valid):
+                                rmap = -np.ones_like(gdofs, dtype=int)
+                                rmap[valid] = self.full_to_red[gdofs[valid]]
+                                active = rmap >= 0
+                                n_valid = int(np.count_nonzero(valid))
+                                n_active = int(np.count_nonzero(active))
+                                active_frac = float(n_active) / float(max(1, n_valid))
+                                if np.any(active):
+                                    fmax_active = float(np.nanmax(absF[active]))
+                                dropped = valid & ~active
+                                if np.any(dropped):
+                                    fmax_dropped = float(np.nanmax(absF[dropped]))
+                        side = getattr(ker, "side", None)
+                        print(
+                            f"[kern] residual dom={getattr(ker,'domain','?')} side={side} "
+                            f"elems={n_ent} max|F|={fmax:.3e} "
+                            f"qw_sum={qw_sum:.3e} qw=[{qw_min:.3e},{qw_max:.3e}] "
+                            f"active_frac={active_frac:.3e} ({n_active}/{n_valid}) "
+                            f"max|F_active|={fmax_active:.3e} max|F_drop|={fmax_dropped:.3e}"
+                        )
+                    except Exception:
+                        pass
+                debug_seen.add(id(ker))
             t_scatter = time.perf_counter()
             if not isinstance(gdofs, np.ndarray):
                 gdofs = ker.static_args["gdofs_map"]
