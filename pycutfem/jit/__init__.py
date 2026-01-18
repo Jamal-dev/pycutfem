@@ -1990,9 +1990,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
             bs_def = intg.measure.defined_on
             deformation = getattr(intg.measure, "deformation", None)
 
-            if need_hess or need_o3 or need_o4:
+            if need_o3 or need_o4:
                 raise NotImplementedError(
-                    "facet_patch JIT currently supports value/grad terms only (no higher jets)."
+                    "facet_patch JIT currently supports up to 2nd-order jets (Hessian/Laplacian). "
+                    "Higher-order (3rd/4th) inverse-map jets are not implemented."
                 )
 
             ctx = _ctx_for(level_set)

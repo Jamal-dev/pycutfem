@@ -1752,12 +1752,14 @@ class HessOpInfo(BaseOpInfo):
         n = self._as_dir_vec(vec)  # (d,)
         if self.data.ndim == 4:    # (k,n,d,d) · (d,) -> (k,n,d)
             out = np.einsum("knij,j->kni", self.data, n, optimize=True)
+            coeffs = self.coeffs
         elif self.data.ndim == 3:  # (k,d,d)   · (d,) -> (k,d)
             out = np.einsum("kij,j->ki",   self.data, n, optimize=True)
+            coeffs = None
         else:
             raise ValueError(f"HessOpInfo.dot_right: unexpected ndim={self.data.ndim}")
         meta = _resolve_meta(self.meta(), getattr(vec, "meta", lambda: {})(), prefer='a')
-        return GradOpInfo(np.asarray(out), role=self.role, **self.update_meta(meta))
+        return GradOpInfo(np.asarray(out), role=self.role, coeffs=coeffs, **self.update_meta(meta))
 
     def dot_left(self, vec) -> "GradOpInfo":
         """
@@ -1779,6 +1781,7 @@ class HessOpInfo(BaseOpInfo):
             elif is_vec and is_d_k:
                 out = np.einsum("s,snij->inj", n, self.data, optimize=True)
             else: raise NotImplementedError(f"HessOpInfo.dot_left: cannot contract with vector of shape {n.shape} and Hess shape {self.data.shape}.")
+            coeffs = self.coeffs
         elif self.data.ndim == 3:  # (d,) · (k,d,d)   -> (k,d)
             if is_vec and is_scalar_field and is_d_d:
                 out = np.einsum("s,ksj->kj",   n, self.data, optimize=True)
@@ -1786,10 +1789,11 @@ class HessOpInfo(BaseOpInfo):
                 out = np.einsum("s,sij->ij", n, self.data, optimize=True)
             else:
                 raise NotImplementedError(f"HessOpInfo.dot_left: cannot contract with vector of shape {n.shape} and Hess shape {self.data.shape}.")
+            coeffs = None
         else:
             raise ValueError(f"HessOpInfo.dot_left: unexpected ndim={self.data.ndim}")
         meta = _resolve_meta(self.meta(), getattr(vec, "meta", lambda: {})(), prefer='a')
-        return GradOpInfo(np.asarray(out), role=self.role, **self.update_meta(meta))
+        return GradOpInfo(np.asarray(out), role=self.role, coeffs=coeffs, **self.update_meta(meta))
 
     def proj_nn(self, nvec) -> "VecOpInfo":
         """

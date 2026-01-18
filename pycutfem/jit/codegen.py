@@ -402,18 +402,21 @@ class NumbaCodeGen:
                             f"d20_q = {d20[i]}[e, q]", f"d11_q = {d11[i]}[e, q]", f"d02_q = {d02[i]}[e, q]",
                             f"{Hloc} = compute_physical_hessian(d20_q, d11_q, d02_q, d10_q, d01_q, A, Hx, Hy, {self.dtype})",
                         ]
-                        if a.side:  # pad to union using map
+                        if a.side:  # pad to union using map (unless already union-sized)
                             side_tag = self._component_side_tag(a.side, a.field_sides, fn, i)
                             map_arr = f"{side_tag}_map_{fn}"
                             required_args.add(map_arr)
                             Hpad, me = new_var("Hpad"), new_var("map_e")
                             Hsub = new_var("Hsub")
                             body_lines += [
-                                f"{me} = {map_arr}[e]",
+                                f"if {Hloc}.shape[0] == n_union:",
+                                f"    {out}[{i}] = {Hloc}",
+                                f"else:",
+                                f"    {me} = {map_arr}[e]",
                                 # slice down to this field first
-                                f"{Hsub} = {Hloc}[{self._field_slice(fn).start}:{self._field_slice(fn).stop}, :, :]",
-                                f"{Hpad} = scatter_tensor_to_union({Hsub}, {me}, n_union, {self.dtype})",
-                                f"{out}[{i}] = {Hpad}",
+                                f"    {Hsub} = {Hloc}[{self._field_slice(fn).start}:{self._field_slice(fn).stop}, :, :]",
+                                f"    {Hpad} = scatter_tensor_to_union({Hsub}, {me}, n_union, {self.dtype})",
+                                f"    {out}[{i}] = {Hpad}",
                             ]
                         else:
                             # volume: typically nloc == n_union; assign directly
@@ -451,10 +454,13 @@ class NumbaCodeGen:
                             Hpad, me = new_var("Hpad"), new_var("map_e")
                             Hsub = new_var("Hsub")
                             body_lines += [
-                                f"{me} = {map_arr}[e]",
-                                f"{Hsub} = {Hloc}[{s0}:{s1}, :, :]",
-                                f"{Hpad} = scatter_tensor_to_union({Hsub}, {me}, n_union, {self.dtype})",
-                                f"{out}[{i}] = hessian_qp({coeff}, {Hpad})",
+                                f"if {Hloc}.shape[0] == {coeff}.shape[0]:",
+                                f"    {out}[{i}] = hessian_qp({coeff}, {Hloc})",
+                                f"else:",
+                                f"    {me} = {map_arr}[e]",
+                                f"    {Hsub} = {Hloc}[{s0}:{s1}, :, :]",
+                                f"    {Hpad} = scatter_tensor_to_union({Hsub}, {me}, n_union, {self.dtype})",
+                                f"    {out}[{i}] = hessian_qp({coeff}, {Hpad})",
                             ]
                         else:
                             # --- tensordot-free collapse: (n,2,2) -> (2,2)
@@ -528,10 +534,13 @@ class NumbaCodeGen:
                             lap_pad, me = new_var("lap_pad"), new_var("map_e")
                             lap_sub = new_var("lap_sub")
                             body_lines += [
-                                f"{me} = {map_arr}[e]",
-                                f"{lap_sub} = {laploc}[{s0}:{s1}]",
-                                f"{lap_pad} = scatter_tensor_to_union({lap_sub}, {me}, n_union, {self.dtype})",
-                                f"{out}[{i}] = {lap_pad}",
+                                f"if {laploc}.shape[0] == n_union:",
+                                f"    {out}[{i}] = {laploc}",
+                                f"else:",
+                                f"    {me} = {map_arr}[e]",
+                                f"    {lap_sub} = {laploc}[{s0}:{s1}]",
+                                f"    {lap_pad} = scatter_tensor_to_union({lap_sub}, {me}, n_union, {self.dtype})",
+                                f"    {out}[{i}] = {lap_pad}",
                             ]
                         else:
                             body_lines += [f"{out}[{i}] = {laploc}"]
@@ -566,10 +575,13 @@ class NumbaCodeGen:
                             required_args.add(map_arr)
                             lap_pad = new_var("lap_pad"); me = new_var("map_e"); lap_sub = new_var("lap_sub")
                             body_lines += [
-                                f"{me} = {map_arr}[e]",
-                                f"{lap_sub} = {laploc}[{s0}:{s1}]",
-                                f"{lap_pad} = scatter_tensor_to_union({lap_sub}, {me}, n_union, {self.dtype})",
-                                f"{out}[{i}] = laplacian_qp({coeff}, {lap_pad})",
+                                f"if {laploc}.shape[0] == {coeff}.shape[0]:",
+                                f"    {out}[{i}] = laplacian_qp({coeff}, {laploc})",
+                                f"else:",
+                                f"    {me} = {map_arr}[e]",
+                                f"    {lap_sub} = {laploc}[{s0}:{s1}]",
+                                f"    {lap_pad} = scatter_tensor_to_union({lap_sub}, {me}, n_union, {self.dtype})",
+                                f"    {out}[{i}] = laplacian_qp({coeff}, {lap_pad})",
                             ]
                         else:
                             body_lines += [

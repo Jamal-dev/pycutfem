@@ -218,6 +218,31 @@ This isolates the mismatch source between the CutFEM benchmark and the body-fitt
 
 ---
 
+## 2026-01-18 (Hessian GP + 2D-1 steady validation)
+
+**DFG 2D-1 (steady, Re=20) validation succeeds on CutFEM (level 4, Q2/Q1, deformation)**
+- Command:
+  - `conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py --benchmark 2d-1 --backend cpp --with-deformation --init stokes --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 0 --force-eval surface --disable-mass --theta 1 --max-steps 1 --vtk-every 0 --level 4`
+- Output:
+  - `Cd=5.5580` (ref `5.5795`, abs err `2.15e-02`)
+  - `Cl=0.0140` (ref `0.0106`, abs err `3.40e-03`)
+  - `dp=0.117706` (ref `0.117520`, abs err `1.86e-04`)
+- Conclusion: force/Δp postprocessing and the steady NS core on CutFEM are consistent; remaining errors are at the expected discretization level on this mesh.
+
+**Hessian ghost penalty (Q2 velocity) — patch-volume form breaks Newton, facet form is stable**
+- Observation:
+  - With `--ghost-measure patch` and a patch-volume Hessian GP term, Newton fails at step 1 (`dt=0.1`, `level=4`) with residual stagnation (`|R|_∞≈6.19e-03`) and line search fallback.
+- Fix applied:
+  - Even in `--ghost-measure patch` mode, assemble the Hessian GP term on **facets** (`dGhost`) with the standard facet scaling (`μ h^3`), while keeping value/pressure patch penalties on `dFacetPatch`.
+- Command sanity check:
+  - `conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py --benchmark 2d-2 --backend cpp --with-deformation --inflow constant --init zero --fe-order 2 --p-order 1 --ghost-measure patch --beta0 40 --gamma-gp 0.01 --gamma-gp-p 0.01 --gamma-gp-hess 1e-6 --dt 0.1 --theta 0.5 --max-steps 1 --vtk-every 0 --force-eval surface --level 4 --newton-tol 1e-8`
+  - converges (5 Newton iterations).
+
+**Regression tests added (Hessian + restrictions + facet patch)**
+- New tests cover:
+  - vector Hessian restriction on `dFacetPatch` (python vs cpp parity)
+  - trial/test normal-projected Hessian jump penalty on `dFacetPatch` (python vs cpp parity)
+
 ## 2026-01-15 (skew-symmetric convection check)
 
 Hypothesis: using the skew-symmetric (energy-conserving) convection form

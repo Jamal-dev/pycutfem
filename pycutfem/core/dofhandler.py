@@ -4624,9 +4624,23 @@ class DofHandler:
         # Empty output (keeps JIT compile path happy even when no patches exist).
         if not edges:
             derivs_eff = {(0, 0)} | set(tuple((int(dx), int(dy))) for (dx, dy) in derivs)
+            max_total = max((int(dx) + int(dy) for (dx, dy) in derivs_eff), default=0)
+            if max_total > 2:
+                raise NotImplementedError(
+                    "facet-patch precompute currently supports derivatives up to total order 2; "
+                    f"requested max order {max_total}."
+                )
+            need_h2 = any(int(dx) + int(dy) == 2 for (dx, dy) in derivs_eff)
+            need_grad = any(int(dx) + int(dy) == 1 for (dx, dy) in derivs_eff) or need_h2
+            if need_grad:
+                derivs_eff |= {(1, 0), (0, 1)}
+            if need_h2:
+                derivs_eff |= {(2, 0), (1, 1), (0, 2)}
+            need_hess = need_h2
             z2 = np.empty((0, 0, 2), dtype=float)
             z1 = np.empty((0, 0), dtype=float)
             z22 = np.empty((0, 0, 2, 2), dtype=float)
+            final_w = int(me.n_dofs_per_elem)
             out = {
                 "eids": np.empty((0,), dtype=np.int32),
                 "qp_phys": z2,
@@ -4646,10 +4660,19 @@ class DofHandler:
             }
             for fld in fields:
                 for (dx, dy) in sorted(derivs_eff):
-                    out[f"r{dx}{dy}_{fld}_pos"] = np.empty((0, 0, n_union_default), dtype=float)
-                    out[f"r{dx}{dy}_{fld}_neg"] = np.empty((0, 0, n_union_default), dtype=float)
+                    out[f"r{dx}{dy}_{fld}_pos"] = np.empty((0, 0, final_w), dtype=float)
+                    out[f"r{dx}{dy}_{fld}_neg"] = np.empty((0, 0, final_w), dtype=float)
                 out[f"restrict_mask_{fld}_pos"] = np.empty((0, n_union_default), dtype=float)
                 out[f"restrict_mask_{fld}_neg"] = np.empty((0, n_union_default), dtype=float)
+            if need_hess:
+                out.update(
+                    {
+                        "pos_Hxi0": z22,
+                        "pos_Hxi1": z22,
+                        "neg_Hxi0": z22,
+                        "neg_Hxi1": z22,
+                    }
+                )
             if _prof:
                 _pc_print(
                     "facet_patch_factors(empty)",
@@ -5340,39 +5363,180 @@ class DofHandler:
                         Jip2 = np.linalg.pinv(Jp)
                     J_inv_pos[i, qq, :, :] = Jip2
 
-        # Basis tables (union layout) for requested derivatives
-        derivs_eff = {(0, 0)} | set(tuple((int(dx), int(dy))) for (dx, dy) in derivs)
+        # Basis tables for facet-patch kernels.
+        #
+        # IMPORTANT: provide *reference-space* derivatives (d/dξ, d/dη) in the
+        # owner-mixed layout (length == me.n_dofs_per_elem). The JIT backends
+        # push forward with J^{-1} and, for Hessians, use the inverse-map jets
+        # (Hxi0/Hxi1). helpers_jit then pads these owner-mixed vectors to the
+        # per-edge union width via pos_map/neg_map when required.
+        #
+        # This matches the ghost-edge data contract and allows Hessian penalties
+        # (Q2/Q3) on facet-patches.
+        from pycutfem.integration.pre_tabulates import (
+            _HAVE_NUMBA,
+            _tabulate_deriv_q1,
+            _tabulate_deriv_q2,
+            _tabulate_deriv_p1,
+        )
+
+        derivs = set(tuple((int(dx), int(dy))) for (dx, dy) in derivs)
+        max_total = max((int(dx) + int(dy) for (dx, dy) in derivs), default=0)
+        if max_total > 2:
+            raise NotImplementedError(
+                "facet-patch precompute currently supports derivatives up to total order 2; "
+                f"requested max order {max_total}."
+            )
+
+        need_h2 = any(int(dx) + int(dy) == 2 for (dx, dy) in derivs)
+        need_grad = any(int(dx) + int(dy) == 1 for (dx, dy) in derivs) or need_h2
+        need_hess = need_h2
+
         basis_tables: dict[str, np.ndarray] = {}
+        final_w = int(me.n_dofs_per_elem)
+
+        def _tab_generic(fld: str, dx: int, dy: int, xi_tab, eta_tab, out_arr):
+            for e in range(nE):
+                for q in range(nQ):
+                    out_arr[e, q, :] = me._eval_scalar_deriv(
+                        fld, float(xi_tab[e, q]), float(eta_tab[e, q]), int(dx), int(dy)
+                    )
+
         for fld in fields:
-            for (dx, dy) in sorted(derivs_eff):
-                tab_pos = np.zeros((nE, nQ, n_union), dtype=float)
-                tab_neg = np.zeros((nE, nQ, n_union), dtype=float)
-                for i in range(nE):
-                    for q in range(nQ):
-                        xip, etap = float(xi_pos[i, q]), float(eta_pos[i, q])
-                        xin, etan = float(xi_neg[i, q]), float(eta_neg[i, q])
-                        Jip = np.asarray(J_inv_pos[i, q, :, :], dtype=float)
-                        Jin = np.asarray(J_inv_neg[i, q, :, :], dtype=float)
+            p_f = int(me._field_orders[fld])
+            sl = me.component_dof_slices[fld]
+            n_f = int(sl.stop - sl.start)
 
-                        if (dx, dy) == (0, 0):
-                            vp = me.basis(fld, xip, etap)
-                            vn = me.basis(fld, xin, etan)
-                            tab_pos[i, q, pos_map[i]] = vp
-                            tab_neg[i, q, neg_map[i]] = vn
-                        elif (dx, dy) in {(1, 0), (0, 1)}:
-                            gp = me.grad_basis(fld, xip, etap) @ Jip
-                            gn = me.grad_basis(fld, xin, etan) @ Jin
-                            col = 0 if (dx, dy) == (1, 0) else 1
-                            tab_pos[i, q, pos_map[i]] = gp[:, col]
-                            tab_neg[i, q, neg_map[i]] = gn[:, col]
-                        else:
-                            raise NotImplementedError(
-                                "facet-patch precompute currently supports only (0,0),(1,0),(0,1) derivatives; "
-                                f"requested ({dx},{dy})."
+            def _tab(dx: int, dy: int, xi_tab, eta_tab, out_arr):
+                if _HAVE_NUMBA and mesh.element_type == "quad" and p_f == 1:
+                    _tabulate_deriv_q1(xi_tab, eta_tab, int(dx), int(dy), out_arr)
+                elif _HAVE_NUMBA and mesh.element_type == "quad" and p_f == 2:
+                    _tabulate_deriv_q2(xi_tab, eta_tab, int(dx), int(dy), out_arr)
+                elif _HAVE_NUMBA and mesh.element_type == "tri" and p_f == 1:
+                    _tabulate_deriv_p1(xi_tab, eta_tab, int(dx), int(dy), out_arr)
+                else:
+                    _tab_generic(fld, dx, dy, xi_tab, eta_tab, out_arr)
+
+            # POS side reference tables
+            arr = np.empty((nE, nQ, n_f))
+            _tab(0, 0, xi_pos, eta_pos, arr)
+            basis_tables[f"r00_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_grad:
+                arr = np.empty((nE, nQ, n_f))
+                _tab(1, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r10_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f))
+                _tab(0, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r01_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_h2:
+                arr = np.empty((nE, nQ, n_f))
+                _tab(2, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r20_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f))
+                _tab(1, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r11_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f))
+                _tab(0, 2, xi_pos, eta_pos, arr)
+                basis_tables[f"r02_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+
+            # NEG side reference tables
+            arr = np.empty((nE, nQ, n_f))
+            _tab(0, 0, xi_neg, eta_neg, arr)
+            basis_tables[f"r00_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_grad:
+                arr = np.empty((nE, nQ, n_f))
+                _tab(1, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r10_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f))
+                _tab(0, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r01_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_h2:
+                arr = np.empty((nE, nQ, n_f))
+                _tab(2, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r20_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f))
+                _tab(1, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r11_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((nE, nQ, n_f))
+                _tab(0, 2, xi_neg, eta_neg, arr)
+                basis_tables[f"r02_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+
+        # Inverse-map Hessians for chain rule: Hxi0/Hxi1 (sided).
+        pos_Hxi0 = pos_Hxi1 = neg_Hxi0 = neg_Hxi1 = None
+        if need_hess:
+            pos_Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+            pos_Hxi1 = np.zeros_like(pos_Hxi0)
+            neg_Hxi0 = np.zeros((nE, nQ, 2, 2), dtype=float)
+            neg_Hxi1 = np.zeros_like(neg_Hxi0)
+
+            if not use_affine_geo:
+                # Deformation-aware inverse jets (order 2) on the possibly-extended reference points.
+                if deformation is not None:
+                    from pycutfem.fem.transform import hess_inverse_from_forward
+
+                    ref_geom_global = get_reference(mesh.element_type, int(p_geo_mesh))
+
+                    def _inverse_hess_for_coords(coords_def_elem: np.ndarray, xi: float, eta: float) -> tuple[np.ndarray, np.ndarray]:
+                        xi = float(xi)
+                        eta = float(eta)
+                        dN_geom = np.asarray(ref_geom_global.grad(xi, eta), float)
+                        J = coords_def_elem.T @ dN_geom
+                        A = np.linalg.inv(J)
+                        try:
+                            HN = np.asarray(ref_geom_global.hess(xi, eta), float)
+                        except AttributeError:
+                            HN = np.empty((coords_def_elem.shape[0], 2, 2), float)
+                            HN[:, 0, 0] = np.asarray(ref_geom_global.derivative(xi, eta, 2, 0), float)
+                            HN[:, 0, 1] = np.asarray(ref_geom_global.derivative(xi, eta, 1, 1), float)
+                            HN[:, 1, 0] = HN[:, 0, 1]
+                            HN[:, 1, 1] = np.asarray(ref_geom_global.derivative(xi, eta, 0, 2), float)
+                        d20 = HN[:, 0, 0]
+                        d11 = HN[:, 0, 1]
+                        d02 = HN[:, 1, 1]
+                        coords_x = coords_def_elem[:, 0]
+                        coords_y = coords_def_elem[:, 1]
+                        Hx0 = np.array(
+                            [[np.dot(d20, coords_x), np.dot(d11, coords_x)], [np.dot(d11, coords_x), np.dot(d02, coords_x)]],
+                            dtype=float,
+                        )
+                        Hx1 = np.array(
+                            [[np.dot(d20, coords_y), np.dot(d11, coords_y)], [np.dot(d11, coords_y), np.dot(d02, coords_y)]],
+                            dtype=float,
+                        )
+                        A2 = hess_inverse_from_forward(A, Hx0, Hx1)
+                        return A2[0], A2[1]
+
+                    for i, e in enumerate(edges):
+                        pos_eid = int(pos_ids[i])
+                        neg_eid = int(neg_ids[i])
+                        conn_pos = np.asarray(mesh.elements_connectivity[pos_eid], dtype=int)
+                        conn_neg = np.asarray(mesh.elements_connectivity[neg_eid], dtype=int)
+                        coords_pos_geom = np.asarray(mesh.nodes_x_y_pos[conn_pos], dtype=float)
+                        coords_neg_geom = np.asarray(mesh.nodes_x_y_pos[conn_neg], dtype=float)
+                        Upos = np.asarray(deformation.node_displacements[conn_pos], dtype=float)
+                        Uneg = np.asarray(deformation.node_displacements[conn_neg], dtype=float)
+                        coords_pos_def = coords_pos_geom + Upos
+                        coords_neg_def = coords_neg_geom + Uneg
+                        for q in range(nQ):
+                            pos_Hxi0[i, q], pos_Hxi1[i, q] = _inverse_hess_for_coords(
+                                coords_pos_def, float(xi_pos[i, q]), float(eta_pos[i, q])
                             )
-
-                basis_tables[f"r{dx}{dy}_{fld}_pos"] = tab_pos
-                basis_tables[f"r{dx}{dy}_{fld}_neg"] = tab_neg
+                            neg_Hxi0[i, q], neg_Hxi1[i, q] = _inverse_hess_for_coords(
+                                coords_neg_def, float(xi_neg[i, q]), float(eta_neg[i, q])
+                            )
+                else:
+                    for i in range(nE):
+                        pe = int(pos_ids[i])
+                        ne = int(neg_ids[i])
+                        for q in range(nQ):
+                            rec = _JET.get(mesh, pe, float(xi_pos[i, q]), float(eta_pos[i, q]), upto=2)
+                            A2 = rec["A2"]
+                            pos_Hxi0[i, q] = A2[0]
+                            pos_Hxi1[i, q] = A2[1]
+                            rec = _JET.get(mesh, ne, float(xi_neg[i, q]), float(eta_neg[i, q]), upto=2)
+                            A2 = rec["A2"]
+                            neg_Hxi0[i, q] = A2[0]
+                            neg_Hxi1[i, q] = A2[1]
 
         out = {
             "eids": np.asarray([int(e.gid) for e in edges], dtype=np.int32),
@@ -5402,6 +5566,15 @@ class DofHandler:
         }
         out.update(masks_by_field)
         out.update(basis_tables)
+        if need_hess:
+            out.update(
+                {
+                    "pos_Hxi0": pos_Hxi0,
+                    "pos_Hxi1": pos_Hxi1,
+                    "neg_Hxi0": neg_Hxi0,
+                    "neg_Hxi1": neg_Hxi1,
+                }
+            )
 
         if reuse:
             _facet_patch_geo_cache_put(geo_cache_key, out)

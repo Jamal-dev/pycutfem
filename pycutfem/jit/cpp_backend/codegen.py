@@ -705,11 +705,19 @@ class CppCodeGen:
                 elif a.kind in {"vec", "mat"}:
                     emit_line(f"auto {nm} = {a.name};")
                     emit_line(f"if (!{flag}_view(e,q)) {nm}.setZero();")
-                elif a.kind in {"grad", "mixed", "hess"}:
+                elif a.kind in {"grad", "mixed"}:
                     emit_line(f"auto {nm} = {a.name};")
                     emit_line(f"if (!{flag}_view(e,q)) {{")
                     emit_line(f"    for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i].setZero();")
                     emit_line("}")
+                elif a.kind == "hess":
+                    emit_line(f"auto {nm} = {a.name};")
+                    if a.role in {"test", "trial"}:
+                        emit_line(f"if (!{flag}_view(e,q)) {{")
+                        emit_line(f"    for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i].setZero();")
+                        emit_line("}")
+                    else:
+                        emit_line(f"if (!{flag}_view(e,q)) {nm}.setZero();")
                 else:
                     emit_line(f"auto {nm} = {a.name};")
                     emit_line(f"if (!{flag}_view(e,q)) {nm}.setZero();")
@@ -1293,12 +1301,22 @@ class CppCodeGen:
                         emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() + {b.name}).matrix();")
                         push_bin("grad", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "hess":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = ({b.name}[_i].array() + {a.name}).matrix();")
+                        if b.role in {"test", "trial"}:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(
+                                f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = ({b.name}[_i].array() + {a.name}).matrix();"
+                            )
+                        else:
+                            emit_line(f"Eigen::MatrixXd {nm} = ({b.name}.array() + {a.name}).matrix();")
                         push_bin("hess", b.role, b.shape, b.field_names, b.parent)
                     elif b.kind == "scalar" and a.kind == "hess":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() + {b.name}).matrix();")
+                        if a.role in {"test", "trial"}:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(
+                                f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() + {b.name}).matrix();"
+                            )
+                        else:
+                            emit_line(f"Eigen::MatrixXd {nm} = ({a.name}.array() + {b.name}).matrix();")
                         push_bin("hess", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "mixed":
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
@@ -1336,9 +1354,29 @@ class CppCodeGen:
                         emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
                         push_bin("mixed", b.role, b.shape, b.field_names, b.parent)
                     elif a.kind == "hess" and b.kind == "hess":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(std::min({a.name}.size(), {b.name}.size()));")
-                        emit_line(f"for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
-                        push_bin("hess", a.role or b.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, combine_side(a.side, b.side), choose_field_sides(a.field_sides, b.field_sides))
+                        # Hessian data has two representations:
+                        # - test/trial basis: std::vector<MatrixXd> (k components), each (n_union, 4)
+                        # - value/function:   MatrixXd (k, 4)
+                        a_is_basis = a.role in {"test", "trial"}
+                        b_is_basis = b.role in {"test", "trial"}
+                        if a_is_basis and b_is_basis:
+                            emit_line(
+                                f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(std::min({a.name}.size(), {b.name}.size()));"
+                            )
+                            emit_line(f"for (size_t _i=0; _i<{nm}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
+                        elif (not a_is_basis) and (not b_is_basis):
+                            emit_line(f"Eigen::MatrixXd {nm} = {a.name} - {b.name};")
+                        else:
+                            raise NotImplementedError("Cannot subtract basis-Hessian from value-Hessian in C++ backend.")
+                        push_bin(
+                            "hess",
+                            a.role or b.role,
+                            a.shape,
+                            a.field_names or b.field_names,
+                            a.parent or b.parent,
+                            combine_side(a.side, b.side),
+                            choose_field_sides(a.field_sides, b.field_sides),
+                        )
                     elif a.kind == "mat" and b.kind == "grad":
                         emit_line(f"auto {nm} = mat_sub_grad({a.name}, GradStack{{{b.name}}}).comps;")
                         push_bin("grad", b.role, b.shape, b.field_names, b.parent)
@@ -1366,12 +1404,22 @@ class CppCodeGen:
                         emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() - {b.name}).matrix();")
                         push_bin("grad", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "hess":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = (-{b.name}[_i].array() + {a.name}).matrix();")
+                        if b.role in {"test", "trial"}:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")
+                            emit_line(
+                                f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = (-{b.name}[_i].array() + {a.name}).matrix();"
+                            )
+                        else:
+                            emit_line(f"Eigen::MatrixXd {nm} = (-{b.name}.array() + {a.name}).matrix();")
                         push_bin("hess", b.role, b.shape, b.field_names, b.parent)
                     elif b.kind == "scalar" and a.kind == "hess":
-                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
-                        emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() - {b.name}).matrix();")
+                        if a.role in {"test", "trial"}:
+                            emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
+                            emit_line(
+                                f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = ({a.name}[_i].array() - {b.name}).matrix();"
+                            )
+                        else:
+                            emit_line(f"Eigen::MatrixXd {nm} = ({a.name}.array() - {b.name}).matrix();")
                         push_bin("hess", a.role, a.shape, a.field_names, a.parent)
                     elif a.kind == "scalar" and b.kind == "mixed":
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());")

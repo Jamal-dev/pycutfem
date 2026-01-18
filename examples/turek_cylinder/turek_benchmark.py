@@ -26,13 +26,13 @@ DFG 2D-1 (steady, Re=20):
 Constant inflow (good for debug / term-by-term parity):
   conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py \\
     --benchmark 2d-2 --backend cpp --with-deformation --inflow constant --init stokes \\
-    --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 1e-2 \\
+    --fe-order 2 --beta0 40 --ghost-measure patch --gamma-gp 1e-2 \\
     --dt 0.01 --theta 0.5 --max-steps 600 --vtk-every 20 --level 3 --newton-tol 1e-8
 
 DFG time-dependent inflow (target for the benchmark 2D-3 setup; runs to t=8):
   conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py \\
     --benchmark 2d-3 --backend cpp --with-deformation --inflow dfg --init stokes \\
-    --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 1e-2 \\
+    --fe-order 2 --beta0 40 --ghost-measure patch --gamma-gp 1e-2 \\
     --dt 0.005 --theta 0.5 --max-steps 1600 --vtk-every 20 --level 3
 
 Mesh level sweep (levels 1..6)
@@ -43,7 +43,7 @@ a dedicated output directory (see below). Example sweep:
   for lv in 1 2 3 4 5 6; do
     conda run --no-capture-output -n xfemcustom python examples/turek_cylinder/turek_benchmark.py \\
       --benchmark 2d-3 --backend cpp --with-deformation --inflow dfg --init stokes \\
-      --fe-order 2 --beta0 100 --ghost-measure patch --gamma-gp 1e-2 \\
+      --fe-order 2 --beta0 40 --ghost-measure patch --gamma-gp 1e-2 \\
       --dt 0.005 --theta 0.5 --max-steps 1600 --vtk-every 50 --level ${lv}
   done
 
@@ -78,6 +78,7 @@ import scipy.sparse.linalg as sp_la
 import numba
 import os
 import argparse
+import json
 import sys
 
 # --- Numba configuration ---
@@ -167,6 +168,16 @@ parser.add_argument(
     default=None,
     help="pressure ghost penalty coefficient (defaults to --gamma-gp)",
 )
+parser.add_argument(
+    "--gamma-gp-hess",
+    type=float,
+    default=0.0,
+    help=(
+        "velocity Hessian ghost-penalty coefficient (j=2 term). "
+        "For robustness this term is integrated on facets (dGhost) even when "
+        "`--ghost-measure=patch`; 0 disables the term."
+    ),
+)
 parser.add_argument("--force-eval", choices=("surface", "babuska", "both"), default="both",
                     help="drag/lift evaluation method: surface (interface), babuska (volume), or both")
 parser.add_argument("--dt", type=float, default=0.1, help="time step size")
@@ -205,6 +216,15 @@ parser.add_argument("--ls-mode", choices=("armijo", "dealii"), default="dealii",
 parser.add_argument("--vtk-every", type=int, default=1,
                     help="write VTU output every N steps (0 disables VTU output)")
 parser.add_argument(
+    "--output-dir",
+    type=str,
+    default=None,
+    help=(
+        "Output directory for CSV/VTU. If relative, it is resolved relative to "
+        "`examples/turek_cylinder/`. Defaults to `turek_results[_lv{level}]`."
+    ),
+)
+parser.add_argument(
     "--diag-interface",
     action="store_true",
     help="compute extra interface diagnostics (slip norms + Nitsche penalty force components)",
@@ -227,6 +247,77 @@ print(f"with_deformation = {with_deformation}")
 print(f"backend = {args.backend}")
 benchmark = str(args.benchmark)
 print(f"benchmark = {benchmark}")
+
+def _maybe_apply_tuned_params(args) -> None:
+    """
+    If `examples/turek_cylinder/tuned_params.json` exists, load a matching entry
+    and override stabilization defaults *only* when the user did not pass the
+    corresponding CLI flag.
+    """
+    tuned_path = Path(__file__).resolve().parent / "tuned_params.json"
+    if not tuned_path.is_file():
+        return
+    try:
+        data = json.loads(tuned_path.read_text())
+    except Exception as exc:
+        print(f"[tuned params] failed to read {tuned_path}: {exc}")
+        return
+    entries = data.get("entries", []) if isinstance(data, dict) else []
+    if not isinstance(entries, list) or not entries:
+        return
+
+    fe_order_eff = int(args.fe_order)
+    p_order_eff = int(args.p_order) if args.p_order is not None else fe_order_eff - 1
+    level_eff = int(args.level) if args.level is not None else None
+    dt_eff = float(args.dt)
+
+    match = None
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("benchmark", "")) != str(args.benchmark):
+            continue
+        if e.get("level", None) != level_eff:
+            continue
+        if str(e.get("ghost_measure", e.get("ghost-measure", ""))) != str(args.ghost_measure):
+            continue
+        if bool(e.get("with_deformation", False)) != bool(with_deformation):
+            continue
+        if int(e.get("fe_order", fe_order_eff)) != fe_order_eff:
+            continue
+        if int(e.get("p_order", p_order_eff)) != p_order_eff:
+            continue
+        # dt matching is intentionally tolerant: allow slight float formatting differences.
+        try:
+            dt_entry = float(e.get("dt", dt_eff))
+        except Exception:
+            dt_entry = dt_eff
+        if abs(dt_entry - dt_eff) > 1e-12:
+            continue
+        match = e
+        break
+
+    if match is None:
+        return
+
+    overrides = {}
+    if not _argv_has("--beta0") and "beta0" in match:
+        overrides["beta0"] = float(match["beta0"])
+        args.beta0 = float(match["beta0"])
+    if not _argv_has("--gamma-gp") and "gamma_gp" in match:
+        overrides["gamma-gp"] = float(match["gamma_gp"])
+        args.gamma_gp = float(match["gamma_gp"])
+    if (not _argv_has("--gamma-gp-p")) and ("gamma_gp_p" in match) and (match.get("gamma_gp_p") is not None):
+        overrides["gamma-gp-p"] = float(match["gamma_gp_p"])
+        args.gamma_gp_p = float(match["gamma_gp_p"])
+    if not _argv_has("--gamma-gp-hess") and "gamma_gp_hess" in match:
+        overrides["gamma-gp-hess"] = float(match["gamma_gp_hess"])
+        args.gamma_gp_hess = float(match["gamma_gp_hess"])
+
+    if overrides:
+        print(f"[tuned params] applied from {tuned_path}: {overrides}")
+
+_maybe_apply_tuned_params(args)
 
 # Optional plotting setup (imports deferred to save startup time when disabled)
 ENABLE_PLOTS = bool(args.plot)
@@ -631,6 +722,20 @@ def nHn(expr,n):
     return dot(dot(Hessian(expr), n),n)
 
 
+def hess_inner_jump(u, v):
+    """
+    Ghost penalty building block: ⟨ [∂²ₙ u], [∂²ₙ v] ⟩ on a facet.
+
+    Uses the directional second derivative along the facet normal:
+      ∂²ₙ u = nᵀ (H u) n.
+    """
+    # IMPORTANT: contract the Hessian with the normal on the *derivative indices*,
+    # i.e. use right-right contractions (H · n) · n, not n · (H · n).
+    a = dot(dot(jump(Hessian(u)), n), n)
+    b = dot(dot(jump(Hessian(v)), n), n)
+    return inner(a, b)
+
+
 
 ghost_edges_used = mesh.edge_bitset('ghost_pos') | mesh.edge_bitset('interface') #| mesh.edge_bitset('ghost_both')
 
@@ -671,32 +776,51 @@ dΓ        = dInterface(
 # do not destroy conditioning or the pressure inf–sup stability.
 ghost_edges_vel = mesh.edge_bitset("ghost")
 ghost_edges_pres = mesh.edge_bitset("ghost")
+# Request only the derivative orders actually needed by the active stabilization:
+# - value/grad jumps: (0,0),(1,0),(0,1)
+# - Hessian jump penalty: additionally (2,0),(1,1),(0,2)
+ghost_derivs = {(0, 0), (1, 0), (0, 1)}
+if float(args.gamma_gp_hess) != 0.0:
+    ghost_derivs |= {(2, 0), (1, 1), (0, 2)}
 if ghost_measure == "patch":
     dG_vel = dFacetPatch(
         defined_on=ghost_edges_vel,
         level_set=analytic_level_set,
-        metadata={"q": volume_quadrature + 1, "derivs": {(0, 0), (0, 1), (1, 0)}},
+        metadata={"q": volume_quadrature + 1, "derivs": ghost_derivs},
         deformation=deformation,
     )
     dG_pres = dFacetPatch(
         defined_on=ghost_edges_pres,
         level_set=analytic_level_set,
-        metadata={"q": volume_quadrature + 1, "derivs": {(0, 0), (0, 1), (1, 0)}},
+        metadata={"q": volume_quadrature + 1, "derivs": ghost_derivs},
         deformation=deformation,
     )
+    # Hessian ghost-penalty is numerically more robust as a *facet* integral:
+    # on a two-cell patch the neighbor-side evaluation happens via polynomial
+    # extension (mapped points outside the reference cell), which can make
+    # second-derivative jumps overly stiff and harm Newton robustness.
+    dG_vel_hess = dG_vel
+    if float(args.gamma_gp_hess) != 0.0:
+        dG_vel_hess = dGhost(
+            defined_on=ghost_edges_vel,
+            level_set=analytic_level_set,
+            metadata={"q": volume_quadrature + 1, "derivs": ghost_derivs},
+            deformation=deformation,
+        )
 else:
     dG_vel = dGhost(
         defined_on=ghost_edges_vel,
         level_set=analytic_level_set,
-        metadata={"q": volume_quadrature + 1, "derivs": {(0, 0), (0, 1), (1, 0)}},
+        metadata={"q": volume_quadrature + 1, "derivs": ghost_derivs},
         deformation=deformation,
     )
     dG_pres = dGhost(
         defined_on=ghost_edges_pres,
         level_set=analytic_level_set,
-        metadata={"q": volume_quadrature + 1, "derivs": {(0, 0), (0, 1), (1, 0)}},
+        metadata={"q": volume_quadrature + 1, "derivs": ghost_derivs},
         deformation=deformation,
     )
+    dG_vel_hess = dG_vel
 
 u_trial_phys = restrict(du, physical_domain)
 v_test_phys = restrict(v, physical_domain)
@@ -915,6 +1039,7 @@ r_vol += outflow_res
 # ghost stabilisation (add exactly as in your Poisson tests) --------
 gamma_gp_u = Constant(float(args.gamma_gp))
 gamma_gp_p = Constant(float(gamma_gp_p_val))
+gamma_gp_hess_u = Constant(float(args.gamma_gp_hess))
 
 # Ghost penalty scaling depends on the integration domain:
 # - `dGhost`: facet integral (|F|~h)  → use facet-style scaling (μ/h, μ h, ...)
@@ -924,13 +1049,17 @@ gamma_gp_p = Constant(float(gamma_gp_p_val))
 if ghost_measure == "patch":
     R_stab = (gamma_gp_u * mu_const / (cell_h * cell_h) * dot(jump(u_k_phys), jump(v_test_phys))) * dG_vel
     J_stab_lin = (gamma_gp_u * mu_const / (cell_h * cell_h) * dot(jump(u_trial_phys), jump(v_test_phys))) * dG_vel
+    if float(args.gamma_gp_hess) != 0.0:
+        # Integrate the j=2 ghost penalty on *facets* even in patch mode.
+        gamma_v_hess = gamma_gp_hess_u * mu_const
+        R_stab += (gamma_v_hess * (cell_h**3.0) / 4.0 * hess_inner_jump(u_k_phys, v_test_phys)) * dG_vel_hess
+        J_stab_lin += (gamma_v_hess * (cell_h**3.0) / 4.0 * hess_inner_jump(u_trial_phys, v_test_phys)) * dG_vel_hess
     R_stab += (gamma_gp_p / mu_const) * (jump(p_k_phys) * jump(q_test_phys)) * dG_pres
     J_stab_lin += (gamma_gp_p / mu_const) * (jump(p_trial_phys) * jump(q_test_phys)) * dG_pres
 else:
-    penalty_val = float(mu)
-    penalty_grad = float(mu)
-    gamma_v = Constant(penalty_val)
-    gamma_v_grad = Constant(penalty_grad)
+    gamma_v = gamma_gp_u * mu_const
+    gamma_v_grad = gamma_gp_u * mu_const
+    gamma_v_hess = gamma_gp_hess_u * mu_const
     # For facet-based pressure stabilization, scale ~ h/μ (value-jump) for Stokes-like regimes.
     gamma_p = Constant(float(gamma_gp_p_val))
 
@@ -942,6 +1071,10 @@ else:
         gamma_v / cell_h * dot(jump(u_trial_phys), jump(v_test_phys))
         + gamma_v_grad * cell_h * grad_inner_jump(u_trial_phys, v_test_phys)
     ) * dG_vel
+    if float(args.gamma_gp_hess) != 0.0:
+        # Facet Hessian ghost penalty for Q2/Q3 (normal second derivative jump).
+        R_stab += (gamma_v_hess * (cell_h**3.0) / 4.0 * hess_inner_jump(u_k_phys, v_test_phys)) * dG_vel
+        J_stab_lin += (gamma_v_hess * (cell_h**3.0) / 4.0 * hess_inner_jump(u_trial_phys, v_test_phys)) * dG_vel
     R_stab += (gamma_p * cell_h / mu_const) * (jump(p_k_phys) * jump(q_test_phys)) * dG_pres
     J_stab_lin += (gamma_p * cell_h / mu_const) * (jump(p_trial_phys) * jump(q_test_phys)) * dG_pres
 # complete Jacobian and residual -----------------------------------
@@ -978,7 +1111,12 @@ from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.fem import transform
 
 out_dir_name = f"turek_results_lv{level}" if level is not None else "turek_results"
-output_dir = Path(__file__).resolve().parent / out_dir_name
+if args.output_dir:
+    output_dir = Path(os.path.expanduser(str(args.output_dir)))
+    if not output_dir.is_absolute():
+        output_dir = (Path(__file__).resolve().parent / output_dir).resolve()
+else:
+    output_dir = Path(__file__).resolve().parent / out_dir_name
 output_dir.mkdir(parents=True, exist_ok=True)
 histories = {}  # Store histories for CD, CL, Δp
 

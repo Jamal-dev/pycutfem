@@ -1544,44 +1544,36 @@ class FormCompiler:
         if isinstance(op, Neg):
             return self._visit(Neg(Hessian(op.operand)))
         if isinstance(op, Restriction):
-            # Evaluate the operand with a coefficient mask so the collapse respects the restriction
-            side = self._active_side()
-            eid  = self.ctx.get('pos_eid' if side == '+' else 'neg_eid', None)
-            gd   = self.ctx.get('global_dofs', None)
-            side = self._active_side()
-            if gd is None:
-                return self._apply_restriction_mask(self._visit(Hessian(op.operand)), op)
-
-            if self.ctx.get('is_ghost', False):
-                idx = self.ctx.get('pos_map' if side == '+' else 'neg_map', None)
-                gmask = np.zeros(len(gd), dtype=float)
-                if idx is not None:
-                    gmask[np.asarray(idx, dtype=int)] = 1.0
+            # `Hessian(restrict(u, domain))` must respect the element-membership gate
+            # (zero on elements not in `domain`) and apply union masks so trial/test
+            # tables are properly restricted on ghost/interface assemblers.
+            eid = self.ctx.get("eid")
+            if eid is None:
+                side = self._active_side()
+                eid = self.ctx.get("pos_eid" if side == "+" else "neg_eid", None)
+            if eid is None:
+                in_domain = True
             else:
-                # (interface path) keep existing φ‑side logic
-                level_set = self.ctx.get('_ghost_level_set', None)
-                pos_masks, neg_masks = _hfa.build_side_masks_by_field(self.dh, fields, int(eid), level_set, tol=SIDE.tol)
-                maps_by_field = self.ctx.get('pos_map_by_field' if side == '+' else 'neg_map_by_field', {})
-                gmask = np.zeros(len(gd), dtype=float)
-                for fld in fields:
-                    local = (pos_masks if side == '+' else neg_masks).get(fld)
-                    fmap  = maps_by_field.get(fld)
-                    if local is not None and fmap is not None and len(local) == len(fmap):
-                        gmask[np.asarray(fmap, dtype=int)] = np.asarray(local, dtype=float)
+                in_domain = (op.domain[int(eid)] if hasattr(op.domain, "__getitem__") else (int(eid) in op.domain))
 
+            if not in_domain:
+                result = self._visit(Hessian(op.operand))
+                if isinstance(result, (VecOpInfo, GradOpInfo, HessOpInfo)):
+                    return result * 0.0
+                if isinstance(result, np.ndarray):
+                    return np.zeros_like(result)
+                return 0.0
 
-            key = 'coeff_mask_pos_global' if side == '+' else 'coeff_mask_neg_global'
-            old_mask   = self.ctx.get(key, None)
-            old_ghost  = self.ctx.get('is_ghost', False)
-            self.ctx[key]   = gmask
-            self.ctx['is_ghost'] = True   # make Hessian path apply the coeff mask
+            depth = int(self.ctx.get("_restriction_mask_active", 0))
+            self.ctx["_restriction_mask_active"] = depth + 1
             try:
-                # Evaluate on the active side so eid/x_phys are consistent
-                return self._with_side(side, 'pos_eid' if side == '+' else 'neg_eid', Hessian(op.operand))
+                result = self._visit(Hessian(op.operand))
             finally:
-                if old_mask is None: self.ctx.pop(key, None)
-                else:                 self.ctx[key] = old_mask
-                self.ctx['is_ghost'] = old_ghost
+                if depth == 0:
+                    self.ctx.pop("_restriction_mask_active", None)
+                else:
+                    self.ctx["_restriction_mask_active"] = depth
+            return self._apply_restriction_mask(result, op)
 
         # Role + component names
         if isinstance(op, (TestFunction, VectorTestFunction)):
@@ -1621,6 +1613,11 @@ class FormCompiler:
                     if self.ctx.get("global_dofs") is not None:
                         side = self._get_side()
                         coeffs_use = _hac._pad_coeffs_to_global(self.ctx, side, fld, coeffs)
+                        mask_dict = self.ctx.get('pos_union_mask_by_field' if side == '+' else 'neg_union_mask_by_field')
+                        if isinstance(mask_dict, dict):
+                            mask = mask_dict.get(fld)
+                            if mask is not None:
+                                coeffs_use = coeffs_use * np.asarray(mask, dtype=coeffs_use.dtype)
                         if self.ctx.get('is_ghost', False):
                             if side == '+':
                                 gmask = self.ctx.get('coeff_mask_pos_global')
@@ -4219,7 +4216,18 @@ class FormCompiler:
                         if use_affine_geo:
                             Ji_pos = np.asarray(Jinv_pos, dtype=float)
                             Ji_neg = np.asarray(Jinv_neg, dtype=float)
-                            deform_ctx_entry = None
+                            # Even under isoparametric deformation we intentionally use an
+                            # affine (corner-based) geometry map for facet-patch stabilizations.
+                            #
+                            # For Hessians we must also ensure the Python backend uses the
+                            # same chain rule as the JIT backends: provide inverse-map jets
+                            # with zero curvature (A2 = 0) instead of falling back to the
+                            # undeformed mesh JET cache.
+                            A2_zero = np.zeros((2, 2, 2), dtype=float)
+                            deform_ctx_entry = {
+                                "+": {"xi": float(xi_pos), "eta": float(eta_pos), "jets": {"A": Ji_pos, "A2": A2_zero}},
+                                "-": {"xi": float(xi_neg), "eta": float(eta_neg), "jets": {"A": Ji_neg, "A2": A2_zero}},
+                            }
                             x_pos = np.asarray(x_origin, dtype=float)
                             x_neg = np.asarray(x_origin, dtype=float)
                         elif deformation is not None:
@@ -4824,8 +4832,11 @@ class FormCompiler:
 
         runner, ir = self._compile_backend(intg.integrand, dh, me_used, on_facet=True)
         derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
-        if need_hess or need_o3 or need_o4:
-            raise NotImplementedError("dFacetPatch JIT currently supports value/grad terms only (no higher jets).")
+        if need_o3 or need_o4:
+            raise NotImplementedError(
+                "dFacetPatch JIT currently supports up to 2nd-order jets (Hessian/Laplacian). "
+                "Higher-order (3rd/4th) inverse-map jets are not implemented."
+            )
 
         max_total = max((ox + oy for (ox, oy) in derivs), default=0)
         qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
