@@ -133,6 +133,35 @@ class Mesh:
 
         elem_node_sets = [set(el.nodes) for el in self.elements_list]
 
+        def _edge_nodes_from_element_side(eid: int, lid: int) -> Tuple[int, ...]:
+            """
+            Return the nodes on local edge `lid` of element `eid` in the canonical
+            CCW direction given by `_EDGE_TABLE` and the element's local node layout.
+            """
+            if int(getattr(self, "poly_order", 1) or 1) <= 1:
+                return ()
+            try:
+                lattice = np.asarray(self.elements_connectivity[int(eid)], dtype=int)
+            except Exception:
+                return ()
+            if self.element_type == "quad":
+                n_lat = int(self.poly_order) + 1
+                if lattice.ndim != 1 or lattice.size != n_lat * n_lat:
+                    return ()
+                grid = lattice.reshape(n_lat, n_lat)
+                if int(lid) == 0:
+                    seq = grid[0, :]  # bottom: bl -> br
+                elif int(lid) == 1:
+                    seq = grid[:, -1]  # right: br -> tr
+                elif int(lid) == 2:
+                    seq = grid[-1, ::-1]  # top: tr -> tl
+                elif int(lid) == 3:
+                    seq = grid[::-1, 0]  # left: tl -> bl
+                else:
+                    return ()
+                return tuple(int(n) for n in np.asarray(seq).ravel())
+            return ()
+
         def _locate_all_nodes_in_edge(vA: int, vB: int, edge_nodes_hint: Optional[Tuple[int, ...]] = None) -> Tuple[int, ...]:
             """
             Return every node that lies on the geometric edge vA→vB.
@@ -149,8 +178,10 @@ class Mesh:
             # Base tolerance for straight edges.
             span_ref = max(L, char_len)
             dist_tol = max(SIDE.tol * L, 5e-8 * span_ref, 1e-10)
-            # If this element stores edge nodes (p>1), allow curvature by
-            # inflating the tolerance with the edge sagitta.
+            # If this element provides higher-order edge nodes, inflate the tolerance
+            # using the observed sagitta so we still recover the intended edge node set
+            # even when nodes are not perfectly collinear (e.g. isoparametric boundaries
+            # or small geometric drift from refinement).
             if edge_nodes_hint:
                 coords_hint = self.nodes_x_y_pos[list(edge_nodes_hint)]
                 cross_hint = np.abs((coords_hint[:, 0] - p0[0]) * d[1] - (coords_hint[:, 1] - p0[1]) * d[0])
@@ -230,6 +261,14 @@ class Mesh:
                         self._neighbors[left_eid].append(right_eid)
                         self._neighbors[right_eid].append(left_eid)
                         elem_edges[right_eid][right_lid].append(edge_gid)
+                edge_nodes_from_elem = (
+                    _edge_nodes_from_element_side(left_eid, left_lid)
+                    if left_eid is not None and left_lid is not None
+                    else ()
+                )
+                if edge_nodes_from_elem:
+                    geom_nodes = edge_nodes_from_elem
+
                 edge_obj = Edge(
                     gid=edge_gid,
                     nodes=(n_start, n_end),

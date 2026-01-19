@@ -387,17 +387,17 @@ jump_vel_res = uf_k - us_k
 
 avg_flux_trial = (
     kappa_pos * traction_fluid(du_f, dp_f)
-    - kappa_neg * traction_solid(ddisp_s)
+    + kappa_neg * traction_solid(ddisp_s)
 )
 
 avg_flux_test = (
     kappa_pos * traction_fluid(test_vel_f, -test_q_f)
-    - kappa_neg * traction_solid(test_vel_s)
+    + kappa_neg * traction_solid(test_vel_s)
 )
 
 avg_flux_res = (
     kappa_pos * traction_fluid(uf_k, pf_k)
-    - kappa_neg * traction_solid(disp_k)
+    + kappa_neg * traction_solid(disp_k)
 )
 
 # --- Jacobian contribution on Γsolid --------------------------------

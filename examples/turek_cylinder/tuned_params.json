@@ -1,0 +1,21 @@
+{
+  "entries": [
+    {
+      "benchmark": "2d-2",
+      "beta0": 20.0,
+      "dt": 0.1,
+      "fe_order": 2,
+      "gamma_gp": 0.03,
+      "gamma_gp_hess": 0.0,
+      "ghost_measure": "patch",
+      "level": 1,
+      "n_done": 50,
+      "p_order": 1,
+      "score": 87.24227995782887,
+      "theta": 0.5,
+      "ts": 1768844148,
+      "with_deformation": false
+    }
+  ],
+  "version": 1
+}

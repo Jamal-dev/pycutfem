@@ -446,9 +446,18 @@ def build_fsi_eulerian_forms(
     avg_flux_fluid_test = kappa_pos * traction_fluid_adjoint(Pos(test_vel_f), Pos(test_q_f))
     avg_flux_fluid_res = kappa_pos * traction_fluid_primal(Pos(uf_k), Pos(pf_k))
 
-    avg_flux_solid_trial = -kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
-    avg_flux_solid_test = -kappa_neg * traction_solid_L(Neg(test_vel_s), Neg(disp_k))
-    avg_flux_solid_res = -kappa_neg * traction_solid_R(Neg(disp_k))
+    # `n` is a single interface normal oriented from (−) solid to (+) fluid.
+    # With this convention the physical dynamic condition is:
+    #   σ_f n = σ_s n  ⇔  t_f = t_s
+    # and the IBP boundary term is:
+    #   B_Γ(v) = ∫_Γ t_f·v_f − t_s·v_s.
+    # The Nitsche consistency term therefore uses the *sum* average
+    #   {t} = κ⁺ t_f + κ⁻ t_s  (κ⁺+κ⁻=1)
+    # so that, on the exact interface condition, {t}=t and the added flux term
+    # cancels B_Γ for arbitrary discontinuous test pairs.
+    avg_flux_solid_trial = kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
+    avg_flux_solid_test = kappa_neg * traction_solid_L(Neg(test_vel_s), Neg(disp_k))
+    avg_flux_solid_res = kappa_neg * traction_solid_R(Neg(disp_k))
 
     s_nitsche = Constant(s_nitsche_value)
 

@@ -1795,9 +1795,9 @@ jump_vel_trial = Jump(du_f, du_s)
 jump_vel_test = Jump(test_vel_f, test_vel_s)
 jump_vel_res = Jump(uf_k, us_k)
 
-avg_flux_trial = kappa_pos * traction_fluid(Pos(du_f), Pos(dp_f)) - kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
-avg_flux_test = kappa_pos * traction_fluid(Pos(test_vel_f), -Pos(test_q_f)) - kappa_neg * traction_solid_L(Neg(test_disp_s), Neg(disp_k))
-avg_flux_res = kappa_pos * traction_fluid(Pos(uf_k), Pos(pf_k)) - kappa_neg * traction_solid_R(Neg(disp_k))
+avg_flux_trial = kappa_pos * traction_fluid(Pos(du_f), Pos(dp_f)) + kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
+avg_flux_test = kappa_pos * traction_fluid(Pos(test_vel_f), -Pos(test_q_f)) + kappa_neg * traction_solid_L(Neg(test_disp_s), Neg(disp_k))
+avg_flux_res = kappa_pos * traction_fluid(Pos(uf_k), Pos(pf_k)) + kappa_neg * traction_solid_R(Neg(disp_k))
 
 J_int = (-dot(avg_flux_trial, jump_vel_test) - dot(avg_flux_test, jump_vel_trial) + (beta_N * mu_f_const / cell_h) * dot(jump_vel_trial, jump_vel_test)) * dΓ
 R_int = (-dot(avg_flux_res, jump_vel_test) - dot(avg_flux_test, jump_vel_res) + (beta_N * mu_f_const / cell_h) * dot(jump_vel_res, jump_vel_test)) * dΓ

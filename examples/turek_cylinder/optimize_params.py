@@ -364,6 +364,24 @@ def _update_tuned_params(best: RunResult, *, tuned_path: Path, meta: dict[str, A
             and abs(float(e.get("dt", entry["dt"])) - float(entry["dt"])) <= 1e-12
         )
 
+    same = [e for e in entries if _same_case(e)]
+    if same:
+        new_score = float(entry.get("score", float("inf")))
+        if not math.isfinite(new_score):
+            return
+        old_scores = []
+        for e in same:
+            try:
+                s = float(e.get("score", float("inf")))
+            except Exception:
+                s = float("inf")
+            if math.isfinite(s):
+                old_scores.append(s)
+        old_best = min(old_scores) if old_scores else float("inf")
+        # Only update this case if we found a strictly better (lower) score.
+        if math.isfinite(old_best) and new_score >= old_best:
+            return
+
     entries = [e for e in entries if not _same_case(e)]
     entries.append(entry)
     doc["entries"] = entries

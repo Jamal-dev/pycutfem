@@ -504,17 +504,17 @@ kappa_pos = Constant(0.5)
 kappa_neg = Constant(0.5)
 avg_flux_trial = (
     kappa_pos * traction_fluid(Pos(du_f), Pos(dp_f))
-    - kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
+    + kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
 )
 
 avg_flux_test = (
     kappa_pos * traction_fluid(Pos(test_vel_f),- Pos(test_q_f))
-    - kappa_neg * traction_solid_L(Neg(test_disp_s), Neg(disp_k))
+    + kappa_neg * traction_solid_L(Neg(test_disp_s), Neg(disp_k))
 )
 
 avg_flux_res = (
     kappa_pos * traction_fluid(Pos(uf_k), Pos(pf_k))
-    - kappa_neg * traction_solid_R(Neg(disp_k))
+    + kappa_neg * traction_solid_R(Neg(disp_k))
 )
 
 
