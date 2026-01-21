@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
-    LoadAnalytic, LoadFacetNormal, Grad, Div, PosOp, NegOp,
+    LoadAnalytic, LoadFacetNormal, Grad, Div, HdivDiv, PosOp, NegOp,
     BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
     MeshSize,
     Trace, Determinant, Inverse, Cofactor, Hessian as IRHessian, Laplacian as IRLaplacian
@@ -337,7 +337,16 @@ class NumbaCodeGen:
                     and a.field_names
                     and any(dim == -1 for dim in a.shape)
                 ):
-                    for i, fld in enumerate(a.field_names):
+                    # Some vector-valued fields (e.g. H(div) RT) use a single
+                    # field name for multiple value components. Apply the same
+                    # restriction mask to every component row.
+                    try:
+                        n_comp = int(a.shape[0]) if (len(a.shape) >= 1 and int(a.shape[0]) > 0) else len(a.field_names)
+                    except Exception:
+                        n_comp = len(a.field_names)
+
+                    for i in range(n_comp):
+                        fld = a.field_names[i] if i < len(a.field_names) else a.field_names[0]
                         side_tag = self._component_side_tag(
                             side, getattr(a, "field_sides", None), fld, i
                         )
@@ -667,6 +676,16 @@ class NumbaCodeGen:
                 field_names = op.field_names
                 is_sided = bool(self.on_facet and op.side in ("+", "-"))
 
+                hdiv_field = None
+                try:
+                    if (
+                        field_names
+                        and len(field_names) == 1
+                        and getattr(self.me, "_field_families", {}).get(str(field_names[0])) == "RT"
+                    ):
+                        hdiv_field = str(field_names[0])
+                except Exception:
+                    hdiv_field = None
 
              
 
@@ -698,9 +717,18 @@ class NumbaCodeGen:
 
          
 
-                # IMPORTANT: pass the index so the helper can pick the correct side per component
-                basis_arg_names = [get_basis_arg_name(fname, deriv_order, i)
-                                for i, fname in enumerate(field_names)]
+                if hdiv_field is not None:
+                    if tuple(deriv_order) != (0, 0):
+                        raise NotImplementedError("Derivatives of H(div) fields are not supported in JIT; use div().")
+                    if is_sided:
+                        side_tag = "pos" if op.side == "+" else "neg"
+                        basis_arg_names = [f"bvec_{hdiv_field}_{side_tag}"]
+                    else:
+                        basis_arg_names = [f"bvec_{hdiv_field}"]
+                else:
+                    # IMPORTANT: pass the index so the helper can pick the correct side per component
+                    basis_arg_names = [get_basis_arg_name(fname, deriv_order, i)
+                                    for i, fname in enumerate(field_names)]
 
 
                 # Only request b_* / d** tables *here* when they are actually needed
@@ -730,7 +758,7 @@ class NumbaCodeGen:
 
                 if op.role in ("test", "trial"):
                     # ---------- facet integrals (+ / -) : pad to union DOFs ----------
-                    if op.side:
+                    if op.side and hdiv_field is None:
                         required_args.add("gdofs_map")  # used for union width                                              # "+" or "-"
                         padded_vars = []                                     # one per component
                         for i, bq in enumerate(basis_vars_at_q):
@@ -752,15 +780,71 @@ class NumbaCodeGen:
                         n_dofs = -1                          # run-time on ghost facets
 
                     # ---------- volume / interface -----------------------------------
-                    else:
+                    elif not op.side:
                         final_basis_var = basis_vars_at_q[0]
                         n_dofs = self.active_n_dofs
+                    else:
+                        # H(div): facet tables are already in union layout (pos/neg).
+                        final_basis_var = basis_vars_at_q[0]
+                        n_dofs = -1
 
                     ox, oy = deriv_order
                     tot = ox + oy
 
                     # ---------- (A) 0th order: keep your fast path -------------------
                     if tot == 0:
+                        if hdiv_field is not None:
+                            if not op.is_vector:
+                                raise NotImplementedError(
+                                    f"RT field '{hdiv_field}' must be used with HdivTestFunction/HdivTrialFunction."
+                                )
+                            # contravariant Piola via adj(J_inv): u = adj(J_inv) @ uhat
+                            if op.side == "+":
+                                sign_tab = f"sign_{hdiv_field}_pos"
+                            elif op.side == "-":
+                                sign_tab = f"sign_{hdiv_field}_neg"
+                            else:
+                                sign_tab = f"sign_{hdiv_field}"
+                            required_args.add(sign_tab)
+                            if op.side == "+":
+                                jinv_sym = "J_inv_pos"
+                            elif op.side == "-":
+                                jinv_sym = "J_inv_neg"
+                            else:
+                                jinv_sym = "J_inv"
+                            required_args.add(jinv_sym)
+
+                            bhat = new_var("bhat")
+                            sgn = new_var("sgn")
+                            adj = new_var("adj")
+                            bphys = new_var("bphys")
+                            body_lines += [
+                                f"{bhat} = {basis_arg_names[0]}[e, q]",  # (2, n_union)
+                                f"{sgn} = {sign_tab}[e]",               # (n_union,)
+                                f"A = {jinv_sym}[e, q]",
+                                f"{adj} = np.empty((2, 2), dtype={self.dtype})",
+                                f"{adj}[0, 0] =  A[1, 1]",
+                                f"{adj}[0, 1] = -A[0, 1]",
+                                f"{adj}[1, 0] = -A[1, 0]",
+                                f"{adj}[1, 1] =  A[0, 0]",
+                                f"{bphys} = {adj} @ {bhat}",
+                                f"{bphys}[0, :] = {bphys}[0, :] * {sgn}",
+                                f"{bphys}[1, :] = {bphys}[1, :] * {sgn}",
+                            ]
+                            stack.append(
+                                StackItem(
+                                    var_name=bphys,
+                                    role=op.role,
+                                    shape=(2, n_dofs),
+                                    is_vector=True,
+                                    field_names=field_names,
+                                    parent_name=op.name,
+                                    side=op.side,
+                                    field_sides=op.field_sides or [],
+                                )
+                            )
+                            continue
+
                         if not op.is_vector:
                             var_name = new_var("basis_reshaped")
                             body_lines.append(f"{var_name} = {final_basis_var}[np.newaxis, :].copy()")
@@ -1010,7 +1094,7 @@ class NumbaCodeGen:
                     # 3-B  Pad reference bases to the DOF-union on ghost facets
                     #      (only used for tot==0 path that uses b_* tables)
                     # --------------------------------------------------------------
-                    if op.side:                                            # "+" or "-"
+                    if op.side and hdiv_field is None:                      # "+" or "-"
                         padded = []
                         for i, b_var in enumerate(basis_vars_at_q):
                             fld_i = field_names[i]
@@ -1038,6 +1122,55 @@ class NumbaCodeGen:
 
                     # --- Case 0: value u(x_q) via b_* --------------------------------
                     if tot == 0:
+                        if hdiv_field is not None:
+                            if op.side == "+":
+                                sign_tab = f"sign_{hdiv_field}_pos"
+                            elif op.side == "-":
+                                sign_tab = f"sign_{hdiv_field}_neg"
+                            else:
+                                sign_tab = f"sign_{hdiv_field}"
+                            required_args.add(sign_tab)
+                            if op.side == "+":
+                                jinv_sym = "J_inv_pos"
+                            elif op.side == "-":
+                                jinv_sym = "J_inv_neg"
+                            else:
+                                jinv_sym = "J_inv"
+                            required_args.add(jinv_sym)
+
+                            bhat = new_var("bhat")
+                            sgn = new_var("sgn")
+                            adj = new_var("adj")
+                            bphys = new_var("bphys")
+                            body_lines += [
+                                f"{bhat} = {basis_arg_names[0]}[e, q]",  # (2, n_union)
+                                f"{sgn} = {sign_tab}[e]",               # (n_union,)
+                                f"A = {jinv_sym}[e, q]",
+                                f"{adj} = np.empty((2, 2), dtype={self.dtype})",
+                                f"{adj}[0, 0] =  A[1, 1]",
+                                f"{adj}[0, 1] = -A[0, 1]",
+                                f"{adj}[1, 0] = -A[1, 0]",
+                                f"{adj}[1, 1] =  A[0, 0]",
+                                f"{bphys} = {adj} @ {bhat}",
+                                f"{bphys}[0, :] = {bphys}[0, :] * {sgn}",
+                                f"{bphys}[1, :] = {bphys}[1, :] * {sgn}",
+                                f"{val_var} = np.array([load_variable_qp({coeff_sym}, {bphys}[0]), load_variable_qp({coeff_sym}, {bphys}[1])], dtype={self.dtype})",
+                            ]
+                            shape = (2,)
+                            stack.append(
+                                StackItem(
+                                    var_name=val_var,
+                                    role="value",
+                                    shape=shape,
+                                    is_vector=True,
+                                    field_names=field_names,
+                                    parent_name=coeff_sym,
+                                    side=op.side,
+                                    field_sides=op.field_sides or [],
+                                )
+                            )
+                            continue
+
                         if op.is_vector:
                             body_lines.append(f"{val_var} = np.zeros(({len(field_names)},), dtype={self.dtype})")
                             for comp_idx, b_var in enumerate(basis_vars_at_q):
@@ -1727,6 +1860,82 @@ class NumbaCodeGen:
                     raise NotImplementedError(
                         f"Div not implemented for role '{a.role}' with gradient=True."
                     )
+
+            elif isinstance(op, HdivDiv):
+                a = stack.pop()
+                if not a.field_names:
+                    raise ValueError("HdivDiv requires field metadata on the stack item.")
+                fld = str(a.field_names[0])
+                fam = getattr(self.me, "_field_families", {}).get(fld, None)
+                if fam != "RT":
+                    raise NotImplementedError(f"HdivDiv only supports RT fields (got {fam!r} for '{fld}').")
+
+                # divergence tables are reference divs; map to physical via /detJ (affine-correct)
+                if a.side == "+":
+                    div_tab = f"div_{fld}_pos"
+                    sign_tab = f"sign_{fld}_pos"
+                    det_tab = "detJ_pos"
+                elif a.side == "-":
+                    div_tab = f"div_{fld}_neg"
+                    sign_tab = f"sign_{fld}_neg"
+                    det_tab = "detJ_neg"
+                else:
+                    div_tab = f"div_{fld}"
+                    sign_tab = f"sign_{fld}"
+                    det_tab = "detJ"
+                required_args.update({div_tab, sign_tab, det_tab})
+
+                # signed physical divergence basis at this quadrature point
+                div_hat = new_var("div_hat")
+                sgn = new_var("sgn")
+                div_phys = new_var("div_phys")
+                body_lines += [
+                    f"{div_hat} = {div_tab}[e, q]",
+                    f"{sgn} = {sign_tab}[e]",
+                    f"{div_phys} = ({div_hat} * {sgn}) / {det_tab}[e, q]",
+                ]
+
+                if a.role in ("test", "trial"):
+                    # scalar basis row (1, n)
+                    div_var = new_var("hdiv_div_basis")
+                    body_lines.append(f"{div_var} = {div_phys}[None, :].copy()")
+                    stack.append(
+                        StackItem(
+                            var_name=div_var,
+                            role=a.role,
+                            shape=(1, -1 if a.side else self.active_n_dofs),
+                            is_vector=False,
+                            is_gradient=False,
+                            field_names=a.field_names,
+                            parent_name=a.parent_name,
+                            side=a.side,
+                            field_sides=a.field_sides or [],
+                        )
+                    )
+                    continue
+
+                if a.role == "value":
+                    coeff_sym = getattr(a, "parent_name", "") or ""
+                    if not coeff_sym:
+                        raise ValueError("HdivDiv(value) requires parent_name=coefficient symbol.")
+                    div_val = new_var("hdiv_div_val")
+                    body_lines.append(f"{div_val} = load_variable_qp({coeff_sym}, {div_phys})")
+                    stack.append(
+                        StackItem(
+                            var_name=div_val,
+                            role="value",
+                            shape=(),
+                            is_vector=False,
+                            is_gradient=False,
+                            field_names=a.field_names,
+                            parent_name=coeff_sym,
+                            side=a.side,
+                            field_sides=a.field_sides or [],
+                        )
+                    )
+                    continue
+
+                raise NotImplementedError(f"HdivDiv not implemented for role '{a.role}'.")
 
             elif isinstance(op, PosOp):
                 a = stack.pop()

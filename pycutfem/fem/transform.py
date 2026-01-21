@@ -81,6 +81,48 @@ def inv_jac_T(mesh, elem_id, xi_eta):
     return np.linalg.inv(J).T
 
 
+def piola_contravariant(J: np.ndarray, detJ: float, uhat: np.ndarray) -> np.ndarray:
+    """
+    Contravariant Piola map for H(div) vector fields (2D).
+
+        u(x) = (J * û(ξ)) / det(J)
+
+    Parameters
+    ----------
+    J : np.ndarray, shape (2,2)
+        Jacobian of the element map at the evaluation point.
+    detJ : float
+        Determinant of J at the evaluation point.
+    uhat : np.ndarray
+        Reference vector values. Supported shapes:
+        - (2,)
+        - (n,2)
+        - (...,2)
+
+    Returns
+    -------
+    np.ndarray
+        Mapped values with the same shape as `uhat`.
+    """
+    J = np.asarray(J, dtype=float)
+    detJ = float(detJ)
+    if J.shape != (2, 2):
+        raise ValueError(f"piola_contravariant expects J shape (2,2), got {J.shape}")
+    if abs(detJ) < 1e-30:
+        raise ValueError("piola_contravariant: detJ is too small")
+
+    v = np.asarray(uhat, dtype=float)
+    if v.ndim == 1:
+        if v.shape != (2,):
+            raise ValueError(f"piola_contravariant expects (2,), got {v.shape}")
+        return (J @ v) / detJ
+
+    if v.shape[-1] != 2:
+        raise ValueError(f"piola_contravariant expects last dim 2, got {v.shape}")
+
+    # Treat last axis as vector components stored as row vectors.
+    return (v @ J.T) / detJ
+
 
 @staticmethod
 def jacobian_1d(mesh, elem_id: int, ref_coords: tuple, local_edge_idx: int) -> float:

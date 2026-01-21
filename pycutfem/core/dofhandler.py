@@ -355,6 +355,12 @@ class DofHandler:
                 self._field_methods = {f: field_methods.get(f, method) for f in self.field_names}
             else:
                 self._field_methods = {f: method for f in self.field_names}
+            # MixedElement families can imply continuity (e.g. DG fields) unless explicitly overridden.
+            families = getattr(self.mixed_element, "_field_families", {})
+            if isinstance(families, dict):
+                for f in self.field_names:
+                    if families.get(f) == "DG" and (field_methods is None or f not in field_methods):
+                        self._field_methods[f] = "dg"
             # Cache token used in internal geometry caches; must change when per-field
             # continuity changes since gdofs_map depends on the numbering.
             self._method_token = (self.method, tuple(sorted(self._field_methods.items())))
@@ -512,6 +518,9 @@ class DofHandler:
         fields = list(self.field_names)
         numset  = getattr(me, "_number_fields", set())
         num_gid = {}      # field -> global id (allocate once)
+        families = getattr(me, "_field_families", {}) if me is not None else {}
+        rt_fields = [f for f in fields if isinstance(families, dict) and families.get(f) == "RT"]
+        std_fields = [f for f in fields if f not in rt_fields]
 
 
         # -------- helpers ---------------------------------------------------------
@@ -540,6 +549,7 @@ class DofHandler:
         # -------- pass 1: per-field CG maps using the transform -------------------
         # element_maps[field][eid] -> list of global dofs (lattice order)
         element_maps: dict[str, list[list[int]]] = {f: [] for f in fields}
+        element_signs: dict[str, list[list[float]]] = {f: [] for f in fields}
 
         # within-field dictionary: (qx, qy) -> gdof  (keeps CG continuity per field)
         key2gdof: dict[str, dict[tuple[float, float], int]] = {f: {} for f in fields}
@@ -552,13 +562,14 @@ class DofHandler:
 
         n_cells = len(mesh.elements_connectivity)
         for eid in range(n_cells):
-            for f in fields:
+            for f in std_fields:
                 if f in numset:
                     if f not in num_gid:
                         num_gid[f] = next_gid; next_gid += 1
                         dof_coords.append((0.0, 0.0))
                     field_gsets[f].add(num_gid[f])
                     element_maps[f].append([int(num_gid[f])]) 
+                    element_signs[f].append([1.0])
                     continue
                 is_dg_field = bool(getattr(self, "_field_methods", {}).get(f, "cg") == "dg")
                 p = int(me._field_orders[f])
@@ -581,8 +592,179 @@ class DofHandler:
                     field_gsets[f].add(gd)
 
                 element_maps[f].append(loc_gids)
+                element_signs[f].append([1.0] * len(loc_gids))
+
+        # -------- pass 1b: H(div) RT fields (topology-based numbering) ------------
+        self._hdiv_field_info = {}
+        corner_conn = getattr(mesh, "corner_connectivity", None)
+        if corner_conn is None:
+            corner_conn = getattr(mesh, "elements_corner_nodes", None)
+        if corner_conn is None:
+            raise RuntimeError("Mesh does not expose corner connectivity needed for RT orientation.")
+
+        edge_table = getattr(mesh, "_EDGE_TABLE", {}).get(mesh.element_type, None)
+        if edge_table is None:
+            raise RuntimeError(f"Unsupported element_type '{mesh.element_type}' for RT numbering.")
+
+        # Build corner-edge entities once per mesh: unique pairs of corner nodes
+        # define the global H(div) facet entities (works for hanging meshes where
+        # a coarse facet may not exist as a mesh Edge segment).
+        edge_key_to_entity: dict[tuple[int, int], int] = {}
+        edge_entity_keys: list[tuple[int, int]] = []
+        edge_entity_owner: list[int] = []
+        edge_entity_owner_oriented: list[tuple[int, int]] = []
+        if rt_fields:
+            for eid in range(n_cells):
+                corners = [int(c) for c in corner_conn[int(eid)]]
+                for c0, c1 in edge_table:
+                    a = int(corners[int(c0)])
+                    b = int(corners[int(c1)])
+                    key = (min(a, b), max(a, b))
+                    if key not in edge_key_to_entity:
+                        edge_key_to_entity[key] = len(edge_entity_keys)
+                        edge_entity_keys.append(key)
+                        edge_entity_owner.append(int(eid))
+                        edge_entity_owner_oriented.append((int(a), int(b)))
+        n_edge_entities = int(len(edge_entity_keys))
+
+        def _edge_normal(n0: int, n1: int) -> np.ndarray:
+            p0 = mesh.nodes_x_y_pos[int(n0)]
+            p1 = mesh.nodes_x_y_pos[int(n1)]
+            d = (p1 - p0).astype(float)
+            raw = np.array([float(d[1]), -float(d[0])], dtype=float)
+            L = float(np.linalg.norm(raw))
+            if L <= 1e-14:
+                return np.array([0.0, 0.0], dtype=float)
+            return raw / L
+
+        def _order_endpoints_by_coords(n0: int, n1: int) -> tuple[int, int]:
+            p0 = mesh.nodes_x_y_pos[int(n0)]
+            p1 = mesh.nodes_x_y_pos[int(n1)]
+            dx = float(abs(p1[0] - p0[0]))
+            dy = float(abs(p1[1] - p0[1]))
+            if dx >= dy:
+                # order by x then y
+                if (p0[0] < p1[0]) or (abs(p0[0] - p1[0]) <= 1e-14 and p0[1] <= p1[1]):
+                    return int(n0), int(n1)
+                return int(n1), int(n0)
+            # order by y then x
+            if (p0[1] < p1[1]) or (abs(p0[1] - p1[1]) <= 1e-14 and p0[0] <= p1[0]):
+                return int(n0), int(n1)
+            return int(n1), int(n0)
+
+        # Oriented edge nodes / normals for each edge entity.
+        edge_entity_nodes: list[tuple[int, int]] = []
+        edge_entity_normals: list[np.ndarray] = []
+        edge_lookup = getattr(mesh, "_edge_dict", {}) if rt_fields else {}
+        for ent, key in enumerate(edge_entity_keys):
+            eobj = edge_lookup.get(tuple(key))
+            if eobj is not None:
+                edge_entity_nodes.append((int(eobj.nodes[0]), int(eobj.nodes[1])))
+                edge_entity_normals.append(np.asarray(eobj.normal, dtype=float))
+            else:
+                start, end = _order_endpoints_by_coords(int(key[0]), int(key[1]))
+                edge_entity_nodes.append((int(start), int(end)))
+                oa, ob = edge_entity_owner_oriented[int(ent)]
+                edge_entity_normals.append(_edge_normal(int(oa), int(ob)))
+
+        for f in rt_fields:
+            if bool(getattr(self, "_field_methods", {}).get(f, "cg") == "dg"):
+                raise NotImplementedError("Discontinuous RT (H(div)) fields are not implemented.")
+            ref = me._ref[f]
+            k = int(me._field_orders[f])
+            n_edge_modes = k + 1
+            n_cell_dofs = int(getattr(ref, "n_cell_dofs", 0))
+            n_loc = int(getattr(ref, "n_dofs", 0))
+            if n_loc <= 0:
+                raise RuntimeError(f"RT reference element for field '{f}' has invalid n_dofs={n_loc}")
+
+            edge_base = int(next_gid)
+            edge_total = int(n_edge_entities * n_edge_modes)
+            cell_base = int(edge_base + edge_total)
+            cell_total = int(n_cells * n_cell_dofs)
+
+            # Ensure dof_coords is aligned with next_gid
+            if len(dof_coords) != next_gid:
+                raise RuntimeError("Internal error: dof_coords length does not match next_gid.")
+
+            # Coordinates: edge-entity midpoints, then element centroids
+            for n0, n1 in edge_entity_nodes:
+                p0 = mesh.nodes_x_y_pos[int(n0)]
+                p1 = mesh.nodes_x_y_pos[int(n1)]
+                mid = (0.5 * (p0 + p1)).astype(float)
+                for _m in range(n_edge_modes):
+                    dof_coords.append((float(mid[0]), float(mid[1])))
+
+            for eid in range(n_cells):
+                corners = np.asarray(corner_conn[int(eid)], dtype=int)
+                cen = np.mean(mesh.nodes_x_y_pos[corners], axis=0)
+                for _r in range(n_cell_dofs):
+                    dof_coords.append((float(cen[0]), float(cen[1])))
+
+            # Local-to-global + orientation signs
+            element_maps[f] = []
+            element_signs[f] = []
+            for eid in range(n_cells):
+                corners = [int(c) for c in corner_conn[int(eid)]]
+                loc: list[int] = []
+                sgn: list[float] = []
+
+                for le, (c0, c1) in enumerate(edge_table):
+                    a = int(corners[int(c0)])
+                    b = int(corners[int(c1)])
+                    key = (min(a, b), max(a, b))
+                    ent = edge_key_to_entity.get(key, None)
+                    if ent is None:
+                        raise RuntimeError(f"Missing RT edge entity for key={key} on element {eid}.")
+
+                    g0, g1 = edge_entity_nodes[int(ent)]
+                    if a == g0 and b == g1:
+                        edge_flip = 1.0
+                    elif a == g1 and b == g0:
+                        edge_flip = -1.0
+                    else:
+                        edge_flip = 1.0
+
+                    n_glob = edge_entity_normals[int(ent)]
+                    n_out = _edge_normal(int(a), int(b))  # outward for CCW element corner ordering
+                    normal_flip = 1.0 if float(np.dot(n_out, n_glob)) >= 0.0 else -1.0
+
+                    for m in range(n_edge_modes):
+                        gd = edge_base + int(ent) * n_edge_modes + m
+                        loc.append(int(gd))
+                        sgn.append(float(normal_flip * (edge_flip**m)))
+
+                for r in range(n_cell_dofs):
+                    gd = cell_base + int(eid) * n_cell_dofs + r
+                    loc.append(int(gd))
+                    sgn.append(1.0)
+
+                if len(loc) != n_loc:
+                    raise RuntimeError(
+                        f"RT local dof count mismatch for field '{f}' on element {eid}: "
+                        f"got {len(loc)} expected {n_loc}"
+                    )
+
+                element_maps[f].append(loc)
+                element_signs[f].append(sgn)
+
+            # Field DOFs and numbering advancement
+            field_gsets[f] = set(range(edge_base, cell_base + cell_total))
+            next_gid = int(cell_base + cell_total)
+            self._hdiv_field_info[f] = {
+                "edge_base": edge_base,
+                "cell_base": cell_base,
+                "k": k,
+                "n_edge_dofs": n_edge_modes,
+                "n_cell_dofs": n_cell_dofs,
+                "edge_key_to_entity": edge_key_to_entity,
+                "edge_entity_keys": edge_entity_keys,
+                "edge_entity_nodes": edge_entity_nodes,
+                "edge_entity_normals": edge_entity_normals,
+            }
 
         self.element_maps = element_maps
+        self.element_signs = element_signs
         self.total_dofs   = int(next_gid)
         self._dof_coords  = np.asarray(dof_coords, dtype=float)
 
@@ -616,6 +798,11 @@ class DofHandler:
         for f in fields:
             if f in numset:
                 # NumberSpace fields have no geometric location.
+                for gd in self._field_slices[f]:
+                    self._dof_to_node_map[int(gd)] = (f, None)
+                continue
+            if isinstance(families, dict) and families.get(f) == "RT":
+                # H(div) DOFs are not point-evaluation DOFs; do not snap to nodes.
                 for gd in self._field_slices[f]:
                     self._dof_to_node_map[int(gd)] = (f, None)
                 continue
@@ -1082,6 +1269,8 @@ class DofHandler:
         (e.g., Q3/Q1 returns 2 DOFs per element along the edge for the Q1 field).
         • For boundary edges (single owner) the existing owner is used.
         """
+        if self.mixed_element is not None and getattr(self.mixed_element, "_field_families", {}).get(field) == "RT":
+            return self.edge_trace_dofs(field, int(edge_id))
         self._ensure_lattice_cache()
         p = self.mixed_element._field_orders[field]
         edge = self.mixed_element.mesh.edge(int(edge_id))
@@ -1115,6 +1304,154 @@ class DofHandler:
         loc_idx = self._edge_lattice_cache[p][local_edge]   # local lattice indices along that edge
         gdofs = self.element_maps[field][eid]
         return [int(gdofs[i]) for i in loc_idx]
+
+
+    def edge_trace_dofs(self, field: str, edge_gid: int) -> list[int]:
+        """
+        Global DOF ids for the H(div) normal-trace moments on a mesh edge.
+
+        For RT_k this returns k+1 DOFs (Legendre modes 0..k) for the given edge.
+        """
+        if self.mixed_element is None:
+            raise RuntimeError("edge_trace_dofs requires a MixedElement-backed DofHandler.")
+        fam = getattr(self.mixed_element, "_field_families", {}).get(field, None)
+        if fam != "RT":
+            raise ValueError(f"edge_trace_dofs is only defined for RT (H(div)) fields, got '{fam}'")
+        info = getattr(self, "_hdiv_field_info", {}).get(field, None)
+        if not isinstance(info, dict):
+            raise RuntimeError(f"H(div) field info not found for '{field}'")
+        n_edge = int(info["n_edge_dofs"])
+        base = int(info["edge_base"])
+        edge_gid = int(edge_gid)
+        edge = self.mixed_element.mesh.edge(int(edge_gid))
+        n0, n1 = int(edge.nodes[0]), int(edge.nodes[1])
+        key = (min(n0, n1), max(n0, n1))
+        key2ent = info.get("edge_key_to_entity", None)
+        if not isinstance(key2ent, dict):
+            raise RuntimeError("Missing edge_key_to_entity mapping for RT field numbering.")
+        ent = key2ent.get(key, None)
+        if ent is None:
+            raise KeyError(f"RT edge entity not found for edge_gid={edge_gid} key={key}.")
+        start = base + int(ent) * n_edge
+        return [int(start + i) for i in range(n_edge)]
+
+    def project_hdiv_boundary_flux(
+        self,
+        field: str,
+        domain_tag: str,
+        g,
+        *,
+        qdeg: int | None = None,
+        locator: Callable[[float, float], bool] | None = None,
+    ) -> Dict[int, float]:
+        """
+        Project a boundary normal flux into RT trace (facet-moment) DOFs.
+
+        Parameters
+        ----------
+        field
+            RT field name.
+        domain_tag
+            Boundary-edge tag name (as stored on `mesh.edges_list[i].tag` and/or `mesh.edge_bitset(tag)`).
+        g
+            Boundary data. Either:
+            • callable: g(x, y) -> scalar (interpreted as u·n) OR g(x, y) -> (gx, gy) (interpreted as vector u),
+            • scalar: constant u·n value.
+        qdeg
+            Gauss–Legendre order on each edge segment. Defaults to `max(2*k+4, 8)`.
+        locator
+            Optional predicate `locator(x, y) -> bool` applied to the edge midpoint to filter edges.
+
+        Returns
+        -------
+        dict[int, float]
+            Map {global_dof_id -> moment_value} for the RT edge-trace DOFs.
+        """
+        import numpy as np
+        from numpy.polynomial.legendre import legval
+        from pycutfem.integration.quadrature import gauss_legendre
+
+        if self.mixed_element is None:
+            raise RuntimeError("project_hdiv_boundary_flux requires a MixedElement-backed DofHandler.")
+        fam = getattr(self.mixed_element, "_field_families", {}).get(field, None)
+        if fam != "RT":
+            raise ValueError(f"project_hdiv_boundary_flux is only defined for RT fields, got {fam!r}.")
+
+        info = getattr(self, "_hdiv_field_info", {}).get(field, None)
+        if not isinstance(info, dict):
+            raise RuntimeError(f"Missing H(div) numbering info for field '{field}'.")
+        k = int(info.get("k", 0))
+        n_edge = int(info.get("n_edge_dofs", k + 1))
+        if n_edge != k + 1:
+            raise RuntimeError("Internal error: RT edge mode count mismatch.")
+
+        qdeg_eff = int(max(2 * k + 4, 8) if qdeg is None else qdeg)
+        s, w_ref = gauss_legendre(qdeg_eff)
+        s = np.asarray(s, dtype=float)
+        w_ref = np.asarray(w_ref, dtype=float)
+
+        mesh = self.mixed_element.mesh
+        out: Dict[int, float] = {}
+
+        # collect boundary edges with this tag
+        edge_ids: list[int] = []
+        try:
+            bs = mesh.edge_bitset(domain_tag)
+            if bs is not None and bs.cardinality() > 0:
+                edge_ids = [int(i) for i in bs.to_indices()]
+        except Exception:
+            edge_ids = []
+        if not edge_ids:
+            for e in getattr(mesh, "edges_list", []):
+                if getattr(e, "tag", None) != domain_tag:
+                    continue
+                edge_ids.append(int(e.gid))
+
+        def _eval_g(xy: np.ndarray) -> float:
+            if callable(g):
+                try:
+                    gv = g(float(xy[0]), float(xy[1]))
+                except TypeError:
+                    gv = g(np.asarray(xy, dtype=float))
+            else:
+                gv = g
+            gv_arr = np.asarray(gv, dtype=float)
+            if gv_arr.ndim == 0:
+                return float(gv_arr)
+            if gv_arr.size != 2:
+                raise ValueError("Boundary flux g must be scalar or 2D vector-valued.")
+            return float(gv_arr.reshape(2,) @ n_global)
+
+        for edge_id in edge_ids:
+            edge = mesh.edge(int(edge_id))
+            # boundary edges only (single owner)
+            if (getattr(edge, "left", None) is not None) and (getattr(edge, "right", None) is not None):
+                continue
+
+            p0 = np.asarray(mesh.nodes_x_y_pos[int(edge.nodes[0])], dtype=float)
+            p1 = np.asarray(mesh.nodes_x_y_pos[int(edge.nodes[1])], dtype=float)
+            mid = 0.5 * (p0 + p1)
+            if locator is not None and not locator(float(mid[0]), float(mid[1])):
+                continue
+
+            # Global edge normal used by RT edge entities (consistent with numbering/orientation).
+            n_global = np.asarray(edge.normal, dtype=float).reshape(2,)
+            half = 0.5 * (p1 - p0)
+            qpts = mid[None, :] + s[:, None] * half[None, :]
+            wts = w_ref * float(np.linalg.norm(half))
+
+            flux = np.asarray([_eval_g(xy) for xy in qpts], dtype=float)  # (nq,)
+            dofs = self.edge_trace_dofs(field, int(edge.gid))
+            if len(dofs) != n_edge:
+                raise RuntimeError("Internal error: edge_trace_dofs length mismatch.")
+
+            for m in range(n_edge):
+                coeff = np.zeros(m + 1, dtype=float)
+                coeff[-1] = 1.0
+                Pm = legval(s, coeff)
+                out[int(dofs[m])] = float(np.sum(wts * flux * Pm))
+
+        return out
 
     
     def build_high_order_topology_view(self, field: str):
@@ -1487,6 +1824,20 @@ class DofHandler:
             if field not in cg_fields:
                 continue
 
+            # RT (H(div)) boundary conditions are flux conditions on the normal trace,
+            # not nodal point values. Project g·n into the edge-moment DOFs.
+            fam = getattr(self.mixed_element, "_field_families", {}).get(field, "Lagrange")
+            if fam == "RT":
+                locator = locators.get(tag)
+                rt_vals = self.project_hdiv_boundary_flux(
+                    field,
+                    tag,
+                    getattr(bc, "value", 0.0),
+                    locator=locator,
+                )
+                out.update({int(k): float(v) for k, v in rt_vals.items()})
+                continue
+
             selected: set[int] = set()
 
             # (A) edge tag → edge.all_nodes → dof_map[field]
@@ -1838,6 +2189,16 @@ class DofHandler:
         mesh = self.mixed_element.mesh
         nodes_xy = np.asarray(mesh.nodes_x_y_pos, dtype=float)
         elem_node_sets = [set(el.nodes) for el in mesh.elements_list]
+        families = getattr(self.mixed_element, "_field_families", {}) if self.mixed_element is not None else {}
+        rt_fields = [f for f in self.field_names if isinstance(families, dict) and families.get(f) == "RT"]
+        edge_table = getattr(mesh, "_EDGE_TABLE", {}).get(mesh.element_type, None) if rt_fields else None
+        corner_conn = getattr(mesh, "corner_connectivity", None)
+        if corner_conn is None:
+            corner_conn = getattr(mesh, "elements_corner_nodes", None)
+        if rt_fields and edge_table is None:
+            raise RuntimeError("Mesh does not provide edge-table metadata required for RT hanging constraints.")
+        if rt_fields and corner_conn is None:
+            raise RuntimeError("Mesh does not provide corner connectivity required for RT hanging constraints.")
 
         def _lagrange_weights_1d(s_nodes: List[float], s_eval: float) -> List[float]:
             n = len(s_nodes)
@@ -1948,6 +2309,131 @@ class DofHandler:
 
             coarse_nodes = [nid for nid, _ in coarse_sorted]
             coarse_s = [val for _, val in coarse_sorted]
+
+            # --- RT hanging-edge constraints (H(div)) ---------------------------
+            # Constrain fine-edge Legendre moments to the coarse-edge moments.
+            if rt_fields:
+                try:
+                    from numpy.polynomial.legendre import legval
+                    from pycutfem.integration.quadrature import gauss_legendre
+                except Exception:
+                    legval = None
+                    gauss_legendre = None
+
+                # Pick one representative segment edge to get each element's local side id.
+                seg_edges = rec.get("edges", [])
+                if seg_edges:
+                    e0 = seg_edges[0]
+
+                    def _lid_for(edge_obj, eid: int) -> int | None:
+                        if int(edge_obj.left) == int(eid):
+                            return int(edge_obj.lid)
+                        if edge_obj.right is not None and int(edge_obj.right) == int(eid):
+                            return int(edge_obj.right_lid)
+                        return None
+
+                    coarse_lid = _lid_for(e0, int(coarse_side[2]))
+                    fine_lid = _lid_for(e0, int(fine_side[2]))
+                    if coarse_lid is not None and fine_lid is not None and legval is not None and gauss_legendre is not None:
+                        coarse_eid = int(coarse_side[2])
+                        fine_eid = int(fine_side[2])
+
+                        coarse_corners = [int(c) for c in corner_conn[int(coarse_eid)]]
+                        fine_corners = [int(c) for c in corner_conn[int(fine_eid)]]
+
+                        c0, c1 = edge_table[int(coarse_lid)]
+                        a0 = int(coarse_corners[int(c0)])
+                        a1 = int(coarse_corners[int(c1)])
+                        coarse_key = (min(a0, a1), max(a0, a1))
+
+                        f0, f1 = edge_table[int(fine_lid)]
+                        b0 = int(fine_corners[int(f0)])
+                        b1 = int(fine_corners[int(f1)])
+                        fine_key = (min(b0, b1), max(b0, b1))
+
+                        for fld in rt_fields:
+                            info = getattr(self, "_hdiv_field_info", {}).get(fld, None)
+                            if not isinstance(info, dict):
+                                continue
+                            key2ent = info.get("edge_key_to_entity", None)
+                            if not isinstance(key2ent, dict):
+                                continue
+                            ent_coarse = key2ent.get(coarse_key, None)
+                            ent_fine = key2ent.get(fine_key, None)
+                            if ent_coarse is None or ent_fine is None or int(ent_coarse) == int(ent_fine):
+                                continue
+
+                            nodes_list = info.get("edge_entity_nodes", None)
+                            normals_list = info.get("edge_entity_normals", None)
+                            if not isinstance(nodes_list, list) or not isinstance(normals_list, list):
+                                continue
+                            if int(ent_coarse) >= len(nodes_list) or int(ent_fine) >= len(nodes_list):
+                                continue
+                            if int(ent_coarse) >= len(normals_list) or int(ent_fine) >= len(normals_list):
+                                continue
+
+                            m0, m1 = nodes_list[int(ent_coarse)]
+                            f0n, f1n = nodes_list[int(ent_fine)]
+                            pM0 = nodes_xy[int(m0)]
+                            pM1 = nodes_xy[int(m1)]
+                            pF0 = nodes_xy[int(f0n)]
+                            pF1 = nodes_xy[int(f1n)]
+
+                            dM = pM1 - pM0
+                            Lm2 = float(np.dot(dM, dM))
+                            Lm = float(np.sqrt(Lm2))
+                            Lf = float(np.linalg.norm(pF1 - pF0))
+                            if Lm2 <= 1e-30 or Lf <= 1e-14:
+                                continue
+
+                            nM = np.asarray(normals_list[int(ent_coarse)], dtype=float).ravel()
+                            nF = np.asarray(normals_list[int(ent_fine)], dtype=float).ravel()
+                            dot_nf = float(np.dot(nF, nM))
+                            normal_rel = 1.0 if dot_nf >= 0.0 else -1.0
+
+                            k = int(info.get("k", 0))
+                            n_edge = int(info.get("n_edge_dofs", k + 1))
+                            if n_edge != k + 1:
+                                continue
+
+                            # Quadrature order: enough to integrate products up to degree 2k.
+                            nq = max(int(k) + 2, 4)
+                            s_f, w_f = gauss_legendre(int(nq))
+                            s_f = np.asarray(s_f, dtype=float)
+                            w_f = np.asarray(w_f, dtype=float)
+
+                            # physical points on fine edge (global orientation is f0n -> f1n)
+                            xq = 0.5 * (1.0 - s_f)[:, None] * pF0[None, :] + 0.5 * (1.0 + s_f)[:, None] * pF1[None, :]
+                            t = ((xq - pM0[None, :]) @ dM) / Lm2
+                            s_m = 2.0 * t - 1.0
+
+                            # Legendre tables on [-1,1]
+                            P_f = np.zeros((k + 1, s_f.size), dtype=float)
+                            P_m = np.zeros((k + 1, s_f.size), dtype=float)
+                            for deg in range(k + 1):
+                                c = np.zeros(deg + 1, dtype=float)
+                                c[-1] = 1.0
+                                P_f[deg, :] = legval(s_f, c)
+                                P_m[deg, :] = legval(s_m, c)
+
+                            I = P_f @ (P_m * w_f[None, :]).T  # (m,j): ∫ P_j(s_m(s_f)) P_m(s_f) ds_f
+                            factors = normal_rel * (Lf / 2.0) / Lm * (2.0 * np.arange(k + 1, dtype=float) + 1.0)
+                            T = I * factors[None, :]  # (k+1,k+1)
+                            base = int(info.get("edge_base", 0))
+
+                            for m in range(n_edge):
+                                sdof = base + int(ent_fine) * n_edge + m
+                                if sdof in slave_to_master:
+                                    continue
+                                combo: list[tuple[int, float]] = []
+                                for j in range(n_edge):
+                                    w = float(T[m, j])
+                                    if abs(w) <= 1e-14:
+                                        continue
+                                    mdof = base + int(ent_coarse) * n_edge + j
+                                    combo.append((int(mdof), w))
+                                if combo:
+                                    slave_to_master[int(sdof)] = combo
 
             for slave_nid, s_slave in fine_map.items():
                 if slave_nid in coarse_map:
@@ -3238,12 +3724,16 @@ class DofHandler:
         # ------------------------------------------------------------------------------
         # 6) Basis & reference derivatives up to requested order
         # ------------------------------------------------------------------------------
-        b_tabs = {f: np.zeros((nE, nQ, n_union), dtype=float) for f in fields}
-        g_tabs = {f: np.zeros((nE, nQ, n_union, 2), dtype=float) for f in fields}
+        families = getattr(me, "_field_families", {}) if me is not None else {}
+        rt_fields = [f for f in fields if isinstance(families, dict) and families.get(f) == "RT"]
+        scalar_fields = [f for f in fields if f not in rt_fields]
+
+        b_tabs = {f: np.zeros((nE, nQ, n_union), dtype=float) for f in scalar_fields}
+        g_tabs = {f: np.zeros((nE, nQ, n_union, 2), dtype=float) for f in scalar_fields}
         xi_flat  = xi_tab.reshape(-1)
         eta_flat = eta_tab.reshape(-1)
 
-        for fld in fields:
+        for fld in scalar_fields:
             sl = self.mixed_element.component_dof_slices[fld]
             B = me._eval_scalar_basis_many(fld, xi_flat, eta_flat).reshape(nE, nQ, -1)
             G = me._eval_scalar_grad_many (fld, xi_flat, eta_flat).reshape(nE, nQ, -1, 2)
@@ -3273,7 +3763,7 @@ class DofHandler:
                             fld_name, float(xi_tab[e, q]), float(eta_tab[e, q]), int(dx), int(dy)
                         )
 
-        for fld in fields:
+        for fld in scalar_fields:
             sl   = me.component_dof_slices[fld]
             ordf = me._field_orders[fld]
             n_f  = sl.stop - sl.start
@@ -3283,6 +3773,52 @@ class DofHandler:
                 arr = np.zeros((nE, nQ, n_union), dtype=float)
                 arr[:, :, sl] = loc
                 d_tabs[f"d{dx}{dy}_{fld}"] = arr
+
+        # H(div) RT reference tables on the interface quadrature points (union layout).
+        # These are reference-space (hat) values; JIT/C++ kernels apply Piola via J_inv_*.
+        hdiv_tabs: Dict[str, np.ndarray] = {}
+        for fld in rt_fields:
+            ref_rt = me._ref[fld]
+            sl = me.component_dof_slices[fld]
+            nloc_f = int(sl.stop - sl.start)
+
+            bvec = np.zeros((nE, nQ, 2, n_union), dtype=float)
+            div = np.zeros((nE, nQ, n_union), dtype=float)
+            sign = np.ones((nE, n_union), dtype=float)
+
+            for i, eid in enumerate(seg_eids):
+                eid_i = int(eid)
+                sgn_loc = np.asarray(self.element_signs[fld][eid_i], dtype=float).ravel()
+                if sgn_loc.shape[0] != nloc_f:
+                    raise RuntimeError(
+                        f"RT element_signs length mismatch for field '{fld}' on element {eid_i}."
+                    )
+                sign[i, sl] = sgn_loc
+                for q in range(nQ):
+                    xi = float(xi_tab[i, q])
+                    eta = float(eta_tab[i, q])
+                    Vhat = np.asarray(ref_rt.tabulate_value(xi, eta), dtype=float)
+                    if Vhat.shape != (nloc_f, 2):
+                        raise RuntimeError("RT tabulate_value shape mismatch in interface precompute.")
+                    bvec[i, q, 0, sl] = Vhat[:, 0]
+                    bvec[i, q, 1, sl] = Vhat[:, 1]
+
+                    dV = np.asarray(ref_rt.tabulate_div(xi, eta), dtype=float).ravel()
+                    if dV.shape[0] != nloc_f:
+                        raise RuntimeError("RT tabulate_div shape mismatch in interface precompute.")
+                    div[i, q, sl] = dV
+
+            # Unsided tables (for dx-style kernels compiled against interface factors)
+            hdiv_tabs[f"bvec_{fld}"] = np.ascontiguousarray(bvec)
+            hdiv_tabs[f"div_{fld}"] = np.ascontiguousarray(div)
+            hdiv_tabs[f"sign_{fld}"] = np.ascontiguousarray(sign)
+            # Side aliases: dInterface uses '+'/'-' to denote Ω^± within the same owner element.
+            hdiv_tabs[f"bvec_{fld}_pos"] = hdiv_tabs[f"bvec_{fld}"]
+            hdiv_tabs[f"bvec_{fld}_neg"] = hdiv_tabs[f"bvec_{fld}"]
+            hdiv_tabs[f"div_{fld}_pos"] = hdiv_tabs[f"div_{fld}"]
+            hdiv_tabs[f"div_{fld}_neg"] = hdiv_tabs[f"div_{fld}"]
+            hdiv_tabs[f"sign_{fld}_pos"] = hdiv_tabs[f"sign_{fld}"]
+            hdiv_tabs[f"sign_{fld}_neg"] = hdiv_tabs[f"sign_{fld}"]
 
         # ------------------------------------------------------------------------------
         # 7) owner/side maps + (optional) inverse‑map jets (Hxi/Txi/Qxi) for chain rule
@@ -3359,6 +3895,8 @@ class DofHandler:
             # side aliases (same element on both sides for dInterface)
             "J_inv_pos":   J_inv,
             "J_inv_neg":   J_inv,
+            "detJ_pos":    detJ,
+            "detJ_neg":    detJ,
             "pos_map":     pos_map,
             "neg_map":     neg_map,
             # owner info (both sides = same element id)
@@ -3366,12 +3904,18 @@ class DofHandler:
             "owner_pos_id": np.asarray(seg_eids, dtype=np.int32),
             "owner_neg_id": np.asarray(seg_eids, dtype=np.int32),
         }
-        for fld in fields:
+        for fld in scalar_fields:
             out[f"b_{fld}"] = b_tabs[fld]
             out[f"g_{fld}"] = g_tabs[fld]
             if level_set is not None:
                 out[f"restrict_mask_{fld}_pos"] = restrict_pos_by_field[fld]
                 out[f"restrict_mask_{fld}_neg"] = restrict_neg_by_field[fld]
+        # Provide restriction masks for RT fields too (neutral masks = ones on the field slice).
+        for fld in rt_fields:
+            if level_set is not None:
+                out[f"restrict_mask_{fld}_pos"] = restrict_pos_by_field[fld]
+                out[f"restrict_mask_{fld}_neg"] = restrict_neg_by_field[fld]
+        out.update(hdiv_tabs)
         out.update(d_tabs)
         if need_hess:
             out["Hxi0"] = Hxi0; out["Hxi1"] = Hxi1
@@ -4244,7 +4788,11 @@ class DofHandler:
                         fld, float(xi[e, q]), float(eta[e, q]), int(dx), int(dy)
                     )
 
-        for fld in fields:
+        families = getattr(me, "_field_families", {})
+        rt_fields = [f for f in fields if families.get(f) == "RT"]
+        scalar_fields = [f for f in fields if f not in rt_fields]
+
+        for fld in scalar_fields:
             p_f = me._field_orders[fld]
             sl  = me.component_dof_slices[fld]
             n_f = sl.stop - sl.start
@@ -4339,6 +4887,72 @@ class DofHandler:
                 basis_tables[f"r13_{fld}_neg"] = _scatter_union(arr, sl, final_w)
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 4, xi_neg, eta_neg, arr)
                 basis_tables[f"r04_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+
+        # 5b) H(div) RT tables (reference-space, union layout) ---------------------
+        # Provide side-specific bvec/div/sign tables so JIT/C++ kernels can evaluate
+        # H(div) test/trial/function values on ghost facets.
+        for fld in rt_fields:
+            ref_rt = me._ref[fld]
+            pm = maps_by_field.get(f"pos_map_{fld}")
+            nm = maps_by_field.get(f"neg_map_{fld}")
+            if not isinstance(pm, np.ndarray) or not isinstance(nm, np.ndarray):
+                continue
+            nloc_f = int(pm.shape[1])
+
+            bvec_pos = np.zeros((nE, nQ, 2, n_union), dtype=np.float64)
+            bvec_neg = np.zeros((nE, nQ, 2, n_union), dtype=np.float64)
+            div_pos = np.zeros((nE, nQ, n_union), dtype=np.float64)
+            div_neg = np.zeros((nE, nQ, n_union), dtype=np.float64)
+            sign_pos = np.ones((nE, n_union), dtype=np.float64)
+            sign_neg = np.ones((nE, n_union), dtype=np.float64)
+
+            for i in range(nE):
+                pos_eid = int(pos_ids[i])
+                neg_eid = int(neg_ids[i])
+                cols_p = np.asarray(pm[i], dtype=np.int32).ravel()
+                cols_n = np.asarray(nm[i], dtype=np.int32).ravel()
+                okp = (cols_p >= 0) & (cols_p < n_union)
+                okn = (cols_n >= 0) & (cols_n < n_union)
+
+                sgn_p_loc = np.asarray(self.element_signs[fld][pos_eid], dtype=np.float64).ravel()
+                sgn_n_loc = np.asarray(self.element_signs[fld][neg_eid], dtype=np.float64).ravel()
+                if sgn_p_loc.shape[0] != nloc_f or sgn_n_loc.shape[0] != nloc_f:
+                    raise RuntimeError("RT element_signs length mismatch in ghost precompute.")
+                if np.any(okp):
+                    sign_pos[i, cols_p[okp]] = sgn_p_loc[okp]
+                if np.any(okn):
+                    sign_neg[i, cols_n[okn]] = sgn_n_loc[okn]
+
+                for q in range(nQ):
+                    xi_p = float(xi_pos[i, q]); eta_p = float(eta_pos[i, q])
+                    xi_n = float(xi_neg[i, q]); eta_n = float(eta_neg[i, q])
+
+                    Vp = np.asarray(ref_rt.tabulate_value(xi_p, eta_p), dtype=np.float64)
+                    Vn = np.asarray(ref_rt.tabulate_value(xi_n, eta_n), dtype=np.float64)
+                    if Vp.shape[0] != nloc_f or Vn.shape[0] != nloc_f:
+                        raise RuntimeError("RT basis tabulation size mismatch in ghost precompute.")
+                    if np.any(okp):
+                        bvec_pos[i, q, 0, cols_p[okp]] = Vp[okp, 0]
+                        bvec_pos[i, q, 1, cols_p[okp]] = Vp[okp, 1]
+                    if np.any(okn):
+                        bvec_neg[i, q, 0, cols_n[okn]] = Vn[okn, 0]
+                        bvec_neg[i, q, 1, cols_n[okn]] = Vn[okn, 1]
+
+                    dp = np.asarray(ref_rt.tabulate_div(xi_p, eta_p), dtype=np.float64).ravel()
+                    dn = np.asarray(ref_rt.tabulate_div(xi_n, eta_n), dtype=np.float64).ravel()
+                    if dp.shape[0] != nloc_f or dn.shape[0] != nloc_f:
+                        raise RuntimeError("RT div tabulation size mismatch in ghost precompute.")
+                    if np.any(okp):
+                        div_pos[i, q, cols_p[okp]] = dp[okp]
+                    if np.any(okn):
+                        div_neg[i, q, cols_n[okn]] = dn[okn]
+
+            basis_tables[f"bvec_{fld}_pos"] = np.ascontiguousarray(bvec_pos)
+            basis_tables[f"bvec_{fld}_neg"] = np.ascontiguousarray(bvec_neg)
+            basis_tables[f"div_{fld}_pos"] = np.ascontiguousarray(div_pos)
+            basis_tables[f"div_{fld}_neg"] = np.ascontiguousarray(div_neg)
+            basis_tables[f"sign_{fld}_pos"] = np.ascontiguousarray(sign_pos)
+            basis_tables[f"sign_{fld}_neg"] = np.ascontiguousarray(sign_neg)
 
         def _inverse_jets_for_coords(coords_def_elem: np.ndarray, xi: float, eta: float, upto: int) -> Dict[str, np.ndarray]:
             xi = float(xi); eta = float(eta)

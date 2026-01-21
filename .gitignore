@@ -215,3 +215,8 @@ _sweep_*/
 turek_2D-*/
 _sweep_results*
 examples/turek_cylinder/tmp*/
+examples/turek_cylinder/opt_runs/
+examples/poroelasticity/pycutfem_out*/
+examples/poroelasticity/fenics_monolithic_out*/
+examples/poroelasticity/convergence_out_*/
+examples/poroelasticity/fenics_out*/

@@ -155,16 +155,30 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
     # Active fields & union mask for this kernel
     def _active_field_order():
-        seen = set(); order = []
+        """
+        Determine which fields are active for this kernel while preserving the
+        MixedElement DOF ordering.
+
+        IMPORTANT: The union-local DOF layout (and thus r** tables, slices, and
+        gdofs_map) is order-dependent. Do *not* reorder fields based on first
+        appearance in the IR; only *filter* the MixedElement order.
+        """
+        me_order = list(getattr(mixed_element, "field_names", ()))
+        me_fields = set(me_order)
+        active: set[str] = set()
         for op in ir:
-            if hasattr(op, "field_names"):
-                for f in getattr(op, "field_names", []) or []:
-                    if f in seen or f not in mixed_element.field_names:
-                        continue
-                    seen.add(f); order.append(f)
-        if not order:
-            order = list(mixed_element.field_names)
-        return order
+            fns = getattr(op, "field_names", None)
+            if fns:
+                for f in fns or []:
+                    if f in me_fields:
+                        active.add(f)
+                continue
+            f = getattr(op, "field_name", None)
+            if f in me_fields:
+                active.add(f)
+        if not active:
+            return me_order
+        return [f for f in me_order if f in active]
 
     _active_fields = _active_field_order()
     _active_cols = np.concatenate(
@@ -218,6 +232,86 @@ def _build_jit_kernel_args(       # ← signature unchanged
             )
             return _expand_per_element(ref)
         return _cached_ref_table("deriv", field, _build, deriv=(ax, ay))
+
+    # --- H(div) RT tables (reference-space, union-padded) ----------------------
+    def _hdiv_bvec_table(field: str) -> np.ndarray:
+        """
+        Reference RT basis values, union-padded.
+
+        Returns shape (n_elem, n_q, 2, n_union).
+        """
+        fam = getattr(mixed_element, "_field_families", {}).get(field, None)
+        if fam != "RT":
+            raise ValueError(f"Requested bvec_{field} for non-RT field family {fam!r}.")
+
+        def _build():
+            n_union = int(getattr(mixed_element, "n_dofs_local", 0))
+            sl = mixed_element.component_dof_slices[field]
+            out_ref = np.zeros((len(qp_ref), 2, n_union), dtype=np.float64)
+            ref_obj = mixed_element._ref[field]
+            for q, (xi, eta) in enumerate(qp_ref):
+                Vhat = np.asarray(ref_obj.tabulate_value(float(xi), float(eta)), dtype=np.float64)  # (n_loc,2)
+                out_ref[q, :, sl] = Vhat.T
+            return np.ascontiguousarray(_expand_per_element(out_ref))  # (n_elem,n_q,2,n_union)
+
+        return _cached_ref_table("hdiv_bvec", field, _build)
+
+    def _hdiv_div_table(field: str) -> np.ndarray:
+        """
+        Reference RT divergences, union-padded.
+
+        Returns shape (n_elem, n_q, n_union).
+        """
+        fam = getattr(mixed_element, "_field_families", {}).get(field, None)
+        if fam != "RT":
+            raise ValueError(f"Requested div_{field} for non-RT field family {fam!r}.")
+
+        def _build():
+            n_union = int(getattr(mixed_element, "n_dofs_local", 0))
+            sl = mixed_element.component_dof_slices[field]
+            out_ref = np.zeros((len(qp_ref), n_union), dtype=np.float64)
+            ref_obj = mixed_element._ref[field]
+            for q, (xi, eta) in enumerate(qp_ref):
+                div_hat = np.asarray(ref_obj.tabulate_div(float(xi), float(eta)), dtype=np.float64).ravel()
+                out_ref[q, sl] = div_hat
+            return np.ascontiguousarray(_expand_per_element(out_ref))  # (n_elem,n_q,n_union)
+
+        return _cached_ref_table("hdiv_div", field, _build)
+
+    def _hdiv_sign_table(field: str) -> np.ndarray:
+        """
+        Per-element RT orientation signs, union-padded.
+
+        Returns shape (n_elem, n_union).
+        """
+        fam = getattr(mixed_element, "_field_families", {}).get(field, None)
+        if fam != "RT":
+            raise ValueError(f"Requested sign_{field} for non-RT field family {fam!r}.")
+
+        n_union = int(getattr(mixed_element, "n_dofs_local", 0))
+        sl = mixed_element.component_dof_slices[field]
+        out = np.ones((n_elem, n_union), dtype=np.float64)
+
+        owners = None
+        if pre_built is not None:
+            owners = _first_present(pre_built, "owner_id", "eids")
+        if owners is None:
+            owners = np.arange(n_elem, dtype=np.int32)
+        owners = np.asarray(owners, dtype=np.int64).ravel()
+        if owners.shape[0] != n_elem:
+            raise ValueError("sign_<field>: owner_id/eids length mismatch with n_elem.")
+
+        try:
+            signs_all = dof_handler.element_signs[field]
+        except Exception as exc:
+            raise RuntimeError(f"Missing dof_handler.element_signs for RT field '{field}'.") from exc
+
+        for e in range(n_elem):
+            eid = int(owners[e])
+            sgn_loc = np.asarray(signs_all[eid], dtype=np.float64).ravel()
+            out[e, sl] = sgn_loc
+
+        return out
     # NEW: evaluate at interface physical quadrature points (qp_phys)
     def _n_union_for_eid(eid: int) -> int:
         return len(dof_handler.get_elemental_dofs(int(eid)))
@@ -561,22 +655,34 @@ def _build_jit_kernel_args(       # ← signature unchanged
                                 f"_build_jit_kernel_args: cannot build '{side}_map_{fld}': "
                                 f"missing component_dof_slices for field '{fld}'."
                             )
-                        # `compile_multi` may compress `gdofs_map` to the kernel's active columns
-                        # (subset of mixed-element local indices). In that case, the union width
-                        # is `len(active_cols)` and component slices must be mapped through the
-                        # active-col permutation.
-                        full_to_union = {int(old): int(new) for new, old in enumerate(_active_cols)}
-                        row = np.asarray(
-                            [full_to_union.get(int(i), -1) for i in range(int(sl.start), int(sl.stop))],
-                            dtype=np.int32,
-                        )
-                        if np.any(row < 0):
-                            missing = [int(i) for i in range(int(sl.start), int(sl.stop)) if int(i) not in full_to_union]
-                            raise ValueError(
-                                f"_build_jit_kernel_args: cannot build '{side}_map_{fld}': "
-                                f"active-col compression dropped local indices {missing} for slice {sl} "
-                                f"(union width n_union={n_union})."
+                        full_n = int(getattr(mixed_element, "n_dofs_local", n_union))
+                        # IMPORTANT:
+                        # - When `gdofs_map` is full-union (width == full_n), maps must be
+                        #   expressed in full local indices so the assembler can later compress
+                        #   /remap them consistently via `_compress_static_for_active`.
+                        # - When `gdofs_map` is already compressed (width < full_n), maps must be
+                        #   expressed in that compressed union indexing.
+                        if int(n_union) == full_n:
+                            row = np.arange(int(sl.start), int(sl.stop), dtype=np.int32)
+                        else:
+                            # Fall back to mapping through this function's active-col ordering.
+                            # This assumes the caller compressed gdofs_map with the same active_cols.
+                            full_to_union = {int(old): int(new) for new, old in enumerate(_active_cols)}
+                            row = np.asarray(
+                                [full_to_union.get(int(i), -1) for i in range(int(sl.start), int(sl.stop))],
+                                dtype=np.int32,
                             )
+                            if np.any(row < 0):
+                                missing = [
+                                    int(i)
+                                    for i in range(int(sl.start), int(sl.stop))
+                                    if int(i) not in full_to_union
+                                ]
+                                raise ValueError(
+                                    f"_build_jit_kernel_args: cannot build '{side}_map_{fld}': "
+                                    f"active-col compression dropped local indices {missing} for slice {sl} "
+                                    f"(union width n_union={n_union})."
+                                )
                         args[f"{side}_map_{fld}"] = np.tile(row, (nE, 1))
                         continue
 
@@ -840,8 +946,25 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
 
 
+        # ---- H(div) RT tables ---------------------------------------------
+        if name.startswith("bvec_"):
+            fld = name[5:]
+            args[name] = _hdiv_bvec_table(fld)
+
+        elif name.startswith("div_"):
+            fld = name[4:]
+            fam = getattr(mixed_element, "_field_families", {}).get(fld, None)
+            if fam == "RT":
+                args[name] = _hdiv_div_table(fld)
+            else:
+                raise KeyError(f"_build_jit_kernel_args: kernel requested '{name}', but it is not an RT field.")
+
+        elif name.startswith("sign_"):
+            fld = name[5:]
+            args[name] = _hdiv_sign_table(fld)
+
         # ---- basis tables ------------------------------------------------
-        if name.startswith("b_"):
+        elif name.startswith("b_"):
             fld = name[2:]
             if pre_built is not None and pre_built.get("entity_kind") == "element" and "qp_phys" in pre_built:
                 args[name] = _basis_table_phys_union(fld)

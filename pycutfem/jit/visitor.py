@@ -1,6 +1,8 @@
 # pycutfem/jit/visitor.py
 from pycutfem.ufl.expressions import (
     Expression, Constant, TestFunction, TrialFunction, Function,
+    HdivTestFunction, HdivTrialFunction,
+    HdivFunction,
     VectorTestFunction, VectorTrialFunction, VectorFunction,
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, 
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
@@ -15,7 +17,7 @@ from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
     LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
     CellDiameter, MeshSize, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse, Cofactor,
-    Hessian as IRHessian, Laplacian as IRLaplacian
+    Hessian as IRHessian, Laplacian as IRLaplacian, HdivDiv
 )
 from dataclasses import replace
 import logging
@@ -245,8 +247,13 @@ class IRGenerator:
                 self._visit(DivOperation(op.operand), side=side)
                 self._emit_restriction(op.domain, side, op.operand)
                 return
+            # H(div) divergence is tabulated directly (no Grad() + Div()).
+            if isinstance(op, (HdivTestFunction, HdivTrialFunction, HdivFunction)):
+                self._visit(op, side=side)
+                self.ir_sequence.append(HdivDiv())
+                return
             self._visit(node.operand, side=side)
-            self.ir_sequence.append(Grad()) 
+            self.ir_sequence.append(Grad())
             self.ir_sequence.append(Div())
             return
         
@@ -280,7 +287,10 @@ class IRGenerator:
             # --- GENERIC CASE: Derivative of a standard field ---
             # At this point, the operand MUST be a leaf-like node (Function, etc.)
             # because all operators that could wrap it have been handled above.
-            is_vec = isinstance(operand, (VectorTestFunction, VectorTrialFunction, VectorFunction))
+            is_vec = isinstance(
+                operand,
+                (VectorTestFunction, VectorTrialFunction, VectorFunction, HdivTestFunction, HdivTrialFunction, HdivFunction),
+            )
             role = 'test' if getattr(operand, 'is_test', False) else 'trial' if getattr(operand, 'is_trial', False) else 'function'
             # Safely get field_names or field_name
             field_names = getattr(operand, 'field_names', None) or [getattr(operand, 'field_name')]
@@ -304,8 +314,11 @@ class IRGenerator:
         while isinstance(node, Restriction):
             node = node.operand
 
-        if isinstance(node, (TestFunction, TrialFunction, Function, VectorTestFunction, VectorTrialFunction, VectorFunction)):
-            is_vec = isinstance(node, (VectorTestFunction, VectorTrialFunction, VectorFunction))
+        if isinstance(
+            node,
+            (TestFunction, TrialFunction, Function, VectorTestFunction, VectorTrialFunction, VectorFunction, HdivTestFunction, HdivTrialFunction, HdivFunction),
+        ):
+            is_vec = isinstance(node, (VectorTestFunction, VectorTrialFunction, VectorFunction, HdivTestFunction, HdivTrialFunction, HdivFunction))
             role = 'test' if getattr(node, 'is_test', False) else 'trial' if getattr(node, 'is_trial', False) else 'function'
             field_names = getattr(node, 'field_names', None) or [getattr(node, 'field_name')]
             name = getattr(getattr(node, 'space', node), 'name', 'anon')

@@ -22,7 +22,7 @@ from typing import Mapping, Sequence, Dict, Tuple, List
 import numpy as np
 
 from pycutfem.core.mesh import Mesh
-from pycutfem.fem.reference import get_reference
+from pycutfem.fem.reference import get_hdiv_reference, get_reference
 
 # -----------------------------------------------------------------------------
 #  MixedElement
@@ -64,24 +64,61 @@ class MixedElement:
     def __init__(
         self,
         mesh: Mesh,
-        field_specs: Mapping[str, int] | None = None,
+        field_specs: Mapping[str, int | tuple[str, int] | str] | None = None,
     ) -> None:
         if not isinstance(field_specs, dict):
             field_specs = dict(field_specs)
         if not isinstance(mesh, Mesh):
             raise TypeError("'mesh' must be a pycutfem Mesh instance.")
-        self.q_orders: Dict[str, int] = {name:q for name,q in field_specs.items() if q != ':number:'}
+        self.q_orders: Dict[str, int] = {}
         self.field_names: Tuple[str, ...] = tuple(field_specs.keys())
         if not self.field_names:
             raise ValueError("'field_names' cannot be empty.")
 
         self.mesh: Mesh = mesh
         # detect number fields
-        self._number_fields = {name for name, p in field_specs.items()
-                       if p == ':number:'}   # sentinel
-        # keep _field_orders numeric so nothing downstream sees a string
-        self._field_orders = {name: (0 if name in self._number_fields else int(p))
-                            for name, p in field_specs.items()}
+        self._number_fields = {name for name, spec in field_specs.items() if spec == ":number:"}  # sentinel
+
+        self._field_families: Dict[str, str] = {}
+        self._value_dims: Dict[str, int] = {}
+        self._field_orders: Dict[str, int] = {}
+
+        for name, spec in field_specs.items():
+            if name in self._number_fields:
+                self._field_families[name] = "Number"
+                self._value_dims[name] = 1
+                self._field_orders[name] = 0
+                continue
+
+            if isinstance(spec, tuple):
+                if len(spec) != 2:
+                    raise ValueError(f"Field spec for '{name}' must be (family, order), got {spec!r}")
+                fam, order = spec
+                fam = str(fam).strip()
+                order = int(order)
+            else:
+                fam, order = "Lagrange", int(spec)
+
+            fam_key = fam.strip().lower()
+            if fam_key in {"lagrange", "cg", "h1"}:
+                fam_norm = "Lagrange"
+                value_dim = 1
+            elif fam_key in {"dg", "l2"}:
+                fam_norm = "DG"
+                value_dim = 1
+            elif fam_key in {"rt", "hdiv", "h(div)"}:
+                fam_norm = "RT"
+                value_dim = 2
+            else:
+                raise ValueError(f"Unknown element family '{fam}' for field '{name}'")
+
+            if order < 0:
+                raise ValueError(f"Field order for '{name}' must be >= 0, got {order}")
+
+            self._field_families[name] = fam_norm
+            self._value_dims[name] = value_dim
+            self._field_orders[name] = order
+            self.q_orders[name] = order
 
 
         # Build per‑field reference elements and basis counts -----------------
@@ -92,12 +129,19 @@ class MixedElement:
                 self._ref[name] = _NumberRef()
                 self._n_basis[name] = 1
             else:
-                ref = get_reference(mesh.element_type, self._field_orders[name])
-                self._ref[name] = ref
-                # or the formula you already use for quads/tris:
-                self._n_basis[name] = ((self._field_orders[name] + 1)**2
-                                    if mesh.element_type == 'quad'
-                                    else (self._field_orders[name] + 1)*(self._field_orders[name] + 2)//2)
+                fam = self._field_families[name]
+                if fam == "RT":
+                    ref = get_hdiv_reference(mesh.element_type, self._field_orders[name])
+                    self._ref[name] = ref
+                    self._n_basis[name] = int(ref.n_dofs)
+                else:
+                    ref = get_reference(mesh.element_type, self._field_orders[name])
+                    self._ref[name] = ref
+                    self._n_basis[name] = (
+                        (self._field_orders[name] + 1) ** 2
+                        if mesh.element_type == "quad"
+                        else (self._field_orders[name] + 1) * (self._field_orders[name] + 2) // 2
+                    )
         # Build slices into the global local‑DOF vector -----------------------
         self.component_dof_slices: Dict[str, slice] = {}
         start = 0
@@ -123,9 +167,19 @@ class MixedElement:
         #       f"{self.mesh.poly_order} (p) and field orders {self._field_orders}.")
         # ------------------------------------------------------------------
         #  Per‑field edge node counts  (shared DOFs on one edge)
-        self._n_edge: Dict[str, int] = {
-            f: _edge_nodes(p, mesh.element_type) for f, p in self._field_orders.items()
-        }
+        self._n_edge: Dict[str, int] = {}
+        for f in self.field_names:
+            if f in self._number_fields:
+                self._n_edge[f] = 1
+                continue
+            fam = self._field_families[f]
+            p = int(self._field_orders[f])
+            if fam == "RT":
+                self._n_edge[f] = p + 1  # flux moments on one edge
+            elif fam == "DG":
+                self._n_edge[f] = 0
+            else:
+                self._n_edge[f] = _edge_nodes(p, mesh.element_type)
         #  Size of the union of two neighbouring elements on an interior edge
         #  =  2·(local DOFs)  –  (shared edge DOFs)   summed over all fields
         self.n_union_cg = sum(2*self._n_basis[f] - self._n_edge[f] for f in self.field_names)
@@ -135,6 +189,13 @@ class MixedElement:
     def get_field_orders(self) -> Dict[str, int]:
         """Return a copy of the per-field polynomial orders."""
         return dict(self._field_orders)
+
+    def get_field_families(self) -> Dict[str, str]:
+        """Return a copy of the per-field element families."""
+        return dict(self._field_families)
+
+    def value_dim(self, field: str) -> int:
+        return int(self._value_dims[field])
     def _ensure_many_cache(self):
         if not hasattr(self, "_tab_many_cache"):
             # (field, kind, nqp, xi.tobytes(), eta.tobytes()) -> np.ndarray
@@ -147,9 +208,13 @@ class MixedElement:
     #  Basis, gradient, Hessian
     # ..................................................................
     def _eval_scalar_basis(self,field:str, xi: float, eta: float) -> np.ndarray:
+        if self._field_families.get(field) == "RT":
+            raise NotImplementedError("Scalar basis is not defined for RT (H(div)) fields.")
         return self._ref[field].shape(xi, eta)
     def _eval_scalar_grad(self, field: str, xi: float, eta: float) -> np.ndarray:
         """Return the gradient of the scalar basis functions for `field`."""
+        if self._field_families.get(field) == "RT":
+            raise NotImplementedError("Scalar gradient is not defined for RT (H(div)) fields.")
         return self._ref[field].grad(xi, eta)
     def _eval_scalar_basis_many(self, field: str, xi_arr, eta_arr):
         """
@@ -204,6 +269,8 @@ class MixedElement:
            order_x =1, order_y=1 would be ∂^2φ/∂eta∂xi
            order_x = 2, order_y=0 would be ∂^2φ/∂xi^2
         """
+        if self._field_families.get(field) == "RT":
+            raise NotImplementedError("Scalar derivatives are not defined for RT (H(div)) fields.")
         return self._ref[field].derivative(xi, eta, order_x, order_y)
     def _cache_key(self, xi: float, eta: float) -> Tuple[float, float]:
         """Round coordinates so different IEEE‑754 spellings hit the same key."""
@@ -211,6 +278,8 @@ class MixedElement:
 
     def basis(self, field: str, xi: float, eta: float) -> np.ndarray:
         """22‑vector with non‑zeros only at the DOFs of ``field``."""
+        if self._field_families.get(field) == "RT":
+            raise NotImplementedError("Use tabulate_value/tabulate_div for RT (H(div)) fields.")
         phi = np.zeros(self.n_dofs_per_elem)
         local = self._eval_scalar_basis(field, xi, eta)
         idx = self.component_dof_slices[field]
@@ -219,6 +288,8 @@ class MixedElement:
 
     def grad_basis(self, field: str, xi: float, eta: float) -> np.ndarray:
         """Shape (22,2); rows belonging to other fields are zero."""
+        if self._field_families.get(field) == "RT":
+            raise NotImplementedError("Use tabulate_value/tabulate_div for RT (H(div)) fields.")
         G = np.zeros((self.n_dofs_per_elem, 2))
         locG = self._eval_scalar_grad(field, xi, eta)  # (n,2)
         idx = self.component_dof_slices[field]
@@ -263,10 +334,56 @@ class MixedElement:
         out = np.zeros((self.n_dofs_local, 2, 2), dtype=float)
         for name in self.field_names:
             s = self.component_dof_slices[name]
+            if self._field_families.get(name) == "RT":
+                raise NotImplementedError("Hessian is not defined for RT (H(div)) fields.")
             # reference provides 2×2 Hessian per basis fn (triangular index or full?)
             h = self._ref[name].hess(xi, eta)  # expects (n_scalar_basis, 2, 2)
             out[s, :, :] = h
         return out
+
+    def tabulate_value(self, field: str, xi: float, eta: float, *, element_id: int | None = None) -> np.ndarray:
+        """
+        Tabulate basis values for a field.
+
+        - Scalar families ('Lagrange','DG','Number'): returns (n_loc, 1) reference values.
+        - RT (H(div)): returns (n_loc, 2) reference values if element_id is None,
+          else returns physical values using the contravariant Piola map.
+        """
+        fam = self._field_families[field]
+        if fam == "RT":
+            Vhat = np.asarray(self._ref[field].tabulate_value(float(xi), float(eta)), dtype=float)
+            if element_id is None:
+                return Vhat
+            from pycutfem.fem import transform
+
+            J = np.asarray(transform.jacobian(self.mesh, int(element_id), (float(xi), float(eta))), dtype=float)
+            detJ = float(np.linalg.det(J))
+            return transform.piola_contravariant(J, detJ, Vhat)
+
+        vals = np.asarray(self._ref[field].shape(float(xi), float(eta)), dtype=float).ravel()
+        return vals[:, None]
+
+    def tabulate_div(self, field: str, xi: float, eta: float, *, element_id: int | None = None) -> np.ndarray:
+        """
+        Tabulate divergence for RT (H(div)) fields.
+
+        Returns
+        -------
+        np.ndarray, shape (n_loc,)
+            Reference divergence if element_id is None, else physical divergence
+            mapped as div(u) = div_hat(u_hat) / detJ (exact for affine maps).
+        """
+        fam = self._field_families[field]
+        if fam != "RT":
+            raise NotImplementedError("tabulate_div is only defined for RT (H(div)) fields.")
+        div_hat = np.asarray(self._ref[field].tabulate_div(float(xi), float(eta)), dtype=float).ravel()
+        if element_id is None:
+            return div_hat
+        from pycutfem.fem import transform
+
+        J = np.asarray(transform.jacobian(self.mesh, int(element_id), (float(xi), float(eta))), dtype=float)
+        detJ = float(np.linalg.det(J))
+        return div_hat / detJ
 
     # ..................................................................
     #  Helpers
@@ -302,7 +419,9 @@ class MixedElement:
         or the resulting local DOF count).  Safe to use as part of a JIT cache key.
         """
         # Preserve field order: MixedElement DOF layout is order-dependent.
-        field_info = tuple((name, self._field_orders[name]) for name in self.field_names)
+        field_info = tuple(
+            (name, self._field_families.get(name, "Lagrange"), self._field_orders[name]) for name in self.field_names
+        )
         return (self.mesh.element_type,            # 'quad' / 'tri'
                 self.mesh.poly_order,              # geometry order
                 field_info,                        # heterogeneous field orders
@@ -310,7 +429,9 @@ class MixedElement:
     
     # ..................................................................
     def __repr__(self) -> str:  # pragma: no cover – debug aide
-        orders = ", ".join(f"{k}:p{self._field_orders[k]}" for k in self.field_names)
+        orders = ", ".join(
+            f"{k}:{self._field_families.get(k, 'Lagrange')}{self._field_orders[k]}" for k in self.field_names
+        )
         return (
             f"<MixedElement [{orders}], elem='{self.mesh.element_type}', geo‑p={self.mesh.poly_order}, "
             f"ndofs={self.n_dofs_local}>"

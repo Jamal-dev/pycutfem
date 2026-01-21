@@ -7,8 +7,6 @@ from pathlib import Path
 from typing import Any, Iterable, Tuple
 from dataclasses import replace
 
-from matplotlib.pylab import f
-
 from .cache import CODEGEN_ABI_CPP
 
 CODEGEN_DEBUG = bool(int(os.environ.get("PYCUTFEM_CPP_CODEGEN_DEBUG", "0")))
@@ -111,6 +109,7 @@ class CppCodeGen:
             Hessian as IRHessian,
             Laplacian as IRLaplacian,
             Div,
+            HdivDiv,
             BinaryOp,
             Dot,
             Inner,
@@ -122,6 +121,14 @@ class CppCodeGen:
             Trace,
         )
         needs_phis = any(isinstance(op, (PosOp, NegOp)) for op in ir_sequence)
+        families = getattr(self.mixed_element, "_field_families", {}) if self.mixed_element is not None else {}
+        needs_any_hdiv_div = any(isinstance(op, HdivDiv) for op in ir_sequence)
+
+        def _is_rt_field(field_name: str) -> bool:
+            try:
+                return isinstance(families, dict) and families.get(str(field_name)) == "RT"
+            except Exception:
+                return False
 
         def coeff_array_name(base: str, side: str) -> str:
             """Match Numba's u_<name>__pos/_neg_loc convention for sided coeffs."""
@@ -146,15 +153,33 @@ class CppCodeGen:
                 param_order = []
                 needs_b: set[str] = set()
                 needs_g: set[str] = set()
+                needs_bvec: set[str] = set()
+                needs_div: set[str] = set()
+                needs_sign: set[str] = set()
+                needs_det: set[str] = set()
                 needs_u: set[str] = set()
                 for op in ir_sequence:
                     if isinstance(op, LoadVariable):
                         for fn in op.field_names or []:
-                            needs_g.add(f"g_{fn}")
-                            if op.deriv_order == (0, 0):
-                                needs_b.add(f"b_{fn}")
+                            if _is_rt_field(str(fn)):
+                                if self.on_facet and op.side in ("+", "-"):
+                                    tag = "pos" if op.side == "+" else "neg"
+                                    needs_bvec.add(f"bvec_{fn}_{tag}")
+                                    needs_sign.add(f"sign_{fn}_{tag}")
+                                    if needs_any_hdiv_div:
+                                        needs_div.add(f"div_{fn}_{tag}")
+                                        needs_det.add(f"detJ_{tag}")
+                                else:
+                                    needs_bvec.add(f"bvec_{fn}")
+                                    needs_sign.add(f"sign_{fn}")
+                                    if needs_any_hdiv_div:
+                                        needs_div.add(f"div_{fn}")
                             else:
                                 needs_g.add(f"g_{fn}")
+                                if op.deriv_order == (0, 0):
+                                    needs_b.add(f"b_{fn}")
+                                else:
+                                    needs_g.add(f"g_{fn}")
                         if op.role == "function":
                             needs_u.add(coeff_array_name(op.name, op.side))
                 param_order = [
@@ -168,10 +193,22 @@ class CppCodeGen:
                 ]
                 if needs_phis:
                     param_order.append("phis")
-                param_order += [*sorted(needs_b), *sorted(needs_g), *sorted(needs_u)]
+                param_order += [
+                    *sorted(needs_b),
+                    *sorted(needs_g),
+                    *sorted(needs_bvec),
+                    *sorted(needs_div),
+                    *sorted(needs_sign),
+                    *sorted(needs_det),
+                    *sorted(needs_u),
+                ]
         # Ensure required basis/grad tables are present even if mirror omitted them
         needs_b: set[str] = set()
         needs_g: set[str] = set()
+        needs_bvec: set[str] = set()
+        needs_div: set[str] = set()
+        needs_sign: set[str] = set()
+        needs_det: set[str] = set()
         needs_u: set[str] = set()
         needs_h: set[str] = set()
         needs_hx: bool = False
@@ -196,6 +233,20 @@ class CppCodeGen:
                     param_order.append(op.name)
             if isinstance(op, LoadVariable):
                 for fn in op.field_names or []:
+                    if _is_rt_field(str(fn)):
+                        if self.on_facet and op.side in ("+", "-"):
+                            tag = "pos" if op.side == "+" else "neg"
+                            needs_bvec.add(f"bvec_{fn}_{tag}")
+                            needs_sign.add(f"sign_{fn}_{tag}")
+                            if needs_any_hdiv_div:
+                                needs_div.add(f"div_{fn}_{tag}")
+                                needs_det.add(f"detJ_{tag}")
+                        else:
+                            needs_bvec.add(f"bvec_{fn}")
+                            needs_sign.add(f"sign_{fn}")
+                            if needs_any_hdiv_div:
+                                needs_div.add(f"div_{fn}")
+                        continue
                     needs_g.add(f"g_{fn}")
                     needs_b.add(f"b_{fn}")
                     if self.on_facet and op.side in ("+", "-"):
@@ -206,6 +257,8 @@ class CppCodeGen:
                 if sum(op.deriv_order) >= 2:
                     needs_hx = True
                     for fn in op.field_names or []:
+                        if _is_rt_field(str(fn)):
+                            continue
                         needs_h.update({f"d10_{fn}", f"d01_{fn}", f"d20_{fn}", f"d11_{fn}", f"d02_{fn}"})
                         if self.on_facet:
                             tags: set[str] = set()
@@ -223,6 +276,8 @@ class CppCodeGen:
             if isinstance(op, (IRHessian, IRLaplacian)):
                 needs_hx = True
                 for fn in getattr(op, "field_names", []) or []:
+                    if _is_rt_field(str(fn)):
+                        continue
                     needs_h.update({f"d10_{fn}", f"d01_{fn}", f"d20_{fn}", f"d11_{fn}", f"d02_{fn}"})
                     if self.on_facet:
                         for tg in ("pos", "neg"):
@@ -259,6 +314,18 @@ class CppCodeGen:
         for name in sorted(needs_g):
             if name not in param_order:
                 param_order.append(name)
+        for name in sorted(needs_bvec):
+            if name not in param_order:
+                param_order.append(name)
+        for name in sorted(needs_div):
+            if name not in param_order:
+                param_order.append(name)
+        for name in sorted(needs_sign):
+            if name not in param_order:
+                param_order.append(name)
+        for name in sorted(needs_det):
+            if name not in param_order:
+                param_order.append(name)
         for name in sorted(needs_u):
             if name not in param_order:
                 param_order.append(name)
@@ -289,6 +356,8 @@ class CppCodeGen:
                 param_order.append("h_arr")
         # Ensure all basis arrays for fields exist (safety net)
         for fn in getattr(self.mixed_element, "field_names", ()):
+            if _is_rt_field(str(fn)):
+                continue
             bname = f"b_{fn}"
             if bname not in param_order:
                 param_order.append(bname)
@@ -506,7 +575,7 @@ class CppCodeGen:
                     if name == "gdofs_map"
                     else f"py::array_t<int32_t, py::array::c_style | py::array::forcecast> {name}"
                 )
-            elif name in {"qp_phys", "qw", "detJ", "J_inv", "J_inv_pos", "J_inv_neg", "normals", "phis"} or name.startswith(("pos_Hxi", "neg_Hxi")):
+            elif name in {"qp_phys", "qw", "detJ", "detJ_pos", "detJ_neg", "J_inv", "J_inv_pos", "J_inv_neg", "normals", "phis"} or name.startswith(("pos_Hxi", "neg_Hxi")):
                 arg_decls.append(
                     f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}"
                 )
@@ -529,6 +598,10 @@ class CppCodeGen:
         ]
         if "detJ" in param_order:
             view_lines.append("    auto detJ_view = detJ.unchecked<2>();")
+        if "detJ_pos" in param_order:
+            view_lines.append("    auto detJ_pos_view = detJ_pos.unchecked<2>();")
+        if "detJ_neg" in param_order:
+            view_lines.append("    auto detJ_neg_view = detJ_neg.unchecked<2>();")
         if "J_inv" in param_order:
             view_lines.append("    auto Jinv_view = J_inv.unchecked<4>();")
         if "J_inv_pos" in param_order:
@@ -550,12 +623,18 @@ class CppCodeGen:
                     )
             if name.startswith("b_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
+            if name.startswith("bvec_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
             if name.startswith("g_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
             if name.startswith("r0") or name.startswith("r1") or name.startswith("r2") or name.startswith("r3") or name.startswith("r4"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
             if name == "normals":
                 view_lines.append(f"    auto normals_view = normals.unchecked<3>();")
+            if name.startswith("div_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
+            if name.startswith("sign_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
             if name.startswith(("d10_", "d01_", "d20_", "d11_", "d02_")):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
             if name.startswith("u_"):
@@ -729,7 +808,16 @@ class CppCodeGen:
                     and a.field_names
                     and any(dim == -1 for dim in a.shape)
                 ):
-                    for idx, fld in enumerate(a.field_names):
+                    # Some vector-valued fields (e.g. H(div) RT) use a single
+                    # field name for multiple value components. Apply the same
+                    # restriction mask to every component row.
+                    try:
+                        n_comp = int(a.shape[0]) if (len(a.shape) >= 1 and int(a.shape[0]) > 0) else int(len(a.field_names))
+                    except Exception:
+                        n_comp = int(len(a.field_names))
+
+                    for idx in range(n_comp):
+                        fld = a.field_names[idx] if idx < len(a.field_names) else a.field_names[0]
                         side_tag = component_side_tag(side, a.field_sides or [], fld, idx)
                         if side_tag not in ("pos", "neg"):
                             side_tag = "pos" if side == "+" else "neg"
@@ -769,6 +857,36 @@ class CppCodeGen:
                     coeff_name = coeff_array_name(op.name, op.side)
                     required_args.add(coeff_name)
                     apply_restrict_mask = isinstance(next_op, CheckDomain)
+                    hdiv_field = None
+                    if op.field_names and len(op.field_names) == 1:
+                        cand = str(op.field_names[0])
+                        if getattr(self.mixed_element, "_field_families", {}).get(cand, None) == "RT":
+                            hdiv_field = cand
+                    if hdiv_field is not None:
+                        side_tag = "pos" if op.side == "+" else "neg" if op.side == "-" else ""
+                        bvec_name = f"bvec_{hdiv_field}_{side_tag}" if side_tag else f"bvec_{hdiv_field}"
+                        sign_name = f"sign_{hdiv_field}_{side_tag}" if side_tag else f"sign_{hdiv_field}"
+                        required_args.update({bvec_name, sign_name})
+                        nm = new_tmp("hdiv_val")
+                        emit_line(f"Eigen::VectorXd {nm}(2);")
+                        emit_line(f"{nm}.setZero();")
+                        adj = new_tmp("adj")
+                        emit_line(f"Eigen::Matrix<double,2,2> {adj};")
+                        jloc_var = "Jloc_pos" if op.side == "+" else "Jloc_neg" if op.side == "-" else "Jloc"
+                        emit_line(f"{adj}(0,0)={jloc_var}(1,1); {adj}(0,1)=-{jloc_var}(0,1);")
+                        emit_line(f"{adj}(1,0)=-{jloc_var}(1,0); {adj}(1,1)={jloc_var}(0,0);")
+                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
+                        emit_line(f"    double s = {sign_name}_view(e, j);")
+                        emit_line(f"    double bh0 = {bvec_name}_view(e, q, 0, j);")
+                        emit_line(f"    double bh1 = {bvec_name}_view(e, q, 1, j);")
+                        emit_line(f"    double b0 = {adj}(0,0)*bh0 + {adj}(0,1)*bh1;")
+                        emit_line(f"    double b1 = {adj}(1,0)*bh0 + {adj}(1,1)*bh1;")
+                        emit_line(f"    double coeff = {coeff_name}_view(e, j);")
+                        emit_line(f"    {nm}(0) += coeff * (b0 * s);")
+                        emit_line(f"    {nm}(1) += coeff * (b1 * s);")
+                        emit_line("}")
+                        stack.append(StackItem(nm, "vec", "value", (2,), op.field_names, op.name, op.side, op.field_sides or []))
+                        continue
                     k = len(op.field_names)
                     nm = new_tmp("val")
                     emit_line(f"Eigen::VectorXd {nm}({k});")
@@ -819,6 +937,35 @@ class CppCodeGen:
                         stack.append(
                             StackItem("__basis__", "basis_ref", op.role, (len(op.field_names), -1), op.field_names, op.name, op.side, op.field_sides)
                         )
+                        continue
+                    hdiv_field = None
+                    if op.field_names and len(op.field_names) == 1:
+                        cand = str(op.field_names[0])
+                        if getattr(self.mixed_element, "_field_families", {}).get(cand, None) == "RT":
+                            hdiv_field = cand
+                    if hdiv_field is not None:
+                        side_tag = "pos" if op.side == "+" else "neg" if op.side == "-" else ""
+                        bvec_name = f"bvec_{hdiv_field}_{side_tag}" if side_tag else f"bvec_{hdiv_field}"
+                        sign_name = f"sign_{hdiv_field}_{side_tag}" if side_tag else f"sign_{hdiv_field}"
+                        required_args.update({bvec_name, sign_name})
+                        nm = new_tmp("hdiv_basis")
+                        emit_line(f"Eigen::MatrixXd {nm}(2, n_union);")
+                        emit_line(f"{nm}.setZero();")
+                        adj = new_tmp("adj")
+                        emit_line(f"Eigen::Matrix<double,2,2> {adj};")
+                        jloc_var = "Jloc_pos" if op.side == "+" else "Jloc_neg" if op.side == "-" else "Jloc"
+                        emit_line(f"{adj}(0,0)={jloc_var}(1,1); {adj}(0,1)=-{jloc_var}(0,1);")
+                        emit_line(f"{adj}(1,0)=-{jloc_var}(1,0); {adj}(1,1)={jloc_var}(0,0);")
+                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
+                        emit_line(f"    double s = {sign_name}_view(e, j);")
+                        emit_line(f"    double bh0 = {bvec_name}_view(e, q, 0, j);")
+                        emit_line(f"    double bh1 = {bvec_name}_view(e, q, 1, j);")
+                        emit_line(f"    double b0 = {adj}(0,0)*bh0 + {adj}(0,1)*bh1;")
+                        emit_line(f"    double b1 = {adj}(1,0)*bh0 + {adj}(1,1)*bh1;")
+                        emit_line(f"    {nm}(0, j) = b0 * s;")
+                        emit_line(f"    {nm}(1, j) = b1 * s;")
+                        emit_line("}")
+                        stack.append(StackItem(nm, "mat", op.role, (2, -1), op.field_names, op.name, op.side, op.field_sides))
                         continue
                     k = len(op.field_names)
                     nm = new_tmp("basis")
@@ -1210,6 +1357,60 @@ class CppCodeGen:
                     stack.append(StackItem(nm, "mat", "value", (k,), a.field_names, a.parent, a.side, a.field_sides))
                 else:
                     raise NotImplementedError("Laplacian on unsupported item")
+            elif isinstance(op, HdivDiv):
+                a = stack.pop()
+                if not a.field_names:
+                    raise ValueError("HdivDiv requires field metadata on the stack item.")
+                fld = str(a.field_names[0])
+                fam = getattr(self.mixed_element, "_field_families", {}).get(fld, None)
+                if fam != "RT":
+                    raise NotImplementedError(f"HdivDiv only supports RT fields (got {fam!r} for '{fld}').")
+
+                side_tag = "pos" if a.side == "+" else "neg" if a.side == "-" else ""
+                div_name = f"div_{fld}_{side_tag}" if side_tag else f"div_{fld}"
+                sign_name = f"sign_{fld}_{side_tag}" if side_tag else f"sign_{fld}"
+                required_args.update({div_name, sign_name})
+
+                if a.role in {"test", "trial"}:
+                    nm = new_tmp("hdiv_div")
+                    emit_line(f"Eigen::MatrixXd {nm}(1, n_union);")
+                    emit_line(f"{nm}.setZero();")
+                    det_var = new_tmp("det")
+                    if a.side == "+":
+                        required_args.add("detJ_pos")
+                        emit_line(f"double {det_var} = detJ_pos_view(e,q);")
+                    elif a.side == "-":
+                        required_args.add("detJ_neg")
+                        emit_line(f"double {det_var} = detJ_neg_view(e,q);")
+                    else:
+                        emit_line(f"double {det_var} = detJ_view(e,q);")
+                    emit_line(
+                        f"for (ssize_t j=0; j<n_union; ++j) {nm}(0,j) = ({div_name}_view(e,q,j) * {sign_name}_view(e,j)) / {det_var};"
+                    )
+                    stack.append(StackItem(nm, "mat", a.role, (1, -1), a.field_names, a.parent, a.side, a.field_sides))
+                    continue
+
+                if a.role == "value":
+                    coeff_name = coeff_array_name(a.parent, a.side)
+                    required_args.add(coeff_name)
+                    nm = new_tmp("hdiv_divv")
+                    emit_line(f"double {nm} = 0.0;")
+                    det_var = new_tmp("det")
+                    if a.side == "+":
+                        required_args.add("detJ_pos")
+                        emit_line(f"double {det_var} = detJ_pos_view(e,q);")
+                    elif a.side == "-":
+                        required_args.add("detJ_neg")
+                        emit_line(f"double {det_var} = detJ_neg_view(e,q);")
+                    else:
+                        emit_line(f"double {det_var} = detJ_view(e,q);")
+                    emit_line(
+                        f"for (ssize_t j=0; j<n_union; ++j) {nm} += {coeff_name}_view(e,j) * ({div_name}_view(e,q,j) * {sign_name}_view(e,j)) / {det_var};"
+                    )
+                    stack.append(StackItem(nm, "scalar", "value", (), a.field_names, a.parent, a.side, a.field_sides))
+                    continue
+
+                raise NotImplementedError(f"HdivDiv not implemented for role '{a.role}'.")
             elif isinstance(op, Div):
                 a = stack.pop()
                 if a.kind == "grad":

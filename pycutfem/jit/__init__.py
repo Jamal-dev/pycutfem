@@ -17,11 +17,12 @@ def _form_rank(expr):
     from pycutfem.ufl.expressions import Function, VectorFunction
     from pycutfem.ufl.expressions import TrialFunction, VectorTrialFunction
     from pycutfem.ufl.expressions import TestFunction,  VectorTestFunction
+    from pycutfem.ufl.expressions import HdivTrialFunction, HdivTestFunction
 
     has_trial = expr.find_first(lambda n: isinstance(
-        n, (TrialFunction, VectorTrialFunction))) is not None
+        n, (TrialFunction, VectorTrialFunction, HdivTrialFunction))) is not None
     has_test  = expr.find_first(lambda n: isinstance(
-        n, (TestFunction,  VectorTestFunction)))  is not None
+        n, (TestFunction,  VectorTestFunction, HdivTestFunction)))  is not None
 
     return 2 if (has_trial and has_test) else 1 if (has_test) else 0
 
@@ -109,7 +110,19 @@ def _compress_static_for_active(static: dict[str, Any],
     def _is_union_key(key: str) -> bool:
         return (
             key == "gdofs_map"
-            or key.startswith(("b_", "g_", "d", "r", "pos_map", "neg_map", "restrict_mask_"))
+            or key.startswith(
+                (
+                    "b_",
+                    "bvec_",
+                    "g_",
+                    "d",
+                    "r",
+                    "sign_",
+                    "pos_map",
+                    "neg_map",
+                    "restrict_mask_",
+                )
+            )
         )
 
     compressed: dict[str, Any] = {}
@@ -927,17 +940,6 @@ def compile_multi(form, *, dof_handler, mixed_element,
         runner_active = getattr(runner, "active_fields", None)
         if runner_active:
             active_fields = tuple(runner_active)
-        else:
-            # Fallback: infer active fields from param_order when IR lacks field annotations
-            _param_fields: list[str] = []
-            for name in getattr(runner, "param_order", []):
-                has_deriv = name.startswith("d") and len(name) > 2 and name[1].isdigit() and "_" in name
-                if name.startswith(("b_", "g_")) or has_deriv:
-                    fld = name.split("_", 1)[1] if "_" in name else name
-                    if fld in getattr(me_kernel, "field_names", ()):
-                        _param_fields.append(fld)
-            if _param_fields:
-                active_fields = tuple(dict.fromkeys(_param_fields))  # preserve order, drop dups
 
         active_cols = _active_columns(me_kernel, active_fields)
         if os.getenv("PYCUTFEM_JIT_DEBUG_ACTIVE", "").lower() in {"1", "true", "yes"}:

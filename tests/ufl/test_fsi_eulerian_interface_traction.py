@@ -179,14 +179,15 @@ def test_fsi_eulerian_interface_traction_balances_for_matching_fields():
     def _epsilon(u):
         return 0.5 * (grad(u) + grad(u).T)
 
-    # IBP boundary term on Γ:
-    #   B_Γ(v_f,v_s) = ∫_Γ t_f·v_f − t_s·v_s
-    # with t_f = σ_f n and t_s = σ_s n using the same normal n (solid→fluid).
+    # IBP boundary term on Γ for the volume terms used in build_fsi_eulerian_forms:
+    #   B_Γ(v_f,v_s) = ∫_Γ (σ_f n_f)·v_f + (σ_s n_s)·v_s
+    # with outward normals n_f=-n (fluid) and n_s=+n (solid), and
+    # t_f = σ_f n, t_s = σ_s n for a single normal n (solid→fluid).
     t_f = 2.0 * Constant(1.0) * dot(_epsilon(Pos(uf_k_R)), n) - Pos(pf_k_R) * n
     eps_s = _epsilon(Neg(disp_k_R))
     sigma_s = Constant(2.0) * Constant(1.0) * eps_s + Constant(0.0) * trace(eps_s) * I2
     t_s = dot(sigma_s, n)
-    B = (dot(t_f, Pos(test_vel_f_R)) - dot(t_s, Neg(test_vel_s_R))) * dGamma
+    B = (-dot(t_f, Pos(test_vel_f_R)) + dot(t_s, Neg(test_vel_s_R))) * dGamma
 
     W = B + forms.R_int
     _, residual = assemble_form(Equation(None, W), dof_handler=dh, bcs=[], backend="python")
@@ -334,7 +335,7 @@ def test_fsi_eulerian_interface_traction_nonzero_for_mismatched_fields():
     t_f = 2.0 * Constant(1.0) * dot(_epsilon(Pos(uf_k_R)), n) - Pos(pf_k_R) * n
     # Solid displacement is zero => σ_s = 0 => t_s = 0.
     t_s = Constant(0.0) * n
-    B = (dot(t_f, Pos(test_vel_f_R)) - dot(t_s, Neg(test_vel_s_R))) * dGamma
+    B = (-dot(t_f, Pos(test_vel_f_R)) + dot(t_s, Neg(test_vel_s_R))) * dGamma
 
     W = B + forms.R_int
     _, residual = assemble_form(Equation(None, W), dof_handler=dh, bcs=[], backend="python")
@@ -614,7 +615,7 @@ def test_fsi_eulerian_interface_pressure_sign_aligned():
 
     n = FacetNormal()
     jump_vel_trial = Pos(du_f_R) - Neg(du_s_R)
-    expected_form = (-kappa_pos * dot(Pos(test_q_f_R) * n, jump_vel_trial)) * dGamma
+    expected_form = (kappa_pos * dot(Pos(test_q_f_R) * n, jump_vel_trial)) * dGamma
     K_expected, _ = assemble_form(Equation(expected_form, None), dof_handler=dh, bcs=[], backend="python")
 
     p_rows = np.asarray(dh.get_field_slice("p_pos_"), dtype=int)

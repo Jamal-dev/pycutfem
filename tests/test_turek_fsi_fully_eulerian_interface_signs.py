@@ -44,13 +44,15 @@ def test_interface_consistency_cancels_ibp_boundary_terms_for_equal_tractions():
       - define tractions with that same `n`:  t_f = σ_f n,  t_s = σ_s n
 
     Integration by parts on Ω_f and Ω_s yields the interface boundary contribution
-      B_Γ(v_f, v_s) = ∫_Γ t_f·v_f ds  - ∫_Γ t_s·v_s ds
+      B_Γ(v_f, v_s) = ∫_Γ (σ_f n_f)·v_f ds + ∫_Γ (σ_s n_s)·v_s ds
+                   = ∫_Γ (-t_f·v_f + t_s·v_s) ds
+    with outward normals n_f=-n (fluid) and n_s=+n (solid).
 
     Under the exact dynamic interface condition t_f = t_s = t, this becomes
-      B_Γ = ∫_Γ t·(v_f - v_s) ds = ∫_Γ t·jump(v) ds.
+      B_Γ = -∫_Γ t·(v_f - v_s) ds = -∫_Γ t·jump(v) ds.
 
     A *consistent* Nitsche flux term must cancel this for all discontinuous test pairs:
-      N_Γ(u;v) = -∫_Γ {t(u)}·jump(v) ds,
+      N_Γ(u;v) = +∫_Γ {t(u)}·jump(v) ds,
       {t} = κ⁺ t_f + κ⁻ t_s,  κ⁺+κ⁻=1  ⇒  {t}=t when t_f=t_s.
 
     This test constructs a manufactured state with constant nonzero traction and checks:
@@ -206,14 +208,15 @@ def test_interface_consistency_cancels_ibp_boundary_terms_for_equal_tractions():
     def _epsilon(u):
         return 0.5 * (grad(u) + grad(u).T)
 
-    # B_Γ(v_f, v_s) = ∫ t_f·v_f - ∫ t_s·v_s
+    # B_Γ(v_f, v_s) = ∫ (σ_f n_f)·v_f + ∫ (σ_s n_s)·v_s = ∫ (-t_f·v_f + t_s·v_s),
+    # where n_f=-n, n_s=+n and t_f=σ_f n, t_s=σ_s n for the single normal n (solid→fluid).
     t_f = -Pos(pf_k_R) * n
     eps_s = _epsilon(Neg(disp_k_R))
     sigma_s = Constant(0.0) * eps_s + Constant(1.0) * trace(eps_s) * I2
     t_s = dot(sigma_s, n)
-    B = (dot(t_f, Pos(test_vel_f_R)) - dot(t_s, Neg(test_vel_s_R))) * dGamma
+    B = (-dot(t_f, Pos(test_vel_f_R)) + dot(t_s, Neg(test_vel_s_R))) * dGamma
 
-    # Code's interface term should be the *negative* of B on the exact interface conditions.
+    # Code's interface term should cancel B on the exact interface conditions.
     W = B + forms.R_int
     _, residual = assemble_form(Equation(None, W), dof_handler=dh, bcs=[], backend="python")
 
@@ -225,8 +228,7 @@ def test_interface_consistency_cancels_ibp_boundary_terms_for_equal_tractions():
     # A "difference-average" does *not* cancel B (diagnostic).
     jump_v = Pos(test_vel_f_R) - Neg(test_vel_s_R)
     avg_wrong = kappa_pos * t_f - kappa_neg * t_s
-    N_wrong = (-dot(avg_wrong, jump_v)) * dGamma
+    N_wrong = (dot(avg_wrong, jump_v)) * dGamma
     W_wrong = B + N_wrong
     _, residual_wrong = assemble_form(Equation(None, W_wrong), dof_handler=dh, bcs=[], backend="python")
     assert np.linalg.norm(residual_wrong[fluid_vel_dofs], ord=np.inf) > 1.0e-6
-

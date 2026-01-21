@@ -2016,8 +2016,9 @@ def _find_all(expr, cls):
 # New: Helper to identify trial and test functions in an expression
 def _trial_test(expr): 
     """Finds the first trial and test function in an expression tree.""" 
-    trial = expr.find_first(lambda n: isinstance(n, (TrialFunction, VectorTrialFunction))) 
-    test = expr.find_first(lambda n: isinstance(n, (TestFunction, VectorTestFunction))) 
+    from pycutfem.ufl.expressions import HdivTrialFunction, HdivTestFunction
+    trial = expr.find_first(lambda n: isinstance(n, (TrialFunction, VectorTrialFunction, HdivTrialFunction))) 
+    test = expr.find_first(lambda n: isinstance(n, (TestFunction, VectorTestFunction, HdivTestFunction))) 
     return trial, test
 
 # ------------------------------------------------------------------
@@ -2467,12 +2468,24 @@ class HelpersFieldAware:
         have_val_elem = hasattr(level_set, "value_on_element")
         have_vals_many = hasattr(level_set, "values_on_element_many")
         fast_eval = have_val_elem and (mesh is not None) and (getattr(mesh, "element_type", None) in {"quad", "tri"})
+        families = getattr(getattr(dh, "mixed_element", None), "_field_families", {}) or {}
 
         for fld in fields:
             try:
                 gidx = np.asarray(dh.element_maps[fld][eid], dtype=int)
             except Exception:
                 continue
+
+            # H(div) RT DOFs are facet/cell moments (not point evaluations). There is no
+            # meaningful "DOF coordinate" to classify against φ, and RT is not currently
+            # split/enriched by side masks. Treat all RT DOFs as active on both sides.
+            try:
+                if isinstance(families, dict) and families.get(str(fld)) == "RT":
+                    pos_masks[fld] = np.ones((gidx.size,), dtype=float)
+                    neg_masks[fld] = np.ones((gidx.size,), dtype=float)
+                    continue
+            except Exception:
+                pass
 
             if fast_eval:
                 p_f = int(getattr(dh.mixed_element, "_field_orders", {}).get(fld, 0))

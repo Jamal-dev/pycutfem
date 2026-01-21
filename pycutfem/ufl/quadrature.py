@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Dict
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import (
     Expression, Constant, TestFunction, TrialFunction, VectorTestFunction,
-    VectorTrialFunction, Function, VectorFunction, Grad, DivOperation, Inner,
+    VectorTrialFunction, Function, VectorFunction, HdivTestFunction, HdivTrialFunction, Grad, DivOperation, Inner,
     Dot, Sum, Sub, Prod, Pos, Neg, Div, FacetNormal, ElementWiseConstant, Jump,
     Derivative, Transpose, Trace, Determinant, Cofactor, Inverse
 )
@@ -58,6 +58,9 @@ class PolynomialDegreeEstimator:
             result = self.me._field_orders[expr.field_name]
         elif isinstance(expr, (VectorTestFunction, VectorTrialFunction, VectorFunction)):
             result = self.me._field_orders[expr.field_names[0]]
+        elif isinstance(expr, (HdivTestFunction, HdivTrialFunction)):
+            # RT_k vector basis components are degree (k+1) on affine cells.
+            result = int(self.me._field_orders[expr.field_name]) + 1
 
         # --- Recursive Cases: Operators ---
         elif isinstance(expr, Grad):

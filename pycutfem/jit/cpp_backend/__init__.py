@@ -91,11 +91,12 @@ def _form_rank(expr):
     from pycutfem.ufl.expressions import Function, VectorFunction
     from pycutfem.ufl.expressions import TrialFunction, VectorTrialFunction
     from pycutfem.ufl.expressions import TestFunction, VectorTestFunction
+    from pycutfem.ufl.expressions import HdivTrialFunction, HdivTestFunction
 
     has_trial = expr.find_first(lambda n: isinstance(
-        n, (TrialFunction, VectorTrialFunction))) is not None
+        n, (TrialFunction, VectorTrialFunction, HdivTrialFunction))) is not None
     has_test = expr.find_first(lambda n: isinstance(
-        n, (TestFunction, VectorTestFunction))) is not None
+        n, (TestFunction, VectorTestFunction, HdivTestFunction))) is not None
 
     return 2 if (has_trial and has_test) else 1 if (has_test) else 0
 

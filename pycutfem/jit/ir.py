@@ -50,6 +50,16 @@ class Div:
     """Instruction to compute the divergence of the top of the stack."""
     pass
 
+@dataclass(frozen=True, slots=True)
+class HdivDiv:
+    """
+    Instruction to compute divergence of an H(div) (RT) quantity.
+
+    Unlike `Div`, this does not require a gradient tensor on the stack. The code
+    generator lowers this using pre-tabulated RT divergence tables.
+    """
+    pass
+
 @dataclass(frozen=True, slots =True)
 class PosOp:
     """Instruction to apply the positive-side restriction: v if phi>=0 else 0."""

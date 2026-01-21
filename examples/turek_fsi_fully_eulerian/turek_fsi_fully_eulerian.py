@@ -4937,7 +4937,22 @@ avg_flux_fluid_trial = kappa_pos * traction_fluid_primal(Pos(du_f_ifc), Pos(dp_f
 avg_flux_fluid_test =  kappa_pos * traction_fluid_adjoint(Pos(test_vel_f_ifc), Pos(test_q_f_ifc))
 avg_flux_fluid_res =   kappa_pos * traction_fluid_primal(Pos(uf_k_ifc), Pos(pf_k_ifc))
 
-# Should we have a negative sign here?
+# Sign convention (single normal `n` used on both sides):
+# - `n` points from solid (−) → fluid (+).
+# - With outward normals n_f = −n (fluid) and n_s = +n (solid), the combined
+#   IBP boundary contribution on Γ for the volume terms used below is
+#       B_Γ(v_f,v_s) = ∫_Γ (σ_f n_f)·v_f + (σ_s n_s)·v_s
+#                  = ∫_Γ (−t_f·v_f + t_s·v_s),
+#   where we define tractions using the same `n`:  t_f = σ_f n,  t_s = σ_s n.
+# - Under the physical dynamic condition t_f = t_s = t this becomes
+#       B_Γ = −∫_Γ t·(v_f − v_s) = −∫_Γ t·jump(v),
+#   where jump(v) := v_f − v_s.
+# - A consistent Nitsche term must therefore be
+#       N_Γ(u;v) = +∫_Γ {t(u)}·jump(v),
+#   with the *sum* average {t} = κ⁺ t_f + κ⁻ t_s (κ⁺+κ⁻=1) so that on the exact
+#   interface condition {t}=t and B_Γ + N_Γ = 0 for arbitrary discontinuous tests.
+# Verified by `tests/ufl/test_fsi_eulerian_interface_traction.py` which assembles
+# `B_Γ + R_int` and checks it is ≈0 iff the manufactured fields satisfy t_f=t_s.
 avg_flux_solid_trial = kappa_neg * traction_solid_L(Neg(ddisp_s_ifc), Neg(disp_k_ifc))
 _sym_ref = disp_n if (SOLID_SYM_NITSCHE_LAGGED and not USE_LINEAR_SOLID) else disp_k_ifc
 avg_flux_solid_test =  kappa_neg * traction_solid_L(Neg(test_vel_s_ifc), Neg(_sym_ref))
@@ -4946,11 +4961,14 @@ avg_flux_solid_res =   kappa_neg * traction_solid_R(Neg(disp_k_ifc))
 s_nitsche_value = float(ARGS.s_nitsche_value)
 s_nitsche = Constant(s_nitsche_value)   # 1 = symmetric, 0 = incomplete, -1 = skew-symmetric
 
-# What should be the sign here?
-J_int_fluid = (-dot(avg_flux_fluid_trial, jump_test_f)) * dΓ + (dot(avg_flux_fluid_trial, jump_test_s)) * dΓ
-R_int_fluid = (-dot(avg_flux_fluid_res, jump_test_f)) * dΓ   + (dot(avg_flux_fluid_res, jump_test_s)) * dΓ
-J_int_solid = (-dot(avg_flux_solid_trial, jump_test_f)) * dΓ + (dot(avg_flux_solid_trial, jump_test_s)) * dΓ
-R_int_solid = (-dot(avg_flux_solid_res, jump_test_f)) * dΓ   + (dot(avg_flux_solid_res, jump_test_s)) * dΓ
+# With jump_test_f = v_f and jump_test_s = v_s (note `v_s` already carries the Neg())
+# the consistency term +∫ {t}·jump(v) expands to:
+#   +∫ {t}·v_f − ∫ {t}·v_s,
+# which is implemented below as "+ dot(avg_flux, jump_test_f) - dot(avg_flux, jump_test_s)".
+J_int_fluid = (dot(avg_flux_fluid_trial, jump_test_f)) * dΓ - (dot(avg_flux_fluid_trial, jump_test_s)) * dΓ
+R_int_fluid = (dot(avg_flux_fluid_res, jump_test_f)) * dΓ   - (dot(avg_flux_fluid_res, jump_test_s)) * dΓ
+J_int_solid = (dot(avg_flux_solid_trial, jump_test_f)) * dΓ - (dot(avg_flux_solid_trial, jump_test_s)) * dΓ
+R_int_solid = (dot(avg_flux_solid_res, jump_test_f)) * dΓ   - (dot(avg_flux_solid_res, jump_test_s)) * dΓ
 nitsche_pen_scale = mu_f_const / cell_h
 if USE_DT_SCALED_NITSCHE_PENALTY:
     nitsche_pen_scale = nitsche_pen_scale + (rho_f_const * cell_h / dt)
@@ -4966,10 +4984,10 @@ J_int_sym_solid = None
 R_int_sym_fluid = None
 R_int_sym_solid = None
 if s_nitsche_value != 0.0:
-    J_int_sym_fluid = (-s_nitsche * dot(avg_flux_fluid_test, jump_vel_trial)) * dΓ
-    J_int_sym_solid = (-s_nitsche * dot(avg_flux_solid_test, jump_vel_trial)) * dΓ
-    R_int_sym_fluid = (-s_nitsche * dot(avg_flux_fluid_test, jump_vel_res)) * dΓ
-    R_int_sym_solid = (-s_nitsche * dot(avg_flux_solid_test, jump_vel_res)) * dΓ
+    J_int_sym_fluid = (s_nitsche * dot(avg_flux_fluid_test, jump_vel_trial)) * dΓ
+    J_int_sym_solid = (s_nitsche * dot(avg_flux_solid_test, jump_vel_trial)) * dΓ
+    R_int_sym_fluid = (s_nitsche * dot(avg_flux_fluid_test, jump_vel_res)) * dΓ
+    R_int_sym_solid = (s_nitsche * dot(avg_flux_solid_test, jump_vel_res)) * dΓ
     J_int = J_int + J_int_sym_fluid + J_int_sym_solid
     R_int = R_int + R_int_sym_fluid + R_int_sym_solid
 

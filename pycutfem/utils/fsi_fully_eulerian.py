@@ -447,24 +447,30 @@ def build_fsi_eulerian_forms(
     avg_flux_fluid_res = kappa_pos * traction_fluid_primal(Pos(uf_k), Pos(pf_k))
 
     # `n` is a single interface normal oriented from (−) solid to (+) fluid.
-    # With this convention the physical dynamic condition is:
-    #   σ_f n = σ_s n  ⇔  t_f = t_s
-    # and the IBP boundary term is:
-    #   B_Γ(v) = ∫_Γ t_f·v_f − t_s·v_s.
-    # The Nitsche consistency term therefore uses the *sum* average
-    #   {t} = κ⁺ t_f + κ⁻ t_s  (κ⁺+κ⁻=1)
-    # so that, on the exact interface condition, {t}=t and the added flux term
-    # cancels B_Γ for arbitrary discontinuous test pairs.
+    # With this convention, outward normals are n_f = −n (fluid) and n_s = +n (solid).
+    # Define tractions using the same `n`:  t_f = σ_f n,  t_s = σ_s n.
+    #
+    # For the volume terms used below (e.g.  μ∫∇u:∇v  and  ∫σ:∇v), integration by parts
+    # yields the combined interface contribution
+    #   B_Γ(v_f,v_s) = ∫_Γ (σ_f n_f)·v_f + (σ_s n_s)·v_s
+    #              = ∫_Γ (−t_f·v_f + t_s·v_s).
+    # Under the physical dynamic condition t_f = t_s = t this becomes
+    #   B_Γ = −∫_Γ t·(v_f − v_s) = −∫_Γ t·jump(v).
+    #
+    # A consistent Nitsche term must therefore add
+    #   N_Γ(u;v) = +∫_Γ {t(u)}·jump(v),
+    # with the *sum* average {t} = κ⁺ t_f + κ⁻ t_s (κ⁺+κ⁻=1), so that {t}=t on the
+    # exact interface condition and B_Γ + N_Γ = 0 for arbitrary discontinuous tests.
     avg_flux_solid_trial = kappa_neg * traction_solid_L(Neg(ddisp_s), Neg(disp_k))
     avg_flux_solid_test = kappa_neg * traction_solid_L(Neg(test_vel_s), Neg(disp_k))
     avg_flux_solid_res = kappa_neg * traction_solid_R(Neg(disp_k))
 
     s_nitsche = Constant(s_nitsche_value)
 
-    J_int_fluid = (-dot(avg_flux_fluid_trial, jump_test_f)) * dGamma + (dot(avg_flux_fluid_trial, jump_test_s)) * dGamma
-    R_int_fluid = (-dot(avg_flux_fluid_res, jump_test_f)) * dGamma + (dot(avg_flux_fluid_res, jump_test_s)) * dGamma
-    J_int_solid = (-dot(avg_flux_solid_trial, jump_test_f)) * dGamma + (dot(avg_flux_solid_trial, jump_test_s)) * dGamma
-    R_int_solid = (-dot(avg_flux_solid_res, jump_test_f)) * dGamma + (dot(avg_flux_solid_res, jump_test_s)) * dGamma
+    J_int_fluid = (dot(avg_flux_fluid_trial, jump_test_f)) * dGamma - (dot(avg_flux_fluid_trial, jump_test_s)) * dGamma
+    R_int_fluid = (dot(avg_flux_fluid_res, jump_test_f)) * dGamma - (dot(avg_flux_fluid_res, jump_test_s)) * dGamma
+    J_int_solid = (dot(avg_flux_solid_trial, jump_test_f)) * dGamma - (dot(avg_flux_solid_trial, jump_test_s)) * dGamma
+    R_int_solid = (dot(avg_flux_solid_res, jump_test_f)) * dGamma - (dot(avg_flux_solid_res, jump_test_s)) * dGamma
     J_int_pen = (beta_N * mu_f / cell_h) * dot(jump_vel_trial, jump_vel_test) * dGamma
     R_int_pen = (beta_N * mu_f / cell_h) * dot(jump_vel_res, jump_vel_test) * dGamma
 
@@ -476,10 +482,10 @@ def build_fsi_eulerian_forms(
     J_int_sym_solid = None
     R_int_sym_solid = None
     if s_nitsche_value != 0.0:
-        J_int_sym_fluid = (-s_nitsche * dot(avg_flux_fluid_test, jump_vel_trial)) * dGamma
-        J_int_sym_solid = (-s_nitsche * dot(avg_flux_solid_test, jump_vel_trial)) * dGamma
-        R_int_sym_fluid = (-s_nitsche * dot(avg_flux_fluid_test, jump_vel_res)) * dGamma
-        R_int_sym_solid = (-s_nitsche * dot(avg_flux_solid_test, jump_vel_res)) * dGamma
+        J_int_sym_fluid = (s_nitsche * dot(avg_flux_fluid_test, jump_vel_trial)) * dGamma
+        J_int_sym_solid = (s_nitsche * dot(avg_flux_solid_test, jump_vel_trial)) * dGamma
+        R_int_sym_fluid = (s_nitsche * dot(avg_flux_fluid_test, jump_vel_res)) * dGamma
+        R_int_sym_solid = (s_nitsche * dot(avg_flux_solid_test, jump_vel_res)) * dGamma
         J_int = J_int + J_int_sym_fluid + J_int_sym_solid
         R_int = R_int + R_int_sym_fluid + R_int_sym_solid
 

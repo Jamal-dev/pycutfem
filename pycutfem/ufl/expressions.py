@@ -891,7 +891,92 @@ class TestFunction(Function):
             self.field_sides = [s] 
         else:
             self.field_sides = ""
- 
+	 
+
+class HdivTrialFunction(Expression):
+    """
+    Vector-valued trial function backed by a *single* H(div) field name (e.g. RT_k).
+
+    Unlike VectorTrialFunction, this does not split into separate scalar fields; it
+    represents one coefficient vector multiplying vector basis functions.
+    """
+
+    is_trial = True
+    is_function = False
+    is_test = False
+
+    def __init__(self, field_name: str, *, value_dim: int = 2, side: str = ""):
+        super().__init__()
+        self.field_name = str(field_name)
+        self.field_names = [self.field_name]
+        self.num_components = int(value_dim)
+        self.dim = 1
+        self.parent_name = ""
+        self.side = side
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
+            self.field_sides = [s] * self.num_components
+        else:
+            self.field_sides = [""] * self.num_components
+
+    def __repr__(self):
+        return f"HdivTrialFunction(field='{self.field_name}')"
+
+
+class HdivTestFunction(Expression):
+    """Vector-valued test function backed by a *single* H(div) field name."""
+
+    is_test = True
+    is_function = False
+    is_trial = False
+
+    def __init__(self, field_name: str, *, value_dim: int = 2, side: str = ""):
+        super().__init__()
+        self.field_name = str(field_name)
+        self.field_names = [self.field_name]
+        self.num_components = int(value_dim)
+        self.dim = 1
+        self.parent_name = ""
+        self.side = side
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
+            self.field_sides = [s] * self.num_components
+        else:
+            self.field_sides = [""] * self.num_components
+
+    def __repr__(self):
+        return f"HdivTestFunction(field='{self.field_name}')"
+
+
+class HdivFunction(Function):
+    """
+    Vector-valued coefficient function backed by a *single* H(div) field name (e.g. RT_k).
+
+    Stores one scalar coefficient per RT basis function, but evaluates to a 2D vector
+    via the vector-valued RT basis.
+    """
+
+    is_function = True
+    is_trial = False
+    is_test = False
+    num_components = 2
+
+    def __init__(self, name: str, field_name: str, dof_handler: 'DofHandler' = None, *, side: str = ""):
+        super().__init__(name=name, field_name=field_name, dof_handler=dof_handler, side=side)
+        self.field_names = [self.field_name]
+        self.dim = 1
+        self.num_components = 2
+        self.parent_name = ""
+        self.side = side
+        if self.side in ("+","-"):
+            s = "pos" if self.side == "+" else "neg"
+            self.field_sides = [s] * self.num_components
+        else:
+            self.field_sides = [""] * self.num_components
+
+    def __repr__(self):
+        return f"HdivFunction(name='{self.name}', field='{self.field_name}')"
+
 
 def _scalar_token(value: float) -> str:
     return f"s_{format(float(value), '.16g')}"

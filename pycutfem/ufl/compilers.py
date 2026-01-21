@@ -41,6 +41,8 @@ from pycutfem.integration.cut_integration import CutIntegration
 from pycutfem.ufl.expressions import (
     Constant,    TestFunction,   TrialFunction,
     VectorTestFunction, VectorTrialFunction,
+    HdivTestFunction, HdivTrialFunction,
+    HdivFunction,
     Function,    VectorFunction,
     Grad, DivOperation, Inner, Dot,
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
@@ -157,6 +159,9 @@ class FormCompiler:
             TrialFunction: self._visit_TrialFunction, 
             VectorTestFunction: self._visit_VectorTestFunction,
             VectorTrialFunction: self._visit_VectorTrialFunction, 
+            HdivTestFunction: self._visit_HdivTestFunction,
+            HdivTrialFunction: self._visit_HdivTrialFunction,
+            HdivFunction: self._visit_HdivFunction,
             Function: self._visit_Function,
             VectorFunction: self._visit_VectorFunction, 
             Grad: self._visit_Grad,
@@ -1301,6 +1306,48 @@ class FormCompiler:
             arr = arr.sum(axis=1)
         return self._vecinfo(arr, role="function", node=n, field_names=[n.field_name])
 
+    def _visit_HdivFunction(self, n: HdivFunction):
+        # H(div) coefficient function evaluates to a 2D vector via the RT basis.
+        if "mask_basis" not in self.ctx:
+            self.ctx["mask_basis"] = False
+        local_dofs = self._local_dofs()
+        coeffs = np.asarray(n.get_nodal_values(local_dofs), dtype=float)  # (n_loc,)
+
+        entry = self._basis_cache.get(n.field_name, {})
+        side = self._get_side() if self._on_sided_path() else None
+        if side == "+":
+            hdiv_val = entry.get("hdiv_val_pos", None)
+        elif side == "-":
+            hdiv_val = entry.get("hdiv_val_neg", None)
+        else:
+            hdiv_val = None
+        if hdiv_val is None:
+            hdiv_val = entry.get("hdiv_val")  # (2, n_loc)
+        if hdiv_val is None:
+            raise RuntimeError(f"Missing H(div) basis cache for field '{n.field_name}'.")
+
+        # On ghost/interface paths, align BOTH basis and coeffs to the same global layout.
+        gd = self.ctx.get("global_dofs", None)
+        if gd is not None:
+            union_key = "pos_union_mask_by_field" if side == "+" else "neg_union_mask_by_field"
+            union_backup = None
+            masks = self.ctx.get(union_key)
+            if self.ctx.get("_restriction_mask_active", 0):
+                if isinstance(masks, dict) and masks:
+                    union_backup = masks
+                    self.ctx[union_key] = {f: np.ones_like(np.asarray(m, dtype=float)) for f, m in masks.items()}
+            try:
+                hdiv_val, coeffs = _hac._align_phi_and_coeffs_to_global(
+                    self.ctx, side or "+", n.field_name, np.asarray(hdiv_val, dtype=float), coeffs
+                )
+            finally:
+                if union_backup is not None:
+                    self.ctx[union_key] = union_backup
+
+        val = np.asarray(hdiv_val, dtype=float) @ np.asarray(coeffs, dtype=float)  # (2,)
+        # Repeat field metadata per vector component so restriction masks apply to both.
+        return self._vecinfo(np.asarray(val, dtype=float), role="function", node=n, field_names=[n.field_name] * 2)
+
     def _visit_VectorFunction(self, n: VectorFunction):
         logger.debug(f"Visiting VectorFunction: {n.field_names}")
         # gating with the mask (respect existing flag if set by caller)
@@ -1394,6 +1441,43 @@ class FormCompiler:
         rows = [self._lookup_basis(f, (0, 0)) for f in names]
         data  = np.stack(rows) if rows else np.zeros((len(n.field_names), self._zero_width()))
         return self._vecinfo(data, role="trial", node=n, field_names=names)
+
+
+    def _visit_HdivTestFunction(self, n: HdivTestFunction):
+        if "mask_basis" not in self.ctx:
+            self.ctx["mask_basis"] = False
+        fld = str(n.field_name)
+        entry = self._basis_cache.get(fld, {})
+        side = self._get_side() if self._on_sided_path() else None
+        if side == "+":
+            val = entry.get("hdiv_val_pos", None)
+        elif side == "-":
+            val = entry.get("hdiv_val_neg", None)
+        else:
+            val = None
+        if val is None:
+            val = entry.get("hdiv_val")
+        if val is None:
+            raise RuntimeError(f"Missing H(div) basis cache for field '{fld}'.")
+        return self._vecinfo(np.asarray(val, dtype=float), role="test", node=n, field_names=[fld] * 2)
+
+    def _visit_HdivTrialFunction(self, n: HdivTrialFunction):
+        if "mask_basis" not in self.ctx:
+            self.ctx["mask_basis"] = False
+        fld = str(n.field_name)
+        entry = self._basis_cache.get(fld, {})
+        side = self._get_side() if self._on_sided_path() else None
+        if side == "+":
+            val = entry.get("hdiv_val_pos", None)
+        elif side == "-":
+            val = entry.get("hdiv_val_neg", None)
+        else:
+            val = None
+        if val is None:
+            val = entry.get("hdiv_val")
+        if val is None:
+            raise RuntimeError(f"Missing H(div) basis cache for field '{fld}'.")
+        return self._vecinfo(np.asarray(val, dtype=float), role="trial", node=n, field_names=[fld] * 2)
 
     # ================== VISITORS: OPERATORS ========================
     def _visit_Grad(self, n: Grad):
@@ -1658,6 +1742,43 @@ class FormCompiler:
         return tr
 
     def _visit_DivOperation(self, n: DivOperation):
+        op0 = n.operand
+        base_op = op0.operand if isinstance(op0, Restriction) else op0
+        # Handle div on H(div) fields directly (no grad/trace).
+        if isinstance(base_op, (HdivTestFunction, HdivTrialFunction)):
+            fld = str(base_op.field_name)
+            entry = self._basis_cache.get(fld, {})
+            side = self._get_side() if self._on_sided_path() else None
+            if side == "+":
+                div_row = entry.get("hdiv_div_pos", None)
+            elif side == "-":
+                div_row = entry.get("hdiv_div_neg", None)
+            else:
+                div_row = None
+            if div_row is None:
+                div_row = entry.get("hdiv_div")
+            if div_row is None:
+                raise RuntimeError(f"Missing H(div) divergence cache for field '{fld}'.")
+            role = "test" if isinstance(base_op, HdivTestFunction) else "trial"
+            return self._vecinfo(np.stack([np.asarray(div_row, dtype=float)]), role=role, node=op0, field_names=[fld])
+        if isinstance(base_op, HdivFunction):
+            fld = str(base_op.field_name)
+            entry = self._basis_cache.get(fld, {})
+            side = self._get_side() if self._on_sided_path() else None
+            if side == "+":
+                div_row = entry.get("hdiv_div_pos", None)
+            elif side == "-":
+                div_row = entry.get("hdiv_div_neg", None)
+            else:
+                div_row = None
+            if div_row is None:
+                div_row = entry.get("hdiv_div")
+            if div_row is None:
+                raise RuntimeError(f"Missing H(div) divergence cache for field '{fld}'.")
+            coeffs = np.asarray(base_op.get_nodal_values(self._local_dofs()), dtype=float)
+            div_val = float(coeffs @ np.asarray(div_row, dtype=float))
+            return self._vecinfo(np.asarray([div_val], dtype=float), role="function", node=op0, field_names=[fld])
+
         grad_op = self._visit(Grad(n.operand))           # (k, n_loc, d)
         logger.debug(f"Visiting DivOperation for operand of type {type(n.operand)}, grad_op shape: {grad_op.data.shape}")
         d = self.me.mesh.spatial_dim
@@ -2593,9 +2714,32 @@ class FormCompiler:
                 # cache basis/grad for exactly the fields used by the integrand
                 self._basis_cache.clear(); self._coeff_cache.clear(); self._collapsed_cache.clear()
                 for f in fields:
+                    fam = getattr(self.me, "_field_families", {}).get(f, "Lagrange")
+                    if fam == "RT":
+                        # H(div): vector basis values + divergence basis (both union-sized).
+                        V = np.asarray(self.me.tabulate_value(f, float(xi), float(eta), element_id=int(eid)), dtype=float)  # (n_loc_f,2)
+                        divV = np.asarray(self.me.tabulate_div(f, float(xi), float(eta), element_id=int(eid)), dtype=float).ravel()  # (n_loc_f,)
+                        sgn = np.asarray(self.dh.element_signs[f][int(eid)], dtype=float).ravel()
+                        if sgn.shape[0] != V.shape[0]:
+                            raise RuntimeError(f"element_signs length mismatch for RT field '{f}' on element {eid}.")
+                        V = sgn[:, None] * V
+                        divV = sgn * divV
+
+                        n_union = int(self.me.n_dofs_local)
+                        sl = self.me.component_dof_slices[f]
+                        hdiv_val = np.zeros((2, n_union), dtype=float)
+                        hdiv_val[:, sl] = V.T
+                        hdiv_div = np.zeros((n_union,), dtype=float)
+                        hdiv_div[sl] = divV
+                        self._basis_cache[f] = {
+                            "hdiv_val": hdiv_val,
+                            "hdiv_div": hdiv_div,
+                        }
+                        continue
+
                     self._basis_cache[f] = {
-                        "val" : self.me.basis(f, xi, eta),
-                        "grad": self.me.grad_basis(f, xi, eta) @ Ji
+                        "val": self.me.basis(f, xi, eta),
+                        "grad": self.me.grad_basis(f, xi, eta) @ Ji,
                     }
 
                 self.ctx["eid"]    = eid
@@ -2949,9 +3093,48 @@ class FormCompiler:
                             self.ctx['normal'] = np.asarray(normal_base, float)
 
                         # basis cache at (xi,eta)
+                        self._basis_cache.clear()
+                        self._coeff_cache.clear()
+                        self._collapsed_cache.clear()
                         self.ctx['basis_values'] = {"+": {}, "-": {}}
                         if fields:
                             for f in fields:
+                                fam = getattr(me, "_field_families", {}).get(f, "Lagrange")
+                                if fam == "RT":
+                                    # H(div): store vector basis + divergence in the basis cache.
+                                    Vhat = np.asarray(me.tabulate_value(f, float(xi), float(eta)), dtype=float)  # (n_loc,2)
+                                    A = np.asarray(Ji, dtype=float)  # J^{-1} at this QP (total, incl. deformation)
+                                    adj = np.array([[A[1, 1], -A[0, 1]], [-A[1, 0], A[0, 0]]], dtype=float)
+                                    Vphys = (adj @ Vhat.T).T  # (n_loc,2)
+                                    detJinv = float(np.linalg.det(A))
+                                    div_hat = np.asarray(me.tabulate_div(f, float(xi), float(eta)), dtype=float).ravel()
+                                    div_phys = div_hat * detJinv
+
+                                    sgn = np.asarray(dh.element_signs[f][int(eid)], dtype=float).ravel()
+                                    if sgn.shape[0] != Vphys.shape[0]:
+                                        raise RuntimeError(f"element_signs length mismatch for RT field '{f}' on element {eid}.")
+                                    Vphys = sgn[:, None] * Vphys
+                                    div_phys = sgn * div_phys
+
+                                    n_union = int(len(global_dofs))
+                                    hdiv_val = np.zeros((2, n_union), dtype=float)
+                                    hdiv_div = np.zeros((n_union,), dtype=float)
+                                    fmap = pos_map_by_field.get(f)
+                                    if fmap is None:
+                                        sl = me.component_dof_slices[f]
+                                        fmap = np.arange(int(sl.start), int(sl.stop), dtype=int)
+                                    fmap = np.asarray(fmap, dtype=int).ravel()
+                                    hdiv_val[:, fmap] = Vphys.T
+                                    hdiv_div[fmap] = div_phys
+
+                                    self._basis_cache[f] = {
+                                        "hdiv_val_pos": hdiv_val,
+                                        "hdiv_val_neg": hdiv_val,
+                                        "hdiv_div_pos": hdiv_div,
+                                        "hdiv_div_neg": hdiv_div,
+                                    }
+                                    continue
+
                                 vrow = me.basis(f, float(xi), float(eta))
                                 Gtab = me.grad_basis(f, float(xi), float(eta)) @ Ji
                                 slotp = self.ctx['basis_values']['+'].setdefault(f, {})
@@ -3199,6 +3382,53 @@ class FormCompiler:
 
                 self.ctx["basis_values"] = {"+": {}, "-": {}}
                 for f in fields:
+                    fam = getattr(me, "_field_families", {}).get(f, "Lagrange")
+                    if fam == "RT":
+                        Vhat_p = np.asarray(me.tabulate_value(f, float(xi_p), float(eta_p)), dtype=float)  # (n_loc,2)
+                        Vhat_n = np.asarray(me.tabulate_value(f, float(xi_n), float(eta_n)), dtype=float)
+                        Apos = np.asarray(Ji_pos, dtype=float)
+                        Aneg = np.asarray(Ji_neg, dtype=float)
+                        adj_p = np.array([[Apos[1, 1], -Apos[0, 1]], [-Apos[1, 0], Apos[0, 0]]], dtype=float)
+                        adj_n = np.array([[Aneg[1, 1], -Aneg[0, 1]], [-Aneg[1, 0], Aneg[0, 0]]], dtype=float)
+                        Vphys_p = (adj_p @ Vhat_p.T).T
+                        Vphys_n = (adj_n @ Vhat_n.T).T
+                        det_inv_p = float(np.linalg.det(Apos))
+                        det_inv_n = float(np.linalg.det(Aneg))
+                        div_hat_p = np.asarray(me.tabulate_div(f, float(xi_p), float(eta_p)), dtype=float).ravel()
+                        div_hat_n = np.asarray(me.tabulate_div(f, float(xi_n), float(eta_n)), dtype=float).ravel()
+                        div_phys_p = div_hat_p * det_inv_p
+                        div_phys_n = div_hat_n * det_inv_n
+
+                        sgn_p = np.asarray(dh.element_signs[f][int(pos_eid)], dtype=float).ravel()
+                        sgn_n = np.asarray(dh.element_signs[f][int(neg_eid)], dtype=float).ravel()
+                        Vphys_p = sgn_p[:, None] * Vphys_p
+                        Vphys_n = sgn_n[:, None] * Vphys_n
+                        div_phys_p = sgn_p * div_phys_p
+                        div_phys_n = sgn_n * div_phys_n
+
+                        n_union = int(len(global_dofs))
+                        hdiv_val_pos = np.zeros((2, n_union), dtype=float)
+                        hdiv_val_neg = np.zeros((2, n_union), dtype=float)
+                        hdiv_div_pos = np.zeros((n_union,), dtype=float)
+                        hdiv_div_neg = np.zeros((n_union,), dtype=float)
+                        idx_p = pos_map_by_field_full.get(f)
+                        idx_n = neg_map_by_field_full.get(f)
+                        if idx_p is not None:
+                            idx_p = np.asarray(idx_p, dtype=int).ravel()
+                            hdiv_val_pos[:, idx_p] = Vphys_p.T
+                            hdiv_div_pos[idx_p] = div_phys_p
+                        if idx_n is not None:
+                            idx_n = np.asarray(idx_n, dtype=int).ravel()
+                            hdiv_val_neg[:, idx_n] = Vphys_n.T
+                            hdiv_div_neg[idx_n] = div_phys_n
+                        self._basis_cache[f] = {
+                            "hdiv_val_pos": hdiv_val_pos,
+                            "hdiv_val_neg": hdiv_val_neg,
+                            "hdiv_div_pos": hdiv_div_pos,
+                            "hdiv_div_neg": hdiv_div_neg,
+                        }
+                        continue
+
                     v_pos = me.basis(f, xi_p, eta_p)
                     g_pos = me.grad_basis(f, xi_p, eta_p) @ Ji_pos
                     v_neg = me.basis(f, xi_n, eta_n)
@@ -3767,6 +3997,58 @@ class FormCompiler:
                         deform_ctx_entry = None
 
                     for fld in fields:
+                        fam = getattr(self.me, "_field_families", {}).get(fld, "Lagrange")
+                        if fam == "RT":
+                            # H(div): build side-specific vector basis + divergence in union layout.
+                            Vhat_p = np.asarray(self.me.tabulate_value(fld, float(xi_pos), float(eta_pos)), dtype=float)  # (n_loc,2)
+                            Vhat_n = np.asarray(self.me.tabulate_value(fld, float(xi_neg), float(eta_neg)), dtype=float)
+                            Apos = np.asarray(Ji_pos, dtype=float)
+                            Aneg = np.asarray(Ji_neg, dtype=float)
+                            adj_p = np.array([[Apos[1, 1], -Apos[0, 1]], [-Apos[1, 0], Apos[0, 0]]], dtype=float)
+                            adj_n = np.array([[Aneg[1, 1], -Aneg[0, 1]], [-Aneg[1, 0], Aneg[0, 0]]], dtype=float)
+                            Vphys_p = (adj_p @ Vhat_p.T).T
+                            Vphys_n = (adj_n @ Vhat_n.T).T
+                            det_inv_p = float(np.linalg.det(Apos))
+                            det_inv_n = float(np.linalg.det(Aneg))
+                            div_hat_p = np.asarray(self.me.tabulate_div(fld, float(xi_pos), float(eta_pos)), dtype=float).ravel()
+                            div_hat_n = np.asarray(self.me.tabulate_div(fld, float(xi_neg), float(eta_neg)), dtype=float).ravel()
+                            div_phys_p = div_hat_p * det_inv_p
+                            div_phys_n = div_hat_n * det_inv_n
+
+                            sgn_p = np.asarray(self.dh.element_signs[fld][int(pos_eid)], dtype=float).ravel()
+                            sgn_n = np.asarray(self.dh.element_signs[fld][int(neg_eid)], dtype=float).ravel()
+                            if sgn_p.shape[0] != Vphys_p.shape[0] or sgn_n.shape[0] != Vphys_n.shape[0]:
+                                raise RuntimeError("element_signs length mismatch for RT field on ghost facet.")
+                            Vphys_p = sgn_p[:, None] * Vphys_p
+                            Vphys_n = sgn_n[:, None] * Vphys_n
+                            div_phys_p = sgn_p * div_phys_p
+                            div_phys_n = sgn_n * div_phys_n
+
+                            n_union = int(len(global_dofs))
+                            hdiv_val_pos = np.zeros((2, n_union), dtype=float)
+                            hdiv_val_neg = np.zeros((2, n_union), dtype=float)
+                            hdiv_div_pos = np.zeros((n_union,), dtype=float)
+                            hdiv_div_neg = np.zeros((n_union,), dtype=float)
+
+                            idx_p = pos_map_by_field_full.get(fld)
+                            idx_n = neg_map_by_field_full.get(fld)
+                            if idx_p is not None:
+                                idx_p = np.asarray(idx_p, dtype=int).ravel()
+                                hdiv_val_pos[:, idx_p] = Vphys_p.T
+                                hdiv_div_pos[idx_p] = div_phys_p
+                            if idx_n is not None:
+                                idx_n = np.asarray(idx_n, dtype=int).ravel()
+                                hdiv_val_neg[:, idx_n] = Vphys_n.T
+                                hdiv_div_neg[idx_n] = div_phys_n
+
+                            self._basis_cache[fld] = {
+                                "hdiv_val_pos": hdiv_val_pos,
+                                "hdiv_val_neg": hdiv_val_neg,
+                                "hdiv_div_pos": hdiv_div_pos,
+                                "hdiv_div_neg": hdiv_div_neg,
+                            }
+                            continue
+
                         try:
                             vrow_pos = self.me.basis(fld, float(xi_pos), float(eta_pos))
                             grad_pos = self.me.grad_basis(fld, float(xi_pos), float(eta_pos)) @ Ji_pos
