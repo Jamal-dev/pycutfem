@@ -698,8 +698,12 @@ POINT_A_INITIAL = (0.6, 0.2) # Point A will change while Point B is fixed
 BETA_PENALTY = float(os.getenv("BETA_PENALTY", "20.0")) * MU_F
 DT = float(ARGS.dt)
 POLY_ORDER = int(ARGS.poly_order)
-USE_TAYLOR_HOOD = os.getenv("PYCUTFEM_TAYLOR_HOOD", "0") not in ("0", "false", "False")
+USE_TAYLOR_HOOD = os.getenv("PYCUTFEM_TAYLOR_HOOD", "1") not in ("0", "false", "False")
+REDUCE_ORDER_SOLID = os.getenv("REDUCE_ORDER_SOLID", "1") not in ("0", "false", "False")
 PRESSURE_ORDER = (POLY_ORDER - 1) if USE_TAYLOR_HOOD else POLY_ORDER
+SOLID_ORDER = POLY_ORDER - 1 if REDUCE_ORDER_SOLID else POLY_ORDER
+if SOLID_ORDER < 1:
+    SOLID_ORDER = 1
 if PRESSURE_ORDER < 1:
     PRESSURE_ORDER = 1
     if USE_TAYLOR_HOOD:
@@ -4429,17 +4433,17 @@ if quick_plot_only:
     sys.exit(0)
 
 # Mixed element for fluid/solid unknowns
-# Default is equal-order P^k/P^k. Set PYCUTFEM_TAYLOR_HOOD=1 for P^k/P^(k-1).
+# Default is Taylor hood. Set PYCUTFEM_TAYLOR_HOOD=1 for P^k/P^(k-1).
 mixed_element = MixedElement(
     mesh,
     field_specs={
         "u_pos_x": POLY_ORDER,
         "u_pos_y": POLY_ORDER,
         "p_pos_": PRESSURE_ORDER,
-        "vs_neg_x": POLY_ORDER ,
-        "vs_neg_y": POLY_ORDER ,
-        "d_neg_x":  POLY_ORDER ,
-        "d_neg_y":  POLY_ORDER ,
+        "vs_neg_x": SOLID_ORDER ,
+        "vs_neg_y": SOLID_ORDER ,
+        "d_neg_x":  SOLID_ORDER ,
+        "d_neg_y":  SOLID_ORDER ,
     },
 )
 dof_handler = DofHandler(mixed_element, method="cg")
