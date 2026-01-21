@@ -197,6 +197,138 @@ def _build_context(poly_order: int = 2, *, nx: int = 2, ny: int = 2, levelset_c:
     return mesh, dh, forms, fd_fields
 
 
+def _fill_affine_vec(dh: DofHandler, vec: VectorFunction, *, fx: str, fy: str, ax: float, bx: float, ay: float, by: float, cx: float = 0.0, cy: float = 0.0) -> None:
+    gx = np.asarray(dh.get_field_slice(fx), dtype=int)
+    xy = dh.get_dof_coords(fx)
+    vec.set_nodal_values(gx, ax * xy[:, 0] + bx * xy[:, 1] + cx)
+    gy = np.asarray(dh.get_field_slice(fy), dtype=int)
+    xy = dh.get_dof_coords(fy)
+    vec.set_nodal_values(gy, ay * xy[:, 0] + by * xy[:, 1] + cy)
+
+
+def _build_context_nonlinear(poly_order: int = 2, *, nx: int = 2, ny: int = 2, levelset_c: float = 0.33, solid_advect_lagged: bool = False):
+    """
+    Like `_build_context(...)` but with a nonzero affine velocity/displacement state
+    so the nonlinear convection/advection Jacobians are exercised in the FD check.
+    """
+    mesh, dh, forms, fd_fields = _build_context(poly_order=poly_order, nx=nx, ny=ny, levelset_c=levelset_c)
+
+    # Rebuild forms with the requested solid advection mode (the base builder always uses lagged=True).
+    # Keep the same geometry/measures and field objects.
+    level_set = AffineLevelSet(a=1.0, b=0.0, c=levelset_c)
+    mesh.classify_elements(level_set)
+    mesh.classify_edges(level_set)
+    mesh.build_interface_segments(level_set)
+    domains = make_domain_sets(mesh, use_aligned_interface=False)
+    dx_fluid, dx_solid, dGamma, dG_fluid, dG_solid = build_measures(mesh, level_set, domains, qvol=3)
+
+    velocity_fluid_space = FunctionSpace(name="velocity_fluid", field_names=["u_pos_x", "u_pos_y"], dim=1, side="+")
+    pressure_fluid_space = FunctionSpace(name="pressure_fluid", field_names=["p_pos_"], dim=0, side="+")
+    velocity_solid_space = FunctionSpace(name="velocity_solid", field_names=["vs_neg_x", "vs_neg_y"], dim=1, side="-")
+    displacement_space = FunctionSpace(name="displacement", field_names=["d_neg_x", "d_neg_y"], dim=1, side="-")
+
+    du_f = VectorTrialFunction(space=velocity_fluid_space, dof_handler=dh)
+    dp_f = TrialFunction(name="trial_pressure_fluid", field_name="p_pos_", dof_handler=dh, side="+")
+    du_s = VectorTrialFunction(space=velocity_solid_space, dof_handler=dh)
+    ddisp_s = VectorTrialFunction(space=displacement_space, dof_handler=dh)
+    test_vel_f = VectorTestFunction(space=velocity_fluid_space, dof_handler=dh)
+    test_q_f = TestFunction(name="test_pressure_fluid", field_name="p_pos_", dof_handler=dh, side="+")
+    test_vel_s = VectorTestFunction(space=velocity_solid_space, dof_handler=dh)
+    test_disp_s = VectorTestFunction(space=displacement_space, dof_handler=dh)
+
+    uf_k = fd_fields["u_pos_x"]
+    pf_k = fd_fields["p_pos_"]
+    uf_n = VectorFunction(name="u_f_n", field_names=["u_pos_x", "u_pos_y"], dof_handler=dh, side="+")
+    pf_n = Function(name="p_f_n", field_name="p_pos_", dof_handler=dh, side="+")
+    us_k = fd_fields["vs_neg_x"]
+    us_n = VectorFunction(name="u_s_n", field_names=["vs_neg_x", "vs_neg_y"], dof_handler=dh, side="-")
+    disp_k = fd_fields["d_neg_x"]
+    disp_n = VectorFunction(name="disp_n", field_names=["d_neg_x", "d_neg_y"], dof_handler=dh, side="-")
+
+    for func in (uf_n, pf_n, us_n, disp_n):
+        func.nodal_values.fill(0.0)
+
+    # Restrict to active domains
+    du_f_R = restrict(du_f, domains["has_pos"])
+    dp_f_R = restrict(dp_f, domains["has_pos"])
+    test_vel_f_R = restrict(test_vel_f, domains["has_pos"])
+    test_q_f_R = restrict(test_q_f, domains["has_pos"])
+    uf_k_R = restrict(uf_k, domains["has_pos"])
+    uf_n_R = restrict(uf_n, domains["has_pos"])
+    pf_k_R = restrict(pf_k, domains["has_pos"])
+    pf_n_R = restrict(pf_n, domains["has_pos"])
+
+    du_s_R = restrict(du_s, domains["has_neg"])
+    ddisp_s_R = restrict(ddisp_s, domains["has_neg"])
+    test_vel_s_R = restrict(test_vel_s, domains["has_neg"])
+    test_disp_s_R = restrict(test_disp_s, domains["has_neg"])
+    us_k_R = restrict(us_k, domains["has_neg"])
+    us_n_R = restrict(us_n, domains["has_neg"])
+    disp_k_R = restrict(disp_k, domains["has_neg"])
+    disp_n_R = restrict(disp_n, domains["has_neg"])
+
+    forms = build_fsi_eulerian_forms(
+        du_f=du_f_R,
+        dp_f=dp_f_R,
+        du_s=du_s_R,
+        ddisp_s=ddisp_s_R,
+        test_vel_f=test_vel_f_R,
+        test_q_f=test_q_f_R,
+        test_vel_s=test_vel_s_R,
+        test_disp_s=test_disp_s_R,
+        uf_k=uf_k_R,
+        pf_k=pf_k_R,
+        uf_n=uf_n_R,
+        pf_n=pf_n_R,
+        us_k=us_k_R,
+        us_n=us_n_R,
+        disp_k=disp_k_R,
+        disp_n=disp_n_R,
+        dx_fluid=dx_fluid,
+        dx_solid=dx_solid,
+        dGamma=dGamma,
+        dG_fluid=dG_fluid,
+        dG_solid=dG_solid,
+        kappa_pos=Constant(0.5),
+        kappa_neg=Constant(0.5),
+        cell_h=CellDiameter(),
+        beta_N=Constant(10.0),
+        rho_f=Constant(1.0),
+        rho_s=Constant(1.0),
+        mu_f=Constant(1.0),
+        mu_s=Constant(1.0),
+        lambda_s=Constant(0.0),
+        dt=Constant(1.0e-1),
+        theta=Constant(1.0),
+        gamma_v=Constant(0.0),
+        gamma_p=Constant(0.0),
+        gamma_v_grad=Constant(0.0),
+        solid_reg_eps=Constant(0.0),
+        use_linear_solid=True,
+        solid_advect_lagged=bool(solid_advect_lagged),
+        s_nitsche_value=1.0,
+    )
+
+    # Nonzero affine state (convection/advection is active):
+    #   u = a*[y,x],  d = dt*u,  p=0.
+    a = 0.2
+    _fill_affine_vec(dh, uf_k, fx="u_pos_x", fy="u_pos_y", ax=0.0, bx=a, ay=a, by=0.0)
+    _fill_affine_vec(dh, us_k, fx="vs_neg_x", fy="vs_neg_y", ax=0.0, bx=a, ay=a, by=0.0)
+    _fill_affine_vec(dh, disp_k, fx="d_neg_x", fy="d_neg_y", ax=0.0, bx=0.1 * a, ay=0.1 * a, by=0.0)
+    pf_k.nodal_values.fill(0.0)
+
+    fd_fields = {
+        "u_pos_x": uf_k,
+        "u_pos_y": uf_k,
+        "p_pos_": pf_k,
+        "vs_neg_x": us_k,
+        "vs_neg_y": us_k,
+        "d_neg_x": disp_k,
+        "d_neg_y": disp_k,
+    }
+    return mesh, dh, forms, fd_fields
+
+
 def _select_fd_dofs(dh: DofHandler, fields_to_probe: dict[str, int], elem_tag: str = "cut") -> np.ndarray:
     selected: list[int] = []
     elems = dh.element_bitset(elem_tag).to_indices()
@@ -337,3 +469,34 @@ def test_fsi_eulerian_fd_stab_ghost_both(backend):
     assert np.isfinite(rel_err), f"{backend} produced non-finite rel error for stab (ghost_both)"
     assert abs_err < 1.0e-6, f"{backend} abs error too large for stab (ghost_both): {abs_err:.3e}"
     assert rel_err < 1.0e-5, f"{backend} rel error too large for stab (ghost_both): {rel_err:.3e}"
+
+
+@pytest.mark.parametrize("backend", ("python", "jit", "cpp"))
+def test_fsi_eulerian_fd_nonlinear_convection_and_solid_advection(backend):
+    mesh, dh, forms, fd_fields = _build_context_nonlinear(poly_order=1, nx=2, ny=2, levelset_c=0.33, solid_advect_lagged=False)
+    if mesh.element_bitset("cut").cardinality() == 0:
+        pytest.skip("No cut elements found; adjust mesh or level set.")
+    probe = _select_fd_dofs(dh, {"u_pos_x": 1, "vs_neg_x": 1, "d_neg_x": 1}, elem_tag="cut")
+    compiler = FormCompiler(dh, backend=backend)
+
+    term_blocks = {
+        "vol_f": (forms.a_vol_f, forms.r_vol_f),
+        "vol_s": (forms.a_vol_s, forms.r_vol_s),
+        "svc_s": (forms.a_svc, forms.r_svc),
+    }
+
+    for name, (jf, rf) in term_blocks.items():
+        abs_err, rel_err = _fd_check(
+            jf,
+            rf,
+            dh,
+            [],
+            fd_fields,
+            probe,
+            compiler=compiler,
+            eps=1.0e-7,
+        )
+        assert np.isfinite(abs_err), f"{backend} produced non-finite abs error for {name}"
+        assert np.isfinite(rel_err), f"{backend} produced non-finite rel error for {name}"
+        assert abs_err < 1.0e-6, f"{backend} abs error too large for {name}: {abs_err:.3e}"
+        assert rel_err < 1.0e-5, f"{backend} rel error too large for {name}: {rel_err:.3e}"

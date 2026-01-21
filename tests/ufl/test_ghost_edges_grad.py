@@ -23,6 +23,13 @@ from pycutfem.ufl.compilers import FormCompiler
 
 X_IFACE = 1.03  # avoid mesh-aligned interface so ghost edges are non-empty
 
+def _have_cpp_backend() -> bool:
+    try:
+        from pycutfem.jit.cpp_backend import compile_backend_cpp  # noqa: F401
+        return True
+    except Exception:
+        return False
+
 @pytest.fixture(scope="module")
 def setup_quad2():
     """2×1 quadratic mesh cut vertically at x=X_IFACE."""
@@ -110,3 +117,29 @@ def test_gradjumpn_known_value_on_aligned_cut(setup_quad2, backend):
 
     expected = 0.0   # (jump)^2 × length(ghost line) = 0 × 0, for interface it should be 1
     assert np.isclose(res["E"], expected, rtol=1e-2)
+
+
+@pytest.mark.parametrize("backend", ["python", "jit"] + (["cpp"] if _have_cpp_backend() else []))
+def test_gradjumpn_matrix_annihilates_linear(setup_quad2, backend):
+    _mesh, ls, ghost, dh, _ = setup_quad2
+    n = FacetNormal()
+
+    u = TrialFunction("u", dh)
+    v = TestFunction("u", dh)
+
+    # Assemble the *matrix* for the normal-derivative jump penalty.
+    a = inner(dot(n, Jump(grad(u))), dot(Jump(grad(v)), n)) * dGhost(
+        defined_on=ghost,
+        level_set=ls,
+        metadata={"derivs": {(1, 0), (0, 1)}, "q": 6},
+    )
+    K, _ = assemble_form(Equation(a, None), dof_handler=dh, bcs=[], backend=backend)
+
+    # Linear FE function -> constant ∇u -> jump(∇u)=0 -> Ku ≈ 0.
+    uh = Function("u", "u", dh)
+    uh.set_values_from_function(lambda x, y: x)
+    x = np.zeros(dh.total_dofs, dtype=float)
+    x[uh._g_dofs] = uh.nodal_values
+
+    energy = float(x @ (K @ x))
+    assert abs(energy) < 1e-10

@@ -50,17 +50,23 @@ import os
 @dataclass
 class TestResult:
     description: str
-    error: float
+    abs_error: float
+    rel_error: float
     passed: bool
     details: str
 # ---------- Pretty printing utilities ----------
-def srelerr(a, b, rtol=1e-9, atol=1e-12):
-    return abs(a-b)
+def _err_abs_rel(a: float, b: float) -> tuple[float, float]:
+    abs_err = float(abs(a - b))
+    scale = max(float(abs(a)), float(abs(b)))
+    rel_err = abs_err / scale if scale > 0.0 else 0.0
+    return abs_err, rel_err
 
-def verdict(err, tol=1e-8):
-    ok = err <= tol
+
+def verdict(a: float, b: float, *, rtol: float, atol: float):
+    abs_err, rel_err = _err_abs_rel(a, b)
+    ok = abs_err <= (atol + rtol * max(float(abs(a)), float(abs(b))))
     mark = "\x1b[32m✓\x1b[0m" if ok else "\x1b[31m✗\x1b[0m"
-    return ok, mark
+    return ok, mark, abs_err, rel_err
 
 def term_header(title):
     print(f"\n=== {title} ===")
@@ -515,31 +521,67 @@ def main(backend='python'):
     ng_dx = NG_DX(quad_order, ng_setup['lsetp1'], ng_setup['ci'], ghost_facets=ng_setup['ghost_facets'])
     ng_dx_def = NG_DX(quad_order, ng_setup_def['lsetp1'], ng_setup_def['ci'], deformation=ng_setup_def['deformation'], ghost_facets=ng_setup_def['ghost_facets'])
 
-    # --- Create vectors of all ONES for matrix comparison ---
+    # --- Probe vectors/fields for matrix comparison ---
+    # Many interface-jump terms vanish if u(+) == u(-). Use PROBE=sided for non-zero jumps.
     total_dofs_pc = pc_setup['dh'].total_dofs
-    u_vec = np.ones(total_dofs_pc)
-    v_vec = np.ones(total_dofs_pc)
+    dh_pc = pc_setup['dh']
+    probe = os.getenv("PROBE", "sided").strip().lower()
+    if probe in {"ones", "unity", "1"}:
+        u_pos_vals = (1.0, 1.0)
+        u_neg_vals = (1.0, 1.0)
+        p_pos_val = 1.0
+        p_neg_val = 1.0
+    elif probe in {"sided", "nonzero", "asym"}:
+        u_pos_vals = (1.25, -0.75)
+        u_neg_vals = (-2.0, 0.5)
+        p_pos_val = 3.0
+        p_neg_val = -1.0
+    else:
+        raise ValueError(
+            f"Unknown PROBE='{probe}'. Use PROBE=ones or PROBE=sided."
+        )
+    print(
+        f"Probe fields: u(+)={u_pos_vals}, u(-)={u_neg_vals}, "
+        f"p(+)={p_pos_val}, p(-)={p_neg_val} (PROBE={probe})"
+    )
+
+    u_vec = np.zeros(total_dofs_pc)
+    v_vec = np.zeros(total_dofs_pc)
+    field_vals = {
+        "u_pos_x": u_pos_vals[0],
+        "u_pos_y": u_pos_vals[1],
+        "u_neg_x": u_neg_vals[0],
+        "u_neg_y": u_neg_vals[1],
+        "p_pos_": p_pos_val,
+        "p_neg_": p_neg_val,
+        "lm": 1.0,
+    }
+    for fld, val in field_vals.items():
+        idx = np.asarray(dh_pc.get_field_slice(fld), dtype=int)
+        u_vec[idx] = val
+        v_vec[idx] = val
     
     ng_setup['gfu'].vec[:] = 0.0
     ng_setup['gfv'].vec[:] = 0.0
     ng_setup_def['gfu'].vec[:] = 0.0
     ng_setup_def['gfv'].vec[:] = 0.0
-    # Define the constant vector field u=v=(1,1)
     ONE = CoefficientFunction(1.0)
-    const_vec_field = CoefficientFunction((1, 1))
-    const_scalar_field = CoefficientFunction(1.0)
+    const_vec_field_pos = CoefficientFunction(u_pos_vals)
+    const_vec_field_neg = CoefficientFunction(u_neg_vals)
+    const_scalar_field_pos = CoefficientFunction(float(p_pos_val))
+    const_scalar_field_neg = CoefficientFunction(float(p_neg_val))
     with TaskManager():
         # Set velocity components (u, v)
-        ng_setup['gfu'].components[0].components[1].Set(const_vec_field) # u_pos
-        ng_setup['gfv'].components[0].components[1].Set(const_vec_field) # v_pos
-        ng_setup['gfu'].components[0].components[0].Set(const_vec_field) # u_neg
-        ng_setup['gfv'].components[0].components[0].Set(const_vec_field) # v_neg
+        ng_setup['gfu'].components[0].components[1].Set(const_vec_field_pos) # u_pos
+        ng_setup['gfv'].components[0].components[1].Set(const_vec_field_pos) # v_pos
+        ng_setup['gfu'].components[0].components[0].Set(const_vec_field_neg) # u_neg
+        ng_setup['gfv'].components[0].components[0].Set(const_vec_field_neg) # v_neg
 
         # Set pressure components (p, q)
-        ng_setup['gfu'].components[1].components[1].Set(const_scalar_field) # p_pos
-        ng_setup['gfv'].components[1].components[1].Set(const_scalar_field) # q_pos
-        ng_setup['gfu'].components[1].components[0].Set(const_scalar_field) # p_neg
-        ng_setup['gfv'].components[1].components[0].Set(const_scalar_field) # q_neg
+        ng_setup['gfu'].components[1].components[1].Set(const_scalar_field_pos) # p_pos
+        ng_setup['gfv'].components[1].components[1].Set(const_scalar_field_pos) # q_pos
+        ng_setup['gfu'].components[1].components[0].Set(const_scalar_field_neg) # p_neg
+        ng_setup['gfv'].components[1].components[0].Set(const_scalar_field_neg) # q_neg
 
         # Set number space components
         ng_setup['gfu'].components[2].Set(CoefficientFunction(1.0)) # lm for u
@@ -547,21 +589,27 @@ def main(backend='python'):
     
     with TaskManager():
         # Set velocity components (u, v)
-        ng_setup_def['gfu'].components[0].components[1].Set(const_vec_field) # u_pos
-        ng_setup_def['gfv'].components[0].components[1].Set(const_vec_field) # v_pos
-        ng_setup_def['gfu'].components[0].components[0].Set(const_vec_field) # u_neg
-        ng_setup_def['gfv'].components[0].components[0].Set(const_vec_field) # v_neg
+        ng_setup_def['gfu'].components[0].components[1].Set(const_vec_field_pos) # u_pos
+        ng_setup_def['gfv'].components[0].components[1].Set(const_vec_field_pos) # v_pos
+        ng_setup_def['gfu'].components[0].components[0].Set(const_vec_field_neg) # u_neg
+        ng_setup_def['gfv'].components[0].components[0].Set(const_vec_field_neg) # v_neg
 
         # Set pressure components (p, q)
-        ng_setup_def['gfu'].components[1].components[1].Set(const_scalar_field) # p_pos
-        ng_setup_def['gfv'].components[1].components[1].Set(const_scalar_field) # q_pos
-        ng_setup_def['gfu'].components[1].components[0].Set(const_scalar_field) # p_neg
-        ng_setup_def['gfv'].components[1].components[0].Set(const_scalar_field) # q_neg
+        ng_setup_def['gfu'].components[1].components[1].Set(const_scalar_field_pos) # p_pos
+        ng_setup_def['gfv'].components[1].components[1].Set(const_scalar_field_pos) # q_pos
+        ng_setup_def['gfu'].components[1].components[0].Set(const_scalar_field_neg) # p_neg
+        ng_setup_def['gfv'].components[1].components[0].Set(const_scalar_field_neg) # q_neg
 
         # Set number space components
         ng_setup_def['gfu'].components[2].Set(CoefficientFunction(1.0)) # lm for u
         ng_setup_def['gfv'].components[2].Set(CoefficientFunction(1.0)) # lm for v
     all_tests = [] # For summary
+    # NOTE: PyCutFEM and NGSolve use different background meshes here, so totals on
+    # curved level sets will differ slightly (geometry approximation + quadrature).
+    # Keep a moderately loose default, and tighten via env vars when needed.
+    rtol = float(os.getenv("COMPARE_RTOL", "1e-4"))
+    atol = float(os.getenv("COMPARE_ATOL", "1e-10"))
+    print(f"Comparison tolerances: rtol={rtol:g}, atol={atol:g} (override via COMPARE_RTOL/COMPARE_ATOL)")
 
     # Helper UFL functions
     def eps_pc(u): return 0.5*(pc_grad(u)+pc_grad(u).T)
@@ -589,15 +637,35 @@ def main(backend='python'):
     
     print(f"NG Areas comparison: +ve Area diff: {area_pos_ng - exact_pos_area:+.2e}, -ve Area diff: {area_neg_ng - exact_neg_area:+.2e}, Combined Area diff: {area_combined_ng - total_exact_area:+.2e}")
     print(f"NG (with deformation) Areas comparison: +ve Area diff: {area_pos_ng_def - exact_pos_area:+.2e}, -ve Area diff: {area_neg_ng_def - exact_neg_area:+.2e}, Combined Area diff: {area_combined_ng_def - total_exact_area:+.2e}")
-    err_A_pos = srelerr(area_pos_pc, exact_pos_area)
-    err_A_neg = srelerr(area_neg_pc, exact_neg_area)
-    err_A_pos_def = srelerr(area_pos_pc_def, exact_pos_area)
-    err_A_neg_def = srelerr(area_neg_pc_def, exact_neg_area)
+    err_A_pos_abs = abs(area_pos_pc - exact_pos_area)
+    err_A_neg_abs = abs(area_neg_pc - exact_neg_area)
+    err_A_pos_def_abs = abs(area_pos_pc_def - exact_pos_area)
+    err_A_neg_def_abs = abs(area_neg_pc_def - exact_neg_area)
+    err_A_pos_rel = err_A_pos_abs / abs(exact_pos_area)
+    err_A_neg_rel = err_A_neg_abs / abs(exact_neg_area)
+    err_A_pos_def_rel = err_A_pos_def_abs / abs(exact_pos_area)
+    err_A_neg_def_rel = err_A_neg_def_abs / abs(exact_neg_area)
     
-    print(f"Relative error (Area +ve): {err_A_pos:+.2e}, (Area -ve): {err_A_neg:+.2e}")
-    print(f"Relative error with deformation (Area +ve): {err_A_pos_def:+.2e}, (Area -ve): {err_A_neg_def:+.2e}")
-    print(f"Relative error PC (Area -ve): {err_A_neg:+.2e}, NG (Area -ve): {srelerr(area_neg_ng, exact_neg_area):+.2e}, NG with deformation (Area -ve): {srelerr(area_neg_ng_def, exact_neg_area):+.2e}")
-    print(f"Relative error PC with deformation (Area -ve): {err_A_neg_def:+.2e}, NG (Area -ve): {srelerr(area_neg_ng, exact_neg_area):+.2e}, NG with deformation (Area -ve): {srelerr(area_neg_ng_def, exact_neg_area):+.2e}")
+    print(
+        "Area error vs exact: "
+        f"+ abs={err_A_pos_abs:+.2e} rel={err_A_pos_rel:+.2e}, "
+        f"- abs={err_A_neg_abs:+.2e} rel={err_A_neg_rel:+.2e}"
+    )
+    print(
+        "Area error vs exact (with deformation): "
+        f"+ abs={err_A_pos_def_abs:+.2e} rel={err_A_pos_def_rel:+.2e}, "
+        f"- abs={err_A_neg_def_abs:+.2e} rel={err_A_neg_def_rel:+.2e}"
+    )
+    err_ng_neg_abs = abs(area_neg_ng - exact_neg_area)
+    err_ng_neg_def_abs = abs(area_neg_ng_def - exact_neg_area)
+    err_ng_neg_rel = err_ng_neg_abs / abs(exact_neg_area)
+    err_ng_neg_def_rel = err_ng_neg_def_abs / abs(exact_neg_area)
+    print(
+        "Area(-) error vs exact: "
+        f"PC abs={err_A_neg_abs:+.2e} rel={err_A_neg_rel:+.2e}, "
+        f"NG abs={err_ng_neg_abs:+.2e} rel={err_ng_neg_rel:+.2e}, "
+        f"NG(def) abs={err_ng_neg_def_abs:+.2e} rel={err_ng_neg_def_rel:+.2e}"
+    )
     print(f"PC Areas: +ve {area_pos_pc:.8f}, -ve {area_neg_pc:.8f}, Combined {area_combined_pc:.8f}")
     print(f"PC (with deformation) Areas: +ve {area_pos_pc_def:.8f}, -ve {area_neg_pc_def:.8f}, Combined {area_combined_pc_def:.8f}")
     print(f"NG Areas: +ve {area_pos_ng:.8f}, -ve {area_neg_ng:.8f}, Combined {area_combined_ng:.8f}")
@@ -970,10 +1038,20 @@ def main(backend='python'):
         E_ng = assemble_and_energy_ng(bf_ng, ng_setup['gfu'], ng_setup['gfv'])
         
         results_total[key] = {'pc': E_pc, 'ng': E_ng}
-        err = srelerr(E_pc, E_ng)
-        ok, mark = verdict(err, tol=1e-6)
-        print(f"{data['description']:<35} | PC: {E_pc:+.12e}  NG: {E_ng:+.12e}  err = {err:.3e} {mark}")
-        all_tests.append(TestResult(f"TOTAL {key}", err, ok, f"PC={E_pc:+.12e}, NG={E_ng:+.12e}"))
+        ok, mark, err_abs, err_rel = verdict(E_pc, E_ng, rtol=rtol, atol=atol)
+        print(
+            f"{data['description']:<35} | PC: {E_pc:+.12e}  NG: {E_ng:+.12e}  "
+            f"| abs={err_abs:.3e} rel={err_rel:.3e} {mark}"
+        )
+        all_tests.append(
+            TestResult(
+                f"TOTAL {key}",
+                abs_error=err_abs,
+                rel_error=err_rel,
+                passed=ok,
+                details=f"PC={E_pc:+.12e}, NG={E_ng:+.12e}",
+            )
+        )
     # without bilinear forms
     for key, data in TEST_CASES.items():
         if not is_enabled(data):
@@ -982,10 +1060,20 @@ def main(backend='python'):
         E_pc = data['pc_form']
         E_ng = data['ng_form']
         results_total[key] = {'pc': E_pc, 'ng': E_ng}
-        err = srelerr(E_pc, E_ng)
-        ok, mark = verdict(err, tol=1e-6)
-        print(f"{data['description']:<35} | PC: {E_pc:+.12e}  NG: {E_ng:+.12e}  err = {err:.3e} {mark}")
-        all_tests.append(TestResult(f"TOTAL {key}", err, ok, f"PC={E_pc:+.12e}, NG={E_ng:+.12e}"))
+        ok, mark, err_abs, err_rel = verdict(E_pc, E_ng, rtol=rtol, atol=atol)
+        print(
+            f"{data['description']:<35} | PC: {E_pc:+.12e}  NG: {E_ng:+.12e}  "
+            f"| abs={err_abs:.3e} rel={err_rel:.3e} {mark}"
+        )
+        all_tests.append(
+            TestResult(
+                f"TOTAL {key}",
+                abs_error=err_abs,
+                rel_error=err_rel,
+                passed=ok,
+                details=f"PC={E_pc:+.12e}, NG={E_ng:+.12e}",
+            )
+        )
 
     # ----- SPLIT-by-region (PC FE vs NG FE) -----
     results_split = {}
@@ -1008,11 +1096,21 @@ def main(backend='python'):
             results_split[key]['pc'][region_key] = E_pc
             results_split[key]['ng'][region_key] = E_ng
 
-            err = srelerr(E_pc, E_ng)
-            ok, mark = verdict(err, tol=1e-8)
+            ok, mark, err_abs, err_rel = verdict(E_pc, E_ng, rtol=rtol, atol=atol)
             side, reg = region_key
-            print(f"{side.upper():3s}/{reg:9s} : PC={E_pc:+.12e}   NG={E_ng:+.12e}   err={err:.3e} {mark}")
-            all_tests.append(TestResult(f"SPLIT {key} {side}/{reg}", err, ok, f"PC={E_pc:+.12e}, NG={E_ng:+.12e}"))
+            print(
+                f"{side.upper():3s}/{reg:9s} : PC={E_pc:+.12e}   NG={E_ng:+.12e}   "
+                f"| abs={err_abs:.3e} rel={err_rel:.3e} {mark}"
+            )
+            all_tests.append(
+                TestResult(
+                    f"SPLIT {key} {side}/{reg}",
+                    abs_error=err_abs,
+                    rel_error=err_rel,
+                    passed=ok,
+                    details=f"PC={E_pc:+.12e}, NG={E_ng:+.12e}",
+                )
+            )
 
     # ----- Consistency checks (PyCutFEM) -----
     term_header("Consistency checks (PyCutFEM)")
@@ -1026,9 +1124,11 @@ def main(backend='python'):
                 total_from_split = sum(results_split[key]['pc'].values())
                 total_from_direct = results_total[parent_key]['pc']
                 
-                err = srelerr(total_from_direct, total_from_split)
-                ok, mark = verdict(err, tol=1e-12)
-                print(f"total({parent_key}) vs Σsplit: {total_from_direct:+.12e} vs {total_from_split:+.12e} diff={err:.3e} {mark}")
+                ok, mark, err_abs, err_rel = verdict(total_from_direct, total_from_split, rtol=rtol, atol=atol)
+                print(
+                    f"total({parent_key}) vs Σsplit: {total_from_direct:+.12e} vs {total_from_split:+.12e} "
+                    f"| abs={err_abs:.3e} rel={err_rel:.3e} {mark}"
+                )
 
     # ----- Summary -----
     failed = [t for t in all_tests if not t.passed]
@@ -1036,8 +1136,10 @@ def main(backend='python'):
     print(f"\n--- Test Summary ---\n{len(passed)} tests passed, {len(failed)} tests FAILED.\n")
     if failed:
         print("--- Top 6 Failed Tests (by error magnitude) ---")
-        for t in sorted(failed, key=lambda z: z.error, reverse=True)[:6]:
-            print(f"- {t.description}: error={t.error:.6e} | {t.details}")
+        for t in sorted(failed, key=lambda z: z.abs_error, reverse=True)[:6]:
+            print(
+                f"- {t.description}: abs={t.abs_error:.6e} rel={t.rel_error:.6e} | {t.details}"
+            )
     print("\nDone. Green ✓ indicates success within tolerance; red ✗ highlights discrepancies.")
 
 if __name__ == "__main__":

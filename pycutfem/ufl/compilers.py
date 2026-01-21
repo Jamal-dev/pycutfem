@@ -576,8 +576,38 @@ class FormCompiler:
             # No element context (e.g., early scalar eval) → do nothing.
             in_domain = True
         else:
-            in_domain = (n.domain[eid] if hasattr(n.domain, "__getitem__")
-                         else (eid in n.domain))
+            # For edge-based assembly (ghost facets / aligned interface), ctx["eid"] is an
+            # *edge id*, while Restriction domains are typically *element* BitSets.
+            # Map the check to the owner element on the active side whenever possible.
+            dom = n.domain
+            if hasattr(dom, "__getitem__"):
+                dom_len = len(dom)
+                mesh = getattr(self.me, "mesh", None)
+                n_elem = len(mesh.elements_list) if mesh is not None else None
+                n_edge = len(mesh.edges_list) if mesh is not None else None
+
+                pos_eid = self.ctx.get("pos_eid", None)
+                neg_eid = self.ctx.get("neg_eid", None)
+
+                if n_elem is not None and dom_len == n_elem and (pos_eid is not None or neg_eid is not None):
+                    side = getattr(n.operand, "side", None)
+                    if side == "+" and pos_eid is not None:
+                        in_domain = bool(dom[int(pos_eid)])
+                    elif side == "-" and neg_eid is not None:
+                        in_domain = bool(dom[int(neg_eid)])
+                    elif pos_eid is not None and neg_eid is not None:
+                        in_domain = bool(dom[int(pos_eid)]) or bool(dom[int(neg_eid)])
+                    elif pos_eid is not None:
+                        in_domain = bool(dom[int(pos_eid)])
+                    else:
+                        in_domain = bool(dom[int(neg_eid)])
+                elif n_edge is not None and dom_len == n_edge:
+                    in_domain = bool(dom[int(eid)])
+                else:
+                    # Default: treat ctx["eid"] as the domain index (volume / element-interface paths).
+                    in_domain = bool(dom[int(eid)])
+            else:
+                in_domain = (eid in dom)
 
         # 2. Check if the element is in the active domain.
         if in_domain:
@@ -3893,6 +3923,8 @@ class FormCompiler:
                     m[np.asarray(idxs, dtype=int)] = 1.0
                     neg_union_mask_by_field[fld] = m
 
+                # For dGhost, (+)/(-) are the two owner elements of the facet. Restriction(...)
+                # must therefore act as an *element-membership* mask on the union layout.
                 restriction_masks_union = {'+': pos_union_mask_by_field, '-': neg_union_mask_by_field}
 
                 pos_map_by_field_red: Dict[str, np.ndarray] = {}
@@ -4092,7 +4124,7 @@ class FormCompiler:
                         "neg_union_mask_by_field": neg_union_mask_by_field,
                         "coeff_mask_pos_global": mask_pos_global,
                         "coeff_mask_neg_global": mask_neg_global,
-                        "_restriction_masks": restriction_masks_phi,
+                        "_restriction_masks": restriction_masks_union,
                         "mask_basis": False,
                         "pos_eid": pos_eid,
                         "neg_eid": neg_eid,
@@ -4387,28 +4419,21 @@ class FormCompiler:
                     self.dh, fields, int(pos_eid), int(neg_eid), global_dofs
                 )
 
-                # Optional per-field masks (for Restriction(...))
-                try:
-                    pos_masks_elem, _ = _hfa.build_side_masks_by_field(self.dh, fields, int(pos_eid), level_set, tol=SIDE.tol)
-                except Exception:
-                    pos_masks_elem = {}
-                try:
-                    _, neg_masks_elem = _hfa.build_side_masks_by_field(self.dh, fields, int(neg_eid), level_set, tol=SIDE.tol)
-                except Exception:
-                    neg_masks_elem = {}
-
-                restriction_masks_phi = {"+": {}, "-": {}}
+                # Restriction masks for facet-patch integrals:
+                # (+)/(-) are the two owner elements (no level-set orientation), so use
+                # element-membership masks on the union layout.
+                restriction_masks_union = {"+": {}, "-": {}}
                 for fld in fields:
                     mp = pos_map_by_field_full.get(fld)
+                    if mp is not None:
+                        arr = np.zeros(len(global_dofs), dtype=float)
+                        arr[np.asarray(mp, dtype=int)] = 1.0
+                        restriction_masks_union["+"][fld] = arr
                     mn = neg_map_by_field_full.get(fld)
-                    if mp is not None and fld in pos_masks_elem and len(pos_masks_elem[fld]) == len(mp):
+                    if mn is not None:
                         arr = np.zeros(len(global_dofs), dtype=float)
-                        arr[np.asarray(mp, dtype=int)] = np.asarray(pos_masks_elem[fld], dtype=float)
-                        restriction_masks_phi["+"][fld] = arr
-                    if mn is not None and fld in neg_masks_elem and len(neg_masks_elem[fld]) == len(mn):
-                        arr = np.zeros(len(global_dofs), dtype=float)
-                        arr[np.asarray(mn, dtype=int)] = np.asarray(neg_masks_elem[fld], dtype=float)
-                        restriction_masks_phi["-"][fld] = arr
+                        arr[np.asarray(mn, dtype=int)] = 1.0
+                        restriction_masks_union["-"][fld] = arr
 
                 # Constant facet normal (if requested by the integrand)
                 p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
@@ -4566,7 +4591,7 @@ class FormCompiler:
                             "neg_map": neg_map,
                             "pos_map_by_field": pos_map_by_field_full,
                             "neg_map_by_field": neg_map_by_field_full,
-                            "_restriction_masks": restriction_masks_phi,
+                            "_restriction_masks": restriction_masks_union,
                             "pos_eid": pos_eid,
                             "neg_eid": neg_eid,
                             "_xi_eta_cache": {"+": (xi_pos, eta_pos), "-": (xi_neg, eta_neg)},
@@ -4984,7 +5009,9 @@ class FormCompiler:
             raise ValueError("dGhost measure requires a 'level_set' callable.")
 
         if edge_ids.cardinality() == 0:
-            raise ValueError("No ghost edges found for the integral.")
+            # This is a valid state (e.g. no cut cells / no ghost band). Treat as
+            # a zero contribution rather than raising.
+            return
 
         # 2) Compile kernel FIRST (to know exact static params it will require)
         runner, ir = self._compile_backend(intg.integrand, dh, me_used, on_facet=on_facet)
@@ -5062,12 +5089,17 @@ class FormCompiler:
         K_edge, F_edge, J_edge = runner(current_funcs, kernel_args)
 
         if (not self.ctx.get("rhs", False)) and (K_edge is not None) and K_edge.ndim == 3:
+            # Keep symmetry for SPD-like facet penalties, but do NOT silently
+            # perturb the diagonal by default: that breaks exact nullspaces
+            # (e.g. constant fields for gradient-jump ghost penalties) and can
+            # cause backend inconsistencies.
             K_edge = 0.5 * (K_edge + np.swapaxes(K_edge, 1, 2))
-            max_abs = float(np.max(np.abs(K_edge))) if K_edge.size else 0.0
-            if max_abs > 0.0:
-                eps = 1e-12 * max_abs
-                diag = np.arange(K_edge.shape[1])
-                K_edge[:, diag, diag] += eps
+            if os.getenv("PYCUTFEM_JIT_GHOST_DIAG_PERTURB", "").lower() in {"1", "true", "yes"}:
+                max_abs = float(np.max(np.abs(K_edge))) if K_edge.size else 0.0
+                if max_abs > 0.0:
+                    eps = 1e-12 * max_abs
+                    diag = np.arange(K_edge.shape[1])
+                    K_edge[:, diag, diag] += eps
 
         hook = self._hook_for(intg.integrand)
         if self._functional_calculate(intg, J_edge, hook):

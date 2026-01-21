@@ -655,34 +655,16 @@ def _build_jit_kernel_args(       # ← signature unchanged
                                 f"_build_jit_kernel_args: cannot build '{side}_map_{fld}': "
                                 f"missing component_dof_slices for field '{fld}'."
                             )
-                        full_n = int(getattr(mixed_element, "n_dofs_local", n_union))
                         # IMPORTANT:
-                        # - When `gdofs_map` is full-union (width == full_n), maps must be
-                        #   expressed in full local indices so the assembler can later compress
-                        #   /remap them consistently via `_compress_static_for_active`.
-                        # - When `gdofs_map` is already compressed (width < full_n), maps must be
-                        #   expressed in that compressed union indexing.
-                        if int(n_union) == full_n:
-                            row = np.arange(int(sl.start), int(sl.stop), dtype=np.int32)
-                        else:
-                            # Fall back to mapping through this function's active-col ordering.
-                            # This assumes the caller compressed gdofs_map with the same active_cols.
-                            full_to_union = {int(old): int(new) for new, old in enumerate(_active_cols)}
-                            row = np.asarray(
-                                [full_to_union.get(int(i), -1) for i in range(int(sl.start), int(sl.stop))],
-                                dtype=np.int32,
-                            )
-                            if np.any(row < 0):
-                                missing = [
-                                    int(i)
-                                    for i in range(int(sl.start), int(sl.stop))
-                                    if int(i) not in full_to_union
-                                ]
-                                raise ValueError(
-                                    f"_build_jit_kernel_args: cannot build '{side}_map_{fld}': "
-                                    f"active-col compression dropped local indices {missing} for slice {sl} "
-                                    f"(union width n_union={n_union})."
-                                )
+                        # Element-based interface/cut kernels use a *single-element* union layout
+                        # (MixedElement local ordering). Side maps must therefore be expressed in
+                        # **full local indices** (slice.start:stop).
+                        #
+                        # Any active-field compression is handled *once* by the assembler via
+                        # `_compress_static_for_active`, which remaps these full indices into the
+                        # packed active layout consistently for all union-keyed arrays (b_/g_/r**,
+                        # gdofs_map, restrict masks, and these maps).
+                        row = np.arange(int(sl.start), int(sl.stop), dtype=np.int32)
                         args[f"{side}_map_{fld}"] = np.tile(row, (nE, 1))
                         continue
 
@@ -713,18 +695,21 @@ def _build_jit_kernel_args(       # ← signature unchanged
                         # map: global dof id -> union column
                         col_of = {int(d): j for j, d in enumerate(union_row)}
                         local_gdofs_f = loc_lists[eid]
+                        missing_dofs: list[int] = []
                         for j, d in enumerate(local_gdofs_f):
-                            try:
-                                m_arr[i, j] = col_of[int(d)]
-                            except KeyError:
-                                # If a field was dropped from active_cols, mark as padding (-1)
-                                m_arr[i, j] = -1
-                    missing_mask = m_arr < 0
-                    if missing_mask.any():
-                        logger.debug(
-                            "Side map for field '%s' missed %d entries (likely pruned by active_cols); padding with -1.",
-                            fld, int(missing_mask.sum()),
-                        )
+                            idx = col_of.get(int(d), None)
+                            if idx is None:
+                                missing_dofs.append(int(d))
+                                continue
+                            m_arr[i, j] = int(idx)
+                        if missing_dofs:
+                            sample = ", ".join(str(x) for x in missing_dofs[:6])
+                            raise KeyError(
+                                f"_build_jit_kernel_args: could not build '{side}_map_{fld}' on entity_kind={entity_kind!r}: "
+                                f"{len(missing_dofs)} local DOFs were not found in gdofs_map union row for owner element {eid}. "
+                                f"Sample missing global DOFs: [{sample}{'...' if len(missing_dofs) > 6 else ''}]. "
+                                "This indicates a layout mismatch between gdofs_map and element_maps."
+                            )
                     args[f"{side}_map_{fld}"] = m_arr
 
     # ------------------------------------------------------------------
@@ -966,7 +951,66 @@ def _build_jit_kernel_args(       # ← signature unchanged
         # ---- basis tables ------------------------------------------------
         elif name.startswith("b_"):
             fld = name[2:]
-            if pre_built is not None and pre_built.get("entity_kind") == "element" and "qp_phys" in pre_built:
+            # Edge-based kernels (ghost facets / aligned interface) operate on an
+            # edge-union `gdofs_map` (typically larger than `me.n_dofs_per_elem`).
+            # The generated kernels may still request `b_<fld>` for unsided traces
+            # (e.g. scalar functionals on aligned interface edges). In that case,
+            # `b_<fld>` must be evaluated at the *edge* quadrature points and
+            # scattered into the edge-union layout using pos/neg maps.
+            if pre_built is not None and pre_built.get("entity_kind") == "edge":
+                if gdofs_map is None:
+                    raise KeyError("_build_jit_kernel_args: edge kernel requested basis but gdofs_map is missing.")
+                gdofs_map_arr = np.asarray(gdofs_map)
+                if gdofs_map_arr.ndim != 2:
+                    raise ValueError(
+                        f"_build_jit_kernel_args: expected 2D gdofs_map for edge kernels, got {gdofs_map_arr.shape}."
+                    )
+                nE = int(gdofs_map_arr.shape[0])
+                n_union_edge = int(gdofs_map_arr.shape[1])
+
+                # Empty aligned-interface placeholder: no edges ⇒ no r** tables.
+                # Still provide a correctly-shaped empty basis array so the kernel
+                # can be registered and later refreshed when edges become aligned.
+                if nE == 0:
+                    qp_phys = np.asarray(pre_built.get("qp_phys", np.empty((0, 0, 2))), dtype=np.float64)
+                    nQ = int(qp_phys.shape[1]) if qp_phys.ndim >= 2 else 0
+                    args[name] = np.empty((0, nQ, n_union_edge), dtype=np.float64)
+                    continue
+
+                # Prefer the (+) trace basis; this matches FormCompiler._active_side
+                # default precedence (falls back to '+') for unsided evaluation.
+                tab_key = f"r00_{fld}_pos"
+                map_key = "pos_map"
+                if tab_key not in pre_built:
+                    # Fallback to (-) if (+) is unavailable.
+                    tab_key = f"r00_{fld}_neg"
+                    map_key = "neg_map"
+
+                if tab_key not in pre_built or map_key not in pre_built:
+                    raise KeyError(
+                        f"_build_jit_kernel_args: edge kernel requested '{name}', but missing '{tab_key}'/'{map_key}' "
+                        "in pre_built. Ensure metadata['derivs'] includes (0,0) and precompute_ghost_factors(..., allow_interface=True) "
+                        "was used for aligned interface edges."
+                    )
+
+                tab = np.asarray(pre_built[tab_key], dtype=np.float64)          # (nE, nQ, n_loc_elem_union)
+                mapper = np.asarray(pre_built[map_key], dtype=np.int32)         # (nE, n_loc_elem_union)
+                if tab.ndim != 3 or mapper.ndim != 2:
+                    raise ValueError(
+                        f"_build_jit_kernel_args: invalid shapes for '{tab_key}'/'{map_key}': {tab.shape} / {mapper.shape}"
+                    )
+                if tab.shape[0] != mapper.shape[0] or tab.shape[2] != mapper.shape[1]:
+                    raise ValueError(
+                        f"_build_jit_kernel_args: shape mismatch for '{tab_key}'/'{map_key}': {tab.shape} / {mapper.shape}"
+                    )
+
+                nE, nQ, _ = tab.shape
+                out = np.zeros((nE, nQ, n_union_edge), dtype=np.float64)
+                ei = np.arange(nE, dtype=np.int32)[:, None, None]
+                qi = np.arange(nQ, dtype=np.int32)[None, :, None]
+                out[ei, qi, mapper[:, None, :]] += tab
+                args[name] = out
+            elif pre_built is not None and pre_built.get("entity_kind") == "element" and "qp_phys" in pre_built:
                 args[name] = _basis_table_phys_union(fld)
             else:
                 args[name] = _basis_table(fld)

@@ -165,6 +165,69 @@ def make_domain_sets(mesh: Mesh, *, use_aligned_interface: bool = False) -> Dict
     }
 
 
+def _update_bs(target: BitSet, new_mask: np.ndarray) -> None:
+    target.mask[...] = np.asarray(new_mask, dtype=bool)
+
+
+def refresh_domain_sets(mesh: Mesh, domains: Dict[str, BitSet], *, use_aligned_interface: bool = False) -> None:
+    """
+    Update `domains` *in place* after re-classifying `mesh` against a (moving) level set.
+
+    This is the moving-interface analogue of `make_domain_sets(...)`. It is designed
+    so any previously created `restrict(...)` wrappers and Measures that captured
+    the BitSet objects remain valid (their masks are updated, not replaced).
+    """
+    fluid = mesh.element_bitset("outside")
+    solid = mesh.element_bitset("inside")
+    cut = mesh.element_bitset("cut")
+    has_fluid = fluid | cut
+    has_solid = solid | cut
+
+    if use_aligned_interface and mesh.edge_bitset("interface").cardinality() > 0:
+        aligned_cut = _aligned_cut_mask(mesh)
+        cut_interface_mask = cut.mask & ~aligned_cut
+    else:
+        cut_interface_mask = cut.mask
+
+    _update_bs(domains["fluid_domain"], fluid.mask)
+    _update_bs(domains["solid_domain"], solid.mask)
+    _update_bs(domains["cut_domain"], cut.mask)
+    _update_bs(domains["cut_interface"], cut_interface_mask)
+    _update_bs(domains["fluid_interface"], has_fluid.mask)
+    _update_bs(domains["solid_interface"], has_solid.mask)
+    _update_bs(domains["has_pos"], fluid.mask | cut.mask)
+    _update_bs(domains["has_neg"], solid.mask | cut.mask)
+
+    interface_bs = mesh.edge_bitset("interface")
+    ghost_pos = mesh.edge_bitset("ghost_pos") - interface_bs
+    ghost_neg = mesh.edge_bitset("ghost_neg") - interface_bs
+    ghost_both = mesh.edge_bitset("ghost_both") - interface_bs
+    ghost_all = (ghost_pos | ghost_neg | ghost_both) - interface_bs
+
+    solid_ghost = ghost_neg | ghost_both
+    fluid_ghost = ghost_pos | ghost_both
+
+    cut_now = mesh.element_bitset("cut")
+    if cut_now.cardinality() > 0:
+        if fluid.cardinality() == 0 or solid.cardinality() == 0:
+            band_ghost = _ghost_band_edges(mesh, cut_now, layers=2)
+            if band_ghost.cardinality() > 0:
+                fluid_ghost = _copy_bitset(band_ghost)
+                solid_ghost = _copy_bitset(band_ghost)
+        else:
+            if fluid_ghost.cardinality() == 0 and ghost_all.cardinality() > 0:
+                fluid_ghost = _copy_bitset(ghost_all)
+            if solid_ghost.cardinality() == 0 and ghost_all.cardinality() > 0:
+                solid_ghost = _copy_bitset(ghost_all)
+
+    _update_bs(domains["solid_ghost"], solid_ghost.mask)
+    _update_bs(domains["fluid_ghost"], fluid_ghost.mask)
+
+
+# Backwards-compatible alias (some examples use the shorter name).
+refresh_domains = refresh_domain_sets
+
+
 def build_measures(
     mesh: Mesh,
     level_set,

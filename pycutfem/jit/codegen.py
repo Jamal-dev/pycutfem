@@ -3481,12 +3481,18 @@ class NumbaCodeGen:
                 side = self.last_side_for_store
 
                 if op.store_type == 'matrix':
-                    if len(integrand.shape) >= 1 and integrand.shape[0] == 1:
+                    # Only peel a leading singleton dimension when the runtime
+                    # value is actually a rank-3 array (1,n,n). For 2D matrices
+                    # (n,n) we must not index [0] (would broadcast a row).
+                    if len(integrand.shape) >= 3 and integrand.shape[0] == 1:
                         body_lines.append(f"Ke += {integrand.var_name}[0] * w_q")
                     else:
                         body_lines.append(f"Ke += {integrand.var_name} * w_q")
                 elif op.store_type == 'vector':
-                    if len(integrand.shape) > 0 and integrand.shape[0] == 1:
+                    # Only peel a leading singleton dimension when the runtime
+                    # value is actually rank-2 (1,n). If the value is 1D (n,),
+                    # indexing [0] would turn it into a scalar and broadcast.
+                    if len(integrand.shape) >= 2 and integrand.shape[0] == 1:
                         body_lines.append(f"Fe += {integrand.var_name}[0] * w_q")
                     else:
                         body_lines.append(f"Fe += {integrand.var_name} * w_q")

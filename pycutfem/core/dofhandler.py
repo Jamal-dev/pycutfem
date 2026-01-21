@@ -3830,27 +3830,34 @@ class DofHandler:
             pos_map[i] = np.arange(n_union, dtype=np.int32)
             neg_map[i] = np.arange(n_union, dtype=np.int32)
 
-        # per-field restriction masks on cut elements (pos/neg within the same owner)
+        # Per-field restriction masks (union-sized) for Restriction(...) nodes.
+        #
+        # IMPORTANT (element-based dInterface):
+        # Γ lies *inside* a cut element. The CG shape functions are side-agnostic, and
+        # side selection is represented by the integration domain (cut quadrature),
+        # not by dropping a subset of DOFs based on φ at nodes. A φ-based DOF mask
+        # here would destroy polynomial consistency and break Python/JIT parity.
+        #
+        # Provide neutral masks (=1 on the field slice) so restrictions act only as
+        # element-membership gates on dInterface.
         restrict_pos_by_field: Dict[str, np.ndarray] = {}
         restrict_neg_by_field: Dict[str, np.ndarray] = {}
         if level_set is not None:
-            from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
             for fld in fields:
-                restrict_pos_by_field[fld] = np.zeros((nE, n_union), dtype=float)
-                restrict_neg_by_field[fld] = np.zeros((nE, n_union), dtype=float)
-
-            for i, eid in enumerate(seg_eids):
-                pos_masks_elem, neg_masks_elem = _hfa.build_side_masks_by_field(
-                    self, fields, int(eid), level_set, tol=SIDE.tol
-                )
-                for fld in fields:
+                arr_pos = np.zeros((nE, n_union), dtype=float)
+                arr_neg = np.zeros((nE, n_union), dtype=float)
+                try:
                     sl = me.component_dof_slices[fld]
-                    mask_pos = pos_masks_elem.get(fld)
-                    mask_neg = neg_masks_elem.get(fld)
-                    if mask_pos is not None and mask_pos.shape[0] == (sl.stop - sl.start):
-                        restrict_pos_by_field[fld][i, sl] = mask_pos
-                    if mask_neg is not None and mask_neg.shape[0] == (sl.stop - sl.start):
-                        restrict_neg_by_field[fld][i, sl] = mask_neg
+                except Exception:
+                    sl = None
+                if sl is not None:
+                    arr_pos[:, sl] = 1.0
+                    arr_neg[:, sl] = 1.0
+                else:
+                    arr_pos[:] = 1.0
+                    arr_neg[:] = 1.0
+                restrict_pos_by_field[fld] = arr_pos
+                restrict_neg_by_field[fld] = arr_neg
 
         # jets
         from pycutfem.fem.transform import JET_CACHE as _JET
@@ -4344,20 +4351,12 @@ class DofHandler:
             neg_map[i, :len(neg_dofs)] = _searchsorted_positions(global_dofs, neg_dofs)
 
         # 3b --- per-field, side-local -> union maps (ghost) + restriction masks
-        # Build per-field side maps using the *true* union list (no padding),
-        # then expand restriction masks to union layout for each field.
+        # Facet integrals use (+)/(-) to denote the two *owner elements* of the facet
+        # (not level-set sides). For CG CutFEM, applying φ-based DOF masks here breaks
+        # polynomial reproduction and makes ghost/patch stabilizations nonzero even for
+        # constant fields. Use element-membership masks on the union layout instead.
         maps_by_field: Dict[str, np.ndarray] = {}
         masks_by_field: Dict[str, np.ndarray] = {}
-        mask_cache: Dict[int, tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]] = {}
-        if level_set is not None:
-            from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
-
-            def _elem_masks(eid: int):
-                if eid not in mask_cache:
-                    mask_cache[eid] = _hfa.build_side_masks_by_field(
-                        self, fields, int(eid), level_set, tol=SIDE.tol
-                    )
-                return mask_cache[eid]
 
         for fld in fields:
             nloc_f = len(self.element_maps[fld][pos_ids[0]])
@@ -4366,7 +4365,8 @@ class DofHandler:
             pos_mask = np.zeros((nE, n_union), dtype=float)
             neg_mask = np.zeros((nE, n_union), dtype=float)
             for i in range(nE):
-                pos_eid = int(pos_ids[i]); neg_eid = int(neg_ids[i])
+                pos_eid = int(pos_ids[i])
+                neg_eid = int(neg_ids[i])
                 # union for this edge (true length, no padding)
                 union = union_lists[i]
                 # side-local gdofs for this field
@@ -4374,26 +4374,21 @@ class DofHandler:
                 neg_loc = np.asarray(self.element_maps[fld][neg_eid], dtype=np.int64)
                 pm[i, :] = _searchsorted_positions(np.asarray(union, dtype=np.int64), pos_loc)
                 nm[i, :] = _searchsorted_positions(np.asarray(union, dtype=np.int64), neg_loc)
-                if level_set is not None:
-                    pos_masks_elem, _ = _elem_masks(pos_eid)
-                    _, neg_masks_elem = _elem_masks(neg_eid)
-                    mask_pos_local = pos_masks_elem.get(fld)
-                    if mask_pos_local is not None and mask_pos_local.shape[0] == pm.shape[1]:
-                        cols = pm[i]
-                        ok = (cols >= 0) & (cols < n_union)
-                        if np.any(ok):
-                            pos_mask[i, cols[ok]] = np.asarray(mask_pos_local, dtype=float)[ok]
-                    mask_neg_local = neg_masks_elem.get(fld)
-                    if mask_neg_local is not None and mask_neg_local.shape[0] == nm.shape[1]:
-                        cols = nm[i]
-                        ok = (cols >= 0) & (cols < n_union)
-                        if np.any(ok):
-                            neg_mask[i, cols[ok]] = np.asarray(mask_neg_local, dtype=float)[ok]
+
+                cols = pm[i]
+                ok = (cols >= 0) & (cols < n_union)
+                if np.any(ok):
+                    pos_mask[i, cols[ok]] = 1.0
+
+                cols = nm[i]
+                ok = (cols >= 0) & (cols < n_union)
+                if np.any(ok):
+                    neg_mask[i, cols[ok]] = 1.0
+
             maps_by_field[f"pos_map_{fld}"] = pm
             maps_by_field[f"neg_map_{fld}"] = nm
-            if level_set is not None:
-                masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
-                masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
+            masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
+            masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
 
         # 3c) Cache key after n_union is known
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
@@ -5431,14 +5426,9 @@ class DofHandler:
         if geom_cached is not None:
             out = dict(geom_cached)
 
-            # Per-field side masks (for Restriction masking on patch paths)
+            # Per-field restriction masks on facet-patch integrals:
+            # (+)/(-) denote the two owner elements, so use element-membership masks.
             masks_by_field: dict[str, np.ndarray] = {}
-            mask_cache: dict[int, tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = {}
-
-            def _elem_masks(eid: int):
-                if eid not in mask_cache:
-                    mask_cache[eid] = _hfa.build_side_masks_by_field(self, fields, int(eid), level_set, tol=SIDE.tol)
-                return mask_cache[eid]
 
             # Cached per-edge local->union maps
             pos_map_cached = np.asarray(out.get("pos_map", np.empty((0, 0), dtype=np.int32)), dtype=np.int32)
@@ -5451,28 +5441,15 @@ class DofHandler:
                 pos_mask = np.zeros((nE, n_union), dtype=float)
                 neg_mask = np.zeros((nE, n_union), dtype=float)
                 for i in range(nE):
-                    pos_eid = int(pos_ids[i])
-                    neg_eid = int(neg_ids[i])
-                    (pos_masks_elem, _) = _elem_masks(pos_eid)
-                    (_, neg_masks_elem) = _elem_masks(neg_eid)
+                    cols = np.asarray(pos_map_cached[i, sl], dtype=np.int32)
+                    ok = cols >= 0
+                    if np.any(ok):
+                        pos_mask[i, cols[ok]] = 1.0
 
-                    mask_pos_local = pos_masks_elem.get(fld)
-                    if mask_pos_local is not None:
-                        cols = np.asarray(pos_map_cached[i, sl], dtype=np.int32)
-                        vals = np.asarray(mask_pos_local, dtype=float)
-                        if cols.shape[0] == vals.shape[0]:
-                            ok = cols >= 0
-                            if np.any(ok):
-                                pos_mask[i, cols[ok]] = vals[ok]
-
-                    mask_neg_local = neg_masks_elem.get(fld)
-                    if mask_neg_local is not None:
-                        cols = np.asarray(neg_map_cached[i, sl], dtype=np.int32)
-                        vals = np.asarray(mask_neg_local, dtype=float)
-                        if cols.shape[0] == vals.shape[0]:
-                            ok = cols >= 0
-                            if np.any(ok):
-                                neg_mask[i, cols[ok]] = vals[ok]
+                    cols = np.asarray(neg_map_cached[i, sl], dtype=np.int32)
+                    ok = cols >= 0
+                    if np.any(ok):
+                        neg_mask[i, cols[ok]] = 1.0
 
                 masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
                 masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
@@ -5592,22 +5569,15 @@ class DofHandler:
             pos_map[i, : len(pos_dofs)] = np.searchsorted(union, pos_dofs)
             neg_map[i, : len(neg_dofs)] = np.searchsorted(union, neg_dofs)
 
-        # Per-field side masks (for Restriction masking on patch paths)
+        # Per-field restriction masks on facet-patch integrals:
+        # (+)/(-) denote the two owner elements, so use element-membership masks.
         masks_by_field: dict[str, np.ndarray] = {}
-        mask_cache: dict[int, tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = {}
-
-        def _elem_masks(eid: int):
-            if eid not in mask_cache:
-                mask_cache[eid] = _hfa.build_side_masks_by_field(self, fields, int(eid), level_set, tol=SIDE.tol)
-            return mask_cache[eid]
 
         for fld in fields:
             pos_mask = np.zeros((nE, n_union), dtype=float)
             neg_mask = np.zeros((nE, n_union), dtype=float)
             for i in range(nE):
                 union = union_lists[i]
-                (pos_masks_elem, _) = _elem_masks(int(pos_ids[i]))
-                (_, neg_masks_elem) = _elem_masks(int(neg_ids[i]))
                 try:
                     gidx_pos_f = np.asarray(self.element_maps[fld][int(pos_ids[i])], dtype=int)
                     gidx_neg_f = np.asarray(self.element_maps[fld][int(neg_ids[i])], dtype=int)
@@ -5615,14 +5585,8 @@ class DofHandler:
                     continue
                 mp_f = np.searchsorted(union, gidx_pos_f)
                 mn_f = np.searchsorted(union, gidx_neg_f)
-
-                mask_pos_local = pos_masks_elem.get(fld)
-                if mask_pos_local is not None and mask_pos_local.shape[0] == mp_f.shape[0]:
-                    pos_mask[i, mp_f] = np.asarray(mask_pos_local, dtype=float)
-
-                mask_neg_local = neg_masks_elem.get(fld)
-                if mask_neg_local is not None and mask_neg_local.shape[0] == mn_f.shape[0]:
-                    neg_mask[i, mn_f] = np.asarray(mask_neg_local, dtype=float)
+                pos_mask[i, mp_f] = 1.0
+                neg_mask[i, mn_f] = 1.0
             masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
             masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
 

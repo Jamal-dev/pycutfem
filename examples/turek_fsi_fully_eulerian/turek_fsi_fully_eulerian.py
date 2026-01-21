@@ -6130,7 +6130,7 @@ def _compute_observables(step_idx: int, t_curr: float) -> None:
     print(
         f"[obs {step_idx:04d}] t={t_curr:.3f}  FD={F_D:.4e}  FL={F_L:.4e}  Δp={dp:.4e}  "
         f"tip=({tip_pos[0]:.5f},{tip_pos[1]:.5f})  "
-        f"tip_disp=({tip_disp[0]:.5f},{tip_disp[1]:.5f})  |Γ|≈{_interface_length(mesh):.5f}"
+        f"tip_disp=({tip_disp[0]:.5e},{tip_disp[1]:.5e})  |Γ|≈{_interface_length(mesh):.5f}"
     )
     _save_vtk(step_idx)
 

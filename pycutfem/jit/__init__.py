@@ -149,6 +149,62 @@ def _compress_static_for_active(static: dict[str, Any],
             compressed[k] = arr
         else:
             compressed[k] = v
+
+    # ------------------------------------------------------------------
+    # Validation (fail-fast): element-based per-field side maps
+    # ------------------------------------------------------------------
+    # These maps are used by facet/interface kernels to scatter per-field
+    # basis rows into the union layout. They must remain aligned with the
+    # same active_cols compression used for gdofs_map and union tables.
+    try:
+        if compressed.get("entity_kind") == "element":
+            full_n = int(getattr(me, "n_dofs_local", 0) or 0)
+            if full_n > 0:
+                col_map = -np.ones(full_n, dtype=np.int32)
+                for new_i, old_i in enumerate(active_cols):
+                    oi = int(old_i)
+                    if 0 <= oi < full_n:
+                        col_map[oi] = int(new_i)
+
+                # Only validate maps that carry an explicit field suffix:
+                #   pos_map_<field>, neg_map_<field>
+                # (Global pos_map/neg_map for ghost edges are handled elsewhere.)
+                for key, arr in compressed.items():
+                    if not (isinstance(key, str) and key.startswith(("pos_map_", "neg_map_"))):
+                        continue
+                    if not isinstance(arr, np.ndarray) or arr.ndim != 2 or arr.dtype.kind not in {"i", "u"}:
+                        continue
+                    m = re.match(r"^(pos|neg)_map_(.+)$", key)
+                    if not m:
+                        continue
+                    fld = m.group(2)
+                    sl = getattr(me, "component_dof_slices", {}).get(fld, None)
+                    if sl is None:
+                        continue
+                    full_idx = np.arange(int(sl.start), int(sl.stop), dtype=np.int32)
+                    expected = col_map[full_idx]
+                    # Field inactive for this kernel: nothing to validate.
+                    if not np.any(expected >= 0):
+                        continue
+                    if np.any(expected < 0):
+                        raise ValueError(
+                            f"[jit] active_cols dropped DOFs needed for '{key}' (field={fld!r}, slice={sl}, "
+                            f"full_n={full_n}, active_n={int(active_cols.size)})."
+                        )
+                    if int(arr.shape[1]) != int(expected.shape[0]):
+                        raise ValueError(
+                            f"[jit] Side map width mismatch for '{key}': got {arr.shape[1]}, expected {expected.shape[0]} "
+                            f"(field={fld!r}, slice={sl})."
+                        )
+                    if int(arr.shape[0]) > 0 and not np.array_equal(np.asarray(arr[0], dtype=np.int32), expected):
+                        raise ValueError(
+                            f"[jit] Side map '{key}' is misaligned with active_cols compression. "
+                            f"First-row map={arr[0].tolist()} expected={expected.tolist()} "
+                            f"(field={fld!r}, slice={sl}, full_n={full_n}, active_n={int(active_cols.size)})."
+                        )
+    except Exception:
+        # Re-raise with context; never silently ignore layout inconsistencies.
+        raise
     return compressed
 
 
@@ -441,6 +497,22 @@ class _IntegralKernel:
 
     def exec(self, current_funcs):
         """Execute the kernel and *return* (Kloc, Floc, Jloc)."""
+        # Robustness: some kernels are registered even when their entity set is
+        # empty (e.g. aligned-interface edges). In that case there is nothing to
+        # assemble, and we must not insist on completing every static arg.
+        gdofs = None
+        if isinstance(self.static_args, dict):
+            gdofs = self.static_args.get("gdofs_map")
+            if isinstance(gdofs, np.ndarray) and gdofs.shape[0] == 0:
+                return None, None, None
+            eids = self.static_args.get("eids")
+            if eids is not None:
+                try:
+                    if int(np.asarray(eids).shape[0]) == 0:
+                        return None, None, None
+                except Exception:
+                    # Fall through to the runner which will raise a clear error.
+                    pass
         return self.runner(current_funcs, self.static_args)
 
     def refresh(self, level_set=None):

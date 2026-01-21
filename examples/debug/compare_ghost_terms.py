@@ -7,7 +7,7 @@ Run with the desired backend (python/jit) by setting
 
 import numpy as np
 from ngsolve import CoefficientFunction, InnerProduct, Grad, TaskManager
-from examples.compare_with_ngsolve import (
+from examples.debug.compare_with_ngsolve import (
     setup_pc,
     setup_ng,
     PC_DX,

@@ -166,7 +166,7 @@ def _build_mms_problem(*, nx: int = 3, ny: int = 2, q: int = 3):
     }
 
 
-def _residual_inf_on_free_dofs(dh: DofHandler, res_form, bcs) -> float:
+def _residual_inf_on_free_dofs(dh: DofHandler, res_form, bcs, *, backend: str) -> float:
     """
     Assemble the *raw* residual (no BC elimination) and measure the infinity norm
     on non-Dirichlet DOFs.
@@ -175,7 +175,7 @@ def _residual_inf_on_free_dofs(dh: DofHandler, res_form, bcs) -> float:
     change the RHS; for MMS residual checks we therefore inspect the unmodified
     residual and simply drop boundary DOFs from the norm.
     """
-    _, F = assemble_form(Equation(None, res_form), dof_handler=dh, bcs=[], backend="python")
+    _, F = assemble_form(Equation(None, res_form), dof_handler=dh, bcs=[], backend=backend)
     dirichlet = dh.get_dirichlet_data(bcs) or {}
     rows = np.fromiter(dirichlet.keys(), dtype=int) if dirichlet else np.zeros((0,), dtype=int)
     free = np.setdiff1d(np.arange(dh.total_dofs, dtype=int), rows)
@@ -184,7 +184,8 @@ def _residual_inf_on_free_dofs(dh: DofHandler, res_form, bcs) -> float:
     return float(np.linalg.norm(F[free], ord=np.inf))
 
 
-def test_fsi_eulerian_mms_variant_a_shear_flap_residual_zero_python_backend():
+@pytest.mark.parametrize("backend", ("python", "cpp"))
+def test_fsi_eulerian_mms_variant_a_shear_flap_residual_zero_python_backend(backend):
     """
     MMS Variant A (shear-flap): choose α = μ_s/μ_f to make interface shear tractions match
     without needing any interface forcing.
@@ -334,11 +335,12 @@ def test_fsi_eulerian_mms_variant_a_shear_flap_residual_zero_python_backend():
             ]
         )
 
-    res_inf = _residual_inf_on_free_dofs(dh, residual_form, bcs)
+    res_inf = _residual_inf_on_free_dofs(dh, residual_form, bcs, backend=backend)
     assert res_inf < 1.0e-10
 
 
-def test_fsi_eulerian_mms_variant_b_sinusoidal_with_interface_forcing_residual_zero_python_backend():
+@pytest.mark.parametrize("backend", ("python", "cpp"))
+def test_fsi_eulerian_mms_variant_b_sinusoidal_with_interface_forcing_residual_zero_python_backend(backend):
     """
     MMS Variant B (sinusoidal flapping): add interface forcing g = t_f - t_s so
     the manufactured fields satisfy the interface traction balance.
@@ -502,5 +504,5 @@ def test_fsi_eulerian_mms_variant_b_sinusoidal_with_interface_forcing_residual_z
             ]
         )
 
-    res_inf = _residual_inf_on_free_dofs(dh, residual_form, bcs)
+    res_inf = _residual_inf_on_free_dofs(dh, residual_form, bcs, backend=backend)
     assert res_inf < 1.0e-10

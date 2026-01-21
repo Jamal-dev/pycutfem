@@ -603,6 +603,23 @@ class XFEMDofHandler:
         n_union_base = int(base_me.n_dofs_per_elem)
         n_union_cut = int(cut_me.n_dofs_per_elem)
 
+        # For XFEM, shifted-Heaviside enrichment needs the *true* per-side (φ-based)
+        # node masks on cut elements. Do not rely on the base handler's restrict masks
+        # because CG CutFEM paths may neutralize them to preserve polynomial reproduction.
+        if level_set is not None:
+            from pycutfem.core.sideconvention import SIDE
+            from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
+
+            _mask_cache: dict[int, tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = {}
+
+            def _elem_side_masks(eid: int):
+                eid_i = int(eid)
+                if eid_i not in _mask_cache:
+                    _mask_cache[eid_i] = _hfa.build_side_masks_by_field(
+                        self.base, list(base_me.field_names), eid_i, level_set, tol=SIDE.tol
+                    )
+                return _mask_cache[eid_i]
+
         # Start from a shallow copy of geometry; replace tables below.
         out = dict(geo_base)
 
@@ -659,12 +676,25 @@ class XFEMDofHandler:
             if level_set is not None:
                 rm_pos_key = f"restrict_mask_{f}_pos"
                 rm_neg_key = f"restrict_mask_{f}_neg"
-                rm_pos = np.asarray(out.get(rm_pos_key))
-                rm_neg = np.asarray(out.get(rm_neg_key))
-                if rm_pos.size and rm_neg.size:
-                    # Recover field-local side masks (0/1, interface nodes possibly 1 in both)
-                    m_pos_loc = np.asarray(rm_pos[:, base_sl], dtype=float)
-                    m_neg_loc = np.asarray(rm_neg[:, base_sl], dtype=float)
+                # Recover field-local side masks (0/1, interface nodes possibly 1 in both)
+                m_pos_loc = np.zeros((eids.size, n0), dtype=float)
+                m_neg_loc = np.zeros((eids.size, n0), dtype=float)
+                for i, eid in enumerate(eids.tolist()):
+                    pos_masks_elem, neg_masks_elem = _elem_side_masks(int(eid))
+                    pm = pos_masks_elem.get(f)
+                    nm = neg_masks_elem.get(f)
+                    if pm is None or nm is None:
+                        raise RuntimeError(f"XFEM interface precompute: missing side masks for field {f!r} on element {int(eid)}.")
+                    pm = np.asarray(pm, dtype=float).ravel()
+                    nm = np.asarray(nm, dtype=float).ravel()
+                    if pm.shape[0] != n0 or nm.shape[0] != n0:
+                        raise RuntimeError(
+                            "XFEM interface precompute: side mask length mismatch "
+                            f"for field {f!r} on element {int(eid)}: "
+                            f"expected {n0}, got pos={pm.shape[0]} neg={nm.shape[0]}."
+                        )
+                    m_pos_loc[i, :] = pm
+                    m_neg_loc[i, :] = nm
 
                     rm_pos_ext = np.zeros((m_pos_loc.shape[0], n_union_cut), dtype=float)
                     rm_neg_ext = np.zeros((m_neg_loc.shape[0], n_union_cut), dtype=float)
