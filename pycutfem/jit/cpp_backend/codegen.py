@@ -112,6 +112,7 @@ class CppCodeGen:
             HdivDiv,
             BinaryOp,
             Dot,
+            Outer,
             Inner,
             Store,
             Transpose,
@@ -1929,6 +1930,170 @@ class CppCodeGen:
                         )
                 else:
                     raise NotImplementedError(f"Binary op {op.op_symbol} unsupported")
+            elif isinstance(op, Outer):
+                b = stack.pop()
+                a = stack.pop()
+                nm = new_tmp("outer")
+
+                side = combine_side(a.side, b.side)
+                meta_fnames, meta_parent, meta_side, meta_fsides = resolve_metadata(
+                    a, b, prefer="basis"
+                )
+
+                # scalar ⊗ * reduces to scalar multiplication
+                if a.kind == "scalar":
+                    if b.kind == "scalar":
+                        emit_line(f"double {nm} = {a.name} * {b.name};")
+                        role = "value" if (a.role == "value" or b.role == "value") else "const"
+                        stack.append(
+                            StackItem(
+                                nm,
+                                "scalar",
+                                role,
+                                (),
+                                meta_fnames,
+                                meta_parent,
+                                side,
+                                meta_fsides,
+                            )
+                        )
+                        continue
+                    if b.kind == "vec":
+                        emit_line(f"Eigen::VectorXd {nm} = {b.name} * {a.name};")
+                        role = "value" if (a.role == "value" or b.role == "value") else b.role
+                        stack.append(
+                            StackItem(
+                                nm,
+                                "vec",
+                                role,
+                                b.shape,
+                                meta_fnames,
+                                meta_parent,
+                                side,
+                                meta_fsides,
+                            )
+                        )
+                        continue
+                    if b.kind == "mat":
+                        emit_line(f"Eigen::MatrixXd {nm} = {b.name} * {a.name};")
+                        role = "value" if (a.role == "value" or b.role == "value") else b.role
+                        stack.append(
+                            StackItem(
+                                nm,
+                                "mat",
+                                role,
+                                b.shape,
+                                meta_fnames,
+                                meta_parent,
+                                side,
+                                meta_fsides,
+                            )
+                        )
+                        continue
+                    if b.kind in {"grad", "hess", "mixed"}:
+                        emit_line(
+                            f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({b.name}.size());"
+                        )
+                        emit_line(
+                            f"for (size_t _i=0; _i<{b.name}.size(); ++_i) {nm}[_i] = {b.name}[_i] * {a.name};"
+                        )
+                        role = "mixed" if b.kind == "mixed" else b.role
+                        stack.append(
+                            StackItem(
+                                nm,
+                                b.kind,
+                                role,
+                                b.shape,
+                                meta_fnames,
+                                meta_parent,
+                                side,
+                                meta_fsides,
+                            )
+                        )
+                        continue
+                    raise NotImplementedError(
+                        f"Outer(scalar, {b.kind}) not supported in C++ backend"
+                    )
+
+                if b.kind == "scalar":
+                    if a.kind == "vec":
+                        emit_line(f"Eigen::VectorXd {nm} = {a.name} * {b.name};")
+                        role = "value" if (a.role == "value" or b.role == "value") else a.role
+                        stack.append(
+                            StackItem(
+                                nm,
+                                "vec",
+                                role,
+                                a.shape,
+                                meta_fnames,
+                                meta_parent,
+                                side,
+                                meta_fsides,
+                            )
+                        )
+                        continue
+                    if a.kind == "mat":
+                        emit_line(f"Eigen::MatrixXd {nm} = {a.name} * {b.name};")
+                        role = "value" if (a.role == "value" or b.role == "value") else a.role
+                        stack.append(
+                            StackItem(
+                                nm,
+                                "mat",
+                                role,
+                                a.shape,
+                                meta_fnames,
+                                meta_parent,
+                                side,
+                                meta_fsides,
+                            )
+                        )
+                        continue
+                    if a.kind in {"grad", "hess", "mixed"}:
+                        emit_line(
+                            f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());"
+                        )
+                        emit_line(
+                            f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] * {b.name};"
+                        )
+                        role = "mixed" if a.kind == "mixed" else a.role
+                        stack.append(
+                            StackItem(
+                                nm,
+                                a.kind,
+                                role,
+                                a.shape,
+                                meta_fnames,
+                                meta_parent,
+                                side,
+                                meta_fsides,
+                            )
+                        )
+                        continue
+                    raise NotImplementedError(
+                        f"Outer({a.kind}, scalar) not supported in C++ backend"
+                    )
+
+                # vector ⊗ vector -> matrix
+                if a.kind == "vec" and b.kind == "vec":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name} * {b.name}.transpose();")
+                    role = "value" if (a.role == "value" or b.role == "value") else "const"
+                    stack.append(
+                        StackItem(
+                            nm,
+                            "mat",
+                            role,
+                            (a.shape[0], b.shape[0]),
+                            meta_fnames,
+                            meta_parent,
+                            side,
+                            meta_fsides,
+                        )
+                    )
+                    continue
+
+                raise NotImplementedError(
+                    f"Outer not implemented for a={a.kind}/{a.role}/{a.shape}, b={b.kind}/{b.role}/{b.shape}"
+                )
             elif isinstance(op, Dot):
                 b = stack.pop()
                 a = stack.pop()

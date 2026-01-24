@@ -414,6 +414,7 @@ def build_fsi_eulerian_forms(
     gamma_v,
     gamma_p,
     gamma_v_grad,
+    svc_scale=None,
     solid_reg_eps,
     use_linear_solid: bool = True,
     solid_advect_lagged: bool = True,
@@ -497,6 +498,9 @@ def build_fsi_eulerian_forms(
     def g_disp_s(gamma, phi_1, phi_2):
         return gamma * (cell_h * grad_inner_jump(phi_1, phi_2))
 
+    if svc_scale is None:
+        svc_scale = Constant(1.0)
+
     jump_vel_trial = Pos(du_f) - Neg(du_s)
     jump_vel_test = Pos(test_vel_f) - Neg(test_vel_s)
     jump_vel_res = Pos(uf_k) - Neg(us_k)
@@ -552,21 +556,27 @@ def build_fsi_eulerian_forms(
         J_int = J_int + J_int_sym_fluid + J_int_sym_solid
         R_int = R_int + R_int_sym_fluid + R_int_sym_solid
 
+    # IMPORTANT:
+    # Use the *symmetric-gradient* viscous volume form so it is consistent with
+    # the traction used in the Nitsche interface fluxes (`traction_fluid_*`).
+    # Otherwise, for oblique interfaces (n has both components), the missing
+    # transpose correction μ(∇uᵀ·n) shows up as a consistency error and MMS tests
+    # can fail or even worsen under refinement.
     a_vol_f = (
         rho_f / dt * dot(du_f, test_vel_f)
         + theta * rho_f * dot(dot(grad(uf_k), du_f), test_vel_f)
         + theta * rho_f * dot(dot(grad(du_f), uf_k), test_vel_f)
-        + theta * mu_f * inner(grad(du_f), grad(test_vel_f))
+        + Constant(2.0) * theta * mu_f * inner(epsilon_f(du_f), epsilon_f(test_vel_f))
         - dp_f * div(test_vel_f)
         + test_q_f * div(du_f)
     ) * dx_fluid
 
     r_vol_f = (
-        rho_f * dot(uf_k - uf_n, test_vel_f) / dt
+        rho_f * inner(uf_k - uf_n, test_vel_f) / dt
         + theta * rho_f * dot(dot(grad(uf_k), uf_k), test_vel_f)
         + (Constant(1.0) - theta) * rho_f * dot(dot(grad(uf_n), uf_n), test_vel_f)
-        + theta * mu_f * inner(grad(uf_k), grad(test_vel_f))
-        + (Constant(1.0) - theta) * mu_f * inner(grad(uf_n), grad(test_vel_f))
+        + Constant(2.0) * theta * mu_f * inner(epsilon_f(uf_k), epsilon_f(test_vel_f))
+        + Constant(2.0) * (Constant(1.0) - theta) * mu_f * inner(epsilon_f(uf_n), epsilon_f(test_vel_f))
         - pf_k * div(test_vel_f)
         + test_q_f * div(uf_k)
     ) * dx_fluid
@@ -592,7 +602,7 @@ def build_fsi_eulerian_forms(
         )
     ) * dx_solid
     r_vol_s = (
-        rho_s * dot(us_k - us_n, test_vel_s) / dt
+        rho_s * inner(us_k - us_n, test_vel_s) / dt
         + theta * inner(sigma_s_k, grad(test_vel_s))
         + (Constant(1.0) - theta) * inner(sigma_s_n, grad(test_vel_s))
         + rho_s
@@ -602,7 +612,7 @@ def build_fsi_eulerian_forms(
         )
     ) * dx_solid
 
-    a_svc = (
+    a_svc = svc_scale * (
         dot(ddisp_s, test_disp_s) / dt
         - theta * dot(du_s, test_disp_s)
         + (
@@ -617,10 +627,10 @@ def build_fsi_eulerian_forms(
             )
         )
     ) * dx_solid
-    r_svc = (
-        dot(disp_k - disp_n, test_disp_s) / dt
-        - theta * dot(us_k, test_disp_s)
-        - (Constant(1.0) - theta) * dot(us_n, test_disp_s)
+    r_svc = svc_scale * (
+        inner(disp_k - disp_n, test_disp_s) / dt
+        - theta * inner(us_k, test_disp_s)
+        - (Constant(1.0) - theta) * inner(us_n, test_disp_s)
         + theta * dot(dot(grad(disp_k), solid_adv_vel), test_disp_s)
         + (Constant(1.0) - theta) * dot(dot(grad(disp_n), us_n), test_disp_s)
     ) * dx_solid
@@ -637,7 +647,7 @@ def build_fsi_eulerian_forms(
     )
 
     a_reg = solid_reg_eps * (dot(du_s, test_vel_s) + dot(ddisp_s, test_disp_s)) * dx_solid
-    r_reg = solid_reg_eps * (dot(us_k, test_vel_s) + dot(disp_k, test_disp_s)) * dx_solid
+    r_reg = solid_reg_eps * (inner(us_k, test_vel_s) + inner(disp_k, test_disp_s)) * dx_solid
 
     jacobian_form = a_vol_f + J_int + a_vol_s + a_stab + a_svc + a_reg
     residual_form = r_vol_f + R_int + r_vol_s + r_stab + r_svc + r_reg

@@ -1450,6 +1450,7 @@ def div(v):
     return DivOperation(v)
 def inner(a, b): return Inner(a, b)
 def outer(a, b): return Outer(a, b)
+def dyad(a, b): return Outer(a, b)
 def jump(v, n=None): return Jump(v, n)
 def avg(v): return Avg(v)
 def dot(a, b): return Dot(a, b)

@@ -85,6 +85,11 @@ class Dot:
     """Instruction to compute the dot product of the top two stack items."""
     pass
 
+@dataclass(frozen=True, slots=True)
+class Outer:
+    """Instruction to compute the outer product (dyad) of the top two stack items."""
+    pass
+
 @dataclass(frozen=True, slots =True)
 class Store:
     """Instruction to store the final result to an accumulator."""

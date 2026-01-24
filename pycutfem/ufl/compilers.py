@@ -44,7 +44,7 @@ from pycutfem.ufl.expressions import (
     HdivTestFunction, HdivTrialFunction,
     HdivFunction,
     Function,    VectorFunction,
-    Grad, DivOperation, Inner, Dot,
+    Grad, DivOperation, Inner, Dot, Outer,
     Sum, Sub, Prod, Pos, Neg,Div, Jump, FacetNormal,
     Avg,
     ElementWiseConstant, Derivative, Transpose,
@@ -167,7 +167,7 @@ class FormCompiler:
             Grad: self._visit_Grad,
             DivOperation: self._visit_DivOperation, Sum: self._visit_Sum,
             Sub: self._visit_Sub, Prod: self._visit_Prod, Dot: self._visit_Dot,
-            Inner: self._visit_Inner, Pos: self._visit_Pos, Neg: self._visit_Neg,
+            Inner: self._visit_Inner, Outer: self._visit_Outer, Pos: self._visit_Pos, Neg: self._visit_Neg,
             Avg: self._visit_Avg,
             Div: self._visit_Div,
             Analytic: self._visit_Analytic,
@@ -2143,10 +2143,7 @@ class FormCompiler:
             and (a.role == "trial" )) and b.role == "function"
             ):
             return b.left_dot(a)  # u_trial · ∇u_k
-        
- 
-        
-        
+
         # ------------------------------------------------------------------
         # Case:  Grad(Function) · Vec(Trial)      (∇u_k) · u
         # ------------------------------------------------------------------
@@ -2190,6 +2187,26 @@ class FormCompiler:
         raise TypeError(f"Unsupported dot product LHS '{type(a)} . {type(b)}'"
                         f" for roles a={getattr(a, 'role', None)}, b={getattr(b, 'role', None)}"
                         f" and data shapes a={getattr(a_data, 'shape', None)}, b={getattr(b_data, 'shape', None)}")
+
+    def _visit_Outer(self, n: Outer):
+        """
+        Outer product of two vectors: Outer(a,b) := a ⊗ b.
+
+        Implemented for evaluated numeric vectors (e.g. Constant vectors, FacetNormal).
+        """
+        a = self._visit(n.a)
+        b = self._visit(n.b)
+
+        a_data = a.data if isinstance(a, (VecOpInfo, GradOpInfo, HessOpInfo)) else a
+        b_data = b.data if isinstance(b, (VecOpInfo, GradOpInfo, HessOpInfo)) else b
+
+        if isinstance(a_data, np.ndarray) and isinstance(b_data, np.ndarray) and a_data.ndim == 1 and b_data.ndim == 1:
+            return np.outer(a_data, b_data)
+
+        raise NotImplementedError(
+            f"Outer product not implemented for types {type(a_data)} (shape {getattr(a_data,'shape',None)}) "
+            f"and {type(b_data)} (shape {getattr(b_data,'shape',None)})."
+        )
 
     # ================ VISITORS: INNER PRODUCTS =========================
     def _visit_Inner(self, n: Inner):

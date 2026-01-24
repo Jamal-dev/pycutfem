@@ -836,6 +836,16 @@ def scalar_vector_outer_product(scalar_vals, vector_vals, dtype):
     if DEBUG: print("scalar_vector_outer_product")
     return np.ascontiguousarray(vector_vals)[:, None] * np.ascontiguousarray(scalar_vals)[None, :]
 
+@numba.njit(cache=True)
+def vector_vector_outer_product(vec_a, vec_b, dtype):
+    """
+    Outer product between two vectors:
+      (k_a,) ⊗ (k_b,) -> (k_a, k_b)
+    """
+    if DEBUG: print("vector_vector_outer_product")
+    return np.ascontiguousarray(vec_a)[:, None] * np.ascontiguousarray(vec_b)[None, :]
+
+
 
 
 @numba.njit(cache=True)
@@ -1348,6 +1358,7 @@ for _helper_name in (
     "scale_mixed_basis_with_coeffs",
     "matrix_times_scalar_basis",
     "scalar_vector_outer_product",
+    "vector_vector_outer_product",
     "scalar_basis_times_vector",
     "scalar_trial_times_grad_test",
     "grad_trial_times_scalar_test",

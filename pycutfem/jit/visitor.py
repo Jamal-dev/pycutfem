@@ -4,7 +4,7 @@ from pycutfem.ufl.expressions import (
     HdivTestFunction, HdivTrialFunction,
     HdivFunction,
     VectorTestFunction, VectorTrialFunction, VectorFunction,
-    Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, 
+    Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, Outer as UflOuter,
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
     Avg,
     ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter, MeshSize as UFLMeshSize,
@@ -16,6 +16,7 @@ from pycutfem.ufl.analytic import Analytic
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant as LoadEWC_IR,
     LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
+    Outer as IROuter,
     CellDiameter, MeshSize, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse, Cofactor,
     Hessian as IRHessian, Laplacian as IRLaplacian, HdivDiv
 )
@@ -184,6 +185,11 @@ class IRGenerator:
             self._visit(node.a, side=side)
             self._visit(node.b, side=side)
             self.ir_sequence.append(Inner() if isinstance(node, UflInner) else Dot())
+            return
+        if isinstance(node, UflOuter):
+            self._visit(node.a, side=side)
+            self._visit(node.b, side=side)
+            self.ir_sequence.append(IROuter())
             return
 
         # --- 3. Unary Operators that modify their operand ---

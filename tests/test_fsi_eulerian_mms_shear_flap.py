@@ -24,8 +24,8 @@ def _tag_rect_boundaries(mesh: Mesh, *, x0: float, x1: float, y0: float, y1: flo
     )
 
 
-def _build_mms_problem(*, nx: int = 3, ny: int = 2, q: int = 3):
-    # Geometry: rectangle with interface x=0 (solid on x<0, fluid on x>0)
+def _build_mms_problem(*, nx: int = 3, ny: int = 2, q: int = 3, level_set: AffineLevelSet | None = None):
+    # Geometry: rectangle with an affine interface (fluid "+" where φ>0, solid "-" where φ<0)
     Lx, Ly = 2.0, 1.0
     x0, x1 = -1.0, 1.0
     y0, y1 = -0.5, 0.5
@@ -50,7 +50,8 @@ def _build_mms_problem(*, nx: int = 3, ny: int = 2, q: int = 3):
     )
     _tag_rect_boundaries(mesh, x0=x0, x1=x1, y0=y0, y1=y1)
 
-    level_set = AffineLevelSet(a=1.0, b=0.0, c=0.0)  # Γ: x=0
+    if level_set is None:
+        level_set = AffineLevelSet(a=1.0, b=0.0, c=0.0)  # Γ: x=0 (aligned baseline)
     mesh.classify_elements(level_set)
     mesh.classify_edges(level_set)
     mesh.build_interface_segments(level_set)
@@ -306,6 +307,157 @@ def test_fsi_eulerian_mms_variant_a_shear_flap_residual_zero_python_backend(back
     prob["pf_k"].nodal_values.fill(0.0)
 
     # Dirichlet: exact outer boundary at t1.
+    def _u_x_bc(x, y):
+        return 0.0
+
+    def _u_y_bc(x, y):
+        return float(u_exact_y(np.asarray(x), t1))
+
+    def _p_bc(x, y):
+        return 0.0
+
+    def _d_x_bc(x, y):
+        return 0.0
+
+    def _d_y_bc(x, y):
+        return float(w_exact(np.asarray(x), t1))
+
+    bcs = []
+    for tag in ("left", "right", "bottom", "top"):
+        bcs.extend(
+            [
+                BoundaryCondition("u_pos_x", "dirichlet", tag, _u_x_bc),
+                BoundaryCondition("u_pos_y", "dirichlet", tag, _u_y_bc),
+                BoundaryCondition("p_pos_", "dirichlet", tag, _p_bc),
+                BoundaryCondition("vs_neg_x", "dirichlet", tag, _u_x_bc),
+                BoundaryCondition("vs_neg_y", "dirichlet", tag, _u_y_bc),
+                BoundaryCondition("d_neg_x", "dirichlet", tag, _d_x_bc),
+                BoundaryCondition("d_neg_y", "dirichlet", tag, _d_y_bc),
+            ]
+        )
+
+    res_inf = _residual_inf_on_free_dofs(dh, residual_form, bcs, backend=backend)
+    assert res_inf < 1.0e-10
+
+
+@pytest.mark.parametrize("backend", ("python", "cpp"))
+def test_fsi_eulerian_mms_variant_a_shear_flap_oblique_interface_residual_zero(backend):
+    """
+    Regression: the Variant-A shear MMS should remain consistent for *oblique* interfaces.
+
+    This catches volume/traction inconsistencies in the viscous term that are masked when
+    the interface normal is axis-aligned.
+    """
+    prob = _build_mms_problem(level_set=AffineLevelSet(a=1.0, b=1.0, c=0.0))  # Γ: x + y = 0
+    dh = prob["dh"]
+
+    mu_f = 1.0
+    mu_s = 2.0
+    alpha = mu_s / mu_f
+    A = 0.1
+    dt_val = 0.05
+    t0, t1 = 0.0, dt_val
+
+    def psi(x):
+        return x
+
+    def w_exact(x, t):
+        return A * np.exp(alpha * t) * psi(x)
+
+    def u_exact_y(x, t):
+        return alpha * w_exact(x, t)
+
+    def f_f_y_discrete(x):
+        u0 = u_exact_y(x, t0)
+        u1 = u_exact_y(x, t1)
+        return (u1 - u0) / dt_val
+
+    def f_s_y_discrete(x):
+        u0 = u_exact_y(x, t0)
+        u1 = u_exact_y(x, t1)
+        return (u1 - u0) / dt_val
+
+    def g_disp_y_discrete(x):
+        d0 = w_exact(x, t0)
+        d1 = w_exact(x, t1)
+        u1 = u_exact_y(x, t1)
+        return (d1 - d0) / dt_val - u1
+
+    f_f = Analytic(lambda x, y: np.stack((0.0 * x, f_f_y_discrete(x)), axis=-1), degree=2)
+    f_s = Analytic(lambda x, y: np.stack((0.0 * x, f_s_y_discrete(x)), axis=-1), degree=2)
+    g_d = Analytic(lambda x, y: np.stack((0.0 * x, g_disp_y_discrete(x)), axis=-1), degree=2)
+
+    dt = Constant(dt_val)
+    theta = Constant(1.0)
+
+    forms = build_fsi_eulerian_forms(
+        du_f=prob["du_f_R"],
+        dp_f=prob["dp_f_R"],
+        du_s=prob["du_s_R"],
+        ddisp_s=prob["ddisp_s_R"],
+        test_vel_f=prob["v_f_R"],
+        test_q_f=prob["q_f_R"],
+        test_vel_s=prob["v_s_R"],
+        test_disp_s=prob["w_s_R"],
+        uf_k=prob["uf_k_R"],
+        pf_k=prob["pf_k_R"],
+        uf_n=prob["uf_n_R"],
+        pf_n=prob["pf_n_R"],
+        us_k=prob["us_k_R"],
+        us_n=prob["us_n_R"],
+        disp_k=prob["disp_k_R"],
+        disp_n=prob["disp_n_R"],
+        dx_fluid=prob["dx_fluid"],
+        dx_solid=prob["dx_solid"],
+        dGamma=prob["dGamma"],
+        dG_fluid=prob["dG_fluid"],
+        dG_solid=prob["dG_solid"],
+        kappa_pos=Constant(0.5),
+        kappa_neg=Constant(0.5),
+        cell_h=CellDiameter(),
+        beta_N=Constant(0.0),
+        rho_f=Constant(1.0),
+        rho_s=Constant(1.0),
+        mu_f=Constant(mu_f),
+        mu_s=Constant(mu_s),
+        lambda_s=Constant(0.0),
+        dt=dt,
+        theta=theta,
+        gamma_v=Constant(0.0),
+        gamma_p=Constant(0.0),
+        gamma_v_grad=Constant(0.0),
+        solid_reg_eps=Constant(0.0),
+        use_linear_solid=True,
+        solid_advect_lagged=True,
+        s_nitsche_value=1.0,
+    )
+
+    residual_form = (
+        forms.residual_form
+        - dot(f_f, prob["v_f_R"]) * prob["dx_fluid"]
+        - dot(f_s, prob["v_s_R"]) * prob["dx_solid"]
+        - dot(g_d, prob["w_s_R"]) * prob["dx_solid"]
+    )
+
+    for comp in (0, 1):
+        gd = np.asarray(dh.get_field_slice("u_pos_x" if comp == 0 else "u_pos_y"), dtype=int)
+        xy = dh.get_dof_coords("u_pos_x" if comp == 0 else "u_pos_y")
+        prob["uf_n"].set_nodal_values(gd, 0.0 * xy[:, 0] if comp == 0 else u_exact_y(xy[:, 0], t0))
+        prob["uf_k"].set_nodal_values(gd, 0.0 * xy[:, 0] if comp == 0 else u_exact_y(xy[:, 0], t1))
+
+        gd = np.asarray(dh.get_field_slice("vs_neg_x" if comp == 0 else "vs_neg_y"), dtype=int)
+        xy = dh.get_dof_coords("vs_neg_x" if comp == 0 else "vs_neg_y")
+        prob["us_n"].set_nodal_values(gd, 0.0 * xy[:, 0] if comp == 0 else u_exact_y(xy[:, 0], t0))
+        prob["us_k"].set_nodal_values(gd, 0.0 * xy[:, 0] if comp == 0 else u_exact_y(xy[:, 0], t1))
+
+        gd = np.asarray(dh.get_field_slice("d_neg_x" if comp == 0 else "d_neg_y"), dtype=int)
+        xy = dh.get_dof_coords("d_neg_x" if comp == 0 else "d_neg_y")
+        prob["disp_n"].set_nodal_values(gd, 0.0 * xy[:, 0] if comp == 0 else w_exact(xy[:, 0], t0))
+        prob["disp_k"].set_nodal_values(gd, 0.0 * xy[:, 0] if comp == 0 else w_exact(xy[:, 0], t1))
+
+    prob["pf_n"].nodal_values.fill(0.0)
+    prob["pf_k"].nodal_values.fill(0.0)
+
     def _u_x_bc(x, y):
         return 0.0
 

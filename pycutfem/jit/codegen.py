@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, replace
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, HdivDiv, PosOp, NegOp,
-    BinaryOp, Inner, Dot, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
+    BinaryOp, Inner, Dot, Outer, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
     MeshSize,
     Trace, Determinant, Inverse, Cofactor, Hessian as IRHessian, Laplacian as IRLaplacian
 )
@@ -2178,6 +2178,101 @@ class NumbaCodeGen:
 
 
             # ------------------------------------------------------------------
+            # OUTER (dyad) — vector ⊗ vector → matrix
+            # ------------------------------------------------------------------
+            elif isinstance(op, Outer):
+                b = stack.pop()
+                a = stack.pop()
+                res_var = new_var("outer")
+
+                # scalar ⊗ anything -> scalar multiplication
+                if a.shape == () and not a.is_vector and not a.is_gradient and not a.is_hessian:
+                    body_lines.append("# Outer: scalar ⊗ tensor -> scalar multiplication")
+                    body_lines.append(f"{res_var} = mul_scalar({a.var_name}, {b.var_name}, {self.dtype})")
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(
+                        a, b, prefer="b", strict=False
+                    )
+                    stack.append(
+                        StackItem(
+                            var_name=res_var,
+                            role=b.role,
+                            shape=b.shape,
+                            is_vector=b.is_vector,
+                            is_gradient=b.is_gradient,
+                            is_hessian=b.is_hessian,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides or [],
+                        )
+                    )
+                    continue
+
+                if b.shape == () and not b.is_vector and not b.is_gradient and not b.is_hessian:
+                    body_lines.append("# Outer: tensor ⊗ scalar -> scalar multiplication")
+                    body_lines.append(f"{res_var} = mul_scalar({b.var_name}, {a.var_name}, {self.dtype})")
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(
+                        a, b, prefer="a", strict=False
+                    )
+                    stack.append(
+                        StackItem(
+                            var_name=res_var,
+                            role=a.role,
+                            shape=a.shape,
+                            is_vector=a.is_vector,
+                            is_gradient=a.is_gradient,
+                            is_hessian=a.is_hessian,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides or [],
+                        )
+                    )
+                    continue
+
+                # vector ⊗ vector -> matrix (k_a, k_b)
+                if (
+                    a.role in {"value", "const"}
+                    and b.role in {"value", "const"}
+                    and a.is_vector
+                    and b.is_vector
+                    and (not a.is_gradient and not a.is_hessian)
+                    and (not b.is_gradient and not b.is_hessian)
+                    and len(a.shape) == 1
+                    and len(b.shape) == 1
+                ):
+                    body_lines.append("# Outer: vector ⊗ vector -> matrix")
+                    body_lines.append(
+                        f"{res_var} = vector_vector_outer_product({a.var_name}, {b.var_name}, {self.dtype})"
+                    )
+                    role = "value" if (a.role == "value" or b.role == "value") else "const"
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(
+                        a, b, prefer=None, strict=False
+                    )
+                    stack.append(
+                        StackItem(
+                            var_name=res_var,
+                            role=role,
+                            shape=(a.shape[0], b.shape[0]),
+                            is_vector=False,
+                            is_gradient=True,
+                            is_hessian=False,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides or [],
+                        )
+                    )
+                    continue
+
+                raise NotImplementedError(
+                    f"JIT Outer not implemented for roles {a.role}/{b.role}, "
+                    f"flags a(v/g/h)={a.is_vector}/{a.is_gradient}/{a.is_hessian}, "
+                    f"b(v/g/h)={b.is_vector}/{b.is_gradient}/{b.is_hessian}, "
+                    f"shapes {a.shape}/{b.shape}."
+                )
+
+            # ------------------------------------------------------------------
             # DOT   — special-cased branches for advection / mass terms --------
             # ------------------------------------------------------------------
             elif isinstance(op, Dot):
@@ -2751,6 +2846,9 @@ class NumbaCodeGen:
                 # ---------------------------------------------------------------------
                 elif (a.role in ('const', 'value') and   
                      b.role in ('const', 'value') ):
+                    shape = None
+                    is_vector = False
+                    is_grad = False
                     if a.is_gradient and b.is_vector:
                         body_lines.append("# Dot: grad(scalar) * const vector → const vector")
                         # print(f" a.shape: {a.shape}, b.shape: {b.shape}, a.is_vector: {a.is_vector}, b.is_vector: {b.is_vector}, a.is_gradient: {a.is_gradient}, b.is_gradient: {b.is_gradient}")
@@ -2803,6 +2901,18 @@ class NumbaCodeGen:
                         )
                         shape = ()
                         is_vector = False; is_grad = False
+                    elif (len(a.shape) >= 1 and len(b.shape) >= 1 and a.shape[-1] == b.shape[0]):
+                        body_lines.append("# Dot: generic contraction (const/value)")
+                        body_lines.append(
+                            f"{res_var} = contract_last_first({a.var_name}, {b.var_name}, {self.dtype})"
+                        )
+                        shape = a.shape[:-1] + b.shape[1:]
+                        is_vector = (len(shape) == 1 and shape[0] != 1)
+                        is_grad = False
+                    else:
+                        raise NotImplementedError(
+                            f"Dot(const/value, const/value) not implemented for shapes {a.shape}/{b.shape}"
+                        )
                     field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
                     stack.append(StackItem(var_name=res_var, role='const',
                                         shape=shape, is_vector=is_vector, 
@@ -2877,6 +2987,15 @@ class NumbaCodeGen:
                         elif b.is_vector: # V(k,) · V(k,) -> ()
                             pass # Scalar result, all flags False
                         # else V · scalar is handled by '*' operator
+
+                    # If the contraction produced a vector-valued result, mark it.
+                    # Important for cases like dot(dyad(n, n), u_trial) which yield
+                    # a vector basis (k, n) without involving Grad/Hessian flags.
+                    if not res_is_gradient and not res_is_hessian:
+                        if res_role in {"test", "trial"} and len(res_shape) == 2 and res_shape[0] != 1:
+                            res_is_vector = True
+                        elif res_role not in {"test", "trial"} and len(res_shape) == 1 and res_shape[0] != 1:
+                            res_is_vector = True
 
                     # 3. Override for your specific "mixed" cases
                     if a.role == 'mixed' and a.is_gradient and b.is_vector:
@@ -3615,6 +3734,7 @@ from pycutfem.jit.numba_helpers import (
     scalar_basis_times_vector,
     matrix_times_scalar_basis,
     scalar_vector_outer_product,
+    vector_vector_outer_product,
     scalar_trial_times_grad_test,
     grad_trial_times_scalar_test,
     scale_mixed_basis_with_coeffs,

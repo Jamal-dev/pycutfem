@@ -220,3 +220,5 @@ examples/poroelasticity/pycutfem_out*/
 examples/poroelasticity/fenics_monolithic_out*/
 examples/poroelasticity/convergence_out_*/
 examples/poroelasticity/fenics_out*/
+examples/FPI/*.tex
+examples/FPI/*.pdf

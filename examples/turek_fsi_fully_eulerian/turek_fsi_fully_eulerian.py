@@ -32,6 +32,48 @@ Long-run validation (FSI-2, `dFacetPatch`, cpp backend):
       --obs-every 20 --no-save-vtk --no-run-fd-check --no-run-fd-terms
   For nonlinear StVK solid, add: `USE_LINEAR_SOLID=0` (more expensive).
 
+Debugging: per-step state dumps + restart
+----------------------------------------
+Lightweight level-set dumps (φ + mesh once):
+  PYCUTFEM_DUMP_LEVELSET=1 PYCUTFEM_DUMP_LEVELSET_EVERY=1
+
+Full state dumps (large; U^k, U^n, φ) for offline replay:
+  PYCUTFEM_DUMP_STATE=1 PYCUTFEM_DUMP_STATE_EVERY=1
+
+If Newton stalls at a step where the log shows extreme slivers (e.g. `min θ ≪ 1`),
+enable/increase sliver-mass stabilization (defaults here: fluid=1.0, solid=10.0; set to 0 to disable):
+  PYCUTFEM_SLIVER_MASS_FLUID=1.0 PYCUTFEM_SLIVER_MASS_SOLID=10.0
+
+Residual term breakdown (useful to see which form component dominates):
+  PYCUTFEM_RESIDUAL_TERM_TRACE=1 PYCUTFEM_RESIDUAL_TERM_TRACE_TOP=3
+  # Optional: also trace at initial state:
+  PYCUTFEM_RESIDUAL_TERM_TRACE_INIT=1
+
+Dumps are written under:
+  `<output-dir>/levelset_dumps/` and `<output-dir>/state_dumps/`
+(override with `PYCUTFEM_LEVELSET_DUMP_DIR` / `PYCUTFEM_STATE_DUMP_DIR`).
+
+On Newton failure, the script also writes `*_fail_####.npz` (when dumping is enabled).
+Reproduce a stall by restarting from a nearby dump:
+  conda run --no-capture-output -n fenicsx python -u examples/turek_fsi_fully_eulerian/turek_fsi_fully_eulerian.py \
+    --restart-dir <output-dir> --restart-tag step --restart-step <n> --max-steps 3
+  # or: --restart-tag fail
+
+Inspect a dump quickly:
+  python -c "import numpy as np; d=np.load('.../state_step_0011.npz'); print(d.files)"
+
+Example Command:
+  PYCUTFEM_DUMP_STATE=1 PYCUTFEM_DUMP_STATE_EVERY=1 \
+  PYCUTFEM_JIT_BACKEND=cpp PYCUTFEM_UNIFIED_PRECOMPUTE=1 USE_FACET_PATCH_GHOST=1 \
+    PENALTY_VAL=1e-3 PENALTY_GRAD=1e-3 BETA_PENALTY=20 \
+    ALLOW_DT_REDUCTION=0 REFINE_INITIAL=0 LEVELSET_UPDATE_TOL=1e-8 \
+    POLY_ORDER_UF=2 POLY_ORDER_PF=1 POLY_ORDER_US=2 POLY_ORDER_DS=1 \
+    python -u examples/turek_fsi_fully_eulerian/turek_fsi_fully_eulerian.py \
+      --turek-case fsi2 --mesh-backend structured --mesh-size 0.01 \
+      --dt 0.005 --final-time 3.0 \
+      --newton-tol 1e-8 --newton-rtol 0 --max-newton-iter 50 \
+      --obs-every 1 --save-vtk --no-run-fd-check --no-run-fd-terms \
+      --linear-solver petsc
 
 """
 from __future__ import annotations
@@ -96,7 +138,7 @@ from pycutfem.ufl.expressions import (
     trace,
     Jump,
 )
-from pycutfem.ufl.measures import dx, ds, dGhost, dInterface, dFacetPatch
+from pycutfem.ufl.measures import dx, ds, dS, dGhost, dInterface, dFacetPatch
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.io.vtk import export_vtk
 from pycutfem.io.visualization import plot_mesh_2
@@ -185,6 +227,30 @@ def _parse_args():
         type=int,
         default=int(os.getenv("POLY_ORDER", "2")),
         help="Polynomial order for primary fields. Env: POLY_ORDER.",
+    )
+    parser.add_argument(
+        "--poly-order-uf",
+        type=int,
+        default=int(os.getenv("POLY_ORDER_UF", "2")),
+        help="Polynomial order for fluid velocity. Env: POLY_ORDER_UF.",
+    )
+    parser.add_argument(
+        "--poly-order-us",
+        type=int,
+        default=int(os.getenv("POLY_ORDER_US", "2")),
+        help="Polynomial order for solid velocity. Env: POLY_ORDER_US.",
+    )
+    parser.add_argument(
+        "--poly-order-ds",
+        type=int,
+        default=int(os.getenv("POLY_ORDER_DS", "1")),
+        help="Polynomial order for solid displacement. Env: POLY_ORDER_DS.",
+    )
+    parser.add_argument(
+        "--poly-order-pf",
+        type=int,
+        default=int(os.getenv("POLY_ORDER_PF", "1")),
+        help="Polynomial order for fluid pressure. Env: POLY_ORDER_PF.",
     )
     parser.add_argument(
         "--taylor-hood",
@@ -503,8 +569,8 @@ def _parse_args():
         plot_only=_env_bool("PLOT_ONLY", False),
         force_full_setup=_env_bool("FORCE_FULL_SETUP", False),
         refine_initial=_env_bool("REFINE_INITIAL", True),
-        taylor_hood=_env_bool("PYCUTFEM_TAYLOR_HOOD", False),
-        pin_pressure=_env_bool("PIN_PRESSURE", True),
+        taylor_hood=_env_bool("PYCUTFEM_TAYLOR_HOOD", True),
+        pin_pressure=_env_bool("PIN_PRESSURE", False),
         use_aligned_interface=_env_bool("USE_ALIGNED_INTERFACE", True),
         solid_advect_lagged=_env_bool("SOLID_ADVECT_LAGGED", True),
         use_restricted_forms=_env_bool("USE_RESTRICTED_FORMS", True),
@@ -659,6 +725,10 @@ def _apply_env_overrides(args: argparse.Namespace) -> None:
     _set_env("THETA", args.theta)
     _set_env("TUREK_CASE", args.turek_case)
     _set_env("VTK_INTERFACE_CLAMP", args.vtk_interface_clamp)
+    _set_env("POLY_ORDER_UF", args.poly_order_uf)
+    _set_env("POLY_ORDER_US", args.poly_order_us)
+    _set_env("POLY_ORDER_DS", args.poly_order_ds)
+    _set_env("POLY_ORDER_PF", args.poly_order_pf)
     if args.jit_backend:
         os.environ["PYCUTFEM_JIT_BACKEND"] = str(args.jit_backend)
 
@@ -698,16 +768,18 @@ POINT_A_INITIAL = (0.6, 0.2) # Point A will change while Point B is fixed
 BETA_PENALTY = float(os.getenv("BETA_PENALTY", "20.0")) * MU_F
 DT = float(ARGS.dt)
 POLY_ORDER = int(ARGS.poly_order)
+poly_orders_dict = {}
+poly_orders_dict["POLY_ORDER_UF"] = int(ARGS.poly_order_uf) if ARGS.poly_order_uf is not None else POLY_ORDER
+poly_orders_dict["POLY_ORDER_US"] = int(ARGS.poly_order_us) if ARGS.poly_order_us is not None else POLY_ORDER
+poly_orders_dict["POLY_ORDER_DS"] = int(ARGS.poly_order_ds) if ARGS.poly_order_ds is not None else POLY_ORDER - 1
+poly_orders_dict["POLY_ORDER_PF"] = int(ARGS.poly_order_pf) if ARGS.poly_order_pf is not None else POLY_ORDER - 1
+for order_name, order in poly_orders_dict.items():
+    if order < 1: 
+        poly_orders_dict[order_name] = 1
+        print(f"[Warning] {order_name} was less than 1; setting to 1.")
 USE_TAYLOR_HOOD = os.getenv("PYCUTFEM_TAYLOR_HOOD", "1") not in ("0", "false", "False")
-REDUCE_ORDER_SOLID = os.getenv("REDUCE_ORDER_SOLID", "1") not in ("0", "false", "False")
-PRESSURE_ORDER = (POLY_ORDER - 1) if USE_TAYLOR_HOOD else POLY_ORDER
-SOLID_ORDER = POLY_ORDER - 1 if REDUCE_ORDER_SOLID else POLY_ORDER
-if SOLID_ORDER < 1:
-    SOLID_ORDER = 1
-if PRESSURE_ORDER < 1:
-    PRESSURE_ORDER = 1
-    if USE_TAYLOR_HOOD:
-        print("[element] Requested Taylor–Hood but POLY_ORDER<2; falling back to equal-order pressure.")
+PRESSURE_ORDER = poly_orders_dict["POLY_ORDER_PF"]
+
 MESH_SIZE = float(ARGS.mesh_size)
 FD_BACKEND = ARGS.fd_backend
 CASE_LABEL = str(getattr(ARGS, "case_label", "FSI-2"))
@@ -774,11 +846,18 @@ PYCUTFEM_CIP_U_EPS = float(os.getenv("PYCUTFEM_CIP_U_EPS", "1e-12"))
 # Optional fluid mass-jump ghost penalty (helps control near-nullspace modes in extreme slivers).
 PYCUTFEM_FLUID_VEL_GHOST_MASS = float(os.getenv("PYCUTFEM_FLUID_VEL_GHOST_MASS", "0.0"))
 
-# Optional sliver-robust cut-cell mass regularization:
+# Sliver-robust cut-cell mass regularization:
 # adds (ρ/dt) * (1/θ) * ⟨u, v⟩ on the *cut* subdomain so tiny cut volumes cannot
-# carry arbitrarily large values with negligible cost.
-PYCUTFEM_SLIVER_MASS_FLUID = float(os.getenv("PYCUTFEM_SLIVER_MASS_FLUID", "0.0"))
-PYCUTFEM_SLIVER_MASS_SOLID = float(os.getenv("PYCUTFEM_SLIVER_MASS_SOLID", "0.0"))
+# carry arbitrarily large values with negligible cost. This is important for
+# fully Eulerian unfitted FSI where θ can drop to ~1e-3 (or less) and Newton can
+# stall without extra mass control.
+PYCUTFEM_SLIVER_MASS_FLUID = float(os.getenv("PYCUTFEM_SLIVER_MASS_FLUID", "1.0"))
+PYCUTFEM_SLIVER_MASS_SOLID = float(os.getenv("PYCUTFEM_SLIVER_MASS_SOLID", "10.0"))
+# When enabled, use the *raw* Hansbo cut ratios (unclipped) in the sliver-mass
+# denominator so the term remains effective even if SLIVER_THETAMIN floors θ for
+# kappa/weights. This is the "sliver mass auto-scale" mode used to debug extreme
+# slivers.
+PYCUTFEM_SLIVER_MASS_AUTO = os.getenv("PYCUTFEM_SLIVER_MASS_AUTO", "0") not in ("0", "false", "False")
 
 # Optional: pressure stabilization on the fluid ghost-edge set (Richter-style).
 # This targets equal-order (Q2/Q2) pressure robustness near the moving interface.
@@ -3097,10 +3176,10 @@ def make_domain_sets(mesh: Mesh) -> Dict[str, BitSet]:
     has_neg = solid | cut
 
     interface_bs = mesh.edge_bitset("interface")
-    ghost_pos = mesh.edge_bitset("ghost_pos") - interface_bs
-    ghost_neg = mesh.edge_bitset("ghost_neg") - interface_bs
-    ghost_both = mesh.edge_bitset("ghost_both") - interface_bs
-    ghost_all = (ghost_pos | ghost_neg | ghost_both) - interface_bs
+    ghost_pos = mesh.edge_bitset("ghost_pos") 
+    ghost_neg = mesh.edge_bitset("ghost_neg") 
+    ghost_both = mesh.edge_bitset("ghost_both") 
+    ghost_all = (ghost_pos | ghost_neg | ghost_both) 
 
     solid_ghost = ghost_neg | ghost_both
     fluid_ghost = ghost_pos | ghost_both
@@ -4437,13 +4516,13 @@ if quick_plot_only:
 mixed_element = MixedElement(
     mesh,
     field_specs={
-        "u_pos_x": POLY_ORDER,
-        "u_pos_y": POLY_ORDER,
-        "p_pos_": PRESSURE_ORDER,
-        "vs_neg_x": SOLID_ORDER ,
-        "vs_neg_y": SOLID_ORDER ,
-        "d_neg_x":  SOLID_ORDER ,
-        "d_neg_y":  SOLID_ORDER ,
+        "u_pos_x": poly_orders_dict["POLY_ORDER_UF"],
+        "u_pos_y": poly_orders_dict["POLY_ORDER_UF"],
+        "p_pos_":  poly_orders_dict["POLY_ORDER_PF"],
+        "vs_neg_x": poly_orders_dict["POLY_ORDER_US"],
+        "vs_neg_y": poly_orders_dict["POLY_ORDER_US"],
+        "d_neg_x":  poly_orders_dict["POLY_ORDER_DS"],
+        "d_neg_y":  poly_orders_dict["POLY_ORDER_DS"],
     },
 )
 dof_handler = DofHandler(mixed_element, method="cg")
@@ -4470,9 +4549,10 @@ bcs: list[BoundaryCondition] = [
     BoundaryCondition("u_pos_y", "dirichlet", "walls", lambda x, y: 0.0),
     BoundaryCondition("u_pos_x", "dirichlet", "cylinder", lambda x, y: 0.0),
     BoundaryCondition("u_pos_y", "dirichlet", "cylinder", lambda x, y: 0.0),
+    # No Dirichlet on the outlet: do-nothing outflow is imposed weakly (see below).
 ]
 
-# Pressure pin to remove nullspace
+# Optional pressure pin (usually not needed with a do-nothing outlet).
 if PIN_PRESSURE:
     pin_tag = "pressure_pin"
     dof_handler.tag_dof_by_locator(
@@ -4591,6 +4671,26 @@ dS_fluid_quad = ds(
     metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
 )
 
+# -----------------------------------------------------------------------------
+# DFG do-nothing outlet (Γ_out)
+# -----------------------------------------------------------------------------
+# Benchmark definition (with outward normal η on Γ_out):
+#   μ ∂_η u - p η = 0
+#
+# Our viscous volume form uses the symmetric interior bilinear form 2μ ε(u):ε(v),
+# whose natural traction corresponds to (μ(∇u+∇uᵀ) - pI)·η. To recover the DFG
+# outflow based on μ∇u - pI while keeping the symmetric interior form, we add the
+# transpose correction on Γ_out:
+#   + ⟨ μ (∇uᵀ·η), v ⟩_{Γ_out}.
+outlet_edges = mesh.edge_bitset("outlet")
+if outlet_edges.cardinality() == 0:
+    raise RuntimeError("Outlet boundary tag not found on the background mesh.")
+dS_outlet = dS(
+    defined_on=outlet_edges,
+    metadata={"q": max(8, int(qvol))},
+)
+n_out = FacetNormal()
+
 cell_h = CellDiameter()
 beta_N = Constant(BETA_PENALTY * POLY_ORDER * (POLY_ORDER + 1))
 
@@ -4623,6 +4723,8 @@ refresh_sliver_weights(
 
 theta_pos_cell = ElementWiseConstant(theta_pos_vals)
 theta_neg_cell = ElementWiseConstant(theta_neg_vals)
+theta_pos_raw_cell = ElementWiseConstant(theta_pos_raw_vals)
+theta_neg_raw_cell = ElementWiseConstant(theta_neg_raw_vals)
 theta_sum = Pos(theta_pos_cell) + Neg(theta_neg_cell) + Constant(1.0e-12)
 kappa_pos = Pos(theta_pos_cell) / theta_sum
 kappa_neg = Neg(theta_neg_cell) / theta_sum
@@ -5030,7 +5132,7 @@ else:
 a_vol_f = (
     rho_f_const / dt * dot(du_f_R, test_vel_f_R)
     + theta * rho_f_const * conv_f_jac
-    + theta * mu_f_const * inner(grad(du_f_R), grad(test_vel_f_R))
+    + 2.0 * theta * mu_f_const * inner(epsilon_f(du_f_R), epsilon_f(test_vel_f_R))
     - dp_f_R * div(test_vel_f_R)
     + test_q_f_R * div(du_f_R)
 ) * dx_fluid
@@ -5039,11 +5141,25 @@ r_vol_f = (
     rho_f_const * dot(uf_k_R - uf_n_R, test_vel_f_R) / dt
     + theta * rho_f_const * conv_f_k
     + (1 - theta) * rho_f_const * conv_f_n
-    + theta * mu_f_const * inner(grad(uf_k_R), grad(test_vel_f_R))
-    + (1 - theta) * mu_f_const * inner(grad(uf_n_R), grad(test_vel_f_R))
+    + 2.0 * theta * mu_f_const * inner(epsilon_f(uf_k_R), epsilon_f(test_vel_f_R))
+    + 2.0 * (1 - theta) * mu_f_const * inner(epsilon_f(uf_n_R), epsilon_f(test_vel_f_R))
     - pf_k_R * div(test_vel_f_R)
     + test_q_f_R * div(uf_k_R)
 ) * dx_fluid
+
+# Do-nothing outlet correction term (DFG): +μ (∇uᵀ·η, v)_Γout.
+#
+# NOTE: the outlet is a boundary of the *background* domain (far away from the
+# level set). Using unrestricted test/trial functions here avoids pulling CutFEM
+# restriction masks into the boundary kernel, while still assembling the correct
+# contribution on Γ_out.
+outflow_jac = theta * mu_f_const * dot(dot(grad(du_f).T, n_out), test_vel_f) * dS_outlet
+outflow_res = mu_f_const * (
+    theta * dot(dot(grad(uf_k).T, n_out), test_vel_f)
+    + (1 - theta) * dot(dot(grad(uf_n).T, n_out), test_vel_f)
+) * dS_outlet
+a_vol_f = a_vol_f + outflow_jac
+r_vol_f = r_vol_f + outflow_res
 
 sigma_s_k = sigma_s_nonlinear(disp_k_R)  # Cauchy stress in current frame
 sigma_s_n = sigma_s_nonlinear(disp_n_R)
@@ -5134,7 +5250,17 @@ else:
     adv_disp_k = dot(dot(grad(disp_k_R), solid_adv_vel), test_disp_s_R)
     adv_disp_n = dot(dot(grad(disp_n_R), us_n_R), test_disp_s_R)
 
-a_svc = (
+# ------------------------------------------------------------------
+# Solid velocity constraint (Eulerian kinematic relation)
+# ------------------------------------------------------------------
+# Numerical scaling:
+# The monolithic (u_s, d_s) block can be very ill-conditioned when the kinematic
+# constraint rows are left unscaled (especially for small dt). A pure row scaling
+# does not change the root in exact arithmetic, but substantially improves
+# conditioning and MMS accuracy in floating point.
+svc_scale = rho_s_const / dt
+
+a_svc = svc_scale * (
     dot(ddisp_s_R, test_disp_s_R) / dt
     - theta * dot(du_s_R, test_disp_s_R)
     + theta * adv_disp_jac
@@ -5142,9 +5268,9 @@ a_svc = (
 if SOLID_KINEMATIC_STAB > 0.0:
     alpha_s = Constant(float(SOLID_KINEMATIC_STAB))
     s_exp = float(SOLID_KINEMATIC_STAB_EXP)
-    a_svc = a_svc + (-alpha_s * cell_h**s_exp * inner(grad(du_s_R), grad(test_disp_s_R))) * dx_solid
+    a_svc = a_svc + svc_scale * (-alpha_s * cell_h**s_exp * inner(grad(du_s_R), grad(test_disp_s_R))) * dx_solid
 # Kinematic constraint with advected displacement in Eulerian frame
-r_svc = (
+r_svc = svc_scale * (
     dot(disp_k_R - disp_n_R, test_disp_s_R) / dt
     - theta * dot(us_k_R, test_disp_s_R)
     - (1 - theta) * dot(us_n_R, test_disp_s_R)
@@ -5152,16 +5278,16 @@ r_svc = (
     + (1 - theta) * adv_disp_n
 ) * dx_solid
 if SOLID_KINEMATIC_STAB > 0.0:
-    r_svc = r_svc + (-alpha_s * cell_h**s_exp * inner(grad(us_k_R), grad(test_disp_s_R))) * dx_solid
+    r_svc = r_svc + svc_scale * (-alpha_s * cell_h**s_exp * inner(grad(us_k_R), grad(test_disp_s_R))) * dx_solid
 
 penalty_val = float(os.getenv("PENALTY_VAL", "0.0"))
 penalty_grad = float(os.getenv("PENALTY_GRAD", "0.0"))
 # Keep the scalar Constants around so we can scale them (e.g. on Newton failure)
 # without regenerating forms/kernels.
-gamma_v_f0 = Constant(penalty_val * POLY_ORDER**2)
-gamma_p_f0 = Constant(penalty_val * PRESSURE_ORDER)
-gamma_v_s0 = Constant(penalty_val * POLY_ORDER**2)
-gamma_disp_s0 = Constant(penalty_grad * POLY_ORDER**2)
+gamma_v_f0 = Constant(penalty_val * poly_orders_dict["POLY_ORDER_UF"]**2)
+gamma_p_f0 = Constant(penalty_val * poly_orders_dict["POLY_ORDER_PF"])
+gamma_v_s0 = Constant(penalty_val * poly_orders_dict["POLY_ORDER_US"]**2)
+gamma_disp_s0 = Constant(penalty_grad * poly_orders_dict["POLY_ORDER_DS"]**2)
 gamma_v_f_mass0 = Constant(float(PYCUTFEM_FLUID_VEL_GHOST_MASS))
 gamma_v_s_mass0 = Constant(float(SOLID_VEL_GHOST_MASS))
 gamma_sliver_mass_f0 = Constant(float(PYCUTFEM_SLIVER_MASS_FLUID))
@@ -5283,15 +5409,17 @@ if (PYCUTFEM_CIP_BETA_FLUID > 0.0) or (PYCUTFEM_CIP_BETA_SOLID > 0.0) or (PYCUTF
 a_reg = solid_reg_eps * (dot(du_s_R, test_vel_s_R) + dot(ddisp_s_R, test_disp_s_R)) * dx_solid
 r_reg = solid_reg_eps * (dot(us_k_R, test_vel_s_R) + dot(disp_k_R, test_disp_s_R)) * dx_solid
 
-j_inv_theta_f = Constant(1.0) / (theta_pos_cell + Constant(1.0e-12))
-j_inv_theta_s = Constant(1.0) / (theta_neg_cell + Constant(1.0e-12))
+theta_pos_mass_cell = theta_pos_raw_cell if PYCUTFEM_SLIVER_MASS_AUTO else theta_pos_cell
+theta_neg_mass_cell = theta_neg_raw_cell if PYCUTFEM_SLIVER_MASS_AUTO else theta_neg_cell
+j_inv_theta_f = Constant(1.0) / (theta_pos_mass_cell + Constant(1.0e-16))
+j_inv_theta_s = Constant(1.0) / (theta_neg_mass_cell + Constant(1.0e-16))
 a_sliver_mass = (
     gamma_sliver_mass_f * (rho_f_const / dt) * j_inv_theta_f * dot(du_f_R, test_vel_f_R) * dx_fluid_cut
     + gamma_sliver_mass_s * (rho_s_const / dt) * j_inv_theta_s * dot(du_s_R, test_vel_s_R) * dx_solid_cut
 )
 r_sliver_mass = (
-    gamma_sliver_mass_f * (rho_f_const / dt) * j_inv_theta_f * dot(uf_k_R, test_vel_f_R) * dx_fluid_cut
-    + gamma_sliver_mass_s * (rho_s_const / dt) * j_inv_theta_s * dot(us_k_R, test_vel_s_R) * dx_solid_cut
+    gamma_sliver_mass_f * (rho_f_const / dt) * j_inv_theta_f * dot(uf_k_R - uf_n_R, test_vel_f_R) * dx_fluid_cut
+    + gamma_sliver_mass_s * (rho_s_const / dt) * j_inv_theta_s * dot(us_k_R - us_n_R, test_vel_s_R) * dx_solid_cut
 )
 
 jacobian_form = a_vol_f + J_int + a_vol_s + a_stab + a_p_stab + a_cip + a_svc + a_reg + a_sliver_mass
@@ -5423,8 +5551,165 @@ def _trace_interface_residuals(label: str = "ifc", *, bcs_apply=None) -> None:
         pf_k.nodal_values[:] = saved[1]
         dof_handler.apply_bcs(bcs, uf_k, pf_k)
 
+# -----------------------------------------------------------------------------
+# Residual term diagnostics (optional)
+# -----------------------------------------------------------------------------
+def _trace_residual_terms(label: str = "res", *, bcs_apply=None, backend: str | None = None) -> None:
+    """
+    Assemble and print a coarse residual breakdown by major form components.
+    Enable with: PYCUTFEM_RESIDUAL_TERM_TRACE=1
+    """
+    if os.getenv("PYCUTFEM_RESIDUAL_TERM_TRACE", "").lower() not in {"1", "true", "yes"}:
+        return
+    bcs_apply = bcs if bcs_apply is None else bcs_apply
+    if backend is None:
+        backend = (os.getenv("PYCUTFEM_RESIDUAL_TERM_TRACE_BACKEND", "").strip() or globals().get("assembly_backend") or "jit")
+    backend = str(backend).strip() or "jit"
+    try:
+        top = int(os.getenv("PYCUTFEM_RESIDUAL_TERM_TRACE_TOP", "2") or "2")
+    except Exception:
+        top = 2
+    top = int(max(0, min(top, 10)))
+
+    bc_dofs: set[int] = set()
+    try:
+        bc_dofs = {int(k) for k in dof_handler.get_dirichlet_data(bcs_apply).keys()}
+    except Exception:
+        bc_dofs = set()
+    inactive_dofs: set[int] = {int(k) for k in getattr(dof_handler, "dof_tags", {}).get("inactive", set())}
+
+    def _free_subset(dofs: np.ndarray) -> np.ndarray:
+        dofs = np.asarray(dofs, dtype=int).ravel()
+        if dofs.size == 0:
+            return dofs
+        if not bc_dofs and not inactive_dofs:
+            return dofs
+        mask = np.ones(dofs.size, dtype=bool)
+        if bc_dofs:
+            mask &= ~np.isin(dofs, np.fromiter(bc_dofs, dtype=int))
+        if inactive_dofs:
+            mask &= ~np.isin(dofs, np.fromiter(inactive_dofs, dtype=int))
+        return dofs[mask]
+
+    # Full DOF slices by field (as global DOF ids).
+    u_f_dofs = np.concatenate(
+        [np.asarray(dof_handler.get_field_slice("u_pos_x"), dtype=int), np.asarray(dof_handler.get_field_slice("u_pos_y"), dtype=int)]
+    )
+    p_f_dofs = np.asarray(dof_handler.get_field_slice("p_pos_"), dtype=int)
+    u_s_dofs = np.concatenate(
+        [np.asarray(dof_handler.get_field_slice("vs_neg_x"), dtype=int), np.asarray(dof_handler.get_field_slice("vs_neg_y"), dtype=int)]
+    )
+    d_s_dofs = np.concatenate(
+        [np.asarray(dof_handler.get_field_slice("d_neg_x"), dtype=int), np.asarray(dof_handler.get_field_slice("d_neg_y"), dtype=int)]
+    )
+    field_dofs = {
+        "u_f": _free_subset(u_f_dofs),
+        "p_f": _free_subset(p_f_dofs),
+        "u_s": _free_subset(u_s_dofs),
+        "d_s": _free_subset(d_s_dofs),
+    }
+
+    terms = {
+        "r_vol_f": r_vol_f,
+        "R_int": R_int,
+        "r_vol_s": r_vol_s,
+        "r_stab": r_stab,
+        "r_p_stab": r_p_stab,
+        "r_cip": r_cip,
+        "r_svc": r_svc,
+        "r_reg": r_reg,
+        "r_sliver_mass": r_sliver_mass,
+    }
+
+    solver_obj = globals().get("solver", None)
+    restrictor = getattr(solver_obj, "restrictor", None) if solver_obj is not None else None
+
+    def _fmt_loc(gdof: int) -> str:
+        gdof = int(gdof)
+        field = None
+        nid = None
+        xy = None
+        try:
+            field, nid = getattr(dof_handler, "_dof_to_node_map", {}).get(gdof, (None, None))
+        except Exception:
+            field, nid = (None, None)
+        try:
+            if nid is not None and nid >= 0:
+                xy = np.asarray(mesh.nodes_x_y_pos[int(nid)], dtype=float).ravel()
+        except Exception:
+            xy = None
+        ph = None
+        if xy is not None and xy.size >= 2:
+            try:
+                ph = float(ls_beam(np.array([float(xy[0]), float(xy[1])], dtype=float)))
+            except Exception:
+                ph = None
+        loc = ""
+        if xy is not None and xy.size >= 2:
+            loc = f" x={float(xy[0]):.4f} y={float(xy[1]):.4f}"
+        msg = f"gdof={gdof}"
+        if field is not None:
+            msg += f" field={field}"
+        if nid is not None:
+            msg += f" node={int(nid)}"
+        msg += loc
+        if ph is not None:
+            msg += f" phi={ph:+.3e}"
+        return msg
+
+    def _dump_top(name: str, dofs: np.ndarray, R: np.ndarray) -> None:
+        if top <= 0 or dofs.size == 0:
+            return
+        vals = np.asarray(R[dofs], dtype=float)
+        if vals.size == 0:
+            return
+        order = np.argsort(-np.abs(vals))
+        for j in order[:top].tolist():
+            gdof = int(dofs[int(j)])
+            val = float(vals[int(j)])
+            print(f"[{label}]   top {name}: {_fmt_loc(gdof)} val={val:+.3e}")
+
+    print(f"[{label}] residual-term breakdown backend={backend} (top={top})")
+    for tname, term in terms.items():
+        if term is None:
+            continue
+        try:
+            _, R_full = assemble_form(Equation(None, term), dof_handler=dof_handler, bcs=[], backend=backend)
+        except Exception as exc:  # noqa: PERF203
+            print(f"[{label}] {tname}: assemble failed ({exc})")
+            continue
+        if R_full is None:
+            continue
+        R_full = np.asarray(R_full, dtype=float)
+        try:
+            inf_free = float(np.linalg.norm(R_full[_free_subset(np.arange(R_full.size, dtype=int))], ord=np.inf))
+        except Exception:
+            inf_free = float(np.linalg.norm(R_full, ord=np.inf))
+        inf_red = None
+        if restrictor is not None:
+            try:
+                R_red = restrictor.restrict_vec(R_full)
+                inf_red = float(np.linalg.norm(np.asarray(R_red, dtype=float), ord=np.inf))
+            except Exception:
+                inf_red = None
+        msg = f"[{label}] {tname}: |R|_inf(full_free)={inf_free:.3e}"
+        if inf_red is not None:
+            msg += f" |R|_inf(reduced)={inf_red:.3e}"
+        print(msg)
+        for fname, dofs in field_dofs.items():
+            if dofs.size == 0:
+                continue
+            try:
+                nrm = float(np.linalg.norm(R_full[dofs], ord=np.inf))
+            except Exception:
+                nrm = float("nan")
+            print(f"[{label}]   {tname}:{fname} |R|_inf={nrm:.3e} (ndof={int(dofs.size)})")
+            _dump_top(f"{tname}:{fname}", dofs, R_full)
+
 # Optional: trace interface residual contributions at the initial state.
 _trace_interface_residuals("ifc_init", bcs_apply=bcs_t0)
+if os.getenv("PYCUTFEM_RESIDUAL_TERM_TRACE_INIT", "").lower() in {"1", "true", "yes"}:
+    _trace_residual_terms("res_init", bcs_apply=bcs_t0)
 
 # -----------------------------------------------------------------------------
 # Peclet number diagnostics (optional)
@@ -6594,6 +6879,9 @@ if ARGS.run_time_stepping:
     nonlinear_solver = getattr(ARGS, "nonlinear_solver", "newton")
     jit_backend_choice = str(getattr(ARGS, "jit_backend", "numba") or "numba").strip().lower()
     assembly_backend = "cpp" if jit_backend_choice in {"cpp", "c++"} else "jit"
+    print(f''' FSI simulation with nonlinear solver="{nonlinear_solver}" assembly_backend="{assembly_backend}," 
+          field orders: u_f={poly_orders_dict["POLY_ORDER_UF"]}, p_f={poly_orders_dict["POLY_ORDER_PF"]}, u_s={poly_orders_dict["POLY_ORDER_US"]}, d_s={poly_orders_dict["POLY_ORDER_DS"]};
+          Linear solver: {getattr(ARGS, "linear_solver", "scipy")}''')
     if nonlinear_solver == "snes":
         solver = PetscSnesNewtonSolver(
             residual_form,
@@ -6639,10 +6927,15 @@ if ARGS.run_time_stepping:
         if counts:
             print("[active] DOFs by field: " + ", ".join(counts))
 
+    # Optional: residual term breakdown at the start state (handy with restart + --max-steps 0).
+    bcs_trace = NewtonSolver._freeze_bcs(bcs, float(getattr(time_params, "t0", 0.0)))
+    _trace_residual_terms("res_start", bcs_apply=bcs_trace, backend=assembly_backend)
+
     # Keep unknowns on their physical side: prevent inactive-side DOFs from drifting.
     zero_inactive_every_newton = os.getenv("PYCUTFEM_ZERO_INACTIVE_SIDES", "0").lower() in {"1", "true", "yes"}
     if zero_inactive_every_newton:
-        def _post_newton_zero_inactive(funcs_now):
+
+        def _post_newton_zero_inactive(funcs_now):  # noqa: ANN001
             try:
                 uf_now, pf_now, us_now, disp_now = funcs_now
             except Exception:
@@ -6729,6 +7022,7 @@ if ARGS.run_time_stepping:
 
         # Optional: term-by-term interface residual traces.
         _trace_interface_residuals(f"ifc_fail_step{step:04d}", bcs_apply=ctx.get("bcs", bcs))
+        _trace_residual_terms(f"res_fail_step{step:04d}", bcs_apply=ctx.get("bcs", bcs))
 
         if not retry_penalties or not retry_scales:
             return False
@@ -7075,9 +7369,8 @@ if ARGS.run_time_stepping:
                             "d_neg_y": disp_n,
                         },
                         k=int(os.getenv("PYCUTFEM_EXTEND_NEWLY_ACTIVE_K", "4") or "4"),
-                        trace=os.getenv("PYCUTFEM_EXTEND_NEWLY_ACTIVE_TRACE", "").lower()
-	                        in {"1", "true", "yes"},
-	                    )
+                        trace=os.getenv("PYCUTFEM_EXTEND_NEWLY_ACTIVE_TRACE", "").lower() in {"1", "true", "yes"},
+                    )
             reextend_enabled = os.getenv("PYCUTFEM_REEXTEND_WRONG_SIDE", "0").lower() in {"1", "true", "yes"}
             if reextend_enabled:
                 stats = _reextend_wrong_side_by_nearest(

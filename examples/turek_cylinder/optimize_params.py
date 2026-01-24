@@ -26,10 +26,17 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover
+    fcntl = None
 
 
 DFG_REFS: dict[str, dict[str, float]] = {
@@ -230,6 +237,46 @@ class RunResult:
     run_dir: Path
 
 
+@contextmanager
+def _tuned_params_lock(tuned_path: Path):
+    """
+    Inter-process lock for updates to tuned_params.json.
+
+    optimize_params is often run in parallel (multiple benchmarks/levels). Without a
+    lock, concurrent "read-modify-write" updates can clobber each other and drop
+    previously written entries. We lock a dedicated sidecar file so atomic replace
+    of tuned_params.json remains possible.
+    """
+    if fcntl is None:
+        yield
+        return
+    lock_path = tuned_path.with_suffix(tuned_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as fp:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        prefix=f".{path.name}.tmp.",
+        delete=False,
+    ) as tmp:
+        tmp.write(text)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = Path(tmp.name)
+    os.replace(str(tmp_path), str(path))
+
+
 def _run_once(
     *,
     candidate: Candidate,
@@ -339,18 +386,6 @@ def _update_tuned_params(best: RunResult, *, tuned_path: Path, meta: dict[str, A
     if best.candidate.gamma_gp_p is not None:
         entry["gamma_gp_p"] = float(best.candidate.gamma_gp_p)
 
-    doc: dict[str, Any] = {"version": 1, "entries": []}
-    if tuned_path.is_file():
-        try:
-            loaded = json.loads(tuned_path.read_text())
-            if isinstance(loaded, dict):
-                doc.update(loaded)
-        except Exception:
-            pass
-    entries = doc.get("entries")
-    if not isinstance(entries, list):
-        entries = []
-
     def _same_case(e: Any) -> bool:
         if not isinstance(e, dict):
             return False
@@ -362,30 +397,60 @@ def _update_tuned_params(best: RunResult, *, tuned_path: Path, meta: dict[str, A
             and int(e.get("fe_order", entry["fe_order"])) == int(entry["fe_order"])
             and int(e.get("p_order", entry["p_order"])) == int(entry["p_order"])
             and abs(float(e.get("dt", entry["dt"])) - float(entry["dt"])) <= 1e-12
+            and abs(float(e.get("theta", entry["theta"])) - float(entry["theta"])) <= 1e-12
         )
 
-    same = [e for e in entries if _same_case(e)]
-    if same:
-        new_score = float(entry.get("score", float("inf")))
-        if not math.isfinite(new_score):
-            return
-        old_scores = []
-        for e in same:
-            try:
-                s = float(e.get("score", float("inf")))
-            except Exception:
-                s = float("inf")
-            if math.isfinite(s):
-                old_scores.append(s)
-        old_best = min(old_scores) if old_scores else float("inf")
-        # Only update this case if we found a strictly better (lower) score.
-        if math.isfinite(old_best) and new_score >= old_best:
-            return
+    doc: dict[str, Any] = {"version": 1, "entries": []}
+    # Serialize updates: a common workflow is running optimize_params.py in parallel.
+    # Without a lock, concurrent read-modify-write cycles can clobber each other.
+    with _tuned_params_lock(tuned_path):
+        if tuned_path.is_file():
+            raw = tuned_path.read_text()
+            if raw.strip():
+                try:
+                    loaded = json.loads(raw)
+                    if isinstance(loaded, dict):
+                        doc.update(loaded)
+                except Exception:
+                    # Preserve the corrupted/partial file for recovery, then continue from a clean slate.
+                    backup = tuned_path.with_name(f"{tuned_path.name}.corrupt.{int(time.time())}")
+                    try:
+                        backup.write_text(raw)
+                        print(f"[warn] tuned params JSON unreadable; backed up to {backup}", file=sys.stderr)
+                    except Exception:
+                        pass
 
-    entries = [e for e in entries if not _same_case(e)]
-    entries.append(entry)
-    doc["entries"] = entries
-    tuned_path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+        entries = doc.get("entries")
+        if not isinstance(entries, list):
+            entries = []
+
+        same = [e for e in entries if _same_case(e)]
+        if same:
+            new_score = float(entry.get("score", float("inf")))
+            if not math.isfinite(new_score):
+                return
+            old_scores = []
+            for e in same:
+                try:
+                    s = float(e.get("score", float("inf")))
+                except Exception:
+                    s = float("inf")
+                if math.isfinite(s):
+                    old_scores.append(s)
+            old_best = min(old_scores) if old_scores else float("inf")
+            # Only update this case if we found a strictly better (lower) score.
+            if math.isfinite(old_best) and new_score >= old_best:
+                return
+
+        entries = [e for e in entries if not _same_case(e)]
+        entries.append(entry)
+        doc["entries"] = entries
+        _atomic_write_json(tuned_path, doc)
+        # Optional rolling backup for safety.
+        try:
+            _atomic_write_json(tuned_path.with_suffix(tuned_path.suffix + ".bak"), doc)
+        except Exception:
+            pass
 
 
 def main() -> int:
