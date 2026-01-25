@@ -563,101 +563,12 @@ class CppCodeGen:
                 self.side = side or ""
                 self.field_sides = field_sides or []
 
-        # argument declaration ---------------------------------------------
-        arg_decls: list[str] = []
-        for name in param_order:
-            if (
-                name == "gdofs_map"
-                or name in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}
-                or name.startswith(("pos_map", "neg_map"))
-            ):
-                arg_decls.append(
-                    "py::array_t<int32_t, py::array::c_style | py::array::forcecast> gdofs_map"
-                    if name == "gdofs_map"
-                    else f"py::array_t<int32_t, py::array::c_style | py::array::forcecast> {name}"
-                )
-            elif name in {"qp_phys", "qw", "detJ", "detJ_pos", "detJ_neg", "J_inv", "J_inv_pos", "J_inv_neg", "normals", "phis"} or name.startswith(("pos_Hxi", "neg_Hxi")):
-                arg_decls.append(
-                    f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}"
-                )
-            elif name.startswith("domain_flag_"):
-                arg_decls.append(
-                    f"py::array_t<uint8_t, py::array::c_style | py::array::forcecast> {name}"
-                )
-            else:
-                arg_decls.append(
-                    f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}"
-                )
-        arg_sig = ",\n        ".join(arg_decls)
-        param_list = ", ".join([f'py::str("{p}")' for p in param_order])
-        active_list = ", ".join([f'py::str("{f}")' for f in active_fields])
-
-        # views for arrays used frequently
-        view_lines = [
-            "    auto qp_view = qp_phys.unchecked<3>();",
-            "    auto qw_view = qw.unchecked<2>();",
-        ]
-        if "detJ" in param_order:
-            view_lines.append("    auto detJ_view = detJ.unchecked<2>();")
-        if "detJ_pos" in param_order:
-            view_lines.append("    auto detJ_pos_view = detJ_pos.unchecked<2>();")
-        if "detJ_neg" in param_order:
-            view_lines.append("    auto detJ_neg_view = detJ_neg.unchecked<2>();")
-        if "J_inv" in param_order:
-            view_lines.append("    auto Jinv_view = J_inv.unchecked<4>();")
-        if "J_inv_pos" in param_order:
-            view_lines.append("    auto Jinv_pos_view = J_inv_pos.unchecked<4>();")
-        if "J_inv_neg" in param_order:
-            view_lines.append("    auto Jinv_neg_view = J_inv_neg.unchecked<4>();")
-        if "h_arr" in param_order:
-            view_lines.append("    auto h_arr_view = h_arr.unchecked<1>();")
-        for name in param_order:
-            if name.startswith("ana_"):
-                shape = analytic_shapes.get(name, ())
-                if len(shape) == 0:
-                    view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
-                elif len(shape) == 1:
-                    view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
-                else:
-                    raise NotImplementedError(
-                        "LoadAnalytic only implemented for scalar/vector tensors in C++ backend"
-                    )
-            if name.startswith("b_"):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
-            if name.startswith("bvec_"):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
-            if name.startswith("g_"):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
-            if name.startswith("r0") or name.startswith("r1") or name.startswith("r2") or name.startswith("r3") or name.startswith("r4"):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
-            if name == "normals":
-                view_lines.append(f"    auto normals_view = normals.unchecked<3>();")
-            if name.startswith("div_"):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
-            if name.startswith("sign_"):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
-            if name.startswith(("d10_", "d01_", "d20_", "d11_", "d02_")):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
-            if name.startswith("u_"):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
-            if name.startswith("domain_flag_"):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
-            if name in ewc_rank:
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<{ewc_rank[name]}>();")
-            if name in {"Hxi0", "Hxi1", "pos_Hxi0", "pos_Hxi1", "neg_Hxi0", "neg_Hxi1"}:
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
-            if name.startswith(("pos_map", "neg_map")):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
-            if name.startswith("restrict_mask_"):
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
-            if name in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}:
-                view_lines.append(f"    auto {name}_view = {name}.unchecked<1>();")
-
         # Hoist constant-array mapping out of the quadrature loop.
         # NOTE: calling pybind11 APIs (like .request()) inside an OpenMP region
         # is not thread-safe and can segfault. These constants are invariant
         # across elements/quadrature points, so we map them once here.
         const_arr_vars: dict[str, tuple[str, str, tuple[int, ...]]] = {}
+        const_arr_setup_lines: list[str] = []
         for op in ir_sequence:
             if not isinstance(op, LoadConstantArray):
                 continue
@@ -675,44 +586,48 @@ class CppCodeGen:
             var = f"{op.name}_const"
             buf = f"{op.name}_buf"
             const_arr_vars[op.name] = (var, kind, shape)
-            view_lines.append(f"    auto {buf} = {op.name}.request();")
+            const_arr_setup_lines.append(f"    auto {buf} = {op.name}.request();")
             if kind == "scalar":
-                view_lines.append(f"    double {var} = 0.0;")
-                view_lines.append(f"    if ({buf}.ndim == 0) {{")
-                view_lines.append(f"        {var} = *static_cast<double*>({buf}.ptr);")
-                view_lines.append(f"    }} else if ({buf}.ndim == 1 && {buf}.shape[0] >= 1) {{")
-                view_lines.append(f"        {var} = static_cast<double*>({buf}.ptr)[0];")
-                view_lines.append(f"    }} else if ({buf}.ndim == 2 && {buf}.shape[0] >= 1 && {buf}.shape[1] >= 1) {{")
-                view_lines.append(f"        {var} = static_cast<double*>({buf}.ptr)[0];")
-                view_lines.append("    } else { throw std::runtime_error(\"Unsupported constant scalar array rank\"); }")
+                const_arr_setup_lines.append(f"    double {var} = 0.0;")
+                const_arr_setup_lines.append(f"    if ({buf}.ndim == 0) {{")
+                const_arr_setup_lines.append(f"        {var} = *static_cast<double*>({buf}.ptr);")
+                const_arr_setup_lines.append(f"    }} else if ({buf}.ndim == 1 && {buf}.shape[0] >= 1) {{")
+                const_arr_setup_lines.append(f"        {var} = static_cast<double*>({buf}.ptr)[0];")
+                const_arr_setup_lines.append(f"    }} else if ({buf}.ndim == 2 && {buf}.shape[0] >= 1 && {buf}.shape[1] >= 1) {{")
+                const_arr_setup_lines.append(f"        {var} = static_cast<double*>({buf}.ptr)[0];")
+                const_arr_setup_lines.append("    } else { throw std::runtime_error(\"Unsupported constant scalar array rank\"); }")
             elif kind == "vec":
-                view_lines.append(f"    Eigen::VectorXd {var};")
-                view_lines.append(f"    if ({buf}.ndim == 0) {{")
-                view_lines.append(f"        double _c = *static_cast<double*>({buf}.ptr);")
+                const_arr_setup_lines.append(f"    Eigen::VectorXd {var};")
+                const_arr_setup_lines.append(f"    if ({buf}.ndim == 0) {{")
+                const_arr_setup_lines.append(f"        double _c = *static_cast<double*>({buf}.ptr);")
                 # Prefer the declared shape when available, else fall back to length 1.
                 decl_n = int(shape[0]) if shape and int(shape[0]) > 0 else 1
-                view_lines.append(f"        {var} = Eigen::VectorXd::Constant({decl_n}, _c);")
-                view_lines.append(f"    }} else if ({buf}.ndim == 1) {{")
-                view_lines.append(f"        Eigen::Map<const Eigen::VectorXd> _map_{var}(static_cast<double*>({buf}.ptr), {buf}.shape[0]);")
-                view_lines.append(f"        {var} = _map_{var};")
-                view_lines.append("    } else { throw std::runtime_error(\"Unsupported constant vector array rank\"); }")
+                const_arr_setup_lines.append(f"        {var} = Eigen::VectorXd::Constant({decl_n}, _c);")
+                const_arr_setup_lines.append(f"    }} else if ({buf}.ndim == 1) {{")
+                const_arr_setup_lines.append(
+                    f"        Eigen::Map<const Eigen::VectorXd> _map_{var}(static_cast<double*>({buf}.ptr), {buf}.shape[0]);"
+                )
+                const_arr_setup_lines.append(f"        {var} = _map_{var};")
+                const_arr_setup_lines.append("    } else { throw std::runtime_error(\"Unsupported constant vector array rank\"); }")
             else:
-                view_lines.append(f"    Eigen::MatrixXd {var};")
-                view_lines.append(f"    if ({buf}.ndim == 0) {{")
-                view_lines.append(f"        double _c = *static_cast<double*>({buf}.ptr);")
-                view_lines.append(f"        {var} = Eigen::MatrixXd::Constant(1, 1, _c);")
-                view_lines.append("    }")
-                view_lines.append(f"    else if ({buf}.ndim == 1) {{")
-                view_lines.append(f"        Eigen::Map<const Eigen::VectorXd> _map_{var}(static_cast<double*>({buf}.ptr), {buf}.shape[0]);")
-                view_lines.append(f"        {var} = _map_{var};")
-                view_lines.append("    }")
-                view_lines.append(f"    else if ({buf}.ndim == 2) {{")
-                view_lines.append(
+                const_arr_setup_lines.append(f"    Eigen::MatrixXd {var};")
+                const_arr_setup_lines.append(f"    if ({buf}.ndim == 0) {{")
+                const_arr_setup_lines.append(f"        double _c = *static_cast<double*>({buf}.ptr);")
+                const_arr_setup_lines.append(f"        {var} = Eigen::MatrixXd::Constant(1, 1, _c);")
+                const_arr_setup_lines.append("    }")
+                const_arr_setup_lines.append(f"    else if ({buf}.ndim == 1) {{")
+                const_arr_setup_lines.append(
+                    f"        Eigen::Map<const Eigen::VectorXd> _map_{var}(static_cast<double*>({buf}.ptr), {buf}.shape[0]);"
+                )
+                const_arr_setup_lines.append(f"        {var} = _map_{var};")
+                const_arr_setup_lines.append("    }")
+                const_arr_setup_lines.append(f"    else if ({buf}.ndim == 2) {{")
+                const_arr_setup_lines.append(
                     f"        Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> _map_{var}(static_cast<double*>({buf}.ptr), {buf}.shape[0], {buf}.shape[1]);"
                 )
-                view_lines.append(f"        {var} = _map_{var};")
-                view_lines.append("    }")
-                view_lines.append("    else { throw std::runtime_error(\"Unsupported constant matrix array rank\"); }")
+                const_arr_setup_lines.append(f"        {var} = _map_{var};")
+                const_arr_setup_lines.append("    }")
+                const_arr_setup_lines.append("    else { throw std::runtime_error(\"Unsupported constant matrix array rank\"); }")
 
         # body generation --------------------------------------------------
         stack: list[StackItem] = []
@@ -864,6 +779,12 @@ class CppCodeGen:
                         if getattr(self.mixed_element, "_field_families", {}).get(cand, None) == "RT":
                             hdiv_field = cand
                     if hdiv_field is not None:
+                        if op.side == "+":
+                            required_args.add("J_inv_pos")
+                        elif op.side == "-":
+                            required_args.add("J_inv_neg")
+                        else:
+                            required_args.add("J_inv")
                         side_tag = "pos" if op.side == "+" else "neg" if op.side == "-" else ""
                         bvec_name = f"bvec_{hdiv_field}_{side_tag}" if side_tag else f"bvec_{hdiv_field}"
                         sign_name = f"sign_{hdiv_field}_{side_tag}" if side_tag else f"sign_{hdiv_field}"
@@ -979,6 +900,7 @@ class CppCodeGen:
                         map_name   = f"{side_tag}_map_{fn}" if use_side else None
                         s0 = field_slices.get(fn, slice(0, 0)).start
                         if use_side:
+                            required_args.update({basis_name, map_name})
                             map_len = new_tmp("map_len")
                             basis_len = new_tmp("basis_len")
                             emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
@@ -1000,6 +922,12 @@ class CppCodeGen:
                 elif op.role in {"test", "trial"} and op.deriv_order in {(1, 0), (0, 1)}:
                     # First derivative requested directly (no Grad op).
                     # Build a (k x n_union) matrix with the selected physical component.
+                    if op.side == "+":
+                        required_args.add("J_inv_pos")
+                    elif op.side == "-":
+                        required_args.add("J_inv_neg")
+                    else:
+                        required_args.add("J_inv")
                     k = len(op.field_names)
                     nm = new_tmp("d1")
                     emit_line(f"Eigen::MatrixXd {nm}({k}, n_union);")
@@ -1127,6 +1055,12 @@ class CppCodeGen:
             elif isinstance(op, Grad):
                 a = stack.pop()
                 if a.kind in {"mat", "basis_ref"} and a.role in {"test", "trial"}:
+                    if a.side == "+":
+                        required_args.add("J_inv_pos")
+                    elif a.side == "-":
+                        required_args.add("J_inv_neg")
+                    else:
+                        required_args.add("J_inv")
                     k = len(a.field_names)
                     nm = new_tmp("grad")
                     emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({k});")
@@ -1140,6 +1074,7 @@ class CppCodeGen:
                             d10 = f"r10_{fn}_{side_tag}"
                             d01 = f"r01_{fn}_{side_tag}"
                             map_name = f"{side_tag}_map_{fn}"
+                            required_args.update({d10, d01, map_name})
                             map_len = new_tmp("map_len")
                             basis_len = new_tmp("basis_len")
                             emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
@@ -1158,6 +1093,7 @@ class CppCodeGen:
                             emit_line("}")
                         else:
                             gname = f"g_{fn}_view"
+                            required_args.add(f"g_{fn}")
                             emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
                             emit_line(
                                 f"    double gx = {gname}(e,q,j,0); double gy = {gname}(e,q,j,1);"
@@ -1170,6 +1106,12 @@ class CppCodeGen:
                     stack.append(StackItem(nm, "grad", a.role, (k, -1, 2), a.field_names, a.parent, a.side, a.field_sides))
                 elif a.role == "value":
                     # gradient of Function/VectorFunction values using coefficients and grad basis
+                    if a.side == "+":
+                        required_args.add("J_inv_pos")
+                    elif a.side == "-":
+                        required_args.add("J_inv_neg")
+                    else:
+                        required_args.add("J_inv")
                     k = len(a.field_names)
                     nm = new_tmp("gval")
                     emit_line(f"Eigen::MatrixXd {nm}({k}, 2);")
@@ -1185,6 +1127,7 @@ class CppCodeGen:
                             d10 = f"r10_{fn}_{side_tag}"
                             d01 = f"r01_{fn}_{side_tag}"
                             map_name = f"{side_tag}_map_{fn}"
+                            required_args.update({d10, d01, map_name})
                             mask_name = None
                             if apply_restrict_mask:
                                 mask_name = f"restrict_mask_{fn}_{side_tag}"
@@ -1217,6 +1160,7 @@ class CppCodeGen:
                             emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
                             emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
                             emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                            required_args.add(f"g_{fn}")
                             emit_line(
                                 f"gradient_component({nm}, {idx}, {coeff_name}_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
                             )
@@ -2757,6 +2701,13 @@ class CppCodeGen:
 
         loop_block = "\n".join(body_lines)
 
+        # Include any late-discovered kernel args (maps, masks, sided grads, ...).
+        # Unlike the Python/Numba backend, the C++ codegen learns some required
+        # arrays during the emission pass (e.g. {pos,neg}_map_<field> on facets).
+        for name in sorted(required_args):
+            if name not in param_order:
+                param_order.append(name)
+
         func_dim = max(1, functional_dim)
         prologue = [
             "    ssize_t n_elem = qp_view.shape(0);",
@@ -2826,10 +2777,113 @@ class CppCodeGen:
                 "            Hy_neg(1,0)=neg_Hxi1_view(e,q,1,0); Hy_neg(1,1)=neg_Hxi1_view(e,q,1,1);",
             ]
 
+        # argument declaration ---------------------------------------------
+        arg_decls: list[str] = []
+        for name in param_order:
+            if (
+                name == "gdofs_map"
+                or name in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}
+                or name.startswith(("pos_map", "neg_map"))
+            ):
+                arg_decls.append(
+                    "py::array_t<int32_t, py::array::c_style | py::array::forcecast> gdofs_map"
+                    if name == "gdofs_map"
+                    else f"py::array_t<int32_t, py::array::c_style | py::array::forcecast> {name}"
+                )
+            elif name in {
+                "qp_phys",
+                "qw",
+                "detJ",
+                "detJ_pos",
+                "detJ_neg",
+                "J_inv",
+                "J_inv_pos",
+                "J_inv_neg",
+                "normals",
+                "phis",
+            } or name.startswith(("pos_Hxi", "neg_Hxi")):
+                arg_decls.append(
+                    f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}"
+                )
+            elif name.startswith("domain_flag_"):
+                arg_decls.append(
+                    f"py::array_t<uint8_t, py::array::c_style | py::array::forcecast> {name}"
+                )
+            else:
+                arg_decls.append(
+                    f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}"
+                )
+        arg_sig = ",\n        ".join(arg_decls)
+        param_list = ", ".join([f'py::str("{p}")' for p in param_order])
+        active_list = ", ".join([f'py::str("{f}")' for f in active_fields])
+
+        # views for arrays used frequently
+        view_lines = [
+            "    auto qp_view = qp_phys.unchecked<3>();",
+            "    auto qw_view = qw.unchecked<2>();",
+        ]
+        if "detJ" in param_order:
+            view_lines.append("    auto detJ_view = detJ.unchecked<2>();")
+        if "detJ_pos" in param_order:
+            view_lines.append("    auto detJ_pos_view = detJ_pos.unchecked<2>();")
+        if "detJ_neg" in param_order:
+            view_lines.append("    auto detJ_neg_view = detJ_neg.unchecked<2>();")
+        if "J_inv" in param_order:
+            view_lines.append("    auto Jinv_view = J_inv.unchecked<4>();")
+        if "J_inv_pos" in param_order:
+            view_lines.append("    auto Jinv_pos_view = J_inv_pos.unchecked<4>();")
+        if "J_inv_neg" in param_order:
+            view_lines.append("    auto Jinv_neg_view = J_inv_neg.unchecked<4>();")
+        if "h_arr" in param_order:
+            view_lines.append("    auto h_arr_view = h_arr.unchecked<1>();")
+        for name in param_order:
+            if name.startswith("ana_"):
+                shape = analytic_shapes.get(name, ())
+                if len(shape) == 0:
+                    view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+                elif len(shape) == 1:
+                    view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
+                else:
+                    raise NotImplementedError(
+                        "LoadAnalytic only implemented for scalar/vector tensors in C++ backend"
+                    )
+            if name.startswith("b_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
+            if name.startswith("bvec_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
+            if name.startswith("g_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
+            if name.startswith("r0") or name.startswith("r1") or name.startswith("r2") or name.startswith("r3") or name.startswith("r4"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
+            if name == "normals":
+                view_lines.append("    auto normals_view = normals.unchecked<3>();")
+            if name.startswith("div_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
+            if name.startswith("sign_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+            if name.startswith(("d10_", "d01_", "d20_", "d11_", "d02_")):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
+            if name.startswith("u_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+            if name.startswith("domain_flag_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+            if name in ewc_rank:
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<{ewc_rank[name]}>();")
+            if name in {"Hxi0", "Hxi1", "pos_Hxi0", "pos_Hxi1", "neg_Hxi0", "neg_Hxi1"}:
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
+            if name.startswith(("pos_map", "neg_map")):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+            if name.startswith("restrict_mask_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
+            if name in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}:
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<1>();")
+
+        view_lines.extend(const_arr_setup_lines)
+
         full_src = (
             CPP_HEADER
             + f"""
-static py::tuple {kernel_name}(
+	static py::tuple {kernel_name}(
         {arg_sig}
     ) {{
 {chr(10).join(view_lines)}

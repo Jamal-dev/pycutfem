@@ -365,11 +365,19 @@ class VecOpInfo(BaseOpInfo):
 
     def inner(self, other: Optional[Union["VecOpInfo", np.ndarray]]) -> np.ndarray:
         """Computes inner product (u, v), returning an (n, n) matrix."""
-        if self.data.shape[0] != other.data.shape[0]:
-            raise ValueError("VecOpInfo component mismatch for inner product.")
-        A, B = self.data, getattr(other, 'data', other)
         role_a = self.role
-        role_b = getattr(other, 'role', None)
+        if isinstance(other, VecOpInfo):
+            B = other.data
+            role_b = other.role
+        else:
+            B = np.asarray(other)
+            role_b = None
+
+        A = self.data
+        if A.ndim == 2 and B.ndim == 1 and A.shape[0] != B.shape[0]:
+            raise ValueError("VecOpInfo component mismatch for inner product.")
+        if A.ndim == 2 and B.ndim == 0 and A.shape[0] != 1:
+            raise ValueError("VecOpInfo component mismatch for inner product.")
         if self.is_rhs:
             if role_a in {"trial","test"} and role_b in {"function"}:
                 fun = _collapsed_function(other) # (k,)
@@ -381,6 +389,12 @@ class VecOpInfo(BaseOpInfo):
                 fun_a = _collapsed_function(self) # (k,)
                 fun_b = _collapsed_function(other) # (k,)
                 return np.einsum("k,k->", fun_a, fun_b, optimize=True) # ()
+            elif role_a in {"trial","test"} and role_b is None and B.ndim == 1:
+                # Test/trial dotted with a constant vector (e.g. interface normal).
+                return np.einsum("kn,k->n", A, B, optimize=True)
+            elif role_a in {"trial","test"} and role_b is None and B.ndim == 0:
+                # Scalar test/trial times scalar constant.
+                return A[0, :] * float(B)
             elif role_a in {"vector"} and role_b in {"vector"}:
                 return np.dot(A, B)
             elif role_a in {"vector"} and role_b in {"function"}:
@@ -629,6 +643,9 @@ class VecOpInfo(BaseOpInfo):
             if other.ndim == 0:
                 # Scalar multiplication
                 return self._with(self.data * other, role=self.role)
+            if self.data.ndim == 0 and other.ndim == 1:
+                # Scalar (QP) value times a constant vector -> vector (QP).
+                return self._with(self.data * other, role="vector")
             elif other.ndim == 1 and other.size == self.data.shape[0]:
                 return self._with(self.data * other[:, np.newaxis], role=self.role)
             elif other.ndim == 1 and self.data.shape[0] == 1:

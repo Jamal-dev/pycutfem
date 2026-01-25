@@ -1577,7 +1577,14 @@ class FormCompiler:
                         if isinstance(mask_dict, dict):
                             mask = mask_dict.get(fld)
                             if mask is not None:
-                                coeffs_use = coeffs_use * np.asarray(mask, dtype=coeffs_use.dtype)
+                                mask_arr = np.asarray(mask, dtype=coeffs_use.dtype).ravel()
+                                if mask_arr.shape[0] != coeffs_use.shape[0]:
+                                    try:
+                                        mask_arr = _hac._pad_coeffs_to_global(self.ctx, side, fld, mask_arr)
+                                    except Exception:
+                                        mask_arr = mask_arr
+                                if mask_arr.shape[0] == coeffs_use.shape[0]:
+                                    coeffs_use = coeffs_use * mask_arr
                         if self.ctx.get("is_ghost", False):
                             if side == "+":
                                 gmask = self.ctx.get("coeff_mask_pos_global")
@@ -1620,7 +1627,14 @@ class FormCompiler:
                         if isinstance(mask_dict, dict):
                             mask = mask_dict.get(fld)
                             if mask is not None:
-                                coeffs_use = coeffs_use * np.asarray(mask, dtype=coeffs_use.dtype)
+                                mask_arr = np.asarray(mask, dtype=coeffs_use.dtype).ravel()
+                                if mask_arr.shape[0] != coeffs_use.shape[0]:
+                                    try:
+                                        mask_arr = _hac._pad_coeffs_to_global(self.ctx, side, fld, mask_arr)
+                                    except Exception:
+                                        mask_arr = mask_arr
+                                if mask_arr.shape[0] == coeffs_use.shape[0]:
+                                    coeffs_use = coeffs_use * mask_arr
                         if self.ctx.get('is_ghost', False):
                             if side == '+':
                                 gmask = self.ctx.get('coeff_mask_pos_global')
@@ -1731,7 +1745,14 @@ class FormCompiler:
                         if isinstance(mask_dict, dict):
                             mask = mask_dict.get(fld)
                             if mask is not None:
-                                coeffs_use = coeffs_use * np.asarray(mask, dtype=coeffs_use.dtype)
+                                mask_arr = np.asarray(mask, dtype=coeffs_use.dtype).ravel()
+                                if mask_arr.shape[0] != coeffs_use.shape[0]:
+                                    try:
+                                        mask_arr = _hac._pad_coeffs_to_global(self.ctx, side, fld, mask_arr)
+                                    except Exception:
+                                        mask_arr = mask_arr
+                                if mask_arr.shape[0] == coeffs_use.shape[0]:
+                                    coeffs_use = coeffs_use * mask_arr
                         if self.ctx.get('is_ghost', False):
                             if side == '+':
                                 gmask = self.ctx.get('coeff_mask_pos_global')

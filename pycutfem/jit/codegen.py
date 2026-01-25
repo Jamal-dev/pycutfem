@@ -1998,12 +1998,75 @@ class NumbaCodeGen:
                             f"{res_var} = dot_mass_test_trial({test_var}, {trial_var}, {self.dtype})"
                         )
 
-                    field_names,parent_name ,side, field_sides = StackItem.resolve_metadata(a, b, prefer=None, strict=False)
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(
+                        a, b, prefer=None, strict=False
+                    )
                     shape = (test_item.shape[1], trial_item.shape[1])  # (n_test, n_trial)
-                    stack.append(StackItem(var_name=res_var, role='value',
-                                        shape=shape, is_vector=False, is_gradient=False,
-                                        field_names=field_names, parent_name=parent_name, side=side,
-                                        field_sides=field_sides or []))
+                    stack.append(
+                        StackItem(
+                            var_name=res_var,
+                            role="value",
+                            shape=shape,
+                            is_vector=False,
+                            is_gradient=False,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides or [],
+                        )
+                    )
+                    continue
+
+                elif (
+                    a.role in {"test", "trial"}
+                    and b.role in {"value", "const"}
+                    and not (a.is_gradient or b.is_gradient or a.is_hessian or b.is_hessian)
+                ):
+                    # RHS: inner(Test, Function/Const) – swapped operand order.
+                    body_lines.append("# RHS: Inner(Test, Function/Const)")
+                    role = a.role
+
+                    if a.is_vector and b.is_vector:
+                        # a: (k,n), b: (k,) -> (n,)
+                        body_lines.append("# RHS: Inner(Test(Vector), Value(Vector))")
+                        body_lines.append(
+                            f"{res_var} = const_vector_dot_basis_1d({b.var_name}, {a.var_name}, {self.dtype})"
+                        )
+                    elif (
+                        (not a.is_vector)
+                        and (not b.is_vector)
+                        and len(a.shape) == 2
+                        and a.shape[0] == 1
+                    ):
+                        # a: (1,n), b: () -> (n,)
+                        body_lines.append("# RHS: Inner(Test(Scalar), Value(Scalar))")
+                        body_lines.append(
+                            f"{res_var} = mul_scalar({b.var_name}, {a.var_name}[0], {self.dtype})"
+                        )
+                    else:
+                        raise NotImplementedError(
+                            f"Inner not implemented for roles {a.role}/{b.role}, "
+                            f"is_vector: {a.is_vector}/{b.is_vector}, "
+                            f"is_gradient: {a.is_gradient}/{b.is_gradient}, "
+                            f"shapes: {a.shape}/{b.shape}, is_hessian: {a.is_hessian}/{b.is_hessian}"
+                        )
+
+                    field_names, parent_name, side, field_sides = StackItem.resolve_metadata(
+                        a, b, prefer="a", strict=False
+                    )
+                    stack.append(
+                        StackItem(
+                            var_name=res_var,
+                            role=role,
+                            shape=(a.shape[1],),
+                            is_vector=False,
+                            is_gradient=False,
+                            field_names=field_names,
+                            parent_name=parent_name,
+                            side=side,
+                            field_sides=field_sides,
+                        )
+                    )
                     continue
 
 
