@@ -1169,7 +1169,7 @@ class GradOpInfo(BaseOpInfo):
             data = np.einsum("ks,snmd->knmd", self_grad_val, other.data, optimize=True)
             meta = _resolve_meta(self.meta(), other.meta(), prefer='b')
             return GradOpInfo(data, role=other.role, **self.update_meta(meta))
-        elif self.role == "function" and other.role == "function":
+        elif self.role in {"function", "identity"} and other.role in {"function", "identity"}:
             # Case:  Grad(Function) · Grad(Function)      ∇u_k · ∇u_k
             # (1)  value of ∇u_k at this quad-point
             grad_val = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)

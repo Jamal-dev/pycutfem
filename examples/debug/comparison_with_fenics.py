@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
+import sys
 
 # FEniCSx imports
 from mpi4py import MPI
@@ -385,9 +386,11 @@ def get_pycutfem_dof_coords(dof_handler: DofHandler, field: str) -> np.ndarray:
         raise ValueError(f"Field '{field}' not found in DofHandler")
     return dof_handler.get_dof_coords(field)
 
-def get_all_pycutfem_dof_coords(dof_handler: DofHandler) -> np.ndarray:
+def get_all_pycutfem_dof_coords(dof_handler: DofHandler, *, fields: list[str] | None = None) -> np.ndarray:
     all_coords = np.zeros((dof_handler.total_dofs, 2))
-    for field in ['ux', 'uy', 'p']:
+    if fields is None:
+        fields = list(dof_handler.field_names)
+    for field in fields:
         field_dofs = dof_handler.get_field_slice(field)
         field_coords = get_pycutfem_dof_coords(dof_handler, field)
         all_coords[field_dofs] = field_coords
@@ -396,25 +399,58 @@ def get_all_pycutfem_dof_coords(dof_handler: DofHandler) -> np.ndarray:
 def get_all_fenicsx_dof_coords(W_fenicsx):
     num_total_dofs = W_fenicsx.dofmap.index_map.size_global
     all_coords = np.zeros((num_total_dofs, 2))
-    
-    W0, V_map = W_fenicsx.sub(0).collapse()
-    W1, P_map_fx = W_fenicsx.sub(1).collapse()
-    W00, V0_map = W0.sub(0).collapse()
-    W01, V1_map = W0.sub(1).collapse()
+    nsub = int(getattr(W_fenicsx, "num_sub_spaces", 0))
 
-    coords_ux = W00.tabulate_dof_coordinates()[:, :2]
-    coords_uy = W01.tabulate_dof_coordinates()[:, :2]
-    coords_p = W1.tabulate_dof_coordinates()[:, :2]
+    if nsub == 2:
+        W0, V_map = W_fenicsx.sub(0).collapse()
+        W1, P_map_fx = W_fenicsx.sub(1).collapse()
+        W00, V0_map = W0.sub(0).collapse()
+        W01, V1_map = W0.sub(1).collapse()
 
-    dofs_ux = np.array(V_map)[np.array(V0_map)]
-    dofs_uy = np.array(V_map)[np.array(V1_map)]
-    dofs_p = np.array(P_map_fx)
+        coords_ux = W00.tabulate_dof_coordinates()[:, :2]
+        coords_uy = W01.tabulate_dof_coordinates()[:, :2]
+        coords_p = W1.tabulate_dof_coordinates()[:, :2]
 
-    all_coords[dofs_ux] = coords_ux
-    all_coords[dofs_uy] = coords_uy
-    all_coords[dofs_p] = coords_p
-    
-    return all_coords
+        dofs_ux = np.array(V_map)[np.array(V0_map)]
+        dofs_uy = np.array(V_map)[np.array(V1_map)]
+        dofs_p = np.array(P_map_fx)
+
+        all_coords[dofs_ux] = coords_ux
+        all_coords[dofs_uy] = coords_uy
+        all_coords[dofs_p] = coords_p
+        return all_coords
+
+    if nsub == 3:
+        # Mixed space: (vector, vector, scalar) e.g. (v, u, p)
+        Wv, Vv_map = W_fenicsx.sub(0).collapse()
+        Wu, Vu_map = W_fenicsx.sub(1).collapse()
+        Wp, P_map_fx = W_fenicsx.sub(2).collapse()
+
+        Wv0, Vv0_map = Wv.sub(0).collapse()
+        Wv1, Vv1_map = Wv.sub(1).collapse()
+        Wu0, Vu0_map = Wu.sub(0).collapse()
+        Wu1, Vu1_map = Wu.sub(1).collapse()
+
+        coords_vx = Wv0.tabulate_dof_coordinates()[:, :2]
+        coords_vy = Wv1.tabulate_dof_coordinates()[:, :2]
+        coords_ux = Wu0.tabulate_dof_coordinates()[:, :2]
+        coords_uy = Wu1.tabulate_dof_coordinates()[:, :2]
+        coords_p = Wp.tabulate_dof_coordinates()[:, :2]
+
+        dofs_vx = np.array(Vv_map)[np.array(Vv0_map)]
+        dofs_vy = np.array(Vv_map)[np.array(Vv1_map)]
+        dofs_ux = np.array(Vu_map)[np.array(Vu0_map)]
+        dofs_uy = np.array(Vu_map)[np.array(Vu1_map)]
+        dofs_p = np.array(P_map_fx)
+
+        all_coords[dofs_vx] = coords_vx
+        all_coords[dofs_vy] = coords_vy
+        all_coords[dofs_ux] = coords_ux
+        all_coords[dofs_uy] = coords_uy
+        all_coords[dofs_p] = coords_p
+        return all_coords
+
+    raise NotImplementedError(f"Unsupported mixed space layout with num_sub_spaces={nsub}.")
 
 def one_to_one_map_coords(coords1, coords2):
     C = np.linalg.norm(coords2[:, np.newaxis, :] - coords1[np.newaxis, :, :], axis=2)
@@ -448,6 +484,738 @@ def create_true_dof_map(dof_handler_pc, W_fenicsx):
     P[pc_dofs['p']] = fx_dofs['p'][coord_map_q1]
     print("True DoF map discovered successfully.")
     return P
+
+
+# ==============================================================================
+#  Poroelastic (Eulerian/reference-map) comparison harness (v,u,p) vs FEniCSx
+# ==============================================================================
+
+
+def setup_poro_problems(*, nx: int = 1, ny: int = 1):
+    """
+    Build a small poro mixed space:
+      pycutfem: (v_x,v_y,u_x,u_y) Q2 + p Q1
+      dolfinx : (v,u,p) as (P2_vec, P2_vec, P1)
+    """
+    # --- pycutfem mesh (Q2 geometry so coordinates match dolfinx's Q2 dofs) ---
+    nodes_q2, elems_q2, _, corners_q2 = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
+    mesh_q2 = Mesh(
+        nodes=nodes_q2,
+        element_connectivity=elems_q2,
+        elements_corner_nodes=corners_q2,
+        element_type="quad",
+        poly_order=2,
+    )
+    mesh_q2.tag_boundary_edges({"all": lambda x, y: True})
+
+    mixed_element_pc = MixedElement(mesh_q2, field_specs={"v_x": 2, "v_y": 2, "u_x": 2, "u_y": 2, "p": 1})
+    dof_handler_pc = DofHandler(mixed_element_pc, method="cg")
+
+    Vv_pc = FunctionSpace("v", ["v_x", "v_y"], dim=1)
+    Vu_pc = FunctionSpace("u", ["u_x", "u_y"], dim=1)
+    Qp_pc = FunctionSpace("p", ["p"], dim=0)
+
+    pc = {
+        # trial/test
+        "dv": VectorTrialFunction(Vv_pc, dof_handler=dof_handler_pc),
+        "du": VectorTrialFunction(Vu_pc, dof_handler=dof_handler_pc),
+        "dp": TrialFunction(Qp_pc, dof_handler=dof_handler_pc),
+        "w": VectorTestFunction(Vv_pc, dof_handler=dof_handler_pc),
+        "eta": VectorTestFunction(Vu_pc, dof_handler=dof_handler_pc),
+        "q": TestFunction(Qp_pc, dof_handler=dof_handler_pc),
+        # states
+        "v_k": VectorFunction(name="v_k", field_names=["v_x", "v_y"], dof_handler=dof_handler_pc),
+        "u_k": VectorFunction(name="u_k", field_names=["u_x", "u_y"], dof_handler=dof_handler_pc),
+        "p_k": Function(name="p_k", field_name="p", dof_handler=dof_handler_pc),
+        "v_n": VectorFunction(name="v_n", field_names=["v_x", "v_y"], dof_handler=dof_handler_pc),
+        "u_n": VectorFunction(name="u_n", field_names=["u_x", "u_y"], dof_handler=dof_handler_pc),
+        "u_nm1": VectorFunction(name="u_nm1", field_names=["u_x", "u_y"], dof_handler=dof_handler_pc),
+        "p_n": Function(name="p_n", field_name="p", dof_handler=dof_handler_pc),
+        # parameters
+        "rho_f": Constant(0.9, dim=0),
+        "mu_f": Constant(1.1, dim=0),
+        "rho_s0_tilde": Constant(1.0, dim=0),
+        "phi": Constant(0.6, dim=0),
+        "dt": Constant(0.1, dim=0),
+        "theta": Constant(0.5, dim=0),
+        "c_nh": Constant(0.7, dim=0),
+        "beta_nh": Constant(0.0, dim=0),
+        # permeability K^{-1} in reference domain
+        "K_inv_I": Identity(2),
+        "K_inv_A": Constant([[2.0, 0.3], [0.1, 1.5]], dim=2),
+        "normal": FacetNormal(),
+        "mesh": mesh_q2,
+    }
+
+    # --- dolfinx mesh / mixed space ---
+    mesh_fx = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, nx, ny, dolfinx.mesh.CellType.quadrilateral)
+    gdim = mesh_fx.geometry.dim
+    P2_vec = basix.ufl.element("Lagrange", "quadrilateral", 2, shape=(gdim,))
+    P1 = basix.ufl.element("Lagrange", "quadrilateral", 1)
+    W_el = mixed_element([P2_vec, P2_vec, P1])
+    W = dolfinx.fem.functionspace(mesh_fx, W_el)
+
+    fenicsx = {
+        "W": W,
+        "mesh": mesh_fx,
+        "rho_f": dolfinx.fem.Constant(mesh_fx, 0.9),
+        "mu_f": dolfinx.fem.Constant(mesh_fx, 1.1),
+        "rho_s0_tilde": dolfinx.fem.Constant(mesh_fx, 1.0),
+        "phi": dolfinx.fem.Constant(mesh_fx, 0.6),
+        "dt": dolfinx.fem.Constant(mesh_fx, 0.1),
+        "theta": dolfinx.fem.Constant(mesh_fx, 0.5),
+        "c_nh": dolfinx.fem.Constant(mesh_fx, 0.7),
+        "beta_nh": dolfinx.fem.Constant(mesh_fx, 0.0),
+        "normal": ufl.FacetNormal(mesh_fx),
+        # states (mixed)
+        "w_k": dolfinx.fem.Function(W, name="w_k"),
+        "w_n": dolfinx.fem.Function(W, name="w_n"),
+        "w_nm1": dolfinx.fem.Function(W, name="w_nm1"),
+        # permeability tensors
+        "K_inv_I": ufl.Identity(gdim),
+        "K_inv_A": ufl.as_matrix(((2.0, 0.3), (0.1, 1.5))),
+    }
+
+    return pc, dof_handler_pc, fenicsx
+
+
+def create_true_dof_map_poro(dof_handler_pc: DofHandler, W_fenicsx):
+    print("=" * 70)
+    print("Discovering poro DoF map (v,u,p) by matching DoF coordinates...")
+    print("=" * 70)
+
+    # fenics: W = (v,u,p)
+    Wv, Vv_map = W_fenicsx.sub(0).collapse()
+    Wu, Vu_map = W_fenicsx.sub(1).collapse()
+    Wp, P_map_fx = W_fenicsx.sub(2).collapse()
+
+    Wv0, Vv0_map = Wv.sub(0).collapse()
+    Wv1, Vv1_map = Wv.sub(1).collapse()
+    Wu0, Vu0_map = Wu.sub(0).collapse()
+    Wu1, Vu1_map = Wu.sub(1).collapse()
+
+    fx_coords = {
+        "v_x": Wv0.tabulate_dof_coordinates()[:, :2],
+        "v_y": Wv1.tabulate_dof_coordinates()[:, :2],
+        "u_x": Wu0.tabulate_dof_coordinates()[:, :2],
+        "u_y": Wu1.tabulate_dof_coordinates()[:, :2],
+        "p": Wp.tabulate_dof_coordinates()[:, :2],
+    }
+    fx_dofs = {
+        "v_x": np.array(Vv_map)[np.array(Vv0_map)],
+        "v_y": np.array(Vv_map)[np.array(Vv1_map)],
+        "u_x": np.array(Vu_map)[np.array(Vu0_map)],
+        "u_y": np.array(Vu_map)[np.array(Vu1_map)],
+        "p": np.array(P_map_fx),
+    }
+
+    pc_fields = ["v_x", "v_y", "u_x", "u_y", "p"]
+    pc_coords = {f: get_pycutfem_dof_coords(dof_handler_pc, f) for f in pc_fields}
+    pc_dofs = {f: dof_handler_pc.get_field_slice(f) for f in pc_fields}
+
+    P = np.zeros(dof_handler_pc.total_dofs, dtype=int)
+
+    # v_x and v_y share coordinates in vector Q2 space
+    coord_map_v = one_to_one_map_coords(pc_coords["v_x"], fx_coords["v_x"])
+    P[pc_dofs["v_x"]] = fx_dofs["v_x"][coord_map_v]
+    P[pc_dofs["v_y"]] = fx_dofs["v_y"][coord_map_v]
+
+    # u_x and u_y share coordinates in vector Q2 space
+    coord_map_u = one_to_one_map_coords(pc_coords["u_x"], fx_coords["u_x"])
+    P[pc_dofs["u_x"]] = fx_dofs["u_x"][coord_map_u]
+    P[pc_dofs["u_y"]] = fx_dofs["u_y"][coord_map_u]
+
+    # p is Q1
+    coord_map_p = one_to_one_map_coords(pc_coords["p"], fx_coords["p"])
+    P[pc_dofs["p"]] = fx_dofs["p"][coord_map_p]
+
+    print("Poro DoF map discovered successfully.")
+    return P
+
+
+def initialize_poro_functions(pc, fenicsx, dof_handler_pc, P_map):
+    print("Initializing poro (v,u,p) functions in pycutfem and FEniCSx...")
+
+    def v_k_init(x):
+        return [0.1 + 0.2 * x[0] + 0.05 * x[1], -0.03 + 0.1 * x[0] - 0.07 * x[1]]
+
+    def u_k_init(x):
+        # keep gradients small so F = inv(I - grad(u)) is well-defined
+        return [0.02 * x[0] * (1.0 - x[0]) + 0.01 * x[1], -0.01 * x[1] * (1.0 - x[1]) + 0.005 * x[0]]
+
+    def p_k_init(x):
+        return 0.2 * x[0] - 0.1 * x[1]
+
+    def v_n_init(x):
+        vv = v_k_init(x)
+        return [0.5 * vv[0], 0.5 * vv[1]]
+
+    def u_n_init(x):
+        uu = u_k_init(x)
+        return [0.6 * uu[0], 0.6 * uu[1]]
+
+    def u_nm1_init(x):
+        uu = u_k_init(x)
+        return [0.2 * uu[0], 0.2 * uu[1]]
+
+    def p_n_init(x):
+        return 0.5 * p_k_init(x)
+
+    # --- pycutfem ---
+    pc["v_k"].set_values_from_function(lambda x, y: v_k_init([x, y]))
+    pc["u_k"].set_values_from_function(lambda x, y: u_k_init([x, y]))
+    pc["p_k"].set_values_from_function(lambda x, y: p_k_init([x, y]))
+    pc["v_n"].set_values_from_function(lambda x, y: v_n_init([x, y]))
+    pc["u_n"].set_values_from_function(lambda x, y: u_n_init([x, y]))
+    pc["u_nm1"].set_values_from_function(lambda x, y: u_nm1_init([x, y]))
+    pc["p_n"].set_values_from_function(lambda x, y: p_n_init([x, y]))
+
+    # --- FEniCSx ---
+    W = fenicsx["W"]
+    w_k = fenicsx["w_k"]
+    w_n = fenicsx["w_n"]
+    w_nm1 = fenicsx["w_nm1"]
+
+    Vv, Vv_to_W = W.sub(0).collapse()
+    Vu, Vu_to_W = W.sub(1).collapse()
+    Q, Q_to_W = W.sub(2).collapse()
+
+    v_k_view = w_k.sub(0)
+    u_k_view = w_k.sub(1)
+    p_k_view = w_k.sub(2)
+
+    v_n_view = w_n.sub(0)
+    u_n_view = w_n.sub(1)
+    p_n_view = w_n.sub(2)
+
+    u_nm1_view = w_nm1.sub(1)
+
+    w_k.x.array[Vv_to_W] = v_k_view.debug_interpolate(v_k_init)
+    w_k.x.array[Vu_to_W] = u_k_view.debug_interpolate(u_k_init)
+    w_k.x.array[Q_to_W] = p_k_view.debug_interpolate(p_k_init)
+    w_k.x.scatter_forward()
+
+    w_n.x.array[Vv_to_W] = v_n_view.debug_interpolate(v_n_init)
+    w_n.x.array[Vu_to_W] = u_n_view.debug_interpolate(u_n_init)
+    w_n.x.array[Q_to_W] = p_n_view.debug_interpolate(p_n_init)
+    w_n.x.scatter_forward()
+
+    # only u_{n-1} is used; other subfields are irrelevant
+    w_nm1.x.array[Vu_to_W] = u_nm1_view.debug_interpolate(u_nm1_init)
+    w_nm1.x.scatter_forward()
+
+    # sanity: check sets of nodal values agree for v_k (unordered)
+    np.testing.assert_allclose(np.sort(pc["v_k"].nodal_values), np.sort(w_k.x.array[Vv_to_W]), rtol=1e-8, atol=1e-12)
+    print("✅ Poro initialization: nodal value sets match (v_k).")
+
+
+def _poro_k_inv_pc(u, *, K_inv):
+    """k^{-1} = J F^{-T} K^{-1} F^{-1}, with F^{-1} = I - ∇u (Eulerian reference-map)."""
+    F = inv(Identity(2) - grad(u))
+    J = det(F)
+    F_inv = Identity(2) - grad(u)
+    return J * dot(F_inv.T, dot(K_inv, F_inv))
+
+
+def _poro_k_inv_pc_iso_short(u):
+    F = inv(Identity(2) - grad(u))
+    J = det(F)
+    F_inv = Identity(2) - grad(u)
+    return J * dot(F_inv.T, F_inv)
+
+
+def _poro_sigma_nh_pc(u, *, c, beta):
+    F = inv(Identity(2) - grad(u))
+    J = det(F)
+    B = dot(F, F.T)
+    a = J ** (-Constant(2.0, dim=0) * beta)
+    return (Constant(2.0, dim=0) * c / J) * (B - a * Identity(2))
+
+
+def _poro_dk_inv_pc(u, du, *, K_inv):
+    """Gateaux derivative of k^{-1} = J F^{-T} K^{-1} F^{-1} in direction du."""
+    F_inv = Identity(2) - grad(u)
+    F = inv(F_inv)
+    J = det(F)
+
+    dF = dot(F, dot(grad(du), F))
+    dJ = J * trace(dot(F_inv, dF))
+
+    dF_inv = -grad(du)
+    dF_inv_T = dF_inv.T
+
+    base = dot(F_inv.T, dot(K_inv, F_inv))
+    return dJ * base + J * dot(dF_inv_T, dot(K_inv, F_inv)) + J * dot(F_inv.T, dot(K_inv, dF_inv))
+
+
+def _poro_dk_inv_pc_iso_short(u, du):
+    """Gateaux derivative of k^{-1} = J F^{-T} F^{-1} (avoids Dot(Identity,·))."""
+    F_inv = Identity(2) - grad(u)
+    F = inv(F_inv)
+    J = det(F)
+
+    dF = dot(F, dot(grad(du), F))
+    dJ = J * trace(dot(F_inv, dF))
+
+    dF_inv = -grad(du)
+    dF_inv_T = dF_inv.T
+
+    base = dot(F_inv.T, F_inv)
+    return dJ * base + J * dot(dF_inv_T, F_inv) + J * dot(F_inv.T, dF_inv)
+
+
+def _poro_dsigma_nh_pc(u, du, *, c, beta):
+    """Gateaux derivative of Neo-Hookean Cauchy stress in direction du."""
+    F_inv = Identity(2) - grad(u)
+    F = inv(F_inv)
+    dF = dot(F, dot(grad(du), F))
+
+    J = det(F)
+    dJ = J * trace(dot(F_inv, dF))
+
+    I2 = Identity(2)
+    a = J ** (-Constant(2.0, dim=0) * beta)
+    da = -(Constant(2.0, dim=0) * beta) * a * (dJ / J)
+
+    B = dot(F, F.T)
+    dB = dot(dF, F.T) + dot(F, dF.T)
+
+    return Constant(2.0, dim=0) * c * (-(dJ / (J * J)) * (B - a * I2) + (Constant(1.0, dim=0) / J) * (dB - da * I2))
+
+
+def run_poro_comparison():
+    pc, dof_handler_pc, fenicsx = setup_poro_problems()
+    W_fx = fenicsx["W"]
+    P_map = create_true_dof_map_poro(dof_handler_pc, W_fx)
+    initialize_poro_functions(pc, fenicsx, dof_handler_pc, P_map)
+
+    # Split mixed functions and arguments on the FEniCSx side
+    dv_fx, du_fx, dp_fx = ufl.split(ufl.TrialFunction(W_fx))
+    w_fx, eta_fx, q_fx = ufl.split(ufl.TestFunction(W_fx))
+
+    v_k_fx, u_k_fx, p_k_fx = ufl.split(fenicsx["w_k"])
+    v_n_fx, u_n_fx, p_n_fx = ufl.split(fenicsx["w_n"])
+    _v_nm1_fx, u_nm1_fx, _p_nm1_fx = ufl.split(fenicsx["w_nm1"])
+
+    # parameters
+    rho_f_pc = pc["rho_f"]
+    mu_f_pc = pc["mu_f"]
+    rho_s_pc = pc["rho_s0_tilde"]
+    phi_pc = pc["phi"]
+    dt_pc = pc["dt"]
+    theta_pc = pc["theta"]
+    c_nh_pc = pc["c_nh"]
+    beta_nh_pc = pc["beta_nh"]
+
+    rho_f_fx = fenicsx["rho_f"]
+    mu_f_fx = fenicsx["mu_f"]
+    rho_s_fx = fenicsx["rho_s0_tilde"]
+    phi_fx = fenicsx["phi"]
+    dt_fx = fenicsx["dt"]
+    theta_fx = fenicsx["theta"]
+    c_nh_fx = fenicsx["c_nh"]
+    beta_nh_fx = fenicsx["beta_nh"]
+
+    # --- Helper kinematics (pc) ---
+    v_s_k_pc = (pc["u_k"] - pc["u_n"]) / dt_pc
+    v_s_n_pc = (pc["u_n"] - pc["u_nm1"]) / dt_pc
+
+    div_v_s_k_pc = (div(pc["u_k"]) - div(pc["u_n"])) / dt_pc
+    div_v_s_n_pc = (div(pc["u_n"]) - div(pc["u_nm1"])) / dt_pc
+    grad_v_s_k_pc = (grad(pc["u_k"]) - grad(pc["u_n"])) / dt_pc
+    grad_v_s_n_pc = (grad(pc["u_n"]) - grad(pc["u_nm1"])) / dt_pc
+
+    # --- Helper kinematics (fx) ---
+    v_s_k_fx = (u_k_fx - u_n_fx) / dt_fx
+    v_s_n_fx = (u_n_fx - u_nm1_fx) / dt_fx
+
+    # Permeability variants
+    K_inv_I_pc = pc["K_inv_I"]
+    K_inv_A_pc = pc["K_inv_A"]
+    K_inv_I_fx = fenicsx["K_inv_I"]
+    K_inv_A_fx = fenicsx["K_inv_A"]
+
+    # Measures
+    qdeg = int(os.environ.get("COMP_FENICS_QDEG", "6"))
+    dx_pc = dx(metadata={"q": qdeg})
+    dx_fx = ufl.dx(metadata={"quadrature_degree": qdeg})
+
+    # --- Residual subterms (pc) ---
+    p_theta_pc = theta_pc * pc["p_k"] + (Constant(1.0, dim=0) - theta_pc) * pc["p_n"]
+    div_mix_k_pc = phi_pc * div(pc["v_k"]) + (Constant(1.0, dim=0) - phi_pc) * div_v_s_k_pc
+    div_mix_n_pc = phi_pc * div(pc["v_n"]) + (Constant(1.0, dim=0) - phi_pc) * div_v_s_n_pc
+    r_mass_pc = pc["q"] * (theta_pc * div_mix_k_pc + (Constant(1.0, dim=0) - theta_pc) * div_mix_n_pc) * dx_pc
+
+    vdot_pc = (pc["v_k"] - pc["v_n"]) / dt_pc
+    r_v_inertia_pc = inner(rho_f_pc * vdot_pc, pc["w"]) * dx_pc
+    r_v_pres_pc = -inner(p_theta_pc, div(pc["w"])) * dx_pc
+
+    conv_k_pc = -rho_f_pc * dot(grad(pc["v_k"]), v_s_k_pc)
+    conv_n_pc = -rho_f_pc * dot(grad(pc["v_n"]), v_s_n_pc)
+    r_v_conv_pc = inner(theta_pc * conv_k_pc + (Constant(1.0, dim=0) - theta_pc) * conv_n_pc, pc["w"]) * dx_pc
+
+    # drag: isotropic shortcut
+    k_inv_iso_pc = _poro_k_inv_pc_iso_short(pc["u_k"])
+    drag_k_iso_pc = mu_f_pc * (phi_pc * phi_pc) * dot(k_inv_iso_pc, (pc["v_k"] - v_s_k_pc))
+    drag_n_iso_pc = mu_f_pc * (phi_pc * phi_pc) * dot(_poro_k_inv_pc_iso_short(pc["u_n"]), (pc["v_n"] - v_s_n_pc))
+    drag_theta_iso_pc = theta_pc * drag_k_iso_pc + (Constant(1.0, dim=0) - theta_pc) * drag_n_iso_pc
+    r_v_drag_iso_pc = inner(drag_theta_iso_pc, pc["w"]) * dx_pc
+
+    # drag: isotropic but force Dot(Identity,·) path in k^{-1}
+    k_inv_iso_full_pc = _poro_k_inv_pc(pc["u_k"], K_inv=K_inv_I_pc)
+    drag_k_iso_full_pc = mu_f_pc * (phi_pc * phi_pc) * dot(k_inv_iso_full_pc, (pc["v_k"] - v_s_k_pc))
+    r_v_drag_iso_full_pc = inner(theta_pc * drag_k_iso_full_pc, pc["w"]) * dx_pc
+
+    # drag: anisotropic
+    k_inv_A_pc = _poro_k_inv_pc(pc["u_k"], K_inv=K_inv_A_pc)
+    drag_k_A_pc = mu_f_pc * (phi_pc * phi_pc) * dot(k_inv_A_pc, (pc["v_k"] - v_s_k_pc))
+    r_v_drag_A_pc = inner(theta_pc * drag_k_A_pc, pc["w"]) * dx_pc
+
+    # skeleton acceleration
+    acc_local_pc = (v_s_k_pc - v_s_n_pc) / dt_pc
+    adv_k_pc = dot(grad_v_s_k_pc, v_s_k_pc)
+    adv_n_pc = dot(grad_v_s_n_pc, v_s_n_pc)
+    acc_pc = acc_local_pc + theta_pc * adv_k_pc + (Constant(1.0, dim=0) - theta_pc) * adv_n_pc
+    r_u_acc_pc = inner(rho_s_pc * acc_pc, pc["eta"]) * dx_pc
+
+    # skeleton stress
+    sig_k_pc = _poro_sigma_nh_pc(pc["u_k"], c=c_nh_pc, beta=beta_nh_pc)
+    sig_n_pc = _poro_sigma_nh_pc(pc["u_n"], c=c_nh_pc, beta=beta_nh_pc)
+    sig_theta_pc = theta_pc * sig_k_pc + (Constant(1.0, dim=0) - theta_pc) * sig_n_pc
+    r_u_sig_pc = inner(sig_theta_pc, grad(pc["eta"])) * dx_pc
+
+    r_u_pres_pc = inner(phi_pc * p_theta_pc, div(pc["eta"])) * dx_pc
+    r_u_drag_iso_pc = -inner(drag_theta_iso_pc, pc["eta"]) * dx_pc
+
+    r_total_pc = (
+        r_mass_pc
+        + r_v_inertia_pc
+        + r_v_pres_pc
+        + r_v_conv_pc
+        + r_v_drag_iso_pc
+        + r_u_acc_pc
+        + r_u_sig_pc
+        + r_u_pres_pc
+        + r_u_drag_iso_pc
+    )
+
+    # --- Residual subterms (fenics) ---
+    I2_fx = ufl.Identity(2)
+    p_theta_fx = theta_fx * p_k_fx + (1.0 - theta_fx) * p_n_fx
+
+    div_mix_k_fx = phi_fx * ufl.div(v_k_fx) + (1.0 - phi_fx) * ufl.div(v_s_k_fx)
+    div_mix_n_fx = phi_fx * ufl.div(v_n_fx) + (1.0 - phi_fx) * ufl.div(v_s_n_fx)
+    r_mass_fx = (q_fx * (theta_fx * div_mix_k_fx + (1.0 - theta_fx) * div_mix_n_fx)) * dx_fx
+
+    vdot_fx = (v_k_fx - v_n_fx) / dt_fx
+    r_v_inertia_fx = ufl.inner(rho_f_fx * vdot_fx, w_fx) * dx_fx
+    r_v_pres_fx = -ufl.inner(p_theta_fx, ufl.div(w_fx)) * dx_fx
+
+    conv_k_fx = -rho_f_fx * ufl.dot(ufl.grad(v_k_fx), v_s_k_fx)
+    conv_n_fx = -rho_f_fx * ufl.dot(ufl.grad(v_n_fx), v_s_n_fx)
+    r_v_conv_fx = ufl.inner(theta_fx * conv_k_fx + (1.0 - theta_fx) * conv_n_fx, w_fx) * dx_fx
+
+    Fk_fx = ufl.inv(I2_fx - ufl.grad(u_k_fx))
+    Jk_fx = ufl.det(Fk_fx)
+    Finv_k_fx = I2_fx - ufl.grad(u_k_fx)
+    k_inv_iso_short_fx = Jk_fx * ufl.dot(Finv_k_fx.T, Finv_k_fx)
+    k_inv_iso_full_fx = Jk_fx * ufl.dot(Finv_k_fx.T, ufl.dot(K_inv_I_fx, Finv_k_fx))
+    k_inv_A_fx = Jk_fx * ufl.dot(Finv_k_fx.T, ufl.dot(K_inv_A_fx, Finv_k_fx))
+
+    drag_k_iso_fx = mu_f_fx * (phi_fx * phi_fx) * ufl.dot(k_inv_iso_short_fx, (v_k_fx - v_s_k_fx))
+    Finv_n_fx = I2_fx - ufl.grad(u_n_fx)
+    Fn_k_fx = ufl.inv(Finv_n_fx)
+    Jn_k_fx = ufl.det(Fn_k_fx)
+    k_inv_iso_short_n_fx = Jn_k_fx * ufl.dot(Finv_n_fx.T, Finv_n_fx)
+    drag_n_iso_fx = mu_f_fx * (phi_fx * phi_fx) * ufl.dot(k_inv_iso_short_n_fx, (v_n_fx - v_s_n_fx))
+    drag_theta_iso_fx = theta_fx * drag_k_iso_fx + (1.0 - theta_fx) * drag_n_iso_fx
+    r_v_drag_iso_fx = ufl.inner(drag_theta_iso_fx, w_fx) * dx_fx
+
+    drag_k_iso_full_fx = mu_f_fx * (phi_fx * phi_fx) * ufl.dot(k_inv_iso_full_fx, (v_k_fx - v_s_k_fx))
+    r_v_drag_iso_full_fx = ufl.inner(theta_fx * drag_k_iso_full_fx, w_fx) * dx_fx
+
+    drag_k_A_fx = mu_f_fx * (phi_fx * phi_fx) * ufl.dot(k_inv_A_fx, (v_k_fx - v_s_k_fx))
+    r_v_drag_A_fx = ufl.inner(theta_fx * drag_k_A_fx, w_fx) * dx_fx
+
+    acc_local_fx = (v_s_k_fx - v_s_n_fx) / dt_fx
+    adv_k_fx = ufl.dot(ufl.grad(v_s_k_fx), v_s_k_fx)
+    adv_n_fx = ufl.dot(ufl.grad(v_s_n_fx), v_s_n_fx)
+    acc_fx = acc_local_fx + theta_fx * adv_k_fx + (1.0 - theta_fx) * adv_n_fx
+    r_u_acc_fx = ufl.inner(rho_s_fx * acc_fx, eta_fx) * dx_fx
+
+    Bk_fx = ufl.dot(Fk_fx, Fk_fx.T)
+    a_fx = Jk_fx ** (-2.0 * beta_nh_fx)
+    sig_k_fx = (2.0 * c_nh_fx / Jk_fx) * (Bk_fx - a_fx * I2_fx)
+    Fn_fx = ufl.inv(I2_fx - ufl.grad(u_n_fx))
+    Jn_fx = ufl.det(Fn_fx)
+    Bn_fx = ufl.dot(Fn_fx, Fn_fx.T)
+    a_n_fx = Jn_fx ** (-2.0 * beta_nh_fx)
+    sig_n_fx = (2.0 * c_nh_fx / Jn_fx) * (Bn_fx - a_n_fx * I2_fx)
+    sig_theta_fx = theta_fx * sig_k_fx + (1.0 - theta_fx) * sig_n_fx
+    r_u_sig_fx = ufl.inner(sig_theta_fx, ufl.grad(eta_fx)) * dx_fx
+
+    r_u_pres_fx = ufl.inner(phi_fx * p_theta_fx, ufl.div(eta_fx)) * dx_fx
+    r_u_drag_iso_fx = -ufl.inner(drag_theta_iso_fx, eta_fx) * dx_fx
+
+    r_total_fx = (
+        r_mass_fx
+        + r_v_inertia_fx
+        + r_v_pres_fx
+        + r_v_conv_fx
+        + r_v_drag_iso_fx
+        + r_u_acc_fx
+        + r_u_sig_fx
+        + r_u_pres_fx
+        + r_u_drag_iso_fx
+    )
+
+    # --- Jacobian subterms (pc) ---
+    # mixture divergence Jacobian
+    div_dv_s_pc = div(pc["du"]) / dt_pc
+    a_mass_pc = pc["q"] * (theta_pc * (phi_pc * div(pc["dv"]) + (Constant(1.0, dim=0) - phi_pc) * div_dv_s_pc)) * dx_pc
+
+    a_v_inertia_pc = inner(rho_f_pc * (pc["dv"] / dt_pc), pc["w"]) * dx_pc
+    a_v_pres_pc = -inner(theta_pc * pc["dp"], div(pc["w"])) * dx_pc
+
+    dv_s_pc = pc["du"] / dt_pc
+    grad_dv_s_pc = grad(pc["du"]) / dt_pc
+    a_v_conv_v_pc = inner(theta_pc * (-rho_f_pc * dot(grad(pc["dv"]), v_s_k_pc)), pc["w"]) * dx_pc
+    a_v_conv_u_pc = inner(theta_pc * (-rho_f_pc * dot(grad(pc["v_k"]), dv_s_pc)), pc["w"]) * dx_pc
+
+    # drag Jacobian (isotropic shortcut) split: freeze + dk^{-1}
+    dk_inv_iso_pc = _poro_dk_inv_pc_iso_short(pc["u_k"], pc["du"])
+    ddrag_iso_freeze_pc = mu_f_pc * (phi_pc * phi_pc) * dot(k_inv_iso_pc, (pc["dv"] - dv_s_pc))
+    ddrag_iso_dk_pc = mu_f_pc * (phi_pc * phi_pc) * dot(dk_inv_iso_pc, (pc["v_k"] - v_s_k_pc))
+    a_v_drag_iso_freeze_pc = inner(theta_pc * ddrag_iso_freeze_pc, pc["w"]) * dx_pc
+    a_v_drag_iso_dk_pc = inner(theta_pc * ddrag_iso_dk_pc, pc["w"]) * dx_pc
+    a_v_drag_iso_full_pc = a_v_drag_iso_freeze_pc + a_v_drag_iso_dk_pc
+
+    a_u_drag_iso_freeze_pc = -inner(theta_pc * ddrag_iso_freeze_pc, pc["eta"]) * dx_pc
+    a_u_drag_iso_dk_pc = -inner(theta_pc * ddrag_iso_dk_pc, pc["eta"]) * dx_pc
+    a_u_drag_iso_full_pc = a_u_drag_iso_freeze_pc + a_u_drag_iso_dk_pc
+
+    # Optional drag Jacobians for debugging: full-I and anisotropic K^{-1}
+    dk_inv_iso_full_pc = _poro_dk_inv_pc(pc["u_k"], pc["du"], K_inv=K_inv_I_pc)
+    ddrag_iso_full_freeze_pc = mu_f_pc * (phi_pc * phi_pc) * dot(k_inv_iso_full_pc, (pc["dv"] - dv_s_pc))
+    ddrag_iso_full_dk_pc = mu_f_pc * (phi_pc * phi_pc) * dot(dk_inv_iso_full_pc, (pc["v_k"] - v_s_k_pc))
+    a_v_drag_iso_fullI_freeze_pc = inner(theta_pc * ddrag_iso_full_freeze_pc, pc["w"]) * dx_pc
+    a_v_drag_iso_fullI_dk_pc = inner(theta_pc * ddrag_iso_full_dk_pc, pc["w"]) * dx_pc
+    a_v_drag_iso_fullI_full_pc = a_v_drag_iso_fullI_freeze_pc + a_v_drag_iso_fullI_dk_pc
+
+    dk_inv_A_pc = _poro_dk_inv_pc(pc["u_k"], pc["du"], K_inv=K_inv_A_pc)
+    ddrag_A_freeze_pc = mu_f_pc * (phi_pc * phi_pc) * dot(k_inv_A_pc, (pc["dv"] - dv_s_pc))
+    ddrag_A_dk_pc = mu_f_pc * (phi_pc * phi_pc) * dot(dk_inv_A_pc, (pc["v_k"] - v_s_k_pc))
+    a_v_drag_A_freeze_pc = inner(theta_pc * ddrag_A_freeze_pc, pc["w"]) * dx_pc
+    a_v_drag_A_dk_pc = inner(theta_pc * ddrag_A_dk_pc, pc["w"]) * dx_pc
+    a_v_drag_A_full_pc = a_v_drag_A_freeze_pc + a_v_drag_A_dk_pc
+
+    # skeleton acceleration Jacobian: local + advective (Eulerian material acceleration)
+    a_u_acc_local_pc = inner(rho_s_pc * (dv_s_pc / dt_pc), pc["eta"]) * dx_pc
+    a_u_acc_adv1_pc = inner(rho_s_pc * theta_pc * dot(grad_dv_s_pc, v_s_k_pc), pc["eta"]) * dx_pc
+    a_u_acc_adv2_pc = inner(rho_s_pc * theta_pc * dot(grad_v_s_k_pc, dv_s_pc), pc["eta"]) * dx_pc
+    a_u_acc_full_pc = a_u_acc_local_pc + a_u_acc_adv1_pc + a_u_acc_adv2_pc
+
+    # skeleton stress Jacobian
+    dsig_k_pc = _poro_dsigma_nh_pc(pc["u_k"], pc["du"], c=c_nh_pc, beta=beta_nh_pc)
+    a_u_sig_pc = inner(theta_pc * dsig_k_pc, grad(pc["eta"])) * dx_pc
+
+    a_u_pres_pc = inner(phi_pc * theta_pc * pc["dp"], div(pc["eta"])) * dx_pc
+
+    a_total_pc = (
+        a_mass_pc
+        + a_v_inertia_pc
+        + a_v_pres_pc
+        + a_v_conv_v_pc
+        + a_v_conv_u_pc
+        + a_v_drag_iso_full_pc
+        + a_u_acc_full_pc
+        + a_u_sig_pc
+        + a_u_pres_pc
+        + a_u_drag_iso_full_pc
+    )
+
+    # --- Jacobian subterms (fenics) ---
+    dv_s_fx = du_fx / dt_fx
+    grad_dv_s_fx = ufl.grad(du_fx) / dt_fx
+    grad_v_s_k_fx = (ufl.grad(u_k_fx) - ufl.grad(u_n_fx)) / dt_fx
+
+    a_mass_fx = ufl.derivative(r_mass_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+    a_v_inertia_fx = ufl.derivative(r_v_inertia_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+    a_v_pres_fx = ufl.derivative(r_v_pres_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+
+    # convection split (equals ufl.derivative(r_v_conv_fx, ...))
+    a_v_conv_v_fx = ufl.inner(theta_fx * (-rho_f_fx * ufl.dot(ufl.grad(dv_fx), v_s_k_fx)), w_fx) * dx_fx
+    a_v_conv_u_fx = ufl.inner(theta_fx * (-rho_f_fx * ufl.dot(ufl.grad(v_k_fx), dv_s_fx)), w_fx) * dx_fx
+    a_v_conv_fx = a_v_conv_v_fx + a_v_conv_u_fx
+
+    # drag (iso-short) split: freeze + dk^{-1}
+    a_v_drag_iso_full_fx = ufl.derivative(r_v_drag_iso_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+    a_v_drag_iso_freeze_fx = ufl.inner(
+        theta_fx * (mu_f_fx * (phi_fx * phi_fx) * ufl.dot(k_inv_iso_short_fx, (dv_fx - dv_s_fx))),
+        w_fx,
+    ) * dx_fx
+    a_v_drag_iso_dk_fx = a_v_drag_iso_full_fx - a_v_drag_iso_freeze_fx
+
+    # drag (full-I) split (diagnostic for Dot(Identity,·) path)
+    a_v_drag_iso_fullI_full_fx = ufl.derivative(r_v_drag_iso_full_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+    a_v_drag_iso_fullI_freeze_fx = ufl.inner(
+        theta_fx * (mu_f_fx * (phi_fx * phi_fx) * ufl.dot(k_inv_iso_full_fx, (dv_fx - dv_s_fx))),
+        w_fx,
+    ) * dx_fx
+    a_v_drag_iso_fullI_dk_fx = a_v_drag_iso_fullI_full_fx - a_v_drag_iso_fullI_freeze_fx
+
+    # drag (anisotropic) split
+    a_v_drag_A_full_fx = ufl.derivative(r_v_drag_A_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+    a_v_drag_A_freeze_fx = ufl.inner(
+        theta_fx * (mu_f_fx * (phi_fx * phi_fx) * ufl.dot(k_inv_A_fx, (dv_fx - dv_s_fx))),
+        w_fx,
+    ) * dx_fx
+    a_v_drag_A_dk_fx = a_v_drag_A_full_fx - a_v_drag_A_freeze_fx
+
+    # skeleton acceleration split
+    a_u_acc_full_fx = ufl.derivative(r_u_acc_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+    a_u_acc_local_fx = ufl.inner(rho_s_fx * (dv_s_fx / dt_fx), eta_fx) * dx_fx
+    a_u_acc_adv1_fx = ufl.inner(rho_s_fx * theta_fx * ufl.dot(grad_dv_s_fx, v_s_k_fx), eta_fx) * dx_fx
+    a_u_acc_adv2_fx = ufl.inner(rho_s_fx * theta_fx * ufl.dot(grad_v_s_k_fx, dv_s_fx), eta_fx) * dx_fx
+
+    a_u_sig_fx = ufl.derivative(r_u_sig_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+    a_u_pres_fx = ufl.derivative(r_u_pres_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+
+    # skeleton drag reaction (iso-short) split
+    a_u_drag_iso_full_fx = ufl.derivative(r_u_drag_iso_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+    a_u_drag_iso_freeze_fx = -ufl.inner(
+        theta_fx * (mu_f_fx * (phi_fx * phi_fx) * ufl.dot(k_inv_iso_short_fx, (dv_fx - dv_s_fx))),
+        eta_fx,
+    ) * dx_fx
+    a_u_drag_iso_dk_fx = a_u_drag_iso_full_fx - a_u_drag_iso_freeze_fx
+
+    a_total_fx = ufl.derivative(r_total_fx, fenicsx["w_k"], ufl.TrialFunction(W_fx))
+
+    # --- Term table ---
+    terms = {
+        # Residual pieces
+        "Poro mass div_mix (res)": {"pc": r_mass_pc, "fx": r_mass_fx, "mat": False},
+        "Poro pore inertia (res)": {"pc": r_v_inertia_pc, "fx": r_v_inertia_fx, "mat": False},
+        "Poro pore pressure (res)": {"pc": r_v_pres_pc, "fx": r_v_pres_fx, "mat": False},
+        "Poro pore convection (res)": {"pc": r_v_conv_pc, "fx": r_v_conv_fx, "mat": False},
+        "Poro pore drag iso (res)": {"pc": r_v_drag_iso_pc, "fx": r_v_drag_iso_fx, "mat": False},
+        "Poro pore drag iso fullI (res)": {"pc": r_v_drag_iso_full_pc, "fx": r_v_drag_iso_full_fx, "mat": False},
+        "Poro pore drag aniso (res)": {"pc": r_v_drag_A_pc, "fx": r_v_drag_A_fx, "mat": False},
+        "Poro skeleton accel (res)": {"pc": r_u_acc_pc, "fx": r_u_acc_fx, "mat": False},
+        "Poro skeleton stress (res)": {"pc": r_u_sig_pc, "fx": r_u_sig_fx, "mat": False},
+        "Poro skeleton pressure (res)": {"pc": r_u_pres_pc, "fx": r_u_pres_fx, "mat": False},
+        "Poro skeleton drag reaction (res)": {"pc": r_u_drag_iso_pc, "fx": r_u_drag_iso_fx, "mat": False},
+        "Poro total residual": {"pc": r_total_pc, "fx": r_total_fx, "mat": False},
+        # Jacobian pieces (split to isolate implementation issues)
+        "Poro mass (jac)": {"pc": a_mass_pc, "fx": a_mass_fx, "mat": True},
+        "Poro pore inertia (jac)": {"pc": a_v_inertia_pc, "fx": a_v_inertia_fx, "mat": True},
+        "Poro pore pressure (jac)": {"pc": a_v_pres_pc, "fx": a_v_pres_fx, "mat": True},
+        "Poro pore convection dv (jac)": {"pc": a_v_conv_v_pc, "fx": a_v_conv_v_fx, "mat": True},
+        "Poro pore convection du (jac)": {"pc": a_v_conv_u_pc, "fx": a_v_conv_u_fx, "mat": True},
+        "Poro pore convection (jac)": {"pc": a_v_conv_v_pc + a_v_conv_u_pc, "fx": a_v_conv_fx, "mat": True},
+        "Poro pore drag iso freeze (jac)": {"pc": a_v_drag_iso_freeze_pc, "fx": a_v_drag_iso_freeze_fx, "mat": True},
+        "Poro pore drag iso dk_inv (jac)": {"pc": a_v_drag_iso_dk_pc, "fx": a_v_drag_iso_dk_fx, "mat": True},
+        "Poro pore drag iso (jac)": {"pc": a_v_drag_iso_full_pc, "fx": a_v_drag_iso_full_fx, "mat": True},
+        "Poro pore drag iso fullI freeze (jac)": {"pc": a_v_drag_iso_fullI_freeze_pc, "fx": a_v_drag_iso_fullI_freeze_fx, "mat": True},
+        "Poro pore drag iso fullI dk_inv (jac)": {"pc": a_v_drag_iso_fullI_dk_pc, "fx": a_v_drag_iso_fullI_dk_fx, "mat": True},
+        "Poro pore drag iso fullI (jac)": {"pc": a_v_drag_iso_fullI_full_pc, "fx": a_v_drag_iso_fullI_full_fx, "mat": True},
+        "Poro pore drag aniso freeze (jac)": {"pc": a_v_drag_A_freeze_pc, "fx": a_v_drag_A_freeze_fx, "mat": True},
+        "Poro pore drag aniso dk_inv (jac)": {"pc": a_v_drag_A_dk_pc, "fx": a_v_drag_A_dk_fx, "mat": True},
+        "Poro pore drag aniso (jac)": {"pc": a_v_drag_A_full_pc, "fx": a_v_drag_A_full_fx, "mat": True},
+        "Poro skeleton accel local (jac)": {"pc": a_u_acc_local_pc, "fx": a_u_acc_local_fx, "mat": True},
+        "Poro skeleton accel adv1 (jac)": {"pc": a_u_acc_adv1_pc, "fx": a_u_acc_adv1_fx, "mat": True},
+        "Poro skeleton accel adv2 (jac)": {"pc": a_u_acc_adv2_pc, "fx": a_u_acc_adv2_fx, "mat": True},
+        "Poro skeleton accel (jac)": {"pc": a_u_acc_full_pc, "fx": a_u_acc_full_fx, "mat": True},
+        "Poro skeleton stress (jac)": {"pc": a_u_sig_pc, "fx": a_u_sig_fx, "mat": True},
+        "Poro skeleton pressure (jac)": {"pc": a_u_pres_pc, "fx": a_u_pres_fx, "mat": True},
+        "Poro skeleton drag iso freeze (jac)": {"pc": a_u_drag_iso_freeze_pc, "fx": a_u_drag_iso_freeze_fx, "mat": True},
+        "Poro skeleton drag iso dk_inv (jac)": {"pc": a_u_drag_iso_dk_pc, "fx": a_u_drag_iso_dk_fx, "mat": True},
+        "Poro skeleton drag iso (jac)": {"pc": a_u_drag_iso_full_pc, "fx": a_u_drag_iso_full_fx, "mat": True},
+        "Poro total jacobian (full)": {"pc": a_total_pc, "fx": a_total_fx, "mat": True},
+    }
+
+    # Filter terms: never run everything by default (keeps this debug script fast)
+    run_all = os.environ.get("COMP_FENICS_RUN_ALL", "").lower() in {"1", "true", "yes"}
+    filter_terms = os.environ.get("COMP_FENICS_TERMS")
+    if filter_terms:
+        allowed = {name.strip() for name in filter_terms.split(",") if name.strip()}
+        terms = {k: v for k, v in terms.items() if k in allowed}
+        print(f"Running filtered terms only: {sorted(terms)}")
+    elif not run_all:
+        default = {
+            "Poro mass div_mix (res)",
+            "Poro pore convection (res)",
+            "Poro pore drag iso (res)",
+            "Poro pore drag iso fullI (res)",
+            "Poro pore drag aniso (res)",
+            "Poro mass (jac)",
+            "Poro pore convection (jac)",
+            "Poro pore drag iso (jac)",
+        }
+        terms = {k: v for k, v in terms.items() if k in default}
+        print(f"COMP_FENICS_TERMS not set; running safe default subset: {sorted(terms)}")
+
+    backends_spec = os.environ.get("BACKEND", "jit")
+    if backends_spec.strip().lower() == "all":
+        backends = ["python", "jit", "cpp"]
+    else:
+        backends = [b.strip() for b in backends_spec.split(",") if b.strip()]
+
+    for backend_type in backends:
+        print("\n" + "=" * 70)
+        print(f"PORO COMPARISON (backend={backend_type})")
+        print("=" * 70)
+
+        failed_tests = []
+        success_count = 0
+
+        for name, forms in terms.items():
+            J_pc, R_pc, J_fx, R_fx = None, None, None, None
+
+            print(f"\nCompiling/assembling '{name}' [backend={backend_type}, qdeg={qdeg}]")
+            try:
+                form_fx_compiled = dolfinx.fem.form(forms["fx"])
+            except Exception as exc:
+                print(f"❌ FEniCSx form compilation failed for '{name}': {exc}")
+                failed_tests.append(f"{name} (fenics-compile)")
+                continue
+
+            try:
+                if forms["mat"]:
+                    J_pc, _ = assemble_form(Equation(forms["pc"], None), dof_handler_pc, quad_degree=qdeg, bcs=[], backend=backend_type)
+                    A = dolfinx.fem.petsc.assemble_matrix(form_fx_compiled)
+                    A.assemble()
+                    indptr, indices, data = A.getValuesCSR()
+                    J_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+                else:
+                    _, R_pc = assemble_form(Equation(None, forms["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
+                    vec = dolfinx.fem.petsc.assemble_vector(form_fx_compiled)
+                    R_fx = vec.array
+            except Exception as exc:
+                print(f"❌ Assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                failed_tests.append(f"{name} (assemble-{backend_type})")
+                continue
+
+            is_success = compare_term(
+                f"{name} [backend={backend_type}]",
+                J_pc,
+                R_pc,
+                J_fx,
+                R_fx,
+                P_map,
+                dof_handler_pc,
+                W_fx,
+                rtol=1e-8,
+                atol=1e-8,
+            )
+            if is_success:
+                success_count += 1
+            else:
+                failed_tests.append(name)
+
+        print_test_summary(success_count, failed_tests)
+
+
 
 def setup_problems():
     nx, ny = 1, 1  # Number of elements in x and y directions
@@ -568,7 +1336,7 @@ def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
 def compare_term(term_name, J_pc, R_pc, J_fx, R_fx, P_map, dof_handler_pc, W_fenicsx, rtol=1e-8, atol=1e-8):
     print("\n" + f"--- Comparing Term: {term_name} ---")
 
-    output_dir = "garbage"
+    output_dir = os.environ.get("COMP_FENICS_OUTDIR", "comparison_outputs")
     os.makedirs(output_dir, exist_ok=True)
     safe_term_name = term_name.replace(' ', '_').lower()
     is_successful = True
@@ -641,6 +1409,11 @@ def print_test_summary(success_count, failed_tests):
 #                      MAIN TEST HARNESS
 # ==============================================================================
 if __name__ == '__main__':
+    problem = os.environ.get("COMP_FENICS_PROBLEM", "fluid").strip().lower()
+    if problem.startswith("poro"):
+        run_poro_comparison()
+        sys.exit(0)
+
     pc, dof_handler_pc, fenicsx = setup_problems()
     P_map = create_true_dof_map(dof_handler_pc, fenicsx['W'])
     initialize_functions(pc, fenicsx, dof_handler_pc, P_map)
@@ -1650,11 +2423,23 @@ if __name__ == '__main__':
     success_count = 0
     import os
     backend_type = os.environ.get("BACKEND", "jit")
+    run_all = os.environ.get("COMP_FENICS_RUN_ALL", "").lower() in {"1", "true", "yes"}
     filter_terms = os.environ.get("COMP_FENICS_TERMS")
     if filter_terms:
         allowed = {name.strip() for name in filter_terms.split(",") if name.strip()}
         terms = {k: v for k, v in terms.items() if k in allowed}
         print(f"Running filtered terms only: {sorted(terms)}")
+    elif not run_all:
+        default = {
+            "LHS Mass",
+            "LHS Diffusion",
+            "LHS Pressure",
+            "RHS Time Derivative",
+            "RHS pressure term",
+            "RHS Identiy [I2:grad(v)]",
+        }
+        terms = {k: v for k, v in terms.items() if k in default}
+        print(f"COMP_FENICS_TERMS not set; running safe default subset: {sorted(terms)}")
     for name, forms in terms.items():
         J_pc, R_pc, J_fx, R_fx = None, None, None, None
 

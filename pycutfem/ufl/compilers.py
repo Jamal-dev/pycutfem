@@ -2001,6 +2001,63 @@ class FormCompiler:
         #       f" shape_a={shape_a}, shape_b={shape_b}")
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
 
+        # ------------------------------------------------------------------
+        # Matrix fast-paths
+        # ------------------------------------------------------------------
+        # Identity matrix: dot(I, X) = X, dot(X, I) = X.
+        #
+        # Note: Identity is represented as GradOpInfo(role="identity") in the
+        # python backend. Many porous/FPI expressions rely on matrix products
+        # like (I - grad(u)) and J * F^{-T} K^{-1} F^{-1}. Historically this
+        # failed when K^{-1}=I or when multiplying by constant 2D tensors.
+        if isinstance(a, GradOpInfo) and role_a == "identity":
+            return b
+        if isinstance(b, GradOpInfo) and role_b == "identity":
+            return a
+
+        # Constant 2D tensor × GradOpInfo:
+        # - If b is already collapsed to a 2D matrix (function path), keep the
+        #   result as GradOpInfo to enable further matrix products.
+        # - If b is a gradient table (trial/test/mixed), delegate to left_dot
+        #   which returns a GradOpInfo with the correct shape.
+        if isinstance(a, np.ndarray) and a.ndim == 2 and isinstance(b, GradOpInfo) and isinstance(b_data, np.ndarray):
+            if b_data.ndim == 2:
+                return b._with(a @ b_data, role=b.role, coeffs=None)
+            if b_data.ndim in {3, 4}:
+                return b.left_dot(a)
+
+        # GradOpInfo × constant 2D tensor:
+        # - If a is collapsed to a 2D matrix (function path), keep the result
+        #   as GradOpInfo for subsequent matrix products.
+        # - If a is a gradient table (trial/test/mixed), dot_vec already
+        #   produces a GradOpInfo with the correct shape.
+        if isinstance(b, np.ndarray) and b.ndim == 2 and isinstance(a, GradOpInfo) and isinstance(a_data, np.ndarray):
+            if a_data.ndim == 2:
+                return a._with(a_data @ b, role=a.role, coeffs=None)
+            if a_data.ndim in {3, 4}:
+                return a.dot_vec(b)
+
+        # Some older code paths produce intermediate matrices as VecOpInfo with
+        # role="vector" and a 2D data array. Treat those as matrices here.
+        if (
+            isinstance(a, GradOpInfo)
+            and isinstance(b, VecOpInfo)
+            and role_b == "vector"
+            and isinstance(a_data, np.ndarray)
+            and isinstance(b_data, np.ndarray)
+            and a_data.ndim == b_data.ndim == 2
+        ):
+            return a._with(a_data @ b_data, role=a.role, coeffs=None)
+        if (
+            isinstance(a, VecOpInfo)
+            and role_a == "vector"
+            and isinstance(b, GradOpInfo)
+            and isinstance(a_data, np.ndarray)
+            and isinstance(b_data, np.ndarray)
+            and a_data.ndim == b_data.ndim == 2
+        ):
+            return b._with(a_data @ b_data, role=b.role, coeffs=None)
+
         def rhs():
             # ------------------------------------------------------------------
             # RHS  •  dot(  Function ,  Test  )   or   dot( Test , Function )

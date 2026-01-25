@@ -222,3 +222,5 @@ examples/poroelasticity/convergence_out_*/
 examples/poroelasticity/fenics_out*/
 examples/FPI/*.tex
 examples/FPI/*.pdf
+comparison_outputs/
+examples/FPI/paper_conv/
