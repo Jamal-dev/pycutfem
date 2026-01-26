@@ -359,8 +359,15 @@ def test_fpi_example41_fd_consistency(backend: str, kinv_case: str):
     fF = Analytic(lambda x, y: mms.fF(x, y), degree=ana_deg)
     fD = Analytic(lambda x, y: mms.fD(x, y), degree=ana_deg)
     fS = Analytic(lambda x, y: mms.fS(x, y), degree=ana_deg)
+    f_mass = Analytic(lambda x, y: mms.f_mass(x, y), degree=ana_deg)
 
-    res = forms.residual_form - dot(fF, prob["vF_testR"]) * prob["dx_f"] - dot(fD, prob["vP_testR"]) * prob["dx_p"] - dot(fS, prob["uP_testR"]) * prob["dx_p"]
+    res = (
+        forms.residual_form
+        - dot(fF, prob["vF_testR"]) * prob["dx_f"]
+        - dot(fD, prob["vP_testR"]) * prob["dx_p"]
+        - dot(fS, prob["uP_testR"]) * prob["dx_p"]
+        - f_mass * prob["qP_testR"] * prob["dx_p"]
+    )
 
     compiler = FormCompiler(prob["dh"], qdeg, backend=backend)
 
@@ -492,12 +499,14 @@ def test_fpi_example41_one_step_convergence(backend: str, kinv_case: str, poly_o
         fF = Analytic(lambda x, y: mms.fF(x, y), degree=ana_deg)
         fD = Analytic(lambda x, y: mms.fD(x, y), degree=ana_deg)
         fS = Analytic(lambda x, y: mms.fS(x, y), degree=ana_deg)
+        f_mass = Analytic(lambda x, y: mms.f_mass(x, y), degree=ana_deg)
 
         residual_form = (
             forms.residual_form
             - dot(fF, prob["vF_testR"]) * prob["dx_f"]
             - dot(fD, prob["vP_testR"]) * prob["dx_p"]
             - dot(fS, prob["uP_testR"]) * prob["dx_p"]
+            - f_mass * prob["qP_testR"] * prob["dx_p"]
         )
 
         # Dirichlet BCs: impose the analytic state at t=t_{n+1}=dt (including pressure to fix the constant mode)

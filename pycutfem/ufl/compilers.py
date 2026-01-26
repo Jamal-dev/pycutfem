@@ -153,6 +153,10 @@ class FormCompiler:
                 self._jit_backend = "jit"
         else:
             raise ValueError(f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'.")
+        # Cache: which level set the mesh is currently classified against.
+        # Some CutFEM assemblers (interface/ghost) rely on mesh tags and interface segments.
+        self._mesh_ls_key = None
+        self._mesh_ls_has_segments = False
         self._dispatch = {
             Constant: self._visit_Constant, 
             TestFunction: self._visit_TestFunction,
@@ -204,6 +208,36 @@ class FormCompiler:
 
     def _is_jit_backend(self) -> bool:
         return self.backend in {"jit", "cpp", "c++"}
+
+    def _ensure_mesh_classified(self, level_set, *, need_interface_segments: bool) -> None:
+        """
+        Ensure the mesh is classified against `level_set`.
+
+        Notes
+        -----
+        - Cut-volume assemblers classify on-the-fly, but interface/ghost assemblers
+          require `mesh.elements_list[*].tag`, edge tags/bitsets, and (for dInterface)
+          `element.interface_segments` to match the current level set.
+        - Boundary edge tags are preserved by `mesh.classify_edges(...)`.
+        """
+        if level_set is None:
+            return
+        mesh = self.me.mesh
+        tol = float(getattr(SIDE, "tol", 0.0))
+        tok = getattr(level_set, "cache_token", None)
+        key = ("token", tok, tol) if tok is not None else ("objid", int(id(level_set)), tol)
+
+        # Volume cut assemblers can re-classify the mesh without going through this
+        # helper. Use mesh-owned markers (when available) to avoid stale caching.
+        if getattr(mesh, "_ls_elements_key", None) != key:
+            mesh.classify_elements(level_set, tol=tol)
+        if getattr(mesh, "_ls_edges_key", None) != key:
+            mesh.classify_edges(level_set, tol=tol)
+        if need_interface_segments and getattr(mesh, "_ls_segments_key", None) != key:
+            mesh.build_interface_segments(level_set, tol=tol)
+
+        self._mesh_ls_key = key
+        self._mesh_ls_has_segments = bool(need_interface_segments)
     # --------------------- OpInfo meta helpers ---------------------
     def _op_meta_from_ctx(self, node, field_names):
         """Build consistent metadata for VecOpInfo/GradOpInfo from ctx + node."""
@@ -5002,6 +5036,10 @@ class FormCompiler:
 
     def _assemble_interface(self, intg: Integral, matvec):
         """Assemble integrals over non-conforming interfaces defined by a level set."""
+        level_set = getattr(intg.measure, "level_set", None)
+        # Interface assembly needs up-to-date cut tags and interface segments.
+        self._ensure_mesh_classified(level_set, need_interface_segments=True)
+
         mesh = self.me.mesh
         aligned_edges = None
         try:
@@ -5407,6 +5445,13 @@ class FormCompiler:
                     Uneg = np.asarray(deformation.node_displacements[conn_neg], dtype=float)
 
                 for x_phys, w in zip(qpts_phys, qwts):
+                    # Reset caches per quadrature point: function gradients/Hessians
+                    # are not constant on Q1/Q2 elements, so per-element caching
+                    # would incorrectly reuse values across different (xi,eta).
+                    self._basis_cache.clear()
+                    self._coeff_cache.clear()
+                    self._collapsed_cache.clear()
+
                     xi_pos, eta_pos = transform.inverse_mapping(mesh, pos_eid, np.asarray(x_phys, float))
                     xi_neg, eta_neg = transform.inverse_mapping(mesh, neg_eid, np.asarray(x_phys, float))
 
@@ -5800,6 +5845,13 @@ class FormCompiler:
                     Uneg = np.asarray(deformation.node_displacements[conn_neg], dtype=float)
 
                 for x_phys, w_eff in zip(qpts_phys, qw):
+                    # Reset caches per quadrature point: function gradients/Hessians
+                    # are not constant on Q1/Q2 elements, so per-element caching
+                    # would incorrectly reuse values across different (xi,eta).
+                    self._basis_cache.clear()
+                    self._coeff_cache.clear()
+                    self._collapsed_cache.clear()
+
                     xi_pos, eta_pos = transform.inverse_mapping(mesh, pos_eid, np.asarray(x_phys, float))
                     xi_neg, eta_neg = transform.inverse_mapping(mesh, neg_eid, np.asarray(x_phys, float))
 
@@ -6064,6 +6116,10 @@ class FormCompiler:
     
     def _assemble_ghost_edge(self, intg: "Integral", matvec):
         """Assemble ghost edge integrals."""
+        level_set = getattr(intg.measure, "level_set", None)
+        # Ghost-edge assembly relies on edge/element tags for owner conventions.
+        self._ensure_mesh_classified(level_set, need_interface_segments=False)
+
         trial, test = _trial_test(intg.integrand)
         if trial is None and test is None and self._is_jit_backend():
             # Ghost-edge functionals rely on Python path for correct normal orientation.
@@ -6080,6 +6136,9 @@ class FormCompiler:
 
     def _assemble_facet_patch(self, intg: "Integral", matvec):
         """Assemble facet-patch (two-element volume patch) integrals."""
+        level_set = getattr(intg.measure, "level_set", None)
+        self._ensure_mesh_classified(level_set, need_interface_segments=False)
+
         trial, test = _trial_test(intg.integrand)
         if trial is None and test is None and self._is_jit_backend():
             # Keep functional accumulation in Python for now.

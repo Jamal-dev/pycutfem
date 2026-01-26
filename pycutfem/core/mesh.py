@@ -536,6 +536,8 @@ class Mesh:
 
         tags_el = np.array([e.tag for e in self.elements_list])
         self._elem_bitsets = {t: BitSet(tags_el == t) for t in np.unique(tags_el)}
+        tok = getattr(level_set, "cache_token", None)
+        self._ls_elements_key = ("token", tok, float(tol)) if tok is not None else ("objid", int(id(level_set)), float(tol))
         return inside_inds, outside_inds, cut_inds
 
     def classify_elements_multi(self, level_sets, tol=SIDE.tol):
@@ -611,6 +613,8 @@ class Mesh:
         self._edge_bitsets['ghost_neg'] = ghost_neg_bs - interface_bs
         self._edge_bitsets['ghost_both'] = ghost_both_bs - interface_bs
         self._edge_bitsets['ghost'] = (ghost_pos_bs | ghost_neg_bs | ghost_both_bs) - interface_bs
+        tok = getattr(level_set, "cache_token", None)
+        self._ls_edges_key = ("token", tok, float(tol)) if tok is not None else ("objid", int(id(level_set)), float(tol))
     
     # def classify_edges(self, level_set, tol=SIDE.tol):
     #     """
@@ -1062,6 +1066,8 @@ class Mesh:
             elem.interface_segments = segments
             elem.interface_pts = [segments[0][0], segments[-1][1]] if segments else []
 
+        tok = getattr(level_set, "cache_token", None)
+        self._ls_segments_key = ("token", tok, float(tol)) if tok is not None else ("objid", int(id(level_set)), float(tol))
 
     def edge_bitset(self, tag: str) -> BitSet:
         """Return cached BitSet of edges with the given tag."""

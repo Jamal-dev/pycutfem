@@ -14,10 +14,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from pycutfem.ufl.expressions import (
     CellDiameter,
     Constant,
     FacetNormal,
+    avg,
     div,
     dot,
     grad,
@@ -37,6 +40,25 @@ def _epsilon(v):
 def _grad_inner_jump(u, v, n):
     """Penalty on the jump of the *normal derivative* across an interior facet."""
     return inner(dot(jump(grad(u)), n), dot(jump(grad(v)), n))
+
+
+def _const_scalar(val: float) -> Constant:
+    return Constant(float(val), dim=0)
+
+
+def _effective_k_inv_scalar(K_inv) -> float:
+    """Conservative scalar proxy for `K_inv` used in stabilization scalings."""
+    try:
+        mat = np.asarray(getattr(K_inv, "value", None), dtype=float)
+    except Exception:
+        return 1.0
+    if mat.shape != (2, 2):
+        return 1.0
+    try:
+        smax = float(np.max(np.linalg.svd(mat, compute_uv=False)))
+    except Exception:
+        smax = float(np.linalg.norm(mat))
+    return smax if smax > 0.0 else 1.0
 
 
 @dataclass(frozen=True)
@@ -66,6 +88,8 @@ def build_fpi_eulerian_forms(
     vP_n,
     uP_n,
     pP_n,
+    # optional unknowns at t_{n-1} (for poro-skeleton acceleration)
+    uP_nm1=None,
     # Newton increments
     dvF,
     dpF,
@@ -85,6 +109,9 @@ def build_fpi_eulerian_forms(
     dG_f,
     dG_p,
     level_set,
+    # optional: separate level sets for facet stabilizations
+    level_set_f=None,
+    level_set_p=None,
     # time integration
     dt,
     theta: float = 1.0,
@@ -112,9 +139,25 @@ def build_fpi_eulerian_forms(
     g_sigma_n=None,
     g_n=None,
     g_t=None,
+    # optional override for the penalty scaling φ^F_Γ (paper eq. (24))
+    use_paper_phi_gamma: bool = False,
+    vF_inf=None,
+    c_v_gamma: float = 1.0 / 6.0,
+    c_t_gamma: float = 1.0 / 12.0,
+    # optional override for the interface mesh-size parameter h_Γ (paper eq. (24))
+    h_gamma=None,
     # feature toggles
     use_interface_terms: bool = True,
     use_stabilization: bool = True,
+    # optional: paper-consistent CIP/ghost penalty (eqs. (21)-(23))
+    use_paper_stabilization: bool = False,
+    poly_order: int = 1,
+    gamma_u: float = 0.05,
+    gamma_p: float = 0.05,
+    gamma_div_factor: float = 1.0e-3,
+    gamma_gp_nu: float = 0.1,
+    gamma_gp_t: float = 0.001,
+    gp_second_weight: float = 0.05,
 ) -> FPIEulerianForms:
     """
     Build the coupled FPI residual/Jacobian forms on a fixed (Eulerian) mesh.
@@ -127,6 +170,7 @@ def build_fpi_eulerian_forms(
       to keep the MMS driver fast and the terms easy to debug.
     """
     cell_h = CellDiameter()
+    h_gamma_expr = h_gamma if h_gamma is not None else cell_h
     th = Constant(float(theta))
     zeta_c = Constant(float(zeta))
 
@@ -163,6 +207,7 @@ def build_fpi_eulerian_forms(
         qP_test,
         vP_test,
         uP_test,
+        u_nm1=uP_nm1,
         rho_f=rho_f,
         mu_f=mu_f,
         rho_s0_tilde=rho_s0_tilde,
@@ -185,6 +230,7 @@ def build_fpi_eulerian_forms(
         qP_test,
         vP_test,
         uP_test,
+        u_nm1=uP_nm1,
         rho_f=rho_f,
         mu_f=mu_f,
         rho_s0_tilde=rho_s0_tilde,
@@ -213,10 +259,22 @@ def build_fpi_eulerian_forms(
         if g_t is None:
             g_t = Constant((0.0, 0.0), dim=1)
 
-        # Penalty scaling (paper's φ^F_Γ): keep a simple robust variant here.
-        # The full ||v||_{∞,Γ} scaling is implemented at the driver level by
-        # allowing callers to pass an ElementWiseConstant if desired.
-        phi_gamma_F = mu_f + (cell_h**2) * (rho_f / dt)
+        # Penalty scaling φ^F_Γ (paper eq. (24)).
+        if use_paper_phi_gamma:
+            if vF_inf is None:
+                vF_inf_expr = Constant(0.0)
+            elif isinstance(vF_inf, (int, float)):
+                vF_inf_expr = Constant(float(vF_inf))
+            else:
+                vF_inf_expr = vF_inf
+            phi_gamma_F = (
+                mu_f
+                + h_gamma_expr * Constant(float(c_v_gamma)) * rho_f * vF_inf_expr
+                + (h_gamma_expr**2) * Constant(float(c_t_gamma)) * (rho_f / (th * dt))
+            )
+        else:
+            # Lightweight default (kept for backwards compatibility with earlier MMS tests).
+            phi_gamma_F = mu_f + (h_gamma_expr**2) * (rho_f / dt)
 
         interface = build_fpi_interface_forms(
             vF_k=vF_k,
@@ -240,7 +298,7 @@ def build_fpi_eulerian_forms(
             gamma_n=gamma_n,
             gamma_t=gamma_t,
             phi_gamma_F=phi_gamma_F,
-            h_gamma=cell_h,
+            h_gamma=h_gamma_expr,
             zeta=zeta_c,
             dt=dt,
             g_sigma=g_sigma,
@@ -261,24 +319,138 @@ def build_fpi_eulerian_forms(
 
         # Use the same quadrature as the volume measures unless overridden.
         qdeg = int((dx_f.metadata or {}).get("q", 6))
-        dS_f = dCutSkeleton(level_set=level_set, metadata={"q": qdeg, "side": "+"})
-        dS_p = dCutSkeleton(level_set=level_set, metadata={"q": qdeg, "side": "-"})
+        ls_f = level_set_f if level_set_f is not None else level_set
+        ls_p = level_set_p if level_set_p is not None else level_set
+        derivs = {(1, 0), (0, 1)}
+        dS_f = dCutSkeleton(level_set=ls_f, metadata={"q": qdeg, "side": "+", "derivs": derivs})
+        dS_p = dCutSkeleton(level_set=ls_p, metadata={"q": qdeg, "side": "-", "derivs": derivs})
+        dG_f_stab = dG_f(metadata={"derivs": derivs})
+        dG_p_stab = dG_p(metadata={"derivs": derivs})
 
-        if float(gamma_F_p) != 0.0:
-            a_stab += Constant(float(gamma_F_p)) * (cell_h**3) * _grad_inner_jump(dpF, qF_test, n) * dS_f
-            r_stab += Constant(float(gamma_F_p)) * (cell_h**3) * _grad_inner_jump(pF_k, qF_test, n) * dS_f
+        if use_paper_stabilization:
+            # CIP parameters (paper eqs. (21)-(22)) and ghost penalty (paper eq. (23)).
+            h_F = avg(cell_h)
 
-        if float(gamma_F_gp) != 0.0:
-            a_stab += Constant(float(gamma_F_gp)) * (cell_h**3) * _grad_inner_jump(dpF, qF_test, n) * dG_f
-            r_stab += Constant(float(gamma_F_gp)) * (cell_h**3) * _grad_inner_jump(pF_k, qF_test, n) * dG_f
+            # For MMS studies we approximate ‖v‖_{∞,F} by a global supplied bound.
+            if vF_inf is None:
+                v_inf_expr = _const_scalar(0.0)
+            elif isinstance(vF_inf, (int, float)):
+                v_inf_expr = _const_scalar(float(vF_inf))
+            else:
+                v_inf_expr = vF_inf
 
-        if float(gamma_P_p) != 0.0:
-            a_stab += Constant(float(gamma_P_p)) * (cell_h**3) * _grad_inner_jump(dpP, qP_test, n) * dS_p
-            r_stab += Constant(float(gamma_P_p)) * (cell_h**3) * _grad_inner_jump(pP_k, qP_test, n) * dS_p
+            c_v = Constant(float(c_v_gamma))
+            c_t = Constant(float(c_t_gamma))
+            Phi_F = mu_f + h_F * c_v * rho_f * v_inf_expr + (h_F**2) * c_t * (rho_f / (th * dt))
 
-        if float(gamma_P_gp) != 0.0:
-            a_stab += Constant(float(gamma_P_gp)) * (cell_h**3) * _grad_inner_jump(dpP, qP_test, n) * dG_p
-            r_stab += Constant(float(gamma_P_gp)) * (cell_h**3) * _grad_inner_jump(pP_k, qP_test, n) * dG_p
+            gamma_div = float(gamma_div_factor) * float(gamma_p)
+            tau_F_u = Constant(float(gamma_u)) * ((rho_f * v_inf_expr) ** 2) * (h_F**3) / Phi_F
+            tau_F_p = Constant(float(gamma_p)) * (h_F**3) / Phi_F
+            tau_F_div = Constant(float(gamma_div)) * h_F * Phi_F
+
+            # Poro scaling uses a reactive term based on φ° and K° (paper eq. (22)).
+            K_inv_eff = _effective_k_inv_scalar(K_inv)
+            Phi_P = (h_F**2) * (
+                Constant(1.0) * mu_f * porosity * Constant(float(K_inv_eff))
+                + c_t * (rho_f / (th * dt))
+            )
+            tau_P_p = Constant(float(gamma_p)) * (h_F**3) / Phi_P
+            tau_P_div = Constant(float(gamma_div)) * h_F * Phi_P
+
+            # CIP on interior faces.
+            a_stab += tau_F_u * _grad_inner_jump(dvF, vF_test, n) * dS_f
+            r_stab += tau_F_u * _grad_inner_jump(vF_k, vF_test, n) * dS_f
+
+            a_stab += tau_F_p * _grad_inner_jump(dpF, qF_test, n) * dS_f
+            r_stab += tau_F_p * _grad_inner_jump(pF_k, qF_test, n) * dS_f
+
+            a_stab += tau_F_div * jump(div(dvF)) * jump(div(vF_test)) * dS_f
+            r_stab += tau_F_div * jump(div(vF_k)) * jump(div(vF_test)) * dS_f
+
+            a_stab += tau_P_p * _grad_inner_jump(dpP, qP_test, n) * dS_p
+            r_stab += tau_P_p * _grad_inner_jump(pP_k, qP_test, n) * dS_p
+
+            a_stab += tau_P_div * jump(div(dvP)) * jump(div(vP_test)) * dS_p
+            r_stab += tau_P_div * jump(div(vP_k)) * jump(div(vP_test)) * dS_p
+
+            # Ghost penalty on near-interface faces (for Q1: only j=1 is non-zero).
+            tau_GP_p1 = tau_F_p
+            tau_GP_div1 = tau_F_div
+            tau_GP_u1 = tau_F_u + Constant(float(gamma_gp_nu)) * h_F * mu_f + Constant(float(gamma_gp_t)) * (h_F**3) * (rho_f / (th * dt))
+
+            a_stab += tau_GP_p1 * _grad_inner_jump(dpF, qF_test, n) * dG_f_stab
+            r_stab += tau_GP_p1 * _grad_inner_jump(pF_k, qF_test, n) * dG_f_stab
+
+            a_stab += tau_GP_div1 * jump(div(dvF)) * jump(div(vF_test)) * dG_f_stab
+            r_stab += tau_GP_div1 * jump(div(vF_k)) * jump(div(vF_test)) * dG_f_stab
+
+            a_stab += tau_GP_u1 * _grad_inner_jump(dvF, vF_test, n) * dG_f_stab
+            r_stab += tau_GP_u1 * _grad_inner_jump(vF_k, vF_test, n) * dG_f_stab
+
+            # Poro-side ghost penalties: our fully Eulerian/CutFEM setup also cuts Ω⁻,
+            # unlike the reference implementation in the paper. Penalize jumps on
+            # the poro ghost facets to control cut-cell ill-conditioning, which is
+            # especially important for the BJ variant (β_BJ=1) where v^P enters the
+            # tangential kinematic constraint.
+            tau_GP_P_p1 = tau_P_p
+            tau_GP_P_div1 = tau_P_div
+            mu_react_P = mu_f * porosity * Constant(float(K_inv_eff))
+            tau_GP_P_v1 = Constant(float(gamma_gp_nu)) * h_F * mu_react_P + Constant(float(gamma_gp_t)) * (h_F**3) * (
+                rho_f / (th * dt)
+            )
+
+            a_stab += tau_GP_P_p1 * _grad_inner_jump(dpP, qP_test, n) * dG_p_stab
+            r_stab += tau_GP_P_p1 * _grad_inner_jump(pP_k, qP_test, n) * dG_p_stab
+
+            a_stab += tau_GP_P_div1 * jump(div(dvP)) * jump(div(vP_test)) * dG_p_stab
+            r_stab += tau_GP_P_div1 * jump(div(vP_k)) * jump(div(vP_test)) * dG_p_stab
+
+            a_stab += tau_GP_P_v1 * _grad_inner_jump(dvP, vP_test, n) * dG_p_stab
+            r_stab += tau_GP_P_v1 * _grad_inner_jump(vP_k, vP_test, n) * dG_p_stab
+
+            # Skeleton displacement ghost penalty (elastic scaling).
+            # Use the same γ^{GP}_ν coefficient as for the fluid velocity GP to
+            # avoid over-penalizing the poro skeleton (the paper uses a fitted
+            # mesh on Ω^P so this term is not present there).
+            tau_GP_uP1 = Constant(float(gamma_gp_nu)) * Constant(2.0) * c_nh * h_F
+            a_stab += tau_GP_uP1 * _grad_inner_jump(duP, uP_test, n) * dG_p_stab
+            r_stab += tau_GP_uP1 * _grad_inner_jump(uP_k, uP_test, n) * dG_p_stab
+
+            # Optional j=2 terms for bi-quadratic discretizations.
+            if int(poly_order) >= 2 and float(gp_second_weight) != 0.0:
+                w2 = Constant(float(gp_second_weight)) * (h_F**2)
+                tau_GP_p2 = w2 * tau_GP_p1
+                tau_GP_u2 = w2 * (tau_GP_u1 + tau_GP_div1)
+
+                def _dn(u):
+                    return dot(grad(u), n)
+
+                def _dn2(u):
+                    return dot(grad(_dn(u)), n)
+
+                a_stab += tau_GP_p2 * inner(jump(_dn2(dpF)), jump(_dn2(qF_test))) * dG_f_stab
+                r_stab += tau_GP_p2 * inner(jump(_dn2(pF_k)), jump(_dn2(qF_test))) * dG_f_stab
+
+                a_stab += tau_GP_u2 * inner(jump(_dn2(dvF)), jump(_dn2(vF_test))) * dG_f_stab
+                r_stab += tau_GP_u2 * inner(jump(_dn2(vF_k)), jump(_dn2(vF_test))) * dG_f_stab
+
+        else:
+            # Legacy lightweight stabilization knobs (kept for earlier MMS/debug scripts).
+            if float(gamma_F_p) != 0.0:
+                a_stab += Constant(float(gamma_F_p)) * (cell_h**3) * _grad_inner_jump(dpF, qF_test, n) * dS_f
+                r_stab += Constant(float(gamma_F_p)) * (cell_h**3) * _grad_inner_jump(pF_k, qF_test, n) * dS_f
+
+            if float(gamma_F_gp) != 0.0:
+                a_stab += Constant(float(gamma_F_gp)) * (cell_h**3) * _grad_inner_jump(dpF, qF_test, n) * dG_f_stab
+                r_stab += Constant(float(gamma_F_gp)) * (cell_h**3) * _grad_inner_jump(pF_k, qF_test, n) * dG_f_stab
+
+            if float(gamma_P_p) != 0.0:
+                a_stab += Constant(float(gamma_P_p)) * (cell_h**3) * _grad_inner_jump(dpP, qP_test, n) * dS_p
+                r_stab += Constant(float(gamma_P_p)) * (cell_h**3) * _grad_inner_jump(pP_k, qP_test, n) * dS_p
+
+            if float(gamma_P_gp) != 0.0:
+                a_stab += Constant(float(gamma_P_gp)) * (cell_h**3) * _grad_inner_jump(dpP, qP_test, n) * dG_p_stab
+                r_stab += Constant(float(gamma_P_gp)) * (cell_h**3) * _grad_inner_jump(pP_k, qP_test, n) * dG_p_stab
 
     jacobian_form = a_fluid + a_poro + a_ifc + a_stab
     residual_form = r_fluid + r_poro + r_ifc + r_stab

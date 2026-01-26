@@ -762,8 +762,18 @@ class CppCodeGen:
                     for ii in range(k):
                         emit_line(f"{nm}({ii}) = {view_name}(e,q,{ii});")
                     stack.append(StackItem(nm, "vec", "const", (k,)))
+                elif len(op.tensor_shape) == 2:
+                    r = int(op.tensor_shape[0])
+                    c = int(op.tensor_shape[1])
+                    emit_line(f"Eigen::Matrix<double,{r},{c}> {nm};")
+                    for ii in range(r):
+                        for jj in range(c):
+                            emit_line(f"{nm}({ii},{jj}) = {view_name}(e,q,{ii},{jj});")
+                    stack.append(StackItem(nm, "mat", "const", (r, c)))
                 else:
-                    raise NotImplementedError("LoadAnalytic only implemented for scalar/vector tensors in C++ backend")
+                    raise NotImplementedError(
+                        "LoadAnalytic only implemented for scalar/vector/matrix tensors in C++ backend"
+                    )
             elif isinstance(op, LoadVariable):
                 followed_by_diff = isinstance(next_op, (Grad,))
                 # ------------------------------------------------------------------
@@ -2843,9 +2853,11 @@ class CppCodeGen:
                     view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
                 elif len(shape) == 1:
                     view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
+                elif len(shape) == 2:
+                    view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
                 else:
                     raise NotImplementedError(
-                        "LoadAnalytic only implemented for scalar/vector tensors in C++ backend"
+                        "LoadAnalytic only implemented for scalar/vector/matrix tensors in C++ backend"
                     )
             if name.startswith("b_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")

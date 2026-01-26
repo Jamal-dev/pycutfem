@@ -7,7 +7,8 @@ from pycutfem.ufl.expressions import Expression, Derivative, Constant, Identity
 from pycutfem.ufl.expressions import (
     VectorFunction, TrialFunction, VectorTrialFunction,
     TestFunction, VectorTestFunction, Restriction,
-    Grad as UFLGrad
+    Grad as UFLGrad,
+    DivOperation as UFLDiv,
 )
 from pycutfem.ufl.forms import Form, Equation
 from pycutfem.core.dofhandler import DofHandler
@@ -1960,6 +1961,11 @@ def required_multi_indices(expr: "Expression") -> Set[MultiIndex]:
             out.update({(2,0),(0,2)}); _walk(node.operand, acc_x, acc_y); return
         
         if isinstance(node, UFLGrad):
+            out.update({(1, 0), (0, 1)})
+            _walk(node.operand, acc_x, acc_y)
+            return
+        if isinstance(node, UFLDiv):
+            # Divergence is implemented via first derivatives of the operand.
             out.update({(1, 0), (0, 1)})
             _walk(node.operand, acc_x, acc_y)
             return

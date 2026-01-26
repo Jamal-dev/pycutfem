@@ -747,6 +747,21 @@ def compile_multi(form, *, dof_handler, mixed_element,
     mesh = mixed_element.mesh
     p_geo  = int(getattr(mesh, "poly_order", 1))
 
+    def _ensure_mesh(ls_obj, *, need_interface_segments: bool = False) -> None:
+        """
+        Ensure the mesh is classified against `ls_obj` before using mesh tags/BitSets.
+
+        The JIT kernel pipeline uses mesh-owned BitSets (inside/outside/cut/interface/ghost)
+        and, for dInterface, `element.interface_segments`. When multiple level sets are
+        present in one form, the mesh may have been classified against a different
+        level set earlier; assembling with stale tags/segments gives incorrect kernels.
+        """
+        if ls_obj is None:
+            return
+        # Reuse FormCompiler's guarded classification helper (mesh keys prevent
+        # redundant work when already classified for this level set).
+        fc._ensure_mesh_classified(ls_obj, need_interface_segments=bool(need_interface_segments))
+
     # ------------------------------------------------------------------
     # Unified precompute support (reduce redundant per-integral precomputes)
     # ------------------------------------------------------------------
@@ -822,6 +837,9 @@ def compile_multi(form, *, dof_handler, mixed_element,
         can_facet = bool(ctx["want_facet_patch"]) and qfacet is not None
         if not (can_cut or can_ifc or can_ghost or can_facet):
             return None
+
+        # Ensure mesh tags/BitSets and interface segments correspond to this level set.
+        _ensure_mesh(ls_obj, need_interface_segments=bool(can_ifc))
 
         # We only support a single deformation object per unified bundle.
         if len(ctx["def_ids"]) > 1:
@@ -1171,22 +1189,20 @@ def compile_multi(form, *, dof_handler, mixed_element,
             # Bind loop-variant values as default args to avoid Python's late-binding
             # closure pitfall (which would mix up per-integral active_cols/qdeg/etc.).
             def _current_sets(ls_obj, _mesh=mesh):
-                """Return (inside, outside, cut) ids based on current mesh tags or by reclassifying."""
-                reclassify = False
+                """Return (inside, outside, cut) ids for the given level set."""
+                _ensure_mesh(ls_obj, need_interface_segments=False)
                 try:
                     inside_now = np.asarray(_mesh.element_bitset("inside").to_indices(), dtype=np.int32)
-                    outside_now = np.asarray(_mesh.element_bitset("outside").to_indices(), dtype=np.int32)
-                    cut_now = np.asarray(_mesh.element_bitset("cut").to_indices(), dtype=np.int32)
-                    if (inside_now.size + outside_now.size + cut_now.size) == 0:
-                        reclassify = True
                 except Exception:
-                    reclassify = True
-
-                if reclassify:
-                    inside_raw, outside_raw, cut_raw = _mesh.classify_elements(ls_obj)
-                    inside_now = np.asarray(inside_raw, dtype=np.int32)
-                    outside_now = np.asarray(outside_raw, dtype=np.int32)
-                    cut_now = np.asarray(cut_raw, dtype=np.int32)
+                    inside_now = np.asarray(_mesh.element_bitset("inside"), dtype=np.int32)
+                try:
+                    outside_now = np.asarray(_mesh.element_bitset("outside").to_indices(), dtype=np.int32)
+                except Exception:
+                    outside_now = np.asarray(_mesh.element_bitset("outside"), dtype=np.int32)
+                try:
+                    cut_now = np.asarray(_mesh.element_bitset("cut").to_indices(), dtype=np.int32)
+                except Exception:
+                    cut_now = np.asarray(_mesh.element_bitset("cut"), dtype=np.int32)
                 return inside_now, outside_now, cut_now
 
             def _apply_defined_on(ids: np.ndarray, _bs=bs) -> np.ndarray:
@@ -1638,6 +1654,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 _linear_interface=bool(linear_interface),
                 _deformation=deformation,
             ):
+                _ensure_mesh(ls_obj, need_interface_segments=True)
                 # IMPORTANT: mesh element/edge BitSets are rebuilt by classification,
                 # so never capture them across refreshes; always fetch a fresh view.
                 bs_cut_now = _me.mesh.element_bitset("cut")
@@ -1772,6 +1789,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 _need_o4=need_o4,
                 _deformation=deformation,
             ):
+                _ensure_mesh(ls_obj, need_interface_segments=False)
                 mesh_obj = _me.mesh
                 # Always fetch current interface edges (mesh edge BitSets are rebuilt on classify_edges).
                 base_edges = mesh_obj.edge_bitset("interface")
@@ -1945,6 +1963,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 _need_o4=need_o4,
                 _deformation=deformation,
             ):
+                _ensure_mesh(ls_obj, need_interface_segments=False)
                 mesh_obj = _me.mesh
                 # Always fetch current ghost edges (mesh edge BitSets are rebuilt on classify_edges).
                 bs_ghost_now = mesh_obj.edge_bitset("ghost")
@@ -2094,6 +2113,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 _active_cols=np.asarray(active_cols, dtype=np.int32),
                 _deformation=deformation,
             ):
+                _ensure_mesh(ls_obj, need_interface_segments=False)
                 mesh_obj = _me.mesh
                 bs_ghost_now = mesh_obj.edge_bitset("ghost")
                 edge_sel = (_bs_def & bs_ghost_now) if _bs_def is not None else bs_ghost_now

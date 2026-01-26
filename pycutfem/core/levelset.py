@@ -213,6 +213,180 @@ class BeamLevelSet(LevelSetFunction):
         nrm_safe = np.where(nrm == 0.0, 1.0, nrm)
         return g / nrm_safe
 
+
+class RotatedBoxLevelSet(LevelSetFunction):
+    """
+    Rotated axis-aligned box in a local coordinate frame.
+
+    The local box is centered at `center` with half-lengths (hx, hy) in the
+    rotated frame. The signed distance is in the L∞-sense:
+
+        φ(x) = max(|x'|/hx, |y'|/hy) - 1
+
+    where (x', y') are coordinates rotated by `angle` about the center.
+    Negative inside, positive outside.
+    """
+
+    def __init__(
+        self,
+        *,
+        center: Tuple[float, float] = (0.0, 0.0),
+        hx: float,
+        hy: float,
+        angle: float = 0.0,
+    ):
+        self.center = np.asarray(center, dtype=float)
+        self.hx = float(hx)
+        self.hy = float(hy)
+        if not (self.hx > 0.0 and self.hy > 0.0):
+            raise ValueError("hx and hy must be positive.")
+        self.angle = float(angle)
+        self._c = float(np.cos(self.angle))
+        self._s = float(np.sin(self.angle))
+        # Used to invalidate caches when the LS changes.
+        self.cache_token = (
+            "rotated_box_ref",
+            float(self.center[0]),
+            float(self.center[1]),
+            float(self.hx),
+            float(self.hy),
+            float(self.angle),
+        )
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        rel = x - self.center
+        # Rotate into the box frame (rotation by -angle).
+        xp = self._c * rel[..., 0] + self._s * rel[..., 1]
+        yp = -self._s * rel[..., 0] + self._c * rel[..., 1]
+        ax = np.abs(xp) / self.hx
+        ay = np.abs(yp) / self.hy
+        return np.maximum(ax, ay) - 1.0
+
+    def gradient(self, x: np.ndarray) -> np.ndarray:
+        """
+        Piecewise-constant unit normal pointing to the closest face.
+
+        For points near corners the normal is ambiguous; we pick a consistent
+        branch via the L∞-distance face selection.
+        """
+        x = np.asarray(x, dtype=float)
+        rel = x - self.center
+        # Rotate into the box frame (rotation by -angle).
+        xp = self._c * rel[..., 0] + self._s * rel[..., 1]
+        yp = -self._s * rel[..., 0] + self._c * rel[..., 1]
+        ax = np.abs(xp) / self.hx
+        ay = np.abs(yp) / self.hy
+        prefer_x = ax > ay
+        # Local frame gradient before normalisation.
+        gx_p = np.where(prefer_x, np.sign(xp) / self.hx, 0.0)
+        gy_p = np.where(prefer_x, 0.0, np.sign(yp) / self.hy)
+        # Rotate back to global frame (rotation by +angle).
+        gx = self._c * gx_p - self._s * gy_p
+        gy = self._s * gx_p + self._c * gy_p
+        g = np.stack((gx, gy), axis=-1)
+        nrm = np.linalg.norm(g, axis=-1, keepdims=True)
+        nrm_safe = np.where(nrm == 0.0, 1.0, nrm)
+        out = g / nrm_safe
+        if x.ndim == 1:
+            return out.reshape(2,)
+        return out
+
+class ScaledLevelSet(LevelSetFunction):
+    """Scale a level set by a nonzero constant.
+
+    Notes
+    -----
+    Many level sets in this code base implement `gradient()` as a *unit* normal.
+    Scaling a signed-distance-like function by a positive constant keeps the
+    unit normal unchanged; scaling by a negative constant flips its direction.
+    """
+
+    def __init__(self, scale: float, level_set: LevelSetFunction):
+        s = float(scale)
+        if abs(s) <= 0.0:
+            raise ValueError("scale must be nonzero.")
+        self.scale = s
+        self.level_set = level_set
+        tok = getattr(level_set, "cache_token", None)
+        self.cache_token = ("scaled_ls", float(self.scale), tok if tok is not None else int(id(level_set)))
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        return self.scale * np.asarray(self.level_set(x), dtype=float)
+
+    def gradient(self, x: np.ndarray) -> np.ndarray:
+        g = np.asarray(self.level_set.gradient(x), dtype=float)
+        sgn = 1.0 if self.scale > 0.0 else -1.0
+        return sgn * g
+
+
+class MinLevelSet(LevelSetFunction):
+    """Pointwise minimum of several level sets."""
+
+    def __init__(self, *levelsets: LevelSetFunction):
+        if len(levelsets) < 2:
+            raise ValueError("MinLevelSet requires at least two level sets.")
+        self.levelsets = tuple(levelsets)
+        toks = []
+        for ls in self.levelsets:
+            tok = getattr(ls, "cache_token", None)
+            toks.append(tok if tok is not None else int(id(ls)))
+        self.cache_token = ("min_ls", tuple(toks))
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        vals = [np.asarray(ls(x), dtype=float) for ls in self.levelsets]
+        out = vals[0]
+        for v in vals[1:]:
+            out = np.minimum(out, v)
+        return out
+
+    def gradient(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        if x.ndim == 1:
+            vals = [float(ls(x)) for ls in self.levelsets]
+            k = int(np.argmin(np.asarray(vals, dtype=float)))
+            return np.asarray(self.levelsets[k].gradient(x), dtype=float)
+
+        vals = np.stack([np.asarray(ls(x), dtype=float) for ls in self.levelsets], axis=0)
+        idx = np.argmin(vals, axis=0)  # (...,)
+        grads = np.stack([np.asarray(ls.gradient(x), dtype=float) for ls in self.levelsets], axis=0)  # (k,...,2)
+        sel = np.take_along_axis(grads, idx[None, ..., None], axis=0)
+        return sel[0]
+
+
+class MaxLevelSet(LevelSetFunction):
+    """Pointwise maximum of several level sets."""
+
+    def __init__(self, *levelsets: LevelSetFunction):
+        if len(levelsets) < 2:
+            raise ValueError("MaxLevelSet requires at least two level sets.")
+        self.levelsets = tuple(levelsets)
+        toks = []
+        for ls in self.levelsets:
+            tok = getattr(ls, "cache_token", None)
+            toks.append(tok if tok is not None else int(id(ls)))
+        self.cache_token = ("max_ls", tuple(toks))
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        vals = [np.asarray(ls(x), dtype=float) for ls in self.levelsets]
+        out = vals[0]
+        for v in vals[1:]:
+            out = np.maximum(out, v)
+        return out
+
+    def gradient(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        if x.ndim == 1:
+            vals = [float(ls(x)) for ls in self.levelsets]
+            k = int(np.argmax(np.asarray(vals, dtype=float)))
+            return np.asarray(self.levelsets[k].gradient(x), dtype=float)
+
+        vals = np.stack([np.asarray(ls(x), dtype=float) for ls in self.levelsets], axis=0)
+        idx = np.argmax(vals, axis=0)  # (...,)
+        grads = np.stack([np.asarray(ls.gradient(x), dtype=float) for ls in self.levelsets], axis=0)  # (k,...,2)
+        sel = np.take_along_axis(grads, idx[None, ..., None], axis=0)
+        return sel[0]
+
 class CompositeLevelSet(LevelSetFunction):
     """Hold several independent level‑set functions.
 

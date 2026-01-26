@@ -224,3 +224,5 @@ examples/FPI/*.tex
 examples/FPI/*.pdf
 comparison_outputs/
 examples/FPI/paper_conv/
+examples/FPI/_mms_example41_plots/
+examples/FPI/*plots_*/
