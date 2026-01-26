@@ -1,6 +1,7 @@
 import argparse
 import logging
 import math
+import os
 from pathlib import Path
 
 import matplotlib
@@ -25,6 +26,7 @@ from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.solvers.nonlinear_solver import NewtonParameters, NewtonSolver, TimeStepperParameters
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import (
+    CellDiameter,
     Constant,
     ElementWiseConstant,
     FacetNormal,
@@ -38,13 +40,16 @@ from pycutfem.ufl.expressions import (
     VectorTrialFunction,
     dot,
     inner,
+    jump,
     restrict,
 )
+from pycutfem.io.visualization import plot_mesh_2
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.measures import dx
 from pycutfem.utils.fpi_fully_eulerian import build_fpi_eulerian_forms
 from pycutfem.utils.fpi_mms_example41 import build_example41_mms
-from pycutfem.utils.fsi_fully_eulerian import build_measures, make_domain_sets
+from pycutfem.utils.fsi_fully_eulerian import build_measures, make_domain_sets, refresh_sliver_weights
 from pycutfem.utils.meshgen import structured_quad
 
 
@@ -58,6 +63,23 @@ def _tag_background_boundaries(mesh: Mesh, *, x0: float, x1: float, y0: float, y
             "right": lambda x, y: abs(x - x1) <= tol,
             "bottom": lambda x, y: abs(y - y0) <= tol,
             "top": lambda x, y: abs(y - y1) <= tol,
+        }
+    )
+
+
+def _tag_paper_outer_boundaries(mesh: Mesh, *, cut_ls, tol: float = 1.0e-12) -> None:
+    """Tag outer boundary edges of the rotated mesh, truncated by x>=x0.
+
+    The physical domain is the rotated outer square with the left corner
+    removed by the vertical cut x=x0. The cut itself is handled by `dInterface`
+    (Neumann), while the remaining mesh boundary is Dirichlet.
+    """
+    mesh.tag_boundary_edges(
+        {
+            # Boundary-edge tags are midpoint-based: this is only used as a
+            # convenience and can be replaced by DOF-based tagging via --inlet-bc dofs.
+            "outer_dirichlet": lambda x, y: float(cut_ls(np.array([x, y], dtype=float))) <= tol,
+            "outer_removed": lambda x, y: float(cut_ls(np.array([x, y], dtype=float))) > tol,
         }
     )
 
@@ -79,44 +101,93 @@ def _build_problem(
     qdeg: int,
     dt_val: float,
     kinv_case: str,
+    mesh_layout: str = "paper",
     ghost: str = "edge",
+    ghost_weights: str = "none",
     cut_drop_fluid: float = 0.0,
     cut_drop_poro: float = 0.0,
 ):
-    # Background mesh (paper Fig. 3): square discretization with matching Dirichlet
-    # boundary on the *vertical cut* at x = Δx = -0.45.
-    x0 = -0.45
-    y0 = -0.75
-    L = 1.5
-    x1 = x0 + L
-    y1 = y0 + L
+    mesh_layout = str(mesh_layout).strip().lower()
+    if mesh_layout not in {"legacy", "paper"}:
+        raise ValueError("mesh_layout must be one of {'legacy','paper'}")
 
-    nodes, elems, edges, corners = structured_quad(
-        L, L, nx=nx, ny=nx, poly_order=poly_order, offset=(x0, y0)
-    )
-    mesh = Mesh(
-        nodes=nodes,
-        element_connectivity=elems,
-        edges_connectivity=edges,
-        elements_corner_nodes=corners,
-        element_type="quad",
-        poly_order=poly_order,
-    )
-    # Level sets for Example 4.1 (paper sec. 4.1)
-    poro_ls = RotatedBoxLevelSet(center=(0.0, 0.0), hx=0.25, hy=0.25, angle=math.pi / 6.0)  # Ω^P
-    fluid_sq_ls = RotatedBoxLevelSet(center=(0.0, 0.0), hx=0.5, hy=0.5, angle=math.pi / 4.0)  # base square
-    cut_ls = AffineLevelSet(-1.0, 0.0, x0)  # φ = x0 - x  (negative for x > x0)
+    # Example 4.1 geometry parameters (paper sec. 4.1)
+    x0 = -0.45  # vertical truncation position (Δx in the paper)
+    poro_ls = RotatedBoxLevelSet(center=(0.0, 0.0), hx=0.25, hy=0.25, angle=math.pi / 6.0)  # Ω^P (rotated 30°)
+    fluid_sq_ls = RotatedBoxLevelSet(center=(0.0, 0.0), hx=0.5, hy=0.5, angle=math.pi / 4.0)  # outer square (rotated 45°)
 
-    # Ω^F support square with vertical cut: Ω^B = square ∩ {x >= x0} (negative inside)
-    outer_std = MaxLevelSet(fluid_sq_ls, cut_ls)
-    # Flip sign so Ω^B is on the positive side (needed for measures with side='+').
-    outer_pos = ScaledLevelSet(-1.0, outer_std)
+    if mesh_layout == "legacy":
+        # Legacy background mesh: axis-aligned square that *contains* the rotated outer square.
+        y0 = -0.75
+        L = 1.5
+        x1 = x0 + L
+        y1 = y0 + L
 
-    # Fluid domain Ω^F = Ω^B \ Ω^P : positive where (outside poro) ∩ (inside Ω^B)
-    fluid_ls = MinLevelSet(poro_ls, outer_pos)
+        nodes, elems, edges, corners = structured_quad(L, L, nx=nx, ny=nx, poly_order=poly_order, offset=(x0, y0))
+        mesh = Mesh(
+            nodes=nodes,
+            element_connectivity=elems,
+            edges_connectivity=edges,
+            elements_corner_nodes=corners,
+            element_type="quad",
+            poly_order=poly_order,
+        )
 
-    # Tag matching boundary Γ_F,D ⊂ {x=x0}∩∂Ω^F as "inlet"
-    _tag_background_boundaries(mesh, x0=x0, x1=x1, y0=y0, y1=y1, fluid_ls=fluid_ls)
+        cut_ls = AffineLevelSet(-1.0, 0.0, x0)  # φ = x0 - x  (negative for x > x0)
+
+        # Ω^B = outer square ∩ {x >= x0} (negative inside) → flip sign so Ω^B is positive.
+        outer_std = MaxLevelSet(fluid_sq_ls, cut_ls)
+        outer_pos = ScaledLevelSet(-1.0, outer_std)
+
+        # Fluid domain Ω^F = Ω^B \\ Ω^P : positive where (outside poro) ∩ (inside Ω^B)
+        fluid_ls = MinLevelSet(poro_ls, outer_pos)
+
+        # Dirichlet on the (matching) cut boundary x=x0; Neumann traction on the outer square.
+        _tag_background_boundaries(mesh, x0=x0, x1=x1, y0=y0, y1=y1, fluid_ls=fluid_ls)
+        dirichlet_edge_tag = "inlet"
+        dirichlet_dof_tag = "inlet_dofs"
+        neumann_ls = fluid_sq_ls
+        neumann_name = "outer"
+    else:
+        # Paper mesh layout (Fig. 3): rotated elements on the outer square (size 1, rotated by 45°).
+        # The left corner is removed by the vertical cut x=x0.
+        L = 1.0
+        x1 = float("nan")
+        y0 = float("nan")
+        y1 = float("nan")
+
+        nodes, elems, edges, corners = structured_quad(
+            L,
+            L,
+            nx=nx,
+            ny=nx,
+            poly_order=poly_order,
+            offset=(-0.5, -0.5),
+            rotation=math.pi / 4.0,
+            rotation_center=(0.0, 0.0),
+        )
+        mesh = Mesh(
+            nodes=nodes,
+            element_connectivity=elems,
+            edges_connectivity=edges,
+            elements_corner_nodes=corners,
+            element_type="quad",
+            poly_order=poly_order,
+        )
+
+        # Vertical truncation: `cut_ls` is negative on the physical side {x >= x0}.
+        cut_ls = AffineLevelSet(-1.0, 0.0, x0)
+        cut_pos = ScaledLevelSet(-1.0, cut_ls)  # positive on {x >= x0}
+
+        # Fluid domain Ω^F = {x>=x0} \\ Ω^P (outer boundary is mesh boundary; avoid extra cut cells there).
+        outer_pos = None
+        fluid_ls = MinLevelSet(poro_ls, cut_pos)
+
+        _tag_paper_outer_boundaries(mesh, cut_ls=cut_ls)
+        dirichlet_edge_tag = "outer_dirichlet"
+        dirichlet_dof_tag = "outer_dofs"
+        neumann_ls = cut_ls
+        neumann_name = "inlet"
 
     ghost = str(ghost).strip().lower()
     if ghost not in {"edge", "patch"}:
@@ -130,6 +201,41 @@ def _build_problem(
     mesh.classify_elements(fluid_ls)
     mesh.classify_edges(fluid_ls)
     domains_fluid = make_domain_sets(mesh, use_aligned_interface=False)
+
+    # ------------------------------------------------------------------
+    # Optional Hansbo cut-ratio weights for ghost penalties
+    # ------------------------------------------------------------------
+    ghost_weights = str(ghost_weights).strip().lower()
+    if ghost_weights not in {"none", "hansbo"}:
+        raise ValueError("ghost_weights must be one of {'none','hansbo'}")
+
+    sliver_theta0 = float(os.getenv("SLIVER_THETA0", "0.05"))
+    sliver_p = float(os.getenv("SLIVER_P", "1.0"))
+    sliver_wmax = float(os.getenv("SLIVER_WMAX", "1000.0"))
+    sliver_thetamin = float(os.getenv("SLIVER_THETAMIN", "1e-6"))
+    sliver_theta_floor = max(sliver_thetamin, 1.0e-12)
+
+    theta_pos_raw_f = hansbo_cut_ratio(mesh, fluid_ls, side="+")
+    theta_neg_raw_f = hansbo_cut_ratio(mesh, fluid_ls, side="-")
+    theta_pos_f = np.clip(theta_pos_raw_f, sliver_theta_floor, 1.0)
+    theta_neg_f = np.clip(theta_neg_raw_f, sliver_theta_floor, 1.0)
+    w_sliver_fluid = None
+    if ghost_weights == "hansbo":
+        w_pos_f = np.ones_like(theta_pos_f)
+        w_neg_f = np.ones_like(theta_neg_f)
+        refresh_sliver_weights(
+            mesh,
+            theta_pos_f,
+            theta_neg_f,
+            w_pos_f,
+            w_neg_f,
+            theta0=sliver_theta0,
+            p=sliver_p,
+            wmax=sliver_wmax,
+            thetamin=sliver_thetamin,
+            smooth=1.0,
+        )
+        w_sliver_fluid = ElementWiseConstant(w_pos_f)
     bad_fluid_mask = None
     if cut_drop_fluid > 0.0:
         cut_mask = np.asarray(mesh.element_bitset("cut").mask, dtype=bool)
@@ -167,6 +273,29 @@ def _build_problem(
     mesh.classify_edges(poro_ls)
     mesh.build_interface_segments(poro_ls)
     domains_poro = make_domain_sets(mesh, use_aligned_interface=False)
+
+    theta_pos_raw_p = hansbo_cut_ratio(mesh, poro_ls, side="+")
+    theta_neg_raw_p = hansbo_cut_ratio(mesh, poro_ls, side="-")
+    theta_pos_p = np.clip(theta_pos_raw_p, sliver_theta_floor, 1.0)
+    theta_neg_p = np.clip(theta_neg_raw_p, sliver_theta_floor, 1.0)
+    w_sliver_poro = None
+    if ghost_weights == "hansbo":
+        w_pos_p = np.ones_like(theta_pos_p)
+        w_neg_p = np.ones_like(theta_neg_p)
+        refresh_sliver_weights(
+            mesh,
+            theta_pos_p,
+            theta_neg_p,
+            w_pos_p,
+            w_neg_p,
+            theta0=sliver_theta0,
+            p=sliver_p,
+            wmax=sliver_wmax,
+            thetamin=sliver_thetamin,
+            smooth=1.0,
+        )
+        # Poro domain is on the negative side of `poro_ls`.
+        w_sliver_poro = ElementWiseConstant(w_neg_p)
     bad_poro_mask = None
     if cut_drop_poro > 0.0:
         cut_mask = np.asarray(mesh.element_bitset("cut").mask, dtype=bool)
@@ -200,14 +329,14 @@ def _build_problem(
             h_gamma_vals[int(eid)] = float(areas[int(eid)]) / seg_len
     h_gamma = ElementWiseConstant(h_gamma_vals)
 
-    # --- Outer (non-matching) fluid boundary Γ_F,N for traction BCs ---
-    # This must only include the rotated outer-square boundary, *not* the matching
-    # inlet cut {x=x0}. Build it from `fluid_sq_ls` (paper sec. 4.1).
-    mesh.classify_elements(fluid_sq_ls)
-    mesh.classify_edges(fluid_sq_ls)
-    mesh.build_interface_segments(fluid_sq_ls)
-    domains_outer = make_domain_sets(mesh, use_aligned_interface=False)
-    _dx_out_b, _dx_in_b, dGamma_outer, _dG_out_b, _dG_in_b = build_measures(mesh, fluid_sq_ls, domains_outer, qvol=qdeg)
+    # --- Neumann traction boundary measure (non-matching dInterface) ---
+    # For the legacy layout: traction is imposed on the rotated outer-square boundary.
+    # For the paper layout: traction is imposed on the vertical cut x=x0 ("inlet").
+    mesh.classify_elements(neumann_ls)
+    mesh.classify_edges(neumann_ls)
+    mesh.build_interface_segments(neumann_ls)
+    domains_neumann = make_domain_sets(mesh, use_aligned_interface=False)
+    _dx_out_b, _dx_in_b, dGamma_neumann, _dG_out_b, _dG_in_b = build_measures(mesh, neumann_ls, domains_neumann, qvol=qdeg)
 
     # Tag inlet DOFs directly (robust even when the Γ_F,D segment does not align
     # with full boundary edges on coarse meshes). We constrain only DOFs whose
@@ -221,7 +350,22 @@ def _build_problem(
             phi = float(fluid_sq_ls([float(x), float(y)]))
         return phi <= 1.0e-12
 
-    dh.tag_dofs_by_locator_map({"inlet_dofs": _inlet_dof_locator}, fields=["v_pos_x", "v_pos_y"])
+    if mesh_layout == "legacy":
+        dh.tag_dofs_by_locator_map({dirichlet_dof_tag: _inlet_dof_locator}, fields=["v_pos_x", "v_pos_y"])
+    else:
+        # Tag Dirichlet DOFs on the *rotated* outer boundary, excluding the removed
+        # corner (x < x0). For the unit outer square rotated by 45°, the boundary is
+        # |x|+|y|=sqrt(2)/2.
+        r = math.sqrt(2.0) / 2.0
+
+        def _outer_dof_locator(x: float, y: float) -> bool:
+            x = float(x)
+            y = float(y)
+            if x < float(x0) - 1.0e-12:
+                return False
+            return abs(abs(x) + abs(y) - r) <= 5.0e-10
+
+        dh.tag_dofs_by_locator_map({dirichlet_dof_tag: _outer_dof_locator}, fields=["v_pos_x", "v_pos_y"])
 
     Vf = FunctionSpace(name="Vf", field_names=["v_pos_x", "v_pos_y"], dim=1, side="+")
     Vp = FunctionSpace(name="Vp", field_names=["v_neg_x", "v_neg_y"], dim=1, side="-")
@@ -259,13 +403,23 @@ def _build_problem(
     has_poro = domains_poro["has_neg"]
 
     return dict(
+        mesh_layout=mesh_layout,
         mesh=mesh,
         poro_ls=poro_ls,
         fluid_ls=fluid_ls,
+        fluid_sq_ls=fluid_sq_ls,
         outer_ls=outer_pos,
+        dirichlet_edge_tag=dirichlet_edge_tag,
+        dirichlet_dof_tag=dirichlet_dof_tag,
+        neumann_name=neumann_name,
+        neumann_ls=neumann_ls,
+        x0=x0,
+        y0=y0,
+        x1=x1,
+        y1=y1,
         domains_fluid=domains_fluid,
         domains_poro=domains_poro,
-        domains_outer=domains_outer,
+        domains_neumann=domains_neumann,
         dh=dh,
         me=me,
         dx_f=dx_f,
@@ -273,8 +427,10 @@ def _build_problem(
         dGamma=dGamma,
         dG_f=dG_f,
         dG_p=dG_p,
-        dGamma_outer=dGamma_outer,
+        dGamma_neumann=dGamma_neumann,
         h_gamma=h_gamma,
+        w_sliver_fluid=w_sliver_fluid,
+        w_sliver_poro=w_sliver_poro,
         h=L / float(nx),
         ghost=ghost,
         vF_k=vF_k,
@@ -313,6 +469,234 @@ def _build_problem(
         dt=Constant(float(dt_val)),
         kinv_case=kinv_case,
     )
+
+
+def _print_bc_diagnostics(*, prob: dict, inlet_bc: str) -> None:
+    mesh: Mesh = prob["mesh"]
+    dh: DofHandler = prob["dh"]
+    mesh_layout = str(prob.get("mesh_layout", "legacy")).strip().lower()
+
+    inlet_bc = str(inlet_bc).strip().lower()
+    if inlet_bc not in {"dofs", "edges", "auto"}:
+        raise ValueError("inlet_bc must be one of {'dofs','edges','auto'}")
+
+    edge_tag = str(prob.get("dirichlet_edge_tag", "inlet"))
+    dof_tag = str(prob.get("dirichlet_dof_tag", "inlet_dofs"))
+
+    if inlet_bc == "edges":
+        inlet_tag = edge_tag
+    elif inlet_bc == "auto":
+        try:
+            inlet_tag = edge_tag if mesh.edge_bitset(edge_tag).cardinality() > 0 else dof_tag
+        except Exception:
+            inlet_tag = dof_tag
+    else:
+        inlet_tag = dof_tag
+
+    bcs = [
+        BoundaryCondition("v_pos_x", "dirichlet", inlet_tag, 0.0),
+        BoundaryCondition("v_pos_y", "dirichlet", inlet_tag, 0.0),
+    ]
+    bc_data = dh.get_dirichlet_data(bcs)
+    bc_dofs = set(int(k) for k in bc_data.keys())
+    inactive = set(getattr(dh, "dof_tags", {}).get("inactive", set()))
+    inlet_dof_tag = set(getattr(dh, "dof_tags", {}).get(dof_tag, set()))
+
+    inlet_edges = float("nan")
+    try:
+        inlet_edges = float(mesh.edge_bitset(edge_tag).cardinality())
+    except Exception:
+        inlet_edges = float("nan")
+    removed_edges = float("nan")
+    try:
+        removed_edges = float(mesh.edge_bitset("outer_removed").cardinality())
+    except Exception:
+        removed_edges = float("nan")
+
+    bc_arr = np.fromiter(bc_dofs, dtype=int, count=len(bc_dofs)) if bc_dofs else np.empty((0,), dtype=int)
+    inlet_arr = (
+        np.fromiter(inlet_dof_tag, dtype=int, count=len(inlet_dof_tag)) if inlet_dof_tag else np.empty((0,), dtype=int)
+    )
+
+    x0 = float(prob.get("x0", float("nan")))
+    print(f"BC diagnostics: layout={mesh_layout}  inlet_bc={inlet_bc}  dirichlet_tag={inlet_tag}")
+    print(f"  edges(tagged)={inlet_edges:.0f}  outer_removed={removed_edges:.0f}")
+
+    max_dx = 0.0
+    for field in ("v_pos_x", "v_pos_y"):
+        ids = np.asarray(dh.get_field_slice(field), dtype=int)
+        coords = dh.get_dof_coords(field)
+
+        tag_mask = np.isin(ids, inlet_arr) if inlet_arr.size else np.zeros(ids.shape, dtype=bool)
+        bc_mask = np.isin(ids, bc_arr) if bc_arr.size else np.zeros(ids.shape, dtype=bool)
+        if mesh_layout == "legacy" and np.isfinite(x0):
+            geom_mask = np.abs(coords[:, 0] - x0) <= 1.0e-10
+        else:
+            r = math.sqrt(2.0) / 2.0
+            geom_mask = np.abs(np.abs(coords[:, 0]) + np.abs(coords[:, 1]) - r) <= 5.0e-10
+
+        n_tag = int(np.count_nonzero(tag_mask))
+        n_bc = int(np.count_nonzero(bc_mask))
+        n_geom = int(np.count_nonzero(geom_mask))
+        if n_bc:
+            bc_ids = set(int(v) for v in ids[bc_mask].tolist())
+            n_bc_active = int(len(bc_ids - inactive))
+            ys = np.asarray(coords[bc_mask, 1], dtype=float)
+            yr_s = f"[{float(ys.min()):+.3e}, {float(ys.max()):+.3e}]"
+            if np.isfinite(x0):
+                xs = np.asarray(coords[bc_mask, 0], dtype=float)
+                if mesh_layout == "legacy":
+                    max_dx = max(max_dx, float(np.max(np.abs(xs - x0))))
+        else:
+            n_bc_active = 0
+            yr_s = "n/a"
+        geom_lbl = "dofs_on_x0" if mesh_layout == "legacy" else "dofs_on_outer"
+        print(f"  {field}: {geom_lbl}={n_geom:4d}  tag={n_tag:4d}  dirichlet(bc)={n_bc:4d}  active={n_bc_active:4d}  y_range={yr_s}")
+
+    if bc_dofs and np.isfinite(x0) and mesh_layout == "legacy":
+        print(f"  max|x_dof - x0| over Dirichlet dofs = {max_dx:.3e} (x0={x0:+.3e})")
+
+
+def _plot_example41_mesh(*, prob: dict, inlet_bc: str, out_path: Path) -> None:
+    mesh: Mesh = prob["mesh"]
+    dh: DofHandler = prob["dh"]
+    mesh_layout = str(prob.get("mesh_layout", "legacy")).strip().lower()
+
+    inlet_bc = str(inlet_bc).strip().lower()
+    if inlet_bc not in {"dofs", "edges", "auto"}:
+        raise ValueError("inlet_bc must be one of {'dofs','edges','auto'}")
+
+    edge_tag = str(prob.get("dirichlet_edge_tag", "inlet"))
+    dof_tag = str(prob.get("dirichlet_dof_tag", "inlet_dofs"))
+
+    if inlet_bc == "edges":
+        inlet_tag = edge_tag
+    elif inlet_bc == "auto":
+        try:
+            inlet_tag = edge_tag if mesh.edge_bitset(edge_tag).cardinality() > 0 else dof_tag
+        except Exception:
+            inlet_tag = dof_tag
+    else:
+        inlet_tag = dof_tag
+
+    x0 = float(prob["x0"])
+    y_max = (math.sqrt(2.0) / 2.0) + x0
+    y_min_mesh = float(np.min(mesh.nodes_x_y_pos[:, 1]))
+    y_max_mesh = float(np.max(mesh.nodes_x_y_pos[:, 1]))
+
+    fig, ax = plt.subplots(figsize=(10, 9))
+    # Background mesh and nodes.
+    plot_mesh_2(mesh, ax=ax, show=False, elem_tags=False, plot_interface=False, edge_colors=True, plot_nodes=True)
+
+    # Outer square boundary (paper Fig. 3) as φ=0 contour.
+    plot_mesh_2(
+        mesh,
+        ax=ax,
+        show=False,
+        elem_tags=False,
+        plot_edges=False,
+        plot_nodes=False,
+        plot_interface=False,
+        level_set=prob["fluid_sq_ls"],
+        edge_colors=False,
+    )
+
+    # Poro domain boundary (rotated by 30°), drawn in purple.
+    try:
+        import matplotlib.tri as mtri
+
+        phi_nodes = np.asarray(prob["poro_ls"].evaluate_on_nodes(mesh), dtype=float)
+        tris_idx = []
+        for e in mesh.elements_list:
+            cn = list(e.corner_nodes)
+            if len(cn) == 3:
+                tris_idx.append(cn)
+            elif len(cn) == 4:
+                tris_idx.append([cn[0], cn[1], cn[2]])
+                tris_idx.append([cn[0], cn[2], cn[3]])
+        tri = mtri.Triangulation(mesh.nodes_x_y_pos[:, 0], mesh.nodes_x_y_pos[:, 1], np.asarray(tris_idx, dtype=int))
+        ax.tricontour(tri, phi_nodes, levels=[0.0], colors="purple", linewidths=2.5, zorder=6)
+    except Exception:
+        pass
+
+    # Highlight the vertical cut line and the (geometric) Γ^{F,N} segment on it.
+    ax.plot([x0, x0], [y_min_mesh, y_max_mesh], linestyle="--", color="gray", linewidth=1.5, zorder=3)
+    ax.plot([x0, x0], [-y_max, y_max], linestyle="-", color="red", linewidth=4.0, zorder=7)
+    ax.plot([x0, x0], [-y_max, y_max], "o", color="red", markersize=5.5, markeredgecolor="white", zorder=8)
+
+    # Highlight relevant tagged boundary edges for context.
+    if mesh_layout == "legacy":
+        tags = (("left", "dodgerblue", 3.0), ("inlet", "crimson", 3.0))
+    else:
+        tags = (("outer_dirichlet", "crimson", 3.0), ("outer_removed", "gray", 2.5))
+    for tag, col, lw in tags:
+        try:
+            mask = np.asarray(mesh.edge_bitset(tag).mask, dtype=bool)
+        except Exception:
+            continue
+        ids = np.flatnonzero(mask)
+        for gid in ids.tolist():
+            e = mesh.edges_list[int(gid)]
+            nids = list(e.all_nodes) if getattr(e, "all_nodes", ()) else list(e.nodes)
+            pts = mesh.nodes_x_y_pos[nids]
+            ax.plot(pts[:, 0], pts[:, 1], "-", color=col, linewidth=lw, zorder=5)
+
+    # Plot DOFs on x=x0 (legacy) and the ones constrained by inlet_tag.
+    bcs = [
+        BoundaryCondition("v_pos_x", "dirichlet", inlet_tag, 0.0),
+        BoundaryCondition("v_pos_y", "dirichlet", inlet_tag, 0.0),
+    ]
+    bc_data = dh.get_dirichlet_data(bcs)
+    bc_dofs = set(int(k) for k in bc_data.keys())
+    inactive = set(getattr(dh, "dof_tags", {}).get("inactive", set()))
+
+    fld = "v_pos_x"  # same coordinates as v_pos_y
+    f_ids = np.asarray(dh.get_field_slice(fld), dtype=int)
+    f_coords = dh.get_dof_coords(fld)
+    x0_mask = np.abs(f_coords[:, 0] - x0) <= 1.0e-10
+    bc_mask = np.isin(f_ids, np.fromiter(bc_dofs, dtype=int, count=len(bc_dofs))) if bc_dofs else np.zeros(f_ids.shape, bool)
+    inact_mask = np.isin(f_ids, np.fromiter(inactive, dtype=int, count=len(inactive))) if inactive else np.zeros(f_ids.shape, bool)
+
+    if mesh_layout == "legacy" and np.any(x0_mask):
+        ax.plot(
+            f_coords[x0_mask & ~inact_mask, 0],
+            f_coords[x0_mask & ~inact_mask, 1],
+            "o",
+            color="black",
+            markersize=6.0,
+            zorder=9,
+            label="Active DOFs on x=x0",
+        )
+        if np.any(x0_mask & inact_mask):
+            ax.plot(
+                f_coords[x0_mask & inact_mask, 0],
+                f_coords[x0_mask & inact_mask, 1],
+                "x",
+                color="gray",
+                markersize=7.0,
+                zorder=9,
+                label="Inactive DOFs on x=x0",
+            )
+    if np.any(bc_mask):
+        ax.plot(
+            f_coords[bc_mask, 0],
+            f_coords[bc_mask, 1],
+            "o",
+            color="gold",
+            markersize=10.0,
+            markeredgecolor="black",
+            zorder=10,
+            label="Dirichlet DOFs",
+        )
+
+    L = 1.5 if mesh_layout == "legacy" else 1.0
+    nx_guess = int(round(float(L) / float(prob["h"]))) if float(prob.get("h", 0.0) or 0.0) > 0.0 else -1
+    ax.set_title(f"Example 4.1 mesh (layout={mesh_layout}, nx={nx_guess}, p={mesh.poly_order}) | dirichlet_tag={inlet_tag}")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
 
 
 def _approx_vinf(mms, *, bbox: tuple[float, float, float, float], n: int = 41) -> float:
@@ -384,18 +768,31 @@ def _run_one(
     nx: int,
     poly_order: int,
     qdeg: int,
+    qerr: int | None,
     dt_val: float,
     t_end: float,
     backend: str,
     kinv_case: str,
     interface: str,
+    mesh_layout: str,
     gamma_inv: float,
     zeta: float,
     init_guess: str,
     ghost: str,
+    ghost_weights: str,
     cut_drop_fluid: float,
     cut_drop_poro: float,
+    sliver_mass_fluid: float = 0.0,
+    sliver_mass_poro: float = 0.0,
+    sliver_mass_skeleton: float = 0.0,
+    sliver_theta_eps: float = 1.0e-16,
+    ghost_mass_fluid: float = 0.0,
+    ghost_mass_poro: float = 0.0,
+    inlet_bc: str = "dofs",
     show_cut_ratios: bool = False,
+    check_exact_residual: bool = False,
+    use_interface_terms: bool = True,
+    use_stabilization: bool = True,
 ):
     prob = _build_problem(
         nx=nx,
@@ -403,7 +800,9 @@ def _run_one(
         qdeg=qdeg,
         dt_val=dt_val,
         kinv_case=kinv_case,
+        mesh_layout=mesh_layout,
         ghost=ghost,
+        ghost_weights=ghost_weights,
         cut_drop_fluid=cut_drop_fluid,
         cut_drop_poro=cut_drop_poro,
     )
@@ -551,8 +950,10 @@ def _run_one(
         c_v_gamma=1.0 / 6.0,
         c_t_gamma=1.0 / 12.0,
         h_gamma=h_gamma,
-        use_interface_terms=True,
-        use_stabilization=True,
+        w_ghost_f=prob["w_sliver_fluid"],
+        w_ghost_p=prob["w_sliver_poro"],
+        use_interface_terms=bool(use_interface_terms),
+        use_stabilization=bool(use_stabilization),
     )
 
     fF = Analytic(lambda x, y: mms.fF(x, y), degree=ana_deg)
@@ -570,29 +971,104 @@ def _run_one(
 
     # ------------------------------------------------------------------
     # Fluid boundary conditions (paper sec. 4.1)
-    #  - Γ_F,D (matching): prescribe analytic v^F on the vertical cut boundary x=x0.
-    #  - Γ_F,N (non-matching): prescribe analytic traction σ^F_A · n^F on the cut boundary
-    #    of the rotated outer square.
+    #  - Γ_F,D: essential BC on a *matching* mesh boundary (outer square, truncated).
+    #  - Γ_F,N: traction BC on a *non-matching* boundary treated via dInterface.
     # ------------------------------------------------------------------
+    inlet_bc = str(inlet_bc).strip().lower()
+    if inlet_bc not in {"dofs", "edges", "auto"}:
+        raise ValueError("inlet_bc must be one of {'dofs','edges','auto'}")
+    edge_tag = str(prob.get("dirichlet_edge_tag", "inlet"))
+    dof_tag = str(prob.get("dirichlet_dof_tag", "inlet_dofs"))
+    if inlet_bc == "edges":
+        inlet_tag = edge_tag
+    elif inlet_bc == "auto":
+        try:
+            inlet_tag = edge_tag if prob["mesh"].edge_bitset(edge_tag).cardinality() > 0 else dof_tag
+        except Exception:
+            inlet_tag = dof_tag
+    else:
+        inlet_tag = dof_tag
+
     bcs = [
-        BoundaryCondition("v_pos_x", "dirichlet", "inlet_dofs", mms.vF_x),
-        BoundaryCondition("v_pos_y", "dirichlet", "inlet_dofs", mms.vF_y),
+        BoundaryCondition("v_pos_x", "dirichlet", inlet_tag, mms.vF_x),
+        BoundaryCondition("v_pos_y", "dirichlet", inlet_tag, mms.vF_y),
     ]
     bcs_homog = [BoundaryCondition(bc.field, bc.method, bc.domain_tag, lambda x, y: 0.0) for bc in bcs]
 
-    # Neumann traction on Γ_F,N: add -∫ (σ^F_A n^F) · w_F ds.
-    # Here `dGamma_outer` is built from `fluid_sq_ls` with negative inside the
-    # square, so FacetNormal() points outward.
-    nF_outer = FacetNormal()
-    traction_outer = dot(sigmaF_A, nF_outer)
-    # `dGamma_outer` is built from `fluid_sq_ls`, which is negative inside the
-    # outer square (Ω⁻) and positive outside (Ω⁺). The physical Neumann boundary
-    # Γ_F,N lies on the *inside* (fluid) side, hence use `Neg(...)`.
-    residual_form = residual_form - inner(traction_outer, Neg(prob["vF_testR"])) * prob["dGamma_outer"]
+    # Neumann traction on Γ_F,N: add -∫ (σ^F_A n^F) · w_F ds on the *fluid* side.
+    # Our `neumann_ls` is chosen such that the physical fluid side is the negative
+    # side (Ω⁻), hence use `Neg(...)` consistently.
+    nF_neu = FacetNormal()
+    traction_neu = dot(sigmaF_A, nF_neu)
+    residual_form = residual_form - inner(traction_neu, Neg(prob["vF_testR"])) * prob["dGamma_neumann"]
+
+    # ------------------------------------------------------------------
+    # Sliver robustness: cut-cell sliver-mass stabilization (optional)
+    # ------------------------------------------------------------------
+    jacobian_form = forms.jacobian_form
+    theta_eps_c = Constant(float(sliver_theta_eps))
+
+    if float(sliver_mass_fluid) != 0.0:
+        gamma_sm_f = Constant(float(sliver_mass_fluid))
+        theta_f = np.clip(hansbo_cut_ratio(prob["mesh"], prob["fluid_ls"], side="+"), 0.0, 1.0)
+        inv_theta_f = Constant(1.0) / (ElementWiseConstant(theta_f) + theta_eps_c)
+        dx_f_cut = dx(
+            defined_on=prob["domains_fluid"]["cut_domain"],
+            level_set=prob["fluid_ls"],
+            metadata={"q": int(qdeg), "side": "+"},
+        )
+        jacobian_form = jacobian_form + gamma_sm_f * (rho_f / prob["dt"]) * inv_theta_f * dot(prob["dvF_R"], prob["vF_testR"]) * dx_f_cut
+        residual_form = residual_form + gamma_sm_f * (rho_f / prob["dt"]) * inv_theta_f * dot(
+            prob["vF_kR"] - prob["vF_nR"], prob["vF_testR"]
+        ) * dx_f_cut
+
+    if float(sliver_mass_poro) != 0.0 or float(sliver_mass_skeleton) != 0.0:
+        theta_p = np.clip(hansbo_cut_ratio(prob["mesh"], prob["poro_ls"], side="-"), 0.0, 1.0)
+        inv_theta_p = Constant(1.0) / (ElementWiseConstant(theta_p) + theta_eps_c)
+        dx_p_cut = dx(
+            defined_on=prob["domains_poro"]["cut_domain"],
+            level_set=prob["poro_ls"],
+            metadata={"q": int(qdeg), "side": "-"},
+        )
+
+        if float(sliver_mass_poro) != 0.0:
+            gamma_sm_p = Constant(float(sliver_mass_poro))
+            jacobian_form = jacobian_form + gamma_sm_p * (rho_f / prob["dt"]) * inv_theta_p * dot(prob["dvP_R"], prob["vP_testR"]) * dx_p_cut
+            residual_form = residual_form + gamma_sm_p * (rho_f / prob["dt"]) * inv_theta_p * dot(
+                prob["vP_kR"] - prob["vP_nR"], prob["vP_testR"]
+            ) * dx_p_cut
+
+        if float(sliver_mass_skeleton) != 0.0:
+            gamma_sm_u = Constant(float(sliver_mass_skeleton))
+            dt = prob["dt"]
+            jacobian_form = jacobian_form + gamma_sm_u * (rho_s0_tilde / (dt * dt)) * inv_theta_p * dot(prob["duP_R"], prob["uP_testR"]) * dx_p_cut
+            residual_form = residual_form + gamma_sm_u * (rho_s0_tilde / (dt * dt)) * inv_theta_p * dot(
+                prob["uP_kR"] - Constant(2.0) * prob["uP_nR"] + prob["uP_nm1R"], prob["uP_testR"]
+            ) * dx_p_cut
+
+    # Ghost-mass stabilization on cut-adjacent facets (optional): controls constant
+    # modes that grad-jump ghost penalties do not see on extreme slivers.
+    if float(ghost_mass_fluid) != 0.0:
+        gamma_gm_f = Constant(float(ghost_mass_fluid))
+        jacobian_form = jacobian_form + (rho_f / prob["dt"]) * gamma_gm_f * CellDiameter() * inner(
+            jump(prob["dvF_R"]), jump(prob["vF_testR"])
+        ) * prob["dG_f"]
+        residual_form = residual_form + (rho_f / prob["dt"]) * gamma_gm_f * CellDiameter() * inner(
+            jump(prob["vF_kR"]), jump(prob["vF_testR"])
+        ) * prob["dG_f"]
+
+    if float(ghost_mass_poro) != 0.0:
+        gamma_gm_p = Constant(float(ghost_mass_poro))
+        jacobian_form = jacobian_form + (rho_f / prob["dt"]) * gamma_gm_p * CellDiameter() * inner(
+            jump(prob["dvP_R"]), jump(prob["vP_testR"])
+        ) * prob["dG_p"]
+        residual_form = residual_form + (rho_f / prob["dt"]) * gamma_gm_p * CellDiameter() * inner(
+            jump(prob["vP_kR"]), jump(prob["vP_testR"])
+        ) * prob["dG_p"]
 
     solver = NewtonSolver(
         residual_form,
-        forms.jacobian_form,
+        jacobian_form,
         dof_handler=prob["dh"],
         mixed_element=prob["me"],
         bcs=bcs,
@@ -613,7 +1089,7 @@ def _run_one(
     else:
         prob["uP_nm1"].nodal_values.fill(0.0)
 
-    init_guess = str(init_guess).strip().lower()
+    init_guess = "exact" if bool(check_exact_residual) else str(init_guess).strip().lower()
     if init_guess == "exact":
         prob["vF_k"].set_values_from_function(lambda x, y: mms.vF_k(x, y))
         prob["vP_k"].set_values_from_function(lambda x, y: mms.vP_k(x, y))
@@ -635,12 +1111,59 @@ def _run_one(
     uP_n_snapshot.nodal_values[:] = prob["uP_n"].nodal_values[:]
     uP_n_snapshotR = restrict(uP_n_snapshot, prob["domains_poro"]["has_neg"])
 
-    solver.solve_time_interval(
-        functions=[prob["vF_k"], prob["pF_k"], prob["vP_k"], prob["uP_k"], prob["pP_k"]],
-        prev_functions=[prob["vF_n"], prob["pF_n"], prob["vP_n"], prob["uP_n"], prob["pP_n"]],
-        aux_functions={"dt": prob["dt"], "uP_nm1": prob["uP_nm1"]},
-        time_params=TimeStepperParameters(dt=dt_val, final_time=dt_val, max_steps=1),
-    )
+    if not bool(check_exact_residual):
+        solver.solve_time_interval(
+            functions=[prob["vF_k"], prob["pF_k"], prob["vP_k"], prob["uP_k"], prob["pP_k"]],
+            prev_functions=[prob["vF_n"], prob["pF_n"], prob["vP_n"], prob["uP_n"], prob["pP_n"]],
+            aux_functions={"dt": prob["dt"], "uP_nm1": prob["uP_nm1"]},
+            time_params=TimeStepperParameters(dt=dt_val, final_time=dt_val, max_steps=1),
+        )
+    else:
+        # Assemble the residual on the manufactured solution without solving.
+        def _assemble_vec(expr):
+            eq = Equation(None, expr)
+            _, vec = assemble_form(eq, dof_handler=prob["dh"], bcs=[], quad_order=int(qdeg), backend=backend)
+            return np.asarray(vec, dtype=float)
+
+        # Component-wise residual (for debugging): volume, interface, stabilization, boundary traction.
+        res_fluid = forms.r_fluid - dot(fF, prob["vF_testR"]) * prob["dx_f"]
+        res_poro = (
+            forms.r_poro
+            - dot(fD, prob["vP_testR"]) * prob["dx_p"]
+            - dot(fS, prob["uP_testR"]) * prob["dx_p"]
+            - f_mass * prob["qP_testR"] * prob["dx_p"]
+        )
+        res_ifc = forms.interface.residual if forms.interface is not None else Constant(0.0) * prob["qF_testR"] * prob["dGamma"]
+        res_cip = forms.r_cip
+        res_gp = forms.r_gp
+        res_stab = forms.r_stab
+        res_bdry = -inner(traction_neu, Neg(prob["vF_testR"])) * prob["dGamma_neumann"]
+
+        R_fluid = _assemble_vec(res_fluid)
+        R_poro = _assemble_vec(res_poro)
+        R_ifc = _assemble_vec(res_ifc)
+        R_cip = _assemble_vec(res_cip)
+        R_gp = _assemble_vec(res_gp)
+        R_stab = _assemble_vec(res_stab)
+        R_bdry = _assemble_vec(res_bdry)
+        R = R_fluid + R_poro + R_ifc + R_stab + R_bdry
+        bc_dofs = set(prob["dh"].get_dirichlet_data(bcs).keys())
+        inactive = set(getattr(prob["dh"], "dof_tags", {}).get("inactive", set()))
+        free = np.asarray(sorted((set(range(prob["dh"].total_dofs)) - bc_dofs) - inactive), dtype=int)
+        def _inf(v):
+            return float(np.linalg.norm(v[free], ord=np.inf)) if free.size else 0.0
+
+        return dict(
+            h=float(prob["h"]),
+            residual_inf=_inf(R),
+            residual_inf_fluid=_inf(R_fluid),
+            residual_inf_poro=_inf(R_poro),
+            residual_inf_ifc=_inf(R_ifc),
+            residual_inf_cip=_inf(R_cip),
+            residual_inf_gp=_inf(R_gp),
+            residual_inf_stab=_inf(R_stab),
+            residual_inf_bdry=_inf(R_bdry),
+        )
 
     dh: DofHandler = prob["dh"]
     fluid_ls = prob["fluid_ls"]
@@ -648,13 +1171,21 @@ def _run_one(
 
     theta_min_fluid = float("nan")
     theta_min_poro = float("nan")
+    theta_zeros_fluid = 0
+    theta_zeros_poro = 0
     if show_cut_ratios:
         try:
             prob["mesh"].classify_elements(fluid_ls)
             cut_ids = prob["mesh"].element_bitset("cut").to_indices()
             if cut_ids.size:
                 theta = hansbo_cut_ratio(prob["mesh"], fluid_ls, side="+")
-                theta_min_fluid = float(np.asarray(theta, dtype=float)[cut_ids].min())
+                theta_cut = np.asarray(theta, dtype=float)[cut_ids]
+                theta_zeros_fluid = int(np.sum(theta_cut <= 0.0))
+                # Use the smallest *strictly positive* cut ratio for diagnostics:
+                # for convex level sets, Γ can "graze" an element (two intersections
+                # on one edge) without contributing any volume on this side.
+                theta_pos = theta_cut[np.isfinite(theta_cut) & (theta_cut > 0.0) & (theta_cut < 1.0)]
+                theta_min_fluid = float(theta_pos.min()) if theta_pos.size else float("nan")
         except Exception:
             theta_min_fluid = float("nan")
         try:
@@ -662,9 +1193,14 @@ def _run_one(
             cut_ids = prob["mesh"].element_bitset("cut").to_indices()
             if cut_ids.size:
                 theta = hansbo_cut_ratio(prob["mesh"], poro_ls, side="-")
-                theta_min_poro = float(np.asarray(theta, dtype=float)[cut_ids].min())
+                theta_cut = np.asarray(theta, dtype=float)[cut_ids]
+                theta_zeros_poro = int(np.sum(theta_cut <= 0.0))
+                theta_pos = theta_cut[np.isfinite(theta_cut) & (theta_cut > 0.0) & (theta_cut < 1.0)]
+                theta_min_poro = float(theta_pos.min()) if theta_pos.size else float("nan")
         except Exception:
             theta_min_poro = float("nan")
+
+    qerr_eff = int(qerr) if qerr is not None else max(int(qdeg), 10)
 
     err_vF = dh.l2_error_on_side(
         functions=prob["vF_k"],
@@ -672,7 +1208,7 @@ def _run_one(
         fields=["v_pos_x", "v_pos_y"],
         level_set=fluid_ls,
         side="+",
-        quad_order=qdeg,
+        quad_order=qerr_eff,
         relative=False,
     )
     err_pF = dh.l2_error_on_side(
@@ -681,7 +1217,7 @@ def _run_one(
         fields=["p_pos_"],
         level_set=fluid_ls,
         side="+",
-        quad_order=qdeg,
+        quad_order=qerr_eff,
         relative=False,
     )
     err_vP = dh.l2_error_on_side(
@@ -690,7 +1226,7 @@ def _run_one(
         fields=["v_neg_x", "v_neg_y"],
         level_set=poro_ls,
         side="-",
-        quad_order=qdeg,
+        quad_order=qerr_eff,
         relative=False,
     )
     err_uP = dh.l2_error_on_side(
@@ -699,7 +1235,7 @@ def _run_one(
         fields=["u_neg_x", "u_neg_y"],
         level_set=poro_ls,
         side="-",
-        quad_order=qdeg,
+        quad_order=qerr_eff,
         relative=False,
     )
     err_pP = dh.l2_error_on_side(
@@ -708,7 +1244,7 @@ def _run_one(
         fields=["p_neg_"],
         level_set=poro_ls,
         side="-",
-        quad_order=qdeg,
+        quad_order=qerr_eff,
         relative=False,
     )
 
@@ -719,7 +1255,7 @@ def _run_one(
         fluid_ls,
         side="+",
         relative=False,
-        quad_order=qdeg,
+        quad_order=qerr_eff,
     )
     err_guP = dh.h1_error_vector_on_side(
         prob["uP_k"],
@@ -727,7 +1263,7 @@ def _run_one(
         poro_ls,
         side="-",
         relative=False,
-        quad_order=qdeg,
+        quad_order=qerr_eff,
     )
 
     # Interface kinematic errors (paper eq. (45))
@@ -749,7 +1285,7 @@ def _run_one(
         vP_A=vP_A,
         uP_Ak=uP_Ak,
         uP_An=uP_An,
-        quad_order=qdeg,
+        quad_order=qerr_eff,
         backend=backend,
     )
 
@@ -757,6 +1293,8 @@ def _run_one(
         h=float(prob["h"]),
         theta_min_fluid=theta_min_fluid,
         theta_min_poro=theta_min_poro,
+        theta_zeros_fluid=theta_zeros_fluid,
+        theta_zeros_poro=theta_zeros_poro,
         err_vF=err_vF,
         err_pF=err_pF,
         err_vP=err_vP,
@@ -792,8 +1330,21 @@ def main():
     )
     parser.add_argument("--t-end", type=float, default=0.1)
     parser.add_argument("--q", type=int, default=4)
+    parser.add_argument(
+        "--q-error",
+        type=int,
+        default=0,
+        help="Quadrature order for error norms (0 -> max(q, 10)).",
+    )
     parser.add_argument("--p", type=int, default=1)
-    parser.add_argument("--nx", type=int, default=6)
+    parser.add_argument(
+        "--mesh-layout",
+        type=str,
+        default="paper",
+        choices=["paper", "legacy"],
+        help="Geometry/layout: 'paper' uses a rotated outer mesh (Fig. 3); 'legacy' uses an axis-aligned background mesh.",
+    )
+    parser.add_argument("--nx", type=int, default=4)
     parser.add_argument("--levels", type=int, default=5, help="Number of h-refinement levels (convergence mode).")
     parser.add_argument("--interface", type=str, default="bj", choices=["bj", "bjs", "both"])
     parser.add_argument(
@@ -802,6 +1353,13 @@ def main():
         default="edge",
         choices=["edge", "patch"],
         help="Ghost-penalty integration: edge-based (default) or facet-patch.",
+    )
+    parser.add_argument(
+        "--ghost-weights",
+        type=str,
+        default="none",
+        choices=["none", "hansbo"],
+        help="Optional Hansbo cut-ratio weights for ghost penalties (default off).",
     )
     parser.add_argument(
         "--cut-drop-fluid",
@@ -815,9 +1373,64 @@ def main():
         default=0.0,
         help="Drop (tag inactive) poro DOFs on cut cells with θ_- < this threshold (sliver robustness).",
     )
+    parser.add_argument(
+        "--sliver-mass-fluid",
+        type=float,
+        default=float(os.getenv("PYCUTFEM_SLIVER_MASS_FLUID", "0.0")),
+        help="γ for fluid sliver-mass stabilization on cut cells (0 disables).",
+    )
+    parser.add_argument(
+        "--sliver-mass-poro",
+        type=float,
+        default=float(os.getenv("PYCUTFEM_SLIVER_MASS_PORO", "0.0")),
+        help="γ for porous-fluid sliver-mass stabilization on cut cells (0 disables).",
+    )
+    parser.add_argument(
+        "--sliver-mass-skeleton",
+        type=float,
+        default=float(os.getenv("PYCUTFEM_SLIVER_MASS_SKELETON", "0.0")),
+        help="γ for skeleton sliver-mass stabilization on cut cells (0 disables).",
+    )
+    parser.add_argument(
+        "--sliver-theta-eps",
+        type=float,
+        default=1.0e-16,
+        help="ε added to θ in sliver-mass denominators to avoid division by zero.",
+    )
+    parser.add_argument(
+        "--ghost-mass-fluid",
+        type=float,
+        default=float(os.getenv("PYCUTFEM_GHOST_MASS_FLUID", "0.0")),
+        help="γ for fluid velocity ghost-mass stabilization (jump-mass on ghost facets; 0 disables).",
+    )
+    parser.add_argument(
+        "--ghost-mass-poro",
+        type=float,
+        default=float(os.getenv("PYCUTFEM_GHOST_MASS_PORO", "0.0")),
+        help="γ for porous velocity ghost-mass stabilization (jump-mass on ghost facets; 0 disables).",
+    )
     parser.add_argument("--show-cut-ratios", action="store_true", help="Print min Hansbo cut ratios per mesh level.")
     parser.add_argument("--gamma-inv", type=float, default=45.0, help="Use gamma_n^{-1}=gamma_t^{-1}=gamma_inv (paper: 45).")
     parser.add_argument("--zeta", type=float, default=-1.0, help="Adjoint term symmetry: +1 (consistent) or -1 (inconsistent).")
+    parser.add_argument(
+        "--no-interface-terms",
+        action="store_false",
+        dest="use_interface_terms",
+        help="Disable Nitsche interface coupling terms (debug only).",
+    )
+    parser.add_argument(
+        "--no-stabilization",
+        action="store_false",
+        dest="use_stabilization",
+        help="Disable CIP/ghost stabilization terms (debug only).",
+    )
+    parser.add_argument(
+        "--inlet-bc",
+        type=str,
+        default="dofs",
+        choices=["dofs", "edges", "auto"],
+        help="How to impose Γ_F,D Dirichlet: DOF-tag ('dofs'), boundary-edge tag ('edges'), or auto fallback.",
+    )
     parser.add_argument(
         "--init",
         type=str,
@@ -826,26 +1439,176 @@ def main():
         help="Newton initial guess: previous time state ('prev') or exact MMS at t=t_end ('exact').",
     )
     parser.add_argument("--outdir", type=str, default="examples/FPI/_mms_example41_plots")
-    parser.add_argument("--convergence", action="store_true", help="Run a 2-level h-refinement study.")
+    parser.add_argument("--convergence", action="store_true", help="Run an h-refinement study (prints tables + saves plots).")
+    parser.add_argument(
+        "--nx-list",
+        type=str,
+        default="",
+        help="In convergence mode: comma-separated nx list (overrides --nx/--levels).",
+    )
+    parser.add_argument(
+        "--paper-h-range",
+        action="store_true",
+        help="In convergence mode: use the paper's h-range [0.25, 0.00390625] with 12 points (paper layout: nx=[4,6,8,12,16,24,32,48,64,96,128,256]; legacy: nx=[6,8,12,16,24,32,48,64,96,128,192,384]).",
+    )
+    parser.add_argument(
+        "--check-exact-residual",
+        action="store_true",
+        help="Assemble the residual at the manufactured solution (no solve) and print |R|_inf on free DOFs.",
+    )
+    parser.add_argument(
+        "--check-bcs",
+        action="store_true",
+        help="Print inlet boundary tags/Dirichlet DOF counts (no solve/assembly).",
+    )
+    parser.add_argument(
+        "--plot-mesh",
+        action="store_true",
+        help="Save a mesh plot (uses plot_mesh_2) with inlet segment and Dirichlet DOFs highlighted.",
+    )
     args = parser.parse_args()
+
+    if args.plot_mesh:
+        outdir = Path(args.outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        prob = _build_problem(
+            nx=int(args.nx),
+            poly_order=int(args.p),
+            qdeg=int(args.q),
+            dt_val=float(args.dt),
+            kinv_case=args.kinv,
+            mesh_layout=args.mesh_layout,
+            ghost=args.ghost,
+            ghost_weights=args.ghost_weights,
+            cut_drop_fluid=args.cut_drop_fluid,
+            cut_drop_poro=args.cut_drop_poro,
+        )
+        out_path = outdir / f"mesh_example41_{args.mesh_layout}_nx{int(args.nx)}_p{int(args.p)}.png"
+        _plot_example41_mesh(prob=prob, inlet_bc=args.inlet_bc, out_path=out_path)
+        print(f"Saved mesh plot to {out_path}")
+        return
+
+    if args.check_bcs:
+        def _parse_nx_list(spec: str) -> list[int]:
+            items = [s.strip() for s in str(spec).split(",") if s.strip()]
+            out: list[int] = []
+            for s in items:
+                try:
+                    out.append(int(s))
+                except Exception as e:
+                    raise ValueError(f"Invalid --nx-list entry {s!r}") from e
+            if any(n <= 0 for n in out):
+                raise ValueError(f"--nx-list must contain positive integers; got {out}")
+            return out
+
+        if args.convergence:
+            if bool(getattr(args, "paper_h_range", False)):
+                nx_list = (
+                    [4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256]
+                    if str(args.mesh_layout).strip().lower() == "paper"
+                    else [6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 384]
+                )
+            else:
+                nx_list = _parse_nx_list(getattr(args, "nx_list", "") or "")
+                if not nx_list:
+                    levels = max(1, int(args.levels))
+                    nx_list = [int(args.nx) * (2**i) for i in range(levels)]
+        else:
+            nx_list = [int(args.nx)]
+
+        print(
+            f"\nFPI Example 4.1 BC check | layout={args.mesh_layout} | backend={args.backend} | p={args.p} | inlet_bc={args.inlet_bc} | K_inv={args.kinv}"
+        )
+        for nx in nx_list:
+            prob = _build_problem(
+                nx=int(nx),
+                poly_order=int(args.p),
+                qdeg=int(args.q),
+                dt_val=float(args.dt),
+                kinv_case=args.kinv,
+                mesh_layout=args.mesh_layout,
+                ghost=args.ghost,
+                ghost_weights=args.ghost_weights,
+                cut_drop_fluid=args.cut_drop_fluid,
+                cut_drop_poro=args.cut_drop_poro,
+            )
+            print(f"\n  nx={nx:4d}  h={float(prob['h']):.3e}")
+            _print_bc_diagnostics(prob=prob, inlet_bc=args.inlet_bc)
+        return
+
+    if args.check_exact_residual:
+        out = _run_one(
+            nx=args.nx,
+            poly_order=args.p,
+            qdeg=args.q,
+            qerr=(None if int(args.q_error) <= 0 else int(args.q_error)),
+            dt_val=args.dt,
+            t_end=args.t_end,
+            backend=args.backend,
+            kinv_case=args.kinv,
+            interface=("bj" if args.interface == "both" else args.interface),
+            mesh_layout=args.mesh_layout,
+            gamma_inv=args.gamma_inv,
+            zeta=args.zeta,
+            init_guess="exact",
+            ghost=args.ghost,
+            ghost_weights=args.ghost_weights,
+            cut_drop_fluid=args.cut_drop_fluid,
+            cut_drop_poro=args.cut_drop_poro,
+            sliver_mass_fluid=args.sliver_mass_fluid,
+            sliver_mass_poro=args.sliver_mass_poro,
+            sliver_mass_skeleton=args.sliver_mass_skeleton,
+            sliver_theta_eps=args.sliver_theta_eps,
+            ghost_mass_fluid=args.ghost_mass_fluid,
+            ghost_mass_poro=args.ghost_mass_poro,
+            inlet_bc=args.inlet_bc,
+            show_cut_ratios=args.show_cut_ratios,
+            check_exact_residual=True,
+            use_interface_terms=args.use_interface_terms,
+            use_stabilization=args.use_stabilization,
+        )
+        print(f"h={out['h']:.3e}  |R|_inf(free)={out['residual_inf']:.3e}")
+        print(
+            "  components:"
+            f"  fluid={out.get('residual_inf_fluid', float('nan')):.3e}"
+            f"  poro={out.get('residual_inf_poro', float('nan')):.3e}"
+            f"  ifc={out.get('residual_inf_ifc', float('nan')):.3e}"
+            f"  cip={out.get('residual_inf_cip', float('nan')):.3e}"
+            f"  gp={out.get('residual_inf_gp', float('nan')):.3e}"
+            f"  stab={out.get('residual_inf_stab', float('nan')):.3e}"
+            f"  bdry={out.get('residual_inf_bdry', float('nan')):.3e}"
+        )
+        return
 
     if not args.convergence:
         out = _run_one(
             nx=args.nx,
             poly_order=args.p,
             qdeg=args.q,
+            qerr=(None if int(args.q_error) <= 0 else int(args.q_error)),
             dt_val=args.dt,
             t_end=args.t_end,
             backend=args.backend,
             kinv_case=args.kinv,
             interface=("bj" if args.interface == "both" else args.interface),
+            mesh_layout=args.mesh_layout,
             gamma_inv=args.gamma_inv,
             zeta=args.zeta,
             init_guess=args.init,
             ghost=args.ghost,
+            ghost_weights=args.ghost_weights,
             cut_drop_fluid=args.cut_drop_fluid,
             cut_drop_poro=args.cut_drop_poro,
+            sliver_mass_fluid=args.sliver_mass_fluid,
+            sliver_mass_poro=args.sliver_mass_poro,
+            sliver_mass_skeleton=args.sliver_mass_skeleton,
+            sliver_theta_eps=args.sliver_theta_eps,
+            ghost_mass_fluid=args.ghost_mass_fluid,
+            ghost_mass_poro=args.ghost_mass_poro,
+            inlet_bc=args.inlet_bc,
             show_cut_ratios=args.show_cut_ratios,
+            use_interface_terms=args.use_interface_terms,
+            use_stabilization=args.use_stabilization,
         )
         print(
             f"h={out['h']:.3e}  |e(vF)|={out['err_vF']:.3e}  |e(pF)|={out['err_pF']:.3e}  "
@@ -858,8 +1621,33 @@ def main():
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    levels = max(2, int(args.levels))
-    nx_list = [int(args.nx) * (2**i) for i in range(levels)]
+    def _parse_nx_list(spec: str) -> list[int]:
+        items = [s.strip() for s in str(spec).split(",") if s.strip()]
+        out: list[int] = []
+        for s in items:
+            try:
+                out.append(int(s))
+            except Exception as e:
+                raise ValueError(f"Invalid --nx-list entry {s!r}") from e
+        if not out:
+            return []
+        if any(n <= 0 for n in out):
+            raise ValueError(f"--nx-list must contain positive integers; got {out}")
+        return out
+
+    if bool(args.paper_h_range):
+        nx_list = (
+            [4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256]
+            if str(args.mesh_layout).strip().lower() == "paper"
+            else [6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 384]
+        )
+    else:
+        nx_list = _parse_nx_list(getattr(args, "nx_list", "") or "")
+        if not nx_list:
+            levels = max(2, int(args.levels))
+            nx_list = [int(args.nx) * (2**i) for i in range(levels)]
+
+    levels = len(nx_list)
 
     def _dt_for_level(i: int) -> float:
         fine_levels = max(0, int(args.dt_fine_levels))
@@ -875,28 +1663,44 @@ def main():
                 nx=nx,
                 poly_order=args.p,
                 qdeg=args.q,
+                qerr=(None if int(args.q_error) <= 0 else int(args.q_error)),
                 dt_val=_dt_for_level(i),
                 t_end=args.t_end,
                 backend=args.backend,
                 kinv_case=args.kinv,
                 interface=interface,
+                mesh_layout=args.mesh_layout,
                 gamma_inv=args.gamma_inv,
                 zeta=args.zeta,
                 init_guess=args.init,
                 ghost=args.ghost,
+                ghost_weights=args.ghost_weights,
                 cut_drop_fluid=args.cut_drop_fluid,
                 cut_drop_poro=args.cut_drop_poro,
+                sliver_mass_fluid=args.sliver_mass_fluid,
+                sliver_mass_poro=args.sliver_mass_poro,
+                sliver_mass_skeleton=args.sliver_mass_skeleton,
+                sliver_theta_eps=args.sliver_theta_eps,
+                ghost_mass_fluid=args.ghost_mass_fluid,
+                ghost_mass_poro=args.ghost_mass_poro,
+                inlet_bc=args.inlet_bc,
                 show_cut_ratios=args.show_cut_ratios,
+                use_interface_terms=args.use_interface_terms,
+                use_stabilization=args.use_stabilization,
             )
             for i, nx in enumerate(nx_list)
         ]
 
-        print(f"\nFPI Example 4.1 (BE) | backend={args.backend} | p={args.p} | K_inv={args.kinv} | interface={interface}")
+        print(
+            f"\nFPI Example 4.1 (BE) | layout={args.mesh_layout} | backend={args.backend} | p={args.p} | K_inv={args.kinv} | interface={interface}"
+        )
 
-        def _eoc(pe, ce):
-            if pe <= 0.0 or ce <= 0.0:
+        def _eoc(prev_h: float, curr_h: float, prev_err: float, curr_err: float) -> float:
+            if not (prev_h > 0.0 and curr_h > 0.0):
                 return float("nan")
-            return math.log(pe / ce, 2.0)
+            if not (prev_err > 0.0 and curr_err > 0.0):
+                return float("nan")
+            return float(math.log(prev_err / curr_err) / math.log(prev_h / curr_h))
 
         def _fmt(val):
             return "   - " if not np.isfinite(val) else f"{val:6.2f}"
@@ -912,11 +1716,11 @@ def main():
                 eoc_vf = eoc_pf = eoc_vp = eoc_pp = eoc_up = float("nan")
             else:
                 prev = rows[i - 1]
-                eoc_vf = _eoc(prev["err_vF"], r["err_vF"])
-                eoc_pf = _eoc(prev["err_pF"], r["err_pF"])
-                eoc_vp = _eoc(prev["err_vP"], r["err_vP"])
-                eoc_pp = _eoc(prev["err_pP"], r["err_pP"])
-                eoc_up = _eoc(prev["err_uP"], r["err_uP"])
+                eoc_vf = _eoc(prev["h"], r["h"], prev["err_vF"], r["err_vF"])
+                eoc_pf = _eoc(prev["h"], r["h"], prev["err_pF"], r["err_pF"])
+                eoc_vp = _eoc(prev["h"], r["h"], prev["err_vP"], r["err_vP"])
+                eoc_pp = _eoc(prev["h"], r["h"], prev["err_pP"], r["err_pP"])
+                eoc_up = _eoc(prev["h"], r["h"], prev["err_uP"], r["err_uP"])
             print(
                 f"{r['h']:8.3e}  {r['err_vF']:12.3e} {_fmt(eoc_vf)}  {r['err_pF']:12.3e} {_fmt(eoc_pf)}  "
                 f"{r['err_vP']:12.3e} {_fmt(eoc_vp)}  {r['err_pP']:12.3e} {_fmt(eoc_pp)}  {r['err_uP']:12.3e} {_fmt(eoc_up)}"
@@ -933,10 +1737,10 @@ def main():
                 eoc_gvf = eoc_gup = eoc_en = eoc_et = float("nan")
             else:
                 prev = rows[i - 1]
-                eoc_gvf = _eoc(prev["err_gvF"], r["err_gvF"])
-                eoc_gup = _eoc(prev["err_guP"], r["err_guP"])
-                eoc_en = _eoc(prev["En"], r["En"])
-                eoc_et = _eoc(prev["Et"], r["Et"])
+                eoc_gvf = _eoc(prev["h"], r["h"], prev["err_gvF"], r["err_gvF"])
+                eoc_gup = _eoc(prev["h"], r["h"], prev["err_guP"], r["err_guP"])
+                eoc_en = _eoc(prev["h"], r["h"], prev["En"], r["En"])
+                eoc_et = _eoc(prev["h"], r["h"], prev["Et"], r["Et"])
             print(
                 f"{r['h']:8.3e}  {r['err_gvF']:12.3e} {_fmt(eoc_gvf)}  {r['err_guP']:12.3e} {_fmt(eoc_gup)}  "
                 f"{r['En']:12.3e} {_fmt(eoc_en)}  {r['Et']:12.3e} {_fmt(eoc_et)}"
@@ -944,11 +1748,13 @@ def main():
 
         if args.show_cut_ratios:
             print("\n  Cut-cell diagnostics (min Hansbo θ on cut cells)")
-            print(f"{'h':>8}  {'theta_min(fluid)':>16}  {'theta_min(poro)':>14}")
+            print(f"{'h':>8}  {'theta_min(fluid)':>16}  {'#θ=0(F)':>8}  {'theta_min(poro)':>14}  {'#θ=0(P)':>8}")
             for r in rows:
                 tf = r.get("theta_min_fluid", float("nan"))
                 tp = r.get("theta_min_poro", float("nan"))
-                print(f"{r['h']:8.3e}  {tf:16.3e}  {tp:14.3e}")
+                zf = int(r.get("theta_zeros_fluid", 0) or 0)
+                zp = int(r.get("theta_zeros_poro", 0) or 0)
+                print(f"{r['h']:8.3e}  {tf:16.3e}  {zf:8d}  {tp:14.3e}  {zp:8d}")
         return rows
 
     rows_by_iface: dict[str, list[dict[str, float]]] = {}
@@ -1042,10 +1848,10 @@ def main():
         plt.gca().invert_xaxis()
         plt.xlabel("h")
         plt.ylabel(y_label)
-        plt.title(f"FPI Example 4.1 {y_label} | backend={args.backend} | p={args.p} | K_inv={args.kinv}")
+        plt.title(f"FPI Example 4.1 {y_label} | layout={args.mesh_layout} | backend={args.backend} | p={args.p} | K_inv={args.kinv}")
         plt.grid(True, which="both", ls=":")
         plt.legend()
-        outpath = outdir / f"example41_{metric_key}_backend-{args.backend}_p{args.p}_kinv-{args.kinv}_iface-{args.interface}.png"
+        outpath = outdir / f"example41_{metric_key}_layout-{args.mesh_layout}_backend-{args.backend}_p{args.p}_kinv-{args.kinv}_iface-{args.interface}.png"
         plt.tight_layout()
         plt.savefig(outpath, dpi=200)
         print(f"Saved log-log plot: {outpath}")

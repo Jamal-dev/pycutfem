@@ -1800,7 +1800,7 @@ class NumbaCodeGen:
                     body_lines.append("# Div(basis) → scalar basis (1,n_loc)")
 
                     body_lines += [
-                        f"n_loc  = {a.shape[1]}",  # number of local basis functions
+                        f"n_loc  = {a.var_name}.shape[1]",  # number of local basis functions (supports n_union=-1)
                         f"n_vec  = {a.shape[0]}",     # components k
                         f"{div_var} = np.zeros((1, n_loc), dtype={self.dtype})",
                         f"for j in range(n_loc):",            # local basis index
@@ -3769,7 +3769,11 @@ class NumbaCodeGen:
 
         decorator = ""
         if not DEBUG:
-            decorator = "@numba.njit(parallel=True, fastmath=True, cache=True)"
+            # Numba's on-disk cache can be fragile for facet kernels (large signatures and
+            # many small kernels). We already cache the generated Python source in
+            # `~/.cache/pycutfem_jit`, so disable Numba caching on facet kernels by default.
+            use_cache = not bool(getattr(self, "on_facet", False))
+            decorator = f"@numba.njit(parallel=True, fastmath=True, cache={str(use_cache)})"
         # New Newton: The kernel signature and loop structure are updated.
         final_kernel_src = f"""
 import numba

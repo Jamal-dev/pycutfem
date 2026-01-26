@@ -288,7 +288,21 @@ def inverse_mapping(mesh, elem_id, x, tol=1e-10, maxiter=50):
             # IMPORTANT: The _invmap_q1_try assumes a node order that may not match your
             # project's lexicographical order. Ensure `coords[:4]` is ordered correctly.
             if mesh.element_type == 'quad' and coords.shape[0] >= 4:
-                r = _invmap_q1_try(coords[:4], x, tol, maxiter)
+                # The numba Q1 inverse-map kernel (_q1_shape_grad) uses a CCW corner
+                # ordering: [(-1,-1),(+1,-1),(+1,+1),(-1,+1)] i.e. [bl, br, tr, tl].
+                # Our meshes typically store Q1 element lattice nodes in lexicographic
+                # order [bl, br, tl, tr]. Prefer `corner_connectivity` when available
+                # and fall back to a swap of the last two corners.
+                try:
+                    cc = getattr(mesh, "corner_connectivity", None)
+                    if cc is not None:
+                        coords_q1 = mesh.nodes_x_y_pos[np.asarray(cc[int(elem_id)], dtype=int)].astype(float)
+                    else:
+                        coords_q1 = coords[:4].copy()
+                        coords_q1 = coords_q1[[0, 1, 3, 2]]
+                except Exception:
+                    coords_q1 = coords[:4]
+                r = _invmap_q1_try(coords_q1[:4], x, tol, maxiter)
                 if r[2] == 1.0: return r[:2]
         
         # --- ADDED: Fast path for Q2 elements ---

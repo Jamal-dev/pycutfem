@@ -11,7 +11,7 @@ from pycutfem.core import mesh
 from pycutfem.jit.ir import LoadAnalytic
 
 # Bump when generated kernel source semantics/signature change.
-CODEGEN_ABI = "2026-01-23-abi-outer-1"
+CODEGEN_ABI = "2026-01-26-abi-outer-3-divbasis-runtime"
 
 class KernelCache:
     """

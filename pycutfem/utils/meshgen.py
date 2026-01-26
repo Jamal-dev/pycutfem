@@ -44,6 +44,32 @@ def _translate_nodes(nodes: List[Node], offset: Tuple[float, float]):
         node.x = coords[i, 0]
         node.y = coords[i, 1]
 
+
+def _rotate_coords(coords: np.ndarray, *, angle: float, center: Tuple[float, float]):
+    """Rotate coordinates in-place around `center` by `angle` (radians)."""
+    ang = float(angle)
+    if coords.size == 0 or abs(ang) <= 0.0:
+        return coords
+    cx, cy = float(center[0]), float(center[1])
+    c = float(np.cos(ang))
+    s = float(np.sin(ang))
+    x = coords[:, 0] - cx
+    y = coords[:, 1] - cy
+    coords[:, 0] = cx + c * x - s * y
+    coords[:, 1] = cy + s * x + c * y
+    return coords
+
+
+def _rotate_nodes(nodes: List[Node], *, angle: float, center: Tuple[float, float]):
+    """Rotate Node objects in-place around `center` by `angle` (radians)."""
+    if not nodes or abs(float(angle)) <= 0.0:
+        return
+    coords = np.array([[node.x, node.y] for node in nodes], dtype=float)
+    _rotate_coords(coords, angle=float(angle), center=center)
+    for i, node in enumerate(nodes):
+        node.x = float(coords[i, 0])
+        node.y = float(coords[i, 1])
+
 @numba.jit(nopython=True, cache=True)
 def _translate_coords(coords: np.ndarray, offset: np.ndarray):
     """Translates all node coordinates by a given offset vector."""
@@ -93,14 +119,21 @@ def unique_rows_int64_impl(a):
 unique_rows_int64 = unique_rows_int64_impl
 
 def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int, 
-                    offset: Optional[Tuple[float, float]] = None,numba_path=True, parallel: bool = True):
+                    offset: Optional[Tuple[float, float]] = None,
+                    rotation: Optional[float] = None,
+                    rotation_center: Optional[Tuple[float, float]] = None,
+                    numba_path=True, parallel: bool = True):
     """
     Main wrapper for generating structured quadrilateral meshes.
     Returns raw data: node objects, element connectivity, edge connectivity,
     and corner node connectivity for each element.
     """
     if not numba_path:
-        return _structured_qn(Lx, Ly, nx, ny, poly_order, offset)
+        nodes, elements, edges, elements_corner_nodes = _structured_qn(Lx, Ly, nx, ny, poly_order, offset)
+        if rotation is not None:
+            center = rotation_center if rotation_center is not None else (0.0, 0.0)
+            _rotate_nodes(nodes, angle=float(rotation), center=center)
+        return nodes, elements, edges, elements_corner_nodes
     else:
         # 1. Call the fast Numba core to get raw NumPy arrays
         nodes_coords, elements, edges, elements_corner_nodes = _structured_qn_numba(
@@ -108,6 +141,9 @@ def structured_quad(Lx: float, Ly: float, *, nx: int, ny: int, poly_order: int,
         )
         if offset is not None:
             nodes_coords = _translate_coords(nodes_coords, np.array(offset, dtype=np.float64))
+        if rotation is not None:
+            center = rotation_center if rotation_center is not None else (0.0, 0.0)
+            nodes_coords = _rotate_coords(nodes_coords, angle=float(rotation), center=center)
 
         # 2. Convert the raw coordinate array back to a list of Node objects
         # This loop is fast and runs in standard Python.

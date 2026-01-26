@@ -424,13 +424,25 @@ class KernelRunner:
             return self.kernel(*final_args)
         except Exception as exc:
             # Debug aid: surface argument shapes/types when a compiled kernel fails.
+            import os
             import sys
-            print("[KernelRunner] kernel execution failed; argument dump:", file=sys.stderr)
-            for tag, arr in zip(self.param_order, final_args):
-                if isinstance(arr, np.ndarray):
-                    print(f"    {tag:<20} shape={arr.shape} dtype={arr.dtype}", file=sys.stderr)
-                else:
-                    print(f"    {tag:<20} type={type(arr).__name__}", file=sys.stderr)
+            try:
+                mod = getattr(getattr(self.kernel, "py_func", None), "__module__", None) or getattr(self.kernel, "__module__", None)
+            except Exception:
+                mod = None
+            verbose_fail = debug or (os.getenv("PYCUTFEM_JIT_DEBUG_FAIL", "").lower() in {"1", "true", "yes"})
+            if verbose_fail:
+                if mod:
+                    print(f"[KernelRunner] failing kernel module: {mod}", file=sys.stderr)
+                print("[KernelRunner] kernel execution failed; argument dump:", file=sys.stderr)
+                for tag, arr in zip(self.param_order, final_args):
+                    if isinstance(arr, np.ndarray):
+                        print(f"    {tag:<20} shape={arr.shape} dtype={arr.dtype}", file=sys.stderr)
+                    else:
+                        print(f"    {tag:<20} type={type(arr).__name__}", file=sys.stderr)
+            # Default: stay quiet here. Higher-level assemblers may fall back to a
+            # Python path, and users can enable detailed dumps via
+            # PYCUTFEM_JIT_DEBUG or PYCUTFEM_JIT_DEBUG_FAIL.
             raise
 
 def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet: bool = False ): # New Newton: Pass dof_handler

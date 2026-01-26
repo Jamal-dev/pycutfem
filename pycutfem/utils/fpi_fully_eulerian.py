@@ -72,6 +72,10 @@ class FPIEulerianForms:
     interface: FPIInterfaceForms | None
     a_stab: object
     r_stab: object
+    a_cip: object
+    r_cip: object
+    a_gp: object
+    r_gp: object
 
 
 def build_fpi_eulerian_forms(
@@ -146,6 +150,9 @@ def build_fpi_eulerian_forms(
     c_t_gamma: float = 1.0 / 12.0,
     # optional override for the interface mesh-size parameter h_Γ (paper eq. (24))
     h_gamma=None,
+    # optional: Hansbo-based sliver weights for ghost penalties (elementwise constants)
+    w_ghost_f=None,
+    w_ghost_p=None,
     # feature toggles
     use_interface_terms: bool = True,
     use_stabilization: bool = True,
@@ -312,8 +319,14 @@ def build_fpi_eulerian_forms(
     # ------------------------------------------------------------------
     # Facet stabilizations (optional)
     # ------------------------------------------------------------------
-    a_stab = Constant(0.0) * dpF * qF_test * dx_f
-    r_stab = Constant(0.0) * qF_test * dx_f
+    a_zero = Constant(0.0) * dpF * qF_test * dx_f
+    r_zero = Constant(0.0) * qF_test * dx_f
+    a_cip = a_zero
+    r_cip = r_zero
+    a_gp = a_zero
+    r_gp = r_zero
+    a_stab = a_zero
+    r_stab = r_zero
     if use_stabilization:
         n = FacetNormal()
 
@@ -322,10 +335,20 @@ def build_fpi_eulerian_forms(
         ls_f = level_set_f if level_set_f is not None else level_set
         ls_p = level_set_p if level_set_p is not None else level_set
         derivs = {(1, 0), (0, 1)}
+        if use_paper_stabilization and int(poly_order) >= 2 and float(gp_second_weight) != 0.0:
+            derivs |= {(2, 0), (1, 1), (0, 2)}
         dS_f = dCutSkeleton(level_set=ls_f, metadata={"q": qdeg, "side": "+", "derivs": derivs})
         dS_p = dCutSkeleton(level_set=ls_p, metadata={"q": qdeg, "side": "-", "derivs": derivs})
         dG_f_stab = dG_f(metadata={"derivs": derivs})
         dG_p_stab = dG_p(metadata={"derivs": derivs})
+
+        # Optional sliver weights for ghost penalties: amplify stabilization on tiny cut fractions.
+        w_gp_f = Constant(1.0)
+        w_gp_p = Constant(1.0)
+        if w_ghost_f is not None:
+            w_gp_f = avg(w_ghost_f)
+        if w_ghost_p is not None:
+            w_gp_p = avg(w_ghost_p)
 
         if use_paper_stabilization:
             # CIP parameters (paper eqs. (21)-(22)) and ghost penalty (paper eq. (23)).
@@ -358,34 +381,34 @@ def build_fpi_eulerian_forms(
             tau_P_div = Constant(float(gamma_div)) * h_F * Phi_P
 
             # CIP on interior faces.
-            a_stab += tau_F_u * _grad_inner_jump(dvF, vF_test, n) * dS_f
-            r_stab += tau_F_u * _grad_inner_jump(vF_k, vF_test, n) * dS_f
+            a_cip += tau_F_u * _grad_inner_jump(dvF, vF_test, n) * dS_f
+            r_cip += tau_F_u * _grad_inner_jump(vF_k, vF_test, n) * dS_f
 
-            a_stab += tau_F_p * _grad_inner_jump(dpF, qF_test, n) * dS_f
-            r_stab += tau_F_p * _grad_inner_jump(pF_k, qF_test, n) * dS_f
+            a_cip += tau_F_p * _grad_inner_jump(dpF, qF_test, n) * dS_f
+            r_cip += tau_F_p * _grad_inner_jump(pF_k, qF_test, n) * dS_f
 
-            a_stab += tau_F_div * jump(div(dvF)) * jump(div(vF_test)) * dS_f
-            r_stab += tau_F_div * jump(div(vF_k)) * jump(div(vF_test)) * dS_f
+            a_cip += tau_F_div * jump(div(dvF)) * jump(div(vF_test)) * dS_f
+            r_cip += tau_F_div * jump(div(vF_k)) * jump(div(vF_test)) * dS_f
 
-            a_stab += tau_P_p * _grad_inner_jump(dpP, qP_test, n) * dS_p
-            r_stab += tau_P_p * _grad_inner_jump(pP_k, qP_test, n) * dS_p
+            a_cip += tau_P_p * _grad_inner_jump(dpP, qP_test, n) * dS_p
+            r_cip += tau_P_p * _grad_inner_jump(pP_k, qP_test, n) * dS_p
 
-            a_stab += tau_P_div * jump(div(dvP)) * jump(div(vP_test)) * dS_p
-            r_stab += tau_P_div * jump(div(vP_k)) * jump(div(vP_test)) * dS_p
+            a_cip += tau_P_div * jump(div(dvP)) * jump(div(vP_test)) * dS_p
+            r_cip += tau_P_div * jump(div(vP_k)) * jump(div(vP_test)) * dS_p
 
             # Ghost penalty on near-interface faces (for Q1: only j=1 is non-zero).
             tau_GP_p1 = tau_F_p
             tau_GP_div1 = tau_F_div
             tau_GP_u1 = tau_F_u + Constant(float(gamma_gp_nu)) * h_F * mu_f + Constant(float(gamma_gp_t)) * (h_F**3) * (rho_f / (th * dt))
 
-            a_stab += tau_GP_p1 * _grad_inner_jump(dpF, qF_test, n) * dG_f_stab
-            r_stab += tau_GP_p1 * _grad_inner_jump(pF_k, qF_test, n) * dG_f_stab
+            a_gp += w_gp_f * tau_GP_p1 * _grad_inner_jump(dpF, qF_test, n) * dG_f_stab
+            r_gp += w_gp_f * tau_GP_p1 * _grad_inner_jump(pF_k, qF_test, n) * dG_f_stab
 
-            a_stab += tau_GP_div1 * jump(div(dvF)) * jump(div(vF_test)) * dG_f_stab
-            r_stab += tau_GP_div1 * jump(div(vF_k)) * jump(div(vF_test)) * dG_f_stab
+            a_gp += w_gp_f * tau_GP_div1 * jump(div(dvF)) * jump(div(vF_test)) * dG_f_stab
+            r_gp += w_gp_f * tau_GP_div1 * jump(div(vF_k)) * jump(div(vF_test)) * dG_f_stab
 
-            a_stab += tau_GP_u1 * _grad_inner_jump(dvF, vF_test, n) * dG_f_stab
-            r_stab += tau_GP_u1 * _grad_inner_jump(vF_k, vF_test, n) * dG_f_stab
+            a_gp += w_gp_f * tau_GP_u1 * _grad_inner_jump(dvF, vF_test, n) * dG_f_stab
+            r_gp += w_gp_f * tau_GP_u1 * _grad_inner_jump(vF_k, vF_test, n) * dG_f_stab
 
             # Poro-side ghost penalties: our fully Eulerian/CutFEM setup also cuts Ω⁻,
             # unlike the reference implementation in the paper. Penalize jumps on
@@ -399,22 +422,22 @@ def build_fpi_eulerian_forms(
                 rho_f / (th * dt)
             )
 
-            a_stab += tau_GP_P_p1 * _grad_inner_jump(dpP, qP_test, n) * dG_p_stab
-            r_stab += tau_GP_P_p1 * _grad_inner_jump(pP_k, qP_test, n) * dG_p_stab
+            a_gp += w_gp_p * tau_GP_P_p1 * _grad_inner_jump(dpP, qP_test, n) * dG_p_stab
+            r_gp += w_gp_p * tau_GP_P_p1 * _grad_inner_jump(pP_k, qP_test, n) * dG_p_stab
 
-            a_stab += tau_GP_P_div1 * jump(div(dvP)) * jump(div(vP_test)) * dG_p_stab
-            r_stab += tau_GP_P_div1 * jump(div(vP_k)) * jump(div(vP_test)) * dG_p_stab
+            a_gp += w_gp_p * tau_GP_P_div1 * jump(div(dvP)) * jump(div(vP_test)) * dG_p_stab
+            r_gp += w_gp_p * tau_GP_P_div1 * jump(div(vP_k)) * jump(div(vP_test)) * dG_p_stab
 
-            a_stab += tau_GP_P_v1 * _grad_inner_jump(dvP, vP_test, n) * dG_p_stab
-            r_stab += tau_GP_P_v1 * _grad_inner_jump(vP_k, vP_test, n) * dG_p_stab
+            a_gp += w_gp_p * tau_GP_P_v1 * _grad_inner_jump(dvP, vP_test, n) * dG_p_stab
+            r_gp += w_gp_p * tau_GP_P_v1 * _grad_inner_jump(vP_k, vP_test, n) * dG_p_stab
 
             # Skeleton displacement ghost penalty (elastic scaling).
             # Use the same γ^{GP}_ν coefficient as for the fluid velocity GP to
             # avoid over-penalizing the poro skeleton (the paper uses a fitted
             # mesh on Ω^P so this term is not present there).
             tau_GP_uP1 = Constant(float(gamma_gp_nu)) * Constant(2.0) * c_nh * h_F
-            a_stab += tau_GP_uP1 * _grad_inner_jump(duP, uP_test, n) * dG_p_stab
-            r_stab += tau_GP_uP1 * _grad_inner_jump(uP_k, uP_test, n) * dG_p_stab
+            a_gp += w_gp_p * tau_GP_uP1 * _grad_inner_jump(duP, uP_test, n) * dG_p_stab
+            r_gp += w_gp_p * tau_GP_uP1 * _grad_inner_jump(uP_k, uP_test, n) * dG_p_stab
 
             # Optional j=2 terms for bi-quadratic discretizations.
             if int(poly_order) >= 2 and float(gp_second_weight) != 0.0:
@@ -428,29 +451,32 @@ def build_fpi_eulerian_forms(
                 def _dn2(u):
                     return dot(grad(_dn(u)), n)
 
-                a_stab += tau_GP_p2 * inner(jump(_dn2(dpF)), jump(_dn2(qF_test))) * dG_f_stab
-                r_stab += tau_GP_p2 * inner(jump(_dn2(pF_k)), jump(_dn2(qF_test))) * dG_f_stab
+                a_gp += w_gp_f * tau_GP_p2 * inner(jump(_dn2(dpF)), jump(_dn2(qF_test))) * dG_f_stab
+                r_gp += w_gp_f * tau_GP_p2 * inner(jump(_dn2(pF_k)), jump(_dn2(qF_test))) * dG_f_stab
 
-                a_stab += tau_GP_u2 * inner(jump(_dn2(dvF)), jump(_dn2(vF_test))) * dG_f_stab
-                r_stab += tau_GP_u2 * inner(jump(_dn2(vF_k)), jump(_dn2(vF_test))) * dG_f_stab
+                a_gp += w_gp_f * tau_GP_u2 * inner(jump(_dn2(dvF)), jump(_dn2(vF_test))) * dG_f_stab
+                r_gp += w_gp_f * tau_GP_u2 * inner(jump(_dn2(vF_k)), jump(_dn2(vF_test))) * dG_f_stab
 
         else:
             # Legacy lightweight stabilization knobs (kept for earlier MMS/debug scripts).
             if float(gamma_F_p) != 0.0:
-                a_stab += Constant(float(gamma_F_p)) * (cell_h**3) * _grad_inner_jump(dpF, qF_test, n) * dS_f
-                r_stab += Constant(float(gamma_F_p)) * (cell_h**3) * _grad_inner_jump(pF_k, qF_test, n) * dS_f
+                a_cip += Constant(float(gamma_F_p)) * (cell_h**3) * _grad_inner_jump(dpF, qF_test, n) * dS_f
+                r_cip += Constant(float(gamma_F_p)) * (cell_h**3) * _grad_inner_jump(pF_k, qF_test, n) * dS_f
 
             if float(gamma_F_gp) != 0.0:
-                a_stab += Constant(float(gamma_F_gp)) * (cell_h**3) * _grad_inner_jump(dpF, qF_test, n) * dG_f_stab
-                r_stab += Constant(float(gamma_F_gp)) * (cell_h**3) * _grad_inner_jump(pF_k, qF_test, n) * dG_f_stab
+                a_gp += Constant(float(gamma_F_gp)) * (cell_h**3) * _grad_inner_jump(dpF, qF_test, n) * dG_f_stab
+                r_gp += Constant(float(gamma_F_gp)) * (cell_h**3) * _grad_inner_jump(pF_k, qF_test, n) * dG_f_stab
 
             if float(gamma_P_p) != 0.0:
-                a_stab += Constant(float(gamma_P_p)) * (cell_h**3) * _grad_inner_jump(dpP, qP_test, n) * dS_p
-                r_stab += Constant(float(gamma_P_p)) * (cell_h**3) * _grad_inner_jump(pP_k, qP_test, n) * dS_p
+                a_cip += Constant(float(gamma_P_p)) * (cell_h**3) * _grad_inner_jump(dpP, qP_test, n) * dS_p
+                r_cip += Constant(float(gamma_P_p)) * (cell_h**3) * _grad_inner_jump(pP_k, qP_test, n) * dS_p
 
             if float(gamma_P_gp) != 0.0:
-                a_stab += Constant(float(gamma_P_gp)) * (cell_h**3) * _grad_inner_jump(dpP, qP_test, n) * dG_p_stab
-                r_stab += Constant(float(gamma_P_gp)) * (cell_h**3) * _grad_inner_jump(pP_k, qP_test, n) * dG_p_stab
+                a_gp += Constant(float(gamma_P_gp)) * (cell_h**3) * _grad_inner_jump(dpP, qP_test, n) * dG_p_stab
+                r_gp += Constant(float(gamma_P_gp)) * (cell_h**3) * _grad_inner_jump(pP_k, qP_test, n) * dG_p_stab
+
+        a_stab = a_cip + a_gp
+        r_stab = r_cip + r_gp
 
     jacobian_form = a_fluid + a_poro + a_ifc + a_stab
     residual_form = r_fluid + r_poro + r_ifc + r_stab
@@ -465,4 +491,8 @@ def build_fpi_eulerian_forms(
         interface=interface,
         a_stab=a_stab,
         r_stab=r_stab,
+        a_cip=a_cip,
+        r_cip=r_cip,
+        a_gp=a_gp,
+        r_gp=r_gp,
     )
