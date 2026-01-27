@@ -169,13 +169,18 @@ def _is_scalar(a) -> bool:
     if np.ndim(a) == 0: return True
     raise NotImplementedError(f"Unsupported type: {type(a)}")
 def _is_scalar_field(a) -> bool:
-    """Check if the given vector is a scalar field."""
+    """Check if the given vector is a scalar field.
+       Fields can be trial and test for function if we have only one component."""
     if isinstance(a, VecOpInfo):
         if a.role in {"trial", "test"}:
             return a.data.shape[0] == 1
         elif a.role == "function":
             collapsed_fun = _collapsed_function(a.data)
             return collapsed_fun.shape[0] == 1
+        # elif a.role in {"scalar"}:
+        #     return True
+        # elif a.role in {"vector"}:
+        #     return False
         # elif a.role in {"scalar", "vector"}:
         #     return False
         else:
@@ -196,6 +201,8 @@ def _is_scalar_field(a) -> bool:
             return a.data.shape[0] == 1
         else:
             raise NotImplementedError(f"Unsupported HessOpInfo role: {a.role}")
+    # if isinstance(a,np.ndarray):
+    #     return a.ndim == 0
     raise NotImplementedError(f"Unsupported type: {type(a)}")
 
 # ========================================================================
@@ -247,11 +254,16 @@ class BaseOpInfo:
     @property
     def shape(self) -> Tuple[int, ...]:
         """Returns the shape of the data array."""
-        return self.data.shape
+        shape = getattr(self.data, 'shape', ())
+        return shape
     @property
     def ndim(self) -> int:
         """Returns the number of dimensions of the data array."""
-        return self.data.ndim
+        ndim = getattr(self.data, 'ndim', None)
+        if ndim is not None:
+            return ndim
+        else:
+            return 0
     # ---------- NumPy interop ----------
     # Make NumPy prefer our ufunc handler over eager coercion to ndarray
     __array_priority__ = 10_000
@@ -375,6 +387,32 @@ class VecOpInfo(BaseOpInfo):
             role_b = None
 
         A = self.data
+        other_shape = getattr(other, 'shape', None)
+        type_a = self.__class__.__name__
+        type_b = other.__class__.__name__
+        A = np.asarray(A)
+        B = np.asarray(B)
+        is_A_scalar = A.ndim == 0
+        is_B_scalar = B.ndim == 0
+        def is_field_1d(role, field, arr: np.ndarray) -> bool:
+            """
+            Return True when the operand should be treated as a 1D vector in
+            scalar-multiplication branches.
+
+            - trial/test/function: True iff it is a *scalar* field (1 component)
+            - vector / None      : True iff the numeric array is 1D
+            - scalar             : False (scalar is handled via `is_*_scalar`)
+            """
+            if role in {"trial", "test", "function"}:
+                return _is_scalar_field(field)
+            if role in {"vector", None}:
+                return np.asarray(arr).ndim == 1
+            if role == "scalar":
+                return False
+            raise ValueError(self._error_msg(other, "VecOpInfo.inner"))
+
+        is_A_1d = is_field_1d(role_a, self, A)
+        is_B_1d = is_field_1d(role_b, other, B)
         if A.ndim == 2 and B.ndim == 1 and A.shape[0] != B.shape[0]:
             raise ValueError("VecOpInfo component mismatch for inner product.")
         if A.ndim == 2 and B.ndim == 0 and A.shape[0] != 1:
@@ -396,6 +434,10 @@ class VecOpInfo(BaseOpInfo):
             elif role_a in {"trial","test"} and role_b is None and B.ndim == 0:
                 # Scalar test/trial times scalar constant.
                 return A[0, :] * float(B)
+            elif role_a in {"vector", "trial","test"} and role_b in {"scalar"} and is_B_scalar and is_A_1d:
+                return A.flatten() * float(B)
+            elif role_a in {"scalar"} and role_b in {"vector", "trial","test"} and is_A_scalar and is_B_1d:
+                return B.flatten() * float(A)
             elif role_a in {"vector"} and role_b in {"vector"}:
                 return np.dot(A, B)
             elif role_a in {"vector"} and role_b in {"function"}:
@@ -427,9 +469,11 @@ class VecOpInfo(BaseOpInfo):
                 trial_var = other if role_a == "test" else self
                 return test_var.data.T @ trial_var.data # (n,n)
 
-        raise ValueError(f"Unsupported inner dims A{A.shape}, B{B.shape} for VecOpInfo."
-                         f" Roles: A={role_a}, B={role_b}."
-                         f" is_rhs: {self.is_rhs}")
+        raise ValueError(f"Unsupported inner dims shape_A:{self.shape}, shape_B:{other_shape} for VecOpInfo."
+                         f", Roles: A={role_a}, B={role_b}."
+                         f", is_rhs: {self.is_rhs}"
+                         f", Type: {type_a}/{type_b}"
+                         f", is_A_1d: {is_A_1d}, is_B_1d: {is_B_1d}")
     
 
     def dot_const(self, const: np.ndarray):
@@ -693,6 +737,10 @@ class VecOpInfo(BaseOpInfo):
         elif isinstance(other, VecOpInfo):
             # if self.data.shape != other.data.shape:
             #     raise ValueError("VecOpInfo shapes mismatch in multiplication.")
+            if self.role == "scalar" and other.role == "scalar":
+                data = float(self.data) * float(other.data)
+                meta = _resolve_meta(self.meta(), other.meta())
+                return VecOpInfo(data, role="scalar", **self.update_meta(meta))
             if self.role == "trial" and other.role == "test":
                 # Case: Trial * Test , outer product case
                 return np.einsum("km,kn->mn", other.data , self.data, optimize=True)
@@ -1392,7 +1440,9 @@ class GradOpInfo(BaseOpInfo):
                 if grad_val.shape[-1] != other_vec.shape[0]:
                     raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
                 data = np.einsum("kd,d->k", grad_val, other_vec, optimize=True)
-                role = "scalar" if data.ndim == 0 else "vector"
+                if isinstance(data, np.ndarray) and data.shape == (1,):
+                    return VecOpInfo(float(data[0]), role="scalar", **self.update_meta(self.meta()))
+                role = "scalar" if np.ndim(data) == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
             if self.data.shape[-1] != other_vec.shape[0]:
                 raise ValueError(f"Cannot dot(∇w, n) GradOpInfo {self.shape} with vector of shape {other_vec.shape}.")
@@ -1543,6 +1593,9 @@ class GradOpInfo(BaseOpInfo):
             mat = self._eval_function_to_2d()
             if arr.shape == mat.shape:
                 return self._with(mat + arr, role=self.role)
+            if arr.ndim == 1 and mat.ndim == 2 and arr.shape[0] == mat.shape[1]:
+                arr2 = np.broadcast_to(arr.reshape(1, -1), mat.shape)
+                return self._with(mat + arr2, role=self.role)
             # if arr.ndim == 2 and arr.shape == (mat.shape[1], mat.shape[0]):
             #     arr = arr.T
             #     return self._with(mat + arr, role=self.role)

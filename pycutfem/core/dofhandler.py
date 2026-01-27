@@ -39,6 +39,7 @@ BcLike = Union[BoundaryCondition, Mapping[str, Any]]
 # ------------------------------------------------------------------
 _edge_geom_cache: dict[tuple[int,int,int], dict] = {}
 _ghost_cache: dict[tuple, dict] = {}
+_nonmatching_cache: dict[tuple, dict] = {}
 _facet_patch_cache: dict[tuple, dict] = {}
 _facet_patch_geo_cache: dict[tuple, dict] = {}
 _jacobian_cache: dict[tuple, dict] = {}
@@ -190,6 +191,7 @@ def clear_caches() -> None:
     _cut_volume_cache.clear()
     _edge_geom_cache.clear()
     _ghost_cache.clear()
+    _nonmatching_cache.clear()
     _facet_patch_cache.clear()
     _facet_patch_geo_cache.clear()
     _jacobian_cache.clear()
@@ -522,6 +524,52 @@ class DofHandler:
         rt_fields = [f for f in fields if isinstance(families, dict) and families.get(f) == "RT"]
         std_fields = [f for f in fields if f not in rt_fields]
 
+        # ------------------------------------------------------------------
+        # Connected-component ids (prevent CG DOF unification across disjoint
+        # mesh components that may share coordinates, e.g. composite meshes
+        # used for non-matching coupling).
+        # ------------------------------------------------------------------
+        n_cells = len(mesh.elements_connectivity)
+        neigh = getattr(mesh, "_neighbors", None)
+        if neigh is None:
+            neigh = getattr(mesh, "neighbors", lambda: None)()
+        if neigh is None:
+            elem_comp = np.zeros((n_cells,), dtype=np.int32)
+        else:
+            elem_comp = -np.ones((n_cells,), dtype=np.int32)
+            comp_id = 0
+            for start in range(n_cells):
+                if elem_comp[start] >= 0:
+                    continue
+                stack = [int(start)]
+                elem_comp[start] = int(comp_id)
+                while stack:
+                    e = int(stack.pop())
+                    for nb in neigh[e]:
+                        if nb is None:
+                            continue
+                        j = int(nb)
+                        if 0 <= j < n_cells and elem_comp[j] < 0:
+                            elem_comp[j] = int(comp_id)
+                            stack.append(j)
+                comp_id += 1
+
+        # Node component ids (each node belongs to exactly one element component).
+        n_nodes = int(mesh.nodes_x_y_pos.shape[0])
+        node_comp = -np.ones((n_nodes,), dtype=np.int32)
+        try:
+            conn_all = np.asarray(mesh.elements_connectivity, dtype=np.int64)
+            for eid in range(n_cells):
+                c = int(elem_comp[eid])
+                for nid in conn_all[eid]:
+                    ii = int(nid)
+                    if 0 <= ii < n_nodes and node_comp[ii] < 0:
+                        node_comp[ii] = c
+        except Exception:
+            # Fallback: best-effort (single component).
+            node_comp[:] = 0
+        node_comp[node_comp < 0] = 0
+
 
         # -------- helpers ---------------------------------------------------------
         def _lattice_quad(p: int):
@@ -552,21 +600,24 @@ class DofHandler:
         element_signs: dict[str, list[list[float]]] = {f: [] for f in fields}
 
         # within-field dictionary: (qx, qy) -> gdof  (keeps CG continuity per field)
-        key2gdof: dict[str, dict[tuple[float, float], int]] = {f: {} for f in fields}
+        # Include component id to avoid merging across disconnected components.
+        key2gdof: dict[str, dict[tuple[int, float, float], int]] = {f: {} for f in fields}
 
         # accumulation of coords and field membership
         dof_coords: list[tuple[float, float]] = []
+        dof_comp: list[int] = []
         field_gsets: dict[str, set[int]] = {f: set() for f in fields}
 
         next_gid = 0
 
-        n_cells = len(mesh.elements_connectivity)
         for eid in range(n_cells):
+            cid = int(elem_comp[int(eid)]) if elem_comp is not None else 0
             for f in std_fields:
                 if f in numset:
                     if f not in num_gid:
                         num_gid[f] = next_gid; next_gid += 1
                         dof_coords.append((0.0, 0.0))
+                        dof_comp.append(int(cid))
                     field_gsets[f].add(num_gid[f])
                     element_maps[f].append([int(num_gid[f])]) 
                     element_signs[f].append([1.0])
@@ -578,7 +629,7 @@ class DofHandler:
 
                 for (xi, eta) in lat:
                     X = transform.x_mapping(mesh, int(eid), (xi, eta))  # (x,y)
-                    k = (_q(float(X[0])), _q(float(X[1])))
+                    k = (int(cid), _q(float(X[0])), _q(float(X[1])))
 
                     gd = None if is_dg_field else key2gdof[f].get(k)
                     if gd is None:
@@ -587,6 +638,7 @@ class DofHandler:
                         if not is_dg_field:
                             key2gdof[f][k] = gd
                         dof_coords.append((float(X[0]), float(X[1])))
+                        dof_comp.append(int(cid))
 
                     loc_gids.append(gd)
                     field_gsets[f].add(gd)
@@ -686,20 +738,30 @@ class DofHandler:
             # Ensure dof_coords is aligned with next_gid
             if len(dof_coords) != next_gid:
                 raise RuntimeError("Internal error: dof_coords length does not match next_gid.")
+            if len(dof_comp) != next_gid:
+                raise RuntimeError("Internal error: dof_comp length does not match next_gid.")
 
             # Coordinates: edge-entity midpoints, then element centroids
-            for n0, n1 in edge_entity_nodes:
+            for ent, (n0, n1) in enumerate(edge_entity_nodes):
                 p0 = mesh.nodes_x_y_pos[int(n0)]
                 p1 = mesh.nodes_x_y_pos[int(n1)]
                 mid = (0.5 * (p0 + p1)).astype(float)
+                # Component from one owner element of this edge entity.
+                try:
+                    cid_ent = int(elem_comp[int(edge_entity_owner[int(ent)])])
+                except Exception:
+                    cid_ent = 0
                 for _m in range(n_edge_modes):
                     dof_coords.append((float(mid[0]), float(mid[1])))
+                    dof_comp.append(int(cid_ent))
 
             for eid in range(n_cells):
                 corners = np.asarray(corner_conn[int(eid)], dtype=int)
                 cen = np.mean(mesh.nodes_x_y_pos[corners], axis=0)
+                cid = int(elem_comp[int(eid)]) if elem_comp is not None else 0
                 for _r in range(n_cell_dofs):
                     dof_coords.append((float(cen[0]), float(cen[1])))
+                    dof_comp.append(int(cid))
 
             # Local-to-global + orientation signs
             element_maps[f] = []
@@ -775,24 +837,40 @@ class DofHandler:
         # Only DOFs that *coincide* with a mesh node get a node mapping.
         # Interior/lobatto interior points won't map to nodes → (field, None).
         nodes_xy = np.asarray(mesh.nodes_x_y_pos, dtype=float)
-        node_lookup = {(_q(float(x)), _q(float(y))): int(nid)
-                    for nid, (x, y) in enumerate(nodes_xy)}
+        # Disambiguate coincident coordinates across disconnected components.
+        node_lookup = {
+            (int(node_comp[int(nid)]), _q(float(x)), _q(float(y))): int(nid)
+            for nid, (x, y) in enumerate(nodes_xy)
+        }
+
+        comp_nodes: dict[int, np.ndarray] = {}
+        try:
+            for cid in np.unique(np.asarray(node_comp, dtype=np.int32)):
+                cid_i = int(cid)
+                comp_nodes[cid_i] = np.nonzero(np.asarray(node_comp, dtype=np.int32) == cid_i)[0].astype(np.int32)
+        except Exception:
+            comp_nodes = {0: np.arange(nodes_xy.shape[0], dtype=np.int32)}
 
         self.dof_map = {f: {} for f in fields}        # node_id -> gdof or {elem_id->gdof}
         self._dof_to_node_map = {}                    # gdof -> (field, node_id|None)
 
         TOL = 1e-12  # geometric snap tolerance (squared distance check uses TOL^2)
 
-        def _find_node_id(x: float, y: float) -> int | None:
-            nkey = (_q(x), _q(y))
+        def _find_node_id(x: float, y: float, cid: int) -> int | None:
+            cid = int(cid)
+            nkey = (cid, _q(x), _q(y))
             nid = node_lookup.get(nkey, None)
             if nid is None:
                 # nearest neighbor fallback for tiny drift
-                dx = nodes_xy[:, 0] - x
-                dy = nodes_xy[:, 1] - y
-                j = int(np.argmin(dx*dx + dy*dy))
-                if (dx[j]*dx[j] + dy[j]*dy[j]) <= (TOL*TOL):
-                    nid = j
+                cand = comp_nodes.get(cid)
+                if cand is None or cand.size == 0:
+                    cand = comp_nodes.get(0, np.arange(nodes_xy.shape[0], dtype=np.int32))
+                pts = nodes_xy[cand]
+                dx = pts[:, 0] - x
+                dy = pts[:, 1] - y
+                jloc = int(np.argmin(dx * dx + dy * dy))
+                if (dx[jloc] * dx[jloc] + dy[jloc] * dy[jloc]) <= (TOL * TOL):
+                    nid = int(cand[jloc])
             return nid
 
         for f in fields:
@@ -811,7 +889,8 @@ class DofHandler:
                 # CG: one DOF per mesh node.
                 for gd in self._field_slices[f]:
                     x, y = self._dof_coords[int(gd)]
-                    nid = _find_node_id(x, y)
+                    cid = int(dof_comp[int(gd)]) if int(gd) < len(dof_comp) else 0
+                    nid = _find_node_id(float(x), float(y), cid)
                     if nid is not None:
                         self.dof_map[f][int(nid)] = int(gd)
                         self._dof_to_node_map[int(gd)] = (f, int(nid))
@@ -825,7 +904,8 @@ class DofHandler:
                 for gd in cell:
                     gd = int(gd)
                     x, y = self._dof_coords[gd]
-                    nid = _find_node_id(float(x), float(y))
+                    cid = int(dof_comp[int(gd)]) if int(gd) < len(dof_comp) else int(elem_comp[int(eid)]) if elem_comp is not None else 0
+                    nid = _find_node_id(float(x), float(y), cid)
                     if nid is not None:
                         per_node.setdefault(int(nid), {})[int(eid)] = gd
                         self._dof_to_node_map[gd] = (f, int(nid))
@@ -5156,6 +5236,475 @@ class DofHandler:
                 allow_interface=bool(allow_interface),
                 deform=bool(deformation is not None),
             )
+        return out
+
+
+    # --------------------------------------------------------------------
+    #  DofHandler.precompute_nonmatching_interface_factors
+    # --------------------------------------------------------------------
+    def precompute_nonmatching_interface_factors(
+        self,
+        interface,
+        qdeg: int,
+        derivs: set[tuple[int, int]],
+        *,
+        reuse: bool = True,
+        need_hess: bool = False,
+        need_o3: bool = False,
+        need_o4: bool = False,
+        deformation: Any = None,
+    ) -> dict:
+        """
+        Pre-compute geometry and basis tables for integrals on a *non-matching*
+        interface represented by a common 1D refinement (overlap segments).
+
+        The returned dictionary follows the same data contract as
+        `precompute_ghost_factors` for facet kernels:
+        - `entity_kind == "edge"`
+        - union DOF layout via `gdofs_map`, `pos_map`, `neg_map`
+        - sided reference tables `r{dx}{dy}_{field}_{pos|neg}` (owner-mixed width)
+        - sided mapping jets `J_inv_pos/neg`, `detJ_pos/neg` when required.
+
+        Notes
+        -----
+        * `interface.mesh_pos` and `interface.mesh_neg` must refer to the same
+          mesh object used by this handler's MixedElement (typically a composite
+          mesh). If you built the interface on separate submeshes, lift/offset
+          the element ids first.
+        * Deformation of the nonmatching interface is not implemented yet.
+        """
+        import numpy as np
+        from pycutfem.integration.quadrature import gauss_legendre
+        from pycutfem.fem import transform
+        from pycutfem.integration.pre_tabulates import (
+            _searchsorted_positions,
+            _tabulate_deriv_q1,
+            _tabulate_deriv_q2,
+            _tabulate_deriv_p1,
+        )
+
+        global _nonmatching_cache
+
+        if deformation is not None:
+            raise NotImplementedError("Nonmatching interface precompute does not yet support deformation.")
+
+        me = self.mixed_element
+        if me is None:
+            raise RuntimeError("precompute_nonmatching_interface_factors requires a MixedElement-backed DofHandler.")
+        mesh = me.mesh
+
+        # Interface must be expressed in the same mesh numbering as this handler.
+        mesh_pos = getattr(interface, "mesh_pos", None)
+        mesh_neg = getattr(interface, "mesh_neg", None)
+        if mesh_pos is not mesh or mesh_neg is not mesh:
+            raise ValueError(
+                "Nonmatching interface mesh mismatch: interface.mesh_pos/mesh_neg must match dof_handler.mixed_element.mesh. "
+                "Build/lift the interface for the composite mesh before assembly."
+            )
+
+        qdeg = int(qdeg)
+        pos_ids = np.asarray(getattr(interface, "pos_elem_ids"), dtype=np.int32).ravel()
+        neg_ids = np.asarray(getattr(interface, "neg_elem_ids"), dtype=np.int32).ravel()
+        P0 = np.asarray(getattr(interface, "P0"), dtype=float)
+        P1 = np.asarray(getattr(interface, "P1"), dtype=float)
+        n_seg = int(P0.shape[0])
+
+        # Empty skeleton (allows kernel compilation even when interface is empty)
+        if n_seg <= 0:
+            derivs_eff = {(0, 0)} | set(tuple((int(dx), int(dy))) for (dx, dy) in (derivs or set()))
+            z2 = np.empty((0, 0, 2), dtype=float)
+            z1 = np.empty((0, 0), dtype=float)
+            z22 = np.empty((0, 0, 2, 2), dtype=float)
+            n_union = int(getattr(self, "union_dofs", getattr(me, "n_dofs_per_elem", 0)))
+            out = {
+                "eids": np.empty((0,), dtype=np.int32),
+                "qp_phys": z2,
+                "qw": z1,
+                "normals": z2,
+                "xi_pos": z1,
+                "eta_pos": z1,
+                "xi_neg": z1,
+                "eta_neg": z1,
+                "gdofs_map": np.empty((0, n_union), dtype=np.int64),
+                "pos_map": np.empty((0, 0), dtype=np.int32),
+                "neg_map": np.empty((0, 0), dtype=np.int32),
+                "J_inv_pos": z22,
+                "J_inv_neg": z22,
+                "detJ_pos": z1,
+                "detJ_neg": z1,
+                "detJ": z1,
+                "J_inv": z22,
+                "phis": z1,
+                "h_arr": np.empty((0,), dtype=float),
+                "entity_kind": "edge",
+                "owner_pos_id": np.empty((0,), dtype=np.int32),
+                "owner_neg_id": np.empty((0,), dtype=np.int32),
+                "owner_id": np.empty((0,), dtype=np.int32),
+            }
+            for fld in me.field_names:
+                nloc_f = int(getattr(me, "_n_basis", {}).get(fld, 0))
+                out[f"pos_map_{fld}"] = np.empty((0, nloc_f), dtype=np.int32)
+                out[f"neg_map_{fld}"] = np.empty((0, nloc_f), dtype=np.int32)
+                out[f"restrict_mask_{fld}_pos"] = np.empty((0, n_union), dtype=float)
+                out[f"restrict_mask_{fld}_neg"] = np.empty((0, n_union), dtype=float)
+                for (dx, dy) in sorted(derivs_eff):
+                    out[f"r{dx}{dy}_{fld}_pos"] = np.empty((0, 0, me.n_dofs_per_elem), dtype=float)
+                    out[f"r{dx}{dy}_{fld}_neg"] = np.empty((0, 0, me.n_dofs_per_elem), dtype=float)
+            return out
+
+        # Normalize inputs -------------------------------------------------------
+        if pos_ids.shape[0] != n_seg or neg_ids.shape[0] != n_seg:
+            raise ValueError("Interface element-id arrays must have length equal to number of segments.")
+
+        # Quadrature on straight overlap segments -------------------------------
+        xi_1d, w_ref = gauss_legendre(int(qdeg))
+        xi_1d = np.asarray(xi_1d, dtype=float).ravel()
+        w_ref = np.asarray(w_ref, dtype=float).ravel()
+        nQ = int(xi_1d.size)
+        mid = 0.5 * (P0 + P1)
+        half = 0.5 * (P1 - P0)
+        seg_J = np.linalg.norm(half, axis=1)
+        qp_phys = mid[:, None, :] + xi_1d[None, :, None] * half[:, None, :]
+        qw = w_ref[None, :] * seg_J[:, None]
+
+        n_vec = np.asarray(getattr(interface, "n"), dtype=float)
+        if n_vec.ndim != 2 or n_vec.shape[1] != 2 or n_vec.shape[0] != n_seg:
+            raise ValueError("interface.n must have shape (n_segments, 2).")
+        nn = np.linalg.norm(n_vec, axis=1)
+        nn = np.where(nn > 0.0, nn, 1.0)
+        n_unit = n_vec / nn[:, None]
+        normals = np.broadcast_to(n_unit[:, None, :], (n_seg, nQ, 2)).copy()
+
+        # Union GDofs and side maps ----------------------------------------------
+        n_union_default = int(getattr(self, "union_dofs", me.n_dofs_per_elem))
+        n_loc = int(me.n_dofs_per_elem)
+        union_lists: list[np.ndarray] = []
+        max_union = int(n_union_default)
+        for i in range(n_seg):
+            pos_dofs = self.get_elemental_dofs(int(pos_ids[i]))
+            neg_dofs = self.get_elemental_dofs(int(neg_ids[i]))
+            union = np.unique(np.concatenate((pos_dofs, neg_dofs)))
+            union_lists.append(np.asarray(union, dtype=np.int64))
+            max_union = max(int(max_union), int(union.size))
+
+        n_union = int(max_union)
+        gdofs_map = np.empty((n_seg, n_union), dtype=np.int64)
+        pos_map = -np.ones((n_seg, n_loc), dtype=np.int32)
+        neg_map = -np.ones((n_seg, n_loc), dtype=np.int32)
+
+        for i in range(n_seg):
+            union = union_lists[i]
+            if union.size == 0:
+                gdofs_map[i, :] = 0
+                continue
+            pad_val = int(union[-1])
+            gdofs_map[i, :] = pad_val
+            gdofs_map[i, : union.size] = union
+
+            pos_dofs = self.get_elemental_dofs(int(pos_ids[i]))
+            neg_dofs = self.get_elemental_dofs(int(neg_ids[i]))
+            pos_map[i, : len(pos_dofs)] = _searchsorted_positions(union, pos_dofs)
+            neg_map[i, : len(neg_dofs)] = _searchsorted_positions(union, neg_dofs)
+
+        # Per-field maps and element-membership restriction masks -----------------
+        maps_by_field: Dict[str, np.ndarray] = {}
+        masks_by_field: Dict[str, np.ndarray] = {}
+        for fld in me.field_names:
+            nloc_f = len(self.element_maps[fld][int(pos_ids[0])])
+            pm = np.empty((n_seg, nloc_f), dtype=np.int32)
+            nm = np.empty((n_seg, nloc_f), dtype=np.int32)
+            pos_mask = np.zeros((n_seg, n_union), dtype=float)
+            neg_mask = np.zeros((n_seg, n_union), dtype=float)
+            for i in range(n_seg):
+                union = union_lists[i]
+                pos_loc = np.asarray(self.element_maps[fld][int(pos_ids[i])], dtype=np.int64)
+                neg_loc = np.asarray(self.element_maps[fld][int(neg_ids[i])], dtype=np.int64)
+                pm[i, :] = _searchsorted_positions(union, pos_loc)
+                nm[i, :] = _searchsorted_positions(union, neg_loc)
+
+                cols = pm[i]
+                ok = (cols >= 0) & (cols < n_union)
+                if np.any(ok):
+                    pos_mask[i, cols[ok]] = 1.0
+                cols = nm[i]
+                ok = (cols >= 0) & (cols < n_union)
+                if np.any(ok):
+                    neg_mask[i, cols[ok]] = 1.0
+
+            maps_by_field[f"pos_map_{fld}"] = pm
+            maps_by_field[f"neg_map_{fld}"] = nm
+            masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
+            masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
+
+        # Cache key (after n_union known) ----------------------------------------
+        derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in (derivs or set())))
+        cache_key = (
+            int(id(interface)),
+            int(qdeg),
+            me.signature(),
+            int(n_union),
+            derivs_key,
+            bool(need_hess),
+            bool(need_o3),
+            bool(need_o4),
+            getattr(self, "_method_token", self.method),
+        )
+        if reuse and cache_key in _nonmatching_cache:
+            return _nonmatching_cache[cache_key]
+
+        # Reference coordinates + geometry per side -------------------------------
+        xi_pos = np.empty((n_seg, nQ), dtype=float)
+        eta_pos = np.empty((n_seg, nQ), dtype=float)
+        xi_neg = np.empty((n_seg, nQ), dtype=float)
+        eta_neg = np.empty((n_seg, nQ), dtype=float)
+        detJ_pos = np.empty((n_seg, nQ), dtype=float)
+        detJ_neg = np.empty((n_seg, nQ), dtype=float)
+        J_inv_pos = np.empty((n_seg, nQ, 2, 2), dtype=float)
+        J_inv_neg = np.empty((n_seg, nQ, 2, 2), dtype=float)
+
+        for i in range(n_seg):
+            pe = int(pos_ids[i])
+            ne = int(neg_ids[i])
+            for q in range(nQ):
+                xq = np.asarray(qp_phys[i, q], dtype=float)
+
+                s, t = transform.inverse_mapping(mesh, pe, xq)
+                xi_pos[i, q] = float(s)
+                eta_pos[i, q] = float(t)
+                Jp = np.asarray(transform.jacobian(mesh, pe, (float(s), float(t))), dtype=float)
+                detp = float(Jp[0, 0] * Jp[1, 1] - Jp[0, 1] * Jp[1, 0])
+                detJ_pos[i, q] = detp
+                invd = 1.0 / (detp + 1e-300)
+                J_inv_pos[i, q, 0, 0] = Jp[1, 1] * invd
+                J_inv_pos[i, q, 0, 1] = -Jp[0, 1] * invd
+                J_inv_pos[i, q, 1, 0] = -Jp[1, 0] * invd
+                J_inv_pos[i, q, 1, 1] = Jp[0, 0] * invd
+
+                s, t = transform.inverse_mapping(mesh, ne, xq)
+                xi_neg[i, q] = float(s)
+                eta_neg[i, q] = float(t)
+                Jn = np.asarray(transform.jacobian(mesh, ne, (float(s), float(t))), dtype=float)
+                detn = float(Jn[0, 0] * Jn[1, 1] - Jn[0, 1] * Jn[1, 0])
+                detJ_neg[i, q] = detn
+                invd = 1.0 / (detn + 1e-300)
+                J_inv_neg[i, q, 0, 0] = Jn[1, 1] * invd
+                J_inv_neg[i, q, 0, 1] = -Jn[0, 1] * invd
+                J_inv_neg[i, q, 1, 0] = -Jn[1, 0] * invd
+                J_inv_neg[i, q, 1, 1] = Jn[0, 0] * invd
+
+        detJ = 0.5 * (detJ_pos + detJ_neg)
+        J_inv = 0.5 * (J_inv_pos + J_inv_neg)
+        phis = np.zeros((n_seg, nQ), dtype=float)
+
+        # Owner ids: choose the smaller element for CellDiameter/EWC evaluation.
+        owner_pos_id = np.asarray(pos_ids, dtype=np.int32)
+        owner_neg_id = np.asarray(neg_ids, dtype=np.int32)
+        owner_id = np.empty((n_seg,), dtype=np.int32)
+        h_face = np.empty((n_seg,), dtype=float)
+        for i in range(n_seg):
+            hp = mesh.element_char_length(int(owner_pos_id[i]))
+            hn = mesh.element_char_length(int(owner_neg_id[i]))
+            hpv = float(hp) if hp is not None else float("inf")
+            hnv = float(hn) if hn is not None else float("inf")
+            if hpv <= hnv:
+                owner_id[i] = int(owner_pos_id[i])
+                h_face[i] = hpv if math.isfinite(hpv) else (hnv if math.isfinite(hnv) else 1.0)
+            else:
+                owner_id[i] = int(owner_neg_id[i])
+                h_face[i] = hnv if math.isfinite(hnv) else (hpv if math.isfinite(hpv) else 1.0)
+
+        # Reference derivative tables per side/field (owner-mixed width) ----------
+        derivs = set(derivs or set())
+        basis_tables: dict[str, np.ndarray] = {}
+        final_w = int(me.n_dofs_per_elem)
+
+        def _tab_generic(fld: str, dx: int, dy: int, xi, eta, out_arr):
+            for e in range(n_seg):
+                for q in range(nQ):
+                    out_arr[e, q, :] = me._eval_scalar_deriv(
+                        fld, float(xi[e, q]), float(eta[e, q]), int(dx), int(dy)
+                    )
+
+        families = getattr(me, "_field_families", {}) or {}
+        rt_fields = [f for f in me.field_names if families.get(f) == "RT"]
+        scalar_fields = [f for f in me.field_names if f not in rt_fields]
+
+        for fld in scalar_fields:
+            p_f = int(me._field_orders[fld])
+            sl = me.component_dof_slices[fld]
+            n_f = int(sl.stop - sl.start)
+
+            def _tab(dx, dy, xi, eta, out_arr):
+                if mesh.element_type == "quad" and p_f == 1:
+                    _tabulate_deriv_q1(xi, eta, int(dx), int(dy), out_arr)
+                elif mesh.element_type == "quad" and p_f == 2:
+                    _tabulate_deriv_q2(xi, eta, int(dx), int(dy), out_arr)
+                elif mesh.element_type == "tri" and p_f == 1:
+                    _tabulate_deriv_p1(xi, eta, int(dx), int(dy), out_arr)
+                else:
+                    _tab_generic(fld, dx, dy, xi, eta, out_arr)
+
+            need_grad = any(dx + dy == 1 for dx, dy in derivs) or need_hess or need_o3 or need_o4
+            need_h2 = any(dx + dy == 2 for dx, dy in derivs) or need_hess or need_o3 or need_o4
+            need_o3rq = any(dx + dy == 3 for dx, dy in derivs) or need_o3 or need_o4
+            need_o4rq = any(dx + dy == 4 for dx, dy in derivs) or need_o4
+
+            # POS tables
+            arr = np.empty((n_seg, nQ, n_f)); _tab(0, 0, xi_pos, eta_pos, arr)
+            basis_tables[f"r00_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_grad:
+                arr = np.empty((n_seg, nQ, n_f)); _tab(1, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r10_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(0, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r01_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_h2:
+                arr = np.empty((n_seg, nQ, n_f)); _tab(2, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r20_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(1, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r11_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(0, 2, xi_pos, eta_pos, arr)
+                basis_tables[f"r02_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_o3rq:
+                arr = np.empty((n_seg, nQ, n_f)); _tab(3, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r30_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(2, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r21_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(1, 2, xi_pos, eta_pos, arr)
+                basis_tables[f"r12_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(0, 3, xi_pos, eta_pos, arr)
+                basis_tables[f"r03_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            if need_o4rq:
+                arr = np.empty((n_seg, nQ, n_f)); _tab(4, 0, xi_pos, eta_pos, arr)
+                basis_tables[f"r40_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(3, 1, xi_pos, eta_pos, arr)
+                basis_tables[f"r31_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(2, 2, xi_pos, eta_pos, arr)
+                basis_tables[f"r22_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(1, 3, xi_pos, eta_pos, arr)
+                basis_tables[f"r13_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(0, 4, xi_pos, eta_pos, arr)
+                basis_tables[f"r04_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+
+            # NEG tables
+            arr = np.empty((n_seg, nQ, n_f)); _tab(0, 0, xi_neg, eta_neg, arr)
+            basis_tables[f"r00_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_grad:
+                arr = np.empty((n_seg, nQ, n_f)); _tab(1, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r10_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(0, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r01_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_h2:
+                arr = np.empty((n_seg, nQ, n_f)); _tab(2, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r20_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(1, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r11_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(0, 2, xi_neg, eta_neg, arr)
+                basis_tables[f"r02_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_o3rq:
+                arr = np.empty((n_seg, nQ, n_f)); _tab(3, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r30_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(2, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r21_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(1, 2, xi_neg, eta_neg, arr)
+                basis_tables[f"r12_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(0, 3, xi_neg, eta_neg, arr)
+                basis_tables[f"r03_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            if need_o4rq:
+                arr = np.empty((n_seg, nQ, n_f)); _tab(4, 0, xi_neg, eta_neg, arr)
+                basis_tables[f"r40_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(3, 1, xi_neg, eta_neg, arr)
+                basis_tables[f"r31_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(2, 2, xi_neg, eta_neg, arr)
+                basis_tables[f"r22_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(1, 3, xi_neg, eta_neg, arr)
+                basis_tables[f"r13_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                arr = np.empty((n_seg, nQ, n_f)); _tab(0, 4, xi_neg, eta_neg, arr)
+                basis_tables[f"r04_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+
+        # Inverse-map jets (optional) --------------------------------------------
+        if need_hess or need_o3 or need_o4:
+            kmax = 4 if need_o4 else (3 if need_o3 else 2)
+            if need_hess:
+                pos_Hxi0 = np.zeros((n_seg, nQ, 2, 2), dtype=float)
+                pos_Hxi1 = np.zeros_like(pos_Hxi0)
+                neg_Hxi0 = np.zeros((n_seg, nQ, 2, 2), dtype=float)
+                neg_Hxi1 = np.zeros_like(neg_Hxi0)
+            if need_o3:
+                pos_Txi0 = np.zeros((n_seg, nQ, 2, 2, 2), dtype=float)
+                pos_Txi1 = np.zeros_like(pos_Txi0)
+                neg_Txi0 = np.zeros((n_seg, nQ, 2, 2, 2), dtype=float)
+                neg_Txi1 = np.zeros_like(neg_Txi0)
+            if need_o4:
+                pos_Qxi0 = np.zeros((n_seg, nQ, 2, 2, 2, 2), dtype=float)
+                pos_Qxi1 = np.zeros_like(pos_Qxi0)
+                neg_Qxi0 = np.zeros((n_seg, nQ, 2, 2, 2, 2), dtype=float)
+                neg_Qxi1 = np.zeros_like(neg_Qxi0)
+            for i in range(n_seg):
+                pe = int(pos_ids[i])
+                ne = int(neg_ids[i])
+                for q in range(nQ):
+                    rec = _JET.get(mesh, pe, float(xi_pos[i, q]), float(eta_pos[i, q]), upto=kmax)
+                    if need_hess:
+                        A2 = rec["A2"]; pos_Hxi0[i, q] = A2[0]; pos_Hxi1[i, q] = A2[1]
+                    if need_o3:
+                        A3 = rec["A3"]; pos_Txi0[i, q] = A3[0]; pos_Txi1[i, q] = A3[1]
+                    if need_o4:
+                        A4 = rec["A4"]; pos_Qxi0[i, q] = A4[0]; pos_Qxi1[i, q] = A4[1]
+
+                    rec = _JET.get(mesh, ne, float(xi_neg[i, q]), float(eta_neg[i, q]), upto=kmax)
+                    if need_hess:
+                        A2 = rec["A2"]; neg_Hxi0[i, q] = A2[0]; neg_Hxi1[i, q] = A2[1]
+                    if need_o3:
+                        A3 = rec["A3"]; neg_Txi0[i, q] = A3[0]; neg_Txi1[i, q] = A3[1]
+                    if need_o4:
+                        A4 = rec["A4"]; neg_Qxi0[i, q] = A4[0]; neg_Qxi1[i, q] = A4[1]
+
+        # Pack --------------------------------------------------------------------
+        # JIT/CPP kernels index CellDiameter as h_arr[owner_id[e]], where owner_id
+        # refers to element ids in the underlying mesh. Therefore h_arr must be
+        # element-indexed (length == mesh.n_elements), *not* per-segment.
+        h_arr_global = np.asarray(
+            [mesh.element_char_length(int(e)) for e in range(int(mesh.n_elements))],
+            dtype=float,
+        )
+
+        out = {
+            "eids": np.arange(n_seg, dtype=np.int32),
+            "qp_phys": np.asarray(qp_phys, dtype=np.float64, order="C"),
+            "qw": np.asarray(qw, dtype=np.float64, order="C"),
+            "normals": np.asarray(normals, dtype=np.float64, order="C"),
+            "xi_pos": xi_pos,
+            "eta_pos": eta_pos,
+            "xi_neg": xi_neg,
+            "eta_neg": eta_neg,
+            "gdofs_map": gdofs_map,
+            "pos_map": pos_map,
+            "neg_map": neg_map,
+            "J_inv_pos": np.asarray(J_inv_pos, dtype=np.float64, order="C"),
+            "J_inv_neg": np.asarray(J_inv_neg, dtype=np.float64, order="C"),
+            "detJ_pos": np.asarray(detJ_pos, dtype=np.float64, order="C"),
+            "detJ_neg": np.asarray(detJ_neg, dtype=np.float64, order="C"),
+            "detJ": np.asarray(detJ, dtype=np.float64, order="C"),
+            "J_inv": np.asarray(J_inv, dtype=np.float64, order="C"),
+            "phis": phis,
+            "h_arr": h_arr_global,
+            "entity_kind": "edge",
+            "owner_pos_id": owner_pos_id,
+            "owner_neg_id": owner_neg_id,
+            "owner_id": owner_id,
+        }
+        out.update(basis_tables)
+        out.update(maps_by_field)
+        out.update(masks_by_field)
+        if need_hess:
+            out.update({"pos_Hxi0": pos_Hxi0, "pos_Hxi1": pos_Hxi1, "neg_Hxi0": neg_Hxi0, "neg_Hxi1": neg_Hxi1})
+        if need_o3:
+            out.update({"pos_Txi0": pos_Txi0, "pos_Txi1": pos_Txi1, "neg_Txi0": neg_Txi0, "neg_Txi1": neg_Txi1})
+        if need_o4:
+            out.update({"pos_Qxi0": pos_Qxi0, "pos_Qxi1": pos_Qxi1, "neg_Qxi0": neg_Qxi0, "neg_Qxi1": neg_Qxi1})
+
+        if reuse:
+            _nonmatching_cache[cache_key] = out
         return out
 
 

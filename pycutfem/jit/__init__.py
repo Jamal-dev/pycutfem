@@ -1944,6 +1944,73 @@ def compile_multi(form, *, dof_handler, mixed_element,
         # ------------------------------------------------------------------
         # GHOST EDGE (stabilization across a cut)
         # ------------------------------------------------------------------
+        if dom == "nonmatching_interface":
+            md = intg.measure.metadata or {}
+            interface = md.get("interface", None)
+            if interface is None:
+                interface = getattr(intg.measure, "interface", None)
+            if interface is None:
+                raise ValueError(
+                    "dNonmatchingInterface requires metadata={'interface': <NonMatchingInterface>} "
+                    "(with element ids in the same mesh numbering as dof_handler.mixed_element.mesh)."
+                )
+
+            derivs = set(md.get("derivs", required_multi_indices(intg.integrand)))
+            derivs |= {(0, 0)}
+            max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+            qdeg_eff = max(int(qdeg), 2 * int(max_total) + 4)
+
+            geom = dof_handler.precompute_nonmatching_interface_factors(
+                interface=interface,
+                qdeg=int(qdeg_eff),
+                derivs=derivs,
+                reuse=True,
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+                deformation=getattr(intg.measure, "deformation", None),
+            )
+
+            gdofs_map_raw = np.asarray(geom.get("gdofs_map", np.empty((0, 0), dtype=np.int32)), dtype=np.int32)
+            ncols = gdofs_map_raw.shape[1] if gdofs_map_raw.ndim == 2 else 0
+            use_full_union = bool(ncols and ncols != me_kernel.n_dofs_local)
+            if use_full_union:
+                eff_cols = np.arange(ncols, dtype=np.int32)
+            else:
+                eff_cols = active_cols[active_cols < ncols] if ncols else active_cols
+                if eff_cols.size == 0 and ncols:
+                    eff_cols = np.arange(ncols, dtype=np.int32)
+            gdofs_map = gdofs_map_raw[:, eff_cols] if gdofs_map_raw.size else gdofs_map_raw
+
+            static = {**geom, "gdofs_map": gdofs_map, "is_ghost": False, "is_interface": True, "entity_kind": "edge"}
+            static["_phi_sig"] = np.zeros((int(np.asarray(static.get("eids", [])).shape[0]),), dtype=float)
+            static.update(
+                _build_jit_kernel_args(
+                    ir,
+                    intg.integrand,
+                    me_kernel,
+                    int(qdeg_eff),
+                    dof_handler=dof_handler,
+                    gdofs_map=gdofs_map,
+                    param_order=tuple(getattr(runner, "param_order", []) or []),
+                    pre_built=static,
+                )
+            )
+            if not use_full_union:
+                static = _compress_static_for_active(static, me_kernel, eff_cols)
+
+            eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
+            _append_kernel(
+                _IntegralKernel(
+                    runner,
+                    static,
+                    "nonmatching_interface",
+                    eids=eids_arr,
+                ),
+                intg,
+            )
+            continue
+
         if dom == "ghost_edge":
             level_set = intg.measure.level_set
             derivs    = set(intg.measure.metadata.get("derivs", required_multi_indices(intg.integrand)))

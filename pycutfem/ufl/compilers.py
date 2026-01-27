@@ -1926,6 +1926,15 @@ class FormCompiler:
         #     raise KeyError("CellDiameter() requires 'eid' in context; set it in the element loop.")
         # h = self.me.mesh.element_char_length(eid)
         if self.ctx.get('is_interface'):
+            # Multi-mesh nonmatching interfaces (and some custom assemblers) can
+            # inject a per-quadrature (or per-entity) face size directly.
+            h_override = self.ctx.get("h_val", None)
+            if h_override is None:
+                h_override = self.ctx.get("h_face", None)
+            if h_override is None:
+                h_override = self.ctx.get("h_interface", None)
+            if h_override is not None:
+                return float(h_override)
             # use min(h_left, h_right) on the face (robust even on aligned Γ)
             h = self.me.mesh.face_char_length(self.ctx.get('pos_eid'), self.ctx.get('neg_eid'))
         else:
@@ -2446,6 +2455,10 @@ class FormCompiler:
                 logger.info(f"Assembling interface integral: {integral} with backend {self.backend}")
                 # print(f"Assembling interface integral with backend {self.backend}")
                 self._assemble_interface(integral, target)
+                continue
+            if integral.measure.domain_type == "nonmatching_interface":
+                logger.info(f"Assembling nonmatching-interface integral: {integral} with backend {self.backend}")
+                self._assemble_nonmatching_interface(integral, target)
                 continue
             if integral.measure.domain_type == "volume":
                 # Handle volume integrals
@@ -5063,6 +5076,307 @@ class FormCompiler:
             raise ValueError(
                 f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
             )
+
+    # ------------------------------------------------------------------
+    # Non-matching interface (common-refinement coupling)
+    # ------------------------------------------------------------------
+    def _assemble_nonmatching_interface(self, intg: Integral, matvec):
+        """Assemble integrals over a non-matching interface (common-refinement segments)."""
+        if self.backend == "python":
+            self._assemble_nonmatching_interface_python(intg, matvec)
+        elif self._is_jit_backend():
+            self._assemble_nonmatching_interface_jit(intg, matvec)
+        else:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. Use 'python', 'jit', or 'cpp'."
+            )
+
+    def _nonmatching_interface_obj(self, intg: Integral):
+        md = getattr(intg.measure, "metadata", None) or {}
+        iface = md.get("interface", None)
+        if iface is None:
+            iface = getattr(intg.measure, "interface", None)
+        if iface is None:
+            raise ValueError(
+                "dNonmatchingInterface requires metadata={'interface': <NonMatchingInterface>} "
+                "(with element ids in the same mesh numbering as dof_handler.mixed_element.mesh)."
+            )
+        return iface
+
+    def _assemble_nonmatching_interface_python(self, intg: Integral, matvec):
+        import numpy as np
+        import logging
+        from pycutfem.ufl.helpers import _trial_test
+
+        log = logging.getLogger(__name__)
+        rhs = bool(self.ctx.get("rhs", False))
+        log.info(f"Assembling nonmatching interface integral: {intg}, is_rhs={rhs}")
+
+        interface = self._nonmatching_interface_obj(intg)
+        dh, me, mesh = self.dh, self.me, self.me.mesh
+
+        # context: we are on Γ_nm
+        self.ctx["is_interface"] = True
+        self.ctx["is_ghost"] = False
+        self.ctx["measure_side"] = None
+
+        md = intg.measure.metadata or {}
+        derivs = set(md.get("derivs", set())) | set(required_multi_indices(intg.integrand))
+        derivs |= {(0, 0), (1, 0), (0, 1)}
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        for p in range(max_total + 1):
+            for ox in range(p + 1):
+                derivs.add((ox, p - ox))
+
+        qdeg = int(self._find_q_order(intg))
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        qdeg += max(0, p_geo - 1)
+
+        geo = dh.precompute_nonmatching_interface_factors(
+            interface=interface,
+            qdeg=int(qdeg),
+            derivs=derivs,
+            reuse=True,
+        )
+        eids = np.asarray(geo.get("eids", np.empty((0,), dtype=np.int32)), dtype=np.int32)
+        if eids.size == 0:
+            return
+
+        # scalar-functional hook support
+        trial, test = _trial_test(intg.integrand)
+        hook = self._hook_for(intg.integrand)
+        is_functional = (hook is not None) and (trial is None) and (test is None)
+        if is_functional:
+            self.ctx.setdefault("scalar_results", {}).setdefault(hook["name"], None)
+
+        fields = self._fields_for(intg.integrand)
+        if not fields:
+            fields = list(getattr(dh, "field_names", []))
+
+        try:
+            for ei in range(int(eids.size)):
+                pos_eid = int(np.asarray(geo["owner_pos_id"], dtype=np.int32)[ei])
+                neg_eid = int(np.asarray(geo["owner_neg_id"], dtype=np.int32)[ei])
+
+                # True (unpadded) union DOFs for this segment entity
+                pos_dofs = np.asarray(dh.get_elemental_dofs(pos_eid), dtype=int)
+                neg_dofs = np.asarray(dh.get_elemental_dofs(neg_eid), dtype=int)
+                global_dofs = np.unique(np.concatenate([pos_dofs, neg_dofs]))
+                pos_map = np.searchsorted(global_dofs, pos_dofs)
+                neg_map = np.searchsorted(global_dofs, neg_dofs)
+
+                pos_map_by_field, neg_map_by_field = _hfa.build_field_union_maps(
+                    dh, fields, pos_eid, neg_eid, global_dofs
+                )
+
+                # Element-membership masks on the union (used by coefficient/basis alignment)
+                pos_union_mask_by_field = {}
+                neg_union_mask_by_field = {}
+                for fld, idxs in pos_map_by_field.items():
+                    m = np.zeros(len(global_dofs), dtype=float)
+                    m[np.asarray(idxs, dtype=int)] = 1.0
+                    pos_union_mask_by_field[fld] = m
+                for fld, idxs in neg_map_by_field.items():
+                    m = np.zeros(len(global_dofs), dtype=float)
+                    m[np.asarray(idxs, dtype=int)] = 1.0
+                    neg_union_mask_by_field[fld] = m
+
+                if is_functional:
+                    acc = None
+                else:
+                    n = int(len(global_dofs))
+                    acc = np.zeros(n, float) if rhs else np.zeros((n, n), float)
+
+                qp_phys = np.asarray(geo["qp_phys"], dtype=float)
+                qw = np.asarray(geo["qw"], dtype=float)
+                normals = np.asarray(geo["normals"], dtype=float)
+                xi_pos = np.asarray(geo["xi_pos"], dtype=float)
+                eta_pos = np.asarray(geo["eta_pos"], dtype=float)
+                xi_neg = np.asarray(geo["xi_neg"], dtype=float)
+                eta_neg = np.asarray(geo["eta_neg"], dtype=float)
+
+                owner_id = int(np.asarray(geo.get("owner_id", geo.get("owner_pos_id")), dtype=np.int32)[ei])
+
+                nQ = int(qp_phys.shape[1])
+                for q in range(nQ):
+                    wq = float(qw[ei, q])
+                    if wq == 0.0:
+                        continue
+
+                    self.ctx.update(
+                        {
+                            "eid": owner_id,
+                            "pos_eid": pos_eid,
+                            "neg_eid": neg_eid,
+                            "normal": np.asarray(normals[ei, q], float),
+                            "x_phys": np.asarray(qp_phys[ei, q], float),
+                            "phi_val": 0.0,
+                            "global_dofs": global_dofs,
+                            "pos_map": pos_map,
+                            "neg_map": neg_map,
+                            "pos_map_by_field": pos_map_by_field,
+                            "neg_map_by_field": neg_map_by_field,
+                            "pos_union_mask_by_field": pos_union_mask_by_field,
+                            "neg_union_mask_by_field": neg_union_mask_by_field,
+                            "use_union_local_dofs": True,
+                            "basis_values": {"+": {}, "-": {}},
+                            "_xi_eta_cache": {
+                                "+": (float(xi_pos[ei, q]), float(eta_pos[ei, q])),
+                                "-": (float(xi_neg[ei, q]), float(eta_neg[ei, q])),
+                            },
+                        }
+                    )
+
+                    val = self._visit(intg.integrand)
+                    if is_functional:
+                        data = val.data if isinstance(val, VecOpInfo) else val
+                        arr = np.asarray(data, dtype=float)
+                        if acc is None:
+                            acc = np.zeros_like(arr, dtype=float)
+                        acc += wq * arr
+                    else:
+                        arr = lhs_num(val)
+                        arr = np.asarray(arr)
+                        if rhs and arr.ndim == 2 and 1 in arr.shape:
+                            arr = arr.reshape(-1)
+                        acc += wq * arr
+
+                if is_functional:
+                    results = self.ctx.setdefault("scalar_results", {})
+                    if results.get(hook["name"]) is None or (
+                        isinstance(results.get(hook["name"]), (int, float)) and isinstance(acc, np.ndarray)
+                    ):
+                        results[hook["name"]] = np.zeros_like(acc, dtype=float)
+                    results[hook["name"]] += acc
+                else:
+                    if rhs:
+                        np.add.at(matvec, global_dofs, acc)
+                    else:
+                        rr, cc = np.meshgrid(global_dofs, global_dofs, indexing="ij")
+                        matvec[rr, cc] += acc
+        finally:
+            for k in (
+                "basis_values",
+                "global_dofs",
+                "pos_map",
+                "neg_map",
+                "pos_map_by_field",
+                "neg_map_by_field",
+                "pos_union_mask_by_field",
+                "neg_union_mask_by_field",
+                "_xi_eta_cache",
+                "use_union_local_dofs",
+                "mask_basis",
+                "pos_eid",
+                "neg_eid",
+                "eid",
+                "x_phys",
+                "phi_val",
+                "normal",
+                "is_interface",
+                "measure_side",
+            ):
+                self.ctx.pop(k, None)
+            self.ctx.pop("is_ghost", None)
+
+    def _assemble_nonmatching_interface_jit(self, intg: "Integral", matvec):
+        import numpy as np
+
+        dh, me = self.dh, self.me
+        interface = self._nonmatching_interface_obj(intg)
+
+        # XFEM: compile facet kernels against the expanded local layout when enrichment is active.
+        me_used = me
+        if (
+            hasattr(dh, "xfem_mixed_element")
+            and callable(getattr(dh, "xfem_mixed_element"))
+            and getattr(dh, "n_enriched", lambda: 0)() > 0
+        ):
+            try:
+                me_used = dh.xfem_mixed_element()
+            except Exception:
+                me_used = me
+
+        runner, ir = self._compile_backend(intg.integrand, dh, me_used, on_facet=True)
+        derivs, need_hess, need_o3, need_o4 = self._find_req_derivs(intg, runner)
+
+        max_total = max((ox + oy for (ox, oy) in derivs), default=0)
+        qdeg = max(self._find_q_order(intg), 2 * max_total + 4)
+        p_geo = int(getattr(me_used.mesh, "poly_order", 1))
+        qdeg += max(0, p_geo - 1)
+
+        geo = dh.precompute_nonmatching_interface_factors(
+            interface=interface,
+            qdeg=int(qdeg),
+            derivs=derivs,
+            reuse=True,
+            need_hess=need_hess,
+            need_o3=need_o3,
+            need_o4=need_o4,
+            deformation=getattr(intg.measure, "deformation", None),
+        )
+        geo["is_interface"] = True
+        geo["is_ghost"] = False
+
+        valid_eids = np.asarray(geo.get("eids", []), dtype=np.int32)
+        if valid_eids.size == 0:
+            return
+
+        kernel_args = _build_jit_kernel_args(
+            ir=ir,
+            expression=intg.integrand,
+            mixed_element=me_used,
+            q_order=int(qdeg),
+            dof_handler=dh,
+            gdofs_map=geo["gdofs_map"],
+            param_order=runner.param_order,
+            pre_built=geo,
+        )
+
+        active_fields = _active_field_order(ir, me_used)
+        active_cols = _active_columns(me_used, active_fields)
+        use_full_union = bool(geo.get("gdofs_map") is not None and geo["gdofs_map"].shape[1] != me_used.n_dofs_local)
+        if not use_full_union:
+            kernel_args = _compress_static_for_active(kernel_args, me_used, active_cols)
+            geo["gdofs_map"] = kernel_args.get("gdofs_map", geo.get("gdofs_map"))
+
+        if ("node_coords" in runner.param_order) and ("node_coords" not in kernel_args):
+            kernel_args["node_coords"] = np.asarray(me_used.mesh.nodes_x_y_pos, dtype=float)
+        if ("element_nodes" in runner.param_order) and ("element_nodes" not in kernel_args):
+            kernel_args["element_nodes"] = np.asarray(me_used.mesh.elements_connectivity, dtype=np.int64)
+
+        req_list = list(getattr(runner, "param_order", []))
+        req = set(req_list)
+        for side in ("pos", "neg"):
+            for t in ("Hxi0", "Hxi1", "Txi0", "Txi1", "Qxi0", "Qxi1"):
+                need_key = f"{side}_{t}"
+                if (need_key in req) and (need_key not in kernel_args) and (need_key in geo):
+                    kernel_args[need_key] = geo[need_key]
+
+        missing = [p for p in runner.param_order if p not in kernel_args]
+        missing = [p for p in missing if not (p.startswith("u_") and p.endswith("_loc"))]
+        if missing:
+            raise KeyError(f"Nonmatching-interface kernel missing static args: {missing}")
+
+        current_funcs = self._get_data_functions_objs(intg)
+        K_ent, F_ent, J_ent = runner(current_funcs, kernel_args)
+
+        hook = self._hook_for(intg.integrand)
+        if self._functional_calculate(intg, J_ent, hook):
+            return
+
+        _scatter_element_contribs(
+            K_ent,
+            F_ent,
+            J_ent,
+            valid_eids,
+            geo["gdofs_map"],
+            matvec,
+            self.ctx,
+            intg.integrand,
+            hook=hook,
+        )
 
     def _assemble_aligned_interface(self, intg: Integral, matvec, aligned_edges=None):
         """Assemble interface integrals on edges tagged as 'interface'."""

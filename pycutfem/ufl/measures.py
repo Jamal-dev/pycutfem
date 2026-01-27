@@ -47,6 +47,7 @@ class Measure:
             "cut_interior_facet",
             "exterior_facet",
             "interface",
+            "nonmatching_interface",
             "ghost_edge",
             "facet_patch",
         }
@@ -120,6 +121,9 @@ dS = Measure("exterior_facet")
 
 #: Measure for integration over a level-set-defined interface.
 dInterface = Measure("interface")
+
+# Measure for integration over a non-matching interface (common-refinement segments).
+dNonmatchingInterface = Measure("nonmatching_interface")
 
 # New: Measure for integration over ghost edges for CutFEM stabilization.
 dGhost = Measure("ghost_edge")

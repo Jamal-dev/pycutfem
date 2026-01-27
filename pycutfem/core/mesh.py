@@ -33,7 +33,8 @@ class Mesh:
                  elements_corner_nodes: np.ndarray = None,
                  *,
                  element_type: str = 'tri',
-                 poly_order: int = 1):
+                 poly_order: int = 1,
+                 deduplicate_nodes: bool = True):
         """
         Initializes the mesh and builds its topology.
         """
@@ -46,7 +47,8 @@ class Mesh:
         self.elements_connectivity: np.ndarray = element_connectivity
         self.corner_connectivity: np.ndarray = elements_corner_nodes
         self._char_length = float(np.ptp(self.nodes_x_y_pos, axis=0).max() or 1.0)
-        self._deduplicate_nodes()
+        if bool(deduplicate_nodes):
+            self._deduplicate_nodes()
         self.elements_list: List['Element'] = []
         self.edges_list: List['Edge'] = []
         self._edge_dict: Dict[Tuple[int, int], 'Edge'] = {}
@@ -162,7 +164,12 @@ class Mesh:
                 return tuple(int(n) for n in np.asarray(seq).ravel())
             return ()
 
-        def _locate_all_nodes_in_edge(vA: int, vB: int, edge_nodes_hint: Optional[Tuple[int, ...]] = None) -> Tuple[int, ...]:
+        def _locate_all_nodes_in_edge(
+            vA: int,
+            vB: int,
+            edge_nodes_hint: Optional[Tuple[int, ...]] = None,
+            candidates: Optional[Iterable[int]] = None,
+        ) -> Tuple[int, ...]:
             """
             Return every node that lies on the geometric edge vA→vB.
             Vectorized to avoid Python loops (hot when rebuilding topology
@@ -189,18 +196,36 @@ class Mesh:
                 dist_tol = max(dist_tol, 1.25 * sagitta + 1e-9 * span_ref)
             proj_tol = max(dist_tol * L, 1e-12 * L2, 1e-8 * span_ref * L)
 
-            rel = self.nodes_x_y_pos - p0  # (n_nodes, 2)
-            cross = np.abs(rel[:, 0] * d[1] - rel[:, 1] * d[0])
-            dot = rel @ d
-            # cross/|d| is the perpendicular distance from the line
-            mask = (cross <= dist_tol * L) & (dot >= -proj_tol) & (dot <= L2 + proj_tol)
-            cand = np.nonzero(mask)[0]
-            if cand.size == 0:
+            if candidates is None:
+                rel = self.nodes_x_y_pos - p0  # (n_nodes, 2)
+                cross = np.abs(rel[:, 0] * d[1] - rel[:, 1] * d[0])
+                dot = rel @ d
+                # cross/|d| is the perpendicular distance from the line
+                mask = (cross <= dist_tol * L) & (dot >= -proj_tol) & (dot <= L2 + proj_tol)
+                cand = np.nonzero(mask)[0]
+                if cand.size == 0:
+                    return (int(vA), int(vB))
+
+                proj = dot[cand]
+                order = np.argsort(proj)
+                ordered = cand[order]
+                return tuple(int(idx) for idx in ordered)
+
+            cand_arr = np.fromiter((int(n) for n in candidates), dtype=int)
+            if cand_arr.size == 0:
                 return (int(vA), int(vB))
 
-            proj = dot[cand]
+            rel = self.nodes_x_y_pos[cand_arr] - p0  # (n_cand, 2)
+            cross = np.abs(rel[:, 0] * d[1] - rel[:, 1] * d[0])
+            dot = rel @ d
+            mask = (cross <= dist_tol * L) & (dot >= -proj_tol) & (dot <= L2 + proj_tol)
+            cand_f = cand_arr[mask]
+            if cand_f.size == 0:
+                return (int(vA), int(vB))
+
+            proj = dot[mask]
             order = np.argsort(proj)
-            ordered = cand[order]
+            ordered = cand_f[order]
             return tuple(int(idx) for idx in ordered)
 
         def _sort_along_edge(n_start: int, n_end: int, nodes: Iterable[int]) -> List[int]:
@@ -236,13 +261,6 @@ class Mesh:
                     order = np.argsort(coords[:, 1] + 1e-12 * coords[:, 0])
                 ordered_nodes = [edge_nodes[i] for i in order]
                 n_start, n_end = int(ordered_nodes[0]), int(ordered_nodes[-1])
-                # Enrich with any intermediate (hanging) nodes that lie on the geometric edge
-                geom_nodes = _locate_all_nodes_in_edge(n_start, n_end)
-                geom_set = set(geom_nodes)
-                for nd in ordered_nodes:
-                    if nd not in geom_set:
-                        geom_nodes = tuple(list(geom_nodes) + [nd])
-                        geom_set.add(nd)
                 key = tuple(sorted((n_start, n_end)))
                 incidences = elem_edge_map.get(key, [])
                 if not incidences:
@@ -261,6 +279,28 @@ class Mesh:
                         self._neighbors[left_eid].append(right_eid)
                         self._neighbors[right_eid].append(left_eid)
                         elem_edges[right_eid][right_lid].append(edge_gid)
+
+                # Determine the full node set on this edge.
+                # Prefer nodes from the owning element(s) to avoid accidentally pulling in
+                # nodes from other disconnected components that share coordinates (e.g.
+                # composite meshes for non-matching coupling).
+                geom_nodes: Tuple[int, ...] = tuple(int(n) for n in ordered_nodes)
+                if left_eid is not None:
+                    cand: set[int] = set(elem_node_sets[int(left_eid)])
+                    if right_eid is not None:
+                        cand.update(elem_node_sets[int(right_eid)])
+                    geom_nodes = _locate_all_nodes_in_edge(
+                        n_start,
+                        n_end,
+                        tuple(int(n) for n in ordered_nodes),
+                        candidates=cand,
+                    )
+
+                geom_set = set(int(n) for n in geom_nodes)
+                for nd in ordered_nodes:
+                    if int(nd) not in geom_set:
+                        geom_nodes = tuple(list(geom_nodes) + [int(nd)])
+                        geom_set.add(int(nd))
                 edge_nodes_from_elem = (
                     _edge_nodes_from_element_side(left_eid, left_lid)
                     if left_eid is not None and left_lid is not None

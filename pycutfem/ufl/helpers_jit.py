@@ -812,7 +812,28 @@ def _build_jit_kernel_args(       # ← signature unchanged
     for name in sorted(required):
         # Always supply global element-length h_arr for CellDiameter
         if name == "h_arr":
-            args["h_arr"] = _h_global
+            # Kernels index CellDiameter / ElementWiseConstant as h_arr[owner_id[e]].
+            #
+            # Contract:
+            # - By default `h_arr` is a global per-element size array for `mixed_element.mesh`.
+            # - For multi-mesh nonmatching interfaces, assemblers may inject a *custom*
+            #   `owner_id` + `h_arr` pair (with `domain == "nonmatching_interface"`).
+            dom = str(args.get("domain") or args.get("domain_type") or "")
+            if dom == "nonmatching_interface" and args.get("h_arr") is not None:
+                harr = np.asarray(args["h_arr"], dtype=np.float64)
+                owners = args.get("owner_id", None)
+                if owners is None:
+                    raise KeyError("nonmatching_interface requires 'owner_id' when requesting 'h_arr'.")
+                owners = np.asarray(owners, dtype=np.int64).ravel()
+                valid = owners >= 0
+                if np.any(valid) and int(np.max(owners[valid])) >= int(harr.shape[0]):
+                    raise ValueError(
+                        "Invalid nonmatching_interface h_arr/owner_id: "
+                        f"max(owner_id)={int(np.max(owners[valid]))} >= len(h_arr)={int(harr.shape[0])}."
+                    )
+                args["h_arr"] = harr
+            else:
+                args["h_arr"] = _h_global
             continue
 
         # --- sided reference value/derivative tables: r{d0}{d1}_{field}_{pos|neg} ---
@@ -827,6 +848,12 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 # Boundary-edge precompute also stores owner ids for convenience, so *do not*
                 # classify by owner_* keys alone.
                 if pb is None:
+                    return False
+                # Nonmatching-interface precompute also carries sided maps, but its r**
+                # tables are already in the expected local layout. Do not treat it as
+                # "ghost" for the owner->union pre-padding path.
+                dom = str(pb.get("domain") or pb.get("domain_type") or "")
+                if dom == "nonmatching_interface":
                     return False
                 return any(
                     k == "pos_map"

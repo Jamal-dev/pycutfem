@@ -2465,6 +2465,9 @@ class CppCodeGen:
                     elif is_a_2x2 and is_b_2x2:
                         emit_line(f"double {nm} = ({a.name}.cwiseProduct({b.name})).sum();")
                         push_inner("scalar", "value", ())
+                    elif a.role in {"value", "const"} and b.role in {"value", "const"} and a.shape == b.shape:
+                        emit_line(f"double {nm} = ({a.name}.cwiseProduct({b.name})).sum();")
+                        push_inner("scalar", "value", ())
                     elif is_a_1d and is_b_basis:
                         emit_line(f"auto {nm} = const_vector_dot_basis_1d({a.name}, {b.name});")
                         push_inner("vec", b.role, (-1,))
