@@ -116,21 +116,6 @@ def build_nonmatching_interface(
     p_ref = np.asarray(neg[0]["p0"], dtype=float)
     s_ref = float(np.dot(p_ref, t))
 
-    # Bounding box heuristic to orient normals neg->pos ------------------------
-    pos_min = np.min(mesh_pos.nodes_x_y_pos, axis=0)
-    pos_max = np.max(mesh_pos.nodes_x_y_pos, axis=0)
-    span = float(np.ptp(mesh_pos.nodes_x_y_pos, axis=0).max() or 1.0)
-    eps = 1.0e-8 * span
-
-    def _orient_normal(nvec: np.ndarray, mid: np.ndarray) -> np.ndarray:
-        nvec = np.asarray(nvec, dtype=float).copy()
-        probe = mid + eps * nvec
-        inside = bool(
-            (pos_min[0] - 10 * tol <= probe[0] <= pos_max[0] + 10 * tol)
-            and (pos_min[1] - 10 * tol <= probe[1] <= pos_max[1] + 10 * tol)
-        )
-        return nvec if inside else -nvec
-
     # Convert each edge segment to 1D intervals along t ------------------------
     def _as_intervals(items: list[dict]) -> list[dict]:
         out = []
@@ -142,15 +127,13 @@ def build_nonmatching_interface(
             if s1 < s0:
                 s0, s1 = s1, s0
                 p0, p1 = p1, p0
-            mid = 0.5 * (p0 + p1)
-            nvec = _orient_normal(np.asarray(it["n"], float), mid)
             out.append(
                 {
                     "s0": s0,
                     "s1": s1,
                     "gid": int(it["gid"]),
                     "eid": int(it["eid"]),
-                    "n": nvec,
+                    "n": np.asarray(it["n"], float),
                 }
             )
         out.sort(key=lambda d: d["s0"])
@@ -202,6 +185,15 @@ def build_nonmatching_interface(
     P0_arr = np.asarray(seg_P0, dtype=float)
     P1_arr = np.asarray(seg_P1, dtype=float)
     n_arr = np.asarray(seg_n, dtype=float)
+    # Robust normal orientation (neg -> pos) based on owner element centroids.
+    cpos = np.asarray([mesh_pos.elements_list[int(eid)].centroid() for eid in seg_pos_eid], dtype=float)
+    cneg = np.asarray([mesh_neg.elements_list[int(eid)].centroid() for eid in seg_neg_eid], dtype=float)
+    orient_vec = cpos - cneg
+    orient_norm = np.linalg.norm(orient_vec, axis=1)
+    dotv = np.einsum("ij,ij->i", n_arr, orient_vec)
+    flip = (orient_norm > float(tol)) & (dotv < 0.0)
+    if np.any(flip):
+        n_arr[flip, :] *= -1.0
     # Normalize normals defensively.
     nn = np.linalg.norm(n_arr, axis=1)
     nn = np.where(nn > 0.0, nn, 1.0)
@@ -220,4 +212,3 @@ def build_nonmatching_interface(
         h_neg=np.asarray(seg_hn, dtype=float),
         h_pos=np.asarray(seg_hp, dtype=float),
     )
-

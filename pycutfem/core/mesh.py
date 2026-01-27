@@ -34,9 +34,18 @@ class Mesh:
                  *,
                  element_type: str = 'tri',
                  poly_order: int = 1,
-                 deduplicate_nodes: bool = True):
+                 deduplicate_nodes: bool = False):
         """
         Initializes the mesh and builds its topology.
+
+        Parameters
+        ----------
+        deduplicate_nodes
+            If True, merge nearly coincident nodes (within a small tolerance)
+            before building topology. This can be helpful for meshes with
+            accidental duplicate coordinates, but **must** be disabled for
+            composite/overlapping meshes where coincident coordinates are
+            intentional and represent distinct components.
         """
         self.edges_connectivity: np.ndarray = edges_connectivity
         self.element_type = element_type

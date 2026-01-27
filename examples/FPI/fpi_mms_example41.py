@@ -562,6 +562,19 @@ def _plot_example41_mesh(*, prob: dict, inlet_bc: str, out_path: Path) -> None:
     dh: DofHandler = prob["dh"]
     mesh_layout = str(prob.get("mesh_layout", "legacy")).strip().lower()
 
+    # Important: `_build_problem(...)` re-classifies the mesh multiple times
+    # (fluid_ls, poro_ls, neumann_ls). For mesh diagnostics we want to see the
+    # *fluid domain* classification (multi-level-set fluid_ls), so ensure the
+    # tags and interface segments shown in this plot correspond to `fluid_ls`.
+    try:
+        fluid_ls = prob.get("fluid_ls", None)
+        if fluid_ls is not None:
+            mesh.classify_elements(fluid_ls)
+            mesh.classify_edges(fluid_ls)
+            mesh.build_interface_segments(fluid_ls)
+    except Exception:
+        pass
+
     inlet_bc = str(inlet_bc).strip().lower()
     if inlet_bc not in {"dofs", "edges", "auto"}:
         raise ValueError("inlet_bc must be one of {'dofs','edges','auto'}")
@@ -585,39 +598,54 @@ def _plot_example41_mesh(*, prob: dict, inlet_bc: str, out_path: Path) -> None:
     y_max_mesh = float(np.max(mesh.nodes_x_y_pos[:, 1]))
 
     fig, ax = plt.subplots(figsize=(10, 9))
-    # Background mesh and nodes.
-    plot_mesh_2(mesh, ax=ax, show=False, elem_tags=False, plot_interface=False, edge_colors=True, plot_nodes=True)
-
-    # Outer square boundary (paper Fig. 3) as φ=0 contour.
+    # Background mesh: show element/edge classifications.
     plot_mesh_2(
         mesh,
         ax=ax,
         show=False,
-        elem_tags=False,
-        plot_edges=False,
-        plot_nodes=False,
-        plot_interface=False,
-        level_set=prob["fluid_sq_ls"],
-        edge_colors=False,
+        elem_tags=True,
+        plot_interface=True,
+        edge_colors=True,
+        plot_nodes=True,
+        fluid_solid_overlay=False,
     )
+    # Keep plot_mesh_2 legend entries (elem/edge tags) and extend it with the
+    # Dirichlet-DOF markers below.
+    base_leg = ax.get_legend()
+    base_handles: list[object] = []
+    base_labels: list[str] = []
+    if base_leg is not None:
+        base_handles = list(getattr(base_leg, "legend_handles", [])) or list(getattr(base_leg, "legendHandles", []))
+        base_labels = [str(t.get_text()) for t in base_leg.get_texts()]
+        base_leg.remove()
 
-    # Poro domain boundary (rotated by 30°), drawn in purple.
-    try:
-        import matplotlib.tri as mtri
+    # Draw the rotated boxes *exactly* (avoid tricontour artifacts when φ=0 at nodes).
+    def _plot_rotated_box(ls, *, color: str, lw: float, zorder: int) -> None:
+        if ls is None:
+            return
+        try:
+            cx, cy = float(ls.center[0]), float(ls.center[1])
+            hx, hy = float(ls.hx), float(ls.hy)
+            ang = float(ls.angle)
+        except Exception:
+            return
+        ca, sa = math.cos(ang), math.sin(ang)
+        R = np.array([[ca, -sa], [sa, ca]], dtype=float)
+        corners = np.array(
+            [
+                [-hx, -hy],
+                [hx, -hy],
+                [hx, hy],
+                [-hx, hy],
+                [-hx, -hy],
+            ],
+            dtype=float,
+        )
+        pts = np.array([cx, cy], dtype=float) + corners @ R.T
+        ax.plot(pts[:, 0], pts[:, 1], "-", color=color, linewidth=float(lw), zorder=int(zorder))
 
-        phi_nodes = np.asarray(prob["poro_ls"].evaluate_on_nodes(mesh), dtype=float)
-        tris_idx = []
-        for e in mesh.elements_list:
-            cn = list(e.corner_nodes)
-            if len(cn) == 3:
-                tris_idx.append(cn)
-            elif len(cn) == 4:
-                tris_idx.append([cn[0], cn[1], cn[2]])
-                tris_idx.append([cn[0], cn[2], cn[3]])
-        tri = mtri.Triangulation(mesh.nodes_x_y_pos[:, 0], mesh.nodes_x_y_pos[:, 1], np.asarray(tris_idx, dtype=int))
-        ax.tricontour(tri, phi_nodes, levels=[0.0], colors="purple", linewidths=2.5, zorder=6)
-    except Exception:
-        pass
+    _plot_rotated_box(prob.get("fluid_sq_ls"), color="green", lw=2.5, zorder=6)
+    _plot_rotated_box(prob.get("poro_ls"), color="purple", lw=2.5, zorder=6)
 
     # Highlight the vertical cut line and the (geometric) Γ^{F,N} segment on it.
     ax.plot([x0, x0], [y_min_mesh, y_max_mesh], linestyle="--", color="gray", linewidth=1.5, zorder=3)
@@ -678,7 +706,7 @@ def _plot_example41_mesh(*, prob: dict, inlet_bc: str, out_path: Path) -> None:
                 label="Inactive DOFs on x=x0",
             )
     if np.any(bc_mask):
-        ax.plot(
+        (h_dirichlet,) = ax.plot(
             f_coords[bc_mask, 0],
             f_coords[bc_mask, 1],
             "o",
@@ -688,12 +716,36 @@ def _plot_example41_mesh(*, prob: dict, inlet_bc: str, out_path: Path) -> None:
             zorder=10,
             label="Dirichlet DOFs",
         )
+    else:
+        h_dirichlet = None
 
     L = 1.5 if mesh_layout == "legacy" else 1.0
     nx_guess = int(round(float(L) / float(prob["h"]))) if float(prob.get("h", 0.0) or 0.0) > 0.0 else -1
     ax.set_title(f"Example 4.1 mesh (layout={mesh_layout}, nx={nx_guess}, p={mesh.poly_order}) | dirichlet_tag={inlet_tag}")
-    ax.legend(loc="upper right")
-    fig.tight_layout()
+    # Merge legends: plot_mesh_2 (elem/edge tags) + Dirichlet DOFs
+    handles: list[object] = []
+    labels: list[str] = []
+
+    def _add(h, lbl: str) -> None:
+        if h is None:
+            return
+        lbl = str(lbl)
+        if not lbl or lbl.startswith("_"):
+            return
+        if lbl in labels:
+            return
+        handles.append(h)
+        labels.append(lbl)
+
+    for h, lbl in zip(base_handles, base_labels):
+        _add(h, lbl)
+    _add(h_dirichlet, "Dirichlet DOFs")
+
+    if handles:
+        ax.legend(handles=handles, labels=labels, bbox_to_anchor=(1.05, 1), loc="upper left")
+        fig.tight_layout(rect=[0, 0, 0.85, 1])
+    else:
+        fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200)
     plt.close(fig)

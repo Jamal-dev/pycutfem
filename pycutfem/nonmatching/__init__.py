@@ -16,7 +16,7 @@ from .diagnostics import (
 from .mortar import MortarCoupling, assemble_mortar_saddle_matrix, assemble_poisson_mortar_coupling
 from .nitsche import assemble_poisson_nitsche_interface_matrix, assemble_stokes_nitsche_interface_matrix
 from .norms import scalar_H1_semi_error, scalar_L2_error
-from .system import apply_dirichlet_data, coupled_dirichlet_data
+from .system import apply_dirichlet_data, apply_dirichlet_increment, coupled_dirichlet_data
 from .ufl_coupling import assemble_nonmatching_interface_form
 
 __all__ = [
@@ -37,6 +37,7 @@ __all__ = [
     "scalar_L2_error",
     "scalar_H1_semi_error",
     "apply_dirichlet_data",
+    "apply_dirichlet_increment",
     "coupled_dirichlet_data",
     "assemble_nonmatching_interface_form",
 ]

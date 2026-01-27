@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Tuple
 from pycutfem.jit.cache import KernelCache
 from .compiler import compile_extension
 
-CODEGEN_ABI_CPP = "2026-01-25-cpp-param-order-required-args-v3"
+# Bump when generated C++ changes in a way that requires recompilation of cached kernels.
+CODEGEN_ABI_CPP = "2026-01-27-cpp-function-derivative-v4"
 
 
 class CppKernelCache:

@@ -56,3 +56,35 @@ def apply_dirichlet_data(
     F[rows] = vals
     return K_csr, F
 
+
+def apply_dirichlet_increment(
+    K: sp.spmatrix,
+    R: np.ndarray,
+    U: np.ndarray,
+    data: Mapping[int, float],
+) -> tuple[sp.csr_matrix, np.ndarray]:
+    """Apply strong Dirichlet constraints to a Newton *increment* system.
+
+    Solves for `dU` in `K dU = -R` while enforcing `U + dU = g` at constrained
+    rows, i.e. `dU[row] = g - U[row]`.
+    """
+    if not data:
+        return K.tocsr(), -np.asarray(R, dtype=float)
+
+    rows = np.fromiter((int(k) for k in data.keys()), dtype=int)
+    vals = np.fromiter((float(v) for v in data.values()), dtype=float)
+    R = np.asarray(R, dtype=float)
+    U = np.asarray(U, dtype=float)
+
+    dU_bc = np.zeros_like(R, dtype=float)
+    dU_bc[rows] = vals - U[rows]
+
+    rhs = -R - K @ dU_bc
+
+    K_lil = K.tolil()
+    K_lil[rows, :] = 0.0
+    K_lil[:, rows] = 0.0
+    K_lil[rows, rows] = 1.0
+
+    rhs[rows] = dU_bc[rows]
+    return K_lil.tocsr(), rhs

@@ -327,6 +327,7 @@ def plot_mesh_2(
         #    draw each sub-segment so the nonconforming interface is visible.
         edge_segments = []
         colors = []
+        widths = []
         for edge in edges_to_draw:
             nids = list(edge.all_nodes) if getattr(edge, "all_nodes", ()) else list(edge.nodes)
             if len(nids) < 2:
@@ -334,8 +335,13 @@ def plot_mesh_2(
             pts = node_coords[nids]
             for i in range(len(nids) - 1):
                 edge_segments.append(pts[i : i + 2])
-                colors.append(_EDGE_COLOR.get(edge.tag, 'black') if edge.right is not None else _EDGE_COLOR.get('boundary', 'black'))
-        line_collection = LineCollection(edge_segments, colors=colors, linewidths=1.2, zorder=2)
+                if edge_colors:
+                    tag = edge.tag or ("boundary" if edge.right is None else "default")
+                else:
+                    tag = "boundary" if edge.right is None else "default"
+                colors.append(_edge_col(tag))
+                widths.append(_edge_lw(tag))
+        line_collection = LineCollection(edge_segments, colors=colors, linewidths=widths, zorder=2)
         ax.add_collection(line_collection)
 
         # 3. Build legend using only the tags from the drawn edges

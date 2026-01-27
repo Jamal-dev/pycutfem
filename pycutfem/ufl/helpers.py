@@ -1440,8 +1440,10 @@ class GradOpInfo(BaseOpInfo):
                 if grad_val.shape[-1] != other_vec.shape[0]:
                     raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
                 data = np.einsum("kd,d->k", grad_val, other_vec, optimize=True)
+                # Keep scalar outputs as arrays (0-D or 1-D) to preserve `.shape`
+                # and avoid breaking VecOpInfo algebra in later sums/products.
                 if isinstance(data, np.ndarray) and data.shape == (1,):
-                    return VecOpInfo(float(data[0]), role="scalar", **self.update_meta(self.meta()))
+                    return VecOpInfo(np.asarray(data[0]), role="scalar", **self.update_meta(self.meta()))
                 role = "scalar" if np.ndim(data) == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
             if self.data.shape[-1] != other_vec.shape[0]:

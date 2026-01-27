@@ -1451,7 +1451,46 @@ def div(v):
 def inner(a, b): return Inner(a, b)
 def outer(a, b): return Outer(a, b)
 def dyad(a, b): return Outer(a, b)
-def jump(v, n=None): return Jump(v, n)
+def jump(v, n=None):
+    """
+    Jump operator.
+
+    Semantics
+    ---------
+    - ``jump(v)``  ->  v(+) - v(-)
+    - ``jump(v, n)`` -> v(+)·n(+) + v(-)·n(-)   (standard UFL "jump with normal")
+
+    Backwards Compatibility
+    -----------------------
+    Historically, this project also allowed ``jump(v_pos, v_neg)`` as a convenience
+    wrapper for ``Jump(v_pos, v_neg)``. This clashes with the UFL meaning of a 2nd
+    argument (a normal vector). We disambiguate by treating the 2nd argument as a
+    normal only when it *looks like* one (e.g. ``FacetNormal()`` or a length-2
+    constant); otherwise we interpret it as an explicit negative-side expression.
+    """
+    if n is None:
+        return Jump(v)
+
+    def _unwrap_side(expr):
+        while isinstance(expr, (Pos, Neg)):
+            expr = expr.operand
+        return expr
+
+    n_base = _unwrap_side(n)
+    is_normal = isinstance(n_base, FacetNormal) or (getattr(n_base, "shape", None) == (2,))
+
+    # Legacy: jump(v_pos, v_neg) -> Jump(v_pos, v_neg)
+    if not is_normal:
+        return Jump(v, n)
+
+    v_pos, v_neg = Pos(v), Neg(v)
+    n_pos, n_neg = Pos(n), Neg(n)
+
+    # For scalar v, UFL defines jump(v,n) as a vector-valued flux jump: v(+) n(+) + v(-) n(-).
+    # Only treat `v` as scalar if it explicitly declares scalar shape (Grad/Div/etc do not).
+    if hasattr(v, "dim") and getattr(v, "dim", 0) == 0 and getattr(v, "num_components", 1) == 1:
+        return v_pos * n_pos + v_neg * n_neg
+    return Dot(v_pos, n_pos) + Dot(v_neg, n_neg)
 def avg(v): return Avg(v)
 def dot(a, b): return Dot(a, b)
 def restrict(expression, domain_tag):

@@ -226,3 +226,4 @@ comparison_outputs/
 examples/FPI/paper_conv/
 examples/FPI/_mms_example41_plots/
 examples/FPI/*plots_*/
+examples/FPI/_two_mesh*/

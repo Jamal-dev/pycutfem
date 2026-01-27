@@ -1010,19 +1010,88 @@ class CppCodeGen:
                         emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx2}, j) = {table_name}_view(e, q, j);")
                     stack.append(StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides))
                 elif op.role == "function":
-                    # coeffs are pre-gathered u_<name>__pos/_neg_loc[e, :] when sided
+                    # Coefficient derivatives (from UFL Derivative nodes) arrive here as
+                    # LoadVariable(role="function", deriv_order != (0,0)).
+                    #
+                    # IMPORTANT: Do not treat these as value lookups. We must evaluate
+                    # the requested physical derivative at the quadrature point using
+                    # the reference gradient tables and J^{-1}. Otherwise H1-seminorm
+                    # error norms become mesh-independent ("flat" convergence).
                     coeff_name = coeff_array_name(op.name, op.side)
                     required_args.add(coeff_name)
-                    # If a differential operator follows, defer evaluation and use coefficients directly.
-                    if followed_by_diff:
-                        stack.append(
-                            StackItem("__func__", "vec", "value", (len(op.field_names),), op.field_names, op.name, op.side, op.field_sides)
+
+                    if op.deriv_order not in {(1, 0), (0, 1)}:
+                        raise NotImplementedError(
+                            f"C++ backend: Function Derivative order {op.deriv_order} not implemented (use grad()/Hessian()/laplacian())."
                         )
+
+                    # Select physical component: (1,0)->dx, (0,1)->dy
+                    comp = 0 if op.deriv_order == (1, 0) else 1
+
+                    # Need inverse Jacobian for push-forward of reference gradients
+                    if op.side == "+":
+                        required_args.add("J_inv_pos")
+                    elif op.side == "-":
+                        required_args.add("J_inv_neg")
                     else:
-                        # Normal unsided functions should not carry field_sides.
-                        fs_clean = [] if not op.side else (op.field_sides or [])
-                        k = len(op.field_names)
-                        nm = new_tmp("val")
+                        required_args.add("J_inv")
+                    jloc_var = "Jloc_pos" if op.side == "+" else "Jloc_neg" if op.side == "-" else "Jloc"
+
+                    # Normal unsided functions should not carry field_sides.
+                    fs_clean = [] if not op.side else (op.field_sides or [])
+                    k = len(op.field_names)
+                    if k <= 0:
+                        stack.append(StackItem("0.0", "scalar", "value", (), [], op.name, op.side, fs_clean))
+                        continue
+
+                    if k == 1:
+                        fn = op.field_names[0]
+                        s0 = field_slices.get(fn, slice(0, 0)).start
+                        s1 = field_slices.get(fn, slice(0, 0)).stop
+                        side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, 0)
+
+                        nm = new_tmp("dval")
+                        if self.on_facet and side_tag in ("pos", "neg"):
+                            d10 = f"r10_{fn}_{side_tag}"
+                            d01 = f"r01_{fn}_{side_tag}"
+                            map_name = f"{side_tag}_map_{fn}"
+                            required_args.update({d10, d01, map_name})
+                            map_len = new_tmp("map_len")
+                            basis_len = new_tmp("basis_len")
+                            emit_line(f"double {nm} = 0.0;")
+                            emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
+                            emit_line(f"ssize_t {basis_len} = {d10}_view.shape(2);")
+                            emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
+                            emit_line(f"    int col = {map_name}_view(e, j);")
+                            emit_line(f"    if (col < 0 || col >= n_union) continue;")
+                            emit_line(
+                                f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                            )
+                            emit_line(f"    if (src >= {basis_len}) continue;")
+                            emit_line(f"    double gx = {d10}_view(e,q,src); double gy = {d01}_view(e,q,src);")
+                            if comp == 0:
+                                emit_line(f"    double dphi = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
+                            else:
+                                emit_line(f"    double dphi = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
+                            emit_line(f"    {nm} += {coeff_name}_view(e, col) * dphi;")
+                            emit_line("}")
+                        else:
+                            required_args.add(f"g_{fn}")
+                            s0_adj = new_tmp("s0")
+                            s1_adj = new_tmp("s1")
+                            emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                            emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                            emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                            gtmp = new_tmp("g_tmp")
+                            emit_line(f"Eigen::MatrixXd {gtmp}(1, 2);")
+                            emit_line(
+                                f"gradient_component({gtmp}, 0, {coeff_name}_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
+                            )
+                            emit_line(f"double {nm} = {gtmp}(0, {comp});")
+
+                        stack.append(StackItem(nm, "scalar", "value", (), op.field_names, op.name, op.side, fs_clean))
+                    else:
+                        nm = new_tmp("dvec")
                         emit_line(f"Eigen::VectorXd {nm}({k});")
                         emit_line(f"{nm}.setZero();")
                         for idx, fn in enumerate(op.field_names):
@@ -1030,13 +1099,16 @@ class CppCodeGen:
                             s1 = field_slices.get(fn, slice(0, 0)).stop
                             side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx)
                             if self.on_facet and side_tag in ("pos", "neg"):
-                                basis_name = f"r00_{fn}_{side_tag}"
-                                map_name   = f"{side_tag}_map_{fn}"
-                                emit_line(f"{nm}({idx}) = 0.0;")
+                                d10 = f"r10_{fn}_{side_tag}"
+                                d01 = f"r01_{fn}_{side_tag}"
+                                map_name = f"{side_tag}_map_{fn}"
+                                required_args.update({d10, d01, map_name})
                                 map_len = new_tmp("map_len")
                                 basis_len = new_tmp("basis_len")
+                                dval = new_tmp("dval")
+                                emit_line(f"double {dval} = 0.0;")
                                 emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
-                                emit_line(f"ssize_t {basis_len} = {basis_name}_view.shape(2);")
+                                emit_line(f"ssize_t {basis_len} = {d10}_view.shape(2);")
                                 emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                                 emit_line(f"    int col = {map_name}_view(e, j);")
                                 emit_line(f"    if (col < 0 || col >= n_union) continue;")
@@ -1044,22 +1116,29 @@ class CppCodeGen:
                                     f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
                                 )
                                 emit_line(f"    if (src >= {basis_len}) continue;")
-                                emit_line(f"    {nm}({idx}) += {coeff_name}_view(e, col) * {basis_name}_view(e, q, src);")
+                                emit_line(f"    double gx = {d10}_view(e,q,src); double gy = {d01}_view(e,q,src);")
+                                if comp == 0:
+                                    emit_line(f"    double dphi = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
+                                else:
+                                    emit_line(f"    double dphi = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
+                                emit_line(f"    {dval} += {coeff_name}_view(e, col) * dphi;")
                                 emit_line("}")
+                                emit_line(f"{nm}({idx}) = {dval};")
                             else:
+                                required_args.add(f"g_{fn}")
                                 s0_adj = new_tmp("s0")
                                 s1_adj = new_tmp("s1")
                                 emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
                                 emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
                                 emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                gtmp = new_tmp("g_tmp")
+                                emit_line(f"Eigen::MatrixXd {gtmp}(1, 2);")
                                 emit_line(
-                                    f"{nm}({idx}) = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0_adj}, {s1_adj});"
+                                    f"gradient_component({gtmp}, 0, {coeff_name}_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
                                 )
-                        if k == 1:
-                            emit_line(f"double {nm}_scalar = {nm}(0);")
-                            stack.append(StackItem(f"{nm}_scalar", "scalar", "value", (), op.field_names, op.name, op.side, fs_clean))
-                        else:
-                            stack.append(StackItem(nm, "vec", "value", (k,), op.field_names, op.name, op.side, fs_clean))
+                                emit_line(f"{nm}({idx}) = {gtmp}(0, {comp});")
+
+                        stack.append(StackItem(nm, "vec", "value", (k,), op.field_names, op.name, op.side, fs_clean))
                 else:
                     raise NotImplementedError(f"LoadVariable role {op.role} unsupported in C++ backend")
             elif isinstance(op, Grad):

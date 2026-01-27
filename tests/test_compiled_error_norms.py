@@ -99,6 +99,41 @@ def test_h1_scalar_error_compiled_matches_python_and_exact(dh_and_level_set, bac
 
 
 @pytest.mark.parametrize("backend", ["jit"] + (["cpp"] if _have_cpp_backend() else []))
+def test_h1_scalar_error_compiled_zero_for_exact_linear(dh_and_level_set, backend):
+    dh, level_set = dh_and_level_set
+    uh = Function(name="uh", field_name="u", dof_handler=dh)
+
+    # Exact Q1 field: u = x + 2y -> grad(u) = [1, 2]
+    uh.set_values_from_function(lambda x, y: x + 2.0 * y)
+
+    def exact_grad(x, y):
+        return np.array([1.0, 2.0], dtype=float)
+
+    err_py = dh.h1_error_scalar_on_side(
+        uh,
+        exact_grad,
+        level_set,
+        side="-",
+        field="u",
+        relative=False,
+        quad_increase=0,
+    )
+    err_cmp = dh.h1_error_scalar_on_side_compiled(
+        uh,
+        exact_grad,
+        level_set,
+        side="-",
+        field="u",
+        relative=False,
+        quad_increase=0,
+        backend=backend,
+    )
+
+    assert err_py < 1e-10
+    assert_allclose(err_cmp, err_py, rtol=1e-11, atol=1e-12)
+
+
+@pytest.mark.parametrize("backend", ["jit"] + (["cpp"] if _have_cpp_backend() else []))
 def test_h1_vector_error_compiled_matches_python_and_exact(dh_and_level_set, backend):
     dh, level_set = dh_and_level_set
     Uh = VectorFunction(name="U", field_names=["ux", "uy"], dof_handler=dh)
@@ -134,3 +169,41 @@ def test_h1_vector_error_compiled_matches_python_and_exact(dh_and_level_set, bac
     assert_allclose(err_cmp, err_py, rtol=1e-11, atol=1e-12)
     assert_allclose(err_cmp, err_exact, rtol=1e-11, atol=1e-12)
 
+
+@pytest.mark.parametrize("backend", ["jit"] + (["cpp"] if _have_cpp_backend() else []))
+def test_h1_vector_error_compiled_zero_for_exact_linear(dh_and_level_set, backend):
+    dh, level_set = dh_and_level_set
+    Uh = VectorFunction(name="U", field_names=["ux", "uy"], dof_handler=dh)
+
+    # Exact Q1 vector field:
+    #   U = (x + y, 2x - y) -> grad(U) = [[1, 1], [2, -1]]
+    Uh.set_values_from_function(lambda x, y: np.array([x + y, 2.0 * x - y], dtype=float))
+
+    def exact_grad_vec(x, y):
+        return np.array([[1.0, 1.0], [2.0, -1.0]], dtype=float)
+
+    q = 6
+    err_py = dh.h1_error_vector_on_side(
+        Uh,
+        exact_grad_vec,
+        level_set,
+        side="-",
+        fields=["ux", "uy"],
+        relative=False,
+        quad_increase=0,
+        quad_order=q,
+    )
+    err_cmp = dh.h1_error_vector_on_side_compiled(
+        Uh,
+        exact_grad_vec,
+        level_set,
+        side="-",
+        fields=["ux", "uy"],
+        relative=False,
+        quad_increase=0,
+        quad_order=q,
+        backend=backend,
+    )
+
+    assert err_py < 1e-10
+    assert_allclose(err_cmp, err_py, rtol=1e-11, atol=1e-12)

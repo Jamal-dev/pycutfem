@@ -2029,6 +2029,239 @@ class DofHandler:
         """
         return self.mixed_element.mesh.edge_bitset(name)
 
+    def distribute_dofs_cutfem(
+        self,
+        level_set,
+        *,
+        domain_side: str = "-",
+        tol: float = 1e-12,
+        verbose: bool = False,
+        reset: bool = False,
+    ) -> None:
+        """
+        CutFEM DOF distribution for overlapping/disconnected active domains.
+
+        Splits CG DOFs across disconnected components of the active domain
+        defined by ``level_set`` so background-mesh continuity does not connect
+        disjoint physical regions.
+
+        Active elements are:
+          - side='-': inside ∪ cut
+          - side='+': outside ∪ cut
+
+        Limitations
+        -----------
+        - Supports CG Lagrange fields on a single mesh. DG fields are renumbered
+          element-locally. RT fields are not supported.
+        - Inactive elements get placeholder DOFs (-1) for non-number fields;
+          after calling this, assemble only on side-restricted measures.
+        - ``dof_map`` becomes ambiguous for split nodes; we keep a best-effort
+          single mapping for compatibility.
+        """
+        import copy
+        import numpy as np
+        from pycutfem.core.levelset import phi_eval as _phi_eval
+
+        if domain_side not in {"-", "+"}:
+            raise ValueError("domain_side must be '-' or '+'.")
+        if self.mixed_element is None:
+            raise RuntimeError("distribute_dofs_cutfem requires a MixedElement-backed DofHandler.")
+
+        if reset and hasattr(self, "_cutfem_bg_state"):
+            st = self._cutfem_bg_state
+            self.element_maps = copy.deepcopy(st["element_maps"])
+            self.element_signs = copy.deepcopy(st["element_signs"])
+            self.total_dofs = int(st["total_dofs"])
+            self._dof_coords = np.asarray(st["dof_coords"], dtype=float)
+            self._field_slices = {k: np.asarray(v, dtype=int) for k, v in st["field_slices"].items()}
+            self.field_num_dofs = dict(st.get("field_num_dofs", {}))
+            self.field_offsets = dict(st.get("field_offsets", {}))
+            self.dof_map = {}
+            self._dof_to_node_map = {}
+        elif hasattr(self, "_cutfem_bg_state"):
+            raise RuntimeError(
+                "distribute_dofs_cutfem was already applied on this DofHandler. "
+                "Pass reset=True to restore and re-apply."
+            )
+
+        self._ensure_dof_coords()
+        self._cutfem_bg_state = {
+            "element_maps": copy.deepcopy(self.element_maps),
+            "element_signs": copy.deepcopy(getattr(self, "element_signs", {})),
+            "total_dofs": int(self.total_dofs),
+            "dof_coords": np.asarray(self._dof_coords, dtype=float).copy(),
+            "field_slices": {f: np.asarray(self.get_field_slice(f), dtype=int).copy() for f in self.field_names},
+            "field_num_dofs": dict(getattr(self, "field_num_dofs", {})),
+            "field_offsets": dict(getattr(self, "field_offsets", {})),
+        }
+
+        mesh = self.mixed_element.mesh
+        me = self.mixed_element
+        families = getattr(me, "_field_families", {}) if me is not None else {}
+        numset = set(getattr(me, "_number_fields", set()))
+
+        mesh.classify_elements(level_set, tol=tol)
+
+        if domain_side == "-":
+            active_mask = mesh.element_bitset("inside") | mesh.element_bitset("cut")
+        else:
+            active_mask = mesh.element_bitset("outside") | mesh.element_bitset("cut")
+        active_eids = set(int(i) for i in active_mask.to_indices())
+
+        if verbose:
+            print(f"[CutFEM] Active elements ({domain_side}): {len(active_eids)} / {mesh.n_elements}")
+
+        parent_e: dict[int, int] = {eid: eid for eid in active_eids}
+
+        def find_e(eid: int) -> int:
+            eid = int(eid)
+            while parent_e[eid] != eid:
+                parent_e[eid] = parent_e[parent_e[eid]]
+                eid = parent_e[eid]
+            return eid
+
+        def union_e(a: int, b: int) -> None:
+            ra = find_e(a)
+            rb = find_e(b)
+            if ra != rb:
+                parent_e[ra] = rb
+
+        phi_nodes = None
+        try:
+            phi_nodes = level_set.evaluate_on_nodes(mesh)
+        except Exception:
+            phi_nodes = None
+
+        def edge_passable(edge) -> bool:
+            vals: list[float] = []
+            if phi_nodes is not None:
+                edge_nodes = getattr(edge, "all_nodes", None) or getattr(edge, "nodes", None) or ()
+                try:
+                    vals = [float(phi_nodes[int(n)]) for n in edge_nodes]
+                except Exception:
+                    vals = []
+
+            if not vals:
+                try:
+                    n0, n1 = int(edge.nodes[0]), int(edge.nodes[1])
+                    p0 = np.asarray(mesh.nodes_x_y_pos[n0], dtype=float)
+                    p1 = np.asarray(mesh.nodes_x_y_pos[n1], dtype=float)
+                    pts = [
+                        p0,
+                        0.25 * p0 + 0.75 * p1,
+                        0.5 * (p0 + p1),
+                        0.75 * p0 + 0.25 * p1,
+                        p1,
+                    ]
+                    vals = [float(_phi_eval(level_set, pt, mesh=mesh)) for pt in pts]
+                except Exception:
+                    vals = []
+
+            if not vals:
+                return True  # conservative: do not disconnect on missing data
+
+            vmin = min(vals)
+            vmax = max(vals)
+            if domain_side == "-":
+                return vmin < -float(tol)
+            return vmax > float(tol)
+
+        for edge in getattr(mesh, "edges_list", []):
+            if getattr(edge, "right", None) is None:
+                continue
+            e_left = int(edge.left)
+            e_right = int(edge.right)
+            if e_left not in active_eids or e_right not in active_eids:
+                continue
+            if not edge_passable(edge):
+                continue
+            union_e(e_left, e_right)
+
+        roots = {eid: find_e(eid) for eid in active_eids}
+        root_list = sorted(set(roots.values()))
+        root_to_comp = {r: i for i, r in enumerate(root_list)}
+        elem_comp = {eid: root_to_comp[r] for eid, r in roots.items()}
+
+        bg_element_maps = copy.deepcopy(self.element_maps)
+
+        new_element_maps: dict[str, list[list[int]]] = {f: [] for f in self.field_names}
+        new_element_signs: dict[str, list[list[float]]] = {f: [] for f in self.field_names}
+        new_field_gsets: dict[str, set[int]] = {f: set() for f in self.field_names}
+        new_dof_coords: list[tuple[float, float]] = []
+
+        next_dof = 0
+        num_gid: dict[str, int] = {}
+        split_map: dict[tuple[str, int, int], int] = {}
+
+        for f in self.field_names:
+            fam = families.get(f, "Lagrange") if isinstance(families, dict) else "Lagrange"
+
+            if f in numset:
+                if f not in num_gid:
+                    num_gid[f] = next_dof
+                    next_dof += 1
+                    new_dof_coords.append((0.0, 0.0))
+                for _eid in range(mesh.n_elements):
+                    new_element_maps[f].append([int(num_gid[f])])
+                    new_element_signs[f].append([1.0])
+                new_field_gsets[f].add(int(num_gid[f]))
+                continue
+
+            if fam == "RT":
+                raise NotImplementedError("distribute_dofs_cutfem currently does not support RT fields.")
+
+            is_dg = self._is_dg_field(f)
+            for eid in range(mesh.n_elements):
+                old = list(bg_element_maps[f][eid])
+                if eid not in active_eids:
+                    new_element_maps[f].append([-1] * len(old))
+                    new_element_signs[f].append([1.0] * len(old))
+                    continue
+
+                if is_dg:
+                    loc: list[int] = []
+                    for bg_dof in old:
+                        gd = next_dof
+                        next_dof += 1
+                        loc.append(int(gd))
+                        xy = self._cutfem_bg_state["dof_coords"][int(bg_dof)]
+                        new_dof_coords.append((float(xy[0]), float(xy[1])))
+                        new_field_gsets[f].add(int(gd))
+                    new_element_maps[f].append(loc)
+                    new_element_signs[f].append([1.0] * len(loc))
+                    continue
+
+                comp = int(elem_comp[int(eid)])
+                loc = []
+                for bg_dof in old:
+                    key = (f, int(bg_dof), comp)
+                    gd = split_map.get(key)
+                    if gd is None:
+                        gd = next_dof
+                        next_dof += 1
+                        split_map[key] = int(gd)
+                        xy = self._cutfem_bg_state["dof_coords"][int(bg_dof)]
+                        new_dof_coords.append((float(xy[0]), float(xy[1])))
+                    loc.append(int(gd))
+                    new_field_gsets[f].add(int(gd))
+                new_element_maps[f].append(loc)
+                new_element_signs[f].append([1.0] * len(loc))
+
+        self.element_maps = new_element_maps
+        self.element_signs = new_element_signs
+        self.total_dofs = int(next_dof)
+        self._dof_coords = np.asarray(new_dof_coords, dtype=float)
+        self._field_slices = {f: np.asarray(sorted(new_field_gsets[f]), dtype=int) for f in self.field_names}
+        self.field_num_dofs = {f: len(self._field_slices[f]) for f in self.field_names}
+        self.field_offsets = {f: 0 for f in self.field_names}
+
+        self.dof_map = {}
+        self._dof_to_node_map = {}
+        self._ensure_node_maps()
+
+        if verbose:
+            print(f"[CutFEM] Active components: {len(root_list)}")
+            print(f"[CutFEM] Total DOFs after splitting: {self.total_dofs}")
 
 
 
@@ -5372,7 +5605,18 @@ class DofHandler:
             raise ValueError("interface.n must have shape (n_segments, 2).")
         nn = np.linalg.norm(n_vec, axis=1)
         nn = np.where(nn > 0.0, nn, 1.0)
-        n_unit = n_vec / nn[:, None]
+        n_unit = (n_vec / nn[:, None]).astype(float, copy=True)
+
+        # Robust normal orientation: enforce neg->pos using owner element centroids.
+        cpos = np.asarray([mesh.elements_list[int(eid)].centroid() for eid in pos_ids], dtype=float)
+        cneg = np.asarray([mesh.elements_list[int(eid)].centroid() for eid in neg_ids], dtype=float)
+        orient_vec = cpos - cneg
+        orient_norm = np.linalg.norm(orient_vec, axis=1)
+        dotv = np.einsum("ij,ij->i", n_unit, orient_vec)
+        flip = (orient_norm > 1e-14) & (dotv < 0.0)
+        if np.any(flip):
+            n_unit[flip, :] *= -1.0
+
         normals = np.broadcast_to(n_unit[:, None, :], (n_seg, nQ, 2)).copy()
 
         # Union GDofs and side maps ----------------------------------------------

@@ -1179,7 +1179,13 @@ class FormCompiler:
                 if gmask is not None:
                     mask_arr = np.asarray(gmask, dtype=coeffs.dtype)
                     coeffs = coeffs * mask_arr[np.newaxis, :]
-            data, role = coeffs * row, "function"
+            # IMPORTANT: Derivative of a *coefficient* function must collapse
+            # the basis-weighted DOF contributions to a scalar value at the QP,
+            # just like `_visit_Function` does for function values.
+            data = np.asarray(coeffs * row)
+            if data.ndim == 2:
+                data = data.sum(axis=1)
+            role = "function"
         elif op.f.is_trial:
             data, role = row, "trial"
         else:
