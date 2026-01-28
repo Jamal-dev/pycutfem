@@ -2758,7 +2758,13 @@ class FormCompiler:
 
         # 4. Build the static arguments required by this specific kernel.
         # We build these fresh every time to avoid caching collisions.
-        q_order = self._find_q_order(integral)
+        # Match the python backend's geometry-aware quadrature inflation for
+        # curved/isoparametric mappings (poly_order>1). Without this, non-polynomial
+        # integrands (e.g. detachment sqrt terms) can differ between backends.
+        q_base = int(self._find_q_order(integral))
+        p_geo = int(getattr(mesh, "poly_order", 1))
+        q_infl = 2 * max(0, p_geo - 1)
+        q_order = q_base + q_infl
         deformation = getattr(integral.measure, "deformation", None)
 
         # (A) Get full-mesh geometric factors and then SLICE them for the subset.

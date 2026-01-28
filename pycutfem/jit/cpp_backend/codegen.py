@@ -1486,6 +1486,16 @@ class CppCodeGen:
                         )
                     )
                 if op.op_symbol == "+":
+                    # Normalize (1,n) row-matrices used as scalar basis vectors to VectorXd
+                    # so we can safely add/subtract with vec-kind basis vectors.
+                    if a.kind == "vec" and b.kind == "mat" and len(b.shape) >= 2 and b.shape[0] == 1:
+                        emit_line(f"Eigen::VectorXd {nm} = {a.name} + {b.name}.row(0).transpose();")
+                        push_bin("vec", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
+                        continue
+                    if b.kind == "vec" and a.kind == "mat" and len(a.shape) >= 2 and a.shape[0] == 1:
+                        emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() + {b.name};")
+                        push_bin("vec", b.role, b.shape, a.field_names or b.field_names, a.parent or b.parent)
+                        continue
                     if a.kind == "grad" and b.kind == "grad":
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
                         emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] + {b.name}[_i];")
@@ -1565,6 +1575,16 @@ class CppCodeGen:
                         emit_line(f"auto {nm} = {a.name} + {b.name};")
                         push_bin(a.kind, a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
                 elif op.op_symbol == "-":
+                    # Normalize (1,n) row-matrices used as scalar basis vectors to VectorXd
+                    # so we can safely add/subtract with vec-kind basis vectors.
+                    if a.kind == "vec" and b.kind == "mat" and len(b.shape) >= 2 and b.shape[0] == 1:
+                        emit_line(f"Eigen::VectorXd {nm} = {a.name} - {b.name}.row(0).transpose();")
+                        push_bin("vec", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent)
+                        continue
+                    if b.kind == "vec" and a.kind == "mat" and len(a.shape) >= 2 and a.shape[0] == 1:
+                        emit_line(f"Eigen::VectorXd {nm} = {a.name}.row(0).transpose() - {b.name};")
+                        push_bin("vec", b.role, b.shape, a.field_names or b.field_names, a.parent or b.parent)
+                        continue
                     if a.kind == "grad" and b.kind == "grad":
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize({a.name}.size());")
                         emit_line(f"for (size_t _i=0; _i<{a.name}.size(); ++_i) {nm}[_i] = {a.name}[_i] - {b.name}[_i];")
@@ -2201,7 +2221,8 @@ class CppCodeGen:
                     push("mixed", "mixed", (a.shape[0], rows, cols, a.shape[2]))
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "value" and b.role == "trial":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_grad_func_trial_vec({a.name}, {b.name});")
-                    push("mat", "trial", (a.shape[1] if len(a.shape)>1 else -1, -1), b.field_names, b.parent)
+                    # grad_func: (k,d), trial_vec: (d,n) -> (k,n)
+                    push("mat", "trial", (a.shape[0] if len(a.shape) > 0 else -1, -1), b.field_names, b.parent)
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "value":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_trial_vec_grad_func({a.name}, {b.name});")
                     push("mat", "trial", (b.shape[1] if len(b.shape)>1 else -1, -1), a.field_names, a.parent)

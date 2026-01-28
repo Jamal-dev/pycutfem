@@ -702,6 +702,8 @@ class VecOpInfo(BaseOpInfo):
             elif other.ndim == 2:
                 # Scale a matrix by a scalar-valued function (e.g. div(u_k) * dot(u_trial, v_test)
                 # in the skew-symmetric convection Jacobian).
+                if self.data.ndim == 0:
+                    return other * float(self.data)
                 if self.data.ndim == 1 and self.data.shape[0] == 1:
                     return other * float(self.data[0])
                 if self.role in {"trial","test"} and self.shape[0] == 1 and other.shape == (2,2):
@@ -748,13 +750,36 @@ class VecOpInfo(BaseOpInfo):
                 # Case: Test * Trial , outer product case
                 return np.einsum("km,kn->mn", self.data, other.data, optimize=True)
             elif self.role == "function" and other.role == "function":
-                # Case: Function * Function , inner product case
-                u_vals = _collapsed_function(self)  # shape (k,)
-                v_vals = _collapsed_function(other)  # shape (k,)
-                data = np.dot(u_vals, v_vals)  # scalar result for rhs
+                # Case: Function * Function
+                #
+                # - scalar * scalar: pointwise product (treated as dot of 1-vectors)
+                # - scalar * vector: component-wise scaling
+                # - vector * scalar: component-wise scaling
+                # - vector * vector: pointwise dot product (scalar)
+                u_vals = _collapsed_function(self)   # shape (k_a,)
+                v_vals = _collapsed_function(other)  # shape (k_b,)
                 meta = _resolve_meta(self.meta(), other.meta())
+
+                if u_vals.shape[0] == 1 and v_vals.shape[0] > 1:
+                    data = float(u_vals[0]) * np.asarray(other.data)
+                    return VecOpInfo(data, role="function", **other.update_meta(meta))
+                if v_vals.shape[0] == 1 and u_vals.shape[0] > 1:
+                    data = float(v_vals[0]) * np.asarray(self.data)
+                    return VecOpInfo(data, role="function", **self.update_meta(meta))
+
+                data = np.dot(u_vals, v_vals)
                 role = "scalar" if np.ndim(data) == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(meta))
+            elif self.role == "scalar" and other.role != "scalar":
+                # Case: scalar coefficient (collapsed) scaling a basis/vector/function
+                scale = float(self.data)
+                meta = _resolve_meta(self.meta(), other.meta(), prefer="b")
+                return VecOpInfo(scale * other.data, role=other.role, **other.update_meta(meta))
+            elif self.role != "scalar" and other.role == "scalar":
+                # Case: basis/vector/function scaled by a scalar coefficient on the right
+                scale = float(other.data)
+                meta = _resolve_meta(self.meta(), other.meta(), prefer="a")
+                return VecOpInfo(scale * self.data, role=self.role, **self.update_meta(meta))
             elif self.role in {"trial","test"} and other.role in {"function", "vector"}:
                 # Case: Scalar Trial/Test * Function 
                 v_vals = _collapsed_function(other)  # shape (k,)
@@ -946,6 +971,10 @@ class VecOpInfo(BaseOpInfo):
             return self._with(self.data / other, role=self.role)
         if isinstance(other, np.ndarray) and other.ndim == 0:
             return self._with(self.data / float(other), role=self.role)
+        if isinstance(other, VecOpInfo) and other.role in {"function", "scalar"}:
+            # Pointwise division by a scalar coefficient function/value.
+            # This is needed for rational nonlinearities such as S/(K+S).
+            return self._with(self.data / other.data, role=self.role)
         raise TypeError(f"VecOpInfo can only be divided by a scalar, not {type(other)}")
 
     def __rtruediv__(self, other):
@@ -975,6 +1004,22 @@ class VecOpInfo(BaseOpInfo):
         if not isinstance(other, (VecOpInfo, np.ndarray)):
             raise TypeError(f"Cannot add VecOpInfo to {type(other)}."
                             f" with shapes {self.data.shape} and {getattr(other_data, 'shape', ())}")
+
+        # Allow adding a scalar-valued VecOpInfo to a scalar/vector-valued VecOpInfo
+        # by treating it like a numeric constant. This occurs naturally for products
+        # of scalar coefficient functions which collapse to role="scalar" (shape=()).
+        if isinstance(other, VecOpInfo) and other_role == "scalar" and np.asarray(other_data).ndim == 0 and self.role in {"function", "vector", "scalar"}:
+            val = float(other_data)
+            meta = _resolve_meta(self.meta(), other_meta, strict=False)
+            return VecOpInfo(self.data + val, role=self.role, **self.update_meta(meta))
+
+        # Broadcast true scalars (shape=()) into length-1 vectors (shape=(1,)).
+        if self.role == "scalar" and np.asarray(self.data).ndim == 0 and isinstance(other, VecOpInfo) and other_role in {"vector", "function"}:
+            arr = np.asarray(other_data)
+            if arr.ndim == 1 and arr.shape[0] == 1:
+                val = float(self.data)
+                meta = _resolve_meta(self.meta(), other_meta, strict=False)
+                return VecOpInfo(arr + val, role=other_role, **other.update_meta(meta))
         if self.role in {"mixed"} and other_role is None and self.data.shape[0] == 1 and self.ndim == 3:
             if self.shape[1] == other.shape[0] and self.shape[2] == other.shape[1]:
                 # Case: mixed + np.ndarray (k,m,n) + (m,n)
@@ -1406,6 +1451,8 @@ class GradOpInfo(BaseOpInfo):
                 if grad_val.shape[-1] != v_val.shape[0]:
                     raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
                 data = np.einsum("kd,d->k", grad_val, v_val, optimize=True) # (k,) result
+                if isinstance(data, np.ndarray) and data.shape == (1,):
+                    return VecOpInfo(np.asarray(data[0]), role="scalar", **self.update_meta(self.meta()))
                 role = "scalar" if data.ndim == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
             elif self.role in {"trial", "test"} and other_vec.role in {"trial", "test"}:

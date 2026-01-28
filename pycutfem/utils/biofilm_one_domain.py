@@ -1,0 +1,526 @@
+"""One-domain diffuse-interface biofilm model (Navier–Stokes–Brinkman–Biot + transport).
+
+This module implements the weak residual and a manually coded consistent Jacobian
+for the model described in `examples/biofilms/model/model.tex`.
+
+Design goals
+------------
+* Keep the implementation debuggable by exposing per-block residuals.
+* Use a one-step-θ scheme (θ=1: backward Euler, θ=0.5: Crank–Nicolson).
+* Be compatible with all pycutfem backends ("python", "jit", "cpp").
+
+Important compiler limitation
+-----------------------------
+The current `FormCompiler` only reliably supports `grad(...)` / `div(...)` when
+applied directly to base Trial/Test/Function objects. Avoid `div(a*v)` and
+`div(vS_k)` where `vS_k` is a linear combination. This module expands such
+divergences explicitly (product rule / difference-of-divergences).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from pycutfem.ufl.expressions import (
+    Constant,
+    Identity,
+    div,
+    dot,
+    grad,
+    inner,
+    outer,
+    trace,
+)
+
+
+def _c(val: float) -> Constant:
+    return Constant(float(val))
+
+
+def _sqrt(expr):
+    return expr ** _c(0.5)
+
+
+def _one_minus(expr):
+    # IMPORTANT: keep the "function-like" operand on the left so VecOpInfo handles
+    # the arithmetic (float - VecOpInfo is not supported by the compiler).
+    return (-expr) + _c(1.0)
+
+
+def _epsilon(v):
+    return _c(0.5) * (grad(v) + grad(v).T)
+
+
+def _linear_elastic_term(u, eta, *, mu_s, lambda_s):
+    # For symmetric stress, σ(u):∇η = 2μ ε(u):ε(η) + λ div(u) div(η).
+    return _c(2.0) * mu_s * inner(_epsilon(u), _epsilon(eta)) + lambda_s * div(u) * div(eta)
+
+
+def _chi_b(alpha):
+    return alpha
+
+
+def _chi_f(alpha):
+    return _one_minus(alpha)
+
+
+def _capacity(alpha, phi):
+    # C = (1-α) + α φ
+    return _chi_f(alpha) + _chi_b(alpha) * phi
+
+
+def _rho(alpha, phi, *, rho_f):
+    # ρ = (1-α) ρ_f + α ρ_f φ = ρ_f ((1-α) + α φ)
+    return rho_f * _capacity(alpha, phi)
+
+
+def _mu(alpha, phi, *, mu_f, mu_b_model: str = "phi_mu"):
+    """
+    Effective viscosity μ(α,φ).
+
+    Choices:
+      - "mu":      μ_B = μ_f (constant)               → μ = μ_f (no α/φ dependence)
+      - "phi_mu":  μ_B = φ μ_f (Brinkman scaling)     → μ = μ_f ((1-α) + α φ)
+    """
+    mu_b_model = str(mu_b_model).strip().lower()
+    if mu_b_model in {"mu", "const", "constant"}:
+        mu_b = mu_f
+    elif mu_b_model in {"phi_mu", "phi*mu", "phi"}:
+        mu_b = phi * mu_f
+    else:
+        raise ValueError(f"Unknown mu_b_model {mu_b_model!r}.")
+    return _chi_f(alpha) * mu_f + _chi_b(alpha) * mu_b
+
+
+def _beta(alpha, phi, *, mu_f, kappa_inv):
+    # β = α μ_f φ^2 κ^{-1} (here κ^{-1} can be scalar or tensor; we treat it as scalar for now)
+    return _chi_b(alpha) * mu_f * (phi * phi) * kappa_inv
+
+
+def _monod(S, *, mu_max, K_S):
+    # Keep Function-like operand on the left: (S + K_S) not (K_S + S).
+    return mu_max * (S / (S + K_S))
+
+
+def _G(S, phi, *, k_g, mu_max, K_S):
+    return k_g * _monod(S, mu_max=mu_max, K_S=K_S) * _one_minus(phi)
+
+
+def _Pi_over_rho_s(S, phi, alpha, *, mu_max, K_S, k_d):
+    # Π_b / ρ_s* (model.tex Monod choice) = (μ_max S/(K+S) - k_d) (1-φ) α
+    return (_monod(S, mu_max=mu_max, K_S=K_S) - k_d) * _one_minus(phi) * alpha
+
+
+def _R_S_consumption(S, phi, alpha, *, mu_max, K_S, k_d, Y):
+    # R_S = (1/Y) Π_b/ρ_s* (default) (positive sink in the strong form)
+    return (_c(1.0) / Y) * _Pi_over_rho_s(S, phi, alpha, mu_max=mu_max, K_S=K_S, k_d=k_d)
+
+
+def _detachment_from_shear_prev(
+    *,
+    v_prev,
+    alpha_prev,
+    mu_f,
+    k_det,
+    eta_n: float = 1.0e-12,
+    dim: int = 2,
+):
+    """
+    Build a *lagged* detachment rate D(τ) from the previous-step velocity.
+
+    We deliberately use a simple shear proxy that is robust in the current UFL/assembler
+    stack (no division by |∇α|). D is treated as a known coefficient in the Newton step,
+    so the Jacobian remains consistent.
+    """
+    # τ ≈ ||ε(v_prev)|| (Frobenius)
+    tau2 = inner(_epsilon(v_prev), _epsilon(v_prev))
+    tau = _sqrt(tau2 + _c(float(eta_n)))
+    return k_det * tau
+
+
+@dataclass(frozen=True)
+class BiofilmOneDomainForms:
+    jacobian_form: object
+    residual_form: object
+    r_momentum: object
+    r_mass: object
+    r_skeleton: object
+    r_phi: object
+    r_alpha: object
+    r_substrate: object
+    # Optional per-block Jacobian contributions (useful for debugging/verification)
+    a_momentum: object | None = None
+    a_mass: object | None = None
+    a_skeleton: object | None = None
+    a_phi: object | None = None
+    a_alpha: object | None = None
+    a_substrate: object | None = None
+
+
+def build_biofilm_one_domain_forms(
+    *,
+    # unknowns at t_{n+1}
+    v_k,
+    p_k,
+    u_k,
+    phi_k,
+    alpha_k,
+    S_k,
+    # unknowns at t_n
+    v_n,
+    p_n,
+    u_n,
+    phi_n,
+    alpha_n,
+    S_n,
+    # optional u_{n-1} (for θ terms with vS_n)
+    u_nm1=None,
+    # Newton increments
+    dv,
+    dp,
+    du,
+    dphi,
+    dalpha,
+    dS,
+    # test functions
+    v_test,
+    q_test,
+    u_test,
+    phi_test,
+    alpha_test,
+    S_test,
+    # measure
+    dx,
+    # time integration
+    dt,
+    theta: float = 1.0,
+    # physical parameters
+    rho_f=None,
+    mu_f=None,
+    kappa_inv=None,
+    mu_s=None,
+    lambda_s=None,
+    # transport parameters
+    D_phi: float = 0.0,
+    gamma_phi: float = 0.0,
+    D_alpha: float = 0.0,
+    D_S: float = 0.0,
+    # growth / detachment parameters
+    mu_max: float = 0.0,
+    K_S: float = 1.0,
+    k_g: float = 0.0,
+    k_d: float = 0.0,
+    Y: float = 1.0,
+    k_det: float = 0.0,
+    # modelling toggles
+    mu_b_model: str = "phi_mu",
+    dim: int = 2,
+    # sources (all optional; default to 0)
+    f_v=None,
+    f_u=None,
+    s_v=None,
+    f_phi=None,
+    f_alpha=None,
+    f_S=None,
+    # detachment rate override (if given, used instead of shear-based lagged rate)
+    D_det_prev=None,
+) -> BiofilmOneDomainForms:
+    """
+    Build residual + consistent Jacobian for the one-domain biofilm system.
+
+    Notes
+    -----
+    - `dt` may be a float or a `Constant`.
+    - All source terms are *added* on the RHS of the strong form; i.e. we build
+      residuals of the form "LHS - RHS" so the default is homogeneous (0).
+    """
+    if rho_f is None or mu_f is None or kappa_inv is None or mu_s is None or lambda_s is None:
+        raise ValueError("Missing required physical parameters: rho_f, mu_f, kappa_inv, mu_s, lambda_s.")
+
+    th = _c(float(theta))
+    one_m_th = _c(1.0) - th
+    inv_dt = _c(1.0) / dt
+
+    # Optional sources default to 0 (as *expressions*, not test-weighted terms).
+    zero_scalar = _c(0.0)
+    zero_vector = Constant([0.0] * int(dim), dim=1)
+    f_v = f_v if f_v is not None else zero_vector
+    f_u = f_u if f_u is not None else zero_vector
+    s_v = s_v if s_v is not None else zero_scalar
+    f_phi = f_phi if f_phi is not None else zero_scalar
+    f_alpha = f_alpha if f_alpha is not None else zero_scalar
+    f_S = f_S if f_S is not None else zero_scalar
+
+    # ------------------------------------------------------------------
+    # Kinematics: skeleton velocity via backward Euler
+    # ------------------------------------------------------------------
+    vS_k = (u_k - u_n) / dt
+    div_vS_k = (div(u_k) - div(u_n)) / dt
+    if u_nm1 is None:
+        vS_n = _c(0.0) * vS_k
+        div_vS_n = _c(0.0) * div_vS_k
+    else:
+        vS_n = (u_n - u_nm1) / dt
+        div_vS_n = (div(u_n) - div(u_nm1)) / dt
+
+    dvS = du / dt
+    div_dvS = div(du) / dt
+
+    # ------------------------------------------------------------------
+    # Coefficients (at n/k) and their variations (at k only)
+    # ------------------------------------------------------------------
+    rho_k = _rho(alpha_k, phi_k, rho_f=rho_f)
+    rho_n = _rho(alpha_n, phi_n, rho_f=rho_f)
+
+    mu_k = _mu(alpha_k, phi_k, mu_f=mu_f, mu_b_model=mu_b_model)
+    mu_n = _mu(alpha_n, phi_n, mu_f=mu_f, mu_b_model=mu_b_model)
+
+    beta_k = _beta(alpha_k, phi_k, mu_f=mu_f, kappa_inv=kappa_inv)
+    beta_n = _beta(alpha_n, phi_n, mu_f=mu_f, kappa_inv=kappa_inv)
+
+    # Coefficient variations w.r.t (α,φ) at k:
+    dC = (phi_k - _c(1.0)) * dalpha + alpha_k * dphi  # δ((1-α)+αφ)
+    drho = rho_f * dC
+
+    if str(mu_b_model).strip().lower() in {"mu", "const", "constant"}:
+        dmu = _c(0.0) * dphi
+    else:
+        dmu = mu_f * dC
+
+    dbeta = (mu_f * (phi_k * phi_k) * kappa_inv) * dalpha + (_c(2.0) * mu_f * alpha_k * phi_k * kappa_inv) * dphi
+
+    # Detachment coefficient: lagged by default (depends on previous v/α)
+    if D_det_prev is None:
+        D_det_prev = _detachment_from_shear_prev(v_prev=v_n, alpha_prev=alpha_n, mu_f=mu_f, k_det=_c(float(k_det)), dim=dim)
+
+    # ------------------------------------------------------------------
+    # (i) Momentum: generalized Navier–Stokes–Brinkman
+    # ------------------------------------------------------------------
+    vdot = (v_k - v_n) * inv_dt
+
+    conv_k = dot(dot(grad(v_k), v_k), v_test)
+    conv_n = dot(dot(grad(v_n), v_n), v_test)
+
+    r_mom = inner(rho_k * vdot, v_test) * dx
+    r_mom += th * rho_k * conv_k * dx + one_m_th * rho_n * conv_n * dx
+    r_mom += _c(2.0) * th * mu_k * inner(_epsilon(v_k), _epsilon(v_test)) * dx
+    r_mom += _c(2.0) * one_m_th * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
+    r_mom += -p_k * div(v_test) * dx
+    # NOTE: avoid Dot of mixed-field linear combinations (v - vS) to keep the compiler happy.
+    r_mom += beta_k * dot(v_k, v_test) * dx
+    r_mom += -beta_k * dot(vS_k, v_test) * dx
+    r_mom += -dot(f_v, v_test) * dx
+
+    a_mom = rho_k * inv_dt * dot(dv, v_test) * dx
+    a_mom += drho * dot(vdot, v_test) * dx
+
+    a_mom += th * (drho * conv_k + rho_k * dot(dot(grad(dv), v_k), v_test) + rho_k * dot(dot(grad(v_k), dv), v_test)) * dx
+    a_mom += _c(2.0) * th * (dmu * inner(_epsilon(v_k), _epsilon(v_test)) + mu_k * inner(_epsilon(dv), _epsilon(v_test))) * dx
+
+    a_mom += -dp * div(v_test) * dx
+    a_mom += dbeta * (dot(v_k, v_test) - dot(vS_k, v_test)) * dx
+    a_mom += beta_k * dot(dv, v_test) * dx
+    a_mom += -beta_k * dot(dvS, v_test) * dx
+
+    # ------------------------------------------------------------------
+    # (ii) Mass / volume constraint (expanded divergence)
+    # ------------------------------------------------------------------
+    # F_m = C v + B vS,  C=(1-α)+αφ,  B=α(1-φ)
+    C_k = _capacity(alpha_k, phi_k)
+    C_n = _capacity(alpha_n, phi_n)
+    B_k = alpha_k * _one_minus(phi_k)
+    B_n = alpha_n * _one_minus(phi_n)
+
+    # div(C v) = C div(v) + grad(C)·v, with grad(C) = (φ-1) grad(α) + α grad(φ)
+    gradC_k = grad(alpha_k) * (phi_k - _c(1.0)) + grad(phi_k) * alpha_k
+    gradC_n = grad(alpha_n) * (phi_n - _c(1.0)) + grad(phi_n) * alpha_n
+
+    divCv_k = C_k * div(v_k) + dot(gradC_k, v_k)
+    divCv_n = C_n * div(v_n) + dot(gradC_n, v_n)
+
+    # div(B vS) = B div(vS) + grad(B)·vS, with grad(B) = (1-φ) grad(α) - α grad(φ)
+    gradB_k = grad(alpha_k) * _one_minus(phi_k) - grad(phi_k) * alpha_k
+    gradB_n = grad(alpha_n) * _one_minus(phi_n) - grad(phi_n) * alpha_n
+
+    divBvS_k = B_k * div_vS_k + dot(gradB_k, vS_k)
+    divBvS_n = B_n * div_vS_n + dot(gradB_n, vS_n)
+
+    divF_k = divCv_k + divBvS_k
+    divF_n = divCv_n + divBvS_n
+
+    r_mass = q_test * (th * divF_k + one_m_th * divF_n - alpha_k * s_v) * dx
+
+    # Jacobian of divF_k (k-part only)
+    # δC = (φ-1) δα + α δφ
+    dC_k = (phi_k - _c(1.0)) * dalpha + alpha_k * dphi
+    dB_k = _one_minus(phi_k) * dalpha - alpha_k * dphi
+
+    # NOTE: Keep GradOpInfo on the left in scalar×grad products (trial×grad(function)
+    # is not implemented, but grad(function)×trial is).
+    dgradC_k = grad(dalpha) * (phi_k - _c(1.0)) + grad(alpha_k) * dphi + grad(phi_k) * dalpha + grad(dphi) * alpha_k
+    dgradB_k = grad(dalpha) * _one_minus(phi_k) - grad(alpha_k) * dphi - grad(phi_k) * dalpha - grad(dphi) * alpha_k
+
+    d_divCv_k = dC_k * div(v_k) + C_k * div(dv) + dot(dgradC_k, v_k) + dot(gradC_k, dv)
+    d_divBvS_k = dB_k * div_vS_k + B_k * div_dvS + dot(dgradB_k, vS_k) + dot(gradB_k, dvS)
+
+    a_mass = q_test * th * (d_divCv_k + d_divBvS_k - dalpha * s_v) * dx
+
+    # ------------------------------------------------------------------
+    # (iii) Skeleton momentum (quasi-static linear elasticity)
+    # ------------------------------------------------------------------
+    r_el_k = _linear_elastic_term(u_k, u_test, mu_s=mu_s, lambda_s=lambda_s)
+    r_el_n = _linear_elastic_term(u_n, u_test, mu_s=mu_s, lambda_s=lambda_s)
+
+    r_skel_k = r_el_k
+    r_skel_n = r_el_n
+
+    # pressure coupling: -(1-φ) p div(η)
+    r_skel_k += -(_one_minus(phi_k) * p_k) * div(u_test)
+    r_skel_n += -(_one_minus(phi_n) * p_n) * div(u_test)
+
+    # drag reaction: -β (v - vS)
+    r_skel_k += -beta_k * dot(v_k, u_test) + beta_k * dot(vS_k, u_test)
+    r_skel_n += -beta_n * dot(v_n, u_test) + beta_n * dot(vS_n, u_test)
+
+    r_skeleton = (th * alpha_k * r_skel_k + one_m_th * alpha_n * r_skel_n) * dx
+    r_skeleton += -dot(alpha_k * f_u, u_test) * dx
+
+    # Jacobian contributions (k-part only)
+    a_el = _linear_elastic_term(du, u_test, mu_s=mu_s, lambda_s=lambda_s)
+
+    a_skel = th * (
+        alpha_k * a_el
+        + dalpha * r_el_k
+        - dalpha * (_one_minus(phi_k) * p_k) * div(u_test)
+        + alpha_k * (dphi * p_k) * div(u_test)
+        - alpha_k * (_one_minus(phi_k) * dp) * div(u_test)
+        - (dalpha * beta_k + alpha_k * dbeta) * (dot(v_k, u_test) - dot(vS_k, u_test))
+        - alpha_k * beta_k * dot(dv, u_test)
+        + alpha_k * beta_k * dot(dvS, u_test)
+    ) * dx
+    a_skel += -dot(dalpha * f_u, u_test) * dx
+
+    # ------------------------------------------------------------------
+    # (iv) Porosity evolution (Eulerian, advected by vS)
+    # ------------------------------------------------------------------
+    D_phi_c = _c(float(D_phi))
+    gamma_phi_c = _c(float(gamma_phi))
+
+    Pi_k = _Pi_over_rho_s(S_k, phi_k, alpha_k, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)))
+    Pi_n = _Pi_over_rho_s(S_n, phi_n, alpha_n, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)))
+
+    # F_phi = vS·∇φ - (1-φ) div vS + Π/ρ_s*
+    # NOTE: the dot-visitor supports Grad(Function)·Vec(Function) but not Vec(Function)·Grad(Function).
+    Fphi_k = dot(grad(phi_k), vS_k) - _one_minus(phi_k) * div_vS_k + Pi_k
+    Fphi_n = dot(grad(phi_n), vS_n) - _one_minus(phi_n) * div_vS_n + Pi_n
+
+    r_phi = alpha_k * phi_test * ((phi_k - phi_n) * inv_dt) * dx
+    r_phi += th * alpha_k * phi_test * Fphi_k * dx
+    r_phi += one_m_th * alpha_n * phi_test * Fphi_n * dx
+    r_phi += D_phi_c * inner(grad(phi_k), grad(phi_test)) * dx
+    r_phi += gamma_phi_c * _one_minus(alpha_k) * (phi_k - _c(1.0)) * phi_test * dx
+    r_phi += -phi_test * f_phi * dx
+
+    # Jacobian (k-part only)
+    # δΠ
+    mu_max_c = _c(float(mu_max))
+    K_S_c = _c(float(K_S))
+    mon_k = _monod(S_k, mu_max=mu_max_c, K_S=K_S_c)
+    dmon_dS = mu_max_c * (K_S_c / ((S_k + K_S_c) * (S_k + K_S_c)))
+    # Π = (mon - k_d) (1-φ) α
+    dPi = (dmon_dS * dS) * _one_minus(phi_k) * alpha_k
+    dPi += (mon_k - _c(float(k_d))) * (-(dphi) * alpha_k + _one_minus(phi_k) * dalpha)
+
+    a_phi = alpha_k * phi_test * (dphi * inv_dt) * dx
+    a_phi += dalpha * phi_test * ((phi_k - phi_n) * inv_dt) * dx
+    a_phi += th * dalpha * phi_test * Fphi_k * dx
+    a_phi += th * alpha_k * phi_test * (
+        dot(grad(phi_k), dvS) + dot(grad(dphi), vS_k) + dphi * div_vS_k - _one_minus(phi_k) * div_dvS + dPi
+    ) * dx
+    a_phi += D_phi_c * inner(grad(dphi), grad(phi_test)) * dx
+    a_phi += gamma_phi_c * ((-_c(1.0) * dalpha) * (phi_k - _c(1.0)) + _one_minus(alpha_k) * dphi) * phi_test * dx
+
+    # ------------------------------------------------------------------
+    # (v) Indicator evolution (advection–diffusion–reaction)
+    # ------------------------------------------------------------------
+    D_alpha_c = _c(float(D_alpha))
+    G_k = _G(S_k, phi_k, k_g=_c(float(k_g)), mu_max=_c(float(mu_max)), K_S=_c(float(K_S)))
+    G_n = _G(S_n, phi_n, k_g=_c(float(k_g)), mu_max=_c(float(mu_max)), K_S=_c(float(K_S)))
+
+    f_alpha_k = (alpha_k - alpha_n) * inv_dt
+    f_alpha_k += th * (dot(grad(alpha_k), vS_k) - G_k * alpha_k * _one_minus(alpha_k) + D_det_prev * alpha_k)
+    f_alpha_k += one_m_th * (dot(grad(alpha_n), vS_n) - G_n * alpha_n * _one_minus(alpha_n) + D_det_prev * alpha_n)
+
+    r_alpha = alpha_test * f_alpha_k * dx
+    r_alpha += D_alpha_c * inner(grad(alpha_k), grad(alpha_test)) * dx
+    r_alpha += -alpha_test * f_alpha * dx
+
+    # Jacobian (k-part only)
+    # δG
+    dG = (_c(float(k_g)) * _one_minus(phi_k) * (dmon_dS * dS) + (-_c(float(k_g)) * mon_k) * dphi)
+    # δ[ G α(1-α) ] = (δG) α(1-α) + G (1-2α) δα
+    dalpha_logistic = _one_minus(_c(2.0) * alpha_k) * dalpha
+
+    a_alpha = alpha_test * (dalpha * inv_dt) * dx
+    a_alpha += alpha_test * th * (dot(grad(alpha_k), dvS) + dot(grad(dalpha), vS_k)) * dx
+    a_alpha += alpha_test * th * (-(dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic) + D_det_prev * dalpha) * dx
+    a_alpha += D_alpha_c * inner(grad(dalpha), grad(alpha_test)) * dx
+
+    # ------------------------------------------------------------------
+    # (vi) Substrate transport
+    # ------------------------------------------------------------------
+    D_S_c = _c(float(D_S))
+    CSk = _capacity(alpha_k, phi_k) * S_k
+    CSn = _capacity(alpha_n, phi_n) * S_n
+
+    # Strong: ∂t(CS) + div(CS v) - div(D grad S) + R_S = f_S.
+    #
+    # IMPORTANT: avoid `dot(CS*v, grad(test))` because the current dot/left_dot
+    # implementation cannot handle scalar-test gradients with vector trials.
+    # We instead expand div(CS v) = CS div(v) + ∇(CS)·v and use
+    # ∇(CS) = S ∇C + C ∇S.
+    RS_k = _R_S_consumption(S_k, phi_k, alpha_k, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)), Y=_c(float(Y)))
+    RS_n = _R_S_consumption(S_n, phi_n, alpha_n, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)), Y=_c(float(Y)))
+
+    div_CSv_k = CSk * div(v_k) + S_k * dot(gradC_k, v_k) + C_k * dot(grad(S_k), v_k)
+    div_CSv_n = CSn * div(v_n) + S_n * dot(gradC_n, v_n) + C_n * dot(grad(S_n), v_n)
+
+    r_sub = S_test * ((CSk - CSn) * inv_dt) * dx
+    r_sub += S_test * (th * div_CSv_k + one_m_th * div_CSv_n) * dx
+    r_sub += D_S_c * th * inner(grad(S_k), grad(S_test)) * dx + D_S_c * one_m_th * inner(grad(S_n), grad(S_test)) * dx
+    r_sub += S_test * (th * RS_k + one_m_th * RS_n) * dx
+    r_sub += -S_test * f_S * dx
+
+    # Jacobian (k-part only)
+    dCSk = dC * S_k + _capacity(alpha_k, phi_k) * dS
+    dRS = (_c(1.0) / _c(float(Y))) * dPi  # RS = (1/Y) Π/ρ_s*
+
+    d_div_CSv_k = dCSk * div(v_k) + CSk * div(dv)
+    d_div_CSv_k += dS * dot(gradC_k, v_k) + S_k * dot(dgradC_k, v_k) + S_k * dot(gradC_k, dv)
+    d_div_CSv_k += dC_k * dot(grad(S_k), v_k) + C_k * dot(grad(dS), v_k) + C_k * dot(grad(S_k), dv)
+
+    a_sub = S_test * (dCSk * inv_dt) * dx
+    a_sub += S_test * th * d_div_CSv_k * dx
+    a_sub += D_S_c * th * inner(grad(dS), grad(S_test)) * dx
+    a_sub += S_test * th * dRS * dx
+
+    # ------------------------------------------------------------------
+    residual_form = r_mom + r_mass + r_skeleton + r_phi + r_alpha + r_sub
+    jacobian_form = a_mom + a_mass + a_skel + a_phi + a_alpha + a_sub
+
+    return BiofilmOneDomainForms(
+        jacobian_form=jacobian_form,
+        residual_form=residual_form,
+        r_momentum=r_mom,
+        r_mass=r_mass,
+        r_skeleton=r_skeleton,
+        r_phi=r_phi,
+        r_alpha=r_alpha,
+        r_substrate=r_sub,
+        a_momentum=a_mom,
+        a_mass=a_mass,
+        a_skeleton=a_skel,
+        a_phi=a_phi,
+        a_alpha=a_alpha,
+        a_substrate=a_sub,
+    )
