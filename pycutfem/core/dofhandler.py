@@ -2810,18 +2810,86 @@ class DofHandler:
     
 
 
-    def l2_error(self,
-                 u_vec: Union[np.ndarray, 'Function', 'VectorFunction'], # Accept multiple types
-                 exact: Mapping[str, Callable[[float, float], float]],
-                 quad_order: int | None = None,
-                 relative: bool = True) -> float:
+    def l2_error(
+        self,
+        u_vec: Union[np.ndarray, "Function", "VectorFunction"],  # Accept multiple types
+        exact: Mapping[str, Callable[[float, float], float]],
+        quad_order: int | None = None,
+        relative: bool = True,
+        *,
+        level_set=None,
+        side: str | None = None,
+        fields: list[str] | None = None,
+        backend: str = "python",
+        deformation=None,
+    ) -> float:
         """
-        Element-wise L2-norm  ‖u_h − u‖, handling NumPy arrays or Function objects.
+        L2 error norm.
+
+        By default (no `level_set`), this computes the element-wise L2 error
+        over the *entire background mesh* using standard volume quadrature.
+
+        For CutFEM / multi-level-set problems, you almost always want to restrict
+        the error to the physical subdomain Ω^±. Pass `level_set` + `side` to
+        delegate to `l2_error_on_side` / `l2_error_on_side_compiled`, which uses
+        cut-cell quadrature and avoids integrating in inactive regions.
         """
         
         # Import here to avoid circular dependencies
         from pycutfem.ufl.expressions import Function, VectorFunction
         
+        if level_set is not None:
+            if side not in {"+", "-"}:
+                raise ValueError("l2_error with 'level_set' requires side='+' or side='-'.")
+
+            # Determine which fields contribute to the error integral.
+            if fields is None:
+                fields = [str(f) for f in exact.keys()]
+
+            # Normalize input to the expected `l2_error_on_side*` signature.
+            if isinstance(u_vec, np.ndarray):
+                # Build per-field standalone Functions with stable names (cache-friendly).
+                func_map: dict[str, Function] = {}
+                u_arr = np.asarray(u_vec, dtype=float)
+                for fld in fields:
+                    if fld not in exact:
+                        continue
+                    f = Function(name=f"l2_{fld}", field_name=fld, dof_handler=self)
+                    sl = np.asarray(self.get_field_slice(fld), dtype=int)
+                    f.set_nodal_values(sl, u_arr[sl])
+                    func_map[fld] = f
+                functions = func_map
+            elif isinstance(u_vec, (Function, VectorFunction)):
+                functions = u_vec
+            else:
+                raise TypeError(f"Unsupported solution type for L2 error calculation: {type(u_vec)}")
+
+            # Prefer compiled kernels when requested.
+            backend_key = str(backend).strip().lower()
+            if backend_key in {"jit", "cpp", "c++"}:
+                return self.l2_error_on_side_compiled(
+                    functions=functions,
+                    exact=exact,
+                    level_set=level_set,
+                    side=str(side),
+                    fields=fields,
+                    quad_order=quad_order,
+                    relative=relative,
+                    deformation=deformation,
+                    backend="cpp" if backend_key == "c++" else backend_key,
+                )
+
+            return self.l2_error_on_side(
+                functions=functions,
+                exact=exact,
+                level_set=level_set,
+                side=str(side),
+                fields=fields,
+                quad_order=quad_order,
+                relative=relative,
+                deformation=deformation,
+            )
+
         
         mesh  = self.mixed_element.mesh
         me    = self.mixed_element

@@ -421,6 +421,404 @@ def _eoc(err_prev: float, err: float, h_prev: float, h: float) -> float:
     return float(np.log(err / err_prev) / np.log(h / h_prev))
 
 
+def _interface_trace_errors(
+    *,
+    interface,
+    dh_f: DofHandler,
+    dh_p: DofHandler,
+    Uf: np.ndarray,
+    Up: np.ndarray,
+    mms,
+    mu_f: float,
+    quad_order: int,
+) -> dict[str, float]:
+    """Interface (Γ^FP) L2 errors for traces and fluid traction.
+
+    We integrate over the CutFEM segment interface using the same segment geometry
+    that drives the nonmatching coupling.
+    """
+    from pycutfem.fem import transform
+    from pycutfem.integration.quadrature import gauss_legendre
+
+    if interface.n_segments() <= 0:
+        return {
+            "err_vF_G": 0.0,
+            "err_vP_G": 0.0,
+            "err_pF_G": 0.0,
+            "err_pP_G": 0.0,
+            "err_tF_G": 0.0,
+            "err_gsigma_n": 0.0,
+        }
+
+    mesh_f = dh_f.mixed_element.mesh
+    mesh_p = dh_p.mixed_element.mesh
+    me_f = dh_f.mixed_element
+    me_p = dh_p.mixed_element
+
+    vfx, vfy, pf = "v_pos_x", "v_pos_y", "p_pos_"
+    vpx, vpy, upx, upy, pp = "v_neg_x", "v_neg_y", "u_neg_x", "u_neg_y", "p_neg_"
+
+    xi_1d, w_1d = gauss_legendre(int(quad_order))
+    xi_1d = np.asarray(xi_1d, dtype=float)
+    w_1d = np.asarray(w_1d, dtype=float)
+
+    sl_vfx = me_f.component_dof_slices[vfx]
+    sl_vfy = me_f.component_dof_slices[vfy]
+    sl_pf = me_f.component_dof_slices[pf]
+
+    sl_vpx = me_p.component_dof_slices[vpx]
+    sl_vpy = me_p.component_dof_slices[vpy]
+    sl_upx = me_p.component_dof_slices[upx]
+    sl_upy = me_p.component_dof_slices[upy]
+    sl_pp = me_p.component_dof_slices[pp]
+
+    mu_f = float(mu_f)
+    I2 = np.eye(2, dtype=float)
+
+    acc_vF2 = 0.0
+    acc_vP2 = 0.0
+    acc_pF2 = 0.0
+    acc_pP2 = 0.0
+    acc_tF2 = 0.0
+    acc_gsig_n2 = 0.0
+
+    for s in range(interface.n_segments()):
+        ef = int(interface.pos_elem_ids[s])
+        ep = int(interface.neg_elem_ids[s])
+
+        n_vec = np.asarray(interface.n[s], dtype=float).reshape(2,)
+        nF = -n_vec  # fluid outward
+
+        P0 = np.asarray(interface.P0[s], float)
+        P1 = np.asarray(interface.P1[s], float)
+        mid = 0.5 * (P0 + P1)
+        half = 0.5 * (P1 - P0)
+        segJ = float(np.linalg.norm(half))
+        if segJ <= 0.0:
+            continue
+
+        gd_vfx = np.asarray(dh_f.element_maps[vfx][ef], dtype=int)
+        gd_vfy = np.asarray(dh_f.element_maps[vfy][ef], dtype=int)
+        gd_pf = np.asarray(dh_f.element_maps[pf][ef], dtype=int)
+
+        gd_vpx = np.asarray(dh_p.element_maps[vpx][ep], dtype=int)
+        gd_vpy = np.asarray(dh_p.element_maps[vpy][ep], dtype=int)
+        gd_upx = np.asarray(dh_p.element_maps[upx][ep], dtype=int)
+        gd_upy = np.asarray(dh_p.element_maps[upy][ep], dtype=int)
+        gd_pp = np.asarray(dh_p.element_maps[pp][ep], dtype=int)
+
+        vf_x = np.asarray(Uf, float)[gd_vfx]
+        vf_y = np.asarray(Uf, float)[gd_vfy]
+        pf_c = np.asarray(Uf, float)[gd_pf]
+
+        vp_x = np.asarray(Up, float)[gd_vpx]
+        vp_y = np.asarray(Up, float)[gd_vpy]
+        up_x = np.asarray(Up, float)[gd_upx]
+        up_y = np.asarray(Up, float)[gd_upy]
+        pp_c = np.asarray(Up, float)[gd_pp]
+        _ = (up_x, up_y)  # reserved (may be used for additional diagnostics)
+
+        for q, wq_ref in enumerate(w_1d):
+            xq = mid + float(xi_1d[q]) * half
+            wq = float(wq_ref) * segJ
+            if wq == 0.0:
+                continue
+
+            xi_f, eta_f = transform.inverse_mapping(mesh_f, ef, xq)
+            xi_p, eta_p = transform.inverse_mapping(mesh_p, ep, xq)
+
+            Jf = transform.jacobian(mesh_f, ef, (float(xi_f), float(eta_f)))
+            Jp = transform.jacobian(mesh_p, ep, (float(xi_p), float(eta_p)))
+            Jif = np.linalg.inv(Jf)
+            _ = np.linalg.inv(Jp)  # Jip (not needed yet)
+
+            phi_vfx = np.asarray(me_f.basis(vfx, float(xi_f), float(eta_f)), float).ravel()[sl_vfx]
+            phi_vfy = np.asarray(me_f.basis(vfy, float(xi_f), float(eta_f)), float).ravel()[sl_vfy]
+            phi_pf = np.asarray(me_f.basis(pf, float(xi_f), float(eta_f)), float).ravel()[sl_pf]
+            g_vfx = (np.asarray(me_f.grad_basis(vfx, float(xi_f), float(eta_f)), float) @ Jif)[sl_vfx]
+            g_vfy = (np.asarray(me_f.grad_basis(vfy, float(xi_f), float(eta_f)), float) @ Jif)[sl_vfy]
+
+            phi_vpx = np.asarray(me_p.basis(vpx, float(xi_p), float(eta_p)), float).ravel()[sl_vpx]
+            phi_vpy = np.asarray(me_p.basis(vpy, float(xi_p), float(eta_p)), float).ravel()[sl_vpy]
+            phi_pp = np.asarray(me_p.basis(pp, float(xi_p), float(eta_p)), float).ravel()[sl_pp]
+
+            vF = np.array([float(vf_x @ phi_vfx), float(vf_y @ phi_vfy)], dtype=float)
+            pF = float(pf_c @ phi_pf)
+            vP = np.array([float(vp_x @ phi_vpx), float(vp_y @ phi_vpy)], dtype=float)
+            pP = float(pp_c @ phi_pp)
+
+            dvx = np.array([float(vf_x @ g_vfx[:, 0]), float(vf_x @ g_vfx[:, 1])], dtype=float)
+            dvy = np.array([float(vf_y @ g_vfy[:, 0]), float(vf_y @ g_vfy[:, 1])], dtype=float)
+            grad_vF = np.array([[dvx[0], dvx[1]], [dvy[0], dvy[1]]], dtype=float)
+            eps = 0.5 * (grad_vF + grad_vF.T)
+            sigmaF_h = -pF * I2 + (2.0 * mu_f) * eps
+            tractionF_h = sigmaF_h @ nF
+
+            x, y = float(xq[0]), float(xq[1])
+            vF_A = np.asarray(mms.vF_k(x, y), float).reshape(2,)
+            vP_A = np.asarray(mms.vP_k(x, y), float).reshape(2,)
+            pF_A = float(mms.pF_k(x, y))
+            pP_A = float(mms.pP_k(x, y))
+            sigmaF_A = np.asarray(mms.sigmaF_k(x, y), float)
+            tractionF_A = np.asarray(sigmaF_A @ nF, float).reshape(2,)
+
+            dvF = vF - vF_A
+            dvP = vP - vP_A
+            dpF = pF - pF_A
+            dpP = pP - pP_A
+            dtF = tractionF_h - tractionF_A
+
+            acc_vF2 += wq * float(dvF @ dvF)
+            acc_vP2 += wq * float(dvP @ dvP)
+            acc_pF2 += wq * float(dpF * dpF)
+            acc_pP2 += wq * float(dpP * dpP)
+            acc_tF2 += wq * float(dtF @ dtF)
+
+            # scalar quantity used in the paper via g_sigma_n:
+            # visc_n = nF · (σF nF) + pP
+            gsig_n_A = float((nF @ tractionF_A) + pP_A)
+            visc_n_h = float((nF @ tractionF_h) + pP)
+            dgs = visc_n_h - gsig_n_A
+            acc_gsig_n2 += wq * float(dgs * dgs)
+
+    return {
+        "err_vF_G": float(math.sqrt(max(float(acc_vF2), 0.0))),
+        "err_vP_G": float(math.sqrt(max(float(acc_vP2), 0.0))),
+        "err_pF_G": float(math.sqrt(max(float(acc_pF2), 0.0))),
+        "err_pP_G": float(math.sqrt(max(float(acc_pP2), 0.0))),
+        "err_tF_G": float(math.sqrt(max(float(acc_tF2), 0.0))),
+        "err_gsigma_n": float(math.sqrt(max(float(acc_gsig_n2), 0.0))),
+    }
+
+
+def _fluid_domain_l2_errors(
+    *,
+    prob: TwoMeshProblem,
+    Uf: np.ndarray,
+    mms,
+    quad_order: int,
+    backend: str,
+) -> dict[str, float]:
+    """L2 errors on Ω^F using the CutFEM `dx_f` measure (correct domain)."""
+    from pycutfem.ufl.forms import Equation, assemble_form
+
+    dh = prob.dh_f
+    dx_f = prob.dx_f
+
+    vF_h = VectorFunction(name="vF_h", field_names=["v_pos_x", "v_pos_y"], dof_handler=dh)
+    pF_h = Function(name="pF_h", field_name="p_pos_", dof_handler=dh)
+    _set_vec_function_from_U(vF_h, dh, Uf, ["v_pos_x", "v_pos_y"])
+    _set_scalar_function_from_U(pF_h, dh, Uf, "p_pos_")
+
+    vF_A = Analytic(lambda x, y: mms.vF_k(x, y), degree=int(quad_order))
+    pF_A = Analytic(lambda x, y: mms.pF_k(x, y), degree=int(quad_order))
+
+    e_vF2 = dot(vF_h - vF_A, vF_h - vF_A)
+    e_pF2 = (pF_h - pF_A) * (pF_h - pF_A)
+
+    L = e_vF2 * dx_f + e_pF2 * dx_f
+    scalars = assemble_form(
+        Equation(None, L),
+        dof_handler=dh,
+        bcs=[],
+        quad_order=int(quad_order),
+        assembler_hooks={
+            e_vF2: {"name": "e_vF2"},
+            e_pF2: {"name": "e_pF2"},
+        },
+        backend=str(backend),
+    )
+    ev2 = float(np.asarray(scalars["e_vF2"]).reshape(()))
+    ep2 = float(np.asarray(scalars["e_pF2"]).reshape(()))
+    return {
+        "err_vF": float(math.sqrt(max(ev2, 0.0))),
+        "err_pF": float(math.sqrt(max(ep2, 0.0))),
+    }
+
+
+def _inlet_trace_errors(
+    *,
+    prob: TwoMeshProblem,
+    Uf: np.ndarray,
+    mms,
+    mu_f: float,
+    quad_order: int,
+) -> dict[str, float]:
+    """Inlet (Γ^{F,N}) L2 errors for vF/pF and traction σ_F nF."""
+    from pycutfem.fem import transform
+    from pycutfem.integration.quadrature import gauss_legendre
+
+    inlet_P0 = np.asarray(prob.inlet.get("inlet_P0", np.zeros((0, 2))), float)
+    inlet_P1 = np.asarray(prob.inlet.get("inlet_P1", np.zeros((0, 2))), float)
+    inlet_pos_ids = np.asarray(prob.inlet.get("inlet_pos_elem_ids", np.zeros((0,), dtype=int)), dtype=int)
+    if inlet_P0.shape[0] == 0:
+        return {"err_vF_in": 0.0, "err_pF_in": 0.0, "err_tF_in": 0.0}
+
+    dh = prob.dh_f
+    mesh_f = dh.mixed_element.mesh
+    me_f = dh.mixed_element
+    vfx, vfy, pf = "v_pos_x", "v_pos_y", "p_pos_"
+    sl_vfx = me_f.component_dof_slices[vfx]
+    sl_vfy = me_f.component_dof_slices[vfy]
+    sl_pf = me_f.component_dof_slices[pf]
+
+    xi_1d, w_1d = gauss_legendre(int(quad_order))
+    xi_1d = np.asarray(xi_1d, dtype=float)
+    w_1d = np.asarray(w_1d, dtype=float)
+
+    mu_f = float(mu_f)
+    I2 = np.eye(2, dtype=float)
+    nF = np.array([-1.0, 0.0], dtype=float)
+
+    acc_v2 = 0.0
+    acc_p2 = 0.0
+    acc_t2 = 0.0
+
+    for s in range(int(inlet_P0.shape[0])):
+        ef = int(inlet_pos_ids[s])
+        P0 = np.asarray(inlet_P0[s], float)
+        P1 = np.asarray(inlet_P1[s], float)
+        mid = 0.5 * (P0 + P1)
+        half = 0.5 * (P1 - P0)
+        segJ = float(np.linalg.norm(half))
+        if segJ <= 0.0:
+            continue
+
+        gd_vfx = np.asarray(dh.element_maps[vfx][ef], dtype=int)
+        gd_vfy = np.asarray(dh.element_maps[vfy][ef], dtype=int)
+        gd_pf = np.asarray(dh.element_maps[pf][ef], dtype=int)
+
+        vf_x = np.asarray(Uf, float)[gd_vfx]
+        vf_y = np.asarray(Uf, float)[gd_vfy]
+        pf_c = np.asarray(Uf, float)[gd_pf]
+
+        for q, wq_ref in enumerate(w_1d):
+            xq = mid + float(xi_1d[q]) * half
+            wq = float(wq_ref) * segJ
+            if wq == 0.0:
+                continue
+
+            xi_f, eta_f = transform.inverse_mapping(mesh_f, ef, xq)
+            Jf = transform.jacobian(mesh_f, ef, (float(xi_f), float(eta_f)))
+            Jif = np.linalg.inv(Jf)
+
+            phi_vfx = np.asarray(me_f.basis(vfx, float(xi_f), float(eta_f)), float).ravel()[sl_vfx]
+            phi_vfy = np.asarray(me_f.basis(vfy, float(xi_f), float(eta_f)), float).ravel()[sl_vfy]
+            phi_pf = np.asarray(me_f.basis(pf, float(xi_f), float(eta_f)), float).ravel()[sl_pf]
+            g_vfx = (np.asarray(me_f.grad_basis(vfx, float(xi_f), float(eta_f)), float) @ Jif)[sl_vfx]
+            g_vfy = (np.asarray(me_f.grad_basis(vfy, float(xi_f), float(eta_f)), float) @ Jif)[sl_vfy]
+
+            vF = np.array([float(vf_x @ phi_vfx), float(vf_y @ phi_vfy)], dtype=float)
+            pF = float(pf_c @ phi_pf)
+
+            dvx = np.array([float(vf_x @ g_vfx[:, 0]), float(vf_x @ g_vfx[:, 1])], dtype=float)
+            dvy = np.array([float(vf_y @ g_vfy[:, 0]), float(vf_y @ g_vfy[:, 1])], dtype=float)
+            grad_vF = np.array([[dvx[0], dvx[1]], [dvy[0], dvy[1]]], dtype=float)
+            eps = 0.5 * (grad_vF + grad_vF.T)
+            sigmaF_h = -pF * I2 + (2.0 * mu_f) * eps
+            tractionF_h = sigmaF_h @ nF
+
+            x, y = float(xq[0]), float(xq[1])
+            vF_A = np.asarray(mms.vF_k(x, y), float).reshape(2,)
+            pF_A = float(mms.pF_k(x, y))
+            sigmaF_A = np.asarray(mms.sigmaF_k(x, y), float)
+            tractionF_A = np.asarray(sigmaF_A @ nF, float).reshape(2,)
+
+            dv = vF - vF_A
+            dp = pF - pF_A
+            dt = tractionF_h - tractionF_A
+            acc_v2 += wq * float(dv @ dv)
+            acc_p2 += wq * float(dp * dp)
+            acc_t2 += wq * float(dt @ dt)
+
+    return {
+        "err_vF_in": float(math.sqrt(max(float(acc_v2), 0.0))),
+        "err_pF_in": float(math.sqrt(max(float(acc_p2), 0.0))),
+        "err_tF_in": float(math.sqrt(max(float(acc_t2), 0.0))),
+    }
+
+
+def _save_convergence_plots(*, outdir: Path, rows_by_iface: dict[str, list[dict]], backend: str, p: int, iface_arg: str) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        print(f"[warn] matplotlib unavailable; skipping convergence plots ({exc})")
+        return
+
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    colors = {"bj": "C0", "bjs": "C1"}
+    iface_keys = [k for k in ("bj", "bjs") if k in rows_by_iface]
+
+    metrics: list[tuple[str, str, float]] = [
+        ("err_vF", "e(vF)", 2.0),
+        ("err_pF", "e(pF)", 2.0),
+        ("err_vP", "e(vP)", 2.0),
+        ("err_uP", "e(uP)", 2.0),
+        ("err_pP", "e(pP)", 2.0),
+        ("err_vF_in", "e(vF)_inlet", 1.5),
+        ("err_pF_in", "e(pF)_inlet", 1.5),
+        ("err_tF_in", "e(tF)_inlet", 0.5),
+        ("err_vF_G", "e(vF)_Γ", 1.5),
+        ("err_vP_G", "e(vP)_Γ", 1.5),
+        ("err_pF_G", "e(pF)_Γ", 1.5),
+        ("err_pP_G", "e(pP)_Γ", 1.5),
+        ("err_tF_G", "e(tF)_Γ", 0.5),
+        ("err_gsigma_n", "e(g_sigma_n)", 0.5),
+    ]
+
+    for key, title, slope_ref in metrics:
+        fig, ax = plt.subplots(figsize=(6.5, 4.8))
+        any_series = False
+
+        for iface in iface_keys:
+            rows = rows_by_iface.get(iface, [])
+            hs = np.asarray([float(r["h"]) for r in rows], dtype=float)
+            ys = np.asarray([float(r.get(key, float("nan"))) for r in rows], dtype=float)
+            ok = np.isfinite(hs) & np.isfinite(ys) & (hs > 0.0) & (ys > 0.0)
+            if not np.any(ok):
+                continue
+            any_series = True
+            ax.loglog(hs[ok], ys[ok], "o-", label=iface.upper(), color=colors.get(iface, None))
+
+        if not any_series:
+            plt.close(fig)
+            continue
+
+        # reference line anchored at the finest h among all plotted series
+        h_all = []
+        y_all = []
+        for iface in iface_keys:
+            rows = rows_by_iface.get(iface, [])
+            for r in rows:
+                h = float(r["h"])
+                y = float(r.get(key, float("nan")))
+                if h > 0.0 and y > 0.0 and np.isfinite(y):
+                    h_all.append(h)
+                    y_all.append(y)
+        if h_all:
+            h_all = np.asarray(h_all, float)
+            y_all = np.asarray(y_all, float)
+            i = int(np.argmin(h_all))
+            h0 = float(h_all[i])
+            y0 = float(y_all[i])
+            href = np.array([h0, float(np.max(h_all))], dtype=float)
+            yref = y0 * (href / h0) ** float(slope_ref)
+            ax.loglog(href, yref, "--", color="0.35", alpha=0.7, label=f"h^{slope_ref:g} ref")
+
+        ax.set_xlabel("h")
+        ax.set_ylabel(title)
+        ax.grid(True, which="both", ls=":", alpha=0.35)
+        ax.legend(loc="best", fontsize=9)
+
+        outpath = outdir / f"two_mesh_example41_{key}_backend-{backend}_p{int(p)}_iface-{iface_arg}.png"
+        fig.savefig(outpath, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+
 def _save_mesh_plots(*, prob: TwoMeshProblem, outdir: Path, nx_f: int, nx_p: int, p: int, tag: str) -> None:
     import matplotlib.pyplot as plt
 
@@ -854,22 +1252,18 @@ def _run_one(
         dU = spla.spsolve(Kc, rhs)
         U = U + np.asarray(dU, float)
 
-    # Error summary (domain-wise, absolute L2)
-    err_vF = prob.dh_f.l2_error(
-        U[: int(prob.dh_f.total_dofs)],
-        exact={
-            "v_pos_x": mms.vF_x,
-            "v_pos_y": mms.vF_y,
-        },
+    # Error summary -----------------------------------------------------------
+    # IMPORTANT: For CutFEM fields, report errors on Ω^F using the CutFEM dx_f
+    # measure (not a full-element quadrature over the background mesh).
+    errs_f = _fluid_domain_l2_errors(
+        prob=prob,
+        Uf=U[: int(prob.dh_f.total_dofs)],
+        mms=mms,
         quad_order=int(qdeg),
-        relative=False,
+        backend=str(backend),
     )
-    err_pF = prob.dh_f.l2_error(
-        U[: int(prob.dh_f.total_dofs)],
-        exact={"p_pos_": mms.pF_k},
-        quad_order=int(qdeg),
-        relative=False,
-    )
+    err_vF = float(errs_f["err_vF"])
+    err_pF = float(errs_f["err_pF"])
     err_vP = prob.dh_p.l2_error(
         U[int(prob.dh_f.total_dofs) :],
         exact={
@@ -895,9 +1289,27 @@ def _run_one(
         relative=False,
     )
 
+    inlet_errs = _inlet_trace_errors(
+        prob=prob,
+        Uf=U[: int(prob.dh_f.total_dofs)],
+        mms=mms,
+        mu_f=mu_f,
+        quad_order=int(qdeg),
+    )
+    ifc = _interface_trace_errors(
+        interface=prob.iface_fp,
+        dh_f=prob.dh_f,
+        dh_p=prob.dh_p,
+        Uf=U[: int(prob.dh_f.total_dofs)],
+        Up=U[int(prob.dh_f.total_dofs) :],
+        mms=mms,
+        mu_f=mu_f,
+        quad_order=int(qdeg),
+    )
+
     h = 1.0 / float(nx_f)
     print(
-        f"[nx={nx_f:4d} iface={interface.upper():3s}] h~{h:.3e}  |e(vF)|={err_vF:.3e}  |e(pF)|={err_pF:.3e}  |e(vP)|={err_vP:.3e}  |e(uP)|={err_uP:.3e}  |e(pP)|={err_pP:.3e}"
+        f"[nx={nx_f:4d} iface={interface.upper():3s}] h~{h:.3e}  |e(vF)|={err_vF:.3e}  |e(pF)|={err_pF:.3e}  |e(vP)|={err_vP:.3e}  |e(uP)|={err_uP:.3e}  |e(pP)|={err_pP:.3e}  |e(vF)_in|={inlet_errs['err_vF_in']:.3e}  |e(pF)_in|={inlet_errs['err_pF_in']:.3e}  |e(tF)_in|={inlet_errs['err_tF_in']:.3e}  |e(vF)_Γ|={ifc['err_vF_G']:.3e}  |e(pF)_Γ|={ifc['err_pF_G']:.3e}  |e(tF)_Γ|={ifc['err_tF_G']:.3e}"
     )
 
     if save_mesh:
@@ -910,6 +1322,8 @@ def _run_one(
         "err_vP": float(err_vP),
         "err_uP": float(err_uP),
         "err_pP": float(err_pP),
+        **inlet_errs,
+        **ifc,
     }
 
 
@@ -925,7 +1339,7 @@ def main() -> None:
     parser.add_argument("--tol", type=float, default=1e-10)
     parser.add_argument("--newton-tol", type=float, default=0.0, help="Overrides --tol when > 0.")
     parser.add_argument("--interface", type=str, default="bj", choices=["bj", "bjs", "both"])
-    parser.add_argument("--convergence", action="store_true", help="Run an h-refinement study (prints a table).")
+    parser.add_argument("--convergence", action="store_true", help="Run an h-refinement study (prints a table + saves plots).")
     parser.add_argument("--levels", type=int, default=5, help="Number of refinement levels (convergence mode).")
     parser.add_argument("--nx-list", type=str, default="", help="In convergence mode: comma-separated nx list (overrides --nx/--levels).")
     parser.add_argument(
@@ -946,6 +1360,7 @@ def main() -> None:
     outdir = Path(str(args.outdir))
 
     if args.convergence:
+        outdir.mkdir(parents=True, exist_ok=True)
         if str(args.nx_list).strip():
             nx_list = _parse_nx_list(str(args.nx_list))
         elif bool(args.paper_h_range):
@@ -956,8 +1371,9 @@ def main() -> None:
             nx_list = [int(nx0 * (2**k)) for k in range(max(1, levels))]
 
         iface_list = [str(args.interface)] if str(args.interface) in {"bj", "bjs"} else ["bj", "bjs"]
+        rows_by_iface: dict[str, list[dict]] = {}
         for iface in iface_list:
-            rows = []
+            rows: list[dict] = []
             for nx_i in nx_list:
                 rows.append(
                     _run_one(
@@ -976,6 +1392,7 @@ def main() -> None:
                         use_stabilization=bool(use_stabilization),
                     )
                 )
+            rows_by_iface[str(iface)] = rows
 
             print(f"\nFPI Example 4.1 (two-mesh, nonmatching) | backend={args.backend} | p={args.p} | interface={iface.upper()}")
             print(f"{'h':>10} |e(vF)|    eoc |e(pF)|    eoc |e(vP)|    eoc |e(uP)|    eoc |e(pP)|    eoc")
@@ -990,6 +1407,14 @@ def main() -> None:
                         f"{r['h']:10.3e} {r['err_vF']:11.3e} { _eoc(prev['err_vF'], r['err_vF'], prev['h'], r['h']):5.2f}  {r['err_pF']:11.3e} { _eoc(prev['err_pF'], r['err_pF'], prev['h'], r['h']):5.2f}  {r['err_vP']:11.3e} { _eoc(prev['err_vP'], r['err_vP'], prev['h'], r['h']):5.2f}  {r['err_uP']:11.3e} { _eoc(prev['err_uP'], r['err_uP'], prev['h'], r['h']):5.2f}  {r['err_pP']:11.3e} { _eoc(prev['err_pP'], r['err_pP'], prev['h'], r['h']):5.2f}"
                     )
                 prev = r
+
+        _save_convergence_plots(
+            outdir=outdir,
+            rows_by_iface=rows_by_iface,
+            backend=str(args.backend),
+            p=int(args.p),
+            iface_arg=str(args.interface),
+        )
         return
 
     iface = str(args.interface) if str(args.interface) in {"bj", "bjs"} else "bj"
