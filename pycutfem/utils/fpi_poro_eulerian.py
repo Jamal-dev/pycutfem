@@ -19,94 +19,16 @@ domain.
 
 from __future__ import annotations
 
-from pycutfem.ufl.expressions import (
-    Constant,
-    Identity,
-    det,
-    div,
-    dot,
-    grad,
-    inner,
-    inv,
-    trace,
+from pycutfem.ufl.expressions import Constant, div, dot, grad, inner
+
+from pycutfem.utils.nonlinear_solid_eulerian_refmap import (
+    deulerian_F as dporo_F,
+    deulerian_k_inv as dporo_k_inv,
+    dsigma_neo_hookean as dporo_sigma_neo_hookean,
+    eulerian_F as poro_F,
+    eulerian_k_inv as poro_k_inv,
+    sigma_neo_hookean as poro_sigma_neo_hookean,
 )
-
-
-# -----------------------------------------------------------------------------
-# Kinematics and constitutive helpers (Eulerian reference-map)
-# -----------------------------------------------------------------------------
-
-
-def poro_F(u):
-    """Eulerian deformation gradient F = (I - ∇u)^{-1} (2D)."""
-    I2 = Identity(2)
-    return inv(I2 - grad(u))
-
-
-def dporo_F(u, du):
-    """Gateaux derivative δF for F=(I-∇u)^{-1}: δF = F (∇du) F."""
-    F = poro_F(u)
-    return dot(F, dot(grad(du), F))
-
-
-def poro_k_inv(u, K_inv):
-    """Spatial inverse permeability k^{-1} = J F^{-T} K^{-1} F^{-1}."""
-    F = poro_F(u)
-    J = det(F)
-    # For the Eulerian reference-map kinematics, we have F^{-1} = I - ∇u.
-    F_inv = Identity(2) - grad(u)
-    return J * dot(F_inv.T, dot(K_inv, F_inv))
-
-
-def dporo_k_inv(u, du, K_inv):
-    """Gateaux derivative of `poro_k_inv` w.r.t. u in direction du."""
-    F = poro_F(u)
-    dF = dporo_F(u, du)
-
-    J = det(F)
-    F_inv = Identity(2) - grad(u)
-    # Use the Eulerian identity F^{-1} = I - ∇u and δJ = J tr(F^{-1} δF).
-    # Prefer Trace(Dot(...)) over Inner(...) because the C++ backend has more
-    # complete coverage for mixed tensor trace operations.
-    dJ = J * trace(dot(F_inv, dF))
-
-    # Eulerian identity: F^{-1} = I - ∇u  ⇒  δ(F^{-1}) = -∇(du).
-    dF_inv = -grad(du)
-    dF_inv_T = dF_inv.T
-
-    base = dot(F_inv.T, dot(K_inv, F_inv))
-    return dJ * base + J * dot(dF_inv_T, dot(K_inv, F_inv)) + J * dot(F_inv.T, dot(K_inv, dF_inv))
-
-
-def poro_sigma_neo_hookean(u, c, beta):
-    """Cauchy stress (compressible Neo-Hookean skeleton) in spatial frame."""
-    F = poro_F(u)
-    J = det(F)
-    I2 = Identity(2)
-
-    a = J ** (-Constant(2.0) * beta)
-    B = dot(F, F.T)  # left Cauchy-Green
-    return (Constant(2.0) * c / J) * (B - a * I2)
-
-
-def dporo_sigma_neo_hookean(u, du, c, beta):
-    """Gateaux derivative of `poro_sigma_neo_hookean` w.r.t. u in direction du."""
-    F = poro_F(u)
-    dF = dporo_F(u, du)
-
-    J = det(F)
-    F_inv = Identity(2) - grad(u)
-    dJ = J * trace(dot(F_inv, dF))
-
-    I2 = Identity(2)
-    a = J ** (-Constant(2.0) * beta)
-    da = -(Constant(2.0) * beta) * a * (dJ / J)
-
-    B = dot(F, F.T)
-    dB = dot(dF, F.T) + dot(F, dF.T)
-
-    # σ = 2c/J (B - a I)
-    return Constant(2.0) * c * (-(dJ / (J * J)) * (B - a * I2) + (Constant(1.0) / J) * (dB - da * I2))
 
 
 # -----------------------------------------------------------------------------

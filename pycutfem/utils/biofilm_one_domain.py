@@ -32,6 +32,13 @@ from pycutfem.ufl.expressions import (
     trace,
 )
 
+from pycutfem.utils.nonlinear_solid_eulerian_refmap import (
+    deulerian_k_inv,
+    dsigma_neo_hookean,
+    eulerian_k_inv,
+    sigma_neo_hookean,
+)
+
 
 def _c(val: float) -> Constant:
     return Constant(float(val))
@@ -200,6 +207,14 @@ def build_biofilm_one_domain_forms(
     kappa_inv=None,
     mu_s=None,
     lambda_s=None,
+    # optional solid inertia (Eulerian skeleton acceleration)
+    rho_s0_tilde=None,
+    include_skeleton_acceleration: bool = False,
+    # solid/permeability modelling toggles
+    solid_model: str = "linear",
+    c_nh=None,
+    beta_nh=None,
+    kappa_inv_model: str = "spatial",
     # transport parameters
     D_phi: float = 0.0,
     gamma_phi: float = 0.0,
@@ -234,8 +249,19 @@ def build_biofilm_one_domain_forms(
     - All source terms are *added* on the RHS of the strong form; i.e. we build
       residuals of the form "LHS - RHS" so the default is homogeneous (0).
     """
-    if rho_f is None or mu_f is None or kappa_inv is None or mu_s is None or lambda_s is None:
-        raise ValueError("Missing required physical parameters: rho_f, mu_f, kappa_inv, mu_s, lambda_s.")
+    if rho_f is None or mu_f is None or kappa_inv is None:
+        raise ValueError("Missing required physical parameters: rho_f, mu_f, kappa_inv.")
+
+    solid_model_key = str(solid_model).strip().lower()
+    if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
+        if mu_s is None or lambda_s is None:
+            raise ValueError("Solid model 'linear' requires mu_s and lambda_s.")
+    elif solid_model_key in {"neo_hookean", "neo_hookean_eulerian", "nh"}:
+        # Allow explicit neo-Hookean parameters; otherwise derive from (mu_s, lambda_s).
+        if (c_nh is None or beta_nh is None) and (mu_s is None or lambda_s is None):
+            raise ValueError("Solid model 'neo_hookean' requires either (c_nh,beta_nh) or (mu_s,lambda_s).")
+    else:
+        raise ValueError(f"Unknown solid_model {solid_model!r}.")
 
     th = _c(float(theta))
     one_m_th = _c(1.0) - th
@@ -275,9 +301,6 @@ def build_biofilm_one_domain_forms(
     mu_k = _mu(alpha_k, phi_k, mu_f=mu_f, mu_b_model=mu_b_model)
     mu_n = _mu(alpha_n, phi_n, mu_f=mu_f, mu_b_model=mu_b_model)
 
-    beta_k = _beta(alpha_k, phi_k, mu_f=mu_f, kappa_inv=kappa_inv)
-    beta_n = _beta(alpha_n, phi_n, mu_f=mu_f, kappa_inv=kappa_inv)
-
     # Coefficient variations w.r.t (α,φ) at k:
     dC = (phi_k - _c(1.0)) * dalpha + alpha_k * dphi  # δ((1-α)+αφ)
     drho = rho_f * dC
@@ -287,7 +310,56 @@ def build_biofilm_one_domain_forms(
     else:
         dmu = mu_f * dC
 
-    dbeta = (mu_f * (phi_k * phi_k) * kappa_inv) * dalpha + (_c(2.0) * mu_f * alpha_k * phi_k * kappa_inv) * dphi
+    # Optional skeleton inertia coefficient (0 by default).
+    rho_s0_tilde = rho_s0_tilde if rho_s0_tilde is not None else zero_scalar
+
+    # ------------------------------------------------------------------
+    # Permeability / drag handling
+    # ------------------------------------------------------------------
+    # Drag coefficient (without κ^{-1}): α μ_f φ^2.
+    beta_coeff_k = alpha_k * mu_f * (phi_k * phi_k)
+    beta_coeff_n = alpha_n * mu_f * (phi_n * phi_n)
+    dbeta_coeff = mu_f * ((phi_k * phi_k) * dalpha + (_c(2.0) * alpha_k * phi_k) * dphi)
+
+    kappa_inv_key = str(kappa_inv_model).strip().lower()
+
+    # Fast/robust path for *scalar spatial* κ^{-1}: keep the legacy scalar formulation.
+    if kappa_inv_key in {"spatial", "constant", "const"} and getattr(kappa_inv, "dim", None) == 0:
+        drag_mode = "scalar"
+        beta_k = beta_coeff_k * kappa_inv
+        beta_n = beta_coeff_n * kappa_inv
+        dbeta = dbeta_coeff * kappa_inv
+    else:
+        drag_mode = "matrix"
+
+        def _as_invperm_matrix(k_inv, *, dim: int):
+            # Accept scalar Constant/Expression as isotropic k_inv * I.
+            if getattr(k_inv, "dim", None) == 0:
+                return k_inv * Identity(int(dim))
+            return k_inv
+
+        K_inv = _as_invperm_matrix(kappa_inv, dim=int(dim))
+        if kappa_inv_key in {"refmap", "eulerian_refmap", "eulerian", "reference_map", "reference-map"}:
+            k_inv_k = eulerian_k_inv(u_k, K_inv, dim=int(dim))
+            k_inv_n = eulerian_k_inv(u_n, K_inv, dim=int(dim))
+            dk_inv_k = deulerian_k_inv(u_k, du, K_inv, dim=int(dim))
+        elif kappa_inv_key in {"spatial", "constant", "const"}:
+            k_inv_k = K_inv
+            k_inv_n = K_inv
+            dk_inv_k = None
+        else:
+            raise ValueError(f"Unknown kappa_inv_model {kappa_inv_model!r}.")
+
+        diff_k = v_k - vS_k
+        diff_n = v_n - vS_n
+        ddiff = dv - dvS
+
+        kdrag_k = dot(k_inv_k, diff_k)
+        kdrag_n = dot(k_inv_n, diff_n)
+
+        dkdrag_k = dot(k_inv_k, ddiff)
+        if dk_inv_k is not None:
+            dkdrag_k += dot(dk_inv_k, diff_k)
 
     # Detachment coefficient: lagged by default (depends on previous v/α)
     if D_det_prev is None:
@@ -306,9 +378,11 @@ def build_biofilm_one_domain_forms(
     r_mom += _c(2.0) * th * mu_k * inner(_epsilon(v_k), _epsilon(v_test)) * dx
     r_mom += _c(2.0) * one_m_th * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
     r_mom += -p_k * div(v_test) * dx
-    # NOTE: avoid Dot of mixed-field linear combinations (v - vS) to keep the compiler happy.
-    r_mom += beta_k * dot(v_k, v_test) * dx
-    r_mom += -beta_k * dot(vS_k, v_test) * dx
+    if drag_mode == "scalar":
+        r_mom += beta_k * dot(v_k, v_test) * dx
+        r_mom += -beta_k * dot(vS_k, v_test) * dx
+    else:
+        r_mom += beta_coeff_k * dot(kdrag_k, v_test) * dx
     r_mom += -dot(f_v, v_test) * dx
 
     a_mom = rho_k * inv_dt * dot(dv, v_test) * dx
@@ -318,9 +392,13 @@ def build_biofilm_one_domain_forms(
     a_mom += _c(2.0) * th * (dmu * inner(_epsilon(v_k), _epsilon(v_test)) + mu_k * inner(_epsilon(dv), _epsilon(v_test))) * dx
 
     a_mom += -dp * div(v_test) * dx
-    a_mom += dbeta * (dot(v_k, v_test) - dot(vS_k, v_test)) * dx
-    a_mom += beta_k * dot(dv, v_test) * dx
-    a_mom += -beta_k * dot(dvS, v_test) * dx
+    if drag_mode == "scalar":
+        a_mom += dbeta * (dot(v_k, v_test) - dot(vS_k, v_test)) * dx
+        a_mom += beta_k * dot(dv, v_test) * dx
+        a_mom += -beta_k * dot(dvS, v_test) * dx
+    else:
+        a_mom += dbeta_coeff * dot(kdrag_k, v_test) * dx
+        a_mom += beta_coeff_k * dot(dkdrag_k, v_test) * dx
 
     # ------------------------------------------------------------------
     # (ii) Mass / volume constraint (expanded divergence)
@@ -366,10 +444,25 @@ def build_biofilm_one_domain_forms(
     a_mass = q_test * th * (d_divCv_k + d_divBvS_k - dalpha * s_v) * dx
 
     # ------------------------------------------------------------------
-    # (iii) Skeleton momentum (quasi-static linear elasticity)
+    # (iii) Skeleton momentum (optional inertia + linear/neo-Hookean stress)
     # ------------------------------------------------------------------
-    r_el_k = _linear_elastic_term(u_k, u_test, mu_s=mu_s, lambda_s=lambda_s)
-    r_el_n = _linear_elastic_term(u_n, u_test, mu_s=mu_s, lambda_s=lambda_s)
+    if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
+        r_el_k = _linear_elastic_term(u_k, u_test, mu_s=mu_s, lambda_s=lambda_s)
+        r_el_n = _linear_elastic_term(u_n, u_test, mu_s=mu_s, lambda_s=lambda_s)
+        a_el = _linear_elastic_term(du, u_test, mu_s=mu_s, lambda_s=lambda_s)
+    else:
+        # Eulerian reference-map Neo-Hookean stress (Cauchy), compatible with FPI poro Eulerian module.
+        if c_nh is None:
+            c_nh = mu_s / _c(2.0)
+        if beta_nh is None:
+            beta_nh = lambda_s / (_c(2.0) * mu_s)
+
+        sig_k = sigma_neo_hookean(u_k, c_nh, beta_nh, dim=int(dim))
+        sig_n = sigma_neo_hookean(u_n, c_nh, beta_nh, dim=int(dim))
+        r_el_k = inner(sig_k, grad(u_test))
+        r_el_n = inner(sig_n, grad(u_test))
+        dsig_k = dsigma_neo_hookean(u_k, du, c_nh, beta_nh, dim=int(dim))
+        a_el = inner(dsig_k, grad(u_test))
 
     r_skel_k = r_el_k
     r_skel_n = r_el_n
@@ -379,14 +472,24 @@ def build_biofilm_one_domain_forms(
     r_skel_n += -(_one_minus(phi_n) * p_n) * div(u_test)
 
     # drag reaction: -β (v - vS)
-    r_skel_k += -beta_k * dot(v_k, u_test) + beta_k * dot(vS_k, u_test)
-    r_skel_n += -beta_n * dot(v_n, u_test) + beta_n * dot(vS_n, u_test)
+    if drag_mode == "scalar":
+        r_skel_k += -beta_k * dot(v_k, u_test) + beta_k * dot(vS_k, u_test)
+        r_skel_n += -beta_n * dot(v_n, u_test) + beta_n * dot(vS_n, u_test)
+    else:
+        r_skel_k += -beta_coeff_k * dot(kdrag_k, u_test)
+        r_skel_n += -beta_coeff_n * dot(kdrag_n, u_test)
 
     r_skeleton = (th * alpha_k * r_skel_k + one_m_th * alpha_n * r_skel_n) * dx
     r_skeleton += -dot(alpha_k * f_u, u_test) * dx
 
     # Jacobian contributions (k-part only)
-    a_el = _linear_elastic_term(du, u_test, mu_s=mu_s, lambda_s=lambda_s)
+    if drag_mode == "scalar":
+        drag_term_k = -beta_k * dot(v_k, u_test) + beta_k * dot(vS_k, u_test)
+        d_drag_term_k = -dbeta * (dot(v_k, u_test) - dot(vS_k, u_test))
+        d_drag_term_k += -beta_k * (dot(dv, u_test) - dot(dvS, u_test))
+    else:
+        drag_term_k = -beta_coeff_k * dot(kdrag_k, u_test)
+        d_drag_term_k = -(dbeta_coeff * dot(kdrag_k, u_test) + beta_coeff_k * dot(dkdrag_k, u_test))
 
     a_skel = th * (
         alpha_k * a_el
@@ -394,11 +497,35 @@ def build_biofilm_one_domain_forms(
         - dalpha * (_one_minus(phi_k) * p_k) * div(u_test)
         + alpha_k * (dphi * p_k) * div(u_test)
         - alpha_k * (_one_minus(phi_k) * dp) * div(u_test)
-        - (dalpha * beta_k + alpha_k * dbeta) * (dot(v_k, u_test) - dot(vS_k, u_test))
-        - alpha_k * beta_k * dot(dv, u_test)
-        + alpha_k * beta_k * dot(dvS, u_test)
+        + dalpha * drag_term_k
+        + alpha_k * d_drag_term_k
     ) * dx
     a_skel += -dot(dalpha * f_u, u_test) * dx
+
+    # Optional Eulerian skeleton inertia (a^S = ∂_t vS + (vS·∇)vS).
+    if bool(include_skeleton_acceleration) and float(rho_s0_tilde) != 0.0:
+        grad_vS_k = (grad(u_k) - grad(u_n)) / dt
+        if u_nm1 is None:
+            grad_vS_n = _c(0.0) * grad_vS_k
+        else:
+            grad_vS_n = (grad(u_n) - grad(u_nm1)) / dt
+
+        acc_local = (vS_k - vS_n) / dt
+        adv_k = dot(grad_vS_k, vS_k)
+        adv_n = dot(grad_vS_n, vS_n)
+        acc = acc_local + th * adv_k + one_m_th * adv_n
+
+        m_s = rho_s0_tilde * _one_minus(phi_k)
+        r_skeleton += alpha_k * inner(m_s * acc, u_test) * dx
+
+        # δm_s = -rho_s0_tilde δφ,  δacc = δvS/dt + θ δ((∇vS)vS)
+        dm_s = rho_s0_tilde * (-dphi)
+        dvS_over_dt = dvS / dt
+        grad_dvS = grad(du) / dt
+        dadv_k = dot(grad_dvS, vS_k) + dot(grad_vS_k, dvS)
+        dacc = dvS_over_dt + th * dadv_k
+
+        a_skel += inner((dalpha * m_s + alpha_k * dm_s) * acc + alpha_k * m_s * dacc, u_test) * dx
 
     # ------------------------------------------------------------------
     # (iv) Porosity evolution (Eulerian, advected by vS)

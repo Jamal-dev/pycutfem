@@ -1,5 +1,3 @@
-import argparse
-
 import numpy as np
 
 from pycutfem.core.dofhandler import DofHandler
@@ -21,7 +19,7 @@ from pycutfem.utils.biofilm_one_domain import build_biofilm_one_domain_forms
 from pycutfem.utils.meshgen import structured_quad
 
 
-def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta: float, solid_model: str, kappa_inv_model: str, rho_s0: float):
+def _build_problem(*, nx: int = 1, ny: int = 1, q: int = 4):
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
     mesh = Mesh(
         nodes=nodes,
@@ -78,7 +76,7 @@ def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta:
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
     S_n = Function("S_n", "S", dof_handler=dh)
 
-    rng = np.random.default_rng(int(seed))
+    rng = np.random.default_rng(0)
     for vf in (v_k, u_k, v_n, u_n, u_nm1):
         vf.nodal_values[:] = 1.0e-2 * rng.standard_normal(vf.nodal_values.shape)
     for sf in (p_k, p_n):
@@ -92,11 +90,11 @@ def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta:
     S_k.nodal_values[:] = np.clip(0.2 + 0.05 * rng.standard_normal(S_k.nodal_values.shape), 0.01, 1.0)
     S_n.nodal_values[:] = np.clip(0.2 + 0.05 * rng.standard_normal(S_n.nodal_values.shape), 0.01, 1.0)
 
-    kappa_inv_model = str(kappa_inv_model).strip().lower()
-    if kappa_inv_model == "refmap":
-        kappa_inv = Constant(10.0 * np.eye(2, dtype=float))
-    else:
-        kappa_inv = Constant(10.0)
+    dt = Constant(0.1)
+    th = 1.0
+
+    # Reference inverse permeability K^{-1} (matrix) for Eulerian ref-map push-forward.
+    K_inv = Constant(10.0 * np.eye(2, dtype=float))
 
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
@@ -125,15 +123,15 @@ def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta:
         alpha_test=alpha_test,
         S_test=S_test,
         dx=dx(metadata={"q": int(q)}),
-        dt=Constant(float(dt_val)),
-        theta=float(theta),
+        dt=dt,
+        theta=th,
         rho_f=Constant(1.0),
         mu_f=Constant(1.0e-2),
-        kappa_inv=kappa_inv,
-        kappa_inv_model=kappa_inv_model,
-        solid_model=str(solid_model).strip().lower(),
-        rho_s0_tilde=Constant(float(rho_s0)),
-        include_skeleton_acceleration=bool(float(rho_s0) != 0.0),
+        kappa_inv=K_inv,
+        kappa_inv_model="refmap",
+        solid_model="neo_hookean",
+        rho_s0_tilde=Constant(0.5),
+        include_skeleton_acceleration=True,
         mu_s=Constant(1.0),
         lambda_s=Constant(1.0),
         D_phi=0.1,
@@ -148,50 +146,55 @@ def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta:
         k_det=0.2,
     )
 
-    return dh, forms
+    field_to_func_k = {
+        "v_x": v_k.components[0],
+        "v_y": v_k.components[1],
+        "p": p_k,
+        "u_x": u_k.components[0],
+        "u_y": u_k.components[1],
+        "phi": phi_k,
+        "alpha": alpha_k,
+        "S": S_k,
+    }
+
+    return dh, forms, field_to_func_k
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Smoke assembly for one-domain biofilm model (python/jit/cpp backends).")
-    ap.add_argument("--nx", type=int, default=2)
-    ap.add_argument("--ny", type=int, default=2)
-    ap.add_argument("--q", type=int, default=5, help="Quadrature order (passed to dx metadata + assembler).")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--dt", type=float, default=0.1)
-    ap.add_argument("--theta", type=float, default=1.0)
-    ap.add_argument("--solid-model", type=str, default="linear", choices=("linear", "neo_hookean"))
-    ap.add_argument("--kappa-inv-model", type=str, default="spatial", choices=("spatial", "refmap"))
-    ap.add_argument("--rho-s0", type=float, default=0.0, help="Skeleton inertia coefficient (rho_s0_tilde).")
-    ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
-    ap.add_argument("--compare-python", action="store_true", help="Also assemble with backend='python' and compare.")
-    args = ap.parse_args()
-
-    dh, forms = _build_problem(
-        nx=args.nx,
-        ny=args.ny,
-        q=args.q,
-        seed=args.seed,
-        dt_val=args.dt,
-        theta=args.theta,
-        solid_model=args.solid_model,
-        kappa_inv_model=args.kappa_inv_model,
-        rho_s0=args.rho_s0,
-    )
+def test_biofilm_one_domain_nh_jacobian_fd_consistency():
+    """
+    FD check for the biofilm Jacobian with:
+      - Neo-Hookean Eulerian reference-map solid
+      - Eulerian push-forward inverse permeability k^{-1}(u)
+      - skeleton acceleration term enabled
+    """
+    dh, forms, field_to_func_k = _build_problem(nx=1, ny=1, q=4)
     eq = Equation(forms.jacobian_form, forms.residual_form)
+    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=4, backend="python")
+    R0 = np.asarray(R0, dtype=float)
 
-    K, R = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=int(args.q), backend=args.backend)
-    R = np.asarray(R, dtype=float)
-    print(f"[{args.backend}] |R|_inf = {np.linalg.norm(R, ord=np.inf):.3e}, nnz(K)={K.nnz}")
+    def assemble_residual():
+        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=4, backend="python")
+        return np.asarray(R, dtype=float)
 
-    if args.compare_python and args.backend != "python":
-        K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=int(args.q), backend="python")
-        A = K.tocsr().toarray()
-        A_py = K_py.tocsr().toarray()
-        dA = float(np.max(np.abs(A - A_py)))
-        dR = float(np.max(np.abs(R - np.asarray(R_py, dtype=float))))
-        print(f"[compare] max|A-{args.backend}-python| = {dA:.3e}")
-        print(f"[compare] max|R-{args.backend}-python| = {dR:.3e}")
+    # Probe a few DOFs (one per block) to cover couplings.
+    probes = []
+    for fld in ("v_x", "p", "u_x", "phi", "alpha", "S"):
+        sl = dh.get_field_slice(fld)
+        if sl:
+            probes.append(int(sl[len(sl) // 2]))
 
+    eps = 1.0e-8
+    for j in probes:
+        fld, _ = dh._dof_to_node_map[j]
+        func = field_to_func_k[fld]
+        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
+        R1 = assemble_residual()
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
 
-if __name__ == "__main__":
-    main()
+        fd = (R1 - R0) / eps
+        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
+        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
+        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
+        assert rel < 5.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
+
