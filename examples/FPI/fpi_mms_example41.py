@@ -6,6 +6,7 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
+import pandas as pd
 
 # Must be set before importing pyplot (headless-safe).
 matplotlib.use("Agg")
@@ -1710,8 +1711,9 @@ def main():
         return float(args.dt)
 
     def _run_convergence(interface: str):
-        rows = [
-            _run_one(
+        rows: list[dict[str, float]] = []
+        for i, nx in enumerate(nx_list):
+            out = _run_one(
                 nx=nx,
                 poly_order=args.p,
                 qdeg=args.q,
@@ -1740,8 +1742,9 @@ def main():
                 use_interface_terms=args.use_interface_terms,
                 use_stabilization=args.use_stabilization,
             )
-            for i, nx in enumerate(nx_list)
-        ]
+            out["nx"] = int(nx)
+            out["dt"] = float(_dt_for_level(i))
+            rows.append(out)
 
         print(
             f"\nFPI Example 4.1 (BE) | layout={args.mesh_layout} | backend={args.backend} | p={args.p} | K_inv={args.kinv} | interface={interface}"
@@ -1807,6 +1810,86 @@ def main():
                 zf = int(r.get("theta_zeros_fluid", 0) or 0)
                 zp = int(r.get("theta_zeros_poro", 0) or 0)
                 print(f"{r['h']:8.3e}  {tf:16.3e}  {zf:8d}  {tp:14.3e}  {zp:8d}")
+
+        # ------------------------------------------------------------------
+        # Pandas tables (saved by default in convergence mode)
+        # ------------------------------------------------------------------
+        df_all = pd.DataFrame(rows)
+        df_all = df_all.sort_values("h", ascending=False, ignore_index=True)
+
+        def _add_eoc(df: pd.DataFrame, key: str, out_key: str) -> None:
+            hs = df["h"].to_numpy(dtype=float)
+            ys = df[key].to_numpy(dtype=float)
+            eoc = np.full_like(ys, np.nan, dtype=float)
+            for j in range(1, ys.size):
+                eoc[j] = _eoc(float(hs[j - 1]), float(hs[j]), float(ys[j - 1]), float(ys[j]))
+            df[out_key] = eoc
+
+        for k in ("err_vF", "err_pF", "err_vP", "err_pP", "err_uP", "err_gvF", "err_guP", "En", "Et"):
+            _add_eoc(df_all, k, f"eoc_{k}")
+
+        df_domain = df_all[
+            [
+                "nx",
+                "h",
+                "dt",
+                "err_vF",
+                "eoc_err_vF",
+                "err_pF",
+                "eoc_err_pF",
+                "err_vP",
+                "eoc_err_vP",
+                "err_pP",
+                "eoc_err_pP",
+                "err_uP",
+                "eoc_err_uP",
+            ]
+        ].copy()
+        df_grad = df_all[
+            [
+                "nx",
+                "h",
+                "dt",
+                "err_gvF",
+                "eoc_err_gvF",
+                "err_guP",
+                "eoc_err_guP",
+                "En",
+                "eoc_En",
+                "Et",
+                "eoc_Et",
+            ]
+        ].copy()
+
+        print("\n  Domain L2 errors (pandas)")
+        with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 200):
+            print(df_domain)
+        print("\n  LaTeX (domain) (copy/paste):\n")
+        latex_domain = df_domain.to_latex(index=False, float_format="%.3e", na_rep="-")
+        print(latex_domain)
+
+        print("\n  Gradient / kinematic interface errors (pandas)")
+        with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 200):
+            print(df_grad)
+        print("\n  LaTeX (grad/interface) (copy/paste):\n")
+        latex_grad = df_grad.to_latex(index=False, float_format="%.3e", na_rep="-")
+        print(latex_grad)
+
+        stem = (
+            f"fpi_example41_convergence_layout={args.mesh_layout}_backend={args.backend}_p={int(args.p)}_kinv={args.kinv}_iface={interface}"
+        )
+        out_csv_domain = outdir / f"{stem}_domain.csv"
+        out_csv_grad = outdir / f"{stem}_grad.csv"
+        out_tex_domain = outdir / f"{stem}_domain.tex"
+        out_tex_grad = outdir / f"{stem}_grad.tex"
+        df_domain.to_csv(out_csv_domain, index=False)
+        df_grad.to_csv(out_csv_grad, index=False)
+        out_tex_domain.write_text(latex_domain, encoding="utf-8")
+        out_tex_grad.write_text(latex_grad, encoding="utf-8")
+        print(f"\nSaved: {out_csv_domain}")
+        print(f"Saved: {out_csv_grad}")
+        print(f"Saved: {out_tex_domain}")
+        print(f"Saved: {out_tex_grad}")
         return rows
 
     rows_by_iface: dict[str, list[dict[str, float]]] = {}

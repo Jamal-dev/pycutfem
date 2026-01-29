@@ -1,7 +1,9 @@
 import argparse
 import math
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
@@ -267,6 +269,8 @@ def main() -> None:
     ap.add_argument("--newton-tol", type=float, default=1.0e-10)
     ap.add_argument("--max-it", type=int, default=30)
     ap.add_argument("--no-detachment", action="store_true", help="Set k_det=0 in the MMS/forcing.")
+    ap.add_argument("--convergence", action="store_true", help="Save log-log convergence plot as a PNG.")
+    ap.add_argument("--outdir", type=str, default="comparison_outputs", help="Directory for saving CSV/LaTeX tables (and plots).")
     args = ap.parse_args()
 
     nx_list = [int(s.strip()) for s in str(args.nx_list).split(",") if s.strip()]
@@ -291,30 +295,86 @@ def main() -> None:
     ]
 
     print(f"\nOne-domain biofilm MMS convergence | backend={args.backend} | theta={float(args.theta):g} | dt={float(args.dt):g}")
-    print(
-        f"{'h':>10}  {'e(v)':>12} {'eoc':>6}  {'e(p)':>12} {'eoc':>6}  {'e(u)':>12} {'eoc':>6}  "
-        f"{'e(phi)':>12} {'eoc':>6}  {'e(alpha)':>12} {'eoc':>6}  {'e(S)':>12} {'eoc':>6}"
-    )
-
+    recs: list[dict] = []
     for i, r in enumerate(rows):
-        if i == 0:
-            eoc_v = eoc_p = eoc_u = eoc_phi = eoc_alpha = eoc_S = float("nan")
-        else:
-            prev = rows[i - 1]
-            eoc_v = _eoc(prev["h"], r["h"], prev["err_v"], r["err_v"])
-            eoc_p = _eoc(prev["h"], r["h"], prev["err_p"], r["err_p"])
-            eoc_u = _eoc(prev["h"], r["h"], prev["err_u"], r["err_u"])
-            eoc_phi = _eoc(prev["h"], r["h"], prev["err_phi"], r["err_phi"])
-            eoc_alpha = _eoc(prev["h"], r["h"], prev["err_alpha"], r["err_alpha"])
-            eoc_S = _eoc(prev["h"], r["h"], prev["err_S"], r["err_S"])
-
-        def _fmt(val: float) -> str:
-            return "   - " if not np.isfinite(val) else f"{val:6.2f}"
-
-        print(
-            f"{r['h']:10.3e}  {r['err_v']:12.3e} {_fmt(eoc_v)}  {r['err_p']:12.3e} {_fmt(eoc_p)}  {r['err_u']:12.3e} {_fmt(eoc_u)}  "
-            f"{r['err_phi']:12.3e} {_fmt(eoc_phi)}  {r['err_alpha']:12.3e} {_fmt(eoc_alpha)}  {r['err_S']:12.3e} {_fmt(eoc_S)}"
+        prev = rows[i - 1] if i > 0 else None
+        recs.append(
+            {
+                "nx": int(r["nx"]),
+                "h": float(r["h"]),
+                "err_v": float(r["err_v"]),
+                "eoc_v": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["err_v"], r["err_v"]),
+                "err_p": float(r["err_p"]),
+                "eoc_p": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["err_p"], r["err_p"]),
+                "err_u": float(r["err_u"]),
+                "eoc_u": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["err_u"], r["err_u"]),
+                "err_phi": float(r["err_phi"]),
+                "eoc_phi": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["err_phi"], r["err_phi"]),
+                "err_alpha": float(r["err_alpha"]),
+                "eoc_alpha": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["err_alpha"], r["err_alpha"]),
+                "err_S": float(r["err_S"]),
+                "eoc_S": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["err_S"], r["err_S"]),
+            }
         )
+
+    df = pd.DataFrame.from_records(recs)
+    print("\nConvergence table (pandas):")
+    with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 160):
+        print(df)
+
+    latex = df.to_latex(index=False, float_format="%.3e", na_rep="-")
+    print("\nLaTeX table (copy/paste):\n")
+    print(latex)
+
+    outdir = Path(str(args.outdir))
+    outdir.mkdir(parents=True, exist_ok=True)
+    stem = f"biofilm_mms_trig_backend={args.backend}_theta={float(args.theta):g}_dt={float(args.dt):g}"
+    out_csv = outdir / f"{stem}.csv"
+    out_tex = outdir / f"{stem}.tex"
+    df.to_csv(out_csv, index=False)
+    out_tex.write_text(latex, encoding="utf-8")
+    print(f"\nSaved: {out_csv}")
+    print(f"Saved: {out_tex}")
+
+    if bool(args.convergence):
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] --convergence requested but matplotlib is unavailable: {exc}")
+            return
+
+        hs = np.asarray([r["h"] for r in rows], dtype=float)
+        series = [
+            ("v", np.asarray([r["err_v"] for r in rows], dtype=float)),
+            ("p", np.asarray([r["err_p"] for r in rows], dtype=float)),
+            ("u", np.asarray([r["err_u"] for r in rows], dtype=float)),
+            ("phi", np.asarray([r["err_phi"] for r in rows], dtype=float)),
+            ("alpha", np.asarray([r["err_alpha"] for r in rows], dtype=float)),
+            ("S", np.asarray([r["err_S"] for r in rows], dtype=float)),
+        ]
+
+        fig, ax = plt.subplots(figsize=(7.0, 5.0), constrained_layout=True)
+
+        for name, errs in series:
+            label = f"e({name})"
+            if hs.size >= 2 and np.all(errs > 0.0):
+                slope = float(np.polyfit(np.log(hs), np.log(errs), 1)[0])
+                label = f"{label} (p≈{slope:.2f})"
+            ax.loglog(hs, errs, marker="o", linewidth=1.5, label=label)
+
+        ax.set_xlabel("h")
+        ax.set_ylabel("L2 error at t_k")
+        ax.grid(True, which="both", linestyle=":", linewidth=0.7)
+        ax.legend(loc="best", fontsize=9)
+        ax.set_title(f"Biofilm MMS convergence (backend={args.backend}, theta={float(args.theta):g}, dt={float(args.dt):g})")
+
+        out = outdir / f"{stem}.png"
+        fig.savefig(out, dpi=180)
+        plt.close(fig)
+        print(f"\nSaved convergence plot to {out}")
 
 
 if __name__ == "__main__":

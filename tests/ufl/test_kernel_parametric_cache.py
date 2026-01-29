@@ -206,3 +206,53 @@ def test_constant_value_change_updates_kernel_inputs_without_recompile(backend, 
 
     factor = 2.5 / 1.5
     assert np.allclose(K2, factor * K1)
+
+
+@pytest.mark.parametrize("backend", ("jit", "cpp"))
+def test_analytic_value_change_updates_kernel_inputs_without_recompile(backend, monkeypatch, tmp_path):
+    """
+    Regression:
+    JIT/CPP backends precompute Analytic(qp_phys) into static args for performance.
+    For time-dependent MMS, Analytic objects often close over mutable state (e.g. t),
+    so the precomputed arrays must be refreshed per kernel execution without
+    forcing a recompile.
+    """
+    if backend == "cpp":
+        monkeypatch.setenv("PYCUTFEM_JIT_BACKEND", "cpp")
+    else:
+        monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / backend))
+
+    dh, me = _make_dh(nx=1, ny=1, poly_order=1)
+    v = TestFunction(field_name="u", name="v", dof_handler=dh)
+
+    state = {"scale": 1.5}
+    forcing = Analytic(lambda x, y: state["scale"] + 0.0 * x, degree=1)
+    expr = forcing * v
+
+    runner, ir = compile_backend(expr, dh, me, on_facet=False)
+
+    geom = dh.precompute_geometric_factors(quad_order=2, level_set=lambda *_: 0.0, reuse=False)
+    static_args = dict(geom)
+    static_args["gdofs_map"] = np.vstack(
+        [np.asarray(dh.get_elemental_dofs(eid), dtype=np.int32) for eid in range(me.mesh.n_elements)]
+    ).astype(np.int32)
+    static_args.update(
+        _build_jit_kernel_args(
+            ir,
+            expr,
+            me,
+            2,
+            dof_handler=dh,
+            gdofs_map=static_args["gdofs_map"],
+            param_order=getattr(runner, "param_order", []),
+            pre_built=static_args,
+        )
+    )
+
+    _, F1, _ = runner({}, static_args)
+    state["scale"] = 2.5
+    _, F2, _ = runner({}, static_args)
+
+    factor = 2.5 / 1.5
+    assert np.allclose(F2, factor * F1)

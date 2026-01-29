@@ -809,6 +809,27 @@ def scalar_basis_times_vector(scalar_basis, vector_vals, dtype):
     return np.ascontiguousarray(vector_vals)[:, None] * np.ascontiguousarray(phi)[None, :]
 
 
+@numba.njit(cache=True)
+def scalar_basis_times_vector_as_grad_tensor(scalar_basis, vector_vals, dtype):
+    """
+    Scalar basis (1,n) or (n,) times a spatial vector (d,) -> (1,n,d).
+
+    This is handy when a term like (grad(scalar_value) * trial_scalar) needs to
+    be added to grad(trial_scalar), which is represented as a grad-tensor with
+    shape (1,n,d) in the JIT codegen.
+    """
+    if DEBUG:
+        print("scalar_basis_times_vector_as_grad_tensor")
+    if scalar_basis.ndim == 2:
+        phi = scalar_basis[0]
+    else:
+        phi = scalar_basis
+    d = int(vector_vals.shape[0])
+    res = np.empty((1, phi.shape[0], d), dtype=dtype)
+    res[0] = np.ascontiguousarray(phi)[:, None] * np.ascontiguousarray(vector_vals)[None, :]
+    return res
+
+
 
 @numba.njit(cache=True)
 def matrix_times_scalar_basis(matrix_vals, scalar_basis, dtype):

@@ -218,6 +218,7 @@ def build_biofilm_one_domain_forms(
     # transport parameters
     D_phi: float = 0.0,
     gamma_phi: float = 0.0,
+    gamma_u: float = 0.0,
     D_alpha: float = 0.0,
     D_S: float = 0.0,
     # growth / detachment parameters
@@ -482,6 +483,14 @@ def build_biofilm_one_domain_forms(
     r_skeleton = (th * alpha_k * r_skel_k + one_m_th * alpha_n * r_skel_n) * dx
     r_skeleton += -dot(alpha_k * f_u, u_test) * dx
 
+    # Optional extension penalty to keep u well-posed in the free-fluid region.
+    # This is a pragmatic stabilization for the one-domain formulation: as α→0,
+    # the skeleton equation vanishes and the u-DOFs can become nearly unconstrained,
+    # leading to ill-conditioned Jacobians and Newton stagnation.
+    gamma_u_c = _c(float(gamma_u))
+    if float(gamma_u) != 0.0:
+        r_skeleton += gamma_u_c * _one_minus(alpha_k) * dot(u_k, u_test) * dx
+
     # Jacobian contributions (k-part only)
     if drag_mode == "scalar":
         drag_term_k = -beta_k * dot(v_k, u_test) + beta_k * dot(vS_k, u_test)
@@ -501,6 +510,9 @@ def build_biofilm_one_domain_forms(
         + alpha_k * d_drag_term_k
     ) * dx
     a_skel += -dot(dalpha * f_u, u_test) * dx
+
+    if float(gamma_u) != 0.0:
+        a_skel += gamma_u_c * ((-_c(1.0) * dalpha) * dot(u_k, u_test) + _one_minus(alpha_k) * dot(du, u_test)) * dx
 
     # Optional Eulerian skeleton inertia (a^S = ∂_t vS + (vS·∇)vS).
     if bool(include_skeleton_acceleration) and float(rho_s0_tilde) != 0.0:

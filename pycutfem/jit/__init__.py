@@ -285,6 +285,37 @@ class KernelRunner:
                         pass
 
         # ---------------------------------------------------------------
+        # A1) refresh Analytic parameters (time-dependent forcing support)
+        #
+        # Compiled backends (jit/cpp) traditionally precompute Analytic(x,y)
+        # values into static_args. That is correct for time-independent data,
+        # but breaks for time-dependent MMS/BC-driven Analytic callables where
+        # the callable closes over mutable state (e.g. current time).
+        #
+        # Refreshing here keeps the kernel cache stable (no recompile) while
+        # ensuring correctness across time steps/Newton iterations.
+        # ---------------------------------------------------------------
+        if param is not None:
+            analytic_by_id = getattr(param, "analytic_by_id", None)
+            if isinstance(analytic_by_id, dict) and analytic_by_id:
+                qp_phys = kernel_args.get("qp_phys")
+                if isinstance(qp_phys, np.ndarray):
+                    for func_id, ana in analytic_by_id.items():
+                        name = f"ana_{int(func_id)}"
+                        if name not in self._param_set:
+                            continue
+                        try:
+                            vals = ana.eval(qp_phys)  # vectorized over (e,q)
+                        except Exception:
+                            continue
+                        arr = np.asarray(vals, dtype=np.float64)
+                        prev = kernel_args.get(name)
+                        if isinstance(prev, np.ndarray) and prev.shape == arr.shape:
+                            prev[...] = arr
+                        else:
+                            kernel_args[name] = arr
+
+        # ---------------------------------------------------------------
         # B)  guarantee presence of 'gdofs_map'  and  'node_coords'
         # ---------------------------------------------------------------
         if "gdofs_map" not in kernel_args:

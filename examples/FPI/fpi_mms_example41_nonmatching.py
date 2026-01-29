@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
@@ -1375,23 +1376,23 @@ def main() -> None:
         for iface in iface_list:
             rows: list[dict] = []
             for nx_i in nx_list:
-                rows.append(
-                    _run_one(
-                        nx_f=int(nx_i),
-                        poly_order=int(args.p),
-                        qdeg=int(args.q),
-                        dt=float(args.dt),
-                        x0=float(args.x0),
-                        backend=str(args.backend),
-                        interface=str(iface),
-                        newton_it=int(args.newton_it),
-                        newton_tol=float(newton_tol),
-                        check_only=False,
-                        save_mesh=bool(save_mesh),
-                        outdir=outdir,
-                        use_stabilization=bool(use_stabilization),
-                    )
+                out = _run_one(
+                    nx_f=int(nx_i),
+                    poly_order=int(args.p),
+                    qdeg=int(args.q),
+                    dt=float(args.dt),
+                    x0=float(args.x0),
+                    backend=str(args.backend),
+                    interface=str(iface),
+                    newton_it=int(args.newton_it),
+                    newton_tol=float(newton_tol),
+                    check_only=False,
+                    save_mesh=bool(save_mesh),
+                    outdir=outdir,
+                    use_stabilization=bool(use_stabilization),
                 )
+                out["nx"] = int(nx_i)
+                rows.append(out)
             rows_by_iface[str(iface)] = rows
 
             print(f"\nFPI Example 4.1 (two-mesh, nonmatching) | backend={args.backend} | p={args.p} | interface={iface.upper()}")
@@ -1407,6 +1408,53 @@ def main() -> None:
                         f"{r['h']:10.3e} {r['err_vF']:11.3e} { _eoc(prev['err_vF'], r['err_vF'], prev['h'], r['h']):5.2f}  {r['err_pF']:11.3e} { _eoc(prev['err_pF'], r['err_pF'], prev['h'], r['h']):5.2f}  {r['err_vP']:11.3e} { _eoc(prev['err_vP'], r['err_vP'], prev['h'], r['h']):5.2f}  {r['err_uP']:11.3e} { _eoc(prev['err_uP'], r['err_uP'], prev['h'], r['h']):5.2f}  {r['err_pP']:11.3e} { _eoc(prev['err_pP'], r['err_pP'], prev['h'], r['h']):5.2f}"
                     )
                 prev = r
+
+            # Pandas table (saved by default in convergence mode)
+            df_all = pd.DataFrame(rows).sort_values("h", ascending=False, ignore_index=True)
+
+            def _add_eoc_col(key: str) -> None:
+                hs = df_all["h"].to_numpy(dtype=float)
+                ys = df_all[key].to_numpy(dtype=float)
+                eoc = np.full_like(ys, np.nan, dtype=float)
+                for j in range(1, ys.size):
+                    eoc[j] = _eoc(float(ys[j - 1]), float(ys[j]), float(hs[j - 1]), float(hs[j]))
+                df_all[f"eoc_{key}"] = eoc
+
+            for k in ("err_vF", "err_pF", "err_vP", "err_uP", "err_pP"):
+                _add_eoc_col(k)
+
+            df_table = df_all[
+                [
+                    "nx",
+                    "h",
+                    "err_vF",
+                    "eoc_err_vF",
+                    "err_pF",
+                    "eoc_err_pF",
+                    "err_vP",
+                    "eoc_err_vP",
+                    "err_uP",
+                    "eoc_err_uP",
+                    "err_pP",
+                    "eoc_err_pP",
+                ]
+            ].copy()
+
+            print("\nConvergence table (pandas):")
+            with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 200):
+                print(df_table)
+
+            latex = df_table.to_latex(index=False, float_format="%.3e", na_rep="-")
+            print("\nLaTeX table (copy/paste):\n")
+            print(latex)
+
+            stem = f"fpi_example41_two_mesh_convergence_backend={args.backend}_p={int(args.p)}_iface={iface}"
+            out_csv = outdir / f"{stem}.csv"
+            out_tex = outdir / f"{stem}.tex"
+            df_table.to_csv(out_csv, index=False)
+            out_tex.write_text(latex, encoding="utf-8")
+            print(f"\nSaved: {out_csv}")
+            print(f"Saved: {out_tex}")
 
         _save_convergence_plots(
             outdir=outdir,

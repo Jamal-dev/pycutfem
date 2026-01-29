@@ -3254,12 +3254,92 @@ class NumbaCodeGen:
                                             shape=(1, n_locs, n_locs), is_vector=False,
                                             field_names=field_names, parent_name=parent_name, side=side,
                                             field_sides=field_sides))
-             
+
                     # -----------------------------------------------------------------
                     # 2. LHS block:   scalar trial/test  *  vector   →  vector trial/test
                     # -----------------------------------------------------------------
-                    elif (a.role in {"trial", "test"} and not a.is_vector and not a.is_gradient and not a.is_hessian and a.shape[0] == 1
-                          and b.role in {"value", "const"} and b.is_vector):
+                    elif (
+                        a.role in {"trial", "test"}
+                        and (not a.is_vector)
+                        and (not a.is_gradient and not a.is_hessian)
+                        and len(a.shape) == 2
+                        and a.shape[0] == 1
+                        and b.role in {"value", "const"}
+                        and b.is_vector
+                        and (not b.is_gradient and not b.is_hessian)
+                        and len(b.shape) == 1
+                        and b.shape[0] == self.spatial_dim
+                        and b.field_names
+                        and len(b.field_names) == 1
+                    ):
+                        # Special case: (scalar basis) * (spatial vector coming from a scalar field)
+                        # Represent as a grad-tensor (1, n, d) so it can be added to
+                        # grad(scalar trial/test) terms which use the same convention.
+                        role = "trial" if a.role == "trial" else "test"
+                        body_lines.append("# Product: scalar Trial/Test × spatial-vector(scalar) → grad-tensor")
+                        body_lines.append(
+                            f"{res_var} = scalar_basis_times_vector_as_grad_tensor({a.var_name}, {b.var_name}, {self.dtype})"
+                        )
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(
+                            a, b, prefer="basis", strict=False
+                        )
+                        stack.append(
+                            StackItem(
+                                var_name=res_var,
+                                role=role,
+                                shape=(1, a.shape[1], self.spatial_dim),
+                                is_vector=False,
+                                is_gradient=True,
+                                field_names=field_names,
+                                parent_name=parent_name,
+                                side=side,
+                                field_sides=field_sides or [],
+                            )
+                        )
+                    elif (
+                        b.role in {"trial", "test"}
+                        and (not b.is_vector)
+                        and (not b.is_gradient and not b.is_hessian)
+                        and len(b.shape) == 2
+                        and b.shape[0] == 1
+                        and a.role in {"value", "const"}
+                        and a.is_vector
+                        and (not a.is_gradient and not a.is_hessian)
+                        and len(a.shape) == 1
+                        and a.shape[0] == self.spatial_dim
+                        and a.field_names
+                        and len(a.field_names) == 1
+                    ):
+                        role = "trial" if b.role == "trial" else "test"
+                        body_lines.append("# Product: spatial-vector(scalar) × scalar Trial/Test → grad-tensor")
+                        body_lines.append(
+                            f"{res_var} = scalar_basis_times_vector_as_grad_tensor({b.var_name}, {a.var_name}, {self.dtype})"
+                        )
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(
+                            a, b, prefer="basis", strict=False
+                        )
+                        stack.append(
+                            StackItem(
+                                var_name=res_var,
+                                role=role,
+                                shape=(1, b.shape[1], self.spatial_dim),
+                                is_vector=False,
+                                is_gradient=True,
+                                field_names=field_names,
+                                parent_name=parent_name,
+                                side=side,
+                                field_sides=field_sides or [],
+                            )
+                        )
+                    elif (
+                        a.role in {"trial", "test"}
+                        and not a.is_vector
+                        and not a.is_gradient
+                        and not a.is_hessian
+                        and a.shape[0] == 1
+                        and b.role in {"value", "const"}
+                        and b.is_vector
+                    ):
                         role = 'trial' if a.role == 'trial' else 'test'
                         body_lines.append("# Product: scalar Trial/Test × vector → vector Trial/Test")
                         body_lines.append(
@@ -3267,7 +3347,7 @@ class NumbaCodeGen:
                         )
 
                         stack.append(StackItem(var_name=res_var, role=role,
-                                            shape=(b.shape[0],a.shape[1]), is_vector=True, field_names=a.field_names,
+                                            shape=(b.shape[0], a.shape[1]), is_vector=True, field_names=a.field_names,
                                             parent_name=a.parent_name, side=a.side, field_sides=a.field_sides))
                     elif (b.role in {"trial", "test"} and not b.is_vector and not b.is_gradient and not b.is_hessian and b.shape[0] == 1
                           and a.role in {"value", "const"} and a.is_vector):
@@ -3796,12 +3876,13 @@ from pycutfem.jit.numba_helpers import (
     dot_grad_basis_with_grad_value,
     dot_grad_value_with_grad_basis,
     basis_dot_const_vector,
-    const_vector_dot_basis,
-    const_vector_dot_basis_1d,
-    scalar_basis_times_vector,
-    matrix_times_scalar_basis,
-    scalar_vector_outer_product,
-    vector_vector_outer_product,
+        const_vector_dot_basis,
+        const_vector_dot_basis_1d,
+        scalar_basis_times_vector,
+        scalar_basis_times_vector_as_grad_tensor,
+        matrix_times_scalar_basis,
+        scalar_vector_outer_product,
+        vector_vector_outer_product,
     scalar_trial_times_grad_test,
     grad_trial_times_scalar_test,
     scale_mixed_basis_with_coeffs,

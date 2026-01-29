@@ -1,7 +1,9 @@
 import argparse
 import math
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
@@ -71,6 +73,7 @@ def _run_one(
     kappa_inv: float,
     D_phi: float,
     gamma_phi: float,
+    gamma_u: float,
     D_alpha: float,
     k_det: float,
     eta_n: float,
@@ -205,6 +208,7 @@ def _run_one(
         lambda_s=Constant(1.0),
         D_phi=float(D_phi),
         gamma_phi=float(gamma_phi),
+        gamma_u=float(gamma_u),
         D_alpha=float(D_alpha),
         D_S=0.0,
         mu_max=0.0,
@@ -320,6 +324,8 @@ def main() -> None:
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
     ap.add_argument("--newton-tol", type=float, default=1.0e-10)
     ap.add_argument("--max-it", type=int, default=30)
+    ap.add_argument("--convergence", action="store_true", help="Save log-log convergence plot as a PNG.")
+    ap.add_argument("--outdir", type=str, default="comparison_outputs", help="Directory for saving CSV/LaTeX tables (and plots).")
 
     # MMS parameters
     ap.add_argument("--h0", type=float, default=0.4)
@@ -337,6 +343,21 @@ def main() -> None:
     ap.add_argument("--kappa-inv", type=float, default=10.0)
     ap.add_argument("--D-phi", type=float, default=0.1)
     ap.add_argument("--gamma-phi", type=float, default=1.0)
+    ap.add_argument(
+        "--gamma-u",
+        type=float,
+        default=None,
+        help=(
+            "Extension penalty for skeleton displacement in the free-fluid region (stabilizes u as alpha->0). "
+            "If omitted, uses a mesh-scaled default gamma_u = gamma_u_factor / h^2."
+        ),
+    )
+    ap.add_argument(
+        "--gamma-u-factor",
+        type=float,
+        default=1.0,
+        help="Factor for the mesh-scaled default gamma_u = gamma_u_factor / h^2 (used when --gamma-u is omitted).",
+    )
     ap.add_argument("--D-alpha", type=float, default=0.1)
     ap.add_argument("--k-det", type=float, default=0.2)
     ap.add_argument("--eta-n", type=float, default=1.0e-12)
@@ -350,6 +371,7 @@ def main() -> None:
     for nx in nx_list:
         h = 1.0 / float(nx)
         eps = float(args.eps) if args.eps is not None else float(args.eps_factor) * h
+        gamma_u = float(args.gamma_u) if args.gamma_u is not None else float(args.gamma_u_factor) / (h * h)
         rows.append(
             _run_one(
                 nx=nx,
@@ -373,6 +395,7 @@ def main() -> None:
                 kappa_inv=float(args.kappa_inv),
                 D_phi=float(args.D_phi),
                 gamma_phi=float(args.gamma_phi),
+                gamma_u=float(gamma_u),
                 D_alpha=float(args.D_alpha),
                 k_det=float(args.k_det),
                 eta_n=float(args.eta_n),
@@ -380,22 +403,87 @@ def main() -> None:
         )
 
     print(f"\nMoving-interface MMS convergence | backend={args.backend} | dt={float(args.dt):g} | nsteps={int(args.nsteps)}")
-    print(f"{'h':>10}  {'e_v(max)':>12} {'eoc':>6}  {'e_v(L2t)':>12} {'eoc':>6}  {'e_alpha(L2t)':>12} {'eoc':>6}")
+
+    recs: list[dict] = []
     for i, r in enumerate(rows):
-        if i == 0:
-            eoc_vmax = eoc_vl2t = eoc_al2t = float("nan")
-        else:
-            prev = rows[i - 1]
-            eoc_vmax = _eoc(prev["h"], r["h"], prev["ev_max"], r["ev_max"])
-            eoc_vl2t = _eoc(prev["h"], r["h"], prev["ev_l2t"], r["ev_l2t"])
-            eoc_al2t = _eoc(prev["h"], r["h"], prev["ealpha_l2t"], r["ealpha_l2t"])
+        prev = rows[i - 1] if i > 0 else None
+        recs.append(
+            {
+                "nx": int(r["nx"]),
+                "h": float(r["h"]),
+                "eps": float(r["eps"]),
+                "ev_max": float(r["ev_max"]),
+                "eoc_ev_max": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["ev_max"], r["ev_max"]),
+                "ev_l2t": float(r["ev_l2t"]),
+                "eoc_ev_l2t": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["ev_l2t"], r["ev_l2t"]),
+                "ephi_max": float(r["ephi_max"]),
+                "eoc_ephi_max": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["ephi_max"], r["ephi_max"]),
+                "ephi_l2t": float(r["ephi_l2t"]),
+                "eoc_ephi_l2t": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["ephi_l2t"], r["ephi_l2t"]),
+                "ealpha_max": float(r["ealpha_max"]),
+                "eoc_ealpha_max": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["ealpha_max"], r["ealpha_max"]),
+                "ealpha_l2t": float(r["ealpha_l2t"]),
+                "eoc_ealpha_l2t": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["ealpha_l2t"], r["ealpha_l2t"]),
+            }
+        )
 
-        def _fmt(val: float) -> str:
-            return "   - " if not np.isfinite(val) else f"{val:6.2f}"
+    df = pd.DataFrame.from_records(recs)
+    print("\nConvergence table (pandas):")
+    with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 160):
+        print(df)
 
-        print(f"{r['h']:10.3e}  {r['ev_max']:12.3e} {_fmt(eoc_vmax)}  {r['ev_l2t']:12.3e} {_fmt(eoc_vl2t)}  {r['ealpha_l2t']:12.3e} {_fmt(eoc_al2t)}")
+    latex = df.to_latex(index=False, float_format="%.3e", na_rep="-")
+    print("\nLaTeX table (copy/paste):\n")
+    print(latex)
+
+    outdir = Path(str(args.outdir))
+    outdir.mkdir(parents=True, exist_ok=True)
+    stem = f"biofilm_mms_moving_interface_backend={args.backend}_dt={float(args.dt):g}_nsteps={int(args.nsteps)}"
+    out_csv = outdir / f"{stem}.csv"
+    out_tex = outdir / f"{stem}.tex"
+    df.to_csv(out_csv, index=False)
+    out_tex.write_text(latex, encoding="utf-8")
+    print(f"\nSaved: {out_csv}")
+    print(f"Saved: {out_tex}")
+
+    if bool(args.convergence):
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] --convergence requested but matplotlib is unavailable: {exc}")
+            return
+
+        hs = np.asarray([r["h"] for r in rows], dtype=float)
+        y_vmax = np.asarray([r["ev_max"] for r in rows], dtype=float)
+        y_vl2t = np.asarray([r["ev_l2t"] for r in rows], dtype=float)
+        y_al2t = np.asarray([r["ealpha_l2t"] for r in rows], dtype=float)
+
+        fig, ax = plt.subplots(figsize=(7.0, 5.0), constrained_layout=True)
+
+        def _label(name: str, vals: np.ndarray) -> str:
+            if hs.size >= 2 and np.all(vals > 0.0):
+                slope = float(np.polyfit(np.log(hs), np.log(vals), 1)[0])
+                return f"{name} (p≈{slope:.2f})"
+            return name
+
+        ax.loglog(hs, y_vmax, marker="o", linewidth=1.5, label=_label("e_v(max)", y_vmax))
+        ax.loglog(hs, y_vl2t, marker="o", linewidth=1.5, label=_label("e_v(L2t)", y_vl2t))
+        ax.loglog(hs, y_al2t, marker="o", linewidth=1.5, label=_label("e_alpha(L2t)", y_al2t))
+
+        ax.set_xlabel("h")
+        ax.set_ylabel("Error")
+        ax.grid(True, which="both", linestyle=":", linewidth=0.7)
+        ax.legend(loc="best", fontsize=9)
+        ax.set_title(f"Moving-interface MMS convergence (backend={args.backend}, dt={float(args.dt):g}, nsteps={int(args.nsteps)})")
+
+        out = outdir / f"{stem}.png"
+        fig.savefig(out, dpi=180)
+        plt.close(fig)
+        print(f"\nSaved convergence plot to {out}")
 
 
 if __name__ == "__main__":
     main()
-
