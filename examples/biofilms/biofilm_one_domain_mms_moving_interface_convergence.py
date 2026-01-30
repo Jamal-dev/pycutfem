@@ -100,6 +100,7 @@ def _run_one(
             "phi": 1,
             "alpha": 1,
             "S": 1,
+            "X": 1,
         },
     )
     dh = DofHandler(me, method="cg")
@@ -113,6 +114,7 @@ def _run_one(
     dphi = TrialFunction("phi", dof_handler=dh)
     dalpha = TrialFunction("alpha", dof_handler=dh)
     dS = TrialFunction("S", dof_handler=dh)
+    dX = TrialFunction("X", dof_handler=dh)
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
@@ -120,6 +122,7 @@ def _run_one(
     phi_test = TestFunction("phi", dof_handler=dh)
     alpha_test = TestFunction("alpha", dof_handler=dh)
     S_test = TestFunction("S", dof_handler=dh)
+    X_test = TestFunction("X", dof_handler=dh)
 
     v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
@@ -127,6 +130,7 @@ def _run_one(
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
     S_k = Function("S_k", "S", dof_handler=dh)
+    X_k = Function("X_k", "X", dof_handler=dh)
 
     v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
     p_n = Function("p_n", "p", dof_handler=dh)
@@ -134,6 +138,7 @@ def _run_one(
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
     S_n = Function("S_n", "S", dof_handler=dh)
+    X_n = Function("X_n", "X", dof_handler=dh)
 
     mms = BiofilmMovingInterfaceMMS(
         h0=float(h0),
@@ -162,6 +167,7 @@ def _run_one(
     phi_n.set_values_from_function(lambda x, y: float(mms.phi(x, y, t0)))
     alpha_n.set_values_from_function(lambda x, y: float(mms.alpha(x, y, t0)))
     S_n.set_values_from_function(lambda x, y: float(mms.S(x, y, t0)))
+    X_n.set_values_from_function(lambda x, y: float(mms.X(x, y, t0)))
 
     dt_c = Constant(float(dt_val))
 
@@ -172,6 +178,7 @@ def _run_one(
     f_alpha = Analytic(lambda x, y: mms.f_alpha(x, y), degree=8)
     f_S = Analytic(lambda x, y: mms.f_S(x, y), degree=6)
     D_det_prev = Analytic(lambda x, y: mms.D_det_prev(x, y), degree=8)
+    f_X = Analytic(lambda x, y: mms.f_X(x, y), degree=8)
 
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
@@ -180,24 +187,28 @@ def _run_one(
         phi_k=phi_k,
         alpha_k=alpha_k,
         S_k=S_k,
+        X_k=X_k,
         v_n=v_n,
         p_n=p_n,
         u_n=u_n,
         phi_n=phi_n,
         alpha_n=alpha_n,
         S_n=S_n,
+        X_n=X_n,
         dv=dv,
         dp=dp,
         du=du,
         dphi=dphi,
         dalpha=dalpha,
         dS=dS,
+        dX=dX,
         v_test=v_test,
         q_test=q_test,
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,
         S_test=S_test,
+        X_test=X_test,
         dx=dx(metadata={"q": int(qdeg)}),
         dt=dt_c,
         theta=theta,
@@ -211,6 +222,7 @@ def _run_one(
         gamma_u=float(gamma_u),
         D_alpha=float(D_alpha),
         D_S=0.0,
+        D_X=0.1,
         mu_max=0.0,
         K_S=1.0,
         k_g=0.0,
@@ -223,6 +235,7 @@ def _run_one(
         f_phi=f_phi,
         f_alpha=f_alpha,
         f_S=f_S,
+        f_X=f_X,
         D_det_prev=D_det_prev,
     )
 
@@ -238,6 +251,7 @@ def _run_one(
                 BoundaryCondition("phi", "dirichlet", tag, _as_float_time(mms.phi)),
                 BoundaryCondition("alpha", "dirichlet", tag, _as_float_time(mms.alpha)),
                 BoundaryCondition("S", "dirichlet", tag, _as_float_time(mms.S)),
+                BoundaryCondition("X", "dirichlet", tag, _as_float_time(mms.X)),
             ]
         )
     bcs_homog = [BoundaryCondition(b.field, b.method, b.domain_tag, (lambda x, y: 0.0)) for b in bcs]
@@ -267,7 +281,9 @@ def _run_one(
         err_alpha = dh.l2_error(
             alpha_k, exact={"alpha": lambda x, y: mms.alpha(x, y, t_err)}, fields=["alpha"], quad_order=int(qerr), relative=False
         )
+        err_X = dh.l2_error(X_k, exact={"X": lambda x, y: mms.X(x, y, t_err)}, fields=["X"], quad_order=int(qerr), relative=False)
         step_rows.append({"dt": float(solver._current_dt), "err_v": float(err_v), "err_phi": float(err_phi), "err_alpha": float(err_alpha)})
+        step_rows[-1]["err_X"] = float(err_X)
 
     solver = NewtonSolver(
         forms.residual_form,
@@ -285,8 +301,8 @@ def _run_one(
     solver_ref["solver"] = solver
 
     solver.solve_time_interval(
-        functions=[v_k, p_k, u_k, phi_k, alpha_k, S_k],
-        prev_functions=[v_n, p_n, u_n, phi_n, alpha_n, S_n],
+        functions=[v_k, p_k, u_k, phi_k, alpha_k, S_k, X_k],
+        prev_functions=[v_n, p_n, u_n, phi_n, alpha_n, S_n, X_n],
         aux_functions={"dt": dt_c},
         time_params=TimeStepperParameters(dt=float(dt_val), final_time=float(nsteps) * float(dt_val), max_steps=int(nsteps), theta=theta, t0=t0),
     )
@@ -311,6 +327,8 @@ def _run_one(
         "ephi_l2t": _agg_l2("err_phi"),
         "ealpha_max": _agg_max("err_alpha"),
         "ealpha_l2t": _agg_l2("err_alpha"),
+        "eX_max": _agg_max("err_X"),
+        "eX_l2t": _agg_l2("err_X"),
     }
 
 
@@ -424,6 +442,10 @@ def main() -> None:
                 "eoc_ealpha_max": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["ealpha_max"], r["ealpha_max"]),
                 "ealpha_l2t": float(r["ealpha_l2t"]),
                 "eoc_ealpha_l2t": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["ealpha_l2t"], r["ealpha_l2t"]),
+                "eX_max": float(r["eX_max"]),
+                "eoc_eX_max": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["eX_max"], r["eX_max"]),
+                "eX_l2t": float(r["eX_l2t"]),
+                "eoc_eX_l2t": float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["eX_l2t"], r["eX_l2t"]),
             }
         )
 
@@ -460,6 +482,7 @@ def main() -> None:
         y_vmax = np.asarray([r["ev_max"] for r in rows], dtype=float)
         y_vl2t = np.asarray([r["ev_l2t"] for r in rows], dtype=float)
         y_al2t = np.asarray([r["ealpha_l2t"] for r in rows], dtype=float)
+        y_Xl2t = np.asarray([r["eX_l2t"] for r in rows], dtype=float)
 
         fig, ax = plt.subplots(figsize=(7.0, 5.0), constrained_layout=True)
 
@@ -472,6 +495,7 @@ def main() -> None:
         ax.loglog(hs, y_vmax, marker="o", linewidth=1.5, label=_label("e_v(max)", y_vmax))
         ax.loglog(hs, y_vl2t, marker="o", linewidth=1.5, label=_label("e_v(L2t)", y_vl2t))
         ax.loglog(hs, y_al2t, marker="o", linewidth=1.5, label=_label("e_alpha(L2t)", y_al2t))
+        ax.loglog(hs, y_Xl2t, marker="o", linewidth=1.5, label=_label("e_X(L2t)", y_Xl2t))
 
         ax.set_xlabel("h")
         ax.set_ylabel("Error")

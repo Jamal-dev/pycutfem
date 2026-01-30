@@ -119,12 +119,18 @@ def _Pi_over_rho_s(S, phi, alpha, *, mu_max, K_S, k_d):
 
 
 def _R_S_consumption(S, phi, alpha, *, mu_max, K_S, k_d, Y):
-    # R_S = (1/Y) Π_b/ρ_s* (default) (positive sink in the strong form).
+    # R_S = (1/Y) Π_b/ρ_s*  (sink in the strong form) where Π_b/ρ_s* has units [1/s].
     #
-    # Unit note:
-    # - If Π_b is a *mass* source [kg/(m^3 s)] and ρ_s* is an intrinsic solid density [kg/m^3],
-    #   then Π_b/ρ_s* has units [1/s]. This matches a substrate variable S that is normalized
-    #   by ρ_s* (dimensionless). For a *mass concentration* substrate, use R_S = Π_b/Y instead.
+    # Unit convention used by the default implementation:
+    # - `_Pi_over_rho_s` returns Π_b/ρ_s* with units [1/s] if (mu_max,k_d) are rates [1/s].
+    # - If the substrate variable S is normalized by ρ_s* (dimensionless), then R_S above
+    #   is consistent.
+    #
+    # If instead S is a *mass concentration* [kg/m^3], then the physical sink is
+    #   R_S = Π_b / Y = (ρ_s* / Y) (Π_b/ρ_s*).
+    #
+    # This scaling is handled in `build_biofilm_one_domain_forms` via the `rho_s_star`
+    # parameter.
     return (_c(1.0) / Y) * _Pi_over_rho_s(S, phi, alpha, mu_max=mu_max, K_S=K_S, k_d=k_d)
 
 
@@ -132,19 +138,25 @@ def _detachment_from_shear_prev(
     *,
     v_prev,
     alpha_prev,
-    mu_f,
+    mu_prev,
     k_det,
     eta_n: float = 1.0e-12,
     dim: int = 2,
 ):
     """
-    Build a *lagged* detachment rate D(τ) from the previous-step velocity.
+    Build a *lagged* detachment rate D_det from previous-step fields.
 
-    We deliberately use a simple shear proxy that is robust in the current UFL/assembler
-    stack (no division by |∇α|). D is treated as a known coefficient in the Newton step,
-    so the Jacobian remains consistent.
+    This model uses a *rate coefficient* D_det that is treated as known in the Newton step.
+    Detachment is then localized to the diffuse interface via a smooth delta δ(α) (handled
+    in the α and X equations).
+
+    Implementation note: while an interface-traction model can be written in terms of
+    n = ∇α/||∇α|| and tangential projections, the current pycutfem UFL/compiler stack
+    does not robustly support the required tensor products for gradients in all backends.
+    We therefore use a simple, robust shear proxy:
+        τ ≈ ||ε(v_prev)||_F
+        D_det = k_det * sqrt( τ^2 + η )
     """
-    # τ ≈ ||ε(v_prev)|| (Frobenius)
     tau2 = inner(_epsilon(v_prev), _epsilon(v_prev))
     tau = _sqrt(tau2 + _c(float(eta_n)))
     return k_det * tau
@@ -167,6 +179,8 @@ class BiofilmOneDomainForms:
     a_phi: object | None = None
     a_alpha: object | None = None
     a_substrate: object | None = None
+    r_detached: object | None = None
+    a_detached: object | None = None
 
 
 def build_biofilm_one_domain_forms(
@@ -178,6 +192,8 @@ def build_biofilm_one_domain_forms(
     phi_k,
     alpha_k,
     S_k,
+    # optional: detached-biomass concentration at t_{n+1}
+    X_k=None,
     # unknowns at t_n
     v_n,
     p_n,
@@ -185,6 +201,8 @@ def build_biofilm_one_domain_forms(
     phi_n,
     alpha_n,
     S_n,
+    # optional: detached-biomass concentration at t_n
+    X_n=None,
     # optional u_{n-1} (for θ terms with vS_n)
     u_nm1=None,
     # Newton increments
@@ -194,6 +212,7 @@ def build_biofilm_one_domain_forms(
     dphi,
     dalpha,
     dS,
+    dX=None,
     # test functions
     v_test,
     q_test,
@@ -201,6 +220,7 @@ def build_biofilm_one_domain_forms(
     phi_test,
     alpha_test,
     S_test,
+    X_test=None,
     # measure
     dx,
     # time integration
@@ -226,12 +246,14 @@ def build_biofilm_one_domain_forms(
     gamma_u: float = 0.0,
     D_alpha: float = 0.0,
     D_S: float = 0.0,
+    D_X: float = 0.0,
     # growth / detachment parameters
     mu_max: float = 0.0,
     K_S: float = 1.0,
     k_g: float = 0.0,
     k_d: float = 0.0,
     Y: float = 1.0,
+    rho_s_star: float = 1.0,
     k_det: float = 0.0,
     # modelling toggles
     mu_b_model: str = "phi_mu",
@@ -243,6 +265,7 @@ def build_biofilm_one_domain_forms(
     f_phi=None,
     f_alpha=None,
     f_S=None,
+    f_X=None,
     # detachment rate override (if given, used instead of shear-based lagged rate)
     D_det_prev=None,
 ) -> BiofilmOneDomainForms:
@@ -282,6 +305,7 @@ def build_biofilm_one_domain_forms(
     f_phi = f_phi if f_phi is not None else zero_scalar
     f_alpha = f_alpha if f_alpha is not None else zero_scalar
     f_S = f_S if f_S is not None else zero_scalar
+    f_X = f_X if f_X is not None else zero_scalar
 
     # ------------------------------------------------------------------
     # Kinematics: skeleton velocity via backward Euler
@@ -369,45 +393,12 @@ def build_biofilm_one_domain_forms(
 
     # Detachment coefficient: lagged by default (depends on previous v/α)
     if D_det_prev is None:
-        D_det_prev = _detachment_from_shear_prev(v_prev=v_n, alpha_prev=alpha_n, mu_f=mu_f, k_det=_c(float(k_det)), dim=dim)
+        D_det_prev = _detachment_from_shear_prev(
+            v_prev=v_n, alpha_prev=alpha_n, mu_prev=mu_n, k_det=_c(float(k_det)), eta_n=1.0e-12, dim=dim
+        )
 
     # ------------------------------------------------------------------
-    # (i) Momentum: generalized Navier–Stokes–Brinkman
-    # ------------------------------------------------------------------
-    vdot = (v_k - v_n) * inv_dt
-
-    conv_k = dot(dot(grad(v_k), v_k), v_test)
-    conv_n = dot(dot(grad(v_n), v_n), v_test)
-
-    r_mom = inner(rho_k * vdot, v_test) * dx
-    r_mom += th * rho_k * conv_k * dx + one_m_th * rho_n * conv_n * dx
-    r_mom += _c(2.0) * th * mu_k * inner(_epsilon(v_k), _epsilon(v_test)) * dx
-    r_mom += _c(2.0) * one_m_th * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
-    r_mom += -p_k * div(v_test) * dx
-    if drag_mode == "scalar":
-        r_mom += beta_k * dot(v_k, v_test) * dx
-        r_mom += -beta_k * dot(vS_k, v_test) * dx
-    else:
-        r_mom += beta_coeff_k * dot(kdrag_k, v_test) * dx
-    r_mom += -dot(f_v, v_test) * dx
-
-    a_mom = rho_k * inv_dt * dot(dv, v_test) * dx
-    a_mom += drho * dot(vdot, v_test) * dx
-
-    a_mom += th * (drho * conv_k + rho_k * dot(dot(grad(dv), v_k), v_test) + rho_k * dot(dot(grad(v_k), dv), v_test)) * dx
-    a_mom += _c(2.0) * th * (dmu * inner(_epsilon(v_k), _epsilon(v_test)) + mu_k * inner(_epsilon(dv), _epsilon(v_test))) * dx
-
-    a_mom += -dp * div(v_test) * dx
-    if drag_mode == "scalar":
-        a_mom += dbeta * (dot(v_k, v_test) - dot(vS_k, v_test)) * dx
-        a_mom += beta_k * dot(dv, v_test) * dx
-        a_mom += -beta_k * dot(dvS, v_test) * dx
-    else:
-        a_mom += dbeta_coeff * dot(kdrag_k, v_test) * dx
-        a_mom += beta_coeff_k * dot(dkdrag_k, v_test) * dx
-
-    # ------------------------------------------------------------------
-    # (ii) Mass / volume constraint (expanded divergence)
+    # Shared helper quantities for conservative forms (expanded divergence)
     # ------------------------------------------------------------------
     # F_m = C v + B vS,  C=(1-α)+αφ,  B=α(1-φ)
     C_k = _capacity(alpha_k, phi_k)
@@ -432,10 +423,7 @@ def build_biofilm_one_domain_forms(
     divF_k = divCv_k + divBvS_k
     divF_n = divCv_n + divBvS_n
 
-    r_mass = q_test * (th * divF_k + one_m_th * divF_n - alpha_k * s_v) * dx
-
-    # Jacobian of divF_k (k-part only)
-    # δC = (φ-1) δα + α δφ
+    # Jacobian helpers for divCv_k and divBvS_k (k-part only)
     dC_k = (phi_k - _c(1.0)) * dalpha + alpha_k * dphi
     dB_k = _one_minus(phi_k) * dalpha - alpha_k * dphi
 
@@ -447,6 +435,53 @@ def build_biofilm_one_domain_forms(
     d_divCv_k = dC_k * div(v_k) + C_k * div(dv) + dot(dgradC_k, v_k) + dot(gradC_k, dv)
     d_divBvS_k = dB_k * div_vS_k + B_k * div_dvS + dot(dgradB_k, vS_k) + dot(gradB_k, dvS)
 
+    # ------------------------------------------------------------------
+    # (i) Momentum: conservative Navier–Stokes–Brinkman
+    # ------------------------------------------------------------------
+    momdot = (rho_k * v_k - rho_n * v_n) * inv_dt
+    conv_k = dot(dot(grad(v_k), v_k), v_test)
+    conv_n = dot(dot(grad(v_n), v_n), v_test)
+
+    # Conservative convection: div(ρ v⊗v) = ρ (v·∇)v + v div(ρ v), with ρ=ρ_f C.
+    div_rhov_k = rho_f * divCv_k
+    div_rhov_n = rho_f * divCv_n
+
+    r_mom = inner(momdot, v_test) * dx
+    r_mom += th * (rho_k * conv_k + div_rhov_k * dot(v_k, v_test)) * dx
+    r_mom += one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+    r_mom += _c(2.0) * th * mu_k * inner(_epsilon(v_k), _epsilon(v_test)) * dx
+    r_mom += _c(2.0) * one_m_th * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
+    r_mom += -p_k * div(v_test) * dx
+    if drag_mode == "scalar":
+        r_mom += beta_k * dot(v_k, v_test) * dx
+        r_mom += -beta_k * dot(vS_k, v_test) * dx
+    else:
+        r_mom += beta_coeff_k * dot(kdrag_k, v_test) * dx
+    r_mom += -dot(f_v, v_test) * dx
+
+    a_mom = inv_dt * (drho * dot(v_k, v_test) + rho_k * dot(dv, v_test)) * dx
+
+    a_mom += th * (drho * conv_k + rho_k * dot(dot(grad(dv), v_k), v_test) + rho_k * dot(dot(grad(v_k), dv), v_test)) * dx
+    # Jacobian of the conservative correction v div(ρ v)
+    a_mom += th * (rho_f * d_divCv_k * dot(v_k, v_test) + div_rhov_k * dot(dv, v_test)) * dx
+    a_mom += _c(2.0) * th * (dmu * inner(_epsilon(v_k), _epsilon(v_test)) + mu_k * inner(_epsilon(dv), _epsilon(v_test))) * dx
+
+    a_mom += -dp * div(v_test) * dx
+    if drag_mode == "scalar":
+        a_mom += dbeta * (dot(v_k, v_test) - dot(vS_k, v_test)) * dx
+        a_mom += beta_k * dot(dv, v_test) * dx
+        a_mom += -beta_k * dot(dvS, v_test) * dx
+    else:
+        a_mom += dbeta_coeff * dot(kdrag_k, v_test) * dx
+        a_mom += beta_coeff_k * dot(dkdrag_k, v_test) * dx
+
+    # ------------------------------------------------------------------
+    # (ii) Mass / volume constraint (expanded divergence)
+    # ------------------------------------------------------------------
+    r_mass = q_test * (th * divF_k + one_m_th * divF_n - alpha_k * s_v) * dx
+
+    # Jacobian of divF_k (k-part only)
+    # δC = (φ-1) δα + α δφ
     a_mass = q_test * th * (d_divCv_k + d_divBvS_k - dalpha * s_v) * dx
 
     # ------------------------------------------------------------------
@@ -595,8 +630,13 @@ def build_biofilm_one_domain_forms(
     G_n = _G(S_n, phi_n, k_g=_c(float(k_g)), mu_max=_c(float(mu_max)), K_S=_c(float(K_S)))
 
     f_alpha_k = (alpha_k - alpha_n) * inv_dt
-    f_alpha_k += th * (dot(grad(alpha_k), vS_k) - G_k * alpha_k * _one_minus(alpha_k) + D_det_prev * alpha_k)
-    f_alpha_k += one_m_th * (dot(grad(alpha_n), vS_n) - G_n * alpha_n * _one_minus(alpha_n) + D_det_prev * alpha_n)
+    # Surface-localized detachment sink: D_det_prev * δ(α), where δ is a smooth interface delta.
+    # We use δ(α) = 4 α (1-α), which is supported robustly by the current UFL/compiler stack.
+    delta_k = _c(4.0) * alpha_k * _one_minus(alpha_k)
+    delta_n = _c(4.0) * alpha_n * _one_minus(alpha_n)
+
+    f_alpha_k += th * (dot(grad(alpha_k), vS_k) - G_k * alpha_k * _one_minus(alpha_k) - D_det_prev * delta_k)
+    f_alpha_k += one_m_th * (dot(grad(alpha_n), vS_n) - G_n * alpha_n * _one_minus(alpha_n) - D_det_prev * delta_n)
 
     r_alpha = alpha_test * f_alpha_k * dx
     r_alpha += D_alpha_c * inner(grad(alpha_k), grad(alpha_test)) * dx
@@ -610,7 +650,9 @@ def build_biofilm_one_domain_forms(
 
     a_alpha = alpha_test * (dalpha * inv_dt) * dx
     a_alpha += alpha_test * th * (dot(grad(alpha_k), dvS) + dot(grad(dalpha), vS_k)) * dx
-    a_alpha += alpha_test * th * (-(dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic) + D_det_prev * dalpha) * dx
+    # δ[ D_det_prev * 4 α(1-α) ] = D_det_prev * 4 (1-2α) δα  (D_det_prev is lagged).
+    d_det = -D_det_prev * (_c(4.0) * (_one_minus(_c(2.0) * alpha_k)) * dalpha)
+    a_alpha += alpha_test * th * (-(dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic) + d_det) * dx
     a_alpha += D_alpha_c * inner(grad(dalpha), grad(alpha_test)) * dx
 
     # ------------------------------------------------------------------
@@ -626,8 +668,17 @@ def build_biofilm_one_domain_forms(
     # implementation cannot handle scalar-test gradients with vector trials.
     # We instead expand div(CS v) = CS div(v) + ∇(CS)·v and use
     # ∇(CS) = S ∇C + C ∇S.
-    RS_k = _R_S_consumption(S_k, phi_k, alpha_k, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)), Y=_c(float(Y)))
-    RS_n = _R_S_consumption(S_n, phi_n, alpha_n, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)), Y=_c(float(Y)))
+    # Substrate sink R_S:
+    # - With S normalized by ρ_s*: R_S = (1/Y) (Π_b/ρ_s*).
+    # - With S as mass concentration: multiply by ρ_s* (handled via rho_s_star).
+    rho_s_star_c = _c(float(rho_s_star))
+    Y_c = _c(float(Y))
+    RS_k = rho_s_star_c * _R_S_consumption(
+        S_k, phi_k, alpha_k, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)), Y=Y_c
+    )
+    RS_n = rho_s_star_c * _R_S_consumption(
+        S_n, phi_n, alpha_n, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)), Y=Y_c
+    )
 
     div_CSv_k = CSk * div(v_k) + S_k * dot(gradC_k, v_k) + C_k * dot(grad(S_k), v_k)
     div_CSv_n = CSn * div(v_n) + S_n * dot(gradC_n, v_n) + C_n * dot(grad(S_n), v_n)
@@ -640,7 +691,7 @@ def build_biofilm_one_domain_forms(
 
     # Jacobian (k-part only)
     dCSk = dC * S_k + _capacity(alpha_k, phi_k) * dS
-    dRS = (_c(1.0) / _c(float(Y))) * dPi  # RS = (1/Y) (Π_b/ρ_s*)  (see unit note in _R_S_consumption)
+    dRS = rho_s_star_c * ((_c(1.0) / Y_c) * dPi)  # RS = (rho_s_star/Y) (Π_b/ρ_s*)
 
     d_div_CSv_k = dCSk * div(v_k) + CSk * div(dv)
     d_div_CSv_k += dS * dot(gradC_k, v_k) + S_k * dot(dgradC_k, v_k) + S_k * dot(gradC_k, dv)
@@ -652,8 +703,55 @@ def build_biofilm_one_domain_forms(
     a_sub += S_test * th * dRS * dx
 
     # ------------------------------------------------------------------
+    # (vii) Detached biomass transport (optional)
+    # ------------------------------------------------------------------
+    r_detached = None
+    a_detached = None
+    if X_k is not None:
+        if X_n is None or dX is None or X_test is None:
+            raise ValueError("X_k provided but one of (X_n, dX, X_test) is missing.")
+
+        D_X_c = _c(float(D_X))
+
+        CXk = C_k * X_k
+        CXn = C_n * X_n
+
+        div_CXv_k = CXk * div(v_k) + X_k * dot(gradC_k, v_k) + C_k * dot(grad(X_k), v_k)
+        div_CXv_n = CXn * div(v_n) + X_n * dot(gradC_n, v_n) + C_n * dot(grad(X_n), v_n)
+
+        # Source from detachment: R_det = ρ_s* (1-φ) D_det_prev δ(α).
+        R_det_k = rho_s_star_c * _one_minus(phi_k) * D_det_prev * delta_k
+        R_det_n = rho_s_star_c * _one_minus(phi_n) * D_det_prev * delta_n
+
+        r_detached = X_test * ((CXk - CXn) * inv_dt) * dx
+        r_detached += X_test * (th * div_CXv_k + one_m_th * div_CXv_n) * dx
+        r_detached += D_X_c * th * inner(grad(X_k), grad(X_test)) * dx + D_X_c * one_m_th * inner(grad(X_n), grad(X_test)) * dx
+        r_detached += -X_test * (th * R_det_k + one_m_th * R_det_n) * dx
+        r_detached += -X_test * f_X * dx
+
+        # Jacobian (k-part only)
+        dCXk = dC * X_k + C_k * dX
+
+        d_div_CXv_k = dCXk * div(v_k) + CXk * div(dv)
+        d_div_CXv_k += dX * dot(gradC_k, v_k) + X_k * dot(dgradC_k, v_k) + X_k * dot(gradC_k, dv)
+        d_div_CXv_k += dC * dot(grad(X_k), v_k) + C_k * dot(grad(dX), v_k) + C_k * dot(grad(X_k), dv)
+
+        # δR_det_k (D_det_prev is lagged): ρ_s* D_det_prev [ -(δφ) δ(α) + (1-φ) δδ(α) ].
+        d_delta_k = _c(4.0) * (_one_minus(_c(2.0) * alpha_k)) * dalpha
+        dR_det_k = rho_s_star_c * D_det_prev * ((-dphi) * delta_k + _one_minus(phi_k) * d_delta_k)
+
+        a_detached = X_test * (dCXk * inv_dt) * dx
+        a_detached += X_test * th * d_div_CXv_k * dx
+        a_detached += D_X_c * th * inner(grad(dX), grad(X_test)) * dx
+        a_detached += -X_test * th * dR_det_k * dx
+
+    # ------------------------------------------------------------------
     residual_form = r_mom + r_mass + r_skeleton + r_phi + r_alpha + r_sub
     jacobian_form = a_mom + a_mass + a_skel + a_phi + a_alpha + a_sub
+    if r_detached is not None:
+        residual_form += r_detached
+    if a_detached is not None:
+        jacobian_form += a_detached
 
     return BiofilmOneDomainForms(
         jacobian_form=jacobian_form,
@@ -670,4 +768,6 @@ def build_biofilm_one_domain_forms(
         a_phi=a_phi,
         a_alpha=a_alpha,
         a_substrate=a_sub,
+        r_detached=r_detached,
+        a_detached=a_detached,
     )

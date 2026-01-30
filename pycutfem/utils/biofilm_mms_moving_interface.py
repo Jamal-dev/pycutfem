@@ -14,6 +14,7 @@ The purpose is to exercise:
   - alpha/phi dependence of rho, mu, beta
   - Brinkman drag (beta v) and the skeleton drag forcing
   - diffusion/penalty terms in alpha/phi
+  - detached-mass transport (X) driven by surface detachment
   - a time-dependent moving interface ("detachment-like")
 
 Important notes
@@ -73,10 +74,14 @@ class BiofilmMovingInterfaceMMS:
     D_phi: float = 0.1
     gamma_phi: float = 1.0
     D_alpha: float = 0.1
+    D_X: float = 0.1
 
     # Lagged detachment rate: D_det_prev = k_det * sqrt(||eps(v_n)||^2 + eta_n)
     k_det: float = 0.2
     eta_n: float = 1.0e-12
+
+    # Detached biomass scaling (intrinsic solid density)
+    rho_s_star: float = 1.0
 
     # Step state (updated by the time-step driver)
     t_n: float = 0.0
@@ -121,6 +126,12 @@ class BiofilmMovingInterfaceMMS:
 
     def S(self, x, y, t: float):
         return np.full_like(_asarray(y), float(self.S0), dtype=float)
+
+    def X(self, x, y, t: float):
+        """Detached biomass concentration (chosen smooth MMS field)."""
+        yv = _asarray(y)
+        amp = 1.0 + 0.2 * np.sin(float(self.omega) * float(t))
+        return 0.1 + 0.05 * np.sin(np.pi * yv) * amp
 
     # ------------------------------------------------------------------
     # Helpers: alpha derivatives (only y-dependence)
@@ -175,9 +186,13 @@ class BiofilmMovingInterfaceMMS:
 
         # Coefficients at k (phi_mu choice ⇒ mu = mu_f*C)
         alpha_k = self.alpha(x, y, t_k)
+        alpha_n = self.alpha(x, y, t_n)
         phi_k = 1.0 - (1.0 - float(self.phi_b)) * alpha_k
+        phi_n = 1.0 - (1.0 - float(self.phi_b)) * alpha_n
         C_k = self._capacity_from_alpha(alpha_k)
+        C_n = self._capacity_from_alpha(alpha_n)
         rho_k = float(self.rho_f) * C_k
+        rho_n = float(self.rho_f) * C_n
         mu_k = float(self.mu_f) * C_k
 
         # Variable-viscosity divergence term: -∂_y( mu * ∂_y vx )
@@ -193,8 +208,9 @@ class BiofilmMovingInterfaceMMS:
         beta_k = alpha_k * float(self.mu_f) * (phi_k * phi_k) * float(self.kappa_inv)
         drag_x = beta_k * vx_k
 
-        vdot_x = (vx_k - vx_n) / dt
-        fvx = rho_k * vdot_x + visc_x + drag_x
+        # Conservative-in-time momentum: (rho_k v_k - rho_n v_n)/dt.
+        vdot_mom_x = (rho_k * vx_k - rho_n * vx_n) / dt
+        fvx = vdot_mom_x + visc_x + drag_x
         fvy = np.zeros_like(fvx)
         return np.stack((fvx, fvy), axis=-1)
 
@@ -209,7 +225,9 @@ class BiofilmMovingInterfaceMMS:
         phi_k = 1.0 - (1.0 - float(self.phi_b)) * alpha_k
         beta_k = alpha_k * float(self.mu_f) * (phi_k * phi_k) * float(self.kappa_inv)
 
-        fux = -beta_k * vx_k
+        # Skeleton drag appears as -β(v-vS) in the weak form, while the forcing is weighted
+        # by α. For u=0 (vS=0), we therefore need α f_u = -β v  ⇒  f_u = -(β/α) v.
+        fux = -(beta_k / alpha_k) * vx_k
         fuy = np.zeros_like(fux)
         return np.stack((fux, fuy), axis=-1)
 
@@ -225,7 +243,8 @@ class BiofilmMovingInterfaceMMS:
         alpha_n = self.alpha(x, y, t_n)
         alpha_yy_k = self._alpha_yy_from_alpha(alpha_k)
 
-        return (alpha_k - alpha_n) / dt + self.D_det_prev(x, y) * alpha_k - float(self.D_alpha) * alpha_yy_k
+        delta_k = 4.0 * alpha_k * (1.0 - alpha_k)
+        return (alpha_k - alpha_n) / dt - self.D_det_prev(x, y) * delta_k - float(self.D_alpha) * alpha_yy_k
 
     def f_phi(self, x, y):
         """Porosity RHS f_phi for the current BE step (with vS=0 and Π_b=0)."""
@@ -261,3 +280,37 @@ class BiofilmMovingInterfaceMMS:
         C_n = self._capacity_from_alpha(alpha_n)
         return float(self.S0) * (C_k - C_n) / dt
 
+    def f_X(self, x, y):
+        """Detached biomass RHS f_X for the current BE step."""
+        dt = float(self.dt)
+        if dt <= 0.0:
+            raise ValueError("dt must be positive.")
+
+        yv = _asarray(y)
+        t_n = float(self.t_n)
+        t_k = float(self.t_k)
+
+        alpha_k = self.alpha(x, y, t_k)
+        alpha_n = self.alpha(x, y, t_n)
+        phi_k = self.phi(x, y, t_k)
+        phi_n = self.phi(x, y, t_n)
+
+        C_k = self._capacity_from_alpha(alpha_k)
+        C_n = self._capacity_from_alpha(alpha_n)
+
+        X_k = self.X(x, y, t_k)
+        X_n = self.X(x, y, t_n)
+
+        # With X=X(y,t) and v=(v_x(y,t),0), div(CX v)=0 (no x-dependence).
+        dCX_dt = (C_k * X_k - C_n * X_n) / dt
+
+        # Diffusion term: -D_X * d^2/dy^2 X_k
+        amp_k = 1.0 + 0.2 * np.sin(float(self.omega) * t_k)
+        X_yy_k = -0.05 * (np.pi**2) * np.sin(np.pi * yv) * amp_k
+        diff = -float(self.D_X) * X_yy_k
+
+        # Detachment-driven source (surface localized via delta(alpha)).
+        delta_k = 4.0 * alpha_k * (1.0 - alpha_k)
+        R_det_k = float(self.rho_s_star) * (1.0 - phi_k) * self.D_det_prev(x, y) * delta_k
+
+        return dCX_dt + diff - R_det_k

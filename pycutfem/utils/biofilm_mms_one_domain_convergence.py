@@ -39,6 +39,7 @@ class BiofilmOneDomainMMSConvergence:
     phi: callable  # (x,y,t)->(...)
     alpha: callable  # (x,y,t)->(...)
     S: callable  # (x,y,t)->(...)
+    X: callable  # (x,y,t)->(...)
 
     # Snapshots at t_n and t_k (x,y)->value
     v_n: callable
@@ -47,6 +48,7 @@ class BiofilmOneDomainMMSConvergence:
     phi_n: callable
     alpha_n: callable
     S_n: callable
+    X_n: callable
 
     v_k: callable
     p_k: callable
@@ -54,6 +56,7 @@ class BiofilmOneDomainMMSConvergence:
     phi_k: callable
     alpha_k: callable
     S_k: callable
+    X_k: callable
 
     # Forcing terms for the discrete step (x,y)->value
     f_v: callable  # (x,y)->(...,2)
@@ -62,6 +65,7 @@ class BiofilmOneDomainMMSConvergence:
     f_phi: callable  # (x,y)->(...)
     f_alpha: callable  # (x,y)->(...)
     f_S: callable  # (x,y)->(...)
+    f_X: callable  # (x,y)->(...)
 
     # Lagged detachment rate used in α-equation (x,y)->(...)
     D_det_prev: callable
@@ -152,11 +156,13 @@ def build_biofilm_one_domain_mms_trig_step(
     gamma_phi: float = 1.0,
     D_alpha: float = 0.1,
     D_S: float = 0.1,
+    D_X: float = 0.1,
     mu_max: float = 0.4,
     K_S: float = 0.3,
     k_g: float = 0.5,
     k_d: float = 0.1,
     Y: float = 0.8,
+    rho_s_star: float = 1.0,
     k_det: float = 0.2,
     eta_n: float = 1.0e-12,
 ) -> BiofilmOneDomainMMSConvergence:
@@ -200,6 +206,7 @@ def build_biofilm_one_domain_mms_trig_step(
     phi_expr = 0.7 + 0.1 * s * (1.0 + 0.2 * sp.cos(t))
     alpha_expr = 0.5 + 0.2 * s * (1.0 + 0.1 * sp.sin(t))
     S_expr = 0.4 + 0.1 * s * (1.0 + 0.2 * sp.cos(t))
+    X_expr = 0.1 + 0.05 * s * (1.0 + 0.2 * sp.sin(t))
 
     # Time-dependent lambdas
     v_t = _lambdify_vec_xyt(v_expr, x, y, t)
@@ -208,6 +215,7 @@ def build_biofilm_one_domain_mms_trig_step(
     phi_t = _lambdify_scalar_xyt(phi_expr, x, y, t)
     alpha_t = _lambdify_scalar_xyt(alpha_expr, x, y, t)
     S_t = _lambdify_scalar_xyt(S_expr, x, y, t)
+    X_t = _lambdify_scalar_xyt(X_expr, x, y, t)
 
     # Snapshots
     subs_n = {t: t_n}
@@ -233,6 +241,8 @@ def build_biofilm_one_domain_mms_trig_step(
 
     S_n_expr = S_expr.subs(subs_n)
     S_k_expr = S_expr.subs(subs_k)
+    X_n_expr = X_expr.subs(subs_n)
+    X_k_expr = X_expr.subs(subs_k)
 
     v_n = _lambdify_vec_xy(v_n_expr, x, y)
     v_k = _lambdify_vec_xy(v_k_expr, x, y)
@@ -246,6 +256,8 @@ def build_biofilm_one_domain_mms_trig_step(
     alpha_k = _lambdify_scalar_xy(alpha_k_expr, x, y)
     S_n = _lambdify_scalar_xy(S_n_expr, x, y)
     S_k = _lambdify_scalar_xy(S_k_expr, x, y)
+    X_n = _lambdify_scalar_xy(X_n_expr, x, y)
+    X_k = _lambdify_scalar_xy(X_k_expr, x, y)
 
     # ------------------------------------------------------------------
     # Derived quantities for the discrete step (vS via BE difference).
@@ -279,8 +291,8 @@ def build_biofilm_one_domain_mms_trig_step(
     G_k_expr = float(k_g) * mon_k_expr * (1.0 - phi_k_expr)
     G_n_expr = float(k_g) * mon_n_expr * (1.0 - phi_n_expr)
 
-    RS_k_expr = (1.0 / float(Y)) * Pi_k_expr
-    RS_n_expr = (1.0 / float(Y)) * Pi_n_expr
+    RS_k_expr = float(rho_s_star) * (1.0 / float(Y)) * Pi_k_expr
+    RS_n_expr = float(rho_s_star) * (1.0 / float(Y)) * Pi_n_expr
 
     # Lagged detachment from previous velocity v_n (consistent with the model's default).
     eps_vn = _sym_epsilon(v_n_expr, x, y)
@@ -290,16 +302,24 @@ def build_biofilm_one_domain_mms_trig_step(
     # ------------------------------------------------------------------
     # Momentum forcing
     # ------------------------------------------------------------------
-    vdot_expr = (v_k_expr - v_n_expr) / dt
+    # Conservative-in-time momentum: (rho_k v_k - rho_n v_n)/dt.
+    momdot_expr = (rho_k_expr * v_k_expr - rho_n_expr * v_n_expr) / dt
     conv_k_expr = _sym_grad_vec(v_k_expr, x, y) * v_k_expr
     conv_n_expr = _sym_grad_vec(v_n_expr, x, y) * v_n_expr
+
+    # Conservative convection correction: v div(rho v), with rho=rho_f*C.
+    divCv_k_expr = _sym_div_vec(C_k_expr * v_k_expr, x, y)
+    divCv_n_expr = _sym_div_vec(C_n_expr * v_n_expr, x, y)
+    div_rhov_k_expr = float(rho_f) * divCv_k_expr
+    div_rhov_n_expr = float(rho_f) * divCv_n_expr
 
     stress_k = mu_k_expr * (_sym_grad_vec(v_k_expr, x, y) + _sym_grad_vec(v_k_expr, x, y).T)
     stress_n = mu_n_expr * (_sym_grad_vec(v_n_expr, x, y) + _sym_grad_vec(v_n_expr, x, y).T)
     div_stress_mix = _sym_div_mat(th * stress_k + one_m_th * stress_n, x, y)
 
-    f_v_expr = rho_k_expr * vdot_expr
-    f_v_expr += th * rho_k_expr * conv_k_expr + one_m_th * rho_n_expr * conv_n_expr
+    f_v_expr = momdot_expr
+    f_v_expr += th * (rho_k_expr * conv_k_expr + div_rhov_k_expr * v_k_expr)
+    f_v_expr += one_m_th * (rho_n_expr * conv_n_expr + div_rhov_n_expr * v_n_expr)
     f_v_expr += -div_stress_mix
     f_v_expr += _sym_grad_scalar(p_k_expr, x, y)
     f_v_expr += beta_k_expr * (v_k_expr - vS_k_expr)
@@ -318,7 +338,7 @@ def build_biofilm_one_domain_mms_trig_step(
     s_v_expr = (th * divF_k + one_m_th * divF_n) / alpha_k_expr
 
     # ------------------------------------------------------------------
-    # Skeleton forcing: -(div(α σ)) - αβ(v-vS) = α f_u  (θ-averaged)
+    # Skeleton forcing: -(div(α σ)) - β(v-vS) = α f_u  (θ-averaged)
     # ------------------------------------------------------------------
     I = sp.eye(2)
 
@@ -332,8 +352,8 @@ def build_biofilm_one_domain_mms_trig_step(
     sigma_k = _stress_s(u_k_expr, p_k_expr, phi_k_expr)
     sigma_n = _stress_s(u_n_expr, p_n_expr, phi_n_expr)
 
-    op_u_k = -_sym_div_mat(alpha_k_expr * sigma_k, x, y) - alpha_k_expr * beta_k_expr * (v_k_expr - vS_k_expr)
-    op_u_n = -_sym_div_mat(alpha_n_expr * sigma_n, x, y) - alpha_n_expr * beta_n_expr * (v_n_expr - vS_n_expr)
+    op_u_k = -_sym_div_mat(alpha_k_expr * sigma_k, x, y) - beta_k_expr * (v_k_expr - vS_k_expr)
+    op_u_n = -_sym_div_mat(alpha_n_expr * sigma_n, x, y) - beta_n_expr * (v_n_expr - vS_n_expr)
     f_u_expr = (th * op_u_k + one_m_th * op_u_n) / alpha_k_expr
 
     # ------------------------------------------------------------------
@@ -349,8 +369,10 @@ def build_biofilm_one_domain_mms_trig_step(
     # ------------------------------------------------------------------
     # Indicator forcing (implicit diffusion at k)
     # ------------------------------------------------------------------
-    Fal_k = _sym_grad_scalar(alpha_k_expr, x, y).dot(vS_k_expr) - G_k_expr * alpha_k_expr * (1.0 - alpha_k_expr) + D_det_prev_expr * alpha_k_expr
-    Fal_n = _sym_grad_scalar(alpha_n_expr, x, y).dot(vS_n_expr) - G_n_expr * alpha_n_expr * (1.0 - alpha_n_expr) + D_det_prev_expr * alpha_n_expr
+    delta_k_expr = 4.0 * alpha_k_expr * (1.0 - alpha_k_expr)
+    delta_n_expr = 4.0 * alpha_n_expr * (1.0 - alpha_n_expr)
+    Fal_k = _sym_grad_scalar(alpha_k_expr, x, y).dot(vS_k_expr) - G_k_expr * alpha_k_expr * (1.0 - alpha_k_expr) - D_det_prev_expr * delta_k_expr
+    Fal_n = _sym_grad_scalar(alpha_n_expr, x, y).dot(vS_n_expr) - G_n_expr * alpha_n_expr * (1.0 - alpha_n_expr) - D_det_prev_expr * delta_n_expr
     f_alpha_expr = (alpha_k_expr - alpha_n_expr) / dt
     f_alpha_expr += th * Fal_k + one_m_th * Fal_n
     f_alpha_expr += -float(D_alpha) * _sym_laplacian(alpha_k_expr, x, y)
@@ -367,6 +389,22 @@ def build_biofilm_one_domain_mms_trig_step(
     f_S_expr += -float(D_S) * (th * _sym_laplacian(S_k_expr, x, y) + one_m_th * _sym_laplacian(S_n_expr, x, y))
     f_S_expr += th * RS_k_expr + one_m_th * RS_n_expr
 
+    # ------------------------------------------------------------------
+    # Detached biomass forcing (θ-averaged diffusion)
+    # ------------------------------------------------------------------
+    CX_k_expr = C_k_expr * X_k_expr
+    CX_n_expr = C_n_expr * X_n_expr
+    div_advX_k = _sym_div_vec(CX_k_expr * v_k_expr, x, y)
+    div_advX_n = _sym_div_vec(CX_n_expr * v_n_expr, x, y)
+
+    R_det_k_expr = float(rho_s_star) * (1.0 - phi_k_expr) * D_det_prev_expr * delta_k_expr
+    R_det_n_expr = float(rho_s_star) * (1.0 - phi_n_expr) * D_det_prev_expr * delta_n_expr
+
+    f_X_expr = (CX_k_expr - CX_n_expr) / dt
+    f_X_expr += th * div_advX_k + one_m_th * div_advX_n
+    f_X_expr += -float(D_X) * (th * _sym_laplacian(X_k_expr, x, y) + one_m_th * _sym_laplacian(X_n_expr, x, y))
+    f_X_expr += -(th * R_det_k_expr + one_m_th * R_det_n_expr)
+
     # Lambdify final forcing
     f_v = _lambdify_vec_xy(f_v_expr, x, y)
     f_u = _lambdify_vec_xy(f_u_expr, x, y)
@@ -374,6 +412,7 @@ def build_biofilm_one_domain_mms_trig_step(
     f_phi = _lambdify_scalar_xy(f_phi_expr, x, y)
     f_alpha = _lambdify_scalar_xy(f_alpha_expr, x, y)
     f_S = _lambdify_scalar_xy(f_S_expr, x, y)
+    f_X = _lambdify_scalar_xy(f_X_expr, x, y)
     D_det_prev = _lambdify_scalar_xy(D_det_prev_expr, x, y)
 
     return BiofilmOneDomainMMSConvergence(
@@ -387,24 +426,27 @@ def build_biofilm_one_domain_mms_trig_step(
         phi=phi_t,
         alpha=alpha_t,
         S=S_t,
+        X=X_t,
         v_n=v_n,
         p_n=p_n,
         u_n=u_n,
         phi_n=phi_n,
         alpha_n=alpha_n,
         S_n=S_n,
+        X_n=X_n,
         v_k=v_k,
         p_k=p_k,
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
         S_k=S_k,
+        X_k=X_k,
         f_v=f_v,
         f_u=f_u,
         s_v=s_v,
         f_phi=f_phi,
         f_alpha=f_alpha,
         f_S=f_S,
+        f_X=f_X,
         D_det_prev=D_det_prev,
     )
-

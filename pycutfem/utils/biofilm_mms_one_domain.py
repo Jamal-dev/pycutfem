@@ -192,13 +192,18 @@ def build_biofilm_one_domain_mms_affine(
 
         ak = alpha_k(x, y)
         phik = phi_k(x, y)
+        an = alpha_n(x, y)
+        phin = phi_n(x, y)
 
         Ck = _capacity(ak, phik)
+        Cn = _capacity(an, phin)
         rho = float(rho_f) * Ck
+        rho_n = float(rho_f) * Cn
         mu = float(mu_f) * Ck  # phi_mu choice
         beta = ak * float(mu_f) * (phik * phik) * float(kappa_inv)
 
-        vdot = (vk - vn) / dt
+        # Conservative-in-time momentum: (rho_k v_k - rho_n v_n)/dt.
+        momdot = (rho[..., None] * vk - rho_n[..., None] * vn) / dt
         conv = np.stack((float(v_amp) ** 2 * x, float(v_amp) ** 2 * y), axis=-1)
 
         Cx, Cy = _grad_capacity(ak, phik)
@@ -210,7 +215,10 @@ def build_biofilm_one_domain_mms_affine(
         visc = np.stack((-2.0 * float(v_amp) * mu_y, -2.0 * float(v_amp) * mu_x), axis=-1)
 
         drag = beta[..., None] * (vk - vS)
-        return rho[..., None] * vdot + rho[..., None] * conv + visc + grad_p + drag
+        # Conservative convection correction: v * div(rho v) with rho=rho_f*C.
+        divCv = Cx * vk[..., 0] + Cy * vk[..., 1]  # div(v)=0 for this affine shear
+        div_rhov = float(rho_f) * divCv
+        return momdot + rho[..., None] * conv + vk * div_rhov[..., None] + visc + grad_p + drag
 
     def s_v(x, y):
         x = np.asarray(x, dtype=float)
@@ -239,9 +247,9 @@ def build_biofilm_one_domain_mms_affine(
 
         beta = ak * float(mu_f) * (phik * phik) * float(kappa_inv)
         # Strong form corresponding to the implemented weak form:
-        #   -div(α σ(u)) + ∇(α (1-φ) p) - α β(v-vS) = α f_u
+        #   -div(α σ(u)) + ∇(α (1-φ) p) - β(v-vS) = α f_u
         # so
-        #   f_u = -(σ(u) ∇α)/α + ∇((1-φ)p) + ((1-φ)p) ∇α/α - β(v-vS),
+        #   f_u = -(σ(u) ∇α)/α + ∇((1-φ)p) + ((1-φ)p) ∇α/α - (β/α)(v-vS),
         # using div(σ(u))=0 for the affine displacement used here.
         grad_p_term = (1.0 - phik)[..., None] * grad_p - pk[..., None] * grad_phi  # ∇((1-φ)p)
         g = (1.0 - phik) * pk
@@ -253,7 +261,7 @@ def build_biofilm_one_domain_mms_affine(
         sigma_grad_alpha = sigma @ grad_alpha
         extra_el = (1.0 / ak)[..., None] * sigma_grad_alpha
 
-        drag = beta[..., None] * (vk - vS)
+        drag = (beta / ak)[..., None] * (vk - vS)
         return grad_p_term + extra_p - extra_el - drag
 
     def f_phi(x, y):
@@ -289,7 +297,8 @@ def build_biofilm_one_domain_mms_affine(
 
         # Lagged detachment uses v_n (here zero) -> tau = sqrt(eta_n) constant.
         D_det_prev = float(k_det) * float(np.sqrt(float(eta_n)))
-        return dadt + adv - G * ak * (1.0 - ak) + D_det_prev * ak
+        delta = 4.0 * ak * (1.0 - ak)
+        return dadt + adv - G * ak * (1.0 - ak) - D_det_prev * delta
 
     def f_S(x, y):
         x = np.asarray(x, dtype=float)
