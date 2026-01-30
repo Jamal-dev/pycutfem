@@ -1769,41 +1769,117 @@ class DofHandler:
         """
         import numpy as np
 
-        if getattr(self, "dof_map", None) and all(isinstance(self.dof_map.get(f, None), dict) and self.dof_map[f]
-                                                for f in self.field_names):
+        cg_fields = [f for f in self.field_names if not self._is_dg_field(f)]
+        if (
+            getattr(self, "_node_maps_built", False)
+            and float(getattr(self, "_node_maps_tol", float("nan"))) == float(tol)
+            and isinstance(getattr(self, "dof_map", None), dict)
+            and isinstance(getattr(self, "_dof_to_node_map", None), dict)
+            and all(isinstance(self.dof_map.get(f, None), dict) and self.dof_map[f] for f in cg_fields)
+        ):
             return  # already built
 
         self._ensure_dof_coords()
         mesh = self.mixed_element.mesh
-        node_xy = mesh.nodes_x_y_pos
+        node_xy = np.asarray(mesh.nodes_x_y_pos, dtype=float)
 
-        # quick lookup by quantized coordinate
-        def _key(xy):
-            return (round(float(xy[0]), 12), round(float(xy[1]), 12))
-        node_lookup = {_key(xy): int(i) for i, xy in enumerate(node_xy)}
-
+        # Robust mapping in the presence of near-duplicate mesh nodes:
+        # map each *mesh node* to its nearest DOF coordinate (within tol).
         self.dof_map = {f: {} for f in self.field_names}
         self._dof_to_node_map = {}
+
+        cell_size = float(max(tol, 1e-14))
+        inv_h = 1.0 / cell_size
+        tol2 = float(tol) * float(tol)
 
         for f in self.field_names:
             if self._is_dg_field(f):
                 continue
-            for gd in self.get_field_slice(f):
-                x, y = self._dof_coords[int(gd)]
-                k = _key((x, y))
-                nid = node_lookup.get(k, None)
-                if nid is None:
-                    # nearest node within tol
-                    d2 = ((node_xy[:, 0] - x) ** 2 + (node_xy[:, 1] - y) ** 2)
-                    j = int(np.argmin(d2))
-                    if d2[j] > tol ** 2:
-                        # No nearby mesh node: keep a reverse-map entry with node_id=None
-                        # so downstream consumers (e.g. VTK export) can safely skip it.
-                        self._dof_to_node_map[int(gd)] = (f, None)
-                        continue
-                    nid = j
-                self.dof_map[f][int(nid)] = int(gd)
-                self._dof_to_node_map[int(gd)] = (f, int(nid))
+
+            dof_ids = np.asarray(self.get_field_slice(f), dtype=int).ravel()
+            if dof_ids.size == 0:
+                continue
+
+            dof_xy = np.asarray(self._dof_coords[dof_ids], dtype=float)
+            dof_keys = np.floor(dof_xy * inv_h).astype(np.int64)
+
+            # Spatial hash: cell -> local dof indices
+            cell_to_locals: dict[tuple[int, int], list[int]] = {}
+            for loc, (kx, ky) in enumerate(dof_keys):
+                cell_to_locals.setdefault((int(kx), int(ky)), []).append(int(loc))
+
+            # Map mesh nodes to DOFs robustly even when multiple nodes/DOFs are
+            # (nearly) coincident (e.g. nonmatching interfaces, hanging nodes).
+            #
+            # Strategy:
+            #   1) collect candidate DOFs within tol for each node
+            #   2) assign unique DOFs greedily in (fewest-candidates, node_id) order
+            #   3) for the remaining nodes, allow many-to-one assignment (best match)
+            used_dofs: set[int] = set()
+            pending: list[tuple[int, list[tuple[float, int]]]] = []
+
+            for nid, (x, y) in enumerate(node_xy):
+                kx = int(np.floor(float(x) * inv_h))
+                ky = int(np.floor(float(y) * inv_h))
+
+                best_by_gd: dict[int, float] = {}
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        locals_ = cell_to_locals.get((kx + dx, ky + dy))
+                        if not locals_:
+                            continue
+                        loc_arr = np.asarray(locals_, dtype=int)
+                        cand = dof_xy[loc_arr]
+                        d2 = (cand[:, 0] - x) ** 2 + (cand[:, 1] - y) ** 2
+                        for loc_idx, d2_val in zip(loc_arr.tolist(), d2.tolist()):
+                            d2_val = float(d2_val)
+                            if d2_val > tol2:
+                                continue
+                            gd = int(dof_ids[int(loc_idx)])
+                            prev = best_by_gd.get(gd)
+                            if prev is None or d2_val < prev:
+                                best_by_gd[gd] = d2_val
+
+                if not best_by_gd:
+                    continue
+
+                cands = [(d2_val, gd) for gd, d2_val in best_by_gd.items()]
+                if len(cands) == 1:
+                    # forced assignment when possible
+                    gd = int(cands[0][1])
+                    if gd not in used_dofs:
+                        self.dof_map[f][int(nid)] = gd
+                        used_dofs.add(gd)
+                        if gd not in self._dof_to_node_map:
+                            self._dof_to_node_map[gd] = (f, int(nid))
+                    else:
+                        pending.append((int(nid), cands))
+                else:
+                    pending.append((int(nid), cands))
+
+            pending.sort(key=lambda item: (len(item[1]), int(item[0])))
+            for nid, cands in pending:
+                cands_sorted = sorted(cands, key=lambda t: (float(t[0]), int(t[1])))
+                chosen = None
+                for _d2, gd in cands_sorted:
+                    gd = int(gd)
+                    if gd not in used_dofs:
+                        chosen = gd
+                        used_dofs.add(gd)
+                        break
+                if chosen is None:
+                    chosen = int(cands_sorted[0][1])
+                self.dof_map[f][int(nid)] = int(chosen)
+                if int(chosen) not in self._dof_to_node_map:
+                    self._dof_to_node_map[int(chosen)] = (f, int(nid))
+
+            # Ensure every DOF has a reverse-map entry (node_id may be None).
+            for gd in dof_ids:
+                gd = int(gd)
+                self._dof_to_node_map.setdefault(gd, (f, None))
+
+        self._node_maps_built = True
+        self._node_maps_tol = float(tol)
 
     def _edge_tag_dofs(
         self,
@@ -2449,37 +2525,11 @@ class DofHandler:
         -------
         None
         """
-        import numpy as np
-        self._ensure_dof_coords()
-        mesh = self.mixed_element.mesh
-        nodes_xy = np.asarray(mesh.nodes_x_y_pos, float)
-
-        # quantized lookup for exact hits (robust to roundoff)
-        def _q(x): return float(round(x, 12))
-        node_lookup = {(_q(float(x)), _q(float(y))): int(i)
-                    for i, (x, y) in enumerate(nodes_xy)}
-
-        self.dof_map = {f: {} for f in self.field_names}
+        # Force a rebuild even if maps already exist.
+        self.dof_map = {}
         self._dof_to_node_map = {}
-
-        for f in self.field_names:
-            if self._is_dg_field(f):
-                continue
-            ids = self.get_field_slice(f)
-            for gd in ids:
-                x, y = self._dof_coords[int(gd)]
-                nid = node_lookup.get((_q(x), _q(y)))
-                if nid is None:
-                    dx = nodes_xy[:, 0] - x
-                    dy = nodes_xy[:, 1] - y
-                    j = int(np.argmin(dx*dx + dy*dy))
-                    if (dx[j]*dx[j] + dy[j]*dy[j]) <= tol*tol:
-                        nid = j
-                if nid is not None:
-                    self.dof_map[f][int(nid)] = int(gd)
-                    self._dof_to_node_map[int(gd)] = (f, int(nid))
-                else:
-                    self._dof_to_node_map[int(gd)] = (f, None)
+        self._node_maps_built = False
+        self._ensure_node_maps(tol=tol)
 
     # ------------------------------------------------------------------
     #  Hanging-node constraints (CG only)
@@ -2749,8 +2799,6 @@ class DofHandler:
                                     slave_to_master[int(sdof)] = combo
 
             for slave_nid, s_slave in fine_map.items():
-                if slave_nid in coarse_map:
-                    continue
                 for fld in self.field_names:
                     if fld in getattr(self.mixed_element, "_number_fields", set()):
                         continue
@@ -2760,6 +2808,28 @@ class DofHandler:
                         continue
                     if slave_dof in slave_to_master:
                         continue
+
+                    # If the fine-side node maps to a DOF that already exists on the
+                    # coarse side (e.g. merged DOF numbering / near-duplicate nodes),
+                    # it is not a hanging slave for this field.
+                    coarse_dofs = [node2dof.get(int(nid)) for nid in coarse_nodes]
+                    coarse_dof_set = {int(gd) for gd in coarse_dofs if gd is not None}
+                    if int(slave_dof) in coarse_dof_set:
+                        continue
+
+                    # Identity constraint when a fine node coincides with a coarse node
+                    # (common in nonconforming high-order meshes where node IDs differ).
+                    if coarse_nodes:
+                        slave_xy = nodes_xy[int(slave_nid)]
+                        coarse_xy = nodes_xy[np.asarray(coarse_nodes, dtype=int)]
+                        d2 = np.sum((coarse_xy - slave_xy[None, :]) ** 2, axis=1)
+                        j = int(np.argmin(d2))
+                        if float(d2[j]) <= tol * tol:
+                            gd_master = node2dof.get(int(coarse_nodes[j]))
+                            if gd_master is not None:
+                                slave_to_master[int(slave_dof)] = [(int(gd_master), 1.0)]
+                                continue
+
                     master_dofs: List[Tuple[int, float]] = []
                     weights = _lagrange_weights_1d(coarse_s, s_slave)
                     for nid, w in zip(coarse_nodes, weights):

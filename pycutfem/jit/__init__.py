@@ -310,10 +310,28 @@ class KernelRunner:
                             continue
                         arr = np.asarray(vals, dtype=np.float64)
                         prev = kernel_args.get(name)
-                        if isinstance(prev, np.ndarray) and prev.shape == arr.shape:
-                            prev[...] = arr
-                        else:
-                            kernel_args[name] = arr
+                        target_shape = tuple(qp_phys.shape[:2])
+
+                        # Keep ABI/shape expectations stable:
+                        # - kernels always index ana_* as (e,q)
+                        # - Analytic.eval may return scalar for constant callables
+                        # - or 1D arrays for per-q / per-e outputs
+                        if isinstance(prev, np.ndarray) and prev.shape == target_shape:
+                            try:
+                                prev[...] = arr  # supports numpy broadcasting (scalar, 1D, ...)
+                            except Exception:
+                                # If refresh fails (unexpected shape), keep the previous values.
+                                pass
+                            continue
+
+                        try:
+                            if arr.ndim == 1 and arr.shape[0] == target_shape[0]:
+                                arr = arr[:, None]
+                            refreshed = np.broadcast_to(arr, target_shape).copy()
+                        except Exception:
+                            # If broadcasting is impossible, keep the previous values (if any).
+                            continue
+                        kernel_args[name] = refreshed
 
         # ---------------------------------------------------------------
         # B)  guarantee presence of 'gdofs_map'  and  'node_coords'
