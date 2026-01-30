@@ -119,7 +119,12 @@ def _Pi_over_rho_s(S, phi, alpha, *, mu_max, K_S, k_d):
 
 
 def _R_S_consumption(S, phi, alpha, *, mu_max, K_S, k_d, Y):
-    # R_S = (1/Y) Π_b/ρ_s* (default) (positive sink in the strong form)
+    # R_S = (1/Y) Π_b/ρ_s* (default) (positive sink in the strong form).
+    #
+    # Unit note:
+    # - If Π_b is a *mass* source [kg/(m^3 s)] and ρ_s* is an intrinsic solid density [kg/m^3],
+    #   then Π_b/ρ_s* has units [1/s]. This matches a substrate variable S that is normalized
+    #   by ρ_s* (dimensionless). For a *mass concentration* substrate, use R_S = Π_b/Y instead.
     return (_c(1.0) / Y) * _Pi_over_rho_s(S, phi, alpha, mu_max=mu_max, K_S=K_S, k_d=k_d)
 
 
@@ -473,14 +478,17 @@ def build_biofilm_one_domain_forms(
     r_skel_n += -(_one_minus(phi_n) * p_n) * div(u_test)
 
     # drag reaction: -β (v - vS)
+    # Since beta already contains α, if we use alpha again then it would square and it won't 
+    # be equal to the drag from the momentum of the fluid.
     if drag_mode == "scalar":
-        r_skel_k += -beta_k * dot(v_k, u_test) + beta_k * dot(vS_k, u_test)
-        r_skel_n += -beta_n * dot(v_n, u_test) + beta_n * dot(vS_n, u_test)
+        r_skel_drag_k = -beta_k * dot(v_k - vS_k, u_test)
+        r_skel_drag_n = -beta_n * dot(v_n - vS_n, u_test)
     else:
-        r_skel_k += -beta_coeff_k * dot(kdrag_k, u_test)
-        r_skel_n += -beta_coeff_n * dot(kdrag_n, u_test)
+        r_skel_drag_k = -beta_coeff_k * dot(kdrag_k, u_test)
+        r_skel_drag_n = -beta_coeff_n * dot(kdrag_n, u_test)
 
-    r_skeleton = (th * alpha_k * r_skel_k + one_m_th * alpha_n * r_skel_n) * dx
+    r_skeleton = (th * alpha_k * r_skel_k + one_m_th * alpha_n * r_skel_n
+                  + th * r_skel_drag_k + one_m_th * r_skel_drag_n) * dx
     r_skeleton += -dot(alpha_k * f_u, u_test) * dx
 
     # Optional extension penalty to keep u well-posed in the free-fluid region.
@@ -506,9 +514,9 @@ def build_biofilm_one_domain_forms(
         - dalpha * (_one_minus(phi_k) * p_k) * div(u_test)
         + alpha_k * (dphi * p_k) * div(u_test)
         - alpha_k * (_one_minus(phi_k) * dp) * div(u_test)
-        + dalpha * drag_term_k
-        + alpha_k * d_drag_term_k
     ) * dx
+    # Drag term is *not* multiplied by alpha again: beta already contains alpha (one-domain blend).
+    a_skel += th * d_drag_term_k * dx
     a_skel += -dot(dalpha * f_u, u_test) * dx
 
     if float(gamma_u) != 0.0:
@@ -632,7 +640,7 @@ def build_biofilm_one_domain_forms(
 
     # Jacobian (k-part only)
     dCSk = dC * S_k + _capacity(alpha_k, phi_k) * dS
-    dRS = (_c(1.0) / _c(float(Y))) * dPi  # RS = (1/Y) Π/ρ_s*
+    dRS = (_c(1.0) / _c(float(Y))) * dPi  # RS = (1/Y) (Π_b/ρ_s*)  (see unit note in _R_S_consumption)
 
     d_div_CSv_k = dCSk * div(v_k) + CSk * div(dv)
     d_div_CSv_k += dS * dot(gradC_k, v_k) + S_k * dot(dgradC_k, v_k) + S_k * dot(gradC_k, dv)
