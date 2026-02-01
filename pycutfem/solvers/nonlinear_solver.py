@@ -267,7 +267,7 @@ class TimeStepperParameters:
 class LinearSolverParameters:
     """Sparse linear solver settings (expandable for PETSc/Krylov/etc.)."""
 
-    backend: str = "scipy"              # placeholder for future options
+    backend: str = ("petsc" if HAS_PETSC else "scipy")
     tol: float = 1e-12
     maxit: int = 10_000
 
@@ -485,6 +485,7 @@ class NewtonSolver:
             else:
                 print("  Inactive DOFs already excluded by restriction domains.")
         print(f"NewtonSolver using backend '{self.backend}'.")
+        print(f"NewtonSolver linear solver backend '{str(getattr(self.lp, 'backend', 'scipy') or 'scipy')}'.")
         # Build once: CSR structure & per-element scatter plan for reduced system
         self._build_reduced_pattern()
 

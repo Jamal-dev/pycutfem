@@ -252,11 +252,17 @@ def build_biofilm_one_domain_forms(
     # transport parameters
     D_phi: float = 0.0,
     gamma_phi: float = 0.0,
+    # transport stabilizations (consistent, for advection-dominated cases)
+    phi_supg: float = 0.0,
+    phi_cip: float = 0.0,
     gamma_u: float = 0.0,
+    u_extension_mode: str = "l2",
+    gamma_u_pin: float = 0.0,
     D_alpha: float = 0.0,
     # transport stabilizations (consistent, for advection-dominated cases)
     alpha_supg: float = 0.0,
     alpha_cip: float = 0.0,
+    u_cip: float = 0.0,
     ds_cip=None,
     D_S: float = 0.0,
     D_X: float = 0.0,
@@ -554,10 +560,28 @@ def build_biofilm_one_domain_forms(
     # leading to ill-conditioned Jacobians and Newton stagnation.
     gamma_u_c = _c(float(gamma_u))
     if float(gamma_u) != 0.0:
-        # Scale the L2 penalty by 1/h^2 so its strength does not vanish under refinement.
-        h_u = MeshSize()
-        inv_h2 = _c(1.0) / (h_u * h_u)
-        r_skeleton += gamma_u_c * inv_h2 * _one_minus(alpha_k) * dot(u_k, u_test) * dx
+        u_ext_mode = str(u_extension_mode).strip().lower()
+        if u_ext_mode in {"l2", "mass"}:
+            # Scale the L2 penalty by 1/h^2 so its strength does not vanish under refinement.
+            h_u = MeshSize()
+            inv_h2 = _c(1.0) / (h_u * h_u)
+            r_skeleton += gamma_u_c * inv_h2 * _one_minus(alpha_k) * dot(u_k, u_test) * dx
+        elif u_ext_mode in {"grad", "h1"}:
+            # Gradient penalty does not fight rigid-body translations (∇u≈0).
+            r_skeleton += gamma_u_c * _one_minus(alpha_k) * inner(grad(u_k), grad(u_test)) * dx
+
+            # Add an optional tiny L2 pin to remove the global-translation nullspace.
+            if float(gamma_u_pin) != 0.0:
+                h_u = MeshSize()
+                inv_h2 = _c(1.0) / (h_u * h_u)
+                # Use a stronger weight (1-α)^2 for the pin so it is negligible in the
+                # diffuse interface region (α≈0.5) but still removes the far-field
+                # translation nullspace when α≈0.
+                w_pin = _one_minus(alpha_k)
+                w_pin2 = w_pin * w_pin
+                r_skeleton += _c(float(gamma_u_pin)) * inv_h2 * w_pin2 * dot(u_k, u_test) * dx
+        else:
+            raise ValueError(f"Unknown u_extension_mode {u_extension_mode!r}.")
 
     # Jacobian contributions (k-part only)
     if drag_mode == "scalar":
@@ -580,11 +604,28 @@ def build_biofilm_one_domain_forms(
     a_skel += -dot(dalpha * f_u, u_test) * dx
 
     if float(gamma_u) != 0.0:
-        h_u = MeshSize()
-        inv_h2 = _c(1.0) / (h_u * h_u)
-        a_skel += gamma_u_c * inv_h2 * (
-            (-_c(1.0) * dalpha) * dot(u_k, u_test) + _one_minus(alpha_k) * dot(du, u_test)
-        ) * dx
+        u_ext_mode = str(u_extension_mode).strip().lower()
+        if u_ext_mode in {"l2", "mass"}:
+            h_u = MeshSize()
+            inv_h2 = _c(1.0) / (h_u * h_u)
+            a_skel += gamma_u_c * inv_h2 * (
+                (-_c(1.0) * dalpha) * dot(u_k, u_test) + _one_minus(alpha_k) * dot(du, u_test)
+            ) * dx
+        elif u_ext_mode in {"grad", "h1"}:
+            a_skel += gamma_u_c * ((-_c(1.0) * dalpha) * inner(grad(u_k), grad(u_test)) + _one_minus(alpha_k) * inner(grad(du), grad(u_test))) * dx
+
+            if float(gamma_u_pin) != 0.0:
+                h_u = MeshSize()
+                inv_h2 = _c(1.0) / (h_u * h_u)
+                pin_c = _c(float(gamma_u_pin))
+                w_pin = _one_minus(alpha_k)
+                w_pin2 = w_pin * w_pin
+                dw_pin2 = (-_c(2.0) * w_pin) * dalpha
+                a_skel += pin_c * inv_h2 * (
+                    dw_pin2 * dot(u_k, u_test) + w_pin2 * dot(du, u_test)
+                ) * dx
+        else:
+            raise ValueError(f"Unknown u_extension_mode {u_extension_mode!r}.")
 
     # Optional Eulerian skeleton inertia (a^S = ∂_t vS + (vS·∇)vS).
     if bool(include_skeleton_acceleration) and float(rho_s0_tilde) != 0.0:
@@ -610,6 +651,23 @@ def build_biofilm_one_domain_forms(
         dacc = dvS_over_dt + th * dadv_k
 
         a_skel += inner((dalpha * m_s + alpha_k * dm_s) * acc + alpha_k * m_s * dacc, u_test) * dx
+
+    # Optional facet stabilization for u (CIP/ghost-penalty on interior facets).
+    # This improves robustness when u becomes weakly constrained (e.g. α→0 in
+    # parts of the domain) and helps avoid Newton stagnation in multi-step runs.
+    # The term is consistent because [∂_n u]=0 for smooth u.
+    if float(u_cip) != 0.0 and ds_cip is not None:
+        n_int = FacetNormal()
+        h_F = avg(MeshSize())
+        vmag = _sqrt(inner(vS_n, vS_n) + _c(1.0e-12))
+        scale = inv_dt + vmag / (h_F + _c(1.0e-12))
+        tau_u_cip = _c(float(u_cip)) * (h_F * h_F * h_F) * scale
+        # Weight by (1-α^n) to primarily stabilize the *extension* region (where α≈0)
+        # without polluting the physical biofilm chunk (α≈1). Using α^n keeps the
+        # Jacobian free of extra α-coupling from the stabilization weight.
+        w_u_cip = avg(_one_minus(alpha_n))
+        r_skeleton += tau_u_cip * w_u_cip * _grad_inner_jump(u_k, u_test, n_int) * ds_cip
+        a_skel += tau_u_cip * w_u_cip * _grad_inner_jump(du, u_test, n_int) * ds_cip
 
     # ------------------------------------------------------------------
     # (iii-b) Optional wall adhesion traction (spring + dashpot)
@@ -700,6 +758,45 @@ def build_biofilm_one_domain_forms(
     ) * dx
     a_phi += D_phi_c * inner(grad(dphi), grad(phi_test)) * dx
     a_phi += gamma_phi_c * ((-_c(1.0) * dalpha) * (phi_k - _c(1.0)) + _one_minus(alpha_k) * dphi) * phi_test * dx
+
+    # Optional consistent stabilization for advection-dominated φ (useful with D_phi=0).
+    # - SUPG: τ (vS·∇w) R_phi
+    # - CIP:  γ h^3 (1/dt + |vS|/h) <[∂_n φ],[∂_n w]>_F on interior facets
+    #
+    # We again use lagged vS_n in τ and in the test-direction to keep the Jacobian
+    # coupling limited to the (already-present) vS_k dependence inside R_phi.
+    if float(phi_supg) != 0.0:
+        h_p = MeshSize()
+        vmag = _sqrt(inner(vS_n, vS_n) + _c(1.0e-12))
+        denom = (_c(2.0) * inv_dt) * (_c(2.0) * inv_dt) + (_c(2.0) * vmag / (h_p + _c(1.0e-12))) * (
+            _c(2.0) * vmag / (h_p + _c(1.0e-12))
+        )
+        tau_supg = _c(float(phi_supg)) / _sqrt(denom + _c(1.0e-16))
+        w_supg = dot(grad(phi_test), vS_n)
+
+        # "Strong" residual (excluding diffusion; diffusion is a stabilizing term already).
+        f_phi_supg_k = alpha_k * ((phi_k - phi_n) * inv_dt)
+        f_phi_supg_k += th * alpha_k * Fphi_k + one_m_th * alpha_n * Fphi_n
+        f_phi_supg_k += gamma_phi_c * _one_minus(alpha_k) * (phi_k - _c(1.0))
+        f_phi_supg_k += -f_phi
+
+        r_phi += tau_supg * w_supg * f_phi_supg_k * dx
+
+        dFphi_k = dot(grad(phi_k), dvS) + dot(grad(dphi), vS_k) + dphi * div_vS_k - _one_minus(phi_k) * div_dvS + dPi
+        df_phi_supg_k = dalpha * ((phi_k - phi_n) * inv_dt) + alpha_k * (dphi * inv_dt)
+        df_phi_supg_k += th * (dalpha * Fphi_k + alpha_k * dFphi_k)
+        df_phi_supg_k += gamma_phi_c * ((-_c(1.0) * dalpha) * (phi_k - _c(1.0)) + _one_minus(alpha_k) * dphi)
+
+        a_phi += tau_supg * w_supg * df_phi_supg_k * dx
+
+    if float(phi_cip) != 0.0 and ds_cip is not None:
+        n_int = FacetNormal()
+        h_F = avg(MeshSize())
+        vmag = _sqrt(inner(vS_n, vS_n) + _c(1.0e-12))
+        scale = inv_dt + vmag / (h_F + _c(1.0e-12))
+        tau_cip = _c(float(phi_cip)) * (h_F * h_F * h_F) * scale
+        r_phi += tau_cip * _grad_inner_jump(phi_k, phi_test, n_int) * ds_cip
+        a_phi += tau_cip * _grad_inner_jump(dphi, phi_test, n_int) * ds_cip
 
     # ------------------------------------------------------------------
     # (v) Indicator evolution (advection–diffusion–reaction)

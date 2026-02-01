@@ -19,7 +19,9 @@ from pycutfem.utils.biofilm_one_domain import build_biofilm_one_domain_forms
 from pycutfem.utils.meshgen import structured_quad
 
 
-def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1, alpha_supg: float = 0.0, alpha_cip: float = 0.0):
+def _build_problem(
+    *, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1, alpha_supg: float = 0.0, alpha_cip: float = 0.0, u_cip: float = 0.0
+):
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
     mesh = Mesh(
         nodes=nodes,
@@ -132,6 +134,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1
         D_alpha=float(D_alpha),
         alpha_supg=float(alpha_supg),
         alpha_cip=float(alpha_cip),
+        u_cip=float(u_cip),
         D_S=0.1,
         mu_max=0.4,
         K_S=0.3,
@@ -236,6 +239,54 @@ def test_biofilm_one_domain_alpha_stabilization_jacobian_fd_consistency():
 
     probes = []
     for fld in ("v_x", "p", "u_x", "alpha"):
+        sl = dh.get_field_slice(fld)
+        if sl:
+            probes.append(int(sl[len(sl) // 2]))
+
+    eps = 1.0e-8
+    for j in probes:
+        fld, _ = dh._dof_to_node_map[j]
+        func = field_to_func_k[fld]
+        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
+        R1 = assemble_residual()
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
+
+        fd = (R1 - R0) / eps
+        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
+        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
+        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
+        assert rel < 1.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
+
+
+def test_biofilm_one_domain_u_cip_backend_parity_python_cpp():
+    dh, forms, _ = _build_problem(nx=2, ny=2, q=5, u_cip=1.0)
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+
+    K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    K_cpp, R_cpp = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="cpp")
+
+    A_py = K_py.tocsr().toarray()
+    A_cpp = K_cpp.tocsr().toarray()
+    assert np.allclose(A_py, A_cpp, rtol=1.0e-10, atol=1.0e-12)
+    assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_biofilm_one_domain_u_cip_jacobian_fd_consistency():
+    """
+    FD check that the u-CIP stabilization remains consistent with the manually coded Jacobian.
+    """
+    dh, forms, field_to_func_k = _build_problem(nx=2, ny=2, q=5, u_cip=1.0)
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    R0 = np.asarray(R0, dtype=float)
+
+    def assemble_residual():
+        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
+        return np.asarray(R, dtype=float)
+
+    probes = []
+    for fld in ("u_x", "u_y"):
         sl = dh.get_field_slice(fld)
         if sl:
             probes.append(int(sl[len(sl) // 2]))

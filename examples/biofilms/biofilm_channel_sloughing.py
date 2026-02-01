@@ -54,7 +54,7 @@ def main() -> None:
     ap.add_argument("--L", type=float, default=4.0)
     ap.add_argument("--H", type=float, default=1.0)
     ap.add_argument("--q", type=int, default=6, help="Quadrature order (dx/dS metadata + NewtonSolver quad_order).")
-    ap.add_argument("--dt", type=float, default=0.01)
+    ap.add_argument("--dt", type=float, default=0.005)
     ap.add_argument("--t-final", type=float, default=1.0)
     ap.add_argument("--theta", type=float, default=1.0)
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
@@ -70,7 +70,7 @@ def main() -> None:
     ap.add_argument("--phi-b", type=float, default=0.3)
     # Flow driving
     ap.add_argument("--Umax", type=float, default=0.3)
-    ap.add_argument("--Tramp", type=float, default=0.2, help="Inflow ramp time (seconds).")
+    ap.add_argument("--Tramp", type=float, default=0.1, help="Inflow ramp time (seconds).")
     ap.add_argument(
         "--process",
         type=str,
@@ -98,7 +98,7 @@ def main() -> None:
     ap.add_argument("--k-t", type=float, default=10.0, help="Tangential spring stiffness [Pa/m].")
     ap.add_argument("--gamma-n", type=float, default=5.0, help="Normal dashpot [Pa*s/m].")
     ap.add_argument("--gamma-t", type=float, default=1.0, help="Tangential dashpot [Pa*s/m].")
-    ap.add_argument("--k-break", type=float, default=5.0, help="Adhesion degradation rate [1/s].")
+    ap.add_argument("--k-break", type=float, default=2.0, help="Adhesion degradation rate [1/s].")
     ap.add_argument("--tau-c", type=float, default=0.2, help="Critical wall shear stress [Pa].")
     ap.add_argument("--m-break", type=float, default=1.0, help="Shear exponent m>=1.")
     # Material / model parameters (kept simple)
@@ -110,18 +110,50 @@ def main() -> None:
     ap.add_argument("--solid-inertia", action="store_true", help="Enable Eulerian skeleton acceleration term a^S in the u-equation.")
     ap.add_argument("--rho-s0", type=float, default=0.0, help="Skeleton inertia coefficient rho_s0_tilde (used if --solid-inertia).")
     ap.add_argument(
+        "--u-predictor",
+        type=str,
+        default="auto",
+        choices=("auto", "copy", "extrapolate"),
+        help="Initial guess strategy for u at each time step (auto: extrapolate when --solid-inertia, else copy).",
+    )
+    ap.add_argument(
         "--gamma-u",
         type=float,
         default=5.0,
         help=(
-            "Extension penalty factor for u in the fluid (used as gamma_u/h^2). "
-            "If you set --D-alpha 0 and enable --solid-inertia, too small values (e.g. <1) "
-            "often lead to ill-conditioning and Newton stagnation; start with 1–10."
+            "Extension penalty factor for u in the fluid. "
+            "Use with --u-extension l2 (gamma_u/h^2 * (1-alpha) u) or --u-extension grad "
+            "(gamma_u * (1-alpha) |grad u|^2)."
         ),
+    )
+    ap.add_argument(
+        "--u-extension",
+        type=str,
+        default="l2",
+        choices=("l2", "grad"),
+        help="Type of u-extension stabilization to use outside the biofilm.",
+    )
+    ap.add_argument(
+        "--gamma-u-pin",
+        type=float,
+        default=1.0e-4,
+        help="Tiny L2 pinning coefficient used only with --u-extension grad (removes global-translation nullspace). Set 0 to disable.",
     )
     # Transport regularization (tune for interface sharpness vs robustness)
     ap.add_argument("--D-phi", type=float, default=0.0, help="Porosity diffusion (recommend ~0 for channel sloughing).")
     ap.add_argument("--gamma-phi", type=float, default=5.0, help="Penalty enforcing phi->1 in free fluid.")
+    ap.add_argument(
+        "--phi-supg",
+        type=float,
+        default=0.0,
+        help="SUPG stabilization factor for the phi advection equation (0 disables). Recommended when --D-phi 0.",
+    )
+    ap.add_argument(
+        "--phi-cip",
+        type=float,
+        default=0.0,
+        help="CIP stabilization factor for phi (jump of normal gradient across interior facets; 0 disables). Recommended when --D-phi 0.",
+    )
     ap.add_argument("--D-alpha", type=float, default=0.001, help="Indicator diffusion (interface regularization).")
     ap.add_argument(
         "--alpha-supg",
@@ -135,6 +167,12 @@ def main() -> None:
         default=0.0,
         help="CIP stabilization factor for alpha (jump of normal gradient across interior facets; 0 disables). Recommended when --D-alpha 0.",
     )
+    ap.add_argument(
+        "--u-cip",
+        type=float,
+        default=0.0,
+        help="CIP stabilization factor for skeleton displacement u (jump of normal gradient across interior facets; 0 disables). Recommended with --solid-inertia.",
+    )
     ap.add_argument("--D-X", type=float, default=0.001, help="Detached biomass diffusion.")
     # Erosion / detachment (produces X and removes alpha at the diffuse interface)
     ap.add_argument("--k-det", type=float, default=1.0, help="Detachment strength for D_det=k_det*||eps(v^n)|| (lagged).")
@@ -145,6 +183,31 @@ def main() -> None:
         action="store_true",
         help="Disable post-step clipping of (alpha,phi,S) to physical bounds. "
         "Clipping keeps alpha in [0,1], phi in [0,1] and S>=0 to avoid non-physical coefficients.",
+    )
+    # Simple sloughing onset indicators (diagnostics only)
+    ap.add_argument(
+        "--slough-a-thresh",
+        type=float,
+        default=0.4,
+        help="Print a sloughing indicator once when a_min drops below this threshold (spatial adhesion mode).",
+    )
+    ap.add_argument(
+        "--slough-contact-rel-thresh",
+        type=float,
+        default=0.97,
+        help="Print a sloughing indicator once when alpha wall-contact measure (alpha_area) drops below this fraction of its initial value.",
+    )
+    ap.add_argument(
+        "--slough-liftoff-dy",
+        type=float,
+        default=0.02,
+        help="Print a sloughing indicator once when the high-alpha center-of-mass y increases by this amount from its initial value.",
+    )
+    ap.add_argument(
+        "--slough-vSx-thresh",
+        type=float,
+        default=1.0e-2,
+        help="Print a sloughing indicator once when |mean(vSx)| over alpha>0.5 exceeds this threshold.",
     )
     args = ap.parse_args()
 
@@ -178,11 +241,30 @@ def main() -> None:
             "default consistent stabilization: --alpha-supg 1 --alpha-cip 10."
         )
 
-    if float(args.D_alpha) == 0.0 and float(args.gamma_u) < 1.0 and bool(getattr(args, "solid_inertia", False)):
+    phi_supg = float(getattr(args, "phi_supg", 0.0) or 0.0)
+    phi_cip = float(getattr(args, "phi_cip", 0.0) or 0.0)
+    if float(args.D_phi) == 0.0 and phi_supg == 0.0 and phi_cip == 0.0:
+        print(
+            "[warn] --D-phi 0 detected with no phi stabilization specified. "
+            "If you see oscillations in phi (and therefore in beta), consider adding "
+            "--phi-supg 1 and/or --phi-cip 10."
+        )
+
+    solid_inertia = bool(getattr(args, "solid_inertia", False))
+    u_predictor = str(getattr(args, "u_predictor", "auto")).strip().lower()
+    if u_predictor == "auto":
+        u_predictor = "extrapolate" if solid_inertia else "copy"
+
+    u_cip = float(getattr(args, "u_cip", 0.0) or 0.0)
+    if u_cip == 0.0 and solid_inertia and float(args.gamma_u) <= 1.0:
+        u_cip = 1.0
+        print("[info] --solid-inertia with small --gamma-u detected; enabling default u facet stabilization: --u-cip 1.")
+
+    if float(args.D_alpha) == 0.0 and str(getattr(args, "u_extension", "l2")).strip().lower() in {"l2"} and float(args.gamma_u) < 1.0 and solid_inertia:
         print(
             "[warn] You are using --D-alpha 0 with --solid-inertia and a small --gamma-u. "
             "This combination often makes the u-block near-singular outside the biofilm and can "
-            "cause Newton stagnation. Try --gamma-u 1 (or keep the default 5), or add mild "
+            "cause Newton stagnation. Try --gamma-u 1 (or keep the default 5), add --u-cip 1, or add mild "
             "interface regularization like --D-alpha 1e-3."
         )
 
@@ -371,12 +453,17 @@ def main() -> None:
         rho_s0_tilde=rho_s0_c,
         include_skeleton_acceleration=bool(getattr(args, "solid_inertia", False)),
         gamma_u=float(args.gamma_u),
+        u_extension_mode=str(getattr(args, "u_extension", "l2")),
+        gamma_u_pin=float(getattr(args, "gamma_u_pin", 0.0)),
         # Mild diffusion/stabilization to keep transport variables well-posed in the free-fluid region.
         D_phi=float(args.D_phi),
         gamma_phi=float(args.gamma_phi),
+        phi_supg=float(phi_supg),
+        phi_cip=float(phi_cip),
         D_alpha=float(args.D_alpha),
         alpha_supg=float(alpha_supg),
         alpha_cip=float(alpha_cip),
+        u_cip=float(u_cip),
         ds_cip=ds_int,
         D_S=0.01,
         D_X=float(args.D_X),
@@ -428,6 +515,9 @@ def main() -> None:
     step_counter = {"k": 0}
     a_state = {"val": float(args.a0)}
     alpha_area0 = {"val": None}
+    slough_flags = {"a_drop": False, "contact_loss": False, "liftoff": False, "motion": False}
+    slough_t = {"a_drop": None, "contact_loss": None, "liftoff": None, "motion": None}
+    alpha_cm_hi0 = {"y": None}
     num_nodes = len(mesh.nodes_list)
     alpha_dof_xy = np.asarray(dh.get_dof_coords("alpha"), dtype=float)
 
@@ -466,6 +556,8 @@ def main() -> None:
             quad_order=qdeg,
         )
         a_msg = ""
+        a_min_val = float(args.a0)
+        a_max_val = float(args.a0)
         if use_sloughing:
             if a_prev is None:
                 # Legacy scalar a(t) update using RMS shear.
@@ -480,6 +572,8 @@ def main() -> None:
                 a_state["val"] = float(a_new)
                 a_c.value = float(a_new)
                 a_msg = f"a={a_state['val']:.6f}"
+                a_min_val = float(a_state["val"])
+                a_max_val = float(a_state["val"])
             else:
                 upd = update_adhesion_integrity_field_on_boundary(
                     dof_handler=dh,
@@ -497,6 +591,8 @@ def main() -> None:
                     quad_order=qdeg,
                 )
                 a_msg = f"a[min,max]=[{upd.a_min:.3f},{upd.a_max:.3f}]"
+                a_min_val = float(upd.a_min)
+                a_max_val = float(upd.a_max)
 
         if alpha_area0["val"] is None:
             alpha_area0["val"] = float(shear.alpha_area)
@@ -535,6 +631,7 @@ def main() -> None:
             if np.any(mask):
                 alpha_vals = np.asarray(alpha_k.nodal_values, dtype=float)
                 alpha_vals_pos = np.maximum(alpha_vals, 0.0)
+                y_cm_hi_curr = None
                 wsum_all = float(np.sum(alpha_vals_pos))
                 if wsum_all > 0.0:
                     x_cm_all = float(np.sum(alpha_vals_pos * alpha_dof_xy[:, 0]) / wsum_all)
@@ -549,7 +646,10 @@ def main() -> None:
                             xy_hi = alpha_dof_xy[mask_dofs, :]
                             x_cm_hi = float(np.sum(w_hi * xy_hi[:, 0]) / wsum_hi)
                             y_cm_hi = float(np.sum(w_hi * xy_hi[:, 1]) / wsum_hi)
+                            y_cm_hi_curr = float(y_cm_hi)
                             cm_msg += f"  alpha_cm_hi=({x_cm_hi:.5f},{y_cm_hi:.5f})"
+                            if alpha_cm_hi0["y"] is None:
+                                alpha_cm_hi0["y"] = float(y_cm_hi)
                 else:
                     cm_msg = ""
                 v_nodes = _vector_to_nodes(v_k)
@@ -565,6 +665,39 @@ def main() -> None:
                     f"mean(vx|alpha>0.5)={vx_mean:.3e}  mean(vSx|alpha>0.5)={vSx_mean:.3e}  "
                     f"mean(vSx|0.4<alpha<0.6)={vSx_int:.3e}{cm_msg}"
                 )
+
+                # ----------------------------------------------------------
+                # Sloughing onset indicators (best-effort diagnostics)
+                # ----------------------------------------------------------
+                if use_sloughing:
+                    rel_contact = float(shear.alpha_area) / (float(alpha_area0["val"]) + 1.0e-16)
+                    if (not slough_flags["a_drop"]) and (a_min_val < float(args.slough_a_thresh)):
+                        slough_flags["a_drop"] = True
+                        slough_t["a_drop"] = float(t_now)
+                        print(
+                            f"           [sloughing] adhesion weakened: a_min={a_min_val:.3f} < {float(args.slough_a_thresh):.3f} (t={t_now:.3f})"
+                        )
+                    if (not slough_flags["contact_loss"]) and (rel_contact < float(args.slough_contact_rel_thresh)):
+                        slough_flags["contact_loss"] = True
+                        slough_t["contact_loss"] = float(t_now)
+                        print(
+                            f"           [sloughing] wall contact loss: rel_contact={rel_contact:.3f} < {float(args.slough_contact_rel_thresh):.3f} (t={t_now:.3f})"
+                        )
+                    if (not slough_flags["motion"]) and (abs(vSx_mean) > float(args.slough_vSx_thresh)):
+                        slough_flags["motion"] = True
+                        slough_t["motion"] = float(t_now)
+                        print(
+                            f"           [sloughing] chunk motion: |mean(vSx)|={abs(vSx_mean):.3e} > {float(args.slough_vSx_thresh):.3e} (t={t_now:.3f})"
+                        )
+                    if (not slough_flags["liftoff"]) and (alpha_cm_hi0["y"] is not None) and (y_cm_hi_curr is not None):
+                        y0 = float(alpha_cm_hi0["y"])
+                        dy = float(y_cm_hi_curr) - y0
+                        if dy > float(args.slough_liftoff_dy):
+                            slough_flags["liftoff"] = True
+                            slough_t["liftoff"] = float(t_now)
+                            print(
+                                f"           [sloughing] liftoff: Δy_cm_hi={dy:.3e} > {float(args.slough_liftoff_dy):.3e} (t={t_now:.3f})"
+                            )
             else:
                 print(f"           beta[min,max]=[{bmin:.3e},{bmax:.3e}]")
         except Exception:
@@ -617,6 +750,20 @@ def main() -> None:
         backend=backend,
         postproc_timeloop_cb=post_step,
     )
+
+    # Optional u predictor (applied once per step, before the first Newton assembly).
+    _pred_state = {"step_no": None}
+
+    def _preproc_predictor(_funcs):
+        step_no = getattr(solver, "_current_step_no", None)
+        if step_no is None or _pred_state["step_no"] == int(step_no):
+            return
+        _pred_state["step_no"] = int(step_no)
+        if u_predictor == "extrapolate" and u_nm1 is not None:
+            # Constant-velocity predictor: u^{n+1} ≈ u^n + (u^n - u^{n-1}).
+            u_k.nodal_values[:] = u_n.nodal_values + (u_n.nodal_values - u_nm1.nodal_values)
+
+    solver.pre_cb = _preproc_predictor
 
     def post_step_refiner(step, bcs_now, functions, prev_functions):
         # NOTE: Called after an accepted Newton step and **before** the solver promotes current -> previous.
