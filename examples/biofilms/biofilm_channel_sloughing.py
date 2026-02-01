@@ -60,6 +60,13 @@ def main() -> None:
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
     ap.add_argument("--newton-tol", type=float, default=1.0e-5)
     ap.add_argument("--max-it", type=int, default=40)
+    ap.add_argument(
+        "--ls-mode",
+        type=str,
+        default="dealii",
+        choices=("armijo", "dealii"),
+        help="Newton line-search mode. 'dealii' is often more robust for the sloughing run.",
+    )
     ap.add_argument("--outdir", type=str, default="examples/biofilms/results/channel_sloughing")
     ap.add_argument("--vtk-every", type=int, default=1, help="Write VTK every N accepted steps (0 disables).")
     # Initial biofilm block geometry (smooth)
@@ -745,7 +752,11 @@ def main() -> None:
         mixed_element=me,
         bcs=bcs,
         bcs_homog=bcs_homog,
-        newton_params=NewtonParameters(newton_tol=float(args.newton_tol), max_newton_iter=int(args.max_it)),
+        newton_params=NewtonParameters(
+            newton_tol=float(args.newton_tol),
+            max_newton_iter=int(args.max_it),
+            ls_mode=str(getattr(args, "ls_mode", "dealii")),
+        ),
         quad_order=qdeg,
         backend=backend,
         postproc_timeloop_cb=post_step,
