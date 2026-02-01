@@ -366,15 +366,16 @@ def main() -> None:
         type=float,
         default=None,
         help=(
-            "Extension penalty for skeleton displacement in the free-fluid region (stabilizes u as alpha->0). "
-            "If omitted, uses a mesh-scaled default gamma_u = gamma_u_factor / h^2."
+            "Extension penalty factor for skeleton displacement in the free-fluid region (stabilizes u as alpha->0). "
+            "In the core model this is used as gamma_u/h^2 (MeshSize scaling). "
+            "If omitted, uses gamma_u = gamma_u_factor."
         ),
     )
     ap.add_argument(
         "--gamma-u-factor",
         type=float,
         default=1.0,
-        help="Factor for the mesh-scaled default gamma_u = gamma_u_factor / h^2 (used when --gamma-u is omitted).",
+        help="Default gamma_u factor used when --gamma-u is omitted (core model uses gamma_u/h^2).",
     )
     ap.add_argument("--D-alpha", type=float, default=0.1)
     ap.add_argument("--k-det", type=float, default=0.2)
@@ -389,7 +390,7 @@ def main() -> None:
     for nx in nx_list:
         h = 1.0 / float(nx)
         eps = float(args.eps) if args.eps is not None else float(args.eps_factor) * h
-        gamma_u = float(args.gamma_u) if args.gamma_u is not None else float(args.gamma_u_factor) / (h * h)
+        gamma_u = float(args.gamma_u) if args.gamma_u is not None else float(args.gamma_u_factor)
         rows.append(
             _run_one(
                 nx=nx,

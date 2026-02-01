@@ -14,12 +14,23 @@ from pycutfem.ufl.expressions import (
 )
 from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.ufl.functionspace import FunctionSpace
-from pycutfem.ufl.measures import ds, dx
+from pycutfem.ufl.measures import dS, dx
 from pycutfem.utils.biofilm_one_domain import build_biofilm_one_domain_forms
 from pycutfem.utils.meshgen import structured_quad
 
 
-def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1, alpha_supg: float = 0.0, alpha_cip: float = 0.0):
+def _tag_unit_square_boundaries(mesh: Mesh, *, tol: float = 1.0e-12) -> None:
+    mesh.tag_boundary_edges(
+        {
+            "left": lambda x, y: abs(x - 0.0) <= tol,
+            "right": lambda x, y: abs(x - 1.0) <= tol,
+            "bottom": lambda x, y: abs(y - 0.0) <= tol,
+            "top": lambda x, y: abs(y - 1.0) <= tol,
+        }
+    )
+
+
+def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
     mesh = Mesh(
         nodes=nodes,
@@ -28,6 +39,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1
         element_type="quad",
         poly_order=2,
     )
+    _tag_unit_square_boundaries(mesh)
 
     # Mixed unknowns: (v,p,u,phi,alpha,S) with 2D vectors for v,u.
     me = MixedElement(
@@ -53,7 +65,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
     dalpha = TrialFunction("alpha", dof_handler=dh)
-    dS = TrialFunction("S", dof_handler=dh)
+    dS_trial = TrialFunction("S", dof_handler=dh)
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
@@ -93,6 +105,11 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1
     dt = Constant(0.1)
     th = 1.0
 
+    ds_bottom = dS(defined_on=mesh.edge_bitset("bottom"), metadata={"q": int(q)})
+
+    # Nonzero adhesion parameters to exercise the added boundary term.
+    a_prev = Constant(0.8)
+
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
         p_k=p_k,
@@ -111,7 +128,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1
         du=du,
         dphi=dphi,
         dalpha=dalpha,
-        dS=dS,
+        dS=dS_trial,
         v_test=v_test,
         q_test=q_test,
         u_test=u_test,
@@ -119,7 +136,6 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1
         alpha_test=alpha_test,
         S_test=S_test,
         dx=dx(metadata={"q": int(q)}),
-        ds_cip=ds(metadata={"q": int(q)}),
         dt=dt,
         theta=th,
         rho_f=Constant(1.0),
@@ -129,9 +145,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1
         lambda_s=Constant(1.0),
         D_phi=0.1,
         gamma_phi=1.0,
-        D_alpha=float(D_alpha),
-        alpha_supg=float(alpha_supg),
-        alpha_cip=float(alpha_cip),
+        D_alpha=0.1,
         D_S=0.1,
         mu_max=0.4,
         K_S=0.3,
@@ -139,6 +153,12 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1
         k_d=0.1,
         Y=0.8,
         k_det=0.2,
+        ds_adh=ds_bottom,
+        adhesion_k_n=5.0,
+        adhesion_k_t=2.0,
+        adhesion_gamma_n=1.0,
+        adhesion_gamma_t=0.5,
+        adhesion_a_prev=a_prev,
     )
 
     # Map global dof -> state function owning it (k-level only).
@@ -156,7 +176,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1
     return dh, forms, field_to_func_k
 
 
-def test_biofilm_one_domain_backend_parity_python_cpp():
+def test_biofilm_one_domain_adhesion_backend_parity_python_cpp():
     dh, forms, _ = _build_problem(nx=2, ny=2, q=5)
     eq = Equation(forms.jacobian_form, forms.residual_form)
 
@@ -169,11 +189,9 @@ def test_biofilm_one_domain_backend_parity_python_cpp():
     assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
 
 
-def test_biofilm_one_domain_jacobian_fd_consistency():
+def test_biofilm_one_domain_adhesion_jacobian_fd_consistency():
     """
-    FD check for the full (v,p,u,phi,alpha,S) one-domain biofilm Jacobian.
-
-    This is intentionally tiny to keep runtime low while catching sign/index bugs.
+    FD check for the added adhesion boundary term contributions.
     """
     dh, forms, field_to_func_k = _build_problem(nx=2, ny=2, q=5)
     eq = Equation(forms.jacobian_form, forms.residual_form)
@@ -184,58 +202,9 @@ def test_biofilm_one_domain_jacobian_fd_consistency():
         _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
         return np.asarray(R, dtype=float)
 
-    # Probe a few DOFs (one per field) to cover block couplings.
+    # Probe DOFs that couple into the adhesion term (u, alpha).
     probes = []
-    for fld in ("v_x", "v_y", "p", "u_x", "phi", "alpha", "S"):
-        sl = dh.get_field_slice(fld)
-        if sl:
-            probes.append(int(sl[len(sl) // 2]))
-
-    eps = 1.0e-8
-    for j in probes:
-        fld, _ = dh._dof_to_node_map[j]
-        func = field_to_func_k[fld]
-        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
-        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
-        R1 = assemble_residual()
-        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
-
-        fd = (R1 - R0) / eps
-        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
-        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
-        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
-        assert rel < 1.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
-
-
-def test_biofilm_one_domain_alpha_stabilization_backend_parity_python_cpp():
-    dh, forms, _ = _build_problem(nx=2, ny=2, q=5, D_alpha=0.0, alpha_supg=0.5, alpha_cip=2.0)
-    eq = Equation(forms.jacobian_form, forms.residual_form)
-
-    K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
-    K_cpp, R_cpp = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="cpp")
-
-    A_py = K_py.tocsr().toarray()
-    A_cpp = K_cpp.tocsr().toarray()
-    assert np.allclose(A_py, A_cpp, rtol=1.0e-10, atol=1.0e-12)
-    assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
-
-
-def test_biofilm_one_domain_alpha_stabilization_jacobian_fd_consistency():
-    """
-    FD check that the (SUPG + CIP) stabilization additions to the alpha equation
-    remain consistent with the manually coded Jacobian.
-    """
-    dh, forms, field_to_func_k = _build_problem(nx=2, ny=2, q=5, D_alpha=0.0, alpha_supg=0.5, alpha_cip=2.0)
-    eq = Equation(forms.jacobian_form, forms.residual_form)
-    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
-    R0 = np.asarray(R0, dtype=float)
-
-    def assemble_residual():
-        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
-        return np.asarray(R, dtype=float)
-
-    probes = []
-    for fld in ("v_x", "p", "u_x", "alpha"):
+    for fld in ("u_x", "u_y", "alpha"):
         sl = dh.get_field_slice(fld)
         if sl:
             probes.append(int(sl[len(sl) // 2]))

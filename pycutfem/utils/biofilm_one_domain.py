@@ -23,11 +23,15 @@ from dataclasses import dataclass
 
 from pycutfem.ufl.expressions import (
     Constant,
+    FacetNormal,
     Identity,
+    MeshSize,
+    avg,
     div,
     dot,
     grad,
     inner,
+    jump,
     outer,
     trace,
 )
@@ -56,6 +60,11 @@ def _one_minus(expr):
 
 def _epsilon(v):
     return _c(0.5) * (grad(v) + grad(v).T)
+
+
+def _grad_inner_jump(u, v, n):
+    """Penalty on the jump of the normal derivative across an interior facet."""
+    return inner(dot(jump(grad(u)), n), dot(jump(grad(v)), n))
 
 
 def _linear_elastic_term(u, eta, *, mu_s, lambda_s):
@@ -245,6 +254,10 @@ def build_biofilm_one_domain_forms(
     gamma_phi: float = 0.0,
     gamma_u: float = 0.0,
     D_alpha: float = 0.0,
+    # transport stabilizations (consistent, for advection-dominated cases)
+    alpha_supg: float = 0.0,
+    alpha_cip: float = 0.0,
+    ds_cip=None,
     D_S: float = 0.0,
     D_X: float = 0.0,
     # growth / detachment parameters
@@ -268,6 +281,13 @@ def build_biofilm_one_domain_forms(
     f_X=None,
     # detachment rate override (if given, used instead of shear-based lagged rate)
     D_det_prev=None,
+    # optional wall adhesion traction (applied to skeleton on a boundary segment)
+    ds_adh=None,
+    adhesion_k_n: float = 0.0,
+    adhesion_k_t: float = 0.0,
+    adhesion_gamma_n: float = 0.0,
+    adhesion_gamma_t: float = 0.0,
+    adhesion_a_prev=None,
 ) -> BiofilmOneDomainForms:
     """
     Build residual + consistent Jacobian for the one-domain biofilm system.
@@ -313,8 +333,10 @@ def build_biofilm_one_domain_forms(
     vS_k = (u_k - u_n) / dt
     div_vS_k = (div(u_k) - div(u_n)) / dt
     if u_nm1 is None:
-        vS_n = _c(0.0) * vS_k
-        div_vS_n = _c(0.0) * div_vS_k
+        # Use explicit constants (not 0*vS_k) so the Python backend does not
+        # treat lagged quantities as depending on current trial/functions.
+        vS_n = Constant([0.0] * int(dim), dim=1)
+        div_vS_n = _c(0.0)
     else:
         vS_n = (u_n - u_nm1) / dt
         div_vS_n = (div(u_n) - div(u_nm1)) / dt
@@ -532,7 +554,10 @@ def build_biofilm_one_domain_forms(
     # leading to ill-conditioned Jacobians and Newton stagnation.
     gamma_u_c = _c(float(gamma_u))
     if float(gamma_u) != 0.0:
-        r_skeleton += gamma_u_c * _one_minus(alpha_k) * dot(u_k, u_test) * dx
+        # Scale the L2 penalty by 1/h^2 so its strength does not vanish under refinement.
+        h_u = MeshSize()
+        inv_h2 = _c(1.0) / (h_u * h_u)
+        r_skeleton += gamma_u_c * inv_h2 * _one_minus(alpha_k) * dot(u_k, u_test) * dx
 
     # Jacobian contributions (k-part only)
     if drag_mode == "scalar":
@@ -555,13 +580,17 @@ def build_biofilm_one_domain_forms(
     a_skel += -dot(dalpha * f_u, u_test) * dx
 
     if float(gamma_u) != 0.0:
-        a_skel += gamma_u_c * ((-_c(1.0) * dalpha) * dot(u_k, u_test) + _one_minus(alpha_k) * dot(du, u_test)) * dx
+        h_u = MeshSize()
+        inv_h2 = _c(1.0) / (h_u * h_u)
+        a_skel += gamma_u_c * inv_h2 * (
+            (-_c(1.0) * dalpha) * dot(u_k, u_test) + _one_minus(alpha_k) * dot(du, u_test)
+        ) * dx
 
     # Optional Eulerian skeleton inertia (a^S = ∂_t vS + (vS·∇)vS).
     if bool(include_skeleton_acceleration) and float(rho_s0_tilde) != 0.0:
         grad_vS_k = (grad(u_k) - grad(u_n)) / dt
         if u_nm1 is None:
-            grad_vS_n = _c(0.0) * grad_vS_k
+            grad_vS_n = Constant([[0.0] * int(dim) for _ in range(int(dim))], dim=2)
         else:
             grad_vS_n = (grad(u_n) - grad(u_nm1)) / dt
 
@@ -581,6 +610,56 @@ def build_biofilm_one_domain_forms(
         dacc = dvS_over_dt + th * dadv_k
 
         a_skel += inner((dalpha * m_s + alpha_k * dm_s) * acc + alpha_k * m_s * dacc, u_test) * dx
+
+    # ------------------------------------------------------------------
+    # (iii-b) Optional wall adhesion traction (spring + dashpot)
+    # ------------------------------------------------------------------
+    if ds_adh is not None and (
+        float(adhesion_k_n) != 0.0
+        or float(adhesion_k_t) != 0.0
+        or float(adhesion_gamma_n) != 0.0
+        or float(adhesion_gamma_t) != 0.0
+    ):
+        # Adhesion integrity a is treated as lagged/known in the Newton step.
+        a_prev = adhesion_a_prev if adhesion_a_prev is not None else _c(1.0)
+
+        k_n_c = _c(float(adhesion_k_n))
+        k_t_c = _c(float(adhesion_k_t))
+        g_n_c = _c(float(adhesion_gamma_n))
+        g_t_c = _c(float(adhesion_gamma_t))
+
+        n_b = FacetNormal()
+
+        def _proj_n(vec):
+            return dot(vec, n_b) * n_b
+
+        def _proj_t(vec):
+            return vec - _proj_n(vec)
+
+        # k-level traction uses (u_k, vS_k); n-level uses (u_n, vS_n) for θ-scheme consistency.
+        u_nvec_k = _proj_n(u_k)
+        u_tvec_k = u_k - u_nvec_k
+        vS_nvec_k = _proj_n(vS_k)
+        vS_tvec_k = vS_k - vS_nvec_k
+
+        u_nvec_n = _proj_n(u_n)
+        u_tvec_n = u_n - u_nvec_n
+        vS_nvec_n = _proj_n(vS_n)
+        vS_tvec_n = vS_n - vS_nvec_n
+
+        t_adh_k = k_n_c * u_nvec_k + k_t_c * u_tvec_k + g_n_c * vS_nvec_k + g_t_c * vS_tvec_k
+        t_adh_n = k_n_c * u_nvec_n + k_t_c * u_tvec_n + g_n_c * vS_nvec_n + g_t_c * vS_tvec_n
+
+        r_skeleton += (th * alpha_k * a_prev * dot(t_adh_k, u_test) + one_m_th * alpha_n * a_prev * dot(t_adh_n, u_test)) * ds_adh
+
+        # Jacobian (k-part only): δ[ α a_prev t_adh(u,vS) ].
+        du_nvec = _proj_n(du)
+        du_tvec = du - du_nvec
+        dvS_nvec = _proj_n(dvS)
+        dvS_tvec = dvS - dvS_nvec
+        dt_adh = k_n_c * du_nvec + k_t_c * du_tvec + g_n_c * dvS_nvec + g_t_c * dvS_tvec
+
+        a_skel += th * (dalpha * a_prev * dot(t_adh_k, u_test) + alpha_k * a_prev * dot(dt_adh, u_test)) * ds_adh
 
     # ------------------------------------------------------------------
     # (iv) Porosity evolution (Eulerian, advected by vS)
@@ -654,6 +733,43 @@ def build_biofilm_one_domain_forms(
     d_det = -D_det_prev * (_c(4.0) * (_one_minus(_c(2.0) * alpha_k)) * dalpha)
     a_alpha += alpha_test * th * (-(dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic) + d_det) * dx
     a_alpha += D_alpha_c * inner(grad(dalpha), grad(alpha_test)) * dx
+
+    # Optional consistent stabilization for advection-dominated α (useful with D_alpha=0).
+    # - SUPG: τ (vS·∇w) R_alpha
+    # - CIP:  γ h^3 (1/dt + |vS|/h) <[∂_n α],[∂_n w]>_F on interior facets
+    #
+    # Notes:
+    # - We use lagged vS_n in τ and in the test-direction to keep the Jacobian
+    #   consistent (no extra u-coupling from the stabilization weights).
+    # - CIP only affects regions where ∇α is non-zero (i.e. the diffuse interface),
+    #   and remains consistent because [∂_n α]=0 for smooth α.
+    if float(alpha_supg) != 0.0:
+        h_a = MeshSize()
+        vmag = _sqrt(inner(vS_n, vS_n) + _c(1.0e-12))
+        denom = (_c(2.0) * inv_dt) * (_c(2.0) * inv_dt) + (_c(2.0) * vmag / (h_a + _c(1.0e-12))) * (
+            _c(2.0) * vmag / (h_a + _c(1.0e-12))
+        )
+        tau_supg = _c(float(alpha_supg)) / _sqrt(denom + _c(1.0e-16))
+        w_supg = dot(grad(alpha_test), vS_n)
+        r_alpha += tau_supg * w_supg * f_alpha_k * dx
+
+        df_alpha_k = dalpha * inv_dt
+        df_alpha_k += th * (
+            dot(grad(alpha_k), dvS)
+            + dot(grad(dalpha), vS_k)
+            - (dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic)
+            + d_det
+        )
+        a_alpha += tau_supg * w_supg * df_alpha_k * dx
+
+    if float(alpha_cip) != 0.0 and ds_cip is not None:
+        n_int = FacetNormal()
+        h_F = avg(MeshSize())
+        vmag = _sqrt(inner(vS_n, vS_n) + _c(1.0e-12))
+        scale = inv_dt + vmag / (h_F + _c(1.0e-12))
+        tau_cip = _c(float(alpha_cip)) * (h_F * h_F * h_F) * scale
+        r_alpha += tau_cip * _grad_inner_jump(alpha_k, alpha_test, n_int) * ds_cip
+        a_alpha += tau_cip * _grad_inner_jump(dalpha, alpha_test, n_int) * ds_cip
 
     # ------------------------------------------------------------------
     # (vi) Substrate transport
