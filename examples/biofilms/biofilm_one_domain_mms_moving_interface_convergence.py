@@ -8,6 +8,7 @@ import pandas as pd
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
+from pycutfem.io.vtk import export_vtk
 from pycutfem.solvers.nonlinear_solver import NewtonParameters, NewtonSolver, TimeStepperParameters
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import (
@@ -77,6 +78,8 @@ def _run_one(
     D_alpha: float,
     k_det: float,
     eta_n: float,
+    vtk_every: int = 0,
+    vtk_dir=None,
 ):
     theta = 1.0
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=int(nx), ny=int(ny), poly_order=2)
@@ -258,6 +261,13 @@ def _run_one(
 
     step_rows = []
     solver_ref = {}
+    vtk_every = int(vtk_every)
+    vtk_dir_run = None
+    if vtk_every > 0:
+        if vtk_dir is None:
+            raise ValueError("vtk_dir is required when vtk_every > 0.")
+        vtk_dir_run = Path(vtk_dir) / f"nx={int(nx)}"
+        vtk_dir_run.mkdir(parents=True, exist_ok=True)
 
     def _preproc_cb(_funcs):
         solver = solver_ref.get("solver")
@@ -269,6 +279,7 @@ def _run_one(
         solver = solver_ref.get("solver")
         if solver is None:
             return
+        step_no = len(step_rows) + 1
         t_err = float(solver._current_t + solver._current_dt)
         err_v = dh.l2_error(
             v_k,
@@ -284,6 +295,13 @@ def _run_one(
         err_X = dh.l2_error(X_k, exact={"X": lambda x, y: mms.X(x, y, t_err)}, fields=["X"], quad_order=int(qerr), relative=False)
         step_rows.append({"dt": float(solver._current_dt), "err_v": float(err_v), "err_phi": float(err_phi), "err_alpha": float(err_alpha)})
         step_rows[-1]["err_X"] = float(err_X)
+        if vtk_dir_run is not None and (step_no % vtk_every == 0):
+            export_vtk(
+                str(vtk_dir_run / f"step={step_no:04d}.vtu"),
+                mesh,
+                dh,
+                {"v": v_k, "p": p_k, "u": u_k, "phi": phi_k, "alpha": alpha_k, "S": S_k, "X": X_k},
+            )
 
     solver = NewtonSolver(
         forms.residual_form,
@@ -344,6 +362,7 @@ def main() -> None:
     ap.add_argument("--max-it", type=int, default=30)
     ap.add_argument("--convergence", action="store_true", help="Save log-log convergence plot as a PNG.")
     ap.add_argument("--outdir", type=str, default="comparison_outputs", help="Directory for saving CSV/LaTeX tables (and plots).")
+    ap.add_argument("--vtk-every", type=int, default=0, help="Write VTK every N accepted steps (0 disables).")
 
     # MMS parameters
     ap.add_argument("--h0", type=float, default=0.4)
@@ -386,6 +405,11 @@ def main() -> None:
     if not nx_list:
         raise ValueError("Empty --nx-list.")
 
+    outdir = Path(str(args.outdir))
+    outdir.mkdir(parents=True, exist_ok=True)
+    stem = f"biofilm_mms_moving_interface_backend={args.backend}_dt={float(args.dt):g}_nsteps={int(args.nsteps)}"
+    vtk_dir = outdir / "vtk" / stem if int(args.vtk_every) > 0 else None
+
     rows = []
     for nx in nx_list:
         h = 1.0 / float(nx)
@@ -418,6 +442,8 @@ def main() -> None:
                 D_alpha=float(args.D_alpha),
                 k_det=float(args.k_det),
                 eta_n=float(args.eta_n),
+                vtk_every=int(args.vtk_every),
+                vtk_dir=vtk_dir,
             )
         )
 
@@ -459,9 +485,6 @@ def main() -> None:
     print("\nLaTeX table (copy/paste):\n")
     print(latex)
 
-    outdir = Path(str(args.outdir))
-    outdir.mkdir(parents=True, exist_ok=True)
-    stem = f"biofilm_mms_moving_interface_backend={args.backend}_dt={float(args.dt):g}_nsteps={int(args.nsteps)}"
     out_csv = outdir / f"{stem}.csv"
     out_tex = outdir / f"{stem}.tex"
     df.to_csv(out_csv, index=False)

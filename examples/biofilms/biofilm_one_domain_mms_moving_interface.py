@@ -1,11 +1,13 @@
 import argparse
 import math
+import os
 
 import numpy as np
 
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
+from pycutfem.io.vtk import export_vtk
 from pycutfem.solvers.nonlinear_solver import NewtonParameters, NewtonSolver, TimeStepperParameters
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import (
@@ -55,6 +57,8 @@ def main() -> None:
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
     ap.add_argument("--newton-tol", type=float, default=1.0e-10)
     ap.add_argument("--max-it", type=int, default=30)
+    ap.add_argument("--outdir", type=str, default="examples/biofilms/results/mms_moving_interface", help="Directory for writing VTK output.")
+    ap.add_argument("--vtk-every", type=int, default=0, help="Write VTK every N accepted steps (0 disables).")
 
     # MMS parameters
     ap.add_argument("--h0", type=float, default=0.4)
@@ -83,6 +87,10 @@ def main() -> None:
         raise ValueError("--final-time must be positive.")
 
     theta = 1.0  # This MMS is intended for BE usage.
+    vtk_every = int(getattr(args, "vtk_every", 0) or 0)
+    vtk_dir = os.path.join(str(args.outdir), "vtk")
+    if vtk_every > 0:
+        os.makedirs(vtk_dir, exist_ok=True)
 
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=int(args.nx), ny=int(args.ny), poly_order=2)
     mesh = Mesh(
@@ -267,6 +275,7 @@ def main() -> None:
         solver = solver_ref.get("solver")
         if solver is None:
             return
+        step_no = len(step_rows) + 1
         t_err = float(solver._current_t + solver._current_dt)
 
         err_v = dh.l2_error(
@@ -301,6 +310,13 @@ def main() -> None:
                 "err_S": float(err_S),
             }
         )
+        if vtk_every > 0 and (step_no % vtk_every == 0):
+            export_vtk(
+                os.path.join(vtk_dir, f"mms_moving_interface_step={step_no:04d}.vtu"),
+                mesh,
+                dh,
+                {"v": v_k, "p": p_k, "u": u_k, "phi": phi_k, "alpha": alpha_k, "S": S_k},
+            )
 
     solver = NewtonSolver(
         forms.residual_form,
@@ -352,4 +368,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

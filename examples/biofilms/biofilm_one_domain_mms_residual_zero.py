@@ -1,10 +1,12 @@
 import argparse
+import os
 
 import numpy as np
 
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
+from pycutfem.io.vtk import export_vtk
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import (
     Constant,
@@ -60,6 +62,8 @@ def main():
     ap.add_argument("--dt", type=float, default=0.1)
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
     ap.add_argument("--compare-python", action="store_true", help="Also compute the residual with backend='python'.")
+    ap.add_argument("--outdir", type=str, default="examples/biofilms/results/mms_residual_zero", help="Directory for writing optional VTK output.")
+    ap.add_argument("--vtk-every", type=int, default=0, help="Write VTK snapshot (0 disables).")
     args = ap.parse_args()
 
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=int(args.nx), ny=int(args.ny), poly_order=2)
@@ -220,6 +224,17 @@ def main():
     res = _residual_inf(dh, forms.residual_form, bcs, backend=args.backend, quad_order=int(args.q))
     print(f"[{args.backend}] |R_free|_inf = {res:.3e}")
 
+    vtk_every = int(getattr(args, "vtk_every", 0) or 0)
+    if vtk_every > 0:
+        vtk_dir = os.path.join(str(args.outdir), "vtk")
+        os.makedirs(vtk_dir, exist_ok=True)
+        export_vtk(
+            os.path.join(vtk_dir, f"mms_residual_zero_nx={int(args.nx)}_ny={int(args.ny)}.vtu"),
+            mesh,
+            dh,
+            {"v": v_k, "p": p_k, "u": u_k, "phi": phi_k, "alpha": alpha_k, "S": S_k},
+        )
+
     if args.compare_python and args.backend != "python":
         res_py = _residual_inf(dh, forms.residual_form, bcs, backend="python", quad_order=int(args.q))
         print(f"[python] |R_free|_inf = {res_py:.3e}")
@@ -228,4 +243,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

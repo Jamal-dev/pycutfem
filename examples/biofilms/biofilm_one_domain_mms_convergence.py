@@ -8,6 +8,7 @@ import pandas as pd
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
+from pycutfem.io.vtk import export_vtk
 from pycutfem.solvers.nonlinear_solver import NewtonParameters, NewtonSolver, TimeStepperParameters
 from pycutfem.ufl.analytic import Analytic
 from pycutfem.ufl.expressions import (
@@ -60,6 +61,8 @@ def _run_one(
     newton_tol: float,
     max_it: int,
     k_det: float,
+    vtk_every: int = 0,
+    vtk_dir=None,
 ):
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=int(nx), ny=int(ny), poly_order=2)
     mesh = Mesh(
@@ -237,6 +240,18 @@ def _run_one(
         time_params=TimeStepperParameters(dt=dt_val, final_time=dt_val, max_steps=1, theta=theta),
     )
 
+    if int(vtk_every) > 0 and (1 % int(vtk_every) == 0):
+        if vtk_dir is None:
+            raise ValueError("vtk_dir is required when vtk_every > 0.")
+        vtk_dir = Path(vtk_dir)
+        vtk_dir.mkdir(parents=True, exist_ok=True)
+        export_vtk(
+            str(vtk_dir / f"mms_trig_nx={int(nx)}_step=0001.vtu"),
+            mesh,
+            dh,
+            {"v": v_k, "p": p_k, "u": u_k, "phi": phi_k, "alpha": alpha_k, "S": S_k, "X": X_k},
+        )
+
     t_err = mms.t_k
     err_v = dh.l2_error(
         v_k,
@@ -287,11 +302,17 @@ def main() -> None:
     ap.add_argument("--no-detachment", action="store_true", help="Set k_det=0 in the MMS/forcing.")
     ap.add_argument("--convergence", action="store_true", help="Save log-log convergence plot as a PNG.")
     ap.add_argument("--outdir", type=str, default="comparison_outputs", help="Directory for saving CSV/LaTeX tables (and plots).")
+    ap.add_argument("--vtk-every", type=int, default=0, help="Write VTK snapshot every N accepted steps (0 disables).")
     args = ap.parse_args()
 
     nx_list = [int(s.strip()) for s in str(args.nx_list).split(",") if s.strip()]
     if not nx_list:
         raise ValueError("Empty --nx-list.")
+
+    outdir = Path(str(args.outdir))
+    outdir.mkdir(parents=True, exist_ok=True)
+    stem = f"biofilm_mms_trig_backend={args.backend}_theta={float(args.theta):g}_dt={float(args.dt):g}"
+    vtk_dir = outdir / "vtk" / stem if int(args.vtk_every) > 0 else None
 
     k_det = 0.0 if bool(args.no_detachment) else 0.2
     rows = [
@@ -306,6 +327,8 @@ def main() -> None:
             newton_tol=float(args.newton_tol),
             max_it=int(args.max_it),
             k_det=float(k_det),
+            vtk_every=int(args.vtk_every),
+            vtk_dir=vtk_dir,
         )
         for nx in nx_list
     ]
@@ -344,9 +367,6 @@ def main() -> None:
     print("\nLaTeX table (copy/paste):\n")
     print(latex)
 
-    outdir = Path(str(args.outdir))
-    outdir.mkdir(parents=True, exist_ok=True)
-    stem = f"biofilm_mms_trig_backend={args.backend}_theta={float(args.theta):g}_dt={float(args.dt):g}"
     out_csv = outdir / f"{stem}.csv"
     out_tex = outdir / f"{stem}.tex"
     df.to_csv(out_csv, index=False)
