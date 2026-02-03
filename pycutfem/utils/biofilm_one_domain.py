@@ -25,6 +25,7 @@ from pycutfem.ufl.expressions import (
     Constant,
     FacetNormal,
     Identity,
+    Laplacian,
     MeshSize,
     avg,
     div,
@@ -33,7 +34,6 @@ from pycutfem.ufl.expressions import (
     inner,
     jump,
     outer,
-    trace,
 )
 
 from pycutfem.utils.nonlinear_solid_eulerian_refmap import (
@@ -249,6 +249,8 @@ def build_biofilm_one_domain_forms(
     c_nh=None,
     beta_nh=None,
     kappa_inv_model: str = "spatial",
+    kappa_inv_phi_ref: float = 0.3,
+    kappa_inv_kc_eps: float = 1.0e-12,
     # transport parameters
     D_phi: float = 0.0,
     gamma_phi: float = 0.0,
@@ -259,6 +261,20 @@ def build_biofilm_one_domain_forms(
     u_extension_mode: str = "l2",
     gamma_u_pin: float = 0.0,
     D_alpha: float = 0.0,
+    # Allen–Cahn / phase-field interface regularization for α
+    alpha_cahn_M: float = 0.0,
+    alpha_cahn_gamma: float = 0.0,
+    alpha_cahn_eps: float = 1.0,
+    # Crack propagation: additional surface speed term V_crack via δ(α)
+    alpha_crack_k: float = 0.0,
+    alpha_crack_Dc: float = 0.0,
+    alpha_crack_m: float = 1.0,
+    alpha_crack_gamma_kappa: float = 0.0,
+    alpha_crack_eta_kappa: float = 1.0e-12,
+    alpha_crack_eta_pos: float = 1.0e-12,
+    alpha_crack_eta_mech: float = 1.0e-12,
+    alpha_crack_driver: str = "shear",
+    V_crack_prev=None,
     # transport stabilizations (consistent, for advection-dominated cases)
     alpha_supg: float = 0.0,
     alpha_cip: float = 0.0,
@@ -381,12 +397,68 @@ def build_biofilm_one_domain_forms(
 
     kappa_inv_key = str(kappa_inv_model).strip().lower()
 
+    kc_keys = {
+        "kozeny",
+        "kozeny_carman",
+        "kozeny-carman",
+        "kozeny_carman_phi",
+        "kc",
+    }
+
+    def _kozeny_carman_scale(phi, *, phi_ref, eps_kc):
+        # Kozeny–Carman scaling (dimensionless) for inverse permeability:
+        #   k^{-1}(phi) ∝ (1-phi)^2 / phi^3
+        # We normalize by phi_ref so that k^{-1}(phi_ref) = kappa_inv.
+        one_m = _one_minus(phi)
+        num = one_m * one_m
+        den = phi * phi * phi + eps_kc
+        g = num / den
+
+        one_m0 = _one_minus(phi_ref)
+        g0 = (one_m0 * one_m0) / (phi_ref * phi_ref * phi_ref + eps_kc)
+        return g / g0
+
+    def _d_kozeny_carman_scale(phi, dphi, *, phi_ref, eps_kc):
+        # Linearization of the normalized scale: δ[ g(phi)/g(phi_ref) ].
+        # g(phi) = (1-phi)^2 / (phi^3+eps)
+        one_m = _one_minus(phi)
+        num = one_m * one_m
+        den = phi * phi * phi + eps_kc
+
+        one_m0 = _one_minus(phi_ref)
+        g0 = (one_m0 * one_m0) / (phi_ref * phi_ref * phi_ref + eps_kc)
+
+        # dg/dphi = (num' den - num den') / den^2,  num'=-2(1-phi), den'=3 phi^2
+        dg_dphi = ((-_c(2.0) * one_m) * den - num * (_c(3.0) * phi * phi)) / (den * den)
+        return (dg_dphi / g0) * dphi
+
     # Fast/robust path for *scalar spatial* κ^{-1}: keep the legacy scalar formulation.
     if kappa_inv_key in {"spatial", "constant", "const"} and getattr(kappa_inv, "dim", None) == 0:
         drag_mode = "scalar"
         beta_k = beta_coeff_k * kappa_inv
         beta_n = beta_coeff_n * kappa_inv
         dbeta = dbeta_coeff * kappa_inv
+    elif kappa_inv_key in kc_keys and getattr(kappa_inv, "dim", None) == 0:
+        # Kozeny–Carman: permeability depends on porosity (phi).
+        drag_mode = "scalar"
+
+        phi_ref_val = float(kappa_inv_phi_ref)
+        if not (0.0 < phi_ref_val < 1.0):
+            raise ValueError(f"kappa_inv_phi_ref must be in (0,1); got {phi_ref_val}.")
+        phi_ref_c = _c(phi_ref_val)
+        eps_kc = _c(float(kappa_inv_kc_eps))
+
+        scale_k = _kozeny_carman_scale(phi_k, phi_ref=phi_ref_c, eps_kc=eps_kc)
+        scale_n = _kozeny_carman_scale(phi_n, phi_ref=phi_ref_c, eps_kc=eps_kc)
+        dscale_k = _d_kozeny_carman_scale(phi_k, dphi, phi_ref=phi_ref_c, eps_kc=eps_kc)
+
+        k_inv_k = kappa_inv * scale_k
+        k_inv_n = kappa_inv * scale_n
+        dk_inv_k = kappa_inv * dscale_k
+
+        beta_k = beta_coeff_k * k_inv_k
+        beta_n = beta_coeff_n * k_inv_n
+        dbeta = dbeta_coeff * k_inv_k + beta_coeff_k * dk_inv_k
     else:
         drag_mode = "matrix"
 
@@ -401,6 +473,21 @@ def build_biofilm_one_domain_forms(
             k_inv_k = eulerian_k_inv(u_k, K_inv, dim=int(dim))
             k_inv_n = eulerian_k_inv(u_n, K_inv, dim=int(dim))
             dk_inv_k = deulerian_k_inv(u_k, du, K_inv, dim=int(dim))
+        elif kappa_inv_key in kc_keys:
+            # Kozeny–Carman scaling applied as an isotropic factor to the (possibly anisotropic) K_inv.
+            phi_ref_val = float(kappa_inv_phi_ref)
+            if not (0.0 < phi_ref_val < 1.0):
+                raise ValueError(f"kappa_inv_phi_ref must be in (0,1); got {phi_ref_val}.")
+            phi_ref_c = _c(phi_ref_val)
+            eps_kc = _c(float(kappa_inv_kc_eps))
+
+            scale_k = _kozeny_carman_scale(phi_k, phi_ref=phi_ref_c, eps_kc=eps_kc)
+            scale_n = _kozeny_carman_scale(phi_n, phi_ref=phi_ref_c, eps_kc=eps_kc)
+            dscale_k = _d_kozeny_carman_scale(phi_k, dphi, phi_ref=phi_ref_c, eps_kc=eps_kc)
+
+            k_inv_k = scale_k * K_inv
+            k_inv_n = scale_n * K_inv
+            dk_inv_k = dscale_k * K_inv
         elif kappa_inv_key in {"spatial", "constant", "const"}:
             k_inv_k = K_inv
             k_inv_n = K_inv
@@ -479,7 +566,9 @@ def build_biofilm_one_domain_forms(
     r_mom += one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
     r_mom += _c(2.0) * th * mu_k * inner(_epsilon(v_k), _epsilon(v_test)) * dx
     r_mom += _c(2.0) * one_m_th * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
-    r_mom += -p_k * div(v_test) * dx
+    # Pressure term for the mixture constraint div(C v + B vS)=... :
+    # variationally consistent momentum coupling is grad(C p), i.e. -(C p, div(w)).
+    r_mom += -(C_k * p_k) * div(v_test) * dx
     if drag_mode == "scalar":
         r_mom += beta_k * dot(v_k, v_test) * dx
         r_mom += -beta_k * dot(vS_k, v_test) * dx
@@ -494,7 +583,8 @@ def build_biofilm_one_domain_forms(
     a_mom += th * (rho_f * d_divCv_k * dot(v_k, v_test) + div_rhov_k * dot(dv, v_test)) * dx
     a_mom += _c(2.0) * th * (dmu * inner(_epsilon(v_k), _epsilon(v_test)) + mu_k * inner(_epsilon(dv), _epsilon(v_test))) * dx
 
-    a_mom += -dp * div(v_test) * dx
+    # δ(C p) = p δC + C δp
+    a_mom += -(p_k * dC_k + C_k * dp) * div(v_test) * dx
     if drag_mode == "scalar":
         a_mom += dbeta * (dot(v_k, v_test) - dot(vS_k, v_test)) * dx
         a_mom += beta_k * dot(dv, v_test) * dx
@@ -627,30 +717,55 @@ def build_biofilm_one_domain_forms(
         else:
             raise ValueError(f"Unknown u_extension_mode {u_extension_mode!r}.")
 
-    # Optional Eulerian skeleton inertia (a^S = ∂_t vS + (vS·∇)vS).
+    # Optional Eulerian skeleton inertia (conservative form).
+    #
+    # When inertia is enabled and the solid mass coefficient depends on (α,φ),
+    # we use the conservative form to avoid missing "variable density" terms:
+    #   ∂t(ρ_s vS) + div(ρ_s vS ⊗ vS) = ρ_s (vS·∇)vS + vS div(ρ_s vS) + ∂t(ρ_s vS),
+    # with ρ_s = rho_s0_tilde * α(1-φ) = rho_s0_tilde * B.
     if bool(include_skeleton_acceleration) and float(rho_s0_tilde) != 0.0:
+        rho_s0_c = rho_s0_tilde
+
+        rhoS_k = rho_s0_c * B_k
+        rhoS_n = rho_s0_c * B_n
+
+        # Conservative-in-time momentum term
+        momS_dot = (rhoS_k * vS_k - rhoS_n * vS_n) * inv_dt
+
+        # Conservative convection: div(ρ_s vS⊗vS) = ρ_s (vS·∇)vS + vS div(ρ_s vS).
+        #
+        # IMPORTANT: avoid grad(vS_k) directly because the current UFL visitor only
+        # supports grad() of primitive Functions/Trials/Tests (not arbitrary expressions like (u_k-u_n)/dt).
         grad_vS_k = (grad(u_k) - grad(u_n)) / dt
         if u_nm1 is None:
             grad_vS_n = Constant([[0.0] * int(dim) for _ in range(int(dim))], dim=2)
         else:
             grad_vS_n = (grad(u_n) - grad(u_nm1)) / dt
 
-        acc_local = (vS_k - vS_n) / dt
-        adv_k = dot(grad_vS_k, vS_k)
-        adv_n = dot(grad_vS_n, vS_n)
-        acc = acc_local + th * adv_k + one_m_th * adv_n
+        advS_k = dot(grad_vS_k, vS_k)
+        advS_n = dot(grad_vS_n, vS_n)
+        convS_k = dot(advS_k, u_test)
+        convS_n = dot(advS_n, u_test)
 
-        m_s = rho_s0_tilde * _one_minus(phi_k)
-        r_skeleton += alpha_k * inner(m_s * acc, u_test) * dx
+        div_rhoS_vS_k = rho_s0_c * divBvS_k
+        div_rhoS_vS_n = rho_s0_c * divBvS_n
 
-        # δm_s = -rho_s0_tilde δφ,  δacc = δvS/dt + θ δ((∇vS)vS)
-        dm_s = rho_s0_tilde * (-dphi)
-        dvS_over_dt = dvS / dt
+        r_skeleton += inner(momS_dot, u_test) * dx
+        r_skeleton += th * (rhoS_k * convS_k + div_rhoS_vS_k * dot(vS_k, u_test)) * dx
+        r_skeleton += one_m_th * (rhoS_n * convS_n + div_rhoS_vS_n * dot(vS_n, u_test)) * dx
+
+        # Jacobian (k-part only): δ[ (ρ_s vS)/dt ] + θ δ[ ρ_s (vS·∇)vS + vS div(ρ_s vS) ].
+        d_rhoS_k = rho_s0_c * dB_k
+        d_momS_dot = (d_rhoS_k * vS_k + rhoS_k * dvS) * inv_dt
+        a_skel += inner(d_momS_dot, u_test) * dx
+
         grad_dvS = grad(du) / dt
-        dadv_k = dot(grad_dvS, vS_k) + dot(grad_vS_k, dvS)
-        dacc = dvS_over_dt + th * dadv_k
+        d_advS_k = dot(grad_dvS, vS_k) + dot(grad_vS_k, dvS)
+        d_convS_k = dot(d_advS_k, u_test)
+        a_skel += th * (d_rhoS_k * convS_k + rhoS_k * d_convS_k) * dx
 
-        a_skel += inner((dalpha * m_s + alpha_k * dm_s) * acc + alpha_k * m_s * dacc, u_test) * dx
+        d_div_rhoS_vS_k = rho_s0_c * d_divBvS_k
+        a_skel += th * (d_div_rhoS_vS_k * dot(vS_k, u_test) + div_rhoS_vS_k * dot(dvS, u_test)) * dx
 
     # Optional facet stabilization for u (CIP/ghost-penalty on interior facets).
     # This improves robustness when u becomes weakly constrained (e.g. α→0 in
@@ -805,17 +920,105 @@ def build_biofilm_one_domain_forms(
     G_k = _G(S_k, phi_k, k_g=_c(float(k_g)), mu_max=_c(float(mu_max)), K_S=_c(float(K_S)))
     G_n = _G(S_n, phi_n, k_g=_c(float(k_g)), mu_max=_c(float(mu_max)), K_S=_c(float(K_S)))
 
+    # Phase-field (Allen–Cahn) regularization parameters for α.
+    # Only active when alpha_cahn_M*alpha_cahn_gamma != 0.
+    eps_alpha_val = float(alpha_cahn_eps)
+    if eps_alpha_val <= 0.0 and (float(alpha_cahn_M) != 0.0 or float(alpha_crack_k) != 0.0):
+        raise ValueError(f"alpha_cahn_eps must be > 0 when phase-field/crack terms are enabled; got {eps_alpha_val}.")
+    eps_alpha_c = _c(max(eps_alpha_val, 1.0e-12))
+
+    M_alpha_c = _c(float(alpha_cahn_M))
+    gamma_alpha_c = _c(float(alpha_cahn_gamma))
+    M_gamma_alpha = M_alpha_c * gamma_alpha_c
+
     f_alpha_k = (alpha_k - alpha_n) * inv_dt
     # Surface-localized detachment sink: D_det_prev * δ(α), where δ is a smooth interface delta.
     # We use δ(α) = 4 α (1-α), which is supported robustly by the current UFL/compiler stack.
     delta_k = _c(4.0) * alpha_k * _one_minus(alpha_k)
     delta_n = _c(4.0) * alpha_n * _one_minus(alpha_n)
 
-    f_alpha_k += th * (dot(grad(alpha_k), vS_k) - G_k * alpha_k * _one_minus(alpha_k) - D_det_prev * delta_k)
-    f_alpha_k += one_m_th * (dot(grad(alpha_n), vS_n) - G_n * alpha_n * _one_minus(alpha_n) - D_det_prev * delta_n)
+    # Optional crack-propagation surface speed V_crack^prev (lagged): adds an additional
+    # surface-localized sink proportional to δ(α).
+    crack_coef_prev = _c(0.0)
+    if float(alpha_crack_k) != 0.0:
+        if V_crack_prev is not None:
+            Vc_prev = V_crack_prev if hasattr(V_crack_prev, "dim") else _c(float(V_crack_prev))
+        else:
+            driver_key = str(alpha_crack_driver).strip().lower()
+            eta_mech = _c(float(alpha_crack_eta_mech))
+
+            # IMPORTANT: avoid vector inner products of function-function in LHS assembly
+            # (the current visitor only supports VecOpInfo.inner for test/trial pairs).
+            # Use driver measures built from GradOpInfo/HessOpInfo or scalar expressions.
+            if driver_key in {"shear", "fluid_shear", "tau"}:
+                # Fluid shear stress proxy (works robustly in all backends):
+                #   τ ≈ 2 μ ||ε(v)||_F
+                tau2 = inner(_epsilon(v_n), _epsilon(v_n))
+                tau = _sqrt(tau2 + eta_mech)
+                D_mech_n = _c(2.0) * mu_n * tau
+            elif driver_key in {"solid_strain", "strain"}:
+                # Skeleton strain proxy (dimensionless):
+                #   ||ε(u)||_F
+                eps2 = inner(_epsilon(u_n), _epsilon(u_n))
+                D_mech_n = _sqrt(eps2 + eta_mech)
+            elif driver_key in {"drag", "brinkman_drag", "brinkman"}:
+                # Approximate drag-driven tearing with the shear proxy due to current compiler limits.
+                tau2 = inner(_epsilon(v_n), _epsilon(v_n))
+                tau = _sqrt(tau2 + eta_mech)
+                D_mech_n = _c(2.0) * mu_n * tau
+            else:
+                raise ValueError(
+                    f"Unknown alpha_crack_driver {alpha_crack_driver!r}. Use 'shear', 'solid_strain', or 'drag' (alias)."
+                )
+
+            # Ensure the driver is treated as a function-like scalar (VecOpInfo on the left)
+            # so subsequent arithmetic does not hit unsupported float - VecOpInfo branches
+            # in LHS assembly.
+            D_mech_n = (_c(0.0) * alpha_n) + D_mech_n
+
+            # Curvature proxy from α^n using only primitive grad/Laplacian operators
+            # (keeps compatibility with all backends, including the C++ kernel).
+            g_n = grad(alpha_n)
+            g2 = inner(g_n, g_n)
+            denom = g2 + _c(float(alpha_crack_eta_kappa))
+            denom_sqrt = _sqrt(denom)
+            # The exact mean curvature κ = div(∇α/|∇α|) is not fully supported in the
+            # current symbolic pipeline. We use a robust approximation based on the
+            # Laplacian (trace of the Hessian):
+            #   κ̃ = (|∇α|^2 Δα) / (|∇α|^2 + η)^{3/2}  ≈ Δα/|∇α|.
+            lap_n = Laplacian(alpha_n)
+            kappa_n = (g2 * lap_n) / (denom * denom_sqrt)
+
+            D_c = _c(float(alpha_crack_Dc))
+            gamma_kappa = _c(float(alpha_crack_gamma_kappa))
+            drive = D_mech_n - gamma_kappa * kappa_n - D_c
+
+            # Smooth positive part: <x>_+ ≈ 0.5 (x + sqrt(x^2 + η)).
+            eta_pos = _c(float(alpha_crack_eta_pos))
+            pos = _c(0.5) * (drive + _sqrt(drive * drive + eta_pos))
+
+            m_pow = float(alpha_crack_m)
+            if m_pow < 1.0:
+                raise ValueError(f"alpha_crack_m must be >= 1; got {m_pow}.")
+            Vc_prev = _c(float(alpha_crack_k)) * (pos ** _c(m_pow))
+
+        # Convert speed [length/time] to a rate [1/time] via (4 ε)^{-1}.
+        crack_coef_prev = Vc_prev / (_c(4.0) * eps_alpha_c)
+
+    # Surface-localized erosion/detachment sink is -D_det_prev δ(α) on the RHS,
+    # so it enters the residual with a + sign (same convention as the X source).
+    surf_coef_prev = D_det_prev + crack_coef_prev
+    f_alpha_k += th * (dot(grad(alpha_k), vS_k) - G_k * alpha_k * _one_minus(alpha_k) + surf_coef_prev * delta_k)
+    f_alpha_k += one_m_th * (dot(grad(alpha_n), vS_n) - G_n * alpha_n * _one_minus(alpha_n) + surf_coef_prev * delta_n)
 
     r_alpha = alpha_test * f_alpha_k * dx
     r_alpha += D_alpha_c * inner(grad(alpha_k), grad(alpha_test)) * dx
+    # Allen–Cahn regularization: -(Mγ ε Δα) + (Mγ/ε) W'(α) in the residual.
+    if float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0:
+        # W'(α) for W(α)=α^2(1-α)^2 is 2α(1-α)(1-2α).
+        Wp_k = _c(2.0) * alpha_k * _one_minus(alpha_k) * _one_minus(_c(2.0) * alpha_k)
+        r_alpha += (M_gamma_alpha * eps_alpha_c) * inner(grad(alpha_k), grad(alpha_test)) * dx
+        r_alpha += alpha_test * ((M_gamma_alpha / eps_alpha_c) * Wp_k) * dx
     r_alpha += -alpha_test * f_alpha * dx
 
     # Jacobian (k-part only)
@@ -826,10 +1029,18 @@ def build_biofilm_one_domain_forms(
 
     a_alpha = alpha_test * (dalpha * inv_dt) * dx
     a_alpha += alpha_test * th * (dot(grad(alpha_k), dvS) + dot(grad(dalpha), vS_k)) * dx
-    # δ[ D_det_prev * 4 α(1-α) ] = D_det_prev * 4 (1-2α) δα  (D_det_prev is lagged).
-    d_det = -D_det_prev * (_c(4.0) * (_one_minus(_c(2.0) * alpha_k)) * dalpha)
-    a_alpha += alpha_test * th * (-(dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic) + d_det) * dx
+    # δ[ (D_det_prev + crack_coef_prev) * δ(α) ] = (D_det_prev + crack_coef_prev) * δ'(α) δα
+    # (surf coefficients are lagged).
+    d_delta_k = _c(4.0) * (_one_minus(_c(2.0) * alpha_k)) * dalpha
+    d_surf = surf_coef_prev * d_delta_k
+    a_alpha += alpha_test * th * (-(dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic) + d_surf) * dx
     a_alpha += D_alpha_c * inner(grad(dalpha), grad(alpha_test)) * dx
+    if float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0:
+        # W''(α) = 2 - 12α + 12α^2
+        # NOTE: keep the function-like term on the left; float - VecOpInfo is not supported.
+        Wpp_k = (-_c(12.0) * alpha_k) + (_c(12.0) * (alpha_k * alpha_k)) + _c(2.0)
+        a_alpha += (M_gamma_alpha * eps_alpha_c) * inner(grad(dalpha), grad(alpha_test)) * dx
+        a_alpha += alpha_test * ((M_gamma_alpha / eps_alpha_c) * Wpp_k * dalpha) * dx
 
     # Optional consistent stabilization for advection-dominated α (useful with D_alpha=0).
     # - SUPG: τ (vS·∇w) R_alpha
@@ -855,7 +1066,7 @@ def build_biofilm_one_domain_forms(
             dot(grad(alpha_k), dvS)
             + dot(grad(dalpha), vS_k)
             - (dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic)
-            + d_det
+            + d_surf
         )
         a_alpha += tau_supg * w_supg * df_alpha_k * dx
 

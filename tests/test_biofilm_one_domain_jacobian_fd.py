@@ -20,7 +20,23 @@ from pycutfem.utils.meshgen import structured_quad
 
 
 def _build_problem(
-    *, nx: int = 2, ny: int = 2, q: int = 5, D_alpha: float = 0.1, alpha_supg: float = 0.0, alpha_cip: float = 0.0, u_cip: float = 0.0
+    *,
+    nx: int = 2,
+    ny: int = 2,
+    q: int = 5,
+    D_alpha: float = 0.1,
+    alpha_supg: float = 0.0,
+    alpha_cip: float = 0.0,
+    u_cip: float = 0.0,
+    kappa_inv_model: str = "spatial",
+    kappa_inv_phi_ref: float | None = None,
+    alpha_cahn_M: float = 0.0,
+    alpha_cahn_gamma: float = 0.0,
+    alpha_cahn_eps: float = 1.0,
+    alpha_crack_k: float = 0.0,
+    alpha_crack_Dc: float = 0.0,
+    alpha_crack_gamma_kappa: float = 0.0,
+    alpha_crack_driver: str = "shear",
 ):
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
     mesh = Mesh(
@@ -127,11 +143,20 @@ def _build_problem(
         rho_f=Constant(1.0),
         mu_f=Constant(1.0e-2),
         kappa_inv=Constant(10.0),
+        kappa_inv_model=str(kappa_inv_model),
+        kappa_inv_phi_ref=float(kappa_inv_phi_ref) if kappa_inv_phi_ref is not None else 0.7,
         mu_s=Constant(1.0),
         lambda_s=Constant(1.0),
         D_phi=0.1,
         gamma_phi=1.0,
         D_alpha=float(D_alpha),
+        alpha_cahn_M=float(alpha_cahn_M),
+        alpha_cahn_gamma=float(alpha_cahn_gamma),
+        alpha_cahn_eps=float(alpha_cahn_eps),
+        alpha_crack_k=float(alpha_crack_k),
+        alpha_crack_Dc=float(alpha_crack_Dc),
+        alpha_crack_gamma_kappa=float(alpha_crack_gamma_kappa),
+        alpha_crack_driver=str(alpha_crack_driver),
         alpha_supg=float(alpha_supg),
         alpha_cip=float(alpha_cip),
         u_cip=float(u_cip),
@@ -305,3 +330,122 @@ def test_biofilm_one_domain_u_cip_jacobian_fd_consistency():
         denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
         rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
         assert rel < 1.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
+
+
+def test_biofilm_one_domain_kc_permeability_backend_parity_python_cpp():
+    dh, forms, _ = _build_problem(nx=2, ny=2, q=5, kappa_inv_model="kozeny_carman", kappa_inv_phi_ref=0.7)
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+
+    K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    K_cpp, R_cpp = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="cpp")
+
+    A_py = K_py.tocsr().toarray()
+    A_cpp = K_cpp.tocsr().toarray()
+    assert np.allclose(A_py, A_cpp, rtol=1.0e-10, atol=1.0e-12)
+    assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_biofilm_one_domain_kc_permeability_jacobian_fd_consistency():
+    """
+    FD check that Kozeny–Carman permeability dependence on phi remains consistent.
+    """
+    dh, forms, field_to_func_k = _build_problem(nx=2, ny=2, q=5, kappa_inv_model="kc", kappa_inv_phi_ref=0.7)
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    R0 = np.asarray(R0, dtype=float)
+
+    def assemble_residual():
+        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
+        return np.asarray(R, dtype=float)
+
+    # Probe a mid phi DOF (kappa_inv(phi) affects beta and therefore both momentum and skeleton drag).
+    probes = []
+    sl = dh.get_field_slice("phi")
+    if sl:
+        probes.append(int(sl[len(sl) // 2]))
+
+    eps = 1.0e-8
+    for j in probes:
+        fld, _ = dh._dof_to_node_map[j]
+        func = field_to_func_k[fld]
+        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
+        R1 = assemble_residual()
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
+
+        fd = (R1 - R0) / eps
+        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
+        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
+        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
+        assert rel < 1.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
+
+
+def test_biofilm_one_domain_alpha_cahn_crack_backend_parity_python_cpp():
+    dh, forms, _ = _build_problem(
+        nx=2,
+        ny=2,
+        q=5,
+        D_alpha=0.05,
+        alpha_cahn_M=0.2,
+        alpha_cahn_gamma=1.0,
+        alpha_cahn_eps=0.1,
+        alpha_crack_k=0.5,
+        alpha_crack_Dc=0.0,
+        alpha_crack_gamma_kappa=0.0,
+        alpha_crack_driver="shear",
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+
+    K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    K_cpp, R_cpp = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="cpp")
+
+    A_py = K_py.tocsr().toarray()
+    A_cpp = K_cpp.tocsr().toarray()
+    assert np.allclose(A_py, A_cpp, rtol=1.0e-10, atol=1.0e-12)
+    assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_biofilm_one_domain_alpha_cahn_crack_jacobian_fd_consistency():
+    """
+    FD check for the Allen–Cahn + crack-propagation additions to the alpha equation.
+    """
+    dh, forms, field_to_func_k = _build_problem(
+        nx=2,
+        ny=2,
+        q=5,
+        D_alpha=0.05,
+        alpha_cahn_M=0.2,
+        alpha_cahn_gamma=1.0,
+        alpha_cahn_eps=0.1,
+        alpha_crack_k=0.5,
+        alpha_crack_Dc=0.0,
+        alpha_crack_gamma_kappa=0.0,
+        alpha_crack_driver="shear",
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    R0 = np.asarray(R0, dtype=float)
+
+    def assemble_residual():
+        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
+        return np.asarray(R, dtype=float)
+
+    probes = []
+    sl = dh.get_field_slice("alpha")
+    if sl:
+        probes.append(int(sl[len(sl) // 2]))
+
+    eps = 1.0e-8
+    for j in probes:
+        fld, _ = dh._dof_to_node_map[j]
+        func = field_to_func_k[fld]
+        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
+        R1 = assemble_residual()
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
+
+        fd = (R1 - R0) / eps
+        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
+        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
+        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
+        assert rel < 2.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"

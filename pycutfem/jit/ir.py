@@ -173,7 +173,22 @@ class Cofactor:
     pass
 
 @dataclass(frozen=True, slots=True)
-class Hessian:   pass
+class Hessian:
+    """Instruction to compute the Hessian of the top of the stack.
+
+    `field_names` is used by backends to request the required second-derivative tables.
+    """
+
+    field_names: list = field(default_factory=list)
+    side: str = ""  # "", "+", or "-"
+
 
 @dataclass(frozen=True, slots=True)
-class Laplacian: pass
+class Laplacian:
+    """Instruction to compute the Laplacian of the top of the stack.
+
+    `field_names` is used by backends to request the required second-derivative tables.
+    """
+
+    field_names: list = field(default_factory=list)
+    side: str = ""  # "", "+", or "-"

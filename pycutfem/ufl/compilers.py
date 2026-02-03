@@ -1077,12 +1077,16 @@ class FormCompiler:
         base = self._visit(n.a)
         exponent = self._visit(n.b)
 
-        # Handle custom VecOpInfo and GradOpInfo types explicitly
-        if isinstance(base, (VecOpInfo, GradOpInfo)):
+        # Handle custom VecOpInfo and GradOpInfo types explicitly.
+        #
+        # NOTE: VecOpInfo and GradOpInfo have different constructor signatures;
+        # use the `_with` helpers to preserve metadata safely.
+        if isinstance(base, VecOpInfo):
             new_data = base.data ** exponent
-            # Return a new instance of the same class with the new data
-            # This uses getattr for robustness, as VecOpInfo lacks 'coeffs'
-            return type(base)(data=new_data, role=base.role, coeffs=getattr(base, 'coeffs', None))
+            return base._with(new_data, role=base.role)
+        if isinstance(base, GradOpInfo):
+            new_data = base.data ** exponent
+            return base._with(new_data, role=base.role)
 
         # Ensure the exponent is a scalar (constant).
         if not np.isscalar(exponent):

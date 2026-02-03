@@ -222,7 +222,12 @@ class IRGenerator:
                 self._emit_restriction(op.domain, side, op.operand)
                 return
             self._visit(op, side=side)
-            self.ir_sequence.append(IRHessian())
+            field_names = []
+            if hasattr(op, "field_names"):
+                field_names = list(getattr(op, "field_names", []) or [])
+            elif hasattr(op, "field_name"):
+                field_names = [getattr(op, "field_name")]
+            self.ir_sequence.append(IRHessian(field_names=field_names, side=str(side or "")))
             return
 
         if isinstance(node, UFLLaplacian):
@@ -237,7 +242,12 @@ class IRGenerator:
                 self._emit_restriction(op.domain, side, op.operand)
                 return
             self._visit(op, side=side)
-            self.ir_sequence.append(IRLaplacian())
+            field_names = []
+            if hasattr(op, "field_names"):
+                field_names = list(getattr(op, "field_names", []) or [])
+            elif hasattr(op, "field_name"):
+                field_names = [getattr(op, "field_name")]
+            self.ir_sequence.append(IRLaplacian(field_names=field_names, side=str(side or "")))
             return
             
         if isinstance(node, DivOperation):

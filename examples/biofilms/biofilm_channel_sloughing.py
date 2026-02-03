@@ -112,10 +112,43 @@ def main() -> None:
     ap.add_argument("--rho-f", type=float, default=1.0)
     ap.add_argument("--mu-f", type=float, default=0.1)
     ap.add_argument("--kappa-inv", type=float, default=10.0)
+    ap.add_argument(
+        "--kappa-inv-model",
+        type=str,
+        default="spatial",
+        choices=("spatial", "kozeny", "kozeny_carman", "kc"),
+        help="Inverse permeability model. 'spatial' uses a constant kappa_inv; 'kozeny_carman' scales it with phi.",
+    )
+    ap.add_argument(
+        "--kappa-phi-ref",
+        type=float,
+        default=None,
+        help="Reference porosity for Kozeny–Carman normalization (k^{-1}(phi_ref)=kappa_inv). Defaults to --phi-b.",
+    )
     ap.add_argument("--mu-s", type=float, default=0.5)
     ap.add_argument("--lambda-s", type=float, default=0.5)
-    ap.add_argument("--solid-inertia", action="store_true", help="Enable Eulerian skeleton acceleration term a^S in the u-equation.")
-    ap.add_argument("--rho-s0", type=float, default=0.0, help="Skeleton inertia coefficient rho_s0_tilde (used if --solid-inertia).")
+    # Solid inertia: for sloughing/both runs we typically want inertia enabled to allow chunk motion.
+    # Use a tri-state default (None) so we can enable it automatically for sloughing unless the user overrides.
+    ap.add_argument(
+        "--solid-inertia",
+        dest="solid_inertia",
+        action="store_true",
+        default=None,
+        help="Enable Eulerian skeleton inertia term in the u-equation (conservative form).",
+    )
+    ap.add_argument(
+        "--no-solid-inertia",
+        dest="solid_inertia",
+        action="store_false",
+        default=None,
+        help="Disable skeleton inertia term (overrides the sloughing default).",
+    )
+    ap.add_argument(
+        "--rho-s0",
+        type=float,
+        default=None,
+        help="Skeleton inertia coefficient rho_s0_tilde (used if inertia is enabled).",
+    )
     ap.add_argument(
         "--u-predictor",
         type=str,
@@ -162,6 +195,74 @@ def main() -> None:
         help="CIP stabilization factor for phi (jump of normal gradient across interior facets; 0 disables). Recommended when --D-phi 0.",
     )
     ap.add_argument("--D-alpha", type=float, default=0.001, help="Indicator diffusion (interface regularization).")
+    # Phase-field / crack options for alpha
+    ap.add_argument(
+        "--alpha-cahn-M",
+        type=float,
+        default=0.0,
+        help="Allen–Cahn mobility M_alpha (0 disables phase-field regularization).",
+    )
+    ap.add_argument(
+        "--alpha-cahn-gamma",
+        type=float,
+        default=0.0,
+        help="Allen–Cahn surface-energy coefficient gamma_alpha (0 disables phase-field regularization).",
+    )
+    ap.add_argument(
+        "--alpha-cahn-eps",
+        type=float,
+        default=None,
+        help="Phase-field interface thickness epsilon for Allen–Cahn/crack terms (defaults to --eps).",
+    )
+    ap.add_argument(
+        "--k-crack",
+        type=float,
+        default=0.0,
+        help="Crack propagation coefficient k_c (0 disables crack term).",
+    )
+    ap.add_argument(
+        "--D-crack",
+        type=float,
+        default=0.0,
+        help="Crack threshold D_c (mechanical driver must exceed this).",
+    )
+    ap.add_argument("--m-crack", type=float, default=1.0, help="Crack exponent m>=1.")
+    ap.add_argument(
+        "--gamma-kappa",
+        type=float,
+        default=0.0,
+        help="Curvature resistance coefficient gamma_kappa in the crack driver D_mech - gamma_kappa*kappa - D_c.",
+    )
+    ap.add_argument("--eta-kappa", type=float, default=1.0e-12, help="Curvature regularization eta_kappa.")
+    ap.add_argument("--eta-pos", type=float, default=1.0e-12, help="Positive-part regularization eta for <x>_+.")
+    ap.add_argument("--eta-mech", type=float, default=1.0e-12, help="Mechanical driver regularization inside sqrt.")
+    ap.add_argument(
+        "--crack-driver",
+        type=str,
+        default="shear",
+        choices=("shear", "solid_strain", "drag"),
+        help=(
+            "Mechanical driver used for crack speed. "
+            "'shear' uses a fluid shear-stress proxy 2*mu*||eps(v)||, "
+            "'solid_strain' uses ||eps(u)||, and 'drag' is an alias for 'shear' "
+            "(current backend limitation prevents a direct |beta(v-vS)| norm)."
+        ),
+    )
+
+    # Initial crack geometry (optional)
+    ap.add_argument("--crack-depth", type=float, default=0.0, help="Initial crack depth from the bottom wall (0 disables).")
+    ap.add_argument("--crack-width", type=float, default=0.05, help="Initial crack width in x.")
+    ap.add_argument(
+        "--crack-x0",
+        type=float,
+        default=None,
+        help="Initial crack center x-position (defaults to midpoint (x1+x2)/2).",
+    )
+    ap.add_argument(
+        "--fix-base",
+        action="store_true",
+        help="Clamp the skeleton displacement u=0 on the bottom wall (static base) to study crack-driven detachment.",
+    )
     ap.add_argument(
         "--alpha-supg",
         type=float,
@@ -232,6 +333,27 @@ def main() -> None:
     use_sloughing = process in {"sloughing", "both"}
     adhesion_integrity = str(getattr(args, "adhesion_integrity", "scalar")).strip().lower()
     use_spatial_adhesion = bool(use_sloughing and adhesion_integrity == "spatial")
+
+    # Kozeny–Carman permeability reference porosity
+    kappa_inv_model = str(getattr(args, "kappa_inv_model", "spatial")).strip().lower()
+    if getattr(args, "kappa_phi_ref", None) is None and kappa_inv_model in {"kozeny", "kozeny_carman", "kc"}:
+        args.kappa_phi_ref = float(args.phi_b)
+
+    # Alpha phase-field thickness defaults to the same smoothing length used to build alpha0.
+    if getattr(args, "alpha_cahn_eps", None) is None:
+        args.alpha_cahn_eps = float(args.eps)
+
+    if getattr(args, "crack_x0", None) is None:
+        args.crack_x0 = 0.5 * (float(args.x1) + float(args.x2))
+
+    # Default inertia for sloughing/both runs unless the user explicitly disables it.
+    if getattr(args, "solid_inertia", None) is None:
+        args.solid_inertia = bool(use_sloughing)
+        if bool(args.solid_inertia):
+            print("[info] sloughing mode detected; enabling --solid-inertia by default (use --no-solid-inertia to disable).")
+
+    if getattr(args, "rho_s0", None) is None:
+        args.rho_s0 = 1.0 if bool(getattr(args, "solid_inertia", False)) else 0.0
 
     os.makedirs(str(args.outdir), exist_ok=True)
 
@@ -368,6 +490,9 @@ def main() -> None:
     h_b = float(args.h_biofilm)
     eps = float(args.eps)
     phi_b = float(args.phi_b)
+    crack_depth = float(getattr(args, "crack_depth", 0.0) or 0.0)
+    crack_width = float(getattr(args, "crack_width", 0.0) or 0.0)
+    crack_x0 = float(getattr(args, "crack_x0", 0.5 * (x1 + x2)))
 
     eps_x = max(eps, 1.0e-12)
     eps_y = max(eps, 1.0e-12)
@@ -377,7 +502,16 @@ def main() -> None:
         y = np.asarray(y, float)
         wx = _smooth_step((x - x1) / eps_x) * _smooth_step((x2 - x) / eps_x)
         wy = _smooth_step((h_b - y) / eps_y)
-        return np.clip(wx * wy, 0.0, 1.0)
+        a0 = wx * wy
+        # Optional initial crack notch (fluid gap) from the bottom wall into the biofilm.
+        # This seeds an internal diffuse interface so the crack-speed term can propagate it.
+        if crack_depth > 0.0 and crack_width > 0.0:
+            xL = crack_x0 - 0.5 * crack_width
+            xR = crack_x0 + 0.5 * crack_width
+            wcx = _smooth_step((x - xL) / eps_x) * _smooth_step((xR - x) / eps_x)
+            wcy = _smooth_step((crack_depth - y) / eps_y)
+            a0 = a0 * (1.0 - wcx * wcy)
+        return np.clip(a0, 0.0, 1.0)
 
     alpha_n.set_values_from_function(lambda x, y: float(alpha0(x, y)))
     phi_n.set_values_from_function(lambda x, y: float(1.0 - (1.0 - phi_b) * alpha0(x, y)))
@@ -455,6 +589,8 @@ def main() -> None:
         rho_f=rho_f_c,
         mu_f=mu_f_c,
         kappa_inv=kappa_inv_c,
+        kappa_inv_model=str(getattr(args, "kappa_inv_model", "spatial")),
+        kappa_inv_phi_ref=float(getattr(args, "kappa_phi_ref", args.phi_b)),
         mu_s=mu_s_c,
         lambda_s=lambda_s_c,
         rho_s0_tilde=rho_s0_c,
@@ -468,6 +604,17 @@ def main() -> None:
         phi_supg=float(phi_supg),
         phi_cip=float(phi_cip),
         D_alpha=float(args.D_alpha),
+        alpha_cahn_M=float(getattr(args, "alpha_cahn_M", 0.0)),
+        alpha_cahn_gamma=float(getattr(args, "alpha_cahn_gamma", 0.0)),
+        alpha_cahn_eps=float(getattr(args, "alpha_cahn_eps", float(args.eps))),
+        alpha_crack_k=float(getattr(args, "k_crack", 0.0)),
+        alpha_crack_Dc=float(getattr(args, "D_crack", 0.0)),
+        alpha_crack_m=float(getattr(args, "m_crack", 1.0)),
+        alpha_crack_gamma_kappa=float(getattr(args, "gamma_kappa", 0.0)),
+        alpha_crack_eta_kappa=float(getattr(args, "eta_kappa", 1.0e-12)),
+        alpha_crack_eta_pos=float(getattr(args, "eta_pos", 1.0e-12)),
+        alpha_crack_eta_mech=float(getattr(args, "eta_mech", 1.0e-12)),
+        alpha_crack_driver=str(getattr(args, "crack_driver", "drag")),
         alpha_supg=float(alpha_supg),
         alpha_cip=float(alpha_cip),
         u_cip=float(u_cip),
@@ -511,6 +658,11 @@ def main() -> None:
     for tag in ("bottom", "top"):
         bcs.append(BoundaryCondition("v_x", "dirichlet", tag, lambda x, y, t: 0.0))
         bcs.append(BoundaryCondition("v_y", "dirichlet", tag, lambda x, y, t: 0.0))
+
+    # Optional static base for crack-propagation studies: clamp skeleton displacement on the bottom wall.
+    if bool(getattr(args, "fix_base", False)):
+        bcs.append(BoundaryCondition("u_x", "dirichlet", "bottom", lambda x, y, t: 0.0))
+        bcs.append(BoundaryCondition("u_y", "dirichlet", "bottom", lambda x, y, t: 0.0))
     # Outlet: pin the pressure to remove the nullspace (velocity is left free -> natural traction).
     bcs.append(BoundaryCondition("p", "dirichlet", "right", lambda x, y, t: 0.0))
 

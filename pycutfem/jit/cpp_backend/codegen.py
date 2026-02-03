@@ -1832,14 +1832,35 @@ class CppCodeGen:
                         emit_line(f"auto {nm} = trace_times_identity({b.name}, {a.name});")
                         push_bin("grad", b.role, (a.shape[0], -1, a.shape[1]), b.field_names, b.parent)
                         continue
-                    # Outer product when scaling test/trial basis (1,n) with value vector (1,n) -> n x n
-                    if a.kind == "mat" and a.shape[0] == 1 and a.role in {"test", "trial"} and b.kind == "mat" and b.shape[0] == 1 and b.role == "value":
-                        emit_line(f"Eigen::MatrixXd {nm} = {a.name}.transpose() * {b.name};")
-                        push_bin("mat", "value", (-1, -1))
+                    # Scaling of scalar (1x1) value with scalar test/trial basis (1,n_union) should
+                    # remain a (1,n_union) basis row, *not* an outer product. Treat (1,1) value mats
+                    # as scalars here to avoid dimension-mismatch / out-of-bounds Eigen behavior.
+                    if a.kind == "mat" and a.role in {"test", "trial"} and len(a.shape) == 2 and a.shape[0] == 1 and b.kind == "mat" and b.role == "value" and b.shape == (1, 1):
+                        emit_line(f"Eigen::MatrixXd {nm} = {b.name}(0,0) * {a.name};")
+                        push_bin("mat", a.role, a.shape, a.field_names, a.parent)
                         continue
-                    if b.kind == "mat" and b.shape[0] == 1 and b.role in {"test", "trial"} and a.kind == "mat" and a.shape[0] == 1 and a.role == "value":
-                        emit_line(f"Eigen::MatrixXd {nm} = {b.name}.transpose() * {a.name};")
-                        push_bin("mat", "value", (-1, -1))
+                    if b.kind == "mat" and b.role in {"test", "trial"} and len(b.shape) == 2 and b.shape[0] == 1 and a.kind == "mat" and a.role == "value" and a.shape == (1, 1):
+                        emit_line(f"Eigen::MatrixXd {nm} = {a.name}(0,0) * {b.name};")
+                        push_bin("mat", b.role, b.shape, b.field_names, b.parent)
+                        continue
+                    # Same scaling but with scalar values represented as VectorXd(k=1) (shape (1,)).
+                    if a.kind == "mat" and a.role in {"test", "trial"} and len(a.shape) == 2 and a.shape[0] == 1 and b.kind == "mat" and b.role == "value" and b.shape == (1,):
+                        emit_line(f"Eigen::MatrixXd {nm} = {b.name}(0) * {a.name};")
+                        push_bin("mat", a.role, a.shape, a.field_names, a.parent)
+                        continue
+                    if b.kind == "mat" and b.role in {"test", "trial"} and len(b.shape) == 2 and b.shape[0] == 1 and a.kind == "mat" and a.role == "value" and a.shape == (1,):
+                        emit_line(f"Eigen::MatrixXd {nm} = {a.name}(0) * {b.name};")
+                        push_bin("mat", b.role, b.shape, b.field_names, b.parent)
+                        continue
+
+                    # Element-wise scaling of a scalar test/trial basis row (1,n_union) by a value row (1,n_union).
+                    if a.kind == "mat" and a.role in {"test", "trial"} and len(a.shape) == 2 and a.shape[0] == 1 and b.kind == "mat" and b.role == "value" and len(b.shape) == 2 and b.shape[0] == 1 and b.shape[1] == a.shape[1]:
+                        emit_line(f"Eigen::MatrixXd {nm} = {a.name}.cwiseProduct({b.name});")
+                        push_bin("mat", a.role, a.shape, a.field_names, a.parent)
+                        continue
+                    if b.kind == "mat" and b.role in {"test", "trial"} and len(b.shape) == 2 and b.shape[0] == 1 and a.kind == "mat" and a.role == "value" and len(a.shape) == 2 and a.shape[0] == 1 and a.shape[1] == b.shape[1]:
+                        emit_line(f"Eigen::MatrixXd {nm} = {b.name}.cwiseProduct({a.name});")
+                        push_bin("mat", b.role, b.shape, b.field_names, b.parent)
                         continue
                     # Outer product for scalar test/trial factors (e.g., pressure · div(velocity))
                     if a.kind == "mat" and b.kind == "mat" and a.role == "test" and b.role == "trial" and a.shape[0] == 1 and b.shape[0] == 1:
@@ -1864,6 +1885,27 @@ class CppCodeGen:
                         emit_line(f"for (int _c=0; _c<{nm}_vdim; ++_c) {nm}.row(_c) = {a.name}.row(0) * {b.name}(_c);")
                         out_k = b.shape[0] if len(b.shape) > 0 and b.shape[0] not in (-1, 0) else -1
                         push_bin("mat", a.role, (out_k, -1), a.field_names, a.parent)
+                        continue
+
+                    # Scalar test/trial basis (1,n_union) multiplied by a value row/col vector (dim=2)
+                    # should produce a 2 x n_union matrix (vector basis scaled by the value components).
+                    if a.kind == "mat" and a.role == "value" and is_a_row_vec_or_col_vec_2k and b.kind == "mat" and b.role in {"test", "trial"} and len(b.shape) == 2 and b.shape[0] == 1:
+                        # Produce an (n_union x 2) matrix so it can be added to GradStack components
+                        # via add_grad_mat (gradient matrices are stored as (n_union x dim)).
+                        emit_line(f"Eigen::MatrixXd {nm}(n_union, 2);")
+                        emit_line(f"for (int _c=0; _c<2; ++_c) {{")
+                        emit_line(f"    double _v = ({a.name}.cols() == 1) ? {a.name}(_c,0) : {a.name}(0,_c);")
+                        emit_line(f"    {nm}.col(_c) = {b.name}.row(0).transpose() * _v;")
+                        emit_line("}")
+                        push_bin("mat", b.role, (-1, 2), b.field_names, b.parent)
+                        continue
+                    if b.kind == "mat" and b.role == "value" and is_b_row_vec_or_col_vec_2k and a.kind == "mat" and a.role in {"test", "trial"} and len(a.shape) == 2 and a.shape[0] == 1:
+                        emit_line(f"Eigen::MatrixXd {nm}(n_union, 2);")
+                        emit_line(f"for (int _c=0; _c<2; ++_c) {{")
+                        emit_line(f"    double _v = ({b.name}.cols() == 1) ? {b.name}(_c,0) : {b.name}(0,_c);")
+                        emit_line(f"    {nm}.col(_c) = {a.name}.row(0).transpose() * _v;")
+                        emit_line("}")
+                        push_bin("mat", a.role, (-1, 2), a.field_names, a.parent)
                         continue
                     # Mixed gradients: scalar basis × grad basis
                     if a.kind == "mat" and a.role == "trial" and len(a.shape) >= 2 and a.shape[0] == 1 and b.kind == "grad" and b.role == "test":
@@ -1916,6 +1958,18 @@ class CppCodeGen:
                     elif a.kind == "scalar" and b.kind == "scalar":
                         emit_line(f"double {nm} = {a.name} * {b.name};")
                         push_bin("scalar", a.role, (), a.field_names or b.field_names, a.parent or b.parent)
+                    elif (
+                        a.kind == "mat"
+                        and b.kind == "mat"
+                        and a.role == "value"
+                        and b.role == "value"
+                        and a.shape == (1,)
+                        and b.shape == (1,)
+                    ):
+                        # Element-wise product of two scalar-valued coefficient vectors (k=1).
+                        # Many scalar fields are represented as VectorXd of length 1 in the IR.
+                        emit_line(f"double {nm} = {a.name}(0) * {b.name}(0);")
+                        push_bin("scalar", "value", (), a.field_names or b.field_names, a.parent or b.parent)
                     else:
                         raise NotImplementedError("Multiplication of these kinds not supported"
                                                   f" with kinds ({a.kind}, {b.kind})"

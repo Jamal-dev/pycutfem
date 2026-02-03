@@ -218,7 +218,10 @@ def build_biofilm_one_domain_mms_affine(
         # Conservative convection correction: v * div(rho v) with rho=rho_f*C.
         divCv = Cx * vk[..., 0] + Cy * vk[..., 1]  # div(v)=0 for this affine shear
         div_rhov = float(rho_f) * divCv
-        return momdot + rho[..., None] * conv + vk * div_rhov[..., None] + visc + grad_p + drag
+        # Pressure gradient: ∇(C p) = C ∇p + p ∇C
+        pk = p_k(x, y)
+        grad_Cp = Ck[..., None] * grad_p + pk[..., None] * np.stack((Cx, Cy), axis=-1)
+        return momdot + rho[..., None] * conv + vk * div_rhov[..., None] + visc + grad_Cp + drag
 
     def s_v(x, y):
         x = np.asarray(x, dtype=float)
@@ -298,7 +301,8 @@ def build_biofilm_one_domain_mms_affine(
         # Lagged detachment uses v_n (here zero) -> tau = sqrt(eta_n) constant.
         D_det_prev = float(k_det) * float(np.sqrt(float(eta_n)))
         delta = 4.0 * ak * (1.0 - ak)
-        return dadt + adv - G * ak * (1.0 - ak) - D_det_prev * delta
+        # Implemented residual uses +D_det_prev*delta on the LHS (i.e. -D_det_prev*delta on the RHS).
+        return dadt + adv - G * ak * (1.0 - ak) + D_det_prev * delta
 
     def f_S(x, y):
         x = np.asarray(x, dtype=float)

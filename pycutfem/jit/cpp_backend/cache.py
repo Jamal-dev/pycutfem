@@ -12,7 +12,7 @@ from pycutfem.jit.cache import KernelCache
 from .compiler import compile_extension
 
 # Bump when generated C++ changes in a way that requires recompilation of cached kernels.
-CODEGEN_ABI_CPP = "2026-01-28-cpp-function-derivative-v5"
+CODEGEN_ABI_CPP = "2026-02-03-cpp-basis-scalar-matmul-v9"
 
 
 class CppKernelCache:
