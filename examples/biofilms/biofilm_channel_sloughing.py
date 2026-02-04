@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 import logging
 import numpy as np
@@ -47,6 +48,90 @@ def _smooth_step(z):
     return 0.5 * (1.0 + np.tanh(z))
 
 
+def _read_polygon_csv(path: str, *, scale: float = 1.0, translate: tuple[float, float] = (0.0, 0.0)) -> np.ndarray:
+    arr = np.genfromtxt(str(path), delimiter=",", skip_header=1, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        raise ValueError(f"Polygon CSV must have at least 2 columns (x,y); got shape {arr.shape} from {path}")
+    poly = np.asarray(arr[:, :2], dtype=float) * float(scale)
+    poly[:, 0] += float(translate[0])
+    poly[:, 1] += float(translate[1])
+    if poly.shape[0] < 3:
+        raise ValueError(f"Polygon must have at least 3 points; got {poly.shape[0]} from {path}")
+    # Drop repeated last vertex if it matches the first (common for closed polygons).
+    if np.allclose(poly[0], poly[-1], rtol=0.0, atol=1.0e-14):
+        poly = poly[:-1]
+    return poly
+
+
+def _signed_distance_polygon(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+    """Signed distance to a simple polygon.
+
+    Returns φ where:
+      - φ < 0 inside the polygon
+      - φ > 0 outside the polygon
+    """
+    P = np.asarray(points, dtype=float)
+    if P.ndim != 2 or P.shape[1] != 2:
+        raise ValueError(f"points must be (N,2), got {P.shape}")
+    poly = np.asarray(polygon, dtype=float)
+    if poly.ndim != 2 or poly.shape[1] != 2 or poly.shape[0] < 3:
+        raise ValueError(f"polygon must be (M,2) with M>=3, got {poly.shape}")
+
+    # Ensure "open" polygon representation (no repeated last vertex).
+    if np.allclose(poly[0], poly[-1], rtol=0.0, atol=1.0e-14):
+        poly = poly[:-1]
+
+    N = P.shape[0]
+    M = poly.shape[0]
+
+    # --- min distance to edges (squared) ---
+    min_d2 = np.full(N, np.inf, dtype=float)
+    x = P[:, 0]
+    y = P[:, 1]
+    x1 = poly[:, 0]
+    y1 = poly[:, 1]
+    x2 = np.roll(x1, -1)
+    y2 = np.roll(y1, -1)
+    for i in range(M):
+        ax = float(x1[i])
+        ay = float(y1[i])
+        bx = float(x2[i])
+        by = float(y2[i])
+        abx = bx - ax
+        aby = by - ay
+        denom = abx * abx + aby * aby
+        if denom <= 0.0:
+            continue
+        apx = x - ax
+        apy = y - ay
+        t = (apx * abx + apy * aby) / denom
+        t = np.clip(t, 0.0, 1.0)
+        dx = apx - t * abx
+        dy = apy - t * aby
+        d2 = dx * dx + dy * dy
+        min_d2 = np.minimum(min_d2, d2)
+    dist = np.sqrt(min_d2)
+
+    # --- inside/outside via ray casting (x+ direction) ---
+    inside = np.zeros(N, dtype=bool)
+    for i in range(M):
+        y1i = float(y1[i])
+        y2i = float(y2[i])
+        dy = y2i - y1i
+        if abs(dy) <= 1.0e-30:
+            continue
+        cond = (y1i > y) != (y2i > y)
+        if not np.any(cond):
+            continue
+        x1i = float(x1[i])
+        x2i = float(x2[i])
+        x_int = (x2i - x1i) * (y - y1i) / dy + x1i
+        inside ^= cond & (x < x_int)
+
+    dist[inside] *= -1.0
+    return dist
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Channel flow with an immersed diffuse-interface biofilm block + wall adhesion degradation.")
     ap.add_argument("--nx", type=int, default=64)
@@ -68,8 +153,37 @@ def main() -> None:
         help="Newton line-search mode. 'dealii' is often more robust for the sloughing run.",
     )
     ap.add_argument("--outdir", type=str, default="examples/biofilms/results/channel_sloughing")
+    ap.add_argument(
+        "--case",
+        type=str,
+        default="generic",
+        choices=("generic", "dian_paper"),
+        help="Preconfigured setups. 'dian_paper' matches the microchannel biofilm deformation case described in "
+        "`examples/biofilms/dian_paper/latex/main.tex` (SI units, polygon alpha0, deformation-only run).",
+    )
     ap.add_argument("--vtk-every", type=int, default=1, help="Write VTK every N accepted steps (0 disables).")
     # Initial biofilm block geometry (smooth)
+    ap.add_argument(
+        "--alpha0-kind",
+        type=str,
+        default="block",
+        choices=("block", "polygon"),
+        help="Initial alpha geometry. 'block' uses (x1,x2,h-biofilm); 'polygon' reads a closed polygon from CSV.",
+    )
+    ap.add_argument(
+        "--alpha0-file",
+        type=str,
+        default=None,
+        help="CSV file for --alpha0-kind polygon (columns x,y; header allowed).",
+    )
+    ap.add_argument(
+        "--alpha0-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to polygon coordinates (e.g. 1e-6 to convert micrometers->meters).",
+    )
+    ap.add_argument("--alpha0-tx", type=float, default=0.0, help="Translate polygon x by this amount after scaling.")
+    ap.add_argument("--alpha0-ty", type=float, default=0.0, help="Translate polygon y by this amount after scaling.")
     ap.add_argument("--x1", type=float, default=1.2)
     ap.add_argument("--x2", type=float, default=2.8)
     ap.add_argument("--h-biofilm", type=float, default=0.35)
@@ -373,6 +487,75 @@ def main() -> None:
     # Silence verbose assembly logs from scalar post-processing (assemble_scalar).
     logging.getLogger("pycutfem.ufl.compilers").setLevel(logging.WARNING)
 
+    # ------------------------------------------------------------------
+    # Case presets (applied unless overridden on CLI)
+    # ------------------------------------------------------------------
+    case = str(getattr(args, "case", "generic")).strip().lower()
+    argv = list(sys.argv[1:])
+
+    def _has_flag(flag: str) -> bool:
+        return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+    if case == "dian_paper":
+        # Microchannel biofilm deformation case (Blauert et al. 2015) used in the
+        # paper reprint under `examples/biofilms/dian_paper/latex/main.tex`.
+        if not _has_flag("--L"):
+            args.L = 3500.0e-6
+        if not _has_flag("--H"):
+            args.H = 1000.0e-6
+        if not _has_flag("--Umax"):
+            args.Umax = 6.84e-2
+        if not _has_flag("--Tramp"):
+            # Keep the inflow ramp short on an ms-scale run.
+            args.Tramp = 5.0e-4
+        if not _has_flag("--phi-b"):
+            args.phi_b = 0.47
+        if not _has_flag("--eps"):
+            # Interface thickness ~ O(10–20 µm) in the paper’s finest scenario.
+            args.eps = 20.0e-6
+
+        if not _has_flag("--alpha0-kind"):
+            args.alpha0_kind = "polygon"
+        if not _has_flag("--alpha0-file"):
+            args.alpha0_file = "examples/biofilms/dian_paper/biofilm_initial_closed_polygon_from_spline_um.csv"
+        if not _has_flag("--alpha0-scale"):
+            args.alpha0_scale = 1.0e-6  # µm -> m
+
+        # Fluid properties: pick mu so that Re≈91 with rho=1000, U=0.0684, H=1e-3.
+        if not _has_flag("--rho-f"):
+            args.rho_f = 1000.0
+        if not _has_flag("--mu-f"):
+            args.mu_f = 7.5e-4
+
+        # Drag from hydraulic conductivity K=1e-5 m/s via k = K*mu/(rho*g), so k^{-1} = rho*g/(K*mu).
+        if not _has_flag("--kappa-inv"):
+            K = 1.0e-5
+            g = 9.81
+            args.kappa_inv = (float(args.rho_f) * g) / (K * float(args.mu_f))
+
+        # Solid material: linear elastic, E=200 Pa, nu=0.4.
+        E = 200.0
+        nu = 0.4
+        mu_s = E / (2.0 * (1.0 + nu))
+        lam_s = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+        if not _has_flag("--mu-s"):
+            args.mu_s = mu_s
+        if not _has_flag("--lambda-s"):
+            args.lambda_s = lam_s
+
+        # Time: paper snapshots at 0.8/1.6/3.2 ms and steady at 8 ms.
+        if not _has_flag("--dt"):
+            args.dt = 1.0e-4
+        if not _has_flag("--t-final"):
+            args.t_final = 8.0e-3
+
+        # Default to deformation-only mode unless user explicitly requested otherwise.
+        if not (_has_flag("--process") or _has_flag("--deformation-only") or _has_flag("--deformation-only-phi")):
+            args.deformation_only_phi = True
+
+        if not _has_flag("--outdir"):
+            args.outdir = "examples/biofilms/results/dian_paper_deformation"
+
     L = float(args.L)
     H = float(args.H)
     qdeg = int(args.q)
@@ -599,8 +782,9 @@ def main() -> None:
         _mark_inactive_fields("X")
 
     # ------------------------------------------------------------------
-    # Initial biofilm block (smooth indicator)
+    # Initial biofilm indicator (smooth diffuse interface)
     # ------------------------------------------------------------------
+    alpha0_kind = str(getattr(args, "alpha0_kind", "block")).strip().lower()
     x1 = float(args.x1)
     x2 = float(args.x2)
     h_b = float(args.h_biofilm)
@@ -613,24 +797,75 @@ def main() -> None:
     eps_x = max(eps, 1.0e-12)
     eps_y = max(eps, 1.0e-12)
 
-    def alpha0(x, y):
-        x = np.asarray(x, float)
-        y = np.asarray(y, float)
-        wx = _smooth_step((x - x1) / eps_x) * _smooth_step((x2 - x) / eps_x)
-        wy = _smooth_step((h_b - y) / eps_y)
-        a0 = wx * wy
-        # Optional initial crack notch (fluid gap) from the bottom wall into the biofilm.
-        # This seeds an internal diffuse interface so the crack-speed term can propagate it.
-        if crack_depth > 0.0 and crack_width > 0.0:
-            xL = crack_x0 - 0.5 * crack_width
-            xR = crack_x0 + 0.5 * crack_width
-            wcx = _smooth_step((x - xL) / eps_x) * _smooth_step((xR - x) / eps_x)
-            wcy = _smooth_step((crack_depth - y) / eps_y)
-            a0 = a0 * (1.0 - wcx * wcy)
-        return np.clip(a0, 0.0, 1.0)
+    poly_alpha0 = None
+    if alpha0_kind == "polygon":
+        if not getattr(args, "alpha0_file", None):
+            raise ValueError("--alpha0-kind polygon requires --alpha0-file")
+        poly_alpha0 = _read_polygon_csv(
+            str(args.alpha0_file),
+            scale=float(getattr(args, "alpha0_scale", 1.0)),
+            translate=(float(getattr(args, "alpha0_tx", 0.0)), float(getattr(args, "alpha0_ty", 0.0))),
+        )
+        xmin, ymin = np.min(poly_alpha0, axis=0)
+        xmax, ymax = np.max(poly_alpha0, axis=0)
+        # Use polygon bbox for convenience diagnostics and (optional) wall-adhesion perturbation defaults.
+        x1 = float(xmin)
+        x2 = float(xmax)
+        h_b = float(ymax)
+        print(
+            f"[info] alpha0 polygon: {str(args.alpha0_file)} "
+            f"(bbox x=[{xmin:.3e},{xmax:.3e}], y=[{ymin:.3e},{ymax:.3e}], eps={eps:.3e})"
+        )
+        if xmin < -1.0e-12 or xmax > float(L) + 1.0e-12 or ymin < -1.0e-12 or ymax > float(H) + 1.0e-12:
+            print(
+                f"[warn] alpha0 polygon bbox does not fit strictly inside the domain [0,L]x[0,H]: "
+                f"L={float(L):.3e}, H={float(H):.3e}."
+            )
 
-    alpha_n.set_values_from_function(lambda x, y: float(alpha0(x, y)))
-    phi_n.set_values_from_function(lambda x, y: float(1.0 - (1.0 - phi_b) * alpha0(x, y)))
+        def alpha0_eval(x, y):
+            x = np.asarray(x, float)
+            y = np.asarray(y, float)
+            xx, yy = np.broadcast_arrays(x, y)
+            pts = np.column_stack((xx.ravel(), yy.ravel()))
+            phi = _signed_distance_polygon(pts, poly_alpha0)
+            a0 = _smooth_step(-phi / eps_x).reshape(xx.shape)
+            return np.clip(a0, 0.0, 1.0)
+
+    else:
+
+        def alpha0_eval(x, y):
+            x = np.asarray(x, float)
+            y = np.asarray(y, float)
+            wx = _smooth_step((x - x1) / eps_x) * _smooth_step((x2 - x) / eps_x)
+            wy = _smooth_step((h_b - y) / eps_y)
+            a0 = wx * wy
+            # Optional initial crack notch (fluid gap) from the bottom wall into the biofilm.
+            # This seeds an internal diffuse interface so the crack-speed term can propagate it.
+            if crack_depth > 0.0 and crack_width > 0.0:
+                xL = crack_x0 - 0.5 * crack_width
+                xR = crack_x0 + 0.5 * crack_width
+                wcx = _smooth_step((x - xL) / eps_x) * _smooth_step((xR - x) / eps_x)
+                wcy = _smooth_step((crack_depth - y) / eps_y)
+                a0 = a0 * (1.0 - wcx * wcy)
+            return np.clip(a0, 0.0, 1.0)
+
+    def alpha0(x, y):
+        # Scalar wrapper (kept for compatibility with existing scalar callbacks).
+        return alpha0_eval(x, y)
+
+    # Vectorized initialization on CG nodes (avoids per-node Python loops for polygon alpha0).
+    alpha_gdofs = np.asarray(dh.get_field_dofs_on_nodes("alpha"), dtype=int).ravel()
+    alpha_xy = np.asarray(dh.get_dof_coords("alpha"), dtype=float)
+    alpha_vals = np.asarray(alpha0_eval(alpha_xy[:, 0], alpha_xy[:, 1]), dtype=float).ravel()
+    alpha_n.set_nodal_values(alpha_gdofs, alpha_vals)
+
+    phi_gdofs = np.asarray(dh.get_field_dofs_on_nodes("phi"), dtype=int).ravel()
+    phi_xy = np.asarray(dh.get_dof_coords("phi"), dtype=float)
+    if phi_xy.shape == alpha_xy.shape and np.allclose(phi_xy, alpha_xy, rtol=0.0, atol=1.0e-14):
+        phi_vals = 1.0 - (1.0 - float(phi_b)) * alpha_vals
+    else:
+        phi_vals = 1.0 - (1.0 - float(phi_b)) * np.asarray(alpha0_eval(phi_xy[:, 0], phi_xy[:, 1]), dtype=float).ravel()
+    phi_n.set_nodal_values(phi_gdofs, np.asarray(phi_vals, dtype=float).ravel())
     S_n.set_values_from_function(lambda x, y: 0.0)
     X_n.set_values_from_function(lambda x, y: 0.0)
     v_n.set_values_from_function(lambda x, y: np.array([0.0, 0.0], dtype=float))
@@ -806,20 +1041,8 @@ def main() -> None:
             raise RuntimeError("alpha-from-refmap requires CG alpha DOFs to be node-attached.")
         alpha_node_ids.append(int(nid))
     alpha_node_ids = np.asarray(alpha_node_ids, dtype=int)
-    alpha0_eps = float(args.eps)
-    x1 = float(args.x1)
-    x2 = float(args.x2)
-    h_b = float(args.h_biofilm)
-    eps_x = max(alpha0_eps, 1.0e-12)
-    eps_y = max(alpha0_eps, 1.0e-12)
-
-    def _alpha0_eval(x, y):
-        x = np.asarray(x, float)
-        y = np.asarray(y, float)
-        wx = _smooth_step((x - x1) / eps_x) * _smooth_step((x2 - x) / eps_x)
-        wy = _smooth_step((h_b - y) / eps_y)
-        a0 = wx * wy
-        return a0
+    # Reuse the initial geometry definition for refmap transport and diagnostics.
+    _alpha0_eval = alpha0_eval
 
     def _update_alpha_from_refmap():
         if not bool(getattr(args, "alpha_from_refmap", False)):
