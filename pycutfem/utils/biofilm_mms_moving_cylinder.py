@@ -258,7 +258,8 @@ class BiofilmMovingCylinderMMS:
 
         vS_k = self.vS(t_k)
         adv = phix_k * vS_k[0] + phiy_k * vS_k[1]
-        penalty = float(self.gamma_phi) * (1.0 - a_k) * (phi_k - 1.0)
+        # Match `build_biofilm_one_domain_forms`: sharpen the fluid-region constraint.
+        penalty = float(self.gamma_phi) * (1.0 - a_k) ** 16 * (phi_k - 1.0)
 
         return a_k * (phi_k - phi_n) / dt + a_k * adv - float(self.D_phi) * lap_phi_k + penalty
 
@@ -358,4 +359,3 @@ class BiofilmMovingCylinderMMS:
         drag = beta_k[..., None] * (v_k - vS_k)
 
         return momdot + rho_k[..., None] * conv + corr + visc + drag
-

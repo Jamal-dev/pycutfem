@@ -281,7 +281,11 @@ def build_biofilm_one_domain_mms_affine(
         adv = grad_phi[0] * vS[..., 0] + grad_phi[1] * vS[..., 1]  # div(vS)=0
         dphi_dt = (phik - phin) / dt
 
-        return ak * (dphi_dt + adv + Pi) + float(gamma_phi) * (1.0 - ak) * (phik - 1.0)
+        # Match the implementation in `build_biofilm_one_domain_forms`: enforce φ≈1 in
+        # the free-fluid region with a sharpened weight (1-α)^4 to avoid long-time
+        # bleed into the biofilm when D_phi=0.
+        w = (1.0 - ak) ** 16
+        return ak * (dphi_dt + adv + Pi) + float(gamma_phi) * w * (phik - 1.0)
 
     def f_alpha(x, y):
         x = np.asarray(x, dtype=float)

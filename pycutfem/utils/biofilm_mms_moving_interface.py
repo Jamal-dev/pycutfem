@@ -263,7 +263,8 @@ class BiofilmMovingInterfaceMMS:
         alpha_yy_k = self._alpha_yy_from_alpha(alpha_k)
         phi_yy_k = -(1.0 - float(self.phi_b)) * alpha_yy_k
 
-        penalty = float(self.gamma_phi) * (1.0 - alpha_k) * (phi_k - 1.0)
+        # Match `build_biofilm_one_domain_forms`: sharpen the fluid-region constraint.
+        penalty = float(self.gamma_phi) * (1.0 - alpha_k) ** 16 * (phi_k - 1.0)
         return alpha_k * (phi_k - phi_n) / dt - float(self.D_phi) * phi_yy_k + penalty
 
     def f_S(self, x, y):

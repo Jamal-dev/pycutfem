@@ -364,7 +364,8 @@ def build_biofilm_one_domain_mms_trig_step(
     f_phi_expr = alpha_k_expr * (phi_k_expr - phi_n_expr) / dt
     f_phi_expr += th * alpha_k_expr * Fphi_k + one_m_th * alpha_n_expr * Fphi_n
     f_phi_expr += -float(D_phi) * _sym_laplacian(phi_k_expr, x, y)
-    f_phi_expr += float(gamma_phi) * (1.0 - alpha_k_expr) * (phi_k_expr - 1.0)
+    # Match `build_biofilm_one_domain_forms`: sharpen the fluid-region constraint.
+    f_phi_expr += float(gamma_phi) * (1.0 - alpha_k_expr) ** 16 * (phi_k_expr - 1.0)
 
     # ------------------------------------------------------------------
     # Indicator forcing (implicit diffusion at k)

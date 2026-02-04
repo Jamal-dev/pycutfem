@@ -1699,7 +1699,8 @@ def run_biofilm_comparison():
     r_phi_fx += theta_fx * alpha_k_fx * zeta_fx * Fphi_k_fx * dx_fx
     r_phi_fx += (1.0 - theta_fx) * alpha_n_fx * zeta_fx * Fphi_n_fx * dx_fx
     r_phi_fx += D_phi_fx * ufl.dot(ufl.grad(phi_k_fx), ufl.grad(zeta_fx)) * dx_fx
-    r_phi_fx += gamma_phi_fx * one_minus(alpha_k_fx) * (phi_k_fx - 1.0) * zeta_fx * dx_fx
+    # Match `build_biofilm_one_domain_forms`: sharpen the fluid-region constraint.
+    r_phi_fx += gamma_phi_fx * (one_minus(alpha_k_fx) ** 16) * (phi_k_fx - 1.0) * zeta_fx * dx_fx
 
     # Indicator evolution
     G_k_fx = G(S_k_fx, phi_k_fx)

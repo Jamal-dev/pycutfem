@@ -115,7 +115,7 @@ def main() -> None:
     ap.add_argument(
         "--kappa-inv-model",
         type=str,
-        default="spatial",
+        default="kozeny_carman",
         choices=("spatial", "kozeny", "kozeny_carman", "kc"),
         help="Inverse permeability model. 'spatial' uses a constant kappa_inv; 'kozeny_carman' scales it with phi.",
     )
@@ -127,6 +127,13 @@ def main() -> None:
     )
     ap.add_argument("--mu-s", type=float, default=0.5)
     ap.add_argument("--lambda-s", type=float, default=0.5)
+    ap.add_argument(
+        "--solid-model",
+        type=str,
+        default="linear",
+        choices=("linear", "neo_hookean", "neo-hookean", "nh"),
+        help="Skeleton constitutive model. Use 'neo_hookean' for large deformations (Eulerian reference-map formulation).",
+    )
     # Solid inertia: for sloughing/both runs we typically want inertia enabled to allow chunk motion.
     # Use a tri-state default (None) so we can enable it automatically for sloughing unless the user overrides.
     ap.add_argument(
@@ -292,6 +299,50 @@ def main() -> None:
         help="Disable post-step clipping of (alpha,phi,S) to physical bounds. "
         "Clipping keeps alpha in [0,1], phi in [0,1] and S>=0 to avoid non-physical coefficients.",
     )
+    # Validation / debug options
+    ap.add_argument(
+        "--freeze-alpha",
+        action="store_true",
+        help="Treat alpha as prescribed (do not solve/update its DOFs). Useful for deformation-only validation.",
+    )
+    ap.add_argument(
+        "--freeze-phi",
+        action="store_true",
+        help="Treat phi as prescribed (do not solve/update its DOFs). Useful for deformation-only validation.",
+    )
+    ap.add_argument(
+        "--freeze-S",
+        action="store_true",
+        help="Treat substrate S as prescribed (do not solve/update its DOFs).",
+    )
+    ap.add_argument(
+        "--freeze-X",
+        action="store_true",
+        help="Treat detached biomass X as prescribed (do not solve/update its DOFs).",
+    )
+    ap.add_argument(
+        "--alpha-from-refmap",
+        action="store_true",
+        help="Recompute alpha after each accepted step from the Eulerian reference-map field u: "
+        "alpha(x,t) := alpha0(x - u(x,t)). This keeps alpha sharp and avoids non-conservative Allen–Cahn drift.",
+    )
+    ap.add_argument(
+        "--alpha-refmap-clamp",
+        action="store_true",
+        help="Clamp alpha-from-refmap values into [0,1] (recommended).",
+    )
+    ap.add_argument(
+        "--deformation-only",
+        action="store_true",
+        help="Convenience mode for validating fluid–poroelastic deformation: disables detachment/crack/Allen–Cahn, "
+        "freezes (alpha,phi,S,X), and clamps the base (--fix-base).",
+    )
+    ap.add_argument(
+        "--deformation-only-phi",
+        action="store_true",
+        help="Deformation-only validation with evolving phi: disables detachment/crack/Allen–Cahn, freezes (S,X), "
+        "clamps the base (--fix-base), and sets alpha from the reference map each step (alpha0(x-u)).",
+    )
     # Simple sloughing onset indicators (diagnostics only)
     ap.add_argument(
         "--slough-a-thresh",
@@ -328,6 +379,48 @@ def main() -> None:
     dt_val = float(args.dt)
     theta = float(args.theta)
     backend = str(args.backend)
+
+    # Basic mesh/interface resolution sanity: a too-thin diffuse interface (eps << h)
+    # behaves like an under-resolved step function in CG spaces and can lead to
+    # noisy coefficients in the one-domain blend.
+    try:
+        h_min = min(float(L) / max(1, int(args.nx)), float(H) / max(1, int(args.ny)))
+        eps_init = float(getattr(args, "eps", 0.0) or 0.0)
+        if eps_init > 0.0 and eps_init < 0.75 * h_min:
+            print(
+                f"[warn] Diffuse-interface thickness --eps={eps_init:.3e} is smaller than the element size "
+                f"h≈{h_min:.3e}. This can be under-resolved and may cause non-physical transients; "
+                "consider eps≈(1–2)h for validation runs."
+            )
+    except Exception:
+        pass
+    if bool(getattr(args, "deformation_only", False)):
+        args.process = "none"
+        args.k_det = 0.0
+        args.crack_depth = 0.0
+        args.alpha_cahn_M = 0.0
+        args.alpha_cahn_gamma = 0.0
+        args.alpha_crack_k = 0.0
+        args.freeze_alpha = True
+        args.freeze_phi = True
+        args.freeze_S = True
+        args.freeze_X = True
+        args.fix_base = True
+    if bool(getattr(args, "deformation_only_phi", False)):
+        args.process = "none"
+        args.k_det = 0.0
+        args.crack_depth = 0.0
+        args.alpha_cahn_M = 0.0
+        args.alpha_cahn_gamma = 0.0
+        args.alpha_crack_k = 0.0
+        args.freeze_alpha = True  # alpha is prescribed via refmap update
+        args.freeze_phi = False
+        args.freeze_S = True
+        args.freeze_X = True
+        args.fix_base = True
+        args.alpha_from_refmap = True
+        args.alpha_refmap_clamp = True
+
     process = str(getattr(args, "process", "both")).strip().lower()
     use_erosion = process in {"erosion", "both"}
     use_sloughing = process in {"sloughing", "both"}
@@ -383,6 +476,12 @@ def main() -> None:
     u_predictor = str(getattr(args, "u_predictor", "auto")).strip().lower()
     if u_predictor == "auto":
         u_predictor = "extrapolate" if solid_inertia else "copy"
+
+    solid_model = str(getattr(args, "solid_model", "linear")).strip().lower()
+    if solid_model in {"neo-hookean", "nh"}:
+        solid_model = "neo_hookean"
+    if bool(use_sloughing) and solid_model == "linear":
+        print("[warn] --process sloughing uses large biofilm motion; consider --solid-model neo_hookean for better large-strain behavior.")
 
     u_cip = float(getattr(args, "u_cip", 0.0) or 0.0)
     if u_cip == 0.0 and solid_inertia and float(args.gamma_u) <= 1.0:
@@ -473,14 +572,31 @@ def main() -> None:
     X_n = Function("X_n", "X", dof_handler=dh)
     if use_spatial_adhesion:
         a_prev = Function("a_prev", "a", dof_handler=dh)
-        # Do not solve for a: mark its DOFs inactive in Newton.
-        tags = getattr(dh, "dof_tags", None) or {}
-        inactive = set(tags.get("inactive", set()))
-        inactive.update(int(i) for i in np.asarray(dh.get_field_slice("a"), dtype=int).ravel())
-        tags["inactive"] = inactive
-        dh.dof_tags = tags
     else:
         a_prev = None
+
+    def _mark_inactive_fields(*field_names: str) -> None:
+        tags = getattr(dh, "dof_tags", None) or {}
+        inactive = set(tags.get("inactive", set()))
+        for fname in field_names:
+            try:
+                sl = np.asarray(dh.get_field_slice(fname), dtype=int).ravel()
+            except Exception:
+                continue
+            inactive.update(int(i) for i in sl)
+        tags["inactive"] = inactive
+        dh.dof_tags = tags
+
+    if use_spatial_adhesion:
+        _mark_inactive_fields("a")
+    if bool(getattr(args, "freeze_alpha", False)):
+        _mark_inactive_fields("alpha")
+    if bool(getattr(args, "freeze_phi", False)):
+        _mark_inactive_fields("phi")
+    if bool(getattr(args, "freeze_S", False)):
+        _mark_inactive_fields("S")
+    if bool(getattr(args, "freeze_X", False)):
+        _mark_inactive_fields("X")
 
     # ------------------------------------------------------------------
     # Initial biofilm block (smooth indicator)
@@ -590,7 +706,9 @@ def main() -> None:
         mu_f=mu_f_c,
         kappa_inv=kappa_inv_c,
         kappa_inv_model=str(getattr(args, "kappa_inv_model", "spatial")),
-        kappa_inv_phi_ref=float(getattr(args, "kappa_phi_ref", args.phi_b)),
+        # Only used by the Kozeny–Carman permeability model; default to phi_b otherwise.
+        kappa_inv_phi_ref=float(getattr(args, "kappa_phi_ref", None) or args.phi_b),
+        solid_model=solid_model,
         mu_s=mu_s_c,
         lambda_s=lambda_s_c,
         rho_s0_tilde=rho_s0_c,
@@ -678,7 +796,43 @@ def main() -> None:
     slough_t = {"a_drop": None, "contact_loss": None, "liftoff": None, "motion": None}
     alpha_cm_hi0 = {"y": None}
     num_nodes = len(mesh.nodes_list)
+    node_xy = np.asarray(getattr(mesh, "nodes_x_y_pos", np.zeros((num_nodes, 2), dtype=float)), dtype=float)
     alpha_dof_xy = np.asarray(dh.get_dof_coords("alpha"), dtype=float)
+    alpha_dof_gids = np.asarray(dh.get_field_slice("alpha"), dtype=int).ravel()
+    alpha_node_ids = []
+    for gd in alpha_dof_gids:
+        _fld, nid = dh._dof_to_node_map.get(int(gd), (None, None))
+        if nid is None:
+            raise RuntimeError("alpha-from-refmap requires CG alpha DOFs to be node-attached.")
+        alpha_node_ids.append(int(nid))
+    alpha_node_ids = np.asarray(alpha_node_ids, dtype=int)
+    alpha0_eps = float(args.eps)
+    x1 = float(args.x1)
+    x2 = float(args.x2)
+    h_b = float(args.h_biofilm)
+    eps_x = max(alpha0_eps, 1.0e-12)
+    eps_y = max(alpha0_eps, 1.0e-12)
+
+    def _alpha0_eval(x, y):
+        x = np.asarray(x, float)
+        y = np.asarray(y, float)
+        wx = _smooth_step((x - x1) / eps_x) * _smooth_step((x2 - x) / eps_x)
+        wy = _smooth_step((h_b - y) / eps_y)
+        a0 = wx * wy
+        return a0
+
+    def _update_alpha_from_refmap():
+        if not bool(getattr(args, "alpha_from_refmap", False)):
+            return
+        # Reference map: χ = x - u (u is the stored "reference map displacement").
+        # Evaluate u at the alpha DOF nodes (alpha is Q1 on the Q2 geometry mesh).
+        u_nodes = _vector_to_nodes(u_k)
+        u_at_alpha = u_nodes[alpha_node_ids, :]
+        chi = alpha_dof_xy - u_at_alpha
+        a_dofs = _alpha0_eval(chi[:, 0], chi[:, 1])
+        if bool(getattr(args, "alpha_refmap_clamp", False)):
+            a_dofs = np.clip(a_dofs, 0.0, 1.0)
+        alpha_k.nodal_values[:] = np.asarray(a_dofs, dtype=float)
 
     def _scalar_to_nodes(f: Function) -> np.ndarray:
         out = np.zeros(num_nodes, dtype=float)
@@ -753,6 +907,9 @@ def main() -> None:
                 a_min_val = float(upd.a_min)
                 a_max_val = float(upd.a_max)
 
+        # NOTE: alpha-from-refmap is applied in post_step_refiner (before promotion),
+        # so alpha_n matches the updated alpha_k at the accepted state.
+
         if alpha_area0["val"] is None:
             alpha_area0["val"] = float(shear.alpha_area)
 
@@ -811,18 +968,64 @@ def main() -> None:
                                 alpha_cm_hi0["y"] = float(y_cm_hi)
                 else:
                     cm_msg = ""
+
                 v_nodes = _vector_to_nodes(v_k)
                 u_nodes = _vector_to_nodes(u_k)
                 u_prev_nodes = _vector_to_nodes(u_prev)
                 vS_nodes = (u_nodes - u_prev_nodes) / float(dt_val)
+                p_nodes = _scalar_to_nodes(p_k)
                 vx_mean = float(np.mean(v_nodes[mask, 0]))
                 vSx_mean = float(np.mean(vS_nodes[mask, 0]))
+                phi_min_bio = float(np.min(phi_nodes[mask]))
+                phi_max_bio = float(np.max(phi_nodes[mask]))
+                uy_mean = float(np.mean(u_nodes[mask, 1]))
+                uy_min = float(np.min(u_nodes[mask, 1]))
+                uy_max = float(np.max(u_nodes[mask, 1]))
+                p_mean_bio = float(np.mean(p_nodes[mask]))
+                p_min_bio = float(np.min(p_nodes[mask]))
+                p_max_bio = float(np.max(p_nodes[mask]))
                 mask_int = (alpha_nodes > 0.4) & (alpha_nodes < 0.6)
                 vSx_int = float(np.mean(vS_nodes[mask_int, 0])) if np.any(mask_int) else float("nan")
+                u_mag = np.linalg.norm(u_nodes[mask, :], axis=1)
+                u_max = float(np.max(u_mag)) if u_mag.size else 0.0
+
+                # Bounding box (in the fixed Eulerian grid) of the high-alpha region.
+                y_hi_max = float("nan")
+                y_hi_min = float("nan")
+                if np.any(mask_dofs):
+                    y_hi_min = float(np.min(alpha_dof_xy[mask_dofs, 1]))
+                    y_hi_max = float(np.max(alpha_dof_xy[mask_dofs, 1]))
+
+                # Velocity profile inside the porous/biofilm block: top should be faster than bottom.
+                y_bio = node_xy[mask, 1]
+                vx_bio = v_nodes[mask, 0]
+                vx_top = float("nan")
+                vx_bot = float("nan")
+                if y_bio.size:
+                    y0 = float(np.min(y_bio))
+                    y1 = float(np.max(y_bio))
+                    if y1 > y0 + 1.0e-12:
+                        y_lo = y0 + 0.2 * (y1 - y0)
+                        y_hi = y0 + 0.8 * (y1 - y0)
+                        bot = y_bio <= y_lo
+                        top = y_bio >= y_hi
+                        if np.any(bot):
+                            vx_bot = float(np.mean(vx_bio[bot]))
+                        if np.any(top):
+                            vx_top = float(np.mean(vx_bio[top]))
+
                 print(
                     f"           beta[min,max]=[{bmin:.3e},{bmax:.3e}]  "
                     f"mean(vx|alpha>0.5)={vx_mean:.3e}  mean(vSx|alpha>0.5)={vSx_mean:.3e}  "
                     f"mean(vSx|0.4<alpha<0.6)={vSx_int:.3e}{cm_msg}"
+                )
+                print(
+                    f"           u[max|alpha>0.5]={u_max:.3e}  "
+                    f"uy[mean,min,max|alpha>0.5]=[{uy_mean:.3e},{uy_min:.3e},{uy_max:.3e}]  "
+                    f"p_bio[mean|min,max]=[{p_mean_bio:.3e}|{p_min_bio:.3e},{p_max_bio:.3e}]  "
+                    f"alpha_hi[ymin,ymax]=[{y_hi_min:.3e},{y_hi_max:.3e}]  "
+                    f"vx_biofilm[bot,top]=[{vx_bot:.3e},{vx_top:.3e}]  "
+                    f"phi_bio[min,max]=[{phi_min_bio:.3e},{phi_max_bio:.3e}]"
                 )
 
                 # ----------------------------------------------------------
@@ -934,6 +1137,11 @@ def main() -> None:
         u_prev.nodal_values[:] = u_n.nodal_values[:]
         if u_nm1 is not None:
             u_nm1.nodal_values[:] = u_n.nodal_values[:]
+
+        # If requested, recompute alpha from the Eulerian reference map (χ = x - u).
+        # Do this BEFORE promotion so alpha_n becomes the refmap-updated state.
+        if bool(getattr(args, "alpha_from_refmap", False)):
+            _update_alpha_from_refmap()
 
         if not bool(args.no_clip):
             # Keep alpha/phi bounded so blended coefficients (rho, mu, beta, delta_eps(alpha)) stay physical.

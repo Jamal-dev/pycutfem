@@ -839,6 +839,18 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     D_phi_c = _c(float(D_phi))
     gamma_phi_c = _c(float(gamma_phi))
+    # Regularization weight for enforcing φ≈1 in the free-fluid region.
+    #
+    # IMPORTANT: we intentionally *sharpen* the weight using (1-α)^16 so the
+    # constraint does not bleed into the biofilm over long time horizons when
+    # D_phi=0 (pure transport). Using (1-α) directly is overly aggressive in the
+    # diffuse interface (α≈0.5) for CG spaces.
+    one_m_alpha_k = _one_minus(alpha_k)
+    # (1-α)^16 = ((1-α)^4)^4
+    w_phi_fluid4_k = one_m_alpha_k * one_m_alpha_k
+    w_phi_fluid4_k = w_phi_fluid4_k * w_phi_fluid4_k  # (1-α)^4
+    w_phi_fluid8_k = w_phi_fluid4_k * w_phi_fluid4_k  # (1-α)^8
+    w_phi_fluid_k = w_phi_fluid8_k * w_phi_fluid8_k  # (1-α)^16
 
     Pi_k = _Pi_over_rho_s(S_k, phi_k, alpha_k, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)))
     Pi_n = _Pi_over_rho_s(S_n, phi_n, alpha_n, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)))
@@ -852,7 +864,7 @@ def build_biofilm_one_domain_forms(
     r_phi += th * alpha_k * phi_test * Fphi_k * dx
     r_phi += one_m_th * alpha_n * phi_test * Fphi_n * dx
     r_phi += D_phi_c * inner(grad(phi_k), grad(phi_test)) * dx
-    r_phi += gamma_phi_c * _one_minus(alpha_k) * (phi_k - _c(1.0)) * phi_test * dx
+    r_phi += gamma_phi_c * w_phi_fluid_k * (phi_k - _c(1.0)) * phi_test * dx
     r_phi += -phi_test * f_phi * dx
 
     # Jacobian (k-part only)
@@ -872,7 +884,10 @@ def build_biofilm_one_domain_forms(
         dot(grad(phi_k), dvS) + dot(grad(dphi), vS_k) + dphi * div_vS_k - _one_minus(phi_k) * div_dvS + dPi
     ) * dx
     a_phi += D_phi_c * inner(grad(dphi), grad(phi_test)) * dx
-    a_phi += gamma_phi_c * ((-_c(1.0) * dalpha) * (phi_k - _c(1.0)) + _one_minus(alpha_k) * dphi) * phi_test * dx
+    # δ[(1-α)^16] = 16 (1-α)^15 δ(1-α) = -16 (1-α)^15 δα
+    one_m_alpha3_k = one_m_alpha_k * one_m_alpha_k * one_m_alpha_k  # (1-α)^3
+    dw_phi_fluid_k = (-_c(16.0) * (w_phi_fluid8_k * w_phi_fluid4_k * one_m_alpha3_k)) * dalpha
+    a_phi += gamma_phi_c * (dw_phi_fluid_k * (phi_k - _c(1.0)) + w_phi_fluid_k * dphi) * phi_test * dx
 
     # Optional consistent stabilization for advection-dominated φ (useful with D_phi=0).
     # - SUPG: τ (vS·∇w) R_phi
@@ -892,7 +907,7 @@ def build_biofilm_one_domain_forms(
         # "Strong" residual (excluding diffusion; diffusion is a stabilizing term already).
         f_phi_supg_k = alpha_k * ((phi_k - phi_n) * inv_dt)
         f_phi_supg_k += th * alpha_k * Fphi_k + one_m_th * alpha_n * Fphi_n
-        f_phi_supg_k += gamma_phi_c * _one_minus(alpha_k) * (phi_k - _c(1.0))
+        f_phi_supg_k += gamma_phi_c * w_phi_fluid_k * (phi_k - _c(1.0))
         f_phi_supg_k += -f_phi
 
         r_phi += tau_supg * w_supg * f_phi_supg_k * dx
@@ -900,7 +915,7 @@ def build_biofilm_one_domain_forms(
         dFphi_k = dot(grad(phi_k), dvS) + dot(grad(dphi), vS_k) + dphi * div_vS_k - _one_minus(phi_k) * div_dvS + dPi
         df_phi_supg_k = dalpha * ((phi_k - phi_n) * inv_dt) + alpha_k * (dphi * inv_dt)
         df_phi_supg_k += th * (dalpha * Fphi_k + alpha_k * dFphi_k)
-        df_phi_supg_k += gamma_phi_c * ((-_c(1.0) * dalpha) * (phi_k - _c(1.0)) + _one_minus(alpha_k) * dphi)
+        df_phi_supg_k += gamma_phi_c * (dw_phi_fluid_k * (phi_k - _c(1.0)) + w_phi_fluid_k * dphi)
 
         a_phi += tau_supg * w_supg * df_phi_supg_k * dx
 
@@ -910,8 +925,16 @@ def build_biofilm_one_domain_forms(
         vmag = _sqrt(inner(vS_n, vS_n) + _c(1.0e-12))
         scale = inv_dt + vmag / (h_F + _c(1.0e-12))
         tau_cip = _c(float(phi_cip)) * (h_F * h_F * h_F) * scale
-        r_phi += tau_cip * _grad_inner_jump(phi_k, phi_test, n_int) * ds_cip
-        a_phi += tau_cip * _grad_inner_jump(dphi, phi_test, n_int) * ds_cip
+        # Localize facet stabilization to the biofilm region to avoid smearing the
+        # imposed fluid value (φ=1) into the biofilm over long time horizons.
+        #
+        # Use α^- α^+ (computed robustly from avg/jump) as a weight:
+        #   α^- α^+ = avg(α)^2 - (jump(α)/2)^2
+        a_avg = avg(alpha_n)
+        a_jump = jump(alpha_n)
+        w_phi_cip = a_avg * a_avg + (-_c(0.25) * a_jump * a_jump)
+        r_phi += tau_cip * w_phi_cip * _grad_inner_jump(phi_k, phi_test, n_int) * ds_cip
+        a_phi += tau_cip * w_phi_cip * _grad_inner_jump(dphi, phi_test, n_int) * ds_cip
 
     # ------------------------------------------------------------------
     # (v) Indicator evolution (advection–diffusion–reaction)
