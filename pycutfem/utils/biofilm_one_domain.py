@@ -34,6 +34,7 @@ from pycutfem.ufl.expressions import (
     inner,
     jump,
     outer,
+    trace,
 )
 
 from pycutfem.utils.nonlinear_solid_eulerian_refmap import (
@@ -70,6 +71,10 @@ def _grad_inner_jump(u, v, n):
 def _linear_elastic_term(u, eta, *, mu_s, lambda_s):
     # For symmetric stress, σ(u):∇η = 2μ ε(u):ε(η) + λ div(u) div(η).
     return _c(2.0) * mu_s * inner(_epsilon(u), _epsilon(eta)) + lambda_s * div(u) * div(eta)
+
+def _smooth_pos(x, *, eta: float = 1.0e-12):
+    """Smooth positive part ⟨x⟩_+ ≈ 0.5 (x + sqrt(x^2 + eta))."""
+    return _c(0.5) * (x + _sqrt(x * x + _c(float(eta))))
 
 
 def _chi_b(alpha):
@@ -180,6 +185,7 @@ class BiofilmOneDomainForms:
     r_skeleton: object
     r_phi: object
     r_alpha: object
+    r_damage: object | None
     r_substrate: object
     # Optional per-block Jacobian contributions (useful for debugging/verification)
     a_momentum: object | None = None
@@ -187,6 +193,7 @@ class BiofilmOneDomainForms:
     a_skeleton: object | None = None
     a_phi: object | None = None
     a_alpha: object | None = None
+    a_damage: object | None = None
     a_substrate: object | None = None
     r_detached: object | None = None
     a_detached: object | None = None
@@ -201,6 +208,8 @@ def build_biofilm_one_domain_forms(
     phi_k,
     alpha_k,
     S_k,
+    # optional: bulk damage / cohesion loss (0=intact, 1=failed)
+    d_k=None,
     # optional: detached-biomass concentration at t_{n+1}
     X_k=None,
     # unknowns at t_n
@@ -210,6 +219,8 @@ def build_biofilm_one_domain_forms(
     phi_n,
     alpha_n,
     S_n,
+    # optional: bulk damage at t_n
+    d_n=None,
     # optional: detached-biomass concentration at t_n
     X_n=None,
     # optional u_{n-1} (for θ terms with vS_n)
@@ -221,6 +232,7 @@ def build_biofilm_one_domain_forms(
     dphi,
     dalpha,
     dS,
+    dd=None,
     dX=None,
     # test functions
     v_test,
@@ -229,6 +241,7 @@ def build_biofilm_one_domain_forms(
     phi_test,
     alpha_test,
     S_test,
+    d_test=None,
     X_test=None,
     # measure
     dx,
@@ -280,6 +293,15 @@ def build_biofilm_one_domain_forms(
     alpha_cip: float = 0.0,
     u_cip: float = 0.0,
     ds_cip=None,
+    # Damage (bulk cohesion loss) model parameters
+    damage_k: float = 0.0,
+    damage_sigma_cr: float = 0.0,
+    damage_m: float = 1.0,
+    damage_D: float = 0.0,
+    damage_gamma_out: float = 0.0,
+    damage_eta_pos: float = 1.0e-12,
+    damage_kappa_stiff: float = 1.0e-8,
+    damage_kappa_perm: float = 1.0e-8,
     D_S: float = 0.0,
     D_X: float = 0.0,
     # growth / detachment parameters
@@ -367,6 +389,35 @@ def build_biofilm_one_domain_forms(
     div_dvS = div(du) / dt
 
     # ------------------------------------------------------------------
+    # Optional bulk damage field d: cohesion loss / fracture-like weakening
+    # ------------------------------------------------------------------
+    use_damage = d_k is not None
+    if use_damage:
+        if d_n is None or dd is None or d_test is None:
+            raise ValueError("d_k provided but one of (d_n, dd, d_test) is missing.")
+
+        kappa_stiff = _c(float(damage_kappa_stiff))
+        kappa_perm = _c(float(damage_kappa_perm))
+
+        one_m_d_k = _one_minus(d_k)
+        one_m_d_n = _one_minus(d_n)
+
+        g_stiff_k = one_m_d_k * one_m_d_k + kappa_stiff
+        g_stiff_n = one_m_d_n * one_m_d_n + kappa_stiff
+        dg_stiff_k = (-_c(2.0) * one_m_d_k) * dd
+
+        g_perm_k = one_m_d_k * one_m_d_k + kappa_perm
+        g_perm_n = one_m_d_n * one_m_d_n + kappa_perm
+        dg_perm_k = (-_c(2.0) * one_m_d_k) * dd
+    else:
+        g_stiff_k = _c(1.0)
+        g_stiff_n = _c(1.0)
+        dg_stiff_k = _c(0.0)
+        g_perm_k = _c(1.0)
+        g_perm_n = _c(1.0)
+        dg_perm_k = _c(0.0)
+
+    # ------------------------------------------------------------------
     # Coefficients (at n/k) and their variations (at k only)
     # ------------------------------------------------------------------
     rho_k = _rho(alpha_k, phi_k, rho_f=rho_f)
@@ -390,10 +441,15 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     # Permeability / drag handling
     # ------------------------------------------------------------------
-    # Drag coefficient (without κ^{-1}): α μ_f φ^2.
-    beta_coeff_k = alpha_k * mu_f * (phi_k * phi_k)
-    beta_coeff_n = alpha_n * mu_f * (phi_n * phi_n)
-    dbeta_coeff = mu_f * ((phi_k * phi_k) * dalpha + (_c(2.0) * alpha_k * phi_k) * dphi)
+    # Drag coefficient (without κ^{-1}): α μ_f φ^2, optionally degraded by damage.
+    # The damage-dependent factor g_perm(d) drives β→0 in failed/cracked regions so
+    # the mixture becomes hydraulically "open" (fluid-like) while α can remain a
+    # material/occupancy indicator.
+    beta_coeff_k = alpha_k * mu_f * (phi_k * phi_k) * g_perm_k
+    beta_coeff_n = alpha_n * mu_f * (phi_n * phi_n) * g_perm_n
+    dbeta_coeff = mu_f * ((phi_k * phi_k) * dalpha + (_c(2.0) * alpha_k * phi_k) * dphi) * g_perm_k
+    if use_damage:
+        dbeta_coeff += alpha_k * mu_f * (phi_k * phi_k) * dg_perm_k
 
     kappa_inv_key = str(kappa_inv_model).strip().lower()
 
@@ -640,9 +696,13 @@ def build_biofilm_one_domain_forms(
         r_skel_drag_k = -beta_coeff_k * dot(kdrag_k, u_test)
         r_skel_drag_n = -beta_coeff_n * dot(kdrag_n, u_test)
 
-    r_skeleton = (th * alpha_k * r_skel_k + one_m_th * alpha_n * r_skel_n
-                  + th * r_skel_drag_k + one_m_th * r_skel_drag_n) * dx
-    r_skeleton += -dot(alpha_k * f_u, u_test) * dx
+    r_skeleton = (
+        th * alpha_k * g_stiff_k * r_skel_k
+        + one_m_th * alpha_n * g_stiff_n * r_skel_n
+        + th * r_skel_drag_k
+        + one_m_th * r_skel_drag_n
+    ) * dx
+    r_skeleton += -dot(alpha_k * g_stiff_k * f_u, u_test) * dx
 
     # Optional extension penalty to keep u well-posed in the free-fluid region.
     # This is a pragmatic stabilization for the one-domain formulation: as α→0,
@@ -682,16 +742,24 @@ def build_biofilm_one_domain_forms(
         drag_term_k = -beta_coeff_k * dot(kdrag_k, u_test)
         d_drag_term_k = -(dbeta_coeff * dot(kdrag_k, u_test) + beta_coeff_k * dot(dkdrag_k, u_test))
 
+    # Jacobian of α g(d) [ elastic + pore-pressure coupling ].
+    # Important: when damage is disabled, dg_stiff_k is not a trial expression, so
+    # avoid forming dalpha + 0*alpha_k (trial + function) which the compiler
+    # cannot simplify reliably.
+    if use_damage:
+        w_ag = dalpha * g_stiff_k + alpha_k * dg_stiff_k
+    else:
+        w_ag = dalpha * g_stiff_k
     a_skel = th * (
-        alpha_k * a_el
-        + dalpha * r_el_k
-        - dalpha * (_one_minus(phi_k) * p_k) * div(u_test)
-        + alpha_k * (dphi * p_k) * div(u_test)
-        - alpha_k * (_one_minus(phi_k) * dp) * div(u_test)
+        alpha_k * g_stiff_k * a_el
+        + w_ag * r_el_k
+        - w_ag * (_one_minus(phi_k) * p_k) * div(u_test)
+        + alpha_k * g_stiff_k * (dphi * p_k) * div(u_test)
+        - alpha_k * g_stiff_k * (_one_minus(phi_k) * dp) * div(u_test)
     ) * dx
     # Drag term is *not* multiplied by alpha again: beta already contains alpha (one-domain blend).
     a_skel += th * d_drag_term_k * dx
-    a_skel += -dot(dalpha * f_u, u_test) * dx
+    a_skel += -dot(w_ag * f_u, u_test) * dx
 
     if float(gamma_u) != 0.0:
         u_ext_mode = str(u_extension_mode).strip().lower()
@@ -823,7 +891,10 @@ def build_biofilm_one_domain_forms(
         t_adh_k = k_n_c * u_nvec_k + k_t_c * u_tvec_k + g_n_c * vS_nvec_k + g_t_c * vS_tvec_k
         t_adh_n = k_n_c * u_nvec_n + k_t_c * u_tvec_n + g_n_c * vS_nvec_n + g_t_c * vS_tvec_n
 
-        r_skeleton += (th * alpha_k * a_prev * dot(t_adh_k, u_test) + one_m_th * alpha_n * a_prev * dot(t_adh_n, u_test)) * ds_adh
+        r_skeleton += (
+            th * alpha_k * g_stiff_k * a_prev * dot(t_adh_k, u_test)
+            + one_m_th * alpha_n * g_stiff_n * a_prev * dot(t_adh_n, u_test)
+        ) * ds_adh
 
         # Jacobian (k-part only): δ[ α a_prev t_adh(u,vS) ].
         du_nvec = _proj_n(du)
@@ -832,7 +903,7 @@ def build_biofilm_one_domain_forms(
         dvS_tvec = dvS - dvS_nvec
         dt_adh = k_n_c * du_nvec + k_t_c * du_tvec + g_n_c * dvS_nvec + g_t_c * dvS_tvec
 
-        a_skel += th * (dalpha * a_prev * dot(t_adh_k, u_test) + alpha_k * a_prev * dot(dt_adh, u_test)) * ds_adh
+        a_skel += th * (w_ag * a_prev * dot(t_adh_k, u_test) + alpha_k * g_stiff_k * a_prev * dot(dt_adh, u_test)) * ds_adh
 
     # ------------------------------------------------------------------
     # (iv) Porosity evolution (Eulerian, advected by vS)
@@ -984,6 +1055,24 @@ def build_biofilm_one_domain_forms(
                 #   ||ε(u)||_F
                 eps2 = inner(_epsilon(u_n), _epsilon(u_n))
                 D_mech_n = _sqrt(eps2 + eta_mech)
+            elif driver_key in {"solid_von_mises", "von_mises", "von-mises", "vm", "solid_vm"}:
+                # Solid von Mises equivalent stress (Pa), based on the *elastic* Cauchy stress.
+                # Use the same constitutive law as the skeleton equation.
+                if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
+                    sig = _c(2.0) * mu_s * _epsilon(u_n) + lambda_s * div(u_n) * Identity(int(dim))
+                else:
+                    if c_nh is None:
+                        c_nh = mu_s / _c(2.0)
+                    if beta_nh is None:
+                        beta_nh = lambda_s / (_c(2.0) * mu_s)
+                    sig = sigma_neo_hookean(u_n, c_nh, beta_nh, dim=int(dim))
+
+                tr_sig = trace(sig)
+                I = Identity(int(dim))
+                s_dev = sig - (tr_sig / _c(float(dim))) * I
+                # σ_vm = sqrt(3/2 s:s). For 2D we still use the 3D-style J2 scaling as a robust proxy.
+                vm2 = (_c(1.5) * inner(s_dev, s_dev)) + eta_mech
+                D_mech_n = _sqrt(vm2)
             elif driver_key in {"drag", "brinkman_drag", "brinkman"}:
                 # Approximate drag-driven tearing with the shear proxy due to current compiler limits.
                 tau2 = inner(_epsilon(v_n), _epsilon(v_n))
@@ -991,7 +1080,7 @@ def build_biofilm_one_domain_forms(
                 D_mech_n = _c(2.0) * mu_n * tau
             else:
                 raise ValueError(
-                    f"Unknown alpha_crack_driver {alpha_crack_driver!r}. Use 'shear', 'solid_strain', or 'drag' (alias)."
+                    f"Unknown alpha_crack_driver {alpha_crack_driver!r}. Use 'shear', 'solid_strain', 'solid_von_mises', or 'drag' (alias)."
                 )
 
             # Ensure the driver is treated as a function-like scalar (VecOpInfo on the left)
@@ -1103,6 +1192,70 @@ def build_biofilm_one_domain_forms(
         a_alpha += tau_cip * _grad_inner_jump(dalpha, alpha_test, n_int) * ds_cip
 
     # ------------------------------------------------------------------
+    # (v-b) Bulk damage evolution (optional): cohesion loss driven by solid stress
+    # ------------------------------------------------------------------
+    r_damage = None
+    a_damage = None
+    if use_damage:
+        D_d_c = _c(float(damage_D))
+        gamma_out_c = _c(float(damage_gamma_out))
+
+        # Driving stress (lagged): von Mises from the *previous* skeleton state u_n.
+        # This avoids the need for dsigma_vm/du in the damage Jacobian, while still
+        # enabling stress-threshold activation with small Δt (ms-scale Dian case).
+        rate = _c(0.0)
+        if float(damage_k) != 0.0 and float(damage_sigma_cr) > 0.0:
+            k_dmg_c = _c(float(damage_k))
+            sigma_cr_c = _c(float(damage_sigma_cr))
+
+            if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
+                eps_un = _epsilon(u_n)
+                sig_un = _c(2.0) * mu_s * eps_un + lambda_s * div(u_n) * Identity(int(dim))
+            else:
+                # Eulerian reference-map neo-Hookean Cauchy stress (same as in the skeleton block).
+                if c_nh is None:
+                    c_nh = mu_s / _c(2.0)
+                if beta_nh is None:
+                    beta_nh = lambda_s / (_c(2.0) * mu_s)
+                sig_un = sigma_neo_hookean(u_n, c_nh, beta_nh, dim=int(dim))
+
+            tr_sig = trace(sig_un)
+            s_dev = sig_un - (tr_sig / _c(float(dim))) * Identity(int(dim))
+            vm2 = _c(1.5) * inner(s_dev, s_dev)
+            sigma_vm = _sqrt(vm2 + _c(1.0e-16))
+
+            ratio = sigma_vm / sigma_cr_c - _c(1.0)
+            pos_ratio = _smooth_pos(ratio, eta=float(damage_eta_pos))
+            rate = k_dmg_c * (pos_ratio ** _c(float(damage_m)))
+
+        # Strong (material) form:
+        #   α (∂t d + vS·∇d) - α rate (1-d) - div(D ∇d) + γ_out (1-α)^16 d = 0.
+        #
+        # The (1-α)^16 weight keeps the extension penalty localized to the free-fluid region.
+        one_m_d_k = _one_minus(d_k)
+        f_dmg_k = alpha_k * ((d_k - d_n) * inv_dt)
+        f_dmg_k += th * alpha_k * dot(grad(d_k), vS_k) + one_m_th * alpha_n * dot(grad(d_n), vS_n)
+        f_dmg_k += -alpha_k * rate * one_m_d_k
+
+        r_damage = d_test * f_dmg_k * dx
+        r_damage += D_d_c * inner(grad(d_k), grad(d_test)) * dx
+        if float(damage_gamma_out) != 0.0:
+            r_damage += gamma_out_c * w_phi_fluid_k * d_k * d_test * dx
+
+        # Jacobian (k-part only)
+        df_dmg_k = dalpha * ((d_k - d_n) * inv_dt) + alpha_k * (dd * inv_dt)
+        # Use inv_dt*dot(grad(d_k), du) instead of dot(grad(d_k), dvS) to avoid
+        # compiler corner cases with dot(grad(function), scaled-trial-vector).
+        df_dmg_k += th * (dalpha * dot(grad(d_k), vS_k) + alpha_k * (dot(grad(dd), vS_k) + dot(grad(d_k), du) * inv_dt))
+        df_dmg_k += -dalpha * rate * one_m_d_k + alpha_k * rate * dd
+
+        a_damage = d_test * df_dmg_k * dx
+        a_damage += D_d_c * inner(grad(dd), grad(d_test)) * dx
+        if float(damage_gamma_out) != 0.0:
+            # δ[ w(α) d ] = w δd + (δw) d, with δw = dw_phi_fluid_k.
+            a_damage += gamma_out_c * (w_phi_fluid_k * dd + dw_phi_fluid_k * d_k) * d_test * dx
+
+    # ------------------------------------------------------------------
     # (vi) Substrate transport
     # ------------------------------------------------------------------
     D_S_c = _c(float(D_S))
@@ -1195,6 +1348,10 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     residual_form = r_mom + r_mass + r_skeleton + r_phi + r_alpha + r_sub
     jacobian_form = a_mom + a_mass + a_skel + a_phi + a_alpha + a_sub
+    if r_damage is not None:
+        residual_form += r_damage
+    if a_damage is not None:
+        jacobian_form += a_damage
     if r_detached is not None:
         residual_form += r_detached
     if a_detached is not None:
@@ -1208,12 +1365,14 @@ def build_biofilm_one_domain_forms(
         r_skeleton=r_skeleton,
         r_phi=r_phi,
         r_alpha=r_alpha,
+        r_damage=r_damage,
         r_substrate=r_sub,
         a_momentum=a_mom,
         a_mass=a_mass,
         a_skeleton=a_skel,
         a_phi=a_phi,
         a_alpha=a_alpha,
+        a_damage=a_damage,
         a_substrate=a_sub,
         r_detached=r_detached,
         a_detached=a_detached,

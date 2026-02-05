@@ -24,8 +24,10 @@ from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.measures import dS, ds, dx
 from pycutfem.utils.biofilm_adhesion import (
     assemble_scalar,
+    solid_von_mises_mass_lumped_in_domain,
     update_adhesion_integrity,
     update_adhesion_integrity_field_on_boundary,
+    update_adhesion_integrity_field_on_boundary_von_mises,
     wall_shear_rms_on_boundary,
 )
 from pycutfem.utils.biofilm_one_domain import build_biofilm_one_domain_forms
@@ -157,7 +159,7 @@ def main() -> None:
         "--case",
         type=str,
         default="generic",
-        choices=("generic", "dian_paper"),
+        choices=("generic", "dian_paper", "dian_paper_sloughing"),
         help="Preconfigured setups. 'dian_paper' matches the microchannel biofilm deformation case described in "
         "`examples/biofilms/dian_paper/latex/main.tex` (SI units, polygon alpha0, deformation-only run).",
     )
@@ -219,9 +221,42 @@ def main() -> None:
     ap.add_argument("--k-t", type=float, default=10.0, help="Tangential spring stiffness [Pa/m].")
     ap.add_argument("--gamma-n", type=float, default=5.0, help="Normal dashpot [Pa*s/m].")
     ap.add_argument("--gamma-t", type=float, default=1.0, help="Tangential dashpot [Pa*s/m].")
-    ap.add_argument("--k-break", type=float, default=2.0, help="Adhesion degradation rate [1/s].")
+    ap.add_argument(
+        "--k-break",
+        type=float,
+        default=2.0,
+        help="Adhesion degradation rate [1/s]. Used for shear-based degradation (tau-c) when --sigma-cr=0, "
+        "and as the von Mises-driven degradation rate when --sigma-cr>0 (spatial mode).",
+    )
     ap.add_argument("--tau-c", type=float, default=0.2, help="Critical wall shear stress [Pa].")
     ap.add_argument("--m-break", type=float, default=1.0, help="Shear exponent m>=1.")
+    ap.add_argument(
+        "--sigma-cr",
+        type=float,
+        default=0.0,
+        help="Optional solid von Mises stress threshold [Pa] for irreversible wall-adhesion failure in spatial mode. "
+        "If >0, then at each step we set a(s)=0 where σ_vm(u)>sigma_cr on Γ_b (paper-style criterion). "
+        "Set to 0 to disable and use shear-based degradation (k-break/tau-c).",
+    )
+    # Bulk damage / cohesion loss (distinct from alpha, which is the phase/occupancy indicator)
+    ap.add_argument("--damage-k", type=float, default=0.0, help="Bulk damage rate coefficient k_d [1/s] (0 disables).")
+    ap.add_argument(
+        "--damage-sigma-cr",
+        type=float,
+        default=0.0,
+        help="Critical von Mises stress [Pa] for bulk damage (0 means: use --sigma-cr).",
+    )
+    ap.add_argument("--damage-m", type=float, default=2.0, help="Bulk damage exponent m>=1.")
+    ap.add_argument("--damage-D", type=float, default=0.0, help="Bulk damage diffusion/regularization coefficient D_d [m^2/s].")
+    ap.add_argument(
+        "--damage-gamma-out",
+        type=float,
+        default=0.0,
+        help="Penalty coefficient enforcing d->0 in free fluid (stabilizes d DOFs where alpha≈0). Units [1/s].",
+    )
+    ap.add_argument("--damage-eta-pos", type=float, default=1.0e-12, help="Positive-part smoothing eta for bulk damage activation.")
+    ap.add_argument("--damage-kappa-stiff", type=float, default=1.0e-8, help="Stiffness degradation floor κ in g(d)=(1-d)^2+κ.")
+    ap.add_argument("--damage-kappa-perm", type=float, default=1.0e-8, help="Permeability degradation floor κ in g_perm(d)=(1-d)^2+κ.")
     # Material / model parameters (kept simple)
     ap.add_argument("--rho-f", type=float, default=1.0)
     ap.add_argument("--mu-f", type=float, default=0.1)
@@ -361,11 +396,12 @@ def main() -> None:
         "--crack-driver",
         type=str,
         default="shear",
-        choices=("shear", "solid_strain", "drag"),
+        choices=("shear", "solid_strain", "solid_von_mises", "drag"),
         help=(
             "Mechanical driver used for crack speed. "
             "'shear' uses a fluid shear-stress proxy 2*mu*||eps(v)||, "
-            "'solid_strain' uses ||eps(u)||, and 'drag' is an alias for 'shear' "
+            "'solid_strain' uses ||eps(u)||, 'solid_von_mises' uses the skeleton von Mises stress, "
+            "and 'drag' is an alias for 'shear' "
             "(current backend limitation prevents a direct |beta(v-vS)| norm)."
         ),
     )
@@ -435,6 +471,11 @@ def main() -> None:
         help="Treat detached biomass X as prescribed (do not solve/update its DOFs).",
     )
     ap.add_argument(
+        "--freeze-damage",
+        action="store_true",
+        help="Treat bulk damage d as prescribed (do not solve/update its DOFs).",
+    )
+    ap.add_argument(
         "--alpha-from-refmap",
         action="store_true",
         help="Recompute alpha after each accepted step from the Eulerian reference-map field u: "
@@ -496,7 +537,7 @@ def main() -> None:
     def _has_flag(flag: str) -> bool:
         return any(a == flag or a.startswith(flag + "=") for a in argv)
 
-    if case == "dian_paper":
+    if case in {"dian_paper", "dian_paper_sloughing"}:
         # Microchannel biofilm deformation case (Blauert et al. 2015) used in the
         # paper reprint under `examples/biofilms/dian_paper/latex/main.tex`.
         if not _has_flag("--L"):
@@ -550,11 +591,128 @@ def main() -> None:
             args.t_final = 8.0e-3
 
         # Default to deformation-only mode unless user explicitly requested otherwise.
-        if not (_has_flag("--process") or _has_flag("--deformation-only") or _has_flag("--deformation-only-phi")):
+        # NOTE: For the sloughing preset we want the sloughing physics active by default,
+        # so only enable deformation-only automatically for the pure deformation case.
+        if case == "dian_paper" and not (
+            _has_flag("--process") or _has_flag("--deformation-only") or _has_flag("--deformation-only-phi")
+        ):
             args.deformation_only_phi = True
 
         if not _has_flag("--outdir"):
             args.outdir = "examples/biofilms/results/dian_paper_deformation"
+
+        if case == "dian_paper_sloughing":
+            # Stress-driven sloughing (paper-style): use a critical von Mises stress σ_cr on the wall
+            # to irreversibly weaken adhesion, while transporting the biofilm indicator α with the
+            # Eulerian reference map (α(x,t)=α0(x-u)).
+            if not _has_flag("--process"):
+                args.process = "sloughing"
+            if not _has_flag("--adhesion-integrity"):
+                args.adhesion_integrity = "spatial"
+            if not _has_flag("--k-det"):
+                args.k_det = 0.0
+            if not _has_flag("--sigma-cr"):
+                args.sigma_cr = 40.0
+
+            # Bulk damage (cohesion loss) driven by σ_vm(u)>σ_cr.
+            # This is distinct from α (phase/occupancy). Damage degrades stiffness and drag
+            # so cracks can open hydraulically and allow chunk separation/motion.
+            if not _has_flag("--damage-k"):
+                # Dian case has κ^{-1} ≫ 1 (from K≈1e-5 m/s), so even a tiny permeability
+                # floor κ_perm can keep β=α μ_f φ^2 κ^{-1} g_perm(d) O(1) when d→1.
+                # Use a more aggressive default damage rate so d localizes on the ms scale.
+                args.damage_k = 5.0e6
+            if not _has_flag("--damage-sigma-cr"):
+                args.damage_sigma_cr = float(args.sigma_cr)
+            if not _has_flag("--damage-m"):
+                args.damage_m = 2.0
+            if not _has_flag("--damage-D"):
+                args.damage_D = 0.0
+            if not _has_flag("--damage-gamma-out"):
+                # Stabilize damage DOFs where α≈0 (free fluid): enforce d≈0 there.
+                args.damage_gamma_out = 1.0e4
+            if not _has_flag("--damage-kappa-perm"):
+                # Make failed regions hydraulically open (β≈0) even with κ^{-1} ~ O(1e12).
+                args.damage_kappa_perm = 1.0e-12
+            if not _has_flag("--damage-kappa-stiff"):
+                # Keep a tiny stiffness floor for conditioning without impeding crack opening.
+                args.damage_kappa_stiff = 1.0e-12
+
+            # Paper sloughing is a failure model (no growth/erosion). Keep α/S/X prescribed by default:
+            #   - α is transported by the reference map to follow the deforming/moving biofilm.
+            #   - S and X are held at zero.
+            if not _has_flag("--freeze-alpha"):
+                args.freeze_alpha = True
+            if not _has_flag("--alpha-from-refmap"):
+                args.alpha_from_refmap = True
+            if not _has_flag("--alpha-refmap-clamp"):
+                args.alpha_refmap_clamp = True
+            if not _has_flag("--freeze-S"):
+                args.freeze_S = True
+            if not _has_flag("--freeze-X"):
+                args.freeze_X = True
+
+            # Keep adhesion traction; use σ_cr-driven *binary* failure by default.
+            # (Set --k-break>0 to use the smoother rate law in `update_adhesion_integrity_field_on_boundary_von_mises`.)
+            if not _has_flag("--k-break"):
+                args.k_break = 0.0
+            if not _has_flag("--tau-c"):
+                args.tau_c = 1.0e9
+
+            # Scale adhesion stiffness to SI units: to generate O(10–100) Pa tractions
+            # for O(10–100) µm displacements, k should be O(1e5–1e6) Pa/m.
+            if not _has_flag("--k-n"):
+                args.k_n = 5.0e5
+            if not _has_flag("--k-t"):
+                args.k_t = 2.0e5
+            if not _has_flag("--gamma-n"):
+                args.gamma_n = 5.0e3
+            if not _has_flag("--gamma-t"):
+                args.gamma_t = 2.0e3
+
+            # Disable Allen–Cahn / crack α dynamics in this preset (paper uses σ_cr failure instead).
+            if not _has_flag("--alpha-cahn-M"):
+                args.alpha_cahn_M = 0.0
+            if not _has_flag("--alpha-cahn-gamma"):
+                args.alpha_cahn_gamma = 0.0
+            if not _has_flag("--k-crack"):
+                args.k_crack = 0.0
+
+            # φ is a pure CG transport equation when D_phi=0; enable consistent stabilization by default.
+            if not _has_flag("--phi-supg"):
+                args.phi_supg = 1.0
+            if not _has_flag("--phi-cip"):
+                args.phi_cip = 10.0
+
+            # Favor robust Newton parameters.
+            if not _has_flag("--ls-mode"):
+                args.ls_mode = "dealii"
+            if not _has_flag("--newton-tol"):
+                args.newton_tol = 1.0e-4
+            if not _has_flag("--max-it"):
+                args.max_it = 60
+            if not _has_flag("--u-extension"):
+                args.u_extension = "grad"
+            if not _has_flag("--gamma-u"):
+                args.gamma_u = 2.0
+            if not _has_flag("--gamma-u-pin"):
+                args.gamma_u_pin = 1.0e-8
+
+            # Default to the paper’s detachment-pattern time (6.4 ms) and output at 0.8/1.6/3.2/6.4 ms.
+            if not _has_flag("--dt"):
+                args.dt = 2.0e-4
+            if not _has_flag("--t-final"):
+                args.t_final = 6.4e-3
+            if not _has_flag("--vtk-every"):
+                args.vtk_every = 4
+            if not _has_flag("--outdir"):
+                args.outdir = "examples/biofilms/results/dian_paper_sloughing"
+
+            # Sloughing onset indicators tuned to the micro-scale Dian run.
+            if not _has_flag("--slough-liftoff-dy"):
+                args.slough_liftoff_dy = 20.0e-6
+            if not _has_flag("--slough-contact-rel-thresh"):
+                args.slough_contact_rel_thresh = 0.98
 
     L = float(args.L)
     H = float(args.H)
@@ -584,6 +742,10 @@ def main() -> None:
         args.alpha_cahn_M = 0.0
         args.alpha_cahn_gamma = 0.0
         args.alpha_crack_k = 0.0
+        args.damage_k = 0.0
+        args.damage_D = 0.0
+        args.damage_gamma_out = 0.0
+        args.freeze_damage = True
         args.freeze_alpha = True
         args.freeze_phi = True
         args.freeze_S = True
@@ -596,6 +758,10 @@ def main() -> None:
         args.alpha_cahn_M = 0.0
         args.alpha_cahn_gamma = 0.0
         args.alpha_crack_k = 0.0
+        args.damage_k = 0.0
+        args.damage_D = 0.0
+        args.damage_gamma_out = 0.0
+        args.freeze_damage = True
         args.freeze_alpha = True  # alpha is prescribed via refmap update
         args.freeze_phi = False
         args.freeze_S = True
@@ -609,6 +775,16 @@ def main() -> None:
     use_sloughing = process in {"sloughing", "both"}
     adhesion_integrity = str(getattr(args, "adhesion_integrity", "scalar")).strip().lower()
     use_spatial_adhesion = bool(use_sloughing and adhesion_integrity == "spatial")
+
+    # Bulk damage is enabled if any of its coefficients are non-zero.
+    use_damage = bool(
+        float(getattr(args, "damage_k", 0.0) or 0.0) != 0.0
+        or float(getattr(args, "damage_D", 0.0) or 0.0) != 0.0
+        or float(getattr(args, "damage_gamma_out", 0.0) or 0.0) != 0.0
+    )
+    if use_damage and float(getattr(args, "damage_sigma_cr", 0.0) or 0.0) <= 0.0:
+        # Default to the same stress threshold used for wall adhesion if provided.
+        args.damage_sigma_cr = float(getattr(args, "sigma_cr", 0.0) or 0.0)
 
     # Kozeny–Carman permeability reference porosity
     kappa_inv_model = str(getattr(args, "kappa_inv_model", "spatial")).strip().lower()
@@ -703,6 +879,8 @@ def main() -> None:
         "u_y": 2,
         "phi": 1,
         "alpha": 1,
+        # Bulk damage / cohesion loss (optional).
+        **({"d": 1} if use_damage else {}),
         "S": 1,
         "X": 1,
     }
@@ -720,6 +898,7 @@ def main() -> None:
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
     dalpha = TrialFunction("alpha", dof_handler=dh)
+    dd = TrialFunction("d", dof_handler=dh) if use_damage else None
     dS_trial = TrialFunction("S", dof_handler=dh)
     dX_trial = TrialFunction("X", dof_handler=dh)
 
@@ -728,6 +907,7 @@ def main() -> None:
     q_test = TestFunction("p", dof_handler=dh)
     phi_test = TestFunction("phi", dof_handler=dh)
     alpha_test = TestFunction("alpha", dof_handler=dh)
+    d_test = TestFunction("d", dof_handler=dh) if use_damage else None
     S_test = TestFunction("S", dof_handler=dh)
     X_test = TestFunction("X", dof_handler=dh)
 
@@ -737,6 +917,7 @@ def main() -> None:
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
+    d_k = Function("d_k", "d", dof_handler=dh) if use_damage else None
     S_k = Function("S_k", "S", dof_handler=dh)
     X_k = Function("X_k", "X", dof_handler=dh)
 
@@ -751,6 +932,7 @@ def main() -> None:
         u_nm1 = VectorFunction("u_nm1", ["u_x", "u_y"], dof_handler=dh)
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
+    d_n = Function("d_n", "d", dof_handler=dh) if use_damage else None
     S_n = Function("S_n", "S", dof_handler=dh)
     X_n = Function("X_n", "X", dof_handler=dh)
     if use_spatial_adhesion:
@@ -780,6 +962,8 @@ def main() -> None:
         _mark_inactive_fields("S")
     if bool(getattr(args, "freeze_X", False)):
         _mark_inactive_fields("X")
+    if use_damage and bool(getattr(args, "freeze_damage", False)):
+        _mark_inactive_fields("d")
 
     # ------------------------------------------------------------------
     # Initial biofilm indicator (smooth diffuse interface)
@@ -873,6 +1057,8 @@ def main() -> None:
     if u_nm1 is not None:
         u_nm1.set_values_from_function(lambda x, y: np.array([0.0, 0.0], dtype=float))
     p_n.set_values_from_function(lambda x, y: 0.0)
+    if use_damage and d_n is not None:
+        d_n.set_values_from_function(lambda x, y: 0.0)
     if a_prev is not None:
         a0 = float(args.a0)
         a_pert = float(getattr(args, "a_perturb", 0.0) or 0.0)
@@ -913,6 +1099,7 @@ def main() -> None:
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
+        d_k=d_k,
         S_k=S_k,
         v_n=v_n,
         p_n=p_n,
@@ -920,6 +1107,7 @@ def main() -> None:
         u_nm1=u_nm1,
         phi_n=phi_n,
         alpha_n=alpha_n,
+        d_n=d_n,
         S_n=S_n,
         dv=dv,
         dp=dp,
@@ -927,12 +1115,14 @@ def main() -> None:
         dphi=dphi,
         dalpha=dalpha,
         dS=dS_trial,
+        dd=dd,
         v_test=v_test,
         q_test=q_test,
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,
         S_test=S_test,
+        d_test=d_test,
         X_test=X_test,
         dx=dx(metadata={"q": int(qdeg)}),
         dt=dt_c,
@@ -972,6 +1162,14 @@ def main() -> None:
         alpha_cip=float(alpha_cip),
         u_cip=float(u_cip),
         ds_cip=ds_int,
+        damage_k=float(getattr(args, "damage_k", 0.0) or 0.0),
+        damage_sigma_cr=float(getattr(args, "damage_sigma_cr", 0.0) or 0.0),
+        damage_m=float(getattr(args, "damage_m", 1.0) or 1.0),
+        damage_D=float(getattr(args, "damage_D", 0.0) or 0.0),
+        damage_gamma_out=float(getattr(args, "damage_gamma_out", 0.0) or 0.0),
+        damage_eta_pos=float(getattr(args, "damage_eta_pos", 1.0e-12) or 1.0e-12),
+        damage_kappa_stiff=float(getattr(args, "damage_kappa_stiff", 1.0e-8) or 1.0e-8),
+        damage_kappa_perm=float(getattr(args, "damage_kappa_perm", 1.0e-8) or 1.0e-8),
         D_S=0.01,
         D_X=float(args.D_X),
         rho_s_star=float(args.rho_s_star),
@@ -1027,8 +1225,8 @@ def main() -> None:
     step_counter = {"k": 0}
     a_state = {"val": float(args.a0)}
     alpha_area0 = {"val": None}
-    slough_flags = {"a_drop": False, "contact_loss": False, "liftoff": False, "motion": False}
-    slough_t = {"a_drop": None, "contact_loss": None, "liftoff": None, "motion": None}
+    slough_flags = {"a_drop": False, "contact_loss": False, "liftoff": False, "motion": False, "wall_clear": False}
+    slough_t = {"a_drop": None, "contact_loss": None, "liftoff": None, "motion": None, "wall_clear": None}
     alpha_cm_hi0 = {"y": None}
     num_nodes = len(mesh.nodes_list)
     node_xy = np.asarray(getattr(mesh, "nodes_x_y_pos", np.zeros((num_nodes, 2), dtype=float)), dtype=float)
@@ -1111,22 +1309,41 @@ def main() -> None:
                 a_min_val = float(a_state["val"])
                 a_max_val = float(a_state["val"])
             else:
-                upd = update_adhesion_integrity_field_on_boundary(
-                    dof_handler=dh,
-                    a_field=a_prev,
-                    dt=dt_val,
-                    v=v_k,
-                    alpha=alpha_k,
-                    phi=phi_k,
-                    ds_wall=ds_bottom,
-                    mu_f=mu_f_c,
-                    k_break=float(args.k_break),
-                    tau_c=float(args.tau_c),
-                    m=float(args.m_break),
-                    backend=backend,
-                    quad_order=qdeg,
-                )
-                a_msg = f"a[min,max]=[{upd.a_min:.3f},{upd.a_max:.3f}]"
+                sigma_cr = float(getattr(args, "sigma_cr", 0.0) or 0.0)
+                if sigma_cr > 0.0:
+                    upd = update_adhesion_integrity_field_on_boundary_von_mises(
+                        dof_handler=dh,
+                        a_field=a_prev,
+                        dt=dt_val,
+                        u=u_k,
+                        alpha=alpha_k,
+                        ds_wall=ds_bottom,
+                        mu_s=mu_s_c,
+                        lambda_s=lambda_s_c,
+                        k_break=float(args.k_break),
+                        sigma_cr=sigma_cr,
+                        m=float(args.m_break),
+                        backend=backend,
+                        quad_order=qdeg,
+                    )
+                    a_msg = f"a[min,max]=[{upd.a_min:.3f},{upd.a_max:.3f}]  sigma_vm[max]={upd.tau_max:.3e}"
+                else:
+                    upd = update_adhesion_integrity_field_on_boundary(
+                        dof_handler=dh,
+                        a_field=a_prev,
+                        dt=dt_val,
+                        v=v_k,
+                        alpha=alpha_k,
+                        phi=phi_k,
+                        ds_wall=ds_bottom,
+                        mu_f=mu_f_c,
+                        k_break=float(args.k_break),
+                        tau_c=float(args.tau_c),
+                        m=float(args.m_break),
+                        backend=backend,
+                        quad_order=qdeg,
+                    )
+                    a_msg = f"a[min,max]=[{upd.a_min:.3f},{upd.a_max:.3f}]"
                 a_min_val = float(upd.a_min)
                 a_max_val = float(upd.a_max)
 
@@ -1157,12 +1374,29 @@ def main() -> None:
             a_max = float(np.max(alpha_k.nodal_values))
             p_min = float(np.min(phi_k.nodal_values))
             p_max = float(np.max(phi_k.nodal_values))
-            print(f"           alpha[min,max]=[{a_min:.3e},{a_max:.3e}]  phi[min,max]=[{p_min:.3e},{p_max:.3e}]")
+            dmg_msg = ""
+            if d_k is not None:
+                d_min = float(np.min(d_k.nodal_values))
+                d_max = float(np.max(d_k.nodal_values))
+                dmg_msg = f"  d[min,max]=[{d_min:.3e},{d_max:.3e}]"
+            print(f"           alpha[min,max]=[{a_min:.3e},{a_max:.3e}]  phi[min,max]=[{p_min:.3e},{p_max:.3e}]{dmg_msg}")
 
             # Lightweight nodal diagnostics (helps interpret "no Darcy effect / wrong motion")
             alpha_nodes = _scalar_to_nodes(alpha_k)
             phi_nodes = _scalar_to_nodes(phi_k)
-            beta_nodes = alpha_nodes * float(args.mu_f) * (phi_nodes * phi_nodes) * float(args.kappa_inv)
+            # Diagnostic drag coefficient β = α μ_f φ^2 κ^{-1}(φ) g_perm(d).
+            kappa_inv_eff = float(args.kappa_inv)
+            if str(getattr(args, "kappa_inv_model", "spatial")).strip().lower() in {"kozeny", "kozeny_carman", "kc"}:
+                phi_ref = float(getattr(args, "kappa_phi_ref", None) or args.phi_b)
+                eps_kc = 1.0e-12
+                g = ((1.0 - phi_nodes) ** 2) / (phi_nodes**3 + eps_kc)
+                g0 = ((1.0 - phi_ref) ** 2) / (phi_ref**3 + eps_kc)
+                kappa_inv_eff = float(args.kappa_inv) * (g / max(1.0e-30, g0))
+            g_perm_nodes = 1.0
+            if d_k is not None:
+                d_nodes = _scalar_to_nodes(d_k)
+                g_perm_nodes = (1.0 - d_nodes) ** 2 + float(getattr(args, "damage_kappa_perm", 1.0e-8) or 1.0e-8)
+            beta_nodes = alpha_nodes * float(args.mu_f) * (phi_nodes * phi_nodes) * kappa_inv_eff * g_perm_nodes
             bmin = float(beta_nodes.min())
             bmax = float(beta_nodes.max())
 
@@ -1283,6 +1517,16 @@ def main() -> None:
                             print(
                                 f"           [sloughing] liftoff: Δy_cm_hi={dy:.3e} > {float(args.slough_liftoff_dy):.3e} (t={t_now:.3f})"
                             )
+                    if (not slough_flags["wall_clear"]) and np.isfinite(y_hi_min):
+                        # A more direct detachment indicator: the high-alpha region no longer touches the wall.
+                        # Use a small fraction of eps (diffuse thickness) to avoid triggering from round-off.
+                        y_thresh = 0.5 * float(getattr(args, "eps", 0.0) or 0.0)
+                        if y_thresh > 0.0 and y_hi_min > y_thresh:
+                            slough_flags["wall_clear"] = True
+                            slough_t["wall_clear"] = float(t_now)
+                            print(
+                                f"           [sloughing] wall clearance: alpha_hi[ymin]={y_hi_min:.3e} > {y_thresh:.3e} (t={t_now:.3f})"
+                            )
             else:
                 print(f"           beta[min,max]=[{bmin:.3e},{bmax:.3e}]")
         except Exception:
@@ -1294,13 +1538,44 @@ def main() -> None:
             try:
                 alpha_nodes = _scalar_to_nodes(alpha_k)
                 phi_nodes = _scalar_to_nodes(phi_k)
-                beta_nodes = alpha_nodes * float(args.mu_f) * (phi_nodes * phi_nodes) * float(args.kappa_inv)
+                kappa_inv_eff = float(args.kappa_inv)
+                if str(getattr(args, "kappa_inv_model", "spatial")).strip().lower() in {"kozeny", "kozeny_carman", "kc"}:
+                    phi_ref = float(getattr(args, "kappa_phi_ref", None) or args.phi_b)
+                    eps_kc = 1.0e-12
+                    g = ((1.0 - phi_nodes) ** 2) / (phi_nodes**3 + eps_kc)
+                    g0 = ((1.0 - phi_ref) ** 2) / (phi_ref**3 + eps_kc)
+                    kappa_inv_eff = float(args.kappa_inv) * (g / max(1.0e-30, g0))
+                g_perm_nodes = 1.0
+                if d_k is not None:
+                    d_nodes = _scalar_to_nodes(d_k)
+                    g_perm_nodes = (1.0 - d_nodes) ** 2 + float(getattr(args, "damage_kappa_perm", 1.0e-8) or 1.0e-8)
+                beta_nodes = alpha_nodes * float(args.mu_f) * (phi_nodes * phi_nodes) * kappa_inv_eff * g_perm_nodes
                 u_nodes = _vector_to_nodes(u_k)
                 u_prev_nodes = _vector_to_nodes(u_prev)
                 vS_nodes = (u_nodes - u_prev_nodes) / float(dt_val)
+                sigma_u, _w_sigma = solid_von_mises_mass_lumped_in_domain(
+                    dof_handler=dh,
+                    field="u_x",
+                    u=u_k,
+                    alpha=alpha_k,
+                    dx_domain=dx_q,
+                    mu_s=mu_s_c,
+                    lambda_s=lambda_s_c,
+                    solid_model=solid_model,
+                    backend=backend,
+                    quad_order=qdeg,
+                )
+                sigma_vm_nodes = np.zeros(num_nodes, dtype=float)
+                sl_u = np.asarray(dh.get_field_slice("u_x"), dtype=int).ravel()
+                for i, gdof in enumerate(sl_u):
+                    _fld, node_id = dh._dof_to_node_map[int(gdof)]
+                    if node_id is None:
+                        continue
+                    sigma_vm_nodes[int(node_id)] = float(sigma_u[i])
             except Exception:
                 beta_nodes = None
                 vS_nodes = None
+                sigma_vm_nodes = None
 
             export_vtk(
                 filename=os.path.join(str(args.outdir), f"solution_{step_no:04d}.vtu"),
@@ -1313,10 +1588,12 @@ def main() -> None:
                     "vS": vS_nodes if vS_nodes is not None else (lambda x, y: (0.0, 0.0)),
                     "phi": phi_k,
                     "alpha": alpha_k,
+                    "d": d_k if d_k is not None else (lambda x, y: 0.0),
                     "a": a_prev if a_prev is not None else (lambda x, y: float(a_state["val"])),
                     "S": S_k,
                     "X": X_k,
                     "beta": beta_nodes if beta_nodes is not None else (lambda x, y: 0.0),
+                    "sigma_vm": sigma_vm_nodes if sigma_vm_nodes is not None else (lambda x, y: 0.0),
                 },
             )
 
@@ -1370,14 +1647,19 @@ def main() -> None:
             # Keep alpha/phi bounded so blended coefficients (rho, mu, beta, delta_eps(alpha)) stay physical.
             alpha_k.nodal_values[:] = np.clip(alpha_k.nodal_values, 0.0, 1.0)
             phi_k.nodal_values[:] = np.clip(phi_k.nodal_values, 0.0, 1.0)
+            if d_k is not None:
+                # Damage is irreversible and bounded.
+                d_k.nodal_values[:] = np.clip(d_k.nodal_values, 0.0, 1.0)
+                if d_n is not None:
+                    d_k.nodal_values[:] = np.maximum(d_k.nodal_values, d_n.nodal_values)
             S_k.nodal_values[:] = np.maximum(S_k.nodal_values, 0.0)
             X_k.nodal_values[:] = np.maximum(X_k.nodal_values, 0.0)
             if a_prev is not None:
                 a_prev.nodal_values[:] = np.clip(a_prev.nodal_values, 0.0, 1.0)
 
     solver.solve_time_interval(
-        functions=[v_k, p_k, u_k, phi_k, alpha_k, S_k, X_k],
-        prev_functions=[v_n, p_n, u_n, phi_n, alpha_n, S_n, X_n],
+        functions=[v_k, p_k, u_k, phi_k, alpha_k, *([d_k] if d_k is not None else []), S_k, X_k],
+        prev_functions=[v_n, p_n, u_n, phi_n, alpha_n, *([d_n] if d_n is not None else []), S_n, X_n],
         aux_functions={
             "dt": dt_c,
             **({"a_prev": a_prev} if a_prev is not None else {}),
