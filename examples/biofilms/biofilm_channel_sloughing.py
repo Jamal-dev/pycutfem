@@ -1426,6 +1426,20 @@ def main() -> None:
                 else:
                     cm_msg = ""
 
+                # Damage transport sanity: d is a material/Eulerian field advected by vS,
+                # so it should remain co-located with the moving biofilm (up to diffusion).
+                # Print a simple alpha-weighted damage center-of-mass to spot "damage trails".
+                if d_k is not None:
+                    try:
+                        w_d = np.maximum(d_nodes, 0.0) * np.maximum(alpha_nodes, 0.0)
+                        wsum_d = float(np.sum(w_d))
+                        if wsum_d > 0.0:
+                            x_cm_d = float(np.sum(w_d * node_xy[:, 0]) / wsum_d)
+                            y_cm_d = float(np.sum(w_d * node_xy[:, 1]) / wsum_d)
+                            cm_msg += f"  d_cm=({x_cm_d:.5f},{y_cm_d:.5f})"
+                    except Exception:
+                        pass
+
                 v_nodes = _vector_to_nodes(v_k)
                 u_nodes = _vector_to_nodes(u_k)
                 u_prev_nodes = _vector_to_nodes(u_prev)
@@ -1648,10 +1662,14 @@ def main() -> None:
             alpha_k.nodal_values[:] = np.clip(alpha_k.nodal_values, 0.0, 1.0)
             phi_k.nodal_values[:] = np.clip(phi_k.nodal_values, 0.0, 1.0)
             if d_k is not None:
-                # Damage is irreversible and bounded.
+                # Damage is bounded in [0,1]. NOTE: do NOT enforce Eulerian
+                # pointwise irreversibility d^{k}(x) >= d^{n}(x) here: in an
+                # Eulerian formulation the material can advect, so a fixed
+                # spatial point may legitimately see d decrease as damaged
+                # material moves away. Irreversibility (no healing) must be
+                # enforced along material trajectories (or via a history
+                # variable), not by a pointwise max in x.
                 d_k.nodal_values[:] = np.clip(d_k.nodal_values, 0.0, 1.0)
-                if d_n is not None:
-                    d_k.nodal_values[:] = np.maximum(d_k.nodal_values, d_n.nodal_values)
             S_k.nodal_values[:] = np.maximum(S_k.nodal_values, 0.0)
             X_k.nodal_values[:] = np.maximum(X_k.nodal_values, 0.0)
             if a_prev is not None:
