@@ -19,7 +19,17 @@ from pycutfem.utils.biofilm_one_domain import build_biofilm_one_domain_forms
 from pycutfem.utils.meshgen import structured_quad
 
 
-def _build_problem(*, nx: int = 1, ny: int = 1, q: int = 3):
+def _build_problem(
+    *,
+    nx: int = 1,
+    ny: int = 1,
+    q: int = 3,
+    damage_model: str = "kinetic",
+    damage_eta: float = 0.0,
+    damage_Gc: float = 0.0,
+    damage_l: float = 0.0,
+    damage_psi0: float = 0.0,
+):
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
     mesh = Mesh(
         nodes=nodes,
@@ -145,6 +155,11 @@ def _build_problem(*, nx: int = 1, ny: int = 1, q: int = 3):
         damage_gamma_out=10.0,
         damage_kappa_stiff=1.0e-6,
         damage_kappa_perm=1.0e-6,
+        damage_model=str(damage_model),
+        damage_eta=float(damage_eta),
+        damage_Gc=float(damage_Gc),
+        damage_l=float(damage_l),
+        damage_psi0=float(damage_psi0),
     )
 
     # Map global dof -> state function owning it (k-level only).
@@ -210,3 +225,66 @@ def test_biofilm_one_domain_damage_jacobian_fd_consistency():
         denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
         rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
         assert rel < 5.0e-5, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
+
+
+def test_biofilm_one_domain_phase_field_damage_backend_parity_python_cpp():
+    dh, forms, _ = _build_problem(
+        nx=1,
+        ny=1,
+        q=3,
+        damage_model="phase_field",
+        damage_eta=1.0,
+        damage_Gc=1.0e-3,
+        damage_l=0.05,
+        damage_psi0=0.02,
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+
+    K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    K_cpp, R_cpp = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="cpp")
+
+    A_py = K_py.tocsr().toarray()
+    A_cpp = K_cpp.tocsr().toarray()
+    assert np.allclose(A_py, A_cpp, rtol=1.0e-10, atol=1.0e-12)
+    assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_biofilm_one_domain_phase_field_damage_jacobian_fd_consistency():
+    dh, forms, field_to_func_k = _build_problem(
+        nx=1,
+        ny=1,
+        q=3,
+        damage_model="phase_field",
+        damage_eta=1.0,
+        damage_Gc=1.0e-3,
+        damage_l=0.05,
+        damage_psi0=0.02,
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    R0 = np.asarray(R0, dtype=float)
+
+    def assemble_residual():
+        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
+        return np.asarray(R, dtype=float)
+
+    probes = []
+    for fld in ("v_x", "v_y", "p", "u_x", "phi", "alpha", "d", "S"):
+        sl = dh.get_field_slice(fld)
+        if sl:
+            probes.append(int(sl[len(sl) // 2]))
+
+    eps = 1.0e-4
+    for j in probes:
+        fld, _ = dh._dof_to_node_map[j]
+        func = field_to_func_k[fld]
+        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
+        R1 = assemble_residual()
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
+
+        fd = (R1 - R0) / eps
+        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
+        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
+        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
+        assert rel < 8.0e-5, f"phase-field FD mismatch at dof {j} ({fld}): rel={rel:.2e}"

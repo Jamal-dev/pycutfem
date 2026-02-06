@@ -3,7 +3,15 @@ import numpy as np
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
-from pycutfem.ufl.expressions import Constant, Function, TestFunction, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction
+from pycutfem.ufl.expressions import (
+    Constant,
+    Function,
+    TestFunction as UFLTestFunction,
+    TrialFunction,
+    VectorFunction,
+    VectorTestFunction,
+    VectorTrialFunction,
+)
 from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.ufl.functionspace import FunctionSpace
 from pycutfem.ufl.measures import dS, dx
@@ -22,11 +30,11 @@ def _tag_unit_square_boundaries(mesh: Mesh, *, tol: float = 1.0e-12) -> None:
     )
 
 
-def test_damage_degrades_wall_adhesion_traction():
+def test_wall_adhesion_is_not_scaled_by_bulk_damage():
     """
-    If bulk damage is enabled, the wall adhesion traction in the skeleton block is scaled by
-    g_stiff(d)=(1-d)^2+κ. This test checks that the assembled *adhesion contribution* to the
-    u-residual is reduced by ~κ when d goes from 0 -> 1.
+    Wall adhesion should be controlled by the adhesion integrity variable `a` and `alpha`,
+    not by bulk damage `d`. This test checks that the assembled *adhesion contribution* to
+    the u-residual is approximately unchanged when d goes from 0 -> 1.
     """
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=2, ny=2, poly_order=2)
     mesh = Mesh(
@@ -67,11 +75,11 @@ def test_damage_degrades_wall_adhesion_traction():
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
-    q_test = TestFunction("p", dof_handler=dh)
-    phi_test = TestFunction("phi", dof_handler=dh)
-    alpha_test = TestFunction("alpha", dof_handler=dh)
-    d_test = TestFunction("d", dof_handler=dh)
-    S_test = TestFunction("S", dof_handler=dh)
+    q_test = UFLTestFunction("p", dof_handler=dh)
+    phi_test = UFLTestFunction("phi", dof_handler=dh)
+    alpha_test = UFLTestFunction("alpha", dof_handler=dh)
+    d_test = UFLTestFunction("d", dof_handler=dh)
+    S_test = UFLTestFunction("S", dof_handler=dh)
 
     v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
@@ -190,6 +198,4 @@ def test_damage_degrades_wall_adhesion_traction():
     n1 = float(np.linalg.norm(adh_d1))
     assert n0 > 0.0
     ratio = n1 / n0
-    expected = kappa_stiff / (1.0 + kappa_stiff)
-    assert ratio > 0.2 * expected
-    assert ratio < 5.0 * expected
+    assert 0.95 <= ratio <= 1.05

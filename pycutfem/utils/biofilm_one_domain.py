@@ -302,6 +302,11 @@ def build_biofilm_one_domain_forms(
     damage_eta_pos: float = 1.0e-12,
     damage_kappa_stiff: float = 1.0e-8,
     damage_kappa_perm: float = 1.0e-8,
+    damage_model: str = "kinetic",
+    damage_eta: float = 0.0,
+    damage_Gc: float = 0.0,
+    damage_l: float = 0.0,
+    damage_psi0: float = 0.0,
     D_S: float = 0.0,
     D_X: float = 0.0,
     # growth / detachment parameters
@@ -623,8 +628,12 @@ def build_biofilm_one_domain_forms(
     r_mom += _c(2.0) * th * mu_k * inner(_epsilon(v_k), _epsilon(v_test)) * dx
     r_mom += _c(2.0) * one_m_th * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
     # Pressure term for the mixture constraint div(C v + B vS)=... :
-    # variationally consistent momentum coupling is grad(C p), i.e. -(C p, div(w)).
-    r_mom += -(C_k * p_k) * div(v_test) * dx
+    # variationally consistent fluid coupling is C grad(p), i.e.
+    #   -(p, div(C w)) = -p (C div(w) + grad(C)·w)
+    # which is the exact adjoint of the C v part of the constraint.
+    # Use dot(gradC, w_test) ordering for backend compatibility.
+    div_C_vtest_k = C_k * div(v_test) + dot(gradC_k, v_test)
+    r_mom += -p_k * div_C_vtest_k * dx
     if drag_mode == "scalar":
         r_mom += beta_k * dot(v_k, v_test) * dx
         r_mom += -beta_k * dot(vS_k, v_test) * dx
@@ -635,12 +644,28 @@ def build_biofilm_one_domain_forms(
     a_mom = inv_dt * (drho * dot(v_k, v_test) + rho_k * dot(dv, v_test)) * dx
 
     a_mom += th * (drho * conv_k + rho_k * dot(dot(grad(dv), v_k), v_test) + rho_k * dot(dot(grad(v_k), dv), v_test)) * dx
-    # Jacobian of the conservative correction v div(ρ v)
-    a_mom += th * (rho_f * d_divCv_k * dot(v_k, v_test) + div_rhov_k * dot(dv, v_test)) * dx
+    # Jacobian of the conservative correction v div(ρ v).
+    # Keep trial-family contributions separated to avoid mixed-role metadata
+    # leakage in the assembler (v-trial vs alpha/phi-trial pieces).
+    d_divCv_k_ap = dC_k * div(v_k) + dot(dgradC_k, v_k)
+    d_divCv_k_v = C_k * div(dv) + dot(gradC_k, dv)
+    a_mom += th * (rho_f * d_divCv_k_ap * dot(v_k, v_test)) * dx
+    a_mom += th * (rho_f * d_divCv_k_v * dot(v_k, v_test)) * dx
+    a_mom += th * (div_rhov_k * dot(dv, v_test)) * dx
     a_mom += _c(2.0) * th * (dmu * inner(_epsilon(v_k), _epsilon(v_test)) + mu_k * inner(_epsilon(dv), _epsilon(v_test))) * dx
 
-    # δ(C p) = p δC + C δp
-    a_mom += -(p_k * dC_k + C_k * dp) * div(v_test) * dx
+    # δ[-p div(C w)] = -(δp) div(C w) - p δ(div(C w)),
+    # with δ(div(C w)) = δC div(w) + δgrad(C)·w for fixed test w.
+    # Expand dgrad·w component-wise to avoid backend-dependent contraction
+    # paths for Grad(trial-scalar) · VectorTest.
+    d_div_C_vtest_k = dC_k * div(v_test)
+    if int(dim) == 2:
+        dgradC_k_x = (phi_k - _c(1.0)) * grad(dalpha)[0] + dphi * grad(alpha_k)[0] + dalpha * grad(phi_k)[0] + alpha_k * grad(dphi)[0]
+        dgradC_k_y = (phi_k - _c(1.0)) * grad(dalpha)[1] + dphi * grad(alpha_k)[1] + dalpha * grad(phi_k)[1] + alpha_k * grad(dphi)[1]
+        d_div_C_vtest_k += dgradC_k_x * v_test[0] + dgradC_k_y * v_test[1]
+    else:
+        d_div_C_vtest_k += dot(dgradC_k, v_test)
+    a_mom += -(dp * div_C_vtest_k + p_k * d_div_C_vtest_k) * dx
     if drag_mode == "scalar":
         a_mom += dbeta * (dot(v_k, v_test) - dot(vS_k, v_test)) * dx
         a_mom += beta_k * dot(dv, v_test) * dx
@@ -682,9 +707,13 @@ def build_biofilm_one_domain_forms(
     r_skel_k = r_el_k
     r_skel_n = r_el_n
 
-    # pressure coupling: -(1-φ) p div(η)
-    r_skel_k += -(_one_minus(phi_k) * p_k) * div(u_test)
-    r_skel_n += -(_one_minus(phi_n) * p_n) * div(u_test)
+    # Pressure coupling from the B vS part of the constraint:
+    #   -(p, div(B η)) = -p (B div(η) + grad(B)·η)
+    # Use dot(gradB, eta_test) ordering for backend compatibility.
+    div_B_utest_k = B_k * div(u_test) + dot(gradB_k, u_test)
+    div_B_utest_n = B_n * div(u_test) + dot(gradB_n, u_test)
+    r_skel_press_k = -p_k * div_B_utest_k
+    r_skel_press_n = -p_n * div_B_utest_n
 
     # drag reaction: -β (v - vS)
     # Since beta already contains α, if we use alpha again then it would square and it won't 
@@ -699,10 +728,13 @@ def build_biofilm_one_domain_forms(
     r_skeleton = (
         th * alpha_k * g_stiff_k * r_skel_k
         + one_m_th * alpha_n * g_stiff_n * r_skel_n
+        + th * r_skel_press_k
+        + one_m_th * r_skel_press_n
         + th * r_skel_drag_k
         + one_m_th * r_skel_drag_n
     ) * dx
-    r_skeleton += -dot(alpha_k * g_stiff_k * f_u, u_test) * dx
+    # External body force is weighted by biofilm presence α, but not degraded by g_stiff(d).
+    r_skeleton += -dot(alpha_k * f_u, u_test) * dx
 
     # Optional extension penalty to keep u well-posed in the free-fluid region.
     # This is a pragmatic stabilization for the one-domain formulation: as α→0,
@@ -742,7 +774,7 @@ def build_biofilm_one_domain_forms(
         drag_term_k = -beta_coeff_k * dot(kdrag_k, u_test)
         d_drag_term_k = -(dbeta_coeff * dot(kdrag_k, u_test) + beta_coeff_k * dot(dkdrag_k, u_test))
 
-    # Jacobian of α g(d) [ elastic + pore-pressure coupling ].
+    # Jacobian of α g(d) elastic part.
     # Important: when damage is disabled, dg_stiff_k is not a trial expression, so
     # avoid forming dalpha + 0*alpha_k (trial + function) which the compiler
     # cannot simplify reliably.
@@ -753,13 +785,21 @@ def build_biofilm_one_domain_forms(
     a_skel = th * (
         alpha_k * g_stiff_k * a_el
         + w_ag * r_el_k
-        - w_ag * (_one_minus(phi_k) * p_k) * div(u_test)
-        + alpha_k * g_stiff_k * (dphi * p_k) * div(u_test)
-        - alpha_k * g_stiff_k * (_one_minus(phi_k) * dp) * div(u_test)
     ) * dx
+    # Jacobian of the pressure coupling -p div(B η).
+    # Expand dgrad·eta component-wise to avoid backend-dependent contraction
+    # paths for Grad(trial-scalar) · VectorTest.
+    d_div_B_utest_k = dB_k * div(u_test)
+    if int(dim) == 2:
+        dgradB_k_x = _one_minus(phi_k) * grad(dalpha)[0] - dphi * grad(alpha_k)[0] - dalpha * grad(phi_k)[0] - alpha_k * grad(dphi)[0]
+        dgradB_k_y = _one_minus(phi_k) * grad(dalpha)[1] - dphi * grad(alpha_k)[1] - dalpha * grad(phi_k)[1] - alpha_k * grad(dphi)[1]
+        d_div_B_utest_k += dgradB_k_x * u_test[0] + dgradB_k_y * u_test[1]
+    else:
+        d_div_B_utest_k += dot(dgradB_k, u_test)
+    a_skel += th * (-(dp * div_B_utest_k + p_k * d_div_B_utest_k)) * dx
     # Drag term is *not* multiplied by alpha again: beta already contains alpha (one-domain blend).
     a_skel += th * d_drag_term_k * dx
-    a_skel += -dot(w_ag * f_u, u_test) * dx
+    a_skel += -dot(dalpha * f_u, u_test) * dx
 
     if float(gamma_u) != 0.0:
         u_ext_mode = str(u_extension_mode).strip().lower()
@@ -892,8 +932,8 @@ def build_biofilm_one_domain_forms(
         t_adh_n = k_n_c * u_nvec_n + k_t_c * u_tvec_n + g_n_c * vS_nvec_n + g_t_c * vS_tvec_n
 
         r_skeleton += (
-            th * alpha_k * g_stiff_k * a_prev * dot(t_adh_k, u_test)
-            + one_m_th * alpha_n * g_stiff_n * a_prev * dot(t_adh_n, u_test)
+            th * alpha_k * a_prev * dot(t_adh_k, u_test)
+            + one_m_th * alpha_n * a_prev * dot(t_adh_n, u_test)
         ) * ds_adh
 
         # Jacobian (k-part only): δ[ α a_prev t_adh(u,vS) ].
@@ -903,7 +943,7 @@ def build_biofilm_one_domain_forms(
         dvS_tvec = dvS - dvS_nvec
         dt_adh = k_n_c * du_nvec + k_t_c * du_tvec + g_n_c * dvS_nvec + g_t_c * dvS_tvec
 
-        a_skel += th * (w_ag * a_prev * dot(t_adh_k, u_test) + alpha_k * g_stiff_k * a_prev * dot(dt_adh, u_test)) * ds_adh
+        a_skel += th * (dalpha * a_prev * dot(t_adh_k, u_test) + alpha_k * a_prev * dot(dt_adh, u_test)) * ds_adh
 
     # ------------------------------------------------------------------
     # (iv) Porosity evolution (Eulerian, advected by vS)
@@ -1197,63 +1237,100 @@ def build_biofilm_one_domain_forms(
     r_damage = None
     a_damage = None
     if use_damage:
+        damage_model_key = str(damage_model).strip().lower()
         D_d_c = _c(float(damage_D))
         gamma_out_c = _c(float(damage_gamma_out))
+        # Lagged von Mises driver from previous skeleton state u_n.
+        # Used by both damage models below; lagging keeps Newton tangents robust.
+        sigma_vm = _c(0.0)
+        drive_vm = _c(0.0)
+        if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
+            eps_un = _epsilon(u_n)
+            sig_un = _c(2.0) * mu_s * eps_un + lambda_s * div(u_n) * Identity(int(dim))
+        else:
+            if c_nh is None:
+                c_nh = mu_s / _c(2.0)
+            if beta_nh is None:
+                beta_nh = lambda_s / (_c(2.0) * mu_s)
+            sig_un = sigma_neo_hookean(u_n, c_nh, beta_nh, dim=int(dim))
 
-        # Driving stress (lagged): von Mises from the *previous* skeleton state u_n.
-        # This avoids the need for dsigma_vm/du in the damage Jacobian, while still
-        # enabling stress-threshold activation with small Δt (ms-scale Dian case).
-        rate = _c(0.0)
-        if float(damage_k) != 0.0 and float(damage_sigma_cr) > 0.0:
-            k_dmg_c = _c(float(damage_k))
+        tr_sig = trace(sig_un)
+        s_dev = sig_un - (tr_sig / _c(float(dim))) * Identity(int(dim))
+        vm2 = _c(1.5) * inner(s_dev, s_dev)
+        sigma_vm = _sqrt(vm2 + _c(1.0e-16))
+
+        if float(damage_sigma_cr) > 0.0:
             sigma_cr_c = _c(float(damage_sigma_cr))
-
-            if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
-                eps_un = _epsilon(u_n)
-                sig_un = _c(2.0) * mu_s * eps_un + lambda_s * div(u_n) * Identity(int(dim))
-            else:
-                # Eulerian reference-map neo-Hookean Cauchy stress (same as in the skeleton block).
-                if c_nh is None:
-                    c_nh = mu_s / _c(2.0)
-                if beta_nh is None:
-                    beta_nh = lambda_s / (_c(2.0) * mu_s)
-                sig_un = sigma_neo_hookean(u_n, c_nh, beta_nh, dim=int(dim))
-
-            tr_sig = trace(sig_un)
-            s_dev = sig_un - (tr_sig / _c(float(dim))) * Identity(int(dim))
-            vm2 = _c(1.5) * inner(s_dev, s_dev)
-            sigma_vm = _sqrt(vm2 + _c(1.0e-16))
-
             ratio = sigma_vm / sigma_cr_c - _c(1.0)
             pos_ratio = _smooth_pos(ratio, eta=float(damage_eta_pos))
-            rate = k_dmg_c * (pos_ratio ** _c(float(damage_m)))
+            drive_vm = pos_ratio ** _c(float(damage_m))
+        else:
+            drive_vm = sigma_vm
 
-        # Strong (material) form:
-        #   α (∂t d + vS·∇d) - α rate (1-d) - div(D ∇d) + γ_out (1-α)^16 d = 0.
-        #
-        # The (1-α)^16 weight keeps the extension penalty localized to the free-fluid region.
-        one_m_d_k = _one_minus(d_k)
-        f_dmg_k = alpha_k * ((d_k - d_n) * inv_dt)
-        f_dmg_k += th * alpha_k * dot(grad(d_k), vS_k) + one_m_th * alpha_n * dot(grad(d_n), vS_n)
-        f_dmg_k += -alpha_k * rate * one_m_d_k
+        if damage_model_key in {"kinetic", "legacy"}:
+            # Legacy advection-reaction-diffusion model:
+            #   α (∂t d + vS·∇d) - α rate (1-d) - div(D_d ∇d) + γ_out (1-α)^16 d = 0.
+            rate = _c(0.0)
+            if float(damage_k) != 0.0:
+                rate = _c(float(damage_k)) * drive_vm
 
-        r_damage = d_test * f_dmg_k * dx
-        r_damage += D_d_c * inner(grad(d_k), grad(d_test)) * dx
-        if float(damage_gamma_out) != 0.0:
-            r_damage += gamma_out_c * w_phi_fluid_k * d_k * d_test * dx
+            f_dmg_k = alpha_k * ((d_k - d_n) * inv_dt)
+            f_dmg_k += th * alpha_k * dot(grad(d_k), vS_k) + one_m_th * alpha_n * dot(grad(d_n), vS_n)
+            f_dmg_k += -alpha_k * rate * one_m_d_k
 
-        # Jacobian (k-part only)
-        df_dmg_k = dalpha * ((d_k - d_n) * inv_dt) + alpha_k * (dd * inv_dt)
-        # Use inv_dt*dot(grad(d_k), du) instead of dot(grad(d_k), dvS) to avoid
-        # compiler corner cases with dot(grad(function), scaled-trial-vector).
-        df_dmg_k += th * (dalpha * dot(grad(d_k), vS_k) + alpha_k * (dot(grad(dd), vS_k) + dot(grad(d_k), du) * inv_dt))
-        df_dmg_k += -dalpha * rate * one_m_d_k + alpha_k * rate * dd
+            r_damage = d_test * f_dmg_k * dx
+            r_damage += D_d_c * inner(grad(d_k), grad(d_test)) * dx
+            if float(damage_gamma_out) != 0.0:
+                r_damage += gamma_out_c * w_phi_fluid_k * d_k * d_test * dx
 
-        a_damage = d_test * df_dmg_k * dx
-        a_damage += D_d_c * inner(grad(dd), grad(d_test)) * dx
-        if float(damage_gamma_out) != 0.0:
-            # δ[ w(α) d ] = w δd + (δw) d, with δw = dw_phi_fluid_k.
-            a_damage += gamma_out_c * (w_phi_fluid_k * dd + dw_phi_fluid_k * d_k) * d_test * dx
+            # Jacobian (k-part only)
+            df_dmg_k = dalpha * ((d_k - d_n) * inv_dt) + alpha_k * (dd * inv_dt)
+            df_dmg_k += th * (dalpha * dot(grad(d_k), vS_k) + alpha_k * (dot(grad(dd), vS_k) + dot(grad(d_k), du) * inv_dt))
+            df_dmg_k += -dalpha * rate * one_m_d_k + alpha_k * rate * dd
+
+            a_damage = d_test * df_dmg_k * dx
+            a_damage += D_d_c * inner(grad(dd), grad(d_test)) * dx
+            if float(damage_gamma_out) != 0.0:
+                # δ[ w(α) d ] = w δd + (δw) d, with δw = dw_phi_fluid_k.
+                a_damage += gamma_out_c * (w_phi_fluid_k * dd + dw_phi_fluid_k * d_k) * d_test * dx
+        elif damage_model_key in {"phase_field", "phase-field", "at2", "energy"}:
+            # Energy-derived phase-field damage (AT2-like, lagged drive):
+            #   α η_d D_t^S d - div(α G_c l ∇d) + α (G_c/l) d = 2 α (1-d) H_prev,
+            # with H_prev built from lagged von Mises stress.
+            Gc_val = float(damage_Gc)
+            ell_val = float(damage_l)
+            if Gc_val <= 0.0 or ell_val <= 0.0:
+                raise ValueError("damage_model='phase_field' requires damage_Gc>0 and damage_l>0.")
+            eta_d_c = _c(float(damage_eta))
+            Gc_c = _c(Gc_val)
+            ell_c = _c(ell_val)
+            Gc_over_l = Gc_c / ell_c
+            Gc_l = Gc_c * ell_c
+
+            psi0_val = float(damage_psi0)
+            if psi0_val <= 0.0:
+                psi0_val = Gc_val / max(ell_val, 1.0e-12)
+            H_prev = _c(psi0_val) * drive_vm
+
+            DtS_d_k = (d_k - d_n) * inv_dt
+            DtS_d_k += th * dot(grad(d_k), vS_k) + one_m_th * dot(grad(d_n), vS_n)
+
+            f_pf_k = eta_d_c * DtS_d_k + Gc_over_l * d_k - _c(2.0) * one_m_d_k * H_prev
+
+            r_damage = alpha_k * d_test * f_pf_k * dx
+            r_damage += alpha_k * Gc_l * inner(grad(d_k), grad(d_test)) * dx
+            if float(damage_gamma_out) != 0.0:
+                r_damage += gamma_out_c * w_phi_fluid_k * d_k * d_test * dx
+
+            d_DtS_d_k = dd * inv_dt + th * (dot(grad(dd), vS_k) + dot(grad(d_k), du) * inv_dt)
+            df_pf_k = eta_d_c * d_DtS_d_k + Gc_over_l * dd + _c(2.0) * H_prev * dd
+
+            a_damage = (dalpha * f_pf_k + alpha_k * df_pf_k) * d_test * dx
+            a_damage += (dalpha * Gc_l * inner(grad(d_k), grad(d_test)) + alpha_k * Gc_l * inner(grad(dd), grad(d_test))) * dx
+            if float(damage_gamma_out) != 0.0:
+                a_damage += gamma_out_c * (w_phi_fluid_k * dd + dw_phi_fluid_k * d_k) * d_test * dx
+        else:
+            raise ValueError(f"Unknown damage_model {damage_model!r}.")
 
     # ------------------------------------------------------------------
     # (vi) Substrate transport

@@ -458,6 +458,12 @@ class KernelRunner:
         final_args = [kernel_args[p] for p in self.param_order]
 
         if debug:
+            try:
+                mod_name = getattr(self.kernel, "__module__", "")
+            except Exception:
+                mod_name = ""
+            if mod_name:
+                print(f"[KernelRunner] module: {mod_name}")
             print("[KernelRunner] launching kernel with:")
             import numpy as np
             for tag, arr in zip(self.param_order, final_args):

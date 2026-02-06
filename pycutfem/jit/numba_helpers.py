@@ -228,6 +228,26 @@ def vector_dot_grad_basis(vec, grad_basis, dtype):
 
 
 @numba.njit(cache=True)
+def vector_dot_grad_value(vec_basis, grad_value, dtype):
+    """
+    Vector basis (k, n) dotted with grad(value) (k, d) -> (n, d).
+    res[j, d] = sum_i vec_basis[i, j] * grad_value[i, d]
+    """
+    if DEBUG: print("vector_dot_grad_value")
+    k, n = vec_basis.shape
+    if grad_value.shape[0] != k:
+        raise ValueError("vector·grad value: incompatible shapes")
+    d = grad_value.shape[1]
+    res = np.empty((n, d), dtype=dtype)
+    V = np.ascontiguousarray(vec_basis)   # (k, n)
+    G = np.ascontiguousarray(grad_value)  # (k, d)
+    for j in range(n):
+        # (k,) dot (k, d) -> (d,)
+        res[j, :] = V[:, j].T @ G
+    return res
+
+
+@numba.njit(cache=True)
 def dot_grad_basis_with_grad_value(grad_basis, grad_value, dtype):
     """
     Grad(basis) (k, n, d) dotted with grad(value) (k, d) -> (k, n, k).
@@ -1393,6 +1413,7 @@ for _helper_name in (
     "mul_scalar",
     "dot_grad_basis_vector",
     "vector_dot_grad_basis",
+    "vector_dot_grad_value",
     "dot_grad_basis_with_grad_value",
     "dot_grad_value_with_grad_basis",
     "dot_grad_func_trial_vec",

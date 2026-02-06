@@ -2269,9 +2269,9 @@ class FormCompiler:
 
             return a.dot_vec(b)  # ∇u_trial · u_k
         # ------------------------------------------------------------------
-        # case u_trial . grad(u_k)
+        # case u_trial/u_test . grad(u_k)
         if isinstance(b, GradOpInfo) and ((isinstance(a, VecOpInfo) \
-            and (a.role == "trial" )) and b.role == "function"
+            and (a.role in {"trial", "test"} )) and b.role == "function"
             ):
             return b.left_dot(a)  # u_trial · ∇u_k
 

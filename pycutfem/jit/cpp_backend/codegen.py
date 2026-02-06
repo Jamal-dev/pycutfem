@@ -2280,6 +2280,11 @@ class CppCodeGen:
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "value":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_trial_vec_grad_func({a.name}, {b.name});")
                     push("mat", "trial", (b.shape[1] if len(b.shape)>1 else -1, -1), a.field_names, a.parent)
+                elif a.kind == "mat" and b.kind == "mat" and a.role == "test" and b.role == "value":
+                    # Vector test basis dotted with grad(value): (k,n)·(k,d) -> (n,d)
+                    if a.shape[0] == b.shape[0] and (len(a.shape) > 1 and len(b.shape) > 1):
+                        emit_line(f"Eigen::MatrixXd {nm} = vector_dot_grad_value({a.name}, {b.name});")
+                        push("mat", "test", (a.shape[1], b.shape[1]), a.field_names, a.parent)
                 # Explicit Test/Trial mass-like dot even when shapes are concrete (not -1 flagged)
                 elif a.kind == "mat" and b.kind == "mat" and a.role == "trial" and b.role == "test":
                     emit_line(f"Eigen::MatrixXd {nm} = dot_mass_test_trial({b.name}, {a.name});")
@@ -2377,6 +2382,11 @@ class CppCodeGen:
 
                         # Result is a row vector with length equal to basis dof count (A.cols).
                         res_shape = (1, a.shape[1])
+                    elif a.role in {"test", "trial"} and (is_b_1d or is_b_col_vec or is_b_row_vec):
+                        # Matrix basis (n,d) dotted with const/value vector (d,) -> (n,)
+                        emit_line(f"Eigen::VectorXd {nm} = {a.name} * {b.name};")
+                        push("vec", a.role, (a.shape[0],), a.field_names, a.parent, side, a.field_sides)
+                        continue
                     elif is_a_2x2 and (is_b_1d or is_b_col_vec or is_b_row_vec):
                         # Value/const matrix-vector dot: return a true 1D vector (Eigen::VectorXd),
                         # not a (1,d) row matrix. Keeping it as vec prevents downstream dot(...) from

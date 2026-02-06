@@ -2479,6 +2479,20 @@ class NumbaCodeGen:
                                         side=a.side, field_sides=a.field_sides or []))
 
                 # ---------------------------------------------------------------------
+                # dot( v_test ,  grad(u_k) )    ← test vector dotted with grad(value)
+                # ---------------------------------------------------------------------
+                elif a.role == 'test' and a.is_vector and b.role == 'value' and b.is_gradient and not b.is_vector:
+                    body_lines.append("# Advection: dot(Test, grad(Function))")
+                    body_lines.append(
+                        f"{res_var} = vector_dot_grad_value({a.var_name}, {b.var_name}, {self.dtype})"
+                    )
+                    stack.append(StackItem(var_name=res_var, role='test',
+                                        shape=(a.shape[1], b.shape[1]), is_vector=False,
+                                        is_gradient=False, field_names=a.field_names,
+                                        parent_name=a.parent_name,
+                                        side=a.side, field_sides=a.field_sides or []))
+
+                # ---------------------------------------------------------------------
                 # dot( u_k ,  u_k )             ← |u_k|², scalar
                 # ---------------------------------------------------------------------
                 elif a.role == 'value' and a.is_vector and b.role == 'value' and b.is_vector:
@@ -3873,6 +3887,7 @@ from pycutfem.jit.numba_helpers import (
     mul_scalar,
     dot_grad_basis_vector,
     vector_dot_grad_basis,
+    vector_dot_grad_value,
     dot_grad_basis_with_grad_value,
     dot_grad_value_with_grad_basis,
     basis_dot_const_vector,

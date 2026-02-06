@@ -1040,6 +1040,18 @@ class VecOpInfo(BaseOpInfo):
                 data = self.data + other_data
             meta = _resolve_meta(self.meta(), other_meta, prefer='a')
             return VecOpInfo(data, role=self.role, **self.update_meta(meta))
+        # Allow adding row-test vectors (1,n) with plain vectors (n,) by broadcasting.
+        if self.role in {"test", "test_n"} and np.asarray(self.data).ndim == 2 and self.data.shape[0] == 1:
+            arr_other = np.asarray(other_data)
+            if arr_other.ndim == 1 and arr_other.shape[0] == self.data.shape[1]:
+                meta = _resolve_meta(self.meta(), other_meta, prefer='a')
+                return VecOpInfo(self.data[0, :] + arr_other, role=self.role, **self.update_meta(meta))
+        if other_role in {"test", "test_n"} and isinstance(other, VecOpInfo):
+            arr_self = np.asarray(self.data)
+            arr_other = np.asarray(other_data)
+            if arr_self.ndim == 1 and arr_other.ndim == 2 and arr_other.shape[0] == 1 and arr_self.shape[0] == arr_other.shape[1]:
+                meta = _resolve_meta(self.meta(), other_meta, prefer='b')
+                return VecOpInfo(arr_self + arr_other[0, :], role=other_role, **other.update_meta(meta))
         if self.data.shape != other_data.shape:
             raise ValueError(f"VecOpInfo shapes mismatch in addition: {self.data.shape} vs {other_data.shape}"
                              f" Roles: {self.role}, other={getattr(other, 'role', None)}."
@@ -1329,11 +1341,16 @@ class GradOpInfo(BaseOpInfo):
                 grad_val = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)
                 # (2)  dot product
                 if left_vec.role in {"trial", "test"}:
-                    if grad_val.shape[0] != left_vec.shape[0]:
-                        raise NotImplementedError(self._error_msg(left_vec, "left_dot with vector"))
                     meta = _resolve_meta(self.meta(), left_vec.meta(), prefer='b')
-                    data = np.einsum("kn,kd->dn", left_vec.data, grad_val, optimize=True)
-                    return VecOpInfo(data, role=left_vec.role, **left_vec.update_meta(meta))
+                    if grad_val.shape[0] == left_vec.shape[0]:
+                        data = np.einsum("kn,kd->dn", left_vec.data, grad_val, optimize=True)
+                        return VecOpInfo(data, role=left_vec.role, **left_vec.update_meta(meta))
+                    # Scalar-gradient special case: grad(Function scalar) has shape (1,d),
+                    # while vector trial/test has shape (d,n). Contract over d to get scalar basis (n).
+                    if grad_val.shape[0] == 1 and left_vec.data.shape[0] == grad_val.shape[1]:
+                        data = np.einsum("dn,d->n", left_vec.data, grad_val[0], optimize=True)
+                        return VecOpInfo(data[np.newaxis, :], role=left_vec.role, **left_vec.update_meta(meta))
+                    raise NotImplementedError(self._error_msg(left_vec, "left_dot with vector"))
                 elif left_vec.role == "function":
                     u_vals = _collapsed_function(left_vec)  # shape (k,)
                     data = np.dot(u_vals, grad_val)  # (d,) result
@@ -1425,6 +1442,15 @@ class GradOpInfo(BaseOpInfo):
                     meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='b')
                     return VecOpInfo(data, role=other_vec.role, **other_vec.update_meta(meta))
                 else: raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
+            elif self.role == "function" and other_vec.role == "test":
+                # Case:  Grad(Function) · Vec(Test)       (∇u_k) · v
+                grad_val = _collapsed_grad(self)
+                if grad_val.shape[-1] == other_vec.shape[0]:
+                    data = grad_val @ other_vec.data
+                    meta = _resolve_meta(self.meta(), other_vec.meta(), prefer="b")
+                    return VecOpInfo(data, role=other_vec.role, **other_vec.update_meta(meta))
+                else:
+                    raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
             
             elif self.role == "trial" and other_vec.role == "function": # introducing a new branch
                 # Case:  Grad(Trial) · Vec(Function)      (∇u_trial) · u_k
@@ -1456,10 +1482,18 @@ class GradOpInfo(BaseOpInfo):
                 role = "scalar" if data.ndim == 0 else "vector"
                 return VecOpInfo(data, role=role, **self.update_meta(self.meta()))
             elif self.role in {"trial", "test"} and other_vec.role in {"trial", "test"}:
-                if self.data.shape[0] != other_vec.data.shape[0]:
+                if self.data.shape[-1] != other_vec.data.shape[0]:
                     raise NotImplementedError(self._error_msg(other_vec, "dot_vec"))
-                data = np.einsum("knd,dm->knm", self.data, other_vec.data, optimize=True)
-                meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
+                # Keep a consistent mixed orientation: rows=test, cols=trial.
+                if self.role == "trial" and other_vec.role == "test":
+                    data = np.einsum("knd,dm->kmn", self.data, other_vec.data, optimize=True)
+                    meta = _resolve_meta(self.meta(), other_vec.meta(), prefer="b")
+                elif self.role == "test" and other_vec.role == "trial":
+                    data = np.einsum("knd,dm->knm", self.data, other_vec.data, optimize=True)
+                    meta = _resolve_meta(self.meta(), other_vec.meta(), prefer="a")
+                else:
+                    data = np.einsum("knd,dm->knm", self.data, other_vec.data, optimize=True)
+                    meta = _resolve_meta(self.meta(), other_vec.meta(), prefer='a')
                 return VecOpInfo(data, role="mixed", **self.update_meta(meta))
             elif self.role in {"trial", "test"} and other_vec.role == "vector":
                 vec_vals = np.asarray(other_vec.data)

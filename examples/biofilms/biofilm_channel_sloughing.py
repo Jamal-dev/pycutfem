@@ -159,7 +159,7 @@ def main() -> None:
         "--case",
         type=str,
         default="generic",
-        choices=("generic", "dian_paper", "dian_paper_sloughing"),
+        choices=("generic", "dian_paper", "dian_paper_sloughing", "dian_paper_sloughing_gap"),
         help="Preconfigured setups. 'dian_paper' matches the microchannel biofilm deformation case described in "
         "`examples/biofilms/dian_paper/latex/main.tex` (SI units, polygon alpha0, deformation-only run).",
     )
@@ -257,6 +257,17 @@ def main() -> None:
     ap.add_argument("--damage-eta-pos", type=float, default=1.0e-12, help="Positive-part smoothing eta for bulk damage activation.")
     ap.add_argument("--damage-kappa-stiff", type=float, default=1.0e-8, help="Stiffness degradation floor κ in g(d)=(1-d)^2+κ.")
     ap.add_argument("--damage-kappa-perm", type=float, default=1.0e-8, help="Permeability degradation floor κ in g_perm(d)=(1-d)^2+κ.")
+    ap.add_argument(
+        "--damage-model",
+        type=str,
+        default="kinetic",
+        choices=("kinetic", "phase_field", "phase-field", "at2"),
+        help="Bulk damage model: legacy kinetic law or AT2-like phase-field damage.",
+    )
+    ap.add_argument("--damage-eta", type=float, default=0.0, help="Damage viscosity η_d for phase-field model.")
+    ap.add_argument("--damage-Gc", type=float, default=0.0, help="Fracture toughness G_c [J/m^2] for phase-field damage.")
+    ap.add_argument("--damage-l", type=float, default=0.0, help="Damage length scale l [m] for phase-field damage.")
+    ap.add_argument("--damage-psi0", type=float, default=0.0, help="Optional stress-drive energy scale for phase-field damage (defaults to G_c/l).")
     # Material / model parameters (kept simple)
     ap.add_argument("--rho-f", type=float, default=1.0)
     ap.add_argument("--mu-f", type=float, default=0.1)
@@ -537,7 +548,7 @@ def main() -> None:
     def _has_flag(flag: str) -> bool:
         return any(a == flag or a.startswith(flag + "=") for a in argv)
 
-    if case in {"dian_paper", "dian_paper_sloughing"}:
+    if case in {"dian_paper", "dian_paper_sloughing", "dian_paper_sloughing_gap"}:
         # Microchannel biofilm deformation case (Blauert et al. 2015) used in the
         # paper reprint under `examples/biofilms/dian_paper/latex/main.tex`.
         if not _has_flag("--L"):
@@ -601,7 +612,7 @@ def main() -> None:
         if not _has_flag("--outdir"):
             args.outdir = "examples/biofilms/results/dian_paper_deformation"
 
-        if case == "dian_paper_sloughing":
+        if case in {"dian_paper_sloughing", "dian_paper_sloughing_gap"}:
             # Stress-driven sloughing (paper-style): use a critical von Mises stress σ_cr on the wall
             # to irreversibly weaken adhesion, while transporting the biofilm indicator α with the
             # Eulerian reference map (α(x,t)=α0(x-u)).
@@ -615,17 +626,34 @@ def main() -> None:
                 args.sigma_cr = 40.0
 
             # Bulk damage (cohesion loss) driven by σ_vm(u)>σ_cr.
-            # This is distinct from α (phase/occupancy). Damage degrades stiffness and drag
-            # so cracks can open hydraulically and allow chunk separation/motion.
-            if not _has_flag("--damage-k"):
-                # Dian case has κ^{-1} ≫ 1 (from K≈1e-5 m/s), so even a tiny permeability
-                # floor κ_perm can keep β=α μ_f φ^2 κ^{-1} g_perm(d) O(1) when d→1.
-                # Use a more aggressive default damage rate so d localizes on the ms scale.
-                args.damage_k = 5.0e6
+            # Default to an AT2-like phase-field model for thermodynamic consistency.
+            if not _has_flag("--damage-model"):
+                args.damage_model = "phase_field"
             if not _has_flag("--damage-sigma-cr"):
                 args.damage_sigma_cr = float(args.sigma_cr)
             if not _has_flag("--damage-m"):
                 args.damage_m = 2.0
+            dmg_model_key = str(getattr(args, "damage_model", "kinetic")).strip().lower()
+            if dmg_model_key in {"kinetic"}:
+                if not _has_flag("--damage-k"):
+                    # Legacy kinetic defaults kept for backward compatibility.
+                    args.damage_k = 5.0e6
+            else:
+                # Calibrate Gc from target σ_cr using AT2 scaling:
+                #   sigma_c = (3/16) * sqrt(3 E' Gc / l)
+                # => Gc = 256 l sigma_c^2 / (27 E')
+                # with E' = E/(1-nu^2) for plane-strain-like scaling.
+                if not _has_flag("--damage-k"):
+                    args.damage_k = 0.0
+                if not _has_flag("--damage-l"):
+                    args.damage_l = max(float(args.eps), 5.0e-5)
+                if not _has_flag("--damage-Gc"):
+                    E_eff = E / (1.0 - nu * nu)
+                    ell = float(args.damage_l)
+                    sigma_c = max(1.0e-12, float(args.damage_sigma_cr))
+                    args.damage_Gc = (256.0 * ell * sigma_c * sigma_c) / (27.0 * E_eff)
+                if not _has_flag("--damage-eta"):
+                    args.damage_eta = 1.0
             if not _has_flag("--damage-D"):
                 args.damage_D = 0.0
             if not _has_flag("--damage-gamma-out"):
@@ -714,6 +742,22 @@ def main() -> None:
             if not _has_flag("--slough-contact-rel-thresh"):
                 args.slough_contact_rel_thresh = 0.98
 
+        if case == "dian_paper_sloughing_gap":
+            # Gap/peeling variant: seed a small notch (initial fluid gap) at the wall.
+            # Keep α transported by the Eulerian reference map (α(x,t)=α0(x-u)) for robustness
+            # and to avoid non-conservative Allen–Cahn drift. The crack then opens mechanically
+            # as wall adhesion fails, allowing lift-off to be detected.
+            if not _has_flag("--crack-depth"):
+                args.crack_depth = 100.0e-6
+            if not _has_flag("--crack-width"):
+                args.crack_width = 1200.0e-6
+            if not _has_flag("--k-break"):
+                # For the gap case, use smooth stress-driven degradation by default.
+                # This avoids binary "stick/slip" behavior and improves peel-off robustness.
+                args.k_break = 20.0
+            if not _has_flag("--outdir"):
+                args.outdir = "examples/biofilms/results/dian_paper_sloughing_gap"
+
     L = float(args.L)
     H = float(args.H)
     qdeg = int(args.q)
@@ -777,10 +821,16 @@ def main() -> None:
     use_spatial_adhesion = bool(use_sloughing and adhesion_integrity == "spatial")
 
     # Bulk damage is enabled if any of its coefficients are non-zero.
+    damage_model_key = str(getattr(args, "damage_model", "kinetic")).strip().lower()
     use_damage = bool(
         float(getattr(args, "damage_k", 0.0) or 0.0) != 0.0
         or float(getattr(args, "damage_D", 0.0) or 0.0) != 0.0
         or float(getattr(args, "damage_gamma_out", 0.0) or 0.0) != 0.0
+        or (damage_model_key in {"phase_field", "phase-field", "at2"} and (
+            float(getattr(args, "damage_Gc", 0.0) or 0.0) != 0.0
+            or float(getattr(args, "damage_l", 0.0) or 0.0) != 0.0
+            or float(getattr(args, "damage_eta", 0.0) or 0.0) != 0.0
+        ))
     )
     if use_damage and float(getattr(args, "damage_sigma_cr", 0.0) or 0.0) <= 0.0:
         # Default to the same stress threshold used for wall adhesion if provided.
@@ -996,6 +1046,11 @@ def main() -> None:
         x1 = float(xmin)
         x2 = float(xmax)
         h_b = float(ymax)
+        # If the user did not explicitly specify --crack-x0, default to the polygon midpoint.
+        # (The global default computed earlier uses the block parameters and is not meaningful for polygon alpha0.)
+        if not _has_flag("--crack-x0"):
+            crack_x0 = 0.5 * (x1 + x2)
+            args.crack_x0 = float(crack_x0)
         print(
             f"[info] alpha0 polygon: {str(args.alpha0_file)} "
             f"(bbox x=[{xmin:.3e},{xmax:.3e}], y=[{ymin:.3e},{ymax:.3e}], eps={eps:.3e})"
@@ -1013,6 +1068,14 @@ def main() -> None:
             pts = np.column_stack((xx.ravel(), yy.ravel()))
             phi = _signed_distance_polygon(pts, poly_alpha0)
             a0 = _smooth_step(-phi / eps_x).reshape(xx.shape)
+            # Optional initial crack notch (fluid gap) from the bottom wall into the biofilm.
+            # This seeds an internal diffuse interface so the crack-speed term can propagate it.
+            if crack_depth > 0.0 and crack_width > 0.0:
+                xL = crack_x0 - 0.5 * crack_width
+                xR = crack_x0 + 0.5 * crack_width
+                wcx = _smooth_step((xx - xL) / eps_x) * _smooth_step((xR - xx) / eps_x)
+                wcy = _smooth_step((crack_depth - yy) / eps_y)
+                a0 = a0 * (1.0 - wcx * wcy)
             return np.clip(a0, 0.0, 1.0)
 
     else:
@@ -1170,6 +1233,11 @@ def main() -> None:
         damage_eta_pos=float(getattr(args, "damage_eta_pos", 1.0e-12) or 1.0e-12),
         damage_kappa_stiff=float(getattr(args, "damage_kappa_stiff", 1.0e-8) or 1.0e-8),
         damage_kappa_perm=float(getattr(args, "damage_kappa_perm", 1.0e-8) or 1.0e-8),
+        damage_model=str(getattr(args, "damage_model", "kinetic")),
+        damage_eta=float(getattr(args, "damage_eta", 0.0) or 0.0),
+        damage_Gc=float(getattr(args, "damage_Gc", 0.0) or 0.0),
+        damage_l=float(getattr(args, "damage_l", 0.0) or 0.0),
+        damage_psi0=float(getattr(args, "damage_psi0", 0.0) or 0.0),
         D_S=0.01,
         D_X=float(args.D_X),
         rho_s_star=float(args.rho_s_star),

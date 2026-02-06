@@ -430,13 +430,29 @@ inline Eigen::MatrixXd contract_matrix_vector(const Eigen::MatrixXd& A,
  * - Always treats 'a' as a row vector (1, M) to contract with the rows of 'b'.
  * - Result is ALWAYS a MatrixXd of shape (1, N).
  */
-inline Eigen::MatrixXd contract_vector_matrix(const Eigen::VectorXd& a,
+/**
+ * Robust vector-matrix contraction for generic Eigen expressions.
+ * Accepts row/column vectors and 1xK/Kx1 expressions; returns shape (1,N).
+ */
+template <typename DerivedA>
+inline Eigen::MatrixXd contract_vector_matrix(const Eigen::MatrixBase<DerivedA>& a_expr,
                                               const Eigen::MatrixXd& b) {
-    if (a.size() != b.rows()) {
-        throw std::runtime_error("Dimension mismatch in contract_vector_matrix: "
-                                 "Vector size must match Matrix rows.");
+    const Eigen::MatrixXd a = a_expr;
+    if (a.rows() == 1 && a.cols() == b.rows()) {
+        return a * b;
     }
-    return a.transpose() * b;  // (1,N)
+    if (a.cols() == 1 && a.rows() == b.rows()) {
+        return a.transpose() * b;
+    }
+    if (a.size() == b.rows()) {
+        Eigen::Map<const Eigen::VectorXd> avec(a.data(), a.size());
+        return avec.transpose() * b;
+    }
+    std::stringstream ss;
+    ss << "Dimension mismatch in contract_vector_matrix: "
+       << "A=(" << a.rows() << "," << a.cols() << "), "
+       << "B=(" << b.rows() << "," << b.cols() << ")";
+    throw std::runtime_error(ss.str());
 }
 
 // ---------------------------------------------------------------------------
@@ -875,6 +891,22 @@ inline Eigen::MatrixXd vector_dot_grad_basis(const Eigen::VectorXd& vec,
         return dot_vec_grad(vec, grad_basis); // (d, n)
     }
     throw std::runtime_error("vector_dot_grad_basis: incompatible shapes.");
+}
+
+// Vector basis (k,n) dotted with grad(value) (k,d) -> (n,d)
+inline Eigen::MatrixXd vector_dot_grad_value(const Eigen::MatrixXd& vec_basis,
+                                             const Eigen::MatrixXd& grad_value) {
+    if (is_debug) {std::cout<< "-----------------vector_dot_grad_value---------------------"<<std::endl;}
+    if (vec_basis.rows() != grad_value.rows()) {
+        throw std::runtime_error("vector_dot_grad_value: incompatible shapes.");
+    }
+    const int n = static_cast<int>(vec_basis.cols());
+    const int d = static_cast<int>(grad_value.cols());
+    Eigen::MatrixXd out(n, d);
+    for (int j = 0; j < n; ++j) {
+        out.row(j).noalias() = vec_basis.col(j).transpose() * grad_value;
+    }
+    return out;
 }
 
 // Contract vector basis (components) with grad basis: sum_c grad[c][:,r] * vec_basis[c,:]

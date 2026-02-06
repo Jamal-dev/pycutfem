@@ -1509,6 +1509,29 @@ class NewtonSolver:
             t_iteration = t_current - temp_t0
             temp_t0 = t_current
             print(f"        Newton {it+1}: |R|_∞ = {norm_R:.2e}, time = {t_iteration}s")
+            if os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS", "").lower() in {"1", "true", "yes"}:
+                try:
+                    R_full_dbg = self.restrictor.expand_vec(R_red)
+                    field_norms = []
+                    for fld in getattr(self.dh, "field_names", []):
+                        try:
+                            sl = self.dh.get_field_slice(fld)
+                        except Exception:
+                            continue
+                        if sl is None or len(sl) == 0:
+                            continue
+                        sl = np.asarray(sl, dtype=int).ravel()
+                        field_norms.append((float(np.linalg.norm(R_full_dbg[sl], ord=np.inf)), str(fld)))
+                    field_norms.sort(reverse=True, key=lambda t: t[0])
+                    n_show_raw = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS_N", "8").strip()
+                    try:
+                        n_show = max(1, int(n_show_raw))
+                    except Exception:
+                        n_show = 8
+                    items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
+                    print(f"        [res] {items}")
+                except Exception as exc:
+                    print(f"        [res] trace failed: {exc}")
             if norm_R <= tol_eff:
                 # Converged — return *time-step* increment for all fields
                 converged = True
