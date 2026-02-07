@@ -1250,6 +1250,16 @@ class Laplacian(Expression):
     def __init__(self, operand): self.operand = operand
     def __repr__(self): return f"Laplacian({self.operand!r})"
 
+class PositivePart(Expression):
+    """Hard positive part ⟨x⟩₊ := max(x, 0) (non-smooth at x=0)."""
+    def __init__(self, operand): self.operand = operand
+    def __repr__(self): return f"PositivePart({self.operand!r})"
+
+class Heaviside(Expression):
+    """Hard Heaviside step H(x):=1 if x>0 else 0 (convention H(0)=0)."""
+    def __init__(self, operand): self.operand = operand
+    def __repr__(self): return f"Heaviside({self.operand!r})"
+
 class Inner(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
     def __repr__(self): return f"Inner({self.a!r}, {self.b!r})"
@@ -1451,6 +1461,8 @@ def div(v):
 def inner(a, b): return Inner(a, b)
 def outer(a, b): return Outer(a, b)
 def dyad(a, b): return Outer(a, b)
+def pos_part(x): return PositivePart(x)
+def heaviside(x): return Heaviside(x)
 def jump(v, n=None):
     """
     Jump operator.

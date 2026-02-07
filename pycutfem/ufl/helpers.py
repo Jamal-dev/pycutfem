@@ -810,6 +810,13 @@ class VecOpInfo(BaseOpInfo):
                     return VecOpInfo(data, role=other.role, **self.update_meta(meta))
                 else:
                     raise NotImplementedError(self._error_msg(other, "VecOpInfo.__mul__"))
+            elif self.role == "function" and other.role == "vector" and self.is_scalar_function():
+                # Case: scalar coefficient function scaling a pre-expanded local RHS vector.
+                scale = float(_collapsed_function(self)[0])
+                return other._with(scale * other.data, role=other.role)
+            elif self.role == "vector" and other.role == "function" and other.is_scalar_function():
+                scale = float(_collapsed_function(other)[0])
+                return self._with(scale * self.data, role=self.role)
             # elif self.role in {"trial","test"} and other.role == "function":
             #     # Case: Trial * Function , dot product case
             #     meta = _resolve_meta(self.meta(), other.meta(), prefer='a')
@@ -861,7 +868,21 @@ class VecOpInfo(BaseOpInfo):
                                           f" (self.shape={self.shape}, other.shape={other.shape})")
                 
         elif isinstance(other, GradOpInfo):
-            if self.shape[0] == 1 and other.shape == (2,2) and self.role in {"trial","test"}:
+            if self.role == "scalar":
+                # Scalar coefficient/value scaling a gradient table.
+                s = np.asarray(self.data)
+                if s.ndim == 0:
+                    scale = float(s)
+                elif s.ndim == 1 and s.shape[0] == 1:
+                    scale = float(s[0])
+                else:
+                    raise NotImplementedError(
+                        f"Scaling GradOpInfo with non-scalar VecOpInfo(role='scalar', shape={s.shape}) is not supported."
+                    )
+                return other._with(scale * other.data, role=other.role, coeffs=other.coeffs)
+            # NOTE: some scalar coefficient products collapse to role="scalar" with shape=().
+            # Avoid indexing self.shape[0] before checking the relevant roles.
+            if self.role in {"trial", "test"} and other.shape == (2, 2) and self.shape[:1] == (1,):
                 # Case: scalar trial or test with identity matrix the result will be GradOpInfo
                 # print(f"self.shape: {self.shape}, other.shape: {other.shape}"
                 #       f" with roles {self.role} and {other.role}")
@@ -1632,6 +1653,17 @@ class GradOpInfo(BaseOpInfo):
             return self._with(self.data / other, role=self.role, coeffs=self.coeffs)
         if isinstance(other, np.ndarray) and other.ndim == 0:
             return self._with(self.data / float(other), role=self.role, coeffs=self.coeffs)
+        if isinstance(other, VecOpInfo) and other.role in {"function", "scalar"}:
+            o = np.asarray(other.data)
+            if o.ndim == 0:
+                denom = float(o)
+            elif o.ndim == 1 and o.shape[0] == 1:
+                denom = float(o[0])
+            else:
+                raise TypeError(
+                    f"GradOpInfo can only be divided by a scalar VecOpInfo; got shape {o.shape} for role {other.role}."
+                )
+            return self._with(self.data / denom, role=self.role, coeffs=self.coeffs)
         raise TypeError(f"GradOpInfo can only be divided by a scalar, not {type(other)}")
 
     def __rtruediv__(self, other):

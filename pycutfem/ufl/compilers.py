@@ -50,7 +50,7 @@ from pycutfem.ufl.expressions import (
     ElementWiseConstant, Derivative, Transpose,
     CellDiameter, MeshSize, NormalComponent,
     Restriction, Power, Trace, Determinant, Inverse, Hessian, Laplacian,
-    Identity, Cofactor
+    Identity, Cofactor, PositivePart, Heaviside
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -191,7 +191,9 @@ class FormCompiler:
             Cofactor: self._visit_Cofactor,
             Hessian: self._visit_Hessian,
     Laplacian: self._visit_Laplacian,
-    Identity: self._visit_Identity
+    Identity: self._visit_Identity,
+    PositivePart: self._visit_PositivePart,
+    Heaviside: self._visit_Heaviside,
         }
     
     @contextmanager
@@ -1273,6 +1275,32 @@ class FormCompiler:
         # return val
         pv = float(self.ctx.get('phi_val', 0.0))
         return (val * 0.0) if SIDE.is_pos(pv) else val
+
+    def _visit_PositivePart(self, node: PositivePart):
+        val = self._visit(node.operand)
+        if val is None:
+            return None
+        if isinstance(val, (VecOpInfo, GradOpInfo, HessOpInfo)):
+            if getattr(val, "role", None) in {"trial", "test", "mixed"}:
+                raise NotImplementedError("PositivePart is only supported for coefficient/value expressions.")
+            return val._with(np.maximum(val.data, 0.0))
+        if isinstance(val, np.ndarray):
+            return np.maximum(val, 0.0)
+        x = float(val)
+        return x if x > 0.0 else 0.0
+
+    def _visit_Heaviside(self, node: Heaviside):
+        val = self._visit(node.operand)
+        if val is None:
+            return None
+        if isinstance(val, (VecOpInfo, GradOpInfo, HessOpInfo)):
+            if getattr(val, "role", None) in {"trial", "test", "mixed"}:
+                raise NotImplementedError("Heaviside is only supported for coefficient/value expressions.")
+            return val._with(np.where(val.data > 0.0, 1.0, 0.0))
+        if isinstance(val, np.ndarray):
+            return np.where(val > 0.0, 1.0, 0.0)
+        x = float(val)
+        return 1.0 if x > 0.0 else 0.0
 
     def _visit_Jump(self, n: Jump):
         phi_old  = self.ctx.get('phi_val', None)

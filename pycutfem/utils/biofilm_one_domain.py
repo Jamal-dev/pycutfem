@@ -37,6 +37,13 @@ from pycutfem.ufl.expressions import (
     trace,
 )
 
+from pycutfem.ufl.linalg import (
+    d_spectral_positive_part_2x2_sym,
+    spectral_positive_part_2x2_sym,
+    smooth_pos as _smooth_pos_u,
+    smooth_pos_derivative as _smooth_pos_u_prime,
+)
+
 from pycutfem.utils.nonlinear_solid_eulerian_refmap import (
     deulerian_k_inv,
     dsigma_neo_hookean,
@@ -307,6 +314,8 @@ def build_biofilm_one_domain_forms(
     damage_Gc: float = 0.0,
     damage_l: float = 0.0,
     damage_psi0: float = 0.0,
+    damage_pf_driver: str = "von_mises",
+    damage_stiff_split: str = "full",
     D_S: float = 0.0,
     D_X: float = 0.0,
     # growth / detachment parameters
@@ -403,17 +412,22 @@ def build_biofilm_one_domain_forms(
 
         kappa_stiff = _c(float(damage_kappa_stiff))
         kappa_perm = _c(float(damage_kappa_perm))
+        one_m_kappa_stiff = _one_minus(kappa_stiff)
+        one_m_kappa_perm = _one_minus(kappa_perm)
 
         one_m_d_k = _one_minus(d_k)
         one_m_d_n = _one_minus(d_n)
 
-        g_stiff_k = one_m_d_k * one_m_d_k + kappa_stiff
-        g_stiff_n = one_m_d_n * one_m_d_n + kappa_stiff
-        dg_stiff_k = (-_c(2.0) * one_m_d_k) * dd
+        # Miehe-type regularized degradation:
+        #   g(d) = (1 - κ) (1 - d)^2 + κ,
+        # so g(0)=1 and g(1)=κ.
+        g_stiff_k = one_m_kappa_stiff * (one_m_d_k * one_m_d_k) + kappa_stiff
+        g_stiff_n = one_m_kappa_stiff * (one_m_d_n * one_m_d_n) + kappa_stiff
+        dg_stiff_k = (-_c(2.0) * one_m_kappa_stiff * one_m_d_k) * dd
 
-        g_perm_k = one_m_d_k * one_m_d_k + kappa_perm
-        g_perm_n = one_m_d_n * one_m_d_n + kappa_perm
-        dg_perm_k = (-_c(2.0) * one_m_d_k) * dd
+        g_perm_k = one_m_kappa_perm * (one_m_d_k * one_m_d_k) + kappa_perm
+        g_perm_n = one_m_kappa_perm * (one_m_d_n * one_m_d_n) + kappa_perm
+        dg_perm_k = (-_c(2.0) * one_m_kappa_perm * one_m_d_k) * dd
     else:
         g_stiff_k = _c(1.0)
         g_stiff_n = _c(1.0)
@@ -686,26 +700,91 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     # (iii) Skeleton momentum (optional inertia + linear/neo-Hookean stress)
     # ------------------------------------------------------------------
-    if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
-        r_el_k = _linear_elastic_term(u_k, u_test, mu_s=mu_s, lambda_s=lambda_s)
-        r_el_n = _linear_elastic_term(u_n, u_test, mu_s=mu_s, lambda_s=lambda_s)
-        a_el = _linear_elastic_term(du, u_test, mu_s=mu_s, lambda_s=lambda_s)
+    damage_stiff_split_key = str(damage_stiff_split).strip().lower()
+    use_miehe_stiff_split = bool(
+        use_damage
+        and damage_stiff_split_key in {"miehe", "tensile", "tension_compression", "tension-compression", "tc"}
+    )
+
+    if use_miehe_stiff_split and solid_model_key not in {"linear", "small_strain", "linear_elastic"}:
+        raise ValueError(
+            "damage_stiff_split='miehe' is currently only implemented for solid_model='linear' "
+            "(small-strain). Use damage_stiff_split='full' for neo-Hookean."
+        )
+    if use_miehe_stiff_split and int(dim) != 2:
+        raise ValueError("damage_stiff_split='miehe' is currently only implemented for dim=2.")
+
+    # Elastic residual/Jacobian contributions.
+    #
+    # - Default: full-stress degradation via scalar g_stiff(d) multiplier.
+    # - Optional: Miehe (tension/compression) split for linear elasticity:
+    #     σ = g(d) σ⁺(u) + σ⁻(u),  with σ⁺ built from the positive principal strains.
+    if solid_model_key in {"linear", "small_strain", "linear_elastic"} and use_miehe_stiff_split:
+        eta_pos = float(damage_eta_pos)
+        disc_reg = 1.0e-16
+        I = Identity(int(dim))
+
+        # --- k-level split ---
+        E_k = _epsilon(u_k)
+        E_plus_k, E_minus_k, _, _, _ = spectral_positive_part_2x2_sym(E_k, eta_pos=eta_pos, disc_reg=disc_reg)
+        trE_k = div(u_k)
+        trE_pos_k = _smooth_pos_u(trE_k, eta=eta_pos)
+
+        sig_plus_k = lambda_s * trE_pos_k * I + _c(2.0) * mu_s * E_plus_k
+        sig_minus_k = lambda_s * (trE_k - trE_pos_k) * I + _c(2.0) * mu_s * E_minus_k
+
+        r_el_plus_k = inner(sig_plus_k, grad(u_test))
+        r_el_minus_k = inner(sig_minus_k, grad(u_test))
+
+        # --- n-level split (lagged, no Jacobian contribution) ---
+        E_n = _epsilon(u_n)
+        E_plus_n, E_minus_n, _, _, _ = spectral_positive_part_2x2_sym(E_n, eta_pos=eta_pos, disc_reg=disc_reg)
+        trE_n = div(u_n)
+        trE_pos_n = _smooth_pos_u(trE_n, eta=eta_pos)
+
+        sig_plus_n = lambda_s * trE_pos_n * I + _c(2.0) * mu_s * E_plus_n
+        sig_minus_n = lambda_s * (trE_n - trE_pos_n) * I + _c(2.0) * mu_s * E_minus_n
+
+        r_el_plus_n = inner(sig_plus_n, grad(u_test))
+        r_el_minus_n = inner(sig_minus_n, grad(u_test))
+
+        # --- consistent Jacobian: Gateaux derivatives ---
+        dE = _epsilon(du)
+        dE_plus = d_spectral_positive_part_2x2_sym(E_k, dE, eta_pos=eta_pos, disc_reg=disc_reg)
+        dtrE = div(du)
+        dtrE_pos = _smooth_pos_u_prime(trE_k, eta=eta_pos) * dtrE
+
+        dsig_plus_k = lambda_s * dtrE_pos * I + _c(2.0) * mu_s * dE_plus
+        dsig_minus_k = lambda_s * (dtrE - dtrE_pos) * I + _c(2.0) * mu_s * (dE - dE_plus)
+
+        a_el_plus = inner(dsig_plus_k, grad(u_test))
+        a_el_minus = inner(dsig_minus_k, grad(u_test))
     else:
-        # Eulerian reference-map Neo-Hookean stress (Cauchy), compatible with FPI poro Eulerian module.
-        if c_nh is None:
-            c_nh = mu_s / _c(2.0)
-        if beta_nh is None:
-            beta_nh = lambda_s / (_c(2.0) * mu_s)
+        # Full-stress (legacy) elastic residual/Jacobian.
+        if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
+            r_el_k = _linear_elastic_term(u_k, u_test, mu_s=mu_s, lambda_s=lambda_s)
+            r_el_n = _linear_elastic_term(u_n, u_test, mu_s=mu_s, lambda_s=lambda_s)
+            a_el = _linear_elastic_term(du, u_test, mu_s=mu_s, lambda_s=lambda_s)
+        else:
+            # Eulerian reference-map Neo-Hookean stress (Cauchy), compatible with FPI poro Eulerian module.
+            if c_nh is None:
+                c_nh = mu_s / _c(2.0)
+            if beta_nh is None:
+                beta_nh = lambda_s / (_c(2.0) * mu_s)
 
-        sig_k = sigma_neo_hookean(u_k, c_nh, beta_nh, dim=int(dim))
-        sig_n = sigma_neo_hookean(u_n, c_nh, beta_nh, dim=int(dim))
-        r_el_k = inner(sig_k, grad(u_test))
-        r_el_n = inner(sig_n, grad(u_test))
-        dsig_k = dsigma_neo_hookean(u_k, du, c_nh, beta_nh, dim=int(dim))
-        a_el = inner(dsig_k, grad(u_test))
+            sig_k = sigma_neo_hookean(u_k, c_nh, beta_nh, dim=int(dim))
+            sig_n = sigma_neo_hookean(u_n, c_nh, beta_nh, dim=int(dim))
+            r_el_k = inner(sig_k, grad(u_test))
+            r_el_n = inner(sig_n, grad(u_test))
+            dsig_k = dsigma_neo_hookean(u_k, du, c_nh, beta_nh, dim=int(dim))
+            a_el = inner(dsig_k, grad(u_test))
 
-    r_skel_k = r_el_k
-    r_skel_n = r_el_n
+        r_el_plus_k = r_el_k
+        r_el_minus_k = _c(0.0)
+        r_el_plus_n = r_el_n
+        r_el_minus_n = _c(0.0)
+        a_el_plus = a_el
+        a_el_minus = _c(0.0)
 
     # Pressure coupling from the B vS part of the constraint:
     #   -(p, div(B η)) = -p (B div(η) + grad(B)·η)
@@ -726,8 +805,8 @@ def build_biofilm_one_domain_forms(
         r_skel_drag_n = -beta_coeff_n * dot(kdrag_n, u_test)
 
     r_skeleton = (
-        th * alpha_k * g_stiff_k * r_skel_k
-        + one_m_th * alpha_n * g_stiff_n * r_skel_n
+        th * alpha_k * (g_stiff_k * r_el_plus_k + r_el_minus_k)
+        + one_m_th * alpha_n * (g_stiff_n * r_el_plus_n + r_el_minus_n)
         + th * r_skel_press_k
         + one_m_th * r_skel_press_n
         + th * r_skel_drag_k
@@ -774,18 +853,21 @@ def build_biofilm_one_domain_forms(
         drag_term_k = -beta_coeff_k * dot(kdrag_k, u_test)
         d_drag_term_k = -(dbeta_coeff * dot(kdrag_k, u_test) + beta_coeff_k * dot(dkdrag_k, u_test))
 
-    # Jacobian of α g(d) elastic part.
-    # Important: when damage is disabled, dg_stiff_k is not a trial expression, so
-    # avoid forming dalpha + 0*alpha_k (trial + function) which the compiler
-    # cannot simplify reliably.
+    # Jacobian of the elastic part (k-part only).
+    #
+    # For the default full-stress model, this reduces to:
+    #   δ[α g(d) r_el(u)] = α g a_el + δ(α g) r_el.
+    #
+    # For Miehe split (linear elasticity), g(d) multiplies only the tensile part:
+    #   δ[α (g r⁺ + r⁻)] = α (δg r⁺ + g δr⁺ + δr⁻) + δα (g r⁺ + r⁻).
+    elastic_jac_k = g_stiff_k * a_el_plus + a_el_minus
     if use_damage:
-        w_ag = dalpha * g_stiff_k + alpha_k * dg_stiff_k
-    else:
-        w_ag = dalpha * g_stiff_k
-    a_skel = th * (
-        alpha_k * g_stiff_k * a_el
-        + w_ag * r_el_k
-    ) * dx
+        # Only include δg(d)·r⁺ when the damage field is part of the unknown vector.
+        # Otherwise this term would appear as a test-only contribution in the Jacobian
+        # (0·test) and break matrix assembly in the python backend.
+        elastic_jac_k += dg_stiff_k * r_el_plus_k
+
+    a_skel = th * (alpha_k * elastic_jac_k + dalpha * (g_stiff_k * r_el_plus_k + r_el_minus_k)) * dx
     # Jacobian of the pressure coupling -p div(B η).
     # Expand dgrad·eta component-wise to avoid backend-dependent contraction
     # paths for Grad(trial-scalar) · VectorTest.
@@ -1296,7 +1378,7 @@ def build_biofilm_one_domain_forms(
         elif damage_model_key in {"phase_field", "phase-field", "at2", "energy"}:
             # Energy-derived phase-field damage (AT2-like, lagged drive):
             #   α η_d D_t^S d - div(α G_c l ∇d) + α (G_c/l) d = 2 α (1-d) H_prev,
-            # with H_prev built from lagged von Mises stress.
+            # with a *lagged* driving field H_prev (updated between steps for robustness).
             Gc_val = float(damage_Gc)
             ell_val = float(damage_l)
             if Gc_val <= 0.0 or ell_val <= 0.0:
@@ -1307,10 +1389,34 @@ def build_biofilm_one_domain_forms(
             Gc_over_l = Gc_c / ell_c
             Gc_l = Gc_c * ell_c
 
-            psi0_val = float(damage_psi0)
-            if psi0_val <= 0.0:
-                psi0_val = Gc_val / max(ell_val, 1.0e-12)
-            H_prev = _c(psi0_val) * drive_vm
+            damage_pf_driver_key = str(damage_pf_driver).strip().lower()
+            if damage_pf_driver_key in {"von_mises", "vm", "von-mises"}:
+                # Legacy: scale a von-Mises-based proxy into an energy density.
+                psi0_val = float(damage_psi0)
+                if psi0_val <= 0.0:
+                    psi0_val = Gc_val / max(ell_val, 1.0e-12)
+                H_prev = _c(psi0_val) * drive_vm
+            elif damage_pf_driver_key in {"miehe", "miehe_energy", "energy", "psi_plus", "psi+"}:
+                # Miehe-type tensile energy density ψ⁺(u) for linear elasticity:
+                #   ψ⁺ = μ ||ε⁺||² + (λ/2) ⟨tr ε⟩₊².
+                if solid_model_key not in {"linear", "small_strain", "linear_elastic"}:
+                    raise ValueError(
+                        "damage_pf_driver='miehe_energy' currently requires solid_model='linear'. "
+                        "Use damage_pf_driver='von_mises' for neo-Hookean."
+                    )
+                eta_pos = float(damage_eta_pos)
+                disc_reg = 1.0e-16
+                eps_un = _epsilon(u_n)
+                eps_plus_un, _, _, _, _ = spectral_positive_part_2x2_sym(eps_un, eta_pos=eta_pos, disc_reg=disc_reg)
+                tr_eps = div(u_n)
+                tr_pos = _smooth_pos_u(tr_eps, eta=eta_pos)
+                psi_plus = mu_s * inner(eps_plus_un, eps_plus_un) + _c(0.5) * lambda_s * (tr_pos * tr_pos)
+                scale = float(damage_psi0)
+                if scale > 0.0:
+                    psi_plus = _c(scale) * psi_plus
+                H_prev = psi_plus
+            else:
+                raise ValueError(f"Unknown damage_pf_driver {damage_pf_driver!r}.")
 
             DtS_d_k = (d_k - d_n) * inv_dt
             DtS_d_k += th * dot(grad(d_k), vS_k) + one_m_th * dot(grad(d_n), vS_n)

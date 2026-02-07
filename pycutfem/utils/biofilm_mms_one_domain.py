@@ -218,10 +218,10 @@ def build_biofilm_one_domain_mms_affine(
         # Conservative convection correction: v * div(rho v) with rho=rho_f*C.
         divCv = Cx * vk[..., 0] + Cy * vk[..., 1]  # div(v)=0 for this affine shear
         div_rhov = float(rho_f) * divCv
-        # Pressure gradient: ∇(C p) = C ∇p + p ∇C
-        pk = p_k(x, y)
-        grad_Cp = Ck[..., None] * grad_p + pk[..., None] * np.stack((Cx, Cy), axis=-1)
-        return momdot + rho[..., None] * conv + vk * div_rhov[..., None] + visc + grad_Cp + drag
+        # Pressure gradient consistent with the implemented weak form:
+        #   R_v^{(p)} = -(p, div(C w))  -> strong term is  C ∇p  (not ∇(C p)).
+        pressure = Ck[..., None] * grad_p
+        return momdot + rho[..., None] * conv + vk * div_rhov[..., None] + visc + pressure + drag
 
     def s_v(x, y):
         x = np.asarray(x, dtype=float)
@@ -250,13 +250,11 @@ def build_biofilm_one_domain_mms_affine(
 
         beta = ak * float(mu_f) * (phik * phik) * float(kappa_inv)
         # Strong form corresponding to the implemented weak form:
-        #   -div(α σ(u)) + ∇(α (1-φ) p) - β(v-vS) = α f_u
+        #   -div(α σ(u)) + α(1-φ) ∇p - β(v-vS) = α f_u
         # so
-        #   f_u = -(σ(u) ∇α)/α + ∇((1-φ)p) + ((1-φ)p) ∇α/α - (β/α)(v-vS),
+        #   f_u = -(σ(u) ∇α)/α + (1-φ)∇p - (β/α)(v-vS),
         # using div(σ(u))=0 for the affine displacement used here.
-        grad_p_term = (1.0 - phik)[..., None] * grad_p - pk[..., None] * grad_phi  # ∇((1-φ)p)
-        g = (1.0 - phik) * pk
-        extra_p = (g / ak)[..., None] * grad_alpha
+        pressure = (1.0 - phik)[..., None] * grad_p
 
         # σ(u_k) is constant for affine u_k = dt*vS_amp*[y,x].
         s_off = 2.0 * float(mu_s) * dt * float(vS_amp)
@@ -265,7 +263,7 @@ def build_biofilm_one_domain_mms_affine(
         extra_el = (1.0 / ak)[..., None] * sigma_grad_alpha
 
         drag = (beta / ak)[..., None] * (vk - vS)
-        return grad_p_term + extra_p - extra_el - drag
+        return pressure - extra_el - drag
 
     def f_phi(x, y):
         x = np.asarray(x, dtype=float)

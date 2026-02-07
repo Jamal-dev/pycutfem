@@ -70,6 +70,16 @@ class NegOp:
     """Instruction to apply the negative-side restriction: v if phi<0 else 0."""
     pass
 
+@dataclass(frozen=True, slots=True)
+class PositivePartOp:
+    """Instruction to apply the hard positive part: max(x, 0)."""
+    pass
+
+@dataclass(frozen=True, slots=True)
+class HeavisideOp:
+    """Instruction to apply a hard Heaviside step: 1 if x>0 else 0 (H(0)=0)."""
+    pass
+
 @dataclass(frozen=True, slots =True)
 class BinaryOp:
     """Instruction to perform a binary operation (e.g., +, *)."""

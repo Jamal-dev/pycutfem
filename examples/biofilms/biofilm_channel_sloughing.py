@@ -255,8 +255,18 @@ def main() -> None:
         help="Penalty coefficient enforcing d->0 in free fluid (stabilizes d DOFs where alpha≈0). Units [1/s].",
     )
     ap.add_argument("--damage-eta-pos", type=float, default=1.0e-12, help="Positive-part smoothing eta for bulk damage activation.")
-    ap.add_argument("--damage-kappa-stiff", type=float, default=1.0e-8, help="Stiffness degradation floor κ in g(d)=(1-d)^2+κ.")
-    ap.add_argument("--damage-kappa-perm", type=float, default=1.0e-8, help="Permeability degradation floor κ in g_perm(d)=(1-d)^2+κ.")
+    ap.add_argument(
+        "--damage-kappa-stiff",
+        type=float,
+        default=1.0e-8,
+        help="Stiffness degradation floor κ in g(d)=(1-κ)(1-d)^2+κ (so g(0)=1 and g(1)=κ).",
+    )
+    ap.add_argument(
+        "--damage-kappa-perm",
+        type=float,
+        default=1.0e-8,
+        help="Permeability degradation floor κ in g_perm(d)=(1-κ)(1-d)^2+κ (so g_perm(0)=1 and g_perm(1)=κ).",
+    )
     ap.add_argument(
         "--damage-model",
         type=str,
@@ -268,6 +278,24 @@ def main() -> None:
     ap.add_argument("--damage-Gc", type=float, default=0.0, help="Fracture toughness G_c [J/m^2] for phase-field damage.")
     ap.add_argument("--damage-l", type=float, default=0.0, help="Damage length scale l [m] for phase-field damage.")
     ap.add_argument("--damage-psi0", type=float, default=0.0, help="Optional stress-drive energy scale for phase-field damage (defaults to G_c/l).")
+    ap.add_argument(
+        "--damage-pf-driver",
+        type=str,
+        default="von_mises",
+        choices=("von_mises", "miehe_energy", "miehe"),
+        help="Driving field H_prev for the phase-field damage (AT2) model. "
+        "'von_mises' uses a lagged von-Mises proxy (legacy). "
+        "'miehe_energy' uses the Miehe tensile elastic energy density ψ⁺(u) (linear elasticity, 2D).",
+    )
+    ap.add_argument(
+        "--damage-stiff-split",
+        type=str,
+        default="full",
+        choices=("full", "miehe"),
+        help="How damage d degrades skeleton stiffness. "
+        "'full' multiplies the full elastic stress by g(d) (legacy). "
+        "'miehe' multiplies only the tensile stress part σ⁺ (Miehe split; linear elasticity, 2D).",
+    )
     # Material / model parameters (kept simple)
     ap.add_argument("--rho-f", type=float, default=1.0)
     ap.add_argument("--mu-f", type=float, default=0.1)
@@ -665,6 +693,10 @@ def main() -> None:
             if not _has_flag("--damage-kappa-stiff"):
                 # Keep a tiny stiffness floor for conditioning without impeding crack opening.
                 args.damage_kappa_stiff = 1.0e-12
+            if not _has_flag("--damage-pf-driver"):
+                args.damage_pf_driver = "miehe_energy"
+            if not _has_flag("--damage-stiff-split"):
+                args.damage_stiff_split = "miehe"
 
             # Paper sloughing is a failure model (no growth/erosion). Keep α/S/X prescribed by default:
             #   - α is transported by the reference map to follow the deforming/moving biofilm.
@@ -1238,6 +1270,8 @@ def main() -> None:
         damage_Gc=float(getattr(args, "damage_Gc", 0.0) or 0.0),
         damage_l=float(getattr(args, "damage_l", 0.0) or 0.0),
         damage_psi0=float(getattr(args, "damage_psi0", 0.0) or 0.0),
+        damage_pf_driver=str(getattr(args, "damage_pf_driver", "von_mises")),
+        damage_stiff_split=str(getattr(args, "damage_stiff_split", "full")),
         D_S=0.01,
         D_X=float(args.D_X),
         rho_s_star=float(args.rho_s_star),
@@ -1463,7 +1497,8 @@ def main() -> None:
             g_perm_nodes = 1.0
             if d_k is not None:
                 d_nodes = _scalar_to_nodes(d_k)
-                g_perm_nodes = (1.0 - d_nodes) ** 2 + float(getattr(args, "damage_kappa_perm", 1.0e-8) or 1.0e-8)
+                kappa_perm = float(getattr(args, "damage_kappa_perm", 1.0e-8) or 1.0e-8)
+                g_perm_nodes = (1.0 - kappa_perm) * ((1.0 - d_nodes) ** 2) + kappa_perm
             beta_nodes = alpha_nodes * float(args.mu_f) * (phi_nodes * phi_nodes) * kappa_inv_eff * g_perm_nodes
             bmin = float(beta_nodes.min())
             bmax = float(beta_nodes.max())
@@ -1630,7 +1665,8 @@ def main() -> None:
                 g_perm_nodes = 1.0
                 if d_k is not None:
                     d_nodes = _scalar_to_nodes(d_k)
-                    g_perm_nodes = (1.0 - d_nodes) ** 2 + float(getattr(args, "damage_kappa_perm", 1.0e-8) or 1.0e-8)
+                    kappa_perm = float(getattr(args, "damage_kappa_perm", 1.0e-8) or 1.0e-8)
+                    g_perm_nodes = (1.0 - kappa_perm) * ((1.0 - d_nodes) ** 2) + kappa_perm
                 beta_nodes = alpha_nodes * float(args.mu_f) * (phi_nodes * phi_nodes) * kappa_inv_eff * g_perm_nodes
                 u_nodes = _vector_to_nodes(u_k)
                 u_prev_nodes = _vector_to_nodes(u_prev)

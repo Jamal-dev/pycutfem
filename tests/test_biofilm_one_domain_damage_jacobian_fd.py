@@ -29,6 +29,8 @@ def _build_problem(
     damage_Gc: float = 0.0,
     damage_l: float = 0.0,
     damage_psi0: float = 0.0,
+    damage_pf_driver: str = "von_mises",
+    damage_stiff_split: str = "full",
 ):
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
     mesh = Mesh(
@@ -160,6 +162,8 @@ def _build_problem(
         damage_Gc=float(damage_Gc),
         damage_l=float(damage_l),
         damage_psi0=float(damage_psi0),
+        damage_pf_driver=str(damage_pf_driver),
+        damage_stiff_split=str(damage_stiff_split),
     )
 
     # Map global dof -> state function owning it (k-level only).
@@ -175,6 +179,12 @@ def _build_problem(
         "S": S_k,
     }
     return dh, forms, field_to_func_k
+
+
+def _set_linear_u(field_to_func_k, *, a: float = 0.1, b: float = -0.05, s: float = 0.02) -> None:
+    # u(x,y) = [a x + s y, s x + b y]  ->  grad(u) = [[a,s],[s,b]] (symmetric, constant).
+    field_to_func_k["u_x"].set_values_from_function(lambda x, y: float(a * x + s * y))
+    field_to_func_k["u_y"].set_values_from_function(lambda x, y: float(s * x + b * y))
 
 
 def test_biofilm_one_domain_damage_backend_parity_python_cpp():
@@ -204,7 +214,7 @@ def test_biofilm_one_domain_damage_jacobian_fd_consistency():
         return np.asarray(R, dtype=float)
 
     probes = []
-    for fld in ("v_x", "v_y", "p", "u_x", "phi", "alpha", "d", "S"):
+    for fld in ("v_x", "v_y", "p", "u_x", "u_y", "phi", "alpha", "d", "S"):
         sl = dh.get_field_slice(fld)
         if sl:
             probes.append(int(sl[len(sl) // 2]))
@@ -288,3 +298,73 @@ def test_biofilm_one_domain_phase_field_damage_jacobian_fd_consistency():
         denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
         rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
         assert rel < 8.0e-5, f"phase-field FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
+
+
+def test_biofilm_one_domain_phase_field_damage_miehe_stiff_split_backend_parity_python_cpp():
+    dh, forms, field_to_func_k = _build_problem(
+        nx=1,
+        ny=1,
+        q=3,
+        damage_model="phase_field",
+        damage_eta=1.0,
+        damage_Gc=1.0e-3,
+        damage_l=0.05,
+        damage_psi0=0.0,
+        damage_pf_driver="miehe_energy",
+        damage_stiff_split="miehe",
+    )
+    _set_linear_u(field_to_func_k)
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+
+    K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    K_cpp, R_cpp = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="cpp")
+
+    A_py = K_py.tocsr().toarray()
+    A_cpp = K_cpp.tocsr().toarray()
+    assert np.allclose(A_py, A_cpp, rtol=1.0e-10, atol=1.0e-12)
+    assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_biofilm_one_domain_phase_field_damage_miehe_stiff_split_jacobian_fd_consistency():
+    dh, forms, field_to_func_k = _build_problem(
+        nx=1,
+        ny=1,
+        q=3,
+        damage_model="phase_field",
+        damage_eta=1.0,
+        damage_Gc=1.0e-3,
+        damage_l=0.05,
+        damage_psi0=0.0,
+        damage_pf_driver="miehe_energy",
+        damage_stiff_split="miehe",
+    )
+    _set_linear_u(field_to_func_k)
+
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    R0 = np.asarray(R0, dtype=float)
+
+    def assemble_residual():
+        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
+        return np.asarray(R, dtype=float)
+
+    probes = []
+    for fld in ("v_x", "v_y", "p", "u_x", "phi", "alpha", "d", "S"):
+        sl = dh.get_field_slice(fld)
+        if sl:
+            probes.append(int(sl[len(sl) // 2]))
+
+    eps = 1.0e-4
+    for j in probes:
+        fld, _ = dh._dof_to_node_map[j]
+        func = field_to_func_k[fld]
+        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
+        R1 = assemble_residual()
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
+
+        fd = (R1 - R0) / eps
+        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
+        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
+        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
+        assert rel < 1.0e-4, f"miehe-split FD mismatch at dof {j} ({fld}): rel={rel:.2e}"

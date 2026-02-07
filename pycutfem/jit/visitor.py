@@ -6,6 +6,7 @@ from pycutfem.ufl.expressions import (
     VectorTestFunction, VectorTrialFunction, VectorFunction,
     Sum, Sub, Prod, Div as UflDiv, Inner as UflInner, Dot as UflDot, Outer as UflOuter,
     Grad as UflGrad, DivOperation, Derivative, FacetNormal, Jump, Pos, Neg,
+    PositivePart, Heaviside,
     Avg,
     ElementWiseConstant, Transpose as UFLTranspose, CellDiameter as UFLCellDiameter, MeshSize as UFLMeshSize,
     NormalComponent, Restriction, Power as UFLPower, Trace as UFLTrace,
@@ -18,6 +19,7 @@ from pycutfem.jit.ir import (
     LoadAnalytic, LoadFacetNormal, Grad, Div, BinaryOp, Inner, Dot, Store, Transpose,
     Outer as IROuter,
     CellDiameter, MeshSize, LoadFacetNormalComponent, CheckDomain, Trace, Determinant, Inverse, Cofactor,
+    PositivePartOp, HeavisideOp,
     Hessian as IRHessian, Laplacian as IRLaplacian, HdivDiv
 )
 from dataclasses import replace
@@ -162,6 +164,16 @@ class IRGenerator:
         if isinstance(node, UFLInverse):
             self._visit(node.A, side=side)
             self.ir_sequence.append(Inverse())
+            return
+
+        if isinstance(node, PositivePart):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(PositivePartOp())
+            return
+
+        if isinstance(node, Heaviside):
+            self._visit(node.operand, side=side)
+            self.ir_sequence.append(HeavisideOp())
             return
         
         if isinstance(node, (Sum, Sub, Prod, UflDiv, UFLPower)):

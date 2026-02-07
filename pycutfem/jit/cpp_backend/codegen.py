@@ -120,6 +120,8 @@ class CppCodeGen:
             Inverse,
             Cofactor,
             Trace,
+            PositivePartOp,
+            HeavisideOp,
         )
         needs_phis = any(isinstance(op, (PosOp, NegOp)) for op in ir_sequence)
         families = getattr(self.mixed_element, "_field_families", {}) if self.mixed_element is not None else {}
@@ -1761,10 +1763,9 @@ class CppCodeGen:
                         # a: basis vector (-1,) and b: value 2x2 matrix -> grad (2,-1,2)
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}(2);")
                         emit_line(f"for (int _i=0; _i<2; ++_i) {{")
-                        emit_line(f"    {nm}[_i] = Eigen::MatrixXd({b.name}.rows(), {a.name}.size());")
-                        emit_line(f"    for (int _c=0; _c<{b.name}.rows(); ++_c) {{")
-                        emit_line(f"        {nm}[_i].row(_c) = {a.name}.transpose() * {b.name}(_c,_i);")
-                        emit_line("    }")
+                        # GradStack convention: each component matrix is (n_union x dim).
+                        # Scale each row of the 2x2 tensor by the scalar basis vector.
+                        emit_line(f"    {nm}[_i] = {a.name} * {b.name}.row(_i);")
                         emit_line("}")
                         push_bin("grad", a.role, (2, -1, 2))
                         continue
@@ -1785,10 +1786,8 @@ class CppCodeGen:
                         # b: basis vector (-1,) and a: value 2x2 matrix -> grad (2,-1,2)
                         emit_line(f"std::vector<Eigen::MatrixXd> {nm}(2);")
                         emit_line(f"for (int _i=0; _i<2; ++_i) {{")
-                        emit_line(f"    {nm}[_i] = Eigen::MatrixXd({a.name}.rows(), {b.name}.size());")
-                        emit_line(f"    for (int _c=0; _c<{a.name}.rows(); ++_c) {{")
-                        emit_line(f"        {nm}[_i].row(_c) = {b.name}.transpose() * {a.name}(_c,_i);")
-                        emit_line("    }")
+                        # GradStack convention: each component matrix is (n_union x dim).
+                        emit_line(f"    {nm}[_i] = {b.name} * {a.name}.row(_i);")
                         emit_line("}")
                         push_bin("grad", b.role, (2, -1, 2))
                         continue
@@ -2799,6 +2798,34 @@ class CppCodeGen:
                     stack.append(StackItem(nm, "mixed", a.role, (1, a.shape[1], a.shape[2]), a.field_names, a.parent))
                 else:
                     raise NotImplementedError("Trace only implemented for matrices")
+            elif isinstance(op, PositivePartOp):
+                a = stack.pop()
+                nm = new_tmp("pos_part")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::max(0.0, {a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.cwiseMax(0.0);")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.cwiseMax(0.0);")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"PositivePartOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, HeavisideOp):
+                a = stack.pop()
+                nm = new_tmp("heaviside")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = ({a.name} > 0.0) ? 1.0 : 0.0;")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = ({a.name}.array() > 0.0).template cast<double>();")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = ({a.name}.array() > 0.0).template cast<double>();")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"HeavisideOp not implemented for kind={a.kind!r}.")
             elif isinstance(op, Store):
                 a = stack.pop()
                 if op.store_type == "matrix":

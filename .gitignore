@@ -230,3 +230,7 @@ examples/FPI/_two_mesh*/
 examples/biofilms/model/model.tex
 examples/biofilms/results/
 examples/biofilms/dian_paper/latex/**/*
+
+# Local debug / parity outputs
+out/
+examples/debug/out/

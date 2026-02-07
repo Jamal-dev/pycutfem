@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, HdivDiv, PosOp, NegOp,
+    PositivePartOp, HeavisideOp,
     BinaryOp, Inner, Dot, Outer, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
     MeshSize,
     Trace, Determinant, Inverse, Cofactor, Hessian as IRHessian, Laplacian as IRLaplacian
@@ -1958,6 +1959,23 @@ class NumbaCodeGen:
                     f"{res_var} = {a.var_name} if (is_interface or (phi_q <  0.0)) "
                     f"else np.zeros_like({a.var_name}, dtype={self.dtype})"
                 )
+                stack.append(a._replace(var_name=res_var))
+
+            elif isinstance(op, PositivePartOp):
+                a = stack.pop()
+                res_var = new_var("pos_part")
+                body_lines.append(f"# PositivePart: max(x,0)")
+                body_lines.append(f"{res_var} = np.maximum({a.var_name}, 0.0)")
+                stack.append(a._replace(var_name=res_var))
+
+            elif isinstance(op, HeavisideOp):
+                a = stack.pop()
+                res_var = new_var("heaviside")
+                body_lines.append(f"# Heaviside: 1 if x>0 else 0 (H(0)=0)")
+                if a.shape == ():
+                    body_lines.append(f"{res_var} = 1.0 if ({a.var_name} > 0.0) else 0.0")
+                else:
+                    body_lines.append(f"{res_var} = np.where({a.var_name} > 0.0, 1.0, 0.0)")
                 stack.append(a._replace(var_name=res_var))
 
             # --- Inner OPERATORS ---
