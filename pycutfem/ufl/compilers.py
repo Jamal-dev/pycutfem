@@ -55,7 +55,7 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
-from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, lhs_num,
+from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, _collapsed_function, lhs_num,
                                   required_multi_indices,
                                   _all_fields,_find_all,
                                   _trial_test, 
@@ -2449,6 +2449,14 @@ class FormCompiler:
                 return a.inner(b)
             if a.role == "trial" and b.role == "test":
                 return b.inner(a)
+            # Allow coefficient-only vector inner products on the LHS, e.g.
+            # `sqrt(inner(v_prev, v_prev) + eps)` used in stabilization weights.
+            # These do not contribute to the bilinear structure directly, but they are
+            # valid scalar coefficients. Collapse (k,n)->(k,) and compute a scalar dot.
+            if a.role == "function" and b.role == "function":
+                a_vec = _collapsed_function(a)
+                b_vec = _collapsed_function(b)
+                return float(np.einsum("k,k->", a_vec, b_vec, optimize=True))
             raise ValueError(f"Vec LHS expects test vs trial; got {a.role} vs {b.role}.")
 
         # ---- Numerical fallbacks ----

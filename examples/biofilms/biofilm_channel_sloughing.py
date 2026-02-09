@@ -32,6 +32,7 @@ from pycutfem.utils.biofilm_adhesion import (
 )
 from pycutfem.utils.biofilm_one_domain import build_biofilm_one_domain_forms
 from pycutfem.utils.meshgen import structured_quad
+from pycutfem.utils.volume_correction import logit_shift_to_match_integral
 
 
 def _tag_rectangle_boundaries(mesh: Mesh, *, L: float, H: float, tol: float = 1.0e-12) -> None:
@@ -217,6 +218,13 @@ def main() -> None:
         help="Optional sinusoidal perturbation amplitude for initial wall a(s) in spatial mode (seeds localized sloughing).",
     )
     ap.add_argument("--a-perturb-k", type=int, default=1, help="Number of sine waves across [x1,x2] for --a-perturb.")
+    ap.add_argument(
+        "--a-snap",
+        type=float,
+        default=0.0,
+        help="If >0, snap adhesion to full failure by setting a(s)=0 wherever a(s)<a_snap after each update "
+        "(irreversible). Useful to prevent tiny residual adhesion from holding a nearly-detached chunk.",
+    )
     ap.add_argument("--k-n", type=float, default=50.0, help="Normal spring stiffness [Pa/m].")
     ap.add_argument("--k-t", type=float, default=10.0, help="Tangential spring stiffness [Pa/m].")
     ap.add_argument("--gamma-n", type=float, default=5.0, help="Normal dashpot [Pa*s/m].")
@@ -491,39 +499,117 @@ def main() -> None:
     # Validation / debug options
     ap.add_argument(
         "--freeze-alpha",
+        dest="freeze_alpha",
         action="store_true",
+        default=None,
         help="Treat alpha as prescribed (do not solve/update its DOFs). Useful for deformation-only validation.",
     )
     ap.add_argument(
+        "--no-freeze-alpha",
+        dest="freeze_alpha",
+        action="store_false",
+        default=None,
+        help="Solve/update alpha DOFs (overrides presets that freeze alpha).",
+    )
+    ap.add_argument(
         "--freeze-phi",
+        dest="freeze_phi",
         action="store_true",
+        default=None,
         help="Treat phi as prescribed (do not solve/update its DOFs). Useful for deformation-only validation.",
     )
     ap.add_argument(
+        "--no-freeze-phi",
+        dest="freeze_phi",
+        action="store_false",
+        default=None,
+        help="Solve/update phi DOFs (overrides presets that freeze phi).",
+    )
+    ap.add_argument(
         "--freeze-S",
+        dest="freeze_S",
         action="store_true",
+        default=None,
         help="Treat substrate S as prescribed (do not solve/update its DOFs).",
     )
     ap.add_argument(
+        "--no-freeze-S",
+        dest="freeze_S",
+        action="store_false",
+        default=None,
+        help="Solve/update S DOFs (overrides presets that freeze S).",
+    )
+    ap.add_argument(
         "--freeze-X",
+        dest="freeze_X",
         action="store_true",
+        default=None,
         help="Treat detached biomass X as prescribed (do not solve/update its DOFs).",
     )
     ap.add_argument(
+        "--no-freeze-X",
+        dest="freeze_X",
+        action="store_false",
+        default=None,
+        help="Solve/update X DOFs (overrides presets that freeze X).",
+    )
+    ap.add_argument(
         "--freeze-damage",
+        dest="freeze_damage",
         action="store_true",
+        default=None,
         help="Treat bulk damage d as prescribed (do not solve/update its DOFs).",
     )
     ap.add_argument(
+        "--no-freeze-damage",
+        dest="freeze_damage",
+        action="store_false",
+        default=None,
+        help="Solve/update bulk damage d DOFs (overrides presets that freeze damage).",
+    )
+    ap.add_argument(
         "--alpha-from-refmap",
+        dest="alpha_from_refmap",
         action="store_true",
+        default=None,
         help="Recompute alpha after each accepted step from the Eulerian reference-map field u: "
         "alpha(x,t) := alpha0(x - u(x,t)). This keeps alpha sharp and avoids non-conservative Allen–Cahn drift.",
     )
     ap.add_argument(
+        "--no-alpha-from-refmap",
+        dest="alpha_from_refmap",
+        action="store_false",
+        default=None,
+        help="Disable alpha-from-refmap update (solve alpha if it is not frozen).",
+    )
+    ap.add_argument(
         "--alpha-refmap-clamp",
+        dest="alpha_refmap_clamp",
         action="store_true",
+        default=None,
         help="Clamp alpha-from-refmap values into [0,1] (recommended).",
+    )
+    ap.add_argument(
+        "--no-alpha-refmap-clamp",
+        dest="alpha_refmap_clamp",
+        action="store_false",
+        default=None,
+        help="Disable clamping of alpha-from-refmap values into [0,1].",
+    )
+    ap.add_argument(
+        "--conserve-alpha",
+        dest="conserve_alpha",
+        action="store_true",
+        default=None,
+        help="After each accepted step, apply a logit-shift volume correction so that int_Omega alpha dx matches its t=0 value. "
+        "Use only when alpha should be conserved (e.g. k_det=0, no Allen–Cahn/crack alpha dynamics).",
+    )
+    ap.add_argument(
+        "--no-conserve-alpha",
+        dest="conserve_alpha",
+        action="store_false",
+        default=None,
+        help="Disable alpha volume correction (overrides presets).",
     )
     ap.add_argument(
         "--deformation-only",
@@ -701,16 +787,18 @@ def main() -> None:
             # Paper sloughing is a failure model (no growth/erosion). Keep α/S/X prescribed by default:
             #   - α is transported by the reference map to follow the deforming/moving biofilm.
             #   - S and X are held at zero.
-            if not _has_flag("--freeze-alpha"):
+            if getattr(args, "freeze_alpha", None) is None:
                 args.freeze_alpha = True
-            if not _has_flag("--alpha-from-refmap"):
+            if getattr(args, "alpha_from_refmap", None) is None:
                 args.alpha_from_refmap = True
-            if not _has_flag("--alpha-refmap-clamp"):
+            if getattr(args, "alpha_refmap_clamp", None) is None:
                 args.alpha_refmap_clamp = True
-            if not _has_flag("--freeze-S"):
+            if getattr(args, "freeze_S", None) is None:
                 args.freeze_S = True
-            if not _has_flag("--freeze-X"):
-                args.freeze_X = True
+            # Only freeze X when erosion is not active; allow `--process both` to solve X.
+            if getattr(args, "freeze_X", None) is None:
+                proc_key = str(getattr(args, "process", "both")).strip().lower()
+                args.freeze_X = proc_key not in {"erosion", "both"}
 
             # Keep adhesion traction; use σ_cr-driven *binary* failure by default.
             # (Set --k-break>0 to use the smoother rate law in `update_adhesion_integrity_field_on_boundary_von_mises`.)
@@ -756,7 +844,11 @@ def main() -> None:
             if not _has_flag("--gamma-u"):
                 args.gamma_u = 2.0
             if not _has_flag("--gamma-u-pin"):
-                args.gamma_u_pin = 1.0e-8
+                # NOTE: the pin enters as (gamma_u_pin / h^2) in the form. On micro-scale meshes
+                # even 1e-8 can become O(1). Keep this truly tiny and rely on u-CIP for conditioning.
+                args.gamma_u_pin = 1.0e-12
+            if not _has_flag("--u-cip"):
+                args.u_cip = 1.0
 
             # Default to the paper’s detachment-pattern time (6.4 ms) and output at 0.8/1.6/3.2/6.4 ms.
             if not _has_flag("--dt"):
@@ -774,21 +866,31 @@ def main() -> None:
             if not _has_flag("--slough-contact-rel-thresh"):
                 args.slough_contact_rel_thresh = 0.98
 
-        if case == "dian_paper_sloughing_gap":
-            # Gap/peeling variant: seed a small notch (initial fluid gap) at the wall.
-            # Keep α transported by the Eulerian reference map (α(x,t)=α0(x-u)) for robustness
-            # and to avoid non-conservative Allen–Cahn drift. The crack then opens mechanically
-            # as wall adhesion fails, allowing lift-off to be detected.
-            if not _has_flag("--crack-depth"):
-                args.crack_depth = 100.0e-6
-            if not _has_flag("--crack-width"):
-                args.crack_width = 1200.0e-6
-            if not _has_flag("--k-break"):
-                # For the gap case, use smooth stress-driven degradation by default.
-                # This avoids binary "stick/slip" behavior and improves peel-off robustness.
-                args.k_break = 20.0
-            if not _has_flag("--outdir"):
-                args.outdir = "examples/biofilms/results/dian_paper_sloughing_gap"
+            if case == "dian_paper_sloughing_gap":
+                # Gap/peeling variant: seed a small notch (initial fluid gap) at the wall.
+                # Keep α transported by the Eulerian reference map (α(x,t)=α0(x-u)) for robustness
+                # and to avoid non-conservative Allen–Cahn drift. The crack then opens mechanically
+                # as wall adhesion fails, allowing lift-off to be detected.
+                if not _has_flag("--crack-depth"):
+                    # Keep the seeded gap *small* and mesh-resolvable. The default in earlier
+                    # experiments (100 µm) can fully detach the high-α region on coarse meshes.
+                    args.crack_depth = 80.0e-6
+                if not _has_flag("--crack-width"):
+                    # Narrow notch so the biofilm remains attached outside the gap region.
+                    args.crack_width = 400.0e-6
+                if not _has_flag("--k-break"):
+                    # For the gap case, use smooth stress-driven degradation by default.
+                    # This avoids binary "stick/slip" behavior and improves peel-off robustness.
+                    args.k_break = 20.0
+                if not _has_flag("--a-snap"):
+                    # Prevent tiny residual adhesion values from holding the chunk once it is effectively detached.
+                    args.a_snap = 0.05
+                if getattr(args, "conserve_alpha", None) is None:
+                    # In the gap preset we disable detachment (k_det=0) and transport alpha via refmap.
+                    # Enforce a global volume constraint to avoid long-run alpha depletion from mesh-level drift.
+                    args.conserve_alpha = True
+                if not _has_flag("--outdir"):
+                    args.outdir = "examples/biofilms/results/dian_paper_sloughing_gap"
 
     L = float(args.L)
     H = float(args.H)
@@ -1341,6 +1443,31 @@ def main() -> None:
             raise RuntimeError("alpha-from-refmap requires CG alpha DOFs to be node-attached.")
         alpha_node_ids.append(int(nid))
     alpha_node_ids = np.asarray(alpha_node_ids, dtype=int)
+
+    alpha_conserve_enabled = bool(getattr(args, "conserve_alpha", False))
+    alpha_weights = None
+    alpha_mass_target = None
+    if alpha_conserve_enabled:
+        try:
+            elem_corners = np.asarray(getattr(mesh, "corner_connectivity", None), dtype=int)
+            if elem_corners.ndim != 2 or elem_corners.shape[1] != 4:
+                raise ValueError(f"expected quad corner-node connectivity, got {getattr(elem_corners, 'shape', None)}")
+            node_w = np.zeros(num_nodes, dtype=float)
+            for corners in elem_corners:
+                pts = node_xy[np.asarray(corners, dtype=int), :]
+                x = pts[:, 0]
+                y = pts[:, 1]
+                # Polygon area formula for a (planar) quad.
+                area = 0.5 * float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+                node_w[np.asarray(corners, dtype=int)] += area / 4.0
+            alpha_weights = node_w[alpha_node_ids]
+            alpha_mass_target = float(np.dot(alpha_weights, np.asarray(alpha_n.nodal_values, dtype=float)))
+            print(f"[info] --conserve-alpha enabled: target int_alpha={alpha_mass_target:.3e}")
+        except Exception as exc:
+            print(f"[warn] --conserve-alpha requested but weight build failed ({exc}); disabling alpha conservation.")
+            alpha_conserve_enabled = False
+            alpha_weights = None
+            alpha_mass_target = None
     # Reuse the initial geometry definition for refmap transport and diagnostics.
     _alpha0_eval = alpha0_eval
 
@@ -1356,6 +1483,23 @@ def main() -> None:
         if bool(getattr(args, "alpha_refmap_clamp", False)):
             a_dofs = np.clip(a_dofs, 0.0, 1.0)
         alpha_k.nodal_values[:] = np.asarray(a_dofs, dtype=float)
+
+    def _apply_alpha_volume_constraint():
+        if not alpha_conserve_enabled or alpha_weights is None or alpha_mass_target is None:
+            return
+        # Only meaningful when alpha has no intended sinks/sources.
+        if bool(use_erosion) and float(getattr(args, "k_det", 0.0) or 0.0) != 0.0:
+            return
+        if float(getattr(args, "k_crack", 0.0) or 0.0) != 0.0:
+            return
+        if float(getattr(args, "alpha_cahn_M", 0.0) or 0.0) != 0.0 or float(getattr(args, "alpha_cahn_gamma", 0.0) or 0.0) != 0.0:
+            return
+        res = logit_shift_to_match_integral(
+            np.asarray(alpha_k.nodal_values, dtype=float),
+            weights=np.asarray(alpha_weights, dtype=float),
+            target_mass=float(alpha_mass_target),
+        )
+        alpha_k.nodal_values[:] = np.asarray(res.values, dtype=float)
 
     def _scalar_to_nodes(f: Function) -> np.ndarray:
         out = np.zeros(num_nodes, dtype=float)
@@ -1425,6 +1569,7 @@ def main() -> None:
                         k_break=float(args.k_break),
                         sigma_cr=sigma_cr,
                         m=float(args.m_break),
+                        a_snap=float(getattr(args, "a_snap", 0.0) or 0.0),
                         backend=backend,
                         quad_order=qdeg,
                     )
@@ -1442,6 +1587,7 @@ def main() -> None:
                         k_break=float(args.k_break),
                         tau_c=float(args.tau_c),
                         m=float(args.m_break),
+                        a_snap=float(getattr(args, "a_snap", 0.0) or 0.0),
                         backend=backend,
                         quad_order=qdeg,
                     )
@@ -1471,6 +1617,20 @@ def main() -> None:
                     print(f"           X[max]={X_max:.3e}")
             except Exception:
                 pass
+        # Mass/volume diagnostics (independent of erosion/X)
+        try:
+            mass_every = int(getattr(args, "mass_every", 0) or 0)
+            if mass_every > 0 and (step_no % mass_every == 0):
+                int_alpha = assemble_scalar(dh, alpha_k * dx_q, backend=backend, quad_order=qdeg)
+                int_B = assemble_scalar(
+                    dh,
+                    alpha_k * (Constant(1.0) - phi_k) * dx_q,
+                    backend=backend,
+                    quad_order=qdeg,
+                )
+                print(f"           int_alpha={int_alpha:.3e}  int_B={int_B:.3e}")
+        except Exception:
+            pass
         try:
             a_min = float(np.min(alpha_k.nodal_values))
             a_max = float(np.max(alpha_k.nodal_values))
@@ -1760,6 +1920,7 @@ def main() -> None:
         # Do this BEFORE promotion so alpha_n becomes the refmap-updated state.
         if bool(getattr(args, "alpha_from_refmap", False)):
             _update_alpha_from_refmap()
+        _apply_alpha_volume_constraint()
 
         if not bool(args.no_clip):
             # Keep alpha/phi bounded so blended coefficients (rho, mu, beta, delta_eps(alpha)) stay physical.

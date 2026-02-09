@@ -138,6 +138,50 @@ def test_von_mises_wall_update_rate_law_degrades_a_but_keeps_it_positive():
     assert float(a_vals.max()) < 1.0
 
 
+def test_von_mises_wall_update_a_snap_sets_tiny_a_to_zero():
+    dh, ds_bottom, u, alpha, a_field = _build_wall_failure_problem(nx=2, ny=2)
+
+    # Zero stress (sigma=0), but active wall DOFs exist (alpha=1 on the wall).
+    u.set_values_from_function(lambda x, y: np.array([0.0, 0.0], dtype=float))
+    alpha.set_values_from_function(lambda x, y: 1.0)
+    a_field.set_values_from_function(lambda x, y: 0.04)
+
+    sigma, w = solid_von_mises_mass_lumped_on_boundary_linear(
+        dof_handler=dh,
+        field="a",
+        u=u,
+        alpha=alpha,
+        ds_wall=ds_bottom,
+        mu_s=1.0,
+        lambda_s=1.0,
+        backend="python",
+        quad_order=3,
+    )
+    assert float(sigma.max()) == 0.0
+    active = w > 1.0e-14
+    assert int(np.count_nonzero(active)) > 0
+
+    update_adhesion_integrity_field_on_boundary_von_mises(
+        dof_handler=dh,
+        a_field=a_field,
+        dt=0.1,
+        u=u,
+        alpha=alpha,
+        ds_wall=ds_bottom,
+        mu_s=1.0,
+        lambda_s=1.0,
+        k_break=0.0,  # binary mode (no stress-based failure here)
+        sigma_cr=1.0e9,
+        m=1.0,
+        a_snap=0.05,
+        backend="python",
+        quad_order=3,
+    )
+
+    a_vals = np.asarray(a_field.nodal_values, float)[active]
+    assert np.allclose(a_vals, 0.0)
+
+
 def test_von_mises_domain_mass_lumped_projection_returns_constant_stress_for_linear_u():
     dh, _ds_bottom, u, alpha, _a_field = _build_wall_failure_problem(nx=2, ny=2)
 

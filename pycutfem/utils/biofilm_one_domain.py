@@ -1421,7 +1421,9 @@ def build_biofilm_one_domain_forms(
             DtS_d_k = (d_k - d_n) * inv_dt
             DtS_d_k += th * dot(grad(d_k), vS_k) + one_m_th * dot(grad(d_n), vS_n)
 
-            f_pf_k = eta_d_c * DtS_d_k + Gc_over_l * d_k - _c(2.0) * one_m_d_k * H_prev
+            # Consistent with g(d) = (1-κ)(1-d)^2 + κ:
+            #   ∂/∂d [ g(d) ψ⁺ ] = -2 (1-κ) (1-d) ψ⁺.
+            f_pf_k = eta_d_c * DtS_d_k + Gc_over_l * d_k - _c(2.0) * one_m_kappa_stiff * one_m_d_k * H_prev
 
             r_damage = alpha_k * d_test * f_pf_k * dx
             r_damage += alpha_k * Gc_l * inner(grad(d_k), grad(d_test)) * dx
@@ -1429,7 +1431,7 @@ def build_biofilm_one_domain_forms(
                 r_damage += gamma_out_c * w_phi_fluid_k * d_k * d_test * dx
 
             d_DtS_d_k = dd * inv_dt + th * (dot(grad(dd), vS_k) + dot(grad(d_k), du) * inv_dt)
-            df_pf_k = eta_d_c * d_DtS_d_k + Gc_over_l * dd + _c(2.0) * H_prev * dd
+            df_pf_k = eta_d_c * d_DtS_d_k + Gc_over_l * dd + _c(2.0) * one_m_kappa_stiff * H_prev * dd
 
             a_damage = (dalpha * f_pf_k + alpha_k * df_pf_k) * d_test * dx
             a_damage += (dalpha * Gc_l * inner(grad(d_k), grad(d_test)) + alpha_k * Gc_l * inner(grad(dd), grad(d_test))) * dx

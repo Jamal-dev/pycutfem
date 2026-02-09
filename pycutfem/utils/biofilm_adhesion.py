@@ -291,6 +291,7 @@ def update_adhesion_integrity_field_on_boundary_von_mises(
     k_break: float = 0.0,
     sigma_cr: float,
     m: float = 1.0,
+    a_snap: float = 0.0,
     backend: str = "cpp",
     quad_order: int | None = None,
     area_eps: float = 1.0e-14,
@@ -335,6 +336,7 @@ def update_adhesion_integrity_field_on_boundary_von_mises(
     dt = float(dt)
     k_break = float(k_break)
     m = float(m)
+    a_snap = float(a_snap)
 
     if k_break <= 0.0 or dt <= 0.0:
         # Binary failure.
@@ -349,6 +351,10 @@ def update_adhesion_integrity_field_on_boundary_von_mises(
             a_new = a_vals.copy()
             a_new[active] = np.clip(a_vals[active] * np.exp(-dt * rate[active]), 0.0, 1.0)
             a_vals = a_new
+    if a_snap > 0.0 and np.any(active):
+        snapped = active & (a_vals < a_snap)
+        if np.any(snapped):
+            a_vals[snapped] = 0.0
     a_vals[:] = np.clip(a_vals, 0.0, 1.0)
     a_field.nodal_values[:] = a_vals
 
@@ -375,6 +381,7 @@ def update_adhesion_integrity_field_on_boundary(
     k_break: float,
     tau_c: float,
     m: float = 1.0,
+    a_snap: float = 0.0,
     mu_b_model: str = "phi_mu",
     backend: str = "cpp",
     quad_order: int | None = None,
@@ -415,6 +422,7 @@ def update_adhesion_integrity_field_on_boundary(
         raise ValueError("tau_c must be positive.")
 
     m = float(m)
+    a_snap = float(a_snap)
     tau, w = wall_shear_mass_lumped_on_boundary(
         dof_handler=dof_handler,
         field=str(getattr(a_field, "field_name", "a")),
@@ -442,6 +450,10 @@ def update_adhesion_integrity_field_on_boundary(
         rate = k_break * (np.maximum(0.0, tau[active]) / tau_c) ** m
         a_new = a_vals.copy()
         a_new[active] = np.clip(a_vals[active] * np.exp(-dt * rate), 0.0, 1.0)
+        if a_snap > 0.0:
+            snap_mask = a_new[active] < a_snap
+            if np.any(snap_mask):
+                a_new[active] = np.where(snap_mask, 0.0, a_new[active])
         a_field.nodal_values[:] = a_new
         tau_active = tau[active]
         a_active = a_new[active]
