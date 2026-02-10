@@ -841,7 +841,7 @@ class TrialFunction(Function):
                  component_index: int = None, name: str = None, side: str = ""):
         # A TrialFunction is purely symbolic. It has no dof_handler or data.
         # Its name and field_name are the same.
-        from pycutfem.ufl.functionspace import FunctionSpace
+        from pycutfem.ufl.spaces import FunctionSpace
         if isinstance(field_name, FunctionSpace):
             # If field_name is a FunctionSpace, use its name and field_names
             name = field_name.name if name is None else name
@@ -872,7 +872,7 @@ class TestFunction(Function):
                  component_index: int = None, name: str = None,
                  side: str = ""):
         # A TestFunction is purely symbolic.
-        from pycutfem.ufl.functionspace import FunctionSpace
+        from pycutfem.ufl.spaces import FunctionSpace
         if isinstance(field_name, FunctionSpace):
             # If field_name is a FunctionSpace, use its name and field_names
             name = field_name.name if name is None else name

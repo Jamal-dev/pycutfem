@@ -1,6 +1,6 @@
 import numpy as np
 
-from pycutfem.utils.volume_correction import logit_shift_to_match_integral
+from examples.utils.shared.volume_correction import logit_shift_to_match_integral
 
 
 def test_logit_shift_matches_target_integral_and_keeps_bounds():

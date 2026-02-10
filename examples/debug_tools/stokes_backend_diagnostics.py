@@ -58,7 +58,7 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.forms import Equation, Form, assemble_form
 from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
 from pycutfem.ufl.measures import dx, dInterface, dGhost
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.utils.meshgen import structured_quad
 
 

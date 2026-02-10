@@ -51,14 +51,14 @@ from pycutfem.ufl.expressions import (
     cof,
     split,  # Added
 )
-# Assuming IncrementFunction exists in pycutfem.ufl.functionspace or similar
+# Assuming IncrementFunction exists in pycutfem.ufl.spaces or similar
 # If not available, usually defined as Function(V)
 try:
     from pycutfem.ufl.expressions import IncrementFunction
 except ImportError:
     from pycutfem.ufl.functions import Function as IncrementFunction
 
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dx, dInterface, dFacetPatch
 
 geom_dim = 2  # Default geometry dimension (2D)

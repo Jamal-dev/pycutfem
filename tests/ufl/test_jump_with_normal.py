@@ -10,7 +10,7 @@ from pycutfem.ufl.expressions import Constant, Dot, FacetNormal, Function, Neg, 
 from pycutfem.ufl.expressions import TestFunction as UFLTestFunction
 from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.ufl.measures import dCutSkeleton
-from pycutfem.utils.fsi_fully_eulerian import make_domain_sets
+from examples.utils.fsi.fully_eulerian import make_domain_sets
 from pycutfem.utils.meshgen import structured_quad
 
 

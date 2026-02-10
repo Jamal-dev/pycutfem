@@ -6,8 +6,8 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.expressions import CellDiameter, Constant, Function, TestFunction, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction, restrict
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
-from pycutfem.utils.fsi_fully_eulerian import build_fsi_eulerian_forms, build_measures, make_domain_sets, refresh_domain_sets, retag_inactive
+from pycutfem.ufl.spaces import FunctionSpace
+from examples.utils.fsi.fully_eulerian import build_fsi_eulerian_forms, build_measures, make_domain_sets, refresh_domain_sets, retag_inactive
 from pycutfem.utils.meshgen import structured_quad
 
 

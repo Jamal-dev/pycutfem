@@ -6,7 +6,7 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.expressions import Jump, Hessian, inner, restrict, VectorTestFunction, VectorTrialFunction
 from pycutfem.ufl.forms import Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dFacetPatch
 from pycutfem.utils.meshgen import structured_quad
 

@@ -2,7 +2,7 @@
 
 This module is the minimal, *standalone* porous-medium part needed for MMS/FD
 verification (Step 1). It mirrors the "manual Jacobian" style used by
-`pycutfem/utils/fsi_fully_eulerian.py`:
+`examples/utils/fsi/fully_eulerian.py`:
 
   - `residual_poro(...)` returns the residual linear form R(w_k; test)
   - `jacobian_poro(...)` returns the Gateaux derivative J(w_k)[dw, test]
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from pycutfem.ufl.expressions import Constant, div, dot, grad, inner
 
-from pycutfem.utils.nonlinear_solid_eulerian_refmap import (
+from ..shared.nonlinear_solid_refmap import (
     deulerian_F as dporo_F,
     deulerian_k_inv as dporo_k_inv,
     dsigma_neo_hookean as dporo_sigma_neo_hookean,

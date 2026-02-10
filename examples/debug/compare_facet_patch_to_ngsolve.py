@@ -42,7 +42,7 @@ from pycutfem.core.mesh import Mesh as PCMesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.expressions import VectorTestFunction, VectorTrialFunction, grad, inner, jump
 from pycutfem.ufl.forms import Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dFacetPatch
 from pycutfem.utils.meshgen import structured_quad
 

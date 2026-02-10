@@ -67,7 +67,7 @@ from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, _collapsed_
                                   normalize_edge_ids,
                                   normalize_elem_ids)
 from pycutfem.ufl.analytic import Analytic
-from pycutfem.ufl.helpers_jit import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
+from pycutfem.jit.kernel_args import  _build_jit_kernel_args, _scatter_element_contribs, _stack_ragged
 from pycutfem.jit import _active_field_order, _active_columns, _compress_static_for_active
 from pycutfem.ufl.helpers_geom import (
     phi_eval, clip_triangle_to_side, fan_triangulate, map_ref_tri_to_phys, corner_tris

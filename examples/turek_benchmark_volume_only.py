@@ -53,7 +53,7 @@ from pycutfem.ufl.expressions import (
     inner,
 )
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dS, dx
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
 from pycutfem.utils.ogrid_meshgen import circular_hole_ogrid

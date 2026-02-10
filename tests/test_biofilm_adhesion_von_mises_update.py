@@ -5,7 +5,7 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.expressions import Function, VectorFunction
 from pycutfem.ufl.measures import dS, dx
-from pycutfem.utils.biofilm_adhesion import (
+from examples.utils.biofilm.adhesion import (
     solid_von_mises_mass_lumped_in_domain,
     solid_von_mises_mass_lumped_on_boundary_linear,
     update_adhesion_integrity_field_on_boundary_von_mises,

@@ -44,7 +44,7 @@ from pycutfem.ufl.linalg import (
     smooth_pos_derivative as _smooth_pos_u_prime,
 )
 
-from pycutfem.utils.nonlinear_solid_eulerian_refmap import (
+from ..shared.nonlinear_solid_refmap import (
     deulerian_k_inv,
     dsigma_neo_hookean,
     eulerian_k_inv,

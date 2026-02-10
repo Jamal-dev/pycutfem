@@ -53,7 +53,7 @@ from pycutfem.ufl.expressions import (
     trace,
 )
 from pycutfem.ufl.forms import BoundaryCondition, Equation
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dx
 from pycutfem.utils.meshgen import structured_quad
 

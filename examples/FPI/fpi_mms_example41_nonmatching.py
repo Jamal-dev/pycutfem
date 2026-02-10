@@ -58,12 +58,12 @@ from pycutfem.ufl.expressions import (
     jump,
 )
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dCutSkeleton, dx
 from pycutfem.ufl.analytic import Analytic
-from pycutfem.utils.fpi_mms_example41 import build_example41_mms
-from pycutfem.utils.fpi_poro_eulerian import jacobian_poro, residual_poro
-from pycutfem.utils.fsi_fully_eulerian import build_measures, make_domain_sets
+from examples.utils.fpi.mms_example41 import build_example41_mms
+from examples.utils.fpi.poro import jacobian_poro, residual_poro
+from examples.utils.fsi.fully_eulerian import build_measures, make_domain_sets
 from pycutfem.utils.meshgen import structured_quad
 
 

@@ -102,7 +102,7 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.utils.bitset import BitSet
-from pycutfem.utils.fsi_fully_eulerian import (
+from examples.utils.fsi.fully_eulerian import (
     nudge_levelset_zeros as _nudge_levelset_zeros,
     refresh_sliver_weights,
 )
@@ -111,7 +111,7 @@ from pycutfem.utils.ogrid_meshgen import circular_hole_ogrid
 from pycutfem.utils.refinement import TensorRefiner
 from pycutfem.fem.reference import get_reference
 
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     CellDiameter,
     Constant,
@@ -3943,7 +3943,7 @@ def finite_difference_check(
     if use_fast_jit:
         import scipy.sparse as sp
         from pycutfem.jit import compile_multi
-        from pycutfem.ufl.helpers_jit import _scatter_element_contribs
+        from pycutfem.jit.kernel_args import _scatter_element_contribs
 
         ndof = dh.total_dofs
         kernels_K = None

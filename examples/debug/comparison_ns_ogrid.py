@@ -48,7 +48,7 @@ from pycutfem.integration import volume
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem import transform
 from examples.turek_benchmark_volume_only import build_turek_channel_mesh
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction,
     TestFunction,

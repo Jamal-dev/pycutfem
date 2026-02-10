@@ -37,7 +37,7 @@ Gateaux derivative w.r.t. u in direction du:
 
   σ(u) = (2c/J) (B - a I),   B = F F^T,   a = J^{-2β}.
 
-This matches the implementation historically used in `fpi_poro_eulerian.py`.
+This matches the implementation historically used in `examples/utils/fpi/poro.py`.
 """
 
 from __future__ import annotations
@@ -110,4 +110,3 @@ def dsigma_neo_hookean(u, du, c, beta, *, dim: int = 2):
 
     # σ = 2c/J (B - a I)
     return Constant(2.0) * c * (-(dJ / (J * J)) * (B - a * I) + (Constant(1.0) / J) * (dB - da * I))
-

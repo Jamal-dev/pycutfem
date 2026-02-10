@@ -17,7 +17,7 @@ from petsc4py import PETSc # Import PETSc for enums like InsertMode
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner,
@@ -28,7 +28,7 @@ from pycutfem.ufl.forms import assemble_form
 from pycutfem.fem.reference import get_reference
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.forms import Equation
-from pycutfem.utils.biofilm_one_domain import build_biofilm_one_domain_forms
+from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
 
 # Imports for mapping and matrix conversion
 from scipy.optimize import linear_sum_assignment

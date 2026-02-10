@@ -76,6 +76,7 @@ ParaView or any VTK viewer.
   assembly.
 - The repository contains Jupyter notebooks under `examples/` for exploratory
   studies and comparisons against external FEM codes.
+- Repository structure and ownership rules are documented in `ARCHITECTURE.md`.
 
 ### Experimental C++ backend
 

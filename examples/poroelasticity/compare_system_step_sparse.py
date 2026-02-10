@@ -252,7 +252,7 @@ def _assemble_pycutfem(*, points: np.ndarray, cells: np.ndarray, params: Params,
         trace,
     )
     from pycutfem.ufl.forms import BoundaryCondition
-    from pycutfem.ufl.functionspace import FunctionSpace
+    from pycutfem.ufl.spaces import FunctionSpace
     from pycutfem.ufl.measures import dS, dx
 
     mesh = _build_p2_tri_mesh(points, cells)

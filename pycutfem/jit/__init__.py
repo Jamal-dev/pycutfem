@@ -448,7 +448,7 @@ class KernelRunner:
             raise KeyError(
                 "KernelRunner: the following static arrays are still missing "
                 f"after automatic completion: {missing}. "
-                "Compute them once (e.g. with helpers_jit._build_jit_kernel_args) "
+                "Compute them once (e.g. with kernel_args._build_jit_kernel_args) "
                 "and pass them via 'static_args'."
             )
 
@@ -789,7 +789,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
         )
     from pycutfem.ufl.measures import Integral
     from pycutfem.ufl.forms    import Equation
-    from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
+    from pycutfem.jit.kernel_args import _build_jit_kernel_args
     from pycutfem.ufl.compilers import FormCompiler
 
     kernels : list[_IntegralKernel] = []
@@ -1308,7 +1308,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 # Fast-path: keep full-volume statics at full-mesh size and only
                 # update quadrature weights when the element set changes.
                 #
-                # Motivation: helpers_jit expands/caches reference-space tables with
+                # Motivation: kernel_args expands/caches reference-space tables with
                 # a key that includes n_elem == gdofs_map.shape[0]. If we rebuild the
                 # full-element subset every refresh (and its size changes), we keep
                 # allocating enormous (nElem x nQ x nLoc) tables which dominates the

@@ -92,10 +92,10 @@ from pycutfem.ufl.expressions import (
     restrict,
 )
 from pycutfem.ufl.forms import BoundaryCondition
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.helpers import analyze_active_dofs
 from pycutfem.ufl.measures import dFacetPatch, dGhost, dInterface, dx
-from pycutfem.utils.fsi_fully_eulerian import (
+from examples.utils.fsi.fully_eulerian import (
     build_fsi_eulerian_forms,
     make_domain_sets,
     refresh_domain_sets,

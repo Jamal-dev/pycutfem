@@ -21,7 +21,7 @@ from pycutfem.ufl.expressions import (
     VectorTestFunction,
     VectorTrialFunction,
 )
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.forms import Equation, assemble_form
 from pycutfem.ufl.measures import dGhost
 

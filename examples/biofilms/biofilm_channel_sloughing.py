@@ -20,9 +20,9 @@ from pycutfem.ufl.expressions import (
     VectorTrialFunction,
 )
 from pycutfem.ufl.forms import BoundaryCondition
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dS, ds, dx
-from pycutfem.utils.biofilm_adhesion import (
+from examples.utils.biofilm.adhesion import (
     assemble_scalar,
     solid_von_mises_mass_lumped_in_domain,
     update_adhesion_integrity,
@@ -30,9 +30,9 @@ from pycutfem.utils.biofilm_adhesion import (
     update_adhesion_integrity_field_on_boundary_von_mises,
     wall_shear_rms_on_boundary,
 )
-from pycutfem.utils.biofilm_one_domain import build_biofilm_one_domain_forms
+from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
 from pycutfem.utils.meshgen import structured_quad
-from pycutfem.utils.volume_correction import logit_shift_to_match_integral
+from examples.utils.shared.volume_correction import logit_shift_to_match_integral
 
 
 def _tag_rectangle_boundaries(mesh: Mesh, *, L: float, H: float, tol: float = 1.0e-12) -> None:

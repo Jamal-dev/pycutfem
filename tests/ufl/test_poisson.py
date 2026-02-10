@@ -11,7 +11,7 @@ from pycutfem.ufl.expressions import TrialFunction,dot, TestFunction, Constant, 
 from pycutfem.ufl.measures import dx
 from pycutfem.ufl.forms import assemble_form, BoundaryCondition, Equation
 from pycutfem.core.dofhandler import DofHandler
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.fem.mixedelement import MixedElement
 
 def test_poisson_symbolic_q1():

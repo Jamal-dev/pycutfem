@@ -6,7 +6,7 @@ def test_precompute_unified_matches_separate_turek_fsi2(tmp_path, monkeypatch):
     monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / "pycutfem_jit_cache"))
 
     from pycutfem.core.dofhandler import clear_caches
-    from pycutfem.utils.turek_fsi2 import build_turek_fsi2_setup
+    from examples.utils.fsi.turek_fsi2 import build_turek_fsi2_setup
 
     setup = build_turek_fsi2_setup(mesh_size=0.025, poly_order=2)
     dh = setup.dof_handler
@@ -248,7 +248,7 @@ def test_facet_patch_geo_cache_reuse_and_subset_reuse_avoid_inverse_mapping(monk
     monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / "pycutfem_jit_cache"))
 
     from pycutfem.core.dofhandler import clear_caches
-    from pycutfem.utils.turek_fsi2 import build_turek_fsi2_setup
+    from examples.utils.fsi.turek_fsi2 import build_turek_fsi2_setup
 
     setup = build_turek_fsi2_setup(mesh_size=0.05, poly_order=2)
     dh = setup.dof_handler
@@ -319,7 +319,7 @@ def test_facet_patch_caches_are_bounded(monkeypatch, tmp_path):
 
     import pycutfem.core.dofhandler as dhmod
     from pycutfem.core.dofhandler import clear_caches
-    from pycutfem.utils.turek_fsi2 import build_turek_fsi2_setup
+    from examples.utils.fsi.turek_fsi2 import build_turek_fsi2_setup
 
     setup = build_turek_fsi2_setup(mesh_size=0.05, poly_order=2)
     dh = setup.dof_handler

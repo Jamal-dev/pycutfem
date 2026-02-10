@@ -24,7 +24,7 @@ from pycutfem.ufl.expressions import (
     div,
 )
 from pycutfem.ufl.forms import BoundaryCondition, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dx, ds, dS
 from pycutfem.utils.meshgen import structured_quad
 

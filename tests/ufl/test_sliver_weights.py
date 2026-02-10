@@ -3,7 +3,7 @@ import numpy as np
 from pycutfem.core.geometry import hansbo_cut_ratio
 from pycutfem.core.levelset import AffineLevelSet
 from pycutfem.core.mesh import Mesh
-from pycutfem.utils.fsi_fully_eulerian import refresh_sliver_weights
+from examples.utils.fsi.fully_eulerian import refresh_sliver_weights
 from pycutfem.utils.meshgen import structured_quad
 
 

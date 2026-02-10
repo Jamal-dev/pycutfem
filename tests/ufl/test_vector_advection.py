@@ -7,7 +7,7 @@ import sympy as sp
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     VectorTrialFunction, VectorTestFunction, VectorFunction,
     grad, inner, dot, Constant

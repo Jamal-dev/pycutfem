@@ -36,9 +36,9 @@ from pycutfem.ufl.expressions import Constant, ElementWiseConstant, FacetNormal,
 from pycutfem.ufl.forms import BoundaryCondition
 from pycutfem.ufl.measures import dNonmatchingInterface, dx
 from pycutfem.utils.bitset import BitSet
-from pycutfem.utils.fpi_fully_eulerian import build_fpi_eulerian_forms
-from pycutfem.utils.fpi_mms_example41 import build_example41_mms
-from pycutfem.utils.fsi_fully_eulerian import build_measures, make_domain_sets
+from examples.utils.fpi.fully_eulerian import build_fpi_eulerian_forms
+from examples.utils.fpi.mms_example41 import build_example41_mms
+from examples.utils.fsi.fully_eulerian import build_measures, make_domain_sets
 from pycutfem.utils.meshgen import structured_quad
 
 
@@ -192,7 +192,7 @@ def _interface_traction_pressure_errors(
 ) -> dict[str, float]:
     """Traction and pressure errors on Γ^{FP} (debugging aid)."""
     from pycutfem.ufl.expressions import Constant, FacetNormal, Identity, dot, grad, inner
-    from pycutfem.utils.fpi_poro_eulerian import poro_sigma_neo_hookean
+    from examples.utils.fpi.poro import poro_sigma_neo_hookean
 
     n = FacetNormal()  # (-)->(+) (poro -> fluid)
     nF = Constant(-1.0) * n  # fluid outward
@@ -384,7 +384,7 @@ def _run_one(
 
     # Physical parameters (match MMS builder)
     from pycutfem.ufl.expressions import Function, VectorFunction
-    from pycutfem.ufl.functionspace import FunctionSpace
+    from pycutfem.ufl.spaces import FunctionSpace
     from pycutfem.ufl.expressions import TestFunction, TrialFunction, VectorTestFunction, VectorTrialFunction
 
     rho_f = Constant(1.0)
@@ -1109,7 +1109,7 @@ def main() -> None:
 
     # --- Unknowns (current and previous) on the composite mesh ---
     from pycutfem.ufl.expressions import Function, VectorFunction
-    from pycutfem.ufl.functionspace import FunctionSpace
+    from pycutfem.ufl.spaces import FunctionSpace
     from pycutfem.ufl.expressions import TestFunction, TrialFunction, VectorTestFunction, VectorTrialFunction
 
     dh = prob.dh

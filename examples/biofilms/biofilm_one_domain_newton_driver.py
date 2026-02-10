@@ -17,10 +17,10 @@ from pycutfem.ufl.expressions import (
     VectorTrialFunction,
 )
 from pycutfem.ufl.forms import BoundaryCondition
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dx
-from pycutfem.utils.biofilm_mms_one_domain_convergence import build_biofilm_one_domain_mms_trig_step
-from pycutfem.utils.biofilm_one_domain import build_biofilm_one_domain_forms
+from examples.utils.biofilm.mms_one_domain_convergence import build_biofilm_one_domain_mms_trig_step
+from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
 from pycutfem.utils.meshgen import structured_quad
 
 

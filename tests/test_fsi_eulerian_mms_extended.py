@@ -19,10 +19,10 @@ from pycutfem.ufl.expressions import (
     restrict,
 )
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.jit import compile_multi
-from pycutfem.ufl.helpers_jit import _scatter_element_contribs
-from pycutfem.utils.fsi_fully_eulerian import (
+from pycutfem.jit.kernel_args import _scatter_element_contribs
+from examples.utils.fsi.fully_eulerian import (
     build_fsi_eulerian_forms,
     build_measures,
     make_domain_sets,

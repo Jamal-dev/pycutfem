@@ -6877,7 +6877,7 @@ class DofHandler:
         # IMPORTANT: provide *reference-space* derivatives (d/dξ, d/dη) in the
         # owner-mixed layout (length == me.n_dofs_per_elem). The JIT backends
         # push forward with J^{-1} and, for Hessians, use the inverse-map jets
-        # (Hxi0/Hxi1). helpers_jit then pads these owner-mixed vectors to the
+        # (Hxi0/Hxi1). kernel_args then pads these owner-mixed vectors to the
         # per-edge union width via pos_map/neg_map when required.
         #
         # This matches the ghost-edge data contract and allows Hessian penalties

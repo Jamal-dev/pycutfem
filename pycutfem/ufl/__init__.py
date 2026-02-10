@@ -24,6 +24,7 @@ from pycutfem.ufl.expressions import (
 )
 from pycutfem.ufl.measures import dx, ds, dInterface, dGhost  # noqa: F401
 from pycutfem.ufl.analytic import Analytic, x, y  # noqa: F401
+from pycutfem.ufl.spaces import FunctionSpace
 
 __all__ = [
     "Equation",
@@ -36,6 +37,7 @@ __all__ = [
     "VectorTestFunction",
     "Function",
     "VectorFunction",
+    "FunctionSpace",
     "HdivFunction",
     "HdivTrialFunction",
     "HdivTestFunction",

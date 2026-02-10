@@ -24,7 +24,7 @@ from typing import Optional
 from pycutfem.core.mesh import Mesh as pycutfem_Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad, _structured_pk, structured_triangles
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     VectorTrialFunction, VectorTestFunction, TrialFunction, TestFunction,
     Function, VectorFunction, Constant,
@@ -37,7 +37,7 @@ from pycutfem.core.levelset import CircleLevelSet, LevelSetGridFunction, LevelSe
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.io.visualization import plot_mesh_2, add_measure_area_overlay, add_element_fill, add_element_outline, zoom_to_elements
 import matplotlib.pyplot as plt
-from pycutfem.utils.area_checks import per_element_circle_split_structured_quad, per_element_circle_split_structured_triangle
+from examples.utils.debug.area_checks import per_element_circle_split_structured_quad, per_element_circle_split_structured_triangle
 # ---------- NGSolve / XFEM imports ----------
 from netgen.geom2d import SplineGeometry
 from ngsolve import *

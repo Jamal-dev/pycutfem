@@ -13,7 +13,7 @@ from pycutfem.ufl.expressions import (
     dot,
     grad,
 )
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.utils.meshgen import structured_quad
 
 

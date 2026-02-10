@@ -31,7 +31,7 @@ from pycutfem.utils.gmsh_loader import mesh_from_gmsh
 from examples.gmsh_cavity_mesh import build_caity_quad_mesh
 
 # --- UFL-like imports ---
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner, dot, div

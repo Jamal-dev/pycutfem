@@ -5,7 +5,7 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.levelset import LevelSetGridFunction
-from pycutfem.utils.fsi_fully_eulerian import nudge_levelset_zeros
+from examples.utils.fsi.fully_eulerian import nudge_levelset_zeros
 
 
 def test_nudge_levelset_zeros_breaks_aligned_interface():

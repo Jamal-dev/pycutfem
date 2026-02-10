@@ -9,7 +9,7 @@ from pycutfem.jit import _active_columns, _active_field_order, compile_multi
 from pycutfem.jit.ir import strip_side_metadata
 from pycutfem.jit.visitor import IRGenerator
 from pycutfem.ufl.expressions import Constant, Neg, Pos, VectorTestFunction, VectorTrialFunction, dot
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dInterface
 from pycutfem.utils.meshgen import structured_quad
 

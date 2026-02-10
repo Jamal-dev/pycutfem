@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import sysconfig
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -22,20 +23,34 @@ class CppKernelCache:
     The interface mirrors :class:`pycutfem.jit.cache.KernelCache`.
     """
 
-    _CACHE_DIR = (
-        Path(
-            os.environ.get("PYCUTFEM_CACHE_DIR", Path.home() / ".cache" / "pycutfem_jit")
-        )
-        .expanduser()
-        .resolve()
-        / "cpp"
-    )
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # Optional test hook; when None, cache dir is resolved from env per instance.
+    _CACHE_DIR: Path | None = None
 
     def __init__(self) -> None:
         self.in_memory_cache: Dict[str, Tuple[Any, List[str]]] = {}
+        self._cache_dir = self._resolve_cache_dir()
         suffix = sysconfig.get_config_var("EXT_SUFFIX")
         self._ext_suffix = suffix if suffix else ".so"
+
+    @classmethod
+    def _resolve_cache_dir(cls) -> Path:
+        """Resolve cache dir at runtime so per-test env overrides are honored."""
+        override = cls._CACHE_DIR
+        if override is not None:
+            cache_dir = Path(override).expanduser().resolve()
+        else:
+            cache_dir = (
+                Path(
+                    os.environ.get(
+                        "PYCUTFEM_CACHE_DIR", Path.home() / ".cache" / "pycutfem_jit"
+                    )
+                )
+                .expanduser()
+                .resolve()
+                / "cpp"
+            )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
 
     # ------------------------------------------------------------------
     def get_kernel(self, ir_sequence: list, codegen, mesh_sig=None):
@@ -49,8 +64,8 @@ class CppKernelCache:
             return self.in_memory_cache[ir_hash]
 
         module_name = f"_pycutfem_cpp_kernel_{ir_hash}"
-        source_file = self._CACHE_DIR / f"{module_name}.cpp"
-        built_module = self._CACHE_DIR / f"{module_name}{self._ext_suffix}"
+        source_file = self._cache_dir / f"{module_name}.cpp"
+        built_module = self._cache_dir / f"{module_name}{self._ext_suffix}"
 
         # Generate source if needed (or if stale ABI is detected).
         regenerate = True
@@ -76,7 +91,7 @@ class CppKernelCache:
             compile_extension(
                 module_name,
                 source_file,
-                self._CACHE_DIR,
+                self._cache_dir,
                 include_dirs=include_dirs,
             )
 
@@ -92,10 +107,10 @@ class CppKernelCache:
             compile_extension(
                 module_name,
                 source_file,
-                self._CACHE_DIR,
+                self._cache_dir,
                 include_dirs=list(codegen.include_dirs),
             )
-            module = self._import_module(module_name, built_module)
+            module = self._import_module(module_name, built_module, force_reload=True)
 
         param_order = (
             list(getattr(module, "PARAM_ORDER"))
@@ -115,10 +130,22 @@ class CppKernelCache:
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _import_module(modname: str, path: Path):
+    def _import_module(modname: str, path: Path, *, force_reload: bool = False):
+        if force_reload:
+            sys.modules.pop(modname, None)
+        else:
+            cached = sys.modules.get(modname)
+            if cached is not None:
+                return cached
         spec = importlib.util.spec_from_file_location(modname, path)
         if not spec or not spec.loader:  # pragma: no cover - safety net
             raise ImportError(f"Could not load spec for {path}")
         mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)  # type: ignore[arg-type]
+        sys.modules[modname] = mod
+        try:
+            spec.loader.exec_module(mod)  # type: ignore[arg-type]
+        except Exception:
+            # Avoid keeping partially-initialized modules around.
+            sys.modules.pop(modname, None)
+            raise
         return mod

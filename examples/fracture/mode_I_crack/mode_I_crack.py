@@ -28,7 +28,7 @@ from pycutfem.ufl.expressions import (
 )
 from pycutfem.ufl.forms import BoundaryCondition
 from pycutfem.ufl.forms import Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.linalg import (
     d_spectral_positive_part_2x2_sym,
     smooth_pos,

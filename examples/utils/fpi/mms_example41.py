@@ -2,9 +2,9 @@
 
 This module provides a *fast* SymPy-derived MMS that is consistent with the
 Eulerian FPI operators implemented in:
-  - `pycutfem/utils/fpi_fully_eulerian.py`
-  - `pycutfem/utils/fpi_poro_eulerian.py`
-  - `pycutfem/utils/fpi_interface_eulerian.py`
+  - `examples/utils/fpi/fully_eulerian.py`
+  - `examples/utils/fpi/poro.py`
+  - `examples/utils/fpi/interface.py`
 
 The geometry in the paper is complex; the MMS itself is purely analytic and can
 be evaluated on arbitrary meshes/level sets.

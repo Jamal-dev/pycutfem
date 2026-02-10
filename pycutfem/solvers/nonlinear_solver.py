@@ -32,8 +32,8 @@ try:
     from scipy.sparse.linalg import MatrixRankWarning
 except Exception:
     MatrixRankWarning = None
-# from pycutfem.ufl.helpers_jit import _scatter_element_contribs
-from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
+# from pycutfem.jit.kernel_args import _scatter_element_contribs
+from pycutfem.jit.kernel_args import _build_jit_kernel_args
 from pycutfem.jit import compile_multi        
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.helpers import analyze_active_dofs

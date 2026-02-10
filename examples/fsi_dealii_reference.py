@@ -32,7 +32,7 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.utils.bitset import BitSet
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     Constant,
     Function,

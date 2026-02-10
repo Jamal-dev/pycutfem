@@ -5,7 +5,7 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.core.levelset import AffineLevelSet
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.core.dofhandler import DofHandler
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import VectorTrialFunction, VectorTestFunction, inner, grad
 from pycutfem.ufl.measures import dx, dGhost
 from pycutfem.jit import compile_multi

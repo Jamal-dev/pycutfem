@@ -23,7 +23,7 @@ Key ideas:
 
 Where:
 - `pycutfem/core/dofhandler.py`
-- `pycutfem/ufl/helpers_jit.py`
+- `pycutfem/jit/kernel_args.py`
 - `pycutfem/ufl/helpers_geom.py`
 - `pycutfem/jit/*` and `pycutfem/jit/cpp_backend/*`
 
@@ -45,7 +45,7 @@ Fixes:
 
 Where:
 - `pycutfem/core/mesh.py`
-- `pycutfem/utils/fsi_fully_eulerian.py`
+- `examples/utils/fsi/fully_eulerian.py`
 - `examples/turek_fsi_fully_eulerian.py`
 
 ### 3) More debuggable and robust Newton iteration (without “dt ping‑pong”)
@@ -88,7 +88,7 @@ Where:
   - Added multiple “debug safety” knobs (abort on dt reduction, penalty retry, line‑search fallback).
   - Kept experimental extension conditioning hooks (wrong‑side re‑extension / interface stitch) **off by default**.
 
-- `pycutfem/utils/fsi_fully_eulerian.py`
+- `examples/utils/fsi/fully_eulerian.py`
   - Domain‑set construction now separates aligned interface edges from cut interface, and builds a stabilizing
     interior ghost band in pathological “one‑sided” sliver cases.
   - Centralizes sliver weight refresh and DOF tagging helpers used by the example(s).
@@ -106,7 +106,7 @@ Where:
 
 - `pycutfem/jit/__init__.py`, `pycutfem/jit/cache.py`, `pycutfem/jit/codegen.py`,
   `pycutfem/jit/cpp_backend/cache.py`, `pycutfem/jit/cpp_backend/codegen.py`,
-  `pycutfem/ufl/compilers.py`, `pycutfem/ufl/helpers_geom.py`, `pycutfem/ufl/helpers_jit.py`
+  `pycutfem/ufl/compilers.py`, `pycutfem/ufl/helpers_geom.py`, `pycutfem/jit/kernel_args.py`
   - Runtime‑parameter refresh for `Constant.value` so penalty/dt tuning doesn’t require kernel regeneration.
   - Unified precompute + cached geometry helpers to reduce kernel refresh time after level‑set updates.
 

@@ -1,7 +1,7 @@
 """Non-matching FPI Nitsche coupling on a CutFEM-resolved interface.
 
 This module assembles the *interface* residual/Jacobian contributions of
-`pycutfem/utils/fpi_interface_eulerian.py`, but for the two-mesh setting:
+`examples/utils/fpi/interface.py`, but for the two-mesh setting:
 
   - fluid unknowns live on a CutFEM background mesh (pos side),
   - poroelastic unknowns live on a separate body-fitted mesh (neg side),

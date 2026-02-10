@@ -33,7 +33,7 @@ from petsc4py import PETSc
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import TrialFunction, TestFunction, Constant, Jump
 from pycutfem.ufl.measures import dGhost
 from pycutfem.fem.mixedelement import MixedElement

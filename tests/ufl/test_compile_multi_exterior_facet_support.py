@@ -7,7 +7,7 @@ from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.jit import compile_multi
 from pycutfem.ufl.expressions import Constant, FacetNormal, VectorTestFunction, VectorTrialFunction, dot, grad
 from pycutfem.ufl.forms import Equation
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dS
 from pycutfem.utils.meshgen import structured_quad
 

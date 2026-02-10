@@ -15,9 +15,9 @@ from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.expressions import Constant, Function, Identity, TestFunction, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction, dot
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.forms import BoundaryCondition
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dS, dx
-from pycutfem.utils.fpi_poro_eulerian import jacobian_poro, residual_poro
+from examples.utils.fpi.poro import jacobian_poro, residual_poro
 from pycutfem.utils.meshgen import structured_quad
 
 

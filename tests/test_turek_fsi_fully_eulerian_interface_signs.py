@@ -23,8 +23,8 @@ from pycutfem.ufl.expressions import (
     trace,
 )
 from pycutfem.ufl.forms import Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
-from pycutfem.utils.fsi_fully_eulerian import build_fsi_eulerian_forms, build_measures, make_domain_sets
+from pycutfem.ufl.spaces import FunctionSpace
+from examples.utils.fsi.fully_eulerian import build_fsi_eulerian_forms, build_measures, make_domain_sets
 from pycutfem.utils.meshgen import structured_quad
 
 

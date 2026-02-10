@@ -9,7 +9,7 @@ from pycutfem.ufl.expressions import (Constant, Pos, Neg, Jump, FacetNormal,grad
                                       TestFunction, VectorTestFunction, TrialFunction)
 from pycutfem.ufl.forms           import assemble_form, Equation
 from pycutfem.core.dofhandler import DofHandler
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from numpy.testing import assert_allclose # Add this import at the top
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.analytic import Analytic

@@ -34,7 +34,7 @@ from pycutfem.ufl.expressions import (
     inner,
 )
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dNonmatchingInterface, dx
 from pycutfem.utils.bitset import BitSet
 from pycutfem.utils.meshgen import structured_quad, structured_triangles

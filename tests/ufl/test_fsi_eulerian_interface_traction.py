@@ -6,8 +6,8 @@ from pycutfem.core.levelset import AffineLevelSet
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.utils.meshgen import structured_quad
-from pycutfem.utils.fsi_fully_eulerian import build_fsi_eulerian_forms, build_measures, make_domain_sets
-from pycutfem.ufl.functionspace import FunctionSpace
+from examples.utils.fsi.fully_eulerian import build_fsi_eulerian_forms, build_measures, make_domain_sets
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     CellDiameter,
     Constant,

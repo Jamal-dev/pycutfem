@@ -10,8 +10,8 @@ from pycutfem.ufl.expressions  import Constant, Function, VectorFunction, TrialF
 from pycutfem.ufl.expressions  import inner, FacetNormal, dot
 from pycutfem.ufl.analytic     import Analytic
 from pycutfem.ufl.analytic     import y as y_ana
-from pycutfem.ufl.functionspace import FunctionSpace
-from pycutfem.ufl.helpers_jit   import _scatter_element_contribs
+from pycutfem.ufl.spaces import FunctionSpace
+from pycutfem.jit.kernel_args import _scatter_element_contribs
 from pycutfem.ufl.forms        import assemble_form, BoundaryCondition,Equation
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.core.dofhandler  import DofHandler

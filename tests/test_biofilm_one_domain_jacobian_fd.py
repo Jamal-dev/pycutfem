@@ -13,9 +13,9 @@ from pycutfem.ufl.expressions import (
     VectorTrialFunction,
 )
 from pycutfem.ufl.forms import Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import ds, dx
-from pycutfem.utils.biofilm_one_domain import build_biofilm_one_domain_forms
+from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
 from pycutfem.utils.meshgen import structured_quad
 
 

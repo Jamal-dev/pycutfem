@@ -26,7 +26,7 @@ from pycutfem.ufl.expressions import (
     inner,
     restrict,
 )
-from pycutfem.ufl.helpers_jit import _build_jit_kernel_args
+from pycutfem.jit.kernel_args import _build_jit_kernel_args
 
 
 def _make_dh(*, nx: int, ny: int, poly_order: int = 1):

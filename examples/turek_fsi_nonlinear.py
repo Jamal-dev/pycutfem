@@ -31,7 +31,7 @@ from pycutfem.utils.domain_manager import get_domain_bitset
 from pycutfem.core.geometry import hansbo_cut_ratio
 
 # --- UFL-like imports ---
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner, dot, div, jump, avg,

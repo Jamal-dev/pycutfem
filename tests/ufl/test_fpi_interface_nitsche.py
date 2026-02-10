@@ -20,9 +20,9 @@ from pycutfem.ufl.expressions import (
     restrict,
 )
 from pycutfem.ufl.forms import Equation
-from pycutfem.ufl.functionspace import FunctionSpace
-from pycutfem.utils.fpi_interface_eulerian import build_fpi_interface_forms
-from pycutfem.utils.fsi_fully_eulerian import build_measures, make_domain_sets
+from pycutfem.ufl.spaces import FunctionSpace
+from examples.utils.fpi.interface import build_fpi_interface_forms
+from examples.utils.fsi.fully_eulerian import build_measures, make_domain_sets
 from pycutfem.utils.meshgen import structured_quad
 
 

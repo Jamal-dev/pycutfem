@@ -396,7 +396,7 @@ def _pycutfem_assemble(
         trace,
     )
     from pycutfem.ufl.forms import BoundaryCondition
-    from pycutfem.ufl.functionspace import FunctionSpace
+    from pycutfem.ufl.spaces import FunctionSpace
     from pycutfem.ufl.measures import dS, dx
 
     tri = simplices

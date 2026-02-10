@@ -12,7 +12,7 @@ from pycutfem.fem import transform
 from pycutfem.integration.quadrature import gauss_legendre
 from pycutfem.ufl.compilers import FormCompiler
 from pycutfem.ufl.helpers import lhs_num, required_multi_indices
-from pycutfem.ufl.helpers_jit import _build_jit_kernel_args, _scatter_element_contribs
+from pycutfem.jit.kernel_args import _build_jit_kernel_args, _scatter_element_contribs
 
 from .interface import NonMatchingInterface
 

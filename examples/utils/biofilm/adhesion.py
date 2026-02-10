@@ -246,7 +246,7 @@ def solid_von_mises_mass_lumped_in_domain(
 
     solid_model_key = str(solid_model).strip().lower()
     if solid_model_key in {"neo-hookean", "neo_hookean", "nh"}:
-        from pycutfem.utils.nonlinear_solid_eulerian_refmap import sigma_neo_hookean
+        from ..shared.nonlinear_solid_refmap import sigma_neo_hookean
 
         c_nh = mu_s / _c(2.0)
         beta_nh = lambda_s / (_c(2.0) * mu_s)

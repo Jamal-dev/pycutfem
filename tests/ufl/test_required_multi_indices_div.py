@@ -4,7 +4,7 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.expressions import VectorTrialFunction, div
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.helpers import required_multi_indices
 from pycutfem.utils.meshgen import structured_quad
 

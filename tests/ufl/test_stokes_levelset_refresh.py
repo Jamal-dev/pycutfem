@@ -8,9 +8,9 @@ from pycutfem.core.levelset import BeamLevelSet
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.fem.mixedelement import MixedElement
-from pycutfem.utils.fsi_fully_eulerian import make_domain_sets, refresh_sliver_weights
+from examples.utils.fsi.fully_eulerian import make_domain_sets, refresh_sliver_weights
 from pycutfem.utils.meshgen import structured_quad
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     CellDiameter,
     Constant,

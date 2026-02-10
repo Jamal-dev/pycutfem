@@ -22,7 +22,7 @@ from pycutfem.utils.meshgen import structured_quad
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.core.dofhandler import DofHandler
 
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     Function,
     VectorFunction,

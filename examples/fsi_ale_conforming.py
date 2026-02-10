@@ -49,7 +49,7 @@ from pycutfem.ufl.expressions import (
     dot,
     div,
 )
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dx, dS
 from pycutfem.ufl.forms import Equation, BoundaryCondition, assemble_form
 from pycutfem.ufl.compilers import FormCompiler

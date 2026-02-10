@@ -42,7 +42,7 @@ from pycutfem.utils.bitset import BitSet
 from pycutfem.utils.gmsh_loader import mesh_from_gmsh
 from pycutfem.utils.ogrid_meshgen import circular_hole_ogrid
 
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     CellDiameter,
     Constant,

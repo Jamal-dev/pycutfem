@@ -8,7 +8,7 @@ from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.expressions import Constant, ElementWiseConstant, TestFunction as UFLTestFunction, TrialFunction
 from pycutfem.ufl.forms import assemble_form
 from pycutfem.ufl.measures import dx
-from pycutfem.utils.fsi_fully_eulerian import make_domain_sets
+from examples.utils.fsi.fully_eulerian import make_domain_sets
 from pycutfem.utils.meshgen import structured_quad
 
 

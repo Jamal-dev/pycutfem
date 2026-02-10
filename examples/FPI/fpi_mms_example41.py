@@ -46,11 +46,11 @@ from pycutfem.ufl.expressions import (
 )
 from pycutfem.io.visualization import plot_mesh_2
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dx
-from pycutfem.utils.fpi_fully_eulerian import build_fpi_eulerian_forms
-from pycutfem.utils.fpi_mms_example41 import build_example41_mms
-from pycutfem.utils.fsi_fully_eulerian import build_measures, make_domain_sets, refresh_sliver_weights
+from examples.utils.fpi.fully_eulerian import build_fpi_eulerian_forms
+from examples.utils.fpi.mms_example41 import build_example41_mms
+from examples.utils.fsi.fully_eulerian import build_measures, make_domain_sets, refresh_sliver_weights
 from pycutfem.utils.meshgen import structured_quad
 
 

@@ -2,8 +2,8 @@
 
 This module composes the already-verified building blocks:
   - fluid volume Navier–Stokes (Eulerian) on Ω⁺,
-  - poroelastic volume sub-problem on Ω⁻ (see `fpi_poro_eulerian.py`),
-  - Nitsche interface coupling terms on Γ (see `fpi_interface_eulerian.py`),
+  - poroelastic volume sub-problem on Ω⁻ (see `poro.py`),
+  - Nitsche interface coupling terms on Γ (see `interface.py`),
 and adds lightweight CutFEM facet stabilizations (optional) for equal-order
 pressure/velocity discretizations.
 
@@ -29,8 +29,8 @@ from pycutfem.ufl.expressions import (
 )
 from pycutfem.ufl.measures import dCutSkeleton
 
-from pycutfem.utils.fpi_interface_eulerian import FPIInterfaceForms, build_fpi_interface_forms
-from pycutfem.utils.fpi_poro_eulerian import jacobian_poro, residual_poro
+from .interface import FPIInterfaceForms, build_fpi_interface_forms
+from .poro import jacobian_poro, residual_poro
 
 
 def _epsilon(v):

@@ -7,9 +7,9 @@ from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.expressions import FacetNormal, Constant, Function, VectorTestFunction, VectorTrialFunction, dot, Neg, Pos
 from pycutfem.ufl.forms import Equation, assemble_form
-from pycutfem.ufl.functionspace import FunctionSpace
+from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dInterface
-from pycutfem.utils.fsi_fully_eulerian import build_measures, make_domain_sets
+from examples.utils.fsi.fully_eulerian import build_measures, make_domain_sets
 from pycutfem.utils.meshgen import structured_quad
 
 
