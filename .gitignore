@@ -234,3 +234,4 @@ examples/biofilms/dian_paper/latex/**/*
 # Local debug / parity outputs
 out/
 examples/debug/out/
+examples/biofilms/model/**

@@ -361,7 +361,7 @@ def main() -> None:
     ap.add_argument("--newton-tol", type=float, default=1.0e-10)
     ap.add_argument("--max-it", type=int, default=30)
     ap.add_argument("--convergence", action="store_true", help="Save log-log convergence plot as a PNG.")
-    ap.add_argument("--outdir", type=str, default="comparison_outputs", help="Directory for saving CSV/LaTeX tables (and plots).")
+    ap.add_argument("--outdir", type=str, default="examples/biofilms/results/moving_interface", help="Directory for saving CSV/LaTeX tables (and plots).")
     ap.add_argument("--vtk-every", type=int, default=0, help="Write VTK every N accepted steps (0 disables).")
 
     # MMS parameters

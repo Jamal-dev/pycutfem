@@ -301,7 +301,7 @@ def main() -> None:
     ap.add_argument("--max-it", type=int, default=30)
     ap.add_argument("--no-detachment", action="store_true", help="Set k_det=0 in the MMS/forcing.")
     ap.add_argument("--convergence", action="store_true", help="Save log-log convergence plot as a PNG.")
-    ap.add_argument("--outdir", type=str, default="comparison_outputs", help="Directory for saving CSV/LaTeX tables (and plots).")
+    ap.add_argument("--outdir", type=str, default="examples/biofilms/results/mms1", help="Directory for saving CSV/LaTeX tables (and plots).")
     ap.add_argument("--vtk-every", type=int, default=0, help="Write VTK snapshot every N accepted steps (0 disables).")
     args = ap.parse_args()
 
