@@ -26,6 +26,10 @@ Important notes
 * This MMS is intended for backward Euler (theta=1). It provides forcing terms
   for the *discrete* BE step (t_n -> t_k=t_n+dt), in the same spirit as
   `BiofilmMovingInterfaceMMS`.
+* IMPORTANT: the one-domain forms define the skeleton velocity as a backward
+  difference `vS_k = (u_k - u_n)/dt`. To keep the MMS fully discrete (and avoid
+  an O(dt) consistency error that can dominate fine-mesh h-convergence), we
+  also define `vS(t)` as a backward difference of the prescribed center motion.
 * The momentum forcing below assumes **constant** viscosity via
   `mu_b_model="mu"` in `build_biofilm_one_domain_forms`. If you switch to
   variable viscosity, you must augment the viscous forcing accordingly.
@@ -147,7 +151,22 @@ class BiofilmMovingCylinderMMS:
         return np.stack((z + dx, z + dy), axis=-1)
 
     def vS(self, t: float):
-        return np.array([self.dxc_dt(t), self.dyc_dt(t)], dtype=float)
+        """
+        Skeleton velocity used in the one-domain forms (backward Euler consistent).
+
+        In `build_biofilm_one_domain_forms`, the skeleton velocity is computed as
+            vS_k = (u_k - u_n) / dt,
+        not as the instantaneous derivative u_t(t_k).
+
+        To make the MMS forcing consistent with that discretization, we define
+            vS(t) := (xc(t) - xc(t - dt)) / dt
+        (and similarly for y).
+        """
+        dt = float(self.dt)
+        if dt <= 0.0:
+            raise ValueError("dt must be positive.")
+        t = float(t)
+        return np.array([(self.xc(t) - self.xc(t - dt)) / dt, (self.yc(t) - self.yc(t - dt)) / dt], dtype=float)
 
     def v(self, x, y, t: float):
         """v = vS(t) + w(x,y,t), with w tangential and divergence-free."""

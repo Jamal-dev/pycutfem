@@ -310,28 +310,42 @@ class KernelRunner:
                             continue
                         arr = np.asarray(vals, dtype=np.float64)
                         prev = kernel_args.get(name)
-                        target_shape = tuple(qp_phys.shape[:2])
+                        tshape = tuple(getattr(ana, "tensor_shape", ()) or ())
+
+                        nE, nQ = int(qp_phys.shape[0]), int(qp_phys.shape[1])
+                        target_shape = (nE, nQ) + tshape
 
                         # Keep ABI/shape expectations stable:
-                        # - kernels always index ana_* as (e,q)
-                        # - Analytic.eval may return scalar for constant callables
-                        # - or 1D arrays for per-q / per-e outputs
-                        if isinstance(prev, np.ndarray) and prev.shape == target_shape:
-                            try:
-                                prev[...] = arr  # supports numpy broadcasting (scalar, 1D, ...)
-                            except Exception:
-                                # If refresh fails (unexpected shape), keep the previous values.
-                                pass
+                        # - kernels index ana_* as (e,q,...) with trailing tensor_shape
+                        # - Analytic.eval may return scalars/vectors/matrices that broadcast
+                        try:
+                            # Some callables naturally return *per-element* values
+                            # (shape (nE, ...) without the quadrature axis). Insert
+                            # a singleton q-axis so broadcasting can replicate it.
+                            if tshape:
+                                if arr.shape == (nE,) + tshape:
+                                    arr = arr[:, None, ...]
+                                elif arr.shape == (nQ,) + tshape:
+                                    arr = arr[None, :, ...]
+                            else:
+                                if arr.shape == (nE,):
+                                    arr = arr[:, None]
+                                elif arr.shape == (nQ,):
+                                    arr = arr[None, :]
+
+                            refreshed = np.broadcast_to(arr, target_shape)
+                        except Exception:
+                            # If broadcasting is impossible, keep previous values (if any).
                             continue
 
-                        try:
-                            if arr.ndim == 1 and arr.shape[0] == target_shape[0]:
-                                arr = arr[:, None]
-                            refreshed = np.broadcast_to(arr, target_shape).copy()
-                        except Exception:
-                            # If broadcasting is impossible, keep the previous values (if any).
-                            continue
-                        kernel_args[name] = refreshed
+                        if isinstance(prev, np.ndarray) and prev.shape == target_shape:
+                            try:
+                                prev[...] = refreshed
+                                continue
+                            except Exception:
+                                pass
+
+                        kernel_args[name] = np.asarray(refreshed, dtype=np.float64).copy()
 
         # ---------------------------------------------------------------
         # B)  guarantee presence of 'gdofs_map'  and  'node_coords'

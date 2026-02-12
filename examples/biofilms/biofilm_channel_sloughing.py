@@ -4,6 +4,7 @@ import sys
 
 import logging
 import numpy as np
+from pathlib import Path
 
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
@@ -33,6 +34,78 @@ from examples.utils.biofilm.adhesion import (
 from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
 from pycutfem.utils.meshgen import structured_quad
 from examples.utils.shared.volume_correction import logit_shift_to_match_integral
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "")
+    if raw is None:
+        return bool(default)
+    raw = str(raw).strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _load_npz_dict(path: Path) -> dict[str, np.ndarray]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    with np.load(str(path)) as data:
+        return {k: data[k] for k in data.files}
+
+
+def _npz_scalar(npz: dict[str, np.ndarray], key: str, default: float) -> float:
+    if key not in npz:
+        return float(default)
+    try:
+        return float(np.asarray(npz[key]).reshape(()))
+    except Exception:
+        return float(default)
+
+
+def _collect_function_arrays(funcs: list[object]) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for f in funcs:
+        if f is None:
+            continue
+        name = getattr(f, "name", None)
+        if not name:
+            continue
+        try:
+            vals = getattr(f, "nodal_values", None)
+            if vals is None:
+                continue
+            out[str(name)] = np.asarray(vals).copy()
+        except Exception:
+            continue
+    return out
+
+
+def _restore_function_from_state(f: object, state: dict[str, np.ndarray]) -> bool:
+    if f is None:
+        return False
+    name = getattr(f, "name", None)
+    if not name:
+        return False
+    key = str(name)
+    src = state.get(key, None)
+    if src is None and key.endswith("_k"):
+        src = state.get(key[:-2] + "_n", None)
+    if src is None and key.endswith("_n"):
+        src = state.get(key[:-2] + "_k", None)
+    if src is None:
+        return False
+    try:
+        arr = np.asarray(src, dtype=float)
+        dst = getattr(f, "nodal_values", None)
+        if dst is None:
+            return False
+        if np.asarray(dst).shape != arr.shape:
+            raise ValueError(f"shape mismatch for {key}: dump has {arr.shape}, function has {np.asarray(dst).shape}")
+        getattr(f, "nodal_values")[:] = arr
+        return True
+    except Exception as exc:
+        raise RuntimeError(f"Failed restoring state for {key}: {exc}") from exc
 
 
 def _tag_rectangle_boundaries(mesh: Mesh, *, L: float, H: float, tol: float = 1.0e-12) -> None:
@@ -165,6 +238,64 @@ def main() -> None:
         "`examples/biofilms/dian_paper/latex/main.tex` (SI units, polygon alpha0, deformation-only run).",
     )
     ap.add_argument("--vtk-every", type=int, default=1, help="Write VTK every N accepted steps (0 disables).")
+
+    # Debugging: per-step state dumps + restart (checkpoints)
+    dump_state_default = _env_bool("PYCUTFEM_DUMP_STATE", False)
+    ap.add_argument(
+        "--dump-state",
+        dest="dump_state",
+        action="store_true",
+        default=dump_state_default,
+        help="Write full state dumps (npz) for restart/debug. Env: PYCUTFEM_DUMP_STATE.",
+    )
+    ap.add_argument(
+        "--no-dump-state",
+        dest="dump_state",
+        action="store_false",
+        help="Disable state dumps. Env: PYCUTFEM_DUMP_STATE.",
+    )
+    ap.add_argument(
+        "--dump-state-every",
+        type=int,
+        default=int(os.getenv("PYCUTFEM_DUMP_STATE_EVERY", "1") or "1"),
+        help="Dump every N accepted steps (1 = every step). Env: PYCUTFEM_DUMP_STATE_EVERY.",
+    )
+    ap.add_argument(
+        "--dump-state-dir",
+        type=str,
+        default=os.getenv("PYCUTFEM_STATE_DUMP_DIR", "").strip(),
+        help="Directory for state dumps (default: <outdir>/state_dumps). Env: PYCUTFEM_STATE_DUMP_DIR.",
+    )
+
+    restart_dir_default = os.getenv("RESTART_DIR", "").strip()
+    ap.add_argument(
+        "--restart-dir",
+        type=str,
+        default=restart_dir_default if restart_dir_default else None,
+        help="Base directory containing state_dumps/ for restart. Env: RESTART_DIR.",
+    )
+    ap.add_argument(
+        "--restart-step",
+        type=int,
+        default=int(os.getenv("RESTART_STEP", "-1") or "-1"),
+        help="Dump step number to restart from (matches state_step_####.npz). Env: RESTART_STEP.",
+    )
+    restart_tag_default = os.getenv("RESTART_TAG", "step").strip().lower() or "step"
+    ap.add_argument(
+        "--restart-tag",
+        choices=("step", "fail"),
+        default=restart_tag_default,
+        help="Which dump tag to load: step (accepted) or fail (Newton failure). Env: RESTART_TAG.",
+    )
+    ap.add_argument(
+        "--restart-reset-counters",
+        action="store_true",
+        default=_env_bool("RESTART_RESET_COUNTERS", False),
+        help=(
+            "Reset step counters for logs/dumps after restart (physical time t is still loaded from checkpoint). "
+            "Env: RESTART_RESET_COUNTERS."
+        ),
+    )
     # Initial biofilm block geometry (smooth)
     ap.add_argument(
         "--alpha0-kind",
@@ -993,6 +1124,61 @@ def main() -> None:
 
     os.makedirs(str(args.outdir), exist_ok=True)
 
+    # ------------------------------------------------------------------
+    # Debugging: state dumps + restart
+    # ------------------------------------------------------------------
+    dump_state = bool(getattr(args, "dump_state", False))
+    try:
+        dump_state_every = int(getattr(args, "dump_state_every", 1))
+    except Exception:
+        dump_state_every = 1
+    dump_state_every = max(0, int(dump_state_every))
+    state_dump_dir = str(getattr(args, "dump_state_dir", "") or "").strip() or os.path.join(str(args.outdir), "state_dumps")
+
+    restart_payload = None
+    restart_t0 = 0.0
+    restart_step0 = 0
+    restart_dir = getattr(args, "restart_dir", None)
+    try:
+        restart_step = int(getattr(args, "restart_step", -1))
+    except Exception:
+        restart_step = -1
+    restart_tag = str(getattr(args, "restart_tag", "step") or "step").strip().lower() or "step"
+    restart_reset = bool(getattr(args, "restart_reset_counters", False))
+    if restart_dir is not None and restart_step >= 0:
+        restart_base = Path(restart_dir)
+        st_dir_raw = os.getenv("RESTART_STATE_DIR", "").strip()
+        state_dir = Path(st_dir_raw) if st_dir_raw else restart_base / "state_dumps"
+        state_path = state_dir / f"state_{restart_tag}_{int(restart_step):04d}.npz"
+        restart_state = _load_npz_dict(state_path)
+        restart_t0 = float(_npz_scalar(restart_state, "t", 0.0))
+        restart_dt0 = float(_npz_scalar(restart_state, "dt", dt_val))
+        try:
+            restart_step_loaded = int(np.asarray(restart_state.get("step", restart_step)).reshape(()))
+        except Exception:
+            restart_step_loaded = int(restart_step)
+        if restart_reset:
+            restart_step0 = 0
+        else:
+            restart_step0 = (
+                max(0, int(restart_step_loaded) - 1) if str(restart_tag) == "fail" else int(restart_step_loaded)
+            )
+        restart_payload = {
+            "state_path": str(state_path),
+            "state": restart_state,
+            "t": float(restart_t0),
+            "dt": float(restart_dt0),
+            "step": int(restart_step_loaded),
+        }
+        msg = f"[restart] loaded {str(state_path)} (step={restart_step_loaded} t={restart_t0:.6e} dt={restart_dt0:.3e})"
+        if restart_reset:
+            msg += " [reset counters]"
+        print(msg)
+        if abs(float(restart_dt0) - float(dt_val)) > 0.0:
+            print(
+                f"[restart] note: dump dt={restart_dt0:.3e} differs from --dt={dt_val:.3e}; continuing with --dt."
+            )
+
     alpha_supg = float(getattr(args, "alpha_supg", 0.0) or 0.0)
     alpha_cip = float(getattr(args, "alpha_cip", 0.0) or 0.0)
     if float(args.D_alpha) == 0.0 and alpha_supg == 0.0 and alpha_cip == 0.0:
@@ -1274,10 +1460,37 @@ def main() -> None:
         a_prev.set_values_from_function(a_init)
 
     # ------------------------------------------------------------------
+    # Optional restart: load solution snapshots from a prior run
+    # ------------------------------------------------------------------
+    if restart_payload is not None:
+        st = dict(restart_payload.get("state", {}) or {})
+        restored: list[str] = []
+        for f in [
+            # Current/previous unknowns
+            v_k, p_k, u_k, phi_k, alpha_k, d_k, S_k, X_k,
+            v_n, p_n, u_n, phi_n, alpha_n, d_n, S_n, X_n,
+            # Extra history / coefficients
+            u_prev, u_nm1, a_prev,
+        ]:
+            if f is None:
+                continue
+            if _restore_function_from_state(f, st):
+                restored.append(str(getattr(f, "name", "?")))
+        if a_prev is None and ("a_scalar" in st):
+            try:
+                restart_payload["a_scalar"] = float(_npz_scalar(st, "a_scalar", float(args.a0)))
+            except Exception:
+                restart_payload["a_scalar"] = float(args.a0)
+        if restored:
+            print(f"[restart] restored {len(restored)} fields: {', '.join(restored)}")
+        else:
+            print("[restart] warning: no matching fields restored from dump.")
+
+    # ------------------------------------------------------------------
     # Forms with adhesion traction on the bottom wall
     # ------------------------------------------------------------------
     dt_c = Constant(dt_val)
-    a_c = Constant(float(args.a0))
+    a_c = Constant(float(restart_payload.get("a_scalar", args.a0)) if restart_payload is not None else float(args.a0))
 
     ds_bottom = dS(defined_on=mesh.edge_bitset("bottom"), metadata={"q": int(qdeg)})
     ds_int = ds(metadata={"q": int(qdeg)})
@@ -1426,12 +1639,63 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Post-step callback: compute wall shear, update adhesion a, write output
     # ------------------------------------------------------------------
-    step_counter = {"k": 0}
-    a_state = {"val": float(args.a0)}
+    step_counter = {"k": int(restart_step0)}
+    a_state = {
+        "val": float(restart_payload.get("a_scalar", args.a0)) if restart_payload is not None else float(args.a0)
+    }
     alpha_area0 = {"val": None}
     slough_flags = {"a_drop": False, "contact_loss": False, "liftoff": False, "motion": False, "wall_clear": False}
     slough_t = {"a_drop": None, "contact_loss": None, "liftoff": None, "motion": None, "wall_clear": None}
     alpha_cm_hi0 = {"y": None}
+
+    if dump_state:
+        os.makedirs(state_dump_dir, exist_ok=True)
+        print(f"[dump] state dumps enabled: dir={state_dump_dir} every={dump_state_every}")
+
+    def _dump_state_snapshot(step_no: int, t_curr: float, dt_curr: float, *, tag: str, funcs: list[object]) -> None:
+        if not dump_state:
+            return
+        if str(tag) == "step":
+            if int(dump_state_every) <= 0:
+                return
+            if (int(step_no) % int(dump_state_every)) != 0:
+                return
+        try:
+            os.makedirs(state_dump_dir, exist_ok=True)
+            arrays = _collect_function_arrays(list(funcs or []))
+            payload: dict[str, object] = {
+                "step": int(step_no),
+                "t": float(t_curr),
+                "dt": float(dt_curr),
+                "mesh_n_nodes": int(getattr(mesh.nodes_x_y_pos, "shape", (0,))[0]),
+                "mesh_n_elements": int(getattr(mesh, "n_elements", len(getattr(mesh, "elements_list", [])))),
+                "mesh_element_type": str(getattr(mesh, "element_type", "")),
+                "mesh_poly_order": int(getattr(mesh, "poly_order", 1)),
+                "dof_total": int(getattr(dh, "total_dofs", -1)),
+            }
+            if a_prev is None:
+                payload["a_scalar"] = float(a_state["val"])
+            payload.update(arrays)
+            fname = os.path.join(state_dump_dir, f"state_{str(tag)}_{int(step_no):04d}.npz")
+            np.savez_compressed(fname, **payload)
+        except Exception as exc:
+            print(f"[warn] state dump failed (tag={tag} step={step_no}): {exc}")
+
+    def _on_step_failure(**ctx):
+        step_fail = int(ctx.get("step_no", ctx.get("step", 0)))
+        t_fail = float(ctx.get("t", 0.0))
+        dt_fail = float(ctx.get("dt", dt_val))
+        funcs_fail = list(ctx.get("functions", []) or [])
+        prev_fail = list(ctx.get("prev_functions", []) or [])
+        aux_vals = list((ctx.get("aux_functions", {}) or {}).values())
+        _dump_state_snapshot(
+            step_fail,
+            t_fail,
+            dt_fail,
+            tag="fail",
+            funcs=funcs_fail + prev_fail + aux_vals + [u_prev],
+        )
+        return False
     num_nodes = len(mesh.nodes_list)
     node_xy = np.asarray(getattr(mesh, "nodes_x_y_pos", np.zeros((num_nodes, 2), dtype=float)), dtype=float)
     alpha_dof_xy = np.asarray(dh.get_dof_coords("alpha"), dtype=float)
@@ -1523,7 +1787,14 @@ def main() -> None:
     def post_step(functions):
         step_counter["k"] += 1
         step_no = int(step_counter["k"])
+        dt_step = float(getattr(solver, "_current_dt", dt_val))
         t_now = step_no * dt_val
+        try:
+            t_start = getattr(solver, "_current_t", None)
+            if t_start is not None:
+                t_now = float(t_start) + float(dt_step)
+        except Exception:
+            t_now = step_no * dt_val
 
         shear = wall_shear_rms_on_boundary(
             dof_handler=dh,
@@ -1875,6 +2146,27 @@ def main() -> None:
                 },
             )
 
+        # Full state dump for restart/offline analysis (written after updating a_prev / a_state).
+        _dump_state_snapshot(
+            step_no,
+            float(t_now),
+            float(dt_step),
+            tag="step",
+            funcs=[
+                v_n,
+                p_n,
+                u_n,
+                phi_n,
+                alpha_n,
+                d_n,
+                S_n,
+                X_n,
+                u_prev,
+                u_nm1,
+                a_prev,
+            ],
+        )
+
     # ------------------------------------------------------------------
     # Solve in time
     # ------------------------------------------------------------------
@@ -1948,7 +2240,15 @@ def main() -> None:
             **({"a_prev": a_prev} if a_prev is not None else {}),
             **({"u_nm1": u_nm1} if u_nm1 is not None else {}),
         },
-        time_params=TimeStepperParameters(dt=dt_val, final_time=float(args.t_final), max_steps=10_000, theta=theta),
+        time_params=TimeStepperParameters(
+            dt=dt_val,
+            final_time=float(args.t_final),
+            max_steps=10_000,
+            theta=theta,
+            t0=float(restart_t0),
+            step0=int(restart_step0),
+            on_step_failure=_on_step_failure,
+        ),
         post_step_refiner=post_step_refiner,
     )
 

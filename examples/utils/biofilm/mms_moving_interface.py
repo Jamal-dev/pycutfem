@@ -244,7 +244,11 @@ class BiofilmMovingInterfaceMMS:
         alpha_yy_k = self._alpha_yy_from_alpha(alpha_k)
 
         delta_k = 4.0 * alpha_k * (1.0 - alpha_k)
-        return (alpha_k - alpha_n) / dt - self.D_det_prev(x, y) * delta_k - float(self.D_alpha) * alpha_yy_k
+        # In `build_biofilm_one_domain_forms`, the surface-localized erosion/detachment sink
+        # enters the residual with a + sign (it is treated as -D_det_prev*δ(α) on the RHS).
+        # Therefore the manufactured forcing must include +D_det_prev*δ(α) to match the
+        # implemented one-domain residual convention.
+        return (alpha_k - alpha_n) / dt + self.D_det_prev(x, y) * delta_k - float(self.D_alpha) * alpha_yy_k
 
     def f_phi(self, x, y):
         """Porosity RHS f_phi for the current BE step (with vS=0 and Π_b=0)."""

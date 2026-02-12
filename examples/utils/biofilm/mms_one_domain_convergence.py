@@ -321,7 +321,9 @@ def build_biofilm_one_domain_mms_trig_step(
     f_v_expr += th * (rho_k_expr * conv_k_expr + div_rhov_k_expr * v_k_expr)
     f_v_expr += one_m_th * (rho_n_expr * conv_n_expr + div_rhov_n_expr * v_n_expr)
     f_v_expr += -div_stress_mix
-    f_v_expr += _sym_grad_scalar(p_k_expr, x, y)
+    # Pressure coupling in `build_biofilm_one_domain_forms` is the variationally
+    # consistent `-(p, div(C w))`, which corresponds (in strong form) to `C ∇p`.
+    f_v_expr += C_k_expr * _sym_grad_scalar(p_k_expr, x, y)
     f_v_expr += beta_k_expr * (v_k_expr - vS_k_expr)
 
     # ------------------------------------------------------------------
@@ -342,18 +344,28 @@ def build_biofilm_one_domain_mms_trig_step(
     # ------------------------------------------------------------------
     I = sp.eye(2)
 
-    def _stress_s(u_expr_t, p_expr_t, phi_expr_t):
+    def _stress_s(u_expr_t):
         eps_u = _sym_epsilon(u_expr_t, x, y)
         div_u = _sym_div_vec(u_expr_t, x, y)
         elastic = 2.0 * float(mu_s) * eps_u + float(lambda_s) * div_u * I
-        pore_p = -(1.0 - phi_expr_t) * p_expr_t * I
-        return elastic + pore_p
+        return elastic
 
-    sigma_k = _stress_s(u_k_expr, p_k_expr, phi_k_expr)
-    sigma_n = _stress_s(u_n_expr, p_n_expr, phi_n_expr)
+    sigma_k = _stress_s(u_k_expr)
+    sigma_n = _stress_s(u_n_expr)
 
-    op_u_k = -_sym_div_mat(alpha_k_expr * sigma_k, x, y) - beta_k_expr * (v_k_expr - vS_k_expr)
-    op_u_n = -_sym_div_mat(alpha_n_expr * sigma_n, x, y) - beta_n_expr * (v_n_expr - vS_n_expr)
+    # In `build_biofilm_one_domain_forms`, the pressure coupling in the skeleton
+    # equation uses the adjoint form `-(p, div(B η))`, which corresponds to the
+    # strong term `B ∇p` (not ∇(B p)).
+    B_k_expr = alpha_k_expr * (1.0 - phi_k_expr)
+    B_n_expr = alpha_n_expr * (1.0 - phi_n_expr)
+
+    op_u_k = -_sym_div_mat(alpha_k_expr * sigma_k, x, y)
+    op_u_k += B_k_expr * _sym_grad_scalar(p_k_expr, x, y)
+    op_u_k += -beta_k_expr * (v_k_expr - vS_k_expr)
+
+    op_u_n = -_sym_div_mat(alpha_n_expr * sigma_n, x, y)
+    op_u_n += B_n_expr * _sym_grad_scalar(p_n_expr, x, y)
+    op_u_n += -beta_n_expr * (v_n_expr - vS_n_expr)
     f_u_expr = (th * op_u_k + one_m_th * op_u_n) / alpha_k_expr
 
     # ------------------------------------------------------------------
@@ -372,8 +384,11 @@ def build_biofilm_one_domain_mms_trig_step(
     # ------------------------------------------------------------------
     delta_k_expr = 4.0 * alpha_k_expr * (1.0 - alpha_k_expr)
     delta_n_expr = 4.0 * alpha_n_expr * (1.0 - alpha_n_expr)
-    Fal_k = _sym_grad_scalar(alpha_k_expr, x, y).dot(vS_k_expr) - G_k_expr * alpha_k_expr * (1.0 - alpha_k_expr) - D_det_prev_expr * delta_k_expr
-    Fal_n = _sym_grad_scalar(alpha_n_expr, x, y).dot(vS_n_expr) - G_n_expr * alpha_n_expr * (1.0 - alpha_n_expr) - D_det_prev_expr * delta_n_expr
+    # NOTE: In the one-domain implementation, the surface-localized erosion /
+    # detachment sink is treated as a negative RHS term; therefore it enters the
+    # residual with a + sign.
+    Fal_k = _sym_grad_scalar(alpha_k_expr, x, y).dot(vS_k_expr) - G_k_expr * alpha_k_expr * (1.0 - alpha_k_expr) + D_det_prev_expr * delta_k_expr
+    Fal_n = _sym_grad_scalar(alpha_n_expr, x, y).dot(vS_n_expr) - G_n_expr * alpha_n_expr * (1.0 - alpha_n_expr) + D_det_prev_expr * delta_n_expr
     f_alpha_expr = (alpha_k_expr - alpha_n_expr) / dt
     f_alpha_expr += th * Fal_k + one_m_th * Fal_n
     f_alpha_expr += -float(D_alpha) * _sym_laplacian(alpha_k_expr, x, y)

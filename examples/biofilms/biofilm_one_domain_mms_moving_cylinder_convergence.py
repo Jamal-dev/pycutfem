@@ -226,8 +226,11 @@ def _run_one(
         kappa_inv=Constant(float(kappa_inv)),
         mu_s=Constant(1.0),
         lambda_s=Constant(1.0),
-        # No extra u-regularization needed for MMS (u is Dirichlet everywhere).
-        gamma_u=0.0,
+        # Robust u-extension in the free-fluid region: use H1 extension so the
+        # rigid-translation MMS (∇u≡0) remains an exact solution while avoiding
+        # near-singular Jacobians when α≈0 far from the chunk.
+        gamma_u=1.0,
+        u_extension_mode="grad",
         D_phi=float(D_phi),
         gamma_phi=float(gamma_phi),
         D_alpha=float(D_alpha),
@@ -391,7 +394,7 @@ def main() -> None:
     ap.add_argument("--mu-f", type=float, default=1.0e-2)
     ap.add_argument("--kappa-inv", type=float, default=10.0)
     ap.add_argument("--D-phi", type=float, default=0.0)
-    ap.add_argument("--gamma-phi", type=float, default=0.0)
+    ap.add_argument("--gamma-phi", type=float, default=1.0)
     ap.add_argument("--D-alpha", type=float, default=0.0)
     args = ap.parse_args()
 
