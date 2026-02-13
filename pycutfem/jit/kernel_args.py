@@ -97,7 +97,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
     dof_handler,                  # DofHandler – *needed* for padding
     gdofs_map: np.ndarray = None, # global DOF map (mixed-space)
     param_order=None,             # order of parameters in the JIT kernel
-    pre_built: dict | None = None
+    pre_built: dict | None = None,
+    jit_param=None,
 ):
     """
     Return a **dict { name -> ndarray }** with *all* reference-space tables
@@ -130,7 +131,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
     logger = __import__("logging").getLogger(__name__)
     dbg    = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
-    param_map = build_jit_parametrization(expression)
+    param_map = jit_param if jit_param is not None else build_jit_parametrization(expression)
 
     # ------------------------------------------------------------------
     # 0. Helpers
@@ -194,7 +195,9 @@ def _build_jit_kernel_args(       # ← signature unchanged
     ) if _active_fields else np.arange(mixed_element.n_dofs_local, dtype=np.int32)
     _active_n = int(len(_active_cols))
     def _cached_ref_table(kind: str, field: str, builder, deriv: tuple[int, int] | None = None):
-        key = (mixed_element.signature(), q_order, n_elem, tuple(_active_cols.tolist()), kind, field, deriv)
+        # Cache key intentionally excludes active columns and n_elem: basis/grad/derivative
+        # reference tables depend on (element signature, quadrature, field, derivative) only.
+        key = (mixed_element.signature(), q_order, kind, field, deriv)
         hit = _REF_TABLE_CACHE.get(key)
         if hit is not None:
             return hit
@@ -206,7 +209,22 @@ def _build_jit_kernel_args(       # ← signature unchanged
         """
         Replicate a reference-space table so that shape[0] == n_elem.
         """
-        return np.broadcast_to(ref_tab, (n_elem, *ref_tab.shape)).copy()
+        # Broadcast along the element axis (stride-0) to avoid allocating
+        # (n_elem * n_q * n_loc) stacks during JIT warm-up.
+        return np.broadcast_to(ref_tab, (n_elem, *ref_tab.shape))
+
+    def _cached_phys_table(kind: str, field: str, token, builder):
+        """
+        Cache element-physical tables (basis/grad) keyed by a lightweight
+        token that tracks the underlying qref/eids arrays for this kernel.
+        """
+        key = (mixed_element.signature(), q_order, n_elem, kind, field, token)
+        hit = _REF_TABLE_CACHE.get(key)
+        if hit is not None:
+            return hit
+        arr = builder()
+        _REF_TABLE_CACHE[key] = arr
+        return arr
 
     # Reference-element quadrature (ξ-space) for table builders
     qp_ref, _ = volume(mixed_element.mesh.element_type, q_order)
@@ -217,8 +235,9 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 [mixed_element.basis(field, *xi_eta) for xi_eta in qp_ref],
                 dtype=np.float64,
             )  # (n_q , n_loc)
-            return _expand_per_element(ref)  # (n_elem , n_q , n_loc)
-        return _cached_ref_table("basis", field, _build)
+            return np.ascontiguousarray(ref)
+        ref = _cached_ref_table("basis", field, _build)
+        return _expand_per_element(ref)  # (n_elem , n_q , n_loc)
 
     def _grad_table(field: str):
         def _build():
@@ -226,8 +245,9 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 [mixed_element.grad_basis(field, *xi_eta) for xi_eta in qp_ref],
                 dtype=np.float64,
             )  # (n_q , n_loc , 2)
-            return np.ascontiguousarray(_expand_per_element(ref))  # (n_elem , n_q , n_loc , 2)
-        return _cached_ref_table("grad", field, _build)
+            return np.ascontiguousarray(ref)
+        ref = _cached_ref_table("grad", field, _build)
+        return _expand_per_element(ref)  # (n_elem , n_q , n_loc , 2)
 
     def _deriv_table(field: str, ax: int, ay: int):
         """∂^{ax+ay} φ_i / ∂ξ^{ax} ∂η^{ay}"""
@@ -236,8 +256,9 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 [mixed_element.deriv_ref(field, *xi_eta, ax, ay) for xi_eta in qp_ref],
                 dtype=np.float64,
             )
-            return _expand_per_element(ref)
-        return _cached_ref_table("deriv", field, _build, deriv=(ax, ay))
+            return np.ascontiguousarray(ref)
+        ref = _cached_ref_table("deriv", field, _build, deriv=(ax, ay))
+        return _expand_per_element(ref)
 
     # --- H(div) RT tables (reference-space, union-padded) ----------------------
     def _hdiv_bvec_table(field: str) -> np.ndarray:
@@ -258,9 +279,10 @@ def _build_jit_kernel_args(       # ← signature unchanged
             for q, (xi, eta) in enumerate(qp_ref):
                 Vhat = np.asarray(ref_obj.tabulate_value(float(xi), float(eta)), dtype=np.float64)  # (n_loc,2)
                 out_ref[q, :, sl] = Vhat.T
-            return np.ascontiguousarray(_expand_per_element(out_ref))  # (n_elem,n_q,2,n_union)
+            return np.ascontiguousarray(out_ref)
 
-        return _cached_ref_table("hdiv_bvec", field, _build)
+        ref = _cached_ref_table("hdiv_bvec", field, _build)
+        return _expand_per_element(ref)  # (n_elem,n_q,2,n_union)
 
     def _hdiv_div_table(field: str) -> np.ndarray:
         """
@@ -280,9 +302,10 @@ def _build_jit_kernel_args(       # ← signature unchanged
             for q, (xi, eta) in enumerate(qp_ref):
                 div_hat = np.asarray(ref_obj.tabulate_div(float(xi), float(eta)), dtype=np.float64).ravel()
                 out_ref[q, sl] = div_hat
-            return np.ascontiguousarray(_expand_per_element(out_ref))  # (n_elem,n_q,n_union)
+            return np.ascontiguousarray(out_ref)
 
-        return _cached_ref_table("hdiv_div", field, _build)
+        ref = _cached_ref_table("hdiv_div", field, _build)
+        return _expand_per_element(ref)  # (n_elem,n_q,n_union)
 
     def _hdiv_sign_table(field: str) -> np.ndarray:
         """
@@ -342,8 +365,11 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if nE == 0:
             n_union = _union_size_from_prebuilt()
             return np.empty((0, nQ, n_union), dtype=np.float64)
-        n_union = _n_union_for_eid(eids[0])
-        tab = np.empty((nE, nQ, n_union), dtype=np.float64)
+        sl = me.component_dof_slices[field]
+        n_union = int(getattr(me, "n_dofs_local", _n_union_for_eid(eids[0])))
+        if n_union < int(sl.stop):
+            n_union = int(sl.stop)
+        n_loc = int(sl.stop - sl.start)
 
         # Prefer cached reference coordinates if available to avoid inverse mapping
         qref_raw = pre_built.get("qref")
@@ -361,19 +387,50 @@ def _build_jit_kernel_args(       # ← signature unchanged
         else:
             qref_mode = None
 
+        if qref_mode is not None:
+            mode, arr = qref_mode
+            if mode == "global":
+                token = ("b_phys_global", int(id(arr)), int(arr.shape[0]), int(sl.start), int(sl.stop))
+
+                def _build():
+                    xi = np.asarray(arr[:, 0], dtype=float)
+                    eta = np.asarray(arr[:, 1], dtype=float)
+                    loc = np.asarray(me._eval_scalar_basis_many(field, xi, eta), dtype=np.float64).reshape(int(arr.shape[0]), n_loc)
+                    ref = np.zeros((int(arr.shape[0]), n_union), dtype=np.float64)
+                    ref[:, sl] = loc
+                    return np.ascontiguousarray(np.broadcast_to(ref[None, :, :], (nE, int(arr.shape[0]), n_union)).copy())
+
+                return _cached_phys_table("basis_phys_union", field, token, _build)
+
+            # per-element qref
+            token = (
+                "b_phys_elem",
+                int(id(arr)),
+                int(id(eids)),
+                int(arr.shape[0]),
+                int(arr.shape[1]),
+                int(sl.start),
+                int(sl.stop),
+            )
+
+            def _build():
+                xi = np.asarray(arr[..., 0], dtype=float).ravel()
+                eta = np.asarray(arr[..., 1], dtype=float).ravel()
+                loc = np.asarray(me._eval_scalar_basis_many(field, xi, eta), dtype=np.float64).reshape(nE, int(arr.shape[1]), n_loc)
+                out = np.zeros((nE, int(arr.shape[1]), n_union), dtype=np.float64)
+                out[:, :, sl] = loc
+                return np.ascontiguousarray(out)
+
+            return _cached_phys_table("basis_phys_union", field, token, _build)
+
+        # Fallback: inverse map physical points to reference and tabulate.
+        tab = np.zeros((nE, nQ, n_union), dtype=np.float64)
         for i in range(nE):
             eid = int(eids[i])
             for q in range(nQ):
-                if qref_mode is not None:
-                    mode, arr = qref_mode
-                    if mode == "per_element":
-                        xi, eta = arr[i, q]
-                    else:
-                        xi, eta = arr[q]
-                else:
-                    x, y = pts[i, q]
-                    xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
-                tab[i, q, :] = me.basis(field, float(xi), float(eta))
+                x, y = pts[i, q]
+                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+                tab[i, q, sl] = me._eval_scalar_basis(field, float(xi), float(eta))
         return np.ascontiguousarray(tab)
 
     def _deriv_table_phys_union(field: str, ax: int, ay: int) -> np.ndarray:
@@ -390,8 +447,11 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if nE == 0:
             n_union = _union_size_from_prebuilt()
             return np.empty((0, nQ, n_union), dtype=np.float64)
-        n_union = _n_union_for_eid(eids[0])
-        tab = np.empty((nE, nQ, n_union), dtype=np.float64)
+        sl = me.component_dof_slices[field]
+        n_union = int(getattr(me, "n_dofs_local", _n_union_for_eid(eids[0])))
+        if n_union < int(sl.stop):
+            n_union = int(sl.stop)
+        n_loc = int(sl.stop - sl.start)
 
         qref_raw = pre_built.get("qref")
         if qref_raw is None:
@@ -406,20 +466,50 @@ def _build_jit_kernel_args(       # ← signature unchanged
             else:
                 qref_mode = None
 
+        if qref_mode is not None:
+            mode, arr = qref_mode
+            if mode == "global":
+                token = ("d_phys_global", int(id(arr)), int(arr.shape[0]), int(ax), int(ay), int(sl.start), int(sl.stop))
+
+                def _build():
+                    out = np.zeros((nE, int(arr.shape[0]), n_union), dtype=np.float64)
+                    for q in range(int(arr.shape[0])):
+                        xi, eta = arr[q]
+                        out[:, q, sl] = me._eval_scalar_deriv(field, float(xi), float(eta), int(ax), int(ay))[None, :]
+                    return np.ascontiguousarray(out)
+
+                return _cached_phys_table("deriv_phys_union", field, token, _build)
+
+            token = (
+                "d_phys_elem",
+                int(id(arr)),
+                int(id(eids)),
+                int(arr.shape[0]),
+                int(arr.shape[1]),
+                int(ax),
+                int(ay),
+                int(sl.start),
+                int(sl.stop),
+            )
+
+            def _build():
+                out = np.zeros((nE, int(arr.shape[1]), n_union), dtype=np.float64)
+                for i in range(nE):
+                    for q in range(int(arr.shape[1])):
+                        xi, eta = arr[i, q]
+                        out[i, q, sl] = me._eval_scalar_deriv(field, float(xi), float(eta), int(ax), int(ay))
+                return np.ascontiguousarray(out)
+
+            return _cached_phys_table("deriv_phys_union", field, token, _build)
+
+        tab = np.zeros((nE, nQ, n_union), dtype=np.float64)
         for i in range(nE):
             eid = int(eids[i])
             for q in range(nQ):
-                if qref_mode is not None:
-                    mode, arr = qref_mode
-                    if mode == "per_element":
-                        xi, eta = arr[i, q]
-                    else:
-                        xi, eta = arr[q]
-                else:
-                    x, y = pts[i, q]
-                    xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
-                tab[i, q, :] = me.deriv_ref(field, float(xi), float(eta), int(ax), int(ay))
-        return tab
+                x, y = pts[i, q]
+                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+                tab[i, q, sl] = me._eval_scalar_deriv(field, float(xi), float(eta), int(ax), int(ay))
+        return np.ascontiguousarray(tab)
 
     def _grad_table_phys_union(field: str) -> np.ndarray:
         """Union-length gradient tables at interface physical QPs."""
@@ -435,8 +525,11 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if nE == 0:
             n_union = _union_size_from_prebuilt()
             return np.empty((0, nQ, n_union, 2), dtype=np.float64)
-        n_union = _n_union_for_eid(eids[0])
-        tab = np.empty((nE, nQ, n_union, 2), dtype=np.float64)
+        sl = me.component_dof_slices[field]
+        n_union = int(getattr(me, "n_dofs_local", _n_union_for_eid(eids[0])))
+        if n_union < int(sl.stop):
+            n_union = int(sl.stop)
+        n_loc = int(sl.stop - sl.start)
 
         qref_raw = pre_built.get("qref")
         if qref_raw is None:
@@ -451,19 +544,48 @@ def _build_jit_kernel_args(       # ← signature unchanged
             else:
                 qref_mode = None
 
+        if qref_mode is not None:
+            mode, arr = qref_mode
+            if mode == "global":
+                token = ("g_phys_global", int(id(arr)), int(arr.shape[0]), int(sl.start), int(sl.stop))
+
+                def _build():
+                    xi = np.asarray(arr[:, 0], dtype=float)
+                    eta = np.asarray(arr[:, 1], dtype=float)
+                    loc = np.asarray(me._eval_scalar_grad_many(field, xi, eta), dtype=np.float64).reshape(int(arr.shape[0]), n_loc, 2)
+                    ref = np.zeros((int(arr.shape[0]), n_union, 2), dtype=np.float64)
+                    ref[:, sl, :] = loc
+                    return np.ascontiguousarray(np.broadcast_to(ref[None, :, :, :], (nE, int(arr.shape[0]), n_union, 2)).copy())
+
+                return _cached_phys_table("grad_phys_union", field, token, _build)
+
+            token = (
+                "g_phys_elem",
+                int(id(arr)),
+                int(id(eids)),
+                int(arr.shape[0]),
+                int(arr.shape[1]),
+                int(sl.start),
+                int(sl.stop),
+            )
+
+            def _build():
+                xi = np.asarray(arr[..., 0], dtype=float).ravel()
+                eta = np.asarray(arr[..., 1], dtype=float).ravel()
+                loc = np.asarray(me._eval_scalar_grad_many(field, xi, eta), dtype=np.float64).reshape(nE, int(arr.shape[1]), n_loc, 2)
+                out = np.zeros((nE, int(arr.shape[1]), n_union, 2), dtype=np.float64)
+                out[:, :, sl, :] = loc
+                return np.ascontiguousarray(out)
+
+            return _cached_phys_table("grad_phys_union", field, token, _build)
+
+        tab = np.zeros((nE, nQ, n_union, 2), dtype=np.float64)
         for i in range(nE):
             eid = int(eids[i])
             for q in range(nQ):
-                if qref_mode is not None:
-                    mode, arr = qref_mode
-                    if mode == "per_element":
-                        xi, eta = arr[i, q]
-                    else:
-                        xi, eta = arr[q]
-                else:
-                    x, y = pts[i, q]
-                    xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
-                tab[i, q, :, :] = me.grad_basis(field, float(xi), float(eta))
+                x, y = pts[i, q]
+                xi, eta = transform.inverse_mapping(mesh, eid, np.array([x, y]))
+                tab[i, q, sl, :] = me._eval_scalar_grad(field, float(xi), float(eta))
         return np.ascontiguousarray(tab)
     def _decode_coeff_name(name: str):
         """
@@ -878,13 +1000,22 @@ def _build_jit_kernel_args(       # ← signature unchanged
                 n_union = gdofs_map.shape[1]             # ghost union length
                 out = np.zeros((nE, nQ, n_union), dtype=tab.dtype)
                 side_map_key = "pos_map" if side == "pos" else "neg_map"
-                owner2union = pre_built[side_map_key]    # shape (nE, L)
-                # vectorized over q
-                for e in range(nE):
-                    m = owner2union[e]                   # (L,)
-                    # keep only valid targets
-                    valid = (m >= 0) & (m < n_union)
-                    out[e, :, m[valid]] = tab[e, :, valid]
+                owner2union = np.asarray(pre_built[side_map_key], dtype=np.int32)    # shape (nE, L)
+                if owner2union.shape[0] != nE or owner2union.shape[1] != L:
+                    raise ValueError(
+                        f"Invalid {side_map_key} shape for ghost padding: got {owner2union.shape}, expected ({nE}, {L})."
+                    )
+
+                # Vectorized scatter: out[e,:, owner2union[e,i]] = tab[e,:, i]
+                e_idx = np.repeat(np.arange(nE, dtype=np.int32), L)
+                i_idx = np.tile(np.arange(L, dtype=np.int32), nE)
+                u_idx = owner2union.reshape(-1)
+                valid = (u_idx >= 0) & (u_idx < int(n_union))
+                if np.any(valid):
+                    e_v = e_idx[valid]
+                    i_v = i_idx[valid]
+                    u_v = u_idx[valid].astype(np.int32, copy=False)
+                    out[e_v, :, u_v] = tab[e_v, :, i_v]
                 return out
 
             # 1) If precompute already provided it, prefer that.

@@ -2982,44 +2982,43 @@ class CppCodeGen:
             ]
 
         # argument declaration ---------------------------------------------
-        arg_decls: list[str] = []
-        for name in param_order:
+        #
+        # IMPORTANT (performance + compile stability):
+        # Binding kernels with hundreds of typed parameters causes pybind11 to
+        # generate an enormous compile-time type descriptor string
+        # (argument_loader::arg_names), which can exceed compiler constexpr
+        # evaluation limits. For such kernels, switch to a variadic py::args
+        # signature and unpack at runtime.
+        MAX_CPP_SIG_ARGS = 96
+        use_args_sig = int(len(param_order)) > int(MAX_CPP_SIG_ARGS)
+
+        def _cpp_array_type(nm: str) -> str:
             if (
-                name == "gdofs_map"
-                or name in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}
-                or name.startswith(("pos_map", "neg_map"))
+                nm == "gdofs_map"
+                or nm in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}
+                or nm.startswith(("pos_map", "neg_map"))
             ):
-                arg_decls.append(
-                    "py::array_t<int32_t, py::array::c_style | py::array::forcecast> gdofs_map"
-                    if name == "gdofs_map"
-                    else f"py::array_t<int32_t, py::array::c_style | py::array::forcecast> {name}"
-                )
-            elif name in {
-                "qp_phys",
-                "qw",
-                "detJ",
-                "detJ_pos",
-                "detJ_neg",
-                "J_inv",
-                "J_inv_pos",
-                "J_inv_neg",
-                "normals",
-                "phis",
-            } or name.startswith(("pos_Hxi", "neg_Hxi")):
-                arg_decls.append(
-                    f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}"
-                )
-            elif name.startswith("domain_flag_"):
-                arg_decls.append(
-                    f"py::array_t<uint8_t, py::array::c_style | py::array::forcecast> {name}"
-                )
-            else:
-                arg_decls.append(
-                    f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}"
-                )
-        arg_sig = ",\n        ".join(arg_decls)
+                return "py::array_t<int32_t, py::array::c_style | py::array::forcecast>"
+            if nm.startswith("domain_flag_"):
+                return "py::array_t<uint8_t, py::array::c_style | py::array::forcecast>"
+            return "py::array_t<double, py::array::c_style | py::array::forcecast>"
+
+        arg_types: list[str] = [_cpp_array_type(nm) for nm in param_order]
+        arg_decls: list[str] = [f"{tp} {nm}" for tp, nm in zip(arg_types, param_order)]
+        arg_sig = "py::args args" if use_args_sig else ",\n        ".join(arg_decls)
         param_list = ", ".join([f'py::str("{p}")' for p in param_order])
         active_list = ", ".join([f'py::str("{f}")' for f in active_fields])
+
+        unpack_lines: list[str] = []
+        if use_args_sig:
+            unpack_lines.append(f"    if (args.size() != {int(len(param_order))}) {{")
+            unpack_lines.append(
+                f'        throw py::value_error("{kernel_name}: expected {int(len(param_order))} args.");'
+            )
+            unpack_lines.append("    }")
+            for i, (nm, tp) in enumerate(zip(param_order, arg_types)):
+                unpack_lines.append(f"    {tp} {nm} = args[{int(i)}].cast<{tp}>();")
+        unpack_block = "\n".join(unpack_lines)
 
         # views for arrays used frequently
         view_lines = [
@@ -3092,6 +3091,7 @@ class CppCodeGen:
 	static py::tuple {kernel_name}(
         {arg_sig}
     ) {{
+{unpack_block}
 {chr(10).join(view_lines)}
 {chr(10).join(prologue)}
 

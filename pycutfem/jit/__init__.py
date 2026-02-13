@@ -63,7 +63,8 @@ def _active_columns(me, active_fields: tuple[str, ...]) -> np.ndarray:
 
 def _compress_static_for_active(static: dict[str, Any],
                                 me,
-                                active_cols: np.ndarray) -> dict[str, Any]:
+                                active_cols: np.ndarray,
+                                compress_cache: dict | None = None) -> dict[str, Any]:
     """
     Reduce union-sized arrays/maps to the active DOF columns only.
     Keeps geometry untouched; only reshapes arrays that carry union dimensions
@@ -79,6 +80,9 @@ def _compress_static_for_active(static: dict[str, Any],
     col_map = -np.ones(full_n, dtype=np.int32)
     for i, old in enumerate(active_cols):
         col_map[int(old)] = int(i)
+    if compress_cache is None:
+        compress_cache = {}
+    active_key = tuple(np.asarray(active_cols, dtype=np.int32).tolist())
 
     def _remap_union(arr: np.ndarray) -> np.ndarray:
         # Prefer the *last* axis matching full_n to avoid slicing nQ when
@@ -135,7 +139,12 @@ def _compress_static_for_active(static: dict[str, Any],
             continue
         if isinstance(v, np.ndarray):
             if k.startswith(("pos_map", "neg_map")) and v.ndim == 2 and v.dtype.kind in {"i", "u"}:
-                compressed[k] = _remap_map(v)
+                ck = ("map", id(v), active_key)
+                hit = compress_cache.get(ck)
+                if hit is None:
+                    hit = _remap_map(v)
+                    compress_cache[ck] = hit
+                compressed[k] = hit
                 continue
             arr = v
             if (
@@ -145,7 +154,12 @@ def _compress_static_for_active(static: dict[str, Any],
                 and not k.startswith(("domain_bs_", "domain_flag_"))
                 and _is_union_key(k)
             ):
-                arr = _remap_union(arr)
+                ck = ("union", id(arr), active_key)
+                hit = compress_cache.get(ck)
+                if hit is None:
+                    hit = _remap_union(arr)
+                    compress_cache[ck] = hit
+                arr = hit
             compressed[k] = arr
         else:
             compressed[k] = v
@@ -790,7 +804,9 @@ def _phi_signature_from_static(static: dict[str, Any] | None) -> dict[int, float
     return sig
 
 def compile_multi(form, *, dof_handler, mixed_element,
-                  quad_order: int | None = None, backend: str = "jit"):
+                  quad_order: int | None = None, backend: str = "jit",
+                  compress_cache: dict | None = None,
+                  gdofs_cache: dict | None = None):
     """
     Compile every integral contained in *form* and return a list of
     _IntegralKernel objects. Supports plain volume, cut volume (level set
@@ -808,6 +824,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
     kernels : list[_IntegralKernel] = []
     fc = FormCompiler(dof_handler, quadrature_order=quad_order, backend=backend)
+    if compress_cache is None:
+        compress_cache = {}
+    if gdofs_cache is None:
+        gdofs_cache = {}
 
     def _append_kernel(kernel, integral):
         kernel.integral_id = id(integral)
@@ -827,6 +847,79 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
     mesh = mixed_element.mesh
     p_geo  = int(getattr(mesh, "poly_order", 1))
+
+    # ------------------------------------------------------------------
+    # Optional integral fusion (compile/setup speed)
+    # ------------------------------------------------------------------
+    # Many example forms are assembled as a long sum of simple integrals that
+    # share the same measure (dx/ds/dS metadata). Compiling/scattering each
+    # integral separately can dominate startup time for small problems.
+    #
+    # Fusion is disabled for functional (rank-0) integrals because callers
+    # may rely on per-integral `integral_id` bookkeeping to separate totals.
+    fuse = os.getenv("PYCUTFEM_FUSE_INTEGRALS", "1").lower() not in {"0", "false", "no"}
+
+    def _meta_sig(md: dict) -> tuple:
+        items = []
+        for k, v in sorted((md or {}).items(), key=lambda kv: str(kv[0])):
+            kk = str(k)
+            if isinstance(v, (int, float, str, bool, type(None))):
+                items.append((kk, v))
+            else:
+                items.append((kk, (type(v).__name__, int(id(v)))))
+        return tuple(items)
+
+    if fuse and len(integrals) > 1:
+        from pycutfem.ufl.expressions import Integral as _IntegralExpr
+
+        groups: dict[tuple, list] = {}
+        order: list[tuple] = []
+        for intg in integrals:
+            dom = intg.measure.domain_type
+            level_set = getattr(intg.measure, "level_set", None)
+            rank = _form_rank(intg.integrand)
+            if (
+                level_set is None
+                and rank > 0
+                and dom in {"volume", "interior_facet", "exterior_facet"}
+            ):
+                qdeg0 = int(fc._find_q_order(intg)) + 2 * max(0, p_geo - 1)
+                md0 = intg.measure.metadata or {}
+                key = (
+                    "fuse",
+                    str(dom),
+                    int(rank),
+                    bool(intg.measure.on_facet),
+                    int(qdeg0),
+                    int(id(getattr(intg.measure, "defined_on", None))),
+                    int(id(getattr(intg.measure, "deformation", None))),
+                    _meta_sig(md0),
+                )
+            else:
+                key = ("single", int(id(intg)))
+
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(intg)
+
+        fused_integrals: list = []
+        for key in order:
+            grp = groups[key]
+            if len(grp) == 1:
+                fused_integrals.append(grp[0])
+                continue
+            integrand_sum = grp[0].integrand
+            for other in grp[1:]:
+                integrand_sum = integrand_sum + other.integrand
+            fused = _IntegralExpr(integrand_sum, grp[0].measure)
+            try:
+                setattr(fused, "_fused_from", [int(id(x)) for x in grp])
+            except Exception:
+                pass
+            fused_integrals.append(fused)
+
+        integrals = fused_integrals
 
     def _ensure_mesh(ls_obj, *, need_interface_segments: bool = False) -> None:
         """
@@ -1150,10 +1243,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
                 sel = getattr(intg.measure, "defined_on", None)
                 allowed = _norm_eids(mesh, sel)
-                if allowed is None:
-                    element_ids = np.arange(mesh.n_elements, dtype=np.int32)
-                else:
-                    element_ids = np.asarray(allowed, dtype=np.int32)
+                element_ids = None if allowed is None else np.asarray(allowed, dtype=np.int32).ravel()
 
                 geom_all = dof_handler.precompute_geometric_factors(
                     qdeg,
@@ -1163,30 +1253,47 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     deformation=getattr(intg.measure, "deformation", None),
                 )
 
-                # Slice only per-element arrays; keep global tables as-is.
-                geom = {}
                 n_total = int(np.asarray(geom_all["qp_phys"]).shape[0])
-                for key, val in geom_all.items():
-                    if isinstance(val, np.ndarray) and val.ndim >= 1 and int(val.shape[0]) == n_total:
-                        geom[key] = val[element_ids]
-                    else:
-                        geom[key] = val
+                all_eids = np.asarray(
+                    geom_all.get("eids", np.arange(n_total, dtype=np.int32)), dtype=np.int32
+                ).ravel()
+                if element_ids is None:
+                    element_ids = all_eids
+                is_full = bool(element_ids.size == all_eids.size and np.array_equal(element_ids, all_eids))
 
-                geom["eids"] = element_ids
+                # Slice only when needed; avoid copying full-geometry arrays for every kernel.
+                if is_full:
+                    geom = dict(geom_all)
+                else:
+                    geom = {}
+                    for key, val in geom_all.items():
+                        if isinstance(val, np.ndarray) and val.ndim >= 1 and int(val.shape[0]) == n_total:
+                            geom[key] = val[element_ids]
+                        else:
+                            geom[key] = val
+                    geom["eids"] = element_ids
                 geom["is_interface"] = False
                 geom["is_ghost"] = False
 
-                if element_ids.size:
-                    gdofs_map = np.vstack(
-                        [
-                            np.asarray(dof_handler.get_elemental_dofs(int(e)), dtype=np.int32)[
-                                active_cols
-                            ]
-                            for e in element_ids
-                        ]
-                    ).astype(np.int32)
-                else:
+                # Fast-path: cached element -> stacked DOFs map, and reuse identical (eids, active_cols)
+                # blocks across integrals (cuts compile/static time drastically for large forms).
+                if element_ids.size == 0:
                     gdofs_map = np.zeros((0, int(active_cols.size)), dtype=np.int32)
+                else:
+                    ids_token: object
+                    if is_full:
+                        ids_token = ("all", int(all_eids.size))
+                    else:
+                        import hashlib
+                        eid_u8 = np.ascontiguousarray(element_ids, dtype=np.int32).view(np.uint8)
+                        ids_token = ("h", int(element_ids.size), hashlib.blake2b(eid_u8, digest_size=8).digest())
+                    cols_token = tuple(np.asarray(active_cols, dtype=np.int32).tolist())
+                    gkey = ("vol_gdofs", int(id(dof_handler)), ids_token, cols_token)
+                    gdofs_map = gdofs_cache.get(gkey)
+                    if gdofs_map is None:
+                        all_gdofs = dof_handler.get_elemental_dofs_map(dtype=np.int32, copy=False)
+                        gdofs_map = np.asarray(all_gdofs[element_ids][:, active_cols], dtype=np.int32)
+                        gdofs_cache[gkey] = gdofs_map
                 geom["gdofs_map"] = gdofs_map
 
                 static = {**geom, "gdofs_map": gdofs_map}
@@ -1201,9 +1308,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         gdofs_map=gdofs_map,
                         param_order=runner.param_order,
                         pre_built=geom,
+                        jit_param=getattr(runner, "_jit_param", None),
                     )
                 )
-                static = _compress_static_for_active(static, mixed_element, active_cols)
+                static = _compress_static_for_active(static, mixed_element, active_cols, compress_cache=compress_cache)
                 _append_kernel(
                     _IntegralKernel(
                         runner,
@@ -1424,7 +1532,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             pre_built=geom_full,
                         )
                     )
-                    static_full = _compress_static_for_active(static_full, _me, _active_cols)
+                    static_full = _compress_static_for_active(static_full, _me, _active_cols, compress_cache=compress_cache)
                     static_full["_full_fixed"] = True
                     return static_full
 
@@ -1560,7 +1668,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         pre_built=geom_full,
                     )
                 )
-                static_full = _compress_static_for_active(static_full, _me, _active_cols)
+                static_full = _compress_static_for_active(static_full, _me, _active_cols, compress_cache=compress_cache)
                 if full_ids.size:
                     _full_cache["ids"] = full_ids
                     _full_cache["static"] = static_full
@@ -1661,7 +1769,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         pre_built=static_cut,
                     )
                 )
-                static_cut = _compress_static_for_active(static_cut, _me, _active_cols)
+                static_cut = _compress_static_for_active(static_cut, _me, _active_cols, compress_cache=compress_cache)
                 return static_cut
 
             static_full = _full_static(level_set)
@@ -1827,7 +1935,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         pre_built=static,
                     )
                 )
-                static = _compress_static_for_active(static, _me, eff_cols)
+                static = _compress_static_for_active(static, _me, eff_cols, compress_cache=compress_cache)
                 static["eids"] = eids_arr
                 return static
 
@@ -1992,7 +2100,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     )
                 )
                 if not use_full_union:
-                    static = _compress_static_for_active(static, _me, eff_cols)
+                    static = _compress_static_for_active(static, _me, eff_cols, compress_cache=compress_cache)
                 return static
 
             static_ifc_edge = _aligned_interface_static(level_set)
@@ -2066,7 +2174,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 )
             )
             if not use_full_union:
-                static = _compress_static_for_active(static, me_kernel, eff_cols)
+                static = _compress_static_for_active(static, me_kernel, eff_cols, compress_cache=compress_cache)
 
             eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
             _append_kernel(
@@ -2204,7 +2312,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     )
                 )
                 if not use_full_union:
-                    static = _compress_static_for_active(static, _me, eff_cols)
+                    static = _compress_static_for_active(static, _me, eff_cols, compress_cache=compress_cache)
                 return static
 
             static = _ghost_static(level_set)
@@ -2330,7 +2438,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     )
                 )
                 if not use_full_union:
-                    static = _compress_static_for_active(static, _me, eff_cols)
+                    static = _compress_static_for_active(static, _me, eff_cols, compress_cache=compress_cache)
                 return static
 
             static = _facet_patch_static(level_set)
@@ -2406,7 +2514,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     )
                 )
                 if not use_full_union:
-                    static = _compress_static_for_active(static, mixed_element, eff_cols)
+                    static = _compress_static_for_active(static, mixed_element, eff_cols, compress_cache=compress_cache)
                 return static
 
             static = _interior_static()
@@ -2488,7 +2596,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     )
                 )
                 if not use_full_union:
-                    static = _compress_static_for_active(static, mixed_element, eff_cols)
+                    static = _compress_static_for_active(static, mixed_element, eff_cols, compress_cache=compress_cache)
                 return static
 
             static = _cut_interior_static(level_set)
@@ -2560,7 +2668,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     pre_built=static,
                 )
             )
-            static = _compress_static_for_active(static, mixed_element, eff_cols)
+            static = _compress_static_for_active(static, mixed_element, eff_cols, compress_cache=compress_cache)
             eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
             _append_kernel(
                 _IntegralKernel(

@@ -73,6 +73,15 @@ def _pc_print(tag: str, dt: float, **info) -> None:
         extra = "  " + " ".join(parts) if parts else ""
     print(f"[precompute] {tag}: {dt:.3f}s{extra}")
 
+def _use_numba_precompute() -> bool:
+    """
+    Whether to use Numba-accelerated kernels in precompute routines.
+
+    Default is off to avoid per-process JIT compilation overhead during small
+    runs and test suites. Enable with `PYCUTFEM_PRECOMPUTE_NUMBA=1`.
+    """
+    return os.getenv("PYCUTFEM_PRECOMPUTE_NUMBA", "").lower() in {"1", "true", "yes"}
+
 def _facet_patch_cache_max_entries() -> int:
     """
     Full facet-patch outputs can be very large (nE*nQ*n_union per field/deriv).
@@ -1051,6 +1060,73 @@ class DofHandler:
         for fld in self.field_names:
             parts.extend(self.element_maps[fld][element_id])
         return np.asarray(parts, dtype=int)
+
+    def get_elemental_dofs_map(self, *, dtype=np.int32, copy: bool = False) -> np.ndarray:
+        """
+        Return stacked global DOFs for **all** elements.
+
+        Shape: (n_elements, mixed_element.n_dofs_local)
+
+        This is a cached fast-path for building `gdofs_map` arrays during JIT
+        compilation and reduced-pattern construction. It avoids repeated Python
+        list concatenation in `get_elemental_dofs`.
+        """
+        if self.mixed_element is None:
+            raise RuntimeError("get_elemental_dofs_map requires a MixedElement‑backed DofHandler.")
+
+        # Guard int32 overflow for very large problems.
+        try:
+            if dtype == np.int32 and int(getattr(self, "total_dofs", 0) or 0) > np.iinfo(np.int32).max:
+                dtype = np.int64
+        except Exception:
+            pass
+
+        cache = getattr(self, "_elemental_dofs_map_cache", None)
+        mesh = self.mixed_element.mesh
+        n_el = int(getattr(mesh, "n_elements", len(getattr(mesh, "elements_list", []))))
+        n_loc = int(getattr(self.mixed_element, "n_dofs_local", 0))
+
+        if isinstance(cache, dict):
+            arr = cache.get("arr")
+            if (
+                isinstance(arr, np.ndarray)
+                and arr.dtype == np.dtype(dtype)
+                and arr.ndim == 2
+                and int(arr.shape[0]) == n_el
+                and int(arr.shape[1]) == n_loc
+            ):
+                return arr.copy() if copy else arr
+
+        out = np.empty((n_el, n_loc), dtype=dtype)
+        col0 = 0
+        for fld in self.field_names:
+            src = self.element_maps.get(fld)
+            if src is None:
+                raise KeyError(f"Missing element map for field {fld!r}.")
+
+            arr = np.asarray(src, dtype=dtype)
+            if arr.ndim != 2 or int(arr.shape[0]) != n_el or arr.dtype.kind == "O":
+                # Fallback for non-rectangular/slow paths.
+                try:
+                    n_f = len(src[0])
+                except Exception as exc:
+                    raise RuntimeError(f"Invalid element map for field {fld!r}.") from exc
+                tmp = np.empty((n_el, int(n_f)), dtype=dtype)
+                for e in range(n_el):
+                    tmp[e, :] = np.asarray(src[e], dtype=dtype).ravel()
+                arr = tmp
+
+            n_f = int(arr.shape[1])
+            out[:, col0 : col0 + n_f] = arr
+            col0 += n_f
+
+        if col0 != n_loc:
+            raise ValueError(
+                f"get_elemental_dofs_map: assembled width {col0} != expected n_dofs_local {n_loc}."
+            )
+
+        self._elemental_dofs_map_cache = {"arr": out}
+        return out.copy() if copy else out
 
     def get_reference_element(self, field: str | None = None):
         """Return the per‑field reference or the MixedElement itself."""
@@ -3047,12 +3123,15 @@ class DofHandler:
         _prof = _pc_enabled()
         _t0 = time.perf_counter() if _prof else 0.0
 
-        # Optional numba path
-        try:
-            import numba as _nb  # type: ignore
-            _HAVE_NUMBA = True
-        except Exception:
-            _HAVE_NUMBA = False
+        # Optional numba path (opt-in to avoid JIT overhead on small runs/tests)
+        _HAVE_NUMBA = False
+        _nb = None
+        if _use_numba_precompute():
+            try:
+                import numba as _nb  # type: ignore
+                _HAVE_NUMBA = True
+            except Exception:
+                _HAVE_NUMBA = False
 
         if self.mixed_element is None:
             raise RuntimeError("This method requires a MixedElement-backed DofHandler.")
@@ -3633,11 +3712,14 @@ class DofHandler:
         except Exception:
             _phi_eval = None
 
-        try:
-            import numba as _nb
-            _HAVE_NUMBA = True
-        except Exception:
-            _HAVE_NUMBA = False
+        _HAVE_NUMBA = False
+        _nb = None
+        if _use_numba_precompute():
+            try:
+                import numba as _nb
+                _HAVE_NUMBA = True
+            except Exception:
+                _HAVE_NUMBA = False
 
         _prof = _pc_enabled()
         _t0 = time.perf_counter() if _prof else 0.0
@@ -4489,11 +4571,14 @@ class DofHandler:
             _tabulate_q1 as _tab_q1, _tabulate_q2 as _tab_q2, _tabulate_p1 as _tab_p1,
         )
 
-        try:
-            import numba as _nb
-            _HAVE_NUMBA = True
-        except Exception:
-            _HAVE_NUMBA = False
+        _HAVE_NUMBA = False
+        _nb = None
+        if _use_numba_precompute():
+            try:
+                import numba as _nb
+                _HAVE_NUMBA = True
+            except Exception:
+                _HAVE_NUMBA = False
 
         _prof = _pc_enabled()
         _t0 = time.perf_counter() if _prof else 0.0
@@ -7134,6 +7219,10 @@ class DofHandler:
             _tabulate_deriv_q2,
             _tabulate_deriv_p1,
         )
+        from pycutfem.integration.quadrature import gauss_legendre, edge as edge_rule
+
+        _prof = _pc_enabled()
+        _t0 = time.perf_counter() if _prof else 0.0
 
         mesh = self.mixed_element.mesh
         me = self.mixed_element
@@ -7145,6 +7234,8 @@ class DofHandler:
             edge_ids = list(int(i) for i in edge_ids.to_indices())
         else:
             edge_ids = list(int(i) for i in edge_ids)
+        # Stable ordering improves cache hits and avoids order-dependent layout drift.
+        edge_ids = sorted(set(edge_ids))
 
         # Keep only interior edges
         edges = []
@@ -7157,7 +7248,16 @@ class DofHandler:
             return {"eids": np.empty(0, dtype=np.int32)}
 
         # Cache key
-        derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
+        # NOTE: `precompute_interior_factors` tabulates *all* derivatives of a given
+        # total order once any term requires that order (e.g. requesting (1,0)
+        # will also tabulate (0,1)). To maximize cache hits we key on which
+        # *orders* are required, not on the exact `(dx,dy)` subset.
+        derivs = set(tuple((int(dx), int(dy))) for (dx, dy) in derivs)
+        need_o1 = bool(any((dx + dy) == 1 for (dx, dy) in derivs) or need_hess)
+        need_o2 = bool(any((dx + dy) == 2 for (dx, dy) in derivs) or need_hess)
+        need_o3rq = bool(any((dx + dy) == 3 for (dx, dy) in derivs) or need_o3)
+        need_o4rq = bool(any((dx + dy) == 4 for (dx, dy) in derivs) or need_o4)
+        derivs_key = (need_o1, need_o2, need_o3rq, need_o4rq)
         side_key = str(side) if side in {"+", "-"} else ""
         ls_key = _ls_fingerprint(level_set) if level_set is not None else ("none",)
         cache_key = (
@@ -7208,56 +7308,226 @@ class DofHandler:
 
         qp_phys = None
         qw = None
-        for i, e in enumerate(edges):
-            p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
-            a0 = np.asarray(p0, float)
-            a1 = np.asarray(p1, float)
-            if use_cut:
-                a0_orig = a0.copy()
-                a1_orig = a1.copy()
-                eid_hint = int(e.left)
-                phi0 = _eval_phi_on_edge(eid_hint, a0)
-                phi1 = _eval_phi_on_edge(eid_hint, a1)
-                # Inclusive tests (phi=0 contributes a measure-zero endpoint only).
-                if side == "+":
-                    in0 = phi0 >= -SIDE.tol
-                    in1 = phi1 >= -SIDE.tol
-                else:
-                    in0 = phi0 <= SIDE.tol
-                    in1 = phi1 <= SIDE.tol
+        nQ = 0
 
-                if (not in0) and (not in1):
-                    # Empty: represent as a zero-length segment (all weights will be zero).
-                    a1 = a0
-                elif in0 and in1:
-                    pass
-                elif in0 != in1:
-                    denom = float(phi0 - phi1)
-                    if abs(denom) <= 1e-30:
-                        t = 0.5
+        # Fast path: straight interior facets (no level-set clipping, no deformation).
+        # Structured meshes often use poly_order=2 even though the geometry mapping is
+        # affine (nodes lie on a regular lattice). The slow inverse_mapping/jacobian
+        # loop dominates startup for small runs.
+        can_fast_geom = (
+            (not use_cut)
+            and deformation is None
+            and mesh.element_type in {"quad", "tri"}
+            and getattr(mesh, "corner_connectivity", None) is not None
+            and all(getattr(e, "lid", None) is not None and getattr(e, "right_lid", None) is not None for e in edges)
+            and all((not getattr(e, "all_nodes", ())) or (len(getattr(e, "all_nodes", ())) == int(getattr(mesh, "poly_order", 1)) + 1) for e in edges)
+        )
+
+        if can_fast_geom:
+            xi_1d, w_1d = gauss_legendre(int(qdeg))
+            xi_1d = np.asarray(xi_1d, dtype=float)
+            w_1d = np.asarray(w_1d, dtype=float)
+            nQ = int(xi_1d.shape[0])
+
+            # Physical quadrature points/weights on each edge via affine segment map.
+            n0 = np.fromiter((int(e.nodes[0]) for e in edges), dtype=np.int64)
+            n1 = np.fromiter((int(e.nodes[1]) for e in edges), dtype=np.int64)
+            P0 = np.asarray(mesh.nodes_x_y_pos[n0], dtype=float)  # (nE,2)
+            P1 = np.asarray(mesh.nodes_x_y_pos[n1], dtype=float)  # (nE,2)
+            mid = 0.5 * (P0 + P1)
+            half = 0.5 * (P1 - P0)
+            qp_phys = mid[:, None, :] + xi_1d[None, :, None] * half[:, None, :]
+            qw = w_1d[None, :] * np.linalg.norm(half, axis=1)[:, None]
+
+            # Normals oriented from neg -> pos (edge.normal is outward from left).
+            nvec = np.asarray([np.asarray(e.normal, dtype=float) for e in edges], dtype=float)  # (nE,2)
+            normals = np.empty((nE, nQ, 2), dtype=float)
+            normals[...] = nvec[:, None, :]
+
+            # Affine-geometry Jacobians per element (corner-based). Only valid for triangles and parallelogram quads
+            # whose higher-order geometry nodes are consistent with an affine map.
+            elem_ids = np.unique(np.concatenate([pos_ids, neg_ids]).astype(np.int32))
+            if mesh.element_type == "tri":
+                tri_nodes = np.asarray(mesh.corner_connectivity[elem_ids], dtype=np.int64)
+                tri_xy = np.asarray(mesh.nodes_x_y_pos[tri_nodes], dtype=float)  # (nEl,3,2)
+                v1 = tri_xy[:, 1, :] - tri_xy[:, 0, :]
+                v2 = tri_xy[:, 2, :] - tri_xy[:, 0, :]
+                J = np.stack([v1, v2], axis=-1)  # (nEl,2,2) columns
+                det = J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0]
+                det_abs = np.abs(det)
+                inv_det = 1.0 / det
+                Jinv = np.empty_like(J)
+                Jinv[:, 0, 0] = J[:, 1, 1] * inv_det
+                Jinv[:, 0, 1] = -J[:, 0, 1] * inv_det
+                Jinv[:, 1, 0] = -J[:, 1, 0] * inv_det
+                Jinv[:, 1, 1] = J[:, 0, 0] * inv_det
+                det_elem = np.zeros((mesh.n_elements,), dtype=float)
+                Jinv_elem = np.zeros((mesh.n_elements, 2, 2), dtype=float)
+                det_elem[elem_ids] = det_abs
+                Jinv_elem[elem_ids] = Jinv
+                affine_ok = True
+            else:
+                quad_nodes = np.asarray(mesh.corner_connectivity[elem_ids], dtype=np.int64)
+                quad_xy = np.asarray(mesh.nodes_x_y_pos[quad_nodes], dtype=float)  # (nEl,4,2) [bl,br,tr,tl]
+                par = quad_xy[:, 0, :] + quad_xy[:, 2, :] - quad_xy[:, 1, :] - quad_xy[:, 3, :]
+                # Tolerance relative to mesh scale (structured meshes are exact).
+                tol = 1e-12 * float(np.ptp(mesh.nodes_x_y_pos, axis=0).max() or 1.0)
+                affine_ok = bool(np.all(np.linalg.norm(par, axis=1) <= tol))
+                # For Q2/Qp meshes, also require the higher-order geometry nodes to agree with the affine map.
+                p_geo = int(getattr(mesh, "poly_order", 1) or 1)
+                if affine_ok and p_geo == 2:
+                    # Expect 9 nodes in lex order: (-1,-1),(0,-1),(1,-1),(-1,0),(0,0),(1,0),(-1,1),(0,1),(1,1)
+                    conn = np.asarray(mesh.elements_connectivity[elem_ids], dtype=np.int64)
+                    if conn.ndim != 2 or conn.shape[1] != 9:
+                        affine_ok = False
                     else:
-                        t = float(phi0 / denom)
-                    t = float(min(max(t, 0.0), 1.0))
-                    pc = a0_orig + t * (a1_orig - a0_orig)
-                    if in0 and (not in1):
-                        a1 = pc
-                    elif (not in0) and in1:
-                        a0 = pc
+                        xy = np.asarray(mesh.nodes_x_y_pos[conn], dtype=float)  # (nEl,9,2)
+                        # indices in the 9-node lattice
+                        bl, bm, br = 0, 1, 2
+                        lm, cc, rm = 3, 4, 5
+                        tl, tm, tr = 6, 7, 8
+                        ok = True
+                        ok &= np.all(np.linalg.norm(xy[:, bm] - 0.5 * (xy[:, bl] + xy[:, br]), axis=1) <= tol)
+                        ok &= np.all(np.linalg.norm(xy[:, tm] - 0.5 * (xy[:, tl] + xy[:, tr]), axis=1) <= tol)
+                        ok &= np.all(np.linalg.norm(xy[:, lm] - 0.5 * (xy[:, bl] + xy[:, tl]), axis=1) <= tol)
+                        ok &= np.all(np.linalg.norm(xy[:, rm] - 0.5 * (xy[:, br] + xy[:, tr]), axis=1) <= tol)
+                        ok &= np.all(np.linalg.norm(xy[:, cc] - 0.25 * (xy[:, bl] + xy[:, br] + xy[:, tr] + xy[:, tl]), axis=1) <= tol)
+                        affine_ok = bool(ok)
 
-            qpts, wts = line_quadrature(a0, a1, qdeg)
-            if qp_phys is None:
-                nQ = len(wts)
-                qp_phys = np.zeros((nE, nQ, 2), dtype=float)
-                qw = np.zeros((nE, nQ), dtype=float)
-            qp_phys[i, :, :] = qpts
-            qw[i, :] = wts
-        nQ = 0 if qp_phys is None else qp_phys.shape[1]
+                if affine_ok:
+                    dxi = 0.25 * (-quad_xy[:, 0, :] + quad_xy[:, 1, :] + quad_xy[:, 2, :] - quad_xy[:, 3, :])
+                    deta = 0.25 * (-quad_xy[:, 0, :] - quad_xy[:, 1, :] + quad_xy[:, 2, :] + quad_xy[:, 3, :])
+                    J = np.empty((dxi.shape[0], 2, 2), dtype=float)
+                    J[:, 0, 0] = dxi[:, 0]
+                    J[:, 1, 0] = dxi[:, 1]
+                    J[:, 0, 1] = deta[:, 0]
+                    J[:, 1, 1] = deta[:, 1]
+                    det = J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0]
+                    det_abs = np.abs(det)
+                    inv_det = 1.0 / det
+                    Jinv = np.empty_like(J)
+                    Jinv[:, 0, 0] = J[:, 1, 1] * inv_det
+                    Jinv[:, 0, 1] = -J[:, 0, 1] * inv_det
+                    Jinv[:, 1, 0] = -J[:, 1, 0] * inv_det
+                    Jinv[:, 1, 1] = J[:, 0, 0] * inv_det
+                    det_elem = np.zeros((mesh.n_elements,), dtype=float)
+                    Jinv_elem = np.zeros((mesh.n_elements, 2, 2), dtype=float)
+                    det_elem[elem_ids] = det_abs
+                    Jinv_elem[elem_ids] = Jinv
+            if affine_ok:
+                # Reference coordinates per side from local edge ids, aligned to the global edge direction.
+                lid_pos = np.fromiter((int(e.right_lid) for e in edges), dtype=np.int32)
+                lid_neg = np.fromiter((int(e.lid) for e in edges), dtype=np.int32)
 
-        # Normals oriented from neg -> pos (edge.normal is outward from left)
-        normals = np.zeros((nE, nQ, 2), dtype=float)
-        for i, e in enumerate(edges):
-            nvec = np.asarray(e.normal, dtype=float)
-            normals[i, :, :] = nvec
+                # Precompute reference edge points for each local edge id.
+                n_lids = len(mesh._EDGE_TABLE[mesh.element_type])
+                ref_pts = {}
+                for lid in range(n_lids):
+                    pts, _ = edge_rule(mesh.element_type, int(lid), int(qdeg))
+                    ref_pts[int(lid)] = np.asarray(pts, dtype=float)
+
+                xi_pos = np.empty((nE, nQ), dtype=float)
+                eta_pos = np.empty((nE, nQ), dtype=float)
+                xi_neg = np.empty((nE, nQ), dtype=float)
+                eta_neg = np.empty((nE, nQ), dtype=float)
+
+                for lid in range(n_lids):
+                    pts = ref_pts[int(lid)]
+                    mpos = lid_pos == int(lid)
+                    if np.any(mpos):
+                        xi_pos[mpos, :] = pts[None, :, 0]
+                        eta_pos[mpos, :] = pts[None, :, 1]
+                    mneg = lid_neg == int(lid)
+                    if np.any(mneg):
+                        xi_neg[mneg, :] = pts[None, :, 0]
+                        eta_neg[mneg, :] = pts[None, :, 1]
+
+                # Flip reference-point order when local edge orientation opposes the global (edge.nodes) direction.
+                edge_vec = P1 - P0  # (nE,2)
+                corners = np.asarray(mesh.corner_connectivity, dtype=np.int64)
+                edge_table = mesh._EDGE_TABLE[mesh.element_type]
+                a_idx = np.asarray([int(a) for (a, _) in edge_table], dtype=np.int32)
+                b_idx = np.asarray([int(b) for (_, b) in edge_table], dtype=np.int32)
+
+                pos_a = corners[pos_ids, a_idx[lid_pos]]
+                pos_b = corners[pos_ids, b_idx[lid_pos]]
+                pos_vec = np.asarray(mesh.nodes_x_y_pos[pos_b], float) - np.asarray(mesh.nodes_x_y_pos[pos_a], float)
+                flip_pos = (np.einsum("ij,ij->i", pos_vec, edge_vec) < 0.0)
+                if np.any(flip_pos):
+                    xi_pos[flip_pos, :] = xi_pos[flip_pos, ::-1]
+                    eta_pos[flip_pos, :] = eta_pos[flip_pos, ::-1]
+
+                neg_a = corners[neg_ids, a_idx[lid_neg]]
+                neg_b = corners[neg_ids, b_idx[lid_neg]]
+                neg_vec = np.asarray(mesh.nodes_x_y_pos[neg_b], float) - np.asarray(mesh.nodes_x_y_pos[neg_a], float)
+                flip_neg = (np.einsum("ij,ij->i", neg_vec, edge_vec) < 0.0)
+                if np.any(flip_neg):
+                    xi_neg[flip_neg, :] = xi_neg[flip_neg, ::-1]
+                    eta_neg[flip_neg, :] = eta_neg[flip_neg, ::-1]
+
+                # Per-edge, per-QP sided Jacobians from per-element constants.
+                detJ_pos = np.empty((nE, nQ), dtype=float)
+                detJ_neg = np.empty((nE, nQ), dtype=float)
+                J_inv_pos = np.empty((nE, nQ, 2, 2), dtype=float)
+                J_inv_neg = np.empty((nE, nQ, 2, 2), dtype=float)
+                detJ_pos[...] = det_elem[pos_ids][:, None]
+                detJ_neg[...] = det_elem[neg_ids][:, None]
+                J_inv_pos[...] = Jinv_elem[pos_ids][:, None, :, :]
+                J_inv_neg[...] = Jinv_elem[neg_ids][:, None, :, :]
+        if qp_phys is None:
+            # Robust fallback (supports cut skeleton and general curved mappings).
+            qp_phys = None
+            qw = None
+            for i, e in enumerate(edges):
+                p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
+                a0 = np.asarray(p0, float)
+                a1 = np.asarray(p1, float)
+                if use_cut:
+                    a0_orig = a0.copy()
+                    a1_orig = a1.copy()
+                    eid_hint = int(e.left)
+                    phi0 = _eval_phi_on_edge(eid_hint, a0)
+                    phi1 = _eval_phi_on_edge(eid_hint, a1)
+                    # Inclusive tests (phi=0 contributes a measure-zero endpoint only).
+                    if side == "+":
+                        in0 = phi0 >= -SIDE.tol
+                        in1 = phi1 >= -SIDE.tol
+                    else:
+                        in0 = phi0 <= SIDE.tol
+                        in1 = phi1 <= SIDE.tol
+
+                    if (not in0) and (not in1):
+                        # Empty: represent as a zero-length segment (all weights will be zero).
+                        a1 = a0
+                    elif in0 and in1:
+                        pass
+                    elif in0 != in1:
+                        denom = float(phi0 - phi1)
+                        if abs(denom) <= 1e-30:
+                            t = 0.5
+                        else:
+                            t = float(phi0 / denom)
+                        t = float(min(max(t, 0.0), 1.0))
+                        pc = a0_orig + t * (a1_orig - a0_orig)
+                        if in0 and (not in1):
+                            a1 = pc
+                        elif (not in0) and in1:
+                            a0 = pc
+
+                qpts, wts = line_quadrature(a0, a1, qdeg)
+                if qp_phys is None:
+                    nQ = len(wts)
+                    qp_phys = np.zeros((nE, nQ, 2), dtype=float)
+                    qw = np.zeros((nE, nQ), dtype=float)
+                qp_phys[i, :, :] = qpts
+                qw[i, :] = wts
+            nQ = 0 if qp_phys is None else qp_phys.shape[1]
+
+            # Normals oriented from neg -> pos (edge.normal is outward from left)
+            normals = np.zeros((nE, nQ, 2), dtype=float)
+            for i, e in enumerate(edges):
+                nvec = np.asarray(e.normal, dtype=float)
+                normals[i, :, :] = nvec
 
         # Union DOF maps
         union_lists = []
@@ -7357,34 +7627,36 @@ class DofHandler:
             masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
             masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
 
-        # Reference coordinates and Jacobians
-        xi_pos = np.zeros((nE, nQ), dtype=float)
-        eta_pos = np.zeros_like(xi_pos)
-        xi_neg = np.zeros_like(xi_pos)
-        eta_neg = np.zeros_like(xi_pos)
-        detJ_pos = np.zeros_like(xi_pos)
-        detJ_neg = np.zeros_like(xi_pos)
-        J_inv_pos = np.zeros((nE, nQ, 2, 2), dtype=float)
-        J_inv_neg = np.zeros((nE, nQ, 2, 2), dtype=float)
+        if qp_phys is not None:
+            # Reference coordinates and Jacobians (robust fallback)
+            if "xi_pos" not in locals():
+                xi_pos = np.zeros((nE, nQ), dtype=float)
+                eta_pos = np.zeros_like(xi_pos)
+                xi_neg = np.zeros_like(xi_pos)
+                eta_neg = np.zeros_like(xi_pos)
+                detJ_pos = np.zeros_like(xi_pos)
+                detJ_neg = np.zeros_like(xi_pos)
+                J_inv_pos = np.zeros((nE, nQ, 2, 2), dtype=float)
+                J_inv_neg = np.zeros((nE, nQ, 2, 2), dtype=float)
 
-        for i in range(nE):
-            pe = int(pos_ids[i])
-            ne = int(neg_ids[i])
-            for q in range(nQ):
-                xq = qp_phys[i, q]
-                xi_p, eta_p = transform.inverse_mapping(mesh, pe, np.asarray(xq, float))
-                xi_n, eta_n = transform.inverse_mapping(mesh, ne, np.asarray(xq, float))
-                xi_pos[i, q] = xi_p
-                eta_pos[i, q] = eta_p
-                xi_neg[i, q] = xi_n
-                eta_neg[i, q] = eta_n
+                for i in range(nE):
+                    pe = int(pos_ids[i])
+                    ne = int(neg_ids[i])
+                    for q in range(nQ):
+                        xq = qp_phys[i, q]
+                        xi_p, eta_p = transform.inverse_mapping(mesh, pe, np.asarray(xq, float))
+                        xi_n, eta_n = transform.inverse_mapping(mesh, ne, np.asarray(xq, float))
+                        xi_pos[i, q] = xi_p
+                        eta_pos[i, q] = eta_p
+                        xi_neg[i, q] = xi_n
+                        eta_neg[i, q] = eta_n
 
-                Jp = transform.jacobian(mesh, pe, (float(xi_p), float(eta_p)))
-                Jn = transform.jacobian(mesh, ne, (float(xi_n), float(eta_n)))
-                detJ_pos[i, q] = abs(float(np.linalg.det(Jp)))
-                detJ_neg[i, q] = abs(float(np.linalg.det(Jn)))
-                J_inv_pos[i, q] = np.linalg.inv(Jp)
-                J_inv_neg[i, q] = np.linalg.inv(Jn)
+                        Jp = transform.jacobian(mesh, pe, (float(xi_p), float(eta_p)))
+                        Jn = transform.jacobian(mesh, ne, (float(xi_n), float(eta_n)))
+                        detJ_pos[i, q] = abs(float(np.linalg.det(Jp)))
+                        detJ_neg[i, q] = abs(float(np.linalg.det(Jn)))
+                        J_inv_pos[i, q] = np.linalg.inv(Jp)
+                        J_inv_neg[i, q] = np.linalg.inv(Jn)
 
         # Optional deformation: move QPs, update Jacobians, and scale weights by ‖(I+∇u) τ̂‖.
         # (Only needed for value/grad terms; higher inverse-map jets are not supported here yet.)
@@ -7673,6 +7945,16 @@ class DofHandler:
 
         if reuse:
             _interior_cache[cache_key] = out
+        if _prof:
+            _pc_print(
+                "interior_factors",
+                time.perf_counter() - _t0,
+                nE=int(nE),
+                nQ=int(nQ),
+                q=int(qdeg),
+                cut=bool(use_cut),
+                deform=bool(deformation is not None),
+            )
         return out
 
 
@@ -7721,11 +8003,14 @@ class DofHandler:
         )
         
 
-        try:
-            import numba as _nb
-            _HAVE_NUMBA = True
-        except Exception:
-            _HAVE_NUMBA = False
+        _HAVE_NUMBA = False
+        _nb = None
+        if _use_numba_precompute():
+            try:
+                import numba as _nb
+                _HAVE_NUMBA = True
+            except Exception:
+                _HAVE_NUMBA = False
 
         # --- J from dN and coords (Numba kernel) -----------------------------------
         if _HAVE_NUMBA:

@@ -417,7 +417,11 @@ class NewtonSolver:
         self._jacobian_form = jacobian_form
 
         # --- compile one kernel list for K, one for F ----------------------
+        _profile_setup = os.getenv("PYCUTFEM_PROFILE_SETUP", "").lower() in {"1", "true", "yes"}
+        _t_setup0 = time.perf_counter() if _profile_setup else 0.0
         self._compile_all_kernels()
+        if _profile_setup:
+            print(f"[setup] compile kernels: {time.perf_counter() - _t_setup0:.3f}s")
         # --- NEW: A PRIORI DOF ANALYSIS ---
         # Analyze the forms once to get the definitive set of active DOFs.
         self.equation = Equation(jacobian_form, residual_form)
@@ -487,7 +491,10 @@ class NewtonSolver:
         print(f"NewtonSolver using backend '{self.backend}'.")
         print(f"NewtonSolver linear solver backend '{str(getattr(self.lp, 'backend', 'scipy') or 'scipy')}'.")
         # Build once: CSR structure & per-element scatter plan for reduced system
+        _t_pat0 = time.perf_counter() if _profile_setup else 0.0
         self._build_reduced_pattern()
+        if _profile_setup:
+            print(f"[setup] reduced pattern: {time.perf_counter() - _t_pat0:.3f}s")
 
         self.restrictor = _ActiveReducer(self.dh, self.active_dofs, constraint=self.constraints)
 
@@ -546,12 +553,16 @@ class NewtonSolver:
     def _compile_all_kernels(self) -> None:
         """(Re)compile residual and Jacobian kernels with current metadata."""
         if self._is_jit_backend():
+            _compress_cache: dict = {}
+            _gdofs_cache: dict = {}
             self.kernels_K = compile_multi(
                 self._jacobian_form,
                 dof_handler=self.dh,
                 mixed_element=self.me,
                 quad_order=self.quad_order,
                 backend=self.backend,
+                compress_cache=_compress_cache,
+                gdofs_cache=_gdofs_cache,
             )
 
             self.kernels_F = compile_multi(
@@ -560,6 +571,8 @@ class NewtonSolver:
                 mixed_element=self.me,
                 quad_order=self.quad_order,
                 backend=self.backend,
+                compress_cache=_compress_cache,
+                gdofs_cache=_gdofs_cache,
             )
             self._python_fc = None
         elif self.backend == "python":
@@ -2697,10 +2710,28 @@ class NewtonSolver:
             self._build_reduced_pattern_constraints()
             return
 
-        # 1) Collect column sets per reduced row
-        rows_cols = [set() for _ in range(n)]
+        _profile = os.getenv("PYCUTFEM_PROFILE_SETUP", "").lower() in {"1", "true", "yes"}
+        _t0 = time.perf_counter() if _profile else 0.0
+
+        # 1) Build reduced sparsity as COO pairs then compress to CSR.
+        #    This avoids Python set churn on every row update.
+        _t_pat0 = time.perf_counter() if _profile else 0.0
+        row_blocks: list[np.ndarray] = []
+        col_blocks: list[np.ndarray] = []
+        seen_gdofs_maps: set[int] = set()
+        if _profile:
+            try:
+                print(f"[setup] kernels_K: {int(len(self.kernels_K))}")
+            except Exception:
+                pass
         for ker in self.kernels_K:
-            gdofs = ker.static_args["gdofs_map"]
+            gdofs = ker.static_args.get("gdofs_map")
+            if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2:
+                continue
+            gid = int(id(gdofs))
+            if gid in seen_gdofs_maps:
+                continue
+            seen_gdofs_maps.add(gid)
             for e in range(gdofs.shape[0]):
                 full = gdofs[e]
                 valid_full = full >= 0
@@ -2710,19 +2741,27 @@ class NewtonSolver:
                 rows = rmap[rmap >= 0]
                 if rows.size == 0:
                     continue
-                cols_set = set(rows.tolist())
-                for r in rows:
-                    rows_cols[r].update(cols_set)
+                # Keep the element-local ordering (no unique) so downstream
+                # local-index plans match Kloc[np.ix_(lidx, lidx)].
+                row_blocks.append(np.repeat(rows, rows.size).astype(np.int32, copy=False))
+                col_blocks.append(np.tile(rows, rows.size).astype(np.int32, copy=False))
 
-        # 2) Build CSR (row-wise sorted for determinism)
-        indptr = np.zeros(n + 1, dtype=np.int32)
-        for i in range(n):
-            indptr[i + 1] = indptr[i] + len(rows_cols[i])
-        indices = np.empty(indptr[-1], dtype=np.int32)
-        for i in range(n):
-            cols = sorted(rows_cols[i])
-            indices[indptr[i] : indptr[i + 1]] = cols
+        if row_blocks:
+            row_all = np.concatenate(row_blocks)
+            col_all = np.concatenate(col_blocks)
+            pat = sp.coo_matrix(
+                (np.ones(row_all.shape[0], dtype=np.int8), (row_all, col_all)),
+                shape=(n, n),
+            ).tocsr()
+            pat.sort_indices()
+            indptr = np.asarray(pat.indptr, dtype=np.int32)
+            indices = np.asarray(pat.indices, dtype=np.int32)
+        else:
+            indptr = np.zeros(n + 1, dtype=np.int32)
+            indices = np.zeros(0, dtype=np.int32)
         self._csr_indptr, self._csr_indices = indptr, indices
+        if _profile:
+            print(f"[setup] pattern csr: {time.perf_counter() - _t_pat0:.3f}s  nnz={int(indices.size)} n={int(n)}")
 
         # PETSc matrix cache: sparsity can change when the interface moves and/or the
         # active DOF set is recomputed. The cached PETSc.Mat preallocation must be
@@ -2735,20 +2774,29 @@ class NewtonSolver:
         except Exception:
             pass
 
-        # 3) Map (row, col) → absolute position in CSR "data"
-        pos = {}
-        for i in range(n):
-            s, t = indptr[i], indptr[i + 1]
-            for k, c in enumerate(indices[s:t]):
-                pos[(i, c)] = s + k
-
-        # 4) Ragged per-element scatter plans (store 1-D position arrays + local idx)
+        # 3) Ragged per-element scatter plans (store 1-D position arrays + local idx).
+        #    Compute CSR data positions with row-wise searchsorted to avoid a large
+        #    Python dict of (row,col) -> idx.
+        _t_pl0 = time.perf_counter() if _profile else 0.0
         self._elem_pos = []   # per-kernel: list of 1-D arrays (len = n_act^2)
         self._elem_lidx = []  # per-kernel: list of local indices kept (len = n_act)
+        plan_cache: dict[int, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+        cache_hits = 0
         for ker in self.kernels_K:
-            gdofs = ker.static_args["gdofs_map"]
+            gdofs = ker.static_args.get("gdofs_map")
+            if isinstance(gdofs, np.ndarray) and gdofs.ndim == 2:
+                cached = plan_cache.get(int(id(gdofs)))
+                if cached is not None:
+                    self._elem_pos.append(cached[0])
+                    self._elem_lidx.append(cached[1])
+                    cache_hits += 1
+                    continue
             pos_list = []
             lidx_list = []
+            if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2:
+                self._elem_pos.append(pos_list)
+                self._elem_lidx.append(lidx_list)
+                continue
             for e in range(gdofs.shape[0]):
                 full = gdofs[e]
                 valid_full = full >= 0
@@ -2764,24 +2812,33 @@ class NewtonSolver:
                     pos_list.append(np.empty(0, dtype=np.int32))
                     lidx_list.append(np.empty(0, dtype=np.int32))
                     continue
-                # flattened positions, row-major order matching Ke[np.ix_(lidx,lidx)].ravel()
                 nact = rows.size
                 pflat = np.empty(nact * nact, dtype=np.int32)
                 t = 0
                 for a in range(nact):
                     ra = rows[a]
-                    for b in range(nact):
-                        cb = rows[b]
-                        pflat[t] = pos[(ra, cb)]
-                        t += 1
+                    s = int(indptr[ra])
+                    epos = int(indptr[ra + 1])
+                    row_cols = indices[s:epos]
+                    row_pos = s + np.searchsorted(row_cols, rows)
+                    pflat[t : t + nact] = row_pos
+                    t += nact
                 pos_list.append(pflat)
                 lidx_list.append(np.nonzero(mask)[0].astype(np.int32))
+            plan_cache[int(id(gdofs))] = (pos_list, lidx_list)
             self._elem_pos.append(pos_list)
             self._elem_lidx.append(lidx_list)
 
         # No constraint metadata in this mode.
         self._elem_extra = None
         self._pattern_stale = False
+        if _profile:
+            try:
+                print(f"[setup] unique gdofs_maps: {int(len(seen_gdofs_maps))}  plan cache hits: {int(cache_hits)}")
+            except Exception:
+                pass
+            print(f"[setup] scatter plans: {time.perf_counter() - _t_pl0:.3f}s")
+            print(f"[setup] build_reduced_pattern total: {time.perf_counter() - _t0:.3f}s")
 
 
     def _build_reduced_pattern_constraints(self) -> None:

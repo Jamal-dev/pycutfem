@@ -1447,17 +1447,15 @@ def main() -> None:
         a_pert = float(getattr(args, "a_perturb", 0.0) or 0.0)
         a_pert_k = int(getattr(args, "a_perturb_k", 1) or 1)
         Lb = max(1.0e-12, float(x2 - x1))
-
-        def a_init(x, y):
-            # Base value everywhere; optional perturbation localized to the biofilm x-range.
-            x = float(x)
-            mask = float(alpha0(x, 0.0))  # smooth mask for [x1,x2]
-            if a_pert != 0.0 and mask > 1.0e-12:
-                phase = 2.0 * np.pi * float(a_pert_k) * (x - float(x1)) / Lb
-                return float(np.clip(a0 * (1.0 - a_pert * mask * np.sin(phase)), 0.0, 1.0))
-            return float(np.clip(a0, 0.0, 1.0))
-
-        a_prev.set_values_from_function(a_init)
+        a_gdofs = np.asarray(dh.get_field_dofs_on_nodes("a"), dtype=int).ravel()
+        a_xy = np.asarray(dh.get_dof_coords("a"), dtype=float)
+        ax = a_xy[:, 0]
+        mask = np.asarray(alpha0_eval(ax, np.zeros_like(ax)), dtype=float).ravel()
+        a_vals = np.full_like(ax, fill_value=float(a0), dtype=float)
+        if a_pert != 0.0:
+            phase = 2.0 * np.pi * float(a_pert_k) * (ax - float(x1)) / Lb
+            a_vals = np.clip(a0 * (1.0 - a_pert * mask * np.sin(phase)), 0.0, 1.0)
+        a_prev.set_nodal_values(a_gdofs, np.asarray(a_vals, dtype=float).ravel())
 
     # ------------------------------------------------------------------
     # Optional restart: load solution snapshots from a prior run
