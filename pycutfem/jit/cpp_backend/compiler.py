@@ -8,11 +8,37 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
+def _fast_compile_enabled() -> bool:
+    fast_env = os.getenv("PYCUTFEM_CPP_FAST_COMPILE", "").strip().lower()
+    under_pytest = bool(os.getenv("PYTEST_CURRENT_TEST", ""))
+    return (fast_env in {"1", "true", "yes"}) or (under_pytest and fast_env not in {"0", "false", "no"})
+
+
+def get_compile_mode_tag() -> str:
+    """
+    Return a stable tag describing the compile mode for cache keying.
+
+    NOTE: The C++ cache key must include this tag to avoid reusing -O0 test
+    builds in normal runs (or vice versa).
+    """
+    return "fast" if _fast_compile_enabled() else "opt"
+
+
 def _default_compile_args() -> list[str]:
     """Baseline compiler flags for performant builds."""
-    args = ["-O3", "-std=c++17"]
-    # Prefer native tuning when available.
-    args.append("-march=native")
+    # NOTE: C++ kernel compilation dominates many small test cases and developer
+    # workflows. Allow opting into a fast (lower-optimization) build without
+    # changing runtime code paths.
+    #
+    # - `PYCUTFEM_CPP_FAST_COMPILE=1` forces `-O0` and disables `-march=native`
+    # - When running under pytest, default to fast compile to keep the suite
+    #   responsive (can be overridden by explicitly setting PYCUTFEM_CPP_FAST_COMPILE=0).
+    fast_compile = _fast_compile_enabled()
+
+    args = ["-O0" if fast_compile else "-O3", "-std=c++17"]
+    # Prefer native tuning when available (skip in fast-compile mode to reduce build time).
+    if not fast_compile:
+        args.append("-march=native")
     # Enable OpenMP if the toolchain supports it.
     args.append("-fopenmp")
     return args

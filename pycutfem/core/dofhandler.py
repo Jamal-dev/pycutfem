@@ -235,7 +235,7 @@ def _def_fingerprint(defm):
 
 
 # ---- utilities ---------------------------------------------------------------
-def _scatter_union(loc_arr: np.ndarray, sl: slice, final_width: int) -> np.ndarray:
+def _scatter_union(loc_arr: np.ndarray, sl: slice | np.ndarray, final_width: int) -> np.ndarray:
     """
     Scatter a per-field local array into the union-local layout.
 
@@ -7206,6 +7206,7 @@ class DofHandler:
         deformation: Any = None,
         level_set: Any = None,
         side: str | None = None,
+        active_cols=None,
     ) -> dict:
         """
         Pre-compute geometry & basis tables for interior-facet (ds) integrals.
@@ -7228,6 +7229,55 @@ class DofHandler:
         me = self.mixed_element
         fields = me.field_names
         n_loc = me.n_dofs_per_elem
+
+        # Optional: restrict precompute to the active DOF columns only. This avoids
+        # generating (and later slicing) large union-sized tables for inactive fields.
+        cols_full = None
+        col_map = None
+        n_loc_out = int(n_loc)
+        if active_cols is not None:
+            cols_full = np.asarray(active_cols, dtype=np.int32).ravel()
+            if cols_full.size == 0:
+                raise ValueError("precompute_interior_factors: active_cols is empty.")
+            if int(cols_full.min()) < 0 or int(cols_full.max()) >= int(n_loc):
+                raise ValueError(
+                    f"precompute_interior_factors: active_cols out of range [0,{int(n_loc)}) "
+                    f"(min={int(cols_full.min())}, max={int(cols_full.max())})."
+                )
+            if int(np.unique(cols_full).size) != int(cols_full.size):
+                raise ValueError("precompute_interior_factors: active_cols contains duplicates.")
+
+            n_loc_out = int(cols_full.size)
+            col_map = -np.ones(int(n_loc), dtype=np.int32)
+            col_map[cols_full] = np.arange(n_loc_out, dtype=np.int32)
+
+            active_fields: list[str] = []
+            for fld in list(fields):
+                sl = me.component_dof_slices[fld]
+                if np.any((cols_full >= int(sl.start)) & (cols_full < int(sl.stop))):
+                    active_fields.append(fld)
+            fields = active_fields
+
+            def _field_new_slice(field: str):
+                sl_full = me.component_dof_slices[field]
+                new_idx = col_map[int(sl_full.start) : int(sl_full.stop)]
+                if new_idx.size == 0:
+                    return slice(0, 0)
+                if np.any(new_idx < 0):
+                    raise ValueError(
+                        f"precompute_interior_factors: active_cols dropped DOFs required for field {field!r} "
+                        f"(slice={sl_full}, n_loc={int(n_loc)}, active_n={int(n_loc_out)})."
+                    )
+                start = int(new_idx[0])
+                if np.array_equal(new_idx, np.arange(start, start + int(new_idx.size), dtype=np.int32)):
+                    return slice(start, start + int(new_idx.size))
+                return new_idx
+        else:
+            cols_full = None
+            n_loc_out = int(n_loc)
+
+            def _field_new_slice(field: str):
+                return me.component_dof_slices[field]
 
         # Normalize edge ids
         if hasattr(edge_ids, "to_indices"):
@@ -7260,6 +7310,7 @@ class DofHandler:
         derivs_key = (need_o1, need_o2, need_o3rq, need_o4rq)
         side_key = str(side) if side in {"+", "-"} else ""
         ls_key = _ls_fingerprint(level_set) if level_set is not None else ("none",)
+        cols_key = None if cols_full is None else tuple(int(c) for c in cols_full.tolist())
         cache_key = (
             tuple(int(e.gid) for e in edges),
             int(qdeg),
@@ -7274,6 +7325,7 @@ class DofHandler:
             side_key,
             ls_key,
             _coords_fingerprint(mesh.nodes_x_y_pos),
+            cols_key,
         )
         if reuse and cache_key in _interior_cache:
             return _interior_cache[cache_key]
@@ -7530,28 +7582,51 @@ class DofHandler:
                 normals[i, :, :] = nvec
 
         # Union DOF maps
-        union_lists = []
-        max_union = 0
-        for i in range(nE):
-            pos_dofs = self.get_elemental_dofs(int(pos_ids[i]))
-            neg_dofs = self.get_elemental_dofs(int(neg_ids[i]))
-            union = np.unique(np.concatenate([pos_dofs, neg_dofs]))
-            union_lists.append(union)
-            max_union = max(max_union, union.size)
+        all_gdofs = self.get_elemental_dofs_map(dtype=np.int64, copy=False)
+        pos_dofs_all = np.asarray(all_gdofs[pos_ids], dtype=np.int64)
+        neg_dofs_all = np.asarray(all_gdofs[neg_ids], dtype=np.int64)
+        if cols_full is not None:
+            pos_dofs_all = pos_dofs_all[:, cols_full]
+            neg_dofs_all = neg_dofs_all[:, cols_full]
 
-        n_union = max_union
+        # Build per-edge union DOF map and side maps efficiently.
+        #
+        # Previous code used a Python loop with `np.unique(np.concatenate(...))`
+        # per edge, which is expensive for structured meshes with thousands of
+        # facets. Here we vectorize:
+        #   - sort the concatenated DOFs row-wise,
+        #   - compute unique masks and per-entry union indices,
+        #   - scatter union indices back to the original (pos/neg) DOF ordering.
+        both = np.concatenate([pos_dofs_all, neg_dofs_all], axis=1)  # (nE, 2*n_loc_out)
+        sort_idx = np.argsort(both, axis=1)
+        both_sorted = np.take_along_axis(both, sort_idx, axis=1)
+        uniq_mask = np.ones_like(both_sorted, dtype=bool)
+        if both_sorted.shape[1] > 1:
+            uniq_mask[:, 1:] = both_sorted[:, 1:] != both_sorted[:, :-1]
+        uniq_counts = np.asarray(uniq_mask.sum(axis=1), dtype=np.int32)
+        n_union = int(uniq_counts.max())
+
+        # union index for every entry in the sorted list (duplicates share the same index)
+        union_pos = (np.cumsum(uniq_mask, axis=1) - 1).astype(np.int32, copy=False)
+
+        # Scatter union indices back to the original `both` order.
+        inv = np.empty_like(sort_idx, dtype=np.int32)
+        rr = np.arange(nE, dtype=np.int32)[:, None]
+        inv[rr, sort_idx] = union_pos
+        pos_map = inv[:, : int(n_loc_out)]
+        neg_map = inv[:, int(n_loc_out) :]
+
+        # Fill `gdofs_map` with sorted unique union DOFs per edge, padded by the
+        # last union entry (keeps downstream gather code fast and deterministic).
+        row_offsets = np.concatenate([[0], np.cumsum(uniq_counts, dtype=np.int64)])
+        uniq_vals_flat = both_sorted[uniq_mask]
+        pad_vals = uniq_vals_flat[row_offsets[1:] - 1]
         gdofs_map = np.empty((nE, n_union), dtype=np.int64)
-        pos_map = -np.ones((nE, n_loc), dtype=np.int32)
-        neg_map = -np.ones((nE, n_loc), dtype=np.int32)
-        for i in range(nE):
-            union = union_lists[i]
-            pad_val = union[-1]
-            gdofs_map[i, :] = pad_val
-            gdofs_map[i, : union.size] = union
-            pos_dofs = self.get_elemental_dofs(int(pos_ids[i]))
-            neg_dofs = self.get_elemental_dofs(int(neg_ids[i]))
-            pos_map[i, : len(pos_dofs)] = _searchsorted_positions(union, pos_dofs)
-            neg_map[i, : len(neg_dofs)] = _searchsorted_positions(union, neg_dofs)
+        gdofs_map[:] = pad_vals[:, None]
+        ridx = np.repeat(np.arange(nE, dtype=np.int32), uniq_counts)
+        start_rep = np.repeat(row_offsets[:-1], uniq_counts)
+        cidx = (np.arange(int(row_offsets[-1]), dtype=np.int64) - start_rep).astype(np.int32, copy=False)
+        gdofs_map[ridx, cidx] = uniq_vals_flat
 
         # Per-field union maps
         maps_by_field: Dict[str, np.ndarray] = {}
@@ -7579,21 +7654,20 @@ class DofHandler:
         else:
             field_side_hint = {fld: None for fld in fields}
         for fld in fields:
-            nloc_f = len(self.element_maps[fld][int(pos_ids[0])])
-            pm = np.empty((nE, nloc_f), dtype=np.int32)
-            nm = np.empty((nE, nloc_f), dtype=np.int32)
+            # `pos_map`/`neg_map` already map mixed-element local DOFs to the
+            # edge-union layout. Extract the field-local subset by slicing.
+            idx = _field_new_slice(fld)
+            pm = np.asarray(pos_map[:, idx], dtype=np.int32)
+            nm = np.asarray(neg_map[:, idx], dtype=np.int32)
+            maps_by_field[f"pos_map_{fld}"] = pm
+            maps_by_field[f"neg_map_{fld}"] = nm
+
             pos_mask = np.ones((nE, n_union), dtype=float)
             neg_mask = np.ones((nE, n_union), dtype=float)
-            for i in range(nE):
-                union = union_lists[i]
-                col_of = {int(d): j for j, d in enumerate(union)}
-                pos_loc = self.element_maps[fld][int(pos_ids[i])]
-                neg_loc = self.element_maps[fld][int(neg_ids[i])]
-                pm[i, :] = [col_of[int(d)] for d in pos_loc]
-                nm[i, :] = [col_of[int(d)] for d in neg_loc]
-                if level_set is not None:
-                    side_hint = field_side_hint.get(fld)
-                    if side_hint in ("pos", "neg"):
+            if level_set is not None:
+                side_hint = field_side_hint.get(fld)
+                if side_hint in ("pos", "neg"):
+                    for i in range(nE):
                         pos_eid = int(pos_ids[i])
                         neg_eid = int(neg_ids[i])
                         pos_masks_elem, neg_masks_elem = _elem_masks(pos_eid)
@@ -7622,8 +7696,6 @@ class DofHandler:
                             ok = (cols >= 0) & (cols < n_union)
                             if np.any(ok):
                                 neg_mask[i, cols[ok]] = np.asarray(mask_neg_local, dtype=float)[ok]
-            maps_by_field[f"pos_map_{fld}"] = pm
-            maps_by_field[f"neg_map_{fld}"] = nm
             masks_by_field[f"restrict_mask_{fld}_pos"] = pos_mask
             masks_by_field[f"restrict_mask_{fld}_neg"] = neg_mask
 
@@ -7811,8 +7883,9 @@ class DofHandler:
 
         for fld in fields:
             p_f = me._field_orders[fld]
-            sl = me.component_dof_slices[fld]
-            n_f = sl.stop - sl.start
+            sl_full = me.component_dof_slices[fld]
+            n_f = int(sl_full.stop) - int(sl_full.start)
+            sl = _field_new_slice(fld)
 
             def _tab(dx, dy, xi, eta, out_arr):
                 if mesh.element_type == "quad" and p_f == 1:
@@ -7832,76 +7905,76 @@ class DofHandler:
             # POS side
             arr = np.empty((nE, nQ, n_f))
             _tab(0, 0, xi_pos, eta_pos, arr)
-            basis_tables[f"r00_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+            basis_tables[f"r00_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
             if need_grad:
                 arr = np.empty((nE, nQ, n_f)); _tab(1, 0, xi_pos, eta_pos, arr)
-                basis_tables[f"r10_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r10_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 1, xi_pos, eta_pos, arr)
-                basis_tables[f"r01_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r01_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
             if need_h2:
                 arr = np.empty((nE, nQ, n_f)); _tab(2, 0, xi_pos, eta_pos, arr)
-                basis_tables[f"r20_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r20_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(1, 1, xi_pos, eta_pos, arr)
-                basis_tables[f"r11_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r11_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 2, xi_pos, eta_pos, arr)
-                basis_tables[f"r02_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r02_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
             if need_o3rq:
                 arr = np.empty((nE, nQ, n_f)); _tab(3, 0, xi_pos, eta_pos, arr)
-                basis_tables[f"r30_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r30_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(2, 1, xi_pos, eta_pos, arr)
-                basis_tables[f"r21_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r21_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(1, 2, xi_pos, eta_pos, arr)
-                basis_tables[f"r12_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r12_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 3, xi_pos, eta_pos, arr)
-                basis_tables[f"r03_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r03_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
             if need_o4rq:
                 arr = np.empty((nE, nQ, n_f)); _tab(4, 0, xi_pos, eta_pos, arr)
-                basis_tables[f"r40_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r40_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(3, 1, xi_pos, eta_pos, arr)
-                basis_tables[f"r31_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r31_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(2, 2, xi_pos, eta_pos, arr)
-                basis_tables[f"r22_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r22_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(1, 3, xi_pos, eta_pos, arr)
-                basis_tables[f"r13_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r13_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 4, xi_pos, eta_pos, arr)
-                basis_tables[f"r04_{fld}_pos"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r04_{fld}_pos"] = _scatter_union(arr, sl, int(n_loc_out))
 
             # NEG side
             arr = np.empty((nE, nQ, n_f))
             _tab(0, 0, xi_neg, eta_neg, arr)
-            basis_tables[f"r00_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+            basis_tables[f"r00_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
             if need_grad:
                 arr = np.empty((nE, nQ, n_f)); _tab(1, 0, xi_neg, eta_neg, arr)
-                basis_tables[f"r10_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r10_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 1, xi_neg, eta_neg, arr)
-                basis_tables[f"r01_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r01_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
             if need_h2:
                 arr = np.empty((nE, nQ, n_f)); _tab(2, 0, xi_neg, eta_neg, arr)
-                basis_tables[f"r20_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r20_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(1, 1, xi_neg, eta_neg, arr)
-                basis_tables[f"r11_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r11_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 2, xi_neg, eta_neg, arr)
-                basis_tables[f"r02_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r02_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
             if need_o3rq:
                 arr = np.empty((nE, nQ, n_f)); _tab(3, 0, xi_neg, eta_neg, arr)
-                basis_tables[f"r30_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r30_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(2, 1, xi_neg, eta_neg, arr)
-                basis_tables[f"r21_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r21_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(1, 2, xi_neg, eta_neg, arr)
-                basis_tables[f"r12_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r12_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 3, xi_neg, eta_neg, arr)
-                basis_tables[f"r03_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r03_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
             if need_o4rq:
                 arr = np.empty((nE, nQ, n_f)); _tab(4, 0, xi_neg, eta_neg, arr)
-                basis_tables[f"r40_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r40_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(3, 1, xi_neg, eta_neg, arr)
-                basis_tables[f"r31_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r31_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(2, 2, xi_neg, eta_neg, arr)
-                basis_tables[f"r22_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r22_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(1, 3, xi_neg, eta_neg, arr)
-                basis_tables[f"r13_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r13_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
                 arr = np.empty((nE, nQ, n_f)); _tab(0, 4, xi_neg, eta_neg, arr)
-                basis_tables[f"r04_{fld}_neg"] = _scatter_union(arr, sl, final_w)
+                basis_tables[f"r04_{fld}_neg"] = _scatter_union(arr, sl, int(n_loc_out))
 
         out = {
             "eids": np.asarray([e.gid for e in edges], dtype=np.int32),
@@ -7971,6 +8044,7 @@ class DofHandler:
         need_hess: bool = False,
         need_o3: bool = False,
         need_o4: bool = False,
+        active_cols=None,
     ) -> dict:
         """
         Pre-compute geometry & basis tables for ∫_Γ ⋯ dS on *boundary* edges.
@@ -8039,9 +8113,57 @@ class DofHandler:
                 return detJ, Jinv
 
         mesh = self.mixed_element.mesh
-        me   = self.mixed_element
-        fields = me.field_names
-        n_loc = me.n_dofs_per_elem  # union-local width
+        me = self.mixed_element
+        fields = list(me.field_names)
+        n_loc = int(me.n_dofs_per_elem)  # union-local width (MixedElement local layout)
+
+        # Optional: restrict precompute to the active DOF columns only. This avoids
+        # generating (and later slicing) large union-sized tables for inactive fields.
+        cols_full = None
+        col_map = None
+        n_loc_out = n_loc
+        if active_cols is not None:
+            cols_full = np.asarray(active_cols, dtype=np.int32).ravel()
+            if cols_full.size:
+                if int(cols_full.min()) < 0 or int(cols_full.max()) >= n_loc:
+                    raise ValueError(
+                        f"precompute_boundary_factors: active_cols out of range [0,{n_loc}) "
+                        f"(min={int(cols_full.min())}, max={int(cols_full.max())})."
+                    )
+                if int(np.unique(cols_full).size) != int(cols_full.size):
+                    raise ValueError("precompute_boundary_factors: active_cols contains duplicates.")
+            n_loc_out = int(cols_full.size)
+            col_map = -np.ones(n_loc, dtype=np.int32)
+            if cols_full.size:
+                col_map[cols_full] = np.arange(n_loc_out, dtype=np.int32)
+
+            active_fields: list[str] = []
+            for fld in fields:
+                sl = me.component_dof_slices[fld]
+                if cols_full.size and np.any((cols_full >= int(sl.start)) & (cols_full < int(sl.stop))):
+                    active_fields.append(fld)
+            fields = active_fields
+
+            def _field_new_slice(field: str):
+                sl_full = me.component_dof_slices[field]
+                new_idx = col_map[int(sl_full.start) : int(sl_full.stop)]
+                if new_idx.size == 0:
+                    return slice(0, 0)
+                if np.any(new_idx < 0):
+                    raise ValueError(
+                        f"precompute_boundary_factors: active_cols dropped DOFs required for field {field!r} "
+                        f"(slice={sl_full}, n_loc={n_loc}, active_n={n_loc_out})."
+                    )
+                start = int(new_idx[0])
+                if np.array_equal(new_idx, np.arange(start, start + int(new_idx.size), dtype=np.int32)):
+                    return slice(start, start + int(new_idx.size))
+                return new_idx
+        else:
+            cols_full = None
+            n_loc_out = n_loc
+
+            def _field_new_slice(field: str):
+                return me.component_dof_slices[field]
 
         # ---- normalize & filter to boundary edges (right is None) ------------------
         if hasattr(edge_ids, "to_indices"):                  # BitSet
@@ -8062,8 +8184,18 @@ class DofHandler:
         except NameError:
             _edge_geom_cache = {}
         derivs_key = tuple(sorted((int(dx), int(dy)) for (dx, dy) in derivs))
-        cache_key  = (tuple(edge_ids.tolist()), int(qdeg),
-                    me.signature(), derivs_key, getattr(self, "_method_token", self.method), bool(need_hess), bool(need_o3), bool(need_o4))
+        cols_key = None if cols_full is None else tuple(cols_full.tolist())
+        cache_key = (
+            tuple(edge_ids.tolist()),
+            int(qdeg),
+            me.signature(),
+            derivs_key,
+            getattr(self, "_method_token", self.method),
+            bool(need_hess),
+            bool(need_o3),
+            bool(need_o4),
+            cols_key,
+        )
         if reuse and cache_key in _edge_geom_cache:
             return _edge_geom_cache[cache_key]
 
@@ -8074,7 +8206,7 @@ class DofHandler:
         detJ     = None
         J_inv    = None
         phis     = None  # boundary integral has no level-set
-        gdofs_map = np.zeros((n_edges, n_loc), dtype=np.int64)
+        gdofs_map = np.zeros((n_edges, n_loc_out), dtype=np.int64)
         h_arr     = np.zeros((n_edges,), dtype=float)
 
         # derivative tables (union-sized, *reference*!)
@@ -8101,7 +8233,11 @@ class DofHandler:
                 local_edge_idx[i] = elem.local_edge_index(int(gid))
             except ValueError:
                 raise RuntimeError(f"Edge {gid} not found in element {eid}")
-            gdofs_map[i, :]  = self.get_elemental_dofs(eid)
+            dofs_full = np.asarray(self.get_elemental_dofs(eid), dtype=np.int64)
+            if cols_full is None:
+                gdofs_map[i, :] = dofs_full
+            else:
+                gdofs_map[i, :] = dofs_full[cols_full]
             h = mesh.element_char_length(eid)
             if h is None:
                 p0, p1 = mesh.nodes_x_y_pos[list(e.nodes)]
@@ -8192,12 +8328,12 @@ class DofHandler:
                     J_inv[e, q, 1, 1] =  a00 * invd
 
         # ---- basis & first derivatives (union-sized, boundary quadrature) ---------
-        b_tabs = {f: np.zeros((n_edges, n_q, n_loc), dtype=float) for f in fields}
-        g_tabs = {f: np.zeros((n_edges, n_q, n_loc, 2), dtype=float) for f in fields}
+        b_tabs = {f: np.zeros((n_edges, n_q, n_loc_out), dtype=float) for f in fields}
+        g_tabs = {f: np.zeros((n_edges, n_q, n_loc_out, 2), dtype=float) for f in fields}
         xi_flat  = xi_tab.reshape(-1)
         eta_flat = eta_tab.reshape(-1)
         for fld in fields:
-            sl = self.mixed_element.component_dof_slices[fld]
+            sl = _field_new_slice(fld)
             B = me._eval_scalar_basis_many(fld, xi_flat, eta_flat).reshape(n_edges, n_q, -1)
             G = me._eval_scalar_grad_many (fld, xi_flat, eta_flat).reshape(n_edges, n_q, -1, 2)
             b_tabs[fld][:, :, sl]    = B
@@ -8242,9 +8378,12 @@ class DofHandler:
         if max_req >= 4: base |= {(4,0), (3,1), (2,2), (1,3), (0,4)}
         derivs |= base
         for fld in fields:
-            sl  = self.mixed_element.component_dof_slices[fld]
+            sl = _field_new_slice(fld)
             p_f = self.mixed_element._field_orders[fld]
-            n_f = sl.stop - sl.start
+            if isinstance(sl, slice):
+                n_f = int(sl.stop) - int(sl.start)
+            else:
+                n_f = int(np.asarray(sl).size)
 
             def _tab(dx, dy, out_arr):
                 if _HAVE_NUMBA and mesh.element_type == "quad" and p_f == 1:
@@ -8264,20 +8403,22 @@ class DofHandler:
                 loc = np.empty((n_edges, n_q, n_f), dtype=float)
                 _tab(dx, dy, loc)
                 dkey = f"d{dx}{dy}_{fld}"
-                basis_tabs[dkey] = _scatter_union(loc, sl, n_loc)
+                tab = np.zeros((n_edges, n_q, n_loc_out), dtype=float)
+                tab[:, :, sl] = loc
+                basis_tabs[dkey] = tab
                 # Facet kernels use sided reference tables rXY_<field>_{pos|neg}.
                 # For boundary edges there is only one physical side; provide both
                 # aliases so kernels compiled with side-aware code paths work.
                 rkey_pos = f"r{dx}{dy}_{fld}_pos"
                 rkey_neg = f"r{dx}{dy}_{fld}_neg"
-                basis_tabs[rkey_pos] = basis_tabs[dkey]
-                basis_tabs[rkey_neg] = basis_tabs[dkey]
+                basis_tabs[rkey_pos] = tab
+                basis_tabs[rkey_neg] = tab
 
         # ---- pack & cache ----------------------------------------------------------
         # Boundary edges have only one adjacent element. Facet kernels still use the
         # sided coefficient convention (u_*__pos_loc) when on_facet=True, so provide
         # identity side maps that select the owner element's union DOFs.
-        pos_map = np.broadcast_to(np.arange(n_loc, dtype=np.int32), (n_edges, n_loc)).copy()
+        pos_map = np.broadcast_to(np.arange(n_loc_out, dtype=np.int32), (n_edges, n_loc_out)).copy()
         neg_map = -np.ones_like(pos_map, dtype=np.int32)
         out = {
             "eids":        np.asarray(edge_ids, dtype=np.int32),

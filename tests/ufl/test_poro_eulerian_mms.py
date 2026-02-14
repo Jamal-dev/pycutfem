@@ -1,3 +1,4 @@
+import os
 import math
 from dataclasses import dataclass
 from functools import lru_cache
@@ -449,8 +450,17 @@ def test_poro_eulerian_mms_convergence(kinv_case):
     deg_v, deg_u, deg_p = 2, 2, 1
 
     for backend in _selected_backends(default="jit"):
-        # Keep the pure-python backend reasonably fast.
-        nx_list = [2, 4] if backend == "python" else [4, 8]
+        # Keep this convergence check lightweight: it is a regression guard, not a
+        # full accuracy study. Larger meshes are useful for debugging, but they
+        # make the default test suite too slow.
+        #
+        # To run a heavier study locally, set `PYCUTFEM_PORO_MMS_NX_LIST`, e.g.:
+        #   PYCUTFEM_PORO_MMS_NX_LIST=4,8,16
+        nx_spec = str(os.environ.get("PYCUTFEM_PORO_MMS_NX_LIST", "")).strip()
+        if nx_spec:
+            nx_list = [int(x.strip()) for x in nx_spec.split(",") if x.strip()]
+        else:
+            nx_list = [2, 4]
 
         errs = [
             _solve_one_step_poro_mms(

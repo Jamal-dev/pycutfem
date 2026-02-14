@@ -19,6 +19,7 @@ import hashlib
 import time
 import os
 import math
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Callable, Optional, Tuple
 import inspect
@@ -56,6 +57,106 @@ else:
     PETSc = None
     HAS_PETSC = False
 import sys
+
+_HAVE_NUMBA_REDUCED_PATTERN = False
+try:
+    from numba import njit  # type: ignore
+
+    _HAVE_NUMBA_REDUCED_PATTERN = True
+except Exception:  # pragma: no cover - optional dependency
+    njit = None  # type: ignore[assignment]
+
+
+if _HAVE_NUMBA_REDUCED_PATTERN:
+    @njit(cache=True)
+    def _csr_find_pos(indices: np.ndarray, start: int, end: int, target: int) -> int:
+        lo = start
+        hi = end
+        while lo < hi:
+            mid = (lo + hi) // 2
+            v = int(indices[mid])
+            if v < target:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < end and int(indices[lo]) == target:
+            return lo
+        return -1
+
+    @njit(cache=True)
+    def _build_pos_flat_numba(red: np.ndarray, indptr: np.ndarray, indices: np.ndarray) -> np.ndarray:
+        n_ent = int(red.shape[0])
+        n_loc = int(red.shape[1])
+        out = -np.ones((n_ent, n_loc * n_loc), dtype=np.int32)
+        for e in range(n_ent):
+            for i in range(n_loc):
+                ra = int(red[e, i])
+                if ra < 0:
+                    continue
+                s = int(indptr[ra])
+                epos = int(indptr[ra + 1])
+                base = i * n_loc
+                for j in range(n_loc):
+                    c = int(red[e, j])
+                    if c < 0:
+                        continue
+                    out[e, base + j] = _csr_find_pos(indices, s, epos, c)
+        return out
+
+# ---------------------------------------------------------------------------
+# Numba reduced-pattern precompile (hide first-call JIT latency)
+# ---------------------------------------------------------------------------
+_NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT: threading.Event | None = None
+_NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR: Exception | None = None
+_NUMBA_REDUCED_PATTERN_PRECOMPILE_LOCK = threading.Lock()
+
+
+def _start_numba_reduced_pattern_precompile() -> None:
+    """
+    Trigger compilation of the reduced-pattern numba kernels in a background
+    thread so the first solver startup does not pay the full JIT cost.
+    """
+    global _NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT, _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR
+    if not _HAVE_NUMBA_REDUCED_PATTERN:
+        return
+    if os.getenv("PYCUTFEM_NUMBA_PRECOMPILE_REDUCED_PATTERN", "1").lower() in {"0", "false", "no"}:
+        return
+    with _NUMBA_REDUCED_PATTERN_PRECOMPILE_LOCK:
+        if _NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT is not None:
+            return
+        ev = threading.Event()
+        _NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT = ev
+
+        def _worker() -> None:
+            global _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR
+            try:
+                red = np.zeros((1, 1), dtype=np.int32)
+                indptr = np.zeros((2,), dtype=np.int32)
+                indices = np.zeros((0,), dtype=np.int32)
+                _build_pos_flat_numba(red, indptr, indices)
+            except Exception as exc:  # pragma: no cover - best effort
+                _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR = exc
+            finally:
+                ev.set()
+
+        t = threading.Thread(
+            target=_worker,
+            name="pycutfem-numba-precompile-reduced-pattern",
+            daemon=True,
+        )
+        t.start()
+
+
+def _wait_numba_reduced_pattern_precompile() -> None:
+    global _NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT, _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR
+    ev = _NUMBA_REDUCED_PATTERN_PRECOMPILE_EVENT
+    if ev is None:
+        return
+    ev.wait()
+    if _NUMBA_REDUCED_PATTERN_PRECOMPILE_ERROR is not None:
+        # Disable the numba fast-path for this process; fall back to the pure-numpy plan.
+        global _HAVE_NUMBA_REDUCED_PATTERN
+        _HAVE_NUMBA_REDUCED_PATTERN = False
 
 def _scatter_element_contribs(
     *,
@@ -419,9 +520,17 @@ class NewtonSolver:
         # --- compile one kernel list for K, one for F ----------------------
         _profile_setup = os.getenv("PYCUTFEM_PROFILE_SETUP", "").lower() in {"1", "true", "yes"}
         _t_setup0 = time.perf_counter() if _profile_setup else 0.0
-        self._compile_all_kernels()
+        parallel_compile = os.getenv("PYCUTFEM_PARALLEL_COMPILE", "1").lower() not in {"0", "false", "no"}
+        _start_numba_reduced_pattern_precompile()
+        # Overlap residual-kernel compilation with active-DOF analysis + reduced-pattern
+        # building. This cuts time-to-first-Newton on small problems.
+        self._compile_all_kernels(parallel_residual=parallel_compile)
         if _profile_setup:
-            print(f"[setup] compile kernels: {time.perf_counter() - _t_setup0:.3f}s")
+            dt = time.perf_counter() - _t_setup0
+            if getattr(self, "_kernels_F_future", None) is not None:
+                print(f"[setup] compile kernels (jacobian): {dt:.3f}s  (residual compiling in background)")
+            else:
+                print(f"[setup] compile kernels: {dt:.3f}s")
         # --- NEW: A PRIORI DOF ANALYSIS ---
         # Analyze the forms once to get the definitive set of active DOFs.
         self.equation = Equation(jacobian_form, residual_form)
@@ -496,6 +605,16 @@ class NewtonSolver:
         if _profile_setup:
             print(f"[setup] reduced pattern: {time.perf_counter() - _t_pat0:.3f}s")
 
+        # Residual kernels may still be compiling in the background when
+        # `PYCUTFEM_PARALLEL_COMPILE=1`. Synchronize before leaving __init__
+        # so failures surface early and no background threads linger.
+        _t_wait0 = time.perf_counter() if _profile_setup else 0.0
+        self._finish_residual_kernel_compilation()
+        if _profile_setup:
+            dt_wait = time.perf_counter() - _t_wait0
+            # Only print if we actually waited a noticeable amount.
+            if dt_wait >= 1.0e-3:
+                print(f"[setup] compile kernels (residual wait): {dt_wait:.3f}s")
         self.restrictor = _ActiveReducer(self.dh, self.active_dofs, constraint=self.constraints)
 
 
@@ -550,8 +669,10 @@ class NewtonSolver:
 
 
 
-    def _compile_all_kernels(self) -> None:
+    def _compile_all_kernels(self, *, parallel_residual: bool = False) -> None:
         """(Re)compile residual and Jacobian kernels with current metadata."""
+        # Ensure no async compilation is left dangling from a previous call.
+        self._finish_residual_kernel_compilation()
         if self._is_jit_backend():
             _compress_cache: dict = {}
             _gdofs_cache: dict = {}
@@ -565,15 +686,31 @@ class NewtonSolver:
                 gdofs_cache=_gdofs_cache,
             )
 
-            self.kernels_F = compile_multi(
-                self._residual_form,
-                dof_handler=self.dh,
-                mixed_element=self.me,
-                quad_order=self.quad_order,
-                backend=self.backend,
-                compress_cache=_compress_cache,
-                gdofs_cache=_gdofs_cache,
-            )
+            if parallel_residual:
+                from concurrent.futures import ThreadPoolExecutor
+
+                self.kernels_F = []
+                self._kernels_F_executor = ThreadPoolExecutor(max_workers=1)
+                self._kernels_F_future = self._kernels_F_executor.submit(
+                    compile_multi,
+                    self._residual_form,
+                    dof_handler=self.dh,
+                    mixed_element=self.me,
+                    quad_order=self.quad_order,
+                    backend=self.backend,
+                    compress_cache=_compress_cache,
+                    gdofs_cache=_gdofs_cache,
+                )
+            else:
+                self.kernels_F = compile_multi(
+                    self._residual_form,
+                    dof_handler=self.dh,
+                    mixed_element=self.me,
+                    quad_order=self.quad_order,
+                    backend=self.backend,
+                    compress_cache=_compress_cache,
+                    gdofs_cache=_gdofs_cache,
+                )
             self._python_fc = None
         elif self.backend == "python":
             # Python backend: defer to the pure-Python FormCompiler at assembly time.
@@ -594,6 +731,21 @@ class NewtonSolver:
         for attr in ("_csr_indptr", "_csr_indices", "_elem_pos", "_elem_lidx"):
             if hasattr(self, attr):
                 delattr(self, attr)
+
+    def _finish_residual_kernel_compilation(self) -> None:
+        fut = getattr(self, "_kernels_F_future", None)
+        if fut is None:
+            return
+        ex = getattr(self, "_kernels_F_executor", None)
+        try:
+            self.kernels_F = fut.result()
+        finally:
+            try:
+                if ex is not None:
+                    ex.shutdown(wait=True)
+            finally:
+                self._kernels_F_future = None
+                self._kernels_F_executor = None
 
     def refresh_levelset_kernels(self, level_set):
         """
@@ -2714,11 +2866,16 @@ class NewtonSolver:
         _t0 = time.perf_counter() if _profile else 0.0
 
         # 1) Build reduced sparsity as COO pairs then compress to CSR.
-        #    This avoids Python set churn on every row update.
+        #    Use an incidence-matrix approach to avoid O(n_elem * n_loc^2) COO expansion:
+        #      - Build sparse B with B[e, i] = 1 if reduced DOF i is present in entity e
+        #      - Pattern is then (B.T @ B) > 0 (boolean adjacency)
+        #    This keeps startup fast even when each entity contributes a dense local block.
         _t_pat0 = time.perf_counter() if _profile else 0.0
-        row_blocks: list[np.ndarray] = []
-        col_blocks: list[np.ndarray] = []
+        ent_row_blocks: list[np.ndarray] = []
+        ent_col_blocks: list[np.ndarray] = []
+        ent_rows = 0
         seen_gdofs_maps: set[int] = set()
+        ndof_full = int(getattr(self.full_to_red, "size", 0))
         if _profile:
             try:
                 print(f"[setup] kernels_K: {int(len(self.kernels_K))}")
@@ -2732,27 +2889,45 @@ class NewtonSolver:
             if gid in seen_gdofs_maps:
                 continue
             seen_gdofs_maps.add(gid)
-            for e in range(gdofs.shape[0]):
-                full = gdofs[e]
-                valid_full = full >= 0
-                if not np.any(valid_full):
-                    continue
-                rmap = self.full_to_red[full[valid_full]]
-                rows = rmap[rmap >= 0]
-                if rows.size == 0:
-                    continue
-                # Keep the element-local ordering (no unique) so downstream
-                # local-index plans match Kloc[np.ix_(lidx, lidx)].
-                row_blocks.append(np.repeat(rows, rows.size).astype(np.int32, copy=False))
-                col_blocks.append(np.tile(rows, rows.size).astype(np.int32, copy=False))
+            full = np.asarray(gdofs, dtype=np.int64)
+            if full.size == 0:
+                continue
+            valid = (full >= 0) & (full < ndof_full)
+            if not np.any(valid):
+                continue
+            red = -np.ones_like(full, dtype=np.int32)
+            red[valid] = self.full_to_red[full[valid]]
+            mask = red >= 0
+            if not np.any(mask):
+                continue
+            cnt = np.asarray(mask.sum(axis=1), dtype=np.int32)
+            nonempty = np.nonzero(cnt)[0]
+            if nonempty.size == 0:
+                continue
+            # Flatten reduced DOF indices in row-major order over the selected entity rows.
+            cols = red[nonempty][mask[nonempty]].astype(np.int32, copy=False)
+            # Row indices aligned with the boolean flattening above.
+            rows = np.repeat(
+                np.arange(ent_rows, ent_rows + int(nonempty.size), dtype=np.int32),
+                cnt[nonempty],
+            ).astype(np.int32, copy=False)
+            ent_row_blocks.append(rows)
+            ent_col_blocks.append(cols)
+            ent_rows += int(nonempty.size)
 
-        if row_blocks:
-            row_all = np.concatenate(row_blocks)
-            col_all = np.concatenate(col_blocks)
-            pat = sp.coo_matrix(
+        if ent_row_blocks:
+            row_all = np.concatenate(ent_row_blocks)
+            col_all = np.concatenate(ent_col_blocks)
+            B = sp.coo_matrix(
                 (np.ones(row_all.shape[0], dtype=np.int8), (row_all, col_all)),
-                shape=(n, n),
+                shape=(int(ent_rows), int(n)),
             ).tocsr()
+            pat = (B.T @ B).tocsr()
+            # pattern only – drop counts
+            try:
+                pat.data[:] = 1
+            except Exception:
+                pat.data = np.ones_like(pat.data, dtype=np.int8)
             pat.sort_indices()
             indptr = np.asarray(pat.indptr, dtype=np.int32)
             indices = np.asarray(pat.indices, dtype=np.int32)
@@ -2774,13 +2949,30 @@ class NewtonSolver:
         except Exception:
             pass
 
+        # CSR positions as a sparse matrix (data = position index).
+        #
+        # NOTE: SciPy CSR fancy indexing can dominate startup for medium-sized
+        # problems (it allocates many temporary submatrices). Default to a
+        # row-wise `searchsorted` path which is usually faster end-to-end for
+        # CutFEM-style kernels. The old sparse-indexing path can be re-enabled
+        # via `PYCUTFEM_PATTERN_POS_CSR=1` for comparison/regressions.
+        pos_csr = None
+        use_pos_csr = os.getenv("PYCUTFEM_PATTERN_POS_CSR", "").lower() in {"1", "true", "yes"}
+        if use_pos_csr:
+            try:
+                if indices.size:
+                    pos_data = np.arange(int(indices.size), dtype=np.int32)
+                    pos_csr = sp.csr_matrix((pos_data, indices, indptr), shape=(int(n), int(n)))
+            except Exception:
+                pos_csr = None
+
         # 3) Ragged per-element scatter plans (store 1-D position arrays + local idx).
         #    Compute CSR data positions with row-wise searchsorted to avoid a large
         #    Python dict of (row,col) -> idx.
         _t_pl0 = time.perf_counter() if _profile else 0.0
         self._elem_pos = []   # per-kernel: list of 1-D arrays (len = n_act^2)
         self._elem_lidx = []  # per-kernel: list of local indices kept (len = n_act)
-        plan_cache: dict[int, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+        plan_cache: dict[int, tuple[object, object]] = {}
         cache_hits = 0
         for ker in self.kernels_K:
             gdofs = ker.static_args.get("gdofs_map")
@@ -2791,43 +2983,59 @@ class NewtonSolver:
                     self._elem_lidx.append(cached[1])
                     cache_hits += 1
                     continue
-            pos_list = []
-            lidx_list = []
             if not isinstance(gdofs, np.ndarray) or gdofs.ndim != 2:
-                self._elem_pos.append(pos_list)
-                self._elem_lidx.append(lidx_list)
+                self._elem_pos.append([])
+                self._elem_lidx.append([])
                 continue
-            for e in range(gdofs.shape[0]):
-                full = gdofs[e]
-                valid_full = full >= 0
-                if not np.any(valid_full):
-                    pos_list.append(np.empty(0, dtype=np.int32))
-                    lidx_list.append(np.empty(0, dtype=np.int32))
-                    continue
-                rmap = -np.ones_like(full, dtype=int)
-                rmap[valid_full] = self.full_to_red[full[valid_full]]
-                mask = rmap >= 0
-                rows = rmap[mask]
-                if rows.size == 0:
-                    pos_list.append(np.empty(0, dtype=np.int32))
-                    lidx_list.append(np.empty(0, dtype=np.int32))
-                    continue
-                nact = rows.size
-                pflat = np.empty(nact * nact, dtype=np.int32)
-                t = 0
-                for a in range(nact):
-                    ra = rows[a]
-                    s = int(indptr[ra])
-                    epos = int(indptr[ra + 1])
-                    row_cols = indices[s:epos]
-                    row_pos = s + np.searchsorted(row_cols, rows)
-                    pflat[t : t + nact] = row_pos
-                    t += nact
-                pos_list.append(pflat)
-                lidx_list.append(np.nonzero(mask)[0].astype(np.int32))
-            plan_cache[int(id(gdofs))] = (pos_list, lidx_list)
-            self._elem_pos.append(pos_list)
-            self._elem_lidx.append(lidx_list)
+
+            full = np.asarray(gdofs, dtype=np.int64)
+            n_ent, n_loc = int(full.shape[0]), int(full.shape[1])
+            if n_ent == 0:
+                pos_flat = np.empty((0, int(n_loc * n_loc)), dtype=np.int32)
+                plan_cache[int(id(gdofs))] = (pos_flat, None)
+                self._elem_pos.append(pos_flat)
+                self._elem_lidx.append(None)
+                continue
+
+            # Map full -> reduced once for the entire entity batch.
+            red = -np.ones_like(full, dtype=np.int32)
+            valid = (full >= 0) & (full < ndof_full)
+            if np.any(valid):
+                red[valid] = self.full_to_red[full[valid]]
+
+            # Dense per-entity position plan:
+            # - shape (n_ent, n_loc*n_loc)
+            # - local ordering matches `Kloc[e].ravel()` for the kernel.
+            # - inactive row/col pairs are marked with -1 and skipped at scatter time.
+            if _HAVE_NUMBA_REDUCED_PATTERN:
+                _wait_numba_reduced_pattern_precompile()
+                pos_flat = _build_pos_flat_numba(red, indptr, indices)
+            else:
+                pos_flat = -np.ones((n_ent, int(n_loc * n_loc)), dtype=np.int32)
+                for e in range(n_ent):
+                    row_red = red[e]
+                    col_mask = row_red >= 0
+                    if not np.any(col_mask):
+                        continue
+                    cols_act = row_red[col_mask].astype(np.int32, copy=False)
+                    all_cols_active = bool(np.all(col_mask))
+                    for i in range(n_loc):
+                        ra = int(row_red[i])
+                        if ra < 0:
+                            continue
+                        s = int(indptr[ra])
+                        epos = int(indptr[ra + 1])
+                        row_cols = indices[s:epos]
+                        row_pos = s + np.searchsorted(row_cols, cols_act)
+                        seg = pos_flat[e, int(i * n_loc) : int((i + 1) * n_loc)]
+                        if all_cols_active:
+                            seg[:] = row_pos
+                        else:
+                            seg[col_mask] = row_pos
+
+            plan_cache[int(id(gdofs))] = (pos_flat, None)
+            self._elem_pos.append(pos_flat)
+            self._elem_lidx.append(None)
 
         # No constraint metadata in this mode.
         self._elem_extra = None
@@ -3097,6 +3305,9 @@ class NewtonSolver:
         if getattr(self, "_pattern_stale", True):
             self._build_reduced_pattern()
 
+        # Residual kernels may be compiling asynchronously (parallel setup).
+        self._finish_residual_kernel_compilation()
+
         indptr, indices = self._csr_indptr, self._csr_indices
         n = indptr.size - 1
         data = np.zeros(indices.size, dtype=float)
@@ -3158,11 +3369,24 @@ class NewtonSolver:
                 debug_seen.add(id(ker))
             t_scatter = time.perf_counter()
             if extra_list is None:
-                for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
-                    if pflat.size == 0:
-                        continue
-                    Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
-                    data[pflat] += Kel
+                if isinstance(pos_list, np.ndarray):
+                    # Dense per-entity plan: pos_list[e] has length n_loc*n_loc and
+                    # matches Kloc[e].ravel(); entries are -1 for inactive pairs.
+                    Kflat = np.asarray(Kloc, dtype=float).reshape(int(Kloc.shape[0]), -1)
+                    for e in range(int(pos_list.shape[0])):
+                        pflat = np.asarray(pos_list[e], dtype=np.int32)
+                        if pflat.size == 0:
+                            continue
+                        m = pflat >= 0
+                        if not np.any(m):
+                            continue
+                        data[pflat[m]] += Kflat[e, m]
+                else:
+                    for e, (pflat, lidx) in enumerate(zip(pos_list, lidx_list)):
+                        if pflat.size == 0:
+                            continue
+                        Kel = Kloc[e][np.ix_(lidx, lidx)].ravel()
+                        data[pflat] += Kel
             else:
                 # Constraint-aware scatter for entities with hanging-node slaves.
                 for e, (pflat, lidx, meta) in enumerate(zip(pos_list, lidx_list, extra_list)):

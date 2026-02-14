@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from pycutfem.jit.cache import KernelCache
-from .compiler import compile_extension
+from .compiler import compile_extension, get_compile_mode_tag
 
 # Bump when generated C++ changes in a way that requires recompilation of cached kernels.
-CODEGEN_ABI_CPP = "2026-02-13-cpp-pyargs-wrapper-v11"
+# Bump when generated C++ changes or when helper semantics change in a way that
+# requires recompilation of cached kernels (e.g. stride-aware accessors).
+CODEGEN_ABI_CPP = "2026-02-14-cpp-v18-hdiv-facet-jinv"
 
 
 class CppKernelCache:
@@ -59,11 +61,13 @@ class CppKernelCache:
         (kernel_fn, param_order list, active_fields list).
         """
         ir_hash = KernelCache._hash_ir(ir_sequence, mesh_sig)
+        compile_tag = get_compile_mode_tag()
+        cache_key = f"{ir_hash}:{compile_tag}"
 
-        if ir_hash in self.in_memory_cache:
-            return self.in_memory_cache[ir_hash]
+        if cache_key in self.in_memory_cache:
+            return self.in_memory_cache[cache_key]
 
-        module_name = f"_pycutfem_cpp_kernel_{ir_hash}"
+        module_name = f"_pycutfem_cpp_kernel_{ir_hash}_{compile_tag}"
         source_file = self._cache_dir / f"{module_name}.cpp"
         built_module = self._cache_dir / f"{module_name}{self._ext_suffix}"
 
@@ -125,7 +129,7 @@ class CppKernelCache:
         )
 
         kernel_fn = getattr(module, codegen.kernel_export_name("kernel"))
-        self.in_memory_cache[ir_hash] = (kernel_fn, param_order, active_fields)
+        self.in_memory_cache[cache_key] = (kernel_fn, param_order, active_fields)
         return kernel_fn, param_order, active_fields
 
     # ------------------------------------------------------------------

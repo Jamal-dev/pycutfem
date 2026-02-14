@@ -1223,8 +1223,25 @@ inline double load_variable_component(const py::detail::unchecked_reference<doub
     if (n <= 0) return 0.0;
     const double* cptr = coeffs.data(e, s0);
     const double* bptr = basis.data(e, q, s0);
-    Eigen::Map<const Eigen::VectorXd> cvec(cptr, n);
-    Eigen::Map<const Eigen::VectorXd> bvec(bptr, n);
+
+    // Numpy tables may be non-contiguous (e.g. views/transposes used to avoid
+    // large copies during setup). Respect the actual axis strides by deriving
+    // a runtime inner stride from adjacent pointers.
+    ptrdiff_t cstride = 1;
+    ptrdiff_t bstride = 1;
+    if (n > 1) {
+        const double* cptr1 = coeffs.data(e, s0 + 1);
+        const double* bptr1 = basis.data(e, q, s0 + 1);
+        cstride = cptr1 - cptr;
+        bstride = bptr1 - bptr;
+        if (cstride == 0) cstride = 1;
+        if (bstride == 0) bstride = 1;
+    }
+
+    Eigen::Map<const Eigen::VectorXd, 0, Eigen::InnerStride<>> cvec(
+        cptr, n, Eigen::InnerStride<>(cstride));
+    Eigen::Map<const Eigen::VectorXd, 0, Eigen::InnerStride<>> bvec(
+        bptr, n, Eigen::InnerStride<>(bstride));
     return cvec.dot(bvec);
 }
 
@@ -1242,10 +1259,27 @@ inline void gradient_component(Eigen::MatrixXd& out, int row,
     }
 
     const double* cptr = coeffs.data(e, s0);
-    const double* gptr0 = gref.data(e, q, s0, 0);  // interleaved (..,0),(..,1)
-    Eigen::Map<const Eigen::VectorXd> cvec(cptr, n);
-    Eigen::Map<const Eigen::VectorXd, 0, Eigen::InnerStride<2>> g0(gptr0, n);
-    Eigen::Map<const Eigen::VectorXd, 0, Eigen::InnerStride<2>> g1(gptr0 + 1, n);
+    const double* gptr0 = gref.data(e, q, s0, 0);
+    const double* gptr1 = gref.data(e, q, s0, 1);
+
+    // Derive runtime strides to support arbitrary numpy layouts.
+    ptrdiff_t cstride = 1;
+    ptrdiff_t gstride = 2;  // default for contiguous (...,n,2) layout
+    if (n > 1) {
+        const double* cptr1 = coeffs.data(e, s0 + 1);
+        const double* gptr0_1 = gref.data(e, q, s0 + 1, 0);
+        cstride = cptr1 - cptr;
+        gstride = gptr0_1 - gptr0;
+        if (cstride == 0) cstride = 1;
+        if (gstride == 0) gstride = 2;
+    }
+
+    Eigen::Map<const Eigen::VectorXd, 0, Eigen::InnerStride<>> cvec(
+        cptr, n, Eigen::InnerStride<>(cstride));
+    Eigen::Map<const Eigen::VectorXd, 0, Eigen::InnerStride<>> g0(
+        gptr0, n, Eigen::InnerStride<>(gstride));
+    Eigen::Map<const Eigen::VectorXd, 0, Eigen::InnerStride<>> g1(
+        gptr1, n, Eigen::InnerStride<>(gstride));
 
     const double s_g0 = cvec.dot(g0);
     const double s_g1 = cvec.dot(g1);

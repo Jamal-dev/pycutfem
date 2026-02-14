@@ -16,6 +16,26 @@ def _backend_requested() -> bool:
     return os.getenv("PYCUTFEM_JIT_BACKEND", "").lower() in {"cpp", "c++"}
 
 
+_CPP_KERNEL_CACHE_SINGLETON = None
+_CPP_KERNEL_CACHE_DIR_TOKEN = None
+
+
+def _get_cpp_kernel_cache():
+    """
+    Return a process-wide `CppKernelCache` instance, recreating it when the
+    cache directory changes (tests often patch `CppKernelCache._CACHE_DIR` or
+    `PYCUTFEM_CACHE_DIR`).
+    """
+    global _CPP_KERNEL_CACHE_SINGLETON, _CPP_KERNEL_CACHE_DIR_TOKEN
+    from .cache import CppKernelCache
+
+    cache_dir = CppKernelCache._resolve_cache_dir()
+    if _CPP_KERNEL_CACHE_SINGLETON is None or cache_dir != _CPP_KERNEL_CACHE_DIR_TOKEN:
+        _CPP_KERNEL_CACHE_SINGLETON = CppKernelCache()
+        _CPP_KERNEL_CACHE_DIR_TOKEN = cache_dir
+    return _CPP_KERNEL_CACHE_SINGLETON
+
+
 def compile_backend_cpp(
     integral_expression,
     dof_handler,
@@ -30,9 +50,7 @@ def compile_backend_cpp(
     The return value matches the Numba backend: (runner, ir_sequence).
     """
     from pycutfem.jit.visitor import IRGenerator
-    from pycutfem.jit.codegen import NumbaCodeGen
     from .codegen import CppCodeGen
-    from .cache import CppKernelCache
     from .runner import KernelRunnerCpp
 
     # Accept Form / Integral / plain Expression alike -----------------
@@ -47,33 +65,20 @@ def compile_backend_cpp(
     ir_generator = IRGenerator()
     rank = _form_rank(integral_expression)
 
-    # Reuse the Python codegen to extract param_order/active fields for now.
-    numba_codegen = NumbaCodeGen(
-        mixed_element=mixed_element,
-        form_rank=rank,
-        on_facet=on_facet,
-    )
     cpp_codegen = CppCodeGen(
         mixed_element=mixed_element,
         form_rank=rank,
         on_facet=on_facet,
-        mirror=numba_codegen,
     )
-    cache = CppKernelCache()
+    cache = _get_cpp_kernel_cache()
 
     ir_sequence = ir_generator.generate(integral_expression)
     param = getattr(ir_generator, "_param", None)
     from pycutfem.jit.ir import strip_side_metadata
     ir_sequence = strip_side_metadata(ir_sequence, on_facet=on_facet)
 
-    try:
-        cache_sig = (mixed_element.signature(), bool(on_facet), int(rank))
-        kernel, param_order, active_fields = cache.get_kernel(
-            ir_sequence, cpp_codegen, cache_sig
-        )
-    except Exception as exc:
-        # Fail hard so missing op coverage is fixed immediately.
-        raise
+    cache_sig = (mixed_element.signature(), bool(on_facet), int(rank))
+    kernel, param_order, active_fields = cache.get_kernel(ir_sequence, cpp_codegen, cache_sig)
 
     runner = KernelRunnerCpp(kernel, param_order, ir_sequence, dof_handler, fallback_runner=None)
     try:

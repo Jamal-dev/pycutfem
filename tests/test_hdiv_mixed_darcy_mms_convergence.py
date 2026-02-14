@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import scipy.sparse.linalg as spla
+import os
 
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
@@ -105,7 +106,13 @@ def test_mixed_darcy_mms_converges_rt1_dg1(backend, monkeypatch, tmp_path):
     if backend == "jit":
         monkeypatch.delenv("PYCUTFEM_JIT_BACKEND", raising=False)
 
-    mesh_ns = [2, 4, 8]
+    nx_spec = str(os.environ.get("PYCUTFEM_HDIV_DARCY_NX_LIST", "")).strip()
+    if nx_spec:
+        mesh_ns = [int(x.strip()) for x in nx_spec.split(",") if x.strip()]
+    else:
+        mesh_ns = [2, 4]
+    if len(mesh_ns) < 2:
+        raise ValueError("PYCUTFEM_HDIV_DARCY_NX_LIST must contain at least two mesh sizes (e.g. '2,4').")
     hs: list[float] = []
     eu: list[float] = []
     ep: list[float] = []
@@ -128,4 +135,3 @@ def test_mixed_darcy_mms_converges_rt1_dg1(backend, monkeypatch, tmp_path):
     assert np.all(rate_u < 2.3)
     assert np.all(rate_p > 1.7)
     assert np.all(rate_p < 2.3)
-

@@ -99,6 +99,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
     param_order=None,             # order of parameters in the JIT kernel
     pre_built: dict | None = None,
     jit_param=None,
+    active_cols: np.ndarray | None = None,
+    materialize_tables: bool | None = None,
 ):
     """
     Return a **dict { name -> ndarray }** with *all* reference-space tables
@@ -136,23 +138,27 @@ def _build_jit_kernel_args(       # ← signature unchanged
     # ------------------------------------------------------------------
     # 0. Helpers
     # ------------------------------------------------------------------
-    # Target element count for per-element tables (respect subsets when provided)
-    n_elem = mixed_element.mesh.n_elements
+    # Target element count for per-element tables (respect subsets when provided).
+    n_elem = int(getattr(mixed_element.mesh, "n_elements", 0) or 0)
     if gdofs_map is not None:
-        try:
-            n_elem = int(np.asarray(gdofs_map).shape[0])
-        except Exception:
-            pass
+        arr = np.asarray(gdofs_map)
+        if arr.ndim < 1:
+            raise ValueError(
+                f"_build_jit_kernel_args: expected gdofs_map with ndim>=1 to infer n_elem, got shape={arr.shape}."
+            )
+        n_elem = int(arr.shape[0])
     elif pre_built is not None:
         for _key in ("qp_phys", "qw", "eids", "gdofs_map"):
+            if _key not in pre_built:
+                continue
             arr = pre_built.get(_key)
             if arr is None:
                 continue
-            try:
-                n_elem = int(np.asarray(arr).shape[0])
-                break
-            except Exception:
+            arr_np = np.asarray(arr)
+            if arr_np.ndim < 1:
                 continue
+            n_elem = int(arr_np.shape[0])
+            break
 
     # full-length element size for CellDiameter() lookups via owner ids
     _h_global = np.asarray(
@@ -188,15 +194,61 @@ def _build_jit_kernel_args(       # ← signature unchanged
         return [f for f in me_order if f in active]
 
     _active_fields = _active_field_order()
-    _active_cols = np.concatenate(
-        [np.arange(mixed_element.component_dof_slices[f].start,
-                   mixed_element.component_dof_slices[f].stop, dtype=np.int32)
-         for f in _active_fields]
-    ) if _active_fields else np.arange(mixed_element.n_dofs_local, dtype=np.int32)
-    _active_n = int(len(_active_cols))
+    _active_cols_default = (
+        np.concatenate(
+            [
+                np.arange(
+                    mixed_element.component_dof_slices[f].start,
+                    mixed_element.component_dof_slices[f].stop,
+                    dtype=np.int32,
+                )
+                for f in _active_fields
+            ]
+        )
+        if _active_fields
+        else np.arange(mixed_element.n_dofs_local, dtype=np.int32)
+    )
+    _active_cols = np.asarray(active_cols, dtype=np.int32).ravel() if active_cols is not None else _active_cols_default
+    _active_n = int(_active_cols.size)
+
+    _materialize = bool(materialize_tables) if materialize_tables is not None else False
+    _full_n = int(
+        getattr(
+            mixed_element,
+            "n_dofs_local",
+            getattr(mixed_element, "n_dofs_per_elem", int(_active_n)),
+        )
+    )
+    if _active_cols.size:
+        if int(_active_cols.min()) < 0 or int(_active_cols.max()) >= _full_n:
+            raise ValueError(
+                f"_build_jit_kernel_args: active_cols out of range [0,{_full_n}) "
+                f"(min={int(_active_cols.min())}, max={int(_active_cols.max())})."
+            )
+        if int(np.unique(_active_cols).size) != int(_active_cols.size):
+            raise ValueError("_build_jit_kernel_args: active_cols contains duplicates.")
+
+    _col_map = -np.ones(_full_n, dtype=np.int32)
+    if _active_cols.size:
+        _col_map[_active_cols] = np.arange(_active_n, dtype=np.int32)
+
+    def _field_new_slice(field: str):
+        sl_full = mixed_element.component_dof_slices[field]
+        new_idx = _col_map[int(sl_full.start) : int(sl_full.stop)]
+        if new_idx.size == 0:
+            return slice(0, 0)
+        if np.any(new_idx < 0):
+            raise ValueError(
+                f"_build_jit_kernel_args: active_cols dropped DOFs required for field {field!r} "
+                f"(slice={sl_full}, full_n={_full_n}, active_n={_active_n})."
+            )
+        start = int(new_idx[0])
+        if np.array_equal(new_idx, np.arange(start, start + int(new_idx.size), dtype=np.int32)):
+            return slice(start, start + int(new_idx.size))
+        return new_idx
+
     def _cached_ref_table(kind: str, field: str, builder, deriv: tuple[int, int] | None = None):
-        # Cache key intentionally excludes active columns and n_elem: basis/grad/derivative
-        # reference tables depend on (element signature, quadrature, field, derivative) only.
+        # Cache *local* reference tables; these do not depend on active column compression.
         key = (mixed_element.signature(), q_order, kind, field, deriv)
         hit = _REF_TABLE_CACHE.get(key)
         if hit is not None:
@@ -209,9 +261,10 @@ def _build_jit_kernel_args(       # ← signature unchanged
         """
         Replicate a reference-space table so that shape[0] == n_elem.
         """
-        # Broadcast along the element axis (stride-0) to avoid allocating
-        # (n_elem * n_q * n_loc) stacks during JIT warm-up.
-        return np.broadcast_to(ref_tab, (n_elem, *ref_tab.shape))
+        tab = np.broadcast_to(ref_tab, (n_elem, *ref_tab.shape))
+        # Optional: materialize broadcast views once during setup (needed for
+        # the C++ backend's pybind11 `c_style` argument conversion).
+        return tab.copy() if _materialize else tab
 
     def _cached_phys_table(kind: str, field: str, token, builder):
         """
@@ -228,36 +281,69 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
     # Reference-element quadrature (ξ-space) for table builders
     qp_ref, _ = volume(mixed_element.mesh.element_type, q_order)
+    qp_ref = np.asarray(qp_ref, dtype=np.float64)
+    xi_ref = qp_ref[:, 0]
+    eta_ref = qp_ref[:, 1]
 
     def _basis_table(field: str):
-        def _build():
-            ref = np.asarray(
-                [mixed_element.basis(field, *xi_eta) for xi_eta in qp_ref],
-                dtype=np.float64,
-            )  # (n_q , n_loc)
-            return np.ascontiguousarray(ref)
-        ref = _cached_ref_table("basis", field, _build)
-        return _expand_per_element(ref)  # (n_elem , n_q , n_loc)
+        def _build_local():
+            ref_loc = mixed_element._eval_scalar_basis_many(field, xi_ref, eta_ref)
+            return np.ascontiguousarray(ref_loc, dtype=np.float64)
+
+        ref_loc = _cached_ref_table("basis_local", field, _build_local)
+        ref = np.zeros((int(qp_ref.shape[0]), _active_n), dtype=np.float64)
+        if _active_n:
+            ref[:, _field_new_slice(field)] = ref_loc
+        return _expand_per_element(ref)  # (n_elem , n_q , active_n)
 
     def _grad_table(field: str):
-        def _build():
-            ref = np.asarray(
-                [mixed_element.grad_basis(field, *xi_eta) for xi_eta in qp_ref],
-                dtype=np.float64,
-            )  # (n_q , n_loc , 2)
-            return np.ascontiguousarray(ref)
-        ref = _cached_ref_table("grad", field, _build)
-        return _expand_per_element(ref)  # (n_elem , n_q , n_loc , 2)
+        def _build_local():
+            ref_loc = mixed_element._eval_scalar_grad_many(field, xi_ref, eta_ref)
+            return np.ascontiguousarray(ref_loc, dtype=np.float64)
+
+        ref_loc = _cached_ref_table("grad_local", field, _build_local)
+        ref = np.zeros((int(qp_ref.shape[0]), _active_n, 2), dtype=np.float64)
+        if _active_n:
+            ref[:, _field_new_slice(field), :] = ref_loc
+        return _expand_per_element(ref)  # (n_elem , n_q , active_n , 2)
 
     def _deriv_table(field: str, ax: int, ay: int):
-        """∂^{ax+ay} φ_i / ∂ξ^{ax} ∂η^{ay}"""
-        def _build():
-            ref = np.asarray(
-                [mixed_element.deriv_ref(field, *xi_eta, ax, ay) for xi_eta in qp_ref],
-                dtype=np.float64,
-            )
-            return np.ascontiguousarray(ref)
-        ref = _cached_ref_table("deriv", field, _build, deriv=(ax, ay))
+        """∂^{ax+ay} φ_i / ∂ξ^{ax} ∂η^{ay} (union-padded to active layout)."""
+        from pycutfem.integration.pre_tabulates import _eval_deriv_q1, _eval_deriv_q2, _eval_deriv_p1
+
+        def _build_local():
+            sl_full = mixed_element.component_dof_slices[field]
+            nloc_f = int(sl_full.stop) - int(sl_full.start)
+            if int(ax) == 0 and int(ay) == 0:
+                ref_loc = mixed_element._eval_scalar_basis_many(field, xi_ref, eta_ref)
+                return np.ascontiguousarray(ref_loc, dtype=np.float64)
+            fam = getattr(mixed_element, "_field_families", {}).get(field, None)
+            if fam == "RT":
+                raise NotImplementedError("Reference derivatives are not defined for RT (H(div)) fields.")
+            p = int(getattr(mixed_element, "_field_orders", {}).get(field, 0) or 0)
+            elem_type = str(getattr(mixed_element.mesh, "element_type", ""))
+            ref_loc = np.empty((int(qp_ref.shape[0]), nloc_f), dtype=np.float64)
+            for q, (xi, eta) in enumerate(qp_ref):
+                if (int(ax) + int(ay)) <= 2:
+                    if elem_type == "quad" and p == 1:
+                        ref_loc[q, :] = _eval_deriv_q1(float(xi), float(eta), int(ax), int(ay))
+                        continue
+                    if elem_type == "quad" and p == 2:
+                        ref_loc[q, :] = _eval_deriv_q2(float(xi), float(eta), int(ax), int(ay))
+                        continue
+                    if elem_type == "tri" and p == 1:
+                        ref_loc[q, :] = _eval_deriv_p1(float(xi), float(eta), int(ax), int(ay))
+                        continue
+                ref_loc[q, :] = np.asarray(
+                    mixed_element._eval_scalar_deriv(field, float(xi), float(eta), int(ax), int(ay)),
+                    dtype=np.float64,
+                ).ravel()
+            return np.ascontiguousarray(ref_loc, dtype=np.float64)
+
+        ref_loc = _cached_ref_table("deriv_local", field, _build_local, deriv=(int(ax), int(ay)))
+        ref = np.zeros((int(qp_ref.shape[0]), _active_n), dtype=np.float64)
+        if _active_n:
+            ref[:, _field_new_slice(field)] = ref_loc
         return _expand_per_element(ref)
 
     # --- H(div) RT tables (reference-space, union-padded) ----------------------
@@ -272,8 +358,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
             raise ValueError(f"Requested bvec_{field} for non-RT field family {fam!r}.")
 
         def _build():
-            n_union = int(getattr(mixed_element, "n_dofs_local", 0))
-            sl = mixed_element.component_dof_slices[field]
+            n_union = int(_active_n)
+            sl = _field_new_slice(field)
             out_ref = np.zeros((len(qp_ref), 2, n_union), dtype=np.float64)
             ref_obj = mixed_element._ref[field]
             for q, (xi, eta) in enumerate(qp_ref):
@@ -295,8 +381,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
             raise ValueError(f"Requested div_{field} for non-RT field family {fam!r}.")
 
         def _build():
-            n_union = int(getattr(mixed_element, "n_dofs_local", 0))
-            sl = mixed_element.component_dof_slices[field]
+            n_union = int(_active_n)
+            sl = _field_new_slice(field)
             out_ref = np.zeros((len(qp_ref), n_union), dtype=np.float64)
             ref_obj = mixed_element._ref[field]
             for q, (xi, eta) in enumerate(qp_ref):
@@ -317,8 +403,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if fam != "RT":
             raise ValueError(f"Requested sign_{field} for non-RT field family {fam!r}.")
 
-        n_union = int(getattr(mixed_element, "n_dofs_local", 0))
-        sl = mixed_element.component_dof_slices[field]
+        n_union = int(_active_n)
+        sl = _field_new_slice(field)
         out = np.ones((n_elem, n_union), dtype=np.float64)
 
         owners = None
@@ -1064,19 +1150,40 @@ def _build_jit_kernel_args(       # ← signature unchanged
             # the "edge" precompute is empty and does not carry r** tables. Create
             # correctly-shaped empty tables so kernel arg building succeeds.
             if pre_built is not None and pre_built.get("entity_kind") == "edge":
-                try:
-                    qp_phys = np.asarray(pre_built.get("qp_phys"), dtype=np.float64)
-                    nE = int(qp_phys.shape[0])
-                    nQ = int(qp_phys.shape[1]) if qp_phys.ndim >= 2 else 0
-                except Exception:
-                    nE = int(np.asarray(gdofs_map).shape[0]) if gdofs_map is not None else 0
-                    nQ = 0
+                qp_phys_raw = pre_built.get("qp_phys", None)
+                nQ = 0
+                if qp_phys_raw is not None:
+                    qp_phys = np.asarray(qp_phys_raw, dtype=np.float64)
+                    if qp_phys.ndim == 3 and int(qp_phys.shape[2]) == 2:
+                        nE = int(qp_phys.shape[0])
+                        nQ = int(qp_phys.shape[1])
+                    elif qp_phys.ndim == 0 and int(qp_phys.size) == 0:
+                        nE = 0
+                    else:
+                        raise ValueError(
+                            f"_build_jit_kernel_args: invalid edge 'qp_phys' shape {qp_phys.shape}; expected (nE,nQ,2)."
+                        )
+                else:
+                    if gdofs_map is not None:
+                        g = np.asarray(gdofs_map)
+                        if g.ndim < 1:
+                            raise ValueError(
+                                f"_build_jit_kernel_args: invalid gdofs_map shape {g.shape} for edge placeholder."
+                            )
+                        nE = int(g.shape[0])
+                    else:
+                        nE = int(np.asarray(pre_built.get("eids", np.empty((0,), dtype=np.int32))).shape[0])
+
                 if nE == 0:
-                    n_union = (
-                        int(np.asarray(gdofs_map).shape[1])
-                        if gdofs_map is not None
-                        else int(_union_size_from_prebuilt())
-                    )
+                    if gdofs_map is not None:
+                        g = np.asarray(gdofs_map)
+                        if g.ndim != 2:
+                            raise ValueError(
+                                f"_build_jit_kernel_args: expected 2D gdofs_map for edge placeholder, got shape={g.shape}."
+                            )
+                        n_union = int(g.shape[1])
+                    else:
+                        n_union = int(_union_size_from_prebuilt())
                     args[name] = np.empty((0, nQ, n_union), dtype=np.float64)
                     continue
 

@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 from pycutfem.jit.cpp_backend import cache as cpp_cache
+from pycutfem.jit.cpp_backend.compiler import get_compile_mode_tag
 
 
 def test_cpp_cache_regenerates_on_stale_source(tmp_path, monkeypatch):
@@ -28,7 +29,8 @@ def test_cpp_cache_regenerates_on_stale_source(tmp_path, monkeypatch):
     monkeypatch.setattr(cpp_cache, "compile_extension", fake_compile_extension)
 
     ir_sequence = []
-    module_name = f"_pycutfem_cpp_kernel_{cpp_cache.KernelCache._hash_ir(ir_sequence, None)}"
+    compile_tag = get_compile_mode_tag()
+    module_name = f"_pycutfem_cpp_kernel_{cpp_cache.KernelCache._hash_ir(ir_sequence, None)}_{compile_tag}"
     source_file = cache_dir / f"{module_name}.cpp"
     source_file.write_text('CODEGEN_ABI") = "old-abi"', encoding="utf-8")
 
@@ -66,7 +68,8 @@ def test_cpp_cache_reuses_loaded_module_across_cache_instances(tmp_path, monkeyp
     abi = cpp_cache.CODEGEN_ABI_CPP
 
     ir_sequence = []
-    module_name = f"_pycutfem_cpp_kernel_{cpp_cache.KernelCache._hash_ir(ir_sequence, None)}"
+    compile_tag = get_compile_mode_tag()
+    module_name = f"_pycutfem_cpp_kernel_{cpp_cache.KernelCache._hash_ir(ir_sequence, None)}_{compile_tag}"
 
     class DummyCodegen:
         include_dirs = []

@@ -141,71 +141,13 @@ class CppCodeGen:
                 return f"{core}{suffix}_loc"
             return f"u_{base}{suffix}_loc"
 
-        if self._mirror is not None:
-            try:
-                _, analytic_map, param_order = self._mirror.generate_source(
-                    ir_sequence, kernel_name
-                )
-            except Exception as exc:
-                if CODEGEN_DEBUG:
-                    print(
-                        "[cpp_codegen] mirror codegen failed; "
-                        f"falling back to IR-derived param_order: {exc}"
-                    )
-                # Fall back to a minimal param_order built from the IR.
-                param_order = []
-                needs_b: set[str] = set()
-                needs_g: set[str] = set()
-                needs_bvec: set[str] = set()
-                needs_div: set[str] = set()
-                needs_sign: set[str] = set()
-                needs_det: set[str] = set()
-                needs_u: set[str] = set()
-                for op in ir_sequence:
-                    if isinstance(op, LoadVariable):
-                        for fn in op.field_names or []:
-                            if _is_rt_field(str(fn)):
-                                if self.on_facet and op.side in ("+", "-"):
-                                    tag = "pos" if op.side == "+" else "neg"
-                                    needs_bvec.add(f"bvec_{fn}_{tag}")
-                                    needs_sign.add(f"sign_{fn}_{tag}")
-                                    if needs_any_hdiv_div:
-                                        needs_div.add(f"div_{fn}_{tag}")
-                                        needs_det.add(f"detJ_{tag}")
-                                else:
-                                    needs_bvec.add(f"bvec_{fn}")
-                                    needs_sign.add(f"sign_{fn}")
-                                    if needs_any_hdiv_div:
-                                        needs_div.add(f"div_{fn}")
-                            else:
-                                needs_g.add(f"g_{fn}")
-                                if op.deriv_order == (0, 0):
-                                    needs_b.add(f"b_{fn}")
-                                else:
-                                    needs_g.add(f"g_{fn}")
-                        if op.role == "function":
-                            needs_u.add(coeff_array_name(op.name, op.side))
-                param_order = [
-                    "gdofs_map",
-                    "node_coords",
-                    "qp_phys",
-                    "qw",
-                    "detJ",
-                    "J_inv",
-                    "normals",
-                ]
-                if needs_phis:
-                    param_order.append("phis")
-                param_order += [
-                    *sorted(needs_b),
-                    *sorted(needs_g),
-                    *sorted(needs_bvec),
-                    *sorted(needs_div),
-                    *sorted(needs_sign),
-                    *sorted(needs_det),
-                    *sorted(needs_u),
-                ]
-        # Ensure required basis/grad tables are present even if mirror omitted them
+        # Base geometry arguments (mirrors the Numba backend’s ABI, but only
+        # includes what the C++ kernels and argument builders actually need).
+        param_order = ["gdofs_map", "node_coords", "qp_phys", "qw", "detJ", "J_inv"]
+        if needs_phis:
+            param_order.append("phis")
+
+        # Collect required basis/grad/aux tables from the IR.
         needs_b: set[str] = set()
         needs_g: set[str] = set()
         needs_bvec: set[str] = set()
@@ -357,13 +299,6 @@ class CppCodeGen:
                 param_order.append("owner_id")
             if "h_arr" not in param_order:
                 param_order.append("h_arr")
-        # Ensure all basis arrays for fields exist (safety net)
-        for fn in getattr(self.mixed_element, "field_names", ()):
-            if _is_rt_field(str(fn)):
-                continue
-            bname = f"b_{fn}"
-            if bname not in param_order:
-                param_order.append(bname)
         for name in sorted(needs_r00):
             if name not in param_order:
                 param_order.append(name)
@@ -423,17 +358,23 @@ class CppCodeGen:
             return order
 
         def _active_fields_from_param_order(params: list[str]) -> list[str]:
-            """Mirror the active-field order encoded in PARAM_ORDER (b_*, g_*, …)."""
+            """
+            Mirror the active-field order encoded in PARAM_ORDER.
+
+            Recognizes scalar basis/grad tables (b_*, g_*, d_*, r_*) and H(div)
+            RT tables (bvec_*, div_*, sign_*), including optional side tags.
+            """
             order: list[str] = []
             for name in params:
                 if not isinstance(name, str):
                     continue
-                prefix = name.split("_", 1)[0]
-                if prefix not in {"b", "g", "d", "r"}:
+                prefix, _, base = name.partition("_")
+                if prefix not in {"b", "g", "d", "r", "bvec", "div", "sign"}:
                     continue
-                base = name.split("_", 1)[1] if "_" in name else ""
-                # strip sided suffixes (pos/neg) when present
+                # strip sided suffixes (pos/neg) when present ("__pos" and "_pos" conventions)
                 base = base.split("__", 1)[0]
+                if base.endswith(("_pos", "_neg")):
+                    base = base.rsplit("_", 1)[0]
                 if base in getattr(self.mixed_element, "field_names", ()) and base not in order:
                     order.append(base)
             return order
@@ -878,6 +819,14 @@ class CppCodeGen:
                         if getattr(self.mixed_element, "_field_families", {}).get(cand, None) == "RT":
                             hdiv_field = cand
                     if hdiv_field is not None:
+                        # H(div) RT basis values are mapped via the (side-specific)
+                        # inverse Jacobian on facet integrals.
+                        if op.side == "+":
+                            required_args.add("J_inv_pos")
+                        elif op.side == "-":
+                            required_args.add("J_inv_neg")
+                        else:
+                            required_args.add("J_inv")
                         side_tag = "pos" if op.side == "+" else "neg" if op.side == "-" else ""
                         bvec_name = f"bvec_{hdiv_field}_{side_tag}" if side_tag else f"bvec_{hdiv_field}"
                         sign_name = f"sign_{hdiv_field}_{side_tag}" if side_tag else f"sign_{hdiv_field}"
@@ -1260,6 +1209,16 @@ class CppCodeGen:
                     raise NotImplementedError("Grad on unsupported item")
             elif isinstance(op, IRHessian):
                 a = stack.pop()
+                # Hessian push-forward needs side-specific inverse Jacobians on facet
+                # integrals. Without these, the generated code may reference Jloc_pos/
+                # Jloc_neg but the corresponding views are never declared, leading to
+                # C++ compile failures (and incorrect physics on deformed meshes).
+                if a.side == "+":
+                    required_args.add("J_inv_pos")
+                elif a.side == "-":
+                    required_args.add("J_inv_neg")
+                else:
+                    required_args.add("J_inv")
                 if a.role in {"test", "trial"}:
                     k = len(a.field_names)
                     nm = new_tmp("hess")
@@ -1330,6 +1289,14 @@ class CppCodeGen:
                     raise NotImplementedError("Hessian on unsupported item")
             elif isinstance(op, IRLaplacian):
                 a = stack.pop()
+                # Laplacian is trace(Hessian), so it also requires the correct
+                # side-specific inverse Jacobian on facets.
+                if a.side == "+":
+                    required_args.add("J_inv_pos")
+                elif a.side == "-":
+                    required_args.add("J_inv_neg")
+                else:
+                    required_args.add("J_inv")
                 if a.role in {"test", "trial"}:
                     k = len(a.field_names)
                     nm = new_tmp("lap")
@@ -2998,10 +2965,10 @@ class CppCodeGen:
                 or nm in {"owner_id", "owner_pos_id", "owner_neg_id", "pos_eids", "neg_eids"}
                 or nm.startswith(("pos_map", "neg_map"))
             ):
-                return "py::array_t<int32_t, py::array::c_style | py::array::forcecast>"
+                return "py::array_t<int32_t, py::array::forcecast>"
             if nm.startswith("domain_flag_"):
-                return "py::array_t<uint8_t, py::array::c_style | py::array::forcecast>"
-            return "py::array_t<double, py::array::c_style | py::array::forcecast>"
+                return "py::array_t<uint8_t, py::array::forcecast>"
+            return "py::array_t<double, py::array::forcecast>"
 
         arg_types: list[str] = [_cpp_array_type(nm) for nm in param_order]
         arg_decls: list[str] = [f"{tp} {nm}" for tp, nm in zip(arg_types, param_order)]
@@ -3159,11 +3126,11 @@ PYBIND11_MODULE({module_name}, m) {{
         arg_decls: list[str] = []
         for name in param_order:
             if name == "gdofs_map":
-                arg_decls.append("py::array_t<int32_t, py::array::c_style | py::array::forcecast> gdofs_map")
+                arg_decls.append("py::array_t<int32_t, py::array::forcecast> gdofs_map")
             elif name in {"qp_phys", "qw", "detJ", "J_inv"}:
-                arg_decls.append(f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}")
+                arg_decls.append(f"py::array_t<double, py::array::forcecast> {name}")
             elif name.startswith(("g_", "b_", "u_")):
-                arg_decls.append(f"py::array_t<double, py::array::c_style | py::array::forcecast> {name}")
+                arg_decls.append(f"py::array_t<double, py::array::forcecast> {name}")
             else:
                 arg_decls.append(f"py::object {name}")
 

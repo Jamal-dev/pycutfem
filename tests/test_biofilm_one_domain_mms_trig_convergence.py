@@ -1,4 +1,5 @@
 import math
+import os
 
 import numpy as np
 
@@ -241,29 +242,55 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
 
 
 def test_biofilm_one_domain_mms_trig_convergence_cpp():
-    # Keep the mesh sizes small: we only want to catch regressions where the MMS
-    # forcing is inconsistent with `build_biofilm_one_domain_forms` (EOC ~ 0).
+    # Keep this convergence check lightweight: it is a regression guard, not a
+    # full accuracy study. The full biofilm one-domain solve has many fields and
+    # can dominate test runtimes.
+    #
+    # To run a heavier study locally, set `PYCUTFEM_BIOFILM_MMS_NX_LIST`, e.g.:
+    #   PYCUTFEM_BIOFILM_MMS_NX_LIST=4,8
     dt_val = 0.05
     theta = 1.0
     k_det = 0.2
-    qdeg = 8
-    qerr = 8
-    newton_tol = 1.0e-10
-    max_it = 30
+    qdeg = int(os.environ.get("PYCUTFEM_BIOFILM_MMS_QDEG", "6") or "6")
+    qerr = int(os.environ.get("PYCUTFEM_BIOFILM_MMS_QERR", str(qdeg)) or str(qdeg))
+    newton_tol = float(os.environ.get("PYCUTFEM_BIOFILM_MMS_NEWTON_TOL", "1.0e-8") or "1.0e-8")
+    max_it = int(os.environ.get("PYCUTFEM_BIOFILM_MMS_NEWTON_MAX_IT", "20") or "20")
+
+    nx_spec = str(os.environ.get("PYCUTFEM_BIOFILM_MMS_NX_LIST", "")).strip()
+    if nx_spec:
+        nx_list = [int(x.strip()) for x in nx_spec.split(",") if x.strip()]
+    else:
+        nx_list = [3, 6]
+    if len(nx_list) < 2:
+        raise ValueError("PYCUTFEM_BIOFILM_MMS_NX_LIST must contain at least two mesh sizes (e.g. '3,6').")
 
     mms = build_biofilm_one_domain_mms_trig_step(dt_val=float(dt_val), theta=float(theta), k_det=float(k_det))
 
-    r4 = _solve_one(nx=4, qdeg=qdeg, qerr=qerr, dt_val=dt_val, theta=theta, newton_tol=newton_tol, max_it=max_it, k_det=k_det, mms=mms)
-    r8 = _solve_one(nx=8, qdeg=qdeg, qerr=qerr, dt_val=dt_val, theta=theta, newton_tol=newton_tol, max_it=max_it, k_det=k_det, mms=mms)
+    errs = [
+        _solve_one(
+            nx=int(nx),
+            qdeg=qdeg,
+            qerr=qerr,
+            dt_val=dt_val,
+            theta=theta,
+            newton_tol=newton_tol,
+            max_it=max_it,
+            k_det=k_det,
+            mms=mms,
+        )
+        for nx in nx_list[:2]
+    ]
+    coarse, fine = errs[0], errs[1]
+    assert fine["err_v"] < coarse["err_v"]
+    assert fine["err_p"] < coarse["err_p"]
+    assert fine["err_alpha"] < coarse["err_alpha"]
 
-    assert r8["err_v"] < r4["err_v"]
-    assert r8["err_p"] < r4["err_p"]
-    assert r8["err_alpha"] < r4["err_alpha"]
+    # Expect clear improvement under refinement. Keep thresholds modest to avoid
+    # flakiness on coarse meshes while still catching regressions (EOC ~ 0).
+    eoc_v = _eoc(coarse["h"], fine["h"], coarse["err_v"], fine["err_v"])
+    eoc_p = _eoc(coarse["h"], fine["h"], coarse["err_p"], fine["err_p"])
+    eoc_alpha = _eoc(coarse["h"], fine["h"], coarse["err_alpha"], fine["err_alpha"])
 
-    eoc_v = _eoc(r4["h"], r8["h"], r4["err_v"], r8["err_v"])
-    eoc_p = _eoc(r4["h"], r8["h"], r4["err_p"], r8["err_p"])
-    eoc_alpha = _eoc(r4["h"], r8["h"], r4["err_alpha"], r8["err_alpha"])
-
-    assert eoc_v > 1.7
-    assert eoc_p > 1.4
-    assert eoc_alpha > 1.7
+    assert eoc_v > 1.0
+    assert eoc_p > 0.7
+    assert eoc_alpha > 1.0

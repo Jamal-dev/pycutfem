@@ -12,6 +12,25 @@ from typing import Callable, Any
 
 #  pycutfem/jit/__init__.py      
 
+# ----------------------------------------------------------------------
+#  Kernel cache singletons
+# ----------------------------------------------------------------------
+_KERNEL_CACHE_SINGLETON: KernelCache | None = None
+_KERNEL_CACHE_DIR_TOKEN: object | None = None
+
+
+def _get_kernel_cache() -> KernelCache:
+    """
+    Return a process-wide KernelCache instance, recreating it when the cache
+    directory is changed (tests often patch `KernelCache._CACHE_DIR`).
+    """
+    global _KERNEL_CACHE_SINGLETON, _KERNEL_CACHE_DIR_TOKEN
+    cache_dir = getattr(KernelCache, "_CACHE_DIR", None)
+    if _KERNEL_CACHE_SINGLETON is None or cache_dir != _KERNEL_CACHE_DIR_TOKEN:
+        _KERNEL_CACHE_SINGLETON = KernelCache()
+        _KERNEL_CACHE_DIR_TOKEN = cache_dir
+    return _KERNEL_CACHE_SINGLETON
+
 def _form_rank(expr):
     """Return 0 (functional), 1 (linear) or 2 (bilinear)."""
     from pycutfem.ufl.expressions import Function, VectorFunction
@@ -60,6 +79,60 @@ def _active_columns(me, active_fields: tuple[str, ...]) -> np.ndarray:
         cols.extend(range(sl.start, sl.stop))
     return np.asarray(cols, dtype=np.int32)
 
+def _fields_from_param_order(param_order: list, me) -> tuple[str, ...]:
+    """
+    Extract MixedElement field names implied by a kernel ABI (PARAM_ORDER).
+
+    This is used to validate that active-field trimming stays aligned with what
+    the backend actually requests.
+    """
+    me_order = list(getattr(me, "field_names", ()))
+    me_fields = set(me_order)
+    seen: set[str] = set()
+
+    def _add(field: str | None) -> None:
+        if not field:
+            return
+        f = str(field)
+        # Strip common sided suffixes used in table names.
+        if f.endswith("_pos") and f[:-4] in me_fields:
+            f = f[:-4]
+        if f.endswith("_neg") and f[:-4] in me_fields:
+            f = f[:-4]
+        if f in me_fields:
+            seen.add(f)
+
+    for tag in param_order or []:
+        if not isinstance(tag, str):
+            continue
+        if tag.startswith(("b_", "g_")) and len(tag) > 2:
+            _add(tag[2:])
+            continue
+        if tag.startswith(("bvec_", "div_", "sign_")):
+            prefix, _, rest = tag.partition("_")
+            if rest:
+                _add(rest)
+            continue
+        m = re.match(r"^r\d{2}_(.+?)(?:_(pos|neg))?$", tag)
+        if m:
+            _add(m.group(1))
+            continue
+        m = re.match(r"^d\d{2,3}_(.+?)(?:_(pos|neg))?$", tag)
+        if m:
+            _add(m.group(1))
+            continue
+        m = re.match(r"^restrict_mask_(.+)_(pos|neg)$", tag)
+        if m:
+            _add(m.group(1))
+            continue
+        if tag.startswith(("pos_map_", "neg_map_")):
+            _add(tag.split("_", 2)[-1])
+            continue
+
+    if not seen:
+        return tuple()
+    return tuple([f for f in me_order if f in seen])
+
 
 def _compress_static_for_active(static: dict[str, Any],
                                 me,
@@ -83,6 +156,33 @@ def _compress_static_for_active(static: dict[str, Any],
     if compress_cache is None:
         compress_cache = {}
     active_key = tuple(np.asarray(active_cols, dtype=np.int32).tolist())
+    # Cache entries are keyed by id(arr), but ids can be reused once an ndarray is
+    # garbage-collected. Guard against collisions by attaching a weakref to the
+    # originating array object and validating it on lookup.
+    import weakref
+    _RefType = weakref.ReferenceType
+
+    def _cache_lookup(key, src_arr: np.ndarray) -> np.ndarray | None:
+        """
+        Safe cache lookup for remapped arrays.
+
+        Cache values must be stored as (weakref(src_arr), remapped_arr). If an
+        unexpected value is encountered, it is evicted and treated as a miss.
+        This avoids silent ABI mismatches when caches are reused across code paths.
+        """
+        hit = compress_cache.get(key)
+        if hit is None:
+            return None
+        if isinstance(hit, tuple) and len(hit) == 2 and isinstance(hit[0], _RefType):
+            wr, cached = hit
+            if wr() is src_arr:
+                return cached
+            # Stale entry: ndarray was GC'ed and id() reused.
+            compress_cache.pop(key, None)
+            return None
+        # Unknown/legacy entry format: drop to avoid using unvalidated data.
+        compress_cache.pop(key, None)
+        return None
 
     def _remap_union(arr: np.ndarray) -> np.ndarray:
         # Prefer the *last* axis matching full_n to avoid slicing nQ when
@@ -140,10 +240,10 @@ def _compress_static_for_active(static: dict[str, Any],
         if isinstance(v, np.ndarray):
             if k.startswith(("pos_map", "neg_map")) and v.ndim == 2 and v.dtype.kind in {"i", "u"}:
                 ck = ("map", id(v), active_key)
-                hit = compress_cache.get(ck)
+                hit = _cache_lookup(ck, v)
                 if hit is None:
                     hit = _remap_map(v)
-                    compress_cache[ck] = hit
+                    compress_cache[ck] = (weakref.ref(v), hit)
                 compressed[k] = hit
                 continue
             arr = v
@@ -155,10 +255,10 @@ def _compress_static_for_active(static: dict[str, Any],
                 and _is_union_key(k)
             ):
                 ck = ("union", id(arr), active_key)
-                hit = compress_cache.get(ck)
+                hit = _cache_lookup(ck, arr)
                 if hit is None:
                     hit = _remap_union(arr)
-                    compress_cache[ck] = hit
+                    compress_cache[ck] = (weakref.ref(arr), hit)
                 arr = hit
             compressed[k] = arr
         else:
@@ -170,57 +270,52 @@ def _compress_static_for_active(static: dict[str, Any],
     # These maps are used by facet/interface kernels to scatter per-field
     # basis rows into the union layout. They must remain aligned with the
     # same active_cols compression used for gdofs_map and union tables.
-    try:
-        if compressed.get("entity_kind") == "element":
-            full_n = int(getattr(me, "n_dofs_local", 0) or 0)
-            if full_n > 0:
-                col_map = -np.ones(full_n, dtype=np.int32)
-                for new_i, old_i in enumerate(active_cols):
-                    oi = int(old_i)
-                    if 0 <= oi < full_n:
-                        col_map[oi] = int(new_i)
+    if compressed.get("entity_kind") == "element":
+        full_n = int(getattr(me, "n_dofs_local", 0) or 0)
+        if full_n > 0:
+            col_map = -np.ones(full_n, dtype=np.int32)
+            for new_i, old_i in enumerate(active_cols):
+                oi = int(old_i)
+                if 0 <= oi < full_n:
+                    col_map[oi] = int(new_i)
 
-                # Only validate maps that carry an explicit field suffix:
-                #   pos_map_<field>, neg_map_<field>
-                # (Global pos_map/neg_map for ghost edges are handled elsewhere.)
-                for key, arr in compressed.items():
-                    if not (isinstance(key, str) and key.startswith(("pos_map_", "neg_map_"))):
-                        continue
-                    if not isinstance(arr, np.ndarray) or arr.ndim != 2 or arr.dtype.kind not in {"i", "u"}:
-                        continue
-                    m = re.match(r"^(pos|neg)_map_(.+)$", key)
-                    if not m:
-                        continue
-                    fld = m.group(2)
-                    sl = getattr(me, "component_dof_slices", {}).get(fld, None)
-                    if sl is None:
-                        continue
-                    full_idx = np.arange(int(sl.start), int(sl.stop), dtype=np.int32)
-                    expected = col_map[full_idx]
-                    # Field inactive for this kernel: nothing to validate.
-                    if not np.any(expected >= 0):
-                        continue
-                    if np.any(expected < 0):
-                        raise ValueError(
-                            f"[jit] active_cols dropped DOFs needed for '{key}' (field={fld!r}, slice={sl}, "
-                            f"full_n={full_n}, active_n={int(active_cols.size)})."
-                        )
-                    if int(arr.shape[1]) != int(expected.shape[0]):
-                        raise ValueError(
-                            f"[jit] Side map width mismatch for '{key}': got {arr.shape[1]}, expected {expected.shape[0]} "
-                            f"(field={fld!r}, slice={sl})."
-                        )
-                    if int(arr.shape[0]) > 0 and not np.array_equal(np.asarray(arr[0], dtype=np.int32), expected):
-                        raise ValueError(
-                            f"[jit] Side map '{key}' is misaligned with active_cols compression. "
-                            f"First-row map={arr[0].tolist()} expected={expected.tolist()} "
-                            f"(field={fld!r}, slice={sl}, full_n={full_n}, active_n={int(active_cols.size)})."
-                        )
-    except Exception:
-        # Re-raise with context; never silently ignore layout inconsistencies.
-        raise
+            # Only validate maps that carry an explicit field suffix:
+            #   pos_map_<field>, neg_map_<field>
+            # (Global pos_map/neg_map for ghost edges are handled elsewhere.)
+            for key, arr in compressed.items():
+                if not (isinstance(key, str) and key.startswith(("pos_map_", "neg_map_"))):
+                    continue
+                if not isinstance(arr, np.ndarray) or arr.ndim != 2 or arr.dtype.kind not in {"i", "u"}:
+                    continue
+                m = re.match(r"^(pos|neg)_map_(.+)$", key)
+                if not m:
+                    continue
+                fld = m.group(2)
+                sl = getattr(me, "component_dof_slices", {}).get(fld, None)
+                if sl is None:
+                    continue
+                full_idx = np.arange(int(sl.start), int(sl.stop), dtype=np.int32)
+                expected = col_map[full_idx]
+                # Field inactive for this kernel: nothing to validate.
+                if not np.any(expected >= 0):
+                    continue
+                if np.any(expected < 0):
+                    raise ValueError(
+                        f"[jit] active_cols dropped DOFs needed for '{key}' (field={fld!r}, slice={sl}, "
+                        f"full_n={full_n}, active_n={int(active_cols.size)})."
+                    )
+                if int(arr.shape[1]) != int(expected.shape[0]):
+                    raise ValueError(
+                        f"[jit] Side map width mismatch for '{key}': got {arr.shape[1]}, expected {expected.shape[0]} "
+                        f"(field={fld!r}, slice={sl})."
+                    )
+                if int(arr.shape[0]) > 0 and not np.array_equal(np.asarray(arr[0], dtype=np.int32), expected):
+                    raise ValueError(
+                        f"[jit] Side map '{key}' is misaligned with active_cols compression. "
+                        f"First-row map={arr[0].tolist()} expected={expected.tolist()} "
+                        f"(field={fld!r}, slice={sl}, full_n={full_n}, active_n={int(active_cols.size)})."
+                    )
     return compressed
-
 
 # New Newton: Create a class to handle data preparation and execution.
 class KernelRunner:
@@ -294,9 +389,11 @@ class KernelRunner:
                     try:
                         # Scalars are carried as 0d arrays for ABI compatibility.
                         kernel_args[name] = np.asarray(getattr(const, "value", const), dtype=np.float64)
-                    except Exception:
-                        # Leave as-is; missing/invalid will be caught below.
-                        pass
+                    except Exception as exc:
+                        raise TypeError(
+                            f"[jit] Failed converting Constant '{name}' to float64 array for kernel "
+                            f"(type={type(const).__name__}): {exc}"
+                        ) from exc
 
         # ---------------------------------------------------------------
         # A1) refresh Analytic parameters (time-dependent forcing support)
@@ -313,6 +410,15 @@ class KernelRunner:
             analytic_by_id = getattr(param, "analytic_by_id", None)
             if isinstance(analytic_by_id, dict) and analytic_by_id:
                 qp_phys = kernel_args.get("qp_phys")
+                needed = [
+                    f"ana_{int(func_id)}"
+                    for func_id in analytic_by_id.keys()
+                    if f"ana_{int(func_id)}" in self._param_set
+                ]
+                if needed and not isinstance(qp_phys, np.ndarray):
+                    raise KeyError(
+                        f"[jit] Missing static arg 'qp_phys' (ndarray) required to refresh Analytic values: {needed}."
+                    )
                 if isinstance(qp_phys, np.ndarray):
                     for func_id, ana in analytic_by_id.items():
                         name = f"ana_{int(func_id)}"
@@ -320,8 +426,11 @@ class KernelRunner:
                             continue
                         try:
                             vals = ana.eval(qp_phys)  # vectorized over (e,q)
-                        except Exception:
-                            continue
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"[jit] Analytic.eval failed for '{name}' (type={type(ana).__name__}, "
+                                f"qp_phys.shape={tuple(np.asarray(qp_phys).shape)}): {exc}"
+                            ) from exc
                         arr = np.asarray(vals, dtype=np.float64)
                         prev = kernel_args.get(name)
                         tshape = tuple(getattr(ana, "tensor_shape", ()) or ())
@@ -332,32 +441,31 @@ class KernelRunner:
                         # Keep ABI/shape expectations stable:
                         # - kernels index ana_* as (e,q,...) with trailing tensor_shape
                         # - Analytic.eval may return scalars/vectors/matrices that broadcast
-                        try:
-                            # Some callables naturally return *per-element* values
-                            # (shape (nE, ...) without the quadrature axis). Insert
-                            # a singleton q-axis so broadcasting can replicate it.
-                            if tshape:
-                                if arr.shape == (nE,) + tshape:
-                                    arr = arr[:, None, ...]
-                                elif arr.shape == (nQ,) + tshape:
-                                    arr = arr[None, :, ...]
-                            else:
-                                if arr.shape == (nE,):
-                                    arr = arr[:, None]
-                                elif arr.shape == (nQ,):
-                                    arr = arr[None, :]
+                        # Some callables naturally return *per-element* values
+                        # (shape (nE, ...) without the quadrature axis). Insert
+                        # a singleton q-axis so broadcasting can replicate it.
+                        if tshape:
+                            if arr.shape == (nE,) + tshape:
+                                arr = arr[:, None, ...]
+                            elif arr.shape == (nQ,) + tshape:
+                                arr = arr[None, :, ...]
+                        else:
+                            if arr.shape == (nE,):
+                                arr = arr[:, None]
+                            elif arr.shape == (nQ,):
+                                arr = arr[None, :]
 
+                        try:
                             refreshed = np.broadcast_to(arr, target_shape)
-                        except Exception:
-                            # If broadcasting is impossible, keep previous values (if any).
-                            continue
+                        except Exception as exc:
+                            raise ValueError(
+                                f"[jit] Analytic '{name}' produced array with shape {tuple(arr.shape)} "
+                                f"which cannot be broadcast to {target_shape}: {exc}"
+                            ) from exc
 
                         if isinstance(prev, np.ndarray) and prev.shape == target_shape:
-                            try:
-                                prev[...] = refreshed
-                                continue
-                            except Exception:
-                                pass
+                            prev[...] = refreshed
+                            continue
 
                         kernel_args[name] = np.asarray(refreshed, dtype=np.float64).copy()
 
@@ -465,9 +573,11 @@ class KernelRunner:
                     kernel_args[tag] = np.asarray(val.value, dtype=np.float64)
                 else:
                     kernel_args[tag] = np.asarray(val, dtype=np.float64)
-            except Exception:
-                # Leave it missing; the check below will raise a clear error.
-                pass
+            except Exception as exc:
+                raise TypeError(
+                    f"[jit] Failed converting auxiliary kernel arg '{tag}' (type={type(val).__name__}) "
+                    f"to a float64 ndarray: {exc}"
+                ) from exc
         # ---------------------------------------------------------------
         # D)  final sanity check – everything the kernel listed?
         # ---------------------------------------------------------------
@@ -554,7 +664,7 @@ def compile_backend(integral_expression, dof_handler,mixed_element, *, on_facet:
     ir_generator = IRGenerator()
     rank    = _form_rank(integral_expression)
     codegen = NumbaCodeGen(mixed_element=mixed_element,form_rank=rank, on_facet=on_facet) 
-    cache = KernelCache()
+    cache = _get_kernel_cache()
 
     ir_sequence = ir_generator.generate(integral_expression)
     param = getattr(ir_generator, "_param", None)
@@ -779,28 +889,25 @@ def _phi_signature_from_static(static: dict[str, Any] | None) -> dict[int, float
         return sig
     arr_eids = np.asarray(eids, dtype=np.int32)
     if phi_sig_arr is not None:
-        try:
-            arr_sig = np.asarray(phi_sig_arr, dtype=float)
-            if arr_sig.shape[0] == arr_eids.shape[0]:
-                for eid, val in zip(arr_eids, arr_sig):
-                    sig[int(eid)] = float(val)
-                return sig
-        except Exception:
-            pass
+        arr_sig = np.asarray(phi_sig_arr)
+        if (
+            arr_sig.ndim == 1
+            and int(arr_sig.shape[0]) == int(arr_eids.shape[0])
+            and arr_sig.dtype.kind in {"f", "i", "u", "b"}
+        ):
+            for eid, val in zip(arr_eids, arr_sig):
+                sig[int(eid)] = float(val)
+            return sig
 
     phis = static.get("phis")
     if phis is None:
         return sig
-    try:
-        arr_phi = np.asarray(phis)
-        if arr_phi.ndim >= 2 and arr_phi.shape[0] == arr_eids.shape[0]:
-            for eid, vals in zip(arr_eids, arr_phi):
-                try:
-                    sig[int(eid)] = float(vals.flat[0])
-                except Exception:
-                    continue
-    except Exception:
-        return {}
+    arr_phi = np.asarray(phis)
+    if arr_phi.ndim >= 2 and int(arr_phi.shape[0]) == int(arr_eids.shape[0]) and int(arr_phi.size) > 0:
+        first = np.asarray(arr_phi.reshape(int(arr_phi.shape[0]), -1)[:, 0])
+        if first.dtype.kind in {"f", "i", "u", "b"}:
+            for eid, val in zip(arr_eids, first):
+                sig[int(eid)] = float(val)
     return sig
 
 def compile_multi(form, *, dof_handler, mixed_element,
@@ -824,6 +931,13 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
     kernels : list[_IntegralKernel] = []
     fc = FormCompiler(dof_handler, quadrature_order=quad_order, backend=backend)
+    # C++ backend can accept strided arrays in the pybind11 wrapper, so we can
+    # keep broadcasted reference tables as views (avoid large copies during setup).
+    # Opt back into materialization via env when debugging ABI/stride issues.
+    materialize_tables = (
+        backend in {"cpp", "c++"}
+        and os.getenv("PYCUTFEM_CPP_MATERIALIZE_TABLES", "").lower() in {"1", "true", "yes"}
+    )
     if compress_cache is None:
         compress_cache = {}
     if gdofs_cache is None:
@@ -913,10 +1027,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
             for other in grp[1:]:
                 integrand_sum = integrand_sum + other.integrand
             fused = _IntegralExpr(integrand_sum, grp[0].measure)
-            try:
-                setattr(fused, "_fused_from", [int(id(x)) for x in grp])
-            except Exception:
-                pass
+            if hasattr(fused, "__dict__"):
+                fused._fused_from = [int(id(x)) for x in grp]
             fused_integrals.append(fused)
 
         integrals = fused_integrals
@@ -942,11 +1054,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
     use_unified = os.getenv("PYCUTFEM_UNIFIED_PRECOMPUTE", "1").lower() not in {"0", "false", "no"}
     # XFEM changes the local union layout dynamically; disable unified precompute
     # until it is explicitly made XFEM-aware.
-    try:
-        if hasattr(dof_handler, "n_enriched") and callable(getattr(dof_handler, "n_enriched")) and dof_handler.n_enriched() > 0:
+    n_enriched_fn = getattr(dof_handler, "n_enriched", None)
+    if callable(n_enriched_fn):
+        if int(n_enriched_fn()) > 0:
             use_unified = False
-    except Exception:
-        pass
     unified_reqs: dict[int, dict[str, Any]] = {}
     unified_cache: dict[int, dict[str, Any]] = {}
 
@@ -1032,10 +1143,12 @@ def compile_multi(form, *, dof_handler, mixed_element,
 
         # Determine current ids (mesh BitSets are rebuilt on classify_*).
         if can_cut or can_ifc:
-            try:
-                cut_ids_all = np.asarray(mixed_element.mesh.element_bitset("cut").to_indices(), dtype=np.int32)
-            except Exception:
-                cut_ids_all = np.asarray(mixed_element.mesh.element_bitset("cut"), dtype=np.int32)
+            bs_cut = mixed_element.mesh.element_bitset("cut")
+            cut_ids_all = (
+                np.asarray(bs_cut.to_indices(), dtype=np.int32)
+                if hasattr(bs_cut, "to_indices")
+                else np.asarray(bs_cut, dtype=np.int32)
+            )
         else:
             cut_ids_all = np.zeros((0,), dtype=np.int32)
         cut_ids = cut_ids_all if can_cut else np.zeros((0,), dtype=np.int32)
@@ -1053,19 +1166,21 @@ def compile_multi(form, *, dof_handler, mixed_element,
         else:
             bs = None
         if bs is not None:
-            try:
-                ghost_ids = np.asarray(bs.to_indices(), dtype=np.int32)
-            except Exception:
-                ghost_ids = np.asarray(bs, dtype=np.int32)
+            ghost_ids = (
+                np.asarray(bs.to_indices(), dtype=np.int32)
+                if hasattr(bs, "to_indices")
+                else np.asarray(bs, dtype=np.int32)
+            )
         else:
             ghost_ids = np.zeros((0,), dtype=np.int32)
 
         if can_facet:
             bs_fp = mixed_element.mesh.edge_bitset("ghost")
-            try:
-                facet_patch_ids = np.asarray(bs_fp.to_indices(), dtype=np.int32)
-            except Exception:
-                facet_patch_ids = np.asarray(bs_fp, dtype=np.int32)
+            facet_patch_ids = (
+                np.asarray(bs_fp.to_indices(), dtype=np.int32)
+                if hasattr(bs_fp, "to_indices")
+                else np.asarray(bs_fp, dtype=np.int32)
+            )
         else:
             facet_patch_ids = np.zeros((0,), dtype=np.int32)
 
@@ -1136,10 +1251,10 @@ def compile_multi(form, *, dof_handler, mixed_element,
         eids = static.get("eids", None)
         if eids is None:
             return static
-        try:
-            n_total = int(np.asarray(eids).shape[0])
-        except Exception:
+        eids_arr = np.asarray(eids)
+        if eids_arr.ndim < 1:
             return static
+        n_total = int(eids_arr.shape[0])
         if mask.shape[0] != n_total:
             return static
         out: dict[str, Any] = {}
@@ -1187,12 +1302,15 @@ def compile_multi(form, *, dof_handler, mixed_element,
         # XFEM: interface/ghost-edge kernels need to compile against the expanded
         # element-local layout when enrichment is active.
         me_kernel = mixed_element
-        try:
-            if dom in {"interface", "ghost_edge", "facet_patch"} and hasattr(dof_handler, "n_enriched") and callable(getattr(dof_handler, "n_enriched")):
-                if dof_handler.n_enriched() > 0 and hasattr(dof_handler, "xfem_mixed_element") and callable(getattr(dof_handler, "xfem_mixed_element")):
-                    me_kernel = dof_handler.xfem_mixed_element()
-        except Exception:
-            me_kernel = mixed_element
+        if dom in {"interface", "ghost_edge", "facet_patch"}:
+            n_enriched_fn = getattr(dof_handler, "n_enriched", None)
+            if callable(n_enriched_fn) and int(n_enriched_fn()) > 0:
+                xfem_fn = getattr(dof_handler, "xfem_mixed_element", None)
+                if not callable(xfem_fn):
+                    raise RuntimeError(
+                        "[jit] DofHandler reports enriched DOFs (n_enriched>0) but has no callable xfem_mixed_element()."
+                    )
+                me_kernel = xfem_fn()
 
         n_loc  = me_kernel.n_dofs_per_elem
 
@@ -1203,7 +1321,28 @@ def compile_multi(form, *, dof_handler, mixed_element,
         # Prefer an explicit hint from the runner/codegen when present.
         runner_active = getattr(runner, "active_fields", None)
         if runner_active:
-            active_fields = tuple(runner_active)
+            me_order = tuple(getattr(me_kernel, "field_names", ()))
+            unknown = [f for f in runner_active if f not in me_order]
+            if unknown:
+                raise ValueError(
+                    f"[jit] runner.active_fields contains unknown fields {unknown} "
+                    f"(known={list(me_order)})."
+                )
+            # Preserve MixedElement field order: DOF layout is order-dependent.
+            active_fields = tuple([f for f in me_order if f in set(runner_active)])
+
+        # Validate that the kernel ABI does not request fields that active_fields
+        # would drop. If this ever triggers, it indicates a codegen/IR mismatch
+        # that would otherwise lead to hard-to-debug table misalignment.
+        po = list(getattr(runner, "param_order", []) or [])
+        abi_fields = _fields_from_param_order(po, me_kernel)
+        if abi_fields:
+            missing = [f for f in abi_fields if f not in set(active_fields)]
+            if missing:
+                raise ValueError(
+                    f"[jit] Kernel ABI requests fields {missing} not present in active_fields={active_fields} "
+                    f"(domain={intg.measure.domain_type}, on_facet={bool(on_facet)})."
+                )
 
         active_cols = _active_columns(me_kernel, active_fields)
         if os.getenv("PYCUTFEM_JIT_DEBUG_ACTIVE", "").lower() in {"1", "true", "yes"}:
@@ -1309,6 +1448,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         param_order=runner.param_order,
                         pre_built=geom,
                         jit_param=getattr(runner, "_jit_param", None),
+                        active_cols=active_cols,
+                        materialize_tables=materialize_tables,
                     )
                 )
                 static = _compress_static_for_active(static, mixed_element, active_cols, compress_cache=compress_cache)
@@ -1351,28 +1492,42 @@ def compile_multi(form, *, dof_handler, mixed_element,
             ir_cut = ir
             me_cut = mixed_element
             active_cols_cut = np.asarray(active_cols, dtype=np.int32)
-            try:
-                if (
-                    hasattr(dof_handler, "n_enriched")
-                    and callable(getattr(dof_handler, "n_enriched"))
-                    and dof_handler.n_enriched() > 0
-                    and hasattr(dof_handler, "xfem_mixed_element")
-                    and callable(getattr(dof_handler, "xfem_mixed_element"))
-                ):
-                    me_cut = dof_handler.xfem_mixed_element()
-                    runner_cut, ir_cut = fc._compile_backend(intg.integrand, dof_handler, me_cut, on_facet=on_facet)
-                    active_fields_cut = _active_field_order(ir_cut, me_cut)
-                    runner_active_cut = getattr(runner_cut, "active_fields", None)
-                    if runner_active_cut:
-                        active_fields_cut = tuple(runner_active_cut)
-                    active_cols_cut = _active_columns(me_cut, active_fields_cut)
-                    use_xfem_cut = True
-            except Exception:
-                use_xfem_cut = False
-                runner_cut = runner
-                ir_cut = ir
-                me_cut = mixed_element
-                active_cols_cut = np.asarray(active_cols, dtype=np.int32)
+            n_enriched_fn = getattr(dof_handler, "n_enriched", None)
+            if callable(n_enriched_fn) and int(n_enriched_fn()) > 0:
+                xfem_fn = getattr(dof_handler, "xfem_mixed_element", None)
+                if not callable(xfem_fn):
+                    raise RuntimeError(
+                        "[jit] DofHandler reports enriched DOFs (n_enriched>0) but has no callable xfem_mixed_element()."
+                    )
+                me_cut = xfem_fn()
+                runner_cut, ir_cut = fc._compile_backend(
+                    intg.integrand, dof_handler, me_cut, on_facet=on_facet
+                )
+                active_fields_cut = _active_field_order(ir_cut, me_cut)
+                runner_active_cut = getattr(runner_cut, "active_fields", None)
+                if runner_active_cut:
+                    me_order_cut = tuple(getattr(me_cut, "field_names", ()))
+                    unknown = [f for f in runner_active_cut if f not in me_order_cut]
+                    if unknown:
+                        raise ValueError(
+                            f"[jit] runner_cut.active_fields contains unknown fields {unknown} "
+                            f"(known={list(me_order_cut)})."
+                        )
+                    active_fields_cut = tuple([f for f in me_order_cut if f in set(runner_active_cut)])
+
+                # Validate that the kernel ABI does not request fields that would be
+                # dropped by the active-field selection for XFEM cut kernels.
+                po_cut = list(getattr(runner_cut, "param_order", []) or [])
+                abi_fields_cut = _fields_from_param_order(po_cut, me_cut)
+                if abi_fields_cut:
+                    missing = [f for f in abi_fields_cut if f not in set(active_fields_cut)]
+                    if missing:
+                        raise ValueError(
+                            f"[jit] XFEM cut kernel ABI requests fields {missing} not present in active_fields_cut={active_fields_cut}."
+                        )
+
+                active_cols_cut = _active_columns(me_cut, active_fields_cut)
+                use_xfem_cut = True
 
             # NOTE: These helper/build functions are called later via kernel.refresh().
             # Bind loop-variant values as default args to avoid Python's late-binding
@@ -1380,18 +1535,25 @@ def compile_multi(form, *, dof_handler, mixed_element,
             def _current_sets(ls_obj, _mesh=mesh):
                 """Return (inside, outside, cut) ids for the given level set."""
                 _ensure_mesh(ls_obj, need_interface_segments=False)
-                try:
-                    inside_now = np.asarray(_mesh.element_bitset("inside").to_indices(), dtype=np.int32)
-                except Exception:
-                    inside_now = np.asarray(_mesh.element_bitset("inside"), dtype=np.int32)
-                try:
-                    outside_now = np.asarray(_mesh.element_bitset("outside").to_indices(), dtype=np.int32)
-                except Exception:
-                    outside_now = np.asarray(_mesh.element_bitset("outside"), dtype=np.int32)
-                try:
-                    cut_now = np.asarray(_mesh.element_bitset("cut").to_indices(), dtype=np.int32)
-                except Exception:
-                    cut_now = np.asarray(_mesh.element_bitset("cut"), dtype=np.int32)
+                inside_bs = _mesh.element_bitset("inside")
+                outside_bs = _mesh.element_bitset("outside")
+                cut_bs = _mesh.element_bitset("cut")
+
+                inside_now = (
+                    np.asarray(inside_bs.to_indices(), dtype=np.int32)
+                    if hasattr(inside_bs, "to_indices")
+                    else np.asarray(inside_bs, dtype=np.int32)
+                )
+                outside_now = (
+                    np.asarray(outside_bs.to_indices(), dtype=np.int32)
+                    if hasattr(outside_bs, "to_indices")
+                    else np.asarray(outside_bs, dtype=np.int32)
+                )
+                cut_now = (
+                    np.asarray(cut_bs.to_indices(), dtype=np.int32)
+                    if hasattr(cut_bs, "to_indices")
+                    else np.asarray(cut_bs, dtype=np.int32)
+                )
                 return inside_now, outside_now, cut_now
 
             def _apply_defined_on(ids: np.ndarray, _bs=bs) -> np.ndarray:
@@ -1530,6 +1692,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             gdofs_map=gdofs_map_full,
                             param_order=_param_order,
                             pre_built=geom_full,
+                            active_cols=_active_cols,
+                            materialize_tables=materialize_tables,
                         )
                     )
                     static_full = _compress_static_for_active(static_full, _me, _active_cols, compress_cache=compress_cache)
@@ -1541,10 +1705,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 # Fast in-place refresh: when the full-element set changes by only a few
                 # elements, update the affected rows instead of rebuilding huge arrays.
                 if reuse_static is not None and isinstance(reuse_static, dict) and treat_phis_static:
-                    try:
-                        old_eids = np.asarray(reuse_static.get("eids", []), dtype=np.int32)
-                    except Exception:
-                        old_eids = np.zeros((0,), dtype=np.int32)
+                    old_eids = np.asarray(reuse_static.get("eids", []), dtype=np.int32)
                     if (
                         os.getenv("PYCUTFEM_FULL_STATIC_INPLACE_TRACE", "").lower() in {"1", "true", "yes"}
                         and int(full_ids.size) >= 1000
@@ -1577,39 +1738,77 @@ def compile_multi(form, *, dof_handler, mixed_element,
                                 f"removed={removed_n} added={int(added.size)}"
                             )
                         if int(added.size) == removed_n:
-                            slots = np.nonzero(removed_mask)[0]
-                            for slot, new_eid in zip(slots, added):
-                                ee = int(new_eid)
-                                old_eids[slot] = ee
-                                # Update geometry rows (qp/weights/J) from the global background cache.
-                                for key in ("qp_phys", "qw", "detJ", "J_inv", "normals"):
-                                    try:
+                            # Preflight: only do in-place updates when all stored arrays are compatible.
+                            trace_inplace = os.getenv("PYCUTFEM_FULL_STATIC_INPLACE_TRACE", "").lower() in {"1", "true", "yes"}
+                            inplace_ok = True
+                            geom_keys = ("qp_phys", "qw", "detJ", "J_inv", "normals")
+                            for key in geom_keys:
+                                dst = reuse_static.get(key, None)
+                                src = _geom_bg.get(key, None)
+                                if dst is None and src is None:
+                                    continue
+                                if not (isinstance(dst, np.ndarray) and isinstance(src, np.ndarray)):
+                                    inplace_ok = False
+                                    if trace_inplace:
+                                        print(f"[jit] full_static inplace skipped (missing/non-array): key={key!r}")
+                                    break
+                                if int(dst.shape[0]) != int(old_eids.size) or dst.ndim != src.ndim or dst.shape[1:] != src.shape[1:]:
+                                    inplace_ok = False
+                                    if trace_inplace:
+                                        print(
+                                            f"[jit] full_static inplace skipped (shape mismatch): key={key!r} "
+                                            f"dst.shape={tuple(dst.shape)} src.shape={tuple(src.shape)} n={int(old_eids.size)}"
+                                        )
+                                    break
+
+                            owner_arr = reuse_static.get("owner_id", None)
+                            if inplace_ok and isinstance(owner_arr, np.ndarray):
+                                if owner_arr.ndim != 1 or int(owner_arr.shape[0]) != int(old_eids.size):
+                                    inplace_ok = False
+                                    if trace_inplace:
+                                        print(
+                                            f"[jit] full_static inplace skipped (owner_id shape): owner_id.shape={tuple(owner_arr.shape)} n={int(old_eids.size)}"
+                                        )
+
+                            gdofs_arr = reuse_static.get("gdofs_map", None)
+                            if inplace_ok and isinstance(gdofs_arr, np.ndarray):
+                                if (
+                                    gdofs_arr.ndim != 2
+                                    or int(gdofs_arr.shape[0]) != int(old_eids.size)
+                                    or int(gdofs_arr.shape[1]) != int(_active_cols.size)
+                                ):
+                                    inplace_ok = False
+                                    if trace_inplace:
+                                        print(
+                                            f"[jit] full_static inplace skipped (gdofs_map shape): gdofs_map.shape={tuple(gdofs_arr.shape)} "
+                                            f"expected=({int(old_eids.size)},{int(_active_cols.size)})"
+                                        )
+
+                            if inplace_ok:
+                                slots = np.nonzero(removed_mask)[0]
+                                for slot, new_eid in zip(slots, added):
+                                    ee = int(new_eid)
+                                    old_eids[slot] = ee
+                                    # Update geometry rows (qp/weights/J) from the global background cache.
+                                    for key in geom_keys:
                                         dst = reuse_static.get(key, None)
                                         src = _geom_bg.get(key, None)
                                         if isinstance(dst, np.ndarray) and isinstance(src, np.ndarray):
                                             dst[slot] = src[ee]
-                                    except Exception:
-                                        pass
-                                if has_phis and const_phi_on and isinstance(reuse_static.get("phis", None), np.ndarray):
-                                    reuse_static["phis"][slot] = phi_const_val
-                                # owner_id is used to index global h_arr / EWC arrays in kernels.
-                                try:
-                                    if isinstance(reuse_static.get("owner_id", None), np.ndarray):
-                                        reuse_static["owner_id"][slot] = ee
-                                except Exception:
-                                    pass
-                                # Update the per-element DOF map row for coefficient gathering.
-                                try:
-                                    if isinstance(reuse_static.get("gdofs_map", None), np.ndarray):
-                                        reuse_static["gdofs_map"][slot] = np.asarray(
-                                            _dof_handler.get_elemental_dofs(ee), dtype=np.int32
-                                        )[_active_cols]
-                                except Exception:
-                                    pass
-                            reuse_static["eids"] = old_eids
-                            _full_cache["ids"] = old_eids
-                            _full_cache["static"] = reuse_static
-                            return reuse_static
+                                    if has_phis and const_phi_on and isinstance(reuse_static.get("phis", None), np.ndarray):
+                                        reuse_static["phis"][slot] = phi_const_val
+                                    # owner_id is used to index global h_arr / EWC arrays in kernels.
+                                    if isinstance(owner_arr, np.ndarray):
+                                        owner_arr[slot] = ee
+                                    # Update the per-element DOF map row for coefficient gathering.
+                                    if isinstance(gdofs_arr, np.ndarray):
+                                        gdofs_arr[slot] = np.asarray(_dof_handler.get_elemental_dofs(ee), dtype=np.int32)[
+                                            _active_cols
+                                        ]
+                                reuse_static["eids"] = old_eids
+                                _full_cache["ids"] = old_eids
+                                _full_cache["static"] = reuse_static
+                                return reuse_static
 
                 prev_ids = _full_cache.get("ids")
                 if prev_ids is not None and np.array_equal(full_ids, prev_ids) and treat_phis_static:
@@ -1666,6 +1865,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         gdofs_map=gdofs_map_full,
                         param_order=_param_order,
                         pre_built=geom_full,
+                        active_cols=_active_cols,
+                        materialize_tables=materialize_tables,
                     )
                 )
                 static_full = _compress_static_for_active(static_full, _me, _active_cols, compress_cache=compress_cache)
@@ -1767,6 +1968,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         gdofs_map=gdofs_map_cut,
                         param_order=_param_order,
                         pre_built=static_cut,
+                        active_cols=_active_cols,
+                        materialize_tables=materialize_tables,
                     )
                 )
                 static_cut = _compress_static_for_active(static_cut, _me, _active_cols, compress_cache=compress_cache)
@@ -1848,10 +2051,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 # so never capture them across refreshes; always fetch a fresh view.
                 bs_cut_now = _me.mesh.element_bitset("cut")
                 cut_eids_bitset = (_bs_def & bs_cut_now) if _bs_def is not None else bs_cut_now
-                try:
-                    new_eids_full = np.asarray(cut_eids_bitset.to_indices(), dtype=np.int32)
-                except Exception:
-                    new_eids_full = np.asarray(cut_eids_bitset, dtype=np.int32)
+                new_eids_full = (
+                    np.asarray(cut_eids_bitset.to_indices(), dtype=np.int32)
+                    if hasattr(cut_eids_bitset, "to_indices")
+                    else np.asarray(cut_eids_bitset, dtype=np.int32)
+                )
                 new_eids_full = np.unique(new_eids_full)
                 if new_eids_full.size == 0:
                     gdofs_map = np.zeros((0, int(_active_cols.size)), dtype=np.int32)
@@ -1877,6 +2081,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             gdofs_map=gdofs_map,
                             param_order=_param_order,
                             pre_built=empty,
+                            active_cols=_active_cols,
+                            materialize_tables=materialize_tables,
                         )
                     )
                     return empty
@@ -1933,6 +2139,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         gdofs_map=gdofs_map,
                         param_order=_param_order,
                         pre_built=static,
+                        active_cols=eff_cols,
+                        materialize_tables=materialize_tables,
                     )
                 )
                 static = _compress_static_for_active(static, _me, eff_cols, compress_cache=compress_cache)
@@ -1985,16 +2193,20 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 edge_sel = base_edges
                 if _bs_def is not None:
                     # If defined_on is an edge mask (same length as edges), respect it.
-                    try:
-                        if len(_bs_def) == len(mesh_obj.edges_list):
-                            edge_sel = _bs_def & base_edges
-                    except Exception:
-                        pass
+                    if hasattr(_bs_def, "__len__") and int(len(_bs_def)) == int(len(mesh_obj.edges_list)):
+                        from pycutfem.utils.bitset import BitSet
 
-                try:
-                    all_eids = np.asarray(edge_sel.to_indices(), dtype=np.int32)
-                except Exception:
-                    all_eids = np.asarray(edge_sel, dtype=np.int32)
+                        if isinstance(_bs_def, BitSet):
+                            edge_sel = _bs_def & base_edges
+                        else:
+                            mask = np.asarray(_bs_def, dtype=bool)
+                            edge_sel = BitSet(mask) & base_edges
+
+                all_eids = (
+                    np.asarray(edge_sel.to_indices(), dtype=np.int32)
+                    if hasattr(edge_sel, "to_indices")
+                    else np.asarray(edge_sel, dtype=np.int32)
+                )
                 all_eids = np.unique(all_eids)
                 if all_eids.size == 0:
                     # Empty aligned-interface set: still return a complete static dict so
@@ -2042,6 +2254,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             gdofs_map=gdofs_map,
                             param_order=_param_order,
                             pre_built=empty,
+                            active_cols=_active_cols,
+                            materialize_tables=materialize_tables,
                         )
                     )
                     return empty
@@ -2097,6 +2311,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         gdofs_map=gdofs_map,
                         param_order=_param_order,
                         pre_built=static,
+                        active_cols=(None if use_full_union else eff_cols),
+                        materialize_tables=materialize_tables,
                     )
                 )
                 if not use_full_union:
@@ -2171,6 +2387,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     gdofs_map=gdofs_map,
                     param_order=tuple(getattr(runner, "param_order", []) or []),
                     pre_built=static,
+                    active_cols=(None if use_full_union else eff_cols),
+                    materialize_tables=materialize_tables,
                 )
             )
             if not use_full_union:
@@ -2224,10 +2442,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 # Always fetch current ghost edges (mesh edge BitSets are rebuilt on classify_edges).
                 bs_ghost_now = mesh_obj.edge_bitset("ghost")
                 edge_sel = (_bs_def & bs_ghost_now) if _bs_def is not None else bs_ghost_now
-                try:
-                    all_eids = np.asarray(edge_sel.to_indices(), dtype=np.int32)
-                except Exception:
-                    all_eids = np.asarray(edge_sel, dtype=np.int32)
+                all_eids = (
+                    np.asarray(edge_sel.to_indices(), dtype=np.int32)
+                    if hasattr(edge_sel, "to_indices")
+                    else np.asarray(edge_sel, dtype=np.int32)
+                )
                 all_eids = np.unique(all_eids)
                 if all_eids.size == 0:
                     gdofs_map = np.zeros((0, int(_active_cols.size)), dtype=np.int32)
@@ -2255,6 +2474,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                             gdofs_map=gdofs_map,
                             param_order=_param_order,
                             pre_built=empty,
+                            active_cols=_active_cols,
+                            materialize_tables=materialize_tables,
                         )
                     )
                     return empty
@@ -2309,6 +2530,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         gdofs_map=gdofs_map,
                         param_order=_param_order,
                         pre_built=static,
+                        active_cols=(None if use_full_union else eff_cols),
+                        materialize_tables=materialize_tables,
                     )
                 )
                 if not use_full_union:
@@ -2373,10 +2596,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 mesh_obj = _me.mesh
                 bs_ghost_now = mesh_obj.edge_bitset("ghost")
                 edge_sel = (_bs_def & bs_ghost_now) if _bs_def is not None else bs_ghost_now
-                try:
-                    all_eids = np.asarray(edge_sel.to_indices(), dtype=np.int32)
-                except Exception:
-                    all_eids = np.asarray(edge_sel, dtype=np.int32)
+                all_eids = (
+                    np.asarray(edge_sel.to_indices(), dtype=np.int32)
+                    if hasattr(edge_sel, "to_indices")
+                    else np.asarray(edge_sel, dtype=np.int32)
+                )
                 all_eids = np.unique(all_eids)
 
                 geom_src = None
@@ -2435,6 +2659,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         gdofs_map=gdofs_map,
                         param_order=_param_order,
                         pre_built=static,
+                        active_cols=(None if use_full_union else eff_cols),
+                        materialize_tables=materialize_tables,
                     )
                 )
                 if not use_full_union:
@@ -2480,6 +2706,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     need_o4=need_o4,
                     level_set=getattr(intg.measure, "level_set", None),
                     deformation=deformation,
+                    active_cols=active_cols,
                 )
                 geom_local = dict(geom)
                 geom_local["is_ghost"] = False
@@ -2511,6 +2738,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         gdofs_map=gdofs_map,
                         param_order=runner.param_order,
                         pre_built=static,
+                        active_cols=active_cols,
+                        materialize_tables=materialize_tables,
                     )
                 )
                 if not use_full_union:
@@ -2562,6 +2791,7 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     deformation=deformation,
                     level_set=ls_obj,
                     side=str(side),
+                    active_cols=active_cols,
                 )
                 geom_local = dict(geom)
                 geom_local["is_ghost"] = False
@@ -2593,6 +2823,8 @@ def compile_multi(form, *, dof_handler, mixed_element,
                         gdofs_map=gdofs_map,
                         param_order=runner.param_order,
                         pre_built=static,
+                        active_cols=active_cols,
+                        materialize_tables=materialize_tables,
                     )
                 )
                 if not use_full_union:
@@ -2640,17 +2872,18 @@ def compile_multi(form, *, dof_handler, mixed_element,
                 need_hess=need_hess,
                 need_o3=need_o3,
                 need_o4=need_o4,
+                active_cols=active_cols,
             )
             if geo.get("eids", np.zeros(0, dtype=np.int32)).size == 0:
                 continue
 
             geo_local = dict(geo)
-            gdofs_raw = np.asarray(geo_local.get("gdofs_map", np.zeros((0, n_loc), dtype=np.int32)), dtype=np.int32)
-            ncols = gdofs_raw.shape[1] if gdofs_raw.ndim == 2 else 0
-            eff_cols = active_cols[active_cols < ncols] if ncols else active_cols
-            if eff_cols.size == 0 and ncols:
-                eff_cols = np.arange(ncols, dtype=np.int32)
-            gdofs_map = gdofs_raw[:, eff_cols] if gdofs_raw.size else gdofs_raw
+            gdofs_raw = np.asarray(
+                geo_local.get("gdofs_map", np.zeros((0, int(active_cols.size)), dtype=np.int32)),
+                dtype=np.int32,
+            )
+            gdofs_map = gdofs_raw
+            geo_local["gdofs_map"] = gdofs_map
             geo_local["is_interface"] = False
             geo_local["is_ghost"] = False
             geo_local["entity_kind"] = "edge"
@@ -2666,9 +2899,11 @@ def compile_multi(form, *, dof_handler, mixed_element,
                     gdofs_map=gdofs_map,
                     param_order=runner.param_order,
                     pre_built=static,
+                    active_cols=active_cols,
+                    materialize_tables=materialize_tables,
                 )
             )
-            static = _compress_static_for_active(static, mixed_element, eff_cols, compress_cache=compress_cache)
+            static = _compress_static_for_active(static, mixed_element, active_cols, compress_cache=compress_cache)
             eids_arr = np.asarray(static.get("eids", []), dtype=np.int32)
             _append_kernel(
                 _IntegralKernel(

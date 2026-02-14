@@ -1,3 +1,4 @@
+import os
 import numpy as np
 
 from pycutfem.core.dofhandler import DofHandler
@@ -547,12 +548,28 @@ def _assert_converges(errors_coarse: dict[str, float], errors_fine: dict[str, fl
 
 
 def test_fsi_eulerian_mms_convergence_variant_a_cut_interface_cpp_backend():
-    e0 = _solve_one_step_variant_a(nx=6, backend="cpp")
-    e1 = _solve_one_step_variant_a(nx=12, backend="cpp")
+    nx_spec = str(os.environ.get("PYCUTFEM_FSI_MMS_NX_LIST", "")).strip()
+    if nx_spec:
+        nx_list = [int(x.strip()) for x in nx_spec.split(",") if x.strip()]
+    else:
+        nx_list = [4, 8]
+    if len(nx_list) < 2:
+        raise ValueError("PYCUTFEM_FSI_MMS_NX_LIST must contain at least two mesh sizes (e.g. '4,8').")
+
+    e0 = _solve_one_step_variant_a(nx=nx_list[0], backend="cpp")
+    e1 = _solve_one_step_variant_a(nx=nx_list[1], backend="cpp")
     _assert_converges(e0, e1)
 
 
 def test_fsi_eulerian_mms_convergence_variant_b_cut_interface_cpp_backend():
-    e0 = _solve_one_step_variant_b(nx=6, backend="cpp")
-    e1 = _solve_one_step_variant_b(nx=12, backend="cpp")
+    nx_spec = str(os.environ.get("PYCUTFEM_FSI_MMS_NX_LIST", "")).strip()
+    if nx_spec:
+        nx_list = [int(x.strip()) for x in nx_spec.split(",") if x.strip()]
+    else:
+        nx_list = [4, 8]
+    if len(nx_list) < 2:
+        raise ValueError("PYCUTFEM_FSI_MMS_NX_LIST must contain at least two mesh sizes (e.g. '4,8').")
+
+    e0 = _solve_one_step_variant_b(nx=nx_list[0], backend="cpp")
+    e1 = _solve_one_step_variant_b(nx=nx_list[1], backend="cpp")
     _assert_converges(e0, e1)
