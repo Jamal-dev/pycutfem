@@ -571,6 +571,32 @@ def main() -> None:
         choices=("constant", "degenerate"),
         help="Mobility for Allen–Cahn terms: 'constant' or interface-localized 'degenerate' (M(alpha)=M0*alpha*(1-alpha)).",
     )
+    # Cahn–Hilliard options for alpha (mass-conserving regularization)
+    ap.add_argument(
+        "--alpha-ch-M",
+        type=float,
+        default=0.0,
+        help="Cahn–Hilliard mobility M_alpha (0 disables Cahn–Hilliard regularization).",
+    )
+    ap.add_argument(
+        "--alpha-ch-gamma",
+        type=float,
+        default=0.0,
+        help="Cahn–Hilliard surface-energy coefficient gamma_alpha (0 disables Cahn–Hilliard regularization).",
+    )
+    ap.add_argument(
+        "--alpha-ch-eps",
+        type=float,
+        default=None,
+        help="Cahn–Hilliard interface thickness epsilon (defaults to --eps).",
+    )
+    ap.add_argument(
+        "--alpha-ch-mobility",
+        type=str,
+        default="constant",
+        choices=("constant", "degenerate"),
+        help="Mobility for Cahn–Hilliard flux: 'constant' or interface-localized 'degenerate' (M(alpha)=M0*alpha*(1-alpha)).",
+    )
     ap.add_argument(
         "--k-crack",
         type=float,
@@ -1089,6 +1115,8 @@ def main() -> None:
         args.crack_depth = 0.0
         args.alpha_cahn_M = 0.0
         args.alpha_cahn_gamma = 0.0
+        args.alpha_ch_M = 0.0
+        args.alpha_ch_gamma = 0.0
         args.alpha_crack_k = 0.0
         args.damage_k = 0.0
         args.damage_D = 0.0
@@ -1132,6 +1160,8 @@ def main() -> None:
     # Alpha phase-field thickness defaults to the same smoothing length used to build alpha0.
     if getattr(args, "alpha_cahn_eps", None) is None:
         args.alpha_cahn_eps = float(args.eps)
+    if getattr(args, "alpha_ch_eps", None) is None:
+        args.alpha_ch_eps = float(args.eps)
 
     if getattr(args, "crack_x0", None) is None:
         args.crack_x0 = 0.5 * (float(args.x1) + float(args.x2))
@@ -1279,6 +1309,19 @@ def main() -> None:
     }
     ac_enabled = float(getattr(args, "alpha_cahn_M", 0.0) or 0.0) != 0.0 and float(getattr(args, "alpha_cahn_gamma", 0.0) or 0.0) != 0.0
     alpha_cahn_conservative = bool(getattr(args, "alpha_cahn_conservative", False))
+    ch_enabled = float(getattr(args, "alpha_ch_M", 0.0) or 0.0) != 0.0 and float(getattr(args, "alpha_ch_gamma", 0.0) or 0.0) != 0.0
+    if ac_enabled and ch_enabled:
+        raise ValueError("Allen–Cahn (--alpha-cahn-*) and Cahn–Hilliard (--alpha-ch-*) cannot both be enabled simultaneously.")
+    if ch_enabled:
+        if bool(getattr(args, "freeze_alpha", False)):
+            raise ValueError("Cahn–Hilliard (--alpha-ch-*) requires --no-freeze-alpha (alpha must be solved).")
+        if bool(getattr(args, "alpha_from_refmap", False)):
+            raise ValueError("Cahn–Hilliard (--alpha-ch-*) requires --no-alpha-from-refmap.")
+        print(
+            f"[info] Cahn–Hilliard alpha regularization enabled (mobility={str(getattr(args, 'alpha_ch_mobility', 'constant'))}): "
+            "adding chemical potential field mu_alpha."
+        )
+        field_specs["mu_alpha"] = 1
     if alpha_cahn_conservative:
         if not ac_enabled:
             raise ValueError("--alpha-cahn-conservative requires --alpha-cahn-M and --alpha-cahn-gamma to be nonzero.")
@@ -1305,6 +1348,7 @@ def main() -> None:
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
     dalpha = TrialFunction("alpha", dof_handler=dh)
+    dmu_alpha = TrialFunction("mu_alpha", dof_handler=dh) if ch_enabled else None
     dlambda_alpha = TrialFunction("lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     dd = TrialFunction("d", dof_handler=dh) if use_damage else None
     dS_trial = TrialFunction("S", dof_handler=dh)
@@ -1315,6 +1359,7 @@ def main() -> None:
     q_test = TestFunction("p", dof_handler=dh)
     phi_test = TestFunction("phi", dof_handler=dh)
     alpha_test = TestFunction("alpha", dof_handler=dh)
+    mu_alpha_test = TestFunction("mu_alpha", dof_handler=dh) if ch_enabled else None
     lambda_alpha_test = TestFunction("lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     d_test = TestFunction("d", dof_handler=dh) if use_damage else None
     S_test = TestFunction("S", dof_handler=dh)
@@ -1326,6 +1371,7 @@ def main() -> None:
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
+    mu_alpha_k = Function("mu_alpha_k", "mu_alpha", dof_handler=dh) if ch_enabled else None
     lambda_alpha_k = Function("lambda_alpha_k", "lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     d_k = Function("d_k", "d", dof_handler=dh) if use_damage else None
     S_k = Function("S_k", "S", dof_handler=dh)
@@ -1342,6 +1388,7 @@ def main() -> None:
         u_nm1 = VectorFunction("u_nm1", ["u_x", "u_y"], dof_handler=dh)
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
+    mu_alpha_n = Function("mu_alpha_n", "mu_alpha", dof_handler=dh) if ch_enabled else None
     lambda_alpha_n = Function("lambda_alpha_n", "lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     d_n = Function("d_n", "d", dof_handler=dh) if use_damage else None
     S_n = Function("S_n", "S", dof_handler=dh)
@@ -1508,8 +1555,8 @@ def main() -> None:
         restored: list[str] = []
         for f in [
             # Current/previous unknowns
-            v_k, p_k, u_k, phi_k, alpha_k, lambda_alpha_k, d_k, S_k, X_k,
-            v_n, p_n, u_n, phi_n, alpha_n, lambda_alpha_n, d_n, S_n, X_n,
+            v_k, p_k, u_k, phi_k, alpha_k, mu_alpha_k, lambda_alpha_k, d_k, S_k, X_k,
+            v_n, p_n, u_n, phi_n, alpha_n, mu_alpha_n, lambda_alpha_n, d_n, S_n, X_n,
             # Extra history / coefficients
             u_prev, u_nm1, a_prev,
         ]:
@@ -1550,6 +1597,7 @@ def main() -> None:
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
+        mu_alpha_k=mu_alpha_k,
         lambda_alpha_k=lambda_alpha_k,
         d_k=d_k,
         S_k=S_k,
@@ -1559,6 +1607,7 @@ def main() -> None:
         u_nm1=u_nm1,
         phi_n=phi_n,
         alpha_n=alpha_n,
+        mu_alpha_n=mu_alpha_n,
         lambda_alpha_n=lambda_alpha_n,
         d_n=d_n,
         S_n=S_n,
@@ -1567,6 +1616,7 @@ def main() -> None:
         du=du,
         dphi=dphi,
         dalpha=dalpha,
+        dmu_alpha=dmu_alpha,
         dlambda_alpha=dlambda_alpha,
         dS=dS_trial,
         dd=dd,
@@ -1575,6 +1625,7 @@ def main() -> None:
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,
+        mu_alpha_test=mu_alpha_test,
         lambda_alpha_test=lambda_alpha_test,
         S_test=S_test,
         d_test=d_test,
@@ -1607,6 +1658,10 @@ def main() -> None:
         alpha_cahn_eps=float(getattr(args, "alpha_cahn_eps", float(args.eps))),
         alpha_cahn_conservative=alpha_cahn_conservative,
         alpha_cahn_mobility=str(getattr(args, "alpha_cahn_mobility", "constant")),
+        alpha_ch_M=float(getattr(args, "alpha_ch_M", 0.0)),
+        alpha_ch_gamma=float(getattr(args, "alpha_ch_gamma", 0.0)),
+        alpha_ch_eps=float(getattr(args, "alpha_ch_eps", float(args.eps))),
+        alpha_ch_mobility=str(getattr(args, "alpha_ch_mobility", "constant")),
         alpha_crack_k=float(getattr(args, "k_crack", 0.0)),
         alpha_crack_Dc=float(getattr(args, "D_crack", 0.0)),
         alpha_crack_m=float(getattr(args, "m_crack", 1.0)),
@@ -1803,7 +1858,12 @@ def main() -> None:
             return
         if float(getattr(args, "k_crack", 0.0) or 0.0) != 0.0:
             return
-        if float(getattr(args, "alpha_cahn_M", 0.0) or 0.0) != 0.0 or float(getattr(args, "alpha_cahn_gamma", 0.0) or 0.0) != 0.0:
+        if (
+            float(getattr(args, "alpha_cahn_M", 0.0) or 0.0) != 0.0
+            or float(getattr(args, "alpha_cahn_gamma", 0.0) or 0.0) != 0.0
+            or float(getattr(args, "alpha_ch_M", 0.0) or 0.0) != 0.0
+            or float(getattr(args, "alpha_ch_gamma", 0.0) or 0.0) != 0.0
+        ):
             return
         res = logit_shift_to_match_integral(
             np.asarray(alpha_k.nodal_values, dtype=float),
@@ -2205,6 +2265,7 @@ def main() -> None:
             u_n,
             phi_n,
             alpha_n,
+            mu_alpha_n,
             lambda_alpha_n,
             d_n,
             S_n,
@@ -2287,6 +2348,7 @@ def main() -> None:
             u_k,
             phi_k,
             alpha_k,
+            *([mu_alpha_k] if ch_enabled else []),
             *([lambda_alpha_k] if alpha_cahn_conservative else []),
             *([d_k] if d_k is not None else []),
             S_k,
@@ -2298,6 +2360,7 @@ def main() -> None:
             u_n,
             phi_n,
             alpha_n,
+            *([mu_alpha_n] if ch_enabled else []),
             *([lambda_alpha_n] if alpha_cahn_conservative else []),
             *([d_n] if d_n is not None else []),
             S_n,

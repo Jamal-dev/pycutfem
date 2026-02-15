@@ -192,6 +192,8 @@ class BiofilmOneDomainForms:
     r_skeleton: object
     r_phi: object
     r_alpha: object
+    # Optional: Cahn–Hilliard chemical potential equation for α (μ_α)
+    r_mu_alpha: object | None
     r_damage: object | None
     r_substrate: object
     # Optional per-block Jacobian contributions (useful for debugging/verification)
@@ -200,6 +202,7 @@ class BiofilmOneDomainForms:
     a_skeleton: object | None = None
     a_phi: object | None = None
     a_alpha: object | None = None
+    a_mu_alpha: object | None = None
     a_damage: object | None = None
     a_substrate: object | None = None
     r_detached: object | None = None
@@ -217,6 +220,7 @@ def build_biofilm_one_domain_forms(
     u_k,
     phi_k,
     alpha_k,
+    mu_alpha_k=None,
     S_k,
     # optional: bulk damage / cohesion loss (0=intact, 1=failed)
     d_k=None,
@@ -228,6 +232,7 @@ def build_biofilm_one_domain_forms(
     u_n,
     phi_n,
     alpha_n,
+    mu_alpha_n=None,
     S_n,
     # optional: bulk damage at t_n
     d_n=None,
@@ -241,6 +246,7 @@ def build_biofilm_one_domain_forms(
     du,
     dphi,
     dalpha,
+    dmu_alpha=None,
     dS,
     dd=None,
     dX=None,
@@ -250,6 +256,7 @@ def build_biofilm_one_domain_forms(
     u_test,
     phi_test,
     alpha_test,
+    mu_alpha_test=None,
     S_test,
     d_test=None,
     X_test=None,
@@ -295,6 +302,11 @@ def build_biofilm_one_domain_forms(
     lambda_alpha_n=None,
     dlambda_alpha=None,
     lambda_alpha_test=None,
+    # Cahn–Hilliard regularization for α (mass-conserving phase-field)
+    alpha_ch_M: float = 0.0,
+    alpha_ch_gamma: float = 0.0,
+    alpha_ch_eps: float = 1.0,
+    alpha_ch_mobility: str = "constant",
     # Crack propagation: additional surface speed term V_crack via δ(α)
     alpha_crack_k: float = 0.0,
     alpha_crack_Dc: float = 0.0,
@@ -1257,8 +1269,16 @@ def build_biofilm_one_domain_forms(
 
     r_alpha = alpha_test * f_alpha_k * dx
     r_alpha += D_alpha_c * inner(grad(alpha_k), grad(alpha_test)) * dx
+
+    # Cahn–Hilliard regularization: α_t + ... = div( M(α) ∇μ_α ), μ_α = γ(-εΔα + (1/ε)W'(α)).
+    ch_enabled = float(alpha_ch_M) != 0.0 and float(alpha_ch_gamma) != 0.0
+    if bool(alpha_cahn_conservative) and ch_enabled:
+        raise ValueError("alpha_cahn_conservative cannot be used together with Cahn–Hilliard regularization (alpha_ch_*).")
+
     # Allen–Cahn regularization: -(Mγ ε Δα) + (Mγ/ε) W'(α) in the residual.
     ac_enabled = float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0
+    if ac_enabled and ch_enabled:
+        raise ValueError("Allen–Cahn (alpha_cahn_*) and Cahn–Hilliard (alpha_ch_*) cannot both be enabled simultaneously.")
     if ac_enabled:
         # W'(α) for W(α)=α^2(1-α)^2 is 2α(1-α)(1-2α).
         Wp_k = _c(2.0) * alpha_k * _one_minus(alpha_k) * _one_minus(_c(2.0) * alpha_k)
@@ -1293,6 +1313,54 @@ def build_biofilm_one_domain_forms(
                     "alpha_cahn_conservative=True requires (lambda_alpha_k, dlambda_alpha, lambda_alpha_test) to be provided."
                 )
             r_alpha += -alpha_test * (M_ac_k * lambda_alpha_k) * dx
+
+    r_mu_alpha = None
+    a_mu_alpha = None
+    if ch_enabled:
+        if mu_alpha_k is None or mu_alpha_n is None or dmu_alpha is None or mu_alpha_test is None:
+            raise ValueError(
+                "Cahn–Hilliard regularization requires (mu_alpha_k, mu_alpha_n, dmu_alpha, mu_alpha_test) to be provided."
+            )
+        eps_ch_val = float(alpha_ch_eps)
+        if eps_ch_val <= 0.0:
+            raise ValueError(f"alpha_ch_eps must be > 0 when Cahn–Hilliard is enabled; got {eps_ch_val}.")
+        eps_ch_c = _c(max(eps_ch_val, 1.0e-12))
+
+        M_ch_c = _c(float(alpha_ch_M))
+        gamma_ch_c = _c(float(alpha_ch_gamma))
+
+        # Double-well derivative W'(α) for W(α)=α^2(1-α)^2 is 2α(1-α)(1-2α).
+        Wp_ch_k = _c(2.0) * alpha_k * _one_minus(alpha_k) * _one_minus(_c(2.0) * alpha_k)
+        # W''(α) = 2 - 12α + 12α^2
+        Wpp_ch_k = (-_c(12.0) * alpha_k) + (_c(12.0) * (alpha_k * alpha_k)) + _c(2.0)
+
+        mob_key = str(alpha_ch_mobility).strip().lower()
+        if mob_key in {"constant", "const"}:
+            M_ch_k = M_ch_c
+            M_ch_n = M_ch_c
+            dM_ch = _c(0.0) * dalpha
+        elif mob_key in {"degenerate", "deg", "alpha(1-alpha)", "alpha*(1-alpha)", "a(1-a)"}:
+            # Degenerate mobility: M(α)=M0 α(1-α)
+            mob_k = alpha_k * _one_minus(alpha_k)
+            mob_n = alpha_n * _one_minus(alpha_n)
+            mob_prime_k = _one_minus(_c(2.0) * alpha_k)  # d/dα [α(1-α)] = 1-2α
+            M_ch_k = M_ch_c * mob_k
+            M_ch_n = M_ch_c * mob_n
+            dM_ch = M_ch_c * mob_prime_k * dalpha
+        else:
+            raise ValueError(f"Unknown alpha_ch_mobility {alpha_ch_mobility!r}. Use 'constant' or 'degenerate'.")
+
+        # α equation: +∫ M(α) ∇μ · ∇w  (no-flux boundary)
+        #
+        # IMPORTANT: keep GradOpInfo on the left in scalar×grad products for backend
+        # compatibility (function×grad(function) is not implemented, but grad(function)×function is).
+        r_alpha += th * inner(grad(mu_alpha_k) * M_ch_k, grad(alpha_test)) * dx
+        r_alpha += one_m_th * inner(grad(mu_alpha_n) * M_ch_n, grad(alpha_test)) * dx
+
+        # μ equation: ∫ ψ ( μ - γ(-εΔα + (1/ε)W'(α)) ) dx = 0 (drop boundary term).
+        r_mu_alpha = mu_alpha_test * mu_alpha_k * dx
+        r_mu_alpha += -(gamma_ch_c * eps_ch_c) * inner(grad(alpha_k), grad(mu_alpha_test)) * dx
+        r_mu_alpha += -mu_alpha_test * ((gamma_ch_c / eps_ch_c) * Wp_ch_k) * dx
     r_alpha += -alpha_test * f_alpha * dx
 
     # Jacobian (k-part only)
@@ -1332,6 +1400,16 @@ def build_biofilm_one_domain_forms(
             a_alpha += alpha_test * (((dM_gamma / eps_alpha_c) * Wp_k) + ((M_gamma_k / eps_alpha_c) * Wpp_k * dalpha)) * dx
             if bool(alpha_cahn_conservative):
                 a_alpha += -alpha_test * ((dM_ac * lambda_alpha_k) + (M_ac_k * dlambda_alpha)) * dx
+
+    if ch_enabled:
+        # k-part Jacobian of ∫ M(α) ∇μ · ∇w
+        a_alpha += th * (dM_ch * inner(grad(mu_alpha_k), grad(alpha_test))) * dx
+        a_alpha += th * inner(M_ch_k * grad(dmu_alpha), grad(alpha_test)) * dx
+
+        # Jacobian of μ equation.
+        a_mu_alpha = mu_alpha_test * dmu_alpha * dx
+        a_mu_alpha += -(gamma_ch_c * eps_ch_c) * inner(grad(dalpha), grad(mu_alpha_test)) * dx
+        a_mu_alpha += -mu_alpha_test * ((gamma_ch_c / eps_ch_c) * Wpp_ch_k * dalpha) * dx
 
     # Optional consistent stabilization for advection-dominated α (useful with D_alpha=0).
     # - SUPG: τ (vS·∇w) R_alpha
@@ -1383,12 +1461,33 @@ def build_biofilm_one_domain_forms(
                 "alpha_cahn_conservative=True requires (lambda_alpha_k, dlambda_alpha, lambda_alpha_test) to be provided."
             )
 
-        # Constraint: ∫ M(α) (μ_α - λ_α) dx with μ_α = γ(-ε Δα + (1/ε)W'(α)).
-        mu_alpha_k = gamma_alpha_c * ((-eps_alpha_c) * Laplacian(alpha_k) + (Wp_k / eps_alpha_c))
-        r_alpha_lambda = lambda_alpha_test * (M_ac_k * (mu_alpha_k - lambda_alpha_k)) * dx
+        # Constraint: ∫ M(α) (μ_α - λ_α) dx = 0, with μ_α = γ(-ε Δα + (1/ε)W'(α)).
+        #
+        # IMPORTANT: avoid assembling Laplacian(alpha) directly in the constraint.
+        # For the domain integral of M(-εΔα), use integration by parts and drop the
+        # boundary term (consistent with the natural no-flux condition for α used
+        # in the biofilm model):
+        #   ∫ M(-εΔα) dx = ε ∫ ∇M·∇α dx.
+        #
+        # This uses only first derivatives and is numerically more robust for high-order runs.
+        r_alpha_lambda = lambda_alpha_test * (((gamma_alpha_c / eps_alpha_c) * (M_ac_k * Wp_k)) - (M_ac_k * lambda_alpha_k)) * dx
 
-        dmu_alpha = gamma_alpha_c * ((-eps_alpha_c) * Laplacian(dalpha) + (Wpp_k * dalpha / eps_alpha_c))
-        a_alpha_lambda = lambda_alpha_test * ((dM_ac * (mu_alpha_k - lambda_alpha_k)) + (M_ac_k * dmu_alpha) + (-M_ac_k * dlambda_alpha)) * dx
+        # Domain correction: γ ε ∇M·∇α (only nonzero for variable mobility).
+        if mob_key not in {"constant", "const"}:
+            g2 = inner(grad(alpha_k), grad(alpha_k))
+            r_alpha_lambda += lambda_alpha_test * ((eps_alpha_c * gamma_alpha_c * M_alpha_c) * mob_prime_k * g2) * dx
+
+        # Jacobian (k-part only)
+        # d[ γ(M/ε)W'(α) - M λ ]
+        a_alpha_lambda = lambda_alpha_test * (
+            (gamma_alpha_c / eps_alpha_c) * ((dM_ac * Wp_k) + (M_ac_k * Wpp_k * dalpha)) + (-(dM_ac * lambda_alpha_k) - (M_ac_k * dlambda_alpha))
+        ) * dx
+
+        if mob_key not in {"constant", "const"}:
+            g2 = inner(grad(alpha_k), grad(alpha_k))
+            a_alpha_lambda += lambda_alpha_test * (
+                (eps_alpha_c * gamma_alpha_c * M_alpha_c) * ((-_c(2.0) * dalpha) * g2 + mob_prime_k * (_c(2.0) * inner(grad(alpha_k), grad(dalpha))))
+            ) * dx
 
     # ------------------------------------------------------------------
     # (v-b) Bulk damage evolution (optional): cohesion loss driven by solid stress
@@ -1610,6 +1709,10 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     residual_form = r_mom + r_mass + r_skeleton + r_phi + r_alpha + r_sub
     jacobian_form = a_mom + a_mass + a_skel + a_phi + a_alpha + a_sub
+    if r_mu_alpha is not None:
+        residual_form += r_mu_alpha
+    if a_mu_alpha is not None:
+        jacobian_form += a_mu_alpha
     if r_alpha_lambda is not None:
         residual_form += r_alpha_lambda
     if a_alpha_lambda is not None:
@@ -1631,6 +1734,7 @@ def build_biofilm_one_domain_forms(
         r_skeleton=r_skeleton,
         r_phi=r_phi,
         r_alpha=r_alpha,
+        r_mu_alpha=r_mu_alpha,
         r_damage=r_damage,
         r_substrate=r_sub,
         a_momentum=a_mom,
@@ -1638,6 +1742,7 @@ def build_biofilm_one_domain_forms(
         a_skeleton=a_skel,
         a_phi=a_phi,
         a_alpha=a_alpha,
+        a_mu_alpha=a_mu_alpha,
         a_damage=a_damage,
         a_substrate=a_sub,
         r_detached=r_detached,

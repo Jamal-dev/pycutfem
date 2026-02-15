@@ -59,6 +59,9 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     _tag_unit_square_boundaries(mesh)
 
     alpha_cahn_conservative = bool(getattr(mms, "alpha_cahn_conservative", False))
+    alpha_ch_enabled = bool(getattr(mms, "alpha_ch_M", 0.0) or 0.0) and bool(getattr(mms, "alpha_ch_gamma", 0.0) or 0.0)
+    if alpha_ch_enabled and alpha_cahn_conservative:
+        raise ValueError("MMS setup does not support alpha_cahn_conservative together with Cahn–Hilliard (alpha_ch_*).")
 
     field_specs = {
         "v_x": 2,
@@ -68,6 +71,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         "u_y": 2,
         "phi": 1,
         "alpha": 1,
+        **({"mu_alpha": 1} if alpha_ch_enabled else {}),
         "S": 1,
         "X": 1,
     }
@@ -85,6 +89,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
     dalpha = TrialFunction("alpha", dof_handler=dh)
+    dmu_alpha = TrialFunction("mu_alpha", dof_handler=dh) if alpha_ch_enabled else None
     dlambda_alpha = TrialFunction("lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     dS = TrialFunction("S", dof_handler=dh)
     dX = TrialFunction("X", dof_handler=dh)
@@ -94,6 +99,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     q_test = UFLTestFunction("p", dof_handler=dh)
     phi_test = UFLTestFunction("phi", dof_handler=dh)
     alpha_test = UFLTestFunction("alpha", dof_handler=dh)
+    mu_alpha_test = UFLTestFunction("mu_alpha", dof_handler=dh) if alpha_ch_enabled else None
     lambda_alpha_test = UFLTestFunction("lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     S_test = UFLTestFunction("S", dof_handler=dh)
     X_test = UFLTestFunction("X", dof_handler=dh)
@@ -103,6 +109,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
+    mu_alpha_k = Function("mu_alpha_k", "mu_alpha", dof_handler=dh) if alpha_ch_enabled else None
     lambda_alpha_k = Function("lambda_alpha_k", "lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     S_k = Function("S_k", "S", dof_handler=dh)
     X_k = Function("X_k", "X", dof_handler=dh)
@@ -112,6 +119,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
+    mu_alpha_n = Function("mu_alpha_n", "mu_alpha", dof_handler=dh) if alpha_ch_enabled else None
     lambda_alpha_n = Function("lambda_alpha_n", "lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     S_n = Function("S_n", "S", dof_handler=dh)
     X_n = Function("X_n", "X", dof_handler=dh)
@@ -121,6 +129,11 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     p_n.set_values_from_function(lambda x, y: float(mms.p(x, y, mms.t_n)))
     phi_n.set_values_from_function(lambda x, y: float(mms.phi(x, y, mms.t_n)))
     alpha_n.set_values_from_function(lambda x, y: float(mms.alpha(x, y, mms.t_n)))
+    if alpha_ch_enabled:
+        if getattr(mms, "mu_alpha", None) is None:
+            raise ValueError("alpha_ch_* enabled but MMS does not provide mu_alpha(x,y,t).")
+        mu_alpha_n.set_values_from_function(lambda x, y: float(mms.mu_alpha(x, y, mms.t_n)))
+        mu_alpha_k.nodal_values[:] = mu_alpha_n.nodal_values
     if alpha_cahn_conservative:
         lambda_alpha_n.nodal_values.fill(float(getattr(mms, "lambda_alpha_n", 0.0)))
         lambda_alpha_k.nodal_values[:] = lambda_alpha_n.nodal_values
@@ -144,6 +157,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
+        mu_alpha_k=mu_alpha_k,
         lambda_alpha_k=lambda_alpha_k,
         S_k=S_k,
         X_k=X_k,
@@ -152,6 +166,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         u_n=u_n,
         phi_n=phi_n,
         alpha_n=alpha_n,
+        mu_alpha_n=mu_alpha_n,
         lambda_alpha_n=lambda_alpha_n,
         S_n=S_n,
         X_n=X_n,
@@ -160,6 +175,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         du=du,
         dphi=dphi,
         dalpha=dalpha,
+        dmu_alpha=dmu_alpha,
         dlambda_alpha=dlambda_alpha,
         dS=dS,
         dX=dX,
@@ -168,6 +184,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,
+        mu_alpha_test=mu_alpha_test,
         lambda_alpha_test=lambda_alpha_test,
         S_test=S_test,
         X_test=X_test,
@@ -181,7 +198,11 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         lambda_s=Constant(1.0),
         D_phi=0.1,
         gamma_phi=1.0,
-        D_alpha=0.1,
+        D_alpha=0.0 if alpha_ch_enabled else 0.1,
+        alpha_ch_M=float(getattr(mms, "alpha_ch_M", 0.0) or 0.0),
+        alpha_ch_gamma=float(getattr(mms, "alpha_ch_gamma", 0.0) or 0.0),
+        alpha_ch_eps=float(getattr(mms, "alpha_ch_eps", 1.0) or 1.0),
+        alpha_ch_mobility=str(getattr(mms, "alpha_ch_mobility", "constant")),
         alpha_cahn_M=float(getattr(mms, "alpha_cahn_M", 0.0) or 0.0),
         alpha_cahn_gamma=float(getattr(mms, "alpha_cahn_gamma", 0.0) or 0.0),
         alpha_cahn_eps=float(getattr(mms, "alpha_cahn_eps", 1.0) or 1.0),
@@ -216,6 +237,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
                 BoundaryCondition("u_y", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.u(x, y, t)[..., 1])),
                 BoundaryCondition("phi", "dirichlet", tag, _as_float_time(mms.phi)),
                 BoundaryCondition("alpha", "dirichlet", tag, _as_float_time(mms.alpha)),
+                *( [BoundaryCondition("mu_alpha", "dirichlet", tag, _as_float_time(mms.mu_alpha))] if alpha_ch_enabled else []),
                 BoundaryCondition("S", "dirichlet", tag, _as_float_time(mms.S)),
                 BoundaryCondition("X", "dirichlet", tag, _as_float_time(mms.X)),
             ]
@@ -235,8 +257,28 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     )
 
     solver.solve_time_interval(
-        functions=[v_k, p_k, u_k, phi_k, alpha_k, *( [lambda_alpha_k] if alpha_cahn_conservative else []), S_k, X_k],
-        prev_functions=[v_n, p_n, u_n, phi_n, alpha_n, *( [lambda_alpha_n] if alpha_cahn_conservative else []), S_n, X_n],
+        functions=[
+            v_k,
+            p_k,
+            u_k,
+            phi_k,
+            alpha_k,
+            *( [mu_alpha_k] if alpha_ch_enabled else []),
+            *( [lambda_alpha_k] if alpha_cahn_conservative else []),
+            S_k,
+            X_k,
+        ],
+        prev_functions=[
+            v_n,
+            p_n,
+            u_n,
+            phi_n,
+            alpha_n,
+            *( [mu_alpha_n] if alpha_ch_enabled else []),
+            *( [lambda_alpha_n] if alpha_cahn_conservative else []),
+            S_n,
+            X_n,
+        ],
         aux_functions={"dt": dt_c},
         time_params=TimeStepperParameters(dt=float(dt_val), final_time=float(dt_val), max_steps=1, theta=float(theta)),
     )
@@ -251,12 +293,22 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     )
     err_p = dh.l2_error(p_k, exact={"p": lambda x, y: mms.p(x, y, t_err)}, fields=["p"], quad_order=int(qerr), relative=False)
     err_alpha = dh.l2_error(alpha_k, exact={"alpha": lambda x, y: mms.alpha(x, y, t_err)}, fields=["alpha"], quad_order=int(qerr), relative=False)
+    err_mu_alpha = None
+    if alpha_ch_enabled:
+        err_mu_alpha = dh.l2_error(
+            mu_alpha_k,
+            exact={"mu_alpha": lambda x, y: mms.mu_alpha(x, y, t_err)},
+            fields=["mu_alpha"],
+            quad_order=int(qerr),
+            relative=False,
+        )
 
     return {
         "h": 1.0 / float(nx),
         "err_v": float(err_v),
         "err_p": float(err_p),
         "err_alpha": float(err_alpha),
+        "err_mu_alpha": float(err_mu_alpha) if err_mu_alpha is not None else None,
     }
 
 
@@ -347,3 +399,7 @@ def test_biofilm_one_domain_mms_trig_convergence_cpp_conservative_alpha_cahn():
 
     eoc_alpha = _eoc(coarse["h"], fine["h"], coarse["err_alpha"], fine["err_alpha"])
     assert eoc_alpha > 1.0
+
+
+## NOTE: Cahn–Hilliard MMS convergence is covered by a dedicated two-field CH MMS test
+## (alpha, mu_alpha) to keep the test suite runtime manageable.

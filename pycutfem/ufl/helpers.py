@@ -1608,6 +1608,19 @@ class GradOpInfo(BaseOpInfo):
             else:
                  raise ValueError(f"Cannot scale GradOpInfo(shape={self.shape}) with array of shape {other.shape}.")
         elif isinstance(other, VecOpInfo):
+            if other.role == "scalar":
+                # Scalar coefficient/value scaling a gradient table (e.g. grad(u)*c where
+                # c is a collapsed coefficient function at a quadrature point).
+                o = np.asarray(other.data)
+                if o.ndim == 0:
+                    scale = float(o)
+                elif o.ndim == 1 and o.shape[0] == 1:
+                    scale = float(o[0])
+                else:
+                    raise TypeError(
+                        f"GradOpInfo can only be scaled by a scalar VecOpInfo; got shape {o.shape} for role {other.role}."
+                    )
+                return self._with(self.data * scale, role=self.role)
             if self.role in ("identity", "function") and other.role in ( "function"):
                 # Case 4: Scaling by a vector of size d (e.g., a constant vector field)
                 grad_vals = _collapsed_grad(self)  # shape (k, d)  —   ∇u_k(ξ)

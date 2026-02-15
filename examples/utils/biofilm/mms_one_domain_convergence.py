@@ -81,6 +81,17 @@ class BiofilmOneDomainMMSConvergence:
     alpha_cahn_conservative: bool = False
     alpha_cahn_mobility: str = "constant"
 
+    # Optional: Cahn–Hilliard chemical potential field μ_α (x,y,t)->(...)
+    mu_alpha: callable | None = None
+    mu_alpha_n: callable | None = None
+    mu_alpha_k: callable | None = None
+
+    # Optional: Cahn–Hilliard settings used to generate f_alpha
+    alpha_ch_M: float = 0.0
+    alpha_ch_gamma: float = 0.0
+    alpha_ch_eps: float = 1.0
+    alpha_ch_mobility: str = "constant"
+
 
 def _sym_grad_vec(v, x, y):
     return sp.Matrix([[sp.diff(v[i], var) for var in (x, y)] for i in range(2)])
@@ -166,6 +177,11 @@ def build_biofilm_one_domain_mms_trig_step(
     D_phi: float = 0.1,
     gamma_phi: float = 1.0,
     D_alpha: float = 0.1,
+    # Optional Cahn–Hilliard / phase-field regularization for α (adds μ_α and a 4th-order operator).
+    alpha_ch_M: float = 0.0,
+    alpha_ch_gamma: float = 0.0,
+    alpha_ch_eps: float = 1.0,
+    alpha_ch_mobility: str = "constant",
     # Optional Allen–Cahn / phase-field regularization for α (implicit at k, as in the model).
     alpha_cahn_M: float = 0.0,
     alpha_cahn_gamma: float = 0.0,
@@ -414,8 +430,50 @@ def build_biofilm_one_domain_mms_trig_step(
     f_alpha_expr += th * Fal_k + one_m_th * Fal_n
     f_alpha_expr += -float(D_alpha) * _sym_laplacian(alpha_k_expr, x, y)
 
+    # Optional Cahn–Hilliard regularization for α (mass-conserving, adds μ_α).
+    ch_enabled = float(alpha_ch_M) != 0.0 and float(alpha_ch_gamma) != 0.0
+
     # Optional Allen–Cahn / phase-field regularization for α (implicit at k).
     ac_enabled = float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0
+    if ch_enabled and ac_enabled:
+        raise ValueError("Allen–Cahn (alpha_cahn_*) and Cahn–Hilliard (alpha_ch_*) cannot both be enabled.")
+    if ch_enabled and bool(alpha_cahn_conservative):
+        raise ValueError("alpha_cahn_conservative cannot be used together with Cahn–Hilliard regularization (alpha_ch_*).")
+
+    mu_alpha_expr = None
+    mu_alpha_n_expr = None
+    mu_alpha_k_expr = None
+    if ch_enabled:
+        eps_ch = float(alpha_ch_eps)
+        if not (eps_ch > 0.0):
+            raise ValueError("alpha_ch_eps must be > 0 when alpha_ch_M and alpha_ch_gamma are enabled.")
+
+        # Mobility options mirror the model implementation.
+        mob_key = str(alpha_ch_mobility).strip().lower()
+        if mob_key in {"constant", "const"}:
+            M_ch_k_expr = float(alpha_ch_M)
+            M_ch_n_expr = float(alpha_ch_M)
+        elif mob_key in {"degenerate", "deg", "alpha(1-alpha)", "alpha*(1-alpha)", "a(1-a)"}:
+            M_ch_k_expr = float(alpha_ch_M) * alpha_k_expr * (1.0 - alpha_k_expr)
+            M_ch_n_expr = float(alpha_ch_M) * alpha_n_expr * (1.0 - alpha_n_expr)
+        else:
+            raise ValueError(f"Unknown alpha_ch_mobility {alpha_ch_mobility!r}. Use 'constant' or 'degenerate'.")
+
+        # Chemical potential μ_α = γ(-εΔα + (1/ε)W'(α)), with W'(α)=2α(1-α)(1-2α).
+        Wp_k_ch = 2.0 * alpha_k_expr * (1.0 - alpha_k_expr) * (1.0 - 2.0 * alpha_k_expr)
+        Wp_n_ch = 2.0 * alpha_n_expr * (1.0 - alpha_n_expr) * (1.0 - 2.0 * alpha_n_expr)
+        mu_alpha_k_expr = float(alpha_ch_gamma) * ((-eps_ch) * _sym_laplacian(alpha_k_expr, x, y) + (Wp_k_ch / eps_ch))
+        mu_alpha_n_expr = float(alpha_ch_gamma) * ((-eps_ch) * _sym_laplacian(alpha_n_expr, x, y) + (Wp_n_ch / eps_ch))
+
+        # Full time-dependent chemical potential for boundary conditions / diagnostics.
+        Wp_t_ch = 2.0 * alpha_expr * (1.0 - alpha_expr) * (1.0 - 2.0 * alpha_expr)
+        mu_alpha_expr = float(alpha_ch_gamma) * ((-eps_ch) * _sym_laplacian(alpha_expr, x, y) + (Wp_t_ch / eps_ch))
+
+        # Strong CH operator in the alpha equation: -div(M(α) ∇μ_α) (theta-averaged).
+        div_flux_k = _sym_div_vec(M_ch_k_expr * _sym_grad_scalar(mu_alpha_k_expr, x, y), x, y)
+        div_flux_n = _sym_div_vec(M_ch_n_expr * _sym_grad_scalar(mu_alpha_n_expr, x, y), x, y)
+        f_alpha_expr += -(th * div_flux_k + one_m_th * div_flux_n)
+
     lambda_alpha_n = 0.0
     lambda_alpha_k = 0.0
     if ac_enabled:
@@ -537,6 +595,9 @@ def build_biofilm_one_domain_mms_trig_step(
     f_S = _lambdify_scalar_xy(f_S_expr, x, y)
     f_X = _lambdify_scalar_xy(f_X_expr, x, y)
     D_det_prev = _lambdify_scalar_xy(D_det_prev_expr, x, y)
+    mu_alpha = _lambdify_scalar_xyt(mu_alpha_expr, x, y, t) if mu_alpha_expr is not None else None
+    mu_alpha_n = _lambdify_scalar_xy(mu_alpha_n_expr, x, y) if mu_alpha_n_expr is not None else None
+    mu_alpha_k = _lambdify_scalar_xy(mu_alpha_k_expr, x, y) if mu_alpha_k_expr is not None else None
 
     return BiofilmOneDomainMMSConvergence(
         t_n=t_n,
@@ -579,4 +640,11 @@ def build_biofilm_one_domain_mms_trig_step(
         alpha_cahn_eps=float(alpha_cahn_eps),
         alpha_cahn_conservative=bool(alpha_cahn_conservative),
         alpha_cahn_mobility=str(alpha_cahn_mobility),
+        mu_alpha=mu_alpha,
+        mu_alpha_n=mu_alpha_n,
+        mu_alpha_k=mu_alpha_k,
+        alpha_ch_M=float(alpha_ch_M),
+        alpha_ch_gamma=float(alpha_ch_gamma),
+        alpha_ch_eps=float(alpha_ch_eps),
+        alpha_ch_mobility=str(alpha_ch_mobility),
     )

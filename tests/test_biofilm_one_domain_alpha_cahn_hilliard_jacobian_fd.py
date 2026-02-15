@@ -20,7 +20,7 @@ from pycutfem.utils.meshgen import structured_quad
 from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
 
 
-def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_cahn_mobility: str = "constant"):
+def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_ch_mobility: str = "constant"):
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
     mesh = Mesh(
         nodes=nodes,
@@ -40,7 +40,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_cahn_mobility:
             "u_y": 2,
             "phi": 1,
             "alpha": 1,
-            "lambda_alpha": ":number:",
+            "mu_alpha": 1,
             "S": 1,
         },
     )
@@ -54,7 +54,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_cahn_mobility:
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
     dalpha = TrialFunction("alpha", dof_handler=dh)
-    dlambda_alpha = TrialFunction("lambda_alpha", dof_handler=dh)
+    dmu_alpha = TrialFunction("mu_alpha", dof_handler=dh)
     dS = TrialFunction("S", dof_handler=dh)
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
@@ -62,7 +62,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_cahn_mobility:
     q_test = TestFunction("p", dof_handler=dh)
     phi_test = TestFunction("phi", dof_handler=dh)
     alpha_test = TestFunction("alpha", dof_handler=dh)
-    lambda_alpha_test = TestFunction("lambda_alpha", dof_handler=dh)
+    mu_alpha_test = TestFunction("mu_alpha", dof_handler=dh)
     S_test = TestFunction("S", dof_handler=dh)
 
     v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
@@ -70,7 +70,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_cahn_mobility:
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
-    lambda_alpha_k = Function("lambda_alpha_k", "lambda_alpha", dof_handler=dh)
+    mu_alpha_k = Function("mu_alpha_k", "mu_alpha", dof_handler=dh)
     S_k = Function("S_k", "S", dof_handler=dh)
 
     v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
@@ -78,7 +78,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_cahn_mobility:
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
-    lambda_alpha_n = Function("lambda_alpha_n", "lambda_alpha", dof_handler=dh)
+    mu_alpha_n = Function("mu_alpha_n", "mu_alpha", dof_handler=dh)
     S_n = Function("S_n", "S", dof_handler=dh)
 
     rng = np.random.default_rng(0)
@@ -91,10 +91,10 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_cahn_mobility:
     phi_n.nodal_values[:] = np.clip(0.7 + 0.05 * rng.standard_normal(phi_n.nodal_values.shape), 0.2, 0.95)
     alpha_k.nodal_values[:] = np.clip(0.5 + 0.05 * rng.standard_normal(alpha_k.nodal_values.shape), 0.05, 0.95)
     alpha_n.nodal_values[:] = np.clip(0.5 + 0.05 * rng.standard_normal(alpha_n.nodal_values.shape), 0.05, 0.95)
+    mu_alpha_k.nodal_values[:] = 1.0e-2 * rng.standard_normal(mu_alpha_k.nodal_values.shape)
+    mu_alpha_n.nodal_values[:] = 1.0e-2 * rng.standard_normal(mu_alpha_n.nodal_values.shape)
     S_k.nodal_values[:] = np.clip(0.2 + 0.05 * rng.standard_normal(S_k.nodal_values.shape), 0.01, 1.0)
     S_n.nodal_values[:] = np.clip(0.2 + 0.05 * rng.standard_normal(S_n.nodal_values.shape), 0.01, 1.0)
-    lambda_alpha_k.nodal_values[:] = 1.0e-2 * rng.standard_normal(lambda_alpha_k.nodal_values.shape)
-    lambda_alpha_n.nodal_values[:] = 1.0e-2 * rng.standard_normal(lambda_alpha_n.nodal_values.shape)
 
     dt = Constant(0.1)
     th = 1.0
@@ -105,28 +105,28 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_cahn_mobility:
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
-        lambda_alpha_k=lambda_alpha_k,
+        mu_alpha_k=mu_alpha_k,
         S_k=S_k,
         v_n=v_n,
         p_n=p_n,
         u_n=u_n,
         phi_n=phi_n,
         alpha_n=alpha_n,
-        lambda_alpha_n=lambda_alpha_n,
+        mu_alpha_n=mu_alpha_n,
         S_n=S_n,
         dv=dv,
         dp=dp,
         du=du,
         dphi=dphi,
         dalpha=dalpha,
-        dlambda_alpha=dlambda_alpha,
+        dmu_alpha=dmu_alpha,
         dS=dS,
         v_test=v_test,
         q_test=q_test,
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,
-        lambda_alpha_test=lambda_alpha_test,
+        mu_alpha_test=mu_alpha_test,
         S_test=S_test,
         dx=dx(metadata={"q": int(q)}),
         ds_cip=ds(metadata={"q": int(q)}),
@@ -140,11 +140,10 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_cahn_mobility:
         D_phi=0.1,
         gamma_phi=1.0,
         D_alpha=0.0,
-        alpha_cahn_M=0.2,
-        alpha_cahn_gamma=1.0,
-        alpha_cahn_eps=0.1,
-        alpha_cahn_conservative=True,
-        alpha_cahn_mobility=str(alpha_cahn_mobility),
+        alpha_ch_M=0.2,
+        alpha_ch_gamma=1.0,
+        alpha_ch_eps=0.1,
+        alpha_ch_mobility=str(alpha_ch_mobility),
         D_S=0.1,
         mu_max=0.4,
         K_S=0.3,
@@ -162,16 +161,16 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5, alpha_cahn_mobility:
         "u_y": u_k.components[1],
         "phi": phi_k,
         "alpha": alpha_k,
-        "lambda_alpha": lambda_alpha_k,
+        "mu_alpha": mu_alpha_k,
         "S": S_k,
     }
 
     return dh, forms, field_to_func_k
 
 
-def test_biofilm_one_domain_alpha_conservative_ac_backend_parity_python_cpp():
+def test_biofilm_one_domain_alpha_cahn_hilliard_backend_parity_python_cpp():
     for mob in ("constant", "degenerate"):
-        dh, forms, _ = _build_problem(nx=2, ny=2, q=5, alpha_cahn_mobility=mob)
+        dh, forms, _ = _build_problem(nx=2, ny=2, q=5, alpha_ch_mobility=mob)
         eq = Equation(forms.jacobian_form, forms.residual_form)
 
         K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
@@ -183,9 +182,9 @@ def test_biofilm_one_domain_alpha_conservative_ac_backend_parity_python_cpp():
         assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
 
 
-def test_biofilm_one_domain_alpha_conservative_ac_jacobian_fd_consistency():
+def test_biofilm_one_domain_alpha_cahn_hilliard_jacobian_fd_consistency():
     for mob in ("constant", "degenerate"):
-        dh, forms, field_to_func_k = _build_problem(nx=2, ny=2, q=5, alpha_cahn_mobility=mob)
+        dh, forms, field_to_func_k = _build_problem(nx=2, ny=2, q=5, alpha_ch_mobility=mob)
         eq = Equation(forms.jacobian_form, forms.residual_form)
         K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
         R0 = np.asarray(R0, dtype=float)
@@ -195,7 +194,7 @@ def test_biofilm_one_domain_alpha_conservative_ac_jacobian_fd_consistency():
             return np.asarray(R, dtype=float)
 
         probes = []
-        for fld in ("alpha", "lambda_alpha"):
+        for fld in ("alpha", "mu_alpha"):
             sl = dh.get_field_slice(fld)
             if sl:
                 probes.append(int(sl[len(sl) // 2]))
@@ -214,3 +213,4 @@ def test_biofilm_one_domain_alpha_conservative_ac_jacobian_fd_consistency():
             denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
             rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
             assert rel < 2.0e-6, f"FD mismatch at dof {j} ({fld}, mob={mob}): rel={rel:.2e}"
+
