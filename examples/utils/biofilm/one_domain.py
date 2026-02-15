@@ -204,6 +204,9 @@ class BiofilmOneDomainForms:
     a_substrate: object | None = None
     r_detached: object | None = None
     a_detached: object | None = None
+    # Optional: conservative Allen–Cahn (global Lagrange multiplier λ_α)
+    r_alpha_lambda: object | None = None
+    a_alpha_lambda: object | None = None
 
 
 def build_biofilm_one_domain_forms(
@@ -285,6 +288,13 @@ def build_biofilm_one_domain_forms(
     alpha_cahn_M: float = 0.0,
     alpha_cahn_gamma: float = 0.0,
     alpha_cahn_eps: float = 1.0,
+    # Conservative Allen–Cahn: mass-conserving via a global Lagrange multiplier λ_α
+    alpha_cahn_conservative: bool = False,
+    alpha_cahn_mobility: str = "constant",
+    lambda_alpha_k=None,
+    lambda_alpha_n=None,
+    dlambda_alpha=None,
+    lambda_alpha_test=None,
     # Crack propagation: additional surface speed term V_crack via δ(α)
     alpha_crack_k: float = 0.0,
     alpha_crack_Dc: float = 0.0,
@@ -1248,11 +1258,41 @@ def build_biofilm_one_domain_forms(
     r_alpha = alpha_test * f_alpha_k * dx
     r_alpha += D_alpha_c * inner(grad(alpha_k), grad(alpha_test)) * dx
     # Allen–Cahn regularization: -(Mγ ε Δα) + (Mγ/ε) W'(α) in the residual.
-    if float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0:
+    ac_enabled = float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0
+    if ac_enabled:
         # W'(α) for W(α)=α^2(1-α)^2 is 2α(1-α)(1-2α).
         Wp_k = _c(2.0) * alpha_k * _one_minus(alpha_k) * _one_minus(_c(2.0) * alpha_k)
-        r_alpha += (M_gamma_alpha * eps_alpha_c) * inner(grad(alpha_k), grad(alpha_test)) * dx
-        r_alpha += alpha_test * ((M_gamma_alpha / eps_alpha_c) * Wp_k) * dx
+        mob_key = str(alpha_cahn_mobility).strip().lower()
+        if mob_key in {"constant", "const"}:
+            M_ac_k = M_alpha_c
+            dM_ac = _c(0.0) * dalpha
+            mob_prime_k = _c(0.0) * alpha_k
+        elif mob_key in {"degenerate", "deg", "alpha(1-alpha)", "alpha*(1-alpha)", "a(1-a)"}:
+            # Degenerate mobility: M(α)=M0 α(1-α)
+            mob_k = alpha_k * _one_minus(alpha_k)
+            mob_prime_k = _one_minus(_c(2.0) * alpha_k)  # d/dα [α(1-α)] = 1-2α
+            M_ac_k = M_alpha_c * mob_k
+            dM_ac = M_alpha_c * mob_prime_k * dalpha
+        else:
+            raise ValueError(f"Unknown alpha_cahn_mobility {alpha_cahn_mobility!r}. Use 'constant' or 'degenerate'.")
+
+        M_gamma_k = gamma_alpha_c * M_ac_k
+        dM_gamma = gamma_alpha_c * dM_ac
+
+        # Strong term: +M(α) μ_α, μ_α=γ(-εΔα + (1/ε)W'(α)).
+        # Integrate by parts the Laplacian term; if M depends on α, an extra
+        # interface-localized term ε ∇M·∇α appears.
+        r_alpha += (M_gamma_k * eps_alpha_c) * inner(grad(alpha_k), grad(alpha_test)) * dx
+        if mob_key not in {"constant", "const"}:
+            r_alpha += alpha_test * ((eps_alpha_c * gamma_alpha_c * M_alpha_c) * mob_prime_k * inner(grad(alpha_k), grad(alpha_k))) * dx
+        r_alpha += alpha_test * ((M_gamma_k / eps_alpha_c) * Wp_k) * dx
+
+        if bool(alpha_cahn_conservative):
+            if lambda_alpha_k is None or dlambda_alpha is None or lambda_alpha_test is None:
+                raise ValueError(
+                    "alpha_cahn_conservative=True requires (lambda_alpha_k, dlambda_alpha, lambda_alpha_test) to be provided."
+                )
+            r_alpha += -alpha_test * (M_ac_k * lambda_alpha_k) * dx
     r_alpha += -alpha_test * f_alpha * dx
 
     # Jacobian (k-part only)
@@ -1269,12 +1309,29 @@ def build_biofilm_one_domain_forms(
     d_surf = surf_coef_prev * d_delta_k
     a_alpha += alpha_test * th * (-(dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic) + d_surf) * dx
     a_alpha += D_alpha_c * inner(grad(dalpha), grad(alpha_test)) * dx
-    if float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0:
+    if ac_enabled:
         # W''(α) = 2 - 12α + 12α^2
         # NOTE: keep the function-like term on the left; float - VecOpInfo is not supported.
         Wpp_k = (-_c(12.0) * alpha_k) + (_c(12.0) * (alpha_k * alpha_k)) + _c(2.0)
-        a_alpha += (M_gamma_alpha * eps_alpha_c) * inner(grad(dalpha), grad(alpha_test)) * dx
-        a_alpha += alpha_test * ((M_gamma_alpha / eps_alpha_c) * Wpp_k * dalpha) * dx
+        if mob_key in {"constant", "const"}:
+            a_alpha += (M_gamma_alpha * eps_alpha_c) * inner(grad(dalpha), grad(alpha_test)) * dx
+            a_alpha += alpha_test * ((M_gamma_alpha / eps_alpha_c) * Wpp_k * dalpha) * dx
+            if bool(alpha_cahn_conservative):
+                a_alpha += -alpha_test * (M_alpha_c * dlambda_alpha) * dx
+        else:
+            # d[ ε Mγ ∇α·∇w ] = ε (dMγ ∇α·∇w + Mγ ∇δα·∇w)
+            a_alpha += (eps_alpha_c * dM_gamma) * inner(grad(alpha_k), grad(alpha_test)) * dx
+            a_alpha += (M_gamma_k * eps_alpha_c) * inner(grad(dalpha), grad(alpha_test)) * dx
+
+            # d[ ε w (∇Mγ·∇α) ] with M= M0 α(1-α): ∇Mγ = γ M0 (1-2α) ∇α
+            g2 = inner(grad(alpha_k), grad(alpha_k))
+            a_alpha += alpha_test * ((eps_alpha_c * gamma_alpha_c * M_alpha_c) * ((-_c(2.0) * dalpha) * g2)) * dx
+            a_alpha += alpha_test * ((eps_alpha_c * gamma_alpha_c * M_alpha_c) * (mob_prime_k * (_c(2.0) * inner(grad(alpha_k), grad(dalpha))))) * dx
+
+            # d[ w (Mγ/ε) W'(α) ] = w/ε (dMγ W'(α) + Mγ W''(α) δα)
+            a_alpha += alpha_test * (((dM_gamma / eps_alpha_c) * Wp_k) + ((M_gamma_k / eps_alpha_c) * Wpp_k * dalpha)) * dx
+            if bool(alpha_cahn_conservative):
+                a_alpha += -alpha_test * ((dM_ac * lambda_alpha_k) + (M_ac_k * dlambda_alpha)) * dx
 
     # Optional consistent stabilization for advection-dominated α (useful with D_alpha=0).
     # - SUPG: τ (vS·∇w) R_alpha
@@ -1312,6 +1369,26 @@ def build_biofilm_one_domain_forms(
         tau_cip = _c(float(alpha_cip)) * (h_F * h_F * h_F) * scale
         r_alpha += tau_cip * _grad_inner_jump(alpha_k, alpha_test, n_int) * ds_cip
         a_alpha += tau_cip * _grad_inner_jump(dalpha, alpha_test, n_int) * ds_cip
+
+    # ------------------------------------------------------------------
+    # (v-a) Conservative Allen–Cahn constraint (optional): determine λ_α(t)
+    # ------------------------------------------------------------------
+    r_alpha_lambda = None
+    a_alpha_lambda = None
+    if bool(alpha_cahn_conservative):
+        if not ac_enabled:
+            raise ValueError("alpha_cahn_conservative=True requires alpha_cahn_M and alpha_cahn_gamma to be nonzero.")
+        if lambda_alpha_k is None or dlambda_alpha is None or lambda_alpha_test is None:
+            raise ValueError(
+                "alpha_cahn_conservative=True requires (lambda_alpha_k, dlambda_alpha, lambda_alpha_test) to be provided."
+            )
+
+        # Constraint: ∫ M(α) (μ_α - λ_α) dx with μ_α = γ(-ε Δα + (1/ε)W'(α)).
+        mu_alpha_k = gamma_alpha_c * ((-eps_alpha_c) * Laplacian(alpha_k) + (Wp_k / eps_alpha_c))
+        r_alpha_lambda = lambda_alpha_test * (M_ac_k * (mu_alpha_k - lambda_alpha_k)) * dx
+
+        dmu_alpha = gamma_alpha_c * ((-eps_alpha_c) * Laplacian(dalpha) + (Wpp_k * dalpha / eps_alpha_c))
+        a_alpha_lambda = lambda_alpha_test * ((dM_ac * (mu_alpha_k - lambda_alpha_k)) + (M_ac_k * dmu_alpha) + (-M_ac_k * dlambda_alpha)) * dx
 
     # ------------------------------------------------------------------
     # (v-b) Bulk damage evolution (optional): cohesion loss driven by solid stress
@@ -1533,6 +1610,10 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     residual_form = r_mom + r_mass + r_skeleton + r_phi + r_alpha + r_sub
     jacobian_form = a_mom + a_mass + a_skel + a_phi + a_alpha + a_sub
+    if r_alpha_lambda is not None:
+        residual_form += r_alpha_lambda
+    if a_alpha_lambda is not None:
+        jacobian_form += a_alpha_lambda
     if r_damage is not None:
         residual_form += r_damage
     if a_damage is not None:
@@ -1561,4 +1642,6 @@ def build_biofilm_one_domain_forms(
         a_substrate=a_sub,
         r_detached=r_detached,
         a_detached=a_detached,
+        r_alpha_lambda=r_alpha_lambda,
+        a_alpha_lambda=a_alpha_lambda,
     )

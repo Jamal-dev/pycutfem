@@ -58,20 +58,23 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     )
     _tag_unit_square_boundaries(mesh)
 
-    me = MixedElement(
-        mesh,
-        field_specs={
-            "v_x": 2,
-            "v_y": 2,
-            "p": 1,
-            "u_x": 2,
-            "u_y": 2,
-            "phi": 1,
-            "alpha": 1,
-            "S": 1,
-            "X": 1,
-        },
-    )
+    alpha_cahn_conservative = bool(getattr(mms, "alpha_cahn_conservative", False))
+
+    field_specs = {
+        "v_x": 2,
+        "v_y": 2,
+        "p": 1,
+        "u_x": 2,
+        "u_y": 2,
+        "phi": 1,
+        "alpha": 1,
+        "S": 1,
+        "X": 1,
+    }
+    if alpha_cahn_conservative:
+        field_specs["lambda_alpha"] = ":number:"
+
+    me = MixedElement(mesh, field_specs=field_specs)
     dh = DofHandler(me, method="cg")
 
     V = FunctionSpace("V", ["v_x", "v_y"], dim=1)
@@ -82,6 +85,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
     dalpha = TrialFunction("alpha", dof_handler=dh)
+    dlambda_alpha = TrialFunction("lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     dS = TrialFunction("S", dof_handler=dh)
     dX = TrialFunction("X", dof_handler=dh)
 
@@ -90,6 +94,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     q_test = UFLTestFunction("p", dof_handler=dh)
     phi_test = UFLTestFunction("phi", dof_handler=dh)
     alpha_test = UFLTestFunction("alpha", dof_handler=dh)
+    lambda_alpha_test = UFLTestFunction("lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     S_test = UFLTestFunction("S", dof_handler=dh)
     X_test = UFLTestFunction("X", dof_handler=dh)
 
@@ -98,6 +103,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
+    lambda_alpha_k = Function("lambda_alpha_k", "lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     S_k = Function("S_k", "S", dof_handler=dh)
     X_k = Function("X_k", "X", dof_handler=dh)
 
@@ -106,6 +112,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
+    lambda_alpha_n = Function("lambda_alpha_n", "lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
     S_n = Function("S_n", "S", dof_handler=dh)
     X_n = Function("X_n", "X", dof_handler=dh)
 
@@ -114,6 +121,9 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     p_n.set_values_from_function(lambda x, y: float(mms.p(x, y, mms.t_n)))
     phi_n.set_values_from_function(lambda x, y: float(mms.phi(x, y, mms.t_n)))
     alpha_n.set_values_from_function(lambda x, y: float(mms.alpha(x, y, mms.t_n)))
+    if alpha_cahn_conservative:
+        lambda_alpha_n.nodal_values.fill(float(getattr(mms, "lambda_alpha_n", 0.0)))
+        lambda_alpha_k.nodal_values[:] = lambda_alpha_n.nodal_values
     S_n.set_values_from_function(lambda x, y: float(mms.S(x, y, mms.t_n)))
     X_n.set_values_from_function(lambda x, y: float(mms.X(x, y, mms.t_n)))
 
@@ -134,6 +144,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
+        lambda_alpha_k=lambda_alpha_k,
         S_k=S_k,
         X_k=X_k,
         v_n=v_n,
@@ -141,6 +152,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         u_n=u_n,
         phi_n=phi_n,
         alpha_n=alpha_n,
+        lambda_alpha_n=lambda_alpha_n,
         S_n=S_n,
         X_n=X_n,
         dv=dv,
@@ -148,6 +160,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         du=du,
         dphi=dphi,
         dalpha=dalpha,
+        dlambda_alpha=dlambda_alpha,
         dS=dS,
         dX=dX,
         v_test=v_test,
@@ -155,6 +168,7 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,
+        lambda_alpha_test=lambda_alpha_test,
         S_test=S_test,
         X_test=X_test,
         dx=dx(metadata={"q": int(qdeg)}),
@@ -168,6 +182,11 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
         D_phi=0.1,
         gamma_phi=1.0,
         D_alpha=0.1,
+        alpha_cahn_M=float(getattr(mms, "alpha_cahn_M", 0.0) or 0.0),
+        alpha_cahn_gamma=float(getattr(mms, "alpha_cahn_gamma", 0.0) or 0.0),
+        alpha_cahn_eps=float(getattr(mms, "alpha_cahn_eps", 1.0) or 1.0),
+        alpha_cahn_conservative=alpha_cahn_conservative,
+        alpha_cahn_mobility=str(getattr(mms, "alpha_cahn_mobility", "constant")),
         D_S=0.1,
         D_X=0.1,
         mu_max=0.4,
@@ -216,8 +235,8 @@ def _solve_one(*, nx: int, qdeg: int, qerr: int, dt_val: float, theta: float, ne
     )
 
     solver.solve_time_interval(
-        functions=[v_k, p_k, u_k, phi_k, alpha_k, S_k, X_k],
-        prev_functions=[v_n, p_n, u_n, phi_n, alpha_n, S_n, X_n],
+        functions=[v_k, p_k, u_k, phi_k, alpha_k, *( [lambda_alpha_k] if alpha_cahn_conservative else []), S_k, X_k],
+        prev_functions=[v_n, p_n, u_n, phi_n, alpha_n, *( [lambda_alpha_n] if alpha_cahn_conservative else []), S_n, X_n],
         aux_functions={"dt": dt_c},
         time_params=TimeStepperParameters(dt=float(dt_val), final_time=float(dt_val), max_steps=1, theta=float(theta)),
     )
@@ -293,4 +312,38 @@ def test_biofilm_one_domain_mms_trig_convergence_cpp():
 
     assert eoc_v > 1.0
     assert eoc_p > 0.7
+    assert eoc_alpha > 1.0
+
+
+def test_biofilm_one_domain_mms_trig_convergence_cpp_conservative_alpha_cahn():
+    # Lightweight convergence regression for the conservative Allen–Cahn extension:
+    # ensure α convergence under refinement when λ_α is included as a global unknown.
+    dt_val = 0.05
+    theta = 1.0
+    k_det = 0.2
+    qdeg = 6
+    qerr = 6
+    newton_tol = 1.0e-7
+    max_it = 15
+
+    mms = build_biofilm_one_domain_mms_trig_step(
+        dt_val=float(dt_val),
+        theta=float(theta),
+        k_det=float(k_det),
+        alpha_cahn_M=0.2,
+        alpha_cahn_gamma=1.0,
+        alpha_cahn_eps=0.1,
+        alpha_cahn_conservative=True,
+        alpha_cahn_mobility="constant",
+        alpha_wave=2,
+    )
+
+    errs = [
+        _solve_one(nx=int(nx), qdeg=qdeg, qerr=qerr, dt_val=dt_val, theta=theta, newton_tol=newton_tol, max_it=max_it, k_det=k_det, mms=mms)
+        for nx in (2, 4)
+    ]
+    coarse, fine = errs[0], errs[1]
+    assert fine["err_alpha"] < coarse["err_alpha"]
+
+    eoc_alpha = _eoc(coarse["h"], fine["h"], coarse["err_alpha"], fine["err_alpha"])
     assert eoc_alpha > 1.0

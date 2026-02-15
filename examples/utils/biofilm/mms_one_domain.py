@@ -47,6 +47,9 @@ class BiofilmOneDomainMMS:
     phi: callable
     alpha: callable
     S: callable
+    # Optional: conservative Allen–Cahn global multiplier (constants)
+    lambda_alpha_n: float = 0.0
+    lambda_alpha_k: float = 0.0
 
 
 def build_biofilm_one_domain_mms_affine(
@@ -75,6 +78,12 @@ def build_biofilm_one_domain_mms_affine(
     D_phi: float = 0.1,
     gamma_phi: float = 1.0,
     D_alpha: float = 0.1,
+    # Optional Allen–Cahn / phase-field regularization for α.
+    alpha_cahn_M: float = 0.0,
+    alpha_cahn_gamma: float = 0.0,
+    alpha_cahn_eps: float = 1.0,
+    # Conservative Allen–Cahn: global λ_α enforcing mass conservation.
+    alpha_cahn_conservative: bool = False,
     D_S: float = 0.1,
     mu_max: float = 0.4,
     K_S: float = 0.3,
@@ -304,7 +313,29 @@ def build_biofilm_one_domain_mms_affine(
         D_det_prev = float(k_det) * float(np.sqrt(float(eta_n)))
         delta = 4.0 * ak * (1.0 - ak)
         # Implemented residual uses +D_det_prev*delta on the LHS (i.e. -D_det_prev*delta on the RHS).
-        return dadt + adv - G * ak * (1.0 - ak) + D_det_prev * delta
+        val = dadt + adv - G * ak * (1.0 - ak) + D_det_prev * delta
+
+        # Optional Allen–Cahn / phase-field regularization (implicit at k).
+        # For affine α, Δα = 0 and the interface term reduces to a local reaction.
+        ac_enabled = float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0
+        if ac_enabled:
+            eps = float(alpha_cahn_eps)
+            if not (eps > 0.0):
+                raise ValueError("alpha_cahn_eps must be > 0 when alpha_cahn_M and alpha_cahn_gamma are enabled.")
+
+            # W'(α) for W(α)=α^2(1-α)^2 is 2α - 6α^2 + 4α^3.
+            Wp = 2.0 * ak - 6.0 * (ak * ak) + 4.0 * (ak * ak * ak)
+            gamma_over_eps = float(alpha_cahn_gamma) / eps
+            coeff = float(alpha_cahn_M) * gamma_over_eps
+
+            if bool(alpha_cahn_conservative):
+                # For constant mobility, λ_α = avg(μ_α) = (γ/ε) avg(W'(α)) since Δα=0.
+                # Use the precomputed value at t_k (global constant).
+                val = val + coeff * (Wp - mean_Wp_k)
+            else:
+                val = val + coeff * Wp
+
+        return val
 
     def f_S(x, y):
         x = np.asarray(x, dtype=float)
@@ -347,6 +378,47 @@ def build_biofilm_one_domain_mms_affine(
     def u_y(x, y):
         return u_k(x, y)[..., 1]
 
+    # --- Conservative Allen–Cahn: compute λ_α(t_n), λ_α(t_k) for constant mobility ---
+    mean_Wp_n = 0.0
+    mean_Wp_k = 0.0
+    lambda_alpha_n = 0.0
+    lambda_alpha_k = 0.0
+    ac_enabled = float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0
+    if ac_enabled and bool(alpha_cahn_conservative):
+        eps = float(alpha_cahn_eps)
+        if not (eps > 0.0):
+            raise ValueError("alpha_cahn_eps must be > 0 when alpha_cahn_M and alpha_cahn_gamma are enabled.")
+
+        # α(x,y) = c + bx x + by y on the unit square -> exact polynomial moments.
+        def _mean_alpha_powers(c: float, bx: float, by: float):
+            # E[x]=E[y]=1/2, E[x^2]=E[y^2]=1/3, E[xy]=1/4, E[x^3]=E[y^3]=1/4, E[x^2 y]=E[x y^2]=1/6.
+            m1 = c + 0.5 * (bx + by)
+            m2 = c * c + c * (bx + by) + (bx * bx + by * by) / 3.0 + (bx * by) / 2.0
+            m3 = (
+                c * c * c
+                + 1.5 * c * c * (bx + by)
+                + c * (bx * bx + by * by)
+                + 1.5 * c * bx * by
+                + 0.25 * (bx * bx * bx + by * by * by)
+                + 0.5 * bx * by * (bx + by)
+            )
+            return m1, m2, m3
+
+        # α_n uses (a0,ax,ay); α_k shifts only the constant term by dt*alpha_t.
+        c_n = a0
+        c_k = a0 + dt * float(alpha_t)
+        bx = ax
+        by = ay
+
+        m1_n, m2_n, m3_n = _mean_alpha_powers(c_n, bx, by)
+        m1_k, m2_k, m3_k = _mean_alpha_powers(c_k, bx, by)
+
+        mean_Wp_n = 2.0 * m1_n - 6.0 * m2_n + 4.0 * m3_n
+        mean_Wp_k = 2.0 * m1_k - 6.0 * m2_k + 4.0 * m3_k
+        gamma_over_eps = float(alpha_cahn_gamma) / eps
+        lambda_alpha_n = gamma_over_eps * mean_Wp_n
+        lambda_alpha_k = gamma_over_eps * mean_Wp_k
+
     return BiofilmOneDomainMMS(
         v_n=v_n,
         p_n=p_n,
@@ -373,4 +445,6 @@ def build_biofilm_one_domain_mms_affine(
         phi=phi_k,
         alpha=alpha_k,
         S=S_k,
+        lambda_alpha_n=float(lambda_alpha_n),
+        lambda_alpha_k=float(lambda_alpha_k),
     )

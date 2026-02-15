@@ -70,6 +70,17 @@ class BiofilmOneDomainMMSConvergence:
     # Lagged detachment rate used in α-equation (x,y)->(...)
     D_det_prev: callable
 
+    # Optional: conservative Allen–Cahn global multiplier (constants for the step)
+    lambda_alpha_n: float = 0.0
+    lambda_alpha_k: float = 0.0
+
+    # Optional: Allen–Cahn settings used to generate f_alpha
+    alpha_cahn_M: float = 0.0
+    alpha_cahn_gamma: float = 0.0
+    alpha_cahn_eps: float = 1.0
+    alpha_cahn_conservative: bool = False
+    alpha_cahn_mobility: str = "constant"
+
 
 def _sym_grad_vec(v, x, y):
     return sp.Matrix([[sp.diff(v[i], var) for var in (x, y)] for i in range(2)])
@@ -155,6 +166,13 @@ def build_biofilm_one_domain_mms_trig_step(
     D_phi: float = 0.1,
     gamma_phi: float = 1.0,
     D_alpha: float = 0.1,
+    # Optional Allen–Cahn / phase-field regularization for α (implicit at k, as in the model).
+    alpha_cahn_M: float = 0.0,
+    alpha_cahn_gamma: float = 0.0,
+    alpha_cahn_eps: float = 1.0,
+    alpha_cahn_conservative: bool = False,
+    alpha_cahn_mobility: str = "constant",
+    alpha_wave: int = 1,
     D_S: float = 0.1,
     D_X: float = 0.1,
     mu_max: float = 0.4,
@@ -188,6 +206,9 @@ def build_biofilm_one_domain_mms_trig_step(
     # ------------------------------------------------------------------
     x, y, t = sp.symbols("x y t", real=True)
     s = sp.sin(sp.pi * x) * sp.sin(sp.pi * y)
+    if int(alpha_wave) < 1:
+        raise ValueError("alpha_wave must be >= 1.")
+    s_alpha = sp.sin(int(alpha_wave) * sp.pi * x) * sp.sin(int(alpha_wave) * sp.pi * y)
 
     v_expr = sp.Matrix(
         [
@@ -204,7 +225,7 @@ def build_biofilm_one_domain_mms_trig_step(
     p_expr = s * (1.0 + 0.3 * sp.sin(t))
 
     phi_expr = 0.7 + 0.1 * s * (1.0 + 0.2 * sp.cos(t))
-    alpha_expr = 0.5 + 0.2 * s * (1.0 + 0.1 * sp.sin(t))
+    alpha_expr = 0.5 + 0.2 * s_alpha * (1.0 + 0.1 * sp.sin(t))
     S_expr = 0.4 + 0.1 * s * (1.0 + 0.2 * sp.cos(t))
     X_expr = 0.1 + 0.05 * s * (1.0 + 0.2 * sp.sin(t))
 
@@ -393,6 +414,92 @@ def build_biofilm_one_domain_mms_trig_step(
     f_alpha_expr += th * Fal_k + one_m_th * Fal_n
     f_alpha_expr += -float(D_alpha) * _sym_laplacian(alpha_k_expr, x, y)
 
+    # Optional Allen–Cahn / phase-field regularization for α (implicit at k).
+    ac_enabled = float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0
+    lambda_alpha_n = 0.0
+    lambda_alpha_k = 0.0
+    if ac_enabled:
+        eps_alpha = float(alpha_cahn_eps)
+        if not (eps_alpha > 0.0):
+            raise ValueError("alpha_cahn_eps must be > 0 when alpha_cahn_M and alpha_cahn_gamma are enabled.")
+
+        # Mobility options mirror the model implementation.
+        mob_key = str(alpha_cahn_mobility).strip().lower()
+        if mob_key in {"constant", "const"}:
+            M_ac_k_expr = float(alpha_cahn_M)
+            M_ac_n_expr = float(alpha_cahn_M)
+        elif mob_key in {"degenerate", "deg", "alpha(1-alpha)", "alpha*(1-alpha)", "a(1-a)"}:
+            M_ac_k_expr = float(alpha_cahn_M) * alpha_k_expr * (1.0 - alpha_k_expr)
+            M_ac_n_expr = float(alpha_cahn_M) * alpha_n_expr * (1.0 - alpha_n_expr)
+        else:
+            raise ValueError(f"Unknown alpha_cahn_mobility {alpha_cahn_mobility!r}. Use 'constant' or 'degenerate'.")
+
+        M_gamma_k_expr = float(alpha_cahn_gamma) * M_ac_k_expr
+
+        # W'(α) for W(α)=α^2(1-α)^2 is 2α(1-α)(1-2α).
+        Wp_k_expr = 2.0 * alpha_k_expr * (1.0 - alpha_k_expr) * (1.0 - 2.0 * alpha_k_expr)
+
+        # Strong Allen–Cahn operator: -div(Mγ ε ∇α) + (Mγ/ε) W'(α).
+        # Use the exact product rule for variable mobility to match the implementation.
+        div_Mgrad = sp.diff(M_gamma_k_expr * sp.diff(alpha_k_expr, x), x) + sp.diff(M_gamma_k_expr * sp.diff(alpha_k_expr, y), y)
+        ac_term = -eps_alpha * div_Mgrad + (M_gamma_k_expr / eps_alpha) * Wp_k_expr
+
+        if bool(alpha_cahn_conservative):
+            # For this MMS, α(t,x,y) is of the form 0.5 + A(t) * sin(kπx)sin(kπy).
+            # Compute λ_α(t) exactly from the constraint:
+            #   λ = (∫ M(α) μ dx)/(∫ M(α) dx),  μ=γ(-εΔα + (1/ε)W'(α)).
+            k = int(alpha_wave)
+            pi = float(np.pi)
+
+            def _A(tval: float) -> float:
+                return 0.2 * (1.0 + 0.1 * float(np.sin(float(tval))))
+
+            def _sin_int_odd(kv: int, *, power: int) -> float:
+                if kv % 2 == 0:
+                    return 0.0
+                if power == 1:
+                    return 2.0 / (kv * pi)
+                if power == 3:
+                    return 4.0 / (3.0 * kv * pi)
+                if power == 5:
+                    return 16.0 / (15.0 * kv * pi)
+                raise ValueError(f"Unsupported power={power} for sine integral.")
+
+            def _lambda_for_A(Aval: float) -> float:
+                # Moments over the unit square of s = sin(kπx)sin(kπy).
+                I1 = _sin_int_odd(k, power=1)
+                I3 = _sin_int_odd(k, power=3)
+                I5 = _sin_int_odd(k, power=5)
+                m1 = I1 * I1
+                m3 = I3 * I3
+                m5 = I5 * I5
+
+                # μ = γ( -εΔα + (1/ε)W'(α) ), with α = 0.5 + δ, δ = A s:
+                #   Δα = -2(kπ)^2 A s
+                #   W'(α) = -δ + 4δ^3 = -A s + 4A^3 s^3
+                c1 = Aval * (2.0 * eps_alpha * ((k * pi) ** 2) - (1.0 / eps_alpha))
+                c3 = (4.0 * (Aval**3)) / eps_alpha
+
+                if mob_key in {"constant", "const"}:
+                    return float(alpha_cahn_gamma) * (c1 * m1 + c3 * m3)
+
+                # Degenerate mobility: M(α)=M0 α(1-α) = M0(0.25 - δ^2), M0 cancels in λ.
+                # Use exact mean(s^2)=1/4 for integer k.
+                denom = (1.0 - Aval * Aval) / 4.0
+                if abs(denom) < 1.0e-14:
+                    raise ValueError("Degenerate mobility denominator too small (A too large).")
+
+                num = 0.25 * c1 * m1
+                num += (0.25 * c3 - (Aval * Aval) * c1) * m3
+                num += -(Aval * Aval) * c3 * m5
+                return float(alpha_cahn_gamma) * (num / denom)
+
+            lambda_alpha_n = _lambda_for_A(_A(t_n))
+            lambda_alpha_k = _lambda_for_A(_A(t_k))
+            ac_term = ac_term - M_ac_k_expr * float(lambda_alpha_k)
+
+        f_alpha_expr += ac_term
+
     # ------------------------------------------------------------------
     # Substrate forcing (θ-averaged diffusion)
     # ------------------------------------------------------------------
@@ -465,4 +572,11 @@ def build_biofilm_one_domain_mms_trig_step(
         f_S=f_S,
         f_X=f_X,
         D_det_prev=D_det_prev,
+        lambda_alpha_n=float(lambda_alpha_n),
+        lambda_alpha_k=float(lambda_alpha_k),
+        alpha_cahn_M=float(alpha_cahn_M),
+        alpha_cahn_gamma=float(alpha_cahn_gamma),
+        alpha_cahn_eps=float(alpha_cahn_eps),
+        alpha_cahn_conservative=bool(alpha_cahn_conservative),
+        alpha_cahn_mobility=str(alpha_cahn_mobility),
     )
