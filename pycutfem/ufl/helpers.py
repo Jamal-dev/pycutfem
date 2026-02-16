@@ -1084,6 +1084,13 @@ class VecOpInfo(BaseOpInfo):
         return VecOpInfo(self.data + other_data, role=self.role, **self.update_meta(meta))
     def __sub__(self, other: "VecOpInfo") -> "VecOpInfo":
         return self.__add__(-other)
+
+    def __radd__(self, other) -> "VecOpInfo":
+        return self.__add__(other)
+
+    def __rsub__(self, other) -> "VecOpInfo":
+        return (-self).__add__(other)
+
     def __neg__(self) -> "VecOpInfo":
         """Element-wise negation of the VecOpInfo."""
         return self._with(-self.data, role=self.role)

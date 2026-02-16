@@ -19,6 +19,8 @@ from pycutfem.ufl.expressions import (
     VectorFunction,
     VectorTestFunction,
     VectorTrialFunction,
+    grad,
+    inner,
 )
 from pycutfem.ufl.forms import BoundaryCondition
 from pycutfem.ufl.spaces import FunctionSpace
@@ -220,6 +222,13 @@ def main() -> None:
     ap.add_argument("--theta", type=float, default=1.0)
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
     ap.add_argument("--newton-tol", type=float, default=1.0e-5)
+    ap.add_argument(
+        "--newton-rtol",
+        type=float,
+        default=0.0,
+        help="Optional relative Newton tolerance. The solver stops when "
+        "|R|_inf <= max(newton_tol, newton_rtol*|R0|_inf).",
+    )
     ap.add_argument("--max-it", type=int, default=40)
     ap.add_argument(
         "--ls-mode",
@@ -1017,6 +1026,12 @@ def main() -> None:
                 args.ls_mode = "dealii"
             if not _has_flag("--newton-tol"):
                 args.newton_tol = 1.0e-4
+            if not _has_flag("--newton-rtol") and bool(getattr(args, "alpha_cahn_conservative", False)):
+                # For conservative Allen–Cahn, the first few Newton solves can be
+                # dominated by interface relaxation residuals. A mild relative
+                # tolerance keeps early steps robust while preserving the absolute
+                # tolerance once the initial residual is small.
+                args.newton_rtol = 0.22
             if not _has_flag("--max-it"):
                 args.max_it = 60
             if not _has_flag("--u-extension"):
@@ -1234,7 +1249,12 @@ def main() -> None:
 
     alpha_supg = float(getattr(args, "alpha_supg", 0.0) or 0.0)
     alpha_cip = float(getattr(args, "alpha_cip", 0.0) or 0.0)
-    if float(args.D_alpha) == 0.0 and alpha_supg == 0.0 and alpha_cip == 0.0:
+    # Only auto-enable advection stabilization when α is a *pure* transport field.
+    # If Allen–Cahn or Cahn–Hilliard regularization is enabled, those terms already
+    # regularize the interface and extra SUPG/CIP can slow Newton convergence.
+    ac_enabled = float(getattr(args, "alpha_cahn_M", 0.0) or 0.0) != 0.0 and float(getattr(args, "alpha_cahn_gamma", 0.0) or 0.0) != 0.0
+    ch_enabled = float(getattr(args, "alpha_ch_M", 0.0) or 0.0) != 0.0 and float(getattr(args, "alpha_ch_gamma", 0.0) or 0.0) != 0.0
+    if float(args.D_alpha) == 0.0 and alpha_supg == 0.0 and alpha_cip == 0.0 and not (ac_enabled or ch_enabled):
         # When users set D-alpha=0, the alpha equation becomes pure CG advection (by vS),
         # which is prone to spurious oscillations/overshoots that can destabilize Newton.
         # Prefer consistent stabilization (SUPG/CIP) over adding physical diffusion.
@@ -1440,6 +1460,12 @@ def main() -> None:
 
     eps_x = max(eps, 1.0e-12)
     eps_y = max(eps, 1.0e-12)
+    # When phase-field regularization is enabled (Allen–Cahn or Cahn–Hilliard),
+    # the stationary 1D interface profile for
+    #   μ = γ(-εΔα + (1/ε)W'(α)),  W(α)=α²(1-α)²
+    # is α(s)=0.5(1+tanh(s/(√2 ε))). Using the √2 factor here makes the initial
+    # diffuse interface closer to equilibrium and improves Newton robustness.
+    eps_profile_scale = float(np.sqrt(2.0)) if (ac_enabled or ch_enabled) else 1.0
 
     poly_alpha0 = None
     if alpha0_kind == "polygon":
@@ -1477,14 +1503,14 @@ def main() -> None:
             xx, yy = np.broadcast_arrays(x, y)
             pts = np.column_stack((xx.ravel(), yy.ravel()))
             phi = _signed_distance_polygon(pts, poly_alpha0)
-            a0 = _smooth_step(-phi / eps_x).reshape(xx.shape)
+            a0 = _smooth_step(-phi / (eps_profile_scale * eps_x)).reshape(xx.shape)
             # Optional initial crack notch (fluid gap) from the bottom wall into the biofilm.
             # This seeds an internal diffuse interface so the crack-speed term can propagate it.
             if crack_depth > 0.0 and crack_width > 0.0:
                 xL = crack_x0 - 0.5 * crack_width
                 xR = crack_x0 + 0.5 * crack_width
-                wcx = _smooth_step((xx - xL) / eps_x) * _smooth_step((xR - xx) / eps_x)
-                wcy = _smooth_step((crack_depth - yy) / eps_y)
+                wcx = _smooth_step((xx - xL) / (eps_profile_scale * eps_x)) * _smooth_step((xR - xx) / (eps_profile_scale * eps_x))
+                wcy = _smooth_step((crack_depth - yy) / (eps_profile_scale * eps_y))
                 a0 = a0 * (1.0 - wcx * wcy)
             return np.clip(a0, 0.0, 1.0)
 
@@ -1493,16 +1519,16 @@ def main() -> None:
         def alpha0_eval(x, y):
             x = np.asarray(x, float)
             y = np.asarray(y, float)
-            wx = _smooth_step((x - x1) / eps_x) * _smooth_step((x2 - x) / eps_x)
-            wy = _smooth_step((h_b - y) / eps_y)
+            wx = _smooth_step((x - x1) / (eps_profile_scale * eps_x)) * _smooth_step((x2 - x) / (eps_profile_scale * eps_x))
+            wy = _smooth_step((h_b - y) / (eps_profile_scale * eps_y))
             a0 = wx * wy
             # Optional initial crack notch (fluid gap) from the bottom wall into the biofilm.
             # This seeds an internal diffuse interface so the crack-speed term can propagate it.
             if crack_depth > 0.0 and crack_width > 0.0:
                 xL = crack_x0 - 0.5 * crack_width
                 xR = crack_x0 + 0.5 * crack_width
-                wcx = _smooth_step((x - xL) / eps_x) * _smooth_step((xR - x) / eps_x)
-                wcy = _smooth_step((crack_depth - y) / eps_y)
+                wcx = _smooth_step((x - xL) / (eps_profile_scale * eps_x)) * _smooth_step((xR - x) / (eps_profile_scale * eps_x))
+                wcy = _smooth_step((crack_depth - y) / (eps_profile_scale * eps_y))
                 a0 = a0 * (1.0 - wcx * wcy)
             return np.clip(a0, 0.0, 1.0)
 
@@ -1550,6 +1576,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Optional restart: load solution snapshots from a prior run
     # ------------------------------------------------------------------
+    mu_alpha_restored = False
     if restart_payload is not None:
         st = dict(restart_payload.get("state", {}) or {})
         restored: list[str] = []
@@ -1563,7 +1590,10 @@ def main() -> None:
             if f is None:
                 continue
             if _restore_function_from_state(f, st):
-                restored.append(str(getattr(f, "name", "?")))
+                name = str(getattr(f, "name", "?"))
+                restored.append(name)
+                if name in {"mu_alpha_k", "mu_alpha_n"}:
+                    mu_alpha_restored = True
         if a_prev is None and ("a_scalar" in st):
             try:
                 restart_payload["a_scalar"] = float(_npz_scalar(st, "a_scalar", float(args.a0)))
@@ -1573,6 +1603,17 @@ def main() -> None:
             print(f"[restart] restored {len(restored)} fields: {', '.join(restored)}")
         else:
             print("[restart] warning: no matching fields restored from dump.")
+
+    if ch_enabled and (mu_alpha_n is not None) and (mu_alpha_k is not None) and (not mu_alpha_restored):
+        # Good initial guess for CH chemical potential: ignore the Laplacian term and use
+        # μ ≈ (γ/ε) W'(α). This materially improves Newton robustness for small ε.
+        eps_ch = float(getattr(args, "alpha_ch_eps", float(args.eps)))
+        gamma_ch = float(getattr(args, "alpha_ch_gamma", 0.0) or 0.0)
+        eps_ch = max(eps_ch, 1.0e-16)
+        a0 = np.asarray(alpha_n.nodal_values, dtype=float)
+        Wp0 = 2.0 * a0 * (1.0 - a0) * (1.0 - 2.0 * a0)
+        mu_alpha_n.nodal_values[:] = (gamma_ch / eps_ch) * Wp0
+        mu_alpha_k.nodal_values[:] = mu_alpha_n.nodal_values
 
     # ------------------------------------------------------------------
     # Forms with adhesion traction on the bottom wall
@@ -2288,6 +2329,7 @@ def main() -> None:
         bcs_homog=bcs_homog,
         newton_params=NewtonParameters(
             newton_tol=float(args.newton_tol),
+            newton_rtol=float(getattr(args, "newton_rtol", 0.0) or 0.0),
             max_newton_iter=int(args.max_it),
             ls_mode=str(getattr(args, "ls_mode", "dealii")),
         ),
@@ -2307,6 +2349,157 @@ def main() -> None:
         if u_predictor == "extrapolate" and u_nm1 is not None:
             # Constant-velocity predictor: u^{n+1} ≈ u^n + (u^n - u^{n-1}).
             u_k.nodal_values[:] = u_n.nodal_values + (u_n.nodal_values - u_nm1.nodal_values)
+        # Predictor for the ramped channel flow: scale the previous (v,p) state
+        # by the inflow ramp ratio so the first Newton residual is not dominated
+        # by the change in prescribed inflow.
+        #
+        # NOTE: This is safe because we re-apply Dirichlet BCs after modifying
+        # the guess (Dirichlet DOFs are excluded from Newton updates).
+        try:
+            t_n = float(getattr(solver, "_current_t", 0.0) or 0.0)
+            dt_curr = float(getattr(solver, "_current_dt", dt_val) or dt_val)
+            t_bc = t_n + float(theta) * dt_curr
+            r_old = float(ramp(t_n))
+            r_new = float(ramp(t_bc))
+        except Exception:
+            r_old = 0.0
+            r_new = 0.0
+
+        if r_new > 0.0:
+            if r_old > 1.0e-12:
+                # Keep the default time-step predictor (copy previous solution).
+                # The Dirichlet inflow ramp is already applied by the solver's
+                # BC update; global scaling of the interior state is not robust
+                # once the coupled sloughing dynamics kicks in.
+                pass
+            else:
+                # First step: initialize a Poiseuille-like guess in the whole
+                # domain (independent of x) matching the inflow amplitude, but
+                # suppress it inside the initial biofilm region to better match
+                # the Brinkman drag there.
+                try:
+                    vx_gdofs = np.asarray(dh.get_field_slice("v_x"), dtype=int).ravel()
+                    vx_xy = np.asarray(dh.get_dof_coords("v_x"), dtype=float)
+                    yy = (vx_xy[:, 1] / float(H)).astype(float)
+                    a0_vx = np.asarray(alpha0_eval(vx_xy[:, 0], vx_xy[:, 1]), dtype=float).ravel()
+                    vx_vals = float(Umax) * float(r_new) * 4.0 * yy * (1.0 - yy) * (1.0 - a0_vx)
+                    v_k.components[0].set_nodal_values(vx_gdofs, np.asarray(vx_vals, dtype=float).ravel())
+
+                    vy_gdofs = np.asarray(dh.get_field_slice("v_y"), dtype=int).ravel()
+                    v_k.components[1].set_nodal_values(vy_gdofs, np.zeros_like(vy_gdofs, dtype=float))
+
+                    # Pressure predictor consistent with Stokes Poiseuille flow:
+                    # u_max = (-dp/dx) H^2 / (8 mu)  =>  p(x) ≈ (8 mu Umax / H^2) (L - x).
+                    try:
+                        p_xy = np.asarray(dh.get_dof_coords("p"), dtype=float)
+                        dpdx = -8.0 * float(args.mu_f) * float(Umax) * float(r_new) / (float(H) * float(H))
+                        p_k.nodal_values[:] = (-dpdx) * (float(L) - p_xy[:, 0])
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        # Predictor for u based on the local drag balance at the *ramp start*:
+        # in the biofilm/interface region the Brinkman drag strongly enforces
+        # vS ≈ v, with vS=(u^k-u^n)/dt. Providing u^k so that vS matches the
+        # initial v guess materially reduces the initial residual.
+        #
+        # IMPORTANT: only do this when r_old≈0 (first step of the ramp); on later
+        # steps the "copy previous solution" predictor is typically better.
+        if r_new > 0.0 and r_old <= 1.0e-12:
+            try:
+                dt_curr = float(getattr(solver, "_current_dt", dt_val) or dt_val)
+                dt_curr = max(dt_curr, 1.0e-16)
+
+                ux_xy = np.asarray(dh.get_dof_coords("u_x"), dtype=float)
+                uy_xy = np.asarray(dh.get_dof_coords("u_y"), dtype=float)
+                vx_xy = np.asarray(dh.get_dof_coords("v_x"), dtype=float)
+                vy_xy = np.asarray(dh.get_dof_coords("v_y"), dtype=float)
+
+                vx_vals = np.asarray(v_k.components[0].nodal_values, dtype=float).ravel()
+                vy_vals = np.asarray(v_k.components[1].nodal_values, dtype=float).ravel()
+
+                if ux_xy.shape == vx_xy.shape and np.allclose(ux_xy, vx_xy, atol=1.0e-14, rtol=0.0):
+                    vx_on_u = vx_vals
+                else:
+                    scale = 1.0e12
+                    keys_v = np.round(vx_xy * scale).astype(np.int64)
+                    vmap = {(int(k[0]), int(k[1])): float(v) for k, v in zip(keys_v, vx_vals)}
+                    keys_u = np.round(ux_xy * scale).astype(np.int64)
+                    vx_on_u = np.asarray([vmap.get((int(k[0]), int(k[1])), 0.0) for k in keys_u], dtype=float)
+
+                if uy_xy.shape == vy_xy.shape and np.allclose(uy_xy, vy_xy, atol=1.0e-14, rtol=0.0):
+                    vy_on_u = vy_vals
+                else:
+                    scale = 1.0e12
+                    keys_v = np.round(vy_xy * scale).astype(np.int64)
+                    vmap = {(int(k[0]), int(k[1])): float(v) for k, v in zip(keys_v, vy_vals)}
+                    keys_u = np.round(uy_xy * scale).astype(np.int64)
+                    vy_on_u = np.asarray([vmap.get((int(k[0]), int(k[1])), 0.0) for k in keys_u], dtype=float)
+
+                a0_u = np.asarray(alpha0_eval(ux_xy[:, 0], ux_xy[:, 1]), dtype=float).ravel()
+                # Saturating weight: use vS≈v when α is not tiny, but keep u≈0
+                # in the free-fluid region so the u-extension penalty stays small.
+                w_u = np.clip(a0_u / 0.25, 0.0, 1.0)
+
+                ux_prev = np.asarray(u_n.components[0].nodal_values, dtype=float).ravel()
+                uy_prev = np.asarray(u_n.components[1].nodal_values, dtype=float).ravel()
+
+                ux_gdofs = np.asarray(dh.get_field_slice("u_x"), dtype=int).ravel()
+                uy_gdofs = np.asarray(dh.get_field_slice("u_y"), dtype=int).ravel()
+
+                u_k.components[0].set_nodal_values(ux_gdofs, ux_prev + dt_curr * w_u * vx_on_u)
+                u_k.components[1].set_nodal_values(uy_gdofs, uy_prev + dt_curr * w_u * vy_on_u)
+            except Exception:
+                pass
+            # Also predict alpha by advecting the initial indicator with the
+            # current u guess (refmap predictor). This does not change the
+            # model (alpha is still solved), but it reduces the first residual
+            # in advection-dominated runs with D_alpha=0.
+            try:
+                if not bool(getattr(args, "alpha_from_refmap", False)):
+                    _update_alpha_from_refmap()
+            except Exception:
+                pass
+
+        # Conservative Allen–Cahn: provide a good initial guess for the global
+        # Lagrange multiplier λ_α so the first Newton residual is not dominated
+        # by the constraint equation.
+        if alpha_cahn_conservative and lambda_alpha_k is not None:
+            try:
+                eps_ac = float(getattr(args, "alpha_cahn_eps", float(args.eps)))
+                gamma_ac = float(getattr(args, "alpha_cahn_gamma", 0.0) or 0.0)
+                eps_ac = max(eps_ac, 1.0e-16)
+
+                mob_key = str(getattr(args, "alpha_cahn_mobility", "constant")).strip().lower()
+                if mob_key in {"constant", "const"}:
+                    mob = Constant(1.0)
+                    mob_prime = Constant(0.0)
+                else:
+                    mob = alpha_k * (Constant(1.0) - alpha_k)
+                    mob_prime = Constant(1.0) - Constant(2.0) * alpha_k
+
+                # W'(α) for W(α)=α^2(1-α)^2.
+                Wp = Constant(2.0) * alpha_k * (Constant(1.0) - alpha_k) * (Constant(1.0) - Constant(2.0) * alpha_k)
+
+                den = float(assemble_scalar(dh, mob * dx_q, backend=backend, quad_order=qdeg))
+                if den > 1.0e-16:
+                    num = float(assemble_scalar(dh, (mob * Wp) * dx_q, backend=backend, quad_order=qdeg))
+                    lam = (gamma_ac / eps_ac) * (num / den)
+                    if mob_key not in {"constant", "const"}:
+                        g2 = inner(grad(alpha_k), grad(alpha_k))
+                        num2 = float(assemble_scalar(dh, (mob_prime * g2) * dx_q, backend=backend, quad_order=qdeg))
+                        lam += (eps_ac * gamma_ac) * (num2 / den)
+                    lambda_alpha_k.nodal_values[:] = lam
+            except Exception:
+                pass
+
+        bcs_now = getattr(solver, "_current_bcs", None)
+        if bcs_now is not None:
+            try:
+                dh.apply_bcs(bcs_now, *_funcs)
+            except Exception:
+                pass
 
     solver.pre_cb = _preproc_predictor
 
