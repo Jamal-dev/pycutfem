@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import traceback
 
 import logging
 import numpy as np
@@ -2438,6 +2439,33 @@ def main() -> None:
         vtk_every = int(args.vtk_every)
         if vtk_every > 0 and (step_no % vtk_every == 0):
             # Export derived fields for debugging in ParaView.
+            #
+            # NOTE: These are *derived* visualization fields, not part of the
+            # monolithic PDE solve. Failures must not silently overwrite values
+            # with zeros (which looks like "vS=0" or "stress=0" in ParaView).
+            # Keep failures local and (optionally) report them.
+            beta_nodes = None
+            vS_nodes = None
+            sigma_vm_nodes = None
+            sigma_xx_nodes = None
+            sigma_yy_nodes = None
+            sigma_xy_nodes = None
+
+            vtk_debug = _env_bool("PYCUTFEM_VTK_DERIVED_DEBUG", False)
+            vtk_warn_once = _env_bool("PYCUTFEM_VTK_DERIVED_WARN_ONCE", True)
+            if "vtk_derived_warned" not in step_counter:
+                step_counter["vtk_derived_warned"] = 0
+
+            def _vtk_derived_warn(tag: str, exc: Exception) -> None:
+                if vtk_warn_once and int(step_counter.get("vtk_derived_warned", 0)) > 0:
+                    return
+                step_counter["vtk_derived_warned"] = int(step_counter.get("vtk_derived_warned", 0)) + 1
+                msg = f"[warn] VTK derived field export failed ({tag}) at step={step_no}: {exc}"
+                if vtk_debug:
+                    msg += "\n" + traceback.format_exc()
+                print(msg)
+
+            # β (drag proxy) for visualization.
             try:
                 alpha_nodes = _scalar_to_nodes(alpha_k)
                 phi_nodes = _scalar_to_nodes(phi_k)
@@ -2454,9 +2482,21 @@ def main() -> None:
                     kappa_perm = float(getattr(args, "damage_kappa_perm", 1.0e-8) or 1.0e-8)
                     g_perm_nodes = (1.0 - kappa_perm) * ((1.0 - d_nodes) ** 2) + kappa_perm
                 beta_nodes = alpha_nodes * float(args.mu_f) * (phi_nodes * phi_nodes) * kappa_inv_eff * g_perm_nodes
+            except Exception as exc:
+                beta_nodes = None
+                _vtk_derived_warn("beta", exc)
+
+            # vS for visualization: finite difference from stored u history.
+            try:
                 u_nodes = _vector_to_nodes(u_k)
                 u_prev_nodes = _vector_to_nodes(u_prev)
                 vS_nodes = (u_nodes - u_prev_nodes) / max(float(dt_step), 1.0e-16)
+            except Exception as exc:
+                vS_nodes = None
+                _vtk_derived_warn("vS", exc)
+
+            # Solid stress diagnostics (domain-projected) for visualization.
+            try:
                 sigma_u, _w_sigma = solid_von_mises_mass_lumped_in_domain(
                     dof_handler=dh,
                     field="u_x",
@@ -2486,21 +2526,24 @@ def main() -> None:
                 sigma_yy_nodes = np.zeros(num_nodes, dtype=float)
                 sigma_xy_nodes = np.zeros(num_nodes, dtype=float)
                 sl_u = np.asarray(dh.get_field_slice("u_x"), dtype=int).ravel()
+                if np.asarray(sigma_u, dtype=float).shape[0] != sl_u.shape[0]:
+                    raise RuntimeError(
+                        f"stress projection size mismatch: sigma_u={np.asarray(sigma_u).shape} sl_u={sl_u.shape}"
+                    )
                 for i, gdof in enumerate(sl_u):
-                    _fld, node_id = dh._dof_to_node_map[int(gdof)]
+                    _fld, node_id = dh._dof_to_node_map.get(int(gdof), (None, None))
                     if node_id is None:
                         continue
                     sigma_vm_nodes[int(node_id)] = float(sigma_u[i])
                     sigma_xx_nodes[int(node_id)] = float(sigma_xx_u[i])
                     sigma_yy_nodes[int(node_id)] = float(sigma_yy_u[i])
                     sigma_xy_nodes[int(node_id)] = float(sigma_xy_u[i])
-            except Exception:
-                beta_nodes = None
-                vS_nodes = None
+            except Exception as exc:
                 sigma_vm_nodes = None
                 sigma_xx_nodes = None
                 sigma_yy_nodes = None
                 sigma_xy_nodes = None
+                _vtk_derived_warn("stress", exc)
 
             export_vtk(
                 filename=os.path.join(str(args.outdir), f"solution_{step_no:04d}.vtu"),

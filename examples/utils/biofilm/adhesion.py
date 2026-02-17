@@ -332,9 +332,19 @@ def solid_cauchy_stress_components_mass_lumped_in_domain(
 
     psi = TestFunction(field, dof_handler=dof_handler)
     w_form = (psi * alpha) * dx_domain
-    rhs_xx_form = (psi * alpha * sig[0, 0]) * dx_domain
-    rhs_yy_form = (psi * alpha * sig[1, 1]) * dx_domain
-    rhs_xy_form = (psi * alpha * sig[0, 1]) * dx_domain
+    # Component extraction: avoid `sig[i,j]` because generic tensor expressions
+    # (e.g. Sum/Prod of matrices) are not subscriptable in our symbolic layer.
+    # Use matrix inner products with basis matrices instead:
+    #   inner(σ, E_ij) = σ_ij.
+    E_xx = Constant(np.array([[1.0, 0.0], [0.0, 0.0]], dtype=float))
+    E_yy = Constant(np.array([[0.0, 0.0], [0.0, 1.0]], dtype=float))
+    E_xy = Constant(np.array([[0.0, 1.0], [0.0, 0.0]], dtype=float))
+    sig_xx = inner(sig, E_xx)
+    sig_yy = inner(sig, E_yy)
+    sig_xy = inner(sig, E_xy)
+    rhs_xx_form = (psi * alpha * sig_xx) * dx_domain
+    rhs_yy_form = (psi * alpha * sig_yy) * dx_domain
+    rhs_xy_form = (psi * alpha * sig_xy) * dx_domain
 
     _, w_vec = assemble_form(Equation(None, w_form), dof_handler=dof_handler, bcs=[], quad_order=quad_order, backend=backend)
     _, rhs_xx_vec = assemble_form(
