@@ -122,6 +122,7 @@ class CppCodeGen:
             Trace,
             PositivePartOp,
             HeavisideOp,
+            LogOp,
         )
         needs_phis = any(isinstance(op, (PosOp, NegOp)) for op in ir_sequence)
         families = getattr(self.mixed_element, "_field_families", {}) if self.mixed_element is not None else {}
@@ -2793,6 +2794,20 @@ class CppCodeGen:
                     stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
                 else:
                     raise NotImplementedError(f"HeavisideOp not implemented for kind={a.kind!r}.")
+            elif isinstance(op, LogOp):
+                a = stack.pop()
+                nm = new_tmp("log")
+                if a.kind == "scalar":
+                    emit_line(f"double {nm} = std::log({a.name});")
+                    stack.append(StackItem(nm, "scalar", a.role, (), a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "vec":
+                    emit_line(f"Eigen::VectorXd {nm} = {a.name}.array().log().matrix();")
+                    stack.append(StackItem(nm, "vec", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                elif a.kind == "mat":
+                    emit_line(f"Eigen::MatrixXd {nm} = {a.name}.array().log().matrix();")
+                    stack.append(StackItem(nm, "mat", a.role, a.shape, a.field_names, a.parent, a.side, a.field_sides))
+                else:
+                    raise NotImplementedError(f"LogOp not implemented for kind={a.kind!r}.")
             elif isinstance(op, Store):
                 a = stack.pop()
                 if op.store_type == "matrix":

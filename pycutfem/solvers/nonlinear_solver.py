@@ -495,6 +495,11 @@ class NewtonSolver:
         constraints: Optional[object] = None,
         use_hanging_constraints: bool = True,
         preproc_cb: Optional[Callable[[List], None]] = None,
+        # Optional callback invoked *before every assembly* (Jacobian/residual,
+        # including line-search residual evaluations). This is intended for
+        # updating dependent coefficients (e.g. projected Lagrange multipliers)
+        # so residual evaluations stay consistent with the current iterate.
+        preassemble_cb: Optional[Callable[[Dict[str, object]], None]] = None,
         postproc_cb: Optional[Callable[[List], None]] = None,
         backend: str = "jit",
         postproc_timeloop_cb: Optional[Callable[[List], None]] = None,
@@ -506,6 +511,7 @@ class NewtonSolver:
         self.np = newton_params
         self.lp = lin_params
         self.pre_cb = preproc_cb
+        self.preassemble_cb = preassemble_cb
         self.post_cb = postproc_cb
         self.post_timeloop_cb = postproc_timeloop_cb
         self.backend = backend
@@ -522,9 +528,21 @@ class NewtonSolver:
         _t_setup0 = time.perf_counter() if _profile_setup else 0.0
         parallel_compile = os.getenv("PYCUTFEM_PARALLEL_COMPILE", "1").lower() not in {"0", "false", "no"}
         _start_numba_reduced_pattern_precompile()
+        _t_compile0 = time.perf_counter()
+        if self._is_jit_backend():
+            msg = f"[setup] compiling kernels (backend='{self.backend}', quad_order={int(self.quad_order)})"
+            if parallel_compile:
+                msg += " (residual in background)"
+            print(msg, flush=True)
         # Overlap residual-kernel compilation with active-DOF analysis + reduced-pattern
         # building. This cuts time-to-first-Newton on small problems.
         self._compile_all_kernels(parallel_residual=parallel_compile)
+        if self._is_jit_backend():
+            dt_compile = time.perf_counter() - _t_compile0
+            if parallel_compile and getattr(self, "_kernels_F_future", None) is not None:
+                print(f"[setup] kernels compiled (jacobian) in {dt_compile:.3f}s; residual will finish during setup.", flush=True)
+            else:
+                print(f"[setup] kernels compiled in {dt_compile:.3f}s", flush=True)
         if _profile_setup:
             dt = time.perf_counter() - _t_setup0
             if getattr(self, "_kernels_F_future", None) is not None:
@@ -1302,6 +1320,10 @@ class NewtonSolver:
                 print(
                     f"    Rejecting step {global_step_no}; reducing Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
                 )
+                # Reset line-search warm-start between attempts: after a failed step the
+                # previous accepted α can be extremely small, which makes retries at a
+                # reduced Δt stagnate unnecessarily.
+                self._ls_alpha_prev = 1.0
                 if abort_on_dt_reduction and float(time_params.dt) < float(dt):
                     raise RuntimeError(
                         f"Aborting after Δt reduction request at step {global_step_no}: "
@@ -1358,6 +1380,8 @@ class NewtonSolver:
                 print(
                     f"    Rejecting step {global_step_no}; reducing Δt → {time_params.dt:.3e} ({decision.reason}) and retrying."
                 )
+                # Same rationale as in the exception path above.
+                self._ls_alpha_prev = 1.0
                 if abort_on_dt_reduction and float(time_params.dt) < float(dt):
                     raise RuntimeError(
                         f"Aborting after Δt reduction request at step {global_step_no}: "
@@ -1449,14 +1473,6 @@ class NewtonSolver:
                 f_prev.nodal_values[:] = f.nodal_values[:]
             prev_delta_inf = delta_inf
 
-            # Steady‑state test -----------------------------------
-            if (
-                time_params.stop_on_steady
-                and step > 0
-                and np.linalg.norm(delta_U, ord=np.inf) < time_params.steady_tol
-            ):
-                break
-
             # # Accept: promote current → previous ------------------
             # dh.apply_bcs(bcs_now, *functions)
             # for f_prev, f in zip(prev_functions, functions):
@@ -1466,6 +1482,13 @@ class NewtonSolver:
                 self.post_timeloop_cb(functions)
             t_n += dt
             step += 1
+
+            # Steady‑state test -----------------------------------
+            # If enabled, still run the post-step callback and advance the
+            # time/step counters before exiting so the final accepted step is
+            # consistently recorded/exported by drivers.
+            if time_params.stop_on_steady and step > 0 and delta_inf < time_params.steady_tol:
+                break
 
         elapsed = time.perf_counter() - t_start
         return delta_U, step, elapsed
@@ -1496,6 +1519,7 @@ class NewtonSolver:
         temp_t0 = time.perf_counter()
         converged = False
         norm_R0: float | None = None
+        norm_hist: list[float] = []
         for it in range(self.np.max_newton_iter):
             if self.pre_cb is not None:
                 self.pre_cb(funcs)
@@ -1527,6 +1551,53 @@ class NewtonSolver:
             R_full = np.zeros(ndof_eff)
             R_full[self.active_dofs] = R_red
             norm_R = np.linalg.norm(R_full, ord=np.inf)
+            norm_hist.append(float(norm_R))
+
+            # Optional matrix diagnostics (expensive; debug-only).
+            if os.getenv("PYCUTFEM_MATRIX_STATS", "").lower() in {"1", "true", "yes"}:
+                step_target_raw = os.getenv("PYCUTFEM_MATRIX_STATS_STEP", "").strip()
+                it_target_raw = os.getenv("PYCUTFEM_MATRIX_STATS_IT", "").strip()
+                try:
+                    step_now = int(getattr(self, "_current_step_no", -1))
+                except Exception:
+                    step_now = -1
+                try:
+                    want_step = int(step_target_raw) if step_target_raw else None
+                except Exception:
+                    want_step = None
+                try:
+                    want_it = int(it_target_raw) if it_target_raw else 1
+                except Exception:
+                    want_it = 1
+                do_stats = (want_step is None or want_step == step_now) and (int(it + 1) == int(want_it))
+                if do_stats and A_red is not None:
+                    try:
+                        A_csr = A_red.tocsr() if hasattr(A_red, "tocsr") else A_red
+                        fro_A = float(np.sqrt(A_csr.multiply(A_csr).sum()))
+                        A_skew = A_csr - A_csr.T
+                        fro_skew = float(np.sqrt(A_skew.multiply(A_skew).sum()))
+                        ratio = fro_skew / max(fro_A, 1.0e-300)
+                        nnz = int(getattr(A_csr, "nnz", 0))
+                        print(f"        [mat] nnz={nnz}  ||A-A^T||_F/||A||_F={ratio:.3e}  ||A||_F={fro_A:.3e}")
+
+                        k_raw = os.getenv("PYCUTFEM_MATRIX_EIGS_K", "").strip()
+                        if k_raw:
+                            k = int(k_raw)
+                        else:
+                            k = 0
+                        if k > 0:
+                            which = os.getenv("PYCUTFEM_MATRIX_EIGS_WHICH", "LM").strip() or "LM"
+                            try:
+                                evals = spla.eigs(A_csr, k=min(k, max(1, A_csr.shape[0] - 2)), which=which, return_eigenvectors=False)
+                                evals = np.asarray(evals, dtype=np.complex128)
+                                order = np.argsort(-np.abs(evals))
+                                evals = evals[order]
+                                e_fmt = ", ".join([f"{z.real:+.3e}{z.imag:+.3e}j" for z in evals[:k]])
+                                print(f"        [mat] eigs(k={k}, which='{which}') ≈ [{e_fmt}]")
+                            except Exception as exc:  # noqa: PERF203
+                                print(f"        [mat] eigs failed: {exc}")
+                    except Exception as exc:  # noqa: PERF203
+                        print(f"        [mat] stats failed: {exc}")
             if os.getenv("PYCUTFEM_RESIDUAL_TRACE", "").lower() in {"1", "true", "yes"}:
                 worst_full = int(np.argmax(np.abs(R_full))) if R_full.size else -1
                 worst_val = float(R_full[worst_full]) if worst_full >= 0 else 0.0
@@ -1554,7 +1625,19 @@ class NewtonSolver:
                     except Exception:
                         extra = ""
 
-                print(f"        [res] worst_gdof={worst_full} worst_val={worst_val:.3e}{fmsg}{extra}")
+                coords_msg = ""
+                if os.getenv("PYCUTFEM_RESIDUAL_TRACE_COORDS", "").lower() in {"1", "true", "yes"} and field is not None:
+                    try:
+                        sl = np.asarray(self.dh.get_field_slice(field), dtype=int).ravel()
+                        hit = np.nonzero(sl == int(worst_full))[0]
+                        if hit.size:
+                            coords = np.asarray(self.dh.get_dof_coords(field), dtype=float)[int(hit[0])]
+                            if coords.size >= 2:
+                                coords_msg = f", x={coords[0]:.3e}, y={coords[1]:.3e}"
+                    except Exception:
+                        coords_msg = ""
+
+                print(f"        [res] worst_gdof={worst_full} worst_val={worst_val:.3e}{fmsg}{extra}{coords_msg}")
                 if os.getenv("PYCUTFEM_RESIDUAL_TRACE_FIELDS", "").lower() in {"1", "true", "yes"}:
                     field_norms = []
                     for fld in getattr(self.dh, "field_names", []):
@@ -1697,6 +1780,86 @@ class NewtonSolver:
                     print(f"        [res] {items}")
                 except Exception as exc:
                     print(f"        [res] trace failed: {exc}")
+            # Stagnation accept (near tolerance) --------------------------------
+            #
+            # In strongly penalty-dominated regimes (e.g. very large Brinkman drag β and/or
+            # inertia terms containing 1/Δt factors), driving the *raw* residual infinity norm
+            # below a very small absolute tolerance can become limited by floating-point noise
+            # and subtractive cancellation. In such cases Newton can stagnate with vanishing
+            # progress while still being effectively "as converged as possible".
+            #
+            # This guard accepts an iterate when:
+            #   (a) the residual is within a modest factor of the requested tolerance, and
+            #   (b) residual improvement over a window is negligible.
+            #
+            # Set the accept factor to 0 to disable.
+            accept_factor_raw = os.getenv("PYCUTFEM_NEWTON_STAGNATION_ACCEPT_FACTOR", "").strip()
+            if accept_factor_raw:
+                try:
+                    stag_accept_factor = float(accept_factor_raw)
+                except Exception:
+                    stag_accept_factor = 0.0
+            else:
+                try:
+                    stag_accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+                except Exception:
+                    stag_accept_factor = 0.0
+
+            if stag_accept_factor > 0.0 and tol_eff > 0.0 and norm_R <= stag_accept_factor * tol_eff:
+                win_raw = os.getenv("PYCUTFEM_NEWTON_STAGNATION_WINDOW", "8").strip()
+                try:
+                    win = max(3, int(win_raw))
+                except Exception:
+                    win = 8
+
+                rel_raw = os.getenv("PYCUTFEM_NEWTON_STAGNATION_REL_DROP", "1e-3").strip()
+                abs_raw = os.getenv("PYCUTFEM_NEWTON_STAGNATION_ABS_DROP_TOLFAC", "0.5").strip()
+                try:
+                    rel_drop_tol = float(rel_raw)
+                except Exception:
+                    rel_drop_tol = 1.0e-3
+                try:
+                    abs_drop_tolfac = float(abs_raw)
+                except Exception:
+                    abs_drop_tolfac = 0.5
+
+                if len(norm_hist) >= win:
+                    recent = norm_hist[-win:]
+                    r_max = float(max(recent))
+                    r_min = float(min(recent))
+                    abs_drop = r_max - r_min
+                    rel_drop = abs_drop / max(r_max, 1.0e-300)
+                    if (rel_drop <= rel_drop_tol) or (abs_drop <= abs_drop_tolfac * tol_eff):
+                        print(
+                            "        Newton stagnated near tolerance "
+                            f"(|R|_∞={float(norm_R):.2e}, tol={tol_eff:.2e}, "
+                            f"window={win}, rel_drop={rel_drop:.2e}, abs_drop={abs_drop:.2e}); accepting iterate."
+                        )
+                        converged = True
+                        delta = np.hstack(
+                            [
+                                f.nodal_values - f_prev.nodal_values
+                                for f, f_prev in zip(funcs, prev_funcs)
+                            ]
+                        )
+                        totals["assembly"] += assembly_time
+                        self._last_iter_timings.append(
+                            {
+                                "iteration": it + 1,
+                                "assembly": assembly_time,
+                                "linear_solve": 0.0,
+                                "line_search": 0.0,
+                                "residual_norm": norm_R,
+                                "converged": True,
+                            }
+                        )
+                        self._last_iteration_totals = totals
+                        print(
+                            "          timings: assembly={:.3e}s, solve={:.3e}s, line-search={:.3e}s".format(
+                                assembly_time, 0.0, 0.0
+                            )
+                        )
+                        return delta, converged, it + 1
             if norm_R <= tol_eff:
                 # Converged — return *time-step* increment for all fields
                 converged = True
@@ -2044,10 +2207,18 @@ class NewtonSolver:
 
         # If we get here, Newton did not converge within the iteration budget
         accept_factor_raw = os.getenv("PYCUTFEM_NEWTON_MAXITER_ACCEPT_FACTOR", "").strip()
-        try:
-            accept_factor = float(accept_factor_raw) if accept_factor_raw else 0.0
-        except Exception:
-            accept_factor = 0.0
+        if accept_factor_raw:
+            try:
+                accept_factor = float(accept_factor_raw)
+            except Exception:
+                accept_factor = 0.0
+        else:
+            # Default: mirror the line-search "near convergence" accept factor so stiff, penalty-dominated
+            # problems can make progress even when the raw residual hits a floating-point floor.
+            try:
+                accept_factor = float(os.getenv("PYCUTFEM_LS_FAIL_ACCEPT_FACTOR", "20.0"))
+            except Exception:
+                accept_factor = 0.0
         if accept_factor > 0.0:
             tol_eff_last = float(tol_eff) if "tol_eff" in locals() else float(getattr(self.np, "newton_tol", 0.0))
             if tol_eff_last > 0.0 and float(norm_R) <= accept_factor * tol_eff_last:
@@ -2155,17 +2326,14 @@ class NewtonSolver:
         # Deal.II style: accept the first step that reduces the infinity norm of the residual.
         if mode == "dealii":
             trace = os.getenv("PYCUTFEM_LS_TRACE", "").lower() in {"1", "true", "yes"}
-            # Warm-start: reuse last accepted α (try slightly larger first).
-            alpha = float(getattr(self, "_ls_alpha_prev", 1.0))
-            alpha = min(1.0, alpha / float(np_.ls_reduction))
             norm0 = float(np.linalg.norm(R_red, ord=np.inf))
             best_alpha, best_norm = 0.0, norm0
             snap = [f.nodal_values.copy() for f in funcs]
 
-            for _ in range(np_.ls_max_iter):
+            def _eval(alpha_try: float) -> float:
                 for f, buf in zip(funcs, snap):
                     f.nodal_values[:] = buf
-                dU_full = self.restrictor.expand_vec(alpha * S_red)
+                dU_full = self.restrictor.expand_vec(alpha_try * S_red)
                 dh.add_to_functions(dU_full, funcs)
                 dh.apply_bcs(bcs_now, *funcs)
                 if getattr(self, "constraints", None) is not None:
@@ -2174,8 +2342,35 @@ class NewtonSolver:
                 _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
                 norm_try = float(np.linalg.norm(R_try, ord=np.inf))
                 if trace:
-                    print(f"        [ls] α={alpha:.6e}  ‖R‖∞={norm_try:.6e}  (‖R‖∞0={norm0:.6e})")
+                    print(f"        [ls] α={alpha_try:.6e}  ‖R‖∞={norm_try:.6e}  (‖R‖∞0={norm0:.6e})")
+                return norm_try
 
+            # Always try the full Newton step first.
+            # Warm-starting from a tiny α (from a previous near-stagnation) can otherwise
+            # "lock" the search into microscopic steps and stall progress on the next
+            # Newton iteration / time step.
+            norm_try = _eval(1.0)
+            if norm_try < best_norm:
+                best_norm, best_alpha = norm_try, 1.0
+            if norm_try < norm0:
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                print("        Line search accepted α = 1.00e+00 (‖R‖∞ decreased)")
+                self._ls_alpha_prev = 1.0
+                return 1.0 * S_red
+
+            # Backtracking sequence after the full-step trial.
+            #
+            # IMPORTANT: do *not* warm-start from the previously accepted α here.
+            # After a near-stagnation, the last accepted α can be microscopic.
+            # Starting from such a value would prevent trying moderate steps
+            # (e.g. 0.5, 0.25, ...) even when they would reduce ‖R‖∞.
+            alpha = float(np_.ls_reduction)
+            if not (0.0 < alpha < 1.0):
+                alpha = 0.5
+
+            for _ in range(np_.ls_max_iter):
+                norm_try = _eval(alpha)
                 if norm_try < best_norm:
                     best_norm, best_alpha = norm_try, alpha
                 if norm_try < norm0:
@@ -2309,6 +2504,8 @@ class NewtonSolver:
     #  Reduced Linear system & BC handling
     # ------------------------------------------------------------------
     def _assemble_system_reduced(self, coeffs, *, need_matrix: bool = True):
+        if getattr(self, "preassemble_cb", None) is not None:
+            self.preassemble_cb(coeffs)
         if self.backend == "python":
             return self._assemble_system_reduced_python(coeffs, need_matrix=need_matrix)
         self._maybe_refresh_deformation(coeffs)

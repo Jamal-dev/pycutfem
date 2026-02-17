@@ -19,7 +19,7 @@ tension/compression splits) in 2D.
 
 from __future__ import annotations
 
-from pycutfem.ufl.expressions import Constant, Identity, cof, det, inner, trace
+from pycutfem.ufl.expressions import Constant, Identity, cof, det, dot, inner, log as ufl_log, trace
 
 
 def _c(val: float) -> Constant:
@@ -159,3 +159,75 @@ def d_spectral_positive_part_2x2_sym(
 
     # δA⁺ = δλ1⁺ P1 + δλ2⁺ P2 + (λ1⁺-λ2⁺) δP1
     return dlam1p * P1 + dlam2p * P2 + (lam1p - lam2p) * dP1
+
+
+def spectral_log_2x2_sym(
+    A,
+    *,
+    log_eps: float = 1.0e-16,
+    disc_reg: float = 1.0e-16,
+):
+    """
+    Spectral matrix logarithm for a 2×2 (approximately) symmetric tensor.
+
+    For SPD A with eigenpairs (λᵢ, Pᵢ), returns:
+        log(A) = Σ log(λᵢ) Pᵢ.
+
+    Parameters
+    ----------
+    log_eps:
+        Small positive shift added to eigenvalues before taking log to avoid
+        log(0) when eigenvalues become very small in highly deformed states.
+    disc_reg:
+        Discriminant regularization used in the spectral decomposition.
+    """
+    P1, P2, lam1, lam2, _ = projectors_2x2_sym(A, disc_reg=float(disc_reg))
+    f1 = ufl_log(lam1 + _c(float(log_eps)))
+    f2 = ufl_log(lam2 + _c(float(log_eps)))
+    return f1 * P1 + f2 * P2
+
+
+def d_spectral_log_2x2_sym(
+    A,
+    dA,
+    *,
+    log_eps: float = 1.0e-16,
+    disc_reg: float = 1.0e-16,
+):
+    """
+    Gateaux derivative of the spectral logarithm log(A) for 2×2 symmetric A.
+
+    Uses the standard spectral-function derivative:
+
+      Df(A)[H] = Σ f'(λᵢ) Pᵢ H Pᵢ
+               + Σ_{i≠j} (f(λᵢ)-f(λⱼ))/(λᵢ-λⱼ) Pᵢ H Pⱼ,
+
+    with f(λ)=log(λ+log_eps). The discriminant regularization is kept consistent
+    with `projectors_2x2_sym` for backend-robustness near repeated eigenvalues.
+    """
+    I = Identity(2)
+
+    trA = trace(A)
+    detA = det(A)
+    disc = trA * trA - _c(4.0) * detA
+    delta = (disc + _c(float(disc_reg))) ** _c(0.5)
+    lam1 = _c(0.5) * (trA + delta)
+    lam2 = _c(0.5) * (trA - delta)
+
+    P1 = (A - lam2 * I) / delta
+    P2 = I - P1
+
+    # f(λ) = log(λ + eps),  f'(λ) = 1/(λ + eps)
+    eps_c = _c(float(log_eps))
+    f1 = ufl_log(lam1 + eps_c)
+    f2 = ufl_log(lam2 + eps_c)
+    f1p = _c(1.0) / (lam1 + eps_c)
+    f2p = _c(1.0) / (lam2 + eps_c)
+
+    H11 = dot(P1, dot(dA, P1))
+    H22 = dot(P2, dot(dA, P2))
+    H12 = dot(P1, dot(dA, P2))
+    H21 = dot(P2, dot(dA, P1))
+
+    gamma = (f1 - f2) / delta
+    return f1p * H11 + f2p * H22 + gamma * (H12 + H21)

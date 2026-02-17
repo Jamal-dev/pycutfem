@@ -23,7 +23,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from pycutfem.ufl.expressions import Constant, FacetNormal, Identity, TestFunction, div, dot, grad, inner, trace
+from pycutfem.ufl.linalg import smooth_pos, spectral_positive_part_2x2_sym
 from pycutfem.ufl.forms import Equation, assemble_form
+
+from ..shared.nonlinear_solid_refmap import hencky_tensile_energy_miehe, svk_tensile_energy_miehe
 
 
 def _c(val: float) -> Constant:
@@ -251,6 +254,14 @@ def solid_von_mises_mass_lumped_in_domain(
         c_nh = mu_s / _c(2.0)
         beta_nh = lambda_s / (_c(2.0) * mu_s)
         sig = sigma_neo_hookean(u, c_nh, beta_nh, dim=2)
+    elif solid_model_key in {"hencky", "hencky_log", "hencky_log_strain"}:
+        from ..shared.nonlinear_solid_refmap import sigma_hencky
+
+        sig = sigma_hencky(u, mu_s, lambda_s, dim=2)
+    elif solid_model_key in {"stvk", "svk", "saint_venant_kirchhoff", "saint-venant-kirchhoff"}:
+        from ..shared.nonlinear_solid_refmap import sigma_svk
+
+        sig = sigma_svk(u, mu_s, lambda_s, dim=2)
     else:
         eps_u = _c(0.5) * (grad(u) + grad(u).T)
         sig = _c(2.0) * mu_s * eps_u + lambda_s * div(u) * Identity(2)
@@ -276,6 +287,155 @@ def solid_von_mises_mass_lumped_in_domain(
         vm2_lumped = np.maximum(0.0, rhs[mask] / (w[mask] + float(area_eps)))
         sigma[mask] = np.sqrt(vm2_lumped)
     return sigma, w
+
+
+def solid_cauchy_stress_components_mass_lumped_in_domain(
+    *,
+    dof_handler,
+    field: str,
+    u,
+    alpha,
+    dx_domain,
+    mu_s,
+    lambda_s,
+    solid_model: str = "linear",
+    backend: str = "cpp",
+    quad_order: int | None = None,
+    area_eps: float = 1.0e-14,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Mass-lumped Cauchy stress components in the domain (α-weighted projection).
+
+    Returns (σ_xx, σ_yy, σ_xy, w) in the scalar FE space given by `field`, where
+      w_i = ∫ ψ_i α dx  and  σ^c_i = (∫ ψ_i α σ_c dx) / (w_i + area_eps).
+    """
+    mu_s = mu_s if hasattr(mu_s, "dim") else _c(float(mu_s))
+    lambda_s = lambda_s if hasattr(lambda_s, "dim") else _c(float(lambda_s))
+
+    solid_model_key = str(solid_model).strip().lower()
+    if solid_model_key in {"neo-hookean", "neo_hookean", "nh"}:
+        from ..shared.nonlinear_solid_refmap import sigma_neo_hookean
+
+        c_nh = mu_s / _c(2.0)
+        beta_nh = lambda_s / (_c(2.0) * mu_s)
+        sig = sigma_neo_hookean(u, c_nh, beta_nh, dim=2)
+    elif solid_model_key in {"hencky", "hencky_log", "hencky_log_strain"}:
+        from ..shared.nonlinear_solid_refmap import sigma_hencky
+
+        sig = sigma_hencky(u, mu_s, lambda_s, dim=2)
+    elif solid_model_key in {"stvk", "svk", "saint_venant_kirchhoff", "saint-venant-kirchhoff"}:
+        from ..shared.nonlinear_solid_refmap import sigma_svk
+
+        sig = sigma_svk(u, mu_s, lambda_s, dim=2)
+    else:
+        eps_u = _c(0.5) * (grad(u) + grad(u).T)
+        sig = _c(2.0) * mu_s * eps_u + lambda_s * div(u) * Identity(2)
+
+    psi = TestFunction(field, dof_handler=dof_handler)
+    w_form = (psi * alpha) * dx_domain
+    rhs_xx_form = (psi * alpha * sig[0, 0]) * dx_domain
+    rhs_yy_form = (psi * alpha * sig[1, 1]) * dx_domain
+    rhs_xy_form = (psi * alpha * sig[0, 1]) * dx_domain
+
+    _, w_vec = assemble_form(Equation(None, w_form), dof_handler=dof_handler, bcs=[], quad_order=quad_order, backend=backend)
+    _, rhs_xx_vec = assemble_form(
+        Equation(None, rhs_xx_form), dof_handler=dof_handler, bcs=[], quad_order=quad_order, backend=backend
+    )
+    _, rhs_yy_vec = assemble_form(
+        Equation(None, rhs_yy_form), dof_handler=dof_handler, bcs=[], quad_order=quad_order, backend=backend
+    )
+    _, rhs_xy_vec = assemble_form(
+        Equation(None, rhs_xy_form), dof_handler=dof_handler, bcs=[], quad_order=quad_order, backend=backend
+    )
+
+    sl = np.asarray(dof_handler.get_field_slice(field), dtype=int)
+    w = np.asarray(w_vec[sl], dtype=float)
+    rhs_xx = np.asarray(rhs_xx_vec[sl], dtype=float)
+    rhs_yy = np.asarray(rhs_yy_vec[sl], dtype=float)
+    rhs_xy = np.asarray(rhs_xy_vec[sl], dtype=float)
+
+    sigma_xx = np.zeros_like(w)
+    sigma_yy = np.zeros_like(w)
+    sigma_xy = np.zeros_like(w)
+    mask = w > float(area_eps)
+    if np.any(mask):
+        denom = w[mask] + float(area_eps)
+        sigma_xx[mask] = rhs_xx[mask] / denom
+        sigma_yy[mask] = rhs_yy[mask] / denom
+        sigma_xy[mask] = rhs_xy[mask] / denom
+    return sigma_xx, sigma_yy, sigma_xy, w
+
+
+def solid_miehe_psi_plus_mass_lumped_in_domain(
+    *,
+    dof_handler,
+    field: str,
+    u,
+    alpha,
+    dx_domain,
+    mu_s,
+    lambda_s,
+    solid_model: str = "linear",
+    eta_pos: float = 1.0e-12,
+    scale: float = 0.0,
+    backend: str = "cpp",
+    quad_order: int | None = None,
+    area_eps: float = 1.0e-14,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mass-lumped Miehe tensile energy density ψ⁺(u) in the domain (α-weighted).
+
+    Supported 2D definitions (as in the one-domain biofilm damage driver):
+
+      ψ⁺ = μ ||ε⁺||² + (λ/2) ⟨tr ε⟩₊².
+      ψ⁺ = μ ||E⁺||² + (λ/2) ⟨tr E⟩₊²,  E=log(V)  (Hencky).
+      ψ⁺ = μ ||E⁺||² + (λ/2) ⟨tr E⟩₊²,  E=0.5(C-I) (SVK).
+
+    Returns (ψ⁺_nodes, w) in the scalar FE space given by `field`, with
+      w_i = ∫ ψ_i α dx and ψ⁺_i = (∫ ψ_i α ψ⁺ dx) / (w_i + area_eps).
+    """
+    mu_s = mu_s if hasattr(mu_s, "dim") else _c(float(mu_s))
+    lambda_s = lambda_s if hasattr(lambda_s, "dim") else _c(float(lambda_s))
+
+    solid_key = str(solid_model).strip().lower()
+    if solid_key in {"linear", "small_strain", "linear_elastic"}:
+        disc_reg = 1.0e-16
+        eps_u = _c(0.5) * (grad(u) + grad(u).T)
+        eps_plus, _, _, _, _ = spectral_positive_part_2x2_sym(
+            eps_u, eta_pos=float(eta_pos), disc_reg=float(disc_reg)
+        )
+        tr_eps = div(u)
+        tr_pos = smooth_pos(tr_eps, eta=float(eta_pos))
+        psi_plus = mu_s * inner(eps_plus, eps_plus) + _c(0.5) * lambda_s * (tr_pos * tr_pos)
+    elif solid_key in {"hencky", "hencky_log", "hencky_log_strain"}:
+        psi_plus = hencky_tensile_energy_miehe(
+            u, mu_s, lambda_s, dim=2, eta_pos=float(eta_pos)
+        )
+    elif solid_key in {"stvk", "svk", "saint_venant_kirchhoff", "saint-venant-kirchhoff"}:
+        psi_plus = svk_tensile_energy_miehe(
+            u, mu_s, lambda_s, dim=2, eta_pos=float(eta_pos)
+        )
+    else:
+        raise ValueError(
+            "solid_miehe_psi_plus_mass_lumped_in_domain requires solid_model in {'linear','stvk','hencky'} (2D)."
+        )
+    if float(scale) > 0.0:
+        psi_plus = _c(float(scale)) * psi_plus
+
+    psi = TestFunction(field, dof_handler=dof_handler)
+    w_form = (psi * alpha) * dx_domain
+    rhs_form = (psi * alpha * psi_plus) * dx_domain
+
+    _, w_vec = assemble_form(Equation(None, w_form), dof_handler=dof_handler, bcs=[], quad_order=quad_order, backend=backend)
+    _, rhs_vec = assemble_form(Equation(None, rhs_form), dof_handler=dof_handler, bcs=[], quad_order=quad_order, backend=backend)
+
+    sl = np.asarray(dof_handler.get_field_slice(field), dtype=int)
+    w = np.asarray(w_vec[sl], dtype=float)
+    rhs = np.asarray(rhs_vec[sl], dtype=float)
+
+    psi_vals = np.zeros_like(w)
+    mask = w > float(area_eps)
+    if np.any(mask):
+        psi_vals[mask] = rhs[mask] / (w[mask] + float(area_eps))
+    return psi_vals, w
 
 
 def update_adhesion_integrity_field_on_boundary_von_mises(

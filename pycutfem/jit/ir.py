@@ -80,6 +80,11 @@ class HeavisideOp:
     """Instruction to apply a hard Heaviside step: 1 if x>0 else 0 (H(0)=0)."""
     pass
 
+@dataclass(frozen=True, slots=True)
+class LogOp:
+    """Instruction to apply the natural logarithm log(x)."""
+    pass
+
 @dataclass(frozen=True, slots =True)
 class BinaryOp:
     """Instruction to perform a binary operation (e.g., +, *)."""

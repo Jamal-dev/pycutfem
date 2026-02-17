@@ -1260,6 +1260,14 @@ class Heaviside(Expression):
     def __init__(self, operand): self.operand = operand
     def __repr__(self): return f"Heaviside({self.operand!r})"
 
+class Log(Expression):
+    """Natural logarithm log(x) (defined for x>0)."""
+    def __init__(self, operand):
+        super().__init__()
+        self.operand = operand
+    def __repr__(self):
+        return f"Log({self.operand!r})"
+
 class Inner(Expression):
     def __init__(self, a, b): self.a, self.b = a, b
     def __repr__(self): return f"Inner({self.a!r}, {self.b!r})"
@@ -1463,6 +1471,7 @@ def outer(a, b): return Outer(a, b)
 def dyad(a, b): return Outer(a, b)
 def pos_part(x): return PositivePart(x)
 def heaviside(x): return Heaviside(x)
+def log(x): return Log(x)
 def jump(v, n=None):
     """
     Jump operator.

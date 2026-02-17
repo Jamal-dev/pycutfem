@@ -50,7 +50,7 @@ from pycutfem.ufl.expressions import (
     ElementWiseConstant, Derivative, Transpose,
     CellDiameter, MeshSize, NormalComponent,
     Restriction, Power, Trace, Determinant, Inverse, Hessian, Laplacian,
-    Identity, Cofactor, PositivePart, Heaviside
+    Identity, Cofactor, PositivePart, Heaviside, Log
 )
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
@@ -190,10 +190,11 @@ class FormCompiler:
             Inverse: self._visit_Inverse,
             Cofactor: self._visit_Cofactor,
             Hessian: self._visit_Hessian,
-    Laplacian: self._visit_Laplacian,
-    Identity: self._visit_Identity,
-    PositivePart: self._visit_PositivePart,
-    Heaviside: self._visit_Heaviside,
+            Laplacian: self._visit_Laplacian,
+            Identity: self._visit_Identity,
+            PositivePart: self._visit_PositivePart,
+            Heaviside: self._visit_Heaviside,
+            Log: self._visit_Log,
         }
     
     @contextmanager
@@ -1301,6 +1302,18 @@ class FormCompiler:
             return np.where(val > 0.0, 1.0, 0.0)
         x = float(val)
         return 1.0 if x > 0.0 else 0.0
+
+    def _visit_Log(self, node: Log):
+        val = self._visit(node.operand)
+        if val is None:
+            return None
+        if isinstance(val, (VecOpInfo, GradOpInfo, HessOpInfo)):
+            if getattr(val, "role", None) in {"trial", "test", "mixed"}:
+                raise NotImplementedError("Log is only supported for coefficient/value expressions.")
+            return val._with(np.log(val.data))
+        if isinstance(val, np.ndarray):
+            return np.log(val)
+        return math.log(float(val))
 
     def _visit_Jump(self, n: Jump):
         phi_old  = self.ctx.get('phi_val', None)

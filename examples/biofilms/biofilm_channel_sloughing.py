@@ -27,6 +27,8 @@ from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.measures import dS, ds, dx
 from examples.utils.biofilm.adhesion import (
     assemble_scalar,
+    solid_cauchy_stress_components_mass_lumped_in_domain,
+    solid_miehe_psi_plus_mass_lumped_in_domain,
     solid_von_mises_mass_lumped_in_domain,
     update_adhesion_integrity,
     update_adhesion_integrity_field_on_boundary,
@@ -219,9 +221,52 @@ def main() -> None:
     ap.add_argument("--q", type=int, default=6, help="Quadrature order (dx/dS metadata + NewtonSolver quad_order).")
     ap.add_argument("--dt", type=float, default=0.005)
     ap.add_argument("--t-final", type=float, default=1.0)
+    ap.add_argument(
+        "--allow-dt-reduction",
+        action="store_true",
+        default=_env_bool("PYCUTFEM_ALLOW_DT_REDUCTION", False),
+        help=(
+            "Allow adaptive dt reduction when Newton fails (retry the step with smaller dt). "
+            "Env: PYCUTFEM_ALLOW_DT_REDUCTION."
+        ),
+    )
+    ap.add_argument(
+        "--dt-min",
+        type=float,
+        default=float(os.getenv("PYCUTFEM_DT_MIN", "0.0") or "0.0"),
+        help="Minimum allowed dt when --allow-dt-reduction is enabled. Env: PYCUTFEM_DT_MIN.",
+    )
+    ap.add_argument(
+        "--dt-reduction-factor",
+        type=float,
+        default=float(os.getenv("PYCUTFEM_DT_REDUCTION_FACTOR", "0.5") or "0.5"),
+        help=(
+            "dt <- factor*dt on Newton failure (0<factor<1) when --allow-dt-reduction is enabled. "
+            "Env: PYCUTFEM_DT_REDUCTION_FACTOR."
+        ),
+    )
+    ap.add_argument(
+        "--stop-on-steady",
+        dest="stop_on_steady",
+        action="store_true",
+        default=True,
+        help="Stop early when the Newton update satisfies ||ΔU||_∞ < --steady-tol (enabled by default).",
+    )
+    ap.add_argument(
+        "--no-stop-on-steady",
+        dest="stop_on_steady",
+        action="store_false",
+        help="Disable steady-state early termination (always run until --t-final or --max-steps).",
+    )
+    ap.add_argument(
+        "--steady-tol",
+        type=float,
+        default=1.0e-6,
+        help="Steady-state tolerance for early termination: stop when ||ΔU||_∞ < steady_tol (only if --stop-on-steady).",
+    )
     ap.add_argument("--theta", type=float, default=1.0)
     ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
-    ap.add_argument("--newton-tol", type=float, default=1.0e-5)
+    ap.add_argument("--newton-tol", type=float, default=1.0e-6)
     ap.add_argument(
         "--newton-rtol",
         type=float,
@@ -433,7 +478,23 @@ def main() -> None:
         choices=("von_mises", "miehe_energy", "miehe"),
         help="Driving field H_prev for the phase-field damage (AT2) model. "
         "'von_mises' uses a lagged von-Mises proxy (legacy). "
-        "'miehe_energy' uses the Miehe tensile elastic energy density ψ⁺(u) (linear elasticity, 2D).",
+        "'miehe_energy' uses the Miehe tensile elastic energy density ψ⁺(u) (2D): "
+        "linear elasticity uses the small-strain split, SVK uses a Green-Lagrange split, and Hencky uses a log-strain split.",
+    )
+    ap.add_argument(
+        "--damage-pf-history",
+        dest="damage_pf_history",
+        action="store_true",
+        default=None,
+        help="For phase-field damage, store and use a history field H(x)=max_{s<=t} H_drive(x,s) "
+        "so damage cannot heal when stresses relax. Enabled by default for --damage-model phase_field.",
+    )
+    ap.add_argument(
+        "--no-damage-pf-history",
+        dest="damage_pf_history",
+        action="store_false",
+        default=None,
+        help="Disable the phase-field damage history field (allows healing when the drive relaxes).",
     )
     ap.add_argument(
         "--damage-stiff-split",
@@ -442,7 +503,10 @@ def main() -> None:
         choices=("full", "miehe"),
         help="How damage d degrades skeleton stiffness. "
         "'full' multiplies the full elastic stress by g(d) (legacy). "
-        "'miehe' multiplies only the tensile stress part σ⁺ (Miehe split; linear elasticity, 2D).",
+        "'miehe' degrades only tensile response (2D): "
+        "for solid_model='linear' it uses the Miehe small-strain split, "
+        "for solid_model='stvk' it uses a finite-strain Green-Lagrange energy split, "
+        "and for solid_model='hencky' it uses a finite-strain Hencky (log-strain) energy split.",
     )
     # Material / model parameters (kept simple)
     ap.add_argument("--rho-f", type=float, default=1.0)
@@ -464,11 +528,34 @@ def main() -> None:
     ap.add_argument("--mu-s", type=float, default=0.5)
     ap.add_argument("--lambda-s", type=float, default=0.5)
     ap.add_argument(
+        "--solid-visco-eta",
+        type=float,
+        default=0.0,
+        help="Optional Kelvin–Voigt viscoelasticity for the skeleton (Eulerian). "
+        "Adds a viscous stress σ_visc = 2*eta*ε(v^S) with v^S = (u^{n+1}-u^n)/dt. "
+        "Time-domain coefficient (real-valued); no complex modulus is involved.",
+    )
+    ap.add_argument(
         "--solid-model",
         type=str,
         default="linear",
-        choices=("linear", "neo_hookean", "neo-hookean", "nh"),
-        help="Skeleton constitutive model. Use 'neo_hookean' for large deformations (Eulerian reference-map formulation).",
+        choices=(
+            "linear",
+            "neo_hookean",
+            "neo-hookean",
+            "nh",
+            "stvk",
+            "svk",
+            "saint_venant_kirchhoff",
+            "saint-venant-kirchhoff",
+            "hencky",
+            "hencky_log",
+            "hencky_log_strain",
+        ),
+        help="Skeleton constitutive model. "
+        "'neo_hookean' uses the Eulerian reference-map compressible neo-Hookean stress. "
+        "'stvk' uses Saint-Venant–Kirchhoff hyperelasticity (Green-Lagrange strain; classic finite-strain Miehe energy split). "
+        "'hencky' uses a quadratic Hencky (log-strain) hyperelastic model (recommended with --damage-stiff-split miehe).",
     )
     # Solid inertia: for sloughing/both runs we typically want inertia enabled to allow chunk motion.
     # Use a tri-state default (None) so we can enable it automatically for sloughing unless the user overrides.
@@ -491,6 +578,17 @@ def main() -> None:
         type=float,
         default=None,
         help="Skeleton inertia coefficient rho_s0_tilde (used if inertia is enabled).",
+    )
+    ap.add_argument(
+        "--solid-inertia-convection",
+        type=str,
+        default="lagged",
+        choices=("lagged", "full"),
+        help=(
+            "How to treat the convective part div(ρ_S v^S⊗v^S) of the Eulerian skeleton inertia. "
+            "'lagged' uses a Picard linearization div(ρ_S^n v^{S,n} ⊗ v^{S,k}) (most robust); "
+            "'full' keeps the fully nonlinear term."
+        ),
     )
     ap.add_argument(
         "--u-predictor",
@@ -565,6 +663,15 @@ def main() -> None:
         help="Use conservative Allen–Cahn regularization for alpha by introducing a global Lagrange multiplier lambda_alpha. "
         "Requires --alpha-cahn-M and --alpha-cahn-gamma and (for this driver) alpha must be solved "
         "(use --no-freeze-alpha and --no-alpha-from-refmap).",
+    )
+    ap.add_argument(
+        "--alpha-cahn-conservative-mode",
+        type=str,
+        default="eliminate",
+        choices=("eliminate", "unknown"),
+        help="How to enforce the conservative Allen–Cahn mass constraint. "
+        "'eliminate' projects lambda_alpha from alpha each assembly (robust with degenerate mobility); "
+        "'unknown' solves lambda_alpha as an additional global unknown with a constraint equation.",
     )
     ap.add_argument(
         "--no-alpha-cahn-conservative",
@@ -673,6 +780,15 @@ def main() -> None:
         type=float,
         default=0.0,
         help="CIP stabilization factor for skeleton displacement u (jump of normal gradient across interior facets; 0 disables). Recommended with --solid-inertia.",
+    )
+    ap.add_argument(
+        "--u-cip-weight",
+        type=str,
+        default="fluid",
+        choices=("fluid", "biofilm", "both"),
+        help="Weighting for u-CIP stabilization. "
+        "'fluid' uses avg(1-α^n) (default; targets free-fluid extension region), "
+        "'biofilm' uses avg(α^n), and 'both' uses unity (stabilize everywhere).",
     )
     ap.add_argument("--D-X", type=float, default=0.001, help="Detached biomass diffusion.")
     # Erosion / detachment (produces X and removes alpha at the diffuse interface)
@@ -1026,7 +1142,11 @@ def main() -> None:
                 args.ls_mode = "dealii"
             if not _has_flag("--newton-tol"):
                 args.newton_tol = 1.0e-4
-            if not _has_flag("--newton-rtol") and bool(getattr(args, "alpha_cahn_conservative", False)):
+            if (
+                (not _has_flag("--newton-rtol"))
+                and (not _has_flag("--newton-tol"))
+                and bool(getattr(args, "alpha_cahn_conservative", False))
+            ):
                 # For conservative Allen–Cahn, the first few Newton solves can be
                 # dominated by interface relaxation residuals. A mild relative
                 # tolerance keeps early steps robust while preserving the absolute
@@ -1093,6 +1213,21 @@ def main() -> None:
     dt_val = float(args.dt)
     theta = float(args.theta)
     backend = str(args.backend)
+    print(
+        f"[setup] case={case} backend={backend} nx={int(args.nx)} ny={int(args.ny)} q={qdeg} "
+        f"dt={dt_val:.3e} t_final={float(args.t_final):.3e}",
+        flush=True,
+    )
+    newton_tol = float(getattr(args, "newton_tol", 0.0) or 0.0)
+    newton_rtol = float(getattr(args, "newton_rtol", 0.0) or 0.0)
+    if newton_rtol > 0.0:
+        print(
+            f"[setup] Newton tolerances: newton_tol={newton_tol:.1e}, newton_rtol={newton_rtol:.3g} "
+            "(effective tol per step: max(newton_tol, newton_rtol*|R0|_inf))",
+            flush=True,
+        )
+    else:
+        print(f"[setup] Newton tolerance: newton_tol={newton_tol:.1e} (absolute |R|_inf)", flush=True)
 
     # Basic mesh/interface resolution sanity: a too-thin diffuse interface (eps << h)
     # behaves like an under-resolved step function in CG spaces and can lead to
@@ -1167,6 +1302,13 @@ def main() -> None:
         # Default to the same stress threshold used for wall adhesion if provided.
         args.damage_sigma_cr = float(getattr(args, "sigma_cr", 0.0) or 0.0)
 
+    damage_is_pf = bool(use_damage and damage_model_key in {"phase_field", "phase-field", "at2"})
+    if getattr(args, "damage_pf_history", None) is None:
+        # Default: phase-field damage should be irreversible (no healing when the drive relaxes).
+        args.damage_pf_history = bool(damage_is_pf)
+    if not damage_is_pf:
+        args.damage_pf_history = False
+
     # Kozeny–Carman permeability reference porosity
     kappa_inv_model = str(getattr(args, "kappa_inv_model", "spatial")).strip().lower()
     if getattr(args, "kappa_phi_ref", None) is None and kappa_inv_model in {"kozeny", "kozeny_carman", "kc"}:
@@ -1221,6 +1363,7 @@ def main() -> None:
         restart_state = _load_npz_dict(state_path)
         restart_t0 = float(_npz_scalar(restart_state, "t", 0.0))
         restart_dt0 = float(_npz_scalar(restart_state, "dt", dt_val))
+        restart_dt_prev0 = float(_npz_scalar(restart_state, "dt_prev", restart_dt0))
         try:
             restart_step_loaded = int(np.asarray(restart_state.get("step", restart_step)).reshape(()))
         except Exception:
@@ -1236,9 +1379,13 @@ def main() -> None:
             "state": restart_state,
             "t": float(restart_t0),
             "dt": float(restart_dt0),
+            "dt_prev": float(restart_dt_prev0),
             "step": int(restart_step_loaded),
         }
-        msg = f"[restart] loaded {str(state_path)} (step={restart_step_loaded} t={restart_t0:.6e} dt={restart_dt0:.3e})"
+        msg = (
+            f"[restart] loaded {str(state_path)} (step={restart_step_loaded} t={restart_t0:.6e} "
+            f"dt={restart_dt0:.3e} dt_prev={restart_dt_prev0:.3e})"
+        )
         if restart_reset:
             msg += " [reset counters]"
         print(msg)
@@ -1275,6 +1422,11 @@ def main() -> None:
         )
 
     solid_inertia = bool(getattr(args, "solid_inertia", False))
+    solid_inertia_conv = str(getattr(args, "solid_inertia_convection", "lagged") or "lagged").strip().lower()
+    if solid_inertia_conv in {"conservative", "nonlinear"}:
+        solid_inertia_conv = "full"
+    if solid_inertia_conv in {"picard", "semi", "semi_implicit", "linear"}:
+        solid_inertia_conv = "lagged"
     u_predictor = str(getattr(args, "u_predictor", "auto")).strip().lower()
     if u_predictor == "auto":
         u_predictor = "extrapolate" if solid_inertia else "copy"
@@ -1283,12 +1435,16 @@ def main() -> None:
     if solid_model in {"neo-hookean", "nh"}:
         solid_model = "neo_hookean"
     if bool(use_sloughing) and solid_model == "linear":
-        print("[warn] --process sloughing uses large biofilm motion; consider --solid-model neo_hookean for better large-strain behavior.")
+        print(
+            "[warn] --process sloughing uses large biofilm motion; consider --solid-model neo_hookean (or hencky) for better large-strain behavior."
+        )
 
     u_cip = float(getattr(args, "u_cip", 0.0) or 0.0)
     if u_cip == 0.0 and solid_inertia and float(args.gamma_u) <= 1.0:
         u_cip = 1.0
         print("[info] --solid-inertia with small --gamma-u detected; enabling default u facet stabilization: --u-cip 1.")
+    if solid_inertia and solid_inertia_conv != "full":
+        print(f"[info] skeleton inertia convection mode: {solid_inertia_conv!r} (set --solid-inertia-convection full for the nonlinear form).")
 
     if float(args.D_alpha) == 0.0 and str(getattr(args, "u_extension", "l2")).strip().lower() in {"l2"} and float(args.gamma_u) < 1.0 and solid_inertia:
         print(
@@ -1301,6 +1457,10 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Mesh + boundary tags
     # ------------------------------------------------------------------
+    print(
+        f"[setup] building mesh: structured_quad(L={L:.3e}, H={H:.3e}, nx={int(args.nx)}, ny={int(args.ny)}, poly_order=2)",
+        flush=True,
+    )
     nodes, elems, _, corners = structured_quad(L, H, nx=int(args.nx), ny=int(args.ny), poly_order=2)
     mesh = Mesh(
         nodes=nodes,
@@ -1349,9 +1509,14 @@ def main() -> None:
             raise ValueError("--alpha-cahn-conservative requires --no-freeze-alpha (alpha must be solved).")
         if bool(getattr(args, "alpha_from_refmap", False)):
             raise ValueError("--alpha-cahn-conservative requires --no-alpha-from-refmap.")
+        cons_mode = str(getattr(args, "alpha_cahn_conservative_mode", "eliminate")).strip().lower()
+        if cons_mode == "unknown":
+            msg = "adding global lambda_alpha unknown."
+        else:
+            msg = "using projected lambda_alpha (eliminated; not solved)."
         print(
-            f"[info] --alpha-cahn-conservative enabled (mobility={str(getattr(args, 'alpha_cahn_mobility', 'constant'))}): "
-            "adding global lambda_alpha unknown."
+            f"[info] --alpha-cahn-conservative enabled (mobility={str(getattr(args, 'alpha_cahn_mobility', 'constant'))}, "
+            f"mode={cons_mode}): {msg}"
         )
         field_specs["lambda_alpha"] = ":number:"
     if use_spatial_adhesion:
@@ -1369,7 +1534,9 @@ def main() -> None:
     dphi = TrialFunction("phi", dof_handler=dh)
     dalpha = TrialFunction("alpha", dof_handler=dh)
     dmu_alpha = TrialFunction("mu_alpha", dof_handler=dh) if ch_enabled else None
-    dlambda_alpha = TrialFunction("lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
+    cons_mode = str(getattr(args, "alpha_cahn_conservative_mode", "eliminate")).strip().lower()
+    solve_lambda = bool(alpha_cahn_conservative) and cons_mode == "unknown"
+    dlambda_alpha = TrialFunction("lambda_alpha", dof_handler=dh) if solve_lambda else None
     dd = TrialFunction("d", dof_handler=dh) if use_damage else None
     dS_trial = TrialFunction("S", dof_handler=dh)
     dX_trial = TrialFunction("X", dof_handler=dh)
@@ -1380,7 +1547,7 @@ def main() -> None:
     phi_test = TestFunction("phi", dof_handler=dh)
     alpha_test = TestFunction("alpha", dof_handler=dh)
     mu_alpha_test = TestFunction("mu_alpha", dof_handler=dh) if ch_enabled else None
-    lambda_alpha_test = TestFunction("lambda_alpha", dof_handler=dh) if alpha_cahn_conservative else None
+    lambda_alpha_test = TestFunction("lambda_alpha", dof_handler=dh) if solve_lambda else None
     d_test = TestFunction("d", dof_handler=dh) if use_damage else None
     S_test = TestFunction("S", dof_handler=dh)
     X_test = TestFunction("X", dof_handler=dh)
@@ -1418,6 +1585,12 @@ def main() -> None:
     else:
         a_prev = None
 
+    H_d_prev = None
+    if use_damage and bool(getattr(args, "damage_pf_history", False)):
+        dmg_key = str(getattr(args, "damage_model", "kinetic")).strip().lower()
+        if dmg_key in {"phase_field", "phase-field", "at2"}:
+            H_d_prev = Function("H_d_prev", "d", dof_handler=dh)
+
     def _mark_inactive_fields(*field_names: str) -> None:
         tags = getattr(dh, "dof_tags", None) or {}
         inactive = set(tags.get("inactive", set()))
@@ -1436,6 +1609,8 @@ def main() -> None:
         _mark_inactive_fields("alpha")
         if alpha_cahn_conservative:
             _mark_inactive_fields("lambda_alpha")
+    if alpha_cahn_conservative and (not solve_lambda):
+        _mark_inactive_fields("lambda_alpha")
     if bool(getattr(args, "freeze_phi", False)):
         _mark_inactive_fields("phi")
     if bool(getattr(args, "freeze_S", False)):
@@ -1558,6 +1733,8 @@ def main() -> None:
     p_n.set_values_from_function(lambda x, y: 0.0)
     if use_damage and d_n is not None:
         d_n.set_values_from_function(lambda x, y: 0.0)
+    if H_d_prev is not None:
+        H_d_prev.set_values_from_function(lambda x, y: 0.0)
     if a_prev is not None:
         a0 = float(args.a0)
         a_pert = float(getattr(args, "a_perturb", 0.0) or 0.0)
@@ -1585,7 +1762,7 @@ def main() -> None:
             v_k, p_k, u_k, phi_k, alpha_k, mu_alpha_k, lambda_alpha_k, d_k, S_k, X_k,
             v_n, p_n, u_n, phi_n, alpha_n, mu_alpha_n, lambda_alpha_n, d_n, S_n, X_n,
             # Extra history / coefficients
-            u_prev, u_nm1, a_prev,
+            u_prev, u_nm1, a_prev, H_d_prev,
         ]:
             if f is None:
                 continue
@@ -1618,7 +1795,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Forms with adhesion traction on the bottom wall
     # ------------------------------------------------------------------
+    print("[setup] building one-domain forms", flush=True)
     dt_c = Constant(dt_val)
+    dt_prev0 = (
+        float(restart_payload.get("dt_prev", restart_payload.get("dt", dt_val)))
+        if restart_payload is not None
+        else float(dt_val)
+    )
+    dt_prev_c = Constant(dt_prev0)
     a_c = Constant(float(restart_payload.get("a_scalar", args.a0)) if restart_payload is not None else float(args.a0))
 
     ds_bottom = dS(defined_on=mesh.edge_bitset("bottom"), metadata={"q": int(qdeg)})
@@ -1631,6 +1815,21 @@ def main() -> None:
     mu_s_c = Constant(float(args.mu_s))
     lambda_s_c = Constant(float(args.lambda_s))
     rho_s0_c = Constant(float(getattr(args, "rho_s0", 0.0)))
+    alpha_cahn_lambda_scale_c = Constant(1.0) if solve_lambda else None
+
+    if solve_lambda and alpha_cahn_lambda_scale_c is not None:
+        # Scale the global conservative Allen–Cahn constraint equation by
+        # 1 / ∫ M(α) dx to improve conditioning when using degenerate mobility
+        # (then ∫M is O(ε) and the λ row becomes nearly singular without scaling).
+        mob_key = str(getattr(args, "alpha_cahn_mobility", "constant")).strip().lower()
+        if mob_key in {"constant", "const"}:
+            mob_expr = Constant(1.0)
+        else:
+            mob_expr = alpha_n * (Constant(1.0) - alpha_n)
+        den = float(assemble_scalar(dh, mob_expr * dx_q, backend=backend, quad_order=qdeg))
+        M0 = float(getattr(args, "alpha_cahn_M", 0.0) or 0.0)
+        denom = float(M0) * float(den)
+        alpha_cahn_lambda_scale_c.value = 1.0 / max(denom, 1.0e-16)
 
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
@@ -1673,6 +1872,7 @@ def main() -> None:
         X_test=X_test,
         dx=dx(metadata={"q": int(qdeg)}),
         dt=dt_c,
+        dt_prev=dt_prev_c,
         theta=theta,
         rho_f=rho_f_c,
         mu_f=mu_f_c,
@@ -1683,8 +1883,10 @@ def main() -> None:
         solid_model=solid_model,
         mu_s=mu_s_c,
         lambda_s=lambda_s_c,
+        solid_visco_eta=float(getattr(args, "solid_visco_eta", 0.0) or 0.0),
         rho_s0_tilde=rho_s0_c,
         include_skeleton_acceleration=bool(getattr(args, "solid_inertia", False)),
+        skeleton_inertia_convection=solid_inertia_conv,
         gamma_u=float(args.gamma_u),
         u_extension_mode=str(getattr(args, "u_extension", "l2")),
         gamma_u_pin=float(getattr(args, "gamma_u_pin", 0.0)),
@@ -1698,7 +1900,9 @@ def main() -> None:
         alpha_cahn_gamma=float(getattr(args, "alpha_cahn_gamma", 0.0)),
         alpha_cahn_eps=float(getattr(args, "alpha_cahn_eps", float(args.eps))),
         alpha_cahn_conservative=alpha_cahn_conservative,
+        alpha_cahn_conservative_mode=cons_mode,
         alpha_cahn_mobility=str(getattr(args, "alpha_cahn_mobility", "constant")),
+        alpha_cahn_lambda_scale=alpha_cahn_lambda_scale_c,
         alpha_ch_M=float(getattr(args, "alpha_ch_M", 0.0)),
         alpha_ch_gamma=float(getattr(args, "alpha_ch_gamma", 0.0)),
         alpha_ch_eps=float(getattr(args, "alpha_ch_eps", float(args.eps))),
@@ -1714,6 +1918,7 @@ def main() -> None:
         alpha_supg=float(alpha_supg),
         alpha_cip=float(alpha_cip),
         u_cip=float(u_cip),
+        u_cip_weight=str(getattr(args, "u_cip_weight", "fluid")),
         ds_cip=ds_int,
         damage_k=float(getattr(args, "damage_k", 0.0) or 0.0),
         damage_sigma_cr=float(getattr(args, "damage_sigma_cr", 0.0) or 0.0),
@@ -1729,6 +1934,7 @@ def main() -> None:
         damage_l=float(getattr(args, "damage_l", 0.0) or 0.0),
         damage_psi0=float(getattr(args, "damage_psi0", 0.0) or 0.0),
         damage_pf_driver=str(getattr(args, "damage_pf_driver", "von_mises")),
+        damage_H_prev=H_d_prev,
         damage_stiff_split=str(getattr(args, "damage_stiff_split", "full")),
         D_S=0.01,
         D_X=float(args.D_X),
@@ -1810,6 +2016,7 @@ def main() -> None:
                 "step": int(step_no),
                 "t": float(t_curr),
                 "dt": float(dt_curr),
+                "dt_prev": float(getattr(dt_prev_c, "value", dt_curr)),
                 "mesh_n_nodes": int(getattr(mesh.nodes_x_y_pos, "shape", (0,))[0]),
                 "mesh_n_elements": int(getattr(mesh, "n_elements", len(getattr(mesh, "elements_list", [])))),
                 "mesh_element_type": str(getattr(mesh, "element_type", "")),
@@ -1962,7 +2169,7 @@ def main() -> None:
                 # Legacy scalar a(t) update using RMS shear.
                 a_new = update_adhesion_integrity(
                     a_n=a_state["val"],
-                    dt=dt_val,
+                    dt=dt_step,
                     tau_rms=shear.tau_rms,
                     k_break=float(args.k_break),
                     tau_c=float(args.tau_c),
@@ -1979,7 +2186,7 @@ def main() -> None:
                     upd = update_adhesion_integrity_field_on_boundary_von_mises(
                         dof_handler=dh,
                         a_field=a_prev,
-                        dt=dt_val,
+                        dt=dt_step,
                         u=u_k,
                         alpha=alpha_k,
                         ds_wall=ds_bottom,
@@ -1997,7 +2204,7 @@ def main() -> None:
                     upd = update_adhesion_integrity_field_on_boundary(
                         dof_handler=dh,
                         a_field=a_prev,
-                        dt=dt_val,
+                        dt=dt_step,
                         v=v_k,
                         alpha=alpha_k,
                         phi=phi_k,
@@ -2249,7 +2456,7 @@ def main() -> None:
                 beta_nodes = alpha_nodes * float(args.mu_f) * (phi_nodes * phi_nodes) * kappa_inv_eff * g_perm_nodes
                 u_nodes = _vector_to_nodes(u_k)
                 u_prev_nodes = _vector_to_nodes(u_prev)
-                vS_nodes = (u_nodes - u_prev_nodes) / float(dt_val)
+                vS_nodes = (u_nodes - u_prev_nodes) / max(float(dt_step), 1.0e-16)
                 sigma_u, _w_sigma = solid_von_mises_mass_lumped_in_domain(
                     dof_handler=dh,
                     field="u_x",
@@ -2262,17 +2469,38 @@ def main() -> None:
                     backend=backend,
                     quad_order=qdeg,
                 )
+                sigma_xx_u, sigma_yy_u, sigma_xy_u, _w_sig = solid_cauchy_stress_components_mass_lumped_in_domain(
+                    dof_handler=dh,
+                    field="u_x",
+                    u=u_k,
+                    alpha=alpha_k,
+                    dx_domain=dx_q,
+                    mu_s=mu_s_c,
+                    lambda_s=lambda_s_c,
+                    solid_model=solid_model,
+                    backend=backend,
+                    quad_order=qdeg,
+                )
                 sigma_vm_nodes = np.zeros(num_nodes, dtype=float)
+                sigma_xx_nodes = np.zeros(num_nodes, dtype=float)
+                sigma_yy_nodes = np.zeros(num_nodes, dtype=float)
+                sigma_xy_nodes = np.zeros(num_nodes, dtype=float)
                 sl_u = np.asarray(dh.get_field_slice("u_x"), dtype=int).ravel()
                 for i, gdof in enumerate(sl_u):
                     _fld, node_id = dh._dof_to_node_map[int(gdof)]
                     if node_id is None:
                         continue
                     sigma_vm_nodes[int(node_id)] = float(sigma_u[i])
+                    sigma_xx_nodes[int(node_id)] = float(sigma_xx_u[i])
+                    sigma_yy_nodes[int(node_id)] = float(sigma_yy_u[i])
+                    sigma_xy_nodes[int(node_id)] = float(sigma_xy_u[i])
             except Exception:
                 beta_nodes = None
                 vS_nodes = None
                 sigma_vm_nodes = None
+                sigma_xx_nodes = None
+                sigma_yy_nodes = None
+                sigma_xy_nodes = None
 
             export_vtk(
                 filename=os.path.join(str(args.outdir), f"solution_{step_no:04d}.vtu"),
@@ -2291,6 +2519,9 @@ def main() -> None:
                     "X": X_k,
                     "beta": beta_nodes if beta_nodes is not None else (lambda x, y: 0.0),
                     "sigma_vm": sigma_vm_nodes if sigma_vm_nodes is not None else (lambda x, y: 0.0),
+                    "sigma_xx": sigma_xx_nodes if sigma_xx_nodes is not None else (lambda x, y: 0.0),
+                    "sigma_yy": sigma_yy_nodes if sigma_yy_nodes is not None else (lambda x, y: 0.0),
+                    "sigma_xy": sigma_xy_nodes if sigma_xy_nodes is not None else (lambda x, y: 0.0),
                 },
             )
 
@@ -2299,27 +2530,29 @@ def main() -> None:
             step_no,
             float(t_now),
             float(dt_step),
-        tag="step",
-        funcs=[
-            v_n,
-            p_n,
-            u_n,
-            phi_n,
-            alpha_n,
-            mu_alpha_n,
-            lambda_alpha_n,
-            d_n,
-            S_n,
-            X_n,
-            u_prev,
+            tag="step",
+            funcs=[
+                v_n,
+                p_n,
+                u_n,
+                phi_n,
+                alpha_n,
+                mu_alpha_n,
+                lambda_alpha_n,
+                d_n,
+                S_n,
+                X_n,
+                u_prev,
                 u_nm1,
                 a_prev,
+                H_d_prev,
             ],
         )
 
     # ------------------------------------------------------------------
     # Solve in time
     # ------------------------------------------------------------------
+    print("[setup] creating NewtonSolver", flush=True)
     solver = NewtonSolver(
         forms.residual_form,
         forms.jacobian_form,
@@ -2338,17 +2571,74 @@ def main() -> None:
         postproc_timeloop_cb=post_step,
     )
 
+    def _update_lambda_alpha_from_alpha(_coeffs: dict[str, object]) -> None:
+        # Conservative Allen–Cahn (eliminated λ): enforce
+        #   ∫ M(α) (μ_α - λ_α) dx = 0
+        # by projecting λ_α = (∫ M μ_α dx)/(∫ M dx) using the same by-parts form
+        # as the weak constraint in `build_biofilm_one_domain_forms`.
+        if (not alpha_cahn_conservative) or solve_lambda or (lambda_alpha_k is None):
+            return
+
+        eps_ac = float(getattr(args, "alpha_cahn_eps", float(args.eps)))
+        gamma_ac = float(getattr(args, "alpha_cahn_gamma", 0.0) or 0.0)
+        eps_ac = max(eps_ac, 1.0e-16)
+        if gamma_ac == 0.0:
+            lambda_alpha_k.nodal_values[:] = 0.0
+            return
+
+        mob_key = str(getattr(args, "alpha_cahn_mobility", "constant")).strip().lower()
+        if mob_key in {"constant", "const"}:
+            mob = Constant(1.0)
+            mob_prime = Constant(0.0)
+        else:
+            mob = alpha_k * (Constant(1.0) - alpha_k)
+            mob_prime = Constant(1.0) - Constant(2.0) * alpha_k
+
+        den = float(assemble_scalar(dh, mob * dx_q, backend=backend, quad_order=qdeg))
+        if not np.isfinite(den) or den <= 1.0e-16:
+            lambda_alpha_k.nodal_values[:] = 0.0
+            return
+
+        Wp = Constant(2.0) * alpha_k * (Constant(1.0) - alpha_k) * (Constant(1.0) - Constant(2.0) * alpha_k)
+        num = float(assemble_scalar(dh, (mob * Wp) * dx_q, backend=backend, quad_order=qdeg))
+        lam = (gamma_ac / eps_ac) * (num / den)
+        if mob_key not in {"constant", "const"}:
+            g2 = inner(grad(alpha_k), grad(alpha_k))
+            num2 = float(assemble_scalar(dh, (mob_prime * g2) * dx_q, backend=backend, quad_order=qdeg))
+            lam += (eps_ac * gamma_ac) * (num2 / den)
+
+        if not np.isfinite(lam):
+            lam = 0.0
+        lambda_alpha_k.nodal_values[:] = float(lam)
+
+    solver.preassemble_cb = _update_lambda_alpha_from_alpha
+
     # Optional u predictor (applied once per step, before the first Newton assembly).
-    _pred_state = {"step_no": None}
+    _pred_state = {"step_no": None, "dt": None}
 
     def _preproc_predictor(_funcs):
         step_no = getattr(solver, "_current_step_no", None)
-        if step_no is None or _pred_state["step_no"] == int(step_no):
+        dt_curr = getattr(solver, "_current_dt", None)
+        if step_no is None or dt_curr is None:
             return
-        _pred_state["step_no"] = int(step_no)
+        step_i = int(step_no)
+        dt_f = float(dt_curr)
+        if _pred_state["step_no"] == step_i and _pred_state["dt"] == dt_f:
+            return
+        _pred_state["step_no"] = step_i
+        _pred_state["dt"] = dt_f
+
         if u_predictor == "extrapolate" and u_nm1 is not None:
-            # Constant-velocity predictor: u^{n+1} ≈ u^n + (u^n - u^{n-1}).
-            u_k.nodal_values[:] = u_n.nodal_values + (u_n.nodal_values - u_nm1.nodal_values)
+            # Constant-velocity predictor:
+            #   vS^n = (u^n - u^{n-1}) / dt_prev
+            #   u^{n+1} ≈ u^n + dt * vS^n
+            #
+            # IMPORTANT: use the ratio dt/dt_prev so retries with reduced dt
+            # remain consistent with the lagged velocity used by inertia terms.
+            dt_prev_eff = float(getattr(dt_prev_c, "value", dt_val))
+            dt_prev_eff = max(dt_prev_eff, 1.0e-16)
+            scale = dt_f / dt_prev_eff
+            u_k.nodal_values[:] = u_n.nodal_values + scale * (u_n.nodal_values - u_nm1.nodal_values)
         # Predictor for the ramped channel flow: scale the previous (v,p) state
         # by the inflow ramp ratio so the first Newton residual is not dominated
         # by the change in prescribed inflow.
@@ -2357,8 +2647,7 @@ def main() -> None:
         # the guess (Dirichlet DOFs are excluded from Newton updates).
         try:
             t_n = float(getattr(solver, "_current_t", 0.0) or 0.0)
-            dt_curr = float(getattr(solver, "_current_dt", dt_val) or dt_val)
-            t_bc = t_n + float(theta) * dt_curr
+            t_bc = t_n + float(theta) * dt_f
             r_old = float(ramp(t_n))
             r_new = float(ramp(t_bc))
         except Exception:
@@ -2408,8 +2697,7 @@ def main() -> None:
         # steps the "copy previous solution" predictor is typically better.
         if r_new > 0.0 and r_old <= 1.0e-12:
             try:
-                dt_curr = float(getattr(solver, "_current_dt", dt_val) or dt_val)
-                dt_curr = max(dt_curr, 1.0e-16)
+                dt_curr = max(dt_f, 1.0e-16)
 
                 ux_xy = np.asarray(dh.get_dof_coords("u_x"), dtype=float)
                 uy_xy = np.asarray(dh.get_dof_coords("u_y"), dtype=float)
@@ -2465,7 +2753,7 @@ def main() -> None:
         # Conservative Allen–Cahn: provide a good initial guess for the global
         # Lagrange multiplier λ_α so the first Newton residual is not dominated
         # by the constraint equation.
-        if alpha_cahn_conservative and lambda_alpha_k is not None:
+        if solve_lambda and lambda_alpha_k is not None:
             try:
                 eps_ac = float(getattr(args, "alpha_cahn_eps", float(args.eps)))
                 gamma_ac = float(getattr(args, "alpha_cahn_gamma", 0.0) or 0.0)
@@ -2503,12 +2791,20 @@ def main() -> None:
 
     solver.pre_cb = _preproc_predictor
 
+    def _on_dt_change(new_dt: float) -> None:
+        # Keep dt-dependent terms inside the assembled UFL forms in sync with the
+        # time-stepper (Constant parameters are refreshed by the JIT runner).
+        dt_c.value = float(new_dt)
+
     def post_step_refiner(step, bcs_now, functions, prev_functions):
         # NOTE: Called after an accepted Newton step and **before** the solver promotes current -> previous.
         # Keep history needed for diagnostics and (optionally) skeleton inertia.
         u_prev.nodal_values[:] = u_n.nodal_values[:]
         if u_nm1 is not None:
             u_nm1.nodal_values[:] = u_n.nodal_values[:]
+        # Store the dt used for this accepted step so vS^n=(u^n-u^{n-1})/dt_prev
+        # remains consistent if the next step uses a different dt.
+        dt_prev_c.value = float(getattr(dt_c, "value", dt_val))
 
         # If requested, recompute alpha from the Eulerian reference map (χ = x - u).
         # Do this BEFORE promotion so alpha_n becomes the refmap-updated state.
@@ -2533,6 +2829,87 @@ def main() -> None:
             X_k.nodal_values[:] = np.maximum(X_k.nodal_values, 0.0)
             if a_prev is not None:
                 a_prev.nodal_values[:] = np.clip(a_prev.nodal_values, 0.0, 1.0)
+
+        if alpha_cahn_conservative and alpha_cahn_lambda_scale_c is not None:
+            mob_key = str(getattr(args, "alpha_cahn_mobility", "constant")).strip().lower()
+            if mob_key in {"constant", "const"}:
+                mob_expr = Constant(1.0)
+            else:
+                mob_expr = alpha_k * (Constant(1.0) - alpha_k)
+            den = float(assemble_scalar(dh, mob_expr * dx_q, backend=backend, quad_order=qdeg))
+            M0 = float(getattr(args, "alpha_cahn_M", 0.0) or 0.0)
+            denom = float(M0) * float(den)
+            alpha_cahn_lambda_scale_c.value = 1.0 / max(denom, 1.0e-16)
+
+        if H_d_prev is not None:
+            # Update the phase-field damage history field to prevent healing when
+            # the instantaneous drive relaxes: H^{n+1} = max(H^n, H_drive(u^{n+1})).
+            drv_key = str(getattr(args, "damage_pf_driver", "von_mises")).strip().lower()
+            solid_key = str(getattr(args, "solid_model", "linear")).strip().lower()
+            if drv_key in {"miehe", "miehe_energy", "energy", "psi_plus", "psi+"} and solid_key in {
+                "linear",
+                "small_strain",
+                "linear_elastic",
+                "stvk",
+                "svk",
+                "saint_venant_kirchhoff",
+                "saint-venant-kirchhoff",
+                "hencky",
+                "hencky_log",
+                "hencky_log_strain",
+            }:
+                H_drive, _w = solid_miehe_psi_plus_mass_lumped_in_domain(
+                    dof_handler=dh,
+                    field="d",
+                    u=u_k,
+                    alpha=alpha_k,
+                    dx_domain=dx_q,
+                    mu_s=mu_s_c,
+                    lambda_s=lambda_s_c,
+                    solid_model=solid_model,
+                    eta_pos=float(getattr(args, "damage_eta_pos", 1.0e-12) or 1.0e-12),
+                    scale=float(getattr(args, "damage_psi0", 0.0) or 0.0),
+                    backend=backend,
+                    quad_order=qdeg,
+                )
+            else:
+                sigma_vm_d, _w = solid_von_mises_mass_lumped_in_domain(
+                    dof_handler=dh,
+                    field="d",
+                    u=u_k,
+                    alpha=alpha_k,
+                    dx_domain=dx_q,
+                    mu_s=mu_s_c,
+                    lambda_s=lambda_s_c,
+                    solid_model=solid_model,
+                    backend=backend,
+                    quad_order=qdeg,
+                )
+                sigma_cr = float(getattr(args, "damage_sigma_cr", 0.0) or 0.0)
+                m_exp = float(getattr(args, "damage_m", 1.0) or 1.0)
+                eta_pos = float(getattr(args, "damage_eta_pos", 1.0e-12) or 1.0e-12)
+                if sigma_cr > 0.0:
+                    ratio = (np.asarray(sigma_vm_d, dtype=float) / sigma_cr) - 1.0
+                    pos_ratio = 0.5 * (ratio + np.sqrt(ratio * ratio + eta_pos))
+                    drive_vm = pos_ratio**m_exp
+                else:
+                    drive_vm = np.asarray(sigma_vm_d, dtype=float)
+
+                psi0 = float(getattr(args, "damage_psi0", 0.0) or 0.0)
+                if psi0 <= 0.0:
+                    Gc = float(getattr(args, "damage_Gc", 0.0) or 0.0)
+                    ell = float(getattr(args, "damage_l", 0.0) or 0.0)
+                    if Gc > 0.0 and ell > 0.0:
+                        psi0 = Gc / max(ell, 1.0e-12)
+                H_drive = psi0 * drive_vm
+
+            H_drive = np.asarray(H_drive, dtype=float)
+            if H_drive.shape != np.asarray(H_d_prev.nodal_values).shape:
+                raise RuntimeError(
+                    "damage history update shape mismatch: "
+                    f"H_drive shape={H_drive.shape} H_d_prev shape={np.asarray(H_d_prev.nodal_values).shape}"
+                )
+            H_d_prev.nodal_values[:] = np.maximum(np.asarray(H_d_prev.nodal_values, dtype=float), H_drive)
 
     solver.solve_time_interval(
         functions=[
@@ -2563,14 +2940,25 @@ def main() -> None:
             "dt": dt_c,
             **({"a_prev": a_prev} if a_prev is not None else {}),
             **({"u_nm1": u_nm1} if u_nm1 is not None else {}),
+            **({"H_d_prev": H_d_prev} if H_d_prev is not None else {}),
         },
         time_params=TimeStepperParameters(
             dt=dt_val,
             final_time=float(args.t_final),
             max_steps=10_000,
+            stop_on_steady=bool(getattr(args, "stop_on_steady", True)),
+            steady_tol=float(getattr(args, "steady_tol", 1.0e-6)),
             theta=theta,
             t0=float(restart_t0),
             step0=int(restart_step0),
+            allow_dt_reduction=bool(getattr(args, "allow_dt_reduction", False)),
+            dt_min=float(getattr(args, "dt_min", 0.0) or 0.0),
+            dt_reduction_factor=float(getattr(args, "dt_reduction_factor", 0.5) or 0.5),
+            # Keep dt constant on success; only reduce on failure unless users
+            # explicitly opt into iteration-count-based adaptation in other drivers.
+            dt_increase_factor=1.0,
+            dt_decrease_factor_slow=1.0,
+            on_dt_change=_on_dt_change if bool(getattr(args, "allow_dt_reduction", False)) else None,
             on_step_failure=_on_step_failure,
         ),
         post_step_refiner=post_step_refiner,

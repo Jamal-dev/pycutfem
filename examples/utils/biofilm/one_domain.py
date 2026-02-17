@@ -46,8 +46,18 @@ from pycutfem.ufl.linalg import (
 
 from ..shared.nonlinear_solid_refmap import (
     deulerian_k_inv,
+    dsigma_svk,
+    dsigma_svk_miehe_split,
+    dsigma_hencky,
+    dsigma_hencky_miehe_split,
     dsigma_neo_hookean,
     eulerian_k_inv,
+    svk_tensile_energy_miehe,
+    hencky_tensile_energy_miehe,
+    sigma_svk,
+    sigma_svk_miehe_split,
+    sigma_hencky,
+    sigma_hencky_miehe_split,
     sigma_neo_hookean,
 )
 
@@ -264,6 +274,8 @@ def build_biofilm_one_domain_forms(
     dx,
     # time integration
     dt,
+    # optional previous time step (for vS_n when dt changes)
+    dt_prev=None,
     theta: float = 1.0,
     # physical parameters
     rho_f=None,
@@ -271,9 +283,17 @@ def build_biofilm_one_domain_forms(
     kappa_inv=None,
     mu_s=None,
     lambda_s=None,
+    # Optional Kelvin–Voigt viscoelasticity for the skeleton (small-strain only):
+    # σ_visc = 2 η_s ε(v^S), with v^S = (u^k-u^n)/dt.
+    solid_visco_eta: float = 0.0,
     # optional solid inertia (Eulerian skeleton acceleration)
     rho_s0_tilde=None,
     include_skeleton_acceleration: bool = False,
+    # How to treat the convective part of the Eulerian skeleton inertia
+    # div(ρ_S v^S ⊗ v^S). "lagged" (default) uses a Picard-like linearization
+    # div(ρ_S^n v^{S,n} ⊗ v^{S,k}) for robustness; "full" keeps the nonlinear
+    # term.
+    skeleton_inertia_convection: str = "lagged",
     # solid/permeability modelling toggles
     solid_model: str = "linear",
     c_nh=None,
@@ -297,11 +317,21 @@ def build_biofilm_one_domain_forms(
     alpha_cahn_eps: float = 1.0,
     # Conservative Allen–Cahn: mass-conserving via a global Lagrange multiplier λ_α
     alpha_cahn_conservative: bool = False,
+    # Conservative Allen–Cahn implementation:
+    # - "unknown" (default): include a global Lagrange multiplier λ_α as an unknown
+    #   with the constraint equation ∫ M(α)(μ_α-λ_α)=0.
+    # - "eliminate": treat λ_α as a dependent coefficient (computed externally,
+    #   e.g. by projecting λ_α = (∫ M μ)/(∫ M)) to avoid ill-conditioning when
+    #   using degenerate mobility.
+    alpha_cahn_conservative_mode: str = "unknown",
     alpha_cahn_mobility: str = "constant",
     lambda_alpha_k=None,
     lambda_alpha_n=None,
     dlambda_alpha=None,
     lambda_alpha_test=None,
+    # Optional scaling for the conservative Allen–Cahn constraint equation
+    # (improves conditioning when using degenerate mobility so ∫M is small).
+    alpha_cahn_lambda_scale=None,
     # Cahn–Hilliard regularization for α (mass-conserving phase-field)
     alpha_ch_M: float = 0.0,
     alpha_ch_gamma: float = 0.0,
@@ -321,6 +351,7 @@ def build_biofilm_one_domain_forms(
     alpha_supg: float = 0.0,
     alpha_cip: float = 0.0,
     u_cip: float = 0.0,
+    u_cip_weight: str = "fluid",
     ds_cip=None,
     # Damage (bulk cohesion loss) model parameters
     damage_k: float = 0.0,
@@ -337,6 +368,8 @@ def build_biofilm_one_domain_forms(
     damage_l: float = 0.0,
     damage_psi0: float = 0.0,
     damage_pf_driver: str = "von_mises",
+    # Optional (lagged) phase-field damage history field H^{prev} (prevents healing when the drive relaxes).
+    damage_H_prev=None,
     damage_stiff_split: str = "full",
     D_S: float = 0.0,
     D_X: float = 0.0,
@@ -375,6 +408,8 @@ def build_biofilm_one_domain_forms(
     Notes
     -----
     - `dt` may be a float or a `Constant`.
+    - If `dt_prev` is provided, it is used for the lagged skeleton velocity
+      vS_n = (u_n - u_{n-1})/dt_prev. This is required for variable-Δt time stepping.
     - All source terms are *added* on the RHS of the strong form; i.e. we build
       residuals of the form "LHS - RHS" so the default is homogeneous (0).
     """
@@ -385,6 +420,12 @@ def build_biofilm_one_domain_forms(
     if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
         if mu_s is None or lambda_s is None:
             raise ValueError("Solid model 'linear' requires mu_s and lambda_s.")
+    elif solid_model_key in {"hencky", "hencky_log", "hencky_log_strain"}:
+        if mu_s is None or lambda_s is None:
+            raise ValueError("Solid model 'hencky' requires mu_s and lambda_s.")
+    elif solid_model_key in {"stvk", "svk", "saint_venant_kirchhoff", "saint-venant-kirchhoff"}:
+        if mu_s is None or lambda_s is None:
+            raise ValueError("Solid model 'stvk' requires mu_s and lambda_s.")
     elif solid_model_key in {"neo_hookean", "neo_hookean_eulerian", "nh"}:
         # Allow explicit neo-Hookean parameters; otherwise derive from (mu_s, lambda_s).
         if (c_nh is None or beta_nh is None) and (mu_s is None or lambda_s is None):
@@ -395,6 +436,7 @@ def build_biofilm_one_domain_forms(
     th = _c(float(theta))
     one_m_th = _c(1.0) - th
     inv_dt = _c(1.0) / dt
+    dt_prev_eff = dt if dt_prev is None else dt_prev
 
     # Optional sources default to 0 (as *expressions*, not test-weighted terms).
     zero_scalar = _c(0.0)
@@ -418,8 +460,8 @@ def build_biofilm_one_domain_forms(
         vS_n = Constant([0.0] * int(dim), dim=1)
         div_vS_n = _c(0.0)
     else:
-        vS_n = (u_n - u_nm1) / dt
-        div_vS_n = (div(u_n) - div(u_nm1)) / dt
+        vS_n = (u_n - u_nm1) / dt_prev_eff
+        div_vS_n = (div(u_n) - div(u_nm1)) / dt_prev_eff
 
     dvS = du / dt
     div_dvS = div(du) / dt
@@ -728,10 +770,21 @@ def build_biofilm_one_domain_forms(
         and damage_stiff_split_key in {"miehe", "tensile", "tension_compression", "tension-compression", "tc"}
     )
 
-    if use_miehe_stiff_split and solid_model_key not in {"linear", "small_strain", "linear_elastic"}:
+    if use_miehe_stiff_split and solid_model_key not in {
+        "linear",
+        "small_strain",
+        "linear_elastic",
+        "hencky",
+        "hencky_log",
+        "hencky_log_strain",
+        "stvk",
+        "svk",
+        "saint_venant_kirchhoff",
+        "saint-venant-kirchhoff",
+    }:
         raise ValueError(
-            "damage_stiff_split='miehe' is currently only implemented for solid_model='linear' "
-            "(small-strain). Use damage_stiff_split='full' for neo-Hookean."
+            "damage_stiff_split='miehe' is currently only implemented for solid_model in "
+            "{'linear','stvk','hencky'} (2D)."
         )
     if use_miehe_stiff_split and int(dim) != 2:
         raise ValueError("damage_stiff_split='miehe' is currently only implemented for dim=2.")
@@ -741,7 +794,53 @@ def build_biofilm_one_domain_forms(
     # - Default: full-stress degradation via scalar g_stiff(d) multiplier.
     # - Optional: Miehe (tension/compression) split for linear elasticity:
     #     σ = g(d) σ⁺(u) + σ⁻(u),  with σ⁺ built from the positive principal strains.
-    if solid_model_key in {"linear", "small_strain", "linear_elastic"} and use_miehe_stiff_split:
+    #
+    # - For finite-strain Hencky hyperelasticity, we implement the classic
+    #   Miehe-style tension/compression split at the *energy* level using the
+    #   spatial Hencky strain E = log(V). This yields:
+    #     ψ⁺ = μ||E⁺||² + (λ/2)⟨tr E⟩₊²,
+    #   and the corresponding Cauchy-stress split σ = σ⁺ + σ⁻ is obtained by
+    #   differentiating the split energy (Kirchhoff stress conjugate to log strain).
+    if solid_model_key in {"hencky", "hencky_log", "hencky_log_strain"} and use_miehe_stiff_split:
+        eta_pos = float(damage_eta_pos)
+        sig_plus_k, sig_minus_k = sigma_hencky_miehe_split(
+            u_k, mu_s, lambda_s, dim=int(dim), eta_pos=eta_pos
+        )
+        sig_plus_n, sig_minus_n = sigma_hencky_miehe_split(
+            u_n, mu_s, lambda_s, dim=int(dim), eta_pos=eta_pos
+        )
+        dsig_plus_k, dsig_minus_k = dsigma_hencky_miehe_split(
+            u_k, du, mu_s, lambda_s, dim=int(dim), eta_pos=eta_pos
+        )
+
+        r_el_plus_k = inner(sig_plus_k, grad(u_test))
+        r_el_minus_k = inner(sig_minus_k, grad(u_test))
+        r_el_plus_n = inner(sig_plus_n, grad(u_test))
+        r_el_minus_n = inner(sig_minus_n, grad(u_test))
+
+        a_el_plus = inner(dsig_plus_k, grad(u_test))
+        a_el_minus = inner(dsig_minus_k, grad(u_test))
+    elif solid_model_key in {"stvk", "svk", "saint_venant_kirchhoff", "saint-venant-kirchhoff"} and use_miehe_stiff_split:
+        eta_pos = float(damage_eta_pos)
+        disc_reg = 1.0e-16
+        sig_plus_k, sig_minus_k = sigma_svk_miehe_split(
+            u_k, mu_s, lambda_s, dim=int(dim), eta_pos=eta_pos, disc_reg=disc_reg
+        )
+        sig_plus_n, sig_minus_n = sigma_svk_miehe_split(
+            u_n, mu_s, lambda_s, dim=int(dim), eta_pos=eta_pos, disc_reg=disc_reg
+        )
+        dsig_plus_k, dsig_minus_k = dsigma_svk_miehe_split(
+            u_k, du, mu_s, lambda_s, dim=int(dim), eta_pos=eta_pos, disc_reg=disc_reg
+        )
+
+        r_el_plus_k = inner(sig_plus_k, grad(u_test))
+        r_el_minus_k = inner(sig_minus_k, grad(u_test))
+        r_el_plus_n = inner(sig_plus_n, grad(u_test))
+        r_el_minus_n = inner(sig_minus_n, grad(u_test))
+
+        a_el_plus = inner(dsig_plus_k, grad(u_test))
+        a_el_minus = inner(dsig_minus_k, grad(u_test))
+    elif solid_model_key in {"linear", "small_strain", "linear_elastic"} and use_miehe_stiff_split:
         eta_pos = float(damage_eta_pos)
         disc_reg = 1.0e-16
         I = Identity(int(dim))
@@ -787,6 +886,20 @@ def build_biofilm_one_domain_forms(
             r_el_k = _linear_elastic_term(u_k, u_test, mu_s=mu_s, lambda_s=lambda_s)
             r_el_n = _linear_elastic_term(u_n, u_test, mu_s=mu_s, lambda_s=lambda_s)
             a_el = _linear_elastic_term(du, u_test, mu_s=mu_s, lambda_s=lambda_s)
+        elif solid_model_key in {"hencky", "hencky_log", "hencky_log_strain"}:
+            sig_k = sigma_hencky(u_k, mu_s, lambda_s, dim=int(dim))
+            sig_n = sigma_hencky(u_n, mu_s, lambda_s, dim=int(dim))
+            r_el_k = inner(sig_k, grad(u_test))
+            r_el_n = inner(sig_n, grad(u_test))
+            dsig_k = dsigma_hencky(u_k, du, mu_s, lambda_s, dim=int(dim))
+            a_el = inner(dsig_k, grad(u_test))
+        elif solid_model_key in {"stvk", "svk", "saint_venant_kirchhoff", "saint-venant-kirchhoff"}:
+            sig_k = sigma_svk(u_k, mu_s, lambda_s, dim=int(dim))
+            sig_n = sigma_svk(u_n, mu_s, lambda_s, dim=int(dim))
+            r_el_k = inner(sig_k, grad(u_test))
+            r_el_n = inner(sig_n, grad(u_test))
+            dsig_k = dsigma_svk(u_k, du, mu_s, lambda_s, dim=int(dim))
+            a_el = inner(dsig_k, grad(u_test))
         else:
             # Eulerian reference-map Neo-Hookean stress (Cauchy), compatible with FPI poro Eulerian module.
             if c_nh is None:
@@ -842,6 +955,24 @@ def build_biofilm_one_domain_forms(
     # the skeleton equation vanishes and the u-DOFs can become nearly unconstrained,
     # leading to ill-conditioned Jacobians and Newton stagnation.
     gamma_u_c = _c(float(gamma_u))
+    a_skel_visco = None
+    if float(solid_visco_eta) != 0.0:
+        eta_s_c = _c(float(solid_visco_eta))
+        # grad_vS_k = (grad(u_k) - grad(u_n))/dt
+        # eps_vS_k = 0.5*(grad_vS_k + grad_vS_k.T)
+        sig_visc_k = _c(2.0) * eta_s_c * _epsilon(vS_k)
+        sig_visc_n = _c(2.0) * eta_s_c * _epsilon(vS_n)
+        r_visc_k = inner(sig_visc_k, grad(u_test))
+        r_visc_n = inner(sig_visc_n, grad(u_test))
+        # Treat viscosity as part of the skeleton response: localize by α and apply the same stiffness
+        # degradation g_stiff(d) used for elasticity.
+        r_skeleton += (th * alpha_k * g_stiff_k * r_visc_k + one_m_th * alpha_n * g_stiff_n * r_visc_n) * dx
+
+        # Consistent k-part Jacobian: δ[α g σ_visc(vS)] = δ(α g) r_visc + α g a_visc.
+        sig_dvisc = _c(2.0) * eta_s_c * _epsilon(dvS)
+        a_visc = inner(sig_dvisc, grad(u_test))
+        w_ag = dalpha * g_stiff_k + alpha_k * dg_stiff_k
+        a_skel_visco = th * (w_ag * r_visc_k + alpha_k * g_stiff_k * a_visc) * dx
     if float(gamma_u) != 0.0:
         u_ext_mode = str(u_extension_mode).strip().lower()
         if u_ext_mode in {"l2", "mass"}:
@@ -890,6 +1021,8 @@ def build_biofilm_one_domain_forms(
         elastic_jac_k += dg_stiff_k * r_el_plus_k
 
     a_skel = th * (alpha_k * elastic_jac_k + dalpha * (g_stiff_k * r_el_plus_k + r_el_minus_k)) * dx
+    if a_skel_visco is not None:
+        a_skel += a_skel_visco
     # Jacobian of the pressure coupling -p div(B η).
     # Expand dgrad·eta component-wise to avoid backend-dependent contraction
     # paths for Grad(trial-scalar) · VectorTest.
@@ -929,55 +1062,97 @@ def build_biofilm_one_domain_forms(
         else:
             raise ValueError(f"Unknown u_extension_mode {u_extension_mode!r}.")
 
-    # Optional Eulerian skeleton inertia (conservative form).
+    # Optional Eulerian skeleton inertia.
     #
-    # When inertia is enabled and the solid mass coefficient depends on (α,φ),
-    # we use the conservative form to avoid missing "variable density" terms:
-    #   ∂t(ρ_s vS) + div(ρ_s vS ⊗ vS) = ρ_s (vS·∇)vS + vS div(ρ_s vS) + ∂t(ρ_s vS),
-    # with ρ_s = rho_s0_tilde * α(1-φ) = rho_s0_tilde * B.
+    # The continuous term is the conservative form
+    #   ∂t(ρ_S v^S) + div(ρ_S v^S ⊗ v^S),
+    # with ρ_S = rho_s0_tilde * α(1-φ) = rho_s0_tilde * B.
+    #
+    # For robustness in monolithic solves (especially when u is displacement and
+    # v^S is derived as (u^{n+1}-u^n)/dt), the default is a Picard-like lagging
+    # of the convective part:
+    #   div(ρ_S v^S ⊗ v^S) ≈ div(ρ_S^n v^{S,n} ⊗ v^{S,k}).
     if bool(include_skeleton_acceleration) and float(rho_s0_tilde) != 0.0:
+        inertia_conv_key = str(skeleton_inertia_convection).strip().lower() if skeleton_inertia_convection is not None else "lagged"
+        if inertia_conv_key in {"conservative", "nonlinear"}:
+            inertia_conv_key = "full"
+        if inertia_conv_key in {"picard", "semi", "semi_implicit", "linear"}:
+            inertia_conv_key = "lagged"
+
         rho_s0_c = rho_s0_tilde
 
         rhoS_k = rho_s0_c * B_k
         rhoS_n = rho_s0_c * B_n
 
-        # Conservative-in-time momentum term
+        # Conservative-in-time momentum term.
         momS_dot = (rhoS_k * vS_k - rhoS_n * vS_n) * inv_dt
 
-        # Conservative convection: div(ρ_s vS⊗vS) = ρ_s (vS·∇)vS + vS div(ρ_s vS).
-        #
+        r_skeleton += inner(momS_dot, u_test) * dx
+
+        # Conservative convection (two modes):
+        # - full:    div(ρ_S^k v^{S,k} ⊗ v^{S,k}) (nonlinear)
+        # - lagged:  div(ρ_S^n v^{S,n} ⊗ v^{S,k}) (Picard linearization)
+        if inertia_conv_key not in {"full", "lagged"}:
+            raise ValueError(
+                f"Unknown skeleton_inertia_convection={skeleton_inertia_convection!r}. "
+                "Use 'lagged' (default) or 'full'."
+            )
+
         # IMPORTANT: avoid grad(vS_k) directly because the current UFL visitor only
         # supports grad() of primitive Functions/Trials/Tests (not arbitrary expressions like (u_k-u_n)/dt).
         grad_vS_k = (grad(u_k) - grad(u_n)) / dt
         if u_nm1 is None:
             grad_vS_n = Constant([[0.0] * int(dim) for _ in range(int(dim))], dim=2)
         else:
-            grad_vS_n = (grad(u_n) - grad(u_nm1)) / dt
+            grad_vS_n = (grad(u_n) - grad(u_nm1)) / dt_prev_eff
 
-        advS_k = dot(grad_vS_k, vS_k)
-        advS_n = dot(grad_vS_n, vS_n)
-        convS_k = dot(advS_k, u_test)
-        convS_n = dot(advS_n, u_test)
-
-        div_rhoS_vS_k = rho_s0_c * divBvS_k
         div_rhoS_vS_n = rho_s0_c * divBvS_n
 
-        r_skeleton += inner(momS_dot, u_test) * dx
-        r_skeleton += th * (rhoS_k * convS_k + div_rhoS_vS_k * dot(vS_k, u_test)) * dx
-        r_skeleton += one_m_th * (rhoS_n * convS_n + div_rhoS_vS_n * dot(vS_n, u_test)) * dx
+        if inertia_conv_key == "full":
+            advS_k = dot(grad_vS_k, vS_k)
+            advS_n = dot(grad_vS_n, vS_n)
+            convS_k = dot(advS_k, u_test)
+            convS_n = dot(advS_n, u_test)
 
-        # Jacobian (k-part only): δ[ (ρ_s vS)/dt ] + θ δ[ ρ_s (vS·∇)vS + vS div(ρ_s vS) ].
+            div_rhoS_vS_k = rho_s0_c * divBvS_k
+
+            r_skeleton += th * (rhoS_k * convS_k + div_rhoS_vS_k * dot(vS_k, u_test)) * dx
+            r_skeleton += one_m_th * (rhoS_n * convS_n + div_rhoS_vS_n * dot(vS_n, u_test)) * dx
+        else:
+            # Lagged/Picard form: div(ρ^n v^n ⊗ v^k) = ρ^n (v^n·∇)v^k + v^k div(ρ^n v^n).
+            advS_k = dot(grad_vS_k, vS_n)
+            convS_k = dot(advS_k, u_test)
+
+            advS_n = dot(grad_vS_n, vS_n)
+            convS_n = dot(advS_n, u_test)
+
+            r_skeleton += th * (rhoS_n * convS_k + div_rhoS_vS_n * dot(vS_k, u_test)) * dx
+            r_skeleton += one_m_th * (rhoS_n * convS_n + div_rhoS_vS_n * dot(vS_n, u_test)) * dx
+
+        # Jacobian (k-part only): always include δ[ (ρ_S v^S)/dt ].
         d_rhoS_k = rho_s0_c * dB_k
         d_momS_dot = (d_rhoS_k * vS_k + rhoS_k * dvS) * inv_dt
         a_skel += inner(d_momS_dot, u_test) * dx
 
-        grad_dvS = grad(du) / dt
-        d_advS_k = dot(grad_dvS, vS_k) + dot(grad_vS_k, dvS)
-        d_convS_k = dot(d_advS_k, u_test)
-        a_skel += th * (d_rhoS_k * convS_k + rhoS_k * d_convS_k) * dx
+        if inertia_conv_key == "full":
+            # δ[ ρ_S (v^S·∇)v^S + v^S div(ρ_S v^S) ] at k-level.
+            grad_dvS = grad(du) / dt
+            d_advS_k = dot(grad_dvS, vS_k) + dot(grad_vS_k, dvS)
+            d_convS_k = dot(d_advS_k, u_test)
+            a_skel += th * (d_rhoS_k * convS_k + rhoS_k * d_convS_k) * dx
 
-        d_div_rhoS_vS_k = rho_s0_c * d_divBvS_k
-        a_skel += th * (d_div_rhoS_vS_k * dot(vS_k, u_test) + div_rhoS_vS_k * dot(dvS, u_test)) * dx
+            div_rhoS_vS_k = rho_s0_c * divBvS_k
+            d_div_rhoS_vS_k = rho_s0_c * d_divBvS_k
+            a_skel += th * (d_div_rhoS_vS_k * dot(vS_k, u_test) + div_rhoS_vS_k * dot(dvS, u_test)) * dx
+        elif inertia_conv_key == "lagged":
+            # δ[ ρ_S^n (v^{S,n}·∇)v^{S} + v^{S} div(ρ_S^n v^{S,n}) ] at k-level.
+            grad_dvS = grad(du) / dt
+            d_advS_k = dot(grad_dvS, vS_n)
+            d_convS_k = dot(d_advS_k, u_test)
+            a_skel += th * (rhoS_n * d_convS_k) * dx
+
+            div_rhoS_vS_n = rho_s0_c * divBvS_n
+            a_skel += th * (div_rhoS_vS_n * dot(dvS, u_test)) * dx
 
     # Optional facet stabilization for u (CIP/ghost-penalty on interior facets).
     # This improves robustness when u becomes weakly constrained (e.g. α→0 in
@@ -989,10 +1164,23 @@ def build_biofilm_one_domain_forms(
         vmag = _sqrt(inner(vS_n, vS_n) + _c(1.0e-12))
         scale = inv_dt + vmag / (h_F + _c(1.0e-12))
         tau_u_cip = _c(float(u_cip)) * (h_F * h_F * h_F) * scale
-        # Weight by (1-α^n) to primarily stabilize the *extension* region (where α≈0)
-        # without polluting the physical biofilm chunk (α≈1). Using α^n keeps the
-        # Jacobian free of extra α-coupling from the stabilization weight.
-        w_u_cip = avg(_one_minus(alpha_n))
+        # Weighting: by default stabilize primarily the *extension* region (α≈0) so we
+        # don't overdamp the physical biofilm chunk (α≈1). Some runs (e.g. when
+        # α is solved and advects/moves) benefit from also stabilizing in α≈1.
+        #
+        # Using lagged α^n keeps the Jacobian free of extra α-coupling from the
+        # stabilization weight.
+        w_key = str(u_cip_weight or "fluid").strip().lower()
+        if w_key in {"fluid", "one_minus_alpha", "1-alpha", "one-minus-alpha"}:
+            w_u_cip = avg(_one_minus(alpha_n))
+        elif w_key in {"biofilm", "alpha"}:
+            w_u_cip = avg(alpha_n)
+        elif w_key in {"both", "all", "unity", "1"}:
+            w_u_cip = _c(1.0)
+        else:
+            raise ValueError(
+                f"Unknown u_cip_weight={u_cip_weight!r}. Use 'fluid' (default), 'biofilm', or 'both'."
+            )
         r_skeleton += tau_u_cip * w_u_cip * _grad_inner_jump(u_k, u_test, n_int) * ds_cip
         a_skel += tau_u_cip * w_u_cip * _grad_inner_jump(du, u_test, n_int) * ds_cip
 
@@ -1204,6 +1392,10 @@ def build_biofilm_one_domain_forms(
                 # Use the same constitutive law as the skeleton equation.
                 if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
                     sig = _c(2.0) * mu_s * _epsilon(u_n) + lambda_s * div(u_n) * Identity(int(dim))
+                elif solid_model_key in {"hencky", "hencky_log", "hencky_log_strain"}:
+                    sig = sigma_hencky(u_n, mu_s, lambda_s, dim=int(dim))
+                elif solid_model_key in {"stvk", "svk", "saint_venant_kirchhoff", "saint-venant-kirchhoff"}:
+                    sig = sigma_svk(u_n, mu_s, lambda_s, dim=int(dim))
                 else:
                     if c_nh is None:
                         c_nh = mu_s / _c(2.0)
@@ -1279,6 +1471,20 @@ def build_biofilm_one_domain_forms(
     ac_enabled = float(alpha_cahn_M) != 0.0 and float(alpha_cahn_gamma) != 0.0
     if ac_enabled and ch_enabled:
         raise ValueError("Allen–Cahn (alpha_cahn_*) and Cahn–Hilliard (alpha_ch_*) cannot both be enabled simultaneously.")
+    if bool(alpha_cahn_conservative):
+        cons_mode = str(alpha_cahn_conservative_mode).strip().lower()
+        if cons_mode in {"solve", "unknown", "lagrange", "constraint"}:
+            cons_mode = "unknown"
+        elif cons_mode in {"eliminate", "elim", "project", "projected", "explicit"}:
+            cons_mode = "eliminate"
+        else:
+            raise ValueError(
+                f"Unknown alpha_cahn_conservative_mode {alpha_cahn_conservative_mode!r}. Use 'unknown' or 'eliminate'."
+            )
+        if not ac_enabled:
+            raise ValueError("alpha_cahn_conservative=True requires alpha_cahn_M and alpha_cahn_gamma to be nonzero.")
+    else:
+        cons_mode = "unknown"
     if ac_enabled:
         # W'(α) for W(α)=α^2(1-α)^2 is 2α(1-α)(1-2α).
         Wp_k = _c(2.0) * alpha_k * _one_minus(alpha_k) * _one_minus(_c(2.0) * alpha_k)
@@ -1308,10 +1514,8 @@ def build_biofilm_one_domain_forms(
         r_alpha += alpha_test * ((M_gamma_k / eps_alpha_c) * Wp_k) * dx
 
         if bool(alpha_cahn_conservative):
-            if lambda_alpha_k is None or dlambda_alpha is None or lambda_alpha_test is None:
-                raise ValueError(
-                    "alpha_cahn_conservative=True requires (lambda_alpha_k, dlambda_alpha, lambda_alpha_test) to be provided."
-                )
+            if lambda_alpha_k is None:
+                raise ValueError("alpha_cahn_conservative=True requires lambda_alpha_k to be provided.")
             r_alpha += -alpha_test * (M_ac_k * lambda_alpha_k) * dx
 
     r_mu_alpha = None
@@ -1384,7 +1588,11 @@ def build_biofilm_one_domain_forms(
         if mob_key in {"constant", "const"}:
             a_alpha += (M_gamma_alpha * eps_alpha_c) * inner(grad(dalpha), grad(alpha_test)) * dx
             a_alpha += alpha_test * ((M_gamma_alpha / eps_alpha_c) * Wpp_k * dalpha) * dx
-            if bool(alpha_cahn_conservative):
+            if bool(alpha_cahn_conservative) and cons_mode == "unknown":
+                if dlambda_alpha is None:
+                    raise ValueError(
+                        "alpha_cahn_conservative_mode='unknown' requires dlambda_alpha (lambda_alpha as unknown)."
+                    )
                 a_alpha += -alpha_test * (M_alpha_c * dlambda_alpha) * dx
         else:
             # d[ ε Mγ ∇α·∇w ] = ε (dMγ ∇α·∇w + Mγ ∇δα·∇w)
@@ -1399,7 +1607,15 @@ def build_biofilm_one_domain_forms(
             # d[ w (Mγ/ε) W'(α) ] = w/ε (dMγ W'(α) + Mγ W''(α) δα)
             a_alpha += alpha_test * (((dM_gamma / eps_alpha_c) * Wp_k) + ((M_gamma_k / eps_alpha_c) * Wpp_k * dalpha)) * dx
             if bool(alpha_cahn_conservative):
-                a_alpha += -alpha_test * ((dM_ac * lambda_alpha_k) + (M_ac_k * dlambda_alpha)) * dx
+                if lambda_alpha_k is None:
+                    raise ValueError("alpha_cahn_conservative=True requires lambda_alpha_k to be provided.")
+                a_alpha += -alpha_test * (dM_ac * lambda_alpha_k) * dx
+                if cons_mode == "unknown":
+                    if dlambda_alpha is None:
+                        raise ValueError(
+                            "alpha_cahn_conservative_mode='unknown' requires dlambda_alpha (lambda_alpha as unknown)."
+                        )
+                    a_alpha += -alpha_test * (M_ac_k * dlambda_alpha) * dx
 
     if ch_enabled:
         # k-part Jacobian of ∫ M(α) ∇μ · ∇w
@@ -1453,7 +1669,7 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     r_alpha_lambda = None
     a_alpha_lambda = None
-    if bool(alpha_cahn_conservative):
+    if bool(alpha_cahn_conservative) and cons_mode == "unknown":
         if not ac_enabled:
             raise ValueError("alpha_cahn_conservative=True requires alpha_cahn_M and alpha_cahn_gamma to be nonzero.")
         if lambda_alpha_k is None or dlambda_alpha is None or lambda_alpha_test is None:
@@ -1470,22 +1686,27 @@ def build_biofilm_one_domain_forms(
         #   ∫ M(-εΔα) dx = ε ∫ ∇M·∇α dx.
         #
         # This uses only first derivatives and is numerically more robust for high-order runs.
-        r_alpha_lambda = lambda_alpha_test * (((gamma_alpha_c / eps_alpha_c) * (M_ac_k * Wp_k)) - (M_ac_k * lambda_alpha_k)) * dx
+        lam_scale = alpha_cahn_lambda_scale if alpha_cahn_lambda_scale is not None else _c(1.0)
+        r_alpha_lambda = lam_scale * lambda_alpha_test * (
+            ((gamma_alpha_c / eps_alpha_c) * (M_ac_k * Wp_k)) - (M_ac_k * lambda_alpha_k)
+        ) * dx
 
         # Domain correction: γ ε ∇M·∇α (only nonzero for variable mobility).
         if mob_key not in {"constant", "const"}:
             g2 = inner(grad(alpha_k), grad(alpha_k))
-            r_alpha_lambda += lambda_alpha_test * ((eps_alpha_c * gamma_alpha_c * M_alpha_c) * mob_prime_k * g2) * dx
+            r_alpha_lambda += lam_scale * lambda_alpha_test * (
+                (eps_alpha_c * gamma_alpha_c * M_alpha_c) * mob_prime_k * g2
+            ) * dx
 
         # Jacobian (k-part only)
         # d[ γ(M/ε)W'(α) - M λ ]
-        a_alpha_lambda = lambda_alpha_test * (
+        a_alpha_lambda = lam_scale * lambda_alpha_test * (
             (gamma_alpha_c / eps_alpha_c) * ((dM_ac * Wp_k) + (M_ac_k * Wpp_k * dalpha)) + (-(dM_ac * lambda_alpha_k) - (M_ac_k * dlambda_alpha))
         ) * dx
 
         if mob_key not in {"constant", "const"}:
             g2 = inner(grad(alpha_k), grad(alpha_k))
-            a_alpha_lambda += lambda_alpha_test * (
+            a_alpha_lambda += lam_scale * lambda_alpha_test * (
                 (eps_alpha_c * gamma_alpha_c * M_alpha_c) * ((-_c(2.0) * dalpha) * g2 + mob_prime_k * (_c(2.0) * inner(grad(alpha_k), grad(dalpha))))
             ) * dx
 
@@ -1505,6 +1726,10 @@ def build_biofilm_one_domain_forms(
         if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
             eps_un = _epsilon(u_n)
             sig_un = _c(2.0) * mu_s * eps_un + lambda_s * div(u_n) * Identity(int(dim))
+        elif solid_model_key in {"hencky", "hencky_log", "hencky_log_strain"}:
+            sig_un = sigma_hencky(u_n, mu_s, lambda_s, dim=int(dim))
+        elif solid_model_key in {"stvk", "svk", "saint_venant_kirchhoff", "saint-venant-kirchhoff"}:
+            sig_un = sigma_svk(u_n, mu_s, lambda_s, dim=int(dim))
         else:
             if c_nh is None:
                 c_nh = mu_s / _c(2.0)
@@ -1565,34 +1790,55 @@ def build_biofilm_one_domain_forms(
             Gc_over_l = Gc_c / ell_c
             Gc_l = Gc_c * ell_c
 
-            damage_pf_driver_key = str(damage_pf_driver).strip().lower()
-            if damage_pf_driver_key in {"von_mises", "vm", "von-mises"}:
-                # Legacy: scale a von-Mises-based proxy into an energy density.
-                psi0_val = float(damage_psi0)
-                if psi0_val <= 0.0:
-                    psi0_val = Gc_val / max(ell_val, 1.0e-12)
-                H_prev = _c(psi0_val) * drive_vm
-            elif damage_pf_driver_key in {"miehe", "miehe_energy", "energy", "psi_plus", "psi+"}:
-                # Miehe-type tensile energy density ψ⁺(u) for linear elasticity:
-                #   ψ⁺ = μ ||ε⁺||² + (λ/2) ⟨tr ε⟩₊².
-                if solid_model_key not in {"linear", "small_strain", "linear_elastic"}:
-                    raise ValueError(
-                        "damage_pf_driver='miehe_energy' currently requires solid_model='linear'. "
-                        "Use damage_pf_driver='von_mises' for neo-Hookean."
-                    )
-                eta_pos = float(damage_eta_pos)
-                disc_reg = 1.0e-16
-                eps_un = _epsilon(u_n)
-                eps_plus_un, _, _, _, _ = spectral_positive_part_2x2_sym(eps_un, eta_pos=eta_pos, disc_reg=disc_reg)
-                tr_eps = div(u_n)
-                tr_pos = _smooth_pos_u(tr_eps, eta=eta_pos)
-                psi_plus = mu_s * inner(eps_plus_un, eps_plus_un) + _c(0.5) * lambda_s * (tr_pos * tr_pos)
-                scale = float(damage_psi0)
-                if scale > 0.0:
-                    psi_plus = _c(scale) * psi_plus
-                H_prev = psi_plus
+            if damage_H_prev is not None:
+                # Optional irreversibility: supply a history field H^{prev}(x)
+                # (typically updated as max over time) so damage cannot heal when
+                # the instantaneous drive relaxes.
+                H_prev = damage_H_prev
             else:
-                raise ValueError(f"Unknown damage_pf_driver {damage_pf_driver!r}.")
+                damage_pf_driver_key = str(damage_pf_driver).strip().lower()
+                if damage_pf_driver_key in {"von_mises", "vm", "von-mises"}:
+                    # Legacy: scale a von-Mises-based proxy into an energy density.
+                    psi0_val = float(damage_psi0)
+                    if psi0_val <= 0.0:
+                        psi0_val = Gc_val / max(ell_val, 1.0e-12)
+                    H_prev = _c(psi0_val) * drive_vm
+                elif damage_pf_driver_key in {"miehe", "miehe_energy", "energy", "psi_plus", "psi+"}:
+                    eta_pos = float(damage_eta_pos)
+                    if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
+                        # Miehe-type tensile energy density ψ⁺(u) for linear elasticity:
+                        #   ψ⁺ = μ ||ε⁺||² + (λ/2) ⟨tr ε⟩₊².
+                        disc_reg = 1.0e-16
+                        eps_un = _epsilon(u_n)
+                        eps_plus_un, _, _, _, _ = spectral_positive_part_2x2_sym(
+                            eps_un, eta_pos=eta_pos, disc_reg=disc_reg
+                        )
+                        tr_eps = div(u_n)
+                        tr_pos = _smooth_pos_u(tr_eps, eta=eta_pos)
+                        psi_plus = mu_s * inner(eps_plus_un, eps_plus_un) + _c(0.5) * lambda_s * (tr_pos * tr_pos)
+                    elif solid_model_key in {"hencky", "hencky_log", "hencky_log_strain"}:
+                        # Finite-strain Hencky tensile energy density ψ⁺(u) in 2D:
+                        #   ψ⁺ = μ ||E⁺||² + (λ/2) ⟨tr E⟩₊²,  E=log(V).
+                        psi_plus = hencky_tensile_energy_miehe(
+                            u_n, mu_s, lambda_s, dim=int(dim), eta_pos=eta_pos
+                        )
+                    elif solid_model_key in {"stvk", "svk", "saint_venant_kirchhoff", "saint-venant-kirchhoff"}:
+                        # Finite-strain SVK tensile energy density ψ⁺(u) in 2D:
+                        #   ψ⁺ = μ ||E⁺||² + (λ/2) ⟨tr E⟩₊²,  E=0.5(C-I).
+                        psi_plus = svk_tensile_energy_miehe(
+                            u_n, mu_s, lambda_s, dim=int(dim), eta_pos=eta_pos
+                        )
+                    else:
+                        raise ValueError(
+                            "damage_pf_driver='miehe_energy' requires solid_model in {'linear','stvk','hencky'} (2D). "
+                            "Use damage_pf_driver='von_mises' for neo-Hookean."
+                        )
+                    scale = float(damage_psi0)
+                    if scale > 0.0:
+                        psi_plus = _c(scale) * psi_plus
+                    H_prev = psi_plus
+                else:
+                    raise ValueError(f"Unknown damage_pf_driver {damage_pf_driver!r}.")
 
             DtS_d_k = (d_k - d_n) * inv_dt
             DtS_d_k += th * dot(grad(d_k), vS_k) + one_m_th * dot(grad(d_n), vS_n)

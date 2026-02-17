@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, replace
 from pycutfem.jit.ir import (
     LoadVariable, LoadConstant, LoadConstantArray, LoadElementWiseConstant,
     LoadAnalytic, LoadFacetNormal, Grad, Div, HdivDiv, PosOp, NegOp,
-    PositivePartOp, HeavisideOp,
+    PositivePartOp, HeavisideOp, LogOp,
     BinaryOp, Inner, Dot, Outer, Store, Transpose, CellDiameter, LoadFacetNormalComponent, CheckDomain,
     MeshSize,
     Trace, Determinant, Inverse, Cofactor, Hessian as IRHessian, Laplacian as IRLaplacian
@@ -1976,6 +1976,13 @@ class NumbaCodeGen:
                     body_lines.append(f"{res_var} = 1.0 if ({a.var_name} > 0.0) else 0.0")
                 else:
                     body_lines.append(f"{res_var} = np.where({a.var_name} > 0.0, 1.0, 0.0)")
+                stack.append(a._replace(var_name=res_var))
+
+            elif isinstance(op, LogOp):
+                a = stack.pop()
+                res_var = new_var("log")
+                body_lines.append("# Log: natural logarithm")
+                body_lines.append(f"{res_var} = np.log({a.var_name})")
                 stack.append(a._replace(var_name=res_var))
 
             # --- Inner OPERATORS ---
