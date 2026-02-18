@@ -613,7 +613,12 @@ def main() -> None:
         type=str,
         default="l2",
         choices=("l2", "grad"),
-        help="Type of u-extension stabilization to use outside the biofilm.",
+        help=(
+            "Type of u-extension stabilization to use outside the biofilm. "
+            "'l2' anchors u in the fluid via (gamma_u/h^2)*(1-α)u and can fight rigid-body chunk translation "
+            "when --solid-inertia is enabled; 'grad' penalizes ∇u and is typically preferred for post-failure motion "
+            "(use --gamma-u-pin to remove the global-translation nullspace)."
+        ),
     )
     ap.add_argument(
         "--gamma-u-pin",
@@ -1447,7 +1452,26 @@ def main() -> None:
     if solid_inertia and solid_inertia_conv != "full":
         print(f"[info] skeleton inertia convection mode: {solid_inertia_conv!r} (set --solid-inertia-convection full for the nonlinear form).")
 
-    if float(args.D_alpha) == 0.0 and str(getattr(args, "u_extension", "l2")).strip().lower() in {"l2"} and float(args.gamma_u) < 1.0 and solid_inertia:
+    u_ext_mode = str(getattr(args, "u_extension", "l2")).strip().lower()
+    if solid_inertia and u_ext_mode in {"l2", "mass"}:
+        print(
+            "[warn] --solid-inertia with --u-extension l2 anchors u in the free fluid and can fight rigid-body chunk motion "
+            "(u is CG/continuous). For post-failure translation/rotation, prefer --u-extension grad with a tiny --gamma-u-pin "
+            "and keep/raise --u-cip as needed."
+        )
+        # In sloughing runs the entire point of enabling solid inertia is to allow
+        # detached chunks to translate/rotate. With a continuous CG u field, an L2
+        # extension effectively anchors u in the free fluid and can make Newton
+        # stagnate or fail as chunks begin to move. Switch to the grad extension
+        # (with a tiny pin) unless the user explicitly disabled sloughing.
+        if bool(use_sloughing):
+            print("[warn] sloughing+inertia detected: overriding --u-extension l2 -> grad for robust post-failure chunk motion.")
+            args.u_extension = "grad"
+            u_ext_mode = "grad"
+            if not _has_flag("--gamma-u-pin"):
+                args.gamma_u_pin = 1.0e-12
+
+    if float(args.D_alpha) == 0.0 and u_ext_mode in {"l2", "mass"} and float(args.gamma_u) < 1.0 and solid_inertia:
         print(
             "[warn] You are using --D-alpha 0 with --solid-inertia and a small --gamma-u. "
             "This combination often makes the u-block near-singular outside the biofilm and can "
@@ -2122,12 +2146,55 @@ def main() -> None:
         alpha_k.nodal_values[:] = np.asarray(res.values, dtype=float)
 
     def _scalar_to_nodes(f: Function) -> np.ndarray:
-        out = np.zeros(num_nodes, dtype=float)
+        out = np.full(num_nodes, np.nan, dtype=float)
+        assigned = np.zeros(num_nodes, dtype=bool)
         for gdof, lidx in f._g2l.items():
             _field, node_id = dh._dof_to_node_map[gdof]
             if node_id is None:
                 continue
-            out[int(node_id)] = float(f.nodal_values[lidx])
+            nid = int(node_id)
+            out[nid] = float(f.nodal_values[lidx])
+            assigned[nid] = True
+
+        # If this is a lower-order CG field on a higher-order geometry mesh, fill
+        # non-DOF nodes by evaluating the bilinear Q1 interpolant from corner values.
+        if (not bool(np.all(assigned))) and getattr(mesh, "element_type", None) == "quad":
+            try:
+                p = int(getattr(mesh, "poly_order", 1) or 1)
+                conn_all = np.asarray(getattr(mesh, "elements_connectivity", None))
+                if conn_all.ndim == 2 and conn_all.shape[1] == (p + 1) * (p + 1) and p > 1:
+                    inv_p = 1.0 / float(p)
+                    for conn in conn_all:
+                        bl = int(conn[0])
+                        br = int(conn[p])
+                        tl = int(conn[p * (p + 1)])
+                        tr = int(conn[p * (p + 1) + p])
+                        if not (assigned[bl] and assigned[br] and assigned[tl] and assigned[tr]):
+                            continue
+                        f_bl = float(out[bl])
+                        f_br = float(out[br])
+                        f_tr = float(out[tr])
+                        f_tl = float(out[tl])
+                        for j in range(p + 1):
+                            t = float(j) * inv_p
+                            one_m_t = 1.0 - t
+                            for i in range(p + 1):
+                                nid = int(conn[j * (p + 1) + i])
+                                if assigned[nid]:
+                                    continue
+                                s = float(i) * inv_p
+                                one_m_s = 1.0 - s
+                                out[nid] = (
+                                    (one_m_s * one_m_t) * f_bl
+                                    + (s * one_m_t) * f_br
+                                    + (s * t) * f_tr
+                                    + (one_m_s * t) * f_tl
+                                )
+            except Exception:
+                pass
+
+        out = np.asarray(out, dtype=float)
+        out[~np.isfinite(out)] = 0.0
         return out
 
     def _vector_to_nodes(vf: VectorFunction) -> np.ndarray:

@@ -54,12 +54,62 @@ def export_vtk(
 
         # Function -> scalar field
         if isinstance(obj, Function):
-            scal = np.zeros(num_nodes)
+            scal = np.zeros(num_nodes, dtype=float)
+            assigned = np.zeros(num_nodes, dtype=bool)
             for gdof, lidx in obj._g2l.items():
                 _field, node_id = dof_handler._dof_to_node_map[gdof]
                 if node_id is None:
                     continue
                 scal[node_id] = obj.nodal_values[lidx]
+                assigned[node_id] = True
+
+            # Visualization quality: when a lower-order CG field (e.g. Q1) lives on a
+            # higher-order geometry mesh (e.g. Q2), the DOF-to-node map touches only a
+            # subset of mesh nodes. Leaving the remaining nodes at 0 makes ParaView
+            # show spurious "holes" and can mislead interpretation (especially when
+            # combining fields, e.g. (1-d)*alpha).
+            #
+            # For quadrilateral Lagrange meshes, we can safely upsample Q1 fields to
+            # the mesh nodes by evaluating the bilinear interpolation defined by the
+            # element corner values at the high-order node locations.
+            if (not np.all(assigned)) and mesh.element_type == "quad" and int(getattr(mesh, "poly_order", 1) or 1) > 1:
+                try:
+                    p = int(mesh.poly_order)
+                    conn_all = np.asarray(getattr(mesh, "elements_connectivity", None))
+                    if conn_all.ndim == 2 and conn_all.shape[1] == (p + 1) * (p + 1) and p > 0:
+                        for conn in conn_all:
+                            # Corner nodes in row-major (j,i) ordering.
+                            bl = int(conn[0])
+                            br = int(conn[p])
+                            tl = int(conn[p * (p + 1)])
+                            tr = int(conn[p * (p + 1) + p])
+                            if not (assigned[bl] and assigned[br] and assigned[tl] and assigned[tr]):
+                                continue
+                            f_bl = float(scal[bl])
+                            f_br = float(scal[br])
+                            f_tr = float(scal[tr])
+                            f_tl = float(scal[tl])
+                            inv_p = 1.0 / float(p)
+                            for j in range(p + 1):
+                                t = float(j) * inv_p
+                                one_m_t = 1.0 - t
+                                for i in range(p + 1):
+                                    nid = int(conn[j * (p + 1) + i])
+                                    if assigned[nid]:
+                                        continue
+                                    s = float(i) * inv_p
+                                    one_m_s = 1.0 - s
+                                    scal[nid] = (
+                                        (one_m_s * one_m_t) * f_bl
+                                        + (s * one_m_t) * f_br
+                                        + (s * t) * f_tr
+                                        + (one_m_s * t) * f_tl
+                                    )
+                        # Do not mark newly filled nodes as "assigned"; corners still remain authoritative.
+                except Exception:
+                    # Fall back to the sparse mapping (zeros on non-DOF nodes).
+                    pass
+
             point_data[name] = scal
             continue
 
