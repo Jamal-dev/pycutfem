@@ -156,6 +156,18 @@ Notes on the chosen sloughing preset:
 - In `--case dian_paper_sloughing_gap`, growth is disabled (`k_g=0`) and detachment is disabled (`k_det=0`) by design; so there is **no sink** that would remove `alpha` mass.
 - If you want “alpha follows the chunk and leaves a true void”, the preset’s intended choice is `--alpha-from-refmap` (transport `alpha(x,t)=alpha0(x-u)`), not solving an Allen–Cahn/Cahn–Hilliard PDE for `alpha`.
 
+Why does `alpha_area` (and sometimes `int_alpha`) increase?
+- `alpha_area` in the log is **not** the domain area of `alpha>0.5`. It is the *bottom-wall contact measure*
+  \[
+    \alpha_{\text{area}} := \int_{\Gamma_{\text{wall}}} \alpha \, ds
+  \]
+  assembled in `examples/utils/biofilm/adhesion.py` (used to normalize the RMS shear). As the diffuse interface spreads or more of the wall has `alpha>0`, this number can increase even if the total mass is unchanged.
+- Naming: `--alpha-cahn-*` is **Allen–Cahn** regularization; true **Cahn–Hilliard** is `--alpha-ch-*`.
+- In the reported run, `int_alpha := ∫_Ω α dx` also increases significantly (e.g. step 1: `6.982e-07` vs step 178: `9.577e-07` in `examples/biofilms/results/dian_paper_sloughing_gap_fix_base_ch/run.log`). This is **not** a ParaView artifact: these integrals are assembled from the FE solution in the driver.
+- Root cause (before fix): when you solve `alpha` (`--no-freeze-alpha --no-alpha-from-refmap`) the transport term was written in **non-conservative advective form** `vS·∇α`. If `div(vS)≠0` (common in the poro/mixture setting) then `∫_Ω α dx` drifts even with no boundary flux. The conservative Allen–Cahn constraint only constrains the Allen–Cahn regularization part, not this advection term.
+- Fix (implemented): the alpha transport now uses the conservative form `div(α vS)` (implemented as `vS·∇α + α div(vS)` for backend robustness) in `examples/utils/biofilm/one_domain.py`. With `k_det=0`, `k_g=0`, and no boundary flux, this removes the systematic mass drift.
+- Remaining safety net: keep `--conserve-alpha` enabled if you want to enforce `int_alpha(t)=int_alpha(0)` exactly in long runs despite discretization errors and/or any boundary flux.
+
 VTK gotcha (important for interpretation):
 - Many of these sloughing runs use a Q2 geometry mesh with Q1 scalars (`alpha,phi,d,a,p,…`). If you export Q1 scalars naively as point data on the Q2 nodes, you will create spurious zeros on mid-edge nodes and ParaView can show misleading patterns.
 - Fix (implemented): `pycutfem/io/vtk.py` now upsamples Q1-on-Qp quad scalars to all mesh nodes by bilinear interpolation of the element corner values, so point-data fields like `alpha` and `d` are meaningful in ParaView.

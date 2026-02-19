@@ -1456,8 +1456,15 @@ def build_biofilm_one_domain_forms(
     # Surface-localized erosion/detachment sink is -D_det_prev δ(α) on the RHS,
     # so it enters the residual with a + sign (same convention as the X source).
     surf_coef_prev = D_det_prev + crack_coef_prev
-    f_alpha_k += th * (dot(grad(alpha_k), vS_k) - G_k * alpha_k * _one_minus(alpha_k) + surf_coef_prev * delta_k)
-    f_alpha_k += one_m_th * (dot(grad(alpha_n), vS_n) - G_n * alpha_n * _one_minus(alpha_n) + surf_coef_prev * delta_n)
+    # Conservative advection: ∂t α + div(α vS) = ...  ⇔  ∂t α + vS·∇α + α div(vS) = ...
+    #
+    # NOTE: using the expanded form avoids assembling div(α vS) directly (which would
+    # involve products not represented in a single FE space) while restoring correct
+    # mass balance when div(vS)≠0.
+    adv_alpha_k = dot(grad(alpha_k), vS_k) + alpha_k * div_vS_k
+    adv_alpha_n = dot(grad(alpha_n), vS_n) + alpha_n * div_vS_n
+    f_alpha_k += th * (adv_alpha_k - G_k * alpha_k * _one_minus(alpha_k) + surf_coef_prev * delta_k)
+    f_alpha_k += one_m_th * (adv_alpha_n - G_n * alpha_n * _one_minus(alpha_n) + surf_coef_prev * delta_n)
 
     r_alpha = alpha_test * f_alpha_k * dx
     r_alpha += D_alpha_c * inner(grad(alpha_k), grad(alpha_test)) * dx
@@ -1574,7 +1581,9 @@ def build_biofilm_one_domain_forms(
     dalpha_logistic = _one_minus(_c(2.0) * alpha_k) * dalpha
 
     a_alpha = alpha_test * (dalpha * inv_dt) * dx
-    a_alpha += alpha_test * th * (dot(grad(alpha_k), dvS) + dot(grad(dalpha), vS_k)) * dx
+    a_alpha += alpha_test * th * (
+        dot(grad(alpha_k), dvS) + dot(grad(dalpha), vS_k) + dalpha * div_vS_k + alpha_k * div_dvS
+    ) * dx
     # δ[ (D_det_prev + crack_coef_prev) * δ(α) ] = (D_det_prev + crack_coef_prev) * δ'(α) δα
     # (surf coefficients are lagged).
     d_delta_k = _c(4.0) * (_one_minus(_c(2.0) * alpha_k)) * dalpha
@@ -1650,6 +1659,8 @@ def build_biofilm_one_domain_forms(
         df_alpha_k += th * (
             dot(grad(alpha_k), dvS)
             + dot(grad(dalpha), vS_k)
+            + dalpha * div_vS_k
+            + alpha_k * div_dvS
             - (dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic)
             + d_surf
         )
