@@ -101,6 +101,8 @@ def _run_one(
             "v_x": 2,
             "v_y": 2,
             "p": 1,
+            "vS_x": 2,
+            "vS_y": 2,
             "u_x": 2,
             "u_y": 2,
             "phi": 1,
@@ -112,9 +114,11 @@ def _run_one(
     dh = DofHandler(me, method="cg")
 
     V = FunctionSpace("V", ["v_x", "v_y"], dim=1)
+    VS = FunctionSpace("VS", ["vS_x", "vS_y"], dim=1)
     U = FunctionSpace("U", ["u_x", "u_y"], dim=1)
 
     dv = VectorTrialFunction(space=V, dof_handler=dh)
+    dvS = VectorTrialFunction(space=VS, dof_handler=dh)
     du = VectorTrialFunction(space=U, dof_handler=dh)
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
@@ -123,6 +127,7 @@ def _run_one(
     dX = TrialFunction("X", dof_handler=dh)
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
+    vS_test = VectorTestFunction(space=VS, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
     q_test = TestFunction("p", dof_handler=dh)
     phi_test = TestFunction("phi", dof_handler=dh)
@@ -133,6 +138,7 @@ def _run_one(
     # Unknowns (k) and previous state (n)
     v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
+    vS_k = VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh)
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
@@ -141,6 +147,7 @@ def _run_one(
 
     v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
     p_n = Function("p_n", "p", dof_handler=dh)
+    vS_n = VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh)
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
@@ -171,6 +178,7 @@ def _run_one(
     # Initial condition at t=0
     t0 = 0.0
     v_n.set_values_from_function(lambda x, y: mms.v(x, y, t0))
+    vS_n.set_values_from_function(lambda x, y: np.asarray(mms.vS(float(t0)), dtype=float))
     u_n.set_values_from_function(lambda x, y: mms.u(x, y, t0))
     p_n.set_values_from_function(lambda x, y: float(mms.p(x, y, t0)))
     phi_n.set_values_from_function(lambda x, y: float(mms.phi(x, y, t0)))
@@ -192,6 +200,7 @@ def _run_one(
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
         p_k=p_k,
+        vS_k=vS_k,
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
@@ -199,6 +208,7 @@ def _run_one(
         X_k=X_k,
         v_n=v_n,
         p_n=p_n,
+        vS_n=vS_n,
         u_n=u_n,
         phi_n=phi_n,
         alpha_n=alpha_n,
@@ -206,6 +216,7 @@ def _run_one(
         X_n=X_n,
         dv=dv,
         dp=dp,
+        dvS=dvS,
         du=du,
         dphi=dphi,
         dalpha=dalpha,
@@ -213,6 +224,7 @@ def _run_one(
         dX=dX,
         v_test=v_test,
         q_test=q_test,
+        vS_test=vS_test,
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,
@@ -260,6 +272,8 @@ def _run_one(
                 BoundaryCondition("v_x", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.v(x, y, t)[..., 0])),
                 BoundaryCondition("v_y", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.v(x, y, t)[..., 1])),
                 BoundaryCondition("p", "dirichlet", tag, _as_float_time(mms.p)),
+                BoundaryCondition("vS_x", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.vS(float(t))[0])),
+                BoundaryCondition("vS_y", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.vS(float(t))[1])),
                 BoundaryCondition("u_x", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.u(x, y, t)[..., 0])),
                 BoundaryCondition("u_y", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.u(x, y, t)[..., 1])),
                 BoundaryCondition("phi", "dirichlet", tag, _as_float_time(mms.phi)),
@@ -299,6 +313,13 @@ def _run_one(
             quad_order=int(qerr),
             relative=False,
         )
+        err_vS = dh.l2_error(
+            vS_k,
+            exact={"vS_x": lambda x, y: mms.vS(float(t_err))[0], "vS_y": lambda x, y: mms.vS(float(t_err))[1]},
+            fields=["vS_x", "vS_y"],
+            quad_order=int(qerr),
+            relative=False,
+        )
         err_phi = dh.l2_error(phi_k, exact={"phi": lambda x, y: mms.phi(x, y, t_err)}, fields=["phi"], quad_order=int(qerr), relative=False)
         err_alpha = dh.l2_error(alpha_k, exact={"alpha": lambda x, y: mms.alpha(x, y, t_err)}, fields=["alpha"], quad_order=int(qerr), relative=False)
         err_u = dh.l2_error(
@@ -308,13 +329,22 @@ def _run_one(
             quad_order=int(qerr),
             relative=False,
         )
-        step_rows.append({"dt": float(solver._current_dt), "err_v": float(err_v), "err_u": float(err_u), "err_phi": float(err_phi), "err_alpha": float(err_alpha)})
+        step_rows.append(
+            {
+                "dt": float(solver._current_dt),
+                "err_v": float(err_v),
+                "err_vS": float(err_vS),
+                "err_u": float(err_u),
+                "err_phi": float(err_phi),
+                "err_alpha": float(err_alpha),
+            }
+        )
         if vtk_dir_run is not None and (step_no % vtk_every == 0):
             export_vtk(
                 os.path.join(vtk_dir_run, f"step={step_no:04d}.vtu"),
                 mesh,
                 dh,
-                {"v": v_k, "p": p_k, "u": u_k, "phi": phi_k, "alpha": alpha_k, "S": S_k, "X": X_k},
+                {"v": v_k, "p": p_k, "vS": vS_k, "u": u_k, "phi": phi_k, "alpha": alpha_k, "S": S_k, "X": X_k},
             )
 
     solver = NewtonSolver(
@@ -333,8 +363,8 @@ def _run_one(
     solver_ref["solver"] = solver
 
     solver.solve_time_interval(
-        functions=[v_k, p_k, u_k, phi_k, alpha_k, S_k, X_k],
-        prev_functions=[v_n, p_n, u_n, phi_n, alpha_n, S_n, X_n],
+        functions=[v_k, p_k, vS_k, u_k, phi_k, alpha_k, S_k, X_k],
+        prev_functions=[v_n, p_n, vS_n, u_n, phi_n, alpha_n, S_n, X_n],
         aux_functions={"dt": dt_c},
         time_params=TimeStepperParameters(dt=float(dt_val), final_time=float(nsteps) * float(dt_val), max_steps=int(nsteps), theta=1.0, t0=t0),
     )
@@ -355,6 +385,8 @@ def _run_one(
         "eps": float(eps),
         "ev_max": _agg_max("err_v"),
         "ev_l2t": _agg_l2("err_v"),
+        "evS_max": _agg_max("err_vS"),
+        "evS_l2t": _agg_l2("err_vS"),
         "eu_max": _agg_max("err_u"),
         "eu_l2t": _agg_l2("err_u"),
         "ephi_max": _agg_max("err_phi"),
@@ -448,6 +480,7 @@ def main() -> None:
     for r in rows:
         row = dict(r)
         row["eoc_ev_l2t"] = float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["ev_l2t"], r["ev_l2t"])
+        row["eoc_evS_l2t"] = float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["evS_l2t"], r["evS_l2t"])
         row["eoc_ealpha_l2t"] = float("nan") if prev is None else _eoc(prev["h"], r["h"], prev["ealpha_l2t"], r["ealpha_l2t"])
         table_rows.append(row)
         prev = r

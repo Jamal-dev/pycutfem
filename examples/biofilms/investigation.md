@@ -189,6 +189,95 @@ If the run still stalls on your machine:
 Checkpointing reminder:
 - `--dump-state-every` does **nothing** unless `--dump-state` (or env `PYCUTFEM_DUMP_STATE=1`) is enabled.
 
+### E5. VTK “σ\_vm > 40 everywhere but no damage”: what it means (and why it’s expected here)
+
+The dataset `examples/biofilms/results/dian_paper_sloughing_gap_fix_base_ch_2/solution_*.vtu` shows that `sigma_vm` is above `40` Pa in most of the biofilm (`alpha>0.5`), but the bulk damage `d` remains moderate and localized.
+
+This is **not** a ParaView artifact. It is a consequence of the **phase-field fracture** formulation and the fact that this preset uses:
+- `--damage-model phase_field`
+- `--damage-pf-driver miehe_energy`
+- `--damage-stiff-split miehe` (tensile-only degradation)
+
+Key points:
+- The exported `sigma_vm` is a **diagnostic**, computed as an α-weighted, mass-lumped projection of the (undamaged) Cauchy stress derived from `u` (see `solid_von_mises_mass_lumped_in_domain(...)` in `examples/utils/biofilm/adhesion.py`). It is **not** the quantity driving the phase-field damage.
+- With `damage_pf_driver=miehe_energy`, the phase-field is driven by the **tensile strain-energy density** `ψ⁺(u)` (Miehe split), stored/lagged via `H_prev` in the damage equation (`examples/utils/biofilm/one_domain.py`).
+- In AT2 fracture, damage is **not** a local “if σ>σ_cr then d=1” rule. Even for a uniform stress state, the regularization/gradient term and the fracture cost prevent “damage everywhere”. Damage tends to **localize** into a narrow band.
+
+Quantitative evidence from the VTK point-data (biofilm nodes defined by `alpha>0.5`):
+
+| step | frac(`sigma_vm>40`) | `d_max` | frac(`d>0.5`) |
+|---:|---:|---:|---:|
+| 50  | 0.953 | 0.241 | 0.000 |
+| 100 | 0.982 | 0.718 | 0.016 |
+| 140 | 0.994 | 0.650 | 0.020 |
+| 178 | 1.000 | 0.588 | 0.019 |
+| 500 | 0.903 | 0.608 | 0.035 |
+| 1000| 0.635 | 0.711 | 0.074 |
+
+If we reconstruct an *approximate* Miehe tensile energy density `ψ⁺` from the exported stress components (linear solid, 2D isotropic law), we find (same `alpha>0.5` region):
+
+- The mean `ψ⁺` is only O(10) J/m³, while the AT2 scale `G_c/ℓ` for this preset is `≈ 6.37e+01` J/m³.
+- Only a small fraction of points have `ψ⁺ > G_c/ℓ`, consistent with “`d` large only in a localized band”.
+
+So, **“σ\_vm>40” is the wrong diagnostic** for “damage should be 1 everywhere” in the current formulation; the correct diagnostic is `ψ⁺` (or the stored history `H_d_prev` if enabled).
+
+Practical ParaView tip:
+- If you want to visualize a stress that more closely matches what enters the *degraded* momentum balance, don’t plot `alpha*sigma_vm` alone. Also plot something like
+  - `alpha*(1-d)^2*sigma_vm` (very rough “effective stress” proxy),
+  - and/or `alpha*(1-d)` if you want an “intact biomass” indicator.
+
+### E6. “Detached then re-attached and stopped moving”: why this happens in `*_fix_base_*` runs
+
+Two separate effects can make the biofilm look like it detached and then re-contacted:
+
+1) `--fix-base` makes **true wall detachment impossible**
+- With `--fix-base`, the bottom-wall displacement is Dirichlet constrained (`u=0` on `Γ_b`). That means the skeleton cannot “lift off” from the wall as a rigid chunk.
+- You can still get internal cohesion loss (`d>0`) and a **low-drag / high-slip** layer (because `g_perm(d)` reduces `β`), which makes the velocity field look like there is a gap, but the base is mechanically pinned.
+
+2) Tensile-only split implies **crack closure under compression**
+- With `damage_stiff_split=miehe`, only the tensile part of the elastic response is degraded. Under compression/shear the “crack” can close and re-contact without any healing of `d`.
+- Visually this can look like “detach → reattach”, even though the phase-field is just representing a closing damaged band.
+
+Additionally (important for the “gap” preset):
+- `dian_paper_sloughing_gap` defaults to **smooth** adhesion degradation (`--k-break 20`) and a snap threshold (`--a-snap 0.05`).
+- With `dt=2e-4`, the per-step decay factor is mild (`dt*k_break = 4e-3`), so `a` can remain O(0.1–1) for many steps even when `sigma_vm` exceeds `sigma_cr`. As long as `a` is not ~0 everywhere on the wall-contact region, the chunk will remain at least partially attached.
+  - Example from `.../run.log`: at step 100, `sigma_vm[max]=3.244e+02` while `a[min,max]=[0.238,1.000]` (far from fully detached).
+
+### E7. Why `sigma_xx` (and stresses in general) become very large
+
+Large stresses (hundreds of Pa) are consistent with the current setup for three reasons:
+
+- **Base clamping** (`--fix-base`) can create large stress concentrations in shear/peel-like loading because the displacement cannot relax by sliding/lift-off.
+- The solid model in these runs is often `--solid-model linear` (small-strain). Once deformation localizes (especially near a damaged band), the small-strain approximation can produce exaggerated stresses; the driver itself warns to prefer `neo_hookean`/`hencky` for large motion.
+- The default phase-field length `ℓ = max(eps, 5e-5)` is **under-resolved** on `nx=30` (`h_x≈1.17e-4`), which promotes stress overshoots and makes damage evolution “too localized” and Newton harder.
+
+If the modeling goal is “base fails and chunk detaches and translates”, the most direct knobs are:
+- remove `--fix-base` (replace with a small gauge pin if needed),
+- make adhesion failure faster/cleaner (increase `--k-break` and/or use binary `--k-break 0` with `--a-snap`),
+- use a large-strain solid (`--solid-model hencky` or `neo_hookean`),
+- choose `--damage-l` mesh-resolved (e.g. `ℓ ≳ 2h`) and re-calibrate `G_c` from the same σ\_cr formula.
+
+### E8. `--fix-base` vs adhesion: you cannot get lift-off when the base is clamped
+
+Important practical point for interpreting sloughing runs:
+
+- `--fix-base` **strongly clamps** `u=0` on the bottom wall.
+- The wall-adhesion traction term is a spring+dashpot in `(u, vS)` (see `examples/utils/biofilm/one_domain.py`).
+
+So, if `--fix-base` is enabled, then on the bottom wall we have (by construction) `u=0` and `vS≈(u^{n+1}-u^n)/dt=0`. That makes the adhesion traction essentially **identically zero** on that boundary. In other words:
+
+> A `*_fix_base_*` run is a “clamped-base” study; it is not capable of simulating wall detachment / peel-off, even if `a(s)` degrades to 0.
+
+If the modeling goal is “adhesion fails → chunk lifts off and is transported”, then:
+- do **not** use `--fix-base`;
+- rely on the adhesion traction (with degrading `a(s)`) to provide the initial wall constraint and its release.
+
+About “prescribing solid velocity = 0 at the wall”:
+- In the current formulation `vS` is **not** a primary unknown; it is derived from `u`. So a true Dirichlet BC on `vS` is not available without switching to a `(u,w)` formulation.
+- The closest existing knobs are:
+  - strong clamp (`--fix-base`) → enforces `vS=0` but also prevents detachment;
+  - adhesion dashpot (`gamma_n/gamma_t`) → penalizes `vS` while allowing release when `a(s)→0`.
+
 ---
 
 ## Test plan (edge cases for the u-block)

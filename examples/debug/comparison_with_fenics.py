@@ -1681,16 +1681,16 @@ def run_alpha_ch_comparison():
 
 
 # ==============================================================================
-#  One-domain biofilm comparison harness (v,p,u,phi,alpha,S) vs FEniCSx
+#  One-domain biofilm comparison harness (v,p,vS,u,phi,alpha,S,X,...) vs FEniCSx
 # ==============================================================================
 
 
 def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
     """
     Build a small one-domain biofilm mixed space with optional fracture/detached blocks:
-      pycutfem: (v_x,v_y) Q2 + p Q1 + (u_x,u_y) Q2 + (phi,alpha,d,S,X) Q1
-      dolfinx : (v,p,u,phi,alpha,d,S,X) as
-                (P2_vec, P1, P2_vec, P1, P1, P1, P1, P1)
+      pycutfem: (v_x,v_y) Q2 + p Q1 + (vS_x,vS_y) Q2 + (u_x,u_y) Q2 + (phi,alpha,d,S,X) Q1
+      dolfinx : (v,p,vS,u,phi,alpha,d,S,X) as
+                (P2_vec, P1, P2_vec, P2_vec, P1, P1, P1, P1, P1)
     """
     # --- pycutfem mesh (Q2 geometry so dof coordinates match dolfinx P2 coords) ---
     nodes_q2, elems_q2, _, corners_q2 = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
@@ -1703,6 +1703,15 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
     )
     mesh_q2.tag_boundary_edges({"all": lambda x, y: True})
 
+    # Parameters (keep in sync with the unit tests and FEniCSx constants below).
+    dt_val = float(os.environ.get("COMP_FENICS_DT", "0.1"))
+    theta_val = float(os.environ.get("COMP_FENICS_THETA", "0.5"))
+    alpha_ch_M_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_M", "0.0"))
+    alpha_ch_gamma_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_GAMMA", "0.0"))
+    alpha_ch_eps_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_EPS", "0.1"))
+    alpha_ch_mobility = str(os.environ.get("COMP_FENICS_ALPHA_CH_MOBILITY", "constant"))
+    alpha_ch_enabled = (alpha_ch_M_val != 0.0) and (alpha_ch_gamma_val != 0.0)
+
     # Keep field insertion order stable (matches DofHandler ordering).
     mixed_element_pc = MixedElement(
         mesh_q2,
@@ -1710,6 +1719,8 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
             "v_x": 2,
             "v_y": 2,
             "p": 1,
+            "vS_x": 2,
+            "vS_y": 2,
             "u_x": 2,
             "u_y": 2,
             "phi": 1,
@@ -1723,21 +1734,14 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
     dof_handler_pc = DofHandler(mixed_element_pc, method="cg")
 
     Vv_pc = FunctionSpace("v", ["v_x", "v_y"], dim=1)
+    VvS_pc = FunctionSpace("vS", ["vS_x", "vS_y"], dim=1)
     Vu_pc = FunctionSpace("u", ["u_x", "u_y"], dim=1)
-
-    # Parameters (keep in sync with the unit tests and FEniCSx constants below).
-    dt_val = float(os.environ.get("COMP_FENICS_DT", "0.1"))
-    theta_val = float(os.environ.get("COMP_FENICS_THETA", "0.5"))
-    alpha_ch_M_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_M", "0.0"))
-    alpha_ch_gamma_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_GAMMA", "0.0"))
-    alpha_ch_eps_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_EPS", "0.1"))
-    alpha_ch_mobility = str(os.environ.get("COMP_FENICS_ALPHA_CH_MOBILITY", "constant"))
-    alpha_ch_enabled = (alpha_ch_M_val != 0.0) and (alpha_ch_gamma_val != 0.0)
 
     pc = {
         # trial/test
         "dv": VectorTrialFunction(Vv_pc, dof_handler=dof_handler_pc),
         "dp": TrialFunction("p", dof_handler=dof_handler_pc),
+        "dvS": VectorTrialFunction(VvS_pc, dof_handler=dof_handler_pc),
         "du": VectorTrialFunction(Vu_pc, dof_handler=dof_handler_pc),
         "dphi": TrialFunction("phi", dof_handler=dof_handler_pc),
         "dalpha": TrialFunction("alpha", dof_handler=dof_handler_pc),
@@ -1747,6 +1751,7 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         "dX": TrialFunction("X", dof_handler=dof_handler_pc),
         "w": VectorTestFunction(Vv_pc, dof_handler=dof_handler_pc),
         "q": TestFunction("p", dof_handler=dof_handler_pc),
+        "eta_vS": VectorTestFunction(VvS_pc, dof_handler=dof_handler_pc),
         "eta": VectorTestFunction(Vu_pc, dof_handler=dof_handler_pc),
         "zeta": TestFunction("phi", dof_handler=dof_handler_pc),
         "xi": TestFunction("alpha", dof_handler=dof_handler_pc),
@@ -1757,6 +1762,7 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         # states at k (t_{n+1})
         "v_k": VectorFunction(name="v_k", field_names=["v_x", "v_y"], dof_handler=dof_handler_pc),
         "p_k": Function(name="p_k", field_name="p", dof_handler=dof_handler_pc),
+        "vS_k": VectorFunction(name="vS_k", field_names=["vS_x", "vS_y"], dof_handler=dof_handler_pc),
         "u_k": VectorFunction(name="u_k", field_names=["u_x", "u_y"], dof_handler=dof_handler_pc),
         "phi_k": Function(name="phi_k", field_name="phi", dof_handler=dof_handler_pc),
         "alpha_k": Function(name="alpha_k", field_name="alpha", dof_handler=dof_handler_pc),
@@ -1767,8 +1773,8 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         # states at n (t_n)
         "v_n": VectorFunction(name="v_n", field_names=["v_x", "v_y"], dof_handler=dof_handler_pc),
         "p_n": Function(name="p_n", field_name="p", dof_handler=dof_handler_pc),
+        "vS_n": VectorFunction(name="vS_n", field_names=["vS_x", "vS_y"], dof_handler=dof_handler_pc),
         "u_n": VectorFunction(name="u_n", field_names=["u_x", "u_y"], dof_handler=dof_handler_pc),
-        "u_nm1": VectorFunction(name="u_nm1", field_names=["u_x", "u_y"], dof_handler=dof_handler_pc),
         "phi_n": Function(name="phi_n", field_name="phi", dof_handler=dof_handler_pc),
         "alpha_n": Function(name="alpha_n", field_name="alpha", dof_handler=dof_handler_pc),
         "mu_alpha_n": Function(name="mu_alpha_n", field_name="mu_alpha", dof_handler=dof_handler_pc) if alpha_ch_enabled else None,
@@ -1821,11 +1827,11 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
     P2_vec = basix.ufl.element("Lagrange", "quadrilateral", 2, shape=(gdim,))
     P1 = basix.ufl.element("Lagrange", "quadrilateral", 1)
     if alpha_ch_enabled:
-        # W = (v, p, u, phi, alpha, mu_alpha, d, S, X)
-        W_el = mixed_element([P2_vec, P1, P2_vec, P1, P1, P1, P1, P1, P1])
+        # W = (v, p, vS, u, phi, alpha, mu_alpha, d, S, X)
+        W_el = mixed_element([P2_vec, P1, P2_vec, P2_vec, P1, P1, P1, P1, P1, P1])
     else:
-        # W = (v, p, u, phi, alpha, d, S, X)
-        W_el = mixed_element([P2_vec, P1, P2_vec, P1, P1, P1, P1, P1])
+        # W = (v, p, vS, u, phi, alpha, d, S, X)
+        W_el = mixed_element([P2_vec, P1, P2_vec, P2_vec, P1, P1, P1, P1, P1])
     W = dolfinx.fem.functionspace(mesh_fx, W_el)
 
     fenicsx = {
@@ -1867,7 +1873,6 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         # states (mixed)
         "w_k": dolfinx.fem.Function(W, name="w_k"),
         "w_n": dolfinx.fem.Function(W, name="w_n"),
-        "w_nm1": dolfinx.fem.Function(W, name="w_nm1"),
     }
 
     return pc, dof_handler_pc, fenicsx
@@ -1876,23 +1881,24 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
 def create_true_dof_map_biofilm(dof_handler_pc: DofHandler, W_fenicsx, *, include_mu_alpha: bool = False):
     print("=" * 70)
     if include_mu_alpha:
-        print("Discovering biofilm DoF map (v,p,u,phi,alpha,mu_alpha,d,S,X) by matching DoF coordinates...")
+        print("Discovering biofilm DoF map (v,p,vS,u,phi,alpha,mu_alpha,d,S,X) by matching DoF coordinates...")
     else:
-        print("Discovering biofilm DoF map (v,p,u,phi,alpha,d,S,X) by matching DoF coordinates...")
+        print("Discovering biofilm DoF map (v,p,vS,u,phi,alpha,d,S,X) by matching DoF coordinates...")
     print("=" * 70)
 
-    # fenics: W = (v, p, u, phi, alpha, [mu_alpha], d, S, X)
+    # fenics: W = (v, p, vS, u, phi, alpha, [mu_alpha], d, S, X)
     Wv, Vv_map = W_fenicsx.sub(0).collapse()
     Wp, P_map_fx = W_fenicsx.sub(1).collapse()
-    Wu, Vu_map = W_fenicsx.sub(2).collapse()
-    Wphi, Phi_map_fx = W_fenicsx.sub(3).collapse()
-    Walpha, Alpha_map_fx = W_fenicsx.sub(4).collapse()
+    WvS, VvS_map = W_fenicsx.sub(2).collapse()
+    Wu, Vu_map = W_fenicsx.sub(3).collapse()
+    Wphi, Phi_map_fx = W_fenicsx.sub(4).collapse()
+    Walpha, Alpha_map_fx = W_fenicsx.sub(5).collapse()
     if include_mu_alpha:
-        Wmu_alpha, Mu_map_fx = W_fenicsx.sub(5).collapse()
-        d_idx = 6
+        Wmu_alpha, Mu_map_fx = W_fenicsx.sub(6).collapse()
+        d_idx = 7
     else:
         Wmu_alpha, Mu_map_fx = None, None
-        d_idx = 5
+        d_idx = 6
     s_idx = d_idx + 1
     x_idx = d_idx + 2
     Wd, D_map_fx = W_fenicsx.sub(d_idx).collapse()
@@ -1901,6 +1907,8 @@ def create_true_dof_map_biofilm(dof_handler_pc: DofHandler, W_fenicsx, *, includ
 
     Wv0, Vv0_map = Wv.sub(0).collapse()
     Wv1, Vv1_map = Wv.sub(1).collapse()
+    WvS0, VvS0_map = WvS.sub(0).collapse()
+    WvS1, VvS1_map = WvS.sub(1).collapse()
     Wu0, Vu0_map = Wu.sub(0).collapse()
     Wu1, Vu1_map = Wu.sub(1).collapse()
 
@@ -1908,6 +1916,8 @@ def create_true_dof_map_biofilm(dof_handler_pc: DofHandler, W_fenicsx, *, includ
         "v_x": Wv0.tabulate_dof_coordinates()[:, :2],
         "v_y": Wv1.tabulate_dof_coordinates()[:, :2],
         "p": Wp.tabulate_dof_coordinates()[:, :2],
+        "vS_x": WvS0.tabulate_dof_coordinates()[:, :2],
+        "vS_y": WvS1.tabulate_dof_coordinates()[:, :2],
         "u_x": Wu0.tabulate_dof_coordinates()[:, :2],
         "u_y": Wu1.tabulate_dof_coordinates()[:, :2],
         "phi": Wphi.tabulate_dof_coordinates()[:, :2],
@@ -1921,6 +1931,8 @@ def create_true_dof_map_biofilm(dof_handler_pc: DofHandler, W_fenicsx, *, includ
         "v_x": np.array(Vv_map)[np.array(Vv0_map)],
         "v_y": np.array(Vv_map)[np.array(Vv1_map)],
         "p": np.array(P_map_fx),
+        "vS_x": np.array(VvS_map)[np.array(VvS0_map)],
+        "vS_y": np.array(VvS_map)[np.array(VvS1_map)],
         "u_x": np.array(Vu_map)[np.array(Vu0_map)],
         "u_y": np.array(Vu_map)[np.array(Vu1_map)],
         "phi": np.array(Phi_map_fx),
@@ -1931,7 +1943,7 @@ def create_true_dof_map_biofilm(dof_handler_pc: DofHandler, W_fenicsx, *, includ
         "X": np.array(X_map_fx),
     }
 
-    pc_fields = ["v_x", "v_y", "p", "u_x", "u_y", "phi", "alpha"]
+    pc_fields = ["v_x", "v_y", "p", "vS_x", "vS_y", "u_x", "u_y", "phi", "alpha"]
     if include_mu_alpha:
         pc_fields.append("mu_alpha")
     pc_fields.extend(["d", "S", "X"])
@@ -1944,6 +1956,11 @@ def create_true_dof_map_biofilm(dof_handler_pc: DofHandler, W_fenicsx, *, includ
     coord_map_v = one_to_one_map_coords(pc_coords["v_x"], fx_coords["v_x"])
     P[pc_dofs["v_x"]] = fx_dofs["v_x"][coord_map_v]
     P[pc_dofs["v_y"]] = fx_dofs["v_y"][coord_map_v]
+
+    # vS_x and vS_y share coordinates in vector Q2 space
+    coord_map_vS = one_to_one_map_coords(pc_coords["vS_x"], fx_coords["vS_x"])
+    P[pc_dofs["vS_x"]] = fx_dofs["vS_x"][coord_map_vS]
+    P[pc_dofs["vS_y"]] = fx_dofs["vS_y"][coord_map_vS]
 
     # u_x and u_y share coordinates in vector Q2 space
     coord_map_u = one_to_one_map_coords(pc_coords["u_x"], fx_coords["u_x"])
@@ -1962,9 +1979,9 @@ def create_true_dof_map_biofilm(dof_handler_pc: DofHandler, W_fenicsx, *, includ
 
 def initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, *, include_mu_alpha: bool = False):
     if include_mu_alpha:
-        print("Initializing biofilm (v,p,u,phi,alpha,mu_alpha,d,S,X) functions in pycutfem and FEniCSx...")
+        print("Initializing biofilm (v,p,vS,u,phi,alpha,mu_alpha,d,S,X) functions in pycutfem and FEniCSx...")
     else:
-        print("Initializing biofilm (v,p,u,phi,alpha,d,S,X) functions in pycutfem and FEniCSx...")
+        print("Initializing biofilm (v,p,vS,u,phi,alpha,d,S,X) functions in pycutfem and FEniCSx...")
 
     # Vector fields (Q2)
     def v_k_init(x):
@@ -1974,6 +1991,13 @@ def initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, *, include_
         vv = v_k_init(x)
         return [0.7 * vv[0], 0.7 * vv[1]]
 
+    def vS_k_init(x):
+        return [0.06 + 0.01 * x[0] - 0.03 * x[1], -0.02 + 0.02 * x[0] + 0.01 * x[1]]
+
+    def vS_n_init(x):
+        vv = vS_k_init(x)
+        return [0.6 * vv[0], 0.6 * vv[1]]
+
     def u_k_init(x):
         # keep gradients small
         return [0.02 * x[0] * (1.0 - x[0]) + 0.01 * x[1], -0.01 * x[1] * (1.0 - x[1]) + 0.005 * x[0]]
@@ -1981,10 +2005,6 @@ def initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, *, include_
     def u_n_init(x):
         uu = u_k_init(x)
         return [0.6 * uu[0], 0.6 * uu[1]]
-
-    def u_nm1_init(x):
-        uu = u_k_init(x)
-        return [0.2 * uu[0], 0.2 * uu[1]]
 
     # Scalar fields (Q1) – keep in safe ranges
     def p_k_init(x):
@@ -2032,9 +2052,10 @@ def initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, *, include_
     # --- pycutfem ---
     pc["v_k"].set_values_from_function(lambda x, y: v_k_init([x, y]))
     pc["v_n"].set_values_from_function(lambda x, y: v_n_init([x, y]))
+    pc["vS_k"].set_values_from_function(lambda x, y: vS_k_init([x, y]))
+    pc["vS_n"].set_values_from_function(lambda x, y: vS_n_init([x, y]))
     pc["u_k"].set_values_from_function(lambda x, y: u_k_init([x, y]))
     pc["u_n"].set_values_from_function(lambda x, y: u_n_init([x, y]))
-    pc["u_nm1"].set_values_from_function(lambda x, y: u_nm1_init([x, y]))
     pc["p_k"].set_values_from_function(lambda x, y: p_k_init([x, y]))
     pc["p_n"].set_values_from_function(lambda x, y: p_n_init([x, y]))
     pc["phi_k"].set_values_from_function(lambda x, y: phi_k_init([x, y]))
@@ -2055,19 +2076,19 @@ def initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, *, include_
     W = fenicsx["W"]
     w_k = fenicsx["w_k"]
     w_n = fenicsx["w_n"]
-    w_nm1 = fenicsx["w_nm1"]
 
     Wv, Vv_to_W = W.sub(0).collapse()
     Wp, P_to_W = W.sub(1).collapse()
-    Wu, Vu_to_W = W.sub(2).collapse()
-    Wphi, Phi_to_W = W.sub(3).collapse()
-    Walpha, Alpha_to_W = W.sub(4).collapse()
+    WvS, VvS_to_W = W.sub(2).collapse()
+    Wu, Vu_to_W = W.sub(3).collapse()
+    Wphi, Phi_to_W = W.sub(4).collapse()
+    Walpha, Alpha_to_W = W.sub(5).collapse()
     if include_mu_alpha:
-        Wmu_alpha, Mu_to_W = W.sub(5).collapse()
-        d_idx = 6
+        Wmu_alpha, Mu_to_W = W.sub(6).collapse()
+        d_idx = 7
     else:
         Wmu_alpha, Mu_to_W = None, None
-        d_idx = 5
+        d_idx = 6
     s_idx = d_idx + 1
     x_idx = d_idx + 2
     Wd, D_to_W = W.sub(d_idx).collapse()
@@ -2076,11 +2097,12 @@ def initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, *, include_
 
     w_k.x.array[Vv_to_W] = w_k.sub(0).debug_interpolate(v_k_init)
     w_k.x.array[P_to_W] = w_k.sub(1).debug_interpolate(p_k_init)
-    w_k.x.array[Vu_to_W] = w_k.sub(2).debug_interpolate(u_k_init)
-    w_k.x.array[Phi_to_W] = w_k.sub(3).debug_interpolate(phi_k_init)
-    w_k.x.array[Alpha_to_W] = w_k.sub(4).debug_interpolate(alpha_k_init)
+    w_k.x.array[VvS_to_W] = w_k.sub(2).debug_interpolate(vS_k_init)
+    w_k.x.array[Vu_to_W] = w_k.sub(3).debug_interpolate(u_k_init)
+    w_k.x.array[Phi_to_W] = w_k.sub(4).debug_interpolate(phi_k_init)
+    w_k.x.array[Alpha_to_W] = w_k.sub(5).debug_interpolate(alpha_k_init)
     if include_mu_alpha:
-        w_k.x.array[Mu_to_W] = w_k.sub(5).debug_interpolate(mu_alpha_k_init)
+        w_k.x.array[Mu_to_W] = w_k.sub(6).debug_interpolate(mu_alpha_k_init)
     w_k.x.array[D_to_W] = w_k.sub(d_idx).debug_interpolate(d_k_init)
     w_k.x.array[S_to_W] = w_k.sub(s_idx).debug_interpolate(S_k_init)
     w_k.x.array[X_to_W] = w_k.sub(x_idx).debug_interpolate(X_k_init)
@@ -2088,19 +2110,16 @@ def initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, *, include_
 
     w_n.x.array[Vv_to_W] = w_n.sub(0).debug_interpolate(v_n_init)
     w_n.x.array[P_to_W] = w_n.sub(1).debug_interpolate(p_n_init)
-    w_n.x.array[Vu_to_W] = w_n.sub(2).debug_interpolate(u_n_init)
-    w_n.x.array[Phi_to_W] = w_n.sub(3).debug_interpolate(phi_n_init)
-    w_n.x.array[Alpha_to_W] = w_n.sub(4).debug_interpolate(alpha_n_init)
+    w_n.x.array[VvS_to_W] = w_n.sub(2).debug_interpolate(vS_n_init)
+    w_n.x.array[Vu_to_W] = w_n.sub(3).debug_interpolate(u_n_init)
+    w_n.x.array[Phi_to_W] = w_n.sub(4).debug_interpolate(phi_n_init)
+    w_n.x.array[Alpha_to_W] = w_n.sub(5).debug_interpolate(alpha_n_init)
     if include_mu_alpha:
-        w_n.x.array[Mu_to_W] = w_n.sub(5).debug_interpolate(mu_alpha_n_init)
+        w_n.x.array[Mu_to_W] = w_n.sub(6).debug_interpolate(mu_alpha_n_init)
     w_n.x.array[D_to_W] = w_n.sub(d_idx).debug_interpolate(d_n_init)
     w_n.x.array[S_to_W] = w_n.sub(s_idx).debug_interpolate(S_n_init)
     w_n.x.array[X_to_W] = w_n.sub(x_idx).debug_interpolate(X_n_init)
     w_n.x.scatter_forward()
-
-    # Only u_{n-1} is used by the biofilm model (through vS_n).
-    w_nm1.x.array[Vu_to_W] = w_nm1.sub(2).debug_interpolate(u_nm1_init)
-    w_nm1.x.scatter_forward()
 
     # Basic sanity: value sets match for v_k (unordered)
     np.testing.assert_allclose(np.sort(pc["v_k"].nodal_values), np.sort(w_k.x.array[Vv_to_W]), rtol=1e-8, atol=1e-12)
@@ -2121,25 +2140,19 @@ def run_biofilm_comparison():
     dw_fx = ufl.TrialFunction(W_fx)
     w_test_fx = ufl.TestFunction(W_fx)
     if include_mu_alpha:
-        dv_fx, dp_fx, du_fx, dphi_fx, dalpha_fx, dmu_alpha_fx, dd_fx, dS_fx, dX_fx = ufl.split(dw_fx)
-        w_fx, q_fx, eta_fx, zeta_fx, xi_fx, eta_mu_fx, chi_fx, r_fx, y_fx = ufl.split(w_test_fx)
+        dv_fx, dp_fx, dvS_fx, du_fx, dphi_fx, dalpha_fx, dmu_alpha_fx, dd_fx, dS_fx, dX_fx = ufl.split(dw_fx)
+        w_fx, q_fx, eta_vS_fx, eta_u_fx, zeta_fx, xi_fx, eta_mu_fx, chi_fx, r_fx, y_fx = ufl.split(w_test_fx)
 
-        v_k_fx, p_k_fx, u_k_fx, phi_k_fx, alpha_k_fx, mu_alpha_k_fx, d_k_fx, S_k_fx, X_k_fx = ufl.split(fenicsx["w_k"])
-        v_n_fx, p_n_fx, u_n_fx, phi_n_fx, alpha_n_fx, mu_alpha_n_fx, d_n_fx, S_n_fx, X_n_fx = ufl.split(fenicsx["w_n"])
-        v_nm1_fx, p_nm1_fx, u_nm1_fx, phi_nm1_fx, alpha_nm1_fx, mu_alpha_nm1_fx, d_nm1_fx, S_nm1_fx, X_nm1_fx = ufl.split(
-            fenicsx["w_nm1"]
-        )
-        _ = (v_nm1_fx, p_nm1_fx, phi_nm1_fx, alpha_nm1_fx, mu_alpha_nm1_fx, d_nm1_fx, S_nm1_fx, X_nm1_fx)  # only u_nm1 is used
+        v_k_fx, p_k_fx, vS_k_fx, u_k_fx, phi_k_fx, alpha_k_fx, mu_alpha_k_fx, d_k_fx, S_k_fx, X_k_fx = ufl.split(fenicsx["w_k"])
+        v_n_fx, p_n_fx, vS_n_fx, u_n_fx, phi_n_fx, alpha_n_fx, mu_alpha_n_fx, d_n_fx, S_n_fx, X_n_fx = ufl.split(fenicsx["w_n"])
     else:
-        dv_fx, dp_fx, du_fx, dphi_fx, dalpha_fx, dd_fx, dS_fx, dX_fx = ufl.split(dw_fx)
-        w_fx, q_fx, eta_fx, zeta_fx, xi_fx, chi_fx, r_fx, y_fx = ufl.split(w_test_fx)
+        dv_fx, dp_fx, dvS_fx, du_fx, dphi_fx, dalpha_fx, dd_fx, dS_fx, dX_fx = ufl.split(dw_fx)
+        w_fx, q_fx, eta_vS_fx, eta_u_fx, zeta_fx, xi_fx, chi_fx, r_fx, y_fx = ufl.split(w_test_fx)
         dmu_alpha_fx = None
         eta_mu_fx = None
 
-        v_k_fx, p_k_fx, u_k_fx, phi_k_fx, alpha_k_fx, d_k_fx, S_k_fx, X_k_fx = ufl.split(fenicsx["w_k"])
-        v_n_fx, p_n_fx, u_n_fx, phi_n_fx, alpha_n_fx, d_n_fx, S_n_fx, X_n_fx = ufl.split(fenicsx["w_n"])
-        v_nm1_fx, p_nm1_fx, u_nm1_fx, phi_nm1_fx, alpha_nm1_fx, d_nm1_fx, S_nm1_fx, X_nm1_fx = ufl.split(fenicsx["w_nm1"])
-        _ = (v_nm1_fx, p_nm1_fx, phi_nm1_fx, alpha_nm1_fx, d_nm1_fx, S_nm1_fx, X_nm1_fx)  # only u_nm1 is used
+        v_k_fx, p_k_fx, vS_k_fx, u_k_fx, phi_k_fx, alpha_k_fx, d_k_fx, S_k_fx, X_k_fx = ufl.split(fenicsx["w_k"])
+        v_n_fx, p_n_fx, vS_n_fx, u_n_fx, phi_n_fx, alpha_n_fx, d_n_fx, S_n_fx, X_n_fx = ufl.split(fenicsx["w_n"])
         mu_alpha_k_fx = None
         mu_alpha_n_fx = None
 
@@ -2202,10 +2215,8 @@ def run_biofilm_comparison():
         return k_g_fx * monod(S) * one_minus(phi)
 
     # Skeleton velocity (Eulerian)
-    vS_k_fx = (u_k_fx - u_n_fx) / dt_fx
-    vS_n_fx = (u_n_fx - u_nm1_fx) / dt_fx
-    div_vS_k_fx = (ufl.div(u_k_fx) - ufl.div(u_n_fx)) / dt_fx
-    div_vS_n_fx = (ufl.div(u_n_fx) - ufl.div(u_nm1_fx)) / dt_fx
+    div_vS_k_fx = ufl.div(vS_k_fx)
+    div_vS_n_fx = ufl.div(vS_n_fx)
 
     # Coefficients
     C_k_fx = capacity(alpha_k_fx, phi_k_fx)
@@ -2270,18 +2281,26 @@ def run_biofilm_comparison():
     # Mass/volume residual (expanded divergence like pycutfem; s_v=0 in this harness).
     r_mass_fx = q_fx * (theta_fx * divF_k_fx + (1.0 - theta_fx) * divF_n_fx) * dx_fx
 
+    # Solid kinematics (Eulerian reference-map constraint):
+    #   ∂_t u + vS·∇u = vS
+    Fkin_dt_fx = (u_k_fx - u_n_fx) / dt_fx
+    Fkin_adv_k_fx = ufl.dot(ufl.grad(u_k_fx), vS_k_fx) - vS_k_fx
+    Fkin_adv_n_fx = ufl.dot(ufl.grad(u_n_fx), vS_n_fx) - vS_n_fx
+    Fkin_k_fx = Fkin_dt_fx + theta_fx * Fkin_adv_k_fx + (1.0 - theta_fx) * Fkin_adv_n_fx
+    r_kin_fx = alpha_k_fx * ufl.inner(Fkin_k_fx, eta_u_fx) * dx_fx
+
     # Skeleton (linear elasticity, with pressure coupling through B and drag).
     def lin_el(u, eta):
         return 2.0 * mu_s_fx * ufl.inner(eps_fx(u), eps_fx(eta)) + lambda_s_fx * ufl.div(u) * ufl.div(eta)
 
-    r_el_k_fx = lin_el(u_k_fx, eta_fx)
-    r_el_n_fx = lin_el(u_n_fx, eta_fx)
-    div_B_eta_k_fx = B_k_fx * ufl.div(eta_fx) + ufl.dot(gradB_k_fx, eta_fx)
-    div_B_eta_n_fx = B_n_fx * ufl.div(eta_fx) + ufl.dot(gradB_n_fx, eta_fx)
+    r_el_k_fx = lin_el(u_k_fx, eta_vS_fx)
+    r_el_n_fx = lin_el(u_n_fx, eta_vS_fx)
+    div_B_eta_k_fx = B_k_fx * ufl.div(eta_vS_fx) + ufl.dot(gradB_k_fx, eta_vS_fx)
+    div_B_eta_n_fx = B_n_fx * ufl.div(eta_vS_fx) + ufl.dot(gradB_n_fx, eta_vS_fx)
     r_skel_press_k_fx = -p_k_fx * div_B_eta_k_fx
     r_skel_press_n_fx = -p_n_fx * div_B_eta_n_fx
-    r_skel_drag_k_fx = -beta_k_fx * ufl.dot(v_k_fx - vS_k_fx, eta_fx)
-    r_skel_drag_n_fx = -beta_n_fx * ufl.dot(v_n_fx - vS_n_fx, eta_fx)
+    r_skel_drag_k_fx = -beta_k_fx * ufl.dot(v_k_fx - vS_k_fx, eta_vS_fx)
+    r_skel_drag_n_fx = -beta_n_fx * ufl.dot(v_n_fx - vS_n_fx, eta_vS_fx)
     r_skeleton_fx = (
         theta_fx * alpha_k_fx * (g_stiff_k_fx * r_el_k_fx)
         + (1.0 - theta_fx) * alpha_n_fx * (g_stiff_n_fx * r_el_n_fx)
@@ -2406,7 +2425,7 @@ def run_biofilm_comparison():
     r_X_fx += D_X_fx * (1.0 - theta_fx) * ufl.dot(ufl.grad(X_n_fx), ufl.grad(y_fx)) * dx_fx
     r_X_fx += -y_fx * (theta_fx * R_det_k_fx + (1.0 - theta_fx) * R_det_n_fx) * dx_fx
 
-    r_total_fx = r_mom_fx + r_mass_fx + r_skeleton_fx + r_phi_fx + r_alpha_fx + r_damage_fx + r_S_fx + r_X_fx
+    r_total_fx = r_mom_fx + r_mass_fx + r_kin_fx + r_skeleton_fx + r_phi_fx + r_alpha_fx + r_damage_fx + r_S_fx + r_X_fx
     if r_mu_alpha_fx is not None:
         r_total_fx += r_mu_alpha_fx
 
@@ -2415,6 +2434,7 @@ def run_biofilm_comparison():
     # ------------------------------------------------------------------
     a_mom_fx = ufl.derivative(r_mom_fx, fenicsx["w_k"], dw_fx)
     a_mass_fx = ufl.derivative(r_mass_fx, fenicsx["w_k"], dw_fx)
+    a_kin_fx = ufl.derivative(r_kin_fx, fenicsx["w_k"], dw_fx)
     a_skeleton_fx = ufl.derivative(r_skeleton_fx, fenicsx["w_k"], dw_fx)
     a_phi_fx = ufl.derivative(r_phi_fx, fenicsx["w_k"], dw_fx)
     a_alpha_fx = ufl.derivative(r_alpha_fx, fenicsx["w_k"], dw_fx)
@@ -2430,6 +2450,7 @@ def run_biofilm_comparison():
     forms_pc = build_biofilm_one_domain_forms(
         v_k=pc["v_k"],
         p_k=pc["p_k"],
+        vS_k=pc["vS_k"],
         u_k=pc["u_k"],
         phi_k=pc["phi_k"],
         alpha_k=pc["alpha_k"],
@@ -2439,6 +2460,7 @@ def run_biofilm_comparison():
         X_k=pc["X_k"],
         v_n=pc["v_n"],
         p_n=pc["p_n"],
+        vS_n=pc["vS_n"],
         u_n=pc["u_n"],
         phi_n=pc["phi_n"],
         alpha_n=pc["alpha_n"],
@@ -2446,9 +2468,9 @@ def run_biofilm_comparison():
         d_n=pc["d_n"],
         S_n=pc["S_n"],
         X_n=pc["X_n"],
-        u_nm1=pc["u_nm1"],
         dv=pc["dv"],
         dp=pc["dp"],
+        dvS=pc["dvS"],
         du=pc["du"],
         dphi=pc["dphi"],
         dalpha=pc["dalpha"],
@@ -2458,6 +2480,7 @@ def run_biofilm_comparison():
         dX=pc["dX"],
         v_test=pc["w"],
         q_test=pc["q"],
+        vS_test=pc["eta_vS"],
         u_test=pc["eta"],
         phi_test=pc["zeta"],
         alpha_test=pc["xi"],
@@ -2507,6 +2530,7 @@ def run_biofilm_comparison():
         # Residual pieces
         "Biofilm momentum (res)": {"pc": forms_pc.r_momentum, "fx": r_mom_fx, "mat": False},
         "Biofilm mass (res)": {"pc": forms_pc.r_mass, "fx": r_mass_fx, "mat": False},
+        "Biofilm kinematics (res)": {"pc": forms_pc.r_kinematics, "fx": r_kin_fx, "mat": False},
         "Biofilm skeleton (res)": {"pc": forms_pc.r_skeleton, "fx": r_skeleton_fx, "mat": False},
         "Biofilm phi (res)": {"pc": forms_pc.r_phi, "fx": r_phi_fx, "mat": False},
         "Biofilm alpha (res)": {"pc": forms_pc.r_alpha, "fx": r_alpha_fx, "mat": False},
@@ -2517,6 +2541,7 @@ def run_biofilm_comparison():
         # Jacobian pieces
         "Biofilm momentum (jac)": {"pc": forms_pc.a_momentum, "fx": a_mom_fx, "mat": True},
         "Biofilm mass (jac)": {"pc": forms_pc.a_mass, "fx": a_mass_fx, "mat": True},
+        "Biofilm kinematics (jac)": {"pc": forms_pc.a_kinematics, "fx": a_kin_fx, "mat": True},
         "Biofilm skeleton (jac)": {"pc": forms_pc.a_skeleton, "fx": a_skeleton_fx, "mat": True},
         "Biofilm phi (jac)": {"pc": forms_pc.a_phi, "fx": a_phi_fx, "mat": True},
         "Biofilm alpha (jac)": {"pc": forms_pc.a_alpha, "fx": a_alpha_fx, "mat": True},

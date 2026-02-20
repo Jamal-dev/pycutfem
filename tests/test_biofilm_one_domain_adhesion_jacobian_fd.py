@@ -1,5 +1,7 @@
 import numpy as np
 
+from tests.subprocess_utils import run_module_func_in_subprocess
+
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
@@ -41,13 +43,15 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
     )
     _tag_unit_square_boundaries(mesh)
 
-    # Mixed unknowns: (v,p,u,phi,alpha,S) with 2D vectors for v,u.
+    # Mixed unknowns: (v,p,vS,u,phi,alpha,S) with 2D vectors for v,vS,u.
     me = MixedElement(
         mesh,
         field_specs={
             "v_x": 2,
             "v_y": 2,
             "p": 1,
+            "vS_x": 2,
+            "vS_y": 2,
             "u_x": 2,
             "u_y": 2,
             "phi": 1,
@@ -58,9 +62,11 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
     dh = DofHandler(me, method="cg")
 
     V = FunctionSpace("V", ["v_x", "v_y"], dim=1)
+    VS = FunctionSpace("VS", ["vS_x", "vS_y"], dim=1)
     U = FunctionSpace("U", ["u_x", "u_y"], dim=1)
 
     dv = VectorTrialFunction(space=V, dof_handler=dh)
+    dvS = VectorTrialFunction(space=VS, dof_handler=dh)
     du = VectorTrialFunction(space=U, dof_handler=dh)
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
@@ -68,6 +74,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
     dS_trial = TrialFunction("S", dof_handler=dh)
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
+    vS_test = VectorTestFunction(space=VS, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
     q_test = TestFunction("p", dof_handler=dh)
     phi_test = TestFunction("phi", dof_handler=dh)
@@ -76,6 +83,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
 
     v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
+    vS_k = VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh)
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
@@ -83,13 +91,14 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
 
     v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
     p_n = Function("p_n", "p", dof_handler=dh)
+    vS_n = VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh)
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
     S_n = Function("S_n", "S", dof_handler=dh)
 
     rng = np.random.default_rng(0)
-    for vf in (v_k, u_k, v_n, u_n):
+    for vf in (v_k, vS_k, u_k, v_n, vS_n, u_n):
         vf.nodal_values[:] = 1.0e-2 * rng.standard_normal(vf.nodal_values.shape)
     for sf in (p_k, p_n):
         sf.nodal_values[:] = 1.0e-2 * rng.standard_normal(sf.nodal_values.shape)
@@ -113,24 +122,28 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
         p_k=p_k,
+        vS_k=vS_k,
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
         S_k=S_k,
         v_n=v_n,
         p_n=p_n,
+        vS_n=vS_n,
         u_n=u_n,
         phi_n=phi_n,
         alpha_n=alpha_n,
         S_n=S_n,
         dv=dv,
         dp=dp,
+        dvS=dvS,
         du=du,
         dphi=dphi,
         dalpha=dalpha,
         dS=dS_trial,
         v_test=v_test,
         q_test=q_test,
+        vS_test=vS_test,
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,
@@ -166,6 +179,8 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
         "v_x": v_k.components[0],
         "v_y": v_k.components[1],
         "p": p_k,
+        "vS_x": vS_k.components[0],
+        "vS_y": vS_k.components[1],
         "u_x": u_k.components[0],
         "u_y": u_k.components[1],
         "phi": phi_k,
@@ -176,7 +191,7 @@ def _build_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
     return dh, forms, field_to_func_k
 
 
-def test_biofilm_one_domain_adhesion_backend_parity_python_cpp():
+def _cpp_backend_parity_impl() -> None:
     dh, forms, _ = _build_problem(nx=2, ny=2, q=5)
     eq = Equation(forms.jacobian_form, forms.residual_form)
 
@@ -187,6 +202,10 @@ def test_biofilm_one_domain_adhesion_backend_parity_python_cpp():
     A_cpp = K_cpp.tocsr().toarray()
     assert np.allclose(A_py, A_cpp, rtol=1.0e-10, atol=1.0e-12)
     assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_biofilm_one_domain_adhesion_backend_parity_python_cpp():
+    run_module_func_in_subprocess(__name__, "_cpp_backend_parity_impl")
 
 
 def test_biofilm_one_domain_adhesion_jacobian_fd_consistency():
@@ -202,9 +221,9 @@ def test_biofilm_one_domain_adhesion_jacobian_fd_consistency():
         _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
         return np.asarray(R, dtype=float)
 
-    # Probe DOFs that couple into the adhesion term (u, alpha).
+    # Probe DOFs that couple into the adhesion term (u, vS, alpha).
     probes = []
-    for fld in ("u_x", "u_y", "alpha"):
+    for fld in ("u_x", "u_y", "vS_x", "alpha"):
         sl = dh.get_field_slice(fld)
         if sl:
             probes.append(int(sl[len(sl) // 2]))

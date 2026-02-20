@@ -13,8 +13,10 @@ Implementation notes
   Therefore, all forcing terms are supplied as `Analytic(callable)` without
   taking derivatives of Analytic objects inside UFL forms.
 * Forcing terms are constructed to satisfy the *discrete* residual of the
-  θ-scheme for a single step t_n -> t_k, using the same difference quotient
-  for vS_k = (u_k - u_n)/dt as the model implementation.
+  θ-scheme for a single step t_n -> t_k. The solid velocity vS is treated as a
+  primary unknown; the kinematic constraint between (u, vS) is enforced in the
+  model without a forcing term, so the manufactured (u, vS) must satisfy it
+  exactly.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ class BiofilmOneDomainMMSConvergence:
     # Time-dependent exact fields (x,y,t) -> value
     v: callable  # (x,y,t)->(...,2)
     p: callable  # (x,y,t)->(...)
+    vS: callable  # (x,y,t)->(...,2)
     u: callable  # (x,y,t)->(...,2)
     phi: callable  # (x,y,t)->(...)
     alpha: callable  # (x,y,t)->(...)
@@ -44,6 +47,7 @@ class BiofilmOneDomainMMSConvergence:
     # Snapshots at t_n and t_k (x,y)->value
     v_n: callable
     p_n: callable
+    vS_n: callable
     u_n: callable
     phi_n: callable
     alpha_n: callable
@@ -52,6 +56,7 @@ class BiofilmOneDomainMMSConvergence:
 
     v_k: callable
     p_k: callable
+    vS_k: callable
     u_k: callable
     phi_k: callable
     alpha_k: callable
@@ -232,12 +237,19 @@ def build_biofilm_one_domain_mms_trig_step(
             s * (1.0 + 0.5 * sp.cos(t)),
         ]
     )
-    u_expr = sp.Matrix(
-        [
-            s * (1.0 + 0.25 * sp.cos(t)),
-            s * (1.0 + 0.25 * sp.sin(t)),
-        ]
-    )
+    # Solid velocity vS is a primary unknown. Choose a simple constant (in space)
+    # translation velocity and an affine u that satisfies the Eulerian kinematic
+    # constraint exactly:
+    #   ∂_t u + vS·∇u = vS.
+    #
+    # With u(x,y,t) = A*[x,y] + b*(t-t_n) and vS constant, grad(u)=A and the
+    # constraint reduces to b + A*vS = vS, i.e. b = (I-A)*vS. This satisfies the
+    # discrete θ-scheme kinematics for any θ and dt (since all terms are constant
+    # over the step).
+    vS_expr = sp.Matrix([0.12, -0.08])
+    A = sp.Matrix([[0.05, 0.02], [0.02, 0.04]])
+    b = (sp.eye(2) - A) * vS_expr
+    u_expr = A * sp.Matrix([x, y]) + b * (t - sp.Float(t_n))
     p_expr = s * (1.0 + 0.3 * sp.sin(t))
 
     phi_expr = 0.7 + 0.1 * s * (1.0 + 0.2 * sp.cos(t))
@@ -247,6 +259,7 @@ def build_biofilm_one_domain_mms_trig_step(
 
     # Time-dependent lambdas
     v_t = _lambdify_vec_xyt(v_expr, x, y, t)
+    vS_t = _lambdify_vec_xyt(vS_expr, x, y, t)
     u_t = _lambdify_vec_xyt(u_expr, x, y, t)
     p_t = _lambdify_scalar_xyt(p_expr, x, y, t)
     phi_t = _lambdify_scalar_xyt(phi_expr, x, y, t)
@@ -257,15 +270,14 @@ def build_biofilm_one_domain_mms_trig_step(
     # Snapshots
     subs_n = {t: t_n}
     subs_k = {t: t_k}
-    subs_nm1 = {t: t_n - dt}
 
     v_n_expr = v_expr.subs(subs_n)
     v_k_expr = v_expr.subs(subs_k)
-    v_nm1_expr = v_expr.subs(subs_nm1)
 
     u_n_expr = u_expr.subs(subs_n)
     u_k_expr = u_expr.subs(subs_k)
-    u_nm1_expr = u_expr.subs(subs_nm1)
+    vS_n_expr = vS_expr.subs(subs_n)
+    vS_k_expr = vS_expr.subs(subs_k)
 
     p_n_expr = p_expr.subs(subs_n)
     p_k_expr = p_expr.subs(subs_k)
@@ -285,6 +297,8 @@ def build_biofilm_one_domain_mms_trig_step(
     v_k = _lambdify_vec_xy(v_k_expr, x, y)
     p_n = _lambdify_scalar_xy(p_n_expr, x, y)
     p_k = _lambdify_scalar_xy(p_k_expr, x, y)
+    vS_n = _lambdify_vec_xy(vS_n_expr, x, y)
+    vS_k = _lambdify_vec_xy(vS_k_expr, x, y)
     u_n = _lambdify_vec_xy(u_n_expr, x, y)
     u_k = _lambdify_vec_xy(u_k_expr, x, y)
     phi_n = _lambdify_scalar_xy(phi_n_expr, x, y)
@@ -295,12 +309,6 @@ def build_biofilm_one_domain_mms_trig_step(
     S_k = _lambdify_scalar_xy(S_k_expr, x, y)
     X_n = _lambdify_scalar_xy(X_n_expr, x, y)
     X_k = _lambdify_scalar_xy(X_k_expr, x, y)
-
-    # ------------------------------------------------------------------
-    # Derived quantities for the discrete step (vS via BE difference).
-    # ------------------------------------------------------------------
-    vS_k_expr = (u_k_expr - u_n_expr) / dt
-    vS_n_expr = (u_n_expr - u_nm1_expr) / dt
 
     div_vS_k_expr = _sym_div_vec(vS_k_expr, x, y)
     div_vS_n_expr = _sym_div_vec(vS_n_expr, x, y)
@@ -424,8 +432,18 @@ def build_biofilm_one_domain_mms_trig_step(
     # NOTE: In the one-domain implementation, the surface-localized erosion /
     # detachment sink is treated as a negative RHS term; therefore it enters the
     # residual with a + sign.
-    Fal_k = _sym_grad_scalar(alpha_k_expr, x, y).dot(vS_k_expr) - G_k_expr * alpha_k_expr * (1.0 - alpha_k_expr) + D_det_prev_expr * delta_k_expr
-    Fal_n = _sym_grad_scalar(alpha_n_expr, x, y).dot(vS_n_expr) - G_n_expr * alpha_n_expr * (1.0 - alpha_n_expr) + D_det_prev_expr * delta_n_expr
+    Fal_k = (
+        _sym_grad_scalar(alpha_k_expr, x, y).dot(vS_k_expr)
+        + alpha_k_expr * div_vS_k_expr
+        - G_k_expr * alpha_k_expr * (1.0 - alpha_k_expr)
+        + D_det_prev_expr * delta_k_expr
+    )
+    Fal_n = (
+        _sym_grad_scalar(alpha_n_expr, x, y).dot(vS_n_expr)
+        + alpha_n_expr * div_vS_n_expr
+        - G_n_expr * alpha_n_expr * (1.0 - alpha_n_expr)
+        + D_det_prev_expr * delta_n_expr
+    )
     f_alpha_expr = (alpha_k_expr - alpha_n_expr) / dt
     f_alpha_expr += th * Fal_k + one_m_th * Fal_n
     f_alpha_expr += -float(D_alpha) * _sym_laplacian(alpha_k_expr, x, y)
@@ -606,6 +624,7 @@ def build_biofilm_one_domain_mms_trig_step(
         theta=th,
         v=v_t,
         p=p_t,
+        vS=vS_t,
         u=u_t,
         phi=phi_t,
         alpha=alpha_t,
@@ -613,6 +632,7 @@ def build_biofilm_one_domain_mms_trig_step(
         X=X_t,
         v_n=v_n,
         p_n=p_n,
+        vS_n=vS_n,
         u_n=u_n,
         phi_n=phi_n,
         alpha_n=alpha_n,
@@ -620,6 +640,7 @@ def build_biofilm_one_domain_mms_trig_step(
         X_n=X_n,
         v_k=v_k,
         p_k=p_k,
+        vS_k=vS_k,
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,

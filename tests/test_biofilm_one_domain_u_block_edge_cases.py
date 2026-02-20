@@ -36,6 +36,8 @@ def _build_one_domain_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
             "v_x": 2,
             "v_y": 2,
             "p": 1,
+            "vS_x": 2,
+            "vS_y": 2,
             "u_x": 2,
             "u_y": 2,
             "phi": 1,
@@ -46,9 +48,11 @@ def _build_one_domain_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
     dh = DofHandler(me, method="cg")
 
     V = FunctionSpace("V", ["v_x", "v_y"], dim=1)
+    VS = FunctionSpace("VS", ["vS_x", "vS_y"], dim=1)
     U = FunctionSpace("U", ["u_x", "u_y"], dim=1)
 
     dv = VectorTrialFunction(space=V, dof_handler=dh)
+    dvS = VectorTrialFunction(space=VS, dof_handler=dh)
     du = VectorTrialFunction(space=U, dof_handler=dh)
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
@@ -56,6 +60,7 @@ def _build_one_domain_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
     dS = TrialFunction("S", dof_handler=dh)
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
+    vS_test = VectorTestFunction(space=VS, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
     q_test = UFLTestFunction("p", dof_handler=dh)
     phi_test = UFLTestFunction("phi", dof_handler=dh)
@@ -64,6 +69,7 @@ def _build_one_domain_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
 
     v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
+    vS_k = VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh)
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
@@ -71,6 +77,7 @@ def _build_one_domain_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
 
     v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
     p_n = Function("p_n", "p", dof_handler=dh)
+    vS_n = VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh)
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
@@ -83,24 +90,28 @@ def _build_one_domain_problem(*, nx: int = 2, ny: int = 2, q: int = 5):
         "q": int(q),
         "dv": dv,
         "dp": dp,
+        "dvS": dvS,
         "du": du,
         "dphi": dphi,
         "dalpha": dalpha,
         "dS": dS,
         "v_test": v_test,
         "q_test": q_test,
+        "vS_test": vS_test,
         "u_test": u_test,
         "phi_test": phi_test,
         "alpha_test": alpha_test,
         "S_test": S_test,
         "v_k": v_k,
         "p_k": p_k,
+        "vS_k": vS_k,
         "u_k": u_k,
         "phi_k": phi_k,
         "alpha_k": alpha_k,
         "S_k": S_k,
         "v_n": v_n,
         "p_n": p_n,
+        "vS_n": vS_n,
         "u_n": u_n,
         "phi_n": phi_n,
         "alpha_n": alpha_n,
@@ -133,6 +144,8 @@ def test_u_block_alpha_zero_has_l2_extension_coercivity() -> None:
     # State: trivial fields.
     prob["v_k"].nodal_values.fill(0.0)
     prob["v_n"].nodal_values.fill(0.0)
+    prob["vS_k"].nodal_values.fill(0.0)
+    prob["vS_n"].nodal_values.fill(0.0)
     prob["u_k"].nodal_values.fill(0.0)
     prob["u_n"].nodal_values.fill(0.0)
     prob["p_k"].nodal_values.fill(0.0)
@@ -147,24 +160,28 @@ def test_u_block_alpha_zero_has_l2_extension_coercivity() -> None:
     forms = build_biofilm_one_domain_forms(
         v_k=prob["v_k"],
         p_k=prob["p_k"],
+        vS_k=prob["vS_k"],
         u_k=prob["u_k"],
         phi_k=prob["phi_k"],
         alpha_k=prob["alpha_k"],
         S_k=prob["S_k"],
         v_n=prob["v_n"],
         p_n=prob["p_n"],
+        vS_n=prob["vS_n"],
         u_n=prob["u_n"],
         phi_n=prob["phi_n"],
         alpha_n=prob["alpha_n"],
         S_n=prob["S_n"],
         dv=prob["dv"],
         dp=prob["dp"],
+        dvS=prob["dvS"],
         du=prob["du"],
         dphi=prob["dphi"],
         dalpha=prob["dalpha"],
         dS=prob["dS"],
         v_test=prob["v_test"],
         q_test=prob["q_test"],
+        vS_test=prob["vS_test"],
         u_test=prob["u_test"],
         phi_test=prob["phi_test"],
         alpha_test=prob["alpha_test"],
@@ -210,14 +227,16 @@ def test_u_block_inertia_and_drag_without_elasticity_is_full_rank() -> None:
     """
     Edge case T2: no elasticity (mu_s=lambda_s=0), but alpha ≡ 1.
 
-    Expectation: inertia and/or drag provides direct (mass-like) coercivity for u
-    through vS=(u^{n+1}-u^n)/dt, so the u-u Jacobian block is full rank.
+    Expectation: the kinematic (time-derivative) block provides direct L2 coercivity
+    for u when alpha ≡ 1, so the u-u Jacobian block is full rank.
     """
     prob = _build_one_domain_problem(nx=2, ny=2, q=5)
     dh: DofHandler = prob["dh"]
 
     prob["v_k"].nodal_values.fill(0.0)
     prob["v_n"].nodal_values.fill(0.0)
+    prob["vS_k"].nodal_values.fill(0.0)
+    prob["vS_n"].nodal_values.fill(0.0)
     prob["u_k"].nodal_values.fill(0.0)
     prob["u_n"].nodal_values.fill(0.0)
     prob["p_k"].nodal_values.fill(0.0)
@@ -232,24 +251,28 @@ def test_u_block_inertia_and_drag_without_elasticity_is_full_rank() -> None:
     forms = build_biofilm_one_domain_forms(
         v_k=prob["v_k"],
         p_k=prob["p_k"],
+        vS_k=prob["vS_k"],
         u_k=prob["u_k"],
         phi_k=prob["phi_k"],
         alpha_k=prob["alpha_k"],
         S_k=prob["S_k"],
         v_n=prob["v_n"],
         p_n=prob["p_n"],
+        vS_n=prob["vS_n"],
         u_n=prob["u_n"],
         phi_n=prob["phi_n"],
         alpha_n=prob["alpha_n"],
         S_n=prob["S_n"],
         dv=prob["dv"],
         dp=prob["dp"],
+        dvS=prob["dvS"],
         du=prob["du"],
         dphi=prob["dphi"],
         dalpha=prob["dalpha"],
         dS=prob["dS"],
         v_test=prob["v_test"],
         q_test=prob["q_test"],
+        vS_test=prob["vS_test"],
         u_test=prob["u_test"],
         phi_test=prob["phi_test"],
         alpha_test=prob["alpha_test"],
@@ -304,6 +327,8 @@ def test_u_block_alpha_zero_grad_extension_with_pin_is_full_rank() -> None:
 
     prob["v_k"].nodal_values.fill(0.0)
     prob["v_n"].nodal_values.fill(0.0)
+    prob["vS_k"].nodal_values.fill(0.0)
+    prob["vS_n"].nodal_values.fill(0.0)
     prob["u_k"].nodal_values.fill(0.0)
     prob["u_n"].nodal_values.fill(0.0)
     prob["p_k"].nodal_values.fill(0.0)
@@ -318,24 +343,28 @@ def test_u_block_alpha_zero_grad_extension_with_pin_is_full_rank() -> None:
     forms = build_biofilm_one_domain_forms(
         v_k=prob["v_k"],
         p_k=prob["p_k"],
+        vS_k=prob["vS_k"],
         u_k=prob["u_k"],
         phi_k=prob["phi_k"],
         alpha_k=prob["alpha_k"],
         S_k=prob["S_k"],
         v_n=prob["v_n"],
         p_n=prob["p_n"],
+        vS_n=prob["vS_n"],
         u_n=prob["u_n"],
         phi_n=prob["phi_n"],
         alpha_n=prob["alpha_n"],
         S_n=prob["S_n"],
         dv=prob["dv"],
         dp=prob["dp"],
+        dvS=prob["dvS"],
         du=prob["du"],
         dphi=prob["dphi"],
         dalpha=prob["dalpha"],
         dS=prob["dS"],
         v_test=prob["v_test"],
         q_test=prob["q_test"],
+        vS_test=prob["vS_test"],
         u_test=prob["u_test"],
         phi_test=prob["phi_test"],
         alpha_test=prob["alpha_test"],

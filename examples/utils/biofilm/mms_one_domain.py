@@ -21,6 +21,7 @@ class BiofilmOneDomainMMS:
     # exact fields (t_n)
     v_n: callable  # (x,y)->(2,)
     p_n: callable  # (x,y)->scalar
+    vS_n: callable  # (x,y)->(2,)
     u_n: callable  # (x,y)->(2,)
     phi_n: callable  # (x,y)->scalar
     alpha_n: callable  # (x,y)->scalar
@@ -28,6 +29,7 @@ class BiofilmOneDomainMMS:
     # exact fields (t_{n+1})
     v_k: callable
     p_k: callable
+    vS_k: callable
     u_k: callable
     phi_k: callable
     alpha_k: callable
@@ -42,6 +44,8 @@ class BiofilmOneDomainMMS:
     # component-wise Dirichlet callables at t_{n+1}
     v_x: callable
     v_y: callable
+    vS_x: callable
+    vS_y: callable
     u_x: callable
     u_y: callable
     phi: callable
@@ -132,7 +136,31 @@ def build_biofilm_one_domain_mms_affine(
         return _v_shear(0.0, x, y)
 
     def u_k(x, y):
-        return dt * _v_shear(vS_amp, x, y)
+        # Choose u_k to satisfy the discrete (theta=1) Eulerian kinematic constraint:
+        #   (u_k-u_n)/dt + grad(u_k) vS_k - vS_k = 0,
+        # with vS_k(x,y)=vS_amp*[y,x] and u_n=0.
+        #
+        # With affine ansatz u_k = [c1 x + c2 y, c2 x + c1 y] this is satisfied for
+        #   c2 = (a*dt) / (1 - (a*dt)^2),  c1 = -(a*dt)^2 / (1 - (a*dt)^2),
+        # where a=vS_amp.
+        a = float(vS_amp)
+        adt = a * dt
+        denom = 1.0 - adt * adt
+        if abs(denom) <= 1.0e-12:
+            raise ValueError("Invalid MMS parameters: 1 - (vS_amp*dt_val)^2 is too small.")
+        c2 = adt / denom
+        c1 = -(adt * adt) / denom
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        ux = c1 * x + c2 * y
+        uy = c2 * x + c1 * y
+        return np.stack((ux, uy), axis=-1)
+
+    def vS_n(x, y):
+        return _v_shear(0.0, x, y)
+
+    def vS_k(x, y):
+        return _v_shear(vS_amp, x, y)
 
     def p_n(x, y):
         x = np.asarray(x, dtype=float)
@@ -265,9 +293,16 @@ def build_biofilm_one_domain_mms_affine(
         # using div(σ(u))=0 for the affine displacement used here.
         pressure = (1.0 - phik)[..., None] * grad_p
 
-        # σ(u_k) is constant for affine u_k = dt*vS_amp*[y,x].
-        s_off = 2.0 * float(mu_s) * dt * float(vS_amp)
-        sigma = np.array([[0.0, s_off], [s_off, 0.0]], dtype=float)
+        # σ(u_k) is constant for the affine u_k above (grad(u_k) constant).
+        a = float(vS_amp)
+        adt = a * dt
+        denom = 1.0 - adt * adt
+        c2 = adt / denom
+        c1 = -(adt * adt) / denom
+        tr_eps = 2.0 * c1
+        sig_diag = 2.0 * float(mu_s) * c1 + float(lambda_s) * tr_eps
+        sig_off = 2.0 * float(mu_s) * c2
+        sigma = np.array([[sig_diag, sig_off], [sig_off, sig_diag]], dtype=float)
         sigma_grad_alpha = sigma @ grad_alpha
         extra_el = (1.0 / ak)[..., None] * sigma_grad_alpha
 
@@ -372,6 +407,12 @@ def build_biofilm_one_domain_mms_affine(
     def v_y(x, y):
         return _v_shear(v_amp, x, y)[..., 1]
 
+    def vS_x(x, y):
+        return _v_shear(vS_amp, x, y)[..., 0]
+
+    def vS_y(x, y):
+        return _v_shear(vS_amp, x, y)[..., 1]
+
     def u_x(x, y):
         return u_k(x, y)[..., 0]
 
@@ -422,12 +463,14 @@ def build_biofilm_one_domain_mms_affine(
     return BiofilmOneDomainMMS(
         v_n=v_n,
         p_n=p_n,
+        vS_n=vS_n,
         u_n=u_n,
         phi_n=phi_n,
         alpha_n=alpha_n,
         S_n=S_n,
         v_k=v_k,
         p_k=p_k,
+        vS_k=vS_k,
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
@@ -440,6 +483,8 @@ def build_biofilm_one_domain_mms_affine(
         f_S=f_S,
         v_x=v_x,
         v_y=v_y,
+        vS_x=vS_x,
+        vS_y=vS_y,
         u_x=u_x,
         u_y=u_y,
         phi=phi_k,

@@ -37,6 +37,8 @@ def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta:
             "v_x": 2,
             "v_y": 2,
             "p": 1,
+            "vS_x": 2,
+            "vS_y": 2,
             "u_x": 2,
             "u_y": 2,
             "phi": 1,
@@ -47,9 +49,11 @@ def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta:
     dh = DofHandler(me, method="cg")
 
     V = FunctionSpace("V", ["v_x", "v_y"], dim=1)
+    VS = FunctionSpace("VS", ["vS_x", "vS_y"], dim=1)
     U = FunctionSpace("U", ["u_x", "u_y"], dim=1)
 
     dv = VectorTrialFunction(space=V, dof_handler=dh)
+    dvS = VectorTrialFunction(space=VS, dof_handler=dh)
     du = VectorTrialFunction(space=U, dof_handler=dh)
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
@@ -57,6 +61,7 @@ def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta:
     dS = TrialFunction("S", dof_handler=dh)
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
+    vS_test = VectorTestFunction(space=VS, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
     q_test = TestFunction("p", dof_handler=dh)
     phi_test = TestFunction("phi", dof_handler=dh)
@@ -65,6 +70,7 @@ def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta:
 
     v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
+    vS_k = VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh)
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
@@ -72,14 +78,14 @@ def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta:
 
     v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
     p_n = Function("p_n", "p", dof_handler=dh)
+    vS_n = VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh)
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
-    u_nm1 = VectorFunction("u_nm1", ["u_x", "u_y"], dof_handler=dh)
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
     S_n = Function("S_n", "S", dof_handler=dh)
 
     rng = np.random.default_rng(int(seed))
-    for vf in (v_k, u_k, v_n, u_n, u_nm1):
+    for vf in (v_k, vS_k, u_k, v_n, vS_n, u_n):
         vf.nodal_values[:] = 1.0e-2 * rng.standard_normal(vf.nodal_values.shape)
     for sf in (p_k, p_n):
         sf.nodal_values[:] = 1.0e-2 * rng.standard_normal(sf.nodal_values.shape)
@@ -101,25 +107,28 @@ def _build_problem(*, nx: int, ny: int, q: int, seed: int, dt_val: float, theta:
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
         p_k=p_k,
+        vS_k=vS_k,
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
         S_k=S_k,
         v_n=v_n,
         p_n=p_n,
+        vS_n=vS_n,
         u_n=u_n,
-        u_nm1=u_nm1,
         phi_n=phi_n,
         alpha_n=alpha_n,
         S_n=S_n,
         dv=dv,
         dp=dp,
+        dvS=dvS,
         du=du,
         dphi=dphi,
         dalpha=dalpha,
         dS=dS,
         v_test=v_test,
         q_test=q_test,
+        vS_test=vS_test,
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,

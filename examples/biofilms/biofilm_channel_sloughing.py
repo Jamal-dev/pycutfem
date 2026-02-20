@@ -1369,7 +1369,6 @@ def main() -> None:
         restart_state = _load_npz_dict(state_path)
         restart_t0 = float(_npz_scalar(restart_state, "t", 0.0))
         restart_dt0 = float(_npz_scalar(restart_state, "dt", dt_val))
-        restart_dt_prev0 = float(_npz_scalar(restart_state, "dt_prev", restart_dt0))
         try:
             restart_step_loaded = int(np.asarray(restart_state.get("step", restart_step)).reshape(()))
         except Exception:
@@ -1385,12 +1384,11 @@ def main() -> None:
             "state": restart_state,
             "t": float(restart_t0),
             "dt": float(restart_dt0),
-            "dt_prev": float(restart_dt_prev0),
             "step": int(restart_step_loaded),
         }
         msg = (
             f"[restart] loaded {str(state_path)} (step={restart_step_loaded} t={restart_t0:.6e} "
-            f"dt={restart_dt0:.3e} dt_prev={restart_dt_prev0:.3e})"
+            f"dt={restart_dt0:.3e})"
         )
         if restart_reset:
             msg += " [reset counters]"
@@ -1503,6 +1501,8 @@ def main() -> None:
         "v_x": 2,
         "v_y": 2,
         "p": 1,
+        "vS_x": 2,
+        "vS_y": 2,
         "u_x": 2,
         "u_y": 2,
         "phi": 1,
@@ -1551,9 +1551,11 @@ def main() -> None:
     dh = DofHandler(me, method="cg")
 
     V = FunctionSpace("V", ["v_x", "v_y"], dim=1)
+    VS = FunctionSpace("VS", ["vS_x", "vS_y"], dim=1)
     U = FunctionSpace("U", ["u_x", "u_y"], dim=1)
 
     dv = VectorTrialFunction(space=V, dof_handler=dh)
+    dvS = VectorTrialFunction(space=VS, dof_handler=dh)
     du = VectorTrialFunction(space=U, dof_handler=dh)
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
@@ -1567,6 +1569,7 @@ def main() -> None:
     dX_trial = TrialFunction("X", dof_handler=dh)
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
+    vS_test = VectorTestFunction(space=VS, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
     q_test = TestFunction("p", dof_handler=dh)
     phi_test = TestFunction("phi", dof_handler=dh)
@@ -1580,6 +1583,7 @@ def main() -> None:
     # Unknowns (k) and previous state (n)
     v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
+    vS_k = VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh)
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
@@ -1591,13 +1595,10 @@ def main() -> None:
 
     v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
     p_n = Function("p_n", "p", dof_handler=dh)
+    vS_n = VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh)
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
-    # Keep a copy of u at the previous accepted step for diagnostics (the solver
-    # promotes prev←current before calling the time-loop callback).
-    u_prev = VectorFunction("u_prev", ["u_x", "u_y"], dof_handler=dh)
-    u_nm1 = None
-    if bool(getattr(args, "solid_inertia", False)):
-        u_nm1 = VectorFunction("u_nm1", ["u_x", "u_y"], dof_handler=dh)
+    # NOTE: In the (u,vS) formulation, vS is a primary unknown so we do not
+    # need to keep extra u history to reconstruct vS by finite differences.
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
     mu_alpha_n = Function("mu_alpha_n", "mu_alpha", dof_handler=dh) if ch_enabled else None
@@ -1752,9 +1753,8 @@ def main() -> None:
     S_n.set_values_from_function(lambda x, y: 0.0)
     X_n.set_values_from_function(lambda x, y: 0.0)
     v_n.set_values_from_function(lambda x, y: np.array([0.0, 0.0], dtype=float))
+    vS_n.set_values_from_function(lambda x, y: np.array([0.0, 0.0], dtype=float))
     u_n.set_values_from_function(lambda x, y: np.array([0.0, 0.0], dtype=float))
-    if u_nm1 is not None:
-        u_nm1.set_values_from_function(lambda x, y: np.array([0.0, 0.0], dtype=float))
     p_n.set_values_from_function(lambda x, y: 0.0)
     if use_damage and d_n is not None:
         d_n.set_values_from_function(lambda x, y: 0.0)
@@ -1784,10 +1784,10 @@ def main() -> None:
         restored: list[str] = []
         for f in [
             # Current/previous unknowns
-            v_k, p_k, u_k, phi_k, alpha_k, mu_alpha_k, lambda_alpha_k, d_k, S_k, X_k,
-            v_n, p_n, u_n, phi_n, alpha_n, mu_alpha_n, lambda_alpha_n, d_n, S_n, X_n,
+            v_k, p_k, vS_k, u_k, phi_k, alpha_k, mu_alpha_k, lambda_alpha_k, d_k, S_k, X_k,
+            v_n, p_n, vS_n, u_n, phi_n, alpha_n, mu_alpha_n, lambda_alpha_n, d_n, S_n, X_n,
             # Extra history / coefficients
-            u_prev, u_nm1, a_prev, H_d_prev,
+            a_prev, H_d_prev,
         ]:
             if f is None:
                 continue
@@ -1822,12 +1822,6 @@ def main() -> None:
     # ------------------------------------------------------------------
     print("[setup] building one-domain forms", flush=True)
     dt_c = Constant(dt_val)
-    dt_prev0 = (
-        float(restart_payload.get("dt_prev", restart_payload.get("dt", dt_val)))
-        if restart_payload is not None
-        else float(dt_val)
-    )
-    dt_prev_c = Constant(dt_prev0)
     a_c = Constant(float(restart_payload.get("a_scalar", args.a0)) if restart_payload is not None else float(args.a0))
 
     ds_bottom = dS(defined_on=mesh.edge_bitset("bottom"), metadata={"q": int(qdeg)})
@@ -1859,6 +1853,7 @@ def main() -> None:
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
         p_k=p_k,
+        vS_k=vS_k,
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
@@ -1868,8 +1863,8 @@ def main() -> None:
         S_k=S_k,
         v_n=v_n,
         p_n=p_n,
+        vS_n=vS_n,
         u_n=u_n,
-        u_nm1=u_nm1,
         phi_n=phi_n,
         alpha_n=alpha_n,
         mu_alpha_n=mu_alpha_n,
@@ -1878,6 +1873,7 @@ def main() -> None:
         S_n=S_n,
         dv=dv,
         dp=dp,
+        dvS=dvS,
         du=du,
         dphi=dphi,
         dalpha=dalpha,
@@ -1887,6 +1883,7 @@ def main() -> None:
         dd=dd,
         v_test=v_test,
         q_test=q_test,
+        vS_test=vS_test,
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,
@@ -1897,7 +1894,6 @@ def main() -> None:
         X_test=X_test,
         dx=dx(metadata={"q": int(qdeg)}),
         dt=dt_c,
-        dt_prev=dt_prev_c,
         theta=theta,
         rho_f=rho_f_c,
         mu_f=mu_f_c,
@@ -2005,6 +2001,9 @@ def main() -> None:
     if bool(getattr(args, "fix_base", False)):
         bcs.append(BoundaryCondition("u_x", "dirichlet", "bottom", lambda x, y, t: 0.0))
         bcs.append(BoundaryCondition("u_y", "dirichlet", "bottom", lambda x, y, t: 0.0))
+        # Keep kinematics consistent: if u is clamped, the skeleton velocity must vanish.
+        bcs.append(BoundaryCondition("vS_x", "dirichlet", "bottom", lambda x, y, t: 0.0))
+        bcs.append(BoundaryCondition("vS_y", "dirichlet", "bottom", lambda x, y, t: 0.0))
     # Outlet: pin the pressure to remove the nullspace (velocity is left free -> natural traction).
     bcs.append(BoundaryCondition("p", "dirichlet", "right", lambda x, y, t: 0.0))
 
@@ -2041,7 +2040,6 @@ def main() -> None:
                 "step": int(step_no),
                 "t": float(t_curr),
                 "dt": float(dt_curr),
-                "dt_prev": float(getattr(dt_prev_c, "value", dt_curr)),
                 "mesh_n_nodes": int(getattr(mesh.nodes_x_y_pos, "shape", (0,))[0]),
                 "mesh_n_elements": int(getattr(mesh, "n_elements", len(getattr(mesh, "elements_list", [])))),
                 "mesh_element_type": str(getattr(mesh, "element_type", "")),
@@ -2068,7 +2066,7 @@ def main() -> None:
             t_fail,
             dt_fail,
             tag="fail",
-            funcs=funcs_fail + prev_fail + aux_vals + [u_prev],
+            funcs=funcs_fail + prev_fail + aux_vals,
         )
         return False
     num_nodes = len(mesh.nodes_list)
@@ -2399,8 +2397,7 @@ def main() -> None:
 
                 v_nodes = _vector_to_nodes(v_k)
                 u_nodes = _vector_to_nodes(u_k)
-                u_prev_nodes = _vector_to_nodes(u_prev)
-                vS_nodes = (u_nodes - u_prev_nodes) / float(dt_val)
+                vS_nodes = _vector_to_nodes(vS_k)
                 p_nodes = _scalar_to_nodes(p_k)
                 vx_mean = float(np.mean(v_nodes[mask, 0]))
                 vSx_mean = float(np.mean(vS_nodes[mask, 0]))
@@ -2512,7 +2509,6 @@ def main() -> None:
             # with zeros (which looks like "vS=0" or "stress=0" in ParaView).
             # Keep failures local and (optionally) report them.
             beta_nodes = None
-            vS_nodes = None
             sigma_vm_nodes = None
             sigma_xx_nodes = None
             sigma_yy_nodes = None
@@ -2552,15 +2548,6 @@ def main() -> None:
             except Exception as exc:
                 beta_nodes = None
                 _vtk_derived_warn("beta", exc)
-
-            # vS for visualization: finite difference from stored u history.
-            try:
-                u_nodes = _vector_to_nodes(u_k)
-                u_prev_nodes = _vector_to_nodes(u_prev)
-                vS_nodes = (u_nodes - u_prev_nodes) / max(float(dt_step), 1.0e-16)
-            except Exception as exc:
-                vS_nodes = None
-                _vtk_derived_warn("vS", exc)
 
             # Solid stress diagnostics (domain-projected) for visualization.
             try:
@@ -2620,7 +2607,7 @@ def main() -> None:
                     "v": v_k,
                     "p": p_k,
                     "u": u_k,
-                    "vS": vS_nodes if vS_nodes is not None else (lambda x, y: (0.0, 0.0)),
+                    "vS": vS_k,
                     "phi": phi_k,
                     "alpha": alpha_k,
                     "d": d_k if d_k is not None else (lambda x, y: 0.0),
@@ -2644,6 +2631,7 @@ def main() -> None:
             funcs=[
                 v_n,
                 p_n,
+                vS_n,
                 u_n,
                 phi_n,
                 alpha_n,
@@ -2652,8 +2640,6 @@ def main() -> None:
                 d_n,
                 S_n,
                 X_n,
-                u_prev,
-                u_nm1,
                 a_prev,
                 H_d_prev,
             ],
@@ -2738,17 +2724,19 @@ def main() -> None:
         _pred_state["step_no"] = step_i
         _pred_state["dt"] = dt_f
 
-        if u_predictor == "extrapolate" and u_nm1 is not None:
-            # Constant-velocity predictor:
-            #   vS^n = (u^n - u^{n-1}) / dt_prev
-            #   u^{n+1} ≈ u^n + dt * vS^n
+        if u_predictor == "extrapolate":
+            # Constant-velocity predictor (Eulerian-consistent):
+            #   u^{n+1} ≈ u^n + dt * vS^n,   vS^{n+1} ≈ vS^n
             #
-            # IMPORTANT: use the ratio dt/dt_prev so retries with reduced dt
-            # remain consistent with the lagged velocity used by inertia terms.
-            dt_prev_eff = float(getattr(dt_prev_c, "value", dt_val))
-            dt_prev_eff = max(dt_prev_eff, 1.0e-16)
-            scale = dt_f / dt_prev_eff
-            u_k.nodal_values[:] = u_n.nodal_values + scale * (u_n.nodal_values - u_nm1.nodal_values)
+            # This is compatible with the kinematic constraint
+            #   (u^{n+1}-u^n)/dt + vS·∇u = vS.
+            try:
+                dt_curr = max(dt_f, 1.0e-16)
+                u_k.components[0].nodal_values[:] = u_n.components[0].nodal_values + dt_curr * vS_n.components[0].nodal_values
+                u_k.components[1].nodal_values[:] = u_n.components[1].nodal_values + dt_curr * vS_n.components[1].nodal_values
+                vS_k.nodal_values[:] = vS_n.nodal_values[:]
+            except Exception:
+                pass
         # Predictor for the ramped channel flow: scale the previous (v,p) state
         # by the inflow ramp ratio so the first Newton residual is not dominated
         # by the change in prescribed inflow.
@@ -2908,13 +2896,6 @@ def main() -> None:
 
     def post_step_refiner(step, bcs_now, functions, prev_functions):
         # NOTE: Called after an accepted Newton step and **before** the solver promotes current -> previous.
-        # Keep history needed for diagnostics and (optionally) skeleton inertia.
-        u_prev.nodal_values[:] = u_n.nodal_values[:]
-        if u_nm1 is not None:
-            u_nm1.nodal_values[:] = u_n.nodal_values[:]
-        # Store the dt used for this accepted step so vS^n=(u^n-u^{n-1})/dt_prev
-        # remains consistent if the next step uses a different dt.
-        dt_prev_c.value = float(getattr(dt_c, "value", dt_val))
 
         # If requested, recompute alpha from the Eulerian reference map (χ = x - u).
         # Do this BEFORE promotion so alpha_n becomes the refmap-updated state.
@@ -3025,6 +3006,7 @@ def main() -> None:
         functions=[
             v_k,
             p_k,
+            vS_k,
             u_k,
             phi_k,
             alpha_k,
@@ -3037,6 +3019,7 @@ def main() -> None:
         prev_functions=[
             v_n,
             p_n,
+            vS_n,
             u_n,
             phi_n,
             alpha_n,
@@ -3049,7 +3032,6 @@ def main() -> None:
         aux_functions={
             "dt": dt_c,
             **({"a_prev": a_prev} if a_prev is not None else {}),
-            **({"u_nm1": u_nm1} if u_nm1 is not None else {}),
             **({"H_d_prev": H_d_prev} if H_d_prev is not None else {}),
         },
         time_params=TimeStepperParameters(

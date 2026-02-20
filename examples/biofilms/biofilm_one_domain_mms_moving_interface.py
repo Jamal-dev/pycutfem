@@ -111,6 +111,8 @@ def main() -> None:
             "v_x": 2,
             "v_y": 2,
             "p": 1,
+            "vS_x": 2,
+            "vS_y": 2,
             "u_x": 2,
             "u_y": 2,
             "phi": 1,
@@ -121,9 +123,11 @@ def main() -> None:
     dh = DofHandler(me, method="cg")
 
     V = FunctionSpace("V", ["v_x", "v_y"], dim=1)
+    VS = FunctionSpace("VS", ["vS_x", "vS_y"], dim=1)
     U = FunctionSpace("U", ["u_x", "u_y"], dim=1)
 
     dv = VectorTrialFunction(space=V, dof_handler=dh)
+    dvS = VectorTrialFunction(space=VS, dof_handler=dh)
     du = VectorTrialFunction(space=U, dof_handler=dh)
     dp = TrialFunction("p", dof_handler=dh)
     dphi = TrialFunction("phi", dof_handler=dh)
@@ -131,6 +135,7 @@ def main() -> None:
     dS = TrialFunction("S", dof_handler=dh)
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
+    vS_test = VectorTestFunction(space=VS, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
     q_test = TestFunction("p", dof_handler=dh)
     phi_test = TestFunction("phi", dof_handler=dh)
@@ -140,6 +145,7 @@ def main() -> None:
     # Unknowns (k) and previous state (n)
     v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
+    vS_k = VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh)
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
     phi_k = Function("phi_k", "phi", dof_handler=dh)
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
@@ -147,6 +153,7 @@ def main() -> None:
 
     v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
     p_n = Function("p_n", "p", dof_handler=dh)
+    vS_n = VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh)
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
     phi_n = Function("phi_n", "phi", dof_handler=dh)
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
@@ -175,6 +182,7 @@ def main() -> None:
     # Initial condition at t=0
     t0 = 0.0
     v_n.set_values_from_function(lambda x, y: mms.v(x, y, t0))
+    vS_n.nodal_values.fill(0.0)
     u_n.set_values_from_function(lambda x, y: mms.u(x, y, t0))
     p_n.set_values_from_function(lambda x, y: float(mms.p(x, y, t0)))
     phi_n.set_values_from_function(lambda x, y: float(mms.phi(x, y, t0)))
@@ -195,24 +203,28 @@ def main() -> None:
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
         p_k=p_k,
+        vS_k=vS_k,
         u_k=u_k,
         phi_k=phi_k,
         alpha_k=alpha_k,
         S_k=S_k,
         v_n=v_n,
         p_n=p_n,
+        vS_n=vS_n,
         u_n=u_n,
         phi_n=phi_n,
         alpha_n=alpha_n,
         S_n=S_n,
         dv=dv,
         dp=dp,
+        dvS=dvS,
         du=du,
         dphi=dphi,
         dalpha=dalpha,
         dS=dS,
         v_test=v_test,
         q_test=q_test,
+        vS_test=vS_test,
         u_test=u_test,
         phi_test=phi_test,
         alpha_test=alpha_test,
@@ -251,6 +263,8 @@ def main() -> None:
                 BoundaryCondition("v_x", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.v(x, y, t)[..., 0])),
                 BoundaryCondition("v_y", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.v(x, y, t)[..., 1])),
                 BoundaryCondition("p", "dirichlet", tag, _as_float_time(mms.p)),
+                BoundaryCondition("vS_x", "dirichlet", tag, _as_float_time(lambda x, y, t: 0.0)),
+                BoundaryCondition("vS_y", "dirichlet", tag, _as_float_time(lambda x, y, t: 0.0)),
                 BoundaryCondition("u_x", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.u(x, y, t)[..., 0])),
                 BoundaryCondition("u_y", "dirichlet", tag, _as_float_time(lambda x, y, t: mms.u(x, y, t)[..., 1])),
                 BoundaryCondition("phi", "dirichlet", tag, _as_float_time(mms.phi)),
@@ -315,7 +329,7 @@ def main() -> None:
                 os.path.join(vtk_dir, f"mms_moving_interface_step={step_no:04d}.vtu"),
                 mesh,
                 dh,
-                {"v": v_k, "p": p_k, "u": u_k, "phi": phi_k, "alpha": alpha_k, "S": S_k},
+                {"v": v_k, "p": p_k, "vS": vS_k, "u": u_k, "phi": phi_k, "alpha": alpha_k, "S": S_k},
             )
 
     solver = NewtonSolver(
@@ -334,8 +348,8 @@ def main() -> None:
     solver_ref["solver"] = solver
 
     solver.solve_time_interval(
-        functions=[v_k, p_k, u_k, phi_k, alpha_k, S_k],
-        prev_functions=[v_n, p_n, u_n, phi_n, alpha_n, S_n],
+        functions=[v_k, p_k, vS_k, u_k, phi_k, alpha_k, S_k],
+        prev_functions=[v_n, p_n, vS_n, u_n, phi_n, alpha_n, S_n],
         aux_functions={"dt": dt_c},
         time_params=TimeStepperParameters(dt=float(args.dt), final_time=float(args.final_time), max_steps=int(1.0e9), theta=theta, t0=t0),
     )
