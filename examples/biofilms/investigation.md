@@ -123,6 +123,19 @@ Result (local run, Feb 18, 2026, `dian_paper_sloughing_gap`, `nx=30,ny=20,q=6,dt
 
 Fix (implemented): in `examples/biofilms/biofilm_channel_sloughing.py`, if `--process` includes sloughing, solid inertia is enabled, and the user requests `--u-extension l2`, the driver prints a warning and overrides `u-extension` to `grad` (keeping the user’s `--gamma-u-pin` if provided, otherwise using a tiny default).
 
+### E2.1. CPP backend: vector-component coefficient names (fixed)
+
+After promoting the skeleton velocity to a primary unknown (`vS`) and adding the Eulerian kinematic constraint for `u`, a CPP backend run of the channel sloughing driver could fail during assembly with an error of the form:
+
+- `KeyError: "KernelRunner: the following static arrays are still missing after automatic completion: ['u_vS_n_vS_x_loc', 'u_vS_n_vS_y_loc', ...]"`.
+
+Root cause:
+- Compiled kernels may request *component* coefficient symbols like `vS_n_vS_x` / `vS_n_vS_y`, but `NewtonSolver` passes coefficients as `{f.name: f}`. For a `VectorFunction("vS_n", ["vS_x","vS_y"])` this dict contains only the parent entry `vS_n`, not the component `Function` objects (`vS_n.components[i]`) whose `name` is `vS_n_vS_x`.
+
+Fix (implemented):
+- `pycutfem/jit/__init__.py` now resolves missing coefficient names by checking `VectorFunction.components` and matching by component `name` (e.g. `vS_n_vS_x`). A regression test was added: `tests/test_jit_kernelrunner_vector_component_coeffs.py`.
+- With this fix, a small CPP sloughing smoke run reaches time step 2 without the assembly-time `KernelRunner` failure.
+
 ### E3. Alpha vs damage: why `alpha` is not 0 where `d≈1` (and why high `v` does not imply “alpha moved”)
 
 Observed “puzzle” (user report): as detachment/cracking begins, `d` reaches 1 in parts of the biofilm and the *fluid* velocity increases there, but `alpha` does not go to 0 (so the region still looks like biofilm in ParaView).
@@ -262,9 +275,11 @@ If the modeling goal is “base fails and chunk detaches and translates”, the 
 Important practical point for interpreting sloughing runs:
 
 - `--fix-base` **strongly clamps** `u=0` on the bottom wall.
+- To keep the Eulerian kinematics consistent, `--fix-base` also clamps `vS=0` on the bottom wall
+  (see the BCs in `examples/biofilms/biofilm_channel_sloughing.py`).
 - The wall-adhesion traction term is a spring+dashpot in `(u, vS)` (see `examples/utils/biofilm/one_domain.py`).
 
-So, if `--fix-base` is enabled, then on the bottom wall we have (by construction) `u=0` and `vS≈(u^{n+1}-u^n)/dt=0`. That makes the adhesion traction essentially **identically zero** on that boundary. In other words:
+So, if `--fix-base` is enabled, then on the bottom wall we have (by construction) `u=0` and `vS=0`. That makes the adhesion traction essentially **identically zero** on that boundary. In other words:
 
 > A `*_fix_base_*` run is a “clamped-base” study; it is not capable of simulating wall detachment / peel-off, even if `a(s)` degrades to 0.
 
@@ -273,12 +288,109 @@ If the modeling goal is “adhesion fails → chunk lifts off and is transported
 - rely on the adhesion traction (with degrading `a(s)`) to provide the initial wall constraint and its release.
 
 About “prescribing solid velocity = 0 at the wall”:
-- In the current formulation `vS` is **not** a primary unknown; it is derived from `u`. So a true Dirichlet BC on `vS` is not available without switching to a `(u,w)` formulation.
-- The closest existing knobs are:
-  - strong clamp (`--fix-base`) → enforces `vS=0` but also prevents detachment;
-  - adhesion dashpot (`gamma_n/gamma_t`) → penalizes `vS` while allowing release when `a(s)→0`.
+- In the current `(vS,u)` formulation, `vS` **is** a primary unknown, so Dirichlet BCs on `vS` are available.
+- For adhesion-driven lift-off studies, do **not** clamp `vS` on the wall; instead use the adhesion dashpot (`gamma_n/gamma_t`)
+  together with degrading integrity `a(s)` so the constraint naturally releases when adhesion fails.
 
 ---
+
+### E9. Cross-backend validation: one-domain biofilm forms match FEniCSx
+
+Goal: ensure the **exact residual/Jacobian forms** in `examples/utils/biofilm/one_domain.py` are assembled consistently across:
+- pycutfem backends: `python`, `jit`, `cpp`
+- a FEniCSx (dolfinx) reference assembly
+
+Implementation: `examples/debug/comparison_with_fenics.py` includes `COMP_FENICS_PROBLEM=biofilm` and compares:
+- per-block residuals: momentum, mass, kinematics, skeleton, φ, α, damage, substrate, detached
+- per-block Jacobians + full Jacobian
+
+Key detail (quadrature semantics):
+- pycutfem uses `dx(metadata={"q": q})` where `q` is a Gauss–Legendre *order* (points per 1D rule)
+- FEniCSx uses `ufl.dx(metadata={"quadrature_degree": p})` where `p` is a polynomial-degree hint
+- On quads, `q` points corresponds to `quadrature_degree = 2q-1`
+
+The harness therefore maps:
+- `COMP_FENICS_QDEG=q` (pycutfem)
+- `COMP_FENICS_QDEG_FX=2q-1` (FEniCSx), defaulting to that mapping automatically in the biofilm harness.
+
+Reproducer (small mesh):
+
+```bash
+COMP_FENICS_PROBLEM=biofilm COMP_FENICS_NX=2 COMP_FENICS_QDEG=4 BACKEND=all \
+  conda run --no-capture-output -n fenicsx \
+    python -u examples/debug/comparison_with_fenics.py
+```
+
+Result (local, Feb 20, 2026):
+- All 20 tests pass for `python`, `jit`, and `cpp` backends.
+
+---
+
+### E10. Assembly-time regression: reduced-system residual scatter was the bottleneck
+
+Symptom (user log): for ~30k DOFs and `backend=cpp`, Newton assembly time jumped to O(40s) per iteration.
+
+Root cause (profiling + code inspection):
+- In `pycutfem/solvers/nonlinear_solver.py`, reduced assembly uses precomputed CSR scatter plans for the **Jacobian**,
+  but the **residual** previously scattered with a per-element Python loop + repeated temporary allocations.
+
+Fix (implemented):
+- `_build_reduced_pattern()` now precomputes per-kernel `full_gdof -> reduced_row` maps for residual kernels.
+- `_assemble_system_reduced_fast()` uses a single `np.add.at` over the flattened (element,local) arrays when there are no hanging-node constraints.
+
+How to confirm on your runs:
+- Use `PYCUTFEM_PROFILE_KERNELS=1` to get per-kernel `exec` vs `scatter` timings from `_assemble_system_reduced_fast`.
+
+Notes:
+- If `scatter` still dominates after this change, the next step is to apply the same “flattened scatter” idea to the Jacobian blocks (or move scatter to compiled code).
+- If `exec` dominates, reduce `--q`, simplify forms, or target hot kernels for optimization.
+
+---
+
+### E11. Moving-interface MMS “low” EOC for α/φ is expected when ε scales with h
+
+There are *two different* studies you can do with the moving-interface MMS, and they have different expected EOCs.
+
+#### (A) Fixed-PDE h-convergence (recommended for order verification)
+
+Keep the interface thickness `eps` **fixed across meshes** so the exact MMS fields do not change with refinement.
+
+Command (example):
+
+```bash
+conda run --no-capture-output -n fenicsx \
+  python -u examples/biofilms/biofilm_one_domain_mms_moving_interface_convergence.py \
+    --backend cpp \
+    --nx-list 8,16,32 \
+    --dt 0.02 --nsteps 1 \
+    --q 8 --q-error 12 \
+    --eps 0.25
+```
+
+Observed outcome (local run, Feb 20, 2026):
+- `v` (Q2) converges at ~3rd order in L2 (EOC ≈ 2.99).
+- `phi, alpha, X` (Q1) converge at ~2nd order in L2 (EOC ≈ 2.00).
+
+This is the expected optimal rate for smooth manufactured fields with Q2/Q1 spaces.
+
+#### (B) Fixed interface resolution (ε ∝ h)
+
+If you choose `eps = eps_factor*h` on each mesh, the exact MMS fields *sharpen as the mesh is refined*. This is **not** a pure h-convergence study of a fixed PDE/MMS.
+
+In that setting:
+- Errors in `alpha`/`phi` are dominated by the diffuse-interface layer (thickness `O(eps)=O(h)`). If the numerical interface is displaced by `O(h)` with an `O(1)` jump, then the global L2 error scales like `O(h^{1/2})`, i.e. EOC ≈ 0.5.
+- Because `v` depends on `alpha,phi` through `rho(mu,beta,...)`, the velocity error can become **non-monotone** or show an apparent plateau when the coefficient errors dominate.
+
+Explanation:
+- With `ε ~ h`, the exact solution *sharpens as the mesh is refined*; this is **not** a pure h-convergence study of a fixed PDE.
+- Errors are dominated by the diffuse-interface layer (thickness `O(ε)=O(h)`): if the numerical interface is displaced by `O(h)` with an `O(1)` jump,
+  then the global L2 error scales like `O(h^{1/2})`, i.e. EOC ≈ 0.5.
+
+Important: this MMS is implemented as a **discrete backward-Euler MMS** (`theta=1`), i.e. the forcing is constructed so the *time-discrete* BE residual is exactly satisfied by the exact MMS fields on each step. So there is no separate “O(dt) time truncation error” term to eliminate by scaling `dt` with `h` in this verification.
+
+Implementation note:
+- `examples/biofilms/biofilm_one_domain_mms_moving_interface_convergence.py` now defaults to a fixed-ε study via `--eps-mode fixed` (it uses `eps = eps_factor*h_coarsest`).
+- Use `--eps-mode scaled` to reproduce the “ε ∝ h” behavior (fixed interface resolution).
 
 ## Test plan (edge cases for the u-block)
 
@@ -333,4 +445,7 @@ P4. Update documentation
 - [x] Added a dynamic chunk-motion regression (T3; MMS 3 moving cylinder / rigid-chunk transport):
   `tests/test_biofilm_one_domain_mms_moving_cylinder_smoke.py` (backend=python, nx=2, Δt=0.02, 1 step),
   asserting bounded errors (`||u-u_exact||_{L2}<1e-3`, `||α-α_exact||_{L2}<0.3`) and successful Newton solve.
+- [x] Validated one-domain biofilm residual/Jacobian forms vs FEniCSx for `python/jit/cpp` backends:
+  `COMP_FENICS_PROBLEM=biofilm` in `examples/debug/comparison_with_fenics.py` (with `quadrature_degree=2q-1` mapping).
+- [x] Reduced reduced-system residual scatter overhead by precomputing `full_gdof -> reduced_row` maps in `NewtonSolver`.
 - [ ] Add a sloughing-gap early-step integration regression (T4; must not throw Newton exceptions).

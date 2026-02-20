@@ -514,12 +514,30 @@ class KernelRunner:
             try:
                 f = functions[name]                   # Function / VectorFunction
             except KeyError:
-                # Fallback: match by field_name when the exact symbol name is absent
-                candidates = [obj for obj in functions.values() if getattr(obj, "field_name", None) == name]
-                if len(candidates) == 1:
-                    f = candidates[0]
+                # Fallback 1: resolve vector-component coefficient names.
+                #
+                # The JIT IR / PARAM_ORDER may refer to a component symbol like
+                # "vS_n_vS_x" even when the caller only provides the parent
+                # VectorFunction under its base name "vS_n". In that case, the
+                # component object exists as `vector.components[i]` but is not
+                # present as a top-level entry in `functions`.
+                component_matches = []
+                for obj in functions.values():
+                    comps = getattr(obj, "components", None)
+                    if not comps:
+                        continue
+                    for comp in comps:
+                        if getattr(comp, "name", None) == name:
+                            component_matches.append(comp)
+                if len(component_matches) == 1:
+                    f = component_matches[0]
                 else:
-                    continue
+                    # Fallback 2: match by field_name when the exact symbol name is absent
+                    candidates = [obj for obj in functions.values() if getattr(obj, "field_name", None) == name]
+                    if len(candidates) == 1:
+                        f = candidates[0]
+                    else:
+                        continue
 
             # 1) global vector with current nodal values --------------------
             base = getattr(f, "_parent_vector", None)

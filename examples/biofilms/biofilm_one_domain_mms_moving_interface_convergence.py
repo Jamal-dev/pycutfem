@@ -385,8 +385,27 @@ def main() -> None:
     ap.add_argument("--S0", type=float, default=0.5)
     ap.add_argument("--a", type=float, default=0.2)
     ap.add_argument("--omega", type=float, default=2.0 * math.pi)
-    ap.add_argument("--eps", type=float, default=None, help="Interface thickness epsilon. If omitted, eps = eps-factor*h.")
+    ap.add_argument(
+        "--eps",
+        type=float,
+        default=None,
+        help=(
+            "Diffuse-interface thickness epsilon. If omitted, eps is selected by --eps-mode "
+            "('fixed' uses eps-factor*h_coarsest; 'scaled' uses eps-factor*h on each mesh)."
+        ),
+    )
     ap.add_argument("--eps-factor", type=float, default=2.0)
+    ap.add_argument(
+        "--eps-mode",
+        type=str,
+        default="fixed",
+        choices=("fixed", "scaled"),
+        help=(
+            "How to choose epsilon when --eps is omitted. "
+            "'fixed': eps = eps-factor*h_coarsest and held constant across meshes (standard h-convergence). "
+            "'scaled': eps = eps-factor*h on each mesh (interface sharpens with refinement; expect reduced EOC for alpha/phi)."
+        ),
+    )
 
     # model/forcing parameters
     ap.add_argument("--rho-f", type=float, default=1.0)
@@ -419,15 +438,42 @@ def main() -> None:
     if not nx_list:
         raise ValueError("Empty --nx-list.")
 
+    eps_mode = str(getattr(args, "eps_mode", "fixed")).strip().lower()
+    if eps_mode not in {"fixed", "scaled"}:
+        raise ValueError(f"Unknown --eps-mode {args.eps_mode!r}. Use 'fixed' or 'scaled'.")
+    nx_coarse = int(min(nx_list))
+    h_coarse = 1.0 / float(nx_coarse)
+    if args.eps is not None:
+        eps_mode_eff = "fixed"
+        eps_fixed = float(args.eps)
+        print(f"[info] Using fixed eps={eps_fixed:g} across meshes (from --eps).")
+    elif eps_mode == "fixed":
+        eps_mode_eff = "fixed"
+        eps_fixed = float(args.eps_factor) * float(h_coarse)
+        print(
+            f"[info] --eps omitted; using fixed eps=eps-factor*h_coarsest = {float(args.eps_factor):g}*{h_coarse:g} = {eps_fixed:g}."
+        )
+    else:
+        eps_mode_eff = "scaled"
+        eps_fixed = None
+        print(
+            "[info] --eps omitted; using eps = eps-factor*h on each mesh (scaled). "
+            "This is not a fixed-PDE h-convergence study; expect reduced EOC for alpha/phi and coupled fields as eps shrinks."
+        )
+
     outdir = Path(str(args.outdir))
     outdir.mkdir(parents=True, exist_ok=True)
-    stem = f"biofilm_mms_moving_interface_backend={args.backend}_dt={float(args.dt):g}_nsteps={int(args.nsteps)}"
+    stem = f"biofilm_mms_moving_interface_backend={args.backend}_dt={float(args.dt):g}_nsteps={int(args.nsteps)}_epsmode={eps_mode_eff}"
+    if eps_mode_eff == "fixed":
+        stem += f"_eps={float(eps_fixed):g}"
+    else:
+        stem += f"_epsfac={float(args.eps_factor):g}"
     vtk_dir = outdir / "vtk" / stem if int(args.vtk_every) > 0 else None
 
     rows = []
     for nx in nx_list:
         h = 1.0 / float(nx)
-        eps = float(args.eps) if args.eps is not None else float(args.eps_factor) * h
+        eps = float(eps_fixed) if eps_mode_eff == "fixed" else float(args.eps_factor) * h
         gamma_u = float(args.gamma_u) if args.gamma_u is not None else float(args.gamma_u_factor)
         rows.append(
             _run_one(
@@ -461,7 +507,9 @@ def main() -> None:
             )
         )
 
-    print(f"\nMoving-interface MMS convergence | backend={args.backend} | dt={float(args.dt):g} | nsteps={int(args.nsteps)}")
+    print(
+        f"\nMoving-interface MMS convergence | backend={args.backend} | dt={float(args.dt):g} | nsteps={int(args.nsteps)} | eps-mode={eps_mode_eff}"
+    )
 
     recs: list[dict] = []
     for i, r in enumerate(rows):

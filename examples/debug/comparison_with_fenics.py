@@ -558,7 +558,146 @@ def get_all_fenicsx_dof_coords(W_fenicsx):
         all_coords[dofs_X] = coords_X
         return all_coords
 
-    raise NotImplementedError(f"Unsupported mixed space layout with num_sub_spaces={nsub}.")
+    if nsub == 9:
+        # Mixed space layout: (vector, scalar, vector, vector, scalar, scalar, scalar, scalar, scalar)
+        # i.e. (v, p, vS, u, phi, alpha, d, S, X) for one-domain biofilm comparisons.
+        Wv, Vv_map = W_fenicsx.sub(0).collapse()
+        Wp, P_map_fx = W_fenicsx.sub(1).collapse()
+        WvS, VvS_map = W_fenicsx.sub(2).collapse()
+        Wu, Vu_map = W_fenicsx.sub(3).collapse()
+        Wphi, Phi_map_fx = W_fenicsx.sub(4).collapse()
+        Walpha, Alpha_map_fx = W_fenicsx.sub(5).collapse()
+        Wd, D_map_fx = W_fenicsx.sub(6).collapse()
+        WS, S_map_fx = W_fenicsx.sub(7).collapse()
+        WX, X_map_fx = W_fenicsx.sub(8).collapse()
+
+        Wv0, Vv0_map = Wv.sub(0).collapse()
+        Wv1, Vv1_map = Wv.sub(1).collapse()
+        WvS0, VvS0_map = WvS.sub(0).collapse()
+        WvS1, VvS1_map = WvS.sub(1).collapse()
+        Wu0, Vu0_map = Wu.sub(0).collapse()
+        Wu1, Vu1_map = Wu.sub(1).collapse()
+
+        coords_vx = Wv0.tabulate_dof_coordinates()[:, :2]
+        coords_vy = Wv1.tabulate_dof_coordinates()[:, :2]
+        coords_p = Wp.tabulate_dof_coordinates()[:, :2]
+        coords_vSx = WvS0.tabulate_dof_coordinates()[:, :2]
+        coords_vSy = WvS1.tabulate_dof_coordinates()[:, :2]
+        coords_ux = Wu0.tabulate_dof_coordinates()[:, :2]
+        coords_uy = Wu1.tabulate_dof_coordinates()[:, :2]
+        coords_phi = Wphi.tabulate_dof_coordinates()[:, :2]
+        coords_alpha = Walpha.tabulate_dof_coordinates()[:, :2]
+        coords_d = Wd.tabulate_dof_coordinates()[:, :2]
+        coords_S = WS.tabulate_dof_coordinates()[:, :2]
+        coords_X = WX.tabulate_dof_coordinates()[:, :2]
+
+        dofs_vx = np.array(Vv_map)[np.array(Vv0_map)]
+        dofs_vy = np.array(Vv_map)[np.array(Vv1_map)]
+        dofs_p = np.array(P_map_fx)
+        dofs_vSx = np.array(VvS_map)[np.array(VvS0_map)]
+        dofs_vSy = np.array(VvS_map)[np.array(VvS1_map)]
+        dofs_ux = np.array(Vu_map)[np.array(Vu0_map)]
+        dofs_uy = np.array(Vu_map)[np.array(Vu1_map)]
+        dofs_phi = np.array(Phi_map_fx)
+        dofs_alpha = np.array(Alpha_map_fx)
+        dofs_d = np.array(D_map_fx)
+        dofs_S = np.array(S_map_fx)
+        dofs_X = np.array(X_map_fx)
+
+        all_coords[dofs_vx] = coords_vx
+        all_coords[dofs_vy] = coords_vy
+        all_coords[dofs_p] = coords_p
+        all_coords[dofs_vSx] = coords_vSx
+        all_coords[dofs_vSy] = coords_vSy
+        all_coords[dofs_ux] = coords_ux
+        all_coords[dofs_uy] = coords_uy
+        all_coords[dofs_phi] = coords_phi
+        all_coords[dofs_alpha] = coords_alpha
+        all_coords[dofs_d] = coords_d
+        all_coords[dofs_S] = coords_S
+        all_coords[dofs_X] = coords_X
+        return all_coords
+
+    if nsub == 10:
+        # Mixed space layout: (vector, scalar, vector, vector, scalar, scalar, scalar, scalar, scalar, scalar)
+        # i.e. (v, p, vS, u, phi, alpha, extra, d, S, X), where "extra" is a scalar
+        # field (e.g. mu_alpha for Cahn–Hilliard or lambda_alpha for conservative AC).
+        Wv, Vv_map = W_fenicsx.sub(0).collapse()
+        Wp, P_map_fx = W_fenicsx.sub(1).collapse()
+        WvS, VvS_map = W_fenicsx.sub(2).collapse()
+        Wu, Vu_map = W_fenicsx.sub(3).collapse()
+        Wphi, Phi_map_fx = W_fenicsx.sub(4).collapse()
+        Walpha, Alpha_map_fx = W_fenicsx.sub(5).collapse()
+        Wextra, Extra_map_fx = W_fenicsx.sub(6).collapse()
+        Wd, D_map_fx = W_fenicsx.sub(7).collapse()
+        WS, S_map_fx = W_fenicsx.sub(8).collapse()
+        WX, X_map_fx = W_fenicsx.sub(9).collapse()
+
+        Wv0, Vv0_map = Wv.sub(0).collapse()
+        Wv1, Vv1_map = Wv.sub(1).collapse()
+        WvS0, VvS0_map = WvS.sub(0).collapse()
+        WvS1, VvS1_map = WvS.sub(1).collapse()
+        Wu0, Vu0_map = Wu.sub(0).collapse()
+        Wu1, Vu1_map = Wu.sub(1).collapse()
+
+        coords_vx = Wv0.tabulate_dof_coordinates()[:, :2]
+        coords_vy = Wv1.tabulate_dof_coordinates()[:, :2]
+        coords_p = Wp.tabulate_dof_coordinates()[:, :2]
+        coords_vSx = WvS0.tabulate_dof_coordinates()[:, :2]
+        coords_vSy = WvS1.tabulate_dof_coordinates()[:, :2]
+        coords_ux = Wu0.tabulate_dof_coordinates()[:, :2]
+        coords_uy = Wu1.tabulate_dof_coordinates()[:, :2]
+        coords_phi = Wphi.tabulate_dof_coordinates()[:, :2]
+        coords_alpha = Walpha.tabulate_dof_coordinates()[:, :2]
+        coords_extra = Wextra.tabulate_dof_coordinates()[:, :2]
+        coords_d = Wd.tabulate_dof_coordinates()[:, :2]
+        coords_S = WS.tabulate_dof_coordinates()[:, :2]
+        coords_X = WX.tabulate_dof_coordinates()[:, :2]
+
+        dofs_vx = np.array(Vv_map)[np.array(Vv0_map)]
+        dofs_vy = np.array(Vv_map)[np.array(Vv1_map)]
+        dofs_p = np.array(P_map_fx)
+        dofs_vSx = np.array(VvS_map)[np.array(VvS0_map)]
+        dofs_vSy = np.array(VvS_map)[np.array(VvS1_map)]
+        dofs_ux = np.array(Vu_map)[np.array(Vu0_map)]
+        dofs_uy = np.array(Vu_map)[np.array(Vu1_map)]
+        dofs_phi = np.array(Phi_map_fx)
+        dofs_alpha = np.array(Alpha_map_fx)
+        dofs_extra = np.array(Extra_map_fx)
+        dofs_d = np.array(D_map_fx)
+        dofs_S = np.array(S_map_fx)
+        dofs_X = np.array(X_map_fx)
+
+        all_coords[dofs_vx] = coords_vx
+        all_coords[dofs_vy] = coords_vy
+        all_coords[dofs_p] = coords_p
+        all_coords[dofs_vSx] = coords_vSx
+        all_coords[dofs_vSy] = coords_vSy
+        all_coords[dofs_ux] = coords_ux
+        all_coords[dofs_uy] = coords_uy
+        all_coords[dofs_phi] = coords_phi
+        all_coords[dofs_alpha] = coords_alpha
+        all_coords[dofs_extra] = coords_extra
+        all_coords[dofs_d] = coords_d
+        all_coords[dofs_S] = coords_S
+        all_coords[dofs_X] = coords_X
+        return all_coords
+
+    # Generic fallback for simple (Lagrange) mixed spaces: collapse each subspace
+    # and inject coordinates into the parent vector using the provided map.
+    try:
+        for i in range(int(nsub)):
+            Wi, sub_map = W_fenicsx.sub(i).collapse()
+            coords_i = Wi.tabulate_dof_coordinates()[:, :2]
+            dofs_i = np.asarray(sub_map, dtype=int)
+            if coords_i.shape[0] != dofs_i.shape[0]:
+                raise ValueError(
+                    f"subspace {i} coordinate count mismatch: coords={coords_i.shape[0]} dofs={dofs_i.shape[0]}"
+                )
+            all_coords[dofs_i] = coords_i
+        return all_coords
+    except Exception as exc:
+        raise NotImplementedError(f"Unsupported mixed space layout with num_sub_spaces={nsub}.") from exc
 
 def one_to_one_map_coords(coords1, coords2):
     C = np.linalg.norm(coords2[:, np.newaxis, :] - coords1[np.newaxis, :, :], axis=2)
@@ -2192,9 +2331,15 @@ def run_biofilm_comparison():
         )
 
     # Measures
+    # NOTE: pycutfem's volume quadrature metadata uses `q` as a Gauss–Legendre
+    # *order* (number of points per 1D rule). In dolfinx/ufl, `quadrature_degree`
+    # is a polynomial degree hint; for tensor-product Gauss rules on quads the
+    # smallest degree that yields `q` points is `2*q - 1`.
     qdeg = int(os.environ.get("COMP_FENICS_QDEG", "6"))
+    qdeg_fx = int(os.environ.get("COMP_FENICS_QDEG_FX", str(max(1, 2 * qdeg - 1))))
     dx_pc = dx(metadata={"q": qdeg})
-    dx_fx = ufl.dx(metadata={"quadrature_degree": qdeg})
+    dx_fx = ufl.dx(metadata={"quadrature_degree": qdeg_fx})
+    print(f"[biofilm] quadrature: pycutfem q={qdeg}, fenics quadrature_degree={qdeg_fx}")
 
     def eps_fx(v):
         return ufl.sym(ufl.grad(v))
@@ -2336,12 +2481,13 @@ def run_biofilm_comparison():
     surf_coef_prev_fx = D_det_prev_fx
     f_alpha_k_fx = (alpha_k_fx - alpha_n_fx) / dt_fx
     f_alpha_k_fx += theta_fx * (
-        ufl.dot(ufl.grad(alpha_k_fx), vS_k_fx)
+        # Conservative transport: div(alpha vS) = vS·∇alpha + alpha div(vS).
+        (ufl.dot(ufl.grad(alpha_k_fx), vS_k_fx) + alpha_k_fx * div_vS_k_fx)
         - G_k_fx * alpha_k_fx * one_minus(alpha_k_fx)
         + surf_coef_prev_fx * delta_k_fx
     )
     f_alpha_k_fx += (1.0 - theta_fx) * (
-        ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx)
+        (ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx) + alpha_n_fx * div_vS_n_fx)
         - G_n_fx * alpha_n_fx * one_minus(alpha_n_fx)
         + surf_coef_prev_fx * delta_n_fx
     )
