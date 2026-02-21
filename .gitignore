@@ -236,3 +236,6 @@ out/
 examples/debug/out/
 examples/biofilms/model/**
 examples/biofilms/examples/**
+
+# VI benchmark outputs
+examples/variational_inequalities/*_vtk/
