@@ -378,6 +378,30 @@ class LinearSolverParameters:
     tol: float = 1e-12
     maxit: int = 10_000
 
+
+@dataclass
+class VIParameters:
+    """
+    Parameters for box-constrained variational inequalities (VI) solved via
+    PDAS / semismooth Newton.
+
+    We support a PDAS / semismooth Newton strategy for box constraints by
+    predicting active sets from a (KKT-style) complementarity indicator.
+
+    For lower/upper bounds we use the standard max-based NCP logic:
+
+      lower-active  if   F(x) - c * (x - lo) > 0
+      upper-active  if   F(x) + c * (hi - x) < 0
+
+    where F(x) is the (reduced) residual vector and c>0 is a scaling parameter
+    with the units of "stiffness" (force/length) for mechanics-like problems.
+    """
+
+    c: float = 1.0
+    active_tol: float = 0.0
+    project_initial_guess: bool = True
+    project_each_iteration: bool = False
+
 # ----------------------------------------------------------------------------
 #  Restriction helper
 # ----------------------------------------------------------------------------
@@ -3999,6 +4023,33 @@ class PetscSnesNewtonSolver(NewtonSolver):
     # ------------------------------------------------------------------ #
     # Utilities
     # ------------------------------------------------------------------ #
+    def _gather_full_iterate(self, funcs: list) -> np.ndarray:
+        """
+        Gather the current iterate into a full global DOF vector (global index order).
+
+        Do *not* use `np.hstack([f.nodal_values ...])` here: Function/VectorFunction
+        storage order follows `._g_dofs`, which is not guaranteed to be sorted by
+        global DOF id.
+        """
+        n = int(self.dh.total_dofs)
+        x_full = np.zeros(n, dtype=float)
+        for f in funcs:
+            g = getattr(f, "_g_dofs", None)
+            vals = getattr(f, "nodal_values", None)
+            if g is None or vals is None:
+                continue
+            g_arr = np.asarray(g, dtype=int).ravel()
+            if g_arr.size == 0:
+                continue
+            v_arr = np.asarray(vals, dtype=float).ravel()
+            if v_arr.size != g_arr.size:
+                raise ValueError(
+                    f"Function '{getattr(f, 'name', '<unnamed>')}' has nodal_values size {int(v_arr.size)} "
+                    f"but _g_dofs size {int(g_arr.size)}."
+                )
+            x_full[g_arr] = v_arr
+        return x_full
+
     def _apply_petsc_options(self) -> None:
         """Load self.petsc_options into PETSc.Options so setFromOptions() sees them."""
         opts = PETSc.Options()
@@ -4043,6 +4094,24 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._box_lower_full = lo_full
         self._box_upper_full = hi_full
 
+        # If we are in a constraint (hanging-node) mode, bounds on slave DOFs do
+        # not map cleanly to box constraints in the reduced/master space.
+        # We apply bounds on master DOFs only.
+        if getattr(self, "constraints", None) is not None:
+            try:
+                slaves = np.asarray(self.constraints.slaves, dtype=int)
+                if slaves.size:
+                    lo_s = lo_full[slaves]
+                    hi_s = hi_full[slaves]
+                    if np.any(np.isfinite(lo_s)) or np.any(np.isfinite(hi_s)):
+                        warnings.warn(
+                            "Box bounds were set on slave/hanging DOFs; these bounds are ignored in the "
+                            "condensed master-space VI solve. Apply bounds to master DOFs instead.",
+                            RuntimeWarning,
+                        )
+            except Exception:
+                pass
+
 
     def _ensure_snes(self, n_free: int, comm) -> None:
         """Create/resize SNES and persistent objects if needed; set defaults then apply options."""
@@ -4079,8 +4148,15 @@ class PetscSnesNewtonSolver(NewtonSolver):
 
         # --- Optional VI bounds (reduced) ---
         if (getattr(self, "_box_lower_full", None) is not None) and (getattr(self, "_box_upper_full", None) is not None):
-            lo_red = self._box_lower_full[self.active_dofs].astype(float, copy=True)
-            hi_red = self._box_upper_full[self.active_dofs].astype(float, copy=True)
+            if getattr(self, "constraints", None) is not None:
+                master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+                lo_master = np.asarray(self._box_lower_full, dtype=float)[master_ids]
+                hi_master = np.asarray(self._box_upper_full, dtype=float)[master_ids]
+                lo_red = lo_master[self.active_dofs].astype(float, copy=True)
+                hi_red = hi_master[self.active_dofs].astype(float, copy=True)
+            else:
+                lo_red = self._box_lower_full[self.active_dofs].astype(float, copy=True)
+                hi_red = self._box_upper_full[self.active_dofs].astype(float, copy=True)
 
             self._XL = PETSc.Vec().create(comm=comm)
             self._XL.setSizes(n_free)
@@ -4138,7 +4214,9 @@ class PetscSnesNewtonSolver(NewtonSolver):
 
         # Apply BCs to the current iterate and form the reduced initial guess
         dh.apply_bcs(bcs_now, *funcs)
-        x0_full = np.hstack([f.nodal_values for f in funcs]).copy()
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+        x0_full = self._gather_full_iterate(funcs)
 
         # Assemble once to prune any decoupled rows/cols (matches Python Newton behavior).
         current: Dict[str, "Function"] = {f.name: f for f in funcs}
@@ -4152,8 +4230,24 @@ class PetscSnesNewtonSolver(NewtonSolver):
         )
         if pattern_was_stale or pruned:
             self._invalidate_petsc_cache()
+        # Ensure we have a CSR sparsity pattern for PETSc preallocation even on the
+        # Python backend (where we don't build the pattern from kernels).
+        try:
+            if A_red is not None:
+                if not sp.isspmatrix_csr(A_red):
+                    A_red = A_red.tocsr()
+                self._csr_indptr = A_red.indptr.copy()
+                self._csr_indices = A_red.indices.copy()
+                self._pattern_stale = False
+        except Exception:
+            pass
 
-        x0_red = x0_full[self.active_dofs].copy()
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            x0_master = x0_full[master_ids]
+            x0_red = x0_master[self.active_dofs].copy()
+        else:
+            x0_red = x0_full[self.active_dofs].copy()
 
         # Context for callbacks
         self._petsc_ctx = dict(
@@ -4194,12 +4288,20 @@ class PetscSnesNewtonSolver(NewtonSolver):
 
         # Write back the absolute solution (not an increment)
         x_fin = self._x_red.getArray(readonly=True)
-        new_full = x0_full.copy()
-        new_full[self.active_dofs] = x_fin
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            new_master = x0_full[master_ids].copy()
+            new_master[self.active_dofs] = np.asarray(x_fin, dtype=float)
+            new_full = self.constraints.prolong(new_master)
+        else:
+            new_full = x0_full.copy()
+            new_full[self.active_dofs] = np.asarray(x_fin, dtype=float)
         for f in funcs:
             g = f._g_dofs
             f.set_nodal_values(g, new_full[g])
         dh.apply_bcs(bcs_now, *funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
 
         prev_vals = np.hstack([f.nodal_values for f in prev_funcs])
         delta = np.hstack([f.nodal_values for f in funcs]) - prev_vals
@@ -4212,14 +4314,27 @@ class PetscSnesNewtonSolver(NewtonSolver):
         ctx = self._petsc_ctx
 
         # Lift reduced iterate to full space on a fresh copy, then apply BCs
-        x_full = ctx["x0_full"].copy()
-        x_full[self.active_dofs] = x_red.getArray(readonly=True)
+        x_fin = np.asarray(x_red.getArray(readonly=True), dtype=float)
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            master = ctx["x0_full"][master_ids].copy()
+            master[self.active_dofs] = x_fin
+            x_full = self.constraints.prolong(master)
+        else:
+            x_full = ctx["x0_full"].copy()
+            x_full[self.active_dofs] = x_fin
 
-        res_funcs = [f.copy() for f in ctx["funcs"]]
+        # IMPORTANT: the pure-Python backend assembles forms using the Function
+        # objects that were captured when the UFL expression was built. In that
+        # mode, assembling on copies would ignore updated coefficients and
+        # produce a constant residual, which breaks SNES line-search.
+        res_funcs = ctx["funcs"] if self.backend == "python" else [f.copy() for f in ctx["funcs"]]
         for f in res_funcs:
             g = f._g_dofs
             f.set_nodal_values(g, x_full[g])
         self.dh.apply_bcs(ctx["bcs_now"], *res_funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(res_funcs)
 
         coeffs = {f.name: f for f in res_funcs}
         coeffs.update({f.name: f for f in ctx["prev_funcs"]})
@@ -4238,14 +4353,23 @@ class PetscSnesNewtonSolver(NewtonSolver):
     def _eval_jacobian_reduced(self, snes, x_red: PETSc.Vec, J: PETSc.Mat, P: PETSc.Mat):
         ctx = self._petsc_ctx
 
-        x_full = ctx["x0_full"].copy()
-        x_full[self.active_dofs] = x_red.getArray(readonly=True)
+        x_fin = np.asarray(x_red.getArray(readonly=True), dtype=float)
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            master = ctx["x0_full"][master_ids].copy()
+            master[self.active_dofs] = x_fin
+            x_full = self.constraints.prolong(master)
+        else:
+            x_full = ctx["x0_full"].copy()
+            x_full[self.active_dofs] = x_fin
 
-        jac_funcs = [f.copy() for f in ctx["funcs"]]
+        jac_funcs = ctx["funcs"] if self.backend == "python" else [f.copy() for f in ctx["funcs"]]
         for f in jac_funcs:
             g = f._g_dofs
             f.set_nodal_values(g, x_full[g])
         self.dh.apply_bcs(ctx["bcs_now"], *jac_funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(jac_funcs)
 
         coeffs = {f.name: f for f in jac_funcs}
         coeffs.update({f.name: f for f in ctx["prev_funcs"]})
@@ -4355,7 +4479,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
         mesh = dh.mixed_element.mesh
 
         # 1) Coordinates and level-set at DOFs
-        X = dh.get_all_dof_coords()                  # shape (total_dofs, 2)  :contentReference[oaicite:3]{index=3}
+        X = dh.get_all_dof_coords()                  # shape (total_dofs, 2)
         phi = level_set(X)
 
         # 2) Choose band half-width in physical units
@@ -4401,43 +4525,481 @@ class PetscSnesNewtonSolver(NewtonSolver):
 
         # Leave pressure (or other fields) unbounded by simply not touching them.
         # Store for SNES setup; they’ll be reduced to the active/free DOFs later.
-        self.set_box_bounds(lower=lo_full, upper=hi_full)     # uses existing API  :contentReference[oaicite:4]{index=4}
+        self.set_box_bounds(lower=lo_full, upper=hi_full)     # uses existing API
+
+
+# --------------------------------------------------------------------------
+#  Internal PDAS / Semismooth Newton solver for box VIs
+# --------------------------------------------------------------------------
+
+class PdasNewtonSolver(NewtonSolver):
+    """
+    Internal Primal-Dual Active Set (PDAS) / semismooth Newton solver for
+    box-constrained variational inequalities:
+
+        find x in [lo, hi] such that 0 in F(x) + N_[lo,hi](x)
+
+    This solver reuses pycutfem's reduced assembly pipeline and PETSc-backed
+    linear solves (via LinearSolverParameters.backend='petsc').
+    """
+
+    def __init__(self, *args, vi_params: VIParameters = VIParameters(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vi_params = vi_params
+        self._box_lower_full: np.ndarray | None = None
+        self._box_upper_full: np.ndarray | None = None
+
+    def set_box_bounds(self, lower=None, upper=None, by_field: dict | None = None) -> None:
+        """
+        Define componentwise bounds on the full DOF vector.
+
+        Parameters
+        ----------
+        lower/upper:
+            Scalar or full-size numpy arrays (total_dofs). Missing bound -> ±inf.
+        by_field:
+            Dict like {'ux': (lo, hi), 'uy': (lo, hi), 'p': (None, None)} applied on
+            the corresponding field slices.
+        """
+        n = int(self.dh.total_dofs)
+        lo_full = np.full(n, -np.inf, dtype=float)
+        hi_full = np.full(n, np.inf, dtype=float)
+
+        if isinstance(lower, (int, float)):
+            lo_full[:] = float(lower)
+        elif isinstance(lower, np.ndarray):
+            if int(lower.size) != n:
+                raise ValueError(f"lower bound array has size {int(lower.size)}, expected {n}.")
+            lo_full[:] = np.asarray(lower, dtype=float)
+
+        if isinstance(upper, (int, float)):
+            hi_full[:] = float(upper)
+        elif isinstance(upper, np.ndarray):
+            if int(upper.size) != n:
+                raise ValueError(f"upper bound array has size {int(upper.size)}, expected {n}.")
+            hi_full[:] = np.asarray(upper, dtype=float)
+
+        if by_field:
+            for name, (lo, hi) in by_field.items():
+                sl = self.dh.get_field_slice(name)
+                if sl is None:
+                    raise KeyError(f"Unknown field '{name}'.")
+                if lo is not None:
+                    lo_full[sl] = float(lo)
+                if hi is not None:
+                    hi_full[sl] = float(hi)
+
+        # sanitize NaNs to ±inf
+        lo_full = np.where(np.isfinite(lo_full), lo_full, -np.inf)
+        hi_full = np.where(np.isfinite(hi_full), hi_full, np.inf)
+
+        if np.any(lo_full > hi_full):
+            bad = np.flatnonzero(lo_full > hi_full)
+            raise ValueError(f"Inconsistent bounds: lower > upper at {int(bad.size)} DOFs (e.g. {int(bad[0])}).")
+
+        self._box_lower_full = lo_full
+        self._box_upper_full = hi_full
+
+        if getattr(self, "constraints", None) is not None:
+            try:
+                slaves = np.asarray(self.constraints.slaves, dtype=int)
+                if slaves.size:
+                    lo_s = lo_full[slaves]
+                    hi_s = hi_full[slaves]
+                    if np.any(np.isfinite(lo_s)) or np.any(np.isfinite(hi_s)):
+                        warnings.warn(
+                            "Box bounds were set on slave/hanging DOFs; these bounds are ignored in the "
+                            "condensed master-space VI solve. Apply bounds to master DOFs instead.",
+                            RuntimeWarning,
+                        )
+            except Exception:
+                pass
+
+    def _bounds_reduced(self) -> tuple[np.ndarray, np.ndarray]:
+        lo_full = getattr(self, "_box_lower_full", None)
+        hi_full = getattr(self, "_box_upper_full", None)
+        if lo_full is None or hi_full is None:
+            raise RuntimeError("Box bounds are not set. Call set_box_bounds() before solving.")
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            lo_master = np.asarray(lo_full, dtype=float)[master_ids]
+            hi_master = np.asarray(hi_full, dtype=float)[master_ids]
+            return lo_master[self.active_dofs].copy(), hi_master[self.active_dofs].copy()
+        return np.asarray(lo_full, dtype=float)[self.active_dofs].copy(), np.asarray(hi_full, dtype=float)[self.active_dofs].copy()
+
+    def _gather_full_iterate(self, funcs: list) -> np.ndarray:
+        """
+        Gather the current iterate into a full global DOF vector in *global index*
+        order.
+
+        IMPORTANT: Function/VectorFunction nodal storage is in their local order
+        (the order of `._g_dofs`), which is not necessarily sorted by global DOF id.
+        Do not use `np.hstack([f.nodal_values ...])` when you need a global vector.
+        """
+        n = int(self.dh.total_dofs)
+        x_full = np.zeros(n, dtype=float)
+        for f in funcs:
+            g = getattr(f, "_g_dofs", None)
+            vals = getattr(f, "nodal_values", None)
+            if g is None or vals is None:
+                continue
+            g_arr = np.asarray(g, dtype=int).ravel()
+            if g_arr.size == 0:
+                continue
+            v_arr = np.asarray(vals, dtype=float).ravel()
+            if v_arr.size != g_arr.size:
+                raise ValueError(
+                    f"Function '{getattr(f, 'name', '<unnamed>')}' has nodal_values size {int(v_arr.size)} "
+                    f"but _g_dofs size {int(g_arr.size)}."
+                )
+            x_full[g_arr] = v_arr
+        return x_full
+
+    def _pack_reduced_iterate(self, funcs: list) -> np.ndarray:
+        x_full = self._gather_full_iterate(funcs)
+        if getattr(self, "constraints", None) is not None:
+            master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            x_master = np.asarray(x_full, dtype=float)[master_ids]
+            return x_master[self.active_dofs].copy()
+        return np.asarray(x_full, dtype=float)[self.active_dofs].copy()
+
+    def _project_funcs_to_bounds(self, funcs: list, bcs_now, lo_red: np.ndarray, hi_red: np.ndarray) -> None:
+        x_red = self._pack_reduced_iterate(funcs)
+        x_proj = np.minimum(np.maximum(x_red, lo_red), hi_red)
+        d_red = x_proj - x_red
+        if not np.any(d_red):
+            return
+        dU_full = self.restrictor.expand_vec(d_red)
+        self.dh.add_to_functions(dU_full, funcs)
+        self.dh.apply_bcs(bcs_now, *funcs)
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+
+    def _pdas_residual_and_sets(
+        self,
+        x_red: np.ndarray,
+        R_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build the semismooth residual for the bound VI and the corresponding
+        PDAS active sets.
+
+        Residual (componentwise):
+          - inactive:    F(x) = 0
+          - lower-active: x - lo = 0
+          - upper-active: x - hi = 0
+
+        Active set prediction:
+          - lower-active if   F(x) - c(x-lo) >  tol
+          - upper-active if   F(x) + c(hi-x) < -tol
+        """
+        c = float(getattr(self.vi_params, "c", 1.0))
+        tol = float(getattr(self.vi_params, "active_tol", 0.0) or 0.0)
+
+        lo_f = np.isfinite(lo_red)
+        hi_f = np.isfinite(hi_red)
+        gap_lo = x_red - lo_red
+        gap_hi = hi_red - x_red
+
+        # Candidate actives (masked to finite bounds).
+        act_lo = lo_f & ((R_red - c * gap_lo) > tol)
+        act_hi = hi_f & ((R_red + c * gap_hi) < -tol)
+
+        # Resolve overlaps (should not happen for consistent bounds, but be safe).
+        both = act_lo & act_hi
+        if np.any(both):
+            # Prefer the closer bound in terms of current gap.
+            choose_lo = gap_lo[both] <= gap_hi[both]
+            act_lo[both] &= choose_lo
+            act_hi[both] &= ~choose_lo
+
+        # Semismooth residual.
+        G = np.asarray(R_red, dtype=float).copy()
+        G[act_lo] = gap_lo[act_lo]
+        G[act_hi] = -gap_hi[act_hi]  # x - hi
+        return G, act_lo, act_hi
+
+    def _apply_identity_rows(self, A: sp.csr_matrix, rows: np.ndarray) -> sp.csr_matrix:
+        if rows.size == 0:
+            return A
+        if not sp.isspmatrix_csr(A):
+            A = A.tocsr()
+        A_mod = A.copy()
+        indptr = A_mod.indptr
+        indices = A_mod.indices
+        data = A_mod.data
+        missing_diag = False
+        for r in rows.tolist():
+            rr = int(r)
+            start = int(indptr[rr])
+            end = int(indptr[rr + 1])
+            if end <= start:
+                missing_diag = True
+                continue
+            data[start:end] = 0.0
+            hit = np.nonzero(indices[start:end] == rr)[0]
+            if hit.size:
+                data[start + int(hit[0])] = 1.0
+            else:
+                missing_diag = True
+        if not missing_diag:
+            return A_mod
+
+        # Fallback: allow pattern change for rows missing a diagonal entry.
+        A_lil = A.tolil(copy=True)
+        for r in rows.tolist():
+            rr = int(r)
+            A_lil.rows[rr] = [rr]
+            A_lil.data[rr] = [1.0]
+        return A_lil.tocsr()
+
+    def _line_search_vi_reduced(
+        self,
+        *,
+        G0: np.ndarray,
+        S_red: np.ndarray,
+        active_mask: np.ndarray | None = None,
+        funcs: list,
+        coeffs: dict,
+        bcs_now,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+    ) -> np.ndarray:
+        dh = self.dh
+        np_ = self.np
+        mode = str(getattr(np_, "ls_mode", "armijo") or "armijo").lower()
+        c1 = float(getattr(np_, "ls_c1", 1.0e-4))
+
+        snap = [f.nodal_values.copy() for f in funcs]
+        norm0 = float(np.linalg.norm(G0, ord=np.inf))
+        phi0 = 0.5 * float(G0 @ G0)
+
+        best_alpha = 0.0
+        best_merit = norm0 if mode == "dealii" else phi0
+
+        def _trial(alpha: float) -> tuple[float, float]:
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            step = alpha * S_red
+            # Keep active-set updates "hard" (PDAS-style): do not damp the bound
+            # enforcement; only damp the inactive part of the Newton step.
+            if active_mask is not None and active_mask.size == step.size:
+                step = step.copy()
+                step[active_mask] = S_red[active_mask]
+            dU_full = self.restrictor.expand_vec(step)
+            dh.add_to_functions(dU_full, funcs)
+            dh.apply_bcs(bcs_now, *funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
+            if bool(getattr(self.vi_params, "project_each_iteration", True)):
+                self._project_funcs_to_bounds(funcs, bcs_now, lo_red, hi_red)
+
+            _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
+            x_try = self._pack_reduced_iterate(funcs)
+            G_try, _, _ = self._pdas_residual_and_sets(x_try, R_try, lo_red, hi_red)
+            nrm = float(np.linalg.norm(G_try, ord=np.inf))
+            phi = 0.5 * float(G_try @ G_try)
+            return nrm, phi
+
+        # Always try full step first (robust, avoids warm-start lock-in).
+        nrm1, phi1 = _trial(1.0)
+        merit1 = nrm1 if mode == "dealii" else phi1
+        if merit1 < best_merit:
+            best_merit = merit1
+            best_alpha = 1.0
+        if (mode == "dealii" and nrm1 < norm0) or (
+            mode == "armijo" and phi1 <= phi0 - c1 * 1.0 * float(G0 @ G0)
+        ):
+            for f, buf in zip(funcs, snap):
+                f.nodal_values[:] = buf
+            self._ls_alpha_prev = 1.0
+            return S_red
+
+        alpha = float(getattr(np_, "ls_reduction", 0.5))
+        if not (0.0 < alpha < 1.0):
+            alpha = 0.5
+
+        for _ in range(int(getattr(np_, "ls_max_iter", 12))):
+            nrm, phi = _trial(alpha)
+            merit = nrm if mode == "dealii" else phi
+            if merit < best_merit:
+                best_merit = merit
+                best_alpha = alpha
+            if mode == "dealii":
+                ok = nrm < norm0
+            else:
+                ok = phi <= phi0 - c1 * alpha * float(G0 @ G0)
+            if ok:
+                for f, buf in zip(funcs, snap):
+                    f.nodal_values[:] = buf
+                self._ls_alpha_prev = alpha
+                step = alpha * S_red
+                if active_mask is not None and active_mask.size == step.size:
+                    step = step.copy()
+                    step[active_mask] = S_red[active_mask]
+                return step
+            alpha *= float(getattr(np_, "ls_reduction", 0.5))
+
+        for f, buf in zip(funcs, snap):
+            f.nodal_values[:] = buf
+        if best_alpha > 0.0:
+            self._ls_alpha_prev = best_alpha
+            step = best_alpha * S_red
+            if active_mask is not None and active_mask.size == step.size:
+                step = step.copy()
+                step[active_mask] = S_red[active_mask]
+            return step
+
+        min_alpha = alpha
+        if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
+            raise RuntimeError("Line search failed: no semismooth residual decrease.")
+        self._ls_alpha_prev = min_alpha
+        step = min_alpha * S_red
+        if active_mask is not None and active_mask.size == step.size:
+            step = step.copy()
+            step[active_mask] = S_red[active_mask]
+        return step
+
+    def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
+        # If no bounds are set, fall back to the standard Newton solver.
+        if getattr(self, "_box_lower_full", None) is None or getattr(self, "_box_upper_full", None) is None:
+            return super()._newton_loop(funcs, prev_funcs, aux_funcs, bcs_now)
+
+        self._current_bcs = bcs_now
+        dh = self.dh
+        ndof_eff = getattr(self.restrictor, "full_size", dh.total_dofs)
+
+        if getattr(self, "constraints", None) is not None:
+            self._enforce_constraints_on_functions(funcs)
+            self._enforce_constraints_on_functions(prev_funcs)
+
+        # Optionally project the initial guess to be feasible.
+        lo_red, hi_red = self._bounds_reduced()
+        if bool(getattr(self.vi_params, "project_initial_guess", True)):
+            self._project_funcs_to_bounds(funcs, bcs_now, lo_red, hi_red)
+
+        norm_G0: float | None = None
+        last_active: np.ndarray | None = None
+        auto_c = False
+        try:
+            c0 = float(getattr(self.vi_params, "c", 1.0))
+            auto_c = (not np.isfinite(c0)) or (c0 <= 0.0)
+        except Exception:
+            auto_c = True
+
+        for it in range(int(self.np.max_newton_iter)):
+            if self.pre_cb is not None:
+                self.pre_cb(funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
+                self._enforce_constraints_on_functions(prev_funcs)
+
+            current: Dict[str, "Function"] = {f.name: f for f in funcs}
+            current.update({f.name: f for f in prev_funcs})
+            if aux_funcs:
+                current.update(aux_funcs)
+
+            # Assemble reduced Jacobian and residual.
+            t_asm = time.perf_counter()
+            A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
+            asm_time = time.perf_counter() - t_asm
+
+            # Prune decoupled rows/cols (CutFEM restriction).
+            A_red, R_red, pruned, extra_asm = self._prune_decoupled_rows_cols(current, A_red, R_red, ndof_eff)
+            asm_time += extra_asm
+            if pruned:
+                lo_red, hi_red = self._bounds_reduced()
+
+            # Current reduced iterate and semismooth residual.
+            x_red = self._pack_reduced_iterate(funcs)
+            if auto_c:
+                try:
+                    bounded = np.isfinite(lo_red) | np.isfinite(hi_red)
+                    if np.any(bounded):
+                        diag = np.asarray(A_red.diagonal(), dtype=float)[bounded]
+                        diag = np.abs(diag[np.isfinite(diag)])
+                        diag = diag[diag > 0.0]
+                        self.vi_params.c = float(np.median(diag)) if diag.size else 1.0
+                    else:
+                        self.vi_params.c = 1.0
+                except Exception:
+                    self.vi_params.c = 1.0
+            G_red, act_lo, act_hi = self._pdas_residual_and_sets(x_red, R_red, lo_red, hi_red)
+            norm_G = float(np.linalg.norm(G_red, ord=np.inf))
+            norm_R = float(np.linalg.norm(R_red, ord=np.inf))
+
+            if norm_G0 is None:
+                norm_G0 = norm_G
+            tol_eff = max(float(self.np.newton_tol), float(getattr(self.np, "newton_rtol", 0.0) or 0.0) * float(norm_G0))
+
+            active = act_lo | act_hi
+
+            nA = int(np.count_nonzero(active))
+            nI = int(active.size - nA)
+            changed = -1
+            if last_active is not None and last_active.shape == active.shape:
+                changed = int(np.count_nonzero(last_active != active))
+            last_active = active.copy()
+
+            print(
+                f"        VI Newton {it+1}: |G|_∞={norm_G:.2e}  |R|_∞={norm_R:.2e}  nA={nA} nI={nI}"
+                + (f"  ΔA={changed}" if changed >= 0 else "")
+                + f"  (asm={asm_time:.2e}s)"
+            )
+
+            if norm_G <= tol_eff:
+                delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+                return delta, True, it + 1
+
+            # Build semismooth Newton system (PDAS): inactive rows use Newton, active rows are identity.
+            rhs = (-R_red).astype(float, copy=True)
+            if nA:
+                rhs[act_lo] = lo_red[act_lo] - x_red[act_lo]
+                rhs[act_hi] = hi_red[act_hi] - x_red[act_hi]
+                A_mod = self._apply_identity_rows(A_red, np.flatnonzero(active))
+            else:
+                A_mod = A_red
+
+            # Linear solve for reduced step.
+            t_lin = time.perf_counter()
+            S_red = self._solve_linear_system(A_mod, rhs)
+            lin_time = time.perf_counter() - t_lin
+
+            # Optional reduced line search on the semismooth residual.
+            if bool(getattr(self.np, "line_search", True)):
+                t_ls = time.perf_counter()
+                S_red = self._line_search_vi_reduced(
+                    G0=G_red,
+                    S_red=S_red,
+                    active_mask=active,
+                    funcs=funcs,
+                    coeffs=current,
+                    bcs_now=bcs_now,
+                    lo_red=lo_red,
+                    hi_red=hi_red,
+                )
+                ls_time = time.perf_counter() - t_ls
+            else:
+                ls_time = 0.0
+
+            # Apply the accepted step.
+            dU_full = self.restrictor.expand_vec(S_red)
+            dh.add_to_functions(dU_full, funcs)
+            dh.apply_bcs(bcs_now, *funcs)
+            if getattr(self, "constraints", None) is not None:
+                self._enforce_constraints_on_functions(funcs)
+            if bool(getattr(self.vi_params, "project_each_iteration", True)):
+                self._project_funcs_to_bounds(funcs, bcs_now, lo_red, hi_red)
+
+            print(f"          timings: solve={lin_time:.2e}s, line-search={ls_time:.2e}s")
+
+        raise RuntimeError("VI Newton did not converge – adjust tolerances/Δt or verify Jacobian.")
 
 
 
 
-
-
-
-
-# --- Helper functions for scattering into global NumPy arrays for PETSc ---
-# These can be added to the bottom of nonlinear_solver.py
-
-def _scatter_element_contribs_petsc(F_elem, element_ids, gdofs_map, target_vec):
-    """Scatters local vectors into a global NumPy vector."""
-    for i in range(len(element_ids)):
-        gdofs = gdofs_map[i]
-        valid = gdofs >= 0
-        if not np.any(valid):
-            continue
-        np.add.at(target_vec, gdofs[valid], F_elem[i][valid])
-
-def _scatter_mat_vec_petsc(K_elem, vec_loc_vals, element_ids, gdofs_map, target_vec):
-    """Computes local mat-vec products and scatters them into a global vector."""
-    for i in range(len(element_ids)):
-        gdofs = gdofs_map[i]
-        valid = gdofs >= 0
-        if not np.any(valid):
-            continue
-        
-        # Get local part of the input vector
-        v_loc = vec_loc_vals[gdofs[valid]]
-        
-        # Local mat-vec product
-        res_loc = K_elem[i][np.ix_(valid, valid)] @ v_loc
-        
-        # Add to global result vector
-        np.add.at(target_vec, gdofs[valid], res_loc)
 
 
 

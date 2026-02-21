@@ -71,6 +71,10 @@ def _resolve_meta(a, b, prefer=None, strict=False):
     Merge metadata dicts {'field_names','parent_name','side','field_sides'}.
     prefer ∈ {None,'a','b'}; strict -> raise on field_names/parent_name conflict.
     """
+    if a is None:
+        a = {}
+    if b is None:
+        b = {}
     def pick(attr, A, B):
         ah, bh = _meta_has(A, attr), _meta_has(B, attr)
         if prefer == "a" and ah: return A

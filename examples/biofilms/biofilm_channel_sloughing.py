@@ -11,7 +11,15 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.io.vtk import export_vtk
-from pycutfem.solvers.nonlinear_solver import NewtonParameters, NewtonSolver, TimeStepperParameters
+from pycutfem.solvers.nonlinear_solver import (
+    LinearSolverParameters,
+    NewtonParameters,
+    NewtonSolver,
+    PdasNewtonSolver,
+    PetscSnesNewtonSolver,
+    TimeStepperParameters,
+    VIParameters,
+)
 from pycutfem.ufl.expressions import (
     Constant,
     Function,
@@ -274,6 +282,58 @@ def main() -> None:
         default=0.0,
         help="Optional relative Newton tolerance. The solver stops when "
         "|R|_inf <= max(newton_tol, newton_rtol*|R0|_inf).",
+    )
+    ap.add_argument(
+        "--semismooth-newton",
+        dest="semismooth_newton",
+        action="store_true",
+        default=_env_bool("PYCUTFEM_SEMISMOOTH_NEWTON", True),
+        help=(
+            "Use PETSc SNES VI semismooth Newton (required for wall-contact bounds). "
+            "Env: PYCUTFEM_SEMISMOOTH_NEWTON."
+        ),
+    )
+    ap.add_argument(
+        "--no-semismooth-newton",
+        dest="semismooth_newton",
+        action="store_false",
+        help="Disable PETSc semismooth VI and use the Python NewtonSolver instead.",
+    )
+    ap.add_argument(
+        "--vi-solver",
+        type=str,
+        default=str(os.getenv("PYCUTFEM_VI_SOLVER", "snesvi") or "snesvi"),
+        choices=("snesvi", "internal-pdas"),
+        help=(
+            "VI solver used when wall-contact bounds are enabled. "
+            "'snesvi' uses PETSc SNES VI; 'internal-pdas' uses pycutfem's internal PDAS/semismooth Newton "
+            "(still using PETSc for linear solves). Env: PYCUTFEM_VI_SOLVER."
+        ),
+    )
+    ap.add_argument(
+        "--vi-c",
+        type=float,
+        default=float(os.getenv("PYCUTFEM_VI_C", "0.0") or "0.0"),
+        help=(
+            "PDAS active-set scaling parameter c (>0). Use c<=0 to auto-estimate it from the Jacobian diagonal "
+            "on bounded DOFs (internal-pdas only). Env: PYCUTFEM_VI_C."
+        ),
+    )
+    ap.add_argument(
+        "--wall-contact",
+        dest="wall_contact",
+        action="store_true",
+        default=_env_bool("PYCUTFEM_WALL_CONTACT", True),
+        help=(
+            "Enable rigid-wall contact (non-penetration) at y=0 and y=H via box bounds on the solid displacement "
+            "component u_y. Uses a semismooth VI solver (PETSc SNES). Env: PYCUTFEM_WALL_CONTACT."
+        ),
+    )
+    ap.add_argument(
+        "--no-wall-contact",
+        dest="wall_contact",
+        action="store_false",
+        help="Disable rigid-wall contact bounds.",
     )
     ap.add_argument("--max-it", type=int, default=40)
     ap.add_argument(
@@ -2010,6 +2070,33 @@ def main() -> None:
     bcs_homog = [BoundaryCondition(b.field, b.method, b.domain_tag, lambda x, y: 0.0) for b in bcs]
 
     # ------------------------------------------------------------------
+    # Rigid-wall contact (non-penetration): y + u_y ∈ [0, H].
+    # Implemented as box bounds on u_y DOFs and solved with a semismooth Newton VI solver.
+    # ------------------------------------------------------------------
+    wall_contact = bool(getattr(args, "wall_contact", True))
+    use_semismooth = bool(getattr(args, "semismooth_newton", True))
+    if wall_contact and not use_semismooth:
+        print("[info] wall contact requested: enabling semismooth Newton VI solver.", flush=True)
+        use_semismooth = True
+    vi_solver = str(getattr(args, "vi_solver", "snesvi") or "snesvi").strip().lower()
+
+    wall_lo_full = None
+    wall_hi_full = None
+    if wall_contact:
+        dh._ensure_dof_coords()
+        wall_lo_full = np.full(dh.total_dofs, -np.inf, dtype=float)
+        wall_hi_full = np.full(dh.total_dofs, np.inf, dtype=float)
+        sl_uy = np.asarray(dh.get_field_slice("u_y"), dtype=int).ravel()
+        y_uy = np.asarray(dh._dof_coords[sl_uy, 1], dtype=float)
+        wall_lo_full[sl_uy] = 0.0 - y_uy
+        wall_hi_full[sl_uy] = float(H) - y_uy
+        print(
+            f"[setup] wall contact enabled: enforcing y+u_y ∈ [0, {float(H):.6g}] via box bounds on u_y "
+            f"(vi_solver={vi_solver})",
+            flush=True,
+        )
+
+    # ------------------------------------------------------------------
     # Post-step callback: compute wall shear, update adhesion a, write output
     # ------------------------------------------------------------------
     step_counter = {"k": int(restart_step0)}
@@ -2216,6 +2303,27 @@ def main() -> None:
                 t_now = float(t_start) + float(dt_step)
         except Exception:
             t_now = step_no * dt_val
+
+        # Quick correctness check for wall contact bounds: enforce y+u_y ∈ [0, H].
+        # This should hold to floating point when using SNES VI with box constraints.
+        if wall_contact:
+            try:
+                dh._ensure_dof_coords()
+                sl_uy = np.asarray(dh.get_field_slice("u_y"), dtype=int).ravel()
+                y_ref = np.asarray(dh._dof_coords[sl_uy, 1], dtype=float)
+                uy = np.asarray(u_k.nodal_values_component(1), dtype=float)
+                y_def = y_ref + uy
+                y_min = float(np.min(y_def))
+                y_max = float(np.max(y_def))
+                tol = 1.0e-10 * max(1.0, float(H))
+                if y_min < -tol or y_max > float(H) + tol:
+                    print(
+                        f"    [warn] wall-contact violation: min(y+u_y)={y_min:.3e} max(y+u_y)={y_max:.3e} "
+                        f"(expected within [0,{float(H):.3e}])",
+                        flush=True,
+                    )
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                print(f"    [warn] wall-contact check failed: {exc}", flush=True)
 
         shear = wall_shear_rms_on_boundary(
             dof_handler=dh,
@@ -2599,6 +2707,36 @@ def main() -> None:
                 sigma_xy_nodes = None
                 _vtk_derived_warn("stress", exc)
 
+            contact_bottom_nodes = None
+            contact_top_nodes = None
+            try:
+                if wall_contact:
+                    dh._ensure_dof_coords()
+                    num_nodes = len(mesh.nodes_list)
+                    contact_bottom_nodes = np.zeros(num_nodes, dtype=float)
+                    contact_top_nodes = np.zeros(num_nodes, dtype=float)
+                    sl_uy = np.asarray(dh.get_field_slice("u_y"), dtype=int).ravel()
+                    tol_gap = 5.0e-12 * max(1.0, float(H))
+                    for gd in sl_uy:
+                        gd_i = int(gd)
+                        lidx = u_k._g2l.get(gd_i)
+                        if lidx is None:
+                            continue
+                        _fld, nid = dh._dof_to_node_map.get(gd_i, (None, None))
+                        if nid is None:
+                            continue
+                        y_ref = float(dh._dof_coords[gd_i, 1])
+                        uy = float(u_k.nodal_values[int(lidx)])
+                        y_def = y_ref + uy
+                        if abs(y_def - 0.0) <= tol_gap:
+                            contact_bottom_nodes[int(nid)] = 1.0
+                        if abs(y_def - float(H)) <= tol_gap:
+                            contact_top_nodes[int(nid)] = 1.0
+            except Exception as exc:
+                contact_bottom_nodes = None
+                contact_top_nodes = None
+                _vtk_derived_warn("contact", exc)
+
             export_vtk(
                 filename=os.path.join(str(args.outdir), f"solution_{step_no:04d}.vtu"),
                 mesh=mesh,
@@ -2619,6 +2757,8 @@ def main() -> None:
                     "sigma_xx": sigma_xx_nodes if sigma_xx_nodes is not None else (lambda x, y: 0.0),
                     "sigma_yy": sigma_yy_nodes if sigma_yy_nodes is not None else (lambda x, y: 0.0),
                     "sigma_xy": sigma_xy_nodes if sigma_xy_nodes is not None else (lambda x, y: 0.0),
+                    "contact_bottom": contact_bottom_nodes if contact_bottom_nodes is not None else (lambda x, y: 0.0),
+                    "contact_top": contact_top_nodes if contact_top_nodes is not None else (lambda x, y: 0.0),
                 },
             )
 
@@ -2648,24 +2788,84 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Solve in time
     # ------------------------------------------------------------------
-    print("[setup] creating NewtonSolver", flush=True)
-    solver = NewtonSolver(
-        forms.residual_form,
-        forms.jacobian_form,
-        dof_handler=dh,
-        mixed_element=me,
-        bcs=bcs,
-        bcs_homog=bcs_homog,
-        newton_params=NewtonParameters(
-            newton_tol=float(args.newton_tol),
-            newton_rtol=float(getattr(args, "newton_rtol", 0.0) or 0.0),
-            max_newton_iter=int(args.max_it),
-            ls_mode=str(getattr(args, "ls_mode", "dealii")),
-        ),
-        quad_order=qdeg,
-        backend=backend,
-        postproc_timeloop_cb=post_step,
-    )
+    if use_semismooth:
+        if vi_solver == "internal-pdas":
+            print("[setup] creating PdasNewtonSolver (internal semismooth VI)", flush=True)
+            solver = PdasNewtonSolver(
+                forms.residual_form,
+                forms.jacobian_form,
+                dof_handler=dh,
+                mixed_element=me,
+                bcs=bcs,
+                bcs_homog=bcs_homog,
+                vi_params=VIParameters(c=float(getattr(args, "vi_c", 0.0) or 0.0)),
+                newton_params=NewtonParameters(
+                    newton_tol=float(args.newton_tol),
+                    newton_rtol=float(getattr(args, "newton_rtol", 0.0) or 0.0),
+                    max_newton_iter=int(args.max_it),
+                    ls_mode=str(getattr(args, "ls_mode", "dealii")),
+                    line_search=True,
+                ),
+                lin_params=LinearSolverParameters(backend="petsc"),
+                quad_order=qdeg,
+                backend=backend,
+                postproc_timeloop_cb=post_step,
+            )
+            if wall_contact and wall_lo_full is not None and wall_hi_full is not None:
+                solver.set_box_bounds(lower=wall_lo_full, upper=wall_hi_full)
+        else:
+            print("[setup] creating PetscSnesNewtonSolver (semismooth VI)", flush=True)
+            snes_type = "vinewtonssls" if wall_contact else "newtonls"
+            petsc_opts = {
+                "snes_type": snes_type,
+                "snes_linesearch_type": "bt",
+                "snes_atol": float(args.newton_tol),
+                "snes_rtol": float(getattr(args, "newton_rtol", 0.0) or 0.0),
+                "snes_max_it": int(args.max_it),
+                # Robust baseline linear solve; users can override via PETSc options/environment.
+                "ksp_type": "preonly",
+                "pc_type": "lu",
+                "pc_factor_mat_solver_type": "mumps",
+            }
+            solver = PetscSnesNewtonSolver(
+                forms.residual_form,
+                forms.jacobian_form,
+                dof_handler=dh,
+                mixed_element=me,
+                bcs=bcs,
+                bcs_homog=bcs_homog,
+                newton_params=NewtonParameters(
+                    newton_tol=float(args.newton_tol),
+                    newton_rtol=float(getattr(args, "newton_rtol", 0.0) or 0.0),
+                    max_newton_iter=int(args.max_it),
+                    ls_mode=str(getattr(args, "ls_mode", "dealii")),
+                ),
+                quad_order=qdeg,
+                backend=backend,
+                postproc_timeloop_cb=post_step,
+                petsc_options=petsc_opts,
+            )
+            if wall_contact and wall_lo_full is not None and wall_hi_full is not None:
+                solver.set_box_bounds(lower=wall_lo_full, upper=wall_hi_full)
+    else:
+        print("[setup] creating NewtonSolver", flush=True)
+        solver = NewtonSolver(
+            forms.residual_form,
+            forms.jacobian_form,
+            dof_handler=dh,
+            mixed_element=me,
+            bcs=bcs,
+            bcs_homog=bcs_homog,
+            newton_params=NewtonParameters(
+                newton_tol=float(args.newton_tol),
+                newton_rtol=float(getattr(args, "newton_rtol", 0.0) or 0.0),
+                max_newton_iter=int(args.max_it),
+                ls_mode=str(getattr(args, "ls_mode", "dealii")),
+            ),
+            quad_order=qdeg,
+            backend=backend,
+            postproc_timeloop_cb=post_step,
+        )
 
     def _update_lambda_alpha_from_alpha(_coeffs: dict[str, object]) -> None:
         # Conservative Allen–Cahn (eliminated λ): enforce

@@ -3626,6 +3626,38 @@ class NumbaCodeGen:
                                             parent_name=parent_name, side=side, field_sides=field_sides))
 
                     # -----------------------------------------------------------------
+                    # 3. Value/const vector × value/const vector → elementwise product
+                    # -----------------------------------------------------------------
+                    elif (
+                        a.role in {"const", "value"}
+                        and b.role in {"const", "value"}
+                        and a.is_vector
+                        and b.is_vector
+                        and (not a.is_gradient and not b.is_gradient)
+                        and (not a.is_hessian and not b.is_hessian)
+                        and len(a.shape) == 1
+                        and a.shape == b.shape
+                    ):
+                        body_lines.append("# Product: vector(value) * vector(value) → vector(value) (elementwise)")
+                        body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}")
+                        role = "value" if ("value" in {a.role, b.role}) else "const"
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer="a", strict=False)
+                        stack.append(
+                            StackItem(
+                                var_name=res_var,
+                                role=role,
+                                shape=a.shape,
+                                is_vector=True,
+                                is_gradient=False,
+                                is_hessian=False,
+                                field_names=field_names,
+                                parent_name=parent_name,
+                                side=side,
+                                field_sides=field_sides,
+                            )
+                        )
+
+                    # -----------------------------------------------------------------
                     # 4. Anything else is ***not implemented yet*** – fail fast
                     # -----------------------------------------------------------------
                     else:

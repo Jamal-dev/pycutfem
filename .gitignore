@@ -238,3 +238,6 @@ examples/biofilms/model/**
 examples/biofilms/examples/**
 examples/fsi_contact/paper/**
 examples/fsi_contact/results/**
+
+# VI benchmark outputs
+examples/variational_inequalities/*_vtk/
