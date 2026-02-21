@@ -15,7 +15,7 @@ from .compiler import compile_extension, get_compile_mode_tag
 # Bump when generated C++ changes in a way that requires recompilation of cached kernels.
 # Bump when generated C++ changes or when helper semantics change in a way that
 # requires recompilation of cached kernels (e.g. stride-aware accessors).
-CODEGEN_ABI_CPP = "2026-02-14-cpp-v18-hdiv-facet-jinv"
+CODEGEN_ABI_CPP = "2026-02-20-cpp-v19-hessian-facet-union"
 
 
 class CppKernelCache:

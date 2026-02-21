@@ -1306,7 +1306,7 @@ def recompute_active_dofs(solver: NewtonSolver, bcs_active: Sequence[BoundaryCon
     dh = solver.dh
     ndof_effective = solver.constraints.n_master if getattr(solver, "constraints", None) else dh.total_dofs
     map_to_master = (lambda ids: solver.constraints.to_master_set(ids)) if getattr(solver, "constraints", None) else (lambda ids: set(ids))
-    active_by_restr, has_restriction = analyze_active_dofs(solver.equation, dh, solver.me, bcs_active)
+    active_by_restr, has_restriction = analyze_active_dofs(solver.equation, dh, solver.me, bcs_active, verbose=False)
     bc_dofs = set(dh.get_dirichlet_data(bcs_active).keys())
     candidate = map_to_master(active_by_restr) if has_restriction else set(range(ndof_effective))
     inactive = set(dh.dof_tags.get("inactive", set()))

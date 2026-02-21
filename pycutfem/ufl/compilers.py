@@ -2117,6 +2117,16 @@ class FormCompiler:
         logger.debug(f"Entering _visit_Dot for types {type(a)} . {type(b)}")
 
         # ------------------------------------------------------------------
+        # Coefficient (vector) · coefficient (vector)
+        # ------------------------------------------------------------------
+        # Needed e.g. for |v| in SUPG parameters and energy functionals.
+        # This should be valid regardless of whether we are assembling the
+        # Jacobian (LHS) or residual (RHS), since it evaluates to a scalar
+        # coefficient value at the current quadrature point.
+        if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo) and a.role == b.role == "function":
+            return a.dot_vec(b)
+
+        # ------------------------------------------------------------------
         # Matrix fast-paths
         # ------------------------------------------------------------------
         # Identity matrix: dot(I, X) = X, dot(X, I) = X.
@@ -4344,6 +4354,11 @@ class FormCompiler:
 
                     self.ctx.update(ctx_updates)
 
+                    # Collapsed coefficient evaluations (e.g. ∇u_k, Hessian(u_k)) depend on the
+                    # current quadrature point. Clear per-QP caches so values are not reused
+                    # across different points on ghost facets.
+                    self._collapsed_cache.clear()
+
                     val = self._visit(intg.integrand)
                     if is_functional:
                         data = val.data if isinstance(val, VecOpInfo) else val
@@ -4365,8 +4380,6 @@ class FormCompiler:
                         results[hook["name"]] = np.zeros_like(loc_acc, dtype=float)
                     results[hook["name"]] += loc_acc
                 else:
-                    if not rhs and loc_acc.ndim == 2:
-                        loc_acc = 0.5 * (loc_acc + loc_acc.T)
                     unique_dofs, union_to_unique = np.unique(global_dofs, return_inverse=True)
                     if rhs:
                         agg = np.zeros(len(unique_dofs), dtype=loc_acc.dtype)
@@ -4807,6 +4820,9 @@ class FormCompiler:
                             ctx_updates["_deformation_current"] = deform_ctx_entry
                         self.ctx.update(ctx_updates)
 
+                        # Per-QP cache invalidation (same rationale as in _assemble_ghost_edge_python).
+                        self._collapsed_cache.clear()
+
                         val = self._visit(intg.integrand)
                         if is_functional:
                             data = val.data if isinstance(val, VecOpInfo) else val
@@ -4828,8 +4844,6 @@ class FormCompiler:
                         results[hook["name"]] = np.zeros_like(loc_acc, dtype=float)
                     results[hook["name"]] += loc_acc
                 else:
-                    if not rhs and loc_acc.ndim == 2:
-                        loc_acc = 0.5 * (loc_acc + loc_acc.T)
                     unique_dofs, union_to_unique = np.unique(global_dofs, return_inverse=True)
                     if rhs:
                         agg = np.zeros(len(unique_dofs), dtype=loc_acc.dtype)
@@ -6675,12 +6689,21 @@ class FormCompiler:
         mesh, dh, me = self.me.mesh, self.dh, self.me
 
         # 1. pick edges -----------------------------------------------
-        edge_set = (intg.measure.defined_on
-                    if intg.measure.defined_on is not None
-                    else mesh.get_domain_bitset(intg.measure.tag, entity="edge"))
+        if intg.measure.defined_on is not None:
+            edge_set = intg.measure.defined_on
+        else:
+            # `dS` without `defined_on`/`tag` should integrate over the full boundary
+            # (mirrors `_assemble_boundary_edge_python` behavior).
+            if intg.measure.tag is None:
+                from pycutfem.utils.bitset import BitSet
+
+                edge_set = BitSet(np.fromiter((e.right is None for e in mesh.edges_list), bool))
+            else:
+                edge_set = mesh.get_domain_bitset(intg.measure.tag, entity="edge")
         on_facet = intg.measure.on_facet
         if edge_set.cardinality() == 0:
-            raise ValueError(f"[Assembler: boundary edge JIT] No edges defined for {intg.measure.tag}.")
+            tag = "boundary" if intg.measure.tag is None else str(intg.measure.tag)
+            raise ValueError(f"[Assembler: boundary edge JIT] No edges defined for {tag}.")
         dbg = os.getenv("PYCUTFEM_JIT_DEBUG", "").lower() in {"1", "true", "yes"}
         if dbg:
             logger.debug("[boundary-edge] n_edges=%d tag=%s", int(edge_set.cardinality()), str(intg.measure.tag))

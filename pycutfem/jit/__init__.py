@@ -166,17 +166,33 @@ def _compress_static_for_active(static: dict[str, Any],
         """
         Safe cache lookup for remapped arrays.
 
-        Cache values must be stored as (weakref(src_arr), remapped_arr). If an
-        unexpected value is encountered, it is evicted and treated as a miss.
-        This avoids silent ABI mismatches when caches are reused across code paths.
+        Cache values are stored as (weakref(src_arr), weakref(remapped_arr)).
+        Older entries may store the remapped array strongly; both formats are
+        accepted. If an unexpected value is encountered, it is evicted and
+        treated as a miss.
+
+        IMPORTANT: the cached *remapped* arrays must not be kept alive solely by
+        this cache in transient moving-interface runs; otherwise every refresh
+        would leak one full snapshot worth of union-sized tables. Storing the
+        value as a weakref ensures memory can be reclaimed once the owning
+        kernel/static bundle is replaced.
         """
         hit = compress_cache.get(key)
         if hit is None:
             return None
         if isinstance(hit, tuple) and len(hit) == 2 and isinstance(hit[0], _RefType):
-            wr, cached = hit
-            if wr() is src_arr:
-                return cached
+            wr_src, cached = hit
+            if wr_src() is src_arr:
+                if isinstance(cached, _RefType):
+                    arr = cached()
+                    if arr is None:
+                        compress_cache.pop(key, None)
+                        return None
+                    return arr
+                if isinstance(cached, np.ndarray):
+                    return cached
+                compress_cache.pop(key, None)
+                return None
             # Stale entry: ndarray was GC'ed and id() reused.
             compress_cache.pop(key, None)
             return None
@@ -243,7 +259,7 @@ def _compress_static_for_active(static: dict[str, Any],
                 hit = _cache_lookup(ck, v)
                 if hit is None:
                     hit = _remap_map(v)
-                    compress_cache[ck] = (weakref.ref(v), hit)
+                    compress_cache[ck] = (weakref.ref(v), weakref.ref(hit))
                 compressed[k] = hit
                 continue
             arr = v
@@ -258,7 +274,7 @@ def _compress_static_for_active(static: dict[str, Any],
                 hit = _cache_lookup(ck, arr)
                 if hit is None:
                     hit = _remap_union(arr)
-                    compress_cache[ck] = (weakref.ref(arr), hit)
+                    compress_cache[ck] = (weakref.ref(arr), weakref.ref(hit))
                 arr = hit
             compressed[k] = arr
         else:

@@ -14,6 +14,7 @@ from pycutfem.jit.ir import (
 from pycutfem.jit.symbols import encode
 import numpy as np
 import re
+import os
 
 
 # Numba is imported inside the generated kernel string
@@ -3892,7 +3893,10 @@ class NumbaCodeGen:
             # many small kernels). We already cache the generated Python source in
             # `~/.cache/pycutfem_jit`, so disable Numba caching on facet kernels by default.
             use_cache = not bool(getattr(self, "on_facet", False))
-            decorator = f"@numba.njit(parallel=True, fastmath=True, cache={str(use_cache)})"
+            # Parallel compilation can be very expensive for large generated kernels.
+            # Allow opting out via an env var while keeping the historical default.
+            use_parallel = os.getenv("PYCUTFEM_JIT_PARALLEL", "1").lower() not in {"0", "false", "no"}
+            decorator = f"@numba.njit(parallel={str(use_parallel)}, fastmath=True, cache={str(use_cache)})"
         # New Newton: The kernel signature and loop structure are updated.
         final_kernel_src = f"""
 import numba

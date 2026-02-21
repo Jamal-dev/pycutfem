@@ -6,6 +6,7 @@ from pycutfem.fem.reference import get_reference
 from functools import lru_cache
 import warnings
 from typing import Tuple, Dict, Any
+import os
 
 # ---------- small utilities ----------
 
@@ -676,8 +677,14 @@ def inverse_A4_material(A: np.ndarray, A2: np.ndarray,
 
 class InverseJetCache:
     """Cache geometry jets per (mesh, elem_id, xi, eta)."""
-    def __init__(self):
+    def __init__(self, *, max_entries: int | None = None):
         self.store: Dict[tuple, Dict[str, Any]] = {}
+        if max_entries is None:
+            try:
+                max_entries = int(os.getenv("PYCUTFEM_INVERSE_JET_CACHE_MAX", "200000") or "200000")
+            except Exception:
+                max_entries = 200000
+        self.max_entries = int(max_entries)
 
     def get(self, mesh, elem_id: int, xi: float, eta: float, upto: int = 4) -> Dict[str, Any]:
         k = _key(mesh, elem_id, xi, eta)
@@ -685,6 +692,14 @@ class InverseJetCache:
         if rec is None:
             rec = {}
             self.store[k] = rec
+            # Bound memory: moving-interface problems can generate a huge number
+            # of distinct (elem,xi,eta) keys over time. Keep this cache bounded.
+            if self.max_entries > 0:
+                while len(self.store) > self.max_entries:
+                    try:
+                        self.store.pop(next(iter(self.store)))
+                    except Exception:
+                        break
 
         # J, A
         if "J" not in rec or "A" not in rec:

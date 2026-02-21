@@ -123,6 +123,55 @@ def _facet_patch_geo_cache_put(key, value) -> None:
         except Exception:
             break
 
+def _cache_max_entries(env: str, default: int) -> int:
+    try:
+        return int(os.getenv(env, str(int(default))) or int(default))
+    except Exception:
+        return int(default)
+
+def _bounded_cache_put(cache: dict, key, value, *, max_entries: int) -> None:
+    """
+    Insert (key,value) into `cache` while bounding the number of retained entries.
+
+    This is crucial for time-dependent CutFEM runs where the level-set token and
+    cut/ghost entity sets change every step; naive caching would keep one full
+    precompute snapshot per step and can quickly exhaust RAM.
+    """
+    if int(max_entries) <= 0:
+        return
+    cache.pop(key, None)  # refresh insertion order when updating the same key
+    cache[key] = value
+    while len(cache) > int(max_entries):
+        try:
+            cache.pop(next(iter(cache)))
+        except Exception:
+            break
+
+def _cut_volume_cache_max_entries() -> int:
+    # Two entries are typically sufficient (cut + / cut -); keep the cache small
+    # because these tables can dominate memory in moving-interface problems.
+    return _cache_max_entries("PYCUTFEM_CUT_VOLUME_CACHE_MAX", 2)
+
+def _interface_cache_max_entries() -> int:
+    return _cache_max_entries("PYCUTFEM_INTERFACE_CACHE_MAX", 2)
+
+def _ghost_cache_max_entries() -> int:
+    return _cache_max_entries("PYCUTFEM_GHOST_CACHE_MAX", 2)
+
+def _nonmatching_cache_max_entries() -> int:
+    return _cache_max_entries("PYCUTFEM_NONMATCHING_CACHE_MAX", 2)
+
+def _edge_geom_cache_max_entries() -> int:
+    return _cache_max_entries("PYCUTFEM_EDGE_GEOM_CACHE_MAX", 16)
+
+def _jacobian_cache_max_entries() -> int:
+    # Geometry blocks can still be large for interface/ghost subsets; bound to a
+    # small-ish value by default to avoid unbounded growth in transient runs.
+    return _cache_max_entries("PYCUTFEM_JACOBIAN_CACHE_MAX", 16)
+
+def _interior_cache_max_entries() -> int:
+    return _cache_max_entries("PYCUTFEM_INTERIOR_CACHE_MAX", 8)
+
 
 class LinearConstraints:
     """
@@ -3302,11 +3351,16 @@ class DofHandler:
 
             qp_phys, qw_sc, detJ, J_inv, J_geo = _geom_kernel(elem_coord, Ntab, dNtab, qw_ref)
             if reuse:
-                _jacobian_cache[base_key] = {
-                    "J": J_geo.copy(),
-                    "det": detJ.copy(),
-                    "inv": J_inv.copy(),
-                }
+                _bounded_cache_put(
+                    _jacobian_cache,
+                    base_key,
+                    {
+                        "J": J_geo.copy(),
+                        "det": detJ.copy(),
+                        "inv": J_inv.copy(),
+                    },
+                    max_entries=_jacobian_cache_max_entries(),
+                )
 
         else:
             # ------------------ safe Python fallback (vectorised) ----------------
@@ -3323,11 +3377,16 @@ class DofHandler:
             detJ = detJ
             J_inv = invJ
             if reuse:
-                _jacobian_cache[base_key] = {
-                    "J": J_geo.copy(),
-                    "det": detJ.copy(),
-                    "inv": J_inv.copy(),
-                }
+                _bounded_cache_put(
+                    _jacobian_cache,
+                    base_key,
+                    {
+                        "J": J_geo.copy(),
+                        "det": detJ.copy(),
+                        "inv": J_inv.copy(),
+                    },
+                    max_entries=_jacobian_cache_max_entries(),
+                )
 
         # ---------------------- post-process & cache -----------------------------
         bad = np.where(detJ <= 1e-12)
@@ -3433,12 +3492,17 @@ class DofHandler:
                 qp_phys = qp_def
                 eps = 1e-300
                 qw_sc = qw_sc * (det_def / (det_geo + eps))
-                _jacobian_cache[final_key] = {
-                    "det": detJ.copy(),
-                    "inv": J_inv.copy(),
-                    "qp": qp_phys.copy(),
-                    "qw": qw_sc.copy(),
-                }
+                _bounded_cache_put(
+                    _jacobian_cache,
+                    final_key,
+                    {
+                        "det": detJ.copy(),
+                        "inv": J_inv.copy(),
+                        "qp": qp_phys.copy(),
+                        "qw": qw_sc.copy(),
+                    },
+                    max_entries=_jacobian_cache_max_entries(),
+                )
 
         # keep dictionary views in sync with the final (possibly deformed) arrays
         geo["qp_phys"] = qp_phys
@@ -4152,11 +4216,16 @@ class DofHandler:
                 inv_base[..., 1, 1] =  J_geom[..., 0, 0]
                 inv_base /= detJ[..., None, None]
                 J_inv = inv_base
-            _jacobian_cache[base_key] = {
-                "J": J_geom.copy(),
-                "det": detJ.copy(),
-                "inv": J_inv.copy(),
-            }
+            _bounded_cache_put(
+                _jacobian_cache,
+                base_key,
+                {
+                    "J": J_geom.copy(),
+                    "det": detJ.copy(),
+                    "inv": J_inv.copy(),
+                },
+                max_entries=_jacobian_cache_max_entries(),
+            )
 
         # Sanity
         bad = np.where(detJ <= 1e-12)
@@ -4186,14 +4255,13 @@ class DofHandler:
                 disp_nodes = np.asarray(deformation.node_displacements, float)
                 U_all = disp_nodes[node_ids_sel]
 
-                geom_entry = _jacobian_cache[base_key]
-                J_geom = geom_entry["J"]
-                inv_geom = geom_entry["inv"]
+                J_geom_base = J_geom
+                inv_geom = J_inv
 
                 Gref = np.einsum('eki,eqkj->eqij', U_all, dN_tab)
                 Gphy = np.einsum('eqij,eqjk->eqik', Gref, inv_geom)
                 F = np.eye(2)[None, None, :, :] + Gphy
-                Jt = np.einsum('eqij,eqjk->eqik', F, J_geom)
+                Jt = np.einsum('eqij,eqjk->eqik', F, J_geom_base)
                 detJ = Jt[..., 0, 0] * Jt[..., 1, 1] - Jt[..., 0, 1] * Jt[..., 1, 0]
                 inv_t = np.empty_like(Jt)
                 inv_t[..., 0, 0] =  Jt[..., 1, 1]
@@ -4234,13 +4302,18 @@ class DofHandler:
                 normals[..., 0] = nx / nn
                 normals[..., 1] = ny / nn
 
-                _jacobian_cache[final_key] = {
-                    "det": detJ.copy(),
-                    "inv": J_inv.copy(),
-                    "qp": qp_phys.copy(),
-                    "qw": qw.copy(),
-                    "normals": normals.copy(),
-                }
+                _bounded_cache_put(
+                    _jacobian_cache,
+                    final_key,
+                    {
+                        "det": detJ.copy(),
+                        "inv": J_inv.copy(),
+                        "qp": qp_phys.copy(),
+                        "qw": qw.copy(),
+                        "normals": normals.copy(),
+                    },
+                    max_entries=_jacobian_cache_max_entries(),
+                )
         # ensure downstream consumers see the updated geometry tensors
         qp_phys = np.asarray(qp_phys, dtype=np.float64, order="C")
         qw      = np.asarray(qw, dtype=np.float64, order="C")
@@ -4465,7 +4538,12 @@ class DofHandler:
             out["Qxi0"] = Qxi0; out["Qxi1"] = Qxi1
 
         if reuse:
-            _interface_cache[cache_key] = out
+            _bounded_cache_put(
+                _interface_cache,
+                cache_key,
+                out,
+                max_entries=_interface_cache_max_entries(),
+            )
         if _prof:
             try:
                 nE_out = int(np.asarray(out.get("qp_phys")).shape[0])
@@ -5195,14 +5273,19 @@ class DofHandler:
                 J_inv_pos /= detJ_pos[..., None, None]
                 J_inv_neg /= detJ_neg[..., None, None]
             if reuse:
-                _jacobian_cache[base_key] = {
-                    "J_pos": J_geom_pos.copy(),
-                    "J_neg": J_geom_neg.copy(),
-                    "det_pos": detJ_pos.copy(),
-                    "det_neg": detJ_neg.copy(),
-                    "inv_pos": J_inv_pos.copy(),
-                    "inv_neg": J_inv_neg.copy(),
-                }
+                _bounded_cache_put(
+                    _jacobian_cache,
+                    base_key,
+                    {
+                        "J_pos": J_geom_pos.copy(),
+                        "J_neg": J_geom_neg.copy(),
+                        "det_pos": detJ_pos.copy(),
+                        "det_neg": detJ_neg.copy(),
+                        "inv_pos": J_inv_pos.copy(),
+                        "inv_neg": J_inv_neg.copy(),
+                    },
+                    max_entries=_jacobian_cache_max_entries(),
+                )
 
         # sanity check
         bad = np.where((detJ_pos <= 1e-12) | (detJ_neg <= 1e-12))
@@ -5276,16 +5359,21 @@ class DofHandler:
                         phi_arr[i, q] = _eval_ls(pos_eid, qp_phys[i, q])
 
                 if reuse:
-                    _jacobian_cache[final_key] = {
-                        "det_pos": detJ_pos.copy(),
-                        "det_neg": detJ_neg.copy(),
-                        "inv_pos": J_inv_pos.copy(),
-                        "inv_neg": J_inv_neg.copy(),
-                        "qp": qp_phys.copy(),
-                        "qw": qw.copy(),
-                        "normals": normals.copy(),
-                        "phi": phi_arr.copy(),
-                    }
+                    _bounded_cache_put(
+                        _jacobian_cache,
+                        final_key,
+                        {
+                            "det_pos": detJ_pos.copy(),
+                            "det_neg": detJ_neg.copy(),
+                            "inv_pos": J_inv_pos.copy(),
+                            "inv_neg": J_inv_neg.copy(),
+                            "qp": qp_phys.copy(),
+                            "qw": qw.copy(),
+                            "normals": normals.copy(),
+                            "phi": phi_arr.copy(),
+                        },
+                        max_entries=_jacobian_cache_max_entries(),
+                    )
 
         elif normals.ndim == 3:
             # ensure normals arrays respect orientation with stored base normal vectors
@@ -5675,7 +5763,12 @@ class DofHandler:
             })
 
         if reuse:
-            _ghost_cache[cache_key] = out
+            _bounded_cache_put(
+                _ghost_cache,
+                cache_key,
+                out,
+                max_entries=_ghost_cache_max_entries(),
+            )
         if _prof:
             try:
                 nE_out = int(np.asarray(out.get("qp_phys")).shape[0])
@@ -6171,7 +6264,12 @@ class DofHandler:
             out.update({"pos_Qxi0": pos_Qxi0, "pos_Qxi1": pos_Qxi1, "neg_Qxi0": neg_Qxi0, "neg_Qxi1": neg_Qxi1})
 
         if reuse:
-            _nonmatching_cache[cache_key] = out
+            _bounded_cache_put(
+                _nonmatching_cache,
+                cache_key,
+                out,
+                max_entries=_nonmatching_cache_max_entries(),
+            )
         return out
 
 
@@ -8017,7 +8115,12 @@ class DofHandler:
             })
 
         if reuse:
-            _interior_cache[cache_key] = out
+            _bounded_cache_put(
+                _interior_cache,
+                cache_key,
+                out,
+                max_entries=_interior_cache_max_entries(),
+            )
         if _prof:
             _pc_print(
                 "interior_factors",
@@ -8456,7 +8559,12 @@ class DofHandler:
             out["Qxi0"] = Qxi0; out["Qxi1"] = Qxi1
 
         if reuse:
-            _edge_geom_cache[cache_key] = out
+            _bounded_cache_put(
+                _edge_geom_cache,
+                cache_key,
+                out,
+                max_entries=_edge_geom_cache_max_entries(),
+            )
         return out
 
 
@@ -8928,7 +9036,12 @@ class DofHandler:
                 out["Qxi1"] = Qxi1
 
             if reuse:
-                _cut_volume_cache[cache_key] = out
+                _bounded_cache_put(
+                    _cut_volume_cache,
+                    cache_key,
+                    out,
+                    max_entries=_cut_volume_cache_max_entries(),
+                )
             if _prof:
                 _pc_print(
                     "cut_volume_factors",
@@ -9504,7 +9617,12 @@ class DofHandler:
             out["Qxi1"] = Qxi1
 
         if reuse:
-            _cut_volume_cache[cache_key] = out
+            _bounded_cache_put(
+                _cut_volume_cache,
+                cache_key,
+                out,
+                max_entries=_cut_volume_cache_max_entries(),
+            )
         if _prof:
             try:
                 nE_out = int(np.asarray(out.get("qp_phys")).shape[0])

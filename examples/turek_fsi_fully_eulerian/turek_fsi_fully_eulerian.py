@@ -3604,7 +3604,7 @@ def recompute_active_dofs(solver: NewtonSolver, bcs_active: Sequence[BoundaryCon
     constraints = getattr(solver, "constraints", None)
     ndof_eff = int(constraints.n_master) if constraints is not None else int(dh.total_dofs)
     old_active = np.asarray(getattr(solver, "active_dofs", np.empty(0, dtype=int)), dtype=int)
-    active_by_restr, has_restriction = analyze_active_dofs(solver.equation, dh, solver.me, bcs_active)
+    active_by_restr, has_restriction = analyze_active_dofs(solver.equation, dh, solver.me, bcs_active, verbose=False)
     bc_dofs_full = set(dh.get_dirichlet_data(bcs_active).keys())
     inactive_full = set(dh.dof_tags.get("inactive", set()))
     inactive_free_full = inactive_full - bc_dofs_full

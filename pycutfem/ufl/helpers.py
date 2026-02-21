@@ -2265,7 +2265,14 @@ def _find_all_restrictions(form) -> list[Restriction]:
     return restrictions
 
 
-def analyze_active_dofs(equation: Equation, dh: DofHandler, me: MixedElement, bcs: list):
+def analyze_active_dofs(
+    equation: Equation,
+    dh: DofHandler,
+    me: MixedElement,
+    bcs: list,
+    *,
+    verbose: bool = True,
+):
     """Return (active_dofs, has_restriction) for reduced-system assembly.
 
     When no ``Restriction`` nodes are present we simply mark every DOF as
@@ -2338,10 +2345,12 @@ def analyze_active_dofs(equation: Equation, dh: DofHandler, me: MixedElement, bc
                 active_dofs.update(element_dofs[sl])
 
     if not saw_restriction:
-        print("No Restriction operators found. All DOFs are considered active.")
+        if verbose:
+            print("No Restriction operators found. All DOFs are considered active.")
         return np.arange(dh.total_dofs, dtype=int), False
 
-    print("Restriction operators found. Analyzing active domains...")
+    if verbose:
+        print("Restriction operators found. Analyzing active domains...")
     if not active_dofs:
         # Fall back to everything if analysis produced nothing (shouldn't happen).
         return np.arange(dh.total_dofs, dtype=int), True

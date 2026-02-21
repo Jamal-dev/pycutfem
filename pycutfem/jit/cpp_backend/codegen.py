@@ -1256,14 +1256,24 @@ class CppCodeGen:
                     coeff = coeff_array_name(a.parent, a.side)
                     required_args.add(coeff)
                     for idx, fn in enumerate(a.field_names):
-                        s0 = field_slices.get(fn, slice(0, 0)).start
-                        s1 = field_slices.get(fn, slice(0, 0)).stop
-                        s0_adj = new_tmp("s0")
-                        s1_adj = new_tmp("s1")
-                        emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                        emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                        emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
-                        emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
+                        side_tag = component_side_tag(a.side, getattr(a, "field_sides", None), fn, idx)
+                        # IMPORTANT (facet unions):
+                        # For ghost/interface edge kernels, the union DOF layout is built from the
+                        # *sorted global DOF ids* of the two owner elements. This layout does not
+                        # coincide with MixedElement.component_dof_slices. Therefore, do not use
+                        # slice-based coefficient loops on facets; iterate over the full union and
+                        # rely on the sided r** tables (which are scattered to union indices).
+                        if self.on_facet and side_tag in ("pos", "neg"):
+                            emit_line("for (ssize_t j=0; j<n_union; ++j) {")
+                        else:
+                            s0 = field_slices.get(fn, slice(0, 0)).start
+                            s1 = field_slices.get(fn, slice(0, 0)).stop
+                            s0_adj = new_tmp("s0")
+                            s1_adj = new_tmp("s1")
+                            emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                            emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                            emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                            emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
                         emit_line(f"    double coeff = {coeff}_view(e,j);")
                         jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
                         hx_var = "Hx_pos" if a.side == "+" else "Hx_neg" if a.side == "-" else "Hx"
@@ -1331,14 +1341,18 @@ class CppCodeGen:
                     coeff = coeff_array_name(a.parent, a.side)
                     required_args.add(coeff)
                     for idx, fn in enumerate(a.field_names):
-                        s0 = field_slices.get(fn, slice(0, 0)).start
-                        s1 = field_slices.get(fn, slice(0, 0)).stop
-                        s0_adj = new_tmp("s0")
-                        s1_adj = new_tmp("s1")
-                        emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                        emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                        emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
-                        emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
+                        side_tag = component_side_tag(a.side, getattr(a, "field_sides", None), fn, idx)
+                        if self.on_facet and side_tag in ("pos", "neg"):
+                            emit_line("for (ssize_t j=0; j<n_union; ++j) {")
+                        else:
+                            s0 = field_slices.get(fn, slice(0, 0)).start
+                            s1 = field_slices.get(fn, slice(0, 0)).stop
+                            s0_adj = new_tmp("s0")
+                            s1_adj = new_tmp("s1")
+                            emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                            emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                            emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                            emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
                         emit_line(f"    double coeff = {coeff}_view(e,j);")
                         jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
                         hx_var = "Hx_pos" if a.side == "+" else "Hx_neg" if a.side == "-" else "Hx"

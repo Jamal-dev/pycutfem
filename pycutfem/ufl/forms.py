@@ -39,6 +39,31 @@ class Form(Expression):
         # Create a new Form where each integral's integrand is negated.
         return Form([integral.__neg__() for integral in self.integrals])
 
+    def __mul__(self, other):
+        """
+        Scale a form by a scalar factor by scaling each integral's integrand.
+
+        Notes
+        -----
+        - Prefer `form * Constant(c)` over `Constant(c) * form` since the left
+          operand's `__mul__` may eagerly build a generic expression tree.
+        """
+        if isinstance(other, (Integral, Form)):
+            raise TypeError("Multiplying two forms/integrals is not supported.")
+        if isinstance(other, numbers.Real):
+            other = Constant(float(other))
+        if not isinstance(other, Expression):
+            return NotImplemented
+        return Form([Integral(other * I.integrand, I.measure) for I in self.integrals])
+
+    def __rmul__(self, other):
+        if isinstance(other, numbers.Real):
+            return self.__mul__(other)
+        if isinstance(other, Expression):
+            # See note in __mul__: Constant * Form will usually not reach here.
+            return self.__mul__(other)
+        return NotImplemented
+
     def __eq__(self, other):
         """Handles cases like `my_form == None`."""
         return Equation(self, other)

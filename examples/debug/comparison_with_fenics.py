@@ -21,7 +21,8 @@ from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner,
-    dot, div, trace, Hessian, Laplacian, FacetNormal, Identity, det, inv
+    dot, div, trace, Hessian, Laplacian, FacetNormal, Identity, det, inv,
+    pos_part, heaviside,
 )
 from pycutfem.ufl.measures import dx, dInterface, dS
 from pycutfem.ufl.forms import assemble_form
@@ -2998,10 +2999,229 @@ def print_test_summary(success_count, failed_tests):
     print("="*70)
 
 # ==============================================================================
+#  Semi-smooth contact (PositivePart/Heaviside) comparison harness vs FEniCSx
+# ==============================================================================
+
+
+def setup_contact_problems(*, nx: int = 2, ny: int = 2):
+    """
+    Build a small mixed space (u, p) for a boundary contact-form comparison:
+      pycutfem: u = (ux,uy) Q2, p Q1
+      dolfinx : u = vector Q2, p Q1  (quadrilateral)
+
+    The forms exercise `pos_part` and `heaviside` on a boundary integral.
+    """
+    # --- pycutfem mesh (Q2 geometry so dof coordinates match dolfinx's Q2 dofs) ---
+    nodes_q2, elems_q2, _, corners_q2 = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
+    mesh_q2 = Mesh(
+        nodes=nodes_q2,
+        element_connectivity=elems_q2,
+        elements_corner_nodes=corners_q2,
+        element_type="quad",
+        poly_order=2,
+    )
+    mesh_q2.tag_boundary_edges({"all": lambda x, y: True})
+
+    mixed_element_pc = MixedElement(mesh_q2, field_specs={"ux": 2, "uy": 2, "p": 1})
+    dof_handler_pc = DofHandler(mixed_element_pc, method="cg")
+
+    # --- dolfinx mesh and mixed space ---
+    mesh_fx = dolfinx.mesh.create_unit_square(
+        MPI.COMM_WORLD,
+        nx,
+        ny,
+        cell_type=dolfinx.mesh.CellType.quadrilateral,
+    )
+    cell = mesh_fx.ufl_cell()
+    cell_name = cell.cellname() if hasattr(cell, "cellname") else cell.name
+    V_el = basix.ufl.element("Lagrange", cell_name, 2, shape=(2,))
+    Q_el = basix.ufl.element("Lagrange", cell_name, 1)
+    W_el = mixed_element([V_el, Q_el])
+    if hasattr(dolfinx.fem, "functionspace"):
+        W_fx = dolfinx.fem.functionspace(mesh_fx, W_el)
+    else:
+        W_fx = dolfinx.fem.FunctionSpace(mesh_fx, W_el)
+
+    w_k_fx = dolfinx.fem.Function(W_fx)
+    n_fx = ufl.FacetNormal(mesh_fx)
+    ds_fx = ufl.ds(domain=mesh_fx)
+
+    gamma_val = float(os.environ.get("COMP_FENICS_CONTACT_GAMMA", "2.0"))
+    g_val = float(os.environ.get("COMP_FENICS_CONTACT_G", "0.5"))
+    gamma_fx = dolfinx.fem.Constant(mesh_fx, PETSc.ScalarType(gamma_val))
+    g_fx = dolfinx.fem.Constant(mesh_fx, PETSc.ScalarType(g_val))
+
+    fenicsx = {
+        "mesh": mesh_fx,
+        "W": W_fx,
+        "w_k": w_k_fx,
+        "normal": n_fx,
+        "ds": ds_fx,
+        "gamma": gamma_fx,
+        "g": g_fx,
+    }
+    return dof_handler_pc, fenicsx
+
+
+def run_contact_comparison():
+    """
+    Compare a semi-smooth contact residual/Jacobian (PositivePart + Heaviside)
+    between pycutfem and dolfinx on a simple (u,p) mixed space.
+
+    Two deterministic cases are tested:
+      - inactive: u=(0,0)       => P<0 everywhere on ∂Ω  => residual/jacobian = 0
+      - active  : u=(0,-1)      => P>0 only on bottom edge (n=(0,-1))
+    """
+    nx = int(os.environ.get("COMP_FENICS_NX", "2"))
+    ny = int(os.environ.get("COMP_FENICS_NY", os.environ.get("COMP_FENICS_NX", "2")))
+    qdeg = int(os.environ.get("COMP_FENICS_QDEG", "6"))
+
+    dof_handler_pc, fenicsx = setup_contact_problems(nx=nx, ny=ny)
+    W_fx = fenicsx["W"]
+    P_map = create_true_dof_map(dof_handler_pc, W_fx)
+
+    # --- pycutfem trial/test/state ---
+    V_pc = FunctionSpace("V", ["ux", "uy"])
+    Q_pc = FunctionSpace("Q", ["p"])
+    du_pc = VectorTrialFunction(V_pc, dof_handler=dof_handler_pc)
+    dp_pc = TrialFunction(name="dp", field_name="p", dof_handler=dof_handler_pc)
+    v_pc = VectorTestFunction(V_pc, dof_handler=dof_handler_pc)
+    q_pc = TestFunction(name="q", field_name="p", dof_handler=dof_handler_pc)
+    _ = (dp_pc, q_pc)  # included to keep the mixed layout consistent; not used in the contact forms
+
+    u_pc = VectorFunction("u", ["ux", "uy"], dof_handler_pc)
+    p_pc = Function("p", "p", dof_handler_pc)
+    n_pc = FacetNormal()
+
+    gamma_pc = Constant(float(fenicsx["gamma"].value))
+    g_pc = Constant(float(fenicsx["g"].value))
+
+    P_pc = dot(u_pc, n_pc) - g_pc
+    r_pc = gamma_pc * pos_part(P_pc) * dot(v_pc, n_pc) * dS()
+    a_pc = gamma_pc * heaviside(P_pc) * dot(du_pc, n_pc) * dot(v_pc, n_pc) * dS()
+
+    # --- dolfinx forms (explicit semi-smooth Jacobian) ---
+    w_k_fx = fenicsx["w_k"]
+    u_fx, p_fx = ufl.split(w_k_fx)
+    dw_fx = ufl.TrialFunction(W_fx)
+    du_fx, dp_fx = ufl.split(dw_fx)
+    w_test_fx = ufl.TestFunction(W_fx)
+    v_fx, q_fx = ufl.split(w_test_fx)
+    _ = (p_fx, dp_fx, q_fx)  # p is present only to mirror the mixed layout
+
+    gamma_fx = fenicsx["gamma"]
+    g_fx = fenicsx["g"]
+    n_fx = fenicsx["normal"]
+    ds_fx = fenicsx["ds"]
+
+    P_fx = ufl.dot(u_fx, n_fx) - g_fx
+    r_fx = gamma_fx * ufl.max_value(P_fx, 0.0) * ufl.dot(v_fx, n_fx) * ds_fx
+    H_fx = ufl.conditional(ufl.gt(P_fx, 0.0), 1.0, 0.0)
+    a_fx = gamma_fx * H_fx * ufl.dot(du_fx, n_fx) * ufl.dot(v_fx, n_fx) * ds_fx
+
+    # Cases: choose u so the active set is deterministic and away from P=0.
+    cases = {
+        "inactive": (0.0, 0.0),
+        "active": (0.0, -1.0),
+    }
+
+    backends_spec = os.environ.get("BACKEND", "jit")
+    if backends_spec.strip().lower() == "all":
+        backends = ["python", "jit", "cpp"]
+    else:
+        backends = [b.strip() for b in backends_spec.split(",") if b.strip()]
+
+    failed_tests = []
+    success_count = 0
+
+    for backend_type in backends:
+        print("\n" + "=" * 70)
+        print(f"CONTACT COMPARISON (backend={backend_type})")
+        print("=" * 70)
+
+        for case_name, (ux_val, uy_val) in cases.items():
+            # --- set pycutfem coefficients ---
+            u_pc.set_values_from_function(lambda x, y, ux=float(ux_val), uy=float(uy_val): np.array([ux, uy], float))
+            p_pc.nodal_values[:] = 0.0
+
+            # --- set dolfinx coefficients via coordinate-based DoF map ---
+            U_full_pc = np.zeros(dof_handler_pc.total_dofs, dtype=float)
+            U_full_pc[dof_handler_pc.get_field_slice("ux")] = float(ux_val)
+            U_full_pc[dof_handler_pc.get_field_slice("uy")] = float(uy_val)
+            U_full_pc[dof_handler_pc.get_field_slice("p")] = 0.0
+
+            w_k_fx.x.array[:] = 0.0
+            w_k_fx.x.array[np.asarray(P_map, dtype=int)] = U_full_pc
+            w_k_fx.x.scatter_forward()
+
+            name = f"Contact ({case_name})"
+            print(f"\nCompiling/assembling '{name}' [backend={backend_type}, qdeg={qdeg}]")
+
+            try:
+                # Assemble pycutfem
+                J_pc, _ = assemble_form(
+                    Equation(a_pc, None),
+                    dof_handler_pc,
+                    quad_degree=qdeg,
+                    bcs=[],
+                    backend=backend_type,
+                )
+                _, R_pc = assemble_form(
+                    Equation(None, r_pc),
+                    dof_handler_pc,
+                    quad_degree=qdeg,
+                    bcs=[],
+                    backend=backend_type,
+                )
+            except Exception as exc:
+                print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                failed_tests.append(f"{name} (assemble-{backend_type})")
+                continue
+
+            try:
+                # Assemble dolfinx
+                r_fx_form = dolfinx.fem.form(r_fx)
+                a_fx_form = dolfinx.fem.form(a_fx)
+                vec = dolfinx.fem.petsc.assemble_vector(r_fx_form)
+                R_fx = vec.array
+
+                A = dolfinx.fem.petsc.assemble_matrix(a_fx_form)
+                A.assemble()
+                indptr, indices, data = A.getValuesCSR()
+                J_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+            except Exception as exc:
+                print(f"❌ dolfinx assembly failed for '{name}': {exc}")
+                failed_tests.append(f"{name} (fenics-assemble)")
+                continue
+
+            is_success = compare_term(
+                f"{name} [backend={backend_type}]",
+                J_pc,
+                R_pc,
+                J_fx,
+                R_fx,
+                P_map,
+                dof_handler_pc,
+                W_fx,
+                rtol=1e-9,
+                atol=1e-9,
+            )
+            if is_success:
+                success_count += 1
+            else:
+                failed_tests.append(f"{name} (mismatch-{backend_type})")
+
+    print_test_summary(success_count, failed_tests)
+
+
+# ==============================================================================
 #                      MAIN TEST HARNESS
 # ==============================================================================
 if __name__ == '__main__':
     problem = os.environ.get("COMP_FENICS_PROBLEM", "fluid").strip().lower()
+    if problem.startswith("contact") or problem.startswith("semismooth"):
+        run_contact_comparison()
+        sys.exit(0)
     if problem.startswith("alpha_ch") or problem.startswith("cahn_hilliard") or problem.startswith("cahn-hilliard"):
         run_alpha_ch_comparison()
         sys.exit(0)
