@@ -15,7 +15,7 @@ from .compiler import compile_extension, get_compile_mode_tag
 # Bump when generated C++ changes in a way that requires recompilation of cached kernels.
 # Bump when generated C++ changes or when helper semantics change in a way that
 # requires recompilation of cached kernels (e.g. stride-aware accessors).
-CODEGEN_ABI_CPP = "2026-02-20-cpp-v19-hessian-facet-union"
+CODEGEN_ABI_CPP = "2026-02-22-cpp-v22-temp-pool-transpose"
 
 
 class CppKernelCache:
@@ -61,7 +61,7 @@ class CppKernelCache:
         (kernel_fn, param_order list, active_fields list).
         """
         ir_hash = KernelCache._hash_ir(ir_sequence, mesh_sig)
-        compile_tag = get_compile_mode_tag()
+        compile_tag = get_compile_mode_tag(ir_len=len(ir_sequence))
         cache_key = f"{ir_hash}:{compile_tag}"
 
         if cache_key in self.in_memory_cache:
@@ -97,6 +97,7 @@ class CppKernelCache:
                 source_file,
                 self._cache_dir,
                 include_dirs=include_dirs,
+                compile_mode=compile_tag,
             )
 
         module = self._import_module(module_name, built_module)
@@ -113,6 +114,7 @@ class CppKernelCache:
                 source_file,
                 self._cache_dir,
                 include_dirs=list(codegen.include_dirs),
+                compile_mode=compile_tag,
             )
             module = self._import_module(module_name, built_module, force_reload=True)
 
