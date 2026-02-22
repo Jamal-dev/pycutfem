@@ -511,6 +511,7 @@ class CppCodeGen:
                 "field_sides",
                 "tmp_kind",
                 "tmp_slot",
+                "tmp_pinned",
             )
 
             def __init__(
@@ -526,6 +527,7 @@ class CppCodeGen:
                 *,
                 tmp_kind: str | None = None,
                 tmp_slot: int | None = None,
+                tmp_pinned: bool = False,
             ):
                 self.name = name
                 self.kind = kind  # scalar | mat | grad | vec | const_arr
@@ -537,6 +539,7 @@ class CppCodeGen:
                 self.field_sides = field_sides or []
                 self.tmp_kind = tmp_kind
                 self.tmp_slot = tmp_slot
+                self.tmp_pinned = bool(tmp_pinned)
 
         # Hoist constant-array mapping out of the quadrature loop.
         # NOTE: calling pybind11 APIs (like .request()) inside an OpenMP region
@@ -649,7 +652,11 @@ class CppCodeGen:
         class _Stack(list):
             def pop(self, *args):  # type: ignore[override]
                 item = super().pop(*args)
-                if temp_pool.enabled and getattr(item, "tmp_kind", None) is not None:
+                if (
+                    temp_pool.enabled
+                    and getattr(item, "tmp_kind", None) is not None
+                    and not bool(getattr(item, "tmp_pinned", False))
+                ):
                     temp_pool.release(item.tmp_kind, item.tmp_slot)
                 return item
 
@@ -663,6 +670,14 @@ class CppCodeGen:
         grad_cache: dict[tuple, StackItem] = {}
         hess_cache: dict[tuple, StackItem] = {}
         lap_cache: dict[tuple, StackItem] = {}
+
+        def _pin_for_cache(item: StackItem) -> StackItem:
+            # Cached values must refer to stable storage for the remainder of the
+            # (e,q) iteration. If the value lives in the temp pool, pin it so its
+            # slot is not released/reused by later operations.
+            if temp_pool.enabled and getattr(item, "tmp_kind", None) is not None:
+                item.tmp_pinned = True
+            return item
 
         def _key_tuple(values: Iterable[Any]) -> tuple:
             out: list[Any] = []
@@ -918,26 +933,26 @@ class CppCodeGen:
                             op.field_sides or [],
                         )
                         stack.append(item)
-                        loadvar_cache[lv_key] = item
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
                         continue
                     k = len(op.field_names)
-                    nm = new_tmp("val")
-                    emit_line(f"Eigen::VectorXd {nm}({k});")
-                    emit_line(f"{nm}.setZero();")
-                    for idx, fn in enumerate(op.field_names):
+                    if k == 1:
+                        fn = op.field_names[0]
+                        nm = new_tmp("val")
                         s0 = field_slices.get(fn, slice(0, 0)).start
                         s1 = field_slices.get(fn, slice(0, 0)).stop
-                        side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx)
+                        side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, 0)
                         if self.on_facet and side_tag in ("pos", "neg"):
                             basis_name = f"r00_{fn}_{side_tag}"
-                            map_name   = f"{side_tag}_map_{fn}"
+                            map_name = f"{side_tag}_map_{fn}"
                             required_args.update({basis_name, map_name})
                             mask_name = None
                             if apply_restrict_mask:
                                 mask_name = f"restrict_mask_{fn}_{side_tag}"
                                 required_args.add(mask_name)
-                            emit_line(f"{nm}({idx}) = 0.0;")
-                            map_len = new_tmp("map_len"); basis_len = new_tmp("basis_len")
+                            emit_line(f"double {nm} = 0.0;")
+                            map_len = new_tmp("map_len")
+                            basis_len = new_tmp("basis_len")
                             emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
                             emit_line(f"ssize_t {basis_len} = {basis_name}_view.shape(2);")
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
@@ -950,20 +965,19 @@ class CppCodeGen:
                             emit_line(f"    double coeff = {coeff_name}_view(e, col);")
                             if mask_name is not None:
                                 emit_line(f"    coeff *= {mask_name}_view(e, col);")
-                            emit_line(f"    {nm}({idx}) += coeff * {basis_name}_view(e, q, src);")
+                            emit_line(f"    {nm} += coeff * {basis_name}_view(e, q, src);")
                             emit_line("}")
                         else:
-                            s0_adj = new_tmp("s0"); s1_adj = new_tmp("s1")
+                            s0_adj = new_tmp("s0")
+                            s1_adj = new_tmp("s1")
                             emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
                             emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
                             emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
                             emit_line(
-                                f"{nm}({idx}) = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0_adj}, {s1_adj});"
+                                f"double {nm} = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0_adj}, {s1_adj});"
                             )
-                    if k == 1:
-                        emit_line(f"double {nm}_scalar = {nm}(0);")
                         item = StackItem(
-                            f"{nm}_scalar",
+                            nm,
                             "scalar",
                             "value",
                             (),
@@ -973,6 +987,47 @@ class CppCodeGen:
                             op.field_sides or [],
                         )
                     else:
+                        nm = new_tmp("val")
+                        emit_line(f"Eigen::VectorXd {nm}({k});")
+                        emit_line(f"{nm}.setZero();")
+                        for idx, fn in enumerate(op.field_names):
+                            s0 = field_slices.get(fn, slice(0, 0)).start
+                            s1 = field_slices.get(fn, slice(0, 0)).stop
+                            side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx)
+                            if self.on_facet and side_tag in ("pos", "neg"):
+                                basis_name = f"r00_{fn}_{side_tag}"
+                                map_name = f"{side_tag}_map_{fn}"
+                                required_args.update({basis_name, map_name})
+                                mask_name = None
+                                if apply_restrict_mask:
+                                    mask_name = f"restrict_mask_{fn}_{side_tag}"
+                                    required_args.add(mask_name)
+                                emit_line(f"{nm}({idx}) = 0.0;")
+                                map_len = new_tmp("map_len")
+                                basis_len = new_tmp("basis_len")
+                                emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
+                                emit_line(f"ssize_t {basis_len} = {basis_name}_view.shape(2);")
+                                emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
+                                emit_line(f"    int col = {map_name}_view(e, j);")
+                                emit_line(f"    if (col < 0 || col >= n_union) continue;")
+                                emit_line(
+                                    f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                                )
+                                emit_line(f"    if (src >= {basis_len}) continue;")
+                                emit_line(f"    double coeff = {coeff_name}_view(e, col);")
+                                if mask_name is not None:
+                                    emit_line(f"    coeff *= {mask_name}_view(e, col);")
+                                emit_line(f"    {nm}({idx}) += coeff * {basis_name}_view(e, q, src);")
+                                emit_line("}")
+                            else:
+                                s0_adj = new_tmp("s0")
+                                s1_adj = new_tmp("s1")
+                                emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                                emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                                emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                emit_line(
+                                    f"{nm}({idx}) = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0_adj}, {s1_adj});"
+                                )
                         item = StackItem(
                             nm,
                             "vec",
@@ -984,7 +1039,7 @@ class CppCodeGen:
                             op.field_sides or [],
                         )
                     stack.append(item)
-                    loadvar_cache[lv_key] = item
+                    loadvar_cache[lv_key] = _pin_for_cache(item)
                 elif op.role in {"test", "trial"} and op.deriv_order == (0, 0):
                     if followed_by_diff:
                         stack.append(
@@ -1022,9 +1077,13 @@ class CppCodeGen:
                         bvec_name = f"bvec_{hdiv_field}_{side_tag}" if side_tag else f"bvec_{hdiv_field}"
                         sign_name = f"sign_{hdiv_field}_{side_tag}" if side_tag else f"sign_{hdiv_field}"
                         required_args.update({bvec_name, sign_name})
-                        nm = new_tmp("hdiv_basis")
-                        emit_line(f"Eigen::MatrixXd {nm}(2, n_union);")
-                        emit_line(f"{nm}.setZero();")
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "hdiv_basis")
+                        if tmp_kind is not None:
+                            emit_line(f"{nm}.resize(2, n_union);")
+                            emit_line(f"{nm}.setZero();")
+                        else:
+                            emit_line(f"Eigen::MatrixXd {nm}(2, n_union);")
+                            emit_line(f"{nm}.setZero();")
                         adj = new_tmp("adj")
                         emit_line(f"Eigen::Matrix<double,2,2> {adj};")
                         jloc_var = "Jloc_pos" if op.side == "+" else "Jloc_neg" if op.side == "-" else "Jloc"
@@ -1039,14 +1098,29 @@ class CppCodeGen:
                         emit_line(f"    {nm}(0, j) = b0 * s;")
                         emit_line(f"    {nm}(1, j) = b1 * s;")
                         emit_line("}")
-                        item = StackItem(nm, "mat", op.role, (2, -1), op.field_names, op.name, op.side, op.field_sides)
+                        item = StackItem(
+                            nm,
+                            "mat",
+                            op.role,
+                            (2, -1),
+                            op.field_names,
+                            op.name,
+                            op.side,
+                            op.field_sides,
+                            tmp_kind=tmp_kind,
+                            tmp_slot=tmp_slot,
+                        )
                         stack.append(item)
-                        loadvar_cache[lv_key] = item
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
                         continue
                     k = len(op.field_names)
-                    nm = new_tmp("basis")
-                    emit_line(f"Eigen::MatrixXd {nm}({k}, n_union);")
-                    emit_line(f"{nm}.setZero();")
+                    nm, tmp_kind, tmp_slot = alloc_tmp("mat", "basis")
+                    if tmp_kind is not None:
+                        emit_line(f"{nm}.resize({k}, n_union);")
+                        emit_line(f"{nm}.setZero();")
+                    else:
+                        emit_line(f"Eigen::MatrixXd {nm}({k}, n_union);")
+                        emit_line(f"{nm}.setZero();")
                     for idx2, fn in enumerate(op.field_names):
                         side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx2)
                         use_side = (self.on_facet and side_tag in ("pos", "neg"))
@@ -1072,9 +1146,20 @@ class CppCodeGen:
                             emit_line(
                                 f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx2}, j) = {basis_name}_view(e, q, j);"
                             )
-                    item = StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides)
+                    item = StackItem(
+                        nm,
+                        "mat",
+                        op.role,
+                        (k, -1),
+                        op.field_names,
+                        op.name,
+                        op.side,
+                        op.field_sides,
+                        tmp_kind=tmp_kind,
+                        tmp_slot=tmp_slot,
+                    )
                     stack.append(item)
-                    loadvar_cache[lv_key] = item
+                    loadvar_cache[lv_key] = _pin_for_cache(item)
                 elif op.role in {"test", "trial"} and op.deriv_order in {(1, 0), (0, 1)}:
                     # First derivative requested directly (no Grad op).
                     # Build a (k x n_union) matrix with the selected physical component.
@@ -1139,7 +1224,7 @@ class CppCodeGen:
                             emit_line("}")
                     item = StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides)
                     stack.append(item)
-                    loadvar_cache[lv_key] = item
+                    loadvar_cache[lv_key] = _pin_for_cache(item)
                 elif op.role in {"test", "trial"} and op.deriv_order in {(2, 0), (1, 1), (0, 2)}:
                     lv_key = (
                         "LoadVariable",
@@ -1184,7 +1269,7 @@ class CppCodeGen:
                         emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx2}, j) = {table_name}_view(e, q, j);")
                     item = StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides)
                     stack.append(item)
-                    loadvar_cache[lv_key] = item
+                    loadvar_cache[lv_key] = _pin_for_cache(item)
                 elif op.role == "function":
                     # Coefficient derivatives (from UFL Derivative nodes) arrive here as
                     # LoadVariable(role="function", deriv_order != (0,0)).
@@ -1232,7 +1317,7 @@ class CppCodeGen:
                     if k <= 0:
                         item = StackItem("0.0", "scalar", "value", (), [], op.name, op.side, fs_clean)
                         stack.append(item)
-                        loadvar_cache[lv_key] = item
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
                         continue
 
                     if k == 1:
@@ -1282,7 +1367,7 @@ class CppCodeGen:
 
                         item = StackItem(nm, "scalar", "value", (), op.field_names, op.name, op.side, fs_clean)
                         stack.append(item)
-                        loadvar_cache[lv_key] = item
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
                     else:
                         nm = new_tmp("dvec")
                         emit_line(f"Eigen::VectorXd {nm}({k});")
@@ -1333,7 +1418,7 @@ class CppCodeGen:
 
                         item = StackItem(nm, "vec", "value", (k,), op.field_names, op.name, op.side, fs_clean)
                         stack.append(item)
-                        loadvar_cache[lv_key] = item
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
                 else:
                     raise NotImplementedError(f"LoadVariable role {op.role} unsupported in C++ backend")
             elif isinstance(op, Grad):
@@ -1401,7 +1486,7 @@ class CppCodeGen:
                             emit_line("}")
                     item = StackItem(nm, "grad", a.role, (k, -1, 2), a.field_names, a.parent, a.side, a.field_sides)
                     stack.append(item)
-                    grad_cache[gv_key] = item
+                    grad_cache[gv_key] = _pin_for_cache(item)
                 elif a.role == "value":
                     # gradient of Function/VectorFunction values using coefficients and grad basis
                     apply_restrict_mask = bool(self.on_facet and isinstance(next_op, CheckDomain))
@@ -1478,7 +1563,7 @@ class CppCodeGen:
                             )
                     item = StackItem(nm, "mat", "value", (k, 2), a.field_names, a.parent, a.side, a.field_sides)
                     stack.append(item)
-                    grad_cache[gv_key] = item
+                    grad_cache[gv_key] = _pin_for_cache(item)
                 else:
                     raise NotImplementedError("Grad on unsupported item")
             elif isinstance(op, IRHessian):
@@ -1534,7 +1619,7 @@ class CppCodeGen:
                         emit_line("}")
                     item = StackItem(nm, "hess", a.role, (k, -1, 2, 2), a.field_names, a.parent)
                     stack.append(item)
-                    hess_cache[hv_key] = item
+                    hess_cache[hv_key] = _pin_for_cache(item)
                 elif a.role == "value":
                     k = len(a.field_names)
                     nm = new_tmp("hessv")
@@ -1584,7 +1669,7 @@ class CppCodeGen:
                         emit_line("}")
                     item = StackItem(nm, "hess", "value", (k, 2, 2), a.field_names, a.parent, a.side, a.field_sides)
                     stack.append(item)
-                    hess_cache[hv_key] = item
+                    hess_cache[hv_key] = _pin_for_cache(item)
                 else:
                     raise NotImplementedError("Hessian on unsupported item")
             elif isinstance(op, IRLaplacian):
@@ -1635,7 +1720,7 @@ class CppCodeGen:
                         emit_line("}")
                     item = StackItem(nm, "mat", a.role, (k, -1), a.field_names, a.parent)
                     stack.append(item)
-                    lap_cache[lap_key] = item
+                    lap_cache[lap_key] = _pin_for_cache(item)
                 elif a.role == "value":
                     k = len(a.field_names)
                     nm = new_tmp("lapv")
@@ -1677,7 +1762,7 @@ class CppCodeGen:
                         emit_line("}")
                     item = StackItem(nm, "mat", "value", (k,), a.field_names, a.parent, a.side, a.field_sides)
                     stack.append(item)
-                    lap_cache[lap_key] = item
+                    lap_cache[lap_key] = _pin_for_cache(item)
                 else:
                     raise NotImplementedError("Laplacian on unsupported item")
             elif isinstance(op, HdivDiv):
@@ -3384,17 +3469,17 @@ class CppCodeGen:
 
         loop_block = "\n".join(body_lines)
 
-        workspace_lines: list[str] = []
+        thread_workspace_lines: list[str] = []
         if temp_pool.enabled:
             n_s = temp_pool.size("scalar")
             n_v = temp_pool.size("vec")
             n_m = temp_pool.size("mat")
             if n_s:
-                workspace_lines.append(f"            double _s[{n_s}];")
+                thread_workspace_lines.append(f"            double _s[{n_s}];")
             if n_v:
-                workspace_lines.append(f"            Eigen::VectorXd _v[{n_v}];")
+                thread_workspace_lines.append(f"            Eigen::VectorXd _v[{n_v}];")
             if n_m:
-                workspace_lines.append(f"            Eigen::MatrixXd _m[{n_m}];")
+                thread_workspace_lines.append(f"            Eigen::MatrixXd _m[{n_m}];")
 
         # Include any late-discovered kernel args (maps, masks, sided grads, ...).
         # Unlike the Python/Numba backend, the C++ codegen learns some required
@@ -3588,14 +3673,19 @@ class CppCodeGen:
 
     {{
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel
 #endif
-        for (ssize_t e = 0; e < n_elem; ++e) {{
-            for (ssize_t q = 0; q < n_q; ++q) {{
+        {{
+{chr(10).join(thread_workspace_lines)}
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (ssize_t e = 0; e < n_elem; ++e) {{
+                for (ssize_t q = 0; q < n_q; ++q) {{
 {chr(10).join(jloc_lines)}
 {chr(10).join(hxhy_lines)}
-{chr(10).join(workspace_lines)}
 {loop_block}
+                }}
             }}
         }}
     }}

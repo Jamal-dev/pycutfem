@@ -3686,6 +3686,7 @@ class NewtonSolver:
         prof_entries = []
         debug_kernel = os.getenv("PYCUTFEM_DEBUG_KERNELS", "").lower() in {"1", "true", "yes"}
         debug_kernel_min_elems = int(os.getenv("PYCUTFEM_DEBUG_KERNELS_MIN_ELEMS", "0") or "0")
+        trace_exec = os.getenv("PYCUTFEM_TRACE_KERNEL_EXEC", "").lower() in {"1", "true", "yes"}
         debug_seen = getattr(self, "_debug_kernel_seen", None)
         if debug_kernel and debug_seen is None:
             debug_seen = set()
@@ -3701,8 +3702,18 @@ class NewtonSolver:
             if isinstance(gdofs, np.ndarray) and gdofs.shape[0] == 0:
                 continue
             t_exec = time.perf_counter()
+            if trace_exec:
+                print(
+                    f"        [kern] exec jacobian dom={getattr(ker,'domain','?')} side={getattr(ker,'side',None)}",
+                    flush=True,
+                )
             Kloc, _, _ = ker.exec(coeffs)  # shape [nel, nloc, nloc]
             exec_time = time.perf_counter() - t_exec
+            if trace_exec:
+                print(
+                    f"        [kern] done jacobian dom={getattr(ker,'domain','?')} exec={exec_time:.3e}s",
+                    flush=True,
+                )
             if debug_kernel and isinstance(debug_seen, set) and (id(ker) not in debug_seen):
                 try:
                     n_ent = int(getattr(Kloc, "shape", (0,))[0])
@@ -3810,8 +3821,18 @@ class NewtonSolver:
             if isinstance(gdofs, np.ndarray) and gdofs.shape[0] == 0:
                 continue
             t_exec = time.perf_counter()
+            if trace_exec:
+                print(
+                    f"        [kern] exec residual dom={getattr(ker,'domain','?')} side={getattr(ker,'side',None)}",
+                    flush=True,
+                )
             _, Floc, _ = ker.exec(coeffs)  # [nel, nloc]
             exec_time = time.perf_counter() - t_exec
+            if trace_exec:
+                print(
+                    f"        [kern] done residual dom={getattr(ker,'domain','?')} exec={exec_time:.3e}s",
+                    flush=True,
+                )
             if debug_kernel and isinstance(debug_seen, set) and (id(ker) not in debug_seen):
                 try:
                     n_ent = int(getattr(Floc, "shape", (0,))[0])
@@ -4902,6 +4923,8 @@ class PdasNewtonSolver(NewtonSolver):
                 current.update(aux_funcs)
 
             # Assemble reduced Jacobian and residual.
+            if str(getattr(self, "backend", "")).lower() == "cpp":
+                print(f"        VI Newton {it+1}: assembling...", flush=True)
             t_asm = time.perf_counter()
             A_red, R_red = self._assemble_system_reduced(current, need_matrix=True)
             asm_time = time.perf_counter() - t_asm

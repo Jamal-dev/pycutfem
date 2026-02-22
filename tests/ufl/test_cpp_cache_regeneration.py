@@ -15,7 +15,7 @@ def test_cpp_cache_regenerates_on_stale_source(tmp_path, monkeypatch):
     cache._ext_suffix = ".py"
     abi = cpp_cache.CODEGEN_ABI_CPP
 
-    def fake_compile_extension(module_name, source_file, build_dir, include_dirs=None):
+    def fake_compile_extension(module_name, source_file, build_dir, include_dirs=None, **_kwargs):
         mod_path = Path(build_dir) / f"{module_name}{cache._ext_suffix}"
         mod_path.write_text(
             f'CODEGEN_ABI = "{abi}"\n'
@@ -83,7 +83,7 @@ def test_cpp_cache_reuses_loaded_module_across_cache_instances(tmp_path, monkeyp
         def kernel_export_name(name):
             return name
 
-    def fake_compile_extension(module_name, source_file, build_dir, include_dirs=None):
+    def fake_compile_extension(module_name, source_file, build_dir, include_dirs=None, **_kwargs):
         mod_path = Path(build_dir) / f"{module_name}.py"
         mod_path.write_text(
             "import builtins\n"
