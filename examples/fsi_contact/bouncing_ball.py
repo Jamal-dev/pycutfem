@@ -61,7 +61,6 @@ from pycutfem.ufl.expressions import (
     div,
     Identity,
 )
-from pycutfem.ufl.measures import dx, ds, dGhost, dInterface
 from pycutfem.ufl.forms import BoundaryCondition
 from pycutfem.solvers.nonlinear_solver import NewtonSolver, NewtonParameters, TimeStepperParameters
 
@@ -337,13 +336,13 @@ def main() -> None:
     domains = make_domain_sets(mesh, extension_layers=extension_layers)
     qvol = int(args.quad_order)
     dx_fluid, dx_solid, dGamma, dG_fluid, dG_solid = build_measures(
-        mesh, ls_ball, domains, qvol=qvol, use_facet_patch_ghost=False
+        mesh, ls_ball, domains, qvol=qvol, use_facet_patch_ghost=True
     )
     dG_fluid_ext = None
     dG_solid_ext = None
     if use_extension:
         dG_fluid_ext, dG_solid_ext = build_extension_measures(
-            mesh, ls_ball, domains, qvol=qvol, use_facet_patch_ghost=False
+            mesh, ls_ball, domains, qvol=qvol, use_facet_patch_ghost=True
         )
 
     # Hansbo weights (updated in-place)
@@ -637,6 +636,8 @@ def main() -> None:
         max_steps=int(np.ceil(float(args.final_time) / max(dt0, 1.0e-16))),
         theta=1.0,
         final_time=float(args.final_time),
+        # This is a transient benchmark; do not early-exit based on a small Newton update.
+        stop_on_steady=False,
         allow_dt_reduction=bool(args.adaptive_dt),
         dt_reduction_factor=0.1,
         dt_min=float(args.dt_min),

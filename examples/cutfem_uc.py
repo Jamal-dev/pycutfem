@@ -219,8 +219,10 @@ def solve_uc(
     dsk_neg = dCutSkeleton(defined_on=facets_hasneg, level_set=lsetp1, deformation=deformation, metadata={"side": "-", "q": q})
     dsk_pos = dCutSkeleton(defined_on=facets_haspos, level_set=lsetp1, deformation=deformation, metadata={"side": "+", "q": q})
 
-    a += gamma_cip * h * mu_neg * jump(dot(grad(u_neg), nF)) * jump(dot(grad(v_neg), nF)) * dsk_neg
-    a += gamma_cip * h * mu_pos * jump(dot(grad(u_pos), nF)) * jump(dot(grad(v_pos), nF)) * dsk_pos
+    # CIP jump of normal derivatives across cut-skeleton facets.
+    # Use the UFL-style flux jump `jump(grad(u), n)` (outward normals per side).
+    a += gamma_cip * h * mu_neg * jump(grad(u_neg), nF) * jump(grad(v_neg), nF) * dsk_neg
+    a += gamma_cip * h * mu_pos * jump(grad(u_pos), nF) * jump(grad(v_pos), nF) * dsk_pos
 
     # --- GLS ------------------------------------------------------------------
     Lu_neg = -mu_neg * Laplacian(u_neg)

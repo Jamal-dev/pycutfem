@@ -258,11 +258,7 @@ def test_jump_grad_vector(mesh:Mesh):
     velocity_space_neg.set_values_from_function(v_neg)
     n = FacetNormal()  # unit normal from ctx
     jump_grad_v = Jump(grad(velocity_space_pos),grad(velocity_space_neg))  # jump in vector
-    grad_v_pos_n = dot(grad(velocity_space_pos),n)  
-    grad_v_neg_n = dot(grad(velocity_space_neg),n)
-
-    # form = dot(jump_grad_v,n) * dInterface(level_set=phi)
-    form = Jump(grad_v_pos_n,grad_v_neg_n) * dInterface(level_set=phi)
+    form = dot(jump_grad_v,n) * dInterface(level_set=phi)
     eq   = Equation(form, None)
     res  = assemble_form(eq, dof_handler=dof_handler, bcs=[],
                          assembler_hooks={type(form.integrand):{'name':'jv'}})

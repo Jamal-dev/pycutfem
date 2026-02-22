@@ -1212,10 +1212,35 @@ class FormCompiler:
         return self._gradinfo(data, role="identity", node=n, field_names=[])
     
     def _visit_FacetNormal(self, n: FacetNormal): 
-        """Returns the normal vector from the context.""" 
-        if 'normal' not in self.ctx: 
-            raise RuntimeError("FacetNormal accessed outside of a facet or interface integral context.") 
-        return self.ctx['normal'] 
+        """Return the facet/interface normal from the context.
+
+        Conventions
+        -----------
+        Assemblers set ``ctx['normal']`` to a *single* oriented unit normal `n₀`
+        for the current facet/interface quadrature point.
+
+        - For two-sided measures (ghost/cut-skeleton/interior facets), `n₀` is
+          oriented from the (–) side element to the (+) side element.
+        - For interface measures, `n₀` is oriented from Ω⁻ (φ<0) to Ω⁺ (φ>0),
+          i.e. `n₀ = ∇φ/||∇φ||` in the reference (undeformed) configuration.
+
+        UFL semantics require side-dependent outward normals:
+          n(+) = outward normal of the (+) side element/domain
+          n(-) = outward normal of the (–) side element/domain
+        with n(-) = -n(+).
+
+        With our stored orientation `n₀` (from – to +), the outward normals are:
+          n(+) = -n₀,   n(-) = +n₀.
+        """
+        if "normal" not in self.ctx:
+            raise RuntimeError("FacetNormal accessed outside of a facet or interface integral context.")
+        n0 = np.asarray(self.ctx["normal"], dtype=float)
+        side = self.ctx.get("side")
+        if side == "+":
+            return -n0
+        if side == "-":
+            return n0
+        return n0
     
     # -- Element-wise constants ----------------------------------------
     def _visit_EWC(self, n:ElementWiseConstant):

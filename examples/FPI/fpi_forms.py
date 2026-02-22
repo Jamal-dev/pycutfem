@@ -660,16 +660,18 @@ def residual_ghost_penalty_fluid(
     tau_p_gp = gamma_p_gp * tau_p
     tau_div_gp = gamma_div_gp * tau_div
 
-    dnv = dot(grad(v), n)
-    dntv = dot(grad(dv_test), n)
-    dnp = dot(grad(p), n)
-    dntp = dot(grad(dp_test), n)
-    dndivv = dot(grad(div(v)), n)
-    dntdivv = dot(grad(div(dv_test)), n)
+    # NOTE: With sided facet normals, do *not* use `jump(dot(grad(u), n))` to form
+    # normal-derivative jumps. Use the UFL-style flux jump `jump(grad(u), n)` instead.
+    dnv = jump(grad(v), n)
+    dntv = jump(grad(dv_test), n)
+    dnp = jump(grad(p), n)
+    dntp = jump(grad(dp_test), n)
+    dndivv = jump(grad(div(v)), n)
+    dntdivv = jump(grad(div(dv_test)), n)
 
-    r = tau_u_gp * inner(jump(dntv), jump(dnv)) * dG_f
-    r += tau_p_gp * inner(jump(dntp), jump(dnp)) * dG_f
-    r += tau_div_gp * inner(jump(dntdivv), jump(dndivv)) * dG_f
+    r = tau_u_gp * inner(dntv, dnv) * dG_f
+    r += tau_p_gp * inner(dntp, dnp) * dG_f
+    r += tau_div_gp * inner(dntdivv, dndivv) * dG_f
     return r
 
 
@@ -695,16 +697,17 @@ def jacobian_ghost_penalty_fluid(
     tau_p_gp = gamma_p_gp * tau_p
     tau_div_gp = gamma_div_gp * tau_div
 
-    dnv = dot(grad(dv), n)
-    dntv = dot(grad(dv_test), n)
-    dnp = dot(grad(dp), n)
-    dntp = dot(grad(dp_test), n)
-    dndivv = dot(grad(div(dv)), n)
-    dntdivv = dot(grad(div(dv_test)), n)
+    # Use the UFL-style flux jump `jump(grad(u), n)` (outward normals per side).
+    dnv = jump(grad(dv), n)
+    dntv = jump(grad(dv_test), n)
+    dnp = jump(grad(dp), n)
+    dntp = jump(grad(dp_test), n)
+    dndivv = jump(grad(div(dv)), n)
+    dntdivv = jump(grad(div(dv_test)), n)
 
-    a = tau_u_gp * inner(jump(dntv), jump(dnv)) * dG_f
-    a += tau_p_gp * inner(jump(dntp), jump(dnp)) * dG_f
-    a += tau_div_gp * inner(jump(dntdivv), jump(dndivv)) * dG_f
+    a = tau_u_gp * inner(dntv, dnv) * dG_f
+    a += tau_p_gp * inner(dntp, dnp) * dG_f
+    a += tau_div_gp * inner(dntdivv, dndivv) * dG_f
     return a
 
 

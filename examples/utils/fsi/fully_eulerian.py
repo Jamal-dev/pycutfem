@@ -382,7 +382,7 @@ def build_measures(
     domains: Dict[str, BitSet],
     qvol: int = 6,
     *,
-    use_facet_patch_ghost: bool = False,
+    use_facet_patch_ghost: bool = True,
 ):
     dx_fluid = dx(
         defined_on=domains["fluid_interface"],
@@ -400,15 +400,19 @@ def build_measures(
         metadata={"q": qvol + 2, "derivs": {(0, 0), (0, 1), (1, 0)}},
     )
     ghost_measure = dFacetPatch if use_facet_patch_ghost else dGhost
+    ghost_derivs = {(0, 1), (1, 0)}
+    # Facet-patch kernels may need 2nd derivatives (Hessian ghost penalties).
+    if use_facet_patch_ghost:
+        ghost_derivs |= {(2, 0), (1, 1), (0, 2)}
     dG_fluid = ghost_measure(
         defined_on=domains["fluid_ghost"],
         level_set=level_set,
-        metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
+        metadata={"q": qvol, "derivs": ghost_derivs},
     )
     dG_solid = ghost_measure(
         defined_on=domains["solid_ghost"],
         level_set=level_set,
-        metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
+        metadata={"q": qvol, "derivs": ghost_derivs},
     )
     return dx_fluid, dx_solid, dGamma, dG_fluid, dG_solid
 
@@ -419,7 +423,7 @@ def build_extension_measures(
     domains: Dict[str, BitSet],
     qvol: int = 6,
     *,
-    use_facet_patch_ghost: bool = False,
+    use_facet_patch_ghost: bool = True,
 ):
     """
     Build additional ghost-type measures on the implicit extension facets
@@ -434,15 +438,18 @@ def build_extension_measures(
         raise KeyError("Extension sets missing; call make_domain_sets(..., extension_layers>0) first.")
 
     ghost_measure = dFacetPatch if use_facet_patch_ghost else dGhost
+    ghost_derivs = {(0, 1), (1, 0)}
+    if use_facet_patch_ghost:
+        ghost_derivs |= {(2, 0), (1, 1), (0, 2)}
     dG_fluid_ext = ghost_measure(
         defined_on=domains["fluid_ext_ghost"],
         level_set=level_set,
-        metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
+        metadata={"q": qvol, "derivs": ghost_derivs},
     )
     dG_solid_ext = ghost_measure(
         defined_on=domains["solid_ext_ghost"],
         level_set=level_set,
-        metadata={"q": qvol, "derivs": {(0, 1), (1, 0)}},
+        metadata={"q": qvol, "derivs": ghost_derivs},
     )
     return dG_fluid_ext, dG_solid_ext
 

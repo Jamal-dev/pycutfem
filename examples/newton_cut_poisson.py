@@ -163,10 +163,6 @@ def run_step85_newton(*, backend: str = "jit", with_deformation: bool = False, c
         n = FacetNormal()
         h = CellDiameter()
         
-        def normal_grad(expr):
-            """Compact helper for n·∇expr on interface/ghost facets."""
-            return dot(grad(expr), n)
-
         gamma_N = Constant(nitsche_parameter)
         gamma_G = Constant(ghost_parameter)
 
@@ -194,7 +190,7 @@ def run_step85_newton(*, backend: str = "jit", with_deformation: bool = False, c
             # Nitsche terms for BC
             + interface_terms_residual
             # Ghost penalty stabilization
-            + (0.5 * gamma_G * h * jump(normal_grad(u_k)) * jump(normal_grad(v))) * dGhost_stab
+            + (0.5 * gamma_G * h * jump(grad(u_k), n) * jump(grad(v), n)) * dGhost_stab
         )
 
         # --- NEW: Define Jacobian Form J(du, v) ---
@@ -211,7 +207,7 @@ def run_step85_newton(*, backend: str = "jit", with_deformation: bool = False, c
             # Nitsche terms
             + interface_terms_jacobian
             # Ghost penalty
-            + (0.5 * gamma_G * h * jump(normal_grad(du)) * jump(normal_grad(v))) * dGhost_stab
+            + (0.5 * gamma_G * h * jump(grad(du), n) * jump(grad(v), n)) * dGhost_stab
         )
 
         # ====================================================================

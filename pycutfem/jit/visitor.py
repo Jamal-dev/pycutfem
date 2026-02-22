@@ -403,10 +403,18 @@ class IRGenerator:
             return
 
         if isinstance(node, FacetNormal):
+            # Match UFL semantics for sided normals with our stored orientation:
+            #   ctx['normal'] is oriented from (–) to (+)  =>  n(+) = -n0, n(-) = +n0.
             self.ir_sequence.append(LoadFacetNormal())
+            if side == "+":
+                self.ir_sequence.append(LoadConstant(value=-1.0))
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
             return
         if isinstance(node, NormalComponent):
             self.ir_sequence.append(LoadFacetNormalComponent(idx=node.idx))
+            if side == "+":
+                self.ir_sequence.append(LoadConstant(value=-1.0))
+                self.ir_sequence.append(BinaryOp(op_symbol='*'))
             return
 
         if isinstance(node, ElementWiseConstant):

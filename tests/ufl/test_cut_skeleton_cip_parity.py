@@ -42,7 +42,8 @@ def test_cut_skeleton_cip_matrix_matches_python(backend: str):
 
     qdeg = 6
     dsk = dCutSkeleton(level_set=level_set, deformation=deformation, metadata={"side": "-", "q": qdeg})
-    a = jump(dot(grad(u), n)) * jump(dot(grad(v), n)) * dsk
+    # Jump of normal derivatives (CIP): `jump(grad(u), n)` uses sided outward normals.
+    a = jump(grad(u), n) * jump(grad(v), n) * dsk
 
     K_py, _ = assemble_form(Equation(a, None), dof_handler=dh, bcs=[], backend="python")
     K_b, _ = assemble_form(Equation(a, None), dof_handler=dh, bcs=[], backend=backend)
@@ -56,4 +57,3 @@ def test_cut_skeleton_cip_matrix_matches_python(backend: str):
 
     assert diff < 1e-8
     assert rel < 1e-8
-

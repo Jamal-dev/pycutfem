@@ -135,7 +135,9 @@ def _fd_check(*, backend: str, case: Case, args: argparse.Namespace) -> tuple[fl
     dG_f_ext = None
     dG_s_ext = None
     if use_extension and (not bool(args.no_ext)):
-        dG_f_ext, dG_s_ext = build_extension_measures(mesh, level_set, domains, qvol=int(args.quad_order))
+        dG_f_ext, dG_s_ext = build_extension_measures(
+            mesh, level_set, domains, qvol=int(args.quad_order), use_facet_patch_ghost=True
+        )
 
     # Hansbo weights
     theta_pos_vals, theta_neg_vals = hansbo_kappa(mesh, level_set, theta_min=1.0e-3)
