@@ -507,7 +507,8 @@ def _time_series(sol, *, case_id: int, params: Warner1986Params) -> dict[str, np
     """
     Derived time series used in Warner (1986) figures:
       - L(t)
-      - substrate removal fluxes j_Li(t) at film-water interface (eq. 39)
+      - signed substrate fluxes j_Li(t) at film-water interface (eq. 39);
+        bulk-liquid removal is plotted as -j_Li (positive)
       - (case 5) bulk liquid concentrations S_Li(t)
     """
     n = int(params.npoint)
@@ -1221,14 +1222,14 @@ def main() -> None:
                 plt.savefig(paper_figdir / f"warner1986_case{case_id}_L_um_backend={args.backend}.pdf")
             plt.close()
 
-            # Substrate removal from bulk liquid: j_Li (eq. 39).
+            # Substrate removal from bulk liquid: -j_Li (eq. 39).
             plt.figure()
-            plt.plot(ts["t_days"], ts["jL_1"], label="COD (j_L1)")
-            plt.plot(ts["t_days"], ts["jL_2"], label="NH4 (j_L2)")
-            plt.plot(ts["t_days"], ts["jL_3"], label="O2 (j_L3)")
+            plt.plot(ts["t_days"], -ts["jL_1"], label="COD (-j_L1)")
+            plt.plot(ts["t_days"], -ts["jL_2"], label="NH4 (-j_L2)")
+            plt.plot(ts["t_days"], -ts["jL_3"], label="O2 (-j_L3)")
             plt.xlabel("t [d]")
-            plt.ylabel("j_L [g m$^{-2}$ d$^{-1}$]")
-            plt.title(f"Warner1986 case {case_id}: substrate removal (backend={args.backend})")
+            plt.ylabel("-j_L [g m$^{-2}$ d$^{-1}$]")
+            plt.title(f"Warner1986 case {case_id}: substrate removal (-j_L) (backend={args.backend})")
             plt.grid(True, alpha=0.3)
             plt.legend()
             plt.tight_layout()
@@ -1250,6 +1251,8 @@ def main() -> None:
                 plt.savefig(outdir / f"case{case_id}_backend={args.backend}_bulk_SL.png", dpi=200)
                 if paper_figdir is not None:
                     plt.savefig(paper_figdir / f"warner1986_case5_bulk_SL_backend={args.backend}.pdf")
+                    if str(args.backend) == "cpp":
+                        plt.savefig(paper_figdir / "warner1986_case5_bulk_SL_cpp.pdf")
                 plt.close()
 
             if case_id == 1:
@@ -1269,6 +1272,8 @@ def main() -> None:
                 plt.savefig(outdir / f"case{case_id}_backend={args.backend}_profiles_t=6d_substrates.png", dpi=200)
                 if paper_figdir is not None:
                     plt.savefig(paper_figdir / f"warner1986_case1_profiles_t6d_substrates_backend={args.backend}.pdf")
+                    if str(args.backend) == "cpp":
+                        plt.savefig(paper_figdir / "warner1986_case1_profiles_t6d_substrates_cpp.pdf")
                 plt.close()
 
     if not args.no_plots and len(ts_by_case) > 1:
@@ -1288,27 +1293,31 @@ def main() -> None:
         plt.savefig(outdir / f"all_cases_backend={args.backend}_L_um.png", dpi=200)
         if paper_figdir is not None:
             plt.savefig(paper_figdir / f"warner1986_all_cases_L_um_backend={args.backend}.pdf")
+            if str(args.backend) == "cpp":
+                plt.savefig(paper_figdir / "warner1986_all_cases_L_um_cpp.pdf")
         plt.close()
 
         fig, ax = plt.subplots(3, 1, figsize=(6.0, 7.0), sharex=True)
         for cid in cases_sorted:
             ts = ts_by_case[cid]
-            ax[0].plot(ts["t_days"], ts["jL_1"], label=f"Case {cid}")
-            ax[1].plot(ts["t_days"], ts["jL_2"], label=f"Case {cid}")
-            ax[2].plot(ts["t_days"], ts["jL_3"], label=f"Case {cid}")
-        ax[0].set_ylabel("j_L1 [g m$^{-2}$ d$^{-1}$]")
-        ax[1].set_ylabel("j_L2 [g m$^{-2}$ d$^{-1}$]")
-        ax[2].set_ylabel("j_L3 [g m$^{-2}$ d$^{-1}$]")
+            ax[0].plot(ts["t_days"], -ts["jL_1"], label=f"Case {cid}")
+            ax[1].plot(ts["t_days"], -ts["jL_2"], label=f"Case {cid}")
+            ax[2].plot(ts["t_days"], -ts["jL_3"], label=f"Case {cid}")
+        ax[0].set_ylabel("-j_L1 [g m$^{-2}$ d$^{-1}$]")
+        ax[1].set_ylabel("-j_L2 [g m$^{-2}$ d$^{-1}$]")
+        ax[2].set_ylabel("-j_L3 [g m$^{-2}$ d$^{-1}$]")
         ax[2].set_xlabel("t [d]")
         ax[0].grid(True, alpha=0.3)
         ax[1].grid(True, alpha=0.3)
         ax[2].grid(True, alpha=0.3)
         ax[0].legend(ncol=2, fontsize=8)
-        fig.suptitle(f"Warner1986: substrate removal comparison (backend={args.backend})")
+        fig.suptitle(f"Warner1986: substrate removal comparison (-j_L) (backend={args.backend})")
         fig.tight_layout()
         fig.savefig(outdir / f"all_cases_backend={args.backend}_jL.png", dpi=200)
         if paper_figdir is not None:
             fig.savefig(paper_figdir / f"warner1986_all_cases_jL_backend={args.backend}.pdf")
+            if str(args.backend) == "cpp":
+                fig.savefig(paper_figdir / "warner1986_all_cases_jL_cpp.pdf")
         plt.close(fig)
 
 

@@ -86,6 +86,28 @@ Outputs:
 - `output_bouncing_ball/metrics.json`: paper-style quantities of interest (to compare to Table 2/3).
 - `output_bouncing_ball/min_dist.csv`: time series for the minimal distance to the bottom wall.
 
+### Plot: distance vs time
+
+`min_dist.csv` can be plotted with:
+
+```bash
+python examples/fsi_contact/plot_min_dist.py output_bouncing_ball/min_dist.csv
+```
+
+If you accidentally type `plot_min_dit.py`, that alias exists as well:
+
+```bash
+python examples/fsi_contact/plot_min_dit.py output_bouncing_ball/min_dist.csv
+```
+
+Overlay multiple runs (e.g. different mesh levels):
+
+```bash
+python examples/fsi_contact/plot_min_dist.py \
+  out_nx16/min_dist.csv out_nx32/min_dist.csv out_nx64/min_dist.csv out_nx128/min_dist.csv \
+  --labels nx16 nx32 nx64 nx128 --out min_dist_levels.png
+```
+
 You can control expensive energy evaluations via `--metrics-stride` (set `0` to disable).
 For long runs, reduce console output with `--log-stride 100` (or similar).
 You can also silence the solver’s per-Newton prints via `--newton-print-level 0` (default).
