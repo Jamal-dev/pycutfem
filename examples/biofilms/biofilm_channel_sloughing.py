@@ -686,6 +686,17 @@ def main() -> None:
         default=1.0e-4,
         help="Tiny L2 pinning coefficient used only with --u-extension grad (removes global-translation nullspace). Set 0 to disable.",
     )
+    ap.add_argument(
+        "--kinematics-scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional scaling factor for the solid kinematic constraint (u equation). "
+            "This does not change the nonlinear solution set, but it can change the residual norm weighting "
+            "used by line-search / stopping criteria and may improve conditioning for some coupled runs. "
+            "Default: auto (rho_s0 if solid inertia is enabled, else 1)."
+        ),
+    )
     # Transport regularization (tune for interface sharpness vs robustness)
     ap.add_argument("--D-phi", type=float, default=0.0, help="Porosity diffusion (recommend ~0 for channel sloughing).")
     ap.add_argument("--gamma-phi", type=float, default=5.0, help="Penalty enforcing phi->1 in free fluid.")
@@ -701,7 +712,16 @@ def main() -> None:
         default=0.0,
         help="CIP stabilization factor for phi (jump of normal gradient across interior facets; 0 disables). Recommended when --D-phi 0.",
     )
-    ap.add_argument("--D-alpha", type=float, default=0.001, help="Indicator diffusion (interface regularization).")
+    ap.add_argument(
+        "--D-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "Indicator diffusion coefficient D_alpha [m^2/s] (interface regularization). "
+            "NOTE: large values quickly homogenize alpha on micro-scale domains; prefer --D-alpha 0 with "
+            "consistent stabilization (--alpha-supg/--alpha-cip) or phase-field regularization (--alpha-cahn-* / --alpha-ch-*)."
+        ),
+    )
     # Phase-field / crack options for alpha
     ap.add_argument(
         "--alpha-cahn-M",
@@ -1295,6 +1315,24 @@ def main() -> None:
     else:
         print(f"[setup] Newton tolerance: newton_tol={newton_tol:.1e} (absolute |R|_inf)", flush=True)
 
+    # Inflow-ramp sanity: for the exponential ramp r(t)=1-exp(-t/Tramp), the first
+    # time step sees an increment Δr≈1-exp(-θΔt/Tramp). If this is large, Newton
+    # can stagnate because the coupled system experiences an abrupt forcing jump.
+    try:
+        Tramp_val = float(getattr(args, "Tramp", 0.0) or 0.0)
+        if Tramp_val > 0.0 and dt_val > 0.0 and theta > 0.0:
+            dr0 = 1.0 - float(np.exp(-(theta * dt_val) / Tramp_val))
+            if dr0 > 0.2:
+                print(
+                    f"[warn] Inflow ramp is steep relative to dt: Tramp={Tramp_val:.3e}, dt={dt_val:.3e}, "
+                    f"theta={theta:.2f} gives Δr≈{dr0:.3f} on the first step. "
+                    "This can cause Newton stagnation in the monolithic solve. "
+                    "Consider increasing --Tramp (e.g. 2e-3), reducing --dt during the ramp, or enabling "
+                    "--allow-dt-reduction."
+                )
+    except Exception:
+        pass
+
     # Basic mesh/interface resolution sanity: a too-thin diffuse interface (eps << h)
     # behaves like an under-resolved step function in CG spaces and can lead to
     # noisy coefficients in the one-domain blend.
@@ -1307,6 +1345,27 @@ def main() -> None:
                 f"h≈{h_min:.3e}. This can be under-resolved and may cause non-physical transients; "
                 "consider eps≈(1–2)h for validation runs."
             )
+        # Diffusion sanity: D_alpha has physical units [m^2/s]. On micro-scale runs, a
+        # "numerically small" value like 1e-3 can completely homogenize alpha (and
+        # therefore phi/beta) on the time horizon of interest.
+        D_alpha_val = float(getattr(args, "D_alpha", 0.0) or 0.0)
+        if (
+            D_alpha_val > 0.0
+            and (not bool(getattr(args, "freeze_alpha", False)))
+            and (not bool(getattr(args, "alpha_from_refmap", False)))
+        ):
+            t_probe = float(getattr(args, "t_final", 0.0) or 0.0)
+            if t_probe > 0.0:
+                Lmin = min(float(L), float(H))
+                ldiff = float(np.sqrt(D_alpha_val * t_probe))
+                if ldiff > 0.25 * Lmin:
+                    print(
+                        f"[warn] Large alpha diffusion: --D-alpha={D_alpha_val:.3e} [m^2/s] with "
+                        f"t_final={t_probe:.3e} gives diffusion length sqrt(D*t)≈{ldiff:.3e}, "
+                        f"comparable to min(L,H)≈{Lmin:.3e}. This can smear alpha into a nearly-uniform "
+                        "field. Consider --D-alpha 0 and use --alpha-supg/--alpha-cip (if needed) or "
+                        "phase-field regularization (--alpha-cahn-* / --alpha-ch-*)."
+                    )
     except Exception:
         pass
     if bool(getattr(args, "deformation_only", False)):
@@ -1475,6 +1534,29 @@ def main() -> None:
             "[info] --D-alpha 0 detected with no alpha stabilization specified; enabling "
             "default consistent stabilization: --alpha-supg 1 --alpha-cip 10."
         )
+    elif float(args.D_alpha) == 0.0 and alpha_supg == 0.0 and alpha_cip == 0.0 and ac_enabled:
+        # Allen–Cahn provides interface regularization via a Laplacian term with
+        # effective diffusion coefficient ~ M*gamma*eps. If this coefficient is
+        # tiny compared to h^2/dt, the alpha equation is still effectively a CG
+        # advection-reaction problem and may require SUPG/CIP stabilization.
+        try:
+            h_min = min(float(L) / max(1, int(args.nx)), float(H) / max(1, int(args.ny)))
+            dt_here = float(getattr(args, "dt", 0.0) or 0.0)
+            eps_ac = float(getattr(args, "alpha_cahn_eps", float(getattr(args, "eps", 0.0) or 0.0)) or 0.0)
+            M_ac = float(getattr(args, "alpha_cahn_M", 0.0) or 0.0)
+            gamma_ac = float(getattr(args, "alpha_cahn_gamma", 0.0) or 0.0)
+            D_eff = abs(M_ac * gamma_ac * eps_ac)
+            if dt_here > 0.0 and h_min > 0.0 and D_eff > 0.0:
+                diff_cfl = (D_eff * dt_here) / (h_min * h_min + 1.0e-30)
+                if diff_cfl < 1.0e-3:
+                    print(
+                        f"[warn] Allen–Cahn enabled but has tiny interface diffusion: "
+                        f"M*gamma*eps≈{D_eff:.3e} and D*dt/h^2≈{diff_cfl:.3e}. "
+                        "If Newton stagnates or alpha shows CG transport oscillations, try "
+                        "--alpha-supg 1 --alpha-cip 10 (or add mild --D-alpha)."
+                    )
+        except Exception:
+            pass
 
     phi_supg = float(getattr(args, "phi_supg", 0.0) or 0.0)
     phi_cip = float(getattr(args, "phi_cip", 0.0) or 0.0)
@@ -2001,6 +2083,7 @@ def main() -> None:
         u_cip=float(u_cip),
         u_cip_weight=str(getattr(args, "u_cip_weight", "fluid")),
         ds_cip=ds_int,
+        kinematics_scale=(None if getattr(args, "kinematics_scale", None) is None else float(args.kinematics_scale)),
         damage_k=float(getattr(args, "damage_k", 0.0) or 0.0),
         damage_sigma_cr=float(getattr(args, "damage_sigma_cr", 0.0) or 0.0),
         damage_m=float(getattr(args, "damage_m", 1.0) or 1.0),
@@ -2195,8 +2278,11 @@ def main() -> None:
     # Reuse the initial geometry definition for refmap transport and diagnostics.
     _alpha0_eval = alpha0_eval
 
-    def _update_alpha_from_refmap():
-        if not bool(getattr(args, "alpha_from_refmap", False)):
+    def _update_alpha_from_refmap(*, force: bool = False):
+        # For production runs, only apply when --alpha-from-refmap is enabled.
+        # For Newton predictors (when alpha is *solved*), we also support a forced
+        # refmap-based initial guess via force=True.
+        if (not force) and (not bool(getattr(args, "alpha_from_refmap", False))):
             return
         # Reference map: χ = x - u (u is the stored "reference map displacement").
         # Evaluate u at the alpha DOF nodes (alpha is Q1 on the Q2 geometry mesh).
@@ -2827,6 +2913,14 @@ def main() -> None:
                 "pc_type": "lu",
                 "pc_factor_mat_solver_type": "mumps",
             }
+            if _env_bool("PYCUTFEM_PETSC_MONITOR", False):
+                # Debugging: enable PETSc monitors without requiring argparse to accept
+                # `-snes_monitor` style flags.
+                petsc_opts.setdefault("snes_monitor", None)
+                petsc_opts.setdefault("snes_converged_reason", None)
+                petsc_opts.setdefault("snes_linesearch_monitor", None)
+                petsc_opts.setdefault("ksp_monitor_short", None)
+                petsc_opts.setdefault("ksp_converged_reason", None)
             solver = PetscSnesNewtonSolver(
                 forms.residual_form,
                 forms.jacobian_form,
@@ -3044,7 +3138,7 @@ def main() -> None:
             # in advection-dominated runs with D_alpha=0.
             try:
                 if not bool(getattr(args, "alpha_from_refmap", False)):
-                    _update_alpha_from_refmap()
+                    _update_alpha_from_refmap(force=True)
             except Exception:
                 pass
 

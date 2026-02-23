@@ -4935,6 +4935,84 @@ class PdasNewtonSolver(NewtonSolver):
             if pruned:
                 lo_red, hi_red = self._bounds_reduced()
 
+            # Optional Jacobian eigenvalue tracing (debugging/conditioning studies).
+            #
+            # IMPORTANT:
+            # - This is potentially expensive; it is off by default and can be
+            #   restricted to a single step/iteration via env vars.
+            # - These are eigenvalues of the *reduced, pruned* Jacobian A_red
+            #   (before PDAS identity-row modification). Row/field scaling of
+            #   equations will generally change these eigenvalues.
+            if os.getenv("PYCUTFEM_TRACE_JAC_EIGS", "").lower() in {"1", "true", "yes"}:
+                try:
+                    step_filter = int(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_STEP", "-1") or "-1")
+                except Exception:
+                    step_filter = -1
+                try:
+                    it_filter = int(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_IT", "1") or "1")
+                except Exception:
+                    it_filter = 1
+
+                step_now = int(getattr(self, "_current_step_no", -1))
+                do_trace = (step_filter < 0 or step_now == step_filter) and (it + 1 == it_filter)
+                if do_trace:
+                    traced = getattr(self, "_trace_jac_eigs_done", None)
+                    if traced is None:
+                        traced = set()
+                        setattr(self, "_trace_jac_eigs_done", traced)
+                    key = (step_now, it + 1)
+                    if key not in traced:
+                        traced.add(key)
+                        try:
+                            n = int(getattr(A_red, "shape", (0, 0))[0])
+                            nnz = int(getattr(A_red, "nnz", 0))
+                        except Exception:
+                            n = 0
+                            nnz = 0
+                        print(f"        [vi-jac] A_red: n={n} nnz={nnz}")
+                        try:
+                            k_req = int(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_K", "6") or "6")
+                        except Exception:
+                            k_req = 6
+                        try:
+                            which = str(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_WHICH", "LM") or "LM").strip().upper()
+                        except Exception:
+                            which = "LM"
+                        try:
+                            maxiter = int(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_MAXITER", "300") or "300")
+                        except Exception:
+                            maxiter = 300
+                        try:
+                            tol = float(os.getenv("PYCUTFEM_TRACE_JAC_EIGS_TOL", "1e-6") or "1e-6")
+                        except Exception:
+                            tol = 1.0e-6
+
+                        if n >= 3 and k_req >= 1:
+                            k_eigs = int(min(max(k_req, 1), n - 2))
+                            try:
+                                evals = spla.eigs(A_red, k=k_eigs, which=which, tol=tol, maxiter=maxiter, return_eigenvectors=False)
+                                evals = np.asarray(evals)
+                                # Sort by magnitude (descending) for stable printing.
+                                order = np.argsort(-np.abs(evals))
+                                evals = evals[order]
+
+                                def _fmt(ev: complex) -> str:
+                                    evc = complex(ev)
+                                    if abs(evc.imag) < 1.0e-12:
+                                        return f"{evc.real:.3e}"
+                                    sgn = "+" if evc.imag >= 0.0 else "-"
+                                    return f"{evc.real:.3e}{sgn}{abs(evc.imag):.3e}j"
+
+                                print(
+                                    f"        [vi-jac] eigs(A_red) which={which} k={k_eigs}: "
+                                    + ", ".join(_fmt(ev) for ev in evals)
+                                )
+                            except Exception as e:
+                                print(f"        [vi-jac] eigs(A_red) failed: {e}")
+                        else:
+                            print("        [vi-jac] eigs(A_red) skipped: matrix too small.")
+                # else: not traced
+
             # Current reduced iterate and semismooth residual.
             x_red = self._pack_reduced_iterate(funcs)
             if auto_c:
@@ -4971,6 +5049,64 @@ class PdasNewtonSolver(NewtonSolver):
                 + (f"  ΔA={changed}" if changed >= 0 else "")
                 + f"  (asm={asm_time:.2e}s)"
             )
+
+            # Optional residual tracing (same env vars as the standard Newton solver).
+            # For VI, we expose both the semismooth residual G and the raw residual R
+            # so users can identify whether non-convergence comes from active-set
+            # complementarity (gap) or from a particular PDE block.
+            if os.getenv("PYCUTFEM_RESIDUAL_TRACE", "").lower() in {"1", "true", "yes"}:
+                try:
+                    G_full = self.restrictor.expand_vec(G_red)
+                    R_full = self.restrictor.expand_vec(R_red)
+                except Exception:
+                    G_full = None
+                    R_full = None
+
+                def _trace_vec(tag: str, vec: np.ndarray | None) -> None:
+                    if vec is None:
+                        return
+                    vec = np.asarray(vec, dtype=float).ravel()
+                    if vec.size == 0:
+                        return
+                    worst = int(np.argmax(np.abs(vec)))
+                    worst_val = float(vec[worst])
+                    field = None
+                    try:
+                        field = getattr(self.dh, "_dof_to_node_map", {}).get(worst, (None, None))[0]
+                    except Exception:
+                        field = None
+                    fmsg = f", field={field}" if field is not None else ""
+
+                    coords_msg = ""
+                    if os.getenv("PYCUTFEM_RESIDUAL_TRACE_COORDS", "").lower() in {"1", "true", "yes"}:
+                        try:
+                            self.dh._ensure_dof_coords()
+                            coords = np.asarray(getattr(self.dh, "_dof_coords", None), dtype=float)
+                            if coords.ndim == 2 and coords.shape[0] > worst and coords.shape[1] >= 2:
+                                coords_msg = f", x={coords[worst, 0]:.3e}, y={coords[worst, 1]:.3e}"
+                        except Exception:
+                            coords_msg = ""
+
+                    print(f"        [vi-res] worst_{tag}: gdof={worst} val={worst_val:.3e}{fmsg}{coords_msg}")
+
+                    if os.getenv("PYCUTFEM_RESIDUAL_TRACE_FIELDS", "").lower() in {"1", "true", "yes"}:
+                        field_norms = []
+                        for fld in getattr(self.dh, "field_names", []):
+                            try:
+                                sl = self.dh.get_field_slice(fld)
+                            except Exception:
+                                continue
+                            if sl is None or len(sl) == 0:
+                                continue
+                            try:
+                                field_norms.append(f"{fld}:{np.linalg.norm(vec[sl], ord=np.inf):.2e}")
+                            except Exception:
+                                continue
+                        if field_norms:
+                            print(f"        [vi-res] per-field |{tag}|_∞: " + ", ".join(field_norms))
+
+                _trace_vec("G", G_full)
+                _trace_vec("R", R_full)
 
             if norm_G <= tol_eff:
                 delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])

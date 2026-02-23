@@ -965,7 +965,15 @@ def build_biofilm_one_domain_forms(
     gamma_vS_eff = float(gamma_u) if gamma_vS is None else float(gamma_vS)
     vS_ext_mode = str(u_extension_mode if vS_extension_mode is None else vS_extension_mode).strip().lower()
     gamma_vS_c = _c(float(gamma_vS_eff))
-    gamma_vS_pin_eff = 0.0 if gamma_vS_pin is None else float(gamma_vS_pin)
+    # Mirror u-extension pinning by default: both u-extension (grad-mode) and the
+    # vS-extension (grad-mode) have a global-translation nullspace in a one-domain
+    # CG setting. A tiny L2 pin in the fluid region breaks the nullspace and
+    # materially improves Newton robustness without affecting the biofilm region
+    # (the pin weight scales like (1-α)^2).
+    if gamma_vS_pin is None and vS_ext_mode in {"grad", "h1"} and float(gamma_u_pin) != 0.0:
+        gamma_vS_pin_eff = float(gamma_u_pin)
+    else:
+        gamma_vS_pin_eff = 0.0 if gamma_vS_pin is None else float(gamma_vS_pin)
     gamma_vS_pin_c = _c(float(gamma_vS_pin_eff))
     a_skel_visco = None
     if float(solid_visco_eta) != 0.0:
@@ -1224,8 +1232,10 @@ def build_biofilm_one_domain_forms(
     # biofilm region via α. Outside the biofilm (α≈0), u is defined by the
     # extension penalty below.
     #
-    # Scaling: multiplying by a positive scalar does not change the solution but
-    # can improve conditioning of the monolithic Newton solve.
+    # Scaling: multiplying the *entire* u-equation by a positive scalar does not
+    # change the solution set, but it can improve conditioning of the monolithic
+    # Newton solve and the line-search norm weighting (important when the u
+    # residual is orders of magnitude smaller than the vS residual).
     if kinematics_scale is None:
         kinematics_scale = rho_s0_tilde if (rho_s0_tilde is not None and float(rho_s0_tilde) != 0.0) else 1.0
     kin_scale_c = kinematics_scale if hasattr(kinematics_scale, "dim") else _c(float(kinematics_scale))
@@ -1249,13 +1259,13 @@ def build_biofilm_one_domain_forms(
         if u_ext_mode in {"l2", "mass"}:
             h_u = MeshSize()
             inv_h2 = _c(1.0) / (h_u * h_u)
-            r_kinematics += gamma_u_c * inv_h2 * _one_minus(alpha_k) * dot(u_k, u_test) * dx
-            a_kinematics += gamma_u_c * inv_h2 * (
+            r_kinematics += kin_scale_c * gamma_u_c * inv_h2 * _one_minus(alpha_k) * dot(u_k, u_test) * dx
+            a_kinematics += kin_scale_c * gamma_u_c * inv_h2 * (
                 (-_c(1.0) * dalpha) * dot(u_k, u_test) + _one_minus(alpha_k) * dot(du, u_test)
             ) * dx
         elif u_ext_mode in {"grad", "h1"}:
-            r_kinematics += gamma_u_c * _one_minus(alpha_k) * inner(grad(u_k), grad(u_test)) * dx
-            a_kinematics += gamma_u_c * (
+            r_kinematics += kin_scale_c * gamma_u_c * _one_minus(alpha_k) * inner(grad(u_k), grad(u_test)) * dx
+            a_kinematics += kin_scale_c * gamma_u_c * (
                 (-_c(1.0) * dalpha) * inner(grad(u_k), grad(u_test)) + _one_minus(alpha_k) * inner(grad(du), grad(u_test))
             ) * dx
 
@@ -1266,8 +1276,8 @@ def build_biofilm_one_domain_forms(
                 w_pin = _one_minus(alpha_k)
                 w_pin2 = w_pin * w_pin
                 dw_pin2 = (-_c(2.0) * w_pin) * dalpha
-                r_kinematics += pin_c * inv_h2 * w_pin2 * dot(u_k, u_test) * dx
-                a_kinematics += pin_c * inv_h2 * (dw_pin2 * dot(u_k, u_test) + w_pin2 * dot(du, u_test)) * dx
+                r_kinematics += kin_scale_c * pin_c * inv_h2 * w_pin2 * dot(u_k, u_test) * dx
+                a_kinematics += kin_scale_c * pin_c * inv_h2 * (dw_pin2 * dot(u_k, u_test) + w_pin2 * dot(du, u_test)) * dx
         else:
             raise ValueError(f"Unknown u_extension_mode {u_extension_mode!r}.")
 
@@ -1290,8 +1300,8 @@ def build_biofilm_one_domain_forms(
             raise ValueError(
                 f"Unknown u_cip_weight={u_cip_weight!r}. Use 'fluid' (default), 'biofilm', or 'both'."
             )
-        r_kinematics += tau_u_cip * w_u_cip * _grad_inner_jump(u_k, u_test, n_int) * ds_cip
-        a_kinematics += tau_u_cip * w_u_cip * _grad_inner_jump(du, u_test, n_int) * ds_cip
+        r_kinematics += kin_scale_c * tau_u_cip * w_u_cip * _grad_inner_jump(u_k, u_test, n_int) * ds_cip
+        a_kinematics += kin_scale_c * tau_u_cip * w_u_cip * _grad_inner_jump(du, u_test, n_int) * ds_cip
 
     # ------------------------------------------------------------------
     # (iv) Porosity evolution (Eulerian, advected by vS)
