@@ -44,6 +44,9 @@ def _build_problem(
     alpha_ch_gamma: float = 0.0,
     alpha_ch_eps: float = 0.1,
     alpha_ch_mobility: str = "constant",
+    theta: float = 1.0,
+    substrate_reaction_scheme: str = "theta",
+    substrate_diffusion_scheme: str = "theta",
 ):
     nodes, elems, _, corners = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
     mesh = Mesh(
@@ -136,7 +139,20 @@ def _build_problem(
     S_n.nodal_values[:] = np.clip(0.2 + 0.05 * rng.standard_normal(S_n.nodal_values.shape), 0.01, 1.0)
 
     dt = Constant(0.1)
-    th = 1.0
+    th = float(theta)
+
+    # Volume source in the mixture constraint (matches the Warner-style benchmark):
+    #   div(C v + B vS) = alpha * s_v,  with  s_v=(monod(S)-k_d)*(1-phi).
+    # This exercises the coupling δ(α s_v) = (δα)s_v + α(δs_v) in the Jacobian.
+    mu_max_c = Constant(0.4)
+    K_S_c = Constant(0.3)
+    k_d_c = Constant(0.1)
+    monod = mu_max_c * (S_k / (S_k + K_S_c))
+    one_m_phi = (-phi_k) + Constant(1.0)
+    s_v = (monod - k_d_c) * one_m_phi
+    denom = S_k + K_S_c
+    dmonod = mu_max_c * (K_S_c / (denom * denom)) * dS
+    ds_v = dmonod * one_m_phi - (monod - k_d_c) * dphi
 
     forms = build_biofilm_one_domain_forms(
         v_k=v_k,
@@ -200,12 +216,16 @@ def _build_problem(
         alpha_cip=float(alpha_cip),
         u_cip=float(u_cip),
         D_S=0.1,
+        substrate_reaction_scheme=str(substrate_reaction_scheme),
+        substrate_diffusion_scheme=str(substrate_diffusion_scheme),
         mu_max=0.4,
         K_S=0.3,
         k_g=0.5,
         k_d=0.1,
         Y=0.8,
         k_det=0.2,
+        s_v=s_v,
+        ds_v=ds_v,
     )
 
     # Map global dof -> state function owning it (k-level only).
@@ -249,36 +269,51 @@ def test_biofilm_one_domain_jacobian_fd_consistency():
 
     This is intentionally tiny to keep runtime low while catching sign/index bugs.
     """
-    dh, forms, field_to_func_k = _build_problem(nx=2, ny=2, q=5)
-    eq = Equation(forms.jacobian_form, forms.residual_form)
-    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
-    R0 = np.asarray(R0, dtype=float)
+    for theta in (1.0, 0.5):
+        schemes = (("theta", "theta"),) if float(theta) == 1.0 else (("theta", "theta"), ("implicit", "theta"), ("implicit", "implicit"))
+        for r_scheme, d_scheme in schemes:
+            dh, forms, field_to_func_k = _build_problem(
+                nx=2,
+                ny=2,
+                q=5,
+                theta=float(theta),
+                substrate_reaction_scheme=str(r_scheme),
+                substrate_diffusion_scheme=str(d_scheme),
+            )
+            eq = Equation(forms.jacobian_form, forms.residual_form)
+            K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+            R0 = np.asarray(R0, dtype=float)
 
-    def assemble_residual():
-        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
-        return np.asarray(R, dtype=float)
+            def assemble_residual():
+                _, R = assemble_form(
+                    Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python"
+                )
+                return np.asarray(R, dtype=float)
 
-    # Probe a few DOFs (one per field) to cover block couplings.
-    probes = []
-    for fld in ("v_x", "v_y", "p", "vS_x", "u_x", "phi", "alpha", "S"):
-        sl = dh.get_field_slice(fld)
-        if sl:
-            probes.append(int(sl[len(sl) // 2]))
+            # Probe a few DOFs (one per field) to cover block couplings.
+            probes = []
+            for fld in ("v_x", "v_y", "p", "vS_x", "u_x", "phi", "alpha", "S"):
+                sl = dh.get_field_slice(fld)
+                if sl:
+                    probes.append(int(sl[len(sl) // 2]))
 
-    eps = 1.0e-8
-    for j in probes:
-        fld, _ = dh._dof_to_node_map[j]
-        func = field_to_func_k[fld]
-        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
-        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
-        R1 = assemble_residual()
-        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
+            eps = 1.0e-8
+            for j in probes:
+                fld, _ = dh._dof_to_node_map[j]
+                func = field_to_func_k[fld]
+                old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
+                func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
+                R1 = assemble_residual()
+                func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
 
-        fd = (R1 - R0) / eps
-        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
-        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
-        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
-        assert rel < 1.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
+                fd = (R1 - R0) / eps
+                col = np.asarray(K.getcol(j).toarray()).reshape(-1)
+                denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
+                rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
+                assert rel < 1.0e-6, (
+                    f"FD mismatch at dof {j} ({fld}, theta={theta}, substrate_reaction_scheme={r_scheme}, "
+                    f"substrate_diffusion_scheme={d_scheme}): rel={rel:.2e}"
+                )
 
 
 def _cpp_backend_parity_alpha_stabilization_impl() -> None:

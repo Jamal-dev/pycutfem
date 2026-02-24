@@ -1115,8 +1115,11 @@ def main() -> None:
         paper_figdir.mkdir(parents=True, exist_ok=True)
 
     cases = [1, 2, 3, 4, 5] if args.case == "all" else [int(args.case)]
-    t_eval = np.arange(0.0, float(args.t_final) + 1.0e-12, float(args.dt_out), dtype=float)
-    if 6.0 not in t_eval:
+    t_final = float(args.t_final)
+    t_eval = np.arange(0.0, t_final + 1.0e-12, float(args.dt_out), dtype=float)
+    # Table VI comparisons in the paper use t=6 d. Only enforce that output time
+    # when it is within the requested simulation horizon.
+    if t_final >= 6.0 and 6.0 not in t_eval:
         t_eval = np.unique(np.sort(np.concatenate([t_eval, np.asarray([6.0])])))
 
     refs = _table_vi_reference()
@@ -1168,7 +1171,7 @@ def main() -> None:
             comments="",
         )
 
-        if case_id in (1, 4):
+        if case_id in (1, 4) and float(args.t_final) >= 6.0:
             prof = _profiles_at_time(sol, t=6.0, case_id=case_id, params=params)
             key = "case1_t6" if case_id == 1 else "case4_t6"
             err = _compare_to_table_vi(prof=prof, ref=refs[key], label=key)

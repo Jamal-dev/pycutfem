@@ -1273,12 +1273,37 @@ class NewtonSolver:
         while step < time_params.max_steps and t_n < time_params.final_time:
             global_step = int(step0 + step)
             global_step_no = int(global_step + 1)
-            dt = float(time_params.dt)
+            dt_nominal = float(time_params.dt)
+            dt = float(dt_nominal)
+            # Cap the last time step to hit final_time exactly.
+            # Without this, the time loop can overshoot (e.g. t_n=0.46875, dt=0.125, final_time=0.5).
+            try:
+                final_time_val = float(time_params.final_time)
+            except Exception:
+                final_time_val = None
+            if final_time_val is not None:
+                remaining = float(final_time_val) - float(t_n)
+                if remaining <= 0.0:
+                    break
+                if dt > remaining:
+                    dt = float(remaining)
             dt_min = float(getattr(time_params, "dt_min", 0.0))
             if dt_min > 0.0 and dt < dt_min:
-                raise RuntimeError(
-                    f"Δt={dt:.3e} dropped below dt_min={dt_min:.3e}; aborting time stepping."
+                # Allow a shorter *last* step to hit final_time exactly.
+                tol_last = 1.0e-12 * max(1.0, abs(float(final_time_val))) if final_time_val is not None else 0.0
+                is_last_step = bool(
+                    final_time_val is not None
+                    and dt < dt_nominal
+                    and abs((t_n + dt) - final_time_val) <= tol_last
                 )
+                if not is_last_step:
+                    raise RuntimeError(
+                        f"Δt={dt:.3e} dropped below dt_min={dt_min:.3e}; aborting time stepping."
+                    )
+                if int(getattr(self.np, "print_level", 2) or 0) >= 1:
+                    print(
+                        f"    [warn] Last step uses Δt={dt:.3e} < dt_min={dt_min:.3e} to hit final_time={final_time_val:.3e}."
+                    )
             if last_dt is None or not math.isclose(dt, last_dt, rel_tol=0.0, abs_tol=0.0):
                 on_dt_change = getattr(time_params, "on_dt_change", None)
                 if callable(on_dt_change):
@@ -5049,6 +5074,32 @@ class PdasNewtonSolver(NewtonSolver):
                 + (f"  ΔA={changed}" if changed >= 0 else "")
                 + f"  (asm={asm_time:.2e}s)"
             )
+
+            # Match the standard Newton field-residual tracing output for VI solves.
+            # (Useful to identify which PDE block dominates the raw residual.)
+            if os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS", "").lower() in {"1", "true", "yes"}:
+                try:
+                    R_full_dbg = self.restrictor.expand_vec(R_red)
+                    field_norms = []
+                    for fld in getattr(self.dh, "field_names", []):
+                        try:
+                            sl = self.dh.get_field_slice(fld)
+                        except Exception:
+                            continue
+                        if sl is None or len(sl) == 0:
+                            continue
+                        sl = np.asarray(sl, dtype=int).ravel()
+                        field_norms.append((float(np.linalg.norm(R_full_dbg[sl], ord=np.inf)), str(fld)))
+                    field_norms.sort(reverse=True, key=lambda t: t[0])
+                    n_show_raw = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS_N", "8").strip()
+                    try:
+                        n_show = max(1, int(n_show_raw))
+                    except Exception:
+                        n_show = 8
+                    items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
+                    print(f"        [res] {items}")
+                except Exception as exc:
+                    print(f"        [res] trace failed: {exc}")
 
             # Optional residual tracing (same env vars as the standard Newton solver).
             # For VI, we expose both the semismooth residual G and the raw residual R

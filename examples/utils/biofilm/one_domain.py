@@ -322,6 +322,10 @@ def build_biofilm_one_domain_forms(
     u_extension_mode: str = "l2",
     gamma_u_pin: float = 0.0,
     D_alpha: float = 0.0,
+    # How to advect the diffuse indicator α by the skeleton velocity v^S:
+    # - "advective" (default): v^S·∇α   (indicator/level-set style; preserves α along characteristics)
+    # - "conservative":        div(α v^S) = v^S·∇α + α div(v^S)
+    alpha_advection_form: str = "advective",
     # Allen–Cahn / phase-field interface regularization for α
     alpha_cahn_M: float = 0.0,
     alpha_cahn_gamma: float = 0.0,
@@ -383,6 +387,13 @@ def build_biofilm_one_domain_forms(
     damage_H_prev=None,
     damage_stiff_split: str = "full",
     D_S: float = 0.0,
+    # Substrate reaction time discretization:
+    # - "theta" (default): use the global θ-scheme (may be CN if θ=0.5)
+    # - "implicit"/"imex": treat the reaction term fully implicitly (L-stable for stiff decay)
+    # - "explicit": treat the reaction term explicitly (not recommended for stiff kinetics)
+    substrate_reaction_scheme: str = "theta",
+    # Substrate diffusion time discretization (same choices as reaction scheme).
+    substrate_diffusion_scheme: str = "theta",
     D_X: float = 0.0,
     # growth / detachment parameters
     mu_max: float = 0.0,
@@ -399,6 +410,7 @@ def build_biofilm_one_domain_forms(
     f_v=None,
     f_u=None,
     s_v=None,
+    ds_v=None,
     f_phi=None,
     f_alpha=None,
     f_S=None,
@@ -460,6 +472,23 @@ def build_biofilm_one_domain_forms(
     f_v = f_v if f_v is not None else zero_vector
     f_u = f_u if f_u is not None else zero_vector
     s_v = s_v if s_v is not None else zero_scalar
+    # NOTE: `ds_v` is the Gateaux derivative of the volumetric source `s_v`.
+    # When no derivative is provided (or a Picard/frozen linearization is used),
+    # we must still keep the Jacobian term `-alpha_k * ds_v` in the *trial* role.
+    # Using a bare scalar `0` here can leave `alpha_k*0` tagged as a function-like
+    # operand in the symbolic pipeline, which then breaks assembly when combined
+    # with other trial-family contributions. Use an explicit zero-trial instead.
+    if ds_v is None:
+        ds_v = zero_scalar * dS
+    else:
+        # Some drivers pass a frozen/Picard linearization as `Constant(0.0)`.
+        # Treat this as the intended "zero derivative" and keep it in the trial
+        # role to avoid trial/function shape-mismatch errors during assembly.
+        try:
+            if float(ds_v) == 0.0:
+                ds_v = zero_scalar * dS
+        except Exception:
+            pass
     f_phi = f_phi if f_phi is not None else zero_scalar
     f_alpha = f_alpha if f_alpha is not None else zero_scalar
     f_S = f_S if f_S is not None else zero_scalar
@@ -761,11 +790,24 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     # (ii) Mass / volume constraint (expanded divergence)
     # ------------------------------------------------------------------
-    r_mass = q_test * (th * divF_k + one_m_th * divF_n - alpha_k * s_v) * dx
+    # IMPORTANT (time discretization):
+    #
+    # This is an algebraic (DAE) constraint whose Lagrange multiplier is `p`.
+    # Using a θ-average of *only* the divergence while keeping the source fully
+    # implicit leads to a mixed time level for the constraint. For θ<1 (e.g.
+    # Crank–Nicolson), this can introduce large explicit forcing from the
+    # previous step and destabilize the coupled solve (in particular when
+    # coupled to stiff substrate kinetics).
+    #
+    # We therefore enforce the constraint fully implicitly at the k-level:
+    #     div(F_k) = α_k s_v(k),
+    # consistent with taking the pressure coupling terms at the k-level.
+    r_mass = q_test * (divF_k - alpha_k * s_v) * dx
 
     # Jacobian of divF_k (k-part only)
     # δC = (φ-1) δα + α δφ
-    a_mass = q_test * th * (d_divCv_k + d_divBvS_k - dalpha * s_v) * dx
+    # δ(α s_v) = (δα) s_v + α (δs_v).
+    a_mass = q_test * (d_divCv_k + d_divBvS_k - dalpha * s_v - alpha_k * ds_v) * dx
 
     # ------------------------------------------------------------------
     # (iii) Skeleton momentum (optional inertia + linear/neo-Hookean stress)
@@ -945,13 +987,23 @@ def build_biofilm_one_domain_forms(
         r_skel_drag_k = -beta_coeff_k * dot(kdrag_k, vS_test)
         r_skel_drag_n = -beta_coeff_n * dot(kdrag_n, vS_test)
 
+    # Time discretization for the (quasi-static) skeleton momentum balance.
+    #
+    # When `include_skeleton_acceleration=False`, the skeleton equation is an
+    # algebraic equilibrium (no time derivative). A θ-average would introduce
+    # explicit forcing from the previous step unless *all* terms (including the
+    # pressure coupling) are treated consistently. For robustness, we therefore
+    # evaluate the quasi-static balance fully at the k-level.
+    sk_th = th if bool(include_skeleton_acceleration) else _c(1.0)
+    sk_one_m_th = one_m_th if bool(include_skeleton_acceleration) else _c(0.0)
+
     r_skeleton = (
-        th * alpha_k * (g_stiff_k * r_el_plus_k + r_el_minus_k)
-        + one_m_th * alpha_n * (g_stiff_n * r_el_plus_n + r_el_minus_n)
-        + th * r_skel_press_k
-        + one_m_th * r_skel_press_n
-        + th * r_skel_drag_k
-        + one_m_th * r_skel_drag_n
+        sk_th * alpha_k * (g_stiff_k * r_el_plus_k + r_el_minus_k)
+        + sk_one_m_th * alpha_n * (g_stiff_n * r_el_plus_n + r_el_minus_n)
+        + sk_th * r_skel_press_k
+        + sk_one_m_th * r_skel_press_n
+        + sk_th * r_skel_drag_k
+        + sk_one_m_th * r_skel_drag_n
     ) * dx
     # External body force is weighted by biofilm presence α, but not degraded by g_stiff(d).
     r_skeleton += -dot(alpha_k * f_u, vS_test) * dx
@@ -975,7 +1027,8 @@ def build_biofilm_one_domain_forms(
     else:
         gamma_vS_pin_eff = 0.0 if gamma_vS_pin is None else float(gamma_vS_pin)
     gamma_vS_pin_c = _c(float(gamma_vS_pin_eff))
-    a_skel_visco = None
+    a_skel_visco_alpha = None
+    a_skel_visco_vS = None
     if float(solid_visco_eta) != 0.0:
         eta_s_c = _c(float(solid_visco_eta))
         # grad_vS_k = (grad(u_k) - grad(u_n))/dt
@@ -989,10 +1042,21 @@ def build_biofilm_one_domain_forms(
         r_skeleton += (th * alpha_k * g_stiff_k * r_visc_k + one_m_th * alpha_n * g_stiff_n * r_visc_n) * dx
 
         # Consistent k-part Jacobian: δ[α g σ_visc(vS)] = δ(α g) r_visc + α g a_visc.
+        #
+        # IMPORTANT: keep trial-family contributions separated. Mixing dalpha (and/or dd)
+        # with dvS in a single integrand sum can trigger VecOpInfo shape-mismatch errors
+        # in the current compiler/assembler pipeline.
         sig_dvisc = _c(2.0) * eta_s_c * _epsilon(dvS)
         a_visc = inner(sig_dvisc, grad(vS_test))
-        w_ag = dalpha * g_stiff_k + alpha_k * dg_stiff_k
-        a_skel_visco = th * (w_ag * r_visc_k + alpha_k * g_stiff_k * a_visc) * dx
+        if use_damage:
+            w_ag = dalpha * g_stiff_k + alpha_k * dg_stiff_k
+        else:
+            # Avoid mixing trial and function roles in the symbolic pipeline:
+            # when damage is disabled, dg_stiff_k is exactly 0 but still carries
+            # "function" metadata, and (trial + 0*function) can break assembly.
+            w_ag = dalpha * g_stiff_k
+        a_skel_visco_alpha = sk_th * (w_ag * r_visc_k) * dx
+        a_skel_visco_vS = sk_th * (alpha_k * g_stiff_k * a_visc) * dx
 
     # Optional extension penalty for vS in the free-fluid region.
     if float(gamma_vS_eff) != 0.0:
@@ -1035,9 +1099,11 @@ def build_biofilm_one_domain_forms(
         # (0·test) and break matrix assembly in the python backend.
         elastic_jac_k += dg_stiff_k * r_el_plus_k
 
-    a_skel = th * (alpha_k * elastic_jac_k + dalpha * (g_stiff_k * r_el_plus_k + r_el_minus_k)) * dx
-    if a_skel_visco is not None:
-        a_skel += a_skel_visco
+    a_skel = sk_th * (alpha_k * elastic_jac_k + dalpha * (g_stiff_k * r_el_plus_k + r_el_minus_k)) * dx
+    if a_skel_visco_alpha is not None:
+        a_skel += a_skel_visco_alpha
+    if a_skel_visco_vS is not None:
+        a_skel += a_skel_visco_vS
     # Jacobian of the pressure coupling -p div(B η).
     # Expand dgrad·eta component-wise to avoid backend-dependent contraction
     # paths for Grad(trial-scalar) · VectorTest.
@@ -1048,9 +1114,9 @@ def build_biofilm_one_domain_forms(
         d_div_B_vStest_k += dgradB_k_x * vS_test[0] + dgradB_k_y * vS_test[1]
     else:
         d_div_B_vStest_k += dot(dgradB_k, vS_test)
-    a_skel += th * (-(dp * div_B_vStest_k + p_k * d_div_B_vStest_k)) * dx
+    a_skel += sk_th * (-(dp * div_B_vStest_k + p_k * d_div_B_vStest_k)) * dx
     # Drag term is *not* multiplied by alpha again: beta already contains alpha (one-domain blend).
-    a_skel += th * d_drag_term_k * dx
+    a_skel += sk_th * d_drag_term_k * dx
     a_skel += -dot(dalpha * f_u, vS_test) * dx
 
     # Jacobian of the vS extension penalty (k-part only).
@@ -1207,8 +1273,8 @@ def build_biofilm_one_domain_forms(
         t_adh_n = k_n_c * u_nvec_n + k_t_c * u_tvec_n + g_n_c * vS_nvec_n + g_t_c * vS_tvec_n
 
         r_skeleton += (
-            th * alpha_k * a_prev * dot(t_adh_k, vS_test)
-            + one_m_th * alpha_n * a_prev * dot(t_adh_n, vS_test)
+            sk_th * alpha_k * a_prev * dot(t_adh_k, vS_test)
+            + sk_one_m_th * alpha_n * a_prev * dot(t_adh_n, vS_test)
         ) * ds_adh
 
         # Jacobian (k-part only): δ[ α a_prev t_adh(u,vS) ].
@@ -1218,7 +1284,7 @@ def build_biofilm_one_domain_forms(
         dvS_tvec = dvS - dvS_nvec
         dt_adh = k_n_c * du_nvec + k_t_c * du_tvec + g_n_c * dvS_nvec + g_t_c * dvS_tvec
 
-        a_skel += th * (dalpha * a_prev * dot(t_adh_k, vS_test) + alpha_k * a_prev * dot(dt_adh, vS_test)) * ds_adh
+        a_skel += sk_th * (dalpha * a_prev * dot(t_adh_k, vS_test) + alpha_k * a_prev * dot(dt_adh, vS_test)) * ds_adh
 
     # ------------------------------------------------------------------
     # (iii-c) Solid kinematics (Eulerian reference-map constraint)
@@ -1412,8 +1478,11 @@ def build_biofilm_one_domain_forms(
     # (v) Indicator evolution (advection–diffusion–reaction)
     # ------------------------------------------------------------------
     D_alpha_c = _c(float(D_alpha))
-    G_k = _G(S_k, phi_k, k_g=_c(float(k_g)), mu_max=_c(float(mu_max)), K_S=_c(float(K_S)))
-    G_n = _G(S_n, phi_n, k_g=_c(float(k_g)), mu_max=_c(float(mu_max)), K_S=_c(float(K_S)))
+    k_g_c = k_g if hasattr(k_g, "dim") else _c(float(k_g))
+    mu_max_c = mu_max if hasattr(mu_max, "dim") else _c(float(mu_max))
+    K_S_c = K_S if hasattr(K_S, "dim") else _c(float(K_S))
+    G_k = _G(S_k, phi_k, k_g=k_g_c, mu_max=mu_max_c, K_S=K_S_c)
+    G_n = _G(S_n, phi_n, k_g=k_g_c, mu_max=mu_max_c, K_S=K_S_c)
 
     # Phase-field (Allen–Cahn) regularization parameters for α.
     # Only active when alpha_cahn_M*alpha_cahn_gamma != 0.
@@ -1525,13 +1594,27 @@ def build_biofilm_one_domain_forms(
     # Surface-localized erosion/detachment sink is -D_det_prev δ(α) on the RHS,
     # so it enters the residual with a + sign (same convention as the X source).
     surf_coef_prev = D_det_prev + crack_coef_prev
-    # Conservative advection: ∂t α + div(α vS) = ...  ⇔  ∂t α + vS·∇α + α div(vS) = ...
-    #
-    # NOTE: using the expanded form avoids assembling div(α vS) directly (which would
-    # involve products not represented in a single FE space) while restoring correct
-    # mass balance when div(vS)≠0.
-    adv_alpha_k = dot(grad(alpha_k), vS_k) + alpha_k * div_vS_k
-    adv_alpha_n = dot(grad(alpha_n), vS_n) + alpha_n * div_vS_n
+    adv_key = str(alpha_advection_form).strip().lower()
+    if adv_key in {"advective", "nonconservative", "v.grad", "v·grad", "vgrad"}:
+        adv_key = "advective"
+    elif adv_key in {"conservative", "div", "divergence", "div(alpha*v)"}:
+        adv_key = "conservative"
+    else:
+        raise ValueError(
+            f"Unknown alpha_advection_form={alpha_advection_form!r}. Use 'advective' or 'conservative'."
+        )
+
+    if adv_key == "advective":
+        # Indicator advection: ∂t α + vS·∇α = ...
+        adv_alpha_k = dot(grad(alpha_k), vS_k)
+        adv_alpha_n = dot(grad(alpha_n), vS_n)
+    else:
+        # Conservative advection: ∂t α + div(α vS) = ...
+        #
+        # We implement div(α vS) as vS·∇α + α div(vS) to avoid relying on backend
+        # support for `div(alpha*vS)` in all code paths.
+        adv_alpha_k = dot(grad(alpha_k), vS_k) + alpha_k * div_vS_k
+        adv_alpha_n = dot(grad(alpha_n), vS_n) + alpha_n * div_vS_n
     f_alpha_k += th * (adv_alpha_k - G_k * alpha_k * _one_minus(alpha_k) + surf_coef_prev * delta_k)
     f_alpha_k += one_m_th * (adv_alpha_n - G_n * alpha_n * _one_minus(alpha_n) + surf_coef_prev * delta_n)
 
@@ -1650,9 +1733,12 @@ def build_biofilm_one_domain_forms(
     dalpha_logistic = _one_minus(_c(2.0) * alpha_k) * dalpha
 
     a_alpha = alpha_test * (dalpha * inv_dt) * dx
-    a_alpha += alpha_test * th * (
-        dot(grad(alpha_k), dvS) + dot(grad(dalpha), vS_k) + dalpha * div_vS_k + alpha_k * div_dvS
-    ) * dx
+    if adv_key == "advective":
+        a_alpha += alpha_test * th * (dot(grad(alpha_k), dvS) + dot(grad(dalpha), vS_k)) * dx
+    else:
+        a_alpha += alpha_test * th * (
+            dot(grad(alpha_k), dvS) + dot(grad(dalpha), vS_k) + dalpha * div_vS_k + alpha_k * div_dvS
+        ) * dx
     # δ[ (D_det_prev + crack_coef_prev) * δ(α) ] = (D_det_prev + crack_coef_prev) * δ'(α) δα
     # (surf coefficients are lagged).
     d_delta_k = _c(4.0) * (_one_minus(_c(2.0) * alpha_k)) * dalpha
@@ -1729,14 +1815,22 @@ def build_biofilm_one_domain_forms(
         r_alpha += tau_supg * w_supg * f_alpha_k * dx
 
         df_alpha_k = dalpha * inv_dt
-        df_alpha_k += th * (
-            dot(grad(alpha_k), dvS)
-            + dot(grad(dalpha), vS_k)
-            + dalpha * div_vS_k
-            + alpha_k * div_dvS
-            - (dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic)
-            + d_surf
-        )
+        if adv_key == "advective":
+            df_alpha_k += th * (
+                dot(grad(alpha_k), dvS)
+                + dot(grad(dalpha), vS_k)
+                - (dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic)
+                + d_surf
+            )
+        else:
+            df_alpha_k += th * (
+                dot(grad(alpha_k), dvS)
+                + dot(grad(dalpha), vS_k)
+                + dalpha * div_vS_k
+                + alpha_k * div_dvS
+                - (dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic)
+                + d_surf
+            )
         a_alpha += tau_supg * w_supg * df_alpha_k * dx
 
     if float(alpha_cip) != 0.0 and ds_cip is not None:
@@ -1970,13 +2064,50 @@ def build_biofilm_one_domain_forms(
         S_n, phi_n, alpha_n, mu_max=_c(float(mu_max)), K_S=_c(float(K_S)), k_d=_c(float(k_d)), Y=Y_c
     )
 
+    # IMEX split for stiff substrate reaction:
+    # The Monod sink can be very stiff once scaled by ρ_s^*/Y, so Crank–Nicolson
+    # (θ=0.5) may produce oscillatory updates unless Δt is extremely small.
+    # Allow treating the reaction term fully implicitly while keeping the rest
+    # of the transport equation at the global θ-scheme.
+    rs_key = str(substrate_reaction_scheme).strip().lower()
+    if rs_key in {"theta", "cn", "trap", "trapezoid", "trapezoidal"}:
+        th_RS = th
+        one_m_th_RS = one_m_th
+    elif rs_key in {"implicit", "imex", "be", "backward_euler", "backward-euler", "lstable", "l-stable"}:
+        th_RS = _c(1.0)
+        one_m_th_RS = _c(0.0)
+    elif rs_key in {"explicit", "fe", "forward_euler", "forward-euler"}:
+        th_RS = _c(0.0)
+        one_m_th_RS = _c(1.0)
+    else:
+        raise ValueError(
+            f"Unknown substrate_reaction_scheme={substrate_reaction_scheme!r}. "
+            "Use 'theta' (default), 'implicit'/'imex', or 'explicit'."
+        )
+
+    diff_key = str(substrate_diffusion_scheme).strip().lower()
+    if diff_key in {"theta", "cn", "trap", "trapezoid", "trapezoidal"}:
+        th_diff = th
+        one_m_th_diff = one_m_th
+    elif diff_key in {"implicit", "imex", "be", "backward_euler", "backward-euler", "lstable", "l-stable"}:
+        th_diff = _c(1.0)
+        one_m_th_diff = _c(0.0)
+    elif diff_key in {"explicit", "fe", "forward_euler", "forward-euler"}:
+        th_diff = _c(0.0)
+        one_m_th_diff = _c(1.0)
+    else:
+        raise ValueError(
+            f"Unknown substrate_diffusion_scheme={substrate_diffusion_scheme!r}. "
+            "Use 'theta' (default), 'implicit'/'imex', or 'explicit'."
+        )
+
     div_CSv_k = CSk * div(v_k) + S_k * dot(gradC_k, v_k) + C_k * dot(grad(S_k), v_k)
     div_CSv_n = CSn * div(v_n) + S_n * dot(gradC_n, v_n) + C_n * dot(grad(S_n), v_n)
 
     r_sub = S_test * ((CSk - CSn) * inv_dt) * dx
     r_sub += S_test * (th * div_CSv_k + one_m_th * div_CSv_n) * dx
-    r_sub += D_S_c * th * inner(grad(S_k), grad(S_test)) * dx + D_S_c * one_m_th * inner(grad(S_n), grad(S_test)) * dx
-    r_sub += S_test * (th * RS_k + one_m_th * RS_n) * dx
+    r_sub += D_S_c * th_diff * inner(grad(S_k), grad(S_test)) * dx + D_S_c * one_m_th_diff * inner(grad(S_n), grad(S_test)) * dx
+    r_sub += S_test * (th_RS * RS_k + one_m_th_RS * RS_n) * dx
     r_sub += -S_test * f_S * dx
 
     # Jacobian (k-part only)
@@ -1989,8 +2120,8 @@ def build_biofilm_one_domain_forms(
 
     a_sub = S_test * (dCSk * inv_dt) * dx
     a_sub += S_test * th * d_div_CSv_k * dx
-    a_sub += D_S_c * th * inner(grad(dS), grad(S_test)) * dx
-    a_sub += S_test * th * dRS * dx
+    a_sub += D_S_c * th_diff * inner(grad(dS), grad(S_test)) * dx
+    a_sub += S_test * th_RS * dRS * dx
 
     # ------------------------------------------------------------------
     # (vii) Detached biomass transport (optional)

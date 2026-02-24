@@ -243,3 +243,6 @@ examples/fsi_contact/results/**
 examples/variational_inequalities/*_vtk/
 examples/biofilms/benchmarks/*.pdf
 examples/biofilms/benchmarks/*.tex
+examples/biofilms/**/*.tex
+examples/biofilms/**/*.pdf
+examples/biofilms/**/*.avi
