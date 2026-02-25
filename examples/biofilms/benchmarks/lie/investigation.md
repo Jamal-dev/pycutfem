@@ -131,3 +131,135 @@ Outputs:
    - Implement a minimal **Li-model surrogate** (e.g., a Newtonian high-viscosity two-fluid PF benchmark) and compare our poroelastic model against that.
 3. Increase resolution near the biofilm (or use a smaller scaled domain with equivalent dimensionless groups) so that the solid is not represented by only a handful of Q1 alpha nodes.
 4. Document the final chosen scaling (geometry + parameters + numerical stabilization like `gamma_u`, `kappa_inv`) and the stability envelope (dt, Newton tolerances) in this file once the above is pinned down.
+
+---
+
+## Update: Experimental Video S1 → contour + dx(t)
+
+### Experimental source
+Video S1 provided in:
+- `examples/biofilms/benchmarks/lie/additional_data/bit27491-sup-0001-si_v1.avi`
+
+Setup (from `main.tex`, Section “Biofilm deformation experiments”):
+- Support: cylindrical, **1 mm diameter × 3 mm height**
+- Flow cell: **10 mm × 10 mm** cross-section (width × height), long in streamwise direction
+
+### What we extract
+From the OCT frames we extract:
+- A **2D contour** of the protruding biofilm (frame 0)
+- A deformation time series `dx(t)` at three “tracking line” heights:
+  - `y = 25%, 50%, 75%` of the initial biofilm height (measured from the straightened base)
+  - Metric: **rightmost x-intersection** of the contour with the horizontal line
+
+### Scaling to physical units (critical)
+We scale pixels to meters by enforcing:
+- biofilm **base width = 1 mm** (matches the support diameter)
+
+For Video S1, frame 0 (auto-detected base span):
+- `base_w_px = 525 px` ⇒ `m_per_px = 1e-3 / 525 ≈ 1.904762e-6 m/px`
+
+Sanity check using the **100 μm** scale bar embedded in the video:
+- detected scale bar length ≈ `48 px` ⇒ `≈ 2.083e-6 m/px`
+- agreement within ~9% (reasonable given thresholding and antialiasing of the overlay bar)
+
+### Commands
+Extract dx(t) for the whole video and debug overlays:
+
+```bash
+python -u examples/biofilms/benchmarks/lie/extract_deformation_timeseries_from_experimental_video_s1.py \
+  --clahe --thr-mode otsu --kernel 5 --close-iters 2 --min-area 5000 --component-index 0 \
+  --straighten-base --base-tol-px 6 --simplify-eps 2 \
+  --out-csv out/_lie_exp_s1_dx/timeseries.csv \
+  --debug-dir out/_lie_exp_s1_dx --debug-every 40 \
+  --out-poly0-mm-csv examples/biofilms/benchmarks/lie/biofilm_exp_s1_frame0_polygon_mm.csv
+```
+
+Key outputs:
+- Experimental time series: `out/_lie_exp_s1_dx/timeseries.csv`
+- Debug overlays (every ~5 s): `out/_lie_exp_s1_dx/frame_0000_overlay.png`, `...0040...0080...0120...0160...`
+- Experimental polygon (mm, base is exactly `x=-0.5..0.5`, `y=0`): `examples/biofilms/benchmarks/lie/biofilm_exp_s1_frame0_polygon_mm.csv`
+
+### Experimental dx(t) summary (Video S1)
+Typical magnitudes from `out/_lie_exp_s1_dx/timeseries.csv`:
+- around `t≈5 s`: `dx ≈ 0.04–0.07 mm` (line1..line3)
+- around `t≈20 s`: `dx ≈ 0.13–0.17 mm` (line1..line3)
+
+The extracted curves are noisy (OCT speckle + threshold sensitivity), so comparisons below use a short moving-average smoothing in the plotting script.
+
+---
+
+## Update: One-domain simulation setup + calibration attempts
+
+### Geometry + mesh (corrected)
+We represent the 2D channel as:
+- channel rectangle `L×H = 15 mm × 10 mm`
+- a rigid support block (removed from the fluid mesh): `1 mm × 3 mm`, centered at `x=L/2`
+- biofilm attached to the **top** of the block
+
+Driver:
+- `examples/biofilms/benchmarks/lie/lie_synthetic_deformation_one_domain.py`
+
+Visualization helper (mesh + polygon overlay):
+- `examples/biofilms/benchmarks/lie/plot_mesh_setup_with_biofilm.py`
+
+### Numerical details that strongly affect deformation
+Two knobs were decisive:
+
+1) **u-extension strategy and penalty**
+- `--u-extension l2` uses an `L2/h^2` penalty in the free fluid and can suppress `u` in small biofilm regions unless `--gamma-u` is extremely small.
+- `--u-extension grad` is more usable, but requires a nonzero `--gamma-u-pin` to remove the translation nullspace.
+
+2) **`gamma_u_pin` (grad-mode translation pin)**
+- too small (e.g. `1e-12`) can lead to a singular/ill-conditioned system (we observed early termination/OS “Terminated”)
+- stable runs typically used `--gamma-u-pin ~ 1e-9 ... 1e-10`
+
+The driver now also writes the actual y-levels used for tracking to:
+- `out/<run>/lines.csv`
+
+### Comparison tooling
+We compare exp vs sim with:
+- `examples/biofilms/benchmarks/lie/compare_exp_sim_timeseries_dx.py`
+
+It reports:
+- RMSE (in meters)
+- a **relative error** metric matching the paper’s description (sum(|Dm−De|)/sum(De)×100%, using every 2nd datum)
+
+Example:
+
+```bash
+python -u examples/biofilms/benchmarks/lie/compare_exp_sim_timeseries_dx.py \
+  --exp-csv out/_lie_exp_s1_dx/timeseries.csv \
+  --sim-dir out/_lie_sim_cal2 \
+  --smooth-exp 5
+```
+
+### Calibration runs (summary)
+Paper Table-1 values (`G_b=69736 Pa`, `mu_b=30494 Pa·s`) lead to essentially zero deformation in this one-domain setup at `u_avg=6e-4 m/s` and `H=10 mm`.
+To obtain comparable mm-scale displacements, we treated `G_b, mu_b` as **effective** parameters of the poroelastic one-domain surrogate and tuned them together with numerical stabilization parameters.
+
+Selected runs (all with `--backend cpp`, PETSc SNES + LU/MUMPS, and the experimental polygon as `alpha0`):
+
+1) Baseline “deforms but plateaus early”
+- `out/_lie_sim_cal2`
+- key params: `--u-extension grad --gamma-u 1e-6 --gamma-u-pin 1e-9 --G-b 2e-3 --mu-b 0.05 --t-ramp 1`
+- relative error (every 2nd point): total ≈ **51%**
+
+2) Slower inflow ramp improves line3 trend
+- `out/_lie_sim_cal2_tr20`
+- key change: `--t-ramp 20`
+- relative error: total ≈ **42%**
+
+3) Best (so far) overall relative error (but still imperfect)
+- `out/_lie_sim_cal2_pin1e-10_tr20`
+- key params: `--t-ramp 20 --gamma-u-pin 1e-10 --G-b 2e-3 --mu-b 0.05`
+- relative error: total ≈ **35%** (line1≈36%, line2≈30%, line3≈39%)
+
+Notes:
+- Several parameter combinations yield a small negative `dx_line3` transient at early times (when displacements are O(1–10 μm)); this appears to be a **measurement sensitivity** of the “alpha=0.5 crossing” metric at tiny deformations. Reducing `dt` and/or refining `ny` should help.
+- Runs with too small `--gamma-u-pin` can fail (singular solve / “Terminated”).
+
+### Next actions to reduce the remaining error
+To move from “reasonable” to “paper-ready” agreement:
+1. Increase `ny` (and possibly reduce `dt`) so the tracking-line y-levels are well resolved and small-deformation crossings are less noisy.
+2. Consider a tracking metric closer to the paper’s DIC (e.g., track an interior material marker line instead of the rightmost contour point).
+3. Revisit constitutive mapping: the paper calibrates a Maxwell/Oldroyd‑B response, while this one-domain surrogate currently behaves more like a Kelvin–Voigt skeleton; matching long-time creep may require a different viscoelastic closure.

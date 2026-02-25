@@ -64,6 +64,47 @@ def _tag_rectangle_boundaries(mesh: Mesh, *, L: float, H: float, tol: float = 1.
     )
 
 
+def _apply_y_stretch(nodes: np.ndarray, *, Hy: float, y_stretch: float) -> np.ndarray:
+    """
+    Optional y-mapping to cluster elements near y=0 and y=Hy (both ends).
+
+    We use a smooth periodic perturbation of the uniform parameter η=y/Hy:
+        y_new = Hy * (η + c * sin(2π η)/(2π)),   with |c| < 1.
+
+    For c<0, dy/dη = 1 + c cos(2π η) is smaller near η=0,1 and larger near η=0.5,
+    clustering resolution near the two boundaries (useful because the Warner cases
+    start with a thin film at y≈0 and later approach y≈Hy).
+    """
+    c = float(y_stretch)
+    if abs(c) <= 1.0e-14:
+        return nodes
+    if not (-0.99 < c < 0.99):
+        raise ValueError(f"y_stretch must be in (-0.99,0.99); got {c}.")
+    Hy = float(Hy)
+    if Hy <= 0.0:
+        return nodes
+    # Common case for pycutfem meshes: `nodes` is a list[Node] (see core.topology.Node).
+    if isinstance(nodes, (list, tuple)) and len(nodes) > 0 and hasattr(nodes[0], "y"):
+        for node in nodes:
+            eta = float(node.y) / Hy
+            if eta < 0.0:
+                eta = 0.0
+            elif eta > 1.0:
+                eta = 1.0
+            node.y = Hy * (eta + c * math.sin(2.0 * math.pi * eta) / (2.0 * math.pi))
+        return nodes
+
+    # Fallback: nodes as numeric array-like of shape (n,2) or (n,>=2).
+    arr = np.asarray(nodes, dtype=float)
+    if arr.ndim == 2 and arr.shape[1] >= 2:
+        out = np.array(arr, copy=True)
+        eta = np.clip(out[:, 1] / Hy, 0.0, 1.0)
+        out[:, 1] = Hy * (eta + c * np.sin(2.0 * math.pi * eta) / (2.0 * math.pi))
+        return out
+
+    return nodes
+
+
 def _mark_inactive_fields(dh: DofHandler, *field_names: str) -> None:
     """Exclude selected fields from the Newton solve via `dh.dof_tags['inactive']`."""
     tags = getattr(dh, "dof_tags", None) or {}
@@ -85,6 +126,18 @@ def _smooth_step(z: np.ndarray) -> np.ndarray:
 def _one_minus(expr):
     # Keep the UFL operand on the left for backend compatibility.
     return (-expr) + Constant(1.0)
+
+def _pow_int(expr, n: int):
+    """Integer power helper that stays within the UFL expression algebra."""
+    n = int(n)
+    if n < 0:
+        raise ValueError(f"n must be >= 0; got {n}.")
+    if n == 0:
+        return Constant(1.0)
+    out = expr
+    for _ in range(n - 1):
+        out = out * expr
+    return out
 
 
 def _alpha_step_eval(x: np.ndarray, y: np.ndarray, *, h: np.ndarray, eps: float) -> np.ndarray:
@@ -298,7 +351,7 @@ def _detachment_coeff_case(
         V_det_nondim = float(lambda_shear) * float(L_ref_m) * (L * L)
         return float(V_det_nondim / (4.0 * eps))
 
-    if cid == 4 and (5.984 < t < 5.994):
+    if cid == 4 and (5.984 <= t < 5.994):
         # Sloughing speed magnitude in Warner: 0.05 m/d.
         V_slough_nondim = 0.05 / float(L_ref_m)
         return float(V_slough_nondim / (4.0 * eps))
@@ -321,6 +374,7 @@ def _build_one_domain_problem(
     Hy: float,
     nx: int,
     ny: int,
+    y_stretch: float,
     qdeg: int,
     dt_days: float,
     theta: float,
@@ -373,6 +427,7 @@ def _build_one_domain_problem(
     D_det_prev: Constant,
 ):
     nodes, elems, _, corners = structured_quad(Lx, Hy, nx=int(nx), ny=int(ny), poly_order=2)
+    nodes = _apply_y_stretch(nodes, Hy=float(Hy), y_stretch=float(y_stretch))
     mesh = Mesh(
         nodes=nodes,
         element_connectivity=elems,
@@ -892,13 +947,48 @@ def main() -> None:
         help="Relaxation rate (1/d) used with --bulk-mode well_mixed.",
     )
     ap.add_argument(
+        "--bulk-alpha-power",
+        type=int,
+        default=16,
+        help=(
+            "Exponent m in the bulk-relaxation weight w(α)=(1-α)^m used with --bulk-mode well_mixed. "
+            "Using a high power confines the relaxation to the bulk fluid (α≈0) and avoids directly "
+            "injecting substrate in the diffuse interface."
+        ),
+    )
+    ap.add_argument(
+        "--bulk-jacobian",
+        type=str,
+        default="full",
+        choices=("full", "frozen"),
+        help=(
+            "Linearization mode for the bulk-relaxation term used with --bulk-mode well_mixed. "
+            "'full' includes the α-dependence of w(α) in the Jacobian; "
+            "'frozen' treats w(α) as fixed (Picard), which can improve robustness when "
+            "using small --bulk-alpha-power."
+        ),
+    )
+    ap.add_argument(
         "--removal-metric",
         type=str,
         default="interface_total",
-        choices=("interface_total", "interface_diff", "top_flux", "consumption"),
+        choices=("interface_total", "interface_diff", "top_flux", "bulk_exchange", "reservoir_exchange", "consumption"),
         help=(
             "How to compute substrate removal (for comparison curves). "
-            "'interface_total' is closest to Warner's definition (-j_L = -j_diff + u_L S_L)."
+            "'interface_total' is closest to Warner's definition (-j_L = -j_diff + u_L S_L). "
+            "'reservoir_exchange' measures net transfer from the imposed bulk (well_mixed relaxation) plus the top-boundary flux "
+            "(and includes the interface penalty exchange if --surface-gamma is used)."
+        ),
+    )
+    ap.add_argument(
+        "--thickness-metric",
+        type=str,
+        default="half",
+        choices=("half", "eff"),
+        help=(
+            "Thickness diagnostic used in comparison plots (strip mode) and for u_L in the interface_total removal. "
+            "'half' uses the geometric α=0.5 contour; "
+            "'eff' uses L_eff := (∫α dA)/width (matches sharp-interface thickness when α≈1/0)."
         ),
     )
     ap.add_argument(
@@ -914,6 +1004,15 @@ def main() -> None:
     ap.add_argument("--Hy", type=float, default=1.5, help="Domain height (nondimensional). Must exceed the maximum thickness.")
     ap.add_argument("--nx", type=int, default=4, help="Strip: elements in x.")
     ap.add_argument("--ny", type=int, default=240, help="Strip: elements in y.")
+    ap.add_argument(
+        "--y-stretch",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional y-mesh stretching parameter c in y = Hy*(η + c*sin(2π η)/(2π)), η=y/Hy. "
+            "Use c<0 to cluster resolution near y=0 and y=Hy (both ends)."
+        ),
+    )
     ap.add_argument("--nx-2d", type=int, default=32, help="2D: elements in x.")
     ap.add_argument("--ny-2d", type=int, default=64, help="2D: elements in y.")
     ap.add_argument("--q", type=int, default=8, help="Assembly quadrature order.")
@@ -941,6 +1040,17 @@ def main() -> None:
         type=float,
         default=0.0,
         help="Maximum dt when using --adaptive-dt (0 uses the initial --dt).",
+    )
+    ap.add_argument(
+        "--dt-after-event",
+        type=float,
+        default=0.01,
+        help=(
+            "Initial dt to use immediately after event times (days). "
+            "Used when the script splits the solve into segments for case 2 (step at 6d) "
+            "and case 4 (sloughing around 6d) so the post-event transient converges robustly. "
+            "If <=0, reuse --dt."
+        ),
     )
     ap.add_argument(
         "--dt-reduction-factor",
@@ -1226,8 +1336,31 @@ def main() -> None:
     ap.add_argument("--slough-drop-um", type=float, default=500.0, help="Case 4 integrated sloughing thickness drop (microns).")
 
     # 2D initial surface perturbation
-    ap.add_argument("--h0-amp", type=float, default=0.0, help="2D: relative amplitude for wavy initial thickness (0.2 => ±20%).")
+    ap.add_argument("--h0-amp", type=float, default=0.0, help="2D: relative amplitude for wavy initial thickness (0.2 => ±20 percent).")
+    ap.add_argument(
+        "--surface-gamma",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional interface Dirichlet-penalty for the substrate: adds "
+            "γ_s |∇α| (S - S_bulk) to the substrate residual to enforce S≈S_bulk at the "
+            "diffuse interface (Warner cases 1–4 assume fixed surface concentration). "
+            "Units: 1/d. Use 0 to disable."
+        ),
+    )
+    ap.add_argument(
+        "--surface-jacobian",
+        type=str,
+        default="frozen",
+        choices=("full", "frozen"),
+        help=(
+            "Linearization mode for the interface penalty term added by --surface-gamma. "
+            "'full' includes α-dependence of |∇α| in the Jacobian; "
+            "'frozen' treats |∇α| as fixed (Picard), recommended for --solve-strategy split."
+        ),
+    )
 
+    # NOTE: argparse uses old-style '%' string formatting internally. Avoid '%' in help strings.
     args = ap.parse_args()
 
     # Keep the benchmark logs readable: suppress very verbose assembly INFO logs.
@@ -1249,9 +1382,17 @@ def main() -> None:
     # and the kinematics block for u becomes unnecessary. Freezing u significantly
     # improves Newton/PDAS robustness while keeping the intended kinematic thickness
     # evolution driven by vS.
-    if str(args.mechanics).strip().lower() == "skeleton" and float(args.mu_s) == 0.0 and float(args.lambda_s) == 0.0 and not bool(args.freeze_u):
+    if (
+        str(args.mechanics).strip().lower() in {"skeleton", "full"}
+        and float(args.mu_s) == 0.0
+        and float(args.lambda_s) == 0.0
+        and not bool(args.freeze_u)
+    ):
         args.freeze_u = True
-        print("[preset] mechanics=skeleton with mu_s=lambda_s=0 -> enabling --freeze-u for robustness.", flush=True)
+        print(
+            f"[preset] mechanics={args.mechanics} with mu_s=lambda_s=0 -> enabling --freeze-u for robustness.",
+            flush=True,
+        )
 
     mech_key = str(args.mechanics).strip().lower()
     sv_key = str(getattr(args, "s_v_mode", "auto")).strip().lower()
@@ -1316,6 +1457,35 @@ def main() -> None:
 
     rows_by_mode_case: dict[tuple[str, int], list[dict[str, float]]] = {}
 
+    def _write_rows_csv(*, rows: list[dict[str, float]], out_csv: Path) -> None:
+        if not rows:
+            return
+        cols = [
+            "t_days",
+            "L_eff_um",
+            "L_half_um",
+            "L_thickness_um",
+            "removal",
+            "removal_top_flux",
+            "removal_bulk_exchange",
+            "removal_surface_exchange",
+            "removal_reservoir_exchange",
+            "removal_consumption",
+            "removal_interface_diff_grad",
+            "removal_interface_diff_int",
+            "removal_interface_diff",
+            "removal_interface_total",
+            "uL_um_per_d",
+            "D_det_prev",
+            "k_g_eff",
+            "S_surf",
+            "S_top",
+        ]
+        arr = np.column_stack([[r[c] for r in rows] for c in cols])
+        tmp = out_csv.with_suffix(out_csv.suffix + ".tmp")
+        np.savetxt(tmp, arr, delimiter=",", header=",".join(cols), comments="")
+        os.replace(tmp, out_csv)
+
     def _run_mode(mode: str, *, cid: int, Lx: float, Hy: float, nx: int, ny: int, h0_fn) -> Path:
         D_det_prev = Constant(0.0)
         S_bulk_value = float(args.S_high)
@@ -1340,6 +1510,7 @@ def main() -> None:
             Hy=float(Hy),
             nx=int(nx),
             ny=int(ny),
+            y_stretch=float(getattr(args, "y_stretch", 0.0) or 0.0),
             qdeg=int(qdeg),
             dt_days=float(args.dt),
             theta=float(theta),
@@ -1461,15 +1632,68 @@ def main() -> None:
             base_jacobian_form = base_jacobian_form + gamma_p_c * (w16 * dp + dw16 * p_k) * q_p * dx_q
         bulk_residual = None
         bulk_jacobian = None
+        w_bulk = Constant(0.0)
         if bulk_mode == "well_mixed" and float(args.bulk_gamma) != 0.0:
             S_test = TestFunction("S", dof_handler=dh)
             dS_trial = TrialFunction("S", dof_handler=dh)
             dalpha = TrialFunction("alpha", dof_handler=dh)
             one_m_alpha_k = _one_minus(alpha_k)
-            bulk_residual = gamma_bulk_c * one_m_alpha_k * (S_k - S_bulk_c) * S_test * dx_q
-            bulk_jacobian = gamma_bulk_c * (one_m_alpha_k * dS_trial + (S_k - S_bulk_c) * (-dalpha)) * S_test * dx_q
+            m_bulk = int(getattr(args, "bulk_alpha_power", 16) or 0)
+            w_bulk = _pow_int(one_m_alpha_k, m_bulk)
+            if m_bulk <= 0:
+                dw_bulk = Constant(0.0) * dalpha
+            else:
+                dw_bulk = (-Constant(float(m_bulk)) * _pow_int(one_m_alpha_k, m_bulk - 1)) * dalpha
+            bulk_residual = gamma_bulk_c * w_bulk * (S_k - S_bulk_c) * S_test * dx_q
+            bulk_jac_mode = str(getattr(args, "bulk_jacobian", "full")).strip().lower()
+            if bulk_jac_mode in {"full"}:
+                bulk_jacobian = gamma_bulk_c * (w_bulk * dS_trial + (S_k - S_bulk_c) * dw_bulk) * S_test * dx_q
+            elif bulk_jac_mode in {"frozen", "picard"}:
+                bulk_jacobian = gamma_bulk_c * (w_bulk * dS_trial) * S_test * dx_q
+            else:
+                raise ValueError(f"Unknown --bulk-jacobian={args.bulk_jacobian!r}. Use 'full' or 'frozen'.")
+
+        # Optional interface Dirichlet-penalty (surface BC at α=0.5):
+        #   ∫ γ_s |∇α| (S - S_bulk) w dx  ≈  ∫_Γ γ_s (S - S_bulk) w dS.
+        #
+        # This addresses the main mismatch for Warner cases 1–4: the FD reference uses
+        # a fixed surface concentration S(t,L)=S_L(t), while a fixed-domain diffuse
+        # interface has a finite-thickness transition region where reaction can
+        # reduce S at the α=0.5 contour. The penalty enforces the Dirichlet value
+        # at the interface without injecting substrate into the bulk volume.
+        surface_residual = None
+        surface_jacobian = None
+        gamma_surf_c = Constant(0.0)
+        w_surf = Constant(0.0)
+        surface_gamma = float(getattr(args, "surface_gamma", 0.0) or 0.0)
+        if surface_gamma != 0.0:
+            gamma_surf_c = Constant(float(surface_gamma))
+            S_test = TestFunction("S", dof_handler=dh)
+            dS_trial = TrialFunction("S", dof_handler=dh)
+            dalpha = TrialFunction("alpha", dof_handler=dh)
+            g2 = inner(grad(alpha_k), grad(alpha_k))
+            w_surf = (g2 + Constant(1.0e-16)) ** Constant(0.5)
+            surface_residual = gamma_surf_c * w_surf * (S_k - S_bulk_c) * S_test * dx_q
+
+            surf_jac_mode = str(getattr(args, "surface_jacobian", "frozen")).strip().lower()
+            if surf_jac_mode in {"full"}:
+                # δ|∇α| = (∇α·∇δα)/|∇α| for |∇α| = sqrt(∇α·∇α + η).
+                dw_surf = (inner(grad(alpha_k), grad(dalpha)) / w_surf) if surface_gamma != 0.0 else Constant(0.0) * dalpha
+                surface_jacobian = gamma_surf_c * (w_surf * dS_trial + (S_k - S_bulk_c) * dw_surf) * S_test * dx_q
+            elif surf_jac_mode in {"frozen", "picard"}:
+                surface_jacobian = gamma_surf_c * (w_surf * dS_trial) * S_test * dx_q
+            else:
+                raise ValueError(f"Unknown --surface-jacobian={args.surface_jacobian!r}. Use 'full' or 'frozen'.")
+
+        # Net substrate transfer from the (imposed) bulk into the computational domain.
+        # Positive when the bulk supplies substrate (S < S_bulk), negative when substrate is released.
+        I_bulk_exchange = (-gamma_bulk_c * w_bulk * (S_k - S_bulk_c)) * dx_q
+        # If the interface penalty is enabled, it also represents exchange with the
+        # imposed bulk reservoir (localized to the diffuse interface).
+        I_surface_exchange = (-gamma_surf_c * w_surf * (S_k - S_bulk_c)) * dx_q
 
         rows: list[dict[str, float]] = []
+        out_csv = outdir / f"one_domain_{mode}_case{cid}_backend={backend}_timeseries.csv"
 
         dS_top = dS(tag="top", metadata={"q": int(qdeg)})
         D_S_c = Constant(float(D_S_nondim))
@@ -1507,11 +1731,11 @@ def main() -> None:
             except Exception:
                 k_g_c.value = float(k_g_base)
 
-        L_half_prev_nondim: float | None = None
+        L_thickness_prev_nondim: float | None = None
 
         def _record_step(*, t_k: float, _funcs):
             nonlocal S_bulk_value
-            nonlocal L_half_prev_nondim
+            nonlocal L_thickness_prev_nondim
             # Update bulk substrate value for the current step (case 2 step change).
             if int(cid) != 5:
                 S_bulk_value = float(_S_bulk_case(cid, float(t_k), S_high=float(args.S_high)))
@@ -1535,10 +1759,21 @@ def main() -> None:
             else:
                 L_half_nondim = _strip_thickness_alpha_half(dh=dh, alpha=alpha_k)
             L_half_um = 1.0e6 * float(L_ref_m) * float(L_half_nondim)
+            thickness_key = str(getattr(args, "thickness_metric", "half")).strip().lower()
+            if thickness_key not in {"half", "eff"}:
+                raise ValueError(f"Unknown --thickness-metric={args.thickness_metric!r}. Use 'half' or 'eff'.")
+            L_thickness_nondim = float(L_half_nondim) if thickness_key == "half" else float(L_eff_nondim)
+            L_thickness_um = 1.0e6 * float(L_ref_m) * float(L_thickness_nondim)
 
             # Removal flux metrics (positive for uptake/removal).
             F_top = assemble_scalar(dh, I_flux_top, backend=backend, quad_order=int(qdeg))
             removal_top_flux = float(L_ref_m) * (float(F_top) / max(width, 1.0e-16))
+
+            F_bulk = assemble_scalar(dh, I_bulk_exchange, backend=backend, quad_order=int(qdeg))
+            removal_bulk_exchange = float(L_ref_m) * (float(F_bulk) / max(width, 1.0e-16))
+            F_surf = assemble_scalar(dh, I_surface_exchange, backend=backend, quad_order=int(qdeg))
+            removal_surface_exchange = float(L_ref_m) * (float(F_surf) / max(width, 1.0e-16))
+            removal_reservoir_exchange = float(removal_top_flux + removal_bulk_exchange + removal_surface_exchange)
 
             C_tot = assemble_scalar(dh, I_consumption, backend=backend, quad_order=int(qdeg))
             removal_consumption = float(L_ref_m) * (float(C_tot) / max(width, 1.0e-16))
@@ -1546,11 +1781,14 @@ def main() -> None:
             # Interface diffusive flux (-j_diff) at α=0.5. For strip runs we estimate it
             # from the x-averaged 1D profile; otherwise fall back to a diffuse-interface
             # proxy (may be noisy on coarse meshes).
+            removal_interface_diff_grad = float("nan")
             if mode == "strip" and np.isfinite(float(dS_dy_surf)):
-                removal_interface_diff = float(L_ref_m) * float(D_S_nondim) * float(dS_dy_surf)
-            else:
-                F_int = assemble_scalar(dh, I_flux_interface, backend=backend, quad_order=int(qdeg))
-                removal_interface_diff = float(L_ref_m) * (float(F_int) / max(width, 1.0e-16))
+                removal_interface_diff_grad = float(L_ref_m) * float(D_S_nondim) * float(dS_dy_surf)
+
+            F_int = assemble_scalar(dh, I_flux_interface, backend=backend, quad_order=int(qdeg))
+            removal_interface_diff_int = float(L_ref_m) * (float(F_int) / max(width, 1.0e-16))
+
+            removal_interface_diff = removal_interface_diff_grad if np.isfinite(removal_interface_diff_grad) else removal_interface_diff_int
 
             # Warner's total interface flux is j_L = j_diff - u_L S_L.
             # Their plotted "removal" is -j_L = (-j_diff) + u_L S_L.
@@ -1558,9 +1796,9 @@ def main() -> None:
             if dt_step <= 0.0:
                 dt_step = float(args.dt)
             uL_m_per_d = 0.0
-            if L_half_prev_nondim is not None and dt_step > 0.0:
-                uL_m_per_d = (float(L_half_nondim) - float(L_half_prev_nondim)) * float(L_ref_m) / float(dt_step)
-            L_half_prev_nondim = float(L_half_nondim)
+            if L_thickness_prev_nondim is not None and dt_step > 0.0:
+                uL_m_per_d = (float(L_thickness_nondim) - float(L_thickness_prev_nondim)) * float(L_ref_m) / float(dt_step)
+            L_thickness_prev_nondim = float(L_thickness_nondim)
             S_L = float(S_surf) if np.isfinite(float(S_surf)) else float(S_bulk_value)
             removal_interface_total = float(removal_interface_diff + uL_m_per_d * S_L)
 
@@ -1569,6 +1807,10 @@ def main() -> None:
                 removal = removal_consumption
             elif removal_key in {"top_flux", "top"}:
                 removal = removal_top_flux
+            elif removal_key in {"bulk_exchange", "bulk"}:
+                removal = removal_bulk_exchange
+            elif removal_key in {"reservoir_exchange", "reservoir", "bulk_total", "bulk+top"}:
+                removal = removal_reservoir_exchange
             elif removal_key in {"interface_diff", "interface_flux", "interface"}:
                 removal = removal_interface_diff
             elif removal_key in {"interface_total", "interface_total_flux"}:
@@ -1576,7 +1818,7 @@ def main() -> None:
             else:
                 raise ValueError(
                     f"Unknown --removal-metric={args.removal_metric!r}. "
-                    "Use 'consumption', 'top_flux', 'interface_diff', or 'interface_total'."
+                    "Use 'consumption', 'top_flux', 'bulk_exchange', 'reservoir_exchange', 'interface_diff', or 'interface_total'."
                 )
 
             # Case 5: coupled completely-mixed bulk ODE (COD only, simplified).
@@ -1614,7 +1856,7 @@ def main() -> None:
             D_det_prev.value = _detachment_coeff_case(
                 case_id=cid,
                 t_days=t_k,
-                dt_days=float(args.dt),
+                dt_days=float(dt_step),
                 L_eff_nondim=L_eff_nondim,
                 L_ref_m=float(L_ref_m),
                 eps_det_nondim=float(eps_det_eff),
@@ -1628,9 +1870,15 @@ def main() -> None:
                     "t_days": float(t_k),
                     "L_eff_um": float(L_eff_um),
                     "L_half_um": float(L_half_um),
+                    "L_thickness_um": float(L_thickness_um),
                     "removal": float(removal),
                     "removal_top_flux": float(removal_top_flux),
+                    "removal_bulk_exchange": float(removal_bulk_exchange),
+                    "removal_surface_exchange": float(removal_surface_exchange),
+                    "removal_reservoir_exchange": float(removal_reservoir_exchange),
                     "removal_consumption": float(removal_consumption),
+                    "removal_interface_diff_grad": float(removal_interface_diff_grad) if np.isfinite(removal_interface_diff_grad) else float("nan"),
+                    "removal_interface_diff_int": float(removal_interface_diff_int),
                     "removal_interface_diff": float(removal_interface_diff),
                     "removal_interface_total": float(removal_interface_total),
                     "uL_um_per_d": float(1.0e6 * float(uL_m_per_d)),
@@ -1640,6 +1888,7 @@ def main() -> None:
                     "S_top": float(S_bulk_value),
                 }
             )
+            _write_rows_csv(rows=rows, out_csv=out_csv)
 
             # Update thickness-scaled growth coefficient for the *next* step.
             if k_g_mode == "warner" and k_g_base != 0.0:
@@ -1664,7 +1913,7 @@ def main() -> None:
                 vSmax = float(np.max(np.abs(vS_k.nodal_values))) if hasattr(vS_k, "nodal_values") else float("nan")
                 umax = float(np.max(np.abs(u_k.nodal_values))) if hasattr(u_k, "nodal_values") else float("nan")
                 print(
-                    f"[diag] t={t_k:.3f}d  L_eff={L_eff_um:.3f}um  removal={removal:.3e}  "
+                    f"[diag] t={t_k:.3f}d  L_eff={L_eff_um:.3f}um  L_thick={L_thickness_um:.3f}um  removal={removal:.3e}  "
                     f"alpha=[{a_min:.3e},{a_max:.3e}]  phi=[{p_min:.3e},{p_max:.3e}]  S=[{s_min:.3e},{s_max:.3e}]  "
                     f"|v|_max={vmax:.3e}  |p|_max={pmax:.3e}  |vS|_max={vSmax:.3e}  |u|_max={umax:.3e}"
                 )
@@ -1731,6 +1980,9 @@ def main() -> None:
             if bulk_residual is not None and bulk_jacobian is not None:
                 residual_form = residual_form + bulk_residual
                 jacobian_form = jacobian_form + bulk_jacobian
+            if surface_residual is not None and surface_jacobian is not None:
+                residual_form = residual_form + surface_residual
+                jacobian_form = jacobian_form + surface_jacobian
             solver = _new_solver(
                 residual_form,
                 jacobian_form,
@@ -1802,6 +2054,9 @@ def main() -> None:
             if bulk_residual is not None and bulk_jacobian is not None:
                 res_B = res_B + bulk_residual
                 jac_B = jac_B + bulk_jacobian
+            if surface_residual is not None and surface_jacobian is not None:
+                res_B = res_B + surface_residual
+                jac_B = jac_B + surface_jacobian
             res_B = res_B + r_freeze_other
             jac_B = jac_B + a_freeze_other
 
@@ -1874,102 +2129,195 @@ def main() -> None:
 
         if strategy == "monolithic":
             dt_max_val = float(args.dt) if float(getattr(args, "dt_max", 0.0) or 0.0) <= 0.0 else float(args.dt_max)
-            solver.solve_time_interval(
-                functions=funcs,
-                prev_functions=prev_funcs,
-                aux_functions={"dt": dt_c},
-                time_params=TimeStepperParameters(
-                    dt=float(args.dt),
-                    final_time=float(args.t_final),
-                    max_steps=int(1.0e9),
-                    theta=float(theta),
-                    t0=0.0,
-                    stop_on_steady=False,
-                    on_dt_change=_on_dt_change,
-                    allow_dt_reduction=bool(getattr(args, "adaptive_dt", False)),
-                    dt_min=float(getattr(args, "dt_min", 0.0) or 0.0),
-                    dt_max=float(dt_max_val),
-                    dt_reduction_factor=float(getattr(args, "dt_reduction_factor", 0.5) or 0.5),
-                    dt_increase_factor=float(getattr(args, "dt_increase_factor", 2.0) or 2.0),
-                    dt_iters_increase_threshold=int(getattr(args, "dt_iters_increase_threshold", 25) or 25),
-                    dt_easy_steps_before_increase=int(getattr(args, "dt_easy_steps_before_increase", 1) or 1),
-                    dt_decrease_factor_slow=float(getattr(args, "dt_decrease_factor_slow", 1.0) or 1.0),
-                    dt_iters_decrease_threshold=int(getattr(args, "dt_iters_decrease_threshold", 40) or 40),
-                    dt_slow_steps_before_decrease=int(getattr(args, "dt_slow_steps_before_decrease", 1) or 1),
-                    dt_reject_on_slow=bool(getattr(args, "dt_reject_on_slow", False)),
-                ),
-            )
+
+            # Split the long run at discontinuous "event" times so we hit them exactly
+            # (and can restart dt for the post-event transient).
+            t_final = float(args.t_final)
+            t_events: list[float] = []
+            if int(cid) == 2:
+                t_events.append(6.0)  # step-change in surface substrate
+            if int(cid) == 4:
+                slough_mode = str(getattr(args, "slough_mode", "integrated")).strip().lower()
+                if slough_mode == "exact":
+                    t_events.extend([5.984, 5.994])  # Warner window
+                else:
+                    t_events.append(6.0)  # integrated coarse drop around 6d
+
+            dt_base = float(args.dt)
+            # For discontinuities, also stop one base step before the event so the
+            # (event-ε, event] interval can be taken with a smaller restarted dt.
+            if int(cid) in {2, 4}:
+                for te in list(t_events):
+                    t_pre = float(te) - float(dt_base)
+                    if 0.0 < t_pre < t_final:
+                        t_events.append(t_pre)
+
+            # Keep only strict interior events; always end at t_final.
+            t_stops = sorted({t for t in t_events if 0.0 < float(t) < t_final})
+            t_stops.append(t_final)
+
+            t0 = 0.0
+            dt_after = float(getattr(args, "dt_after_event", 0.0) or 0.0)
+            if dt_after <= 0.0:
+                dt_after = float(dt_base)
+
+            for t1 in t_stops:
+                if t1 <= t0 + 1.0e-15:
+                    t0 = float(t1)
+                    continue
+
+                dt_init = float(dt_base) if t0 <= 1.0e-15 else float(min(dt_base, dt_after))
+                solver.solve_time_interval(
+                    functions=funcs,
+                    prev_functions=prev_funcs,
+                    aux_functions={"dt": dt_c},
+                    time_params=TimeStepperParameters(
+                        dt=float(dt_init),
+                        final_time=float(t1),
+                        max_steps=int(1.0e9),
+                        theta=float(theta),
+                        t0=float(t0),
+                        stop_on_steady=False,
+                        on_dt_change=_on_dt_change,
+                        allow_dt_reduction=bool(getattr(args, "adaptive_dt", False)),
+                        dt_min=float(getattr(args, "dt_min", 0.0) or 0.0),
+                        dt_max=float(dt_max_val),
+                        dt_reduction_factor=float(getattr(args, "dt_reduction_factor", 0.5) or 0.5),
+                        dt_increase_factor=float(getattr(args, "dt_increase_factor", 2.0) or 2.0),
+                        dt_iters_increase_threshold=int(getattr(args, "dt_iters_increase_threshold", 25) or 25),
+                        dt_easy_steps_before_increase=int(getattr(args, "dt_easy_steps_before_increase", 1) or 1),
+                        dt_decrease_factor_slow=float(getattr(args, "dt_decrease_factor_slow", 1.0) or 1.0),
+                        dt_iters_decrease_threshold=int(getattr(args, "dt_iters_decrease_threshold", 40) or 40),
+                        dt_slow_steps_before_decrease=int(getattr(args, "dt_slow_steps_before_decrease", 1) or 1),
+                        dt_reject_on_slow=bool(getattr(args, "dt_reject_on_slow", False)),
+                    ),
+                )
+                t0 = float(t1)
         else:
             # Manual time loop for split strategy.
-            t_n = 0.0
-            dt = float(args.dt)
+            #
+            # IMPORTANT: cases 2 and 4 have discontinuous "events" at ~t=6d. We must
+            # hit these times exactly (same as the monolithic driver) so the frozen
+            # θ-time BC evaluation does not smear the discontinuity across a step.
             t_final = float(args.t_final)
+            dt_base = float(args.dt)
+            dt_max_val = float(args.dt) if float(getattr(args, "dt_max", 0.0) or 0.0) <= 0.0 else float(args.dt_max)
+            dt_min_val = float(getattr(args, "dt_min", 0.0) or 0.0)
+            allow_adapt = bool(getattr(args, "adaptive_dt", False))
+            dt_reduction = float(getattr(args, "dt_reduction_factor", 0.5) or 0.5)
+            dt_increase = float(getattr(args, "dt_increase_factor", 2.0) or 2.0)
+
+            # Split the run at discontinuous "event" times so we hit them exactly.
+            t_events: list[float] = []
+            if int(cid) == 2:
+                t_events.append(6.0)  # step-change in surface substrate
+            if int(cid) == 4:
+                slough_mode = str(getattr(args, "slough_mode", "integrated")).strip().lower()
+                if slough_mode == "exact":
+                    t_events.extend([5.984, 5.994])  # Warner window
+                else:
+                    t_events.append(6.0)  # integrated coarse drop around 6d
+
+            # For discontinuities, also stop one base step before the event so the
+            # (event-Δt, event] interval can be taken with a restarted dt.
+            if int(cid) in {2, 4}:
+                for te in list(t_events):
+                    t_pre = float(te) - float(dt_base)
+                    if 0.0 < t_pre < t_final:
+                        t_events.append(t_pre)
+
+            # Keep only strict interior events; always end at t_final.
+            t_stops = sorted({t for t in t_events if 0.0 < float(t) < t_final})
+            t_stops.append(t_final)
+
+            dt_after = float(getattr(args, "dt_after_event", 0.0) or 0.0)
+            if dt_after <= 0.0:
+                dt_after = float(dt_base)
+
             step_no = 0
-            while t_n < t_final - 1.0e-15:
-                step_no += 1
-                dt_step = min(dt, t_final - t_n)
-                dt_c.value = float(dt_step)
+            t0 = 0.0
+            for t1 in t_stops:
+                if t1 <= t0 + 1.0e-15:
+                    t0 = float(t1)
+                    continue
 
-                # Predictor
-                for f, f_prev in zip(funcs, prev_funcs):
-                    f.nodal_values[:] = f_prev.nodal_values[:]
+                # Restart dt after events (and ramp back up if adaptive dt is enabled).
+                dt = float(dt_base) if t0 <= 1.0e-15 else float(min(dt_base, dt_after))
+                t_n = float(t0)
 
-                t_bc = float(t_n + float(theta) * dt_step)
-                bcs_now = solver_A._freeze_bcs(bcs, t_bc)
-                dh.apply_bcs(bcs_now, *funcs)
+                while t_n < t1 - 1.0e-15:
+                    dt_step = float(min(dt, t1 - t_n))
+                    dt_c.value = float(dt_step)
 
-                solver_A._current_step_no = int(step_no)
-                solver_A._current_t = float(t_n)
-                solver_A._current_dt = float(dt_step)
-                solver_A._newton_loop(funcs, prev_funcs, {"dt": dt_c}, bcs_now)
-                dh.apply_bcs(bcs_now, *funcs)
+                    # Predictor: reset to previous accepted state for each attempt.
+                    for f, f_prev in zip(funcs, prev_funcs):
+                        f.nodal_values[:] = f_prev.nodal_values[:]
 
-                # Freeze targets for the substrate stage
-                v_hold.nodal_values[:] = fields["v"].nodal_values[:]
-                vS_hold.nodal_values[:] = fields["vS"].nodal_values[:]
-                u_hold.nodal_values[:] = fields["u"].nodal_values[:]
-                p_hold.nodal_values[:] = fields["p"].nodal_values[:]
-                phi_hold.nodal_values[:] = fields["phi"].nodal_values[:]
-                alpha_hold.nodal_values[:] = fields["alpha"].nodal_values[:]
-                if lambda_hold is not None:
-                    lambda_hold.nodal_values[:] = fields["lambda_alpha"].nodal_values[:]
+                    step_no_next = int(step_no + 1)
+                    t_bc = float(t_n + float(theta) * dt_step)
+                    bcs_now = solver_A._freeze_bcs(bcs, t_bc)
+                    dh.apply_bcs(bcs_now, *funcs)
 
-                solver_B._current_step_no = int(step_no)
-                solver_B._current_t = float(t_n)
-                solver_B._current_dt = float(dt_step)
-                solver_B._newton_loop(funcs, prev_funcs, {"dt": dt_c}, bcs_now)
-                dh.apply_bcs(bcs_now, *funcs)
+                    try:
+                        solver_A._current_step_no = int(step_no_next)
+                        solver_A._current_t = float(t_n)
+                        solver_A._current_dt = float(dt_step)
+                        solver_A._newton_loop(funcs, prev_funcs, {"dt": dt_c}, bcs_now)
+                        dh.apply_bcs(bcs_now, *funcs)
 
-                t_k = float(t_n + dt_step)
-                _record_step(t_k=t_k, _funcs=funcs)
+                        # Freeze targets for the substrate stage
+                        v_hold.nodal_values[:] = fields["v"].nodal_values[:]
+                        vS_hold.nodal_values[:] = fields["vS"].nodal_values[:]
+                        u_hold.nodal_values[:] = fields["u"].nodal_values[:]
+                        p_hold.nodal_values[:] = fields["p"].nodal_values[:]
+                        phi_hold.nodal_values[:] = fields["phi"].nodal_values[:]
+                        alpha_hold.nodal_values[:] = fields["alpha"].nodal_values[:]
+                        if lambda_hold is not None:
+                            lambda_hold.nodal_values[:] = fields["lambda_alpha"].nodal_values[:]
 
-                # Advance
-                for f, f_prev in zip(funcs, prev_funcs):
-                    f_prev.nodal_values[:] = f.nodal_values[:]
-                t_n = float(t_k)
+                        solver_B._current_step_no = int(step_no_next)
+                        solver_B._current_t = float(t_n)
+                        solver_B._current_dt = float(dt_step)
+                        aux_B = {
+                            "dt": dt_c,
+                            # Hold fields referenced by the freezing terms in (B).
+                            # Needed for the cpp backend so the kernel sees these coefficients.
+                            "v_hold": v_hold,
+                            "p_hold": p_hold,
+                            "vS_hold": vS_hold,
+                            "u_hold": u_hold,
+                            "phi_hold": phi_hold,
+                            "alpha_hold": alpha_hold,
+                        }
+                        if lambda_hold is not None:
+                            aux_B["lambda_alpha_hold"] = lambda_hold
+                        solver_B._newton_loop(funcs, prev_funcs, aux_B, bcs_now)
+                        dh.apply_bcs(bcs_now, *funcs)
+                    except Exception:
+                        if not allow_adapt:
+                            raise
+                        dt = float(dt) * float(dt_reduction)
+                        if dt_min_val > 0.0 and float(dt) < float(dt_min_val) - 1.0e-15:
+                            raise
+                        continue
+
+                    # Accepted step: record, advance time, update step counter.
+                    t_k = float(t_n + dt_step)
+                    _record_step(t_k=t_k, _funcs=funcs)
+                    for f, f_prev in zip(funcs, prev_funcs):
+                        f_prev.nodal_values[:] = f.nodal_values[:]
+                    t_n = float(t_k)
+                    step_no = int(step_no_next)
+
+                    if allow_adapt:
+                        dt = float(min(float(dt_max_val), float(dt) * float(dt_increase)))
+
+                t0 = float(t1)
 
         rows_by_mode_case.setdefault((mode, cid), []).extend(rows)
 
-        # Write per-run CSV.
-        out_csv = outdir / f"one_domain_{mode}_case{cid}_backend={backend}_timeseries.csv"
-        if rows:
-            cols = [
-                "t_days",
-                "L_eff_um",
-                "L_half_um",
-                "removal",
-                "removal_top_flux",
-                "removal_consumption",
-                "removal_interface_diff",
-                "removal_interface_total",
-                "uL_um_per_d",
-                "D_det_prev",
-                "k_g_eff",
-                "S_surf",
-                "S_top",
-            ]
-            arr = np.column_stack([[r[c] for r in rows] for c in cols])
-            np.savetxt(out_csv, arr, delimiter=",", header=",".join(cols), comments="")
+        # Write per-run CSV (final snapshot; partial snapshots are written per step).
+        _write_rows_csv(rows=rows, out_csv=out_csv)
         return out_csv
 
     # ------------------------------------------------------------------
@@ -2039,12 +2387,18 @@ def main() -> None:
                 continue
             r = ref_by_case[cid]
             t = np.asarray([rr["t_days"] for rr in rows], dtype=float)
-            L_eff = np.asarray([rr["L_half_um"] for rr in rows], dtype=float)
+            thickness_key = str(getattr(args, "thickness_metric", "half")).strip().lower()
+            if thickness_key == "eff":
+                L_eff = np.asarray([rr["L_eff_um"] for rr in rows], dtype=float)
+                thickness_label = "L_eff"
+            else:
+                L_eff = np.asarray([rr["L_half_um"] for rr in rows], dtype=float)
+                thickness_label = "L_{α=0.5}"
             rem = np.asarray([rr["removal"] for rr in rows], dtype=float)
 
             fig, ax = plt.subplots(2, 1, figsize=(6.5, 6.0), sharex=True)
             ax[0].plot(r.t_days, r.L_um, "k-", label="Warner1986 (FD)")
-            ax[0].plot(t, L_eff, "C0-o", ms=3, label=f"one-domain ({args.mode})")
+            ax[0].plot(t, L_eff, "C0-o", ms=3, label=f"one-domain ({thickness_label}, {args.mode})")
             ax[0].set_ylabel("thickness [µm]")
             ax[0].grid(True, alpha=0.3)
             ax[0].legend(loc="best", fontsize=9)

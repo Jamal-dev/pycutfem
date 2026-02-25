@@ -1283,7 +1283,12 @@ class NewtonSolver:
                 final_time_val = None
             if final_time_val is not None:
                 remaining = float(final_time_val) - float(t_n)
-                if remaining <= 0.0:
+                # Avoid taking a numerically tiny "last" step due to floating-point
+                # drift (e.g. t_n=0.49999999999999994 < 0.5). Such steps can make
+                # the transient blocks nearly singular (inv_dt -> huge) and break
+                # Newton at the end of an otherwise successful run.
+                tol_final = 1.0e-12 * max(1.0, abs(float(final_time_val)))
+                if remaining <= tol_final:
                     break
                 if dt > remaining:
                     dt = float(remaining)

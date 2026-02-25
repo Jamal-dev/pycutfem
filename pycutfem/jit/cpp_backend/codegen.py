@@ -3038,6 +3038,26 @@ class CppCodeGen:
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                     emit_mat(nm, f"inner_grad_grad({a.name}, {b.name})", tmp_kind=tmp_kind)
                     push("mat", "value", (-1, -1), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                elif (
+                    a.kind == "mat"
+                    and b.kind == "mat"
+                    and a.role in {"value", "const"}
+                    and b.role in {"value", "const"}
+                    and (is_a_row_vec or is_a_col_vec)
+                    and (is_b_row_vec or is_b_col_vec)
+                ):
+                    # Treat row/col matrices as vectors and compute a scalar dot.
+                    #
+                    # This matters for expressions like dot(grad(S), grad(alpha)) when grad(Function)
+                    # is represented as a (1,dim) matrix. Without this branch, we fall back to matrix
+                    # multiplication, which is dimensionally inconsistent and can silently yield zero
+                    # in assembled functionals.
+                    nm, tmp_kind, tmp_slot = alloc_tmp("scalar", "dot")
+                    a_vec = f"{a.name}.row(0).transpose()" if is_a_row_vec else f"{a.name}.col(0)"
+                    b_vec = f"{b.name}.row(0).transpose()" if is_b_row_vec else f"{b.name}.col(0)"
+                    emit_scalar(nm, f"({a_vec}).dot({b_vec})", tmp_kind=tmp_kind)
+                    push("scalar", "value", (), tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    continue
                 elif a.kind == "mat" and b.kind == "mat":
                     nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
                     emit_mat(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
