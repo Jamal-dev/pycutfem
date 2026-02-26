@@ -66,6 +66,11 @@ def _time_lt(t_days: float, target_days: float) -> bool:
     return float(t_days) < float(target_days) - _TIME_TOL_DAYS
 
 
+def _time_near(t_days: float, target_days: float) -> bool:
+    """Floating-point tolerant `t == target` comparison in day units."""
+    return abs(float(t_days) - float(target_days)) <= _TIME_TOL_DAYS
+
+
 def _time_in_half_open_window(t_days: float, start_days: float, end_days: float) -> bool:
     """Floating-point tolerant half-open window check: t ∈ [start, end)."""
     t = float(t_days)
@@ -373,10 +378,80 @@ def _strip_interface_metrics(
     return float(y_half), float(S_surf), float(dS_dy)
 
 
+def _strip_removal_warner_stencil(
+    *,
+    dh: DofHandler,
+    S: Function,
+    L_thickness_nondim: float,
+    L_ref_m: float,
+    D_S_phys: float,
+    S_L: float,
+    uL_m_per_d: float,
+    npoint: int = 15,
+    y_round: int = 12,
+) -> float:
+    """
+    Compute Warner-like "removal" (-j_L) using a fixed ζ-grid stencil (UPDATE: NPOINT=15).
+
+    Warner (1986) computes for cases 1–4:
+      j_diff = -D * (∂S/∂ζ)|_{ζ=1} / L
+      j_L    = j_diff - u_L * S_L
+      removal = -j_L = D*(∂S/∂ζ)|_{ζ=1} / L + u_L * S_L.
+
+    We mimic this by sampling the strip x-averaged S(y) profile at `npoint`
+    equally-spaced ζ locations over [0,1], where y = ζ L. The surface value is
+    enforced by setting the last sample to `S_L` (Dirichlet), regardless of the
+    current diffuse-interface nodal value.
+    """
+    n = int(npoint)
+    if n < 3:
+        raise ValueError(f"npoint must be >= 3; got {n}.")
+    L_n = float(L_thickness_nondim)
+    if not math.isfinite(L_n) or L_n <= 0.0:
+        return 0.0
+    L_phys = float(L_ref_m) * L_n
+    if not math.isfinite(L_phys) or L_phys <= 0.0:
+        return 0.0
+
+    y_s, S_bar = _strip_average_by_y(
+        dh=dh,
+        field_name="S",
+        values=np.asarray(S.nodal_values, dtype=float),
+        y_round=int(y_round),
+    )
+    if y_s.size < 2:
+        return 0.0
+
+    zeta = np.linspace(0.0, 1.0, n, dtype=float)
+    yq = zeta * L_n
+    Sq = np.interp(yq, y_s, S_bar)
+    Sq[-1] = float(S_L)
+
+    dz = float(zeta[1] - zeta[0])
+    dS_dzeta = (3.0 * float(Sq[-1]) - 4.0 * float(Sq[-2]) + float(Sq[-3])) / (2.0 * dz)
+
+    removal_diff = float(D_S_phys) * float(dS_dzeta) / float(L_phys)
+    return float(removal_diff + float(uL_m_per_d) * float(S_L))
+
+
 def _S_bulk_case(case_id: int, t_days: float, *, S_high: float) -> float:
     if int(case_id) == 2 and _time_ge(float(t_days), 6.0):
         return 0.0
     return float(S_high)
+
+
+def _S_bulk_case_for_bc(case_id: int, t_days: float, *, S_high: float) -> float:
+    """
+    Bulk/surface COD value used to evaluate *Dirichlet data* at t_{n+θ}.
+
+    Warner Case 2 has a discontinuous Dirichlet step at t=6d. To match the FD
+    reference timeseries, we solve the step that ends exactly at t=6d using the
+    pre-step value, and only apply the new value for t>6d. This avoids smearing
+    the discontinuity across the last pre-event time step for θ=1 schemes.
+    """
+    if int(case_id) == 2 and _time_near(float(t_days), 6.0):
+        return float(S_high)
+    return _S_bulk_case(case_id, float(t_days), S_high=float(S_high))
 
 
 def _detachment_coeff_case(
@@ -1192,9 +1267,10 @@ def main() -> None:
         "--removal-metric",
         type=str,
         default="interface_total",
-        choices=("interface_total", "interface_diff", "top_flux", "bulk_exchange", "reservoir_exchange", "consumption"),
+        choices=("warner_stencil", "interface_total", "interface_diff", "top_flux", "bulk_exchange", "reservoir_exchange", "consumption"),
         help=(
             "How to compute substrate removal (for comparison curves). "
+            "'warner_stencil' computes -j_L using the same NPOINT=15 ζ-grid end-stencil as the Warner FD reference. "
             "'interface_total' is closest to Warner's definition (-j_L = -j_diff + u_L S_L). "
             "'reservoir_exchange' measures net transfer from the imposed bulk (well_mixed relaxation) plus the top-boundary flux "
             "(and includes the interface penalty exchange if --surface-gamma is used)."
@@ -1756,6 +1832,7 @@ def main() -> None:
             "removal_interface_diff_int",
             "removal_interface_diff",
             "removal_interface_total",
+            "removal_warner_stencil",
             "uL_um_per_d",
             "D_det_prev",
             "k_g_eff",
@@ -1888,7 +1965,7 @@ def main() -> None:
         def _S_top_bc(x, y, t):
             if int(cid) == 5:
                 return float(S_bulk_value)
-            return _S_bulk_case(cid, float(t), S_high=float(args.S_high))
+            return _S_bulk_case_for_bc(cid, float(t), S_high=float(args.S_high))
 
         bcs.append(BoundaryCondition("S", "dirichlet", "top", _as_float_time(_S_top_bc)))
         bcs_homog.append(BoundaryCondition("S", "dirichlet", "top", (lambda x, y: 0.0)))
@@ -2041,11 +2118,13 @@ def main() -> None:
         slough_shift_applied = False
         slough_shift_window_applied_nondim = 0.0
         slough_drop_nondim = float(args.slough_drop_um) * 1.0e-6 / float(L_ref_m)
+        case2_bulk_step_applied = False
 
         def _record_step(*, t_k: float, _funcs):
             nonlocal S_bulk_value
             nonlocal L_thickness_prev_nondim
             nonlocal slough_shift_applied
+            nonlocal case2_bulk_step_applied
             # Update bulk substrate value for the current step (case 2 step change).
             if int(cid) != 5:
                 S_bulk_value = float(_S_bulk_case(cid, float(t_k), S_high=float(args.S_high)))
@@ -2125,8 +2204,26 @@ def main() -> None:
             S_L = float(S_surf) if np.isfinite(float(S_surf)) else float(S_bulk_value)
             removal_interface_total = float(removal_interface_diff + uL_m_per_d * S_L)
 
+            removal_warner_stencil = float("nan")
+            if mode == "strip":
+                try:
+                    removal_warner_stencil = _strip_removal_warner_stencil(
+                        dh=dh,
+                        S=S_k,
+                        L_thickness_nondim=float(L_thickness_nondim),
+                        L_ref_m=float(L_ref_m),
+                        D_S_phys=float(args.D_S_phys),
+                        S_L=float(S_bulk_value),
+                        uL_m_per_d=float(uL_m_per_d),
+                        npoint=15,
+                    )
+                except Exception:
+                    removal_warner_stencil = float("nan")
+
             removal_key = str(args.removal_metric).strip().lower()
-            if removal_key in {"consumption"}:
+            if removal_key in {"warner_stencil", "warner"}:
+                removal = float(removal_warner_stencil)
+            elif removal_key in {"consumption"}:
                 removal = removal_consumption
             elif removal_key in {"top_flux", "top"}:
                 removal = removal_top_flux
@@ -2141,7 +2238,7 @@ def main() -> None:
             else:
                 raise ValueError(
                     f"Unknown --removal-metric={args.removal_metric!r}. "
-                    "Use 'consumption', 'top_flux', 'bulk_exchange', 'reservoir_exchange', 'interface_diff', or 'interface_total'."
+                    "Use 'warner_stencil', 'consumption', 'top_flux', 'bulk_exchange', 'reservoir_exchange', 'interface_diff', or 'interface_total'."
                 )
 
             # Case 5: coupled completely-mixed bulk ODE (COD only, simplified).
@@ -2205,6 +2302,7 @@ def main() -> None:
                     "removal_interface_diff_int": float(removal_interface_diff_int),
                     "removal_interface_diff": float(removal_interface_diff),
                     "removal_interface_total": float(removal_interface_total),
+                    "removal_warner_stencil": float(removal_warner_stencil) if np.isfinite(float(removal_warner_stencil)) else float("nan"),
                     "uL_um_per_d": float(1.0e6 * float(uL_m_per_d)),
                     "D_det_prev": float(D_det_prev.value),
                     "k_g_eff": float(k_g_used),
@@ -2214,6 +2312,24 @@ def main() -> None:
                 }
             )
             _write_rows_csv(rows=rows, out_csv=out_csv)
+
+            # Case 2 bulk step: at t=6d, reset the bulk-liquid substrate above the film to
+            # the new imposed value (well-mixed reservoir surrogate). This prevents the
+            # post-event transient from being dominated by "draining" a thick fluid layer
+            # that still contains the pre-event concentration.
+            if int(cid) == 2 and (not bool(case2_bulk_step_applied)) and _time_near(float(t_k), 6.0):
+                try:
+                    coords_S = np.asarray(dh.get_dof_coords("S"), dtype=float)
+                    if coords_S.ndim == 2 and coords_S.shape[1] >= 2 and coords_S.shape[0] == np.asarray(S_k.nodal_values).size:
+                        mask = coords_S[:, 1] >= float(L_thickness_nondim)
+                        S_k.nodal_values[:] = np.where(mask, float(S_bulk_value), S_k.nodal_values)
+                        try:
+                            S_n.nodal_values[:] = S_k.nodal_values[:]
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                case2_bulk_step_applied = True
 
             # Case 2: update the effective COD-independent expansion term (for next step).
             mu_extra_base = float(getattr(args, "mu_extra_const", 0.0) or 0.0)
@@ -2418,7 +2534,7 @@ def main() -> None:
                 t_warm0 = float(max(0.0, float(t_start) - float(warm_steps) * float(warm_dt)))
                 if int(cid) != 5:
                     # Ensure the bulk reservoir value is consistent at the warmup start time.
-                    S_bulk_value = float(_S_bulk_case(cid, float(t_warm0), S_high=float(args.S_high)))
+                    S_bulk_value = float(_S_bulk_case_for_bc(cid, float(t_warm0), S_high=float(args.S_high)))
                     S_bulk_c.value = float(S_bulk_value)
 
                 aux_B_warm = {
@@ -2451,7 +2567,7 @@ def main() -> None:
 
                     # Update bulk substrate value for the warmup time (case 2 step-change).
                     if int(cid) != 5:
-                        S_bulk_value = float(_S_bulk_case(cid, float(t_n_w), S_high=float(args.S_high)))
+                        S_bulk_value = float(_S_bulk_case_for_bc(cid, float(t_n_w), S_high=float(args.S_high)))
                         S_bulk_c.value = float(S_bulk_value)
 
                     t_bc_w = float(t_n_w + float(theta) * float(warm_dt))
@@ -2705,7 +2821,7 @@ def main() -> None:
                     # is solved with the correct forcing.
                     t_bc = float(t_n + float(theta) * dt_step)
                     if int(cid) != 5:
-                        S_bulk_value = float(_S_bulk_case(cid, float(t_bc), S_high=float(args.S_high)))
+                        S_bulk_value = float(_S_bulk_case_for_bc(cid, float(t_bc), S_high=float(args.S_high)))
                         S_bulk_c.value = float(S_bulk_value)
                     mu_extra_base = float(getattr(args, "mu_extra_const", 0.0) or 0.0)
                     if int(cid) == 2:

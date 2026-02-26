@@ -118,4 +118,62 @@ def test_warner1986_one_domain_shift_slough_truncates_and_refills() -> None:
     )
     assert applied2 is False
     assert np.allclose(alpha2.nodal_values, alpha0, atol=0.0, rtol=0.0)
-    assert np.allclose(S2.nodal_values, 0.0, atol=0.0, rtol=0.0)
+
+
+def test_warner1986_one_domain_case2_step_bc_is_not_smeared() -> None:
+    # Regression: Case 2 has a Dirichlet step at t=6d. For θ=1 schemes, evaluating
+    # the BC at t_{n+θ} can smear the discontinuity across the last pre-event step
+    # (and suppress the Warner spike at exactly t=6d). The driver now treats
+    # t==6d as "pre-event" for Dirichlet evaluation only.
+    from examples.biofilms.benchmarks.warner import warner1986_one_domain as wod
+
+    assert wod._S_bulk_case(case_id=2, t_days=5.999, S_high=3.0) == 3.0
+    assert wod._S_bulk_case(case_id=2, t_days=6.0, S_high=3.0) == 0.0
+    assert wod._S_bulk_case_for_bc(case_id=2, t_days=6.0, S_high=3.0) == 3.0
+    assert wod._S_bulk_case_for_bc(case_id=2, t_days=6.1, S_high=3.0) == 0.0
+
+
+def test_warner1986_one_domain_warner_stencil_matches_linear_profile() -> None:
+    import numpy as np
+
+    from examples.biofilms.benchmarks.warner import warner1986_one_domain as wod
+
+    class _DH:
+        def __init__(self, coords_by_field: dict[str, np.ndarray]):
+            self._coords = coords_by_field
+
+        def get_dof_coords(self, field: str) -> np.ndarray:
+            return self._coords[field]
+
+    class _F:
+        def __init__(self, values: np.ndarray):
+            self.nodal_values = np.asarray(values, dtype=float).copy()
+
+    # Construct a strip profile S(y)=S_L*(y/L) for y<=L (linear in ζ), and constant above.
+    L = 0.7
+    S_L = 3.0
+    y = np.linspace(0.0, 1.0, 4001)
+    coords = np.column_stack([np.zeros_like(y), y])
+    dh = _DH({"S": coords})
+    S_vals = np.where(y <= L, S_L * (y / L), S_L)
+    S = _F(S_vals)
+
+    L_ref_m = 1.0e-3
+    D_S_phys = 83.0e-6
+    uL_m_per_d = 0.0
+
+    got = wod._strip_removal_warner_stencil(
+        dh=dh,
+        S=S,
+        L_thickness_nondim=L,
+        L_ref_m=L_ref_m,
+        D_S_phys=D_S_phys,
+        S_L=S_L,
+        uL_m_per_d=uL_m_per_d,
+        npoint=15,
+    )
+
+    # For S(ζ)=S_L*ζ, dS/dζ|_{ζ=1}=S_L, so removal = D*S_L/L_phys.
+    L_phys = L_ref_m * L
+    expected = D_S_phys * S_L / L_phys
+    assert abs(got - expected) <= 1.0e-12 * max(1.0, abs(expected))

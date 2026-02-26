@@ -160,7 +160,7 @@ def main() -> None:
     # “Publishable” preset (strip, full mechanics + strong drag).
     #
     # Notes (important for stability / reproducibility):
-    # - Use split solves + no-line-search for robustness with stiff substrate kinetics and surface penalties.
+    # - Use split solves for robustness with stiff substrate kinetics.
     # - Keep dt fixed unless you are actively tuning an adaptive strategy (dt growth can skip short events).
     base_one = [
         "conda",
@@ -193,11 +193,9 @@ def main() -> None:
         "--bulk-alpha-power",
         "16",
         "--surface-gamma",
-        "5000",
-        "--surface-jacobian",
-        "frozen",
+        "0",
         "--removal-metric",
-        "reservoir_exchange",
+        "warner_stencil",
         "--thickness-metric",
         "half",
         "--L-ref-m",

@@ -16,6 +16,10 @@ These cases assume **fixed surface concentrations** (no external mass-transfer r
 - a top Dirichlet boundary with a very thin fluid layer, or
 - the recommended `--bulk-mode well_mixed` relaxation to emulate a fixed “reservoir” above the film.
 
+Removal/flux comparison note:
+- Warner’s reported `jL_1` uses a **fixed 15-point ζ-grid** (UPDATE: `NPOINT=15`) and a one-sided end-stencil at the surface.
+  For like-for-like comparisons (especially the **Case 2 spike at t=6 d**), use `--removal-metric warner_stencil` in the one-domain driver.
+
 ## Reduced mapping used for the one-domain comparison
 
 The one-domain PDE model currently has **one substrate** field `S`, so we use the reduced mapping:
