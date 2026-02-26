@@ -7,7 +7,7 @@ Implements the 5 case studies from:
   28(3):314–328, 1986.
 
 The implementation follows the FORTRAN UPDATE listing in
-`examples/biofilms/benchmarks/warner1986.tex` (Appendix B) and reproduces the
+`examples/biofilms/benchmarks/warner/warner1986.tex` (Appendix B) and reproduces the
 reference Table VI profiles for:
   - Case 1 at t = 6.0 d
   - Case 4 at t = 6.0 d (0.006 d after sloughing)
@@ -150,7 +150,11 @@ def _sigma(case_id: int, t: float, L: float, params: Warner1986Params) -> float:
     if case_id == 3:
         return -float(params.shear_lambda) * float(L) * float(L)
     if case_id == 4:
-        if float(params.slough_t0) < float(t) < float(params.slough_t1):
+        # Sloughing is implemented as a short interval of constant recession speed.
+        # IMPORTANT: The RHS may be evaluated only at step endpoints by stiff ODE
+        # solvers, so we include both endpoints and also segment the integration
+        # in `_solve_case` to ensure the event cannot be skipped.
+        if float(params.slough_t0) <= float(t) <= float(params.slough_t1):
             return float(params.slough_sigma)
         return 0.0
     raise ValueError(f"Unknown case_id={case_id}")
@@ -395,6 +399,36 @@ def _solve_case(
         y = np.concatenate([sol1.y, sol2.y[:, 1:]], axis=1) if sol2.y.shape[1] and sol1.y.shape[1] and sol1.t[-1] == sol2.t[0] else np.concatenate([sol1.y, sol2.y], axis=1)
         return SimpleNamespace(t=t, y=y, success=True, message="stitched")
 
+    # Case 4 has a short sloughing window; segmenting ensures it cannot be skipped.
+    if case_id == 4 and (t_eval.min() < float(params.slough_t0) < float(params.slough_t1) < t_final):
+        from types import SimpleNamespace
+
+        t0 = float(params.slough_t0)
+        t1 = float(params.slough_t1)
+
+        t_eval_a = t_eval[t_eval <= t0]
+        t_eval_b = t_eval[(t_eval >= t0) & (t_eval <= t1)]
+        t_eval_c = t_eval[t_eval >= t1]
+
+        sol_a = solve_ivp(rhs, (float(t_eval_a[0]), t0), y0, method="BDF", t_eval=t_eval_a, rtol=rtol, atol=atol)
+        if not sol_a.success:
+            raise RuntimeError(f"Case 4 segment A failed: {sol_a.message}")
+
+        y_t0 = np.asarray(sol_a.y[:, -1], dtype=float)
+        sol_b = solve_ivp(rhs, (t0, t1), y_t0, method="BDF", t_eval=t_eval_b, rtol=rtol, atol=atol)
+        if not sol_b.success:
+            raise RuntimeError(f"Case 4 segment B (slough window) failed: {sol_b.message}")
+
+        y_t1 = np.asarray(sol_b.y[:, -1], dtype=float)
+        sol_c = solve_ivp(rhs, (t1, float(t_final)), y_t1, method="BDF", t_eval=t_eval_c, rtol=rtol, atol=atol)
+        if not sol_c.success:
+            raise RuntimeError(f"Case 4 segment C failed: {sol_c.message}")
+
+        # Stitch (avoid duplicate endpoints).
+        t = np.concatenate([sol_a.t, sol_b.t[1:], sol_c.t[1:]])
+        y = np.concatenate([sol_a.y, sol_b.y[:, 1:], sol_c.y[:, 1:]], axis=1)
+        return SimpleNamespace(t=t, y=y, success=True, message="stitched (case 4 slough)")
+
     sol = solve_ivp(rhs, (float(t_eval[0]), float(t_final)), y0, method="BDF", t_eval=t_eval, rtol=rtol, atol=atol)
     if not sol.success:
         raise RuntimeError(f"Case {case_id} failed: {sol.message}")
@@ -637,7 +671,9 @@ def _rhs_cpp(case_id: int, params: Warner1986Params) -> Callable[[float, np.ndar
     # Keep the translation unit small and case-specialized to reduce compile time.
     # Cache key includes (case_id, params) and an explicit ABI tag so changes to the
     # generated C++ source trigger recompilation.
-    cpp_abi = "2026-02-22-warner1986-rhs-v2"
+    # Bump this tag whenever the generated C++ source changes; it is part of the
+    # on-disk cache key.
+    cpp_abi = "2026-02-25-warner1986-rhs-v3"
     mode_tag = get_compile_mode_tag()
     src_tag = f"{cpp_abi}_case{case_id}_{mode_tag}"
     src_hash = hashlib.sha256((src_tag + repr(params)).encode("utf-8")).hexdigest()
@@ -676,7 +712,7 @@ static inline double sigma(double t, double L) {{
     if ({case_id} == 1 || {case_id} == 2 || {case_id} == 5) return 0.0;
     if ({case_id} == 3) return -{params.shear_lambda:.17g} * L * L;
     if ({case_id} == 4) {{
-        if ({params.slough_t0:.17g} < t && t < {params.slough_t1:.17g}) return {params.slough_sigma:.17g};
+        if ({params.slough_t0:.17g} <= t && t <= {params.slough_t1:.17g}) return {params.slough_sigma:.17g};
         return 0.0;
     }}
     return 0.0;
@@ -945,7 +981,7 @@ def _rhs_jit(case_id: int, params: Warner1986Params) -> Callable[[float, np.ndar
         if case_id == 3:
             sig = -shear_lambda * L * L
         elif case_id == 4:
-            if slough_t0 < t < slough_t1:
+            if slough_t0 <= t <= slough_t1:
                 sig = slough_sigma
 
         # Surface concentrations.
@@ -1092,6 +1128,10 @@ def _build_rhs(case_id: int, params: Warner1986Params, backend: Backend) -> Call
         return _rhs_cpp(case_id, params)
     raise ValueError(f"Unknown backend={backend}")
 
+def _needs_t6_profiles(*, case_id: int, t_final: float) -> bool:
+    """Whether we can/should request the paper's Table VI profiles at t=6 d."""
+    return int(case_id) in (1, 4) and float(t_final) >= 6.0
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Warner & Gujer (1986) 1D multispecies biofilm benchmark (5 cases).")
@@ -1121,6 +1161,12 @@ def main() -> None:
     # when it is within the requested simulation horizon.
     if t_final >= 6.0 and 6.0 not in t_eval:
         t_eval = np.unique(np.sort(np.concatenate([t_eval, np.asarray([6.0])])))
+    # Ensure the case 4 sloughing window endpoints are on the output grid when
+    # they are within the simulation horizon. This avoids interpolation in the
+    # Table VI diagnostics and helps debugging.
+    if t_final >= float(params.slough_t1):
+        extra = np.asarray([float(params.slough_t0), float(params.slough_t1)], dtype=float)
+        t_eval = np.unique(np.sort(np.concatenate([t_eval, extra])))
 
     refs = _table_vi_reference()
     ts_by_case: dict[int, dict[str, np.ndarray]] = {}
@@ -1171,7 +1217,7 @@ def main() -> None:
             comments="",
         )
 
-        if case_id in (1, 4) and float(args.t_final) >= 6.0:
+        if _needs_t6_profiles(case_id=case_id, t_final=t_final):
             prof = _profiles_at_time(sol, t=6.0, case_id=case_id, params=params)
             key = "case1_t6" if case_id == 1 else "case4_t6"
             err = _compare_to_table_vi(prof=prof, ref=refs[key], label=key)
@@ -1258,7 +1304,7 @@ def main() -> None:
                         plt.savefig(paper_figdir / "warner1986_case5_bulk_SL_cpp.pdf")
                 plt.close()
 
-            if case_id == 1:
+            if case_id == 1 and float(args.t_final) >= 6.0:
                 prof = _profiles_at_time(sol, t=6.0, case_id=case_id, params=params)
                 z_um = prof["z_um"]
                 plt.figure()

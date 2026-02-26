@@ -74,7 +74,14 @@ def assemble_scalar(dof_handler, functional, *, backend: str = "cpp", quad_order
     """Assemble a pure functional (no test/trial) and return it as a float."""
     hooks = {functional.integrand: {"name": "val"}}
     res = assemble_form(Equation(None, functional), dof_handler=dof_handler, bcs=[], quad_order=quad_order, backend=backend, assembler_hooks=hooks)
-    return float(res["val"])
+    # Backends may return either a scalar or a length-1 array. Normalize both.
+    val = res["val"]
+    arr = np.asarray(val)
+    if arr.shape == ():
+        return float(arr)
+    if arr.size == 1:
+        return float(arr.reshape(()))
+    raise ValueError(f"assemble_scalar expected a scalar but got shape={arr.shape}.")
 
 
 def wall_shear_rms_on_boundary(

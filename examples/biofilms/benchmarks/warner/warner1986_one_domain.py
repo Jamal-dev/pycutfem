@@ -53,6 +53,25 @@ from examples.utils.biofilm.adhesion import assemble_scalar
 from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
 
 
+_TIME_TOL_DAYS = 1.0e-12
+
+
+def _time_ge(t_days: float, target_days: float) -> bool:
+    """Floating-point tolerant `t >= target` comparison in day units."""
+    return float(t_days) >= float(target_days) - _TIME_TOL_DAYS
+
+
+def _time_lt(t_days: float, target_days: float) -> bool:
+    """Floating-point tolerant `t < target` comparison in day units."""
+    return float(t_days) < float(target_days) - _TIME_TOL_DAYS
+
+
+def _time_in_half_open_window(t_days: float, start_days: float, end_days: float) -> bool:
+    """Floating-point tolerant half-open window check: t ∈ [start, end)."""
+    t = float(t_days)
+    return _time_ge(t, float(start_days)) and _time_lt(t, float(end_days))
+
+
 def _tag_rectangle_boundaries(mesh: Mesh, *, L: float, H: float, tol: float = 1.0e-12) -> None:
     mesh.tag_boundary_edges(
         {
@@ -123,6 +142,51 @@ def _smooth_step(z: np.ndarray) -> np.ndarray:
     # Robust sigmoid: 0.5*(1+tanh(z)).
     return 0.5 * (1.0 + np.tanh(np.asarray(z, dtype=float)))
 
+def _sanitize_run_tag(tag: str) -> str:
+    """Convert a user-provided tag into a filesystem-friendly suffix."""
+    raw = str(tag or "").strip()
+    if not raw:
+        return ""
+    out = []
+    for ch in raw:
+        if ch.isspace():
+            out.append("_")
+            continue
+        if ch.isalnum() or ch in {".", "_", "-"}:
+            out.append(ch)
+    return "".join(out)
+
+def _case2_mu_extra(
+    *,
+    t_days: float,
+    enabled: bool,
+    start_days: float,
+    mu0: float,
+    mu1: float,
+    tau_days: float,
+) -> float:
+    """
+    Effective COD-independent volumetric expansion source for case 2.
+
+    Warner case 2 regrows after the COD step due to other substrates/species.
+    This reduced one-substrate mapping mimics that by adding an extra net
+    expansion rate (1/d) to the mixture constraint only (no COD consumption).
+    """
+    if not bool(enabled):
+        return 0.0
+    t = float(t_days)
+    t0 = float(start_days)
+    if t < t0:
+        return 0.0
+    mu0 = float(mu0)
+    mu1 = float(mu1)
+    tau = float(tau_days)
+    if not math.isfinite(tau) or tau <= 0.0:
+        return float(mu1)
+    dt = max(t - t0, 0.0)
+    w = 1.0 - math.exp(-dt / tau)
+    return float(mu0 + (mu1 - mu0) * w)
+
 def _one_minus(expr):
     # Keep the UFL operand on the left for backend compatibility.
     return (-expr) + Constant(1.0)
@@ -164,7 +228,7 @@ def _load_warner_cod_reference(*, case_id: int, warner_outdir: Path) -> WarnerCO
     if not path.exists():
         raise FileNotFoundError(
             f"Missing Warner1986 reference CSV: {path}\n"
-            "Run: `python -u examples/biofilms/benchmarks/warner1986_benchmark.py --case all --backend cpp`"
+            "Run: `python -u examples/biofilms/benchmarks/warner/warner1986_benchmark.py --case all --backend cpp`"
         )
     data = np.genfromtxt(str(path), delimiter=",", names=True, dtype=float, encoding=None)
     if getattr(data, "shape", ()) == ():
@@ -310,7 +374,7 @@ def _strip_interface_metrics(
 
 
 def _S_bulk_case(case_id: int, t_days: float, *, S_high: float) -> float:
-    if int(case_id) == 2 and float(t_days) >= 6.0:
+    if int(case_id) == 2 and _time_ge(float(t_days), 6.0):
         return 0.0
     return float(S_high)
 
@@ -320,7 +384,7 @@ def _detachment_coeff_case(
     case_id: int,
     t_days: float,
     dt_days: float,
-    L_eff_nondim: float,
+    L_thickness_nondim: float,
     L_ref_m: float,
     eps_det_nondim: float,
     lambda_shear: float,
@@ -336,12 +400,14 @@ def _detachment_coeff_case(
         V_det_nondim = V_det / L_ref
         D_det_prev ≈ V_det_nondim / (4 eps_det)
 
-    For case 4 we mimic the short sloughing event σ=-0.05 m/d on (5.984,5.994) d.
+    For case 4 we mimic the short sloughing event σ=-0.05 m/d on (5.984,5.994) d
+    when `slough_mode='exact'`. Other modes may apply sloughing by different means.
     """
     cid = int(case_id)
     t = float(t_days)
     eps = max(float(eps_det_nondim), 1.0e-12)
-    L = max(float(L_eff_nondim), 0.0)
+    L = max(float(L_thickness_nondim), 0.0)
+    slough_key = str(slough_mode).strip().lower()
 
     if cid == 3:
         # Warner: sigma = -lambda * L^2 with lambda=750 m^{-1} d^{-1}.
@@ -351,21 +417,167 @@ def _detachment_coeff_case(
         V_det_nondim = float(lambda_shear) * float(L_ref_m) * (L * L)
         return float(V_det_nondim / (4.0 * eps))
 
-    if cid == 4 and (5.984 <= t < 5.994):
+    if cid == 4 and slough_key == "exact" and _time_in_half_open_window(t, 5.984, 5.994):
         # Sloughing speed magnitude in Warner: 0.05 m/d.
         V_slough_nondim = 0.05 / float(L_ref_m)
         return float(V_slough_nondim / (4.0 * eps))
 
-    if cid == 4 and str(slough_mode).strip().lower() in {"integrated", "coarse"}:
+    if cid == 4 and slough_key in {"integrated", "coarse"}:
         # Coarse sloughing: apply a single-step thickness drop around t=6d.
         dt = max(float(dt_days), 1.0e-16)
         t0 = float(t)
         t1 = float(t0 + dt)
-        if t0 < 6.0 <= t1:
+        if float(t0) < 6.0 - _TIME_TOL_DAYS and _time_ge(float(t1), 6.0):
             V_slough_nondim = float(slough_drop_nondim) / dt
             return float(V_slough_nondim / (4.0 * eps))
 
     return 0.0
+
+
+def _apply_slough_truncate_strip(
+    *,
+    dh: DofHandler,
+    alpha: Function,
+    drop_nondim: float,
+    eps_nondim: float,
+    x_round: int = 12,
+) -> None:
+    """
+    Case-4 sloughing "truncate" update for strip-like runs.
+
+    We remove a thickness `drop_nondim` from the *top* of the biofilm while keeping the
+    bottom fixed, i.e. we enforce a new interface position
+        L_new = L_old - drop
+    by applying an additional diffuse cutoff at y=L_new:
+        alpha_new(x,y) = min(alpha_old(x,y), H_eps(L_new - y)).
+
+    This is a closer analogue of Warner's sloughing (surface recession) than a pure
+    vertical translation of α, which would incorrectly shift the entire profile.
+    """
+    drop = float(drop_nondim)
+    if not (math.isfinite(drop) and drop > 0.0):
+        return
+    eps = max(float(eps_nondim), 1.0e-12)
+    coords = np.asarray(dh.get_dof_coords("alpha"), dtype=float)
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        return
+    a0 = np.asarray(alpha.nodal_values, dtype=float).ravel()
+    if a0.size != coords.shape[0]:
+        return
+
+    try:
+        L_old = float(_strip_thickness_alpha_half(dh=dh, alpha=alpha))
+    except Exception:
+        # Fallback for pathological profiles: assume the current "thickness" scale is the max y where α is significant.
+        y = np.asarray(coords[:, 1], dtype=float)
+        mask = np.asarray(a0, dtype=float) >= 0.5
+        L_old = float(np.max(y[mask])) if np.any(mask) else 0.0
+
+    L_new = float(max(L_old - drop, 0.0))
+
+    # Cutoff profile H_eps(L_new - y).
+    x = coords[:, 0]
+    y = coords[:, 1]
+    x_key = np.round(x, decimals=int(x_round))
+    x_levels, inv = np.unique(x_key, return_inverse=True)
+
+    out = np.array(a0, copy=True)
+    for xi in range(int(x_levels.size)):
+        idx = np.nonzero(inv == xi)[0]
+        if idx.size == 0:
+            continue
+        yy = np.asarray(y[idx], dtype=float)
+        aa = np.asarray(a0[idx], dtype=float)
+        cutoff = _smooth_step((L_new - yy) / eps)
+        out[idx] = np.minimum(aa, cutoff)
+
+    alpha.nodal_values[:] = np.clip(out, 0.0, 1.0)
+
+
+def _apply_slough_shift_strip_scalar(
+    *,
+    dh: DofHandler,
+    f: Function,
+    field: str,
+    drop_nondim: float,
+    x_round: int = 12,
+    clip_min: float | None = None,
+) -> None:
+    """Generic strip shift: f_new(x,y) = f_old(x, y + drop)."""
+    drop = float(drop_nondim)
+    if not (math.isfinite(drop) and drop > 0.0):
+        return
+    coords = np.asarray(dh.get_dof_coords(field), dtype=float)
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        return
+    a0 = np.asarray(f.nodal_values, dtype=float).ravel()
+    if a0.size != coords.shape[0]:
+        return
+
+    x = coords[:, 0]
+    y = coords[:, 1]
+    x_key = np.round(x, decimals=int(x_round))
+    x_levels, inv = np.unique(x_key, return_inverse=True)
+
+    out = np.array(a0, copy=True)
+    for xi in range(int(x_levels.size)):
+        idx = np.nonzero(inv == xi)[0]
+        if idx.size == 0:
+            continue
+        yy = np.asarray(y[idx], dtype=float)
+        aa = np.asarray(a0[idx], dtype=float)
+        order = np.argsort(yy)
+        yy = yy[order]
+        aa = aa[order]
+        if yy.size < 2:
+            continue
+        yq = yy + drop
+        out[idx[order]] = np.interp(yq, yy, aa, left=float(aa[0]), right=float(aa[-1]))
+
+    if clip_min is not None:
+        out = np.maximum(out, float(clip_min))
+    f.nodal_values[:] = out
+
+
+def _apply_case4_shift_slough_strip(
+    *,
+    t_days: float,
+    applied: bool,
+    dh: DofHandler,
+    alpha: Function,
+    S: Function,
+    drop_nondim: float,
+    eps_nondim: float,
+    S_bulk_value: float,
+) -> bool:
+    """
+    Apply case-4 instantaneous sloughing for strip-like runs ("shift" mode).
+
+    We apply the truncation-from-top update once at t>=5.994d (end of Warner's
+    window) and refill the new fluid region above the shifted interface with
+    bulk substrate so diagnostics at the event time are consistent.
+
+    Returns the updated `applied` flag.
+    """
+    if bool(applied):
+        return True
+    if not _time_ge(float(t_days), 5.994):
+        return False
+    _apply_slough_truncate_strip(
+        dh=dh,
+        alpha=alpha,
+        drop_nondim=float(drop_nondim),
+        eps_nondim=float(eps_nondim),
+    )
+    try:
+        L_new = float(_strip_thickness_alpha_half(dh=dh, alpha=alpha))
+        coords_S = np.asarray(dh.get_dof_coords("S"), dtype=float)
+        if coords_S.ndim == 2 and coords_S.shape[1] >= 2 and coords_S.shape[0] == np.asarray(S.nodal_values).size:
+            mask = coords_S[:, 1] >= float(L_new)
+            S.nodal_values[:] = np.where(mask, float(S_bulk_value), S.nodal_values)
+    except Exception:
+        pass
+    return True
 
 
 def _build_one_domain_problem(
@@ -573,6 +785,7 @@ def _build_one_domain_problem(
         raise ValueError(f"Unknown init_vS_profile={init_vS_profile!r}. Use 'growth' or 'zero'.")
 
     dt_c = Constant(float(dt_days))
+    mu_extra_c = Constant(0.0)
 
     # Volume source in the mixture constraint: div(C v + B vS) = alpha*s_v.
     # For growth-driven expansion we use the same Pi_b/rho_s* structure as in the phi equation:
@@ -605,11 +818,11 @@ def _build_one_domain_problem(
         k_d_c = Constant(float(k_d))
         if bool(s_v_lagged):
             monod = mu_max_c * (S_n / (S_n + K_S_c))
-            s_v = monod - k_d_c
+            s_v = monod - k_d_c + mu_extra_c
             ds_v = Constant(0.0)
         else:
             monod = mu_max_c * (S_k / (S_k + K_S_c))
-            s_v = monod - k_d_c
+            s_v = monod - k_d_c + mu_extra_c
             if jac_key == "full":
                 denom = S_k + K_S_c
                 dmonod = mu_max_c * (K_S_c / (denom * denom)) * dS
@@ -622,15 +835,15 @@ def _build_one_domain_problem(
         k_d_c = Constant(float(k_d))
         if bool(s_v_lagged):
             monod = mu_max_c * (S_n / (S_n + K_S_c))
-            s_v = (monod - k_d_c) * _one_minus(phi_n)
+            s_v = (monod - k_d_c + mu_extra_c) * _one_minus(phi_n)
             ds_v = Constant(0.0)
         else:
             monod = mu_max_c * (S_k / (S_k + K_S_c))
-            s_v = (monod - k_d_c) * _one_minus(phi_k)
+            s_v = (monod - k_d_c + mu_extra_c) * _one_minus(phi_k)
             if jac_key == "full":
                 denom = S_k + K_S_c
                 dmonod = mu_max_c * (K_S_c / (denom * denom)) * dS
-                ds_v = dmonod * _one_minus(phi_k) - (monod - k_d_c) * dphi
+                ds_v = dmonod * _one_minus(phi_k) - (monod - k_d_c + mu_extra_c) * dphi
             else:
                 ds_v = Constant(0.0)
     else:
@@ -784,6 +997,7 @@ def _build_one_domain_problem(
         "me": me,
         "dh": dh,
         "dt_c": dt_c,
+        "mu_extra_c": mu_extra_c,
         "forms": forms,
         "bcs": bcs,
         "bcs_homog": bcs_homog,
@@ -930,6 +1144,12 @@ def main() -> None:
     )
     ap.add_argument("--freeze-phi", action="store_true", help="Hold phi fixed to its initial profile (closer to Warner's constant-density assumption).")
     ap.add_argument("--outdir", type=str, default="examples/biofilms/results/warner1986_one_domain")
+    ap.add_argument(
+        "--run-tag",
+        type=str,
+        default="",
+        help="Optional suffix tag appended to output filenames (useful for parameter/mesh sweeps).",
+    )
     ap.add_argument("--paper-figdir", type=str, default="", help="Optional directory to write LaTeX-ready PDF figures.")
     ap.add_argument("--no-plots", action="store_true")
     ap.add_argument("--diagnostics", action="store_true", help="Print min/max diagnostics for (alpha,phi,S) each step.")
@@ -1019,8 +1239,32 @@ def main() -> None:
 
     # Time stepping (days)
     ap.add_argument("--dt", type=float, default=0.5)
+    ap.add_argument(
+        "--t-start",
+        type=float,
+        default=0.0,
+        help=(
+            "Start time (days). Useful to run only the sloughing window for case 4 "
+            "(e.g. --t-start 5.934 --t-final 6.05 with --h0 ~ 0.68)."
+        ),
+    )
     ap.add_argument("--t-final", type=float, default=10.0)
     ap.add_argument("--theta", type=float, default=1.0)
+    ap.add_argument(
+        "--warmup-substrate-steps",
+        type=int,
+        default=0,
+        help=(
+            "If >0 and --solve-strategy=split, run this many substrate-only warmup steps before the main time loop. "
+            "Useful with --t-start>0 + thick --h0 to relax S away from the uniform initial value."
+        ),
+    )
+    ap.add_argument(
+        "--warmup-substrate-dt",
+        type=float,
+        default=0.01,
+        help="Warmup step size (days) used with --warmup-substrate-steps.",
+    )
     ap.add_argument(
         "--adaptive-dt",
         action="store_true",
@@ -1170,6 +1414,31 @@ def main() -> None:
     ap.add_argument("--eps0", type=float, default=0.01, help="Initial interface thickness epsilon for alpha0 (nondimensional).")
     ap.add_argument("--phi-b", type=float, default=0.3, help="Initial biofilm porosity (phi inside biofilm where alpha≈1).")
     ap.add_argument("--S-high", type=float, default=3.0, help="Bulk/surface COD concentration S_L1 before step (g/m^3).")
+    ap.add_argument(
+        "--case2-autotroph",
+        action="store_true",
+        help=(
+            "Case 2 only: add an effective COD-independent expansion term after the COD step (t>=6d) "
+            "to mimic Warner's multispecies regrowth. This modifies only the mixture volume constraint "
+            "source s_v (no COD consumption is added)."
+        ),
+    )
+    ap.add_argument("--case2-autotroph-start", type=float, default=6.0, help="Start time for the effective autotroph expansion term (days).")
+    ap.add_argument("--case2-autotroph-mu0", type=float, default=0.173, help="Expansion rate at t=start (1/d).")
+    ap.add_argument("--case2-autotroph-mu1", type=float, default=0.249, help="Asymptotic expansion rate as t→∞ (1/d).")
+    ap.add_argument("--case2-autotroph-tau", type=float, default=3.0, help="Ramp timescale tau (days) for the exponential transition mu0→mu1.")
+    ap.add_argument(
+        "--mu-extra-const",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional COD-independent extra volumetric expansion rate (1/d) added to the mixture volume constraint source s_v. "
+            "This does NOT add COD consumption. "
+            "Use this only as part of the reduced mapping when the single-substrate model must emulate additional growth/inert "
+            "accumulation from unmodeled substrates/species (Warner cases are multispecies/multisubstrate). "
+            "Case 2: this value is added on top of --case2-autotroph (if enabled)."
+        ),
+    )
     ap.add_argument(
         "--case5-Q",
         type=float,
@@ -1330,8 +1599,14 @@ def main() -> None:
         "--slough-mode",
         type=str,
         default="integrated",
-        choices=("integrated", "exact"),
-        help="Case 4 sloughing: 'integrated' applies a single-step drop around t=6; 'exact' uses Warner's (5.984,5.994)d window.",
+        choices=("integrated", "exact", "shift", "shift_window"),
+        help=(
+            "Case 4 sloughing: "
+            "'shift' applies an instantaneous thickness drop at t=5.994 (end of Warner's window); "
+            "'shift_window' applies the same drop gradually over [5.984, 5.994] by repeated small shifts; "
+            "'integrated' applies a coarse drop around t=6; "
+            "'exact' uses Warner's (5.984,5.994)d detachment window."
+        ),
     )
     ap.add_argument("--slough-drop-um", type=float, default=500.0, help="Case 4 integrated sloughing thickness drop (microns).")
 
@@ -1365,6 +1640,12 @@ def main() -> None:
 
     # Keep the benchmark logs readable: suppress very verbose assembly INFO logs.
     logging.getLogger("pycutfem.ufl.compilers").setLevel(logging.WARNING)
+
+    t_start_global = float(getattr(args, "t_start", 0.0) or 0.0)
+    if not math.isfinite(t_start_global) or t_start_global < 0.0:
+        raise ValueError(f"--t-start must be a finite value >= 0; got {args.t_start!r}.")
+    if float(t_start_global) >= float(args.t_final) - _TIME_TOL_DAYS:
+        raise ValueError(f"--t-start must be < --t-final (got {t_start_global:g} >= {float(args.t_final):g}).")
 
     if float(getattr(args, "rho_s_effective", 0.0) or 0.0) > 0.0:
         one_m_phi_b = 1.0 - float(args.phi_b)
@@ -1480,6 +1761,7 @@ def main() -> None:
             "k_g_eff",
             "S_surf",
             "S_top",
+            "mu_extra",
         ]
         arr = np.column_stack([[r[c] for r in rows] for c in cols])
         tmp = out_csv.with_suffix(out_csv.suffix + ".tmp")
@@ -1488,7 +1770,11 @@ def main() -> None:
 
     def _run_mode(mode: str, *, cid: int, Lx: float, Hy: float, nx: int, ny: int, h0_fn) -> Path:
         D_det_prev = Constant(0.0)
-        S_bulk_value = float(args.S_high)
+        t_start = float(getattr(args, "t_start", 0.0) or 0.0)
+        if int(cid) == 5 and abs(float(t_start)) > _TIME_TOL_DAYS:
+            raise NotImplementedError("Case 5 with --t-start>0 is not supported (bulk ODE restart not implemented).")
+
+        S_bulk_value = float(args.S_high) if int(cid) == 5 else float(_S_bulk_case(cid, float(t_start), S_high=float(args.S_high)))
         S_bulk_c = Constant(float(S_bulk_value))
         gamma_bulk_c = Constant(float(args.bulk_gamma))
         k_g_base = float(args.k_g)
@@ -1570,6 +1856,23 @@ def main() -> None:
         alpha_k: Function = prob["alpha_k"]
         S_n: Function = prob["S_n"]
         dt_c: Constant = prob["dt_c"]
+        mu_extra_c: Constant = prob["mu_extra_c"]
+        alpha_n: Function = prob["alpha_n"]
+
+        # Initialize COD-independent volumetric expansion (if enabled) at t_start
+        # so the first step uses the correct value when --t-start>0.
+        mu_extra_base = float(getattr(args, "mu_extra_const", 0.0) or 0.0)
+        if int(cid) == 2:
+            mu_extra_c.value = mu_extra_base + _case2_mu_extra(
+                t_days=float(t_start),
+                enabled=bool(getattr(args, "case2_autotroph", False)),
+                start_days=float(getattr(args, "case2_autotroph_start", 6.0)),
+                mu0=float(getattr(args, "case2_autotroph_mu0", 0.0)),
+                mu1=float(getattr(args, "case2_autotroph_mu1", 0.0)),
+                tau_days=float(getattr(args, "case2_autotroph_tau", 1.0)),
+            )
+        else:
+            mu_extra_c.value = mu_extra_base
 
         # Override initial alpha for 2D mode (strip stays uniform).
         if callable(h0_fn):
@@ -1693,7 +1996,9 @@ def main() -> None:
         I_surface_exchange = (-gamma_surf_c * w_surf * (S_k - S_bulk_c)) * dx_q
 
         rows: list[dict[str, float]] = []
-        out_csv = outdir / f"one_domain_{mode}_case{cid}_backend={backend}_timeseries.csv"
+        run_tag = _sanitize_run_tag(getattr(args, "run_tag", ""))
+        tag_suffix = f"_{run_tag}" if run_tag else ""
+        out_csv = outdir / f"one_domain_{mode}_case{cid}_backend={backend}{tag_suffix}_timeseries.csv"
 
         dS_top = dS(tag="top", metadata={"q": int(qdeg)})
         D_S_c = Constant(float(D_S_nondim))
@@ -1732,14 +2037,32 @@ def main() -> None:
                 k_g_c.value = float(k_g_base)
 
         L_thickness_prev_nondim: float | None = None
+        slough_mode_key = str(getattr(args, "slough_mode", "integrated")).strip().lower()
+        slough_shift_applied = False
+        slough_shift_window_applied_nondim = 0.0
+        slough_drop_nondim = float(args.slough_drop_um) * 1.0e-6 / float(L_ref_m)
 
         def _record_step(*, t_k: float, _funcs):
             nonlocal S_bulk_value
             nonlocal L_thickness_prev_nondim
+            nonlocal slough_shift_applied
             # Update bulk substrate value for the current step (case 2 step change).
             if int(cid) != 5:
                 S_bulk_value = float(_S_bulk_case(cid, float(t_k), S_high=float(args.S_high)))
                 S_bulk_c.value = float(S_bulk_value)
+
+            # Case 4 instantaneous sloughing ("shift").
+            if int(cid) == 4 and slough_mode_key == "shift":
+                slough_shift_applied = _apply_case4_shift_slough_strip(
+                    t_days=float(t_k),
+                    applied=bool(slough_shift_applied),
+                    dh=dh,
+                    alpha=alpha_k,
+                    S=S_k,
+                    drop_nondim=float(slough_drop_nondim),
+                    eps_nondim=float(args.eps0),
+                    S_bulk_value=float(S_bulk_value),
+                )
 
             if bool(args.clip):
                 # Post-step VI clip (bounds preservation). See model.tex discussion.
@@ -1857,7 +2180,7 @@ def main() -> None:
                 case_id=cid,
                 t_days=t_k,
                 dt_days=float(dt_step),
-                L_eff_nondim=L_eff_nondim,
+                L_thickness_nondim=L_thickness_nondim,
                 L_ref_m=float(L_ref_m),
                 eps_det_nondim=float(eps_det_eff),
                 lambda_shear=float(args.lambda_shear),
@@ -1865,6 +2188,7 @@ def main() -> None:
                 slough_drop_nondim=float(args.slough_drop_um) * 1.0e-6 / float(L_ref_m),
             )
 
+            mu_extra_used = float(getattr(mu_extra_c, "value", 0.0))
             rows.append(
                 {
                     "t_days": float(t_k),
@@ -1886,9 +2210,24 @@ def main() -> None:
                     "k_g_eff": float(k_g_used),
                     "S_surf": float(S_surf) if np.isfinite(float(S_surf)) else float("nan"),
                     "S_top": float(S_bulk_value),
+                    "mu_extra": float(mu_extra_used),
                 }
             )
             _write_rows_csv(rows=rows, out_csv=out_csv)
+
+            # Case 2: update the effective COD-independent expansion term (for next step).
+            mu_extra_base = float(getattr(args, "mu_extra_const", 0.0) or 0.0)
+            if int(cid) == 2:
+                mu_extra_c.value = mu_extra_base + _case2_mu_extra(
+                    t_days=float(t_k),
+                    enabled=bool(getattr(args, "case2_autotroph", False)),
+                    start_days=float(getattr(args, "case2_autotroph_start", 6.0)),
+                    mu0=float(getattr(args, "case2_autotroph_mu0", 0.0)),
+                    mu1=float(getattr(args, "case2_autotroph_mu1", 0.0)),
+                    tau_days=float(getattr(args, "case2_autotroph_tau", 1.0)),
+                )
+            else:
+                mu_extra_c.value = mu_extra_base
 
             # Update thickness-scaled growth coefficient for the *next* step.
             if k_g_mode == "warner" and k_g_base != 0.0:
@@ -2066,6 +2405,73 @@ def main() -> None:
             solver_ref["solver"] = solver_B
             solver_alpha = solver_A
 
+            # Optional substrate warmup: with thick-film restarts (t_start>0, h0>>eps0),
+            # a split strategy can fail because stage (A) uses the *frozen* substrate
+            # state. Warm up S by repeatedly solving only the substrate stage with all
+            # other fields frozen to the current state.
+            warm_steps = int(getattr(args, "warmup_substrate_steps", 0) or 0)
+            warm_dt = float(getattr(args, "warmup_substrate_dt", 0.0) or 0.0)
+            if warm_steps > 0:
+                if not (math.isfinite(warm_dt) and warm_dt > 0.0):
+                    raise ValueError(f"--warmup-substrate-dt must be > 0; got {getattr(args, 'warmup_substrate_dt', None)!r}.")
+                warm_steps = int(max(warm_steps, 0))
+                t_warm0 = float(max(0.0, float(t_start) - float(warm_steps) * float(warm_dt)))
+                if int(cid) != 5:
+                    # Ensure the bulk reservoir value is consistent at the warmup start time.
+                    S_bulk_value = float(_S_bulk_case(cid, float(t_warm0), S_high=float(args.S_high)))
+                    S_bulk_c.value = float(S_bulk_value)
+
+                aux_B_warm = {
+                    "dt": dt_c,
+                    "v_hold": v_hold,
+                    "p_hold": p_hold,
+                    "vS_hold": vS_hold,
+                    "u_hold": u_hold,
+                    "phi_hold": phi_hold,
+                    "alpha_hold": alpha_hold,
+                }
+                if lambda_hold is not None:
+                    aux_B_warm["lambda_alpha_hold"] = lambda_hold
+
+                for j in range(int(warm_steps)):
+                    t_n_w = float(t_warm0 + float(j) * float(warm_dt))
+                    dt_c.value = float(warm_dt)
+
+                    # Refresh holds from the previous state and reset the predictor.
+                    for f, f_prev in zip(funcs, prev_funcs):
+                        f.nodal_values[:] = f_prev.nodal_values[:]
+                    v_hold.nodal_values[:] = fields["v"].nodal_values[:]
+                    vS_hold.nodal_values[:] = fields["vS"].nodal_values[:]
+                    u_hold.nodal_values[:] = fields["u"].nodal_values[:]
+                    p_hold.nodal_values[:] = fields["p"].nodal_values[:]
+                    phi_hold.nodal_values[:] = fields["phi"].nodal_values[:]
+                    alpha_hold.nodal_values[:] = fields["alpha"].nodal_values[:]
+                    if lambda_hold is not None:
+                        lambda_hold.nodal_values[:] = fields["lambda_alpha"].nodal_values[:]
+
+                    # Update bulk substrate value for the warmup time (case 2 step-change).
+                    if int(cid) != 5:
+                        S_bulk_value = float(_S_bulk_case(cid, float(t_n_w), S_high=float(args.S_high)))
+                        S_bulk_c.value = float(S_bulk_value)
+
+                    t_bc_w = float(t_n_w + float(theta) * float(warm_dt))
+                    bcs_now_w = solver_B._freeze_bcs(bcs, t_bc_w)
+                    dh.apply_bcs(bcs_now_w, *funcs)
+
+                    solver_B._current_step_no = int(-1000000 + j)
+                    solver_B._current_t = float(t_n_w)
+                    solver_B._current_dt = float(warm_dt)
+                    solver_B._newton_loop(funcs, prev_funcs, aux_B_warm, bcs_now_w)
+                    dh.apply_bcs(bcs_now_w, *funcs)
+
+                    # Accept warmup step: sync previous state.
+                    for f, f_prev in zip(funcs, prev_funcs):
+                        f_prev.nodal_values[:] = f.nodal_values[:]
+
+                # After warmup, ensure current and previous alpha are consistent for any
+                # later in-step "shift" sloughing updates.
+                alpha_n.nodal_values[:] = alpha_k.nodal_values[:]
+
         # Conservative Allen–Cahn (eliminated λ): enforce
         #   ∫ M(α) (μ_α - λ_α) dx = 0
         # by projecting λ_α from α before each assembly, using the same by-parts
@@ -2114,12 +2520,12 @@ def main() -> None:
         def _on_dt_change(new_dt: float) -> None:
             dt_c.value = float(new_dt)
 
-        # Set initial detachment coefficient for t=0.
+        # Set initial detachment coefficient for t=t_start.
         D_det_prev.value = _detachment_coeff_case(
             case_id=cid,
-            t_days=0.0,
+            t_days=float(t_start),
             dt_days=float(args.dt),
-            L_eff_nondim=float(args.h0),
+            L_thickness_nondim=float(args.h0),
             L_ref_m=float(L_ref_m),
             eps_det_nondim=float(eps_det_eff),
             lambda_shear=float(args.lambda_shear),
@@ -2132,13 +2538,14 @@ def main() -> None:
 
             # Split the long run at discontinuous "event" times so we hit them exactly
             # (and can restart dt for the post-event transient).
+            t_start = float(getattr(args, "t_start", 0.0) or 0.0)
             t_final = float(args.t_final)
             t_events: list[float] = []
             if int(cid) == 2:
                 t_events.append(6.0)  # step-change in surface substrate
             if int(cid) == 4:
                 slough_mode = str(getattr(args, "slough_mode", "integrated")).strip().lower()
-                if slough_mode == "exact":
+                if slough_mode in {"exact", "shift", "shift_window"}:
                     t_events.extend([5.984, 5.994])  # Warner window
                 else:
                     t_events.append(6.0)  # integrated coarse drop around 6d
@@ -2149,14 +2556,15 @@ def main() -> None:
             if int(cid) in {2, 4}:
                 for te in list(t_events):
                     t_pre = float(te) - float(dt_base)
-                    if 0.0 < t_pre < t_final:
+                    if float(t_start) < t_pre < t_final:
                         t_events.append(t_pre)
 
             # Keep only strict interior events; always end at t_final.
-            t_stops = sorted({t for t in t_events if 0.0 < float(t) < t_final})
+            t_stops = sorted({t for t in t_events if float(t_start) < float(t) < t_final})
             t_stops.append(t_final)
 
-            t0 = 0.0
+            t0 = float(t_start)
+            first_segment = True
             dt_after = float(getattr(args, "dt_after_event", 0.0) or 0.0)
             if dt_after <= 0.0:
                 dt_after = float(dt_base)
@@ -2166,7 +2574,7 @@ def main() -> None:
                     t0 = float(t1)
                     continue
 
-                dt_init = float(dt_base) if t0 <= 1.0e-15 else float(min(dt_base, dt_after))
+                dt_init = float(dt_base) if first_segment else float(min(dt_base, dt_after))
                 solver.solve_time_interval(
                     functions=funcs,
                     prev_functions=prev_funcs,
@@ -2193,12 +2601,14 @@ def main() -> None:
                     ),
                 )
                 t0 = float(t1)
+                first_segment = False
         else:
             # Manual time loop for split strategy.
             #
             # IMPORTANT: cases 2 and 4 have discontinuous "events" at ~t=6d. We must
             # hit these times exactly (same as the monolithic driver) so the frozen
             # θ-time BC evaluation does not smear the discontinuity across a step.
+            t_start = float(getattr(args, "t_start", 0.0) or 0.0)
             t_final = float(args.t_final)
             dt_base = float(args.dt)
             dt_max_val = float(args.dt) if float(getattr(args, "dt_max", 0.0) or 0.0) <= 0.0 else float(args.dt_max)
@@ -2213,7 +2623,7 @@ def main() -> None:
                 t_events.append(6.0)  # step-change in surface substrate
             if int(cid) == 4:
                 slough_mode = str(getattr(args, "slough_mode", "integrated")).strip().lower()
-                if slough_mode == "exact":
+                if slough_mode in {"exact", "shift", "shift_window"}:
                     t_events.extend([5.984, 5.994])  # Warner window
                 else:
                     t_events.append(6.0)  # integrated coarse drop around 6d
@@ -2223,11 +2633,11 @@ def main() -> None:
             if int(cid) in {2, 4}:
                 for te in list(t_events):
                     t_pre = float(te) - float(dt_base)
-                    if 0.0 < t_pre < t_final:
+                    if float(t_start) < t_pre < t_final:
                         t_events.append(t_pre)
 
             # Keep only strict interior events; always end at t_final.
-            t_stops = sorted({t for t in t_events if 0.0 < float(t) < t_final})
+            t_stops = sorted({t for t in t_events if float(t_start) < float(t) < t_final})
             t_stops.append(t_final)
 
             dt_after = float(getattr(args, "dt_after_event", 0.0) or 0.0)
@@ -2235,15 +2645,52 @@ def main() -> None:
                 dt_after = float(dt_base)
 
             step_no = 0
-            t0 = 0.0
+            t0 = float(t_start)
+            first_segment = True
             for t1 in t_stops:
                 if t1 <= t0 + 1.0e-15:
                     t0 = float(t1)
                     continue
 
                 # Restart dt after events (and ramp back up if adaptive dt is enabled).
-                dt = float(dt_base) if t0 <= 1.0e-15 else float(min(dt_base, dt_after))
+                dt = float(dt_base) if first_segment else float(min(dt_base, dt_after))
                 t_n = float(t0)
+                first_segment = False
+
+                # IMPORTANT: for case 4 "integrated" sloughing, the detachment
+                # coefficient depends on the *upcoming* step length (to detect a
+                # crossing of 6d). Because we restart dt at each segment boundary,
+                # the lagged update inside `_record_step` can otherwise miss the
+                # event if the last step of the previous segment had a smaller dt.
+                dt_first = float(min(dt, t1 - t_n))
+                if dt_first > 0.0:
+                    thickness_key = str(getattr(args, "thickness_metric", "half")).strip().lower()
+                    if mode == "strip":
+                        try:
+                            L_half_seg, _, _ = _strip_interface_metrics(dh=dh, alpha=alpha_k, S=S_k)
+                        except Exception:
+                            L_half_seg = _strip_thickness_alpha_half(dh=dh, alpha=alpha_k)
+
+                        if thickness_key == "eff":
+                            A_alpha = assemble_scalar(dh, I_alpha, backend=backend, quad_order=int(qdeg))
+                            L_thickness_seg = float(A_alpha) / max(width, 1.0e-16)
+                        else:
+                            L_thickness_seg = float(L_half_seg)
+                    else:
+                        # 2D mode: use the initial thickness scale as a fallback.
+                        L_thickness_seg = float(getattr(args, "h0", 0.0) or 0.0)
+
+                    D_det_prev.value = _detachment_coeff_case(
+                        case_id=cid,
+                        t_days=float(t_n),
+                        dt_days=float(dt_first),
+                        L_thickness_nondim=float(L_thickness_seg),
+                        L_ref_m=float(L_ref_m),
+                        eps_det_nondim=float(eps_det_eff),
+                        lambda_shear=float(args.lambda_shear),
+                        slough_mode=str(args.slough_mode),
+                        slough_drop_nondim=float(args.slough_drop_um) * 1.0e-6 / float(L_ref_m),
+                    )
 
                 while t_n < t1 - 1.0e-15:
                     dt_step = float(min(dt, t1 - t_n))
@@ -2253,8 +2700,71 @@ def main() -> None:
                     for f, f_prev in zip(funcs, prev_funcs):
                         f.nodal_values[:] = f_prev.nodal_values[:]
 
-                    step_no_next = int(step_no + 1)
+                    # IMPORTANT: update any *time-dependent* imposed bulk values *before* the
+                    # PDE solve so the step that hits an event time (e.g. case 2 at t=6d)
+                    # is solved with the correct forcing.
                     t_bc = float(t_n + float(theta) * dt_step)
+                    if int(cid) != 5:
+                        S_bulk_value = float(_S_bulk_case(cid, float(t_bc), S_high=float(args.S_high)))
+                        S_bulk_c.value = float(S_bulk_value)
+                    mu_extra_base = float(getattr(args, "mu_extra_const", 0.0) or 0.0)
+                    if int(cid) == 2:
+                        mu_extra_c.value = mu_extra_base + _case2_mu_extra(
+                            t_days=float(t_bc),
+                            enabled=bool(getattr(args, "case2_autotroph", False)),
+                            start_days=float(getattr(args, "case2_autotroph_start", 6.0)),
+                            mu0=float(getattr(args, "case2_autotroph_mu0", 0.0)),
+                            mu1=float(getattr(args, "case2_autotroph_mu1", 0.0)),
+                            tau_days=float(getattr(args, "case2_autotroph_tau", 1.0)),
+                        )
+                    else:
+                        mu_extra_c.value = mu_extra_base
+
+                    # Case 4 "shift_window": apply sloughing *before* the PDE solve so the
+                    # substrate/mechanics stages evolve on the updated interface position.
+                    #
+                    # If we apply the truncation after the solve (post-step), diagnostics at
+                    # the window endpoint (t=5.994) are inconsistent (α is updated but S is
+                    # still the pre-slough solution). Applying it pre-step avoids that.
+                    slough_drop_now = 0.0
+                    alpha_prev_backup = None
+                    S_prev_backup = None
+                    if int(cid) == 4 and slough_mode_key == "shift_window":
+                        win0 = 5.984
+                        win1 = 5.994
+                        t0_step = float(t_n)
+                        t1_step = float(t_n + dt_step)
+                        overlap = max(0.0, min(t1_step, win1) - max(t0_step, win0))
+                        remaining = float(slough_drop_nondim) - float(slough_shift_window_applied_nondim)
+                        if overlap > 0.0 and remaining > 1.0e-15:
+                            V_nondim = float(slough_drop_nondim) / float(win1 - win0)
+                            slough_drop_now = float(min(float(V_nondim) * float(overlap), remaining))
+                            if slough_drop_now > 0.0:
+                                # Backup previous state so we can rollback if the nonlinear solve fails
+                                # and we retry with a smaller dt (adaptive_dt).
+                                alpha_prev_backup = np.array(alpha_n.nodal_values, copy=True)
+                                S_prev_backup = np.array(S_n.nodal_values, copy=True)
+
+                                _apply_slough_truncate_strip(
+                                    dh=dh,
+                                    alpha=alpha_n,
+                                    drop_nondim=float(slough_drop_now),
+                                    eps_nondim=float(args.eps0),
+                                )
+                                try:
+                                    L_new = float(_strip_thickness_alpha_half(dh=dh, alpha=alpha_n))
+                                    coords_S = np.asarray(dh.get_dof_coords("S"), dtype=float)
+                                    if coords_S.ndim == 2 and coords_S.shape[1] >= 2 and coords_S.shape[0] == np.asarray(S_n.nodal_values).size:
+                                        mask = coords_S[:, 1] >= float(L_new)
+                                        S_n.nodal_values[:] = np.where(mask, float(S_bulk_value), S_n.nodal_values)
+                                except Exception:
+                                    pass
+
+                                # Sync current predictor to the shifted previous state.
+                                alpha_k.nodal_values[:] = alpha_n.nodal_values[:]
+                                S_k.nodal_values[:] = S_n.nodal_values[:]
+
+                    step_no_next = int(step_no + 1)
                     bcs_now = solver_A._freeze_bcs(bcs, t_bc)
                     dh.apply_bcs(bcs_now, *funcs)
 
@@ -2294,6 +2804,10 @@ def main() -> None:
                         solver_B._newton_loop(funcs, prev_funcs, aux_B, bcs_now)
                         dh.apply_bcs(bcs_now, *funcs)
                     except Exception:
+                        # Rollback pre-step sloughing update before retrying.
+                        if alpha_prev_backup is not None and S_prev_backup is not None:
+                            alpha_n.nodal_values[:] = alpha_prev_backup
+                            S_n.nodal_values[:] = S_prev_backup
                         if not allow_adapt:
                             raise
                         dt = float(dt) * float(dt_reduction)
@@ -2301,8 +2815,13 @@ def main() -> None:
                             raise
                         continue
 
-                    # Accepted step: record, advance time, update step counter.
-                    t_k = float(t_n + dt_step)
+            # Accepted step: record, advance time, update step counter.
+                    # Snap times to the segment endpoint to avoid missing case-event
+                    # windows due to roundoff (e.g. 5.984 represented as 5.983999999999999).
+                    t_k_raw = float(t_n + dt_step)
+                    t_k = float(t1) if abs(float(t_k_raw) - float(t1)) <= _TIME_TOL_DAYS else float(t_k_raw)
+                    if float(slough_drop_now) > 0.0:
+                        slough_shift_window_applied_nondim = float(slough_shift_window_applied_nondim) + float(slough_drop_now)
                     _record_step(t_k=t_k, _funcs=funcs)
                     for f, f_prev in zip(funcs, prev_funcs):
                         f_prev.nodal_values[:] = f.nodal_values[:]

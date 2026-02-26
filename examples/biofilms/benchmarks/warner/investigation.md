@@ -307,3 +307,7 @@ match the constant-density assumptions in Warner & Gujer).
   - x-averaged thickness/removal vs strip,
   - and (optionally) thickness profile `h(x,t)` from the α=0.5 contour.
 - Add the final parameter table + solver settings + stability discussion to the manuscript section.
+
+## 6) Repo regressions fixed while working on this benchmark (Feb 25, 2026)
+- `warner1986_benchmark.py`: when `--t-final < 6`, the script used to crash in the plotting branch by requesting a `t=6d` profile. Guarded this and added a regression test.
+- `warner1986_benchmark.py`: case 4 sloughing could be skipped entirely by the stiff ODE integrator (a large BDF step jumping over the short `[5.984, 5.994] d` window). Fixed by segmenting the integration at the window endpoints (and included-endpoint sigma); added a regression test checking the ≈`500 µm` thickness drop.
