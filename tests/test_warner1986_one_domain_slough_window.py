@@ -56,6 +56,93 @@ def test_warner1986_one_domain_slough_window_handles_roundoff() -> None:
     assert D1 == 0.0
 
 
+def test_warner1986_one_domain_case3_shear_mode_truncate_disables_sink() -> None:
+    from examples.biofilms.benchmarks.warner import warner1986_one_domain as wod
+
+    L_ref_m = 1.0e-3
+    eps_det = 0.006
+
+    D_sink = wod._detachment_coeff_case(
+        case_id=3,
+        t_days=1.0,
+        dt_days=0.05,
+        L_thickness_nondim=0.7,
+        L_ref_m=L_ref_m,
+        eps_det_nondim=eps_det,
+        lambda_shear=750.0,
+        shear_mode="sink",
+        slough_mode="integrated",
+        slough_drop_nondim=0.5,
+    )
+    assert D_sink > 0.0
+
+    D_trunc = wod._detachment_coeff_case(
+        case_id=3,
+        t_days=1.0,
+        dt_days=0.05,
+        L_thickness_nondim=0.7,
+        L_ref_m=L_ref_m,
+        eps_det_nondim=eps_det,
+        lambda_shear=750.0,
+        shear_mode="truncate",
+        slough_mode="integrated",
+        slough_drop_nondim=0.5,
+    )
+    assert D_trunc == 0.0
+
+
+def test_warner1986_one_domain_case3_shear_truncate_recedes_and_refills() -> None:
+    import numpy as np
+
+    from examples.biofilms.benchmarks.warner import warner1986_one_domain as wod
+
+    class _DH:
+        def __init__(self, coords_by_field: dict[str, np.ndarray]):
+            self._coords = coords_by_field
+
+        def get_dof_coords(self, field: str) -> np.ndarray:
+            return self._coords[field]
+
+    class _F:
+        def __init__(self, values: np.ndarray):
+            self.nodal_values = np.asarray(values, dtype=float).copy()
+
+    y = np.linspace(0.0, 1.0, 2001)
+    coords = np.column_stack([np.zeros_like(y), y])
+    dh = _DH({"alpha": coords, "S": coords})
+
+    alpha0 = (y <= 0.7).astype(float)
+    alpha = _F(alpha0)
+    S = _F(np.zeros_like(y))
+
+    L_old = float(wod._strip_thickness_alpha_half(dh=dh, alpha=alpha))
+
+    dt_days = 0.05
+    lambda_shear = 750.0
+    L_ref_m = 1.0e-3
+    expected_drop = float(lambda_shear) * float(L_ref_m) * (float(L_old) ** 2) * float(dt_days)
+
+    drop = wod._apply_case3_shear_truncate_strip(
+        dh=dh,
+        alpha=alpha,
+        S=S,
+        dt_days=dt_days,
+        lambda_shear=lambda_shear,
+        L_ref_m=L_ref_m,
+        eps_nondim=0.006,
+        S_bulk_value=3.0,
+    )
+    assert abs(drop - expected_drop) <= 1.0e-15 * max(1.0, abs(expected_drop))
+
+    L_new = float(wod._strip_thickness_alpha_half(dh=dh, alpha=alpha))
+    dy = float(y[1] - y[0])
+    assert abs(L_new - (L_old - expected_drop)) <= 2.0 * dy
+
+    # New fluid region above the shifted interface is refilled to bulk.
+    mask = y >= float(L_new) - 1.0e-14
+    assert np.allclose(S.nodal_values[mask], 3.0, atol=0.0, rtol=0.0)
+
+
 def test_warner1986_one_domain_shift_slough_truncates_and_refills() -> None:
     import numpy as np
 

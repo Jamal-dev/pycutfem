@@ -463,6 +463,7 @@ def _detachment_coeff_case(
     L_ref_m: float,
     eps_det_nondim: float,
     lambda_shear: float,
+    shear_mode: str = "sink",
     slough_mode: str,
     slough_drop_nondim: float,
 ) -> float:
@@ -483,8 +484,13 @@ def _detachment_coeff_case(
     eps = max(float(eps_det_nondim), 1.0e-12)
     L = max(float(L_thickness_nondim), 0.0)
     slough_key = str(slough_mode).strip().lower()
+    shear_key = str(shear_mode).strip().lower()
 
     if cid == 3:
+        # If shear is applied as a geometric surface recession (truncate), do not
+        # also activate the diffuse-interface detachment sink.
+        if shear_key not in {"sink", "delta", "ac"}:
+            return 0.0
         # Warner: sigma = -lambda * L^2 with lambda=750 m^{-1} d^{-1}.
         # Use V_det = +lambda*L^2 for recession speed magnitude.
         # Convert to nondimensional length/time with L_phys=L_ref*L_nondim:
@@ -653,6 +659,55 @@ def _apply_case4_shift_slough_strip(
     except Exception:
         pass
     return True
+
+
+def _apply_case3_shear_truncate_strip(
+    *,
+    dh: DofHandler,
+    alpha: Function,
+    S: Function,
+    dt_days: float,
+    lambda_shear: float,
+    L_ref_m: float,
+    eps_nondim: float,
+    S_bulk_value: float,
+) -> float:
+    """
+    Apply Warner case-3 shear σ=-λL² as a per-step geometric surface recession.
+
+    Returns the applied thickness drop (nondimensional). If dt<=0 or no valid
+    thickness is detected, returns 0.
+    """
+    dt = float(dt_days)
+    if not (math.isfinite(dt) and dt > 0.0):
+        return 0.0
+    try:
+        L_surf_nondim = float(_strip_thickness_alpha_half(dh=dh, alpha=alpha))
+    except Exception:
+        return 0.0
+    if not (math.isfinite(L_surf_nondim) and L_surf_nondim > 0.0):
+        return 0.0
+
+    drop_nondim = float(lambda_shear) * float(L_ref_m) * (float(L_surf_nondim) ** 2) * float(dt)
+    if not (math.isfinite(drop_nondim) and drop_nondim > 0.0):
+        return 0.0
+
+    _apply_slough_truncate_strip(
+        dh=dh,
+        alpha=alpha,
+        drop_nondim=float(drop_nondim),
+        eps_nondim=float(eps_nondim),
+    )
+    try:
+        L_new = float(_strip_thickness_alpha_half(dh=dh, alpha=alpha))
+        coords_S = np.asarray(dh.get_dof_coords("S"), dtype=float)
+        if coords_S.ndim == 2 and coords_S.shape[1] >= 2 and coords_S.shape[0] == np.asarray(S.nodal_values).size:
+            mask = coords_S[:, 1] >= float(L_new)
+            S.nodal_values[:] = np.where(mask, float(S_bulk_value), S.nodal_values)
+    except Exception:
+        pass
+
+    return float(drop_nondim)
 
 
 def _build_one_domain_problem(
@@ -1672,6 +1727,17 @@ def main() -> None:
     )
     ap.add_argument("--lambda-shear", type=float, default=750.0, help="Warner shear coefficient lambda (m^-1 d^-1) for case 3 mapping.")
     ap.add_argument(
+        "--shear-mode",
+        type=str,
+        default="sink",
+        choices=("sink", "truncate"),
+        help=(
+            "Case 3 shear detachment mapping. "
+            "'sink' uses a diffuse-interface detachment sink -D_det*delta(alpha) with D_det derived from sigma=-lambda*L^2. "
+            "'truncate' applies a geometric surface recession each accepted step (recommended for robust Warner matching)."
+        ),
+    )
+    ap.add_argument(
         "--slough-mode",
         type=str,
         default="integrated",
@@ -2149,6 +2215,27 @@ def main() -> None:
                 _funcs[4].nodal_values[:] = np.clip(_funcs[4].nodal_values, 0.0, 1.0)  # phi
                 S_k.nodal_values[:] = np.maximum(S_k.nodal_values, 0.0)
 
+            # Case 3: continuous shear sigma=-lambda*L^2.
+            #
+            # The diffuse-interface sink mapping (D_det*delta(alpha)) can be sensitive
+            # to eps/regularization for thick films. In "truncate" mode we therefore
+            # apply shear as a geometric surface recession each accepted step.
+            shear_mode_key = str(getattr(args, "shear_mode", "sink")).strip().lower()
+            if int(cid) == 3 and shear_mode_key in {"truncate", "shift"} and str(strategy).strip().lower() != "split":
+                dt_step_shear = float(getattr(dt_c, "value", float(args.dt)))
+                if dt_step_shear <= 0.0:
+                    dt_step_shear = float(args.dt)
+                _apply_case3_shear_truncate_strip(
+                    dh=dh,
+                    alpha=alpha_k,
+                    S=S_k,
+                    dt_days=float(dt_step_shear),
+                    lambda_shear=float(args.lambda_shear),
+                    L_ref_m=float(L_ref_m),
+                    eps_nondim=float(args.eps0),
+                    S_bulk_value=float(S_bulk_value),
+                )
+
             k_g_used = float(getattr(k_g_c, "value", k_g_base))
 
             A_alpha = assemble_scalar(dh, I_alpha, backend=backend, quad_order=int(qdeg))
@@ -2281,6 +2368,7 @@ def main() -> None:
                 L_ref_m=float(L_ref_m),
                 eps_det_nondim=float(eps_det_eff),
                 lambda_shear=float(args.lambda_shear),
+                shear_mode=str(getattr(args, "shear_mode", "sink")),
                 slough_mode=str(args.slough_mode),
                 slough_drop_nondim=float(args.slough_drop_um) * 1.0e-6 / float(L_ref_m),
             )
@@ -2645,6 +2733,7 @@ def main() -> None:
             L_ref_m=float(L_ref_m),
             eps_det_nondim=float(eps_det_eff),
             lambda_shear=float(args.lambda_shear),
+            shear_mode=str(getattr(args, "shear_mode", "sink")),
             slough_mode=str(args.slough_mode),
             slough_drop_nondim=float(args.slough_drop_um) * 1.0e-6 / float(L_ref_m),
         )
@@ -2804,6 +2893,7 @@ def main() -> None:
                         L_ref_m=float(L_ref_m),
                         eps_det_nondim=float(eps_det_eff),
                         lambda_shear=float(args.lambda_shear),
+                        shear_mode=str(getattr(args, "shear_mode", "sink")),
                         slough_mode=str(args.slough_mode),
                         slough_drop_nondim=float(args.slough_drop_um) * 1.0e-6 / float(L_ref_m),
                     )
@@ -2845,6 +2935,32 @@ def main() -> None:
                     slough_drop_now = 0.0
                     alpha_prev_backup = None
                     S_prev_backup = None
+
+                    # Case 3 ("truncate" shear): apply the surface recession *before*
+                    # the PDE solve so substrate/mechanics evolve on the updated interface.
+                    #
+                    # If we apply truncation post-step (inside `_record_step`), α is updated
+                    # but S is still the pre-shear solution, which can produce inconsistent
+                    # flux diagnostics.
+                    shear_mode_key = str(getattr(args, "shear_mode", "sink")).strip().lower()
+                    if int(cid) == 3 and shear_mode_key == "truncate":
+                        if allow_adapt:
+                            alpha_prev_backup = np.array(alpha_n.nodal_values, copy=True)
+                            S_prev_backup = np.array(S_n.nodal_values, copy=True)
+                        _apply_case3_shear_truncate_strip(
+                            dh=dh,
+                            alpha=alpha_n,
+                            S=S_n,
+                            dt_days=float(dt_step),
+                            lambda_shear=float(args.lambda_shear),
+                            L_ref_m=float(L_ref_m),
+                            eps_nondim=float(args.eps0),
+                            S_bulk_value=float(S_bulk_value),
+                        )
+                        # Sync current predictor to the shifted previous state.
+                        alpha_k.nodal_values[:] = alpha_n.nodal_values[:]
+                        S_k.nodal_values[:] = S_n.nodal_values[:]
+
                     if int(cid) == 4 and slough_mode_key == "shift_window":
                         win0 = 5.984
                         win1 = 5.994

@@ -100,6 +100,11 @@ def main() -> None:
         default="",
         help="Optional comma-separated time list in days (overrides per-case defaults).",
     )
+    ap.add_argument(
+        "--allow-extrapolation",
+        action="store_true",
+        help="Allow comparing at times beyond the last one-domain output time by holding the last value.",
+    )
     args = ap.parse_args()
 
     cases: list[int] = []
@@ -129,6 +134,14 @@ def main() -> None:
         ref = _load_ref(cid)
         one = _load_one(cid, backend=str(args.backend), run_tag=str(args.run_tag))
         times = custom_times if custom_times is not None else times_by_case[int(cid)]
+        if (not bool(args.allow_extrapolation)) and times:
+            t_last = float(one[0][-1]) if one[0].size else float("nan")
+            t_req = float(max(times))
+            if np.isfinite(t_last) and t_last + 1.0e-12 < t_req:
+                raise RuntimeError(
+                    f"One-domain CSV for case {cid} ends at t={t_last:g} d but comparison requested t={t_req:g} d. "
+                    "Re-run with a larger --t-final or pass --allow-extrapolation."
+                )
         for t in times:
             rows.append(_row(cid, t, ref, one))
 

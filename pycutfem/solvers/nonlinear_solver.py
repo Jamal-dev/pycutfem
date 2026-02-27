@@ -3030,6 +3030,16 @@ class NewtonSolver:
         ia = np.asarray(A.indptr, dtype=PETSc.IntType)
         ja = np.asarray(A.indices, dtype=PETSc.IntType)
         a = np.asarray(A.data, dtype=np.float64)
+        rhs = np.asarray(rhs, dtype=np.float64)
+        if (not np.all(np.isfinite(a))) or (not np.all(np.isfinite(rhs))):
+            # Non-finite values can corrupt direct solvers (e.g. MUMPS) and even
+            # leave cached PETSc objects in a bad internal state. Clear the cache
+            # so adaptive dt retries start with a clean KSP/Mat.
+            try:
+                self._petsc_linear_cache = None
+            except Exception:
+                pass
+            raise RuntimeError("PETSc linear solve received non-finite entries in matrix or rhs.")
         try:
             mat.setValuesCSR(ia, ja, a)
         except TypeError:
@@ -3038,11 +3048,30 @@ class NewtonSolver:
         mat.assemblyEnd()
 
         # Load RHS and solve.
+        #
+        # IMPORTANT: petsc4py's Vec.getArray() returns a NumPy view that can keep
+        # the underlying Vec "locked" for array access while the view exists.
+        # If a PETSc solve throws an exception while such a view is live, the lock
+        # can persist and break subsequent solves (e.g. during adaptive-Δt retries).
         b_arr = b.getArray()
         b_arr[:] = rhs
+        del b_arr
+
         x.set(0.0)
-        ksp.solve(b, x)
-        return x.getArray(readonly=True).copy()
+        try:
+            ksp.solve(b, x)
+        except PETSc.Error:
+            # Clear cache so the next attempt rebuilds PETSc objects from scratch.
+            try:
+                self._petsc_linear_cache = None
+            except Exception:
+                pass
+            raise
+
+        x_arr = x.getArray(readonly=True)
+        out = x_arr.copy()
+        del x_arr
+        return out
 
 
     def _phi(self, vec):                 # ½‖·‖² helper

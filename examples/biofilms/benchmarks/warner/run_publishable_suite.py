@@ -306,6 +306,8 @@ def main() -> None:
                     run_tag,
                     "--lambda-shear",
                     "750.0",
+                    "--shear-mode",
+                    "truncate",
                     "--Hy",
                     "0.7",
                     "--h0",
