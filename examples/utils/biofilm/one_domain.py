@@ -118,22 +118,32 @@ def _rho(alpha, phi, *, rho_f):
     return rho_f * _capacity(alpha, phi)
 
 
-def _mu(alpha, phi, *, mu_f, mu_b_model: str = "phi_mu"):
+def _mu(alpha, phi, *, mu_f, mu_b=None, mu_b_model: str = "phi_mu"):
     """
     Effective viscosity μ(α,φ).
 
     Choices:
       - "mu":      μ_B = μ_f (constant)               → μ = μ_f (no α/φ dependence)
       - "phi_mu":  μ_B = φ μ_f (Brinkman scaling)     → μ = μ_f ((1-α) + α φ)
+      - "alpha_mu": μ_B = μ_b (constant)              → μ = (1-α) μ_f + α μ_b
+      - "alpha_phi_mu": μ_B = φ μ_b                   → μ = (1-α) μ_f + α φ μ_b
     """
     mu_b_model = str(mu_b_model).strip().lower()
     if mu_b_model in {"mu", "const", "constant"}:
-        mu_b = mu_f
+        mu_b_eff = mu_f
     elif mu_b_model in {"phi_mu", "phi*mu", "phi"}:
-        mu_b = phi * mu_f
+        mu_b_eff = phi * mu_f
+    elif mu_b_model in {"alpha_mu", "alpha", "mu_b", "biofilm_mu", "biofilm"}:
+        if mu_b is None:
+            raise ValueError("mu_b_model='alpha_mu' requires mu_b to be provided.")
+        mu_b_eff = mu_b
+    elif mu_b_model in {"alpha_phi_mu", "alpha_phi", "alpha*phi_mu", "alpha*phi*mu"}:
+        if mu_b is None:
+            raise ValueError("mu_b_model='alpha_phi_mu' requires mu_b to be provided.")
+        mu_b_eff = phi * mu_b
     else:
         raise ValueError(f"Unknown mu_b_model {mu_b_model!r}.")
-    return _chi_f(alpha) * mu_f + _chi_b(alpha) * mu_b
+    return _chi_f(alpha) * mu_f + _chi_b(alpha) * mu_b_eff
 
 
 def _beta(alpha, phi, *, mu_f, kappa_inv):
@@ -291,6 +301,7 @@ def build_biofilm_one_domain_forms(
     # physical parameters
     rho_f=None,
     mu_f=None,
+    mu_b=None,
     kappa_inv=None,
     mu_s=None,
     lambda_s=None,
@@ -557,17 +568,32 @@ def build_biofilm_one_domain_forms(
     rho_k = _rho(alpha_k, phi_k, rho_f=rho_f)
     rho_n = _rho(alpha_n, phi_n, rho_f=rho_f)
 
-    mu_k = _mu(alpha_k, phi_k, mu_f=mu_f, mu_b_model=mu_b_model)
-    mu_n = _mu(alpha_n, phi_n, mu_f=mu_f, mu_b_model=mu_b_model)
+    mu_b_key = str(mu_b_model).strip().lower()
+    mu_b_expr = mu_b
+    if mu_b_expr is not None and not hasattr(mu_b_expr, "dim"):
+        mu_b_expr = _c(float(mu_b_expr))
+
+    mu_k = _mu(alpha_k, phi_k, mu_f=mu_f, mu_b=mu_b_expr, mu_b_model=mu_b_model)
+    mu_n = _mu(alpha_n, phi_n, mu_f=mu_f, mu_b=mu_b_expr, mu_b_model=mu_b_model)
 
     # Coefficient variations w.r.t (α,φ) at k:
     dC = (phi_k - _c(1.0)) * dalpha + alpha_k * dphi  # δ((1-α)+αφ)
     drho = rho_f * dC
 
-    if str(mu_b_model).strip().lower() in {"mu", "const", "constant"}:
+    if mu_b_key in {"mu", "const", "constant"}:
         dmu = _c(0.0) * dphi
-    else:
+    elif mu_b_key in {"phi_mu", "phi*mu", "phi"}:
         dmu = mu_f * dC
+    elif mu_b_key in {"alpha_mu", "alpha", "mu_b", "biofilm_mu", "biofilm"}:
+        if mu_b_expr is None:
+            raise ValueError("mu_b_model='alpha_mu' requires mu_b to be provided.")
+        dmu = (mu_b_expr - mu_f) * dalpha
+    elif mu_b_key in {"alpha_phi_mu", "alpha_phi", "alpha*phi_mu", "alpha*phi*mu"}:
+        if mu_b_expr is None:
+            raise ValueError("mu_b_model='alpha_phi_mu' requires mu_b to be provided.")
+        dmu = (phi_k * mu_b_expr - mu_f) * dalpha + (alpha_k * mu_b_expr) * dphi
+    else:
+        raise ValueError(f"Unknown mu_b_model {mu_b_model!r}.")
 
     # Optional skeleton inertia coefficient (0 by default).
     rho_s0_tilde = rho_s0_tilde if rho_s0_tilde is not None else zero_scalar

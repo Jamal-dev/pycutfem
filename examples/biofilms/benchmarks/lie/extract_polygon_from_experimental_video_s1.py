@@ -75,6 +75,7 @@ def _auto_base_from_mask(
     base_method: str,
     base_quantile: float,
     min_col_fg: int,
+    span_height_frac: float = 0.0,
     force_base_y_px: float | None = None,
 ) -> tuple[float, int, int, int]:
     """
@@ -140,13 +141,45 @@ def _auto_base_from_mask(
     y_hi = int(np.clip(int(np.ceil(base_y + float(tol_px))), 0, h - 1))
     band_rows = mask[y_lo : y_hi + 1, :]
     col_has = np.any(band_rows, axis=0)
+
+    # Optional: exclude spurious base-touching columns that have too little
+    # vertical extent (typically speckle noise touching the base band).
+    #
+    # We keep only columns whose mask extends above the base by at least a
+    # fraction of the overall height of the component.
+    base_y_i = int(np.clip(int(round(float(base_y))), 0, h - 1))
+    span_height_frac = float(max(0.0, float(span_height_frac)))
+    if span_height_frac > 0.0:
+        has_fg_col = np.any(mask, axis=0)
+        y_top = np.full(w, np.nan, dtype=float)
+        # argmax gives the first True along axis=0 when mask is boolean.
+        y_top[has_fg_col] = np.argmax(mask[:, has_fg_col], axis=0).astype(float)
+        heights = float(base_y_i) - y_top
+        heights[~np.isfinite(heights)] = 0.0
+        h_max = float(np.max(heights)) if np.any(np.isfinite(heights)) else 0.0
+        h_thr = max(10.0, span_height_frac * h_max)
+        col_has = col_has & (heights >= h_thr)
+
     xs = np.nonzero(col_has & valid_cols)[0]
     if xs.size < 2:
         xs = np.nonzero(col_has)[0]
     if xs.size < 2:
         raise RuntimeError("Could not determine x-span of the base (too few columns).")
-    x_left = int(np.min(xs))
-    x_right = int(np.max(xs))
+
+    # Choose the longest contiguous run (robust to isolated noisy columns).
+    xs = np.sort(xs.astype(int))
+    runs: list[tuple[int, int]] = []
+    start = int(xs[0])
+    prev = int(xs[0])
+    for x in xs[1:]:
+        x = int(x)
+        if x == prev + 1:
+            prev = x
+            continue
+        runs.append((start, prev))
+        start = prev = x
+    runs.append((start, prev))
+    x_left, x_right = max(runs, key=lambda r: int(r[1] - r[0]))
     return float(base_y), x_left, x_right, int(min_col_fg)
 
 
@@ -187,7 +220,8 @@ def _straighten_base_in_mask(
         y_top = int(np.argmax(col))  # first True (top-most) because y increases downward
         mask_out[y_top : base_y_i + 1, x] = True
 
-    # Ensure base line is present.
+    # Ensure base line is present and *only* on the support span.
+    mask_out[base_y_i, :] = False
     mask_out[base_y_i, x_left : x_right + 1] = True
 
     return (mask_out.astype(np.uint8) * 255), int(base_y_i)
@@ -246,6 +280,15 @@ def main() -> None:
         type=int,
         default=0,
         help="Min number of foreground pixels in a column to consider it for base detection. 0 uses 1%% of image height.",
+    )
+    ap.add_argument(
+        "--base-span-height-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional filter for base x-span detection: keep only base-touching columns "
+            "whose vertical extent is >= frac*max_height. Helps remove speckle noise touching the base."
+        ),
     )
     ap.add_argument("--simplify-eps", type=float, default=2.0, help="RDP simplification epsilon [px]. 0 disables.")
 
@@ -343,6 +386,7 @@ def main() -> None:
             base_method=str(args.base_method),
             base_quantile=float(args.base_quantile),
             min_col_fg=int(args.base_min_col_fg),
+            span_height_frac=float(args.base_span_height_frac),
             force_base_y_px=base_y_for_span,
         )
         if not np.isfinite(base_y):

@@ -1,0 +1,106 @@
+{
+  "name": "lie_best_fit_v4_svgtrace_refmap_y706050_q010_alphaMin1e-3",
+  "description": "Best-fit effective parameters for the Lie (Li et al. 2020, BIT27491) deformation benchmark using manually traced Inkscape SVG outlines (Video S1). This calibration uses transport_mode=refmap (alpha mapped by displacement), an interior dx quantile (q=0.1), and continuity-based experimental tracking to avoid multi-intersection jumps. NOTE: these are effective poroelastic surrogate parameters and are not directly comparable to the Oldroyd-B PF parameters in the paper.",
+  "reference": {
+    "paper_doi": "10.1002/bit.27491",
+    "video_s1": "examples/biofilms/benchmarks/lie/additional_data/bit27491-sup-0001-si_v1.avi",
+    "svg_dir": "examples/biofilms/benchmarks/lie/svg_fles",
+    "exp_target_csv": "examples/biofilms/benchmarks/lie/exp_s1_dx_leftmost_svgtrace_y706050_q010_base_cont.csv",
+    "alpha0_polygon_mm_csv": "examples/biofilms/benchmarks/lie/biofilm_exp_s1_frame0_polygon_mm_svgtrace_q010_base_cont.csv",
+    "optimizer_run_dir": "out/_lie_opt_refmap_y706050_q010_alphaMin1e-3/run_ce3675a8bf90"
+  },
+  "experimental_extraction": {
+    "scale_mode": "base_frame0",
+    "block_w_mm": 1.0,
+    "m_per_px": 1.906818e-06,
+    "dx_intersection": "leftmost",
+    "dx_quantile": 0.1,
+    "track_mode": "continuity",
+    "max_jump_mm": 0.2,
+    "y_fracs": [0.7, 0.6, 0.5],
+    "notes": "The SVG series currently has 160 frames (missing frame_0123.svg). The extractor skips missing frames; add the missing SVG for a complete per-frame exp outline series."
+  },
+  "geometry_m": {
+    "L": 0.015,
+    "H": 0.01,
+    "block_w": 0.001,
+    "block_h": 0.003,
+    "block_xc": 0.0075
+  },
+  "flow": {
+    "rho_f": 1000.0,
+    "mu_f": 0.001,
+    "u_avg": 0.0006,
+    "t_ramp": 8.0
+  },
+  "indicator_transport": {
+    "transport_mode": "refmap",
+    "D_alpha": 0.0,
+    "alpha_advection_form": "refmap",
+    "alpha_ch_M": 0.0,
+    "alpha_ch_gamma": 0.0,
+    "alpha_ch_eps": 0.0002,
+    "alpha_ch_mobility": "degenerate"
+  },
+  "mixture_viscosity": {
+    "mu_b_model": "mu",
+    "mu_b_fluid": 30494.0
+  },
+  "skeleton_effective_params": {
+    "solid_model": "linear",
+    "G_b": 0.009681986388903573,
+    "mu_b": 0.021821724704999892,
+    "nu": 0.49,
+    "kappa_inv": 1000000000.0,
+    "restrict_skeleton_dofs": true,
+    "restrict_skeleton_alpha_min": 0.001
+  },
+  "numerics": {
+    "dt": 1.0,
+    "t_final": 20.0,
+    "theta": 1.0,
+    "newton_tol": 3e-06,
+    "max_it": 25,
+    "snes_accept_factor": 3.0,
+    "allow_dt_reduction": true,
+    "dt_min": 0.1,
+    "dt_reduction_factor": 0.5,
+    "stop_on_steady": true,
+    "steady_tol": 1e-12,
+    "backend": "cpp",
+    "quadrature_order_q": 4,
+    "mesh_cells": {
+      "nx": 40,
+      "ny": 20,
+      "nx_left": 14,
+      "nx_mid": 12,
+      "nx_right": 14,
+      "ny_bottom": 4,
+      "ny_top": 16
+    }
+  },
+  "fit_metrics": {
+    "rmse_total_um": 18.29363,
+    "rmse_lines_um": {
+      "line1": 19.39514,
+      "line2": 21.93036,
+      "line3": 12.11854
+    },
+    "mae_total_um": 15.32234,
+    "mae_lines_um": {
+      "line1": 16.21745,
+      "line2": 19.26297,
+      "line3": 10.48661
+    },
+    "relative_errors_percent": {
+      "line1": 25.1,
+      "line2": 27.9,
+      "line3": 18.3,
+      "total": 24.1
+    },
+    "notes": "Metrics computed by examples/biofilms/benchmarks/lie/compare_exp_sim_timeseries_dx.py for out/_lie_refmap_y706050_best_vtk_dt1 (same physics/params as the optimizer run). Relative error uses the paper's 'every second datum' convention as implemented in the script."
+  },
+  "repro_command_fit": "conda run --no-capture-output -n fenicsx python -u examples/biofilms/benchmarks/lie/lie_synthetic_deformation_one_domain.py --backend cpp --transport-mode refmap --alpha0-file examples/biofilms/benchmarks/lie/biofilm_exp_s1_frame0_polygon_mm_svgtrace_q010_base_cont.csv --alpha0-scale 1e-3 --alpha0-align block --restrict-skeleton-dofs --restrict-skeleton-alpha-min 0.001 --G-b 9.682e-3 --mu-b 2.182e-2 --kappa-inv 1e9 --mu-b-model mu --mu-b-fluid 30494 --solid-model linear --u-avg 6e-4 --t-ramp 8 --dt 1 --t-final 20 --allow-dt-reduction --dt-min 0.1 --dt-reduction-factor 0.5 --stop-on-steady --steady-tol 1e-12 --nx 40 --ny 20 --nx-left 14 --nx-mid 12 --nx-right 14 --ny-bottom 4 --ny-top 16 --q 4 --vtk-every 0 --alpha-ch-M 0 --alpha-ch-gamma 0 --dx-intersection leftmost --dx-quantile 0.1 --y-fracs 0.7,0.6,0.5 --out-dir out/_lie_best_fit_v4_svgtrace_refmap",
+  "repro_command_overlay": "conda run --no-capture-output -n fenicsx python -u examples/biofilms/benchmarks/lie/lie_synthetic_deformation_one_domain.py --backend cpp --transport-mode refmap --alpha0-file examples/biofilms/benchmarks/lie/biofilm_exp_s1_frame0_polygon_mm_svgtrace_q010_base_cont.csv --alpha0-scale 1e-3 --alpha0-align block --restrict-skeleton-dofs --restrict-skeleton-alpha-min 0.001 --G-b 9.682e-3 --mu-b 2.182e-2 --kappa-inv 1e9 --mu-b-model mu --mu-b-fluid 30494 --solid-model linear --u-avg 6e-4 --t-ramp 8 --dt 1 --t-final 20 --nx 40 --ny 20 --nx-left 14 --nx-mid 12 --nx-right 14 --ny-bottom 4 --ny-top 16 --q 4 --vtk-every 1 --alpha-ch-M 0 --alpha-ch-gamma 0 --dx-intersection leftmost --dx-quantile 0.1 --y-fracs 0.7,0.6,0.5 --out-dir out/_lie_refmap_y706050_best_vtk_dt1 && python -u examples/biofilms/benchmarks/lie/make_overlay_video_exp_sim_svgtrace.py --sim-dir out/_lie_refmap_y706050_best_vtk_dt1"
+}
+

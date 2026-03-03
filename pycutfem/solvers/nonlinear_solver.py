@@ -302,6 +302,18 @@ class NewtonParameters:
     newton_tol: float = 1e-8            # ‖R‖_∞ convergence threshold
     newton_rtol: float = 0.0           # optional relative tolerance (‖R‖_∞ ≤ rtol·‖R₀‖_∞)
     max_newton_iter: int = 20           # hard cap on inner Newton iterations
+    # PETSc SNES robustness: when SNES returns a best iterate but reports a
+    # non-converged reason (e.g. line-search divergence), optionally accept the
+    # step if the reported ‖F‖ is still "close enough" to the absolute tolerance.
+    #
+    # - 0 disables this behavior (default; preserves strict rejection)
+    # - A value like 2 means accept if ‖F‖ ≤ 2*newton_tol.
+    #
+    # NOTE: SNES uses its own norm for ‖F‖ (typically an L2 norm of the residual
+    # vector), while `newton_tol` is documented as an infinity-norm threshold for
+    # the pure-Python Newton path. For SNES we interpret `newton_tol` as the
+    # absolute tolerance supplied via `snes_atol`.
+    accept_nonconverged_atol_factor: float = 0.0
     # Logging verbosity:
     #   0 = quiet (no per-step/iteration prints)
     #   1 = time-step summary only
@@ -1334,6 +1346,13 @@ class NewtonSolver:
             self._current_step_no = int(global_step_no)
             self._current_t = float(t_n)
             self._current_dt = float(dt)
+            # Clear last-step diagnostics (set by backend-specific Newton loops).
+            self._last_nonlinear_norm = None
+            self._last_nonlinear_norm_label = None
+            self._last_nonlinear_reason = None
+            self._last_nonlinear_update_inf = None
+            self._last_nonlinear_update_label = None
+            self._last_nonlinear_accepted = False
             try:
                 delta_U, converged, n_iters = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
             except Exception as e:
@@ -1509,7 +1528,43 @@ class NewtonSolver:
 
             delta_inf = float(np.linalg.norm(delta_U, ord=np.inf))
             if int(getattr(self.np, "print_level", 2) or 0) >= 1:
-                print(f"    Time step {global_step_no}: ΔU = {delta_inf:.2e}")
+                dom_name = None
+                try:
+                    dom = []
+                    for f_prev, f in zip(prev_functions, functions):
+                        df = np.asarray(f.nodal_values, dtype=float) - np.asarray(f_prev.nodal_values, dtype=float)
+                        dom.append((getattr(f, "name", type(f).__name__), float(np.linalg.norm(df.ravel(), ord=np.inf))))
+                    if dom:
+                        dom_name, _dom_val = max(dom, key=lambda t: t[1])
+                except Exception:
+                    dom_name = None
+
+                msg = (
+                    f"    Time step {global_step_no}: t={float(t_n + dt):.6e}s, dt={float(dt):.3e}, "
+                    f"nNewton={int(n_iters)}, ΔU_step∞ = {delta_inf:.2e}"
+                )
+                if dom_name:
+                    msg += f" (dom={dom_name})"
+                norm_val = getattr(self, "_last_nonlinear_norm", None)
+                norm_label = getattr(self, "_last_nonlinear_norm_label", None)
+                if norm_label and norm_val is not None:
+                    try:
+                        msg += f", {str(norm_label)} = {float(norm_val):.3e}"
+                    except Exception:
+                        pass
+                upd_val = getattr(self, "_last_nonlinear_update_inf", None)
+                upd_label = getattr(self, "_last_nonlinear_update_label", None)
+                if upd_label and upd_val is not None:
+                    try:
+                        msg += f", {str(upd_label)} = {float(upd_val):.3e}"
+                    except Exception:
+                        pass
+                reason = getattr(self, "_last_nonlinear_reason", None)
+                if reason is not None:
+                    msg += f", reason={reason}"
+                if bool(getattr(self, "_last_nonlinear_accepted", False)):
+                    msg += ", accepted=True"
+                print(msg)
             
             # Post-step refiner (VI clip) **before** promotion so prev matches clipped state
             if post_step_refiner is not None:
@@ -1566,6 +1621,15 @@ class NewtonSolver:
             # time/step counters before exiting so the final accepted step is
             # consistently recorded/exported by drivers.
             if time_params.stop_on_steady and step > 0 and delta_inf < time_params.steady_tol:
+                if int(getattr(self.np, "print_level", 2) or 0) >= 1:
+                    try:
+                        tol = float(getattr(time_params, "steady_tol", 0.0))
+                    except Exception:
+                        tol = float("nan")
+                    print(
+                        f"    Steady-state reached at t={float(t_n):.6e}s (step={int(global_step_no)}): "
+                        f"ΔU_step∞={float(delta_inf):.3e} < steady_tol={tol:.3e}; stopping (--stop-on-steady)."
+                    )
                 break
 
         elapsed = time.perf_counter() - t_start
@@ -1633,6 +1697,9 @@ class NewtonSolver:
             R_full[self.active_dofs] = R_red
             norm_R = np.linalg.norm(R_full, ord=np.inf)
             norm_hist.append(float(norm_R))
+            # Expose convergence diagnostics to the outer time-stepper.
+            self._last_nonlinear_norm = float(norm_R)
+            self._last_nonlinear_norm_label = "|R|_∞"
 
             # Optional matrix diagnostics (expensive; debug-only).
             if os.getenv("PYCUTFEM_MATRIX_STATS", "").lower() in {"1", "true", "yes"}:
@@ -4347,6 +4414,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
             hi = self._XU.getArray(readonly=True)
             x0_red = np.minimum(np.maximum(x0_red, lo), hi)
 
+        x0_red_guess = np.asarray(x0_red, dtype=float).copy()
         self._x_red.setValues(idx, x0_red, addv=PETSc.InsertMode.INSERT_VALUES)
         self._x_red.assemblyBegin(); self._x_red.assemblyEnd()
 
@@ -4355,19 +4423,50 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._snes.solve(None, self._x_red)
         reason = int(self._snes.getConvergedReason())
         converged = reason > 0
+        accepted = False
         n_iters = int(self._snes.getIterationNumber())
+        try:
+            fnorm = float(self._snes.getFunctionNorm())
+        except Exception:
+            fnorm = float("nan")
+        # Expose convergence diagnostics to the outer time-stepper.
+        self._last_nonlinear_norm = float(fnorm)
+        self._last_nonlinear_norm_label = "‖F‖"
+        self._last_nonlinear_reason = int(reason)
         if not converged:
             try:
                 fnorm = float(self._snes.getFunctionNorm())
             except Exception:
                 fnorm = float("nan")
+            accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+            atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
+            accept_step = bool(
+                accept_factor > 0.0
+                and atol > 0.0
+                and np.isfinite(fnorm)
+                and fnorm <= accept_factor * atol
+            )
             print(
                 f"    [warn] SNES did not converge (reason={reason}, iters={n_iters}, ‖F‖={fnorm:.3e}). "
                 "Continuing with best iterate."
             )
+            if accept_step:
+                print(
+                    f"    [warn] Accepting SNES best iterate since ‖F‖={fnorm:.3e} ≤ {accept_factor:g}·atol "
+                    f"(atol={atol:.3e})."
+                )
+                converged = True
+                accepted = True
 
         # Write back the absolute solution (not an increment)
         x_fin = self._x_red.getArray(readonly=True)
+        try:
+            dx_inf = float(np.linalg.norm(np.asarray(x_fin, dtype=float) - x0_red_guess, ord=np.inf))
+        except Exception:
+            dx_inf = float("nan")
+        self._last_nonlinear_update_inf = float(dx_inf)
+        self._last_nonlinear_update_label = "Δx_snes∞"
+        self._last_nonlinear_accepted = bool(accepted)
         if getattr(self, "constraints", None) is not None:
             master_ids = np.asarray(self.constraints.master_ids, dtype=int)
             new_master = x0_full[master_ids].copy()

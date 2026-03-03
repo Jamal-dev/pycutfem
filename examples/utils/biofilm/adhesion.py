@@ -41,15 +41,23 @@ def _epsilon(v):
     return _c(0.5) * (grad(v) + grad(v).T)
 
 
-def mu_mixture(alpha, phi, *, mu_f, mu_b_model: str = "phi_mu"):
+def mu_mixture(alpha, phi, *, mu_f, mu_b=None, mu_b_model: str = "phi_mu"):
     mu_b_model = str(mu_b_model).strip().lower()
     if mu_b_model in {"mu", "const", "constant"}:
-        mu_b = mu_f
+        mu_b_eff = mu_f
     elif mu_b_model in {"phi_mu", "phi*mu", "phi"}:
-        mu_b = phi * mu_f
+        mu_b_eff = phi * mu_f
+    elif mu_b_model in {"alpha_mu", "alpha", "mu_b", "biofilm_mu", "biofilm"}:
+        if mu_b is None:
+            raise ValueError("mu_b_model='alpha_mu' requires mu_b to be provided.")
+        mu_b_eff = mu_b
+    elif mu_b_model in {"alpha_phi_mu", "alpha_phi", "alpha*phi_mu", "alpha*phi*mu"}:
+        if mu_b is None:
+            raise ValueError("mu_b_model='alpha_phi_mu' requires mu_b to be provided.")
+        mu_b_eff = phi * mu_b
     else:
         raise ValueError(f"Unknown mu_b_model {mu_b_model!r}.")
-    return _one_minus(alpha) * mu_f + alpha * mu_b
+    return _one_minus(alpha) * mu_f + alpha * mu_b_eff
 
 
 @dataclass(frozen=True)

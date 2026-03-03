@@ -246,3 +246,5 @@ examples/biofilms/benchmarks/*.tex
 examples/biofilms/**/*.tex
 examples/biofilms/**/*.pdf
 examples/biofilms/**/*.avi
+examples/biofilms/**/*.png
+examples/biofilms/**/*.jpg
