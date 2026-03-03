@@ -160,7 +160,7 @@ Mapping from a physical recession speed `F_det` (mm/day) to `D_det_prev` (1/day)
 
 ## Driver added
 
-- `examples/biofilms/benchmarks/dadu/duddu2009_detachment_2d.py`
+- `examples/biofilms/benchmarks/dadu/duddu2009_detachment_2d_seq.py` (recommended for reproducible Fig. 6-style runs)
   - Solves a reduced 2D one-domain setup with active unknowns:
     - `v,p,alpha` (+ optionally `S`),
     - with `u,vS,phi` frozen (to avoid poroelastic/mechanics differences).
@@ -170,40 +170,104 @@ Mapping from a physical recession speed `F_det` (mm/day) to `D_det_prev` (1/day)
     - `A_alpha` (≈ biofilm area), and `A_alpha_window` (optional sub-window, for Fig. 7-style comparisons),
     - `L_max`, `L_mean` (from an `alpha>=0.5` thickness profile),
     - `S_min`, `S_max` (if substrate is solved).
+  - Writes a final-time VTK snapshot (`solution_*.vtu`) per model and an `outdir/summary.csv` for quick comparisons.
 
 ## How to run (recommended)
 
-Coarse smoke test (fast, checks that each model runs):
+### Critical notes for Duddu (2009) Fig. 6 comparisons
+
+- **Disable Allen–Cahn regularization for 2D detachment comparisons**:
+  - With the default `--ac-M 1 --ac-gamma 1`, the Allen–Cahn term introduces curvature-driven
+    shrinkage (mean-curvature flow) that is *not* part of Duddu’s level-set interface evolution.
+  - In practice this makes colonies collapse to ~0 quickly (see `results/duddu2009_fig6_smoke/`).
+  - For Fig. 6-style detachment-law comparisons, run with:
+    - `--ac-M 0 --ac-gamma 0`
+- **Paper units**: the paper specifies `U_avg` in **mm/s** and viscosity in **Pa·s**.
+  - The drivers use **days** as the internal time unit, so use the convenience flags:
+    - `--U-avg-mm-s 0.83` (converted to mm/day)
+    - `--mu-tau-Pa-s 0.001` (converted to Pa·day by dividing by 86400)
+  - You can keep `--mu-f` larger (e.g. `1.0`) for numerical convenience since (for constant μ) the
+    Stokes velocity field is independent of μ; `--mu-tau-Pa-s` is what matters for detachment τ.
+
+### Coarse smoke test (fast, checks that each model runs)
 
 ```bash
 conda run --no-capture-output -n fenicsx \
-  python examples/biofilms/benchmarks/dadu/duddu2009_detachment_2d.py \
+  python examples/biofilms/benchmarks/dadu/duddu2009_detachment_2d_seq.py \
   --backend cpp --linear-solver petsc \
   --models shear,l2,poly \
   --nx 60 --ny 15 --q 2 \
   --dt 0.1 --t-final 0.5 \
-  --adaptive-dt --dt-min 1e-3
+  --adaptive-dt --dt-min 1e-3 \
+  --ac-M 0 --ac-gamma 0
 ```
 
-Paper-like Fig. 6 setup (you will likely need to tune `dt`, mesh, and solver options for stability):
+### Paper-like Fig. 6 setup (Duddu 2009: L=2mm, H=0.5mm, r0=25μm, U_avg=0.83mm/s)
 
 ```bash
 conda run --no-capture-output -n fenicsx \
-  python examples/biofilms/benchmarks/dadu/duddu2009_detachment_2d.py \
+  python examples/biofilms/benchmarks/dadu/duddu2009_detachment_2d_seq.py \
   --backend cpp --linear-solver petsc \
   --models shear,l2,poly \
   --L 2.0 --H 0.5 --r0 0.025 \
   --k-l2 0.28 --k0-poly 0.00707 --shear-a 0.1 --shear-b 0.5 \
-  --dt 0.05 --t-final 7.0 \
-  --adaptive-dt --dt-min 1e-3 \
-  --vtk-every 20
+  --dt 0.2 --t-final 7.0 \
+  --adaptive-dt --dt-min 0.01 \
+  --no-line-search \
+  --ac-M 0 --ac-gamma 0 \
+  --U-avg-mm-s 0.83 \
+  --mu-f 1.0 --mu-tau-Pa-s 0.001 \
+  --kappa-inv 1e6 \
+  --vtk-every 999999 --flush-csv-every 5 \
+  --mu-max 1.0 \
+  --outdir examples/biofilms/benchmarks/dadu/results/fig6_noac_units_mu1_t7_ny30
 ```
 
 Notes:
 
+- `--mu-max 1.0` is a simple calibration so the polynomial detachment case remains present at `t=7d`
+  (with the default `mu_max=0.5` it can erode away too aggressively in this reduced setup).
 - If Newton struggles with the saddle-point (Stokes) block, try `--no-line-search`.
 - The very first run per detachment model compiles C++ kernels and can take ~O(1 min) per model; subsequent runs hit the cache.
 - To quickly compare runs, use `examples/biofilms/benchmarks/dadu/plot_duddu2009_detachment_2d.py` (plots `A_alpha` by default).
+
+### Postprocess into Fig. 6-style plots
+
+After the run completes (writes `model=*/solution_*.vtu`), run:
+
+```bash
+conda run --no-capture-output -n fenicsx \
+  python examples/biofilms/benchmarks/dadu/postprocess_duddu2009_fig6.py \
+  --outdir examples/biofilms/benchmarks/dadu/results/fig6_noac_units_mu1_t7_ny30 \
+  --models shear,l2,poly \
+  --save-prefix fig6_noac_units_mu1_t7_ny30
+```
+
+This writes:
+
+- `*_alpha_contours.png` (alpha contours with the `alpha=0.5` interface)
+- `*_interface_only.png` (paper-style interface-only panel)
+- `*_thickness_profiles.png` (upper-envelope thickness profile from the `alpha=0.5` contour)
+
+and prints per-colony peak heights.
+
+### Reference results (mu_max=1.0 run)
+
+For the run in `examples/biofilms/benchmarks/dadu/results/fig6_noac_units_mu1_t7_ny30/`:
+
+- `summary.csv` at `t=7d`:
+  - `A_alpha(l2)=3.679e-02`, `A_alpha(shear)=1.399e-02`, `A_alpha(poly)=4.718e-03`
+- Per-colony peak heights at `t=7d` from `postprocess_duddu2009_fig6.py` (mm):
+  - `shear`: `0.02593, 0.03369, 0.03555, 0.03366, 0.03970`
+  - `l2`:    `0.06432, 0.06382, 0.06432, 0.06382, 0.06432`
+  - `poly`:  `0.01774, 0.01528, 0.01774, 0.01528, 0.01774`
+
+Generated plots:
+
+- `fig6_noac_units_mu1_t7_ny30_alpha_contours.png`
+- `fig6_noac_units_mu1_t7_ny30_interface_only.png`
+- `fig6_noac_units_mu1_t7_ny30_thickness_profiles.png`
+- `plot_A_alpha.png` (optional time-series plot)
 
 ## Quick sanity result (coarse 2D run)
 

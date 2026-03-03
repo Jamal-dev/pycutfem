@@ -248,9 +248,13 @@ def _build_detachment_rate(
     *,
     model_key: str,
     mu_f: Constant,
+    mu_tau: Constant,
     v_prev: VectorFunction,
+    alpha_prev: Function,
     eps_alpha: float,
     ac_enabled: bool,
+    shear_tau_model: str,
+    normal_eta: float,
     # shear params (paper)
     shear_a: float,
     shear_b: float,
@@ -291,16 +295,43 @@ def _build_detachment_rate(
         )
 
     if key == "shear":
-        # Robust shear/stress proxy (used elsewhere in one_domain.py):
-        #   tau_rate = ||eps(v)||_F,   tau_stress ≈ 2 mu_f tau_rate.
-        # Detachment speed: V_det = a * |tau_stress|^b.
+        # Detachment speed: V_det = a * |tau|^b.
+        #
+        # Two tau models:
+        # - "proxy":  |tau| ≈ 2*mu_tau*||eps(v)||_F (robust, used elsewhere in one_domain.py)
+        # - "paper":  tau as in Duddu (2009) Eq. (5), using n ~ grad(alpha)/||grad(alpha)||
         b = float(shear_b)
         if b <= 0.0:
             raise ValueError(f"shear_b must be > 0; got {b}.")
-        tau2 = inner(0.5 * (grad(v_prev) + grad(v_prev).T), 0.5 * (grad(v_prev) + grad(v_prev).T))
-        tau_rate = (tau2 + Constant(float(max(shear_eta, 0.0)))) ** Constant(0.5)
-        tau = Constant(2.0) * mu_f * tau_rate
-        V = Constant(float(shear_a)) * (tau ** Constant(b))
+        tau_model = str(shear_tau_model or "").strip().lower()
+        if tau_model in {"proxy", "eps", "strain"}:
+            epsv = 0.5 * (grad(v_prev) + grad(v_prev).T)
+            tau_proxy = Constant(2.0) * mu_tau * (inner(epsv, epsv) ** Constant(0.5))
+            tau = tau_proxy
+        elif tau_model in {"paper", "duddu", "interface"}:
+            # pycutfem's `grad(...)` is scalar-only (returns a 2-vector). For a vector
+            # field v=(u,v) we therefore build the needed derivatives componentwise.
+            du_dx = grad(v_prev[0])[0]
+            du_dy = grad(v_prev[0])[1]
+            dv_dx = grad(v_prev[1])[0]
+            dv_dy = grad(v_prev[1])[1]
+
+            ga = grad(alpha_prev)
+            ga2 = inner(ga, ga)
+            denom = (ga2 + Constant(float(max(normal_eta, 0.0)))) ** Constant(0.5)
+            nx = ga[0] / denom
+            ny = ga[1] / denom
+
+            term1 = (nx * nx - ny * ny) * (du_dy + dv_dx)
+            term2 = Constant(2.0) * nx * ny * (dv_dy - du_dx)
+            tau = mu_tau * (term1 + term2)
+        else:
+            raise ValueError(
+                f"Unknown --shear-tau-model={shear_tau_model!r}. Use 'paper' or 'proxy'."
+            )
+
+        tau_abs = (tau * tau + Constant(float(max(shear_eta, 0.0)))) ** Constant(0.5)
+        V = Constant(float(shear_a)) * (tau_abs ** Constant(b))
         return c_speed_to_rate * V * c_inv_4eps
 
     raise ValueError(f"Unknown detachment model {model_key!r}.")
@@ -446,12 +477,19 @@ def _run_one_model(
     ac_enabled = (ac_M != 0.0) and (ac_gamma != 0.0)
 
     mu_f = Constant(float(args.mu_f))
+    mu_tau = mu_f
+    if getattr(args, "mu_tau", None) is not None:
+        mu_tau = Constant(float(args.mu_tau))
     D_det_prev = _build_detachment_rate(
         model_key=model.key,
         mu_f=mu_f,
+        mu_tau=mu_tau,
         v_prev=v_n,
+        alpha_prev=alpha_n,
         eps_alpha=eps_alpha,
         ac_enabled=ac_enabled,
+        shear_tau_model=str(args.shear_tau_model),
+        normal_eta=float(args.normal_eta),
         shear_a=float(args.shear_a),
         shear_b=float(args.shear_b),
         shear_eta=float(args.shear_eta),
@@ -722,6 +760,12 @@ def main() -> None:
 
     # Inlet flow (mm/day). (Use small values for robustness; this driver uses Stokes by default.)
     ap.add_argument("--U-avg", type=float, default=10.0, help="Average inlet velocity (mm/day).")
+    ap.add_argument(
+        "--U-avg-mm-s",
+        type=float,
+        default=None,
+        help="Average inlet velocity (mm/s); converted to mm/day and overrides --U-avg.",
+    )
 
     # Initial colonies (mm)
     ap.add_argument("--n-colonies", type=int, default=5)
@@ -748,6 +792,24 @@ def main() -> None:
     # One-domain coefficients / regularization
     ap.add_argument("--phi-b", type=float, default=0.3, help="Frozen biofilm porosity phi (inside alpha≈1).")
     ap.add_argument("--mu-f", type=float, default=1.0, help="Dynamic viscosity coefficient used in Stokes–Brinkman (unit-consistent with your scaling).")
+    ap.add_argument(
+        "--mu-f-Pa-s",
+        type=float,
+        default=None,
+        help="Dynamic viscosity mu_f in Pa*s; converted to Pa*day (divide by 86400) and overrides --mu-f.",
+    )
+    ap.add_argument(
+        "--mu-tau",
+        type=float,
+        default=None,
+        help="Dynamic viscosity used only for detachment shear-stress (defaults to --mu-f).",
+    )
+    ap.add_argument(
+        "--mu-tau-Pa-s",
+        type=float,
+        default=None,
+        help="Dynamic viscosity used only for detachment shear-stress in Pa*s; converted to Pa*day (divide by 86400) and overrides --mu-tau/--mu-f.",
+    )
     ap.add_argument("--mu-b-model", type=str, default="mu", choices=("mu", "phi_mu"))
     ap.add_argument("--kappa-inv", type=float, default=1.0e3, help="Inverse permeability (bigger -> more solid-like biofilm).")
 
@@ -775,7 +837,15 @@ def main() -> None:
     # Detachment: shear-based (paper form) and height-based (paper constants)
     ap.add_argument("--shear-a", type=float, default=0.1, help="Shear detachment prefactor a in V=a|tau|^b (speed units).")
     ap.add_argument("--shear-b", type=float, default=0.5, help="Shear detachment exponent b.")
-    ap.add_argument("--shear-eta", type=float, default=1.0e-12, help="Regularization added inside sqrt for tau.")
+    ap.add_argument(
+        "--shear-tau-model",
+        type=str,
+        default="paper",
+        choices=("paper", "proxy"),
+        help="How to compute tau for shear detachment: Duddu (2009) Eq.(5) ('paper') or robust proxy ('proxy').",
+    )
+    ap.add_argument("--normal-eta", type=float, default=1.0e-12, help="Regularization used in n=grad(alpha)/sqrt(|grad(alpha)|^2+eta).")
+    ap.add_argument("--shear-eta", type=float, default=1.0e-12, help="Regularization added inside sqrt for |tau| (units: Pa^2).")
     ap.add_argument("--k-l2", type=float, default=0.28, help="Height detachment V=k*l^2 (mm/day).")
     ap.add_argument("--k0-poly", type=float, default=0.00707, help="Polynomial detachment base coefficient (mm/day).")
 
@@ -804,6 +874,17 @@ def main() -> None:
     ap.add_argument("--vi-active-tol", type=float, default=0.0)
 
     args = ap.parse_args()
+
+    # Convenience overrides for paper-like units while keeping "day" as the internal time unit.
+    seconds_per_day = 86400.0
+    if getattr(args, "U_avg_mm_s", None) is not None:
+        args.U_avg = float(args.U_avg_mm_s) * seconds_per_day
+    if getattr(args, "mu_f_Pa_s", None) is not None:
+        # Use "day" as the internal time unit (v in mm/day), so convert
+        # mu [Pa*s] -> mu [Pa*day] by dividing by seconds_per_day.
+        args.mu_f = float(args.mu_f_Pa_s) / seconds_per_day
+    if getattr(args, "mu_tau_Pa_s", None) is not None:
+        args.mu_tau = float(args.mu_tau_Pa_s) / seconds_per_day
 
     models = _parse_models(args.models)
     outdir = Path(args.outdir)

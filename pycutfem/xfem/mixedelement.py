@@ -103,3 +103,33 @@ class XFEMMixedElement:
         ]
         return out
 
+    # ------------------------------------------------------------------
+    # Vectorized reference tables (used by JIT kernel arg builders)
+    # ------------------------------------------------------------------
+    def _eval_scalar_basis_many(self, field: str, xi_arr, eta_arr) -> np.ndarray:
+        """
+        Match MixedElement._eval_scalar_basis_many but return a widened table for
+        enriched fields (base values in the first block, zeros in the enriched block).
+        """
+        field = str(field)
+        tab = self.base._eval_scalar_basis_many(field, xi_arr, eta_arr)  # (n_qp, n0)
+        if self._enrich_kind_by_field.get(field) is None:
+            return tab
+        nqp, n0 = tab.shape
+        out = np.zeros((nqp, 2 * n0), dtype=float)
+        out[:, :n0] = tab
+        return out
+
+    def _eval_scalar_grad_many(self, field: str, xi_arr, eta_arr) -> np.ndarray:
+        """
+        Match MixedElement._eval_scalar_grad_many but return a widened table for
+        enriched fields (base gradients in the first block, zeros in the enriched block).
+        """
+        field = str(field)
+        tab = self.base._eval_scalar_grad_many(field, xi_arr, eta_arr)  # (n_qp, n0, 2)
+        if self._enrich_kind_by_field.get(field) is None:
+            return tab
+        nqp, n0, dim = tab.shape
+        out = np.zeros((nqp, 2 * n0, dim), dtype=float)
+        out[:, :n0, :] = tab
+        return out

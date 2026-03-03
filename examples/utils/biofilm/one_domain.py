@@ -322,9 +322,20 @@ def build_biofilm_one_domain_forms(
     u_extension_mode: str = "l2",
     gamma_u_pin: float = 0.0,
     D_alpha: float = 0.0,
-    # How to advect the diffuse indicator α by the skeleton velocity v^S:
-    # - "advective" (default): v^S·∇α   (indicator/level-set style; preserves α along characteristics)
-    # - "conservative":        div(α v^S) = v^S·∇α + α div(v^S)
+    # Which velocity advects the diffuse indicator α:
+    # - "vS"  (default): skeleton velocity v^S
+    # - "v":            fluid velocity v
+    # - "mix":          mixture/volume velocity F = C v + B v^S, with C=(1-α)+αφ and B=α(1-φ)
+    # - "mix_biofilm":  like "mix", but gate the fluid part (Cv) by a smooth α-cutoff to
+    #                   avoid advecting α through the pure-fluid (α≈0) region
+    alpha_advect_with: str = "vS",
+    # Parameters used by alpha_advect_with="mix_biofilm":
+    # gate C by  g(α) = α^m / (α^m + α0^m). For α≫α0, g≈1; for α≪α0, g≈0.
+    alpha_mix_gate_alpha0: float = 0.1,
+    alpha_mix_gate_power: int = 4,
+    # How to advect α by the chosen velocity field:
+    # - "advective" (default): u·∇α   (indicator/level-set style; preserves α along characteristics)
+    # - "conservative":        div(α u) = u·∇α + α div(u)
     alpha_advection_form: str = "advective",
     # Allen–Cahn / phase-field interface regularization for α
     alpha_cahn_M: float = 0.0,
@@ -340,6 +351,10 @@ def build_biofilm_one_domain_forms(
     #   using degenerate mobility.
     alpha_cahn_conservative_mode: str = "unknown",
     alpha_cahn_mobility: str = "constant",
+    # Optional mobility floor for degenerate Allen–Cahn: M(α)=M0(α(1-α)+m_floor)
+    # This can prevent complete "deactivation" of the phase-field regularization in
+    # bulk regions when α drifts away from {0,1} due to numerical diffusion.
+    alpha_cahn_mobility_floor: float = 0.0,
     lambda_alpha_k=None,
     lambda_alpha_n=None,
     dlambda_alpha=None,
@@ -430,6 +445,7 @@ def build_biofilm_one_domain_forms(
     gamma_vS: float | None = None,
     vS_extension_mode: str | None = None,
     gamma_vS_pin: float | None = None,
+    gamma_vS_pin_power: int = 2,
     # Scaling for the kinematic constraint (improves monolithic conditioning).
     kinematics_scale: float | None = None,
 ) -> BiofilmOneDomainForms:
@@ -1027,6 +1043,9 @@ def build_biofilm_one_domain_forms(
     else:
         gamma_vS_pin_eff = 0.0 if gamma_vS_pin is None else float(gamma_vS_pin)
     gamma_vS_pin_c = _c(float(gamma_vS_pin_eff))
+    vS_pin_pow = int(gamma_vS_pin_power)
+    if vS_pin_pow < 1:
+        raise ValueError(f"gamma_vS_pin_power must be >= 1; got {gamma_vS_pin_power}.")
     a_skel_visco_alpha = None
     a_skel_visco_vS = None
     if float(solid_visco_eta) != 0.0:
@@ -1071,8 +1090,10 @@ def build_biofilm_one_domain_forms(
                 h_u = MeshSize()
                 inv_h2 = _c(1.0) / (h_u * h_u)
                 w_pin = _one_minus(alpha_k)
-                w_pin2 = w_pin * w_pin
-                r_skeleton += gamma_vS_pin_c * inv_h2 * w_pin2 * dot(vS_k, vS_test) * dx
+                w_pin_pow = w_pin
+                for _ in range(vS_pin_pow - 1):
+                    w_pin_pow = w_pin_pow * w_pin
+                r_skeleton += gamma_vS_pin_c * inv_h2 * w_pin_pow * dot(vS_k, vS_test) * dx
         else:
             raise ValueError(f"Unknown vS_extension_mode {vS_extension_mode!r}.")
 
@@ -1137,10 +1158,19 @@ def build_biofilm_one_domain_forms(
                 h_u = MeshSize()
                 inv_h2 = _c(1.0) / (h_u * h_u)
                 w_pin = _one_minus(alpha_k)
-                w_pin2 = w_pin * w_pin
-                dw_pin2 = (-_c(2.0) * w_pin) * dalpha
+                w_pin_pow = w_pin
+                for _ in range(vS_pin_pow - 1):
+                    w_pin_pow = w_pin_pow * w_pin
+
+                if vS_pin_pow == 1:
+                    w_pin_pow_m1 = _c(1.0)
+                else:
+                    w_pin_pow_m1 = w_pin
+                    for _ in range(vS_pin_pow - 2):
+                        w_pin_pow_m1 = w_pin_pow_m1 * w_pin
+                dw_pin_pow = (-_c(float(vS_pin_pow)) * w_pin_pow_m1) * dalpha
                 a_skel += gamma_vS_pin_c * inv_h2 * (
-                    dw_pin2 * dot(vS_k, vS_test) + w_pin2 * dot(dvS, vS_test)
+                    dw_pin_pow * dot(vS_k, vS_test) + w_pin_pow * dot(dvS, vS_test)
                 ) * dx
         else:
             raise ValueError(f"Unknown vS_extension_mode {vS_extension_mode!r}.")
@@ -1594,6 +1624,80 @@ def build_biofilm_one_domain_forms(
     # Surface-localized erosion/detachment sink is -D_det_prev δ(α) on the RHS,
     # so it enters the residual with a + sign (same convention as the X source).
     surf_coef_prev = D_det_prev + crack_coef_prev
+
+    # Select the advecting velocity for α.
+    #
+    # NOTE: For the "mix" option we intentionally use *lagged* (C_n,B_n) weights so the
+    # α advection remains linear for frozen (v,vS) updates in operator-splitting schemes.
+    adv_with_key = str(alpha_advect_with or "vS").strip().lower()
+    if adv_with_key in {"vs", "v^s", "v_s", "s", "skeleton", "solid"}:
+        adv_u_k = vS_k
+        adv_u_n = vS_n
+        adv_u_k_comp = [vS_k[i] for i in range(int(dim))]
+        adv_u_n_comp = [vS_n[i] for i in range(int(dim))]
+        dadv_u = dvS
+        div_adv_u_k = div_vS_k
+        div_adv_u_n = div_vS_n
+        d_div_adv_u = div_dvS
+    elif adv_with_key in {"v", "fluid"}:
+        adv_u_k = v_k
+        adv_u_n = v_n
+        adv_u_k_comp = [v_k[i] for i in range(int(dim))]
+        adv_u_n_comp = [v_n[i] for i in range(int(dim))]
+        dadv_u = dv
+        div_adv_u_k = div(v_k)
+        div_adv_u_n = div(v_n)
+        d_div_adv_u = div(dv)
+    elif adv_with_key in {"mix", "mixture", "f", "flux", "volume"}:
+        # Mixture/volume velocity: F = C v + B vS,  with C=(1-α)+αφ and B=α(1-φ).
+        adv_u_k = C_n * v_k + B_n * vS_k
+        adv_u_n = C_n * v_n + B_n * vS_n
+        adv_u_k_comp = [C_n * v_k[i] + B_n * vS_k[i] for i in range(int(dim))]
+        adv_u_n_comp = [C_n * v_n[i] + B_n * vS_n[i] for i in range(int(dim))]
+        dadv_u = C_n * dv + B_n * dvS
+
+        # Conservative form needs div(F). Expand div(C_n v + B_n vS) explicitly.
+        div_adv_u_k = C_n * div(v_k) + dot(gradC_n, v_k) + B_n * div_vS_k + dot(gradB_n, vS_k)
+        div_adv_u_n = divCv_n + divBvS_n
+        d_div_adv_u = C_n * div(dv) + dot(gradC_n, dv) + B_n * div_dvS + dot(gradB_n, dvS)
+    elif adv_with_key in {"mix_biofilm", "mix-biofilm", "mix_bio", "mixbio", "mix_cutoff", "mixcutoff"}:
+        # Mixture/volume velocity but *gated* so we do not advect α through the pure fluid
+        # where α≈0 (which can create a spurious thin "chimney" when v has strong outflow).
+        #
+        # We gate only the C-part by a smooth cutoff g(α^n), leaving the biofilm-side
+        # velocity unchanged for α above the cutoff:
+        #   F_adv = (g C) v + B vS,   g(α) = α^m / (α^m + α0^m).
+        alpha0 = float(alpha_mix_gate_alpha0)
+        if not (0.0 < alpha0 < 1.0):
+            raise ValueError(f"alpha_mix_gate_alpha0 must be in (0,1); got {alpha0}.")
+        m_pow = int(alpha_mix_gate_power)
+        if m_pow < 1:
+            raise ValueError(f"alpha_mix_gate_power must be >= 1; got {m_pow}.")
+
+        # Build α^m with repeated multiplication (keeps backend compatibility).
+        a_pow = alpha_n
+        for _ in range(m_pow - 1):
+            a_pow = a_pow * alpha_n
+        a0_pow = _c(alpha0 ** float(m_pow))
+        gate_n = a_pow / (a_pow + a0_pow + _c(1.0e-12))
+
+        Cg_n = gate_n * C_n
+        gradCg_n = grad(Cg_n)
+
+        adv_u_k = Cg_n * v_k + B_n * vS_k
+        adv_u_n = Cg_n * v_n + B_n * vS_n
+        adv_u_k_comp = [Cg_n * v_k[i] + B_n * vS_k[i] for i in range(int(dim))]
+        adv_u_n_comp = [Cg_n * v_n[i] + B_n * vS_n[i] for i in range(int(dim))]
+        dadv_u = Cg_n * dv + B_n * dvS
+
+        div_adv_u_k = Cg_n * div(v_k) + dot(gradCg_n, v_k) + B_n * div_vS_k + dot(gradB_n, vS_k)
+        div_adv_u_n = Cg_n * div(v_n) + dot(gradCg_n, v_n) + divBvS_n
+        d_div_adv_u = Cg_n * div(dv) + dot(gradCg_n, dv) + B_n * div_dvS + dot(gradB_n, dvS)
+    else:
+        raise ValueError(
+            f"Unknown alpha_advect_with={alpha_advect_with!r}. Use 'vS' (default), 'v', 'mix', or 'mix_biofilm'."
+        )
+
     adv_key = str(alpha_advection_form).strip().lower()
     if adv_key in {"advective", "nonconservative", "v.grad", "v·grad", "vgrad"}:
         adv_key = "advective"
@@ -1605,16 +1709,16 @@ def build_biofilm_one_domain_forms(
         )
 
     if adv_key == "advective":
-        # Indicator advection: ∂t α + vS·∇α = ...
-        adv_alpha_k = dot(grad(alpha_k), vS_k)
-        adv_alpha_n = dot(grad(alpha_n), vS_n)
+        # Indicator advection: ∂t α + u·∇α = ...
+        adv_alpha_k = dot(grad(alpha_k), adv_u_k)
+        adv_alpha_n = dot(grad(alpha_n), adv_u_n)
     else:
-        # Conservative advection: ∂t α + div(α vS) = ...
+        # Conservative advection: ∂t α + div(α u) = ...
         #
-        # We implement div(α vS) as vS·∇α + α div(vS) to avoid relying on backend
-        # support for `div(alpha*vS)` in all code paths.
-        adv_alpha_k = dot(grad(alpha_k), vS_k) + alpha_k * div_vS_k
-        adv_alpha_n = dot(grad(alpha_n), vS_n) + alpha_n * div_vS_n
+        # We implement div(α u) as u·∇α + α div(u) to avoid relying on backend
+        # support for `div(alpha*u)` in all code paths.
+        adv_alpha_k = dot(grad(alpha_k), adv_u_k) + alpha_k * div_adv_u_k
+        adv_alpha_n = dot(grad(alpha_n), adv_u_n) + alpha_n * div_adv_u_n
     f_alpha_k += th * (adv_alpha_k - G_k * alpha_k * _one_minus(alpha_k) + surf_coef_prev * delta_k)
     f_alpha_k += one_m_th * (adv_alpha_n - G_n * alpha_n * _one_minus(alpha_n) + surf_coef_prev * delta_n)
 
@@ -1654,7 +1758,10 @@ def build_biofilm_one_domain_forms(
             mob_prime_k = _c(0.0) * alpha_k
         elif mob_key in {"degenerate", "deg", "alpha(1-alpha)", "alpha*(1-alpha)", "a(1-a)"}:
             # Degenerate mobility: M(α)=M0 α(1-α)
-            mob_k = alpha_k * _one_minus(alpha_k)
+            floor = float(alpha_cahn_mobility_floor)
+            if floor < 0.0:
+                raise ValueError(f"alpha_cahn_mobility_floor must be >= 0; got {floor}.")
+            mob_k = alpha_k * _one_minus(alpha_k) + _c(floor)
             mob_prime_k = _one_minus(_c(2.0) * alpha_k)  # d/dα [α(1-α)] = 1-2α
             M_ac_k = M_alpha_c * mob_k
             dM_ac = M_alpha_c * mob_prime_k * dalpha
@@ -1734,10 +1841,13 @@ def build_biofilm_one_domain_forms(
 
     a_alpha = alpha_test * (dalpha * inv_dt) * dx
     if adv_key == "advective":
-        a_alpha += alpha_test * th * (dot(grad(alpha_k), dvS) + dot(grad(dalpha), vS_k)) * dx
+        a_alpha += alpha_test * th * (dot(grad(alpha_k), dadv_u) + dot(grad(dalpha), adv_u_k)) * dx
     else:
         a_alpha += alpha_test * th * (
-            dot(grad(alpha_k), dvS) + dot(grad(dalpha), vS_k) + dalpha * div_vS_k + alpha_k * div_dvS
+            dot(grad(alpha_k), dadv_u)
+            + dot(grad(dalpha), adv_u_k)
+            + dalpha * div_adv_u_k
+            + alpha_k * d_div_adv_u
         ) * dx
     # δ[ (D_det_prev + crack_coef_prev) * δ(α) ] = (D_det_prev + crack_coef_prev) * δ'(α) δα
     # (surf coefficients are lagged).
@@ -1792,17 +1902,19 @@ def build_biofilm_one_domain_forms(
         a_mu_alpha += -mu_alpha_test * ((gamma_ch_c / eps_ch_c) * Wpp_ch_k * dalpha) * dx
 
     # Optional consistent stabilization for advection-dominated α (useful with D_alpha=0).
-    # - SUPG: τ (vS·∇w) R_alpha
-    # - CIP:  γ h^3 (1/dt + |vS|/h) <[∂_n α],[∂_n w]>_F on interior facets
+    # - SUPG: τ (u·∇w) R_alpha
+    # - CIP:  γ h^3 (1/dt + |u|/h) <[∂_n α],[∂_n w]>_F on interior facets
     #
     # Notes:
-    # - We use lagged vS_n in τ and in the test-direction to keep the Jacobian
+    # - We use a lagged advector u_n in τ and in the test-direction to keep the Jacobian
     #   consistent (no extra u-coupling from the stabilization weights).
     # - CIP only affects regions where ∇α is non-zero (i.e. the diffuse interface),
     #   and remains consistent because [∂_n α]=0 for smooth α.
     if float(alpha_supg) != 0.0:
         h_a = MeshSize()
-        vmag2 = vS_n[0] * vS_n[0] + vS_n[1] * vS_n[1]
+        vmag2 = _c(0.0)
+        for j in range(int(dim)):
+            vmag2 += adv_u_n_comp[j] * adv_u_n_comp[j]
         vmag = _sqrt(vmag2 + _c(1.0e-12))
         denom = (_c(2.0) * inv_dt) * (_c(2.0) * inv_dt) + (_c(2.0) * vmag / (h_a + _c(1.0e-12))) * (
             _c(2.0) * vmag / (h_a + _c(1.0e-12))
@@ -1811,23 +1923,25 @@ def build_biofilm_one_domain_forms(
         # Avoid `dot(grad(test), v)` due to current dot/left_dot limitations in the
         # C++ backend for some mixed expression types; expand componentwise.
         g_test = grad(alpha_test)
-        w_supg = g_test[0] * vS_n[0] + g_test[1] * vS_n[1]
+        w_supg = _c(0.0)
+        for j in range(int(dim)):
+            w_supg += g_test[j] * adv_u_n_comp[j]
         r_alpha += tau_supg * w_supg * f_alpha_k * dx
 
         df_alpha_k = dalpha * inv_dt
         if adv_key == "advective":
             df_alpha_k += th * (
-                dot(grad(alpha_k), dvS)
-                + dot(grad(dalpha), vS_k)
+                dot(grad(alpha_k), dadv_u)
+                + dot(grad(dalpha), adv_u_k)
                 - (dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic)
                 + d_surf
             )
         else:
             df_alpha_k += th * (
-                dot(grad(alpha_k), dvS)
-                + dot(grad(dalpha), vS_k)
-                + dalpha * div_vS_k
-                + alpha_k * div_dvS
+                dot(grad(alpha_k), dadv_u)
+                + dot(grad(dalpha), adv_u_k)
+                + dalpha * div_adv_u_k
+                + alpha_k * d_div_adv_u
                 - (dG * alpha_k * _one_minus(alpha_k) + G_k * dalpha_logistic)
                 + d_surf
             )

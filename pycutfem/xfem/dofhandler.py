@@ -290,6 +290,7 @@ class XFEMDofHandler:
         fixed_base: set[int] = set()
         if assign_order:
             for (f, gd) in assign_order:
+                kind = (self.enrichment_spec.kind_by_field.get(str(f)) or "").lower().strip()
                 try:
                     phi = float(level_set(base_coords[int(gd), :]))
                 except Exception:
@@ -301,14 +302,15 @@ class XFEMDofHandler:
                 if enr is None:
                     continue
 
-                # (1) φ≈0: α=0 for shifted-Heaviside
-                if abs(phi) <= float(tol):
+                # (1) φ≈0: α=0 for shifted-Heaviside only.
+                # For weak-discontinuity (shifted |φ|) enrichment, the enriched
+                # basis is not identically inactive at φ=0 nodes.
+                if kind == "heaviside" and abs(phi) <= float(tol):
                     fixed.add(int(enr))
                     continue
 
                 # (2) One-sided assemblies: fix Heaviside enriched DOFs with α=0
                 # on the assembled side.
-                kind = (self.enrichment_spec.kind_by_field.get(str(f)) or "").lower().strip()
                 if active_side is not None and kind == "heaviside":
                     # In a one-sided assembly (e.g. only Ω⁺), the trace on that side
                     # depends on u_i and a_i only through their sum/difference for
@@ -458,22 +460,87 @@ class XFEMDofHandler:
         cut_me = self.xfem_mixed_element()
         n_union_cut = int(cut_me.n_dofs_local)
 
-        # Alpha per element per enriched field (constant over QPs on a given side)
-        alpha_by_field: Dict[str, np.ndarray] = {}
-        for f in enriched_fields:
-            n0 = int(base_me._n_basis[f])
-            alpha_by_field[f] = np.zeros((eids.size, n0), dtype=float)
+        kind_by_field = {
+            str(k): (None if v is None else str(v).lower().strip())
+            for k, v in dict(self.enrichment_spec.kind_by_field).items()
+        }
+        heaviside_fields = [f for f in enriched_fields if kind_by_field.get(f) == "heaviside"]
+        abs_fields = [f for f in enriched_fields if kind_by_field.get(f) == "abs"]
 
-        for ie, eid in enumerate(eids.tolist()):
-            pos_masks, neg_masks = _hfa.build_side_masks_by_field(
-                self.base, enriched_fields, int(eid), level_set, tol=SIDE.tol
-            )
-            for f in enriched_fields:
-                pm = pos_masks.get(f)
-                nm = neg_masks.get(f)
-                if pm is None or nm is None:
-                    continue
-                alpha_by_field[f][ie, :] = alpha_from_side_masks(pm, nm, side=side)
+        # Alpha per element per shifted-Heaviside enriched field (constant over QPs on a given side)
+        alpha_by_field: Dict[str, np.ndarray] = {}
+        if heaviside_fields:
+            for f in heaviside_fields:
+                n0 = int(base_me._n_basis[f])
+                alpha_by_field[f] = np.zeros((eids.size, n0), dtype=float)
+
+            for ie, eid in enumerate(eids.tolist()):
+                pos_masks, neg_masks = _hfa.build_side_masks_by_field(
+                    self.base, heaviside_fields, int(eid), level_set, tol=SIDE.tol
+                )
+                for f in heaviside_fields:
+                    pm = pos_masks.get(f)
+                    nm = neg_masks.get(f)
+                    if pm is None or nm is None:
+                        continue
+                    alpha_by_field[f][ie, :] = alpha_from_side_masks(pm, nm, side=side)
+
+        # Precompute |phi| and ∇̂|phi| at cut-volume QPs for shifted-|phi| enrichment.
+        phis = None
+        abs_phi_q = None
+        grad_abs_phi_ref = None
+        if abs_fields:
+            phis = np.asarray(geo.get("phis"))
+            if phis.size == 0:
+                raise RuntimeError("Cut-volume geo is missing 'phis' needed for abs enrichment.")
+            abs_phi_q = np.abs(phis)  # (nE,nQ)
+
+            qref = np.asarray(geo.get("qref"))
+            J_inv = np.asarray(geo.get("J_inv"))
+            if qref.size == 0 or J_inv.size == 0:
+                raise RuntimeError("Cut-volume geo is missing 'qref'/'J_inv' needed for abs enrichment.")
+
+            # Physical gradient ∇phi at QPs.
+            grad_phi_phys = np.zeros((eids.size, qref.shape[1], 2), dtype=float)
+            if hasattr(level_set, "gradients_on_element_many"):
+                for ie, eid in enumerate(eids.tolist()):
+                    xi = qref[ie, :, 0]
+                    eta = qref[ie, :, 1]
+                    grad_phi_phys[ie, :, :] = np.asarray(
+                        level_set.gradients_on_element_many(int(eid), xi, eta), dtype=float
+                    )
+            elif hasattr(level_set, "gradient_on_element"):
+                for ie, eid in enumerate(eids.tolist()):
+                    for q in range(int(qref.shape[1])):
+                        xi = float(qref[ie, q, 0])
+                        eta = float(qref[ie, q, 1])
+                        grad_phi_phys[ie, q, :] = np.asarray(
+                            level_set.gradient_on_element(int(eid), (xi, eta)), dtype=float
+                        ).ravel()
+            elif hasattr(level_set, "gradient"):
+                qp_phys = np.asarray(geo.get("qp_phys"))
+                for ie in range(eids.size):
+                    for q in range(int(qref.shape[1])):
+                        grad_phi_phys[ie, q, :] = np.asarray(
+                            level_set.gradient(np.asarray(qp_phys[ie, q, :], dtype=float)), dtype=float
+                        ).ravel()
+            else:
+                raise NotImplementedError("abs enrichment requires level_set gradient evaluation.")
+
+            # Invert J_inv (2x2) at each QP: J = inv(J_inv)
+            A = np.asarray(J_inv, dtype=float)  # (nE,nQ,2,2)
+            detA = A[:, :, 0, 0] * A[:, :, 1, 1] - A[:, :, 0, 1] * A[:, :, 1, 0]
+            detA_safe = np.where(np.abs(detA) > 0.0, detA, 1.0)
+            J = np.empty_like(A)
+            J[:, :, 0, 0] = A[:, :, 1, 1] / detA_safe
+            J[:, :, 0, 1] = -A[:, :, 0, 1] / detA_safe
+            J[:, :, 1, 0] = -A[:, :, 1, 0] / detA_safe
+            J[:, :, 1, 1] = A[:, :, 0, 0] / detA_safe
+
+            grad_phi_ref = np.einsum("eqi,eqij->eqj", grad_phi_phys, J, optimize=True)  # (nE,nQ,2)
+            # Deterministic sign at φ=0 (measure-zero in volume integrals).
+            sgn = np.where(phis >= 0.0, 1.0, -1.0).astype(float)
+            grad_abs_phi_ref = grad_phi_ref * sgn[:, :, None]
 
         # Replace gdofs_map with XFEM-local layout (per field base+enr)
         geo["gdofs_map"] = np.vstack([self.get_elemental_dofs_xfem(int(eid)) for eid in eids]).astype(np.int64)
@@ -499,10 +566,49 @@ class XFEMDofHandler:
             g_ext[:, :, cut_sl.start : cut_sl.start + n0, :] = g_loc
 
             # enriched part (if requested)
-            if f in alpha_by_field:
-                a = alpha_by_field[f]  # (nE, n0)
-                b_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = b_loc * a[:, None, :]
-                g_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, :] = g_loc * a[:, None, :, None]
+            if f in enriched_fields:
+                kind = kind_by_field.get(f)
+                if kind == "heaviside":
+                    a = alpha_by_field.get(f)  # (nE, n0)
+                    if a is None:
+                        raise RuntimeError(f"Missing Heaviside alpha table for field '{f}'.")
+                    b_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = b_loc * a[:, None, :]
+                    g_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, :] = g_loc * a[:, None, :, None]
+                elif kind == "abs":
+                    if abs_phi_q is None or grad_abs_phi_ref is None or phis is None:
+                        raise RuntimeError("Internal error: abs enrichment tables were not prepared.")
+                    # |phi_i| at the element-local DOF nodes (P1/Q1 expected).
+                    abs_phi_i = np.zeros((eids.size, n0), dtype=float)
+                    mesh = self.base.mixed_element.mesh
+                    phi_nodes = None
+                    try:
+                        phi_nodes = np.asarray(level_set.evaluate_on_nodes(mesh), dtype=float).ravel()
+                    except Exception:
+                        phi_nodes = None
+                    base_coords = None
+                    try:
+                        base_coords = np.asarray(self.base.get_all_dof_coords(), dtype=float)
+                    except Exception:
+                        base_coords = None
+                    dof_to_node = getattr(self.base, "_dof_to_node_map", {}) or {}
+                    for ie, eid in enumerate(eids.tolist()):
+                        gdofs_loc = np.asarray(self.base.element_maps[f][int(eid)], dtype=int).ravel()
+                        for j, gd in enumerate(gdofs_loc.tolist()):
+                            nid = dof_to_node.get(int(gd), (None, None))[1]
+                            if nid is not None and phi_nodes is not None and 0 <= int(nid) < phi_nodes.size:
+                                abs_phi_i[ie, j] = abs(float(phi_nodes[int(nid)]))
+                            else:
+                                if base_coords is None:
+                                    raise RuntimeError("Missing DOF coordinates for abs enrichment fallback.")
+                                abs_phi_i[ie, j] = abs(float(level_set(base_coords[int(gd), :])))
+
+                    D = abs_phi_q[:, :, None] - abs_phi_i[:, None, :]  # (nE,nQ,n0)
+                    b_enr = b_loc * D
+                    b_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = b_enr
+                    g_enr = g_loc * D[:, :, :, None] + b_loc[:, :, :, None] * grad_abs_phi_ref[:, :, None, :]
+                    g_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, :] = g_enr
+                else:
+                    raise NotImplementedError(f"Unknown enrichment kind '{kind}' for field '{f}'.")
 
             geo[f"b_{f}"] = b_ext
             geo[f"g_{f}"] = g_ext
@@ -521,9 +627,28 @@ class XFEMDofHandler:
                 d_loc = dtab[:, :, base_sl]
                 d_ext = np.zeros((nE, nQ, n_union_cut), dtype=dtab.dtype)
                 d_ext[:, :, cut_sl.start : cut_sl.start + n0] = d_loc
-                if f in alpha_by_field:
-                    a = alpha_by_field[f]
-                    d_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = d_loc * a[:, None, :]
+                if f in enriched_fields:
+                    kind = kind_by_field.get(f)
+                    if kind == "heaviside":
+                        a = alpha_by_field.get(f)
+                        if a is None:
+                            raise RuntimeError(f"Missing Heaviside alpha table for field '{f}'.")
+                        d_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = d_loc * a[:, None, :]
+                    elif kind == "abs":
+                        if (int(dx), int(dy)) == (1, 0):
+                            d_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = geo[f"g_{f}"][
+                                :, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, 0
+                            ]
+                        elif (int(dx), int(dy)) == (0, 1):
+                            d_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = geo[f"g_{f}"][
+                                :, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, 1
+                            ]
+                        else:
+                            raise NotImplementedError(
+                                f"abs enrichment derivative d{dx}{dy}_{f} not implemented (order>1)."
+                            )
+                    else:
+                        raise NotImplementedError(f"Unknown enrichment kind '{kind}' for field '{f}'.")
                 geo[key] = d_ext
 
         return geo
@@ -557,7 +682,9 @@ class XFEMDofHandler:
 
         Notes
         -----
-        This implementation currently supports shifted-Heaviside enrichment only.
+        This implementation supports shifted-Heaviside and shifted-|phi| ("abs")
+        enrichment. For "abs", enriched gradients on Γ are approximated (sufficient
+        for penalty-only Dirichlet terms on Γ).
         """
         enriched_fields = list(self.enrichment_spec.enriched_fields)
         if not enriched_fields:
@@ -574,10 +701,17 @@ class XFEMDofHandler:
                 deformation=deformation,
             )
 
-        # Ensure we only claim support for what we actually implement.
+        kind_by_field = {
+            str(k): (None if v is None else str(v).lower().strip())
+            for k, v in dict(self.enrichment_spec.kind_by_field).items()
+        }
+        supported = {"heaviside", "abs"}
         for f in enriched_fields:
-            if (self.enrichment_spec.kind_by_field.get(f) or "").lower().strip() != "heaviside":
-                raise NotImplementedError("Interface factors currently support only 'heaviside' XFEM enrichment.")
+            kind = kind_by_field.get(f)
+            if kind not in supported:
+                raise NotImplementedError(
+                    f"Interface factors do not support XFEM enrichment kind '{kind}' for field '{f}'."
+                )
 
         from pycutfem.xfem.enrichment import alpha_from_side_masks
 
@@ -597,6 +731,27 @@ class XFEMDofHandler:
         eids = np.asarray(geo_base.get("eids", []), dtype=int)
         if eids.size == 0:
             return geo_base
+
+        # Helpers for shifted-|phi| enrichment at interface QPs
+        have_abs = any(kind_by_field.get(f) == "abs" for f in enriched_fields)
+        abs_phi_q = None
+        phi_nodes = None
+        base_coords = None
+        dof_to_node = getattr(self.base, "_dof_to_node_map", {}) or {}
+        if have_abs and level_set is not None:
+            phis_if = np.asarray(geo_base.get("phis"))
+            if phis_if.size == 0:
+                raise RuntimeError("Interface geo is missing 'phis' needed for abs enrichment.")
+            abs_phi_q = np.abs(phis_if)  # (nE,nQ), should be ~0
+            mesh = self.base.mixed_element.mesh
+            try:
+                phi_nodes = np.asarray(level_set.evaluate_on_nodes(mesh), dtype=float).ravel()
+            except Exception:
+                phi_nodes = None
+            try:
+                base_coords = np.asarray(self.base.get_all_dof_coords(), dtype=float)
+            except Exception:
+                base_coords = None
 
         base_me = self.base.mixed_element
         cut_me = self.xfem_mixed_element()
@@ -647,14 +802,55 @@ class XFEMDofHandler:
                 b_ext = np.zeros((b_loc.shape[0], b_loc.shape[1], n_union_cut), dtype=btab.dtype)
                 b_ext[:, :, cut_sl.start : cut_sl.start + n0] = b_loc
                 if f in enriched_fields:
-                    b_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = b_loc
+                    kind = kind_by_field.get(f)
+                    if kind == "heaviside":
+                        b_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = b_loc
+                    elif kind == "abs":
+                        if abs_phi_q is None:
+                            raise RuntimeError("Internal error: abs_phi_q not prepared.")
+                        abs_phi_i = np.zeros((eids.size, n0), dtype=float)
+                        for ie, eid in enumerate(eids.tolist()):
+                            gdofs_loc = np.asarray(self.base.element_maps[f][int(eid)], dtype=int).ravel()
+                            for j, gd in enumerate(gdofs_loc.tolist()):
+                                nid = dof_to_node.get(int(gd), (None, None))[1]
+                                if nid is not None and phi_nodes is not None and 0 <= int(nid) < phi_nodes.size:
+                                    abs_phi_i[ie, j] = abs(float(phi_nodes[int(nid)]))
+                                else:
+                                    if base_coords is None:
+                                        raise RuntimeError("Missing DOF coordinates for abs enrichment fallback.")
+                                    abs_phi_i[ie, j] = abs(float(level_set(base_coords[int(gd), :])))
+                        D = abs_phi_q[:, :, None] - abs_phi_i[:, None, :]  # (nE,nQ,n0)
+                        b_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = b_loc * D
+                    else:
+                        raise NotImplementedError(f"Unknown enrichment kind '{kind}' for field '{f}'.")
                 out[b_key] = b_ext
             if gtab.size:
                 g_loc = gtab[:, :, base_sl, :]  # (nE,nQ,n0,2)
                 g_ext = np.zeros((g_loc.shape[0], g_loc.shape[1], n_union_cut, 2), dtype=gtab.dtype)
                 g_ext[:, :, cut_sl.start : cut_sl.start + n0, :] = g_loc
                 if f in enriched_fields:
-                    g_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, :] = g_loc
+                    kind = kind_by_field.get(f)
+                    if kind == "heaviside":
+                        g_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, :] = g_loc
+                    elif kind == "abs":
+                        # Approximation: treat ∇̂|phi| contribution as negligible on Γ.
+                        if abs_phi_q is None:
+                            raise RuntimeError("Internal error: abs_phi_q not prepared.")
+                        abs_phi_i = np.zeros((eids.size, n0), dtype=float)
+                        for ie, eid in enumerate(eids.tolist()):
+                            gdofs_loc = np.asarray(self.base.element_maps[f][int(eid)], dtype=int).ravel()
+                            for j, gd in enumerate(gdofs_loc.tolist()):
+                                nid = dof_to_node.get(int(gd), (None, None))[1]
+                                if nid is not None and phi_nodes is not None and 0 <= int(nid) < phi_nodes.size:
+                                    abs_phi_i[ie, j] = abs(float(phi_nodes[int(nid)]))
+                                else:
+                                    if base_coords is None:
+                                        raise RuntimeError("Missing DOF coordinates for abs enrichment fallback.")
+                                    abs_phi_i[ie, j] = abs(float(level_set(base_coords[int(gd), :])))
+                        D = abs_phi_q[:, :, None] - abs_phi_i[:, None, :]
+                        g_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, :] = g_loc * D[:, :, :, None]
+                    else:
+                        raise NotImplementedError(f"Unknown enrichment kind '{kind}' for field '{f}'.")
                 out[g_key] = g_ext
 
             # --- higher derivative tables (if present) ---
@@ -669,7 +865,27 @@ class XFEMDofHandler:
                 d_ext = np.zeros((d_loc.shape[0], d_loc.shape[1], n_union_cut), dtype=dtab.dtype)
                 d_ext[:, :, cut_sl.start : cut_sl.start + n0] = d_loc
                 if f in enriched_fields:
-                    d_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = d_loc
+                    kind = kind_by_field.get(f)
+                    if kind == "heaviside":
+                        d_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = d_loc
+                    elif kind == "abs":
+                        if abs_phi_q is None:
+                            raise RuntimeError("Internal error: abs_phi_q not prepared.")
+                        abs_phi_i = np.zeros((eids.size, n0), dtype=float)
+                        for ie, eid in enumerate(eids.tolist()):
+                            gdofs_loc = np.asarray(self.base.element_maps[f][int(eid)], dtype=int).ravel()
+                            for j, gd in enumerate(gdofs_loc.tolist()):
+                                nid = dof_to_node.get(int(gd), (None, None))[1]
+                                if nid is not None and phi_nodes is not None and 0 <= int(nid) < phi_nodes.size:
+                                    abs_phi_i[ie, j] = abs(float(phi_nodes[int(nid)]))
+                                else:
+                                    if base_coords is None:
+                                        raise RuntimeError("Missing DOF coordinates for abs enrichment fallback.")
+                                    abs_phi_i[ie, j] = abs(float(level_set(base_coords[int(gd), :])))
+                        D = abs_phi_q[:, :, None] - abs_phi_i[:, None, :]
+                        d_ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = d_loc * D
+                    else:
+                        raise NotImplementedError(f"Unknown enrichment kind '{kind}' for field '{f}'.")
                 out[d_key] = d_ext
 
             # --- restriction masks (pos/neg) ---
@@ -716,10 +932,22 @@ class XFEMDofHandler:
 
                     # Enriched block: α multipliers per side
                     if f in enriched_fields:
-                        a_pos = np.vstack([alpha_from_side_masks(m_pos_loc[i], m_neg_loc[i], side="+") for i in range(m_pos_loc.shape[0])])
-                        a_neg = np.vstack([alpha_from_side_masks(m_pos_loc[i], m_neg_loc[i], side="-") for i in range(m_pos_loc.shape[0])])
-                        rm_pos_ext[:, cut_sl.start + n0 : cut_sl.start + 2 * n0] = a_pos
-                        rm_neg_ext[:, cut_sl.start + n0 : cut_sl.start + 2 * n0] = a_neg
+                        kind = kind_by_field.get(f)
+                        if kind == "heaviside":
+                            a_pos = np.vstack(
+                                [alpha_from_side_masks(m_pos_loc[i], m_neg_loc[i], side="+") for i in range(m_pos_loc.shape[0])]
+                            )
+                            a_neg = np.vstack(
+                                [alpha_from_side_masks(m_pos_loc[i], m_neg_loc[i], side="-") for i in range(m_pos_loc.shape[0])]
+                            )
+                            rm_pos_ext[:, cut_sl.start + n0 : cut_sl.start + 2 * n0] = a_pos
+                            rm_neg_ext[:, cut_sl.start + n0 : cut_sl.start + 2 * n0] = a_neg
+                        elif kind == "abs":
+                            # shifted-|phi| enrichment is already baked into b_/g_/d.. tables.
+                            rm_pos_ext[:, cut_sl.start + n0 : cut_sl.start + 2 * n0] = 1.0
+                            rm_neg_ext[:, cut_sl.start + n0 : cut_sl.start + 2 * n0] = 1.0
+                        else:
+                            raise NotImplementedError(f"Unknown enrichment kind '{kind}' for field '{f}'.")
 
                     out[rm_pos_key] = rm_pos_ext
                     out[rm_neg_key] = rm_neg_ext
@@ -789,10 +1017,34 @@ class XFEMDofHandler:
                 need_o4=need_o4,
                 deformation=deformation,
             )
+        # If there are no enriched DOFs in the current classification (e.g. a fully
+        # mesh-aligned interface), assemble ghosts in the base layout to match the
+        # compiler's choice of mixed element.
+        if int(getattr(self, "n_enriched", lambda: 0)()) <= 0:
+            return self.base.precompute_ghost_factors(
+                ghost_edge_ids=ghost_edge_ids,
+                qdeg=qdeg,
+                level_set=level_set,
+                derivs=derivs,
+                allow_interface=allow_interface,
+                reuse=reuse,
+                need_hess=need_hess,
+                need_o3=need_o3,
+                need_o4=need_o4,
+                deformation=deformation,
+            )
 
-        for f in enriched_fields:
-            if (self.enrichment_spec.kind_by_field.get(f) or "").lower().strip() != "heaviside":
-                raise NotImplementedError("Ghost factors currently support only 'heaviside' XFEM enrichment.")
+        kind_by_field = {
+            f: str(self.enrichment_spec.kind_by_field.get(f) or "heaviside").lower().strip()
+            for f in enriched_fields
+        }
+        unsupported = [f for f, k in kind_by_field.items() if k not in {"heaviside", "abs"}]
+        if unsupported:
+            raise NotImplementedError(
+                "Ghost factors currently support only 'heaviside' and 'abs' XFEM enrichment "
+                f"(unsupported fields: {unsupported})."
+            )
+        abs_fields = {f for f, k in kind_by_field.items() if k == "abs"}
 
         from pycutfem.ufl.helpers import HelpersFieldAware as _hfa
         from pycutfem.core.sideconvention import SIDE
@@ -884,6 +1136,40 @@ class XFEMDofHandler:
                 )
             return mask_cache[eid]
 
+        # Precompute D = |phi(qp)| - |phi_i| factors for shifted-|phi| enrichment on facets.
+        # For interface-aligned edges, phi(qp)≈0 so D≈-|phi_i|, matching Duddu's shifted abs enrichment.
+        abs_D: Dict[tuple[str, str], np.ndarray] = {}
+        if abs_fields and (level_set is not None):
+            from pycutfem.core.levelset import phi_eval as _phi_eval
+
+            coords_all = np.asarray(self.base.get_all_dof_coords(), dtype=float)
+            phis_qp = np.asarray(geo_base.get("phis", np.zeros((edge_ids.size, 0), dtype=float)), dtype=float)
+            if phis_qp.ndim != 2:
+                phis_qp = np.zeros((edge_ids.size, 0), dtype=float)
+            abs_phi_qp = np.abs(phis_qp)  # (nE,nQ)
+
+            for fld in abs_fields:
+                base_sl = base_me.component_dof_slices[fld]
+                n0 = int(base_sl.stop - base_sl.start)
+                if n0 <= 0:
+                    continue
+
+                phi_i_pos = np.empty((edge_ids.size, n0), dtype=float)
+                phi_i_neg = np.empty((edge_ids.size, n0), dtype=float)
+                for i in range(edge_ids.size):
+                    pe = int(pos_ids[i])
+                    ne = int(neg_ids[i])
+                    gpos = np.asarray(self.base.element_maps[fld][pe], dtype=np.int64)
+                    gneg = np.asarray(self.base.element_maps[fld][ne], dtype=np.int64)
+                    if gpos.size != n0 or gneg.size != n0:
+                        raise RuntimeError(f"Unexpected local DOF count for field {fld!r} on ghost edge.")
+                    for j in range(n0):
+                        phi_i_pos[i, j] = abs(float(_phi_eval(level_set, coords_all[int(gpos[j])])))
+                        phi_i_neg[i, j] = abs(float(_phi_eval(level_set, coords_all[int(gneg[j])])))
+
+                abs_D[(fld, "pos")] = abs_phi_qp[:, :, None] - phi_i_pos[:, None, :]
+                abs_D[(fld, "neg")] = abs_phi_qp[:, :, None] - phi_i_neg[:, None, :]
+
         # Fill maps and masks per edge
         for i in range(edge_ids.size):
             union = union_lists[i]
@@ -957,10 +1243,14 @@ class XFEMDofHandler:
                             mneg_local_same_elem = neg_masks_elem_pos.get(fld)
                             if mneg_local_same_elem is None:
                                 mneg_local_same_elem = np.zeros_like(mpos_loc, dtype=float)
-                            a_pos = alpha_from_side_masks(mpos_loc, mneg_local_same_elem, side="+")
                             cols_enr = pm[i, n0 : 2 * n0]
                             ok2 = (cols_enr >= 0) & (cols_enr < max_union)
-                            masks_by_field[f"restrict_mask_{fld}_pos"][i, cols_enr[ok2]] = np.asarray(a_pos, dtype=float)[ok2]
+                            kind = kind_by_field.get(fld, "heaviside")
+                            if kind == "heaviside":
+                                a_pos = alpha_from_side_masks(mpos_loc, mneg_local_same_elem, side="+")
+                                masks_by_field[f"restrict_mask_{fld}_pos"][i, cols_enr[ok2]] = np.asarray(a_pos, dtype=float)[ok2]
+                            else:  # abs enrichment: D factor is baked into the basis
+                                masks_by_field[f"restrict_mask_{fld}_pos"][i, cols_enr[ok2]] = 1.0
 
                     if mneg_loc is not None and mneg_loc.shape[0] == n0:
                         cols = nm[i, :n0]
@@ -978,10 +1268,14 @@ class XFEMDofHandler:
                             pm_ne = pos_m_ne.get(fld)
                             nm_ne = neg_m_ne.get(fld)
                             if pm_ne is not None and nm_ne is not None:
-                                a_neg = alpha_from_side_masks(pm_ne, nm_ne, side="-")
                                 cols_enr = nm[i, n0 : 2 * n0]
                                 ok2 = (cols_enr >= 0) & (cols_enr < max_union)
-                                masks_by_field[f"restrict_mask_{fld}_neg"][i, cols_enr[ok2]] = np.asarray(a_neg, dtype=float)[ok2]
+                                kind = kind_by_field.get(fld, "heaviside")
+                                if kind == "heaviside":
+                                    a_neg = alpha_from_side_masks(pm_ne, nm_ne, side="-")
+                                    masks_by_field[f"restrict_mask_{fld}_neg"][i, cols_enr[ok2]] = np.asarray(a_neg, dtype=float)[ok2]
+                                else:  # abs enrichment: D factor is baked into the basis
+                                    masks_by_field[f"restrict_mask_{fld}_neg"][i, cols_enr[ok2]] = 1.0
 
         # Expand r** basis/derivative tables to the XFEM element-union layout.
         basis_tables: Dict[str, np.ndarray] = {}
@@ -1003,14 +1297,28 @@ class XFEMDofHandler:
                         ext = np.zeros((loc.shape[0], loc.shape[1], n_loc_cut), dtype=tab.dtype)
                         ext[:, :, cut_sl.start : cut_sl.start + n0] = loc
                         if fld in enriched_fields:
-                            ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = loc
+                            kind = kind_by_field.get(fld, "heaviside")
+                            if kind == "abs":
+                                D = abs_D.get((fld, side_tag))
+                                if D is None:
+                                    raise RuntimeError("Missing abs enrichment factors for ghost-edge precompute.")
+                                ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = loc * D
+                            else:
+                                ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0] = loc
                         basis_tables[key] = ext
                     elif tab.ndim == 4:
                         loc = tab[:, :, base_sl, :]
                         ext = np.zeros((loc.shape[0], loc.shape[1], n_loc_cut, loc.shape[3]), dtype=tab.dtype)
                         ext[:, :, cut_sl.start : cut_sl.start + n0, :] = loc
                         if fld in enriched_fields:
-                            ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, :] = loc
+                            kind = kind_by_field.get(fld, "heaviside")
+                            if kind == "abs":
+                                D = abs_D.get((fld, side_tag))
+                                if D is None:
+                                    raise RuntimeError("Missing abs enrichment factors for ghost-edge precompute.")
+                                ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, :] = loc * D[:, :, :, None]
+                            else:
+                                ext[:, :, cut_sl.start + n0 : cut_sl.start + 2 * n0, :] = loc
                         basis_tables[key] = ext
 
         # Assemble final output, reusing base geometry.

@@ -248,6 +248,18 @@ def main() -> None:
     ap.add_argument("--dt", type=float, default=0.05)
     ap.add_argument("--t-final", type=float, default=7.0)
     ap.add_argument("--theta", type=float, default=1.0)
+    ap.add_argument(
+        "--adaptive-dt",
+        action="store_true",
+        help="Enable adaptive time-step reduction on Newton failure (recommended for long runs).",
+    )
+    ap.add_argument("--dt-min", type=float, default=0.0, help="Minimum dt when using --adaptive-dt (0 disables).")
+    ap.add_argument(
+        "--dt-reduction-factor",
+        type=float,
+        default=0.5,
+        help="dt <- factor*dt on failed step when using --adaptive-dt.",
+    )
 
     # Alpha interface parameters (mm)
     ap.add_argument("--l0", type=float, default=0.10, help="Initial thickness (mm).")
@@ -561,6 +573,9 @@ def main() -> None:
             t0=0.0,
             stop_on_steady=False,
             on_dt_change=_on_dt_change,
+            allow_dt_reduction=bool(getattr(args, "adaptive_dt", False)),
+            dt_min=float(getattr(args, "dt_min", 0.0) or 0.0),
+            dt_reduction_factor=float(getattr(args, "dt_reduction_factor", 0.5) or 0.5),
         ),
     )
 

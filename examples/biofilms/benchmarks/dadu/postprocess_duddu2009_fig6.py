@@ -5,7 +5,7 @@ Reads the final VTK snapshot (solution_*.vtu) for each detachment model folder p
 `duddu2009_detachment_2d_seq.py` and generates:
 
   - alpha contour plots with the alpha=0.5 interface overlaid
-  - thickness profiles l(x) computed from alpha>=alpha_half
+  - thickness profiles l(x) computed from the alpha=alpha_half interface
   - per-colony peak heights (printed to stdout)
 
 All outputs are written under the provided --outdir.
@@ -36,7 +36,7 @@ def _triangulation_from_quads(points_xy: np.ndarray, quads: np.ndarray) -> tuple
     return used, tris
 
 
-def _thickness_profile(
+def _thickness_profile_nodal(
     *,
     points_xy: np.ndarray,
     alpha: np.ndarray,
@@ -59,6 +59,41 @@ def _thickness_profile(
     return np.asarray(x_levels, dtype=float), np.asarray(l, dtype=float)
 
 
+def _interface_vertices_from_contour_set(contour_set) -> np.ndarray:
+    # TriContourSet uses linear interpolation on the triangulation; this gives sub-mesh
+    # interface coordinates, avoiding the "node-quantized" thickness artifacts.
+    try:
+        segs = contour_set.allsegs[0]  # one contour level
+    except Exception:
+        segs = []
+    if not segs:
+        return np.zeros((0, 2), dtype=float)
+    arrays: list[np.ndarray] = []
+    for s in segs:
+        a = np.asarray(s, dtype=float)
+        if a.size == 0:
+            continue
+        arrays.append(a.reshape(-1, 2))
+    if not arrays:
+        return np.zeros((0, 2), dtype=float)
+    verts = np.vstack(arrays)
+    return np.asarray(verts, dtype=float)
+
+
+def _thickness_profile_from_vertices(*, verts_xy: np.ndarray, x_round: int = 10) -> tuple[np.ndarray, np.ndarray]:
+    verts = np.asarray(verts_xy, dtype=float)
+    if verts.ndim != 2 or verts.shape[1] != 2 or verts.size == 0:
+        return np.asarray([]), np.asarray([])
+    x = np.round(verts[:, 0], decimals=int(x_round))
+    y = verts[:, 1]
+    x_levels = np.unique(x)
+    l = np.zeros_like(x_levels, dtype=float)
+    for i, xv in enumerate(x_levels):
+        yy = y[x == xv]
+        l[i] = float(np.max(yy)) if yy.size else 0.0
+    return np.asarray(x_levels, dtype=float), np.asarray(l, dtype=float)
+
+
 def _colony_centers(*, L: float, r0: float, n_colonies: int) -> np.ndarray:
     margin = max(2.0 * float(r0), 1.0e-12)
     if float(L) <= 2.0 * margin:
@@ -71,6 +106,13 @@ def main() -> None:
     ap.add_argument("--outdir", type=str, required=True, help="Run output directory (contains model=*/ folders).")
     ap.add_argument("--models", type=str, default="shear,l2,poly", help="Comma list: shear,l2,poly,none or 'all'.")
     ap.add_argument("--alpha-half", type=float, default=0.5, help="Threshold used for thickness l(x).")
+    ap.add_argument(
+        "--thickness-mode",
+        type=str,
+        default="contour",
+        choices=("contour", "nodal"),
+        help="How to compute l(x): from alpha=alpha_half contour ('contour') or nodal alpha>=alpha_half ('nodal').",
+    )
     ap.add_argument("--L", type=float, default=2.0, help="Domain length (mm), used for colony centers.")
     ap.add_argument("--r0", type=float, default=0.025, help="Initial colony radius (mm), used for colony centers.")
     ap.add_argument("--n-colonies", type=int, default=5, help="Number of initial colonies, used for colony centers.")
@@ -100,8 +142,9 @@ def main() -> None:
         raise SystemExit(f"matplotlib is required ({exc}).")
 
     # Load meshes / profiles
-    alpha_fields: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    alpha_fields: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
     l_profiles: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    interface_verts: dict[str, np.ndarray] = {}
 
     for m in models:
         model_dir = outdir / f"model={m}"
@@ -117,11 +160,7 @@ def main() -> None:
         used, tris = _triangulation_from_quads(pts_xy, quads)
         alpha = np.asarray(mesh.point_data["alpha"], dtype=float).ravel()
 
-        alpha_fields[m] = (pts_xy, tris, alpha)
-        x_prof, l_prof = _thickness_profile(
-            points_xy=pts_xy, alpha=alpha, used_point_ids=used, alpha_half=float(args.alpha_half)
-        )
-        l_profiles[m] = (x_prof, l_prof)
+        alpha_fields[m] = (pts_xy, tris, alpha, used)
 
     # Alpha/interface plots
     n = len(models)
@@ -131,10 +170,11 @@ def main() -> None:
     levels = np.linspace(0.0, 1.0, 21)
     mappable = None
     for ax, m in zip(axs, models):
-        pts_xy, tris, alpha = alpha_fields[m]
+        pts_xy, tris, alpha, _used = alpha_fields[m]
         tri = Triangulation(pts_xy[:, 0], pts_xy[:, 1], tris)
         mappable = ax.tricontourf(tri, alpha, levels=levels, cmap="viridis")
-        ax.tricontour(tri, alpha, levels=[float(args.alpha_half)], colors="w", linewidths=1.0)
+        cs = ax.tricontour(tri, alpha, levels=[float(args.alpha_half)], colors="w", linewidths=1.0)
+        interface_verts[m] = _interface_vertices_from_contour_set(cs)
         ax.set_title(m)
         ax.set_aspect("equal")
         ax.set_xlabel("x (mm)")
@@ -144,6 +184,34 @@ def main() -> None:
     save_alpha = outdir / f"{str(args.save_prefix)}_alpha_contours.png"
     fig.savefig(str(save_alpha), dpi=200)
     print(f"[ok] wrote {save_alpha}")
+
+    # Interface-only plot (paper-style)
+    figi, axsi = plt.subplots(1, n, figsize=(4.2 * n, 2.0), sharex=True, sharey=True, constrained_layout=True)
+    if n == 1:
+        axsi = [axsi]
+    for ax, m in zip(axsi, models):
+        pts_xy, tris, alpha, _used = alpha_fields[m]
+        tri = Triangulation(pts_xy[:, 0], pts_xy[:, 1], tris)
+        ax.tricontour(tri, alpha, levels=[float(args.alpha_half)], colors="k", linewidths=1.5)
+        ax.set_title(m)
+        ax.set_aspect("equal")
+        ax.set_xlabel("x (mm)")
+    axsi[0].set_ylabel("y (mm)")
+    save_int = outdir / f"{str(args.save_prefix)}_interface_only.png"
+    figi.savefig(str(save_int), dpi=200)
+    print(f"[ok] wrote {save_int}")
+
+    # Thickness profiles (compute after contour extraction so we can use the interface vertices).
+    for m in models:
+        pts_xy, _tris, alpha, used = alpha_fields[m]
+        verts = interface_verts.get(m, np.zeros((0, 2), dtype=float))
+        if str(args.thickness_mode).strip().lower() == "contour" and verts.size:
+            x_prof, l_prof = _thickness_profile_from_vertices(verts_xy=verts)
+        else:
+            x_prof, l_prof = _thickness_profile_nodal(
+                points_xy=pts_xy, alpha=alpha, used_point_ids=used, alpha_half=float(args.alpha_half)
+            )
+        l_profiles[m] = (x_prof, l_prof)
 
     # Thickness profiles
     fig2, ax2 = plt.subplots(figsize=(7.0, 2.7), constrained_layout=True)
@@ -165,11 +233,19 @@ def main() -> None:
     print("\nPer-colony peak heights at final time (mm):")
     print("  centers_x =", ", ".join(f"{c:.4g}" for c in centers))
     for m in models:
-        x_prof, l_prof = l_profiles[m]
+        verts = interface_verts.get(m, np.zeros((0, 2), dtype=float))
         peaks = []
-        for cx in centers:
-            mask = np.abs(x_prof - cx) <= float(args.r0)
-            peaks.append(float(np.max(l_prof[mask])) if np.any(mask) else 0.0)
+        if str(args.thickness_mode).strip().lower() == "contour" and verts.size:
+            x_v = np.asarray(verts[:, 0], dtype=float)
+            y_v = np.asarray(verts[:, 1], dtype=float)
+            for cx in centers:
+                mask = np.abs(x_v - float(cx)) <= float(args.r0)
+                peaks.append(float(np.max(y_v[mask])) if np.any(mask) else 0.0)
+        else:
+            x_prof, l_prof = l_profiles[m]
+            for cx in centers:
+                mask = np.abs(x_prof - cx) <= float(args.r0)
+                peaks.append(float(np.max(l_prof[mask])) if np.any(mask) else 0.0)
         print(f"  {m:>6s}: " + ", ".join(f"{p:.4g}" for p in peaks))
 
 

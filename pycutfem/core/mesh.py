@@ -479,6 +479,56 @@ class Mesh:
         from pycutfem.fem import transform
         from pycutfem.core.levelset import phi_eval as _phi_eval
 
+        tok = getattr(level_set, "cache_token", None)
+        key = ("token", tok, float(tol)) if tok is not None else ("objid", int(id(level_set)), float(tol))
+        if getattr(self, "_ls_elements_key", None) == key and getattr(self, "_elem_bitsets", None):
+            inside = self._elem_bitsets.get("inside")
+            outside = self._elem_bitsets.get("outside")
+            cut = self._elem_bitsets.get("cut")
+            return (
+                inside.to_indices() if inside is not None else np.asarray([], dtype=int),
+                outside.to_indices() if outside is not None else np.asarray([], dtype=int),
+                cut.to_indices() if cut is not None else np.asarray([], dtype=int),
+            )
+
+        # Fast-path: for a piecewise-linear surrogate φ, corner/node signs fully
+        # determine cut/inside/outside. Avoid expensive centroid probing and
+        # higher-order edge-root checks.
+        try:
+            from pycutfem.core.levelset import PiecewiseLinearLevelSet
+
+            if isinstance(level_set, PiecewiseLinearLevelSet):
+                phi_nodes = level_set.evaluate_on_nodes(self)
+                elem_phi_nodes = phi_nodes[self.elements_connectivity]
+
+                has_neg = elem_phi_nodes < -tol
+                has_pos = elem_phi_nodes > tol
+                any_neg = has_neg.any(axis=1)
+                any_pos = has_pos.any(axis=1)
+
+                cut_mask = any_neg & any_pos
+                inside_mask = any_neg & ~any_pos
+                outside_mask = any_pos & ~any_neg
+                cut_mask |= ~(inside_mask | outside_mask | cut_mask)
+
+                inside_inds = np.where(inside_mask)[0]
+                outside_inds = np.where(outside_mask)[0]
+                cut_inds = np.where(cut_mask)[0]
+
+                for eid in inside_inds:
+                    self.elements_list[int(eid)].tag = "inside"
+                for eid in outside_inds:
+                    self.elements_list[int(eid)].tag = "outside"
+                for eid in cut_inds:
+                    self.elements_list[int(eid)].tag = "cut"
+
+                tags_el = np.array([e.tag for e in self.elements_list])
+                self._elem_bitsets = {t: BitSet(tags_el == t) for t in np.unique(tags_el)}
+                self._ls_elements_key = key
+                return inside_inds, outside_inds, cut_inds
+        except Exception:
+            pass
+
         phi_nodes = level_set.evaluate_on_nodes(self)
         # Use *all* element nodes (not just corners) so higher-order meshes/level-sets
         # cannot miss interior sign changes (a common source of spurious "aligned" edges).
@@ -585,8 +635,7 @@ class Mesh:
 
         tags_el = np.array([e.tag for e in self.elements_list])
         self._elem_bitsets = {t: BitSet(tags_el == t) for t in np.unique(tags_el)}
-        tok = getattr(level_set, "cache_token", None)
-        self._ls_elements_key = ("token", tok, float(tol)) if tok is not None else ("objid", int(id(level_set)), float(tol))
+        self._ls_elements_key = key
         return inside_inds, outside_inds, cut_inds
 
     def classify_elements_multi(self, level_sets, tol=SIDE.tol):

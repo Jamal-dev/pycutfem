@@ -144,6 +144,15 @@ class AffineLevelSet(LevelSetFunction):
     def __init__(self, a: float, b: float, c: float):
         self.a, self.b, self.c = float(a), float(b), float(c)
 
+    @property
+    def cache_token(self):
+        # NOTE: `Mesh.classify_elements` caches per-level-set results using
+        # either an explicit `cache_token` or the object id. For affine level
+        # sets we often *mutate* the coefficients (e.g. moving internal
+        # boundaries), so the token must depend on (a,b,c) to avoid stale
+        # cached cut/inside/outside classifications.
+        return ("affine_ls", float(self.a), float(self.b), float(self.c))
+
     # ---- value ------------------------------------------------------
     def __call__(self, x: np.ndarray) -> np.ndarray:
         # Works with shape (2,) or (..., 2)
