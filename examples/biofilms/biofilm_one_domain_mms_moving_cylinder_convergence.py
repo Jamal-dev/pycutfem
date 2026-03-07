@@ -4,6 +4,16 @@ import os
 
 import numpy as np
 
+# Avoid extremely verbose Numba debug dumps if the environment enables them.
+for _k in (
+    "NUMBA_DEBUG",
+    "NUMBA_DUMP_BYTECODE",
+    "NUMBA_DUMP_IR",
+    "NUMBA_DUMP_SSA",
+    "NUMBA_DEBUG_ARRAY_OPT",
+):
+    os.environ[_k] = "0"
+
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement

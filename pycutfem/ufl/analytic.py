@@ -26,14 +26,34 @@ class Analytic(Expression):
         try:
             probe = self._func(np.asarray([0.0]), np.asarray([0.0]))
             arr = np.asarray(probe)
-            self.tensor_shape = arr.shape[1:] if arr.ndim >= 1 else ()
+            if arr.ndim == 0:
+                self.tensor_shape = ()
+            elif arr.ndim == 1:
+                self.tensor_shape = () if arr.shape[0] == 1 else (arr.shape[0],)
+            else:
+                self.tensor_shape = arr.shape[1:]
         except Exception:
             self.tensor_shape = ()
+        if int(self.dim) == 0 and self.tensor_shape != ():
+            self.dim = len(self.tensor_shape)
 
     def grad(self): from pycutfem.ufl.expressions import Grad; return Grad(self)
     @property
     def degree(self):   # used by the estimator
         return self._degree
+    def __getitem__(self, idx: int):
+        tshape = tuple(self.tensor_shape or ())
+        if len(tshape) != 1:
+            raise IndexError("Analytic component access is only available for vector-valued analyticals.")
+        if not (0 <= int(idx) < int(tshape[0])):
+            raise IndexError(f"Component index {idx} out of range for tensor_shape={tshape}.")
+
+        def _component(xv, yv, _idx=int(idx), _func=self._func):
+            arr = np.asarray(_func(xv, yv), dtype=float)
+            return arr[..., _idx]
+
+        return Analytic(_component, degree=self._degree)
+
     def eval(self, X):
         """X : (..., 2) array → numpy array of same leading shape (scalar) or (...,k) (vector)."""
         X = np.asarray(X)

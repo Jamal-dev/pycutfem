@@ -1,9 +1,20 @@
 import argparse
 import math
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Avoid extremely verbose Numba debug dumps if the environment enables them.
+for _k in (
+    "NUMBA_DEBUG",
+    "NUMBA_DUMP_BYTECODE",
+    "NUMBA_DUMP_IR",
+    "NUMBA_DUMP_SSA",
+    "NUMBA_DEBUG_ARRAY_OPT",
+):
+    os.environ[_k] = "0"
 
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
