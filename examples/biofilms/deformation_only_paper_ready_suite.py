@@ -88,6 +88,18 @@ PROFILE_CONFIGS = {
                 },
             }
         },
+        "benchmark4": {
+            "overrides": {
+                "benchmark4_terzaghi": {
+                    "ny_list": "8",
+                    "nx_cells": "2",
+                    "steps_per_ny": "2",
+                    "Tv_final": "0.5",
+                    "sample_tv": "0.20,0.50",
+                    "png_dpi": "160",
+                }
+            }
+        },
     },
     "baseline": {
         "mms": {
@@ -134,6 +146,18 @@ PROFILE_CONFIGS = {
                 },
             }
         },
+        "benchmark4": {
+            "overrides": {
+                "benchmark4_terzaghi": {
+                    "ny_list": "16,32",
+                    "nx_cells": "4",
+                    "steps_per_ny": "4",
+                    "Tv_final": "1.0",
+                    "sample_tv": "0.20,0.50,1.00",
+                    "png_dpi": "220",
+                }
+            }
+        },
     },
     "production": {
         "mms": {
@@ -178,6 +202,18 @@ PROFILE_CONFIGS = {
                     "plot_k": "1e-2,1e-4",
                     "png_dpi": "280",
                 },
+            }
+        },
+        "benchmark4": {
+            "overrides": {
+                "benchmark4_terzaghi": {
+                    "ny_list": "16,32,64",
+                    "nx_cells": "4",
+                    "steps_per_ny": "4",
+                    "Tv_final": "1.0",
+                    "sample_tv": "0.20,0.50,1.00",
+                    "png_dpi": "280",
+                }
             }
         },
     },
@@ -249,6 +285,13 @@ CASE_SPECS = (
         family="benchmark3",
         driver_rel="examples/biofilms/benchmarks/wang/paper1_benchmark3_wang2014_staircase.py",
         output_key="wang2014_staircase",
+    ),
+    CaseSpec(
+        key="benchmark4_terzaghi",
+        label="Poroelastic benchmark: Terzaghi consolidation",
+        family="benchmark4",
+        driver_rel="examples/biofilms/benchmarks/poroelastic/paper1_benchmark4_terzaghi_consolidation.py",
+        output_key="terzaghi",
     ),
 )
 
@@ -389,6 +432,30 @@ def _build_case_command(spec: CaseSpec, *, profile: str, run_dir: Path, env_name
             "--convergence",
             "--vtk-snapshots" if profile == "production" else "",
         )
+    if spec.family == "benchmark4":
+        merged = {}
+        merged.update(cfg.get("overrides", {}).get(spec.key, {}))
+        return _conda_python(
+            env_name,
+            spec.driver_rel,
+            "--outdir",
+            str(run_dir / spec.key),
+            "--ny-list",
+            merged["ny_list"],
+            "--nx-cells",
+            merged["nx_cells"],
+            "--steps-per-ny",
+            merged["steps_per_ny"],
+            "--Tv-final",
+            merged["Tv_final"],
+            "--sample-tv",
+            merged["sample_tv"],
+            "--backend",
+            "jit",
+            "--png-dpi",
+            merged["png_dpi"],
+            "--quiet",
+        )
     merged = {}
     merged.update(cfg.get("overrides", {}).get(spec.key, {}))
     if spec.output_key == "wang2014_layered":
@@ -425,7 +492,7 @@ def _normalize_cmd(cmd: list[str]) -> list[str]:
 
 
 def _case_dir(run_dir: Path, spec: CaseSpec) -> Path:
-    if spec.family == "benchmark3":
+    if spec.family in {"benchmark3", "benchmark4"}:
         return run_dir / spec.key
     return run_dir / spec.key / spec.output_key
 
@@ -435,6 +502,8 @@ def _case_csv(case_dir: Path, spec: CaseSpec) -> Path:
         return case_dir / f"deformation_only_mms_{spec.output_key}.csv"
     if spec.family == "benchmark3":
         return case_dir / f"benchmark3_{spec.output_key}_summary.csv"
+    if spec.family == "benchmark4":
+        return case_dir / "benchmark4_terzaghi_summary.csv"
     return case_dir / f"deformation_only_interface_transport_{spec.output_key}.csv"
 
 
@@ -443,6 +512,8 @@ def _case_convergence_png(case_dir: Path, spec: CaseSpec) -> Path:
         return case_dir / f"deformation_only_mms_{spec.output_key}_convergence.png"
     if spec.family == "benchmark3":
         return case_dir / f"benchmark3_{spec.output_key}_error_trends.png"
+    if spec.family == "benchmark4":
+        return case_dir / "benchmark4_terzaghi_error_trends.png"
     return case_dir / f"deformation_only_interface_transport_{spec.output_key}_convergence.png"
 
 
@@ -548,8 +619,15 @@ def _summary_metric(spec: CaseSpec, finest: dict[str, str]) -> str:
             f"K={_fmt_float(finest.get('K'), precision=0)}, "
             f"L2_f={_fmt_float(finest.get('l2_fluid'))}, "
             f"L2_p={_fmt_float(finest.get('l2_porous'))}, "
-            f"H1_f={_fmt_float(finest.get('h1_fluid'))}, "
-            f"H1_p={_fmt_float(finest.get('h1_porous'))}"
+                f"H1_f={_fmt_float(finest.get('h1_fluid'))}, "
+                f"H1_p={_fmt_float(finest.get('h1_porous'))}"
+            )
+    if spec.family == "benchmark4":
+        return (
+            f"n_y={_fmt_int(finest.get('ny'))}, "
+            f"max pL2={_fmt_float(finest.get('max_pbar_l2'))}, "
+            f"max pInf={_fmt_float(finest.get('max_pbar_linf'))}, "
+            f"max s={_fmt_float(finest.get('max_settlement_bar_error'))}"
         )
     return (
         f"max|dm|={_fmt_float(finest.get('max_mass_drift'))}, "
@@ -577,6 +655,12 @@ def _summary_note(spec: CaseSpec, finest: dict[str, str]) -> str:
         return (
             "Wang2014 Example 6.1 style layered benchmark; the one-domain transition profile is "
             "compared against a two-domain sharp-interface reference with regional L2 and semi-H1 errors."
+        )
+    if spec.family == "benchmark4":
+        return (
+            "Terzaghi single-drainage consolidation benchmark; normalized pore-pressure profiles "
+            "and top-settlement history are compared against the analytic series solution, with "
+            "profile errors reported after the initial drained-boundary layer is resolved."
         )
     if spec.output_key == "translation":
         return "Rigid-body transport benchmark; Crank-Nicolson with light SUPG is used to suppress artificial interface decay."
@@ -677,6 +761,18 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
                 ("rho_h1_porous", r"$\rho_p^{H^1}$"),
             ]
         }
+    if spec.family == "benchmark4":
+        return {
+            "summary": [
+                ("ny", r"$n_y$"),
+                ("num_time_steps", "steps"),
+                ("max_pbar_l2", r"$\max \|\bar p_h-\bar p_{\mathrm{ex}}\|_{L^2}$"),
+                ("max_pbar_linf", r"$\max \|\bar p_h-\bar p_{\mathrm{ex}}\|_{L^\infty}$"),
+                ("max_mid_pressure_bar_error", r"$\max |\bar p_h(H/2)-\bar p_{\mathrm{ex}}(H/2)|$"),
+                ("max_settlement_bar_error", r"$\max |\bar s_h-\bar s_{\mathrm{ex}}|$"),
+                ("final_settlement_bar_error", r"$|\bar s_h(T)-\bar s_{\mathrm{ex}}(T)|$"),
+            ]
+        }
     return {
         "summary": [
             ("nx", r"$n_x$"),
@@ -691,7 +787,7 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
 
 
 def _format_table_value(key: str, val: str) -> str:
-    if key in {"nx", "ny", "nxy", "newton_iters"}:
+    if key in {"nx", "ny", "nxy", "newton_iters", "num_time_steps"}:
         return _fmt_int(val)
     return _fmt_float(val)
 
@@ -700,6 +796,8 @@ def _resolution_label(spec: CaseSpec, finest: dict[str, str]) -> str:
     if spec.family == "benchmark3":
         if spec.output_key == "wang2014_staircase":
             return f"n={_fmt_int(finest.get('nxy'))}"
+        return f"n_y={_fmt_int(finest.get('ny'))}"
+    if spec.family == "benchmark4":
         return f"n_y={_fmt_int(finest.get('ny'))}"
     return _fmt_int(finest.get("nx"))
 
@@ -765,7 +863,7 @@ def _publish_case_assets(spec: CaseSpec, *, case_dir: Path, rows: list[dict[str,
         if snap_src.exists():
             shutil.copy2(snap_src, VERIFICATION_GENERATED / f"interface_transport_{spec.output_key}_snapshots.png")
         summary_name = f"interface_transport_{spec.output_key}_summary.json"
-    else:
+    elif spec.family == "benchmark3":
         _write_case_table(
             VERIFICATION_GENERATED / f"benchmark3_{spec.output_key}_l2_table.tex",
             rows=rows,
@@ -799,6 +897,23 @@ def _publish_case_assets(spec: CaseSpec, *, case_dir: Path, rows: list[dict[str,
             if src.exists():
                 shutil.copy2(src, VERIFICATION_GENERATED / dst_name)
         summary_name = f"benchmark3_{spec.output_key}_summary.json"
+    else:
+        _write_case_table(
+            VERIFICATION_GENERATED / "benchmark4_terzaghi_table.tex",
+            rows=rows,
+            columns=spec_tables["summary"],
+        )
+        shutil.copy2(_case_csv(case_dir, spec), VERIFICATION_GENERATED / f"benchmark4_{spec.output_key}_{profile}.csv")
+        extra_pngs = [
+            ("benchmark4_terzaghi_history.png", "benchmark4_terzaghi_history.png"),
+            ("benchmark4_terzaghi_profiles.png", "benchmark4_terzaghi_profiles.png"),
+            ("benchmark4_terzaghi_error_trends.png", "benchmark4_terzaghi_error_trends.png"),
+        ]
+        for src_name, dst_name in extra_pngs:
+            src = case_dir / src_name
+            if src.exists():
+                shutil.copy2(src, VERIFICATION_GENERATED / dst_name)
+        summary_name = "benchmark4_terzaghi_summary.json"
 
     summary = {
         "case": spec.key,
