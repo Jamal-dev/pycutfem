@@ -73,6 +73,21 @@ PROFILE_CONFIGS = {
                 }
             },
         },
+        "benchmark3": {
+            "overrides": {
+                "benchmark3_wang2014_layered": {
+                    "k_list": "1e-2,1e-4",
+                    "ny": "1200",
+                    "plot_k": "1e-2,1e-4",
+                    "png_dpi": "160",
+                },
+                "benchmark3_wang2014_staircase": {
+                    "grid_pairs": "1e-2:32,1e-3:64",
+                    "plot_k": "1e-2",
+                    "png_dpi": "160",
+                },
+            }
+        },
     },
     "baseline": {
         "mms": {
@@ -104,6 +119,21 @@ PROFILE_CONFIGS = {
                 }
             },
         },
+        "benchmark3": {
+            "overrides": {
+                "benchmark3_wang2014_layered": {
+                    "k_list": "1e-2,1e-3,1e-4,1e-5",
+                    "ny": "4000",
+                    "plot_k": "1e-2,1e-4",
+                    "png_dpi": "220",
+                },
+                "benchmark3_wang2014_staircase": {
+                    "grid_pairs": "1e-2:96,1e-3:192,1e-4:384",
+                    "plot_k": "1e-2,1e-4",
+                    "png_dpi": "220",
+                },
+            }
+        },
     },
     "production": {
         "mms": {
@@ -134,6 +164,21 @@ PROFILE_CONFIGS = {
                     "alpha_cip": "0.0",
                 }
             },
+        },
+        "benchmark3": {
+            "overrides": {
+                "benchmark3_wang2014_layered": {
+                    "k_list": "1e-2,1e-3,1e-4,1e-5,1e-6",
+                    "ny": "8000",
+                    "plot_k": "1e-2,1e-4",
+                    "png_dpi": "280",
+                },
+                "benchmark3_wang2014_staircase": {
+                    "grid_pairs": "1e-2:128,1e-3:256,1e-4:512",
+                    "plot_k": "1e-2,1e-4",
+                    "png_dpi": "280",
+                },
+            }
         },
     },
 }
@@ -190,6 +235,20 @@ CASE_SPECS = (
         family="transport",
         driver_rel="examples/biofilms/deformation_only_interface_transport_shear_return.py",
         output_key="shear_return",
+    ),
+    CaseSpec(
+        key="benchmark3_wang2014_layered",
+        label="Two-domain vs one-domain: Wang2014 layered benchmark",
+        family="benchmark3",
+        driver_rel="examples/biofilms/benchmarks/wang/paper1_benchmark3_wang2014_layered.py",
+        output_key="wang2014_layered",
+    ),
+    CaseSpec(
+        key="benchmark3_wang2014_staircase",
+        label="Two-domain vs one-domain: Wang2014 stepped benchmark",
+        family="benchmark3",
+        driver_rel="examples/biofilms/benchmarks/wang/paper1_benchmark3_wang2014_staircase.py",
+        output_key="wang2014_staircase",
     ),
 )
 
@@ -288,46 +347,76 @@ def _build_case_command(spec: CaseSpec, *, profile: str, run_dir: Path, env_name
             str(run_dir / spec.key),
             "--convergence",
         )
-    merged = dict(cfg)
-    overrides = merged.pop("overrides", {})
-    merged.update(overrides.get(spec.key, {}))
+    if spec.family == "transport":
+        merged = dict(cfg)
+        overrides = merged.pop("overrides", {})
+        merged.update(overrides.get(spec.key, {}))
+        return _conda_python(
+            env_name,
+            spec.driver_rel,
+            "--backend",
+            "cpp",
+            "--nx-list",
+            merged["nx_list"],
+            "--q",
+            merged["q"],
+            "--q-metrics",
+            merged["q_metrics"],
+            "--theta",
+            merged["theta"],
+            "--cfl",
+            merged["cfl"],
+            "--alpha-supg",
+            merged["alpha_supg"],
+            "--alpha-cip",
+            merged["alpha_cip"],
+            "--newton-tol",
+            "1e-10",
+            "--max-it",
+            merged["max_it"],
+            "--geom-every",
+            merged["geom_every"],
+            "--geom-grid",
+            merged["geom_grid"],
+            "--final-grid",
+            merged["final_grid"],
+            "--snapshot-grid",
+            merged["snapshot_grid"],
+            "--png-dpi",
+            merged["png_dpi"],
+            "--outdir",
+            str(run_dir / spec.key),
+            "--convergence",
+            "--vtk-snapshots" if profile == "production" else "",
+        )
+    merged = {}
+    merged.update(cfg.get("overrides", {}).get(spec.key, {}))
+    if spec.output_key == "wang2014_layered":
+        return _conda_python(
+            env_name,
+            spec.driver_rel,
+            "--outdir",
+            str(run_dir / spec.key),
+            "--k-list",
+            merged["k_list"],
+            "--ny",
+            merged["ny"],
+            "--plot-k",
+            merged["plot_k"],
+            "--png-dpi",
+            merged["png_dpi"],
+        )
     return _conda_python(
         env_name,
         spec.driver_rel,
-        "--backend",
-        "cpp",
-        "--nx-list",
-        merged["nx_list"],
-        "--q",
-        merged["q"],
-        "--q-metrics",
-        merged["q_metrics"],
-        "--theta",
-        merged["theta"],
-        "--cfl",
-        merged["cfl"],
-        "--alpha-supg",
-        merged["alpha_supg"],
-        "--alpha-cip",
-        merged["alpha_cip"],
-        "--newton-tol",
-        "1e-10",
-        "--max-it",
-        merged["max_it"],
-        "--geom-every",
-        merged["geom_every"],
-        "--geom-grid",
-        merged["geom_grid"],
-        "--final-grid",
-        merged["final_grid"],
-        "--snapshot-grid",
-        merged["snapshot_grid"],
-        "--png-dpi",
-        merged["png_dpi"],
         "--outdir",
         str(run_dir / spec.key),
-        "--convergence",
-        "--vtk-snapshots" if profile == "production" else "",
+        "--grid-pairs",
+        merged["grid_pairs"],
+        "--plot-k",
+        merged["plot_k"],
+        "--png-dpi",
+        merged["png_dpi"],
     )
 
 
@@ -336,18 +425,24 @@ def _normalize_cmd(cmd: list[str]) -> list[str]:
 
 
 def _case_dir(run_dir: Path, spec: CaseSpec) -> Path:
+    if spec.family == "benchmark3":
+        return run_dir / spec.key
     return run_dir / spec.key / spec.output_key
 
 
 def _case_csv(case_dir: Path, spec: CaseSpec) -> Path:
     if spec.family == "mms":
         return case_dir / f"deformation_only_mms_{spec.output_key}.csv"
+    if spec.family == "benchmark3":
+        return case_dir / f"benchmark3_{spec.output_key}_summary.csv"
     return case_dir / f"deformation_only_interface_transport_{spec.output_key}.csv"
 
 
 def _case_convergence_png(case_dir: Path, spec: CaseSpec) -> Path:
     if spec.family == "mms":
         return case_dir / f"deformation_only_mms_{spec.output_key}_convergence.png"
+    if spec.family == "benchmark3":
+        return case_dir / f"benchmark3_{spec.output_key}_error_trends.png"
     return case_dir / f"deformation_only_interface_transport_{spec.output_key}_convergence.png"
 
 
@@ -440,6 +535,22 @@ def _summary_metric(spec: CaseSpec, finest: dict[str, str]) -> str:
             f"EOC(vS_L2)={_fmt_float(finest.get('eoc_vS_l2'))}, "
             f"EOC(alpha_L2)={_fmt_float(finest.get('eoc_alpha_l2'))}"
         )
+    if spec.family == "benchmark3":
+        if spec.output_key == "wang2014_staircase":
+            return (
+                f"K={_fmt_float(finest.get('K'), precision=0)}, "
+                f"n={_fmt_int(finest.get('nxy'))}, "
+                f"L2_f={_fmt_float(finest.get('l2_fluid'))}, "
+                f"L2_p={_fmt_float(finest.get('l2_porous'))}, "
+                f"profile_inf={_fmt_float(finest.get('profile_linf'))}"
+            )
+        return (
+            f"K={_fmt_float(finest.get('K'), precision=0)}, "
+            f"L2_f={_fmt_float(finest.get('l2_fluid'))}, "
+            f"L2_p={_fmt_float(finest.get('l2_porous'))}, "
+            f"H1_f={_fmt_float(finest.get('h1_fluid'))}, "
+            f"H1_p={_fmt_float(finest.get('h1_porous'))}"
+        )
     return (
         f"max|dm|={_fmt_float(finest.get('max_mass_drift'))}, "
         f"max ec={_fmt_float(finest.get('max_geom_centroid_err'))}, "
@@ -456,6 +567,17 @@ def _summary_note(spec: CaseSpec, finest: dict[str, str]) -> str:
             nx = _fmt_int(finest.get("nx"))
             return f"Transport-only MMS; alpha and mu_alpha reach the asymptotic regime by nx={nx}."
         return "Fully coupled reduced MMS; fluid, skeleton, reference-map, and phase fields are all active."
+    if spec.family == "benchmark3":
+        if spec.output_key == "wang2014_staircase":
+            return (
+                "Wang2014 Example 6.2 style stepped-interface reduced benchmark; the diffuse "
+                "transition-layer field is compared against a sharp split reference on "
+                "interface-resolving grids for a non-flat geometry."
+            )
+        return (
+            "Wang2014 Example 6.1 style layered benchmark; the one-domain transition profile is "
+            "compared against a two-domain sharp-interface reference with regional L2 and semi-H1 errors."
+        )
     if spec.output_key == "translation":
         return "Rigid-body transport benchmark; Crank-Nicolson with light SUPG is used to suppress artificial interface decay."
     if spec.output_key == "rotation":
@@ -519,6 +641,42 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
                 ("newton_iters", "Newton"),
             ],
         }
+    if spec.family == "benchmark3":
+        if spec.output_key == "wang2014_staircase":
+            return {
+                "l2": [
+                    ("K", r"$K$"),
+                    ("nxy", r"$n$"),
+                    ("l2_fluid", r"$\|u_{\mathrm{one}}-u_{\mathrm{two}}\|_{L^2(\Omega_f)}$"),
+                    ("l2_porous", r"$\|u_{\mathrm{one}}-u_{\mathrm{two}}\|_{L^2(\Omega_p)}$"),
+                    ("profile_linf", r"$\|e_{\mathrm{prof}}\|_{L^\infty}$"),
+                    ("max_field_abs_error", r"$\|e\|_{L^\infty(\Omega)}$"),
+                ],
+                "h1": [
+                    ("K", r"$K$"),
+                    ("nxy", r"$n$"),
+                    ("h1_fluid", r"$|\!|u_{\mathrm{one}}-u_{\mathrm{two}}|\!|_{H^1(\Omega_f)}$"),
+                    ("h1_porous", r"$|\!|u_{\mathrm{one}}-u_{\mathrm{two}}|\!|_{H^1(\Omega_p)}$"),
+                    ("profile_l2", r"$\|e_{\mathrm{prof}}\|_{L^2}$"),
+                    ("interface_band_linf", r"$\|e\|_{L^\infty(\Gamma_{\mathrm{band}})}$"),
+                ],
+            }
+        return {
+            "l2": [
+                ("K", r"$K$"),
+                ("l2_fluid", r"$\|u_{\mathrm{one}}-u_{\mathrm{two}}\|_{L^2(\Omega_f)}$"),
+                ("rho_l2_fluid", r"$\rho_f^{L^2}$"),
+                ("l2_porous", r"$\|u_{\mathrm{one}}-u_{\mathrm{two}}\|_{L^2(\Omega_p)}$"),
+                ("rho_l2_porous", r"$\rho_p^{L^2}$"),
+            ],
+            "h1": [
+                ("K", r"$K$"),
+                ("h1_fluid", r"$|\!|u_{\mathrm{one}}-u_{\mathrm{two}}|\!|_{H^1(\Omega_f)}$"),
+                ("rho_h1_fluid", r"$\rho_f^{H^1}$"),
+                ("h1_porous", r"$|\!|u_{\mathrm{one}}-u_{\mathrm{two}}|\!|_{H^1(\Omega_p)}$"),
+                ("rho_h1_porous", r"$\rho_p^{H^1}$"),
+            ]
+        }
     return {
         "summary": [
             ("nx", r"$n_x$"),
@@ -533,9 +691,17 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
 
 
 def _format_table_value(key: str, val: str) -> str:
-    if key in {"nx", "newton_iters"}:
+    if key in {"nx", "ny", "nxy", "newton_iters"}:
         return _fmt_int(val)
     return _fmt_float(val)
+
+
+def _resolution_label(spec: CaseSpec, finest: dict[str, str]) -> str:
+    if spec.family == "benchmark3":
+        if spec.output_key == "wang2014_staircase":
+            return f"n={_fmt_int(finest.get('nxy'))}"
+        return f"n_y={_fmt_int(finest.get('ny'))}"
+    return _fmt_int(finest.get("nx"))
 
 
 def _write_case_table(path: Path, *, rows: list[dict[str, str]], columns: list[tuple[str, str]]) -> None:
@@ -584,7 +750,7 @@ def _publish_case_assets(spec: CaseSpec, *, case_dir: Path, rows: list[dict[str,
         if png_src.exists():
             shutil.copy2(png_src, VERIFICATION_GENERATED / f"mms_{spec.output_key}_convergence.png")
         summary_name = f"mms_{spec.output_key}_summary.json"
-    else:
+    elif spec.family == "transport":
         _write_case_table(
             VERIFICATION_GENERATED / f"interface_transport_{spec.output_key}_table.tex",
             rows=rows,
@@ -599,6 +765,40 @@ def _publish_case_assets(spec: CaseSpec, *, case_dir: Path, rows: list[dict[str,
         if snap_src.exists():
             shutil.copy2(snap_src, VERIFICATION_GENERATED / f"interface_transport_{spec.output_key}_snapshots.png")
         summary_name = f"interface_transport_{spec.output_key}_summary.json"
+    else:
+        _write_case_table(
+            VERIFICATION_GENERATED / f"benchmark3_{spec.output_key}_l2_table.tex",
+            rows=rows,
+            columns=spec_tables["l2"],
+        )
+        _write_case_table(
+            VERIFICATION_GENERATED / f"benchmark3_{spec.output_key}_h1_table.tex",
+            rows=rows,
+            columns=spec_tables["h1"],
+        )
+        shutil.copy2(_case_csv(case_dir, spec), VERIFICATION_GENERATED / f"benchmark3_{spec.output_key}_{profile}.csv")
+        extra_pngs = [
+            (f"benchmark3_{spec.output_key}_error_trends.png", f"benchmark3_{spec.output_key}_error_trends.png"),
+        ]
+        if spec.output_key == "wang2014_layered":
+            extra_pngs.extend(
+                [
+                    ("benchmark3_wang2014_layered_profiles.png", "benchmark3_wang2014_layered_profiles.png"),
+                ]
+            )
+        else:
+            extra_pngs.extend(
+                [
+                    ("benchmark3_wang2014_staircase_geometry.png", "benchmark3_wang2014_staircase_geometry.png"),
+                    ("benchmark3_wang2014_staircase_profiles.png", "benchmark3_wang2014_staircase_profiles.png"),
+                    ("benchmark3_wang2014_staircase_fields.png", "benchmark3_wang2014_staircase_fields.png"),
+                ]
+            )
+        for src_name, dst_name in extra_pngs:
+            src = case_dir / src_name
+            if src.exists():
+                shutil.copy2(src, VERIFICATION_GENERATED / dst_name)
+        summary_name = f"benchmark3_{spec.output_key}_summary.json"
 
     summary = {
         "case": spec.key,
@@ -629,13 +829,13 @@ def _write_summary(entries: list[dict[str, str]], *, profile: str, run_tag: str)
     )
 
     md_lines = [
-        "# Reduced deformation-only paper-ready status",
+        "# Paper 1 paper-ready status",
         "",
         f"- profile: `{profile}`",
         f"- run tag: `{run_tag}`",
         f"- generated at: `{stamp}`",
         "",
-        "| Case | Status | Finest nx | Summary |",
+        "| Case | Status | Resolution | Summary |",
         "| --- | --- | --- | --- |",
     ]
     for entry in entries:
@@ -659,7 +859,7 @@ def _write_summary(entries: list[dict[str, str]], *, profile: str, run_tag: str)
         "\\begin{center}",
         "\\begin{tabular}{p{0.28\\linewidth}p{0.10\\linewidth}p{0.08\\linewidth}p{0.38\\linewidth}}",
         "\\toprule",
-        "Case & Status & Finest $n_x$ & Summary \\\\",
+        "Case & Status & Resolution & Summary \\\\",
         "\\midrule",
     ]
     for entry in entries:
@@ -733,7 +933,7 @@ def main() -> None:
                     "status": status,
                     "profile": profile,
                     "run_tag": run_tag,
-                    "finest_nx": _fmt_int(finest.get("nx")),
+                    "finest_nx": _resolution_label(spec, finest),
                     "summary_metric": _summary_metric(spec, finest),
                     "note": _summary_note(spec, finest),
                     "case_dir": str(case_dir.relative_to(PAPER_ROOT)),

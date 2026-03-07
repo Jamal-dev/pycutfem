@@ -18,7 +18,7 @@ def test_paper1_paper_ready_suite_dry_run_lists_expected_commands() -> None:
             "--profile",
             "smoke",
             "--cases",
-            "static,transport_translation",
+            "static,transport_translation,benchmark3_wang2014_layered,benchmark3_wang2014_staircase",
         ],
         cwd=str(repo_root),
         capture_output=True,
@@ -30,4 +30,6 @@ def test_paper1_paper_ready_suite_dry_run_lists_expected_commands() -> None:
     )
     assert "deformation_only_mms_static_convergence.py" in proc.stdout
     assert "deformation_only_interface_transport_translation.py" in proc.stdout
+    assert "paper1_benchmark3_wang2014_layered.py" in proc.stdout
+    assert "paper1_benchmark3_wang2014_staircase.py" in proc.stdout
     assert "examples/biofilms" in proc.stdout

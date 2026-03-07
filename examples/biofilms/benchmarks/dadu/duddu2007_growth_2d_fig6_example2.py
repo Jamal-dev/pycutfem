@@ -230,6 +230,20 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def _write_snaps_npz(path: Path, *, grid_x: np.ndarray, grid_y: np.ndarray, snaps: list[tuple[float, np.ndarray]]) -> None:
+    if not snaps:
+        raise ValueError("No level-set snapshots to write.")
+    t_days = np.asarray([float(t) for t, _ in snaps], dtype=np.float64)
+    phi = np.stack([np.asarray(arr, dtype=np.float32) for _, arr in snaps], axis=0)
+    np.savez_compressed(
+        path,
+        t_days=t_days,
+        phi=phi,
+        grid_x=np.asarray(grid_x, dtype=np.float64),
+        grid_y=np.asarray(grid_y, dtype=np.float64),
+    )
+
+
 def main() -> None:
     # Keep compiler logs quiet by default (they can dominate runtime on long runs).
     logging.getLogger("pycutfem").setLevel(logging.WARNING)
@@ -293,6 +307,12 @@ def main() -> None:
     )
     p.add_argument("--progress-every", type=int, default=10)
     p.add_argument("--timings", action="store_true", help="Print per-step timing breakdown.")
+    p.add_argument(
+        "--snaps-npz",
+        type=str,
+        default="",
+        help="Optional path for the saved level-set snapshots (default: <outdir>/snaps_phi.npz).",
+    )
 
     args = p.parse_args()
 
@@ -319,6 +339,7 @@ def main() -> None:
 
     outdir = Path(str(args.outdir))
     outdir.mkdir(parents=True, exist_ok=True)
+    snaps_npz = Path(str(args.snaps_npz)).expanduser() if str(args.snaps_npz).strip() else (outdir / "snaps_phi.npz")
 
     # Paper times for Fig.6(a) (Example 2), every 20 time steps.
     t_targets = np.asarray(
@@ -716,6 +737,7 @@ def main() -> None:
 
     # --- outputs ------------------------------------------------------------
     _plot_level_set_contours(phi_snaps, grid_x=grid.x, grid_y=grid.y, outpng=outdir / "fig6a_interface.png")
+    _write_snaps_npz(snaps_npz, grid_x=grid.x, grid_y=grid.y, snaps=phi_snaps)
 
     # Plot final fields (S and Phi) from the last solve
     dh_base = dh.base
@@ -745,6 +767,7 @@ def main() -> None:
     print(f"- Wrote {outdir/'fig6a_interface.png'}")
     print(f"- Wrote {outdir/'fig6b_S.png'}")
     print(f"- Wrote {outdir/'fig6c_Phi.png'}")
+    print(f"- Wrote {snaps_npz}")
     print(f"- Wrote {outdir/'y_top_timeseries.csv'}")
 
 
