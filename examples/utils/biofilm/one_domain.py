@@ -332,6 +332,11 @@ def build_biofilm_one_domain_forms(
     gamma_u: float = 0.0,
     u_extension_mode: str = "l2",
     gamma_u_pin: float = 0.0,
+    # Optional SUPG-like streamline diffusion stabilizations:
+    # - v_supg: fluid momentum convection stabilization
+    # - u_supg: kinematic (u) transport stabilization
+    v_supg: float = 0.0,
+    u_supg: float = 0.0,
     D_alpha: float = 0.0,
     # Which velocity advects the diffuse indicator α:
     # - "vS"  (default): skeleton velocity v^S
@@ -828,6 +833,37 @@ def build_biofilm_one_domain_forms(
     else:
         a_mom += dbeta_coeff * dot(kdrag_k, v_test) * dx
         a_mom += beta_coeff_k * dot(dkdrag_k, v_test) * dx
+
+    # Optional SUPG-like streamline diffusion for the fluid convection term.
+    #
+    # This is a conservative, easy-to-linearize variant:
+    #   τ ( (v^n·∇)v^k , (v^n·∇)w ) in the fluid region.
+    #
+    # It is primarily intended as a robustness knob for long transient runs.
+    if float(v_supg) != 0.0:
+        rho_f_val = None
+        try:
+            rho_f_val = float(rho_f)
+        except Exception:
+            rho_f_val = None
+
+        # If rho_f==0 then inertia/convection vanishes and this stabilization is irrelevant.
+        # Avoid dividing by rho_f in that case.
+        if rho_f_val is not None and abs(rho_f_val) < 1.0e-16:
+            pass
+        else:
+            h_v = MeshSize()
+            vmag2 = v_n[0] * v_n[0] + v_n[1] * v_n[1]
+            vmag = _sqrt(vmag2 + _c(1.0e-12))
+            # Standard SUPG scaling: τ ~ h^2 / (ν + h|v| + h^2/dt).
+            nu_f = mu_f / rho_f
+            denom = _c(6.0) * nu_f + h_v * vmag + (h_v * h_v) * inv_dt
+            tau_v = _c(float(v_supg)) * (h_v * h_v) / (denom + _c(1.0e-16))
+            w_v = _one_minus(alpha_n)  # lagged "fluid-only" localization
+            adv_v_k = dot(grad(v_k), v_n)
+            adv_w = dot(grad(v_test), v_n)
+            r_mom += tau_v * w_v * inner(adv_v_k, adv_w) * dx
+            a_mom += tau_v * w_v * inner(dot(grad(dv), v_n), adv_w) * dx
 
     # ------------------------------------------------------------------
     # (ii) Mass / volume constraint (expanded divergence)
@@ -1374,6 +1410,22 @@ def build_biofilm_one_domain_forms(
     dFkin_adv_k = dot(grad(du), vS_k) + dot(grad(u_k), dvS) - dvS
     dFkin_k = dFkin_dt + th * dFkin_adv_k
     a_kinematics = kin_scale_c * (dalpha * dot(Fkin_k, u_test) + alpha_k * dot(dFkin_k, u_test)) * dx
+
+    # Optional SUPG-like streamline diffusion for the u-transport (kinematic constraint).
+    #
+    # This adds an artificial diffusion along vS in the solid region:
+    #   τ ( (vS^n·∇)u^k , (vS^n·∇)ξ )_{Ω}  localized by α^n.
+    if float(u_supg) != 0.0:
+        h_u = MeshSize()
+        vmag2 = vS_n[0] * vS_n[0] + vS_n[1] * vS_n[1]
+        vmag = _sqrt(vmag2 + _c(1.0e-12))
+        denom = h_u * vmag + (h_u * h_u) * inv_dt
+        tau_u = _c(float(u_supg)) * (h_u * h_u) / (denom + _c(1.0e-16))
+        w_u = alpha_n  # lagged "solid-only" localization
+        adv_u_k = dot(grad(u_k), vS_n)
+        adv_xi = dot(grad(u_test), vS_n)
+        r_kinematics += kin_scale_c * tau_u * w_u * inner(adv_u_k, adv_xi) * dx
+        a_kinematics += kin_scale_c * tau_u * w_u * inner(dot(grad(du), vS_n), adv_xi) * dx
 
     # Optional extension penalty to keep u well-posed in the free-fluid region (α≈0).
     if float(gamma_u) != 0.0:

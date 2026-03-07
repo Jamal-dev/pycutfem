@@ -4155,6 +4155,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._box_upper_full = None
         self._XL = None               # PETSc Vec (reduced) for lower bounds
         self._XU = None               # PETSc Vec (reduced) for upper bounds
+        self._trace_monitor_installed = False
 
 
         # Sensible defaults; user options may override via setFromOptions()
@@ -4213,6 +4214,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._P = None
         self._XL = None
         self._XU = None
+        self._trace_monitor_installed = False
     
     def set_box_bounds(self, lower=None, upper=None, by_field: dict | None=None):
         """
@@ -4293,6 +4295,70 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._snes.setFunction(self._eval_residual_reduced, self._r_red)
         self._snes.setJacobian(self._eval_jacobian_reduced, self._J, self._P)
 
+        # ------------------------------------------------------------------
+        # Convergence norm: use infinity norm by default.
+        #
+        # Rationale:
+        # - Our `NewtonParameters.newton_tol` is documented as an infinity-norm
+        #   threshold (‖R‖_∞) for the pure-Python Newton implementation.
+        # - PETSc SNES defaults to a 2-norm on the residual vector. On large
+        #   systems this can be *much* stricter (scales like √N) and may cause
+        #   unnecessary max-iteration failures even when every field has
+        #   already reached the intended per-DOF tolerance.
+        #
+        # We first try to set the SNES norm type directly (if supported by
+        # petsc4py/PETSc). If not available, we install a custom convergence
+        # test that checks ‖F‖_∞ against (atol, rtol).
+        # ------------------------------------------------------------------
+        self._snes_norm_is_infinity = False
+        try:
+            self._snes.setNormType(PETSc.NormType.NORM_INFINITY)  # type: ignore[attr-defined]
+            self._snes_norm_is_infinity = True
+        except Exception:
+            fnorm0_box: dict[str, float | None] = {"fnorm0": None}
+
+            # NOTE: petsc4py changed the callback signature across versions.
+            # Accept optional args so this works with both:
+            #   (snes, it, xnorm, gnorm, fnorm)  and  (snes, it, xnorm)
+            def _conv_test(snes, it, xnorm=None, gnorm=None, fnorm=None, *args, **kwargs):  # noqa: ANN001
+                try:
+                    f_vec, _ctx = snes.getFunction()
+                    f_inf = float(f_vec.norm(PETSc.NormType.NORM_INFINITY))
+                except Exception:
+                    try:
+                        f_inf = float(self._r_red.norm(PETSc.NormType.NORM_INFINITY))
+                    except Exception:
+                        try:
+                            f_inf = float(fnorm) if fnorm is not None else float("nan")
+                        except Exception:
+                            f_inf = float("nan")
+
+                # Reset the "initial norm" at the start of every SNES solve (it=0),
+                # even when SNES is reused across time steps.
+                if it == 0 and np.isfinite(f_inf):
+                    fnorm0_box["fnorm0"] = float(f_inf)
+
+                atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
+                rtol = float(getattr(self.np, "newton_rtol", 0.0) or 0.0)
+                if atol > 0.0 and np.isfinite(f_inf) and f_inf <= atol:
+                    return PETSc.SNES.ConvergedReason.CONVERGED_FNORM_ABS
+                if (
+                    rtol > 0.0
+                    and fnorm0_box["fnorm0"] is not None
+                    and np.isfinite(f_inf)
+                    and f_inf <= rtol * float(fnorm0_box["fnorm0"])
+                ):
+                    rel_reason = getattr(PETSc.SNES.ConvergedReason, "CONVERGED_FNORM_RELATIVE", None)
+                    if rel_reason is None:
+                        rel_reason = getattr(PETSc.SNES.ConvergedReason, "CONVERGED_FNORM_REL", None)
+                    if rel_reason is None:
+                        rel_reason = PETSc.SNES.ConvergedReason.CONVERGED_FNORM_ABS
+                    return rel_reason
+                return PETSc.SNES.ConvergedReason.ITERATING
+
+            self._snes.setConvergenceTest(_conv_test)
+            self._snes_norm_is_infinity = True
+
         # --- Optional VI bounds (reduced) ---
         if (getattr(self, "_box_lower_full", None) is not None) and (getattr(self, "_box_upper_full", None) is not None):
             if getattr(self, "constraints", None) is not None:
@@ -4325,7 +4391,11 @@ class PetscSnesNewtonSolver(NewtonSolver):
 
         # --- Programmatic defaults (robust baseline; options may override) ---
         # Use absolute tolerance to mimic your Python Newton's stopping rule
-        self._snes.setTolerances(rtol=0.0, atol=self.np.newton_tol, max_it=self.np.max_newton_iter)
+        self._snes.setTolerances(
+            rtol=float(getattr(self.np, "newton_rtol", 0.0) or 0.0),
+            atol=float(getattr(self.np, "newton_tol", 0.0) or 0.0),
+            max_it=int(getattr(self.np, "max_newton_iter", 0) or 0),
+        )
         try:
             self._snes.getLineSearch().setType("bt")
         except Exception:
@@ -4347,6 +4417,96 @@ class PetscSnesNewtonSolver(NewtonSolver):
         # --- Apply user options last so they override all defaults ---
         self._apply_petsc_options()
         self._snes.setFromOptions()
+        self._maybe_install_residual_trace_monitor()
+
+    def _maybe_install_residual_trace_monitor(self) -> None:
+        """
+        Install a lightweight SNES monitor to print per-field residual diagnostics.
+
+        This mirrors the env-var based tracing supported by the Python Newton/PDAS
+        implementations:
+          - PYCUTFEM_NEWTON_TRACE_RES_FIELDS=1  (top-N per-field |R|_∞)
+          - PYCUTFEM_RESIDUAL_TRACE=1           (worst DOF residual; optionally coords)
+        """
+        if self._trace_monitor_installed:
+            return
+        snes = getattr(self, "_snes", None)
+        r_red = getattr(self, "_r_red", None)
+        if snes is None or r_red is None:
+            return
+
+        want_fields = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS", "").lower() in {"1", "true", "yes"}
+        want_worst = os.getenv("PYCUTFEM_RESIDUAL_TRACE", "").lower() in {"1", "true", "yes"}
+        if not (want_fields or want_worst):
+            return
+
+        def _monitor(_snes, it, _norm) -> None:
+            try:
+                if PETSc.COMM_WORLD.getRank() != 0:
+                    return
+            except Exception:
+                pass
+
+            try:
+                R_red = np.asarray(r_red.getArray(readonly=True), dtype=float).ravel()
+                R_full = np.asarray(self.restrictor.expand_vec(R_red), dtype=float).ravel()
+            except Exception as exc:
+                print(f"        [res] snes trace failed: {exc}")
+                return
+
+            if want_fields:
+                try:
+                    field_norms = []
+                    for fld in getattr(self.dh, "field_names", []):
+                        try:
+                            sl = self.dh.get_field_slice(fld)
+                        except Exception:
+                            continue
+                        if sl is None or len(sl) == 0:
+                            continue
+                        sl = np.asarray(sl, dtype=int).ravel()
+                        field_norms.append((float(np.linalg.norm(R_full[sl], ord=np.inf)), str(fld)))
+                    field_norms.sort(reverse=True, key=lambda t: t[0])
+                    n_show_raw = os.getenv("PYCUTFEM_NEWTON_TRACE_RES_FIELDS_N", "8").strip()
+                    try:
+                        n_show = max(1, int(n_show_raw))
+                    except Exception:
+                        n_show = 8
+                    items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
+                    print(f"        [res] it={int(it)} {items}")
+                except Exception as exc:
+                    print(f"        [res] snes per-field trace failed: {exc}")
+
+            if want_worst:
+                try:
+                    if R_full.size == 0:
+                        return
+                    worst_full = int(np.argmax(np.abs(R_full)))
+                    worst_val = float(R_full[worst_full])
+                    field = None
+                    try:
+                        field = getattr(self.dh, "_dof_to_node_map", {}).get(worst_full, (None, None))[0]
+                    except Exception:
+                        field = None
+                    fmsg = f", field={field}" if field is not None else ""
+
+                    coords_msg = ""
+                    if os.getenv("PYCUTFEM_RESIDUAL_TRACE_COORDS", "").lower() in {"1", "true", "yes"} and field is not None:
+                        try:
+                            sl = np.asarray(self.dh.get_field_slice(field), dtype=int).ravel()
+                            hit = np.nonzero(sl == int(worst_full))[0]
+                            if hit.size:
+                                coords = np.asarray(self.dh.get_dof_coords(field), dtype=float)[int(hit[0])]
+                                if coords.size >= 2:
+                                    coords_msg = f", x={coords[0]:.3e}, y={coords[1]:.3e}"
+                        except Exception:
+                            coords_msg = ""
+                    print(f"        [res] it={int(it)} worst_gdof={worst_full} worst_val={worst_val:.3e}{fmsg}{coords_msg}")
+                except Exception as exc:
+                    print(f"        [res] snes worst trace failed: {exc}")
+
+        snes.setMonitor(_monitor)
+        self._trace_monitor_installed = True
 
 
     # ------------------------------------------------------------------ #
@@ -4425,19 +4585,40 @@ class PetscSnesNewtonSolver(NewtonSolver):
         converged = reason > 0
         accepted = False
         n_iters = int(self._snes.getIterationNumber())
+        fnorm_snes = float("nan")
         try:
-            fnorm = float(self._snes.getFunctionNorm())
+            fnorm_snes = float(self._snes.getFunctionNorm())
         except Exception:
-            fnorm = float("nan")
+            pass
+        # Prefer reporting an infinity-norm to match NewtonParameters semantics.
+        fnorm = float("nan")
+        try:
+            f_vec, _ctx = self._snes.getFunction()
+            fnorm = float(f_vec.norm(PETSc.NormType.NORM_INFINITY))
+        except Exception:
+            try:
+                fnorm = float(self._r_red.norm(PETSc.NormType.NORM_INFINITY))
+            except Exception:
+                fnorm = float(fnorm_snes)
+
         # Expose convergence diagnostics to the outer time-stepper.
         self._last_nonlinear_norm = float(fnorm)
-        self._last_nonlinear_norm_label = "‖F‖"
+        self._last_nonlinear_norm_label = "‖F‖_inf"
         self._last_nonlinear_reason = int(reason)
         if not converged:
             try:
-                fnorm = float(self._snes.getFunctionNorm())
+                fnorm_snes = float(self._snes.getFunctionNorm())
             except Exception:
-                fnorm = float("nan")
+                fnorm_snes = float("nan")
+            # Keep the same acceptance norm as the convergence check (∞-norm).
+            try:
+                f_vec, _ctx = self._snes.getFunction()
+                fnorm = float(f_vec.norm(PETSc.NormType.NORM_INFINITY))
+            except Exception:
+                try:
+                    fnorm = float(self._r_red.norm(PETSc.NormType.NORM_INFINITY))
+                except Exception:
+                    fnorm = float(fnorm_snes)
             accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
             atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
             accept_step = bool(
@@ -4447,12 +4628,12 @@ class PetscSnesNewtonSolver(NewtonSolver):
                 and fnorm <= accept_factor * atol
             )
             print(
-                f"    [warn] SNES did not converge (reason={reason}, iters={n_iters}, ‖F‖={fnorm:.3e}). "
+                f"    [warn] SNES did not converge (reason={reason}, iters={n_iters}, ‖F‖_inf={fnorm:.3e}, ‖F‖_2={fnorm_snes:.3e}). "
                 "Continuing with best iterate."
             )
             if accept_step:
                 print(
-                    f"    [warn] Accepting SNES best iterate since ‖F‖={fnorm:.3e} ≤ {accept_factor:g}·atol "
+                    f"    [warn] Accepting SNES best iterate since ‖F‖_inf={fnorm:.3e} ≤ {accept_factor:g}·atol "
                     f"(atol={atol:.3e})."
                 )
                 converged = True
