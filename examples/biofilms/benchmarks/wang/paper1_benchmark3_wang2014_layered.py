@@ -178,10 +178,11 @@ def _regional_error_metrics(
     fluid = y >= 0.0
     porous = y < 0.0
 
-    l2_fluid = math.sqrt(float(np.trapezoid((u_num[fluid] - u_ref[fluid]) ** 2, y[fluid])))
-    l2_porous = math.sqrt(float(np.trapezoid((u_num[porous] - u_ref[porous]) ** 2, y[porous])))
-    h1_fluid = math.sqrt(float(np.trapezoid((du_num[fluid] - du_ref[fluid]) ** 2, y[fluid])))
-    h1_porous = math.sqrt(float(np.trapezoid((du_num[porous] - du_ref[porous]) ** 2, y[porous])))
+    # Use trapz for compatibility with NumPy versions that do not provide np.trapezoid.
+    l2_fluid = math.sqrt(float(np.trapz((u_num[fluid] - u_ref[fluid]) ** 2, x=y[fluid])))
+    l2_porous = math.sqrt(float(np.trapz((u_num[porous] - u_ref[porous]) ** 2, x=y[porous])))
+    h1_fluid = math.sqrt(float(np.trapz((du_num[fluid] - du_ref[fluid]) ** 2, x=y[fluid])))
+    h1_porous = math.sqrt(float(np.trapz((du_num[porous] - du_ref[porous]) ** 2, x=y[porous])))
     i0 = int(np.argmin(np.abs(y)))
     return {
         "K": float(K),
