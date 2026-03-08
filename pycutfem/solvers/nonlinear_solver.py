@@ -375,6 +375,19 @@ class TimeStepperParameters:
     # - "retry_keep_guess": retry the same step but keep the current iterate (skip predictor reset)
     on_step_failure: Optional[Callable[..., object]] = None
 
+    # Predictor for the initial guess at each new time step.
+    #
+    # - "prev" (default): U^{n+1,0} <- U^n
+    # - "delta":          U^{n+1,0} <- U^n + (dt/dt_prev) * (U^n - U^{n-1})
+    #                     implemented via the previous accepted step increment.
+    #
+    # NOTE: this only affects the *initial guess* for Newton/SNES and does not
+    # change the converged solution (it can, however, strongly affect robustness
+    # and iteration counts).
+    predictor: str = "prev"
+    predictor_damping: float = 1.0
+    predictor_clip_01: bool = False
+
     def __post_init__(self) -> None:
         if self.final_time is None:
             self.final_time = float(self.t0) + float(self.max_steps) * float(self.dt)
@@ -680,6 +693,32 @@ class NewtonSolver:
 
     def _is_jit_backend(self) -> bool:
         return self.backend in {"jit", "cpp", "c++"}
+
+    def _gather_full_iterate(self, funcs: list) -> np.ndarray:
+        """
+        Gather the current iterate into a full global DOF vector (global index order).
+
+        Do not assume `func.nodal_values` is stored in global-DOF order. Always map
+        via each function's `_g_dofs`.
+        """
+        n = int(self.dh.total_dofs)
+        x_full = np.zeros(n, dtype=float)
+        for f in funcs:
+            g = getattr(f, "_g_dofs", None)
+            vals = getattr(f, "nodal_values", None)
+            if g is None or vals is None:
+                continue
+            g_arr = np.asarray(g, dtype=int).ravel()
+            if g_arr.size == 0:
+                continue
+            v_arr = np.asarray(vals, dtype=float).ravel()
+            if v_arr.size != g_arr.size:
+                raise ValueError(
+                    f"Function '{getattr(f, 'name', '<unnamed>')}' has nodal_values size {int(v_arr.size)} "
+                    f"but _g_dofs size {int(g_arr.size)}."
+                )
+            x_full[g_arr] = v_arr
+        return x_full
 
     def _enforce_constraints_on_functions(self, functions: list) -> None:
         """
@@ -1229,6 +1268,8 @@ class NewtonSolver:
         step0 = int(getattr(time_params, "step0", 0) or 0)
         prev_delta_inf: float | None = None
         last_dt: float | None = None
+        last_success_delta: np.ndarray | None = None
+        last_success_dt: float | None = None
 
         abort_on_dt_reduction = os.getenv("PYCUTFEM_ABORT_ON_DT_REDUCTION", "").lower() in {"1", "true", "yes"}
         keep_guess = False  # set by on_step_failure="retry_keep_guess"
@@ -1331,6 +1372,25 @@ class NewtonSolver:
             if not keep_guess:
                 for f, f_prev in zip(functions, prev_functions):
                     f.nodal_values[:] = f_prev.nodal_values[:]
+                pred_key = str(getattr(time_params, "predictor", "prev")).strip().lower()
+                if pred_key in {"delta", "increment", "extrap", "extrapolate"}:
+                    if (
+                        last_success_delta is not None
+                        and last_success_dt is not None
+                        and float(last_success_dt) > 0.0
+                        and float(getattr(time_params, "predictor_damping", 1.0) or 0.0) != 0.0
+                    ):
+                        scale = float(dt) / float(last_success_dt)
+                        damp = float(getattr(time_params, "predictor_damping", 1.0) or 0.0)
+                        dh.add_to_functions(damp * scale * last_success_delta, functions)
+                        if bool(getattr(time_params, "predictor_clip_01", False)):
+                            for f in functions:
+                                fld = getattr(f, "field_name", None)
+                                if fld in {"alpha", "phi"}:
+                                    try:
+                                        f.nodal_values[:] = np.clip(np.asarray(f.nodal_values, dtype=float), 0.0, 1.0)
+                                    except Exception:
+                                        pass
             else:
                 keep_guess = False
 
@@ -1569,6 +1629,20 @@ class NewtonSolver:
             # Post-step refiner (VI clip) **before** promotion so prev matches clipped state
             if post_step_refiner is not None:
                 post_step_refiner(step, bcs_now, functions, prev_functions)
+
+            # Store last accepted increment for predictor use on the next step.
+            #
+            # IMPORTANT: Build this in *global DOF order* using `_g_dofs` maps.
+            # Concatenating `f.nodal_values` is not guaranteed to match the global
+            # DOF numbering (mixed/vector fields, cut/xfem splitting, constraints),
+            # and using a mis-ordered delta can catastrophically destabilize the
+            # "delta" predictor.
+            try:
+                last_success_delta = self._gather_full_iterate(functions) - self._gather_full_iterate(prev_functions)
+                last_success_dt = float(dt)
+            except Exception:
+                last_success_delta = None
+                last_success_dt = None
 
             # # Reject and retry with smaller Δt if the update blows up
             # if step > 0 and prev_delta_inf is not None and prev_delta_inf > 0.0:
@@ -4215,6 +4289,9 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._XL = None
         self._XU = None
         self._trace_monitor_installed = False
+        self._inf_ls_precheck_installed = False
+        self._inf_ls_x_trial = None
+        self._inf_ls_r_trial = None
     
     def set_box_bounds(self, lower=None, upper=None, by_field: dict | None=None):
         """
@@ -4418,6 +4495,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._apply_petsc_options()
         self._snes.setFromOptions()
         self._maybe_install_residual_trace_monitor()
+        self._maybe_install_inf_ls_precheck()
 
     def _maybe_install_residual_trace_monitor(self) -> None:
         """
@@ -4508,6 +4586,141 @@ class PetscSnesNewtonSolver(NewtonSolver):
         snes.setMonitor(_monitor)
         self._trace_monitor_installed = True
 
+    def _maybe_install_inf_ls_precheck(self) -> None:
+        """
+        Install an infinity-norm based line-search *pre-check* to improve robustness.
+
+        Motivation:
+        - PETSc line searches/globalization are typically based on a 2-norm of F.
+          For large mixed systems this can accept steps that reduce the 2-norm
+          while increasing the per-DOF maximum residual (∞-norm), which is the
+          metric we use for our time-step accept/reject diagnostics.
+        - In some cases SNES can then terminate with DIVERGED_LINE_SEARCH (-6)
+          even though an earlier iterate had a small ∞-norm residual.
+
+        This pre-check dampens the Newton direction `y` so that a trial step
+          x_trial = x - α y
+        reduces ‖F‖_∞ whenever possible (or at least avoids catastrophic growth).
+
+        Notes:
+        - petsc4py's callback signature for `setLineSearchPreCheck` varies; in the
+          version used by our fenicsx environment it is `precheck(x: Vec, y: Vec)`.
+        - We keep this lightweight (few trial alphas) and only scale the direction.
+        """
+        if getattr(self, "_inf_ls_precheck_installed", False):
+            return
+        snes = getattr(self, "_snes", None)
+        x_red = getattr(self, "_x_red", None)
+        r_red = getattr(self, "_r_red", None)
+        if snes is None or x_red is None or r_red is None:
+            return
+        if not hasattr(snes, "setLineSearchPreCheck"):
+            return
+
+        # Work vectors for trial residual evaluations.
+        try:
+            self._inf_ls_x_trial = x_red.duplicate()
+            self._inf_ls_r_trial = r_red.duplicate()
+        except Exception:
+            return
+
+        # Pre-check tuning via env vars (keep conservative defaults).
+        try:
+            max_tries = int(os.getenv("PYCUTFEM_SNES_INF_LS_MAX_TRIES", "8"))
+        except Exception:
+            max_tries = 8
+        max_tries = max(1, min(20, int(max_tries)))
+        try:
+            reduction = float(os.getenv("PYCUTFEM_SNES_INF_LS_REDUCTION", "0.5"))
+        except Exception:
+            reduction = 0.5
+        if not (0.0 < reduction < 1.0):
+            reduction = 0.5
+
+        x_trial = self._inf_ls_x_trial
+        r_trial = self._inf_ls_r_trial
+
+        def _precheck(x: PETSc.Vec, y: PETSc.Vec, *args, **kwargs):  # noqa: ANN001
+            # Guard: if direction is zero, nothing to do.
+            try:
+                y_inf = float(y.norm(PETSc.NormType.NORM_INFINITY))
+            except Exception:
+                y_inf = float("nan")
+            if not (np.isfinite(y_inf) and y_inf > 0.0):
+                return False
+
+            # Current infinity norm (try to reuse SNES' stored function vector).
+            try:
+                f_vec, _ctx = snes.getFunction()
+                norm0 = float(f_vec.norm(PETSc.NormType.NORM_INFINITY))
+            except Exception:
+                try:
+                    snes.computeFunction(x, r_red)
+                    norm0 = float(r_red.norm(PETSc.NormType.NORM_INFINITY))
+                except Exception:
+                    norm0 = float("nan")
+            if not np.isfinite(norm0):
+                return False
+
+            # First try the full Newton step (α=1). If it already decreases the
+            # ∞-norm, do not interfere with PETSc's native globalization (keeps
+            # overhead low and avoids overly conservative damping).
+            try:
+                x_trial.waxpy(-1.0, y, x)
+                snes.computeFunction(x_trial, r_trial)
+                n_full = float(r_trial.norm(PETSc.NormType.NORM_INFINITY))
+            except Exception:
+                n_full = float("nan")
+            if np.isfinite(n_full) and n_full <= float(norm0):
+                return False
+
+            alpha = 1.0
+            best_alpha = 0.0
+            best_norm = float(norm0)
+            smallest_tried: float | None = None
+            if np.isfinite(n_full):
+                best_alpha = 1.0
+                best_norm = float(n_full)
+
+            # Try a short backtracking sequence and pick the best trial.
+            # If nothing improves, apply the smallest alpha to avoid blow-ups
+            # that can trigger DIVERGED_LINE_SEARCH.
+            for _ in range(max_tries - 1):
+                try:
+                    alpha *= float(reduction)
+                    smallest_tried = float(alpha)
+                    x_trial.waxpy(-alpha, y, x)  # x_trial = x - α y
+                    snes.computeFunction(x_trial, r_trial)
+                    n_try = float(r_trial.norm(PETSc.NormType.NORM_INFINITY))
+                except Exception:
+                    n_try = float("nan")
+
+                if np.isfinite(n_try) and n_try < best_norm:
+                    best_norm = float(n_try)
+                    best_alpha = float(alpha)
+
+                if alpha <= 0.0:
+                    break
+
+            if best_alpha <= 0.0:
+                best_alpha = float(smallest_tried) if smallest_tried is not None else float(reduction)
+
+            # Only scale if we are actually damping.
+            if best_alpha < 1.0 - 1.0e-14:
+                try:
+                    y.scale(best_alpha)
+                    return True
+                except Exception:
+                    return False
+            return False
+
+        try:
+            snes.setLineSearchPreCheck(_precheck)
+            self._inf_ls_precheck_installed = True
+        except Exception:
+            # If this fails, do not block the solve; proceed with PETSc defaults.
+            self._inf_ls_precheck_installed = False
+
 
     # ------------------------------------------------------------------ #
     # Newton loop
@@ -4578,49 +4791,77 @@ class PetscSnesNewtonSolver(NewtonSolver):
         self._x_red.setValues(idx, x0_red, addv=PETSc.InsertMode.INSERT_VALUES)
         self._x_red.assemblyBegin(); self._x_red.assemblyEnd()
 
+        # Keep SNES tolerances in sync with `NewtonParameters`. This allows runtime
+        # adjustments (e.g. temporary max-it boosts) via callbacks without needing
+        # to recreate the SNES object.
+        try:
+            self._snes.setTolerances(
+                rtol=float(getattr(self.np, "newton_rtol", 0.0) or 0.0),
+                atol=float(getattr(self.np, "newton_tol", 0.0) or 0.0),
+                max_it=int(getattr(self.np, "max_newton_iter", 0) or 0),
+            )
+        except Exception:
+            pass
 
         # Solve the nonlinear system on the reduced space
         self._snes.solve(None, self._x_red)
-        reason = int(self._snes.getConvergedReason())
-        converged = reason > 0
+        reason_snes = int(self._snes.getConvergedReason())
+        reason = int(reason_snes)
+        converged = reason_snes > 0
         accepted = False
         n_iters = int(self._snes.getIterationNumber())
+        # Re-evaluate the residual at the *returned* iterate. In particular for
+        # DIVERGED_LINE_SEARCH (-6), PETSc can exit with a solution vector that
+        # does not match the last stored function vector.
+        fnorm = float("nan")
         fnorm_snes = float("nan")
         try:
-            fnorm_snes = float(self._snes.getFunctionNorm())
-        except Exception:
-            pass
-        # Prefer reporting an infinity-norm to match NewtonParameters semantics.
-        fnorm = float("nan")
-        try:
-            f_vec, _ctx = self._snes.getFunction()
-            fnorm = float(f_vec.norm(PETSc.NormType.NORM_INFINITY))
+            self._snes.computeFunction(self._x_red, self._r_red)
+            fnorm = float(self._r_red.norm(PETSc.NormType.NORM_INFINITY))
+            fnorm_snes = float(self._r_red.norm(PETSc.NormType.NORM_2))
         except Exception:
             try:
-                fnorm = float(self._r_red.norm(PETSc.NormType.NORM_INFINITY))
+                fnorm_snes = float(self._snes.getFunctionNorm())
+            except Exception:
+                fnorm_snes = float("nan")
+            try:
+                f_vec, _ctx = self._snes.getFunction()
+                fnorm = float(f_vec.norm(PETSc.NormType.NORM_INFINITY))
             except Exception:
                 fnorm = float(fnorm_snes)
+
+        # PETSc may report a nonconverged reason (e.g. DIVERGED_MAX_IT) even when the
+        # returned iterate already satisfies our intended infinity-norm tolerance.
+        # Treat such cases as converged by our criterion (does not relax tolerances).
+        atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
+        rtol = float(getattr(self.np, "newton_rtol", 0.0) or 0.0)
+        tol_met_abs = bool(atol > 0.0 and np.isfinite(fnorm) and float(fnorm) <= float(atol))
+        tol_met_rel = False  # rtol currently handled by SNES convergence tests (if enabled)
+        if not converged and (tol_met_abs or tol_met_rel):
+            try:
+                conv_abs = int(getattr(PETSc.SNES.ConvergedReason, "CONVERGED_FNORM_ABS", 2))
+            except Exception:
+                conv_abs = 2
+            print(
+                f"    [warn] SNES returned reason={reason_snes} after {n_iters} iters, but ‖F‖_inf={fnorm:.3e} ≤ atol={atol:.3e}; "
+                "treating as converged."
+            )
+            converged = True
+            reason = int(conv_abs)
 
         # Expose convergence diagnostics to the outer time-stepper.
         self._last_nonlinear_norm = float(fnorm)
         self._last_nonlinear_norm_label = "‖F‖_inf"
         self._last_nonlinear_reason = int(reason)
         if not converged:
+            # Ensure norms correspond to the returned iterate.
             try:
-                fnorm_snes = float(self._snes.getFunctionNorm())
+                self._snes.computeFunction(self._x_red, self._r_red)
+                fnorm = float(self._r_red.norm(PETSc.NormType.NORM_INFINITY))
+                fnorm_snes = float(self._r_red.norm(PETSc.NormType.NORM_2))
             except Exception:
-                fnorm_snes = float("nan")
-            # Keep the same acceptance norm as the convergence check (∞-norm).
-            try:
-                f_vec, _ctx = self._snes.getFunction()
-                fnorm = float(f_vec.norm(PETSc.NormType.NORM_INFINITY))
-            except Exception:
-                try:
-                    fnorm = float(self._r_red.norm(PETSc.NormType.NORM_INFINITY))
-                except Exception:
-                    fnorm = float(fnorm_snes)
+                pass
             accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
-            atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
             accept_step = bool(
                 accept_factor > 0.0
                 and atol > 0.0
@@ -4628,7 +4869,7 @@ class PetscSnesNewtonSolver(NewtonSolver):
                 and fnorm <= accept_factor * atol
             )
             print(
-                f"    [warn] SNES did not converge (reason={reason}, iters={n_iters}, ‖F‖_inf={fnorm:.3e}, ‖F‖_2={fnorm_snes:.3e}). "
+                f"    [warn] SNES did not converge (reason={reason_snes}, iters={n_iters}, ‖F‖_inf={fnorm:.3e}, ‖F‖_2={fnorm_snes:.3e}). "
                 "Continuing with best iterate."
             )
             if accept_step:

@@ -316,6 +316,17 @@ def build_biofilm_one_domain_forms(
     # div(ρ_S^n v^{S,n} ⊗ v^{S,k}) for robustness; "full" keeps the nonlinear
     # term.
     skeleton_inertia_convection: str = "lagged",
+    # How to treat the convective part of the fluid momentum.
+    #
+    # The conservative convection in this one-domain formulation includes both
+    #   ρ (v·∇)v  and  v div(ρ v),
+    # where ρ = ρ_f C(α,φ). This can be a major source of nonlinearity in the
+    # monolithic Newton solve.
+    #
+    # - "full" (default): fully nonlinear convection at the k-level
+    # - "lagged": Picard/IMEX-like linearization using n-level coefficients/advectors
+    # - "off": omit convection entirely (Stokes/Brinkman limit)
+    fluid_convection: str = "full",
     # solid/permeability modelling toggles
     solid_model: str = "linear",
     c_nh=None,
@@ -337,6 +348,16 @@ def build_biofilm_one_domain_forms(
     # - u_supg: kinematic (u) transport stabilization
     v_supg: float = 0.0,
     u_supg: float = 0.0,
+    # Optional CIP (interior penalty) stabilizations on the mesh skeleton:
+    # - v_cip:  fluid velocity regularization (helps at moderate/high Re on coarse meshes)
+    # - vS_cip: skeleton velocity regularization (helps near the diffuse interface)
+    v_cip: float = 0.0,
+    vS_cip: float = 0.0,
+    # Optional augmented-Lagrangian / grad-div style stabilization:
+    # adds γ_div * (div(C v + B vS), div(C w) + div(B η)) to the momentum/skeleton
+    # equations. This is consistent (vanishes when the constraint holds) and can
+    # improve conditioning of the transient convection-dominated solve.
+    gamma_div: float = 0.0,
     D_alpha: float = 0.0,
     # Which velocity advects the diffuse indicator α:
     # - "vS"  (default): skeleton velocity v^S
@@ -775,16 +796,40 @@ def build_biofilm_one_domain_forms(
     # (i) Momentum: conservative Navier–Stokes–Brinkman
     # ------------------------------------------------------------------
     momdot = (rho_k * v_k - rho_n * v_n) * inv_dt
-    conv_k = dot(dot(grad(v_k), v_k), v_test)
-    conv_n = dot(dot(grad(v_n), v_n), v_test)
+    fluid_conv_key = str(fluid_convection).strip().lower()
+    if fluid_conv_key in {"explicit"}:
+        fluid_conv_key = "imex"
+    if fluid_conv_key not in {"full", "lagged", "imex", "off"}:
+        raise ValueError(
+            f"Unknown fluid_convection={fluid_convection!r}. Use 'full' (default), 'lagged', 'imex', or 'off'."
+        )
 
     # Conservative convection: div(ρ v⊗v) = ρ (v·∇)v + v div(ρ v), with ρ=ρ_f C.
     div_rhov_k = rho_f * divCv_k
     div_rhov_n = rho_f * divCv_n
 
     r_mom = inner(momdot, v_test) * dx
-    r_mom += th * (rho_k * conv_k + div_rhov_k * dot(v_k, v_test)) * dx
-    r_mom += one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+    if fluid_conv_key == "full":
+        conv_k = dot(dot(grad(v_k), v_k), v_test)
+        conv_n = dot(dot(grad(v_n), v_n), v_test)
+        r_mom += th * (rho_k * conv_k + div_rhov_k * dot(v_k, v_test)) * dx
+        r_mom += one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+    elif fluid_conv_key == "lagged":
+        # Picard/IMEX-like linearization:
+        #   div(ρ^n v^n ⊗ v^k) = ρ^n (v^n·∇)v^k + v^k div(ρ^n v^n)
+        conv_k = dot(dot(grad(v_k), v_n), v_test)
+        conv_n = dot(dot(grad(v_n), v_n), v_test)
+        r_mom += th * (rho_n * conv_k + div_rhov_n * dot(v_k, v_test)) * dx
+        r_mom += one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+    elif fluid_conv_key == "imex":
+        # IMEX-style explicit convection: treat the convective term fully at the n-level
+        # (no v^k dependence). This removes the non-symmetric convection block from the
+        # Jacobian and can significantly improve robustness for long transient runs.
+        conv_k = None
+        conv_n = dot(dot(grad(v_n), v_n), v_test)
+        r_mom += (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+    else:
+        conv_k = None
     r_mom += _c(2.0) * th * mu_k * inner(_epsilon(v_k), _epsilon(v_test)) * dx
     r_mom += _c(2.0) * one_m_th * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
     # Pressure term for the mixture constraint div(C v + B vS)=... :
@@ -794,6 +839,11 @@ def build_biofilm_one_domain_forms(
     # Use dot(gradC, w_test) ordering for backend compatibility.
     div_C_vtest_k = C_k * div(v_test) + dot(gradC_k, v_test)
     r_mom += -p_k * div_C_vtest_k * dx
+    if float(gamma_div) != 0.0:
+        gamma_div_c = _c(float(gamma_div))
+        # Consistent augmented-Lagrangian / grad-div stabilization for the mixture
+        # volume constraint div(F)=0 with F=C v + B vS.
+        r_mom += gamma_div_c * divF_k * div_C_vtest_k * dx
     if drag_mode == "scalar":
         r_mom += beta_k * dot(v_k, v_test) * dx
         r_mom += -beta_k * dot(vS_k, v_test) * dx
@@ -803,15 +853,26 @@ def build_biofilm_one_domain_forms(
 
     a_mom = inv_dt * (drho * dot(v_k, v_test) + rho_k * dot(dv, v_test)) * dx
 
-    a_mom += th * (drho * conv_k + rho_k * dot(dot(grad(dv), v_k), v_test) + rho_k * dot(dot(grad(v_k), dv), v_test)) * dx
-    # Jacobian of the conservative correction v div(ρ v).
-    # Keep trial-family contributions separated to avoid mixed-role metadata
-    # leakage in the assembler (v-trial vs alpha/phi-trial pieces).
-    d_divCv_k_ap = dC_k * div(v_k) + dot(dgradC_k, v_k)
-    d_divCv_k_v = C_k * div(dv) + dot(gradC_k, dv)
-    a_mom += th * (rho_f * d_divCv_k_ap * dot(v_k, v_test)) * dx
-    a_mom += th * (rho_f * d_divCv_k_v * dot(v_k, v_test)) * dx
-    a_mom += th * (div_rhov_k * dot(dv, v_test)) * dx
+    if fluid_conv_key == "full":
+        a_mom += th * (
+            drho * conv_k
+            + rho_k * dot(dot(grad(dv), v_k), v_test)
+            + rho_k * dot(dot(grad(v_k), dv), v_test)
+        ) * dx
+        # Jacobian of the conservative correction v div(ρ v).
+        # Keep trial-family contributions separated to avoid mixed-role metadata
+        # leakage in the assembler (v-trial vs alpha/phi-trial pieces).
+        d_divCv_k_ap = dC_k * div(v_k) + dot(dgradC_k, v_k)
+        d_divCv_k_v = C_k * div(dv) + dot(gradC_k, dv)
+        a_mom += th * (rho_f * d_divCv_k_ap * dot(v_k, v_test)) * dx
+        a_mom += th * (rho_f * d_divCv_k_v * dot(v_k, v_test)) * dx
+        a_mom += th * (div_rhov_k * dot(dv, v_test)) * dx
+    elif fluid_conv_key == "lagged":
+        a_mom += th * (rho_n * dot(dot(grad(dv), v_n), v_test)) * dx
+        a_mom += th * (div_rhov_n * dot(dv, v_test)) * dx
+    elif fluid_conv_key == "imex":
+        # Explicit convection contributes no Jacobian terms.
+        pass
     a_mom += _c(2.0) * th * (dmu * inner(_epsilon(v_k), _epsilon(v_test)) + mu_k * inner(_epsilon(dv), _epsilon(v_test))) * dx
 
     # δ[-p div(C w)] = -(δp) div(C w) - p δ(div(C w)),
@@ -826,6 +887,10 @@ def build_biofilm_one_domain_forms(
     else:
         d_div_C_vtest_k += dot(dgradC_k, v_test)
     a_mom += -(dp * div_C_vtest_k + p_k * d_div_C_vtest_k) * dx
+    if float(gamma_div) != 0.0:
+        gamma_div_c = _c(float(gamma_div))
+        d_divF_k = d_divCv_k + d_divBvS_k
+        a_mom += gamma_div_c * (d_divF_k * div_C_vtest_k + divF_k * d_div_C_vtest_k) * dx
     if drag_mode == "scalar":
         a_mom += dbeta * (dot(v_k, v_test) - dot(vS_k, v_test)) * dx
         a_mom += beta_k * dot(dv, v_test) * dx
@@ -864,6 +929,16 @@ def build_biofilm_one_domain_forms(
             adv_w = dot(grad(v_test), v_n)
             r_mom += tau_v * w_v * inner(adv_v_k, adv_w) * dx
             a_mom += tau_v * w_v * inner(dot(grad(dv), v_n), adv_w) * dx
+
+    # Optional CIP (continuous interior penalty) stabilization for the fluid velocity.
+    # This is a consistent high-frequency regularization that can improve robustness on coarse meshes.
+    if float(v_cip) != 0.0 and ds_cip is not None:
+        n_int = FacetNormal()
+        h_F = avg(MeshSize())
+        tau_cip = _c(float(v_cip)) * (h_F * h_F * h_F) * inv_dt
+        w_v = avg(_one_minus(alpha_n))
+        r_mom += tau_cip * w_v * _grad_inner_jump(v_k, v_test, n_int) * ds_cip
+        a_mom += tau_cip * w_v * _grad_inner_jump(dv, v_test, n_int) * ds_cip
 
     # ------------------------------------------------------------------
     # (ii) Mass / volume constraint (expanded divergence)
@@ -1054,6 +1129,11 @@ def build_biofilm_one_domain_forms(
     div_B_vStest_n = B_n * div(vS_test) + dot(gradB_n, vS_test)
     r_skel_press_k = -p_k * div_B_vStest_k
     r_skel_press_n = -p_n * div_B_vStest_n
+    if float(gamma_div) != 0.0:
+        gamma_div_c = _c(float(gamma_div))
+        # Consistent augmented-Lagrangian stabilization for the mixture constraint
+        # div(F)=0 with F=C v + B vS. The vS variation contributes div(B η).
+        r_skel_press_k += gamma_div_c * divF_k * div_B_vStest_k
 
     # drag reaction: -β (v - vS)
     # Since beta already contains α, if we use alpha again then it would square and it won't 
@@ -1198,6 +1278,10 @@ def build_biofilm_one_domain_forms(
     else:
         d_div_B_vStest_k += dot(dgradB_k, vS_test)
     a_skel += sk_th * (-(dp * div_B_vStest_k + p_k * d_div_B_vStest_k)) * dx
+    if float(gamma_div) != 0.0:
+        gamma_div_c = _c(float(gamma_div))
+        d_divF_k = d_divCv_k + d_divBvS_k
+        a_skel += sk_th * gamma_div_c * (d_divF_k * div_B_vStest_k + divF_k * d_div_B_vStest_k) * dx
     # Drag term is *not* multiplied by alpha again: beta already contains alpha (one-domain blend).
     a_skel += sk_th * d_drag_term_k * dx
     a_skel += -dot(dalpha * f_u, vS_test) * dx
@@ -1377,6 +1461,16 @@ def build_biofilm_one_domain_forms(
         dt_adh = k_n_c * du_nvec + k_t_c * du_tvec + g_n_c * dvS_nvec + g_t_c * dvS_tvec
 
         a_skel += sk_th * (dalpha * a_prev * dot(t_adh_k, vS_test) + alpha_k * a_prev * dot(dt_adh, vS_test)) * ds_adh
+
+    # Optional CIP (continuous interior penalty) stabilization for vS.
+    # Regularizes vS in the diffuse interface / near-zero-α region without changing the continuous limit.
+    if float(vS_cip) != 0.0 and ds_cip is not None:
+        n_int = FacetNormal()
+        h_F = avg(MeshSize())
+        tau_cip = _c(float(vS_cip)) * (h_F * h_F * h_F) * inv_dt
+        w_s = avg(alpha_n)
+        r_skeleton += tau_cip * w_s * _grad_inner_jump(vS_k, vS_test, n_int) * ds_cip
+        a_skel += tau_cip * w_s * _grad_inner_jump(dvS, vS_test, n_int) * ds_cip
 
     # ------------------------------------------------------------------
     # (iii-c) Solid kinematics (Eulerian reference-map constraint)

@@ -121,15 +121,46 @@ To keep the same `τ_w` as you change `H`, scale `u_avg ∝ H` (i.e. keep `u_avg
   - increase inflow ramp time `--t-ramp` (e.g. 2.0 s),
   - enable `--allow-dt-reduction` with a reasonable `--dt-min`.
 
+### Consistent conditioning fix: augmented-Lagrangian `--gamma-div`
+We observed a **repeatable SNES stall** in the transient momentum block for the fully convective case
+(`--fluid-convection full`): SNES iterations reduce the residual quickly but then stagnate just above `--newton-tol`
+(typically dominated by `v_x` at the upstream foot of the biofilm). This happens even at very small `dt`
+and is therefore primarily a **conditioning / saddle-point robustness** issue rather than a physical instability.
+
+Fix: enable the consistent augmented-Lagrangian term
+`γ_div * (div(C v + B vS), div(C w) + div(B η))` in the momentum/skeleton equations:
+- it is **consistent** (vanishes when the mixture volume constraint holds),
+- it acts like a **grad-div penalty** and improves conditioning of the pressure/constraint coupling in transient runs,
+- it does **not** rely on loosening tolerances (works with `--newton-rtol 0` and `--accept-nonconverged-atol-factor 0`).
+
+Recommended scale: `--gamma-div ≈ mu_f` (for water, `mu_f≈1e-3 Pa*s`).
+
+Concrete repro from checkpoint `out/_blauert_pde/restart/checkpoint_step=00042.npz` (t≈0.306 s):
+- Without `--gamma-div`: stalls at `‖F‖_inf≈1.12e-6` and fails at `--max-it 15`.
+- With `--gamma-div 1e-3`: converges in **3 Newton iterations** to `‖F‖_inf≈4.8e-7`.
+
+Example:
+```bash
+conda run --no-capture-output -n fenicsx python -u \
+  examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py \
+  --backend cpp --nx 60 --ny 20 \
+  --restart-from out/_blauert_pde/restart/checkpoint_step=00042.npz --restart-dt 1e-3 \
+  --dt-min 1e-3 --allow-dt-reduction \
+  --newton-tol 1e-6 --newton-rtol 0 --accept-nonconverged-atol-factor 0 \
+  --fluid-convection full --gamma-div 1e-3
+```
+
 **Interpreting SNES “reason=-5” in this benchmark**
 - PETSc SNES reports `reason=-5` when it hits `--max-it` without satisfying its stopping criterion.
 - In this repo we run SNES with an **infinity-norm** stopping criterion by default (`‖F‖_inf`), so `--newton-tol`
   matches the usual “max residual entry” interpretation used by the pure-Python Newton solver.
-- If you see `reason=-5` with `‖F‖_inf` already below `--newton-tol`, that indicates a solver/norm mismatch (should
-  not happen); if `‖F‖_inf` is only slightly above `--newton-tol` and the residual breakdown is dominated by `v_*`,
-  it is typically an iteration-limit issue (increase `--max-it`) rather than a physical instability.
-- `--accept-nonconverged-atol-factor` exists as an escape hatch (default disabled) for cases where SNES reports a
-  nonconverged reason but returns a best iterate with sufficiently small `‖F‖_inf`.
+- PETSc can still return a nonconverged reason (e.g. `-5`) even when the returned iterate satisfies `‖F‖_inf ≤ atol`
+  (common when SNES uses a 2-norm internally on large reduced systems). The solver now treats `‖F‖_inf ≤ atol` as
+  **converged** and prints a one-line warning (this is *not* a tolerance relaxation).
+- If `‖F‖_inf` is only slightly above `--newton-tol` and the residual breakdown is dominated by `v_*`, it is usually an
+  iteration/line-search robustness issue in the transient fluid block rather than a physical instability.
+- `--accept-nonconverged-atol-factor` remains an explicit escape hatch (default disabled) when you *want* to accept a
+  best iterate with `‖F‖_inf` near `atol` even if strict convergence is not achieved.
 
 #### Observed Newton failure mode (fluid momentum block)
 When the long run fails (e.g. `step≈27`, `t≈0.8438 s` in the log you shared), the residual tracing shows:
@@ -137,8 +168,9 @@ When the long run fails (e.g. `step≈27`, `t≈0.8438 s` in the log you shared)
 - only the **fluid velocity** residuals (`v_x, v_y`) stagnate at `O(10^{-3})`,
 - PETSc SNES exits with `DIVERGED_LINE_SEARCH` or `DIVERGED_MAX_IT`.
 
-This is a **time-step/inertia driven** robustness issue in the transient Navier–Stokes part: the solver needs a
-smaller `dt` than the current `--dt-min` to keep the nonlinear change per step small enough.
+This can be either:
+- a **conditioning-driven stall** near the tolerance (fixed robustly by `--gamma-div`), or
+- a true **time-step/inertia driven** failure when the nonlinear change per step is too large.
 
 Concrete reproduction (coarse `nx=60, ny=20`):
 - With `rho_f=1000` and `dt=0.05`, the `t=0.55→0.60 s` step stalls at `‖F‖≈2.3e-3` dominated by `v_y≈7e-4`.
