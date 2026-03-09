@@ -301,7 +301,8 @@ def _regional_error_metrics(
 
     ix = int(np.argmin(np.abs(np.asarray(x, dtype=float) - float(params.profile_x))))
     profile_diff = np.asarray(diff[ix, :], dtype=float)
-    profile_l2 = math.sqrt(float(np.trapezoid(profile_diff ** 2, np.asarray(y, dtype=float))))
+    # Use trapz for compatibility with NumPy versions that do not provide np.trapezoid.
+    profile_l2 = math.sqrt(float(np.trapz(profile_diff ** 2, x=np.asarray(y, dtype=float))))
     profile_linf = float(np.max(np.abs(profile_diff)))
     profile_y_int = float(_interface_height(np.array([float(x[ix])], dtype=float))[0])
     band = np.abs(np.asarray(y, dtype=float) - profile_y_int) <= max(float(x[1] - x[0]), 0.05)

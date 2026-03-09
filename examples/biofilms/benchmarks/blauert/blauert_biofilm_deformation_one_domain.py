@@ -964,6 +964,26 @@ def main() -> None:
     ap.add_argument("--dt-min", type=float, default=0.01)
     ap.add_argument("--dt-reduction-factor", type=float, default=0.5)
 
+    ap.add_argument(
+        "--predictor",
+        type=str,
+        default="delta",
+        choices=("prev", "delta"),
+        help="Initial guess for each time step: 'prev' uses U^n, 'delta' extrapolates using the previous accepted increment.",
+    )
+    ap.add_argument(
+        "--predictor-damping",
+        type=float,
+        default=0.5,
+        help="Damping factor for the 'delta' predictor (0 disables). Values < 1 often improve robustness during inflow ramping.",
+    )
+    ap.add_argument(
+        "--predictor-clip-01",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clip predicted alpha/phi to [0,1] (predictor only; does not change converged solution).",
+    )
+
     ap.add_argument("--newton-tol", type=float, default=1.0e-6)
     ap.add_argument("--newton-rtol", type=float, default=0.0, help="Relative SNES tolerance (0 disables).")
     ap.add_argument("--max-it", type=int, default=25)
@@ -985,10 +1005,24 @@ def main() -> None:
     ap.add_argument("--alpha-box-constraints", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--phi-box-constraints", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument(
+        "--newton-solver",
+        type=str,
+        default="pdas",
+        choices=("pdas", "snes"),
+        help="Nonlinear solver: 'pdas' (semismooth Newton for box constraints) or 'snes' (PETSc SNES).",
+    )
+    ap.add_argument(
         "--accept-nonconverged-atol-factor",
         type=float,
         default=0.0,
         help="Accept SNES best iterate when ‖F‖ <= factor*atol even if SNES reports non-convergence (0 disables).",
+    )
+    ap.add_argument(
+        "--lu-solver",
+        type=str,
+        default="mumps",
+        choices=("mumps", "superlu_dist", "superlu"),
+        help="Direct LU factorization backend used by PETSc (SNES only).",
     )
 
     # Flow
@@ -1006,6 +1040,13 @@ def main() -> None:
     # Material / coupling (FSI-only: disable growth/detachment/damage)
     ap.add_argument("--rho-f", type=float, default=1000.0)
     ap.add_argument("--mu-f", type=float, default=1.0e-3)
+    ap.add_argument(
+        "--mu-b-model",
+        type=str,
+        default="phi_mu",
+        choices=("mu", "phi_mu"),
+        help="Effective viscosity model μ(α,φ). 'mu' keeps μ≡μ_f; 'phi_mu' (default) uses Brinkman scaling μ=μ_f((1-α)+αφ).",
+    )
     ap.add_argument("--kappa-inv", type=float, default=1.0e12, help="Inverse permeability [1/m^2].")
     ap.add_argument("--phi-b", type=float, default=0.47, help="Initial porosity inside the biofilm (0<phi_b<1).")
     ap.add_argument("--E", type=float, default=200.0, help="Young's modulus of the solid phase [Pa] (Dian paper default).")
@@ -1092,20 +1133,35 @@ def main() -> None:
         help="SUPG-like streamline diffusion for fluid momentum convection (0 disables; typical 0.1–10).",
     )
     ap.add_argument(
+        "--gamma-div",
+        type=float,
+        default=0.0,
+        help=(
+            "Consistent augmented-Lagrangian stabilization for the mixture volume constraint "
+            "div(C v + B vS)=0. Acts like a grad-div penalty and can improve conditioning "
+            "for long transient runs (0 disables; typical ≈mu_f, e.g. 1e-3)."
+        ),
+    )
+    ap.add_argument(
+        "--fluid-convection",
+        type=str,
+        default="full",
+        choices=("full", "lagged", "imex", "off"),
+        help=(
+            "How to treat fluid convection: 'full' (default) is fully nonlinear, "
+            "'lagged' is Picard/Oseen-like (linear in v^k with n-level advector), "
+            "'imex' treats convection explicitly at the n-level, "
+            "'off' is Stokes/Brinkman."
+        ),
+    )
+    ap.add_argument(
         "--u-supg",
         type=float,
         default=0.0,
         help="SUPG-like streamline diffusion for kinematic u-transport (0 disables; typical 0.1–10).",
     )
-    ap.add_argument(
-        "--gamma-div",
-        type=float,
-        default=0.0,
-        help=(
-            "Augmented-Lagrangian / grad-div stabilization strength on the mixture "
-            "constraint div(C v + B vS)=0 (or div(C v + B vS)=alpha*s_v in the full model)."
-        ),
-    )
+    ap.add_argument("--v-cip", type=float, default=0.0, help="CIP stabilization strength for fluid velocity (0 disables).")
+    ap.add_argument("--vS-cip", type=float, default=0.0, help="CIP stabilization strength for skeleton velocity (0 disables).")
 
     # Transport (alpha/phi)
     ap.add_argument(
@@ -1153,6 +1209,12 @@ def main() -> None:
         default="degenerate",
         choices=("constant", "degenerate"),
         help="Mobility model for Cahn–Hilliard alpha regularization.",
+    )
+    ap.add_argument(
+        "--alpha-phi-vi-bounds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use PETSc SNES VI bounds to enforce alpha,phi ∈ [0,1] in --transport-mode pde.",
     )
 
     # Alpha initialization
@@ -1270,6 +1332,12 @@ def main() -> None:
     alpha_ch_eps = float(getattr(args, "alpha_ch_eps", float("nan")))
     if not np.isfinite(alpha_ch_eps):
         alpha_ch_eps = float(getattr(args, "eps", 1.0))
+
+    use_alpha_phi_vi_bounds = bool(
+        (transport_mode == "pde")
+        and (not paper1_reduced)
+        and bool(getattr(args, "alpha_phi_vi_bounds", True))
+    )
 
     if (transport_mode == "pde") and (not paper1_reduced):
         D_phi_val = float(getattr(args, "D_phi", 0.0))
@@ -1607,6 +1675,7 @@ def main() -> None:
             rho_f=Constant(float(args.rho_f)),
             mu_f=Constant(float(args.mu_f)),
             mu_b=Constant(float(args.mu_f)),
+            mu_b_model=str(getattr(args, "mu_b_model", "phi_mu")),
             kappa_inv=Constant(float(args.kappa_inv)),
             mu_s=Constant(float(mu_s)),
             lambda_s=Constant(float(lambda_s)),
@@ -1672,7 +1741,10 @@ def main() -> None:
             kinematics_scale=float(args.kinematics_scale) if np.isfinite(float(args.kinematics_scale)) else None,
             v_supg=float(args.v_supg),
             u_supg=float(args.u_supg),
+            v_cip=float(args.v_cip),
+            vS_cip=float(args.vS_cip),
             gamma_div=float(args.gamma_div),
+            fluid_convection=str(getattr(args, "fluid_convection", "full")),
             # Transport/kinetics controls (FSI-only: disable growth/detachment/damage, but may solve alpha/phi in PDE mode).
             D_phi=float(args.D_phi) if transport_mode == "pde" else 0.0,
             gamma_phi=float(args.gamma_phi) if transport_mode == "pde" else 0.0,
@@ -1701,7 +1773,6 @@ def main() -> None:
             k_det=0.0,
             dim=2,
         )
-
     # ------------------------------------------------------------------
     # Boundary conditions
     # ------------------------------------------------------------------
@@ -1972,7 +2043,11 @@ def main() -> None:
         line_search=True,
         ls_mode=str(args.ls_mode),
     )
-    solver_kind = str(args.nonlinear_solver).strip().lower()
+    solver_kind = str(getattr(args, "nonlinear_solver", "pdas")).strip().lower()
+    newton_solver_key = str(getattr(args, "newton_solver", "pdas")).strip().lower()
+    if newton_solver_key in {"snes", "newton"}:
+        solver_kind = newton_solver_key
+
     common_solver_kwargs = dict(
         dof_handler=dh,
         mixed_element=me,
@@ -1984,15 +2059,22 @@ def main() -> None:
     )
     if solver_kind == "snes":
         petsc_opts = {
-            "snes_type": "newtonls",
+            # For box-constrained runs (alpha/phi bounds), use a VI-capable SNES.
+            "snes_type": "vinewtonrsls" if use_alpha_phi_vi_bounds else "newtonls",
+            # Backtracking line search; we also apply an infinity-norm based pre-check
+            # damping in the solver to reduce DIVERGED_LINE_SEARCH events near tight tol.
             "snes_linesearch_type": "bt",
             "snes_atol": float(args.newton_tol),
             "snes_rtol": float(args.newton_rtol),
             "snes_max_it": int(args.max_it),
             "ksp_type": "preonly",
             "pc_type": "lu",
-            "pc_factor_mat_solver_type": "mumps",
+            "pc_factor_mat_solver_type": str(getattr(args, "lu_solver", "mumps")),
         }
+        if str(getattr(args, "lu_solver", "mumps")).strip().lower() == "mumps":
+            # Improve robustness/accuracy on the non-symmetric transient momentum block.
+            # MUMPS ICNTL(10): max iterative refinement steps (0 = default).
+            petsc_opts.setdefault("mat_mumps_icntl_10", 5)
         if os.getenv("PYCUTFEM_PETSC_MONITOR", "").strip().lower() in {"1", "true", "yes"}:
             petsc_opts.setdefault("snes_monitor", None)
             petsc_opts.setdefault("snes_converged_reason", None)
@@ -2028,9 +2110,9 @@ def main() -> None:
         )
 
     bounds_by_field: dict[str, tuple[float | None, float | None]] = {}
-    if bool(args.alpha_box_constraints):
+    if bool(args.alpha_box_constraints) or use_alpha_phi_vi_bounds:
         bounds_by_field["alpha"] = (0.0, 1.0)
-    if (phi_k is not None) and bool(args.phi_box_constraints):
+    if (phi_k is not None) and (bool(args.phi_box_constraints) or use_alpha_phi_vi_bounds):
         bounds_by_field["phi"] = (0.0, 1.0)
     if bounds_by_field and hasattr(solver, "set_box_bounds"):
         solver.set_box_bounds(by_field=bounds_by_field)
@@ -2088,6 +2170,18 @@ def main() -> None:
         out.sort(reverse=True, key=lambda t: t[0])
         return out
 
+    predictor_base = str(args.predictor)
+    predictor_damping_base = float(args.predictor_damping)
+    predictor_clip_01_base = bool(args.predictor_clip_01)
+    retry_state = {
+        "step_no": None,
+        "predictor_fallbacks": 0,
+        "maxit_boosts": 0,
+        "linesearch_fallbacks": 0,
+        "dtmin_maxit_retries": 0,
+        "petsc_resets": 0,
+    }
+
     def on_step_failure(**info):  # noqa: ANN001
         """
         Debug hook for failed/nonconverged time steps.
@@ -2110,6 +2204,116 @@ def main() -> None:
         reason = getattr(solver, "_last_nonlinear_reason", None)
         fnorm = getattr(solver, "_last_nonlinear_norm", None)
         print(f"    [fail] step={step_no} t={t_fail:.6e} dt={dt_fail:.3e} reason={reason} norm={fnorm}")
+
+        # For SNES line-search divergence, the most common cause we've observed in this
+        # benchmark is an overly aggressive time-step predictor. Try re-solving the same
+        # time step with a safer initial guess before reducing Δt.
+        #
+        # NOTE: This keeps the same tolerances (rtol=0, accept_factor=0) and only changes
+        # the initial guess / solve strategy.
+        try:
+            reason_i = int(reason) if reason is not None else None
+        except Exception:
+            reason_i = None
+        if retry_state.get("step_no", None) != step_no:
+            retry_state["step_no"] = int(step_no)
+            retry_state["predictor_fallbacks"] = 0
+            retry_state["maxit_boosts"] = 0
+            retry_state["linesearch_fallbacks"] = 0
+            retry_state["dtmin_maxit_retries"] = 0
+            retry_state["petsc_resets"] = 0
+
+        # Retry once with predictor='prev' on line-search divergence (-6).
+        if reason_i == -6 and retry_state.get("predictor_fallbacks", 0) < 1 and predictor_base.strip().lower() != "prev":
+            retry_state["predictor_fallbacks"] = int(retry_state.get("predictor_fallbacks", 0)) + 1
+            try:
+                time_params.predictor = "prev"
+                time_params.predictor_damping = 0.0
+                time_params.predictor_clip_01 = predictor_clip_01_base
+            except Exception:
+                pass
+            print("    [retry] SNES diverged in line search; retrying same Δt with predictor='prev' (no extrapolation).")
+            return "retry"
+
+        # If we are very close to the requested absolute tolerance but hit SNES max-it at dt==dt_min,
+        # retry the same step with a higher max-it (keeps rtol=0 and avoids dt collapse).
+        try:
+            atol = float(args.newton_tol)
+        except Exception:
+            atol = 0.0
+        try:
+            dt_min_val = float(getattr(args, "dt_min", 0.0))
+        except Exception:
+            dt_min_val = 0.0
+        try:
+            max_it_cap = int(os.getenv("PYCUTFEM_MAX_IT_CAP", "80"))
+        except Exception:
+            max_it_cap = 80
+        try:
+            max_it_now = int(getattr(solver.np, "max_newton_iter", int(args.max_it)))
+        except Exception:
+            max_it_now = int(args.max_it)
+
+        close_enough = bool(atol > 0.0 and fnorm is not None and np.isfinite(float(fnorm)) and float(fnorm) <= 20.0 * atol)
+        hit_maxit = bool(reason_i == -5)
+        at_dt_min = bool(dt_min_val > 0.0 and dt_fail <= dt_min_val + 1.0e-15)
+
+        # At dt==dt_min, if SNES diverges in line search, do one retry from the current
+        # best iterate (keep guess) before giving up. This avoids touching PETSc's
+        # internal linesearch objects (API differences across PETSc builds).
+        if reason_i == -6 and at_dt_min and retry_state.get("linesearch_fallbacks", 0) < 1:
+            retry_state["linesearch_fallbacks"] = int(retry_state.get("linesearch_fallbacks", 0)) + 1
+            print("    [retry] dt==dt_min and SNES line search diverged; retrying from best iterate (keep guess).")
+            return "retry_keep_guess"
+
+        if hit_maxit and at_dt_min:
+            retry_state["dtmin_maxit_retries"] = int(retry_state.get("dtmin_maxit_retries", 0)) + 1
+            # If we keep hitting max-it at dt_min, SNES/KSP can get stuck in a
+            # poor internal state. Rebuild the PETSc stack once and retry.
+            if retry_state.get("dtmin_maxit_retries", 0) >= 2 and retry_state.get("petsc_resets", 0) < 1:
+                retry_state["petsc_resets"] = int(retry_state.get("petsc_resets", 0)) + 1
+                if hasattr(solver, "_invalidate_petsc_cache"):
+                    try:
+                        solver._invalidate_petsc_cache()
+                        print("    [retry] repeated max-it at dt_min; rebuilding PETSc SNES/KSP stack and retrying.")
+                        return "retry_keep_guess"
+                    except Exception as exc:
+                        print(f"    [retry] failed to reset PETSc stack: {exc}")
+
+        if hit_maxit and at_dt_min and close_enough and max_it_now < max_it_cap:
+            new_max = min(max_it_cap, max(max_it_now + 5, int(1.5 * max_it_now)))
+            try:
+                solver.np.max_newton_iter = int(new_max)
+                if getattr(solver, "_snes", None) is not None:
+                    try:
+                        _atol, _rtol, _stol, _max_it, _max_funcs = solver._snes.getTolerances()
+                        solver._snes.setTolerances(atol=float(_atol), rtol=float(_rtol), stol=float(_stol), max_it=int(new_max))
+                    except Exception:
+                        pass
+                print(
+                    f"    [retry] SNES hit max-it at dt_min with ‖F‖_inf={float(fnorm):.3e}; retrying with --max-it {new_max}."
+                )
+                return "retry_keep_guess"
+            except Exception as exc:
+                print(f"    [retry] failed to increase max-it: {exc}")
+
+        # If we are close to atol and just hit SNES max-it, do one continuation retry with
+        # a larger max-it before reducing Δt. Keep the current best iterate as the initial guess.
+        if hit_maxit and close_enough and max_it_now < max_it_cap and retry_state.get("maxit_boosts", 0) < 1:
+            retry_state["maxit_boosts"] = int(retry_state.get("maxit_boosts", 0)) + 1
+            new_max = min(max_it_cap, max(max_it_now + 5, int(1.5 * max_it_now)))
+            try:
+                solver.np.max_newton_iter = int(new_max)
+                if getattr(solver, "_snes", None) is not None:
+                    try:
+                        _atol, _rtol, _stol, _max_it, _max_funcs = solver._snes.getTolerances()
+                        solver._snes.setTolerances(atol=float(_atol), rtol=float(_rtol), stol=float(_stol), max_it=int(new_max))
+                    except Exception:
+                        pass
+                print(f"    [retry] SNES hit max-it with ‖F‖_inf={float(fnorm):.3e}; retrying with --max-it {new_max}.")
+                return "retry_keep_guess"
+            except Exception as exc:
+                print(f"    [retry] failed to increase max-it: {exc}")
 
         try:
             funcs = list(info.get("functions", []) or [])
@@ -2167,6 +2371,17 @@ def main() -> None:
         return None
 
     def post_step_refiner(step, bcs_now, functions, prev_functions):
+        # Restore baseline predictor after successful steps (handles retries where we
+        # temporarily fall back to predictor='prev' for robustness).
+        try:
+            time_params.predictor = str(predictor_base)
+            time_params.predictor_damping = float(predictor_damping_base)
+            time_params.predictor_clip_01 = bool(predictor_clip_01_base)
+        except Exception:
+            pass
+        # Line search is configured via `petsc_opts` on solver creation; avoid mutating
+        # PETSc options mid-run (can rewire KSP/PC and lead to size-mismatch errors).
+
         _post_step_update()
         step_no = int(getattr(solver, "_current_step_no", int(step)))
         t_now = float(getattr(solver, "_current_t", 0.0) + getattr(solver, "_current_dt", dt_val))
@@ -2335,25 +2550,29 @@ def main() -> None:
     if float(t0) >= float(args.t_final) - 1.0e-14:
         logging.info(f"[done] restart t0={float(t0):.6e}s >= t_final={float(args.t_final):.6e}s; nothing to do.")
         return
+    time_params = TimeStepperParameters(
+        dt=dt_val,
+        final_time=float(args.t_final),
+        max_steps=100_000,
+        theta=theta,
+        t0=float(t0),
+        step0=int(step0),
+        stop_on_steady=False,
+        steady_tol=0.0,
+        allow_dt_reduction=bool(args.allow_dt_reduction),
+        dt_min=float(args.dt_min),
+        dt_reduction_factor=float(args.dt_reduction_factor),
+        on_dt_change=_on_dt_change,
+        on_step_failure=on_step_failure,
+        predictor=str(predictor_base),
+        predictor_damping=float(predictor_damping_base),
+        predictor_clip_01=bool(predictor_clip_01_base),
+    )
     solver.solve_time_interval(
         functions=functions_k,
         prev_functions=functions_n,
         aux_functions={"dt": dt_c},
-        time_params=TimeStepperParameters(
-            dt=dt_val,
-            final_time=float(args.t_final),
-            max_steps=100_000,
-            theta=theta,
-            t0=float(t0),
-            step0=int(step0),
-            stop_on_steady=False,
-            steady_tol=0.0,
-            allow_dt_reduction=bool(args.allow_dt_reduction),
-            dt_min=float(args.dt_min),
-            dt_reduction_factor=float(args.dt_reduction_factor),
-            on_dt_change=_on_dt_change,
-            on_step_failure=on_step_failure,
-        ),
+        time_params=time_params,
         post_step_refiner=post_step_refiner,
     )
 
