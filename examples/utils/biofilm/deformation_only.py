@@ -11,6 +11,10 @@ This module implements the baseline system described in the manuscript:
 Compared to `examples.utils.biofilm.one_domain`, this reduced model removes
 porosity transport, substrate, detached biomass, growth, detachment, and damage.
 It is the form builder that should be used for the Paper-1 verification program.
+
+An optional Kelvin--Voigt skeleton viscosity `solid_visco_eta` is supported for
+dynamic application-style benchmarks. It is off by default, so the exact and
+manufactured-solution benchmarks remain on the purely elastic reduced model.
 """
 
 from __future__ import annotations
@@ -119,10 +123,18 @@ def build_deformation_only_forms(
     kappa_inv=None,
     mu_s=None,
     lambda_s=None,
+    solid_visco_eta: float = 0.0,
+    gamma_div: float = 0.0,
     phi_b: float = 0.5,
     M_alpha: float = 1.0,
     gamma_alpha: float = 1.0,
     eps_alpha: float = 1.0,
+    # optional interface traction benchmark hook
+    dGamma=None,
+    g_t_k=None,
+    g_t_n=None,
+    traction_weight_k=None,
+    traction_weight_n=None,
     # sources
     f_v=None,
     f_u=None,
@@ -147,6 +159,10 @@ def build_deformation_only_forms(
     f_v = f_v if f_v is not None else zero_vector
     f_u = f_u if f_u is not None else zero_vector
     f_alpha = f_alpha if f_alpha is not None else zero_scalar
+    g_t_k = g_t_k if g_t_k is not None else zero_vector
+    g_t_n = g_t_n if g_t_n is not None else g_t_k
+    traction_weight_k = traction_weight_k if traction_weight_k is not None else zero_scalar
+    traction_weight_n = traction_weight_n if traction_weight_n is not None else traction_weight_k
 
     # Frozen coefficients at time level n (matches the one-step analysis in the manuscript).
     C_n = _C(alpha_n, phi_b=phi_b_c)
@@ -164,6 +180,8 @@ def build_deformation_only_forms(
 
     div_C_vtest = _div_weighted_scalar_times_vector(C_n, gradC_n, v_test)
     div_B_vStest = _div_weighted_scalar_times_vector(B_n, gradB_n, vS_test)
+    d_div_C_vtest = zero_scalar
+    d_div_B_vStest = zero_scalar
 
     div_C_vk = _div_weighted_scalar_times_vector(C_n, gradC_n, v_k)
     div_B_vSk = _div_weighted_scalar_times_vector(B_n, gradB_n, vS_k)
@@ -210,6 +228,40 @@ def build_deformation_only_forms(
     a_skel = th * alpha_n * _linear_elastic_term(du, vS_test, mu_s=mu_s, lambda_s=lambda_s) * dx
     a_skel += -(dp * div_B_vStest) * dx
     a_skel += -th * beta_n * (dot(dv, vS_test) - dot(dvS, vS_test)) * dx
+
+    if float(solid_visco_eta) != 0.0:
+        eta_s_c = _c(float(solid_visco_eta))
+        sig_visc_k = _c(2.0) * eta_s_c * _epsilon(vS_k)
+        sig_visc_n = _c(2.0) * eta_s_c * _epsilon(vS_n)
+        r_visc_k = inner(sig_visc_k, grad(vS_test))
+        r_visc_n = inner(sig_visc_n, grad(vS_test))
+        r_skel += (th * alpha_n * r_visc_k + one_m_th * alpha_n * r_visc_n) * dx
+
+        sig_dvisc = _c(2.0) * eta_s_c * _epsilon(dvS)
+        a_skel += th * alpha_n * inner(sig_dvisc, grad(vS_test)) * dx
+
+    # Optional equal-and-opposite interface traction transfer, used by the
+    # FSI benchmark to inject a known tangential traction on the alpha=1/2 contour.
+    if dGamma is not None:
+        r_mom += -(th * _dot_2d_components(g_t_k, v_test) + one_m_th * _dot_2d_components(g_t_n, v_test)) * dGamma
+        r_skel += (th * _dot_2d_components(g_t_k, vS_test) + one_m_th * _dot_2d_components(g_t_n, vS_test)) * dGamma
+    if traction_weight_k is not None or traction_weight_n is not None:
+        r_mom += -(
+            th * traction_weight_k * _dot_2d_components(g_t_k, v_test)
+            + one_m_th * traction_weight_n * _dot_2d_components(g_t_n, v_test)
+        ) * dx
+        r_skel += (
+            th * traction_weight_k * _dot_2d_components(g_t_k, vS_test)
+            + one_m_th * traction_weight_n * _dot_2d_components(g_t_n, vS_test)
+        ) * dx
+    if float(gamma_div) != 0.0:
+        gamma_div_c = _c(float(gamma_div))
+        mass_res_k = div_C_vk + div_B_vSk
+        d_mass_res_k = div_C_dv + div_B_dvS
+        r_mom += gamma_div_c * mass_res_k * div_C_vtest * dx
+        r_skel += gamma_div_c * mass_res_k * div_B_vStest * dx
+        a_mom += gamma_div_c * (d_mass_res_k * div_C_vtest + mass_res_k * d_div_C_vtest) * dx
+        a_skel += gamma_div_c * (d_mass_res_k * div_B_vStest + mass_res_k * d_div_B_vStest) * dx
 
     # (iv) Eulerian reference-map kinematics.
     r_kin = inv_dt * (inner(u_k, u_test) - inner(u_n, u_test)) * dx

@@ -1,3 +1,125 @@
+# FSI benchmark investigation log
+
+## 2026-03-08: Jonas-inspired exact shear benchmark (publication candidate)
+
+### Final Benchmark 5 design
+The publication Benchmark 5 is now the Jonas-inspired exact shear benchmark:
+
+- exact driver: `examples/biofilms/benchmarks/FSI/paper1_benchmark5_jonas_shear.py`
+- exact benchmark definition: `examples/utils/biofilm/benchmark5_jonas_shear_exact.py`
+
+The final benchmark is tailored to the reduced Paper 1 one-domain variables
+`(v,p,vS,u,alpha,mu_alpha)` and keeps the conservative Cahn--Hilliard interface active.
+Instead of reusing the sharp Jonas annulus directly, the benchmark introduces a
+benchmark-local **diffuse tangential traction transfer**
+localized by the conserved interface weight `omega_Gamma = d_y alpha`.
+That gives an exact verification problem for the actual reduced Paper 1 model.
+
+### Frozen production result
+Run tag:
+
+- `benchmark5_jonas_publish_ready_20260308`
+
+Finest production mesh (`n_x = 32`):
+
+- `||e_v||_{L^2} = 7.630e-04`
+- `||e_p||_{L^2} = 7.864e-03`
+- `||e_u||_{L^2} = 1.410e-03`
+- `||e_alpha||_{L^2} = 1.549e-03`
+- `||e_mu_alpha||_{L^2} = 1.368e-04`
+- `|e_{u,Gamma}| = 1.421e-03`
+
+Production rates from `16 -> 32`:
+
+- `EOC(v_L2) = 1.692`
+- `EOC(p_L2) = 1.727`
+- `EOC(vS_L2) = 1.948`
+- `EOC(u_L2) = 1.948`
+- `EOC(alpha_L2) = 1.981`
+- `EOC(mu_alpha_L2) = 1.962`
+- `EOC(v_H1) = 1.932`
+- `EOC(u_H1) = 1.927`
+
+### Assessment
+This is the first structurally consistent Benchmark 5 variant.
+It verifies:
+
+- tangential traction transfer,
+- reference-map deformation response,
+- and the conserved Cahn--Hilliard interface
+
+inside the reduced one-domain formulation itself.
+This benchmark is strong enough to serve as the Benchmark 5 manuscript block for Paper 1.
+
+## 2026-03-08: Jonas annulus impermeable-limit prototype
+
+### Goal
+Test whether the reduced Paper 1 one-domain mechanics block can recover the
+steady analytic annulus benchmark from Jonas--Heuveline (2016):
+- Taylor--Couette fluid annulus with inner angular velocity,
+- surrounding elastic ring,
+- exact steady fluid velocity / pressure and exact solid tangential displacement.
+
+### Historical prototype files
+The annulus prototype was evaluated locally during development and then retired.
+It is kept in this log only as a failure analysis record.
+
+### What was tested
+- annulus mesh generated with gmsh and loaded into pycutfem,
+- reduced one-domain unknown set `(v,p,vS,u,phi,alpha,mu_alpha,S)`,
+- `phi`, `alpha`, `mu_alpha`, and `S` frozen so only the mechanics block is active,
+- transient relaxation from rest to a steady state under the analytic inner-wall
+  tangential velocity,
+- comparison against the Jonas steady fields on fluid and solid core regions.
+
+### Main finding
+The prototype converges to a steady state numerically, but it does **not**
+recover the Jonas solid displacement field. The mismatch is structural, not a
+parameter-tuning issue.
+
+Representative run:
+```bash
+conda run --no-capture-output -n fenicsx python -u \
+  examples/biofilms/benchmarks/FSI/paper1_benchmark5_jonas_annulus.py \
+  --outdir /tmp/benchmark5_transient_probe2 \
+  --h-list 0.12 --kappa-inv-list 1e4,1e5 \
+  --dt 0.1 --final-time 1.0 --steady-tol 1e-5 --png-dpi 100 --quiet
+```
+
+Observed steady states on `h_max ≈ 0.118`:
+- `kappa_inv = 1e4`: `fluid_v_rel_l2 = 5.38e-01`, `solid_u_rel_l2 = 1.00e+00`,
+  `u_probe_final = 1.10e-05`, `u_probe_exact = -1.63e-02`
+- `kappa_inv = 1e5`: `fluid_v_rel_l2 = 7.41e-01`, `solid_u_rel_l2 = 1.00e+00`,
+  `u_probe_final = 1.24e-06`, `u_probe_exact = -1.63e-02`
+
+So the solver reaches steady state quickly, leakage decreases with larger
+`kappa_inv`, but the solid tangential displacement remains essentially zero.
+
+### Interpretation
+This is consistent with the reduced Paper 1 mechanics model.
+The Jonas annulus deformation is driven by **tangential interfacial viscous
+traction**.
+In the current reduced one-domain mechanics block, the skeleton is driven by:
+- pressure coupling through `B(alpha,phi) grad p`,
+- Darcy/Brinkman drag through `beta(alpha,phi) (v - vS)`,
+- elastic stress and the Eulerian kinematic update.
+
+The model does **not** include a sharp-interface tangential traction transfer of
+the Jonas type. Therefore the Jonas `u_theta` field is not the correct target
+for this reduced model, even though the annulus fluid solve itself is well posed.
+
+### Consequence for Benchmark 5
+Do **not** wire the Jonas annulus benchmark into the paper-ready suite as a
+publication benchmark in its current form.
+
+There are two viable paths:
+1. Change the model so the impermeable limit carries the missing tangential
+   traction transfer, then rerun Jonas.
+2. Replace Benchmark 5 with an impermeable-limit comparison whose deformation is
+   driven by the couplings that are actually present in the reduced model
+   (pressure / drag / reference-map kinematics), not by classical tangential
+   FSI traction continuity.
+
 # Turek–Hron FSI-2 (one-domain) investigation log
 
 ## Goal

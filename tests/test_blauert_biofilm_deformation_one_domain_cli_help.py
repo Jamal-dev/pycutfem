@@ -27,7 +27,13 @@ def test_blauert_biofilm_deformation_one_domain_cli_help() -> None:
     assert "--trace-residual-worst" in proc.stdout
     assert "--v-supg" in proc.stdout
     assert "--u-supg" in proc.stdout
+    assert "--gamma-div" in proc.stdout
     assert "--newton-rtol" in proc.stdout
+    assert "--nonlinear-solver" in proc.stdout
+    assert "--ls-mode" in proc.stdout
+    assert "--vi-c" in proc.stdout
+    assert "--alpha-box-constraints" in proc.stdout
+    assert "--phi-box-constraints" in proc.stdout
     assert "--accept-nonconverged-atol-factor" in proc.stdout
     assert "--kinematics-scale" in proc.stdout
     assert "--transport-mode" in proc.stdout
@@ -36,3 +42,8 @@ def test_blauert_biofilm_deformation_one_domain_cli_help() -> None:
     assert "--alpha-advection-form" in proc.stdout
     assert "--alpha-ch-M" in proc.stdout
     assert "--alpha-ch-gamma" in proc.stdout
+    assert "--diffuse-shear-traction" in proc.stdout
+    assert "--diffuse-shear-model" in proc.stdout
+    assert "--diffuse-shear-time-scheme" in proc.stdout
+    assert "--diffuse-shear-ramp-time" in proc.stdout
+    assert "lagged_stress" in proc.stdout

@@ -95,6 +95,21 @@ def _linear_elastic_term(u, eta, *, mu_s, lambda_s):
     # For symmetric stress, σ(u):∇η = 2μ ε(u):ε(η) + λ div(u) div(η).
     return _c(2.0) * mu_s * inner(_epsilon(u), _epsilon(eta)) + lambda_s * div(u) * div(eta)
 
+
+def _vector_component(vec_expr, idx: int):
+    try:
+        return vec_expr[idx]
+    except Exception:
+        val = getattr(vec_expr, "value", None)
+        if val is None:
+            raise
+        return _c(float(val[int(idx)]))
+
+
+def _dot_2d_components(vec_expr, vec_test):
+    return _vector_component(vec_expr, 0) * vec_test[0] + _vector_component(vec_expr, 1) * vec_test[1]
+
+
 def _smooth_pos(x, *, eta: float = 1.0e-12):
     """Smooth positive part ⟨x⟩_+ ≈ 0.5 (x + sqrt(x^2 + eta))."""
     return _c(0.5) * (x + _sqrt(x * x + _c(float(eta))))
@@ -337,6 +352,9 @@ def build_biofilm_one_domain_forms(
     # - u_supg: kinematic (u) transport stabilization
     v_supg: float = 0.0,
     u_supg: float = 0.0,
+    # Optional augmented-Lagrangian / grad-div stabilization on the
+    # one-domain mixture constraint div(C v + B vS) = alpha*s_v.
+    gamma_div: float = 0.0,
     D_alpha: float = 0.0,
     # Which velocity advects the diffuse indicator α:
     # - "vS"  (default): skeleton velocity v^S
@@ -353,6 +371,12 @@ def build_biofilm_one_domain_forms(
     # - "advective" (default): u·∇α   (indicator/level-set style; preserves α along characteristics)
     # - "conservative":        div(α u) = u·∇α + α div(u)
     alpha_advection_form: str = "advective",
+    # Optional interface traction benchmark hook.
+    dGamma=None,
+    g_t_k=None,
+    g_t_n=None,
+    traction_weight_k=None,
+    traction_weight_n=None,
     # Allen–Cahn / phase-field interface regularization for α
     alpha_cahn_M: float = 0.0,
     alpha_cahn_gamma: float = 0.0,
@@ -525,6 +549,10 @@ def build_biofilm_one_domain_forms(
     f_alpha = f_alpha if f_alpha is not None else zero_scalar
     f_S = f_S if f_S is not None else zero_scalar
     f_X = f_X if f_X is not None else zero_scalar
+    g_t_k = g_t_k if g_t_k is not None else zero_vector
+    g_t_n = g_t_n if g_t_n is not None else g_t_k
+    traction_weight_k = traction_weight_k if traction_weight_k is not None else zero_scalar
+    traction_weight_n = traction_weight_n if traction_weight_n is not None else traction_weight_k
 
     # ------------------------------------------------------------------
     # Skeleton velocity is now a primary unknown (vS).
@@ -771,6 +799,26 @@ def build_biofilm_one_domain_forms(
     d_divCv_k = dC_k * div(v_k) + C_k * div(dv) + dot(dgradC_k, v_k) + dot(gradC_k, dv)
     d_divBvS_k = dB_k * div_vS_k + B_k * div_dvS + dot(dgradB_k, vS_k) + dot(gradB_k, dvS)
 
+    # Divergence of the test fluxes and their coefficient variations.
+    div_C_vtest_k = C_k * div(v_test) + dot(gradC_k, v_test)
+    div_B_vStest_k = B_k * div(vS_test) + dot(gradB_k, vS_test)
+
+    # Expand dgrad·test component-wise to avoid backend-dependent contraction
+    # paths for Grad(trial-scalar) · VectorTest.
+    d_div_C_vtest_k = dC_k * div(v_test)
+    d_div_B_vStest_k = dB_k * div(vS_test)
+    if int(dim) == 2:
+        dgradC_k_x = (phi_k - _c(1.0)) * grad(dalpha)[0] + dphi * grad(alpha_k)[0] + dalpha * grad(phi_k)[0] + alpha_k * grad(dphi)[0]
+        dgradC_k_y = (phi_k - _c(1.0)) * grad(dalpha)[1] + dphi * grad(alpha_k)[1] + dalpha * grad(phi_k)[1] + alpha_k * grad(dphi)[1]
+        d_div_C_vtest_k += dgradC_k_x * v_test[0] + dgradC_k_y * v_test[1]
+
+        dgradB_k_x = _one_minus(phi_k) * grad(dalpha)[0] - dphi * grad(alpha_k)[0] - dalpha * grad(phi_k)[0] - alpha_k * grad(dphi)[0]
+        dgradB_k_y = _one_minus(phi_k) * grad(dalpha)[1] - dphi * grad(alpha_k)[1] - dalpha * grad(phi_k)[1] - alpha_k * grad(dphi)[1]
+        d_div_B_vStest_k += dgradB_k_x * vS_test[0] + dgradB_k_y * vS_test[1]
+    else:
+        d_div_C_vtest_k += dot(dgradC_k, v_test)
+        d_div_B_vStest_k += dot(dgradB_k, vS_test)
+
     # ------------------------------------------------------------------
     # (i) Momentum: conservative Navier–Stokes–Brinkman
     # ------------------------------------------------------------------
@@ -791,14 +839,19 @@ def build_biofilm_one_domain_forms(
     # variationally consistent fluid coupling is C grad(p), i.e.
     #   -(p, div(C w)) = -p (C div(w) + grad(C)·w)
     # which is the exact adjoint of the C v part of the constraint.
-    # Use dot(gradC, w_test) ordering for backend compatibility.
-    div_C_vtest_k = C_k * div(v_test) + dot(gradC_k, v_test)
     r_mom += -p_k * div_C_vtest_k * dx
     if drag_mode == "scalar":
         r_mom += beta_k * dot(v_k, v_test) * dx
         r_mom += -beta_k * dot(vS_k, v_test) * dx
     else:
         r_mom += beta_coeff_k * dot(kdrag_k, v_test) * dx
+    if dGamma is not None:
+        r_mom += -(th * _dot_2d_components(g_t_k, v_test) + one_m_th * _dot_2d_components(g_t_n, v_test)) * dGamma
+    if traction_weight_k is not None or traction_weight_n is not None:
+        r_mom += -(
+            th * traction_weight_k * _dot_2d_components(g_t_k, v_test)
+            + one_m_th * traction_weight_n * _dot_2d_components(g_t_n, v_test)
+        ) * dx
     r_mom += -dot(f_v, v_test) * dx
 
     a_mom = inv_dt * (drho * dot(v_k, v_test) + rho_k * dot(dv, v_test)) * dx
@@ -816,15 +869,6 @@ def build_biofilm_one_domain_forms(
 
     # δ[-p div(C w)] = -(δp) div(C w) - p δ(div(C w)),
     # with δ(div(C w)) = δC div(w) + δgrad(C)·w for fixed test w.
-    # Expand dgrad·w component-wise to avoid backend-dependent contraction
-    # paths for Grad(trial-scalar) · VectorTest.
-    d_div_C_vtest_k = dC_k * div(v_test)
-    if int(dim) == 2:
-        dgradC_k_x = (phi_k - _c(1.0)) * grad(dalpha)[0] + dphi * grad(alpha_k)[0] + dalpha * grad(phi_k)[0] + alpha_k * grad(dphi)[0]
-        dgradC_k_y = (phi_k - _c(1.0)) * grad(dalpha)[1] + dphi * grad(alpha_k)[1] + dalpha * grad(phi_k)[1] + alpha_k * grad(dphi)[1]
-        d_div_C_vtest_k += dgradC_k_x * v_test[0] + dgradC_k_y * v_test[1]
-    else:
-        d_div_C_vtest_k += dot(dgradC_k, v_test)
     a_mom += -(dp * div_C_vtest_k + p_k * d_div_C_vtest_k) * dx
     if drag_mode == "scalar":
         a_mom += dbeta * (dot(v_k, v_test) - dot(vS_k, v_test)) * dx
@@ -886,6 +930,17 @@ def build_biofilm_one_domain_forms(
     # δC = (φ-1) δα + α δφ
     # δ(α s_v) = (δα) s_v + α (δs_v).
     a_mass = q_test * (d_divCv_k + d_divBvS_k - dalpha * s_v - alpha_k * ds_v) * dx
+
+    if float(gamma_div) != 0.0:
+        gamma_div_c = _c(float(gamma_div))
+        mass_res_k = divF_k - alpha_k * s_v
+        d_mass_res_k = d_divCv_k + d_divBvS_k - dalpha * s_v - alpha_k * ds_v
+        r_mom += gamma_div_c * mass_res_k * div_C_vtest_k * dx
+        a_mom += gamma_div_c * (d_mass_res_k * div_C_vtest_k + mass_res_k * d_div_C_vtest_k) * dx
+    else:
+        gamma_div_c = None
+        mass_res_k = None
+        d_mass_res_k = None
 
     # ------------------------------------------------------------------
     # (iii) Skeleton momentum (optional inertia + linear/neo-Hookean stress)
@@ -1085,6 +1140,13 @@ def build_biofilm_one_domain_forms(
     ) * dx
     # External body force is weighted by biofilm presence α, but not degraded by g_stiff(d).
     r_skeleton += -dot(alpha_k * f_u, vS_test) * dx
+    if dGamma is not None:
+        r_skeleton += (th * _dot_2d_components(g_t_k, vS_test) + one_m_th * _dot_2d_components(g_t_n, vS_test)) * dGamma
+    if traction_weight_k is not None or traction_weight_n is not None:
+        r_skeleton += (
+            th * traction_weight_k * _dot_2d_components(g_t_k, vS_test)
+            + one_m_th * traction_weight_n * _dot_2d_components(g_t_n, vS_test)
+        ) * dx
 
     # Extension / stabilization coefficients.
     # - `gamma_u` controls u-extension in the kinematic constraint below.
@@ -1188,19 +1250,13 @@ def build_biofilm_one_domain_forms(
     if a_skel_visco_vS is not None:
         a_skel += a_skel_visco_vS
     # Jacobian of the pressure coupling -p div(B η).
-    # Expand dgrad·eta component-wise to avoid backend-dependent contraction
-    # paths for Grad(trial-scalar) · VectorTest.
-    d_div_B_vStest_k = dB_k * div(vS_test)
-    if int(dim) == 2:
-        dgradB_k_x = _one_minus(phi_k) * grad(dalpha)[0] - dphi * grad(alpha_k)[0] - dalpha * grad(phi_k)[0] - alpha_k * grad(dphi)[0]
-        dgradB_k_y = _one_minus(phi_k) * grad(dalpha)[1] - dphi * grad(alpha_k)[1] - dalpha * grad(phi_k)[1] - alpha_k * grad(dphi)[1]
-        d_div_B_vStest_k += dgradB_k_x * vS_test[0] + dgradB_k_y * vS_test[1]
-    else:
-        d_div_B_vStest_k += dot(dgradB_k, vS_test)
     a_skel += sk_th * (-(dp * div_B_vStest_k + p_k * d_div_B_vStest_k)) * dx
     # Drag term is *not* multiplied by alpha again: beta already contains alpha (one-domain blend).
     a_skel += sk_th * d_drag_term_k * dx
     a_skel += -dot(dalpha * f_u, vS_test) * dx
+    if gamma_div_c is not None:
+        r_skeleton += gamma_div_c * mass_res_k * div_B_vStest_k * dx
+        a_skel += gamma_div_c * (d_mass_res_k * div_B_vStest_k + mass_res_k * d_div_B_vStest_k) * dx
 
     # Jacobian of the vS extension penalty (k-part only).
     if float(gamma_vS_eff) != 0.0:

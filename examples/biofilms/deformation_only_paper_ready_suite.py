@@ -100,6 +100,19 @@ PROFILE_CONFIGS = {
                 }
             }
         },
+        "benchmark5": {
+            "overrides": {
+                "benchmark5_jonas_shear": {
+                    "nx_list": "4,8",
+                    "q": "8",
+                    "q_error": "10",
+                    "backend": "cpp",
+                    "error_backend": "cpp",
+                    "png_dpi": "180",
+                }
+            }
+        },
+        "benchmark6": {"overrides": {"benchmark6_blauert_channel": {}}},
     },
     "baseline": {
         "mms": {
@@ -158,6 +171,19 @@ PROFILE_CONFIGS = {
                 }
             }
         },
+        "benchmark5": {
+            "overrides": {
+                "benchmark5_jonas_shear": {
+                    "nx_list": "8,16",
+                    "q": "8",
+                    "q_error": "10",
+                    "backend": "cpp",
+                    "error_backend": "cpp",
+                    "png_dpi": "220",
+                }
+            }
+        },
+        "benchmark6": {"overrides": {"benchmark6_blauert_channel": {}}},
     },
     "production": {
         "mms": {
@@ -216,6 +242,19 @@ PROFILE_CONFIGS = {
                 }
             }
         },
+        "benchmark5": {
+            "overrides": {
+                "benchmark5_jonas_shear": {
+                    "nx_list": "8,16,32",
+                    "q": "8",
+                    "q_error": "10",
+                    "backend": "cpp",
+                    "error_backend": "cpp",
+                    "png_dpi": "280",
+                }
+            }
+        },
+        "benchmark6": {"overrides": {"benchmark6_blauert_channel": {}}},
     },
 }
 
@@ -292,6 +331,20 @@ CASE_SPECS = (
         family="benchmark4",
         driver_rel="examples/biofilms/benchmarks/poroelastic/paper1_benchmark4_terzaghi_consolidation.py",
         output_key="terzaghi",
+    ),
+    CaseSpec(
+        key="benchmark5_jonas_shear",
+        label="FSI benchmark: Jonas-inspired exact shear",
+        family="benchmark5",
+        driver_rel="examples/biofilms/benchmarks/FSI/paper1_benchmark5_jonas_shear.py",
+        output_key="jonas_shear",
+    ),
+    CaseSpec(
+        key="benchmark6_blauert_channel",
+        label="Application benchmark: Blauert attached-patch channel deformation",
+        family="benchmark6",
+        driver_rel="examples/biofilms/benchmarks/blauert/paper1_benchmark6_blauert_channel.py",
+        output_key="blauert_channel",
     ),
 )
 
@@ -456,6 +509,40 @@ def _build_case_command(spec: CaseSpec, *, profile: str, run_dir: Path, env_name
             merged["png_dpi"],
             "--quiet",
         )
+    if spec.family == "benchmark5":
+        merged = {}
+        merged.update(cfg.get("overrides", {}).get(spec.key, {}))
+        cmd = _conda_python(
+            env_name,
+            spec.driver_rel,
+            "--outdir",
+            str(run_dir / spec.key),
+            "--nx-list",
+            merged["nx_list"],
+            "--q",
+            merged["q"],
+            "--q-error",
+            merged["q_error"],
+            "--backend",
+            merged["backend"],
+            "--error-backend",
+            merged["error_backend"],
+            "--png-dpi",
+            merged["png_dpi"],
+            "--convergence",
+        )
+        if profile == "production":
+            cmd.append("--vtk")
+        return cmd
+    if spec.family == "benchmark6":
+        return _conda_python(
+            env_name,
+            spec.driver_rel,
+            "--outdir",
+            str(run_dir / spec.key),
+            "--profile",
+            str(profile),
+        )
     merged = {}
     merged.update(cfg.get("overrides", {}).get(spec.key, {}))
     if spec.output_key == "wang2014_layered":
@@ -492,7 +579,7 @@ def _normalize_cmd(cmd: list[str]) -> list[str]:
 
 
 def _case_dir(run_dir: Path, spec: CaseSpec) -> Path:
-    if spec.family in {"benchmark3", "benchmark4"}:
+    if spec.family in {"benchmark3", "benchmark4", "benchmark5", "benchmark6"}:
         return run_dir / spec.key
     return run_dir / spec.key / spec.output_key
 
@@ -504,6 +591,10 @@ def _case_csv(case_dir: Path, spec: CaseSpec) -> Path:
         return case_dir / f"benchmark3_{spec.output_key}_summary.csv"
     if spec.family == "benchmark4":
         return case_dir / "benchmark4_terzaghi_summary.csv"
+    if spec.family == "benchmark5":
+        return case_dir / "benchmark5_jonas_shear_summary.csv"
+    if spec.family == "benchmark6":
+        return case_dir / "benchmark6_blauert_channel_summary.csv"
     return case_dir / f"deformation_only_interface_transport_{spec.output_key}.csv"
 
 
@@ -514,6 +605,10 @@ def _case_convergence_png(case_dir: Path, spec: CaseSpec) -> Path:
         return case_dir / f"benchmark3_{spec.output_key}_error_trends.png"
     if spec.family == "benchmark4":
         return case_dir / "benchmark4_terzaghi_error_trends.png"
+    if spec.family == "benchmark5":
+        return case_dir / "benchmark5_jonas_shear_convergence.png"
+    if spec.family == "benchmark6":
+        return case_dir / "benchmark6_blauert_channel_mesh_sensitivity.png"
     return case_dir / f"deformation_only_interface_transport_{spec.output_key}_convergence.png"
 
 
@@ -629,6 +724,21 @@ def _summary_metric(spec: CaseSpec, finest: dict[str, str]) -> str:
             f"max pInf={_fmt_float(finest.get('max_pbar_linf'))}, "
             f"max s={_fmt_float(finest.get('max_settlement_bar_error'))}"
         )
+    if spec.family == "benchmark5":
+        return (
+            f"n_x={_fmt_int(finest.get('nx'))}, "
+            f"EOC(v_L2)={_fmt_float(finest.get('eoc_v_l2'))}, "
+            f"EOC(u_L2)={_fmt_float(finest.get('eoc_u_l2'))}, "
+            f"EOC(alpha_L2)={_fmt_float(finest.get('eoc_alpha_l2'))}, "
+            f"|e_u(\\Gamma)|={_fmt_float(finest.get('u_interface_error'))}"
+        )
+    if spec.family == "benchmark6":
+        return (
+            f"n_x={_fmt_int(finest.get('nx'))}, "
+            f"RMSE={_fmt_float(finest.get('global_rmse_um'))} um, "
+            f"mean per-y={_fmt_float(finest.get('mean_per_y_rmse_um'))} um, "
+            f"contour(2s)={_fmt_float(finest.get('contour_rmse_2.0s_um'))} um"
+        )
     return (
         f"max|dm|={_fmt_float(finest.get('max_mass_drift'))}, "
         f"max ec={_fmt_float(finest.get('max_geom_centroid_err'))}, "
@@ -661,6 +771,19 @@ def _summary_note(spec: CaseSpec, finest: dict[str, str]) -> str:
             "Terzaghi single-drainage consolidation benchmark; normalized pore-pressure profiles "
             "and top-settlement history are compared against the analytic series solution, with "
             "profile errors reported after the initial drained-boundary layer is resolved."
+        )
+    if spec.family == "benchmark5":
+        return (
+            "Jonas-inspired exact shear benchmark; tangential traction is localized on the "
+            "conserved diffuse interface and the numerical solution is compared against a "
+            "closed-form deformation-only reference state with active CH transport."
+        )
+    if spec.family == "benchmark6":
+        return (
+            "Blauert attached-patch channel benchmark; the full one-domain deformation block "
+            "with active porosity transport and conserved CH interface evolution is calibrated "
+            "against the OCT video using global and per-height front histories, then checked "
+            "on a mesh ladder with contour overlays at representative times."
         )
     if spec.output_key == "translation":
         return "Rigid-body transport benchmark; Crank-Nicolson with light SUPG is used to suppress artificial interface decay."
@@ -773,6 +896,38 @@ def _table_spec(spec: CaseSpec) -> dict[str, list[tuple[str, str]]]:
                 ("final_settlement_bar_error", r"$|\bar s_h(T)-\bar s_{\mathrm{ex}}(T)|$"),
             ]
         }
+    if spec.family == "benchmark5":
+        return {
+            "l2": [
+                ("nx", r"$n_x$"),
+                ("v_l2", r"$\|e_{\bm v}\|_{L^2}$"),
+                ("p_l2", r"$\|e_p\|_{L^2}$"),
+                ("u_l2", r"$\|e_{\bm u}\|_{L^2}$"),
+                ("alpha_l2", r"$\|e_\alpha\|_{L^2}$"),
+                ("mu_alpha_l2", r"$\|e_{\mu_\alpha}\|_{L^2}$"),
+                ("u_interface_error", r"$|e_{u,\Gamma}|$"),
+                ("newton_iters", "Newton"),
+            ],
+            "h1": [
+                ("nx", r"$n_x$"),
+                ("v_h1", r"$\|e_{\bm v}\|_{H^1}$"),
+                ("u_h1", r"$\|e_{\bm u}\|_{H^1}$"),
+                ("alpha_h1", r"$\|e_\alpha\|_{H^1}$"),
+                ("mu_alpha_h1", r"$\|e_{\mu_\alpha}\|_{H^1}$"),
+                ("newton_iters", "Newton"),
+            ],
+        }
+    if spec.family == "benchmark6":
+        return {
+            "summary": [
+                ("nx", r"$n_x$"),
+                ("ny", r"$n_y$"),
+                ("global_rmse_um", r"global RMSE [$\mu$m]"),
+                ("mean_per_y_rmse_um", r"mean per-$y$ RMSE [$\mu$m]"),
+                ("contour_rmse_2.0s_um", r"contour RMSE at $t=2$ s [$\mu$m]"),
+                ("contour_rmse_4.0s_um", r"contour RMSE at $t=4$ s [$\mu$m]"),
+            ]
+        }
     return {
         "summary": [
             ("nx", r"$n_x$"),
@@ -799,6 +954,10 @@ def _resolution_label(spec: CaseSpec, finest: dict[str, str]) -> str:
         return f"n_y={_fmt_int(finest.get('ny'))}"
     if spec.family == "benchmark4":
         return f"n_y={_fmt_int(finest.get('ny'))}"
+    if spec.family == "benchmark5":
+        return f"n_x={_fmt_int(finest.get('nx'))}"
+    if spec.family == "benchmark6":
+        return f"n_x={_fmt_int(finest.get('nx'))}"
     return _fmt_int(finest.get("nx"))
 
 
@@ -897,6 +1056,46 @@ def _publish_case_assets(spec: CaseSpec, *, case_dir: Path, rows: list[dict[str,
             if src.exists():
                 shutil.copy2(src, VERIFICATION_GENERATED / dst_name)
         summary_name = f"benchmark3_{spec.output_key}_summary.json"
+    elif spec.family == "benchmark5":
+        _write_case_table(
+            VERIFICATION_GENERATED / "benchmark5_jonas_shear_l2_table.tex",
+            rows=rows,
+            columns=spec_tables["l2"],
+        )
+        _write_case_table(
+            VERIFICATION_GENERATED / "benchmark5_jonas_shear_h1_table.tex",
+            rows=rows,
+            columns=spec_tables["h1"],
+        )
+        shutil.copy2(_case_csv(case_dir, spec), VERIFICATION_GENERATED / f"benchmark5_{spec.output_key}_{profile}.csv")
+        extra_pngs = [
+            ("benchmark5_jonas_shear_convergence.png", "benchmark5_jonas_shear_convergence.png"),
+            ("benchmark5_jonas_shear_profiles.png", "benchmark5_jonas_shear_profiles.png"),
+            ("benchmark5_jonas_shear_fields.png", "benchmark5_jonas_shear_fields.png"),
+        ]
+        for src_name, dst_name in extra_pngs:
+            src = case_dir / src_name
+            if src.exists():
+                shutil.copy2(src, VERIFICATION_GENERATED / dst_name)
+        summary_name = "benchmark5_jonas_shear_summary.json"
+    elif spec.family == "benchmark6":
+        _write_case_table(
+            VERIFICATION_GENERATED / "benchmark6_blauert_channel_table.tex",
+            rows=rows,
+            columns=spec_tables["summary"],
+        )
+        shutil.copy2(_case_csv(case_dir, spec), VERIFICATION_GENERATED / f"benchmark6_{spec.output_key}_{profile}.csv")
+        extra_files = [
+            ("benchmark6_blauert_channel_calibration.csv", "benchmark6_blauert_channel_calibration.csv"),
+            ("benchmark6_blauert_channel_history.png", "benchmark6_blauert_channel_history.png"),
+            ("benchmark6_blauert_channel_contours.png", "benchmark6_blauert_channel_contours.png"),
+            ("benchmark6_blauert_channel_mesh_sensitivity.png", "benchmark6_blauert_channel_mesh_sensitivity.png"),
+        ]
+        for src_name, dst_name in extra_files:
+            src = case_dir / src_name
+            if src.exists():
+                shutil.copy2(src, VERIFICATION_GENERATED / dst_name)
+        summary_name = "benchmark6_blauert_channel_summary.json"
     else:
         _write_case_table(
             VERIFICATION_GENERATED / "benchmark4_terzaghi_table.tex",

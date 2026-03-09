@@ -41,6 +41,17 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.tri as mtri
+except Exception:  # pragma: no cover - optional snapshot export
+    matplotlib = None
+    plt = None
+    mtri = None
+
 # Avoid extremely verbose Numba debug dumps if the environment enables them.
 for _k in (
     "NUMBA_DEBUG",
@@ -58,17 +69,23 @@ from pycutfem.fem import transform
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.io.vtk import export_vtk
 from pycutfem.solvers.nonlinear_solver import (
+    LinearSolverParameters,
     NewtonParameters,
+    NewtonSolver,
     PetscSnesNewtonSolver,
+    PdasNewtonSolver,
     TimeStepperParameters,
+    VIParameters,
 )
-from pycutfem.ufl.expressions import Constant, Function, TestFunction, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction
-from pycutfem.ufl.forms import BoundaryCondition
+from pycutfem.ufl.analytic import Analytic
+from pycutfem.ufl.expressions import Constant, Function, TestFunction, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction, grad
+from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
 from pycutfem.ufl.measures import ds, dx
 from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.utils.meshgen import structured_quad
 
-from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
+from examples.utils.biofilm.deformation_only import build_deformation_only_forms
+from examples.utils.biofilm.one_domain import _sqrt, build_biofilm_one_domain_forms
 
 
 def _tag_channel_boundaries(mesh: Mesh, *, L: float, H: float, tol: float = 1.0e-12) -> None:
@@ -147,6 +164,114 @@ def _restrict_skeleton_dofs_to_box(
 
 def _smooth_step(z: np.ndarray) -> np.ndarray:
     return 0.5 * (1.0 + np.tanh(np.asarray(z, dtype=float)))
+
+
+def _as_scalar_expr(val):
+    if hasattr(val, "dim"):
+        return val
+    return Constant(float(val))
+
+
+def _cosine_ramp_value(t_now: float, ramp_time: float) -> float:
+    tt = float(t_now)
+    tr = float(ramp_time)
+    if not np.isfinite(tr) or tr <= 0.0:
+        return 1.0
+    if tt <= 0.0:
+        return 0.0
+    if tt >= tr:
+        return 1.0
+    return 0.5 * (1.0 - math.cos(math.pi * tt / max(1.0e-12, tr)))
+
+
+def _lagged_diffuse_interface_shear_traction(
+    *,
+    v_lag,
+    alpha_lag,
+    mu_f: float,
+    scale: float = 1.0,
+    eta_n: float = 1.0e-12,
+):
+    """
+    Return a lagged diffuse-interface tangential traction proxy.
+
+    This approximates the fluid shear traction on the alpha=1/2 contour by
+    localizing the tangential projection of 2 mu_f eps(v) n with |grad(alpha)|.
+    The result is used as an equal-and-opposite traction pair in the reduced
+    one-domain benchmark via the existing traction hook.
+    """
+    grad_alpha = grad(alpha_lag)
+    grad_norm = _sqrt(grad_alpha[0] * grad_alpha[0] + grad_alpha[1] * grad_alpha[1] + Constant(float(eta_n)))
+    n_if = (grad_alpha[0] / grad_norm, grad_alpha[1] / grad_norm)
+    t_if = (-n_if[1], n_if[0])
+    dvx = grad(v_lag[0])
+    dvy = grad(v_lag[1])
+    eps_xx = dvx[0]
+    eps_xy = Constant(0.5) * (dvx[1] + dvy[0])
+    eps_yy = dvy[1]
+    tr_x = Constant(2.0 * float(mu_f)) * (eps_xx * n_if[0] + eps_xy * n_if[1])
+    tr_y = Constant(2.0 * float(mu_f)) * (eps_xy * n_if[0] + eps_yy * n_if[1])
+    scale_c = _as_scalar_expr(scale)
+    tau_t = scale_c * (tr_x * t_if[0] + tr_y * t_if[1])
+    g_t = (tau_t * t_if[0], tau_t * t_if[1])
+    return g_t, grad_norm
+
+
+def _lagged_diffuse_interface_stress_traction(
+    *,
+    v_lag,
+    p_lag,
+    alpha_lag,
+    mu_f: float,
+    scale: float = 1.0,
+    eta_n: float = 1.0e-12,
+):
+    """
+    Return the lagged diffuse-interface fluid traction proxy
+
+        t = (-p I + 2 mu_f eps(v)) n_if
+
+    localized by |grad(alpha)|. This carries both the normal compression and the
+    tangential shear transmitted by the surrounding fluid and is more appropriate
+    than a tangential-only proxy for the Blauert compression benchmark.
+    """
+    grad_alpha = grad(alpha_lag)
+    grad_norm = _sqrt(grad_alpha[0] * grad_alpha[0] + grad_alpha[1] * grad_alpha[1] + Constant(float(eta_n)))
+    n_if = (grad_alpha[0] / grad_norm, grad_alpha[1] / grad_norm)
+    dvx = grad(v_lag[0])
+    dvy = grad(v_lag[1])
+    eps_xx = dvx[0]
+    eps_xy = Constant(0.5) * (dvx[1] + dvy[0])
+    eps_yy = dvy[1]
+    tr_x = -p_lag * n_if[0] + Constant(2.0 * float(mu_f)) * (eps_xx * n_if[0] + eps_xy * n_if[1])
+    tr_y = -p_lag * n_if[1] + Constant(2.0 * float(mu_f)) * (eps_xy * n_if[0] + eps_yy * n_if[1])
+    scale_c = _as_scalar_expr(scale)
+    g_t = (scale_c * tr_x, scale_c * tr_y)
+    return g_t, grad_norm
+
+
+def _poiseuille_diffuse_interface_shear_traction(
+    *,
+    alpha_lag,
+    H: float,
+    u_max: float,
+    mu_f: float,
+    scale: float = 1.0,
+    eta_n: float = 1.0e-12,
+):
+    grad_alpha = grad(alpha_lag)
+    grad_norm = _sqrt(grad_alpha[0] * grad_alpha[0] + grad_alpha[1] * grad_alpha[1] + Constant(float(eta_n)))
+    n_if = (grad_alpha[0] / grad_norm, grad_alpha[1] / grad_norm)
+    t_if = (-n_if[1], n_if[0])
+    scale_c = _as_scalar_expr(scale)
+    tau_bg = Analytic(
+        lambda x, y, _H=float(H), _u=float(u_max), _mu=float(mu_f): _mu
+        * (4.0 * _u / _H)
+        * (1.0 - 2.0 * np.asarray(y, dtype=float) / _H),
+        degree=2,
+    )
+    g_t = (scale_c * tau_bg * t_if[0], scale_c * tau_bg * t_if[1])
+    return g_t, grad_norm
 
 
 def _read_polygon_mm_csv(path: str) -> np.ndarray:
@@ -477,6 +602,40 @@ def _x_front_global_quantile(
     return float(np.quantile(xs, q))
 
 
+def _alpha_half_contours(alpha_xy: np.ndarray, alpha_vals: np.ndarray, *, alpha_half: float = 0.5) -> list[np.ndarray]:
+    if plt is None or mtri is None:
+        return []
+    xy = np.asarray(alpha_xy, dtype=float)
+    vals = np.asarray(alpha_vals, dtype=float).ravel()
+    if xy.ndim != 2 or xy.shape[1] < 2 or vals.size != xy.shape[0]:
+        return []
+    try:
+        triang = mtri.Triangulation(xy[:, 0], xy[:, 1])
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        cs = ax.tricontour(triang, vals, levels=[float(alpha_half)])
+        contours: list[np.ndarray] = []
+        for coll in cs.collections:
+            for path in coll.get_paths():
+                verts = np.asarray(path.vertices, dtype=float)
+                if verts.ndim == 2 and verts.shape[0] >= 2:
+                    contours.append(verts.copy())
+        plt.close(fig)
+        return contours
+    except Exception:
+        return []
+
+
+def _write_contours_csv(path: Path, contours: list[np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        f.write("contour_id,point_id,x_m,y_m\n")
+        for cid, pts in enumerate(contours):
+            arr = np.asarray(pts, dtype=float)
+            for pid, (xx, yy) in enumerate(arr):
+                f.write(f"{int(cid)},{int(pid)},{float(xx):.12e},{float(yy):.12e}\n")
+
+
 def _lame_from_E_nu(E: float, nu: float) -> tuple[float, float]:
     E = float(E)
     nu = float(nu)
@@ -525,8 +684,8 @@ def _write_restart_checkpoint(
     vS: VectorFunction,
     u: VectorFunction,
     alpha: Function,
-    phi: Function,
-    S: Function,
+    phi: Function | None = None,
+    S: Function | None = None,
     mu_alpha: Function | None = None,
 ) -> None:
     path = Path(path)
@@ -547,9 +706,11 @@ def _write_restart_checkpoint(
         vS=np.asarray(vS.nodal_values, dtype=float),
         u=np.asarray(u.nodal_values, dtype=float),
         alpha=np.asarray(alpha.nodal_values, dtype=float),
-        phi=np.asarray(phi.nodal_values, dtype=float),
-        S=np.asarray(S.nodal_values, dtype=float),
     )
+    if phi is not None:
+        payload["phi"] = np.asarray(phi.nodal_values, dtype=float)
+    if S is not None:
+        payload["S"] = np.asarray(S.nodal_values, dtype=float)
     if mu_alpha is not None:
         payload["mu_alpha"] = np.asarray(mu_alpha.nodal_values, dtype=float)
 
@@ -564,8 +725,8 @@ def _load_restart_checkpoint(
     vS: VectorFunction,
     u: VectorFunction,
     alpha: Function,
-    phi: Function,
-    S: Function,
+    phi: Function | None = None,
+    S: Function | None = None,
     mu_alpha: Function | None = None,
 ) -> dict[str, object]:
     path = Path(path)
@@ -590,8 +751,10 @@ def _load_restart_checkpoint(
         _load_into(vS, "vS")
         _load_into(u, "u")
         _load_into(alpha, "alpha")
-        _load_into(phi, "phi")
-        _load_into(S, "S")
+        if phi is not None and "phi" in data:
+            _load_into(phi, "phi")
+        if S is not None and "S" in data:
+            _load_into(S, "S")
         if mu_alpha is not None and "mu_alpha" in data:
             _load_into(mu_alpha, "mu_alpha")
 
@@ -803,7 +966,24 @@ def main() -> None:
 
     ap.add_argument("--newton-tol", type=float, default=1.0e-6)
     ap.add_argument("--newton-rtol", type=float, default=0.0, help="Relative SNES tolerance (0 disables).")
-    ap.add_argument("--max-it", type=int, default=15)
+    ap.add_argument("--max-it", type=int, default=25)
+    ap.add_argument(
+        "--nonlinear-solver",
+        type=str,
+        default="pdas",
+        choices=("pdas", "newton", "snes"),
+        help="Nonlinear solver used for the monolithic step. Benchmark 6 defaults to the internal PDAS path.",
+    )
+    ap.add_argument(
+        "--ls-mode",
+        type=str,
+        default="dealii",
+        choices=("armijo", "dealii"),
+        help="Line-search mode used by the internal Newton / PDAS solvers.",
+    )
+    ap.add_argument("--vi-c", type=float, default=0.0, help="PDAS active-set scaling parameter.")
+    ap.add_argument("--alpha-box-constraints", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--phi-box-constraints", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument(
         "--accept-nonconverged-atol-factor",
         type=float,
@@ -812,7 +992,15 @@ def main() -> None:
     )
 
     # Flow
-    ap.add_argument("--u-avg", type=float, default=6.84e-2, help="Average inflow velocity [m/s] (Dian paper default).")
+    ap.add_argument(
+        "--u-avg",
+        type=float,
+        default=4.56e-2,
+        help=(
+            "Average inflow velocity [m/s]. For the parabolic channel inflow used here, "
+            "the Dian preprocessing value v0=6.84e-2 m/s corresponds to u_avg≈4.56e-2 m/s."
+        ),
+    )
     ap.add_argument("--t-ramp", type=float, default=0.5, help="Cosine ramp time for inflow [s].")
 
     # Material / coupling (FSI-only: disable growth/detachment/damage)
@@ -823,10 +1011,74 @@ def main() -> None:
     ap.add_argument("--E", type=float, default=200.0, help="Young's modulus of the solid phase [Pa] (Dian paper default).")
     ap.add_argument("--nu", type=float, default=0.4, help="Poisson ratio (Dian paper default).")
     ap.add_argument("--solid-visco-eta", type=float, default=0.0, help="Kelvin–Voigt viscosity eta_s [Pa*s] (0 disables).")
+    ap.add_argument(
+        "--paper1-reduced",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the Paper-1 reduced deformation-only model with fixed phi_b and active "
+            "conservative Cahn--Hilliard alpha transport. This disables the full phi/S blocks."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-shear-traction",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Add a lagged diffuse-interface tangential shear-traction transfer term "
+            "computed from the current fluid field. This is intended for application-style "
+            "channel deformation cases where viscous surface loading is essential."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-shear-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to the diffuse-interface tangential shear traction.",
+    )
+    ap.add_argument(
+        "--diffuse-shear-model",
+        type=str,
+        default="lagged_velocity",
+        choices=("lagged_velocity", "lagged_stress", "poiseuille"),
+        help=(
+            "How the diffuse-interface tangential shear traction is computed: "
+            "'lagged_velocity' uses the tangential projection of 2 mu_f eps(v^n) n, "
+            "'lagged_stress' uses the full lagged traction (-p^n I + 2 mu_f eps(v^n)) n, "
+            "while 'poiseuille' uses the imposed channel Poiseuille shear profile."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-shear-time-scheme",
+        type=str,
+        default="constant",
+        choices=("constant", "imex"),
+        help=(
+            "Time treatment for the benchmark-local diffuse traction correction: "
+            "'constant' keeps the full correction active from t=0, while "
+            "'imex' applies the correction with a lagged amplitude continuation "
+            "factor based on the accepted previous-step time."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-shear-ramp-time",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Ramp time [s] for --diffuse-shear-time-scheme imex. "
+            "Default: reuse --t-ramp."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-shear-eta",
+        type=float,
+        default=1.0e-12,
+        help="Regularization added to |grad(alpha)| when building the diffuse-interface normal.",
+    )
 
-    ap.add_argument("--gamma-u", type=float, default=1.0e-6, help="u extension penalty outside biofilm.")
-    ap.add_argument("--u-extension", type=str, default="grad", choices=("l2", "grad"))
-    ap.add_argument("--gamma-u-pin", type=float, default=1.0e-10, help="Tiny pinning used only with --u-extension grad.")
+    ap.add_argument("--gamma-u", type=float, default=5.0, help="u extension penalty outside biofilm.")
+    ap.add_argument("--u-extension", type=str, default="l2", choices=("l2", "grad"))
+    ap.add_argument("--gamma-u-pin", type=float, default=1.0e-4, help="Tiny pinning used only with --u-extension grad.")
     ap.add_argument(
         "--kinematics-scale",
         type=float,
@@ -844,6 +1096,15 @@ def main() -> None:
         type=float,
         default=0.0,
         help="SUPG-like streamline diffusion for kinematic u-transport (0 disables; typical 0.1–10).",
+    )
+    ap.add_argument(
+        "--gamma-div",
+        type=float,
+        default=0.0,
+        help=(
+            "Augmented-Lagrangian / grad-div stabilization strength on the mixture "
+            "constraint div(C v + B vS)=0 (or div(C v + B vS)=alpha*s_v in the full model)."
+        ),
     )
 
     # Transport (alpha/phi)
@@ -940,6 +1201,12 @@ def main() -> None:
         default=0.005,
         help="Quantile for global x_front (over alpha>=0.5 DOFs). 0=min, 0.005 is robust to tiny blobs.",
     )
+    ap.add_argument(
+        "--snapshot-times",
+        type=str,
+        default="",
+        help="Comma-separated times [s] at which to export raw alpha=0.5 contour CSVs.",
+    )
     ap.add_argument("--vtk-every", type=int, default=0)
     ap.add_argument("--out-dir", type=str, default="out/_blauert_one_domain")
     ap.add_argument(
@@ -983,6 +1250,7 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    paper1_reduced = bool(getattr(args, "paper1_reduced", False))
     transport_mode = str(getattr(args, "transport_mode", "refmap")).strip().lower()
     if transport_mode not in {"refmap", "pde"}:
         raise ValueError(f"Unknown --transport-mode {transport_mode!r}.")
@@ -995,11 +1263,15 @@ def main() -> None:
         alpha_ch_M = 0.0
         alpha_ch_gamma = 0.0
     ch_enabled = bool(alpha_ch_M != 0.0 and alpha_ch_gamma != 0.0)
+    if paper1_reduced and transport_mode != "pde":
+        raise ValueError("--paper1-reduced requires --transport-mode pde.")
+    if paper1_reduced and not ch_enabled:
+        raise ValueError("--paper1-reduced requires nonzero --alpha-ch-M and --alpha-ch-gamma.")
     alpha_ch_eps = float(getattr(args, "alpha_ch_eps", float("nan")))
     if not np.isfinite(alpha_ch_eps):
         alpha_ch_eps = float(getattr(args, "eps", 1.0))
 
-    if transport_mode == "pde":
+    if (transport_mode == "pde") and (not paper1_reduced):
         D_phi_val = float(getattr(args, "D_phi", 0.0))
         gamma_phi_val = float(getattr(args, "gamma_phi", 0.0))
         if abs(D_phi_val) < 1.0e-30 and abs(gamma_phi_val) < 1.0e-30:
@@ -1081,11 +1353,12 @@ def main() -> None:
         "vS_y": 2,
         "u_x": 2,
         "u_y": 2,
-        "phi": 1,
         "alpha": 1,
         "mu_alpha": 1,
-        "S": 1,
     }
+    if not paper1_reduced:
+        field_specs["phi"] = 1
+        field_specs["S"] = 1
     me = MixedElement(mesh, field_specs=field_specs)
     dh = DofHandler(me, method="cg")
 
@@ -1097,37 +1370,37 @@ def main() -> None:
     dvS = VectorTrialFunction(space=VS, dof_handler=dh)
     du = VectorTrialFunction(space=U, dof_handler=dh)
     dp = TrialFunction("p", dof_handler=dh)
-    dphi = TrialFunction("phi", dof_handler=dh)
+    dphi = TrialFunction("phi", dof_handler=dh) if not paper1_reduced else None
     dalpha = TrialFunction("alpha", dof_handler=dh)
     dmu_alpha = TrialFunction("mu_alpha", dof_handler=dh)
-    dS = TrialFunction("S", dof_handler=dh)
+    dS = TrialFunction("S", dof_handler=dh) if not paper1_reduced else None
 
     v_test = VectorTestFunction(space=V, dof_handler=dh)
     vS_test = VectorTestFunction(space=VS, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
     q_test = TestFunction("p", dof_handler=dh)
-    phi_test = TestFunction("phi", dof_handler=dh)
+    phi_test = TestFunction("phi", dof_handler=dh) if not paper1_reduced else None
     alpha_test = TestFunction("alpha", dof_handler=dh)
     mu_alpha_test = TestFunction("mu_alpha", dof_handler=dh)
-    S_test = TestFunction("S", dof_handler=dh)
+    S_test = TestFunction("S", dof_handler=dh) if not paper1_reduced else None
 
     v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
     vS_k = VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh)
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
-    phi_k = Function("phi_k", "phi", dof_handler=dh)
+    phi_k = Function("phi_k", "phi", dof_handler=dh) if not paper1_reduced else None
     alpha_k = Function("alpha_k", "alpha", dof_handler=dh)
     mu_alpha_k = Function("mu_alpha_k", "mu_alpha", dof_handler=dh)
-    S_k = Function("S_k", "S", dof_handler=dh)
+    S_k = Function("S_k", "S", dof_handler=dh) if not paper1_reduced else None
 
     v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
     p_n = Function("p_n", "p", dof_handler=dh)
     vS_n = VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh)
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
-    phi_n = Function("phi_n", "phi", dof_handler=dh)
+    phi_n = Function("phi_n", "phi", dof_handler=dh) if not paper1_reduced else None
     alpha_n = Function("alpha_n", "alpha", dof_handler=dh)
     mu_alpha_n = Function("mu_alpha_n", "mu_alpha", dof_handler=dh)
-    S_n = Function("S_n", "S", dof_handler=dh)
+    S_n = Function("S_n", "S", dof_handler=dh) if not paper1_reduced else None
 
     # ------------------------------------------------------------------
     # Initial conditions
@@ -1137,7 +1410,8 @@ def main() -> None:
     vS_n.nodal_values[:] = 0.0
     u_n.nodal_values[:] = 0.0
     mu_alpha_n.nodal_values[:] = 0.0
-    S_n.nodal_values[:] = 0.0
+    if S_n is not None:
+        S_n.nodal_values[:] = 0.0
 
     eps0 = float(args.eps)
     alpha_xy = np.asarray(dh.get_dof_coords("alpha"), dtype=float)
@@ -1147,11 +1421,17 @@ def main() -> None:
     phi_b = float(args.phi_b)
     if not (0.0 < phi_b < 1.0):
         raise ValueError("--phi-b must be in (0,1).")
-    phi_n.nodal_values[:] = np.clip(1.0 - (1.0 - phi_b) * np.asarray(alpha_n.nodal_values, dtype=float), 0.0, 1.0)
+    if phi_n is not None:
+        phi_n.nodal_values[:] = np.clip(1.0 - (1.0 - phi_b) * np.asarray(alpha_n.nodal_values, dtype=float), 0.0, 1.0)
 
     if transport_mode == "refmap":
         # Refmap mode: freeze transport fields and update alpha/phi after each accepted step.
         _mark_inactive_fields(dh, "alpha", "phi", "S", "mu_alpha")
+    elif paper1_reduced:
+        # Reduced Paper-1 mode: solve alpha/mu_alpha and keep only the reduced unknown set active.
+        a0 = np.asarray(alpha_n.nodal_values, dtype=float)
+        Wp = 2.0 * a0 * (1.0 - a0) * (1.0 - 2.0 * a0)
+        mu_alpha_n.nodal_values[:] = float(alpha_ch_gamma / max(alpha_ch_eps, 1.0e-12)) * Wp
     else:
         # PDE mode: solve alpha/phi. We never solve substrate in this benchmark (no growth/chemistry).
         _mark_inactive_fields(dh, "S")
@@ -1207,7 +1487,8 @@ def main() -> None:
             chi = alpha_xy - u_at_alpha
             a = _smooth_step((-_signed_distance_polygon(chi[:, 0], chi[:, 1], poly_m)) / max(1.0e-12, eps0))
             alpha_k.nodal_values[:] = np.clip(np.asarray(a, dtype=float), 0.0, 1.0)
-            phi_k.nodal_values[:] = np.clip(1.0 - (1.0 - phi_b) * np.asarray(alpha_k.nodal_values, dtype=float), 0.0, 1.0)
+            if phi_k is not None:
+                phi_k.nodal_values[:] = np.clip(1.0 - (1.0 - phi_b) * np.asarray(alpha_k.nodal_values, dtype=float), 0.0, 1.0)
 
     else:
 
@@ -1236,81 +1517,190 @@ def main() -> None:
     theta = float(args.theta)
 
     mu_s, lambda_s = _lame_from_E_nu(float(args.E), float(args.nu))
+    diffuse_g_t = None
+    diffuse_w_t = None
+    diffuse_scale_expr = None
+    diffuse_scale_update = None
+    if bool(getattr(args, "diffuse_shear_traction", False)):
+        diffuse_time_scheme = str(getattr(args, "diffuse_shear_time_scheme", "constant")).strip().lower()
+        if diffuse_time_scheme not in {"constant", "imex"}:
+            raise ValueError(f"Unknown --diffuse-shear-time-scheme {diffuse_time_scheme!r}.")
+        diffuse_ramp_time = float(getattr(args, "diffuse_shear_ramp_time", float("nan")))
+        if not np.isfinite(diffuse_ramp_time):
+            diffuse_ramp_time = float(args.t_ramp)
+        target_diffuse_scale = float(args.diffuse_shear_scale)
+        diffuse_scale_expr = Constant(target_diffuse_scale)
+        if diffuse_time_scheme == "imex":
+            def _update_diffuse_scale(t_now: float) -> None:
+                diffuse_scale_expr.value = float(target_diffuse_scale) * _cosine_ramp_value(float(t_now), diffuse_ramp_time)
 
-    forms = build_biofilm_one_domain_forms(
-        v_k=v_k,
-        p_k=p_k,
-        vS_k=vS_k,
-        u_k=u_k,
-        phi_k=phi_k,
-        alpha_k=alpha_k,
-        mu_alpha_k=mu_alpha_k,
-        S_k=S_k,
-        v_n=v_n,
-        p_n=p_n,
-        vS_n=vS_n,
-        u_n=u_n,
-        phi_n=phi_n,
-        alpha_n=alpha_n,
-        mu_alpha_n=mu_alpha_n,
-        S_n=S_n,
-        dv=dv,
-        dp=dp,
-        dvS=dvS,
-        du=du,
-        dphi=dphi,
-        dalpha=dalpha,
-        dmu_alpha=dmu_alpha,
-        dS=dS,
-        v_test=v_test,
-        q_test=q_test,
-        vS_test=vS_test,
-        u_test=u_test,
-        phi_test=phi_test,
-        alpha_test=alpha_test,
-        mu_alpha_test=mu_alpha_test,
-        S_test=S_test,
-        dx=dx(metadata={"q": int(args.q)}),
-        ds_cip=ds(metadata={"q": int(args.q)}),
-        dt=dt_c,
-        theta=theta,
-        rho_f=Constant(float(args.rho_f)),
-        mu_f=Constant(float(args.mu_f)),
-        mu_b=Constant(float(args.mu_f)),
-        kappa_inv=Constant(float(args.kappa_inv)),
-        mu_s=Constant(float(mu_s)),
-        lambda_s=Constant(float(lambda_s)),
-        solid_visco_eta=float(args.solid_visco_eta),
-        gamma_u=float(args.gamma_u),
-        u_extension_mode=str(args.u_extension),
-        gamma_u_pin=float(args.gamma_u_pin),
-        kinematics_scale=float(args.kinematics_scale) if np.isfinite(float(args.kinematics_scale)) else None,
-        v_supg=float(args.v_supg),
-        u_supg=float(args.u_supg),
-        # Transport/kinetics controls (FSI-only: disable growth/detachment/damage, but may solve alpha/phi in PDE mode).
-        D_phi=float(args.D_phi) if transport_mode == "pde" else 0.0,
-        gamma_phi=float(args.gamma_phi) if transport_mode == "pde" else 0.0,
-        phi_supg=float(args.phi_supg) if transport_mode == "pde" else 0.0,
-        phi_cip=float(args.phi_cip) if transport_mode == "pde" else 0.0,
-        D_alpha=float(args.D_alpha) if transport_mode == "pde" else 0.0,
-        alpha_advect_with=str(args.alpha_advect_with),
-        alpha_advection_form=str(args.alpha_advection_form) if transport_mode == "pde" else "advective",
-        alpha_ch_M=float(alpha_ch_M) if transport_mode == "pde" else 0.0,
-        alpha_ch_gamma=float(alpha_ch_gamma) if transport_mode == "pde" else 0.0,
-        alpha_ch_eps=float(alpha_ch_eps) if transport_mode == "pde" else 1.0,
-        alpha_ch_mobility=str(args.alpha_ch_mobility),
-        alpha_supg=float(args.alpha_supg) if transport_mode == "pde" else 0.0,
-        alpha_cip=float(args.alpha_cip) if transport_mode == "pde" else 0.0,
-        # (keep Allen–Cahn disabled in this benchmark)
-        alpha_cahn_M=0.0,
-        alpha_cahn_gamma=0.0,
-        D_S=0.0,
-        mu_max=0.0,
-        k_g=0.0,
-        k_d=0.0,
-        k_det=0.0,
-        dim=2,
-    )
+            diffuse_scale_update = _update_diffuse_scale
+            diffuse_scale_update(float(t0))
+        else:
+            diffuse_scale_expr.value = float(target_diffuse_scale)
+
+        shear_model = str(getattr(args, "diffuse_shear_model", "lagged_velocity")).strip().lower()
+        if shear_model == "poiseuille":
+            diffuse_g_t, diffuse_w_t = _poiseuille_diffuse_interface_shear_traction(
+                alpha_lag=alpha_n,
+                H=float(H),
+                u_max=1.5 * float(args.u_avg),
+                mu_f=float(args.mu_f),
+                scale=diffuse_scale_expr,
+                eta_n=float(args.diffuse_shear_eta),
+            )
+        elif shear_model == "lagged_stress":
+            diffuse_g_t, diffuse_w_t = _lagged_diffuse_interface_stress_traction(
+                v_lag=v_n,
+                p_lag=p_n,
+                alpha_lag=alpha_n,
+                mu_f=float(args.mu_f),
+                scale=diffuse_scale_expr,
+                eta_n=float(args.diffuse_shear_eta),
+            )
+        else:
+            diffuse_g_t, diffuse_w_t = _lagged_diffuse_interface_shear_traction(
+                v_lag=v_n,
+                alpha_lag=alpha_n,
+                mu_f=float(args.mu_f),
+                scale=diffuse_scale_expr,
+                eta_n=float(args.diffuse_shear_eta),
+            )
+        logging.info(
+            "[setup] diffuse interface traction enabled: model=%s, scale=%.3e, scheme=%s, ramp=%.3e, eta=%.3e",
+            shear_model,
+            float(args.diffuse_shear_scale),
+            diffuse_time_scheme,
+            float(diffuse_ramp_time),
+            float(args.diffuse_shear_eta),
+        )
+
+    if paper1_reduced:
+        forms = build_deformation_only_forms(
+            v_k=v_k,
+            p_k=p_k,
+            vS_k=vS_k,
+            u_k=u_k,
+            alpha_k=alpha_k,
+            mu_alpha_k=mu_alpha_k,
+            v_n=v_n,
+            p_n=p_n,
+            vS_n=vS_n,
+            u_n=u_n,
+            alpha_n=alpha_n,
+            mu_alpha_n=mu_alpha_n,
+            dv=dv,
+            dp=dp,
+            dvS=dvS,
+            du=du,
+            dalpha=dalpha,
+            dmu_alpha=dmu_alpha,
+            v_test=v_test,
+            q_test=q_test,
+            vS_test=vS_test,
+            u_test=u_test,
+            alpha_test=alpha_test,
+            mu_alpha_test=mu_alpha_test,
+            dx=dx(metadata={"q": int(args.q)}),
+            dt=dt_c,
+            theta=theta,
+            rho_f=Constant(float(args.rho_f)),
+            mu_f=Constant(float(args.mu_f)),
+            mu_b=Constant(float(args.mu_f)),
+            kappa_inv=Constant(float(args.kappa_inv)),
+            mu_s=Constant(float(mu_s)),
+            lambda_s=Constant(float(lambda_s)),
+            solid_visco_eta=float(args.solid_visco_eta),
+            gamma_div=float(args.gamma_div),
+            phi_b=float(phi_b),
+            M_alpha=float(alpha_ch_M),
+            gamma_alpha=float(alpha_ch_gamma),
+            eps_alpha=float(alpha_ch_eps),
+            g_t_k=diffuse_g_t,
+            g_t_n=diffuse_g_t,
+            traction_weight_k=diffuse_w_t,
+            traction_weight_n=diffuse_w_t,
+        )
+    else:
+        forms = build_biofilm_one_domain_forms(
+            v_k=v_k,
+            p_k=p_k,
+            vS_k=vS_k,
+            u_k=u_k,
+            phi_k=phi_k,
+            alpha_k=alpha_k,
+            mu_alpha_k=mu_alpha_k,
+            S_k=S_k,
+            v_n=v_n,
+            p_n=p_n,
+            vS_n=vS_n,
+            u_n=u_n,
+            phi_n=phi_n,
+            alpha_n=alpha_n,
+            mu_alpha_n=mu_alpha_n,
+            S_n=S_n,
+            dv=dv,
+            dp=dp,
+            dvS=dvS,
+            du=du,
+            dphi=dphi,
+            dalpha=dalpha,
+            dmu_alpha=dmu_alpha,
+            dS=dS,
+            v_test=v_test,
+            q_test=q_test,
+            vS_test=vS_test,
+            u_test=u_test,
+            phi_test=phi_test,
+            alpha_test=alpha_test,
+            mu_alpha_test=mu_alpha_test,
+            S_test=S_test,
+            dx=dx(metadata={"q": int(args.q)}),
+            ds_cip=ds(metadata={"q": int(args.q)}),
+            dt=dt_c,
+            theta=theta,
+            rho_f=Constant(float(args.rho_f)),
+            mu_f=Constant(float(args.mu_f)),
+            mu_b=Constant(float(args.mu_f)),
+            kappa_inv=Constant(float(args.kappa_inv)),
+            mu_s=Constant(float(mu_s)),
+            lambda_s=Constant(float(lambda_s)),
+            solid_visco_eta=float(args.solid_visco_eta),
+            gamma_u=float(args.gamma_u),
+            u_extension_mode=str(args.u_extension),
+            gamma_u_pin=float(args.gamma_u_pin),
+            kinematics_scale=float(args.kinematics_scale) if np.isfinite(float(args.kinematics_scale)) else None,
+            v_supg=float(args.v_supg),
+            u_supg=float(args.u_supg),
+            gamma_div=float(args.gamma_div),
+            # Transport/kinetics controls (FSI-only: disable growth/detachment/damage, but may solve alpha/phi in PDE mode).
+            D_phi=float(args.D_phi) if transport_mode == "pde" else 0.0,
+            gamma_phi=float(args.gamma_phi) if transport_mode == "pde" else 0.0,
+            phi_supg=float(args.phi_supg) if transport_mode == "pde" else 0.0,
+            phi_cip=float(args.phi_cip) if transport_mode == "pde" else 0.0,
+            D_alpha=float(args.D_alpha) if transport_mode == "pde" else 0.0,
+            alpha_advect_with=str(args.alpha_advect_with),
+            alpha_advection_form=str(args.alpha_advection_form) if transport_mode == "pde" else "advective",
+            alpha_ch_M=float(alpha_ch_M) if transport_mode == "pde" else 0.0,
+            alpha_ch_gamma=float(alpha_ch_gamma) if transport_mode == "pde" else 0.0,
+            alpha_ch_eps=float(alpha_ch_eps) if transport_mode == "pde" else 1.0,
+            alpha_ch_mobility=str(args.alpha_ch_mobility),
+            alpha_supg=float(args.alpha_supg) if transport_mode == "pde" else 0.0,
+            alpha_cip=float(args.alpha_cip) if transport_mode == "pde" else 0.0,
+            g_t_k=diffuse_g_t,
+            g_t_n=diffuse_g_t,
+            traction_weight_k=diffuse_w_t,
+            traction_weight_n=diffuse_w_t,
+            # (keep Allen–Cahn disabled in this benchmark)
+            alpha_cahn_M=0.0,
+            alpha_cahn_gamma=0.0,
+            D_S=0.0,
+            mu_max=0.0,
+            k_g=0.0,
+            k_d=0.0,
+            k_det=0.0,
+            dim=2,
+        )
 
     # ------------------------------------------------------------------
     # Boundary conditions
@@ -1324,6 +1714,8 @@ def main() -> None:
         tau_w = 6.0 * mu_f0 * u_avg / float(H)  # plane Poiseuille between plates
         Re = rho_f0 * u_avg * float(H) / max(mu_f0, 1.0e-30)
         logging.info(f"[setup] inflow: u_avg={u_avg:.3e} m/s (u_max={u_max:.3e}), tau_w≈{tau_w:.3e} Pa, Re≈{Re:.1f}")
+        if float(args.gamma_div) != 0.0:
+            logging.info(f"[setup] mixture grad-div stabilization enabled: gamma_div={float(args.gamma_div):.3e}")
     except Exception:
         pass
 
@@ -1371,6 +1763,13 @@ def main() -> None:
     if restart_write_every > 0 or restart_from is not None:
         restart_dir.mkdir(parents=True, exist_ok=True)
 
+    snapshot_targets = sorted(
+        float(v) for v in str(getattr(args, "snapshot_times", "")).split(",") if str(v).strip()
+    )
+    snapshot_dir = out_dir / "snapshots"
+    if snapshot_targets:
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
     restart_state: dict[str, object] | None = None
     if restart_from is not None:
         restart_state = _load_restart_checkpoint(
@@ -1390,8 +1789,10 @@ def main() -> None:
         vS_k.nodal_values[:] = vS_n.nodal_values
         u_k.nodal_values[:] = u_n.nodal_values
         alpha_k.nodal_values[:] = alpha_n.nodal_values
-        phi_k.nodal_values[:] = phi_n.nodal_values
-        S_k.nodal_values[:] = S_n.nodal_values
+        if phi_k is not None and phi_n is not None:
+            phi_k.nodal_values[:] = phi_n.nodal_values
+        if S_k is not None and S_n is not None:
+            S_k.nodal_values[:] = S_n.nodal_values
         mu_alpha_k.nodal_values[:] = mu_alpha_n.nodal_values
         logging.info(f"[restart] loaded {restart_from} (t={float(t0):.6e}s, step={int(step0)}, dt={float(dt_val):.3e})")
 
@@ -1426,9 +1827,35 @@ def main() -> None:
     else:
         x_ref_global = _x_front_global_quantile(alpha_xy, alpha_n.nodal_values, q=float(args.global_front_quantile), alpha_half=0.5)
 
+    alpha_vals_ref = np.asarray(alpha_n.nodal_values, dtype=float).ravel()
+    alpha_weights_ref = np.clip(alpha_vals_ref, 0.0, 1.0)
+    alpha_mask_ref = alpha_vals_ref >= 0.5
+    if phi_n is not None:
+        phi_vals_ref = np.asarray(phi_n.nodal_values, dtype=float).ravel()
+        if np.any(alpha_mask_ref):
+            phi_ref_alpha05 = float(np.mean(phi_vals_ref[alpha_mask_ref]))
+        else:
+            phi_ref_alpha05 = float("nan")
+        denom_ref = float(np.sum(alpha_weights_ref))
+        if denom_ref > 1.0e-14:
+            phi_ref_alpha_weighted = float(np.sum(alpha_weights_ref * phi_vals_ref) / denom_ref)
+        else:
+            phi_ref_alpha_weighted = float("nan")
+    else:
+        phi_ref_alpha05 = float("nan")
+        phi_ref_alpha_weighted = float("nan")
+
     ts_path = out_dir / "timeseries.csv"
     header = (
-        ["t_s", "x_front_global", "dx_front_global"]
+        [
+            "t_s",
+            "x_front_global",
+            "dx_front_global",
+            "phi_mean_alpha05",
+            "phi_drop_alpha05_pp",
+            "phi_mean_alpha_weighted",
+            "phi_drop_alpha_weighted_pp",
+        ]
         + [f"x_front_y{int(round(1.0e6 * y))}um" for y in y_lines]
         + [f"dx_front_y{int(round(1.0e6 * y))}um" for y in y_lines]
     )
@@ -1457,9 +1884,45 @@ def main() -> None:
     else:
         x_prev = [float(v) for v in x_ref]
 
+    pending_snapshots = list(snapshot_targets)
+
+    def _write_snapshot_contours(t_s: float, step_no: int) -> None:
+        if not snapshot_targets:
+            return
+        contours = _alpha_half_contours(alpha_xy, alpha_k.nodal_values, alpha_half=0.5)
+        stem = f"snapshot_step{int(step_no):04d}_t{float(t_s):06.3f}"
+        _write_contours_csv(snapshot_dir / f"{stem}_alpha05.csv", contours)
+
     def _append_timeseries(t_s: float) -> None:
         xg = _x_front_global_quantile(alpha_xy, alpha_k.nodal_values, q=float(args.global_front_quantile), alpha_half=0.5)
         dxg = float(xg - x_ref_global) if (math.isfinite(xg) and math.isfinite(x_ref_global)) else float("nan")
+        alpha_vals = np.asarray(alpha_k.nodal_values, dtype=float).ravel()
+        alpha_weights = np.clip(alpha_vals, 0.0, 1.0)
+        alpha_mask = alpha_vals >= 0.5
+        if phi_k is not None:
+            phi_vals = np.asarray(phi_k.nodal_values, dtype=float).ravel()
+            if np.any(alpha_mask):
+                phi_mean_alpha05 = float(np.mean(phi_vals[alpha_mask]))
+            else:
+                phi_mean_alpha05 = float("nan")
+            denom = float(np.sum(alpha_weights))
+            if denom > 1.0e-14:
+                phi_mean_alpha_weighted = float(np.sum(alpha_weights * phi_vals) / denom)
+            else:
+                phi_mean_alpha_weighted = float("nan")
+        else:
+            phi_mean_alpha05 = float("nan")
+            phi_mean_alpha_weighted = float("nan")
+        phi_drop_alpha05_pp = (
+            100.0 * float(phi_mean_alpha05 - phi_ref_alpha05)
+            if math.isfinite(phi_mean_alpha05) and math.isfinite(phi_ref_alpha05)
+            else float("nan")
+        )
+        phi_drop_alpha_weighted_pp = (
+            100.0 * float(phi_mean_alpha_weighted - phi_ref_alpha_weighted)
+            if math.isfinite(phi_mean_alpha_weighted) and math.isfinite(phi_ref_alpha_weighted)
+            else float("nan")
+        )
         nonlocal x_prev
         xs = []
         x_new_prev: list[float] = []
@@ -1483,7 +1946,15 @@ def main() -> None:
         with ts_path.open("a", encoding="utf-8") as f:
             f.write(
                 ",".join(
-                    [f"{float(t_s):.12e}", f"{xg:.12e}", f"{dxg:.12e}"]
+                    [
+                        f"{float(t_s):.12e}",
+                        f"{xg:.12e}",
+                        f"{dxg:.12e}",
+                        f"{phi_mean_alpha05:.12e}",
+                        f"{phi_drop_alpha05_pp:.12e}",
+                        f"{phi_mean_alpha_weighted:.12e}",
+                        f"{phi_drop_alpha_weighted_pp:.12e}",
+                    ]
                     + [f"{z:.12e}" for z in xs]
                     + [f"{z:.12e}" for z in dxs]
                 )
@@ -1493,42 +1964,129 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Solver
     # ------------------------------------------------------------------
-    petsc_opts = {
-        "snes_type": "newtonls",
-        "snes_linesearch_type": "bt",
-        "snes_atol": float(args.newton_tol),
-        "snes_rtol": float(args.newton_rtol),
-        "snes_max_it": int(args.max_it),
-        "ksp_type": "preonly",
-        "pc_type": "lu",
-        "pc_factor_mat_solver_type": "mumps",
-    }
-    if os.getenv("PYCUTFEM_PETSC_MONITOR", "").strip().lower() in {"1", "true", "yes"}:
-        petsc_opts.setdefault("snes_monitor", None)
-        petsc_opts.setdefault("snes_converged_reason", None)
-        petsc_opts.setdefault("ksp_converged_reason", None)
-        petsc_opts.setdefault("ksp_monitor_short", None)
-
-    solver = PetscSnesNewtonSolver(
-        forms.residual_form,
-        forms.jacobian_form,
+    newton_params = NewtonParameters(
+        newton_tol=float(args.newton_tol),
+        newton_rtol=float(args.newton_rtol),
+        max_newton_iter=int(args.max_it),
+        accept_nonconverged_atol_factor=float(args.accept_nonconverged_atol_factor),
+        line_search=True,
+        ls_mode=str(args.ls_mode),
+    )
+    solver_kind = str(args.nonlinear_solver).strip().lower()
+    common_solver_kwargs = dict(
         dof_handler=dh,
         mixed_element=me,
         bcs=bcs,
         bcs_homog=bcs_homog,
-        newton_params=NewtonParameters(
-            newton_tol=float(args.newton_tol),
-            newton_rtol=float(args.newton_rtol),
-            max_newton_iter=int(args.max_it),
-            accept_nonconverged_atol_factor=float(args.accept_nonconverged_atol_factor),
-        ),
+        newton_params=newton_params,
         quad_order=int(args.q),
         backend=str(args.backend),
-        petsc_options=petsc_opts,
     )
+    if solver_kind == "snes":
+        petsc_opts = {
+            "snes_type": "newtonls",
+            "snes_linesearch_type": "bt",
+            "snes_atol": float(args.newton_tol),
+            "snes_rtol": float(args.newton_rtol),
+            "snes_max_it": int(args.max_it),
+            "ksp_type": "preonly",
+            "pc_type": "lu",
+            "pc_factor_mat_solver_type": "mumps",
+        }
+        if os.getenv("PYCUTFEM_PETSC_MONITOR", "").strip().lower() in {"1", "true", "yes"}:
+            petsc_opts.setdefault("snes_monitor", None)
+            petsc_opts.setdefault("snes_converged_reason", None)
+            petsc_opts.setdefault("ksp_converged_reason", None)
+            petsc_opts.setdefault("ksp_monitor_short", None)
+        logging.info("[setup] nonlinear solver: snes")
+        solver = PetscSnesNewtonSolver(
+            forms.residual_form,
+            forms.jacobian_form,
+            petsc_options=petsc_opts,
+            **common_solver_kwargs,
+        )
+    elif solver_kind == "newton":
+        logging.info("[setup] nonlinear solver: internal-newton")
+        solver = NewtonSolver(
+            forms.residual_form,
+            forms.jacobian_form,
+            lin_params=LinearSolverParameters(backend="petsc"),
+            **common_solver_kwargs,
+        )
+    else:
+        logging.info("[setup] nonlinear solver: pdas")
+        solver = PdasNewtonSolver(
+            forms.residual_form,
+            forms.jacobian_form,
+            vi_params=VIParameters(
+                c=float(args.vi_c),
+                project_initial_guess=True,
+                project_each_iteration=True,
+            ),
+            lin_params=LinearSolverParameters(backend="petsc"),
+            **common_solver_kwargs,
+        )
+
+    bounds_by_field: dict[str, tuple[float | None, float | None]] = {}
+    if bool(args.alpha_box_constraints):
+        bounds_by_field["alpha"] = (0.0, 1.0)
+    if (phi_k is not None) and bool(args.phi_box_constraints):
+        bounds_by_field["phi"] = (0.0, 1.0)
+    if bounds_by_field and hasattr(solver, "set_box_bounds"):
+        solver.set_box_bounds(by_field=bounds_by_field)
 
     def _on_dt_change(new_dt: float) -> None:
         dt_c.value = float(new_dt)
+
+    def _masked_residual_inf(vec: np.ndarray, bcs_now) -> float:
+        arr = np.asarray(vec, dtype=float).ravel()
+        mask = np.ones(arr.size, dtype=bool)
+        try:
+            dirichlet = dh.get_dirichlet_data(bcs_now or []) or {}
+        except Exception:
+            dirichlet = {}
+        if dirichlet:
+            bc_rows = np.fromiter(dirichlet.keys(), dtype=int)
+            if bc_rows.size:
+                mask[bc_rows] = False
+        inactive = set(getattr(dh, "dof_tags", {}).get("inactive", set()))
+        if inactive:
+            mask[np.fromiter(inactive, dtype=int)] = False
+        if not np.any(mask):
+            return 0.0
+        return float(np.linalg.norm(arr[mask], ord=np.inf))
+
+    def _block_residual_breakdown(bcs_now) -> list[tuple[float, str]]:
+        blocks = [
+            ("momentum", getattr(forms, "r_momentum", None)),
+            ("mass", getattr(forms, "r_mass", None)),
+            ("skeleton", getattr(forms, "r_skeleton", None)),
+            ("kinematics", getattr(forms, "r_kinematics", None)),
+            ("phi", getattr(forms, "r_phi", None)),
+            ("alpha", getattr(forms, "r_alpha", None)),
+            ("mu_alpha", getattr(forms, "r_mu_alpha", None)),
+            ("alpha_lambda", getattr(forms, "r_alpha_lambda", None)),
+            ("substrate", getattr(forms, "r_substrate", None)),
+            ("damage", getattr(forms, "r_damage", None)),
+            ("detached", getattr(forms, "r_detached", None)),
+        ]
+        out: list[tuple[float, str]] = []
+        for name, res_form in blocks:
+            if res_form is None:
+                continue
+            try:
+                _, F_blk = assemble_form(
+                    Equation(None, res_form),
+                    dof_handler=dh,
+                    bcs=[],
+                    quad_order=int(args.q),
+                    backend=str(args.backend),
+                )
+                out.append((_masked_residual_inf(np.asarray(F_blk, dtype=float), bcs_now), str(name)))
+            except Exception as exc:
+                out.append((float("inf"), f"{name}(assembly_failed:{exc})"))
+        out.sort(reverse=True, key=lambda t: t[0])
+        return out
 
     def on_step_failure(**info):  # noqa: ANN001
         """
@@ -1585,16 +2143,24 @@ def main() -> None:
             if n_show:
                 items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
                 print(f"    [fail_res] {items}")
+                block_norms = _block_residual_breakdown(bcs_now)
+                if block_norms:
+                    block_items = ", ".join(f"{name}:{val:.2e}" for val, name in block_norms[: min(8, len(block_norms))])
+                    print(f"    [fail_blocks] {block_items}")
+                    worst_block = str(block_norms[0][1])
+                else:
+                    worst_block = ""
                 try:
                     dt_min_val = float(getattr(args, "dt_min", 0.0))
                 except Exception:
                     dt_min_val = 0.0
                 if dt_min_val > 0.0 and dt_fail <= dt_min_val + 1.0e-15:
                     worst_field = str(field_norms[0][1])
-                    if worst_field.startswith("v"):
+                    if worst_block.startswith("momentum") or worst_block.startswith("skeleton") or worst_field.startswith("v"):
                         print(
-                            "    [hint] failure occurred at dt==--dt-min and is dominated by fluid momentum residuals; "
-                            "try a smaller --dt-min (e.g. 5e-3 or 1e-3) or consider quasi-static flow (--rho-f 0) for this benchmark."
+                            "    [hint] failure occurred at dt==--dt-min and is dominated by the coupled momentum block; "
+                            "for Benchmark 6 this usually indicates lost mechanics coercivity/conditioning rather than a tolerance issue. "
+                            "Prefer increasing --gamma-div and/or --gamma-u, keep --u-extension l2, and refine around the biofilm before reducing dt_min further."
                         )
         except Exception as exc:
             print(f"    [fail_res] failed to compute residual breakdown: {exc}")
@@ -1604,9 +2170,16 @@ def main() -> None:
         _post_step_update()
         step_no = int(getattr(solver, "_current_step_no", int(step)))
         t_now = float(getattr(solver, "_current_t", 0.0) + getattr(solver, "_current_dt", dt_val))
+        if diffuse_scale_update is not None:
+            diffuse_scale_update(float(t_now))
         _append_timeseries(t_now)
+        while pending_snapshots and t_now + 1.0e-12 >= float(pending_snapshots[0]):
+            _write_snapshot_contours(float(t_now), int(step_no))
+            pending_snapshots.pop(0)
         if vtk_every > 0 and (step_no % vtk_every == 0):
-            vtkf = {"v": v_k, "p": p_k, "vS": vS_k, "u": u_k, "phi": phi_k, "alpha": alpha_k}
+            vtkf = {"v": v_k, "p": p_k, "vS": vS_k, "u": u_k, "alpha": alpha_k}
+            if phi_k is not None:
+                vtkf["phi"] = phi_k
             if transport_mode == "pde" and ch_enabled:
                 vtkf["mu_alpha"] = mu_alpha_k
             export_vtk(str(vtk_dir / f"step={step_no:04d}.vtu"), mesh, dh, vtkf)
@@ -1654,11 +2227,16 @@ def main() -> None:
 
     # Prime alpha_k/phi_k and write the initial row (t=0 for fresh runs, or t=t0 for restart into a fresh out_dir).
     alpha_k.nodal_values[:] = alpha_n.nodal_values
-    phi_k.nodal_values[:] = phi_n.nodal_values
+    if phi_k is not None and phi_n is not None:
+        phi_k.nodal_values[:] = phi_n.nodal_values
     mu_alpha_k.nodal_values[:] = mu_alpha_n.nodal_values
-    S_k.nodal_values[:] = S_n.nodal_values
+    if S_k is not None and S_n is not None:
+        S_k.nodal_values[:] = S_n.nodal_values
     if restart_from is None:
         _append_timeseries(0.0)
+        while pending_snapshots and abs(float(pending_snapshots[0])) <= 1.0e-14:
+            _write_snapshot_contours(0.0, 0)
+            pending_snapshots.pop(0)
         if restart_write_every > 0:
             _write_restart_checkpoint(
                 restart_dir / "checkpoint_step=00000.npz",
@@ -1700,6 +2278,9 @@ def main() -> None:
             )
     elif not append_existing_ts:
         _append_timeseries(float(t0))
+        while pending_snapshots and float(t0) + 1.0e-12 >= float(pending_snapshots[0]):
+            _write_snapshot_contours(float(t0), int(step0))
+            pending_snapshots.pop(0)
         if restart_write_every > 0:
             _write_restart_checkpoint(
                 restart_dir / f"checkpoint_step={int(step0):05d}.npz",
@@ -1740,13 +2321,17 @@ def main() -> None:
                 mu_alpha=mu_alpha_k,
             )
 
-    functions_k = [v_k, p_k, vS_k, u_k, phi_k, alpha_k]
-    functions_n = [v_n, p_n, vS_n, u_n, phi_n, alpha_n]
+    functions_k = [v_k, p_k, vS_k, u_k, alpha_k]
+    functions_n = [v_n, p_n, vS_n, u_n, alpha_n]
+    if phi_k is not None and phi_n is not None:
+        functions_k.append(phi_k)
+        functions_n.append(phi_n)
     if transport_mode == "pde" and ch_enabled:
         functions_k.append(mu_alpha_k)
         functions_n.append(mu_alpha_n)
-    functions_k.append(S_k)
-    functions_n.append(S_n)
+    if S_k is not None and S_n is not None:
+        functions_k.append(S_k)
+        functions_n.append(S_n)
     if float(t0) >= float(args.t_final) - 1.0e-14:
         logging.info(f"[done] restart t0={float(t0):.6e}s >= t_final={float(args.t_final):.6e}s; nothing to do.")
         return
