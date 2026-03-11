@@ -55,6 +55,7 @@ class CppCodeGen:
         self.mixed_element = mixed_element
         self.form_rank = form_rank
         self.on_facet = on_facet
+        self.spatial_dim = int(getattr(self.mixed_element.mesh, "spatial_dim", 2))
         # Optional hook to a NumbaCodeGen instance for metadata reuse.
         self._mirror = mirror
         self.include_dirs = [Path(__file__).parent]
@@ -162,11 +163,12 @@ class CppCodeGen:
         needs_det: set[str] = set()
         needs_u: set[str] = set()
         needs_h: set[str] = set()
-        needs_hx: bool = False
+        needs_hx_unsided: bool = False
+        needs_hx_sided: bool = False
         needs_normals = False
         needs_cell_diam = False
         needs_r00: set[str] = set()
-        for op in ir_sequence:
+        for op_idx, op in enumerate(ir_sequence):
             if isinstance(op, LoadAnalytic):
                 name = f"ana_{op.func_id}"
                 shape = tuple(getattr(op, "tensor_shape", ()) or ())
@@ -206,7 +208,6 @@ class CppCodeGen:
                 if op.role == "function":
                     needs_u.add(coeff_array_name(op.name, op.side))
                 if sum(op.deriv_order) >= 2:
-                    needs_hx = True
                     for fn in op.field_names or []:
                         if _is_rt_field(str(fn)):
                             continue
@@ -217,25 +218,48 @@ class CppCodeGen:
                                 tags.add("pos" if op.side == "+" else "neg")
                             if getattr(op, "field_sides", None):
                                 tags.update(t for t in op.field_sides if t in ("+", "-"))
-                            if not tags:
-                                tags.update({"pos", "neg"})
+                            if tags:
+                                needs_hx_sided = True
+                            else:
+                                # Exterior-facet (`ds`) Hessian operators are unsided and
+                                # must use the unsided inverse-map Hessians Hxi0/Hxi1.
+                                needs_hx_unsided = True
                             for tg in tags:
                                 needs_h.update({
                                     f"r10_{fn}_{tg}", f"r01_{fn}_{tg}",
                                     f"r20_{fn}_{tg}", f"r11_{fn}_{tg}", f"r02_{fn}_{tg}",
                                 })
+                        else:
+                            needs_hx_unsided = True
             if isinstance(op, (IRHessian, IRLaplacian)):
-                needs_hx = True
                 for fn in getattr(op, "field_names", []) or []:
                     if _is_rt_field(str(fn)):
                         continue
                     needs_h.update({f"d10_{fn}", f"d01_{fn}", f"d20_{fn}", f"d11_{fn}", f"d02_{fn}"})
                     if self.on_facet:
-                        for tg in ("pos", "neg"):
-                            needs_h.update({
-                                f"r10_{fn}_{tg}", f"r01_{fn}_{tg}",
-                                f"r20_{fn}_{tg}", f"r11_{fn}_{tg}", f"r02_{fn}_{tg}",
-                            })
+                        if getattr(op, "side", "") in ("+", "-"):
+                            needs_hx_sided = True
+                            for tg in ("pos", "neg"):
+                                needs_h.update({
+                                    f"r10_{fn}_{tg}", f"r01_{fn}_{tg}",
+                                    f"r20_{fn}_{tg}", f"r11_{fn}_{tg}", f"r02_{fn}_{tg}",
+                                })
+                        else:
+                            needs_hx_unsided = True
+                    else:
+                        needs_hx_unsided = True
+            if isinstance(op, Grad):
+                # Only grad(div(.)) needs inverse-map Hessians for the chain rule.
+                # Ordinary first gradients use J^{-1} only.
+                prev_is_div = op_idx > 0 and isinstance(ir_sequence[op_idx - 1], Div)
+                if prev_is_div:
+                    if self.on_facet:
+                        if getattr(op, "side", "") in ("+", "-"):
+                            needs_hx_sided = True
+                        else:
+                            needs_hx_unsided = True
+                    else:
+                        needs_hx_unsided = True
             if isinstance(op, LoadElementWiseConstant):
                 rank = 1 + len(getattr(op, "tensor_shape", ()) or ())
                 ewc_rank[op.name] = rank
@@ -280,15 +304,14 @@ class CppCodeGen:
         for name in sorted(needs_u):
             if name not in param_order:
                 param_order.append(name)
-        if needs_hx:
-            if self.on_facet:
-                for base in ("pos_Hxi0", "pos_Hxi1", "neg_Hxi0", "neg_Hxi1"):
-                    if base not in param_order:
-                        param_order.append(base)
-            else:
-                for base in ("Hxi0", "Hxi1"):
-                    if base not in param_order:
-                        param_order.append(base)
+        if needs_hx_unsided:
+            for base in ("Hxi0", "Hxi1"):
+                if base not in param_order:
+                    param_order.append(base)
+        if needs_hx_sided:
+            for base in ("pos_Hxi0", "pos_Hxi1", "neg_Hxi0", "neg_Hxi1"):
+                if base not in param_order:
+                    param_order.append(base)
         if needs_normals and "normals" not in param_order:
             param_order.append("normals")
         for name in sorted(needs_h):
@@ -509,6 +532,7 @@ class CppCodeGen:
                 "parent",
                 "side",
                 "field_sides",
+                "is_divergence",
                 "tmp_kind",
                 "tmp_slot",
                 "tmp_pinned",
@@ -524,6 +548,7 @@ class CppCodeGen:
                 parent="",
                 side="",
                 field_sides=None,
+                is_divergence: bool = False,
                 *,
                 tmp_kind: str | None = None,
                 tmp_slot: int | None = None,
@@ -537,6 +562,7 @@ class CppCodeGen:
                 self.parent = parent  # parent symbol name for functions
                 self.side = side or ""
                 self.field_sides = field_sides or []
+                self.is_divergence = bool(is_divergence)
                 self.tmp_kind = tmp_kind
                 self.tmp_slot = tmp_slot
                 self.tmp_pinned = bool(tmp_pinned)
@@ -1246,16 +1272,34 @@ class CppCodeGen:
                     for idx2, fn in enumerate(op.field_names):
                         side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx2)
                         use_side = (self.on_facet and side_tag in ("pos", "neg"))
-                        base = "r" if use_side else "d"
-                        deriv_key = "20" if op.deriv_order == (2, 0) else "11" if op.deriv_order == (1, 1) else "02"
-                        table_name = f"{base}{deriv_key}_{fn}" + (f"_{side_tag}" if use_side else "")
+                        if use_side and side_tag == "pos":
+                            required_args.update({"J_inv_pos", "pos_Hxi0", "pos_Hxi1"})
+                            jloc_var = "Jloc_pos"
+                            hx_var = "Hx_pos"
+                            hy_var = "Hy_pos"
+                        elif use_side and side_tag == "neg":
+                            required_args.update({"J_inv_neg", "neg_Hxi0", "neg_Hxi1"})
+                            jloc_var = "Jloc_neg"
+                            hx_var = "Hx_neg"
+                            hy_var = "Hy_neg"
+                        else:
+                            required_args.update({"J_inv", "Hxi0", "Hxi1"})
+                            jloc_var = "Jloc"
+                            hx_var = "Hx"
+                            hy_var = "Hy"
+                        d10 = f"r10_{fn}_{side_tag}" if use_side else f"d10_{fn}"
+                        d01 = f"r01_{fn}_{side_tag}" if use_side else f"d01_{fn}"
+                        d20 = f"r20_{fn}_{side_tag}" if use_side else f"d20_{fn}"
+                        d11 = f"r11_{fn}_{side_tag}" if use_side else f"d11_{fn}"
+                        d02 = f"r02_{fn}_{side_tag}" if use_side else f"d02_{fn}"
                         map_name = f"{side_tag}_map_{fn}" if use_side else None
                         s0 = field_slices.get(fn, slice(0, 0)).start
+                        required_args.update({d10, d01, d20, d11, d02})
                         if use_side:
                             map_len = new_tmp("map_len")
                             basis_len = new_tmp("basis_len")
                             emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
-                            emit_line(f"ssize_t {basis_len} = {table_name}_view.shape(2);")
+                            emit_line(f"ssize_t {basis_len} = {d20}_view.shape(2);")
                             emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
                             emit_line(f"    int col = {map_name}_view(e, j);")
                             emit_line(f"    if (col < 0 || col >= n_union) continue;")
@@ -1263,10 +1307,30 @@ class CppCodeGen:
                                 f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
                             )
                             emit_line(f"    if (src >= {basis_len}) continue;")
-                            emit_line(f"    {nm}({idx2}, col) = {table_name}_view(e, q, src);")
+                            emit_line(f"    double d20j = {d20}_view(e,q,src); double d11j = {d11}_view(e,q,src); double d02j = {d02}_view(e,q,src);")
+                            emit_line(f"    double d10j = {d10}_view(e,q,src); double d01j = {d01}_view(e,q,src);")
+                            emit_line(f"    double tmp00 = d20j * {jloc_var}(0,0) + d11j * {jloc_var}(1,0);")
+                            emit_line(f"    double tmp01 = d20j * {jloc_var}(0,1) + d11j * {jloc_var}(1,1);")
+                            emit_line(f"    double tmp10 = d11j * {jloc_var}(0,0) + d02j * {jloc_var}(1,0);")
+                            emit_line(f"    double tmp11 = d11j * {jloc_var}(0,1) + d02j * {jloc_var}(1,1);")
+                            emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10j*{hx_var}(0,0) + d01j*{hy_var}(0,0);")
+                            emit_line(f"    double h01 = {jloc_var}(0,1)*tmp00 + {jloc_var}(1,1)*tmp10 + d10j*{hx_var}(0,1) + d01j*{hy_var}(0,1);")
+                            emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10j*{hx_var}(1,1) + d01j*{hy_var}(1,1);")
+                            emit_line(f"    {nm}({idx2}, col) = h00;" if op.deriv_order == (2, 0) else f"    {nm}({idx2}, col) = h01;" if op.deriv_order == (1, 1) else f"    {nm}({idx2}, col) = h11;")
                             emit_line("}")
-                    else:
-                        emit_line(f"for (ssize_t j=0; j<n_union; ++j) {nm}({idx2}, j) = {table_name}_view(e, q, j);")
+                        else:
+                            emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
+                            emit_line(f"    double d20j = {d20}_view(e,q,j); double d11j = {d11}_view(e,q,j); double d02j = {d02}_view(e,q,j);")
+                            emit_line(f"    double d10j = {d10}_view(e,q,j); double d01j = {d01}_view(e,q,j);")
+                            emit_line(f"    double tmp00 = d20j * {jloc_var}(0,0) + d11j * {jloc_var}(1,0);")
+                            emit_line(f"    double tmp01 = d20j * {jloc_var}(0,1) + d11j * {jloc_var}(1,1);")
+                            emit_line(f"    double tmp10 = d11j * {jloc_var}(0,0) + d02j * {jloc_var}(1,0);")
+                            emit_line(f"    double tmp11 = d11j * {jloc_var}(0,1) + d02j * {jloc_var}(1,1);")
+                            emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10j*{hx_var}(0,0) + d01j*{hy_var}(0,0);")
+                            emit_line(f"    double h01 = {jloc_var}(0,1)*tmp00 + {jloc_var}(1,1)*tmp10 + d10j*{hx_var}(0,1) + d01j*{hy_var}(0,1);")
+                            emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10j*{hx_var}(1,1) + d01j*{hy_var}(1,1);")
+                            emit_line(f"    {nm}({idx2}, j) = h00;" if op.deriv_order == (2, 0) else f"    {nm}({idx2}, j) = h01;" if op.deriv_order == (1, 1) else f"    {nm}({idx2}, j) = h11;")
+                            emit_line("}")
                     item = StackItem(nm, "mat", op.role, (k, -1), op.field_names, op.name, op.side, op.field_sides)
                     stack.append(item)
                     loadvar_cache[lv_key] = _pin_for_cache(item)
@@ -1294,22 +1358,37 @@ class CppCodeGen:
                     coeff_name = coeff_array_name(op.name, op.side)
                     required_args.add(coeff_name)
 
-                    if op.deriv_order not in {(1, 0), (0, 1)}:
+                    if op.deriv_order not in {(1, 0), (0, 1), (2, 0), (1, 1), (0, 2)}:
                         raise NotImplementedError(
-                            f"C++ backend: Function Derivative order {op.deriv_order} not implemented (use grad()/Hessian()/laplacian())."
+                            f"C++ backend: Function Derivative order {op.deriv_order} not implemented."
                         )
 
-                    # Select physical component: (1,0)->dx, (0,1)->dy
-                    comp = 0 if op.deriv_order == (1, 0) else 1
+                    tot = int(op.deriv_order[0] + op.deriv_order[1])
+                    comp = 0 if op.deriv_order == (1, 0) else 1 if op.deriv_order == (0, 1) else None
+                    hess_comp = "00" if op.deriv_order == (2, 0) else "01" if op.deriv_order == (1, 1) else "11"
 
                     # Need inverse Jacobian for push-forward of reference gradients
                     if op.side == "+":
                         required_args.add("J_inv_pos")
+                        jloc_var = "Jloc_pos"
+                        hx_var = "Hx_pos"
+                        hy_var = "Hy_pos"
+                        if tot == 2:
+                            required_args.update({"pos_Hxi0", "pos_Hxi1"})
                     elif op.side == "-":
                         required_args.add("J_inv_neg")
+                        jloc_var = "Jloc_neg"
+                        hx_var = "Hx_neg"
+                        hy_var = "Hy_neg"
+                        if tot == 2:
+                            required_args.update({"neg_Hxi0", "neg_Hxi1"})
                     else:
                         required_args.add("J_inv")
-                    jloc_var = "Jloc_pos" if op.side == "+" else "Jloc_neg" if op.side == "-" else "Jloc"
+                        jloc_var = "Jloc"
+                        hx_var = "Hx"
+                        hy_var = "Hy"
+                        if tot == 2:
+                            required_args.update({"Hxi0", "Hxi1"})
 
                     # Normal unsided functions should not carry field_sides.
                     fs_clean = [] if not op.side else (op.field_sides or [])
@@ -1327,55 +1406,7 @@ class CppCodeGen:
                         side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, 0)
 
                         nm = new_tmp("dval")
-                        if self.on_facet and side_tag in ("pos", "neg"):
-                            d10 = f"r10_{fn}_{side_tag}"
-                            d01 = f"r01_{fn}_{side_tag}"
-                            map_name = f"{side_tag}_map_{fn}"
-                            required_args.update({d10, d01, map_name})
-                            map_len = new_tmp("map_len")
-                            basis_len = new_tmp("basis_len")
-                            emit_line(f"double {nm} = 0.0;")
-                            emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
-                            emit_line(f"ssize_t {basis_len} = {d10}_view.shape(2);")
-                            emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
-                            emit_line(f"    int col = {map_name}_view(e, j);")
-                            emit_line(f"    if (col < 0 || col >= n_union) continue;")
-                            emit_line(
-                                f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
-                            )
-                            emit_line(f"    if (src >= {basis_len}) continue;")
-                            emit_line(f"    double gx = {d10}_view(e,q,src); double gy = {d01}_view(e,q,src);")
-                            if comp == 0:
-                                emit_line(f"    double dphi = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
-                            else:
-                                emit_line(f"    double dphi = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
-                            emit_line(f"    {nm} += {coeff_name}_view(e, col) * dphi;")
-                            emit_line("}")
-                        else:
-                            required_args.add(f"g_{fn}")
-                            s0_adj = new_tmp("s0")
-                            s1_adj = new_tmp("s1")
-                            emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                            emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                            emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
-                            gtmp = new_tmp("g_tmp")
-                            emit_line(f"Eigen::MatrixXd {gtmp}(1, 2);")
-                            emit_line(
-                                f"gradient_component({gtmp}, 0, {coeff_name}_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
-                            )
-                            emit_line(f"double {nm} = {gtmp}(0, {comp});")
-
-                        item = StackItem(nm, "scalar", "value", (), op.field_names, op.name, op.side, fs_clean)
-                        stack.append(item)
-                        loadvar_cache[lv_key] = _pin_for_cache(item)
-                    else:
-                        nm = new_tmp("dvec")
-                        emit_line(f"Eigen::VectorXd {nm}({k});")
-                        emit_line(f"{nm}.setZero();")
-                        for idx, fn in enumerate(op.field_names):
-                            s0 = field_slices.get(fn, slice(0, 0)).start
-                            s1 = field_slices.get(fn, slice(0, 0)).stop
-                            side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx)
+                        if tot == 1:
                             if self.on_facet and side_tag in ("pos", "neg"):
                                 d10 = f"r10_{fn}_{side_tag}"
                                 d01 = f"r01_{fn}_{side_tag}"
@@ -1383,8 +1414,7 @@ class CppCodeGen:
                                 required_args.update({d10, d01, map_name})
                                 map_len = new_tmp("map_len")
                                 basis_len = new_tmp("basis_len")
-                                dval = new_tmp("dval")
-                                emit_line(f"double {dval} = 0.0;")
+                                emit_line(f"double {nm} = 0.0;")
                                 emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
                                 emit_line(f"ssize_t {basis_len} = {d10}_view.shape(2);")
                                 emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
@@ -1399,9 +1429,8 @@ class CppCodeGen:
                                     emit_line(f"    double dphi = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
                                 else:
                                     emit_line(f"    double dphi = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
-                                emit_line(f"    {dval} += {coeff_name}_view(e, col) * dphi;")
+                                emit_line(f"    {nm} += {coeff_name}_view(e, col) * dphi;")
                                 emit_line("}")
-                                emit_line(f"{nm}({idx}) = {dval};")
                             else:
                                 required_args.add(f"g_{fn}")
                                 s0_adj = new_tmp("s0")
@@ -1414,7 +1443,171 @@ class CppCodeGen:
                                 emit_line(
                                     f"gradient_component({gtmp}, 0, {coeff_name}_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
                                 )
-                                emit_line(f"{nm}({idx}) = {gtmp}(0, {comp});")
+                                emit_line(f"double {nm} = {gtmp}(0, {comp});")
+                        else:
+                            d10 = f"r10_{fn}_{side_tag}" if self.on_facet and side_tag in ("pos", "neg") else f"d10_{fn}"
+                            d01 = f"r01_{fn}_{side_tag}" if self.on_facet and side_tag in ("pos", "neg") else f"d01_{fn}"
+                            d20 = f"r20_{fn}_{side_tag}" if self.on_facet and side_tag in ("pos", "neg") else f"d20_{fn}"
+                            d11 = f"r11_{fn}_{side_tag}" if self.on_facet and side_tag in ("pos", "neg") else f"d11_{fn}"
+                            d02 = f"r02_{fn}_{side_tag}" if self.on_facet and side_tag in ("pos", "neg") else f"d02_{fn}"
+                            required_args.update({d10, d01, d20, d11, d02})
+                            emit_line(f"double {nm} = 0.0;")
+                            if self.on_facet and side_tag in ("pos", "neg"):
+                                map_name = f"{side_tag}_map_{fn}"
+                                required_args.add(map_name)
+                                map_len = new_tmp("map_len")
+                                basis_len = new_tmp("basis_len")
+                                emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
+                                emit_line(f"ssize_t {basis_len} = {d20}_view.shape(2);")
+                                emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
+                                emit_line(f"    int col = {map_name}_view(e, j);")
+                                emit_line(f"    if (col < 0 || col >= n_union) continue;")
+                                emit_line(
+                                    f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                                )
+                                emit_line(f"    if (src >= {basis_len}) continue;")
+                                emit_line(f"    double coeff_j = {coeff_name}_view(e, col);")
+                                emit_line(f"    double d20j = {d20}_view(e,q,src); double d11j = {d11}_view(e,q,src); double d02j = {d02}_view(e,q,src);")
+                                emit_line(f"    double d10j = {d10}_view(e,q,src); double d01j = {d01}_view(e,q,src);")
+                                emit_line(f"    double tmp00 = d20j * {jloc_var}(0,0) + d11j * {jloc_var}(1,0);")
+                                emit_line(f"    double tmp01 = d20j * {jloc_var}(0,1) + d11j * {jloc_var}(1,1);")
+                                emit_line(f"    double tmp10 = d11j * {jloc_var}(0,0) + d02j * {jloc_var}(1,0);")
+                                emit_line(f"    double tmp11 = d11j * {jloc_var}(0,1) + d02j * {jloc_var}(1,1);")
+                                emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10j*{hx_var}(0,0) + d01j*{hy_var}(0,0);")
+                                emit_line(f"    double h01 = {jloc_var}(0,1)*tmp00 + {jloc_var}(1,1)*tmp10 + d10j*{hx_var}(0,1) + d01j*{hy_var}(0,1);")
+                                emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10j*{hx_var}(1,1) + d01j*{hy_var}(1,1);")
+                                emit_line(f"    double dphi = h00;" if hess_comp == "00" else f"    double dphi = h01;" if hess_comp == "01" else f"    double dphi = h11;")
+                                emit_line(f"    {nm} += coeff_j * dphi;")
+                                emit_line("}")
+                            else:
+                                s0_adj = new_tmp("s0")
+                                s1_adj = new_tmp("s1")
+                                emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                                emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                                emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
+                                emit_line(f"    double coeff_j = {coeff_name}_view(e, j);")
+                                emit_line(f"    double d20j = {d20}_view(e,q,j); double d11j = {d11}_view(e,q,j); double d02j = {d02}_view(e,q,j);")
+                                emit_line(f"    double d10j = {d10}_view(e,q,j); double d01j = {d01}_view(e,q,j);")
+                                emit_line(f"    double tmp00 = d20j * {jloc_var}(0,0) + d11j * {jloc_var}(1,0);")
+                                emit_line(f"    double tmp01 = d20j * {jloc_var}(0,1) + d11j * {jloc_var}(1,1);")
+                                emit_line(f"    double tmp10 = d11j * {jloc_var}(0,0) + d02j * {jloc_var}(1,0);")
+                                emit_line(f"    double tmp11 = d11j * {jloc_var}(0,1) + d02j * {jloc_var}(1,1);")
+                                emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10j*{hx_var}(0,0) + d01j*{hy_var}(0,0);")
+                                emit_line(f"    double h01 = {jloc_var}(0,1)*tmp00 + {jloc_var}(1,1)*tmp10 + d10j*{hx_var}(0,1) + d01j*{hy_var}(0,1);")
+                                emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10j*{hx_var}(1,1) + d01j*{hy_var}(1,1);")
+                                emit_line(f"    double dphi = h00;" if hess_comp == "00" else f"    double dphi = h01;" if hess_comp == "01" else f"    double dphi = h11;")
+                                emit_line(f"    {nm} += coeff_j * dphi;")
+                                emit_line("}")
+
+                        item = StackItem(nm, "scalar", "value", (), op.field_names, op.name, op.side, fs_clean)
+                        stack.append(item)
+                        loadvar_cache[lv_key] = _pin_for_cache(item)
+                    else:
+                        nm = new_tmp("dvec")
+                        emit_line(f"Eigen::VectorXd {nm}({k});")
+                        emit_line(f"{nm}.setZero();")
+                        for idx, fn in enumerate(op.field_names):
+                            s0 = field_slices.get(fn, slice(0, 0)).start
+                            s1 = field_slices.get(fn, slice(0, 0)).stop
+                            side_tag = component_side_tag(op.side, getattr(op, "field_sides", None), fn, idx)
+                            if tot == 1:
+                                if self.on_facet and side_tag in ("pos", "neg"):
+                                    d10 = f"r10_{fn}_{side_tag}"
+                                    d01 = f"r01_{fn}_{side_tag}"
+                                    map_name = f"{side_tag}_map_{fn}"
+                                    required_args.update({d10, d01, map_name})
+                                    map_len = new_tmp("map_len")
+                                    basis_len = new_tmp("basis_len")
+                                    dval = new_tmp("dval")
+                                    emit_line(f"double {dval} = 0.0;")
+                                    emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
+                                    emit_line(f"ssize_t {basis_len} = {d10}_view.shape(2);")
+                                    emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
+                                    emit_line(f"    int col = {map_name}_view(e, j);")
+                                    emit_line(f"    if (col < 0 || col >= n_union) continue;")
+                                    emit_line(
+                                        f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                                    )
+                                    emit_line(f"    if (src >= {basis_len}) continue;")
+                                    emit_line(f"    double gx = {d10}_view(e,q,src); double gy = {d01}_view(e,q,src);")
+                                    if comp == 0:
+                                        emit_line(f"    double dphi = gx*{jloc_var}(0,0) + gy*{jloc_var}(1,0);")
+                                    else:
+                                        emit_line(f"    double dphi = gx*{jloc_var}(0,1) + gy*{jloc_var}(1,1);")
+                                    emit_line(f"    {dval} += {coeff_name}_view(e, col) * dphi;")
+                                    emit_line("}")
+                                    emit_line(f"{nm}({idx}) = {dval};")
+                                else:
+                                    required_args.add(f"g_{fn}")
+                                    s0_adj = new_tmp("s0")
+                                    s1_adj = new_tmp("s1")
+                                    emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                                    emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                                    emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                    gtmp = new_tmp("g_tmp")
+                                    emit_line(f"Eigen::MatrixXd {gtmp}(1, 2);")
+                                    emit_line(
+                                        f"gradient_component({gtmp}, 0, {coeff_name}_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
+                                    )
+                                    emit_line(f"{nm}({idx}) = {gtmp}(0, {comp});")
+                            else:
+                                d10 = f"r10_{fn}_{side_tag}" if self.on_facet and side_tag in ("pos", "neg") else f"d10_{fn}"
+                                d01 = f"r01_{fn}_{side_tag}" if self.on_facet and side_tag in ("pos", "neg") else f"d01_{fn}"
+                                d20 = f"r20_{fn}_{side_tag}" if self.on_facet and side_tag in ("pos", "neg") else f"d20_{fn}"
+                                d11 = f"r11_{fn}_{side_tag}" if self.on_facet and side_tag in ("pos", "neg") else f"d11_{fn}"
+                                d02 = f"r02_{fn}_{side_tag}" if self.on_facet and side_tag in ("pos", "neg") else f"d02_{fn}"
+                                required_args.update({d10, d01, d20, d11, d02})
+                                dval = new_tmp("dval")
+                                emit_line(f"double {dval} = 0.0;")
+                                if self.on_facet and side_tag in ("pos", "neg"):
+                                    map_name = f"{side_tag}_map_{fn}"
+                                    required_args.add(map_name)
+                                    map_len = new_tmp("map_len")
+                                    basis_len = new_tmp("basis_len")
+                                    emit_line(f"ssize_t {map_len} = {map_name}_view.shape(1);")
+                                    emit_line(f"ssize_t {basis_len} = {d20}_view.shape(2);")
+                                    emit_line(f"for (ssize_t j=0; j<{map_len}; ++j) {{")
+                                    emit_line(f"    int col = {map_name}_view(e, j);")
+                                    emit_line(f"    if (col < 0 || col >= n_union) continue;")
+                                    emit_line(
+                                        f"    ssize_t src = ({basis_len} == {map_len}) ? j : (({basis_len} == n_union) ? col : {s0} + j);"
+                                    )
+                                    emit_line(f"    if (src >= {basis_len}) continue;")
+                                    emit_line(f"    double coeff_j = {coeff_name}_view(e, col);")
+                                    emit_line(f"    double d20j = {d20}_view(e,q,src); double d11j = {d11}_view(e,q,src); double d02j = {d02}_view(e,q,src);")
+                                    emit_line(f"    double d10j = {d10}_view(e,q,src); double d01j = {d01}_view(e,q,src);")
+                                    emit_line(f"    double tmp00 = d20j * {jloc_var}(0,0) + d11j * {jloc_var}(1,0);")
+                                    emit_line(f"    double tmp01 = d20j * {jloc_var}(0,1) + d11j * {jloc_var}(1,1);")
+                                    emit_line(f"    double tmp10 = d11j * {jloc_var}(0,0) + d02j * {jloc_var}(1,0);")
+                                    emit_line(f"    double tmp11 = d11j * {jloc_var}(0,1) + d02j * {jloc_var}(1,1);")
+                                    emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10j*{hx_var}(0,0) + d01j*{hy_var}(0,0);")
+                                    emit_line(f"    double h01 = {jloc_var}(0,1)*tmp00 + {jloc_var}(1,1)*tmp10 + d10j*{hx_var}(0,1) + d01j*{hy_var}(0,1);")
+                                    emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10j*{hx_var}(1,1) + d01j*{hy_var}(1,1);")
+                                    emit_line(f"    double dphi = h00;" if hess_comp == "00" else f"    double dphi = h01;" if hess_comp == "01" else f"    double dphi = h11;")
+                                    emit_line(f"    {dval} += coeff_j * dphi;")
+                                    emit_line("}")
+                                else:
+                                    s0_adj = new_tmp("s0")
+                                    s1_adj = new_tmp("s1")
+                                    emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                                    emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                                    emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                    emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
+                                    emit_line(f"    double coeff_j = {coeff_name}_view(e, j);")
+                                    emit_line(f"    double d20j = {d20}_view(e,q,j); double d11j = {d11}_view(e,q,j); double d02j = {d02}_view(e,q,j);")
+                                    emit_line(f"    double d10j = {d10}_view(e,q,j); double d01j = {d01}_view(e,q,j);")
+                                    emit_line(f"    double tmp00 = d20j * {jloc_var}(0,0) + d11j * {jloc_var}(1,0);")
+                                    emit_line(f"    double tmp01 = d20j * {jloc_var}(0,1) + d11j * {jloc_var}(1,1);")
+                                    emit_line(f"    double tmp10 = d11j * {jloc_var}(0,0) + d02j * {jloc_var}(1,0);")
+                                    emit_line(f"    double tmp11 = d11j * {jloc_var}(0,1) + d02j * {jloc_var}(1,1);")
+                                    emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10j*{hx_var}(0,0) + d01j*{hy_var}(0,0);")
+                                    emit_line(f"    double h01 = {jloc_var}(0,1)*tmp00 + {jloc_var}(1,1)*tmp10 + d10j*{hx_var}(0,1) + d01j*{hy_var}(0,1);")
+                                    emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10j*{hx_var}(1,1) + d01j*{hy_var}(1,1);")
+                                    emit_line(f"    double dphi = h00;" if hess_comp == "00" else f"    double dphi = h01;" if hess_comp == "01" else f"    double dphi = h11;")
+                                    emit_line(f"    {dval} += coeff_j * dphi;")
+                                    emit_line("}")
+                                emit_line(f"{nm}({idx}) = {dval};")
 
                         item = StackItem(nm, "vec", "value", (k,), op.field_names, op.name, op.side, fs_clean)
                         stack.append(item)
@@ -1423,6 +1616,100 @@ class CppCodeGen:
                     raise NotImplementedError(f"LoadVariable role {op.role} unsupported in C++ backend")
             elif isinstance(op, Grad):
                 a = stack.pop()
+                if getattr(a, "is_divergence", False):
+                    if self.spatial_dim != 2:
+                        raise NotImplementedError("grad(div(.)) is currently implemented for 2D only.")
+                    if len(a.field_names) < self.spatial_dim:
+                        raise NotImplementedError(
+                            "grad(div(.)) requires a vector field with one component per spatial direction."
+                        )
+
+                    if a.side == "+":
+                        required_args.update({"J_inv_pos", "pos_Hxi0", "pos_Hxi1"})
+                        jloc_var = "Jloc_pos"; hx_var = "Hx_pos"; hy_var = "Hy_pos"
+                    elif a.side == "-":
+                        required_args.update({"J_inv_neg", "neg_Hxi0", "neg_Hxi1"})
+                        jloc_var = "Jloc_neg"; hx_var = "Hx_neg"; hy_var = "Hy_neg"
+                    else:
+                        required_args.update({"J_inv", "Hxi0", "Hxi1"})
+                        jloc_var = "Jloc"; hx_var = "Hx"; hy_var = "Hy"
+
+                    if a.role in {"test", "trial"}:
+                        nm = new_tmp("graddiv")
+                        emit_line(f"Eigen::MatrixXd {nm}(2, n_union);")
+                        emit_line(f"{nm}.setZero();")
+                        for idx, fn in enumerate(a.field_names[:2]):
+                            d20n = deriv_name("d20", fn, a.side, a.field_sides, idx)
+                            d11n = deriv_name("d11", fn, a.side, a.field_sides, idx)
+                            d02n = deriv_name("d02", fn, a.side, a.field_sides, idx)
+                            d10n = deriv_name("d10", fn, a.side, a.field_sides, idx)
+                            d01n = deriv_name("d01", fn, a.side, a.field_sides, idx)
+                            required_args.update({d20n, d11n, d02n, d10n, d01n})
+                            emit_line(f"for (ssize_t j=0; j<n_union; ++j) {{")
+                            emit_line(f"    double d20 = {d20n}_view(e,q,j); double d11 = {d11n}_view(e,q,j); double d02 = {d02n}_view(e,q,j);")
+                            emit_line(f"    double d10 = {d10n}_view(e,q,j); double d01 = {d01n}_view(e,q,j);")
+                            emit_line(f"    double tmp00 = d20 * {jloc_var}(0,0) + d11 * {jloc_var}(1,0);")
+                            emit_line(f"    double tmp01 = d20 * {jloc_var}(0,1) + d11 * {jloc_var}(1,1);")
+                            emit_line(f"    double tmp10 = d11 * {jloc_var}(0,0) + d02 * {jloc_var}(1,0);")
+                            emit_line(f"    double tmp11 = d11 * {jloc_var}(0,1) + d02 * {jloc_var}(1,1);")
+                            emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10*{hx_var}(0,0) + d01*{hy_var}(0,0);")
+                            emit_line(f"    double h01 = {jloc_var}(0,1)*tmp00 + {jloc_var}(1,1)*tmp10 + d10*{hx_var}(0,1) + d01*{hy_var}(0,1);")
+                            emit_line(f"    double h10 = {jloc_var}(0,0)*tmp01 + {jloc_var}(1,0)*tmp11 + d10*{hx_var}(1,0) + d01*{hy_var}(1,0);")
+                            emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
+                            if idx == 0:
+                                emit_line(f"    {nm}(0,j) += h00; {nm}(1,j) += h10;")
+                            else:
+                                emit_line(f"    {nm}(0,j) += h01; {nm}(1,j) += h11;")
+                            emit_line("}")
+                        stack.append(StackItem(nm, "mat", a.role, (2, -1), list(a.field_names[:2]), a.parent, a.side, a.field_sides))
+                        continue
+
+                    if a.role == "value":
+                        coeff = coeff_array_name(a.parent, a.side)
+                        required_args.add(coeff)
+                        nm = new_tmp("graddivv")
+                        emit_line(f"Eigen::VectorXd {nm}(2);")
+                        emit_line(f"{nm}.setZero();")
+                        for idx, fn in enumerate(a.field_names[:2]):
+                            d20n = deriv_name("d20", fn, a.side, a.field_sides, idx)
+                            d11n = deriv_name("d11", fn, a.side, a.field_sides, idx)
+                            d02n = deriv_name("d02", fn, a.side, a.field_sides, idx)
+                            d10n = deriv_name("d10", fn, a.side, a.field_sides, idx)
+                            d01n = deriv_name("d01", fn, a.side, a.field_sides, idx)
+                            required_args.update({d20n, d11n, d02n, d10n, d01n})
+                            side_tag = component_side_tag(a.side, getattr(a, "field_sides", None), fn, idx)
+                            if self.on_facet and side_tag in ("pos", "neg"):
+                                emit_line("for (ssize_t j=0; j<n_union; ++j) {")
+                            else:
+                                s0 = field_slices.get(fn, slice(0, 0)).start
+                                s1 = field_slices.get(fn, slice(0, 0)).stop
+                                s0_adj = new_tmp("s0")
+                                s1_adj = new_tmp("s1")
+                                emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
+                                emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
+                                emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
+                            emit_line(f"    double coeff_j = {coeff}_view(e,j);")
+                            emit_line(f"    double d20 = {d20n}_view(e,q,j); double d11 = {d11n}_view(e,q,j); double d02 = {d02n}_view(e,q,j);")
+                            emit_line(f"    double d10 = {d10n}_view(e,q,j); double d01 = {d01n}_view(e,q,j);")
+                            emit_line(f"    double tmp00 = d20 * {jloc_var}(0,0) + d11 * {jloc_var}(1,0);")
+                            emit_line(f"    double tmp01 = d20 * {jloc_var}(0,1) + d11 * {jloc_var}(1,1);")
+                            emit_line(f"    double tmp10 = d11 * {jloc_var}(0,0) + d02 * {jloc_var}(1,0);")
+                            emit_line(f"    double tmp11 = d11 * {jloc_var}(0,1) + d02 * {jloc_var}(1,1);")
+                            emit_line(f"    double h00 = {jloc_var}(0,0)*tmp00 + {jloc_var}(1,0)*tmp10 + d10*{hx_var}(0,0) + d01*{hy_var}(0,0);")
+                            emit_line(f"    double h01 = {jloc_var}(0,1)*tmp00 + {jloc_var}(1,1)*tmp10 + d10*{hx_var}(0,1) + d01*{hy_var}(0,1);")
+                            emit_line(f"    double h10 = {jloc_var}(0,0)*tmp01 + {jloc_var}(1,0)*tmp11 + d10*{hx_var}(1,0) + d01*{hy_var}(1,0);")
+                            emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
+                            if idx == 0:
+                                emit_line(f"    {nm}(0) += coeff_j * h00; {nm}(1) += coeff_j * h10;")
+                            else:
+                                emit_line(f"    {nm}(0) += coeff_j * h01; {nm}(1) += coeff_j * h11;")
+                            emit_line("}")
+                        stack.append(StackItem(nm, "mat", "value", (2,), list(a.field_names[:2]), a.parent, a.side, a.field_sides))
+                        continue
+
+                    raise NotImplementedError(f"grad(div(.)) not implemented for role {a.role}")
+
                 if a.kind in {"mat", "basis_ref"} and a.role in {"test", "trial"}:
                     gv_key = (
                         "Grad",
@@ -1617,7 +1904,16 @@ class CppCodeGen:
                         emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
                         emit_line(f"    {nm}[{idx}](j,0)=h00; {nm}[{idx}](j,1)=h01; {nm}[{idx}](j,2)=h10; {nm}[{idx}](j,3)=h11;");
                         emit_line("}")
-                    item = StackItem(nm, "hess", a.role, (k, -1, 2, 2), a.field_names, a.parent)
+                    item = StackItem(
+                        nm,
+                        "hess",
+                        a.role,
+                        (k, -1, 2, 2),
+                        a.field_names,
+                        a.parent,
+                        a.side,
+                        a.field_sides,
+                    )
                     stack.append(item)
                     hess_cache[hv_key] = _pin_for_cache(item)
                 elif a.role == "value":
@@ -1718,7 +2014,16 @@ class CppCodeGen:
                         emit_line(f"    double h11 = {jloc_var}(0,1)*tmp01 + {jloc_var}(1,1)*tmp11 + d10*{hx_var}(1,1) + d01*{hy_var}(1,1);")
                         emit_line(f"    {nm}({idx}, j) = h00 + h11;");
                         emit_line("}")
-                    item = StackItem(nm, "mat", a.role, (k, -1), a.field_names, a.parent)
+                    item = StackItem(
+                        nm,
+                        "mat",
+                        a.role,
+                        (k, -1),
+                        a.field_names,
+                        a.parent,
+                        a.side,
+                        a.field_sides,
+                    )
                     stack.append(item)
                     lap_cache[lap_key] = _pin_for_cache(item)
                 elif a.role == "value":
@@ -1831,11 +2136,11 @@ class CppCodeGen:
                         f"    {nm}(0,j) = {a.name}[0](j,0) + {a.name}[1](j,1);"
                     )
                     emit_line("}")
-                    stack.append(StackItem(nm, "mat", a.role, (1, -1), a.field_names))
+                    stack.append(StackItem(nm, "mat", a.role, (1, -1), a.field_names, a.parent, a.side, a.field_sides, is_divergence=True))
                 elif a.kind == "mat" and a.role == "value":
                     nm = new_tmp("divv")
                     emit_line(f"double {nm} = {a.name}(0,0) + {a.name}(1,1);")
-                    stack.append(StackItem(nm, "scalar", "value", ()))
+                    stack.append(StackItem(nm, "scalar", "value", (), a.field_names, a.parent, a.side, a.field_sides, is_divergence=True))
                 else:
                     raise NotImplementedError("Div on unsupported item")
             elif isinstance(op, BinaryOp):
@@ -2396,6 +2701,31 @@ class CppCodeGen:
                         nm, tmp_kind, tmp_slot = alloc_tmp("scalar", "bin")
                         emit_scalar(nm, f"{a.name} * {b.name}", tmp_kind=tmp_kind)
                         push_bin("scalar", a.role, (), a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    elif (
+                        a.kind == "mat"
+                        and a.role == "value"
+                        and a.shape == (1,)
+                        and b.kind == "mat"
+                        and b.role == "value"
+                        and b.shape != (1,)
+                    ):
+                        # Scalar-valued coefficients may still reach codegen as
+                        # Eigen vectors/matrices of length 1. Treat them as scalars
+                        # when multiplying by a genuine value matrix.
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                        emit_mat(nm, f"{b.name} * {a.name}(0)", tmp_kind=tmp_kind)
+                        push_bin("mat", b.role, b.shape, a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
+                    elif (
+                        b.kind == "mat"
+                        and b.role == "value"
+                        and b.shape == (1,)
+                        and a.kind == "mat"
+                        and a.role == "value"
+                        and a.shape != (1,)
+                    ):
+                        nm, tmp_kind, tmp_slot = alloc_tmp("mat", "bin")
+                        emit_mat(nm, f"{a.name} * {b.name}(0)", tmp_kind=tmp_kind)
+                        push_bin("mat", a.role, a.shape, a.field_names or b.field_names, a.parent or b.parent, tmp_kind=tmp_kind, tmp_slot=tmp_slot)
                     elif (
                         a.kind == "mat"
                         and b.kind == "mat"

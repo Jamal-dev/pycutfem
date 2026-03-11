@@ -1100,6 +1100,65 @@ class FormCompiler:
 
 
     def _visit_Derivative(self, op: Derivative):
+        def _is_scalar_leaf(expr):
+            return isinstance(expr, (Function, TrialFunction, TestFunction))
+
+        def _derivative_of_scalar_expr(expr, order):
+            ox, oy = order
+            if (ox + oy) > 1 and not _is_scalar_leaf(expr):
+                res = expr
+                for _ in range(int(ox)):
+                    res = Derivative(res, 1, 0)
+                for _ in range(int(oy)):
+                    res = Derivative(res, 0, 1)
+                return self._visit(res)
+
+            if isinstance(expr, Constant):
+                return 0.0
+            if isinstance(expr, Derivative):
+                ex, ey = expr.order
+                return self._visit(Derivative(expr.f, ex + ox, ey + oy))
+            if isinstance(expr, Pos):
+                return self._visit(Pos(Derivative(expr.operand, *order)))
+            if isinstance(expr, Neg):
+                return self._visit(Neg(Derivative(expr.operand, *order)))
+            if isinstance(expr, Sum):
+                return self._visit(Derivative(expr.a, *order)) + self._visit(Derivative(expr.b, *order))
+            if isinstance(expr, Sub):
+                return self._visit(Derivative(expr.a, *order)) - self._visit(Derivative(expr.b, *order))
+            if isinstance(expr, Prod):
+                da = self._visit(Derivative(expr.a, *order))
+                db = self._visit(Derivative(expr.b, *order))
+                a = self._visit(expr.a)
+                b = self._visit(expr.b)
+                return da * b + a * db
+            if isinstance(expr, Div):
+                da = self._visit(Derivative(expr.a, *order))
+                db = self._visit(Derivative(expr.b, *order))
+                a = self._visit(expr.a)
+                b = self._visit(expr.b)
+                return (da * b - a * db) / (b * b)
+            if isinstance(expr, Power):
+                base = expr.a
+                expo = expr.b
+                dbase = self._visit(Derivative(base, *order))
+                dexp = self._visit(Derivative(expo, *order))
+                base_val = self._visit(base)
+                expo_val = self._visit(expo)
+                if isinstance(expo, Constant):
+                    p = float(expo.value)
+                    return p * (base_val ** (p - 1.0)) * dbase
+                return (base_val ** expo_val) * (dexp * self._visit(Log(base)) + expo_val * dbase / base_val)
+            if isinstance(expr, Log):
+                darg = self._visit(Derivative(expr.operand, *order))
+                arg = self._visit(expr.operand)
+                return darg / arg
+            if isinstance(expr, (PositivePart, Heaviside)):
+                raise NotImplementedError("Derivative of PositivePart/Heaviside is not supported in the Python backend.")
+            if not _is_scalar_leaf(expr):
+                raise NotImplementedError(f"Derivative() not implemented for composite operand {type(expr)}.")
+            return None
+
         # --------------------------------------------------------------
         # 1) Operand is a Jump  →  Jump of derivatives
         # --------------------------------------------------------------
@@ -1161,6 +1220,10 @@ class FormCompiler:
             if isinstance(result, np.ndarray):
                 return np.zeros_like(result)
             return 0.0
+
+        composite_val = _derivative_of_scalar_expr(op.f, op.order)
+        if composite_val is not None:
+            return composite_val
 
         fld, alpha = op.f.field_name, op.order
         row = self._lookup_basis(fld, alpha)[np.newaxis, :]      # (1,n)
@@ -1624,6 +1687,39 @@ class FormCompiler:
         """Return GradOpInfo with shape (k, n_dofs_local, d) for test/trial, or (k,d) for function (collapsed)."""
         op = n.operand
         logger.debug(f"Entering _visit_Grad for operand type {type(op)}")
+
+        def _grad_from_scalar_derivatives(node, dx_part, dy_part):
+            parts = [dx_part, dy_part]
+            template = next((p for p in parts if isinstance(p, VecOpInfo)), None)
+            if template is not None:
+                def _coerce_part(part):
+                    if isinstance(part, VecOpInfo):
+                        return np.asarray(part.data)
+                    arr = np.asarray(part, dtype=float)
+                    tmpl = np.asarray(template.data)
+                    if arr.ndim == 0:
+                        return np.full_like(tmpl, float(arr), dtype=float)
+                    if arr.shape == tmpl.shape:
+                        return arr
+                    if tmpl.ndim == 2 and arr.ndim == 1 and tmpl.shape[0] == 1 and arr.shape[0] == tmpl.shape[1]:
+                        return arr[np.newaxis, :]
+                    raise ValueError(
+                        f"Cannot coerce derivative part shape {arr.shape} to gradient template shape {tmpl.shape}."
+                    )
+
+                grad_data = np.stack([_coerce_part(dx_part), _coerce_part(dy_part)], axis=-1)
+                return GradOpInfo(grad_data, role=template.role, coeffs=None, **template.update_meta(template.meta()))
+
+            dx_arr = np.asarray(dx_part, dtype=float)
+            dy_arr = np.asarray(dy_part, dtype=float)
+            if dx_arr.ndim == 0 and dy_arr.ndim == 0:
+                grad_data = np.asarray([[float(dx_arr), float(dy_arr)]], dtype=float)
+            else:
+                grad_data = np.stack([dx_arr, dy_arr], axis=-1)
+                if grad_data.ndim == 1:
+                    grad_data = grad_data[np.newaxis, :]
+            return self._gradinfo(grad_data, role="function", node=node, field_names=[])
+
         # Distribute grad over sided restrictions so Pos/Neg work with grad()
         #   grad(Pos(u)) = Pos(grad(u))
         #   grad(Neg(u)) = Neg(grad(u))
@@ -1644,6 +1740,12 @@ class FormCompiler:
                 else:
                     self.ctx['_restriction_mask_active'] = depth
             return self._apply_restriction_mask(result, op)
+        if isinstance(op, DivOperation):
+            return self._visit_GradOfDiv(op)
+        if not isinstance(op, (TestFunction, VectorTestFunction, TrialFunction, VectorTrialFunction, Function, VectorFunction)):
+            dx_part = self._visit(Derivative(op, 1, 0))
+            dy_part = self._visit(Derivative(op, 0, 1))
+            return _grad_from_scalar_derivatives(n, dx_part, dy_part)
 
         # 1) role
         if isinstance(op, (TestFunction, VectorTestFunction)):
@@ -1657,7 +1759,17 @@ class FormCompiler:
 
         # 2) fields
         fields = op.field_names if hasattr(op, "field_names") else [op.field_name]
+        if fields is None:
+            fields = []
+        elif isinstance(fields, tuple):
+            fields = list(fields)
+        elif not isinstance(fields, list):
+            fields = [fields]
         fields = _hfa._filter_fields_for_side(self, op, list(fields))
+        if not fields:
+            fld = getattr(op, "field_name", None)
+            if fld is not None:
+                fields = [fld]
 
         k_blocks = []
         if role == "function":
@@ -1758,13 +1870,45 @@ class FormCompiler:
                     gval = np.einsum("nd,n->d", g, coeffs_use, optimize=True)  # (2,)
                     self._collapsed_cache[key_coll] = gval
                 k_blocks.append(gval)
-            return self._gradinfo(np.stack(k_blocks), role=role, node=op, field_names=fields)
-
         else:
             for fld in fields:
-                g = self._g(fld)
-                k_blocks.append(g)
-            return self._gradinfo(np.stack(k_blocks), role=role, node=op, field_names=fields)
+                k_blocks.append(self._g(fld))
+        if not k_blocks:
+            raise RuntimeError(
+                f"Grad assembly produced no component blocks for operand type {type(op).__name__} "
+                f"with role={role}, fields={fields}, repr={op!r}."
+            )
+        return self._gradinfo(np.stack(k_blocks), role=role, node=op, field_names=fields)
+
+    def _visit_GradOfDiv(self, n: DivOperation):
+        """
+        grad(div(v)) for vector-valued v, assembled from the component Hessians.
+
+        In 2D/3D, [grad(div(v))]_j = sum_i d_j d_i v_i = sum_i Hess(v_i)[j, i].
+        We return a VecOpInfo because the result is a vector field, not a matrix.
+        """
+        H = self._visit_Hessian(Hessian(n.operand))
+        d = int(self.me.mesh.spatial_dim)
+        num_comps = int(H.data.shape[0])
+        if num_comps < d:
+            raise ValueError(f"grad(div(v)) expects at least {d} components, got {num_comps}.")
+
+        fields = getattr(n.operand, "field_names", None)
+        if fields is None:
+            fld = getattr(n.operand, "field_name", None)
+            fields = [fld] if fld is not None else []
+        fields = list(fields)[:d] if fields else [f"gdiv_{i}" for i in range(d)]
+
+        if H.role == "function":
+            out = np.zeros((d,), dtype=H.data.dtype)
+            for j in range(d):
+                out[j] = np.sum([H.data[i, j, i] for i in range(d)], axis=0)
+            return self._vecinfo(out, role="function", node=n, field_names=fields)
+
+        out = np.zeros((d, H.data.shape[1]), dtype=H.data.dtype)
+        for j in range(d):
+            out[j, :] = np.sum([H.data[i, :, j, i] for i in range(d)], axis=0)
+        return self._vecinfo(out, role=H.role, node=n, field_names=fields)
     
     def _visit_Hessian(self, n: Hessian):
         """

@@ -227,6 +227,7 @@ def _simulation_command(
     nonlinear_solver: str,
     ls_mode: str,
     vi_c: float,
+    backend: str,
     u_avg: float,
     kappa_inv: float,
     phi_b: float,
@@ -235,10 +236,24 @@ def _simulation_command(
     gamma_u: float,
     u_extension: str,
     gamma_u_pin: float,
+    kinematics_scale: float,
+    v_supg: float,
+    v_supg_mode: str,
+    v_supg_c_nu: float,
+    u_supg: float,
+    u_cip: float,
+    u_cip_weight: str,
+    v_cip: float,
+    vS_cip: float,
+    alpha_ch_eps: float,
+    scale_alpha_ch_eps_with_zeta: bool,
+    diffuse_shear_scale_ref: float,
     refine_biofilm: bool,
     refine_band: float,
     refine_expand_layers: int,
     gamma_div: float,
+    adaptive_gamma_div: bool,
+    gamma_div_max: float,
     newton_tol: float,
     max_it: int,
     dt_min: float,
@@ -275,7 +290,7 @@ def _simulation_command(
         "--vi-c",
         str(float(vi_c)),
         "--backend",
-        "cpp",
+        str(backend),
         "--nx",
         str(int(nx)),
         "--ny",
@@ -310,22 +325,46 @@ def _simulation_command(
         str(u_extension),
         "--gamma-u-pin",
         str(float(gamma_u_pin)),
+        "--kinematics-scale",
+        str(float(kinematics_scale)),
         "--alpha-ch-M",
         "1e-12",
         "--alpha-ch-gamma",
         "2e-3",
+        "--alpha-ch-eps",
+        str(float(alpha_ch_eps)),
+        "--diffuse-shear-scale-ref",
+        str(float(diffuse_shear_scale_ref)),
         "--alpha-advection-form",
         "conservative",
         "--alpha-supg",
         "0.5",
         "--alpha-cip",
         "0.0",
+        "--v-supg",
+        str(float(v_supg)),
+        "--v-supg-mode",
+        str(v_supg_mode),
+        "--v-supg-c-nu",
+        str(float(v_supg_c_nu)),
+        "--u-supg",
+        str(float(u_supg)),
+        "--u-cip",
+        str(float(u_cip)),
+        "--u-cip-weight",
+        str(u_cip_weight),
+        "--v-cip",
+        str(float(v_cip)),
+        "--vS-cip",
+        str(float(vS_cip)),
         "--global-front-quantile",
         str(float(global_front_quantile)),
         "--dx-quantile",
         str(float(dx_quantile)),
         "--gamma-div",
         str(float(gamma_div)),
+        "--gamma-div-max",
+        str(float(gamma_div_max)),
         "--newton-tol",
         str(float(newton_tol)),
         "--max-it",
@@ -352,6 +391,8 @@ def _simulation_command(
         "--out-dir",
         str(case_dir),
     ]
+    cmd.append("--adaptive-gamma-div" if bool(adaptive_gamma_div) else "--no-adaptive-gamma-div")
+    cmd.append("--scale-alpha-ch-eps-with-zeta" if bool(scale_alpha_ch_eps_with_zeta) else "--no-scale-alpha-ch-eps-with-zeta")
     if bool(refine_biofilm):
         cmd.extend(
             [
@@ -435,6 +476,37 @@ def _calibration_score(
         return float("inf")
     w_sum = float(sum(weight for weight, _ in weighted))
     return float(sum(weight * value for weight, value in weighted) / max(1.0e-14, w_sum))
+
+
+def _required_calibration_metrics(
+    *,
+    obs_scenarios: list[str],
+    steady_profile_rmse_um: float,
+    steady_front_y150_err_um: float,
+    front_compression_2p0_err_um: float,
+    front_plateau_drift_2p0_10p0_um: float,
+    porosity_drop_2p0_err_pp: float,
+) -> dict[str, float]:
+    required: dict[str, float] = {}
+    if "steady_dian" in obs_scenarios:
+        required["steady_profile_rmse_um"] = float(steady_profile_rmse_um)
+        required["steady_front_y150_err_um"] = float(steady_front_y150_err_um)
+    if "dynamic_08pa" in obs_scenarios:
+        required["front_compression_2p0_err_um"] = float(front_compression_2p0_err_um)
+        required["front_plateau_drift_2p0_10p0_um"] = float(front_plateau_drift_2p0_10p0_um)
+        required["porosity_drop_2p0_err_pp"] = float(porosity_drop_2p0_err_pp)
+    return required
+
+
+def _validate_calibration_metrics(*, case_dir: Path, obs_scenarios: list[str], **metrics: float) -> None:
+    required = _required_calibration_metrics(obs_scenarios=obs_scenarios, **metrics)
+    missing = [name for name, value in required.items() if not np.isfinite(float(value))]
+    if missing:
+        raise RuntimeError(
+            "Missing required calibration observables "
+            f"({', '.join(missing)}) for requested scenarios {obs_scenarios}. "
+            f"Case did not reach the required observation window; see {case_dir / 'run.log'}."
+        )
 
 
 def _compare_metrics(case_dir: Path, *, t_max: float, stream_subprocess: bool = False) -> dict[str, object]:
@@ -1047,6 +1119,7 @@ def main() -> None:
     ap.add_argument("--nonlinear-solver", type=str, default="pdas", choices=("pdas", "newton", "snes"))
     ap.add_argument("--ls-mode", type=str, default="dealii", choices=("armijo", "dealii"))
     ap.add_argument("--vi-c", type=float, default=0.0)
+    ap.add_argument("--backend", type=str, default="cpp", choices=("python", "jit", "cpp"))
     ap.add_argument("--nx-list", type=str, default="")
     ap.add_argument("--u-avg", type=float, default=4.56e-2)
     ap.add_argument("--rho-f", type=float, default=0.0)
@@ -1056,10 +1129,95 @@ def main() -> None:
     ap.add_argument("--gamma-u", type=float, default=5.0)
     ap.add_argument("--u-extension", type=str, default="l2", choices=("l2", "grad"))
     ap.add_argument("--gamma-u-pin", type=float, default=1.0e-4)
+    ap.add_argument(
+        "--kinematics-scale",
+        type=float,
+        default=float("nan"),
+        help="Scaling applied to the kinematic constraint when forwarding to the Blauert driver.",
+    )
+    ap.add_argument(
+        "--v-supg",
+        type=float,
+        default=0.0,
+        help="Fluid-momentum SUPG-like streamline diffusion forwarded to the Blauert driver.",
+    )
+    ap.add_argument(
+        "--v-supg-mode",
+        type=str,
+        default="streamline",
+        choices=("streamline", "residual"),
+        help="Fluid momentum stabilization form forwarded to the Blauert driver.",
+    )
+    ap.add_argument(
+        "--v-supg-c-nu",
+        type=float,
+        default=4.0,
+        help="Viscous constant c_nu in the Green's-function elemental tau for fluid SUPG.",
+    )
+    ap.add_argument("--u-supg", type=float, default=0.0, help="SUPG strength for the kinematic u-transport equation.")
+    ap.add_argument("--u-cip", type=float, default=0.0, help="CIP strength for the kinematic u-transport equation.")
+    ap.add_argument(
+        "--u-cip-weight",
+        type=str,
+        default="biofilm",
+        choices=("fluid", "biofilm", "both"),
+        help="Localization used by --u-cip in the kinematic equation.",
+    )
+    ap.add_argument(
+        "--v-cip",
+        type=float,
+        default=0.0,
+        help="Continuous-interior-penalty stabilization strength for fluid velocity.",
+    )
+    ap.add_argument(
+        "--vS-cip",
+        type=float,
+        default=0.0,
+        help="Continuous-interior-penalty stabilization strength for skeleton velocity.",
+    )
+    ap.add_argument("--alpha-ch-eps", type=float, default=2.0e-5)
+    ap.add_argument(
+        "--scale-alpha-ch-eps-with-zeta",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Scale alpha CH eps like zeta^2 above --diffuse-shear-scale-ref.",
+    )
+    ap.add_argument(
+        "--diffuse-shear-scale-ref",
+        type=float,
+        default=50.0,
+        help="Reference zeta used by --scale-alpha-ch-eps-with-zeta.",
+    )
     ap.add_argument("--refine-biofilm", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--refine-band", type=float, default=2.5e-4)
     ap.add_argument("--refine-expand-layers", type=int, default=1)
-    ap.add_argument("--gamma-div", type=float, default=1.0e-2)
+    ap.add_argument(
+        "--gamma-div",
+        type=float,
+        default=5.0e-2,
+        help="Consistent mixed-block grad-div / augmented-Lagrangian strength.",
+    )
+    ap.add_argument(
+        "--adaptive-gamma-div",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the Benchmark 6 adaptive gamma_div retry/relaxation strategy.",
+    )
+    ap.add_argument(
+        "--gamma-div-max",
+        type=float,
+        default=1.0e-1,
+        help="Upper cap forwarded to the driver's adaptive gamma_div controller.",
+    )
+    ap.add_argument(
+        "--vtk-every",
+        type=int,
+        default=-1,
+        help=(
+            "Override VTK cadence for all runs. "
+            "Negative keeps the benchmark defaults (calibration off, finest production mesh every 10 steps)."
+        ),
+    )
     ap.add_argument("--dt", type=float, default=0.025)
     ap.add_argument("--dt-min", type=float, default=5.0e-3)
     ap.add_argument("--restart-from", type=str, default="")
@@ -1147,6 +1305,7 @@ def main() -> None:
     calibration_root = outdir / "calibration"
     calibration_rows: list[CalibrationRow] = []
     failed_calibration_cases: list[FailedCalibrationCase] = []
+    vtk_every_override = int(args.vtk_every)
     nx_cal = int(min(nx_list))
     ny_cal = _ny_from_nx(nx_cal)
     for E in E_list:
@@ -1172,6 +1331,7 @@ def main() -> None:
                     nonlinear_solver=str(args.nonlinear_solver),
                     ls_mode=str(args.ls_mode),
                     vi_c=float(args.vi_c),
+                    backend=str(args.backend),
                     u_avg=float(args.u_avg),
                     kappa_inv=float(args.kappa_inv),
                     phi_b=float(args.phi_b),
@@ -1180,10 +1340,24 @@ def main() -> None:
                     gamma_u=float(args.gamma_u),
                     u_extension=str(args.u_extension),
                     gamma_u_pin=float(args.gamma_u_pin),
+                    kinematics_scale=float(args.kinematics_scale),
+                    v_supg=float(args.v_supg),
+                    v_supg_mode=str(args.v_supg_mode),
+                    v_supg_c_nu=float(args.v_supg_c_nu),
+                    u_supg=float(args.u_supg),
+                    u_cip=float(args.u_cip),
+                    u_cip_weight=str(args.u_cip_weight),
+                    v_cip=float(args.v_cip),
+                    vS_cip=float(args.vS_cip),
+                    alpha_ch_eps=float(args.alpha_ch_eps),
+                    scale_alpha_ch_eps_with_zeta=bool(args.scale_alpha_ch_eps_with_zeta),
+                    diffuse_shear_scale_ref=float(args.diffuse_shear_scale_ref),
                     refine_biofilm=bool(args.refine_biofilm),
                     refine_band=float(args.refine_band),
                     refine_expand_layers=int(args.refine_expand_layers),
                     gamma_div=float(args.gamma_div),
+                    adaptive_gamma_div=bool(args.adaptive_gamma_div),
+                    gamma_div_max=float(args.gamma_div_max),
                     newton_tol=float(args.newton_tol),
                     max_it=int(args.max_it),
                     dt_min=float(args.dt_min),
@@ -1194,7 +1368,7 @@ def main() -> None:
                     t_final=float(args.t_final),
                     t_ramp=float(args.t_ramp),
                     snapshot_times=cal_snapshot_tag,
-                    vtk_every=0,
+                    vtk_every=int(vtk_every_override) if vtk_every_override >= 0 else 0,
                     global_front_quantile=float(args.global_front_quantile),
                     dx_quantile=float(args.dx_quantile),
                 )
@@ -1247,6 +1421,15 @@ def main() -> None:
                         else float("nan")
                     )
                     score = _calibration_score(
+                        steady_profile_rmse_um=float(steady_profile_rmse),
+                        steady_front_y150_err_um=float(steady_front_y150_err),
+                        front_compression_2p0_err_um=float(front_compression_2p0_err),
+                        front_plateau_drift_2p0_10p0_um=float(front_plateau_drift_2p0_10p0),
+                        porosity_drop_2p0_err_pp=float(porosity_drop_2p0_err),
+                    )
+                    _validate_calibration_metrics(
+                        case_dir=case_dir,
+                        obs_scenarios=obs_scenarios,
                         steady_profile_rmse_um=float(steady_profile_rmse),
                         steady_front_y150_err_um=float(steady_front_y150_err),
                         front_compression_2p0_err_um=float(front_compression_2p0_err),
@@ -1330,9 +1513,16 @@ def main() -> None:
         "u_avg": float(args.u_avg),
         "rho_f": float(args.rho_f),
         "phi_b": float(args.phi_b),
+        "alpha_ch_eps": float(args.alpha_ch_eps),
+        "scale_alpha_ch_eps_with_zeta": bool(args.scale_alpha_ch_eps_with_zeta),
+        "diffuse_shear_scale_ref": float(args.diffuse_shear_scale_ref),
         "refine_biofilm": bool(args.refine_biofilm),
         "refine_band": float(args.refine_band),
         "refine_expand_layers": int(args.refine_expand_layers),
+        "gamma_div": float(args.gamma_div),
+        "adaptive_gamma_div": bool(args.adaptive_gamma_div),
+        "gamma_div_max": float(args.gamma_div_max),
+        "vtk_every_override": int(vtk_every_override),
         "dt": float(args.dt),
         "t_final": float(args.t_final),
         "steady_time": float(steady_time),
@@ -1379,6 +1569,7 @@ def main() -> None:
             nonlinear_solver=str(args.nonlinear_solver),
             ls_mode=str(args.ls_mode),
             vi_c=float(args.vi_c),
+            backend=str(args.backend),
             u_avg=float(args.u_avg),
             kappa_inv=float(args.kappa_inv),
             phi_b=float(args.phi_b),
@@ -1387,10 +1578,24 @@ def main() -> None:
             gamma_u=float(args.gamma_u),
             u_extension=str(args.u_extension),
             gamma_u_pin=float(args.gamma_u_pin),
+            kinematics_scale=float(args.kinematics_scale),
+            v_supg=float(args.v_supg),
+            v_supg_mode=str(args.v_supg_mode),
+            v_supg_c_nu=float(args.v_supg_c_nu),
+            u_supg=float(args.u_supg),
+            u_cip=float(args.u_cip),
+            u_cip_weight=str(args.u_cip_weight),
+            v_cip=float(args.v_cip),
+            vS_cip=float(args.vS_cip),
+            alpha_ch_eps=float(args.alpha_ch_eps),
+            scale_alpha_ch_eps_with_zeta=bool(args.scale_alpha_ch_eps_with_zeta),
+            diffuse_shear_scale_ref=float(args.diffuse_shear_scale_ref),
             refine_biofilm=bool(args.refine_biofilm),
             refine_band=float(args.refine_band),
             refine_expand_layers=int(args.refine_expand_layers),
             gamma_div=float(args.gamma_div),
+            adaptive_gamma_div=bool(args.adaptive_gamma_div),
+            gamma_div_max=float(args.gamma_div_max),
             newton_tol=float(args.newton_tol),
             max_it=int(args.max_it),
             dt_min=float(args.dt_min),
@@ -1401,7 +1606,11 @@ def main() -> None:
             t_final=float(args.t_final),
             t_ramp=float(args.t_ramp),
             snapshot_times=snapshot_tag,
-            vtk_every=10 if int(nx) == int(finest_nx) else 0,
+            vtk_every=(
+                int(vtk_every_override)
+                if vtk_every_override >= 0
+                else (10 if int(nx) == int(finest_nx) else 0)
+            ),
             global_front_quantile=float(args.global_front_quantile),
             dx_quantile=float(args.dx_quantile),
         )
@@ -1495,9 +1704,16 @@ def main() -> None:
         "u_avg": float(args.u_avg),
         "rho_f": float(args.rho_f),
         "phi_b": float(args.phi_b),
+        "alpha_ch_eps": float(args.alpha_ch_eps),
+        "scale_alpha_ch_eps_with_zeta": bool(args.scale_alpha_ch_eps_with_zeta),
+        "diffuse_shear_scale_ref": float(args.diffuse_shear_scale_ref),
         "refine_biofilm": bool(args.refine_biofilm),
         "refine_band": float(args.refine_band),
         "refine_expand_layers": int(args.refine_expand_layers),
+        "gamma_div": float(args.gamma_div),
+        "adaptive_gamma_div": bool(args.adaptive_gamma_div),
+        "gamma_div_max": float(args.gamma_div_max),
+        "vtk_every_override": int(vtk_every_override),
         "dt": float(args.dt),
         "t_final": float(args.t_final),
         "steady_time": float(steady_time),

@@ -26,9 +26,15 @@ def test_benchmark6_blauert_channel_cli_help() -> None:
     assert "--ls-mode" in proc.stdout
     assert "--gamma-u" in proc.stdout
     assert "--u-extension" in proc.stdout
+    assert "--alpha-ch-eps" in proc.stdout
+    assert "--scale-alpha-ch-eps-with-zeta" in proc.stdout
+    assert "--diffuse-shear-scale-ref" in proc.stdout
     assert "--dt" in proc.stdout
     assert "--dt-min" in proc.stdout
     assert "--gamma-div" in proc.stdout
+    assert "--adaptive-gamma-div" in proc.stdout
+    assert "--gamma-div-max" in proc.stdout
+    assert "--vtk-every" in proc.stdout
     assert "--max-it" in proc.stdout
     assert "--newton-tol" in proc.stdout
     assert "--restart-from" in proc.stdout

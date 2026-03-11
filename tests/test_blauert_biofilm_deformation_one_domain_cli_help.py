@@ -43,8 +43,11 @@ def test_blauert_biofilm_deformation_one_domain_cli_help() -> None:
     assert "--alpha-advection-form" in proc.stdout
     assert "--alpha-ch-M" in proc.stdout
     assert "--alpha-ch-gamma" in proc.stdout
+    assert "--alpha-ch-eps" in proc.stdout
+    assert "--scale-alpha-ch-eps-with-zeta" in proc.stdout
     assert "--diffuse-shear-traction" in proc.stdout
     assert "--diffuse-shear-model" in proc.stdout
+    assert "--diffuse-shear-scale-ref" in proc.stdout
     assert "--diffuse-shear-time-scheme" in proc.stdout
     assert "--diffuse-shear-ramp-time" in proc.stdout
     assert "lagged_stress" in proc.stdout

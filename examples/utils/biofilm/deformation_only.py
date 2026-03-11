@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 from pycutfem.ufl.expressions import Constant, div, dot, grad, inner
 
-from .one_domain import _c, _epsilon, _linear_elastic_term
+from .one_domain import _as_constant, _c, _epsilon, _linear_elastic_term
 
 
 def _W_prime(alpha):
@@ -255,7 +255,7 @@ def build_deformation_only_forms(
             + one_m_th * traction_weight_n * _dot_2d_components(g_t_n, vS_test)
         ) * dx
     if float(gamma_div) != 0.0:
-        gamma_div_c = _c(float(gamma_div))
+        gamma_div_c = _as_constant(gamma_div)
         mass_res_k = div_C_vk + div_B_vSk
         d_mass_res_k = div_C_dv + div_B_dvS
         r_mom += gamma_div_c * mass_res_k * div_C_vtest * dx

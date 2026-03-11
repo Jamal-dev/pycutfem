@@ -22,7 +22,7 @@ from pycutfem.ufl.expressions import (
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner,
     dot, div, trace, Hessian, Laplacian, FacetNormal, Identity, det, inv,
-    pos_part, heaviside,
+    pos_part, heaviside, MeshSize,
 )
 from pycutfem.ufl.measures import dx, dInterface, dS
 from pycutfem.ufl.forms import assemble_form
@@ -1846,6 +1846,16 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
     # Parameters (keep in sync with the unit tests and FEniCSx constants below).
     dt_val = float(os.environ.get("COMP_FENICS_DT", "0.1"))
     theta_val = float(os.environ.get("COMP_FENICS_THETA", "0.5"))
+    fluid_convection = str(os.environ.get("COMP_FENICS_FLUID_CONVECTION", "full"))
+    alpha_advect_with = str(os.environ.get("COMP_FENICS_ALPHA_ADVECT_WITH", "vS"))
+    alpha_advection_form = str(os.environ.get("COMP_FENICS_ALPHA_ADVECTION_FORM", "advective"))
+    gamma_div_val = float(os.environ.get("COMP_FENICS_GAMMA_DIV", "0.0"))
+    gamma_u_val = float(os.environ.get("COMP_FENICS_GAMMA_U", "0.0"))
+    u_extension_mode = str(os.environ.get("COMP_FENICS_U_EXTENSION_MODE", "l2"))
+    gamma_u_pin_val = float(os.environ.get("COMP_FENICS_GAMMA_U_PIN", "0.0"))
+    v_supg_val = float(os.environ.get("COMP_FENICS_V_SUPG", "0.0"))
+    v_supg_mode = str(os.environ.get("COMP_FENICS_V_SUPG_MODE", "streamline"))
+    v_supg_c_nu_val = float(os.environ.get("COMP_FENICS_V_SUPG_C_NU", "4.0"))
     alpha_ch_M_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_M", "0.0"))
     alpha_ch_gamma_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_GAMMA", "0.0"))
     alpha_ch_eps_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_EPS", "0.1"))
@@ -1929,6 +1939,16 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         "lambda_s": Constant(1.0, dim=0),
         "dt": Constant(dt_val, dim=0),
         "theta": float(theta_val),
+        "fluid_convection": str(fluid_convection),
+        "alpha_advect_with": str(alpha_advect_with),
+        "alpha_advection_form": str(alpha_advection_form),
+        "gamma_div": float(gamma_div_val),
+        "gamma_u": float(gamma_u_val),
+        "u_extension_mode": str(u_extension_mode),
+        "gamma_u_pin": float(gamma_u_pin_val),
+        "v_supg": float(v_supg_val),
+        "v_supg_mode": str(v_supg_mode),
+        "v_supg_c_nu": float(v_supg_c_nu_val),
         # Optional Cahn–Hilliard regularization for alpha (adds mu_alpha when enabled).
         "alpha_ch_enabled": bool(alpha_ch_enabled),
         "alpha_ch_M": float(alpha_ch_M_val),
@@ -1985,6 +2005,16 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         "lambda_s": dolfinx.fem.Constant(mesh_fx, float(pc["lambda_s"].value)),
         "dt": dolfinx.fem.Constant(mesh_fx, dt_val),
         "theta": dolfinx.fem.Constant(mesh_fx, theta_val),
+        "fluid_convection": str(fluid_convection),
+        "alpha_advect_with": str(alpha_advect_with),
+        "alpha_advection_form": str(alpha_advection_form),
+        "gamma_div": dolfinx.fem.Constant(mesh_fx, float(gamma_div_val)),
+        "gamma_u": dolfinx.fem.Constant(mesh_fx, float(gamma_u_val)),
+        "u_extension_mode": str(u_extension_mode),
+        "gamma_u_pin": dolfinx.fem.Constant(mesh_fx, float(gamma_u_pin_val)),
+        "v_supg": dolfinx.fem.Constant(mesh_fx, float(v_supg_val)),
+        "v_supg_mode": str(v_supg_mode),
+        "v_supg_c_nu": dolfinx.fem.Constant(mesh_fx, float(v_supg_c_nu_val)),
         "alpha_ch_enabled": bool(alpha_ch_enabled),
         "alpha_ch_M": dolfinx.fem.Constant(mesh_fx, float(alpha_ch_M_val)),
         "alpha_ch_gamma": dolfinx.fem.Constant(mesh_fx, float(alpha_ch_gamma_val)),
@@ -2304,6 +2334,16 @@ def run_biofilm_comparison():
     lambda_s_fx = fenicsx["lambda_s"]
     dt_fx = fenicsx["dt"]
     theta_fx = fenicsx["theta"]
+    fluid_convection_key = str(fenicsx.get("fluid_convection", "full")).strip().lower()
+    alpha_advect_with_key = str(fenicsx.get("alpha_advect_with", "vS")).strip().lower()
+    alpha_advection_form_key = str(fenicsx.get("alpha_advection_form", "advective")).strip().lower()
+    gamma_div_fx = fenicsx["gamma_div"]
+    gamma_u_fx = fenicsx["gamma_u"]
+    u_extension_mode_fx = str(fenicsx.get("u_extension_mode", "l2")).strip().lower()
+    gamma_u_pin_fx = fenicsx["gamma_u_pin"]
+    v_supg_fx = fenicsx["v_supg"]
+    v_supg_mode_key = str(fenicsx.get("v_supg_mode", "streamline")).strip().lower()
+    v_supg_c_nu_fx = fenicsx["v_supg_c_nu"]
 
     D_phi_fx = fenicsx["D_phi"]
     gamma_phi_fx = fenicsx["gamma_phi"]
@@ -2341,6 +2381,18 @@ def run_biofilm_comparison():
     dx_pc = dx(metadata={"q": qdeg})
     dx_fx = ufl.dx(metadata={"quadrature_degree": qdeg_fx})
     print(f"[biofilm] quadrature: pycutfem q={qdeg}, fenics quadrature_degree={qdeg_fx}")
+    Jdet_fx = ufl.JacobianDeterminant(fenicsx["mesh"])
+    # Match pycutfem MeshSize() on quads.
+    #
+    # pycutfem uses a [-1,1]^2 reference cell and lowers MeshSize() to
+    #   2 * sqrt(|detJ_pc|),
+    # which equals the physical element size h for an affine square.
+    #
+    # FEniCSx/Basix quadrilaterals use the [0,1]^2 reference cell, so the same
+    # physical square has detJ_fx = h^2 instead of h^2/4. The equivalent pointwise
+    # mesh size is therefore sqrt(|detJ_fx|), not 2*sqrt(|detJ_fx|).
+    h_fx = ufl.sqrt(ufl.sqrt(Jdet_fx * Jdet_fx + 1.0e-16))
+    inv_h2_fx = 1.0 / (h_fx * h_fx)
 
     def eps_fx(v):
         return ufl.sym(ufl.grad(v))
@@ -2416,16 +2468,77 @@ def run_biofilm_comparison():
     div_C_w_fx = C_k_fx * ufl.div(w_fx) + ufl.dot(gradC_k_fx, w_fx)
 
     r_mom_fx = ufl.inner(vdot_fx, w_fx) * dx_fx
-    r_mom_fx += theta_fx * (rho_k_fx * conv_k_fx + div_rhov_k_fx * ufl.dot(v_k_fx, w_fx)) * dx_fx
-    r_mom_fx += (1.0 - theta_fx) * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx)) * dx_fx
+    if fluid_convection_key == "full":
+        r_mom_fx += theta_fx * (rho_k_fx * conv_k_fx + div_rhov_k_fx * ufl.dot(v_k_fx, w_fx)) * dx_fx
+        r_mom_fx += (1.0 - theta_fx) * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx)) * dx_fx
+    elif fluid_convection_key in {"lagged", "explicit"}:
+        conv_lag_k_fx = ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_n_fx), w_fx)
+        r_mom_fx += theta_fx * (rho_n_fx * conv_lag_k_fx + div_rhov_n_fx * ufl.dot(v_k_fx, w_fx)) * dx_fx
+        r_mom_fx += (1.0 - theta_fx) * (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx)) * dx_fx
+    elif fluid_convection_key == "imex":
+        r_mom_fx += (rho_n_fx * conv_n_fx + div_rhov_n_fx * ufl.dot(v_n_fx, w_fx)) * dx_fx
+    elif fluid_convection_key == "off":
+        pass
+    else:
+        raise ValueError(f"Unknown COMP_FENICS_FLUID_CONVECTION={fluid_convection_key!r}.")
     r_mom_fx += 2.0 * theta_fx * mu_k_fx * ufl.inner(eps_fx(v_k_fx), eps_fx(w_fx)) * dx_fx
     r_mom_fx += 2.0 * (1.0 - theta_fx) * mu_n_fx * ufl.inner(eps_fx(v_n_fx), eps_fx(w_fx)) * dx_fx
     r_mom_fx += -p_k_fx * div_C_w_fx * dx_fx
+    r_mom_fx += gamma_div_fx * divF_k_fx * div_C_w_fx * dx_fx
     r_mom_fx += beta_k_fx * ufl.dot(v_k_fx, w_fx) * dx_fx
     r_mom_fx += -beta_k_fx * ufl.dot(vS_k_fx, w_fx) * dx_fx
 
-    # Mass/volume residual (expanded divergence like pycutfem; s_v=0 in this harness).
-    r_mass_fx = q_fx * (theta_fx * divF_k_fx + (1.0 - theta_fx) * divF_n_fx) * dx_fx
+    if float(v_supg_fx.value) != 0.0 and float(rho_f_fx.value) != 0.0:
+        if v_supg_mode_key in {"streamline", "weak", "legacy"}:
+            vmag_n_fx = ufl.sqrt(ufl.dot(v_n_fx, v_n_fx) + 1.0e-12)
+            rho_safe_n_fx = rho_n_fx + 1.0e-16
+            nu_eff_n_fx = mu_n_fx / rho_safe_n_fx
+            drag_rate_n_fx = beta_n_fx / rho_safe_n_fx
+            tau_v_fx = v_supg_fx / ufl.sqrt(
+                (2.0 / dt_fx) ** 2
+                + (2.0 * vmag_n_fx / (h_fx + 1.0e-16)) ** 2
+                + (v_supg_c_nu_fx * nu_eff_n_fx / (h_fx * h_fx + 1.0e-16)) ** 2
+                + drag_rate_n_fx * drag_rate_n_fx
+                + 1.0e-16
+            )
+            adv_v_k_fx = ufl.dot(ufl.grad(v_k_fx), v_n_fx)
+            adv_w_fx = ufl.dot(ufl.grad(w_fx), v_n_fx)
+            r_mom_fx += tau_v_fx * (1.0 - alpha_n_fx) * ufl.inner(adv_v_k_fx, adv_w_fx) * dx_fx
+        elif v_supg_mode_key in {"residual", "strong", "strong_residual", "strong-residual"}:
+            vmag_k_fx = ufl.sqrt(ufl.dot(v_k_fx, v_k_fx) + 1.0e-12)
+            rho_safe_k_fx = rho_k_fx + 1.0e-16
+            nu_eff_k_fx = mu_k_fx / rho_safe_k_fx
+            drag_rate_k_fx = beta_k_fx / rho_safe_k_fx
+            tau_v_fx = v_supg_fx / ufl.sqrt(
+                (2.0 / dt_fx) ** 2
+                + (2.0 * vmag_k_fx / (h_fx + 1.0e-16)) ** 2
+                + (v_supg_c_nu_fx * nu_eff_k_fx / (h_fx * h_fx + 1.0e-16)) ** 2
+                + drag_rate_k_fx * drag_rate_k_fx
+                + 1.0e-16
+            )
+            strong_visc_k_fx = ufl.div(2.0 * mu_k_fx * eps_fx(v_k_fx))
+            strong_mom_k_fx = ((rho_k_fx * (v_k_fx - v_n_fx)) / dt_fx) - strong_visc_k_fx + C_k_fx * ufl.grad(p_k_fx)
+            if fluid_convection_key == "full":
+                strong_mom_k_fx += rho_k_fx * ufl.dot(ufl.grad(v_k_fx), v_k_fx) + div_rhov_k_fx * v_k_fx
+            elif fluid_convection_key in {"lagged", "explicit"}:
+                strong_mom_k_fx += rho_n_fx * ufl.dot(ufl.grad(v_k_fx), v_n_fx) + div_rhov_n_fx * v_k_fx
+            elif fluid_convection_key == "imex":
+                strong_mom_k_fx += rho_n_fx * ufl.dot(ufl.grad(v_n_fx), v_n_fx) + div_rhov_n_fx * v_n_fx
+            strong_mom_k_fx += beta_k_fx * (v_k_fx - vS_k_fx)
+            adv_w_fx = ufl.dot(ufl.grad(w_fx), v_k_fx)
+            r_mom_fx += tau_v_fx * (1.0 - alpha_k_fx) * ufl.inner(strong_mom_k_fx, adv_w_fx) * dx_fx
+        else:
+            raise ValueError(f"Unknown COMP_FENICS_V_SUPG_MODE={v_supg_mode_key!r}.")
+
+    # Mass/volume constraint: match the one-domain implementation exactly.
+    #
+    # This is an algebraic constraint with pressure as the Lagrange multiplier.
+    # In the production one-domain form we enforce it fully implicitly at level k:
+    #   div(F_k) = alpha_k s_v(k),
+    # not with a theta-average of div(F). Keeping the FEniCS mirror aligned here
+    # is essential; otherwise the mass block and any total form containing it will
+    # show a false mismatch against pycutfem.
+    r_mass_fx = q_fx * divF_k_fx * dx_fx
 
     # Solid kinematics (Eulerian reference-map constraint):
     #   ∂_t u + vS·∇u = vS
@@ -2434,6 +2547,16 @@ def run_biofilm_comparison():
     Fkin_adv_n_fx = ufl.dot(ufl.grad(u_n_fx), vS_n_fx) - vS_n_fx
     Fkin_k_fx = Fkin_dt_fx + theta_fx * Fkin_adv_k_fx + (1.0 - theta_fx) * Fkin_adv_n_fx
     r_kin_fx = alpha_k_fx * ufl.inner(Fkin_k_fx, eta_u_fx) * dx_fx
+    if float(gamma_u_fx.value) != 0.0:
+        if u_extension_mode_fx in {"l2", "mass"}:
+            r_kin_fx += gamma_u_fx * inv_h2_fx * (1.0 - alpha_k_fx) * ufl.dot(u_k_fx, eta_u_fx) * dx_fx
+        elif u_extension_mode_fx in {"grad", "h1"}:
+            r_kin_fx += gamma_u_fx * (1.0 - alpha_k_fx) * ufl.inner(ufl.grad(u_k_fx), ufl.grad(eta_u_fx)) * dx_fx
+            if float(gamma_u_pin_fx.value) != 0.0:
+                w_pin_u_fx = 1.0 - alpha_k_fx
+                r_kin_fx += gamma_u_pin_fx * inv_h2_fx * (w_pin_u_fx * w_pin_u_fx) * ufl.dot(u_k_fx, eta_u_fx) * dx_fx
+        else:
+            raise ValueError(f"Unknown COMP_FENICS_U_EXTENSION_MODE={u_extension_mode_fx!r}.")
 
     # Skeleton (linear elasticity, with pressure coupling through B and drag).
     def lin_el(u, eta):
@@ -2445,16 +2568,81 @@ def run_biofilm_comparison():
     div_B_eta_n_fx = B_n_fx * ufl.div(eta_vS_fx) + ufl.dot(gradB_n_fx, eta_vS_fx)
     r_skel_press_k_fx = -p_k_fx * div_B_eta_k_fx
     r_skel_press_n_fx = -p_n_fx * div_B_eta_n_fx
+    r_skel_press_k_fx += gamma_div_fx * divF_k_fx * div_B_eta_k_fx
     r_skel_drag_k_fx = -beta_k_fx * ufl.dot(v_k_fx - vS_k_fx, eta_vS_fx)
     r_skel_drag_n_fx = -beta_n_fx * ufl.dot(v_n_fx - vS_n_fx, eta_vS_fx)
+    sk_th_fx = 1.0
+    sk_one_m_th_fx = 0.0
     r_skeleton_fx = (
-        theta_fx * alpha_k_fx * (g_stiff_k_fx * r_el_k_fx)
-        + (1.0 - theta_fx) * alpha_n_fx * (g_stiff_n_fx * r_el_n_fx)
-        + theta_fx * r_skel_press_k_fx
-        + (1.0 - theta_fx) * r_skel_press_n_fx
-        + theta_fx * r_skel_drag_k_fx
-        + (1.0 - theta_fx) * r_skel_drag_n_fx
+        sk_th_fx * alpha_k_fx * (g_stiff_k_fx * r_el_k_fx)
+        + sk_one_m_th_fx * alpha_n_fx * (g_stiff_n_fx * r_el_n_fx)
+        + sk_th_fx * r_skel_press_k_fx
+        + sk_one_m_th_fx * r_skel_press_n_fx
+        + sk_th_fx * r_skel_drag_k_fx
+        + sk_one_m_th_fx * r_skel_drag_n_fx
     ) * dx_fx
+    if float(gamma_u_fx.value) != 0.0:
+        if u_extension_mode_fx in {"l2", "mass"}:
+            r_skeleton_fx += gamma_u_fx * inv_h2_fx * (1.0 - alpha_k_fx) * ufl.dot(vS_k_fx, eta_vS_fx) * dx_fx
+        elif u_extension_mode_fx in {"grad", "h1"}:
+            r_skeleton_fx += gamma_u_fx * (1.0 - alpha_k_fx) * ufl.inner(ufl.grad(vS_k_fx), ufl.grad(eta_vS_fx)) * dx_fx
+            if float(gamma_u_pin_fx.value) != 0.0:
+                w_pin_vS_fx = 1.0 - alpha_k_fx
+                r_skeleton_fx += gamma_u_pin_fx * inv_h2_fx * (w_pin_vS_fx * w_pin_vS_fx) * ufl.dot(vS_k_fx, eta_vS_fx) * dx_fx
+        else:
+            raise ValueError(f"Unknown COMP_FENICS_U_EXTENSION_MODE={u_extension_mode_fx!r}.")
+
+    # Extension-only residuals/Jacobians, kept separate to diagnose conditioning
+    # differences in the one-domain free-fluid extension layer.
+    r_u_ext_pc = None
+    a_u_ext_pc = None
+    r_vS_ext_pc = None
+    a_vS_ext_pc = None
+    if float(pc["gamma_u"]) != 0.0:
+        one_minus_alpha_pc = Constant(1.0) - pc["alpha_k"]
+        h_pc = MeshSize()
+        inv_h2_pc = Constant(1.0) / (h_pc * h_pc)
+        if str(pc["u_extension_mode"]).strip().lower() in {"l2", "mass"}:
+            r_u_ext_pc = float(pc["gamma_u"]) * inv_h2_pc * one_minus_alpha_pc * dot(pc["u_k"], pc["eta"]) * dx_pc
+            a_u_ext_pc = float(pc["gamma_u"]) * inv_h2_pc * (
+                (-Constant(1.0) * pc["dalpha"]) * dot(pc["u_k"], pc["eta"])
+                + one_minus_alpha_pc * dot(pc["du"], pc["eta"])
+            ) * dx_pc
+            r_vS_ext_pc = float(pc["gamma_u"]) * inv_h2_pc * one_minus_alpha_pc * dot(pc["vS_k"], pc["eta_vS"]) * dx_pc
+            a_vS_ext_pc = float(pc["gamma_u"]) * inv_h2_pc * (
+                (-Constant(1.0) * pc["dalpha"]) * dot(pc["vS_k"], pc["eta_vS"])
+                + one_minus_alpha_pc * dot(pc["dvS"], pc["eta_vS"])
+            ) * dx_pc
+        elif str(pc["u_extension_mode"]).strip().lower() in {"grad", "h1"}:
+            r_u_ext_pc = float(pc["gamma_u"]) * one_minus_alpha_pc * inner(grad(pc["u_k"]), grad(pc["eta"])) * dx_pc
+            a_u_ext_pc = float(pc["gamma_u"]) * (
+                (-Constant(1.0) * pc["dalpha"]) * inner(grad(pc["u_k"]), grad(pc["eta"]))
+                + one_minus_alpha_pc * inner(grad(pc["du"]), grad(pc["eta"]))
+            ) * dx_pc
+            r_vS_ext_pc = float(pc["gamma_u"]) * one_minus_alpha_pc * inner(grad(pc["vS_k"]), grad(pc["eta_vS"])) * dx_pc
+            a_vS_ext_pc = float(pc["gamma_u"]) * (
+                (-Constant(1.0) * pc["dalpha"]) * inner(grad(pc["vS_k"]), grad(pc["eta_vS"]))
+                + one_minus_alpha_pc * inner(grad(pc["dvS"]), grad(pc["eta_vS"]))
+            ) * dx_pc
+        else:
+            raise ValueError(f"Unknown u_extension_mode={pc['u_extension_mode']!r}.")
+
+    r_u_ext_fx = None
+    a_u_ext_fx = None
+    r_vS_ext_fx = None
+    a_vS_ext_fx = None
+    if float(gamma_u_fx.value) != 0.0:
+        one_minus_alpha_fx = 1.0 - alpha_k_fx
+        if u_extension_mode_fx in {"l2", "mass"}:
+            r_u_ext_fx = gamma_u_fx * inv_h2_fx * one_minus_alpha_fx * ufl.dot(u_k_fx, eta_u_fx) * dx_fx
+            r_vS_ext_fx = gamma_u_fx * inv_h2_fx * one_minus_alpha_fx * ufl.dot(vS_k_fx, eta_vS_fx) * dx_fx
+        elif u_extension_mode_fx in {"grad", "h1"}:
+            r_u_ext_fx = gamma_u_fx * one_minus_alpha_fx * ufl.inner(ufl.grad(u_k_fx), ufl.grad(eta_u_fx)) * dx_fx
+            r_vS_ext_fx = gamma_u_fx * one_minus_alpha_fx * ufl.inner(ufl.grad(vS_k_fx), ufl.grad(eta_vS_fx)) * dx_fx
+        else:
+            raise ValueError(f"Unknown COMP_FENICS_U_EXTENSION_MODE={u_extension_mode_fx!r}.")
+        a_u_ext_fx = ufl.derivative(r_u_ext_fx, fenicsx["w_k"], dw_fx)
+        a_vS_ext_fx = ufl.derivative(r_vS_ext_fx, fenicsx["w_k"], dw_fx)
 
     # Porosity evolution
     Pi_k_fx = Pi_over_rho_s(S_k_fx, phi_k_fx, alpha_k_fx)
@@ -2481,16 +2669,19 @@ def run_biofilm_comparison():
     delta_n_fx = 4.0 * alpha_n_fx * one_minus(alpha_n_fx)
     surf_coef_prev_fx = D_det_prev_fx
     f_alpha_k_fx = (alpha_k_fx - alpha_n_fx) / dt_fx
-    f_alpha_k_fx += theta_fx * (
-        # Conservative transport: div(alpha vS) = vS·∇alpha + alpha div(vS).
-        (ufl.dot(ufl.grad(alpha_k_fx), vS_k_fx) + alpha_k_fx * div_vS_k_fx)
-        - G_k_fx * alpha_k_fx * one_minus(alpha_k_fx)
-        + surf_coef_prev_fx * delta_k_fx
-    )
+    if alpha_advect_with_key not in {"vs", "v^s", "v_s", "s", "skeleton", "solid"}:
+        raise ValueError(f"Current FEniCS biofilm harness supports only alpha advection with vS; got {alpha_advect_with_key!r}.")
+    if alpha_advection_form_key in {"advective", "nonconservative", "v.grad", "v·grad", "vgrad"}:
+        adv_alpha_k_fx = ufl.dot(ufl.grad(alpha_k_fx), vS_k_fx)
+        adv_alpha_n_fx = ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx)
+    elif alpha_advection_form_key in {"conservative", "div", "divergence", "div(alpha*v)"}:
+        adv_alpha_k_fx = ufl.dot(ufl.grad(alpha_k_fx), vS_k_fx) + alpha_k_fx * div_vS_k_fx
+        adv_alpha_n_fx = ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx) + alpha_n_fx * div_vS_n_fx
+    else:
+        raise ValueError(f"Unknown COMP_FENICS_ALPHA_ADVECTION_FORM={alpha_advection_form_key!r}.")
+    f_alpha_k_fx += theta_fx * (adv_alpha_k_fx - G_k_fx * alpha_k_fx * one_minus(alpha_k_fx) + surf_coef_prev_fx * delta_k_fx)
     f_alpha_k_fx += (1.0 - theta_fx) * (
-        (ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx) + alpha_n_fx * div_vS_n_fx)
-        - G_n_fx * alpha_n_fx * one_minus(alpha_n_fx)
-        + surf_coef_prev_fx * delta_n_fx
+        adv_alpha_n_fx - G_n_fx * alpha_n_fx * one_minus(alpha_n_fx) + surf_coef_prev_fx * delta_n_fx
     )
     r_alpha_fx = xi_fx * f_alpha_k_fx * dx_fx
     r_alpha_fx += D_alpha_fx * ufl.dot(ufl.grad(alpha_k_fx), ufl.grad(xi_fx)) * dx_fx
@@ -2572,8 +2763,10 @@ def run_biofilm_comparison():
     r_X_fx += D_X_fx * (1.0 - theta_fx) * ufl.dot(ufl.grad(X_n_fx), ufl.grad(y_fx)) * dx_fx
     r_X_fx += -y_fx * (theta_fx * R_det_k_fx + (1.0 - theta_fx) * R_det_n_fx) * dx_fx
 
-    r_total_fx = r_mom_fx + r_mass_fx + r_kin_fx + r_skeleton_fx + r_phi_fx + r_alpha_fx + r_damage_fx + r_S_fx + r_X_fx
+    r_current_total_fx = r_mom_fx + r_mass_fx + r_kin_fx + r_skeleton_fx + r_phi_fx + r_alpha_fx + r_S_fx
+    r_total_fx = r_current_total_fx + r_damage_fx + r_X_fx
     if r_mu_alpha_fx is not None:
+        r_current_total_fx += r_mu_alpha_fx
         r_total_fx += r_mu_alpha_fx
 
     # ------------------------------------------------------------------
@@ -2589,6 +2782,7 @@ def run_biofilm_comparison():
     a_damage_fx = ufl.derivative(r_damage_fx, fenicsx["w_k"], dw_fx)
     a_S_fx = ufl.derivative(r_S_fx, fenicsx["w_k"], dw_fx)
     a_X_fx = ufl.derivative(r_X_fx, fenicsx["w_k"], dw_fx)
+    a_current_total_fx = ufl.derivative(r_current_total_fx, fenicsx["w_k"], dw_fx)
     a_total_fx = ufl.derivative(r_total_fx, fenicsx["w_k"], dw_fx)
 
     # ------------------------------------------------------------------
@@ -2643,6 +2837,16 @@ def run_biofilm_comparison():
         kappa_inv=pc["kappa_inv"],
         mu_s=pc["mu_s"],
         lambda_s=pc["lambda_s"],
+        fluid_convection=str(pc["fluid_convection"]),
+        gamma_div=float(pc["gamma_div"]),
+        gamma_u=float(pc["gamma_u"]),
+        u_extension_mode=str(pc["u_extension_mode"]),
+        gamma_u_pin=float(pc["gamma_u_pin"]),
+        v_supg=float(pc["v_supg"]),
+        v_supg_mode=str(pc["v_supg_mode"]),
+        v_supg_c_nu=float(pc["v_supg_c_nu"]),
+        alpha_advect_with=str(pc["alpha_advect_with"]),
+        alpha_advection_form=str(pc["alpha_advection_form"]),
         D_phi=float(pc["D_phi"]),
         gamma_phi=float(pc["gamma_phi"]),
         D_alpha=float(pc["D_alpha"]),
@@ -2684,6 +2888,17 @@ def run_biofilm_comparison():
         "Biofilm damage (res)": {"pc": forms_pc.r_damage, "fx": r_damage_fx, "mat": False},
         "Biofilm substrate (res)": {"pc": forms_pc.r_substrate, "fx": r_S_fx, "mat": False},
         "Biofilm detached (res)": {"pc": forms_pc.r_detached, "fx": r_X_fx, "mat": False},
+        "Biofilm current total residual": {
+            "pc": forms_pc.r_momentum
+            + forms_pc.r_mass
+            + forms_pc.r_kinematics
+            + forms_pc.r_skeleton
+            + forms_pc.r_phi
+            + forms_pc.r_alpha
+            + forms_pc.r_substrate,
+            "fx": r_current_total_fx,
+            "mat": False,
+        },
         "Biofilm total residual": {"pc": forms_pc.residual_form, "fx": r_total_fx, "mat": False},
         # Jacobian pieces
         "Biofilm momentum (jac)": {"pc": forms_pc.a_momentum, "fx": a_mom_fx, "mat": True},
@@ -2695,12 +2910,31 @@ def run_biofilm_comparison():
         "Biofilm damage (jac)": {"pc": forms_pc.a_damage, "fx": a_damage_fx, "mat": True},
         "Biofilm substrate (jac)": {"pc": forms_pc.a_substrate, "fx": a_S_fx, "mat": True},
         "Biofilm detached (jac)": {"pc": forms_pc.a_detached, "fx": a_X_fx, "mat": True},
+        "Biofilm current total jacobian": {
+            "pc": forms_pc.a_momentum
+            + forms_pc.a_mass
+            + forms_pc.a_kinematics
+            + forms_pc.a_skeleton
+            + forms_pc.a_phi
+            + forms_pc.a_alpha
+            + forms_pc.a_substrate,
+            "fx": a_current_total_fx,
+            "mat": True,
+        },
         "Biofilm total jacobian": {"pc": forms_pc.jacobian_form, "fx": a_total_fx, "mat": True},
     }
 
     if r_mu_alpha_fx is not None:
         terms["Biofilm mu_alpha (res)"] = {"pc": forms_pc.r_mu_alpha, "fx": r_mu_alpha_fx, "mat": False}
         terms["Biofilm mu_alpha (jac)"] = {"pc": forms_pc.a_mu_alpha, "fx": a_mu_alpha_fx, "mat": True}
+        terms["Biofilm current total residual"]["pc"] = terms["Biofilm current total residual"]["pc"] + forms_pc.r_mu_alpha
+        terms["Biofilm current total jacobian"]["pc"] = terms["Biofilm current total jacobian"]["pc"] + forms_pc.a_mu_alpha
+    if r_u_ext_pc is not None and r_u_ext_fx is not None:
+        terms["Biofilm u extension (res)"] = {"pc": r_u_ext_pc, "fx": r_u_ext_fx, "mat": False}
+        terms["Biofilm u extension (jac)"] = {"pc": a_u_ext_pc, "fx": a_u_ext_fx, "mat": True}
+    if r_vS_ext_pc is not None and r_vS_ext_fx is not None:
+        terms["Biofilm vS extension (res)"] = {"pc": r_vS_ext_pc, "fx": r_vS_ext_fx, "mat": False}
+        terms["Biofilm vS extension (jac)"] = {"pc": a_vS_ext_pc, "fx": a_vS_ext_fx, "mat": True}
 
     # Filter terms (full suite is the default for biofilm).
     filter_terms = os.environ.get("COMP_FENICS_TERMS")

@@ -43,6 +43,7 @@ class StackItem:
     # tiny shim so we can write  item = item._replace(var_name="tmp")
     is_transpose: bool = field(default=False)  # True if this item is a transposed version of another
     is_hessian: bool = field(default=False)  # True if this item is a Hessian matrix
+    is_divergence: bool = field(default=False)  # True if this scalar came from div(grad(vector))
     def _replace(self, **changes) -> "StackItem":
         return replace(self, **changes)
     @staticmethod
@@ -609,9 +610,6 @@ class NumbaCodeGen:
                 else:
                     raise NotImplementedError(f"Laplacian not implemented for role {a.role}")
 
-
-
-            
             elif isinstance(op, LoadElementWiseConstant):
                 # the full (n_elem, …) array is passed as a kernel argument
                 required_args.add(op.name)
@@ -1616,6 +1614,145 @@ class NumbaCodeGen:
                 jinv_q = f"{jinv_sym}_q"  # 2x2 at (e,q)
                 body_lines.append(f"{jinv_q} = {jinv_sym}[e, q]")
 
+                if a.is_divergence:
+                    if self.spatial_dim != 2:
+                        raise NotImplementedError("grad(div(.)) is currently implemented for 2D only.")
+                    if len(a.field_names) < self.spatial_dim:
+                        raise NotImplementedError(
+                            "grad(div(.)) requires a vector field with one component per spatial direction."
+                        )
+
+                    if a.side == "+":
+                        H0 = "pos_Hxi0"; H1 = "pos_Hxi1"; suff = "_pos"
+                    elif a.side == "-":
+                        H0 = "neg_Hxi0"; H1 = "neg_Hxi1"; suff = "_neg"
+                    else:
+                        H0 = "Hxi0"; H1 = "Hxi1"; suff = ""
+                    required_args.update({H0, H1, "gdofs_map"})
+
+                    d10, d01, d20, d11, d02 = [], [], [], [], []
+                    for i, fn in enumerate(a.field_names[: self.spatial_dim]):
+                        if suff == "":
+                            n10 = f"d10_{fn}"; n01 = f"d01_{fn}"; n20 = f"d20_{fn}"; n11 = f"d11_{fn}"; n02 = f"d02_{fn}"
+                        else:
+                            side_tag = self._component_side_tag(a.side, getattr(a, "field_sides", None), fn, i)
+                            n10 = f"r10_{fn}_{side_tag}"; n01 = f"r01_{fn}_{side_tag}"
+                            n20 = f"r20_{fn}_{side_tag}"; n11 = f"r11_{fn}_{side_tag}"; n02 = f"r02_{fn}_{side_tag}"
+                        required_args.update({n10, n01, n20, n11, n02})
+                        d10.append(n10); d01.append(n01); d20.append(n20); d11.append(n11); d02.append(n02)
+
+                    if a.role in ("test", "trial"):
+                        out = new_var("graddiv")
+                        body_lines.append(f"{out} = np.zeros(({self.spatial_dim}, n_union), dtype={self.dtype})")
+                        for i, fn in enumerate(a.field_names[: self.spatial_dim]):
+                            s0 = self._field_slice(fn).start
+                            s1 = self._field_slice(fn).stop
+                            Hloc = new_var("Hloc")
+                            body_lines += [
+                                f"Hx = {H0}[e, q]",
+                                f"Hy = {H1}[e, q]",
+                                f"d10_q = {d10[i]}[e, q]",
+                                f"d01_q = {d01[i]}[e, q]",
+                                f"d20_q = {d20[i]}[e, q]",
+                                f"d11_q = {d11[i]}[e, q]",
+                                f"d02_q = {d02[i]}[e, q]",
+                                f"{Hloc} = compute_physical_hessian(d20_q, d11_q, d02_q, d10_q, d01_q, {jinv_q}, Hx, Hy, {self.dtype})",
+                            ]
+                            Huse = Hloc
+                            if a.side:
+                                side_tag = self._component_side_tag(a.side, a.field_sides, fn, i)
+                                map_arr = f"{side_tag}_map_{fn}"
+                                required_args.add(map_arr)
+                                Hpad = new_var("Hpad")
+                                Hsub = new_var("Hsub")
+                                me = new_var("map_e")
+                                body_lines += [
+                                    f"if {Hloc}.shape[0] == n_union:",
+                                    f"    {Hpad} = {Hloc}",
+                                    f"else:",
+                                    f"    {me} = {map_arr}[e]",
+                                    f"    {Hsub} = {Hloc}[{s0}:{s1}, :, :]",
+                                    f"    {Hpad} = scatter_tensor_to_union({Hsub}, {me}, n_union, {self.dtype})",
+                                ]
+                                Huse = Hpad
+                            body_lines += [
+                                f"{out}[0] += {Huse}[:, 0, {i}]",
+                                f"{out}[1] += {Huse}[:, 1, {i}]",
+                            ]
+
+                        stack.append(
+                            StackItem(
+                                var_name=out,
+                                role=a.role,
+                                shape=(self.spatial_dim, -1),
+                                is_vector=True,
+                                field_names=list(a.field_names[: self.spatial_dim]),
+                                parent_name=a.parent_name,
+                                side=a.side,
+                                field_sides=a.field_sides or [],
+                            )
+                        )
+                        continue
+
+                    if a.role == "value":
+                        coeff = a.parent_name if a.parent_name.startswith("u_") else f"u_{a.parent_name}_loc"
+                        required_args.add(coeff)
+                        out = new_var("graddivv")
+                        body_lines.append(f"{out} = np.zeros(({self.spatial_dim},), dtype={self.dtype})")
+                        for i, fn in enumerate(a.field_names[: self.spatial_dim]):
+                            s0 = self._field_slice(fn).start
+                            s1 = self._field_slice(fn).stop
+                            Hloc = new_var("Hloc")
+                            Hval = new_var("Hval")
+                            body_lines += [
+                                f"Hx = {H0}[e, q]",
+                                f"Hy = {H1}[e, q]",
+                                f"d10_q = {d10[i]}[e, q]",
+                                f"d01_q = {d01[i]}[e, q]",
+                                f"d20_q = {d20[i]}[e, q]",
+                                f"d11_q = {d11[i]}[e, q]",
+                                f"d02_q = {d02[i]}[e, q]",
+                                f"{Hloc} = compute_physical_hessian(d20_q, d11_q, d02_q, d10_q, d01_q, {jinv_q}, Hx, Hy, {self.dtype})",
+                            ]
+                            if a.side:
+                                side_tag = self._component_side_tag(a.side, a.field_sides, fn, i)
+                                map_arr = f"{side_tag}_map_{fn}"
+                                required_args.add(map_arr)
+                                Hpad = new_var("Hpad")
+                                Hsub = new_var("Hsub")
+                                me = new_var("map_e")
+                                body_lines += [
+                                    f"if {Hloc}.shape[0] == {coeff}.shape[0]:",
+                                    f"    {Hval} = hessian_qp({coeff}, {Hloc})",
+                                    f"else:",
+                                    f"    {me} = {map_arr}[e]",
+                                    f"    {Hsub} = {Hloc}[{s0}:{s1}, :, :]",
+                                    f"    {Hpad} = scatter_tensor_to_union({Hsub}, {me}, n_union, {self.dtype})",
+                                    f"    {Hval} = hessian_qp({coeff}, {Hpad})",
+                                ]
+                            else:
+                                body_lines.append(f"{Hval} = hessian_qp({coeff}, {Hloc})")
+                            body_lines += [
+                                f"{out}[0] += {Hval}[0, {i}]",
+                                f"{out}[1] += {Hval}[1, {i}]",
+                            ]
+
+                        stack.append(
+                            StackItem(
+                                var_name=out,
+                                role="value",
+                                shape=(self.spatial_dim,),
+                                is_vector=True,
+                                field_names=list(a.field_names[: self.spatial_dim]),
+                                parent_name=coeff,
+                                side=a.side,
+                                field_sides=a.field_sides or [],
+                            )
+                        )
+                        continue
+
+                    raise NotImplementedError(f"grad(div(.)) not implemented for role {a.role}")
+
 
                 # ======================================================================
                 # (A) grad(Test/Trial)  -> shape (k , n_loc_or_union , 2)
@@ -1822,6 +1959,7 @@ class NumbaCodeGen:
                             parent_name=a.parent_name,
                             side=a.side,
                             is_gradient=False,
+                            is_divergence=True,
                             field_sides=a.field_sides or []
                         )
                     )
@@ -1841,7 +1979,8 @@ class NumbaCodeGen:
                         stack.append(StackItem(var_name=div_var, role='value',
                                             shape=(), is_vector=False, is_gradient=False,
                                             field_names=a.field_names, parent_name=a.parent_name,
-                                            side=a.side, field_sides=a.field_sides or []))
+                                            side=a.side, is_divergence=True,
+                                            field_sides=a.field_sides or []))
                     else:                          # tensor field → vector (k,)
                         body_lines.append("# Div(tensor value) → vector")
                         body_lines.append(f"{div_var} = np.zeros(({k_comp},), dtype={self.dtype})")
@@ -3515,31 +3654,77 @@ class NumbaCodeGen:
                     #                (u_k or c)                ·  φ_v
                     # -----------------------------------------------------------------
                     elif (b.role == "test" and not b.is_vector
-                        and a.role == "value" and not a.is_vector
+                        and a.role == "value"
+                        and (
+                            (not a.is_vector)
+                            or (len(a.shape) == 1 and a.shape[0] == 1)
+                        )
                         and not a.is_gradient and not b.is_gradient
                         and not a.is_hessian and not b.is_hessian
                         ):
                         body_lines.append("# Load: scalar Function × scalar Test → (n_loc,)")
-
-                        body_lines.append(f"{res_var} = {a.var_name} * {b.var_name}")   # (n_loc,)
+                        a_expr = f"{a.var_name}[0]" if (a.is_vector and len(a.shape) == 1 and a.shape[0] == 1) else a.var_name
+                        body_lines.append(f"{res_var} = {a_expr} * {b.var_name}")   # (n_loc,)
                         field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=b, strict=False)
                         stack.append(StackItem(var_name=res_var, role='value',
-                                            shape=(b.shape[1],), is_vector=False,
+                                            shape=(_basis_col_dim(b.shape),), is_vector=False,
                                             field_names=field_names, parent_name=parent_name, side=side,
                                             field_sides=field_sides))
 
                     # symmetric orientation
                     elif (a.role == "test" and not a.is_vector
-                        and b.role == "value" and not b.is_vector
+                        and b.role == "value"
+                        and (
+                            (not b.is_vector)
+                            or (len(b.shape) == 1 and b.shape[0] == 1)
+                        )
                         and not a.is_gradient and not b.is_gradient
                         and not a.is_hessian and not b.is_hessian
                         ):
                         body_lines.append("# Load: scalar Test × scalar Function → (n_loc,)")
-
-                        body_lines.append(f"{res_var} = {b.var_name} * {a.var_name}")   # (n_loc,)
+                        b_expr = f"{b.var_name}[0]" if (b.is_vector and len(b.shape) == 1 and b.shape[0] == 1) else b.var_name
+                        body_lines.append(f"{res_var} = {b_expr} * {a.var_name}")   # (n_loc,)
                         field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer=a, strict=False)
                         stack.append(StackItem(var_name=res_var, role='value',
-                                            shape=(a.shape[1],), is_vector=False,
+                                            shape=(_basis_col_dim(a.shape),), is_vector=False,
+                                            field_names=field_names, parent_name=parent_name, side=side,
+                                            field_sides=field_sides))
+                    # -----------------------------------------------------------------
+                    # scalar-like value/const coefficient (represented as a length-1
+                    # vector) times a mixed basis block
+                    # -----------------------------------------------------------------
+                    elif (
+                        a.role in {"const", "value"}
+                        and a.is_vector
+                        and len(a.shape) == 1
+                        and a.shape[0] == 1
+                        and not a.is_gradient and not a.is_hessian
+                        and b.role == "mixed"
+                        and not b.is_gradient and not b.is_hessian
+                    ):
+                        body_lines.append("# Product: scalar-like value * mixed basis → mixed")
+                        body_lines.append(f"{res_var} = {a.var_name}[0] * {b.var_name}")
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='b', strict=False)
+                        stack.append(StackItem(var_name=res_var, role='mixed',
+                                            shape=b.shape, is_vector=False,
+                                            is_gradient=False, is_hessian=False,
+                                            field_names=field_names, parent_name=parent_name, side=side,
+                                            field_sides=field_sides))
+                    elif (
+                        b.role in {"const", "value"}
+                        and b.is_vector
+                        and len(b.shape) == 1
+                        and b.shape[0] == 1
+                        and not b.is_gradient and not b.is_hessian
+                        and a.role == "mixed"
+                        and not a.is_gradient and not a.is_hessian
+                    ):
+                        body_lines.append("# Product: mixed basis * scalar-like value → mixed")
+                        body_lines.append(f"{res_var} = {b.var_name}[0] * {a.var_name}")
+                        field_names, parent_name, side, field_sides = StackItem.resolve_metadata(a, b, prefer='a', strict=False)
+                        stack.append(StackItem(var_name=res_var, role='mixed',
+                                            shape=a.shape, is_vector=False,
+                                            is_gradient=False, is_hessian=False,
                                             field_names=field_names, parent_name=parent_name, side=side,
                                             field_sides=field_sides))
                     # -----------------------------------------------------------------

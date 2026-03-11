@@ -26,4 +26,11 @@ def test_benchmark6_observation_campaign_cli_help() -> None:
     assert "--restart-from" in proc.stdout
     assert "--restart-write-every" in proc.stdout
     assert "--restart-dt" in proc.stdout
+    assert "--gamma-div" in proc.stdout
+    assert "--adaptive-gamma-div" in proc.stdout
+    assert "--gamma-div-max" in proc.stdout
+    assert "--alpha-ch-eps" in proc.stdout
+    assert "--scale-alpha-ch-eps-with-zeta" in proc.stdout
+    assert "--diffuse-shear-scale-ref" in proc.stdout
+    assert "--vtk-every" in proc.stdout
     assert "--dry-run" in proc.stdout

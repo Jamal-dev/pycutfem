@@ -796,3 +796,635 @@ accepted step in the early transient window. Based on that probe, the
 observation campaign's steady block was changed from `dt = 2.5e-2` to
 `dt = 5e-3` so the steady calibration starts from the stable branch instead of
 relying on repeated time-step cuts from the first few steps.
+
+### March 9, 2026: semismooth line-search isolation on the steady branch
+
+To separate model-conditioning issues from "just try a smaller `dt` again", the
+failing steady candidate
+
+- `E = 200`,
+- `eta_s = 0`,
+- `zeta_tau = 0`,
+- refined `nx = 16`,
+- `dt = dt_min = 5e-3`,
+
+was restarted directly from the last accepted checkpoint before failure
+(`checkpoint_step=00038`, `t = 0.19 s`) and rerun with one stabilization knob
+changed at a time.
+
+Observed outcomes on that same restart state:
+
+- baseline benchmark settings
+  (`gamma_div = 1e-2`, `gamma_u = 5`, `u_extension = l2`) fail again at
+  `step 39` with
+  `RuntimeError: Line search failed: no semismooth residual decrease`;
+- stronger whole-domain extension alone
+  (`gamma_div = 1e-2`, `gamma_u = 20`) delays the failure only to `step 43`;
+- stronger mixed-block conditioning succeeds:
+  `gamma_div = 5e-2` reaches `t = 0.25 s` cleanly from the same checkpoint,
+  and `gamma_div = 1e-1` also reaches `t = 0.25 s` cleanly.
+
+The residual signature stays the same in the failed branches:
+
+- the PDAS iterate stalls with `|G|_inf ~ 1e-6`,
+- the raw per-field residuals are already small (`v`, `vS` around `1e-6`,
+  `alpha/phi/mu_alpha` much smaller),
+- but the assembled block breakdown is still dominated by `momentum`
+  (`~ 1.37e-3 -- 1.39e-3` in the repeated failing runs).
+
+That experiment is the clearest evidence so far that the steady Benchmark 6
+stall is **not** a phase-box issue and **not** primarily a `u`-extension issue.
+It is a mixed Stokes/Brinkman/constraint conditioning problem:
+the semismooth line search is being asked to globalize a step in a regime where
+the coupled `(v,p,vS)` block is still much stiffer than the phase and
+kinematics blocks.
+
+Practical conclusion for the publishable branch:
+
+- keep the stronger application-style extension (`gamma_u = 5`, `u_extension = l2`);
+- but treat a larger consistent mixed-block penalty
+  (`gamma_div ~ 5e-2`, with `1e-1` as a conservative upper diagnostic value)
+  as the **primary** stabilization needed for Benchmark 6.
+
+### Mesh-only effect (preliminary)
+
+A mesh-only rerun of the same baseline physics path on refined `nx = 24`
+(`gamma_div = 1e-2`, `gamma_u = 5`) is more benign in the early transient
+window than `nx = 16`: it stays on the fixed step and advances through the
+startup with `2--5` PDAS iterations per time step over the first `0.115 s`.
+
+That is consistent with the scale argument already noted above:
+refining the mesh increases the local viscous scale `mu/h^2`, so the
+drag-to-viscous ratio becomes less extreme.
+But the gap is still several orders of magnitude, so refinement alone should be
+treated as a **secondary** aid to the steady Dian branch, not as a replacement
+for the mixed-block conditioning fix.
+
+### March 9, 2026: `L2` vs `H1`-style `u` regularization
+
+The remaining modeling question was whether Benchmark 6 should use the current
+`L2` extension penalty or switch to the `grad` option as a more "smoother"
+`H1` regularization. In the implementation, that distinction is important:
+
+- `--u-extension l2` adds a mass-style penalty
+  `gamma_u h^{-2} (1-alpha) (u, xi)`;
+- `--u-extension grad` adds only the gradient seminorm
+  `gamma_u (1-alpha) (grad u, grad xi)`,
+  with the small `gamma_u_pin` term used only to remove the rigid-translation
+  nullspace of that seminorm.
+
+So the `grad` option is not a full `H1` norm; it is an `H1`-seminorm plus a
+very small pinning mass term.
+
+To compare them fairly, both modes were run from the same hard restart state:
+
+- checkpoint `step 38`, `t = 0.19 s`,
+- refined steady Dian calibration case
+  `E = 200`, `eta_s = 0`, `zeta_tau = 0`, `nx = 16`,
+- fixed `dt = dt_min = 5e-3`,
+- stabilized mixed block `gamma_div = 5e-2`,
+- same `gamma_u = 5`, same mesh, same bounds, same PDAS solver.
+
+Results over the restart interval `t = 0.19 -> 0.25 s`:
+
+- `u_extension = l2` reaches `t = 0.25 s` in **17** total Newton iterations
+  over 12 accepted steps, with
+  `{1: 9, 2: 2, 4: 1}` iterations per step,
+  cumulative line-search time about `4.06 s`,
+  and wall time `91.13 s`;
+- `u_extension = grad` also reaches `t = 0.25 s`, but needs **36** total
+  Newton iterations,
+  `{1: 2, 2: 2, 3: 4, 4: 2, 5: 2}` iterations per step,
+  cumulative line-search time about `17.91 s`,
+  and wall time `245.90 s`.
+
+So, on the same stabilized branch, the `grad`/`H1`-style regularization is
+about:
+
+- `2.1x` more Newton iterations,
+- `4.4x` more line-search work,
+- `2.7x` more wall-clock time.
+
+The tail behavior is especially different.
+
+- With `l2`, once the active set settles after `t ~ 0.21 s`, the solve drops to
+  mostly one Newton step per time level and stays there through `t = 0.25 s`.
+- With `grad`, the same window still shows repeated semismooth bursts:
+  `5` Newton steps at `t = 0.225 s`,
+  `5` again at `t = 0.235 s`,
+  `4` at `t = 0.245 s`,
+  and `3` at `t = 0.25 s`.
+
+That behavior is consistent with the structure of the two penalties.
+The `l2` extension gives direct zero-order coercivity outside the biofilm,
+scaled with `h^{-2}`, so rigid-body-like modes in the weakly constrained
+free-fluid region are damped immediately.
+The `grad` extension only penalizes spatial variation; nearly rigid
+translations remain cheap and are controlled only through the tiny pinning
+term. In this PDAS active-set regime, that makes the semismooth line search
+noticeably choppier even though the run remains formally convergent.
+
+On the recorded observables, the difference is modest for the weighted
+quantities and front positions, but it is not zero:
+
+- final weighted mean volume fraction differs by only `6.95e-05`
+  (`0.0135%`);
+- final weighted `phi` drop differs by `6.95e-03`;
+- final front positions are larger under `grad` by about
+  `2.5 -- 9.0 um`
+  (`0.24 -- 0.83%`);
+- the derived displacement-at-height values differ by about
+  `15 -- 52%` because they are small residual differences between two close
+  fronts.
+
+Recommendation for Benchmark 6:
+
+- keep `--u-extension l2` as the publishable default;
+- do **not** switch the steady Dian branch to `grad`/`H1` regularization;
+- if extra robustness is needed, spend stabilization budget on the mixed-block
+  conditioning (`gamma_div`) and on local refinement, not on replacing the
+  `l2` extension with the `grad` variant.
+
+So the answer to "L2 or H1 here?" is: **use `L2` for Benchmark 6**.
+The `grad`/`H1`-style option is admissible, but in this simulation it is
+strictly less attractive: slower, choppier for the semismooth line search, and
+not more faithful in any observable that matters for the paper.
+
+### March 9, 2026: campaign `run.log` audit and publication plan
+
+The next question is not only "what stabilizes one representative restart?", but
+"what part of the current Benchmark 6 campaign is actually publication-ready?"
+To answer that, the calibration-stage `run.log` files under
+`examples/biofilms/results/benchmark6_observation_campaign` were audited case by
+case.
+
+Two facts are immediately relevant for paper quality.
+
+First, the current artifact tree is **not clean**.
+At least one case in `steady_calibration_refined` is still a stale morning run
+with the old settings (`gamma_div = 1e-2`, `vtk_every = 0`), while later cases
+in the same directory were rerun with the new settings
+(`gamma_div = 5e-2`, `vtk_every = 1`).
+So the present mix of logs, summaries, and calibration rows should not be used
+directly in a paper figure or table.
+
+Second, once stale and incomplete artifacts are separated from the genuinely
+completed ones, the stability map is very structured:
+
+- on the clean `steady_mesh_refined` calibration-stage runs with
+  `gamma_div = 5e-2`, `u_extension = l2`, `gamma_u = 5`,
+  the completed `zeta = 0` cases show
+  `E = 200` and `E = 500` passing to `t = 1.0 s`,
+  while `E = 120` and `E = 320` still fail;
+- every completed nonzero diffuse-shear case
+  (`zeta = 30` or `50`) still fails by line-search breakdown;
+- one case (`E = 500`, `zeta = 50`) is merely incomplete, so it provides no
+  evidence either way.
+
+Across those failures, the residual signature is again nearly invariant:
+
+- the dominant failed block remains `momentum`,
+  typically `1.39e-3 -- 1.45e-3`;
+- the phase and bound-associated blocks stay tiny
+  (`alpha`, `phi`, `mu_alpha` around `1e-8 -- 1e-10`);
+- therefore the remaining campaign failures are still a mixed
+  mechanics/conditioning problem, not a phase-box pathology.
+
+To test whether the nonzero-`zeta` branch can be rescued by simply pushing the
+same stabilization knob harder, a representative difficult case
+
+- `E = 200`,
+- `zeta = 30`,
+- refined `nx = 16`,
+- restart from `checkpoint_step = 45` (`t = 0.225 s`),
+
+was rerun with `gamma_div = 1e-1` while keeping
+`dt = dt_min = 5e-3`, `u_extension = l2`, and the rest of the setup unchanged.
+That branch still fails immediately at `step 46`, with the same momentum-block
+signature. So, for the current model, **raising `gamma_div` from `5e-2` to
+`1e-1` is not enough to make the nonzero-`zeta` steady calibration publishably
+robust**.
+
+#### Recommended parameter set for the publishable branch
+
+Based on the evidence above, the conservative publication choice is:
+
+- use `u_extension = l2`;
+- use `gamma_u = 5`;
+- use `gamma_div = 5e-2` as the default reported stabilization;
+- keep `dt = dt_min = 5e-3`, `theta = 1`, `q = 4`;
+- keep the local geometric refinement around the biofilm
+  (`refine_band = 2.5e-4`, `refine_expand_layers = 1`);
+- for the nominal reported steady Dian case, use `zeta = 0`.
+
+For the material parameter, `E = 200` is the safest nominal choice:
+
+- it is in the middle of the calibration range rather than at an endpoint,
+- it passes the clean `zeta = 0` refined steady run,
+- it is the case already used for the detailed restart diagnostics,
+- and it avoids depending on the currently mixed/stale `E = 120` artifact set.
+
+`E = 500` can be kept as a robustness cross-check, but not as the primary
+published choice unless it is needed for the final fit.
+
+#### What should not be claimed yet
+
+The current data do **not** support claiming that the steady Benchmark 6
+calibration is robust for arbitrary `zeta` in `{0,30,50}`.
+
+More specifically:
+
+- the clean evidence supports the `zeta = 0` branch;
+- the `zeta = 30` and `50` branches are still unstable in the current solver
+  path;
+- and `gamma_div = 1e-1` alone does not rescue a representative `zeta = 30`
+  case.
+
+So unless a separate stabilization campaign is completed, nonzero-`zeta` steady
+cases should be treated as exploratory and should not appear in the main paper
+as established benchmark results.
+
+#### Publication plan
+
+To make Benchmark 6 acceptable for review, the next steps should be:
+
+1. **Clean the artifact tree and rerun from scratch.**
+   Archive or delete the mixed `steady_calibration_refined` directory and rerun
+   into a fresh output directory with `--skip-existing` disabled for the first
+   publication pass.
+
+2. **Freeze the main-paper scope to the stable subspace.**
+   For the steady Dian benchmark, restrict the main results to
+   `zeta = 0`, `u_extension = l2`, `gamma_u = 5`, `gamma_div = 5e-2`,
+   with `E = 200` as the nominal reported parameter set.
+
+3. **Complete a clean steady mesh ladder on that frozen branch.**
+   Run `nx = 16, 24, 32` only for the frozen `zeta = 0` branch and document:
+   - pass/fail,
+   - Newton iterations,
+   - front/displacement observables,
+   - and contour convergence.
+   That is the mesh evidence reviewers will expect.
+
+4. **Separate robustness from calibration.**
+   After the nominal branch is reproduced cleanly, run only a small robustness
+   set:
+   - `E = 500`, `zeta = 0` as a parameter sensitivity check,
+   - possibly one `gamma_div = 1e-1` repeat to show the solution is not an
+     artifact of a knife-edge stabilization value.
+
+5. **Move nonzero-`zeta` work onto a dedicated continuation track.**
+   If the paper still needs `zeta > 0`, do not brute-force the full grid.
+   Instead:
+   - converge the `zeta = 0` branch first,
+   - restart from that state,
+   - continue `zeta` in small increments (`0 -> 5 -> 10 -> 20 -> 30 -> ...`),
+   - and, if needed, combine that with mesh refinement and a longer traction
+     ramp.
+   Without that continuation strategy, the current runs suggest the branch is
+   not solver-robust enough for publication.
+
+6. **Include a reviewer-facing stability discussion in the paper.**
+   The text should say explicitly that:
+   - bounds on `alpha` and `phi` were not the source of failure,
+   - the failing residuals were dominated by the mixed momentum block,
+   - `L2` outperformed the `H1`-style `grad` regularization,
+   - `gamma_div` was the primary stabilizing ingredient,
+   - and refinement helped but did not replace mixed-block conditioning.
+
+7. **Use VTK only as diagnostic evidence, not as the full production output.**
+   Keep `--vtk-every 1` only for short diagnostic runs.
+   For the publication rerun, use a sparse cadence (for example every `10`
+   accepted steps on the final branch) and archive only the frames that support
+   figures or qualitative discussion.
+
+#### Bottom line
+
+The publishable Benchmark 6 story is available now, but only if it is scoped
+correctly:
+
+- stable, reproducible steady Dian benchmark;
+- `zeta = 0`;
+- `E = 200`;
+- `u_extension = l2`;
+- `gamma_div = 5e-2`;
+- clean rerun from fresh outputs;
+- mesh ladder and stability discussion included.
+
+That is a defensible JCP-level package.
+Trying to present the current nonzero-`zeta` steady cases as already settled
+would invite exactly the reviewer objection we want to avoid.
+
+## March 9, 2026: analytical scaling of the benchmark-local `zeta` traction
+
+Before spending more time on transient parameter sweeps, it is useful to extend
+the paper's one-step analysis to the benchmark-local diffuse traction term.
+
+### 1. What `zeta` changes in the variational problem
+
+In the current Blauert driver, the added load enters the momentum and skeleton
+equations as a lagged equal-and-opposite pair of body forces:
+
+- fluid momentum receives `- w_Gamma^n g_t^n`,
+- skeleton momentum receives `+ w_Gamma^n g_t^n`,
+
+with
+
+- `w_Gamma^n = sqrt(|grad alpha^n|^2 + eta)`,
+- `g_t^n = zeta * tau^n * t_Gamma^n` for the `poiseuille` model,
+- `|t_Gamma^n| = 1`.
+
+So the extra linear functional at one backward-Euler step is
+
+```text
+ell_zeta^n(w,z)
+  = zeta * int_Omega tau^n w_Gamma^n t_Gamma^n · (z - w) dx.
+```
+
+Crucially, this is a **lagged right-hand side term**, not a new bilinear part of
+the linearized step. Therefore:
+
+- it does **not** change the mechanics coercivity condition `delta_v^n > 0`,
+- it does **not** change the kinematic coercivity condition `delta_u^n > 0`,
+- and it does **not** change the fixed-point smallness condition `L^n < 1`
+  directly.
+
+What it changes is the **size of the forcing**, which then propagates into
+`v^{S,n+1}`, `u^{n+1}`, and the next-step advection constants used in the paper
+analysis.
+
+### 2. A clean bound for the added load
+
+By Cauchy-Schwarz and Poincare,
+
+```text
+|ell_zeta^n(w,z)|
+<= |zeta| * ||tau^n||_Linf * ||w_Gamma^n||_L2 * (||w||_L2 + ||z||_L2)
+<= C_P * |zeta| * ||tau^n||_Linf * ||w_Gamma^n||_L2
+   * (||w||_H1 + ||z||_H1).
+```
+
+Hence the dual norm of the added load is controlled by
+
+```text
+||ell_zeta^n||_(V x V)'
+<= C_P * |zeta| * ||tau^n||_Linf * ||w_Gamma^n||_L2.
+```
+
+The diffuse-interface weight can be tied back to the Cahn-Hilliard energy.
+Since
+
+```text
+||w_Gamma^n||_L2^2
+ = int_Omega (|grad alpha^n|^2 + eta) dx
+<= ||grad alpha^n||_L2^2 + eta |Omega|,
+```
+
+and the CH energy contains
+
+```text
+E_alpha^n
+ = (gamma_alpha * eps_alpha / 2) ||grad alpha^n||_L2^2
+   + (gamma_alpha / eps_alpha) int_Omega W(alpha^n) dx,
+```
+
+we have
+
+```text
+||grad alpha^n||_L2^2 <= 2 E_alpha^n / (gamma_alpha * eps_alpha).
+```
+
+Therefore
+
+```text
+||ell_zeta^n||_(V x V)'
+<= C_P * |zeta| * ||tau^n||_Linf
+   * sqrt( 2 E_alpha^n / (gamma_alpha * eps_alpha) + eta |Omega| ).
+```
+
+Define the dimensionless traction-amplitude factor
+
+```text
+Xi_zeta^n
+:=
+|zeta| * ||tau^n||_Linf
+* sqrt( 2 E_alpha^n / (gamma_alpha * eps_alpha) + eta |Omega| ).
+```
+
+Then the one-step mechanics estimate becomes
+
+```text
+||v^{n+1}||_H1 + ||vS^{n+1}||_H1 + ||p^{n+1}||_L2
+<= C_mech^n * (F_base^n + Xi_zeta^n),
+```
+
+where `F_base^n` collects the pre-existing loads already present in the paper
+analysis.
+
+### 3. What this implies for stable parameter scaling
+
+The key scaling is now explicit:
+
+```text
+Xi_zeta^n ~ |zeta| / sqrt(gamma_alpha * eps_alpha)
+```
+
+up to the bounded factors `||tau^n||_Linf` and `E_alpha^n`.
+
+So if everything else is fixed, increasing `zeta` makes the added forcing grow
+like `|zeta| / sqrt(eps_alpha)`. Equivalently, to keep the same one-step forcing
+level, one should keep
+
+```text
+zeta^2 / (gamma_alpha * eps_alpha)
+```
+
+bounded.
+
+This is the first analytically meaningful rule for the transient campaign:
+
+- if `zeta` is increased by a factor `r`, then the pair `gamma_alpha *
+  eps_alpha` should ideally increase by a factor `r^2`,
+- or, if `gamma_alpha` is kept fixed, then `eps_alpha` should increase like
+  `zeta^2`.
+
+This does **not** say that arbitrarily large `eps_alpha` is a good idea.
+It only says that the diffuse traction becomes more concentrated, and therefore
+ more aggressive, when `eps_alpha` is made smaller.
+
+### 4. How the added forcing feeds the paper's stability conditions
+
+The mechanics theorem itself is unchanged, but the next-step constants are not.
+
+First, the kinematic coercivity condition in the paper depends on
+
+```text
+delta_u^n = c_u - ((D_u^n / 2) - 1 / dt)_+ * C_P^2,
+```
+
+with `D_u^n = ||div vS^n||_Linf`.
+At the discrete level, a standard inverse/embedding estimate gives
+
+```text
+D_u^n <= C_div(h) * ||vS^n||_H1
+       <= C_div(h) * C_mech^n * (F_base^n + Xi_zeta^n).
+```
+
+Hence a sufficient condition for keeping the kinematic step in the stable regime
+is
+
+```text
+1 / dt + c_u / C_P^2
+>
+(1/2) * C_div(h) * C_mech^n * (F_base^n + Xi_zeta^n).
+```
+
+Second, in the bulk CH regime the paper proves the one-step estimate
+
+```text
+dt < M_alpha * gamma_alpha * eps_alpha
+     / (C_P^2 ||vS^n||_Linf^2).
+```
+
+Again using a discrete embedding,
+
+```text
+||vS^n||_Linf <= C_inf(h) * C_mech^n * (F_base^n + Xi_zeta^n),
+```
+
+so a sufficient practical condition becomes
+
+```text
+dt
+<
+M_alpha * gamma_alpha * eps_alpha
+/
+(
+  C_P^2 * C_inf(h)^2 * (C_mech^n)^2 * (F_base^n + Xi_zeta^n)^2
+).
+```
+
+This shows exactly which parameters can compensate a larger `zeta`:
+
+- increase `gamma_alpha * eps_alpha`,
+- increase the extension coercivity constants `c_u` and `c_S`,
+- reduce `dt`,
+- and keep the discrete interface resolved so that `C_div(h)` and `C_inf(h)`
+  do not become the dominant source of instability/noise.
+
+### 5. Consequences for the actual Blauert controls
+
+For the current code path, these abstract constants translate as follows.
+
+1. `gamma_u` is analytically relevant.
+
+   In the Blauert implementation, `gamma_u` controls the displacement extension
+   and, by default, the mirrored skeleton-velocity extension as well.
+   So increasing `gamma_u` increases both coercivity constants that appear in
+   the paper analysis:
+
+   - `c_u` for the kinematic update,
+   - `c_S` for the skeleton part of the mechanics block.
+
+   This is therefore a genuine analytical counterweight to larger `zeta`.
+
+2. `gamma_div` is mainly algorithmic.
+
+   The added `gamma_div` term improves conditioning of the mixed solve and is
+   very useful numerically, but in the Brezzi coercivity proof it vanishes on
+   `ker(b^n)`. So it does **not** play the same role as `c_u`, `c_S`, or
+   `gamma_alpha * eps_alpha` in the analytical stability inequalities above.
+
+3. `eps` / `alpha_ch_eps` is the first parameter that should be paired with
+   `zeta`.
+
+   The diffuse traction is localized with `|grad alpha|`, so decreasing the
+   interface thickness while keeping `zeta` fixed makes the forcing more
+   concentrated. Analytically, the dangerous combination is `zeta^2 /
+   (gamma_alpha * eps_alpha)`.
+
+4. `q` is not part of the PDE stability theory.
+
+   The diffuse traction contains non-polynomial factors (`sqrt(|grad alpha|^2 +
+   eta)` and normalized tangents), so no finite quadrature degree is exact.
+   Quadrature choice is therefore a consistency/implementation issue, not part
+   of the one-step well-posedness analysis.
+
+5. Scalar `zeta` is the mathematically natural choice.
+
+   The added traction is defined in the interface tangent/normal frame, not in
+   the Cartesian frame. A separate `x`/`y` scale would be ad hoc and would not
+   align with the variational structure above. If a two-parameter extension is
+   ever needed, it should be "tangential vs normal", not "x vs y".
+
+### 6. Model-dependent upper bounds for `tau^n`
+
+The previous bounds use `||tau^n||_Linf`. For the currently available load
+closures:
+
+- `poiseuille`:
+
+  ```text
+  ||tau^n||_Linf <= 4 * mu_f * u_max / H,
+  ```
+
+  which is explicit and independent of the unknown fields.
+
+- `lagged_velocity`:
+
+  ```text
+  ||tau^n||_Linf <= 2 * mu_f * ||grad v^n||_Linf.
+  ```
+
+- `lagged_stress`:
+
+  ```text
+  ||tau^n||_Linf <= ||p^n||_Linf + 2 * mu_f * ||grad v^n||_Linf.
+  ```
+
+So the cleanest reviewer-facing analysis is for the `poiseuille` model. The
+`lagged_stress` branch can still be bounded, but only under stronger
+`Linf` assumptions on the frozen pressure and velocity gradient.
+
+### 7. Practical rule set for the transient study
+
+The analysis suggests the following order of operations for the transient
+Blauert campaign.
+
+1. Do **not** tune `zeta` in isolation.
+   Tune the combination
+
+   ```text
+   zeta^2 / (gamma_alpha * eps_alpha)
+   ```
+
+   instead.
+
+2. When increasing `zeta`, first increase `eps_alpha` (or `gamma_alpha`) enough
+   to keep the above ratio in the same ballpark.
+
+3. If the step then becomes kinematically fragile, increase `gamma_u`, because
+   that is the parameter that actually enlarges the coercivity constants in the
+   one-step proof.
+
+4. Use `gamma_div` to help the nonlinear algebra, but do not interpret it as the
+   main analytical stabilizer for `zeta`.
+
+5. Keep the mesh fine enough that the diffuse layer is resolved.
+   The paper's existing interface-resolution discussion still applies: one wants
+   several cells across the diffuse layer, i.e. practically `h <= O(eps_alpha)`,
+   rather than `h >> eps_alpha`.
+
+#### Bottom line
+
+The mathematically meaningful "zeta stability parameter" is not `zeta` alone.
+For the present benchmark it is
+
+```text
+zeta^2 / (gamma_alpha * eps_alpha),
+```
+
+with secondary control coming from the extension coercivity (`gamma_u`) and only
+algorithmic help from `gamma_div`.
+
+That is the right quantity to organize the next transient screening around.

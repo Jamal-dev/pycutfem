@@ -339,7 +339,7 @@ def run_elastic_disk_collision_with_wall(
             solver_vi.set_box_bounds(lower=lo_full, upper=hi_full)
         else:
             petsc_opts = {
-                "snes_type": "vinewtonssls",
+                "snes_type": "vinewtonrsls",
                 "snes_linesearch_type": "bt",
                 "snes_atol": 1.0e-10,
                 "snes_rtol": 0.0,

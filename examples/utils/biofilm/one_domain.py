@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 from pycutfem.ufl.expressions import (
     Constant,
+    Derivative,
     FacetNormal,
     Identity,
     Laplacian,
@@ -66,6 +67,10 @@ def _c(val: float) -> Constant:
     return Constant(float(val))
 
 
+def _as_constant(val) -> Constant:
+    return val if isinstance(val, Constant) else _c(float(val))
+
+
 def _sqrt(expr):
     return expr ** _c(0.5)
 
@@ -78,6 +83,12 @@ def _one_minus(expr):
 
 def _epsilon(v):
     return _c(0.5) * (grad(v) + grad(v).T)
+
+
+def _epsilon_component(v, i: int, j: int):
+    if int(i) == int(j):
+        return grad(v[i])[j]
+    return _c(0.5) * (grad(v[i])[j] + grad(v[j])[i])
 
 
 def _grad_inner_jump(u, v, n):
@@ -108,6 +119,81 @@ def _vector_component(vec_expr, idx: int):
 
 def _dot_2d_components(vec_expr, vec_test):
     return _vector_component(vec_expr, 0) * vec_test[0] + _vector_component(vec_expr, 1) * vec_test[1]
+
+
+def _grad_div_components(v_expr, *, dim: int):
+    """
+    Exact componentwise expansion of grad(div(v)).
+
+    In 2D:
+      [grad(div(v))]_0 = d_xx v_0 + d_xy v_1
+      [grad(div(v))]_1 = d_xy v_0 + d_yy v_1
+    """
+    if int(dim) != 2:
+        raise NotImplementedError("grad(div(v)) component expansion is currently implemented for 2D only.")
+    v0 = v_expr[0]
+    v1 = v_expr[1]
+    return (
+        Derivative(v0, 2, 0) + Derivative(v1, 1, 1),
+        Derivative(v0, 1, 1) + Derivative(v1, 0, 2),
+    )
+
+
+def _strong_div_2mu_eps_components(v_expr, mu_expr, grad_mu_components, *, dim: int):
+    """
+    Componentwise strong viscous operator div(2 mu eps(v)).
+
+    We expand
+        div(2 mu eps(v)) = mu (Delta v + grad(div v)) + 2 eps(v) grad(mu)
+    componentwise using primitive operators already exercised by the backends.
+    This avoids relying on tensor-divergence code paths for composite expressions.
+    """
+    lap_v = tuple(Laplacian(v_expr[i]) for i in range(int(dim)))
+    grad_div_v = _grad_div_components(v_expr, dim=int(dim))
+    comps = []
+    for i in range(int(dim)):
+        comp = mu_expr * (lap_v[i] + grad_div_v[i])
+        grad_part = _c(0.0)
+        for j in range(int(dim)):
+            grad_part += _c(2.0) * _epsilon_component(v_expr, i, j) * grad_mu_components[j]
+        comps.append(comp + grad_part)
+    return tuple(comps)
+
+
+def _d_strong_div_2mu_eps_components(
+    v_expr,
+    dv_expr,
+    mu_expr,
+    dmu_expr,
+    grad_mu_components,
+    grad_dmu_components,
+    *,
+    dim: int,
+):
+    """
+    Componentwise variation of div(2 mu eps(v)):
+        d[div(2 mu eps(v))]
+        = dmu (Delta v + grad(div v))
+          + mu (Delta dv + grad(div dv))
+          + 2 eps(dv) grad(mu)
+          + 2 eps(v) grad(dmu).
+    """
+    lap_v = tuple(Laplacian(v_expr[i]) for i in range(int(dim)))
+    lap_dv = tuple(Laplacian(dv_expr[i]) for i in range(int(dim)))
+    grad_div_v = _grad_div_components(v_expr, dim=int(dim))
+    grad_div_dv = _grad_div_components(dv_expr, dim=int(dim))
+    comps = []
+    for i in range(int(dim)):
+        comp = dmu_expr * (lap_v[i] + grad_div_v[i])
+        comp += mu_expr * (lap_dv[i] + grad_div_dv[i])
+        grad_part = _c(0.0)
+        for j in range(int(dim)):
+            grad_part += _c(2.0) * (
+                _epsilon_component(dv_expr, i, j) * grad_mu_components[j]
+                + _epsilon_component(v_expr, i, j) * grad_dmu_components[j]
+            )
+        comps.append(comp + grad_part)
+    return tuple(comps)
 
 
 def _smooth_pos(x, *, eta: float = 1.0e-12):
@@ -239,6 +325,8 @@ class BiofilmOneDomainForms:
     r_mu_alpha: object | None
     r_damage: object | None
     r_substrate: object
+    r_momentum_terms: dict[str, object] | None = None
+    r_kinematics_terms: dict[str, object] | None = None
     # Optional per-block Jacobian contributions (useful for debugging/verification)
     a_momentum: object | None = None
     a_mass: object | None = None
@@ -362,6 +450,8 @@ def build_biofilm_one_domain_forms(
     # - v_supg: fluid momentum convection stabilization
     # - u_supg: kinematic (u) transport stabilization
     v_supg: float = 0.0,
+    v_supg_mode: str = "streamline",
+    v_supg_c_nu: float = 4.0,
     u_supg: float = 0.0,
     # Optional CIP (interior penalty) stabilizations on the mesh skeleton:
     # - v_cip:  fluid velocity regularization (helps at moderate/high Re on coarse meshes)
@@ -791,6 +881,8 @@ def build_biofilm_one_domain_forms(
     # div(C v) = C div(v) + grad(C)·v, with grad(C) = (φ-1) grad(α) + α grad(φ)
     gradC_k = grad(alpha_k) * (phi_k - _c(1.0)) + grad(phi_k) * alpha_k
     gradC_n = grad(alpha_n) * (phi_n - _c(1.0)) + grad(phi_n) * alpha_n
+    gradC_k_components = tuple((phi_k - _c(1.0)) * grad(alpha_k)[i] + alpha_k * grad(phi_k)[i] for i in range(int(dim)))
+    gradC_n_components = tuple((phi_n - _c(1.0)) * grad(alpha_n)[i] + alpha_n * grad(phi_n)[i] for i in range(int(dim)))
 
     divCv_k = C_k * div(v_k) + dot(gradC_k, v_k)
     divCv_n = C_n * div(v_n) + dot(gradC_n, v_n)
@@ -798,6 +890,8 @@ def build_biofilm_one_domain_forms(
     # div(B vS) = B div(vS) + grad(B)·vS, with grad(B) = (1-φ) grad(α) - α grad(φ)
     gradB_k = grad(alpha_k) * _one_minus(phi_k) - grad(phi_k) * alpha_k
     gradB_n = grad(alpha_n) * _one_minus(phi_n) - grad(phi_n) * alpha_n
+    gradB_k_components = tuple(_one_minus(phi_k) * grad(alpha_k)[i] - alpha_k * grad(phi_k)[i] for i in range(int(dim)))
+    gradB_n_components = tuple(_one_minus(phi_n) * grad(alpha_n)[i] - alpha_n * grad(phi_n)[i] for i in range(int(dim)))
 
     divBvS_k = B_k * div_vS_k + dot(gradB_k, vS_k)
     divBvS_n = B_n * div_vS_n + dot(gradB_n, vS_n)
@@ -826,16 +920,54 @@ def build_biofilm_one_domain_forms(
     d_div_C_vtest_k = dC_k * div(v_test)
     d_div_B_vStest_k = dB_k * div(vS_test)
     if int(dim) == 2:
-        dgradC_k_x = (phi_k - _c(1.0)) * grad(dalpha)[0] + dphi * grad(alpha_k)[0] + dalpha * grad(phi_k)[0] + alpha_k * grad(dphi)[0]
-        dgradC_k_y = (phi_k - _c(1.0)) * grad(dalpha)[1] + dphi * grad(alpha_k)[1] + dalpha * grad(phi_k)[1] + alpha_k * grad(dphi)[1]
-        d_div_C_vtest_k += dgradC_k_x * v_test[0] + dgradC_k_y * v_test[1]
+        dgradC_k_components = (
+            (phi_k - _c(1.0)) * grad(dalpha)[0] + dphi * grad(alpha_k)[0] + dalpha * grad(phi_k)[0] + alpha_k * grad(dphi)[0],
+            (phi_k - _c(1.0)) * grad(dalpha)[1] + dphi * grad(alpha_k)[1] + dalpha * grad(phi_k)[1] + alpha_k * grad(dphi)[1],
+        )
+        d_div_C_vtest_k += dgradC_k_components[0] * v_test[0] + dgradC_k_components[1] * v_test[1]
 
-        dgradB_k_x = _one_minus(phi_k) * grad(dalpha)[0] - dphi * grad(alpha_k)[0] - dalpha * grad(phi_k)[0] - alpha_k * grad(dphi)[0]
-        dgradB_k_y = _one_minus(phi_k) * grad(dalpha)[1] - dphi * grad(alpha_k)[1] - dalpha * grad(phi_k)[1] - alpha_k * grad(dphi)[1]
-        d_div_B_vStest_k += dgradB_k_x * vS_test[0] + dgradB_k_y * vS_test[1]
+        dgradB_k_components = (
+            _one_minus(phi_k) * grad(dalpha)[0] - dphi * grad(alpha_k)[0] - dalpha * grad(phi_k)[0] - alpha_k * grad(dphi)[0],
+            _one_minus(phi_k) * grad(dalpha)[1] - dphi * grad(alpha_k)[1] - dalpha * grad(phi_k)[1] - alpha_k * grad(dphi)[1],
+        )
+        d_div_B_vStest_k += dgradB_k_components[0] * vS_test[0] + dgradB_k_components[1] * vS_test[1]
     else:
         d_div_C_vtest_k += dot(dgradC_k, v_test)
         d_div_B_vStest_k += dot(dgradB_k, vS_test)
+        dgradC_k_components = tuple(grad(dC_k)[i] for i in range(int(dim)))
+        dgradB_k_components = tuple(grad(dB_k)[i] for i in range(int(dim)))
+    if mu_b_key in {"mu", "const", "constant"}:
+        grad_mu_k = tuple(zero_scalar for _ in range(int(dim)))
+        grad_dmu = tuple(zero_scalar for _ in range(int(dim)))
+    elif mu_b_key in {"phi_mu", "phi*mu", "phi"}:
+        grad_mu_k = tuple(mu_f * ((phi_k - _c(1.0)) * grad(alpha_k)[i] + alpha_k * grad(phi_k)[i]) for i in range(int(dim)))
+        grad_dmu = tuple(
+            mu_f
+            * (
+                (phi_k - _c(1.0)) * grad(dalpha)[i]
+                + dphi * grad(alpha_k)[i]
+                + dalpha * grad(phi_k)[i]
+                + alpha_k * grad(dphi)[i]
+            )
+            for i in range(int(dim))
+        )
+    elif mu_b_key in {"alpha_mu", "alpha", "mu_b", "biofilm_mu", "biofilm"}:
+        coeff_mu = mu_b_expr - mu_f
+        grad_mu_k = tuple(coeff_mu * grad(alpha_k)[i] for i in range(int(dim)))
+        grad_dmu = tuple(coeff_mu * grad(dalpha)[i] for i in range(int(dim)))
+    elif mu_b_key in {"alpha_phi_mu", "alpha_phi", "alpha*phi_mu", "alpha*phi*mu"}:
+        coeff_a = phi_k * mu_b_expr - mu_f
+        coeff_phi = alpha_k * mu_b_expr
+        grad_mu_k = tuple(coeff_a * grad(alpha_k)[i] + coeff_phi * grad(phi_k)[i] for i in range(int(dim)))
+        grad_dmu = tuple(
+            coeff_a * grad(dalpha)[i]
+            + (mu_b_expr * dphi) * grad(alpha_k)[i]
+            + coeff_phi * grad(dphi)[i]
+            + (mu_b_expr * dalpha) * grad(phi_k)[i]
+            for i in range(int(dim))
+        )
+    else:
+        raise ValueError(f"Unknown mu_b_model {mu_b_model!r}.")
 
     # ------------------------------------------------------------------
     # (i) Momentum: conservative Navier–Stokes–Brinkman
@@ -853,53 +985,83 @@ def build_biofilm_one_domain_forms(
     div_rhov_k = rho_f * divCv_k
     div_rhov_n = rho_f * divCv_n
 
-    r_mom = inner(momdot, v_test) * dx
+    momentum_zero = _c(0.0) * dot(v_k, v_test) * dx
+    momentum_terms: dict[str, object] = {
+        "transient": inner(momdot, v_test) * dx,
+        "convection": momentum_zero,
+        "viscous": momentum_zero,
+        "pressure": momentum_zero,
+        "gamma_div": momentum_zero,
+        "drag": momentum_zero,
+        "traction": momentum_zero,
+        "body": momentum_zero,
+        "supg": momentum_zero,
+        "cip": momentum_zero,
+    }
+    r_mom = momentum_terms["transient"]
     if fluid_conv_key == "full":
         conv_k = dot(dot(grad(v_k), v_k), v_test)
         conv_n = dot(dot(grad(v_n), v_n), v_test)
-        r_mom += th * (rho_k * conv_k + div_rhov_k * dot(v_k, v_test)) * dx
-        r_mom += one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+        momentum_terms["convection"] = (
+            th * (rho_k * conv_k + div_rhov_k * dot(v_k, v_test)) * dx
+            + one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+        )
+        r_mom += momentum_terms["convection"]
     elif fluid_conv_key == "lagged":
         # Picard/IMEX-like linearization:
         #   div(ρ^n v^n ⊗ v^k) = ρ^n (v^n·∇)v^k + v^k div(ρ^n v^n)
         conv_k = dot(dot(grad(v_k), v_n), v_test)
         conv_n = dot(dot(grad(v_n), v_n), v_test)
-        r_mom += th * (rho_n * conv_k + div_rhov_n * dot(v_k, v_test)) * dx
-        r_mom += one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+        momentum_terms["convection"] = (
+            th * (rho_n * conv_k + div_rhov_n * dot(v_k, v_test)) * dx
+            + one_m_th * (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+        )
+        r_mom += momentum_terms["convection"]
     elif fluid_conv_key == "imex":
         # IMEX-style explicit convection: treat the convective term fully at the n-level
         # (no v^k dependence). This removes the non-symmetric convection block from the
         # Jacobian and can significantly improve robustness for long transient runs.
         conv_k = None
         conv_n = dot(dot(grad(v_n), v_n), v_test)
-        r_mom += (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+        momentum_terms["convection"] = (rho_n * conv_n + div_rhov_n * dot(v_n, v_test)) * dx
+        r_mom += momentum_terms["convection"]
     else:
         conv_k = None
-    r_mom += _c(2.0) * th * mu_k * inner(_epsilon(v_k), _epsilon(v_test)) * dx
-    r_mom += _c(2.0) * one_m_th * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
+    momentum_terms["viscous"] = (
+        _c(2.0) * th * mu_k * inner(_epsilon(v_k), _epsilon(v_test)) * dx
+        + _c(2.0) * one_m_th * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
+    )
+    r_mom += momentum_terms["viscous"]
     # Pressure term for the mixture constraint div(C v + B vS)=... :
     # variationally consistent fluid coupling is C grad(p), i.e.
     #   -(p, div(C w)) = -p (C div(w) + grad(C)·w)
     # which is the exact adjoint of the C v part of the constraint.
-    r_mom += -p_k * div_C_vtest_k * dx
+    momentum_terms["pressure"] = -p_k * div_C_vtest_k * dx
+    r_mom += momentum_terms["pressure"]
     if float(gamma_div) != 0.0:
-        gamma_div_c = _c(float(gamma_div))
+        gamma_div_c = _as_constant(gamma_div)
         # Consistent augmented-Lagrangian / grad-div stabilization for the mixture
         # volume constraint div(F)=0 with F=C v + B vS.
-        r_mom += gamma_div_c * divF_k * div_C_vtest_k * dx
+        momentum_terms["gamma_div"] = gamma_div_c * divF_k * div_C_vtest_k * dx
+        r_mom += momentum_terms["gamma_div"]
     if drag_mode == "scalar":
-        r_mom += beta_k * dot(v_k, v_test) * dx
-        r_mom += -beta_k * dot(vS_k, v_test) * dx
+        momentum_terms["drag"] = (beta_k * dot(v_k, v_test) - beta_k * dot(vS_k, v_test)) * dx
+        r_mom += momentum_terms["drag"]
     else:
-        r_mom += beta_coeff_k * dot(kdrag_k, v_test) * dx
+        momentum_terms["drag"] = beta_coeff_k * dot(kdrag_k, v_test) * dx
+        r_mom += momentum_terms["drag"]
     if dGamma is not None:
-        r_mom += -(th * _dot_2d_components(g_t_k, v_test) + one_m_th * _dot_2d_components(g_t_n, v_test)) * dGamma
+        momentum_terms["traction"] = -(th * _dot_2d_components(g_t_k, v_test) + one_m_th * _dot_2d_components(g_t_n, v_test)) * dGamma
+        r_mom += momentum_terms["traction"]
     if traction_weight_k is not None or traction_weight_n is not None:
-        r_mom += -(
+        traction_volume = -(
             th * traction_weight_k * _dot_2d_components(g_t_k, v_test)
             + one_m_th * traction_weight_n * _dot_2d_components(g_t_n, v_test)
         ) * dx
-    r_mom += -dot(f_v, v_test) * dx
+        momentum_terms["traction"] = momentum_terms["traction"] + traction_volume
+        r_mom += traction_volume
+    momentum_terms["body"] = -dot(f_v, v_test) * dx
+    r_mom += momentum_terms["body"]
 
     a_mom = inv_dt * (drho * dot(v_k, v_test) + rho_k * dot(dv, v_test)) * dx
 
@@ -929,7 +1091,7 @@ def build_biofilm_one_domain_forms(
     # with δ(div(C w)) = δC div(w) + δgrad(C)·w for fixed test w.
     a_mom += -(dp * div_C_vtest_k + p_k * d_div_C_vtest_k) * dx
     if float(gamma_div) != 0.0:
-        gamma_div_c = _c(float(gamma_div))
+        gamma_div_c = _as_constant(gamma_div)
         d_divF_k = d_divCv_k + d_divBvS_k
         a_mom += gamma_div_c * (d_divF_k * div_C_vtest_k + divF_k * d_div_C_vtest_k) * dx
     if drag_mode == "scalar":
@@ -940,12 +1102,15 @@ def build_biofilm_one_domain_forms(
         a_mom += dbeta_coeff * dot(kdrag_k, v_test) * dx
         a_mom += beta_coeff_k * dot(dkdrag_k, v_test) * dx
 
-    # Optional SUPG-like streamline diffusion for the fluid convection term.
+    # Optional SUPG-like stabilization for the fluid momentum equation.
     #
-    # This is a conservative, easy-to-linearize variant:
-    #   τ ( (v^n·∇)v^k , (v^n·∇)w ) in the fluid region.
-    #
-    # It is primarily intended as a robustness knob for long transient runs.
+    # Modes:
+    # - "streamline" (legacy): τ ((v^n·∇)v^k, (v^n·∇)w)
+    # - "residual":  τ (R_mom,strong, (v^n·∇)w), where R_mom,strong uses the same
+    #                 current-iterate momentum operator as the implicit part of the
+    #                 time-discrete residual (plus lagged explicit terms for IMEX/lagged
+    #                 convection choices). The streamline test direction and τ remain
+    #                 lagged for robustness.
     if float(v_supg) != 0.0:
         rho_f_val = None
         try:
@@ -959,17 +1124,187 @@ def build_biofilm_one_domain_forms(
             pass
         else:
             h_v = MeshSize()
-            vmag2 = v_n[0] * v_n[0] + v_n[1] * v_n[1]
-            vmag = _sqrt(vmag2 + _c(1.0e-12))
-            # Standard SUPG scaling: τ ~ h^2 / (ν + h|v| + h^2/dt).
-            nu_f = mu_f / rho_f
-            denom = _c(6.0) * nu_f + h_v * vmag + (h_v * h_v) * inv_dt
-            tau_v = _c(float(v_supg)) * (h_v * h_v) / (denom + _c(1.0e-16))
-            w_v = _one_minus(alpha_n)  # lagged "fluid-only" localization
-            adv_v_k = dot(grad(v_k), v_n)
-            adv_w = dot(grad(v_test), v_n)
-            r_mom += tau_v * w_v * inner(adv_v_k, adv_w) * dx
-            a_mom += tau_v * w_v * inner(dot(grad(dv), v_n), adv_w) * dx
+            h_v_safe = h_v + _c(1.0e-16)
+            h_v2_safe = (h_v * h_v) + _c(1.0e-16)
+            adv_w_components = []
+            for i in range(int(dim)):
+                comp = _c(0.0)
+                for j in range(int(dim)):
+                    comp += grad(v_test[i])[j] * v_n[j]
+                adv_w_components.append(comp)
+            v_supg_mode_key = str(v_supg_mode or "streamline").strip().lower()
+            if v_supg_mode_key in {"streamline", "weak", "legacy"}:
+                vmag2 = v_n[0] * v_n[0] + v_n[1] * v_n[1]
+                vmag = _sqrt(vmag2 + _c(1.0e-12))
+                rho_safe = rho_n + _c(1.0e-16)
+                nu_eff = mu_n / rho_safe
+                if drag_mode == "scalar":
+                    drag_rate = beta_n / rho_safe
+                else:
+                    # Use the scalar prefactor as the local reaction-rate scale when the
+                    # drag operator is anisotropic.
+                    drag_rate = beta_coeff_n / rho_safe
+                time_scale = _c(2.0) * inv_dt
+                adv_scale = _c(2.0) * vmag / h_v_safe
+                diff_scale = _c(float(v_supg_c_nu)) * nu_eff / h_v2_safe
+                tau_v = _c(float(v_supg)) / _sqrt(
+                    time_scale * time_scale
+                    + adv_scale * adv_scale
+                    + diff_scale * diff_scale
+                    + drag_rate * drag_rate
+                    + _c(1.0e-16)
+                )
+                w_v = _one_minus(alpha_n)  # legacy lagged "fluid-only" localization
+                adv_v_k = dot(grad(v_k), v_n)
+                adv_w = dot(grad(v_test), v_n)
+                momentum_terms["supg"] = tau_v * w_v * inner(adv_v_k, adv_w) * dx
+                r_mom += momentum_terms["supg"]
+                a_mom += tau_v * w_v * inner(dot(grad(dv), v_n), adv_w) * dx
+            elif v_supg_mode_key in {"residual", "strong", "strong_residual", "strong-residual"}:
+                # Current-iterate Green's-function tau: use the same k-level
+                # transport/reaction coefficients in the residual and Jacobian so the
+                # SUPG block is a true Newton linearization, not a quasi-Newton lag.
+                vmag2_k = _c(0.0)
+                for j in range(int(dim)):
+                    vmag2_k += v_k[j] * v_k[j]
+                vmag_k = _sqrt(vmag2_k + _c(1.0e-12))
+                d_vmag2_k = _c(0.0)
+                for j in range(int(dim)):
+                    d_vmag2_k += _c(2.0) * v_k[j] * dv[j]
+                d_vmag_k = (_c(0.5) / vmag_k) * d_vmag2_k
+
+                rho_safe_k = rho_k + _c(1.0e-16)
+                rho_safe_k_sq = rho_safe_k * rho_safe_k
+                nu_eff_k = mu_k / rho_safe_k
+                d_nu_eff_k = (dmu * rho_safe_k - mu_k * drho) / rho_safe_k_sq
+                if drag_mode == "scalar":
+                    drag_rate_k = beta_k / rho_safe_k
+                    d_drag_rate_k = (dbeta * rho_safe_k - beta_k * drho) / rho_safe_k_sq
+                else:
+                    drag_rate_k = beta_coeff_k / rho_safe_k
+                    d_drag_rate_k = (dbeta_coeff * rho_safe_k - beta_coeff_k * drho) / rho_safe_k_sq
+
+                time_scale = _c(2.0) * inv_dt
+                adv_scale_k = _c(2.0) * vmag_k / h_v_safe
+                d_adv_scale_k = _c(2.0) * d_vmag_k / h_v_safe
+                diff_scale_k = _c(float(v_supg_c_nu)) * nu_eff_k / h_v2_safe
+                d_diff_scale_k = _c(float(v_supg_c_nu)) * d_nu_eff_k / h_v2_safe
+                tau_denom = (
+                    time_scale * time_scale
+                    + adv_scale_k * adv_scale_k
+                    + diff_scale_k * diff_scale_k
+                    + drag_rate_k * drag_rate_k
+                    + _c(1.0e-16)
+                )
+                d_tau_denom = (
+                    _c(2.0) * adv_scale_k * d_adv_scale_k
+                    + _c(2.0) * diff_scale_k * d_diff_scale_k
+                    + _c(2.0) * drag_rate_k * d_drag_rate_k
+                )
+                tau_v = _c(float(v_supg)) / _sqrt(tau_denom)
+                d_tau_v = -_c(0.5) * tau_v * d_tau_denom / tau_denom
+                w_v = _one_minus(alpha_k)
+                dw_v = -dalpha
+
+                adv_w_components = []
+                d_adv_w_components = []
+                for i in range(int(dim)):
+                    comp = _c(0.0)
+                    dcomp = _c(0.0)
+                    for j in range(int(dim)):
+                        comp += grad(v_test[i])[j] * v_k[j]
+                        dcomp += grad(v_test[i])[j] * dv[j]
+                    adv_w_components.append(comp)
+                    d_adv_w_components.append(dcomp)
+
+                strong_visc_k = _strong_div_2mu_eps_components(v_k, mu_k, grad_mu_k, dim=int(dim))
+                d_strong_visc_k = _d_strong_div_2mu_eps_components(
+                    v_k,
+                    dv,
+                    mu_k,
+                    dmu,
+                    grad_mu_k,
+                    grad_dmu,
+                    dim=int(dim),
+                )
+                d_div_rhov_k = rho_f * d_divCv_k
+
+                strong_mom_comp_k = []
+                d_strong_mom_comp_k = []
+                for i in range(int(dim)):
+                    comp_k = rho_k * (v_k[i] - v_n[i]) * inv_dt
+                    dcomp_k = drho * (v_k[i] - v_n[i]) * inv_dt + rho_k * dv[i] * inv_dt
+
+                    if fluid_conv_key == "full":
+                        adv_supg_comp = _c(0.0)
+                        d_adv_supg_comp = _c(0.0)
+                        for j in range(int(dim)):
+                            adv_supg_comp += grad(v_k[i])[j] * v_k[j]
+                            d_adv_supg_comp += grad(dv[i])[j] * v_k[j] + grad(v_k[i])[j] * dv[j]
+                        comp_k += rho_k * adv_supg_comp + div_rhov_k * v_k[i]
+                        dcomp_k += drho * adv_supg_comp + rho_k * d_adv_supg_comp + d_div_rhov_k * v_k[i] + div_rhov_k * dv[i]
+                    elif fluid_conv_key == "lagged":
+                        adv_supg_comp = _c(0.0)
+                        d_adv_supg_comp = _c(0.0)
+                        for j in range(int(dim)):
+                            adv_supg_comp += grad(v_k[i])[j] * v_n[j]
+                            d_adv_supg_comp += grad(dv[i])[j] * v_n[j]
+                        comp_k += rho_n * adv_supg_comp + div_rhov_n * v_k[i]
+                        dcomp_k += rho_n * d_adv_supg_comp + div_rhov_n * dv[i]
+                    elif fluid_conv_key == "imex":
+                        adv_supg_comp_n = _c(0.0)
+                        for j in range(int(dim)):
+                            adv_supg_comp_n += grad(v_n[i])[j] * v_n[j]
+                        comp_k += rho_n * adv_supg_comp_n + div_rhov_n * v_n[i]
+
+                    comp_k += -strong_visc_k[i]
+                    dcomp_k += -d_strong_visc_k[i]
+
+                    # The pressure split is constraint-adjoint:
+                    #   fluid block carries C grad(p), skeleton block carries B grad(p),
+                    # with C+B=1 recovering the total pressure gradient when the two
+                    # momentum equations are combined. The weak form already stores the
+                    # adjoint term as -p div(C w); the corresponding strong operator for
+                    # residual-based SUPG is therefore C grad(p), not grad(C p).
+                    comp_k += C_k * grad(p_k)[i]
+                    dcomp_k += dC * grad(p_k)[i] + C_k * grad(dp)[i]
+
+                    if drag_mode == "scalar":
+                        comp_k += beta_k * (v_k[i] - vS_k[i])
+                        dcomp_k += dbeta * (v_k[i] - vS_k[i]) + beta_k * (dv[i] - dvS[i])
+                    else:
+                        comp_k += beta_coeff_k * kdrag_k[i]
+                        dcomp_k += dbeta_coeff * kdrag_k[i] + beta_coeff_k * dkdrag_k[i]
+
+                    if traction_weight_k is not None or traction_weight_n is not None:
+                        comp_k += -(
+                            th * traction_weight_k * _vector_component(g_t_k, i)
+                            + one_m_th * traction_weight_n * _vector_component(g_t_n, i)
+                        )
+                    comp_k += -_vector_component(f_v, i)
+
+                    strong_mom_comp_k.append(comp_k)
+                    d_strong_mom_comp_k.append(dcomp_k)
+
+                strong_supg_proj = _c(0.0)
+                d_strong_supg_proj = _c(0.0)
+                for i in range(int(dim)):
+                    strong_supg_proj += strong_mom_comp_k[i] * adv_w_components[i]
+                    d_strong_supg_proj += d_strong_mom_comp_k[i] * adv_w_components[i]
+                    d_strong_supg_proj += strong_mom_comp_k[i] * d_adv_w_components[i]
+
+                momentum_terms["supg"] = tau_v * w_v * strong_supg_proj * dx
+                r_mom += momentum_terms["supg"]
+                a_mom += (
+                    d_tau_v * w_v * strong_supg_proj
+                    + tau_v * dw_v * strong_supg_proj
+                    + tau_v * w_v * d_strong_supg_proj
+                ) * dx
+            else:
+                raise ValueError(
+                    f"Unknown v_supg_mode={v_supg_mode!r}. "
+                    "Use 'streamline' (legacy) or 'residual' (strong-residual SUPG)."
+                )
 
     # Optional CIP (continuous interior penalty) stabilization for the fluid velocity.
     # This is a consistent high-frequency regularization that can improve robustness on coarse meshes.
@@ -978,7 +1313,8 @@ def build_biofilm_one_domain_forms(
         h_F = avg(MeshSize())
         tau_cip = _c(float(v_cip)) * (h_F * h_F * h_F) * inv_dt
         w_v = avg(_one_minus(alpha_n))
-        r_mom += tau_cip * w_v * _grad_inner_jump(v_k, v_test, n_int) * ds_cip
+        momentum_terms["cip"] = tau_cip * w_v * _grad_inner_jump(v_k, v_test, n_int) * ds_cip
+        r_mom += momentum_terms["cip"]
         a_mom += tau_cip * w_v * _grad_inner_jump(dv, v_test, n_int) * ds_cip
 
     # ------------------------------------------------------------------
@@ -1171,7 +1507,7 @@ def build_biofilm_one_domain_forms(
     r_skel_press_k = -p_k * div_B_vStest_k
     r_skel_press_n = -p_n * div_B_vStest_n
     if float(gamma_div) != 0.0:
-        gamma_div_c = _c(float(gamma_div))
+        gamma_div_c = _as_constant(gamma_div)
         # Consistent augmented-Lagrangian stabilization for the mixture constraint
         # div(F)=0 with F=C v + B vS. The vS variation contributes div(B η).
         r_skel_press_k += gamma_div_c * divF_k * div_B_vStest_k
@@ -1318,7 +1654,7 @@ def build_biofilm_one_domain_forms(
     # Jacobian of the pressure coupling -p div(B η).
     a_skel += sk_th * (-(dp * div_B_vStest_k + p_k * d_div_B_vStest_k)) * dx
     if float(gamma_div) != 0.0:
-        gamma_div_c = _c(float(gamma_div))
+        gamma_div_c = _as_constant(gamma_div)
         d_divF_k = d_divCv_k + d_divBvS_k
         a_skel += sk_th * gamma_div_c * (d_divF_k * div_B_vStest_k + divF_k * d_div_B_vStest_k) * dx
     # Drag term is *not* multiplied by alpha again: beta already contains alpha (one-domain blend).
@@ -1535,7 +1871,14 @@ def build_biofilm_one_domain_forms(
     Fkin_adv_n = dot(grad(u_n), vS_n) - vS_n
     Fkin_k = Fkin_dt + th * Fkin_adv_k + one_m_th * Fkin_adv_n
 
-    r_kinematics = kin_scale_c * alpha_k * dot(Fkin_k, u_test) * dx
+    kinematics_zero = kin_scale_c * _c(0.0) * dot(u_k, u_test) * dx
+    kinematics_terms: dict[str, object] = {
+        "base": kin_scale_c * alpha_k * dot(Fkin_k, u_test) * dx,
+        "supg": kinematics_zero,
+        "extension": kinematics_zero,
+        "cip": kinematics_zero,
+    }
+    r_kinematics = kinematics_terms["base"]
 
     # Jacobian (k-part only)
     dFkin_dt = du * inv_dt
@@ -1556,7 +1899,8 @@ def build_biofilm_one_domain_forms(
         w_u = alpha_n  # lagged "solid-only" localization
         adv_u_k = dot(grad(u_k), vS_n)
         adv_xi = dot(grad(u_test), vS_n)
-        r_kinematics += kin_scale_c * tau_u * w_u * inner(adv_u_k, adv_xi) * dx
+        kinematics_terms["supg"] = kin_scale_c * tau_u * w_u * inner(adv_u_k, adv_xi) * dx
+        r_kinematics += kinematics_terms["supg"]
         a_kinematics += kin_scale_c * tau_u * w_u * inner(dot(grad(du), vS_n), adv_xi) * dx
 
     # Optional extension penalty to keep u well-posed in the free-fluid region (α≈0).
@@ -1565,12 +1909,16 @@ def build_biofilm_one_domain_forms(
         if u_ext_mode in {"l2", "mass"}:
             h_u = MeshSize()
             inv_h2 = _c(1.0) / (h_u * h_u)
-            r_kinematics += kin_scale_c * gamma_u_c * inv_h2 * _one_minus(alpha_k) * dot(u_k, u_test) * dx
+            extension_term = kin_scale_c * gamma_u_c * inv_h2 * _one_minus(alpha_k) * dot(u_k, u_test) * dx
+            kinematics_terms["extension"] = kinematics_terms["extension"] + extension_term
+            r_kinematics += extension_term
             a_kinematics += kin_scale_c * gamma_u_c * inv_h2 * (
                 (-_c(1.0) * dalpha) * dot(u_k, u_test) + _one_minus(alpha_k) * dot(du, u_test)
             ) * dx
         elif u_ext_mode in {"grad", "h1"}:
-            r_kinematics += kin_scale_c * gamma_u_c * _one_minus(alpha_k) * inner(grad(u_k), grad(u_test)) * dx
+            extension_term = kin_scale_c * gamma_u_c * _one_minus(alpha_k) * inner(grad(u_k), grad(u_test)) * dx
+            kinematics_terms["extension"] = kinematics_terms["extension"] + extension_term
+            r_kinematics += extension_term
             a_kinematics += kin_scale_c * gamma_u_c * (
                 (-_c(1.0) * dalpha) * inner(grad(u_k), grad(u_test)) + _one_minus(alpha_k) * inner(grad(du), grad(u_test))
             ) * dx
@@ -1582,7 +1930,9 @@ def build_biofilm_one_domain_forms(
                 w_pin = _one_minus(alpha_k)
                 w_pin2 = w_pin * w_pin
                 dw_pin2 = (-_c(2.0) * w_pin) * dalpha
-                r_kinematics += kin_scale_c * pin_c * inv_h2 * w_pin2 * dot(u_k, u_test) * dx
+                pin_term = kin_scale_c * pin_c * inv_h2 * w_pin2 * dot(u_k, u_test) * dx
+                kinematics_terms["extension"] = kinematics_terms["extension"] + pin_term
+                r_kinematics += pin_term
                 a_kinematics += kin_scale_c * pin_c * inv_h2 * (dw_pin2 * dot(u_k, u_test) + w_pin2 * dot(du, u_test)) * dx
         else:
             raise ValueError(f"Unknown u_extension_mode {u_extension_mode!r}.")
@@ -1606,7 +1956,8 @@ def build_biofilm_one_domain_forms(
             raise ValueError(
                 f"Unknown u_cip_weight={u_cip_weight!r}. Use 'fluid' (default), 'biofilm', or 'both'."
             )
-        r_kinematics += kin_scale_c * tau_u_cip * w_u_cip * _grad_inner_jump(u_k, u_test, n_int) * ds_cip
+        kinematics_terms["cip"] = kin_scale_c * tau_u_cip * w_u_cip * _grad_inner_jump(u_k, u_test, n_int) * ds_cip
+        r_kinematics += kinematics_terms["cip"]
         a_kinematics += kin_scale_c * tau_u_cip * w_u_cip * _grad_inner_jump(du, u_test, n_int) * ds_cip
 
     # ------------------------------------------------------------------
@@ -2514,8 +2865,10 @@ def build_biofilm_one_domain_forms(
         jacobian_form=jacobian_form,
         residual_form=residual_form,
         r_momentum=r_mom,
+        r_momentum_terms=momentum_terms,
         r_mass=r_mass,
         r_kinematics=r_kinematics,
+        r_kinematics_terms=kinematics_terms,
         r_skeleton=r_skeleton,
         r_phi=r_phi,
         r_alpha=r_alpha,

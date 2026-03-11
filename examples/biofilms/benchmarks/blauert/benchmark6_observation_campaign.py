@@ -36,7 +36,27 @@ class CampaignCase:
     args: list[str]
 
 
-def _build_cases(run_root: Path) -> list[CampaignCase]:
+def _build_cases(
+    run_root: Path,
+    *,
+    backend: str,
+    kinematics_scale: float,
+    v_supg: float,
+    v_supg_mode: str,
+    v_supg_c_nu: float,
+    u_supg: float,
+    u_cip: float,
+    u_cip_weight: str,
+    v_cip: float,
+    vS_cip: float,
+    gamma_div: float,
+    adaptive_gamma_div: bool,
+    gamma_div_max: float,
+    alpha_ch_eps: float,
+    scale_alpha_ch_eps_with_zeta: bool,
+    diffuse_shear_scale_ref: float,
+    vtk_every: int,
+) -> list[CampaignCase]:
     steady_common = [
         "--observation-scenarios",
         "steady_dian",
@@ -44,18 +64,44 @@ def _build_cases(run_root: Path) -> list[CampaignCase]:
         "pdas",
         "--ls-mode",
         "dealii",
+        "--backend",
+        str(backend),
         "--gamma-u",
         "5.0",
         "--u-extension",
         "l2",
         "--gamma-u-pin",
         "1e-4",
+        "--kinematics-scale",
+        str(float(kinematics_scale)),
+        "--v-supg",
+        str(float(v_supg)),
+        "--v-supg-mode",
+        str(v_supg_mode),
+        "--v-supg-c-nu",
+        str(float(v_supg_c_nu)),
+        "--u-supg",
+        str(float(u_supg)),
+        "--u-cip",
+        str(float(u_cip)),
+        "--u-cip-weight",
+        str(u_cip_weight),
+        "--v-cip",
+        str(float(v_cip)),
+        "--vS-cip",
+        str(float(vS_cip)),
         "--rho-f",
         "0",
         "--phi-b",
         "0.47",
+        "--alpha-ch-eps",
+        str(float(alpha_ch_eps)),
+        "--diffuse-shear-scale-ref",
+        str(float(diffuse_shear_scale_ref)),
         "--gamma-div",
-        "1e-2",
+        str(float(gamma_div)),
+        "--gamma-div-max",
+        str(float(gamma_div_max)),
         "--q",
         "4",
         "--dt",
@@ -74,7 +120,13 @@ def _build_cases(run_root: Path) -> list[CampaignCase]:
         "--refine-expand-layers",
         "1",
         "--skip-existing",
+        "--vtk-every",
+        str(int(vtk_every)),
     ]
+    steady_common.append("--adaptive-gamma-div" if bool(adaptive_gamma_div) else "--no-adaptive-gamma-div")
+    steady_common.append(
+        "--scale-alpha-ch-eps-with-zeta" if bool(scale_alpha_ch_eps_with_zeta) else "--no-scale-alpha-ch-eps-with-zeta"
+    )
     dynamic08_common = [
         "--observation-scenarios",
         "dynamic_08pa",
@@ -82,20 +134,46 @@ def _build_cases(run_root: Path) -> list[CampaignCase]:
         "pdas",
         "--ls-mode",
         "dealii",
+        "--backend",
+        str(backend),
         "--gamma-u",
         "5.0",
         "--u-extension",
         "l2",
         "--gamma-u-pin",
         "1e-4",
+        "--kinematics-scale",
+        str(float(kinematics_scale)),
+        "--v-supg",
+        str(float(v_supg)),
+        "--v-supg-mode",
+        str(v_supg_mode),
+        "--v-supg-c-nu",
+        str(float(v_supg_c_nu)),
+        "--u-supg",
+        str(float(u_supg)),
+        "--u-cip",
+        str(float(u_cip)),
+        "--u-cip-weight",
+        str(u_cip_weight),
+        "--v-cip",
+        str(float(v_cip)),
+        "--vS-cip",
+        str(float(vS_cip)),
         "--rho-f",
         "1000",
         "--u-avg",
         "0.1777777778",
         "--phi-b",
         "0.47",
+        "--alpha-ch-eps",
+        str(float(alpha_ch_eps)),
+        "--diffuse-shear-scale-ref",
+        str(float(diffuse_shear_scale_ref)),
         "--gamma-div",
-        "1e-2",
+        str(float(gamma_div)),
+        "--gamma-div-max",
+        str(float(gamma_div_max)),
         "--q",
         "4",
         "--dt",
@@ -112,7 +190,13 @@ def _build_cases(run_root: Path) -> list[CampaignCase]:
         "--refine-expand-layers",
         "1",
         "--skip-existing",
+        "--vtk-every",
+        str(int(vtk_every)),
     ]
+    dynamic08_common.append("--adaptive-gamma-div" if bool(adaptive_gamma_div) else "--no-adaptive-gamma-div")
+    dynamic08_common.append(
+        "--scale-alpha-ch-eps-with-zeta" if bool(scale_alpha_ch_eps_with_zeta) else "--no-scale-alpha-ch-eps-with-zeta"
+    )
     dynamic164_common = [
         "--observation-scenarios",
         "dynamic_164pa",
@@ -120,20 +204,46 @@ def _build_cases(run_root: Path) -> list[CampaignCase]:
         "pdas",
         "--ls-mode",
         "dealii",
+        "--backend",
+        str(backend),
         "--gamma-u",
         "5.0",
         "--u-extension",
         "l2",
         "--gamma-u-pin",
         "1e-4",
+        "--kinematics-scale",
+        str(float(kinematics_scale)),
+        "--v-supg",
+        str(float(v_supg)),
+        "--v-supg-mode",
+        str(v_supg_mode),
+        "--v-supg-c-nu",
+        str(float(v_supg_c_nu)),
+        "--u-supg",
+        str(float(u_supg)),
+        "--u-cip",
+        str(float(u_cip)),
+        "--u-cip-weight",
+        str(u_cip_weight),
+        "--v-cip",
+        str(float(v_cip)),
+        "--vS-cip",
+        str(float(vS_cip)),
         "--rho-f",
         "1000",
         "--u-avg",
         "0.3644444444",
         "--phi-b",
         "0.66",
+        "--alpha-ch-eps",
+        str(float(alpha_ch_eps)),
+        "--diffuse-shear-scale-ref",
+        str(float(diffuse_shear_scale_ref)),
         "--gamma-div",
-        "1e-2",
+        str(float(gamma_div)),
+        "--gamma-div-max",
+        str(float(gamma_div_max)),
         "--q",
         "4",
         "--dt",
@@ -152,7 +262,13 @@ def _build_cases(run_root: Path) -> list[CampaignCase]:
         "--refine-expand-layers",
         "1",
         "--skip-existing",
+        "--vtk-every",
+        str(int(vtk_every)),
     ]
+    dynamic164_common.append("--adaptive-gamma-div" if bool(adaptive_gamma_div) else "--no-adaptive-gamma-div")
+    dynamic164_common.append(
+        "--scale-alpha-ch-eps-with-zeta" if bool(scale_alpha_ch_eps_with_zeta) else "--no-scale-alpha-ch-eps-with-zeta"
+    )
     return [
         CampaignCase(
             name="steady_calibration_refined",
@@ -292,12 +408,134 @@ def main() -> None:
         default=1,
         help="Checkpoint write frequency forwarded to the wrapper.",
     )
+    ap.add_argument(
+        "--gamma-div",
+        type=float,
+        default=5.0e-2,
+        help="Consistent mixed-block grad-div / augmented-Lagrangian strength forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--backend",
+        type=str,
+        default="cpp",
+        choices=("python", "jit", "cpp"),
+        help="Assembly backend forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--v-supg",
+        type=float,
+        default=0.0,
+        help="Fluid-momentum SUPG-like streamline diffusion forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--v-supg-mode",
+        type=str,
+        default="streamline",
+        choices=("streamline", "residual"),
+        help="Fluid momentum stabilization form forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--v-supg-c-nu",
+        type=float,
+        default=4.0,
+        help="Viscous constant c_nu in the Green's-function elemental tau forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--kinematics-scale",
+        type=float,
+        default=float("nan"),
+        help="Scaling applied to the kinematic constraint, forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--u-supg",
+        type=float,
+        default=0.0,
+        help="SUPG strength for the kinematic u-transport equation, forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--u-cip",
+        type=float,
+        default=0.0,
+        help="CIP strength for the kinematic u-transport equation, forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--u-cip-weight",
+        type=str,
+        default="biofilm",
+        choices=("fluid", "biofilm", "both"),
+        help="Localization used by --u-cip, forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--v-cip",
+        type=float,
+        default=0.0,
+        help="Continuous-interior-penalty stabilization strength forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--vS-cip",
+        type=float,
+        default=0.0,
+        help="Continuous-interior-penalty stabilization strength for skeleton velocity, forwarded to the wrapper.",
+    )
+    ap.add_argument(
+        "--adaptive-gamma-div",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Forward the Benchmark 6 adaptive gamma_div controller to the wrapper.",
+    )
+    ap.add_argument(
+        "--gamma-div-max",
+        type=float,
+        default=1.0e-1,
+        help="Upper cap forwarded to the wrapper's adaptive gamma_div controller.",
+    )
+    ap.add_argument("--alpha-ch-eps", type=float, default=2.0e-5, help="Forwarded baseline alpha CH eps.")
+    ap.add_argument(
+        "--scale-alpha-ch-eps-with-zeta",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Forward the zeta^2-based alpha CH eps scaling rule to the wrapper.",
+    )
+    ap.add_argument(
+        "--diffuse-shear-scale-ref",
+        type=float,
+        default=50.0,
+        help="Reference zeta used when scaling alpha CH eps with zeta.",
+    )
+    ap.add_argument(
+        "--vtk-every",
+        type=int,
+        default=-1,
+        help=(
+            "VTK write cadence forwarded to the wrapper. "
+            "Negative keeps the wrapper defaults (calibration off, finest production mesh every 10 steps)."
+        ),
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     run_root = (_REPO_ROOT / str(args.run_root)).resolve()
     selected = {part.strip() for part in str(args.cases).split(",") if part.strip()}
-    all_cases = _build_cases(run_root)
+    all_cases = _build_cases(
+        run_root,
+        backend=str(args.backend),
+        kinematics_scale=float(args.kinematics_scale),
+        v_supg=float(args.v_supg),
+        v_supg_mode=str(args.v_supg_mode),
+        v_supg_c_nu=float(args.v_supg_c_nu),
+        u_supg=float(args.u_supg),
+        u_cip=float(args.u_cip),
+        u_cip_weight=str(args.u_cip_weight),
+        v_cip=float(args.v_cip),
+        vS_cip=float(args.vS_cip),
+        gamma_div=float(args.gamma_div),
+        adaptive_gamma_div=bool(args.adaptive_gamma_div),
+        gamma_div_max=float(args.gamma_div_max),
+        alpha_ch_eps=float(args.alpha_ch_eps),
+        scale_alpha_ch_eps_with_zeta=bool(args.scale_alpha_ch_eps_with_zeta),
+        diffuse_shear_scale_ref=float(args.diffuse_shear_scale_ref),
+        vtk_every=int(args.vtk_every),
+    )
     chosen = [case for case in all_cases if case.name in selected]
     missing = sorted(selected - {case.name for case in all_cases})
     if missing:

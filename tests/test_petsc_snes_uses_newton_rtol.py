@@ -63,6 +63,11 @@ def test_petsc_snes_uses_newton_rtol() -> None:
 
     snes = getattr(solver, "_snes", None)
     assert snes is not None
-    _atol, rtol, _stol, _max_it, _max_funcs = snes.getTolerances()
+    tolerances = tuple(snes.getTolerances())
+    if len(tolerances) == 5:
+        rtol, _atol, _stol, _max_it, _max_funcs = tolerances
+    elif len(tolerances) == 4:
+        rtol, _atol, _stol, _max_it = tolerances
+    else:  # pragma: no cover - PETSc API guard
+        raise AssertionError(f"Unexpected SNES tolerance tuple length: {len(tolerances)}")
     assert float(rtol) == pytest.approx(float(newton_rtol))
-

@@ -665,7 +665,8 @@ def _restart_peek(path: Path) -> dict[str, float | int]:
         step = int(np.asarray(data["step"], dtype=int).ravel()[0])
         dt = float(np.asarray(data["dt"], dtype=float).ravel()[0])
         theta = float(np.asarray(data.get("theta", [1.0]), dtype=float).ravel()[0])
-    return {"t": t, "step": step, "dt": dt, "theta": theta}
+        gamma_div = float(np.asarray(data.get("gamma_div", [float("nan")]), dtype=float).ravel()[0])
+    return {"t": t, "step": step, "dt": dt, "theta": theta, "gamma_div": gamma_div}
 
 
 def _write_restart_checkpoint(
@@ -675,6 +676,7 @@ def _write_restart_checkpoint(
     step: int,
     dt: float,
     theta: float,
+    gamma_div: float,
     y_lines: np.ndarray,
     x_ref_global: float,
     x_ref: np.ndarray,
@@ -697,6 +699,7 @@ def _write_restart_checkpoint(
         step=int(step),
         dt=float(dt),
         theta=float(theta),
+        gamma_div=float(gamma_div),
         y_lines=np.asarray(y_lines, dtype=float).ravel(),
         x_ref_global=float(x_ref_global),
         x_ref=np.asarray(x_ref, dtype=float).ravel(),
@@ -763,6 +766,7 @@ def _load_restart_checkpoint(
             "step": int(np.asarray(data["step"], dtype=int).ravel()[0]),
             "dt": float(np.asarray(data["dt"], dtype=float).ravel()[0]),
             "theta": float(np.asarray(data.get("theta", [1.0]), dtype=float).ravel()[0]),
+            "gamma_div": float(np.asarray(data.get("gamma_div", [float("nan")]), dtype=float).ravel()[0]),
             "y_lines": np.asarray(data.get("y_lines", []), dtype=float).ravel(),
             "x_ref_global": float(np.asarray(data.get("x_ref_global", [float("nan")]), dtype=float).ravel()[0]),
             "x_ref": np.asarray(data.get("x_ref", []), dtype=float).ravel(),
@@ -1078,6 +1082,15 @@ def main() -> None:
         help="Scale factor applied to the diffuse-interface tangential shear traction.",
     )
     ap.add_argument(
+        "--diffuse-shear-scale-ref",
+        type=float,
+        default=50.0,
+        help=(
+            "Reference diffuse-traction scale used when --scale-alpha-ch-eps-with-zeta is enabled. "
+            "For |zeta| above this reference, alpha CH eps is increased like (|zeta|/zeta_ref)^2."
+        ),
+    )
+    ap.add_argument(
         "--diffuse-shear-model",
         type=str,
         default="lagged_velocity",
@@ -1133,6 +1146,26 @@ def main() -> None:
         help="SUPG-like streamline diffusion for fluid momentum convection (0 disables; typical 0.1–10).",
     )
     ap.add_argument(
+        "--v-supg-mode",
+        type=str,
+        default="streamline",
+        choices=("streamline", "residual"),
+        help=(
+            "Fluid momentum stabilization form for --v-supg: "
+            "'streamline' keeps the legacy weak streamline term, "
+            "'residual' uses a transient strong-residual SUPG term."
+        ),
+    )
+    ap.add_argument(
+        "--v-supg-c-nu",
+        type=float,
+        default=4.0,
+        help=(
+            "Viscous constant c_nu in the Green's-function-style elemental tau for "
+            "fluid SUPG: tau_K^{-2} contains (c_nu * (mu/rho) / h_K^2)^2."
+        ),
+    )
+    ap.add_argument(
         "--gamma-div",
         type=float,
         default=0.0,
@@ -1141,6 +1174,45 @@ def main() -> None:
             "div(C v + B vS)=0. Acts like a grad-div penalty and can improve conditioning "
             "for long transient runs (0 disables; typical ≈mu_f, e.g. 1e-3)."
         ),
+    )
+    ap.add_argument(
+        "--adaptive-gamma-div",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "At dt==dt_min, if a line-search failure is dominated by the momentum/skeleton block, "
+            "increase gamma_div and retry the same step from the current best iterate."
+        ),
+    )
+    ap.add_argument(
+        "--gamma-div-max",
+        type=float,
+        default=float("nan"),
+        help="Upper cap for adaptive gamma_div. Default: max(--gamma-div, 1e-1) when adaptation is enabled.",
+    )
+    ap.add_argument(
+        "--gamma-div-growth",
+        type=float,
+        default=2.0,
+        help="Multiplicative growth factor used when adaptive gamma_div is triggered.",
+    )
+    ap.add_argument(
+        "--gamma-div-relax-factor",
+        type=float,
+        default=0.5,
+        help="After enough easy accepted steps, relax adaptive gamma_div by this factor toward the baseline value.",
+    )
+    ap.add_argument(
+        "--gamma-div-relax-after",
+        type=int,
+        default=3,
+        help="Number of consecutive easy accepted steps required before relaxing adaptive gamma_div.",
+    )
+    ap.add_argument(
+        "--gamma-div-relax-newton-max",
+        type=int,
+        default=2,
+        help="Accepted steps with nNewton <= this threshold count as easy for adaptive gamma_div relaxation.",
     )
     ap.add_argument(
         "--fluid-convection",
@@ -1159,6 +1231,19 @@ def main() -> None:
         type=float,
         default=0.0,
         help="SUPG-like streamline diffusion for kinematic u-transport (0 disables; typical 0.1–10).",
+    )
+    ap.add_argument(
+        "--u-cip",
+        type=float,
+        default=0.0,
+        help="CIP stabilization strength for the kinematic u-transport equation (0 disables).",
+    )
+    ap.add_argument(
+        "--u-cip-weight",
+        type=str,
+        default="biofilm",
+        choices=("fluid", "biofilm", "both"),
+        help="Localization used by --u-cip: outside biofilm, inside biofilm, or both.",
     )
     ap.add_argument("--v-cip", type=float, default=0.0, help="CIP stabilization strength for fluid velocity (0 disables).")
     ap.add_argument("--vS-cip", type=float, default=0.0, help="CIP stabilization strength for skeleton velocity (0 disables).")
@@ -1202,6 +1287,15 @@ def main() -> None:
         type=float,
         default=float("nan"),
         help="Cahn–Hilliard eps (interface thickness). Default: use --eps.",
+    )
+    ap.add_argument(
+        "--scale-alpha-ch-eps-with-zeta",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Increase the effective alpha CH eps with the benchmark-local diffuse traction scale "
+            "to keep zeta^2/(gamma_alpha eps_alpha) from growing unchecked."
+        ),
     )
     ap.add_argument(
         "--alpha-ch-mobility",
@@ -1329,9 +1423,22 @@ def main() -> None:
         raise ValueError("--paper1-reduced requires --transport-mode pde.")
     if paper1_reduced and not ch_enabled:
         raise ValueError("--paper1-reduced requires nonzero --alpha-ch-M and --alpha-ch-gamma.")
-    alpha_ch_eps = float(getattr(args, "alpha_ch_eps", float("nan")))
-    if not np.isfinite(alpha_ch_eps):
-        alpha_ch_eps = float(getattr(args, "eps", 1.0))
+    alpha_ch_eps_base = float(getattr(args, "alpha_ch_eps", float("nan")))
+    if not np.isfinite(alpha_ch_eps_base):
+        alpha_ch_eps_base = float(getattr(args, "eps", 1.0))
+    scale_alpha_ch_eps_with_zeta = bool(getattr(args, "scale_alpha_ch_eps_with_zeta", False)) and bool(
+        getattr(args, "diffuse_shear_traction", False)
+    )
+    diffuse_shear_scale_ref = float(getattr(args, "diffuse_shear_scale_ref", 50.0))
+    alpha_ch_eps_scale_factor = 1.0
+    if scale_alpha_ch_eps_with_zeta:
+        if (not np.isfinite(diffuse_shear_scale_ref)) or diffuse_shear_scale_ref <= 0.0:
+            raise ValueError("--diffuse-shear-scale-ref must be positive when --scale-alpha-ch-eps-with-zeta is enabled.")
+        alpha_ch_eps_scale_factor = max(
+            1.0,
+            (abs(float(getattr(args, "diffuse_shear_scale", 0.0))) / float(diffuse_shear_scale_ref)) ** 2,
+        )
+    alpha_ch_eps = float(alpha_ch_eps_base) * float(alpha_ch_eps_scale_factor)
 
     use_alpha_phi_vi_bounds = bool(
         (transport_mode == "pde")
@@ -1354,6 +1461,22 @@ def main() -> None:
     restart_meta: dict[str, float | int] | None = None
     if restart_from is not None:
         restart_meta = _restart_peek(restart_from)
+
+    gamma_div_base = float(args.gamma_div)
+    adaptive_gamma_div = bool(getattr(args, "adaptive_gamma_div", False))
+    gamma_div_restart = float(restart_meta.get("gamma_div", float("nan"))) if restart_meta is not None else float("nan")
+    gamma_div_init = gamma_div_base
+    if adaptive_gamma_div and np.isfinite(gamma_div_restart):
+        gamma_div_init = float(gamma_div_restart)
+    gamma_div_max = float(getattr(args, "gamma_div_max", float("nan")))
+    if not np.isfinite(gamma_div_max):
+        gamma_div_max = max(float(gamma_div_base), 1.0e-1) if adaptive_gamma_div else float(gamma_div_base)
+    gamma_div_max = max(float(gamma_div_max), float(gamma_div_init), float(gamma_div_base))
+    gamma_div_growth = max(1.1, float(getattr(args, "gamma_div_growth", 2.0)))
+    gamma_div_relax_factor = min(1.0, max(0.0, float(getattr(args, "gamma_div_relax_factor", 0.5))))
+    gamma_div_relax_after = max(1, int(getattr(args, "gamma_div_relax_after", 3)))
+    gamma_div_relax_newton_max = max(1, int(getattr(args, "gamma_div_relax_newton_max", 2)))
+    gamma_div_expr = _as_scalar_expr(gamma_div_init)
 
     # ------------------------------------------------------------------
     # Polygon (alpha0)
@@ -1482,6 +1605,8 @@ def main() -> None:
         S_n.nodal_values[:] = 0.0
 
     eps0 = float(args.eps)
+    if ch_enabled and transport_mode == "pde" and bool(scale_alpha_ch_eps_with_zeta):
+        eps0 = max(float(eps0), float(alpha_ch_eps))
     alpha_xy = np.asarray(dh.get_dof_coords("alpha"), dtype=float)
     alpha0 = _smooth_step((-_signed_distance_polygon(alpha_xy[:, 0], alpha_xy[:, 1], poly_m)) / max(1.0e-12, eps0))
     alpha_n.nodal_values[:] = np.clip(np.asarray(alpha0, dtype=float), 0.0, 1.0)
@@ -1642,6 +1767,20 @@ def main() -> None:
             float(diffuse_ramp_time),
             float(args.diffuse_shear_eta),
         )
+    if ch_enabled:
+        zeta_ratio = float("nan")
+        if abs(float(alpha_ch_gamma)) > 0.0 and abs(float(alpha_ch_eps)) > 0.0:
+            zeta_ratio = (float(getattr(args, "diffuse_shear_scale", 0.0)) ** 2) / (float(alpha_ch_gamma) * float(alpha_ch_eps))
+        logging.info(
+            "[setup] alpha interface thickness: eps0=%.3e alpha_ch_eps_base=%.3e alpha_ch_eps_eff=%.3e scale_with_zeta=%s scale_factor=%.3e zeta_ref=%.3e zeta^2/(gamma_alpha eps_alpha)=%.3e",
+            float(eps0),
+            float(alpha_ch_eps_base),
+            float(alpha_ch_eps),
+            str(bool(scale_alpha_ch_eps_with_zeta)).lower(),
+            float(alpha_ch_eps_scale_factor),
+            float(diffuse_shear_scale_ref),
+            float(zeta_ratio),
+        )
 
     if paper1_reduced:
         forms = build_deformation_only_forms(
@@ -1680,7 +1819,7 @@ def main() -> None:
             mu_s=Constant(float(mu_s)),
             lambda_s=Constant(float(lambda_s)),
             solid_visco_eta=float(args.solid_visco_eta),
-            gamma_div=float(args.gamma_div),
+            gamma_div=gamma_div_expr,
             phi_b=float(phi_b),
             M_alpha=float(alpha_ch_M),
             gamma_alpha=float(alpha_ch_gamma),
@@ -1740,10 +1879,14 @@ def main() -> None:
             gamma_u_pin=float(args.gamma_u_pin),
             kinematics_scale=float(args.kinematics_scale) if np.isfinite(float(args.kinematics_scale)) else None,
             v_supg=float(args.v_supg),
+            v_supg_mode=str(getattr(args, "v_supg_mode", "streamline")),
+            v_supg_c_nu=float(getattr(args, "v_supg_c_nu", 4.0)),
             u_supg=float(args.u_supg),
+            u_cip=float(args.u_cip),
+            u_cip_weight=str(args.u_cip_weight),
             v_cip=float(args.v_cip),
             vS_cip=float(args.vS_cip),
-            gamma_div=float(args.gamma_div),
+            gamma_div=gamma_div_expr,
             fluid_convection=str(getattr(args, "fluid_convection", "full")),
             # Transport/kinetics controls (FSI-only: disable growth/detachment/damage, but may solve alpha/phi in PDE mode).
             D_phi=float(args.D_phi) if transport_mode == "pde" else 0.0,
@@ -1785,8 +1928,19 @@ def main() -> None:
         tau_w = 6.0 * mu_f0 * u_avg / float(H)  # plane Poiseuille between plates
         Re = rho_f0 * u_avg * float(H) / max(mu_f0, 1.0e-30)
         logging.info(f"[setup] inflow: u_avg={u_avg:.3e} m/s (u_max={u_max:.3e}), tau_w≈{tau_w:.3e} Pa, Re≈{Re:.1f}")
-        if float(args.gamma_div) != 0.0:
-            logging.info(f"[setup] mixture grad-div stabilization enabled: gamma_div={float(args.gamma_div):.3e}")
+        if float(gamma_div_expr) != 0.0:
+            logging.info(f"[setup] mixture grad-div stabilization enabled: gamma_div={float(gamma_div_expr):.3e}")
+            if adaptive_gamma_div:
+                logging.info(
+                    "[setup] adaptive gamma_div enabled: base=%.3e current=%.3e max=%.3e growth=%.2f relax_after=%d relax_factor=%.2f easy_nNewton<=%d",
+                    float(gamma_div_base),
+                    float(gamma_div_expr),
+                    float(gamma_div_max),
+                    float(gamma_div_growth),
+                    int(gamma_div_relax_after),
+                    float(gamma_div_relax_factor),
+                    int(gamma_div_relax_newton_max),
+                )
     except Exception:
         pass
 
@@ -1824,6 +1978,17 @@ def main() -> None:
     # ------------------------------------------------------------------
     out_dir = Path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
+    gamma_div_history_path = out_dir / "gamma_div_history.csv"
+    if adaptive_gamma_div:
+        if (not gamma_div_history_path.exists()) or gamma_div_history_path.stat().st_size == 0:
+            with gamma_div_history_path.open("w", encoding="utf-8") as f:
+                f.write("event,step,t_s,dt_s,gamma_div_old,gamma_div_new,reason\n")
+                f.write(
+                    f"init,{int(step0) if restart_meta is not None else 0},"
+                    f"{float(restart_meta.get('t', 0.0)) if restart_meta is not None else 0.0:.12e},"
+                    f"{float(restart_meta.get('dt', dt_val)) if restart_meta is not None else float(dt_val):.12e},"
+                    f"{float(gamma_div_expr):.12e},{float(gamma_div_expr):.12e},startup\n"
+                )
     vtk_every = int(args.vtk_every)
     vtk_dir = out_dir / "vtk"
     if vtk_every > 0:
@@ -1840,6 +2005,46 @@ def main() -> None:
     snapshot_dir = out_dir / "snapshots"
     if snapshot_targets:
         snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    gamma_div_state = {
+        "base": float(gamma_div_base),
+        "current": float(gamma_div_expr),
+        "max": float(gamma_div_max),
+        "easy_steps": 0,
+    }
+
+    def _record_gamma_div_event(event: str, *, step_no: int, t_s: float, dt_s: float, old: float, new: float, reason: str) -> None:
+        if not adaptive_gamma_div:
+            return
+        with gamma_div_history_path.open("a", encoding="utf-8") as f:
+            f.write(
+                f"{str(event)},{int(step_no)},{float(t_s):.12e},{float(dt_s):.12e},"
+                f"{float(old):.12e},{float(new):.12e},{str(reason)}\n"
+            )
+
+    def _set_gamma_div(new_value: float, *, reason: str, step_no: int, t_s: float, dt_s: float) -> None:
+        old_value = float(gamma_div_expr)
+        new_value = float(new_value)
+        if not np.isfinite(new_value):
+            return
+        if abs(new_value - old_value) <= 1.0e-15:
+            return
+        gamma_div_expr.value = float(new_value)
+        gamma_div_state["current"] = float(new_value)
+        gamma_div_state["easy_steps"] = 0
+        print(
+            f"    [adapt_gamma_div] {str(reason)}; gamma_div {float(old_value):.3e} -> {float(new_value):.3e} "
+            f"(step={int(step_no)}, t={float(t_s):.6e}, dt={float(dt_s):.3e})."
+        )
+        _record_gamma_div_event(
+            "update",
+            step_no=int(step_no),
+            t_s=float(t_s),
+            dt_s=float(dt_s),
+            old=float(old_value),
+            new=float(new_value),
+            reason=str(reason),
+        )
 
     restart_state: dict[str, object] | None = None
     if restart_from is not None:
@@ -1866,6 +2071,8 @@ def main() -> None:
             S_k.nodal_values[:] = S_n.nodal_values
         mu_alpha_k.nodal_values[:] = mu_alpha_n.nodal_values
         logging.info(f"[restart] loaded {restart_from} (t={float(t0):.6e}s, step={int(step0)}, dt={float(dt_val):.3e})")
+        if adaptive_gamma_div and np.isfinite(float(restart_state.get("gamma_div", float("nan")))):
+            logging.info(f"[restart] continuing adaptive gamma_div from checkpoint: {float(gamma_div_expr):.3e}")
 
     track_y_um = [float(v) for v in str(args.track_y_um).split(",") if str(v).strip()]
     y_targets = [1.0e-6 * float(v) for v in track_y_um]
@@ -2170,6 +2377,27 @@ def main() -> None:
         out.sort(reverse=True, key=lambda t: t[0])
         return out
 
+    def _named_residual_breakdown(named_forms, bcs_now) -> list[tuple[float, str]]:
+        out: list[tuple[float, str]] = []
+        if not isinstance(named_forms, dict):
+            return out
+        for name, res_form in named_forms.items():
+            if res_form is None:
+                continue
+            try:
+                _, F_blk = assemble_form(
+                    Equation(None, res_form),
+                    dof_handler=dh,
+                    bcs=[],
+                    quad_order=int(args.q),
+                    backend=str(args.backend),
+                )
+                out.append((_masked_residual_inf(np.asarray(F_blk, dtype=float), bcs_now), str(name)))
+            except Exception as exc:
+                out.append((float("inf"), f"{name}(assembly_failed:{exc})"))
+        out.sort(reverse=True, key=lambda t: t[0])
+        return out
+
     predictor_base = str(args.predictor)
     predictor_damping_base = float(args.predictor_damping)
     predictor_clip_01_base = bool(args.predictor_clip_01)
@@ -2178,6 +2406,7 @@ def main() -> None:
         "predictor_fallbacks": 0,
         "maxit_boosts": 0,
         "linesearch_fallbacks": 0,
+        "gamma_div_retries": 0,
         "dtmin_maxit_retries": 0,
         "petsc_resets": 0,
     }
@@ -2203,9 +2432,11 @@ def main() -> None:
             dt_fail = float(dt_val)
         reason = getattr(solver, "_last_nonlinear_reason", None)
         fnorm = getattr(solver, "_last_nonlinear_norm", None)
+        exc = info.get("exception", None)
+        exc_msg = str(exc) if exc is not None else ""
         print(f"    [fail] step={step_no} t={t_fail:.6e} dt={dt_fail:.3e} reason={reason} norm={fnorm}")
 
-        # For SNES line-search divergence, the most common cause we've observed in this
+        # For line-search divergence, the most common cause we've observed in this
         # benchmark is an overly aggressive time-step predictor. Try re-solving the same
         # time step with a safer initial guess before reducing Δt.
         #
@@ -2220,11 +2451,16 @@ def main() -> None:
             retry_state["predictor_fallbacks"] = 0
             retry_state["maxit_boosts"] = 0
             retry_state["linesearch_fallbacks"] = 0
+            retry_state["gamma_div_retries"] = 0
             retry_state["dtmin_maxit_retries"] = 0
             retry_state["petsc_resets"] = 0
 
-        # Retry once with predictor='prev' on line-search divergence (-6).
-        if reason_i == -6 and retry_state.get("predictor_fallbacks", 0) < 1 and predictor_base.strip().lower() != "prev":
+        line_search_failure = bool(
+            reason_i == -6 or (isinstance(exc, RuntimeError) and "Line search failed" in exc_msg)
+        )
+
+        # Retry once with predictor='prev' on line-search divergence.
+        if line_search_failure and retry_state.get("predictor_fallbacks", 0) < 1 and predictor_base.strip().lower() != "prev":
             retry_state["predictor_fallbacks"] = int(retry_state.get("predictor_fallbacks", 0)) + 1
             try:
                 time_params.predictor = "prev"
@@ -2232,7 +2468,7 @@ def main() -> None:
                 time_params.predictor_clip_01 = predictor_clip_01_base
             except Exception:
                 pass
-            print("    [retry] SNES diverged in line search; retrying same Δt with predictor='prev' (no extrapolation).")
+            print("    [retry] line search failed; retrying same Δt with predictor='prev' (no extrapolation).")
             return "retry"
 
         # If we are very close to the requested absolute tolerance but hit SNES max-it at dt==dt_min,
@@ -2257,14 +2493,151 @@ def main() -> None:
         close_enough = bool(atol > 0.0 and fnorm is not None and np.isfinite(float(fnorm)) and float(fnorm) <= 20.0 * atol)
         hit_maxit = bool(reason_i == -5)
         at_dt_min = bool(dt_min_val > 0.0 and dt_fail <= dt_min_val + 1.0e-15)
+        failure_diag: dict[str, object] | None = None
 
-        # At dt==dt_min, if SNES diverges in line search, do one retry from the current
+        def _compute_failure_diagnostics() -> dict[str, object]:
+            nonlocal failure_diag
+            if failure_diag is not None:
+                return failure_diag
+            diag: dict[str, object] = {
+                "worst_block": "",
+                "worst_field": "",
+                "field_norms": [],
+                "block_norms": [],
+                "momentum_terms": [],
+                "kinematics_terms": [],
+                "slip_norms": {},
+            }
+            try:
+                funcs = list(info.get("functions", []) or [])
+                prev_funcs = list(info.get("prev_functions", []) or [])
+                bcs_now = info.get("bcs", None)
+                if bcs_now is not None and funcs:
+                    dh.apply_bcs(bcs_now, *funcs)
+                if getattr(solver, "constraints", None) is not None and funcs:
+                    solver._enforce_constraints_on_functions(funcs)
+
+                coeffs = {f.name: f for f in funcs}
+                coeffs.update({f.name: f for f in prev_funcs})
+                aux = info.get("aux_functions", None)
+                if isinstance(aux, dict):
+                    coeffs.update(aux)
+
+                _, R_red = solver._assemble_system_reduced(coeffs, need_matrix=False)
+                R_full = np.asarray(solver.restrictor.expand_vec(np.asarray(R_red, dtype=float)), dtype=float).ravel()
+
+                field_norms: list[tuple[float, str]] = []
+                for fld in getattr(dh, "field_names", []):
+                    try:
+                        sl = np.asarray(dh.get_field_slice(fld), dtype=int).ravel()
+                    except Exception:
+                        continue
+                    if sl.size == 0:
+                        continue
+                    field_norms.append((float(np.linalg.norm(R_full[sl], ord=np.inf)), str(fld)))
+                field_norms.sort(reverse=True, key=lambda t: t[0])
+                diag["field_norms"] = field_norms
+                if field_norms:
+                    diag["worst_field"] = str(field_norms[0][1])
+                n_show = min(12, len(field_norms))
+                if n_show:
+                    items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
+                    print(f"    [fail_res] {items}")
+
+                block_norms = _block_residual_breakdown(bcs_now)
+                diag["block_norms"] = block_norms
+                if block_norms:
+                    block_items = ", ".join(f"{name}:{val:.2e}" for val, name in block_norms[: min(8, len(block_norms))])
+                    print(f"    [fail_blocks] {block_items}")
+                    diag["worst_block"] = str(block_norms[0][1])
+
+                momentum_terms = _named_residual_breakdown(getattr(forms, "r_momentum_terms", None), bcs_now)
+                diag["momentum_terms"] = momentum_terms
+                if momentum_terms:
+                    items = ", ".join(f"{name}:{val:.2e}" for val, name in momentum_terms[: min(10, len(momentum_terms))])
+                    print(f"    [fail_mom_terms] {items}")
+
+                kinematics_terms = _named_residual_breakdown(getattr(forms, "r_kinematics_terms", None), bcs_now)
+                diag["kinematics_terms"] = kinematics_terms
+                if kinematics_terms:
+                    items = ", ".join(f"{name}:{val:.2e}" for val, name in kinematics_terms[: min(10, len(kinematics_terms))])
+                    print(f"    [fail_kin_terms] {items}")
+
+                coeff_map = {f.name: f for f in funcs}
+                v_fun = coeff_map.get("v_k")
+                vS_fun = coeff_map.get("vS_k")
+                if v_fun is not None and vS_fun is not None:
+                    try:
+                        vx = np.asarray(v_fun.components[0].nodal_values, dtype=float).ravel()
+                        vy = np.asarray(v_fun.components[1].nodal_values, dtype=float).ravel()
+                        vsx = np.asarray(vS_fun.components[0].nodal_values, dtype=float).ravel()
+                        vsy = np.asarray(vS_fun.components[1].nodal_values, dtype=float).ravel()
+                        dxv = vx - vsx
+                        dyv = vy - vsy
+                        slip_l2 = float(np.sqrt(np.dot(dxv, dxv) + np.dot(dyv, dyv)))
+                        slip_inf = float(max(np.max(np.abs(dxv)), np.max(np.abs(dyv))))
+                        slip_norms = {
+                            "vx_minus_vSx_inf": float(np.max(np.abs(dxv))),
+                            "vy_minus_vSy_inf": float(np.max(np.abs(dyv))),
+                            "v_minus_vS_inf": slip_inf,
+                            "v_minus_vS_l2": slip_l2,
+                        }
+                        diag["slip_norms"] = slip_norms
+                        print(
+                            "    [fail_slip] "
+                            f"|vx-vSx|_inf={slip_norms['vx_minus_vSx_inf']:.2e}, "
+                            f"|vy-vSy|_inf={slip_norms['vy_minus_vSy_inf']:.2e}, "
+                            f"|v-vS|_inf={slip_norms['v_minus_vS_inf']:.2e}, "
+                            f"|v-vS|_2={slip_norms['v_minus_vS_l2']:.2e}"
+                        )
+                    except Exception as exc_slip:
+                        print(f"    [fail_slip] failed to compute slip mismatch: {exc_slip}")
+
+                if at_dt_min:
+                    worst_block = str(diag.get("worst_block", ""))
+                    worst_field = str(diag.get("worst_field", ""))
+                    if worst_block.startswith("momentum") or worst_block.startswith("skeleton") or worst_field.startswith("v"):
+                        print(
+                            "    [hint] failure occurred at dt==--dt-min and is dominated by the coupled momentum block; "
+                            "for Benchmark 6 this usually indicates lost mechanics coercivity/conditioning rather than a tolerance issue. "
+                            "Prefer increasing --gamma-div and/or --gamma-u, keep --u-extension l2, and refine around the biofilm before reducing dt_min further."
+                        )
+            except Exception as exc_inner:
+                print(f"    [fail_res] failed to compute residual breakdown: {exc_inner}")
+            failure_diag = diag
+            return failure_diag
+
+        # At dt==dt_min, if line search fails, do one retry from the current
         # best iterate (keep guess) before giving up. This avoids touching PETSc's
         # internal linesearch objects (API differences across PETSc builds).
-        if reason_i == -6 and at_dt_min and retry_state.get("linesearch_fallbacks", 0) < 1:
+        if line_search_failure and at_dt_min and retry_state.get("linesearch_fallbacks", 0) < 1:
             retry_state["linesearch_fallbacks"] = int(retry_state.get("linesearch_fallbacks", 0)) + 1
-            print("    [retry] dt==dt_min and SNES line search diverged; retrying from best iterate (keep guess).")
+            print("    [retry] dt==dt_min and line search failed; retrying from best iterate (keep guess).")
             return "retry_keep_guess"
+
+        if adaptive_gamma_div and line_search_failure and at_dt_min:
+            diag = _compute_failure_diagnostics()
+            worst_block = str(diag.get("worst_block", ""))
+            worst_field = str(diag.get("worst_field", ""))
+            momentum_dominated = bool(
+                worst_block.startswith("momentum") or worst_block.startswith("skeleton") or worst_field.startswith("v")
+            )
+            cur_gamma = float(gamma_div_expr)
+            if momentum_dominated and cur_gamma + 1.0e-15 < float(gamma_div_max):
+                retry_state["gamma_div_retries"] = int(retry_state.get("gamma_div_retries", 0)) + 1
+                new_gamma = min(float(gamma_div_max), max(float(cur_gamma) * float(gamma_div_growth), float(cur_gamma) + 1.0e-12))
+                _set_gamma_div(
+                    new_gamma,
+                    reason=f"momentum-dominated line-search failure ({worst_block or worst_field})",
+                    step_no=int(step_no),
+                    t_s=float(t_fail),
+                    dt_s=float(dt_fail),
+                )
+                try:
+                    solver._ls_alpha_prev = 1.0
+                except Exception:
+                    pass
+                return "retry_keep_guess"
 
         if hit_maxit and at_dt_min:
             retry_state["dtmin_maxit_retries"] = int(retry_state.get("dtmin_maxit_retries", 0)) + 1
@@ -2315,59 +2688,7 @@ def main() -> None:
             except Exception as exc:
                 print(f"    [retry] failed to increase max-it: {exc}")
 
-        try:
-            funcs = list(info.get("functions", []) or [])
-            prev_funcs = list(info.get("prev_functions", []) or [])
-            bcs_now = info.get("bcs", None)
-            if bcs_now is not None and funcs:
-                dh.apply_bcs(bcs_now, *funcs)
-            if getattr(solver, "constraints", None) is not None and funcs:
-                solver._enforce_constraints_on_functions(funcs)
-
-            coeffs = {f.name: f for f in funcs}
-            coeffs.update({f.name: f for f in prev_funcs})
-            aux = info.get("aux_functions", None)
-            if isinstance(aux, dict):
-                coeffs.update(aux)
-
-            _, R_red = solver._assemble_system_reduced(coeffs, need_matrix=False)
-            R_full = np.asarray(solver.restrictor.expand_vec(np.asarray(R_red, dtype=float)), dtype=float).ravel()
-
-            field_norms: list[tuple[float, str]] = []
-            for fld in getattr(dh, "field_names", []):
-                try:
-                    sl = np.asarray(dh.get_field_slice(fld), dtype=int).ravel()
-                except Exception:
-                    continue
-                if sl.size == 0:
-                    continue
-                field_norms.append((float(np.linalg.norm(R_full[sl], ord=np.inf)), str(fld)))
-            field_norms.sort(reverse=True, key=lambda t: t[0])
-            n_show = min(12, len(field_norms))
-            if n_show:
-                items = ", ".join(f"{name}:{val:.2e}" for val, name in field_norms[:n_show])
-                print(f"    [fail_res] {items}")
-                block_norms = _block_residual_breakdown(bcs_now)
-                if block_norms:
-                    block_items = ", ".join(f"{name}:{val:.2e}" for val, name in block_norms[: min(8, len(block_norms))])
-                    print(f"    [fail_blocks] {block_items}")
-                    worst_block = str(block_norms[0][1])
-                else:
-                    worst_block = ""
-                try:
-                    dt_min_val = float(getattr(args, "dt_min", 0.0))
-                except Exception:
-                    dt_min_val = 0.0
-                if dt_min_val > 0.0 and dt_fail <= dt_min_val + 1.0e-15:
-                    worst_field = str(field_norms[0][1])
-                    if worst_block.startswith("momentum") or worst_block.startswith("skeleton") or worst_field.startswith("v"):
-                        print(
-                            "    [hint] failure occurred at dt==--dt-min and is dominated by the coupled momentum block; "
-                            "for Benchmark 6 this usually indicates lost mechanics coercivity/conditioning rather than a tolerance issue. "
-                            "Prefer increasing --gamma-div and/or --gamma-u, keep --u-extension l2, and refine around the biofilm before reducing dt_min further."
-                        )
-        except Exception as exc:
-            print(f"    [fail_res] failed to compute residual breakdown: {exc}")
+        _compute_failure_diagnostics()
         return None
 
     def post_step_refiner(step, bcs_now, functions, prev_functions):
@@ -2385,6 +2706,31 @@ def main() -> None:
         _post_step_update()
         step_no = int(getattr(solver, "_current_step_no", int(step)))
         t_now = float(getattr(solver, "_current_t", 0.0) + getattr(solver, "_current_dt", dt_val))
+        dt_now = float(getattr(solver, "_current_dt", dt_val))
+        n_newton = int(getattr(solver, "_last_nonlinear_iterations", 0) or 0)
+        if adaptive_gamma_div:
+            cur_gamma = float(gamma_div_expr)
+            base_gamma = float(gamma_div_base)
+            if cur_gamma > base_gamma + 1.0e-15:
+                if n_newton <= int(gamma_div_relax_newton_max):
+                    gamma_div_state["easy_steps"] = int(gamma_div_state.get("easy_steps", 0)) + 1
+                else:
+                    gamma_div_state["easy_steps"] = 0
+                if (
+                    float(gamma_div_relax_factor) < 1.0
+                    and int(gamma_div_state.get("easy_steps", 0)) >= int(gamma_div_relax_after)
+                ):
+                    new_gamma = max(float(base_gamma), float(cur_gamma) * float(gamma_div_relax_factor))
+                    gamma_div_state["easy_steps"] = 0
+                    _set_gamma_div(
+                        new_gamma,
+                        reason=f"relax after {int(gamma_div_relax_after)} easy accepted steps (nNewton<={int(gamma_div_relax_newton_max)})",
+                        step_no=int(step_no),
+                        t_s=float(t_now),
+                        dt_s=float(dt_now),
+                    )
+            else:
+                gamma_div_state["easy_steps"] = 0
         if diffuse_scale_update is not None:
             diffuse_scale_update(float(t_now))
         _append_timeseries(t_now)
@@ -2407,6 +2753,7 @@ def main() -> None:
                 step=int(step_no),
                 dt=float(dt_step),
                 theta=float(theta),
+                gamma_div=float(gamma_div_expr),
                 y_lines=np.asarray(y_lines, dtype=float),
                 x_ref_global=float(x_ref_global),
                 x_ref=np.asarray(x_ref, dtype=float),
@@ -2426,6 +2773,7 @@ def main() -> None:
                 step=int(step_no),
                 dt=float(dt_step),
                 theta=float(theta),
+                gamma_div=float(gamma_div_expr),
                 y_lines=np.asarray(y_lines, dtype=float),
                 x_ref_global=float(x_ref_global),
                 x_ref=np.asarray(x_ref, dtype=float),
@@ -2459,6 +2807,7 @@ def main() -> None:
                 step=0,
                 dt=float(dt_val),
                 theta=float(theta),
+                gamma_div=float(gamma_div_expr),
                 y_lines=np.asarray(y_lines, dtype=float),
                 x_ref_global=float(x_ref_global),
                 x_ref=np.asarray(x_ref, dtype=float),
@@ -2478,6 +2827,7 @@ def main() -> None:
                 step=0,
                 dt=float(dt_val),
                 theta=float(theta),
+                gamma_div=float(gamma_div_expr),
                 y_lines=np.asarray(y_lines, dtype=float),
                 x_ref_global=float(x_ref_global),
                 x_ref=np.asarray(x_ref, dtype=float),
@@ -2503,6 +2853,7 @@ def main() -> None:
                 step=int(step0),
                 dt=float(dt_val),
                 theta=float(theta),
+                gamma_div=float(gamma_div_expr),
                 y_lines=np.asarray(y_lines, dtype=float),
                 x_ref_global=float(x_ref_global),
                 x_ref=np.asarray(x_ref, dtype=float),
@@ -2522,6 +2873,7 @@ def main() -> None:
                 step=int(step0),
                 dt=float(dt_val),
                 theta=float(theta),
+                gamma_div=float(gamma_div_expr),
                 y_lines=np.asarray(y_lines, dtype=float),
                 x_ref_global=float(x_ref_global),
                 x_ref=np.asarray(x_ref, dtype=float),

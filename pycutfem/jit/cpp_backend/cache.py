@@ -15,7 +15,22 @@ from .compiler import compile_extension, get_compile_mode_tag
 # Bump when generated C++ changes in a way that requires recompilation of cached kernels.
 # Bump when generated C++ changes or when helper semantics change in a way that
 # requires recompilation of cached kernels (e.g. stride-aware accessors).
-CODEGEN_ABI_CPP = "2026-02-24-cpp-v24-dot-gradgrad-rowcol"
+# 2026-03-10:
+# - v25 invalidated stale facet-Hessian kernels that still referenced unsided
+#   Hx/Hy on side-aware facet geometry.
+# - v26 additionally invalidates boundary-facet (`ds`) Hessian kernels after
+#   separating unsided Hxi0/Hxi1 requests from sided pos/neg Hxi requests.
+# - v27 invalidates kernels that previously over-requested Hxi0/Hxi1 for
+#   ordinary Grad(.) operators instead of only grad(div(.)).
+# - v28 invalidates kernels after fixing unsided vector trial/test second-derivative
+#   table loads in the C++ codegen (the previous code only populated the last
+#   component row due to a misplaced for/else).
+# - v29 invalidates kernels after fixing physical push-forward of trial/test
+#   second derivatives in volume kernels (the previous code used raw reference
+#   d20/d11/d02 tables directly).
+# - v30 invalidates kernels after wiring the correct Jloc/Hx/Hy selection for
+#   those trial/test second-derivative push-forwards.
+CODEGEN_ABI_CPP = "2026-03-11-cpp-v31-graddiv-d2-args-fix"
 
 
 class CppKernelCache:

@@ -44,6 +44,11 @@ def _build_problem(
     alpha_ch_gamma: float = 0.0,
     alpha_ch_eps: float = 0.1,
     alpha_ch_mobility: str = "constant",
+    v_supg: float = 0.0,
+    v_supg_mode: str = "streamline",
+    v_supg_c_nu: float = 4.0,
+    v_cip: float = 0.0,
+    fluid_convection: str = "full",
     theta: float = 1.0,
     substrate_reaction_scheme: str = "theta",
     substrate_diffusion_scheme: str = "theta",
@@ -205,6 +210,11 @@ def _build_problem(
         alpha_ch_gamma=float(alpha_ch_gamma),
         alpha_ch_eps=float(alpha_ch_eps),
         alpha_ch_mobility=str(alpha_ch_mobility),
+        v_supg=float(v_supg),
+        v_supg_mode=str(v_supg_mode),
+        v_supg_c_nu=float(v_supg_c_nu),
+        v_cip=float(v_cip),
+        fluid_convection=str(fluid_convection),
         alpha_cahn_M=float(alpha_cahn_M),
         alpha_cahn_gamma=float(alpha_cahn_gamma),
         alpha_cahn_eps=float(alpha_cahn_eps),
@@ -314,6 +324,166 @@ def test_biofilm_one_domain_jacobian_fd_consistency():
                     f"FD mismatch at dof {j} ({fld}, theta={theta}, substrate_reaction_scheme={r_scheme}, "
                     f"substrate_diffusion_scheme={d_scheme}): rel={rel:.2e}"
                 )
+
+
+def _cpp_backend_parity_v_supg_residual_impl() -> None:
+    dh, forms, _ = _build_problem(
+        nx=2,
+        ny=2,
+        q=5,
+        v_supg=1.0,
+        v_supg_mode="residual",
+        v_supg_c_nu=4.0,
+        fluid_convection="full",
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+
+    K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    K_cpp, R_cpp = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="cpp")
+
+    A_py = K_py.tocsr().toarray()
+    A_cpp = K_cpp.tocsr().toarray()
+    assert np.allclose(A_py, A_cpp, rtol=1.0e-10, atol=1.0e-12)
+    assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_biofilm_one_domain_v_supg_residual_backend_parity_python_cpp():
+    run_module_func_in_subprocess(__name__, "_cpp_backend_parity_v_supg_residual_impl")
+
+
+def _all_backend_parity_v_supg_residual_momentum_impl() -> None:
+    dh, forms, _ = _build_problem(
+        nx=1,
+        ny=1,
+        q=4,
+        v_supg=1.0,
+        v_supg_mode="residual",
+        v_supg_c_nu=4.0,
+        fluid_convection="full",
+    )
+    equations = {
+        "momentum_residual": Equation(None, forms.r_momentum),
+        "momentum_jacobian": Equation(forms.a_momentum, None),
+    }
+
+    for name, eq in equations.items():
+        assembled = {}
+        for backend in ("python", "jit", "cpp"):
+            K, R = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=4, backend=backend)
+            assembled[backend] = K.tocsr().toarray() if K is not None else np.asarray(R, dtype=float)
+
+        ref = assembled["python"]
+        for backend in ("jit", "cpp"):
+            got = assembled[backend]
+            assert np.allclose(got, ref, rtol=1.0e-10, atol=1.0e-12), (
+                f"{name} backend parity failed for {backend}: "
+                f"max_abs={float(np.max(np.abs(got - ref))):.3e}"
+            )
+
+
+def test_biofilm_one_domain_v_supg_residual_momentum_backend_parity_all_backends():
+    run_module_func_in_subprocess(__name__, "_all_backend_parity_v_supg_residual_momentum_impl")
+
+
+def test_biofilm_one_domain_v_supg_residual_jacobian_fd_consistency():
+    dh, forms, field_to_func_k = _build_problem(
+        nx=2,
+        ny=2,
+        q=5,
+        v_supg=1.0,
+        v_supg_mode="residual",
+        v_supg_c_nu=4.0,
+        fluid_convection="full",
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    R0 = np.asarray(R0, dtype=float)
+
+    def assemble_residual():
+        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
+        return np.asarray(R, dtype=float)
+
+    probes = []
+    for fld in ("v_x", "v_y", "p", "vS_x", "phi", "alpha"):
+        sl = dh.get_field_slice(fld)
+        if sl:
+            probes.append(int(sl[len(sl) // 2]))
+
+    eps = 1.0e-8
+    for j in probes:
+        fld, _ = dh._dof_to_node_map[j]
+        func = field_to_func_k[fld]
+        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
+        R1 = assemble_residual()
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
+
+        fd = (R1 - R0) / eps
+        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
+        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
+        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
+        assert rel < 5.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
+
+
+def _cpp_backend_parity_v_cip_impl() -> None:
+    dh, forms, _ = _build_problem(
+        nx=2,
+        ny=2,
+        q=5,
+        v_cip=1.0,
+        fluid_convection="full",
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+
+    K_py, R_py = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    K_cpp, R_cpp = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="cpp")
+
+    A_py = K_py.tocsr().toarray()
+    A_cpp = K_cpp.tocsr().toarray()
+    assert np.allclose(A_py, A_cpp, rtol=1.0e-10, atol=1.0e-12)
+    assert np.allclose(np.asarray(R_py, float), np.asarray(R_cpp, float), rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_biofilm_one_domain_v_cip_backend_parity_python_cpp():
+    run_module_func_in_subprocess(__name__, "_cpp_backend_parity_v_cip_impl")
+
+
+def test_biofilm_one_domain_v_cip_jacobian_fd_consistency():
+    dh, forms, field_to_func_k = _build_problem(
+        nx=2,
+        ny=2,
+        q=5,
+        v_cip=1.0,
+        fluid_convection="full",
+    )
+    eq = Equation(forms.jacobian_form, forms.residual_form)
+    K, R0 = assemble_form(eq, dof_handler=dh, bcs=[], quad_order=5, backend="python")
+    R0 = np.asarray(R0, dtype=float)
+
+    def assemble_residual():
+        _, R = assemble_form(Equation(None, forms.residual_form), dof_handler=dh, bcs=[], quad_order=5, backend="python")
+        return np.asarray(R, dtype=float)
+
+    probes = []
+    for fld in ("v_x", "v_y", "alpha"):
+        sl = dh.get_field_slice(fld)
+        if sl:
+            probes.append(int(sl[len(sl) // 2]))
+
+    eps = 1.0e-8
+    for j in probes:
+        fld, _ = dh._dof_to_node_map[j]
+        func = field_to_func_k[fld]
+        old = float(func.get_nodal_values(np.asarray([j], dtype=int))[0])
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old + eps], dtype=float))
+        R1 = assemble_residual()
+        func.set_nodal_values(np.asarray([j], dtype=int), np.asarray([old], dtype=float))
+
+        fd = (R1 - R0) / eps
+        col = np.asarray(K.getcol(j).toarray()).reshape(-1)
+        denom = max(1.0, float(np.linalg.norm(fd, ord=np.inf)), float(np.linalg.norm(col, ord=np.inf)))
+        rel = float(np.linalg.norm(fd - col, ord=np.inf)) / denom
+        assert rel < 5.0e-6, f"FD mismatch at dof {j} ({fld}): rel={rel:.2e}"
 
 
 def _cpp_backend_parity_alpha_stabilization_impl() -> None:

@@ -1413,6 +1413,7 @@ class NewtonSolver:
             self._last_nonlinear_update_inf = None
             self._last_nonlinear_update_label = None
             self._last_nonlinear_accepted = False
+            self._last_nonlinear_iterations = None
             try:
                 delta_U, converged, n_iters = self._newton_loop(functions, prev_functions, aux_functions, bcs_now)
             except Exception as e:
@@ -1625,6 +1626,7 @@ class NewtonSolver:
                 if bool(getattr(self, "_last_nonlinear_accepted", False)):
                     msg += ", accepted=True"
                 print(msg)
+            self._last_nonlinear_iterations = int(n_iters)
             
             # Post-step refiner (VI clip) **before** promotion so prev matches clipped state
             if post_step_refiner is not None:
