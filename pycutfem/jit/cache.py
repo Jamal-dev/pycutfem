@@ -1,5 +1,5 @@
 # pycutfem/jit/cache.py
-import hashlib, pickle, importlib.util, sys, tempfile, textwrap, os
+import hashlib, pickle, importlib.util, sys, tempfile, textwrap, os, uuid
 from pathlib import Path
 from contextlib import contextmanager
 from types import ModuleType
@@ -13,6 +13,48 @@ from pycutfem.jit.ir import LoadAnalytic
 # Bump when generated kernel source semantics/signature change.
 CODEGEN_ABI = "2026-01-26-abi-outer-3-divbasis-runtime"
 
+
+def _resolve_cache_dir() -> Path:
+    """
+    Resolve a writable cache root for generated kernel modules.
+
+    Prefer `PYCUTFEM_CACHE_DIR` when set. Otherwise default to the user cache
+    directory (via `XDG_CACHE_HOME` / `~/.cache`). If that location is not
+    writable (e.g. sandboxed CI, read-only home), fall back to a temp-dir cache.
+    """
+    candidates: list[Path] = []
+
+    root = os.environ.get("PYCUTFEM_CACHE_DIR", "")
+    if root:
+        candidates.append(Path(root))
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME", "")
+        if xdg:
+            candidates.append(Path(xdg) / "pycutfem_jit")
+        else:
+            candidates.append(Path.home() / ".cache" / "pycutfem_jit")
+
+    candidates.append(Path(tempfile.gettempdir()) / "pycutfem_jit")
+
+    last_err: OSError | None = None
+    for candidate in candidates:
+        cache_dir = candidate.expanduser().resolve()
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            probe = cache_dir / f".pycutfem_write_probe_{uuid.uuid4().hex}"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return cache_dir
+        except OSError as err:
+            last_err = err
+            continue
+
+    msg = "Could not create a writable JIT cache directory. Tried:\n" + "\n".join(
+        f"  - {Path(p).expanduser()}" for p in candidates
+    )
+    raise OSError(msg) from last_err
+
+
 class KernelCache:
     """
     Compile-once, reuse-many cache for JIT-generated kernels.
@@ -20,8 +62,7 @@ class KernelCache:
     get_kernel(ir_sequence, codegen) -> (callable kernel, param_order list)
     """
 
-    _CACHE_DIR = Path(os.environ.get("PYCUTFEM_CACHE_DIR", Path.home() / ".cache" / "pycutfem_jit")).expanduser()
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _CACHE_DIR = _resolve_cache_dir()
 
     def __init__(self) -> None:
         self.in_memory_cache: Dict[str, Tuple[Any, List[str]]] = {}

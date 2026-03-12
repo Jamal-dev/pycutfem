@@ -7,6 +7,8 @@ import importlib.util
 import os
 import sys
 import sysconfig
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -31,7 +33,7 @@ from .compiler import compile_extension, get_compile_mode_tag
 #   d20/d11/d02 tables directly).
 # - v30 invalidates kernels after wiring the correct Jloc/Hx/Hy selection for
 #   those trial/test second-derivative push-forwards.
-CODEGEN_ABI_CPP = "2026-03-11-cpp-v31-graddiv-d2-args-fix"
+CODEGEN_ABI_CPP = "2026-03-12-cpp-v32-pybind11-no-subinterp"
 
 
 class CppKernelCache:
@@ -43,32 +45,61 @@ class CppKernelCache:
 
     # Optional test hook; when None, cache dir is resolved from env per instance.
     _CACHE_DIR: Path | None = None
+    # Share the in-memory kernel cache across instances so tests that vary
+    # `PYCUTFEM_CACHE_DIR` do not repeatedly compile/import the same kernel
+    # under different cache roots (which can exhaust per-process TLS resources).
+    _GLOBAL_IN_MEMORY_CACHE: Dict[str, Tuple[Any, List[str], List[str]]] = {}
 
     def __init__(self) -> None:
-        self.in_memory_cache: Dict[str, Tuple[Any, List[str]]] = {}
+        # NOTE: this cache is intentionally shared across instances.
+        self.in_memory_cache = self._GLOBAL_IN_MEMORY_CACHE
         self._cache_dir = self._resolve_cache_dir()
         suffix = sysconfig.get_config_var("EXT_SUFFIX")
         self._ext_suffix = suffix if suffix else ".so"
 
     @classmethod
     def _resolve_cache_dir(cls) -> Path:
-        """Resolve cache dir at runtime so per-test env overrides are honored."""
+        """
+        Resolve cache dir at runtime so per-test env overrides are honored.
+
+        The default cache location lives under the user's cache directory
+        (typically `~/.cache/pycutfem_jit`). Some environments (sandboxed CI,
+        read-only home dirs) disallow writes there; in that case we fall back
+        to a temp-directory cache so the C++ backend remains usable.
+        """
         override = cls._CACHE_DIR
+        candidates: list[Path] = []
         if override is not None:
-            cache_dir = Path(override).expanduser().resolve()
+            candidates.append(Path(override))
         else:
-            cache_dir = (
-                Path(
-                    os.environ.get(
-                        "PYCUTFEM_CACHE_DIR", Path.home() / ".cache" / "pycutfem_jit"
-                    )
-                )
-                .expanduser()
-                .resolve()
-                / "cpp"
-            )
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir
+            root = os.environ.get("PYCUTFEM_CACHE_DIR", "")
+            if root:
+                root_dir = Path(root)
+            else:
+                xdg = os.environ.get("XDG_CACHE_HOME", "")
+                root_dir = Path(xdg) / "pycutfem_jit" if xdg else Path.home() / ".cache" / "pycutfem_jit"
+            candidates.append(root_dir / "cpp")
+
+        # Always have a safe fallback under the system temp dir.
+        candidates.append(Path(tempfile.gettempdir()) / "pycutfem_jit" / "cpp")
+
+        last_err: OSError | None = None
+        for candidate in candidates:
+            cache_dir = candidate.expanduser().resolve()
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                probe = cache_dir / f".pycutfem_write_probe_{uuid.uuid4().hex}"
+                probe.write_text("ok", encoding="utf-8")
+                probe.unlink(missing_ok=True)
+                return cache_dir
+            except OSError as err:
+                last_err = err
+                continue
+
+        msg = "Could not create a writable C++ JIT cache directory. Tried:\n" + "\n".join(
+            f"  - {Path(p).expanduser()}" for p in candidates
+        )
+        raise OSError(msg) from last_err
 
     # ------------------------------------------------------------------
     def get_kernel(self, ir_sequence: list, codegen, mesh_sig=None):

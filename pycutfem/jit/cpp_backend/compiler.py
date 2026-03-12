@@ -117,7 +117,16 @@ def _compile_args_for_mode(mode: str) -> list[str]:
         raise ValueError(f"Unknown compile mode: {mode!r}")
 
     opt_flag = _fast_opt_level_flag() if mode == "fast" else _opt_level_flag()
-    args = [opt_flag, "-std=c++17"]
+    args = [
+        opt_flag,
+        "-std=c++17",
+        # pybind11 enables subinterpreter support on Python >= 3.12 by default,
+        # which adds per-module thread-specific storage keys. The C++ backend
+        # compiles many kernels as distinct extension modules; with subinterpreter
+        # support enabled this can exhaust the available TSS keys and crash/abort
+        # during module import. Disable it for robustness in long-running runs.
+        "-DPYBIND11_HAS_SUBINTERPRETER_SUPPORT=0",
+    ]
 
     # Performance-first default: enable `-march=native` unless explicitly disabled.
     # (This is the single largest win for Eigen-heavy kernels.)

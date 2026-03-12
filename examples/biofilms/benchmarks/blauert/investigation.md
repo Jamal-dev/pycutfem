@@ -14,7 +14,250 @@ For this benchmark we disable all biofilm biology/damage:
 
 The intent is: *can the FSI mechanics + coupling reproduce the deformation response?*
 
+## 2026-03-12 short investigation
+
+### Benchmark 6 formulation and scientific success
+
+- Paper formulation (`verification/benchmark6_overview.tex`, `verification/benchmark6_blauert_channel.tex`):
+  - domain `L=5.5 mm`, `H=1.0 mm`,
+  - parabolic inflow with `u_avg = 4.56e-2 m/s` and cosine ramp `t_ramp = 2 s`,
+  - transported `(alpha, mu_alpha)` via conservative CH transport,
+  - transported `phi`,
+  - no growth / substrate / detached biomass / damage,
+  - optional benchmark-local diffuse tangential traction `g_Gamma^n = zeta_tau r(t_n) tau_P(y) t_Gamma^n`, evaluated IMEX at the accepted previous time level.
+- Reviewer-facing success in the paper:
+  - global front motion and front motion at `y = 150, 250, 350 um`,
+  - contour mismatch at representative times,
+  - mesh sensitivity of those errors.
+- Wrapper-level success checks:
+  - `dynamic_08pa` requires `t_final >= 10 s` and targets `front_compression_2p0_um = 148`, `front_plateau_drift_2p0_10p0_um = 0`, `porosity_drop_2p0_pp = 2`,
+  - `steady_dian` tracks contour RMSE / MAE / max and `steady_front_y150_err_um`,
+  - calibration score weights are `0.45` contour RMSE, `0.15` front-150 error, `0.20` 2 s compression error, `0.10` plateau drift, `0.10` porosity-drop error.
+
+### Ranked root-cause hypotheses
+
+1. Immediate blocker for the current short benchmark-6 probe: the internal PDAS linear solve fails in the PETSc Schur/FGMRES path before any LM step can be attempted.
+   - Evidence from the exact short probe at `/tmp/b6_schur_probe_fast_diag_escalated`:
+     - `VI Newton 1: |G|_inf=9.96e-04 |R|_inf=9.96e-04 nA=49`,
+     - `[vi-set] alpha:lo=0,hi=0  phi:lo=0,hi=49`,
+     - `[vi-lm] skipped: nA=49 active VI dofs keep PDAS mode enabled. active={phi:lo=0,hi=49}`,
+     - `[ksp] type=fgmres pc=fieldsplit reason=-3 its=10000 rnorm=5.731e-04`,
+     - `[fail_blocks] momentum:9.96e-04, mass:1.05e-06, ...`,
+     - `[fail_mom_terms] gamma_div:9.66e-04, viscous:1.92e-05, supg:8.03e-06, convection:3.31e-06, ...`.
+   - Control evidence: the same case with direct LU (`/tmp/b6_direct_probe`) reached `t=0.025 s` in 3 Newton iterations with `|G|_inf=8.14e-07`.
+
+2. The current LM path is usually disabled in Benchmark 6 exactly when the hard regime appears, because the implementation only enables LM when the VI active set is empty.
+   - Code: `pycutfem/solvers/nonlinear_solver.py` uses `use_lm = unconstrained_lm and nA == 0`.
+   - Driver: `examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py` sets box bounds on both `alpha` and `phi`.
+   - Existing benchmark-6 logs show nonempty active sets immediately:
+     - `/tmp/benchmark6_diag_E320_z30_maxit7/calibration/E320_eta0_zeta30_nx24/run.log`: `nA=255` at Newton 1, `nA=589` at Newton 2,
+     - `/tmp/benchmark6_zeta30_gdiv01.log`: `nA=310` at Newton 1, `nA=515` at Newton 2.
+
+3. Even when LM is allowed to run, it is not a VI-aware LM globalization; it is a shifted Newton step accepted on the raw residual merit `0.5 ||R||^2`, not on the semismooth residual `G`.
+   - `_vi_build_unconstrained_lm_system()` forms `(A + lambda D) s = -R`.
+   - `_eval_reduced_trial()` evaluates `R_try` only.
+   - `_vi_unconstrained_lm_model()` and the accept/reject logic use the raw residual merit, not a semismooth complementarity merit.
+   - That matches the unit tests in `tests/test_internal_pdas_controls.py`, which only verify the shifted-system algebra and a scalar toy solve, not a benchmark-6 active-set case.
+
+4. Secondary diagnostic suspicion: the Schur/FGMRES configuration is either under-preconditioned for this reduced system or its effective iteration cap is not behaving as intended.
+   - The failing probe reports `its=10000` even though the command sets `--linear-ksp-max-it 200`.
+   - Treat this as secondary until hypotheses 1-3 are resolved; the direct-LU control already shows the short-horizon problem is otherwise solvable.
+
+5. The paper wrapper was not actually running the Benchmark-6 forcing from the paper source: it defaulted to `t_ramp = 0.2 s` even though the paper benchmark and the checked-in investigation note specify `t_ramp = 2.0 s`.
+   - Code: `examples/biofilms/benchmarks/blauert/paper1_benchmark6_blauert_channel.py` defaulted `--t-ramp` to `0.2`.
+   - Paper source: `verification/benchmark6_blauert_channel.tex` states `t_ramp = 2 s`.
+   - Observed effect:
+     - old wrapper smoke (`/tmp/b6_wrapper_smoke_steady`) already reached `dx_front_y250 ≈ 42.7 um` at `t = 0.2 s` and `64.7 um` at `t = 0.25 s`,
+     - but the extracted video stays near zero over the same window (`dx_front_y250 ≈ 0 um` at `t ≈ 0.20-0.23 s`),
+     - after correcting the wrapper to `t_ramp = 2.0 s`, the same candidate (`E=200, zeta=30, gamma_u=5`) dropped to `dx_front_y250 ≈ 0.689 um` at `t = 0.2 s` and `1.35 um` at `t = 0.25 s`, with early-time per-height RMSEs `4.22/1.20/1.17 um` at `150/250/350 um`.
+
+6. The global front observable in the driver was not the paper's contour-based quantity; it used a quantile over all DOFs with `alpha >= 0.5`, which explains the repeated `dx_front_global = 0` even when the tracked contour fronts moved.
+   - Code: `_x_front_global_quantile()` in `examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py` used the DOF set `alpha >= alpha_half`.
+   - Paper source: `verification/benchmark6_overview.tex` says the front-displacement histories are extracted from the transported `alpha = 1/2` contour.
+   - Observed effect:
+     - long/short runs before the fix reported `dx_front_global = 0` while `dx_front_y250` and `dx_front_y333` were nonzero,
+     - after switching the observable to the contour points, the same `t <= 0.25 s` probe produced a nonzero global history with `dx_front_global ≈ 0.140 um` at `t = 0.2 s` and `0.295 um` at `t = 0.25 s`,
+     - the early-time global comparison against the video extraction became finite and small: RMSE `1.17 um` over `t ∈ [0, 0.2336] s`.
+
+### Files to inspect or edit
+
+- `pycutfem/solvers/nonlinear_solver.py`
+  - PDAS active-set assembly and Newton loop,
+  - LM gate and LM model,
+  - PETSc Schur/FGMRES linear-solve path.
+- `examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py`
+  - benchmark-6 argument plumbing,
+  - bound setup for `alpha` / `phi`,
+  - linear-solver environment wiring.
+- `examples/biofilms/benchmarks/blauert/paper1_benchmark6_blauert_channel.py`
+  - scientific success metrics, required observation windows, paper outputs.
+- `examples/biofilms/benchmarks/blauert/compare_sim_vs_observations.py`
+  - exact observation targets and measured errors.
+- `examples/biofilms/benchmarks/blauert/investigation.md`
+  - keep this note aligned with observed logs and the next validation results.
+
+### Minimal diagnostic edit already applied
+
+- `pycutfem/solvers/nonlinear_solver.py` now prints an explicit `[vi-lm] skipped: ...` message when `--vi-unconstrained-lm` is enabled but `nA > 0`.
+- This is diagnostic only. It does not change the PDAS/LM algorithm; it only makes it visible when LM is not actually in play.
+
+### Short validation commands
+
+1. Reproduce the immediate short-run failure in the Schur/FGMRES path and confirm whether LM is skipped or active:
+
+```bash
+env OMP_NUM_THREADS=8 BLIS_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+PYCUTFEM_CPP_FAST_COMPILE=0 PYCUTFEM_CPP_FAST_OPT_LEVEL=1 \
+PYCUTFEM_LINEAR_KSP_TRACE=1 PYCUTFEM_VI_TRACE_LM=1 PYCUTFEM_VI_TRACE_LS=1 \
+PYCUTFEM_VI_TRACE_REG=1 PYCUTFEM_VI_TRACE_FIELDS=1 \
+PYCUTFEM_NEWTON_TRACE_RES_FIELDS=1 PYCUTFEM_NEWTON_TRACE_RES_FIELDS_N=10 \
+conda run --no-capture-output -n fenicsx python \
+examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py \
+--backend cpp --transport-mode pde \
+--diffuse-shear-traction --diffuse-shear-model poiseuille --diffuse-shear-scale 30 \
+--diffuse-shear-time-scheme imex --nonlinear-solver pdas --ls-mode dealii \
+--vi-unconstrained-lm --vi-lm-lambda0 1e-4 --vi-lm-lambda-max 1e6 \
+--vi-lm-growth 5 --vi-lm-decay 0.5 --vi-lm-accept-ratio 1e-3 \
+--vi-lm-good-ratio 0.75 --vi-lm-max-tries 6 \
+--linear-ksp-type fgmres --linear-ksp-rtol 1e-8 --linear-ksp-max-it 200 \
+--linear-ksp-trace --linear-schur --linear-schur-pressure-field p \
+--linear-schur-fact upper --linear-schur-pre selfp \
+--linear-schur-rest-ksp preonly --linear-schur-rest-pc ilu \
+--linear-schur-pressure-ksp preonly --linear-schur-pressure-pc jacobi \
+--nx 24 --ny 8 --dt 0.025 --t-final 0.025 --theta 1.0 --q 4 --t-ramp 0.2 \
+--E 320 --nu 0.4 --solid-visco-eta 0 --u-avg 0.1777777778 --rho-f 1000 \
+--kappa-inv 9.81e11 --phi-b 0.47 --gamma-u 5 --u-extension l2 --gamma-u-pin 1e-4 \
+--kinematics-scale 1000 --alpha-ch-M 1e-12 --alpha-ch-gamma 2e-3 --alpha-ch-eps 2e-5 \
+--diffuse-shear-scale-ref 50 --scale-alpha-ch-eps-with-zeta \
+--alpha-advection-form conservative --alpha-supg 0.5 --alpha-cip 0.0 \
+--v-supg 1 --v-supg-mode residual --v-supg-c-nu 4 \
+--u-supg 1 --u-cip 1 --u-cip-weight biofilm --v-cip 1 --vS-cip 1 \
+--global-front-quantile 0.9 --dx-quantile 0.9 \
+--gamma-div 0.1 --adaptive-gamma-div --gamma-div-max 0.2 \
+--newton-tol 1e-6 --max-it 8 --dt-min 0.005 \
+--refine-biofilm --refine-band 2.5e-4 --refine-expand-layers 1 \
+--restart-write-every 1 --vtk-every 0 \
+--out-dir /tmp/b6_schur_probe_fast_diag_escalated
+```
+
+2. Isolate the linear solver as the immediate blocker by keeping the same benchmark-6 setup but replacing Schur/FGMRES with direct LU:
+
+```bash
+env OMP_NUM_THREADS=8 BLIS_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+PYCUTFEM_CPP_FAST_COMPILE=0 PYCUTFEM_CPP_FAST_OPT_LEVEL=1 \
+PYCUTFEM_LINEAR_KSP_TRACE=1 PYCUTFEM_NEWTON_TRACE_RES_FIELDS=1 \
+PYCUTFEM_NEWTON_TRACE_RES_FIELDS_N=10 \
+conda run --no-capture-output -n fenicsx python \
+examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py \
+--backend cpp --transport-mode pde \
+--diffuse-shear-traction --diffuse-shear-model poiseuille --diffuse-shear-scale 30 \
+--diffuse-shear-time-scheme imex --nonlinear-solver pdas --ls-mode dealii \
+--vi-unconstrained-lm --vi-lm-lambda0 1e-4 --vi-lm-lambda-max 1e6 \
+--vi-lm-growth 5 --vi-lm-decay 0.5 --vi-lm-accept-ratio 1e-3 \
+--vi-lm-good-ratio 0.75 --vi-lm-max-tries 6 \
+--linear-ksp-type preonly --linear-pc-type lu --linear-pc-factor-solver-type mumps \
+--linear-ksp-rtol 1e-8 --linear-ksp-max-it 200 --linear-ksp-trace --no-linear-schur \
+--nx 24 --ny 8 --dt 0.025 --t-final 0.025 --theta 1.0 --q 4 --t-ramp 0.2 \
+--E 320 --nu 0.4 --solid-visco-eta 0 --u-avg 0.1777777778 --rho-f 1000 \
+--kappa-inv 9.81e11 --phi-b 0.47 --gamma-u 5 --u-extension l2 --gamma-u-pin 1e-4 \
+--kinematics-scale 1000 --alpha-ch-M 1e-12 --alpha-ch-gamma 2e-3 --alpha-ch-eps 2e-5 \
+--diffuse-shear-scale-ref 50 --scale-alpha-ch-eps-with-zeta \
+--alpha-advection-form conservative --alpha-supg 0.5 --alpha-cip 0.0 \
+--v-supg 1 --v-supg-mode residual --v-supg-c-nu 4 \
+--u-supg 1 --u-cip 1 --u-cip-weight biofilm --v-cip 1 --vS-cip 1 \
+--global-front-quantile 0.9 --dx-quantile 0.9 \
+--gamma-div 0.1 --adaptive-gamma-div --gamma-div-max 0.2 \
+--newton-tol 1e-6 --max-it 8 --dt-min 0.005 \
+--refine-biofilm --refine-band 2.5e-4 --refine-expand-layers 1 \
+--restart-write-every 1 --vtk-every 0 \
+--out-dir /tmp/b6_direct_probe
+```
+
+3. Isolate the LM implementation itself outside the benchmark-6 active-set regime:
+
+```bash
+conda run --no-capture-output -n fenicsx python -m pytest \
+tests/test_internal_pdas_controls.py -k unconstrained_lm -q
+```
+
+### Measurable success criteria for a healthy run
+
+- Healthy short validation run:
+  - reaches `t = 0.025 s` without PETSc KSP failure or line-search failure,
+  - converges the first step in at most 3 Newton iterations on the current `nx=24, ny=8` probe,
+  - reduces `|G|_inf` below `1e-6`,
+  - accepts full steps (`alpha = 1`) and does not trigger dt reduction.
+- Healthy benchmark-6 production run:
+  - completes the observation window required by the selected paper scenario (`dynamic_08pa` needs `t_final >= 10 s`; `steady_dian` needs a finite steady snapshot),
+  - produces finite values for the required metrics in `benchmark6_blauert_channel_summary.csv` / `.json`,
+  - writes the paper assets
+    - `benchmark6_blauert_channel_history.png`,
+    - `benchmark6_blauert_channel_contours.png`,
+    - `benchmark6_blauert_channel_mesh_sensitivity.png`,
+  - preserves restart checkpoints so any late-time failure can be restarted from the last accepted step.
+
+### Logs and metrics to monitor during long runs
+
+- Solver iteration metrics:
+  - `|G|_inf`, `|R|_inf`, `nA`, `nI`, `DeltaA`, `|R_I|_inf`, `|gap_A|_inf`, `nA_strong`, `lambda`.
+- Active-set ownership:
+  - per-field active counts for `alpha` and `phi` from `[vi-set]`.
+- Residual ownership:
+  - `[res]` and `[fail_res]` with special attention to `v_x`, `v_y`, `vS_x`, `vS_y`.
+- Momentum decomposition:
+  - `[fail_blocks]`, `[fail_mom_terms]`, and `[fail_slip]` when a step is rejected.
+- Linear solver behavior:
+  - `[ksp-schur]` split sizes,
+  - `[ksp]` reason / iteration count / residual norm.
+- Time-step robustness:
+  - `gamma_div_history.csv`,
+  - dt reductions, retries, and accepted `nNewton`.
+- Scientific outputs:
+  - `timeseries.csv` columns `dx_front_global`, `dx_front_y150um`, `dx_front_y250um`, `dx_front_y350um`, `phi_mean_alpha_weighted`,
+  - observation comparison JSON files under each case directory,
+  - summary CSV/JSON and generated paper figures.
+
 ## Literature reference points
+
+## 2026-03-12: corrected-observable calibration queue
+
+The corrected best active-porosity branch
+`/tmp/b6_driver_E500_z100_gU10_rho1000_nx24_t2p0_obsfix`
+is solver-healthy but fails with a split late-time shape error:
+
+- global/toe front still under-advances (`-30.4 um` at `t=2.0 s`),
+- tracked heights overshoot by `+29 / +48 / +42 um` at `150 / 250 / 350 um`,
+- contour `front_y150_err_um` grows from `58.4 um` at `1.0 s` to `131.5 um`
+  at `2.0 s`.
+
+That pattern matters: it is not a pure amplitude deficit. The current
+`poiseuille` closure is tangential-only, so the first new model-level canary is
+to re-check the full lagged traction closure on the corrected observable path.
+
+Ranked Batch A for the next screening window (`t_final = 1.5 s`, direct LU):
+
+1. `lagged_stress`, `diffuse_shear_scale = 10`, `E = 500`, `gamma_u = 10`,
+   `rho_f = 1000`, `nu = 0.4`, `kappa_inv = 9.81e11`.
+   Hypothesis: missing normal compression is the main reason the toe lags while
+   the upper contour overshoots.
+2. `poiseuille`, `gamma_u = 12.5`, same base branch otherwise.
+   Hypothesis: slightly stronger extension penalty suppresses the late upper
+   overshoot without changing the onset.
+3. `poiseuille`, `kappa_inv = 1.962e12`, same base branch otherwise.
+   Hypothesis: stronger drag redistributes the fluid loading into a broader
+   compressive response.
+4. `poiseuille`, `nu = 0.45`, same base branch otherwise.
+   Hypothesis: near-incompressibility changes the contour shape more than the
+   scalar amplitude.
+
+All Batch A probes keep:
+
+- corrected global observable (`row-wise leftmost contour quantile`),
+- `global_front_quantile = 0.05`, `dx_quantile = 0.05`,
+- `u_avg = 0.0456`, `t_ramp = 2.0`,
+- direct LU / MUMPS,
+- `vi_lm_good_ratio = 0.05`,
+- `accept_nonconverged_atol_factor = 4`.
 Source: `examples/biofilms/benchmarks/blauert/blauert.tex`.
 
 - Dynamic experiment shows an upstream/front compression measured as the distance from the
@@ -1428,3 +1671,955 @@ with secondary control coming from the extension coercivity (`gamma_u`) and only
 algorithmic help from `gamma_div`.
 
 That is the right quantity to organize the next transient screening around.
+
+## 2026-03-12 short-validation follow-up
+
+### Completed `gamma_u` comparison on the corrected benchmark setup
+
+Common setup for the comparison:
+
+- corrected `t_ramp = 2.0 s`,
+- corrected contour-based global front observable,
+- `E = 200 Pa`, `solid_visco_eta = 0`, `zeta = 30`,
+- `rho_f = 0`, `u_avg = 0.0456 m/s`,
+- direct LU (`preonly + lu + mumps`),
+- `dt = 0.005`, `dt_min = 0.00125`,
+- `global_front_quantile = 0.005`, `dx_quantile = 0.05`.
+
+Short validation run for the new candidate:
+
+- output: `/tmp/b6_driver_tramp2_gU10_t1`,
+- restart source: `/tmp/b6_driver_tramp2_gfix_t025/restart/checkpoint_latest.npz`,
+- changed parameter: `gamma_u = 10` (previous comparison branch used `gamma_u = 5` in `/tmp/b6_driver_tramp2_gfix_t2`).
+
+### What changed scientifically
+
+- Solver health is no longer the limiting factor:
+  - the `gamma_u = 10` branch reached `t = 1.0 s` with every step accepted,
+  - `dt` stayed at `0.005`,
+  - each step converged in `2` Newton iterations,
+  - no `dt` reduction, line-search failure, trust-region stagnation, or NaNs occurred.
+
+- Comparison against the extracted video over `t ∈ [0.267, 0.968] s`:
+
+  - `gamma_u = 10`:
+    - global `RMSE = 6.15 um`,
+    - `y = 150 um`: `RMSE = 20.3 um`,
+    - `y = 250 um`: `RMSE = 12.1 um`,
+    - `y = 350 um`: `RMSE = 9.77 um`.
+
+  - `gamma_u = 5`:
+    - global `RMSE = 5.05 um`,
+    - `y = 150 um`: `RMSE = 18.7 um`,
+    - `y = 250 um`: `RMSE = 25.4 um`,
+    - `y = 350 um`: `RMSE = 7.88 um`.
+
+- Direct displacement comparison at `t = 1.0 s`:
+  - `gamma_u = 10`: `dx_front_global ≈ 12.25 um`, `dx_front_y250 ≈ 41.0 um`,
+  - `gamma_u = 5`: `dx_front_global ≈ 17.17 um`, `dx_front_y250 ≈ 97.6 um`.
+
+### Decision for the first corrected long run
+
+- `gamma_u = 10` is the best-working parameter set so far.
+  - It materially reduces the dominant mid-height overshoot that made the `gamma_u = 5`
+    trajectory scientifically questionable.
+  - Its aggregate front-history fit is better over the full `0.27-0.97 s` window
+    (`mean RMSE ≈ 12.1 um` across global/150/250/350) than `gamma_u = 5`
+    (`mean RMSE ≈ 14.3 um`).
+
+- Remaining risk:
+  - the global and `y = 150 um` histories are still not ideal, so the next step must be a
+    monitored long production run rather than declaring the calibration complete.
+
+- Planned next run:
+  - wrapper production run with the same corrected physics and `gamma_u = 10`,
+  - explicit `--t-ramp 2.0`,
+  - monitored at the first `30 min` checkpoint and then hourly if healthy.
+
+### Completed follow-up: `gamma_u = 20` at the corrected `zeta = 30` forcing
+
+A stronger whole-domain extension was tested next to see whether the remaining
+late-time defect was still just the overly peaked `y = 250 um` front.
+
+Common setup relative to the `gamma_u = 10` branch:
+
+- same corrected paper forcing:
+  - `u_avg = 4.56e-2 m/s`,
+  - `t_ramp = 2.0 s`,
+  - `zeta = 30`,
+- same corrected observables:
+  - contour-based global front with `global_front_quantile = 0.005`,
+  - per-height contour fronts with `dx_quantile = 0.05`,
+- same solver path:
+  - semismooth LM enabled on nonempty active sets,
+  - direct LU,
+  - `gamma_div = 0.1`,
+  - `rho_f = 0`,
+  - `dt = 0.005`, `dt_min = 0.00125`.
+
+Changed parameter:
+
+- `gamma_u = 20` (output: `/tmp/b6_driver_tramp2_gU20_t1p5`).
+
+What happened:
+
+- Solver health stayed excellent through `t = 1.5 s`:
+  - no dt reduction,
+  - `nNewton = 2`,
+  - no line-search failure,
+  - no LM/trust-region stagnation,
+  - no NaNs.
+- But the scientific fit became much worse by late times.
+
+Measured comparison against the extracted video over `t ∈ [0.267, 1.47] s`:
+
+- global `RMSE = 37.1 um`,
+- `y = 150 um`: `RMSE = 40.7 um`,
+- `y = 250 um`: `RMSE = 27.2 um`,
+- `y = 350 um`: `RMSE = 35.6 um`.
+
+Late-time displacement check at `t ≈ 1.50 s`:
+
+- simulation:
+  - global `≈ 20.3 um`,
+  - `y167 ≈ 20.3 um`,
+  - `y250 ≈ 61.5 um`,
+  - `y333 ≈ 25.7 um`;
+- extracted video:
+  - global `≈ 88.1 um`,
+  - `y150 ≈ 95.9 um`,
+  - `y250 ≈ 86.5 um`,
+  - `y350 ≈ 88.1 um`.
+
+Practical conclusion from this branch:
+
+- increasing `gamma_u` further is **not** the right next lever.
+- It does flatten the centerline peak, but by `t ≈ 1.5 s` it underpredicts the
+  whole benchmark and cannot reach a publishable history fit.
+- The next corrected-physics validation should therefore move to a branch that
+  has evidence for a flatter per-height response at the parameter level, not
+  just through stronger extension.
+
+### Evidence-based next parameter move
+
+The most useful archived qualitative clue is the earlier dynamic branch with
+`E = 500`, `zeta = 50` on the old fast-ramp configuration:
+
+- `examples/biofilms/results/benchmark6_target_dynamic08_20260311/calibration/E500_eta0_zeta50_nx24/timeseries.csv`
+
+That run is **not** quantitatively comparable, because it used the old
+over-aggressive ramp and the old global observable, but it is still useful as a
+shape indicator: by its final reported time (`t ≈ 0.120 s`) the per-height
+fronts were already nearly uniform (`y167 ≈ 32.6 um`, `y250 ≈ 26.2 um`,
+`y333 ≈ 30.2 um`), unlike the strongly center-peaked corrected `E = 200`,
+`zeta = 30` branch.
+
+So the next short validation should test the corrected paper physics on the
+first branch with prior support for a flatter front:
+
+- `E = 500 Pa`,
+- `zeta = 50`,
+- keep the corrected LM path,
+- keep `gamma_u = 10` as the best current extension setting,
+- run only a short corrected probe first (`t_final = 0.5 s`) before any longer
+  continuation.
+
+## 2026-03-12 continuation update
+
+### Completed continuation: corrected `E = 500`, `zeta = 50`, `gamma_u = 10` is solver-healthy but still not publishable
+
+Continuation run:
+
+- output root: `/tmp/b6_driver_E500_z50_gU10_t1p5`,
+- resumed to completion from the last written checkpoint in that directory,
+- same corrected setup otherwise:
+  - `transport-mode pde`,
+  - `poiseuille` diffuse traction,
+  - `t_ramp = 2.0 s`,
+  - `rho_f = 0`,
+  - `dt = 0.005`,
+  - direct LU,
+  - `gamma_u = 10`.
+
+Observed solver behavior:
+
+- no LM/trust-region stagnation,
+- no line-search failure,
+- no KSP failure,
+- no NaNs,
+- fixed `dt = 0.005`,
+- accepted the full run to `t = 1.5 s`.
+
+So the LM stall issue is fixed on this branch too. The blocker is scientific fit only.
+
+Late-window fit from the completed continuation:
+
+- comparison against the extracted video over `t ∈ [0.501, 1.47] s`:
+  - global `RMSE = 35.0 um`,
+  - `y = 150 um`: `RMSE = 39.0 um`,
+  - `y = 250 um`: `RMSE = 14.2 um`,
+  - `y = 350 um`: `RMSE = 32.1 um`;
+- direct front values:
+  - at `t = 1.0 s`:
+    - global `≈ 14.6 um`,
+    - `y167 ≈ 14.9 um`,
+    - `y250 ≈ 42.9 um`,
+    - `y333 ≈ 18.8 um`;
+  - at `t = 1.5 s`:
+    - global `≈ 36.4 um`,
+    - `y167 ≈ 36.1 um`,
+    - `y250 ≈ 112.2 um`,
+    - `y333 ≈ 45.4 um`.
+
+Against the extracted video at `t ≈ 1.5 s`:
+
+- global `≈ 88.1 um`,
+- `y150 ≈ 95.9 um`,
+- `y250 ≈ 86.5 um`,
+- `y350 ≈ 88.1 um`.
+
+Interpretation:
+
+- the branch keeps its excellent early-window fit,
+- but by late time it falls back into the same structural defect:
+  - the centerline front overshoots,
+  - while the global / `y150` / `y350` histories remain far too small.
+
+So this branch is not publishable yet even though the solver is now healthy.
+
+### Additional root-cause eliminations completed
+
+1. Initial contour source is **not** the problem.
+
+- Re-ran the extractor with the recommended Matlab source:
+
+  ```bash
+  conda run --no-capture-output -n fenicsx python \
+    examples/biofilms/benchmarks/blauert/extract_front_displacement_from_video.py \
+    --polygon-source matlab_preprocessing --matlab-shift-um 0 --t-max 0 \
+    --out-csv /tmp/b6_matlab_extract.csv \
+    --out-polygon /tmp/b6_matlab_polygon_mm.csv
+  ```
+
+- The generated `/tmp/b6_matlab_polygon_mm.csv` matches
+  `examples/biofilms/benchmarks/blauert/exp_frame0_polygon_mm.csv`.
+- So the current default `alpha0` file is already the recommended Matlab-derived contour.
+
+2. The IMEX traction time level is wired correctly.
+
+- In `blauert_biofilm_deformation_one_domain.py`, `diffuse_scale_update(t_now)` is called in `post_step_refiner(...)`.
+- In `nonlinear_solver.py`, `post_step_refiner(...)` runs only after an accepted step with
+  `solver._current_t = t_n` and `solver._current_dt = dt`.
+- Therefore the updated diffuse-traction amplitude is used on the next solve at the accepted previous time level, matching the benchmark statement.
+
+So the late-time mismatch is not explained by either:
+
+- a wrong initial polygon source, or
+- a wrong IMEX time-level update.
+
+### Evidence-based next move
+
+The next short validation should reintroduce the physical fluid inertia around the now-promising high-`E`, `zeta = 50` branch.
+
+Reason:
+
+- the earlier active-porosity proxy winner and screening logic were built on `rho_f = 1000`,
+- the corrected quasi-static branch is now solver-healthy but still shape-mismatched at late time,
+- so the next evidence-based question is whether restoring the physical fluid transient changes the late-time front profile in the right direction.
+
+## 2026-03-12 physical-inertia follow-up
+
+### Completed physical-inertia validation: `E = 500`, `zeta = 50`, `gamma_u = 10`, `rho_f = 1000`
+
+Validation branch:
+
+- output root: `/tmp/b6_driver_E500_z50_gU10_rho1000_nx24_t0p5`,
+- active-porosity path,
+- `poiseuille` diffuse traction,
+- `nx = 24`, `ny = 12`,
+- `dt = 0.05`,
+- `t_ramp = 2.0 s`,
+- direct LU,
+- `gamma_u = 10`,
+- `gamma_div = 0.1`, `gamma_div_max = 0.2`.
+
+Short-window result (`t_final = 0.5 s`):
+
+- numerically healthy:
+  - no dt reduction,
+  - no LM/trust-region stagnation,
+  - no KSP failure,
+  - no NaNs;
+- early comparison remained strong:
+  - global `RMSE = 0.974 um`,
+  - `y = 150 um`: `RMSE = 5.97 um`,
+  - `y = 250 um`: `RMSE = 1.68 um`,
+  - `y = 350 um`: `RMSE = 1.46 um`.
+
+Continuation result (`t_final = 1.5 s` on the same branch):
+
+- still numerically healthy through `t = 1.5 s`,
+- no dt reduction,
+- accepted every step,
+- late-window comparison over `t ∈ [0, 1.47] s`:
+  - global `RMSE = 29.1 um`,
+  - `y = 150 um`: `RMSE = 30.7 um`,
+  - `y = 250 um`: `RMSE = 25.4 um`,
+  - `y = 350 um`: `RMSE = 26.4 um`.
+
+Late-time front values:
+
+- at `t = 1.0 s`:
+  - global `≈ 15 um`,
+  - `y167 ≈ 16 um`,
+  - `y250 ≈ 19 um`,
+  - `y333 ≈ 22 um`;
+- at `t = 1.2 s`:
+  - global `≈ 21 um`,
+  - `y167 ≈ 23 um`,
+  - `y250 ≈ 24 um`,
+  - `y333 ≈ 28 um`;
+- at `t = 1.5 s`:
+  - global `≈ 31 um`,
+  - `y167 ≈ 36 um`,
+  - `y250 ≈ 53 um`,
+  - `y333 ≈ 38 um`.
+
+Interpretation:
+
+- restoring `rho_f = 1000` changes the **shape** in the right direction:
+  - the late-time response is much flatter than the `rho_f = 0` branch,
+  - the earlier centerline overshoot is largely removed;
+- but the whole benchmark is now underdriven:
+  - all histories are still well below the extracted video by `t ≈ 1.5 s`.
+
+So the next lever should be **amplitude**, not another stabilization or LM change.
+
+### Evidence-based next move
+
+Increase the diffuse-traction scale on this same physical-inertia branch.
+
+Reason:
+
+- with `rho_f = 1000`, `zeta = 50` looks like an amplitude deficit more than a shape defect,
+- the earlier active-porosity onset screen already identified `zeta = 50` and `zeta = 100` as the numerically clean onset band,
+- and `--scale-alpha-ch-eps-with-zeta` is already enabled, so the next `zeta` step respects the current analytical scaling rule.
+
+### Completed follow-up: `zeta = 100` on the same physical-inertia branch
+
+Run family:
+
+- output root: `/tmp/b6_driver_E500_z100_gU10_rho1000_nx24_t0p5`,
+- same setup as the `zeta = 50` branch except `diffuse_shear_scale = 100`.
+
+Short-window result (`t_final = 0.5 s`):
+
+- numerically healthy with fixed `dt = 0.05`,
+- no dt reduction / no LM stagnation / no KSP failure / no NaNs,
+- early comparison over `t ∈ [0, 0.467] s`:
+  - global `RMSE = 0.983 um`,
+  - `y = 150 um`: `RMSE = 6.00 um`,
+  - `y = 250 um`: `RMSE = 1.03 um`,
+  - `y = 350 um`: `RMSE = 1.29 um`.
+
+So the stronger branch still clears the short-validation gate.
+
+Continuation result (`t = 1.5 s`):
+
+- still solver-healthy,
+- dynamic per-height histories become the best so far:
+  - `y = 150 um`: `RMSE = 24.0 um`,
+  - `y = 250 um`: `RMSE = 9.93 um`,
+  - `y = 350 um`: `RMSE = 14.7 um`.
+
+But the global history remains wrong:
+
+- global `RMSE = 39.2 um`,
+- at `t = 1.5 s`:
+  - global `≈ -5 um`,
+  - `y167 ≈ 65 um`,
+  - `y250 ≈ 92 um`,
+  - `y333 ≈ 76 um`.
+
+Continuation result (`t = 2.0 s`):
+
+- still numerically healthy through `t = 2.0 s`,
+- but the late branch now overdrives the tracked heights while the global toe remains pinned/backward:
+  - global `≈ -17 um`,
+  - `y167 ≈ 128 um`,
+  - `y250 ≈ 142 um`,
+  - `y333 ≈ 134 um`.
+
+History comparison to `t = 2.0 s`:
+
+- global `RMSE = 62.5 um`,
+- `y = 150 um`: `RMSE = 22.3 um`,
+- `y = 250 um`: `RMSE = 18.2 um`,
+- `y = 350 um`: `RMSE = 16.0 um`.
+
+The `steady_dian` contour check at `t = 2.0 s` also remains poor:
+
+- `steady_profile_rmse_um = 206.0`,
+- `steady_front_y150_err_um = 79.7`.
+
+Interpretation:
+
+- `zeta = 100` is the first corrected branch that gets the **y-resolved dynamic histories** close,
+- but it is still not publishable because the global/front-toe observable and the 2-second contour remain wrong.
+
+### Evidence-based next move
+
+Increase stiffness on the same `zeta = 100`, `rho_f = 1000` branch.
+
+Reason:
+
+- the stronger forcing fixed the amplitude deficit but now overdrives the tracked heights by `2.0 s`,
+- the old stiffness screen improved the high-`zeta` branch monotonically with increasing `E`,
+- so the next evidence-based question is whether a stiffer solid can reduce the late contour distortion while keeping the now-corrected dynamic onset.
+
+### Completed stiffness check: `E = 1000` is indistinguishable from `E = 500` on the validated window
+
+Run:
+
+- output root: `/tmp/b6_driver_E1000_z100_gU10_rho1000_nx24_t0p5`,
+- same branch as above except `E = 1000 Pa`.
+
+Observed result:
+
+- the `t <= 0.5 s` history is identical to the `E = 500` branch to numerical precision,
+- and the continued run stayed step-for-step identical through `t ≈ 1.05 s` before it was stopped deliberately.
+
+Measured maximum difference versus the `E = 500` branch over the `t <= 0.5 s` timeseries:
+
+- `dx_front_global`: `4.88e-11 m`,
+- `dx_front_y167um`: `1.20e-11 m`,
+- `dx_front_y250um`: `4.11e-11 m`,
+- `dx_front_y333um`: `3.66e-11 m`,
+- `phi_mean_alpha_weighted`: `7.45e-11`.
+
+Interpretation:
+
+- in the current `zeta = 100`, `rho_f = 1000`, `nx = 24`, `dt = 0.05` regime,
+  raising `E` from `500` to `1000` does not materially move the observed branch.
+- So a further stiffness-only sweep is not the most useful next step.
+
+### Current bottom line
+
+- The LM/globalization problem is fixed.
+- The best dynamic-history branch so far is:
+  - `E = 500`,
+  - `zeta = 100`,
+  - `rho_f = 1000`,
+  - `gamma_u = 10`,
+  - `nx = 24`,
+  - `dt = 0.05`,
+  - `t_ramp = 2.0`.
+- But this branch is still not publishable because the global front and contour observables remain wrong.
+
+### Follow-up result: corrected `E = 500`, `zeta = 50`, `gamma_u = 10`
+
+That branch did exactly what the archived proxy evidence suggested on the early
+window, but it still failed the full late-time history check.
+
+Observed sequence:
+
+- short corrected probe to `t = 0.5 s`
+  (`/tmp/b6_driver_E500_z50_gU10_t0p5`):
+  - numerically clean,
+  - video comparison over `t ∈ [0, 0.467] s`:
+    - global `RMSE = 1.03 um`,
+    - `y150 RMSE = 5.90 um`,
+    - `y250 RMSE = 2.00 um`,
+    - `y350 RMSE = 0.988 um`;
+- continued corrected run to `t = 1.5 s`
+  (`/tmp/b6_driver_E500_z50_gU10_t1p5`):
+  - still numerically clean after resuming from `t = 1.325 s`,
+  - but comparison over `t ∈ [0.501, 1.47] s` degraded to:
+    - global `RMSE = 35.0 um`,
+    - `y150 RMSE = 39.0 um`,
+    - `y250 RMSE = 14.2 um`,
+    - `y350 RMSE = 32.1 um`.
+
+Late-time displacement state at `t = 1.5 s`:
+
+- simulation:
+  - global `≈ 36.4 um`,
+  - `y167 ≈ 36.1 um`,
+  - `y250 ≈ 112.2 um`,
+  - `y333 ≈ 45.4 um`;
+- extracted video:
+  - global `≈ 88.1 um`,
+  - `y150 ≈ 95.9 um`,
+  - `y250 ≈ 86.5 um`,
+  - `y350 ≈ 88.1 um`.
+
+Practical conclusion:
+
+- the branch is **not** publishable despite the early success;
+- the same late-time shape defect remains:
+  - the middle height outruns the video,
+  - while the global and outer-height fronts lag badly.
+
+This makes the next move clearer.
+
+- The quasi-static simplification (`rho_f = 0`) is no longer enough to judge the
+  promising branch.
+- The earlier staged search and proxy winner that motivated `E = 500 -- 1000`,
+  `zeta = 50` were built on the physical-fluid branch (`rho_f = 1000`).
+- So the next evidence-based screening run should reintroduce `rho_f = 1000`
+  around this now-promising high-`E`, `zeta = 50` branch, using the corrected LM
+  implementation and a short direct validation first.
+
+## 2026-03-12: global-observable correction and corrected `zeta = 100` revalidation
+
+### Newly confirmed measurement root cause
+
+The late-time Benchmark-6 failure was not only physics. The previous global
+observable was also too sensitive to tiny contour tails.
+
+Evidence from the existing inertial `E = 500`, `zeta = 100`, `gamma_u = 10`
+branch:
+
+- previous `t = 2.0 s` stored values reported:
+  - `dx_front_global = -17.05 um`,
+  - `dx_front_y167um = 128.11 um`,
+  - `dx_front_y250um = 142.12 um`,
+  - `dx_front_y333um = 133.59 um`;
+- re-measuring the same saved `alpha = 1/2` contour as an area-like left
+  quantile gave about `64.7 um` instead.
+
+That mismatch is too large to be a physical conclusion. It means the old
+point-quantile global metric was letting a tiny toe/tail dominate the full
+"global" history.
+
+### Code correction applied
+
+- `examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py`
+  now computes `x_front_global` from row-wise leftmost `alpha = 1/2` contour
+  intersections instead of a quantile over raw contour points.
+- We then use `--global-front-quantile 0.05` on the corrected branch, which is
+  the closest robust analogue of the video extractor's left-quantile over the
+  segmented area.
+
+### Revalidation of the best inertial `zeta = 100` branch
+
+Corrected short run:
+
+- output: `/tmp/b6_driver_E500_z100_gU10_rho1000_nx24_t0p5_obsfix`,
+- early video comparison over `t ∈ [0, 0.467] s` stayed essentially unchanged:
+  - global `RMSE = 0.952 um`,
+  - `y150 RMSE = 6.00 um`,
+  - `y250 RMSE = 1.03 um`,
+  - `y350 RMSE = 1.29 um`.
+
+Corrected continuation:
+
+- output: `/tmp/b6_driver_E500_z100_gU10_rho1000_nx24_t2p0_obsfix`,
+- numerically healthy to `t = 2.0 s`,
+- no dt reduction, no retries, no NaNs, no KSP failure, no LM stagnation.
+
+Corrected scientific result:
+
+- video comparison over `t ∈ [0.501, 1.97] s`:
+  - global `RMSE = 30.4 um`,
+  - `y150 RMSE = 26.0 um`,
+  - `y250 RMSE = 21.4 um`,
+  - `y350 RMSE = 18.8 um`;
+- `dynamic_08pa` scalar observation:
+  - `front_compression_2p0_um = 60.71`,
+  - target `148.0`,
+  - error `87.29 um`.
+
+Interpretation:
+
+- the observable correction was necessary and materially improved the branch,
+- but `E = 500`, `zeta = 100`, `rho_f = 1000` is still not publishable,
+- because the corrected global/front history still underpredicts the benchmark.
+
+### Updated next move
+
+Do **not** spend more time on stiffness-only changes at the same `zeta = 100`
+branch.
+
+The next short validation should instead test the archived inertial proxy winner
+under the corrected observable path:
+
+- `E = 1000`,
+- `zeta = 50`,
+- `rho_f = 1000`,
+- `gamma_u = 10`,
+- direct LU,
+- corrected global front output.
+
+Reason:
+
+- the corrected `zeta = 100` branch is now clearly solver-healthy but still
+  globally underdriven,
+- the earlier staged inertial proxy search selected `E = 1000`, `zeta = 50` as
+  the best early-window branch,
+- and the current observable correction removes the previous ambiguity in the
+  global metric, so that proxy winner can now be judged on the right output.
+
+### Completed corrected proxy-winner run: `E = 1000`, `zeta = 50`, `rho_f = 1000`
+
+Observed outputs:
+
+- short corrected run:
+  - `/tmp/b6_driver_E1000_z50_gU10_rho1000_nx24_t0p5_obsfix`,
+  - early window remained strong:
+    - global `RMSE = 0.932 um`,
+    - `y150 RMSE = 5.97 um`,
+    - `y250 RMSE = 1.65 um`,
+    - `y350 RMSE = 1.48 um`;
+- continued corrected run:
+  - `/tmp/b6_driver_E1000_z50_gU10_rho1000_nx24_t2p0_obsfix`,
+  - solver reached `t = 2.0 s` without dt reduction or loss of step acceptance,
+  - but late-window science degraded to:
+    - global `RMSE = 40.7 um`,
+    - `y150 RMSE = 44.2 um`,
+    - `y250 RMSE = 33.4 um`,
+    - `y350 RMSE = 35.5 um`,
+  - `dynamic_08pa` `front_compression_2p0_um = 52.82`.
+
+Interpretation:
+
+- the archived inertial proxy winner does **not** survive the corrected
+  observable path and the longer benchmark window;
+- it is worse than the corrected `E = 500`, `zeta = 100` branch on the full
+  scientific window.
+
+### Final evidence-based conclusion for this turn
+
+- The LM/globalization failure is fixed.
+- The corrected best branch is now:
+  - `E = 500`,
+  - `zeta = 100`,
+  - `rho_f = 1000`,
+  - `gamma_u = 10`,
+  - `nx = 24`,
+  - `dt = 0.05`,
+  - `t_ramp = 2.0`,
+  - corrected global front output.
+- But publishable Benchmark-6 agreement is still not reached:
+  - corrected best branch full-window video RMSEs remain
+    `30.4 / 26.0 / 21.4 / 18.8 um`,
+  - and its `2.0 s` front compression is only `60.7 um` against the
+    `148 um` paper target.
+
+So the remaining blocker is no longer solver stability. It is model calibration /
+physics fit on the corrected observable definitions.
+
+## 2026-03-12: Batch A completion and Batch B promotion
+
+Completed evidence:
+
+- promoted full-window branch:
+  - `/tmp/b6A_pois_z100_kappa2x_gU10_rho1000_nx24_t1p5`
+  - corrected `t = 2.0 s` score:
+    - global `RMSE = 19.27 um`,
+    - mean per-height `RMSE = 29.01 um`,
+    - max per-height `RMSE = 36.74 um`,
+    - global bias `= -10.95 um`,
+    - contour mean `RMSE = 215.27 um`,
+    - contour max-time `RMSE = 250.28 um`,
+    - `front_compression_2p0_um = 80.07`.
+- combined screen:
+  - `/tmp/b6B_pois_z100_kappa2x_gU12p5_rho1000_nx24_t1p5`
+  - corrected `t <= 1.5 s` screen:
+    - global `RMSE = 25.52 um`,
+    - mean per-height `RMSE = 18.41 um`,
+    - max per-height `RMSE = 28.58 um`,
+    - global bias `= -11.53 um`,
+    - contour mean `RMSE = 187.95 um`,
+    - contour max-time `RMSE = 189.92 um`.
+
+Interpretation:
+
+- `kappa_inv` is now clearly the strongest late-time amplitude control in the
+  corrected physical-inertia regime.
+- Its isolated effect is not publishable because it flips the sign of the
+  late-time `y250/y350` errors and worsens contour mismatch.
+- Adding `gamma_u = 12.5` on top of the same `kappa_inv` is the first tested
+  move that pulls those heights back to the correct side of zero while keeping
+  most of the amplitude gain.
+
+Updated source-of-truth ranking:
+
+1. Promote `/tmp/b6B_pois_z100_kappa2x_gU12p5_rho1000_nx24_t1p5`
+   to `t = 2.0 s`.
+2. Screen the same combined family with `diffuse_shear_scale = 130`.
+3. If that remains healthy and still uniformly low, screen
+   `diffuse_shear_scale = 150`.
+
+Reason for raising `diffuse_shear_scale` next:
+
+- after `kappa_inv + gamma_u`, the remaining corrected history defect at
+  `t = 1.5 s` is mostly uniform underprediction rather than the previous
+  shape split;
+- with `--scale-alpha-ch-eps-with-zeta` already active, increasing `zeta`
+  within the numerically clean onset band is the most direct supported way to
+  raise the forcing without discarding the improved shape controls.
+
+## 2026-03-12: resumed-session lagged-stress bracket
+
+The pending lower-bracket canary has now finished scoring:
+
+- `/tmp/b6F_laggedstress_s1_kappa2x_gU15_rho1000_nx24_t1p0/score_t1p0.json`
+- corrected screen metrics at `t <= 1.0 s`:
+  - global `RMSE = 9.01 um`,
+  - mean per-height `RMSE = 15.28 um`,
+  - max per-height `RMSE = 25.66 um`,
+  - global bias `= -4.50 um`,
+  - contour `RMSE(1.0 s) = 174.68 um`.
+- direct timeseries amplitudes at `t = 1.0 s`:
+  - global `≈ 7.31 um`,
+  - `y250 ≈ 18.92 um`,
+  - `y333 ≈ 14.82 um`.
+
+Interpretation:
+
+- `lagged_stress` at scale `1` is a valid lower bracket:
+  it is numerically healthy, and its corrected history/contour balance is
+  already competitive with the best poiseuille screens;
+- but the absolute compression is much too low, so the next move is to bracket
+  the scale upward instead of retuning the same poiseuille family again.
+
+Operational note:
+
+- no Benchmark 6 simulation remained active at the resumed checkpoint;
+- the next runs use the highest normal-build kernel optimization documented in
+  `pycutfem/jit/cpp_backend/compiler.py`:
+  `PYCUTFEM_CPP_FAST_COMPILE=0 PYCUTFEM_CPP_OPT_LEVEL=3`.
+
+Ranked next batch:
+
+1. `lagged_stress`, `diffuse_shear_scale = 3`, `t_final = 1.0 s`.
+2. `lagged_stress`, `diffuse_shear_scale = 5`, `t_final = 1.0 s`.
+3. Promote the better branch only if it gains amplitude without breaking the
+   current `~175-190 um` contour floor.
+
+## 2026-03-12: lagged-stress scale bracket outcome
+
+Results:
+
+- `scale = 5` completed:
+  - `/tmp/b6H_laggedstress_s5_kappa2x_gU15_rho1000_nx24_t1p0`
+  - corrected `t <= 1.0 s` score:
+    - global `RMSE = 13.54 um`,
+    - mean per-height `RMSE = 18.63 um`,
+    - max per-height `RMSE = 28.43 um`,
+    - global bias `= -8.94 um`,
+    - contour `RMSE(1.0 s) = 171.92 um`,
+    - screen score `= 0.9531`.
+- `scale = 3` was not a valid promotion candidate:
+  - first parallel launch hit the same optimized-cache race
+    (`ImportError: ... .so: file too short`);
+  - after relaunch on the warmed cache, it reached only `t = 0.50 s` and then
+    spent multiple minutes inside step-11 / Newton-2 assembly with no new
+    accepted step while still using `~150%` CPU;
+  - branch was terminated and recorded as
+    `early_stop_stalled_halfwindow`.
+
+Interpretation:
+
+- `lagged_stress` remains scientifically interesting because the scale-1 canary
+  still gives the best corrected `t <= 1.0 s` score in this family;
+- but increasing the traction scale does not move the solution toward the
+  publishability gate in a simple way:
+  `scale = 5` slightly improves the 1.0 s contour while *worsening* the overall
+  history score and driving the global / upper fronts back negative by `t=1.0 s`.
+
+Updated conclusion:
+
+- the next calibration lever in the `lagged_stress` family should be
+  **stiffness**, not more scale;
+- keep `diffuse_shear_scale = 1` fixed and bracket `E` downward:
+  - `E = 350`,
+  - `E = 250`,
+  still with `gamma_u = 15`, `kappa_inv = 1.962e12`, and the direct-LU solver
+  stack.
+
+## 2026-03-12: lagged-stress stiffness bracket outcome
+
+Results:
+
+- `E = 250`:
+  - `/tmp/b6J_laggedstress_s1_E250_kappa2x_gU15_rho1000_nx24_t1p0`
+  - corrected `t <= 1.0 s` score:
+    - global `RMSE = 8.93 um`,
+    - mean per-height `RMSE = 15.21 um`,
+    - max per-height `RMSE = 25.70 um`,
+    - global bias `= -4.38 um`,
+    - contour `RMSE(1.0 s) = 174.96 um`,
+    - screen score `= 0.8062`.
+- `E = 350`:
+  - `/tmp/b6I_laggedstress_s1_E350_kappa2x_gU15_rho1000_nx24_t1p0`
+  - matched the same front history trend up to `t = 0.95 s`,
+  - but the final step entered a much heavier LM-assisted solve and was not
+    worth promoting over `E = 250`;
+  - recorded as `not_selected_same_history_heavier_solver`.
+
+Interpretation:
+
+- lowering `E` helps only **marginally** in this family:
+  it improves the corrected score by about `0.002` relative to the original
+  `E = 500` scale-1 canary, while leaving the contour floor essentially
+  unchanged (`~175 um`);
+- that makes stiffness a secondary lever, not the main path to a publishable
+  contour match.
+
+Updated next batch:
+
+- keep the new best lagged-stress screen point fixed:
+  - `diffuse_shear_scale = 1`,
+  - `E = 250`,
+  - `kappa_inv = 1.962e12`;
+- bracket `gamma_u` downward next:
+  1. `gamma_u = 12.5`,
+  2. `gamma_u = 10`.
+
+## 2026-03-12: lagged-stress gamma-u bracket outcome
+
+Results:
+
+- `gamma_u = 12.5` was not worth promoting:
+  - it only reached `t = 0.6 s`,
+  - it was weaker than the `gamma_u = 10` branch in the tracked fronts,
+  - and it stalled late enough to justify early stop.
+- `gamma_u = 10` is the new best lagged-stress screen:
+  - merged `dt = 0.05` screen score:
+    - out dir:
+      `/tmp/b6N_laggedstress_s1_E250_kappa2x_gU10_rho1000_nx24_t1p0_dt0p05_merged`
+    - global `RMSE = 8.27 um`,
+    - mean per-height `RMSE = 14.78 um`,
+    - max per-height `RMSE = 24.78 um`,
+    - global bias `= -3.60 um`,
+    - contour `RMSE(1.0 s) = 178.87 um`,
+    - screen score `= 0.7936`.
+
+Important solver conclusion:
+
+- the first `gamma_u = 10` screen stalled after `t = 0.9 s` while another
+  branch was running concurrently;
+- restarting from the same checkpoint:
+  - with `dt = 0.025` finished immediately,
+  - and then a single-branch restart with the original `dt = 0.05` also
+    completed cleanly to `t = 1.0 s`.
+
+Interpretation:
+
+- `gamma_u` is the strongest lagged-stress lever tested so far;
+- the best corrected history is now in the lagged-stress family;
+- but the contour floor is still essentially unchanged, so the remaining
+  publishability gap is still geometry, not just history amplitude.
+
+Updated next step:
+
+- promote the new best lagged-stress branch
+  (`scale = 1`, `E = 250`, `gamma_u = 10`) to `t = 1.5 s` from scratch,
+  alone on the machine, and score it on the corrected `1.5 s` window.
+
+## 2026-03-12: first lagged-stress `t = 1.5 s` promotion outcome
+
+Run:
+
+- `/tmp/b6O_laggedstress_s1_E250_kappa2x_gU10_rho1000_nx24_t1p5`
+- exact physics/solver stack:
+  - `diffuse_shear_model = lagged_stress`,
+  - `diffuse_shear_scale = 1`,
+  - `E = 250`,
+  - `gamma_u = 10`,
+  - `kappa_inv = 1.962e12`,
+  - `rho_f = 1000`,
+  - `nu = 0.4`,
+  - direct LU / MUMPS,
+  - `dt = 0.05`,
+  - `t_final = 1.5`,
+  - `max_it = 12`.
+
+Observed failure mode:
+
+- the run advanced cleanly through `t = 0.90 s`;
+- the last accepted log line was:
+  - `Time step 18: t=9.000000e-01s, dt=5.000e-02, nNewton=3, accepted=True`;
+- step 19 then showed:
+  - `VI Newton 1` accepted with a noticeably harder solve
+    (`lm_lambda = 6.25e-03`, `merit_ratio = 0.317`);
+  - `VI Newton 2: assembling...`;
+- after that point the run stopped making visible progress:
+  - `run.log` frozen at `2026-03-12 16:40:12 +0100`,
+  - `timeseries.csv` frozen at `2026-03-12 16:39:58 +0100`,
+  - no new checkpoint beyond `checkpoint_step=00018.npz`,
+  - no new accepted step beyond `t = 0.90 s`.
+
+Interpretation:
+
+- this is the same branch family that already proved physically viable at
+  `t = 1.0 s`, so the current evidence does **not** justify discarding the
+  parameter set on physics grounds yet;
+- but it does show that the branch is still solver-fragile in the late window
+  at the production `dt = 0.05` setting.
+
+Decision:
+
+- classify the from-scratch `t = 1.5 s` promotion as `unhealthy_late_step_stall`;
+- stop it early instead of burning the remaining wall clock on a frozen step;
+- continue from the saved `t = 0.90 s` checkpoint with the shortest diagnostic
+  continuation needed to judge the physical late-window trajectory.
+
+## 2026-03-12: restart continuation and rerank
+
+Restart continuation:
+
+- `/tmp/b6P_laggedstress_s1_E250_kappa2x_gU10_rho1000_nx24_t1p5_restart_dt0p025`
+- restart source:
+  `/tmp/b6O_laggedstress_s1_E250_kappa2x_gU10_rho1000_nx24_t1p5/restart/checkpoint_step=00018.npz`
+- change relative to the stalled from-scratch run:
+  - `restart_dt = 0.025`.
+
+Observed outcome:
+
+- the continuation immediately cleared the old `t = 0.90 s` barrier and
+  accepted steps through `t = 1.275 s`;
+- representative accepted steps:
+  - `t = 0.925 s`, `nNewton = 4`,
+  - `t = 1.000 s`, `nNewton = 2`,
+  - `t = 1.175 s`, `nNewton = 4`,
+  - `t = 1.275 s`, `nNewton = 2`;
+- but it then froze again with no new checkpoint or time-series row after
+  `2026-03-12 16:57:04 +0100`.
+
+Merged corrected diagnostic:
+
+- merged out dir:
+  `/tmp/b6Q_laggedstress_s1_E250_kappa2x_gU10_rho1000_nx24_t1p25_restart_dt0p025_merged`
+- corrected `t <= 1.25 s` score:
+  - global `RMSE = 12.78 um`,
+  - mean per-height `RMSE = 15.00 um`,
+  - max per-height `RMSE = 23.98 um`,
+  - global bias `= -7.21 um`,
+  - contour `RMSE(1.0 s) = 178.85 um`,
+  - screen score `= 0.8976`.
+
+Raw late-window comparison is more decisive than that scalar:
+
+- at `t = 1.275 s` the branch remains strongly underdriven relative to the
+  video extraction:
+  - global `7.90 um` vs video `100.17 um`,
+  - `y150/167`: `22.99 um` vs video `94.23 um`,
+  - `y250`: `55.45 um` vs video `95.12 um`,
+  - `y350/333`: `32.06 um` vs video `100.35 um`.
+
+Interpretation:
+
+- the `lagged_stress`, `scale = 1`, `E = 250`, `gamma_u = 10`,
+  `kappa_inv = 1.962e12` point is still too weak in the corrected late window;
+- the repeated stall is therefore not hiding a good late-time physical match;
+- the next move should be a stronger **physical coupling** probe rather than
+  another solver-only tweak on the same point.
+
+Updated ranked queue:
+
+1. `kappa_inv = 3.924e12`, keep `E = 250`, `gamma_u = 10`.
+2. `E = 150`, keep `kappa_inv = 1.962e12`, `gamma_u = 10`.
+3. Combine them only if one of the single-parameter probes is clearly better.

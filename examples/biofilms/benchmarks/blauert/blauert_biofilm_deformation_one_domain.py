@@ -584,6 +584,26 @@ def _x_alpha_half_quantile_on_y_line(
     return float(xR - q * (xR - xL))
 
 
+def _segment_intersections_x(points: np.ndarray, y_sample: float) -> np.ndarray:
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[0] < 2:
+        return np.empty((0,), dtype=float)
+    out: list[float] = []
+    for i in range(pts.shape[0] - 1):
+        x0, y0 = float(pts[i, 0]), float(pts[i, 1])
+        x1, y1 = float(pts[i + 1, 0]), float(pts[i + 1, 1])
+        if not ((y0 <= y_sample <= y1) or (y1 <= y_sample <= y0)):
+            continue
+        dy = y1 - y0
+        if abs(dy) <= 1.0e-14:
+            out.extend([x0, x1])
+            continue
+        tau = (float(y_sample) - y0) / dy
+        if -1.0e-12 <= tau <= 1.0 + 1.0e-12:
+            out.append(x0 + tau * (x1 - x0))
+    return np.asarray(out, dtype=float)
+
+
 def _x_front_global_quantile(
     alpha_xy: np.ndarray,
     alpha_vals: np.ndarray,
@@ -592,20 +612,57 @@ def _x_front_global_quantile(
     alpha_half: float = 0.5,
 ) -> float:
     """
-    Global upstream front location based on a quantile of x where alpha >= alpha_half.
+    Global upstream front location based on a quantile of row-wise leftmost
+    alpha=alpha_half contour intersections.
 
-    This is intended to be comparable to the video extractor's global x_front
-    measurement (quantile over segmented mask pixels).
+    The video extractor uses a robust left-quantile over the segmented biofilm
+    area, not a quantile over raw contour points. Approximating that from the
+    transported alpha=1/2 contour via row-wise leftmost intersections avoids a
+    single tiny tail dominating the "global" metric at late times.
     """
+    q = float(np.clip(float(q), 0.0, 1.0))
+    contours = _alpha_half_contours(alpha_xy, alpha_vals, alpha_half=float(alpha_half))
+    contour_pts = [
+        np.asarray(pts, dtype=float)
+        for pts in contours
+        if np.asarray(pts, dtype=float).ndim == 2 and np.asarray(pts, dtype=float).shape[1] >= 2
+    ]
+    if contour_pts:
+        pts_all = np.vstack(contour_pts)
+        ys = np.asarray(pts_all[:, 1], dtype=float).ravel()
+        ys = ys[np.isfinite(ys)]
+        if ys.size > 1:
+            y_min = float(np.min(ys))
+            y_max = float(np.max(ys))
+            if y_max > y_min:
+                row_fronts: list[float] = []
+                y_samples = np.linspace(y_min, y_max, 400, dtype=float)
+                for yy in y_samples:
+                    xs_all: list[float] = []
+                    for pts in contour_pts:
+                        xs = _segment_intersections_x(pts, float(yy))
+                        if xs.size:
+                            xs_all.extend(float(v) for v in xs if np.isfinite(v))
+                    if xs_all:
+                        row_fronts.append(float(np.min(np.asarray(xs_all, dtype=float))))
+                if row_fronts:
+                    return float(np.quantile(np.asarray(row_fronts, dtype=float), q))
+
+        contour_xs = [np.asarray(pts, dtype=float)[:, 0].ravel() for pts in contour_pts]
+        xs = np.concatenate(contour_xs)
+        xs = xs[np.isfinite(xs)]
+        if xs.size > 0:
+            return float(np.quantile(xs, q))
+
     xy = np.asarray(alpha_xy, dtype=float)
     a = np.asarray(alpha_vals, dtype=float).ravel()
     if xy.ndim != 2 or xy.shape[1] < 2 or a.shape[0] != xy.shape[0]:
         return float("nan")
-    q = float(np.clip(float(q), 0.0, 1.0))
     inside = a >= float(alpha_half)
     if not np.any(inside):
         return float("nan")
     xs = np.asarray(xy[inside, 0], dtype=float).ravel()
+    xs = xs[np.isfinite(xs)]
     if xs.size == 0:
         return float("nan")
     return float(np.quantile(xs, q))
@@ -1401,7 +1458,7 @@ def main() -> None:
         "--global-front-quantile",
         type=float,
         default=0.005,
-        help="Quantile for global x_front (over alpha>=0.5 DOFs). 0=min, 0.005 is robust to tiny blobs.",
+        help="Quantile for global x_front over row-wise leftmost contour fronts (0=min).",
     )
     ap.add_argument(
         "--snapshot-times",
@@ -2839,11 +2896,12 @@ def main() -> None:
         t_now = float(getattr(solver, "_current_t", 0.0) + getattr(solver, "_current_dt", dt_val))
         dt_now = float(getattr(solver, "_current_dt", dt_val))
         n_newton = int(getattr(solver, "_last_nonlinear_iterations", 0) or 0)
+        relaxed_accept = bool(getattr(solver, "_last_nonlinear_relaxed_accept", False))
         if adaptive_gamma_div:
             cur_gamma = float(gamma_div_expr)
             base_gamma = float(gamma_div_base)
             if cur_gamma > base_gamma + 1.0e-15:
-                if n_newton <= int(gamma_div_relax_newton_max):
+                if (not relaxed_accept) and n_newton <= int(gamma_div_relax_newton_max):
                     gamma_div_state["easy_steps"] = int(gamma_div_state.get("easy_steps", 0)) + 1
                 else:
                     gamma_div_state["easy_steps"] = 0

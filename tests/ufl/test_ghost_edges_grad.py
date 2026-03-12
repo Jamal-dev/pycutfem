@@ -21,6 +21,8 @@ from pycutfem.io.visualization import plot_mesh_2
 import matplotlib.pyplot as plt
 from pycutfem.ufl.compilers import FormCompiler
 
+from tests.subprocess_utils import run_module_func_in_subprocess
+
 X_IFACE = 1.03  # avoid mesh-aligned interface so ghost edges are non-empty
 
 def _have_cpp_backend() -> bool:
@@ -33,6 +35,15 @@ def _have_cpp_backend() -> bool:
 @pytest.fixture(scope="module")
 def setup_quad2():
     """2×1 quadratic mesh cut vertically at x=X_IFACE."""
+    mesh, level_set, ghost, dh = _build_quad2_problem()
+
+    comp = FormCompiler(dh, quadrature_order=4)
+
+    return mesh, level_set, ghost, dh, comp
+
+
+def _build_quad2_problem():
+    """Build the mesh/level set/dofs for this module (usable from subprocess tests)."""
     poly_order = 2
     nodes, elements_connectivity, edge_connectivity, corner_nodes = structured_quad(2.0, 1.0, nx=20, ny=5, poly_order=poly_order)
     mesh = Mesh(nodes = nodes,
@@ -57,10 +68,7 @@ def setup_quad2():
 
     me = MixedElement(mesh, field_specs={"u": poly_order})
     dh = DofHandler(me, method="cg")
-
-    comp = FormCompiler(dh, quadrature_order=4)
-
-    return mesh, level_set, ghost, dh, comp
+    return mesh, level_set, ghost, dh
 
 @pytest.mark.parametrize("backend", ["jit", "python"])
 def test_gradjumpn_spd(setup_quad2, backend):
@@ -119,7 +127,7 @@ def test_gradjumpn_known_value_on_aligned_cut(setup_quad2, backend):
     assert np.isclose(res["E"], expected, rtol=1e-2)
 
 
-@pytest.mark.parametrize("backend", ["python", "jit"] + (["cpp"] if _have_cpp_backend() else []))
+@pytest.mark.parametrize("backend", ["python", "jit"])
 def test_gradjumpn_matrix_annihilates_linear(setup_quad2, backend):
     _mesh, ls, ghost, dh, _ = setup_quad2
     n = FacetNormal()
@@ -143,3 +151,32 @@ def test_gradjumpn_matrix_annihilates_linear(setup_quad2, backend):
 
     energy = float(x @ (K @ x))
     assert abs(energy) < 1e-10
+
+
+def _gradjumpn_matrix_annihilates_linear_cpp_impl():
+    _mesh, level_set, ghost, dh = _build_quad2_problem()
+    n = FacetNormal()
+
+    u = TrialFunction("u", dh)
+    v = TestFunction("u", dh)
+
+    a = inner(dot(n, Jump(grad(u))), dot(Jump(grad(v)), n)) * dGhost(
+        defined_on=ghost,
+        level_set=level_set,
+        metadata={"derivs": {(1, 0), (0, 1)}, "q": 6},
+    )
+    K, _ = assemble_form(Equation(a, None), dof_handler=dh, bcs=[], backend="cpp")
+
+    uh = Function("u", "u", dh)
+    uh.set_values_from_function(lambda x, y: x)
+    x = np.zeros(dh.total_dofs, dtype=float)
+    x[uh._g_dofs] = uh.nodal_values
+
+    energy = float(x @ (K @ x))
+    assert abs(energy) < 1e-10
+
+
+def test_gradjumpn_matrix_annihilates_linear_cpp_subprocess():
+    if not _have_cpp_backend():
+        pytest.skip("C++ backend not available.")
+    run_module_func_in_subprocess(__name__, "_gradjumpn_matrix_annihilates_linear_cpp_impl")

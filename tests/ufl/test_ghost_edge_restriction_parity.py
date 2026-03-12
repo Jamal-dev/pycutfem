@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 
+from tests.subprocess_utils import run_module_func_in_subprocess
+
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.core.mesh import Mesh
 from pycutfem.core.levelset import AffineLevelSet
@@ -22,6 +24,7 @@ from pycutfem.ufl.forms import Equation, assemble_form
 
 
 BACKENDS = ("python", "jit", "cpp")
+BACKENDS_INPROCESS = ("python", "jit")
 
 
 def _build_mesh():
@@ -44,6 +47,19 @@ def _build_mesh():
     mesh.classify_elements(level_set)
     mesh.classify_edges(level_set)
     return mesh, level_set
+
+
+def _make_ghost_setup():
+    mesh, level_set = _build_mesh()
+    ghost = mesh.edge_bitset("ghost")
+    assert ghost.cardinality() > 0, "Expected ghost edges for restriction test."
+
+    inside = mesh.element_bitset("inside")
+    outside = mesh.element_bitset("outside")
+
+    me = MixedElement(mesh, field_specs={"u": 1})
+    dh = DofHandler(me, method="cg")
+    return dh, level_set, ghost, inside, outside
 
 
 def _assemble_jump(dh, expr, measure, backend: str) -> float:
@@ -110,21 +126,11 @@ def _expected_jump_constant(
 
 @pytest.fixture(scope="module")
 def ghost_setup():
-    mesh, level_set = _build_mesh()
-    ghost = mesh.edge_bitset("ghost")
-    assert ghost.cardinality() > 0, "Expected ghost edges for restriction test."
-
-    inside = mesh.element_bitset("inside")
-    outside = mesh.element_bitset("outside")
-
-    me = MixedElement(mesh, field_specs={"u": 1})
-    dh = DofHandler(me, method="cg")
-    return dh, level_set, ghost, inside, outside
+    return _make_ghost_setup()
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_ghost_jump_inside_outside_expected(ghost_setup, backend):
-    dh, level_set, ghost, inside, outside = ghost_setup
+def _ghost_jump_inside_outside_expected_impl(backend: str):
+    dh, level_set, ghost, inside, outside = _make_ghost_setup()
 
     qdeg = 4
     val_outside = 2.0
@@ -161,9 +167,21 @@ def test_ghost_jump_inside_outside_expected(ghost_setup, backend):
     assert abs(val - expected) < 1e-9, f"{backend} mismatch on ghost restriction: {val} vs {expected}"
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_ghost_jump_zero_when_equal(ghost_setup, backend):
-    dh, level_set, ghost, inside, outside = ghost_setup
+def _ghost_jump_inside_outside_expected_cpp_impl():
+    _ghost_jump_inside_outside_expected_impl("cpp")
+
+
+def test_ghost_jump_inside_outside_expected_cpp_subprocess():
+    run_module_func_in_subprocess(__name__, "_ghost_jump_inside_outside_expected_cpp_impl")
+
+
+@pytest.mark.parametrize("backend", BACKENDS_INPROCESS)
+def test_ghost_jump_inside_outside_expected(ghost_setup, backend):
+    _ghost_jump_inside_outside_expected_impl(backend)
+
+
+def _ghost_jump_zero_when_equal_impl(backend: str):
+    dh, level_set, ghost, inside, outside = _make_ghost_setup()
     mesh = dh.mixed_element.mesh
     full = inside | outside | mesh.element_bitset("cut")
 
@@ -203,7 +221,20 @@ def test_ghost_jump_zero_when_equal(ghost_setup, backend):
     assert abs(val) < 1e-9, f"{backend} expected ~0 jump integral, got {val}"
 
 
-def test_ghost_grad_restriction_parity_matrix_and_rhs(ghost_setup):
+def _ghost_jump_zero_when_equal_cpp_impl():
+    _ghost_jump_zero_when_equal_impl("cpp")
+
+
+def test_ghost_jump_zero_when_equal_cpp_subprocess():
+    run_module_func_in_subprocess(__name__, "_ghost_jump_zero_when_equal_cpp_impl")
+
+
+@pytest.mark.parametrize("backend", BACKENDS_INPROCESS)
+def test_ghost_jump_zero_when_equal(ghost_setup, backend):
+    _ghost_jump_zero_when_equal_impl(backend)
+
+
+def _ghost_grad_restriction_parity_matrix_and_rhs_impl(*, ghost_setup, backend: str):
     dh, level_set, ghost, inside, outside = ghost_setup
     mesh = dh.mixed_element.mesh
 
@@ -240,17 +271,31 @@ def test_ghost_grad_restriction_parity_matrix_and_rhs(ghost_setup):
     assert k_abs > 1e-12, "Reference matrix unexpectedly zero."
     assert np.max(np.abs(F_py)) > 1e-12, "Reference RHS unexpectedly zero."
 
-    for backend in ("jit", "cpp"):
-        K_b = _assemble_matrix(dh, a, backend)
-        F_b = _assemble_vector(dh, L, backend)
+    K_b = _assemble_matrix(dh, a, backend)
+    F_b = _assemble_vector(dh, L, backend)
 
-        K_diff = K_b - K_py
-        if hasattr(K_diff, "data"):
-            k_err = float(np.max(np.abs(K_diff.data))) if K_diff.data.size else 0.0
-        else:
-            k_err = float(np.max(np.abs(K_diff)))
+    K_diff = K_b - K_py
+    if hasattr(K_diff, "data"):
+        k_err = float(np.max(np.abs(K_diff.data))) if K_diff.data.size else 0.0
+    else:
+        k_err = float(np.max(np.abs(K_diff)))
 
-        f_err = float(np.max(np.abs(F_b - F_py)))
+    f_err = float(np.max(np.abs(F_b - F_py)))
 
-        assert k_err < 1e-9, f"{backend} mismatch in restricted ghost grad matrix: {k_err}"
-        assert f_err < 1e-9, f"{backend} mismatch in restricted ghost grad RHS: {f_err}"
+    assert k_err < 1e-9, f"{backend} mismatch in restricted ghost grad matrix: {k_err}"
+    assert f_err < 1e-9, f"{backend} mismatch in restricted ghost grad RHS: {f_err}"
+
+
+def _ghost_grad_restriction_parity_matrix_and_rhs_cpp_impl():
+    _ghost_grad_restriction_parity_matrix_and_rhs_impl(
+        ghost_setup=_make_ghost_setup(),
+        backend="cpp",
+    )
+
+
+def test_ghost_grad_restriction_parity_matrix_and_rhs_cpp_subprocess():
+    run_module_func_in_subprocess(__name__, "_ghost_grad_restriction_parity_matrix_and_rhs_cpp_impl")
+
+
+def test_ghost_grad_restriction_parity_matrix_and_rhs(ghost_setup):
+    _ghost_grad_restriction_parity_matrix_and_rhs_impl(ghost_setup=ghost_setup, backend="jit")

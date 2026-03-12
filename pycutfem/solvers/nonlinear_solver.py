@@ -5617,6 +5617,15 @@ class PdasNewtonSolver(NewtonSolver):
         R_red: np.ndarray,
         lam: float,
     ) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray]:
+        rhs = -np.asarray(R_red, dtype=float)
+        return self._vi_build_lm_system(A_red, rhs, lam)
+
+    def _vi_build_lm_system(
+        self,
+        A_red: sp.csr_matrix,
+        rhs_red: np.ndarray,
+        lam: float,
+    ) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray]:
         if not sp.isspmatrix_csr(A_red):
             A_red = A_red.tocsr()
         diag = np.abs(np.asarray(A_red.diagonal(), dtype=float))
@@ -5625,7 +5634,7 @@ class PdasNewtonSolver(NewtonSolver):
         H = A_red.copy().tocsr()
         if lam > 0.0:
             H = H + sp.diags(float(lam) * diag, format="csr")
-        rhs = -np.asarray(R_red, dtype=float)
+        rhs = np.asarray(rhs_red, dtype=float).copy()
         return H, rhs, diag
 
     def _vi_unconstrained_lm_model(
@@ -6054,7 +6063,9 @@ class PdasNewtonSolver(NewtonSolver):
             if max_delta_active > 0 and int(metrics.get("delta_active", 0.0)) > max_delta_active:
                 return False
             merit = float(metrics["merit"])
-            return merit <= merit0 - c1 * alpha * max(merit0, 1.0)
+            # Use a relative Armijo decrease on the VI merit. Scaling by 1.0 makes
+            # late-time steps with merit << 1 fail unconditionally even when merit decreases.
+            return merit <= merit0 - c1 * alpha * max(merit0, 1.0e-30)
 
         def _trace_trial(metrics: dict[str, float], accepted: bool) -> None:
             if not trace_ls:
@@ -6153,6 +6164,15 @@ class PdasNewtonSolver(NewtonSolver):
 
         norm_G0: float | None = None
         last_active: np.ndarray | None = None
+        last_norm_G = float("inf")
+        last_norm_R = float("inf")
+        last_it = 0
+        accept_factor = float(getattr(self.np, "accept_nonconverged_atol_factor", 0.0) or 0.0)
+        atol = float(getattr(self.np, "newton_tol", 0.0) or 0.0)
+        # Each accepted time step defines a new nonlinear subproblem. Reusing a
+        # previously saturated LM damping parameter across solves can freeze the
+        # next step at an almost-zero trust-region correction.
+        self._vi_lm_lambda_current = float(getattr(self.vi_params, "unconstrained_lm_lambda0", 1.0e-4) or 1.0e-4)
 
         for it in range(int(self.np.max_newton_iter)):
             if self.pre_cb is not None:
@@ -6264,6 +6284,14 @@ class PdasNewtonSolver(NewtonSolver):
             metrics0 = self._vi_metrics(x_red, R_red, lo_red, hi_red, act_lo, act_hi, G_red)
             norm_G = float(np.linalg.norm(G_red, ord=np.inf))
             norm_R = float(np.linalg.norm(R_red, ord=np.inf))
+            last_norm_G = float(norm_G)
+            last_norm_R = float(norm_R)
+            last_it = int(it + 1)
+            self._last_nonlinear_norm = float(norm_G)
+            self._last_nonlinear_norm_label = "|G|_∞"
+            self._last_nonlinear_reason = None
+            self._last_nonlinear_accepted = False
+            self._last_nonlinear_relaxed_accept = False
 
             if norm_G0 is None:
                 norm_G0 = norm_G
@@ -6387,6 +6415,9 @@ class PdasNewtonSolver(NewtonSolver):
                 _trace_vec("R", R_full)
 
             if norm_G <= tol_eff:
+                self._last_nonlinear_reason = 2
+                self._last_nonlinear_accepted = True
+                self._last_nonlinear_relaxed_accept = False
                 delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
                 return delta, True, it + 1
 
@@ -6414,11 +6445,16 @@ class PdasNewtonSolver(NewtonSolver):
             used_lm = False
             lm_info: dict[str, float] = {}
 
-            def _eval_reduced_trial(step_red: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            def _eval_reduced_trial(
+                step_red: np.ndarray,
+            ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
                 step_red = np.asarray(step_red, dtype=float)
                 if not np.all(np.isfinite(step_red)):
                     raise RuntimeError("Trial step contains non-finite entries.")
                 snap = [f.nodal_values.copy() for f in funcs]
+                prev_state_save = None if self._vi_prev_state is None else self._vi_prev_state.copy()
+                prev_pending = None if self._vi_pending_state is None else self._vi_pending_state.copy()
+                prev_counts = None if self._vi_pending_count is None else self._vi_pending_count.copy()
                 try:
                     dU_full = self.restrictor.expand_vec(step_red)
                     if not np.all(np.isfinite(dU_full)):
@@ -6443,12 +6479,40 @@ class PdasNewtonSolver(NewtonSolver):
                     x_try = self._pack_reduced_iterate(funcs)
                     if not np.all(np.isfinite(x_try)):
                         raise RuntimeError("Trial reduced iterate contains non-finite entries.")
-                    return x_try, R_try
+                    G_try, act_lo_try, act_hi_try = self._pdas_residual_and_sets(x_try, R_try, lo_red, hi_red, c_red=c_red)
+                    metrics_try = self._vi_metrics(x_try, R_try, lo_red, hi_red, act_lo_try, act_hi_try, G_try)
+                    metrics_try["delta_active"] = float(
+                        np.count_nonzero(self._vi_state_from_sets(act_lo_try, act_hi_try) != self._vi_state_from_sets(act_lo, act_hi))
+                    )
+                    return x_try, R_try, G_try, act_lo_try, act_hi_try, metrics_try
                 finally:
+                    if prev_state_save is None:
+                        self._vi_prev_state = None
+                    else:
+                        self._vi_prev_state = prev_state_save
+                    self._vi_pending_state = prev_pending
+                    self._vi_pending_count = prev_counts
                     for f, buf in zip(funcs, snap):
                         f.nodal_values[:] = buf
 
-            use_lm = bool(getattr(self.vi_params, "unconstrained_lm", False)) and nA == 0
+            lm_requested = bool(getattr(self.vi_params, "unconstrained_lm", False))
+            lm_trace = os.getenv("PYCUTFEM_VI_TRACE_LM", "").lower() in {"1", "true", "yes"}
+            use_lm = lm_requested
+            if lm_requested and nA > 0 and lm_trace:
+                active_items = []
+                for fld in np.unique(self._vi_red_field_names):
+                    fld = str(fld)
+                    if not fld:
+                        continue
+                    mask = self._vi_red_field_names == fld
+                    n_lo = int(np.count_nonzero(act_lo & mask))
+                    n_hi = int(np.count_nonzero(act_hi & mask))
+                    if n_lo or n_hi:
+                        active_items.append(f"{fld}:lo={n_lo},hi={n_hi}")
+                msg = f"        [vi-lm] active-set mode: nA={nA} semismooth LM will use the PDAS-modified system."
+                if active_items:
+                    msg += " active={" + ", ".join(active_items) + "}"
+                print(msg)
             if use_lm:
                 lm_lam = float(getattr(self, "_vi_lm_lambda_current", 0.0) or 0.0)
                 lm0 = float(getattr(self.vi_params, "unconstrained_lm_lambda0", 1.0e-4) or 1.0e-4)
@@ -6458,20 +6522,32 @@ class PdasNewtonSolver(NewtonSolver):
                 lm_accept = float(getattr(self.vi_params, "unconstrained_lm_accept_ratio", 1.0e-3) or 1.0e-3)
                 lm_good = float(getattr(self.vi_params, "unconstrained_lm_good_ratio", 0.75) or 0.75)
                 lm_max_tries = int(getattr(self.vi_params, "unconstrained_lm_max_tries", 6) or 6)
-                lm_trace = os.getenv("PYCUTFEM_VI_TRACE_LM", "").lower() in {"1", "true", "yes"}
-                phi0_lm = 0.5 * float(np.asarray(R_red, dtype=float) @ np.asarray(R_red, dtype=float))
+                phi0_lm = float(metrics0["merit"])
                 best_step = None
                 best_phi = phi0_lm
                 best_rho = -np.inf
+                best_metrics = None
+                res0_lm = float(metrics0["inactive_res_inf"])
+                gap0_lm = float(metrics0["active_gap_inf"])
+                max_delta_active = int(getattr(self.vi_params, "filter_max_delta_active", 0) or 0)
+                max_res_growth = float(getattr(self.vi_params, "filter_max_residual_growth", 1.25) or 1.25)
+                max_gap_growth = float(getattr(self.vi_params, "filter_max_gap_growth", 1.25) or 1.25)
+                fallback_rho_min = max(1.0e-6, 0.1 * lm_accept)
 
                 for lm_try in range(max(lm_max_tries, 1)):
-                    H_lm, rhs_lm, lm_diag = self._vi_build_unconstrained_lm_system(A_red, R_red, lm_lam)
-                    t_lin = time.perf_counter()
-                    step_lm = self._solve_linear_system(H_lm, rhs_lm)
-                    lin_time += time.perf_counter() - t_lin
                     try:
-                        _, R_try = _eval_reduced_trial(step_lm)
-                        phi_try = 0.5 * float(R_try @ R_try)
+                        H_lm, rhs_lm, lm_diag = self._vi_build_lm_system(A_mod, rhs, lm_lam)
+                        t_lin = time.perf_counter()
+                        step_lm = self._solve_linear_system(H_lm, rhs_lm)
+                        lin_time += time.perf_counter() - t_lin
+                    except RuntimeError as exc:
+                        if lm_trace:
+                            print(f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} linear solve failed: {exc}")
+                        lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                        continue
+                    try:
+                        _, _, _, _, _, metrics_try = _eval_reduced_trial(step_lm)
+                        phi_try = float(metrics_try["merit"])
                     except RuntimeError as exc:
                         if lm_trace:
                             print(f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} rejected: {exc}")
@@ -6482,21 +6558,25 @@ class PdasNewtonSolver(NewtonSolver):
                             print(f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} rejected: non-finite phi_try")
                         lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
                         continue
-                    _, model_phi, pred_model, rho = self._vi_unconstrained_lm_model(
-                        R_red, A_red, step_lm, lm_lam, lm_diag, phi_try=phi_try
-                    )
+                    _, model_phi, pred_model, _ = self._vi_unconstrained_lm_model(G_red, A_mod, step_lm, lm_lam, lm_diag, phi_try=phi_try)
                     actual = phi0_lm - phi_try
+                    rho = actual / max(phi0_lm, 1.0e-30)
+                    res_ok = float(metrics_try["inactive_res_inf"]) <= max(max_res_growth * max(res0_lm, 1.0e-16), 1.0e-16)
+                    gap_ok = float(metrics_try["active_gap_inf"]) <= max(max_gap_growth * max(gap0_lm, 1.0e-16), 1.0e-16)
+                    delta_ok = max_delta_active <= 0 or int(metrics_try.get("delta_active", 0.0)) <= max_delta_active
                     if lm_trace:
                         print(
                             f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} "
                             f"phi0={phi0_lm:.3e} phitry={phi_try:.3e} "
-                            f"pred_model={pred_model:.3e} act={actual:.3e} rho={rho:.3e}"
+                            f"pred_model={pred_model:.3e} act={actual:.3e} rho={rho:.3e} "
+                            f"res_ok={int(res_ok)} gap_ok={int(gap_ok)} delta_ok={int(delta_ok)}"
                         )
                     if phi_try < best_phi:
                         best_phi = phi_try
                         best_step = np.asarray(step_lm, dtype=float).copy()
                         best_rho = float(rho)
-                    if np.isfinite(rho) and actual > 0.0 and rho >= lm_accept:
+                        best_metrics = dict(metrics_try)
+                    if np.isfinite(rho) and actual > 0.0 and rho >= lm_accept and res_ok and gap_ok and delta_ok:
                         used_lm = True
                         S_red = np.asarray(step_lm, dtype=float)
                         accepted_alpha = 1.0
@@ -6506,10 +6586,10 @@ class PdasNewtonSolver(NewtonSolver):
                             lm_lam = max(lm0, lm_lam * lm_decay if lm_lam > 0.0 else lm0)
                         self._vi_lm_lambda_current = float(min(max(lm_lam, lm0), lm_max))
                         self._ls_alpha_prev = 1.0
-                        self._vi_last_metrics = {"merit": float(phi_try)}
+                        self._vi_last_metrics = dict(metrics_try)
                         break
                     lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
-                if not used_lm and best_step is not None and best_phi < phi0_lm:
+                if not used_lm and best_step is not None and best_phi < phi0_lm and np.isfinite(best_rho) and best_rho >= fallback_rho_min:
                     used_lm = True
                     S_red = np.asarray(best_step, dtype=float)
                     accepted_alpha = 1.0
@@ -6517,7 +6597,14 @@ class PdasNewtonSolver(NewtonSolver):
                     lm_info = {"rho": float(best_rho), "phi_try": float(best_phi), "phi0": float(phi0_lm)}
                     self._vi_lm_lambda_current = float(min(max(lm_lam, lm0), lm_max))
                     self._ls_alpha_prev = 1.0
-                    self._vi_last_metrics = {"merit": float(best_phi)}
+                    self._vi_last_metrics = dict(best_metrics or {"merit": float(best_phi)})
+                elif not used_lm and best_step is not None and best_phi < phi0_lm and lm_trace:
+                    print(
+                        f"        [vi-lm] best trial rejected for insufficient improvement: "
+                        f"rho={float(best_rho):.3e} < fallback_min={fallback_rho_min:.3e}"
+                    )
+                if not used_lm:
+                    self._vi_lm_lambda_current = float(lm0)
 
             if used_lm:
                 self._vi_last_retry_count = 0
@@ -6540,9 +6627,22 @@ class PdasNewtonSolver(NewtonSolver):
 
             while True:
                 A_work, reg_diag = self._vi_apply_inactive_regularization(A_mod, A_red, active, lam)
-                t_lin = time.perf_counter()
-                S_red = self._solve_linear_system(A_work, rhs)
-                lin_time += time.perf_counter() - t_lin
+                try:
+                    t_lin = time.perf_counter()
+                    S_red = self._solve_linear_system(A_work, rhs)
+                    lin_time += time.perf_counter() - t_lin
+                except RuntimeError as exc:
+                    lam_max = float(getattr(self.vi_params, "inactive_reg_lambda_max", 1.0e6) or 1.0e6)
+                    lam_growth = float(getattr(self.vi_params, "inactive_reg_growth", 5.0) or 5.0)
+                    lam0 = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
+                    if lam < lam_max and (lam > 0.0 or lam0 > 0.0):
+                        lam = max(lam, lam0)
+                        lam = min(lam_max, lam * lam_growth if lam > 0.0 else lam0)
+                        reg_retries += 1
+                        if os.getenv("PYCUTFEM_VI_TRACE_REG", "").lower() in {"1", "true", "yes"}:
+                            print(f"        [vi-reg] retry={reg_retries}  λ->{lam:.2e}  after linear solve failure: {exc}")
+                        continue
+                    raise
 
                 if bool(getattr(self.np, "line_search", True)):
                     t_ls = time.perf_counter()
@@ -6616,6 +6716,19 @@ class PdasNewtonSolver(NewtonSolver):
                         self._vi_lambda_current = lam0
 
             print(f"          timings: solve={lin_time:.2e}s, line-search={ls_time:.2e}s, alpha={accepted_alpha:.2e}, merit_ratio={merit_ratio:.3f}")
+
+        if accept_factor > 0.0 and atol > 0.0 and np.isfinite(last_norm_G) and last_norm_G <= accept_factor * atol:
+            print(
+                f"    [warn] Accepting VI Newton best iterate since |G|_∞={last_norm_G:.3e} "
+                f"≤ {accept_factor:g}·atol (atol={atol:.3e})."
+            )
+            self._last_nonlinear_norm = float(last_norm_G)
+            self._last_nonlinear_norm_label = "|G|_∞"
+            self._last_nonlinear_reason = 2
+            self._last_nonlinear_accepted = True
+            self._last_nonlinear_relaxed_accept = True
+            delta = np.hstack([f.nodal_values - f_prev.nodal_values for f, f_prev in zip(funcs, prev_funcs)])
+            return delta, True, int(last_it)
 
         raise RuntimeError("VI Newton did not converge – adjust tolerances/Δt or verify Jacobian.")
 
