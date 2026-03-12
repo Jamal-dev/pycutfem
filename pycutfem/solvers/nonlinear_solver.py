@@ -20,7 +20,7 @@ import time
 import os
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Callable, Optional, Tuple
 import inspect
 import warnings
@@ -423,9 +423,39 @@ class VIParameters:
     """
 
     c: float = 1.0
+    c_by_field: dict[str, float] = field(default_factory=dict)
     active_tol: float = 0.0
+    enter_tol: float | None = None
+    leave_tol: float | None = None
+    active_set_persistence: int = 0
     project_initial_guess: bool = True
     project_each_iteration: bool = False
+    inactive_reg_lambda0: float = 0.0
+    inactive_reg_lambda_max: float = 1.0e6
+    inactive_reg_growth: float = 5.0
+    inactive_reg_decay: float = 0.5
+    inactive_reg_min_diag: float = 1.0e-12
+    inactive_reg_delta_active_trigger: int = 0
+    inactive_reg_stall_alpha: float = 0.25
+    inactive_reg_stall_merit_ratio: float = 0.95
+    merit_mode: str = "split"
+    merit_residual_weight: float = 1.0
+    merit_gap_weight: float = 1.0
+    filter_max_residual_growth: float = 1.25
+    filter_max_gap_growth: float = 1.25
+    active_step_delta_active_trigger: int = 0
+    active_step_soft_alpha: float = 1.0
+    active_step_strong_factor: float = 5.0
+    filter_max_delta_active: int = 0
+    unconstrained_lm: bool = False
+    unconstrained_lm_lambda0: float = 1.0e-4
+    unconstrained_lm_lambda_max: float = 1.0e6
+    unconstrained_lm_growth: float = 5.0
+    unconstrained_lm_decay: float = 0.5
+    unconstrained_lm_min_diag: float = 1.0e-12
+    unconstrained_lm_accept_ratio: float = 1.0e-3
+    unconstrained_lm_good_ratio: float = 0.75
+    unconstrained_lm_max_tries: int = 6
 
 # ----------------------------------------------------------------------------
 #  Restriction helper
@@ -585,7 +615,7 @@ class NewtonSolver:
         _start_numba_reduced_pattern_precompile()
         _t_compile0 = time.perf_counter()
         if self._is_jit_backend():
-            msg = f"[setup] compiling kernels (backend='{self.backend}', quad_order={int(self.quad_order)})"
+            msg = f"[setup] preparing kernels (backend='{self.backend}', quad_order={int(self.quad_order)}, cache-aware)"
             if parallel_compile:
                 msg += " (residual in background)"
             print(msg, flush=True)
@@ -595,15 +625,15 @@ class NewtonSolver:
         if self._is_jit_backend():
             dt_compile = time.perf_counter() - _t_compile0
             if parallel_compile and getattr(self, "_kernels_F_future", None) is not None:
-                print(f"[setup] kernels compiled (jacobian) in {dt_compile:.3f}s; residual will finish during setup.", flush=True)
+                print(f"[setup] kernels ready (jacobian) in {dt_compile:.3f}s; residual will finish during setup.", flush=True)
             else:
-                print(f"[setup] kernels compiled in {dt_compile:.3f}s", flush=True)
+                print(f"[setup] kernels ready in {dt_compile:.3f}s", flush=True)
         if _profile_setup:
             dt = time.perf_counter() - _t_setup0
             if getattr(self, "_kernels_F_future", None) is not None:
-                print(f"[setup] compile kernels (jacobian): {dt:.3f}s  (residual compiling in background)")
+                print(f"[setup] prepare kernels (jacobian): {dt:.3f}s  (residual preparing in background)")
             else:
-                print(f"[setup] compile kernels: {dt:.3f}s")
+                print(f"[setup] prepare kernels: {dt:.3f}s")
         # --- NEW: A PRIORI DOF ANALYSIS ---
         # Analyze the forms once to get the definitive set of active DOFs.
         self.equation = Equation(jacobian_form, residual_form)
@@ -764,6 +794,18 @@ class NewtonSolver:
                 continue
             for gdof, lidx in g2l.items():
                 vals[int(lidx)] = U[int(gdof)]
+
+    def _assert_functions_finite(self, functions: list, *, context: str) -> None:
+        from pycutfem.ufl.expressions import Function, VectorFunction
+
+        for func in functions:
+            if not isinstance(func, (Function, VectorFunction)):
+                continue
+            vals = np.asarray(getattr(func, "nodal_values", np.array([], dtype=float)), dtype=float)
+            if vals.size and not np.all(np.isfinite(vals)):
+                raise RuntimeError(
+                    f"Non-finite iterate detected {context} in field '{getattr(func, 'name', '<unnamed>')}'."
+                )
 
 
 
@@ -1822,6 +1864,43 @@ class NewtonSolver:
                                 print(f"        [mat] eigs failed: {exc}")
                     except Exception as exc:  # noqa: PERF203
                         print(f"        [mat] stats failed: {exc}")
+            if os.getenv("PYCUTFEM_SAVE_MATRIX", "").lower() in {"1", "true", "yes"}:
+                step_target_raw = os.getenv("PYCUTFEM_SAVE_MATRIX_STEP", "").strip()
+                it_target_raw = os.getenv("PYCUTFEM_SAVE_MATRIX_IT", "").strip()
+                outdir = str(os.getenv("PYCUTFEM_SAVE_MATRIX_DIR", "") or "").strip()
+                if not outdir:
+                    outdir = os.path.join(os.getcwd(), "_pycutfem_matrix_dumps")
+                try:
+                    step_now = int(getattr(self, "_current_step_no", -1))
+                except Exception:
+                    step_now = -1
+                try:
+                    want_step = int(step_target_raw) if step_target_raw else None
+                except Exception:
+                    want_step = None
+                try:
+                    want_it = int(it_target_raw) if it_target_raw else 1
+                except Exception:
+                    want_it = 1
+                do_dump = (want_step is None or want_step == step_now) and (int(it + 1) == int(want_it))
+                if do_dump:
+                    dumped = getattr(self, "_saved_matrix_keys", None)
+                    if dumped is None:
+                        dumped = set()
+                        setattr(self, "_saved_matrix_keys", dumped)
+                    key = (step_now, int(it + 1))
+                    if key not in dumped and A_red is not None:
+                        dumped.add(key)
+                        try:
+                            os.makedirs(outdir, exist_ok=True)
+                            stem = f"step{int(step_now):04d}_it{int(it + 1):02d}"
+                            A_csr = A_red.tocsr() if hasattr(A_red, "tocsr") else A_red
+                            sp.save_npz(os.path.join(outdir, f"{stem}_A_red.npz"), A_csr)
+                            np.save(os.path.join(outdir, f"{stem}_R_red.npy"), np.asarray(R_red, dtype=np.float64))
+                            np.save(os.path.join(outdir, f"{stem}_active_dofs.npy"), np.asarray(self.active_dofs, dtype=np.int64))
+                            print(f"        [mat-save] saved reduced matrix/vector to {outdir}/{stem}_*")
+                        except Exception as exc:
+                            print(f"        [mat-save] failed: {exc}")
             if os.getenv("PYCUTFEM_RESIDUAL_TRACE", "").lower() in {"1", "true", "yes"}:
                 worst_full = int(np.argmax(np.abs(R_full))) if R_full.size else -1
                 worst_val = float(R_full[worst_full]) if worst_full >= 0 else 0.0
@@ -3110,6 +3189,133 @@ class NewtonSolver:
             return self._solve_linear_system_petsc(A, rhs)
         raise ValueError(f"Unknown linear solver backend '{self.lp.backend}'.")
 
+    def set_linear_schur_fieldsplit(
+        self,
+        *,
+        pressure_field: str = "p",
+        schur_fact: str = "full",
+        schur_pre: str = "selfp",
+        outer_ksp: str | None = None,
+        outer_pc: str | None = None,
+        rest_ksp: str | None = None,
+        rest_pc: str | None = None,
+        rest_factor_solver_type: str | None = None,
+        pressure_ksp: str | None = None,
+        pressure_pc: str | None = None,
+        pressure_factor_solver_type: str | None = None,
+    ) -> None:
+        self._linear_schur_cfg = {
+            "pressure_field": str(pressure_field),
+            "schur_fact": str(schur_fact).lower(),
+            "schur_pre": str(schur_pre).lower(),
+            "outer_ksp": None if outer_ksp is None else str(outer_ksp).lower(),
+            "outer_pc": None if outer_pc is None else str(outer_pc).lower(),
+            "rest_ksp": None if rest_ksp is None else str(rest_ksp).lower(),
+            "rest_pc": None if rest_pc is None else str(rest_pc).lower(),
+            "rest_factor_solver_type": None if rest_factor_solver_type is None else str(rest_factor_solver_type).lower(),
+            "pressure_ksp": None if pressure_ksp is None else str(pressure_ksp).lower(),
+            "pressure_pc": None if pressure_pc is None else str(pressure_pc).lower(),
+            "pressure_factor_solver_type": None if pressure_factor_solver_type is None else str(pressure_factor_solver_type).lower(),
+        }
+        try:
+            self._petsc_linear_cache = None
+        except Exception:
+            pass
+
+    def _petsc_linear_schur_cfg_from_env(self) -> dict | None:
+        flag = str(os.getenv("PYCUTFEM_LINEAR_SCHUR", "") or "").strip().lower()
+        if flag not in {"1", "true", "yes"}:
+            return None
+        return {
+            "pressure_field": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_FIELD", "p") or "p").strip(),
+            "schur_fact": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_FACT_TYPE", "full") or "full").strip().lower(),
+            "schur_pre": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRECONDITION", "selfp") or "selfp").strip().lower(),
+            "outer_ksp": str(os.getenv("PYCUTFEM_LINEAR_KSP_TYPE", "") or "").strip().lower() or None,
+            "outer_pc": "fieldsplit",
+            "rest_ksp": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_REST_KSP_TYPE", "preonly") or "preonly").strip().lower(),
+            "rest_pc": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_REST_PC_TYPE", "ilu") or "ilu").strip().lower(),
+            "rest_factor_solver_type": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_REST_FACTOR_SOLVER_TYPE", "") or "").strip().lower() or None,
+            "pressure_ksp": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_KSP_TYPE", "preonly") or "preonly").strip().lower(),
+            "pressure_pc": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_PC_TYPE", "jacobi") or "jacobi").strip().lower(),
+            "pressure_factor_solver_type": str(os.getenv("PYCUTFEM_LINEAR_SCHUR_PRESSURE_FACTOR_SOLVER_TYPE", "") or "").strip().lower() or None,
+        }
+
+    def _reduced_indices_for_field(self, field_name: str) -> np.ndarray:
+        try:
+            full_idx = np.asarray(self.dh.get_field_slice(field_name), dtype=int).ravel()
+        except Exception:
+            return np.empty((0,), dtype=int)
+        if full_idx.size == 0:
+            return np.empty((0,), dtype=int)
+        if getattr(self, "constraints", None) is not None:
+            red_idx_list: list[int] = []
+            for gd in full_idx.tolist():
+                try:
+                    mcol = self.constraints.master_index_for(int(gd))
+                except Exception:
+                    mcol = None
+                if mcol is None:
+                    continue
+                ridx = int(self.full_to_red[int(mcol)]) if 0 <= int(mcol) < int(self.full_to_red.size) else -1
+                if ridx >= 0:
+                    red_idx_list.append(ridx)
+            if not red_idx_list:
+                return np.empty((0,), dtype=int)
+            return np.asarray(sorted(set(red_idx_list)), dtype=int)
+        red_idx = np.asarray(self.full_to_red[full_idx], dtype=int).ravel()
+        red_idx = red_idx[red_idx >= 0]
+        if red_idx.size == 0:
+            return np.empty((0,), dtype=int)
+        return np.unique(red_idx)
+
+    def _apply_linear_schur_fieldsplit(self, ksp, n: int) -> bool:
+        from petsc4py import PETSc  # type: ignore
+
+        cfg = getattr(self, "_linear_schur_cfg", None)
+        if cfg is None:
+            cfg = self._petsc_linear_schur_cfg_from_env()
+        if cfg is None:
+            return False
+
+        p_red = self._reduced_indices_for_field(str(cfg.get("pressure_field", "p") or "p"))
+        if p_red.size == 0 or p_red.size >= int(n):
+            return False
+        rest_red = np.setdiff1d(np.arange(int(n), dtype=int), p_red, assume_unique=False)
+        if rest_red.size == 0:
+            return False
+
+        pc = ksp.getPC()
+        if cfg.get("outer_ksp"):
+            ksp.setType(str(cfg["outer_ksp"]))
+        pc.setType(str(cfg.get("outer_pc", "fieldsplit") or "fieldsplit"))
+        pc.setFieldSplitType(PETSc.PC.CompositeType.SCHUR)
+
+        rest_is = PETSc.IS().createGeneral(rest_red.astype(PETSc.IntType), comm=PETSc.COMM_SELF)
+        p_is = PETSc.IS().createGeneral(p_red.astype(PETSc.IntType), comm=PETSc.COMM_SELF)
+        pc.setFieldSplitIS(("rest", rest_is), ("p", p_is))
+
+        opts = PETSc.Options()
+        opts["pc_fieldsplit_schur_fact_type"] = str(cfg.get("schur_fact", "full") or "full")
+        opts["pc_fieldsplit_schur_precondition"] = str(cfg.get("schur_pre", "selfp") or "selfp")
+        if cfg.get("rest_ksp"):
+            opts["fieldsplit_rest_ksp_type"] = str(cfg["rest_ksp"])
+        if cfg.get("rest_pc"):
+            opts["fieldsplit_rest_pc_type"] = str(cfg["rest_pc"])
+        if cfg.get("rest_factor_solver_type"):
+            opts["fieldsplit_rest_pc_factor_mat_solver_type"] = str(cfg["rest_factor_solver_type"])
+        if cfg.get("pressure_ksp"):
+            opts["fieldsplit_p_ksp_type"] = str(cfg["pressure_ksp"])
+        if cfg.get("pressure_pc"):
+            opts["fieldsplit_p_pc_type"] = str(cfg["pressure_pc"])
+        if cfg.get("pressure_factor_solver_type"):
+            opts["fieldsplit_p_pc_factor_mat_solver_type"] = str(cfg["pressure_factor_solver_type"])
+        self._linear_schur_last_info = {
+            "pressure_field": str(cfg.get("pressure_field", "p") or "p"),
+            "p_dofs": int(p_red.size),
+            "rest_dofs": int(rest_red.size),
+        }
+        return True
+
     def _solve_linear_system_petsc(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
         """
         Solve A x = rhs using PETSc KSP on COMM_SELF (serial) while reusing
@@ -3154,8 +3360,62 @@ class NewtonSolver:
                 pc.setFactorSolverType("mumps")
             except Exception:
                 pass
+            # Optional env overrides for the internal PETSc linear solve used by
+            # the custom Newton/PDAS path. This keeps the benchmark CLI stable
+            # while allowing direct LU vs Krylov experiments.
+            try:
+                ksp_type = str(os.getenv("PYCUTFEM_LINEAR_KSP_TYPE", "") or "").strip()
+                if ksp_type:
+                    ksp.setType(ksp_type)
+            except Exception:
+                pass
+            try:
+                pc_type = str(os.getenv("PYCUTFEM_LINEAR_PC_TYPE", "") or "").strip()
+                if pc_type:
+                    pc.setType(pc_type)
+            except Exception:
+                pass
+            try:
+                factor_type = str(os.getenv("PYCUTFEM_LINEAR_PC_FACTOR_SOLVER_TYPE", "") or "").strip()
+                if factor_type:
+                    pc.setFactorSolverType(factor_type)
+            except Exception:
+                pass
+            schur_applied = False
+            try:
+                schur_applied = bool(self._apply_linear_schur_fieldsplit(ksp, n))
+            except Exception:
+                schur_applied = False
+            try:
+                rtol_raw = str(os.getenv("PYCUTFEM_LINEAR_KSP_RTOL", "") or "").strip()
+                atol_raw = str(os.getenv("PYCUTFEM_LINEAR_KSP_ATOL", "") or "").strip()
+                dtol_raw = str(os.getenv("PYCUTFEM_LINEAR_KSP_DTOL", "") or "").strip()
+                maxit_raw = str(os.getenv("PYCUTFEM_LINEAR_KSP_MAX_IT", "") or "").strip()
+                rtol = float(rtol_raw) if rtol_raw else None
+                atol = float(atol_raw) if atol_raw else None
+                dtol = float(dtol_raw) if dtol_raw else None
+                max_it = int(maxit_raw) if maxit_raw else None
+                if any(v is not None for v in (rtol, atol, dtol, max_it)):
+                    ksp.setTolerances(
+                        rtol=PETSc.DECIDE if rtol is None else rtol,
+                        atol=PETSc.DECIDE if atol is None else atol,
+                        divtol=PETSc.DECIDE if dtol is None else dtol,
+                        max_it=PETSc.DECIDE if max_it is None else max_it,
+                    )
+            except Exception:
+                pass
             # Allow users to override via PETSc options (e.g. -pc_factor_mat_solver_type superlu_dist).
             ksp.setFromOptions()
+            if os.getenv("PYCUTFEM_LINEAR_KSP_TRACE", "").lower() in {"1", "true", "yes"} and schur_applied:
+                try:
+                    info = dict(getattr(self, "_linear_schur_last_info", {}) or {})
+                    print(
+                        "        [ksp-schur] pressure_field="
+                        + str(info.get("pressure_field", "p"))
+                        + f" p_dofs={int(info.get('p_dofs', 0))} rest_dofs={int(info.get('rest_dofs', 0))}"
+                    )
+                except Exception:
+                    pass
 
             b = PETSc.Vec().createSeq(n, comm=comm)
             x = PETSc.Vec().createSeq(n, comm=comm)
@@ -3211,9 +3471,45 @@ class NewtonSolver:
                 pass
             raise
 
+        try:
+            reason = int(ksp.getConvergedReason())
+        except Exception:
+            reason = 0
+        if os.getenv("PYCUTFEM_LINEAR_KSP_TRACE", "").lower() in {"1", "true", "yes"}:
+            try:
+                its = int(ksp.getIterationNumber())
+            except Exception:
+                its = -1
+            try:
+                rnorm = float(ksp.getResidualNorm())
+            except Exception:
+                rnorm = float("nan")
+            print(f"        [ksp] type={ksp.getType()} pc={ksp.getPC().getType()} reason={reason} its={its} rnorm={rnorm:.3e}")
+        if reason <= 0:
+            try:
+                self._petsc_linear_cache = None
+            except Exception:
+                pass
+            its = None
+            try:
+                its = int(ksp.getIterationNumber())
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"PETSc KSP failed to converge (reason={reason}"
+                + (f", its={its}" if its is not None else "")
+                + ")."
+            )
+
         x_arr = x.getArray(readonly=True)
         out = x_arr.copy()
         del x_arr
+        if not np.all(np.isfinite(out)):
+            try:
+                self._petsc_linear_cache = None
+            except Exception:
+                pass
+            raise RuntimeError("PETSc linear solve returned non-finite solution values.")
         return out
 
 
@@ -5151,6 +5447,274 @@ class PdasNewtonSolver(NewtonSolver):
         self.vi_params = vi_params
         self._box_lower_full: np.ndarray | None = None
         self._box_upper_full: np.ndarray | None = None
+        self._vi_prev_state: np.ndarray | None = None
+        self._vi_pending_state: np.ndarray | None = None
+        self._vi_pending_count: np.ndarray | None = None
+        self._vi_lambda_current: float = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
+        self._vi_lm_lambda_current: float = float(getattr(self.vi_params, "unconstrained_lm_lambda0", 1.0e-4) or 1.0e-4)
+        self._vi_last_metrics: dict[str, float] | None = None
+        self._vi_last_retry_count: int = 0
+        self._vi_red_field_names = self._build_vi_reduced_field_names()
+
+    def _build_vi_reduced_field_names(self) -> np.ndarray:
+        names: list[str] = []
+        full_to_field = getattr(self.dh, "_dof_to_node_map", {})
+        master_ids = None
+        if getattr(self, "constraints", None) is not None:
+            try:
+                master_ids = np.asarray(self.constraints.master_ids, dtype=int)
+            except Exception:
+                master_ids = None
+        for rid in np.asarray(self.active_dofs, dtype=int).tolist():
+            full_id = int(rid)
+            if master_ids is not None and 0 <= full_id < int(master_ids.size):
+                full_id = int(master_ids[full_id])
+            names.append(str(full_to_field.get(full_id, ("", None))[0] or ""))
+        return np.asarray(names, dtype=object)
+
+    def _vi_c_vector(self, A_red: sp.csr_matrix, lo_red: np.ndarray, hi_red: np.ndarray) -> np.ndarray:
+        bounded = np.isfinite(lo_red) | np.isfinite(hi_red)
+        c_base = float(getattr(self.vi_params, "c", 1.0) or 1.0)
+        c_red = np.full(lo_red.shape, c_base, dtype=float)
+
+        # Auto-scale by field from the current Jacobian diagonal when requested.
+        auto_c = (not np.isfinite(c_base)) or (c_base <= 0.0)
+        diag_full = np.abs(np.asarray(A_red.diagonal(), dtype=float))
+        diag_full = np.where(np.isfinite(diag_full) & (diag_full > 0.0), diag_full, np.nan)
+
+        field_vals: dict[str, float] = {}
+        if auto_c and np.any(bounded):
+            for fld in np.unique(self._vi_red_field_names[bounded]):
+                if not str(fld):
+                    continue
+                mask = bounded & (self._vi_red_field_names == fld)
+                vals = diag_full[mask]
+                vals = vals[np.isfinite(vals)]
+                if vals.size:
+                    field_vals[str(fld)] = float(np.median(vals))
+            if field_vals:
+                finite_vals = np.asarray(list(field_vals.values()), dtype=float)
+                finite_vals = finite_vals[np.isfinite(finite_vals) & (finite_vals > 0.0)]
+                self.vi_params.c = float(np.median(finite_vals)) if finite_vals.size else 1.0
+            else:
+                self.vi_params.c = 1.0
+            c_red[:] = float(getattr(self.vi_params, "c", 1.0) or 1.0)
+
+        # Explicit per-field overrides always win.
+        for fld, c_val in dict(getattr(self.vi_params, "c_by_field", {}) or {}).items():
+            try:
+                c_f = float(c_val)
+            except Exception:
+                continue
+            if np.isfinite(c_f) and c_f > 0.0:
+                field_vals[str(fld)] = c_f
+
+        for fld, c_f in field_vals.items():
+            c_red[self._vi_red_field_names == fld] = float(c_f)
+
+        c_red = np.where(np.isfinite(c_red) & (c_red > 0.0), c_red, 1.0)
+        self._vi_c_field_current = dict(field_vals)
+        return c_red
+
+    def _vi_state_from_sets(self, act_lo: np.ndarray, act_hi: np.ndarray) -> np.ndarray:
+        state = np.zeros(act_lo.shape, dtype=np.int8)
+        state[np.asarray(act_lo, dtype=bool)] = 1
+        state[np.asarray(act_hi, dtype=bool)] = -1
+        return state
+
+    def _vi_apply_state_persistence(self, proposed_state: np.ndarray) -> np.ndarray:
+        persist = max(0, int(getattr(self.vi_params, "active_set_persistence", 0) or 0))
+        if persist <= 0:
+            self._vi_pending_state = proposed_state.copy()
+            self._vi_pending_count = np.zeros(proposed_state.shape, dtype=np.int16)
+            return proposed_state
+
+        prev = getattr(self, "_vi_prev_state", None)
+        if prev is None or prev.shape != proposed_state.shape:
+            self._vi_pending_state = proposed_state.copy()
+            self._vi_pending_count = np.zeros(proposed_state.shape, dtype=np.int16)
+            return proposed_state
+
+        pending = getattr(self, "_vi_pending_state", None)
+        counts = getattr(self, "_vi_pending_count", None)
+        if pending is None or counts is None or pending.shape != proposed_state.shape or counts.shape != proposed_state.shape:
+            pending = prev.copy()
+            counts = np.zeros(proposed_state.shape, dtype=np.int16)
+
+        changed = proposed_state != prev
+        same_pending = proposed_state == pending
+        counts = np.where(changed & same_pending, counts + 1, np.where(changed, 1, 0)).astype(np.int16, copy=False)
+        pending = np.where(changed, proposed_state, prev).astype(np.int8, copy=False)
+
+        accepted = prev.copy()
+        promote = changed & (counts > persist)
+        accepted[promote] = proposed_state[promote]
+
+        self._vi_pending_state = pending.astype(np.int8, copy=False)
+        self._vi_pending_count = counts.astype(np.int16, copy=False)
+        return accepted.astype(np.int8, copy=False)
+
+    def _vi_metrics(
+        self,
+        x_red: np.ndarray,
+        R_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        act_lo: np.ndarray,
+        act_hi: np.ndarray,
+        G_red: np.ndarray,
+    ) -> dict[str, float]:
+        active = np.asarray(act_lo | act_hi, dtype=bool)
+        inactive = ~active
+        gap = np.zeros_like(x_red, dtype=float)
+        gap[act_lo] = np.abs(x_red[act_lo] - lo_red[act_lo])
+        gap[act_hi] = np.abs(hi_red[act_hi] - x_red[act_hi])
+        R_inactive = np.asarray(R_red[inactive], dtype=float)
+        gap_active = np.asarray(gap[active], dtype=float)
+        res_inf = float(np.linalg.norm(R_inactive, ord=np.inf)) if R_inactive.size else 0.0
+        gap_inf = float(np.linalg.norm(gap_active, ord=np.inf)) if gap_active.size else 0.0
+        res_l2 = float(R_inactive @ R_inactive) if R_inactive.size else 0.0
+        gap_l2 = float(gap_active @ gap_active) if gap_active.size else 0.0
+        merit = (
+            0.5 * float(getattr(self.vi_params, "merit_residual_weight", 1.0) or 1.0) * res_l2
+            + 0.5 * float(getattr(self.vi_params, "merit_gap_weight", 1.0) or 1.0) * gap_l2
+        )
+        return {
+            "G_inf": float(np.linalg.norm(np.asarray(G_red, dtype=float), ord=np.inf)),
+            "G_half": 0.5 * float(np.asarray(G_red, dtype=float) @ np.asarray(G_red, dtype=float)),
+            "inactive_res_inf": res_inf,
+            "active_gap_inf": gap_inf,
+            "inactive_res_l2_sq": res_l2,
+            "active_gap_l2_sq": gap_l2,
+            "merit": merit,
+        }
+
+    def _vi_apply_inactive_regularization(
+        self,
+        A_mod: sp.csr_matrix,
+        A_base: sp.csr_matrix,
+        active: np.ndarray,
+        lam: float,
+    ) -> tuple[sp.csr_matrix, np.ndarray]:
+        inactive = ~np.asarray(active, dtype=bool)
+        if lam <= 0.0 or not np.any(inactive):
+            return A_mod, np.zeros(active.shape, dtype=float)
+
+        diag = np.abs(np.asarray(A_base.diagonal(), dtype=float))
+        floor = float(getattr(self.vi_params, "inactive_reg_min_diag", 1.0e-12) or 1.0e-12)
+        diag = np.where(np.isfinite(diag) & (diag > floor), diag, floor)
+        add = np.zeros(active.shape, dtype=float)
+        add[inactive] = float(lam) * diag[inactive]
+
+        A_reg = A_mod.tolil(copy=True)
+        for idx in np.flatnonzero(inactive).tolist():
+            A_reg[int(idx), int(idx)] = float(A_reg[int(idx), int(idx)]) + float(add[int(idx)])
+        return A_reg.tocsr(), add
+
+    def _vi_build_unconstrained_lm_system(
+        self,
+        A_red: sp.csr_matrix,
+        R_red: np.ndarray,
+        lam: float,
+    ) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray]:
+        if not sp.isspmatrix_csr(A_red):
+            A_red = A_red.tocsr()
+        diag = np.abs(np.asarray(A_red.diagonal(), dtype=float))
+        floor = float(getattr(self.vi_params, "unconstrained_lm_min_diag", 1.0e-12) or 1.0e-12)
+        diag = np.where(np.isfinite(diag) & (diag > floor), diag, floor)
+        H = A_red.copy().tocsr()
+        if lam > 0.0:
+            H = H + sp.diags(float(lam) * diag, format="csr")
+        rhs = -np.asarray(R_red, dtype=float)
+        return H, rhs, diag
+
+    def _vi_unconstrained_lm_model(
+        self,
+        R_red: np.ndarray,
+        A_red: sp.csr_matrix,
+        step: np.ndarray,
+        lam: float,
+        diag: np.ndarray,
+        *,
+        phi_try: float | None = None,
+    ) -> tuple[float, float, float, float]:
+        phi0 = 0.5 * float(np.asarray(R_red, dtype=float) @ np.asarray(R_red, dtype=float))
+        lin_res = np.asarray(R_red, dtype=float) + np.asarray(A_red @ step, dtype=float)
+        model_phi = 0.5 * float(lin_res @ lin_res)
+        # IMPORTANT:
+        # The current unconstrained "LM" branch solves a shifted Newton system
+        #   (A + λ D) s = -R
+        # for speed, not the classical least-squares LM normal equations.
+        # Therefore `phi0 - model_phi` is *not* a reliable predicted reduction
+        # for the accepted step, and using it in rho can produce ±inf / nonsense.
+        #
+        # We still return the linearized merit model value for diagnostics, but
+        # the acceptance ratio uses the *actual* relative reduction instead.
+        rho = float("nan")
+        if phi_try is not None:
+            actual = phi0 - float(phi_try)
+            rho = actual / max(phi0, 1.0e-30)
+        pred_model = phi0 - model_phi
+        return phi0, model_phi, pred_model, rho
+
+    def _vi_strong_active_mask(
+        self,
+        x_red: np.ndarray,
+        R_red: np.ndarray,
+        lo_red: np.ndarray,
+        hi_red: np.ndarray,
+        act_lo: np.ndarray,
+        act_hi: np.ndarray,
+        c_red: np.ndarray,
+    ) -> np.ndarray:
+        tol0 = float(getattr(self.vi_params, "active_tol", 0.0) or 0.0)
+        enter_tol = getattr(self.vi_params, "enter_tol", None)
+        leave_tol = getattr(self.vi_params, "leave_tol", None)
+        enter_tol = tol0 if enter_tol is None else float(enter_tol)
+        leave_tol = enter_tol if leave_tol is None else float(leave_tol)
+        base_tol = max(abs(enter_tol), abs(leave_tol), 1.0e-16)
+        factor = float(getattr(self.vi_params, "active_step_strong_factor", 5.0) or 5.0)
+        gap_lo = x_red - lo_red
+        gap_hi = hi_red - x_red
+        ind_lo = R_red - c_red * gap_lo
+        ind_hi = R_red + c_red * gap_hi
+        strong_lo = np.asarray(act_lo, dtype=bool) & (ind_lo >= factor * base_tol)
+        strong_hi = np.asarray(act_hi, dtype=bool) & ((-ind_hi) >= factor * base_tol)
+        return np.asarray(strong_lo | strong_hi, dtype=bool)
+
+    def _vi_apply_active_step_policy(
+        self,
+        *,
+        alpha: float,
+        S_red: np.ndarray,
+        active_mask: np.ndarray | None,
+        strong_active_mask: np.ndarray | None,
+        active_delta_ref: int,
+    ) -> tuple[np.ndarray, bool]:
+        step = alpha * np.asarray(S_red, dtype=float)
+        if active_mask is None or active_mask.size != step.size:
+            return step, False
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if not np.any(active_mask):
+            return step, False
+
+        trigger = int(getattr(self.vi_params, "active_step_delta_active_trigger", 0) or 0)
+        soft_alpha = float(getattr(self.vi_params, "active_step_soft_alpha", 1.0) or 1.0)
+        use_soft = trigger > 0 and active_delta_ref >= trigger and soft_alpha < 1.0
+        if not use_soft:
+            step = step.copy()
+            step[active_mask] = np.asarray(S_red, dtype=float)[active_mask]
+            return step, False
+
+        strong_active_mask = np.zeros(step.shape, dtype=bool) if strong_active_mask is None else np.asarray(strong_active_mask, dtype=bool)
+        if strong_active_mask.shape != step.shape:
+            strong_active_mask = np.zeros(step.shape, dtype=bool)
+        weak_active_mask = active_mask & (~strong_active_mask)
+        weak_alpha = min(max(alpha, 0.0), soft_alpha)
+        step = step.copy()
+        step[strong_active_mask] = np.asarray(S_red, dtype=float)[strong_active_mask]
+        step[weak_active_mask] = weak_alpha * np.asarray(S_red, dtype=float)[weak_active_mask]
+        return step, True
 
     def set_box_bounds(self, lower=None, upper=None, by_field: dict | None = None) -> None:
         """
@@ -5284,6 +5848,7 @@ class PdasNewtonSolver(NewtonSolver):
         R_red: np.ndarray,
         lo_red: np.ndarray,
         hi_red: np.ndarray,
+        c_red: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Build the semismooth residual for the bound VI and the corresponding
@@ -5298,17 +5863,40 @@ class PdasNewtonSolver(NewtonSolver):
           - lower-active if   F(x) - c(x-lo) >  tol
           - upper-active if   F(x) + c(hi-x) < -tol
         """
-        c = float(getattr(self.vi_params, "c", 1.0))
-        tol = float(getattr(self.vi_params, "active_tol", 0.0) or 0.0)
+        tol0 = float(getattr(self.vi_params, "active_tol", 0.0) or 0.0)
+        enter_tol = getattr(self.vi_params, "enter_tol", None)
+        leave_tol = getattr(self.vi_params, "leave_tol", None)
+        enter_tol = tol0 if enter_tol is None else float(enter_tol)
+        leave_tol = enter_tol if leave_tol is None else float(leave_tol)
+        if c_red is None:
+            c_red = np.full(x_red.shape, float(getattr(self.vi_params, "c", 1.0) or 1.0), dtype=float)
+        c_red = np.where(np.isfinite(c_red) & (c_red > 0.0), c_red, 1.0)
 
         lo_f = np.isfinite(lo_red)
         hi_f = np.isfinite(hi_red)
         gap_lo = x_red - lo_red
         gap_hi = hi_red - x_red
 
-        # Candidate actives (masked to finite bounds).
-        act_lo = lo_f & ((R_red - c * gap_lo) > tol)
-        act_hi = hi_f & ((R_red + c * gap_hi) < -tol)
+        ind_lo = R_red - c_red * gap_lo
+        ind_hi = R_red + c_red * gap_hi
+
+        prev_state = getattr(self, "_vi_prev_state", None)
+        prev_lo = prev_state is not None and prev_state.shape == x_red.shape
+        if prev_lo:
+            prev_lo_mask = prev_state == 1
+            prev_hi_mask = prev_state == -1
+        else:
+            prev_lo_mask = np.zeros(x_red.shape, dtype=bool)
+            prev_hi_mask = np.zeros(x_red.shape, dtype=bool)
+
+        # Candidate actives (masked to finite bounds) with hysteresis.
+        enter_lo = lo_f & (ind_lo > enter_tol)
+        enter_hi = hi_f & (ind_hi < -enter_tol)
+        keep_lo = prev_lo_mask & lo_f & (ind_lo > -leave_tol)
+        keep_hi = prev_hi_mask & hi_f & (ind_hi < leave_tol)
+
+        act_lo = enter_lo | keep_lo
+        act_hi = enter_hi | keep_hi
 
         # Resolve overlaps (should not happen for consistent bounds, but be safe).
         both = act_lo & act_hi
@@ -5318,10 +5906,16 @@ class PdasNewtonSolver(NewtonSolver):
             act_lo[both] &= choose_lo
             act_hi[both] &= ~choose_lo
 
+        proposed_state = self._vi_state_from_sets(act_lo, act_hi)
+        state = self._vi_apply_state_persistence(proposed_state)
+        act_lo = state == 1
+        act_hi = state == -1
+
         # Semismooth residual.
         G = np.asarray(R_red, dtype=float).copy()
         G[act_lo] = gap_lo[act_lo]
         G[act_hi] = -gap_hi[act_hi]  # x - hi
+        self._vi_prev_state = state.copy()
         return G, act_lo, act_hi
 
     def _apply_identity_rows(self, A: sp.csr_matrix, rows: np.ndarray) -> sp.csr_matrix:
@@ -5361,8 +5955,15 @@ class PdasNewtonSolver(NewtonSolver):
     def _line_search_vi_reduced(
         self,
         *,
+        x0_red: np.ndarray,
+        R0_red: np.ndarray,
         G0: np.ndarray,
+        act_lo0: np.ndarray,
+        act_hi0: np.ndarray,
         S_red: np.ndarray,
+        c_red: np.ndarray,
+        strong_active_mask: np.ndarray | None = None,
+        active_delta_ref: int = 0,
         active_mask: np.ndarray | None = None,
         funcs: list,
         coeffs: dict,
@@ -5374,23 +5975,30 @@ class PdasNewtonSolver(NewtonSolver):
         np_ = self.np
         mode = str(getattr(np_, "ls_mode", "armijo") or "armijo").lower()
         c1 = float(getattr(np_, "ls_c1", 1.0e-4))
+        merit_mode = str(getattr(self.vi_params, "merit_mode", "split") or "split").lower()
+        trace_ls = os.getenv("PYCUTFEM_VI_TRACE_LS", "").lower() in {"1", "true", "yes"}
 
         snap = [f.nodal_values.copy() for f in funcs]
-        norm0 = float(np.linalg.norm(G0, ord=np.inf))
-        phi0 = 0.5 * float(G0 @ G0)
-
+        metrics0 = self._vi_metrics(x0_red, R0_red, lo_red, hi_red, act_lo0, act_hi0, G0)
+        norm0 = float(metrics0["G_inf"])
+        phi0 = float(metrics0["G_half"])
+        merit0 = norm0 if merit_mode == "legacy" and mode == "dealii" else (phi0 if merit_mode == "legacy" else float(metrics0["merit"]))
+        gap0 = float(metrics0["active_gap_inf"])
+        res0 = float(metrics0["inactive_res_inf"])
         best_alpha = 0.0
-        best_merit = norm0 if mode == "dealii" else phi0
+        best_merit = merit0
+        best_metrics = dict(metrics0)
 
-        def _trial(alpha: float) -> tuple[float, float]:
+        def _trial(alpha: float) -> tuple[dict[str, float], np.ndarray]:
             for f, buf in zip(funcs, snap):
                 f.nodal_values[:] = buf
-            step = alpha * S_red
-            # Keep active-set updates "hard" (PDAS-style): do not damp the bound
-            # enforcement; only damp the inactive part of the Newton step.
-            if active_mask is not None and active_mask.size == step.size:
-                step = step.copy()
-                step[active_mask] = S_red[active_mask]
+            step, soft_active = self._vi_apply_active_step_policy(
+                alpha=alpha,
+                S_red=S_red,
+                active_mask=active_mask,
+                strong_active_mask=strong_active_mask,
+                active_delta_ref=active_delta_ref,
+            )
             dU_full = self.restrictor.expand_vec(step)
             dh.add_to_functions(dU_full, funcs)
             dh.apply_bcs(bcs_now, *funcs)
@@ -5401,47 +6009,99 @@ class PdasNewtonSolver(NewtonSolver):
 
             _, R_try = self._assemble_system_reduced(coeffs, need_matrix=False)
             x_try = self._pack_reduced_iterate(funcs)
-            G_try, _, _ = self._pdas_residual_and_sets(x_try, R_try, lo_red, hi_red)
-            nrm = float(np.linalg.norm(G_try, ord=np.inf))
-            phi = 0.5 * float(G_try @ G_try)
-            return nrm, phi
+            prev_state_save = None if self._vi_prev_state is None else self._vi_prev_state.copy()
+            prev_pending = None if self._vi_pending_state is None else self._vi_pending_state.copy()
+            prev_counts = None if self._vi_pending_count is None else self._vi_pending_count.copy()
+            G_try, act_lo_try, act_hi_try = self._pdas_residual_and_sets(x_try, R_try, lo_red, hi_red, c_red=c_red)
+            metrics = self._vi_metrics(x_try, R_try, lo_red, hi_red, act_lo_try, act_hi_try, G_try)
+            metrics["delta_active"] = float(
+                np.count_nonzero(self._vi_state_from_sets(act_lo_try, act_hi_try) != self._vi_state_from_sets(act_lo0, act_hi0))
+            )
+            metrics["soft_active"] = 1.0 if soft_active else 0.0
+            metrics["alpha_trial"] = float(alpha)
+            if prev_state_save is None:
+                self._vi_prev_state = None
+            else:
+                self._vi_prev_state = prev_state_save
+            self._vi_pending_state = prev_pending
+            self._vi_pending_count = prev_counts
+            return metrics, step
 
         # Always try full step first (robust, avoids warm-start lock-in).
-        nrm1, phi1 = _trial(1.0)
-        merit1 = nrm1 if mode == "dealii" else phi1
+        metrics1, step1 = _trial(1.0)
+        merit1 = metrics1["G_inf"] if merit_mode == "legacy" and mode == "dealii" else (metrics1["G_half"] if merit_mode == "legacy" else metrics1["merit"])
         if merit1 < best_merit:
             best_merit = merit1
             best_alpha = 1.0
-        if (mode == "dealii" and nrm1 < norm0) or (
-            mode == "armijo" and phi1 <= phi0 - c1 * 1.0 * float(G0 @ G0)
-        ):
+            best_metrics = dict(metrics1)
+
+        def _accept(metrics: dict[str, float], alpha: float) -> bool:
+            if merit_mode == "legacy":
+                if mode == "dealii":
+                    return float(metrics["G_inf"]) < norm0
+                return float(metrics["G_half"]) <= phi0 - c1 * alpha * float(G0 @ G0)
+            res_ok = float(metrics["inactive_res_inf"]) <= max(
+                float(getattr(self.vi_params, "filter_max_residual_growth", 1.25) or 1.25) * max(res0, 1.0e-16),
+                1.0e-16,
+            )
+            gap_ok = float(metrics["active_gap_inf"]) <= max(
+                float(getattr(self.vi_params, "filter_max_gap_growth", 1.25) or 1.25) * max(gap0, 1.0e-16),
+                1.0e-16,
+            )
+            if not (res_ok and gap_ok):
+                return False
+            max_delta_active = int(getattr(self.vi_params, "filter_max_delta_active", 0) or 0)
+            if max_delta_active > 0 and int(metrics.get("delta_active", 0.0)) > max_delta_active:
+                return False
+            merit = float(metrics["merit"])
+            return merit <= merit0 - c1 * alpha * max(merit0, 1.0)
+
+        def _trace_trial(metrics: dict[str, float], accepted: bool) -> None:
+            if not trace_ls:
+                return
+            msg = (
+                f"        [vi-ls] alpha={float(metrics.get('alpha_trial', 0.0)):.3e} "
+                f"merit={float(metrics.get('merit', 0.0)):.3e} "
+                f"resI={float(metrics.get('inactive_res_inf', 0.0)):.3e} "
+                f"gapA={float(metrics.get('active_gap_inf', 0.0)):.3e} "
+                f"ΔA={int(metrics.get('delta_active', 0.0))} "
+                f"soft={int(metrics.get('soft_active', 0.0))} "
+                f"accepted={int(bool(accepted))}"
+            )
+            if not np.any(act_lo0 | act_hi0):
+                alpha_trial = float(metrics.get("alpha_trial", 0.0))
+                pred_ratio = (1.0 - alpha_trial) ** 2
+                actual_ratio = float(metrics.get("merit", 0.0)) / max(merit0, 1.0e-30)
+                msg += f" pred_ratio={pred_ratio:.3e} model_ratio={actual_ratio / max(pred_ratio, 1.0e-30):.3e}"
+            print(msg)
+
+        ok1 = _accept(metrics1, 1.0)
+        _trace_trial(metrics1, ok1)
+        if ok1:
             for f, buf in zip(funcs, snap):
                 f.nodal_values[:] = buf
             self._ls_alpha_prev = 1.0
-            return S_red
+            self._vi_last_metrics = dict(metrics1)
+            return step1
 
         alpha = float(getattr(np_, "ls_reduction", 0.5))
         if not (0.0 < alpha < 1.0):
             alpha = 0.5
 
         for _ in range(int(getattr(np_, "ls_max_iter", 12))):
-            nrm, phi = _trial(alpha)
-            merit = nrm if mode == "dealii" else phi
+            metrics, step = _trial(alpha)
+            merit = metrics["G_inf"] if merit_mode == "legacy" and mode == "dealii" else (metrics["G_half"] if merit_mode == "legacy" else metrics["merit"])
             if merit < best_merit:
                 best_merit = merit
                 best_alpha = alpha
-            if mode == "dealii":
-                ok = nrm < norm0
-            else:
-                ok = phi <= phi0 - c1 * alpha * float(G0 @ G0)
+                best_metrics = dict(metrics)
+            ok = _accept(metrics, alpha)
+            _trace_trial(metrics, ok)
             if ok:
                 for f, buf in zip(funcs, snap):
                     f.nodal_values[:] = buf
                 self._ls_alpha_prev = alpha
-                step = alpha * S_red
-                if active_mask is not None and active_mask.size == step.size:
-                    step = step.copy()
-                    step[active_mask] = S_red[active_mask]
+                self._vi_last_metrics = dict(metrics)
                 return step
             alpha *= float(getattr(np_, "ls_reduction", 0.5))
 
@@ -5449,20 +6109,28 @@ class PdasNewtonSolver(NewtonSolver):
             f.nodal_values[:] = buf
         if best_alpha > 0.0:
             self._ls_alpha_prev = best_alpha
-            step = best_alpha * S_red
-            if active_mask is not None and active_mask.size == step.size:
-                step = step.copy()
-                step[active_mask] = S_red[active_mask]
+            self._vi_last_metrics = dict(best_metrics)
+            step, _ = self._vi_apply_active_step_policy(
+                alpha=best_alpha,
+                S_red=S_red,
+                active_mask=active_mask,
+                strong_active_mask=strong_active_mask,
+                active_delta_ref=active_delta_ref,
+            )
             return step
 
         min_alpha = alpha
         if os.getenv("PYCUTFEM_LS_FAIL_HARD", "1").lower() not in {"0", "false", "no"}:
             raise RuntimeError("Line search failed: no semismooth residual decrease.")
         self._ls_alpha_prev = min_alpha
-        step = min_alpha * S_red
-        if active_mask is not None and active_mask.size == step.size:
-            step = step.copy()
-            step[active_mask] = S_red[active_mask]
+        self._vi_last_metrics = dict(metrics0)
+        step, _ = self._vi_apply_active_step_policy(
+            alpha=min_alpha,
+            S_red=S_red,
+            active_mask=active_mask,
+            strong_active_mask=strong_active_mask,
+            active_delta_ref=active_delta_ref,
+        )
         return step
 
     def _newton_loop(self, funcs, prev_funcs, aux_funcs, bcs_now):
@@ -5485,12 +6153,6 @@ class PdasNewtonSolver(NewtonSolver):
 
         norm_G0: float | None = None
         last_active: np.ndarray | None = None
-        auto_c = False
-        try:
-            c0 = float(getattr(self.vi_params, "c", 1.0))
-            auto_c = (not np.isfinite(c0)) or (c0 <= 0.0)
-        except Exception:
-            auto_c = True
 
         for it in range(int(self.np.max_newton_iter)):
             if self.pre_cb is not None:
@@ -5597,19 +6259,9 @@ class PdasNewtonSolver(NewtonSolver):
 
             # Current reduced iterate and semismooth residual.
             x_red = self._pack_reduced_iterate(funcs)
-            if auto_c:
-                try:
-                    bounded = np.isfinite(lo_red) | np.isfinite(hi_red)
-                    if np.any(bounded):
-                        diag = np.asarray(A_red.diagonal(), dtype=float)[bounded]
-                        diag = np.abs(diag[np.isfinite(diag)])
-                        diag = diag[diag > 0.0]
-                        self.vi_params.c = float(np.median(diag)) if diag.size else 1.0
-                    else:
-                        self.vi_params.c = 1.0
-                except Exception:
-                    self.vi_params.c = 1.0
-            G_red, act_lo, act_hi = self._pdas_residual_and_sets(x_red, R_red, lo_red, hi_red)
+            c_red = self._vi_c_vector(A_red, lo_red, hi_red)
+            G_red, act_lo, act_hi = self._pdas_residual_and_sets(x_red, R_red, lo_red, hi_red, c_red=c_red)
+            metrics0 = self._vi_metrics(x_red, R_red, lo_red, hi_red, act_lo, act_hi, G_red)
             norm_G = float(np.linalg.norm(G_red, ord=np.inf))
             norm_R = float(np.linalg.norm(R_red, ord=np.inf))
 
@@ -5625,12 +6277,30 @@ class PdasNewtonSolver(NewtonSolver):
             if last_active is not None and last_active.shape == active.shape:
                 changed = int(np.count_nonzero(last_active != active))
             last_active = active.copy()
+            strong_active = self._vi_strong_active_mask(x_red, R_red, lo_red, hi_red, act_lo, act_hi, c_red)
 
             print(
                 f"        VI Newton {it+1}: |G|_∞={norm_G:.2e}  |R|_∞={norm_R:.2e}  nA={nA} nI={nI}"
                 + (f"  ΔA={changed}" if changed >= 0 else "")
+                + f"  |R_I|_∞={metrics0['inactive_res_inf']:.2e}  |gap_A|_∞={metrics0['active_gap_inf']:.2e}"
+                + f"  λ={float(getattr(self, '_vi_lambda_current', 0.0)):.2e}"
+                + f"  nA_strong={int(np.count_nonzero(strong_active))}"
                 + f"  (asm={asm_time:.2e}s)"
             )
+            if os.getenv("PYCUTFEM_VI_TRACE_FIELDS", "").lower() in {"1", "true", "yes"}:
+                items = []
+                for fld in np.unique(self._vi_red_field_names):
+                    fld = str(fld)
+                    if not fld:
+                        continue
+                    mask = self._vi_red_field_names == fld
+                    n_lo = int(np.count_nonzero(act_lo & mask))
+                    n_hi = int(np.count_nonzero(act_hi & mask))
+                    c_f = float(np.median(c_red[mask])) if np.any(mask) else float(getattr(self.vi_params, "c", 1.0) or 1.0)
+                    if n_lo or n_hi or np.any(np.isfinite(lo_red[mask]) | np.isfinite(hi_red[mask])):
+                        items.append(f"{fld}:lo={n_lo},hi={n_hi},c={c_f:.2e}")
+                if items:
+                    print("        [vi-set] " + "  ".join(items))
 
             # Match the standard Newton field-residual tracing output for VI solves.
             # (Useful to identify which PDE block dominates the raw residual.)
@@ -5729,38 +6399,223 @@ class PdasNewtonSolver(NewtonSolver):
             else:
                 A_mod = A_red
 
-            # Linear solve for reduced step.
-            t_lin = time.perf_counter()
-            S_red = self._solve_linear_system(A_mod, rhs)
-            lin_time = time.perf_counter() - t_lin
-
-            # Optional reduced line search on the semismooth residual.
-            if bool(getattr(self.np, "line_search", True)):
-                t_ls = time.perf_counter()
-                S_red = self._line_search_vi_reduced(
-                    G0=G_red,
-                    S_red=S_red,
-                    active_mask=active,
-                    funcs=funcs,
-                    coeffs=current,
-                    bcs_now=bcs_now,
-                    lo_red=lo_red,
-                    hi_red=hi_red,
+            lam = float(getattr(self, "_vi_lambda_current", 0.0) or 0.0)
+            delta_trigger = int(getattr(self.vi_params, "inactive_reg_delta_active_trigger", 0) or 0)
+            if delta_trigger > 0 and changed >= delta_trigger:
+                lam = max(lam, float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0))
+                lam = min(
+                    float(getattr(self.vi_params, "inactive_reg_lambda_max", 1.0e6) or 1.0e6),
+                    lam * float(getattr(self.vi_params, "inactive_reg_growth", 5.0) or 5.0) if lam > 0.0 else 0.0,
                 )
-                ls_time = time.perf_counter() - t_ls
-            else:
-                ls_time = 0.0
+
+            lin_time = 0.0
+            ls_time = 0.0
+            reg_retries = 0
+            used_lm = False
+            lm_info: dict[str, float] = {}
+
+            def _eval_reduced_trial(step_red: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                step_red = np.asarray(step_red, dtype=float)
+                if not np.all(np.isfinite(step_red)):
+                    raise RuntimeError("Trial step contains non-finite entries.")
+                snap = [f.nodal_values.copy() for f in funcs]
+                try:
+                    dU_full = self.restrictor.expand_vec(step_red)
+                    if not np.all(np.isfinite(dU_full)):
+                        raise RuntimeError("Expanded trial step contains non-finite entries.")
+                    dh.add_to_functions(dU_full, funcs)
+                    dh.apply_bcs(bcs_now, *funcs)
+                    if getattr(self, "constraints", None) is not None:
+                        self._enforce_constraints_on_functions(funcs)
+                    for f in funcs:
+                        vals = np.asarray(getattr(f, "nodal_values", np.array([], dtype=float)), dtype=float)
+                        if vals.size and not np.all(np.isfinite(vals)):
+                            raise RuntimeError(
+                                f"Trial iterate became non-finite after constraint enforcement in field "
+                                f"'{getattr(f, 'name', '<unnamed>')}'."
+                            )
+                    if bool(getattr(self.vi_params, "project_each_iteration", True)):
+                        self._project_funcs_to_bounds(funcs, bcs_now, lo_red, hi_red)
+                    _, R_try = self._assemble_system_reduced(current, need_matrix=False)
+                    R_try = np.asarray(R_try, dtype=float)
+                    if not np.all(np.isfinite(R_try)):
+                        raise RuntimeError("Trial residual contains non-finite entries.")
+                    x_try = self._pack_reduced_iterate(funcs)
+                    if not np.all(np.isfinite(x_try)):
+                        raise RuntimeError("Trial reduced iterate contains non-finite entries.")
+                    return x_try, R_try
+                finally:
+                    for f, buf in zip(funcs, snap):
+                        f.nodal_values[:] = buf
+
+            use_lm = bool(getattr(self.vi_params, "unconstrained_lm", False)) and nA == 0
+            if use_lm:
+                lm_lam = float(getattr(self, "_vi_lm_lambda_current", 0.0) or 0.0)
+                lm0 = float(getattr(self.vi_params, "unconstrained_lm_lambda0", 1.0e-4) or 1.0e-4)
+                lm_max = float(getattr(self.vi_params, "unconstrained_lm_lambda_max", 1.0e6) or 1.0e6)
+                lm_growth = float(getattr(self.vi_params, "unconstrained_lm_growth", 5.0) or 5.0)
+                lm_decay = float(getattr(self.vi_params, "unconstrained_lm_decay", 0.5) or 0.5)
+                lm_accept = float(getattr(self.vi_params, "unconstrained_lm_accept_ratio", 1.0e-3) or 1.0e-3)
+                lm_good = float(getattr(self.vi_params, "unconstrained_lm_good_ratio", 0.75) or 0.75)
+                lm_max_tries = int(getattr(self.vi_params, "unconstrained_lm_max_tries", 6) or 6)
+                lm_trace = os.getenv("PYCUTFEM_VI_TRACE_LM", "").lower() in {"1", "true", "yes"}
+                phi0_lm = 0.5 * float(np.asarray(R_red, dtype=float) @ np.asarray(R_red, dtype=float))
+                best_step = None
+                best_phi = phi0_lm
+                best_rho = -np.inf
+
+                for lm_try in range(max(lm_max_tries, 1)):
+                    H_lm, rhs_lm, lm_diag = self._vi_build_unconstrained_lm_system(A_red, R_red, lm_lam)
+                    t_lin = time.perf_counter()
+                    step_lm = self._solve_linear_system(H_lm, rhs_lm)
+                    lin_time += time.perf_counter() - t_lin
+                    try:
+                        _, R_try = _eval_reduced_trial(step_lm)
+                        phi_try = 0.5 * float(R_try @ R_try)
+                    except RuntimeError as exc:
+                        if lm_trace:
+                            print(f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} rejected: {exc}")
+                        lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                        continue
+                    if not np.isfinite(phi_try):
+                        if lm_trace:
+                            print(f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} rejected: non-finite phi_try")
+                        lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                        continue
+                    _, model_phi, pred_model, rho = self._vi_unconstrained_lm_model(
+                        R_red, A_red, step_lm, lm_lam, lm_diag, phi_try=phi_try
+                    )
+                    actual = phi0_lm - phi_try
+                    if lm_trace:
+                        print(
+                            f"        [vi-lm] try={lm_try+1} λ={lm_lam:.2e} "
+                            f"phi0={phi0_lm:.3e} phitry={phi_try:.3e} "
+                            f"pred_model={pred_model:.3e} act={actual:.3e} rho={rho:.3e}"
+                        )
+                    if phi_try < best_phi:
+                        best_phi = phi_try
+                        best_step = np.asarray(step_lm, dtype=float).copy()
+                        best_rho = float(rho)
+                    if np.isfinite(rho) and actual > 0.0 and rho >= lm_accept:
+                        used_lm = True
+                        S_red = np.asarray(step_lm, dtype=float)
+                        accepted_alpha = 1.0
+                        merit_ratio = phi_try / max(phi0_lm, 1.0e-30)
+                        lm_info = {"rho": float(rho), "phi_try": float(phi_try), "phi0": float(phi0_lm)}
+                        if rho >= lm_good:
+                            lm_lam = max(lm0, lm_lam * lm_decay if lm_lam > 0.0 else lm0)
+                        self._vi_lm_lambda_current = float(min(max(lm_lam, lm0), lm_max))
+                        self._ls_alpha_prev = 1.0
+                        self._vi_last_metrics = {"merit": float(phi_try)}
+                        break
+                    lm_lam = min(lm_max, max(lm_lam, lm0) * lm_growth if max(lm_lam, lm0) > 0.0 else lm0)
+                if not used_lm and best_step is not None and best_phi < phi0_lm:
+                    used_lm = True
+                    S_red = np.asarray(best_step, dtype=float)
+                    accepted_alpha = 1.0
+                    merit_ratio = best_phi / max(phi0_lm, 1.0e-30)
+                    lm_info = {"rho": float(best_rho), "phi_try": float(best_phi), "phi0": float(phi0_lm)}
+                    self._vi_lm_lambda_current = float(min(max(lm_lam, lm0), lm_max))
+                    self._ls_alpha_prev = 1.0
+                    self._vi_last_metrics = {"merit": float(best_phi)}
+
+            if used_lm:
+                self._vi_last_retry_count = 0
+                dU_full = self.restrictor.expand_vec(S_red)
+                if not np.all(np.isfinite(dU_full)):
+                    raise RuntimeError("Accepted LM step expanded to non-finite full increment.")
+                dh.add_to_functions(dU_full, funcs)
+                dh.apply_bcs(bcs_now, *funcs)
+                if getattr(self, "constraints", None) is not None:
+                    self._enforce_constraints_on_functions(funcs)
+                if bool(getattr(self.vi_params, "project_each_iteration", True)):
+                    self._project_funcs_to_bounds(funcs, bcs_now, lo_red, hi_red)
+                self._assert_functions_finite(funcs, context="after accepted LM step")
+                print(
+                    f"          timings: solve={lin_time:.2e}s, line-search={ls_time:.2e}s, "
+                    f"alpha=1.00e+00, merit_ratio={float(lm_info.get('phi_try', 0.0)) / max(float(lm_info.get('phi0', 1.0)), 1.0e-30):.3f}, "
+                    f"lm_rho={float(lm_info.get('rho', 0.0)):.3f}, lm_lambda={float(getattr(self, '_vi_lm_lambda_current', 0.0)):.2e}"
+                )
+                continue
+
+            while True:
+                A_work, reg_diag = self._vi_apply_inactive_regularization(A_mod, A_red, active, lam)
+                t_lin = time.perf_counter()
+                S_red = self._solve_linear_system(A_work, rhs)
+                lin_time += time.perf_counter() - t_lin
+
+                if bool(getattr(self.np, "line_search", True)):
+                    t_ls = time.perf_counter()
+                    try:
+                        S_red = self._line_search_vi_reduced(
+                                x0_red=x_red,
+                                R0_red=R_red,
+                                G0=G_red,
+                                act_lo0=act_lo,
+                                act_hi0=act_hi,
+                                S_red=S_red,
+                                c_red=c_red,
+                                strong_active_mask=strong_active,
+                                active_delta_ref=max(changed, 0),
+                                active_mask=active,
+                                funcs=funcs,
+                                coeffs=current,
+                                bcs_now=bcs_now,
+                                lo_red=lo_red,
+                                hi_red=hi_red,
+                            )
+                        ls_time += time.perf_counter() - t_ls
+                        break
+                    except RuntimeError:
+                        ls_time += time.perf_counter() - t_ls
+                        lam_max = float(getattr(self.vi_params, "inactive_reg_lambda_max", 1.0e6) or 1.0e6)
+                        lam_growth = float(getattr(self.vi_params, "inactive_reg_growth", 5.0) or 5.0)
+                        lam0 = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
+                        if lam < lam_max and (lam > 0.0 or lam0 > 0.0):
+                            lam = max(lam, lam0)
+                            lam = min(lam_max, lam * lam_growth if lam > 0.0 else lam0)
+                            reg_retries += 1
+                            if os.getenv("PYCUTFEM_VI_TRACE_REG", "").lower() in {"1", "true", "yes"}:
+                                print(f"        [vi-reg] retry={reg_retries}  λ->{lam:.2e}  diag∞={float(np.max(reg_diag)):.2e}")
+                            continue
+                        raise
+                else:
+                    break
+            self._vi_lambda_current = float(lam)
+            self._vi_last_retry_count = int(reg_retries)
+            accepted_alpha = float(getattr(self, "_ls_alpha_prev", 1.0) or 1.0)
+            accepted_metrics = dict(getattr(self, "_vi_last_metrics", {}) or {})
+            merit_ratio = float(accepted_metrics.get("merit", metrics0["merit"])) / max(float(metrics0["merit"]), 1.0e-30)
 
             # Apply the accepted step.
             dU_full = self.restrictor.expand_vec(S_red)
+            if not np.all(np.isfinite(dU_full)):
+                raise RuntimeError("Accepted semismooth Newton step expanded to non-finite full increment.")
             dh.add_to_functions(dU_full, funcs)
             dh.apply_bcs(bcs_now, *funcs)
             if getattr(self, "constraints", None) is not None:
                 self._enforce_constraints_on_functions(funcs)
             if bool(getattr(self.vi_params, "project_each_iteration", True)):
                 self._project_funcs_to_bounds(funcs, bcs_now, lo_red, hi_red)
+            self._assert_functions_finite(funcs, context="after accepted semismooth Newton step")
 
-            print(f"          timings: solve={lin_time:.2e}s, line-search={ls_time:.2e}s")
+            lam0 = float(getattr(self.vi_params, "inactive_reg_lambda0", 0.0) or 0.0)
+            lam_max = float(getattr(self.vi_params, "inactive_reg_lambda_max", 1.0e6) or 1.0e6)
+            lam_growth = float(getattr(self.vi_params, "inactive_reg_growth", 5.0) or 5.0)
+            stall_alpha = float(getattr(self.vi_params, "inactive_reg_stall_alpha", 0.25) or 0.25)
+            stall_ratio = float(getattr(self.vi_params, "inactive_reg_stall_merit_ratio", 0.95) or 0.95)
+            if lam0 > 0.0 and accepted_alpha < stall_alpha and merit_ratio > stall_ratio and self._vi_lambda_current < lam_max:
+                self._vi_lambda_current = min(lam_max, max(self._vi_lambda_current, lam0) * lam_growth)
+                if os.getenv("PYCUTFEM_VI_TRACE_REG", "").lower() in {"1", "true", "yes"}:
+                    print(f"        [vi-reg] accepted-stall  alpha={accepted_alpha:.2e}  merit_ratio={merit_ratio:.3f}  λ->{self._vi_lambda_current:.2e}")
+            elif accepted_alpha >= 0.999 and reg_retries == 0:
+                lam_decay = float(getattr(self.vi_params, "inactive_reg_decay", 0.5) or 0.5)
+                if 0.0 < lam_decay < 1.0:
+                    self._vi_lambda_current *= lam_decay
+                    if self._vi_lambda_current < lam0:
+                        self._vi_lambda_current = lam0
+
+            print(f"          timings: solve={lin_time:.2e}s, line-search={ls_time:.2e}s, alpha={accepted_alpha:.2e}, merit_ratio={merit_ratio:.3f}")
 
         raise RuntimeError("VI Newton did not converge – adjust tolerances/Δt or verify Jacobian.")
 

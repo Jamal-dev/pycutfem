@@ -1117,6 +1117,12 @@ class FormCompiler:
                 return 0.0
             if isinstance(expr, Derivative):
                 ex, ey = expr.order
+                if isinstance(expr.f, Pos):
+                    return self._visit(Pos(Derivative(expr.f.operand, ex + ox, ey + oy)))
+                if isinstance(expr.f, Neg):
+                    return self._visit(Neg(Derivative(expr.f.operand, ex + ox, ey + oy)))
+                if isinstance(expr.f, Restriction):
+                    return self._visit(Restriction(Derivative(expr.f.operand, ex + ox, ey + oy), expr.f.domain))
                 return self._visit(Derivative(expr.f, ex + ox, ey + oy))
             if isinstance(expr, Pos):
                 return self._visit(Pos(Derivative(expr.operand, *order)))

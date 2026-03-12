@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import sys
@@ -85,6 +86,7 @@ class CppKernelCache:
         module_name = f"_pycutfem_cpp_kernel_{ir_hash}_{compile_tag}"
         source_file = self._cache_dir / f"{module_name}.cpp"
         built_module = self._cache_dir / f"{module_name}{self._ext_suffix}"
+        digest_file = self._cache_dir / f"{module_name}.sha256"
 
         # Generate source if needed (or if stale ABI is detected).
         regenerate = True
@@ -101,8 +103,25 @@ class CppKernelCache:
             )
             source_file.write_text(src, encoding="utf-8")
             built_module.unlink(missing_ok=True)
+            digest_file.unlink(missing_ok=True)
         else:
             param_order = None
+
+        try:
+            source_digest = hashlib.sha256(source_file.read_bytes()).hexdigest()
+        except OSError:
+            source_digest = ""
+
+        force_reload = False
+        digest_matches = False
+        try:
+            digest_matches = digest_file.read_text(encoding="utf-8").strip() == source_digest
+        except OSError:
+            digest_matches = False
+
+        if built_module.exists() and not digest_matches:
+            built_module.unlink(missing_ok=True)
+            force_reload = True
 
         # Compile when the shared object is missing.
         if not built_module.exists():
@@ -114,16 +133,21 @@ class CppKernelCache:
                 include_dirs=include_dirs,
                 compile_mode=compile_tag,
             )
+            if source_digest:
+                digest_file.write_text(source_digest, encoding="utf-8")
+            force_reload = True
 
-        module = self._import_module(module_name, built_module)
+        module = self._import_module(module_name, built_module, force_reload=force_reload)
         if getattr(module, "CODEGEN_ABI", None) != CODEGEN_ABI_CPP:
             # Stale ABI – rebuild and reload once.
             source_file.unlink(missing_ok=True)
             built_module.unlink(missing_ok=True)
+            digest_file.unlink(missing_ok=True)
             src, _, param_order = codegen.generate_source(
                 ir_sequence, "kernel", module_name=module_name
             )
             source_file.write_text(src, encoding="utf-8")
+            source_digest = hashlib.sha256(source_file.read_bytes()).hexdigest()
             compile_extension(
                 module_name,
                 source_file,
@@ -131,6 +155,7 @@ class CppKernelCache:
                 include_dirs=list(codegen.include_dirs),
                 compile_mode=compile_tag,
             )
+            digest_file.write_text(source_digest, encoding="utf-8")
             module = self._import_module(module_name, built_module, force_reload=True)
 
         param_order = (

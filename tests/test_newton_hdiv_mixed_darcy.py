@@ -4,7 +4,13 @@ import pytest
 from pycutfem.core.dofhandler import DofHandler
 from pycutfem.core.mesh import Mesh
 from pycutfem.fem.mixedelement import MixedElement
-from pycutfem.solvers.nonlinear_solver import NewtonParameters, NewtonSolver, TimeStepperParameters
+from pycutfem.solvers.nonlinear_solver import (
+    HAS_PETSC,
+    LinearSolverParameters,
+    NewtonParameters,
+    NewtonSolver,
+    TimeStepperParameters,
+)
 from pycutfem.ufl import HdivFunction, HdivTestFunction, HdivTrialFunction
 from pycutfem.ufl import Function, TestFunction as UFLTestFunction, TrialFunction as UFLTrialFunction
 from pycutfem.ufl import div, dx, inner
@@ -106,3 +112,77 @@ def test_newton_mixed_darcy_hdiv_runs_on_hanging_mesh(backend, monkeypatch, tmp_
         for mdof, w in combo:
             approx += float(w) * float(U_full[int(mdof)])
         assert abs(float(U_full[int(sdof)]) - approx) < 2.0e-9
+
+
+@pytest.mark.skipif(not HAS_PETSC, reason="petsc4py is required for PETSc Schur fieldsplit test")
+def test_newton_mixed_darcy_petsc_schur_fieldsplit_converges(monkeypatch, tmp_path):
+    monkeypatch.setenv("PYCUTFEM_CACHE_DIR", str(tmp_path / "jit_cache_python"))
+    monkeypatch.setenv("PYCUTFEM_LINEAR_KSP_RTOL", "1e-10")
+    monkeypatch.setenv("PYCUTFEM_LINEAR_KSP_MAX_IT", "200")
+    monkeypatch.delenv("PYCUTFEM_LINEAR_SCHUR", raising=False)
+
+    nodes, elems, _edges, corners = structured_quad(1.0, 1.0, nx=2, ny=2, poly_order=1)
+    mesh = Mesh(
+        nodes,
+        element_connectivity=elems,
+        edges_connectivity=None,
+        elements_corner_nodes=corners,
+        element_type="quad",
+        poly_order=1,
+    )
+    me = MixedElement(mesh, {"u": ("RT", 0), "p": ("DG", 0)})
+    dh = DofHandler(me, method="cg")
+
+    u_k = HdivFunction(name="u_k", field_name="u", dof_handler=dh)
+    p_k = Function(name="p_k", field_name="p", dof_handler=dh)
+    u_n = HdivFunction(name="u_n", field_name="u", dof_handler=dh)
+    p_n = Function(name="p_n", field_name="p", dof_handler=dh)
+
+    du = HdivTrialFunction("u")
+    dp = UFLTrialFunction("p", dof_handler=dh)
+    v = HdivTestFunction("u")
+    q = UFLTestFunction("p", dof_handler=dh)
+
+    pi = float(np.pi)
+    g = Analytic(lambda x, y: 2.0 * (pi**2) * np.sin(pi * x) * np.sin(pi * y), degree=6)
+    qdeg = 6
+    residual_form = (inner(u_k, v) - p_k * div(v) + div(u_k) * q - g * q) * dx(metadata={"q": qdeg})
+    jacobian_form = (inner(du, v) - dp * div(v) + div(du) * q) * dx(metadata={"q": qdeg})
+
+    solver = NewtonSolver(
+        residual_form,
+        jacobian_form,
+        dof_handler=dh,
+        mixed_element=me,
+        bcs=[],
+        bcs_homog=[],
+        newton_params=NewtonParameters(newton_tol=1.0e-10, max_newton_iter=10, line_search=False),
+        lin_params=LinearSolverParameters(backend="petsc"),
+        quad_order=qdeg,
+        backend="python",
+    )
+    solver.set_linear_schur_fieldsplit(
+        pressure_field="p",
+        schur_fact="full",
+        schur_pre="selfp",
+        outer_ksp="fgmres",
+        outer_pc="fieldsplit",
+        rest_ksp="preonly",
+        rest_pc="ilu",
+        pressure_ksp="preonly",
+        pressure_pc="jacobi",
+    )
+
+    u_k.nodal_values[:] = 0.0
+    p_k.nodal_values[:] = 0.0
+    u_n.nodal_values[:] = 0.0
+    p_n.nodal_values[:] = 0.0
+
+    solver.solve_time_interval(
+        functions=[u_k, p_k],
+        prev_functions=[u_n, p_n],
+        time_params=TimeStepperParameters(dt=1.0, max_steps=1, stop_on_steady=True),
+    )
+
+    _, R = solver._assemble_system({"u_k": u_k, "p_k": p_k, "u_n": u_n, "p_n": p_n}, need_matrix=False)
+    assert float(np.linalg.norm(np.asarray(R, dtype=float), ord=np.inf)) < 1.0e-8

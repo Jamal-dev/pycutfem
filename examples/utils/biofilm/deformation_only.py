@@ -149,10 +149,10 @@ def build_deformation_only_forms(
     one_m_th = _c(1.0) - th
     inv_dt = _c(1.0) / dt
 
-    phi_b_c = _c(float(phi_b))
-    M_alpha_c = _c(float(M_alpha))
-    gamma_alpha_c = _c(float(gamma_alpha))
-    eps_alpha_c = _c(float(eps_alpha))
+    phi_b_c = _as_constant(phi_b)
+    M_alpha_c = _as_constant(M_alpha)
+    gamma_alpha_c = _as_constant(gamma_alpha)
+    eps_alpha_c = _as_constant(eps_alpha)
 
     zero_scalar = _c(0.0)
     zero_vector = Constant([0.0, 0.0], dim=1)

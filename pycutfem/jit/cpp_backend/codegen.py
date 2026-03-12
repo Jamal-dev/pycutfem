@@ -731,6 +731,13 @@ class CppCodeGen:
                 body_lines.append("            " + line)
 
         def alloc_tmp(kind: str, prefix: str) -> tuple[str, str | None, int | None]:
+            # Do not pool vector temporaries. Many hot biofilm/interface kernels
+            # operate on fixed-size 2-vectors (normals, tangents, 2D gradients).
+            # Storing those into Eigen::VectorXd pool slots forces dynamic-size
+            # assignments in the inner quadrature loop and was the root cause of
+            # the observed memcpy/AVX overread warnings and runtime slowdown.
+            if kind == "vec":
+                return new_tmp(prefix), None, None
             name, tmp_kind, tmp_slot = temp_pool.alloc(kind)
             if name is not None:
                 return name, tmp_kind, tmp_slot
@@ -746,13 +753,13 @@ class CppCodeGen:
             if tmp_kind is not None:
                 emit_line(f"{name} = ({expr}).eval();")
             else:
-                emit_line(f"Eigen::VectorXd {name} = {expr};")
+                emit_line(f"auto {name} = ({expr}).eval();")
 
         def emit_mat(name: str, expr: str, *, tmp_kind: str | None = None) -> None:
             if tmp_kind is not None:
                 emit_line(f"{name} = ({expr}).eval();")
             else:
-                emit_line(f"Eigen::MatrixXd {name} = {expr};")
+                emit_line(f"auto {name} = ({expr}).eval();")
 
         for idx, op in enumerate(ir_sequence):
             next_op = ir_sequence[idx + 1] if idx + 1 < len(ir_sequence) else None
@@ -3966,6 +3973,8 @@ class CppCodeGen:
         if "h_arr" in param_order:
             view_lines.append("    auto h_arr_view = h_arr.unchecked<1>();")
         for name in param_order:
+            if name in const_arr_vars:
+                continue
             if name.startswith("ana_"):
                 shape = analytic_shapes.get(name, ())
                 if len(shape) == 0:
@@ -3994,7 +4003,7 @@ class CppCodeGen:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
             if name.startswith(("d10_", "d01_", "d20_", "d11_", "d02_")):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
-            if name.startswith("u_"):
+            if name.startswith("u_") and name.endswith("_loc"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")
             if name.startswith("domain_flag_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<2>();")

@@ -172,6 +172,15 @@ def _as_scalar_expr(val):
     return Constant(float(val))
 
 
+def _named_scalar_expr(name: str, val):
+    expr = _as_scalar_expr(val)
+    try:
+        expr._jit_name = str(name)
+    except Exception:
+        pass
+    return expr
+
+
 def _cosine_ramp_value(t_now: float, ramp_time: float) -> float:
     tt = float(t_now)
     tr = float(ramp_time)
@@ -1006,6 +1015,25 @@ def main() -> None:
         help="Line-search mode used by the internal Newton / PDAS solvers.",
     )
     ap.add_argument("--vi-c", type=float, default=0.0, help="PDAS active-set scaling parameter.")
+    ap.add_argument("--vi-enter-tol", type=float, default=0.0, help="Active-set entry threshold for PDAS hysteresis.")
+    ap.add_argument("--vi-leave-tol", type=float, default=0.0, help="Active-set release threshold for PDAS hysteresis.")
+    ap.add_argument("--vi-persistence", type=int, default=0, help="Iterations a proposed active-set change must persist before it is accepted.")
+    ap.add_argument("--vi-lambda0", type=float, default=0.0, help="Initial inactive-block PDAS regularization lambda.")
+    ap.add_argument("--vi-lambda-max", type=float, default=1.0e6, help="Maximum inactive-block PDAS regularization lambda.")
+    ap.add_argument("--vi-lambda-growth", type=float, default=5.0, help="Multiplicative growth factor for inactive-block PDAS regularization.")
+    ap.add_argument("--vi-lambda-decay", type=float, default=0.5, help="Decay factor applied to inactive-block PDAS regularization after easy accepted full steps.")
+    ap.add_argument("--vi-active-soft-threshold", type=int, default=0, help="Enable soft damping of marginal active DOFs when DeltaA exceeds this threshold.")
+    ap.add_argument("--vi-active-soft-alpha", type=float, default=1.0, help="Step factor used for marginal active DOFs when soft active damping is enabled.")
+    ap.add_argument("--vi-active-strong-factor", type=float, default=5.0, help="Indicator multiple used to classify clearly active DOFs that remain hard-updated.")
+    ap.add_argument("--vi-filter-max-delta-active", type=int, default=0, help="Reject VI line-search trials whose predicted DeltaA exceeds this threshold (0 disables).")
+    ap.add_argument("--vi-unconstrained-lm", action=argparse.BooleanOptionalAction, default=False, help="Enable trust-region / Levenberg-Marquardt globalization when the PDAS active set is empty.")
+    ap.add_argument("--vi-lm-lambda0", type=float, default=1.0e-4, help="Initial LM damping parameter for the zero-active-set branch.")
+    ap.add_argument("--vi-lm-lambda-max", type=float, default=1.0e6, help="Maximum LM damping parameter for the zero-active-set branch.")
+    ap.add_argument("--vi-lm-growth", type=float, default=5.0, help="Multiplicative growth factor for LM damping after rejected steps.")
+    ap.add_argument("--vi-lm-decay", type=float, default=0.5, help="Decay factor for LM damping after good accepted steps.")
+    ap.add_argument("--vi-lm-accept-ratio", type=float, default=1.0e-3, help="Minimum actual/predicted reduction ratio required to accept an LM step.")
+    ap.add_argument("--vi-lm-good-ratio", type=float, default=0.75, help="Ratio above which LM damping is relaxed after an accepted step.")
+    ap.add_argument("--vi-lm-max-tries", type=int, default=6, help="Maximum LM trust-region retries per Newton iteration.")
     ap.add_argument("--alpha-box-constraints", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--phi-box-constraints", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument(
@@ -1028,6 +1056,24 @@ def main() -> None:
         choices=("mumps", "superlu_dist", "superlu"),
         help="Direct LU factorization backend used by PETSc (SNES only).",
     )
+    ap.add_argument("--linear-ksp-type", type=str, default="", help="Internal PETSc KSP type for Newton/PDAS/LM linear solves.")
+    ap.add_argument("--linear-pc-type", type=str, default="", help="Internal PETSc PC type for Newton/PDAS/LM linear solves.")
+    ap.add_argument("--linear-pc-factor-solver-type", type=str, default="", help="Direct factor backend for the internal PETSc linear solve.")
+    ap.add_argument("--linear-ksp-rtol", type=float, default=float("nan"), help="Relative tolerance for the internal PETSc KSP.")
+    ap.add_argument("--linear-ksp-atol", type=float, default=float("nan"), help="Absolute tolerance for the internal PETSc KSP.")
+    ap.add_argument("--linear-ksp-dtol", type=float, default=float("nan"), help="Divergence tolerance for the internal PETSc KSP.")
+    ap.add_argument("--linear-ksp-max-it", type=int, default=-1, help="Maximum iterations for the internal PETSc KSP.")
+    ap.add_argument("--linear-ksp-trace", action=argparse.BooleanOptionalAction, default=False, help="Print PETSc KSP convergence diagnostics for internal Newton/PDAS solves.")
+    ap.add_argument("--linear-schur", action=argparse.BooleanOptionalAction, default=False, help="Use a PETSc Schur-complement fieldsplit on the internal Newton/PDAS linear solve.")
+    ap.add_argument("--linear-schur-pressure-field", type=str, default="p", help="Pressure field name used for the Schur pressure split.")
+    ap.add_argument("--linear-schur-fact", type=str, default="full", choices=("full", "upper", "lower", "diag"), help="PETSc Schur factorization type.")
+    ap.add_argument("--linear-schur-pre", type=str, default="selfp", choices=("selfp", "a11", "user"), help="PETSc Schur preconditioner type.")
+    ap.add_argument("--linear-schur-rest-ksp", type=str, default="preonly", help="KSP type for the non-pressure Schur block.")
+    ap.add_argument("--linear-schur-rest-pc", type=str, default="ilu", help="PC type for the non-pressure Schur block.")
+    ap.add_argument("--linear-schur-rest-factor-solver-type", type=str, default="", help="Optional direct factor backend for the non-pressure Schur block.")
+    ap.add_argument("--linear-schur-pressure-ksp", type=str, default="preonly", help="KSP type for the pressure Schur block.")
+    ap.add_argument("--linear-schur-pressure-pc", type=str, default="jacobi", help="PC type for the pressure Schur block.")
+    ap.add_argument("--linear-schur-pressure-factor-solver-type", type=str, default="", help="Optional direct factor backend for the pressure Schur block.")
 
     # Flow
     ap.add_argument(
@@ -1403,6 +1449,35 @@ def main() -> None:
         os.environ["PYCUTFEM_RESIDUAL_TRACE"] = "1"
         if bool(args.trace_residual_coords):
             os.environ["PYCUTFEM_RESIDUAL_TRACE_COORDS"] = "1"
+    if str(args.linear_ksp_type).strip():
+        os.environ["PYCUTFEM_LINEAR_KSP_TYPE"] = str(args.linear_ksp_type).strip()
+    if str(args.linear_pc_type).strip():
+        os.environ["PYCUTFEM_LINEAR_PC_TYPE"] = str(args.linear_pc_type).strip()
+    if str(args.linear_pc_factor_solver_type).strip():
+        os.environ["PYCUTFEM_LINEAR_PC_FACTOR_SOLVER_TYPE"] = str(args.linear_pc_factor_solver_type).strip()
+    if np.isfinite(float(args.linear_ksp_rtol)):
+        os.environ["PYCUTFEM_LINEAR_KSP_RTOL"] = str(float(args.linear_ksp_rtol))
+    if np.isfinite(float(args.linear_ksp_atol)):
+        os.environ["PYCUTFEM_LINEAR_KSP_ATOL"] = str(float(args.linear_ksp_atol))
+    if np.isfinite(float(args.linear_ksp_dtol)):
+        os.environ["PYCUTFEM_LINEAR_KSP_DTOL"] = str(float(args.linear_ksp_dtol))
+    if int(args.linear_ksp_max_it) > 0:
+        os.environ["PYCUTFEM_LINEAR_KSP_MAX_IT"] = str(int(args.linear_ksp_max_it))
+    if bool(args.linear_ksp_trace):
+        os.environ["PYCUTFEM_LINEAR_KSP_TRACE"] = "1"
+    if bool(args.linear_schur):
+        os.environ["PYCUTFEM_LINEAR_SCHUR"] = "1"
+        os.environ["PYCUTFEM_LINEAR_SCHUR_PRESSURE_FIELD"] = str(args.linear_schur_pressure_field)
+        os.environ["PYCUTFEM_LINEAR_SCHUR_FACT_TYPE"] = str(args.linear_schur_fact)
+        os.environ["PYCUTFEM_LINEAR_SCHUR_PRECONDITION"] = str(args.linear_schur_pre)
+        os.environ["PYCUTFEM_LINEAR_SCHUR_REST_KSP_TYPE"] = str(args.linear_schur_rest_ksp)
+        os.environ["PYCUTFEM_LINEAR_SCHUR_REST_PC_TYPE"] = str(args.linear_schur_rest_pc)
+        if str(args.linear_schur_rest_factor_solver_type).strip():
+            os.environ["PYCUTFEM_LINEAR_SCHUR_REST_FACTOR_SOLVER_TYPE"] = str(args.linear_schur_rest_factor_solver_type)
+        os.environ["PYCUTFEM_LINEAR_SCHUR_PRESSURE_KSP_TYPE"] = str(args.linear_schur_pressure_ksp)
+        os.environ["PYCUTFEM_LINEAR_SCHUR_PRESSURE_PC_TYPE"] = str(args.linear_schur_pressure_pc)
+        if str(args.linear_schur_pressure_factor_solver_type).strip():
+            os.environ["PYCUTFEM_LINEAR_SCHUR_PRESSURE_FACTOR_SOLVER_TYPE"] = str(args.linear_schur_pressure_factor_solver_type)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -1476,7 +1551,7 @@ def main() -> None:
     gamma_div_relax_factor = min(1.0, max(0.0, float(getattr(args, "gamma_div_relax_factor", 0.5))))
     gamma_div_relax_after = max(1, int(getattr(args, "gamma_div_relax_after", 3)))
     gamma_div_relax_newton_max = max(1, int(getattr(args, "gamma_div_relax_newton_max", 2)))
-    gamma_div_expr = _as_scalar_expr(gamma_div_init)
+    gamma_div_expr = _named_scalar_expr("gamma_div", gamma_div_init)
 
     # ------------------------------------------------------------------
     # Polygon (alpha0)
@@ -1706,10 +1781,30 @@ def main() -> None:
         dt_val = float(args.dt)
         t0 = 0.0
         step0 = 0
-    dt_c = Constant(dt_val)
+    dt_c = _named_scalar_expr("dt", dt_val)
     theta = float(args.theta)
 
     mu_s, lambda_s = _lame_from_E_nu(float(args.E), float(args.nu))
+    rho_f_c = _named_scalar_expr("rho_f", float(args.rho_f))
+    mu_f_c = _named_scalar_expr("mu_f", float(args.mu_f))
+    mu_b_c = _named_scalar_expr("mu_b", float(args.mu_f))
+    kappa_inv_c = _named_scalar_expr("kappa_inv", float(args.kappa_inv))
+    mu_s_c = _named_scalar_expr("mu_s", float(mu_s))
+    lambda_s_c = _named_scalar_expr("lambda_s", float(lambda_s))
+    solid_visco_eta_c = _named_scalar_expr("solid_visco_eta", float(args.solid_visco_eta))
+    gamma_u_c = _named_scalar_expr("gamma_u", float(args.gamma_u))
+    gamma_u_pin_c = _named_scalar_expr("gamma_u_pin", float(args.gamma_u_pin))
+    v_supg_c = _named_scalar_expr("v_supg", float(args.v_supg))
+    u_supg_c = _named_scalar_expr("u_supg", float(args.u_supg))
+    u_cip_c = _named_scalar_expr("u_cip", float(args.u_cip))
+    v_cip_c = _named_scalar_expr("v_cip", float(args.v_cip))
+    vS_cip_c = _named_scalar_expr("vS_cip", float(args.vS_cip))
+    D_phi_c = _named_scalar_expr("D_phi", float(args.D_phi))
+    gamma_phi_c = _named_scalar_expr("gamma_phi", float(args.gamma_phi))
+    D_alpha_c = _named_scalar_expr("D_alpha", float(args.D_alpha))
+    alpha_ch_M_c = _named_scalar_expr("alpha_ch_M", float(alpha_ch_M))
+    alpha_ch_gamma_c = _named_scalar_expr("alpha_ch_gamma", float(alpha_ch_gamma))
+    alpha_ch_eps_c = _named_scalar_expr("alpha_ch_eps", float(alpha_ch_eps))
     diffuse_g_t = None
     diffuse_w_t = None
     diffuse_scale_expr = None
@@ -1722,7 +1817,7 @@ def main() -> None:
         if not np.isfinite(diffuse_ramp_time):
             diffuse_ramp_time = float(args.t_ramp)
         target_diffuse_scale = float(args.diffuse_shear_scale)
-        diffuse_scale_expr = Constant(target_diffuse_scale)
+        diffuse_scale_expr = _named_scalar_expr("diffuse_shear_scale", target_diffuse_scale)
         if diffuse_time_scheme == "imex":
             def _update_diffuse_scale(t_now: float) -> None:
                 diffuse_scale_expr.value = float(target_diffuse_scale) * _cosine_ramp_value(float(t_now), diffuse_ramp_time)
@@ -1811,19 +1906,19 @@ def main() -> None:
             dx=dx(metadata={"q": int(args.q)}),
             dt=dt_c,
             theta=theta,
-            rho_f=Constant(float(args.rho_f)),
-            mu_f=Constant(float(args.mu_f)),
-            mu_b=Constant(float(args.mu_f)),
+            rho_f=rho_f_c,
+            mu_f=mu_f_c,
+            mu_b=mu_b_c,
             mu_b_model=str(getattr(args, "mu_b_model", "phi_mu")),
-            kappa_inv=Constant(float(args.kappa_inv)),
-            mu_s=Constant(float(mu_s)),
-            lambda_s=Constant(float(lambda_s)),
-            solid_visco_eta=float(args.solid_visco_eta),
+            kappa_inv=kappa_inv_c,
+            mu_s=mu_s_c,
+            lambda_s=lambda_s_c,
+            solid_visco_eta=solid_visco_eta_c,
             gamma_div=gamma_div_expr,
             phi_b=float(phi_b),
-            M_alpha=float(alpha_ch_M),
-            gamma_alpha=float(alpha_ch_gamma),
-            eps_alpha=float(alpha_ch_eps),
+            M_alpha=alpha_ch_M_c,
+            gamma_alpha=alpha_ch_gamma_c,
+            eps_alpha=alpha_ch_eps_c,
             g_t_k=diffuse_g_t,
             g_t_n=diffuse_g_t,
             traction_weight_k=diffuse_w_t,
@@ -1867,38 +1962,38 @@ def main() -> None:
             ds_cip=ds(metadata={"q": int(args.q)}),
             dt=dt_c,
             theta=theta,
-            rho_f=Constant(float(args.rho_f)),
-            mu_f=Constant(float(args.mu_f)),
-            mu_b=Constant(float(args.mu_f)),
-            kappa_inv=Constant(float(args.kappa_inv)),
-            mu_s=Constant(float(mu_s)),
-            lambda_s=Constant(float(lambda_s)),
-            solid_visco_eta=float(args.solid_visco_eta),
-            gamma_u=float(args.gamma_u),
+            rho_f=rho_f_c,
+            mu_f=mu_f_c,
+            mu_b=mu_b_c,
+            kappa_inv=kappa_inv_c,
+            mu_s=mu_s_c,
+            lambda_s=lambda_s_c,
+            solid_visco_eta=solid_visco_eta_c,
+            gamma_u=gamma_u_c,
             u_extension_mode=str(args.u_extension),
-            gamma_u_pin=float(args.gamma_u_pin),
+            gamma_u_pin=gamma_u_pin_c,
             kinematics_scale=float(args.kinematics_scale) if np.isfinite(float(args.kinematics_scale)) else None,
-            v_supg=float(args.v_supg),
+            v_supg=v_supg_c,
             v_supg_mode=str(getattr(args, "v_supg_mode", "streamline")),
             v_supg_c_nu=float(getattr(args, "v_supg_c_nu", 4.0)),
-            u_supg=float(args.u_supg),
-            u_cip=float(args.u_cip),
+            u_supg=u_supg_c,
+            u_cip=u_cip_c,
             u_cip_weight=str(args.u_cip_weight),
-            v_cip=float(args.v_cip),
-            vS_cip=float(args.vS_cip),
+            v_cip=v_cip_c,
+            vS_cip=vS_cip_c,
             gamma_div=gamma_div_expr,
             fluid_convection=str(getattr(args, "fluid_convection", "full")),
             # Transport/kinetics controls (FSI-only: disable growth/detachment/damage, but may solve alpha/phi in PDE mode).
-            D_phi=float(args.D_phi) if transport_mode == "pde" else 0.0,
-            gamma_phi=float(args.gamma_phi) if transport_mode == "pde" else 0.0,
+            D_phi=D_phi_c if transport_mode == "pde" else 0.0,
+            gamma_phi=gamma_phi_c if transport_mode == "pde" else 0.0,
             phi_supg=float(args.phi_supg) if transport_mode == "pde" else 0.0,
             phi_cip=float(args.phi_cip) if transport_mode == "pde" else 0.0,
-            D_alpha=float(args.D_alpha) if transport_mode == "pde" else 0.0,
+            D_alpha=D_alpha_c if transport_mode == "pde" else 0.0,
             alpha_advect_with=str(args.alpha_advect_with),
             alpha_advection_form=str(args.alpha_advection_form) if transport_mode == "pde" else "advective",
-            alpha_ch_M=float(alpha_ch_M) if transport_mode == "pde" else 0.0,
-            alpha_ch_gamma=float(alpha_ch_gamma) if transport_mode == "pde" else 0.0,
-            alpha_ch_eps=float(alpha_ch_eps) if transport_mode == "pde" else 1.0,
+            alpha_ch_M=alpha_ch_M_c if transport_mode == "pde" else 0.0,
+            alpha_ch_gamma=alpha_ch_gamma_c if transport_mode == "pde" else 0.0,
+            alpha_ch_eps=alpha_ch_eps_c if transport_mode == "pde" else 1.0,
             alpha_ch_mobility=str(args.alpha_ch_mobility),
             alpha_supg=float(args.alpha_supg) if transport_mode == "pde" else 0.0,
             alpha_cip=float(args.alpha_cip) if transport_mode == "pde" else 0.0,
@@ -2309,12 +2404,48 @@ def main() -> None:
             forms.jacobian_form,
             vi_params=VIParameters(
                 c=float(args.vi_c),
+                enter_tol=float(args.vi_enter_tol),
+                leave_tol=float(args.vi_leave_tol),
+                active_set_persistence=int(args.vi_persistence),
                 project_initial_guess=True,
                 project_each_iteration=True,
+                inactive_reg_lambda0=float(args.vi_lambda0),
+                inactive_reg_lambda_max=float(args.vi_lambda_max),
+                inactive_reg_growth=float(args.vi_lambda_growth),
+                inactive_reg_decay=float(args.vi_lambda_decay),
+                active_step_delta_active_trigger=int(args.vi_active_soft_threshold),
+                active_step_soft_alpha=float(args.vi_active_soft_alpha),
+                active_step_strong_factor=float(args.vi_active_strong_factor),
+                filter_max_delta_active=int(args.vi_filter_max_delta_active),
+                unconstrained_lm=bool(args.vi_unconstrained_lm),
+                unconstrained_lm_lambda0=float(args.vi_lm_lambda0),
+                unconstrained_lm_lambda_max=float(args.vi_lm_lambda_max),
+                unconstrained_lm_growth=float(args.vi_lm_growth),
+                unconstrained_lm_decay=float(args.vi_lm_decay),
+                unconstrained_lm_accept_ratio=float(args.vi_lm_accept_ratio),
+                unconstrained_lm_good_ratio=float(args.vi_lm_good_ratio),
+                unconstrained_lm_max_tries=int(args.vi_lm_max_tries),
             ),
             lin_params=LinearSolverParameters(backend="petsc"),
             **common_solver_kwargs,
         )
+    if bool(getattr(args, "linear_schur", False)) and hasattr(solver, "set_linear_schur_fieldsplit"):
+        try:
+            solver.set_linear_schur_fieldsplit(
+                pressure_field=str(args.linear_schur_pressure_field),
+                schur_fact=str(args.linear_schur_fact),
+                schur_pre=str(args.linear_schur_pre),
+                outer_ksp=(str(args.linear_ksp_type).strip() or None),
+                outer_pc="fieldsplit",
+                rest_ksp=str(args.linear_schur_rest_ksp),
+                rest_pc=str(args.linear_schur_rest_pc),
+                rest_factor_solver_type=(str(args.linear_schur_rest_factor_solver_type).strip() or None),
+                pressure_ksp=str(args.linear_schur_pressure_ksp),
+                pressure_pc=str(args.linear_schur_pressure_pc),
+                pressure_factor_solver_type=(str(args.linear_schur_pressure_factor_solver_type).strip() or None),
+            )
+        except Exception as exc:
+            logging.warning(f"[setup] failed to install linear Schur fieldsplit: {exc}")
 
     bounds_by_field: dict[str, tuple[float | None, float | None]] = {}
     if bool(args.alpha_box_constraints) or use_alpha_phi_vi_bounds:

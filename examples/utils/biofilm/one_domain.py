@@ -1112,6 +1112,7 @@ def build_biofilm_one_domain_forms(
     #                 convection choices). The streamline test direction and τ remain
     #                 lagged for robustness.
     if float(v_supg) != 0.0:
+        v_supg_c = _as_constant(v_supg)
         rho_f_val = None
         try:
             rho_f_val = float(rho_f)
@@ -1147,7 +1148,7 @@ def build_biofilm_one_domain_forms(
                 time_scale = _c(2.0) * inv_dt
                 adv_scale = _c(2.0) * vmag / h_v_safe
                 diff_scale = _c(float(v_supg_c_nu)) * nu_eff / h_v2_safe
-                tau_v = _c(float(v_supg)) / _sqrt(
+                tau_v = v_supg_c / _sqrt(
                     time_scale * time_scale
                     + adv_scale * adv_scale
                     + diff_scale * diff_scale
@@ -1201,7 +1202,7 @@ def build_biofilm_one_domain_forms(
                     + _c(2.0) * diff_scale_k * d_diff_scale_k
                     + _c(2.0) * drag_rate_k * d_drag_rate_k
                 )
-                tau_v = _c(float(v_supg)) / _sqrt(tau_denom)
+                tau_v = v_supg_c / _sqrt(tau_denom)
                 d_tau_v = -_c(0.5) * tau_v * d_tau_denom / tau_denom
                 w_v = _one_minus(alpha_k)
                 dw_v = -dalpha
@@ -1309,9 +1310,10 @@ def build_biofilm_one_domain_forms(
     # Optional CIP (continuous interior penalty) stabilization for the fluid velocity.
     # This is a consistent high-frequency regularization that can improve robustness on coarse meshes.
     if float(v_cip) != 0.0 and ds_cip is not None:
+        v_cip_c = _as_constant(v_cip)
         n_int = FacetNormal()
         h_F = avg(MeshSize())
-        tau_cip = _c(float(v_cip)) * (h_F * h_F * h_F) * inv_dt
+        tau_cip = v_cip_c * (h_F * h_F * h_F) * inv_dt
         w_v = avg(_one_minus(alpha_n))
         momentum_terms["cip"] = tau_cip * w_v * _grad_inner_jump(v_k, v_test, n_int) * ds_cip
         r_mom += momentum_terms["cip"]
@@ -1555,7 +1557,7 @@ def build_biofilm_one_domain_forms(
     # - vS also needs an extension penalty in the free-fluid region (α≈0) to keep
     #   the one-domain CG formulation well-posed (otherwise vS DOFs in pure fluid
     #   elements can become weakly constrained / singular).
-    gamma_u_c = _c(float(gamma_u))
+    gamma_u_c = _as_constant(gamma_u)
     gamma_vS_eff = float(gamma_u) if gamma_vS is None else float(gamma_vS)
     vS_ext_mode = str(u_extension_mode if vS_extension_mode is None else vS_extension_mode).strip().lower()
     gamma_vS_c = _c(float(gamma_vS_eff))
@@ -1839,9 +1841,10 @@ def build_biofilm_one_domain_forms(
     # Optional CIP (continuous interior penalty) stabilization for vS.
     # Regularizes vS in the diffuse interface / near-zero-α region without changing the continuous limit.
     if float(vS_cip) != 0.0 and ds_cip is not None:
+        vS_cip_c = _as_constant(vS_cip)
         n_int = FacetNormal()
         h_F = avg(MeshSize())
-        tau_cip = _c(float(vS_cip)) * (h_F * h_F * h_F) * inv_dt
+        tau_cip = vS_cip_c * (h_F * h_F * h_F) * inv_dt
         w_s = avg(alpha_n)
         r_skeleton += tau_cip * w_s * _grad_inner_jump(vS_k, vS_test, n_int) * ds_cip
         a_skel += tau_cip * w_s * _grad_inner_jump(dvS, vS_test, n_int) * ds_cip
@@ -1891,11 +1894,12 @@ def build_biofilm_one_domain_forms(
     # This adds an artificial diffusion along vS in the solid region:
     #   τ ( (vS^n·∇)u^k , (vS^n·∇)ξ )_{Ω}  localized by α^n.
     if float(u_supg) != 0.0:
+        u_supg_c = _as_constant(u_supg)
         h_u = MeshSize()
         vmag2 = vS_n[0] * vS_n[0] + vS_n[1] * vS_n[1]
         vmag = _sqrt(vmag2 + _c(1.0e-12))
         denom = h_u * vmag + (h_u * h_u) * inv_dt
-        tau_u = _c(float(u_supg)) * (h_u * h_u) / (denom + _c(1.0e-16))
+        tau_u = u_supg_c * (h_u * h_u) / (denom + _c(1.0e-16))
         w_u = alpha_n  # lagged "solid-only" localization
         adv_u_k = dot(grad(u_k), vS_n)
         adv_xi = dot(grad(u_test), vS_n)
@@ -1963,7 +1967,7 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     # (iv) Porosity evolution (Eulerian, advected by vS)
     # ------------------------------------------------------------------
-    D_phi_c = _c(float(D_phi))
+    D_phi_c = _as_constant(D_phi)
     gamma_phi_c = _c(float(gamma_phi))
     # Regularization weight for enforcing φ≈1 in the free-fluid region.
     #
@@ -2068,7 +2072,7 @@ def build_biofilm_one_domain_forms(
     # ------------------------------------------------------------------
     # (v) Indicator evolution (advection–diffusion–reaction)
     # ------------------------------------------------------------------
-    D_alpha_c = _c(float(D_alpha))
+    D_alpha_c = _as_constant(D_alpha)
     k_g_c = k_g if hasattr(k_g, "dim") else _c(float(k_g))
     mu_max_c = mu_max if hasattr(mu_max, "dim") else _c(float(mu_max))
     K_S_c = K_S if hasattr(K_S, "dim") else _c(float(K_S))
@@ -2355,10 +2359,9 @@ def build_biofilm_one_domain_forms(
         eps_ch_val = float(alpha_ch_eps)
         if eps_ch_val <= 0.0:
             raise ValueError(f"alpha_ch_eps must be > 0 when Cahn–Hilliard is enabled; got {eps_ch_val}.")
-        eps_ch_c = _c(max(eps_ch_val, 1.0e-12))
-
-        M_ch_c = _c(float(alpha_ch_M))
-        gamma_ch_c = _c(float(alpha_ch_gamma))
+        eps_ch_c = _as_constant(alpha_ch_eps)
+        M_ch_c = _as_constant(alpha_ch_M)
+        gamma_ch_c = _as_constant(alpha_ch_gamma)
 
         # Double-well derivative W'(α) for W(α)=α^2(1-α)^2 is 2α(1-α)(1-2α).
         Wp_ch_k = _c(2.0) * alpha_k * _one_minus(alpha_k) * _one_minus(_c(2.0) * alpha_k)

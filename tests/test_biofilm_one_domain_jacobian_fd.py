@@ -26,6 +26,13 @@ def _build_problem(
     nx: int = 2,
     ny: int = 2,
     q: int = 5,
+    dt_val: float = 0.1,
+    rho_f: float = 1.0,
+    mu_f: float = 1.0e-2,
+    kappa_inv: float = 10.0,
+    mu_s: float = 1.0,
+    lambda_s: float = 1.0,
+    gamma_div: float = 0.0,
     D_alpha: float = 0.1,
     alpha_supg: float = 0.0,
     alpha_cip: float = 0.0,
@@ -143,7 +150,7 @@ def _build_problem(
     S_k.nodal_values[:] = np.clip(0.2 + 0.05 * rng.standard_normal(S_k.nodal_values.shape), 0.01, 1.0)
     S_n.nodal_values[:] = np.clip(0.2 + 0.05 * rng.standard_normal(S_n.nodal_values.shape), 0.01, 1.0)
 
-    dt = Constant(0.1)
+    dt = Constant(float(dt_val))
     th = float(theta)
 
     # Volume source in the mixture constraint (matches the Warner-style benchmark):
@@ -196,13 +203,14 @@ def _build_problem(
         ds_cip=ds(metadata={"q": int(q)}),
         dt=dt,
         theta=th,
-        rho_f=Constant(1.0),
-        mu_f=Constant(1.0e-2),
-        kappa_inv=Constant(10.0),
+        rho_f=Constant(float(rho_f)),
+        mu_f=Constant(float(mu_f)),
+        kappa_inv=Constant(float(kappa_inv)),
         kappa_inv_model=str(kappa_inv_model),
         kappa_inv_phi_ref=float(kappa_inv_phi_ref) if kappa_inv_phi_ref is not None else 0.7,
-        mu_s=Constant(1.0),
-        lambda_s=Constant(1.0),
+        mu_s=Constant(float(mu_s)),
+        lambda_s=Constant(float(lambda_s)),
+        gamma_div=float(gamma_div),
         D_phi=0.1,
         gamma_phi=1.0,
         D_alpha=float(D_alpha),
