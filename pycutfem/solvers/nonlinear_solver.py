@@ -56,6 +56,17 @@ if not _skip_petsc:
 else:
     PETSc = None
     HAS_PETSC = False
+_skip_pypardiso = os.getenv("PYCUTFEM_SKIP_PYPARDISO", "").lower() in {"1", "true", "yes"}
+if not _skip_pypardiso:
+    try:
+        from pypardiso import PyPardisoSolver
+        HAS_PYPARDISO = True
+    except Exception:  # noqa: PERF203
+        PyPardisoSolver = None
+        HAS_PYPARDISO = False
+else:
+    PyPardisoSolver = None
+    HAS_PYPARDISO = False
 import sys
 
 _HAVE_NUMBA_REDUCED_PATTERN = False
@@ -3162,6 +3173,8 @@ class NewtonSolver:
 
     def _solve_linear_system(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
         backend = str(getattr(self.lp, "backend", "scipy") or "scipy").lower()
+        if backend == "pypardiso":
+            backend = "pardiso"
         if backend == "scipy":
             try:
                 with warnings.catch_warnings():
@@ -3181,6 +3194,12 @@ class NewtonSolver:
                 A_reg = A + (shift * sp.eye(A.shape[0], format="csr"))
                 print(f"        [lin] adding diagonal shift {shift:.3e} after solver failure: {exc}")
                 return spla.spsolve(A_reg, rhs)
+        if backend == "pardiso":
+            if not HAS_PYPARDISO:
+                raise RuntimeError(
+                    "LinearSolverParameters.backend='pardiso' requested but pypardiso is not available."
+                )
+            return self._solve_linear_system_pardiso(A, rhs)
         if backend == "petsc":
             if not HAS_PETSC:
                 raise RuntimeError(
@@ -3188,6 +3207,56 @@ class NewtonSolver:
                 )
             return self._solve_linear_system_petsc(A, rhs)
         raise ValueError(f"Unknown linear solver backend '{self.lp.backend}'.")
+
+    def _invalidate_pardiso_linear_cache(self) -> None:
+        cache = getattr(self, "_pardiso_linear_cache", None)
+        solver = cache.get("solver") if isinstance(cache, dict) else None
+        if solver is not None:
+            try:
+                solver.free_memory()
+            except Exception:
+                pass
+        if hasattr(self, "_pardiso_linear_cache"):
+            delattr(self, "_pardiso_linear_cache")
+
+    def _solve_linear_system_pardiso(self, A: sp.csr_matrix, rhs: np.ndarray) -> np.ndarray:
+        if not (sp.isspmatrix_csr(A) or sp.isspmatrix_csc(A)):
+            A = A.tocsr()
+
+        n = int(A.shape[0])
+        if int(A.shape[1]) != n:
+            raise ValueError("PARDISO linear solve expects a square matrix.")
+
+        rhs = np.asarray(rhs, dtype=np.float64)
+        if (not np.all(np.isfinite(A.data))) or (not np.all(np.isfinite(rhs))):
+            self._invalidate_pardiso_linear_cache()
+            raise RuntimeError("PARDISO linear solve received non-finite entries in matrix or rhs.")
+
+        cache = getattr(self, "_pardiso_linear_cache", None)
+        if cache is None or int(cache.get("n", -1)) != n:
+            self._invalidate_pardiso_linear_cache()
+            cache = {"n": n, "solver": PyPardisoSolver()}
+            self._pardiso_linear_cache = cache
+
+        solver = cache["solver"]
+        try:
+            out = np.asarray(solver.solve(A, rhs), dtype=np.float64).ravel()
+        except Exception as exc:
+            self._invalidate_pardiso_linear_cache()
+            shift_scale = float(os.getenv("PYCUTFEM_LIN_SHIFT", "1e-8"))
+            diag = A.diagonal()
+            diag_scale = float(np.max(np.abs(diag))) if diag.size else 1.0
+            shift = max(shift_scale * max(1.0, diag_scale), 1.0e-14)
+            A_reg = A + (shift * sp.eye(n, format="csr"))
+            print(f"        [lin] adding diagonal shift {shift:.3e} after PARDISO failure: {exc}")
+            retry_solver = PyPardisoSolver()
+            out = np.asarray(retry_solver.solve(A_reg, rhs), dtype=np.float64).ravel()
+            self._pardiso_linear_cache = {"n": n, "solver": retry_solver}
+
+        if not np.all(np.isfinite(out)):
+            self._invalidate_pardiso_linear_cache()
+            raise RuntimeError("PARDISO linear solve returned non-finite solution values.")
+        return out
 
     def set_linear_schur_fieldsplit(
         self,
@@ -3782,9 +3851,10 @@ class NewtonSolver:
         # rebuilt when the CSR pattern changes, otherwise PETSc can raise
         # "new nonzero" insertion errors.
         try:
-            if str(getattr(self.lp, "backend", "scipy") or "scipy").lower() == "petsc":
+            if str(getattr(self.lp, "backend", "scipy") or "scipy").lower() in {"petsc", "pardiso", "pypardiso"}:
                 if hasattr(self, "_petsc_linear_cache"):
                     delattr(self, "_petsc_linear_cache")
+                self._invalidate_pardiso_linear_cache()
         except Exception:
             pass
 
@@ -4028,9 +4098,10 @@ class NewtonSolver:
 
         # Pattern changed → drop PETSc cache
         try:
-            if str(getattr(self.lp, "backend", "scipy") or "scipy").lower() == "petsc":
+            if str(getattr(self.lp, "backend", "scipy") or "scipy").lower() in {"petsc", "pardiso", "pypardiso"}:
                 if hasattr(self, "_petsc_linear_cache"):
                     delattr(self, "_petsc_linear_cache")
+                self._invalidate_pardiso_linear_cache()
         except Exception:
             pass
 
@@ -6308,7 +6379,7 @@ class PdasNewtonSolver(NewtonSolver):
             strong_active = self._vi_strong_active_mask(x_red, R_red, lo_red, hi_red, act_lo, act_hi, c_red)
 
             print(
-                f"        VI Newton {it+1}: |G|_∞={norm_G:.2e}  |R|_∞={norm_R:.2e}  nA={nA} nI={nI}"
+                f"        VI Newton {it+1}: |G|_∞={norm_G:.2e}  |R_raw|_∞={norm_R:.2e}  nA={nA} nI={nI}"
                 + (f"  ΔA={changed}" if changed >= 0 else "")
                 + f"  |R_I|_∞={metrics0['inactive_res_inf']:.2e}  |gap_A|_∞={metrics0['active_gap_inf']:.2e}"
                 + f"  λ={float(getattr(self, '_vi_lambda_current', 0.0)):.2e}"

@@ -1,0 +1,54 @@
+{
+  "source": "Seboldt et al. 2021 Figure 6",
+  "pdf": "/home/bhatti/Documents/pycutfem/examples/biofilms/benchmarks/seboldt/20m1386268.pdf",
+  "page": 22,
+  "curve_labels": [
+    "monolithic_fixed_linear",
+    "partitioned_fixed_linear",
+    "partitioned_moving_linear",
+    "partitioned_moving_nonlinear"
+  ],
+  "panel_order": [
+    {
+      "panel_index": 0,
+      "kappa": 0.001,
+      "y_max": 0.004
+    },
+    {
+      "panel_index": 1,
+      "kappa": 0.0001,
+      "y_max": 0.04
+    },
+    {
+      "panel_index": 2,
+      "kappa": 1e-05,
+      "y_max": 0.15
+    }
+  ],
+  "panel_axes_page_coordinates": [
+    {
+      "x0": 94.500000015,
+      "x1": 197.77734375,
+      "y_base": 177.460937495,
+      "y_top": 103.66406251999999
+    },
+    {
+      "x0": 214.42578126,
+      "x1": 310.72656250499995,
+      "y_base": 177.460937495,
+      "y_top": 102.76171873999999
+    },
+    {
+      "x0": 332.10156250499995,
+      "x1": 428.40234375,
+      "y_base": 177.460937495,
+      "y_top": 102.76171873999999
+    }
+  ],
+  "digitization_mode": "vector_svg_extraction",
+  "notes": [
+    "x-axis is normalized to [0,1] from the paper axes.",
+    "y-axis limits follow the panel scales visible in Figure 6.",
+    "The extraction keeps the moving-domain linear curve as the primary benchmark target."
+  ]
+}

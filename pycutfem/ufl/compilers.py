@@ -55,7 +55,7 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.forms import Equation
 from pycutfem.ufl.measures import Integral
 from pycutfem.ufl.quadrature import PolynomialDegreeEstimator
-from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, _collapsed_function, lhs_num,
+from pycutfem.ufl.helpers import (VecOpInfo, GradOpInfo, HessOpInfo, _collapsed_function, _collapsed_grad, lhs_num,
                                   required_multi_indices,
                                   _all_fields,_find_all,
                                   _trial_test, 
@@ -1748,17 +1748,30 @@ class FormCompiler:
             return self._apply_restriction_mask(result, op)
         if isinstance(op, DivOperation):
             return self._visit_GradOfDiv(op)
-        if not isinstance(op, (TestFunction, VectorTestFunction, TrialFunction, VectorTrialFunction, Function, VectorFunction)):
+        if not isinstance(
+            op,
+            (
+                TestFunction,
+                VectorTestFunction,
+                HdivTestFunction,
+                TrialFunction,
+                VectorTrialFunction,
+                HdivTrialFunction,
+                Function,
+                VectorFunction,
+                HdivFunction,
+            ),
+        ):
             dx_part = self._visit(Derivative(op, 1, 0))
             dy_part = self._visit(Derivative(op, 0, 1))
             return _grad_from_scalar_derivatives(n, dx_part, dy_part)
 
         # 1) role
-        if isinstance(op, (TestFunction, VectorTestFunction)):
+        if isinstance(op, (TestFunction, VectorTestFunction, HdivTestFunction)):
             role = "test"
-        elif isinstance(op, (TrialFunction, VectorTrialFunction)):
+        elif isinstance(op, (TrialFunction, VectorTrialFunction, HdivTrialFunction)):
             role = "trial"
-        elif isinstance(op, (Function, VectorFunction)):
+        elif isinstance(op, (Function, VectorFunction, HdivFunction)):
             role = "function"
         else:
             raise NotImplementedError(f"grad() not implemented for {type(op)}")
@@ -1776,6 +1789,33 @@ class FormCompiler:
             fld = getattr(op, "field_name", None)
             if fld is not None:
                 fields = [fld]
+
+        is_hdiv_rt = (
+            len(fields) == 1
+            and getattr(self.me, "_field_families", {}).get(str(fields[0]), None) == "RT"
+            and isinstance(op, (HdivTestFunction, HdivTrialFunction, HdivFunction))
+        )
+        if is_hdiv_rt:
+            fld = str(fields[0])
+            entry = self._basis_cache.get(fld, {})
+            side = self._get_side() if self._on_sided_path() else None
+            if side == "+":
+                grad_tbl = entry.get("hdiv_grad_pos", None)
+            elif side == "-":
+                grad_tbl = entry.get("hdiv_grad_neg", None)
+            else:
+                grad_tbl = None
+            if grad_tbl is None:
+                grad_tbl = entry.get("hdiv_grad")
+            if grad_tbl is None:
+                raise RuntimeError(f"Missing H(div) gradient cache for field '{fld}'.")
+
+            grad_fields = [fld, fld]
+            if role == "function":
+                coeffs = np.asarray(op.get_nodal_values(self._local_dofs()), dtype=float)
+                grad_val = np.einsum("ind,n->id", np.asarray(grad_tbl, dtype=float), coeffs, optimize=True)
+                return self._gradinfo(np.asarray(grad_val, dtype=float), role=role, node=op, field_names=grad_fields)
+            return self._gradinfo(np.asarray(grad_tbl, dtype=float), role=role, node=op, field_names=grad_fields)
 
         k_blocks = []
         if role == "function":
@@ -2577,11 +2617,34 @@ class FormCompiler:
 
         rhs = bool(self.ctx.get("rhs"))
 
+        def _grad_const_inner(grad_info: GradOpInfo, const_arr: np.ndarray, *, node, role_hint: str | None = None):
+            carr = np.asarray(const_arr, dtype=float)
+            if carr.ndim != 2:
+                raise TypeError(f"Grad-constant inner expects a rank-2 constant, got shape {carr.shape}.")
+            if grad_info.role == "function":
+                kd = _collapsed_grad(grad_info)
+                if kd.shape != carr.shape:
+                    raise ValueError(f"Grad-constant inner shape mismatch: {kd.shape} vs {carr.shape}.")
+                return float(np.einsum("kd,kd->", kd, carr, optimize=True))
+            if grad_info.role in {"trial", "test"}:
+                if grad_info.data.shape[0] != carr.shape[0] or grad_info.data.shape[2] != carr.shape[1]:
+                    raise ValueError(
+                        f"Grad-constant inner shape mismatch: {grad_info.data.shape} vs {carr.shape}."
+                    )
+                data = np.einsum("knd,kd->n", grad_info.data, carr, optimize=True)
+                role = role_hint or grad_info.role
+                return self._vecinfo(data[np.newaxis, :], role=role, node=node, field_names=grad_info.field_names)
+            raise TypeError(f"Grad-constant inner not implemented for role '{grad_info.role}'.")
+
         # ============================= RHS =============================
         if rhs:
             # ---- Hessian(Function) · Hessian(Test/Trial)  → (n,) ----
             if isinstance(a, (HessOpInfo, VecOpInfo, GradOpInfo)) and isinstance(b, (HessOpInfo, VecOpInfo, GradOpInfo)):
                 return a.inner(b)  # returns (n,) vector
+            if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray):
+                return _grad_const_inner(a, b, node=n)
+            if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray):
+                return _grad_const_inner(b, a, node=n)
             # ---- Numeric tensor with Grad basis on RHS ----
             if isinstance(a, ( VecOpInfo)) and isinstance(b, (np.ndarray, VecOpInfo)):
                 return a.inner(b)  # returns (n,) vector
@@ -2640,6 +2703,10 @@ class FormCompiler:
                 return a.inner(b)
             raise ValueError(f"Grad LHS expects test vs trial; got {a.role} vs {b.role}."
                              f" shapes a={getattr(a.data,'shape',None)}, b={getattr(b.data,'shape',None)}")
+        if isinstance(a, GradOpInfo) and isinstance(b, np.ndarray):
+            return _grad_const_inner(a, b, node=n)
+        if isinstance(b, GradOpInfo) and isinstance(a, np.ndarray):
+            return _grad_const_inner(b, a, node=n)
 
         # ---- Vec LHS (e.g., Laplacian(LHS) yields VecOpInfo) ----
         if isinstance(a, VecOpInfo) and isinstance(b, VecOpInfo):
@@ -3140,21 +3207,26 @@ class FormCompiler:
                     if fam == "RT":
                         # H(div): vector basis values + divergence basis (both union-sized).
                         V = np.asarray(self.me.tabulate_value(f, float(xi), float(eta), element_id=int(eid)), dtype=float)  # (n_loc_f,2)
+                        G = np.asarray(self.me.tabulate_grad(f, float(xi), float(eta), element_id=int(eid)), dtype=float)  # (n_loc_f,2,2)
                         divV = np.asarray(self.me.tabulate_div(f, float(xi), float(eta), element_id=int(eid)), dtype=float).ravel()  # (n_loc_f,)
                         sgn = np.asarray(self.dh.element_signs[f][int(eid)], dtype=float).ravel()
                         if sgn.shape[0] != V.shape[0]:
                             raise RuntimeError(f"element_signs length mismatch for RT field '{f}' on element {eid}.")
                         V = sgn[:, None] * V
+                        G = sgn[:, None, None] * G
                         divV = sgn * divV
 
                         n_union = int(self.me.n_dofs_local)
                         sl = self.me.component_dof_slices[f]
                         hdiv_val = np.zeros((2, n_union), dtype=float)
+                        hdiv_grad = np.zeros((2, n_union, 2), dtype=float)
                         hdiv_val[:, sl] = V.T
+                        hdiv_grad[:, sl, :] = np.transpose(G, (1, 0, 2))
                         hdiv_div = np.zeros((n_union,), dtype=float)
                         hdiv_div[sl] = divV
                         self._basis_cache[f] = {
                             "hdiv_val": hdiv_val,
+                            "hdiv_grad": hdiv_grad,
                             "hdiv_div": hdiv_div,
                         }
                         continue

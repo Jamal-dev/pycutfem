@@ -730,6 +730,13 @@ class CppCodeGen:
             if line.strip():
                 body_lines.append("            " + line)
 
+        def emit_local_coeff_bounds(coeff_name: str, basis_len_expr: str) -> tuple[str, str]:
+            coeff_len = new_tmp("coeff_len")
+            stop = new_tmp("stop")
+            emit_line(f"ssize_t {coeff_len} = {coeff_name}_view.shape(1);")
+            emit_line(f"ssize_t {stop} = std::min<ssize_t>({coeff_len}, {basis_len_expr});")
+            return "0", stop
+
         def alloc_tmp(kind: str, prefix: str) -> tuple[str, str | None, int | None]:
             # Do not pool vector temporaries. Many hot biofilm/interface kernels
             # operate on fixed-size 2-vectors (normals, tangents, 2D gradients).
@@ -1001,11 +1008,7 @@ class CppCodeGen:
                             emit_line(f"    {nm} += coeff * {basis_name}_view(e, q, src);")
                             emit_line("}")
                         else:
-                            s0_adj = new_tmp("s0")
-                            s1_adj = new_tmp("s1")
-                            emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                            emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                            emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                            s0_adj, s1_adj = emit_local_coeff_bounds(coeff_name, f"b_{fn}_view.shape(2)")
                             emit_line(
                                 f"double {nm} = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0_adj}, {s1_adj});"
                             )
@@ -1053,11 +1056,7 @@ class CppCodeGen:
                                 emit_line(f"    {nm}({idx}) += coeff * {basis_name}_view(e, q, src);")
                                 emit_line("}")
                             else:
-                                s0_adj = new_tmp("s0")
-                                s1_adj = new_tmp("s1")
-                                emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                                emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                                emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                s0_adj, s1_adj = emit_local_coeff_bounds(coeff_name, f"b_{fn}_view.shape(2)")
                                 emit_line(
                                     f"{nm}({idx}) = load_variable_component({coeff_name}_view, b_{fn}_view, e, q, {s0_adj}, {s1_adj});"
                                 )
@@ -1440,11 +1439,7 @@ class CppCodeGen:
                                 emit_line("}")
                             else:
                                 required_args.add(f"g_{fn}")
-                                s0_adj = new_tmp("s0")
-                                s1_adj = new_tmp("s1")
-                                emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                                emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                                emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                s0_adj, s1_adj = emit_local_coeff_bounds(coeff_name, f"g_{fn}_view.shape(2)")
                                 gtmp = new_tmp("g_tmp")
                                 emit_line(f"Eigen::MatrixXd {gtmp}(1, 2);")
                                 emit_line(
@@ -1487,11 +1482,7 @@ class CppCodeGen:
                                 emit_line(f"    {nm} += coeff_j * dphi;")
                                 emit_line("}")
                             else:
-                                s0_adj = new_tmp("s0")
-                                s1_adj = new_tmp("s1")
-                                emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                                emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                                emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                s0_adj, s1_adj = emit_local_coeff_bounds(coeff_name, f"{d20}_view.shape(2)")
                                 emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
                                 emit_line(f"    double coeff_j = {coeff_name}_view(e, j);")
                                 emit_line(f"    double d20j = {d20}_view(e,q,j); double d11j = {d11}_view(e,q,j); double d02j = {d02}_view(e,q,j);")
@@ -1547,11 +1538,7 @@ class CppCodeGen:
                                     emit_line(f"{nm}({idx}) = {dval};")
                                 else:
                                     required_args.add(f"g_{fn}")
-                                    s0_adj = new_tmp("s0")
-                                    s1_adj = new_tmp("s1")
-                                    emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                                    emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                                    emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                    s0_adj, s1_adj = emit_local_coeff_bounds(coeff_name, f"g_{fn}_view.shape(2)")
                                     gtmp = new_tmp("g_tmp")
                                     emit_line(f"Eigen::MatrixXd {gtmp}(1, 2);")
                                     emit_line(
@@ -1595,11 +1582,7 @@ class CppCodeGen:
                                     emit_line(f"    {dval} += coeff_j * dphi;")
                                     emit_line("}")
                                 else:
-                                    s0_adj = new_tmp("s0")
-                                    s1_adj = new_tmp("s1")
-                                    emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                                    emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                                    emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                    s0_adj, s1_adj = emit_local_coeff_bounds(coeff_name, f"{d20}_view.shape(2)")
                                     emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
                                     emit_line(f"    double coeff_j = {coeff_name}_view(e, j);")
                                     emit_line(f"    double d20j = {d20}_view(e,q,j); double d11j = {d11}_view(e,q,j); double d02j = {d02}_view(e,q,j);")
@@ -1688,13 +1671,7 @@ class CppCodeGen:
                             if self.on_facet and side_tag in ("pos", "neg"):
                                 emit_line("for (ssize_t j=0; j<n_union; ++j) {")
                             else:
-                                s0 = field_slices.get(fn, slice(0, 0)).start
-                                s1 = field_slices.get(fn, slice(0, 0)).stop
-                                s0_adj = new_tmp("s0")
-                                s1_adj = new_tmp("s1")
-                                emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                                emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                                emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                                s0_adj, s1_adj = emit_local_coeff_bounds(coeff, f"{d20n}_view.shape(2)")
                                 emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
                             emit_line(f"    double coeff_j = {coeff}_view(e,j);")
                             emit_line(f"    double d20 = {d20n}_view(e,q,j); double d11 = {d11n}_view(e,q,j); double d02 = {d02n}_view(e,q,j);")
@@ -1716,6 +1693,77 @@ class CppCodeGen:
                         continue
 
                     raise NotImplementedError(f"grad(div(.)) not implemented for role {a.role}")
+
+                is_hdiv_grad = (
+                    len(getattr(a, "field_names", []) or []) == 1
+                    and getattr(self.mixed_element, "_field_families", {}).get(str(a.field_names[0]), None) == "RT"
+                )
+                if is_hdiv_grad:
+                    fld = str(a.field_names[0])
+                    if a.side in ("+", "-") and self.on_facet:
+                        raise NotImplementedError("grad(H(div)) is currently implemented for volume integrals only in the C++ backend.")
+
+                    gvec_name = f"gvec_{fld}"
+                    sign_name = f"sign_{fld}"
+                    required_args.update({gvec_name, sign_name})
+                    jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
+
+                    if a.role in {"test", "trial"}:
+                        nm = new_tmp("hdiv_grad")
+                        emit_line(f"std::vector<Eigen::MatrixXd> {nm}; {nm}.resize(2);")
+                        emit_line(f"{nm}[0] = Eigen::MatrixXd::Zero(n_union, 2);")
+                        emit_line(f"{nm}[1] = Eigen::MatrixXd::Zero(n_union, 2);")
+                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
+                        emit_line(f"    double s = {sign_name}_view(e, j);")
+                        emit_line(f"    double g00 = {gvec_name}_view(e,q,0,j,0); double g01 = {gvec_name}_view(e,q,0,j,1);")
+                        emit_line(f"    double g10 = {gvec_name}_view(e,q,1,j,0); double g11 = {gvec_name}_view(e,q,1,j,1);")
+                        emit_line(f"    double adj00 =  {jloc_var}(1,1); double adj01 = -{jloc_var}(0,1);")
+                        emit_line(f"    double adj10 = -{jloc_var}(1,0); double adj11 =  {jloc_var}(0,0);")
+                        emit_line("    double t00 = adj00 * g00 + adj01 * g10;")
+                        emit_line("    double t01 = adj00 * g01 + adj01 * g11;")
+                        emit_line("    double t10 = adj10 * g00 + adj11 * g10;")
+                        emit_line("    double t11 = adj10 * g01 + adj11 * g11;")
+                        emit_line(f"    {nm}[0](j,0) = s * (t00 * {jloc_var}(0,0) + t01 * {jloc_var}(1,0));")
+                        emit_line(f"    {nm}[0](j,1) = s * (t00 * {jloc_var}(0,1) + t01 * {jloc_var}(1,1));")
+                        emit_line(f"    {nm}[1](j,0) = s * (t10 * {jloc_var}(0,0) + t11 * {jloc_var}(1,0));")
+                        emit_line(f"    {nm}[1](j,1) = s * (t10 * {jloc_var}(0,1) + t11 * {jloc_var}(1,1));")
+                        emit_line("}")
+                        stack.append(StackItem(nm, "grad", a.role, (2, -1, 2), [fld, fld], a.parent, a.side, a.field_sides))
+                        continue
+
+                    if a.role == "value":
+                        coeff_name = coeff_array_name(a.parent, a.side)
+                        required_args.add(coeff_name)
+                        nm = new_tmp("hdiv_gval")
+                        # Use a dynamic 2x2 matrix here. This value participates in the
+                        # generic matrix expression pipeline together with MatrixXd
+                        # temporaries (for example grad(v_k) + grad(v_k).T inside
+                        # epsilon(v_k)). Keeping it fixed-size lets Eigen vectorize the
+                        # mixed fixed/dynamic add path aggressively, which in practice
+                        # triggered out-of-bounds reads and NaNs in the O3 C++ backend on
+                        # 1x1 H(div) regression cases.
+                        emit_line(f"Eigen::MatrixXd {nm}(2,2);")
+                        emit_line(f"{nm}.setZero();")
+                        emit_line("for (ssize_t j=0; j<n_union; ++j) {")
+                        emit_line(f"    double coeff = {coeff_name}_view(e,j);")
+                        emit_line(f"    double s = {sign_name}_view(e, j);")
+                        emit_line(f"    double g00 = {gvec_name}_view(e,q,0,j,0); double g01 = {gvec_name}_view(e,q,0,j,1);")
+                        emit_line(f"    double g10 = {gvec_name}_view(e,q,1,j,0); double g11 = {gvec_name}_view(e,q,1,j,1);")
+                        emit_line(f"    double adj00 =  {jloc_var}(1,1); double adj01 = -{jloc_var}(0,1);")
+                        emit_line(f"    double adj10 = -{jloc_var}(1,0); double adj11 =  {jloc_var}(0,0);")
+                        emit_line("    double t00 = adj00 * g00 + adj01 * g10;")
+                        emit_line("    double t01 = adj00 * g01 + adj01 * g11;")
+                        emit_line("    double t10 = adj10 * g00 + adj11 * g10;")
+                        emit_line("    double t11 = adj10 * g01 + adj11 * g11;")
+                        emit_line(f"    {nm}(0,0) += coeff * s * (t00 * {jloc_var}(0,0) + t01 * {jloc_var}(1,0));")
+                        emit_line(f"    {nm}(0,1) += coeff * s * (t00 * {jloc_var}(0,1) + t01 * {jloc_var}(1,1));")
+                        emit_line(f"    {nm}(1,0) += coeff * s * (t10 * {jloc_var}(0,0) + t11 * {jloc_var}(1,0));")
+                        emit_line(f"    {nm}(1,1) += coeff * s * (t10 * {jloc_var}(0,1) + t11 * {jloc_var}(1,1));")
+                        emit_line("}")
+                        stack.append(StackItem(nm, "mat", "value", (2, 2), [fld, fld], a.parent, a.side, a.field_sides))
+                        continue
+
+                    raise NotImplementedError(f"grad(H(div)) not implemented for role {a.role}")
 
                 if a.kind in {"mat", "basis_ref"} and a.role in {"test", "trial"}:
                     gv_key = (
@@ -1846,11 +1894,7 @@ class CppCodeGen:
                             emit_line("}")
                             emit_line(f"{nm}({idx},0) = {gx_var}; {nm}({idx},1) = {gy_var};")
                         else:
-                            s0_adj = new_tmp("s0")
-                            s1_adj = new_tmp("s1")
-                            emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                            emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                            emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                            s0_adj, s1_adj = emit_local_coeff_bounds(coeff_name, f"g_{fn}_view.shape(2)")
                             required_args.add(f"g_{fn}")
                             emit_line(
                                 f"gradient_component({nm}, {idx}, {coeff_name}_view, g_{fn}_view, {jloc_var}, e, q, {s0_adj}, {s1_adj});"
@@ -1941,13 +1985,7 @@ class CppCodeGen:
                         if self.on_facet and side_tag in ("pos", "neg"):
                             emit_line("for (ssize_t j=0; j<n_union; ++j) {")
                         else:
-                            s0 = field_slices.get(fn, slice(0, 0)).start
-                            s1 = field_slices.get(fn, slice(0, 0)).stop
-                            s0_adj = new_tmp("s0")
-                            s1_adj = new_tmp("s1")
-                            emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                            emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                            emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                            s0_adj, s1_adj = emit_local_coeff_bounds(coeff, f"{d20n}_view.shape(2)")
                             emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
                         emit_line(f"    double coeff = {coeff}_view(e,j);")
                         jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
@@ -2045,13 +2083,7 @@ class CppCodeGen:
                         if self.on_facet and side_tag in ("pos", "neg"):
                             emit_line("for (ssize_t j=0; j<n_union; ++j) {")
                         else:
-                            s0 = field_slices.get(fn, slice(0, 0)).start
-                            s1 = field_slices.get(fn, slice(0, 0)).stop
-                            s0_adj = new_tmp("s0")
-                            s1_adj = new_tmp("s1")
-                            emit_line(f"ssize_t {s0_adj} = ({s0} < 0 || {s0} >= n_union) ? 0 : {s0};")
-                            emit_line(f"ssize_t {s1_adj} = ({s1} < 0 || {s1} > n_union) ? n_union : {s1};")
-                            emit_line(f"if ({s1_adj} < {s0_adj}) {s1_adj} = {s0_adj};")
+                            s0_adj, s1_adj = emit_local_coeff_bounds(coeff, f"{d20n}_view.shape(2)")
                             emit_line(f"for (ssize_t j={s0_adj}; j<{s1_adj}; ++j) {{")
                         emit_line(f"    double coeff = {coeff}_view(e,j);")
                         jloc_var = "Jloc_pos" if a.side == "+" else "Jloc_neg" if a.side == "-" else "Jloc"
@@ -3198,7 +3230,15 @@ class CppCodeGen:
                     elif len(b.shape) >= 2 and b.shape[1] == -1:
                         if a.role in {"test", "trial"} and b.role in {"test", "trial"}:
                             emit_line(f"auto {nm} = contract_last_first({a.name}, {b.name});")
-                            res_shape = a.shape[:-1] + b.shape[1:]
+                            # contract_last_first(A, B) returns rows from A and cols from B.
+                            # For bilinear forms we need rows=test and cols=trial. When the
+                            # gradient basis is the trial operand and the vector basis is the
+                            # test operand, transpose each component block back to test-by-trial.
+                            if a.role == "trial" and b.role == "test":
+                                emit_line(f"for (auto& _m : {nm}) _m.transposeInPlace();")
+                                res_shape = (a.shape[0], b.shape[1], a.shape[1])
+                            else:
+                                res_shape = a.shape[:-1] + b.shape[1:]
                             push("grad", "mixed", res_shape)
                         else:    
                             nm, tmp_kind, tmp_slot = alloc_tmp("mat", "dot")
@@ -3991,6 +4031,8 @@ class CppCodeGen:
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<3>();")
             if name.startswith("bvec_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
+            if name.startswith("gvec_"):
+                view_lines.append(f"    auto {name}_view = {name}.unchecked<5>();")
             if name.startswith("g_"):
                 view_lines.append(f"    auto {name}_view = {name}.unchecked<4>();")
             if name.startswith("r0") or name.startswith("r1") or name.startswith("r2") or name.startswith("r3") or name.startswith("r4"):

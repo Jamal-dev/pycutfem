@@ -137,6 +137,238 @@ class Expression:
 
         return dfs(self)
 
+    def __getitem__(self, index):
+        return _index_expression(self, index)
+
+
+def _normalize_index(index):
+    if isinstance(index, tuple):
+        if not index:
+            raise IndexError("Empty index is not valid.")
+        return tuple(int(i) for i in index)
+    return (int(index),)
+
+
+def _shape_after_slice(shape: tuple[int, ...], index: tuple[int, ...]) -> tuple[int, ...]:
+    if len(index) > len(shape):
+        raise IndexError(f"Too many indices {index!r} for shape {shape!r}.")
+    for axis, ind in enumerate(index):
+        dim = int(shape[axis])
+        if ind < 0 or ind >= dim:
+            raise IndexError(f"Index {ind} out of range for axis {axis} with size {dim}.")
+    return tuple(shape[len(index):])
+
+
+def _expr_shape(expr) -> tuple[int, ...]:
+    if isinstance(expr, Constant):
+        return tuple(expr.shape)
+    if isinstance(expr, ElementWiseConstant):
+        return tuple(expr.shape)
+    if isinstance(expr, (Function, TrialFunction, TestFunction, NormalComponent, Derivative, DivOperation, Laplacian,
+                         PositivePart, Heaviside, Log, Inner, Trace, Determinant)):
+        return ()
+    if isinstance(expr, (FacetNormal, VectorFunction, VectorTrialFunction, VectorTestFunction,
+                         HdivFunction, HdivTrialFunction, HdivTestFunction)):
+        return (int(expr.num_components),)
+    if isinstance(expr, (Pos, Neg, Restriction)):
+        return _expr_shape(expr.operand)
+    if isinstance(expr, Side):
+        return _expr_shape(expr.f)
+    if isinstance(expr, Avg):
+        return _expr_shape(expr.v)
+    if isinstance(expr, Jump):
+        return _expr_shape(expr.u_pos)
+    if isinstance(expr, Transpose):
+        shape = _expr_shape(expr.A)
+        if len(shape) == 2:
+            return (shape[1], shape[0])
+        return shape
+    if isinstance(expr, Grad):
+        base_shape = _expr_shape(expr.operand)
+        if base_shape == ():
+            return (2,)
+        if len(base_shape) == 1:
+            return (base_shape[0], 2)
+        raise TypeError(f"Grad shape not supported for operand shape {base_shape!r}.")
+    if isinstance(expr, Hessian):
+        base_shape = _expr_shape(expr.operand)
+        if base_shape == ():
+            return (2, 2)
+        if len(base_shape) == 1:
+            return (base_shape[0], 2, 2)
+        raise TypeError(f"Hessian shape not supported for operand shape {base_shape!r}.")
+    if isinstance(expr, (Sum, Sub)):
+        shape_a = _expr_shape(expr.a)
+        shape_b = _expr_shape(expr.b)
+        if shape_a == shape_b:
+            return shape_a
+        if shape_a == ():
+            return shape_b
+        if shape_b == ():
+            return shape_a
+        raise TypeError(f"Cannot infer shape for {type(expr).__name__} with {shape_a!r}/{shape_b!r}.")
+    if isinstance(expr, Prod):
+        shape_a = _expr_shape(expr.a)
+        shape_b = _expr_shape(expr.b)
+        if shape_a == ():
+            return shape_b
+        if shape_b == ():
+            return shape_a
+        if shape_a == shape_b:
+            return shape_a
+        raise TypeError(f"Cannot infer shape for Prod with {shape_a!r}/{shape_b!r}.")
+    if isinstance(expr, Div):
+        shape_a = _expr_shape(expr.a)
+        shape_b = _expr_shape(expr.b)
+        if shape_b == ():
+            return shape_a
+        if shape_a == shape_b:
+            return shape_a
+        raise TypeError(f"Cannot infer shape for Div with {shape_a!r}/{shape_b!r}.")
+    if isinstance(expr, Outer):
+        return _expr_shape(expr.a) + _expr_shape(expr.b)
+    if isinstance(expr, Dot):
+        shape_a = _expr_shape(expr.a)
+        shape_b = _expr_shape(expr.b)
+        if not shape_a or not shape_b:
+            raise TypeError(f"Dot expects non-scalar operands, got {shape_a!r}/{shape_b!r}.")
+        if shape_a[-1] != shape_b[0]:
+            raise TypeError(f"Dot shape mismatch: {shape_a!r} vs {shape_b!r}.")
+        return shape_a[:-1] + shape_b[1:]
+    if isinstance(expr, (Inverse, Cofactor)):
+        return _expr_shape(expr.A)
+    if isinstance(expr, Power):
+        return _expr_shape(expr.a)
+    raise TypeError(f"Cannot infer expression shape for {type(expr).__name__}.")
+
+
+def _scalar_sum(terms):
+    total = None
+    for term in terms:
+        total = term if total is None else total + term
+    return total if total is not None else Constant(0.0)
+
+
+def _slice_constant(value, index):
+    arr = np.asarray(value)
+    sliced = arr[index]
+    if np.ndim(sliced) == 0:
+        return Constant(float(sliced))
+    return Constant(np.asarray(sliced, dtype=float))
+
+
+def _dot_component(a, b, index):
+    idx = _normalize_index(index)
+    shape_a = _expr_shape(a)
+    shape_b = _expr_shape(b)
+    if not shape_a or not shape_b:
+        raise IndexError("Scalar dot result is not subscriptable.")
+    if shape_a[-1] != shape_b[0]:
+        raise TypeError(f"Dot shape mismatch: {shape_a!r} vs {shape_b!r}.")
+    result_shape = shape_a[:-1] + shape_b[1:]
+    if result_shape == ():
+        raise IndexError("Scalar dot result is not subscriptable.")
+    _shape_after_slice(result_shape, idx)
+    prefix = idx[: len(shape_a) - 1]
+    suffix = idx[len(shape_a) - 1 :]
+    return _scalar_sum(
+        (
+            a[prefix + (k,) if len(prefix) + 1 > 1 else prefix[0] if prefix else k]
+            * b[(k,) + suffix if len(suffix) + 1 > 1 else suffix[0] if suffix else k]
+        )
+        for k in range(int(shape_a[-1]))
+    )
+
+
+def _index_expression(expr, index):
+    idx = _normalize_index(index)
+    shape = _expr_shape(expr)
+    if shape == ():
+        raise IndexError(f"Scalar expression {type(expr).__name__} is not subscriptable.")
+    _shape_after_slice(shape, idx)
+
+    if isinstance(expr, Constant):
+        return _slice_constant(expr.value, idx)
+    if isinstance(expr, ElementWiseConstant):
+        return ElementWiseConstant(expr.values[(slice(None),) + idx])
+    if isinstance(expr, (Pos, Neg)):
+        return type(expr)(expr.operand[idx if len(idx) > 1 else idx[0]])
+    if isinstance(expr, Restriction):
+        return Restriction(expr.operand[idx if len(idx) > 1 else idx[0]], expr.domain)
+    if isinstance(expr, Side):
+        return Side(expr.f[idx if len(idx) > 1 else idx[0]], expr.side)
+    if isinstance(expr, Avg):
+        return Avg(expr.v[idx if len(idx) > 1 else idx[0]])
+    if isinstance(expr, Jump):
+        return Jump(expr.u_pos[idx if len(idx) > 1 else idx[0]], expr.u_neg[idx if len(idx) > 1 else idx[0]])
+    if isinstance(expr, Transpose):
+        if len(idx) != 2:
+            raise IndexError("Transpose indexing expects two indices.")
+        return expr.A[idx[1], idx[0]]
+    if isinstance(expr, Sum):
+        key = idx if len(idx) > 1 else idx[0]
+        return expr.a[key] + expr.b[key]
+    if isinstance(expr, Sub):
+        key = idx if len(idx) > 1 else idx[0]
+        return expr.a[key] - expr.b[key]
+    if isinstance(expr, Prod):
+        key = idx if len(idx) > 1 else idx[0]
+        shape_a = _expr_shape(expr.a)
+        shape_b = _expr_shape(expr.b)
+        if shape_a == ():
+            return expr.a * expr.b[key]
+        if shape_b == ():
+            return expr.a[key] * expr.b
+        if shape_a == shape_b:
+            return expr.a[key] * expr.b[key]
+        raise TypeError(f"Cannot index Prod with operand shapes {shape_a!r}/{shape_b!r}.")
+    if isinstance(expr, Div):
+        key = idx if len(idx) > 1 else idx[0]
+        shape_b = _expr_shape(expr.b)
+        if shape_b == ():
+            return expr.a[key] / expr.b
+        if _expr_shape(expr.a) == shape_b:
+            return expr.a[key] / expr.b[key]
+        raise TypeError(f"Cannot index Div with operand shapes {_expr_shape(expr.a)!r}/{shape_b!r}.")
+    if isinstance(expr, Outer):
+        if len(idx) == 1:
+            raise IndexError("Outer-product indexing expects at least two indices.")
+        shape_a = _expr_shape(expr.a)
+        split = len(shape_a)
+        a_idx = idx[:split]
+        b_idx = idx[split:]
+        a_key = a_idx if len(a_idx) > 1 else a_idx[0]
+        b_key = b_idx if len(b_idx) > 1 else b_idx[0]
+        return expr.a[a_key] * expr.b[b_key]
+    if isinstance(expr, Dot):
+        return _dot_component(expr.a, expr.b, idx)
+    if isinstance(expr, Inverse):
+        if shape != (2, 2) or len(idx) != 2:
+            raise NotImplementedError("Only 2x2 inverse component access is implemented.")
+        i, j = idx
+        A = expr.A
+        detA = det(A)
+        if (i, j) == (0, 0):
+            return A[1, 1] / detA
+        if (i, j) == (0, 1):
+            return -A[0, 1] / detA
+        if (i, j) == (1, 0):
+            return -A[1, 0] / detA
+        return A[0, 0] / detA
+    if isinstance(expr, Cofactor):
+        if shape != (2, 2) or len(idx) != 2:
+            raise NotImplementedError("Only 2x2 cofactor component access is implemented.")
+        i, j = idx
+        A = expr.A
+        if (i, j) == (0, 0):
+            return A[1, 1]
+        if (i, j) == (0, 1):
+            return -A[0, 1]
+        if (i, j) == (1, 0):
+            return -A[1, 0]
+        return A[0, 0]
+    raise TypeError(f"Component access not implemented for {type(expr).__name__}.")
+
 
 
 class Transpose(Expression):
@@ -922,6 +1154,13 @@ class HdivTrialFunction(Expression):
     def __repr__(self):
         return f"HdivTrialFunction(field='{self.field_name}')"
 
+    def __getitem__(self, i):
+        idx = int(i)
+        if idx not in (0, 1):
+            raise IndexError("HdivTrialFunction has two components (0, 1).")
+        basis = Constant([1.0, 0.0] if idx == 0 else [0.0, 1.0], dim=1)
+        return dot(self, basis)
+
 
 class HdivTestFunction(Expression):
     """Vector-valued test function backed by a *single* H(div) field name."""
@@ -946,6 +1185,13 @@ class HdivTestFunction(Expression):
 
     def __repr__(self):
         return f"HdivTestFunction(field='{self.field_name}')"
+
+    def __getitem__(self, i):
+        idx = int(i)
+        if idx not in (0, 1):
+            raise IndexError("HdivTestFunction has two components (0, 1).")
+        basis = Constant([1.0, 0.0] if idx == 0 else [0.0, 1.0], dim=1)
+        return dot(self, basis)
 
 
 class HdivFunction(Function):
@@ -976,6 +1222,13 @@ class HdivFunction(Function):
 
     def __repr__(self):
         return f"HdivFunction(name='{self.name}', field='{self.field_name}')"
+
+    def __getitem__(self, i):
+        idx = int(i)
+        if idx not in (0, 1):
+            raise IndexError("HdivFunction has two components (0, 1).")
+        basis = Constant([1.0, 0.0] if idx == 0 else [0.0, 1.0], dim=1)
+        return dot(self, basis)
 
 
 def _scalar_token(value: float) -> str:
@@ -1228,11 +1481,22 @@ class Grad(Expression):
     #   Grad(u)[1]   → ∂u/∂y   = Derivative(u, 0, 1)
     # ------------------------------------------------------------------
     def __getitem__(self, index):
-        if index == 0:
-            return Derivative(self.operand, 1, 0)
-        elif index == 1:
-            return Derivative(self.operand, 0, 1)
-        raise IndexError("Grad supports indices 0 (x) or 1 (y)")
+        idx = _normalize_index(index)
+        if len(idx) == 1:
+            if idx[0] == 0:
+                return Derivative(self.operand, 1, 0)
+            if idx[0] == 1:
+                return Derivative(self.operand, 0, 1)
+            raise IndexError("Grad supports indices 0 (x) or 1 (y)")
+        if len(idx) == 2:
+            comp, coord = idx
+            base_shape = _expr_shape(self.operand)
+            if len(base_shape) != 1:
+                raise IndexError(f"Grad component indexing requires a vector operand, got shape {base_shape!r}.")
+            if comp < 0 or comp >= int(base_shape[0]):
+                raise IndexError(f"Vector component {comp} out of range for shape {base_shape!r}.")
+            return Grad(self.operand[comp])[coord]
+        raise IndexError("Grad supports one index for scalar operands or two for vector operands.")
 
 
 

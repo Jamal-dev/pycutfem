@@ -258,6 +258,262 @@ All Batch A probes keep:
 - direct LU / MUMPS,
 - `vi_lm_good_ratio = 0.05`,
 - `accept_nonconverged_atol_factor = 4`.
+
+## 2026-03-13T12:08:00+01:00: shift from diffuse-load calibration to attachment modeling
+
+### Current evidence anchor
+
+- No Benchmark 6 run is currently active.
+- The exact reproduced control remains
+  `/tmp/b6BS_pois_z100_nsneg1p0_exactcmd_E500_gU10_rho1000_nx24_t1p5`.
+- Corrected exact-command screen on `t ∈ [0.5,1.0] s`:
+  - global `RMSE = 6.17 um`,
+  - mean per-height `RMSE = 11.69 um`,
+  - max per-height `RMSE = 20.16 um`,
+  - contour `RMSE(1.0 s) = 182.07 um`.
+- That is already solver-healthy and history-credible on the short window, so
+  the remaining gap is a contour-shape defect concentrated near the lower/toe
+  part of the patch.
+
+### Why the strategy changes here
+
+- Diffuse-load variants tested after the exact-command re-anchor did not close
+  the contour gap:
+  - top-weighted + front-pressure split load pinned the global front and
+    overshot the upper fronts;
+  - upstream-only normal-stress corrections were essentially flat relative to
+    the full-interface `normal_stress = -1.0` control;
+  - `mu_b_model=mu` and `solid_model=svk` reproduced the same short-screen
+    result to roundoff.
+- The Blauert driver still hard-clamps `u_x`, `u_y`, `vS_x`, `vS_y` on the
+  bottom wall, while the full one-domain formulation already supports a softer
+  wall-adhesion traction `ds_adh` with normal/tangential springs and dashpots.
+- That makes the bottom-attachment law the highest-value next model-side
+  hypothesis: it directly targets the lower/toe region without moving the
+  corrected observables or the now-stable solver path.
+
+### Next ranked model-side queue
+
+1. `compliant_bottom_attachment`
+   - replace the hard clamp with the built-in wall-adhesion traction;
+   - first branch:
+     `attachment_mode=adhesion`,
+     `adhesion_k_n=5e5 Pa/m`,
+     `adhesion_k_t=1e5 Pa/m`,
+     `adhesion_gamma_n=0`,
+     `adhesion_gamma_t=0`.
+2. `compliant_bottom_attachment_tangential_sweep`
+   - adjust `adhesion_k_t` if the first branch is stable but either too close
+   to the clamped control or too free in x.
+3. `viscoadhesive_bottom_attachment`
+   - add `adhesion_gamma_n/t` only if the elastic adhesion branch is promising
+   but noisy.
+
+### 2026-03-13T12:27:00+01:00: first adhesion screen result
+
+- Smoke branch:
+  `/tmp/b6CA_pois_z100_nsneg1p0_adh_kn5e5_kt1e5_E500_gU10_rho1000_nx24_t0p25`
+  reached `t = 0.25 s` with 5 accepted steps, all in 2 Newton iterations, no
+  dt cuts, and no linear-solver failures.
+- Corrected `t = 1.0 s` screen:
+  `/tmp/b6CB_pois_z100_nsneg1p0_adh_kn5e5_kt1e5_E500_gU10_rho1000_nx24_t1p0`
+  reached `t = 1.0 s` with 20 accepted steps, every step in 2 Newton
+  iterations.
+- Corrected metrics:
+  - history `RMSE = 6.13 / 11.73 / 20.31 um`,
+  - bias `= +3.17 um`,
+  - contour `RMSE(1.0 s) = 185.14 um`,
+  - screen score `= 0.72249`.
+- Comparison against the exact clamped control:
+  - control:
+    `6.17 / 11.69 / 20.16 um`, contour `182.07 um`, score `0.71594`;
+  - adhesion attempt:
+    `6.13 / 11.73 / 20.31 um`, contour `185.14 um`, score `0.72249`.
+
+Interpretation:
+
+- the branch is solver-clean but scientifically unconvincing;
+- `adhesion_k_t = 1e5 Pa/m` leaves the solution almost indistinguishable from
+  the clamped control through the entire `t = 1.0 s` screen, with the contour
+  floor slightly worse;
+- that means the first attachment branch does **not** support a long run, but
+  it does support the next focused sweep: reduce `adhesion_k_t` aggressively
+  while keeping strong normal attachment.
+
+### 2026-03-13T12:43:00+01:00: attachment family ruled out as inactive
+
+- Diagnostic smoke
+  `/tmp/b6CC_pois_z100_nsneg1p0_adh_kn5e5_kt0_E500_gU10_rho1000_nx24_t0p25`
+  set `adhesion_k_t = 0` and matched the previous adhesion smoke to machine
+  precision.
+- Diagnostic smoke
+  `/tmp/b6CE_pois_z100_nsneg1p0_adh_kn1_kt0_E500_gU10_rho1000_nx24_t0p25`
+  collapsed the base almost entirely (`adhesion_k_n = 1`, `adhesion_k_t = 0`)
+  and still matched the previous adhesion smoke to machine precision.
+
+Consequence:
+
+- the bottom-attachment law is not an active calibration axis for the current
+  Benchmark 6 trajectory;
+- the hard bottom clamp is therefore not the main reason for the persistent
+  contour mismatch.
+
+Next ranked model-side queue:
+
+1. `kozeny_carman_drag`
+   - expose the existing porosity-dependent inverse-permeability model already
+     implemented in `examples/utils/biofilm/one_domain.py`;
+   - first branch:
+     `kappa_inv_model=kozeny_carman`,
+     `kappa_phi_ref=phi_b=0.47`,
+     `kappa_inv_kc_eps=1e-12`.
+2. `neo_hookean_solid`
+   - if Kozeny-Carman is flat or unstable, expose the existing neo-Hookean
+   solid model next;
+   - this is lower priority because linear and SVK were already nearly
+   identical on the `t = 1.0 s` screen.
+
+### 2026-03-13T13:14:00+01:00: additional deeper probes
+
+- `kozeny_carman_drag`
+  - branch:
+    `/tmp/b6CF_pois_z100_nsneg1p0_kc_E500_gU10_rho1000_nx24_t0p25`
+  - result:
+    numerically clean to `t = 0.25 s`, but under-driven relative to the exact
+    control at every tracked front.
+
+- `neo_hookean_solid`
+  - branch:
+    `/tmp/b6CH_pois_z100_nsneg1p0_neoHookean_E500_gU10_rho1000_nx24_t0p25`
+  - result:
+    numerically clean to `t = 0.25 s`, but again under-driven relative to the
+    exact control at every tracked front.
+
+- `refmap_permeability`
+  - first run:
+    `/tmp/b6CI_pois_z100_nsneg1p0_kref_E500_gU10_rho1000_nx24_t0p25`
+    exposed a real bug in the matrix-drag path:
+    `TypeError: 'Dot' object is not subscriptable`;
+  - after a first local fix in `examples/utils/biofilm/one_domain.py`, rerun
+    `/tmp/b6CJ_pois_z100_nsneg1p0_kref_E500_gU10_rho1000_nx24_t0p25`
+    exposed a second related bug:
+    `TypeError: 'Prod' object is not subscriptable`.
+
+Current implication:
+
+- among the deeper families tested in this checkpoint, none has yet improved
+  the corrected observables;
+- the only remaining live deeper branch here is `refmap_permeability`, but it
+  cannot be judged scientifically until the matrix-symbolics bug chain in
+  `examples/utils/biofilm/one_domain.py` is fully resolved.
+
+## 2026-03-13T15:05:00+01:00: resolved `refmap` drag path, inert smoke
+
+- the symbolic-indexing fixes in `pycutfem/ufl/expressions.py` and
+  `examples/utils/biofilm/one_domain.py` now let the deformation-pushed
+  permeability path assemble and run;
+- smoke branch:
+  `/tmp/b6CK_pois_z100_nsneg1p0_kref_E500_gU10_rho1000_nx24_t0p25`
+  reached `t = 0.25 s` with 5 accepted steps, all in 2 Newton iterations;
+- relative to the exact-command control at the same times, the tracked fronts
+  were identical to within about
+  `1e-6 - 5e-6 um` at `t = 0.25 s`.
+
+Implication:
+
+- `refmap_permeability` is now a resolved code path but not a live scientific
+  branch for Benchmark 6;
+- the next credible model-side move is transport-family testing inside the
+  active-porosity PDE benchmark, not more permeability retuning.
+
+Updated ranked next queue:
+
+1. `alpha_transport_mix_biofilm`
+   - test `--alpha-advect-with mix_biofilm` on the exact-command control;
+   - motivation:
+     it is the smallest untested active-PDE change that can alter contour shape
+     without changing the benchmark-local forcing.
+2. `alpha_transport_mix`
+   - stronger mixture-advection fallback if the gated branch is inert.
+3. `transport_mode_refmap`
+  - deeper fallback only if the active-PDE transport variants still cannot
+  lower the contour floor.
+
+## 2026-03-13T15:26:00+01:00: `mix_biofilm` overshoots badly
+
+- smoke branch:
+  `/tmp/b6CL_pois_z100_nsneg1p0_mixbio_E500_gU10_rho1000_nx24_t0p25`
+  was solver-clean and increased the early fronts relative to the exact
+  control;
+- promoted branch:
+  `/tmp/b6CM_pois_z100_nsneg1p0_mixbio_E500_gU10_rho1000_nx24_t1p0`
+  also stayed solver-clean to `t = 1.0 s`, but the corrected metrics were much
+  worse than the exact control:
+  - global `RMSE = 24.45 um`,
+  - mean per-height `RMSE = 31.94 um`,
+  - max per-height `RMSE = 47.08 um`,
+  - contour `RMSE(1.0 s) = 237.20 um`.
+
+Implication:
+
+- the benchmark is transport-sensitive, but `mix_biofilm` is too strong for the
+  present load family;
+- the ungated `mix` branch is not worth a separate run now because the code
+  makes it a strictly stronger version of `mix_biofilm` on the fluid part.
+
+Updated next move:
+
+1. `transport_mode_refmap`
+  - test the sharper reference-map transport family next on the same
+    exact-command load family.
+
+## 2026-03-13T16:20:00+01:00: refmap transport rejected, reduced path fixed
+
+- `transport-mode refmap` smoke
+  `/tmp/b6CN_pois_z100_nsneg1p0_refmaptransport_E500_gU10_rho1000_nx24_t0p25`
+  ran cleanly but was too rigid to matter scientifically;
+- the reduced/frozen-porosity branch exposed a real driver bug
+  (`build_deformation_only_forms()` does not accept `mu_b_model`), which is now
+  fixed in the Blauert driver;
+- after that fix, the reduced smoke
+  `/tmp/b6CP_pois_z100_nsneg1p0_reduced_E500_gU10_rho1000_nx24_t0p25`
+  was solver-clean and directionally mixed, but the promoted screen
+  `/tmp/b6CQ_pois_z100_nsneg1p0_reduced_E500_gU10_rho1000_nx24_t1p0`
+  became practically unhealthy and produced an unphysical negative global front
+  by `t = 0.70 s`.
+
+Current implication:
+
+- the reduced formulation itself is no longer blocked by code;
+- the problem is the forcing family used with it.
+
+Updated next move:
+
+1. `paper1_reduced_lagged_stress`
+  - use the reduced branch with the lagged full-traction closure that the
+  March 8 reset identified as the intended reduced-model family.
+
+## 2026-03-13T17:10:00+01:00: transport gating also fails the contour gate
+
+- reduced `lagged_stress` smoke
+  `/tmp/b6CR_laggedstress_s1_reduced_E500_gU10_rho1000_nx24_t0p25`
+  is solver-clean but wrong-way on the primary toe/global target;
+- exposing the built-in `mix_biofilm` gate parameters and weakening the gate to
+  `alpha0 = 0.7`, `m = 4` produced a true interpolation between the exact
+  control and the overdriven default gate:
+  - smoke branch:
+    `/tmp/b6CS_pois_z100_nsneg1p0_mixbio_a0p7_m4_E500_gU10_rho1000_nx24_t0p25`
+  - promoted screen:
+    `/tmp/b6CT_pois_z100_nsneg1p0_mixbio_a0p7_m4_E500_gU10_rho1000_nx24_t1p0`
+  - histories remained good, but the contour still worsened to
+    `RMSE(1.0 s) = 199.84 um`.
+
+Current implication:
+
+- nonzero transport gating appears to worsen the contour monotonically relative
+  to the exact control;
+- the next credible active-PDE hypothesis is not another advection-family
+  change, but a sharper diffuse-interface regularization.
 Source: `examples/biofilms/benchmarks/blauert/blauert.tex`.
 
 - Dynamic experiment shows an upstream/front compression measured as the distance from the
@@ -2623,3 +2879,1111 @@ Updated ranked queue:
 1. `kappa_inv = 3.924e12`, keep `E = 250`, `gamma_u = 10`.
 2. `E = 150`, keep `kappa_inv = 1.962e12`, `gamma_u = 10`.
 3. Combine them only if one of the single-parameter probes is clearly better.
+
+## 2026-03-12: late lagged-stress continuation outcome
+
+- `gamma_u = 5` remained the strongest scalar support lever inside the
+  `lagged_stress` family:
+  - merged `t <= 1.25 s` result:
+    `/tmp/b6V_laggedstress_s1_E250_kappa2x_gU5_rho1000_nx24_t1p25_restart_dt0p025_merged`
+  - corrected metrics:
+    - global `RMSE = 10.73 um`,
+    - mean per-height `RMSE = 14.84 um`,
+    - contour `RMSE(1.0 s) = 187.08 um`.
+- But the promoted continuation toward `t = 1.5 s`
+  (`/tmp/b6W_laggedstress_s1_E250_kappa2x_gU5_rho1000_nx24_t1p5_restart_dt0p025`)
+  hit the same late-step unhealthy pattern:
+  - accepted cleanly through `t = 1.425 s`,
+  - then froze inside `VI Newton 2`,
+  - with `run.log`, `timeseries.csv`, and `checkpoint_latest.npz` unchanged for
+    about `8` minutes while the process was still consuming CPU.
+- Merged corrected partial score for the stalled branch:
+  - `/tmp/b6X_laggedstress_s1_E250_kappa2x_gU5_rho1000_nx24_t1p425_restart_dt0p025_merged`
+  - global `RMSE = 43.51 um`,
+  - mean per-height `RMSE = 19.89 um`,
+  - max per-height `RMSE = 26.95 um`,
+  - global bias `= -22.10 um`,
+  - contour `RMSE(1.0 s) = 187.08 um`.
+- Direct late-window evidence is more decisive than the scalar:
+  - at `t = 1.40 s`,
+    - global `= -2.26 um`,
+    - `y167 = 79.59 um`,
+    - `y250 = 108.83 um`,
+    - `y333 = 72.34 um`;
+  - at `t = 1.425 s`,
+    - global `= -2.26 um`,
+    - `y167 = 88.33 um`,
+    - `y250 = 113.66 um`,
+    - `y333 = 75.83 um`.
+
+Interpretation:
+
+- `gamma_u = 5` improves the middle-height response but sharpens the same split
+  defect rather than fixing it:
+  the corrected global/toe collapses while the middle height overshoots.
+- Together with the `kappa_inv` and `E` probes, this is strong evidence that
+  the remaining Benchmark 6 gap is no longer a scalar-parameter problem inside
+  the current `lagged_stress` family.
+
+## 2026-03-12: pressure-only Poiseuille hybrid screen
+
+Implemented smallest new benchmark-local model change first:
+
+- file changed:
+  `examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py`
+- new control:
+  `--diffuse-normal-pressure-scale`
+- construction:
+  keep the existing Poiseuille tangential traction and add an independently
+  scaled lagged normal-pressure term `-p^n n` through the same diffuse traction
+  hook and the same IMEX ramp treatment.
+
+Shortest inert validation:
+
+- baseline-preserving check:
+  `/tmp/b6Y_pois_z100_pn0_E500_gU10_rho1000_nx24_t0p10`
+- result:
+  - accepted to `t = 0.10 s`,
+  - no solver regression when `normal_pressure_scale = 0`.
+
+Execution finding that matters for the experiment queue:
+
+- first-use kernel builds for different branches must not be launched in
+  parallel on the shared cache:
+  - parallel `0.10` and `0.25` screens hit
+    `ImportError: ... file too short` on the same JIT module,
+  - so new kernel signatures should be compiled sequentially.
+
+Corrected screen results on `poiseuille + normal pressure`:
+
+- `pressure_scale = 0.25`:
+  - out dir:
+    `/tmp/b6Z2_pois_z100_pn0p25_E500_gU10_rho1000_nx24_t1p0`
+  - corrected metrics:
+    - global `RMSE = 6.18 um`,
+    - mean per-height `RMSE = 11.36 um`,
+    - contour `RMSE(1.0 s) = 188.55 um`,
+  - `t = 1.0 s` fronts:
+    - global `19.16 um`,
+    - `y167 = 20.69 um`,
+    - `y250 = 22.46 um`,
+    - `y333 = 32.61 um`.
+- `pressure_scale = 0.10`:
+  - out dir:
+    `/tmp/b6Z1_pois_z100_pn0p10_E500_gU10_rho1000_nx24_t1p0`
+  - corrected metrics:
+    - global `RMSE = 6.10 um`,
+    - mean per-height `RMSE = 11.45 um`,
+    - contour `RMSE(1.0 s) = 187.59 um`,
+  - `t = 1.0 s` fronts:
+    - global `20.16 um`,
+    - `y167 = 20.62 um`,
+    - `y250 = 22.01 um`,
+    - `y333 = 30.88 um`.
+- matched baseline for comparison:
+  - `/tmp/b6_driver_E500_z100_gU10_rho1000_nx24_t2p0_obsfix`
+  - corrected `t <= 1.0 s` metrics:
+    - global `RMSE = 6.07 um`,
+    - mean per-height `RMSE = 11.51 um`,
+    - contour `RMSE(1.0 s) = 187.01 um`,
+  - `t = 1.0 s` fronts:
+    - global `20.77 um`,
+    - `y167 = 20.72 um`,
+    - `y250 = 21.90 um`,
+    - `y333 = 29.91 um`.
+
+Conclusion:
+
+- positive `--diffuse-normal-pressure-scale` in the tested range `[0.10, 0.25]`
+  is now bounded as a lower-bracket model tweak;
+- it moves the branch in the **wrong** direction for the remaining defect:
+  - corrected global/toe decreases slightly,
+  - middle and upper fronts increase slightly,
+  - contour mismatch stays pinned near the same bad floor.
+
+Most justified next model change:
+
+- replace the pressure-only add-on with a lagged **normal-stress** add-on,
+  i.e. the normal projection of the full lagged traction
+  `(-p^n I + 2 mu_f eps(v^n)) n`,
+  still combined with the Poiseuille tangential term;
+- that is the smallest follow-on change consistent with the current evidence:
+  - pressure-only was too weak and moved in the wrong direction,
+  - full lagged traction clearly changes the benchmark materially,
+  - the remaining need is independent control of tangential vs normal loading.
+
+## 2026-03-12: completed `normal_stress_scale` bracket on the corrected `E = 500`, `zeta = 100`, `gamma_u = 10`, `rho_f = 1000` branch
+
+Implemented the next smallest benchmark-local model change in
+`examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py`:
+
+- new helper:
+  `_lagged_diffuse_interface_normal_stress_traction(...)`,
+- new CLI control:
+  `--diffuse-normal-stress-scale`,
+- construction:
+  keep the paper's Poiseuille tangential proxy and add an independently scaled
+  lagged normal projection of the full fluid traction
+  `(-p^n I + 2 mu_f eps(v^n)) n_if`.
+
+Shortest inert regression check:
+
+- `/tmp/b6AA_pois_z100_pn0_ns0_E500_gU10_rho1000_nx24_t0p05`
+- result:
+  - accepted to `t = 0.05 s`,
+  - no numerical regression when both added normal controls are zero.
+
+Completed corrected `t = 1.0 s` screen results:
+
+- baseline reference:
+  `/tmp/b6_driver_E500_z100_gU10_rho1000_nx24_t2p0_obsfix/score_t1p0.json`
+  - global `RMSE = 6.07 um`,
+  - mean per-height `RMSE = 11.51 um`,
+  - contour `RMSE(1.0 s) = 187.01 um`,
+  - contour `max abs = 427.32 um`,
+  - screen score `= 0.82022`.
+- `normal_stress_scale = -0.25`:
+  `/tmp/b6AD_pois_z100_nsneg0p25_E500_gU10_rho1000_nx24_t1p0/score_t1p0.json`
+  - global `RMSE = 6.03 um`,
+  - mean per-height `RMSE = 11.59 um`,
+  - max per-height `RMSE = 20.87 um`,
+  - contour `RMSE(1.0 s) = 185.64 um`,
+  - contour `max abs = 420.85 um`,
+  - screen score `= 0.71627`.
+- `normal_stress_scale = -0.5`:
+  `/tmp/b6AC_pois_z100_nsneg0p5_E500_gU10_rho1000_nx24_t1p0/score_t1p0.json`
+  - global `RMSE = 6.05 um`,
+  - mean per-height `RMSE = 11.55 um`,
+  - max per-height `RMSE = 20.63 um`,
+  - contour `RMSE(1.0 s) = 184.38 um`,
+  - contour `max abs = 412.89 um`,
+  - screen score `= 0.71444`.
+- `normal_stress_scale = -1.0`:
+  `/tmp/b6AE_pois_z100_nsneg1p0_E500_gU10_rho1000_nx24_t1p0/score_t1p0.json`
+  - global `RMSE = 6.17 um`,
+  - mean per-height `RMSE = 11.69 um`,
+  - max per-height `RMSE = 20.16 um`,
+  - contour `RMSE(1.0 s) = 182.07 um`,
+  - contour `max abs = 395.35 um`,
+  - screen score `= 0.71594`.
+
+Solver behavior on the closed bracket:
+
+- all three completed normal-stress screens reached `t = 1.0 s`,
+- all accepted every step,
+- no dt cuts,
+- no LM/trust-region stagnation,
+- active sets remained nonempty, so the branch continued to use the robust PDAS
+  path rather than relying on unconstrained LM globalization.
+
+Interpretation:
+
+- this is the first model change after the observable correction that improves
+  the corrected contour floor materially without wrecking the corrected history;
+- contour improvement was monotone over the tested bracket
+  `-0.25 -> -0.5 -> -1.0`;
+- the dominant remaining calibration axis is therefore no longer `E` or
+  `gamma_u` alone, but the split between tangential Poiseuille loading and
+  lagged normal compression.
+
+Decision and next ranked batch:
+
+1. Promote `normal_stress_scale = -1.0` first to `t = 1.5 s`.
+   It gives the lowest contour RMSE and lowest contour max error in the closed
+   bracket while staying numerically clean.
+2. Fine-screen `normal_stress_scale = -1.25` at `t = 1.0 s`.
+3. Fine-screen `normal_stress_scale = -1.5` at `t = 1.0 s`.
+4. Only if the promoted branch remains uniformly low while contour keeps
+   improving, revisit the tangential amplitude with a small `zeta` increase
+   around the best normal-stress value instead of changing `E` or `gamma_u`
+   first.
+
+## 2026-03-12T19:39:24+01:00
+
+### Weighted normal-stress bracket and next late-window promotions
+
+Completed corrected `t = 1.0 s` screens with `--diffuse-normal-stress-xweight`:
+
+- `normal_stress_scale = -1.0`
+  - out dir:
+    `/tmp/b6AN_pois_z100_nsneg1p0_xw_E500_gU10_rho1000_nx24_t1p0`
+  - global `RMSE = 6.53 um`,
+  - mean per-height `RMSE = 10.98 um`,
+  - max per-height `RMSE = 19.36 um`,
+  - global bias `= +4.17 um`,
+  - contour `RMSE(1.0 s) = 184.09 um`,
+  - contour `max abs = 409.91 um`,
+  - screen score `= 0.72113`.
+- `normal_stress_scale = -1.25`
+  - out dir:
+    `/tmp/b6AO_pois_z100_nsneg1p25_xw_E500_gU10_rho1000_nx24_t1p0`
+  - global `RMSE = 6.81 um`,
+  - mean per-height `RMSE = 10.90 um`,
+  - max per-height `RMSE = 18.96 um`,
+  - global bias `= +4.68 um`,
+  - contour `RMSE(1.0 s) = 183.43 um`,
+  - contour `max abs = 403.92 um`,
+  - screen score `= 0.72572`.
+- `normal_stress_scale = -1.5`
+  - out dir:
+    `/tmp/b6AP_pois_z100_nsneg1p5_xw_E500_gU10_rho1000_nx24_t1p0`
+  - global `RMSE = 7.12 um`,
+  - mean per-height `RMSE = 10.83 um`,
+  - max per-height `RMSE = 18.57 um`,
+  - global bias `= +5.17 um`,
+  - contour `RMSE(1.0 s) = 182.79 um`,
+  - contour `max abs = 396.94 um`,
+  - screen score `= 0.73107`.
+
+Interpretation:
+
+- the orientation weighting does not win on the short scalar screen score;
+- it does, however, produce the first branch family that nearly preserves the
+  unweighted contour gain while clearly improving the corrected per-height
+  history balance;
+- that is exactly the direction needed for the remaining Benchmark 6 failure,
+  which is late-window underdrive rather than early-window instability.
+
+Evidence-based ranking after the weighted screen:
+
+1. Promote weighted `normal_stress_scale = -1.5` to `t = 1.5 s`.
+   Reason:
+   it is nearly tied with the best unweighted contour point while improving
+   both mean and worst per-height RMSE.
+2. Promote weighted `normal_stress_scale = -1.25` to `t = 1.5 s`.
+   Reason:
+   it brackets the same trend with slightly weaker contour gain and slightly
+   smaller history overshoot.
+3. Keep unweighted `normal_stress_scale = -1.0` as the contour-only fallback.
+4. Do not reopen `zeta`, `E`, or `kappa_inv` yet.
+   Reason:
+   the latest direct evidence says those directions are either harmful
+   (`zeta`, `kappa2x`) or nearly inert (`E = 350`) compared with the current
+   loading-shape split.
+
+## 2026-03-12T20:10:37+01:00
+
+### Failure/stall split on the first weighted `t = 1.5 s` promotions
+
+- weighted `normal_stress_scale = -1.5`
+  - out dir:
+    `/tmp/b6AR_pois_z100_nsneg1p5_xw_E500_gU10_rho1000_nx24_t1p5`
+  - reached `t = 1.05 s`,
+  - failed at step `22`,
+  - direct evidence:
+    - `nNewton = 12`,
+    - `|G|_inf = 4.73e-06`,
+    - no KSP failure,
+    - no NaNs,
+    - dominant residual block was momentum / pressure.
+- weighted `normal_stress_scale = -1.25`
+  - out dir:
+    `/tmp/b6AQ_pois_z100_nsneg1p25_xw_E500_gU10_rho1000_nx24_t1p5`
+  - advanced to `t = 0.90 s`,
+  - then stopped producing accepted steps for more than `30 minutes`,
+  - `gdb` stack showed the live process in PETSc `MatSetValues_SeqAIJ` with
+    OpenMP workers at a barrier, so this branch became impractically expensive
+    in late assembly rather than returning to the original LM stall.
+
+Interpretation:
+
+- the weighted stronger-scale family is physically promising but numerically
+  expensive in the late window;
+- the immediate blocker is no longer early globalization but late-step support
+  on the momentum/pressure block and overall cost of the stronger branches.
+
+Evidence-driven replacement batch:
+
+1. Promote weighted `normal_stress_scale = -1.0` to `t = 1.5 s`.
+   Reason:
+   this is the least stiff weighted branch and therefore the best chance of
+   preserving the improved per-height balance while actually reaching the late
+   observation window on the current support stack.
+2. Restart weighted `normal_stress_scale = -1.5` from the last accepted
+   checkpoint with `max_it = 16` only through `t = 1.15 s`.
+   Reason:
+   this is the shortest meaningful solver validation for the specific failure
+   mode that was observed at `t = 1.05 s`.
+
+## 2026-03-12T20:36:47+01:00
+
+### Weighted `xweight` family is no longer the leading physics path
+
+Completed late-window evidence:
+
+- weighted `normal_stress_scale = -1.0`, `xweight`
+  - out dir:
+    `/tmp/b6AU_pois_z100_nsneg1p0_xw_E500_gU10_rho1000_nx24_t1p5`
+  - failed at `t = 1.35 s`,
+  - partial corrected score over `t <= 1.35 s`:
+    - global `RMSE = 52.90 um`,
+    - mean per-height `RMSE = 86.83 um`,
+    - max per-height `RMSE = 103.54 um`,
+    - global bias `= +46.57 um`.
+- unweighted `normal_stress_scale = -1.0` reference on the same late window:
+  - `/tmp/b6AH_pois_z100_nsneg1p0_E500_gU10_rho1000_nx24_t1p5/score_t1p35.json`
+  - global `RMSE = 22.07 um`,
+  - mean per-height `RMSE = 16.70 um`,
+  - max per-height `RMSE = 21.50 um`,
+  - global bias `= -5.29 um`.
+
+Conclusion:
+
+- the weighted branch does not merely fail later numerically;
+- it also overshoots the corrected late-window histories badly, so more solver
+  effort on the current `xweight` formulation is not justified.
+
+Support-test result for the stronger weighted branch:
+
+- restarting `normal_stress_scale = -1.5`, `xweight` with `max_it = 16`
+  pushed the failure point from `t = 1.05 s` to `t = 1.25 s`,
+  which proves the old failure had a support-budget component;
+- but the branch still fails before `t = 1.5 s`, so that support change alone
+  is not enough to make it viable for the paper.
+
+Most justified next model change:
+
+- use `solid_visco_eta` as the next calibration axis;
+- rationale:
+  - prior investigation already identified Kelvin–Voigt viscosity as a strong
+    time-scale control,
+  - the current weighted failures are skeleton/slip dominated,
+  - and a moderate `eta_s` could slow the late overshoot without changing the
+    load shape again.
+
+Next batch:
+
+1. weighted `normal_stress_scale = -1.0`, `xweight`, `solid_visco_eta = 500`,
+   `t_final = 1.25 s`.
+2. weighted `normal_stress_scale = -1.0`, `xweight`, `solid_visco_eta = 1000`,
+   `t_final = 1.25 s`.
+
+## 2026-03-12T20:58:26+01:00
+
+### Closed `eta_s` check on the weighted family
+
+- `/tmp/b6AW_pois_z100_nsneg1p0_xw_eta500_E500_gU10_rho1000_nx24_t1p25`
+  - global `RMSE = 14.18 um`,
+  - mean per-height `RMSE = 21.63 um`,
+  - max per-height `RMSE = 26.61 um`,
+  - global bias `= -9.52 um`,
+  - no contour metric because snapshots were not requested.
+- `/tmp/b6AX_pois_z100_nsneg1p0_xw_eta1000_E500_gU10_rho1000_nx24_t1p25`
+  - global `RMSE = 15.67 um`,
+  - mean per-height `RMSE = 22.87 um`,
+  - max per-height `RMSE = 27.94 um`,
+  - global bias `= -10.82 um`,
+  - no contour metric because snapshots were not requested.
+- unweighted late-window reference:
+  `/tmp/b6AH_pois_z100_nsneg1p0_E500_gU10_rho1000_nx24_t1p5/score_t1p25.json`
+  - global `RMSE = 6.35 um`,
+  - mean per-height `RMSE = 11.44 um`,
+  - max per-height `RMSE = 18.54 um`,
+  - global bias `= +1.58 um`,
+  - contour `RMSE(1.0 s) = 182.07 um`.
+
+Conclusion:
+
+- Kelvin-Voigt damping repaired robustness on the weighted branch, but it did
+  not repair the science;
+- the weighted `|n_x|` family is now closed as a publishable direction.
+
+### Smallest justified next model change
+
+The remaining defect is now most consistent with a *load-shape* error rather
+than a support-budget or pure amplitude error:
+
+- the best unweighted `normal_stress_scale = -1.0` branch already has strong
+  corrected history through `t <= 1.25 s`,
+- but the contour floor stays around `182 um`,
+- while the symmetric `|n_x|` weighting shows that localization matters but
+  still redistributes the load in the wrong way late in time.
+
+The minimal credible follow-up is therefore:
+
+- add an upstream-only weighting for the extra lagged normal-stress term,
+  i.e. weight by `max(n_x, 0)` instead of `|n_x|`,
+- keep the existing corrected observable path and solver stack unchanged,
+- and screen this new load shape against the same unweighted reference before
+  reopening broader `E / gamma_u / rho_f` sweeps.
+
+Ranked first batch with the new load shape:
+
+1. upstream-only normal stress, `normal_stress_scale = -1.0`,
+   `diffuse_shear_scale = 100`, `gamma_u = 10`, `t_final = 1.25 s`,
+   `--snapshot-times 1.0`.
+2. upstream-only normal stress, `normal_stress_scale = -1.25`, same otherwise.
+3. Promote only the better short-screen branch to `t_final = 1.5 s` with
+   `--snapshot-times 1.0,1.5`.
+
+### Live checkpoint on the first upstream-only canary
+
+Active run:
+
+- `/tmp/b6AY_pois_z100_nsneg1p0_upwind_E500_gU10_rho1000_nx24_t1p25`
+
+Observed behavior before the quiet late-step phase:
+
+- accepted every step through `t = 0.90 s`,
+- no KSP failures,
+- no NaNs,
+- no dt reduction,
+- Newton counts increased only gradually:
+  - `2` through `t = 0.40 s`,
+  - `3` through `t = 0.65 s`,
+  - `4` through `t = 0.90 s`.
+
+Current diagnostic evidence after `t = 0.90 s`:
+
+- `timeseries.csv` and `checkpoint_latest.npz` are frozen at the `0.90 s`
+  accepted state,
+- the live child process remains CPU-active,
+- `top -H` shows one hot thread while the OpenMP workers sleep,
+- `gdb` on the hot thread shows
+  `MatSetValues_SeqAIJ -> MatSetValues -> petsc4py setValuesCSR`.
+
+Interpretation:
+
+- the new upstream-only load shape is solver-healthy through the early/mid
+  window,
+- but it is currently hitting the same PETSc matrix-assembly hotspot that made
+  earlier late-window screens practically expensive,
+- so this branch is promising scientifically but not yet proven practical.
+
+## 2026-03-12T21:20:26+01:00
+
+### Upstream-only canary stopped as a practical casualty
+
+Stopped branch:
+
+- `/tmp/b6AY_pois_z100_nsneg1p0_upwind_E500_gU10_rho1000_nx24_t1p25`
+
+Evidence at stop:
+
+- last accepted time remained `t = 0.90 s`,
+- the run then spent more than `13 minutes` with no new accepted step on a
+  short `t = 1.25 s` screen,
+- `gdb` showed the hot thread in
+  `MatSetValues_SeqAIJ -> MatSetValues -> petsc4py setValuesCSR`,
+- the child process remained CPU-active throughout, so this was another
+  practical PETSc assembly-cost casualty rather than the old LM stall.
+
+Conclusion:
+
+- the upstream-only load shape may still be a scientifically relevant idea,
+  but it is not a practical short-screen path in the current implementation.
+
+### Next practical batch
+
+Return to the practical unweighted family and vary the smallest coupled
+parameter set that can plausibly improve the remaining late-window mismatch:
+
+1. unweighted `normal_stress_scale = -1.25`, `gamma_u = 12.5`,
+   `t_final = 1.25 s`, `--snapshot-times 1.0`.
+2. unweighted `normal_stress_scale = -1.0`, `gamma_u = 12.5`,
+   `t_final = 1.25 s`, `--snapshot-times 1.0`.
+
+Reasoning:
+
+- `normal_stress_scale = -1.25` preserved the best contour trend in the
+  practical unweighted bracket,
+- `gamma_u` is the smallest supported parameter that directly targets the
+  late-window extension mismatch,
+- and both branches stay on the already practical unweighted assembly path.
+
+### Live checkpoint on the first practical coupled branch
+
+Active run:
+
+- `/tmp/b6AZ_pois_z100_nsneg1p25_gU12p5_rho1000_nx24_t1p25`
+
+Observed behavior so far:
+
+- accepted every step through `t = 0.95 s`,
+- no KSP failures,
+- no NaNs,
+- no dt reductions,
+- Newton counts remained practical:
+  - `2` through `t = 0.40 s`,
+  - `3` through `t = 0.80 s`,
+  - `6` at `t = 0.85 s`,
+  - `4` at `t = 0.90 / 0.95 s`.
+
+Current late-step state:
+
+- `timeseries.csv` and `checkpoint_latest.npz` are frozen at the accepted
+  `0.95 s` state,
+- the process remains CPU-active,
+- `gdb` on the hot thread currently shows PETSc memory-management work
+  (`PetscFreeAlign -> PetscFreeA -> libc free -> ucm_munmap`),
+  not the earlier `MatSetValues_SeqAIJ` insertion stack from the upstream-only
+  casualty.
+
+Interpretation:
+
+- this branch is the strongest practical calibration candidate from the resumed
+  session so far,
+- but late-step PETSc work near the `1.0 s` window is still the practical
+  blocker that must be monitored while the branch continues.
+
+## 2026-03-13T08:13:25+01:00
+
+### Closed practical coupled branch `b6AZ`
+
+Branch:
+
+- `/tmp/b6AZ_pois_z100_nsneg1p25_gU12p5_rho1000_nx24_t1p25`
+
+Observed final behavior:
+
+- the run eventually advanced well beyond the last live `0.95 s` checkpoint:
+  - accepted `t = 1.00 s` at step `20` with `nNewton = 8`,
+  - accepted `t = 1.05 s` at step `21` with `nNewton = 5`,
+  - accepted `t = 1.10 s` at step `22` with `nNewton = 6`,
+- then failed at step `23` on the `t = 1.10 -> 1.15 s` advance,
+- first failure mode:
+  `Line search failed: no semismooth residual decrease`,
+- retry with predictor `prev` still ended with
+  `RuntimeError: VI Newton did not converge`.
+
+Failure evidence from the recorded session output:
+
+- dominant failed momentum terms:
+  - `pressure = 1.30e-02`,
+  - `traction = 2.20e-03`,
+  - `drag = 2.05e-03`,
+  - `convection = 1.28e-03`,
+  - `viscous = 8.98e-04`,
+  - `gamma_div = 2.33e-04`;
+- failed slip mismatch:
+  - `|v-vS|_inf = 4.96e-01`,
+  - `|v-vS|_2 = 8.21e+00`.
+
+Scientific score on the corrected `t <= 1.0 s` screen:
+
+- output:
+  `/tmp/b6AZ_pois_z100_nsneg1p25_gU12p5_rho1000_nx24_t1p25/score_t1p0.json`
+- metrics:
+  - global `RMSE = 36.93 um`,
+  - mean per-height `RMSE = 37.38 um`,
+  - max per-height `RMSE = 54.94 um`,
+  - global bias `= +32.82 um`,
+  - contour `RMSE(1.0 s) = 243.53 um`.
+
+Verdict:
+
+- `b6AZ` is materially worse than the current best practical branch
+  `/tmp/b6AH_pois_z100_nsneg1p0_E500_gU10_rho1000_nx24_t1p5`,
+- it should not be promoted or reopened.
+
+### Updated diagnosis
+
+The main blocker has shifted again:
+
+1. LM stability is fixed and is no longer the dominant issue.
+2. The best practical unweighted branch has strong corrected history through
+   `t <= 1.25 s`, but still sits at a contour floor around `182 um`.
+3. The only model change that still looks scientifically worth a closer look is
+   the upstream-only normal-stress localization, but that path previously froze
+   after the accepted `t = 0.90 s` checkpoint with the hot thread in
+   `MatSetValues_SeqAIJ -> MatSetValues -> petsc4py setValuesCSR`.
+4. Therefore the highest-value unresolved question is whether that
+   upstream-only branch is actually promising and only masked by a
+   thread-sensitive PETSc assembly/runtime pathology near the `1.0 s` window.
+
+### Ranked next step
+
+1. Restart the upstream-only canary from its last accepted checkpoint using
+   `OMP_NUM_THREADS=1`, target only `t = 1.0 s`, and write the mandatory
+   `1.0 s` contour snapshot.
+   - restart source:
+     `/tmp/b6AY_pois_z100_nsneg1p0_upwind_E500_gU10_rho1000_nx24_t1p25/restart/checkpoint_step=00018.npz`
+   - new output:
+     `/tmp/b6BA_restart_nsneg1p0_upwind_omp1_E500_gU10_rho1000_nx24_t1p0`
+2. If that restart still stalls or scores poorly, fall back to the smallest
+   practical damping screen on the current best unweighted branch:
+   `solid_visco_eta = 100` then `200`, with
+   `normal_stress_scale = -1.0`, `t_final = 1.25 s`, and `--snapshot-times 1.0`.
+
+## 2026-03-13T08:28:00+01:00
+
+### `b6AY` runtime-mitigation restart: practical issue resolved, science rejected
+
+Restarted branch:
+
+- source checkpoint:
+  `/tmp/b6AY_pois_z100_nsneg1p0_upwind_E500_gU10_rho1000_nx24_t1p25/restart/checkpoint_step=00018.npz`
+- restarted output:
+  `/tmp/b6BA_restart_nsneg1p0_upwind_omp1_E500_gU10_rho1000_nx24_t1p0`
+
+What changed:
+
+- only the runtime environment:
+  `OMP_NUM_THREADS=1` with the same direct-LU, corrected-observable,
+  upstream-only normal-stress branch otherwise unchanged.
+
+Observed solver behavior:
+
+- accepted `t = 0.95 s` in `6` Newton iterations with `|G|_∞ = 4.739e-07`,
+- accepted `t = 1.00 s` in `5` Newton iterations with `|G|_∞ = 2.090e-10`,
+- no PETSc matrix-insertion freeze,
+- no dt reduction,
+- no KSP failure.
+
+Conclusion on the practical side:
+
+- the previous `b6AY` stoppage was a runtime/assembly pathology, not an LM
+  stability problem.
+
+### Corrected score of the merged full `0 <= t <= 1.0 s` branch
+
+To make the score comparable, the original `0.0-0.90 s` history was merged with
+the restarted `0.90-1.00 s` tail into:
+
+- `/tmp/b6BA_restart_nsneg1p0_upwind_omp1_E500_gU10_rho1000_nx24_t1p0_merged`
+
+Corrected metrics:
+
+- global `RMSE = 44.57 um`,
+- mean per-height `RMSE = 50.13 um`,
+- max per-height `RMSE = 69.15 um`,
+- global bias `= +40.41 um`,
+- contour `RMSE(1.0 s) = 259.43 um`.
+
+Comparison:
+
+- current best practical reference `b6AH` remains far better on the same screen:
+  - global `RMSE = 6.17 um`,
+  - mean per-height `RMSE = 11.69 um`,
+  - contour `RMSE(1.0 s) = 182.07 um`.
+
+Verdict:
+
+- upstream-only normal-stress localization is no longer an active candidate;
+- it is scientifically worse than the current best practical branch even after
+  removing the late-step runtime artifact.
+
+### Next ranked branch
+
+Return to the current best practical unweighted family and test the smallest
+damping bracket that could improve the late window without changing the basic
+load shape:
+
+1. `normal_stress_scale = -1.0`, `solid_visco_eta = 100`, `t_final = 1.25 s`,
+   `--snapshot-times 1.0`.
+2. If needed, repeat with `solid_visco_eta = 200`.
+
+## 2026-03-13T08:41:00+01:00
+
+### `solid_visco_eta = 100` is scientifically relevant
+
+Branch:
+
+- `/tmp/b6BB_pois_z100_nsneg1p0_eta100_E500_gU10_rho1000_nx24_t1p25`
+
+Observed run behavior:
+
+- reached `t = 1.25 s` cleanly,
+- accepted every step,
+- no dt cut,
+- no KSP issue,
+- practical Newton counts throughout:
+  - `2` through `t = 0.40 s`,
+  - `3` for most of the screen,
+  - `4` only on the last two steps.
+
+Corrected `t <= 1.25 s` metrics:
+
+- global `RMSE = 7.59 um`,
+- mean per-height `RMSE = 15.79 um`,
+- max per-height `RMSE = 21.08 um`,
+- global bias `= -3.39 um`,
+- contour `RMSE(1.0 s) = 174.80 um`,
+- screen score `= 0.7842`.
+
+Why this matters:
+
+- compared to the current best practical branch `b6AH`,
+  the contour improved from `182.07 um` to `174.80 um`,
+- and the branch stayed fully practical,
+- but the history weakened enough that the overall screen score is still
+  slightly worse than `b6AH`.
+
+Updated interpretation:
+
+- Kelvin-Voigt damping is now the first post-stability physics axis that
+  improves the corrected contour without creating a practical runtime problem;
+- the improvement is not yet enough for paper-readiness, but it is strong
+  enough to justify bracketing with `solid_visco_eta = 200`.
+
+### Next run
+
+1. same branch template with `solid_visco_eta = 200`.
+2. If that continues the contour improvement while keeping history inside the
+   short-screen gate, promote the better damping level to the next longer
+   screen with `1.0 / 1.5 / 2.0 s` snapshots.
+
+## 2026-03-13T08:55:00+01:00
+
+### `solid_visco_eta = 200` keeps the damping axis alive
+
+Branch:
+
+- `/tmp/b6BC_pois_z100_nsneg1p0_eta200_E500_gU10_rho1000_nx24_t1p25`
+
+Observed run behavior:
+
+- reached `t = 1.25 s` cleanly,
+- accepted every step,
+- no dt cut,
+- no KSP issue,
+- essentially the same practical Newton pattern as `eta = 100`.
+
+Corrected `t <= 1.25 s` metrics:
+
+- global `RMSE = 11.15 um`,
+- mean per-height `RMSE = 19.11 um`,
+- max per-height `RMSE = 24.01 um`,
+- global bias `= -6.82 um`,
+- contour `RMSE(1.0 s) = 170.73 um`,
+- screen score `= 0.9027`.
+
+Interpretation:
+
+- the contour improved again compared with `eta = 100`
+  (`170.73 um` vs `174.80 um`),
+- while the history weakened further,
+- but the branch still passes the short history gate.
+
+Decision:
+
+- promote `eta = 200` to a full `t = 2.0 s` corrected screen with
+  snapshots at `1.0 / 1.5 / 2.0 s`;
+- the next question is now whether this damping level fixes the late-window
+  deterioration that made `b6AH` non-promotable on the corrected full window.
+
+## 2026-03-13T09:15:00+01:00
+
+### Smallest credible code change after the late-step PETSc diagnosis
+
+Changed file:
+
+- `examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py`
+
+Change:
+
+- exposed the already-implemented `LinearSolverParameters.backend` choice as
+  `--linear-backend {petsc,scipy}` for the internal Newton/PDAS path.
+
+Why this was justified:
+
+- on the late `eta = 200` branch, both the full run and the `OMP=1` restart
+  became practically blocked around `t = 1.75 -> 1.80 s`,
+- `gdb` repeatedly showed the main thread in
+  `MatSetValues_SeqAIJ -> MatSetValues`,
+- and the interrupted PETSc-path run reported a single solve cost of about
+  `4.81e+02 s` inside the hard step.
+
+### What the SciPy backend fixed
+
+Hard-step validation:
+
+- restart branch:
+  `/tmp/b6BG_restart_eta200_scipy_E500_gU10_rho1000_nx24_t1p8`
+- same checkpoint and physics as the blocked PETSc run, but with
+  `--linear-backend scipy`.
+
+Observed result:
+
+- the previously blocked `t = 1.75 -> 1.80 s` step now accepted in `4`
+  Newton iterations,
+- the expensive solve dropped to about `3.83e+01 s`,
+- the branch no longer died in the PETSc AIJ upload path.
+
+Interpretation:
+
+- this is a real solver/backend fix,
+- but it only removes the practical PETSc-path bottleneck;
+- it does not automatically make the branch scientifically correct.
+
+### Full-window result for the best short-screen contour branch
+
+Merged branch:
+
+- `/tmp/b6BJ_eta200_scipy_merged_t2p0`
+
+Source pieces:
+
+- `/tmp/b6BD_pois_z100_nsneg1p0_eta200_E500_gU10_rho1000_nx24_t2p0`
+- `/tmp/b6BG_restart_eta200_scipy_E500_gU10_rho1000_nx24_t1p8`
+- `/tmp/b6BI_restart_eta200_scipy_E500_gU10_rho1000_nx24_t2p0`
+
+Corrected full-window metrics:
+
+- history:
+  - global `RMSE = 42.03 um`,
+  - mean per-height `RMSE = 40.71 um`,
+  - max per-height `RMSE = 42.08 um`;
+- contours:
+  - `RMSE(1.0 s) = 170.73 um`,
+  - `RMSE(1.5 s) = 150.27 um`,
+  - `RMSE(2.0 s) = 293.27 um`,
+  - mean `RMSE = 204.76 um`;
+- dynamic-08 scalar:
+  - `front_compression_2p0_um = 227.89`.
+
+Verdict:
+
+- full-window `eta = 200` is not publishable;
+- it overshoots the 2 s compression badly and fails both the history and
+  contour paper gates.
+
+### Full-window result for the better short-screen tradeoff branch
+
+Continuation branch:
+
+- `/tmp/b6BK_restart_eta100_scipy_E500_gU10_rho1000_nx24_t2p0`
+
+Observed behavior before stop:
+
+- advanced cleanly through `t = 1.70 s`,
+- then on `t = 1.70 -> 1.75 s` hit
+  `Newton failed at step 35 with dt=5.000e-02: Line search failed: no semismooth residual decrease.`,
+- the built-in retry path remained expensive and was still inside hard
+  late-window work when stopped.
+
+Interpretation:
+
+- `eta = 100` remains the better short-screen science tradeoff,
+- but it is still not a stable/practical full-window paper branch.
+
+### Updated scientific conclusion
+
+At this checkpoint:
+
+1. the original LM iteration-1/2 stall is fixed;
+2. the late-step PETSc upload bottleneck has a concrete workaround
+   (`--linear-backend scipy`);
+3. after using that workaround, the current damped `poiseuille + normal_stress`
+   family still does not produce a publishable Benchmark 6 result;
+4. the remaining blocker is now the model trajectory itself, not only solver
+   robustness.
+
+## 2026-03-13: next model-side hypothesis after the damping family
+
+No Benchmark 6 process is currently alive. The stopped continuation
+`/tmp/b6BK_restart_eta100_scipy_E500_gU10_rho1000_nx24_t2p0` leaves the best
+remaining practical clue: the milder damped branch is scientifically better
+than `eta = 200` through `t <= 1.25 s`, reaches `t = 1.70 s`, and then falls
+into hard late Newton work rather than the extreme `2.0 s` over-compression
+seen on the stronger branch.
+
+That points to a specific model-side defect, not another generic solver issue:
+
+- the extra lagged normal-stress correction is useful early,
+- but its persistence into the late ramp window appears too strong,
+- so the next justified change is to make the *added* normal-stress correction
+  transient rather than static.
+
+First ranked hypothesis for the next batch:
+
+1. add a time-localized decay envelope to the added diffuse normal-stress term,
+   starting from the better short-screen family
+   `normal_stress_scale = -1.0`, `solid_visco_eta = 100`;
+2. only if that becomes under-driven, repeat the same transient envelope on the
+   stronger `eta = 200` branch.
+
+Decision rule for the first transient branch:
+
+- shortest meaningful validation is `t_final = 1.5 s` with corrected scoring on
+  `t ∈ [0.5, 1.5] s` and contour times `1.0,1.5 s`;
+- promote only if the branch stays numerically clean and improves the
+  late-window history/contour tradeoff relative to `b6BB` and `b6BC`.
+
+## 2026-03-13: transient normal-stress probe exposed a provenance gap
+
+First deeper model-side probe:
+
+- `/tmp/b6BL_pois_z100_nsneg1p0_eta100_decay1p0_2p0_tail0p5_E500_gU10_rho1000_nx24_t1p5`
+
+What changed:
+
+- keep `normal_stress_scale = -1.0`, `solid_visco_eta = 100`,
+- apply a cosine decay only to the added normal-stress correction:
+  - start `1.0 s`,
+  - end `2.0 s`,
+  - tail factor `0.5`.
+
+Observed result:
+
+- numerically clean to `t = 1.5 s`,
+- but histories were badly under-driven:
+  - global `RMSE = 47.94 um`,
+  - mean per-height `RMSE = 50.43 um`,
+  - global bias `= -31.24 um`;
+- contours improved relative to the weak current exact-command branch:
+  - `RMSE(1.0 s) = 166.53 um`,
+  - `RMSE(1.5 s) = 130.21 um`.
+
+Why this did **not** immediately validate or reject the model idea:
+
+- a constant-load control on the same current exact command
+  (`/tmp/b6BM_pois_z100_nsneg1p0_eta100_control_curcode_E500_gU10_rho1000_nx24_t1p0`)
+  produced the same tiny `t = 1.0 s` fronts as the transient branch,
+  so the early under-drive is not caused by the decay envelope itself;
+- `OMP = 1` reproduced the same early Newton pattern, so this is not a
+  threading artifact;
+- shorter-ramp controls (`t_ramp = 0.5`, then `0.2`) moved toward the archived
+  damping behavior, which strongly suggests that the archived `b6BB` / `b6BC`
+  rows were produced under undocumented launch conditions and cannot be used as
+  trustworthy paper-ramp references.
+
+Updated scientific decision:
+
+- stop using `b6BB` / `b6BC` as source-of-truth anchors for future model-side
+  calibration;
+- add exact launch metadata logging for all future Benchmark 6 runs;
+- re-anchor the next model-side branch on a reproducible paper-ramp baseline
+  whose exact command is recorded at launch.
+
+The re-anchoring step is now completed:
+
+- exact-command baseline:
+  `/tmp/b6BR_pois_z100_baseline_exactcmd_E500_gU10_rho1000_nx24_t1p0`
+- archived baseline:
+  `/tmp/b6_driver_E500_z100_gU10_rho1000_nx24_t2p0_obsfix`
+
+At `t = 1.0 s`, the fronts match to roundoff:
+
+- exact-command:
+  `20.79 / 20.74 / 21.90 / 29.91 um`
+  for `global / y167 / y250 / y333`;
+- archived baseline:
+  `20.77 / 20.72 / 21.90 / 29.91 um`.
+
+So the campaign now has a trustworthy exact-command paper-ramp baseline, and
+future model-side probes should be judged only relative to that exact family.
+
+## 2026-03-13: exact-command re-anchor now rules out the fast normal-stress ramp
+
+Quantified corrected `t ∈ [0.5, 1.0] s` screens:
+
+- exact-command baseline
+  `/tmp/b6BR_pois_z100_baseline_exactcmd_E500_gU10_rho1000_nx24_t1p0`
+  gives:
+  - global `RMSE = 6.06 um`,
+  - mean per-height `RMSE = 11.50 um`,
+  - max per-height `RMSE = 21.05 um`,
+  - contour `RMSE(1.0 s) = 187.01 um`;
+- exact-command `normal_stress = -1.0`
+  `/tmp/b6BS_pois_z100_nsneg1p0_exactcmd_E500_gU10_rho1000_nx24_t1p5`
+  gives:
+  - global `RMSE = 6.17 um`,
+  - mean per-height `RMSE = 11.69 um`,
+  - max per-height `RMSE = 20.16 um`,
+  - contour `RMSE(1.0 s) = 182.07 um`.
+
+So the exact-command `normal_stress = -1.0` family is real, but only a modest
+screen improvement over the paper-ramp baseline.
+
+Aggressive early-loading branch:
+
+- `/tmp/b6BT_pois_z100_nsneg1p0_nsramp0p5_exactcmd_E500_gU10_rho1000_nx24_t1p5`
+
+Observed result:
+
+- accepted through `t = 1.0 s`, then failed at `t = 1.0 -> 1.05 s` with
+  `VI Newton did not converge – adjust tolerances/Δt or verify Jacobian.`
+- corrected `t ∈ [0.5, 1.0] s` metrics:
+  - global `RMSE = 7.88 um`,
+  - mean per-height `RMSE = 21.01 um`,
+  - max per-height `RMSE = 30.36 um`,
+  - contour `RMSE(1.0 s) = 187.24 um`.
+
+At `t = 1.0 s`, the exact fronts are:
+
+- experiment:
+  `34.59 / 31.45 / 39.31 / 36.16 um`
+  for `global / y150 / y250 / y350`;
+- exact baseline:
+  `20.79 / 20.74 / 21.90 / 29.91 um`;
+- exact `normal_stress = -1.0`:
+  `25.26 / 23.82 / 43.26 / 23.33 um`;
+- fast-ramp branch:
+  `26.80 / 24.84 / 54.59 / 46.10 um`.
+
+Conclusion:
+
+- the dedicated `0.5 s` normal-stress ramp is not the right continuation;
+- it pushes the mid/upper response too hard, does not lower the contour floor,
+  and becomes numerically fragile at the first contour checkpoint.
+
+Updated highest-value next family:
+
+1. split the benchmark-local loading more physically:
+   - top-weight the Poiseuille tangential proxy by `|n_y|`, so the channel
+     shear transfer acts mainly on the top-facing contour;
+   - localize any added lagged normal-pressure term to the streamwise/upstream
+     face instead of the whole interface;
+2. only if that remains too weak, try the same split with the lagged
+   normal-stress correction rather than the pressure-only correction.
+
+## 2026-03-13: sharper-interface exact-command batch
+
+The current exact-command control with `normal_stress = -1.0` and the default
+zeta-scaled interface thickness had a persistent contour floor near
+`182 um` at `t = 1.0 s`. The next hypothesis was that the benchmark-local load
+family was already directionally correct, but the diffuse interface was too
+wide to recover the contour geometry.
+
+Observed results:
+
+- removing `--scale-alpha-ch-eps-with-zeta` while keeping
+  `alpha_ch_eps = 2e-5`, `zeta = 100`, `normal_stress = -1.0` produced a real
+  first-checkpoint gain:
+  - `/tmp/b6CU_pois_z100_nsneg1p0_noepsscale_E500_gU10_rho1000_nx24_t1p0`
+  - contour `RMSE(1.0 s) = 176.75 um`,
+  - screen score `= 0.71155`.
+- sharpening further to `alpha_ch_eps = 1e-5` did **not** improve the
+  corrected score:
+  - PETSc version stalled around `t = 0.65 s`,
+  - `gdb` showed the main thread in
+    `MatSetValues_SeqAIJ -> MatSetValues`,
+  - SciPy rescue `/tmp/b6CW_pois_z100_nsneg1p0_eps1e5_scipy_E500_gU10_rho1000_nx24_t1p0`
+    finished but only gave contour `RMSE(1.0 s) = 176.87 um`.
+- promoting the `2e-5` sharper-interface branch to `t = 1.5 s` showed the
+  key tradeoff clearly:
+  - `/tmp/b6CX_pois_z100_nsneg1p0_noepsscale_E500_gU10_rho1000_nx24_t1p5`
+  - contour mean `RMSE(1.0/1.5 s) = 163.00 um`,
+  - but history mean per-height `RMSE = 27.28 um`,
+  - so the sharper interface improved geometry while under-driving the late
+    displacement histories.
+
+That led to a targeted recovery step instead of more blind sharpening:
+
+- uniform load-up (`zeta = 105`) on the sharper-interface branch was nearly
+  neutral:
+  - `/tmp/b6CY_pois_z105_nsneg1p0_noepsscale_E500_gU10_rho1000_nx24_t1p0`
+  - contour `RMSE(1.0 s) = 176.72 um`,
+  - screen score `= 0.71228`.
+- a slightly stronger lagged normal-stress term on the same sharper interface
+  was directionally better:
+  - short screen:
+    `/tmp/b6CZ_pois_z100_nsneg1p25_noepsscale_E500_gU10_rho1000_nx24_t1p0`
+    with contour `RMSE(1.0 s) = 176.44 um`,
+    score `= 0.71068`;
+  - promoted screen:
+    `/tmp/b6D0_pois_z100_nsneg1p25_noepsscale_E500_gU10_rho1000_nx24_t1p5`
+    with contour mean `RMSE = 162.55 um` and late history
+    mean per-height `RMSE = 26.57 um`.
+
+Scientific interpretation:
+
+- The sharper-interface hypothesis is now supported by code and data:
+  `alpha_ch_eps_eff = 2e-5` is better than the prior `8e-5` effective value.
+- The remaining gap is no longer “contour only” or “solver only”.
+  The active best frontier is now:
+  - improved contour geometry from the sharper interface,
+  - but still under-driven late histories.
+- The next justified step is to stay on that frontier and continue along the
+  late-compression axis (`normal_stress`) before trying another family.

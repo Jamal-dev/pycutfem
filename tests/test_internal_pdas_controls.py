@@ -249,3 +249,23 @@ def test_internal_pdas_unconstrained_lm_solves_scalar_constrained_root() -> None
     assert n_iters <= 8
     assert np.allclose(np.asarray(u_k.nodal_values, dtype=float), 0.5, atol=1.0e-8)
     assert np.all((np.asarray(u_k.nodal_values, dtype=float) >= 0.0) & (np.asarray(u_k.nodal_values, dtype=float) <= 1.0))
+
+
+def test_internal_pdas_reports_small_semismooth_residual_with_nonzero_raw_residual_on_active_bounds() -> None:
+    solver = _build_scalar_vi_solver(
+        vi_params=VIParameters(c=2.0, enter_tol=0.0, leave_tol=0.0)
+    )
+    lo_red, hi_red = solver._bounds_reduced()
+    x_red = lo_red.copy()
+    R_red = np.full(x_red.shape, 0.25, dtype=float)
+
+    G_red, act_lo, act_hi = solver._pdas_residual_and_sets(x_red, R_red, lo_red, hi_red)
+    metrics = solver._vi_metrics(x_red, R_red, lo_red, hi_red, act_lo, act_hi, G_red)
+
+    assert np.all(act_lo)
+    assert not np.any(act_hi)
+    assert np.isclose(float(np.linalg.norm(R_red, ord=np.inf)), 0.25)
+    assert np.isclose(float(np.linalg.norm(G_red, ord=np.inf)), 0.0)
+    assert np.isclose(metrics["G_inf"], 0.0)
+    assert np.isclose(metrics["inactive_res_inf"], 0.0)
+    assert np.isclose(metrics["active_gap_inf"], 0.0)

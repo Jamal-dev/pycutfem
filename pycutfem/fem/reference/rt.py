@@ -485,6 +485,33 @@ class RaviartThomasRef:
             div_phi[j] = p.eval(xi, eta)
         return self.C.T @ div_phi
 
+    @lru_cache(maxsize=512)
+    def tabulate_grad(self, xi: float, eta: float) -> np.ndarray:
+        """
+        Reference gradients of the nodal RT basis.
+
+        Returns
+        -------
+        np.ndarray, shape (n_dofs, 2, 2)
+            ``out[j, i, a] = d/dhat_x_a (phi_j)_i`` where ``i`` is the vector
+            component and ``a`` is the reference derivative index.
+        """
+        xi = float(xi)
+        eta = float(eta)
+        grad_phi = np.empty((self.n_dofs, 2, 2), dtype=float)
+        for j, (px, py) in enumerate(self._poly_basis):
+            grad_phi[j, 0, 0] = px.deriv(1, 0).eval(xi, eta)
+            grad_phi[j, 0, 1] = px.deriv(0, 1).eval(xi, eta)
+            grad_phi[j, 1, 0] = py.deriv(1, 0).eval(xi, eta)
+            grad_phi[j, 1, 1] = py.deriv(0, 1).eval(xi, eta)
+
+        # Apply the nodal-basis transform Psi = C^T Phi component-wise.
+        out = np.empty_like(grad_phi)
+        for comp in range(2):
+            for ax in range(2):
+                out[:, comp, ax] = self.C.T @ grad_phi[:, comp, ax]
+        return out
+
 
 @lru_cache(maxsize=None)
 def get_rt_reference(element_type: str, k: int) -> RaviartThomasRef:

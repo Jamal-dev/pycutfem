@@ -5,10 +5,12 @@ This module hosts runtime/JIT-specific helpers that were previously in
 """
 
 import numpy as np
+from pathlib import Path
 from typing import Mapping, Tuple, Dict, Any, Sequence, Set
 from pycutfem.integration import volume
 import logging # Added for logging warnings
 import os
+import pickle
 import re
 from hashlib import blake2b
 import pycutfem.jit.symbols as symbols
@@ -25,15 +27,99 @@ logger = logging.getLogger(__name__)
 # stacks during JIT warm-up. Keys include element signature, quadrature order,
 # target element count and derivative kind.
 _REF_TABLE_CACHE: dict[tuple, np.ndarray] = {}
+_REF_TABLE_CACHE_ABI = "2026-03-14-ref-tables-v1"
+_REF_TABLE_CACHE_DIR: Path | None = None
 
 
 def _array_token(arr) -> str:
-    carr = np.ascontiguousarray(np.asarray(arr, dtype=np.float64))
+    carr = np.ascontiguousarray(np.asarray(arr))
     h = blake2b(digest_size=16)
     shape_info = np.asarray(carr.shape, dtype=np.int64)
     h.update(shape_info.tobytes())
+    h.update(str(carr.dtype).encode("ascii"))
     h.update(carr.tobytes())
     return h.hexdigest()
+
+
+def _ref_table_cache_enabled() -> bool:
+    return os.getenv("PYCUTFEM_REF_TABLE_CACHE", "1").lower() not in {"0", "false", "no"}
+
+
+def _ref_table_cache_max_bytes() -> int:
+    raw = os.getenv("PYCUTFEM_REF_TABLE_CACHE_MAX_MB", "128").strip()
+    try:
+        mb = max(1, int(raw))
+    except Exception:
+        mb = 128
+    return mb * 1024 * 1024
+
+
+def _resolve_ref_table_cache_dir() -> Path | None:
+    global _REF_TABLE_CACHE_DIR
+    if not _ref_table_cache_enabled():
+        return None
+    if _REF_TABLE_CACHE_DIR is not None:
+        return _REF_TABLE_CACHE_DIR
+    override = os.getenv("PYCUTFEM_REF_TABLE_CACHE_DIR", "").strip()
+    try:
+        if override:
+            base = Path(override).expanduser().resolve()
+        else:
+            from pycutfem.jit.cache import _resolve_cache_dir
+            base = (_resolve_cache_dir() / "ref_tables").resolve()
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    _REF_TABLE_CACHE_DIR = base
+    return base
+
+
+def _ref_table_cache_path(key: tuple) -> Path | None:
+    root = _resolve_ref_table_cache_dir()
+    if root is None:
+        return None
+    digest = blake2b(pickle.dumps((_REF_TABLE_CACHE_ABI, key), protocol=5), digest_size=16).hexdigest()
+    return root / f"{digest}.npy"
+
+
+def _cache_array_get(key: tuple) -> np.ndarray | None:
+    hit = _REF_TABLE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    path = _ref_table_cache_path(key)
+    if path is None or not path.exists():
+        return None
+    try:
+        arr = np.load(path, allow_pickle=False)
+    except Exception:
+        return None
+    _REF_TABLE_CACHE[key] = arr
+    return arr
+
+
+def _cache_array_put(key: tuple, arr: np.ndarray) -> np.ndarray:
+    _REF_TABLE_CACHE[key] = arr
+    path = _ref_table_cache_path(key)
+    if path is None:
+        return arr
+    if arr.nbytes > _ref_table_cache_max_bytes():
+        return arr
+    tmp_path: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            return arr
+        tmp_path = path.with_suffix(f".{os.getpid()}.tmp.npy")
+        with open(tmp_path, "wb") as f:
+            np.save(f, arr, allow_pickle=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+    return arr
 
 
 def _pad_coeffs(coeffs, phi, ctx):
@@ -247,15 +333,25 @@ def _build_jit_kernel_args(       # ← signature unchanged
             return slice(start, start + int(new_idx.size))
         return new_idx
 
+    _active_layout_token = _array_token(np.asarray(_active_cols, dtype=np.int32))
+
     def _cached_ref_table(kind: str, field: str, builder, deriv: tuple[int, int] | None = None):
-        # Cache *local* reference tables; these do not depend on active column compression.
-        key = (mixed_element.signature(), q_order, kind, field, deriv)
-        hit = _REF_TABLE_CACHE.get(key)
+        # Cache reference tables in the *current union layout*. These tables are
+        # padded into the active mixed-space columns, so reusing them across a
+        # different active_cols selection corrupts H(div) sign/div contractions.
+        key = (
+            mixed_element.signature(),
+            q_order,
+            kind,
+            field,
+            deriv,
+            _active_layout_token,
+        )
+        hit = _cache_array_get(key)
         if hit is not None:
             return hit
         arr = builder()
-        _REF_TABLE_CACHE[key] = arr
-        return arr
+        return _cache_array_put(key, arr)
 
     def _expand_per_element(ref_tab: np.ndarray) -> np.ndarray:
         """
@@ -272,12 +368,11 @@ def _build_jit_kernel_args(       # ← signature unchanged
         token that tracks the underlying qref/eids arrays for this kernel.
         """
         key = (mixed_element.signature(), q_order, n_elem, kind, field, token)
-        hit = _REF_TABLE_CACHE.get(key)
+        hit = _cache_array_get(key)
         if hit is not None:
             return hit
         arr = builder()
-        _REF_TABLE_CACHE[key] = arr
-        return arr
+        return _cache_array_put(key, arr)
 
     # Reference-element quadrature (ξ-space) for table builders
     qp_ref, _ = volume(mixed_element.mesh.element_type, q_order)
@@ -393,6 +488,30 @@ def _build_jit_kernel_args(       # ← signature unchanged
         ref = _cached_ref_table("hdiv_div", field, _build)
         return _expand_per_element(ref)  # (n_elem,n_q,n_union)
 
+    def _hdiv_grad_table(field: str) -> np.ndarray:
+        """
+        Reference RT gradients, union-padded.
+
+        Returns shape ``(n_elem, n_q, 2, n_union, 2)`` with axes
+        ``(elem, qp, component, dof, d/dhat_x)``.
+        """
+        fam = getattr(mixed_element, "_field_families", {}).get(field, None)
+        if fam != "RT":
+            raise ValueError(f"Requested gvec_{field} for non-RT field family {fam!r}.")
+
+        def _build():
+            n_union = int(_active_n)
+            sl = _field_new_slice(field)
+            out_ref = np.zeros((len(qp_ref), 2, n_union, 2), dtype=np.float64)
+            ref_obj = mixed_element._ref[field]
+            for q, (xi, eta) in enumerate(qp_ref):
+                grad_hat = np.asarray(ref_obj.tabulate_grad(float(xi), float(eta)), dtype=np.float64)  # (n_loc,2,2)
+                out_ref[q, :, sl, :] = np.transpose(grad_hat, (1, 0, 2))
+            return np.ascontiguousarray(out_ref)
+
+        ref = _cached_ref_table("hdiv_grad", field, _build)
+        return _expand_per_element(ref)  # (n_elem,n_q,2,n_union,2)
+
     def _hdiv_sign_table(field: str) -> np.ndarray:
         """
         Per-element RT orientation signs, union-padded.
@@ -476,7 +595,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if qref_mode is not None:
             mode, arr = qref_mode
             if mode == "global":
-                token = ("b_phys_global", int(id(arr)), int(arr.shape[0]), int(sl.start), int(sl.stop))
+                token = ("b_phys_global", _array_token(arr), int(arr.shape[0]), int(sl.start), int(sl.stop))
 
                 def _build():
                     xi = np.asarray(arr[:, 0], dtype=float)
@@ -491,8 +610,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
             # per-element qref
             token = (
                 "b_phys_elem",
-                int(id(arr)),
-                int(id(eids)),
+                _array_token(arr),
+                _array_token(np.asarray(eids, dtype=np.int64)),
                 int(arr.shape[0]),
                 int(arr.shape[1]),
                 int(sl.start),
@@ -555,7 +674,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if qref_mode is not None:
             mode, arr = qref_mode
             if mode == "global":
-                token = ("d_phys_global", int(id(arr)), int(arr.shape[0]), int(ax), int(ay), int(sl.start), int(sl.stop))
+                token = ("d_phys_global", _array_token(arr), int(arr.shape[0]), int(ax), int(ay), int(sl.start), int(sl.stop))
 
                 def _build():
                     out = np.zeros((nE, int(arr.shape[0]), n_union), dtype=np.float64)
@@ -568,8 +687,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
             token = (
                 "d_phys_elem",
-                int(id(arr)),
-                int(id(eids)),
+                _array_token(arr),
+                _array_token(np.asarray(eids, dtype=np.int64)),
                 int(arr.shape[0]),
                 int(arr.shape[1]),
                 int(ax),
@@ -633,7 +752,7 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if qref_mode is not None:
             mode, arr = qref_mode
             if mode == "global":
-                token = ("g_phys_global", int(id(arr)), int(arr.shape[0]), int(sl.start), int(sl.stop))
+                token = ("g_phys_global", _array_token(arr), int(arr.shape[0]), int(sl.start), int(sl.stop))
 
                 def _build():
                     xi = np.asarray(arr[:, 0], dtype=float)
@@ -647,8 +766,8 @@ def _build_jit_kernel_args(       # ← signature unchanged
 
             token = (
                 "g_phys_elem",
-                int(id(arr)),
-                int(id(eids)),
+                _array_token(arr),
+                _array_token(np.asarray(eids, dtype=np.int64)),
                 int(arr.shape[0]),
                 int(arr.shape[1]),
                 int(sl.start),
@@ -1206,6 +1325,10 @@ def _build_jit_kernel_args(       # ← signature unchanged
         if name.startswith("bvec_"):
             fld = name[5:]
             args[name] = _hdiv_bvec_table(fld)
+
+        elif name.startswith("gvec_"):
+            fld = name[5:]
+            args[name] = _hdiv_grad_table(fld)
 
         elif name.startswith("div_"):
             fld = name[4:]

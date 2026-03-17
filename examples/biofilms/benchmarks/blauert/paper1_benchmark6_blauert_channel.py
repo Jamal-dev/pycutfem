@@ -59,6 +59,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 from examples.biofilms.benchmarks.blauert.compare_sim_vs_video import _interp_1d, _read_csv_columns
 from examples.biofilms.benchmarks.blauert.compare_sim_vs_observations import _svg_contour_to_mm
+from examples.biofilms.benchmarks.blauert.extract_front_displacement_from_video import (
+    _contour_roi_from_polygon_mm,
+    _crop_mask_to_mm_roi,
+)
 
 
 BLAUERT_DRIVER = _REPO_ROOT / "examples/biofilms/benchmarks/blauert/blauert_biofilm_deformation_one_domain.py"
@@ -71,6 +75,8 @@ POLY_CSV = _REPO_ROOT / "examples/biofilms/benchmarks/blauert/exp_frame0_polygon
 MATLAB_BIOFILM_TXT = _REPO_ROOT / "examples/biofilms/benchmarks/blauert/biofilm_preprocessing/biofilm.txt"
 STEADY_SVG = _REPO_ROOT / "examples/biofilms/benchmarks/blauert/biofilm_preprocessing/Basic_t=2_INK.svg"
 STEADY_DOMAIN = _REPO_ROOT / "examples/biofilms/benchmarks/blauert/biofilm_preprocessing/domain1.txt"
+CONTOUR_ROI_PAD_RIGHT_MM = 0.02
+CONTOUR_ROI_PAD_TOP_MM = 0.02
 
 
 @dataclass(frozen=True)
@@ -940,6 +946,15 @@ def _extract_video_contours(times: list[float], *, outdir: Path, force: bool = F
     y_base0 = _detect_substrate_row(gray0)
     y_cut0 = max(1, int(y_base0) - 6)
     fixed_thr0 = _otsu_threshold_u8(gray0[:y_cut0, :])
+    contour_roi = (
+        _contour_roi_from_polygon_mm(
+            POLY_CSV,
+            pad_right_mm=float(CONTOUR_ROI_PAD_RIGHT_MM),
+            pad_top_mm=float(CONTOUR_ROI_PAD_TOP_MM),
+        )
+        if POLY_CSV.exists()
+        else None
+    )
 
     outputs: dict[float, Path] = {}
     for target in times:
@@ -963,6 +978,18 @@ def _extract_video_contours(times: list[float], *, outdir: Path, force: bool = F
             fixed_threshold=float(fixed_thr0),
             overlay_rects=overlay_rects,
         )
+        if contour_roi is not None:
+            x_min_mm, x_max_mm, y_min_mm, y_max_mm = contour_roi
+            mask_u8 = _crop_mask_to_mm_roi(
+                mask_u8,
+                y_base=int(y_base),
+                px_size_um=float(px_size_um),
+                x_min_mm=float(x_min_mm),
+                x_max_mm=float(x_max_mm),
+                y_min_mm=float(y_min_mm),
+                y_max_mm=float(y_max_mm),
+                min_area_px=5000,
+            )
         poly_mm = _mask_contour_polygon_mm(mask_u8, y_base=int(y_base), px_size_um=float(px_size_um))
         with out_csv.open("w", encoding="utf-8") as f:
             f.write("x_mm,y_mm\n")

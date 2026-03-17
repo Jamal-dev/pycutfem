@@ -385,6 +385,38 @@ class MixedElement:
         detJ = float(np.linalg.det(J))
         return div_hat / detJ
 
+    def tabulate_grad(self, field: str, xi: float, eta: float, *, element_id: int | None = None) -> np.ndarray:
+        """
+        Tabulate gradients for RT (H(div)) basis values.
+
+        Returns
+        -------
+        np.ndarray
+            Reference gradients with shape ``(n_loc, 2, 2)`` if
+            ``element_id is None`` and physical gradients with the same shape
+            otherwise. The physical mapping uses the affine Piola-gradient rule
+            ``grad_x u = (J / detJ) grad_hat(u_hat) J^{-1}``.
+        """
+        fam = self._field_families[field]
+        if fam != "RT":
+            raise NotImplementedError("tabulate_grad is only defined for RT (H(div)) fields.")
+
+        Ghat = np.asarray(self._ref[field].tabulate_grad(float(xi), float(eta)), dtype=float)
+        if element_id is None:
+            return Ghat
+
+        from pycutfem.fem import transform
+
+        J = np.asarray(transform.jacobian(self.mesh, int(element_id), (float(xi), float(eta))), dtype=float)
+        detJ = float(np.linalg.det(J))
+        Jinv = np.asarray(np.linalg.inv(J), dtype=float)
+        pref = J / detJ
+
+        Gphys = np.empty_like(Ghat)
+        for a in range(Ghat.shape[0]):
+            Gphys[a, :, :] = pref @ Ghat[a, :, :] @ Jinv
+        return Gphys
+
     # ..................................................................
     #  Helpers
     # ..................................................................

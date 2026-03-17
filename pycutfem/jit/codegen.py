@@ -818,6 +818,8 @@ class NumbaCodeGen:
                             sgn = new_var("sgn")
                             adj = new_var("adj")
                             bphys = new_var("bphys")
+                            t0 = new_var("t0")
+                            t1 = new_var("t1")
                             body_lines += [
                                 f"{bhat} = {basis_arg_names[0]}[e, q]",  # (2, n_union)
                                 f"{sgn} = {sign_tab}[e]",               # (n_union,)
@@ -827,9 +829,12 @@ class NumbaCodeGen:
                                 f"{adj}[0, 1] = -A[0, 1]",
                                 f"{adj}[1, 0] = -A[1, 0]",
                                 f"{adj}[1, 1] =  A[0, 0]",
-                                f"{bphys} = {adj} @ {bhat}",
-                                f"{bphys}[0, :] = {bphys}[0, :] * {sgn}",
-                                f"{bphys}[1, :] = {bphys}[1, :] * {sgn}",
+                                f"{bphys} = np.empty((2, {bhat}.shape[1]), dtype={self.dtype})",
+                                f"for _j in range({bhat}.shape[1]):",
+                                f"    {t0} = {adj}[0, 0] * {bhat}[0, _j] + {adj}[0, 1] * {bhat}[1, _j]",
+                                f"    {t1} = {adj}[1, 0] * {bhat}[0, _j] + {adj}[1, 1] * {bhat}[1, _j]",
+                                f"    {bphys}[0, _j] = {t0} * {sgn}[_j]",
+                                f"    {bphys}[1, _j] = {t1} * {sgn}[_j]",
                             ]
                             stack.append(
                                 StackItem(
@@ -1142,6 +1147,8 @@ class NumbaCodeGen:
                             sgn = new_var("sgn")
                             adj = new_var("adj")
                             bphys = new_var("bphys")
+                            t0 = new_var("t0")
+                            t1 = new_var("t1")
                             body_lines += [
                                 f"{bhat} = {basis_arg_names[0]}[e, q]",  # (2, n_union)
                                 f"{sgn} = {sign_tab}[e]",               # (n_union,)
@@ -1151,9 +1158,12 @@ class NumbaCodeGen:
                                 f"{adj}[0, 1] = -A[0, 1]",
                                 f"{adj}[1, 0] = -A[1, 0]",
                                 f"{adj}[1, 1] =  A[0, 0]",
-                                f"{bphys} = {adj} @ {bhat}",
-                                f"{bphys}[0, :] = {bphys}[0, :] * {sgn}",
-                                f"{bphys}[1, :] = {bphys}[1, :] * {sgn}",
+                                f"{bphys} = np.empty((2, {bhat}.shape[1]), dtype={self.dtype})",
+                                f"for _j in range({bhat}.shape[1]):",
+                                f"    {t0} = {adj}[0, 0] * {bhat}[0, _j] + {adj}[0, 1] * {bhat}[1, _j]",
+                                f"    {t1} = {adj}[1, 0] * {bhat}[0, _j] + {adj}[1, 1] * {bhat}[1, _j]",
+                                f"    {bphys}[0, _j] = {t0} * {sgn}[_j]",
+                                f"    {bphys}[1, _j] = {t1} * {sgn}[_j]",
                                 f"{val_var} = np.array([load_variable_qp({coeff_sym}, {bphys}[0]), load_variable_qp({coeff_sym}, {bphys}[1])], dtype={self.dtype})",
                             ]
                             shape = (2,)
@@ -1752,6 +1762,101 @@ class NumbaCodeGen:
                         continue
 
                     raise NotImplementedError(f"grad(div(.)) not implemented for role {a.role}")
+
+                is_hdiv_grad = (
+                    len(getattr(a, "field_names", []) or []) == 1
+                    and getattr(self.me, "_field_families", {}).get(str(a.field_names[0]), None) == "RT"
+                )
+                if is_hdiv_grad:
+                    fld = str(a.field_names[0])
+                    if a.side in ("+", "-") and self.on_facet:
+                        raise NotImplementedError("grad(H(div)) is currently implemented for volume integrals only in the JIT backend.")
+
+                    gvec_name = f"gvec_{fld}"
+                    sign_name = f"sign_{fld}"
+                    required_args.update({gvec_name, sign_name})
+
+                    adj = new_var("adj")
+                    ghat = new_var("ghat")
+                    gphys = new_var("gphys")
+                    sgn = new_var("sgn")
+                    t00 = new_var("t00")
+                    t01 = new_var("t01")
+                    t10 = new_var("t10")
+                    t11 = new_var("t11")
+                    body_lines += [
+                        f"{ghat} = {gvec_name}[e, q]",
+                        f"{sgn} = {sign_name}[e]",
+                        f"{adj} = np.empty((2, 2), dtype={self.dtype})",
+                        f"{adj}[0, 0] =  {jinv_q}[1, 1]",
+                        f"{adj}[0, 1] = -{jinv_q}[0, 1]",
+                        f"{adj}[1, 0] = -{jinv_q}[1, 0]",
+                        f"{adj}[1, 1] =  {jinv_q}[0, 0]",
+                        f"{gphys} = np.empty((2, {ghat}.shape[1], 2), dtype={self.dtype})",
+                        f"for _j in range({ghat}.shape[1]):",
+                        f"    {t00} = {adj}[0, 0] * {ghat}[0, _j, 0] + {adj}[0, 1] * {ghat}[1, _j, 0]",
+                        f"    {t01} = {adj}[0, 0] * {ghat}[0, _j, 1] + {adj}[0, 1] * {ghat}[1, _j, 1]",
+                        f"    {t10} = {adj}[1, 0] * {ghat}[0, _j, 0] + {adj}[1, 1] * {ghat}[1, _j, 0]",
+                        f"    {t11} = {adj}[1, 0] * {ghat}[0, _j, 1] + {adj}[1, 1] * {ghat}[1, _j, 1]",
+                        f"    {gphys}[0, _j, 0] = ({t00} * {jinv_q}[0, 0] + {t01} * {jinv_q}[1, 0]) * {sgn}[_j]",
+                        f"    {gphys}[0, _j, 1] = ({t00} * {jinv_q}[0, 1] + {t01} * {jinv_q}[1, 1]) * {sgn}[_j]",
+                        f"    {gphys}[1, _j, 0] = ({t10} * {jinv_q}[0, 0] + {t11} * {jinv_q}[1, 0]) * {sgn}[_j]",
+                        f"    {gphys}[1, _j, 1] = ({t10} * {jinv_q}[0, 1] + {t11} * {jinv_q}[1, 1]) * {sgn}[_j]",
+                    ]
+
+                    if a.role in ("test", "trial"):
+                        stack.append(
+                            a._replace(
+                                var_name=gphys,
+                                shape=(2, -1 if a.side else self.active_n_dofs, self.spatial_dim),
+                                is_gradient=True,
+                                is_vector=False,
+                                field_names=[fld, fld],
+                            )
+                        )
+                        continue
+
+                    if a.role == "value":
+                        coeff = a.parent_name if a.parent_name.startswith("u_") else f"u_{a.parent_name}_loc"
+                        required_args.add(coeff)
+                        gval = new_var("hdiv_grad_val")
+                        acc00 = new_var("acc00")
+                        acc01 = new_var("acc01")
+                        acc10 = new_var("acc10")
+                        acc11 = new_var("acc11")
+                        body_lines += [
+                            f"{acc00} = 0.0",
+                            f"{acc01} = 0.0",
+                            f"{acc10} = 0.0",
+                            f"{acc11} = 0.0",
+                            f"for _j in range({gphys}.shape[1]):",
+                            f"    _c = {coeff}[_j]",
+                            f"    {acc00} += {gphys}[0, _j, 0] * _c",
+                            f"    {acc01} += {gphys}[0, _j, 1] * _c",
+                            f"    {acc10} += {gphys}[1, _j, 0] * _c",
+                            f"    {acc11} += {gphys}[1, _j, 1] * _c",
+                            f"{gval} = np.empty((2, {self.spatial_dim}), dtype={self.dtype})",
+                            f"{gval}[0, 0] = {acc00}",
+                            f"{gval}[0, 1] = {acc01}",
+                            f"{gval}[1, 0] = {acc10}",
+                            f"{gval}[1, 1] = {acc11}",
+                        ]
+                        stack.append(
+                            StackItem(
+                                var_name=gval,
+                                role="value",
+                                shape=(2, self.spatial_dim),
+                                is_gradient=True,
+                                is_vector=False,
+                                field_names=[fld, fld],
+                                parent_name=coeff,
+                                side=a.side,
+                                field_sides=a.field_sides or [],
+                            )
+                        )
+                        continue
+
+                    raise NotImplementedError(f"grad(H(div)) not implemented for role {a.role}")
 
 
                 # ======================================================================

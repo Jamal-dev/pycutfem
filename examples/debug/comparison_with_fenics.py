@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import os
 import sys
+import scipy.sparse as sp
 
 # FEniCSx imports
 from mpi4py import MPI
@@ -19,6 +20,9 @@ from pycutfem.core.dofhandler import DofHandler
 from pycutfem.utils.meshgen import structured_quad
 from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.ufl.expressions import (
+    HdivFunction,
+    HdivTestFunction,
+    HdivTrialFunction,
     TrialFunction, TestFunction, VectorTrialFunction, VectorTestFunction,
     Function, VectorFunction, Constant, grad, inner,
     dot, div, trace, Hessian, Laplacian, FacetNormal, Identity, det, inv,
@@ -27,9 +31,22 @@ from pycutfem.ufl.expressions import (
 from pycutfem.ufl.measures import dx, dInterface, dS
 from pycutfem.ufl.forms import assemble_form
 from pycutfem.fem.reference import get_reference
+from pycutfem.fem.reference.rt import (
+    _edge_normal,
+    _edge_param,
+    _legendre_all,
+    _monomials_quad,
+    gauss_legendre,
+    _quad_rule,
+)
 from pycutfem.fem.mixedelement import MixedElement
 from pycutfem.ufl.forms import Equation
+from pycutfem.utils.bitset import BitSet
 from examples.utils.biofilm.one_domain import build_biofilm_one_domain_forms
+from examples.biofilms.benchmarks.seboldt.paper1_benchmark7_seboldt import (
+    _build_forms as build_benchmark7_seboldt_forms,
+    _create_problem as create_benchmark7_seboldt_problem,
+)
 
 # Imports for mapping and matrix conversion
 from scipy.optimize import linear_sum_assignment
@@ -701,9 +718,339 @@ def get_all_fenicsx_dof_coords(W_fenicsx):
         raise NotImplementedError(f"Unsupported mixed space layout with num_sub_spaces={nsub}.") from exc
 
 def one_to_one_map_coords(coords1, coords2):
-    C = np.linalg.norm(coords2[:, np.newaxis, :] - coords1[np.newaxis, :, :], axis=2)
-    rows, cols = linear_sum_assignment(C)
-    return rows[np.argsort(cols)]
+    coords1 = np.asarray(coords1, dtype=float)
+    coords2 = np.asarray(coords2, dtype=float)
+    if coords1.shape != coords2.shape:
+        raise ValueError(f"Coordinate arrays must have the same shape, got {coords1.shape} vs {coords2.shape}.")
+
+    n = int(coords1.shape[0])
+    if n == 0:
+        return np.zeros((0,), dtype=int)
+
+    tol = float(os.environ.get("COMP_FENICS_COORD_TOL", "1e-12"))
+    scale = 1.0 / max(tol, 1.0e-16)
+
+    def _quantize(arr):
+        return np.rint(np.asarray(arr, dtype=float) * scale).astype(np.int64)
+
+    keys1 = _quantize(coords1)
+    keys2 = _quantize(coords2)
+
+    buckets: dict[tuple[int, ...], list[int]] = {}
+    for idx, key in enumerate(keys2):
+        buckets.setdefault(tuple(int(v) for v in key.tolist()), []).append(int(idx))
+
+    mapping = np.empty(n, dtype=int)
+    try:
+        for i, key in enumerate(keys1):
+            bucket_key = tuple(int(v) for v in key.tolist())
+            bucket = buckets.get(bucket_key)
+            if not bucket:
+                raise KeyError(bucket_key)
+            mapping[i] = int(bucket.pop())
+        return mapping
+    except Exception:
+        # Fallback for near-coincident coordinates that escape the quantized map.
+        C = np.linalg.norm(coords2[:, np.newaxis, :] - coords1[np.newaxis, :, :], axis=2)
+        rows, cols = linear_sum_assignment(C)
+        return rows[np.argsort(cols)]
+
+
+def _fenics_rt_dofs_and_descriptors(V_fenicsx):
+    """Return collapsed RT dofs and entity descriptors for quadrilateral H(div) spaces."""
+    entity_dofs = V_fenicsx.element.basix_element.entity_dofs
+    mesh_fx = V_fenicsx.mesh
+    tdim = mesh_fx.topology.dim
+    fdim = tdim - 1
+    mesh_fx.topology.create_connectivity(tdim, fdim)
+    mesh_fx.topology.create_connectivity(fdim, 0)
+    mesh_fx.topology.create_connectivity(tdim, 0)
+    cell_to_facet = mesh_fx.topology.connectivity(tdim, fdim)
+    facet_to_vertex = mesh_fx.topology.connectivity(fdim, 0)
+    cell_to_vertex = mesh_fx.topology.connectivity(tdim, 0)
+
+    dof_to_kind: dict[int, str] = {}
+    dof_to_point: dict[int, np.ndarray] = {}
+    dof_to_mode: dict[int, int] = {}
+    geom = np.asarray(mesh_fx.geometry.x, dtype=float)
+    for cell, row in enumerate(V_fenicsx.dofmap.list):
+        local_facets = cell_to_facet.links(int(cell))
+        for local_facet, local_dofs in enumerate(entity_dofs[fdim]):
+            facet = int(local_facets[int(local_facet)])
+            verts = np.asarray(facet_to_vertex.links(facet), dtype=int)
+            midpoint = np.mean(geom[verts, :2], axis=0)
+            for mode_idx, local_dof in enumerate(local_dofs):
+                gdof = int(row[int(local_dof)])
+                dof_to_kind.setdefault(gdof, "edge")
+                dof_to_point.setdefault(gdof, np.asarray(midpoint, dtype=float))
+                dof_to_mode.setdefault(gdof, int(mode_idx))
+
+        cell_local_dofs = entity_dofs[tdim][0] if len(entity_dofs[tdim]) else []
+        if len(cell_local_dofs):
+            verts = np.asarray(cell_to_vertex.links(int(cell)), dtype=int)
+            centroid = np.mean(geom[verts, :2], axis=0)
+            for mode_idx, local_dof in enumerate(cell_local_dofs):
+                gdof = int(row[int(local_dof)])
+                dof_to_kind.setdefault(gdof, "cell")
+                dof_to_point.setdefault(gdof, np.asarray(centroid, dtype=float))
+                dof_to_mode.setdefault(gdof, int(mode_idx))
+
+    dofs = np.asarray(sorted(dof_to_point.keys()), dtype=int)
+    kinds = [str(dof_to_kind[int(d)]) for d in dofs]
+    points = np.vstack([np.asarray(dof_to_point[int(d)], dtype=float) for d in dofs])
+    modes = np.asarray([int(dof_to_mode[int(d)]) for d in dofs], dtype=int)
+    return dofs, kinds, points, modes
+
+
+def _pycutfem_rt_dofs_and_descriptors(dof_handler: DofHandler, field: str):
+    """Return pycutfem RT dofs and entity descriptors in field-slice order."""
+    info = getattr(dof_handler, "_hdiv_field_info", {}).get(str(field), None)
+    if info is None:
+        raise ValueError(f"Missing H(div) metadata for field {field!r}.")
+
+    mesh = dof_handler.mixed_element.mesh
+    corner_conn = getattr(mesh, "corner_connectivity", None)
+    if corner_conn is None:
+        corner_conn = getattr(mesh, "elements_corner_nodes", None)
+    if corner_conn is None:
+        raise RuntimeError("Mesh does not expose corner connectivity required for RT descriptor mapping.")
+
+    desc_by_gid: dict[int, tuple[str, np.ndarray, int]] = {}
+    edge_base = int(info["edge_base"])
+    cell_base = int(info["cell_base"])
+    n_edge_dofs = int(info["n_edge_dofs"])
+    n_cell_dofs = int(info["n_cell_dofs"])
+
+    for ent, nodes in enumerate(info["edge_entity_nodes"]):
+        p0 = np.asarray(mesh.nodes_x_y_pos[int(nodes[0])], dtype=float)
+        p1 = np.asarray(mesh.nodes_x_y_pos[int(nodes[1])], dtype=float)
+        midpoint = 0.5 * (p0 + p1)
+        for mode_idx in range(n_edge_dofs):
+            gdof = edge_base + int(ent) * n_edge_dofs + int(mode_idx)
+            desc_by_gid[int(gdof)] = ("edge", np.asarray(midpoint, dtype=float), int(mode_idx))
+
+    if n_cell_dofs:
+        for eid in range(mesh.n_elements):
+            corners = np.asarray(corner_conn[int(eid)], dtype=int)
+            centroid = np.mean(np.asarray(mesh.nodes_x_y_pos[corners], dtype=float), axis=0)
+            for mode_idx in range(n_cell_dofs):
+                gdof = cell_base + int(eid) * n_cell_dofs + int(mode_idx)
+                desc_by_gid[int(gdof)] = ("cell", np.asarray(centroid, dtype=float), int(mode_idx))
+
+    dofs = np.asarray(dof_handler.get_field_slice(field), dtype=int)
+    kinds = [str(desc_by_gid[int(d)][0]) for d in dofs]
+    points = np.vstack([np.asarray(desc_by_gid[int(d)][1], dtype=float) for d in dofs])
+    modes = np.asarray([int(desc_by_gid[int(d)][2]) for d in dofs], dtype=int)
+    return dofs, kinds, points, modes
+
+
+def _map_rt_descriptors(pc_kinds, pc_points, pc_modes, fx_kinds, fx_points, fx_modes):
+    tol = float(os.environ.get("COMP_FENICS_COORD_TOL", "1e-12"))
+    scale = 1.0 / max(tol, 1.0e-16)
+
+    def _key(kind, point, mode):
+        qxy = np.rint(np.asarray(point, dtype=float) * scale).astype(np.int64)
+        return (str(kind), int(mode), int(qxy[0]), int(qxy[1]))
+
+    buckets: dict[tuple[str, int, int, int], list[int]] = {}
+    for idx, (kind, point, mode) in enumerate(zip(fx_kinds, fx_points, fx_modes)):
+        buckets.setdefault(_key(kind, point, mode), []).append(int(idx))
+
+    mapping = np.empty(len(pc_kinds), dtype=int)
+    for i, (kind, point, mode) in enumerate(zip(pc_kinds, pc_points, pc_modes)):
+        key = _key(kind, point, mode)
+        bucket = buckets.get(key)
+        if not bucket:
+            raise KeyError(f"Unable to match RT descriptor {key}.")
+        mapping[i] = int(bucket.pop())
+    return mapping
+
+
+def _evaluate_fenicsx_basis_values(V_fenicsx, pts_phys: np.ndarray) -> np.ndarray:
+    pts_phys = np.asarray(pts_phys, dtype=float)
+    ndofs = int(V_fenicsx.dofmap.index_map.size_global)
+    cells = np.array([0], dtype=np.int32)
+    values = np.empty((pts_phys.shape[0], ndofs, 2), dtype=float)
+    expr_points = np.ascontiguousarray(pts_phys[:, ::-1], dtype=float)
+    basis_fn = dolfinx.fem.Function(V_fenicsx)
+    for j in range(ndofs):
+        basis_fn.x.array[:] = 0.0
+        basis_fn.x.array[int(j)] = 1.0
+        basis_fn.x.scatter_forward()
+        expr = dolfinx.fem.Expression(basis_fn, expr_points)
+        raw = np.asarray(expr.eval(V_fenicsx.mesh, cells), dtype=float).reshape(1, pts_phys.shape[0], 2)
+        values[:, j, :] = raw[0]
+    return values
+
+
+def _quadrilateral_rt_fenicsx_row_signs_against_pycutfem(V_fenicsx) -> np.ndarray:
+    """
+    Return the per-row sign needed to map quadrilateral FEniCSx RT coefficients
+    into the same local edge-mode convention used by pycutfem.
+
+    Both implementations agree on the bottom and right edge parameter
+    directions. On the top and left edges the parameter directions are
+    opposite, so odd Legendre edge modes pick up a minus sign.
+    """
+    fx_dofs, fx_kinds, fx_points, fx_modes = _fenics_rt_dofs_and_descriptors(V_fenicsx)
+    signs = np.ones((len(fx_dofs),), dtype=float)
+    if len(fx_points) == 0:
+        return signs
+
+    tol = float(os.environ.get("COMP_FENICS_COORD_TOL", "1e-12"))
+    x_min = float(np.min(fx_points[:, 0]))
+    y_max = float(np.max(fx_points[:, 1]))
+    for i, (kind, point, mode) in enumerate(zip(fx_kinds, fx_points, fx_modes)):
+        if str(kind) != "edge":
+            continue
+        on_left = abs(float(point[0]) - x_min) <= tol
+        on_top = abs(float(point[1]) - y_max) <= tol
+        if (on_left or on_top) and (int(mode) % 2 == 1):
+            signs[i] = -1.0
+    return signs
+
+
+def _build_rt1_local_transform(me_pc: MixedElement, V_fenicsx, *, field: str = "v") -> np.ndarray:
+    """
+    Return the single-cell quadrilateral RT_k coefficient transform B such that
+        u_fx = B @ u_pc
+    maps pycutfem RT_k coefficients to the FEniCSx RT_k coefficients on a unit quad.
+
+    This is a true local basis transform, not just a sign/permutation map.
+    """
+    ref_pc = me_pc._ref[str(field)]
+    nloc = int(ref_pc.n_dofs)
+    if ref_pc.element_type != "quad" or int(ref_pc.k) < 1:
+        raise NotImplementedError("Whole-domain RT transform helper currently targets quadrilateral RTk with k >= 1 only.")
+    k = int(ref_pc.k)
+
+    C_fx_to_pc = np.zeros((nloc, nloc), dtype=float)
+    row = 0
+
+    qmom = max(6, 2 * k + 4)
+    s, w = gauss_legendre(qmom)
+    P = _legendre_all(k, s)
+    for edge in range(4):
+        xi_ref, eta_ref, w_scale = _edge_param("quad", edge, s)
+        pts_phys = np.column_stack((0.5 * (xi_ref + 1.0), 0.5 * (eta_ref + 1.0)))
+        vals_fx = _evaluate_fenicsx_basis_values(V_fenicsx, pts_phys)
+        nvec = _edge_normal("quad", edge)
+        flux = vals_fx[:, :, 0] * float(nvec[0]) + vals_fx[:, :, 1] * float(nvec[1])
+        ww = (0.5 * w * w_scale).reshape(-1, 1)
+        for mode in range(k + 1):
+            C_fx_to_pc[row, :] = np.sum(ww * P[mode][:, None] * flux, axis=0)
+            row += 1
+
+    qp_ref, qw_ref = _quad_rule(qmom)
+    qp_ref = np.asarray(qp_ref, dtype=float)
+    qw_ref = np.asarray(qw_ref, dtype=float)
+    pts_phys = 0.5 * (qp_ref + 1.0)
+    vals_fx = _evaluate_fenicsx_basis_values(V_fenicsx, pts_phys)
+    cell_monos = ((_monomials_quad(k - 1, k), 0), (_monomials_quad(k, k - 1), 1))
+    for monos, comp in cell_monos:
+        for i, j in monos:
+            weight = (0.5 * qw_ref * (qp_ref[:, 0] ** int(i)) * (qp_ref[:, 1] ** int(j))).reshape(-1, 1)
+            C_fx_to_pc[row, :] = np.sum(weight * vals_fx[:, :, int(comp)], axis=0)
+            row += 1
+
+    if np.linalg.matrix_rank(C_fx_to_pc) != nloc:
+        raise RuntimeError("RT local FEniCSx->pycutfem transform is singular.")
+
+    B_pc_to_fx = np.linalg.inv(C_fx_to_pc)
+    fx_sign = _quadrilateral_rt_fenicsx_row_signs_against_pycutfem(V_fenicsx)
+    if fx_sign.shape[0] != B_pc_to_fx.shape[0]:
+        raise RuntimeError("RT transform sign vector size mismatch.")
+    return fx_sign[:, None] * B_pc_to_fx
+
+
+def _recover_sign_congruence(A_pc: np.ndarray, A_fx: np.ndarray, *, tol: float = 1.0e-12) -> np.ndarray:
+    """
+    Recover a diagonal sign vector s such that A_pc ~= diag(s) A_fx diag(s).
+
+    This is used for H(div) spaces where the global facet orientation may differ
+    between pycutfem and FEniCSx.
+    """
+    A_pc = np.asarray(A_pc, dtype=float)
+    A_fx = np.asarray(A_fx, dtype=float)
+    if A_pc.shape != A_fx.shape:
+        raise ValueError(f"Sign recovery shape mismatch: {A_pc.shape} vs {A_fx.shape}")
+
+    n = int(A_pc.shape[0])
+    s = np.ones(n, dtype=float)
+    seen = np.zeros(n, dtype=bool)
+    graph = (np.abs(A_pc) > tol) | (np.abs(A_fx) > tol)
+
+    for start in range(n):
+        if seen[start]:
+            continue
+        seen[start] = True
+        stack = [int(start)]
+        while stack:
+            i = int(stack.pop())
+            neigh = np.nonzero(graph[i])[0]
+            for j in neigh:
+                j = int(j)
+                if i == j:
+                    continue
+                aij = float(A_pc[i, j])
+                bij = float(A_fx[i, j])
+                if abs(aij) <= tol and abs(bij) <= tol:
+                    continue
+                if abs(aij) <= tol or abs(bij) <= tol:
+                    raise RuntimeError(
+                        f"Cannot recover RT sign: zero-pattern mismatch at ({i}, {j}) "
+                        f"with pycutfem={aij:.3e}, fenics={bij:.3e}."
+                    )
+                sign_ij = 1.0 if (aij / bij) >= 0.0 else -1.0
+                cand = s[i] * sign_ij
+                if not seen[j]:
+                    s[j] = cand
+                    seen[j] = True
+                    stack.append(j)
+                elif abs(s[j] - cand) > tol:
+                    raise RuntimeError(
+                        f"Inconsistent RT sign recovery between dofs {i} and {j}: "
+                        f"existing {s[j]:+.0f}, candidate {cand:+.0f}."
+                    )
+
+    A_fx_signed = s[:, None] * A_fx * s[None, :]
+    np.testing.assert_allclose(A_pc, A_fx_signed, rtol=1.0e-9, atol=max(tol, 1.0e-11))
+    return s
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sparse_matrix_allclose(A, B, *, rtol: float = 1.0e-8, atol: float = 1.0e-8):
+    A_csr = A.tocsr() if sp.issparse(A) else csr_matrix(np.asarray(A, dtype=float))
+    B_csr = B.tocsr() if sp.issparse(B) else csr_matrix(np.asarray(B, dtype=float))
+    if A_csr.shape != B_csr.shape:
+        return False, float("inf"), ("shape", A_csr.shape, B_csr.shape, float("inf"), 0.0, 0.0)
+
+    diff = (A_csr - B_csr).tocsr()
+    diff.eliminate_zeros()
+    if diff.nnz == 0:
+        return True, 0.0, None
+
+    abs_data = np.abs(diff.data)
+    idx = int(np.argmax(abs_data))
+    max_abs = float(abs_data[idx])
+    rows, cols = diff.nonzero()
+    row = int(rows[idx])
+    col = int(cols[idx])
+    a_val = float(A_csr[row, col])
+    b_val = float(B_csr[row, col])
+    scale = max(
+        float(np.max(np.abs(A_csr.data))) if A_csr.nnz else 0.0,
+        float(np.max(np.abs(B_csr.data))) if B_csr.nnz else 0.0,
+        1.0,
+    )
+    tol = float(atol) + float(rtol) * scale
+    return max_abs <= tol, max_abs, (row, col, a_val, b_val, max_abs, tol)
 
 def create_true_dof_map(dof_handler_pc, W_fenicsx):
     print("="*70)
@@ -754,7 +1101,15 @@ def setup_poro_problems(*, nx: int = 1, ny: int = 1):
         element_type="quad",
         poly_order=2,
     )
-    mesh_q2.tag_boundary_edges({"all": lambda x, y: True})
+    mesh_q2.tag_boundary_edges(
+        {
+            "left": lambda x, y: abs(x - 0.0) <= 1.0e-12,
+            "right": lambda x, y: abs(x - 1.0) <= 1.0e-12,
+            "bottom": lambda x, y: abs(y - 0.0) <= 1.0e-12,
+            "top": lambda x, y: abs(y - 1.0) <= 1.0e-12,
+            "all": lambda x, y: True,
+        }
+    )
 
     mixed_element_pc = MixedElement(mesh_q2, field_specs={"v_x": 2, "v_y": 2, "u_x": 2, "u_y": 2, "p": 1})
     dof_handler_pc = DofHandler(mixed_element_pc, method="cg")
@@ -1828,9 +2183,10 @@ def run_alpha_ch_comparison():
 def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
     """
     Build a small one-domain biofilm mixed space with optional fracture/detached blocks:
-      pycutfem: (v_x,v_y) Q2 + p Q1 + (vS_x,vS_y) Q2 + (u_x,u_y) Q2 + (phi,alpha,d,S,X) Q1
+      pycutfem: CG fluid (v_x,v_y) Q2 or H(div) fluid v RT0, plus
+                p Q1 + (vS_x,vS_y) Q2 + (u_x,u_y) Q2 + (phi,alpha,d,S,X) Q1
       dolfinx : (v,p,vS,u,phi,alpha,d,S,X) as
-                (P2_vec, P1, P2_vec, P2_vec, P1, P1, P1, P1, P1)
+                (P2_vec or RT0, P1, P2_vec, P2_vec, P1, P1, P1, P1, P1)
     """
     # --- pycutfem mesh (Q2 geometry so dof coordinates match dolfinx P2 coords) ---
     nodes_q2, elems_q2, _, corners_q2 = structured_quad(1.0, 1.0, nx=nx, ny=ny, poly_order=2)
@@ -1847,8 +2203,11 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
     dt_val = float(os.environ.get("COMP_FENICS_DT", "0.1"))
     theta_val = float(os.environ.get("COMP_FENICS_THETA", "0.5"))
     fluid_convection = str(os.environ.get("COMP_FENICS_FLUID_CONVECTION", "full"))
+    fluid_space = str(os.environ.get("COMP_FENICS_FLUID_SPACE", "cg")).strip().lower()
+    fluid_hdiv_order = int(os.environ.get("COMP_FENICS_FLUID_HDIV_ORDER", "0"))
     alpha_advect_with = str(os.environ.get("COMP_FENICS_ALPHA_ADVECT_WITH", "vS"))
     alpha_advection_form = str(os.environ.get("COMP_FENICS_ALPHA_ADVECTION_FORM", "advective"))
+    kappa_inv_model = str(os.environ.get("COMP_FENICS_KAPPA_INV_MODEL", "spatial")).strip().lower()
     gamma_div_val = float(os.environ.get("COMP_FENICS_GAMMA_DIV", "0.0"))
     gamma_u_val = float(os.environ.get("COMP_FENICS_GAMMA_U", "0.0"))
     u_extension_mode = str(os.environ.get("COMP_FENICS_U_EXTENSION_MODE", "l2"))
@@ -1856,40 +2215,63 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
     v_supg_val = float(os.environ.get("COMP_FENICS_V_SUPG", "0.0"))
     v_supg_mode = str(os.environ.get("COMP_FENICS_V_SUPG_MODE", "streamline"))
     v_supg_c_nu_val = float(os.environ.get("COMP_FENICS_V_SUPG_C_NU", "4.0"))
+    hdiv_tangential_dirichlet = _env_truthy("COMP_FENICS_HDIV_TANGENTIAL_DIRICHLET", False)
+    hdiv_tangential_gamma = float(os.environ.get("COMP_FENICS_HDIV_TANGENTIAL_GAMMA", "20.0"))
+    hdiv_tangential_method = str(os.environ.get("COMP_FENICS_HDIV_TANGENTIAL_METHOD", "penalty")).strip().lower()
+    if hdiv_tangential_method not in {"penalty", "nitsche"}:
+        raise ValueError(f"Unsupported COMP_FENICS_HDIV_TANGENTIAL_METHOD={hdiv_tangential_method!r}.")
     alpha_ch_M_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_M", "0.0"))
     alpha_ch_gamma_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_GAMMA", "0.0"))
     alpha_ch_eps_val = float(os.environ.get("COMP_FENICS_ALPHA_CH_EPS", "0.1"))
     alpha_ch_mobility = str(os.environ.get("COMP_FENICS_ALPHA_CH_MOBILITY", "constant"))
     alpha_ch_enabled = (alpha_ch_M_val != 0.0) and (alpha_ch_gamma_val != 0.0)
-
+    if fluid_space not in {"cg", "hdiv"}:
+        raise ValueError(f"Unsupported COMP_FENICS_FLUID_SPACE={fluid_space!r}.")
+    if fluid_space == "hdiv" and int(fluid_hdiv_order) != 0:
+        if not (int(fluid_hdiv_order) == 1 and int(nx) == 1 and int(ny) == 1):
+            raise NotImplementedError(
+                "Biofilm H(div) comparison currently supports RT0 on arbitrary structured meshes, "
+                "and RT1 on the single-cell whole-domain harness (COMP_FENICS_NX=1, COMP_FENICS_NY=1)."
+            )
     # Keep field insertion order stable (matches DofHandler ordering).
-    mixed_element_pc = MixedElement(
-        mesh_q2,
-        field_specs={
-            "v_x": 2,
-            "v_y": 2,
-            "p": 1,
-            "vS_x": 2,
-            "vS_y": 2,
-            "u_x": 2,
-            "u_y": 2,
-            "phi": 1,
-            "alpha": 1,
-            **({"mu_alpha": 1} if alpha_ch_enabled else {}),
-            "d": 1,
-            "S": 1,
-            "X": 1,
-        },
-    )
+    field_specs_pc = {
+        "p": 1,
+        "vS_x": 2,
+        "vS_y": 2,
+        "u_x": 2,
+        "u_y": 2,
+        "phi": 1,
+        "alpha": 1,
+        **({"mu_alpha": 1} if alpha_ch_enabled else {}),
+        "d": 1,
+        "S": 1,
+        "X": 1,
+    }
+    if fluid_space == "cg":
+        field_specs_pc = {"v_x": 2, "v_y": 2, **field_specs_pc}
+    else:
+        field_specs_pc = {"v": ("RT", int(fluid_hdiv_order)), **field_specs_pc}
+    mixed_element_pc = MixedElement(mesh_q2, field_specs=field_specs_pc)
     dof_handler_pc = DofHandler(mixed_element_pc, method="cg")
 
-    Vv_pc = FunctionSpace("v", ["v_x", "v_y"], dim=1)
     VvS_pc = FunctionSpace("vS", ["vS_x", "vS_y"], dim=1)
     Vu_pc = FunctionSpace("u", ["u_x", "u_y"], dim=1)
 
+    if fluid_space == "cg":
+        Vv_pc = FunctionSpace("v", ["v_x", "v_y"], dim=1)
+        dv_pc = VectorTrialFunction(Vv_pc, dof_handler=dof_handler_pc)
+        w_pc = VectorTestFunction(Vv_pc, dof_handler=dof_handler_pc)
+        v_k_pc = VectorFunction(name="v_k", field_names=["v_x", "v_y"], dof_handler=dof_handler_pc)
+        v_n_pc = VectorFunction(name="v_n", field_names=["v_x", "v_y"], dof_handler=dof_handler_pc)
+    else:
+        dv_pc = HdivTrialFunction("v")
+        w_pc = HdivTestFunction("v")
+        v_k_pc = HdivFunction(name="v_k", field_name="v", dof_handler=dof_handler_pc)
+        v_n_pc = HdivFunction(name="v_n", field_name="v", dof_handler=dof_handler_pc)
+
     pc = {
         # trial/test
-        "dv": VectorTrialFunction(Vv_pc, dof_handler=dof_handler_pc),
+        "dv": dv_pc,
         "dp": TrialFunction("p", dof_handler=dof_handler_pc),
         "dvS": VectorTrialFunction(VvS_pc, dof_handler=dof_handler_pc),
         "du": VectorTrialFunction(Vu_pc, dof_handler=dof_handler_pc),
@@ -1899,7 +2281,7 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         "dd": TrialFunction("d", dof_handler=dof_handler_pc),
         "dS": TrialFunction("S", dof_handler=dof_handler_pc),
         "dX": TrialFunction("X", dof_handler=dof_handler_pc),
-        "w": VectorTestFunction(Vv_pc, dof_handler=dof_handler_pc),
+        "w": w_pc,
         "q": TestFunction("p", dof_handler=dof_handler_pc),
         "eta_vS": VectorTestFunction(VvS_pc, dof_handler=dof_handler_pc),
         "eta": VectorTestFunction(Vu_pc, dof_handler=dof_handler_pc),
@@ -1910,7 +2292,7 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         "r": TestFunction("S", dof_handler=dof_handler_pc),
         "y": TestFunction("X", dof_handler=dof_handler_pc),
         # states at k (t_{n+1})
-        "v_k": VectorFunction(name="v_k", field_names=["v_x", "v_y"], dof_handler=dof_handler_pc),
+        "v_k": v_k_pc,
         "p_k": Function(name="p_k", field_name="p", dof_handler=dof_handler_pc),
         "vS_k": VectorFunction(name="vS_k", field_names=["vS_x", "vS_y"], dof_handler=dof_handler_pc),
         "u_k": VectorFunction(name="u_k", field_names=["u_x", "u_y"], dof_handler=dof_handler_pc),
@@ -1921,7 +2303,7 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         "S_k": Function(name="S_k", field_name="S", dof_handler=dof_handler_pc),
         "X_k": Function(name="X_k", field_name="X", dof_handler=dof_handler_pc),
         # states at n (t_n)
-        "v_n": VectorFunction(name="v_n", field_names=["v_x", "v_y"], dof_handler=dof_handler_pc),
+        "v_n": v_n_pc,
         "p_n": Function(name="p_n", field_name="p", dof_handler=dof_handler_pc),
         "vS_n": VectorFunction(name="vS_n", field_names=["vS_x", "vS_y"], dof_handler=dof_handler_pc),
         "u_n": VectorFunction(name="u_n", field_names=["u_x", "u_y"], dof_handler=dof_handler_pc),
@@ -1935,11 +2317,14 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         "rho_f": Constant(1.0, dim=0),
         "mu_f": Constant(1.0e-2, dim=0),
         "kappa_inv": Constant(10.0, dim=0),
+        "kappa_inv_model": str(kappa_inv_model),
         "mu_s": Constant(1.0, dim=0),
         "lambda_s": Constant(1.0, dim=0),
         "dt": Constant(dt_val, dim=0),
         "theta": float(theta_val),
         "fluid_convection": str(fluid_convection),
+        "fluid_space": str(fluid_space),
+        "fluid_hdiv_order": int(fluid_hdiv_order),
         "alpha_advect_with": str(alpha_advect_with),
         "alpha_advection_form": str(alpha_advection_form),
         "gamma_div": float(gamma_div_val),
@@ -1949,6 +2334,9 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         "v_supg": float(v_supg_val),
         "v_supg_mode": str(v_supg_mode),
         "v_supg_c_nu": float(v_supg_c_nu_val),
+        "hdiv_tangential_dirichlet": bool(hdiv_tangential_dirichlet),
+        "hdiv_tangential_gamma": float(hdiv_tangential_gamma),
+        "hdiv_tangential_method": str(hdiv_tangential_method),
         # Optional Cahn–Hilliard regularization for alpha (adds mu_alpha when enabled).
         "alpha_ch_enabled": bool(alpha_ch_enabled),
         "alpha_ch_M": float(alpha_ch_M_val),
@@ -1986,21 +2374,36 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
     gdim = mesh_fx.geometry.dim
     P2_vec = basix.ufl.element("Lagrange", "quadrilateral", 2, shape=(gdim,))
     P1 = basix.ufl.element("Lagrange", "quadrilateral", 1)
+    fluid_el_fx = basix.ufl.element("RT", "quadrilateral", int(fluid_hdiv_order) + 1) if fluid_space == "hdiv" else P2_vec
     if alpha_ch_enabled:
         # W = (v, p, vS, u, phi, alpha, mu_alpha, d, S, X)
-        W_el = mixed_element([P2_vec, P1, P2_vec, P2_vec, P1, P1, P1, P1, P1, P1])
+        W_el = mixed_element([fluid_el_fx, P1, P2_vec, P2_vec, P1, P1, P1, P1, P1, P1])
     else:
         # W = (v, p, vS, u, phi, alpha, d, S, X)
-        W_el = mixed_element([P2_vec, P1, P2_vec, P2_vec, P1, P1, P1, P1, P1])
+        W_el = mixed_element([fluid_el_fx, P1, P2_vec, P2_vec, P1, P1, P1, P1, P1])
     W = dolfinx.fem.functionspace(mesh_fx, W_el)
+
+    facet_tags = None
+    if fluid_space == "hdiv" and bool(hdiv_tangential_dirichlet):
+        fdim = mesh_fx.topology.dim - 1
+        facet_blocks = [
+            dolfinx.mesh.locate_entities_boundary(mesh_fx, fdim, lambda x: np.isclose(x[0], 0.0)),
+            dolfinx.mesh.locate_entities_boundary(mesh_fx, fdim, lambda x: np.isclose(x[1], 0.0)),
+            dolfinx.mesh.locate_entities_boundary(mesh_fx, fdim, lambda x: np.isclose(x[1], 1.0)),
+        ]
+        tagged_facets = np.unique(np.concatenate([blk.astype(np.int32, copy=False) for blk in facet_blocks]))
+        tagged_values = np.full(tagged_facets.shape, 1, dtype=np.int32)
+        facet_tags = dolfinx.mesh.meshtags(mesh_fx, fdim, tagged_facets, tagged_values)
 
     fenicsx = {
         "W": W,
         "mesh": mesh_fx,
+        "hdiv_tangential_facet_tags": facet_tags,
         # constants
         "rho_f": dolfinx.fem.Constant(mesh_fx, float(pc["rho_f"].value)),
         "mu_f": dolfinx.fem.Constant(mesh_fx, float(pc["mu_f"].value)),
         "kappa_inv": dolfinx.fem.Constant(mesh_fx, float(pc["kappa_inv"].value)),
+        "kappa_inv_model": str(kappa_inv_model),
         "mu_s": dolfinx.fem.Constant(mesh_fx, float(pc["mu_s"].value)),
         "lambda_s": dolfinx.fem.Constant(mesh_fx, float(pc["lambda_s"].value)),
         "dt": dolfinx.fem.Constant(mesh_fx, dt_val),
@@ -2015,6 +2418,9 @@ def setup_biofilm_problems(*, nx: int = 2, ny: int = 2):
         "v_supg": dolfinx.fem.Constant(mesh_fx, float(v_supg_val)),
         "v_supg_mode": str(v_supg_mode),
         "v_supg_c_nu": dolfinx.fem.Constant(mesh_fx, float(v_supg_c_nu_val)),
+        "hdiv_tangential_dirichlet": bool(hdiv_tangential_dirichlet),
+        "hdiv_tangential_gamma": dolfinx.fem.Constant(mesh_fx, float(hdiv_tangential_gamma)),
+        "hdiv_tangential_method": str(hdiv_tangential_method),
         "alpha_ch_enabled": bool(alpha_ch_enabled),
         "alpha_ch_M": dolfinx.fem.Constant(mesh_fx, float(alpha_ch_M_val)),
         "alpha_ch_gamma": dolfinx.fem.Constant(mesh_fx, float(alpha_ch_gamma_val)),
@@ -2145,6 +2551,245 @@ def create_true_dof_map_biofilm(dof_handler_pc: DofHandler, W_fenicsx, *, includ
 
     print("Biofilm DoF map discovered successfully.")
     return P
+
+
+def _biofilm_hdiv_state_vector(pc, dof_handler_pc: DofHandler, *, suffix: str, include_mu_alpha: bool = False) -> np.ndarray:
+    state = np.zeros(dof_handler_pc.total_dofs, dtype=float)
+    state[np.asarray(dof_handler_pc.get_field_slice("v"), dtype=int)] = np.asarray(pc[f"v_{suffix}"].nodal_values, dtype=float)
+    state[np.asarray(dof_handler_pc.get_field_slice("p"), dtype=int)] = np.asarray(pc[f"p_{suffix}"].nodal_values, dtype=float)
+    for base, fields in (("vS", ("vS_x", "vS_y")), ("u", ("u_x", "u_y"))):
+        vec = pc[f"{base}_{suffix}"]
+        state[np.asarray(dof_handler_pc.get_field_slice(fields[0]), dtype=int)] = np.asarray(vec.nodal_values_component(0), dtype=float)
+        state[np.asarray(dof_handler_pc.get_field_slice(fields[1]), dtype=int)] = np.asarray(vec.nodal_values_component(1), dtype=float)
+    for fld in ("phi", "alpha", "d", "S", "X"):
+        state[np.asarray(dof_handler_pc.get_field_slice(fld), dtype=int)] = np.asarray(pc[f"{fld}_{suffix}"].nodal_values, dtype=float)
+    if include_mu_alpha:
+        state[np.asarray(dof_handler_pc.get_field_slice("mu_alpha"), dtype=int)] = np.asarray(pc[f"mu_alpha_{suffix}"].nodal_values, dtype=float)
+    return state
+
+
+def create_true_dof_map_biofilm_hdiv(dof_handler_pc: DofHandler, W_fenicsx, *, include_mu_alpha: bool = False):
+    print("=" * 70)
+    if include_mu_alpha:
+        print("Discovering biofilm H(div) DoF map (RT,p,vS,u,phi,alpha,mu_alpha,d,S,X)...")
+    else:
+        print("Discovering biofilm H(div) DoF map (RT,p,vS,u,phi,alpha,d,S,X)...")
+    print("=" * 70)
+
+    P = np.zeros(dof_handler_pc.total_dofs, dtype=int)
+    fx_coords_all = np.zeros((W_fenicsx.dofmap.index_map.size_global, 2), dtype=float)
+
+    Wv, Vv_map = W_fenicsx.sub(0).collapse()
+    v_fx_dofs_collapsed, v_fx_kinds, v_fx_points, v_fx_modes = _fenics_rt_dofs_and_descriptors(Wv)
+    v_fx_parent = np.asarray(Vv_map, dtype=int)[v_fx_dofs_collapsed]
+    v_pc_slice = np.asarray(dof_handler_pc.get_field_slice("v"), dtype=int)
+    _, v_pc_kinds, v_pc_points, v_pc_modes = _pycutfem_rt_dofs_and_descriptors(dof_handler_pc, "v")
+    v_pc_to_fx = _map_rt_descriptors(v_pc_kinds, v_pc_points, v_pc_modes, v_fx_kinds, v_fx_points, v_fx_modes)
+    P[v_pc_slice] = v_fx_parent[v_pc_to_fx]
+    fx_coords_all[v_fx_parent] = v_fx_points
+
+    Wp, P_map_fx = W_fenicsx.sub(1).collapse()
+    p_fx_coords = Wp.tabulate_dof_coordinates()[:, :2]
+    p_fx_parent = np.asarray(P_map_fx, dtype=int)
+    p_pc_slice = np.asarray(dof_handler_pc.get_field_slice("p"), dtype=int)
+    p_pc_coords = get_pycutfem_dof_coords(dof_handler_pc, "p")
+    p_pc_to_fx = one_to_one_map_coords(p_pc_coords, p_fx_coords)
+    P[p_pc_slice] = p_fx_parent[p_pc_to_fx]
+    fx_coords_all[p_fx_parent] = p_fx_coords
+
+    for parent_idx, pc_prefix in ((2, "vS"), (3, "u")):
+        Wvec, Vec_map = W_fenicsx.sub(parent_idx).collapse()
+        W0, V0_map = Wvec.sub(0).collapse()
+        W1, V1_map = Wvec.sub(1).collapse()
+        vec_fx_coords = W0.tabulate_dof_coordinates()[:, :2]
+        vec_fx_parent0 = np.asarray(Vec_map, dtype=int)[np.asarray(V0_map, dtype=int)]
+        vec_fx_parent1 = np.asarray(Vec_map, dtype=int)[np.asarray(V1_map, dtype=int)]
+        pc_field0 = f"{pc_prefix}_x"
+        pc_field1 = f"{pc_prefix}_y"
+        pc_slice0 = np.asarray(dof_handler_pc.get_field_slice(pc_field0), dtype=int)
+        pc_slice1 = np.asarray(dof_handler_pc.get_field_slice(pc_field1), dtype=int)
+        pc_coords0 = get_pycutfem_dof_coords(dof_handler_pc, pc_field0)
+        pc_to_fx = one_to_one_map_coords(pc_coords0, vec_fx_coords)
+        P[pc_slice0] = vec_fx_parent0[pc_to_fx]
+        P[pc_slice1] = vec_fx_parent1[pc_to_fx]
+        fx_coords_all[vec_fx_parent0] = vec_fx_coords
+        fx_coords_all[vec_fx_parent1] = W1.tabulate_dof_coordinates()[:, :2]
+
+    scalar_parents = [(4, "phi"), (5, "alpha")]
+    next_idx = 6
+    if include_mu_alpha:
+        scalar_parents.append((next_idx, "mu_alpha"))
+        next_idx += 1
+    scalar_parents.extend(((next_idx, "d"), (next_idx + 1, "S"), (next_idx + 2, "X")))
+    for parent_idx, fld in scalar_parents:
+        Ws, S_map_fx = W_fenicsx.sub(parent_idx).collapse()
+        fx_coords = Ws.tabulate_dof_coordinates()[:, :2]
+        fx_parent = np.asarray(S_map_fx, dtype=int)
+        pc_slice = np.asarray(dof_handler_pc.get_field_slice(fld), dtype=int)
+        pc_coords = get_pycutfem_dof_coords(dof_handler_pc, fld)
+        pc_to_fx = one_to_one_map_coords(pc_coords, fx_coords)
+        P[pc_slice] = fx_parent[pc_to_fx]
+        fx_coords_all[fx_parent] = fx_coords
+
+    print("Biofilm H(div) DoF map discovered successfully.")
+    return {
+        "P": P,
+        "fx_coords_all": fx_coords_all,
+        "v_pc_slice": v_pc_slice,
+        "v_pc_to_fx_collapsed": np.asarray(v_pc_to_fx, dtype=int),
+    }
+
+
+def create_true_dof_transform_biofilm_hdiv_rt1_single_cell(
+    dof_handler_pc: DofHandler,
+    W_fenicsx,
+    *,
+    include_mu_alpha: bool = False,
+):
+    """
+    Build a full mixed-space transform for the single-cell RT1 biofilm harness.
+
+    The RT block requires a genuine local basis transform rather than the
+    signed-permutation map used for RT0.
+    """
+    base = create_true_dof_map_biofilm_hdiv(
+        dof_handler_pc,
+        W_fenicsx,
+        include_mu_alpha=include_mu_alpha,
+    )
+    mixed_element_pc = dof_handler_pc.mixed_element
+    if int(getattr(mixed_element_pc._ref["v"], "k", -1)) != 1 or int(mixed_element_pc.mesh.n_elements) != 1:
+        raise NotImplementedError("RT1 whole-domain transform helper currently targets a single quadrilateral element.")
+
+    n_pc = int(dof_handler_pc.total_dofs)
+    n_fx = int(W_fenicsx.dofmap.index_map.size_global)
+    T_basis = np.zeros((n_fx, n_pc), dtype=float)
+    T_coeff = np.zeros((n_fx, n_pc), dtype=float)
+
+    P = np.asarray(base["P"], dtype=int)
+    v_pc_slice = np.asarray(base["v_pc_slice"], dtype=int)
+    mask_nonrt = np.ones((n_pc,), dtype=bool)
+    mask_nonrt[v_pc_slice] = False
+    nonrt_cols = np.nonzero(mask_nonrt)[0]
+    T_basis[P[nonrt_cols], nonrt_cols] = 1.0
+    T_coeff[P[nonrt_cols], nonrt_cols] = 1.0
+
+    Vv_fx, Vv_to_W = W_fenicsx.sub(0).collapse()
+    v_fx_parent = np.asarray(Vv_to_W, dtype=int)
+    B_pc_to_fx = _build_rt1_local_transform(mixed_element_pc, Vv_fx, field="v")
+    T_basis[np.ix_(v_fx_parent, v_pc_slice)] = np.asarray(B_pc_to_fx, dtype=float)
+    T_coeff[np.ix_(v_fx_parent, v_pc_slice)] = np.asarray(B_pc_to_fx, dtype=float)
+
+    base["T"] = T_basis
+    base["T_coeff"] = T_coeff
+    return base
+
+
+def initialize_biofilm_hdiv_functions(pc, fenicsx, dof_handler_pc, map_info, *, include_mu_alpha: bool = False):
+    print("Initializing biofilm H(div) state vectors in pycutfem and FEniCSx...")
+
+    def v_k_init(x):
+        return 0.1 + 0.2 * x[0] + 0.05 * x[1]
+
+    def v_n_init(x):
+        return 0.07 + 0.11 * x[0] - 0.03 * x[1]
+
+    def vS_k_init(x):
+        return [0.06 + 0.01 * x[0] - 0.03 * x[1], -0.02 + 0.02 * x[0] + 0.01 * x[1]]
+
+    def vS_n_init(x):
+        vv = vS_k_init(x)
+        return [0.6 * vv[0], 0.6 * vv[1]]
+
+    def u_k_init(x):
+        return [0.02 * x[0] * (1.0 - x[0]) + 0.01 * x[1], -0.01 * x[1] * (1.0 - x[1]) + 0.005 * x[0]]
+
+    def u_n_init(x):
+        uu = u_k_init(x)
+        return [0.6 * uu[0], 0.6 * uu[1]]
+
+    def p_k_init(x):
+        return 0.2 * x[0] - 0.1 * x[1] + 0.3
+
+    def p_n_init(x):
+        return 0.5 * p_k_init(x)
+
+    def phi_k_init(x):
+        return 0.72 + 0.03 * x[0] - 0.02 * x[1]
+
+    def phi_n_init(x):
+        return 0.70 + 0.02 * x[0] - 0.01 * x[1]
+
+    def alpha_k_init(x):
+        return 0.55 + 0.03 * x[0] + 0.01 * x[1]
+
+    def alpha_n_init(x):
+        return 0.50 + 0.02 * x[0] + 0.01 * x[1]
+
+    def mu_alpha_k_init(x):
+        return 0.12 + 0.01 * x[0] - 0.015 * x[1]
+
+    def mu_alpha_n_init(x):
+        return 0.10 + 0.008 * x[0] - 0.01 * x[1]
+
+    def d_k_init(x):
+        return 0.18 + 0.03 * x[0] - 0.02 * x[1]
+
+    def d_n_init(x):
+        return 0.12 + 0.02 * x[0] - 0.01 * x[1]
+
+    def S_k_init(x):
+        return 0.22 + 0.05 * x[0] + 0.02 * x[1]
+
+    def S_n_init(x):
+        return 0.20 + 0.03 * x[0] + 0.01 * x[1]
+
+    def X_k_init(x):
+        return 0.08 + 0.01 * x[0] + 0.015 * x[1]
+
+    def X_n_init(x):
+        return 0.05 + 0.01 * x[0] + 0.01 * x[1]
+
+    v_coords = get_pycutfem_dof_coords(dof_handler_pc, "v")
+    pc["v_k"].nodal_values[:] = np.asarray([v_k_init(xy) for xy in v_coords], dtype=float)
+    pc["v_n"].nodal_values[:] = np.asarray([v_n_init(xy) for xy in v_coords], dtype=float)
+    pc["vS_k"].set_values_from_function(lambda x, y: vS_k_init([x, y]))
+    pc["vS_n"].set_values_from_function(lambda x, y: vS_n_init([x, y]))
+    pc["u_k"].set_values_from_function(lambda x, y: u_k_init([x, y]))
+    pc["u_n"].set_values_from_function(lambda x, y: u_n_init([x, y]))
+    pc["p_k"].set_values_from_function(lambda x, y: p_k_init([x, y]))
+    pc["p_n"].set_values_from_function(lambda x, y: p_n_init([x, y]))
+    pc["phi_k"].set_values_from_function(lambda x, y: phi_k_init([x, y]))
+    pc["phi_n"].set_values_from_function(lambda x, y: phi_n_init([x, y]))
+    pc["alpha_k"].set_values_from_function(lambda x, y: alpha_k_init([x, y]))
+    pc["alpha_n"].set_values_from_function(lambda x, y: alpha_n_init([x, y]))
+    if include_mu_alpha:
+        pc["mu_alpha_k"].set_values_from_function(lambda x, y: mu_alpha_k_init([x, y]))
+        pc["mu_alpha_n"].set_values_from_function(lambda x, y: mu_alpha_n_init([x, y]))
+    pc["d_k"].set_values_from_function(lambda x, y: d_k_init([x, y]))
+    pc["d_n"].set_values_from_function(lambda x, y: d_n_init([x, y]))
+    pc["S_k"].set_values_from_function(lambda x, y: S_k_init([x, y]))
+    pc["S_n"].set_values_from_function(lambda x, y: S_n_init([x, y]))
+    pc["X_k"].set_values_from_function(lambda x, y: X_k_init([x, y]))
+    pc["X_n"].set_values_from_function(lambda x, y: X_n_init([x, y]))
+
+    x_pc_k = _biofilm_hdiv_state_vector(pc, dof_handler_pc, suffix="k", include_mu_alpha=include_mu_alpha)
+    x_pc_n = _biofilm_hdiv_state_vector(pc, dof_handler_pc, suffix="n", include_mu_alpha=include_mu_alpha)
+    fenicsx["w_k"].x.array[:] = 0.0
+    fenicsx["w_n"].x.array[:] = 0.0
+    transform = map_info.get("T", None)
+    transform_coeff = map_info.get("T_coeff", transform)
+    if transform_coeff is not None:
+        T = np.asarray(transform_coeff, dtype=float)
+        fenicsx["w_k"].x.array[:] = np.asarray(T @ x_pc_k, dtype=float)
+        fenicsx["w_n"].x.array[:] = np.asarray(T @ x_pc_n, dtype=float)
+    else:
+        sign_map = np.asarray(map_info["sign_map"], dtype=float)
+        P_map = np.asarray(map_info["P"], dtype=int)
+        fenicsx["w_k"].x.array[P_map] = sign_map * x_pc_k
+        fenicsx["w_n"].x.array[P_map] = sign_map * x_pc_n
+    fenicsx["w_k"].x.scatter_forward()
+    fenicsx["w_n"].x.scatter_forward()
 
 
 def initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, *, include_mu_alpha: bool = False):
@@ -2297,14 +2942,101 @@ def initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, *, include_
 
 
 def run_biofilm_comparison():
+    nx = int(os.environ.get("COMP_FENICS_NX", "2"))
+    ny = int(os.environ.get("COMP_FENICS_NY", os.environ.get("COMP_FENICS_NX", "2")))
     pc, dof_handler_pc, fenicsx = setup_biofilm_problems(
-        nx=int(os.environ.get("COMP_FENICS_NX", "2")),
-        ny=int(os.environ.get("COMP_FENICS_NY", os.environ.get("COMP_FENICS_NX", "2"))),
+        nx=nx,
+        ny=ny,
     )
     W_fx = fenicsx["W"]
     include_mu_alpha = bool(pc.get("alpha_ch_enabled", False))
-    P_map = create_true_dof_map_biofilm(dof_handler_pc, W_fx, include_mu_alpha=include_mu_alpha)
-    initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, include_mu_alpha=include_mu_alpha)
+    fluid_space = str(pc.get("fluid_space", "cg")).strip().lower()
+    fluid_hdiv_order = int(pc.get("fluid_hdiv_order", 0))
+    use_sparse_compare = _env_truthy("COMP_FENICS_SPARSE_COMPARE", False)
+    sign_map = np.ones(dof_handler_pc.total_dofs, dtype=float)
+    fx_coords_all = None
+    transform_map = None
+    if fluid_space == "hdiv":
+        if int(fluid_hdiv_order) == 1 and int(nx) == 1 and int(ny) == 1:
+            map_info = create_true_dof_transform_biofilm_hdiv_rt1_single_cell(
+                dof_handler_pc,
+                W_fx,
+                include_mu_alpha=include_mu_alpha,
+            )
+            transform_map = np.asarray(map_info["T"], dtype=float)
+            P_map = None
+            fx_coords_all = np.asarray(map_info["fx_coords_all"], dtype=float)
+            initialize_biofilm_hdiv_functions(
+                pc,
+                fenicsx,
+                dof_handler_pc,
+                map_info,
+                include_mu_alpha=include_mu_alpha,
+            )
+        else:
+            map_info = create_true_dof_map_biofilm_hdiv(dof_handler_pc, W_fx, include_mu_alpha=include_mu_alpha)
+            P_map = np.asarray(map_info["P"], dtype=int)
+            fx_coords_all = np.asarray(map_info["fx_coords_all"], dtype=float)
+            v_pc_slice = np.asarray(map_info["v_pc_slice"], dtype=int)
+            v_pc_to_fx_collapsed = np.asarray(map_info["v_pc_to_fx_collapsed"], dtype=int)
+
+            qdeg_map = int(os.environ.get("COMP_FENICS_QDEG", "6"))
+            M_pc_full, _ = assemble_form(
+                Equation(inner(pc["dv"], pc["w"]) * dx(metadata={"q": qdeg_map}), None),
+                dof_handler_pc,
+                bcs=[],
+                backend="python",
+            )
+            M_pc = M_pc_full.tocsr()[v_pc_slice, :][:, v_pc_slice].toarray()
+
+            Vv_fx, _ = W_fx.sub(0).collapse()
+            dvv_fx = ufl.TrialFunction(Vv_fx)
+            wv_fx = ufl.TestFunction(Vv_fx)
+            M_fx_form = dolfinx.fem.form(ufl.inner(dvv_fx, wv_fx) * ufl.dx(metadata={"quadrature_degree": int(max(1, 2 * qdeg_map - 1))}))
+            A_mass_fx = dolfinx.fem.petsc.assemble_matrix(M_fx_form)
+            A_mass_fx.assemble()
+            indptr, indices, data = A_mass_fx.getValuesCSR()
+            M_fx = csr_matrix((data, indices, indptr), shape=A_mass_fx.getSize()).tocsr()
+            M_fx_perm = M_fx[v_pc_to_fx_collapsed, :][:, v_pc_to_fx_collapsed].toarray()
+
+            sign_map[v_pc_slice] = _recover_sign_congruence(M_pc, M_fx_perm)
+
+            p_pc_slice = np.asarray(dof_handler_pc.get_field_slice("p"), dtype=int)
+            C_pc_full, _ = assemble_form(
+                Equation(pc["q"] * div(pc["dv"]) * dx(metadata={"q": qdeg_map}), None),
+                dof_handler_pc,
+                bcs=[],
+                backend="python",
+            )
+            C_pc = C_pc_full.tocsr()[p_pc_slice, :][:, v_pc_slice].toarray()
+
+            dw_anchor_fx = ufl.TrialFunction(W_fx)
+            w_anchor_fx = ufl.TestFunction(W_fx)
+            dv_anchor_fx = ufl.split(dw_anchor_fx)[0]
+            q_anchor_fx = ufl.split(w_anchor_fx)[1]
+            C_fx_form = dolfinx.fem.form(
+                q_anchor_fx * ufl.div(dv_anchor_fx) * ufl.dx(metadata={"quadrature_degree": int(max(1, 2 * qdeg_map - 1))})
+            )
+            A_cpl_fx = dolfinx.fem.petsc.assemble_matrix(C_fx_form)
+            A_cpl_fx.assemble()
+            indptr, indices, data = A_cpl_fx.getValuesCSR()
+            C_fx_full = csr_matrix((data, indices, indptr), shape=A_cpl_fx.getSize()).tocsr()
+            C_fx = C_fx_full[np.asarray(P_map[p_pc_slice], dtype=int), :][:, np.asarray(P_map[v_pc_slice], dtype=int)].toarray()
+            score = float(np.sum(C_pc * (C_fx * sign_map[v_pc_slice][None, :])))
+            if score < 0.0:
+                sign_map[v_pc_slice] *= -1.0
+
+            map_info["sign_map"] = sign_map
+            initialize_biofilm_hdiv_functions(
+                pc,
+                fenicsx,
+                dof_handler_pc,
+                map_info,
+                include_mu_alpha=include_mu_alpha,
+            )
+    else:
+        P_map = create_true_dof_map_biofilm(dof_handler_pc, W_fx, include_mu_alpha=include_mu_alpha)
+        initialize_biofilm_functions(pc, fenicsx, dof_handler_pc, P_map, include_mu_alpha=include_mu_alpha)
 
     # Split mixed functions and arguments on the FEniCSx side
     dw_fx = ufl.TrialFunction(W_fx)
@@ -2330,6 +3062,8 @@ def run_biofilm_comparison():
     rho_f_fx = fenicsx["rho_f"]
     mu_f_fx = fenicsx["mu_f"]
     kappa_inv_fx = fenicsx["kappa_inv"]
+    kappa_inv_model_key = str(fenicsx.get("kappa_inv_model", "spatial")).strip().lower()
+    gdim = int(fenicsx["mesh"].geometry.dim)
     mu_s_fx = fenicsx["mu_s"]
     lambda_s_fx = fenicsx["lambda_s"]
     dt_fx = fenicsx["dt"]
@@ -2380,6 +3114,31 @@ def run_biofilm_comparison():
     qdeg_fx = int(os.environ.get("COMP_FENICS_QDEG_FX", str(max(1, 2 * qdeg - 1))))
     dx_pc = dx(metadata={"q": qdeg})
     dx_fx = ufl.dx(metadata={"quadrature_degree": qdeg_fx})
+    ds_hdiv_tangential_pc = None
+    ds_hdiv_tangential_fx = None
+    if fluid_space == "hdiv" and bool(pc.get("hdiv_tangential_dirichlet", False)):
+        edge_mask = np.zeros(len(pc["mesh"].edges_list), dtype=bool)
+        for edge in pc["mesh"].edges_list:
+            if edge.right is not None:
+                continue
+            edge_nodes = getattr(edge, "all_nodes", None) or edge.nodes
+            coords = np.asarray(pc["mesh"].nodes_x_y_pos[list(edge_nodes)], dtype=float)
+            mid = coords[int(coords.shape[0] // 2)] if coords.shape[0] >= 3 else coords.mean(axis=0)
+            x_mid = float(mid[0])
+            y_mid = float(mid[1])
+            if abs(x_mid - 0.0) <= 1.0e-12 or abs(y_mid - 0.0) <= 1.0e-12 or abs(y_mid - 1.0) <= 1.0e-12:
+                edge_mask[int(edge.gid)] = True
+        ds_hdiv_tangential_pc = dS(
+            defined_on=BitSet(edge_mask),
+            metadata={"q": qdeg},
+        )
+        if fenicsx.get("hdiv_tangential_facet_tags") is not None:
+            ds_hdiv_tangential_fx = ufl.Measure(
+                "ds",
+                domain=fenicsx["mesh"],
+                subdomain_data=fenicsx["hdiv_tangential_facet_tags"],
+                metadata={"quadrature_degree": qdeg_fx},
+            )
     print(f"[biofilm] quadrature: pycutfem q={qdeg}, fenics quadrature_degree={qdeg_fx}")
     Jdet_fx = ufl.JacobianDeterminant(fenicsx["mesh"])
     # Match pycutfem MeshSize() on quads.
@@ -2396,6 +3155,54 @@ def run_biofilm_comparison():
 
     def eps_fx(v):
         return ufl.sym(ufl.grad(v))
+
+    def grad_component_fx(vec_expr, i: int, j: int):
+        return vec_expr[i].dx(j)
+
+    def advected_grad_fx(vec_expr, adv_vec):
+        comps = []
+        for i in range(gdim):
+            comp = 0
+            for j in range(gdim):
+                comp += grad_component_fx(vec_expr, i, j) * adv_vec[j]
+            comps.append(comp)
+        return ufl.as_vector(comps)
+
+    def _laplace_components_fx(vec_expr):
+        comps = []
+        for i in range(gdim):
+            comps.append(vec_expr[i].dx(0).dx(0) + vec_expr[i].dx(1).dx(1))
+        return tuple(comps)
+
+    def _grad_div_components_hdiv_fx(v_expr):
+        if int(gdim) != 2:
+            raise NotImplementedError("Biofilm H(div) FEniCSx comparison currently targets 2D only.")
+        return (
+            v_expr[0].dx(0).dx(0) + v_expr[1].dx(0).dx(1),
+            v_expr[0].dx(0).dx(1) + v_expr[1].dx(1).dx(1),
+        )
+
+    def strong_div_2mu_eps_hdiv_fx(v_expr, mu_expr):
+        grad_mu = ufl.grad(mu_expr)
+        lap_v = _laplace_components_fx(v_expr)
+        grad_div_v = _grad_div_components_hdiv_fx(v_expr)
+        comps = []
+        for i in range(gdim):
+            comp = mu_expr * (lap_v[i] + grad_div_v[i])
+            for j in range(gdim):
+                eps_ij = 0.5 * (grad_component_fx(v_expr, i, j) + grad_component_fx(v_expr, j, i))
+                comp += 2.0 * eps_ij * grad_mu[j]
+            comps.append(comp)
+        return ufl.as_vector(comps)
+
+    def tangent_fx(n_expr):
+        return ufl.as_vector((n_expr[1], -n_expr[0]))
+
+    def tangential_component_fx(vec_expr, n_expr):
+        return ufl.dot(vec_expr, tangent_fx(n_expr))
+
+    def tangential_viscous_traction_fx(v_expr, mu_expr, n_expr):
+        return ufl.dot(2.0 * mu_expr * eps_fx(v_expr) * n_expr, tangent_fx(n_expr))
 
     def one_minus(a):
         return 1.0 - a
@@ -2435,8 +3242,29 @@ def run_biofilm_comparison():
     g_perm_k_fx = (1.0 - damage_kappa_perm_fx) * (one_m_d_k_fx * one_m_d_k_fx) + damage_kappa_perm_fx
     g_perm_n_fx = (1.0 - damage_kappa_perm_fx) * (one_m_d_n_fx * one_m_d_n_fx) + damage_kappa_perm_fx
 
-    beta_k_fx = alpha_k_fx * mu_f_fx * (phi_k_fx * phi_k_fx) * g_perm_k_fx * kappa_inv_fx
-    beta_n_fx = alpha_n_fx * mu_f_fx * (phi_n_fx * phi_n_fx) * g_perm_n_fx * kappa_inv_fx
+    beta_coeff_k_fx = alpha_k_fx * mu_f_fx * (phi_k_fx * phi_k_fx) * g_perm_k_fx
+    beta_coeff_n_fx = alpha_n_fx * mu_f_fx * (phi_n_fx * phi_n_fx) * g_perm_n_fx
+    beta_k_fx = beta_coeff_k_fx * kappa_inv_fx
+    beta_n_fx = beta_coeff_n_fx * kappa_inv_fx
+    use_refmap_drag_fx = kappa_inv_model_key in {"refmap", "eulerian_refmap", "eulerian", "reference_map", "reference-map"}
+    if use_refmap_drag_fx:
+        I_fx = ufl.Identity(gdim)
+        Finv_k_ref_fx = I_fx - ufl.grad(u_k_fx)
+        Finv_n_ref_fx = I_fx - ufl.grad(u_n_fx)
+        Fk_ref_fx = ufl.inv(Finv_k_ref_fx)
+        Fn_ref_fx = ufl.inv(Finv_n_ref_fx)
+        Jk_ref_fx = ufl.det(Fk_ref_fx)
+        Jn_ref_fx = ufl.det(Fn_ref_fx)
+        Kinv_ref_fx = kappa_inv_fx * I_fx
+        k_inv_k_fx = Jk_ref_fx * ufl.dot(Finv_k_ref_fx.T, ufl.dot(Kinv_ref_fx, Finv_k_ref_fx))
+        k_inv_n_fx = Jn_ref_fx * ufl.dot(Finv_n_ref_fx.T, ufl.dot(Kinv_ref_fx, Finv_n_ref_fx))
+        kdrag_k_fx = ufl.dot(k_inv_k_fx, v_k_fx - vS_k_fx)
+        kdrag_n_fx = ufl.dot(k_inv_n_fx, v_n_fx - vS_n_fx)
+    elif kappa_inv_model_key in {"spatial", "constant", "const"}:
+        kdrag_k_fx = None
+        kdrag_n_fx = None
+    else:
+        raise ValueError(f"Unsupported COMP_FENICS_KAPPA_INV_MODEL={kappa_inv_model_key!r} for biofilm comparison.")
 
     # Detachment coefficient (lagged by v_n)
     eta_n = 1.0e-12
@@ -2485,10 +3313,35 @@ def run_biofilm_comparison():
     r_mom_fx += 2.0 * (1.0 - theta_fx) * mu_n_fx * ufl.inner(eps_fx(v_n_fx), eps_fx(w_fx)) * dx_fx
     r_mom_fx += -p_k_fx * div_C_w_fx * dx_fx
     r_mom_fx += gamma_div_fx * divF_k_fx * div_C_w_fx * dx_fx
-    r_mom_fx += beta_k_fx * ufl.dot(v_k_fx, w_fx) * dx_fx
-    r_mom_fx += -beta_k_fx * ufl.dot(vS_k_fx, w_fx) * dx_fx
+    if use_refmap_drag_fx:
+        r_mom_fx += beta_coeff_k_fx * ufl.dot(kdrag_k_fx, w_fx) * dx_fx
+    else:
+        r_mom_fx += beta_k_fx * ufl.dot(v_k_fx, w_fx) * dx_fx
+        r_mom_fx += -beta_k_fx * ufl.dot(vS_k_fx, w_fx) * dx_fx
+    if ds_hdiv_tangential_fx is not None:
+        n_b_fx = ufl.FacetNormal(fenicsx["mesh"])
+        vt_k_fx = tangential_component_fx(v_k_fx, n_b_fx)
+        vt_n_fx = tangential_component_fx(v_n_fx, n_b_fx)
+        wt_fx = tangential_component_fx(w_fx, n_b_fx)
+        gap_t_k_fx = vt_k_fx
+        gap_t_n_fx = vt_n_fx
+        penalty_t_fx = fenicsx["hdiv_tangential_gamma"] / (h_fx + 1.0e-16)
+        r_mom_fx += (
+            penalty_t_fx * (theta_fx * mu_k_fx * gap_t_k_fx + (1.0 - theta_fx) * mu_n_fx * gap_t_n_fx) * wt_fx
+        ) * ds_hdiv_tangential_fx(1)
+        if str(fenicsx.get("hdiv_tangential_method", "penalty")) == "nitsche":
+            traction_t_k_fx = tangential_viscous_traction_fx(v_k_fx, mu_k_fx, n_b_fx)
+            traction_t_n_fx = tangential_viscous_traction_fx(v_n_fx, mu_n_fx, n_b_fx)
+            traction_t_w_k_fx = tangential_viscous_traction_fx(w_fx, mu_k_fx, n_b_fx)
+            traction_t_w_n_fx = tangential_viscous_traction_fx(w_fx, mu_n_fx, n_b_fx)
+            r_mom_fx += (
+                -(theta_fx * traction_t_k_fx + (1.0 - theta_fx) * traction_t_n_fx) * wt_fx
+                - (theta_fx * traction_t_w_k_fx * gap_t_k_fx + (1.0 - theta_fx) * traction_t_w_n_fx * gap_t_n_fx)
+            ) * ds_hdiv_tangential_fx(1)
 
     if float(v_supg_fx.value) != 0.0 and float(rho_f_fx.value) != 0.0:
+        if use_refmap_drag_fx:
+            raise NotImplementedError("Biofilm comparison harness does not define SUPG drag-rate scaling for refmap kappa_inv_model.")
         if v_supg_mode_key in {"streamline", "weak", "legacy"}:
             vmag_n_fx = ufl.sqrt(ufl.dot(v_n_fx, v_n_fx) + 1.0e-12)
             rho_safe_n_fx = rho_n_fx + 1.0e-16
@@ -2501,8 +3354,8 @@ def run_biofilm_comparison():
                 + drag_rate_n_fx * drag_rate_n_fx
                 + 1.0e-16
             )
-            adv_v_k_fx = ufl.dot(ufl.grad(v_k_fx), v_n_fx)
-            adv_w_fx = ufl.dot(ufl.grad(w_fx), v_n_fx)
+            adv_v_k_fx = advected_grad_fx(v_k_fx, v_n_fx)
+            adv_w_fx = advected_grad_fx(w_fx, v_n_fx)
             r_mom_fx += tau_v_fx * (1.0 - alpha_n_fx) * ufl.inner(adv_v_k_fx, adv_w_fx) * dx_fx
         elif v_supg_mode_key in {"residual", "strong", "strong_residual", "strong-residual"}:
             vmag_k_fx = ufl.sqrt(ufl.dot(v_k_fx, v_k_fx) + 1.0e-12)
@@ -2516,16 +3369,22 @@ def run_biofilm_comparison():
                 + drag_rate_k_fx * drag_rate_k_fx
                 + 1.0e-16
             )
-            strong_visc_k_fx = ufl.div(2.0 * mu_k_fx * eps_fx(v_k_fx))
+            if fluid_space == "hdiv":
+                strong_visc_k_fx = strong_div_2mu_eps_hdiv_fx(v_k_fx, mu_k_fx)
+            else:
+                strong_visc_k_fx = ufl.div(2.0 * mu_k_fx * eps_fx(v_k_fx))
             strong_mom_k_fx = ((rho_k_fx * (v_k_fx - v_n_fx)) / dt_fx) - strong_visc_k_fx + C_k_fx * ufl.grad(p_k_fx)
             if fluid_convection_key == "full":
-                strong_mom_k_fx += rho_k_fx * ufl.dot(ufl.grad(v_k_fx), v_k_fx) + div_rhov_k_fx * v_k_fx
+                strong_mom_k_fx += rho_k_fx * advected_grad_fx(v_k_fx, v_k_fx) + div_rhov_k_fx * v_k_fx
             elif fluid_convection_key in {"lagged", "explicit"}:
-                strong_mom_k_fx += rho_n_fx * ufl.dot(ufl.grad(v_k_fx), v_n_fx) + div_rhov_n_fx * v_k_fx
+                strong_mom_k_fx += rho_n_fx * advected_grad_fx(v_k_fx, v_n_fx) + div_rhov_n_fx * v_k_fx
             elif fluid_convection_key == "imex":
-                strong_mom_k_fx += rho_n_fx * ufl.dot(ufl.grad(v_n_fx), v_n_fx) + div_rhov_n_fx * v_n_fx
-            strong_mom_k_fx += beta_k_fx * (v_k_fx - vS_k_fx)
-            adv_w_fx = ufl.dot(ufl.grad(w_fx), v_k_fx)
+                strong_mom_k_fx += rho_n_fx * advected_grad_fx(v_n_fx, v_n_fx) + div_rhov_n_fx * v_n_fx
+            if use_refmap_drag_fx:
+                strong_mom_k_fx += beta_coeff_k_fx * kdrag_k_fx
+            else:
+                strong_mom_k_fx += beta_k_fx * (v_k_fx - vS_k_fx)
+            adv_w_fx = advected_grad_fx(w_fx, v_k_fx)
             r_mom_fx += tau_v_fx * (1.0 - alpha_k_fx) * ufl.inner(strong_mom_k_fx, adv_w_fx) * dx_fx
         else:
             raise ValueError(f"Unknown COMP_FENICS_V_SUPG_MODE={v_supg_mode_key!r}.")
@@ -2569,8 +3428,12 @@ def run_biofilm_comparison():
     r_skel_press_k_fx = -p_k_fx * div_B_eta_k_fx
     r_skel_press_n_fx = -p_n_fx * div_B_eta_n_fx
     r_skel_press_k_fx += gamma_div_fx * divF_k_fx * div_B_eta_k_fx
-    r_skel_drag_k_fx = -beta_k_fx * ufl.dot(v_k_fx - vS_k_fx, eta_vS_fx)
-    r_skel_drag_n_fx = -beta_n_fx * ufl.dot(v_n_fx - vS_n_fx, eta_vS_fx)
+    if use_refmap_drag_fx:
+        r_skel_drag_k_fx = -beta_coeff_k_fx * ufl.dot(kdrag_k_fx, eta_vS_fx)
+        r_skel_drag_n_fx = -beta_coeff_n_fx * ufl.dot(kdrag_n_fx, eta_vS_fx)
+    else:
+        r_skel_drag_k_fx = -beta_k_fx * ufl.dot(v_k_fx - vS_k_fx, eta_vS_fx)
+        r_skel_drag_n_fx = -beta_n_fx * ufl.dot(v_n_fx - vS_n_fx, eta_vS_fx)
     sk_th_fx = 1.0
     sk_one_m_th_fx = 0.0
     r_skeleton_fx = (
@@ -2835,6 +3698,7 @@ def run_biofilm_comparison():
         rho_f=pc["rho_f"],
         mu_f=pc["mu_f"],
         kappa_inv=pc["kappa_inv"],
+        kappa_inv_model=str(pc["kappa_inv_model"]),
         mu_s=pc["mu_s"],
         lambda_s=pc["lambda_s"],
         fluid_convection=str(pc["fluid_convection"]),
@@ -2845,6 +3709,9 @@ def run_biofilm_comparison():
         v_supg=float(pc["v_supg"]),
         v_supg_mode=str(pc["v_supg_mode"]),
         v_supg_c_nu=float(pc["v_supg_c_nu"]),
+        ds_hdiv_tangential=ds_hdiv_tangential_pc,
+        hdiv_tangential_gamma=float(pc["hdiv_tangential_gamma"]),
+        hdiv_tangential_method=str(pc["hdiv_tangential_method"]),
         alpha_advect_with=str(pc["alpha_advect_with"]),
         alpha_advection_form=str(pc["alpha_advection_form"]),
         D_phi=float(pc["D_phi"]),
@@ -2954,7 +3821,8 @@ def run_biofilm_comparison():
                 A = dolfinx.fem.petsc.assemble_matrix(form_fx_compiled)
                 A.assemble()
                 indptr, indices, data = A.getValuesCSR()
-                fenics_ref[name] = csr_matrix((data, indices, indptr), shape=A.getSize()).toarray()
+                mat_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).tocsr()
+                fenics_ref[name] = mat_fx if use_sparse_compare else mat_fx.toarray()
             else:
                 vec = dolfinx.fem.petsc.assemble_vector(form_fx_compiled)
                 fenics_ref[name] = vec.array.copy()
@@ -3002,13 +3870,23 @@ def run_biofilm_comparison():
             # Backend parity (pycutfem) against a reference backend
             if backend_type == ref_backend:
                 if spec["mat"]:
-                    ref_pc[name] = J_pc.toarray()
+                    ref_pc[name] = J_pc.tocsr().copy() if use_sparse_compare else J_pc.toarray()
                 else:
                     ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
             else:
                 try:
                     if spec["mat"]:
-                        np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                        if use_sparse_compare:
+                            ok, max_abs, worst = _sparse_matrix_allclose(
+                                J_pc.tocsr(),
+                                ref_pc[name],
+                                rtol=parity_rtol,
+                                atol=parity_atol,
+                            )
+                            if not ok:
+                                raise AssertionError(f"sparse mismatch: max_abs={max_abs:.3e}, worst={worst}")
+                        else:
+                            np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
                     else:
                         np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
                     print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
@@ -3034,6 +3912,9 @@ def run_biofilm_comparison():
                 W_fx,
                 rtol=1e-8,
                 atol=1e-8,
+                sign_map=sign_map,
+                fx_coords_all=fx_coords_all,
+                transform=transform_map,
             )
             if is_success:
                 success_count += 1
@@ -3042,6 +3923,524 @@ def run_biofilm_comparison():
 
         print_test_summary(success_count, failed_tests)
 
+
+def _benchmark7_hdiv_state_vector(problem, *, suffix: str) -> np.ndarray:
+    dh = problem["dh"]
+    state = np.zeros(dh.total_dofs, dtype=float)
+
+    state[np.asarray(dh.get_field_slice("v"), dtype=int)] = np.asarray(problem[f"v_{suffix}"].nodal_values, dtype=float)
+    state[np.asarray(dh.get_field_slice("p"), dtype=int)] = np.asarray(problem[f"p_{suffix}"].nodal_values, dtype=float)
+
+    for base, fields in (("vS", ("vS_x", "vS_y")), ("u", ("u_x", "u_y"))):
+        vec = problem[f"{base}_{suffix}"]
+        state[np.asarray(dh.get_field_slice(fields[0]), dtype=int)] = np.asarray(vec.nodal_values_component(0), dtype=float)
+        state[np.asarray(dh.get_field_slice(fields[1]), dtype=int)] = np.asarray(vec.nodal_values_component(1), dtype=float)
+
+    state[np.asarray(dh.get_field_slice("alpha"), dtype=int)] = np.asarray(problem[f"alpha_{suffix}"].nodal_values, dtype=float)
+    state[np.asarray(dh.get_field_slice("mu_alpha"), dtype=int)] = np.asarray(problem[f"mu_{suffix}"].nodal_values, dtype=float)
+    return state
+
+
+def setup_benchmark7_hdiv_problems(*, nx: int = 2, ny: int = 3):
+    Lx = float(os.environ.get("COMP_FENICS_B7_LX", "1.0"))
+    Ly = float(os.environ.get("COMP_FENICS_B7_LY", "1.5"))
+    poly_order = int(os.environ.get("COMP_FENICS_B7_POLY_ORDER", "2"))
+    pressure_order = int(os.environ.get("COMP_FENICS_B7_PRESSURE_ORDER", str(max(1, poly_order - 1))))
+    scalar_order = int(os.environ.get("COMP_FENICS_B7_SCALAR_ORDER", str(max(1, poly_order - 1))))
+    fluid_hdiv_order = int(os.environ.get("COMP_FENICS_B7_FLUID_HDIV_ORDER", "0"))
+    if fluid_hdiv_order != 0:
+        raise NotImplementedError("Seboldt H(div) comparison currently targets RT0 only (fluid_hdiv_order=0).")
+    problem_pc = create_benchmark7_seboldt_problem(
+        Lx=Lx,
+        Ly=Ly,
+        nx=int(nx),
+        ny=int(ny),
+        poly_order=int(poly_order),
+        pressure_order=int(pressure_order),
+        scalar_order=int(scalar_order),
+        fluid_space="hdiv",
+        fluid_hdiv_order=int(fluid_hdiv_order),
+        enable_phi_evolution=False,
+    )
+    dof_handler_pc = problem_pc["dh"]
+
+    p_family = "DQ" if int(pressure_order) == 0 else "Lagrange"
+    s_family = "DQ" if int(scalar_order) == 0 else "Lagrange"
+
+    mesh_fx = dolfinx.mesh.create_rectangle(
+        MPI.COMM_WORLD,
+        [np.array([0.0, 0.0], dtype=float), np.array([Lx, Ly], dtype=float)],
+        [int(nx), int(ny)],
+        cell_type=dolfinx.mesh.CellType.quadrilateral,
+    )
+    gdim = mesh_fx.geometry.dim
+    RT = basix.ufl.element("RT", "quadrilateral", int(fluid_hdiv_order) + 1)
+    Pp = basix.ufl.element(p_family, "quadrilateral", int(pressure_order))
+    Pvec = basix.ufl.element("Lagrange", "quadrilateral", int(poly_order), shape=(gdim,))
+    Ps = basix.ufl.element(s_family, "quadrilateral", int(scalar_order))
+    W_el = mixed_element([RT, Pp, Pvec, Pvec, Ps, Ps])
+    W = dolfinx.fem.functionspace(mesh_fx, W_el)
+
+    params = {
+        "Lx": Lx,
+        "Ly": Ly,
+        "poly_order": int(poly_order),
+        "pressure_order": int(pressure_order),
+        "scalar_order": int(scalar_order),
+        "fluid_hdiv_order": int(fluid_hdiv_order),
+        "qdeg": int(os.environ.get("COMP_FENICS_B7_QDEG", str(max(6, 2 * poly_order + 2)))),
+        "dt": float(os.environ.get("COMP_FENICS_DT", "0.1")),
+        "theta": float(os.environ.get("COMP_FENICS_THETA", "0.5")),
+        "rho_f": float(os.environ.get("COMP_FENICS_B7_RHO_F", "1.0")),
+        "mu_f": float(os.environ.get("COMP_FENICS_B7_MU_F", "0.035")),
+        "mu_b": float(os.environ.get("COMP_FENICS_B7_MU_B", "0.035")),
+        "kappa_inv": float(os.environ.get("COMP_FENICS_B7_KAPPA_INV", "1000.0")),
+        "mu_s": float(os.environ.get("COMP_FENICS_B7_MU_S", "1.67785e5")),
+        "lambda_s": float(os.environ.get("COMP_FENICS_B7_LAMBDA_S", "8.22148e6")),
+        "phi_b": float(os.environ.get("COMP_FENICS_B7_PHI_B", "0.5")),
+        "M_alpha": float(os.environ.get("COMP_FENICS_B7_M_ALPHA", "1.0")),
+        "gamma_alpha": float(os.environ.get("COMP_FENICS_B7_GAMMA_ALPHA", "1.0")),
+        "eps_alpha": float(os.environ.get("COMP_FENICS_B7_EPS_ALPHA", "0.05")),
+        "gamma_div": float(os.environ.get("COMP_FENICS_B7_GAMMA_DIV", "0.0")),
+    }
+
+    fenicsx = {
+        "W": W,
+        "mesh": mesh_fx,
+        "rho_f": dolfinx.fem.Constant(mesh_fx, params["rho_f"]),
+        "mu_f": dolfinx.fem.Constant(mesh_fx, params["mu_f"]),
+        "mu_b": dolfinx.fem.Constant(mesh_fx, params["mu_b"]),
+        "kappa_inv": dolfinx.fem.Constant(mesh_fx, params["kappa_inv"]),
+        "mu_s": dolfinx.fem.Constant(mesh_fx, params["mu_s"]),
+        "lambda_s": dolfinx.fem.Constant(mesh_fx, params["lambda_s"]),
+        "phi_b": dolfinx.fem.Constant(mesh_fx, params["phi_b"]),
+        "dt": dolfinx.fem.Constant(mesh_fx, params["dt"]),
+        "theta": dolfinx.fem.Constant(mesh_fx, params["theta"]),
+        "M_alpha": dolfinx.fem.Constant(mesh_fx, params["M_alpha"]),
+        "gamma_alpha": dolfinx.fem.Constant(mesh_fx, params["gamma_alpha"]),
+        "eps_alpha": dolfinx.fem.Constant(mesh_fx, params["eps_alpha"]),
+        "gamma_div": dolfinx.fem.Constant(mesh_fx, params["gamma_div"]),
+        "w_k": dolfinx.fem.Function(W, name="w_k"),
+        "w_n": dolfinx.fem.Function(W, name="w_n"),
+    }
+    return problem_pc, dof_handler_pc, fenicsx, params
+
+
+def create_true_dof_map_benchmark7_hdiv(dof_handler_pc: DofHandler, W_fenicsx):
+    print("=" * 70)
+    print("Discovering Seboldt H(div) DoF map (RT,p,vS,u,alpha,mu_alpha)...")
+    print("=" * 70)
+
+    P = np.zeros(dof_handler_pc.total_dofs, dtype=int)
+    fx_coords_all = np.zeros((W_fenicsx.dofmap.index_map.size_global, 2), dtype=float)
+
+    Wv, Vv_map = W_fenicsx.sub(0).collapse()
+    v_fx_dofs_collapsed, v_fx_kinds, v_fx_points, v_fx_modes = _fenics_rt_dofs_and_descriptors(Wv)
+    v_fx_parent = np.asarray(Vv_map, dtype=int)[v_fx_dofs_collapsed]
+    v_pc_slice = np.asarray(dof_handler_pc.get_field_slice("v"), dtype=int)
+    _, v_pc_kinds, v_pc_points, v_pc_modes = _pycutfem_rt_dofs_and_descriptors(dof_handler_pc, "v")
+    v_pc_to_fx = _map_rt_descriptors(v_pc_kinds, v_pc_points, v_pc_modes, v_fx_kinds, v_fx_points, v_fx_modes)
+    P[v_pc_slice] = v_fx_parent[v_pc_to_fx]
+    fx_coords_all[v_fx_parent] = v_fx_points
+
+    Wp, P_map_fx = W_fenicsx.sub(1).collapse()
+    p_fx_coords = Wp.tabulate_dof_coordinates()[:, :2]
+    p_fx_parent = np.asarray(P_map_fx, dtype=int)
+    p_pc_slice = np.asarray(dof_handler_pc.get_field_slice("p"), dtype=int)
+    p_pc_coords = get_pycutfem_dof_coords(dof_handler_pc, "p")
+    p_pc_to_fx = one_to_one_map_coords(p_pc_coords, p_fx_coords)
+    P[p_pc_slice] = p_fx_parent[p_pc_to_fx]
+    fx_coords_all[p_fx_parent] = p_fx_coords
+
+    for parent_idx, pc_prefix in ((2, "vS"), (3, "u")):
+        Wvec, Vec_map = W_fenicsx.sub(parent_idx).collapse()
+        W0, V0_map = Wvec.sub(0).collapse()
+        W1, V1_map = Wvec.sub(1).collapse()
+        vec_fx_coords = W0.tabulate_dof_coordinates()[:, :2]
+        vec_fx_parent0 = np.asarray(Vec_map, dtype=int)[np.asarray(V0_map, dtype=int)]
+        vec_fx_parent1 = np.asarray(Vec_map, dtype=int)[np.asarray(V1_map, dtype=int)]
+        pc_field0 = f"{pc_prefix}_x"
+        pc_field1 = f"{pc_prefix}_y"
+        pc_slice0 = np.asarray(dof_handler_pc.get_field_slice(pc_field0), dtype=int)
+        pc_slice1 = np.asarray(dof_handler_pc.get_field_slice(pc_field1), dtype=int)
+        pc_coords0 = get_pycutfem_dof_coords(dof_handler_pc, pc_field0)
+        pc_to_fx = one_to_one_map_coords(pc_coords0, vec_fx_coords)
+        P[pc_slice0] = vec_fx_parent0[pc_to_fx]
+        P[pc_slice1] = vec_fx_parent1[pc_to_fx]
+        fx_coords_all[vec_fx_parent0] = vec_fx_coords
+        fx_coords_all[vec_fx_parent1] = W1.tabulate_dof_coordinates()[:, :2]
+
+    for parent_idx, fld in ((4, "alpha"), (5, "mu_alpha")):
+        Ws, S_map_fx = W_fenicsx.sub(parent_idx).collapse()
+        fx_coords = Ws.tabulate_dof_coordinates()[:, :2]
+        fx_parent = np.asarray(S_map_fx, dtype=int)
+        pc_slice = np.asarray(dof_handler_pc.get_field_slice(fld), dtype=int)
+        pc_coords = get_pycutfem_dof_coords(dof_handler_pc, fld)
+        pc_to_fx = one_to_one_map_coords(pc_coords, fx_coords)
+        P[pc_slice] = fx_parent[pc_to_fx]
+        fx_coords_all[fx_parent] = fx_coords
+
+    print("Seboldt H(div) DoF map discovered successfully.")
+    return {
+        "P": P,
+        "fx_coords_all": fx_coords_all,
+        "v_pc_slice": v_pc_slice,
+        "v_pc_to_fx_collapsed": np.asarray(v_pc_to_fx, dtype=int),
+    }
+
+
+def initialize_benchmark7_hdiv_functions(problem, fenicsx, map_info):
+    print("Initializing Seboldt H(div) state vectors in pycutfem and FEniCSx...")
+
+    dh = problem["dh"]
+    v_coords = get_pycutfem_dof_coords(dh, "v")
+    problem["v_k"].nodal_values[:] = 0.18 + 0.04 * v_coords[:, 0] - 0.03 * v_coords[:, 1]
+    problem["v_n"].nodal_values[:] = -0.07 + 0.03 * v_coords[:, 0] + 0.02 * v_coords[:, 1]
+
+    problem["p_k"].set_values_from_function(lambda x, y: 0.25 + 0.10 * x - 0.05 * y)
+    problem["p_n"].set_values_from_function(lambda x, y: 0.12 + 0.04 * x - 0.03 * y)
+    problem["vS_k"].set_values_from_function(lambda x, y: np.array([0.05 + 0.02 * x - 0.01 * y, -0.03 + 0.01 * x + 0.015 * y]))
+    problem["vS_n"].set_values_from_function(lambda x, y: np.array([0.03 + 0.01 * x - 0.008 * y, -0.015 + 0.008 * x + 0.010 * y]))
+    problem["u_k"].set_values_from_function(lambda x, y: np.array([0.015 + 0.010 * x * (1.0 - x), -0.008 + 0.006 * y * (1.0 - y / 1.5)]))
+    problem["u_n"].set_values_from_function(lambda x, y: np.array([0.010 + 0.006 * x * (1.0 - x), -0.005 + 0.004 * y * (1.0 - y / 1.5)]))
+    problem["alpha_k"].set_values_from_function(lambda x, y: 0.58 + 0.015 * x + 0.010 * y)
+    problem["alpha_n"].set_values_from_function(lambda x, y: 0.54 + 0.010 * x + 0.008 * y)
+    problem["mu_k"].set_values_from_function(lambda x, y: 0.10 + 0.020 * x - 0.015 * y)
+    problem["mu_n"].set_values_from_function(lambda x, y: 0.07 + 0.015 * x - 0.010 * y)
+
+    x_pc_k = _benchmark7_hdiv_state_vector(problem, suffix="k")
+    x_pc_n = _benchmark7_hdiv_state_vector(problem, suffix="n")
+    sign_map = np.asarray(map_info["sign_map"], dtype=float)
+    P_map = np.asarray(map_info["P"], dtype=int)
+
+    fenicsx["w_k"].x.array[:] = 0.0
+    fenicsx["w_n"].x.array[:] = 0.0
+    fenicsx["w_k"].x.array[P_map] = sign_map * x_pc_k
+    fenicsx["w_n"].x.array[P_map] = sign_map * x_pc_n
+    fenicsx["w_k"].x.scatter_forward()
+    fenicsx["w_n"].x.scatter_forward()
+
+
+def run_benchmark7_hdiv_comparison():
+    problem_pc, dof_handler_pc, fenicsx, params = setup_benchmark7_hdiv_problems(
+        nx=int(os.environ.get("COMP_FENICS_NX", "2")),
+        ny=int(os.environ.get("COMP_FENICS_NY", "3")),
+    )
+    W_fx = fenicsx["W"]
+    map_info = create_true_dof_map_benchmark7_hdiv(dof_handler_pc, W_fx)
+    P_map = np.asarray(map_info["P"], dtype=int)
+    fx_coords_all = np.asarray(map_info["fx_coords_all"], dtype=float)
+    v_pc_slice = np.asarray(map_info["v_pc_slice"], dtype=int)
+    v_pc_to_fx_collapsed = np.asarray(map_info["v_pc_to_fx_collapsed"], dtype=int)
+    use_sparse_compare = _env_truthy("COMP_FENICS_SPARSE_COMPARE", False)
+
+    M_pc_full, _ = assemble_form(
+        Equation(inner(problem_pc["dv"], problem_pc["v_test"]) * dx(metadata={"q": int(params["qdeg"])}), None),
+        dof_handler_pc,
+        bcs=[],
+        backend="python",
+    )
+    M_pc = M_pc_full.tocsr()[v_pc_slice, :][:, v_pc_slice].toarray()
+
+    Vv_fx, _ = W_fx.sub(0).collapse()
+    dvv_fx = ufl.TrialFunction(Vv_fx)
+    wv_fx = ufl.TestFunction(Vv_fx)
+    M_fx_form = dolfinx.fem.form(ufl.inner(dvv_fx, wv_fx) * ufl.dx(metadata={"quadrature_degree": int(params["qdeg"])}))
+    A_mass_fx = dolfinx.fem.petsc.assemble_matrix(M_fx_form)
+    A_mass_fx.assemble()
+    indptr, indices, data = A_mass_fx.getValuesCSR()
+    M_fx = csr_matrix((data, indices, indptr), shape=A_mass_fx.getSize()).tocsr()
+    M_fx_perm = M_fx[v_pc_to_fx_collapsed, :][:, v_pc_to_fx_collapsed].toarray()
+
+    sign_map = np.ones(dof_handler_pc.total_dofs, dtype=float)
+    sign_map[v_pc_slice] = _recover_sign_congruence(M_pc, M_fx_perm)
+
+    # The RT mass matrix fixes signs only up to a global +/- per connected RT block.
+    # Anchor that remaining ambiguity with a pressure-divergence coupling.
+    p_pc_slice = np.asarray(dof_handler_pc.get_field_slice("p"), dtype=int)
+    C_pc_full, _ = assemble_form(
+        Equation(problem_pc["q_test"] * div(problem_pc["dv"]) * dx(metadata={"q": int(params["qdeg"])}), None),
+        dof_handler_pc,
+        bcs=[],
+        backend="python",
+    )
+    C_pc = C_pc_full.tocsr()[p_pc_slice, :][:, v_pc_slice].toarray()
+
+    dw_anchor_fx = ufl.TrialFunction(W_fx)
+    w_anchor_fx = ufl.TestFunction(W_fx)
+    _, _, _, _, _, _ = ufl.split(dw_anchor_fx)
+    _, q_anchor_fx, _, _, _, _ = ufl.split(w_anchor_fx)
+    dv_anchor_fx, _, _, _, _, _ = ufl.split(dw_anchor_fx)
+    C_fx_form = dolfinx.fem.form(q_anchor_fx * ufl.div(dv_anchor_fx) * ufl.dx(metadata={"quadrature_degree": int(params["qdeg"])}))
+    A_cpl_fx = dolfinx.fem.petsc.assemble_matrix(C_fx_form)
+    A_cpl_fx.assemble()
+    indptr, indices, data = A_cpl_fx.getValuesCSR()
+    C_fx_full = csr_matrix((data, indices, indptr), shape=A_cpl_fx.getSize()).tocsr()
+    C_fx = C_fx_full[np.asarray(P_map[p_pc_slice], dtype=int), :][:, np.asarray(P_map[v_pc_slice], dtype=int)].toarray()
+    score = float(np.sum(C_pc * (C_fx * sign_map[v_pc_slice][None, :])))
+    if score < 0.0:
+        sign_map[v_pc_slice] *= -1.0
+
+    map_info["sign_map"] = sign_map
+
+    initialize_benchmark7_hdiv_functions(problem_pc, fenicsx, map_info)
+
+    forms_pc = build_benchmark7_seboldt_forms(
+        problem_pc,
+        qdeg=int(params["qdeg"]),
+        dt_c=Constant(float(params["dt"])),
+        theta=float(params["theta"]),
+        rho_f=float(params["rho_f"]),
+        mu_f=float(params["mu_f"]),
+        mu_b=float(params["mu_b"]),
+        mu_b_model="mu",
+        kappa_inv=float(params["kappa_inv"]),
+        mu_s=float(params["mu_s"]),
+        lambda_s=float(params["lambda_s"]),
+        phi_b=float(params["phi_b"]),
+        M_alpha=float(params["M_alpha"]),
+        gamma_alpha=float(params["gamma_alpha"]),
+        eps_alpha=float(params["eps_alpha"]),
+        solid_visco_eta=0.0,
+        gamma_div=float(params["gamma_div"]),
+        gamma_u=0.0,
+        u_extension_mode="l2",
+        gamma_u_pin=0.0,
+        u_cip=0.0,
+        u_cip_weight="fluid",
+        vS_cip=0.0,
+        gamma_vS=None,
+        vS_extension_mode=None,
+        gamma_vS_pin=None,
+        D_phi=0.0,
+        phi_diffusion_weight="fluid",
+        gamma_phi=0.0,
+        phi_supg=0.0,
+        phi_cip=0.0,
+        alpha_regularization="ch",
+        alpha_reg_gamma=1.0,
+        alpha_reg_eps_normal=float(params["eps_alpha"]),
+        alpha_reg_eps_tangent=0.25 * float(params["eps_alpha"]),
+        alpha_reg_eta=1.0e-12,
+        alpha_advect_with="vS",
+        alpha_advection_form="conservative",
+        solid_model="linear",
+        kappa_inv_model="spatial",
+        enable_phi_evolution=False,
+    )
+
+    dw_fx = ufl.TrialFunction(W_fx)
+    w_test_fx = ufl.TestFunction(W_fx)
+    dv_fx, dp_fx, dvS_fx, du_fx, dalpha_fx, dmu_alpha_fx = ufl.split(dw_fx)
+    w_fx, q_fx, eta_vS_fx, eta_u_fx, xi_fx, eta_mu_fx = ufl.split(w_test_fx)
+    v_k_fx, p_k_fx, vS_k_fx, u_k_fx, alpha_k_fx, mu_alpha_k_fx = ufl.split(fenicsx["w_k"])
+    v_n_fx, p_n_fx, vS_n_fx, u_n_fx, alpha_n_fx, mu_alpha_n_fx = ufl.split(fenicsx["w_n"])
+
+    def eps_fx(v):
+        return 0.5 * (ufl.grad(v) + ufl.grad(v).T)
+
+    def div_weighted_fx(weight, grad_weight, vec):
+        return weight * ufl.div(vec) + ufl.dot(grad_weight, vec)
+
+    dx_fx = ufl.dx(metadata={"quadrature_degree": int(params["qdeg"])})
+    th_fx = fenicsx["theta"]
+    one_m_th_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.0) - th_fx
+    inv_dt_fx = dolfinx.fem.Constant(fenicsx["mesh"], 1.0) / fenicsx["dt"]
+
+    C_n_fx = 1.0 - alpha_n_fx * (1.0 - fenicsx["phi_b"])
+    B_n_fx = alpha_n_fx * (1.0 - fenicsx["phi_b"])
+    gradC_n_fx = -(1.0 - fenicsx["phi_b"]) * ufl.grad(alpha_n_fx)
+    gradB_n_fx = (1.0 - fenicsx["phi_b"]) * ufl.grad(alpha_n_fx)
+    rho_n_fx = fenicsx["rho_f"] * C_n_fx
+    mu_n_fx = (1.0 - alpha_n_fx) * fenicsx["mu_f"] + alpha_n_fx * fenicsx["mu_b"]
+
+    div_C_w_fx = div_weighted_fx(C_n_fx, gradC_n_fx, w_fx)
+    div_B_vStest_fx = div_weighted_fx(B_n_fx, gradB_n_fx, eta_vS_fx)
+    div_C_vk_fx = div_weighted_fx(C_n_fx, gradC_n_fx, v_k_fx)
+    div_B_vSk_fx = div_weighted_fx(B_n_fx, gradB_n_fx, vS_k_fx)
+
+    r_mom_fx = (rho_n_fx * inv_dt_fx) * (ufl.inner(v_k_fx, w_fx) - ufl.inner(v_n_fx, w_fx)) * dx_fx
+    r_mom_fx += th_fx * rho_n_fx * ufl.dot(ufl.dot(ufl.grad(v_k_fx), v_n_fx), w_fx) * dx_fx
+    r_mom_fx += one_m_th_fx * rho_n_fx * ufl.dot(ufl.dot(ufl.grad(v_n_fx), v_n_fx), w_fx) * dx_fx
+    r_mom_fx += th_fx * 2.0 * mu_n_fx * ufl.inner(eps_fx(v_k_fx), eps_fx(w_fx)) * dx_fx
+    r_mom_fx += one_m_th_fx * 2.0 * mu_n_fx * ufl.inner(eps_fx(v_n_fx), eps_fx(w_fx)) * dx_fx
+    r_mom_fx += -(p_k_fx * div_C_w_fx) * dx_fx
+
+    r_mass_fx = q_fx * (div_C_vk_fx + div_weighted_fx(B_n_fx, gradB_n_fx, vS_k_fx)) * dx_fx
+
+    r_el_k_fx = 2.0 * fenicsx["mu_s"] * ufl.inner(eps_fx(u_k_fx), eps_fx(eta_vS_fx))
+    r_el_k_fx += fenicsx["lambda_s"] * ufl.div(u_k_fx) * ufl.div(eta_vS_fx)
+    r_el_n_fx = 2.0 * fenicsx["mu_s"] * ufl.inner(eps_fx(u_n_fx), eps_fx(eta_vS_fx))
+    r_el_n_fx += fenicsx["lambda_s"] * ufl.div(u_n_fx) * ufl.div(eta_vS_fx)
+
+    r_skel_fx = th_fx * alpha_n_fx * r_el_k_fx * dx_fx
+    r_skel_fx += one_m_th_fx * alpha_n_fx * r_el_n_fx * dx_fx
+    r_skel_fx += -(p_k_fx * div_B_vStest_fx) * dx_fx
+
+    beta_n_fx = alpha_n_fx * fenicsx["mu_f"] * fenicsx["kappa_inv"]
+    diff_k_fx = v_k_fx - vS_k_fx
+    diff_n_fx = v_n_fx - vS_n_fx
+    r_mom_fx += beta_n_fx * (th_fx * ufl.dot(diff_k_fx, w_fx) + one_m_th_fx * ufl.dot(diff_n_fx, w_fx)) * dx_fx
+    r_skel_fx += -beta_n_fx * (th_fx * ufl.dot(diff_k_fx, eta_vS_fx) + one_m_th_fx * ufl.dot(diff_n_fx, eta_vS_fx)) * dx_fx
+
+    if float(params["gamma_div"]) != 0.0:
+        mass_res_fx = div_C_vk_fx + div_weighted_fx(B_n_fx, gradB_n_fx, vS_k_fx)
+        r_mom_fx += fenicsx["gamma_div"] * mass_res_fx * div_C_w_fx * dx_fx
+        r_skel_fx += fenicsx["gamma_div"] * mass_res_fx * div_B_vStest_fx * dx_fx
+
+    r_kin_fx = inv_dt_fx * (ufl.inner(u_k_fx, eta_u_fx) - ufl.inner(u_n_fx, eta_u_fx)) * dx_fx
+    r_kin_fx += th_fx * ufl.dot(ufl.dot(ufl.grad(u_k_fx), vS_n_fx), eta_u_fx) * dx_fx
+    r_kin_fx += one_m_th_fx * ufl.dot(ufl.dot(ufl.grad(u_n_fx), vS_n_fx), eta_u_fx) * dx_fx
+    r_kin_fx += -(th_fx * ufl.dot(vS_k_fx, eta_u_fx) + one_m_th_fx * ufl.dot(vS_n_fx, eta_u_fx)) * dx_fx
+
+    div_vS_n_fx = ufl.div(vS_n_fx)
+    r_alpha_fx = xi_fx * ((alpha_k_fx - alpha_n_fx) * inv_dt_fx) * dx_fx
+    r_alpha_fx += th_fx * xi_fx * (ufl.dot(ufl.grad(alpha_k_fx), vS_n_fx) + alpha_k_fx * div_vS_n_fx) * dx_fx
+    r_alpha_fx += one_m_th_fx * xi_fx * (ufl.dot(ufl.grad(alpha_n_fx), vS_n_fx) + alpha_n_fx * div_vS_n_fx) * dx_fx
+    r_alpha_fx += fenicsx["M_alpha"] * ufl.dot(ufl.grad(mu_alpha_k_fx), ufl.grad(xi_fx)) * dx_fx
+
+    Wp_alpha_fx = 2.0 * alpha_k_fx * (1.0 - alpha_k_fx) * (1.0 - 2.0 * alpha_k_fx)
+    r_mu_alpha_fx = eta_mu_fx * mu_alpha_k_fx * dx_fx
+    r_mu_alpha_fx += -(fenicsx["gamma_alpha"] * fenicsx["eps_alpha"]) * ufl.dot(ufl.grad(alpha_k_fx), ufl.grad(eta_mu_fx)) * dx_fx
+    r_mu_alpha_fx += -(fenicsx["gamma_alpha"] / fenicsx["eps_alpha"]) * eta_mu_fx * Wp_alpha_fx * dx_fx
+
+    r_total_fx = r_mom_fx + r_mass_fx + r_skel_fx + r_kin_fx + r_alpha_fx + r_mu_alpha_fx
+
+    a_mom_fx = ufl.derivative(r_mom_fx, fenicsx["w_k"], dw_fx)
+    a_mass_fx = ufl.derivative(r_mass_fx, fenicsx["w_k"], dw_fx)
+    a_skel_fx = ufl.derivative(r_skel_fx, fenicsx["w_k"], dw_fx)
+    a_kin_fx = ufl.derivative(r_kin_fx, fenicsx["w_k"], dw_fx)
+    a_alpha_fx = ufl.derivative(r_alpha_fx, fenicsx["w_k"], dw_fx)
+    a_mu_alpha_fx = ufl.derivative(r_mu_alpha_fx, fenicsx["w_k"], dw_fx)
+    a_total_fx = ufl.derivative(r_total_fx, fenicsx["w_k"], dw_fx)
+
+    terms = {
+        "Seboldt Hdiv momentum (res)": {"pc": forms_pc.r_momentum, "fx": r_mom_fx, "mat": False},
+        "Seboldt Hdiv mass (res)": {"pc": forms_pc.r_mass, "fx": r_mass_fx, "mat": False},
+        "Seboldt Hdiv skeleton (res)": {"pc": forms_pc.r_skeleton, "fx": r_skel_fx, "mat": False},
+        "Seboldt Hdiv kinematics (res)": {"pc": forms_pc.r_kinematics, "fx": r_kin_fx, "mat": False},
+        "Seboldt Hdiv alpha (res)": {"pc": forms_pc.r_alpha, "fx": r_alpha_fx, "mat": False},
+        "Seboldt Hdiv mu_alpha (res)": {"pc": forms_pc.r_mu_alpha, "fx": r_mu_alpha_fx, "mat": False},
+        "Seboldt Hdiv total residual": {"pc": forms_pc.residual_form, "fx": r_total_fx, "mat": False},
+        "Seboldt Hdiv momentum (jac)": {"pc": forms_pc.a_momentum, "fx": a_mom_fx, "mat": True},
+        "Seboldt Hdiv mass (jac)": {"pc": forms_pc.a_mass, "fx": a_mass_fx, "mat": True},
+        "Seboldt Hdiv skeleton (jac)": {"pc": forms_pc.a_skeleton, "fx": a_skel_fx, "mat": True},
+        "Seboldt Hdiv kinematics (jac)": {"pc": forms_pc.a_kinematics, "fx": a_kin_fx, "mat": True},
+        "Seboldt Hdiv alpha (jac)": {"pc": forms_pc.a_alpha, "fx": a_alpha_fx, "mat": True},
+        "Seboldt Hdiv mu_alpha (jac)": {"pc": forms_pc.a_mu_alpha, "fx": a_mu_alpha_fx, "mat": True},
+        "Seboldt Hdiv total jacobian": {"pc": forms_pc.jacobian_form, "fx": a_total_fx, "mat": True},
+    }
+
+    filter_terms = os.environ.get("COMP_FENICS_TERMS")
+    if filter_terms:
+        allowed = {name.strip() for name in filter_terms.split(",") if name.strip()}
+        terms = {k: v for k, v in terms.items() if k in allowed}
+        print(f"Running filtered terms only: {sorted(terms)}")
+    else:
+        print(f"Running full Seboldt H(div) suite: {sorted(terms)}")
+
+    fenics_ref = {}
+    for name, spec in terms.items():
+        try:
+            form_fx_compiled = dolfinx.fem.form(spec["fx"])
+            if spec["mat"]:
+                A = dolfinx.fem.petsc.assemble_matrix(form_fx_compiled)
+                A.assemble()
+                indptr, indices, data = A.getValuesCSR()
+                mat_fx = csr_matrix((data, indices, indptr), shape=A.getSize()).tocsr()
+                fenics_ref[name] = mat_fx if use_sparse_compare else mat_fx.toarray()
+            else:
+                vec = dolfinx.fem.petsc.assemble_vector(form_fx_compiled)
+                fenics_ref[name] = vec.array.copy()
+        except Exception as exc:
+            print(f"❌ FEniCSx assembly failed for '{name}': {exc}")
+            fenics_ref[name] = None
+
+    backends_spec = os.environ.get("BACKEND", "jit")
+    if backends_spec.strip().lower() == "all":
+        backends = ["python", "jit", "cpp"]
+    else:
+        backends = [b.strip() for b in backends_spec.split(",") if b.strip()]
+    parity_rtol = float(os.environ.get("COMP_FENICS_PARITY_RTOL", "1e-9"))
+    parity_atol = float(os.environ.get("COMP_FENICS_PARITY_ATOL", "1e-9"))
+    ref_backend = "python" if "python" in backends else (backends[0] if backends else "python")
+    ref_pc = {}
+
+    for backend_type in backends:
+        print("\n" + "=" * 70)
+        print(f"SEBOLDT H(div) COMPARISON (backend={backend_type}, qdeg={int(params['qdeg'])})")
+        print("=" * 70)
+
+        failed_tests = []
+        success_count = 0
+
+        for name, spec in terms.items():
+            if fenics_ref.get(name) is None:
+                failed_tests.append(f"{name} (fenics-assemble)")
+                continue
+
+            J_pc, R_pc = None, None
+            print(f"\nCompiling/assembling '{name}' [backend={backend_type}]")
+            try:
+                if spec["mat"]:
+                    J_pc, _ = assemble_form(Equation(spec["pc"], None), dof_handler_pc, quad_degree=int(params["qdeg"]), bcs=[], backend=backend_type)
+                else:
+                    _, R_pc = assemble_form(Equation(None, spec["pc"]), dof_handler_pc, bcs=[], backend=backend_type)
+            except Exception as exc:
+                print(f"❌ pycutfem assembly failed for '{name}' on backend '{backend_type}': {exc}")
+                failed_tests.append(f"{name} (assemble-{backend_type})")
+                continue
+
+            if backend_type == ref_backend:
+                if spec["mat"]:
+                    ref_pc[name] = J_pc.tocsr().copy() if use_sparse_compare else J_pc.toarray()
+                else:
+                    ref_pc[name] = np.asarray(R_pc, dtype=float).copy()
+            else:
+                try:
+                    if spec["mat"]:
+                        if use_sparse_compare:
+                            ok, max_abs, worst = _sparse_matrix_allclose(
+                                J_pc.tocsr(),
+                                ref_pc[name],
+                                rtol=parity_rtol,
+                                atol=parity_atol,
+                            )
+                            if not ok:
+                                raise AssertionError(
+                                    f"sparse mismatch: max_abs={max_abs:.3e}, worst={worst}"
+                                )
+                        else:
+                            np.testing.assert_allclose(J_pc.toarray(), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                    else:
+                        np.testing.assert_allclose(np.asarray(R_pc, dtype=float), ref_pc[name], rtol=parity_rtol, atol=parity_atol)
+                    print(f"✅ pycutfem backend parity OK vs '{ref_backend}'.")
+                except Exception as exc:
+                    print(f"❌ pycutfem backend parity FAILED vs '{ref_backend}': {exc}")
+                    failed_tests.append(f"{name} (parity-{backend_type}-vs-{ref_backend})")
+
+            J_fx = fenics_ref[name] if spec["mat"] else None
+            R_fx = fenics_ref[name] if not spec["mat"] else None
+            is_success = compare_term(
+                f"{name} [backend={backend_type}]",
+                J_pc,
+                R_pc,
+                J_fx,
+                R_fx,
+                P_map,
+                dof_handler_pc,
+                W_fx,
+                rtol=1e-8,
+                atol=1e-8,
+                sign_map=sign_map,
+                fx_coords_all=fx_coords_all,
+            )
+            if is_success:
+                success_count += 1
+            else:
+                failed_tests.append(name)
+
+        print_test_summary(success_count, failed_tests)
 
 
 def setup_problems():
@@ -3160,33 +4559,67 @@ def initialize_functions(pc, fenicsx, dof_handler_pc, P_map):
     np.testing.assert_allclose(np.sort(pycutfem_uk_values), np.sort(u_k_values), rtol=1e-8, atol=1e-15)
     print("\n✅ ASSERTION PASSED: pycutfem and FEniCSx calculated the same set of nodal values for u_k.")
 
-def compare_term(term_name, J_pc, R_pc, J_fx, R_fx, P_map, dof_handler_pc, W_fenicsx, rtol=1e-8, atol=1e-8):
+def compare_term(
+    term_name,
+    J_pc,
+    R_pc,
+    J_fx,
+    R_fx,
+    P_map,
+    dof_handler_pc,
+    W_fenicsx,
+    rtol=1e-8,
+    atol=1e-8,
+    *,
+    sign_map=None,
+    fx_coords_all=None,
+    transform=None,
+):
     print("\n" + f"--- Comparing Term: {term_name} ---")
 
     output_dir = os.environ.get("COMP_FENICS_OUTDIR", "comparison_outputs")
     os.makedirs(output_dir, exist_ok=True)
     safe_term_name = term_name.replace(' ', '_').lower()
     is_successful = True
+    write_xlsx = _env_truthy("COMP_FENICS_WRITE_XLSX", True)
+    transform_arr = None if transform is None else np.asarray(transform, dtype=float)
+    if transform_arr is None:
+        if P_map is None:
+            raise ValueError("compare_term requires either P_map or transform.")
+        if sign_map is None:
+            sign_map = np.ones(len(P_map), dtype=float)
+        sign_map = np.asarray(sign_map, dtype=float).reshape(-1)
 
     if R_pc is not None and R_fx is not None:
         filename = os.path.join(output_dir, f"{safe_term_name}_residual.xlsx")
-        R_fx_reordered = R_fx[P_map]
+        if transform_arr is not None:
+            R_fx_reordered = np.asarray(transform_arr.T @ np.asarray(R_fx, dtype=float), dtype=float).reshape(-1)
+        else:
+            R_fx_reordered = sign_map * np.asarray(R_fx, dtype=float)[P_map]
         
         R_pc_flat = R_pc.flatten()
         R_fx_reordered_flat = R_fx_reordered.flatten()
 
-        pc_coords = get_all_pycutfem_dof_coords(dof_handler_pc)
-        fx_coords_all = get_all_fenicsx_dof_coords(W_fenicsx)
-        fx_coords_reordered = fx_coords_all[P_map]
-        
-        comparison_data = {
-            'pc_dof_index': np.arange(dof_handler_pc.total_dofs),
-            'pc_coord_x': pc_coords[:, 0], 'pc_coord_y': pc_coords[:, 1], 'pc_residual': R_pc_flat,
-            'fx_coord_x': fx_coords_reordered[:, 0], 'fx_coord_y': fx_coords_reordered[:, 1],
-            'fx_reordered_residual': R_fx_reordered_flat, 'abs_difference': np.abs(R_pc_flat - R_fx_reordered_flat)
-        }
-        pd.DataFrame(comparison_data).to_excel(filename, sheet_name='residual_comparison', index=False)
-        print(f"✅ Residual comparison data saved to '{filename}'")
+        comparison_data = None
+        if transform_arr is None:
+            pc_coords = get_all_pycutfem_dof_coords(dof_handler_pc)
+            if fx_coords_all is None:
+                fx_coords_all = get_all_fenicsx_dof_coords(W_fenicsx)
+            fx_coords_reordered = fx_coords_all[P_map]
+            comparison_data = {
+                'pc_dof_index': np.arange(dof_handler_pc.total_dofs),
+                'pc_coord_x': pc_coords[:, 0], 'pc_coord_y': pc_coords[:, 1], 'pc_residual': R_pc_flat,
+                'fx_coord_x': fx_coords_reordered[:, 0], 'fx_coord_y': fx_coords_reordered[:, 1],
+                'fx_reordered_residual': R_fx_reordered_flat, 'abs_difference': np.abs(R_pc_flat - R_fx_reordered_flat)
+            }
+        if write_xlsx:
+            if comparison_data is None:
+                print("ℹ️ Skipping residual Excel export for transform-based comparison.")
+            else:
+                pd.DataFrame(comparison_data).to_excel(filename, sheet_name='residual_comparison', index=False)
+                print(f"✅ Residual comparison data saved to '{filename}'")
+        else:
+            print("ℹ️ Skipping residual Excel export (COMP_FENICS_WRITE_XLSX=0).")
 
         try:
             np.testing.assert_allclose(R_pc_flat, R_fx_reordered_flat, rtol=rtol, atol=atol)
@@ -3197,21 +4630,70 @@ def compare_term(term_name, J_pc, R_pc, J_fx, R_fx, P_map, dof_handler_pc, W_fen
             is_successful = False
 
     if J_pc is not None and J_fx is not None:
-        filename = os.path.join(output_dir, f"{safe_term_name}_jacobian.xlsx")
-        J_pc_dense = J_pc.toarray()
-        J_fx_reordered = J_fx[P_map, :][:, P_map]
-        with pd.ExcelWriter(filename) as writer:
-            pd.DataFrame(J_pc_dense).to_excel(writer, sheet_name='pycutfem', index=False, header=False)
-            pd.DataFrame(J_fx_reordered).to_excel(writer, sheet_name='fenics', index=False, header=False)
-            pd.DataFrame(np.abs(J_pc_dense - J_fx_reordered)<1e-12).to_excel(writer, sheet_name='difference', index=False, header=False)
-        print(f"✅ Jacobian matrices saved to '{filename}'")
-        try:
-            np.testing.assert_allclose(J_pc_dense, J_fx_reordered, rtol=rtol, atol=atol)
-            print(f"✅ Jacobian matrix for '{term_name}' is numerically equivalent.")
-        except AssertionError as e:
-            print(f"❌ Jacobian matrix for '{term_name}' is NOT equivalent!")
-            print(e)
-            is_successful = False
+        use_sparse_compare = (
+            _env_truthy("COMP_FENICS_SPARSE_COMPARE", False)
+            or sp.issparse(J_pc)
+            or sp.issparse(J_fx)
+        )
+        if use_sparse_compare:
+            J_pc_sparse = J_pc.tocsr() if sp.issparse(J_pc) else csr_matrix(np.asarray(J_pc, dtype=float))
+            if transform_arr is not None:
+                T_sparse = csr_matrix(transform_arr)
+                if sp.issparse(J_fx):
+                    J_fx_reordered = (T_sparse.T @ J_fx.tocsr() @ T_sparse).tocsr()
+                else:
+                    J_fx_reordered = (T_sparse.T @ csr_matrix(np.asarray(J_fx, dtype=float)) @ T_sparse).tocsr()
+            else:
+                if sp.issparse(J_fx):
+                    J_fx_reordered = J_fx.tocsr()[P_map, :][:, P_map]
+                else:
+                    J_fx_reordered = csr_matrix(np.asarray(J_fx, dtype=float)[P_map, :][:, P_map])
+                D_sign = sp.diags(sign_map)
+                J_fx_reordered = (D_sign @ J_fx_reordered @ D_sign).tocsr()
+            ok, max_abs, worst = _sparse_matrix_allclose(J_pc_sparse, J_fx_reordered, rtol=rtol, atol=atol)
+            print(
+                f"ℹ️ Sparse Jacobian compare: nnz_pycutfem={J_pc_sparse.nnz}, "
+                f"nnz_fenics={J_fx_reordered.nnz}, max_abs={max_abs:.3e}"
+            )
+            if ok:
+                print(f"✅ Jacobian matrix for '{term_name}' is numerically equivalent.")
+            else:
+                print(f"❌ Jacobian matrix for '{term_name}' is NOT equivalent!")
+                if worst is not None:
+                    row, col, a_val, b_val, diff, tol = worst
+                    print(
+                        f"   Worst entry ({row}, {col}): pycutfem={a_val:.16e}, "
+                        f"fenics={b_val:.16e}, diff={diff:.3e}, tol={tol:.3e}"
+                    )
+                is_successful = False
+        else:
+            filename = os.path.join(output_dir, f"{safe_term_name}_jacobian.xlsx")
+            J_pc_dense = J_pc.toarray()
+            if transform_arr is not None:
+                J_fx_reordered = np.asarray(transform_arr.T @ np.asarray(J_fx, dtype=float) @ transform_arr, dtype=float)
+            else:
+                J_fx_reordered = np.asarray(J_fx, dtype=float)[P_map, :][:, P_map]
+                J_fx_reordered = sign_map[:, None] * J_fx_reordered * sign_map[None, :]
+            if write_xlsx:
+                if transform_arr is not None:
+                    print("ℹ️ Skipping Jacobian Excel export for transform-based comparison.")
+                else:
+                    with pd.ExcelWriter(filename) as writer:
+                        pd.DataFrame(J_pc_dense).to_excel(writer, sheet_name='pycutfem', index=False, header=False)
+                        pd.DataFrame(J_fx_reordered).to_excel(writer, sheet_name='fenics', index=False, header=False)
+                        pd.DataFrame(np.abs(J_pc_dense - J_fx_reordered) < 1e-12).to_excel(
+                            writer, sheet_name='difference', index=False, header=False
+                        )
+                    print(f"✅ Jacobian matrices saved to '{filename}'")
+            else:
+                print("ℹ️ Skipping Jacobian Excel export (COMP_FENICS_WRITE_XLSX=0).")
+            try:
+                np.testing.assert_allclose(J_pc_dense, J_fx_reordered, rtol=rtol, atol=atol)
+                print(f"✅ Jacobian matrix for '{term_name}' is numerically equivalent.")
+            except AssertionError as e:
+                print(f"❌ Jacobian matrix for '{term_name}' is NOT equivalent!")
+                print(e)
+                is_successful = False
     return is_successful
 
 def print_test_summary(success_count, failed_tests):
@@ -3458,6 +4940,9 @@ if __name__ == '__main__':
         sys.exit(0)
     if problem.startswith("alpha_ch") or problem.startswith("cahn_hilliard") or problem.startswith("cahn-hilliard"):
         run_alpha_ch_comparison()
+        sys.exit(0)
+    if problem.startswith("seboldt_hdiv") or problem.startswith("benchmark7_hdiv") or problem.startswith("b7_hdiv"):
+        run_benchmark7_hdiv_comparison()
         sys.exit(0)
     if problem.startswith("biofilm"):
         run_biofilm_comparison()

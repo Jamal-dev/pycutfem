@@ -30,6 +30,62 @@ def _parse_float_list(s: str) -> list[float]:
     return [float(p) for p in parts]
 
 
+def _read_polygon_mm(path: Path | str) -> np.ndarray:
+    arr = np.genfromtxt(str(path), delimiter=",", names=True, dtype=float)
+    if getattr(arr, "ndim", 0) == 0:
+        arr = np.asarray([arr], dtype=arr.dtype)
+    pts = np.column_stack([np.asarray(arr["x_mm"], dtype=float), np.asarray(arr["y_mm"], dtype=float)]).astype(float)
+    if pts.shape[0] < 3:
+        raise ValueError(f"Polygon in {str(path)!r} is too short (N={int(pts.shape[0])}).")
+    return pts
+
+
+def _contour_roi_from_polygon_mm(
+    path: Path | str,
+    *,
+    pad_left_mm: float = 0.0,
+    pad_right_mm: float = 0.02,
+    pad_bottom_mm: float = 0.0,
+    pad_top_mm: float = 0.02,
+) -> tuple[float, float, float, float]:
+    pts = _read_polygon_mm(path)
+    x_min = max(0.0, float(np.min(pts[:, 0])) - float(pad_left_mm))
+    x_max = float(np.max(pts[:, 0])) + float(pad_right_mm)
+    y_min = max(0.0, float(np.min(pts[:, 1])) - float(pad_bottom_mm))
+    y_max = float(np.max(pts[:, 1])) + float(pad_top_mm)
+    return float(x_min), float(x_max), float(y_min), float(y_max)
+
+
+def _crop_mask_to_mm_roi(
+    mask_u8: np.ndarray,
+    *,
+    y_base: int,
+    px_size_um: float,
+    x_min_mm: float | None = None,
+    x_max_mm: float | None = None,
+    y_min_mm: float | None = None,
+    y_max_mm: float | None = None,
+    min_area_px: int | None = None,
+) -> np.ndarray:
+    out = np.asarray(mask_u8, dtype=np.uint8).copy()
+    h, w = out.shape
+    if x_min_mm is not None:
+        x0 = int(math.ceil((1000.0 * float(x_min_mm)) / float(px_size_um)))
+        out[:, : max(0, min(w, x0))] = 0
+    if x_max_mm is not None:
+        x1 = int(math.ceil((1000.0 * float(x_max_mm)) / float(px_size_um)))
+        out[:, max(0, min(w, x1)) :] = 0
+    if y_max_mm is not None:
+        y_top = int(math.floor(float(y_base) - (1000.0 * float(y_max_mm)) / float(px_size_um)))
+        out[: max(0, min(h, y_top)), :] = 0
+    if y_min_mm is not None:
+        y_bot = int(math.ceil(float(y_base) - (1000.0 * float(y_min_mm)) / float(px_size_um)))
+        out[max(0, min(h, y_bot)) :, :] = 0
+    if min_area_px is not None and int(min_area_px) > 0:
+        out = _largest_component_u8(out, min_area=int(min_area_px))
+    return out
+
+
 def _detect_scale_bar_px(
     gray: np.ndarray,
     *,

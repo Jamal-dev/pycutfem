@@ -31,7 +31,9 @@ from examples.biofilms.benchmarks.blauert.compare_sim_vs_video import (
     _select_time_window,
 )
 from examples.biofilms.benchmarks.blauert.extract_front_displacement_from_video import (
+    _contour_roi_from_polygon_mm,
     _contour_polygon_mm,
+    _crop_mask_to_mm_roi,
     _detect_scale_bar_px,
     _detect_substrate_row,
     _overlay_rects_for_blauert_video,
@@ -45,6 +47,7 @@ from examples.biofilms.benchmarks.blauert.paper1_benchmark6_blauert_channel impo
 
 DEFAULT_EXP_CSV = Path("examples/biofilms/benchmarks/blauert/exp_front_displacement_from_video.csv")
 DEFAULT_VIDEO = Path("examples/biofilms/benchmarks/blauert/biofilm_preprocessing/1-s2.0-S0043135418307000-mmc1.mp4")
+DEFAULT_CONTOUR_ROI_POLY = Path("examples/biofilms/benchmarks/blauert/exp_frame0_polygon_mm.csv")
 
 
 def _parse_float_list(text: str) -> list[float]:
@@ -136,7 +139,15 @@ def _append_leaderboard_csv(path: Path, row: dict[str, Any]) -> None:
 
 
 class _VideoContourSampler:
-    def __init__(self, video_path: Path) -> None:
+    def __init__(
+        self,
+        video_path: Path,
+        *,
+        contour_roi_poly: Path | None,
+        contour_roi_enabled: bool,
+        contour_roi_pad_right_mm: float,
+        contour_roi_pad_top_mm: float,
+    ) -> None:
         self.video_path = Path(video_path)
         self.cap = cv2.VideoCapture(str(self.video_path))
         if not self.cap.isOpened():
@@ -157,6 +168,14 @@ class _VideoContourSampler:
         y_cut0 = max(1, int(self.y_base0) - 6)
         work0 = cv2.GaussianBlur(gray0[:y_cut0, :], (0, 0), sigmaX=2.0, sigmaY=2.0)
         self.fixed_thr0, _ = cv2.threshold(work0, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        self.min_area_px = 5000
+        self.contour_roi: tuple[float, float, float, float] | None = None
+        if contour_roi_enabled and contour_roi_poly is not None and contour_roi_poly.exists():
+            self.contour_roi = _contour_roi_from_polygon_mm(
+                contour_roi_poly,
+                pad_right_mm=float(contour_roi_pad_right_mm),
+                pad_top_mm=float(contour_roi_pad_top_mm),
+            )
 
     def close(self) -> None:
         self.cap.release()
@@ -179,6 +198,18 @@ class _VideoContourSampler:
             fixed_threshold=float(self.fixed_thr0),
             overlay_rects=self.overlay_rects,
         )
+        if self.contour_roi is not None:
+            x_min_mm, x_max_mm, y_min_mm, y_max_mm = self.contour_roi
+            mask_u8 = _crop_mask_to_mm_roi(
+                mask_u8,
+                y_base=int(y_base),
+                px_size_um=float(self.px_size_um),
+                x_min_mm=float(x_min_mm),
+                x_max_mm=float(x_max_mm),
+                y_min_mm=float(y_min_mm),
+                y_max_mm=float(y_max_mm),
+                min_area_px=int(self.min_area_px),
+            )
         return _contour_polygon_mm(
             mask_u8,
             y_base=int(y_base),
@@ -294,6 +325,10 @@ def main() -> None:
     ap.add_argument("--t-max", type=float, default=2.0)
     ap.add_argument("--contour-times", type=str, default="1.0,1.5,2.0")
     ap.add_argument("--alpha0-tx-mm", type=float, default=0.5)
+    ap.add_argument("--contour-roi-poly-csv", type=str, default=str(DEFAULT_CONTOUR_ROI_POLY))
+    ap.add_argument("--contour-roi-pad-right-mm", type=float, default=0.02)
+    ap.add_argument("--contour-roi-pad-top-mm", type=float, default=0.02)
+    ap.add_argument("--contour-roi", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--json-out", type=str, default="")
     ap.add_argument("--leaderboard-csv", type=str, default="")
     ap.add_argument("--meta", action="append", default=[], help="Repeated key=value metadata entries written to --leaderboard-csv.")
@@ -305,7 +340,13 @@ def main() -> None:
         raise FileNotFoundError(sim_csv)
 
     exp_csv = Path(str(args.exp_csv))
-    sampler = _VideoContourSampler(Path(str(args.video)))
+    sampler = _VideoContourSampler(
+        Path(str(args.video)),
+        contour_roi_poly=Path(str(args.contour_roi_poly_csv)) if str(args.contour_roi_poly_csv).strip() else None,
+        contour_roi_enabled=bool(args.contour_roi),
+        contour_roi_pad_right_mm=float(args.contour_roi_pad_right_mm),
+        contour_roi_pad_top_mm=float(args.contour_roi_pad_top_mm),
+    )
     try:
         history = _history_metrics(exp_csv=exp_csv, sim_csv=sim_csv, t_min=float(args.t_min), t_max=float(args.t_max))
         dyn08 = _evaluate_dynamic_08pa(out_dir)

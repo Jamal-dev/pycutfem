@@ -21,9 +21,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pycutfem.ufl.expressions import Constant, div, dot, grad, inner
+from pycutfem.ufl.expressions import Constant, Identity, div, dot, grad, inner
 
 from .one_domain import _as_constant, _c, _epsilon, _linear_elastic_term
+from ..shared.nonlinear_solid_refmap import deulerian_k_inv, dsigma_neo_hookean, eulerian_k_inv, sigma_neo_hookean
 
 
 def _W_prime(alpha):
@@ -54,6 +55,11 @@ def _vector_component(vec_expr, idx: int):
     try:
         return vec_expr[idx]
     except Exception:
+        try:
+            basis = Constant([1.0, 0.0] if int(idx) == 0 else [0.0, 1.0], dim=1)
+            return dot(vec_expr, basis)
+        except Exception:
+            pass
         val = getattr(vec_expr, "value", None)
         if val is None:
             raise
@@ -61,7 +67,14 @@ def _vector_component(vec_expr, idx: int):
 
 
 def _dot_2d_components(vec_expr, vec_test):
-    return _vector_component(vec_expr, 0) * vec_test[0] + _vector_component(vec_expr, 1) * vec_test[1]
+    return _vector_component(vec_expr, 0) * _vector_component(vec_test, 0) + _vector_component(vec_expr, 1) * _vector_component(vec_test, 1)
+
+
+def _matvec_2d_components(mat_expr, vec_expr):
+    return (
+        mat_expr[0, 0] * _vector_component(vec_expr, 0) + mat_expr[0, 1] * _vector_component(vec_expr, 1),
+        mat_expr[1, 0] * _vector_component(vec_expr, 0) + mat_expr[1, 1] * _vector_component(vec_expr, 1),
+    )
 
 
 @dataclass(frozen=True)
@@ -123,6 +136,10 @@ def build_deformation_only_forms(
     kappa_inv=None,
     mu_s=None,
     lambda_s=None,
+    solid_model: str = "linear",
+    c_nh=None,
+    beta_nh=None,
+    kappa_inv_model: str = "spatial",
     solid_visco_eta: float = 0.0,
     gamma_div: float = 0.0,
     phi_b: float = 0.5,
@@ -144,6 +161,9 @@ def build_deformation_only_forms(
         raise ValueError("rho_f, mu_f, mu_b, and kappa_inv are required.")
     if mu_s is None or lambda_s is None:
         raise ValueError("mu_s and lambda_s are required.")
+    solid_model_key = str(solid_model).strip().lower().replace("-", "_")
+    if solid_model_key not in {"linear", "small_strain", "linear_elastic", "neo_hookean", "nh"}:
+        raise ValueError(f"Unsupported deformation-only solid model {solid_model!r}.")
 
     th = _c(float(theta))
     one_m_th = _c(1.0) - th
@@ -171,7 +191,10 @@ def build_deformation_only_forms(
     gradB_n = (_c(1.0) - phi_b_c) * grad(alpha_n)
     rho_n = rho_f * C_n
     mu_n = _mu_mix(alpha_n, mu_f=mu_f, mu_b=mu_b)
-    beta_n = alpha_n * mu_f * kappa_inv
+    kappa_inv_key = str(kappa_inv_model).strip().lower().replace("-", "_")
+    use_refmap_drag = kappa_inv_key in {"refmap", "eulerian_refmap", "eulerian", "reference_map"}
+    if kappa_inv_key not in {"spatial", "constant", "const"} and not use_refmap_drag:
+        raise ValueError(f"Unsupported deformation-only kappa_inv_model {kappa_inv_model!r}.")
 
     v_th = th * v_k + one_m_th * v_n
     vS_th = th * vS_k + one_m_th * vS_n
@@ -195,39 +218,77 @@ def build_deformation_only_forms(
     r_mom += th * _c(2.0) * mu_n * inner(_epsilon(v_k), _epsilon(v_test)) * dx
     r_mom += one_m_th * _c(2.0) * mu_n * inner(_epsilon(v_n), _epsilon(v_test)) * dx
     r_mom += -p_k * div_C_vtest * dx
-    r_mom += beta_n * (
-        th * dot(v_k, v_test)
-        + one_m_th * dot(v_n, v_test)
-        - th * dot(vS_k, v_test)
-        - one_m_th * dot(vS_n, v_test)
-    ) * dx
     r_mom += -_dot_2d_components(f_v, v_test) * dx
 
     a_mom = (rho_n * inv_dt) * inner(dv, v_test) * dx
     a_mom += th * rho_n * dot(dot(grad(dv), v_n), v_test) * dx
     a_mom += th * _c(2.0) * mu_n * inner(_epsilon(dv), _epsilon(v_test)) * dx
     a_mom += -(dp * div_C_vtest) * dx
-    a_mom += th * beta_n * (dot(dv, v_test) - dot(dvS, v_test)) * dx
 
     # (ii) One-domain mass constraint.
     r_mass = q_test * (div_C_vk + div_B_vSk) * dx
     a_mass = q_test * (div_C_dv + div_B_dvS) * dx
 
     # (iii) Skeleton momentum.
-    r_skel = th * alpha_n * _linear_elastic_term(u_k, vS_test, mu_s=mu_s, lambda_s=lambda_s) * dx
-    r_skel += one_m_th * alpha_n * _linear_elastic_term(u_n, vS_test, mu_s=mu_s, lambda_s=lambda_s) * dx
+    if solid_model_key in {"linear", "small_strain", "linear_elastic"}:
+        r_el_k = _linear_elastic_term(u_k, vS_test, mu_s=mu_s, lambda_s=lambda_s)
+        r_el_n = _linear_elastic_term(u_n, vS_test, mu_s=mu_s, lambda_s=lambda_s)
+        a_el = _linear_elastic_term(du, vS_test, mu_s=mu_s, lambda_s=lambda_s)
+    else:
+        if c_nh is None:
+            c_nh = mu_s / _c(2.0)
+        if beta_nh is None:
+            beta_nh = lambda_s / (_c(2.0) * mu_s)
+        sig_k = sigma_neo_hookean(u_k, c_nh, beta_nh, dim=2)
+        sig_n = sigma_neo_hookean(u_n, c_nh, beta_nh, dim=2)
+        dsig_k = dsigma_neo_hookean(u_k, du, c_nh, beta_nh, dim=2)
+        r_el_k = inner(sig_k, grad(vS_test))
+        r_el_n = inner(sig_n, grad(vS_test))
+        a_el = inner(dsig_k, grad(vS_test))
+
+    r_skel = th * alpha_n * r_el_k * dx
+    r_skel += one_m_th * alpha_n * r_el_n * dx
     r_skel += -(p_k * div_B_vStest) * dx
-    r_skel += -beta_n * (
-        th * dot(v_k, vS_test)
-        + one_m_th * dot(v_n, vS_test)
-        - th * dot(vS_k, vS_test)
-        - one_m_th * dot(vS_n, vS_test)
-    ) * dx
     r_skel += -alpha_n * _dot_2d_components(f_u, vS_test) * dx
 
-    a_skel = th * alpha_n * _linear_elastic_term(du, vS_test, mu_s=mu_s, lambda_s=lambda_s) * dx
+    a_skel = th * alpha_n * a_el * dx
     a_skel += -(dp * div_B_vStest) * dx
-    a_skel += -th * beta_n * (dot(dv, vS_test) - dot(dvS, vS_test)) * dx
+
+    diff_k = v_k - vS_k
+    diff_n = v_n - vS_n
+    ddiff = dv - dvS
+    if use_refmap_drag:
+        K_inv = kappa_inv * Identity(2) if getattr(kappa_inv, "dim", None) == 0 else kappa_inv
+        k_inv_k = eulerian_k_inv(u_k, K_inv, dim=2)
+        k_inv_n = eulerian_k_inv(u_n, K_inv, dim=2)
+        dk_inv_k = deulerian_k_inv(u_k, du, K_inv, dim=2)
+
+        kdrag_k = _matvec_2d_components(k_inv_k, diff_k)
+        kdrag_n = _matvec_2d_components(k_inv_n, diff_n)
+        dkdrag_k_base = _matvec_2d_components(k_inv_k, ddiff)
+        dkdrag_k_geom = _matvec_2d_components(dk_inv_k, diff_k)
+        dkdrag_k = (
+            dkdrag_k_base[0] + dkdrag_k_geom[0],
+            dkdrag_k_base[1] + dkdrag_k_geom[1],
+        )
+
+        drag_pref = alpha_n * mu_f
+        r_mom += drag_pref * (
+            th * _dot_2d_components(kdrag_k, v_test) + one_m_th * _dot_2d_components(kdrag_n, v_test)
+        ) * dx
+        a_mom += th * drag_pref * _dot_2d_components(dkdrag_k, v_test) * dx
+
+        r_skel += -drag_pref * (
+            th * _dot_2d_components(kdrag_k, vS_test) + one_m_th * _dot_2d_components(kdrag_n, vS_test)
+        ) * dx
+        a_skel += -th * drag_pref * _dot_2d_components(dkdrag_k, vS_test) * dx
+    else:
+        beta_n = alpha_n * mu_f * kappa_inv
+        r_mom += beta_n * (th * dot(diff_k, v_test) + one_m_th * dot(diff_n, v_test)) * dx
+        a_mom += th * beta_n * dot(ddiff, v_test) * dx
+
+        r_skel += -beta_n * (th * dot(diff_k, vS_test) + one_m_th * dot(diff_n, vS_test)) * dx
+        a_skel += -th * beta_n * dot(ddiff, vS_test) * dx
 
     if float(solid_visco_eta) != 0.0:
         eta_s_c = _c(float(solid_visco_eta))

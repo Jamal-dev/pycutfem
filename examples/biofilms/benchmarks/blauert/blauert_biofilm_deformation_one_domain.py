@@ -34,9 +34,13 @@ Writes to `out_dir`:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
+import shlex
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -78,9 +82,21 @@ from pycutfem.solvers.nonlinear_solver import (
     VIParameters,
 )
 from pycutfem.ufl.analytic import Analytic
-from pycutfem.ufl.expressions import Constant, Function, TestFunction, TrialFunction, VectorFunction, VectorTestFunction, VectorTrialFunction, grad
+from pycutfem.ufl.expressions import (
+    Constant,
+    Function,
+    HdivFunction,
+    HdivTestFunction,
+    HdivTrialFunction,
+    TestFunction,
+    TrialFunction,
+    VectorFunction,
+    VectorTestFunction,
+    VectorTrialFunction,
+    grad,
+)
 from pycutfem.ufl.forms import BoundaryCondition, Equation, assemble_form
-from pycutfem.ufl.measures import ds, dx
+from pycutfem.ufl.measures import dS as dS_measure, ds, dx
 from pycutfem.ufl.spaces import FunctionSpace
 from pycutfem.utils.meshgen import structured_quad
 
@@ -166,6 +182,32 @@ def _smooth_step(z: np.ndarray) -> np.ndarray:
     return 0.5 * (1.0 + np.tanh(np.asarray(z, dtype=float)))
 
 
+def _alpha_profile_signed_distance(alpha_vals: np.ndarray, eps: float, *, clip: float = 1.0e-6) -> np.ndarray:
+    """
+    Approximate signed distance from a diffuse alpha profile assuming the
+    standard tanh transition alpha ~= 0.5 * (1 - tanh(d / eps)).
+    """
+    ee = float(eps)
+    if not np.isfinite(ee) or ee <= 0.0:
+        raise ValueError(f"eps must be positive to recover a signed distance; got {eps!r}.")
+    cc = float(clip)
+    aa = np.clip(np.asarray(alpha_vals, dtype=float), cc, 1.0 - cc)
+    return -ee * np.arctanh(2.0 * aa - 1.0)
+
+
+def _interface_band_reg_weight(alpha_vals: np.ndarray, *, eps: float, band_factor: float, floor: float) -> np.ndarray:
+    bf = float(band_factor)
+    ff = float(floor)
+    if not np.isfinite(bf) or bf <= 0.0:
+        return np.ones_like(np.asarray(alpha_vals, dtype=float))
+    if not np.isfinite(ff) or ff < 0.0 or ff > 1.0:
+        raise ValueError(f"interface regularization floor must be in [0, 1]; got {floor!r}.")
+    band_halfwidth = bf * float(eps)
+    dist = _alpha_profile_signed_distance(alpha_vals, float(eps))
+    inside = np.abs(dist) <= band_halfwidth
+    return np.where(inside, 1.0, ff)
+
+
 def _as_scalar_expr(val):
     if hasattr(val, "dim"):
         return val
@@ -193,6 +235,30 @@ def _cosine_ramp_value(t_now: float, ramp_time: float) -> float:
     return 0.5 * (1.0 - math.cos(math.pi * tt / max(1.0e-12, tr)))
 
 
+def _cosine_blend_value(
+    t_now: float,
+    *,
+    start_time: float,
+    end_time: float,
+    start_value: float,
+    end_value: float,
+) -> float:
+    tt = float(t_now)
+    t0 = float(start_time)
+    t1 = float(end_time)
+    v0 = float(start_value)
+    v1 = float(end_value)
+    if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+        return v0
+    if tt <= t0:
+        return v0
+    if tt >= t1:
+        return v1
+    xi = (tt - t0) / max(1.0e-12, (t1 - t0))
+    w = 0.5 * (1.0 - math.cos(math.pi * xi))
+    return (1.0 - w) * v0 + w * v1
+
+
 def _lagged_diffuse_interface_shear_traction(
     *,
     v_lag,
@@ -200,6 +266,7 @@ def _lagged_diffuse_interface_shear_traction(
     mu_f: float,
     scale: float = 1.0,
     eta_n: float = 1.0e-12,
+    topweight: bool = False,
 ):
     """
     Return a lagged diffuse-interface tangential traction proxy.
@@ -222,6 +289,8 @@ def _lagged_diffuse_interface_shear_traction(
     tr_y = Constant(2.0 * float(mu_f)) * (eps_xy * n_if[0] + eps_yy * n_if[1])
     scale_c = _as_scalar_expr(scale)
     tau_t = scale_c * (tr_x * t_if[0] + tr_y * t_if[1])
+    if bool(topweight):
+        tau_t = _sqrt(n_if[1] * n_if[1] + Constant(float(eta_n))) * tau_t
     g_t = (tau_t * t_if[0], tau_t * t_if[1])
     return g_t, grad_norm
 
@@ -259,6 +328,111 @@ def _lagged_diffuse_interface_stress_traction(
     return g_t, grad_norm
 
 
+def _lagged_diffuse_interface_pressure_traction(
+    *,
+    p_lag,
+    alpha_lag,
+    scale: float = 1.0,
+    eta_n: float = 1.0e-12,
+    xweight: bool = False,
+    upstream_only: bool = False,
+):
+    """
+    Return the lagged normal-pressure part of the diffuse-interface traction.
+
+    This isolates the `-p^n n` contribution so the Blauert benchmark can blend
+    the paper's Poiseuille tangential proxy with an independently scaled normal
+    compression term.
+    """
+    grad_alpha = grad(alpha_lag)
+    grad_norm = _sqrt(grad_alpha[0] * grad_alpha[0] + grad_alpha[1] * grad_alpha[1] + Constant(float(eta_n)))
+    n_if = (grad_alpha[0] / grad_norm, grad_alpha[1] / grad_norm)
+    scale_c = _as_scalar_expr(scale)
+    weight = Constant(1.0)
+    if bool(upstream_only):
+        nx_pos = Constant(0.5) * (n_if[0] + _sqrt(n_if[0] * n_if[0] + Constant(float(eta_n))))
+        weight = nx_pos
+    elif bool(xweight):
+        weight = _sqrt(n_if[0] * n_if[0] + Constant(float(eta_n)))
+    g_t = (-scale_c * weight * p_lag * n_if[0], -scale_c * weight * p_lag * n_if[1])
+    return g_t, grad_norm
+
+
+def _lagged_diffuse_interface_normal_stress_traction(
+    *,
+    v_lag,
+    p_lag,
+    alpha_lag,
+    mu_f: float,
+    scale: float = 1.0,
+    eta_n: float = 1.0e-12,
+    xweight: bool = False,
+    topweight: bool = False,
+    topbias: float = 0.0,
+    frontbias: float = 0.0,
+    bottomskew: float = 0.0,
+    channel_height: float | None = None,
+    upstream_only: bool = False,
+):
+    """
+    Return the lagged normal-stress part of the diffuse-interface traction.
+
+    This keeps only the normal projection of the full lagged traction
+
+        (-p^n I + 2 mu_f eps(v^n)) n_if
+
+    so the Blauert benchmark can combine the paper's Poiseuille tangential load
+    with independently scaled lagged normal compression.
+    """
+    grad_alpha = grad(alpha_lag)
+    grad_norm = _sqrt(grad_alpha[0] * grad_alpha[0] + grad_alpha[1] * grad_alpha[1] + Constant(float(eta_n)))
+    n_if = (grad_alpha[0] / grad_norm, grad_alpha[1] / grad_norm)
+    dvx = grad(v_lag[0])
+    dvy = grad(v_lag[1])
+    eps_xx = dvx[0]
+    eps_xy = Constant(0.5) * (dvx[1] + dvy[0])
+    eps_yy = dvy[1]
+    tr_x = -p_lag * n_if[0] + Constant(2.0 * float(mu_f)) * (eps_xx * n_if[0] + eps_xy * n_if[1])
+    tr_y = -p_lag * n_if[1] + Constant(2.0 * float(mu_f)) * (eps_xy * n_if[0] + eps_yy * n_if[1])
+    tau_n = tr_x * n_if[0] + tr_y * n_if[1]
+    weight = Constant(1.0)
+    nx_pos = Constant(0.5) * (n_if[0] + _sqrt(n_if[0] * n_if[0] + Constant(float(eta_n))))
+    ny_mag = _sqrt(n_if[1] * n_if[1] + Constant(float(eta_n)))
+    if bool(upstream_only):
+        # Focus the added compression on the inflow-facing side of the patch.
+        weight = weight * nx_pos
+    else:
+        frontbias_c = _as_scalar_expr(frontbias)
+        # Blend smoothly between uniform loading and the inflow-facing weight.
+        weight = weight * (Constant(1.0) - frontbias_c + frontbias_c * nx_pos)
+    if bool(xweight):
+        # Streamwise-facing parts of the interface should feel most of the
+        # compressive load; nearly horizontal segments should contribute less.
+        weight = weight * _sqrt(n_if[0] * n_if[0] + Constant(float(eta_n)))
+    if bool(topweight):
+        # Upper/lower flanks are under-driven on Benchmark 6; weighting by |n_y|
+        # shifts the extra compression away from the near-vertical mid-front.
+        weight = weight * ny_mag
+    elif abs(float(topbias)) > 0.0:
+        # Blend smoothly between uniform loading and the hard |n_y|-weighted
+        # flank emphasis instead of switching directly to the corner-heavy mode.
+        weight = weight * (Constant(1.0 - float(topbias)) + Constant(float(topbias)) * ny_mag)
+    H = float(channel_height) if channel_height is not None else float("nan")
+    if not np.isfinite(H) or H <= 0.0:
+        raise ValueError("channel_height must be positive for normal-stress height weighting.")
+    bottomskew_c = _as_scalar_expr(bottomskew)
+    # Redistribute the added compression toward the lower part of the patch
+    # while keeping the height-average weight equal to one.
+    y_weight = Analytic(
+        lambda x, y, H=H: 1.0 - 2.0 * np.asarray(y, dtype=float) / H,
+        degree=1,
+    )
+    weight = weight * (Constant(1.0) + bottomskew_c * y_weight)
+    scale_c = _as_scalar_expr(scale)
+    g_t = (scale_c * weight * tau_n * n_if[0], scale_c * weight * tau_n * n_if[1])
+    return g_t, grad_norm
+
+
 def _poiseuille_diffuse_interface_shear_traction(
     *,
     alpha_lag,
@@ -267,6 +441,7 @@ def _poiseuille_diffuse_interface_shear_traction(
     mu_f: float,
     scale: float = 1.0,
     eta_n: float = 1.0e-12,
+    topweight: bool = False,
 ):
     grad_alpha = grad(alpha_lag)
     grad_norm = _sqrt(grad_alpha[0] * grad_alpha[0] + grad_alpha[1] * grad_alpha[1] + Constant(float(eta_n)))
@@ -279,7 +454,10 @@ def _poiseuille_diffuse_interface_shear_traction(
         * (1.0 - 2.0 * np.asarray(y, dtype=float) / _H),
         degree=2,
     )
-    g_t = (scale_c * tau_bg * t_if[0], scale_c * tau_bg * t_if[1])
+    tau_t = scale_c * tau_bg
+    if bool(topweight):
+        tau_t = _sqrt(n_if[1] * n_if[1] + Constant(float(eta_n))) * tau_t
+    g_t = (tau_t * t_if[0], tau_t * t_if[1])
     return g_t, grad_norm
 
 
@@ -1113,6 +1291,13 @@ def main() -> None:
         choices=("mumps", "superlu_dist", "superlu"),
         help="Direct LU factorization backend used by PETSc (SNES only).",
     )
+    ap.add_argument(
+        "--linear-backend",
+        type=str,
+        default="petsc",
+        choices=("petsc", "scipy", "pardiso"),
+        help="Linear algebra backend for internal Newton/PDAS solves (`pardiso` uses pypardiso/MKL).",
+    )
     ap.add_argument("--linear-ksp-type", type=str, default="", help="Internal PETSc KSP type for Newton/PDAS/LM linear solves.")
     ap.add_argument("--linear-pc-type", type=str, default="", help="Internal PETSc PC type for Newton/PDAS/LM linear solves.")
     ap.add_argument("--linear-pc-factor-solver-type", type=str, default="", help="Direct factor backend for the internal PETSc linear solve.")
@@ -1142,7 +1327,50 @@ def main() -> None:
             "the Dian preprocessing value v0=6.84e-2 m/s corresponds to u_avg≈4.56e-2 m/s."
         ),
     )
+    ap.add_argument(
+        "--inflow-profile",
+        type=str,
+        default="poiseuille",
+        choices=("poiseuille", "plug"),
+        help=(
+            "Left-boundary inflow profile. 'poiseuille' matches the current paper benchmark; "
+            "'plug' applies a uniform inlet speed and defaults to the Dian/SPH peak speed "
+            "v0 = 1.5 * u_avg unless --inflow-plug-speed is set explicitly."
+        ),
+    )
+    ap.add_argument(
+        "--inflow-plug-speed",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Uniform inlet speed [m/s] used when --inflow-profile=plug. "
+            "Default: 1.5 * --u-avg so the Dian/SPH v0 is recovered from the paper u_avg."
+        ),
+    )
     ap.add_argument("--t-ramp", type=float, default=0.5, help="Cosine ramp time for inflow [s].")
+    ap.add_argument(
+        "--flow-shutoff-start",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Optional late-time start [s] for a cosine shutoff of the imposed flow drive. "
+            "When set together with --flow-shutoff-end, the inflow and all diffuse flow-driven "
+            "tractions are multiplied by a smooth factor that transitions from 1 to "
+            "--flow-shutoff-end-factor."
+        ),
+    )
+    ap.add_argument(
+        "--flow-shutoff-end",
+        type=float,
+        default=float("nan"),
+        help="Optional late-time end [s] for the cosine shutoff of the imposed flow drive.",
+    )
+    ap.add_argument(
+        "--flow-shutoff-end-factor",
+        type=float,
+        default=0.0,
+        help="Residual multiplier after --flow-shutoff-end (default: 0, i.e. full shutoff).",
+    )
 
     # Material / coupling (FSI-only: disable growth/detachment/damage)
     ap.add_argument("--rho-f", type=float, default=1000.0)
@@ -1155,10 +1383,79 @@ def main() -> None:
         help="Effective viscosity model μ(α,φ). 'mu' keeps μ≡μ_f; 'phi_mu' (default) uses Brinkman scaling μ=μ_f((1-α)+αφ).",
     )
     ap.add_argument("--kappa-inv", type=float, default=1.0e12, help="Inverse permeability [1/m^2].")
+    ap.add_argument(
+        "--kappa-inv-model",
+        type=str,
+        default="spatial",
+        choices=("spatial", "kozeny", "kozeny_carman", "kc", "refmap"),
+        help=(
+            "Inverse permeability model. 'spatial' keeps kappa_inv constant; "
+            "'kozeny_carman' scales it with the transported phi field; "
+            "'refmap' pushes a reference inverse permeability through the deformation."
+        ),
+    )
+    ap.add_argument(
+        "--kappa-phi-ref",
+        type=float,
+        default=None,
+        help="Reference porosity for Kozeny-Carman normalization. Default: reuse --phi-b.",
+    )
+    ap.add_argument(
+        "--kappa-inv-kc-eps",
+        type=float,
+        default=1.0e-12,
+        help="Regularization epsilon used in the Kozeny-Carman porosity scaling.",
+    )
     ap.add_argument("--phi-b", type=float, default=0.47, help="Initial porosity inside the biofilm (0<phi_b<1).")
     ap.add_argument("--E", type=float, default=200.0, help="Young's modulus of the solid phase [Pa] (Dian paper default).")
     ap.add_argument("--nu", type=float, default=0.4, help="Poisson ratio (Dian paper default).")
+    ap.add_argument(
+        "--solid-model",
+        type=str,
+        default="linear",
+        choices=("linear", "neo_hookean", "neo-hookean", "nh", "hencky", "svk"),
+        help=(
+            "Skeleton constitutive law. 'linear' is the current default; "
+            "'neo_hookean', 'hencky', and 'svk' activate the large-deformation "
+            "hyperelastic variants already implemented in the one-domain form assembly."
+        ),
+    )
     ap.add_argument("--solid-visco-eta", type=float, default=0.0, help="Kelvin–Voigt viscosity eta_s [Pa*s] (0 disables).")
+    ap.add_argument(
+        "--attachment-mode",
+        type=str,
+        default="clamped",
+        choices=("clamped", "adhesion"),
+        help=(
+            "Bottom attachment model for the skeleton. 'clamped' reproduces the current "
+            "Benchmark 6 setup; 'adhesion' replaces the hard bottom clamp with the "
+            "existing wall-adhesion spring/dashpot traction on the substratum."
+        ),
+    )
+    ap.add_argument(
+        "--adhesion-k-n",
+        type=float,
+        default=0.0,
+        help="Bottom-attachment normal spring stiffness [Pa/m] used when --attachment-mode adhesion.",
+    )
+    ap.add_argument(
+        "--adhesion-k-t",
+        type=float,
+        default=0.0,
+        help="Bottom-attachment tangential spring stiffness [Pa/m] used when --attachment-mode adhesion.",
+    )
+    ap.add_argument(
+        "--adhesion-gamma-n",
+        type=float,
+        default=0.0,
+        help="Bottom-attachment normal dashpot [Pa*s/m] used when --attachment-mode adhesion.",
+    )
+    ap.add_argument(
+        "--adhesion-gamma-t",
+        type=float,
+        default=0.0,
+        help="Bottom-attachment tangential dashpot [Pa*s/m] used when --attachment-mode adhesion.",
+    )
     ap.add_argument(
         "--paper1-reduced",
         action=argparse.BooleanOptionalAction,
@@ -1232,9 +1529,173 @@ def main() -> None:
         default=1.0e-12,
         help="Regularization added to |grad(alpha)| when building the diffuse-interface normal.",
     )
+    ap.add_argument(
+        "--diffuse-shear-topweight",
+        action="store_true",
+        help=(
+            "Weight the diffuse-interface tangential shear proxy by |n_y| so the "
+            "benchmark-local channel shear acts mainly on the top-facing contour "
+            "instead of the nearly vertical inflow/outflow faces."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-pressure-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Additional scale applied to the lagged normal-pressure term -p^n n on the diffuse interface. "
+            "Used to augment the Benchmark 6 Poiseuille tangential proxy with independently tuned normal compression."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-pressure-xweight",
+        action="store_true",
+        help=(
+            "Weight the added lagged normal-pressure term by |n_x| so it acts mainly "
+            "on streamwise-facing interface segments."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-pressure-upstream-only",
+        action="store_true",
+        help=(
+            "Weight the added lagged normal-pressure term by max(n_x, 0) so the extra "
+            "compression acts primarily on the inflow-facing interface."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Additional scale applied to the normal projection of the full lagged traction "
+            "(-p^n I + 2 mu_f eps(v^n)) n on the diffuse interface. "
+            "Used to augment the Benchmark 6 Poiseuille tangential proxy with independently tuned normal stress."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-ramp-time",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Optional ramp time [s] applied only to the added diffuse normal-stress "
+            "correction. Default: reuse --diffuse-shear-ramp-time / --t-ramp."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-xweight",
+        action="store_true",
+        help=(
+            "Weight the added lagged normal-stress term by |n_x| so it acts mainly on "
+            "streamwise-facing interface segments instead of the nearly horizontal top."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-topweight",
+        action="store_true",
+        help=(
+            "Weight the added lagged normal-stress term by |n_y| so it acts mainly on "
+            "the top/bottom flanks instead of the near-vertical mid-front."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-topbias",
+        type=float,
+        default=0.0,
+        help=(
+            "Smoothly bias the added lagged normal-stress term toward the top/bottom "
+            "flanks using (1-b)*1 + b*|n_y|, with b in [0,1]. "
+            "Use this to interpolate between uniform loading (0) and hard topweight (1)."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-frontbias",
+        type=float,
+        default=0.0,
+        help=(
+            "Smoothly bias the added lagged normal-stress term toward the inflow-facing "
+            "interface using (1-b)*1 + b*max(n_x,0), with b in [0,1]. "
+            "Use this to interpolate between uniform loading (0) and upstream-only loading (1)."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-frontbias-tail-value",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Optional late-time value reached by --diffuse-normal-stress-frontbias over the "
+            "same --diffuse-normal-stress-decay-start / --diffuse-normal-stress-decay-end interval "
+            "used by the late normal-stress tail. Default keeps frontbias constant."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-bottomskew",
+        type=float,
+        default=0.0,
+        help=(
+            "Redistribute the added lagged normal-stress term toward the lower part of "
+            "the channel using the height-normalized profile 1 + b*(1-2*y/H), with b in [0,1]. "
+            "This raises lower-band compression while reducing upper-band loading at the same mean scale."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-bottomskew-ramp-with-tail",
+        action="store_true",
+        help=(
+            "Ramp --diffuse-normal-stress-bottomskew from zero to its target value over the "
+            "same --diffuse-normal-stress-decay-start / --diffuse-normal-stress-decay-end interval "
+            "used by the late normal-stress tail."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-upstream-only",
+        action="store_true",
+        help=(
+            "Weight the added lagged normal-stress term by max(n_x, 0) so the extra "
+            "compression acts primarily on the inflow-facing interface."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-decay-start",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Optional start time [s] for a cosine decay applied only to the added "
+            "diffuse normal-stress correction."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-decay-end",
+        type=float,
+        default=float("nan"),
+        help=(
+            "Optional end time [s] for a cosine decay applied only to the added "
+            "diffuse normal-stress correction."
+        ),
+    )
+    ap.add_argument(
+        "--diffuse-normal-stress-tail-factor",
+        type=float,
+        default=1.0,
+        help=(
+            "Late-time multiplier reached at --diffuse-normal-stress-decay-end for "
+            "the added diffuse normal-stress correction. Default keeps the current "
+            "constant-amplitude behavior."
+        ),
+    )
 
     ap.add_argument("--gamma-u", type=float, default=5.0, help="u extension penalty outside biofilm.")
-    ap.add_argument("--u-extension", type=str, default="l2", choices=("l2", "grad"))
+    ap.add_argument(
+        "--u-extension",
+        type=str,
+        default="l2",
+        choices=("l2", "grad", "h1"),
+        help=(
+            "Extension regularization used outside the biofilm for u and, by default, vS. "
+            "'l2' keeps the current mass-style penalty; 'grad'/'h1' use the H1-seminorm "
+            "plus the tiny pinning term."
+        ),
+    )
     ap.add_argument("--gamma-u-pin", type=float, default=1.0e-4, help="Tiny pinning used only with --u-extension grad.")
     ap.add_argument(
         "--kinematics-scale",
@@ -1330,6 +1791,19 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--fluid-space",
+        type=str,
+        default="cg",
+        choices=("cg", "hdiv"),
+        help="Fluid velocity space. 'hdiv' uses a single RT field for v.",
+    )
+    ap.add_argument(
+        "--fluid-hdiv-order",
+        type=int,
+        default=0,
+        help="RT order used when --fluid-space=hdiv.",
+    )
+    ap.add_argument(
         "--u-supg",
         type=float,
         default=0.0,
@@ -1383,6 +1857,21 @@ def main() -> None:
         choices=("advective", "conservative"),
         help="Form of alpha advection by the chosen velocity in the alpha PDE (pde mode).",
     )
+    ap.add_argument(
+        "--alpha-mix-gate-alpha0",
+        type=float,
+        default=0.1,
+        help=(
+            "Gate parameter alpha0 used when --alpha-advect-with mix_biofilm. "
+            "The fluid part is weighted by g(alpha)=alpha^m/(alpha^m+alpha0^m)."
+        ),
+    )
+    ap.add_argument(
+        "--alpha-mix-gate-power",
+        type=int,
+        default=4,
+        help="Gate power m used when --alpha-advect-with mix_biofilm.",
+    )
     ap.add_argument("--alpha-ch-M", type=float, default=1.0e-12, help="Cahn–Hilliard mobility M for alpha (0 disables CH).")
     ap.add_argument("--alpha-ch-gamma", type=float, default=2.0e-3, help="Cahn–Hilliard gamma for alpha (0 disables CH).")
     ap.add_argument(
@@ -1433,6 +1922,22 @@ def main() -> None:
     ap.add_argument("--restrict-box-x1", type=float, default=float("nan"))
     ap.add_argument("--restrict-box-y0", type=float, default=float("nan"))
     ap.add_argument("--restrict-box-y1", type=float, default=float("nan"))
+    ap.add_argument(
+        "--interface-reg-band-factor",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, localize u/vS extension and CIP regularization to a lagged "
+            "interface band |d(alpha)| <= factor * eps, with the outside weight "
+            "set by --interface-reg-weight-floor."
+        ),
+    )
+    ap.add_argument(
+        "--interface-reg-weight-floor",
+        type=float,
+        default=1.0,
+        help="Background regularization weight outside the interface band when --interface-reg-band-factor > 0.",
+    )
 
     # Tracking output
     ap.add_argument(
@@ -1609,6 +2114,28 @@ def main() -> None:
     gamma_div_relax_after = max(1, int(getattr(args, "gamma_div_relax_after", 3)))
     gamma_div_relax_newton_max = max(1, int(getattr(args, "gamma_div_relax_newton_max", 2)))
     gamma_div_expr = _named_scalar_expr("gamma_div", gamma_div_init)
+    flow_shutoff_start = float(getattr(args, "flow_shutoff_start", float("nan")))
+    flow_shutoff_end = float(getattr(args, "flow_shutoff_end", float("nan")))
+    flow_shutoff_end_factor = float(getattr(args, "flow_shutoff_end_factor", 0.0))
+    flow_shutoff_start_finite = np.isfinite(flow_shutoff_start)
+    flow_shutoff_end_finite = np.isfinite(flow_shutoff_end)
+    if flow_shutoff_start_finite != flow_shutoff_end_finite:
+        raise ValueError("Use --flow-shutoff-start and --flow-shutoff-end together.")
+    if flow_shutoff_start_finite and not (flow_shutoff_end > flow_shutoff_start):
+        raise ValueError("--flow-shutoff-end must be greater than --flow-shutoff-start.")
+    if not np.isfinite(flow_shutoff_end_factor) or flow_shutoff_end_factor < 0.0:
+        raise ValueError("--flow-shutoff-end-factor must be finite and nonnegative.")
+
+    def _late_flow_shutoff_factor(t_now: float) -> float:
+        if not flow_shutoff_start_finite:
+            return 1.0
+        return _cosine_blend_value(
+            float(t_now),
+            start_time=float(flow_shutoff_start),
+            end_time=float(flow_shutoff_end),
+            start_value=1.0,
+            end_value=float(flow_shutoff_end_factor),
+        )
 
     # ------------------------------------------------------------------
     # Polygon (alpha0)
@@ -1668,9 +2195,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Mixed space
     # ------------------------------------------------------------------
+    fluid_space_key = str(getattr(args, "fluid_space", "cg")).strip().lower()
+    fluid_hdiv_order = int(getattr(args, "fluid_hdiv_order", 0))
+    if fluid_space_key not in {"cg", "hdiv"}:
+        raise ValueError(f"Unsupported --fluid-space={args.fluid_space!r}.")
     field_specs = {
-        "v_x": 2,
-        "v_y": 2,
         "p": 1,
         "vS_x": 2,
         "vS_y": 2,
@@ -1679,17 +2208,30 @@ def main() -> None:
         "alpha": 1,
         "mu_alpha": 1,
     }
+    if fluid_space_key == "cg":
+        field_specs = {"v_x": 2, "v_y": 2, **field_specs}
+    else:
+        field_specs = {"v": ("RT", int(fluid_hdiv_order)), **field_specs}
     if not paper1_reduced:
         field_specs["phi"] = 1
         field_specs["S"] = 1
     me = MixedElement(mesh, field_specs=field_specs)
     dh = DofHandler(me, method="cg")
 
-    V = FunctionSpace("V", ["v_x", "v_y"], dim=1)
     VS = FunctionSpace("VS", ["vS_x", "vS_y"], dim=1)
     U = FunctionSpace("U", ["u_x", "u_y"], dim=1)
 
-    dv = VectorTrialFunction(space=V, dof_handler=dh)
+    if fluid_space_key == "cg":
+        V = FunctionSpace("V", ["v_x", "v_y"], dim=1)
+        dv = VectorTrialFunction(space=V, dof_handler=dh)
+        v_test = VectorTestFunction(space=V, dof_handler=dh)
+        v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
+        v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
+    else:
+        dv = HdivTrialFunction("v")
+        v_test = HdivTestFunction("v")
+        v_k = HdivFunction("v_k", "v", dof_handler=dh)
+        v_n = HdivFunction("v_n", "v", dof_handler=dh)
     dvS = VectorTrialFunction(space=VS, dof_handler=dh)
     du = VectorTrialFunction(space=U, dof_handler=dh)
     dp = TrialFunction("p", dof_handler=dh)
@@ -1698,7 +2240,6 @@ def main() -> None:
     dmu_alpha = TrialFunction("mu_alpha", dof_handler=dh)
     dS = TrialFunction("S", dof_handler=dh) if not paper1_reduced else None
 
-    v_test = VectorTestFunction(space=V, dof_handler=dh)
     vS_test = VectorTestFunction(space=VS, dof_handler=dh)
     u_test = VectorTestFunction(space=U, dof_handler=dh)
     q_test = TestFunction("p", dof_handler=dh)
@@ -1707,7 +2248,6 @@ def main() -> None:
     mu_alpha_test = TestFunction("mu_alpha", dof_handler=dh)
     S_test = TestFunction("S", dof_handler=dh) if not paper1_reduced else None
 
-    v_k = VectorFunction("v_k", ["v_x", "v_y"], dof_handler=dh)
     p_k = Function("p_k", "p", dof_handler=dh)
     vS_k = VectorFunction("vS_k", ["vS_x", "vS_y"], dof_handler=dh)
     u_k = VectorFunction("u_k", ["u_x", "u_y"], dof_handler=dh)
@@ -1716,7 +2256,6 @@ def main() -> None:
     mu_alpha_k = Function("mu_alpha_k", "mu_alpha", dof_handler=dh)
     S_k = Function("S_k", "S", dof_handler=dh) if not paper1_reduced else None
 
-    v_n = VectorFunction("v_n", ["v_x", "v_y"], dof_handler=dh)
     p_n = Function("p_n", "p", dof_handler=dh)
     vS_n = VectorFunction("vS_n", ["vS_x", "vS_y"], dof_handler=dh)
     u_n = VectorFunction("u_n", ["u_x", "u_y"], dof_handler=dh)
@@ -1788,6 +2327,31 @@ def main() -> None:
         n_keep, n_tot = _restrict_skeleton_dofs_to_box(dh, x0=x0, x1=x1, y0=y0, y1=y1)
         logging.info(f"[setup] restricted (u,vS) DOFs to box: keep {n_keep}/{n_tot} Q2 nodes")
 
+    interface_reg_band_factor = float(getattr(args, "interface_reg_band_factor", 0.0))
+    interface_reg_weight_floor = float(getattr(args, "interface_reg_weight_floor", 1.0))
+    regularization_weight = None
+
+    def _update_regularization_weight(alpha_vals_now) -> None:
+        if regularization_weight is None:
+            return
+        regularization_weight.nodal_values[:] = _interface_band_reg_weight(
+            np.asarray(alpha_vals_now, dtype=float),
+            eps=float(alpha_ch_eps),
+            band_factor=float(interface_reg_band_factor),
+            floor=float(interface_reg_weight_floor),
+        )
+
+    if interface_reg_band_factor > 0.0:
+        regularization_weight = Function("reg_weight", "alpha", dof_handler=dh)
+        _update_regularization_weight(alpha_n.nodal_values)
+        logging.info(
+            "[setup] interface-band regularization enabled: band_factor=%.3f, eps=%.3e, band_halfwidth=%.3e, floor=%.3f",
+            float(interface_reg_band_factor),
+            float(alpha_ch_eps),
+            float(interface_reg_band_factor) * float(alpha_ch_eps),
+            float(interface_reg_weight_floor),
+        )
+
     # ------------------------------------------------------------------
     # Alpha-from-refmap mapping: alpha(x,t) = alpha0(x - u(x,t))
     # Build alpha->u DOF lookup via coordinate matching (Q1 alpha is a subset of Q2 u).
@@ -1814,11 +2378,13 @@ def main() -> None:
             alpha_k.nodal_values[:] = np.clip(np.asarray(a, dtype=float), 0.0, 1.0)
             if phi_k is not None:
                 phi_k.nodal_values[:] = np.clip(1.0 - (1.0 - phi_b) * np.asarray(alpha_k.nodal_values, dtype=float), 0.0, 1.0)
+            _update_regularization_weight(alpha_k.nodal_values)
 
     else:
 
         def _post_step_update() -> None:
             # Nothing to do in PDE mode; alpha/phi are solved.
+            _update_regularization_weight(alpha_k.nodal_values)
             return
 
     # ------------------------------------------------------------------
@@ -1840,6 +2406,23 @@ def main() -> None:
         step0 = 0
     dt_c = _named_scalar_expr("dt", dt_val)
     theta = float(args.theta)
+    attachment_mode = str(getattr(args, "attachment_mode", "clamped")).strip().lower()
+    use_bottom_adhesion = attachment_mode == "adhesion"
+    adhesion_k_n = float(getattr(args, "adhesion_k_n", 0.0))
+    adhesion_k_t = float(getattr(args, "adhesion_k_t", 0.0))
+    adhesion_gamma_n = float(getattr(args, "adhesion_gamma_n", 0.0))
+    adhesion_gamma_t = float(getattr(args, "adhesion_gamma_t", 0.0))
+    if use_bottom_adhesion and paper1_reduced:
+        raise RuntimeError("--attachment-mode adhesion is only supported in the full one-domain benchmark path; disable --paper1-reduced.")
+    if use_bottom_adhesion:
+        adhesion_scale = max(abs(adhesion_k_n), abs(adhesion_k_t), abs(adhesion_gamma_n), abs(adhesion_gamma_t))
+        if adhesion_scale <= 0.0:
+            raise RuntimeError(
+                "--attachment-mode adhesion requires at least one nonzero coefficient among "
+                "--adhesion-k-n/--adhesion-k-t/--adhesion-gamma-n/--adhesion-gamma-t."
+            )
+    kappa_inv_model = str(getattr(args, "kappa_inv_model", "spatial")).strip().lower()
+    kappa_phi_ref = float(getattr(args, "kappa_phi_ref", None) or args.phi_b)
 
     mu_s, lambda_s = _lame_from_E_nu(float(args.E), float(args.nu))
     rho_f_c = _named_scalar_expr("rho_f", float(args.rho_f))
@@ -1865,6 +2448,8 @@ def main() -> None:
     diffuse_g_t = None
     diffuse_w_t = None
     diffuse_scale_expr = None
+    diffuse_pressure_scale_expr = None
+    diffuse_normal_stress_scale_expr = None
     diffuse_scale_update = None
     if bool(getattr(args, "diffuse_shear_traction", False)):
         diffuse_time_scheme = str(getattr(args, "diffuse_shear_time_scheme", "constant")).strip().lower()
@@ -1874,15 +2459,152 @@ def main() -> None:
         if not np.isfinite(diffuse_ramp_time):
             diffuse_ramp_time = float(args.t_ramp)
         target_diffuse_scale = float(args.diffuse_shear_scale)
+        target_diffuse_pressure_scale = float(getattr(args, "diffuse_normal_pressure_scale", 0.0))
+        target_diffuse_normal_stress_scale = float(getattr(args, "diffuse_normal_stress_scale", 0.0))
+        diffuse_shear_topweight = bool(getattr(args, "diffuse_shear_topweight", False))
+        diffuse_pressure_xweight = bool(getattr(args, "diffuse_normal_pressure_xweight", False))
+        diffuse_pressure_upstream_only = bool(getattr(args, "diffuse_normal_pressure_upstream_only", False))
+        normal_stress_ramp_time = float(getattr(args, "diffuse_normal_stress_ramp_time", float("nan")))
+        if not np.isfinite(normal_stress_ramp_time):
+            normal_stress_ramp_time = float(diffuse_ramp_time)
+        normal_stress_decay_start = float(getattr(args, "diffuse_normal_stress_decay_start", float("nan")))
+        normal_stress_decay_end = float(getattr(args, "diffuse_normal_stress_decay_end", float("nan")))
+        normal_stress_tail_factor = float(getattr(args, "diffuse_normal_stress_tail_factor", 1.0))
+        decay_start_finite = np.isfinite(normal_stress_decay_start)
+        decay_end_finite = np.isfinite(normal_stress_decay_end)
+        normal_stress_topbias = float(getattr(args, "diffuse_normal_stress_topbias", 0.0))
+        if not (0.0 <= normal_stress_topbias <= 1.0):
+            raise ValueError("--diffuse-normal-stress-topbias must lie in [0, 1].")
+        normal_stress_frontbias = float(getattr(args, "diffuse_normal_stress_frontbias", 0.0))
+        if not (0.0 <= normal_stress_frontbias <= 1.0):
+            raise ValueError("--diffuse-normal-stress-frontbias must lie in [0, 1].")
+        normal_stress_frontbias_tail_value = float(
+            getattr(args, "diffuse_normal_stress_frontbias_tail_value", float("nan"))
+        )
+        if np.isfinite(normal_stress_frontbias_tail_value) and not (
+            0.0 <= normal_stress_frontbias_tail_value <= 1.0
+        ):
+            raise ValueError("--diffuse-normal-stress-frontbias-tail-value must lie in [0, 1].")
+        normal_stress_bottomskew = float(getattr(args, "diffuse_normal_stress_bottomskew", 0.0))
+        if not (0.0 <= normal_stress_bottomskew <= 1.0):
+            raise ValueError("--diffuse-normal-stress-bottomskew must lie in [0, 1].")
+        normal_stress_bottomskew_ramp_with_tail = bool(
+            getattr(args, "diffuse_normal_stress_bottomskew_ramp_with_tail", False)
+        )
+        if normal_stress_bottomskew_ramp_with_tail and not decay_start_finite:
+            raise ValueError(
+                "--diffuse-normal-stress-bottomskew-ramp-with-tail requires "
+                "--diffuse-normal-stress-decay-start and --diffuse-normal-stress-decay-end."
+            )
+        if np.isfinite(normal_stress_frontbias_tail_value) and not decay_start_finite:
+            raise ValueError(
+                "--diffuse-normal-stress-frontbias-tail-value requires "
+                "--diffuse-normal-stress-decay-start and --diffuse-normal-stress-decay-end."
+            )
+        if decay_start_finite != decay_end_finite:
+            raise ValueError(
+                "Use --diffuse-normal-stress-decay-start and "
+                "--diffuse-normal-stress-decay-end together."
+            )
+        if decay_start_finite and not (normal_stress_decay_end > normal_stress_decay_start):
+            raise ValueError(
+                "--diffuse-normal-stress-decay-end must be greater than "
+                "--diffuse-normal-stress-decay-start."
+            )
         diffuse_scale_expr = _named_scalar_expr("diffuse_shear_scale", target_diffuse_scale)
+        diffuse_pressure_scale_expr = _named_scalar_expr("diffuse_normal_pressure_scale", target_diffuse_pressure_scale)
+        diffuse_normal_stress_scale_expr = _named_scalar_expr(
+            "diffuse_normal_stress_scale", target_diffuse_normal_stress_scale
+        )
+        diffuse_normal_stress_frontbias_expr = _named_scalar_expr(
+            "diffuse_normal_stress_frontbias", normal_stress_frontbias
+        )
+        diffuse_normal_stress_bottomskew_expr = _named_scalar_expr(
+            "diffuse_normal_stress_bottomskew", normal_stress_bottomskew
+        )
+
+        def _normal_stress_decay_factor(t_now: float) -> float:
+            if not decay_start_finite:
+                return 1.0
+            return _cosine_blend_value(
+                float(t_now),
+                start_time=float(normal_stress_decay_start),
+                end_time=float(normal_stress_decay_end),
+                start_value=1.0,
+                end_value=float(normal_stress_tail_factor),
+            )
+
         if diffuse_time_scheme == "imex":
             def _update_diffuse_scale(t_now: float) -> None:
-                diffuse_scale_expr.value = float(target_diffuse_scale) * _cosine_ramp_value(float(t_now), diffuse_ramp_time)
+                ramp = _cosine_ramp_value(float(t_now), diffuse_ramp_time)
+                normal_stress_ramp = _cosine_ramp_value(float(t_now), normal_stress_ramp_time)
+                shutoff = _late_flow_shutoff_factor(float(t_now))
+                diffuse_scale_expr.value = float(target_diffuse_scale) * ramp * shutoff
+                diffuse_pressure_scale_expr.value = float(target_diffuse_pressure_scale) * ramp * shutoff
+                diffuse_normal_stress_scale_expr.value = (
+                    float(target_diffuse_normal_stress_scale)
+                    * normal_stress_ramp
+                    * _normal_stress_decay_factor(float(t_now))
+                    * shutoff
+                )
+                if np.isfinite(normal_stress_frontbias_tail_value):
+                    diffuse_normal_stress_frontbias_expr.value = _cosine_blend_value(
+                        float(t_now),
+                        start_time=float(normal_stress_decay_start),
+                        end_time=float(normal_stress_decay_end),
+                        start_value=float(normal_stress_frontbias),
+                        end_value=float(normal_stress_frontbias_tail_value),
+                    )
+                else:
+                    diffuse_normal_stress_frontbias_expr.value = float(normal_stress_frontbias)
+                if normal_stress_bottomskew_ramp_with_tail:
+                    diffuse_normal_stress_bottomskew_expr.value = (
+                        float(normal_stress_bottomskew)
+                        * _cosine_blend_value(
+                            float(t_now),
+                            start_time=float(normal_stress_decay_start),
+                            end_time=float(normal_stress_decay_end),
+                            start_value=0.0,
+                            end_value=1.0,
+                        )
+                    )
+                else:
+                    diffuse_normal_stress_bottomskew_expr.value = float(normal_stress_bottomskew)
 
             diffuse_scale_update = _update_diffuse_scale
             diffuse_scale_update(float(t0))
         else:
-            diffuse_scale_expr.value = float(target_diffuse_scale)
+            shutoff = _late_flow_shutoff_factor(float(t0))
+            diffuse_scale_expr.value = float(target_diffuse_scale) * shutoff
+            diffuse_pressure_scale_expr.value = float(target_diffuse_pressure_scale) * shutoff
+            diffuse_normal_stress_scale_expr.value = (
+                float(target_diffuse_normal_stress_scale)
+                * _normal_stress_decay_factor(float(t0))
+                * shutoff
+            )
+            if np.isfinite(normal_stress_frontbias_tail_value):
+                diffuse_normal_stress_frontbias_expr.value = _cosine_blend_value(
+                    float(t0),
+                    start_time=float(normal_stress_decay_start),
+                    end_time=float(normal_stress_decay_end),
+                    start_value=float(normal_stress_frontbias),
+                    end_value=float(normal_stress_frontbias_tail_value),
+                )
+            else:
+                diffuse_normal_stress_frontbias_expr.value = float(normal_stress_frontbias)
+            if normal_stress_bottomskew_ramp_with_tail:
+                diffuse_normal_stress_bottomskew_expr.value = (
+                    float(normal_stress_bottomskew)
+                    * _cosine_blend_value(
+                        float(t0),
+                        start_time=float(normal_stress_decay_start),
+                        end_time=float(normal_stress_decay_end),
+                        start_value=0.0,
+                        end_value=1.0,
+                    )
+                )
+            else:
+                diffuse_normal_stress_bottomskew_expr.value = float(normal_stress_bottomskew)
 
         shear_model = str(getattr(args, "diffuse_shear_model", "lagged_velocity")).strip().lower()
         if shear_model == "poiseuille":
@@ -1893,6 +2615,7 @@ def main() -> None:
                 mu_f=float(args.mu_f),
                 scale=diffuse_scale_expr,
                 eta_n=float(args.diffuse_shear_eta),
+                topweight=diffuse_shear_topweight,
             )
         elif shear_model == "lagged_stress":
             diffuse_g_t, diffuse_w_t = _lagged_diffuse_interface_stress_traction(
@@ -1910,15 +2633,75 @@ def main() -> None:
                 mu_f=float(args.mu_f),
                 scale=diffuse_scale_expr,
                 eta_n=float(args.diffuse_shear_eta),
+                topweight=diffuse_shear_topweight,
             )
+        if abs(float(target_diffuse_pressure_scale)) > 0.0:
+            diffuse_g_p, diffuse_w_p = _lagged_diffuse_interface_pressure_traction(
+                p_lag=p_n,
+                alpha_lag=alpha_n,
+                scale=diffuse_pressure_scale_expr,
+                eta_n=float(args.diffuse_shear_eta),
+                xweight=diffuse_pressure_xweight,
+                upstream_only=diffuse_pressure_upstream_only,
+            )
+            if diffuse_g_t is None:
+                diffuse_g_t = diffuse_g_p
+                diffuse_w_t = diffuse_w_p
+            else:
+                diffuse_g_t = (diffuse_g_t[0] + diffuse_g_p[0], diffuse_g_t[1] + diffuse_g_p[1])
+        if abs(float(target_diffuse_normal_stress_scale)) > 0.0:
+            diffuse_g_n, diffuse_w_n = _lagged_diffuse_interface_normal_stress_traction(
+                v_lag=v_n,
+                p_lag=p_n,
+                alpha_lag=alpha_n,
+                mu_f=float(args.mu_f),
+                scale=diffuse_normal_stress_scale_expr,
+                eta_n=float(args.diffuse_shear_eta),
+                xweight=bool(getattr(args, "diffuse_normal_stress_xweight", False)),
+                topweight=bool(getattr(args, "diffuse_normal_stress_topweight", False)),
+                topbias=normal_stress_topbias,
+                frontbias=diffuse_normal_stress_frontbias_expr,
+                bottomskew=diffuse_normal_stress_bottomskew_expr,
+                channel_height=float(H),
+                upstream_only=bool(getattr(args, "diffuse_normal_stress_upstream_only", False)),
+            )
+            if diffuse_g_t is None:
+                diffuse_g_t = diffuse_g_n
+                diffuse_w_t = diffuse_w_n
+            else:
+                diffuse_g_t = (diffuse_g_t[0] + diffuse_g_n[0], diffuse_g_t[1] + diffuse_g_n[1])
         logging.info(
-            "[setup] diffuse interface traction enabled: model=%s, scale=%.3e, scheme=%s, ramp=%.3e, eta=%.3e",
+            "[setup] diffuse interface traction enabled: model=%s, scale=%.3e, shear_topweight=%s, normal_pressure_scale=%.3e, normal_pressure_xweight=%s, normal_pressure_upstream_only=%s, normal_stress_scale=%.3e, normal_stress_xweight=%s, normal_stress_topweight=%s, normal_stress_topbias=%.3e, normal_stress_frontbias=%.3e, normal_stress_frontbias_tail_value=%.3e, normal_stress_bottomskew=%.3e, normal_stress_bottomskew_ramp_with_tail=%s, normal_stress_upstream_only=%s, normal_stress_ramp=%.3e, normal_stress_decay_start=%.3e, normal_stress_decay_end=%.3e, normal_stress_tail_factor=%.3e, scheme=%s, ramp=%.3e, eta=%.3e",
             shear_model,
             float(args.diffuse_shear_scale),
+            str(diffuse_shear_topweight),
+            float(target_diffuse_pressure_scale),
+            str(diffuse_pressure_xweight),
+            str(diffuse_pressure_upstream_only),
+            float(target_diffuse_normal_stress_scale),
+            str(bool(getattr(args, "diffuse_normal_stress_xweight", False))),
+            str(bool(getattr(args, "diffuse_normal_stress_topweight", False))),
+            float(normal_stress_topbias),
+            float(normal_stress_frontbias),
+            float(normal_stress_frontbias_tail_value),
+            float(normal_stress_bottomskew),
+            str(normal_stress_bottomskew_ramp_with_tail),
+            str(bool(getattr(args, "diffuse_normal_stress_upstream_only", False))),
+            float(normal_stress_ramp_time),
+            float(normal_stress_decay_start),
+            float(normal_stress_decay_end),
+            float(normal_stress_tail_factor),
             diffuse_time_scheme,
             float(diffuse_ramp_time),
             float(args.diffuse_shear_eta),
         )
+        if flow_shutoff_start_finite:
+            logging.info(
+                "[setup] late flow shutoff enabled: start=%.3e s end=%.3e s end_factor=%.3e",
+                float(flow_shutoff_start),
+                float(flow_shutoff_end),
+                float(flow_shutoff_end_factor),
+            )
     if ch_enabled:
         zeta_ratio = float("nan")
         if abs(float(alpha_ch_gamma)) > 0.0 and abs(float(alpha_ch_eps)) > 0.0:
@@ -1966,7 +2749,6 @@ def main() -> None:
             rho_f=rho_f_c,
             mu_f=mu_f_c,
             mu_b=mu_b_c,
-            mu_b_model=str(getattr(args, "mu_b_model", "phi_mu")),
             kappa_inv=kappa_inv_c,
             mu_s=mu_s_c,
             lambda_s=lambda_s_c,
@@ -2022,17 +2804,24 @@ def main() -> None:
             rho_f=rho_f_c,
             mu_f=mu_f_c,
             mu_b=mu_b_c,
+            mu_b_model=str(getattr(args, "mu_b_model", "phi_mu")),
             kappa_inv=kappa_inv_c,
+            kappa_inv_model=kappa_inv_model,
+            kappa_inv_phi_ref=kappa_phi_ref,
+            kappa_inv_kc_eps=float(getattr(args, "kappa_inv_kc_eps", 1.0e-12)),
             mu_s=mu_s_c,
             lambda_s=lambda_s_c,
+            solid_model=str(getattr(args, "solid_model", "linear")),
             solid_visco_eta=solid_visco_eta_c,
             gamma_u=gamma_u_c,
             u_extension_mode=str(args.u_extension),
             gamma_u_pin=gamma_u_pin_c,
+            regularization_weight=regularization_weight,
             kinematics_scale=float(args.kinematics_scale) if np.isfinite(float(args.kinematics_scale)) else None,
             v_supg=v_supg_c,
             v_supg_mode=str(getattr(args, "v_supg_mode", "streamline")),
             v_supg_c_nu=float(getattr(args, "v_supg_c_nu", 4.0)),
+            fluid_hdiv_order=int(fluid_hdiv_order),
             u_supg=u_supg_c,
             u_cip=u_cip_c,
             u_cip_weight=str(args.u_cip_weight),
@@ -2047,6 +2836,8 @@ def main() -> None:
             phi_cip=float(args.phi_cip) if transport_mode == "pde" else 0.0,
             D_alpha=D_alpha_c if transport_mode == "pde" else 0.0,
             alpha_advect_with=str(args.alpha_advect_with),
+            alpha_mix_gate_alpha0=float(getattr(args, "alpha_mix_gate_alpha0", 0.1)),
+            alpha_mix_gate_power=int(getattr(args, "alpha_mix_gate_power", 4)),
             alpha_advection_form=str(args.alpha_advection_form) if transport_mode == "pde" else "advective",
             alpha_ch_M=alpha_ch_M_c if transport_mode == "pde" else 0.0,
             alpha_ch_gamma=alpha_ch_gamma_c if transport_mode == "pde" else 0.0,
@@ -2058,6 +2849,13 @@ def main() -> None:
             g_t_n=diffuse_g_t,
             traction_weight_k=diffuse_w_t,
             traction_weight_n=diffuse_w_t,
+            ds_adh=dS_measure(defined_on=mesh.edge_bitset("bottom"), metadata={"q": int(args.q)})
+            if use_bottom_adhesion
+            else None,
+            adhesion_k_n=adhesion_k_n if use_bottom_adhesion else 0.0,
+            adhesion_k_t=adhesion_k_t if use_bottom_adhesion else 0.0,
+            adhesion_gamma_n=adhesion_gamma_n if use_bottom_adhesion else 0.0,
+            adhesion_gamma_t=adhesion_gamma_t if use_bottom_adhesion else 0.0,
             # (keep Allen–Cahn disabled in this benchmark)
             alpha_cahn_M=0.0,
             alpha_cahn_gamma=0.0,
@@ -2073,13 +2871,64 @@ def main() -> None:
     # ------------------------------------------------------------------
     u_avg = float(args.u_avg)
     u_max = 1.5 * u_avg
+    inflow_profile = str(getattr(args, "inflow_profile", "poiseuille")).strip().lower()
+    if inflow_profile not in {"poiseuille", "plug"}:
+        raise ValueError(f"Unknown --inflow-profile {inflow_profile!r}.")
+    inflow_plug_speed = float(getattr(args, "inflow_plug_speed", float("nan")))
+    if not np.isfinite(inflow_plug_speed):
+        inflow_plug_speed = u_max
     t_ramp = float(args.t_ramp)
     try:
         mu_f0 = float(args.mu_f)
         rho_f0 = float(args.rho_f)
         tau_w = 6.0 * mu_f0 * u_avg / float(H)  # plane Poiseuille between plates
-        Re = rho_f0 * u_avg * float(H) / max(mu_f0, 1.0e-30)
-        logging.info(f"[setup] inflow: u_avg={u_avg:.3e} m/s (u_max={u_max:.3e}), tau_w≈{tau_w:.3e} Pa, Re≈{Re:.1f}")
+        inflow_speed_ref = u_avg if inflow_profile == "poiseuille" else inflow_plug_speed
+        Re = rho_f0 * inflow_speed_ref * float(H) / max(mu_f0, 1.0e-30)
+        if inflow_profile == "poiseuille":
+            logging.info(
+                "[setup] inflow: profile=%s u_avg=%.3e m/s (u_max=%.3e), tau_w≈%.3e Pa, Re≈%.1f",
+                inflow_profile,
+                u_avg,
+                u_max,
+                tau_w,
+                Re,
+            )
+        else:
+            logging.info(
+                "[setup] inflow: profile=%s u_plug=%.3e m/s (u_avg_ref=%.3e, u_max_ref=%.3e), Re≈%.1f",
+                inflow_profile,
+                inflow_plug_speed,
+                u_avg,
+                u_max,
+                Re,
+            )
+        logging.info(
+            "[setup] constitutive choices: solid_model=%s mu_b_model=%s",
+            str(getattr(args, "solid_model", "linear")),
+            str(getattr(args, "mu_b_model", "phi_mu")),
+        )
+        if flow_shutoff_start_finite:
+            logging.info(
+                "[setup] inflow shutoff schedule: start=%.3e s end=%.3e s end_factor=%.3e",
+                float(flow_shutoff_start),
+                float(flow_shutoff_end),
+                float(flow_shutoff_end_factor),
+            )
+        logging.info(
+            "[setup] permeability: model=%s kappa_inv=%.3e kappa_phi_ref=%.3e kappa_inv_kc_eps=%.3e",
+            kappa_inv_model,
+            float(args.kappa_inv),
+            float(kappa_phi_ref),
+            float(getattr(args, "kappa_inv_kc_eps", 1.0e-12)),
+        )
+        logging.info(
+            "[setup] attachment: mode=%s adhesion_k_n=%.3e adhesion_k_t=%.3e adhesion_gamma_n=%.3e adhesion_gamma_t=%.3e",
+            attachment_mode,
+            float(adhesion_k_n),
+            float(adhesion_k_t),
+            float(adhesion_gamma_n),
+            float(adhesion_gamma_t),
+        )
         if float(gamma_div_expr) != 0.0:
             logging.info(f"[setup] mixture grad-div stabilization enabled: gamma_div={float(gamma_div_expr):.3e}")
             if adaptive_gamma_div:
@@ -2097,32 +2946,46 @@ def main() -> None:
         pass
 
     def inflow_vx(_x, y, t):
-        yy = float(y) / float(H)
-        base = float(u_max * 4.0 * yy * (1.0 - yy))
+        if inflow_profile == "plug":
+            base = float(inflow_plug_speed)
+        else:
+            yy = float(y) / float(H)
+            base = float(u_max * 4.0 * yy * (1.0 - yy))
         if t is None:
             return base
         tt = float(t)
-        if tt <= 0.0:
-            return 0.0
-        if tt >= t_ramp:
-            return base
-        return base * 0.5 * (1.0 - math.cos(math.pi * tt / max(1.0e-12, t_ramp)))
+        return base * _cosine_ramp_value(tt, t_ramp) * _late_flow_shutoff_factor(tt)
 
-    bcs = [
-        BoundaryCondition("v_x", "dirichlet", "left", inflow_vx),
-        BoundaryCondition("v_y", "dirichlet", "left", lambda x, y, t: 0.0),
-        BoundaryCondition("v_x", "dirichlet", "bottom", lambda x, y, t: 0.0),
-        BoundaryCondition("v_y", "dirichlet", "bottom", lambda x, y, t: 0.0),
-        BoundaryCondition("v_x", "dirichlet", "top", lambda x, y, t: 0.0),
-        BoundaryCondition("v_y", "dirichlet", "top", lambda x, y, t: 0.0),
-        # Clamp skeleton to the substratum (biofilm is attached; no detachment in this FSI-only run).
-        BoundaryCondition("u_x", "dirichlet", "bottom", lambda x, y, t: 0.0),
-        BoundaryCondition("u_y", "dirichlet", "bottom", lambda x, y, t: 0.0),
-        BoundaryCondition("vS_x", "dirichlet", "bottom", lambda x, y, t: 0.0),
-        BoundaryCondition("vS_y", "dirichlet", "bottom", lambda x, y, t: 0.0),
-        # Pressure reference
-        BoundaryCondition("p", "dirichlet", "right", lambda x, y, t: 0.0),
-    ]
+    if fluid_space_key == "cg":
+        bcs = [
+            BoundaryCondition("v_x", "dirichlet", "left", inflow_vx),
+            BoundaryCondition("v_y", "dirichlet", "left", lambda x, y, t: 0.0),
+            BoundaryCondition("v_x", "dirichlet", "bottom", lambda x, y, t: 0.0),
+            BoundaryCondition("v_y", "dirichlet", "bottom", lambda x, y, t: 0.0),
+            BoundaryCondition("v_x", "dirichlet", "top", lambda x, y, t: 0.0),
+            BoundaryCondition("v_y", "dirichlet", "top", lambda x, y, t: 0.0),
+            BoundaryCondition("p", "dirichlet", "right", lambda x, y, t: 0.0),
+        ]
+    else:
+        logging.info(
+            "[setup] fluid-space=hdiv imposes only normal-flux Dirichlet data on v; tangential no-slip remains unconstrained."
+        )
+        bcs = [
+            BoundaryCondition("v", "dirichlet", "left", lambda x, y, t: np.asarray([inflow_vx(x, y, t), 0.0], dtype=float)),
+            BoundaryCondition("v", "dirichlet", "bottom", lambda x, y, t: 0.0),
+            BoundaryCondition("v", "dirichlet", "top", lambda x, y, t: 0.0),
+            BoundaryCondition("p", "dirichlet", "right", lambda x, y, t: 0.0),
+        ]
+    if not use_bottom_adhesion:
+        # Default Benchmark 6 setup: hard clamp on the substratum.
+        bcs.extend(
+            [
+                BoundaryCondition("u_x", "dirichlet", "bottom", lambda x, y, t: 0.0),
+                BoundaryCondition("u_y", "dirichlet", "bottom", lambda x, y, t: 0.0),
+                BoundaryCondition("vS_x", "dirichlet", "bottom", lambda x, y, t: 0.0),
+                BoundaryCondition("vS_y", "dirichlet", "bottom", lambda x, y, t: 0.0),
+            ]
+        )
     bcs_homog = [BoundaryCondition(b.field, b.method, b.domain_tag, (lambda x, y: 0.0)) for b in bcs]
 
     # ------------------------------------------------------------------
@@ -2130,6 +2993,27 @@ def main() -> None:
     # ------------------------------------------------------------------
     out_dir = Path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
+    launch_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("PYCUTFEM_")
+        or key in {
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "BLIS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "CONDA_DEFAULT_ENV",
+        }
+    }
+    launch_meta = {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "cwd": os.getcwd(),
+        "argv": list(sys.argv),
+        "command": shlex.join(list(sys.argv)),
+        "environment": dict(sorted(launch_env.items())),
+    }
+    (out_dir / "run_metadata.json").write_text(json.dumps(launch_meta, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "run_command.sh").write_text("#!/usr/bin/env bash\n" + shlex.join(list(sys.argv)) + "\n", encoding="utf-8")
     gamma_div_history_path = out_dir / "gamma_div_history.csv"
     if adaptive_gamma_div:
         if (not gamma_div_history_path.exists()) or gamma_div_history_path.stat().st_size == 0:
@@ -2222,6 +3106,7 @@ def main() -> None:
         if S_k is not None and S_n is not None:
             S_k.nodal_values[:] = S_n.nodal_values
         mu_alpha_k.nodal_values[:] = mu_alpha_n.nodal_values
+        _update_regularization_weight(alpha_n.nodal_values)
         logging.info(f"[restart] loaded {restart_from} (t={float(t0):.6e}s, step={int(step0)}, dt={float(dt_val):.3e})")
         if adaptive_gamma_div and np.isfinite(float(restart_state.get("gamma_div", float("nan")))):
             logging.info(f"[restart] continuing adaptive gamma_div from checkpoint: {float(gamma_div_expr):.3e}")
@@ -2451,7 +3336,7 @@ def main() -> None:
         solver = NewtonSolver(
             forms.residual_form,
             forms.jacobian_form,
-            lin_params=LinearSolverParameters(backend="petsc"),
+            lin_params=LinearSolverParameters(backend=str(args.linear_backend)),
             **common_solver_kwargs,
         )
     else:
@@ -2483,7 +3368,7 @@ def main() -> None:
                 unconstrained_lm_good_ratio=float(args.vi_lm_good_ratio),
                 unconstrained_lm_max_tries=int(args.vi_lm_max_tries),
             ),
-            lin_params=LinearSolverParameters(backend="petsc"),
+            lin_params=LinearSolverParameters(backend=str(args.linear_backend)),
             **common_solver_kwargs,
         )
     if bool(getattr(args, "linear_schur", False)) and hasattr(solver, "set_linear_schur_fieldsplit"):
@@ -3109,10 +3994,13 @@ def main() -> None:
         predictor_damping=float(predictor_damping_base),
         predictor_clip_01=bool(predictor_clip_01_base),
     )
+    aux_solver_functions: dict[str, object] = {"dt": dt_c}
+    if regularization_weight is not None:
+        aux_solver_functions["reg_weight"] = regularization_weight
     solver.solve_time_interval(
         functions=functions_k,
         prev_functions=functions_n,
-        aux_functions={"dt": dt_c},
+        aux_functions=aux_solver_functions,
         time_params=time_params,
         post_step_refiner=post_step_refiner,
     )
